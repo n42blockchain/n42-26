@@ -51,9 +51,9 @@ impl BlockVerificationStatus {
             .insert(receipt.verifier_pubkey, receipt.is_valid());
 
         if receipt.is_valid() {
-            self.valid_count += 1;
+            self.valid_count = self.valid_count.saturating_add(1);
         } else {
-            self.invalid_count += 1;
+            self.invalid_count = self.invalid_count.saturating_add(1);
         }
 
         true
@@ -167,5 +167,174 @@ impl ReceiptAggregator {
     /// Updates the default threshold (e.g., when phone count changes).
     pub fn set_default_threshold(&mut self, threshold: u32) {
         self.default_threshold = threshold;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ed25519_dalek::Signature;
+
+    /// Helper: creates a mock VerificationReceipt with the given fields.
+    /// Uses a dummy signature (not cryptographically valid, but sufficient
+    /// for aggregator-level tests that don't verify signatures).
+    fn mock_receipt(
+        block_hash: B256,
+        block_number: u64,
+        state_root_match: bool,
+        receipts_root_match: bool,
+        verifier_pubkey: [u8; 32],
+    ) -> VerificationReceipt {
+        VerificationReceipt {
+            block_hash,
+            block_number,
+            state_root_match,
+            receipts_root_match,
+            verifier_pubkey,
+            signature: Signature::from_bytes(&[0u8; 64]),
+            timestamp_ms: 1_000_000,
+        }
+    }
+
+    /// Helper: creates a B256 from a single byte.
+    fn hash(b: u8) -> B256 {
+        B256::from([b; 32])
+    }
+
+    /// Helper: creates a unique verifier pubkey from a single byte.
+    fn pubkey(b: u8) -> [u8; 32] {
+        let mut pk = [0u8; 32];
+        pk[0] = b;
+        pk
+    }
+
+    #[test]
+    fn test_block_verification_status() {
+        let bh = hash(1);
+        let mut status = BlockVerificationStatus::new(bh, 100, 3);
+
+        assert_eq!(status.valid_count, 0);
+        assert_eq!(status.invalid_count, 0);
+        assert!(!status.is_attested());
+        assert_eq!(status.total_receipts(), 0);
+
+        // Add two valid receipts.
+        let r1 = mock_receipt(bh, 100, true, true, pubkey(1));
+        let r2 = mock_receipt(bh, 100, true, true, pubkey(2));
+        assert!(status.add_receipt(&r1));
+        assert!(status.add_receipt(&r2));
+
+        assert_eq!(status.valid_count, 2);
+        assert_eq!(status.invalid_count, 0);
+        assert_eq!(status.total_receipts(), 2);
+        assert!(!status.is_attested(), "threshold is 3, only 2 valid");
+
+        // Add one invalid receipt.
+        let r3 = mock_receipt(bh, 100, false, true, pubkey(3));
+        assert!(status.add_receipt(&r3));
+        assert_eq!(status.invalid_count, 1);
+        assert!(!status.is_attested(), "only 2 valid, threshold 3");
+
+        // Add a third valid receipt → threshold reached.
+        let r4 = mock_receipt(bh, 100, true, true, pubkey(4));
+        assert!(status.add_receipt(&r4));
+        assert_eq!(status.valid_count, 3);
+        assert!(status.is_attested());
+    }
+
+    #[test]
+    fn test_block_verification_dedup() {
+        let bh = hash(2);
+        let mut status = BlockVerificationStatus::new(bh, 200, 5);
+
+        let pk = pubkey(10);
+        let r1 = mock_receipt(bh, 200, true, true, pk);
+        let r2 = mock_receipt(bh, 200, true, true, pk); // same verifier
+
+        assert!(status.add_receipt(&r1), "first receipt should be accepted");
+        assert!(!status.add_receipt(&r2), "duplicate verifier should be rejected");
+
+        assert_eq!(status.valid_count, 1, "dedup: only one receipt should be counted");
+        assert_eq!(status.total_receipts(), 1);
+    }
+
+    #[test]
+    fn test_receipt_aggregator_register_and_process() {
+        let mut agg = ReceiptAggregator::new(2, 100); // threshold = 2
+
+        let bh = hash(10);
+        agg.register_block(bh, 1000);
+
+        assert_eq!(agg.tracked_blocks(), 1);
+
+        // Process first valid receipt — not yet attested.
+        let r1 = mock_receipt(bh, 1000, true, true, pubkey(1));
+        let result1 = agg.process_receipt(&r1);
+        assert_eq!(result1, Some(false), "first receipt should not reach threshold");
+
+        // Process second valid receipt — threshold reached.
+        let r2 = mock_receipt(bh, 1000, true, true, pubkey(2));
+        let result2 = agg.process_receipt(&r2);
+        assert_eq!(result2, Some(true), "second receipt should reach threshold");
+
+        // Process a receipt for an untracked block.
+        let untracked_bh = hash(99);
+        let r3 = mock_receipt(untracked_bh, 999, true, true, pubkey(3));
+        let result3 = agg.process_receipt(&r3);
+        assert_eq!(result3, None, "untracked block should return None");
+
+        // Process a duplicate receipt.
+        let result4 = agg.process_receipt(&r1);
+        assert_eq!(result4, None, "duplicate receipt should return None");
+
+        // Verify status.
+        let status = agg.get_status(&bh).expect("block should be tracked");
+        assert_eq!(status.valid_count, 2);
+        assert!(status.is_attested());
+    }
+
+    #[test]
+    fn test_receipt_aggregator_eviction() {
+        let max_tracked = 3;
+        let mut agg = ReceiptAggregator::new(2, max_tracked);
+
+        // Register exactly max_tracked blocks.
+        for i in 0..max_tracked {
+            agg.register_block(hash(i as u8), i as u64);
+        }
+        assert_eq!(agg.tracked_blocks(), max_tracked);
+
+        // Register one more. The block with the lowest block_number (0) should be evicted.
+        agg.register_block(hash(100), 100);
+        assert_eq!(agg.tracked_blocks(), max_tracked);
+
+        // hash(0) at block_number 0 should have been evicted.
+        assert!(
+            agg.get_status(&hash(0)).is_none(),
+            "oldest block (block_number 0) should be evicted"
+        );
+
+        // The others should still be present.
+        assert!(agg.get_status(&hash(1)).is_some());
+        assert!(agg.get_status(&hash(2)).is_some());
+        assert!(agg.get_status(&hash(100)).is_some());
+    }
+
+    #[test]
+    fn test_validity_ratio() {
+        let bh = hash(50);
+        let mut status = BlockVerificationStatus::new(bh, 500, 10);
+
+        // No receipts → ratio 0.0.
+        assert_eq!(status.validity_ratio(), 0.0);
+
+        // 3 valid, 1 invalid → 3/4 = 0.75.
+        status.add_receipt(&mock_receipt(bh, 500, true, true, pubkey(1)));
+        status.add_receipt(&mock_receipt(bh, 500, true, true, pubkey(2)));
+        status.add_receipt(&mock_receipt(bh, 500, true, true, pubkey(3)));
+        status.add_receipt(&mock_receipt(bh, 500, false, true, pubkey(4)));
+
+        let ratio = status.validity_ratio();
+        assert!((ratio - 0.75).abs() < f64::EPSILON, "expected 0.75, got {ratio}");
     }
 }

@@ -56,3 +56,38 @@ where
         Ok(Arc::new(N42Consensus::new(ctx.chain_spec())))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_executor_builder_default() {
+        let builder = N42ExecutorBuilder::default();
+        let debug_str = format!("{:?}", builder);
+        assert!(debug_str.contains("N42ExecutorBuilder"));
+    }
+
+    #[test]
+    fn test_executor_builder_clone_copy() {
+        let builder = N42ExecutorBuilder;
+        let cloned = builder.clone();
+        let copied = builder;
+        let _ = (cloned, copied);
+    }
+
+    #[test]
+    fn test_consensus_builder_default() {
+        let builder = N42ConsensusBuilder::default();
+        let debug_str = format!("{:?}", builder);
+        assert!(debug_str.contains("N42ConsensusBuilder"));
+    }
+
+    #[test]
+    fn test_consensus_builder_clone_copy() {
+        let builder = N42ConsensusBuilder;
+        let cloned = builder.clone();
+        let copied = builder;
+        let _ = (cloned, copied);
+    }
+}

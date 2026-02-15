@@ -5442,6 +5442,7 @@ version = "0.1.0"
 dependencies = [
  "alloy-primitives",
  "eyre",
+ "libp2p",
  "n42-chainspec",
  "n42-consensus",
  "n42-execution",

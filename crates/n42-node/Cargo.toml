@@ -36,3 +36,6 @@ alloy-primitives.workspace = true
 eyre.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+libp2p.workspace = true

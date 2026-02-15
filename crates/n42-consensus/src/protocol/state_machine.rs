@@ -405,7 +405,7 @@ impl ConsensusEngine {
             });
 
             // Advance to next view
-            let next_view = view + 1;
+            let next_view = view.saturating_add(1);
             self.advance_to_view(next_view);
         }
 
@@ -444,7 +444,7 @@ impl ConsensusEngine {
         );
 
         // Check if we should form a TC and trigger view change
-        let next_view = view + 1;
+        let next_view = view.saturating_add(1);
         let next_leader =
             LeaderSelector::leader_for_view(next_view, &self.validator_set);
 
@@ -543,5 +543,271 @@ impl std::fmt::Debug for ConsensusEngine {
             .field("view", &self.round_state.current_view())
             .field("phase", &self.round_state.phase())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_primitives::Address;
+    use n42_chainspec::ValidatorInfo;
+
+    /// Helper: create a test engine with `n` validators, returning the engine
+    /// for validator at index `my_index`, all secret keys, and the output receiver.
+    fn make_engine(
+        n: usize,
+        my_index: u32,
+    ) -> (
+        ConsensusEngine,
+        Vec<BlsSecretKey>,
+        ValidatorSet,
+        mpsc::UnboundedReceiver<EngineOutput>,
+    ) {
+        let sks: Vec<_> = (0..n).map(|_| BlsSecretKey::random().unwrap()).collect();
+        let infos: Vec<_> = sks
+            .iter()
+            .enumerate()
+            .map(|(i, sk)| ValidatorInfo {
+                address: Address::with_last_byte(i as u8),
+                bls_public_key: sk.public_key(),
+            })
+            .collect();
+        let f = ((n as u32).saturating_sub(1)) / 3;
+        let vs = ValidatorSet::new(&infos, f);
+
+        let (output_tx, output_rx) = mpsc::unbounded_channel();
+        let engine = ConsensusEngine::new(
+            my_index,
+            sks[my_index as usize].clone(),
+            vs.clone(),
+            60000,
+            120000,
+            output_tx,
+        );
+
+        (engine, sks, vs, output_rx)
+    }
+
+    #[test]
+    fn test_engine_creation() {
+        let (engine, _, _, _rx) = make_engine(4, 0);
+
+        assert_eq!(engine.current_view(), 1, "initial view should be 1");
+        assert_eq!(
+            engine.current_phase(),
+            Phase::WaitingForProposal,
+            "initial phase should be WaitingForProposal"
+        );
+    }
+
+    #[test]
+    fn test_engine_is_leader() {
+        // With 4 validators, view 1: leader is 1 % 4 = 1
+        let (engine, _, _, _rx) = make_engine(4, 1);
+        assert!(
+            engine.is_current_leader(),
+            "validator 1 should be leader at view 1"
+        );
+
+        let (engine, _, _, _rx) = make_engine(4, 0);
+        assert!(
+            !engine.is_current_leader(),
+            "validator 0 should NOT be leader at view 1"
+        );
+    }
+
+    #[test]
+    fn test_engine_debug() {
+        let (engine, _, _, _rx) = make_engine(1, 0);
+        let debug_str = format!("{:?}", engine);
+        assert!(debug_str.contains("ConsensusEngine"));
+        assert!(debug_str.contains("my_index"));
+    }
+
+    #[test]
+    fn test_engine_block_ready_non_leader() {
+        // Validator 0 is NOT the leader for view 1 (leader is 1)
+        let (mut engine, _, _, _rx) = make_engine(4, 0);
+        let block_hash = B256::repeat_byte(0xAA);
+
+        // Should succeed but do nothing (not leader)
+        engine
+            .process_event(ConsensusEvent::BlockReady(block_hash))
+            .expect("non-leader block ready should succeed");
+
+        assert_eq!(
+            engine.current_phase(),
+            Phase::WaitingForProposal,
+            "phase should remain WaitingForProposal for non-leader"
+        );
+    }
+
+    #[test]
+    fn test_engine_block_ready_as_leader() {
+        // Single validator: always leader
+        let (mut engine, _, _, mut rx) = make_engine(1, 0);
+        let block_hash = B256::repeat_byte(0xBB);
+
+        engine
+            .process_event(ConsensusEvent::BlockReady(block_hash))
+            .expect("leader block ready should succeed");
+
+        assert_eq!(
+            engine.current_phase(),
+            Phase::Voting,
+            "leader should enter Voting phase after proposing"
+        );
+
+        // Should have emitted a BroadcastMessage(Proposal)
+        let output = rx.try_recv().expect("should have an output");
+        assert!(
+            matches!(output, EngineOutput::BroadcastMessage(ConsensusMessage::Proposal(_))),
+            "should broadcast a Proposal"
+        );
+    }
+
+    #[test]
+    fn test_engine_proposal_wrong_view() {
+        let (mut engine, sks, _, _rx) = make_engine(4, 0);
+
+        // Create a proposal with wrong view
+        let msg = signing_message(99, &B256::repeat_byte(0xCC));
+        let sig = sks[1].sign(&msg);
+
+        let proposal = Proposal {
+            view: 99,
+            block_hash: B256::repeat_byte(0xCC),
+            justify_qc: QuorumCertificate::genesis(),
+            proposer: 1,
+            signature: sig,
+        };
+
+        let result = engine.process_event(ConsensusEvent::Message(
+            ConsensusMessage::Proposal(proposal),
+        ));
+        assert!(result.is_err(), "proposal with wrong view should be rejected");
+    }
+
+    #[test]
+    fn test_engine_proposal_wrong_proposer() {
+        let (mut engine, sks, _, _rx) = make_engine(4, 0);
+
+        // View 1: leader should be validator 1, but we set proposer to 0
+        let msg = signing_message(1, &B256::repeat_byte(0xDD));
+        let sig = sks[0].sign(&msg);
+
+        let proposal = Proposal {
+            view: 1,
+            block_hash: B256::repeat_byte(0xDD),
+            justify_qc: QuorumCertificate::genesis(),
+            proposer: 0, // Wrong! Leader should be 1
+            signature: sig,
+        };
+
+        let result = engine.process_event(ConsensusEvent::Message(
+            ConsensusMessage::Proposal(proposal),
+        ));
+        assert!(result.is_err(), "proposal from wrong proposer should be rejected");
+
+        match result.unwrap_err() {
+            ConsensusError::InvalidProposer { expected, actual, .. } => {
+                assert_eq!(expected, 1);
+                assert_eq!(actual, 0);
+            }
+            other => panic!("expected InvalidProposer, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_engine_valid_proposal() {
+        let (mut engine, sks, _, mut rx) = make_engine(4, 0);
+
+        // View 1: leader is validator 1
+        let block_hash = B256::repeat_byte(0xEE);
+        let msg = signing_message(1, &block_hash);
+        let sig = sks[1].sign(&msg);
+
+        let proposal = Proposal {
+            view: 1,
+            block_hash,
+            justify_qc: QuorumCertificate::genesis(),
+            proposer: 1,
+            signature: sig,
+        };
+
+        engine
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(
+                proposal,
+            )))
+            .expect("valid proposal should be accepted");
+
+        assert_eq!(engine.current_phase(), Phase::Voting);
+
+        // Should have emitted ExecuteBlock and SendToValidator(vote)
+        let mut outputs = vec![];
+        while let Ok(output) = rx.try_recv() {
+            outputs.push(output);
+        }
+
+        let has_execute = outputs
+            .iter()
+            .any(|o| matches!(o, EngineOutput::ExecuteBlock(h) if *h == block_hash));
+        assert!(has_execute, "should request block execution");
+
+        let has_vote = outputs
+            .iter()
+            .any(|o| matches!(o, EngineOutput::SendToValidator(_, ConsensusMessage::Vote(_))));
+        assert!(has_vote, "should send vote to leader");
+    }
+
+    #[test]
+    fn test_engine_timeout() {
+        let (mut engine, _, _, mut rx) = make_engine(4, 0);
+
+        engine.on_timeout().expect("timeout should succeed");
+
+        assert_eq!(engine.current_phase(), Phase::TimedOut);
+
+        // Should have broadcast a Timeout message
+        let output = rx.try_recv().expect("should have timeout output");
+        assert!(
+            matches!(
+                output,
+                EngineOutput::BroadcastMessage(ConsensusMessage::Timeout(_))
+            ),
+            "should broadcast a Timeout message"
+        );
+    }
+
+    #[test]
+    fn test_engine_vote_non_leader_ignored() {
+        let (mut engine, sks, _, _rx) = make_engine(4, 0);
+
+        // Validator 0 is NOT the leader for view 1, so votes should be ignored
+        let msg = signing_message(1, &B256::repeat_byte(0xAA));
+        let sig = sks[1].sign(&msg);
+
+        let vote = Vote {
+            view: 1,
+            block_hash: B256::repeat_byte(0xAA),
+            voter: 1,
+            signature: sig,
+        };
+
+        // Should succeed (silently ignored)
+        engine
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Vote(vote)))
+            .expect("vote to non-leader should not error");
+    }
+
+    #[test]
+    fn test_engine_pacemaker_accessible() {
+        let (engine, _, _, _rx) = make_engine(1, 0);
+        let pacemaker = engine.pacemaker();
+
+        assert!(
+            !pacemaker.is_timed_out(),
+            "pacemaker should not be timed out initially"
+        );
     }
 }

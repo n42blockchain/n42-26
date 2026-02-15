@@ -69,6 +69,17 @@ pub fn execute_block_full<DB: Database>(
     // Extract state diff from the bundle state in the output
     let diff = StateDiff::from_bundle_state(&output.state);
 
+    // Defensive consistency check: witness accounts should be a superset of diff accounts.
+    // The witness captures all state *accessed* (reads + writes), while the diff only
+    // captures state that *changed* (writes). So witness.accounts >= diff.accounts.
+    // This holds because any changed account must have been accessed during execution.
+    debug_assert!(
+        witness.hashed_state.accounts.len() >= diff.len(),
+        "witness accounts ({}) < diff accounts ({}): possible state inconsistency",
+        witness.hashed_state.accounts.len(),
+        diff.len(),
+    );
+
     Ok(FullExecutionResult {
         output,
         witness,

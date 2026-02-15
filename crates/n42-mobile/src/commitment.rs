@@ -53,6 +53,7 @@ impl VerificationReveal {
     pub fn compute_commitment_hash(&self) -> B256 {
         compute_commitment(
             &self.block_hash,
+            self.block_number,
             self.state_root_match,
             self.receipts_root_match,
             &self.nonce,
@@ -67,6 +68,11 @@ impl VerificationReveal {
         // Check block hash matches
         if self.block_hash != commitment.block_hash {
             return Err(CommitmentError::BlockMismatch);
+        }
+
+        // Check block number matches
+        if self.block_number != commitment.block_number {
+            return Err(CommitmentError::BlockNumberMismatch);
         }
 
         // Check verifier matches
@@ -86,15 +92,17 @@ impl VerificationReveal {
 
 /// Computes a commitment hash from the verification result and nonce.
 ///
-/// `commitment = keccak256(block_hash || state_root_match || receipts_root_match || nonce)`
+/// `commitment = keccak256(block_hash || block_number || state_root_match || receipts_root_match || nonce)`
 pub fn compute_commitment(
     block_hash: &B256,
+    block_number: u64,
     state_root_match: bool,
     receipts_root_match: bool,
     nonce: &B256,
 ) -> B256 {
-    let mut data = Vec::with_capacity(66);
+    let mut data = Vec::with_capacity(74); // 32 + 8 + 1 + 1 + 32
     data.extend_from_slice(block_hash.as_slice());
+    data.extend_from_slice(&block_number.to_le_bytes());
     data.push(state_root_match as u8);
     data.push(receipts_root_match as u8);
     data.extend_from_slice(nonce.as_slice());
@@ -112,7 +120,165 @@ pub enum CommitmentError {
     #[error("verifier public key mismatch")]
     VerifierMismatch,
 
+    /// The reveal's block number doesn't match the commitment's.
+    #[error("block number mismatch between commitment and reveal")]
+    BlockNumberMismatch,
+
     /// The computed commitment hash doesn't match the committed one.
     #[error("commitment hash mismatch (possible result copying)")]
     HashMismatch,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_compute_commitment_deterministic() {
+        let block_hash = B256::from([1u8; 32]);
+        let nonce = B256::from([99u8; 32]);
+
+        let hash1 = compute_commitment(&block_hash, 1, true, true, &nonce);
+        let hash2 = compute_commitment(&block_hash, 1, true, true, &nonce);
+
+        assert_eq!(hash1, hash2, "same inputs must produce the same commitment hash");
+    }
+
+    #[test]
+    fn test_compute_commitment_different_nonce() {
+        let block_hash = B256::from([1u8; 32]);
+        let nonce_a = B256::from([10u8; 32]);
+        let nonce_b = B256::from([20u8; 32]);
+
+        let hash_a = compute_commitment(&block_hash, 1, true, true, &nonce_a);
+        let hash_b = compute_commitment(&block_hash, 1, true, true, &nonce_b);
+
+        assert_ne!(hash_a, hash_b, "different nonces must produce different commitment hashes");
+    }
+
+    /// Helper: builds a matching (commitment, reveal) pair.
+    fn make_commitment_reveal_pair(
+        block_hash: B256,
+        block_number: u64,
+        verifier_pubkey: [u8; 32],
+        state_root_match: bool,
+        receipts_root_match: bool,
+        nonce: B256,
+    ) -> (VerificationCommitment, VerificationReveal) {
+        let commitment_hash = compute_commitment(&block_hash, block_number, state_root_match, receipts_root_match, &nonce);
+
+        let commitment = VerificationCommitment {
+            block_hash,
+            block_number,
+            verifier_pubkey,
+            commitment_hash,
+            timestamp_ms: 1_000_000,
+        };
+
+        let reveal = VerificationReveal {
+            block_hash,
+            block_number,
+            verifier_pubkey,
+            state_root_match,
+            receipts_root_match,
+            nonce,
+        };
+
+        (commitment, reveal)
+    }
+
+    #[test]
+    fn test_verify_against_commitment_success() {
+        let block_hash = B256::from([5u8; 32]);
+        let pubkey = [42u8; 32];
+        let nonce = B256::from([77u8; 32]);
+
+        let (commitment, reveal) = make_commitment_reveal_pair(
+            block_hash, 100, pubkey, true, true, nonce,
+        );
+
+        // Verification must succeed with matching fields.
+        reveal
+            .verify_against_commitment(&commitment)
+            .expect("matching reveal should pass verification");
+    }
+
+    #[test]
+    fn test_verify_against_commitment_wrong_nonce() {
+        let block_hash = B256::from([5u8; 32]);
+        let pubkey = [42u8; 32];
+        let nonce = B256::from([77u8; 32]);
+        let wrong_nonce = B256::from([88u8; 32]);
+
+        // Build a valid commitment with the correct nonce.
+        let (commitment, _) = make_commitment_reveal_pair(
+            block_hash, 100, pubkey, true, true, nonce,
+        );
+
+        // Build a reveal with the wrong nonce.
+        let bad_reveal = VerificationReveal {
+            block_hash,
+            block_number: 100,
+            verifier_pubkey: pubkey,
+            state_root_match: true,
+            receipts_root_match: true,
+            nonce: wrong_nonce,
+        };
+
+        let result = bad_reveal.verify_against_commitment(&commitment);
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), CommitmentError::HashMismatch));
+    }
+
+    #[test]
+    fn test_verify_against_commitment_wrong_block() {
+        let block_hash = B256::from([5u8; 32]);
+        let different_block = B256::from([6u8; 32]);
+        let pubkey = [42u8; 32];
+        let nonce = B256::from([77u8; 32]);
+
+        let (commitment, _) = make_commitment_reveal_pair(
+            block_hash, 100, pubkey, true, true, nonce,
+        );
+
+        // Build a reveal referencing a different block hash.
+        let bad_reveal = VerificationReveal {
+            block_hash: different_block,
+            block_number: 100,
+            verifier_pubkey: pubkey,
+            state_root_match: true,
+            receipts_root_match: true,
+            nonce,
+        };
+
+        let result = bad_reveal.verify_against_commitment(&commitment);
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), CommitmentError::BlockMismatch));
+    }
+
+    #[test]
+    fn test_verify_against_commitment_wrong_verifier() {
+        let block_hash = B256::from([5u8; 32]);
+        let pubkey = [42u8; 32];
+        let other_pubkey = [99u8; 32];
+        let nonce = B256::from([77u8; 32]);
+
+        let (commitment, _) = make_commitment_reveal_pair(
+            block_hash, 100, pubkey, true, true, nonce,
+        );
+
+        // Build a reveal with a different verifier.
+        let bad_reveal = VerificationReveal {
+            block_hash,
+            block_number: 100,
+            verifier_pubkey: other_pubkey,
+            state_root_match: true,
+            receipts_root_match: true,
+            nonce,
+        };
+
+        let result = bad_reveal.verify_against_commitment(&commitment);
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), CommitmentError::VerifierMismatch));
+    }
 }

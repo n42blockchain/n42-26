@@ -61,3 +61,32 @@ where
         EthereumAddOns::default()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_n42_node_default() {
+        let node = N42Node::default();
+        let _ = node; // should compile and not panic
+    }
+
+    #[test]
+    fn test_n42_node_clone_copy() {
+        let node = N42Node;
+        let cloned = node.clone();
+        let copied = node; // Copy
+        let _ = (cloned, copied);
+    }
+
+    #[test]
+    fn test_n42_node_debug() {
+        let node = N42Node;
+        let debug_str = format!("{:?}", node);
+        assert!(
+            debug_str.contains("N42Node"),
+            "Debug output should contain 'N42Node'"
+        );
+    }
+}

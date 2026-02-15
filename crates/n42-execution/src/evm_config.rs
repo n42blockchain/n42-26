@@ -121,3 +121,69 @@ impl ConfigureEngineEvm<ExecutionData> for N42EvmConfig {
         Ok((txs, convert))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use n42_chainspec::{n42_dev_chainspec, N42_CHAIN_ID};
+
+    #[test]
+    fn test_evm_config_creation() {
+        let chain_spec = n42_dev_chainspec();
+        let config = N42EvmConfig::new(chain_spec);
+
+        // Should not panic, and the config should be usable.
+        assert_eq!(
+            config.chain_spec().chain().id(),
+            N42_CHAIN_ID,
+            "chain_spec should have N42 chain ID"
+        );
+    }
+
+    #[test]
+    fn test_evm_config_chain_spec() {
+        let chain_spec = n42_dev_chainspec();
+        let config = N42EvmConfig::new(chain_spec.clone());
+
+        // chain_spec() should return the same Arc
+        assert!(
+            Arc::ptr_eq(config.chain_spec(), &chain_spec),
+            "chain_spec should return the same Arc"
+        );
+    }
+
+    #[test]
+    fn test_evm_config_inner() {
+        let chain_spec = n42_dev_chainspec();
+        let config = N42EvmConfig::new(chain_spec);
+
+        // inner() should return a reference to the inner EthEvmConfig
+        let _inner = config.inner();
+        // Just verify it doesn't panic and the inner type is accessible
+    }
+
+    #[test]
+    fn test_evm_config_clone() {
+        let chain_spec = n42_dev_chainspec();
+        let config = N42EvmConfig::new(chain_spec);
+        let cloned = config.clone();
+
+        assert_eq!(
+            cloned.chain_spec().chain().id(),
+            config.chain_spec().chain().id(),
+            "cloned config should have the same chain ID"
+        );
+    }
+
+    #[test]
+    fn test_evm_config_debug() {
+        let chain_spec = n42_dev_chainspec();
+        let config = N42EvmConfig::new(chain_spec);
+
+        let debug_str = format!("{:?}", config);
+        assert!(
+            !debug_str.is_empty(),
+            "Debug output should not be empty"
+        );
+    }
+}

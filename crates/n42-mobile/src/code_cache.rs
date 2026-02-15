@@ -143,3 +143,141 @@ pub struct CacheSyncMessage {
     /// Code hashes that are no longer hot and can be evicted.
     pub evict_hints: Vec<B256>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_primitives::{Bytes, B256};
+
+    /// Helper: creates a B256 hash from a single byte (for readability).
+    fn hash(b: u8) -> B256 {
+        B256::from([b; 32])
+    }
+
+    /// Helper: creates Bytes from a short slice.
+    fn bytecode(data: &[u8]) -> Bytes {
+        Bytes::from(data.to_vec())
+    }
+
+    // ---- CodeCache tests ----
+
+    #[test]
+    fn test_code_cache_insert_and_get() {
+        let mut cache = CodeCache::new(10);
+        let h = hash(1);
+        let code = bytecode(&[0xAA, 0xBB, 0xCC]);
+
+        cache.insert(h, code.clone());
+
+        let retrieved = cache.get(&h).expect("should find the inserted bytecode");
+        assert_eq!(*retrieved, code);
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn test_code_cache_lru_eviction() {
+        let capacity = 3;
+        let mut cache = CodeCache::new(capacity);
+
+        // Insert exactly `capacity` items.
+        for i in 0..capacity {
+            cache.insert(hash(i as u8), bytecode(&[i as u8]));
+        }
+        assert_eq!(cache.len(), capacity);
+
+        // Insert one more (capacity + 1). This should evict hash(0), the oldest.
+        cache.insert(hash(100), bytecode(&[100]));
+        assert_eq!(cache.len(), capacity);
+
+        // hash(0) should have been evicted.
+        assert!(!cache.contains(&hash(0)), "oldest entry should be evicted");
+
+        // The others should still be present.
+        assert!(cache.contains(&hash(1)));
+        assert!(cache.contains(&hash(2)));
+        assert!(cache.contains(&hash(100)));
+    }
+
+    #[test]
+    fn test_code_cache_contains() {
+        let mut cache = CodeCache::new(10);
+        let h = hash(5);
+
+        assert!(!cache.contains(&h), "empty cache should not contain any key");
+
+        cache.insert(h, bytecode(&[0x01]));
+        assert!(cache.contains(&h), "cache should contain the inserted key");
+
+        assert!(!cache.contains(&hash(99)), "cache should not contain a key that was never inserted");
+    }
+
+    #[test]
+    fn test_code_cache_cached_hashes() {
+        let mut cache = CodeCache::new(10);
+
+        assert!(cache.cached_hashes().is_empty(), "empty cache returns empty hashes");
+
+        let hashes_to_insert = vec![hash(10), hash(20), hash(30)];
+        for h in &hashes_to_insert {
+            cache.insert(*h, bytecode(&[0xFF]));
+        }
+
+        let mut cached = cache.cached_hashes();
+        cached.sort();
+        let mut expected = hashes_to_insert.clone();
+        expected.sort();
+
+        assert_eq!(cached, expected, "cached_hashes should return all inserted hashes");
+    }
+
+    // ---- HotContractTracker tests ----
+
+    #[test]
+    fn test_hot_contract_tracker_basic() {
+        let mut tracker = HotContractTracker::new();
+
+        // Record accesses over multiple blocks.
+        tracker.record_block_accesses(&[hash(1), hash(2), hash(3)]);
+        tracker.record_block_accesses(&[hash(1), hash(2)]);
+        tracker.record_block_accesses(&[hash(1)]);
+
+        assert_eq!(tracker.blocks_tracked(), 3);
+
+        let top = tracker.top_contracts(5);
+
+        // hash(1) was accessed 3 times, hash(2) twice, hash(3) once.
+        assert_eq!(top.len(), 3);
+        assert_eq!(top[0], (hash(1), 3));
+        assert_eq!(top[1], (hash(2), 2));
+        assert_eq!(top[2], (hash(3), 1));
+
+        // top_contracts with n=1 should return only the hottest.
+        let top1 = tracker.top_contracts(1);
+        assert_eq!(top1.len(), 1);
+        assert_eq!(top1[0], (hash(1), 3));
+    }
+
+    #[test]
+    fn test_hot_contract_tracker_decay() {
+        let mut tracker = HotContractTracker::new();
+
+        // hash(1): 10 accesses, hash(2): 1 access.
+        for _ in 0..10 {
+            tracker.record_block_accesses(&[hash(1)]);
+        }
+        tracker.record_block_accesses(&[hash(2)]);
+
+        // After decay(0.5), hash(1) should have 5, hash(2) should have 0 and be removed.
+        tracker.decay(0.5);
+
+        let top = tracker.top_contracts(10);
+
+        // hash(2) had count 1, after * 0.5 → 0.5 truncated to 0 → removed.
+        // hash(1) had count 10, after * 0.5 → 5.
+        let hash1_entry = top.iter().find(|(h, _)| *h == hash(1));
+        assert_eq!(hash1_entry, Some(&(hash(1), 5)), "hash(1) count should be halved to 5");
+
+        let hash2_entry = top.iter().find(|(h, _)| *h == hash(2));
+        assert!(hash2_entry.is_none(), "hash(2) should be removed after decay (count went to 0)");
+    }
+}

@@ -96,6 +96,12 @@ impl VoteCollector {
             })?;
             valid_sigs.push(sig);
             valid_pks.push(pk);
+            if idx as usize >= self.set_size as usize {
+                return Err(ConsensusError::UnknownValidator {
+                    index: idx,
+                    set_size: self.set_size,
+                });
+            }
             signers.set(idx as usize, true);
         }
 
@@ -190,6 +196,12 @@ impl TimeoutCollector {
                 }
             })?;
             valid_sigs.push(sig);
+            if idx as usize >= self.set_size as usize {
+                return Err(ConsensusError::UnknownValidator {
+                    index: idx,
+                    set_size: self.set_size,
+                });
+            }
             signers.set(idx as usize, true);
 
             // Track highest QC
@@ -273,4 +285,226 @@ pub fn timeout_signing_message(view: ViewNumber) -> Vec<u8> {
     msg.extend_from_slice(b"timeout");
     msg.extend_from_slice(&view.to_le_bytes());
     msg
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_primitives::Address;
+    use n42_chainspec::ValidatorInfo;
+    use n42_primitives::BlsSecretKey;
+
+    /// Helper: create a test validator set of size `n` along with the secret keys.
+    fn test_validator_set(n: usize) -> (Vec<BlsSecretKey>, ValidatorSet) {
+        let sks: Vec<_> = (0..n).map(|_| BlsSecretKey::random().unwrap()).collect();
+        let infos: Vec<_> = sks
+            .iter()
+            .enumerate()
+            .map(|(i, sk)| ValidatorInfo {
+                address: Address::with_last_byte(i as u8),
+                bls_public_key: sk.public_key(),
+            })
+            .collect();
+        let f = ((n as u32).saturating_sub(1)) / 3;
+        let vs = ValidatorSet::new(&infos, f);
+        (sks, vs)
+    }
+
+    #[test]
+    fn test_vote_collector_basic() {
+        let (sks, vs) = test_validator_set(4);
+        let view = 1u64;
+        let block_hash = B256::repeat_byte(0xBB);
+        let mut collector = VoteCollector::new(view, block_hash, vs.len());
+
+        assert_eq!(collector.vote_count(), 0, "initially no votes");
+        assert!(!collector.has_quorum(vs.quorum_size()), "no quorum with 0 votes");
+
+        // Add 3 votes (quorum = 2*1+1 = 3 for n=4)
+        let msg = signing_message(view, &block_hash);
+        for i in 0..3u32 {
+            let sig = sks[i as usize].sign(&msg);
+            collector.add_vote(i, sig).expect("adding vote should succeed");
+        }
+
+        assert_eq!(collector.vote_count(), 3, "should have 3 votes");
+        assert!(collector.has_quorum(vs.quorum_size()), "should have quorum with 3 votes");
+    }
+
+    #[test]
+    fn test_vote_collector_duplicate() {
+        let (sks, vs) = test_validator_set(4);
+        let view = 1u64;
+        let block_hash = B256::repeat_byte(0xCC);
+        let mut collector = VoteCollector::new(view, block_hash, vs.len());
+
+        let msg = signing_message(view, &block_hash);
+        let sig = sks[0].sign(&msg);
+
+        // First vote succeeds
+        collector.add_vote(0, sig.clone()).expect("first vote should succeed");
+
+        // Duplicate vote should fail
+        let sig2 = sks[0].sign(&msg);
+        let result = collector.add_vote(0, sig2);
+        assert!(result.is_err(), "duplicate vote should return error");
+
+        // Verify it's specifically a DuplicateVote error
+        match result.unwrap_err() {
+            ConsensusError::DuplicateVote {
+                view: v,
+                validator_index: idx,
+            } => {
+                assert_eq!(v, view);
+                assert_eq!(idx, 0);
+            }
+            other => panic!("expected DuplicateVote error, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_build_qc_and_verify() {
+        let (sks, vs) = test_validator_set(4);
+        let view = 5u64;
+        let block_hash = B256::repeat_byte(0xDD);
+        let mut collector = VoteCollector::new(view, block_hash, vs.len());
+
+        // Sign with 3 validators (indices 0, 1, 2) to meet quorum of 3
+        let msg = signing_message(view, &block_hash);
+        for i in 0..3u32 {
+            let sig = sks[i as usize].sign(&msg);
+            collector.add_vote(i, sig).unwrap();
+        }
+
+        // Build QC should succeed
+        let qc = collector.build_qc(&vs).expect("build_qc should succeed");
+        assert_eq!(qc.view, view, "QC view should match");
+        assert_eq!(qc.block_hash, block_hash, "QC block_hash should match");
+        assert_eq!(qc.signer_count(), 3, "QC should have 3 signers");
+
+        // Verify signers bitmap: bits 0, 1, 2 set; bit 3 unset
+        assert!(qc.signers[0], "signer 0 should be set");
+        assert!(qc.signers[1], "signer 1 should be set");
+        assert!(qc.signers[2], "signer 2 should be set");
+        assert!(!qc.signers[3], "signer 3 should not be set");
+
+        // verify_qc should succeed
+        verify_qc(&qc, &vs).expect("verify_qc should succeed for valid QC");
+    }
+
+    #[test]
+    fn test_verify_qc_insufficient_signers() {
+        let (sks, vs) = test_validator_set(4);
+        let view = 10u64;
+        let block_hash = B256::repeat_byte(0xEE);
+
+        // Build a QC with only 1 signer (quorum requires 3)
+        let msg = signing_message(view, &block_hash);
+        let sig = sks[0].sign(&msg);
+        let agg_sig =
+            n42_primitives::bls::AggregateSignature::aggregate(&[&sig]).unwrap();
+
+        let qc = QuorumCertificate {
+            view,
+            block_hash,
+            aggregate_signature: agg_sig,
+            signers: {
+                let mut bv = bitvec![u8, Msb0; 0; 4];
+                bv.set(0, true);
+                bv
+            },
+        };
+
+        let result = verify_qc(&qc, &vs);
+        assert!(result.is_err(), "verify_qc should fail with insufficient signers");
+
+        match result.unwrap_err() {
+            ConsensusError::InvalidQC { view: v, reason } => {
+                assert_eq!(v, view);
+                assert!(
+                    reason.contains("insufficient signers"),
+                    "error reason should mention insufficient signers, got: {}",
+                    reason
+                );
+            }
+            other => panic!("expected InvalidQC error, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_signing_message() {
+        let view: ViewNumber = 42;
+        let block_hash = B256::repeat_byte(0xFF);
+
+        let msg = signing_message(view, &block_hash);
+
+        // Should be 8 bytes (view LE) + 32 bytes (block hash) = 40 bytes
+        assert_eq!(msg.len(), 40, "signing message should be 40 bytes");
+
+        // First 8 bytes: view 42 in little-endian
+        assert_eq!(&msg[..8], &42u64.to_le_bytes(), "first 8 bytes should be view in LE");
+
+        // Last 32 bytes: block hash
+        assert_eq!(
+            &msg[8..],
+            block_hash.as_slice(),
+            "last 32 bytes should be block hash"
+        );
+    }
+
+    #[test]
+    fn test_timeout_signing_message() {
+        let view: ViewNumber = 99;
+        let msg = timeout_signing_message(view);
+
+        // Should be 7 bytes ("timeout") + 8 bytes (view LE) = 15 bytes
+        assert_eq!(msg.len(), 15, "timeout signing message should be 15 bytes");
+
+        // First 7 bytes: "timeout"
+        assert_eq!(&msg[..7], b"timeout", "should start with 'timeout'");
+
+        // Last 8 bytes: view in LE
+        assert_eq!(
+            &msg[7..],
+            &99u64.to_le_bytes(),
+            "last 8 bytes should be view in LE"
+        );
+    }
+
+    #[test]
+    fn test_commit_signing_message_format() {
+        let view: ViewNumber = 7;
+        let block_hash = B256::repeat_byte(0x11);
+        let msg = commit_signing_message(view, &block_hash);
+
+        // Should be 6 bytes ("commit") + 8 bytes (view LE) + 32 bytes (block hash) = 46 bytes
+        assert_eq!(msg.len(), 46, "commit signing message should be 46 bytes");
+        assert_eq!(&msg[..6], b"commit", "should start with 'commit'");
+        assert_eq!(&msg[6..14], &7u64.to_le_bytes(), "view bytes should match");
+        assert_eq!(&msg[14..], block_hash.as_slice(), "block hash should match");
+    }
+
+    #[test]
+    fn test_build_qc_insufficient_votes() {
+        let (sks, vs) = test_validator_set(4);
+        let view = 1u64;
+        let block_hash = B256::repeat_byte(0xAA);
+        let mut collector = VoteCollector::new(view, block_hash, vs.len());
+
+        // Add only 1 vote (quorum is 3)
+        let msg = signing_message(view, &block_hash);
+        let sig = sks[0].sign(&msg);
+        collector.add_vote(0, sig).unwrap();
+
+        let result = collector.build_qc(&vs);
+        assert!(result.is_err(), "build_qc should fail with insufficient votes");
+
+        match result.unwrap_err() {
+            ConsensusError::InsufficientVotes { have, need, .. } => {
+                assert_eq!(have, 1);
+                assert_eq!(need, 3);
+            }
+            other => panic!("expected InsufficientVotes, got: {:?}", other),
+        }
+    }
 }

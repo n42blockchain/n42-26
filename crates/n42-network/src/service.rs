@@ -8,7 +8,7 @@ use crate::error::NetworkError;
 use crate::gossipsub::handlers::{
     decode_consensus_message, encode_consensus_message, validate_message,
 };
-use crate::gossipsub::topics::{block_announce_topic, consensus_topic};
+use crate::gossipsub::topics::{block_announce_topic, consensus_topic, verification_receipts_topic};
 use crate::transport::{N42Behaviour, N42BehaviourEvent};
 
 /// Commands sent to the network service from the node layer.
@@ -35,6 +35,11 @@ pub enum NetworkEvent {
         source: PeerId,
         data: Vec<u8>,
     },
+    /// A verification receipt received from a peer.
+    VerificationReceipt {
+        source: PeerId,
+        data: Vec<u8>,
+    },
     /// A new peer connected.
     PeerConnected(PeerId),
     /// A peer disconnected.
@@ -51,6 +56,11 @@ pub struct NetworkHandle {
 }
 
 impl NetworkHandle {
+    /// Creates a new `NetworkHandle` from a command channel sender.
+    pub fn new(command_tx: mpsc::UnboundedSender<NetworkCommand>) -> Self {
+        Self { command_tx }
+    }
+
     /// Broadcasts a consensus message to the GossipSub network.
     pub fn broadcast_consensus(&self, msg: ConsensusMessage) -> Result<(), NetworkError> {
         self.command_tx
@@ -90,6 +100,8 @@ pub struct NetworkService {
     event_tx: mpsc::UnboundedSender<NetworkEvent>,
     /// Topic hash for the consensus topic (cached for validation).
     consensus_topic_hash: gossipsub::TopicHash,
+    /// Topic hash for the block announcement topic (cached for routing).
+    block_announce_topic_hash: gossipsub::TopicHash,
 }
 
 impl NetworkService {
@@ -108,6 +120,7 @@ impl NetworkService {
         // Subscribe to GossipSub topics
         let consensus = consensus_topic();
         let block_announce = block_announce_topic();
+        let verification = verification_receipts_topic();
 
         swarm
             .behaviour_mut()
@@ -119,8 +132,14 @@ impl NetworkService {
             .gossipsub
             .subscribe(&block_announce)
             .map_err(|e| NetworkError::Subscribe(e.to_string()))?;
+        swarm
+            .behaviour_mut()
+            .gossipsub
+            .subscribe(&verification)
+            .map_err(|e| NetworkError::Subscribe(e.to_string()))?;
 
         let consensus_topic_hash = consensus.hash();
+        let block_announce_topic_hash = block_announce.hash();
 
         let handle = NetworkHandle { command_tx };
 
@@ -129,6 +148,7 @@ impl NetworkService {
             command_rx,
             event_tx,
             consensus_topic_hash,
+            block_announce_topic_hash,
         };
 
         Ok((service, handle, event_rx))
@@ -248,9 +268,15 @@ impl NetworkService {
                     tracing::warn!(%source, error = %e, "failed to decode consensus message");
                 }
             }
-        } else {
-            // Block announcement or other topic
+        } else if message.topic == self.block_announce_topic_hash {
+            // Block announcement
             let _ = self.event_tx.send(NetworkEvent::BlockAnnouncement {
+                source,
+                data: message.data,
+            });
+        } else {
+            // Verification receipts or unknown topic
+            let _ = self.event_tx.send(NetworkEvent::VerificationReceipt {
                 source,
                 data: message.data,
             });

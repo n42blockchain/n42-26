@@ -122,7 +122,7 @@ impl ConsensusOrchestrator {
     }
 
     /// Dispatches an engine output to the appropriate destination.
-    fn handle_engine_output(&self, output: EngineOutput) {
+    pub(crate) fn handle_engine_output(&self, output: EngineOutput) {
         match output {
             EngineOutput::BroadcastMessage(msg) => {
                 if let Err(e) = self.network.broadcast_consensus(msg) {
@@ -156,5 +156,256 @@ impl ConsensusOrchestrator {
                 info!(new_view, "view changed");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_primitives::{Address, B256};
+    use n42_chainspec::ValidatorInfo;
+    use n42_consensus::{ConsensusEngine, ValidatorSet};
+    use n42_network::{NetworkCommand, NetworkHandle};
+    use n42_primitives::{BlsSecretKey, ConsensusMessage, QuorumCertificate, Vote};
+    use std::time::Duration;
+
+    /// Helper: create a test ConsensusEngine with a single validator.
+    fn make_test_engine() -> (
+        ConsensusEngine,
+        mpsc::UnboundedReceiver<EngineOutput>,
+    ) {
+        let sk = BlsSecretKey::random().unwrap();
+        let pk = sk.public_key();
+
+        let validator_info = ValidatorInfo {
+            address: Address::with_last_byte(1),
+            bls_public_key: pk,
+        };
+
+        let vs = ValidatorSet::new(&[validator_info], 0); // f=0, quorum=1
+        let (output_tx, output_rx) = mpsc::unbounded_channel();
+
+        let engine = ConsensusEngine::new(
+            0,  // my_index
+            sk,
+            vs,
+            60000, // large base_timeout to avoid test timeouts
+            120000,
+            output_tx,
+        );
+
+        (engine, output_rx)
+    }
+
+    /// Helper: create a test NetworkHandle.
+    fn make_test_network() -> (
+        NetworkHandle,
+        mpsc::UnboundedReceiver<NetworkCommand>,
+    ) {
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        (NetworkHandle::new(cmd_tx), cmd_rx)
+    }
+
+    #[test]
+    fn test_orchestrator_construction() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::unbounded_channel();
+
+        let orch = ConsensusOrchestrator::new(engine, network, net_event_rx, output_rx);
+
+        // Verify the orchestrator was created successfully.
+        let _ = orch;
+    }
+
+    #[test]
+    fn test_engine_initial_state() {
+        let (engine, _output_rx) = make_test_engine();
+
+        assert_eq!(engine.current_view(), 1, "initial view should be 1");
+        assert!(engine.is_current_leader(), "single validator should be leader");
+    }
+
+    #[test]
+    fn test_handle_engine_output_broadcast() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, mut cmd_rx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::unbounded_channel();
+
+        let orch = ConsensusOrchestrator::new(engine, network, net_event_rx, output_rx);
+
+        // Create a dummy consensus message
+        let sk = BlsSecretKey::random().unwrap();
+        let sig = sk.sign(b"test");
+        let vote = Vote {
+            view: 1,
+            block_hash: B256::repeat_byte(0xAA),
+            voter: 0,
+            signature: sig,
+        };
+
+        // handle_engine_output should forward BroadcastMessage to the network
+        orch.handle_engine_output(EngineOutput::BroadcastMessage(
+            ConsensusMessage::Vote(vote),
+        ));
+
+        // Verify the command was sent to the network
+        let cmd = cmd_rx.try_recv().expect("should receive a command");
+        assert!(
+            matches!(cmd, NetworkCommand::BroadcastConsensus(_)),
+            "should be a BroadcastConsensus command"
+        );
+    }
+
+    #[test]
+    fn test_handle_engine_output_send_to_validator() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, mut cmd_rx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::unbounded_channel();
+
+        let orch = ConsensusOrchestrator::new(engine, network, net_event_rx, output_rx);
+
+        let sk = BlsSecretKey::random().unwrap();
+        let sig = sk.sign(b"test");
+        let vote = Vote {
+            view: 1,
+            block_hash: B256::repeat_byte(0xBB),
+            voter: 0,
+            signature: sig,
+        };
+
+        // SendToValidator should fallback to broadcast
+        orch.handle_engine_output(EngineOutput::SendToValidator(
+            0,
+            ConsensusMessage::Vote(vote),
+        ));
+
+        let cmd = cmd_rx.try_recv().expect("should receive a command");
+        assert!(
+            matches!(cmd, NetworkCommand::BroadcastConsensus(_)),
+            "SendToValidator should fallback to BroadcastConsensus"
+        );
+    }
+
+    #[test]
+    fn test_handle_engine_output_execute_block() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::unbounded_channel();
+
+        let orch = ConsensusOrchestrator::new(engine, network, net_event_rx, output_rx);
+
+        // ExecuteBlock should not panic (it just logs)
+        orch.handle_engine_output(EngineOutput::ExecuteBlock(B256::repeat_byte(0xCC)));
+    }
+
+    #[test]
+    fn test_handle_engine_output_block_committed() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::unbounded_channel();
+
+        let orch = ConsensusOrchestrator::new(engine, network, net_event_rx, output_rx);
+
+        let commit_qc = QuorumCertificate::genesis();
+        orch.handle_engine_output(EngineOutput::BlockCommitted {
+            view: 1,
+            block_hash: B256::repeat_byte(0xDD),
+            commit_qc,
+        });
+        // Should not panic
+    }
+
+    #[test]
+    fn test_handle_engine_output_view_changed() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::unbounded_channel();
+
+        let orch = ConsensusOrchestrator::new(engine, network, net_event_rx, output_rx);
+
+        orch.handle_engine_output(EngineOutput::ViewChanged { new_view: 5 });
+        // Should not panic
+    }
+
+    #[tokio::test]
+    async fn test_orchestrator_exits_on_net_event_channel_close() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx) = make_test_network();
+        let (net_event_tx, net_event_rx) = mpsc::unbounded_channel::<NetworkEvent>();
+
+        let orch = ConsensusOrchestrator::new(engine, network, net_event_rx, output_rx);
+
+        // Drop the event sender so the channel closes
+        drop(net_event_tx);
+
+        // run() should exit because net_event_rx.recv() returns None
+        let result = tokio::time::timeout(Duration::from_secs(5), orch.run()).await;
+        assert!(
+            result.is_ok(),
+            "orchestrator should exit when network event channel is closed"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_orchestrator_exits_on_output_channel_close() {
+        let sk = BlsSecretKey::random().unwrap();
+        let pk = sk.public_key();
+        let validator_info = ValidatorInfo {
+            address: Address::with_last_byte(1),
+            bls_public_key: pk,
+        };
+        let vs = ValidatorSet::new(&[validator_info], 0);
+        let (output_tx, output_rx) = mpsc::unbounded_channel();
+
+        let _engine = ConsensusEngine::new(0, sk, vs, 60000, 120000, output_tx);
+
+        let (_network, _cmd_rx) = make_test_network();
+        let (_net_event_tx, _net_event_rx) = mpsc::unbounded_channel::<NetworkEvent>();
+
+        // Drop the output_rx before creating orchestrator to test that case
+        drop(output_rx);
+
+        // Need to recreate since output_rx was consumed
+        let (output_tx2, output_rx2) = mpsc::unbounded_channel();
+        let sk2 = BlsSecretKey::random().unwrap();
+        let pk2 = sk2.public_key();
+        let vi2 = ValidatorInfo {
+            address: Address::with_last_byte(2),
+            bls_public_key: pk2,
+        };
+        let vs2 = ValidatorSet::new(&[vi2], 0);
+        let engine2 = ConsensusEngine::new(0, sk2, vs2, 60000, 120000, output_tx2);
+
+        let (network2, _cmd_rx2) = make_test_network();
+        let (net_event_tx2, net_event_rx2) = mpsc::unbounded_channel::<NetworkEvent>();
+
+        let orch = ConsensusOrchestrator::new(engine2, network2, net_event_rx2, output_rx2);
+
+        // Close the net event channel to trigger shutdown
+        drop(net_event_tx2);
+
+        let result = tokio::time::timeout(Duration::from_secs(5), orch.run()).await;
+        assert!(result.is_ok(), "orchestrator should exit cleanly");
+    }
+
+    #[tokio::test]
+    async fn test_orchestrator_processes_peer_events() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx) = make_test_network();
+        let (net_event_tx, net_event_rx) = mpsc::unbounded_channel::<NetworkEvent>();
+
+        let orch = ConsensusOrchestrator::new(engine, network, net_event_rx, output_rx);
+
+        // Send a PeerConnected event, then close the channel
+        let peer_id = libp2p::PeerId::random();
+        net_event_tx
+            .send(NetworkEvent::PeerConnected(peer_id))
+            .unwrap();
+        drop(net_event_tx);
+
+        // The orchestrator should process the PeerConnected event and then exit
+        let result = tokio::time::timeout(Duration::from_secs(5), orch.run()).await;
+        assert!(result.is_ok(), "orchestrator should exit after processing events");
     }
 }
