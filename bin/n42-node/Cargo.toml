@@ -1,0 +1,15 @@
+[package]
+name = "n42-node-bin"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "N42 blockchain node binary"
+
+[[bin]]
+name = "n42-node"
+path = "src/main.rs"
+
+[dependencies]
+n42-node.workspace = true
+n42-chainspec.workspace = true

@@ -1,0 +1,20 @@
+[package]
+name = "n42-chainspec"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "N42 chain specification with consensus parameters"
+
+[dependencies]
+n42-primitives.workspace = true
+
+reth-chainspec.workspace = true
+reth-ethereum-primitives.workspace = true
+reth-primitives-traits.workspace = true
+
+alloy-consensus = { workspace = true, features = ["serde"] }
+alloy-genesis.workspace = true
+alloy-primitives.workspace = true
+
+serde.workspace = true

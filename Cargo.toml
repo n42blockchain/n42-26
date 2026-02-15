@@ -1,0 +1,98 @@
+[workspace]
+members = [
+    "bin/n42-node",
+    "crates/n42-primitives",
+    "crates/n42-chainspec",
+    "crates/n42-consensus",
+    "crates/n42-execution",
+    "crates/n42-mobile",
+    "crates/n42-network",
+    "crates/n42-node",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.86"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+# Internal crates
+n42-primitives = { path = "crates/n42-primitives" }
+n42-chainspec = { path = "crates/n42-chainspec" }
+n42-consensus = { path = "crates/n42-consensus" }
+n42-execution = { path = "crates/n42-execution" }
+n42-mobile = { path = "crates/n42-mobile" }
+n42-network = { path = "crates/n42-network" }
+n42-node = { path = "crates/n42-node" }
+
+# reth dependencies (local path)
+reth-chainspec = { path = "../reth/crates/chainspec" }
+reth-consensus = { path = "../reth/crates/consensus/consensus" }
+reth-db = { path = "../reth/crates/storage/db" }
+reth-db-api = { path = "../reth/crates/storage/db-api" }
+reth-ethereum-consensus = { path = "../reth/crates/ethereum/consensus" }
+reth-ethereum-engine-primitives = { path = "../reth/crates/ethereum/engine-primitives" }
+reth-ethereum-primitives = { path = "../reth/crates/ethereum/primitives" }
+reth-evm = { path = "../reth/crates/evm/evm" }
+reth-evm-ethereum = { path = "../reth/crates/ethereum/evm" }
+reth-execution-types = { path = "../reth/crates/evm/execution-types" }
+reth-node-api = { path = "../reth/crates/node/api" }
+reth-node-builder = { path = "../reth/crates/node/builder" }
+reth-node-ethereum = { path = "../reth/crates/ethereum/node" }
+reth-node-types = { path = "../reth/crates/node/types" }
+reth-payload-builder = { path = "../reth/crates/payload/builder" }
+reth-primitives-traits = { path = "../reth/crates/primitives-traits" }
+reth-provider = { path = "../reth/crates/storage/provider" }
+reth-revm = { path = "../reth/crates/revm" }
+reth-tasks = { path = "../reth/crates/tasks" }
+reth-tracing = { path = "../reth/crates/tracing" }
+reth-storage-errors = { path = "../reth/crates/storage/errors" }
+reth-trie-common = { path = "../reth/crates/trie/common" }
+reth-trie-sparse = { path = "../reth/crates/trie/sparse" }
+reth-network-api = { path = "../reth/crates/net/network-api" }
+
+# Alloy
+alloy-consensus = { version = "1.0", default-features = false }
+alloy-eips = { version = "1.0", default-features = false }
+alloy-primitives = { version = "1.0", default-features = false, features = ["serde"] }
+alloy-rlp = { version = "0.3", default-features = false }
+alloy-genesis = { version = "1.0", default-features = false }
+alloy-rpc-types-engine = { version = "1.0", default-features = false }
+
+# EVM
+alloy-evm = { version = "0.27.2", default-features = false }
+revm = { version = "34.0.0", default-features = false, features = ["std"] }
+
+# Crypto
+blst = "0.3"
+bitvec = { version = "1.0", features = ["serde"] }
+ed25519-dalek = { version = "2", features = ["serde", "rand_core"] }
+
+# Caching
+lru = "0.12"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+bincode = "1.3"
+
+# Async
+tokio = { version = "1.0", features = ["full"] }
+
+# Error handling
+eyre = "0.6"
+thiserror = "2.0"
+
+# Logging
+tracing = "0.1"
+
+# Networking
+libp2p = { version = "0.54", features = ["gossipsub", "tokio", "quic", "identify", "macros"] }
+quinn = "0.11"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rcgen = "0.13"
+
+# Misc
+auto_impl = "1.0"
+derive_more = { version = "1.0", features = ["display"] }
