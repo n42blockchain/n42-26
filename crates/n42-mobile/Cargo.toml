@@ -1,0 +1,26 @@
+[package]
+name = "n42-mobile"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+# Primitives
+alloy-primitives.workspace = true
+
+# Crypto
+ed25519-dalek.workspace = true
+
+# Caching
+lru.workspace = true
+
+# Serialization
+serde.workspace = true
+bincode.workspace = true
+
+# Error handling
+thiserror.workspace = true
+
+# Logging
+tracing.workspace = true
