@@ -11,6 +11,7 @@ n42-primitives.workspace = true
 n42-chainspec.workspace = true
 n42-consensus.workspace = true
 n42-execution.workspace = true
+n42-network.workspace = true
 
 reth-chainspec.workspace = true
 reth-consensus.workspace = true

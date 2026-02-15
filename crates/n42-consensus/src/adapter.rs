@@ -3,11 +3,13 @@ use reth_consensus::{Consensus, ConsensusError, FullConsensus, HeaderValidator};
 use reth_ethereum_consensus::EthBeaconConsensus;
 use reth_execution_types::BlockExecutionResult;
 use reth_primitives_traits::{
-    Block, BlockHeader, NodePrimitives, RecoveredBlock, SealedBlock, SealedHeader,
+    AlloyBlockHeader, Block, BlockHeader, NodePrimitives, RecoveredBlock, SealedBlock, SealedHeader,
 };
 use std::fmt::Debug;
 use std::sync::Arc;
 
+use crate::extra_data::extract_qc_from_extra_data;
+use crate::protocol::quorum::verify_qc;
 use crate::validator::ValidatorSet;
 
 /// N42 consensus adapter that integrates with the reth node builder.
@@ -75,15 +77,20 @@ where
             receipt_root_bloom,
         )?;
 
-        // TODO (Phase 6): Extract QC from block extra_data and verify it
-        // against the validator set. For now, we skip QC validation because:
-        // 1. The consensus engine hasn't started producing blocks with QCs yet
-        // 2. During sync, we need the validator set which requires chain state
-        //
-        // if let Some(ref vs) = self.validator_set {
-        //     let qc = extract_qc_from_header(block.header())?;
-        //     verify_qc(&qc, vs).map_err(|e| ConsensusError::Other(e.to_string()))?;
-        // }
+        // Extract and verify QC from block extra_data.
+        // If the validator set is loaded and the header contains a QC,
+        // verify the aggregate BLS signature against the signer public keys.
+        if let Some(ref vs) = self.validator_set {
+            let extra_data = block.header().extra_data();
+            if let Some(qc) = extract_qc_from_extra_data(extra_data)? {
+                verify_qc(&qc, vs).map_err(|e| {
+                    ConsensusError::Other(e.to_string())
+                })?;
+            }
+            // No QC in extra_data is acceptable for:
+            // - Genesis block (view 0)
+            // - Blocks during initial sync before consensus engine activation
+        }
 
         Ok(())
     }

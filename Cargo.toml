@@ -52,6 +52,7 @@ reth-storage-errors = { path = "../reth/crates/storage/errors" }
 reth-trie-common = { path = "../reth/crates/trie/common" }
 reth-trie-sparse = { path = "../reth/crates/trie/sparse" }
 reth-network-api = { path = "../reth/crates/net/network-api" }
+reth-ethereum-cli = { path = "../reth/crates/ethereum/cli" }
 
 # Alloy
 alloy-consensus = { version = "1.0", default-features = false }
