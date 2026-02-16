@@ -8,6 +8,7 @@ members = [
     "crates/n42-mobile",
     "crates/n42-network",
     "crates/n42-node",
+    "tests/e2e",
 ]
 resolver = "2"
 
@@ -71,6 +72,13 @@ alloy-rlp = { version = "0.3", default-features = false }
 alloy-genesis = { version = "1.0", default-features = false }
 alloy-rpc-types-engine = { version = "1.0", default-features = false }
 
+# Alloy signing & network
+alloy-signer = { version = "1.0", default-features = false }
+alloy-signer-local = { version = "1.0", default-features = false }
+alloy-network = { version = "1.0", default-features = false }
+alloy-rpc-types-eth = { version = "1.0", default-features = false }
+alloy-sol-types = { version = "1.0", default-features = false }
+
 # EVM
 alloy-evm = { version = "0.27.2", default-features = false }
 revm = { version = "34.0.0", default-features = false, features = ["std"] }
@@ -111,6 +119,9 @@ arc-swap = "1.7"
 
 # Encoding
 hex = "0.4"
+
+# Random
+rand = "0.8"
 
 # Misc
 auto_impl = "1.0"

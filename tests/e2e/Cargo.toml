@@ -1,0 +1,67 @@
+[package]
+name = "e2e-test"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "N42 end-to-end integration tests"
+
+[[bin]]
+name = "e2e-test"
+path = "src/main.rs"
+
+[dependencies]
+# Internal crates
+n42-primitives = { path = "../../crates/n42-primitives" }
+n42-chainspec = { path = "../../crates/n42-chainspec" }
+
+# Alloy
+alloy-primitives.workspace = true
+alloy-consensus.workspace = true
+alloy-signer.workspace = true
+alloy-signer-local.workspace = true
+alloy-network.workspace = true
+alloy-genesis.workspace = true
+alloy-sol-types.workspace = true
+alloy-rlp.workspace = true
+alloy-eips.workspace = true
+
+# HTTP client
+reqwest = { version = "0.12", features = ["json"] }
+
+# WebSocket
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+futures-util = "0.3"
+
+# Serialization
+serde.workspace = true
+serde_json = "1.0"
+
+# Async
+tokio.workspace = true
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Temp files
+tempfile = "3"
+
+# Random
+rand.workspace = true
+
+# Encoding
+hex.workspace = true
+
+# Logging
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# BLS crypto
+blst.workspace = true
+
+# Error handling
+eyre.workspace = true
+
+# Unix process management
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

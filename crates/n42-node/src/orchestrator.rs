@@ -10,6 +10,7 @@ use reth_payload_primitives::{EngineApiMessageVersion, PayloadKind};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
+use tokio::time::Instant;
 use tracing::{debug, error, info, warn};
 
 /// Bridges the consensus engine with the P2P network layer and reth Engine API.
@@ -44,6 +45,11 @@ pub struct ConsensusOrchestrator {
     block_ready_rx: mpsc::UnboundedReceiver<B256>,
     /// Fee recipient address for payload attributes.
     fee_recipient: Address,
+    /// Minimum interval between consecutive block builds.
+    /// When zero, blocks are built immediately (legacy behavior).
+    block_interval: Duration,
+    /// Scheduled time for the next payload build (set when block_interval > 0).
+    next_build_at: Option<Instant>,
 }
 
 impl ConsensusOrchestrator {
@@ -68,6 +74,8 @@ impl ConsensusOrchestrator {
             block_ready_tx,
             block_ready_rx,
             fee_recipient: Address::ZERO,
+            block_interval: Duration::ZERO,
+            next_build_at: None,
         }
     }
 
@@ -84,6 +92,18 @@ impl ConsensusOrchestrator {
         fee_recipient: Address,
     ) -> Self {
         let (block_ready_tx, block_ready_rx) = mpsc::unbounded_channel();
+
+        // Read block interval from environment variable (default: 0 = immediate).
+        let block_interval_ms: u64 = std::env::var("N42_BLOCK_INTERVAL_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let block_interval = Duration::from_millis(block_interval_ms);
+
+        if block_interval_ms > 0 {
+            info!(interval_ms = block_interval_ms, "block build interval configured");
+        }
+
         Self {
             engine,
             network,
@@ -96,6 +116,8 @@ impl ConsensusOrchestrator {
             block_ready_tx,
             block_ready_rx,
             fee_recipient,
+            block_interval,
+            next_build_at: None,
         }
     }
 
@@ -115,12 +137,22 @@ impl ConsensusOrchestrator {
         // This kicks off the genesis block production cycle.
         if self.engine.is_current_leader() && self.beacon_engine.is_some() {
             info!("this node is leader for view 1, triggering genesis payload build");
-            self.trigger_payload_build().await;
+            self.schedule_payload_build().await;
         }
 
         loop {
             let timeout = self.engine.pacemaker().timeout_sleep();
             tokio::pin!(timeout);
+
+            // Copy the deadline so the async block doesn't borrow self.
+            let next_build_deadline = self.next_build_at;
+            let build_timer = async {
+                match next_build_deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::pin!(build_timer);
 
             tokio::select! {
                 // Branch 1: Pacemaker timeout -> trigger view change
@@ -183,7 +215,31 @@ impl ConsensusOrchestrator {
                         }
                     }
                 }
+
+                // Branch 5: Scheduled payload build timer fires
+                _ = &mut build_timer => {
+                    self.next_build_at = None;
+                    info!("scheduled block build timer fired, triggering payload build");
+                    self.do_trigger_payload_build().await;
+                }
             }
+        }
+    }
+
+    /// Schedules a payload build, respecting the configured block_interval.
+    ///
+    /// If block_interval > 0, sets `next_build_at` to fire after the interval.
+    /// If block_interval == 0, triggers immediately (legacy behavior).
+    async fn schedule_payload_build(&mut self) {
+        if self.block_interval.is_zero() {
+            self.do_trigger_payload_build().await;
+        } else {
+            let deadline = Instant::now() + self.block_interval;
+            self.next_build_at = Some(deadline);
+            debug!(
+                interval_ms = self.block_interval.as_millis() as u64,
+                "scheduled next payload build"
+            );
         }
     }
 
@@ -191,7 +247,7 @@ impl ConsensusOrchestrator {
     ///
     /// When the payload is ready, a spawned task sends the block hash to
     /// `block_ready_rx`, which feeds it to the consensus engine as BlockReady.
-    async fn trigger_payload_build(&self) {
+    async fn do_trigger_payload_build(&self) {
         let beacon_engine = match &self.beacon_engine {
             Some(e) => e,
             None => {
@@ -353,7 +409,7 @@ impl ConsensusOrchestrator {
                         next_view = self.engine.current_view(),
                         "this node is leader for next view, triggering payload build"
                     );
-                    self.trigger_payload_build().await;
+                    self.schedule_payload_build().await;
                 }
             }
             EngineOutput::ViewChanged { new_view } => {
@@ -363,7 +419,7 @@ impl ConsensusOrchestrator {
                 // the new leader, it should trigger payload building.
                 if self.engine.is_current_leader() {
                     info!(new_view, "became leader after view change, triggering payload build");
-                    self.trigger_payload_build().await;
+                    self.schedule_payload_build().await;
                 }
             }
         }
@@ -593,6 +649,8 @@ mod tests {
             block_ready_tx,
             block_ready_rx,
             fee_recipient: Address::ZERO,
+            block_interval: Duration::ZERO,
+            next_build_at: None,
         };
 
         assert!(state.load_committed_qc().is_none(), "should start with no QC");
@@ -628,6 +686,8 @@ mod tests {
             block_ready_tx: block_ready_tx.clone(),
             block_ready_rx,
             fee_recipient: Address::ZERO,
+            block_interval: Duration::ZERO,
+            next_build_at: None,
         };
 
         // Send a BlockReady hash through the channel.
