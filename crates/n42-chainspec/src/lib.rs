@@ -33,7 +33,7 @@ pub struct ValidatorInfo {
 }
 
 impl ConsensusConfig {
-    /// Create a default dev/test configuration.
+    /// Create a default dev/test configuration (single validator, no preset keys).
     pub fn dev() -> Self {
         Self {
             slot_time_ms: 8000,
@@ -43,6 +43,46 @@ impl ConsensusConfig {
             max_timeout_ms: 8000,
             initial_validators: Vec::new(),
         }
+    }
+
+    /// Create a dev/test configuration with `count` deterministic validators.
+    ///
+    /// Keys are generated deterministically: validator `i` gets a 32-byte secret
+    /// key with value `(i+1)` in big-endian at the last 4 bytes. This matches
+    /// the key generation in `scripts/local-testnet.sh`.
+    pub fn dev_multi(count: usize) -> Self {
+        let mut validators = Vec::with_capacity(count);
+        for i in 0..count {
+            let key_bytes = Self::deterministic_key_bytes(i);
+            let sk = n42_primitives::BlsSecretKey::from_bytes(&key_bytes)
+                .expect("deterministic BLS key should be valid");
+            let pk = sk.public_key();
+            validators.push(ValidatorInfo {
+                address: Address::with_last_byte((i + 1) as u8),
+                bls_public_key: pk,
+            });
+        }
+
+        let f = if count >= 4 { ((count as u32) - 1) / 3 } else { 0 };
+
+        Self {
+            slot_time_ms: 8000,
+            validator_set_size: count as u32,
+            fault_tolerance: f,
+            base_timeout_ms: 4000,
+            max_timeout_ms: 8000,
+            initial_validators: validators,
+        }
+    }
+
+    /// Generate deterministic 32-byte secret key material for validator at `index`.
+    ///
+    /// Matches `scripts/local-testnet.sh`: `printf '%056x%08x' 0 "$((index+1))"`.
+    pub fn deterministic_key_bytes(index: usize) -> [u8; 32] {
+        let mut bytes = [0u8; 32];
+        let val = (index + 1) as u32;
+        bytes[28..32].copy_from_slice(&val.to_be_bytes());
+        bytes
     }
 
     /// Returns the quorum size (2f+1).
@@ -172,6 +212,50 @@ mod tests {
         let mut bad_slot = ConsensusConfig::dev();
         bad_slot.slot_time_ms = 0;
         assert!(bad_slot.validate().is_err(), "should reject zero slot time");
+    }
+
+    #[test]
+    fn test_consensus_config_dev_multi() {
+        let config = ConsensusConfig::dev_multi(3);
+        assert_eq!(config.validator_set_size, 3);
+        assert_eq!(config.fault_tolerance, 0); // 3 < 4, so f=0
+        assert_eq!(config.initial_validators.len(), 3);
+
+        // Keys should be deterministic and distinct.
+        let pk0 = config.initial_validators[0].bls_public_key.to_bytes();
+        let pk1 = config.initial_validators[1].bls_public_key.to_bytes();
+        let pk2 = config.initial_validators[2].bls_public_key.to_bytes();
+        assert_ne!(pk0, pk1);
+        assert_ne!(pk1, pk2);
+
+        // Addresses should match pattern.
+        assert_eq!(config.initial_validators[0].address, Address::with_last_byte(1));
+        assert_eq!(config.initial_validators[1].address, Address::with_last_byte(2));
+    }
+
+    #[test]
+    fn test_consensus_config_dev_multi_4() {
+        let config = ConsensusConfig::dev_multi(4);
+        assert_eq!(config.fault_tolerance, 1); // (4-1)/3 = 1
+        assert_eq!(config.quorum_size(), 3);   // 2*1+1 = 3
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_deterministic_key_bytes() {
+        let k0 = ConsensusConfig::deterministic_key_bytes(0);
+        assert_eq!(k0[31], 1);
+        assert_eq!(k0[30], 0);
+
+        let k1 = ConsensusConfig::deterministic_key_bytes(1);
+        assert_eq!(k1[31], 2);
+
+        // Verify roundtrip: key bytes → secret key → public key → sign/verify.
+        use n42_primitives::BlsSecretKey;
+        let sk = BlsSecretKey::from_bytes(&k0).unwrap();
+        let pk = sk.public_key();
+        let sig = sk.sign(b"test");
+        pk.verify(b"test", &sig).unwrap();
     }
 
     #[test]

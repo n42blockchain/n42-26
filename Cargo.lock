@@ -955,6 +955,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "arc-swap"
+version = "1.8.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f9f3647c145568cec02c42054e07bdf9a5a698e15b466fb2341bfc393cd24aa5"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "ark-bls12-381"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5443,17 +5452,27 @@ name = "n42-node"
 version = "0.1.0"
 dependencies = [
  "alloy-primitives",
+ "alloy-rpc-types-engine",
+ "arc-swap",
+ "async-trait",
  "eyre",
+ "hex",
+ "jsonrpsee",
  "libp2p",
  "n42-chainspec",
  "n42-consensus",
  "n42-execution",
+ "n42-mobile",
  "n42-network",
  "n42-primitives",
+ "reth-basic-payload-builder",
+ "reth-chain-state",
  "reth-chainspec",
  "reth-consensus",
+ "reth-engine-primitives",
  "reth-ethereum-consensus",
  "reth-ethereum-engine-primitives",
+ "reth-ethereum-payload-builder",
  "reth-ethereum-primitives",
  "reth-evm",
  "reth-evm-ethereum",
@@ -5463,11 +5482,16 @@ dependencies = [
  "reth-node-ethereum",
  "reth-node-types",
  "reth-payload-builder",
+ "reth-payload-builder-primitives",
+ "reth-payload-primitives",
  "reth-primitives-traits",
  "reth-provider",
+ "reth-rpc-builder",
+ "reth-storage-api",
  "reth-tasks",
  "reth-tracing",
  "reth-transaction-pool",
+ "serde",
  "tokio",
  "tracing",
 ]
@@ -5476,12 +5500,22 @@ dependencies = [
 name = "n42-node-bin"
 version = "0.1.0"
 dependencies = [
+ "alloy-primitives",
  "clap",
  "eyre",
+ "hex",
+ "jsonrpsee",
+ "libp2p",
  "n42-chainspec",
+ "n42-consensus",
+ "n42-network",
  "n42-node",
+ "n42-primitives",
  "reth-ethereum-cli",
  "reth-node-builder",
+ "reth-storage-api",
+ "reth-tasks",
+ "tokio",
  "tracing",
 ]
 

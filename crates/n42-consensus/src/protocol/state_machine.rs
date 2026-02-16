@@ -2,7 +2,7 @@ use alloy_primitives::B256;
 use n42_primitives::{
     BlsSecretKey,
     consensus::{
-        CommitVote, ConsensusMessage, NewView, Proposal, QuorumCertificate,
+        CommitVote, ConsensusMessage, NewView, PrepareQC, Proposal, QuorumCertificate,
         TimeoutMessage, ViewNumber, Vote,
     },
 };
@@ -13,7 +13,7 @@ use crate::validator::{LeaderSelector, ValidatorSet};
 use super::pacemaker::Pacemaker;
 use super::quorum::{
     VoteCollector, TimeoutCollector,
-    signing_message, timeout_signing_message,
+    signing_message, commit_signing_message, timeout_signing_message,
 };
 use super::round::{Phase, RoundState};
 
@@ -186,6 +186,7 @@ impl ConsensusEngine {
             ConsensusMessage::Proposal(p) => self.process_proposal(p),
             ConsensusMessage::Vote(v) => self.process_vote(v),
             ConsensusMessage::CommitVote(cv) => self.process_commit_vote(cv),
+            ConsensusMessage::PrepareQC(pqc) => self.process_prepare_qc(pqc),
             ConsensusMessage::Timeout(t) => self.process_timeout(t),
             ConsensusMessage::NewView(nv) => self.process_new_view(nv),
         }
@@ -229,9 +230,20 @@ impl ConsensusEngine {
 
         self.round_state.enter_voting();
 
+        // Leader self-vote: GossipSub does not deliver messages back to the sender,
+        // so the leader must add its own vote to the collector.
+        let leader_vote_msg = signing_message(view, &block_hash);
+        let leader_vote_sig = self.secret_key.sign(&leader_vote_msg);
+        if let Some(ref mut collector) = self.vote_collector {
+            let _ = collector.add_vote(self.my_index, leader_vote_sig);
+        }
+
         self.emit(EngineOutput::BroadcastMessage(
             ConsensusMessage::Proposal(proposal),
         ));
+
+        // Check if quorum already reached (single-validator scenario).
+        self.try_form_prepare_qc()?;
 
         Ok(())
     }
@@ -336,25 +348,102 @@ impl ConsensusEngine {
             "received vote"
         );
 
-        // Check if we have a quorum
-        if collector.has_quorum(self.validator_set.quorum_size()) {
-            let qc = collector.build_qc(&self.validator_set)?;
-            tracing::info!(view, signers = qc.signer_count(), "QC formed, entering pre-commit");
+        self.try_form_prepare_qc()
+    }
 
-            self.prepare_qc = Some(qc.clone());
-            self.round_state.enter_pre_commit();
-            self.round_state.update_locked_qc(&qc);
+    /// Attempts to form a PrepareQC from collected Round 1 votes.
+    /// If quorum is reached, broadcasts the QC and transitions to PreCommit.
+    /// The leader also self-votes for CommitVote (Round 2).
+    fn try_form_prepare_qc(&mut self) -> ConsensusResult<()> {
+        let view = self.round_state.current_view();
 
-            // Broadcast QC to all validators (they'll send commit votes)
-            // We piggyback the QC as a Proposal-like message;
-            // for simplicity, we broadcast it as a CommitVote trigger
-            // by having validators see the QC and respond with commit votes.
-            // In practice, the leader sends the QC, and validators respond.
+        let has_quorum = self
+            .vote_collector
+            .as_ref()
+            .is_some_and(|c| c.has_quorum(self.validator_set.quorum_size()));
 
-            // For now, we assume validators send commit votes upon seeing the QC.
-            // The QC is embedded in the protocol state; we don't have a separate
-            // "QC broadcast" message. Instead, we transition and wait for commit votes.
+        if !has_quorum {
+            return Ok(());
         }
+
+        // Already formed QC for this view
+        if self.prepare_qc.is_some() {
+            return Ok(());
+        }
+
+        let qc = self
+            .vote_collector
+            .as_ref()
+            .unwrap()
+            .build_qc(&self.validator_set)?;
+
+        tracing::info!(view, signers = qc.signer_count(), "QC formed, entering pre-commit");
+
+        self.prepare_qc = Some(qc.clone());
+        self.round_state.enter_pre_commit();
+        self.round_state.update_locked_qc(&qc);
+
+        // Broadcast PrepareQC so validators can send CommitVotes
+        let prepare_qc_msg = PrepareQC {
+            view,
+            block_hash: qc.block_hash,
+            qc,
+        };
+        self.emit(EngineOutput::BroadcastMessage(
+            ConsensusMessage::PrepareQC(prepare_qc_msg),
+        ));
+
+        // Leader self-vote for CommitVote (Round 2)
+        let block_hash = self.prepare_qc.as_ref().unwrap().block_hash;
+        let commit_msg = commit_signing_message(view, &block_hash);
+        let commit_sig = self.secret_key.sign(&commit_msg);
+        if let Some(ref mut collector) = self.commit_collector {
+            let _ = collector.add_vote(self.my_index, commit_sig);
+        }
+
+        // Check if commit quorum already reached (single-validator scenario)
+        self.try_form_commit_qc()
+    }
+
+    // ── PrepareQC handling (Validators receive QC from leader) ──
+
+    /// Processes a PrepareQC from the leader: validates the QC and sends a CommitVote.
+    fn process_prepare_qc(&mut self, pqc: PrepareQC) -> ConsensusResult<()> {
+        let view = self.round_state.current_view();
+
+        if pqc.view != view {
+            return Err(ConsensusError::ViewMismatch {
+                current: view,
+                received: pqc.view,
+            });
+        }
+
+        // Verify the QC signatures
+        super::quorum::verify_qc(&pqc.qc, &self.validator_set)?;
+
+        // Update locked QC
+        self.round_state.update_locked_qc(&pqc.qc);
+        self.round_state.enter_pre_commit();
+
+        tracing::info!(view, block_hash = %pqc.block_hash, "received valid PrepareQC, sending commit vote");
+
+        // Send CommitVote (Round 2) to leader
+        let commit_msg = commit_signing_message(view, &pqc.block_hash);
+        let commit_sig = self.secret_key.sign(&commit_msg);
+
+        let leader = LeaderSelector::leader_for_view(view, &self.validator_set);
+
+        let commit_vote = CommitVote {
+            view,
+            block_hash: pqc.block_hash,
+            voter: self.my_index,
+            signature: commit_sig,
+        };
+
+        self.emit(EngineOutput::SendToValidator(
+            leader,
+            ConsensusMessage::CommitVote(commit_vote),
+        ));
 
         Ok(())
     }
@@ -389,25 +478,50 @@ impl ConsensusEngine {
             "received commit vote"
         );
 
-        // Check if we have a quorum for commit
-        if collector.has_quorum(self.validator_set.quorum_size()) {
-            let commit_qc = collector.build_qc(&self.validator_set)?;
-            let block_hash = commit_qc.block_hash;
+        self.try_form_commit_qc()
+    }
 
-            tracing::info!(view, %block_hash, "block committed!");
+    /// Attempts to form a Commit QC from collected Round 2 votes.
+    /// Uses commit_signing_message for signature verification.
+    fn try_form_commit_qc(&mut self) -> ConsensusResult<()> {
+        let view = self.round_state.current_view();
 
-            self.round_state.commit(commit_qc.clone());
+        let has_quorum = self
+            .commit_collector
+            .as_ref()
+            .is_some_and(|c| c.has_quorum(self.validator_set.quorum_size()));
 
-            self.emit(EngineOutput::BlockCommitted {
-                view,
-                block_hash,
-                commit_qc,
-            });
-
-            // Advance to next view
-            let next_view = view.saturating_add(1);
-            self.advance_to_view(next_view);
+        if !has_quorum {
+            return Ok(());
         }
+
+        // CommitVotes use "commit" prefix in their signing message
+        let block_hash = self
+            .commit_collector
+            .as_ref()
+            .map(|c| c.block_hash())
+            .unwrap_or_default();
+        let commit_msg = commit_signing_message(view, &block_hash);
+
+        let commit_qc = self
+            .commit_collector
+            .as_ref()
+            .unwrap()
+            .build_qc_with_message(&self.validator_set, &commit_msg)?;
+
+        tracing::info!(view, %block_hash, "block committed!");
+
+        self.round_state.commit(commit_qc.clone());
+
+        self.emit(EngineOutput::BlockCommitted {
+            view,
+            block_hash,
+            commit_qc,
+        });
+
+        // Advance to next view
+        let next_view = view.saturating_add(1);
+        self.advance_to_view(next_view);
 
         Ok(())
     }
@@ -644,7 +758,9 @@ mod tests {
 
     #[test]
     fn test_engine_block_ready_as_leader() {
-        // Single validator: always leader
+        // Single validator: always leader.
+        // With self-voting, the entire 2-round consensus completes immediately:
+        // BlockReady → Propose → self-vote → QC → self-CommitVote → Commit → next view
         let (mut engine, _, _, mut rx) = make_engine(1, 0);
         let block_hash = B256::repeat_byte(0xBB);
 
@@ -652,18 +768,39 @@ mod tests {
             .process_event(ConsensusEvent::BlockReady(block_hash))
             .expect("leader block ready should succeed");
 
+        // Single-validator: consensus completes in one call, advancing to next view
+        assert_eq!(
+            engine.current_view(),
+            2,
+            "should advance to view 2 after single-validator consensus"
+        );
         assert_eq!(
             engine.current_phase(),
-            Phase::Voting,
-            "leader should enter Voting phase after proposing"
+            Phase::WaitingForProposal,
+            "should be WaitingForProposal in new view"
         );
 
-        // Should have emitted a BroadcastMessage(Proposal)
-        let output = rx.try_recv().expect("should have an output");
-        assert!(
-            matches!(output, EngineOutput::BroadcastMessage(ConsensusMessage::Proposal(_))),
-            "should broadcast a Proposal"
-        );
+        // Collect all outputs
+        let mut outputs = vec![];
+        while let Ok(output) = rx.try_recv() {
+            outputs.push(output);
+        }
+
+        // Should have emitted: Proposal, PrepareQC, BlockCommitted
+        let has_proposal = outputs
+            .iter()
+            .any(|o| matches!(o, EngineOutput::BroadcastMessage(ConsensusMessage::Proposal(_))));
+        assert!(has_proposal, "should broadcast a Proposal");
+
+        let has_prepare_qc = outputs
+            .iter()
+            .any(|o| matches!(o, EngineOutput::BroadcastMessage(ConsensusMessage::PrepareQC(_))));
+        assert!(has_prepare_qc, "should broadcast a PrepareQC");
+
+        let has_committed = outputs
+            .iter()
+            .any(|o| matches!(o, EngineOutput::BlockCommitted { block_hash: h, .. } if *h == block_hash));
+        assert!(has_committed, "should emit BlockCommitted");
     }
 
     #[test]
@@ -809,5 +946,127 @@ mod tests {
             !pacemaker.is_timed_out(),
             "pacemaker should not be timed out initially"
         );
+    }
+
+    /// Full two-round consensus test with 4 validators.
+    /// Simulates: Leader proposes → 3 validators vote → QC formed → PrepareQC broadcast
+    /// → 3 validators send CommitVote → block committed.
+    #[test]
+    fn test_full_consensus_4_validators() {
+        use crate::protocol::quorum::commit_signing_message;
+
+        // View 1: leader is validator 1 (1 % 4)
+        let (mut engine, sks, _vs, mut rx) = make_engine(4, 1);
+        let block_hash = B256::repeat_byte(0xF1);
+        let view = 1u64;
+
+        // Step 1: Leader proposes
+        engine
+            .process_event(ConsensusEvent::BlockReady(block_hash))
+            .expect("block ready should succeed");
+
+        // Leader is in Voting phase (self-vote added but quorum=3, only 1 vote so far)
+        assert_eq!(engine.current_phase(), Phase::Voting);
+
+        // Drain outputs so far
+        let mut outputs = vec![];
+        while let Ok(o) = rx.try_recv() {
+            outputs.push(o);
+        }
+        assert!(outputs.iter().any(|o| matches!(o, EngineOutput::BroadcastMessage(ConsensusMessage::Proposal(_)))));
+
+        // Step 2: Two more validators send votes (need 3 total for quorum, leader already has 1)
+        for i in [0u32, 2] {
+            let msg = signing_message(view, &block_hash);
+            let sig = sks[i as usize].sign(&msg);
+            let vote = Vote { view, block_hash, voter: i, signature: sig };
+            engine
+                .process_event(ConsensusEvent::Message(ConsensusMessage::Vote(vote)))
+                .expect("vote should succeed");
+        }
+
+        // After 3 votes (leader + 2), QC should be formed → PreCommit phase
+        // But leader also self-voted for CommitVote, so now we check commit collector
+        // The engine should have broadcast PrepareQC
+        outputs.clear();
+        while let Ok(o) = rx.try_recv() {
+            outputs.push(o);
+        }
+        let has_prepare_qc = outputs.iter().any(|o| matches!(o, EngineOutput::BroadcastMessage(ConsensusMessage::PrepareQC(_))));
+        assert!(has_prepare_qc, "leader should broadcast PrepareQC after forming QC");
+
+        // Step 3: Two more validators send commit votes (leader already self-voted)
+        for i in [0u32, 2] {
+            let msg = commit_signing_message(view, &block_hash);
+            let sig = sks[i as usize].sign(&msg);
+            let cv = CommitVote { view, block_hash, voter: i, signature: sig };
+            engine
+                .process_event(ConsensusEvent::Message(ConsensusMessage::CommitVote(cv)))
+                .expect("commit vote should succeed");
+        }
+
+        // Block should be committed, engine advances to view 2
+        assert_eq!(engine.current_view(), 2, "should advance to view 2");
+        assert_eq!(engine.current_phase(), Phase::WaitingForProposal);
+
+        outputs.clear();
+        while let Ok(o) = rx.try_recv() {
+            outputs.push(o);
+        }
+        let has_committed = outputs.iter().any(|o| matches!(o, EngineOutput::BlockCommitted { block_hash: h, view: v, .. } if *h == block_hash && *v == view));
+        assert!(has_committed, "should emit BlockCommitted");
+    }
+
+    /// Test that validators correctly process PrepareQC and send CommitVote.
+    #[test]
+    fn test_validator_receives_prepare_qc() {
+        use crate::protocol::quorum::VoteCollector;
+
+        // Validator 0, view 1, leader is validator 1
+        let (mut engine, sks, vs, mut rx) = make_engine(4, 0);
+        let block_hash = B256::repeat_byte(0xF2);
+        let view = 1u64;
+
+        // First, the validator receives a valid proposal from the leader
+        let prop_msg = signing_message(view, &block_hash);
+        let prop_sig = sks[1].sign(&prop_msg);
+        let proposal = Proposal {
+            view,
+            block_hash,
+            justify_qc: QuorumCertificate::genesis(),
+            proposer: 1,
+            signature: prop_sig,
+        };
+        engine
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(proposal)))
+            .expect("proposal should succeed");
+
+        // Drain outputs
+        while rx.try_recv().is_ok() {}
+
+        // Build a valid QC from 3 validators
+        let mut collector = VoteCollector::new(view, block_hash, vs.len());
+        for i in 0..3u32 {
+            let msg = signing_message(view, &block_hash);
+            let sig = sks[i as usize].sign(&msg);
+            collector.add_vote(i, sig).unwrap();
+        }
+        let qc = collector.build_qc(&vs).unwrap();
+
+        // Validator receives PrepareQC
+        let prepare_qc = PrepareQC { view, block_hash, qc };
+        engine
+            .process_event(ConsensusEvent::Message(ConsensusMessage::PrepareQC(prepare_qc)))
+            .expect("PrepareQC should succeed");
+
+        assert_eq!(engine.current_phase(), Phase::PreCommit);
+
+        // Should have sent CommitVote to leader (validator 1)
+        let mut outputs = vec![];
+        while let Ok(o) = rx.try_recv() {
+            outputs.push(o);
+        }
+        let has_commit_vote = outputs.iter().any(|o| matches!(o, EngineOutput::SendToValidator(1, ConsensusMessage::CommitVote(cv)) if cv.view == view && cv.block_hash == block_hash));
+        assert!(has_commit_vote, "validator should send CommitVote to leader");
     }
 }

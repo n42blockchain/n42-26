@@ -13,10 +13,21 @@ path = "src/main.rs"
 [dependencies]
 n42-node.workspace = true
 n42-chainspec.workspace = true
+n42-consensus.workspace = true
+n42-network.workspace = true
+n42-primitives.workspace = true
 
 reth-ethereum-cli.workspace = true
 reth-node-builder.workspace = true
+reth-storage-api.workspace = true
+reth-tasks.workspace = true
 
+alloy-primitives.workspace = true
+
+jsonrpsee.workspace = true
 clap = { version = "4", features = ["derive"] }
 eyre.workspace = true
+hex.workspace = true
+tokio.workspace = true
 tracing.workspace = true
+libp2p.workspace = true

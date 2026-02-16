@@ -141,12 +141,25 @@ pub struct NewView {
     pub signature: BlsSignature,
 }
 
+/// PrepareQC message: leader broadcasts after forming Round 1 QC.
+/// Validators receive this and respond with CommitVote (Round 2).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PrepareQC {
+    /// The view this QC was formed in.
+    pub view: ViewNumber,
+    /// Block hash that was voted on.
+    pub block_hash: B256,
+    /// The quorum certificate formed from Round 1 votes.
+    pub qc: QuorumCertificate,
+}
+
 /// Envelope for all consensus messages on the wire.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ConsensusMessage {
     Proposal(Proposal),
     Vote(Vote),
     CommitVote(CommitVote),
+    PrepareQC(PrepareQC),
     Timeout(TimeoutMessage),
     NewView(NewView),
 }

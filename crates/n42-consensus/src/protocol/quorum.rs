@@ -50,6 +50,11 @@ impl VoteCollector {
         Ok(())
     }
 
+    /// Returns the block hash this collector is gathering votes for.
+    pub fn block_hash(&self) -> B256 {
+        self.block_hash
+    }
+
     /// Returns the current number of collected votes.
     pub fn vote_count(&self) -> usize {
         self.votes.len()
@@ -63,10 +68,24 @@ impl VoteCollector {
     /// Builds a QuorumCertificate by aggregating collected signatures.
     ///
     /// Verifies each vote against the validator's public key before aggregating.
+    /// Uses the standard signing message (view || block_hash).
     /// Returns an error if there aren't enough valid votes for a quorum.
     pub fn build_qc(
         &self,
         validator_set: &ValidatorSet,
+    ) -> ConsensusResult<QuorumCertificate> {
+        let message = signing_message(self.view, &self.block_hash);
+        self.build_qc_with_message(validator_set, &message)
+    }
+
+    /// Builds a QuorumCertificate using a custom signing message for verification.
+    ///
+    /// This is needed for CommitVote (Round 2) which uses a different message
+    /// format ("commit" || view || block_hash) than the standard Round 1 vote.
+    pub fn build_qc_with_message(
+        &self,
+        validator_set: &ValidatorSet,
+        message: &[u8],
     ) -> ConsensusResult<QuorumCertificate> {
         let quorum_size = validator_set.quorum_size();
         if self.votes.len() < quorum_size {
@@ -77,9 +96,6 @@ impl VoteCollector {
             });
         }
 
-        // Build the signing message: (view || block_hash)
-        let message = signing_message(self.view, &self.block_hash);
-
         // Verify each vote and collect valid signatures
         let mut valid_sigs: Vec<&BlsSignature> = Vec::new();
         let mut valid_pks: Vec<&BlsPublicKey> = Vec::new();
@@ -88,7 +104,7 @@ impl VoteCollector {
         for (&idx, sig) in &self.votes {
             let pk = validator_set.get_public_key(idx)?;
             // Verify individual signature
-            pk.verify(&message, sig).map_err(|_| {
+            pk.verify(message, sig).map_err(|_| {
                 ConsensusError::InvalidSignature {
                     view: self.view,
                     validator_index: idx,

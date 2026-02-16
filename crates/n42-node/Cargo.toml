@@ -11,6 +11,7 @@ n42-primitives.workspace = true
 n42-chainspec.workspace = true
 n42-consensus.workspace = true
 n42-execution.workspace = true
+n42-mobile.workspace = true
 n42-network.workspace = true
 
 reth-chainspec.workspace = true
@@ -33,6 +34,23 @@ reth-tasks.workspace = true
 reth-tracing.workspace = true
 
 alloy-primitives.workspace = true
+alloy-rpc-types-engine.workspace = true
+
+reth-ethereum-payload-builder.workspace = true
+reth-basic-payload-builder.workspace = true
+reth-payload-builder-primitives.workspace = true
+reth-payload-primitives.workspace = true
+reth-engine-primitives.workspace = true
+reth-chain-state.workspace = true
+reth-storage-api.workspace = true
+reth-rpc-builder.workspace = true
+
+arc-swap.workspace = true
+jsonrpsee.workspace = true
+serde.workspace = true
+
+async-trait = "0.1"
+hex.workspace = true
 
 eyre.workspace = true
 tokio.workspace = true

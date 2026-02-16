@@ -25,3 +25,7 @@ tokio.workspace = true
 tracing.workspace = true
 eyre.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+n42-mobile = { workspace = true }
+ed25519-dalek = { workspace = true }

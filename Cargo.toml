@@ -54,6 +54,14 @@ reth-trie-common = { path = "../reth/crates/trie/common" }
 reth-trie-sparse = { path = "../reth/crates/trie/sparse" }
 reth-network-api = { path = "../reth/crates/net/network-api" }
 reth-ethereum-cli = { path = "../reth/crates/ethereum/cli" }
+reth-ethereum-payload-builder = { path = "../reth/crates/ethereum/payload" }
+reth-basic-payload-builder = { path = "../reth/crates/payload/basic" }
+reth-payload-builder-primitives = { path = "../reth/crates/payload/builder-primitives" }
+reth-payload-primitives = { path = "../reth/crates/payload/primitives" }
+reth-engine-primitives = { path = "../reth/crates/engine/primitives" }
+reth-chain-state = { path = "../reth/crates/chain-state" }
+reth-storage-api = { path = "../reth/crates/storage/storage-api" }
+reth-rpc-builder = { path = "../reth/crates/rpc/rpc-builder" }
 
 # Alloy
 alloy-consensus = { version = "1.0", default-features = false }
@@ -94,6 +102,15 @@ libp2p = { version = "0.54", features = ["gossipsub", "tokio", "quic", "identify
 quinn = "0.11"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rcgen = "0.13"
+
+# RPC
+jsonrpsee = { version = "0.26", features = ["server", "macros"] }
+
+# Concurrency
+arc-swap = "1.7"
+
+# Encoding
+hex = "0.4"
 
 # Misc
 auto_impl = "1.0"
