@@ -303,6 +303,8 @@ impl ConsensusOrchestrator {
                 //    in the next block's extra_data.
                 if let Some(ref state) = self.consensus_state {
                     state.update_committed_qc(commit_qc);
+                    // Notify mobile verification subscribers of the committed block.
+                    state.notify_block_committed(block_hash, view);
                 }
 
                 // 2. Update our head block hash.
