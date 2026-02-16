@@ -45,11 +45,17 @@ pub struct ConsensusOrchestrator {
     block_ready_rx: mpsc::UnboundedReceiver<B256>,
     /// Fee recipient address for payload attributes.
     fee_recipient: Address,
-    /// Minimum interval between consecutive block builds.
+    /// Slot duration for wall-clock-aligned block production.
     /// When zero, blocks are built immediately (legacy behavior).
-    block_interval: Duration,
-    /// Scheduled time for the next payload build (set when block_interval > 0).
+    /// When non-zero, builds are triggered at fixed wall-clock boundaries:
+    ///   boundary = ceil(now / slot_time) * slot_time
+    /// This produces precise block intervals regardless of build overhead.
+    slot_time: Duration,
+    /// Scheduled tokio Instant for the next payload build.
     next_build_at: Option<Instant>,
+    /// The slot-aligned timestamp (Unix seconds) for the next block.
+    /// Used as the block's timestamp to ensure perfectly regular intervals.
+    next_slot_timestamp: Option<u64>,
 }
 
 impl ConsensusOrchestrator {
@@ -74,8 +80,9 @@ impl ConsensusOrchestrator {
             block_ready_tx,
             block_ready_rx,
             fee_recipient: Address::ZERO,
-            block_interval: Duration::ZERO,
+            slot_time: Duration::ZERO,
             next_build_at: None,
+            next_slot_timestamp: None,
         }
     }
 
@@ -93,15 +100,17 @@ impl ConsensusOrchestrator {
     ) -> Self {
         let (block_ready_tx, block_ready_rx) = mpsc::unbounded_channel();
 
-        // Read block interval from environment variable (default: 0 = immediate).
-        let block_interval_ms: u64 = std::env::var("N42_BLOCK_INTERVAL_MS")
+        // Read slot time from environment variable (default: 0 = immediate build).
+        // When non-zero, blocks are produced at wall-clock-aligned boundaries
+        // (e.g., 4000ms → builds trigger at Unix times divisible by 4 seconds).
+        let slot_time_ms: u64 = std::env::var("N42_BLOCK_INTERVAL_MS")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
-        let block_interval = Duration::from_millis(block_interval_ms);
+        let slot_time = Duration::from_millis(slot_time_ms);
 
-        if block_interval_ms > 0 {
-            info!(interval_ms = block_interval_ms, "block build interval configured");
+        if slot_time_ms > 0 {
+            info!(slot_time_ms, "wall-clock-aligned slot timing configured");
         }
 
         Self {
@@ -116,8 +125,9 @@ impl ConsensusOrchestrator {
             block_ready_tx,
             block_ready_rx,
             fee_recipient,
-            block_interval,
+            slot_time,
             next_build_at: None,
+            next_slot_timestamp: None,
         }
     }
 
@@ -216,38 +226,76 @@ impl ConsensusOrchestrator {
                     }
                 }
 
-                // Branch 5: Scheduled payload build timer fires
+                // Branch 5: Slot boundary reached, trigger payload build
                 _ = &mut build_timer => {
+                    let slot_ts = self.next_slot_timestamp.take();
                     self.next_build_at = None;
-                    info!("scheduled block build timer fired, triggering payload build");
-                    self.do_trigger_payload_build().await;
+                    info!(slot_timestamp = ?slot_ts, "slot boundary reached, triggering payload build");
+                    self.do_trigger_payload_build(slot_ts).await;
                 }
             }
         }
     }
 
-    /// Schedules a payload build, respecting the configured block_interval.
+    /// Schedules a payload build using wall-clock-aligned slot timing.
     ///
-    /// If block_interval > 0, sets `next_build_at` to fire after the interval.
-    /// If block_interval == 0, triggers immediately (legacy behavior).
+    /// If slot_time > 0, computes the next wall-clock boundary (a time where
+    /// `unix_ms % slot_time_ms == 0`) and schedules the build for that instant.
+    /// This ensures all nodes with synchronized clocks produce blocks at the
+    /// same fixed intervals, regardless of build overhead or consensus latency.
+    ///
+    /// If slot_time == 0, triggers immediately (legacy behavior).
     async fn schedule_payload_build(&mut self) {
-        if self.block_interval.is_zero() {
-            self.do_trigger_payload_build().await;
+        if self.slot_time.is_zero() {
+            self.do_trigger_payload_build(None).await;
         } else {
-            let deadline = Instant::now() + self.block_interval;
+            let (slot_ts, delay) = self.next_slot_boundary();
+            let deadline = Instant::now() + delay;
             self.next_build_at = Some(deadline);
-            debug!(
-                interval_ms = self.block_interval.as_millis() as u64,
-                "scheduled next payload build"
+            self.next_slot_timestamp = Some(slot_ts);
+            info!(
+                slot_timestamp = slot_ts,
+                delay_ms = delay.as_millis() as u64,
+                "scheduled payload build at next slot boundary"
             );
         }
     }
 
+    /// Computes the next wall-clock-aligned slot boundary.
+    ///
+    /// Returns `(slot_timestamp_secs, delay_until_boundary)`.
+    ///
+    /// Slot boundaries are fixed points in time defined by:
+    ///   `boundary = ceil(now_ms / slot_ms) * slot_ms`
+    ///
+    /// This is the same approach used by BSC, Polygon, and Ethereum 2.0:
+    /// all validators with synchronized clocks see identical slot boundaries.
+    fn next_slot_boundary(&self) -> (u64, Duration) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        let now_ms = now.as_millis() as u64;
+        let slot_ms = self.slot_time.as_millis() as u64;
+
+        // Find the next boundary: smallest multiple of slot_ms that is > now_ms.
+        let current_slot = now_ms / slot_ms;
+        let next_boundary_ms = (current_slot + 1) * slot_ms;
+        let delay_ms = next_boundary_ms - now_ms;
+
+        // Block timestamp = slot boundary time in seconds.
+        let slot_timestamp = next_boundary_ms / 1000;
+        (slot_timestamp, Duration::from_millis(delay_ms))
+    }
+
     /// Triggers payload building by calling fork_choice_updated with PayloadAttributes.
+    ///
+    /// When `slot_timestamp` is provided, it is used as the block's timestamp
+    /// (for wall-clock-aligned slot timing). Otherwise, the current system time
+    /// is used (legacy immediate mode).
     ///
     /// When the payload is ready, a spawned task sends the block hash to
     /// `block_ready_rx`, which feeds it to the consensus engine as BlockReady.
-    async fn do_trigger_payload_build(&self) {
+    async fn do_trigger_payload_build(&self, slot_timestamp: Option<u64>) {
         let beacon_engine = match &self.beacon_engine {
             Some(e) => e,
             None => {
@@ -263,10 +311,12 @@ impl ConsensusOrchestrator {
             }
         };
 
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let timestamp = slot_timestamp.unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+        });
 
         let attrs = PayloadAttributes {
             timestamp,
@@ -686,8 +736,9 @@ mod tests {
             block_ready_tx,
             block_ready_rx,
             fee_recipient: Address::ZERO,
-            block_interval: Duration::ZERO,
+            slot_time: Duration::ZERO,
             next_build_at: None,
+            next_slot_timestamp: None,
         };
 
         assert!(state.load_committed_qc().is_none(), "should start with no QC");
@@ -723,8 +774,9 @@ mod tests {
             block_ready_tx: block_ready_tx.clone(),
             block_ready_rx,
             fee_recipient: Address::ZERO,
-            block_interval: Duration::ZERO,
+            slot_time: Duration::ZERO,
             next_build_at: None,
+            next_slot_timestamp: None,
         };
 
         // Send a BlockReady hash through the channel.
