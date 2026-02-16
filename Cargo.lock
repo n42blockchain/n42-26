@@ -5365,8 +5365,10 @@ dependencies = [
  "alloy-primitives",
  "bincode",
  "bitvec",
+ "ed25519-dalek",
  "eyre",
  "n42-chainspec",
+ "n42-mobile",
  "n42-primitives",
  "reth-chainspec",
  "reth-consensus",
@@ -5465,6 +5467,7 @@ dependencies = [
  "reth-provider",
  "reth-tasks",
  "reth-tracing",
+ "reth-transaction-pool",
  "tokio",
  "tracing",
 ]

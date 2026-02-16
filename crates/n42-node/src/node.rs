@@ -1,4 +1,5 @@
 use crate::components::{N42ConsensusBuilder, N42ExecutorBuilder};
+use crate::pool::N42PoolBuilder;
 use reth_chainspec::ChainSpec;
 use reth_ethereum_engine_primitives::EthEngineTypes;
 use reth_ethereum_primitives::EthPrimitives;
@@ -9,7 +10,7 @@ use reth_node_builder::{
 };
 use reth_node_ethereum::node::{
     EthereumAddOns, EthereumEthApiBuilder, EthereumEngineValidatorBuilder,
-    EthereumNetworkBuilder, EthereumPoolBuilder,
+    EthereumNetworkBuilder,
 };
 use reth_node_ethereum::EthereumPayloadBuilder;
 use reth_node_builder::components::BasicPayloadServiceBuilder;
@@ -37,7 +38,7 @@ where
 {
     type ComponentsBuilder = ComponentsBuilder<
         N,
-        EthereumPoolBuilder,
+        N42PoolBuilder,
         BasicPayloadServiceBuilder<EthereumPayloadBuilder>,
         EthereumNetworkBuilder,
         N42ExecutorBuilder,
@@ -50,7 +51,7 @@ where
     fn components_builder(&self) -> Self::ComponentsBuilder {
         ComponentsBuilder::default()
             .node_types::<N>()
-            .pool(EthereumPoolBuilder::default())
+            .pool(N42PoolBuilder::default())
             .executor(N42ExecutorBuilder::default())
             .payload(BasicPayloadServiceBuilder::default())
             .network(EthereumNetworkBuilder::default())

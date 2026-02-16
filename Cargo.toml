@@ -47,6 +47,7 @@ reth-primitives-traits = { path = "../reth/crates/primitives-traits" }
 reth-provider = { path = "../reth/crates/storage/provider" }
 reth-revm = { path = "../reth/crates/revm" }
 reth-tasks = { path = "../reth/crates/tasks" }
+reth-transaction-pool = { path = "../reth/crates/transaction-pool" }
 reth-tracing = { path = "../reth/crates/tracing" }
 reth-storage-errors = { path = "../reth/crates/storage/errors" }
 reth-trie-common = { path = "../reth/crates/trie/common" }
