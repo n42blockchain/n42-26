@@ -69,6 +69,13 @@ pub enum ConsensusError {
         locked_view: ViewNumber,
     },
 
+    /// Block hash in QC does not match expected block hash (e.g., in Decide message).
+    #[error("block hash mismatch: expected {expected}, got {got}")]
+    BlockHashMismatch {
+        expected: alloy_primitives::B256,
+        got: alloy_primitives::B256,
+    },
+
     /// Internal BLS cryptographic error.
     #[error("BLS error: {0}")]
     Bls(#[from] n42_primitives::bls::BlsError),

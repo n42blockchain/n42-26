@@ -153,6 +153,18 @@ pub struct PrepareQC {
     pub qc: QuorumCertificate,
 }
 
+/// Decide message: leader broadcasts after forming CommitQC.
+/// Tells all followers the block is committed so they can finalize and advance view.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Decide {
+    /// The view this decision is for.
+    pub view: ViewNumber,
+    /// Block hash that was committed.
+    pub block_hash: B256,
+    /// The CommitQC that proves 2f+1 validators committed.
+    pub commit_qc: QuorumCertificate,
+}
+
 /// Envelope for all consensus messages on the wire.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ConsensusMessage {
@@ -162,6 +174,7 @@ pub enum ConsensusMessage {
     PrepareQC(PrepareQC),
     Timeout(TimeoutMessage),
     NewView(NewView),
+    Decide(Decide),
 }
 
 #[cfg(test)]

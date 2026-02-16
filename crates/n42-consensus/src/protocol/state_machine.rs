@@ -2,10 +2,11 @@ use alloy_primitives::B256;
 use n42_primitives::{
     BlsSecretKey,
     consensus::{
-        CommitVote, ConsensusMessage, NewView, PrepareQC, Proposal, QuorumCertificate,
+        CommitVote, ConsensusMessage, Decide, NewView, PrepareQC, Proposal, QuorumCertificate,
         TimeoutMessage, ViewNumber, Vote,
     },
 };
+use std::collections::HashSet;
 use tokio::sync::mpsc;
 
 use crate::error::{ConsensusError, ConsensusResult};
@@ -25,6 +26,9 @@ pub enum ConsensusEvent {
     /// A block has been executed and is ready for proposal.
     /// Contains the block hash.
     BlockReady(B256),
+    /// Block data has been imported into the execution layer (follower only).
+    /// Triggers the deferred vote for the pending proposal.
+    BlockImported(B256),
 }
 
 /// Actions the consensus engine requests from the outer node.
@@ -46,6 +50,13 @@ pub enum EngineOutput {
     ViewChanged {
         new_view: ViewNumber,
     },
+}
+
+/// Pending proposal awaiting block data import before voting (follower path).
+#[derive(Debug, Clone)]
+struct PendingProposal {
+    view: ViewNumber,
+    block_hash: B256,
 }
 
 /// The HotStuff-2 consensus engine.
@@ -89,6 +100,12 @@ pub struct ConsensusEngine {
     prepare_qc: Option<QuorumCertificate>,
     /// Output channel for engine actions.
     output_tx: mpsc::UnboundedSender<EngineOutput>,
+    /// Pending proposal awaiting block data import before voting.
+    /// Set when process_proposal() defers the vote (follower path).
+    pending_proposal: Option<PendingProposal>,
+    /// Block hashes that have been imported but no matching proposal yet.
+    /// Handles the case where BlockData arrives before Proposal.
+    imported_blocks: HashSet<B256>,
 }
 
 impl ConsensusEngine {
@@ -114,6 +131,8 @@ impl ConsensusEngine {
             timeout_collector: None,
             prepare_qc: None,
             output_tx,
+            pending_proposal: None,
+            imported_blocks: HashSet::new(),
         }
     }
 
@@ -146,6 +165,7 @@ impl ConsensusEngine {
         match event {
             ConsensusEvent::Message(msg) => self.process_message(msg),
             ConsensusEvent::BlockReady(block_hash) => self.on_block_ready(block_hash),
+            ConsensusEvent::BlockImported(block_hash) => self.on_block_imported(block_hash),
         }
     }
 
@@ -155,6 +175,11 @@ impl ConsensusEngine {
         tracing::warn!(view, "view timed out");
 
         self.round_state.timeout();
+
+        // Clear pending block data state: block data may never arrive.
+        // Similar to Tendermint's "prevote nil" — timeout implies giving up on this view.
+        self.pending_proposal = None;
+        self.imported_blocks.clear();
 
         // Initialize timeout collector
         self.timeout_collector =
@@ -189,6 +214,7 @@ impl ConsensusEngine {
             ConsensusMessage::PrepareQC(pqc) => self.process_prepare_qc(pqc),
             ConsensusMessage::Timeout(t) => self.process_timeout(t),
             ConsensusMessage::NewView(nv) => self.process_new_view(nv),
+            ConsensusMessage::Decide(d) => self.process_decide(d),
         }
     }
 
@@ -293,26 +319,22 @@ impl ConsensusEngine {
         self.round_state.update_locked_qc(&proposal.justify_qc);
         self.round_state.enter_voting();
 
-        tracing::info!(view, block_hash = %proposal.block_hash, "received valid proposal, voting");
-
-        // Request block execution
+        // Request block execution (orchestrator will import block data)
         self.emit(EngineOutput::ExecuteBlock(proposal.block_hash));
 
-        // Send Round 1 vote to leader
-        let vote_msg = signing_message(view, &proposal.block_hash);
-        let vote_sig = self.secret_key.sign(&vote_msg);
-
-        let vote = Vote {
-            view,
-            block_hash: proposal.block_hash,
-            voter: self.my_index,
-            signature: vote_sig,
-        };
-
-        self.emit(EngineOutput::SendToValidator(
-            expected_leader,
-            ConsensusMessage::Vote(vote),
-        ));
+        // Check if the block has already been imported (BlockData arrived before Proposal).
+        // Reference: Aptos Baby Raptr — "if local data exists, vote immediately".
+        if self.imported_blocks.remove(&proposal.block_hash) {
+            tracing::info!(view, block_hash = %proposal.block_hash, "received valid proposal, block already imported, voting immediately");
+            self.send_vote(view, proposal.block_hash)?;
+        } else {
+            // Defer the vote until BlockImported arrives.
+            tracing::info!(view, block_hash = %proposal.block_hash, "received valid proposal, deferring vote until block data imported");
+            self.pending_proposal = Some(PendingProposal {
+                view: proposal.view,
+                block_hash: proposal.block_hash,
+            });
+        }
 
         Ok(())
     }
@@ -545,6 +567,16 @@ impl ConsensusEngine {
 
         self.round_state.commit(commit_qc.clone());
 
+        // Broadcast Decide to all followers so they can also commit and advance.
+        let decide = Decide {
+            view,
+            block_hash,
+            commit_qc: commit_qc.clone(),
+        };
+        self.emit(EngineOutput::BroadcastMessage(
+            ConsensusMessage::Decide(decide),
+        ));
+
         self.emit(EngineOutput::BlockCommitted {
             view,
             block_hash,
@@ -553,6 +585,71 @@ impl ConsensusEngine {
 
         // Advance to next view
         let next_view = view.saturating_add(1);
+        self.advance_to_view(next_view);
+
+        Ok(())
+    }
+
+    // ── Decide handling ──
+
+    /// Processes a Decide message from the leader.
+    /// Verifies the CommitQC and advances the follower to the next view.
+    fn process_decide(&mut self, decide: Decide) -> ConsensusResult<()> {
+        let current_view = self.round_state.current_view();
+
+        // Accept Decide for current or future views (catch-up scenario)
+        if decide.view < current_view {
+            tracing::debug!(
+                decide_view = decide.view,
+                current_view,
+                "ignoring stale Decide"
+            );
+            return Ok(());
+        }
+
+        // Verify the CommitQC has sufficient signers (quorum check)
+        let quorum_size = self.validator_set.quorum_size();
+        if decide.commit_qc.signer_count() < quorum_size {
+            return Err(ConsensusError::InsufficientVotes {
+                view: decide.view,
+                have: decide.commit_qc.signer_count(),
+                need: quorum_size,
+            });
+        }
+
+        // Verify QC view matches Decide view
+        if decide.commit_qc.view != decide.view {
+            return Err(ConsensusError::ViewMismatch {
+                current: decide.view,
+                received: decide.commit_qc.view,
+            });
+        }
+
+        // Verify QC block_hash matches
+        if decide.commit_qc.block_hash != decide.block_hash {
+            return Err(ConsensusError::BlockHashMismatch {
+                expected: decide.block_hash,
+                got: decide.commit_qc.block_hash,
+            });
+        }
+
+        tracing::info!(
+            view = decide.view,
+            %decide.block_hash,
+            "received Decide, committing block"
+        );
+
+        // Commit and advance
+        self.round_state.update_locked_qc(&decide.commit_qc);
+        self.round_state.commit(decide.commit_qc.clone());
+
+        self.emit(EngineOutput::BlockCommitted {
+            view: decide.view,
+            block_hash: decide.block_hash,
+            commit_qc: decide.commit_qc,
+        });
+
+        let next_view = decide.view.saturating_add(1);
         self.advance_to_view(next_view);
 
         Ok(())
@@ -669,6 +766,56 @@ impl ConsensusEngine {
         Ok(())
     }
 
+    // ── Block data import handling ──
+
+    /// Sends a Round 1 vote for the given view and block hash.
+    /// Extracted from process_proposal() to support both immediate and deferred voting.
+    fn send_vote(&mut self, view: ViewNumber, block_hash: B256) -> ConsensusResult<()> {
+        let leader = LeaderSelector::leader_for_view(view, &self.validator_set);
+        let vote_msg = signing_message(view, &block_hash);
+        let vote_sig = self.secret_key.sign(&vote_msg);
+
+        let vote = Vote {
+            view,
+            block_hash,
+            voter: self.my_index,
+            signature: vote_sig,
+        };
+
+        self.emit(EngineOutput::SendToValidator(
+            leader,
+            ConsensusMessage::Vote(vote),
+        ));
+
+        Ok(())
+    }
+
+    /// Handles the BlockImported event from the orchestrator.
+    ///
+    /// Two message arrival orders are supported (reference: Aptos Baby Raptr):
+    /// 1. Proposal first, BlockData later → pending_proposal set → vote now
+    /// 2. BlockData first, Proposal later → cache in imported_blocks → vote when Proposal arrives
+    fn on_block_imported(&mut self, block_hash: B256) -> ConsensusResult<()> {
+        if let Some(pending) = self.pending_proposal.take() {
+            if pending.block_hash == block_hash {
+                // Case 1: Proposal arrived first, BlockData arrived now → send deferred vote
+                tracing::info!(
+                    view = pending.view, %block_hash,
+                    "block imported, sending deferred vote"
+                );
+                self.send_vote(pending.view, pending.block_hash)?;
+            } else {
+                // Hash mismatch: cache this import, restore the pending proposal
+                self.imported_blocks.insert(block_hash);
+                self.pending_proposal = Some(pending);
+            }
+        } else {
+            // Case 2: BlockData arrived first, no Proposal yet → cache for later
+            self.imported_blocks.insert(block_hash);
+        }
+        Ok(())
+    }
+
     // ── Internal helpers ──
 
     fn advance_to_view(&mut self, new_view: ViewNumber) {
@@ -681,6 +828,8 @@ impl ConsensusEngine {
         self.commit_collector = None;
         self.timeout_collector = None;
         self.prepare_qc = None;
+        self.pending_proposal = None;
+        self.imported_blocks.clear();
 
         tracing::debug!(view = new_view, "advanced to new view");
     }
@@ -828,7 +977,7 @@ mod tests {
             outputs.push(output);
         }
 
-        // Should have emitted: Proposal, PrepareQC, BlockCommitted
+        // Should have emitted: Proposal, PrepareQC, Decide, BlockCommitted
         let has_proposal = outputs
             .iter()
             .any(|o| matches!(o, EngineOutput::BroadcastMessage(ConsensusMessage::Proposal(_))));
@@ -838,6 +987,11 @@ mod tests {
             .iter()
             .any(|o| matches!(o, EngineOutput::BroadcastMessage(ConsensusMessage::PrepareQC(_))));
         assert!(has_prepare_qc, "should broadcast a PrepareQC");
+
+        let has_decide = outputs
+            .iter()
+            .any(|o| matches!(o, EngineOutput::BroadcastMessage(ConsensusMessage::Decide(_))));
+        assert!(has_decide, "should broadcast a Decide");
 
         let has_committed = outputs
             .iter()
@@ -898,7 +1052,7 @@ mod tests {
     }
 
     #[test]
-    fn test_engine_valid_proposal() {
+    fn test_engine_valid_proposal_defers_vote() {
         let (mut engine, sks, _, mut rx) = make_engine(4, 0);
 
         // View 1: leader is validator 1
@@ -922,7 +1076,7 @@ mod tests {
 
         assert_eq!(engine.current_phase(), Phase::Voting);
 
-        // Should have emitted ExecuteBlock and SendToValidator(vote)
+        // Should have emitted ExecuteBlock but NOT a vote yet (deferred)
         let mut outputs = vec![];
         while let Ok(output) = rx.try_recv() {
             outputs.push(output);
@@ -936,7 +1090,100 @@ mod tests {
         let has_vote = outputs
             .iter()
             .any(|o| matches!(o, EngineOutput::SendToValidator(_, ConsensusMessage::Vote(_))));
-        assert!(has_vote, "should send vote to leader");
+        assert!(!has_vote, "should NOT send vote before block is imported");
+
+        // Verify pending_proposal is set
+        assert!(engine.pending_proposal.is_some(), "should have pending proposal");
+
+        // Now send BlockImported → should trigger deferred vote
+        engine
+            .process_event(ConsensusEvent::BlockImported(block_hash))
+            .expect("BlockImported should succeed");
+
+        let mut outputs = vec![];
+        while let Ok(output) = rx.try_recv() {
+            outputs.push(output);
+        }
+
+        let has_vote = outputs
+            .iter()
+            .any(|o| matches!(o, EngineOutput::SendToValidator(_, ConsensusMessage::Vote(_))));
+        assert!(has_vote, "should send vote after block is imported");
+
+        // pending_proposal should be cleared
+        assert!(engine.pending_proposal.is_none(), "pending proposal should be cleared");
+    }
+
+    #[test]
+    fn test_engine_block_imported_before_proposal() {
+        let (mut engine, sks, _, mut rx) = make_engine(4, 0);
+        let block_hash = B256::repeat_byte(0xEE);
+
+        // BlockData arrives BEFORE Proposal
+        engine
+            .process_event(ConsensusEvent::BlockImported(block_hash))
+            .expect("BlockImported before proposal should succeed");
+
+        // Should be cached in imported_blocks
+        assert!(engine.imported_blocks.contains(&block_hash), "block should be cached");
+
+        // Now Proposal arrives
+        let msg = signing_message(1, &block_hash);
+        let sig = sks[1].sign(&msg);
+        let proposal = Proposal {
+            view: 1,
+            block_hash,
+            justify_qc: QuorumCertificate::genesis(),
+            proposer: 1,
+            signature: sig,
+        };
+
+        engine
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(proposal)))
+            .expect("valid proposal should be accepted");
+
+        // Should have voted immediately (block was already imported)
+        let mut outputs = vec![];
+        while let Ok(output) = rx.try_recv() {
+            outputs.push(output);
+        }
+
+        let has_vote = outputs
+            .iter()
+            .any(|o| matches!(o, EngineOutput::SendToValidator(_, ConsensusMessage::Vote(_))));
+        assert!(has_vote, "should send vote immediately when block was already imported");
+
+        // No pending proposal
+        assert!(engine.pending_proposal.is_none(), "should not have pending proposal");
+        // Block should be removed from cache
+        assert!(!engine.imported_blocks.contains(&block_hash), "block should be removed from cache");
+    }
+
+    #[test]
+    fn test_engine_timeout_clears_pending_proposal() {
+        let (mut engine, sks, _, mut rx) = make_engine(4, 0);
+        let block_hash = B256::repeat_byte(0xEE);
+
+        // Receive a valid proposal (defers vote)
+        let msg = signing_message(1, &block_hash);
+        let sig = sks[1].sign(&msg);
+        let proposal = Proposal {
+            view: 1,
+            block_hash,
+            justify_qc: QuorumCertificate::genesis(),
+            proposer: 1,
+            signature: sig,
+        };
+        engine
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(proposal)))
+            .expect("proposal should succeed");
+        while rx.try_recv().is_ok() {}
+
+        assert!(engine.pending_proposal.is_some(), "should have pending proposal");
+
+        // Timeout → pending should be cleared
+        engine.on_timeout().expect("timeout should succeed");
+        assert!(engine.pending_proposal.is_none(), "timeout should clear pending proposal");
     }
 
     #[test]
@@ -1055,6 +1302,8 @@ mod tests {
         while let Ok(o) = rx.try_recv() {
             outputs.push(o);
         }
+        let has_decide = outputs.iter().any(|o| matches!(o, EngineOutput::BroadcastMessage(ConsensusMessage::Decide(_))));
+        assert!(has_decide, "should broadcast Decide");
         let has_committed = outputs.iter().any(|o| matches!(o, EngineOutput::BlockCommitted { block_hash: h, view: v, .. } if *h == block_hash && *v == view));
         assert!(has_committed, "should emit BlockCommitted");
     }
@@ -1082,6 +1331,11 @@ mod tests {
         engine
             .process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(proposal)))
             .expect("proposal should succeed");
+
+        // Simulate block data import (required before vote is sent)
+        engine
+            .process_event(ConsensusEvent::BlockImported(block_hash))
+            .expect("BlockImported should succeed");
 
         // Drain outputs
         while rx.try_recv().is_ok() {}
@@ -1345,7 +1599,152 @@ mod tests {
         while let Ok(o) = rx.try_recv() {
             outputs.push(o);
         }
+        let has_decide = outputs.iter().any(|o| matches!(o, EngineOutput::BroadcastMessage(ConsensusMessage::Decide(_))));
+        assert!(has_decide, "should broadcast Decide despite invalid vote from validator 3");
         let has_committed = outputs.iter().any(|o| matches!(o, EngineOutput::BlockCommitted { .. }));
         assert!(has_committed, "block should be committed despite invalid vote from validator 3");
+    }
+
+    // ── Decide message tests ──
+
+    /// Helper: build a valid CommitQC for testing Decide messages.
+    fn build_test_commit_qc(
+        view: ViewNumber,
+        block_hash: B256,
+        sks: &[BlsSecretKey],
+        vs: &ValidatorSet,
+        signers: &[u32],
+    ) -> QuorumCertificate {
+        use crate::protocol::quorum::{VoteCollector, commit_signing_message};
+        let mut collector = VoteCollector::new(view, block_hash, vs.len());
+        for &i in signers {
+            let msg = commit_signing_message(view, &block_hash);
+            let sig = sks[i as usize].sign(&msg);
+            collector.add_vote(i, sig).unwrap();
+        }
+        collector.build_qc_with_message(vs, &commit_signing_message(view, &block_hash)).unwrap()
+    }
+
+    /// Follower correctly commits and advances view when receiving a valid Decide.
+    #[test]
+    fn test_decide_advances_follower() {
+        use n42_primitives::consensus::Decide;
+
+        // 4 validators, follower is validator 0, view 1
+        let (mut engine, sks, vs, mut rx) = make_engine(4, 0);
+        let block_hash = B256::repeat_byte(0xD1);
+        let view = 1u64;
+
+        assert_eq!(engine.current_view(), 1);
+
+        // Build a valid CommitQC with 3 signers (quorum)
+        let commit_qc = build_test_commit_qc(view, block_hash, &sks, &vs, &[0, 1, 2]);
+
+        let decide = Decide {
+            view,
+            block_hash,
+            commit_qc,
+        };
+
+        engine
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Decide(decide)))
+            .expect("valid Decide should succeed");
+
+        // Follower should advance to view 2
+        assert_eq!(engine.current_view(), 2, "follower should advance to view 2");
+        assert_eq!(engine.current_phase(), Phase::WaitingForProposal);
+
+        // Should have emitted BlockCommitted
+        let mut outputs = vec![];
+        while let Ok(o) = rx.try_recv() {
+            outputs.push(o);
+        }
+        let has_committed = outputs.iter().any(|o| matches!(
+            o,
+            EngineOutput::BlockCommitted { block_hash: h, view: v, .. }
+            if *h == block_hash && *v == view
+        ));
+        assert!(has_committed, "follower should emit BlockCommitted after Decide");
+    }
+
+    /// Stale Decide (view < current) should be silently ignored.
+    #[test]
+    fn test_decide_stale_ignored() {
+        use n42_primitives::consensus::Decide;
+
+        let (mut engine, sks, vs, _rx) = make_engine(4, 0);
+        let block_hash = B256::repeat_byte(0xD2);
+
+        // Advance engine to view 5 by processing a future timeout
+        let dummy = n42_primitives::consensus::TimeoutMessage {
+            view: 5,
+            high_qc: QuorumCertificate::genesis(),
+            sender: 0,
+            signature: sks[0].sign(b"advance"),
+        };
+        let _ = engine.process_event(ConsensusEvent::Message(
+            ConsensusMessage::Timeout(dummy),
+        ));
+        assert_eq!(engine.current_view(), 5);
+
+        // Send a Decide for view 3 (stale)
+        let commit_qc = build_test_commit_qc(3, block_hash, &sks, &vs, &[0, 1, 2]);
+        let decide = Decide {
+            view: 3,
+            block_hash,
+            commit_qc,
+        };
+
+        engine
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Decide(decide)))
+            .expect("stale Decide should be ignored without error");
+
+        // Engine should still be at view 5
+        assert_eq!(engine.current_view(), 5, "stale Decide should not change view");
+    }
+
+    /// Decide with insufficient quorum in CommitQC should be rejected.
+    #[test]
+    fn test_decide_invalid_qc_rejected() {
+        use bitvec::prelude::*;
+        use n42_primitives::consensus::Decide;
+
+        // 4 validators, f=1, quorum=3
+        let (mut engine, sks, _vs, _rx) = make_engine(4, 0);
+        let block_hash = B256::repeat_byte(0xD3);
+        let view = 1u64;
+
+        // Manually construct a QC with only 2 signers (below quorum of 3).
+        // We can't use VoteCollector::build_qc_with_message because it also
+        // enforces quorum. Instead, build the QC struct directly.
+        let mut signers = bitvec![u8, Msb0; 0; 4];
+        signers.set(0, true);
+        signers.set(1, true);
+        // 2 signers out of 4 (quorum = 3)
+
+        let weak_qc = QuorumCertificate {
+            view,
+            block_hash,
+            aggregate_signature: sks[0].sign(b"dummy"),
+            signers,
+        };
+
+        let decide = Decide {
+            view,
+            block_hash,
+            commit_qc: weak_qc,
+        };
+
+        let result = engine.process_event(ConsensusEvent::Message(
+            ConsensusMessage::Decide(decide),
+        ));
+        assert!(result.is_err(), "Decide with insufficient quorum should be rejected");
+        match result.unwrap_err() {
+            ConsensusError::InsufficientVotes { have, need, .. } => {
+                assert_eq!(have, 2);
+                assert_eq!(need, 3);
+            }
+            other => panic!("expected InsufficientVotes, got: {:?}", other),
+        }
     }
 }

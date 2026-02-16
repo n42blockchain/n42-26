@@ -122,10 +122,23 @@ impl BenchHarness {
             .unwrap();
 
         // Step 2: Route Proposal
+        let proposal_block_hash = match &proposal {
+            ConsensusMessage::Proposal(p) => p.block_hash,
+            _ => unreachable!(),
+        };
         for i in 0..n {
             if i != leader {
                 self.engines[i]
                     .process_event(ConsensusEvent::Message(proposal.clone()))
+                    .unwrap();
+            }
+        }
+
+        // Step 2.5: Simulate block data import for non-leaders (deferred voting)
+        for i in 0..n {
+            if i != leader {
+                self.engines[i]
+                    .process_event(ConsensusEvent::BlockImported(proposal_block_hash))
                     .unwrap();
             }
         }
@@ -181,9 +194,22 @@ impl BenchHarness {
             }
         }
 
+        // Step 6: Route Decide from leader to followers
+        let leader_outputs_final = self.drain_outputs(leader);
+        for output in &leader_outputs_final {
+            if let EngineOutput::BroadcastMessage(msg @ ConsensusMessage::Decide(_)) = output {
+                for i in 0..n {
+                    if i != leader {
+                        let _ = self.engines[i]
+                            .process_event(ConsensusEvent::Message(msg.clone()));
+                    }
+                }
+            }
+        }
+
         let elapsed = start.elapsed();
 
-        // Advance non-leaders
+        // Safety net: advance any engines still behind
         let next_view = view + 1;
         for i in 0..n {
             if self.engines[i].current_view() < next_view {

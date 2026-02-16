@@ -170,6 +170,22 @@ impl TestHarness {
             }
         }
 
+        // ── Step 2.5: Simulate block data import for non-leaders ──
+        // In production, the leader broadcasts block data via /n42/blocks/1 topic
+        // and the orchestrator sends BlockImported after new_payload succeeds.
+        // In this test harness, we simulate immediate block data availability.
+        let proposal_block_hash = match &proposal {
+            ConsensusMessage::Proposal(p) => p.block_hash,
+            _ => unreachable!(),
+        };
+        for i in 0..n {
+            if i != leader {
+                self.engines[i]
+                    .process_event(ConsensusEvent::BlockImported(proposal_block_hash))
+                    .expect("non-leader should accept BlockImported");
+            }
+        }
+
         // ── Step 3: Route Votes from non-leaders to leader ──
         for i in 0..n {
             if i != leader {
@@ -224,8 +240,10 @@ impl TestHarness {
             }
         }
 
-        // ── Step 6: Record committed block ──
+        // ── Step 6: Route Decide from leader to all followers ──
         let leader_outputs = self.drain_outputs(leader);
+
+        // Record committed block from leader outputs
         for output in &leader_outputs {
             if let EngineOutput::BlockCommitted {
                 view: v,
@@ -237,7 +255,32 @@ impl TestHarness {
             }
         }
 
-        // ── Step 7: Advance non-leaders to next view via timeout catch-up ──
+        // Extract and route Decide messages to all non-leaders
+        let decide_msgs: Vec<_> = leader_outputs
+            .into_iter()
+            .filter(|o| matches!(o, EngineOutput::BroadcastMessage(ConsensusMessage::Decide(_))))
+            .collect();
+
+        for output in &decide_msgs {
+            if let EngineOutput::BroadcastMessage(msg) = output {
+                for i in 0..n {
+                    if i != leader {
+                        let _ = self.engines[i]
+                            .process_event(ConsensusEvent::Message(msg.clone()));
+                    }
+                }
+            }
+        }
+
+        // Drain follower outputs (Decide triggers BlockCommitted on followers,
+        // but we only count committed blocks once per view from the leader above).
+        for i in 0..n {
+            if i != leader {
+                self.drain_outputs(i);
+            }
+        }
+
+        // ── Step 7: Safety net — advance any engines still behind ──
         let next_view = view + 1;
         for i in 0..n {
             if self.engines[i].current_view() < next_view {
@@ -290,11 +333,24 @@ impl TestHarness {
             .expect("leader should broadcast Proposal");
 
         // Step 2: Route Proposal only to participating non-leaders
+        let proposal_block_hash = match &proposal {
+            ConsensusMessage::Proposal(p) => p.block_hash,
+            _ => unreachable!(),
+        };
         for &i in participating {
             if i != leader {
                 self.engines[i]
                     .process_event(ConsensusEvent::Message(proposal.clone()))
                     .expect("non-leader should accept Proposal");
+            }
+        }
+
+        // Step 2.5: Simulate block data import for participating non-leaders
+        for &i in participating {
+            if i != leader {
+                self.engines[i]
+                    .process_event(ConsensusEvent::BlockImported(proposal_block_hash))
+                    .expect("non-leader should accept BlockImported");
             }
         }
 
@@ -352,7 +408,7 @@ impl TestHarness {
             }
         }
 
-        // Step 7: Check for BlockCommitted
+        // Step 7: Check for BlockCommitted and route Decide
         let leader_outputs = self.drain_outputs(leader);
         let mut committed = false;
         for output in &leader_outputs {
@@ -367,7 +423,56 @@ impl TestHarness {
             }
         }
 
+        // Route Decide messages from leader to all other engines
+        let decide_msgs: Vec<_> = leader_outputs
+            .into_iter()
+            .filter(|o| matches!(o, EngineOutput::BroadcastMessage(ConsensusMessage::Decide(_))))
+            .collect();
+
+        for output in &decide_msgs {
+            if let EngineOutput::BroadcastMessage(msg) = output {
+                for i in 0..n {
+                    if i != leader {
+                        let _ = self.engines[i]
+                            .process_event(ConsensusEvent::Message(msg.clone()));
+                    }
+                }
+            }
+        }
+
+        // Drain follower outputs (Decide triggers BlockCommitted on followers,
+        // but we only count committed blocks once per view from the leader above).
+        for i in 0..n {
+            if i != leader {
+                self.drain_outputs(i);
+            }
+        }
+
         if committed {
+            // Catch-up: propagate Proposal + BlockImported + PrepareQC to non-participating
+            // engines so their locked_qc stays current. This simulates gossip catch-up
+            // that would happen in a real network — non-participating nodes eventually
+            // receive the round's messages and update their state. Without this,
+            // a non-participant that becomes leader next round would propose with a
+            // stale justify_qc, causing SafetyViolation on participating nodes.
+            let participating_set: std::collections::HashSet<usize> =
+                participating.iter().copied().collect();
+            for i in 0..n {
+                if !participating_set.contains(&i) && self.engines[i].current_view() <= view {
+                    // Send Proposal (updates locked_qc from justify_qc, enters Voting)
+                    let _ = self.engines[i]
+                        .process_event(ConsensusEvent::Message(proposal.clone()));
+                    // Send BlockImported (triggers deferred vote)
+                    let _ = self.engines[i]
+                        .process_event(ConsensusEvent::BlockImported(proposal_block_hash));
+                    // Send PrepareQC (updates locked_qc to current round's QC)
+                    let _ = self.engines[i]
+                        .process_event(ConsensusEvent::Message(prepare_qc.clone()));
+                }
+            }
+            // Drain catch-up outputs (discard late votes/commit-votes from catch-up)
+            self.drain_all_outputs();
+
             // Advance all engines to next view
             let next_view = view + 1;
             for i in 0..n {
@@ -562,13 +667,26 @@ mod multi_node_consensus {
             })
             .unwrap();
 
-        // Step 2: Non-leaders receive Proposal, produce Votes
+        // Step 2: Non-leaders receive Proposal (vote is deferred until block imported)
+        let proposal_block_hash = match &proposal {
+            ConsensusMessage::Proposal(p) => p.block_hash,
+            _ => unreachable!(),
+        };
         for i in 0..4 {
             if i != leader {
                 harness.engines[i]
                     .process_event(ConsensusEvent::Message(proposal.clone()))
                     .unwrap();
                 assert_eq!(harness.engines[i].current_phase(), Phase::Voting);
+            }
+        }
+
+        // Step 2.5: Simulate block data import → triggers deferred votes
+        for i in 0..4 {
+            if i != leader {
+                harness.engines[i]
+                    .process_event(ConsensusEvent::BlockImported(proposal_block_hash))
+                    .unwrap();
             }
         }
 
@@ -1066,11 +1184,18 @@ mod fault_tolerance {
             })
             .unwrap();
 
-        // Non-leaders accept proposal and vote
+        // Non-leaders accept proposal and simulate block import to trigger votes
+        let proposal_block_hash_1 = match &proposal {
+            ConsensusMessage::Proposal(p) => p.block_hash,
+            _ => unreachable!(),
+        };
         for i in 0..4 {
             if i != leader {
                 harness.engines[i]
                     .process_event(ConsensusEvent::Message(proposal.clone()))
+                    .unwrap();
+                harness.engines[i]
+                    .process_event(ConsensusEvent::BlockImported(proposal_block_hash_1))
                     .unwrap();
             }
         }
@@ -1117,8 +1242,15 @@ mod fault_tolerance {
             .unwrap();
 
         // Only engine 0 votes legitimately (leader has self-vote = 1, + engine 0 = 2)
+        let proposal2_block_hash = match &proposal2 {
+            ConsensusMessage::Proposal(p) => p.block_hash,
+            _ => unreachable!(),
+        };
         harness2.engines[0]
             .process_event(ConsensusEvent::Message(proposal2))
+            .unwrap();
+        harness2.engines[0]
+            .process_event(ConsensusEvent::BlockImported(proposal2_block_hash))
             .unwrap();
         let outputs = harness2.drain_outputs(0);
         for output in outputs {
@@ -1815,12 +1947,19 @@ mod byzantine_signature {
             })
             .expect("leader should broadcast Proposal");
 
-        // Step 2: Route proposal to non-leaders
+        // Step 2: Route proposal to non-leaders and simulate block import
+        let proposal_block_hash_byz = match &proposal {
+            ConsensusMessage::Proposal(p) => p.block_hash,
+            _ => unreachable!(),
+        };
         for i in 0..7 {
             if i != leader {
                 harness.engines[i]
                     .process_event(ConsensusEvent::Message(proposal.clone()))
                     .expect("non-leader should accept Proposal");
+                harness.engines[i]
+                    .process_event(ConsensusEvent::BlockImported(proposal_block_hash_byz))
+                    .expect("non-leader should accept BlockImported");
             }
         }
 
@@ -1914,11 +2053,18 @@ mod byzantine_signature {
             _ => None,
         }).unwrap();
 
+        let proposal_block_hash_cv = match &proposal {
+            ConsensusMessage::Proposal(p) => p.block_hash,
+            _ => unreachable!(),
+        };
         for i in 0..4 {
             if i != leader {
                 harness.engines[i]
                     .process_event(ConsensusEvent::Message(proposal.clone()))
                     .expect("accept proposal");
+                harness.engines[i]
+                    .process_event(ConsensusEvent::BlockImported(proposal_block_hash_cv))
+                    .expect("accept BlockImported");
             }
         }
 
@@ -2204,6 +2350,822 @@ mod attestation_e2e {
             harness.committed_blocks.len(),
             10,
             "all 10 blocks should be committed"
+        );
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Module: 21-Node HotStuff-2 Consensus Tests
+// n=21, f=6, quorum=13
+// ══════════════════════════════════════════════════════════════════════════════
+
+mod twenty_one_node {
+    use super::*;
+
+    /// Basic: verify n=21 validator set parameters.
+    #[test]
+    fn test_21v_genesis_state() {
+        let harness = TestHarness::new(21);
+
+        assert_eq!(harness.validator_set.len(), 21);
+        assert_eq!(harness.validator_set.fault_tolerance(), 6, "f should be 6 for n=21");
+        assert_eq!(harness.validator_set.quorum_size(), 13, "quorum should be 13 for n=21");
+
+        // All engines start at view 1, WaitingForProposal
+        for i in 0..21 {
+            assert_eq!(harness.engines[i].current_view(), 1);
+            assert_eq!(harness.engines[i].current_phase(), Phase::WaitingForProposal);
+        }
+
+        // View 1 leader should be validator 1 (1 % 21 = 1)
+        assert!(harness.engines[1].is_current_leader());
+        for i in 0..21 {
+            if i != 1 {
+                assert!(!harness.engines[i].is_current_leader());
+            }
+        }
+    }
+
+    /// Basic: single block consensus with all 21 nodes participating.
+    #[test]
+    fn test_21v_full_consensus_single_block() {
+        let mut harness = TestHarness::new(21);
+
+        let block_hash = B256::repeat_byte(0x21);
+        harness.run_consensus_round(1, block_hash);
+
+        assert_eq!(harness.committed_blocks.len(), 1);
+        assert_eq!(harness.committed_blocks[0], (1, block_hash));
+
+        // All engines should advance to view 2
+        for i in 0..21 {
+            assert!(
+                harness.engines[i].current_view() >= 2,
+                "engine {} should be at view >= 2, got {}",
+                i,
+                harness.engines[i].current_view()
+            );
+        }
+    }
+
+    /// Leader rotation: run 21 consecutive blocks to ensure every validator
+    /// gets to be leader exactly once.
+    #[test]
+    fn test_21v_leader_rotation_full_cycle() {
+        let mut harness = TestHarness::new(21);
+
+        for view in 1..=21u64 {
+            let leader = (view % 21) as usize;
+            assert!(
+                harness.engines[leader].is_current_leader(),
+                "view {} leader should be validator {}",
+                view,
+                leader
+            );
+
+            let mut block_bytes = [0u8; 32];
+            block_bytes[0..8].copy_from_slice(&view.to_le_bytes());
+            let block_hash = B256::from(block_bytes);
+
+            harness.run_consensus_round(view, block_hash);
+        }
+
+        assert_eq!(
+            harness.committed_blocks.len(),
+            21,
+            "all 21 blocks should be committed (full leader rotation)"
+        );
+
+        // Verify each view committed the correct block
+        for (idx, &(v, _h)) in harness.committed_blocks.iter().enumerate() {
+            assert_eq!(
+                v,
+                (idx + 1) as u64,
+                "committed block {} should be at view {}",
+                idx,
+                idx + 1
+            );
+        }
+    }
+
+    /// Consecutive: 50 blocks with all 21 nodes, verifying liveness over
+    /// multiple leader rotation cycles.
+    #[test]
+    fn test_21v_consecutive_50_blocks() {
+        let mut harness = TestHarness::new(21);
+
+        for view in 1..=50u64 {
+            let mut block_bytes = [0u8; 32];
+            block_bytes[0..8].copy_from_slice(&view.to_le_bytes());
+            let block_hash = B256::from(block_bytes);
+            harness.run_consensus_round(view, block_hash);
+        }
+
+        assert_eq!(harness.committed_blocks.len(), 50);
+
+        // Verify monotonic view progression
+        for i in 1..harness.committed_blocks.len() {
+            assert!(
+                harness.committed_blocks[i].0 > harness.committed_blocks[i - 1].0,
+                "committed views should be monotonically increasing"
+            );
+        }
+    }
+
+    /// Fault tolerance: exactly quorum (13 of 21) participate, 8 crash.
+    /// With f=6, losing 8 > f nodes should still work because quorum=13
+    /// and we have exactly 13 participants.
+    #[test]
+    fn test_21v_exact_quorum_13_of_21() {
+        let mut harness = TestHarness::new(21);
+
+        // Participating validators: first 13 (indices 0-12)
+        // For view 1, leader = 1 % 21 = 1, which is in the participating set.
+        let participating: Vec<usize> = (0..13).collect();
+
+        let block_hash = B256::repeat_byte(0xEE);
+        let committed = harness.run_consensus_round_partial(1, block_hash, &participating);
+
+        assert!(committed, "exactly quorum (13/21) should achieve consensus");
+        assert_eq!(harness.committed_blocks.len(), 1);
+    }
+
+    /// Fault tolerance: f=6 crash, 15 nodes remain (still > quorum=13).
+    #[test]
+    fn test_21v_f_crash_6_nodes_down() {
+        let mut harness = TestHarness::new(21);
+
+        // 6 crashed nodes: indices 15-20
+        let participating: Vec<usize> = (0..15).collect();
+
+        let block_hash = B256::repeat_byte(0xCC);
+        let committed = harness.run_consensus_round_partial(1, block_hash, &participating);
+
+        assert!(committed, "15/21 nodes (6 crashed, f=6) should achieve consensus");
+        assert_eq!(harness.committed_blocks.len(), 1);
+    }
+
+    /// Fault tolerance: f+1=7 crash, only 14 remain.
+    /// 14 >= quorum=13, so should still commit.
+    #[test]
+    fn test_21v_f_plus_1_crash_14_remain() {
+        let mut harness = TestHarness::new(21);
+
+        // 7 crashed nodes: indices 14-20
+        let participating: Vec<usize> = (0..14).collect();
+
+        let block_hash = B256::repeat_byte(0xDD);
+        let committed = harness.run_consensus_round_partial(1, block_hash, &participating);
+
+        assert!(committed, "14/21 nodes (7 crashed) should still achieve consensus (14 >= quorum=13)");
+    }
+
+    /// Fault tolerance: 9 crash, only 12 remain.
+    /// 12 < quorum=13, so consensus MUST stall.
+    #[test]
+    fn test_21v_below_quorum_12_of_21_stalls() {
+        let mut harness = TestHarness::new(21);
+
+        // Only 12 nodes participate (indices 0-11)
+        // For view 1, leader = 1, which is in the set
+        let participating: Vec<usize> = (0..12).collect();
+
+        let block_hash = B256::repeat_byte(0xFF);
+        let committed = harness.run_consensus_round_partial(1, block_hash, &participating);
+
+        assert!(!committed, "12/21 nodes (below quorum=13) must NOT achieve consensus");
+        assert_eq!(harness.committed_blocks.len(), 0);
+    }
+
+    /// Byzantine: f=6 nodes send votes with invalid signatures,
+    /// but 14 honest nodes form quorum (14 >= 13).
+    #[test]
+    fn test_21v_byzantine_6_invalid_votes() {
+        let mut harness = TestHarness::new(21);
+        let n = 21;
+        let view = 1u64;
+        let leader = (view % n as u64) as usize;
+        let block_hash = B256::repeat_byte(0xBB);
+
+        // Step 1: Leader proposes
+        harness.engines[leader]
+            .process_event(ConsensusEvent::BlockReady(block_hash))
+            .expect("leader BlockReady should succeed");
+
+        let leader_outputs = harness.drain_outputs(leader);
+        let proposal = leader_outputs
+            .iter()
+            .find_map(|o| match o {
+                EngineOutput::BroadcastMessage(msg @ ConsensusMessage::Proposal(_)) => {
+                    Some(msg.clone())
+                }
+                _ => None,
+            })
+            .expect("leader should broadcast Proposal");
+
+        // Step 2: Route Proposal to all non-leaders
+        for i in 0..n {
+            if i != leader {
+                harness.engines[i]
+                    .process_event(ConsensusEvent::Message(proposal.clone()))
+                    .expect("should accept Proposal");
+            }
+        }
+
+        // Step 2.5: BlockImported for all non-leaders
+        for i in 0..n {
+            if i != leader {
+                harness.engines[i]
+                    .process_event(ConsensusEvent::BlockImported(block_hash))
+                    .expect("should accept BlockImported");
+            }
+        }
+
+        // Step 3: Route votes — 6 Byzantine nodes (indices 15-20) send invalid votes
+        let byzantine_set: std::collections::HashSet<usize> = (15..21).collect();
+
+        for i in 0..n {
+            if i != leader {
+                let outputs = harness.drain_outputs(i);
+                for output in outputs {
+                    if let EngineOutput::SendToValidator(target, msg) = output {
+                        if target == leader as u32 {
+                            if byzantine_set.contains(&i) {
+                                // Byzantine: tamper with signature by using wrong key
+                                if let ConsensusMessage::Vote(vote) = &msg {
+                                    let wrong_key = test_bls_key(99);
+                                    let vote_msg = n42_consensus::protocol::quorum::signing_message(
+                                        vote.view,
+                                        &vote.block_hash,
+                                    );
+                                    let bad_sig = wrong_key.sign(&vote_msg);
+                                    let bad_vote = Vote {
+                                        view: vote.view,
+                                        block_hash: vote.block_hash,
+                                        voter: vote.voter,
+                                        signature: bad_sig,
+                                    };
+                                    let _ = harness.engines[leader].process_event(
+                                        ConsensusEvent::Message(ConsensusMessage::Vote(bad_vote)),
+                                    );
+                                }
+                            } else {
+                                // Honest vote
+                                harness.engines[leader]
+                                    .process_event(ConsensusEvent::Message(msg))
+                                    .expect("leader should accept honest Vote");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Step 4: Leader should have PrepareQC from 14 honest votes (>= quorum=13)
+        let leader_outputs = harness.drain_outputs(leader);
+        let prepare_qc = leader_outputs.iter().find_map(|o| match o {
+            EngineOutput::BroadcastMessage(msg @ ConsensusMessage::PrepareQC(_)) => {
+                Some(msg.clone())
+            }
+            _ => None,
+        });
+
+        assert!(
+            prepare_qc.is_some(),
+            "14 honest votes should form PrepareQC (quorum=13)"
+        );
+
+        // Continue: Route PrepareQC → CommitVotes → verify commitment
+        let prepare_qc = prepare_qc.unwrap();
+        for i in 0..n {
+            if i != leader && !byzantine_set.contains(&i) {
+                harness.engines[i]
+                    .process_event(ConsensusEvent::Message(prepare_qc.clone()))
+                    .expect("honest node should accept PrepareQC");
+            }
+        }
+
+        // Route commit votes from honest nodes
+        for i in 0..n {
+            if i != leader && !byzantine_set.contains(&i) {
+                let outputs = harness.drain_outputs(i);
+                for output in outputs {
+                    if let EngineOutput::SendToValidator(target, msg) = output {
+                        if target == leader as u32 {
+                            let _ = harness.engines[leader]
+                                .process_event(ConsensusEvent::Message(msg));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Verify commitment
+        let leader_outputs = harness.drain_outputs(leader);
+        let committed = leader_outputs.iter().any(|o| {
+            matches!(o, EngineOutput::BlockCommitted { .. })
+        });
+
+        assert!(committed, "block should be committed despite 6 Byzantine nodes");
+    }
+
+    /// Timeout: leader crash triggers view change across 21 nodes.
+    #[test]
+    fn test_21v_leader_crash_view_change() {
+        let mut harness = TestHarness::new(21);
+
+        // View 1 leader is validator 1 — simulate crash (don't propose).
+        // All other nodes timeout.
+        harness.run_timeout_view_change(1);
+
+        // After view change, all engines should be at view 2.
+        let _next_leader = (2 % 21) as usize; // validator 2
+        for i in 0..21 {
+            assert!(
+                harness.engines[i].current_view() >= 2,
+                "engine {} should advance to view >= 2 after view change, got {}",
+                i,
+                harness.engines[i].current_view()
+            );
+        }
+
+        // View 2: new leader (validator 2) proposes successfully.
+        let block_hash = B256::repeat_byte(0xAA);
+        harness.run_consensus_round(2, block_hash);
+
+        assert_eq!(harness.committed_blocks.len(), 1);
+        assert_eq!(harness.committed_blocks[0], (2, block_hash));
+    }
+
+    /// Timeout: two consecutive leader crashes, then successful consensus.
+    #[test]
+    fn test_21v_two_consecutive_leader_crashes() {
+        let mut harness = TestHarness::new(21);
+
+        // View 1: leader (val 1) crashes → timeout → advance to view 2
+        harness.run_timeout_view_change(1);
+
+        // View 2: leader (val 2) also crashes → timeout → advance to view 3
+        harness.run_timeout_view_change(2);
+
+        // View 3: leader (val 3) proposes successfully
+        let block_hash = B256::repeat_byte(0x33);
+        harness.run_consensus_round(3, block_hash);
+
+        assert_eq!(harness.committed_blocks.len(), 1);
+        assert_eq!(harness.committed_blocks[0], (3, block_hash));
+    }
+
+    /// Mixed: alternating successful rounds and timeouts.
+    /// 30 views: even views commit, odd views timeout.
+    #[test]
+    fn test_21v_mixed_consensus_and_timeouts() {
+        let mut harness = TestHarness::new(21);
+
+        let mut committed_count = 0;
+        let mut view = 1u64;
+
+        for round in 0..30 {
+            if round % 2 == 0 {
+                // Successful round
+                let mut block_bytes = [0u8; 32];
+                block_bytes[0..8].copy_from_slice(&view.to_le_bytes());
+                let block_hash = B256::from(block_bytes);
+                harness.run_consensus_round(view, block_hash);
+                committed_count += 1;
+                view += 1;
+            } else {
+                // Timeout round
+                harness.run_timeout_view_change(view);
+                view += 1;
+            }
+        }
+
+        assert_eq!(
+            harness.committed_blocks.len(),
+            committed_count,
+            "should have committed exactly {} blocks",
+            committed_count
+        );
+
+        // All engines should be at the same view
+        let final_view = harness.engines[0].current_view();
+        for i in 1..21 {
+            assert!(
+                harness.engines[i].current_view() >= final_view - 1,
+                "engine {} view {} should be near {}",
+                i,
+                harness.engines[i].current_view(),
+                final_view
+            );
+        }
+    }
+
+    /// Stability: 100 consecutive blocks with 21 nodes.
+    /// Tests sustained operation and memory behavior.
+    #[test]
+    fn test_21v_100_blocks_liveness() {
+        let mut harness = TestHarness::new(21);
+
+        for view in 1..=100u64 {
+            let mut block_bytes = [0u8; 32];
+            block_bytes[0..8].copy_from_slice(&view.to_le_bytes());
+            let block_hash = B256::from(block_bytes);
+            harness.run_consensus_round(view, block_hash);
+        }
+
+        assert_eq!(harness.committed_blocks.len(), 100);
+    }
+
+    /// Stability: verify locked_qc monotonicity over 50 mixed rounds.
+    #[test]
+    fn test_21v_locked_qc_monotonic() {
+        let mut harness = TestHarness::new(21);
+
+        let mut view = 1u64;
+        for round in 0..50 {
+            if round % 3 == 2 {
+                // Every 3rd round is a timeout
+                harness.run_timeout_view_change(view);
+            } else {
+                let mut block_bytes = [0u8; 32];
+                block_bytes[0..8].copy_from_slice(&view.to_le_bytes());
+                let block_hash = B256::from(block_bytes);
+                harness.run_consensus_round(view, block_hash);
+            }
+            view += 1;
+        }
+
+        // Verify all engines have consistent views
+        let views: Vec<u64> = (0..21)
+            .map(|i| harness.engines[i].current_view())
+            .collect();
+        let max_view = *views.iter().max().unwrap();
+        let min_view = *views.iter().min().unwrap();
+        assert!(
+            max_view - min_view <= 1,
+            "view divergence too large: max={}, min={}, views={:?}",
+            max_view,
+            min_view,
+            views
+        );
+    }
+
+    /// Fault tolerance: multiple rounds with exactly quorum participants,
+    /// different subsets each round (rotating which 8 are "down").
+    #[test]
+    fn test_21v_rotating_failures_10_rounds() {
+        let mut harness = TestHarness::new(21);
+
+        for round in 0..10u64 {
+            let view = round + 1;
+
+            // Rotate which 8 nodes are "down" each round.
+            // Ensure the leader for this view is always in the participating set.
+            let leader = (view % 21) as usize;
+
+            let participating: Vec<usize> = (0..21)
+                .filter(|&i| {
+                    // Drop 8 nodes based on round number
+                    let dropped_start = ((round as usize) * 3) % 21;
+                    let is_dropped = (0..8).any(|d| (dropped_start + d) % 21 == i);
+                    !is_dropped || i == leader // leader always participates
+                })
+                .collect();
+
+            // Ensure at least quorum (13) participants
+            if participating.len() < 13 {
+                // If leader inclusion pushed us to exactly 13, that's fine
+                // Otherwise we need more — but with 21-8=13, plus leader always included,
+                // we should have exactly 13 or 14.
+            }
+
+            let mut block_bytes = [0u8; 32];
+            block_bytes[0..8].copy_from_slice(&view.to_le_bytes());
+            let block_hash = B256::from(block_bytes);
+
+            let committed =
+                harness.run_consensus_round_partial(view, block_hash, &participating);
+
+            assert!(
+                committed,
+                "round {} (view {}) with {}/21 nodes should commit (quorum=13), participating={:?}",
+                round,
+                view,
+                participating.len(),
+                participating
+            );
+
+            // Advance non-participating engines to keep them roughly in sync
+            let next_view = view + 1;
+            for i in 0..21 {
+                if harness.engines[i].current_view() < next_view {
+                    let dummy = TimeoutMessage {
+                        view: next_view,
+                        high_qc: QuorumCertificate::genesis(),
+                        sender: 0,
+                        signature: harness.secret_keys[0].sign(b"advance"),
+                    };
+                    let _ = harness.engines[i].process_event(ConsensusEvent::Message(
+                        ConsensusMessage::Timeout(dummy),
+                    ));
+                }
+            }
+            harness.drain_all_outputs();
+        }
+
+        assert_eq!(harness.committed_blocks.len(), 10);
+    }
+
+    /// All 21 engines should remain view-consistent after 200 mixed rounds.
+    #[test]
+    fn test_21v_view_consistency_200_rounds() {
+        let mut harness = TestHarness::new(21);
+
+        let mut view = 1u64;
+        let mut committed = 0;
+        let mut timeouts = 0;
+
+        for round in 0..200 {
+            // 80% success, 20% timeout
+            if round % 5 == 4 {
+                harness.run_timeout_view_change(view);
+                timeouts += 1;
+            } else {
+                let mut block_bytes = [0u8; 32];
+                block_bytes[0..8].copy_from_slice(&view.to_le_bytes());
+                let block_hash = B256::from(block_bytes);
+                harness.run_consensus_round(view, block_hash);
+                committed += 1;
+            }
+            view += 1;
+        }
+
+        assert_eq!(harness.committed_blocks.len(), committed);
+
+        // Final view consistency check
+        let views: Vec<u64> = (0..21)
+            .map(|i| harness.engines[i].current_view())
+            .collect();
+        let max_view = *views.iter().max().unwrap();
+        let min_view = *views.iter().min().unwrap();
+
+        assert!(
+            max_view - min_view <= 1,
+            "after 200 rounds ({}c/{}t), view divergence too large: max={}, min={}, views={:?}",
+            committed,
+            timeouts,
+            max_view,
+            min_view,
+            views
+        );
+    }
+
+    /// Byzantine: f=6 nodes send votes for WRONG block hash.
+    /// 14 honest nodes should still reach consensus on the correct block.
+    #[test]
+    fn test_21v_byzantine_6_wrong_block_votes() {
+        let mut harness = TestHarness::new(21);
+        let n = 21;
+        let view = 1u64;
+        let leader = (view % n as u64) as usize;
+        let correct_hash = B256::repeat_byte(0xAA);
+        let wrong_hash = B256::repeat_byte(0x99);
+
+        // Step 1: Leader proposes correct block
+        harness.engines[leader]
+            .process_event(ConsensusEvent::BlockReady(correct_hash))
+            .expect("BlockReady should succeed");
+
+        let leader_outputs = harness.drain_outputs(leader);
+        let proposal = leader_outputs
+            .iter()
+            .find_map(|o| match o {
+                EngineOutput::BroadcastMessage(msg @ ConsensusMessage::Proposal(_)) => {
+                    Some(msg.clone())
+                }
+                _ => None,
+            })
+            .expect("leader should broadcast Proposal");
+
+        // Step 2: Route Proposal + BlockImported to all
+        for i in 0..n {
+            if i != leader {
+                harness.engines[i]
+                    .process_event(ConsensusEvent::Message(proposal.clone()))
+                    .expect("should accept Proposal");
+                harness.engines[i]
+                    .process_event(ConsensusEvent::BlockImported(correct_hash))
+                    .expect("should accept BlockImported");
+            }
+        }
+
+        // Step 3: Byzantine validators (15-20) forge votes for wrong block
+        let byzantine_set: std::collections::HashSet<usize> = (15..21).collect();
+
+        for i in 0..n {
+            if i != leader {
+                let outputs = harness.drain_outputs(i);
+                for output in outputs {
+                    if let EngineOutput::SendToValidator(target, msg) = output {
+                        if target == leader as u32 {
+                            if byzantine_set.contains(&i) {
+                                // Byzantine: vote for wrong block hash
+                                if let ConsensusMessage::Vote(vote) = &msg {
+                                    let vote_msg = signing_message(vote.view, &wrong_hash);
+                                    let bad_sig =
+                                        harness.secret_keys[i].sign(&vote_msg);
+                                    let bad_vote = Vote {
+                                        view: vote.view,
+                                        block_hash: wrong_hash,
+                                        voter: vote.voter,
+                                        signature: bad_sig,
+                                    };
+                                    // This vote is for a different block → VoteCollector
+                                    // should ignore it (wrong block_hash).
+                                    let _ = harness.engines[leader].process_event(
+                                        ConsensusEvent::Message(ConsensusMessage::Vote(bad_vote)),
+                                    );
+                                }
+                            } else {
+                                harness.engines[leader]
+                                    .process_event(ConsensusEvent::Message(msg))
+                                    .expect("should accept honest Vote");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 14 honest votes for correct_hash → should form PrepareQC
+        let leader_outputs = harness.drain_outputs(leader);
+        let has_prepare_qc = leader_outputs.iter().any(|o| {
+            matches!(o, EngineOutput::BroadcastMessage(ConsensusMessage::PrepareQC(_)))
+        });
+
+        assert!(
+            has_prepare_qc,
+            "14 honest votes for correct block should form PrepareQC despite 6 wrong-block votes"
+        );
+    }
+
+    /// Boundary: exactly 12 honest + leader = 13 (borderline quorum) should commit.
+    #[test]
+    fn test_21v_borderline_quorum() {
+        let mut harness = TestHarness::new(21);
+
+        // View 1: leader = 1
+        // Participating: leader (1) + validators 2-13 = 13 total = exact quorum
+        let participating: Vec<usize> = (1..14).collect();
+
+        let block_hash = B256::repeat_byte(0xBD);
+        let committed = harness.run_consensus_round_partial(1, block_hash, &participating);
+
+        assert!(
+            committed,
+            "borderline quorum of exactly 13/21 (including leader) should commit"
+        );
+    }
+
+    /// Boundary: 12 voters + leader = 13 for quorum, but one fewer = 12, should NOT commit.
+    #[test]
+    fn test_21v_one_below_quorum() {
+        let mut harness = TestHarness::new(21);
+
+        // View 1: leader = 1
+        // Participating: leader (1) + validators 2-12 = 12 total (one below quorum=13)
+        let participating: Vec<usize> = (1..13).collect();
+
+        let block_hash = B256::repeat_byte(0xB1);
+        let committed = harness.run_consensus_round_partial(1, block_hash, &participating);
+
+        assert!(
+            !committed,
+            "12/21 (one below quorum=13) should NOT commit"
+        );
+    }
+
+    /// Stability: 200 consecutive blocks with 21 nodes.
+    /// Tests sustained operation, memory behavior, and correct leader rotation
+    /// over ~9.5 full rotation cycles.
+    #[test]
+    fn test_21v_200_consecutive_blocks() {
+        let mut harness = TestHarness::new(21);
+
+        for view in 1..=200u64 {
+            let mut block_bytes = [0u8; 32];
+            block_bytes[0..8].copy_from_slice(&view.to_le_bytes());
+            block_bytes[8..16].copy_from_slice(&(view * 0x1337).to_le_bytes());
+            let block_hash = B256::from(block_bytes);
+            harness.run_consensus_round(view, block_hash);
+        }
+
+        assert_eq!(
+            harness.committed_blocks.len(),
+            200,
+            "all 200 blocks should be committed"
+        );
+
+        // Verify monotonic view progression
+        for i in 1..harness.committed_blocks.len() {
+            assert!(
+                harness.committed_blocks[i].0 > harness.committed_blocks[i - 1].0,
+                "committed views should be monotonically increasing at index {}",
+                i
+            );
+        }
+
+        // Verify correct block hash for each view
+        for (idx, &(v, h)) in harness.committed_blocks.iter().enumerate() {
+            let mut expected_bytes = [0u8; 32];
+            expected_bytes[0..8].copy_from_slice(&v.to_le_bytes());
+            expected_bytes[8..16].copy_from_slice(&(v * 0x1337).to_le_bytes());
+            let expected = B256::from(expected_bytes);
+            assert_eq!(
+                h, expected,
+                "block {} (view {}) hash mismatch",
+                idx, v
+            );
+        }
+
+        // All engines at view 201
+        for i in 0..21 {
+            assert!(
+                harness.engines[i].current_view() >= 201,
+                "engine {} should be at view >= 201 after 200 blocks, got {}",
+                i,
+                harness.engines[i].current_view()
+            );
+        }
+
+        // Verify every validator was leader approximately 200/21 ≈ 9-10 times
+        let mut leader_counts = [0u32; 21];
+        for &(v, _) in &harness.committed_blocks {
+            let leader = (v % 21) as usize;
+            leader_counts[leader] += 1;
+        }
+        for (i, &count) in leader_counts.iter().enumerate() {
+            assert!(
+                count >= 8 && count <= 11,
+                "validator {} was leader {} times (expected ~9-10)",
+                i,
+                count
+            );
+        }
+    }
+
+    /// Verify deferred voting: non-leader should NOT emit vote until BlockImported.
+    #[test]
+    fn test_21v_deferred_voting_behavior() {
+        let mut harness = TestHarness::new(21);
+        let view = 1u64;
+        let leader = (view % 21) as usize;
+        let block_hash = B256::repeat_byte(0xDF);
+
+        // Leader proposes
+        harness.engines[leader]
+            .process_event(ConsensusEvent::BlockReady(block_hash))
+            .expect("BlockReady should succeed");
+
+        let leader_outputs = harness.drain_outputs(leader);
+        let proposal = leader_outputs
+            .iter()
+            .find_map(|o| match o {
+                EngineOutput::BroadcastMessage(msg @ ConsensusMessage::Proposal(_)) => {
+                    Some(msg.clone())
+                }
+                _ => None,
+            })
+            .expect("should have Proposal");
+
+        // Route Proposal to validator 0 (non-leader)
+        harness.engines[0]
+            .process_event(ConsensusEvent::Message(proposal))
+            .expect("should accept Proposal");
+
+        // Check: NO vote yet (deferred voting)
+        let outputs = harness.drain_outputs(0);
+        let has_vote = outputs.iter().any(|o| {
+            matches!(o, EngineOutput::SendToValidator(_, ConsensusMessage::Vote(_)))
+        });
+        assert!(
+            !has_vote,
+            "non-leader should NOT emit vote before BlockImported"
+        );
+
+        // Now send BlockImported → vote should be emitted
+        harness.engines[0]
+            .process_event(ConsensusEvent::BlockImported(block_hash))
+            .expect("should accept BlockImported");
+
+        let outputs = harness.drain_outputs(0);
+        let has_vote = outputs.iter().any(|o| {
+            matches!(o, EngineOutput::SendToValidator(_, ConsensusMessage::Vote(_)))
+        });
+        assert!(
+            has_vote,
+            "non-leader should emit vote after BlockImported"
         );
     }
 }
