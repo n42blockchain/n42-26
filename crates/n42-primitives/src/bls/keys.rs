@@ -39,6 +39,15 @@ impl BlsSecretKey {
         Ok(Self(sk))
     }
 
+    /// Derives a BLS secret key from input keying material (IKM) using the
+    /// standard BLS key-generation algorithm (hash-to-scalar). This always
+    /// produces a valid key, unlike `from_bytes` which may reject raw bytes
+    /// that exceed the BLS12-381 curve order.
+    pub fn key_gen(ikm: &[u8; 32]) -> Result<Self, BlsError> {
+        let sk = SecretKey::key_gen(ikm, &[]).map_err(|_| BlsError::KeyGeneration)?;
+        Ok(Self(sk))
+    }
+
     pub fn public_key(&self) -> BlsPublicKey {
         BlsPublicKey(self.0.sk_to_pk())
     }

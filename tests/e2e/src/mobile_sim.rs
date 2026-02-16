@@ -14,12 +14,15 @@ pub struct MobileSimulator {
 
 impl MobileSimulator {
     /// Creates a new mobile simulator with a deterministic BLS key.
+    ///
+    /// Uses `key_gen` (IKM derivation) instead of `from_bytes` because raw
+    /// keccak256 output may exceed the BLS12-381 curve order.
     pub fn new(index: usize, node_url: String) -> Self {
         let seed = format!("n42-mobile-key-{index}");
         let seed_hash = alloy_primitives::keccak256(seed.as_bytes());
-        let key_bytes: [u8; 32] = seed_hash.0;
-        let bls_key = BlsSecretKey::from_bytes(&key_bytes)
-            .expect("valid BLS key from deterministic seed");
+        let ikm: [u8; 32] = seed_hash.0;
+        let bls_key = BlsSecretKey::key_gen(&ikm)
+            .expect("valid BLS key from deterministic IKM");
 
         let pubkey = bls_key.public_key();
         let pubkey_hex = hex::encode(pubkey.to_bytes());

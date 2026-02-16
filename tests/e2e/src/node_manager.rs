@@ -68,15 +68,24 @@ pub struct NodeProcess {
     pub ws_port: u16,
     pub p2p_port: u16,
     pub consensus_port: u16,
-    pub data_dir: TempDir,
+    /// Wrapped in Option so it can be extracted for restart tests via `stop_keep_data`.
+    data_dir: Option<TempDir>,
     pub rpc: RpcClient,
 }
 
 impl NodeProcess {
-    /// Starts an N42 node with the given configuration.
+    /// Starts an N42 node with the given configuration (new temp data directory).
     pub async fn start(config: &NodeConfig) -> eyre::Result<Self> {
         let data_dir = TempDir::new()?;
+        Self::start_inner(config, data_dir).await
+    }
 
+    /// Starts an N42 node reusing an existing data directory (for restart tests).
+    pub async fn start_with_datadir(config: &NodeConfig, data_dir: TempDir) -> eyre::Result<Self> {
+        Self::start_inner(config, data_dir).await
+    }
+
+    async fn start_inner(config: &NodeConfig, data_dir: TempDir) -> eyre::Result<Self> {
         // Generate the deterministic validator key for this index.
         let key_bytes = n42_chainspec::ConsensusConfig::deterministic_key_bytes(config.validator_index);
         let key_hex = hex::encode(key_bytes);
@@ -101,17 +110,18 @@ impl NodeProcess {
             .arg("--ipcdisable")
             .arg("--disable-discovery");
 
-        // Add trusted peers for multi-node setups.
-        for peer in &config.trusted_peers {
-            cmd.arg("--trusted-peers").arg(peer);
-        }
-
         // Set environment variables.
         cmd.env("N42_VALIDATOR_KEY", &key_hex)
-            .env("N42_VALIDATOR_COUNT", config.validator_count.to_string());
+            .env("N42_VALIDATOR_COUNT", config.validator_count.to_string())
+            .env("N42_CONSENSUS_PORT", consensus_port.to_string());
 
         if config.block_interval_ms > 0 {
             cmd.env("N42_BLOCK_INTERVAL_MS", config.block_interval_ms.to_string());
+        }
+
+        // Pass trusted peers via environment variable for multi-node setups.
+        if !config.trusted_peers.is_empty() {
+            cmd.env("N42_TRUSTED_PEERS", config.trusted_peers.join(","));
         }
 
         // Use Stdio::null() to avoid pipe buffer deadlock.
@@ -138,7 +148,7 @@ impl NodeProcess {
             ws_port,
             p2p_port,
             consensus_port,
-            data_dir,
+            data_dir: Some(data_dir),
             rpc,
         };
 
@@ -175,6 +185,26 @@ impl NodeProcess {
             // Check if the process has already exited.
             // We can't call wait() since it would block, but we can try_wait().
         }
+    }
+
+    /// Stops the node but returns the data directory for reuse in restart tests.
+    pub fn stop_keep_data(mut self) -> eyre::Result<TempDir> {
+        info!(http_port = self.http_port, "stopping N42 node (keeping data)");
+
+        #[cfg(unix)]
+        {
+            unsafe {
+                libc::kill(self.child.id() as i32, libc::SIGTERM);
+            }
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = self.child.kill();
+        }
+
+        let _ = self.child.wait();
+        self.data_dir.take().ok_or_else(|| eyre::eyre!("data dir already taken"))
     }
 
     /// Sends SIGTERM and waits for the node process to exit.

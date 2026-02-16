@@ -59,6 +59,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # BLS crypto
 blst.workspace = true
 
+# P2P (for computing deterministic PeerIds in multi-node tests)
+libp2p = { workspace = true, features = ["ed25519"] }
+
 # Error handling
 eyre.workspace = true
 

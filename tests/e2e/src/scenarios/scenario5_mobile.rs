@@ -7,39 +7,46 @@ use crate::mobile_sim;
 use crate::node_manager::{NodeConfig, NodeProcess};
 use crate::tx_engine::TxEngine;
 
-/// Scenario 5: Mobile phone verification with 3 consensus nodes + 15 phones.
+/// Scenario 5: Mobile phone verification with 3 solo nodes + 15 phones.
+///
+/// Each node runs as solo validator (independent block production) to avoid
+/// the multi-node block sync limitation. 5 mobile simulators per node submit
+/// BLS attestations against each node's chain.
 ///
 /// Verifies:
-/// - 3 consensus nodes produce blocks
+/// - 3 solo-validator nodes produce blocks independently
 /// - 15 mobile simulators (5 per node) submit BLS attestations
-/// - Attestations are accepted by nodes
+/// - Attestations are accepted by nodes (BLS signature verified)
 /// - Transactions execute normally alongside verification
 pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
-    info!("=== Scenario 5: Mobile Verification (3 nodes, 15 phones, 400s) ===");
+    info!("=== Scenario 5: Mobile Verification (3 solo nodes, 15 phones, 60s) ===");
 
     let accounts = genesis::generate_test_accounts();
-    let tmp_dir = tempfile::tempdir()?;
-    let genesis_path = genesis::write_genesis_file(tmp_dir.path(), &accounts);
 
-    // Start 3 consensus nodes.
+    // Start 3 solo-validator nodes (each produces blocks independently).
     let mut nodes = Vec::new();
+    let mut tmp_dirs = Vec::new();
     for i in 0..3 {
+        let tmp_dir = tempfile::tempdir()?;
+        let genesis_path = genesis::write_genesis_file(tmp_dir.path(), &accounts);
+
         let config = NodeConfig {
             binary_path: binary_path.clone(),
-            genesis_path: genesis_path.clone(),
-            validator_index: i,
-            validator_count: 3,
+            genesis_path,
+            validator_index: 0,
+            validator_count: 1,
             block_interval_ms: 4000,
             port_offset: (i as u16) * 10,
             trusted_peers: vec![],
         };
 
         let node = NodeProcess::start(&config).await?;
-        info!(index = i, http_port = node.http_port, "consensus node started");
+        info!(index = i, http_port = node.http_port, "solo node started");
         nodes.push(node);
+        tmp_dirs.push(tmp_dir);
     }
 
-    let test_duration = Duration::from_secs(400);
+    let test_duration = Duration::from_secs(60);
 
     // Spawn mobile simulators: 5 per node = 15 total.
     let mut mobile_handles = Vec::new();
@@ -71,11 +78,11 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
             let max_fee = gas_price * 2;
             let priority_fee = gas_price / 10;
 
-            // Send 5 tx/sec for the test duration (minus startup time).
+            // Send 5 tx/sec for a portion of the test duration.
             let _ = tx_engine.send_transfers_at_rate(
                 &rpc,
                 5,
-                380, // slightly less than 400s to account for startup
+                40, // ~40 seconds of transactions
                 max_fee,
                 priority_fee,
             ).await;

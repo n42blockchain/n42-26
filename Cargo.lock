@@ -2731,6 +2731,7 @@ dependencies = [
  "futures-util",
  "hex",
  "libc",
+ "libp2p",
  "n42-chainspec",
  "n42-primitives",
  "rand 0.8.5",

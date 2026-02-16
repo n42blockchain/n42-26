@@ -54,6 +54,7 @@ pub struct TransactionReceipt {
 
 /// Consensus status response from n42_consensusStatus.
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 #[allow(dead_code)]
 pub struct ConsensusStatus {
     pub latest_committed_view: Option<u64>,
@@ -64,6 +65,7 @@ pub struct ConsensusStatus {
 
 /// Attestation response from n42_submitAttestation.
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AttestationResponse {
     pub accepted: bool,
     pub attestation_count: u32,
@@ -231,7 +233,7 @@ impl RpcClient {
     ) -> eyre::Result<AttestationResponse> {
         self.call(
             "n42_submitAttestation",
-            json!([pubkey, signature, format!("{block_hash:?}"), format!("0x{slot:x}")]),
+            json!([pubkey, signature, format!("{block_hash:?}"), slot]),
         ).await
     }
 
