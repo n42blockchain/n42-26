@@ -35,11 +35,17 @@ impl<C> N42Consensus<C>
 where
     C: EthChainSpec + EthereumHardforks,
 {
+    /// Maximum extra_data size for N42 blocks.
+    /// N42 stores QuorumCertificate (BLS aggregate signature + signer bitmap)
+    /// in the header extra_data field, which exceeds Ethereum's default 32-byte limit.
+    const MAX_EXTRA_DATA_SIZE: usize = 4096;
+
     /// Create a new N42 consensus adapter (without validator set).
     /// QC verification is skipped until `set_validator_set` is called.
     pub fn new(chain_spec: Arc<C>) -> Self {
         Self {
-            inner: EthBeaconConsensus::new(chain_spec),
+            inner: EthBeaconConsensus::new(chain_spec)
+                .with_max_extra_data_size(Self::MAX_EXTRA_DATA_SIZE),
             validator_set: None,
         }
     }
@@ -47,7 +53,8 @@ where
     /// Create a new N42 consensus adapter with a validator set for QC verification.
     pub fn with_validator_set(chain_spec: Arc<C>, validator_set: ValidatorSet) -> Self {
         Self {
-            inner: EthBeaconConsensus::new(chain_spec),
+            inner: EthBeaconConsensus::new(chain_spec)
+                .with_max_extra_data_size(Self::MAX_EXTRA_DATA_SIZE),
             validator_set: Some(validator_set),
         }
     }

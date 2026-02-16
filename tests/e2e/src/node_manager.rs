@@ -99,7 +99,7 @@ impl NodeProcess {
             .arg("--authrpc.port").arg(auth_port.to_string())
             .arg("--port").arg(p2p_port.to_string())
             .arg("--ipcdisable")
-            .arg("--discovery.disable");
+            .arg("--disable-discovery");
 
         // Add trusted peers for multi-node setups.
         for peer in &config.trusted_peers {

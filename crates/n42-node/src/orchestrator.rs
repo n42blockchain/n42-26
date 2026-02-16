@@ -1,12 +1,12 @@
 use crate::consensus_state::SharedConsensusState;
 use alloy_primitives::{Address, B256};
-use alloy_rpc_types_engine::{ForkchoiceState, PayloadAttributes};
+use alloy_rpc_types_engine::{ForkchoiceState, PayloadAttributes, PayloadStatusEnum};
 use n42_consensus::{ConsensusEngine, ConsensusEvent, EngineOutput};
 use n42_network::{NetworkEvent, NetworkHandle};
 use reth_ethereum_engine_primitives::EthEngineTypes;
 use reth_node_builder::ConsensusEngineHandle;
 use reth_payload_builder::PayloadBuilderHandle;
-use reth_payload_primitives::{EngineApiMessageVersion, PayloadKind};
+use reth_payload_primitives::{EngineApiMessageVersion, PayloadKind, PayloadTypes};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -299,8 +299,10 @@ impl ConsensusOrchestrator {
                     info!(?payload_id, "payload building started, spawning resolve task");
 
                     // Spawn an async task that waits for the payload to be built,
-                    // then sends the block hash through the channel.
+                    // inserts it into reth via newPayload, then sends the block
+                    // hash through the channel.
                     let tx = self.block_ready_tx.clone();
+                    let engine_handle = beacon_engine.clone();
                     tokio::spawn(async move {
                         // Give the builder time to pack transactions from the pool.
                         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -311,8 +313,43 @@ impl ConsensusOrchestrator {
                         {
                             Some(Ok(payload)) => {
                                 let hash = payload.block().hash();
-                                info!(%hash, "payload resolved, sending BlockReady");
-                                let _ = tx.send(hash);
+
+                                // Insert the block into reth via Engine API newPayload.
+                                // Without this call, reth has no knowledge of the built
+                                // block and will report "syncing" on fork_choice_updated.
+                                let execution_data =
+                                    <EthEngineTypes as PayloadTypes>::block_to_payload(
+                                        payload.block().clone(),
+                                    );
+                                match engine_handle.new_payload(execution_data).await {
+                                    Ok(status) => {
+                                        match status.status {
+                                            PayloadStatusEnum::Valid |
+                                            PayloadStatusEnum::Accepted => {
+                                                info!(
+                                                    %hash,
+                                                    status = ?status.status,
+                                                    "newPayload valid, sending BlockReady"
+                                                );
+                                                let _ = tx.send(hash);
+                                            }
+                                            _ => {
+                                                error!(
+                                                    %hash,
+                                                    status = ?status.status,
+                                                    "newPayload returned non-valid status, block rejected"
+                                                );
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        error!(
+                                            %hash,
+                                            error = %e,
+                                            "newPayload failed, block not inserted"
+                                        );
+                                    }
+                                }
                             }
                             Some(Err(e)) => {
                                 error!(error = %e, "payload build failed");

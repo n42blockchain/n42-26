@@ -1,5 +1,4 @@
 use crate::consensus_state::SharedConsensusState;
-use n42_consensus::encode_qc_to_extra_data;
 use reth_basic_payload_builder::{
     BuildArguments, BuildOutcome, MissingPayloadBehaviour, PayloadBuilder, PayloadConfig,
 };
@@ -18,7 +17,6 @@ use reth_payload_builder_primitives::PayloadBuilderError;
 use reth_storage_api::StateProviderFactory;
 use reth_transaction_pool::{PoolTransaction, TransactionPool};
 use std::sync::Arc;
-use tracing::warn;
 
 /// N42 payload builder that injects the latest committed QC into block `extra_data`.
 ///
@@ -76,32 +74,29 @@ where
     }
 }
 
-/// Inner payload builder that dynamically reads QC from shared consensus state
-/// and injects it into `extra_data` on every `try_build()` invocation.
+/// Inner payload builder that builds blocks using the standard Ethereum payload flow.
+///
+/// Holds a reference to `SharedConsensusState` for future use (e.g., QC storage
+/// once a custom Engine API payload type is implemented).
 #[derive(Debug, Clone)]
 pub struct N42InnerPayloadBuilder<Pool, Client, Evm> {
     client: Client,
     pool: Pool,
     evm_config: Evm,
     base_config: EthereumBuilderConfig,
+    #[allow(dead_code)]
     consensus_state: Arc<SharedConsensusState>,
 }
 
 impl<Pool, Client, Evm> N42InnerPayloadBuilder<Pool, Client, Evm> {
-    /// Builds the `EthereumBuilderConfig` with the latest QC encoded as `extra_data`.
-    fn config_with_qc(&self) -> EthereumBuilderConfig {
-        let extra_data = match self.consensus_state.load_committed_qc().as_ref() {
-            Some(qc) => match encode_qc_to_extra_data(qc) {
-                Ok(data) => data,
-                Err(e) => {
-                    warn!(error = %e, "failed to encode QC for extra_data, using empty");
-                    Default::default()
-                }
-            },
-            None => Default::default(),
-        };
-
-        self.base_config.clone().with_extra_data(extra_data)
+    /// Returns the builder config for the current build.
+    ///
+    /// Note: QC data is NOT injected into extra_data because the alloy Engine API
+    /// layer (`ExecutionPayload::try_into_block_with_sidecar`) enforces a 32-byte
+    /// limit on extra_data, which is incompatible with N42's QC encoding (~200 bytes).
+    /// The QC is stored separately in `SharedConsensusState` for consensus purposes.
+    fn build_config(&self) -> EthereumBuilderConfig {
+        self.base_config.clone()
     }
 }
 
@@ -118,7 +113,7 @@ where
         &self,
         args: BuildArguments<EthPayloadBuilderAttributes, EthBuiltPayload>,
     ) -> Result<BuildOutcome<EthBuiltPayload>, PayloadBuilderError> {
-        let config = self.config_with_qc();
+        let config = self.build_config();
         default_ethereum_payload(
             self.evm_config.clone(),
             self.client.clone(),
@@ -140,7 +135,7 @@ where
         &self,
         config: PayloadConfig<Self::Attributes>,
     ) -> Result<EthBuiltPayload, PayloadBuilderError> {
-        let builder_config = self.config_with_qc();
+        let builder_config = self.build_config();
         let args = BuildArguments::new(Default::default(), config, Default::default(), None);
 
         default_ethereum_payload(
