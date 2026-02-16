@@ -339,6 +339,22 @@ impl ConsensusEngine {
             None => return Ok(()),
         };
 
+        // Verify the vote is for the correct block
+        if vote.block_hash != collector.block_hash() {
+            tracing::debug!(view, voter = vote.voter, "ignoring vote for different block");
+            return Ok(());
+        }
+
+        // Verify BLS signature before adding to collector
+        let pk = self.validator_set.get_public_key(vote.voter)?;
+        let msg = signing_message(view, &vote.block_hash);
+        pk.verify(&msg, &vote.signature).map_err(|_| {
+            ConsensusError::InvalidSignature {
+                view,
+                validator_index: vote.voter,
+            }
+        })?;
+
         collector.add_vote(vote.voter, vote.signature)?;
 
         tracing::debug!(
@@ -469,6 +485,22 @@ impl ConsensusEngine {
             None => return Ok(()),
         };
 
+        // Verify the commit vote is for the correct block
+        if cv.block_hash != collector.block_hash() {
+            tracing::debug!(view, voter = cv.voter, "ignoring commit vote for different block");
+            return Ok(());
+        }
+
+        // Verify BLS signature before adding to collector
+        let pk = self.validator_set.get_public_key(cv.voter)?;
+        let msg = commit_signing_message(view, &cv.block_hash);
+        pk.verify(&msg, &cv.signature).map_err(|_| {
+            ConsensusError::InvalidSignature {
+                view,
+                validator_index: cv.voter,
+            }
+        })?;
+
         collector.add_vote(cv.voter, cv.signature)?;
 
         tracing::debug!(
@@ -539,6 +571,16 @@ impl ConsensusEngine {
             }
             return Ok(());
         }
+
+        // Verify BLS signature on timeout message before adding to collector
+        let pk = self.validator_set.get_public_key(timeout.sender)?;
+        let msg = timeout_signing_message(view);
+        pk.verify(&msg, &timeout.signature).map_err(|_| {
+            ConsensusError::InvalidSignature {
+                view,
+                validator_index: timeout.sender,
+            }
+        })?;
 
         let collector = self
             .timeout_collector
@@ -1068,5 +1110,242 @@ mod tests {
         }
         let has_commit_vote = outputs.iter().any(|o| matches!(o, EngineOutput::SendToValidator(1, ConsensusMessage::CommitVote(cv)) if cv.view == view && cv.block_hash == block_hash));
         assert!(has_commit_vote, "validator should send CommitVote to leader");
+    }
+
+    // ── Level 2: Early signature verification tests ──
+
+    /// Votes with invalid BLS signatures should be rejected before entering the collector.
+    #[test]
+    fn test_process_vote_rejects_invalid_signature() {
+        // Leader is validator 1 at view 1 (1 % 4)
+        let (mut engine, sks, _, mut rx) = make_engine(4, 1);
+        let block_hash = B256::repeat_byte(0xA1);
+        let view = 1u64;
+
+        // Leader proposes
+        engine
+            .process_event(ConsensusEvent::BlockReady(block_hash))
+            .expect("block ready should succeed");
+        while rx.try_recv().is_ok() {}
+
+        // Send a vote with a signature signed over wrong message
+        let wrong_msg = signing_message(99, &block_hash);
+        let bad_sig = sks[0].sign(&wrong_msg);
+        let vote = Vote {
+            view,
+            block_hash,
+            voter: 0,
+            signature: bad_sig,
+        };
+
+        let result = engine.process_event(ConsensusEvent::Message(
+            ConsensusMessage::Vote(vote),
+        ));
+        assert!(result.is_err(), "vote with invalid signature should be rejected");
+        match result.unwrap_err() {
+            ConsensusError::InvalidSignature { view: v, validator_index } => {
+                assert_eq!(v, view);
+                assert_eq!(validator_index, 0);
+            }
+            other => panic!("expected InvalidSignature, got: {:?}", other),
+        }
+    }
+
+    /// Votes for a different block hash should be silently ignored.
+    #[test]
+    fn test_process_vote_ignores_wrong_block() {
+        let (mut engine, sks, _, mut rx) = make_engine(4, 1);
+        let block_hash = B256::repeat_byte(0xA2);
+        let wrong_block = B256::repeat_byte(0xFF);
+        let view = 1u64;
+
+        engine
+            .process_event(ConsensusEvent::BlockReady(block_hash))
+            .expect("block ready should succeed");
+        while rx.try_recv().is_ok() {}
+
+        // Vote for a different block
+        let msg = signing_message(view, &wrong_block);
+        let sig = sks[0].sign(&msg);
+        let vote = Vote {
+            view,
+            block_hash: wrong_block,
+            voter: 0,
+            signature: sig,
+        };
+
+        // Should succeed (silently ignored, not an error)
+        engine
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Vote(vote)))
+            .expect("vote for wrong block should be silently ignored");
+
+        // Engine should still be in Voting phase (no quorum progress)
+        assert_eq!(engine.current_phase(), Phase::Voting);
+    }
+
+    /// Commit votes with invalid BLS signatures should be rejected.
+    #[test]
+    fn test_process_commit_vote_rejects_invalid_signature() {
+        use crate::protocol::quorum::commit_signing_message;
+        use n42_primitives::consensus::CommitVote;
+
+        let (mut engine, sks, _vs, mut rx) = make_engine(4, 1);
+        let block_hash = B256::repeat_byte(0xA3);
+        let view = 1u64;
+
+        // Run through proposal + votes to reach PreCommit phase
+        engine
+            .process_event(ConsensusEvent::BlockReady(block_hash))
+            .expect("block ready");
+        while rx.try_recv().is_ok() {}
+
+        // Two votes from non-leaders to form QC (leader self-voted already)
+        for i in [0u32, 2] {
+            let msg = signing_message(view, &block_hash);
+            let sig = sks[i as usize].sign(&msg);
+            let vote = Vote { view, block_hash, voter: i, signature: sig };
+            engine
+                .process_event(ConsensusEvent::Message(ConsensusMessage::Vote(vote)))
+                .expect("vote should succeed");
+        }
+        while rx.try_recv().is_ok() {}
+
+        // Now submit a commit vote with wrong signature
+        let wrong_msg = commit_signing_message(99, &block_hash);
+        let bad_sig = sks[0].sign(&wrong_msg);
+        let cv = CommitVote {
+            view,
+            block_hash,
+            voter: 0,
+            signature: bad_sig,
+        };
+
+        let result = engine.process_event(ConsensusEvent::Message(
+            ConsensusMessage::CommitVote(cv),
+        ));
+        assert!(result.is_err(), "commit vote with invalid signature should be rejected");
+        match result.unwrap_err() {
+            ConsensusError::InvalidSignature { view: v, validator_index } => {
+                assert_eq!(v, view);
+                assert_eq!(validator_index, 0);
+            }
+            other => panic!("expected InvalidSignature, got: {:?}", other),
+        }
+    }
+
+    /// Timeout messages with invalid BLS signatures should be rejected.
+    #[test]
+    fn test_process_timeout_rejects_invalid_signature() {
+        use crate::protocol::quorum::timeout_signing_message;
+
+        let (mut engine, sks, _, mut rx) = make_engine(4, 0);
+        let view = 1u64;
+
+        // Trigger timeout first so the engine enters TimedOut phase
+        engine.on_timeout().expect("timeout should succeed");
+        while rx.try_recv().is_ok() {}
+
+        // Send a timeout with wrong signature
+        let wrong_msg = timeout_signing_message(999);
+        let bad_sig = sks[2].sign(&wrong_msg);
+        let timeout = TimeoutMessage {
+            view,
+            high_qc: QuorumCertificate::genesis(),
+            sender: 2,
+            signature: bad_sig,
+        };
+
+        let result = engine.process_event(ConsensusEvent::Message(
+            ConsensusMessage::Timeout(timeout),
+        ));
+        assert!(result.is_err(), "timeout with invalid signature should be rejected");
+        match result.unwrap_err() {
+            ConsensusError::InvalidSignature { view: v, validator_index } => {
+                assert_eq!(v, view);
+                assert_eq!(validator_index, 2);
+            }
+            other => panic!("expected InvalidSignature, got: {:?}", other),
+        }
+    }
+
+    /// Full consensus should succeed even when f validators send invalid signatures.
+    /// Valid validators' votes should still reach quorum.
+    #[test]
+    fn test_consensus_succeeds_despite_invalid_votes() {
+        use crate::protocol::quorum::commit_signing_message;
+        use n42_primitives::consensus::CommitVote;
+
+        // 4 validators, f=1, quorum=3. Leader is validator 1.
+        let (mut engine, sks, _vs, mut rx) = make_engine(4, 1);
+        let block_hash = B256::repeat_byte(0xA5);
+        let view = 1u64;
+
+        // Step 1: Leader proposes (self-votes)
+        engine
+            .process_event(ConsensusEvent::BlockReady(block_hash))
+            .expect("block ready");
+        while rx.try_recv().is_ok() {}
+
+        // Step 2: Validator 0 sends a valid vote
+        let msg = signing_message(view, &block_hash);
+        let sig = sks[0].sign(&msg);
+        engine
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Vote(Vote {
+                view,
+                block_hash,
+                voter: 0,
+                signature: sig,
+            })))
+            .expect("valid vote from 0");
+
+        // Step 3: Validator 3 sends an INVALID vote (wrong signature) — rejected
+        let bad_msg = signing_message(99, &block_hash);
+        let bad_sig = sks[3].sign(&bad_msg);
+        let result = engine.process_event(ConsensusEvent::Message(ConsensusMessage::Vote(Vote {
+            view,
+            block_hash,
+            voter: 3,
+            signature: bad_sig,
+        })));
+        assert!(result.is_err(), "invalid vote should be rejected");
+
+        // Step 4: Validator 2 sends a valid vote → quorum reached (1+0+2 = 3)
+        let msg = signing_message(view, &block_hash);
+        let sig = sks[2].sign(&msg);
+        engine
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Vote(Vote {
+                view,
+                block_hash,
+                voter: 2,
+                signature: sig,
+            })))
+            .expect("valid vote from 2");
+
+        // QC should be formed now (PrepareQC broadcast)
+        let mut outputs = vec![];
+        while let Ok(o) = rx.try_recv() {
+            outputs.push(o);
+        }
+        let has_prepare_qc = outputs.iter().any(|o| matches!(o, EngineOutput::BroadcastMessage(ConsensusMessage::PrepareQC(_))));
+        assert!(has_prepare_qc, "QC should form despite one invalid vote");
+
+        // Step 5: Valid commit votes from 0 and 2 to reach commit quorum
+        for i in [0u32, 2] {
+            let msg = commit_signing_message(view, &block_hash);
+            let sig = sks[i as usize].sign(&msg);
+            let cv = CommitVote { view, block_hash, voter: i, signature: sig };
+            engine
+                .process_event(ConsensusEvent::Message(ConsensusMessage::CommitVote(cv)))
+                .expect("commit vote should succeed");
+        }
+
+        // Block should be committed
+        assert_eq!(engine.current_view(), 2, "should advance to view 2");
+        let mut outputs = vec![];
+        while let Ok(o) = rx.try_recv() {
+            outputs.push(o);
+        }
+        let has_committed = outputs.iter().any(|o| matches!(o, EngineOutput::BlockCommitted { .. }));
+        assert!(has_committed, "block should be committed despite invalid vote from validator 3");
     }
 }

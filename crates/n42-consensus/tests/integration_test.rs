@@ -1779,3 +1779,431 @@ mod stability {
         }
     }
 }
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Level 3: Byzantine invalid-signature resilience
+// ══════════════════════════════════════════════════════════════════════════════
+
+mod byzantine_signature {
+    use super::*;
+    use n42_consensus::protocol::quorum::{commit_signing_message, signing_message, timeout_signing_message};
+    use n42_primitives::consensus::CommitVote;
+
+    /// Run consensus round where f Byzantine validators send votes with invalid signatures.
+    /// Consensus should still succeed because 2f+1 honest validators form quorum.
+    ///
+    /// Topology: 7 validators, f=2, quorum=5.
+    /// Byzantine validators (5, 6) send votes with wrong signatures.
+    /// Honest validators (0..5) send valid votes.
+    #[test]
+    fn test_byzantine_invalid_vote_signatures_7v() {
+        let mut harness = TestHarness::new(7);
+        let view = 1u64;
+        let leader = (view % 7) as usize; // leader = 1
+        let block_hash = B256::repeat_byte(0xB1);
+
+        // Step 1: Leader proposes
+        harness.engines[leader]
+            .process_event(ConsensusEvent::BlockReady(block_hash))
+            .expect("leader BlockReady");
+        let leader_outputs = harness.drain_outputs(leader);
+        let proposal = leader_outputs
+            .iter()
+            .find_map(|o| match o {
+                EngineOutput::BroadcastMessage(msg @ ConsensusMessage::Proposal(_)) => Some(msg.clone()),
+                _ => None,
+            })
+            .expect("leader should broadcast Proposal");
+
+        // Step 2: Route proposal to non-leaders
+        for i in 0..7 {
+            if i != leader {
+                harness.engines[i]
+                    .process_event(ConsensusEvent::Message(proposal.clone()))
+                    .expect("non-leader should accept Proposal");
+            }
+        }
+
+        // Step 3: Send valid votes from honest validators (0, 2, 3, 4)
+        for &i in &[0usize, 2, 3, 4] {
+            let outputs = harness.drain_outputs(i);
+            for output in outputs {
+                if let EngineOutput::SendToValidator(target, msg) = output {
+                    if target == leader as u32 {
+                        harness.engines[leader]
+                            .process_event(ConsensusEvent::Message(msg))
+                            .expect("leader should accept valid vote");
+                    }
+                }
+            }
+        }
+
+        // Step 4: Send INVALID votes from Byzantine validators (5, 6)
+        for &i in &[5usize, 6] {
+            harness.drain_outputs(i); // drain their valid votes
+            // Send forged votes with wrong signatures
+            let wrong_msg = signing_message(999, &block_hash);
+            let bad_sig = harness.secret_keys[i].sign(&wrong_msg);
+            let bad_vote = Vote {
+                view,
+                block_hash,
+                voter: i as u32,
+                signature: bad_sig,
+            };
+            let result = harness.engines[leader]
+                .process_event(ConsensusEvent::Message(ConsensusMessage::Vote(bad_vote)));
+            assert!(result.is_err(), "invalid vote from byzantine validator {} should be rejected", i);
+        }
+
+        // Step 5: QC should be formed (leader self-vote + 4 honest = 5 ≥ quorum of 5)
+        let leader_outputs = harness.drain_outputs(leader);
+        let prepare_qc = leader_outputs
+            .iter()
+            .find_map(|o| match o {
+                EngineOutput::BroadcastMessage(msg @ ConsensusMessage::PrepareQC(_)) => Some(msg.clone()),
+                _ => None,
+            })
+            .expect("QC should form from honest validators despite Byzantine ones");
+
+        // Step 6: Route PrepareQC to honest validators
+        for i in 0..5 {
+            if i != leader {
+                harness.engines[i]
+                    .process_event(ConsensusEvent::Message(prepare_qc.clone()))
+                    .expect("honest validator should accept PrepareQC");
+            }
+        }
+
+        // Step 7: Route commit votes from honest validators
+        for i in 0..5 {
+            if i != leader {
+                let outputs = harness.drain_outputs(i);
+                for output in outputs {
+                    if let EngineOutput::SendToValidator(target, msg) = output {
+                        if target == leader as u32 {
+                            let _ = harness.engines[leader]
+                                .process_event(ConsensusEvent::Message(msg));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Block should be committed
+        let leader_outputs = harness.drain_outputs(leader);
+        let committed = leader_outputs.iter().any(|o| matches!(o, EngineOutput::BlockCommitted { .. }));
+        assert!(committed, "block should be committed despite Byzantine invalid signatures");
+    }
+
+    /// Byzantine validators send commit votes with invalid signatures.
+    /// The commit phase should still succeed with enough honest commit votes.
+    #[test]
+    fn test_byzantine_invalid_commit_vote_signatures() {
+        let mut harness = TestHarness::new(4);
+        let view = 1u64;
+        let leader = (view % 4) as usize; // leader = 1
+        let block_hash = B256::repeat_byte(0xB2);
+
+        // Run through proposal + voting phase normally
+        harness.engines[leader]
+            .process_event(ConsensusEvent::BlockReady(block_hash))
+            .expect("leader BlockReady");
+        let leader_outputs = harness.drain_outputs(leader);
+        let proposal = leader_outputs.iter().find_map(|o| match o {
+            EngineOutput::BroadcastMessage(msg @ ConsensusMessage::Proposal(_)) => Some(msg.clone()),
+            _ => None,
+        }).unwrap();
+
+        for i in 0..4 {
+            if i != leader {
+                harness.engines[i]
+                    .process_event(ConsensusEvent::Message(proposal.clone()))
+                    .expect("accept proposal");
+            }
+        }
+
+        // Route valid votes
+        for i in 0..4 {
+            if i != leader {
+                let outputs = harness.drain_outputs(i);
+                for output in outputs {
+                    if let EngineOutput::SendToValidator(target, msg) = output {
+                        if target == leader as u32 {
+                            harness.engines[leader]
+                                .process_event(ConsensusEvent::Message(msg))
+                                .expect("accept vote");
+                        }
+                    }
+                }
+            }
+        }
+
+        // PrepareQC should be formed
+        let leader_outputs = harness.drain_outputs(leader);
+        let prepare_qc = leader_outputs.iter().find_map(|o| match o {
+            EngineOutput::BroadcastMessage(msg @ ConsensusMessage::PrepareQC(_)) => Some(msg.clone()),
+            _ => None,
+        }).expect("PrepareQC should form");
+
+        // Route PrepareQC to all non-leaders
+        for i in 0..4 {
+            if i != leader {
+                harness.engines[i]
+                    .process_event(ConsensusEvent::Message(prepare_qc.clone()))
+                    .expect("accept PrepareQC");
+            }
+        }
+
+        // Honest validators 0 and 2 send valid commit votes
+        for &i in &[0usize, 2] {
+            let outputs = harness.drain_outputs(i);
+            for output in outputs {
+                if let EngineOutput::SendToValidator(target, msg) = output {
+                    if target == leader as u32 {
+                        let _ = harness.engines[leader]
+                            .process_event(ConsensusEvent::Message(msg));
+                    }
+                }
+            }
+        }
+
+        // Byzantine validator 3 sends invalid commit vote
+        harness.drain_outputs(3);
+        let wrong_msg = commit_signing_message(999, &block_hash);
+        let bad_sig = harness.secret_keys[3].sign(&wrong_msg);
+        let bad_cv = CommitVote {
+            view,
+            block_hash,
+            voter: 3,
+            signature: bad_sig,
+        };
+        let result = harness.engines[leader]
+            .process_event(ConsensusEvent::Message(ConsensusMessage::CommitVote(bad_cv)));
+        assert!(result.is_err(), "invalid commit vote should be rejected");
+
+        // Block should still be committed (leader + 0 + 2 = 3 ≥ quorum)
+        let leader_outputs = harness.drain_outputs(leader);
+        let committed = leader_outputs.iter().any(|o| matches!(o, EngineOutput::BlockCommitted { .. }));
+        assert!(committed, "block should commit with honest commit votes despite Byzantine");
+    }
+
+    /// Byzantine validators send timeout messages with invalid signatures during view change.
+    /// The invalid timeout is rejected before entering the collector, while honest
+    /// validators still reach quorum for the view change.
+    #[test]
+    fn test_byzantine_invalid_timeout_signatures() {
+        let mut harness = TestHarness::new(4);
+        let view = 1u64;
+
+        // All honest validators (0, 1, 2) timeout
+        for i in 0..3 {
+            harness.engines[i].on_timeout().expect("timeout");
+        }
+
+        // Collect honest timeout messages
+        let mut honest_timeouts: Vec<(usize, ConsensusMessage)> = Vec::new();
+        for i in 0..3 {
+            let outputs = harness.drain_outputs(i);
+            for output in outputs {
+                if let EngineOutput::BroadcastMessage(msg @ ConsensusMessage::Timeout(_)) = output {
+                    honest_timeouts.push((i, msg));
+                }
+            }
+        }
+
+        // Byzantine validator 3 sends timeout with invalid signature FIRST
+        // (before honest timeouts are routed, so engines are still at view 1)
+        let wrong_msg = timeout_signing_message(999);
+        let bad_sig = harness.secret_keys[3].sign(&wrong_msg);
+        let bad_timeout = n42_primitives::consensus::TimeoutMessage {
+            view,
+            high_qc: QuorumCertificate::genesis(),
+            sender: 3,
+            signature: bad_sig,
+        };
+
+        // Process the invalid timeout on engines that are still at view 1
+        for i in 0..3 {
+            let result = harness.engines[i]
+                .process_event(ConsensusEvent::Message(ConsensusMessage::Timeout(bad_timeout.clone())));
+            assert!(result.is_err(), "invalid timeout should be rejected on engine {}", i);
+        }
+
+        // Now route honest timeouts — view change should still succeed
+        for (sender, msg) in &honest_timeouts {
+            for i in 0..3 {
+                if i != *sender {
+                    let _ = harness.engines[i]
+                        .process_event(ConsensusEvent::Message(msg.clone()));
+                }
+            }
+        }
+
+        // The next leader (view 2 → 2 % 4 = 2, engine 2) should have formed TC
+        let mut any_new_view = false;
+        for i in 0..3 {
+            let outputs = harness.drain_outputs(i);
+            for output in &outputs {
+                if matches!(output, EngineOutput::BroadcastMessage(ConsensusMessage::NewView(_))) {
+                    any_new_view = true;
+                }
+            }
+        }
+        assert!(any_new_view, "honest validators should form TC without Byzantine timeout");
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Level 4: Attestation end-to-end with real BLS keys
+// ══════════════════════════════════════════════════════════════════════════════
+
+mod attestation_e2e {
+    use super::*;
+    use alloy_primitives::hex;
+    use n42_primitives::BlsSecretKey;
+
+    /// End-to-end test: consensus commits a block → mobile attestation with real BLS keys.
+    ///
+    /// Simulates the full flow:
+    /// 1. Consensus commits a block
+    /// 2. Multiple mobile validators sign the block hash with BLS
+    /// 3. Signatures are verified and attestation count tracked
+    #[test]
+    fn test_consensus_to_attestation_e2e() {
+        // Setup: 4-validator consensus
+        let mut harness = TestHarness::new(4);
+        let view = 1u64;
+        let block_hash = B256::repeat_byte(0xE1);
+
+        // Step 1: Run consensus to commit a block
+        harness.run_consensus_round(view, block_hash);
+        assert_eq!(harness.committed_blocks.len(), 1);
+        assert_eq!(harness.committed_blocks[0], (view, block_hash));
+
+        // Step 2: Simulate mobile attestation with real BLS keys
+        let mobile_keys: Vec<BlsSecretKey> = (100..110u32).map(test_bls_key).collect();
+        let threshold = 5u32;
+        let mut attestation_count = 0u32;
+        let mut attesters = std::collections::HashSet::new();
+
+        for (i, sk) in mobile_keys.iter().enumerate() {
+            let pk = sk.public_key();
+
+            // Mobile signs the block hash
+            let sig = sk.sign(block_hash.as_slice());
+
+            // Verify signature (as the node would)
+            pk.verify(block_hash.as_slice(), &sig)
+                .expect(&format!("mobile {} signature should verify", i));
+
+            // Track attestation
+            let pk_hex = hex::encode(pk.to_bytes());
+            if attesters.insert(pk_hex) {
+                attestation_count += 1;
+            }
+
+            if attestation_count >= threshold {
+                break;
+            }
+        }
+
+        assert!(
+            attestation_count >= threshold,
+            "should reach attestation threshold of {}, got {}",
+            threshold,
+            attestation_count
+        );
+    }
+
+    /// Test deduplication: same mobile key signing twice should not increase count.
+    #[test]
+    fn test_attestation_dedup_with_real_keys() {
+        let block_hash = B256::repeat_byte(0xE2);
+        let sk = test_bls_key(200);
+        let pk = sk.public_key();
+        let pk_hex = hex::encode(pk.to_bytes());
+
+        let mut attesters = std::collections::HashSet::new();
+
+        // First attestation
+        let sig1 = sk.sign(block_hash.as_slice());
+        pk.verify(block_hash.as_slice(), &sig1).expect("sig1 should verify");
+        assert!(attesters.insert(pk_hex.clone()), "first attestation should be new");
+
+        // Duplicate attestation (different signature bytes, same key)
+        let sig2 = sk.sign(block_hash.as_slice());
+        pk.verify(block_hash.as_slice(), &sig2).expect("sig2 should verify");
+        assert!(!attesters.insert(pk_hex), "duplicate attestation should be rejected");
+
+        assert_eq!(attesters.len(), 1, "should only count one attestation");
+    }
+
+    /// Test that attestation for wrong block is detected.
+    #[test]
+    fn test_attestation_wrong_block_detected() {
+        let correct_hash = B256::repeat_byte(0xE3);
+        let wrong_hash = B256::repeat_byte(0xFF);
+        let sk = test_bls_key(300);
+        let pk = sk.public_key();
+
+        // Sign the wrong block
+        let sig = sk.sign(wrong_hash.as_slice());
+
+        // Verification against correct block should fail
+        let result = pk.verify(correct_hash.as_slice(), &sig);
+        assert!(result.is_err(), "signature for wrong block should fail verification");
+    }
+
+    /// Full pipeline: 10 blocks committed, each gets 5+ mobile attestations.
+    #[test]
+    fn test_multi_block_attestation_pipeline() {
+        let mut harness = TestHarness::new(4);
+        let mobile_keys: Vec<BlsSecretKey> = (0..8u32).map(|i| test_bls_key(500 + i)).collect();
+        let threshold = 5u32;
+
+        for round in 0..10u32 {
+            let view = harness.engines[0].current_view();
+            let block_hash = {
+                let mut bytes = [0u8; 32];
+                bytes[..4].copy_from_slice(&round.to_le_bytes());
+                bytes[4] = 0xE4;
+                B256::from(bytes)
+            };
+
+            // Commit block
+            harness.run_consensus_round(view, block_hash);
+
+            // Mobile attestation
+            let mut count = 0u32;
+            let mut attesters = std::collections::HashSet::new();
+
+            for sk in &mobile_keys {
+                let pk = sk.public_key();
+                let sig = sk.sign(block_hash.as_slice());
+                pk.verify(block_hash.as_slice(), &sig)
+                    .expect("mobile signature should verify");
+
+                let pk_hex = hex::encode(pk.to_bytes());
+                if attesters.insert(pk_hex) {
+                    count += 1;
+                }
+                if count >= threshold {
+                    break;
+                }
+            }
+
+            assert!(
+                count >= threshold,
+                "block {} (view {}) should reach attestation threshold",
+                round,
+                view
+            );
+        }
+
+        assert_eq!(
+            harness.committed_blocks.len(),
+            10,
+            "all 10 blocks should be committed"
+        );
+    }
+}

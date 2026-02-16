@@ -82,6 +82,10 @@ impl VoteCollector {
     ///
     /// This is needed for CommitVote (Round 2) which uses a different message
     /// format ("commit" || view || block_hash) than the standard Round 1 vote.
+    ///
+    /// Votes with invalid signatures are skipped (defense-in-depth). The QC is
+    /// formed from the remaining valid votes, failing only if fewer than
+    /// `quorum_size` valid votes remain.
     pub fn build_qc_with_message(
         &self,
         validator_set: &ValidatorSet,
@@ -96,32 +100,40 @@ impl VoteCollector {
             });
         }
 
-        // Verify each vote and collect valid signatures
+        // Verify each vote and collect valid signatures, skipping invalid ones.
         let mut valid_sigs: Vec<&BlsSignature> = Vec::new();
-        let mut valid_pks: Vec<&BlsPublicKey> = Vec::new();
         let mut signers = bitvec![u8, Msb0; 0; self.set_size as usize];
 
         for (&idx, sig) in &self.votes {
-            let pk = validator_set.get_public_key(idx)?;
-            // Verify individual signature
-            pk.verify(message, sig).map_err(|_| {
-                ConsensusError::InvalidSignature {
-                    view: self.view,
-                    validator_index: idx,
-                }
-            })?;
-            valid_sigs.push(sig);
-            valid_pks.push(pk);
-            if idx as usize >= self.set_size as usize {
-                return Err(ConsensusError::UnknownValidator {
-                    index: idx,
-                    set_size: self.set_size,
-                });
+            // Bounds check first
+            if idx >= self.set_size {
+                tracing::warn!(view = self.view, idx, "skipping out-of-range validator in QC build");
+                continue;
             }
+            let pk = match validator_set.get_public_key(idx) {
+                Ok(pk) => pk,
+                Err(_) => {
+                    tracing::warn!(view = self.view, idx, "skipping unknown validator in QC build");
+                    continue;
+                }
+            };
+            if pk.verify(message, sig).is_err() {
+                tracing::warn!(view = self.view, idx, "skipping invalid signature in QC build");
+                continue;
+            }
+            valid_sigs.push(sig);
             signers.set(idx as usize, true);
         }
 
-        // Aggregate all valid signatures
+        // Check we still have enough valid votes after filtering
+        if valid_sigs.len() < quorum_size {
+            return Err(ConsensusError::InsufficientVotes {
+                view: self.view,
+                have: valid_sigs.len(),
+                need: quorum_size,
+            });
+        }
+
         let aggregate_signature = AggregateSignature::aggregate(&valid_sigs)?;
 
         Ok(QuorumCertificate {
@@ -182,6 +194,10 @@ impl TimeoutCollector {
     }
 
     /// Builds a TimeoutCertificate by aggregating collected timeout signatures.
+    ///
+    /// Timeout messages with invalid signatures are skipped (defense-in-depth).
+    /// The TC is formed from the remaining valid timeouts, failing only if fewer
+    /// than `quorum_size` valid timeouts remain.
     pub fn build_tc(
         &self,
         validator_set: &ValidatorSet,
@@ -204,26 +220,38 @@ impl TimeoutCollector {
         let mut signers = bitvec![u8, Msb0; 0; self.set_size as usize];
 
         for (&idx, (sig, high_qc)) in &self.timeouts {
-            let pk = validator_set.get_public_key(idx)?;
-            pk.verify(&message, sig).map_err(|_| {
-                ConsensusError::InvalidSignature {
-                    view: self.view,
-                    validator_index: idx,
-                }
-            })?;
-            valid_sigs.push(sig);
-            if idx as usize >= self.set_size as usize {
-                return Err(ConsensusError::UnknownValidator {
-                    index: idx,
-                    set_size: self.set_size,
-                });
+            // Bounds check first
+            if idx >= self.set_size {
+                tracing::warn!(view = self.view, idx, "skipping out-of-range validator in TC build");
+                continue;
             }
+            let pk = match validator_set.get_public_key(idx) {
+                Ok(pk) => pk,
+                Err(_) => {
+                    tracing::warn!(view = self.view, idx, "skipping unknown validator in TC build");
+                    continue;
+                }
+            };
+            if pk.verify(&message, sig).is_err() {
+                tracing::warn!(view = self.view, idx, "skipping invalid timeout signature in TC build");
+                continue;
+            }
+            valid_sigs.push(sig);
             signers.set(idx as usize, true);
 
             // Track highest QC
             if highest_qc.as_ref().is_none_or(|hq| high_qc.view > hq.view) {
                 highest_qc = Some(high_qc);
             }
+        }
+
+        // Check we still have enough valid timeouts after filtering
+        if valid_sigs.len() < quorum_size {
+            return Err(ConsensusError::InsufficientVotes {
+                view: self.view,
+                have: valid_sigs.len(),
+                need: quorum_size,
+            });
         }
 
         let aggregate_signature = AggregateSignature::aggregate(&valid_sigs)?;
@@ -522,5 +550,172 @@ mod tests {
             }
             other => panic!("expected InsufficientVotes, got: {:?}", other),
         }
+    }
+
+    // ── Level 1: Defense-in-depth tests for invalid signature skipping ──
+
+    /// build_qc should skip votes with invalid signatures and still form a QC
+    /// if enough valid votes remain.
+    #[test]
+    fn test_build_qc_skips_invalid_signature() {
+        let (sks, vs) = test_validator_set(4);
+        let view = 3u64;
+        let block_hash = B256::repeat_byte(0xF1);
+        let mut collector = VoteCollector::new(view, block_hash, vs.len());
+
+        // 3 valid votes from validators 0, 1, 2
+        let msg = signing_message(view, &block_hash);
+        for i in 0..3u32 {
+            let sig = sks[i as usize].sign(&msg);
+            collector.add_vote(i, sig).unwrap();
+        }
+
+        // 1 invalid vote from validator 3 (signed with wrong message)
+        let wrong_msg = signing_message(view, &B256::repeat_byte(0xFF));
+        let bad_sig = sks[3].sign(&wrong_msg);
+        collector.add_vote(3, bad_sig).unwrap();
+
+        // build_qc should succeed with 3 valid signatures, skipping the invalid one
+        let qc = collector.build_qc(&vs).expect("QC should form from valid votes");
+        assert_eq!(qc.signer_count(), 3, "QC should have 3 signers (invalid skipped)");
+        assert!(qc.signers[0]);
+        assert!(qc.signers[1]);
+        assert!(qc.signers[2]);
+        assert!(!qc.signers[3], "invalid signer should be excluded");
+
+        // QC should verify successfully
+        verify_qc(&qc, &vs).expect("QC should verify");
+    }
+
+    /// build_qc should fail if too many invalid signatures reduce valid count below quorum.
+    #[test]
+    fn test_build_qc_fails_with_too_many_invalid() {
+        let (sks, vs) = test_validator_set(4);
+        let view = 4u64;
+        let block_hash = B256::repeat_byte(0xF2);
+        let mut collector = VoteCollector::new(view, block_hash, vs.len());
+
+        // 2 valid votes (quorum is 3)
+        let msg = signing_message(view, &block_hash);
+        for i in 0..2u32 {
+            let sig = sks[i as usize].sign(&msg);
+            collector.add_vote(i, sig).unwrap();
+        }
+
+        // 2 invalid votes
+        let wrong_msg = signing_message(99, &block_hash);
+        for i in 2..4u32 {
+            let bad_sig = sks[i as usize].sign(&wrong_msg);
+            collector.add_vote(i, bad_sig).unwrap();
+        }
+
+        // 4 raw votes but only 2 valid → below quorum
+        let result = collector.build_qc(&vs);
+        assert!(result.is_err(), "should fail with insufficient valid votes");
+        match result.unwrap_err() {
+            ConsensusError::InsufficientVotes { have, need, .. } => {
+                assert_eq!(have, 2);
+                assert_eq!(need, 3);
+            }
+            other => panic!("expected InsufficientVotes, got: {:?}", other),
+        }
+    }
+
+    /// build_tc should skip timeout messages with invalid signatures.
+    #[test]
+    fn test_build_tc_skips_invalid_signature() {
+        let (sks, vs) = test_validator_set(4);
+        let view = 5u64;
+        let genesis_qc = QuorumCertificate::genesis();
+
+        let mut collector = TimeoutCollector::new(view, vs.len());
+        let msg = timeout_signing_message(view);
+
+        // 3 valid timeouts
+        for i in 0..3u32 {
+            let sig = sks[i as usize].sign(&msg);
+            collector.add_timeout(i, sig, genesis_qc.clone()).unwrap();
+        }
+
+        // 1 invalid timeout (wrong message)
+        let wrong_msg = timeout_signing_message(999);
+        let bad_sig = sks[3].sign(&wrong_msg);
+        collector.add_timeout(3, bad_sig, genesis_qc.clone()).unwrap();
+
+        // TC should form with 3 valid, skipping the invalid one
+        let tc = collector.build_tc(&vs).expect("TC should form from valid timeouts");
+        assert_eq!(tc.signers.iter().filter(|b| **b).count(), 3);
+        assert!(tc.signers[0]);
+        assert!(tc.signers[1]);
+        assert!(tc.signers[2]);
+        assert!(!tc.signers[3], "invalid signer should be excluded");
+    }
+
+    /// build_tc should fail if too many invalid signatures reduce count below quorum.
+    #[test]
+    fn test_build_tc_fails_with_too_many_invalid() {
+        let (sks, vs) = test_validator_set(4);
+        let view = 6u64;
+        let genesis_qc = QuorumCertificate::genesis();
+
+        let mut collector = TimeoutCollector::new(view, vs.len());
+        let msg = timeout_signing_message(view);
+
+        // 2 valid timeouts
+        for i in 0..2u32 {
+            let sig = sks[i as usize].sign(&msg);
+            collector.add_timeout(i, sig, genesis_qc.clone()).unwrap();
+        }
+
+        // 2 invalid timeouts
+        let wrong_msg = timeout_signing_message(999);
+        for i in 2..4u32 {
+            let bad_sig = sks[i as usize].sign(&wrong_msg);
+            collector.add_timeout(i, bad_sig, genesis_qc.clone()).unwrap();
+        }
+
+        let result = collector.build_tc(&vs);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ConsensusError::InsufficientVotes { have, need, .. } => {
+                assert_eq!(have, 2);
+                assert_eq!(need, 3);
+            }
+            other => panic!("expected InsufficientVotes, got: {:?}", other),
+        }
+    }
+
+    /// build_tc should track the highest QC among valid timeouts only.
+    #[test]
+    fn test_build_tc_highest_qc_from_valid_only() {
+        let (sks, vs) = test_validator_set(4);
+        let view = 7u64;
+        let genesis_qc = QuorumCertificate::genesis(); // view 0
+
+        // Build a "higher" QC (view 5) for the invalid timeout
+        let higher_qc = QuorumCertificate {
+            view: 5,
+            block_hash: B256::repeat_byte(0xAB),
+            aggregate_signature: genesis_qc.aggregate_signature.clone(),
+            signers: genesis_qc.signers.clone(),
+        };
+
+        let mut collector = TimeoutCollector::new(view, vs.len());
+        let msg = timeout_signing_message(view);
+
+        // 3 valid timeouts with genesis QC (view 0)
+        for i in 0..3u32 {
+            let sig = sks[i as usize].sign(&msg);
+            collector.add_timeout(i, sig, genesis_qc.clone()).unwrap();
+        }
+
+        // 1 invalid timeout with higher QC (view 5) — should be skipped
+        let wrong_msg = timeout_signing_message(999);
+        let bad_sig = sks[3].sign(&wrong_msg);
+        collector.add_timeout(3, bad_sig, higher_qc).unwrap();
+
+        let tc = collector.build_tc(&vs).expect("TC should form");
+        // high_qc should be genesis (view 0), not the invalid timeout's view 5
+        assert_eq!(tc.high_qc.view, 0, "high_qc should come from valid timeouts only");
     }
 }
