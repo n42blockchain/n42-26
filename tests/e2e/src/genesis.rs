@@ -99,8 +99,9 @@ pub fn write_genesis_file(dir: &std::path::Path, accounts: &[TestAccount]) -> st
 }
 
 /// Returns the initial balance as a U256 value.
+/// Must match the INITIAL_BALANCE hex constant used in genesis allocation.
 pub fn initial_balance() -> U256 {
-    U256::from(100_000_000u64) * U256::from(10u64).pow(U256::from(18u64))
+    U256::from_str_radix(&INITIAL_BALANCE[2..], 16).expect("valid hex balance")
 }
 
 #[cfg(test)]

@@ -114,9 +114,12 @@ impl NodeProcess {
             cmd.env("N42_BLOCK_INTERVAL_MS", config.block_interval_ms.to_string());
         }
 
+        // Use Stdio::null() to avoid pipe buffer deadlock.
+        // If stdout/stderr are piped but never read, the OS pipe buffer (~64KB)
+        // fills up and the node process blocks on write, halting block production.
         cmd.env("RUST_LOG", "info")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
 
         info!(
             binary = %config.binary_path.display(),
