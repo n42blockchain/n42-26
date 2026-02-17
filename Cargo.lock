@@ -5530,6 +5530,7 @@ dependencies = [
  "alloy-rpc-types-engine",
  "arc-swap",
  "async-trait",
+ "bincode",
  "eyre",
  "hex",
  "jsonrpsee",
@@ -5567,6 +5568,7 @@ dependencies = [
  "reth-tracing",
  "reth-transaction-pool",
  "serde",
+ "serde_json",
  "tokio",
  "tracing",
 ]

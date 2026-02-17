@@ -39,6 +39,7 @@ impl ConsensusConfig {
             slot_time_ms: 8000,
             validator_set_size: 1,
             fault_tolerance: 0,
+            // Single-node: short timeouts are fine since solo commits are instant.
             base_timeout_ms: 4000,
             max_timeout_ms: 8000,
             initial_validators: Vec::new(),
@@ -69,8 +70,11 @@ impl ConsensusConfig {
             slot_time_ms: 8000,
             validator_set_size: count as u32,
             fault_tolerance: f,
-            base_timeout_ms: 4000,
-            max_timeout_ms: 8000,
+            // Multi-node: timeout must exceed slot_time + build_time + consensus_round.
+            // Production pipeline: up to 8s slot delay + 700ms build + 2s consensus = ~11s.
+            // 20s base gives comfortable margin; exponential backoff handles failures.
+            base_timeout_ms: 20000,
+            max_timeout_ms: 60000,
             initial_validators: validators,
         }
     }

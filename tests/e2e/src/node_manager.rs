@@ -124,12 +124,16 @@ impl NodeProcess {
             cmd.env("N42_TRUSTED_PEERS", config.trusted_peers.join(","));
         }
 
-        // Use Stdio::null() to avoid pipe buffer deadlock.
-        // If stdout/stderr are piped but never read, the OS pipe buffer (~64KB)
-        // fills up and the node process blocks on write, halting block production.
-        cmd.env("RUST_LOG", "info")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
+        // Capture stdout and stderr to log files for debugging.
+        // Reth writes structured logs to stdout via tracing; panics go to stderr.
+        let stdout_log = std::fs::File::create(
+            format!("/tmp/n42-node-{}.log", config.validator_index)
+        ).unwrap_or_else(|_| std::fs::File::create("/dev/null").unwrap());
+        let stderr_log = std::fs::File::create(
+            format!("/tmp/n42-node-{}.err.log", config.validator_index)
+        ).unwrap_or_else(|_| std::fs::File::create("/dev/null").unwrap());
+        cmd.stdout(Stdio::from(stdout_log))
+            .stderr(Stdio::from(stderr_log));
 
         info!(
             binary = %config.binary_path.display(),
@@ -262,14 +266,14 @@ pub fn find_n42_binary() -> eyre::Result<PathBuf> {
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
         .unwrap_or_else(|_| ".".to_string());
 
-    // Walk up to find the workspace root.
+    // Walk up to find the workspace root. Prefer release over debug for performance.
     let mut dir = PathBuf::from(&manifest_dir);
     loop {
-        let target = dir.join("target/debug/n42-node");
+        let target = dir.join("target/release/n42-node");
         if target.exists() {
             return Ok(target);
         }
-        let target = dir.join("target/release/n42-node");
+        let target = dir.join("target/debug/n42-node");
         if target.exists() {
             return Ok(target);
         }

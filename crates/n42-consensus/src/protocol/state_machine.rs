@@ -151,6 +151,19 @@ impl ConsensusEngine {
         &self.pacemaker
     }
 
+    /// Returns a mutable reference to the pacemaker.
+    ///
+    /// Used by the orchestrator to extend the deadline at startup,
+    /// allowing time for GossipSub mesh formation before the first proposal.
+    pub fn pacemaker_mut(&mut self) -> &mut Pacemaker {
+        &mut self.pacemaker
+    }
+
+    /// Returns the number of validators in the set.
+    pub fn validator_count(&self) -> u32 {
+        self.validator_set.len()
+    }
+
     /// Checks if this node is the leader for the current view.
     pub fn is_current_leader(&self) -> bool {
         LeaderSelector::is_leader(
@@ -175,6 +188,14 @@ impl ConsensusEngine {
         tracing::warn!(view, "view timed out");
 
         self.round_state.timeout();
+
+        // Reset pacemaker with exponential backoff BEFORE processing.
+        // Without this, the pacemaker deadline stays in the past and the
+        // orchestrator's select! loop re-fires immediately, creating a tight
+        // timeout loop (hundreds of timeouts per second instead of one per interval).
+        // If process_timeout() forms a TC and calls advance_to_view(), the pacemaker
+        // will be reset again for the new view — a harmless double reset.
+        self.pacemaker.reset_for_view(view, self.round_state.consecutive_timeouts());
 
         // Clear pending block data state: block data may never arrive.
         // Similar to Tendermint's "prevote nil" — timeout implies giving up on this view.

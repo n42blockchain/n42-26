@@ -34,8 +34,8 @@ pub fn message_id_fn(message: &Message) -> MessageId {
 /// Performs lightweight checks to prevent obviously invalid messages
 /// from propagating through the gossip network:
 /// - Rejects empty messages
-/// - Verifies the message is decodable (well-formed)
-/// - Rejects oversized messages (>1MB)
+/// - Verifies the message is decodable (well-formed) for consensus topic
+/// - Rejects oversized messages (per-topic size limits)
 ///
 /// Full semantic validation (signature checks, view verification)
 /// is done by the consensus engine after the message is delivered.
@@ -43,9 +43,22 @@ pub fn validate_message(
     topic: &TopicHash,
     data: &[u8],
     consensus_topic_hash: &TopicHash,
+    block_topic_hash: &TopicHash,
 ) -> gossipsub::MessageAcceptance {
-    // Reject empty or oversized messages for ALL topics
-    if data.is_empty() || data.len() > 1_048_576 {
+    if data.is_empty() {
+        return gossipsub::MessageAcceptance::Reject;
+    }
+
+    // Per-topic size limits.
+    // Block data can reach several MB; consensus messages are small (~130-500 bytes).
+    // Reference: Ethereum uses 10MB for beacon blocks.
+    let max_size = if topic == block_topic_hash {
+        4 * 1024 * 1024 // 4MB for block data
+    } else {
+        1024 * 1024 // 1MB for consensus messages and other topics
+    };
+
+    if data.len() > max_size {
         return gossipsub::MessageAcceptance::Reject;
     }
 
@@ -65,7 +78,7 @@ mod tests {
     use super::*;
     use alloy_primitives::B256;
     use n42_primitives::{BlsSecretKey, ConsensusMessage, Vote};
-    use crate::gossipsub::topics::consensus_topic;
+    use crate::gossipsub::topics::{block_announce_topic, consensus_topic};
 
     /// Helper: create a dummy Vote wrapped in ConsensusMessage for testing.
     fn dummy_consensus_vote() -> ConsensusMessage {
@@ -111,8 +124,9 @@ mod tests {
 
         let topic = consensus_topic();
         let topic_hash = topic.hash();
+        let block_hash = block_announce_topic().hash();
 
-        let result = validate_message(&topic_hash, &encoded, &topic_hash);
+        let result = validate_message(&topic_hash, &encoded, &topic_hash, &block_hash);
         assert!(
             matches!(result, gossipsub::MessageAcceptance::Accept),
             "valid encoded consensus message should be accepted"
@@ -123,8 +137,9 @@ mod tests {
     fn test_validate_message_reject_empty() {
         let topic = consensus_topic();
         let topic_hash = topic.hash();
+        let block_hash = block_announce_topic().hash();
 
-        let result = validate_message(&topic_hash, &[], &topic_hash);
+        let result = validate_message(&topic_hash, &[], &topic_hash, &block_hash);
         assert!(
             matches!(result, gossipsub::MessageAcceptance::Reject),
             "empty data should be rejected"
@@ -135,13 +150,44 @@ mod tests {
     fn test_validate_message_reject_oversized() {
         let topic = consensus_topic();
         let topic_hash = topic.hash();
+        let block_hash = block_announce_topic().hash();
 
-        // Create data that exceeds 1MB.
+        // Create data that exceeds 1MB (consensus topic limit).
         let oversized = vec![0u8; 1_048_576 + 1];
-        let result = validate_message(&topic_hash, &oversized, &topic_hash);
+        let result = validate_message(&topic_hash, &oversized, &topic_hash, &block_hash);
         assert!(
             matches!(result, gossipsub::MessageAcceptance::Reject),
-            "oversized data (>1MB) should be rejected"
+            "oversized data (>1MB) should be rejected for consensus topic"
+        );
+    }
+
+    #[test]
+    fn test_validate_message_block_topic_large_accepted() {
+        let consensus_hash = consensus_topic().hash();
+        let block_topic = block_announce_topic();
+        let block_hash = block_topic.hash();
+
+        // 2MB data on block topic should be accepted (limit is 4MB).
+        let large_data = vec![0u8; 2 * 1024 * 1024];
+        let result = validate_message(&block_hash, &large_data, &consensus_hash, &block_hash);
+        assert!(
+            matches!(result, gossipsub::MessageAcceptance::Accept),
+            "2MB data should be accepted on block topic (4MB limit)"
+        );
+    }
+
+    #[test]
+    fn test_validate_message_block_topic_oversized_rejected() {
+        let consensus_hash = consensus_topic().hash();
+        let block_topic = block_announce_topic();
+        let block_hash = block_topic.hash();
+
+        // Data exceeding 4MB on block topic should be rejected.
+        let oversized = vec![0u8; 4 * 1024 * 1024 + 1];
+        let result = validate_message(&block_hash, &oversized, &consensus_hash, &block_hash);
+        assert!(
+            matches!(result, gossipsub::MessageAcceptance::Reject),
+            "oversized data (>4MB) should be rejected for block topic"
         );
     }
 
@@ -149,10 +195,11 @@ mod tests {
     fn test_validate_message_reject_malformed() {
         let topic = consensus_topic();
         let topic_hash = topic.hash();
+        let block_hash = block_announce_topic().hash();
 
         // Random bytes that do not form a valid ConsensusMessage.
         let garbage = vec![0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04];
-        let result = validate_message(&topic_hash, &garbage, &topic_hash);
+        let result = validate_message(&topic_hash, &garbage, &topic_hash, &block_hash);
         assert!(
             matches!(result, gossipsub::MessageAcceptance::Reject),
             "malformed data should be rejected"
@@ -162,10 +209,11 @@ mod tests {
     #[test]
     fn test_validate_message_non_consensus_topic_valid() {
         let consensus_topic_hash = consensus_topic().hash();
+        let block_hash = block_announce_topic().hash();
         let other_topic_hash = libp2p::gossipsub::IdentTopic::new("other").hash();
 
         // Non-empty data on a non-consensus topic should be accepted.
-        let result = validate_message(&other_topic_hash, &[1, 2, 3], &consensus_topic_hash);
+        let result = validate_message(&other_topic_hash, &[1, 2, 3], &consensus_topic_hash, &block_hash);
         assert!(
             matches!(result, gossipsub::MessageAcceptance::Accept),
             "non-consensus topic messages with data should be accepted"
@@ -175,10 +223,11 @@ mod tests {
     #[test]
     fn test_validate_message_non_consensus_topic_empty_rejected() {
         let consensus_topic_hash = consensus_topic().hash();
+        let block_hash = block_announce_topic().hash();
         let other_topic_hash = libp2p::gossipsub::IdentTopic::new("other").hash();
 
         // Empty data should be rejected for ALL topics.
-        let result = validate_message(&other_topic_hash, &[], &consensus_topic_hash);
+        let result = validate_message(&other_topic_hash, &[], &consensus_topic_hash, &block_hash);
         assert!(
             matches!(result, gossipsub::MessageAcceptance::Reject),
             "empty messages should be rejected on all topics"

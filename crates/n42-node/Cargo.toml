@@ -48,6 +48,8 @@ reth-rpc-builder.workspace = true
 arc-swap.workspace = true
 jsonrpsee.workspace = true
 serde.workspace = true
+serde_json.workspace = true
+bincode.workspace = true
 
 async-trait = "0.1"
 hex.workspace = true

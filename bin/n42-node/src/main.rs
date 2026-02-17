@@ -146,7 +146,7 @@ fn main() {
 
                 info!(target: "n42::cli", %local_peer_id, "P2P identity (deterministic)");
 
-                let transport_config = TransportConfig::default();
+                let transport_config = TransportConfig::for_network_size(validator_set.len() as usize);
                 let swarm = build_swarm(keypair, transport_config)
                     .expect("Failed to build libp2p swarm");
 

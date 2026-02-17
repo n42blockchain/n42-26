@@ -3,15 +3,45 @@ use alloy_primitives::{Address, B256};
 use alloy_rpc_types_engine::{ForkchoiceState, PayloadAttributes, PayloadStatusEnum};
 use n42_consensus::{ConsensusEngine, ConsensusEvent, EngineOutput};
 use n42_network::{NetworkEvent, NetworkHandle};
+use n42_primitives::QuorumCertificate;
 use reth_ethereum_engine_primitives::EthEngineTypes;
 use reth_node_builder::ConsensusEngineHandle;
 use reth_payload_builder::PayloadBuilderHandle;
 use reth_payload_primitives::{EngineApiMessageVersion, PayloadKind, PayloadTypes};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tracing::{debug, error, info, warn};
+
+/// Block data broadcast message sent via /n42/blocks/1 GossipSub topic.
+///
+/// The leader broadcasts this alongside the Proposal so followers can
+/// import the block before voting.
+///
+/// Design reference: Aptos Raptr uses a separate TCP channel for data;
+/// Ethereum uses a separate GossipSub topic for beacon_block.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct BlockDataBroadcast {
+    /// Block hash for matching with Proposal.
+    block_hash: B256,
+    /// Consensus view number.
+    view: u64,
+    /// JSON-serialized ExecutionData (reth Engine API format).
+    /// Using JSON because reth's payload types implement serde for the Engine API,
+    /// and some types use #[serde(untagged)] which bincode doesn't handle reliably.
+    payload_json: Vec<u8>,
+}
+
+/// Deferred finalization for blocks committed by consensus but not yet imported into reth.
+/// This handles the f=0 race condition where Decide arrives before BlockData.
+struct PendingFinalization {
+    view: u64,
+    block_hash: B256,
+    #[allow(dead_code)]
+    commit_qc: QuorumCertificate,
+}
 
 /// Bridges the consensus engine with the P2P network layer and reth Engine API.
 ///
@@ -56,6 +86,15 @@ pub struct ConsensusOrchestrator {
     /// The slot-aligned timestamp (Unix seconds) for the next block.
     /// Used as the block's timestamp to ensure perfectly regular intervals.
     next_slot_timestamp: Option<u64>,
+    /// Cache of block data received from network but not yet requested by engine.
+    /// Key: block_hash, Value: raw broadcast bytes.
+    /// Bounded to 16 entries to prevent memory issues.
+    pending_block_data: HashMap<B256, Vec<u8>>,
+    /// Block hashes the engine has requested (via ExecuteBlock) but data not yet received.
+    pending_executions: HashSet<B256>,
+    /// Deferred block finalization when Decide arrives before block data.
+    /// The committed block hasn't been imported into reth yet.
+    pending_finalization: Option<PendingFinalization>,
 }
 
 impl ConsensusOrchestrator {
@@ -83,6 +122,9 @@ impl ConsensusOrchestrator {
             slot_time: Duration::ZERO,
             next_build_at: None,
             next_slot_timestamp: None,
+            pending_block_data: HashMap::new(),
+            pending_executions: HashSet::new(),
+            pending_finalization: None,
         }
     }
 
@@ -128,6 +170,9 @@ impl ConsensusOrchestrator {
             slot_time,
             next_build_at: None,
             next_slot_timestamp: None,
+            pending_block_data: HashMap::new(),
+            pending_executions: HashSet::new(),
+            pending_finalization: None,
         }
     }
 
@@ -143,11 +188,35 @@ impl ConsensusOrchestrator {
             "consensus orchestrator started"
         );
 
-        // On startup, if this node is the leader for view 1, trigger first payload build.
-        // This kicks off the genesis block production cycle.
+        // On startup, if this node is the leader for view 1, schedule first payload build.
+        // A startup delay is needed to allow GossipSub mesh formation before proposing.
+        // Without this, the leader broadcasts proposals before peers have joined the mesh,
+        // and follower votes can't route back to the leader (no mesh paths yet).
         if self.engine.is_current_leader() && self.beacon_engine.is_some() {
-            info!("this node is leader for view 1, triggering genesis payload build");
-            self.schedule_payload_build().await;
+            let n = self.engine.validator_count() as u64;
+            let startup_delay_ms: u64 = std::env::var("N42_STARTUP_DELAY_MS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or_else(|| {
+                    if n <= 1 { 0 } else { 5000 + n * 500 }
+                });
+
+            if startup_delay_ms > 0 {
+                let startup_delay = Duration::from_millis(startup_delay_ms);
+                info!(
+                    delay_ms = startup_delay_ms,
+                    validators = n,
+                    "leader for view 1, waiting for GossipSub mesh formation"
+                );
+                // Schedule first build after startup delay.
+                self.next_build_at = Some(Instant::now() + startup_delay);
+                // Extend pacemaker deadline so it doesn't fire during the startup delay.
+                // The full base_timeout starts AFTER the startup delay.
+                self.engine.pacemaker_mut().extend_deadline(startup_delay);
+            } else {
+                info!("this node is leader for view 1, triggering genesis payload build");
+                self.schedule_payload_build().await;
+            }
         }
 
         loop {
@@ -190,9 +259,12 @@ impl ConsensusOrchestrator {
                         Some(NetworkEvent::PeerDisconnected(peer_id)) => {
                             warn!(%peer_id, "consensus peer disconnected");
                         }
+                        Some(NetworkEvent::BlockAnnouncement { source, data }) => {
+                            debug!(%source, bytes = data.len(), "received block data broadcast");
+                            self.handle_block_data(data).await;
+                        }
                         Some(_) => {
-                            // Block announcements and verification receipts are handled
-                            // by dedicated subsystems, not the consensus orchestrator.
+                            // Verification receipts are handled by dedicated subsystems.
                         }
                         None => {
                             info!("network event channel closed, shutting down orchestrator");
@@ -226,11 +298,21 @@ impl ConsensusOrchestrator {
                     }
                 }
 
-                // Branch 5: Slot boundary reached, trigger payload build
+                // Branch 5: Slot boundary / startup delay reached, trigger payload build
                 _ = &mut build_timer => {
                     let slot_ts = self.next_slot_timestamp.take();
                     self.next_build_at = None;
-                    info!(slot_timestamp = ?slot_ts, "slot boundary reached, triggering payload build");
+
+                    if slot_ts.is_none() {
+                        // Startup delay completed (no slot timestamp was set).
+                        // Reset pacemaker so the full base_timeout starts now.
+                        let view = self.engine.current_view();
+                        self.engine.pacemaker_mut().reset_for_view(view, 0);
+                        info!("startup delay completed, triggering first payload build");
+                    } else {
+                        info!(slot_timestamp = ?slot_ts, "slot boundary reached, triggering payload build");
+                    }
+
                     self.do_trigger_payload_build(slot_ts).await;
                 }
             }
@@ -350,9 +432,11 @@ impl ConsensusOrchestrator {
 
                     // Spawn an async task that waits for the payload to be built,
                     // inserts it into reth via newPayload, then sends the block
-                    // hash through the channel.
+                    // hash through the channel and broadcasts block data to followers.
                     let tx = self.block_ready_tx.clone();
                     let engine_handle = beacon_engine.clone();
+                    let network = self.network.clone();
+                    let current_view = self.engine.current_view();
                     tokio::spawn(async move {
                         // Give the builder time to pack transactions from the pool.
                         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -371,6 +455,13 @@ impl ConsensusOrchestrator {
                                     <EthEngineTypes as PayloadTypes>::block_to_payload(
                                         payload.block().clone(),
                                     );
+
+                                // Serialize the execution payload for broadcasting to followers.
+                                // Uses JSON because reth Engine API types are designed for JSON
+                                // serialization (some use #[serde(untagged)] which bincode can't handle).
+                                let payload_json = serde_json::to_vec(&execution_data)
+                                    .unwrap_or_default();
+
                                 match engine_handle.new_payload(execution_data).await {
                                     Ok(status) => {
                                         match status.status {
@@ -382,6 +473,32 @@ impl ConsensusOrchestrator {
                                                     "newPayload valid, sending BlockReady"
                                                 );
                                                 let _ = tx.send(hash);
+
+                                                // Broadcast block data to followers via /n42/blocks/1 topic.
+                                                // Reference: Aptos Raptr uses separate TCP channel;
+                                                // Ethereum uses separate GossipSub topic for beacon_block.
+                                                if !payload_json.is_empty() {
+                                                    let broadcast = BlockDataBroadcast {
+                                                        block_hash: hash,
+                                                        view: current_view,
+                                                        payload_json,
+                                                    };
+                                                    match bincode::serialize(&broadcast) {
+                                                        Ok(encoded) => {
+                                                            info!(
+                                                                %hash,
+                                                                bytes = encoded.len(),
+                                                                "broadcasting block data to followers"
+                                                            );
+                                                            if let Err(e) = network.announce_block(encoded) {
+                                                                warn!(error = %e, "failed to broadcast block data");
+                                                            }
+                                                        }
+                                                        Err(e) => {
+                                                            error!(error = %e, "failed to serialize block data broadcast");
+                                                        }
+                                                    }
+                                                }
                                             }
                                             _ => {
                                                 error!(
@@ -434,26 +551,38 @@ impl ConsensusOrchestrator {
                 }
             }
             EngineOutput::ExecuteBlock(block_hash) => {
-                debug!(%block_hash, "block execution requested (non-leader trusts leader's proposal)");
-                // Non-leader validators trust the leader's block hash during consensus.
-                // The block data will be synced via reth's devp2p after commit.
-                // Mobile phones perform independent verification.
+                debug!(%block_hash, pending_data = self.pending_block_data.contains_key(&block_hash), "ExecuteBlock requested");
+
+                // Check if we already have the block data cached (BlockData arrived before Proposal)
+                if let Some(data) = self.pending_block_data.remove(&block_hash) {
+                    match bincode::deserialize::<BlockDataBroadcast>(&data) {
+                        Ok(broadcast) => {
+                            self.import_and_notify(broadcast).await;
+                        }
+                        Err(e) => {
+                            warn!(%block_hash, error = %e, "failed to deserialize cached block data");
+                        }
+                    }
+                } else {
+                    // Wait for BlockAnnouncement to arrive from the leader
+                    self.pending_executions.insert(block_hash);
+                }
             }
             EngineOutput::BlockCommitted { view, block_hash, commit_qc } => {
                 info!(view, %block_hash, "block committed by consensus");
 
-                // 1. Update shared consensus state so PayloadBuilder uses this QC
-                //    in the next block's extra_data.
+                // Update shared consensus state (always safe, QC is valid regardless of reth state)
                 if let Some(ref state) = self.consensus_state {
-                    state.update_committed_qc(commit_qc);
-                    // Notify mobile verification subscribers of the committed block.
+                    state.update_committed_qc(commit_qc.clone());
                     state.notify_block_committed(block_hash, view);
                 }
 
-                // 2. Update our head block hash.
+                // Always advance head — consensus has committed this block.
+                // The next payload build must reference it as parent regardless
+                // of whether reth has finished importing it yet.
                 self.head_block_hash = block_hash;
 
-                // 3. Notify reth Engine to finalize the block via fork_choice_updated.
+                // Try to finalize in reth
                 if let Some(ref engine_handle) = self.beacon_engine {
                     let fcu_state = ForkchoiceState {
                         head_block_hash: block_hash,
@@ -461,46 +590,79 @@ impl ConsensusOrchestrator {
                         finalized_block_hash: block_hash,
                     };
 
-                    match engine_handle
-                        .fork_choice_updated(
-                            fcu_state,
-                            None,
-                            EngineApiMessageVersion::default(),
-                        )
+                    let finalized = match engine_handle
+                        .fork_choice_updated(fcu_state, None, EngineApiMessageVersion::default())
                         .await
                     {
                         Ok(result) => {
-                            debug!(
-                                view,
-                                %block_hash,
-                                status = ?result.payload_status.status,
-                                "fork choice updated for committed block"
-                            );
+                            debug!(view, %block_hash, status = ?result.payload_status.status, "fcu result");
+                            matches!(
+                                result.payload_status.status,
+                                PayloadStatusEnum::Valid | PayloadStatusEnum::Accepted
+                            )
                         }
                         Err(e) => {
-                            error!(
-                                view,
-                                %block_hash,
-                                error = %e,
-                                "failed to update fork choice for committed block"
-                            );
+                            warn!(view, %block_hash, error = %e, "fork_choice_updated failed");
+                            false
                         }
+                    };
+
+                    if finalized {
+                        // Case A: Block already in reth (leader path, or fast follower)
+                        debug!(view, %block_hash, "block finalized in reth");
+                        self.pending_block_data.clear();
+                        self.pending_executions.clear();
+                    } else if let Some(data) = self.pending_block_data.remove(&block_hash) {
+                        // Case B: BlockData arrived first, cached but not imported
+                        info!(view, %block_hash, "block data cached, importing for deferred finalization");
+                        match bincode::deserialize::<BlockDataBroadcast>(&data) {
+                            Ok(broadcast) => {
+                                self.import_and_notify(broadcast).await;
+                                self.pending_block_data.clear();
+                                self.pending_executions.clear();
+                            }
+                            Err(e) => {
+                                warn!(%block_hash, error = %e, "failed to deserialize cached block data");
+                                self.pending_finalization = Some(PendingFinalization { view, block_hash, commit_qc });
+                                self.pending_executions.insert(block_hash);
+                            }
+                        }
+                    } else {
+                        // Case C: Block data not yet received (Decide arrived before BlockData)
+                        // Defer finalization until block data arrives via handle_block_data.
+                        info!(view, %block_hash, "block not yet in reth, deferring finalization");
+                        self.pending_finalization = Some(PendingFinalization {
+                            view,
+                            block_hash,
+                            commit_qc,
+                        });
+                        self.pending_executions.insert(block_hash);
                     }
+                } else {
+                    // No beacon engine (test mode)
+                    self.pending_block_data.clear();
+                    self.pending_executions.clear();
                 }
 
-                // 4. If this node is the leader for the next view, trigger
-                //    the next payload build immediately. The engine has already
-                //    advanced to the next view in try_form_commit_qc.
+                // Always check: if this node is leader for the next view, start building.
                 if self.engine.is_current_leader() {
-                    info!(
-                        next_view = self.engine.current_view(),
-                        "this node is leader for next view, triggering payload build"
-                    );
+                    info!(next_view = self.engine.current_view(), "leader for next view");
                     self.schedule_payload_build().await;
                 }
             }
             EngineOutput::ViewChanged { new_view } => {
                 info!(new_view, "view changed");
+
+                // Clean up stale block data from previous views.
+                self.pending_block_data.clear();
+
+                // Preserve pending_executions and pending_finalization if a committed
+                // block is awaiting import. In f=0 configs, ViewChanged fires immediately
+                // after BlockCommitted (same process_event call), and clearing these would
+                // lose the deferred finalization state.
+                if self.pending_finalization.is_none() {
+                    self.pending_executions.clear();
+                }
 
                 // After a view change (timeout recovery), if this node becomes
                 // the new leader, it should trigger payload building.
@@ -508,6 +670,141 @@ impl ConsensusOrchestrator {
                     info!(new_view, "became leader after view change, triggering payload build");
                     self.schedule_payload_build().await;
                 }
+            }
+        }
+    }
+
+    /// Handles incoming block data from the leader via /n42/blocks/1 topic.
+    ///
+    /// Two arrival orders are supported:
+    ///   1. ExecuteBlock(hash) first → data cached in pending_executions → import on arrival
+    ///   2. BlockData first → cache in pending_block_data → import when ExecuteBlock arrives
+    async fn handle_block_data(&mut self, data: Vec<u8>) {
+        debug!(bytes = data.len(), "handle_block_data called");
+        let broadcast: BlockDataBroadcast = match bincode::deserialize(&data) {
+            Ok(b) => b,
+            Err(e) => {
+                warn!("invalid block data broadcast: {e}");
+                return;
+            }
+        };
+
+        let hash = broadcast.block_hash;
+
+        if self.pending_executions.remove(&hash) {
+            debug!(%hash, "block data matched pending execution, importing now");
+            self.import_and_notify(broadcast).await;
+        } else {
+            debug!(%hash, pending_execs = ?self.pending_executions, "block data cached (no pending execution)");
+            // Cache for when engine requests it via ExecuteBlock
+            // Bound cache to 16 entries to prevent memory issues
+            if self.pending_block_data.len() >= 16 {
+                if let Some(old_key) = self.pending_block_data.keys().next().copied() {
+                    self.pending_block_data.remove(&old_key);
+                }
+            }
+            self.pending_block_data.insert(hash, data);
+        }
+    }
+
+    /// Imports block data into reth via new_payload, then:
+    /// 1. Calls fork_choice_updated to advance the chain head (critical for followers!)
+    /// 2. Notifies the consensus engine via BlockImported event
+    ///
+    /// Reference: In Aptos, insert_block() starts the execution pipeline
+    /// then immediately proceeds to vote construction. We wait for new_payload
+    /// to ensure block validity before voting (more conservative, acceptable
+    /// with 8-second slots).
+    async fn import_and_notify(&mut self, broadcast: BlockDataBroadcast) {
+        let Some(ref engine_handle) = self.beacon_engine else { return; };
+
+        // Deserialize the execution payload from JSON
+        let execution_data = match serde_json::from_slice(&broadcast.payload_json) {
+            Ok(data) => data,
+            Err(e) => {
+                warn!(hash = %broadcast.block_hash, "failed to deserialize execution payload: {e}");
+                return;
+            }
+        };
+
+        // Import block via Engine API new_payload
+        match engine_handle.new_payload(execution_data).await {
+            Ok(status) => {
+                let is_valid = matches!(
+                    status.status,
+                    PayloadStatusEnum::Valid | PayloadStatusEnum::Accepted
+                );
+
+                if is_valid {
+                    info!(hash = %broadcast.block_hash, "block imported from leader");
+
+                    // Advance reth chain head (CRITICAL: without this, reth stays at genesis).
+                    // HotStuff-2 provides instant finality, so committed blocks are final.
+                    // Reference: Ethereum beacon chain also calls fork_choice_updated
+                    // after processing each block from gossip.
+                    let fcu_state = ForkchoiceState {
+                        head_block_hash: broadcast.block_hash,
+                        safe_block_hash: broadcast.block_hash,
+                        finalized_block_hash: broadcast.block_hash,
+                    };
+                    if let Err(e) = engine_handle
+                        .fork_choice_updated(fcu_state, None, EngineApiMessageVersion::default())
+                        .await
+                    {
+                        error!(
+                            hash = %broadcast.block_hash,
+                            error = %e,
+                            "fork_choice_updated failed for imported block"
+                        );
+                    }
+
+                    // Update local head
+                    self.head_block_hash = broadcast.block_hash;
+
+                    // Complete deferred finalization if this block was committed but not yet imported.
+                    if let Some(ref pf) = self.pending_finalization {
+                        if pf.block_hash == broadcast.block_hash {
+                            info!(
+                                view = pf.view,
+                                %broadcast.block_hash,
+                                "completing deferred finalization"
+                            );
+                            let _pf = self.pending_finalization.take().unwrap();
+                            self.pending_block_data.clear();
+                            self.pending_executions.clear();
+
+                            if self.engine.is_current_leader() {
+                                info!(
+                                    next_view = self.engine.current_view(),
+                                    "leader for next view, triggering payload build"
+                                );
+                                self.schedule_payload_build().await;
+                            }
+                        }
+                    }
+
+                    // Notify consensus engine → triggers deferred vote
+                    if let Err(e) = self.engine.process_event(
+                        ConsensusEvent::BlockImported(broadcast.block_hash)
+                    ) {
+                        error!(error = %e, "error processing BlockImported");
+                    }
+                } else {
+                    warn!(
+                        hash = %broadcast.block_hash,
+                        status = ?status.status,
+                        "new_payload rejected block (invalid data from leader)"
+                    );
+                    // Don't notify engine → pacemaker timeout will trigger view change.
+                    // Reference: Tendermint prevotes nil when block is invalid.
+                }
+            }
+            Err(e) => {
+                error!(
+                    hash = %broadcast.block_hash,
+                    error = %e,
+                    "new_payload failed for imported block"
+                );
             }
         }
     }
@@ -521,6 +818,7 @@ mod tests {
     use n42_consensus::{ConsensusEngine, ValidatorSet};
     use n42_network::{NetworkCommand, NetworkHandle};
     use n42_primitives::{BlsSecretKey, ConsensusMessage, QuorumCertificate, Vote};
+    use std::collections::{HashMap, HashSet};
     use std::time::Duration;
 
     /// Helper: create a test ConsensusEngine with a single validator.
@@ -739,6 +1037,9 @@ mod tests {
             slot_time: Duration::ZERO,
             next_build_at: None,
             next_slot_timestamp: None,
+            pending_block_data: HashMap::new(),
+            pending_executions: HashSet::new(),
+            pending_finalization: None,
         };
 
         assert!(state.load_committed_qc().is_none(), "should start with no QC");
@@ -777,6 +1078,9 @@ mod tests {
             slot_time: Duration::ZERO,
             next_build_at: None,
             next_slot_timestamp: None,
+            pending_block_data: HashMap::new(),
+            pending_executions: HashSet::new(),
+            pending_finalization: None,
         };
 
         // Send a BlockReady hash through the channel.

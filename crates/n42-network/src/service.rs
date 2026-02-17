@@ -247,6 +247,7 @@ impl NetworkService {
             &message.topic,
             &message.data,
             &self.consensus_topic_hash,
+            &self.block_announce_topic_hash,
         );
 
         if !matches!(acceptance, gossipsub::MessageAcceptance::Accept) {

@@ -30,6 +30,44 @@ pub struct TransportConfig {
     pub mesh_d_low: usize,
     /// GossipSub high watermark D_high (default: 12).
     pub mesh_d_high: usize,
+    /// GossipSub outbound minimum D_out (default: 2).
+    /// Must satisfy: mesh_outbound_min <= mesh_d / 2 AND mesh_outbound_min < mesh_d_low.
+    pub mesh_outbound_min: usize,
+}
+
+impl TransportConfig {
+    /// Creates a transport config with GossipSub mesh parameters adapted
+    /// to the actual network size.
+    ///
+    /// GossipSub uses three mesh parameters:
+    /// - `mesh_d` (D): target number of peers in the mesh
+    /// - `mesh_d_low` (D_low): heartbeat tries to GRAFT peers when below this
+    /// - `mesh_d_high` (D_high): heartbeat prunes peers when above this
+    ///
+    /// For small networks (< 8 nodes), these are scaled down so that the mesh
+    /// can actually form. Without this, a 3-node network (2 peers each) would
+    /// never satisfy D_low=6 and GossipSub logs continuous "Mesh low" warnings.
+    pub fn for_network_size(node_count: usize) -> Self {
+        let max_peers = if node_count > 1 { node_count - 1 } else { 1 };
+
+        // Standard params for large networks: D=8, D_low=6, D_high=12, D_out=2
+        // Scale down for small networks where max_peers < standard values
+        let mesh_d = 8.min(max_peers);
+        let mesh_d_low = 6.min(max_peers);
+        let mesh_d_high = 12.min(max_peers).max(mesh_d);
+
+        // GossipSub requires: mesh_outbound_min <= mesh_d / 2 AND mesh_outbound_min < mesh_d_low
+        let mesh_outbound_min = 2.min(mesh_d / 2).min(if mesh_d_low > 0 { mesh_d_low - 1 } else { 0 });
+
+        Self {
+            heartbeat_interval: Duration::from_secs(1),
+            idle_connection_timeout: Duration::from_secs(120),
+            mesh_d,
+            mesh_d_low,
+            mesh_d_high,
+            mesh_outbound_min,
+        }
+    }
 }
 
 impl Default for TransportConfig {
@@ -40,6 +78,7 @@ impl Default for TransportConfig {
             mesh_d: 8,
             mesh_d_low: 6,
             mesh_d_high: 12,
+            mesh_outbound_min: 2,
         }
     }
 }
@@ -56,9 +95,14 @@ pub fn build_swarm(
     let gossipsub_config = gossipsub::ConfigBuilder::default()
         .heartbeat_interval(config.heartbeat_interval)
         .validation_mode(gossipsub::ValidationMode::Strict)
+        // 4MB max message size: block data broadcasts via /n42/blocks/1 topic
+        // can reach several MB. Without this, libp2p's default (~65KB) would
+        // silently drop block data messages.
+        .max_transmit_size(4 * 1024 * 1024)
         .mesh_n(config.mesh_d)
         .mesh_n_low(config.mesh_d_low)
         .mesh_n_high(config.mesh_d_high)
+        .mesh_outbound_min(config.mesh_outbound_min)
         .message_id_fn(message_id_fn)
         .build()
         .map_err(|e| eyre::eyre!("gossipsub config error: {e}"))?;
@@ -96,4 +140,76 @@ pub fn build_swarm(
     // (done in NetworkService::new after construction)
 
     Ok(swarm)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_for_network_size_3_nodes() {
+        let config = TransportConfig::for_network_size(3);
+        // 3 nodes → max_peers = 2
+        assert_eq!(config.mesh_d, 2);
+        assert_eq!(config.mesh_d_low, 2);
+        assert_eq!(config.mesh_d_high, 2);
+        assert_eq!(config.mesh_outbound_min, 1);
+    }
+
+    #[test]
+    fn test_for_network_size_21_nodes() {
+        let config = TransportConfig::for_network_size(21);
+        // 21 nodes → max_peers = 20, standard params apply
+        assert_eq!(config.mesh_d, 8);
+        assert_eq!(config.mesh_d_low, 6);
+        assert_eq!(config.mesh_d_high, 12);
+        assert_eq!(config.mesh_outbound_min, 2);
+    }
+
+    #[test]
+    fn test_for_network_size_100_nodes() {
+        let config = TransportConfig::for_network_size(100);
+        // Large network → standard params
+        assert_eq!(config.mesh_d, 8);
+        assert_eq!(config.mesh_d_low, 6);
+        assert_eq!(config.mesh_d_high, 12);
+        assert_eq!(config.mesh_outbound_min, 2);
+    }
+
+    #[test]
+    fn test_for_network_size_1_node() {
+        let config = TransportConfig::for_network_size(1);
+        // Solo node → max_peers = 1 (degenerate case)
+        assert_eq!(config.mesh_d, 1);
+        assert_eq!(config.mesh_d_low, 1);
+        assert_eq!(config.mesh_d_high, 1);
+        assert_eq!(config.mesh_outbound_min, 0);
+    }
+
+    #[test]
+    fn test_for_network_size_invariants() {
+        // Verify GossipSub constraints for all reasonable sizes:
+        // 1. D_low <= D <= D_high
+        // 2. mesh_outbound_min <= D / 2
+        // 3. mesh_outbound_min < D_low
+        for n in 1..=500 {
+            let c = TransportConfig::for_network_size(n);
+            assert!(
+                c.mesh_d_low <= c.mesh_d,
+                "D_low ({}) > D ({}) for n={}", c.mesh_d_low, c.mesh_d, n
+            );
+            assert!(
+                c.mesh_d <= c.mesh_d_high,
+                "D ({}) > D_high ({}) for n={}", c.mesh_d, c.mesh_d_high, n
+            );
+            assert!(
+                c.mesh_outbound_min <= c.mesh_d / 2,
+                "D_out ({}) > D/2 ({}) for n={}", c.mesh_outbound_min, c.mesh_d / 2, n
+            );
+            assert!(
+                c.mesh_outbound_min < c.mesh_d_low || c.mesh_d_low == 0,
+                "D_out ({}) >= D_low ({}) for n={}", c.mesh_outbound_min, c.mesh_d_low, n
+            );
+        }
+    }
 }
