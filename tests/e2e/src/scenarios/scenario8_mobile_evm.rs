@@ -291,6 +291,34 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
     // Close QUIC connection gracefully
     quic_conn.close(0u32.into(), b"test complete");
 
+    // ─── 10. Verify node received receipts ───
+    // Wait briefly for the node to process the receipts we sent back.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    // Read the node log and verify receipt processing messages.
+    let log_path = format!("/tmp/n42-node-0.log");
+    let log_contents = std::fs::read_to_string(&log_path).unwrap_or_default();
+    let receipt_log_count = log_contents
+        .lines()
+        .filter(|line| line.contains("verification receipt received from mobile verifier"))
+        .count();
+
+    info!(
+        receipt_log_count,
+        receipts_sent,
+        "node-side receipt processing verification"
+    );
+
+    assert!(
+        receipt_log_count > 0,
+        "node should have logged at least one receipt reception, but found 0 in node log"
+    );
+    assert_eq!(
+        receipt_log_count as u32, receipts_sent,
+        "node should have received all {} receipts we sent, but log shows {}",
+        receipts_sent, receipt_log_count
+    );
+
     info!("=== Scenario 8 PASSED ===");
     info!(
         "  Blocks verified via QUIC: {}",

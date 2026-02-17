@@ -1,3 +1,9 @@
 /target
 .claude/mind.mv2
 .claude/mind.mv2.lock
+/n42-data/
+
+# Binary artifacts (built via cross-compilation)
+*.a
+*.so
+*.dylib

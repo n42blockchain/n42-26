@@ -5545,6 +5545,7 @@ dependencies = [
  "bincode",
  "blst",
  "hex",
+ "jni",
  "n42-chainspec",
  "n42-execution",
  "n42-mobile",

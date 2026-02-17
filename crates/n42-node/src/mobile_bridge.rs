@@ -54,6 +54,12 @@ impl MobileVerificationBridge {
                     );
                 }
                 HubEvent::ReceiptReceived(receipt) => {
+                    info!(
+                        target: "n42::mobile",
+                        block_number = receipt.block_number,
+                        %receipt.block_hash,
+                        "verification receipt received from mobile verifier"
+                    );
                     self.process_receipt(&receipt);
                 }
                 HubEvent::CacheInventoryReceived { session_id, code_hashes } => {

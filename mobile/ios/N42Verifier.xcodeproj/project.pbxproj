@@ -1,0 +1,249 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 56;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		A10001 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10001; };
+		A10002 /* N42VerifierApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10002; };
+		A10003 /* N42VerifierWrapper.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10003; };
+		A10004 /* libn42_mobile_ffi.a in Frameworks */ = {isa = PBXBuildFile; fileRef = B10004; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		B10001 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
+		B10002 /* N42VerifierApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = N42VerifierApp.swift; sourceTree = "<group>"; };
+		B10003 /* N42VerifierWrapper.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = N42VerifierWrapper.swift; sourceTree = "<group>"; };
+		B10004 /* libn42_mobile_ffi.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = libn42_mobile_ffi.a; sourceTree = "<group>"; };
+		B10005 /* N42Verifier-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "N42Verifier-Bridging-Header.h"; sourceTree = "<group>"; };
+		B10006 /* n42_mobile.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; name = n42_mobile.h; path = ../../../crates/n42-mobile-ffi/include/n42_mobile.h; sourceTree = "<group>"; };
+		B10010 /* N42Verifier.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = N42Verifier.app; sourceTree = BUILT_PRODUCTS_DIR; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		C10001 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A10004 /* libn42_mobile_ffi.a in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		D10001 /* root */ = {
+			isa = PBXGroup;
+			children = (
+				D10002 /* N42Verifier */,
+				D10003 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		D10002 /* N42Verifier */ = {
+			isa = PBXGroup;
+			children = (
+				B10002 /* N42VerifierApp.swift */,
+				B10001 /* ContentView.swift */,
+				B10003 /* N42VerifierWrapper.swift */,
+				B10005 /* N42Verifier-Bridging-Header.h */,
+				B10006 /* n42_mobile.h */,
+				B10004 /* libn42_mobile_ffi.a */,
+			);
+			path = N42Verifier;
+			sourceTree = "<group>";
+		};
+		D10003 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				B10010 /* N42Verifier.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		E10001 /* N42Verifier */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = F10003;
+			buildPhases = (
+				C10002 /* Sources */,
+				C10001 /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = N42Verifier;
+			productName = N42Verifier;
+			productReference = B10010 /* N42Verifier.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		P10001 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastSwiftUpdateCheck = 1540;
+				LastUpgradeCheck = 1540;
+			};
+			buildConfigurationList = F10001;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = D10001;
+			productRefGroup = D10003 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				E10001 /* N42Verifier */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXSourcesBuildPhase section */
+		C10002 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A10001 /* ContentView.swift in Sources */,
+				A10002 /* N42VerifierApp.swift in Sources */,
+				A10003 /* N42VerifierWrapper.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		F10011 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CODE_SIGN_STYLE = Automatic;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"DEBUG=1",
+					"$(inherited)",
+				);
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				ONLY_ACTIVE_ARCH = YES;
+				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+			};
+			name = Debug;
+		};
+		F10012 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CODE_SIGN_STYLE = Automatic;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				GCC_OPTIMIZATION_LEVEL = s;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				SDKROOT = iphoneos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				VALIDATE_PRODUCT = YES;
+			};
+			name = Release;
+		};
+		F10021 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = "N42 Verifier";
+				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
+				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				LIBRARY_SEARCH_PATHS = "$(PROJECT_DIR)/N42Verifier";
+				MARKETING_VERSION = 1.0;
+				OTHER_LDFLAGS = (
+					"-lresolv",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.n42.verifier;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_OBJC_BRIDGING_HEADER = "N42Verifier/N42Verifier-Bridging-Header.h";
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		F10022 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = "N42 Verifier";
+				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
+				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				LIBRARY_SEARCH_PATHS = "$(PROJECT_DIR)/N42Verifier";
+				MARKETING_VERSION = 1.0;
+				OTHER_LDFLAGS = (
+					"-lresolv",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.n42.verifier;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_OBJC_BRIDGING_HEADER = "N42Verifier/N42Verifier-Bridging-Header.h";
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		F10001 /* Build configuration list for PBXProject */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				F10011 /* Debug */,
+				F10012 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		F10003 /* Build configuration list for PBXNativeTarget */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				F10021 /* Debug */,
+				F10022 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+
+	};
+	rootObject = P10001 /* Project object */;
+}
