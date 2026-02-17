@@ -1,8 +1,7 @@
 use super::keys::{BlsError, BlsPublicKey, BlsSignature};
+use super::DST;
 use blst::min_pk::AggregateSignature as BlstAggSig;
 use blst::BLST_ERROR;
-
-const DST: &[u8] = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_NUL_";
 
 pub struct AggregateSignature;
 

@@ -7,6 +7,6 @@ pub mod verification;
 
 pub use code_cache::{CacheSyncMessage, CodeCache, HotContractTracker};
 pub use commitment::{CommitmentError, VerificationCommitment, VerificationReveal};
-pub use packet::{VerificationPacket, WitnessAccount};
+pub use packet::{PacketError, VerificationPacket, WitnessAccount};
 pub use receipt::{ReceiptError, VerificationReceipt, sign_receipt};
 pub use verification::{BlockVerificationStatus, ReceiptAggregator};

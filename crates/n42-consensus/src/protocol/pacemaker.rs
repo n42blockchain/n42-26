@@ -50,10 +50,11 @@ impl Pacemaker {
 
     /// Resets the timer for a new view.
     /// Called when advancing to a new view (either after commit or view change).
-    pub fn reset_for_view(&mut self, _view: ViewNumber, consecutive_timeouts: u32) {
+    pub fn reset_for_view(&mut self, view: ViewNumber, consecutive_timeouts: u32) {
         let duration = self.timeout_duration(consecutive_timeouts);
         self.deadline = Instant::now() + duration;
         tracing::debug!(
+            view,
             timeout_ms = duration.as_millis() as u64,
             consecutive_timeouts,
             "pacemaker timer reset"

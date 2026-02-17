@@ -1,9 +1,8 @@
 use super::keys::{BlsError, BlsPublicKey, BlsSignature};
+use super::DST;
 use blst::blst_scalar;
 use blst::min_pk::Signature;
 use blst::BLST_ERROR;
-
-const DST: &[u8] = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_NUL_";
 
 /// Creates a blst_scalar from a 64-bit little-endian value.
 /// The scalar is stored in a 256-bit field (32 bytes), with the

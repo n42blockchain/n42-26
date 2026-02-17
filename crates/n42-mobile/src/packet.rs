@@ -87,14 +87,22 @@ impl VerificationPacket {
     }
 }
 
+/// Errors from packet encoding/decoding.
+#[derive(Debug, thiserror::Error)]
+pub enum PacketError {
+    /// Failed to serialize the verification packet.
+    #[error("packet serialization failed: {0}")]
+    Encode(#[from] bincode::Error),
+}
+
 /// Encodes a verification packet to bytes for transmission.
-pub fn encode_packet(packet: &VerificationPacket) -> Result<Vec<u8>, String> {
-    bincode::serialize(packet).map_err(|e| e.to_string())
+pub fn encode_packet(packet: &VerificationPacket) -> Result<Vec<u8>, PacketError> {
+    bincode::serialize(packet).map_err(PacketError::Encode)
 }
 
 /// Decodes a verification packet from bytes.
-pub fn decode_packet(data: &[u8]) -> Result<VerificationPacket, String> {
-    bincode::deserialize(data).map_err(|e| e.to_string())
+pub fn decode_packet(data: &[u8]) -> Result<VerificationPacket, PacketError> {
+    bincode::deserialize(data).map_err(PacketError::Encode)
 }
 
 #[cfg(test)]

@@ -52,18 +52,6 @@ pub fn encode_qc_to_extra_data(qc: &QuorumCertificate) -> Result<Bytes, Consensu
     Ok(Bytes::from(data))
 }
 
-/// Errors specific to QC extra_data encoding/decoding.
-#[derive(Debug, thiserror::Error)]
-pub enum ExtraDataError {
-    /// The extra_data has the QC magic prefix but the data is malformed.
-    #[error("malformed QC in extra_data: {0}")]
-    MalformedQC(String),
-
-    /// Failed to serialize QC to bytes.
-    #[error("QC serialization failed: {0}")]
-    SerializationFailed(String),
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

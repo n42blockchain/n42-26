@@ -137,8 +137,11 @@ impl SharedConsensusState {
     /// Notify RPC subscribers and register block for attestation tracking.
     pub fn notify_block_committed(&self, block_hash: B256, view: u64) {
         // Register block for attestation tracking.
-        if let Ok(mut att_state) = self.attestation_state.lock() {
-            att_state.register_block(block_hash, view);
+        // A poisoned mutex here means a prior panic during attestation processing;
+        // we log and skip rather than propagate the panic.
+        match self.attestation_state.lock() {
+            Ok(mut att_state) => att_state.register_block(block_hash, view),
+            Err(e) => tracing::error!("attestation_state mutex poisoned: {e}"),
         }
 
         let task = VerificationTask {

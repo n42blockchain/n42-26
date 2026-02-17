@@ -1,5 +1,5 @@
 use alloy_primitives::B256;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::receipt::VerificationReceipt;
 
@@ -21,7 +21,7 @@ pub struct BlockVerificationStatus {
     /// Typically 2/3 of connected phones.
     pub threshold: u32,
     /// Verifier pubkeys that have submitted receipts (for deduplication).
-    seen_verifiers: HashMap<[u8; 48], bool>,
+    seen_verifiers: HashSet<[u8; 48]>,
 }
 
 impl BlockVerificationStatus {
@@ -33,7 +33,7 @@ impl BlockVerificationStatus {
             valid_count: 0,
             invalid_count: 0,
             threshold,
-            seen_verifiers: HashMap::new(),
+            seen_verifiers: HashSet::new(),
         }
     }
 
@@ -43,12 +43,9 @@ impl BlockVerificationStatus {
     /// Duplicate receipts from the same verifier are ignored.
     pub fn add_receipt(&mut self, receipt: &VerificationReceipt) -> bool {
         // Skip duplicates
-        if self.seen_verifiers.contains_key(&receipt.verifier_pubkey) {
+        if !self.seen_verifiers.insert(receipt.verifier_pubkey) {
             return false;
         }
-
-        self.seen_verifiers
-            .insert(receipt.verifier_pubkey, receipt.is_valid());
 
         if receipt.is_valid() {
             self.valid_count = self.valid_count.saturating_add(1);

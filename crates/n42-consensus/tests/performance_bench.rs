@@ -10,7 +10,7 @@ use n42_consensus::protocol::quorum::{
 };
 use n42_consensus::protocol::VoteCollector;
 use n42_consensus::{ConsensusEngine, ConsensusEvent, EngineOutput, ValidatorSet};
-use n42_primitives::consensus::{ConsensusMessage, QuorumCertificate, TimeoutMessage, ViewNumber};
+use n42_primitives::consensus::{ConsensusMessage, ViewNumber};
 use n42_primitives::BlsSecretKey;
 use std::time::Instant;
 use tokio::sync::mpsc;

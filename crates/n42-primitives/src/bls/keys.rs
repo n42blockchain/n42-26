@@ -5,7 +5,7 @@ use blst::BLST_ERROR;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-const DST: &[u8] = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_NUL_";
+use super::DST;
 
 #[derive(Debug, Error)]
 pub enum BlsError {

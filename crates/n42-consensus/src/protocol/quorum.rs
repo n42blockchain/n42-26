@@ -325,33 +325,42 @@ impl TimeoutCollector {
     }
 }
 
+/// Collects signer public keys from a signers bitmap.
+///
+/// Shared helper for `verify_qc` and `verify_tc` to avoid duplicating
+/// the signer-count check and public-key collection logic.
+fn collect_signer_keys<'a>(
+    signers: &BitVec<u8, Msb0>,
+    validator_set: &'a ValidatorSet,
+    quorum_size: usize,
+    view: ViewNumber,
+    cert_kind: &str,
+) -> ConsensusResult<Vec<&'a BlsPublicKey>> {
+    let signer_count = signers.iter().filter(|b| **b).count();
+    if signer_count < quorum_size {
+        let reason = format!("insufficient signers: have {signer_count}, need {quorum_size}");
+        return match cert_kind {
+            "TC" => Err(ConsensusError::InvalidTC { view, reason }),
+            _ => Err(ConsensusError::InvalidQC { view, reason }),
+        };
+    }
+
+    signers
+        .iter()
+        .enumerate()
+        .filter(|(_, bit)| **bit)
+        .map(|(idx, _)| validator_set.get_public_key(idx as u32))
+        .collect::<ConsensusResult<Vec<_>>>()
+}
+
 /// Verifies a QuorumCertificate against the validator set.
 pub fn verify_qc(
     qc: &QuorumCertificate,
     validator_set: &ValidatorSet,
 ) -> ConsensusResult<()> {
-    // Check that enough signers participated
-    let signer_count = qc.signer_count();
     let quorum_size = validator_set.quorum_size();
-    if signer_count < quorum_size {
-        return Err(ConsensusError::InvalidQC {
-            view: qc.view,
-            reason: format!(
-                "insufficient signers: have {signer_count}, need {quorum_size}"
-            ),
-        });
-    }
+    let signer_pks = collect_signer_keys(&qc.signers, validator_set, quorum_size, qc.view, "QC")?;
 
-    // Collect public keys of signers
-    let signer_pks: Vec<&BlsPublicKey> = qc
-        .signers
-        .iter()
-        .enumerate()
-        .filter(|(_, bit)| *bit == true)
-        .map(|(idx, _)| validator_set.get_public_key(idx as u32))
-        .collect::<ConsensusResult<Vec<_>>>()?;
-
-    // Verify the aggregated signature
     let message = signing_message(qc.view, &qc.block_hash);
     AggregateSignature::verify_aggregate(&message, &qc.aggregate_signature, &signer_pks)
         .map_err(|_| ConsensusError::InvalidQC {
@@ -386,28 +395,9 @@ pub fn verify_tc(
     tc: &TimeoutCertificate,
     validator_set: &ValidatorSet,
 ) -> ConsensusResult<()> {
-    // Check that enough signers participated
-    let signer_count = tc.signers.iter().filter(|b| **b).count();
     let quorum_size = validator_set.quorum_size();
-    if signer_count < quorum_size {
-        return Err(ConsensusError::InvalidTC {
-            view: tc.view,
-            reason: format!(
-                "insufficient signers: have {signer_count}, need {quorum_size}"
-            ),
-        });
-    }
+    let signer_pks = collect_signer_keys(&tc.signers, validator_set, quorum_size, tc.view, "TC")?;
 
-    // Collect public keys of signers
-    let signer_pks: Vec<&BlsPublicKey> = tc
-        .signers
-        .iter()
-        .enumerate()
-        .filter(|(_, bit)| *bit == true)
-        .map(|(idx, _)| validator_set.get_public_key(idx as u32))
-        .collect::<ConsensusResult<Vec<_>>>()?;
-
-    // Verify the aggregated signature over timeout message
     let message = timeout_signing_message(tc.view);
     AggregateSignature::verify_aggregate(&message, &tc.aggregate_signature, &signer_pks)
         .map_err(|_| ConsensusError::InvalidTC {

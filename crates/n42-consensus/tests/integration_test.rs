@@ -13,7 +13,7 @@ use n42_consensus::protocol::quorum::signing_message;
 use n42_consensus::protocol::Phase;
 use n42_consensus::{ConsensusEngine, ConsensusEvent, EngineOutput, LeaderSelector, ValidatorSet};
 use n42_primitives::consensus::{
-    ConsensusMessage, Proposal, QuorumCertificate, TimeoutMessage, ViewNumber, Vote,
+    ConsensusMessage, Proposal, QuorumCertificate, ViewNumber, Vote,
 };
 use n42_primitives::BlsSecretKey;
 use tokio::sync::mpsc;
