@@ -2,6 +2,7 @@ pub mod code_cache;
 pub mod commitment;
 pub mod packet;
 pub mod receipt;
+pub(crate) mod serde_helpers;
 pub mod verification;
 
 pub use code_cache::{CacheSyncMessage, CodeCache, HotContractTracker};

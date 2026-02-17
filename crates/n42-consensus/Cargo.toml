@@ -28,4 +28,3 @@ thiserror.workspace = true
 
 [dev-dependencies]
 n42-mobile = { workspace = true }
-ed25519-dalek = { workspace = true }

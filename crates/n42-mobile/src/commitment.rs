@@ -1,6 +1,8 @@
 use alloy_primitives::{keccak256, B256};
 use serde::{Deserialize, Serialize};
 
+use crate::serde_helpers::pubkey_48;
+
 /// Commitment-first verification protocol.
 ///
 /// Prevents mobile devices from copying verification results from peers:
@@ -20,8 +22,9 @@ pub struct VerificationCommitment {
     pub block_hash: B256,
     /// Block number.
     pub block_number: u64,
-    /// Ed25519 public key of the verifier.
-    pub verifier_pubkey: [u8; 32],
+    /// BLS12-381 public key of the verifier.
+    #[serde(with = "pubkey_48")]
+    pub verifier_pubkey: [u8; 48],
     /// keccak256(block_hash || state_root_match || receipts_root_match || nonce)
     pub commitment_hash: B256,
     /// Timestamp when commitment was made (ms since epoch).
@@ -35,8 +38,9 @@ pub struct VerificationReveal {
     pub block_hash: B256,
     /// Block number.
     pub block_number: u64,
-    /// Ed25519 public key (must match commitment).
-    pub verifier_pubkey: [u8; 32],
+    /// BLS12-381 public key (must match commitment).
+    #[serde(with = "pubkey_48")]
+    pub verifier_pubkey: [u8; 48],
     /// Actual verification result: state root matches.
     pub state_root_match: bool,
     /// Actual verification result: receipts root matches.
@@ -160,7 +164,7 @@ mod tests {
     fn make_commitment_reveal_pair(
         block_hash: B256,
         block_number: u64,
-        verifier_pubkey: [u8; 32],
+        verifier_pubkey: [u8; 48],
         state_root_match: bool,
         receipts_root_match: bool,
         nonce: B256,
@@ -190,7 +194,7 @@ mod tests {
     #[test]
     fn test_verify_against_commitment_success() {
         let block_hash = B256::from([5u8; 32]);
-        let pubkey = [42u8; 32];
+        let pubkey = [42u8; 48];
         let nonce = B256::from([77u8; 32]);
 
         let (commitment, reveal) = make_commitment_reveal_pair(
@@ -206,7 +210,7 @@ mod tests {
     #[test]
     fn test_verify_against_commitment_wrong_nonce() {
         let block_hash = B256::from([5u8; 32]);
-        let pubkey = [42u8; 32];
+        let pubkey = [42u8; 48];
         let nonce = B256::from([77u8; 32]);
         let wrong_nonce = B256::from([88u8; 32]);
 
@@ -234,7 +238,7 @@ mod tests {
     fn test_verify_against_commitment_wrong_block() {
         let block_hash = B256::from([5u8; 32]);
         let different_block = B256::from([6u8; 32]);
-        let pubkey = [42u8; 32];
+        let pubkey = [42u8; 48];
         let nonce = B256::from([77u8; 32]);
 
         let (commitment, _) = make_commitment_reveal_pair(
@@ -259,8 +263,8 @@ mod tests {
     #[test]
     fn test_verify_against_commitment_wrong_verifier() {
         let block_hash = B256::from([5u8; 32]);
-        let pubkey = [42u8; 32];
-        let other_pubkey = [99u8; 32];
+        let pubkey = [42u8; 48];
+        let other_pubkey = [99u8; 48];
         let nonce = B256::from([77u8; 32]);
 
         let (commitment, _) = make_commitment_reveal_pair(

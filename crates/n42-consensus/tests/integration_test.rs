@@ -7,7 +7,6 @@
 //! via synchronous routing—no real network, fully deterministic.
 
 use alloy_primitives::{Address, B256};
-use ed25519_dalek::SigningKey;
 use n42_chainspec::ValidatorInfo;
 use n42_consensus::error::ConsensusError;
 use n42_consensus::protocol::quorum::signing_message;
@@ -33,12 +32,12 @@ fn test_bls_key(index: u32) -> BlsSecretKey {
     BlsSecretKey::from_bytes(&bytes).expect("deterministic BLS key should be valid")
 }
 
-/// Deterministic Ed25519 signing key from an index.
-fn test_ed25519_key(index: u32) -> SigningKey {
+/// Deterministic BLS signing key for mobile verifiers from an index.
+fn test_mobile_bls_key(index: u32) -> BlsSecretKey {
     let mut bytes = [0u8; 32];
     bytes[..4].copy_from_slice(&index.to_le_bytes());
     bytes[31] = 0xED;
-    SigningKey::from_bytes(&bytes)
+    BlsSecretKey::key_gen(&bytes).expect("deterministic mobile BLS key should be valid")
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -865,15 +864,15 @@ mod mobile_verification {
         let block_number = 42u64;
 
         for i in 0..10u32 {
-            let key = test_ed25519_key(i);
+            let key = test_mobile_bls_key(i);
             let receipt = sign_receipt(block_hash, block_number, true, true, 1_700_000_000_000, &key);
 
             assert!(receipt.is_valid());
             assert_eq!(receipt.block_hash, block_hash);
             assert_eq!(receipt.block_number, block_number);
-            assert_eq!(receipt.verifier_pubkey, key.verifying_key().to_bytes());
+            assert_eq!(receipt.verifier_pubkey, key.public_key().to_bytes());
 
-            // Ed25519 signature must verify
+            // BLS12-381 signature must verify
             receipt
                 .verify_signature()
                 .expect("receipt signature should be valid");
@@ -890,7 +889,7 @@ mod mobile_verification {
         aggregator.register_block(block_hash, block_number);
 
         for i in 0..10u32 {
-            let key = test_ed25519_key(i);
+            let key = test_mobile_bls_key(i);
             let receipt = sign_receipt(block_hash, block_number, true, true, 1_000_000 + i as u64, &key);
 
             let result = aggregator.process_receipt(&receipt);
@@ -927,7 +926,7 @@ mod mobile_verification {
         let mut aggregator = ReceiptAggregator::new(5, 100);
         aggregator.register_block(block_hash, block_number);
 
-        let key = test_ed25519_key(0);
+        let key = test_mobile_bls_key(0);
         let receipt = sign_receipt(block_hash, block_number, true, true, 1_000_000, &key);
 
         // First submission accepted
@@ -948,8 +947,8 @@ mod mobile_verification {
         let block_number = 200u64;
 
         for i in 0..5u32 {
-            let key = test_ed25519_key(i);
-            let verifier_pubkey = key.verifying_key().to_bytes();
+            let key = test_mobile_bls_key(i);
+            let verifier_pubkey = key.public_key().to_bytes();
             let nonce = B256::repeat_byte(i as u8 + 1);
 
             let commitment_hash = compute_commitment(
@@ -989,8 +988,8 @@ mod mobile_verification {
         let block_number = 300u64;
 
         // Phone A creates a valid commitment
-        let key_a = test_ed25519_key(0);
-        let pubkey_a = key_a.verifying_key().to_bytes();
+        let key_a = test_mobile_bls_key(0);
+        let pubkey_a = key_a.public_key().to_bytes();
         let nonce_a = B256::repeat_byte(0xAA);
 
         let commitment_hash_a = compute_commitment(
@@ -1010,8 +1009,8 @@ mod mobile_verification {
         };
 
         // Phone B tries to copy Phone A's result with a DIFFERENT nonce
-        let key_b = test_ed25519_key(1);
-        let pubkey_b = key_b.verifying_key().to_bytes();
+        let key_b = test_mobile_bls_key(1);
+        let pubkey_b = key_b.public_key().to_bytes();
         let nonce_b = B256::repeat_byte(0xBB);
 
         // B creates its own commitment
@@ -1070,7 +1069,7 @@ mod mobile_verification {
         aggregator.register_block(block_hash, 1);
 
         for i in 0..10u32 {
-            let key = test_ed25519_key(i);
+            let key = test_mobile_bls_key(i);
             let receipt = sign_receipt(block_hash, 1, true, true, 2_000_000 + i as u64, &key);
 
             receipt.verify_signature().unwrap();
@@ -1714,7 +1713,7 @@ mod stress_performance {
         let mut threshold_reached_at = None;
 
         for i in 0..1000u32 {
-            let key = test_ed25519_key(i);
+            let key = test_mobile_bls_key(i);
             let receipt = sign_receipt(
                 block_hash,
                 block_number,

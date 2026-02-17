@@ -21,7 +21,7 @@ pub struct BlockVerificationStatus {
     /// Typically 2/3 of connected phones.
     pub threshold: u32,
     /// Verifier pubkeys that have submitted receipts (for deduplication).
-    seen_verifiers: HashMap<[u8; 32], bool>,
+    seen_verifiers: HashMap<[u8; 48], bool>,
 }
 
 impl BlockVerificationStatus {
@@ -173,17 +173,25 @@ impl ReceiptAggregator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ed25519_dalek::Signature;
+    use n42_primitives::{BlsSecretKey, BlsSignature};
+    use std::sync::LazyLock;
+
+    /// Cached dummy BLS signature for mock receipts.
+    /// Aggregator tests only check dedup/counting, not cryptographic validity.
+    static DUMMY_SIG: LazyLock<BlsSignature> = LazyLock::new(|| {
+        let sk = BlsSecretKey::key_gen(&[1u8; 32]).unwrap();
+        sk.sign(b"dummy")
+    });
 
     /// Helper: creates a mock VerificationReceipt with the given fields.
-    /// Uses a dummy signature (not cryptographically valid, but sufficient
+    /// Uses a cached dummy BLS signature (not matching the content, but sufficient
     /// for aggregator-level tests that don't verify signatures).
     fn mock_receipt(
         block_hash: B256,
         block_number: u64,
         state_root_match: bool,
         receipts_root_match: bool,
-        verifier_pubkey: [u8; 32],
+        verifier_pubkey: [u8; 48],
     ) -> VerificationReceipt {
         VerificationReceipt {
             block_hash,
@@ -191,7 +199,7 @@ mod tests {
             state_root_match,
             receipts_root_match,
             verifier_pubkey,
-            signature: Signature::from_bytes(&[0u8; 64]),
+            signature: DUMMY_SIG.clone(),
             timestamp_ms: 1_000_000,
         }
     }
@@ -202,8 +210,8 @@ mod tests {
     }
 
     /// Helper: creates a unique verifier pubkey from a single byte.
-    fn pubkey(b: u8) -> [u8; 32] {
-        let mut pk = [0u8; 32];
+    fn pubkey(b: u8) -> [u8; 48] {
+        let mut pk = [0u8; 48];
         pk[0] = b;
         pk
     }

@@ -32,7 +32,7 @@ pub enum HubEvent {
     /// A mobile verifier connected.
     PhoneConnected {
         session_id: u64,
-        verifier_pubkey: [u8; 32],
+        verifier_pubkey: [u8; 48],
     },
     /// A mobile verifier disconnected.
     PhoneDisconnected {
@@ -110,7 +110,7 @@ impl StarHubHandle {
 /// ## Connection protocol
 ///
 /// 1. Phone connects via QUIC to the hub's endpoint
-/// 2. Phone opens a uni stream and sends its 32-byte Ed25519 public key (handshake)
+/// 2. Phone opens a uni stream and sends its 48-byte BLS12-381 public key (handshake)
 /// 3. Hub validates the key (must be non-zero) within 5 seconds
 /// 4. Hub creates a `MobileSession` and starts pushing verification packets
 /// 5. Phone sends `VerificationReceipt` back after verifying each block
@@ -290,16 +290,16 @@ async fn handle_phone_connection(
         "phone connected, awaiting handshake"
     );
 
-    // --- Handshake: read 32-byte Ed25519 public key from first uni stream ---
+    // --- Handshake: read 48-byte BLS12-381 public key from first uni stream ---
     let verifier_pubkey = match tokio::time::timeout(
         HANDSHAKE_TIMEOUT,
         connection.accept_uni(),
     )
     .await
     {
-        Ok(Ok(mut recv)) => match recv.read_to_end(32).await {
-            Ok(data) if data.len() == 32 => {
-                let mut pubkey = [0u8; 32];
+        Ok(Ok(mut recv)) => match recv.read_to_end(48).await {
+            Ok(data) if data.len() == 48 => {
+                let mut pubkey = [0u8; 48];
                 pubkey.copy_from_slice(&data);
                 pubkey
             }
@@ -307,7 +307,7 @@ async fn handle_phone_connection(
                 tracing::warn!(
                     session_id,
                     len = data.len(),
-                    "invalid handshake: expected 32-byte public key"
+                    "invalid handshake: expected 48-byte BLS public key"
                 );
                 connection.close(1u32.into(), b"invalid handshake");
                 return;
@@ -331,7 +331,7 @@ async fn handle_phone_connection(
     };
 
     // Validate public key is non-zero
-    if verifier_pubkey == [0u8; 32] {
+    if verifier_pubkey == [0u8; 48] {
         tracing::warn!(session_id, "rejected connection: zero public key");
         connection.close(1u32.into(), b"invalid pubkey");
         return;
@@ -546,14 +546,14 @@ mod tests {
     #[test]
     fn test_zero_pubkey_is_invalid() {
         // This tests the validation logic used in handle_phone_connection
-        let zero_key = [0u8; 32];
-        assert_eq!(zero_key, [0u8; 32], "zero key should match zero pattern");
+        let zero_key = [0u8; 48];
+        assert_eq!(zero_key, [0u8; 48], "zero key should match zero pattern");
 
         let valid_key = {
-            let mut k = [0u8; 32];
+            let mut k = [0u8; 48];
             k[0] = 1;
             k
         };
-        assert_ne!(valid_key, [0u8; 32], "non-zero key should not match");
+        assert_ne!(valid_key, [0u8; 48], "non-zero key should not match");
     }
 }

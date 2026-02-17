@@ -10,8 +10,8 @@ use std::time::Instant;
 pub struct MobileSession {
     /// Unique session identifier (derived from QUIC connection ID).
     pub session_id: u64,
-    /// Ed25519 public key of the mobile verifier.
-    pub verifier_pubkey: [u8; 32],
+    /// BLS12-381 public key of the mobile verifier.
+    pub verifier_pubkey: [u8; 48],
     /// When the phone connected.
     pub connected_at: Instant,
     /// Last activity timestamp (updated on message send/receive).
@@ -27,7 +27,7 @@ pub struct MobileSession {
 
 impl MobileSession {
     /// Creates a new mobile session.
-    pub fn new(session_id: u64, verifier_pubkey: [u8; 32]) -> Self {
+    pub fn new(session_id: u64, verifier_pubkey: [u8; 48]) -> Self {
         let now = Instant::now();
         Self {
             session_id,

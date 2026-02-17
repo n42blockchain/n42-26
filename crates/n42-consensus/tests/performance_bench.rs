@@ -4,7 +4,6 @@
 //! Run with: cargo test -p n42-consensus --test performance_bench -- --nocapture
 
 use alloy_primitives::{Address, B256};
-use ed25519_dalek::SigningKey;
 use n42_chainspec::ValidatorInfo;
 use n42_consensus::protocol::quorum::{
     commit_signing_message, signing_message,
@@ -25,11 +24,11 @@ fn test_bls_key(index: u32) -> BlsSecretKey {
     BlsSecretKey::from_bytes(&bytes).expect("deterministic BLS key should be valid")
 }
 
-fn test_ed25519_key(index: u32) -> SigningKey {
+fn test_mobile_bls_key(index: u32) -> BlsSecretKey {
     let mut bytes = [0u8; 32];
     bytes[..4].copy_from_slice(&index.to_le_bytes());
     bytes[31] = 0xED;
-    SigningKey::from_bytes(&bytes)
+    BlsSecretKey::key_gen(&bytes).expect("deterministic mobile BLS key should be valid")
 }
 
 // ── Harness (simplified for benchmarking) ──
@@ -302,14 +301,14 @@ fn bench_bls_operations() {
 }
 
 #[test]
-fn bench_ed25519_operations() {
+fn bench_bls_mobile_operations() {
     println!("\n{}", "=".repeat(70));
-    println!("  Ed25519 (Mobile) Operations Benchmark");
+    println!("  BLS12-381 (Mobile) Operations Benchmark");
     println!("{}\n", "=".repeat(70));
 
-    let sk = test_ed25519_key(0);
+    let sk = test_mobile_bls_key(0);
 
-    // ── Ed25519 Sign ──
+    // ── BLS Sign ──
     let iterations = 10_000;
     let block_hash = B256::repeat_byte(0xCC);
     let start = Instant::now();
@@ -317,16 +316,16 @@ fn bench_ed25519_operations() {
         let _ = n42_mobile::sign_receipt(block_hash, 1, true, true, i as u64, &sk);
     }
     let sign_time = start.elapsed() / iterations;
-    println!("  Ed25519 Sign Receipt:  {:>6.1} us/op", sign_time.as_nanos() as f64 / 1000.0);
+    println!("  BLS Sign Receipt:  {:>6.1} us/op", sign_time.as_nanos() as f64 / 1000.0);
 
-    // ── Ed25519 Verify ──
+    // ── BLS Verify ──
     let receipt = n42_mobile::sign_receipt(block_hash, 1, true, true, 12345, &sk);
     let start = Instant::now();
     for _ in 0..iterations {
         receipt.verify_signature().unwrap();
     }
     let verify_time = start.elapsed() / iterations;
-    println!("  Ed25519 Verify Receipt: {:>6.1} us/op", verify_time.as_nanos() as f64 / 1000.0);
+    println!("  BLS Verify Receipt: {:>6.1} us/op", verify_time.as_nanos() as f64 / 1000.0);
 
     // ── Receipt Aggregation (various sizes) ──
     println!("\n  Receipt Aggregation (sign + verify + aggregate):");
@@ -343,7 +342,7 @@ fn bench_ed25519_operations() {
 
         let mut threshold_reached = false;
         for i in 0..total_receipts {
-            let key = test_ed25519_key(i);
+            let key = test_mobile_bls_key(i);
             let receipt =
                 n42_mobile::sign_receipt(block_hash, 1, true, true, 1_000_000 + i as u64, &key);
             receipt.verify_signature().unwrap();
@@ -407,7 +406,7 @@ fn bench_config_500_nodes_500_mobiles() {
     );
     aggregator.register_block(block_hash, 1);
     for i in 0..mobiles_per_node {
-        let key = test_ed25519_key(i);
+        let key = test_mobile_bls_key(i);
         let receipt = n42_mobile::sign_receipt(block_hash, 1, true, true, i as u64, &key);
         receipt.verify_signature().unwrap();
         aggregator.process_receipt(&receipt);
@@ -422,7 +421,7 @@ fn bench_config_500_nodes_500_mobiles() {
     );
     total_aggregator.register_block(block_hash, 1);
     for i in 0..total_mobiles {
-        let key = test_ed25519_key(i);
+        let key = test_mobile_bls_key(i);
         let receipt = n42_mobile::sign_receipt(block_hash, 1, true, true, i as u64, &key);
         receipt.verify_signature().unwrap();
         total_aggregator.process_receipt(&receipt);
@@ -477,7 +476,7 @@ fn bench_config_100_nodes_2500_mobiles() {
     );
     aggregator.register_block(block_hash, 1);
     for i in 0..mobiles_per_node {
-        let key = test_ed25519_key(i);
+        let key = test_mobile_bls_key(i);
         let receipt = n42_mobile::sign_receipt(block_hash, 1, true, true, i as u64, &key);
         receipt.verify_signature().unwrap();
         aggregator.process_receipt(&receipt);
@@ -492,7 +491,7 @@ fn bench_config_100_nodes_2500_mobiles() {
     );
     total_aggregator.register_block(block_hash, 1);
     for i in 0..total_mobiles {
-        let key = test_ed25519_key(i);
+        let key = test_mobile_bls_key(i);
         let receipt = n42_mobile::sign_receipt(block_hash, 1, true, true, i as u64, &key);
         receipt.verify_signature().unwrap();
         total_aggregator.process_receipt(&receipt);
@@ -538,7 +537,7 @@ fn bench_comparative_summary() {
     let mut agg_a = n42_mobile::ReceiptAggregator::new(334, 10);
     agg_a.register_block(block_hash, 1);
     for i in 0..500u32 {
-        let key = test_ed25519_key(i);
+        let key = test_mobile_bls_key(i);
         let receipt = n42_mobile::sign_receipt(block_hash, 1, true, true, i as u64, &key);
         receipt.verify_signature().unwrap();
         agg_a.process_receipt(&receipt);
@@ -564,7 +563,7 @@ fn bench_comparative_summary() {
     let mut agg_b = n42_mobile::ReceiptAggregator::new(1667, 10);
     agg_b.register_block(block_hash, 1);
     for i in 0..2500u32 {
-        let key = test_ed25519_key(i);
+        let key = test_mobile_bls_key(i);
         let receipt = n42_mobile::sign_receipt(block_hash, 1, true, true, i as u64, &key);
         receipt.verify_signature().unwrap();
         agg_b.process_receipt(&receipt);

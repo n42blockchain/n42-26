@@ -9,8 +9,8 @@ license.workspace = true
 # Primitives
 alloy-primitives.workspace = true
 
-# Crypto
-ed25519-dalek.workspace = true
+# Crypto (BLS12-381 signatures)
+n42-primitives = { path = "../n42-primitives" }
 
 # Caching
 lru.workspace = true

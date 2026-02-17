@@ -1,6 +1,8 @@
 use alloy_primitives::B256;
-use ed25519_dalek::{Signature, SigningKey, VerifyingKey, Signer, Verifier};
+use n42_primitives::{BlsPublicKey, BlsSecretKey, BlsSignature};
 use serde::{Deserialize, Serialize};
+
+use crate::serde_helpers::pubkey_48;
 
 /// Verification receipt returned from a mobile device to the IDC node.
 ///
@@ -8,7 +10,7 @@ use serde::{Deserialize, Serialize};
 /// produces this receipt indicating whether the execution result matches
 /// the expected state root and receipts root.
 ///
-/// Receipts use Ed25519 signatures (faster than BLS on mobile hardware).
+/// Receipts use BLS12-381 signatures for aggregation compatibility.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VerificationReceipt {
     /// Hash of the verified block.
@@ -19,12 +21,37 @@ pub struct VerificationReceipt {
     pub state_root_match: bool,
     /// Whether the computed receipts root matches the expected one.
     pub receipts_root_match: bool,
-    /// Ed25519 public key of the verifier (32 bytes).
-    pub verifier_pubkey: [u8; 32],
-    /// Ed25519 signature over the receipt content.
-    pub signature: Signature,
+    /// BLS12-381 public key of the verifier (48 bytes).
+    #[serde(with = "pubkey_48")]
+    pub verifier_pubkey: [u8; 48],
+    /// BLS12-381 signature over the receipt content.
+    pub signature: BlsSignature,
     /// Timestamp when verification completed (milliseconds since epoch).
     pub timestamp_ms: u64,
+}
+
+/// Builds the canonical signing message from receipt fields.
+///
+/// Format: block_hash (32B) || block_number (8B LE) ||
+///         state_root_match (1B) || receipts_root_match (1B) ||
+///         timestamp_ms (8B LE)
+///
+/// This is the single source of truth for the receipt signing format,
+/// used by both `sign_receipt()` and `VerificationReceipt::verify_signature()`.
+fn build_signing_message(
+    block_hash: &B256,
+    block_number: u64,
+    state_root_match: bool,
+    receipts_root_match: bool,
+    timestamp_ms: u64,
+) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(50);
+    msg.extend_from_slice(block_hash.as_slice());
+    msg.extend_from_slice(&block_number.to_le_bytes());
+    msg.push(state_root_match as u8);
+    msg.push(receipts_root_match as u8);
+    msg.extend_from_slice(&timestamp_ms.to_le_bytes());
+    msg
 }
 
 impl VerificationReceipt {
@@ -35,23 +62,19 @@ impl VerificationReceipt {
     }
 
     /// Constructs the signing message for this receipt.
-    ///
-    /// Format: block_hash (32B) || block_number (8B LE) ||
-    ///         state_root_match (1B) || receipts_root_match (1B) ||
-    ///         timestamp_ms (8B LE)
     pub fn signing_message(&self) -> Vec<u8> {
-        let mut msg = Vec::with_capacity(50);
-        msg.extend_from_slice(self.block_hash.as_slice());
-        msg.extend_from_slice(&self.block_number.to_le_bytes());
-        msg.push(self.state_root_match as u8);
-        msg.push(self.receipts_root_match as u8);
-        msg.extend_from_slice(&self.timestamp_ms.to_le_bytes());
-        msg
+        build_signing_message(
+            &self.block_hash,
+            self.block_number,
+            self.state_root_match,
+            self.receipts_root_match,
+            self.timestamp_ms,
+        )
     }
 
-    /// Verifies the Ed25519 signature on this receipt.
+    /// Verifies the BLS12-381 signature on this receipt.
     pub fn verify_signature(&self) -> Result<(), ReceiptError> {
-        let pubkey = VerifyingKey::from_bytes(&self.verifier_pubkey)
+        let pubkey = BlsPublicKey::from_bytes(&self.verifier_pubkey)
             .map_err(|_| ReceiptError::InvalidPublicKey)?;
         let msg = self.signing_message();
         pubkey
@@ -69,44 +92,41 @@ pub fn sign_receipt(
     state_root_match: bool,
     receipts_root_match: bool,
     timestamp_ms: u64,
-    signing_key: &SigningKey,
+    signing_key: &BlsSecretKey,
 ) -> VerificationReceipt {
-    let verifier_pubkey = signing_key.verifying_key().to_bytes();
+    let verifier_pubkey = signing_key.public_key().to_bytes();
+    let msg = build_signing_message(
+        &block_hash, block_number, state_root_match, receipts_root_match, timestamp_ms,
+    );
+    let signature = signing_key.sign(&msg);
 
-    // Build the receipt (without signature) to compute signing message
-    let mut receipt = VerificationReceipt {
+    VerificationReceipt {
         block_hash,
         block_number,
         state_root_match,
         receipts_root_match,
         verifier_pubkey,
-        signature: Signature::from_bytes(&[0u8; 64]),
+        signature,
         timestamp_ms,
-    };
-
-    let msg = receipt.signing_message();
-    let sig = signing_key.sign(&msg);
-    receipt.signature = sig;
-
-    receipt
+    }
 }
 
 /// Receipt verification errors.
 #[derive(Debug, thiserror::Error)]
 pub enum ReceiptError {
-    /// The Ed25519 public key is malformed.
-    #[error("invalid Ed25519 public key")]
+    /// The BLS12-381 public key is malformed.
+    #[error("invalid BLS12-381 public key")]
     InvalidPublicKey,
 
-    /// The Ed25519 signature verification failed.
-    #[error("invalid Ed25519 signature")]
+    /// The BLS12-381 signature verification failed.
+    #[error("invalid BLS12-381 signature")]
     InvalidSignature,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ed25519_dalek::SigningKey;
+    use n42_primitives::BlsSecretKey;
 
     /// Helper: creates a signed receipt with the given parameters.
     fn make_receipt(
@@ -115,19 +135,19 @@ mod tests {
         state_root_match: bool,
         receipts_root_match: bool,
         timestamp_ms: u64,
-        sk: &SigningKey,
+        sk: &BlsSecretKey,
     ) -> VerificationReceipt {
         sign_receipt(block_hash, block_number, state_root_match, receipts_root_match, timestamp_ms, sk)
     }
 
     #[test]
     fn test_sign_and_verify() {
-        let sk = SigningKey::from_bytes(&[42u8; 32]);
+        let sk = BlsSecretKey::key_gen(&[42u8; 32]).unwrap();
         let block_hash = B256::from([1u8; 32]);
         let receipt = make_receipt(block_hash, 100, true, true, 1_700_000_000_000, &sk);
 
-        // The verifier pubkey should match the signing key's verifying key.
-        assert_eq!(receipt.verifier_pubkey, sk.verifying_key().to_bytes());
+        // The verifier pubkey should match the signing key's public key.
+        assert_eq!(receipt.verifier_pubkey, sk.public_key().to_bytes());
         assert_eq!(receipt.block_hash, block_hash);
         assert_eq!(receipt.block_number, 100);
         assert!(receipt.state_root_match);
@@ -140,7 +160,7 @@ mod tests {
 
     #[test]
     fn test_verify_tampered_receipt() {
-        let sk = SigningKey::from_bytes(&[42u8; 32]);
+        let sk = BlsSecretKey::key_gen(&[42u8; 32]).unwrap();
         let block_hash = B256::from([1u8; 32]);
         let mut receipt = make_receipt(block_hash, 100, true, true, 1_700_000_000_000, &sk);
 
@@ -155,7 +175,7 @@ mod tests {
 
     #[test]
     fn test_is_valid() {
-        let sk = SigningKey::from_bytes(&[42u8; 32]);
+        let sk = BlsSecretKey::key_gen(&[42u8; 32]).unwrap();
         let block_hash = B256::from([2u8; 32]);
 
         // Both true → is_valid returns true.
@@ -177,7 +197,7 @@ mod tests {
 
     #[test]
     fn test_signing_message_deterministic() {
-        let sk = SigningKey::from_bytes(&[42u8; 32]);
+        let sk = BlsSecretKey::key_gen(&[42u8; 32]).unwrap();
         let block_hash = B256::from([3u8; 32]);
 
         let receipt1 = make_receipt(block_hash, 50, true, false, 12345, &sk);
