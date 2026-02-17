@@ -58,6 +58,10 @@ struct CommittedBlock {
 /// At 8-second slots, 1000 blocks ≈ ~2.2 hours of history.
 const MAX_COMMITTED_BLOCKS: usize = 1000;
 
+/// Timeout for a state sync request. If no response arrives within this duration,
+/// the in-flight flag is reset so a new request can be sent.
+const SYNC_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Bridges the consensus engine with the P2P network layer and reth Engine API.
 ///
 /// The orchestrator runs as a background task (`spawn_critical`) and drives
@@ -121,6 +125,8 @@ pub struct ConsensusOrchestrator {
     connected_peers: HashSet<PeerId>,
     /// Whether a sync request is currently in-flight (prevents duplicate requests).
     sync_in_flight: bool,
+    /// When the current sync request was initiated (for timeout detection).
+    sync_started_at: Option<Instant>,
     /// Path for persisting consensus state snapshots (atomic JSON write).
     /// When set, a snapshot is saved after each BlockCommitted event.
     state_file: Option<PathBuf>,
@@ -164,6 +170,7 @@ impl ConsensusOrchestrator {
             committed_blocks: VecDeque::new(),
             connected_peers: HashSet::new(),
             sync_in_flight: false,
+            sync_started_at: None,
             state_file: None,
             validator_set_for_sync: None,
             mobile_packet_tx: None,
@@ -220,6 +227,7 @@ impl ConsensusOrchestrator {
             committed_blocks: VecDeque::new(),
             connected_peers: HashSet::new(),
             sync_in_flight: false,
+            sync_started_at: None,
             state_file: None,
             validator_set_for_sync: None,
             mobile_packet_tx: None,
@@ -368,6 +376,7 @@ impl ConsensusOrchestrator {
                         Some(NetworkEvent::SyncRequestFailed { peer, error }) => {
                             warn!(%peer, %error, "sync request failed");
                             self.sync_in_flight = false;
+                            self.sync_started_at = None;
                         }
                         Some(_) => {
                             // Verification receipts are handled by dedicated subsystems.
@@ -1011,8 +1020,23 @@ impl ConsensusOrchestrator {
     /// Initiates a state sync request to a random connected peer.
     fn initiate_sync(&mut self, local_view: u64, target_view: u64) {
         if self.sync_in_flight {
-            debug!(local_view, target_view, "sync already in flight, skipping");
-            return;
+            // Check for stale sync request (peer may have gone silent).
+            if let Some(started) = self.sync_started_at {
+                if started.elapsed() > SYNC_REQUEST_TIMEOUT {
+                    warn!(
+                        elapsed_secs = started.elapsed().as_secs(),
+                        "sync request timed out, resetting"
+                    );
+                    self.sync_in_flight = false;
+                    self.sync_started_at = None;
+                } else {
+                    debug!(local_view, target_view, "sync already in flight, skipping");
+                    return;
+                }
+            } else {
+                debug!(local_view, target_view, "sync already in flight, skipping");
+                return;
+            }
         }
 
         // Pick a random connected peer for sync
@@ -1043,6 +1067,7 @@ impl ConsensusOrchestrator {
         }
 
         self.sync_in_flight = true;
+        self.sync_started_at = Some(Instant::now());
     }
 
     /// Handles an incoming sync request from a peer.
@@ -1101,6 +1126,7 @@ impl ConsensusOrchestrator {
         response: BlockSyncResponse,
     ) {
         self.sync_in_flight = false;
+        self.sync_started_at = None;
 
         info!(
             %peer,
@@ -1432,6 +1458,7 @@ mod tests {
             committed_blocks: VecDeque::new(),
             connected_peers: HashSet::new(),
             sync_in_flight: false,
+            sync_started_at: None,
             state_file: None,
             validator_set_for_sync: None,
             mobile_packet_tx: None,
@@ -1481,6 +1508,7 @@ mod tests {
             committed_blocks: VecDeque::new(),
             connected_peers: HashSet::new(),
             sync_in_flight: false,
+            sync_started_at: None,
             state_file: None,
             validator_set_for_sync: None,
             mobile_packet_tx: None,
@@ -1495,5 +1523,34 @@ mod tests {
         let received = orch.block_ready_rx.try_recv();
         assert!(received.is_ok(), "should receive BlockReady hash");
         assert_eq!(received.unwrap(), test_hash);
+    }
+
+    #[test]
+    fn test_sync_timeout_resets_in_flight() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::unbounded_channel();
+
+        let mut orch = ConsensusOrchestrator::new(engine, network, net_event_rx, output_rx);
+
+        // Add a peer so sync can proceed.
+        orch.connected_peers.insert(libp2p::PeerId::random());
+
+        // Simulate a sync that started 60 seconds ago (well past 30s timeout).
+        orch.sync_in_flight = true;
+        orch.sync_started_at = Some(Instant::now() - Duration::from_secs(60));
+
+        // A new initiate_sync should detect the timeout, reset, and send a new request.
+        orch.initiate_sync(1, 10);
+
+        // After the timeout reset + new request, sync_in_flight should be true
+        // (a new request was sent).
+        assert!(orch.sync_in_flight, "new sync request should be in flight");
+        // And sync_started_at should be recent (not 60s ago).
+        let started = orch.sync_started_at.expect("sync_started_at should be set");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "sync_started_at should be recent after timeout reset"
+        );
     }
 }

@@ -7,7 +7,7 @@ license.workspace = true
 description = "N42 mobile verifier FFI library - complete SDK for Android/iOS"
 
 [lib]
-crate-type = ["staticlib", "cdylib"]
+crate-type = ["lib", "staticlib", "cdylib"]
 
 [dependencies]
 # Internal crates

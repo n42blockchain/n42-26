@@ -62,6 +62,13 @@ impl CodeCache {
         self.cache.is_empty()
     }
 
+    /// Removes a specific entry from the cache.
+    ///
+    /// Used by CacheSyncMessage evict hints to free memory for rarely-used contracts.
+    pub fn remove(&mut self, code_hash: &B256) -> Option<Bytes> {
+        self.cache.pop(code_hash)
+    }
+
     /// Clears all cached entries.
     pub fn clear(&mut self) {
         self.cache.clear();
@@ -228,6 +235,77 @@ mod tests {
         expected.sort();
 
         assert_eq!(cached, expected, "cached_hashes should return all inserted hashes");
+    }
+
+    #[test]
+    fn test_code_cache_remove() {
+        let mut cache = CodeCache::new(10);
+        let h = hash(42);
+        let code = bytecode(&[0xDE, 0xAD]);
+
+        // Remove from empty cache returns None.
+        assert!(cache.remove(&h).is_none());
+
+        cache.insert(h, code.clone());
+        assert_eq!(cache.len(), 1);
+
+        // Remove existing key returns the value.
+        let removed = cache.remove(&h);
+        assert_eq!(removed, Some(code));
+        assert_eq!(cache.len(), 0);
+
+        // Remove again returns None.
+        assert!(cache.remove(&h).is_none());
+    }
+
+    #[test]
+    fn test_code_cache_clear() {
+        let mut cache = CodeCache::new(10);
+
+        cache.insert(hash(1), bytecode(&[0x01]));
+        cache.insert(hash(2), bytecode(&[0x02]));
+        cache.insert(hash(3), bytecode(&[0x03]));
+        assert_eq!(cache.len(), 3);
+
+        cache.clear();
+        assert_eq!(cache.len(), 0);
+        assert!(cache.is_empty());
+        assert!(!cache.contains(&hash(1)));
+    }
+
+    #[test]
+    fn test_cache_sync_message_roundtrip() {
+        let msg = CacheSyncMessage {
+            codes: vec![
+                (hash(1), bytecode(&[0x60, 0x00])),
+                (hash(2), bytecode(&[0x60, 0x01, 0x60, 0x00, 0xf3])),
+            ],
+            evict_hints: vec![hash(10), hash(20)],
+        };
+
+        let encoded = bincode::serialize(&msg).expect("serialize should succeed");
+        let decoded: CacheSyncMessage =
+            bincode::deserialize(&encoded).expect("deserialize should succeed");
+
+        assert_eq!(decoded.codes.len(), 2);
+        assert_eq!(decoded.codes[0].0, hash(1));
+        assert_eq!(decoded.codes[1].1, bytecode(&[0x60, 0x01, 0x60, 0x00, 0xf3]));
+        assert_eq!(decoded.evict_hints, vec![hash(10), hash(20)]);
+    }
+
+    #[test]
+    fn test_cache_sync_message_empty() {
+        let msg = CacheSyncMessage {
+            codes: vec![],
+            evict_hints: vec![],
+        };
+
+        let encoded = bincode::serialize(&msg).expect("serialize should succeed");
+        let decoded: CacheSyncMessage =
+            bincode::deserialize(&encoded).expect("deserialize should succeed");
+
+        assert!(decoded.codes.is_empty());
+        assert!(decoded.evict_hints.is_empty());
     }
 
     // ---- HotContractTracker tests ----

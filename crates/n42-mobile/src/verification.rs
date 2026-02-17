@@ -94,7 +94,13 @@ impl ReceiptAggregator {
     ///
     /// `default_threshold` is the number of valid receipts required
     /// for attestation (typically 2/3 of connected phones).
+    /// Must be at least 1; threshold=0 would cause all blocks to be
+    /// immediately "attested" with zero receipts.
     pub fn new(default_threshold: u32, max_tracked_blocks: usize) -> Self {
+        debug_assert!(
+            default_threshold >= 1,
+            "attestation threshold must be at least 1"
+        );
         Self {
             blocks: HashMap::new(),
             default_threshold,
@@ -103,10 +109,20 @@ impl ReceiptAggregator {
     }
 
     /// Registers a new block for verification tracking.
+    ///
+    /// Idempotent: if the block is already tracked, this is a no-op.
+    /// This prevents resetting receipt counts when multiple phones
+    /// send receipts for the same block (each receipt triggers
+    /// `process_receipt` which calls `register_block`).
     pub fn register_block(&mut self, block_hash: B256, block_number: u64) {
-        // Evict oldest blocks if at capacity
+        if self.blocks.contains_key(&block_hash) {
+            return;
+        }
+
+        // Evict oldest block if at capacity.
+        // O(N) scan over max_tracked_blocks (typically 1000); acceptable since
+        // register_block is called at most once per new block, not per receipt.
         if self.blocks.len() >= self.max_tracked_blocks {
-            // Find the block with the lowest block number
             if let Some(oldest_hash) = self
                 .blocks
                 .iter()
@@ -323,6 +339,44 @@ mod tests {
         assert!(agg.get_status(&hash(1)).is_some());
         assert!(agg.get_status(&hash(2)).is_some());
         assert!(agg.get_status(&hash(100)).is_some());
+    }
+
+    #[test]
+    fn test_register_block_no_overwrite() {
+        let mut agg = ReceiptAggregator::new(3, 100);
+        let bh = hash(20);
+        agg.register_block(bh, 2000);
+
+        // Add two receipts to the block.
+        let r1 = mock_receipt(bh, 2000, true, true, pubkey(1));
+        let r2 = mock_receipt(bh, 2000, true, true, pubkey(2));
+        agg.process_receipt(&r1);
+        agg.process_receipt(&r2);
+
+        let status = agg.get_status(&bh).unwrap();
+        assert_eq!(status.valid_count, 2);
+
+        // Re-register the same block — should NOT reset counts.
+        agg.register_block(bh, 2000);
+
+        let status = agg.get_status(&bh).unwrap();
+        assert_eq!(
+            status.valid_count, 2,
+            "register_block must not overwrite existing receipt counts"
+        );
+    }
+
+    #[test]
+    fn test_threshold_one_immediate_attestation() {
+        let mut agg = ReceiptAggregator::new(1, 100);
+        let bh = hash(30);
+        agg.register_block(bh, 3000);
+
+        // With threshold=1, the first valid receipt should trigger attestation.
+        let r = mock_receipt(bh, 3000, true, true, pubkey(1));
+        let result = agg.process_receipt(&r);
+        assert_eq!(result, Some(true), "threshold=1 should attest on first valid receipt");
+        assert!(agg.get_status(&bh).unwrap().is_attested());
     }
 
     #[test]

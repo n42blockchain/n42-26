@@ -230,15 +230,35 @@ fn main() {
                 );
 
                 // 3. Start MobileVerificationBridge (receipt aggregation).
+                let (attest_tx, mut attest_rx) = mpsc::unbounded_channel();
+                let (phone_connected_tx, phone_connected_rx) = mpsc::unbounded_channel();
                 let mobile_bridge = MobileVerificationBridge::new(
                     hub_event_rx,
                     10, // default threshold: 10 valid receipts
                     1000, // track up to 1000 blocks
-                );
+                )
+                .with_attestation_tx(attest_tx)
+                .with_phone_connected_tx(phone_connected_tx);
 
                 task_executor.spawn_critical_task(
                     "n42-mobile-bridge",
                     Box::pin(mobile_bridge.run()),
+                );
+
+                // Spawn a lightweight task to log attestation events.
+                task_executor.spawn_critical_task(
+                    "n42-attestation-logger",
+                    Box::pin(async move {
+                        while let Some(event) = attest_rx.recv().await {
+                            info!(
+                                target: "n42::mobile",
+                                block_number = event.block_number,
+                                %event.block_hash,
+                                valid_count = event.valid_count,
+                                "block reached mobile attestation threshold"
+                            );
+                        }
+                    }),
                 );
 
                 // 4. Start mobile packet generation loop.
@@ -256,6 +276,7 @@ fn main() {
                         mobile_provider,
                         mobile_chain_spec,
                         mobile_hub_handle,
+                        phone_connected_rx,
                     )),
                 );
 

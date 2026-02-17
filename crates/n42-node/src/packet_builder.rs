@@ -245,4 +245,114 @@ mod tests {
         assert_eq!(uncached[0].0, expected_hash);
         assert_eq!(uncached[0].1, code);
     }
+
+    #[test]
+    fn test_build_with_account_and_storage() {
+        // Set up an account with a storage slot in the witness.
+        let addr = Address::with_last_byte(0x42);
+        let hashed_addr = keccak256(addr);
+        let slot = B256::with_last_byte(0x01);
+        let hashed_slot = keccak256(slot);
+
+        let account = Account {
+            nonce: 5,
+            balance: U256::from(1000),
+            bytecode_hash: Some(KECCAK_EMPTY),
+        };
+
+        let mut hashed_state = HashedPostState::default();
+        hashed_state.accounts.insert(hashed_addr, Some(account));
+
+        let mut hashed_storage = HashedStorage::new(false);
+        hashed_storage.storage.insert(hashed_slot, U256::from(42));
+        hashed_state.storages.insert(hashed_addr, hashed_storage);
+
+        let witness = ExecutionWitness {
+            hashed_state,
+            codes: vec![],
+            keys: vec![
+                Bytes::copy_from_slice(addr.as_slice()),
+                Bytes::copy_from_slice(slot.as_slice()),
+            ],
+            lowest_block_number: None,
+        };
+
+        // Build preimage maps and resolve accounts (same logic as build_verification_packet).
+        let mut address_preimages = HashMap::new();
+        let mut slot_preimages = HashMap::new();
+        for key in &witness.keys {
+            match key.len() {
+                20 => {
+                    let a = Address::from_slice(key);
+                    address_preimages.insert(keccak256(a), a);
+                }
+                32 => {
+                    let s = B256::from_slice(key);
+                    slot_preimages.insert(keccak256(s), s);
+                }
+                _ => {}
+            }
+        }
+
+        // Resolve the account.
+        let (ha, maybe_acct) = witness.hashed_state.accounts.iter().next().unwrap();
+        let acct = maybe_acct.unwrap();
+        let resolved_addr = address_preimages.get(ha).unwrap();
+        assert_eq!(*resolved_addr, addr);
+        assert_eq!(acct.nonce, 5);
+        assert_eq!(acct.balance, U256::from(1000));
+
+        // Resolve storage slots.
+        let hs = witness.hashed_state.storages.get(ha).unwrap();
+        let (hs_key, hs_val) = hs.storage.iter().next().unwrap();
+        let real_slot = slot_preimages.get(hs_key).unwrap();
+        assert_eq!(*real_slot, slot);
+        assert_eq!(*hs_val, U256::from(42));
+    }
+
+    #[test]
+    fn test_missing_account_preimage() {
+        // Create a witness with hashed account but no preimage key.
+        let addr = Address::with_last_byte(0x99);
+        let hashed_addr = keccak256(addr);
+
+        let account = Account {
+            nonce: 1,
+            balance: U256::from(100),
+            bytecode_hash: Some(KECCAK_EMPTY),
+        };
+
+        let mut hashed_state = HashedPostState::default();
+        hashed_state.accounts.insert(hashed_addr, Some(account));
+
+        let witness = ExecutionWitness {
+            hashed_state,
+            codes: vec![],
+            keys: vec![], // no preimage!
+            lowest_block_number: None,
+        };
+
+        // Reproduce the preimage resolution logic.
+        let mut address_preimages: HashMap<B256, Address> = HashMap::new();
+        for key in &witness.keys {
+            if key.len() == 20 {
+                let a = Address::from_slice(key);
+                address_preimages.insert(keccak256(a), a);
+            }
+        }
+
+        // Should fail to find the preimage.
+        for (ha, maybe_acct) in &witness.hashed_state.accounts {
+            if maybe_acct.is_some() {
+                let result = address_preimages
+                    .get(ha)
+                    .copied()
+                    .ok_or_else(|| PacketBuildError::MissingAccountPreimage(*ha));
+                assert!(result.is_err(), "should fail when preimage is missing");
+                assert!(
+                    matches!(result.unwrap_err(), PacketBuildError::MissingAccountPreimage(h) if h == *ha)
+                );
+            }
+        }
+    }
 }

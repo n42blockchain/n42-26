@@ -1,4 +1,4 @@
-use n42_mobile::code_cache::CodeCache;
+use n42_mobile::code_cache::{CacheSyncMessage, CodeCache};
 use n42_mobile::packet::decode_packet;
 use n42_mobile::receipt::sign_receipt;
 use n42_mobile::verifier::{update_cache_after_verify, verify_block};
@@ -6,9 +6,31 @@ use n42_primitives::BlsSecretKey;
 use reth_chainspec::ChainSpec;
 use std::collections::VecDeque;
 use std::ffi::{CStr, c_char, c_int};
-use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
+
+// ── Safety helpers ──
+
+/// Recovers from a poisoned mutex instead of panicking.
+///
+/// If a thread panics while holding the mutex, subsequent `.lock()` calls
+/// return `Err(PoisonError)`. This helper logs a warning and recovers the
+/// inner data, preventing cascading panics across FFI boundaries.
+fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poisoned| {
+        warn!("mutex poisoned, recovering");
+        poisoned.into_inner()
+    })
+}
+
+/// Safely converts `usize` to `c_int`, returning -1 on overflow.
+///
+/// Prevents undefined behavior when packet sizes exceed `c_int::MAX` (~2GB).
+fn safe_cint(val: usize) -> c_int {
+    c_int::try_from(val).unwrap_or(-1)
+}
 
 /// Maximum number of pending packets in the receive queue.
 const MAX_PENDING_PACKETS: usize = 64;
@@ -45,6 +67,8 @@ struct LastVerifyInfo {
 struct QuicConnection {
     connection: quinn::Connection,
     pending_packets: Arc<Mutex<VecDeque<Vec<u8>>>>,
+    /// Counter for packets dropped due to full queue.
+    dropped_count: Arc<AtomicU64>,
     /// Handle to the background receiver task.
     _recv_task: tokio::task::JoinHandle<()>,
 }
@@ -56,7 +80,7 @@ pub struct VerifierContext {
     chain_spec: Arc<ChainSpec>,
     signing_key: BlsSecretKey,
     pubkey_bytes: [u8; 48],
-    code_cache: Mutex<CodeCache>,
+    code_cache: Arc<Mutex<CodeCache>>,
     runtime: tokio::runtime::Runtime,
     connection: Mutex<Option<QuicConnection>>,
     stats: Mutex<VerifyStats>,
@@ -118,7 +142,7 @@ pub unsafe extern "C" fn n42_verifier_init(chain_id: u64) -> *mut VerifierContex
         chain_spec,
         signing_key,
         pubkey_bytes,
-        code_cache: Mutex::new(CodeCache::new(DEFAULT_CODE_CACHE_CAPACITY)),
+        code_cache: Arc::new(Mutex::new(CodeCache::new(DEFAULT_CODE_CACHE_CAPACITY))),
         runtime,
         connection: Mutex::new(None),
         stats: Mutex::new(VerifyStats::default()),
@@ -148,6 +172,10 @@ pub unsafe extern "C" fn n42_connect(
         None => return -1,
     };
 
+    if host.is_null() {
+        return -1;
+    }
+
     let host_str = match unsafe { CStr::from_ptr(host) }.to_str() {
         Ok(s) => s.to_string(),
         Err(_) => return -1,
@@ -160,16 +188,20 @@ pub unsafe extern "C" fn n42_connect(
             // Spawn background task to receive packets from QUIC streams.
             let conn_clone = connection.clone();
             let packets_clone = pending_packets.clone();
+            let cache_clone = ctx.code_cache.clone();
+            let dropped = Arc::new(AtomicU64::new(0));
+            let dropped_clone = dropped.clone();
             let recv_task = ctx.runtime.spawn(async move {
-                recv_loop(conn_clone, packets_clone).await;
+                recv_loop(conn_clone, packets_clone, cache_clone, dropped_clone).await;
             });
 
             let quic_conn = QuicConnection {
                 connection,
                 pending_packets,
+                dropped_count: dropped,
                 _recv_task: recv_task,
             };
-            *ctx.connection.lock().unwrap() = Some(quic_conn);
+            *lock_or_recover(&ctx.connection) = Some(quic_conn);
             info!(%host_str, port, "connected to StarHub");
             0
         }
@@ -198,13 +230,17 @@ pub unsafe extern "C" fn n42_poll_packet(
         None => return -1,
     };
 
-    let conn_guard = ctx.connection.lock().unwrap();
+    if out_buf.is_null() {
+        return -1;
+    }
+
+    let conn_guard = lock_or_recover(&ctx.connection);
     let conn = match conn_guard.as_ref() {
         Some(c) => c,
         None => return -1, // not connected
     };
 
-    let mut queue = conn.pending_packets.lock().unwrap();
+    let mut queue = lock_or_recover(&conn.pending_packets);
     match queue.pop_front() {
         Some(data) => {
             if data.len() > buf_len {
@@ -215,7 +251,7 @@ pub unsafe extern "C" fn n42_poll_packet(
             unsafe {
                 std::ptr::copy_nonoverlapping(data.as_ptr(), out_buf, data.len());
             }
-            data.len() as c_int
+            safe_cint(data.len())
         }
         None => 0,
     }
@@ -237,6 +273,10 @@ pub unsafe extern "C" fn n42_verify_and_send(
         Some(c) => c,
         None => return -1,
     };
+
+    if data.is_null() || len == 0 {
+        return -1;
+    }
 
     let packet_bytes = unsafe { std::slice::from_raw_parts(data, len) };
     let packet_size = len;
@@ -260,7 +300,7 @@ pub unsafe extern "C" fn n42_verify_and_send(
     // Execute and verify.
     let start = Instant::now();
     let result = {
-        let mut cache = ctx.code_cache.lock().unwrap();
+        let mut cache = lock_or_recover(&ctx.code_cache);
         verify_block(&packet, &mut cache, ctx.chain_spec.clone())
     };
     let verify_time_ms = start.elapsed().as_millis() as u64;
@@ -269,7 +309,7 @@ pub unsafe extern "C" fn n42_verify_and_send(
         Ok(r) => r,
         Err(e) => {
             error!(block_number, "verification failed: {}", e);
-            let mut stats = ctx.stats.lock().unwrap();
+            let mut stats = lock_or_recover(&ctx.stats);
             stats.blocks_verified += 1;
             stats.failure_count += 1;
             return 2;
@@ -278,7 +318,7 @@ pub unsafe extern "C" fn n42_verify_and_send(
 
     // Update code cache with newly received bytecodes.
     {
-        let mut cache = ctx.code_cache.lock().unwrap();
+        let mut cache = lock_or_recover(&ctx.code_cache);
         update_cache_after_verify(&packet, &mut cache);
     }
 
@@ -291,7 +331,10 @@ pub unsafe extern "C" fn n42_verify_and_send(
     let receipt = sign_receipt(
         block_hash,
         block_number,
-        true, // state_root_match - we only verify receipts_root
+        // state_root_match: always true because mobile verifiers only re-execute
+        // transactions and verify receipts_root. Full state_root verification would
+        // require the complete state trie, which is infeasible on mobile devices.
+        true,
         result.receipts_root_match,
         timestamp_ms,
         &ctx.signing_key,
@@ -299,7 +342,7 @@ pub unsafe extern "C" fn n42_verify_and_send(
 
     // Update stats.
     {
-        let mut stats = ctx.stats.lock().unwrap();
+        let mut stats = lock_or_recover(&ctx.stats);
         stats.blocks_verified += 1;
         if result.receipts_root_match {
             stats.success_count += 1;
@@ -325,7 +368,7 @@ pub unsafe extern "C" fn n42_verify_and_send(
             verify_time_ms,
             signature: hex::encode(sig_bytes),
         };
-        *ctx.last_info.lock().unwrap() = Some(info);
+        *lock_or_recover(&ctx.last_info) = Some(info);
     }
 
     info!(
@@ -336,7 +379,7 @@ pub unsafe extern "C" fn n42_verify_and_send(
     );
 
     // Send receipt via QUIC.
-    let conn_guard = ctx.connection.lock().unwrap();
+    let conn_guard = lock_or_recover(&ctx.connection);
     if let Some(conn) = conn_guard.as_ref() {
         let receipt_bytes = match bincode::serialize(&receipt) {
             Ok(b) => b,
@@ -382,7 +425,11 @@ pub unsafe extern "C" fn n42_last_verify_info(
         None => return -1,
     };
 
-    let info_guard = ctx.last_info.lock().unwrap();
+    if out_buf.is_null() {
+        return -1;
+    }
+
+    let info_guard = lock_or_recover(&ctx.last_info);
     let info = match info_guard.as_ref() {
         Some(i) => i,
         None => return 0,
@@ -401,7 +448,7 @@ pub unsafe extern "C" fn n42_last_verify_info(
         std::ptr::copy_nonoverlapping(json.as_ptr(), out_buf as *mut u8, json.len());
         *out_buf.add(json.len()) = 0; // null-terminate
     }
-    json.len() as c_int
+    safe_cint(json.len())
 }
 
 /// Gets the BLS12-381 public key (48 bytes).
@@ -419,6 +466,10 @@ pub unsafe extern "C" fn n42_get_pubkey(
         Some(c) => c,
         None => return -1,
     };
+
+    if out_buf.is_null() {
+        return -1;
+    }
 
     unsafe {
         std::ptr::copy_nonoverlapping(ctx.pubkey_bytes.as_ptr(), out_buf, 48);
@@ -443,11 +494,23 @@ pub unsafe extern "C" fn n42_get_stats(
         None => return -1,
     };
 
-    let stats = ctx.stats.lock().unwrap();
+    if out_buf.is_null() {
+        return -1;
+    }
+
+    let stats = lock_or_recover(&ctx.stats);
     let avg_time = if stats.blocks_verified > 0 {
         stats.total_verify_time_ms / stats.blocks_verified
     } else {
         0
+    };
+
+    let dropped = {
+        let conn_guard = lock_or_recover(&ctx.connection);
+        conn_guard
+            .as_ref()
+            .map(|c| c.dropped_count.load(Ordering::Relaxed))
+            .unwrap_or(0)
     };
 
     let json = serde_json::json!({
@@ -460,6 +523,7 @@ pub unsafe extern "C" fn n42_get_stats(
         } else {
             0
         },
+        "dropped_packets": dropped,
     });
 
     let json_str = json.to_string();
@@ -471,7 +535,7 @@ pub unsafe extern "C" fn n42_get_stats(
         std::ptr::copy_nonoverlapping(json_str.as_ptr(), out_buf as *mut u8, json_str.len());
         *out_buf.add(json_str.len()) = 0;
     }
-    json_str.len() as c_int
+    safe_cint(json_str.len())
 }
 
 /// Disconnects from the StarHub server.
@@ -487,7 +551,7 @@ pub unsafe extern "C" fn n42_disconnect(ctx: *mut VerifierContext) -> c_int {
         None => return -1,
     };
 
-    let mut conn_guard = ctx.connection.lock().unwrap();
+    let mut conn_guard = lock_or_recover(&ctx.connection);
     if let Some(conn) = conn_guard.take() {
         conn.connection.close(0u32.into(), b"disconnect");
         info!("disconnected from StarHub");
@@ -504,15 +568,21 @@ pub unsafe extern "C" fn n42_disconnect(ctx: *mut VerifierContext) -> c_int {
 /// Must not be called more than once for the same pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn n42_verifier_free(ctx: *mut VerifierContext) {
-    if !ctx.is_null() {
-        let ctx = unsafe { Box::from_raw(ctx) };
-        // Disconnect if still connected.
-        if let Some(conn) = ctx.connection.lock().unwrap().take() {
-            conn.connection.close(0u32.into(), b"shutdown");
-        }
-        info!("verifier context freed");
-        // ctx dropped here, runtime shuts down
+    if ctx.is_null() {
+        return;
     }
+    let ctx = unsafe { Box::from_raw(ctx) };
+    // Close QUIC connection and abort the background recv_task to prevent
+    // use-after-free: the task holds an Arc<Mutex<VecDeque>> that would
+    // otherwise outlive the VerifierContext.
+    let mut guard = lock_or_recover(&ctx.connection);
+    if let Some(conn) = guard.take() {
+        conn.connection.close(0u32.into(), b"shutdown");
+        conn._recv_task.abort();
+    }
+    drop(guard);
+    info!("verifier context freed");
+    // ctx dropped here, runtime shuts down
 }
 
 // ── Internal helpers ──
@@ -545,9 +615,14 @@ async fn connect_quic(
     endpoint.set_default_client_config(client_config);
 
     let addr = format!("{}:{}", host, port);
-    let connection = endpoint
-        .connect(addr.parse()?, "n42-starhub")?
-        .await?;
+    let connection = tokio::time::timeout(
+        Duration::from_secs(10),
+        endpoint.connect(addr.parse()?, "n42-starhub")?,
+    )
+    .await
+    .map_err(|_| -> Box<dyn std::error::Error + Send + Sync> {
+        "QUIC connect timed out after 10s".into()
+    })??;
 
     info!("QUIC connection established, sending BLS pubkey handshake");
 
@@ -561,6 +636,23 @@ async fn connect_quic(
     Ok((connection, pending))
 }
 
+/// Applies a `CacheSyncMessage` to the code cache.
+///
+/// Inserts new bytecodes and removes evict hints. Returns `(added, evicted)` counts.
+/// Evict hints for keys not in the cache are silently ignored.
+fn apply_cache_sync(msg: CacheSyncMessage, cache: &Mutex<CodeCache>) -> (usize, usize) {
+    let mut guard = lock_or_recover(cache);
+    let added = msg.codes.len();
+    for (hash, code) in msg.codes {
+        guard.insert(hash, code);
+    }
+    let evicted = msg.evict_hints.len();
+    for hash in &msg.evict_hints {
+        guard.remove(hash);
+    }
+    (added, evicted)
+}
+
 /// Background task that receives packets from the StarHub via QUIC uni-streams.
 ///
 /// StarHub sends data with a 1-byte type prefix:
@@ -569,6 +661,8 @@ async fn connect_quic(
 async fn recv_loop(
     connection: quinn::Connection,
     pending_packets: Arc<Mutex<VecDeque<Vec<u8>>>>,
+    code_cache: Arc<Mutex<CodeCache>>,
+    dropped_count: Arc<AtomicU64>,
 ) {
     loop {
         match connection.accept_uni().await {
@@ -587,15 +681,36 @@ async fn recv_loop(
                             0x01 => {
                                 // VerificationPacket
                                 debug!(size = payload.len(), "received verification packet");
-                                let mut queue = pending_packets.lock().unwrap();
+                                let mut queue = lock_or_recover(&pending_packets);
                                 if queue.len() >= MAX_PENDING_PACKETS {
-                                    queue.pop_front(); // drop oldest
+                                    dropped_count.fetch_add(1, Ordering::Relaxed);
+                                    warn!(
+                                        queue_len = queue.len(),
+                                        dropped = dropped_count.load(Ordering::Relaxed),
+                                        "packet queue full, dropping oldest packet"
+                                    );
+                                    queue.pop_front();
                                 }
                                 queue.push_back(payload.to_vec());
                             }
                             0x02 => {
-                                // CacheSyncMessage - handle separately if needed
-                                debug!(size = payload.len(), "received cache sync message");
+                                // CacheSyncMessage: pre-populate local code cache with hot bytecodes.
+                                match bincode::deserialize::<CacheSyncMessage>(payload) {
+                                    Ok(msg) => {
+                                        let (added, evicted) =
+                                            apply_cache_sync(msg, &code_cache);
+                                        let cache_size = lock_or_recover(&code_cache).len();
+                                        info!(
+                                            added,
+                                            evicted,
+                                            cache_size,
+                                            "applied cache sync message"
+                                        );
+                                    }
+                                    Err(e) => {
+                                        warn!("failed to decode CacheSyncMessage: {}", e);
+                                    }
+                                }
                             }
                             _ => {
                                 warn!(msg_type, "unknown message type from StarHub");
@@ -620,8 +735,14 @@ async fn recv_loop(
 #[cfg(target_os = "android")]
 mod android;
 
-/// Custom certificate verifier that accepts any server certificate.
-/// This is necessary because StarHub uses self-signed certificates generated by rcgen.
+/// Custom certificate verifier that accepts **any** server certificate.
+///
+/// # Security Warning
+///
+/// This disables all TLS certificate validation and is vulnerable to
+/// man-in-the-middle attacks. It is used here because StarHub nodes use
+/// self-signed certificates generated by `rcgen`. In production, consider
+/// pinning the StarHub certificate or using a proper CA chain.
 #[derive(Debug)]
 struct SkipServerVerification;
 
@@ -667,5 +788,134 @@ impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
             rustls::SignatureScheme::RSA_PSS_SHA384,
             rustls::SignatureScheme::RSA_PSS_SHA512,
         ]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_verify_stats_default() {
+        let stats = VerifyStats::default();
+        assert_eq!(stats.blocks_verified, 0);
+        assert_eq!(stats.success_count, 0);
+        assert_eq!(stats.failure_count, 0);
+        assert_eq!(stats.total_verify_time_ms, 0);
+    }
+
+    #[test]
+    fn test_last_verify_info_serialization() {
+        let info = LastVerifyInfo {
+            block_number: 42,
+            block_hash: "0x1234".to_string(),
+            receipts_root_match: true,
+            computed_receipts_root: "0xaaaa".to_string(),
+            expected_receipts_root: "0xbbbb".to_string(),
+            tx_count: 10,
+            witness_accounts: 5,
+            uncached_bytecodes: 2,
+            packet_size_bytes: 1024,
+            verify_time_ms: 150,
+            signature: "deadbeef".to_string(),
+        };
+
+        let json = serde_json::to_string(&info).expect("serialization should succeed");
+        assert!(json.contains("\"block_number\":42"));
+        assert!(json.contains("\"receipts_root_match\":true"));
+        assert!(json.contains("\"tx_count\":10"));
+        assert!(json.contains("\"verify_time_ms\":150"));
+
+        // Verify round-trip: deserialize back.
+        let parsed: serde_json::Value =
+            serde_json::from_str(&json).expect("should parse as valid JSON");
+        assert_eq!(parsed["block_number"], 42);
+        assert_eq!(parsed["witness_accounts"], 5);
+    }
+
+    #[test]
+    fn test_stats_json_format() {
+        // Simulate the JSON generation from n42_get_stats.
+        let stats = VerifyStats {
+            blocks_verified: 100,
+            success_count: 95,
+            failure_count: 5,
+            total_verify_time_ms: 15000,
+        };
+
+        let avg_time = stats.total_verify_time_ms / stats.blocks_verified;
+        let success_rate =
+            (stats.success_count as f64 / stats.blocks_verified as f64 * 100.0) as u64;
+
+        let json = serde_json::json!({
+            "blocks_verified": stats.blocks_verified,
+            "success_count": stats.success_count,
+            "failure_count": stats.failure_count,
+            "avg_time_ms": avg_time,
+            "success_rate": success_rate,
+        });
+
+        let json_str = json.to_string();
+        assert!(json_str.contains("\"blocks_verified\":100"));
+        assert!(json_str.contains("\"success_count\":95"));
+        assert!(json_str.contains("\"failure_count\":5"));
+        assert!(json_str.contains("\"avg_time_ms\":150"));
+        assert!(json_str.contains("\"success_rate\":95"));
+    }
+
+    #[test]
+    fn test_safe_cint_normal() {
+        assert_eq!(safe_cint(0), 0);
+        assert_eq!(safe_cint(100), 100);
+        assert_eq!(safe_cint(c_int::MAX as usize), c_int::MAX);
+    }
+
+    #[test]
+    fn test_apply_cache_sync() {
+        use alloy_primitives::{Bytes, B256};
+
+        let cache = Mutex::new(CodeCache::new(100));
+
+        let h1 = B256::with_last_byte(0x01);
+        let h2 = B256::with_last_byte(0x02);
+        let h3 = B256::with_last_byte(0x03);
+
+        let msg = CacheSyncMessage {
+            codes: vec![
+                (h1, Bytes::from(vec![0x60, 0x00])),
+                (h2, Bytes::from(vec![0x60, 0x01])),
+            ],
+            evict_hints: vec![h3], // h3 not in cache — should not panic
+        };
+
+        let (added, evicted) = apply_cache_sync(msg, &cache);
+        assert_eq!(added, 2);
+        assert_eq!(evicted, 1);
+
+        let mut guard = lock_or_recover(&cache);
+        assert!(guard.get(&h1).is_some(), "h1 should be in cache");
+        assert!(guard.get(&h2).is_some(), "h2 should be in cache");
+        assert_eq!(guard.len(), 2);
+
+        // Now evict h1 via a second sync message.
+        drop(guard);
+        let msg2 = CacheSyncMessage {
+            codes: vec![],
+            evict_hints: vec![h1],
+        };
+        let (added2, evicted2) = apply_cache_sync(msg2, &cache);
+        assert_eq!(added2, 0);
+        assert_eq!(evicted2, 1);
+
+        let mut guard = lock_or_recover(&cache);
+        assert!(guard.get(&h1).is_none(), "h1 should have been evicted");
+        assert_eq!(guard.len(), 1);
+    }
+
+    #[test]
+    fn test_safe_cint_overflow() {
+        // Values larger than c_int::MAX should return -1.
+        assert_eq!(safe_cint(c_int::MAX as usize + 1), -1);
+        assert_eq!(safe_cint(usize::MAX), -1);
     }
 }
