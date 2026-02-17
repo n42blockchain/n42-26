@@ -4,6 +4,7 @@ pub mod consensus_state;
 pub mod mobile_bridge;
 pub mod orchestrator;
 pub mod payload;
+pub mod persistence;
 pub mod pool;
 pub mod rpc;
 pub mod tx_bridge;

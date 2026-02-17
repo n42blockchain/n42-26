@@ -1,10 +1,11 @@
 use alloy_primitives::Address;
 use clap::Parser;
 use n42_chainspec::ConsensusConfig;
-use n42_consensus::{ConsensusEngine, ValidatorSet};
+use n42_consensus::{ConsensusEngine, EpochManager, ValidatorSet};
 use n42_network::{build_swarm, StarHub, StarHubConfig, TransportConfig};
 use n42_network::NetworkService;
 use n42_node::mobile_bridge::MobileVerificationBridge;
+use n42_node::persistence;
 use n42_node::rpc::{N42ApiServer, N42RpcServer};
 use n42_node::tx_bridge::TxPoolBridge;
 use n42_node::{ConsensusOrchestrator, N42Node, SharedConsensusState};
@@ -12,6 +13,7 @@ use n42_primitives::BlsSecretKey;
 use reth_ethereum_cli::chainspec::EthereumChainSpecParser;
 use reth_ethereum_cli::Cli;
 use reth_storage_api::BlockHashReader;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
@@ -230,16 +232,62 @@ fn main() {
                     Box::pin(mobile_bridge.run()),
                 );
 
-                // 4. Create ConsensusEngine.
+                // 4. Create ConsensusEngine (with optional state recovery).
+                let data_dir: PathBuf = std::env::var("N42_DATA_DIR")
+                    .unwrap_or_else(|_| "./n42-data".to_string())
+                    .into();
+                let state_file = data_dir.join("consensus_state.json");
+
                 let (output_tx, output_rx) = mpsc::unbounded_channel();
-                let consensus_engine = ConsensusEngine::new(
-                    my_index,
-                    secret_key,
-                    validator_set,
-                    consensus_config.base_timeout_ms,
-                    consensus_config.max_timeout_ms,
-                    output_tx,
-                );
+                let consensus_engine = match persistence::load_consensus_state(&state_file) {
+                    Ok(Some(snapshot)) => {
+                        info!(
+                            target: "n42::cli",
+                            view = snapshot.current_view,
+                            locked_qc_view = snapshot.locked_qc.view,
+                            last_committed_view = snapshot.last_committed_qc.view,
+                            "recovered consensus state from snapshot"
+                        );
+                        ConsensusEngine::with_recovered_state(
+                            my_index,
+                            secret_key,
+                            EpochManager::new(validator_set.clone()),
+                            consensus_config.base_timeout_ms,
+                            consensus_config.max_timeout_ms,
+                            output_tx,
+                            snapshot.current_view,
+                            snapshot.locked_qc,
+                            snapshot.last_committed_qc,
+                            snapshot.consecutive_timeouts,
+                        )
+                    }
+                    Ok(None) => {
+                        info!(target: "n42::cli", "no consensus snapshot found, starting fresh");
+                        ConsensusEngine::new(
+                            my_index,
+                            secret_key,
+                            validator_set.clone(),
+                            consensus_config.base_timeout_ms,
+                            consensus_config.max_timeout_ms,
+                            output_tx,
+                        )
+                    }
+                    Err(e) => {
+                        warn!(
+                            target: "n42::cli",
+                            error = %e,
+                            "failed to load consensus snapshot, starting fresh"
+                        );
+                        ConsensusEngine::new(
+                            my_index,
+                            secret_key,
+                            validator_set.clone(),
+                            consensus_config.base_timeout_ms,
+                            consensus_config.max_timeout_ms,
+                            output_tx,
+                        )
+                    }
+                };
 
                 // 5. Start TxPoolBridge for P2P transaction sync.
                 let (tx_import_tx, tx_import_rx) = mpsc::unbounded_channel::<Vec<u8>>();
@@ -271,7 +319,10 @@ fn main() {
                     consensus_state,
                     genesis_hash,
                     fee_recipient,
-                ).with_tx_pool_bridge(tx_import_tx, tx_broadcast_rx);
+                )
+                .with_tx_pool_bridge(tx_import_tx, tx_broadcast_rx)
+                .with_state_persistence(state_file)
+                .with_validator_set(validator_set);
 
                 task_executor.spawn_critical_task(
                     "n42-consensus-orchestrator",

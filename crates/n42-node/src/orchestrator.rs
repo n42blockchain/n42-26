@@ -1,7 +1,8 @@
 use crate::consensus_state::SharedConsensusState;
+use crate::persistence::{self, ConsensusSnapshot};
 use alloy_primitives::{Address, B256};
 use alloy_rpc_types_engine::{ForkchoiceState, PayloadAttributes, PayloadStatusEnum};
-use n42_consensus::{ConsensusEngine, ConsensusEvent, EngineOutput};
+use n42_consensus::{ConsensusEngine, ConsensusEvent, EngineOutput, verify_qc, ValidatorSet};
 use n42_network::{BlockSyncResponse, NetworkEvent, NetworkHandle, PeerId, SyncBlock};
 use n42_primitives::QuorumCertificate;
 use reth_ethereum_engine_primitives::EthEngineTypes;
@@ -9,6 +10,7 @@ use reth_node_builder::ConsensusEngineHandle;
 use reth_payload_builder::PayloadBuilderHandle;
 use reth_payload_primitives::{EngineApiMessageVersion, PayloadKind, PayloadTypes};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -119,6 +121,11 @@ pub struct ConsensusOrchestrator {
     connected_peers: HashSet<PeerId>,
     /// Whether a sync request is currently in-flight (prevents duplicate requests).
     sync_in_flight: bool,
+    /// Path for persisting consensus state snapshots (atomic JSON write).
+    /// When set, a snapshot is saved after each BlockCommitted event.
+    state_file: Option<PathBuf>,
+    /// Validator set reference for verifying QCs during state sync.
+    validator_set_for_sync: Option<ValidatorSet>,
 }
 
 impl ConsensusOrchestrator {
@@ -154,6 +161,8 @@ impl ConsensusOrchestrator {
             committed_blocks: VecDeque::new(),
             connected_peers: HashSet::new(),
             sync_in_flight: false,
+            state_file: None,
+            validator_set_for_sync: None,
         }
     }
 
@@ -207,7 +216,21 @@ impl ConsensusOrchestrator {
             committed_blocks: VecDeque::new(),
             connected_peers: HashSet::new(),
             sync_in_flight: false,
+            state_file: None,
+            validator_set_for_sync: None,
         }
+    }
+
+    /// Configures the path for persisting consensus state snapshots.
+    pub fn with_state_persistence(mut self, path: PathBuf) -> Self {
+        self.state_file = Some(path);
+        self
+    }
+
+    /// Configures the validator set used for verifying QCs during state sync.
+    pub fn with_validator_set(mut self, vs: ValidatorSet) -> Self {
+        self.validator_set_for_sync = Some(vs);
+        self
     }
 
     /// Configures the transaction pool bridge channels.
@@ -651,6 +674,9 @@ impl ConsensusOrchestrator {
             EngineOutput::BlockCommitted { view, block_hash, commit_qc } => {
                 info!(view, %block_hash, "block committed by consensus");
 
+                // Clone commit_qc early for snapshot persistence (before potential moves below).
+                let snapshot_qc = commit_qc.clone();
+
                 // Update shared consensus state (always safe, QC is valid regardless of reth state)
                 if let Some(ref state) = self.consensus_state {
                     state.update_committed_qc(commit_qc.clone());
@@ -727,6 +753,22 @@ impl ConsensusOrchestrator {
                     // No beacon engine (test mode)
                     self.pending_block_data.clear();
                     self.pending_executions.clear();
+                }
+
+                // Persist consensus state after each commit.
+                // This ensures locked_qc and view survive node restarts.
+                if let Some(ref path) = self.state_file {
+                    let snapshot = ConsensusSnapshot {
+                        current_view: self.engine.current_view(),
+                        locked_qc: snapshot_qc.clone(),
+                        last_committed_qc: snapshot_qc,
+                        consecutive_timeouts: 0, // reset after commit
+                    };
+                    if let Err(e) = persistence::save_consensus_state(path, &snapshot) {
+                        error!(error = %e, "failed to save consensus state");
+                    } else {
+                        debug!(view = snapshot.current_view, "consensus state persisted");
+                    }
                 }
 
                 // Always check: if this node is leader for the next view, start building.
@@ -824,6 +866,19 @@ impl ConsensusOrchestrator {
                 );
 
                 if is_valid {
+                    // Verify block hash: cross-check engine's validated hash against
+                    // the broadcast's claimed hash to detect substitution attacks.
+                    if let Some(ref valid_hash) = status.latest_valid_hash {
+                        if *valid_hash != broadcast.block_hash {
+                            warn!(
+                                expected = %broadcast.block_hash,
+                                engine_hash = %valid_hash,
+                                "block hash mismatch between broadcast and engine, skipping"
+                            );
+                            return;
+                        }
+                    }
+
                     info!(hash = %broadcast.block_hash, "block imported from leader");
 
                     // Advance reth chain head (CRITICAL: without this, reth stays at genesis).
@@ -1032,6 +1087,39 @@ impl ConsensusOrchestrator {
             if sync_block.payload.is_empty() {
                 debug!(view = sync_block.view, "skipping sync block with empty payload");
                 continue;
+            }
+
+            // Verify commit_qc before importing (defect 3 fix).
+            // Without this, a malicious peer could inject forged blocks during sync.
+            if let Some(ref vs) = self.validator_set_for_sync {
+                // Check QC signature validity
+                if let Err(e) = verify_qc(&sync_block.commit_qc, vs) {
+                    warn!(
+                        view = sync_block.view,
+                        hash = %sync_block.block_hash,
+                        error = %e,
+                        "sync block has invalid commit_qc, skipping"
+                    );
+                    continue;
+                }
+                // Check QC corresponds to this block
+                if sync_block.commit_qc.block_hash != sync_block.block_hash {
+                    warn!(
+                        view = sync_block.view,
+                        block_hash = %sync_block.block_hash,
+                        qc_hash = %sync_block.commit_qc.block_hash,
+                        "sync block commit_qc hash mismatch, skipping"
+                    );
+                    continue;
+                }
+                if sync_block.commit_qc.view != sync_block.view {
+                    warn!(
+                        block_view = sync_block.view,
+                        qc_view = sync_block.commit_qc.view,
+                        "sync block commit_qc view mismatch, skipping"
+                    );
+                    continue;
+                }
             }
 
             // Construct a BlockDataBroadcast for import_and_notify
@@ -1311,6 +1399,8 @@ mod tests {
             committed_blocks: VecDeque::new(),
             connected_peers: HashSet::new(),
             sync_in_flight: false,
+            state_file: None,
+            validator_set_for_sync: None,
         };
 
         assert!(state.load_committed_qc().is_none(), "should start with no QC");
@@ -1357,6 +1447,8 @@ mod tests {
             committed_blocks: VecDeque::new(),
             connected_peers: HashSet::new(),
             sync_in_flight: false,
+            state_file: None,
+            validator_set_for_sync: None,
         };
 
         // Send a BlockReady hash through the channel.

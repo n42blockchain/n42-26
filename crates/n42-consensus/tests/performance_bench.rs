@@ -209,19 +209,16 @@ impl BenchHarness {
 
         let elapsed = start.elapsed();
 
-        // Safety net: advance any engines still behind
+        // Re-deliver Decide to any engines still behind
         let next_view = view + 1;
         for i in 0..n {
             if self.engines[i].current_view() < next_view {
-                let dummy = TimeoutMessage {
-                    view: next_view,
-                    high_qc: QuorumCertificate::genesis(),
-                    sender: 0,
-                    signature: self.secret_keys[0].sign(b"advance"),
-                };
-                let _ = self.engines[i].process_event(ConsensusEvent::Message(
-                    ConsensusMessage::Timeout(dummy),
-                ));
+                for output in &leader_outputs_final {
+                    if let EngineOutput::BroadcastMessage(msg @ ConsensusMessage::Decide(_)) = output {
+                        let _ = self.engines[i]
+                            .process_event(ConsensusEvent::Message(msg.clone()));
+                    }
+                }
             }
         }
         self.drain_all();

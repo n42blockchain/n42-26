@@ -51,6 +51,25 @@ impl RoundState {
         }
     }
 
+    /// Creates a RoundState from a persisted snapshot (crash recovery).
+    ///
+    /// Restores the critical safety state (locked_qc, last_committed_qc)
+    /// so that the node resumes with its previous locking constraints intact.
+    pub fn from_snapshot(
+        view: ViewNumber,
+        locked_qc: QuorumCertificate,
+        last_committed_qc: QuorumCertificate,
+        consecutive_timeouts: u32,
+    ) -> Self {
+        Self {
+            current_view: view,
+            phase: Phase::WaitingForProposal,
+            locked_qc,
+            last_committed_qc,
+            consecutive_timeouts,
+        }
+    }
+
     /// Returns the current view number.
     pub fn current_view(&self) -> ViewNumber {
         self.current_view

@@ -165,6 +165,47 @@ impl ConsensusEngine {
         }
     }
 
+    /// Creates a consensus engine with recovered state from a persisted snapshot.
+    ///
+    /// Used at startup when a `consensus_state.json` file is found, restoring
+    /// the critical safety invariants (locked_qc, last_committed_qc) so that the
+    /// node doesn't vote in ways that violate its previous locking commitments.
+    pub fn with_recovered_state(
+        my_index: u32,
+        secret_key: BlsSecretKey,
+        epoch_manager: EpochManager,
+        base_timeout_ms: u64,
+        max_timeout_ms: u64,
+        output_tx: mpsc::UnboundedSender<EngineOutput>,
+        recovered_view: ViewNumber,
+        locked_qc: QuorumCertificate,
+        last_committed_qc: QuorumCertificate,
+        consecutive_timeouts: u32,
+    ) -> Self {
+        let pacemaker = Pacemaker::new(base_timeout_ms, max_timeout_ms);
+
+        Self {
+            my_index,
+            secret_key,
+            epoch_manager,
+            round_state: RoundState::from_snapshot(
+                recovered_view,
+                locked_qc,
+                last_committed_qc,
+                consecutive_timeouts,
+            ),
+            pacemaker,
+            vote_collector: None,
+            commit_collector: None,
+            timeout_collector: None,
+            prepare_qc: None,
+            previous_prepare_qc: None,
+            output_tx,
+            pending_proposal: None,
+            imported_blocks: HashSet::new(),
+        }
+    }
+
     /// Returns the current view number.
     pub fn current_view(&self) -> ViewNumber {
         self.round_state.current_view()
@@ -782,12 +823,10 @@ impl ConsensusEngine {
     fn process_timeout(&mut self, timeout: TimeoutMessage) -> ConsensusResult<()> {
         let view = self.round_state.current_view();
 
+        // Only process timeouts for the current view.
+        // If we're truly behind, NewView or Decide messages with verifiable
+        // QC/TC will advance our view — not unverified timeout messages.
         if timeout.view != view {
-            // Accept timeouts for current view only
-            if timeout.view > view {
-                // We're behind, catch up
-                self.advance_to_view(timeout.view);
-            }
             return Ok(());
         }
 
@@ -876,6 +915,37 @@ impl ConsensusEngine {
                 expected: expected_leader,
                 actual: nv.leader,
             });
+        }
+
+        // Verify leader's signature on the NewView message.
+        // Without this, a Byzantine node could forge NewView to force view jumps.
+        let pk = self.validator_set().get_public_key(nv.leader)?;
+        let nv_msg = timeout_signing_message(nv.view);
+        pk.verify(&nv_msg, &nv.signature).map_err(|_| {
+            ConsensusError::InvalidSignature {
+                view: nv.view,
+                validator_index: nv.leader,
+            }
+        })?;
+
+        // Verify TC: the timeout certificate must be for the previous view (nv.view - 1)
+        // and must have valid aggregated signatures from a quorum of validators.
+        if nv.timeout_cert.view != nv.view.saturating_sub(1) {
+            return Err(ConsensusError::InvalidTC {
+                view: nv.timeout_cert.view,
+                reason: format!(
+                    "TC view {} does not match expected view {} (nv.view - 1)",
+                    nv.timeout_cert.view,
+                    nv.view.saturating_sub(1)
+                ),
+            });
+        }
+        super::quorum::verify_tc(&nv.timeout_cert, self.validator_set())?;
+
+        // Verify the TC's high_qc signature to prevent injection of forged QCs.
+        // Genesis QC (view 0) is exempt — it has no real signatures.
+        if nv.timeout_cert.high_qc.view > 0 {
+            super::quorum::verify_qc(&nv.timeout_cert.high_qc, self.validator_set())?;
         }
 
         // Update locked QC from TC's high_qc if higher
@@ -1809,19 +1879,19 @@ mod tests {
     fn test_decide_stale_ignored() {
         use n42_primitives::consensus::Decide;
 
-        let (mut engine, sks, vs, _rx) = make_engine(4, 0);
+        let (mut engine, sks, vs, mut rx) = make_engine(4, 0);
         let block_hash = B256::repeat_byte(0xD2);
 
-        // Advance engine to view 5 by processing a future timeout
-        let dummy = n42_primitives::consensus::TimeoutMessage {
-            view: 5,
-            high_qc: QuorumCertificate::genesis(),
-            sender: 0,
-            signature: sks[0].sign(b"advance"),
-        };
-        let _ = engine.process_event(ConsensusEvent::Message(
-            ConsensusMessage::Timeout(dummy),
-        ));
+        // Advance engine to view 5 by processing valid Decide messages for views 1..=4.
+        for v in 1u64..=4 {
+            let bh = B256::repeat_byte(v as u8);
+            let cqc = build_test_commit_qc(v, bh, &sks, &vs, &[0, 1, 2]);
+            let decide = Decide { view: v, block_hash: bh, commit_qc: cqc };
+            let _ = engine.process_event(ConsensusEvent::Message(
+                ConsensusMessage::Decide(decide),
+            ));
+            while rx.try_recv().is_ok() {}
+        }
         assert_eq!(engine.current_view(), 5);
 
         // Send a Decide for view 3 (stale)

@@ -377,6 +377,45 @@ pub fn commit_signing_message(view: ViewNumber, block_hash: &B256) -> Vec<u8> {
     msg
 }
 
+/// Verifies a TimeoutCertificate against the validator set.
+///
+/// Checks that:
+/// 1. Enough signers participated (quorum)
+/// 2. The aggregated signature is valid over `timeout_signing_message(tc.view)`
+pub fn verify_tc(
+    tc: &TimeoutCertificate,
+    validator_set: &ValidatorSet,
+) -> ConsensusResult<()> {
+    // Check that enough signers participated
+    let signer_count = tc.signers.iter().filter(|b| **b).count();
+    let quorum_size = validator_set.quorum_size();
+    if signer_count < quorum_size {
+        return Err(ConsensusError::InvalidTC {
+            view: tc.view,
+            reason: format!(
+                "insufficient signers: have {signer_count}, need {quorum_size}"
+            ),
+        });
+    }
+
+    // Collect public keys of signers
+    let signer_pks: Vec<&BlsPublicKey> = tc
+        .signers
+        .iter()
+        .enumerate()
+        .filter(|(_, bit)| *bit == true)
+        .map(|(idx, _)| validator_set.get_public_key(idx as u32))
+        .collect::<ConsensusResult<Vec<_>>>()?;
+
+    // Verify the aggregated signature over timeout message
+    let message = timeout_signing_message(tc.view);
+    AggregateSignature::verify_aggregate(&message, &tc.aggregate_signature, &signer_pks)
+        .map_err(|_| ConsensusError::InvalidTC {
+            view: tc.view,
+            reason: "aggregated signature verification failed".to_string(),
+        })
+}
+
 /// Constructs the signing message for timeout: "timeout" || view (8 bytes LE).
 pub fn timeout_signing_message(view: ViewNumber) -> Vec<u8> {
     let mut msg = Vec::with_capacity(15);

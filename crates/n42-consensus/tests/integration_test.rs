@@ -280,19 +280,16 @@ impl TestHarness {
             }
         }
 
-        // ── Step 7: Safety net — advance any engines still behind ──
+        // ── Step 7: Safety net — re-deliver Decide to any engines still behind ──
         let next_view = view + 1;
         for i in 0..n {
             if self.engines[i].current_view() < next_view {
-                let dummy = TimeoutMessage {
-                    view: next_view,
-                    high_qc: QuorumCertificate::genesis(),
-                    sender: 0,
-                    signature: self.secret_keys[0].sign(b"advance"),
-                };
-                let _ = self.engines[i].process_event(ConsensusEvent::Message(
-                    ConsensusMessage::Timeout(dummy),
-                ));
+                for output in &decide_msgs {
+                    if let EngineOutput::BroadcastMessage(msg) = output {
+                        let _ = self.engines[i]
+                            .process_event(ConsensusEvent::Message(msg.clone()));
+                    }
+                }
             }
         }
 
@@ -473,19 +470,16 @@ impl TestHarness {
             // Drain catch-up outputs (discard late votes/commit-votes from catch-up)
             self.drain_all_outputs();
 
-            // Advance all engines to next view
+            // Re-deliver Decide to any engines still behind
             let next_view = view + 1;
             for i in 0..n {
                 if self.engines[i].current_view() < next_view {
-                    let dummy = TimeoutMessage {
-                        view: next_view,
-                        high_qc: QuorumCertificate::genesis(),
-                        sender: 0,
-                        signature: self.secret_keys[0].sign(b"advance"),
-                    };
-                    let _ = self.engines[i].process_event(ConsensusEvent::Message(
-                        ConsensusMessage::Timeout(dummy),
-                    ));
+                    for output in &decide_msgs {
+                        if let EngineOutput::BroadcastMessage(msg) = output {
+                            let _ = self.engines[i]
+                                .process_event(ConsensusEvent::Message(msg.clone()));
+                        }
+                    }
                 }
             }
             self.drain_all_outputs();
@@ -1362,26 +1356,10 @@ mod fault_tolerance {
     fn test_consecutive_timeouts_backoff() {
         let mut harness = TestHarness::new(4);
 
-        // Timeout 3 times
+        // Timeout 3 times using the proper TC → NewView flow
         for _ in 0..3 {
-            for i in 0..4 {
-                harness.trigger_timeout(i);
-            }
-            harness.drain_all_outputs();
-            // Advance engines manually for next round
-            let current = harness.engines[0].current_view();
-            for i in 0..4 {
-                let dummy = TimeoutMessage {
-                    view: current + 1,
-                    high_qc: QuorumCertificate::genesis(),
-                    sender: 0,
-                    signature: harness.secret_keys[0].sign(b"advance"),
-                };
-                let _ = harness.engines[i].process_event(ConsensusEvent::Message(
-                    ConsensusMessage::Timeout(dummy),
-                ));
-            }
-            harness.drain_all_outputs();
+            let view = harness.engines[0].current_view();
+            harness.run_timeout_view_change(view);
         }
 
         // Verify pacemaker timeout duration has increased (exponential backoff)
@@ -2858,21 +2836,7 @@ mod twenty_one_node {
                 participating
             );
 
-            // Advance non-participating engines to keep them roughly in sync
-            let next_view = view + 1;
-            for i in 0..21 {
-                if harness.engines[i].current_view() < next_view {
-                    let dummy = TimeoutMessage {
-                        view: next_view,
-                        high_qc: QuorumCertificate::genesis(),
-                        sender: 0,
-                        signature: harness.secret_keys[0].sign(b"advance"),
-                    };
-                    let _ = harness.engines[i].process_event(ConsensusEvent::Message(
-                        ConsensusMessage::Timeout(dummy),
-                    ));
-                }
-            }
+            // Non-participating engines are already advanced via Decide in run_consensus_round_partial.
             harness.drain_all_outputs();
         }
 
