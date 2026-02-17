@@ -47,6 +47,9 @@ tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 # Encoding
 hex.workspace = true
 
+# Hashing
+sha2.workspace = true
+
 # Concurrency
 once_cell = "1.19"
 

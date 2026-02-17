@@ -2,7 +2,7 @@ use n42_mobile::receipt::VerificationReceipt;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc, RwLock};
 
 use super::session::MobileSession;
@@ -14,6 +14,19 @@ const MSG_TYPE_CACHE_SYNC: u8 = 0x02;
 
 /// Handshake timeout: phones must send their public key within this duration.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Maximum size for a receipt bincode message (64KB).
+/// Actual receipt is ~220 bytes; 64KB provides 300x headroom.
+const MAX_RECEIPT_SIZE: u64 = 64 * 1024;
+
+/// Timeout for reading a single receipt stream from a phone.
+/// Receipt is ~220 bytes; even on 2G (50Kbps) completes in <1s.
+/// 10s covers extreme network jitter without blocking the accept loop.
+const RECEIPT_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Minimum interval between receipts from the same phone.
+/// Each phone sends ~1 receipt per 8s slot; 2s allows up to 4/slot (4x headroom).
+const MIN_RECEIPT_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Commands sent to the star hub from the node layer.
 #[derive(Debug)]
@@ -64,6 +77,12 @@ pub struct StarHubConfig {
     pub max_connections: usize,
     /// Session idle timeout in seconds.
     pub idle_timeout_secs: u64,
+    /// Broadcast channel buffer size. At ~0.15 msg/sec, 256 provides ~28 min buffer.
+    pub broadcast_buffer_size: usize,
+    /// Directory for persisting the TLS certificate. When set, the certificate is
+    /// saved on first run and reloaded on subsequent starts, enabling client-side
+    /// certificate pinning. When `None`, an ephemeral cert is generated each run.
+    pub cert_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for StarHubConfig {
@@ -72,6 +91,8 @@ impl Default for StarHubConfig {
             bind_addr: "0.0.0.0:9443".parse().unwrap(),
             max_connections: 10_000,
             idle_timeout_secs: 300,
+            broadcast_buffer_size: 256,
+            cert_dir: None,
         }
     }
 }
@@ -139,6 +160,8 @@ pub struct StarHub {
     event_tx: mpsc::UnboundedSender<HubEvent>,
     /// Broadcast sender for pushing data to all connection handlers.
     broadcast_tx: broadcast::Sender<BroadcastMsg>,
+    /// SHA-256 hash of the server certificate (populated during run()).
+    cert_hash: Option<[u8; 32]>,
 }
 
 impl StarHub {
@@ -149,9 +172,8 @@ impl StarHub {
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         // Broadcast channel: buffer recent messages for slow receivers.
-        // If a receiver falls behind by more than 256 messages, it will
-        // receive a Lagged error and skip ahead.
-        let (broadcast_tx, _) = broadcast::channel(256);
+        // If a receiver falls behind, it will receive a Lagged error and skip ahead.
+        let (broadcast_tx, _) = broadcast::channel(config.broadcast_buffer_size);
 
         let handle = StarHubHandle { command_tx };
 
@@ -161,6 +183,7 @@ impl StarHub {
             command_rx,
             event_tx,
             broadcast_tx,
+            cert_hash: None,
         };
 
         (hub, handle, event_rx)
@@ -188,8 +211,21 @@ impl StarHub {
     ///
     /// Should be spawned as a background task via `tokio::spawn` or
     /// `spawn_critical`.
+    /// Returns the SHA-256 hash of the server certificate for client-side pinning.
+    /// Must be called after construction; the hash is computed during `run()`.
+    pub fn cert_hash(&self) -> Option<[u8; 32]> {
+        self.cert_hash
+    }
+
     pub async fn run(mut self) -> eyre::Result<()> {
-        let server_config = build_server_config()?;
+        let (server_config, cert_hash) = build_server_config(
+            self.config.cert_dir.as_deref(),
+        )?;
+        self.cert_hash = Some(cert_hash);
+        tracing::info!(
+            cert_hash = hex::encode(cert_hash),
+            "StarHub certificate hash (for client pinning)"
+        );
 
         let endpoint = quinn::Endpoint::server(server_config, self.config.bind_addr)?;
 
@@ -348,6 +384,9 @@ async fn handle_phone_connection(
 
     tracing::debug!(session_id, "handshake complete, session active");
 
+    // Per-phone rate limiting: track last receipt time.
+    let mut last_receipt_at: Option<Instant> = None;
+
     // --- Main loop: handle receipts from phone + broadcasts to phone ---
     loop {
         tokio::select! {
@@ -355,10 +394,40 @@ async fn handle_phone_connection(
             stream = connection.accept_uni() => {
                 match stream {
                     Ok(mut recv) => {
-                        match recv.read_to_end(1_048_576).await {
-                            Ok(data) => {
-                                match bincode::deserialize::<VerificationReceipt>(&data) {
+                        // [C4] Timeout prevents slowloris attacks from exhausting the accept loop.
+                        let read_result = tokio::time::timeout(
+                            RECEIPT_READ_TIMEOUT,
+                            recv.read_to_end(MAX_RECEIPT_SIZE as usize),
+                        ).await;
+
+                        match read_result {
+                            Ok(Ok(data)) => {
+                                // [H2] Per-phone rate limiting: drop receipts arriving too fast.
+                                let now = Instant::now();
+                                if let Some(last) = last_receipt_at {
+                                    if now.duration_since(last) < MIN_RECEIPT_INTERVAL {
+                                        tracing::warn!(
+                                            session_id,
+                                            "receipt rate limited, dropping"
+                                        );
+                                        continue;
+                                    }
+                                }
+
+                                // [C2] Size-limited deserialization prevents OOM.
+                                if data.len() as u64 > MAX_RECEIPT_SIZE {
+                                    tracing::warn!(
+                                        target: "n42::starhub",
+                                        session_id,
+                                        size = data.len(),
+                                        "receipt too large, dropping"
+                                    );
+                                    continue;
+                                }
+                                match bincode::deserialize::<VerificationReceipt>(&data)
+                                {
                                     Ok(receipt) => {
+                                        last_receipt_at = Some(now);
                                         if let Some(session) = sessions.write().await.get_mut(&session_id) {
                                             session.receipts_received += 1;
                                             session.touch();
@@ -374,9 +443,12 @@ async fn handle_phone_connection(
                                     }
                                 }
                             }
-                            Err(e) => {
+                            Ok(Err(e)) => {
                                 tracing::debug!(session_id, error = %e, "read stream error");
                                 break;
+                            }
+                            Err(_) => {
+                                tracing::warn!(session_id, "receipt stream read timed out");
                             }
                         }
                     }
@@ -434,14 +506,59 @@ async fn handle_phone_connection(
     tracing::debug!(session_id, "phone disconnected");
 }
 
-/// Builds a QUIC server config with a self-signed certificate.
+/// Builds a QUIC server config with a persistent self-signed certificate.
 ///
-/// For production, replace with proper certificate management (e.g., ACME).
-fn build_server_config() -> eyre::Result<quinn::ServerConfig> {
-    let cert = rcgen::generate_simple_self_signed(vec!["n42-mobile".into()])?;
-    let cert_der = rustls::pki_types::CertificateDer::from(cert.cert);
-    let key_der = rustls::pki_types::PrivateKeyDer::try_from(cert.key_pair.serialize_der())
-        .map_err(|e| eyre::eyre!("key conversion error: {e}"))?;
+/// If `cert_dir` is provided, the certificate and key are loaded from (or generated
+/// and saved to) that directory. This ensures the same certificate is used across
+/// restarts, enabling client-side certificate pinning.
+///
+/// Returns `(ServerConfig, SHA-256 hash of the DER-encoded certificate)`.
+fn build_server_config(
+    cert_dir: Option<&std::path::Path>,
+) -> eyre::Result<(quinn::ServerConfig, [u8; 32])> {
+    use sha2::{Sha256, Digest};
+
+    let (cert_der, key_der) = if let Some(dir) = cert_dir {
+        let cert_path = dir.join("starhub_cert.der");
+        let key_path = dir.join("starhub_key.der");
+
+        if cert_path.exists() && key_path.exists() {
+            let cert_bytes = std::fs::read(&cert_path)?;
+            let key_bytes = std::fs::read(&key_path)?;
+            let cert = rustls::pki_types::CertificateDer::from(cert_bytes);
+            let key = rustls::pki_types::PrivateKeyDer::try_from(key_bytes)
+                .map_err(|e| eyre::eyre!("key load error: {e}"))?;
+            tracing::info!("loaded persistent StarHub certificate from {:?}", cert_path);
+            (cert, key)
+        } else {
+            let cert = rcgen::generate_simple_self_signed(vec!["n42-mobile".into()])?;
+            let cert_der = rustls::pki_types::CertificateDer::from(cert.cert);
+            let key_bytes = cert.key_pair.serialize_der();
+            let key_der = rustls::pki_types::PrivateKeyDer::try_from(key_bytes.clone())
+                .map_err(|e| eyre::eyre!("key conversion error: {e}"))?;
+
+            // Persist for future restarts
+            std::fs::create_dir_all(dir)?;
+            std::fs::write(&cert_path, cert_der.as_ref())?;
+            std::fs::write(&key_path, &key_bytes)?;
+            tracing::info!("generated and saved StarHub certificate to {:?}", cert_path);
+            (cert_der, key_der)
+        }
+    } else {
+        // Ephemeral certificate (dev mode)
+        let cert = rcgen::generate_simple_self_signed(vec!["n42-mobile".into()])?;
+        let cert_der = rustls::pki_types::CertificateDer::from(cert.cert);
+        let key_der = rustls::pki_types::PrivateKeyDer::try_from(cert.key_pair.serialize_der())
+            .map_err(|e| eyre::eyre!("key conversion error: {e}"))?;
+        (cert_der, key_der)
+    };
+
+    // Compute SHA-256 hash of the certificate for client-side pinning.
+    let cert_hash: [u8; 32] = {
+        let mut hasher = Sha256::new();
+        hasher.update(cert_der.as_ref());
+        hasher.finalize().into()
+    };
 
     let mut server_crypto = rustls::ServerConfig::builder()
         .with_no_client_auth()
@@ -460,7 +577,7 @@ fn build_server_config() -> eyre::Result<quinn::ServerConfig> {
     ));
     server_config.transport_config(Arc::new(transport));
 
-    Ok(server_config)
+    Ok((server_config, cert_hash))
 }
 
 #[cfg(test)]

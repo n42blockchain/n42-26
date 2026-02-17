@@ -6,7 +6,7 @@ use n42_primitives::{
         TimeoutMessage, ViewNumber, Vote,
     },
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use tokio::sync::mpsc;
 
 use crate::error::{ConsensusError, ConsensusResult};
@@ -55,6 +55,14 @@ pub enum EngineOutput {
     SyncRequired {
         local_view: ViewNumber,
         target_view: ViewNumber,
+    },
+    /// Equivocation detected: a validator voted for two different blocks
+    /// in the same view. This is evidence of Byzantine behavior.
+    EquivocationDetected {
+        view: ViewNumber,
+        validator: u32,
+        hash1: B256,
+        hash2: B256,
     },
 }
 
@@ -115,6 +123,9 @@ pub struct ConsensusEngine {
     /// Block hashes that have been imported but no matching proposal yet.
     /// Handles the case where BlockData arrives before Proposal.
     imported_blocks: HashSet<B256>,
+    /// Tracks which block hash each validator voted for in the current view.
+    /// Used to detect equivocation (same validator voting for different blocks).
+    equivocation_tracker: HashMap<u32, B256>,
 }
 
 impl ConsensusEngine {
@@ -162,6 +173,7 @@ impl ConsensusEngine {
             output_tx,
             pending_proposal: None,
             imported_blocks: HashSet::new(),
+            equivocation_tracker: HashMap::new(),
         }
     }
 
@@ -203,6 +215,7 @@ impl ConsensusEngine {
             output_tx,
             pending_proposal: None,
             imported_blocks: HashSet::new(),
+            equivocation_tracker: HashMap::new(),
         }
     }
 
@@ -256,6 +269,21 @@ impl ConsensusEngine {
             self.round_state.current_view(),
             self.validator_set(),
         )
+    }
+
+    /// Returns the current locked QC (highest QC seen in a valid proposal).
+    pub fn locked_qc(&self) -> &QuorumCertificate {
+        self.round_state.locked_qc()
+    }
+
+    /// Returns the last committed QC.
+    pub fn last_committed_qc(&self) -> &QuorumCertificate {
+        self.round_state.last_committed_qc()
+    }
+
+    /// Returns the number of consecutive timeouts since the last progress.
+    pub fn consecutive_timeouts(&self) -> u32 {
+        self.round_state.consecutive_timeouts()
     }
 
     /// Processes a consensus event and generates outputs.
@@ -493,6 +521,30 @@ impl ConsensusEngine {
         // Only the leader processes votes
         if !self.is_current_leader() {
             return Ok(());
+        }
+
+        // Equivocation detection: check if this validator already voted for a
+        // different block hash in the same view. This is evidence of Byzantine
+        // behavior — the validator is attempting to double-vote.
+        if let Some(&prev_hash) = self.equivocation_tracker.get(&vote.voter) {
+            if prev_hash != vote.block_hash {
+                tracing::warn!(
+                    view,
+                    validator = vote.voter,
+                    %prev_hash,
+                    new_hash = %vote.block_hash,
+                    "equivocation detected: validator voted for two different blocks"
+                );
+                self.emit(EngineOutput::EquivocationDetected {
+                    view,
+                    validator: vote.voter,
+                    hash1: prev_hash,
+                    hash2: vote.block_hash,
+                });
+                return Ok(());
+            }
+        } else {
+            self.equivocation_tracker.insert(vote.voter, vote.block_hash);
         }
 
         // Check block hash before verification (read-only borrow of collector)
@@ -1031,6 +1083,7 @@ impl ConsensusEngine {
         self.prepare_qc = None;
         self.pending_proposal = None;
         self.imported_blocks.clear();
+        self.equivocation_tracker.clear();
 
         tracing::debug!(view = new_view, "advanced to new view");
     }

@@ -15,6 +15,10 @@ pub struct AttestationEvent {
     pub valid_count: u32,
 }
 
+/// Minimum attestation threshold regardless of connected phone count.
+/// Protects initial deployment when very few phones are connected.
+const MIN_ATTESTATION_THRESHOLD: u32 = 10;
+
 /// Bridges the StarHub mobile verification events with the ReceiptAggregator.
 ///
 /// Consumes HubEvents from the StarHub and processes verification receipts
@@ -31,6 +35,9 @@ pub struct MobileVerificationBridge {
     /// Optional sender for notifying when a new phone connects.
     /// Used by `mobile_packet_loop` to trigger CacheSyncMessage broadcast.
     phone_connected_tx: Option<mpsc::UnboundedSender<()>>,
+    /// Number of currently connected mobile verifiers.
+    /// Used to dynamically adjust the attestation threshold.
+    connected_count: u32,
 }
 
 impl MobileVerificationBridge {
@@ -48,6 +55,7 @@ impl MobileVerificationBridge {
             receipt_aggregator: ReceiptAggregator::new(default_threshold, max_tracked_blocks),
             attestation_tx: None,
             phone_connected_tx: None,
+            connected_count: 0,
         }
     }
 
@@ -87,9 +95,12 @@ impl MobileVerificationBridge {
         while let Some(event) = self.hub_event_rx.recv().await {
             match event {
                 HubEvent::PhoneConnected { session_id, .. } => {
+                    self.connected_count += 1;
+                    self.update_dynamic_threshold();
                     debug!(
                         target: "n42::mobile",
                         session_id,
+                        connected = self.connected_count,
                         "mobile verifier connected"
                     );
                     // Notify mobile_packet_loop to send CacheSyncMessage.
@@ -98,9 +109,12 @@ impl MobileVerificationBridge {
                     }
                 }
                 HubEvent::PhoneDisconnected { session_id } => {
+                    self.connected_count = self.connected_count.saturating_sub(1);
+                    self.update_dynamic_threshold();
                     debug!(
                         target: "n42::mobile",
                         session_id,
+                        connected = self.connected_count,
                         "mobile verifier disconnected"
                     );
                 }
@@ -127,10 +141,38 @@ impl MobileVerificationBridge {
         info!(target: "n42::mobile", "mobile verification bridge shutting down");
     }
 
+    /// Recalculates the attestation threshold based on the number of connected phones.
+    ///
+    /// Formula: `max(MIN_ATTESTATION_THRESHOLD, connected_count * 2 / 3)`
+    /// This ensures BFT-grade security (2/3 threshold) when enough phones are connected,
+    /// while maintaining a minimum of 10 during early deployment.
+    fn update_dynamic_threshold(&mut self) {
+        let dynamic = self.connected_count * 2 / 3;
+        let threshold = dynamic.max(MIN_ATTESTATION_THRESHOLD);
+        self.receipt_aggregator.set_default_threshold(threshold);
+        debug!(
+            target: "n42::mobile",
+            connected = self.connected_count,
+            threshold,
+            "attestation threshold updated"
+        );
+    }
+
     /// Processes a verification receipt through the aggregator.
     ///
     /// Public for testing; production code calls this via the event loop.
     pub fn process_receipt(&mut self, receipt: &VerificationReceipt) {
+        // Verify BLS signature before aggregation to prevent forged receipts.
+        if let Err(e) = receipt.verify_signature() {
+            warn!(
+                target: "n42::mobile",
+                block_number = receipt.block_number,
+                error = %e,
+                "receipt signature invalid, dropping"
+            );
+            return;
+        }
+
         // Register block if not yet tracked.
         self.receipt_aggregator.register_block(
             receipt.block_hash,

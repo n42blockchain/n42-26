@@ -123,6 +123,9 @@ arc-swap = "1.7"
 # Encoding
 hex = "0.4"
 
+# Hashing
+sha2 = "0.10"
+
 # Random
 rand = "0.8"
 

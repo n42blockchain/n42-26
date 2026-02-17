@@ -298,10 +298,20 @@ fn main() {
                             last_committed_view = snapshot.last_committed_qc.view,
                             "recovered consensus state from snapshot"
                         );
+                        let mut epoch_manager = EpochManager::new(validator_set.clone());
+                        // Restore staged epoch transition if one was in progress.
+                        if let Some((_, ref validators, f)) = snapshot.scheduled_epoch_transition {
+                            info!(
+                                target: "n42::cli",
+                                new_validators = validators.len(),
+                                "restoring staged epoch transition from snapshot"
+                            );
+                            epoch_manager.stage_next_epoch(validators, f);
+                        }
                         ConsensusEngine::with_recovered_state(
                             my_index,
                             secret_key,
-                            EpochManager::new(validator_set.clone()),
+                            epoch_manager,
                             consensus_config.base_timeout_ms,
                             consensus_config.max_timeout_ms,
                             output_tx,

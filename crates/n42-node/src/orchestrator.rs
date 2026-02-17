@@ -446,6 +446,30 @@ impl ConsensusOrchestrator {
                 }
             }
         }
+
+        // Graceful shutdown: persist final consensus state so that a restarted
+        // node resumes from the latest committed view instead of replaying.
+        info!(
+            view = self.engine.current_view(),
+            "orchestrator shutting down, persisting final state"
+        );
+        if let Some(ref path) = self.state_file {
+            let scheduled_epoch = self.engine.epoch_manager()
+                .staged_epoch_info()
+                .map(|(epoch, validators, f)| (epoch, validators.to_vec(), f));
+            let snapshot = ConsensusSnapshot {
+                current_view: self.engine.current_view(),
+                locked_qc: self.engine.locked_qc().clone(),
+                last_committed_qc: self.engine.last_committed_qc().clone(),
+                consecutive_timeouts: self.engine.consecutive_timeouts(),
+                scheduled_epoch_transition: scheduled_epoch,
+            };
+            if let Err(e) = persistence::save_consensus_state(path, &snapshot) {
+                error!(error = %e, "failed to persist final consensus state on shutdown");
+            } else {
+                info!(view = snapshot.current_view, "final consensus state persisted");
+            }
+        }
     }
 
     /// Schedules a payload build using wall-clock-aligned slot timing.
@@ -794,11 +818,15 @@ impl ConsensusOrchestrator {
                 // Persist consensus state after each commit.
                 // This ensures locked_qc and view survive node restarts.
                 if let Some(ref path) = self.state_file {
+                    let scheduled_epoch = self.engine.epoch_manager()
+                        .staged_epoch_info()
+                        .map(|(epoch, validators, f)| (epoch, validators.to_vec(), f));
                     let snapshot = ConsensusSnapshot {
                         current_view: self.engine.current_view(),
                         locked_qc: snapshot_qc.clone(),
                         last_committed_qc: snapshot_qc,
                         consecutive_timeouts: 0, // reset after commit
+                        scheduled_epoch_transition: scheduled_epoch,
                     };
                     if let Err(e) = persistence::save_consensus_state(path, &snapshot) {
                         error!(error = %e, "failed to save consensus state");
@@ -816,14 +844,12 @@ impl ConsensusOrchestrator {
             EngineOutput::ViewChanged { new_view } => {
                 info!(new_view, "view changed");
 
-                // Clean up stale block data from previous views.
-                self.pending_block_data.clear();
-
-                // Preserve pending_executions and pending_finalization if a committed
-                // block is awaiting import. In f=0 configs, ViewChanged fires immediately
-                // after BlockCommitted (same process_event call), and clearing these would
-                // lose the deferred finalization state.
+                // Preserve pending data if a committed block is awaiting import.
+                // In f=0 configs, ViewChanged fires immediately after BlockCommitted
+                // (same process_event call), and clearing these would lose the
+                // deferred finalization state that depends on pending_block_data.
                 if self.pending_finalization.is_none() {
+                    self.pending_block_data.clear();
                     self.pending_executions.clear();
                 }
 
@@ -836,6 +862,16 @@ impl ConsensusOrchestrator {
             }
             EngineOutput::SyncRequired { local_view, target_view } => {
                 self.initiate_sync(local_view, target_view);
+            }
+            EngineOutput::EquivocationDetected { view, validator, hash1, hash2 } => {
+                warn!(
+                    view,
+                    validator,
+                    %hash1,
+                    %hash2,
+                    "EQUIVOCATION: validator voted for two different blocks in same view"
+                );
+                // Future: slashing evidence could be recorded here.
             }
         }
     }

@@ -1,3 +1,4 @@
+use n42_chainspec::ValidatorInfo;
 use n42_primitives::consensus::QuorumCertificate;
 use serde::{Deserialize, Serialize};
 use std::io;
@@ -10,14 +11,20 @@ use std::path::Path;
 /// - `locked_qc`: preserves the locking constraint (safety rule)
 /// - `last_committed_qc`: tracks the latest committed block
 /// - `consecutive_timeouts`: maintains pacemaker backoff state
+/// - `scheduled_epoch_transition`: preserves staged epoch changes across restarts
 ///
-/// Approximately 520 bytes when serialized as JSON.
+/// Approximately 520 bytes when serialized as JSON (without epoch data).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConsensusSnapshot {
     pub current_view: u64,
     pub locked_qc: QuorumCertificate,
     pub last_committed_qc: QuorumCertificate,
     pub consecutive_timeouts: u32,
+    /// Staged epoch transition: (epoch_number, new_validators, fault_tolerance).
+    /// Persisted when `EpochManager::stage_next_epoch()` is called, so that a
+    /// crash before `advance_epoch()` doesn't lose the scheduled transition.
+    #[serde(default)]
+    pub scheduled_epoch_transition: Option<(u64, Vec<ValidatorInfo>, u32)>,
 }
 
 /// Atomically saves the consensus snapshot to a JSON file.
@@ -73,6 +80,7 @@ mod tests {
             locked_qc: QuorumCertificate::genesis(),
             last_committed_qc: QuorumCertificate::genesis(),
             consecutive_timeouts: 3,
+            scheduled_epoch_transition: None,
         };
 
         save_consensus_state(&path, &snapshot).expect("save should succeed");
@@ -126,6 +134,7 @@ mod tests {
             locked_qc: QuorumCertificate::genesis(),
             last_committed_qc: QuorumCertificate::genesis(),
             consecutive_timeouts: 0,
+            scheduled_epoch_transition: None,
         };
 
         save_consensus_state(&path, &snapshot).expect("save should create parent dirs");

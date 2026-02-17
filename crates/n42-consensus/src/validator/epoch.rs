@@ -24,6 +24,8 @@ pub struct EpochManager {
     current_set: ValidatorSet,
     /// Staged validator set for the next epoch (if any).
     next_set: Option<ValidatorSet>,
+    /// Raw validator info for the staged set (kept for persistence).
+    staged_info: Option<(Vec<ValidatorInfo>, u32)>,
     /// Historical validator sets keyed by epoch number (most recent MAX_HISTORICAL_EPOCHS).
     historical_sets: BTreeMap<u64, ValidatorSet>,
 }
@@ -36,6 +38,7 @@ impl EpochManager {
             current_epoch: 0,
             current_set: validator_set,
             next_set: None,
+            staged_info: None,
             historical_sets: BTreeMap::new(),
         }
     }
@@ -47,6 +50,7 @@ impl EpochManager {
             current_epoch: 0,
             current_set: validator_set,
             next_set: None,
+            staged_info: None,
             historical_sets: BTreeMap::new(),
         }
     }
@@ -63,6 +67,7 @@ impl EpochManager {
             current_epoch: starting_epoch,
             current_set: validator_set,
             next_set: None,
+            staged_info: None,
             historical_sets: BTreeMap::new(),
         }
     }
@@ -95,6 +100,7 @@ impl EpochManager {
                     current_epoch: *epoch,
                     current_set: set,
                     next_set: None,
+                    staged_info: None,
                     historical_sets: historical,
                 };
             }
@@ -169,6 +175,15 @@ impl EpochManager {
     /// The set will be activated when `advance_epoch()` is called.
     pub fn stage_next_epoch(&mut self, validators: &[ValidatorInfo], fault_tolerance: u32) {
         self.next_set = Some(ValidatorSet::new(validators, fault_tolerance));
+        self.staged_info = Some((validators.to_vec(), fault_tolerance));
+    }
+
+    /// Returns the staged epoch transition info for persistence.
+    /// Returns `(next_epoch_number, validators, fault_tolerance)`.
+    pub fn staged_epoch_info(&self) -> Option<(u64, &[ValidatorInfo], u32)> {
+        self.staged_info.as_ref().map(|(validators, f)| {
+            (self.current_epoch + 1, validators.as_slice(), *f)
+        })
     }
 
     /// Advances to the next epoch, activating the staged validator set.
@@ -179,6 +194,7 @@ impl EpochManager {
             Some(set) => set,
             None => return false,
         };
+        self.staged_info = None;
 
         // Archive current set
         self.historical_sets.insert(self.current_epoch, self.current_set.clone());

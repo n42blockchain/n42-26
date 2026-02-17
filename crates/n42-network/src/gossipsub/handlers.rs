@@ -4,13 +4,28 @@ use n42_primitives::ConsensusMessage;
 
 use crate::error::NetworkError;
 
+/// Maximum size for a consensus bincode message (4MB).
+/// Full blocks with many transactions can reach several MB.
+const MAX_CONSENSUS_MSG_SIZE: usize = 4 * 1024 * 1024;
+
 /// Encodes a consensus message to bytes using bincode for GossipSub publishing.
 pub fn encode_consensus_message(msg: &ConsensusMessage) -> Result<Vec<u8>, NetworkError> {
     bincode::serialize(msg).map_err(|e| NetworkError::Codec(e.to_string()))
 }
 
-/// Decodes a consensus message from GossipSub bytes.
+/// Decodes a consensus message from GossipSub bytes with size limit.
+///
+/// Rejects payloads exceeding 4MB before deserialization to prevent OOM
+/// from decompression bombs. Uses standard `bincode::deserialize` for
+/// format compatibility with `bincode::serialize`.
 pub fn decode_consensus_message(data: &[u8]) -> Result<ConsensusMessage, NetworkError> {
+    if data.len() > MAX_CONSENSUS_MSG_SIZE {
+        return Err(NetworkError::Codec(format!(
+            "consensus message too large: {} bytes (max {})",
+            data.len(),
+            MAX_CONSENSUS_MSG_SIZE,
+        )));
+    }
     bincode::deserialize(data).map_err(|e| NetworkError::Codec(e.to_string()))
 }
 
