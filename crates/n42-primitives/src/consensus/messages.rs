@@ -87,6 +87,11 @@ pub struct Proposal {
     pub proposer: ValidatorIndex,
     /// Proposer's BLS signature over (view, block_hash).
     pub signature: BlsSignature,
+    /// Piggybacked PrepareQC from the previous view (chained mode).
+    /// When present, allows followers to receive the PrepareQC earlier
+    /// without waiting for the separate PrepareQC broadcast.
+    /// None if the previous view timed out or no QC was formed.
+    pub prepare_qc: Option<QuorumCertificate>,
 }
 
 /// Vote message (Round 1: Prepare).

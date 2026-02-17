@@ -2,13 +2,15 @@ use libp2p::gossipsub;
 use libp2p::swarm::SwarmEvent;
 use libp2p::{Multiaddr, PeerId, Swarm};
 use n42_primitives::ConsensusMessage;
+use std::collections::HashMap;
 use tokio::sync::mpsc;
 
 use crate::error::NetworkError;
 use crate::gossipsub::handlers::{
     decode_consensus_message, encode_consensus_message, validate_message,
 };
-use crate::gossipsub::topics::{block_announce_topic, consensus_topic, verification_receipts_topic};
+use crate::gossipsub::topics::{block_announce_topic, consensus_topic, mempool_topic, verification_receipts_topic};
+use crate::state_sync::{BlockSyncRequest, BlockSyncResponse};
 use crate::transport::{N42Behaviour, N42BehaviourEvent};
 
 /// Commands sent to the network service from the node layer.
@@ -18,8 +20,14 @@ pub enum NetworkCommand {
     BroadcastConsensus(ConsensusMessage),
     /// Publish raw bytes to the block announcement topic.
     AnnounceBlock(Vec<u8>),
+    /// Broadcast a raw transaction (RLP-encoded) to the mempool topic.
+    BroadcastTransaction(Vec<u8>),
     /// Connect to a peer at the given multiaddr.
     Dial(Multiaddr),
+    /// Request block sync from a specific peer.
+    RequestSync { peer: PeerId, request: BlockSyncRequest },
+    /// Send a sync response back to a requesting peer.
+    SendSyncResponse { request_id: u64, response: BlockSyncResponse },
 }
 
 /// Events produced by the network service for the node layer.
@@ -40,10 +48,31 @@ pub enum NetworkEvent {
         source: PeerId,
         data: Vec<u8>,
     },
+    /// A transaction received from the mempool topic.
+    TransactionReceived {
+        source: PeerId,
+        data: Vec<u8>,
+    },
     /// A new peer connected.
     PeerConnected(PeerId),
     /// A peer disconnected.
     PeerDisconnected(PeerId),
+    /// An inbound block sync request from a peer.
+    SyncRequest {
+        peer: PeerId,
+        request_id: u64,
+        request: BlockSyncRequest,
+    },
+    /// A block sync response from a peer (reply to our RequestSync).
+    SyncResponse {
+        peer: PeerId,
+        response: BlockSyncResponse,
+    },
+    /// A sync request to a peer failed.
+    SyncRequestFailed {
+        peer: PeerId,
+        error: String,
+    },
 }
 
 /// Handle for sending commands to the running NetworkService.
@@ -75,10 +104,31 @@ impl NetworkHandle {
             .map_err(|_| NetworkError::ChannelClosed)
     }
 
+    /// Broadcasts a raw transaction to the mempool topic.
+    pub fn broadcast_transaction(&self, data: Vec<u8>) -> Result<(), NetworkError> {
+        self.command_tx
+            .send(NetworkCommand::BroadcastTransaction(data))
+            .map_err(|_| NetworkError::ChannelClosed)
+    }
+
     /// Dials a peer at the given multiaddr.
     pub fn dial(&self, addr: Multiaddr) -> Result<(), NetworkError> {
         self.command_tx
             .send(NetworkCommand::Dial(addr))
+            .map_err(|_| NetworkError::ChannelClosed)
+    }
+
+    /// Sends a block sync request to a specific peer.
+    pub fn request_sync(&self, peer: PeerId, request: BlockSyncRequest) -> Result<(), NetworkError> {
+        self.command_tx
+            .send(NetworkCommand::RequestSync { peer, request })
+            .map_err(|_| NetworkError::ChannelClosed)
+    }
+
+    /// Sends a sync response back to a peer that requested blocks.
+    pub fn send_sync_response(&self, request_id: u64, response: BlockSyncResponse) -> Result<(), NetworkError> {
+        self.command_tx
+            .send(NetworkCommand::SendSyncResponse { request_id, response })
             .map_err(|_| NetworkError::ChannelClosed)
     }
 }
@@ -102,6 +152,13 @@ pub struct NetworkService {
     consensus_topic_hash: gossipsub::TopicHash,
     /// Topic hash for the block announcement topic (cached for routing).
     block_announce_topic_hash: gossipsub::TopicHash,
+    /// Topic hash for the mempool topic (cached for routing).
+    mempool_topic_hash: gossipsub::TopicHash,
+    /// Pending sync response channels, keyed by internal request ID.
+    /// Maps our internal u64 ID to the libp2p ResponseChannel for sending replies.
+    pending_sync_channels: HashMap<u64, libp2p::request_response::ResponseChannel<BlockSyncResponse>>,
+    /// Next available sync request ID counter.
+    next_sync_id: u64,
 }
 
 impl NetworkService {
@@ -121,6 +178,7 @@ impl NetworkService {
         let consensus = consensus_topic();
         let block_announce = block_announce_topic();
         let verification = verification_receipts_topic();
+        let mempool = mempool_topic();
 
         swarm
             .behaviour_mut()
@@ -137,9 +195,15 @@ impl NetworkService {
             .gossipsub
             .subscribe(&verification)
             .map_err(|e| NetworkError::Subscribe(e.to_string()))?;
+        swarm
+            .behaviour_mut()
+            .gossipsub
+            .subscribe(&mempool)
+            .map_err(|e| NetworkError::Subscribe(e.to_string()))?;
 
         let consensus_topic_hash = consensus.hash();
         let block_announce_topic_hash = block_announce.hash();
+        let mempool_topic_hash = mempool.hash();
 
         let handle = NetworkHandle { command_tx };
 
@@ -149,6 +213,9 @@ impl NetworkService {
             event_tx,
             consensus_topic_hash,
             block_announce_topic_hash,
+            mempool_topic_hash,
+            pending_sync_channels: HashMap::new(),
+            next_sync_id: 0,
         };
 
         Ok((service, handle, event_rx))
@@ -215,6 +282,9 @@ impl NetworkService {
             )) => {
                 tracing::debug!(%peer_id, %topic, "peer subscribed to topic");
             }
+            SwarmEvent::Behaviour(N42BehaviourEvent::StateSync(event)) => {
+                self.handle_state_sync_event(event);
+            }
             SwarmEvent::Behaviour(N42BehaviourEvent::Identify(
                 libp2p::identify::Event::Received { peer_id, info, .. },
             )) => {
@@ -248,6 +318,7 @@ impl NetworkService {
             &message.data,
             &self.consensus_topic_hash,
             &self.block_announce_topic_hash,
+            &self.mempool_topic_hash,
         );
 
         if !matches!(acceptance, gossipsub::MessageAcceptance::Accept) {
@@ -275,12 +346,62 @@ impl NetworkService {
                 source,
                 data: message.data,
             });
+        } else if message.topic == self.mempool_topic_hash {
+            // Transaction from mempool topic
+            let _ = self.event_tx.send(NetworkEvent::TransactionReceived {
+                source,
+                data: message.data,
+            });
         } else {
             // Verification receipts or unknown topic
             let _ = self.event_tx.send(NetworkEvent::VerificationReceipt {
                 source,
                 data: message.data,
             });
+        }
+    }
+
+    /// Handles a state sync (request-response) event.
+    fn handle_state_sync_event(
+        &mut self,
+        event: libp2p::request_response::Event<BlockSyncRequest, BlockSyncResponse>,
+    ) {
+        match event {
+            libp2p::request_response::Event::Message { peer, message, .. } => {
+                match message {
+                    libp2p::request_response::Message::Request { request, channel, .. } => {
+                        let id = self.next_sync_id;
+                        self.next_sync_id += 1;
+                        self.pending_sync_channels.insert(id, channel);
+                        tracing::debug!(%peer, request_id = id, "received sync request");
+                        let _ = self.event_tx.send(NetworkEvent::SyncRequest {
+                            peer,
+                            request_id: id,
+                            request,
+                        });
+                    }
+                    libp2p::request_response::Message::Response { response, .. } => {
+                        tracing::debug!(%peer, blocks = response.blocks.len(), "received sync response");
+                        let _ = self.event_tx.send(NetworkEvent::SyncResponse {
+                            peer,
+                            response,
+                        });
+                    }
+                }
+            }
+            libp2p::request_response::Event::OutboundFailure { peer, error, .. } => {
+                tracing::warn!(%peer, %error, "sync request failed");
+                let _ = self.event_tx.send(NetworkEvent::SyncRequestFailed {
+                    peer,
+                    error: error.to_string(),
+                });
+            }
+            libp2p::request_response::Event::InboundFailure { peer, error, .. } => {
+                tracing::debug!(%peer, %error, "sync inbound failure");
+            }
+            libp2p::request_response::Event::ResponseSent { peer, .. } => {
+                tracing::debug!(%peer, "sync response sent");
+            }
         }
     }
 
@@ -306,9 +427,36 @@ impl NetworkService {
                     tracing::warn!(error = %e, "failed to publish block announcement");
                 }
             }
+            NetworkCommand::BroadcastTransaction(data) => {
+                let topic = mempool_topic();
+                if let Err(e) = self.swarm.behaviour_mut().gossipsub.publish(topic, data) {
+                    tracing::trace!(error = %e, "failed to publish transaction (no peers yet?)");
+                }
+            }
             NetworkCommand::Dial(addr) => {
                 if let Err(e) = self.swarm.dial(addr.clone()) {
                     tracing::warn!(%addr, error = %e, "failed to dial peer");
+                }
+            }
+            NetworkCommand::RequestSync { peer, request } => {
+                tracing::debug!(
+                    %peer,
+                    from_view = request.from_view,
+                    to_view = request.to_view,
+                    "sending sync request"
+                );
+                let _req_id = self.swarm.behaviour_mut().state_sync.send_request(&peer, request);
+            }
+            NetworkCommand::SendSyncResponse { request_id, response } => {
+                if let Some(channel) = self.pending_sync_channels.remove(&request_id) {
+                    let block_count = response.blocks.len();
+                    if self.swarm.behaviour_mut().state_sync.send_response(channel, response).is_err() {
+                        tracing::warn!(request_id, "failed to send sync response (channel closed)");
+                    } else {
+                        tracing::debug!(request_id, blocks = block_count, "sync response sent");
+                    }
+                } else {
+                    tracing::warn!(request_id, "no pending channel for sync response");
                 }
             }
         }

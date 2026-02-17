@@ -6,6 +6,7 @@ pub mod orchestrator;
 pub mod payload;
 pub mod pool;
 pub mod rpc;
+pub mod tx_bridge;
 
 pub use consensus_state::SharedConsensusState;
 pub use node::N42Node;

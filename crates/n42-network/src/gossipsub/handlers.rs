@@ -44,6 +44,7 @@ pub fn validate_message(
     data: &[u8],
     consensus_topic_hash: &TopicHash,
     block_topic_hash: &TopicHash,
+    mempool_topic_hash: &TopicHash,
 ) -> gossipsub::MessageAcceptance {
     if data.is_empty() {
         return gossipsub::MessageAcceptance::Reject;
@@ -51,9 +52,12 @@ pub fn validate_message(
 
     // Per-topic size limits.
     // Block data can reach several MB; consensus messages are small (~130-500 bytes).
+    // Mempool transactions are capped at 128KB (generous for any single tx).
     // Reference: Ethereum uses 10MB for beacon blocks.
     let max_size = if topic == block_topic_hash {
         4 * 1024 * 1024 // 4MB for block data
+    } else if topic == mempool_topic_hash {
+        128 * 1024 // 128KB for individual transactions
     } else {
         1024 * 1024 // 1MB for consensus messages and other topics
     };
@@ -78,7 +82,7 @@ mod tests {
     use super::*;
     use alloy_primitives::B256;
     use n42_primitives::{BlsSecretKey, ConsensusMessage, Vote};
-    use crate::gossipsub::topics::{block_announce_topic, consensus_topic};
+    use crate::gossipsub::topics::{block_announce_topic, consensus_topic, mempool_topic};
 
     /// Helper: create a dummy Vote wrapped in ConsensusMessage for testing.
     fn dummy_consensus_vote() -> ConsensusMessage {
@@ -117,6 +121,10 @@ mod tests {
         }
     }
 
+    fn mem_hash() -> TopicHash {
+        mempool_topic().hash()
+    }
+
     #[test]
     fn test_validate_message_accept() {
         let consensus_msg = dummy_consensus_vote();
@@ -126,7 +134,7 @@ mod tests {
         let topic_hash = topic.hash();
         let block_hash = block_announce_topic().hash();
 
-        let result = validate_message(&topic_hash, &encoded, &topic_hash, &block_hash);
+        let result = validate_message(&topic_hash, &encoded, &topic_hash, &block_hash, &mem_hash());
         assert!(
             matches!(result, gossipsub::MessageAcceptance::Accept),
             "valid encoded consensus message should be accepted"
@@ -139,7 +147,7 @@ mod tests {
         let topic_hash = topic.hash();
         let block_hash = block_announce_topic().hash();
 
-        let result = validate_message(&topic_hash, &[], &topic_hash, &block_hash);
+        let result = validate_message(&topic_hash, &[], &topic_hash, &block_hash, &mem_hash());
         assert!(
             matches!(result, gossipsub::MessageAcceptance::Reject),
             "empty data should be rejected"
@@ -154,7 +162,7 @@ mod tests {
 
         // Create data that exceeds 1MB (consensus topic limit).
         let oversized = vec![0u8; 1_048_576 + 1];
-        let result = validate_message(&topic_hash, &oversized, &topic_hash, &block_hash);
+        let result = validate_message(&topic_hash, &oversized, &topic_hash, &block_hash, &mem_hash());
         assert!(
             matches!(result, gossipsub::MessageAcceptance::Reject),
             "oversized data (>1MB) should be rejected for consensus topic"
@@ -169,7 +177,7 @@ mod tests {
 
         // 2MB data on block topic should be accepted (limit is 4MB).
         let large_data = vec![0u8; 2 * 1024 * 1024];
-        let result = validate_message(&block_hash, &large_data, &consensus_hash, &block_hash);
+        let result = validate_message(&block_hash, &large_data, &consensus_hash, &block_hash, &mem_hash());
         assert!(
             matches!(result, gossipsub::MessageAcceptance::Accept),
             "2MB data should be accepted on block topic (4MB limit)"
@@ -184,7 +192,7 @@ mod tests {
 
         // Data exceeding 4MB on block topic should be rejected.
         let oversized = vec![0u8; 4 * 1024 * 1024 + 1];
-        let result = validate_message(&block_hash, &oversized, &consensus_hash, &block_hash);
+        let result = validate_message(&block_hash, &oversized, &consensus_hash, &block_hash, &mem_hash());
         assert!(
             matches!(result, gossipsub::MessageAcceptance::Reject),
             "oversized data (>4MB) should be rejected for block topic"
@@ -199,7 +207,7 @@ mod tests {
 
         // Random bytes that do not form a valid ConsensusMessage.
         let garbage = vec![0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04];
-        let result = validate_message(&topic_hash, &garbage, &topic_hash, &block_hash);
+        let result = validate_message(&topic_hash, &garbage, &topic_hash, &block_hash, &mem_hash());
         assert!(
             matches!(result, gossipsub::MessageAcceptance::Reject),
             "malformed data should be rejected"
@@ -213,7 +221,7 @@ mod tests {
         let other_topic_hash = libp2p::gossipsub::IdentTopic::new("other").hash();
 
         // Non-empty data on a non-consensus topic should be accepted.
-        let result = validate_message(&other_topic_hash, &[1, 2, 3], &consensus_topic_hash, &block_hash);
+        let result = validate_message(&other_topic_hash, &[1, 2, 3], &consensus_topic_hash, &block_hash, &mem_hash());
         assert!(
             matches!(result, gossipsub::MessageAcceptance::Accept),
             "non-consensus topic messages with data should be accepted"
@@ -227,10 +235,33 @@ mod tests {
         let other_topic_hash = libp2p::gossipsub::IdentTopic::new("other").hash();
 
         // Empty data should be rejected for ALL topics.
-        let result = validate_message(&other_topic_hash, &[], &consensus_topic_hash, &block_hash);
+        let result = validate_message(&other_topic_hash, &[], &consensus_topic_hash, &block_hash, &mem_hash());
         assert!(
             matches!(result, gossipsub::MessageAcceptance::Reject),
             "empty messages should be rejected on all topics"
+        );
+    }
+
+    #[test]
+    fn test_validate_message_mempool_size_limit() {
+        let consensus_hash = consensus_topic().hash();
+        let block_hash = block_announce_topic().hash();
+        let mp_hash = mem_hash();
+
+        // 64KB on mempool topic should be accepted (limit is 128KB).
+        let data = vec![0u8; 64 * 1024];
+        let result = validate_message(&mp_hash, &data, &consensus_hash, &block_hash, &mp_hash);
+        assert!(
+            matches!(result, gossipsub::MessageAcceptance::Accept),
+            "64KB data should be accepted on mempool topic"
+        );
+
+        // 129KB on mempool topic should be rejected (limit is 128KB).
+        let oversized = vec![0u8; 128 * 1024 + 1];
+        let result = validate_message(&mp_hash, &oversized, &consensus_hash, &block_hash, &mp_hash);
+        assert!(
+            matches!(result, gossipsub::MessageAcceptance::Reject),
+            "oversized data (>128KB) should be rejected for mempool topic"
         );
     }
 }

@@ -4,7 +4,7 @@ use n42_primitives::{
     bls::{AggregateSignature, BlsPublicKey, BlsSignature},
     consensus::{QuorumCertificate, TimeoutCertificate, ViewNumber},
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::error::{ConsensusError, ConsensusResult};
 use crate::validator::ValidatorSet;
@@ -21,6 +21,10 @@ pub struct VoteCollector {
     votes: HashMap<u32, BlsSignature>,
     /// Total validators in the set.
     set_size: u32,
+    /// Validator indices whose signatures have already been verified
+    /// (in process_vote/process_commit_vote). Skipped during build_qc
+    /// to avoid redundant pairing operations (~50% savings).
+    verified: HashSet<u32>,
 }
 
 impl VoteCollector {
@@ -31,6 +35,7 @@ impl VoteCollector {
             block_hash,
             votes: HashMap::new(),
             set_size,
+            verified: HashSet::new(),
         }
     }
 
@@ -47,6 +52,19 @@ impl VoteCollector {
             });
         }
         self.votes.insert(validator_index, signature);
+        Ok(())
+    }
+
+    /// Adds a vote that has already been signature-verified by the caller.
+    /// The `verified` set is checked in `build_qc_with_message()` to skip
+    /// redundant re-verification, saving ~50% of pairing operations.
+    pub fn add_verified_vote(
+        &mut self,
+        validator_index: u32,
+        signature: BlsSignature,
+    ) -> ConsensusResult<()> {
+        self.add_vote(validator_index, signature)?;
+        self.verified.insert(validator_index);
         Ok(())
     }
 
@@ -101,6 +119,8 @@ impl VoteCollector {
         }
 
         // Verify each vote and collect valid signatures, skipping invalid ones.
+        // Votes already verified in process_vote() (tracked in `self.verified`)
+        // are not re-verified, saving ~50% of pairing operations.
         let mut valid_sigs: Vec<&BlsSignature> = Vec::new();
         let mut signers = bitvec![u8, Msb0; 0; self.set_size as usize];
 
@@ -110,6 +130,14 @@ impl VoteCollector {
                 tracing::warn!(view = self.view, idx, "skipping out-of-range validator in QC build");
                 continue;
             }
+
+            // Skip re-verification for votes already verified in process_vote().
+            if self.verified.contains(&idx) {
+                valid_sigs.push(sig);
+                signers.set(idx as usize, true);
+                continue;
+            }
+
             let pk = match validator_set.get_public_key(idx) {
                 Ok(pk) => pk,
                 Err(_) => {
@@ -154,6 +182,8 @@ pub struct TimeoutCollector {
     timeouts: HashMap<u32, (BlsSignature, QuorumCertificate)>,
     /// Total validators in the set.
     set_size: u32,
+    /// Validator indices whose timeout signatures have already been verified.
+    verified: HashSet<u32>,
 }
 
 impl TimeoutCollector {
@@ -163,6 +193,7 @@ impl TimeoutCollector {
             view,
             timeouts: HashMap::new(),
             set_size,
+            verified: HashSet::new(),
         }
     }
 
@@ -180,6 +211,18 @@ impl TimeoutCollector {
             });
         }
         self.timeouts.insert(validator_index, (signature, high_qc));
+        Ok(())
+    }
+
+    /// Adds a timeout message that has already been signature-verified.
+    pub fn add_verified_timeout(
+        &mut self,
+        validator_index: u32,
+        signature: BlsSignature,
+        high_qc: QuorumCertificate,
+    ) -> ConsensusResult<()> {
+        self.add_timeout(validator_index, signature, high_qc)?;
+        self.verified.insert(validator_index);
         Ok(())
     }
 
@@ -225,6 +268,17 @@ impl TimeoutCollector {
                 tracing::warn!(view = self.view, idx, "skipping out-of-range validator in TC build");
                 continue;
             }
+
+            // Skip re-verification for already-verified timeouts.
+            if self.verified.contains(&idx) {
+                valid_sigs.push(sig);
+                signers.set(idx as usize, true);
+                if highest_qc.as_ref().is_none_or(|hq| high_qc.view > hq.view) {
+                    highest_qc = Some(high_qc);
+                }
+                continue;
+            }
+
             let pk = match validator_set.get_public_key(idx) {
                 Ok(pk) => pk,
                 Err(_) => {

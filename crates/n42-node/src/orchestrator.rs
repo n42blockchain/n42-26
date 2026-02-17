@@ -2,13 +2,13 @@ use crate::consensus_state::SharedConsensusState;
 use alloy_primitives::{Address, B256};
 use alloy_rpc_types_engine::{ForkchoiceState, PayloadAttributes, PayloadStatusEnum};
 use n42_consensus::{ConsensusEngine, ConsensusEvent, EngineOutput};
-use n42_network::{NetworkEvent, NetworkHandle};
+use n42_network::{BlockSyncResponse, NetworkEvent, NetworkHandle, PeerId, SyncBlock};
 use n42_primitives::QuorumCertificate;
 use reth_ethereum_engine_primitives::EthEngineTypes;
 use reth_node_builder::ConsensusEngineHandle;
 use reth_payload_builder::PayloadBuilderHandle;
 use reth_payload_primitives::{EngineApiMessageVersion, PayloadKind, PayloadTypes};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -42,6 +42,19 @@ struct PendingFinalization {
     #[allow(dead_code)]
     commit_qc: QuorumCertificate,
 }
+
+/// A committed block stored in the ring buffer for serving sync requests.
+struct CommittedBlock {
+    view: u64,
+    block_hash: B256,
+    commit_qc: QuorumCertificate,
+    /// Serialized block payload (JSON) for the execution layer.
+    payload: Vec<u8>,
+}
+
+/// Maximum number of committed blocks retained for sync (ring buffer capacity).
+/// At 8-second slots, 1000 blocks ≈ ~2.2 hours of history.
+const MAX_COMMITTED_BLOCKS: usize = 1000;
 
 /// Bridges the consensus engine with the P2P network layer and reth Engine API.
 ///
@@ -95,6 +108,17 @@ pub struct ConsensusOrchestrator {
     /// Deferred block finalization when Decide arrives before block data.
     /// The committed block hasn't been imported into reth yet.
     pending_finalization: Option<PendingFinalization>,
+    /// Sender for forwarding received transactions to TxPoolBridge.
+    tx_import_tx: Option<mpsc::UnboundedSender<Vec<u8>>>,
+    /// Receiver for transactions to broadcast from TxPoolBridge.
+    tx_broadcast_rx: Option<mpsc::UnboundedReceiver<Vec<u8>>>,
+    /// Ring buffer of recently committed blocks for serving sync requests from peers.
+    /// Bounded to MAX_COMMITTED_BLOCKS entries (~250MB worst case at 250KB avg blocks).
+    committed_blocks: VecDeque<CommittedBlock>,
+    /// Set of connected peer IDs for sync target selection.
+    connected_peers: HashSet<PeerId>,
+    /// Whether a sync request is currently in-flight (prevents duplicate requests).
+    sync_in_flight: bool,
 }
 
 impl ConsensusOrchestrator {
@@ -125,6 +149,11 @@ impl ConsensusOrchestrator {
             pending_block_data: HashMap::new(),
             pending_executions: HashSet::new(),
             pending_finalization: None,
+            tx_import_tx: None,
+            tx_broadcast_rx: None,
+            committed_blocks: VecDeque::new(),
+            connected_peers: HashSet::new(),
+            sync_in_flight: false,
         }
     }
 
@@ -173,7 +202,25 @@ impl ConsensusOrchestrator {
             pending_block_data: HashMap::new(),
             pending_executions: HashSet::new(),
             pending_finalization: None,
+            tx_import_tx: None,
+            tx_broadcast_rx: None,
+            committed_blocks: VecDeque::new(),
+            connected_peers: HashSet::new(),
+            sync_in_flight: false,
         }
+    }
+
+    /// Configures the transaction pool bridge channels.
+    /// `tx_import_tx`: sends received network transactions to TxPoolBridge for import.
+    /// `tx_broadcast_rx`: receives new local transactions from TxPoolBridge for broadcast.
+    pub fn with_tx_pool_bridge(
+        mut self,
+        tx_import_tx: mpsc::UnboundedSender<Vec<u8>>,
+        tx_broadcast_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    ) -> Self {
+        self.tx_import_tx = Some(tx_import_tx);
+        self.tx_broadcast_rx = Some(tx_broadcast_rx);
+        self
     }
 
     /// Runs the orchestrator event loop.
@@ -255,13 +302,32 @@ impl ConsensusOrchestrator {
                         }
                         Some(NetworkEvent::PeerConnected(peer_id)) => {
                             info!(%peer_id, "consensus peer connected");
+                            self.connected_peers.insert(peer_id);
                         }
                         Some(NetworkEvent::PeerDisconnected(peer_id)) => {
                             warn!(%peer_id, "consensus peer disconnected");
+                            self.connected_peers.remove(&peer_id);
                         }
                         Some(NetworkEvent::BlockAnnouncement { source, data }) => {
                             debug!(%source, bytes = data.len(), "received block data broadcast");
                             self.handle_block_data(data).await;
+                        }
+                        Some(NetworkEvent::TransactionReceived { source, data }) => {
+                            debug!(%source, bytes = data.len(), "received transaction from mempool");
+                            // Forward to TxPoolBridge via channel if configured.
+                            if let Some(ref tx) = self.tx_import_tx {
+                                let _ = tx.send(data);
+                            }
+                        }
+                        Some(NetworkEvent::SyncRequest { peer, request_id, request }) => {
+                            self.handle_sync_request(peer, request_id, request);
+                        }
+                        Some(NetworkEvent::SyncResponse { peer, response }) => {
+                            self.handle_sync_response(peer, response).await;
+                        }
+                        Some(NetworkEvent::SyncRequestFailed { peer, error }) => {
+                            warn!(%peer, %error, "sync request failed");
+                            self.sync_in_flight = false;
                         }
                         Some(_) => {
                             // Verification receipts are handled by dedicated subsystems.
@@ -298,7 +364,21 @@ impl ConsensusOrchestrator {
                     }
                 }
 
-                // Branch 5: Slot boundary / startup delay reached, trigger payload build
+                // Branch 5: Transaction from TxPoolBridge -> broadcast to network
+                tx_data = async {
+                    match self.tx_broadcast_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if let Some(data) = tx_data {
+                        if let Err(e) = self.network.broadcast_transaction(data) {
+                            debug!(error = %e, "failed to broadcast transaction");
+                        }
+                    }
+                }
+
+                // Branch 6: Slot boundary / startup delay reached, trigger payload build
                 _ = &mut build_timer => {
                     let slot_ts = self.next_slot_timestamp.take();
                     self.next_build_at = None;
@@ -577,6 +657,11 @@ impl ConsensusOrchestrator {
                     state.notify_block_committed(block_hash, view);
                 }
 
+                // Store committed block in ring buffer for serving sync requests.
+                // The payload is populated later when block data becomes available
+                // (via import_and_notify for followers, or the build task for leaders).
+                self.store_committed_block(view, block_hash, commit_qc.clone());
+
                 // Always advance head — consensus has committed this block.
                 // The next payload build must reference it as parent regardless
                 // of whether reth has finished importing it yet.
@@ -670,6 +755,9 @@ impl ConsensusOrchestrator {
                     info!(new_view, "became leader after view change, triggering payload build");
                     self.schedule_payload_build().await;
                 }
+            }
+            EngineOutput::SyncRequired { local_view, target_view } => {
+                self.initiate_sync(local_view, target_view);
             }
         }
     }
@@ -806,6 +894,184 @@ impl ConsensusOrchestrator {
                     "new_payload failed for imported block"
                 );
             }
+        }
+    }
+
+    // ── State Sync ──
+
+    /// Stores a committed block in the ring buffer for serving sync requests.
+    fn store_committed_block(&mut self, view: u64, block_hash: B256, commit_qc: QuorumCertificate) {
+        // Try to get the payload from pending_block_data (follower path)
+        // or it will be empty for now (leader populates it during broadcast).
+        let payload = self.pending_block_data
+            .get(&block_hash)
+            .and_then(|data| bincode::deserialize::<BlockDataBroadcast>(data).ok())
+            .map(|b| b.payload_json)
+            .unwrap_or_default();
+
+        if self.committed_blocks.len() >= MAX_COMMITTED_BLOCKS {
+            self.committed_blocks.pop_front();
+        }
+        self.committed_blocks.push_back(CommittedBlock {
+            view,
+            block_hash,
+            commit_qc,
+            payload,
+        });
+    }
+
+    /// Initiates a state sync request to a random connected peer.
+    fn initiate_sync(&mut self, local_view: u64, target_view: u64) {
+        if self.sync_in_flight {
+            debug!(local_view, target_view, "sync already in flight, skipping");
+            return;
+        }
+
+        // Pick a random connected peer for sync
+        let peer = match self.connected_peers.iter().next().copied() {
+            Some(p) => p,
+            None => {
+                warn!("no connected peers for sync");
+                return;
+            }
+        };
+
+        info!(
+            %peer,
+            local_view,
+            target_view,
+            "initiating state sync"
+        );
+
+        let request = n42_network::BlockSyncRequest {
+            from_view: local_view + 1,
+            to_view: target_view,
+            local_committed_view: local_view,
+        };
+
+        if let Err(e) = self.network.request_sync(peer, request) {
+            error!(error = %e, "failed to send sync request");
+            return;
+        }
+
+        self.sync_in_flight = true;
+    }
+
+    /// Handles an incoming sync request from a peer.
+    /// Looks up committed blocks in the ring buffer and sends them back.
+    fn handle_sync_request(
+        &self,
+        peer: PeerId,
+        request_id: u64,
+        request: n42_network::BlockSyncRequest,
+    ) {
+        info!(
+            %peer,
+            from_view = request.from_view,
+            to_view = request.to_view,
+            "handling sync request"
+        );
+
+        let blocks: Vec<SyncBlock> = self.committed_blocks
+            .iter()
+            .filter(|b| b.view >= request.from_view && b.view <= request.to_view)
+            .map(|b| SyncBlock {
+                view: b.view,
+                block_hash: b.block_hash,
+                commit_qc: b.commit_qc.clone(),
+                payload: b.payload.clone(),
+            })
+            .collect();
+
+        let peer_committed_view = self.committed_blocks
+            .back()
+            .map(|b| b.view)
+            .unwrap_or(0);
+
+        info!(
+            %peer,
+            blocks_sent = blocks.len(),
+            peer_committed_view,
+            "sending sync response"
+        );
+
+        let response = BlockSyncResponse {
+            blocks,
+            peer_committed_view,
+        };
+
+        if let Err(e) = self.network.send_sync_response(request_id, response) {
+            error!(error = %e, "failed to send sync response");
+        }
+    }
+
+    /// Handles a sync response containing blocks from a peer.
+    /// Imports each block into reth and advances local state.
+    async fn handle_sync_response(
+        &mut self,
+        peer: PeerId,
+        response: BlockSyncResponse,
+    ) {
+        self.sync_in_flight = false;
+
+        info!(
+            %peer,
+            blocks = response.blocks.len(),
+            peer_committed_view = response.peer_committed_view,
+            "received sync response"
+        );
+
+        if response.blocks.is_empty() {
+            debug!("sync response contains no blocks");
+            return;
+        }
+
+        let mut imported = 0u64;
+        for sync_block in &response.blocks {
+            // Skip blocks with empty payload (peer didn't have the data)
+            if sync_block.payload.is_empty() {
+                debug!(view = sync_block.view, "skipping sync block with empty payload");
+                continue;
+            }
+
+            // Construct a BlockDataBroadcast for import_and_notify
+            let broadcast = BlockDataBroadcast {
+                block_hash: sync_block.block_hash,
+                view: sync_block.view,
+                payload_json: sync_block.payload.clone(),
+            };
+
+            self.import_and_notify(broadcast).await;
+
+            // Store in committed_blocks buffer
+            if self.committed_blocks.len() >= MAX_COMMITTED_BLOCKS {
+                self.committed_blocks.pop_front();
+            }
+            self.committed_blocks.push_back(CommittedBlock {
+                view: sync_block.view,
+                block_hash: sync_block.block_hash,
+                commit_qc: sync_block.commit_qc.clone(),
+                payload: sync_block.payload.clone(),
+            });
+
+            imported += 1;
+        }
+
+        info!(
+            imported,
+            peer_committed_view = response.peer_committed_view,
+            "state sync blocks imported"
+        );
+
+        // If we're still behind the peer, request more blocks
+        let local_view = self.engine.current_view();
+        if response.peer_committed_view > local_view + 3 {
+            info!(
+                local_view,
+                peer_committed_view = response.peer_committed_view,
+                "still behind after sync, requesting more blocks"
+            );
+            self.initiate_sync(local_view, response.peer_committed_view);
         }
     }
 }
@@ -1040,6 +1306,11 @@ mod tests {
             pending_block_data: HashMap::new(),
             pending_executions: HashSet::new(),
             pending_finalization: None,
+            tx_import_tx: None,
+            tx_broadcast_rx: None,
+            committed_blocks: VecDeque::new(),
+            connected_peers: HashSet::new(),
+            sync_in_flight: false,
         };
 
         assert!(state.load_committed_qc().is_none(), "should start with no QC");
@@ -1081,6 +1352,11 @@ mod tests {
             pending_block_data: HashMap::new(),
             pending_executions: HashSet::new(),
             pending_finalization: None,
+            tx_import_tx: None,
+            tx_broadcast_rx: None,
+            committed_blocks: VecDeque::new(),
+            connected_peers: HashSet::new(),
+            sync_in_flight: false,
         };
 
         // Send a BlockReady hash through the channel.

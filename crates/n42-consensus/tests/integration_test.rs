@@ -1430,6 +1430,7 @@ mod fault_tolerance {
             justify_qc: QuorumCertificate::genesis(), // view 0! But locked_qc is at view 1
             proposer: leader as u32,
             signature: sig,
+            prepare_qc: None,
         };
 
         // Non-leader should reject this proposal as a safety violation
@@ -1467,6 +1468,7 @@ mod fault_tolerance {
             justify_qc: QuorumCertificate::genesis(),
             proposer: 0, // Wrong! Should be 1
             signature: sig,
+            prepare_qc: None,
         };
 
         let result = harness.engines[2]

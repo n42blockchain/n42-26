@@ -21,6 +21,10 @@ pub struct ConsensusConfig {
     pub max_timeout_ms: u64,
     /// Initial validator public keys.
     pub initial_validators: Vec<ValidatorInfo>,
+    /// Number of views per epoch (0 = epochs disabled, static validator set).
+    /// When > 0, validator set can change at epoch boundaries.
+    #[serde(default)]
+    pub epoch_length: u64,
 }
 
 /// Information about a validator in the initial set.
@@ -43,6 +47,7 @@ impl ConsensusConfig {
             base_timeout_ms: 4000,
             max_timeout_ms: 8000,
             initial_validators: Vec::new(),
+            epoch_length: 0,
         }
     }
 
@@ -76,6 +81,7 @@ impl ConsensusConfig {
             base_timeout_ms: 20000,
             max_timeout_ms: 60000,
             initial_validators: validators,
+            epoch_length: 0,
         }
     }
 

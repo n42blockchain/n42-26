@@ -26,6 +26,15 @@ pub fn verification_receipts_topic() -> IdentTopic {
     IdentTopic::new("/n42/verification/1")
 }
 
+/// GossipSub topic for transaction pool (mempool) synchronization.
+///
+/// Transactions submitted via RPC to any node are broadcast to all peers
+/// via this topic. This ensures that when a different node becomes leader,
+/// its transaction pool contains transactions from other nodes.
+pub fn mempool_topic() -> IdentTopic {
+    IdentTopic::new("/n42/mempool/1")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

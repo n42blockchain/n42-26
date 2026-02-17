@@ -5,17 +5,20 @@ use libp2p::Swarm;
 use std::time::Duration;
 
 use crate::gossipsub::message_id_fn;
+use crate::state_sync::StateSyncCodec;
 
 /// The composite network behaviour for N42 nodes.
 ///
-/// Combines GossipSub (for pub/sub consensus messaging) and Identify
-/// (for peer identification and protocol negotiation).
+/// Combines GossipSub (for pub/sub consensus messaging), Identify
+/// (for peer identification), and request-response (for block sync).
 #[derive(NetworkBehaviour)]
 pub struct N42Behaviour {
     /// GossipSub for consensus message pub/sub.
     pub gossipsub: gossipsub::Behaviour,
     /// Identify protocol for peer discovery metadata.
     pub identify: libp2p::identify::Behaviour,
+    /// Request-response protocol for state sync (block catch-up).
+    pub state_sync: libp2p::request_response::Behaviour<StateSyncCodec>,
 }
 
 /// Configuration for the N42 network transport.
@@ -126,7 +129,15 @@ pub fn build_swarm(
                 ),
             );
 
-            Ok(N42Behaviour { gossipsub, identify })
+            let state_sync = libp2p::request_response::Behaviour::new(
+                [(
+                    libp2p::StreamProtocol::new(crate::state_sync::SYNC_PROTOCOL),
+                    libp2p::request_response::ProtocolSupport::Full,
+                )],
+                libp2p::request_response::Config::default(),
+            );
+
+            Ok(N42Behaviour { gossipsub, identify, state_sync })
         })
         .map_err(|e| eyre::eyre!("swarm builder error: {e}"))?
         .with_swarm_config(|cfg| {

@@ -10,7 +10,7 @@ use std::collections::HashSet;
 use tokio::sync::mpsc;
 
 use crate::error::{ConsensusError, ConsensusResult};
-use crate::validator::{LeaderSelector, ValidatorSet};
+use crate::validator::{EpochManager, LeaderSelector, ValidatorSet};
 use super::pacemaker::Pacemaker;
 use super::quorum::{
     VoteCollector, TimeoutCollector,
@@ -50,6 +50,12 @@ pub enum EngineOutput {
     ViewChanged {
         new_view: ViewNumber,
     },
+    /// Node is behind: detected a view gap larger than threshold.
+    /// The orchestrator should initiate state sync to catch up.
+    SyncRequired {
+        local_view: ViewNumber,
+        target_view: ViewNumber,
+    },
 }
 
 /// Pending proposal awaiting block data import before voting (follower path).
@@ -84,8 +90,8 @@ pub struct ConsensusEngine {
     my_index: u32,
     /// This node's BLS secret key.
     secret_key: BlsSecretKey,
-    /// The active validator set.
-    validator_set: ValidatorSet,
+    /// Epoch manager for validator set transitions.
+    epoch_manager: EpochManager,
     /// Round state tracking.
     round_state: RoundState,
     /// Pacemaker for timeout management.
@@ -98,6 +104,9 @@ pub struct ConsensusEngine {
     timeout_collector: Option<TimeoutCollector>,
     /// The QC formed from Round 1 votes (used to send to validators).
     prepare_qc: Option<QuorumCertificate>,
+    /// Saved PrepareQC from the previous view (chained mode).
+    /// Piggybacked into the next Proposal to accelerate QC delivery.
+    previous_prepare_qc: Option<QuorumCertificate>,
     /// Output channel for engine actions.
     output_tx: mpsc::UnboundedSender<EngineOutput>,
     /// Pending proposal awaiting block data import before voting.
@@ -118,18 +127,38 @@ impl ConsensusEngine {
         max_timeout_ms: u64,
         output_tx: mpsc::UnboundedSender<EngineOutput>,
     ) -> Self {
+        Self::with_epoch_manager(
+            my_index,
+            secret_key,
+            EpochManager::new(validator_set),
+            base_timeout_ms,
+            max_timeout_ms,
+            output_tx,
+        )
+    }
+
+    /// Creates a new consensus engine with an EpochManager for dynamic validator sets.
+    pub fn with_epoch_manager(
+        my_index: u32,
+        secret_key: BlsSecretKey,
+        epoch_manager: EpochManager,
+        base_timeout_ms: u64,
+        max_timeout_ms: u64,
+        output_tx: mpsc::UnboundedSender<EngineOutput>,
+    ) -> Self {
         let pacemaker = Pacemaker::new(base_timeout_ms, max_timeout_ms);
 
         Self {
             my_index,
             secret_key,
-            validator_set,
+            epoch_manager,
             round_state: RoundState::new(),
             pacemaker,
             vote_collector: None,
             commit_collector: None,
             timeout_collector: None,
             prepare_qc: None,
+            previous_prepare_qc: None,
             output_tx,
             pending_proposal: None,
             imported_blocks: HashSet::new(),
@@ -159,9 +188,24 @@ impl ConsensusEngine {
         &mut self.pacemaker
     }
 
-    /// Returns the number of validators in the set.
+    /// Returns the number of validators in the current set.
     pub fn validator_count(&self) -> u32 {
-        self.validator_set.len()
+        self.validator_set().len()
+    }
+
+    /// Returns a reference to the current validator set (convenience accessor).
+    fn validator_set(&self) -> &ValidatorSet {
+        self.epoch_manager.current_validator_set()
+    }
+
+    /// Returns a reference to the epoch manager.
+    pub fn epoch_manager(&self) -> &EpochManager {
+        &self.epoch_manager
+    }
+
+    /// Returns a mutable reference to the epoch manager.
+    pub fn epoch_manager_mut(&mut self) -> &mut EpochManager {
+        &mut self.epoch_manager
     }
 
     /// Checks if this node is the leader for the current view.
@@ -169,7 +213,7 @@ impl ConsensusEngine {
         LeaderSelector::is_leader(
             self.my_index,
             self.round_state.current_view(),
-            &self.validator_set,
+            self.validator_set(),
         )
     }
 
@@ -204,7 +248,7 @@ impl ConsensusEngine {
 
         // Initialize timeout collector
         self.timeout_collector =
-            Some(TimeoutCollector::new(view, self.validator_set.len()));
+            Some(TimeoutCollector::new(view, self.validator_set().len()));
 
         // Send timeout message
         let message = timeout_signing_message(view);
@@ -259,21 +303,28 @@ impl ConsensusEngine {
         let message = signing_message(view, &block_hash);
         let signature = self.secret_key.sign(&message);
 
+        let piggybacked_qc = self.previous_prepare_qc.take();
+
         let proposal = Proposal {
             view,
             block_hash,
             justify_qc,
             proposer: self.my_index,
             signature,
+            prepare_qc: piggybacked_qc.clone(),
         };
 
-        tracing::info!(view, %block_hash, "proposing block");
+        tracing::info!(
+            view, %block_hash,
+            chained = piggybacked_qc.is_some(),
+            "proposing block"
+        );
 
         // Initialize vote collectors for this view
         self.vote_collector =
-            Some(VoteCollector::new(view, block_hash, self.validator_set.len()));
+            Some(VoteCollector::new(view, block_hash, self.validator_set().len()));
         self.commit_collector =
-            Some(VoteCollector::new(view, block_hash, self.validator_set.len()));
+            Some(VoteCollector::new(view, block_hash, self.validator_set().len()));
 
         self.round_state.enter_voting();
 
@@ -309,7 +360,7 @@ impl ConsensusEngine {
 
         // Verify proposer is the expected leader
         let expected_leader =
-            LeaderSelector::leader_for_view(view, &self.validator_set);
+            LeaderSelector::leader_for_view(view, self.validator_set());
         if proposal.proposer != expected_leader {
             return Err(ConsensusError::InvalidProposer {
                 view,
@@ -319,7 +370,7 @@ impl ConsensusEngine {
         }
 
         // Verify proposer's signature
-        let pk = self.validator_set.get_public_key(proposal.proposer)?;
+        let pk = self.validator_set().get_public_key(proposal.proposer)?;
         let msg = signing_message(view, &proposal.block_hash);
         pk.verify(&msg, &proposal.signature).map_err(|_| {
             ConsensusError::InvalidSignature {
@@ -338,6 +389,32 @@ impl ConsensusEngine {
 
         // Update our locked QC if the proposal's justify_qc is higher
         self.round_state.update_locked_qc(&proposal.justify_qc);
+
+        // Chained mode: process piggybacked PrepareQC if present.
+        // This allows followers to receive the QC earlier, potentially
+        // skipping the wait for the separate PrepareQC broadcast.
+        if let Some(ref piggybacked_qc) = proposal.prepare_qc {
+            match super::quorum::verify_qc(piggybacked_qc, self.validator_set()) {
+                Ok(()) => {
+                    tracing::debug!(
+                        view,
+                        qc_view = piggybacked_qc.view,
+                        "accepted piggybacked PrepareQC from proposal"
+                    );
+                    self.round_state.update_locked_qc(piggybacked_qc);
+                }
+                Err(e) => {
+                    // Invalid piggybacked QC is not fatal — the proposal itself
+                    // was already validated. Log and continue without the QC.
+                    tracing::warn!(
+                        view,
+                        error = %e,
+                        "rejected invalid piggybacked PrepareQC, ignoring"
+                    );
+                }
+            }
+        }
+
         self.round_state.enter_voting();
 
         // Request block execution (orchestrator will import block data)
@@ -377,19 +454,19 @@ impl ConsensusEngine {
             return Ok(());
         }
 
-        let collector = match self.vote_collector.as_mut() {
-            Some(c) => c,
+        // Check block hash before verification (read-only borrow of collector)
+        let expected_hash = match self.vote_collector.as_ref() {
+            Some(c) => c.block_hash(),
             None => return Ok(()),
         };
 
-        // Verify the vote is for the correct block
-        if vote.block_hash != collector.block_hash() {
+        if vote.block_hash != expected_hash {
             tracing::debug!(view, voter = vote.voter, "ignoring vote for different block");
             return Ok(());
         }
 
-        // Verify BLS signature before adding to collector
-        let pk = self.validator_set.get_public_key(vote.voter)?;
+        // Verify BLS signature before adding to collector (immutable borrow of epoch_manager)
+        let pk = self.validator_set().get_public_key(vote.voter)?;
         let msg = signing_message(view, &vote.block_hash);
         pk.verify(&msg, &vote.signature).map_err(|_| {
             ConsensusError::InvalidSignature {
@@ -398,7 +475,9 @@ impl ConsensusEngine {
             }
         })?;
 
-        collector.add_vote(vote.voter, vote.signature)?;
+        // Now take mutable borrow of collector
+        let collector = self.vote_collector.as_mut().unwrap();
+        collector.add_verified_vote(vote.voter, vote.signature)?;
 
         tracing::debug!(
             view,
@@ -419,7 +498,7 @@ impl ConsensusEngine {
         let has_quorum = self
             .vote_collector
             .as_ref()
-            .is_some_and(|c| c.has_quorum(self.validator_set.quorum_size()));
+            .is_some_and(|c| c.has_quorum(self.validator_set().quorum_size()));
 
         if !has_quorum {
             return Ok(());
@@ -434,7 +513,7 @@ impl ConsensusEngine {
             .vote_collector
             .as_ref()
             .unwrap()
-            .build_qc(&self.validator_set)?;
+            .build_qc(self.validator_set())?;
 
         tracing::info!(view, signers = qc.signer_count(), "QC formed, entering pre-commit");
 
@@ -478,7 +557,7 @@ impl ConsensusEngine {
         }
 
         // Verify the QC signatures
-        super::quorum::verify_qc(&pqc.qc, &self.validator_set)?;
+        super::quorum::verify_qc(&pqc.qc, self.validator_set())?;
 
         // Update locked QC
         self.round_state.update_locked_qc(&pqc.qc);
@@ -490,7 +569,7 @@ impl ConsensusEngine {
         let commit_msg = commit_signing_message(view, &pqc.block_hash);
         let commit_sig = self.secret_key.sign(&commit_msg);
 
-        let leader = LeaderSelector::leader_for_view(view, &self.validator_set);
+        let leader = LeaderSelector::leader_for_view(view, self.validator_set());
 
         let commit_vote = CommitVote {
             view,
@@ -523,19 +602,19 @@ impl ConsensusEngine {
             return Ok(());
         }
 
-        let collector = match self.commit_collector.as_mut() {
-            Some(c) => c,
+        // Check block hash before verification (read-only borrow of collector)
+        let expected_hash = match self.commit_collector.as_ref() {
+            Some(c) => c.block_hash(),
             None => return Ok(()),
         };
 
-        // Verify the commit vote is for the correct block
-        if cv.block_hash != collector.block_hash() {
+        if cv.block_hash != expected_hash {
             tracing::debug!(view, voter = cv.voter, "ignoring commit vote for different block");
             return Ok(());
         }
 
-        // Verify BLS signature before adding to collector
-        let pk = self.validator_set.get_public_key(cv.voter)?;
+        // Verify BLS signature (immutable borrow of epoch_manager)
+        let pk = self.validator_set().get_public_key(cv.voter)?;
         let msg = commit_signing_message(view, &cv.block_hash);
         pk.verify(&msg, &cv.signature).map_err(|_| {
             ConsensusError::InvalidSignature {
@@ -544,7 +623,9 @@ impl ConsensusEngine {
             }
         })?;
 
-        collector.add_vote(cv.voter, cv.signature)?;
+        // Now take mutable borrow of collector
+        let collector = self.commit_collector.as_mut().unwrap();
+        collector.add_verified_vote(cv.voter, cv.signature)?;
 
         tracing::debug!(
             view,
@@ -564,7 +645,7 @@ impl ConsensusEngine {
         let has_quorum = self
             .commit_collector
             .as_ref()
-            .is_some_and(|c| c.has_quorum(self.validator_set.quorum_size()));
+            .is_some_and(|c| c.has_quorum(self.validator_set().quorum_size()));
 
         if !has_quorum {
             return Ok(());
@@ -582,7 +663,7 @@ impl ConsensusEngine {
             .commit_collector
             .as_ref()
             .unwrap()
-            .build_qc_with_message(&self.validator_set, &commit_msg)?;
+            .build_qc_with_message(self.validator_set(), &commit_msg)?;
 
         tracing::info!(view, %block_hash, "block committed!");
 
@@ -615,6 +696,10 @@ impl ConsensusEngine {
 
     /// Processes a Decide message from the leader.
     /// Verifies the CommitQC and advances the follower to the next view.
+    ///
+    /// If the Decide's view is far ahead of our current view (gap > 3),
+    /// emits `SyncRequired` so the orchestrator can initiate block sync
+    /// to catch up on missed blocks.
     fn process_decide(&mut self, decide: Decide) -> ConsensusResult<()> {
         let current_view = self.round_state.current_view();
 
@@ -629,7 +714,7 @@ impl ConsensusEngine {
         }
 
         // Verify the CommitQC has sufficient signers (quorum check)
-        let quorum_size = self.validator_set.quorum_size();
+        let quorum_size = self.validator_set().quorum_size();
         if decide.commit_qc.signer_count() < quorum_size {
             return Err(ConsensusError::InsufficientVotes {
                 view: decide.view,
@@ -651,6 +736,22 @@ impl ConsensusEngine {
             return Err(ConsensusError::BlockHashMismatch {
                 expected: decide.block_hash,
                 got: decide.commit_qc.block_hash,
+            });
+        }
+
+        // Detect view gap: if we're more than 3 views behind, we've missed
+        // blocks and need to sync them from peers before we can participate.
+        const SYNC_GAP_THRESHOLD: u64 = 3;
+        if decide.view > current_view + SYNC_GAP_THRESHOLD {
+            tracing::warn!(
+                current_view,
+                decide_view = decide.view,
+                gap = decide.view - current_view,
+                "large view gap detected, requesting state sync"
+            );
+            self.emit(EngineOutput::SyncRequired {
+                local_view: current_view,
+                target_view: decide.view,
             });
         }
 
@@ -691,7 +792,7 @@ impl ConsensusEngine {
         }
 
         // Verify BLS signature on timeout message before adding to collector
-        let pk = self.validator_set.get_public_key(timeout.sender)?;
+        let pk = self.validator_set().get_public_key(timeout.sender)?;
         let msg = timeout_signing_message(view);
         pk.verify(&msg, &timeout.signature).map_err(|_| {
             ConsensusError::InvalidSignature {
@@ -700,11 +801,17 @@ impl ConsensusEngine {
             }
         })?;
 
+        // Cache values before mutable borrow of timeout_collector
+        let n_validators = self.validator_set().len();
+        let quorum_size = self.validator_set().quorum_size();
+        let next_view = view.saturating_add(1);
+        let next_leader = LeaderSelector::leader_for_view(next_view, self.validator_set());
+
         let collector = self
             .timeout_collector
-            .get_or_insert_with(|| TimeoutCollector::new(view, self.validator_set.len()));
+            .get_or_insert_with(|| TimeoutCollector::new(view, n_validators));
 
-        collector.add_timeout(
+        collector.add_verified_timeout(
             timeout.sender,
             timeout.signature,
             timeout.high_qc,
@@ -718,14 +825,13 @@ impl ConsensusEngine {
         );
 
         // Check if we should form a TC and trigger view change
-        let next_view = view.saturating_add(1);
-        let next_leader =
-            LeaderSelector::leader_for_view(next_view, &self.validator_set);
+        let should_form_tc = collector.has_quorum(quorum_size)
+            && next_leader == self.my_index;
 
-        if collector.has_quorum(self.validator_set.quorum_size())
-            && next_leader == self.my_index
-        {
-            let tc = collector.build_tc(&self.validator_set)?;
+        // Drop the mutable borrow of collector before accessing validator_set
+        if should_form_tc {
+            let tc = self.timeout_collector.as_ref().unwrap()
+                .build_tc(self.validator_set())?;
 
             tracing::info!(view, "TC formed, I am the new leader for view {}", next_view);
 
@@ -763,7 +869,7 @@ impl ConsensusEngine {
 
         // Verify the new leader is correct
         let expected_leader =
-            LeaderSelector::leader_for_view(nv.view, &self.validator_set);
+            LeaderSelector::leader_for_view(nv.view, self.validator_set());
         if nv.leader != expected_leader {
             return Err(ConsensusError::InvalidProposer {
                 view: nv.view,
@@ -792,7 +898,7 @@ impl ConsensusEngine {
     /// Sends a Round 1 vote for the given view and block hash.
     /// Extracted from process_proposal() to support both immediate and deferred voting.
     fn send_vote(&mut self, view: ViewNumber, block_hash: B256) -> ConsensusResult<()> {
-        let leader = LeaderSelector::leader_for_view(view, &self.validator_set);
+        let leader = LeaderSelector::leader_for_view(view, self.validator_set());
         let vote_msg = signing_message(view, &block_hash);
         let vote_sig = self.secret_key.sign(&vote_msg);
 
@@ -840,6 +946,10 @@ impl ConsensusEngine {
     // ── Internal helpers ──
 
     fn advance_to_view(&mut self, new_view: ViewNumber) {
+        // Chained mode: save the current PrepareQC for piggybacking into next Proposal.
+        // Only save if we actually formed a QC this view (timeout views won't have one).
+        self.previous_prepare_qc = self.prepare_qc.take();
+
         self.round_state.advance_view(new_view);
         self.pacemaker.reset_for_view(
             new_view,
@@ -1034,6 +1144,7 @@ mod tests {
             justify_qc: QuorumCertificate::genesis(),
             proposer: 1,
             signature: sig,
+            prepare_qc: None,
         };
 
         let result = engine.process_event(ConsensusEvent::Message(
@@ -1056,6 +1167,7 @@ mod tests {
             justify_qc: QuorumCertificate::genesis(),
             proposer: 0, // Wrong! Leader should be 1
             signature: sig,
+            prepare_qc: None,
         };
 
         let result = engine.process_event(ConsensusEvent::Message(
@@ -1087,6 +1199,7 @@ mod tests {
             justify_qc: QuorumCertificate::genesis(),
             proposer: 1,
             signature: sig,
+            prepare_qc: None,
         };
 
         engine
@@ -1157,6 +1270,7 @@ mod tests {
             justify_qc: QuorumCertificate::genesis(),
             proposer: 1,
             signature: sig,
+            prepare_qc: None,
         };
 
         engine
@@ -1194,6 +1308,7 @@ mod tests {
             justify_qc: QuorumCertificate::genesis(),
             proposer: 1,
             signature: sig,
+            prepare_qc: None,
         };
         engine
             .process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(proposal)))
@@ -1348,6 +1463,7 @@ mod tests {
             justify_qc: QuorumCertificate::genesis(),
             proposer: 1,
             signature: prop_sig,
+            prepare_qc: None,
         };
         engine
             .process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(proposal)))

@@ -6,6 +6,7 @@ use n42_network::{build_swarm, StarHub, StarHubConfig, TransportConfig};
 use n42_network::NetworkService;
 use n42_node::mobile_bridge::MobileVerificationBridge;
 use n42_node::rpc::{N42ApiServer, N42RpcServer};
+use n42_node::tx_bridge::TxPoolBridge;
 use n42_node::{ConsensusOrchestrator, N42Node, SharedConsensusState};
 use n42_primitives::BlsSecretKey;
 use reth_ethereum_cli::chainspec::EthereumChainSpecParser;
@@ -240,7 +241,24 @@ fn main() {
                     output_tx,
                 );
 
-                // 5. Start ConsensusOrchestrator with Engine API bridge.
+                // 5. Start TxPoolBridge for P2P transaction sync.
+                let (tx_import_tx, tx_import_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+                let (tx_broadcast_tx, tx_broadcast_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+
+                let tx_bridge = TxPoolBridge::new(
+                    full_node.pool.clone(),
+                    tx_import_rx,
+                    tx_broadcast_tx,
+                );
+
+                task_executor.spawn_critical_task(
+                    "n42-tx-pool-bridge",
+                    Box::pin(tx_bridge.run()),
+                );
+
+                info!(target: "n42::cli", "TxPoolBridge started for P2P mempool sync");
+
+                // 6. Start ConsensusOrchestrator with Engine API bridge.
                 //    Now passes genesis_hash and fee_recipient to enable
                 //    payload building → BlockReady → consensus proposal flow.
                 let orchestrator = ConsensusOrchestrator::with_engine_api(
@@ -253,7 +271,7 @@ fn main() {
                     consensus_state,
                     genesis_hash,
                     fee_recipient,
-                );
+                ).with_tx_pool_bridge(tx_import_tx, tx_broadcast_rx);
 
                 task_executor.spawn_critical_task(
                     "n42-consensus-orchestrator",
