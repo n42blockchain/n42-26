@@ -126,6 +126,9 @@ pub struct ConsensusOrchestrator {
     state_file: Option<PathBuf>,
     /// Validator set reference for verifying QCs during state sync.
     validator_set_for_sync: Option<ValidatorSet>,
+    /// Sender for notifying the mobile packet generation task about committed blocks.
+    /// When set, sends `(block_hash, block_number)` after each BlockCommitted event.
+    mobile_packet_tx: Option<mpsc::UnboundedSender<(B256, u64)>>,
 }
 
 impl ConsensusOrchestrator {
@@ -163,6 +166,7 @@ impl ConsensusOrchestrator {
             sync_in_flight: false,
             state_file: None,
             validator_set_for_sync: None,
+            mobile_packet_tx: None,
         }
     }
 
@@ -218,6 +222,7 @@ impl ConsensusOrchestrator {
             sync_in_flight: false,
             state_file: None,
             validator_set_for_sync: None,
+            mobile_packet_tx: None,
         }
     }
 
@@ -230,6 +235,18 @@ impl ConsensusOrchestrator {
     /// Configures the validator set used for verifying QCs during state sync.
     pub fn with_validator_set(mut self, vs: ValidatorSet) -> Self {
         self.validator_set_for_sync = Some(vs);
+        self
+    }
+
+    /// Configures the mobile packet generation channel.
+    /// When set, the orchestrator sends `(block_hash, block_number)` after each
+    /// BlockCommitted event, allowing a separate task to generate and broadcast
+    /// VerificationPackets to mobile verifiers.
+    pub fn with_mobile_packet_tx(
+        mut self,
+        tx: mpsc::UnboundedSender<(B256, u64)>,
+    ) -> Self {
+        self.mobile_packet_tx = Some(tx);
         self
     }
 
@@ -723,6 +740,11 @@ impl ConsensusOrchestrator {
                         debug!(view, %block_hash, "block finalized in reth");
                         self.pending_block_data.clear();
                         self.pending_executions.clear();
+
+                        // Notify mobile packet generation (block is now in reth)
+                        if let Some(ref tx) = self.mobile_packet_tx {
+                            let _ = tx.send((block_hash, view));
+                        }
                     } else if let Some(data) = self.pending_block_data.remove(&block_hash) {
                         // Case B: BlockData arrived first, cached but not imported
                         info!(view, %block_hash, "block data cached, importing for deferred finalization");
@@ -731,6 +753,11 @@ impl ConsensusOrchestrator {
                                 self.import_and_notify(broadcast).await;
                                 self.pending_block_data.clear();
                                 self.pending_executions.clear();
+
+                                // Notify mobile packet generation (block imported)
+                                if let Some(ref tx) = self.mobile_packet_tx {
+                                    let _ = tx.send((block_hash, view));
+                                }
                             }
                             Err(e) => {
                                 warn!(%block_hash, error = %e, "failed to deserialize cached block data");
@@ -907,14 +934,20 @@ impl ConsensusOrchestrator {
                     // Complete deferred finalization if this block was committed but not yet imported.
                     if let Some(ref pf) = self.pending_finalization {
                         if pf.block_hash == broadcast.block_hash {
+                            let deferred_view = pf.view;
                             info!(
-                                view = pf.view,
+                                view = deferred_view,
                                 %broadcast.block_hash,
                                 "completing deferred finalization"
                             );
                             let _pf = self.pending_finalization.take().unwrap();
                             self.pending_block_data.clear();
                             self.pending_executions.clear();
+
+                            // Notify mobile packet generation (deferred block now in reth)
+                            if let Some(ref tx) = self.mobile_packet_tx {
+                                let _ = tx.send((broadcast.block_hash, deferred_view));
+                            }
 
                             if self.engine.is_current_leader() {
                                 info!(
@@ -1401,6 +1434,7 @@ mod tests {
             sync_in_flight: false,
             state_file: None,
             validator_set_for_sync: None,
+            mobile_packet_tx: None,
         };
 
         assert!(state.load_committed_qc().is_none(), "should start with no QC");
@@ -1449,6 +1483,7 @@ mod tests {
             sync_in_flight: false,
             state_file: None,
             validator_set_for_sync: None,
+            mobile_packet_tx: None,
         };
 
         // Send a BlockReady hash through the channel.

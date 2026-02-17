@@ -24,3 +24,20 @@ thiserror.workspace = true
 
 # Logging
 tracing.workspace = true
+
+# reth EVM (same execution engine as main nodes)
+reth-revm.workspace = true
+reth-evm.workspace = true
+reth-primitives-traits.workspace = true
+reth-ethereum-primitives.workspace = true
+reth-chainspec.workspace = true
+revm.workspace = true
+
+# Block RLP decoding
+alloy-consensus.workspace = true
+alloy-rlp.workspace = true
+alloy-eips.workspace = true
+
+# N42 execution & chain spec
+n42-execution.workspace = true
+n42-chainspec.workspace = true

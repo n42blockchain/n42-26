@@ -53,6 +53,10 @@ pub struct VerificationPacket {
     pub gas_limit: u64,
     /// Beneficiary address (coinbase).
     pub beneficiary: Address,
+    /// Full RLP-encoded block header.
+    /// Contains all fields needed for EVM execution (base_fee, prevrandao, etc.)
+    /// that aren't covered by the individual convenience fields above.
+    pub header_rlp: Bytes,
     /// RLP-encoded transactions for re-execution.
     pub transactions: Vec<Bytes>,
     /// Account states accessed during execution (the witness).
@@ -70,8 +74,8 @@ pub struct VerificationPacket {
 impl VerificationPacket {
     /// Returns the approximate serialized size in bytes.
     pub fn estimated_size(&self) -> usize {
-        // Header fields: ~200 bytes
-        let header_size = 200;
+        // Header fields: ~200 bytes + header_rlp
+        let header_size = 200 + self.header_rlp.len();
         // Transactions: sum of encoded sizes
         let tx_size: usize = self.transactions.iter().map(|t| t.len()).sum();
         // Witness accounts: ~100 bytes per account + storage
@@ -138,6 +142,7 @@ mod tests {
             timestamp: 1_700_000_000,
             gas_limit: 30_000_000,
             beneficiary: Address::from([0xFF; 20]),
+            header_rlp: Bytes::from(vec![0xF8; 508]),
             transactions: vec![tx1, tx2],
             witness_accounts: vec![account],
             uncached_bytecodes: vec![uncached_code],
@@ -189,12 +194,12 @@ mod tests {
         let size = packet.estimated_size();
 
         // The packet contains:
-        // - header: 200 bytes
+        // - header: 200 bytes + 508 bytes header_rlp = 708 bytes
         // - transactions: 100 + 200 = 300 bytes
         // - witness: 1 account with 2 storage slots = 100 + 2*64 = 228 bytes
         // - uncached bytecodes: 32 + 500 = 532 bytes
-        // Total expected: 200 + 300 + 228 + 532 = 1260
-        let expected = 200 + 300 + 228 + 532;
+        // Total expected: 708 + 300 + 228 + 532 = 1768
+        let expected = 708 + 300 + 228 + 532;
         assert_eq!(size, expected, "estimated_size should match manual calculation");
 
         // The estimated size must be strictly positive for any non-empty packet.
@@ -211,6 +216,7 @@ mod tests {
             timestamp: 0,
             gas_limit: 0,
             beneficiary: Address::ZERO,
+            header_rlp: Bytes::new(),
             transactions: vec![],
             witness_accounts: vec![],
             uncached_bytecodes: vec![],

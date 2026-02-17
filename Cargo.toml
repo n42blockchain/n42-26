@@ -6,6 +6,7 @@ members = [
     "crates/n42-consensus",
     "crates/n42-execution",
     "crates/n42-mobile",
+    "crates/n42-mobile-ffi",
     "crates/n42-network",
     "crates/n42-node",
     "tests/e2e",
@@ -25,6 +26,7 @@ n42-chainspec = { path = "crates/n42-chainspec" }
 n42-consensus = { path = "crates/n42-consensus" }
 n42-execution = { path = "crates/n42-execution" }
 n42-mobile = { path = "crates/n42-mobile" }
+n42-mobile-ffi = { path = "crates/n42-mobile-ffi" }
 n42-network = { path = "crates/n42-network" }
 n42-node = { path = "crates/n42-node" }
 

@@ -4,3 +4,5 @@ pub mod scenario3_erc20;
 pub mod scenario4_multi_node;
 pub mod scenario5_mobile;
 pub mod scenario6_stress;
+pub mod scenario7_21x21;
+pub mod scenario8_mobile_evm;

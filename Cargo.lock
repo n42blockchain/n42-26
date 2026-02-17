@@ -2725,6 +2725,7 @@ dependencies = [
  "alloy-signer",
  "alloy-signer-local",
  "alloy-sol-types",
+ "bincode",
  "blst",
  "clap",
  "eyre",
@@ -2733,9 +2734,13 @@ dependencies = [
  "libc",
  "libp2p",
  "n42-chainspec",
+ "n42-execution",
+ "n42-mobile",
  "n42-primitives",
+ "quinn",
  "rand 0.8.5",
  "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "tempfile",
@@ -5512,13 +5517,48 @@ dependencies = [
 name = "n42-mobile"
 version = "0.1.0"
 dependencies = [
+ "alloy-consensus",
+ "alloy-eips",
  "alloy-primitives",
+ "alloy-rlp",
  "bincode",
  "lru 0.12.5",
+ "n42-chainspec",
+ "n42-execution",
  "n42-primitives",
+ "reth-chainspec",
+ "reth-ethereum-primitives",
+ "reth-evm",
+ "reth-primitives-traits",
+ "reth-revm",
+ "revm",
  "serde",
  "thiserror 2.0.18",
  "tracing",
+]
+
+[[package]]
+name = "n42-mobile-ffi"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives",
+ "bincode",
+ "blst",
+ "hex",
+ "n42-chainspec",
+ "n42-execution",
+ "n42-mobile",
+ "n42-primitives",
+ "once_cell",
+ "quinn",
+ "reth-chainspec",
+ "rustls",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-subscriber 0.3.22",
 ]
 
 [[package]]
@@ -5545,6 +5585,8 @@ dependencies = [
 name = "n42-node"
 version = "0.1.0"
 dependencies = [
+ "alloy-consensus",
+ "alloy-eips",
  "alloy-primitives",
  "alloy-rlp",
  "alloy-rpc-types-engine",
@@ -5582,13 +5624,16 @@ dependencies = [
  "reth-payload-primitives",
  "reth-primitives-traits",
  "reth-provider",
+ "reth-revm",
  "reth-rpc-builder",
  "reth-storage-api",
  "reth-tasks",
  "reth-tracing",
  "reth-transaction-pool",
+ "reth-trie-common",
  "serde",
  "serde_json",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
 ]
@@ -5608,6 +5653,7 @@ dependencies = [
  "n42-network",
  "n42-node",
  "n42-primitives",
+ "reth-chainspec",
  "reth-ethereum-cli",
  "reth-node-builder",
  "reth-storage-api",

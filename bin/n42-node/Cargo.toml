@@ -17,6 +17,7 @@ n42-consensus.workspace = true
 n42-network.workspace = true
 n42-primitives.workspace = true
 
+reth-chainspec.workspace = true
 reth-ethereum-cli.workspace = true
 reth-node-builder.workspace = true
 reth-storage-api.workspace = true

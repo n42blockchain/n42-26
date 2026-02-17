@@ -58,6 +58,10 @@ impl NodeConfig {
     pub fn consensus_port(&self) -> u16 {
         9400 + self.port_offset
     }
+
+    pub fn starhub_port(&self) -> u16 {
+        9443 + self.port_offset
+    }
 }
 
 /// A running N42 node process.
@@ -68,6 +72,7 @@ pub struct NodeProcess {
     pub ws_port: u16,
     pub p2p_port: u16,
     pub consensus_port: u16,
+    pub starhub_port: u16,
     /// Wrapped in Option so it can be extracted for restart tests via `stop_keep_data`.
     data_dir: Option<TempDir>,
     pub rpc: RpcClient,
@@ -95,6 +100,7 @@ impl NodeProcess {
         let auth_port = config.auth_port();
         let p2p_port = config.p2p_port();
         let consensus_port = config.consensus_port();
+        let starhub_port = config.starhub_port();
 
         let mut cmd = Command::new(&config.binary_path);
 
@@ -113,7 +119,8 @@ impl NodeProcess {
         // Set environment variables.
         cmd.env("N42_VALIDATOR_KEY", &key_hex)
             .env("N42_VALIDATOR_COUNT", config.validator_count.to_string())
-            .env("N42_CONSENSUS_PORT", consensus_port.to_string());
+            .env("N42_CONSENSUS_PORT", consensus_port.to_string())
+            .env("N42_STARHUB_PORT", starhub_port.to_string());
 
         if config.block_interval_ms > 0 {
             cmd.env("N42_BLOCK_INTERVAL_MS", config.block_interval_ms.to_string());
@@ -152,6 +159,7 @@ impl NodeProcess {
             ws_port,
             p2p_port,
             consensus_port,
+            starhub_port,
             data_dir: Some(data_dir),
             rpc,
         };

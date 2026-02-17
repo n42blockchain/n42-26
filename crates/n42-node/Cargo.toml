@@ -21,6 +21,7 @@ reth-ethereum-engine-primitives.workspace = true
 reth-ethereum-primitives.workspace = true
 reth-evm.workspace = true
 reth-evm-ethereum.workspace = true
+reth-revm.workspace = true
 reth-node-api.workspace = true
 reth-node-builder.workspace = true
 reth-node-ethereum.workspace = true
@@ -33,6 +34,8 @@ reth-network-api.workspace = true
 reth-tasks.workspace = true
 reth-tracing.workspace = true
 
+alloy-consensus.workspace = true
+alloy-eips.workspace = true
 alloy-primitives.workspace = true
 alloy-rlp.workspace = true
 alloy-rpc-types-engine.workspace = true
@@ -44,6 +47,7 @@ reth-payload-primitives.workspace = true
 reth-engine-primitives.workspace = true
 reth-chain-state.workspace = true
 reth-storage-api.workspace = true
+reth-trie-common.workspace = true
 reth-rpc-builder.workspace = true
 
 arc-swap.workspace = true
@@ -56,6 +60,7 @@ async-trait = "0.1"
 hex.workspace = true
 
 eyre.workspace = true
+thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 

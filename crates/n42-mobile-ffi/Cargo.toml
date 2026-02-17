@@ -1,0 +1,51 @@
+[package]
+name = "n42-mobile-ffi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "N42 mobile verifier FFI library - complete SDK for Android/iOS"
+
+[lib]
+crate-type = ["staticlib", "cdylib"]
+
+[dependencies]
+# Internal crates
+n42-mobile.workspace = true
+n42-primitives.workspace = true
+n42-chainspec.workspace = true
+n42-execution.workspace = true
+
+# Primitives
+alloy-primitives.workspace = true
+
+# reth EVM
+reth-chainspec.workspace = true
+
+# QUIC networking
+quinn.workspace = true
+rustls = { workspace = true, features = ["ring", "std"] }
+
+# Crypto (BLS12-381)
+blst.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+bincode.workspace = true
+
+# Async
+tokio.workspace = true
+
+# Error handling
+thiserror.workspace = true
+
+# Logging
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+
+# Encoding
+hex.workspace = true
+
+# Concurrency
+once_cell = "1.19"

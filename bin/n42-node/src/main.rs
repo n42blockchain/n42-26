@@ -1,10 +1,12 @@
 use alloy_primitives::Address;
 use clap::Parser;
 use n42_chainspec::ConsensusConfig;
+use reth_chainspec::ChainSpecProvider;
 use n42_consensus::{ConsensusEngine, EpochManager, ValidatorSet};
 use n42_network::{build_swarm, StarHub, StarHubConfig, TransportConfig};
 use n42_network::NetworkService;
 use n42_node::mobile_bridge::MobileVerificationBridge;
+use n42_node::mobile_packet::mobile_packet_loop;
 use n42_node::persistence;
 use n42_node::rpc::{N42ApiServer, N42RpcServer};
 use n42_node::tx_bridge::TxPoolBridge;
@@ -202,8 +204,15 @@ fn main() {
                 }
 
                 // 2. Start mobile verification StarHub.
-                let star_hub_config = StarHubConfig::default();
-                let (star_hub, _star_hub_handle, hub_event_rx) = StarHub::new(star_hub_config);
+                let starhub_port: u16 = std::env::var("N42_STARHUB_PORT")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(9443);
+                let star_hub_config = StarHubConfig {
+                    bind_addr: format!("0.0.0.0:{starhub_port}").parse().unwrap(),
+                    ..StarHubConfig::default()
+                };
+                let (star_hub, star_hub_handle, hub_event_rx) = StarHub::new(star_hub_config);
 
                 info!(
                     target: "n42::cli",
@@ -232,7 +241,27 @@ fn main() {
                     Box::pin(mobile_bridge.run()),
                 );
 
-                // 4. Create ConsensusEngine (with optional state recovery).
+                // 4. Start mobile packet generation loop.
+                // Generates VerificationPackets from committed blocks and broadcasts
+                // them to connected phones via StarHub.
+                let (mobile_packet_tx, mobile_packet_rx) = mpsc::unbounded_channel();
+                let mobile_chain_spec = full_node.provider.chain_spec();
+                let mobile_provider = full_node.provider.clone();
+                let mobile_hub_handle = star_hub_handle.clone();
+
+                task_executor.spawn_critical_task(
+                    "n42-mobile-packet",
+                    Box::pin(mobile_packet_loop(
+                        mobile_packet_rx,
+                        mobile_provider,
+                        mobile_chain_spec,
+                        mobile_hub_handle,
+                    )),
+                );
+
+                info!(target: "n42::cli", "Mobile packet generation loop started");
+
+                // 5. Create ConsensusEngine (with optional state recovery).
                 let data_dir: PathBuf = std::env::var("N42_DATA_DIR")
                     .unwrap_or_else(|_| "./n42-data".to_string())
                     .into();
@@ -321,6 +350,7 @@ fn main() {
                     fee_recipient,
                 )
                 .with_tx_pool_bridge(tx_import_tx, tx_broadcast_rx)
+                .with_mobile_packet_tx(mobile_packet_tx)
                 .with_state_persistence(state_file)
                 .with_validator_set(validator_set);
 
