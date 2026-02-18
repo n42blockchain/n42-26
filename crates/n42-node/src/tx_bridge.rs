@@ -159,6 +159,11 @@ where
 
     /// Marks a transaction hash as recently imported.
     fn mark_imported(&mut self, hash: B256) {
+        // Skip if already tracked — prevents VecDeque/HashSet desync where
+        // duplicate VecDeque entries cause premature HashSet removal on eviction.
+        if self.recently_imported_set.contains(&hash) {
+            return;
+        }
         if self.recently_imported_order.len() >= RECENT_TX_CAPACITY {
             if let Some(evicted) = self.recently_imported_order.pop_front() {
                 self.recently_imported_set.remove(&evicted);
@@ -193,6 +198,9 @@ mod tests {
         }
 
         fn mark_imported(&mut self, hash: B256) {
+            if self.set.contains(&hash) {
+                return;
+            }
             if self.order.len() >= RECENT_TX_CAPACITY {
                 if let Some(evicted) = self.order.pop_front() {
                     self.set.remove(&evicted);
@@ -246,26 +254,51 @@ mod tests {
     }
 
     #[test]
-    fn test_dedup_set_consistency() {
+    fn test_duplicate_insert_no_desync() {
         let mut tracker = DedupTracker::new();
         let h1 = B256::repeat_byte(0x01);
 
-        // Double insert: VecDeque gets 2 entries, HashSet stays at 1
+        // Double insert should be no-op on second call
         tracker.mark_imported(h1);
         tracker.mark_imported(h1);
+        assert_eq!(tracker.order.len(), 1, "VecDeque should have exactly 1 entry");
+        assert_eq!(tracker.set.len(), 1);
         assert!(tracker.is_recently_imported(&h1));
+    }
+
+    #[test]
+    fn test_duplicate_survives_eviction_cycle() {
+        // Regression test: previously double-insert caused VecDeque/HashSet desync
+        // where evicting the first copy removed the hash from the set prematurely.
+        let mut tracker = DedupTracker::new();
+        let target = B256::repeat_byte(0xAA);
+
+        tracker.mark_imported(target);
+        tracker.mark_imported(target); // no-op after fix
+
+        // Fill remaining capacity
+        for i in 1..RECENT_TX_CAPACITY {
+            let mut bytes = [0u8; 32];
+            bytes[0..8].copy_from_slice(&(i as u64).to_le_bytes());
+            tracker.mark_imported(B256::from(bytes));
+        }
+
+        // One more eviction: evicts `target` (the oldest and only copy)
+        tracker.mark_imported(B256::repeat_byte(0xFF));
+        assert!(!tracker.is_recently_imported(&target), "target should be evicted cleanly");
+        assert_eq!(tracker.order.len(), RECENT_TX_CAPACITY);
+        assert_eq!(tracker.set.len(), RECENT_TX_CAPACITY, "set and order must stay in sync");
     }
 
     #[test]
     fn test_eviction_fifo_order() {
         let mut tracker = DedupTracker::new();
 
-        // Insert 3 hashes
         let h1 = B256::repeat_byte(0x01);
         let h2 = B256::repeat_byte(0x02);
         let h3 = B256::repeat_byte(0x03);
 
-        // Fill to capacity first
+        // Fill to capacity with filler entries first
         for i in 0..RECENT_TX_CAPACITY - 3 {
             let mut bytes = [0u8; 32];
             bytes[0..8].copy_from_slice(&(i as u64 + 100).to_le_bytes());

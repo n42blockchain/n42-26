@@ -330,6 +330,7 @@ mod tests {
         // 1. D_low <= D <= D_high
         // 2. mesh_outbound_min <= D / 2
         // 3. mesh_outbound_min < D_low
+        // 4. connection limits: incoming + outgoing >= total (capacity sanity)
         for n in 1..=500 {
             let c = TransportConfig::for_network_size(n);
             assert!(
@@ -348,6 +349,35 @@ mod tests {
                 c.mesh_outbound_min < c.mesh_d_low || c.mesh_d_low == 0,
                 "D_out ({}) >= D_low ({}) for n={}", c.mesh_outbound_min, c.mesh_d_low, n
             );
+            assert!(
+                c.max_established_incoming + c.max_established_outgoing >= c.max_established_total,
+                "incoming ({}) + outgoing ({}) < total ({}) for n={}",
+                c.max_established_incoming, c.max_established_outgoing, c.max_established_total, n
+            );
         }
+    }
+
+    #[test]
+    fn test_connection_limits_defaults() {
+        let config = TransportConfig::default();
+        assert_eq!(config.max_established_incoming, 128);
+        assert_eq!(config.max_established_outgoing, 64);
+        assert_eq!(config.max_established_total, 192);
+    }
+
+    #[test]
+    fn test_connection_limits_from_network_size() {
+        // Connection limits should be consistent across all network sizes
+        let small = TransportConfig::for_network_size(3);
+        let large = TransportConfig::for_network_size(500);
+        let default = TransportConfig::default();
+
+        assert_eq!(small.max_established_incoming, default.max_established_incoming);
+        assert_eq!(small.max_established_outgoing, default.max_established_outgoing);
+        assert_eq!(small.max_established_total, default.max_established_total);
+
+        assert_eq!(large.max_established_incoming, default.max_established_incoming);
+        assert_eq!(large.max_established_outgoing, default.max_established_outgoing);
+        assert_eq!(large.max_established_total, default.max_established_total);
     }
 }

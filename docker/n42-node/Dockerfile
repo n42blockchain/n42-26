@@ -1,6 +1,10 @@
 # N42 Node — Multi-stage Docker build
 # Stage 1: Build the n42-node binary from source
 # Stage 2: Create a minimal runtime image
+#
+# Build context must include both n42-26/ and reth/ directories.
+# Use docker-compose.yml (context: ../../..) or build manually:
+#   docker build -t n42-node -f docker/n42-node/Dockerfile ../../..
 
 # ── Build stage ──
 FROM rust:1.82-bookworm AS builder
@@ -16,20 +20,19 @@ RUN apt-get update && apt-get install -y \
     libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy workspace manifests first for layer caching
-COPY Cargo.toml Cargo.lock ./
-COPY crates/ crates/
-COPY bin/ bin/
-
-# Copy the local reth dependency (referenced via path = "../reth" in Cargo.toml)
-# In Docker context, reth source must be available. The docker-compose.yml
-# mounts the parent directory or uses a build context that includes ../reth.
-# For standalone builds, copy reth into the build context first.
+# Copy reth dependency first (changes less frequently → better layer caching)
 COPY reth/ /build/reth/
+
+# Copy n42 workspace
+COPY n42-26/Cargo.toml n42-26/Cargo.lock /build/n42-26/
+COPY n42-26/crates/ /build/n42-26/crates/
+COPY n42-26/bin/ /build/n42-26/bin/
+
+WORKDIR /build/n42-26
 
 # Build release binary
 RUN cargo build --release -p n42-node \
-    && strip /build/target/release/n42-node
+    && strip /build/n42-26/target/release/n42-node
 
 # ── Runtime stage ──
 FROM debian:bookworm-slim
@@ -43,7 +46,7 @@ RUN apt-get update && apt-get install -y \
 RUN useradd -m -s /bin/bash n42
 
 # Copy binary from builder
-COPY --from=builder /build/target/release/n42-node /usr/local/bin/n42-node
+COPY --from=builder /build/n42-26/target/release/n42-node /usr/local/bin/n42-node
 
 # Create data directory
 RUN mkdir -p /data/n42 && chown n42:n42 /data/n42

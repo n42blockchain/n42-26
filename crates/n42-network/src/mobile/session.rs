@@ -156,4 +156,48 @@ mod tests {
         assert!(session.has_cached(&hash2));
         assert!(!session.has_cached(&hash3));
     }
+
+    #[test]
+    fn test_concurrent_atomic_counters() {
+        use std::sync::Arc;
+
+        let session = Arc::new(MobileSession::new(1, [0u8; 48]));
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let s = session.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..1000 {
+                        s.record_receipt();
+                        s.record_packet_sent();
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert_eq!(session.receipts_received.load(Ordering::Relaxed), 8000);
+        assert_eq!(session.packets_sent.load(Ordering::Relaxed), 8000);
+    }
+
+    #[test]
+    fn test_duration_monotonic() {
+        let session = MobileSession::new(1, [0u8; 48]);
+        let d1 = session.duration();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let d2 = session.duration();
+        assert!(d2 >= d1, "duration should be monotonically increasing");
+    }
+
+    #[test]
+    fn test_debug_format() {
+        let session = MobileSession::new(99, [0u8; 48]);
+        session.record_receipt();
+        session.record_packet_sent();
+        session.record_packet_sent();
+        let debug_str = format!("{:?}", session);
+        assert!(debug_str.contains("session_id: 99"));
+        assert!(debug_str.contains("packets_sent: 2"));
+        assert!(debug_str.contains("receipts_received: 1"));
+    }
 }

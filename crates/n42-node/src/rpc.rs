@@ -424,4 +424,126 @@ mod tests {
         assert_eq!(result.total, 0);
         assert!(result.evidence.is_empty());
     }
+
+    #[tokio::test]
+    async fn test_submit_attestation_invalid_hex() {
+        let rpc = make_rpc();
+        let result = rpc.submit_attestation(
+            "not_hex".into(),
+            "0000".into(),
+            B256::ZERO,
+            0,
+        ).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.code(), -32602);
+    }
+
+    #[tokio::test]
+    async fn test_submit_attestation_wrong_pubkey_length() {
+        let rpc = make_rpc();
+        // Valid hex, but only 32 bytes instead of required 48
+        let short_pubkey = hex::encode([0u8; 32]);
+        let result = rpc.submit_attestation(
+            short_pubkey,
+            hex::encode([0u8; 96]),
+            B256::ZERO,
+            0,
+        ).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.code(), -32602);
+        assert!(err.message().contains("48 bytes"));
+    }
+
+    #[tokio::test]
+    async fn test_submit_attestation_wrong_sig_length() {
+        let rpc = make_rpc();
+        let sk = BlsSecretKey::random().unwrap();
+        let pubkey_hex = hex::encode(sk.public_key().to_bytes());
+        // Valid hex, but only 48 bytes instead of required 96
+        let short_sig = hex::encode([0u8; 48]);
+        let result = rpc.submit_attestation(
+            pubkey_hex,
+            short_sig,
+            B256::ZERO,
+            0,
+        ).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.code(), -32602);
+        assert!(err.message().contains("96 bytes"));
+    }
+
+    #[tokio::test]
+    async fn test_submit_attestation_unknown_block() {
+        let rpc = make_rpc();
+        let sk = BlsSecretKey::random().unwrap();
+        let block_hash = B256::repeat_byte(0xCC);
+        let sig = sk.sign(block_hash.as_slice());
+        let pubkey_hex = hex::encode(sk.public_key().to_bytes());
+        let sig_hex = hex::encode(sig.to_bytes());
+
+        // Block not registered for attestation tracking → error -32001
+        let result = rpc.submit_attestation(pubkey_hex, sig_hex, block_hash, 1).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.code(), -32001);
+    }
+
+    #[tokio::test]
+    async fn test_submit_attestation_valid() {
+        let vs = ValidatorSet::new(&[], 0);
+        let state = Arc::new(SharedConsensusState::new(vs));
+
+        // Register block for attestation tracking
+        let block_hash = B256::repeat_byte(0xDD);
+        state.notify_block_committed(block_hash, 10);
+
+        let rpc = N42RpcServer::new(state);
+
+        let sk = BlsSecretKey::random().unwrap();
+        let sig = sk.sign(block_hash.as_slice());
+        let pubkey_hex = hex::encode(sk.public_key().to_bytes());
+        let sig_hex = hex::encode(sig.to_bytes());
+
+        let result = rpc.submit_attestation(pubkey_hex, sig_hex, block_hash, 10).await;
+        assert!(result.is_ok());
+        let resp = result.unwrap();
+        assert!(resp.accepted);
+        assert_eq!(resp.attestation_count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_block_attestation_lookup() {
+        let vs = ValidatorSet::new(&[], 0);
+        let state = Arc::new(SharedConsensusState::new(vs));
+        let hash = B256::repeat_byte(0xEE);
+        state.record_attestation(hash, 5, 3);
+
+        let rpc = N42RpcServer::new(state);
+        let record = rpc.block_attestation(hash).await.unwrap();
+        assert!(record.is_some());
+        let r = record.unwrap();
+        assert_eq!(r.block_number, 5);
+        assert_eq!(r.valid_count, 3);
+
+        // Unknown hash
+        let none = rpc.block_attestation(B256::ZERO).await.unwrap();
+        assert!(none.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_equivocations_with_data() {
+        let vs = ValidatorSet::new(&[], 0);
+        let state = Arc::new(SharedConsensusState::new(vs));
+        state.record_equivocation(10, 0, B256::repeat_byte(0xAA), B256::repeat_byte(0xBB));
+        state.record_equivocation(11, 1, B256::repeat_byte(0xCC), B256::repeat_byte(0xDD));
+
+        let rpc = N42RpcServer::new(state);
+        let result = rpc.equivocations().await.unwrap();
+        assert_eq!(result.total, 2);
+        assert_eq!(result.evidence[0].view, 10);
+        assert_eq!(result.evidence[1].validator_index, 1);
+    }
 }

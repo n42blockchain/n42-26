@@ -1127,10 +1127,8 @@ impl ConsensusOrchestrator {
                                 %broadcast.block_hash,
                                 "completing deferred finalization"
                             );
-                            let Some(_pf) = self.pending_finalization.take() else {
-                                tracing::warn!(view = deferred_view, "pending_finalization was None during deferred finalization");
-                                return;
-                            };
+                            // Safe: outer `if let Some(ref pf)` guarantees `Some`.
+                            let _pf = self.pending_finalization.take();
                             self.pending_block_data.clear();
                             self.pending_executions.clear();
 

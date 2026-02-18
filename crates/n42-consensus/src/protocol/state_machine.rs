@@ -1154,12 +1154,16 @@ impl ConsensusEngine {
                 self.send_vote(pending.view, pending.block_hash)?;
             } else {
                 // Hash mismatch: cache this import, restore the pending proposal
-                self.imported_blocks.insert(block_hash);
+                if self.imported_blocks.len() < 32 {
+                    self.imported_blocks.insert(block_hash);
+                }
                 self.pending_proposal = Some(pending);
             }
         } else {
             // Case 2: BlockData arrived first, no Proposal yet → cache for later
-            self.imported_blocks.insert(block_hash);
+            if self.imported_blocks.len() < 32 {
+                self.imported_blocks.insert(block_hash);
+            }
         }
         Ok(())
     }
@@ -2203,5 +2207,69 @@ mod tests {
             }
             other => panic!("expected InvalidQC, got: {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_block_imported_hash_mismatch_caches_and_restores() {
+        let (mut engine, sks, _, mut rx) = make_engine(4, 0);
+        let proposal_hash = B256::repeat_byte(0xAA);
+        let other_hash = B256::repeat_byte(0xBB);
+
+        // Receive a valid proposal → defers vote
+        let msg = signing_message(1, &proposal_hash);
+        let sig = sks[1].sign(&msg);
+        let proposal = Proposal {
+            view: 1,
+            block_hash: proposal_hash,
+            justify_qc: QuorumCertificate::genesis(),
+            proposer: 1,
+            signature: sig,
+            prepare_qc: None,
+        };
+        engine
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(proposal)))
+            .expect("proposal should succeed");
+        while rx.try_recv().is_ok() {}
+        assert!(engine.pending_proposal.is_some());
+
+        // BlockImported arrives but for a DIFFERENT hash
+        engine
+            .process_event(ConsensusEvent::BlockImported(other_hash))
+            .expect("mismatched BlockImported should succeed");
+
+        // pending_proposal should be restored (not consumed)
+        assert!(engine.pending_proposal.is_some(), "pending proposal should be restored");
+        assert_eq!(
+            engine.pending_proposal.as_ref().unwrap().block_hash,
+            proposal_hash
+        );
+        // The other hash should be cached for future use
+        assert!(
+            engine.imported_blocks.contains(&other_hash),
+            "mismatched hash should be cached in imported_blocks"
+        );
+    }
+
+    #[test]
+    fn test_imported_blocks_capacity_bound() {
+        let (mut engine, _sks, _, _rx) = make_engine(4, 0);
+
+        // Insert 32 blocks (at the limit)
+        for i in 0..32u8 {
+            engine
+                .process_event(ConsensusEvent::BlockImported(B256::repeat_byte(i)))
+                .expect("BlockImported should succeed");
+        }
+        assert_eq!(engine.imported_blocks.len(), 32);
+
+        // 33rd should be silently dropped (capacity guard)
+        engine
+            .process_event(ConsensusEvent::BlockImported(B256::repeat_byte(0xFF)))
+            .expect("BlockImported at capacity should succeed");
+        assert_eq!(engine.imported_blocks.len(), 32, "should not exceed 32 entries");
+        assert!(
+            !engine.imported_blocks.contains(&B256::repeat_byte(0xFF)),
+            "overflow entry should be dropped"
+        );
     }
 }

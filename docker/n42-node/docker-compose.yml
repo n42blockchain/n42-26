@@ -1,7 +1,10 @@
 # N42 3-Node Local Test Cluster
 #
+# SECURITY WARNING: The validator keys below are deterministic dev-only keys.
+# NEVER use these keys in production. Generate proper keys with n42-keygen.
+#
 # Usage:
-#   # Build from repository root (needs ../reth in context):
+#   # Build (context must include both n42-26/ and reth/ directories):
 #   docker compose -f docker/n42-node/docker-compose.yml build
 #
 #   # Start the cluster:
@@ -12,14 +15,13 @@
 #     -H "Content-Type: application/json" \
 #     -d '{"jsonrpc":"2.0","method":"n42_consensusStatus","params":[],"id":1}'
 #
-# All three nodes share the same deterministic key generation (N42_VALIDATOR_KEY
-# not set → random dev keys derived from index), so they will automatically
-# form a consensus cluster when N42_VALIDATOR_COUNT=3 and mDNS is enabled.
+# All three nodes use deterministic dev keys and mDNS for automatic peer
+# discovery on the Docker bridge network.
 
 x-n42-common: &n42-common
   build:
-    context: ../..
-    dockerfile: docker/n42-node/Dockerfile
+    context: ../../..
+    dockerfile: n42-26/docker/n42-node/Dockerfile
   restart: unless-stopped
   environment: &n42-env
     N42_VALIDATOR_COUNT: "3"
@@ -33,6 +35,7 @@ services:
     container_name: n42-node-0
     environment:
       <<: *n42-env
+      # DEV ONLY — deterministic key for local testing
       N42_VALIDATOR_KEY: "0000000000000000000000000000000000000000000000000000000000000001"
     ports:
       - "8545:8545"   # HTTP RPC
@@ -48,6 +51,7 @@ services:
     container_name: n42-node-1
     environment:
       <<: *n42-env
+      # DEV ONLY — deterministic key for local testing
       N42_VALIDATOR_KEY: "0000000000000000000000000000000000000000000000000000000000000002"
       N42_CONSENSUS_PORT: "9401"
       N42_STARHUB_PORT: "9444"
@@ -65,6 +69,7 @@ services:
     container_name: n42-node-2
     environment:
       <<: *n42-env
+      # DEV ONLY — deterministic key for local testing
       N42_VALIDATOR_KEY: "0000000000000000000000000000000000000000000000000000000000000003"
       N42_CONSENSUS_PORT: "9402"
       N42_STARHUB_PORT: "9445"
