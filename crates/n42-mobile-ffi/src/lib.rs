@@ -32,6 +32,54 @@ fn safe_cint(val: usize) -> c_int {
     c_int::try_from(val).unwrap_or(-1)
 }
 
+/// FFI error type for structured error reporting.
+///
+/// Each variant maps to a distinct C error code, enabling callers to
+/// differentiate error causes without parsing log messages.
+#[derive(Debug, thiserror::Error)]
+enum FfiError {
+    #[error("null context pointer")]
+    NullContext,
+    #[error("null buffer pointer")]
+    NullBuffer,
+    #[error("null host string")]
+    NullHost,
+    #[error("not connected to StarHub")]
+    NotConnected,
+    #[error("output buffer too small (need {need}, have {have})")]
+    BufferTooSmall { need: usize, have: usize },
+    #[error("invalid cert_hash length: expected 0 or 32, got {0}")]
+    InvalidCertHashLen(usize),
+    #[error("QUIC connection failed: {0}")]
+    ConnectFailed(Box<dyn std::error::Error + Send + Sync>),
+    #[error("packet decode failed: {0}")]
+    PacketDecode(String),
+    #[error("block verification failed: {0}")]
+    VerifyFailed(String),
+    #[error("receipt serialization failed: {0}")]
+    SerializeFailed(String),
+    #[error("null or zero-length data")]
+    InvalidData,
+}
+
+impl FfiError {
+    /// Maps to a C error code and logs the error via tracing.
+    fn into_code(self) -> c_int {
+        let code = match &self {
+            Self::NullContext | Self::NullBuffer | Self::NullHost | Self::InvalidData => -1,
+            Self::NotConnected => -2,
+            Self::BufferTooSmall { .. } => -3,
+            Self::InvalidCertHashLen(_) => -4,
+            Self::ConnectFailed(_) => -5,
+            Self::PacketDecode(_) => 1,
+            Self::VerifyFailed(_) => 2,
+            Self::SerializeFailed(_) => 3,
+        };
+        warn!(code, error = %self, "FFI error");
+        code
+    }
+}
+
 /// Maximum number of pending packets in the receive queue.
 const MAX_PENDING_PACKETS: usize = 64;
 
@@ -161,29 +209,44 @@ pub unsafe extern "C" fn n42_verifier_init(chain_id: u64) -> *mut VerifierContex
 /// # Safety
 /// `ctx` must be a valid pointer from `n42_verifier_init`.
 /// `host` must be a valid null-terminated C string.
+/// `cert_hash` is NULL for dev mode (accept any certificate), or points to 32 bytes
+/// containing the SHA-256 hash of the expected server certificate.
+/// `cert_hash_len` must be 0 (dev mode) or 32 (pinned). Other values return -1.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn n42_connect(
     ctx: *mut VerifierContext,
     host: *const c_char,
     port: u16,
+    cert_hash: *const u8,
+    cert_hash_len: usize,
 ) -> c_int {
     let ctx = match unsafe { ctx.as_ref() } {
         Some(c) => c,
-        None => return -1,
+        None => return FfiError::NullContext.into_code(),
     };
 
     if host.is_null() {
-        return -1;
+        return FfiError::NullHost.into_code();
     }
 
     let host_str = match unsafe { CStr::from_ptr(host) }.to_str() {
         Ok(s) => s.to_string(),
-        Err(_) => return -1,
+        Err(_) => return FfiError::NullHost.into_code(),
+    };
+
+    let expected_cert_hash = if cert_hash.is_null() || cert_hash_len == 0 {
+        None
+    } else if cert_hash_len == 32 {
+        let mut hash = [0u8; 32];
+        unsafe { std::ptr::copy_nonoverlapping(cert_hash, hash.as_mut_ptr(), 32) };
+        Some(hash)
+    } else {
+        return FfiError::InvalidCertHashLen(cert_hash_len).into_code();
     };
 
     let pubkey_bytes = ctx.pubkey_bytes;
 
-    match ctx.runtime.block_on(connect_quic(&host_str, port, &pubkey_bytes)) {
+    match ctx.runtime.block_on(connect_quic(&host_str, port, &pubkey_bytes, expected_cert_hash)) {
         Ok((connection, pending_packets)) => {
             // Spawn background task to receive packets from QUIC streams.
             let conn_clone = connection.clone();
@@ -206,8 +269,7 @@ pub unsafe extern "C" fn n42_connect(
             0
         }
         Err(e) => {
-            error!("QUIC connect failed: {}", e);
-            -1
+            FfiError::ConnectFailed(e).into_code()
         }
     }
 }
@@ -227,17 +289,17 @@ pub unsafe extern "C" fn n42_poll_packet(
 ) -> c_int {
     let ctx = match unsafe { ctx.as_ref() } {
         Some(c) => c,
-        None => return -1,
+        None => return FfiError::NullContext.into_code(),
     };
 
     if out_buf.is_null() {
-        return -1;
+        return FfiError::NullBuffer.into_code();
     }
 
     let conn_guard = lock_or_recover(&ctx.connection);
     let conn = match conn_guard.as_ref() {
         Some(c) => c,
-        None => return -1, // not connected
+        None => return FfiError::NotConnected.into_code(),
     };
 
     let mut queue = lock_or_recover(&conn.pending_packets);
@@ -245,8 +307,9 @@ pub unsafe extern "C" fn n42_poll_packet(
         Some(data) => {
             if data.len() > buf_len {
                 // Buffer too small; put it back.
+                let need = data.len();
                 queue.push_front(data);
-                return -1;
+                return FfiError::BufferTooSmall { need, have: buf_len }.into_code();
             }
             unsafe {
                 std::ptr::copy_nonoverlapping(data.as_ptr(), out_buf, data.len());
@@ -271,11 +334,11 @@ pub unsafe extern "C" fn n42_verify_and_send(
 ) -> c_int {
     let ctx = match unsafe { ctx.as_ref() } {
         Some(c) => c,
-        None => return -1,
+        None => return FfiError::NullContext.into_code(),
     };
 
     if data.is_null() || len == 0 {
-        return -1;
+        return FfiError::InvalidData.into_code();
     }
 
     let packet_bytes = unsafe { std::slice::from_raw_parts(data, len) };
@@ -285,8 +348,7 @@ pub unsafe extern "C" fn n42_verify_and_send(
     let packet = match decode_packet(packet_bytes) {
         Ok(p) => p,
         Err(e) => {
-            error!("packet decode failed: {}", e);
-            return 1;
+            return FfiError::PacketDecode(e.to_string()).into_code();
         }
     };
 
@@ -308,11 +370,10 @@ pub unsafe extern "C" fn n42_verify_and_send(
     let result = match result {
         Ok(r) => r,
         Err(e) => {
-            error!(block_number, "verification failed: {}", e);
             let mut stats = lock_or_recover(&ctx.stats);
             stats.blocks_verified += 1;
             stats.failure_count += 1;
-            return 2;
+            return FfiError::VerifyFailed(e.to_string()).into_code();
         }
     };
 
@@ -384,8 +445,7 @@ pub unsafe extern "C" fn n42_verify_and_send(
         let receipt_bytes = match bincode::serialize(&receipt) {
             Ok(b) => b,
             Err(e) => {
-                error!("receipt serialize failed: {}", e);
-                return 3;
+                return FfiError::SerializeFailed(e.to_string()).into_code();
             }
         };
 
@@ -422,11 +482,11 @@ pub unsafe extern "C" fn n42_last_verify_info(
 ) -> c_int {
     let ctx = match unsafe { ctx.as_ref() } {
         Some(c) => c,
-        None => return -1,
+        None => return FfiError::NullContext.into_code(),
     };
 
     if out_buf.is_null() {
-        return -1;
+        return FfiError::NullBuffer.into_code();
     }
 
     let info_guard = lock_or_recover(&ctx.last_info);
@@ -437,11 +497,11 @@ pub unsafe extern "C" fn n42_last_verify_info(
 
     let json = match serde_json::to_string(info) {
         Ok(s) => s,
-        Err(_) => return -1,
+        Err(_) => return FfiError::SerializeFailed("JSON serialization failed".into()).into_code(),
     };
 
     if json.len() + 1 > buf_len {
-        return -1;
+        return FfiError::BufferTooSmall { need: json.len() + 1, have: buf_len }.into_code();
     }
 
     unsafe {
@@ -464,11 +524,11 @@ pub unsafe extern "C" fn n42_get_pubkey(
 ) -> c_int {
     let ctx = match unsafe { ctx.as_ref() } {
         Some(c) => c,
-        None => return -1,
+        None => return FfiError::NullContext.into_code(),
     };
 
     if out_buf.is_null() {
-        return -1;
+        return FfiError::NullBuffer.into_code();
     }
 
     unsafe {
@@ -491,11 +551,11 @@ pub unsafe extern "C" fn n42_get_stats(
 ) -> c_int {
     let ctx = match unsafe { ctx.as_ref() } {
         Some(c) => c,
-        None => return -1,
+        None => return FfiError::NullContext.into_code(),
     };
 
     if out_buf.is_null() {
-        return -1;
+        return FfiError::NullBuffer.into_code();
     }
 
     let stats = lock_or_recover(&ctx.stats);
@@ -528,7 +588,7 @@ pub unsafe extern "C" fn n42_get_stats(
 
     let json_str = json.to_string();
     if json_str.len() + 1 > buf_len {
-        return -1;
+        return FfiError::BufferTooSmall { need: json_str.len() + 1, have: buf_len }.into_code();
     }
 
     unsafe {
@@ -548,7 +608,7 @@ pub unsafe extern "C" fn n42_get_stats(
 pub unsafe extern "C" fn n42_disconnect(ctx: *mut VerifierContext) -> c_int {
     let ctx = match unsafe { ctx.as_ref() } {
         Some(c) => c,
-        None => return -1,
+        None => return FfiError::NullContext.into_code(),
     };
 
     let mut conn_guard = lock_or_recover(&ctx.connection);
@@ -557,7 +617,7 @@ pub unsafe extern "C" fn n42_disconnect(ctx: *mut VerifierContext) -> c_int {
         info!("disconnected from StarHub");
         0
     } else {
-        -1
+        FfiError::NotConnected.into_code()
     }
 }
 
@@ -592,14 +652,14 @@ async fn connect_quic(
     host: &str,
     port: u16,
     pubkey: &[u8; 48],
+    expected_cert_hash: Option<[u8; 32]>,
 ) -> Result<(quinn::Connection, Arc<Mutex<VecDeque<Vec<u8>>>>), Box<dyn std::error::Error + Send + Sync>>
 {
     // Configure QUIC client with certificate pinning (or skip-verify for dev mode).
-    // TODO: Accept expected_cert_hash parameter from caller for production pinning.
     let crypto = rustls::ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(PinnedCertVerification {
-            expected_hash: None, // dev mode: accept any cert
+            expected_hash: expected_cert_hash,
         }))
         .with_no_client_auth();
 
@@ -942,5 +1002,408 @@ mod tests {
         // Values larger than c_int::MAX should return -1.
         assert_eq!(safe_cint(c_int::MAX as usize + 1), -1);
         assert_eq!(safe_cint(usize::MAX), -1);
+    }
+
+    // ── 5A: FFI lifecycle tests ──
+
+    #[test]
+    fn test_init_and_free() {
+        let ctx = unsafe { n42_verifier_init(4242) };
+        assert!(!ctx.is_null(), "n42_verifier_init should return non-null");
+        unsafe { n42_verifier_free(ctx) };
+        // Should not crash.
+    }
+
+    #[test]
+    fn test_init_creates_valid_pubkey() {
+        let ctx = unsafe { n42_verifier_init(4242) };
+        assert!(!ctx.is_null());
+        let mut pubkey = [0u8; 48];
+        let result = unsafe { n42_get_pubkey(ctx, pubkey.as_mut_ptr()) };
+        assert_eq!(result, 0, "n42_get_pubkey should succeed");
+        assert_ne!(pubkey, [0u8; 48], "pubkey should be non-zero");
+        unsafe { n42_verifier_free(ctx) };
+    }
+
+    #[test]
+    fn test_get_stats_json_valid() {
+        let ctx = unsafe { n42_verifier_init(4242) };
+        assert!(!ctx.is_null());
+        let mut buf = vec![0u8; 4096];
+        let len = unsafe {
+            n42_get_stats(ctx, buf.as_mut_ptr() as *mut c_char, buf.len())
+        };
+        assert!(len > 0, "n42_get_stats should return valid JSON");
+        let json_str = std::str::from_utf8(&buf[..len as usize]).expect("valid UTF-8");
+        let parsed: serde_json::Value = serde_json::from_str(json_str).expect("valid JSON");
+        assert!(parsed.get("blocks_verified").is_some());
+        unsafe { n42_verifier_free(ctx) };
+    }
+
+    #[test]
+    fn test_disconnect_when_not_connected() {
+        let ctx = unsafe { n42_verifier_init(4242) };
+        assert!(!ctx.is_null());
+        let result = unsafe { n42_disconnect(ctx) };
+        assert_eq!(result, -2, "disconnect when not connected should return -2 (NotConnected)");
+        unsafe { n42_verifier_free(ctx) };
+    }
+
+    // ── 5B: Null pointer guard tests ──
+
+    #[test]
+    fn test_connect_null_ctx() {
+        let host = std::ffi::CString::new("127.0.0.1").unwrap();
+        let result = unsafe { n42_connect(std::ptr::null_mut(), host.as_ptr(), 9443, std::ptr::null(), 0) };
+        assert_eq!(result, -1);
+    }
+
+    #[test]
+    fn test_poll_null_ctx() {
+        let mut buf = [0u8; 1024];
+        let result = unsafe { n42_poll_packet(std::ptr::null_mut(), buf.as_mut_ptr(), buf.len()) };
+        assert_eq!(result, -1);
+    }
+
+    #[test]
+    fn test_verify_null_ctx() {
+        let data = [0u8; 64];
+        let result = unsafe { n42_verify_and_send(std::ptr::null_mut(), data.as_ptr(), data.len()) };
+        assert_eq!(result, -1);
+    }
+
+    #[test]
+    fn test_get_pubkey_null_ctx() {
+        let mut buf = [0u8; 48];
+        let result = unsafe { n42_get_pubkey(std::ptr::null_mut(), buf.as_mut_ptr()) };
+        assert_eq!(result, -1);
+    }
+
+    #[test]
+    fn test_get_stats_null_ctx() {
+        let mut buf = [0u8; 1024];
+        let result = unsafe { n42_get_stats(std::ptr::null_mut(), buf.as_mut_ptr() as *mut c_char, buf.len()) };
+        assert_eq!(result, -1);
+    }
+
+    #[test]
+    fn test_last_verify_info_null_ctx() {
+        let mut buf = [0u8; 1024];
+        let result = unsafe { n42_last_verify_info(std::ptr::null_mut(), buf.as_mut_ptr() as *mut c_char, buf.len()) };
+        assert_eq!(result, -1);
+    }
+
+    #[test]
+    fn test_free_null_ctx() {
+        // Should not crash.
+        unsafe { n42_verifier_free(std::ptr::null_mut()) };
+    }
+
+    // ── 5C: TLS pinning tests ──
+
+    #[test]
+    fn test_connect_invalid_cert_hash_len() {
+        let ctx = unsafe { n42_verifier_init(4242) };
+        assert!(!ctx.is_null());
+        let host = std::ffi::CString::new("127.0.0.1").unwrap();
+        let fake_hash = [0u8; 16]; // invalid: must be 0 or 32
+        let result = unsafe { n42_connect(ctx, host.as_ptr(), 9443, fake_hash.as_ptr(), 16) };
+        assert_eq!(result, -4, "cert_hash_len != 0 and != 32 should return -4 (InvalidCertHashLen)");
+        unsafe { n42_verifier_free(ctx) };
+    }
+
+    #[test]
+    fn test_connect_null_cert_hash_dev_mode() {
+        // Verify that null cert_hash with len=0 doesn't crash (dev mode path).
+        // This will still fail to connect (no server) but should not panic.
+        let ctx = unsafe { n42_verifier_init(4242) };
+        assert!(!ctx.is_null());
+        let host = std::ffi::CString::new("127.0.0.1").unwrap();
+        let result = unsafe { n42_connect(ctx, host.as_ptr(), 19999, std::ptr::null(), 0) };
+        // Connection will fail (no server), but the cert_hash dev mode path should not crash.
+        assert_eq!(result, -5, "connect to non-existent server returns -5 (ConnectFailed)");
+        unsafe { n42_verifier_free(ctx) };
+    }
+
+    // ── 6A: Input validation tests (new error codes) ──
+
+    #[test]
+    fn test_connect_null_host() {
+        let ctx = unsafe { n42_verifier_init(4242) };
+        assert!(!ctx.is_null());
+        let result = unsafe { n42_connect(ctx, std::ptr::null(), 9443, std::ptr::null(), 0) };
+        assert_eq!(result, -1, "null host should return -1 (NullHost)");
+        unsafe { n42_verifier_free(ctx) };
+    }
+
+    #[test]
+    fn test_poll_packet_null_outbuf() {
+        let ctx = unsafe { n42_verifier_init(4242) };
+        assert!(!ctx.is_null());
+        let result = unsafe { n42_poll_packet(ctx, std::ptr::null_mut(), 1024) };
+        assert_eq!(result, -1, "null out_buf should return -1 (NullBuffer)");
+        unsafe { n42_verifier_free(ctx) };
+    }
+
+    #[test]
+    fn test_verify_null_data() {
+        let ctx = unsafe { n42_verifier_init(4242) };
+        assert!(!ctx.is_null());
+        let result = unsafe { n42_verify_and_send(ctx, std::ptr::null(), 10) };
+        assert_eq!(result, -1, "null data should return -1 (InvalidData)");
+        unsafe { n42_verifier_free(ctx) };
+    }
+
+    #[test]
+    fn test_verify_zero_len() {
+        let ctx = unsafe { n42_verifier_init(4242) };
+        assert!(!ctx.is_null());
+        let data = [0u8; 1];
+        let result = unsafe { n42_verify_and_send(ctx, data.as_ptr(), 0) };
+        assert_eq!(result, -1, "zero length should return -1 (InvalidData)");
+        unsafe { n42_verifier_free(ctx) };
+    }
+
+    #[test]
+    fn test_get_pubkey_null_outbuf() {
+        let ctx = unsafe { n42_verifier_init(4242) };
+        assert!(!ctx.is_null());
+        let result = unsafe { n42_get_pubkey(ctx, std::ptr::null_mut()) };
+        assert_eq!(result, -1, "null out_buf should return -1 (NullBuffer)");
+        unsafe { n42_verifier_free(ctx) };
+    }
+
+    #[test]
+    fn test_last_verify_info_null_outbuf() {
+        let ctx = unsafe { n42_verifier_init(4242) };
+        assert!(!ctx.is_null());
+        let result = unsafe { n42_last_verify_info(ctx, std::ptr::null_mut(), 1024) };
+        assert_eq!(result, -1, "null out_buf should return -1 (NullBuffer)");
+        unsafe { n42_verifier_free(ctx) };
+    }
+
+    // ── 6B: Functional path tests ──
+
+    #[test]
+    fn test_poll_packet_not_connected() {
+        let ctx = unsafe { n42_verifier_init(4242) };
+        assert!(!ctx.is_null());
+        let mut buf = [0u8; 1024];
+        let result = unsafe { n42_poll_packet(ctx, buf.as_mut_ptr(), buf.len()) };
+        assert_eq!(result, -2, "poll when not connected should return -2 (NotConnected)");
+        unsafe { n42_verifier_free(ctx) };
+    }
+
+    #[test]
+    fn test_last_verify_info_no_data() {
+        let ctx = unsafe { n42_verifier_init(4242) };
+        assert!(!ctx.is_null());
+        let mut buf = [0u8; 4096];
+        let result = unsafe { n42_last_verify_info(ctx, buf.as_mut_ptr() as *mut c_char, buf.len()) };
+        assert_eq!(result, 0, "no verification data should return 0");
+        unsafe { n42_verifier_free(ctx) };
+    }
+
+    #[test]
+    fn test_get_stats_buffer_too_small() {
+        let ctx = unsafe { n42_verifier_init(4242) };
+        assert!(!ctx.is_null());
+        let mut buf = [0u8; 2];
+        let result = unsafe { n42_get_stats(ctx, buf.as_mut_ptr() as *mut c_char, buf.len()) };
+        assert_eq!(result, -3, "buffer too small should return -3 (BufferTooSmall)");
+        unsafe { n42_verifier_free(ctx) };
+    }
+
+    #[test]
+    fn test_verify_garbage_data() {
+        let ctx = unsafe { n42_verifier_init(4242) };
+        assert!(!ctx.is_null());
+        let garbage = [0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04];
+        let result = unsafe { n42_verify_and_send(ctx, garbage.as_ptr(), garbage.len()) };
+        assert_eq!(result, 1, "garbage data should return 1 (PacketDecode)");
+        unsafe { n42_verifier_free(ctx) };
+    }
+
+    // ── 6C: Buffer boundary test ──
+
+    #[test]
+    fn test_last_verify_info_buffer_too_small() {
+        let ctx = unsafe { n42_verifier_init(4242) };
+        assert!(!ctx.is_null());
+        let ctx_ref = unsafe { &*ctx };
+        *lock_or_recover(&ctx_ref.last_info) = Some(LastVerifyInfo {
+            block_number: 1,
+            block_hash: "0x00".into(),
+            receipts_root_match: true,
+            computed_receipts_root: "0x00".into(),
+            expected_receipts_root: "0x00".into(),
+            tx_count: 0,
+            witness_accounts: 0,
+            uncached_bytecodes: 0,
+            packet_size_bytes: 0,
+            verify_time_ms: 0,
+            signature: "00".into(),
+        });
+        let mut buf = [0u8; 2];
+        let result = unsafe { n42_last_verify_info(ctx, buf.as_mut_ptr() as *mut c_char, buf.len()) };
+        assert_eq!(result, -3, "buffer too small should return -3 (BufferTooSmall)");
+        unsafe { n42_verifier_free(ctx) };
+    }
+
+    // ── 7: PinnedCertVerification unit tests ──
+
+    #[test]
+    fn test_pinned_cert_dev_mode_accepts_any() {
+        use rustls::client::danger::ServerCertVerifier;
+        use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+
+        let cert_bytes = b"arbitrary DER data for dev mode test";
+        let cert = CertificateDer::from(cert_bytes.to_vec());
+
+        let verifier = PinnedCertVerification { expected_hash: None };
+        let result = verifier.verify_server_cert(
+            &cert,
+            &[],
+            &ServerName::try_from("n42-starhub").unwrap(),
+            &[],
+            UnixTime::now(),
+        );
+        assert!(result.is_ok(), "dev mode (no hash) should accept any certificate");
+    }
+
+    #[test]
+    fn test_pinned_cert_hash_match() {
+        use rustls::client::danger::ServerCertVerifier;
+        use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+        use sha2::{Sha256, Digest};
+
+        let cert_bytes = b"test certificate DER data";
+        let cert = CertificateDer::from(cert_bytes.to_vec());
+        let expected: [u8; 32] = Sha256::digest(cert_bytes).into();
+
+        let verifier = PinnedCertVerification { expected_hash: Some(expected) };
+        let result = verifier.verify_server_cert(
+            &cert,
+            &[],
+            &ServerName::try_from("n42-starhub").unwrap(),
+            &[],
+            UnixTime::now(),
+        );
+        assert!(result.is_ok(), "matching hash should be accepted");
+    }
+
+    #[test]
+    fn test_pinned_cert_hash_mismatch() {
+        use rustls::client::danger::ServerCertVerifier;
+        use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+
+        let cert_bytes = b"test certificate DER data";
+        let cert = CertificateDer::from(cert_bytes.to_vec());
+        let wrong_hash = [0xAA; 32];
+
+        let verifier = PinnedCertVerification { expected_hash: Some(wrong_hash) };
+        let result = verifier.verify_server_cert(
+            &cert,
+            &[],
+            &ServerName::try_from("n42-starhub").unwrap(),
+            &[],
+            UnixTime::now(),
+        );
+        assert!(result.is_err(), "mismatched hash should be rejected");
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(err_msg.contains("certificate hash mismatch"), "error should mention hash mismatch");
+    }
+
+    // ── 8: Queue overflow test ──
+
+    #[test]
+    fn test_queue_overflow_drops_oldest() {
+        let pending = Arc::new(Mutex::new(VecDeque::with_capacity(MAX_PENDING_PACKETS)));
+        let dropped = Arc::new(AtomicU64::new(0));
+
+        // Fill to capacity.
+        {
+            let mut q = pending.lock().unwrap();
+            for i in 0..MAX_PENDING_PACKETS {
+                q.push_back(vec![i as u8]);
+            }
+        }
+
+        // Simulate recv_loop overflow: add one more.
+        {
+            let mut q = pending.lock().unwrap();
+            if q.len() >= MAX_PENDING_PACKETS {
+                dropped.fetch_add(1, Ordering::Relaxed);
+                q.pop_front();
+            }
+            q.push_back(vec![0xFF]);
+        }
+
+        let q = pending.lock().unwrap();
+        assert_eq!(q.len(), MAX_PENDING_PACKETS);
+        assert_eq!(dropped.load(Ordering::Relaxed), 1);
+        assert_eq!(q.front().unwrap()[0], 1, "oldest (0) should be dropped");
+        assert_eq!(q.back().unwrap()[0], 0xFF, "newest should be at back");
+    }
+
+    // ── 9: Concurrency + mutex poison recovery tests ──
+
+    #[test]
+    fn test_mutex_poison_recovery() {
+        let mutex = Mutex::new(42u32);
+        // Poison by panicking while holding the lock.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = mutex.lock().unwrap();
+            panic!("intentional");
+        }));
+        assert!(mutex.is_poisoned());
+        // lock_or_recover should work.
+        let guard = lock_or_recover(&mutex);
+        assert_eq!(*guard, 42);
+    }
+
+    #[test]
+    fn test_concurrent_stats_updates() {
+        let stats = Arc::new(Mutex::new(VerifyStats::default()));
+        let handles: Vec<_> = (0..4)
+            .map(|i| {
+                let stats = stats.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..100 {
+                        let mut s = lock_or_recover(&stats);
+                        s.blocks_verified += 1;
+                        if i % 2 == 0 {
+                            s.success_count += 1;
+                        } else {
+                            s.failure_count += 1;
+                        }
+                        s.total_verify_time_ms += 10;
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let s = stats.lock().unwrap();
+        assert_eq!(s.blocks_verified, 400);
+        assert_eq!(s.success_count + s.failure_count, 400);
+    }
+
+    // ── 10: FfiError code mapping test ──
+
+    #[test]
+    fn test_ffi_error_codes_distinct() {
+        assert_eq!(FfiError::NullContext.into_code(), -1);
+        assert_eq!(FfiError::NullBuffer.into_code(), -1);
+        assert_eq!(FfiError::NullHost.into_code(), -1);
+        assert_eq!(FfiError::InvalidData.into_code(), -1);
+        assert_eq!(FfiError::NotConnected.into_code(), -2);
+        assert_eq!(FfiError::BufferTooSmall { need: 100, have: 10 }.into_code(), -3);
+        assert_eq!(FfiError::InvalidCertHashLen(16).into_code(), -4);
+        assert_eq!(FfiError::ConnectFailed("test".into()).into_code(), -5);
+        assert_eq!(FfiError::PacketDecode("test".into()).into_code(), 1);
+        assert_eq!(FfiError::VerifyFailed("test".into()).into_code(), 2);
+        assert_eq!(FfiError::SerializeFailed("test".into()).into_code(), 3);
     }
 }
