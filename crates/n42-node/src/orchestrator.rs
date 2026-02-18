@@ -980,6 +980,13 @@ impl ConsensusOrchestrator {
                     self.pending_executions.clear();
                 }
 
+                // Reset empty block skip counter after a timeout-driven view change.
+                // Without this, each leader independently skips empty blocks, causing
+                // a cascading dead zone where N validators × MAX_SKIPS views pass
+                // without any block production. Timeouts signal that consensus is
+                // struggling — the next leader must build to restore liveness.
+                self.consecutive_empty_skips = 0;
+
                 // After a view change (timeout recovery), if this node becomes
                 // the new leader, it should trigger payload building.
                 if self.engine.is_current_leader() {

@@ -50,6 +50,9 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
         block_interval_ms: 4000,
         port_offset: 0,
         trusted_peers: vec![],
+        base_timeout_ms: None,
+        max_timeout_ms: None,
+        startup_delay_ms: None,
     };
 
     let node = NodeProcess::start(&config).await?;

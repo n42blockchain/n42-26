@@ -129,6 +129,13 @@ impl RoundState {
         self.consecutive_timeouts += 1;
     }
 
+    /// Resets consecutive_timeouts to 0.
+    /// Called during QC-based view jump to ensure the pacemaker
+    /// uses base_timeout after catching up to the network.
+    pub fn reset_consecutive_timeouts(&mut self) {
+        self.consecutive_timeouts = 0;
+    }
+
     /// Updates the locked QC if the new one is higher.
     /// Called when seeing a QC in a proposal's justify_qc.
     pub fn update_locked_qc(&mut self, qc: &QuorumCertificate) {
@@ -331,9 +338,91 @@ mod tests {
     }
 
     #[test]
+    fn test_reset_consecutive_timeouts() {
+        let mut state = RoundState::new();
+
+        // Accumulate timeouts
+        state.timeout();
+        state.timeout();
+        state.timeout();
+        assert_eq!(state.consecutive_timeouts(), 3);
+
+        // Reset should bring back to 0
+        state.reset_consecutive_timeouts();
+        assert_eq!(
+            state.consecutive_timeouts(),
+            0,
+            "consecutive_timeouts should be 0 after reset"
+        );
+
+        // Subsequent timeout should start from 1 again
+        state.timeout();
+        assert_eq!(state.consecutive_timeouts(), 1);
+    }
+
+    #[test]
     fn test_default() {
         let state = RoundState::default();
         assert_eq!(state.current_view(), 1);
         assert_eq!(state.phase(), Phase::WaitingForProposal);
+    }
+
+    /// update_locked_qc with a lower-view QC must not downgrade the locked QC.
+    #[test]
+    fn test_update_locked_qc_no_downgrade() {
+        let mut state = RoundState::new();
+
+        // Lock on view 10
+        let qc_10 = make_qc(10);
+        state.update_locked_qc(&qc_10);
+        assert_eq!(state.locked_qc().view, 10);
+
+        // Attempt to "update" with a lower QC (view 5) — must be no-op
+        let qc_5 = make_qc(5);
+        state.update_locked_qc(&qc_5);
+        assert_eq!(
+            state.locked_qc().view, 10,
+            "locked_qc should not downgrade from 10 to 5"
+        );
+
+        // Same view — no-op (not strictly higher)
+        let qc_10b = make_qc(10);
+        state.update_locked_qc(&qc_10b);
+        assert_eq!(state.locked_qc().view, 10, "same view should not change locked_qc");
+
+        // Higher view — should update
+        let qc_15 = make_qc(15);
+        state.update_locked_qc(&qc_15);
+        assert_eq!(state.locked_qc().view, 15, "higher view should update locked_qc");
+    }
+
+    /// After timeout + advance_view, the phase must reset to WaitingForProposal.
+    #[test]
+    fn test_advance_view_resets_phase() {
+        let mut state = RoundState::new();
+
+        // Enter various phases, then timeout
+        state.enter_voting();
+        assert_eq!(state.phase(), Phase::Voting);
+        state.timeout();
+        assert_eq!(state.phase(), Phase::TimedOut);
+
+        // advance_view should reset phase
+        state.advance_view(2);
+        assert_eq!(
+            state.phase(), Phase::WaitingForProposal,
+            "advance_view after timeout should reset phase to WaitingForProposal"
+        );
+        assert_eq!(state.current_view(), 2);
+
+        // Also verify from PreCommit
+        state.enter_voting();
+        state.enter_pre_commit();
+        assert_eq!(state.phase(), Phase::PreCommit);
+        state.advance_view(3);
+        assert_eq!(
+            state.phase(), Phase::WaitingForProposal,
+            "advance_view from PreCommit should reset phase"
+        );
     }
 }

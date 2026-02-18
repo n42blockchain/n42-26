@@ -1121,11 +1121,13 @@ mod fault_tolerance {
         let mut harness = TestHarness::new(4);
         let view = 1u64;
 
-        // Create a vote for view 99 (wrong view)
-        let msg = signing_message(99, &B256::repeat_byte(0xBB));
+        // Create a vote for a past view (0 < current_view=1).
+        // Past-view votes bypass future-message buffering and go directly to
+        // dispatch_message, which rejects them via ViewMismatch.
+        let msg = signing_message(0, &B256::repeat_byte(0xBB));
         let sig = harness.secret_keys[0].sign(&msg);
         let vote = Vote {
-            view: 99,
+            view: 0,
             block_hash: B256::repeat_byte(0xBB),
             voter: 0,
             signature: sig,
@@ -1149,7 +1151,7 @@ mod fault_tolerance {
                 received,
             } => {
                 assert_eq!(current, 1);
-                assert_eq!(received, 99);
+                assert_eq!(received, 0);
             }
             other => panic!("expected ViewMismatch, got: {:?}", other),
         }

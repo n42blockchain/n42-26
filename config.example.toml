@@ -54,6 +54,17 @@
 # StarHub QUIC port for mobile verifier connections (default: 9443).
 # N42_STARHUB_PORT = "9443"
 
+# ── Pacemaker Timeouts ──
+
+# Override pacemaker base timeout in milliseconds (default: from ConsensusConfig).
+# Controls how long a node waits before triggering a view timeout.
+# For fast block intervals (e.g., 500ms), set to a low value like 3000.
+# N42_BASE_TIMEOUT_MS = "20000"
+
+# Override pacemaker max timeout in milliseconds (default: from ConsensusConfig).
+# The timeout doubles on consecutive failures, capped at this value.
+# N42_MAX_TIMEOUT_MS = "60000"
+
 # ── Block Production ──
 
 # Block production interval in milliseconds (default: 0 = immediate).

@@ -17,7 +17,7 @@ use n42_primitives::BlsSecretKey;
 use reth_ethereum_cli::chainspec::EthereumChainSpecParser;
 use reth_ethereum_cli::Cli;
 use reth_node_core::args::DefaultRpcServerArgs;
-use reth_storage_api::BlockHashReader;
+use reth_storage_api::{BlockHashReader, BlockNumReader};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -50,7 +50,7 @@ fn main() {
 
         // Load consensus configuration.
         // Priority: N42_CONSENSUS_CONFIG file > N42_VALIDATOR_COUNT dev mode
-        let consensus_config = match std::env::var("N42_CONSENSUS_CONFIG") {
+        let mut consensus_config = match std::env::var("N42_CONSENSUS_CONFIG") {
             Ok(path) => {
                 info!(target: "n42::cli", path, "loading consensus config from file");
                 ConsensusConfig::from_file(std::path::Path::new(&path))
@@ -72,6 +72,31 @@ fn main() {
                 }
             }
         };
+
+        // Allow environment variables to override pacemaker timeouts.
+        // Useful for testing scenarios that need faster timeout (e.g., 500ms block interval).
+        if let Ok(v) = std::env::var("N42_BASE_TIMEOUT_MS") {
+            match v.parse::<u64>() {
+                Ok(ms) => {
+                    info!(target: "n42::cli", base_timeout_ms = ms, "overriding base timeout from env");
+                    consensus_config.base_timeout_ms = ms;
+                }
+                Err(e) => {
+                    warn!(target: "n42::cli", value = %v, error = %e, "N42_BASE_TIMEOUT_MS is not a valid u64, ignoring");
+                }
+            }
+        }
+        if let Ok(v) = std::env::var("N42_MAX_TIMEOUT_MS") {
+            match v.parse::<u64>() {
+                Ok(ms) => {
+                    info!(target: "n42::cli", max_timeout_ms = ms, "overriding max timeout from env");
+                    consensus_config.max_timeout_ms = ms;
+                }
+                Err(e) => {
+                    warn!(target: "n42::cli", value = %v, error = %e, "N42_MAX_TIMEOUT_MS is not a valid u64, ignoring");
+                }
+            }
+        }
 
         // Load or generate validator identity.
         // Priority: N42_KEYSTORE_PATH (encrypted) > N42_VALIDATOR_KEY (plaintext) > random (dev)
@@ -160,7 +185,11 @@ fn main() {
                 let beacon_engine_handle = full_node.add_ons_handle.beacon_engine_handle.clone();
                 let payload_builder_handle = full_node.payload_builder_handle.clone();
 
-                // Get the genesis (current head) block hash from the provider.
+                // Get the canonical chain head block hash from the provider.
+                // On first start this is genesis (block 0). After restart, this is the
+                // latest committed block — critical for fork_choice_updated to succeed.
+                // Without this, restarted leaders send FCU with genesis hash, which reth
+                // rejects because the canonical head is far ahead.
                 let genesis_hash = full_node
                     .provider
                     .block_hash(0)
@@ -168,11 +197,33 @@ fn main() {
                     .flatten()
                     .unwrap_or_default();
 
+                let head_block_hash = {
+                    let best_num = full_node.provider.best_block_number().unwrap_or(0);
+                    if best_num > 0 {
+                        let hash = full_node
+                            .provider
+                            .block_hash(best_num)
+                            .ok()
+                            .flatten()
+                            .unwrap_or(genesis_hash);
+                        info!(
+                            target: "n42::cli",
+                            best_block = best_num,
+                            %hash,
+                            "using canonical chain head as head_block_hash"
+                        );
+                        hash
+                    } else {
+                        genesis_hash
+                    }
+                };
+
                 info!(
                     target: "n42::cli",
                     validator_index = my_index,
                     validator_count = validator_set.len(),
                     %genesis_hash,
+                    %head_block_hash,
                     "starting N42 consensus subsystem"
                 );
 
@@ -481,7 +532,7 @@ fn main() {
                     beacon_engine_handle,
                     payload_builder_handle,
                     consensus_state,
-                    genesis_hash,
+                    head_block_hash,
                     fee_recipient,
                 )
                 .with_tx_pool_bridge(tx_import_tx, tx_broadcast_rx)

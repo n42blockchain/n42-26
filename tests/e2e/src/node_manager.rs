@@ -23,6 +23,12 @@ pub struct NodeConfig {
     pub port_offset: u16,
     /// Additional trusted peer multiaddrs for peer discovery.
     pub trusted_peers: Vec<String>,
+    /// Pacemaker base timeout override in milliseconds.
+    pub base_timeout_ms: Option<u64>,
+    /// Pacemaker max timeout override in milliseconds.
+    pub max_timeout_ms: Option<u64>,
+    /// Startup delay override in milliseconds before first proposal.
+    pub startup_delay_ms: Option<u64>,
 }
 
 impl NodeConfig {
@@ -36,6 +42,9 @@ impl NodeConfig {
             block_interval_ms,
             port_offset: 0,
             trusted_peers: vec![],
+            base_timeout_ms: None,
+            max_timeout_ms: None,
+            startup_delay_ms: None,
         }
     }
 
@@ -117,13 +126,27 @@ impl NodeProcess {
             .arg("--disable-discovery");
 
         // Set environment variables.
+        // N42_DATA_DIR must point to the temp data dir so each node starts with
+        // a clean consensus state (no stale consensus_state.json from prior runs).
         cmd.env("N42_VALIDATOR_KEY", &key_hex)
             .env("N42_VALIDATOR_COUNT", config.validator_count.to_string())
             .env("N42_CONSENSUS_PORT", consensus_port.to_string())
-            .env("N42_STARHUB_PORT", starhub_port.to_string());
+            .env("N42_STARHUB_PORT", starhub_port.to_string())
+            .env("N42_DATA_DIR", data_dir.path());
 
         if config.block_interval_ms > 0 {
             cmd.env("N42_BLOCK_INTERVAL_MS", config.block_interval_ms.to_string());
+        }
+
+        // Pass pacemaker timeout overrides if specified.
+        if let Some(base_timeout) = config.base_timeout_ms {
+            cmd.env("N42_BASE_TIMEOUT_MS", base_timeout.to_string());
+        }
+        if let Some(max_timeout) = config.max_timeout_ms {
+            cmd.env("N42_MAX_TIMEOUT_MS", max_timeout.to_string());
+        }
+        if let Some(startup_delay) = config.startup_delay_ms {
+            cmd.env("N42_STARTUP_DELAY_MS", startup_delay.to_string());
         }
 
         // Pass trusted peers via environment variable for multi-node setups.

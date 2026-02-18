@@ -102,6 +102,9 @@ async fn run_multi_node_test(
             block_interval_ms,
             port_offset,
             trusted_peers,
+            base_timeout_ms: None,
+            max_timeout_ms: None,
+            startup_delay_ms: None,
         };
 
         match NodeProcess::start(&config).await {

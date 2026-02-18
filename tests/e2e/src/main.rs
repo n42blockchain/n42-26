@@ -13,7 +13,7 @@ use tracing_subscriber::EnvFilter;
 #[derive(Parser)]
 #[command(name = "e2e-test", about = "N42 End-to-End Test Suite")]
 struct Cli {
-    /// Run a specific scenario (1-8), or omit to run all.
+    /// Run a specific scenario (1-10), or omit to run all.
     #[arg(long)]
     scenario: Option<u32>,
 
@@ -71,6 +71,8 @@ async fn main() -> eyre::Result<()> {
             6 => scenarios::scenario6_stress::run(binary_path.clone()).await,
             7 => scenarios::scenario7_21x21::run(binary_path.clone()).await,
             8 => scenarios::scenario8_mobile_evm::run(binary_path.clone()).await,
+            9 => scenarios::scenario9_long_run::run(binary_path.clone()).await,
+            10 => scenarios::scenario10_chaos::run(binary_path.clone()).await,
             _ => {
                 info!(scenario, "unknown scenario, skipping");
                 continue;

@@ -197,6 +197,11 @@ impl TimeoutCollector {
         }
     }
 
+    /// Returns the view this collector is gathering timeouts for.
+    pub fn view(&self) -> ViewNumber {
+        self.view
+    }
+
     /// Adds a timeout message. Returns `Err` if duplicate.
     pub fn add_timeout(
         &mut self,
@@ -934,5 +939,47 @@ mod tests {
         // verify_commit_qc should FAIL for this PrepareQC
         let result = verify_commit_qc(&prepare_qc, &vs);
         assert!(result.is_err(), "verify_commit_qc should reject a PrepareQC (different signing format)");
+    }
+
+    // ── TimeoutCollector tests ──
+
+    /// Duplicate add_timeout for the same validator should return DuplicateVote.
+    #[test]
+    fn test_timeout_collector_duplicate_rejected() {
+        let (sks, _vs) = test_validator_set(4);
+        let view = 10u64;
+        let genesis_qc = QuorumCertificate::genesis();
+
+        let mut collector = TimeoutCollector::new(view, 4);
+        let msg = timeout_signing_message(view);
+        let sig = sks[0].sign(&msg);
+
+        // First add succeeds
+        collector
+            .add_timeout(0, sig.clone(), genesis_qc.clone())
+            .expect("first timeout should succeed");
+
+        // Duplicate add returns DuplicateVote
+        let sig2 = sks[0].sign(&msg);
+        let result = collector.add_timeout(0, sig2, genesis_qc.clone());
+        assert!(result.is_err(), "duplicate timeout should return error");
+        match result.unwrap_err() {
+            ConsensusError::DuplicateVote { view: v, validator_index } => {
+                assert_eq!(v, view);
+                assert_eq!(validator_index, 0);
+            }
+            other => panic!("expected DuplicateVote, got: {:?}", other),
+        }
+    }
+
+    /// TimeoutCollector::view() should return the view passed at construction.
+    #[test]
+    fn test_timeout_collector_view_getter() {
+        let view = 42u64;
+        let collector = TimeoutCollector::new(view, 4);
+        assert_eq!(collector.view(), view, "view() should return construction view");
+
+        let collector2 = TimeoutCollector::new(0, 7);
+        assert_eq!(collector2.view(), 0, "view() should return 0 for genesis view");
     }
 }
