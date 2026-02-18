@@ -168,3 +168,120 @@ where
         self.recently_imported_set.insert(hash);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Standalone dedup tracker that mirrors TxPoolBridge's internal logic,
+    /// allowing us to test the dedup mechanism without a full TransactionPool.
+    struct DedupTracker {
+        order: VecDeque<B256>,
+        set: HashSet<B256>,
+    }
+
+    impl DedupTracker {
+        fn new() -> Self {
+            Self {
+                order: VecDeque::with_capacity(RECENT_TX_CAPACITY),
+                set: HashSet::with_capacity(RECENT_TX_CAPACITY),
+            }
+        }
+
+        fn is_recently_imported(&self, hash: &B256) -> bool {
+            self.set.contains(hash)
+        }
+
+        fn mark_imported(&mut self, hash: B256) {
+            if self.order.len() >= RECENT_TX_CAPACITY {
+                if let Some(evicted) = self.order.pop_front() {
+                    self.set.remove(&evicted);
+                }
+            }
+            self.order.push_back(hash);
+            self.set.insert(hash);
+        }
+    }
+
+    #[test]
+    fn test_mark_imported_basic() {
+        let mut tracker = DedupTracker::new();
+        let h1 = B256::repeat_byte(0x01);
+        let h2 = B256::repeat_byte(0x02);
+
+        assert!(!tracker.is_recently_imported(&h1));
+        tracker.mark_imported(h1);
+        assert!(tracker.is_recently_imported(&h1));
+        assert!(!tracker.is_recently_imported(&h2));
+    }
+
+    #[test]
+    fn test_mark_imported_eviction() {
+        let mut tracker = DedupTracker::new();
+
+        // Fill to capacity
+        for i in 0..RECENT_TX_CAPACITY {
+            let mut bytes = [0u8; 32];
+            bytes[0..8].copy_from_slice(&(i as u64).to_le_bytes());
+            tracker.mark_imported(B256::from(bytes));
+        }
+        assert_eq!(tracker.order.len(), RECENT_TX_CAPACITY);
+        assert_eq!(tracker.set.len(), RECENT_TX_CAPACITY);
+
+        // The first hash should still be present
+        let first_hash = B256::from({
+            let mut b = [0u8; 32];
+            b[0..8].copy_from_slice(&0u64.to_le_bytes());
+            b
+        });
+        assert!(tracker.is_recently_imported(&first_hash));
+
+        // Add one more → should evict the first
+        let overflow = B256::repeat_byte(0xFF);
+        tracker.mark_imported(overflow);
+        assert!(!tracker.is_recently_imported(&first_hash), "first hash should be evicted");
+        assert!(tracker.is_recently_imported(&overflow));
+        assert_eq!(tracker.order.len(), RECENT_TX_CAPACITY);
+        assert_eq!(tracker.set.len(), RECENT_TX_CAPACITY);
+    }
+
+    #[test]
+    fn test_dedup_set_consistency() {
+        let mut tracker = DedupTracker::new();
+        let h1 = B256::repeat_byte(0x01);
+
+        // Double insert: VecDeque gets 2 entries, HashSet stays at 1
+        tracker.mark_imported(h1);
+        tracker.mark_imported(h1);
+        assert!(tracker.is_recently_imported(&h1));
+    }
+
+    #[test]
+    fn test_eviction_fifo_order() {
+        let mut tracker = DedupTracker::new();
+
+        // Insert 3 hashes
+        let h1 = B256::repeat_byte(0x01);
+        let h2 = B256::repeat_byte(0x02);
+        let h3 = B256::repeat_byte(0x03);
+
+        // Fill to capacity first
+        for i in 0..RECENT_TX_CAPACITY - 3 {
+            let mut bytes = [0u8; 32];
+            bytes[0..8].copy_from_slice(&(i as u64 + 100).to_le_bytes());
+            tracker.mark_imported(B256::from(bytes));
+        }
+        tracker.mark_imported(h1);
+        tracker.mark_imported(h2);
+        tracker.mark_imported(h3);
+        assert_eq!(tracker.order.len(), RECENT_TX_CAPACITY);
+
+        // Overflow: the oldest filler entries get evicted first, not h1/h2/h3
+        let overflow = B256::repeat_byte(0xFF);
+        tracker.mark_imported(overflow);
+        assert!(tracker.is_recently_imported(&h1));
+        assert!(tracker.is_recently_imported(&h2));
+        assert!(tracker.is_recently_imported(&h3));
+        assert!(tracker.is_recently_imported(&overflow));
+    }
+}

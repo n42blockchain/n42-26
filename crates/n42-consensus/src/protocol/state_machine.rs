@@ -567,11 +567,11 @@ impl ConsensusEngine {
         // Check if the block has already been imported (BlockData arrived before Proposal).
         // Reference: Aptos Baby Raptr — "if local data exists, vote immediately".
         if self.imported_blocks.remove(&proposal.block_hash) {
-            tracing::info!(view, block_hash = %proposal.block_hash, "received valid proposal, block already imported, voting immediately");
+            tracing::debug!(view, block_hash = %proposal.block_hash, "received valid proposal, block already imported, voting immediately");
             self.send_vote(view, proposal.block_hash)?;
         } else {
             // Defer the vote until BlockImported arrives.
-            tracing::info!(view, block_hash = %proposal.block_hash, "received valid proposal, deferring vote until block data imported");
+            tracing::debug!(view, block_hash = %proposal.block_hash, "received valid proposal, deferring vote until block data imported");
             self.pending_proposal = Some(PendingProposal {
                 view: proposal.view,
                 block_hash: proposal.block_hash,
@@ -742,7 +742,7 @@ impl ConsensusEngine {
         self.round_state.update_locked_qc(&pqc.qc);
         self.round_state.enter_pre_commit();
 
-        tracing::info!(view, block_hash = %pqc.block_hash, "received valid PrepareQC, sending commit vote");
+        tracing::debug!(view, block_hash = %pqc.block_hash, "received valid PrepareQC, sending commit vote");
 
         // Send CommitVote (Round 2) to leader
         let commit_msg = commit_signing_message(view, &pqc.block_hash);
@@ -1147,7 +1147,7 @@ impl ConsensusEngine {
         if let Some(pending) = self.pending_proposal.take() {
             if pending.block_hash == block_hash {
                 // Case 1: Proposal arrived first, BlockData arrived now → send deferred vote
-                tracing::info!(
+                tracing::debug!(
                     view = pending.view, %block_hash,
                     "block imported, sending deferred vote"
                 );

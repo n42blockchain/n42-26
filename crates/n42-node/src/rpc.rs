@@ -318,3 +318,110 @@ impl N42ApiServer for N42RpcServer {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use n42_consensus::ValidatorSet;
+    use n42_chainspec::ValidatorInfo;
+    use alloy_primitives::Address;
+    use n42_primitives::{BlsSecretKey, QuorumCertificate};
+
+    fn make_rpc() -> N42RpcServer {
+        let vs = ValidatorSet::new(&[], 0);
+        let state = Arc::new(SharedConsensusState::new(vs));
+        N42RpcServer::new(state)
+    }
+
+    fn make_rpc_with_validators(count: usize) -> N42RpcServer {
+        let mut validators = Vec::new();
+        for _ in 0..count {
+            let sk = BlsSecretKey::random().unwrap();
+            validators.push(ValidatorInfo {
+                address: Address::ZERO,
+                bls_public_key: sk.public_key(),
+            });
+        }
+        let vs = ValidatorSet::new(&validators, 0);
+        let state = Arc::new(SharedConsensusState::new(vs));
+        N42RpcServer::new(state)
+    }
+
+    fn make_qc(view: u64, block_hash: B256) -> QuorumCertificate {
+        let mut qc = QuorumCertificate::genesis();
+        qc.view = view;
+        qc.block_hash = block_hash;
+        qc
+    }
+
+    #[tokio::test]
+    async fn test_consensus_status_empty() {
+        let rpc = make_rpc();
+        let status = rpc.consensus_status().await.unwrap();
+        assert!(!status.has_committed_qc);
+        assert!(status.latest_committed_view.is_none());
+        assert!(status.latest_committed_block_hash.is_none());
+        assert_eq!(status.validator_count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_consensus_status_with_qc() {
+        let vs = ValidatorSet::new(&[], 0);
+        let state = Arc::new(SharedConsensusState::new(vs));
+        state.update_committed_qc(make_qc(42, B256::repeat_byte(0xAB)));
+
+        let rpc = N42RpcServer::new(state);
+        let status = rpc.consensus_status().await.unwrap();
+        assert!(status.has_committed_qc);
+        assert_eq!(status.latest_committed_view, Some(42));
+        assert!(status.latest_committed_block_hash.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_validator_set_response() {
+        let rpc = make_rpc_with_validators(3);
+        let result = rpc.validator_set().await.unwrap();
+        assert_eq!(result.len(), 3);
+        for (i, v) in result.iter().enumerate() {
+            assert_eq!(v.index, i as u32);
+            assert!(!v.public_key.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_health_syncing() {
+        let rpc = make_rpc();
+        let health = rpc.health().await.unwrap();
+        assert_eq!(health.status, "syncing");
+        assert!(!health.has_committed_qc);
+    }
+
+    #[tokio::test]
+    async fn test_health_ok() {
+        let vs = ValidatorSet::new(&[], 0);
+        let state = Arc::new(SharedConsensusState::new(vs));
+        state.update_committed_qc(make_qc(1, B256::ZERO));
+
+        let rpc = N42RpcServer::new(state);
+        let health = rpc.health().await.unwrap();
+        assert_eq!(health.status, "ok");
+        assert!(health.has_committed_qc);
+    }
+
+    #[tokio::test]
+    async fn test_attestation_stats_empty() {
+        let rpc = make_rpc();
+        let stats = rpc.attestation_stats().await.unwrap();
+        assert_eq!(stats.total_attestations, 0);
+        assert!(stats.earliest_block.is_none());
+        assert!(stats.latest_block.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_equivocations_empty() {
+        let rpc = make_rpc();
+        let result = rpc.equivocations().await.unwrap();
+        assert_eq!(result.total, 0);
+        assert!(result.evidence.is_empty());
+    }
+}

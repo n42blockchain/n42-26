@@ -28,6 +28,8 @@ pub struct N42Behaviour {
     /// Kademlia DHT for WAN peer discovery (production).
     /// Wrapped in Toggle so it can be disabled in dev/test.
     pub kademlia: Toggle<libp2p::kad::Behaviour<libp2p::kad::store::MemoryStore>>,
+    /// Connection limits to prevent fd exhaustion from excessive peers.
+    pub connection_limits: libp2p::connection_limits::Behaviour,
 }
 
 /// Configuration for the N42 network transport.
@@ -49,6 +51,12 @@ pub struct TransportConfig {
     pub enable_mdns: bool,
     /// Enable Kademlia DHT for WAN peer discovery (production).
     pub enable_kademlia: bool,
+    /// Maximum number of established incoming connections (default: 128).
+    pub max_established_incoming: u32,
+    /// Maximum number of established outgoing connections (default: 64).
+    pub max_established_outgoing: u32,
+    /// Maximum total number of established connections (default: 192).
+    pub max_established_total: u32,
 }
 
 impl TransportConfig {
@@ -84,6 +92,9 @@ impl TransportConfig {
             mesh_outbound_min,
             enable_mdns: false,
             enable_kademlia: false,
+            max_established_incoming: 128,
+            max_established_outgoing: 64,
+            max_established_total: 192,
         }
     }
 }
@@ -99,6 +110,9 @@ impl Default for TransportConfig {
             mesh_outbound_min: 2,
             enable_mdns: false,
             enable_kademlia: false,
+            max_established_incoming: 128,
+            max_established_outgoing: 64,
+            max_established_total: 192,
         }
     }
 }
@@ -244,7 +258,13 @@ pub fn build_swarm_with_validator_index(
                 Toggle::from(None)
             };
 
-            Ok(N42Behaviour { gossipsub, identify, state_sync, mdns, kademlia })
+            let limits = libp2p::connection_limits::ConnectionLimits::default()
+                .with_max_established_incoming(Some(config.max_established_incoming))
+                .with_max_established_outgoing(Some(config.max_established_outgoing))
+                .with_max_established(Some(config.max_established_total));
+            let connection_limits = libp2p::connection_limits::Behaviour::new(limits);
+
+            Ok(N42Behaviour { gossipsub, identify, state_sync, mdns, kademlia, connection_limits })
         })
         .map_err(|e| eyre::eyre!("swarm builder error: {e}"))?
         .with_swarm_config(|cfg| {

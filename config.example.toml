@@ -75,12 +75,65 @@
 # At 8s slots, 10000 blocks ≈ 22 hours.
 # N42_SYNC_BUFFER_SIZE = "10000"
 
-# ── Genesis ──
+# ── Genesis / Chain Spec ──
 
-# Path to custom genesis JSON file for production deployments.
-# When set, overrides the default empty genesis.
-# The file should contain standard Ethereum genesis format with "alloc" field.
+# N42 uses reth's --chain flag for chain specification (genesis + chain params).
+# Usage: n42-node node --chain /etc/n42/genesis.json
+#
+# The genesis file follows standard Ethereum genesis format:
+# {
+#   "config": {
+#     "chainId": 42,
+#     "homesteadBlock": 0,
+#     "eip150Block": 0,
+#     "eip155Block": 0,
+#     "eip158Block": 0,
+#     "shanghaiTime": 0
+#   },
+#   "alloc": {
+#     "0x...": { "balance": "1000000000000000000" }
+#   },
+#   "coinbase": "0x0000000000000000000000000000000000000000",
+#   "difficulty": "0x1",
+#   "gasLimit": "0x1c9c380",
+#   "nonce": "0x42",
+#   "timestamp": "0x0"
+# }
+#
+# Built-in chains: --chain mainnet | sepolia | holesky
+# Custom chain: --chain /path/to/genesis.json
+#
+# Legacy env var (still supported, sets --chain internally):
 # N42_GENESIS_FILE = "/etc/n42/genesis.json"
+
+# ── Metrics (Prometheus) ──
+
+# N42 exposes custom Prometheus metrics via reth's built-in --metrics flag.
+# Usage: n42-node node --metrics 0.0.0.0:9001
+# Then scrape: curl http://127.0.0.1:9001/metrics
+#
+# Custom N42 metric names (in addition to reth's standard metrics):
+#
+#   Consensus:
+#     n42_blocks_committed_total    — blocks committed by this validator
+#     n42_consensus_view            — current consensus view number
+#     n42_view_timeouts_total       — number of view timeout events
+#     n42_view_changes_total        — number of view change events
+#     n42_empty_block_skips_total   — blocks skipped due to empty payload
+#     n42_equivocations_detected_total — equivocation (double-vote) detections
+#     n42_consensus_messages_received  — total consensus messages received
+#     n42_sync_requests_served_total   — state sync requests served
+#
+#   Network:
+#     n42_connected_peers           — current number of connected P2P peers
+#     n42_broadcast_messages_sent   — gossipsub broadcast messages sent
+#     n42_direct_messages_sent      — direct messages sent
+#     n42_reconnection_attempts     — automatic reconnection attempts
+#
+#   Mobile:
+#     n42_mobile_connected_phones       — current connected mobile verifiers
+#     n42_mobile_valid_receipts_total    — valid verification receipts received
+#     n42_mobile_invalid_receipts_total  — invalid verification receipts received
 
 # ── RPC (reth defaults) ──
 

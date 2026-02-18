@@ -409,6 +409,11 @@ impl NetworkService {
             SwarmEvent::Behaviour(N42BehaviourEvent::Kademlia(event)) => {
                 self.handle_kademlia_event(event);
             }
+            SwarmEvent::Behaviour(N42BehaviourEvent::ConnectionLimits(event)) => {
+                // connection_limits::Behaviour emits void::Void — unreachable at runtime
+                // but required by the exhaustive match on N42BehaviourEvent.
+                match event {}
+            }
             SwarmEvent::Behaviour(N42BehaviourEvent::Mdns(event)) => {
                 self.handle_mdns_event(event);
             }

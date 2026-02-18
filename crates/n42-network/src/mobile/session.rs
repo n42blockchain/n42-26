@@ -96,3 +96,64 @@ impl MobileSession {
         self.cached_code_hashes.contains(code_hash)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_session_creation() {
+        let pubkey = [0xAA; 48];
+        let session = MobileSession::new(42, pubkey);
+        assert_eq!(session.session_id, 42);
+        assert_eq!(session.verifier_pubkey, pubkey);
+        assert_eq!(session.packets_sent.load(Ordering::Relaxed), 0);
+        assert_eq!(session.receipts_received.load(Ordering::Relaxed), 0);
+        assert!(session.cached_code_hashes.is_empty());
+    }
+
+    #[test]
+    fn test_record_receipt_and_packet() {
+        let session = MobileSession::new(1, [0u8; 48]);
+
+        session.record_receipt();
+        session.record_receipt();
+        assert_eq!(session.receipts_received.load(Ordering::Relaxed), 2);
+
+        session.record_packet_sent();
+        assert_eq!(session.packets_sent.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn test_idle_duration() {
+        let session = MobileSession::new(1, [0u8; 48]);
+        // Initially idle_duration ≈ duration since connected
+        let idle = session.idle_duration();
+        assert!(idle.as_millis() < 100, "fresh session should have near-zero idle");
+
+        // Touch should reduce idle time
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        session.touch();
+        let idle_after_touch = session.idle_duration();
+        assert!(idle_after_touch.as_millis() < 50);
+    }
+
+    #[test]
+    fn test_cache_inventory() {
+        let mut session = MobileSession::new(1, [0u8; 48]);
+        let hash1 = B256::repeat_byte(0x01);
+        let hash2 = B256::repeat_byte(0x02);
+        let hash3 = B256::repeat_byte(0x03);
+
+        assert!(!session.has_cached(&hash1));
+
+        let mut cache = HashSet::new();
+        cache.insert(hash1);
+        cache.insert(hash2);
+        session.update_cache_inventory(cache);
+
+        assert!(session.has_cached(&hash1));
+        assert!(session.has_cached(&hash2));
+        assert!(!session.has_cached(&hash3));
+    }
+}
