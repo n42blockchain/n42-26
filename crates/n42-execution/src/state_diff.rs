@@ -9,14 +9,14 @@ use std::collections::BTreeMap;
 /// - Light node incremental sync
 /// - Mobile device state updates
 /// - Audit/debugging of state transitions
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct StateDiff {
     /// Per-account changes in this block.
     pub accounts: BTreeMap<Address, AccountDiff>,
 }
 
 /// Changes to a single account in a block.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AccountDiff {
     /// The type of change to this account.
     pub change_type: AccountChangeType,
@@ -31,7 +31,7 @@ pub struct AccountDiff {
 }
 
 /// Type of account-level change.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum AccountChangeType {
     /// Account was created in this block.
     Created,
@@ -42,7 +42,7 @@ pub enum AccountChangeType {
 }
 
 /// A before/after pair for tracking a value change.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ValueChange<T> {
     /// Value before the block execution.
     pub from: T,
@@ -423,6 +423,60 @@ mod tests {
             .expect("should have code change");
         assert_eq!(code_change.from, Some(old_hash));
         assert_eq!(code_change.to, Some(new_hash));
+    }
+
+    #[test]
+    fn test_state_diff_serde_json_roundtrip() {
+        let addr = Address::with_last_byte(1);
+        let mut diff = StateDiff::default();
+        diff.accounts.insert(addr, AccountDiff {
+            change_type: AccountChangeType::Created,
+            balance: Some(ValueChange::new(U256::ZERO, U256::from(1000))),
+            nonce: Some(ValueChange::new(0u64, 1u64)),
+            code_change: None,
+            storage: BTreeMap::new(),
+        });
+
+        let json = serde_json::to_string(&diff).expect("json serialize");
+        let deserialized: StateDiff = serde_json::from_str(&json).expect("json deserialize");
+
+        assert_eq!(deserialized.len(), 1);
+        let account = deserialized.accounts.get(&addr).unwrap();
+        assert_eq!(account.change_type, AccountChangeType::Created);
+        assert_eq!(account.balance.unwrap().to, U256::from(1000));
+    }
+
+    #[test]
+    fn test_state_diff_bincode_roundtrip() {
+        let addr = Address::with_last_byte(2);
+        let mut storage = BTreeMap::new();
+        storage.insert(U256::from(0), ValueChange::new(U256::from(10), U256::from(20)));
+
+        let mut diff = StateDiff::default();
+        diff.accounts.insert(addr, AccountDiff {
+            change_type: AccountChangeType::Modified,
+            balance: Some(ValueChange::new(U256::from(100), U256::from(200))),
+            nonce: Some(ValueChange::new(5u64, 6u64)),
+            code_change: Some(ValueChange::new(Some(B256::repeat_byte(0xAA)), Some(B256::repeat_byte(0xBB)))),
+            storage,
+        });
+
+        let encoded = bincode::serialize(&diff).expect("bincode serialize");
+        let decoded: StateDiff = bincode::deserialize(&encoded).expect("bincode deserialize");
+
+        assert_eq!(decoded.len(), 1);
+        let account = decoded.accounts.get(&addr).unwrap();
+        assert_eq!(account.change_type, AccountChangeType::Modified);
+        assert_eq!(account.storage.len(), 1);
+    }
+
+    #[test]
+    fn test_account_change_type_serde_roundtrip() {
+        for variant in [AccountChangeType::Created, AccountChangeType::Modified, AccountChangeType::Destroyed] {
+            let json = serde_json::to_string(&variant).expect("serialize");
+            let deserialized: AccountChangeType = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(variant, deserialized);
+        }
     }
 
     #[test]

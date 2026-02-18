@@ -28,6 +28,8 @@ const RECEIPT_READ_TIMEOUT: Duration = Duration::from_secs(10);
 /// Each phone sends ~1 receipt per 8s slot; 2s allows up to 4/slot (4x headroom).
 const MIN_RECEIPT_INTERVAL: Duration = Duration::from_secs(2);
 
+
+
 /// Commands sent to the star hub from the node layer.
 #[derive(Debug)]
 pub enum HubCommand {
@@ -220,6 +222,7 @@ impl StarHub {
     pub async fn run(mut self) -> eyre::Result<()> {
         let (server_config, cert_hash) = build_server_config(
             self.config.cert_dir.as_deref(),
+            self.config.idle_timeout_secs,
         )?;
         self.cert_hash = Some(cert_hash);
         tracing::info!(
@@ -269,6 +272,7 @@ impl StarHub {
                                 sessions,
                                 event_tx,
                                 broadcast_rx,
+                                max_conns,
                             )
                             .await;
                         }
@@ -319,6 +323,7 @@ async fn handle_phone_connection(
     sessions: Arc<RwLock<HashMap<u64, MobileSession>>>,
     event_tx: mpsc::UnboundedSender<HubEvent>,
     mut broadcast_rx: broadcast::Receiver<BroadcastMsg>,
+    max_connections: usize,
 ) {
     tracing::debug!(
         session_id,
@@ -373,9 +378,19 @@ async fn handle_phone_connection(
         return;
     }
 
-    // Create session and notify node layer
+    // Create session and notify node layer.
+    // Re-check connection limit under write lock to close the TOCTOU window
+    // between the initial read-lock check and actual session insertion.
     let session = MobileSession::new(session_id, verifier_pubkey);
-    sessions.write().await.insert(session_id, session);
+    {
+        let mut guard = sessions.write().await;
+        if guard.len() >= max_connections {
+            tracing::warn!(session_id, "connection limit reached during session insert, closing");
+            connection.close(2u32.into(), b"server full");
+            return;
+        }
+        guard.insert(session_id, session);
+    }
 
     let _ = event_tx.send(HubEvent::PhoneConnected {
         session_id,
@@ -428,9 +443,9 @@ async fn handle_phone_connection(
                                 {
                                     Ok(receipt) => {
                                         last_receipt_at = Some(now);
-                                        if let Some(session) = sessions.write().await.get_mut(&session_id) {
-                                            session.receipts_received += 1;
-                                            session.touch();
+                                        // P2 fix: read lock + atomic counter instead of write lock
+                                        if let Some(session) = sessions.read().await.get(&session_id) {
+                                            session.record_receipt();
                                         }
                                         let _ = event_tx.send(HubEvent::ReceiptReceived(receipt));
                                     }
@@ -476,9 +491,9 @@ async fn handle_phone_connection(
                                     tracing::debug!(session_id, "failed to send broadcast, disconnecting");
                                     break;
                                 }
-                                if let Some(session) = sessions.write().await.get_mut(&session_id) {
-                                    session.packets_sent += 1;
-                                    session.touch();
+                                // P2 fix: read lock + atomic counter instead of write lock
+                                if let Some(session) = sessions.read().await.get(&session_id) {
+                                    session.record_packet_sent();
                                 }
                             }
                             Err(e) => {
@@ -515,6 +530,7 @@ async fn handle_phone_connection(
 /// Returns `(ServerConfig, SHA-256 hash of the DER-encoded certificate)`.
 fn build_server_config(
     cert_dir: Option<&std::path::Path>,
+    idle_timeout_secs: u64,
 ) -> eyre::Result<(quinn::ServerConfig, [u8; 32])> {
     use sha2::{Sha256, Digest};
 
@@ -541,6 +557,16 @@ fn build_server_config(
             std::fs::create_dir_all(dir)?;
             std::fs::write(&cert_path, cert_der.as_ref())?;
             std::fs::write(&key_path, &key_bytes)?;
+
+            // Restrict private key file permissions (owner read/write only).
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let perms = std::fs::Permissions::from_mode(0o600);
+                if let Err(e) = std::fs::set_permissions(&key_path, perms) {
+                    tracing::warn!(error = %e, "failed to set private key file permissions");
+                }
+            }
             tracing::info!("generated and saved StarHub certificate to {:?}", cert_path);
             (cert_der, key_der)
         }
@@ -572,9 +598,15 @@ fn build_server_config(
 
     // Tune transport config for many concurrent connections
     let mut transport = quinn::TransportConfig::default();
-    transport.max_idle_timeout(Some(
-        quinn::IdleTimeout::try_from(std::time::Duration::from_secs(300)).unwrap(),
-    ));
+    let idle_duration = std::time::Duration::from_secs(idle_timeout_secs);
+    if let Ok(idle_timeout) = quinn::IdleTimeout::try_from(idle_duration) {
+        transport.max_idle_timeout(Some(idle_timeout));
+    } else {
+        tracing::warn!(
+            idle_timeout_secs,
+            "idle_timeout_secs exceeds QUIC max, using default"
+        );
+    }
     server_config.transport_config(Arc::new(transport));
 
     Ok((server_config, cert_hash))

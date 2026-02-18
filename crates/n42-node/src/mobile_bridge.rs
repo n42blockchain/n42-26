@@ -1,6 +1,8 @@
 use alloy_primitives::B256;
+use metrics::{counter, gauge};
 use n42_mobile::{ReceiptAggregator, VerificationReceipt};
 use n42_network::mobile::HubEvent;
+use std::collections::{HashMap, HashSet};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
@@ -31,13 +33,16 @@ pub struct MobileVerificationBridge {
     /// Aggregates verification receipts from mobile verifiers.
     receipt_aggregator: ReceiptAggregator,
     /// Optional sender for attestation notifications.
-    attestation_tx: Option<mpsc::UnboundedSender<AttestationEvent>>,
+    attestation_tx: Option<mpsc::Sender<AttestationEvent>>,
     /// Optional sender for notifying when a new phone connects.
     /// Used by `mobile_packet_loop` to trigger CacheSyncMessage broadcast.
-    phone_connected_tx: Option<mpsc::UnboundedSender<()>>,
-    /// Number of currently connected mobile verifiers.
-    /// Used to dynamically adjust the attestation threshold.
-    connected_count: u32,
+    phone_connected_tx: Option<mpsc::Sender<()>>,
+    /// Currently connected session IDs, used to derive connected_count accurately.
+    /// Prevents count drift from duplicate connect/disconnect events.
+    connected_sessions: HashSet<u64>,
+    /// Tracks invalid receipt counts per block hash for divergence detection.
+    /// Key: block_hash, Value: count of invalid receipts.
+    invalid_receipt_counts: HashMap<B256, u32>,
 }
 
 impl MobileVerificationBridge {
@@ -55,7 +60,8 @@ impl MobileVerificationBridge {
             receipt_aggregator: ReceiptAggregator::new(default_threshold, max_tracked_blocks),
             attestation_tx: None,
             phone_connected_tx: None,
-            connected_count: 0,
+            connected_sessions: HashSet::new(),
+            invalid_receipt_counts: HashMap::new(),
         }
     }
 
@@ -66,7 +72,7 @@ impl MobileVerificationBridge {
     /// events to track mobile verification status.
     pub fn with_attestation_tx(
         mut self,
-        tx: mpsc::UnboundedSender<AttestationEvent>,
+        tx: mpsc::Sender<AttestationEvent>,
     ) -> Self {
         self.attestation_tx = Some(tx);
         self
@@ -79,7 +85,7 @@ impl MobileVerificationBridge {
     /// CacheSyncMessage broadcasts (sending cached bytecodes to new phones).
     pub fn with_phone_connected_tx(
         mut self,
-        tx: mpsc::UnboundedSender<()>,
+        tx: mpsc::Sender<()>,
     ) -> Self {
         self.phone_connected_tx = Some(tx);
         self
@@ -95,26 +101,34 @@ impl MobileVerificationBridge {
         while let Some(event) = self.hub_event_rx.recv().await {
             match event {
                 HubEvent::PhoneConnected { session_id, .. } => {
-                    self.connected_count += 1;
+                    self.connected_sessions.insert(session_id);
+                    gauge!("n42_mobile_connected_phones").set(self.connected_sessions.len() as f64);
                     self.update_dynamic_threshold();
                     debug!(
                         target: "n42::mobile",
                         session_id,
-                        connected = self.connected_count,
+                        connected = self.connected_sessions.len(),
                         "mobile verifier connected"
                     );
                     // Notify mobile_packet_loop to send CacheSyncMessage.
                     if let Some(ref tx) = self.phone_connected_tx {
-                        let _ = tx.send(());
+                        let _ = tx.try_send(());
                     }
                 }
                 HubEvent::PhoneDisconnected { session_id } => {
-                    self.connected_count = self.connected_count.saturating_sub(1);
+                    if !self.connected_sessions.remove(&session_id) {
+                        tracing::warn!(
+                            target: "n42::mobile",
+                            session_id,
+                            "disconnect for unknown session (duplicate event?)"
+                        );
+                    }
+                    gauge!("n42_mobile_connected_phones").set(self.connected_sessions.len() as f64);
                     self.update_dynamic_threshold();
                     debug!(
                         target: "n42::mobile",
                         session_id,
-                        connected = self.connected_count,
+                        connected = self.connected_sessions.len(),
                         "mobile verifier disconnected"
                     );
                 }
@@ -147,12 +161,13 @@ impl MobileVerificationBridge {
     /// This ensures BFT-grade security (2/3 threshold) when enough phones are connected,
     /// while maintaining a minimum of 10 during early deployment.
     fn update_dynamic_threshold(&mut self) {
-        let dynamic = self.connected_count * 2 / 3;
+        let connected = self.connected_sessions.len() as u32;
+        let dynamic = connected * 2 / 3;
         let threshold = dynamic.max(MIN_ATTESTATION_THRESHOLD);
         self.receipt_aggregator.set_default_threshold(threshold);
         debug!(
             target: "n42::mobile",
-            connected = self.connected_count,
+            connected,
             threshold,
             "attestation threshold updated"
         );
@@ -171,6 +186,41 @@ impl MobileVerificationBridge {
                 "receipt signature invalid, dropping"
             );
             return;
+        }
+
+        // Track valid vs invalid receipts via metrics.
+        if receipt.is_valid() {
+            counter!("n42_mobile_valid_receipts_total").increment(1);
+        } else {
+            counter!("n42_mobile_invalid_receipts_total").increment(1);
+            warn!(
+                target: "n42::mobile",
+                block_number = receipt.block_number,
+                %receipt.block_hash,
+                state_root_match = receipt.state_root_match,
+                receipts_root_match = receipt.receipts_root_match,
+                "mobile verifier reported INVALID block execution"
+            );
+
+            // Track invalid count per block for divergence detection.
+            let count = self.invalid_receipt_counts
+                .entry(receipt.block_hash)
+                .or_insert(0);
+            *count += 1;
+
+            // Alert if invalid receipts exceed connected_count / 3 (potential state divergence).
+            let connected = self.connected_sessions.len() as u32;
+            let threshold = if connected > 0 { connected / 3 } else { 1 };
+            if *count >= threshold && threshold > 0 {
+                tracing::error!(
+                    target: "n42::mobile",
+                    block_number = receipt.block_number,
+                    %receipt.block_hash,
+                    invalid_count = *count,
+                    connected,
+                    "CRITICAL: potential state divergence — invalid receipts exceeded 1/3 of connected verifiers"
+                );
+            }
         }
 
         // Register block if not yet tracked.
@@ -198,7 +248,7 @@ impl MobileVerificationBridge {
 
                 // Notify the orchestrator (if channel is configured).
                 if let Some(ref tx) = self.attestation_tx {
-                    let _ = tx.send(AttestationEvent {
+                    let _ = tx.try_send(AttestationEvent {
                         block_hash: receipt.block_hash,
                         block_number: receipt.block_number,
                         valid_count,
@@ -268,7 +318,7 @@ mod tests {
     #[test]
     fn test_bridge_attestation_notification() {
         let (tx, rx) = mpsc::unbounded_channel();
-        let (attest_tx, mut attest_rx) = mpsc::unbounded_channel();
+        let (attest_tx, mut attest_rx) = mpsc::channel(256);
         let mut bridge = MobileVerificationBridge::new(rx, 1, 100)
             .with_attestation_tx(attest_tx);
 

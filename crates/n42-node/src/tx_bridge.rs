@@ -2,7 +2,7 @@ use alloy_primitives::B256;
 use reth_ethereum_primitives::TransactionSigned;
 use reth_primitives_traits::SignedTransaction;
 use reth_transaction_pool::{TransactionPool, PoolTransaction, EthPooledTransaction};
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
@@ -23,11 +23,13 @@ pub struct TxPoolBridge<Pool> {
     /// The local transaction pool.
     pool: Pool,
     /// Receives raw transaction bytes from the network (via orchestrator).
-    import_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    import_rx: mpsc::Receiver<Vec<u8>>,
     /// Sends raw transaction bytes to the orchestrator for broadcasting.
-    broadcast_tx: mpsc::UnboundedSender<Vec<u8>>,
-    /// Recently imported transaction hashes (ring buffer for dedup).
-    recently_imported: VecDeque<B256>,
+    broadcast_tx: mpsc::Sender<Vec<u8>>,
+    /// Recently imported transaction hashes — VecDeque maintains insertion order
+    /// for FIFO eviction, HashSet provides O(1) lookups (replaces O(n) VecDeque::contains).
+    recently_imported_order: VecDeque<B256>,
+    recently_imported_set: HashSet<B256>,
 }
 
 impl<Pool> TxPoolBridge<Pool>
@@ -37,14 +39,15 @@ where
     /// Creates a new TxPoolBridge.
     pub fn new(
         pool: Pool,
-        import_rx: mpsc::UnboundedReceiver<Vec<u8>>,
-        broadcast_tx: mpsc::UnboundedSender<Vec<u8>>,
+        import_rx: mpsc::Receiver<Vec<u8>>,
+        broadcast_tx: mpsc::Sender<Vec<u8>>,
     ) -> Self {
         Self {
             pool,
             import_rx,
             broadcast_tx,
-            recently_imported: VecDeque::with_capacity(RECENT_TX_CAPACITY),
+            recently_imported_order: VecDeque::with_capacity(RECENT_TX_CAPACITY),
+            recently_imported_set: HashSet::with_capacity(RECENT_TX_CAPACITY),
         }
     }
 
@@ -73,7 +76,7 @@ where
                                 let tx: &TransactionSigned = pooled_tx.transaction.transaction();
                                 let encoded = alloy_rlp::encode(tx);
                                 debug!(%tx_hash, bytes = encoded.len(), "broadcasting local transaction");
-                                let _ = self.broadcast_tx.send(encoded);
+                                let _ = self.broadcast_tx.try_send(encoded);
                             }
                         }
                         None => {
@@ -149,15 +152,19 @@ where
     }
 
     /// Checks if a transaction hash was recently imported from the network.
+    /// O(1) via HashSet lookup (previously O(n) via VecDeque::contains).
     fn is_recently_imported(&self, hash: &B256) -> bool {
-        self.recently_imported.contains(hash)
+        self.recently_imported_set.contains(hash)
     }
 
     /// Marks a transaction hash as recently imported.
     fn mark_imported(&mut self, hash: B256) {
-        if self.recently_imported.len() >= RECENT_TX_CAPACITY {
-            self.recently_imported.pop_front();
+        if self.recently_imported_order.len() >= RECENT_TX_CAPACITY {
+            if let Some(evicted) = self.recently_imported_order.pop_front() {
+                self.recently_imported_set.remove(&evicted);
+            }
         }
-        self.recently_imported.push_back(hash);
+        self.recently_imported_order.push_back(hash);
+        self.recently_imported_set.insert(hash);
     }
 }

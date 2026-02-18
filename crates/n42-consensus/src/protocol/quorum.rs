@@ -336,6 +336,21 @@ fn collect_signer_keys<'a>(
     view: ViewNumber,
     cert_kind: &str,
 ) -> ConsensusResult<Vec<&'a BlsPublicKey>> {
+    // Validate bitmap length matches the validator set to prevent short bitmaps
+    // from bypassing quorum checks (higher-indexed validators would be invisible).
+    let expected_len = validator_set.len() as usize;
+    if signers.len() != expected_len {
+        let reason = format!(
+            "signers bitmap length mismatch: got {}, expected {}",
+            signers.len(),
+            expected_len,
+        );
+        return match cert_kind {
+            "TC" => Err(ConsensusError::InvalidTC { view, reason }),
+            _ => Err(ConsensusError::InvalidQC { view, reason }),
+        };
+    }
+
     let signer_count = signers.iter().filter(|b| **b).count();
     if signer_count < quorum_size {
         let reason = format!("insufficient signers: have {signer_count}, need {quorum_size}");
@@ -384,6 +399,26 @@ pub fn commit_signing_message(view: ViewNumber, block_hash: &B256) -> Vec<u8> {
     msg.extend_from_slice(&view.to_le_bytes());
     msg.extend_from_slice(block_hash.as_slice());
     msg
+}
+
+/// Verifies a CommitQC (Round 2) against the validator set.
+///
+/// Unlike `verify_qc()` which uses the standard `signing_message` format
+/// (view || block_hash), this function uses `commit_signing_message` format
+/// ("commit" || view || block_hash) matching how CommitVotes are signed.
+pub fn verify_commit_qc(
+    qc: &QuorumCertificate,
+    validator_set: &ValidatorSet,
+) -> ConsensusResult<()> {
+    let quorum_size = validator_set.quorum_size();
+    let signer_pks = collect_signer_keys(&qc.signers, validator_set, quorum_size, qc.view, "QC")?;
+
+    let message = commit_signing_message(qc.view, &qc.block_hash);
+    AggregateSignature::verify_aggregate(&message, &qc.aggregate_signature, &signer_pks)
+        .map_err(|_| ConsensusError::InvalidQC {
+            view: qc.view,
+            reason: "commit QC aggregated signature verification failed".to_string(),
+        })
 }
 
 /// Verifies a TimeoutCertificate against the validator set.
@@ -800,5 +835,104 @@ mod tests {
         let tc = collector.build_tc(&vs).expect("TC should form");
         // high_qc should be genesis (view 0), not the invalid timeout's view 5
         assert_eq!(tc.high_qc.view, 0, "high_qc should come from valid timeouts only");
+    }
+
+    // ── CommitQC verification tests (S1/S2 fix) ──
+
+    /// verify_commit_qc should succeed for a valid CommitQC built with commit_signing_message.
+    #[test]
+    fn test_verify_commit_qc_valid() {
+        let (sks, vs) = test_validator_set(4);
+        let view = 10u64;
+        let block_hash = B256::repeat_byte(0xC1);
+
+        // Build a CommitQC using commit_signing_message format
+        let mut collector = VoteCollector::new(view, block_hash, vs.len());
+        let msg = commit_signing_message(view, &block_hash);
+        for i in 0..3u32 {
+            let sig = sks[i as usize].sign(&msg);
+            collector.add_vote(i, sig).unwrap();
+        }
+        let commit_qc = collector.build_qc_with_message(&vs, &msg).unwrap();
+
+        // verify_commit_qc should succeed
+        verify_commit_qc(&commit_qc, &vs).expect("verify_commit_qc should succeed for valid CommitQC");
+    }
+
+    /// verify_commit_qc should reject a CommitQC with insufficient signers.
+    #[test]
+    fn test_verify_commit_qc_insufficient_signers() {
+        let (sks, vs) = test_validator_set(4);
+        let view = 11u64;
+        let block_hash = B256::repeat_byte(0xC2);
+
+        // Build a QC with only 1 signer (quorum requires 3)
+        let msg = commit_signing_message(view, &block_hash);
+        let sig = sks[0].sign(&msg);
+        let agg_sig = AggregateSignature::aggregate(&[&sig]).unwrap();
+
+        let qc = QuorumCertificate {
+            view,
+            block_hash,
+            aggregate_signature: agg_sig,
+            signers: {
+                let mut bv = bitvec![u8, Msb0; 0; 4];
+                bv.set(0, true);
+                bv
+            },
+        };
+
+        let result = verify_commit_qc(&qc, &vs);
+        assert!(result.is_err(), "verify_commit_qc should fail with insufficient signers");
+        match result.unwrap_err() {
+            ConsensusError::InvalidQC { view: v, reason } => {
+                assert_eq!(v, view);
+                assert!(reason.contains("insufficient signers"), "got: {reason}");
+            }
+            other => panic!("expected InvalidQC, got: {:?}", other),
+        }
+    }
+
+    /// verify_qc() should REJECT a CommitQC (signed with commit format).
+    /// This ensures PrepareQC verification can't accidentally accept CommitQCs.
+    #[test]
+    fn test_verify_qc_rejects_commit_qc() {
+        let (sks, vs) = test_validator_set(4);
+        let view = 12u64;
+        let block_hash = B256::repeat_byte(0xC3);
+
+        // Build a QC using commit_signing_message format
+        let mut collector = VoteCollector::new(view, block_hash, vs.len());
+        let msg = commit_signing_message(view, &block_hash);
+        for i in 0..3u32 {
+            let sig = sks[i as usize].sign(&msg);
+            collector.add_vote(i, sig).unwrap();
+        }
+        let commit_qc = collector.build_qc_with_message(&vs, &msg).unwrap();
+
+        // verify_qc (prepare format) should FAIL for this CommitQC
+        let result = verify_qc(&commit_qc, &vs);
+        assert!(result.is_err(), "verify_qc should reject a CommitQC (different signing format)");
+    }
+
+    /// verify_commit_qc() should REJECT a PrepareQC (signed with standard format).
+    #[test]
+    fn test_verify_commit_qc_rejects_prepare_qc() {
+        let (sks, vs) = test_validator_set(4);
+        let view = 13u64;
+        let block_hash = B256::repeat_byte(0xC4);
+
+        // Build a QC using standard signing_message format (PrepareQC)
+        let mut collector = VoteCollector::new(view, block_hash, vs.len());
+        let msg = signing_message(view, &block_hash);
+        for i in 0..3u32 {
+            let sig = sks[i as usize].sign(&msg);
+            collector.add_vote(i, sig).unwrap();
+        }
+        let prepare_qc = collector.build_qc(&vs).unwrap();
+
+        // verify_commit_qc should FAIL for this PrepareQC
+        let result = verify_commit_qc(&prepare_qc, &vs);
+        assert!(result.is_err(), "verify_commit_qc should reject a PrepareQC (different signing format)");
     }
 }

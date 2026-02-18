@@ -63,6 +63,7 @@ eyre.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+metrics.workspace = true
 
 [dev-dependencies]
 libp2p.workspace = true

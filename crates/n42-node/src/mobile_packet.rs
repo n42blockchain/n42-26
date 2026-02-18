@@ -12,7 +12,7 @@ use reth_primitives_traits::NodePrimitives;
 use reth_provider::BlockHashReader;
 use alloy_eips::BlockHashOrNumber;
 use reth_storage_api::{BlockReader, StateProviderFactory, StateProvider, TransactionVariant};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -57,12 +57,59 @@ pub type BlockCommitNotification = (B256, u64);
 /// At ~20 codes per block and 8-second slots, 2000 entries covers ~100 blocks (~13 min).
 const MAX_PREVIOUSLY_SENT_CODES: usize = 2000;
 
+/// Insertion-order bounded code cache (P1 fix).
+///
+/// Evicts oldest entries (FIFO) when capacity is exceeded, unlike HashMap's
+/// arbitrary eviction which could remove recently-sent codes and cause
+/// unnecessary retransmission.
+struct CodeCache {
+    map: HashMap<B256, Bytes>,
+    order: VecDeque<B256>,
+    capacity: usize,
+}
+
+impl CodeCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            map: HashMap::new(),
+            order: VecDeque::new(),
+            capacity,
+        }
+    }
+
+    fn contains_key(&self, key: &B256) -> bool {
+        self.map.contains_key(key)
+    }
+
+    fn insert(&mut self, key: B256, value: Bytes) {
+        if self.map.contains_key(&key) {
+            return; // already present, no ordering change needed
+        }
+        self.map.insert(key, value);
+        self.order.push_back(key);
+        // Evict oldest entries if over capacity
+        while self.map.len() > self.capacity {
+            if let Some(old_key) = self.order.pop_front() {
+                self.map.remove(&old_key);
+            }
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&B256, &Bytes)> {
+        self.map.iter()
+    }
+}
+
 pub async fn mobile_packet_loop<P>(
-    mut rx: mpsc::UnboundedReceiver<BlockCommitNotification>,
+    mut rx: mpsc::Receiver<BlockCommitNotification>,
     provider: P,
     chain_spec: Arc<ChainSpec>,
     hub_handle: StarHubHandle,
-    mut phone_connected_rx: mpsc::UnboundedReceiver<()>,
+    mut phone_connected_rx: mpsc::Receiver<()>,
 ) where
     P: BlockReader<Block = <EthPrimitives as NodePrimitives>::Block>
         + StateProviderFactory
@@ -75,9 +122,10 @@ pub async fn mobile_packet_loop<P>(
     let evm_config = N42EvmConfig::new(chain_spec);
 
     // Track bytecodes that have been broadcast to phones.
-    // Subsequent blocks only transmit codes NOT in this map (differential).
+    // Subsequent blocks only transmit codes NOT in this cache (differential).
     // New phone connections trigger a CacheSyncMessage with all tracked codes.
-    let mut previously_sent_codes: HashMap<B256, Bytes> = HashMap::new();
+    // Uses insertion-order eviction (FIFO) to avoid dropping recently-sent codes.
+    let mut previously_sent_codes = CodeCache::new(MAX_PREVIOUSLY_SENT_CODES);
 
     loop {
         tokio::select! {
@@ -209,7 +257,7 @@ fn generate_and_broadcast<P>(
     hub_handle: &StarHubHandle,
     block_hash: B256,
     block_number: u64,
-    previously_sent_codes: &mut HashMap<B256, Bytes>,
+    previously_sent_codes: &mut CodeCache,
 ) -> Result<usize, MobilePacketError>
 where
     P: BlockReader<Block = <EthPrimitives as NodePrimitives>::Block>
@@ -283,15 +331,9 @@ where
 
     // Step 7: Update previously_sent_codes with ALL codes from this block
     // (not just the ones we sent, since phones that received earlier blocks already have them).
+    // CodeCache handles FIFO eviction internally when capacity is exceeded.
     for (hash, code) in all_codes {
         previously_sent_codes.insert(hash, code);
-    }
-    // Evict oldest entries if over capacity.
-    while previously_sent_codes.len() > MAX_PREVIOUSLY_SENT_CODES {
-        // HashMap doesn't have ordering; remove an arbitrary entry.
-        if let Some(key) = previously_sent_codes.keys().next().copied() {
-            previously_sent_codes.remove(&key);
-        }
     }
 
     Ok(packet_size)

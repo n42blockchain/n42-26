@@ -64,6 +64,12 @@ pub enum EngineOutput {
         hash1: B256,
         hash2: B256,
     },
+    /// An epoch transition has occurred. The validator set may have changed.
+    /// Emitted at epoch boundaries when epochs are enabled (epoch_length > 0).
+    EpochTransition {
+        new_epoch: u64,
+        validator_count: u32,
+    },
 }
 
 /// Pending proposal awaiting block data import before voting (follower path).
@@ -72,6 +78,14 @@ struct PendingProposal {
     view: ViewNumber,
     block_hash: B256,
 }
+
+/// Maximum number of views ahead a future message can be to be buffered.
+/// Messages beyond this window are rejected to prevent memory exhaustion attacks.
+const FUTURE_VIEW_WINDOW: u64 = 5;
+
+/// Maximum number of buffered future-view messages.
+/// When exceeded, the oldest (lowest view) messages are evicted.
+const MAX_FUTURE_MESSAGES: usize = 64;
 
 /// The HotStuff-2 consensus engine.
 ///
@@ -116,7 +130,7 @@ pub struct ConsensusEngine {
     /// Piggybacked into the next Proposal to accelerate QC delivery.
     previous_prepare_qc: Option<QuorumCertificate>,
     /// Output channel for engine actions.
-    output_tx: mpsc::UnboundedSender<EngineOutput>,
+    output_tx: mpsc::Sender<EngineOutput>,
     /// Pending proposal awaiting block data import before voting.
     /// Set when process_proposal() defers the vote (follower path).
     pending_proposal: Option<PendingProposal>,
@@ -126,6 +140,10 @@ pub struct ConsensusEngine {
     /// Tracks which block hash each validator voted for in the current view.
     /// Used to detect equivocation (same validator voting for different blocks).
     equivocation_tracker: HashMap<u32, B256>,
+    /// Buffer for messages that arrive for future views (within FUTURE_VIEW_WINDOW).
+    /// Instead of permanently rejecting slightly early messages, we buffer them
+    /// and replay when the engine advances to the target view.
+    future_msg_buffer: Vec<(ViewNumber, ConsensusMessage)>,
 }
 
 impl ConsensusEngine {
@@ -136,7 +154,7 @@ impl ConsensusEngine {
         validator_set: ValidatorSet,
         base_timeout_ms: u64,
         max_timeout_ms: u64,
-        output_tx: mpsc::UnboundedSender<EngineOutput>,
+        output_tx: mpsc::Sender<EngineOutput>,
     ) -> Self {
         Self::with_epoch_manager(
             my_index,
@@ -155,7 +173,7 @@ impl ConsensusEngine {
         epoch_manager: EpochManager,
         base_timeout_ms: u64,
         max_timeout_ms: u64,
-        output_tx: mpsc::UnboundedSender<EngineOutput>,
+        output_tx: mpsc::Sender<EngineOutput>,
     ) -> Self {
         let pacemaker = Pacemaker::new(base_timeout_ms, max_timeout_ms);
 
@@ -174,6 +192,7 @@ impl ConsensusEngine {
             pending_proposal: None,
             imported_blocks: HashSet::new(),
             equivocation_tracker: HashMap::new(),
+            future_msg_buffer: Vec::new(),
         }
     }
 
@@ -188,7 +207,7 @@ impl ConsensusEngine {
         epoch_manager: EpochManager,
         base_timeout_ms: u64,
         max_timeout_ms: u64,
-        output_tx: mpsc::UnboundedSender<EngineOutput>,
+        output_tx: mpsc::Sender<EngineOutput>,
         recovered_view: ViewNumber,
         locked_qc: QuorumCertificate,
         last_committed_qc: QuorumCertificate,
@@ -216,6 +235,7 @@ impl ConsensusEngine {
             pending_proposal: None,
             imported_blocks: HashSet::new(),
             equivocation_tracker: HashMap::new(),
+            future_msg_buffer: Vec::new(),
         }
     }
 
@@ -341,6 +361,61 @@ impl ConsensusEngine {
     // ── Message dispatch ──
 
     fn process_message(&mut self, msg: ConsensusMessage) -> ConsensusResult<()> {
+        // Extract the message's view number for future-view buffering.
+        let msg_view = Self::message_view(&msg);
+        let current_view = self.round_state.current_view();
+
+        // Buffer messages for future views (within window) instead of rejecting.
+        // Decide and NewView messages are exempt — they handle their own view logic
+        // (Decide accepts future views, NewView accepts view > current).
+        if let Some(view) = msg_view {
+            if view > current_view
+                && !matches!(msg, ConsensusMessage::Decide(_) | ConsensusMessage::NewView(_))
+            {
+                if view <= current_view + FUTURE_VIEW_WINDOW {
+                    // Buffer the message for replay when we advance
+                    if self.future_msg_buffer.len() >= MAX_FUTURE_MESSAGES {
+                        // Evict the oldest (lowest view) entry
+                        if let Some(min_idx) = self.future_msg_buffer
+                            .iter()
+                            .enumerate()
+                            .min_by_key(|(_, (v, _))| *v)
+                            .map(|(i, _)| i)
+                        {
+                            self.future_msg_buffer.swap_remove(min_idx);
+                        }
+                    }
+                    tracing::debug!(
+                        current_view,
+                        msg_view = view,
+                        buffered = self.future_msg_buffer.len(),
+                        "buffering future-view message"
+                    );
+                    self.future_msg_buffer.push((view, msg));
+                    return Ok(());
+                }
+                // Beyond window: fall through to normal processing which will reject
+            }
+        }
+
+        self.dispatch_message(msg)
+    }
+
+    /// Extracts the view number from a consensus message (if applicable).
+    fn message_view(msg: &ConsensusMessage) -> Option<ViewNumber> {
+        match msg {
+            ConsensusMessage::Proposal(p) => Some(p.view),
+            ConsensusMessage::Vote(v) => Some(v.view),
+            ConsensusMessage::CommitVote(cv) => Some(cv.view),
+            ConsensusMessage::PrepareQC(pqc) => Some(pqc.view),
+            ConsensusMessage::Timeout(t) => Some(t.view),
+            ConsensusMessage::NewView(nv) => Some(nv.view),
+            ConsensusMessage::Decide(d) => Some(d.view),
+        }
+    }
+
+    /// Dispatches a consensus message to the appropriate handler.
+    fn dispatch_message(&mut self, msg: ConsensusMessage) -> ConsensusResult<()> {
         match msg {
             ConsensusMessage::Proposal(p) => self.process_proposal(p),
             ConsensusMessage::Vote(v) => self.process_vote(v),
@@ -569,7 +644,13 @@ impl ConsensusEngine {
         })?;
 
         // Now take mutable borrow of collector
-        let collector = self.vote_collector.as_mut().unwrap();
+        let collector = match self.vote_collector.as_mut() {
+            Some(c) => c,
+            None => {
+                tracing::warn!(view, "vote_collector not initialized, ignoring vote");
+                return Ok(());
+            }
+        };
         collector.add_verified_vote(vote.voter, vote.signature)?;
 
         tracing::debug!(
@@ -602,11 +683,14 @@ impl ConsensusEngine {
             return Ok(());
         }
 
-        let qc = self
-            .vote_collector
-            .as_ref()
-            .unwrap()
-            .build_qc(self.validator_set())?;
+        let collector = match self.vote_collector.as_ref() {
+            Some(c) => c,
+            None => {
+                tracing::warn!(view, "vote_collector not initialized in try_form_prepare_qc");
+                return Ok(());
+            }
+        };
+        let qc = collector.build_qc(self.validator_set())?;
 
         tracing::info!(view, signers = qc.signer_count(), "QC formed, entering pre-commit");
 
@@ -614,10 +698,13 @@ impl ConsensusEngine {
         self.round_state.enter_pre_commit();
         self.round_state.update_locked_qc(&qc);
 
+        // Capture block_hash before qc is moved into the PrepareQC message.
+        let block_hash = qc.block_hash;
+
         // Broadcast PrepareQC so validators can send CommitVotes
         let prepare_qc_msg = PrepareQC {
             view,
-            block_hash: qc.block_hash,
+            block_hash,
             qc,
         };
         self.emit(EngineOutput::BroadcastMessage(
@@ -625,7 +712,6 @@ impl ConsensusEngine {
         ));
 
         // Leader self-vote for CommitVote (Round 2)
-        let block_hash = self.prepare_qc.as_ref().unwrap().block_hash;
         let commit_msg = commit_signing_message(view, &block_hash);
         let commit_sig = self.secret_key.sign(&commit_msg);
         if let Some(ref mut collector) = self.commit_collector {
@@ -717,7 +803,13 @@ impl ConsensusEngine {
         })?;
 
         // Now take mutable borrow of collector
-        let collector = self.commit_collector.as_mut().unwrap();
+        let collector = match self.commit_collector.as_mut() {
+            Some(c) => c,
+            None => {
+                tracing::warn!(view, "commit_collector not initialized, ignoring commit vote");
+                return Ok(());
+            }
+        };
         collector.add_verified_vote(cv.voter, cv.signature)?;
 
         tracing::debug!(
@@ -744,19 +836,16 @@ impl ConsensusEngine {
             return Ok(());
         }
 
-        // CommitVotes use "commit" prefix in their signing message
-        let block_hash = self
-            .commit_collector
-            .as_ref()
-            .map(|c| c.block_hash())
-            .unwrap_or_default();
+        // CommitVotes use "commit" prefix in their signing message.
+        // Safety: has_quorum is true only when commit_collector is Some,
+        // but we guard defensively to avoid panics in edge cases.
+        let collector = match self.commit_collector.as_ref() {
+            Some(c) => c,
+            None => return Ok(()),
+        };
+        let block_hash = collector.block_hash();
         let commit_msg = commit_signing_message(view, &block_hash);
-
-        let commit_qc = self
-            .commit_collector
-            .as_ref()
-            .unwrap()
-            .build_qc_with_message(self.validator_set(), &commit_msg)?;
+        let commit_qc = collector.build_qc_with_message(self.validator_set(), &commit_msg)?;
 
         tracing::info!(view, %block_hash, "block committed!");
 
@@ -831,6 +920,11 @@ impl ConsensusEngine {
                 got: decide.commit_qc.block_hash,
             });
         }
+
+        // Verify CommitQC aggregate BLS signature (S1 fix).
+        // Without this, a Byzantine leader could forge a Decide with a valid-looking
+        // signer bitmap but an invalid aggregate signature.
+        super::quorum::verify_commit_qc(&decide.commit_qc, self.validator_set())?;
 
         // Detect view gap: if we're more than 3 views behind, we've missed
         // blocks and need to sync them from peers before we can participate.
@@ -921,8 +1015,13 @@ impl ConsensusEngine {
 
         // Drop the mutable borrow of collector before accessing validator_set
         if should_form_tc {
-            let tc = self.timeout_collector.as_ref().unwrap()
-                .build_tc(self.validator_set())?;
+            let tc = match self.timeout_collector.as_ref() {
+                Some(c) => c.build_tc(self.validator_set())?,
+                None => {
+                    tracing::warn!(view, "timeout_collector disappeared during TC formation");
+                    return Ok(());
+                }
+            };
 
             tracing::info!(view, "TC formed, I am the new leader for view {}", next_view);
 
@@ -1072,6 +1171,25 @@ impl ConsensusEngine {
         // Only save if we actually formed a QC this view (timeout views won't have one).
         self.previous_prepare_qc = self.prepare_qc.take();
 
+        // Check epoch boundary: if epochs are enabled and we're crossing into
+        // a new epoch, attempt to advance the validator set.
+        if self.epoch_manager.epochs_enabled() && self.epoch_manager.is_epoch_boundary(new_view) {
+            if self.epoch_manager.advance_epoch() {
+                let new_epoch = self.epoch_manager.current_epoch();
+                let validator_count = self.validator_set().len();
+                tracing::info!(
+                    new_epoch,
+                    validator_count,
+                    view = new_view,
+                    "epoch transition at view boundary"
+                );
+                self.emit(EngineOutput::EpochTransition {
+                    new_epoch,
+                    validator_count,
+                });
+            }
+        }
+
         self.round_state.advance_view(new_view);
         self.pacemaker.reset_for_view(
             new_view,
@@ -1085,12 +1203,42 @@ impl ConsensusEngine {
         self.imported_blocks.clear();
         self.equivocation_tracker.clear();
 
+        // Replay buffered messages for the new view and discard expired ones.
+        // Two-phase approach: drain all, then partition into replay/keep/discard.
+        let drained: Vec<(ViewNumber, ConsensusMessage)> =
+            self.future_msg_buffer.drain(..).collect();
+
+        let mut to_replay = Vec::new();
+        for (view, msg) in drained {
+            if view == new_view {
+                to_replay.push(msg);
+            } else if view > new_view && view <= new_view + FUTURE_VIEW_WINDOW {
+                // Still in window — re-buffer
+                self.future_msg_buffer.push((view, msg));
+            }
+            // else: expired — discard silently
+        }
+
+        if !to_replay.is_empty() {
+            tracing::debug!(
+                view = new_view,
+                replaying = to_replay.len(),
+                "replaying buffered future-view messages"
+            );
+        }
+
+        for msg in to_replay {
+            if let Err(e) = self.dispatch_message(msg) {
+                tracing::debug!(view = new_view, error = %e, "buffered message replay failed");
+            }
+        }
+
         tracing::debug!(view = new_view, "advanced to new view");
     }
 
     fn emit(&self, output: EngineOutput) {
-        if self.output_tx.send(output).is_err() {
-            tracing::error!("consensus output channel closed");
+        if self.output_tx.try_send(output).is_err() {
+            tracing::error!("consensus output channel closed or full");
         }
     }
 }
@@ -1120,7 +1268,7 @@ mod tests {
         ConsensusEngine,
         Vec<BlsSecretKey>,
         ValidatorSet,
-        mpsc::UnboundedReceiver<EngineOutput>,
+        mpsc::Receiver<EngineOutput>,
     ) {
         let sks: Vec<_> = (0..n).map(|_| BlsSecretKey::random().unwrap()).collect();
         let infos: Vec<_> = sks
@@ -1134,7 +1282,7 @@ mod tests {
         let f = ((n as u32).saturating_sub(1)) / 3;
         let vs = ValidatorSet::new(&infos, f);
 
-        let (output_tx, output_rx) = mpsc::unbounded_channel();
+        let (output_tx, output_rx) = mpsc::channel(1024);
         let engine = ConsensusEngine::new(
             my_index,
             sks[my_index as usize].clone(),
@@ -2005,6 +2153,55 @@ mod tests {
                 assert_eq!(need, 3);
             }
             other => panic!("expected InsufficientVotes, got: {:?}", other),
+        }
+    }
+
+    /// Decide with a forged CommitQC signature should be rejected (S1 fix).
+    /// The QC has correct signer count, view, and block_hash but the aggregate
+    /// signature does not match the commit_signing_message.
+    #[test]
+    fn test_decide_rejects_forged_signature() {
+        use bitvec::prelude::*;
+        use n42_primitives::consensus::Decide;
+
+        let (mut engine, sks, _vs, _rx) = make_engine(4, 0);
+        let block_hash = B256::repeat_byte(0xD4);
+        let view = 1u64;
+
+        // Build a QC with 3 signers but signed with WRONG message (prepare format instead of commit)
+        let wrong_msg = crate::protocol::quorum::signing_message(view, &block_hash);
+        let sigs: Vec<_> = (0..3u32).map(|i| sks[i as usize].sign(&wrong_msg)).collect();
+        let sig_refs: Vec<_> = sigs.iter().collect();
+        let agg_sig = n42_primitives::bls::AggregateSignature::aggregate(&sig_refs).unwrap();
+
+        let mut signers = bitvec![u8, Msb0; 0; 4];
+        signers.set(0, true);
+        signers.set(1, true);
+        signers.set(2, true);
+
+        let forged_qc = QuorumCertificate {
+            view,
+            block_hash,
+            aggregate_signature: agg_sig,
+            signers,
+        };
+
+        let decide = Decide {
+            view,
+            block_hash,
+            commit_qc: forged_qc,
+        };
+
+        let result = engine.process_event(ConsensusEvent::Message(
+            ConsensusMessage::Decide(decide),
+        ));
+        assert!(result.is_err(), "Decide with forged CommitQC signature should be rejected");
+        match result.unwrap_err() {
+            ConsensusError::InvalidQC { view: v, reason } => {
+                assert_eq!(v, view);
+                assert!(reason.contains("commit QC"), "error should mention commit QC, got: {reason}");
+            }
+            other => panic!("expected InvalidQC, got: {:?}", other),
         }
     }
 }

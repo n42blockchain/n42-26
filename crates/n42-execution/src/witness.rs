@@ -9,7 +9,7 @@ use std::collections::HashSet;
 /// Contains all state accessed during EVM execution, which is sufficient
 /// for an independent verifier (e.g., a mobile device) to re-execute the block
 /// without access to the full state trie.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ExecutionWitness {
     /// Hashed post-state: all accounts and storage slots accessed/modified.
     pub hashed_state: HashedPostState,
@@ -69,7 +69,7 @@ impl ExecutionWitness {
 /// This is the format sent to mobile devices for verification. It reduces bandwidth
 /// by only including contract bytecodes that the mobile device doesn't have in its
 /// local cache.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct CompactWitness {
     /// Hashed post-state for trie verification.
     pub hashed_state: HashedPostState,
@@ -200,6 +200,79 @@ mod tests {
             2,
             "code_a and code_c hashes should be referenced"
         );
+    }
+
+    #[test]
+    fn test_execution_witness_serde_json_roundtrip() {
+        let witness = ExecutionWitness {
+            hashed_state: HashedPostState::default(),
+            codes: vec![bytecode(&[0xAA, 0xBB]), bytecode(&[0xCC])],
+            keys: vec![bytecode(&[1, 2, 3])],
+            lowest_block_number: Some(42),
+        };
+
+        let json = serde_json::to_string(&witness).expect("json serialize");
+        let deserialized: ExecutionWitness =
+            serde_json::from_str(&json).expect("json deserialize");
+
+        assert_eq!(deserialized.codes.len(), 2);
+        assert_eq!(deserialized.keys.len(), 1);
+        assert_eq!(deserialized.lowest_block_number, Some(42));
+    }
+
+    #[test]
+    fn test_execution_witness_bincode_roundtrip() {
+        let witness = ExecutionWitness {
+            hashed_state: HashedPostState::default(),
+            codes: vec![bytecode(&[0xDE, 0xAD])],
+            keys: vec![],
+            lowest_block_number: None,
+        };
+
+        let encoded = bincode::serialize(&witness).expect("bincode serialize");
+        let decoded: ExecutionWitness =
+            bincode::deserialize(&encoded).expect("bincode deserialize");
+
+        assert_eq!(decoded.codes.len(), 1);
+        assert_eq!(decoded.codes[0], bytecode(&[0xDE, 0xAD]));
+        assert!(decoded.lowest_block_number.is_none());
+    }
+
+    #[test]
+    fn test_compact_witness_serde_json_roundtrip() {
+        let compact = CompactWitness {
+            hashed_state: HashedPostState::default(),
+            uncached_codes: vec![bytecode(&[0xFF])],
+            cached_code_hashes: vec![keccak256(&[0xAA])],
+            keys: vec![bytecode(&[4, 5, 6])],
+            lowest_block_number: Some(100),
+        };
+
+        let json = serde_json::to_string(&compact).expect("json serialize");
+        let deserialized: CompactWitness =
+            serde_json::from_str(&json).expect("json deserialize");
+
+        assert_eq!(deserialized.uncached_codes.len(), 1);
+        assert_eq!(deserialized.cached_code_hashes.len(), 1);
+        assert_eq!(deserialized.lowest_block_number, Some(100));
+    }
+
+    #[test]
+    fn test_compact_witness_bincode_roundtrip() {
+        let compact = CompactWitness {
+            hashed_state: HashedPostState::default(),
+            uncached_codes: vec![],
+            cached_code_hashes: vec![],
+            keys: vec![bytecode(&[7, 8, 9])],
+            lowest_block_number: None,
+        };
+
+        let encoded = bincode::serialize(&compact).expect("bincode serialize");
+        let decoded: CompactWitness =
+            bincode::deserialize(&encoded).expect("bincode deserialize");
+
+        assert_eq!(decoded.keys.len(), 1);
+        assert!(decoded.uncached_codes.is_empty());
     }
 
     #[test]

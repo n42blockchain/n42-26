@@ -170,6 +170,25 @@ pub struct Decide {
     pub commit_qc: QuorumCertificate,
 }
 
+/// Current consensus protocol wire format version.
+/// Increment when making breaking changes to message formats.
+pub const CONSENSUS_PROTOCOL_VERSION: u16 = 1;
+
+/// Versioned wrapper for consensus messages on the wire.
+///
+/// Enables safe rolling upgrades: a node running version N can detect
+/// and reject messages from version N+1 rather than silently failing
+/// to deserialize them. All nodes in a deployment must share the same
+/// version; the version field enables graceful error reporting during
+/// the upgrade window.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct VersionedMessage {
+    /// Protocol version of the message format.
+    pub version: u16,
+    /// The actual consensus message.
+    pub message: ConsensusMessage,
+}
+
 /// Envelope for all consensus messages on the wire.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ConsensusMessage {

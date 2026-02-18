@@ -1,16 +1,19 @@
-use libp2p::gossipsub;
+use libp2p::gossipsub::{self, PeerScoreParams, PeerScoreThresholds, TopicScoreParams};
 use libp2p::identity::Keypair;
 use libp2p::swarm::NetworkBehaviour;
+use libp2p::swarm::behaviour::toggle::Toggle;
 use libp2p::Swarm;
 use std::time::Duration;
 
 use crate::gossipsub::message_id_fn;
+use crate::gossipsub::topics::{consensus_topic, block_announce_topic, mempool_topic};
 use crate::state_sync::StateSyncCodec;
 
 /// The composite network behaviour for N42 nodes.
 ///
 /// Combines GossipSub (for pub/sub consensus messaging), Identify
-/// (for peer identification), and request-response (for block sync).
+/// (for peer identification), request-response (for block sync),
+/// and optionally mDNS (for LAN peer discovery in dev/test).
 #[derive(NetworkBehaviour)]
 pub struct N42Behaviour {
     /// GossipSub for consensus message pub/sub.
@@ -19,6 +22,12 @@ pub struct N42Behaviour {
     pub identify: libp2p::identify::Behaviour,
     /// Request-response protocol for state sync (block catch-up).
     pub state_sync: libp2p::request_response::Behaviour<StateSyncCodec>,
+    /// mDNS for automatic LAN peer discovery (dev/test only).
+    /// Wrapped in Toggle so it can be disabled in production.
+    pub mdns: Toggle<libp2p::mdns::tokio::Behaviour>,
+    /// Kademlia DHT for WAN peer discovery (production).
+    /// Wrapped in Toggle so it can be disabled in dev/test.
+    pub kademlia: Toggle<libp2p::kad::Behaviour<libp2p::kad::store::MemoryStore>>,
 }
 
 /// Configuration for the N42 network transport.
@@ -36,6 +45,10 @@ pub struct TransportConfig {
     /// GossipSub outbound minimum D_out (default: 2).
     /// Must satisfy: mesh_outbound_min <= mesh_d / 2 AND mesh_outbound_min < mesh_d_low.
     pub mesh_outbound_min: usize,
+    /// Enable mDNS for automatic LAN peer discovery (dev/test only).
+    pub enable_mdns: bool,
+    /// Enable Kademlia DHT for WAN peer discovery (production).
+    pub enable_kademlia: bool,
 }
 
 impl TransportConfig {
@@ -69,6 +82,8 @@ impl TransportConfig {
             mesh_d_low,
             mesh_d_high,
             mesh_outbound_min,
+            enable_mdns: false,
+            enable_kademlia: false,
         }
     }
 }
@@ -82,6 +97,8 @@ impl Default for TransportConfig {
             mesh_d_low: 6,
             mesh_d_high: 12,
             mesh_outbound_min: 2,
+            enable_mdns: false,
+            enable_kademlia: false,
         }
     }
 }
@@ -91,9 +108,21 @@ impl Default for TransportConfig {
 /// Uses QUIC for low-latency encrypted transport (TLS 1.3 built-in,
 /// no need for separate Noise handshake). GossipSub is configured
 /// for the consensus network topology.
+///
+/// `validator_index` is included in the Identify agent_version field
+/// (format: `n42/1.0.0/v{index}`) to enable directed messaging.
 pub fn build_swarm(
     keypair: Keypair,
     config: TransportConfig,
+) -> eyre::Result<Swarm<N42Behaviour>> {
+    build_swarm_with_validator_index(keypair, config, None)
+}
+
+/// Builds the swarm with an optional validator index for directed messaging.
+pub fn build_swarm_with_validator_index(
+    keypair: Keypair,
+    config: TransportConfig,
+    validator_index: Option<u32>,
 ) -> eyre::Result<Swarm<N42Behaviour>> {
     let gossipsub_config = gossipsub::ConfigBuilder::default()
         .heartbeat_interval(config.heartbeat_interval)
@@ -116,17 +145,61 @@ pub fn build_swarm(
         .with_tokio()
         .with_quic()
         .with_behaviour(|key| {
-            let gossipsub = gossipsub::Behaviour::new(
+            // Configure per-topic scoring parameters.
+            // Invalid messages give a penalty; first deliveries give a reward.
+            let mut peer_score_params = PeerScoreParams::default();
+
+            let mut consensus_score = TopicScoreParams::default();
+            consensus_score.topic_weight = 1.0;
+            consensus_score.first_message_deliveries_weight = 1.0;
+            consensus_score.first_message_deliveries_cap = 100.0;
+            consensus_score.first_message_deliveries_decay = 0.99;
+            consensus_score.invalid_message_deliveries_weight = -10.0;
+            consensus_score.invalid_message_deliveries_decay = 0.9;
+            peer_score_params.topics.insert(consensus_topic().hash(), consensus_score);
+
+            let mut block_score = TopicScoreParams::default();
+            block_score.topic_weight = 0.5;
+            block_score.first_message_deliveries_weight = 1.0;
+            block_score.first_message_deliveries_cap = 50.0;
+            block_score.first_message_deliveries_decay = 0.99;
+            block_score.invalid_message_deliveries_weight = -5.0;
+            block_score.invalid_message_deliveries_decay = 0.9;
+            peer_score_params.topics.insert(block_announce_topic().hash(), block_score);
+
+            let mut mempool_score = TopicScoreParams::default();
+            mempool_score.topic_weight = 0.2;
+            mempool_score.invalid_message_deliveries_weight = -2.0;
+            mempool_score.invalid_message_deliveries_decay = 0.95;
+            peer_score_params.topics.insert(mempool_topic().hash(), mempool_score);
+
+            let thresholds = PeerScoreThresholds {
+                gossip_threshold: -50.0,
+                publish_threshold: -100.0,
+                graylist_threshold: -200.0,
+                ..Default::default()
+            };
+
+            let mut gossipsub = gossipsub::Behaviour::new(
                 gossipsub::MessageAuthenticity::Signed(key.clone()),
                 gossipsub_config,
             )
             .map_err(|e| eyre::eyre!("gossipsub behaviour error: {e}"))?;
 
+            gossipsub.with_peer_score(peer_score_params, thresholds)
+                .map_err(|e| eyre::eyre!("gossipsub peer scoring error: {e}"))?;
+
+            // Include validator index in agent_version for directed messaging.
+            // Format: "n42/1.0.0/v{index}" or "n42/1.0.0" if no index.
+            let agent_version = match validator_index {
+                Some(idx) => format!("n42/1.0.0/v{idx}"),
+                None => "n42/1.0.0".to_string(),
+            };
             let identify = libp2p::identify::Behaviour::new(
                 libp2p::identify::Config::new(
                     "/n42/1.0.0".into(),
                     key.public(),
-                ),
+                ).with_agent_version(agent_version),
             );
 
             let state_sync = libp2p::request_response::Behaviour::new(
@@ -137,7 +210,41 @@ pub fn build_swarm(
                 libp2p::request_response::Config::default(),
             );
 
-            Ok(N42Behaviour { gossipsub, identify, state_sync })
+            let mdns = if config.enable_mdns {
+                let mdns_config = libp2p::mdns::Config {
+                    ttl: Duration::from_secs(300),
+                    query_interval: Duration::from_secs(60),
+                    enable_ipv6: false,
+                };
+                match libp2p::mdns::tokio::Behaviour::new(mdns_config, key.public().to_peer_id()) {
+                    Ok(m) => {
+                        tracing::info!("mDNS peer discovery enabled (dev/test mode)");
+                        Toggle::from(Some(m))
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "failed to initialize mDNS, continuing without it");
+                        Toggle::from(None)
+                    }
+                }
+            } else {
+                Toggle::from(None)
+            };
+
+            let kademlia = if config.enable_kademlia {
+                let local_peer_id = key.public().to_peer_id();
+                let store = libp2p::kad::store::MemoryStore::new(local_peer_id);
+                let mut kad_config = libp2p::kad::Config::new(
+                    libp2p::StreamProtocol::new("/n42/kad/1.0.0"),
+                );
+                kad_config.set_query_timeout(Duration::from_secs(60));
+                let kad = libp2p::kad::Behaviour::with_config(local_peer_id, store, kad_config);
+                tracing::info!("Kademlia DHT peer discovery enabled");
+                Toggle::from(Some(kad))
+            } else {
+                Toggle::from(None)
+            };
+
+            Ok(N42Behaviour { gossipsub, identify, state_sync, mdns, kademlia })
         })
         .map_err(|e| eyre::eyre!("swarm builder error: {e}"))?
         .with_swarm_config(|cfg| {

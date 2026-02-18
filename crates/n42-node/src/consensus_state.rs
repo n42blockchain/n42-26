@@ -3,7 +3,7 @@ use arc_swap::ArcSwap;
 use n42_consensus::ValidatorSet;
 use n42_primitives::QuorumCertificate;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 use tracing::info;
@@ -94,6 +94,32 @@ impl AttestationState {
     }
 }
 
+/// Record of a mobile attestation event (block reaching threshold).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AttestationRecord {
+    pub block_hash: B256,
+    pub block_number: u64,
+    pub valid_count: u32,
+    pub timestamp: u64,
+}
+
+/// Evidence of equivocation (double-voting) by a validator.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EquivocationEvidence {
+    pub view: u64,
+    pub validator_index: u32,
+    pub hash1: B256,
+    pub hash2: B256,
+    pub detected_at: u64,
+}
+
+/// Maximum number of attestation records kept in history.
+const MAX_ATTESTATION_HISTORY: usize = 1000;
+/// Maximum number of equivocation evidence entries kept.
+const MAX_EQUIVOCATION_LOG: usize = 500;
+
 /// Shared consensus state between the Orchestrator, PayloadBuilder, and RPC.
 ///
 /// The Orchestrator writes to this state (low frequency, on block commit),
@@ -110,6 +136,10 @@ pub struct SharedConsensusState {
     pub attestation_state: Mutex<AttestationState>,
     /// Broadcast sender for notifying RPC subscribers of committed blocks.
     pub block_committed_tx: broadcast::Sender<VerificationTask>,
+    /// History of attestation events (blocks that reached threshold).
+    pub attestation_history: Mutex<VecDeque<AttestationRecord>>,
+    /// Log of detected equivocation evidence for accountability.
+    pub equivocation_log: Mutex<Vec<EquivocationEvidence>>,
 }
 
 impl SharedConsensusState {
@@ -121,6 +151,8 @@ impl SharedConsensusState {
             validator_set: Arc::new(validator_set),
             attestation_state: Mutex::new(AttestationState::new(10, 100)),
             block_committed_tx,
+            attestation_history: Mutex::new(VecDeque::new()),
+            equivocation_log: Mutex::new(Vec::new()),
         }
     }
 
@@ -132,6 +164,72 @@ impl SharedConsensusState {
     /// Reads the latest committed QC (called by the PayloadBuilder).
     pub fn load_committed_qc(&self) -> Arc<Option<QuorumCertificate>> {
         self.latest_committed_qc.load_full()
+    }
+
+    /// Records a mobile attestation event (block reached verification threshold).
+    pub fn record_attestation(&self, block_hash: B256, block_number: u64, valid_count: u32) {
+        let record = AttestationRecord {
+            block_hash,
+            block_number,
+            valid_count,
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        };
+        if let Ok(mut history) = self.attestation_history.lock() {
+            if history.len() >= MAX_ATTESTATION_HISTORY {
+                history.pop_front();
+            }
+            history.push_back(record);
+        }
+    }
+
+    /// Returns attestation record for a specific block hash, if available.
+    pub fn get_block_attestation(&self, block_hash: &B256) -> Option<AttestationRecord> {
+        self.attestation_history.lock().ok()?
+            .iter()
+            .find(|r| r.block_hash == *block_hash)
+            .cloned()
+    }
+
+    /// Returns summary statistics about attestation history.
+    pub fn attestation_stats(&self) -> (usize, Option<u64>, Option<u64>) {
+        let history = match self.attestation_history.lock() {
+            Ok(h) => h,
+            Err(_) => return (0, None, None),
+        };
+        let total = history.len();
+        let latest_block = history.back().map(|r| r.block_number);
+        let earliest_block = history.front().map(|r| r.block_number);
+        (total, earliest_block, latest_block)
+    }
+
+    /// Records equivocation evidence for accountability.
+    pub fn record_equivocation(&self, view: u64, validator_index: u32, hash1: B256, hash2: B256) {
+        let evidence = EquivocationEvidence {
+            view,
+            validator_index,
+            hash1,
+            hash2,
+            detected_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        };
+        if let Ok(mut log) = self.equivocation_log.lock() {
+            if log.len() >= MAX_EQUIVOCATION_LOG {
+                log.remove(0);
+            }
+            log.push(evidence);
+        }
+    }
+
+    /// Returns all recorded equivocation evidence.
+    pub fn get_equivocations(&self) -> Vec<EquivocationEvidence> {
+        self.equivocation_log.lock()
+            .map(|log| log.clone())
+            .unwrap_or_default()
     }
 
     /// Notify RPC subscribers and register block for attestation tracking.
@@ -248,5 +346,63 @@ mod tests {
         // Block should also be registered for attestation.
         let att = state.attestation_state.lock().unwrap();
         assert_eq!(att.get_attestation_count(&hash), Some(0));
+    }
+
+    #[test]
+    fn test_record_attestation() {
+        let state = make_state();
+        let hash = B256::repeat_byte(0xAA);
+        state.record_attestation(hash, 10, 5);
+
+        let record = state.get_block_attestation(&hash);
+        assert!(record.is_some());
+        let r = record.unwrap();
+        assert_eq!(r.block_number, 10);
+        assert_eq!(r.valid_count, 5);
+    }
+
+    #[test]
+    fn test_attestation_stats() {
+        let state = make_state();
+        let (total, _, _) = state.attestation_stats();
+        assert_eq!(total, 0);
+
+        state.record_attestation(B256::repeat_byte(0x01), 1, 3);
+        state.record_attestation(B256::repeat_byte(0x02), 2, 5);
+
+        let (total, earliest, latest) = state.attestation_stats();
+        assert_eq!(total, 2);
+        assert_eq!(earliest, Some(1));
+        assert_eq!(latest, Some(2));
+    }
+
+    #[test]
+    fn test_record_equivocation() {
+        let state = make_state();
+        let h1 = B256::repeat_byte(0xAA);
+        let h2 = B256::repeat_byte(0xBB);
+        state.record_equivocation(5, 2, h1, h2);
+
+        let evs = state.get_equivocations();
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].view, 5);
+        assert_eq!(evs[0].validator_index, 2);
+        assert_eq!(evs[0].hash1, h1);
+        assert_eq!(evs[0].hash2, h2);
+    }
+
+    #[test]
+    fn test_attestation_history_bounded() {
+        let state = make_state();
+        // Fill beyond MAX_ATTESTATION_HISTORY (1000)
+        for i in 0..1010u64 {
+            let mut hash_bytes = [0u8; 32];
+            hash_bytes[0..8].copy_from_slice(&i.to_le_bytes());
+            state.record_attestation(B256::from(hash_bytes), i, 1);
+        }
+        let (total, earliest, _) = state.attestation_stats();
+        assert_eq!(total, 1000);
+        // Earliest should be 10 (first 10 were evicted)
+        assert_eq!(earliest, Some(10));
     }
 }

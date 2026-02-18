@@ -28,3 +28,7 @@ revm.workspace = true
 serde.workspace = true
 eyre.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+bincode.workspace = true

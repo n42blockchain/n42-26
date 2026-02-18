@@ -47,7 +47,7 @@ fn test_mobile_bls_key(index: u32) -> BlsSecretKey {
 struct TestHarness {
     engines: Vec<ConsensusEngine>,
     secret_keys: Vec<BlsSecretKey>,
-    output_rxs: Vec<mpsc::UnboundedReceiver<EngineOutput>>,
+    output_rxs: Vec<mpsc::Receiver<EngineOutput>>,
     validator_set: ValidatorSet,
     committed_blocks: Vec<(ViewNumber, B256)>,
 }
@@ -73,7 +73,7 @@ impl TestHarness {
         let mut output_rxs = Vec::with_capacity(n);
 
         for i in 0..n {
-            let (tx, rx) = mpsc::unbounded_channel();
+            let (tx, rx) = mpsc::channel(1024);
             let engine = ConsensusEngine::new(
                 i as u32,
                 secret_keys[i].clone(),

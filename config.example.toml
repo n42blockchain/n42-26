@@ -1,0 +1,95 @@
+# N42 Node Configuration Example
+# ================================
+# N42 uses environment variables for configuration.
+# This file documents all available options with their defaults.
+#
+# In production, set these via systemd Environment=, Docker --env, or K8s ConfigMap.
+# In development, source a .env file or export directly.
+
+# ── Consensus ──
+
+# Path to consensus config file (JSON or TOML).
+# When set, overrides N42_VALIDATOR_COUNT.
+# N42_CONSENSUS_CONFIG = "/etc/n42/consensus.json"
+
+# Number of deterministic dev validators (default: 1).
+# Only used when N42_CONSENSUS_CONFIG is not set.
+# N42_VALIDATOR_COUNT = "3"
+
+# ── Identity ──
+
+# Path to encrypted BLS keystore file (production).
+# Requires N42_KEYSTORE_PASSWORD to be set.
+# N42_KEYSTORE_PATH = "/etc/n42/validator.keystore"
+
+# Password for decrypting the keystore.
+# SECURITY: Never commit this value. Use secrets management.
+# N42_KEYSTORE_PASSWORD = ""
+
+# Plaintext BLS secret key in hex (dev only).
+# WARNING: Insecure. Use N42_KEYSTORE_PATH in production.
+# N42_VALIDATOR_KEY = "00000000...01"
+
+# ── Network ──
+
+# Consensus P2P port (QUIC transport, default: 9400).
+# N42_CONSENSUS_PORT = "9400"
+
+# Comma-separated trusted peer multiaddrs for bootstrap.
+# Example: "/ip4/10.0.0.1/udp/9400/quic-v1/p2p/12D3Koo..."
+# N42_TRUSTED_PEERS = ""
+
+# Enable mDNS for automatic LAN peer discovery (default: false).
+# Only for dev/test — mDNS is limited to local network.
+# N42_ENABLE_MDNS = "false"
+
+# Enable Kademlia DHT for WAN peer discovery (default: false).
+# When enabled, nodes use the /n42/kad/1.0.0 protocol to discover peers
+# beyond those listed in N42_TRUSTED_PEERS. Requires at least one trusted
+# peer as a bootstrap node. DHT routing table is refreshed every 5 minutes.
+# N42_ENABLE_DHT = "false"
+
+# ── Mobile Verification ──
+
+# StarHub QUIC port for mobile verifier connections (default: 9443).
+# N42_STARHUB_PORT = "9443"
+
+# ── Block Production ──
+
+# Block production interval in milliseconds (default: 0 = immediate).
+# When > 0, blocks are produced at wall-clock-aligned boundaries.
+# Recommended: 8000 (8 seconds) for production.
+# N42_BLOCK_INTERVAL_MS = "0"
+
+# Startup delay in milliseconds before first proposal (default: auto).
+# Allows GossipSub mesh to form before leader proposes.
+# Auto-calculated as 5000 + validator_count * 500.
+# N42_STARTUP_DELAY_MS = ""
+
+# ── Storage ──
+
+# Data directory for consensus state persistence (default: ./n42-data).
+# N42_DATA_DIR = "/data/n42"
+
+# Number of committed blocks retained in memory for state sync (default: 10000).
+# At 8s slots, 10000 blocks ≈ 22 hours.
+# N42_SYNC_BUFFER_SIZE = "10000"
+
+# ── Genesis ──
+
+# Path to custom genesis JSON file for production deployments.
+# When set, overrides the default empty genesis.
+# The file should contain standard Ethereum genesis format with "alloc" field.
+# N42_GENESIS_FILE = "/etc/n42/genesis.json"
+
+# ── RPC (reth defaults) ──
+
+# N42 extends reth's standard RPC with the "n42" namespace.
+# HTTP is enabled by default with standard modules: eth,net,web3
+# WS is NOT enabled by default (use --ws --ws.port <port> to enable).
+#
+# For Blockscout compatibility, add debug/trace/txpool:
+#   --http.api eth,net,web3,debug,trace,txpool,rpc
+#
+# The "n42" RPC namespace (n42_consensusStatus, n42_validatorSet, etc.)
+# is always registered and available on the HTTP server regardless of --http.api.

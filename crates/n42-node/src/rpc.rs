@@ -1,4 +1,4 @@
-use crate::consensus_state::SharedConsensusState;
+use crate::consensus_state::{AttestationRecord, EquivocationEvidence, SharedConsensusState};
 // VerificationTask is used by the #[subscription(item = ...)] macro attribute.
 #[allow(unused_imports)]
 use crate::consensus_state::VerificationTask;
@@ -41,9 +41,41 @@ pub struct AttestationResponse {
     pub threshold_reached: bool,
 }
 
+/// Response for n42_health.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HealthResponse {
+    pub status: String,
+    pub has_committed_qc: bool,
+    pub validator_count: u32,
+}
+
+/// Response for n42_attestationStats.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AttestationStatsResponse {
+    pub total_attestations: usize,
+    pub earliest_block: Option<u64>,
+    pub latest_block: Option<u64>,
+}
+
+/// Response for n42_equivocations.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EquivocationsResponse {
+    pub total: usize,
+    pub evidence: Vec<EquivocationEvidence>,
+}
+
 /// N42-specific RPC API.
 #[rpc(server, namespace = "n42")]
 pub trait N42Api {
+    /// Returns the node health status for load balancers and K8s probes.
+    /// Returns "ok" when consensus has committed at least one block,
+    /// "syncing" when no block has been committed yet.
+    #[method(name = "health")]
+    async fn health(&self) -> RpcResult<HealthResponse>;
+
     /// Returns the current consensus status.
     #[method(name = "consensusStatus")]
     async fn consensus_status(&self) -> RpcResult<ConsensusStatusResponse>;
@@ -66,6 +98,18 @@ pub trait N42Api {
         block_hash: B256,
         slot: u64,
     ) -> RpcResult<AttestationResponse>;
+
+    /// Returns the attestation record for a specific block hash.
+    #[method(name = "blockAttestation")]
+    async fn block_attestation(&self, block_hash: B256) -> RpcResult<Option<AttestationRecord>>;
+
+    /// Returns summary statistics about mobile attestation history.
+    #[method(name = "attestationStats")]
+    async fn attestation_stats(&self) -> RpcResult<AttestationStatsResponse>;
+
+    /// Returns all recorded equivocation evidence.
+    #[method(name = "equivocations")]
+    async fn equivocations(&self) -> RpcResult<EquivocationsResponse>;
 }
 
 /// Implementation of the N42 RPC API.
@@ -81,6 +125,16 @@ impl N42RpcServer {
 
 #[async_trait::async_trait]
 impl N42ApiServer for N42RpcServer {
+    async fn health(&self) -> RpcResult<HealthResponse> {
+        let has_qc = self.consensus_state.load_committed_qc().is_some();
+        let status = if has_qc { "ok" } else { "syncing" };
+        Ok(HealthResponse {
+            status: status.to_string(),
+            has_committed_qc: has_qc,
+            validator_count: self.consensus_state.validator_set.len(),
+        })
+    }
+
     async fn consensus_status(&self) -> RpcResult<ConsensusStatusResponse> {
         let committed_qc = self.consensus_state.load_committed_qc();
         let (view, block_hash, has_qc) = match committed_qc.as_ref() {
@@ -241,5 +295,26 @@ impl N42ApiServer for N42RpcServer {
                 None::<()>,
             )),
         }
+    }
+
+    async fn block_attestation(&self, block_hash: B256) -> RpcResult<Option<AttestationRecord>> {
+        Ok(self.consensus_state.get_block_attestation(&block_hash))
+    }
+
+    async fn attestation_stats(&self) -> RpcResult<AttestationStatsResponse> {
+        let (total, earliest, latest) = self.consensus_state.attestation_stats();
+        Ok(AttestationStatsResponse {
+            total_attestations: total,
+            earliest_block: earliest,
+            latest_block: latest,
+        })
+    }
+
+    async fn equivocations(&self) -> RpcResult<EquivocationsResponse> {
+        let evidence = self.consensus_state.get_equivocations();
+        Ok(EquivocationsResponse {
+            total: evidence.len(),
+            evidence,
+        })
     }
 }

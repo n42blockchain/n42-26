@@ -1,8 +1,9 @@
-use alloy_genesis::Genesis;
-use alloy_primitives::Address;
+use alloy_genesis::{Genesis, GenesisAccount};
+use alloy_primitives::{Address, U256};
 use n42_primitives::BlsPublicKey;
 use reth_chainspec::{Chain, ChainSpec, ChainSpecBuilder};
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 use std::sync::Arc;
 
 /// N42 consensus-specific configuration, separate from the EVM chain spec.
@@ -37,6 +38,27 @@ pub struct ValidatorInfo {
 }
 
 impl ConsensusConfig {
+    /// Load consensus configuration from a TOML or JSON file.
+    ///
+    /// The format is determined by file extension:
+    /// - `.toml` → TOML
+    /// - anything else → JSON
+    ///
+    /// The loaded configuration is validated before returning.
+    pub fn from_file(path: &std::path::Path) -> Result<Self, String> {
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| format!("failed to read config {}: {e}", path.display()))?;
+        let config: Self = if path.extension().is_some_and(|ext| ext == "toml") {
+            toml::from_str(&content)
+                .map_err(|e| format!("TOML parse error in {}: {e}", path.display()))?
+        } else {
+            serde_json::from_str(&content)
+                .map_err(|e| format!("JSON parse error in {}: {e}", path.display()))?
+        };
+        config.validate()?;
+        Ok(config)
+    }
+
     /// Create a default dev/test configuration (single validator, no preset keys).
     pub fn dev() -> Self {
         Self {
@@ -148,6 +170,64 @@ pub fn n42_dev_chainspec() -> Arc<ChainSpec> {
         .build();
 
     Arc::new(spec)
+}
+
+/// 10,000 ETH in wei.
+fn ten_thousand_eth() -> U256 {
+    U256::from(10_000) * U256::from(10).pow(U256::from(18))
+}
+
+/// Create a dev chain spec with pre-funded allocations.
+///
+/// Each validator address receives 10,000 ETH. Additionally, 10 test accounts
+/// (addresses 0x10..0x19) each receive 10,000 ETH for transaction testing.
+pub fn n42_dev_chainspec_with_alloc(validators: &[ValidatorInfo]) -> Arc<ChainSpec> {
+    let mut alloc = std::collections::BTreeMap::new();
+    let balance = ten_thousand_eth();
+
+    // Fund validator addresses.
+    for v in validators {
+        alloc.insert(v.address, GenesisAccount {
+            balance,
+            ..Default::default()
+        });
+    }
+
+    // Fund 10 test accounts (0x10..0x19).
+    for i in 0..10u8 {
+        let addr = Address::with_last_byte(0x10 + i);
+        alloc.insert(addr, GenesisAccount {
+            balance,
+            ..Default::default()
+        });
+    }
+
+    let genesis = Genesis { alloc, ..Default::default() };
+    Arc::new(
+        ChainSpecBuilder::default()
+            .chain(Chain::from_id(N42_CHAIN_ID))
+            .genesis(genesis)
+            .cancun_activated()
+            .build(),
+    )
+}
+
+/// Load a chain spec from a genesis JSON file (production use).
+///
+/// The file should contain a standard Ethereum-style genesis JSON with
+/// `alloc`, `config`, etc. fields.
+pub fn n42_chainspec_from_genesis(genesis_path: &Path) -> Result<Arc<ChainSpec>, String> {
+    let content = std::fs::read_to_string(genesis_path)
+        .map_err(|e| format!("read genesis {}: {e}", genesis_path.display()))?;
+    let genesis: Genesis = serde_json::from_str(&content)
+        .map_err(|e| format!("parse genesis {}: {e}", genesis_path.display()))?;
+    Ok(Arc::new(
+        ChainSpecBuilder::default()
+            .chain(Chain::from_id(N42_CHAIN_ID))
+            .genesis(genesis)
+            .cancun_activated()
+            .build(),
+    ))
 }
 
 #[cfg(test)]
@@ -266,6 +346,165 @@ mod tests {
         let pk = sk.public_key();
         let sig = sk.sign(b"test");
         pk.verify(b"test", &sig).unwrap();
+    }
+
+    #[test]
+    fn test_consensus_config_from_json_file() {
+        use std::io::Write;
+
+        let config = ConsensusConfig::dev_multi(4);
+        let json = serde_json::to_string_pretty(&config).unwrap();
+
+        let dir = std::env::temp_dir().join("n42_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("test_config.json");
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(json.as_bytes()).unwrap();
+
+        let loaded = ConsensusConfig::from_file(&path).expect("should load JSON config");
+        assert_eq!(loaded.validator_set_size, 4);
+        assert_eq!(loaded.fault_tolerance, 1);
+        assert_eq!(loaded.initial_validators.len(), 4);
+        assert!(loaded.validate().is_ok());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_consensus_config_from_toml_file() {
+        use std::io::Write;
+
+        let toml_content = r#"
+slot_time_ms = 8000
+validator_set_size = 1
+fault_tolerance = 0
+base_timeout_ms = 4000
+max_timeout_ms = 8000
+initial_validators = []
+epoch_length = 0
+"#;
+        let dir = std::env::temp_dir().join("n42_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("test_config.toml");
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(toml_content.as_bytes()).unwrap();
+
+        let loaded = ConsensusConfig::from_file(&path).expect("should load TOML config");
+        assert_eq!(loaded.slot_time_ms, 8000);
+        assert_eq!(loaded.validator_set_size, 1);
+        assert!(loaded.validate().is_ok());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_consensus_config_from_file_nonexistent() {
+        let result = ConsensusConfig::from_file(std::path::Path::new("/nonexistent/path.json"));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("failed to read config"));
+    }
+
+    #[test]
+    fn test_consensus_config_from_file_invalid_json() {
+        use std::io::Write;
+
+        let dir = std::env::temp_dir().join("n42_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("bad_config.json");
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(b"not valid json {{{").unwrap();
+
+        let result = ConsensusConfig::from_file(&path);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("JSON parse error"));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_consensus_config_from_file_validation_fails() {
+        use std::io::Write;
+
+        // Create a config where slot_time_ms = 0 (invalid)
+        let json = r#"{
+            "slot_time_ms": 0,
+            "validator_set_size": 1,
+            "fault_tolerance": 0,
+            "base_timeout_ms": 4000,
+            "max_timeout_ms": 8000,
+            "initial_validators": []
+        }"#;
+        let dir = std::env::temp_dir().join("n42_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("invalid_config.json");
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(json.as_bytes()).unwrap();
+
+        let result = ConsensusConfig::from_file(&path);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("slot_time_ms"));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_dev_chainspec_with_alloc() {
+        let config = ConsensusConfig::dev_multi(3);
+        let spec = n42_dev_chainspec_with_alloc(&config.initial_validators);
+        assert_eq!(spec.chain().id(), N42_CHAIN_ID);
+
+        let genesis = &spec.genesis;
+        // Validator addresses should be funded.
+        for v in &config.initial_validators {
+            let account = genesis.alloc.get(&v.address)
+                .expect("validator should have allocation");
+            assert!(account.balance > U256::ZERO, "validator balance should be non-zero");
+        }
+        // Test accounts should be funded.
+        for i in 0..10u8 {
+            let addr = Address::with_last_byte(0x10 + i);
+            let account = genesis.alloc.get(&addr)
+                .expect("test account should have allocation");
+            assert_eq!(account.balance, ten_thousand_eth());
+        }
+    }
+
+    #[test]
+    fn test_dev_chainspec_with_alloc_empty_validators() {
+        let spec = n42_dev_chainspec_with_alloc(&[]);
+        // Should still have the 10 test accounts.
+        assert_eq!(spec.genesis.alloc.len(), 10);
+    }
+
+    #[test]
+    fn test_chainspec_from_genesis_file() {
+        use std::io::Write;
+
+        let genesis_json = r#"{
+            "alloc": {
+                "0x0000000000000000000000000000000000000001": {
+                    "balance": "0xDE0B6B3A7640000"
+                }
+            }
+        }"#;
+
+        let dir = std::env::temp_dir().join("n42_test_genesis");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("genesis.json");
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(genesis_json.as_bytes()).unwrap();
+
+        let spec = n42_chainspec_from_genesis(&path).expect("should load genesis");
+        assert_eq!(spec.chain().id(), N42_CHAIN_ID);
+        assert!(!spec.genesis.alloc.is_empty());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_chainspec_from_genesis_nonexistent() {
+        let result = n42_chainspec_from_genesis(std::path::Path::new("/nonexistent/genesis.json"));
+        assert!(result.is_err());
     }
 
     #[test]

@@ -16,6 +16,8 @@ BASE_RPC_PORT=8545
 BASE_P2P_PORT=30303
 BASE_CONSENSUS_PORT=9400
 BASE_STARHUB_PORT=9500
+BASE_AUTH_PORT=8551
+BASE_WS_PORT=8645
 
 # Colors for output
 RED='\033[0;31m'
@@ -86,34 +88,44 @@ for i in $(seq 0 $((NUM_VALIDATORS - 1))); do
     datadir="${BASE_DIR}/validator-${i}"
     rpc_port=$((BASE_RPC_PORT + i))
     p2p_port=$((BASE_P2P_PORT + i))
+    auth_port=$((BASE_AUTH_PORT + i))
+    ws_port=$((BASE_WS_PORT + i))
     consensus_port=$((BASE_CONSENSUS_PORT + i))
     log_file="${BASE_DIR}/validator-${i}.log"
 
     mkdir -p "${datadir}"
 
-    log "Starting validator ${i} (rpc=:${rpc_port}, p2p=:${p2p_port}, consensus=:${consensus_port})"
+    log "Starting validator ${i} (rpc=:${rpc_port}, p2p=:${p2p_port}, auth=:${auth_port}, consensus=:${consensus_port})"
 
-    # Build bootnode list: connect to all previously started nodes via reth devp2p.
-    BOOTNODES_ARG=""
+    # Build trusted-peers list: connect to all previously started nodes.
+    TRUSTED_PEERS_ARG=""
     if [ ${#ENODES[@]} -gt 0 ]; then
-        # Use reth's --peers.connect to connect to previously started nodes.
-        for enode in "${ENODES[@]}"; do
-            BOOTNODES_ARG="${BOOTNODES_ARG} --peers.connect ${enode}"
-        done
+        TRUSTED_PEERS_ARG=$(IFS=,; echo "${ENODES[*]}")
+    fi
+
+    TRUSTED_PEERS_FLAG=""
+    if [ -n "$TRUSTED_PEERS_ARG" ]; then
+        TRUSTED_PEERS_FLAG="--trusted-peers ${TRUSTED_PEERS_ARG}"
     fi
 
     N42_VALIDATOR_KEY="${KEYS[$i]}" \
     N42_VALIDATOR_COUNT="${NUM_VALIDATORS}" \
+    N42_ENABLE_MDNS="true" \
     "${BINARY}" node \
         --chain dev \
         --datadir "${datadir}" \
         --http \
         --http.port "${rpc_port}" \
-        --http.api "eth,net,web3,n42" \
+        --http.api eth,net,web3,debug,trace,txpool,rpc \
+        --http.corsdomain "*" \
+        --ws \
+        --ws.port "${ws_port}" \
+        --ws.api eth,net,web3 \
+        --authrpc.port "${auth_port}" \
         --port "${p2p_port}" \
         --discovery.port "${p2p_port}" \
         --log.file.directory "${datadir}/logs" \
-        ${BOOTNODES_ARG} \
+        ${TRUSTED_PEERS_FLAG} \
         > "${log_file}" 2>&1 &
 
     PIDS+=($!)
@@ -124,7 +136,7 @@ for i in $(seq 0 $((NUM_VALIDATORS - 1))); do
     ENODES+=("enode://0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000${i}@127.0.0.1:${p2p_port}")
 
     # Brief pause to let the node initialize before starting the next.
-    sleep 1
+    sleep 2
 done
 
 log ""

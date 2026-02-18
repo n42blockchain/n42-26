@@ -2,19 +2,20 @@ use crate::consensus_state::SharedConsensusState;
 use crate::persistence::{self, ConsensusSnapshot};
 use alloy_primitives::{Address, B256};
 use alloy_rpc_types_engine::{ForkchoiceState, PayloadAttributes, PayloadStatusEnum};
-use n42_consensus::{ConsensusEngine, ConsensusEvent, EngineOutput, verify_qc, ValidatorSet};
+use n42_consensus::{ConsensusEngine, ConsensusEvent, EngineOutput, verify_commit_qc, ValidatorSet};
 use n42_network::{BlockSyncResponse, NetworkEvent, NetworkHandle, PeerId, SyncBlock};
 use n42_primitives::QuorumCertificate;
 use reth_ethereum_engine_primitives::EthEngineTypes;
 use reth_node_builder::ConsensusEngineHandle;
 use reth_payload_builder::PayloadBuilderHandle;
 use reth_payload_primitives::{EngineApiMessageVersion, PayloadKind, PayloadTypes};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
+use metrics::{counter, gauge};
 use tracing::{debug, error, info, warn};
 
 /// Block data broadcast message sent via /n42/blocks/1 GossipSub topic.
@@ -54,13 +55,23 @@ struct CommittedBlock {
     payload: Vec<u8>,
 }
 
-/// Maximum number of committed blocks retained for sync (ring buffer capacity).
-/// At 8-second slots, 1000 blocks ≈ ~2.2 hours of history.
-const MAX_COMMITTED_BLOCKS: usize = 1000;
+/// Default maximum number of committed blocks retained for sync (ring buffer).
+/// At 8-second slots, 10,000 blocks ≈ ~22 hours of history.
+/// Configurable via N42_SYNC_BUFFER_SIZE environment variable.
+fn max_committed_blocks() -> usize {
+    std::env::var("N42_SYNC_BUFFER_SIZE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10_000)
+}
 
 /// Timeout for a state sync request. If no response arrives within this duration,
 /// the in-flight flag is reset so a new request can be sent.
 const SYNC_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Maximum consecutive empty block skips before producing a block anyway.
+/// At 8s slots, 3 skips = 24 seconds max gap before liveness kicks in.
+const MAX_CONSECUTIVE_EMPTY_SKIPS: u32 = 3;
 
 /// Bridges the consensus engine with the P2P network layer and reth Engine API.
 ///
@@ -79,7 +90,7 @@ pub struct ConsensusOrchestrator {
     /// Receiver for events from the network service.
     net_event_rx: mpsc::UnboundedReceiver<NetworkEvent>,
     /// Receiver for outputs from the consensus engine.
-    output_rx: mpsc::UnboundedReceiver<EngineOutput>,
+    output_rx: mpsc::Receiver<EngineOutput>,
     /// Handle to the reth beacon consensus engine for block finalization.
     beacon_engine: Option<ConsensusEngineHandle<EthEngineTypes>>,
     /// Handle to the payload builder service for triggering block production.
@@ -105,21 +116,23 @@ pub struct ConsensusOrchestrator {
     /// The slot-aligned timestamp (Unix seconds) for the next block.
     /// Used as the block's timestamp to ensure perfectly regular intervals.
     next_slot_timestamp: Option<u64>,
+    /// Count of consecutive empty block skips (for empty block optimization).
+    consecutive_empty_skips: u32,
     /// Cache of block data received from network but not yet requested by engine.
     /// Key: block_hash, Value: raw broadcast bytes.
     /// Bounded to 16 entries to prevent memory issues.
-    pending_block_data: HashMap<B256, Vec<u8>>,
+    pending_block_data: BTreeMap<B256, Vec<u8>>,
     /// Block hashes the engine has requested (via ExecuteBlock) but data not yet received.
     pending_executions: HashSet<B256>,
     /// Deferred block finalization when Decide arrives before block data.
     /// The committed block hasn't been imported into reth yet.
     pending_finalization: Option<PendingFinalization>,
     /// Sender for forwarding received transactions to TxPoolBridge.
-    tx_import_tx: Option<mpsc::UnboundedSender<Vec<u8>>>,
+    tx_import_tx: Option<mpsc::Sender<Vec<u8>>>,
     /// Receiver for transactions to broadcast from TxPoolBridge.
-    tx_broadcast_rx: Option<mpsc::UnboundedReceiver<Vec<u8>>>,
+    tx_broadcast_rx: Option<mpsc::Receiver<Vec<u8>>>,
     /// Ring buffer of recently committed blocks for serving sync requests from peers.
-    /// Bounded to MAX_COMMITTED_BLOCKS entries (~250MB worst case at 250KB avg blocks).
+    /// Bounded to max_committed_blocks() entries (~250MB worst case at 250KB avg blocks).
     committed_blocks: VecDeque<CommittedBlock>,
     /// Set of connected peer IDs for sync target selection.
     connected_peers: HashSet<PeerId>,
@@ -134,7 +147,13 @@ pub struct ConsensusOrchestrator {
     validator_set_for_sync: Option<ValidatorSet>,
     /// Sender for notifying the mobile packet generation task about committed blocks.
     /// When set, sends `(block_hash, block_number)` after each BlockCommitted event.
-    mobile_packet_tx: Option<mpsc::UnboundedSender<(B256, u64)>>,
+    mobile_packet_tx: Option<mpsc::Sender<(B256, u64)>>,
+    /// Receiver for leader payload data sent back from the spawned build task.
+    /// The leader's build task broadcasts block data to followers but the orchestrator
+    /// needs a copy to populate committed_blocks for state sync.
+    leader_payload_rx: mpsc::UnboundedReceiver<(B256, Vec<u8>)>,
+    /// Sender cloned into spawned build tasks for leader payload feedback.
+    leader_payload_tx: mpsc::UnboundedSender<(B256, Vec<u8>)>,
 }
 
 impl ConsensusOrchestrator {
@@ -144,9 +163,10 @@ impl ConsensusOrchestrator {
         engine: ConsensusEngine,
         network: NetworkHandle,
         net_event_rx: mpsc::UnboundedReceiver<NetworkEvent>,
-        output_rx: mpsc::UnboundedReceiver<EngineOutput>,
+        output_rx: mpsc::Receiver<EngineOutput>,
     ) -> Self {
         let (block_ready_tx, block_ready_rx) = mpsc::unbounded_channel();
+        let (leader_payload_tx, leader_payload_rx) = mpsc::unbounded_channel();
         Self {
             engine,
             network,
@@ -162,7 +182,8 @@ impl ConsensusOrchestrator {
             slot_time: Duration::ZERO,
             next_build_at: None,
             next_slot_timestamp: None,
-            pending_block_data: HashMap::new(),
+            consecutive_empty_skips: 0,
+            pending_block_data: BTreeMap::new(),
             pending_executions: HashSet::new(),
             pending_finalization: None,
             tx_import_tx: None,
@@ -174,6 +195,8 @@ impl ConsensusOrchestrator {
             state_file: None,
             validator_set_for_sync: None,
             mobile_packet_tx: None,
+            leader_payload_rx,
+            leader_payload_tx,
         }
     }
 
@@ -182,7 +205,7 @@ impl ConsensusOrchestrator {
         engine: ConsensusEngine,
         network: NetworkHandle,
         net_event_rx: mpsc::UnboundedReceiver<NetworkEvent>,
-        output_rx: mpsc::UnboundedReceiver<EngineOutput>,
+        output_rx: mpsc::Receiver<EngineOutput>,
         beacon_engine: ConsensusEngineHandle<EthEngineTypes>,
         payload_builder: PayloadBuilderHandle<EthEngineTypes>,
         consensus_state: Arc<SharedConsensusState>,
@@ -190,6 +213,7 @@ impl ConsensusOrchestrator {
         fee_recipient: Address,
     ) -> Self {
         let (block_ready_tx, block_ready_rx) = mpsc::unbounded_channel();
+        let (leader_payload_tx, leader_payload_rx) = mpsc::unbounded_channel();
 
         // Read slot time from environment variable (default: 0 = immediate build).
         // When non-zero, blocks are produced at wall-clock-aligned boundaries
@@ -219,7 +243,8 @@ impl ConsensusOrchestrator {
             slot_time,
             next_build_at: None,
             next_slot_timestamp: None,
-            pending_block_data: HashMap::new(),
+            consecutive_empty_skips: 0,
+            pending_block_data: BTreeMap::new(),
             pending_executions: HashSet::new(),
             pending_finalization: None,
             tx_import_tx: None,
@@ -231,6 +256,8 @@ impl ConsensusOrchestrator {
             state_file: None,
             validator_set_for_sync: None,
             mobile_packet_tx: None,
+            leader_payload_rx,
+            leader_payload_tx,
         }
     }
 
@@ -252,7 +279,7 @@ impl ConsensusOrchestrator {
     /// VerificationPackets to mobile verifiers.
     pub fn with_mobile_packet_tx(
         mut self,
-        tx: mpsc::UnboundedSender<(B256, u64)>,
+        tx: mpsc::Sender<(B256, u64)>,
     ) -> Self {
         self.mobile_packet_tx = Some(tx);
         self
@@ -263,8 +290,8 @@ impl ConsensusOrchestrator {
     /// `tx_broadcast_rx`: receives new local transactions from TxPoolBridge for broadcast.
     pub fn with_tx_pool_bridge(
         mut self,
-        tx_import_tx: mpsc::UnboundedSender<Vec<u8>>,
-        tx_broadcast_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+        tx_import_tx: mpsc::Sender<Vec<u8>>,
+        tx_broadcast_rx: mpsc::Receiver<Vec<u8>>,
     ) -> Self {
         self.tx_import_tx = Some(tx_import_tx);
         self.tx_broadcast_rx = Some(tx_broadcast_rx);
@@ -332,6 +359,7 @@ impl ConsensusOrchestrator {
                 // Branch 1: Pacemaker timeout -> trigger view change
                 _ = &mut timeout => {
                     let view = self.engine.current_view();
+                    counter!("n42_view_timeouts_total").increment(1);
                     warn!(view, "pacemaker timeout, initiating view change");
                     if let Err(e) = self.engine.on_timeout() {
                         error!(view, error = %e, "error handling timeout");
@@ -342,6 +370,7 @@ impl ConsensusOrchestrator {
                 event = self.net_event_rx.recv() => {
                     match event {
                         Some(NetworkEvent::ConsensusMessage { source: _, message }) => {
+                            counter!("n42_consensus_messages_received").increment(1);
                             if let Err(e) = self.engine.process_event(
                                 ConsensusEvent::Message(message)
                             ) {
@@ -351,10 +380,12 @@ impl ConsensusOrchestrator {
                         Some(NetworkEvent::PeerConnected(peer_id)) => {
                             info!(%peer_id, "consensus peer connected");
                             self.connected_peers.insert(peer_id);
+                            gauge!("n42_connected_peers").set(self.connected_peers.len() as f64);
                         }
                         Some(NetworkEvent::PeerDisconnected(peer_id)) => {
                             warn!(%peer_id, "consensus peer disconnected");
                             self.connected_peers.remove(&peer_id);
+                            gauge!("n42_connected_peers").set(self.connected_peers.len() as f64);
                         }
                         Some(NetworkEvent::BlockAnnouncement { source, data }) => {
                             debug!(%source, bytes = data.len(), "received block data broadcast");
@@ -364,7 +395,7 @@ impl ConsensusOrchestrator {
                             debug!(%source, bytes = data.len(), "received transaction from mempool");
                             // Forward to TxPoolBridge via channel if configured.
                             if let Some(ref tx) = self.tx_import_tx {
-                                let _ = tx.send(data);
+                                let _ = tx.try_send(data);
                             }
                         }
                         Some(NetworkEvent::SyncRequest { peer, request_id, request }) => {
@@ -427,7 +458,25 @@ impl ConsensusOrchestrator {
                     }
                 }
 
-                // Branch 6: Slot boundary / startup delay reached, trigger payload build
+                // Branch 6: Leader payload feedback — populate committed_blocks for sync
+                payload_data = self.leader_payload_rx.recv() => {
+                    if let Some((hash, data)) = payload_data {
+                        // Find the committed block entry and populate its payload
+                        if let Some(block) = self.committed_blocks.iter_mut().rev()
+                            .find(|b| b.block_hash == hash)
+                        {
+                            if block.payload.is_empty() {
+                                // Decode the broadcast envelope to extract payload_json
+                                if let Ok(broadcast) = bincode::deserialize::<BlockDataBroadcast>(&data) {
+                                    block.payload = broadcast.payload_json;
+                                    debug!(%hash, "populated committed block payload from leader build task");
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Branch 7: Slot boundary / startup delay reached, trigger payload build
                 _ = &mut build_timer => {
                     let slot_ts = self.next_slot_timestamp.take();
                     self.next_build_at = None;
@@ -458,6 +507,7 @@ impl ConsensusOrchestrator {
                 .staged_epoch_info()
                 .map(|(epoch, validators, f)| (epoch, validators.to_vec(), f));
             let snapshot = ConsensusSnapshot {
+                version: 1,
                 current_view: self.engine.current_view(),
                 locked_qc: self.engine.locked_qc().clone(),
                 last_committed_qc: self.engine.last_committed_qc().clone(),
@@ -472,6 +522,23 @@ impl ConsensusOrchestrator {
         }
     }
 
+    /// Checks if the most recent committed blocks had empty payloads,
+    /// indicating low network activity where empty block skipping is appropriate.
+    fn recent_blocks_empty(&self) -> bool {
+        // Check last 3 committed blocks (or fewer if we haven't committed that many).
+        let check_count = 3.min(self.committed_blocks.len());
+        if check_count == 0 {
+            return false; // No history yet, don't skip.
+        }
+        self.committed_blocks.iter().rev().take(check_count)
+            .all(|b| b.payload.is_empty() || {
+                // Check if the payload contains a block with zero transactions.
+                // Empty payload JSON typically encodes a block with empty transactions list.
+                // We use a heuristic: payload under 512 bytes is likely an empty block.
+                b.payload.len() < 512
+            })
+    }
+
     /// Schedules a payload build using wall-clock-aligned slot timing.
     ///
     /// If slot_time > 0, computes the next wall-clock boundary (a time where
@@ -480,7 +547,31 @@ impl ConsensusOrchestrator {
     /// same fixed intervals, regardless of build overhead or consensus latency.
     ///
     /// If slot_time == 0, triggers immediately (legacy behavior).
+    ///
+    /// Empty block optimization: when the mempool is likely empty (recent blocks
+    /// were empty), skip up to MAX_CONSECUTIVE_EMPTY_SKIPS slots before producing
+    /// an empty block to maintain liveness.
     async fn schedule_payload_build(&mut self) {
+        // Empty block skip optimization.
+        if self.recent_blocks_empty() && self.consecutive_empty_skips < MAX_CONSECUTIVE_EMPTY_SKIPS {
+            self.consecutive_empty_skips += 1;
+            counter!("n42_empty_block_skips_total").increment(1);
+            debug!(
+                skip_count = self.consecutive_empty_skips,
+                max = MAX_CONSECUTIVE_EMPTY_SKIPS,
+                "skipping empty block proposal (low activity)"
+            );
+            // Re-schedule at the next slot boundary to check again.
+            if !self.slot_time.is_zero() {
+                let (slot_ts, delay) = self.next_slot_boundary();
+                self.next_build_at = Some(Instant::now() + delay);
+                self.next_slot_timestamp = Some(slot_ts);
+            }
+            return;
+        }
+        // Reset skip counter when we decide to build.
+        self.consecutive_empty_skips = 0;
+
         if self.slot_time.is_zero() {
             self.do_trigger_payload_build(None).await;
         } else {
@@ -511,6 +602,12 @@ impl ConsensusOrchestrator {
             .unwrap_or_default();
         let now_ms = now.as_millis() as u64;
         let slot_ms = self.slot_time.as_millis() as u64;
+
+        // Guard against misconfiguration: slot_ms must be positive.
+        if slot_ms == 0 {
+            tracing::error!("slot_time is zero, defaulting to 1-second delay");
+            return (now_ms / 1000 + 1, Duration::from_secs(1));
+        }
 
         // Find the next boundary: smallest multiple of slot_ms that is > now_ms.
         let current_slot = now_ms / slot_ms;
@@ -589,15 +686,28 @@ impl ConsensusOrchestrator {
                     let tx = self.block_ready_tx.clone();
                     let engine_handle = beacon_engine.clone();
                     let network = self.network.clone();
+                    let leader_payload_tx = self.leader_payload_tx.clone();
                     let current_view = self.engine.current_view();
                     tokio::spawn(async move {
                         // Give the builder time to pack transactions from the pool.
                         tokio::time::sleep(Duration::from_millis(500)).await;
 
-                        match payload_builder
-                            .resolve_kind(payload_id, PayloadKind::WaitForPending)
-                            .await
-                        {
+                        // R1 fix: timeout prevents task leak if resolve_kind hangs.
+                        // 30s covers extreme cases (8s slot, builds typically < 1s).
+                        let resolve_result = tokio::time::timeout(
+                            Duration::from_secs(30),
+                            payload_builder.resolve_kind(payload_id, PayloadKind::WaitForPending),
+                        ).await;
+
+                        let payload_opt = match resolve_result {
+                            Ok(result) => result,
+                            Err(_) => {
+                                error!("payload build timed out after 30s, task will exit");
+                                return;
+                            }
+                        };
+
+                        match payload_opt {
                             Some(Ok(payload)) => {
                                 let hash = payload.block().hash();
 
@@ -612,8 +722,13 @@ impl ConsensusOrchestrator {
                                 // Serialize the execution payload for broadcasting to followers.
                                 // Uses JSON because reth Engine API types are designed for JSON
                                 // serialization (some use #[serde(untagged)] which bincode can't handle).
-                                let payload_json = serde_json::to_vec(&execution_data)
-                                    .unwrap_or_default();
+                                let payload_json = match serde_json::to_vec(&execution_data) {
+                                    Ok(json) => json,
+                                    Err(e) => {
+                                        error!(%hash, error = %e, "CRITICAL: failed to serialize execution payload, block will not be broadcast");
+                                        return;
+                                    }
+                                };
 
                                 match engine_handle.new_payload(execution_data).await {
                                     Ok(status) => {
@@ -643,9 +758,11 @@ impl ConsensusOrchestrator {
                                                                 bytes = encoded.len(),
                                                                 "broadcasting block data to followers"
                                                             );
-                                                            if let Err(e) = network.announce_block(encoded) {
+                                                            if let Err(e) = network.announce_block(encoded.clone()) {
                                                                 warn!(error = %e, "failed to broadcast block data");
                                                             }
+                                                            // Feed payload back to orchestrator for state sync buffer
+                                                            let _ = leader_payload_tx.send((hash, encoded));
                                                         }
                                                         Err(e) => {
                                                             error!(error = %e, "failed to serialize block data broadcast");
@@ -697,10 +814,18 @@ impl ConsensusOrchestrator {
                     error!(error = %e, "failed to broadcast consensus message");
                 }
             }
-            EngineOutput::SendToValidator(_target, msg) => {
-                // GossipSub doesn't support point-to-point; broadcast instead.
-                if let Err(e) = self.network.broadcast_consensus(msg) {
-                    error!(error = %e, "failed to send message to validator (broadcast fallback)");
+            EngineOutput::SendToValidator(target, msg) => {
+                // Try directed send if we know the target peer.
+                if let Some(peer_id) = self.network.validator_peer(target) {
+                    if let Err(e) = self.network.send_direct(peer_id, msg.clone()) {
+                        warn!(target_validator = target, error = %e, "direct send failed, falling back to broadcast");
+                        let _ = self.network.broadcast_consensus(msg);
+                    }
+                } else {
+                    // Peer not yet identified, fall back to broadcast.
+                    if let Err(e) = self.network.broadcast_consensus(msg) {
+                        error!(error = %e, "failed to send message to validator (broadcast fallback)");
+                    }
                 }
             }
             EngineOutput::ExecuteBlock(block_hash) => {
@@ -722,10 +847,9 @@ impl ConsensusOrchestrator {
                 }
             }
             EngineOutput::BlockCommitted { view, block_hash, commit_qc } => {
+                counter!("n42_blocks_committed_total").increment(1);
+                gauge!("n42_consensus_view").set(view as f64);
                 info!(view, %block_hash, "block committed by consensus");
-
-                // Clone commit_qc early for snapshot persistence (before potential moves below).
-                let snapshot_qc = commit_qc.clone();
 
                 // Update shared consensus state (always safe, QC is valid regardless of reth state)
                 if let Some(ref state) = self.consensus_state {
@@ -776,7 +900,7 @@ impl ConsensusOrchestrator {
 
                         // Notify mobile packet generation (block is now in reth)
                         if let Some(ref tx) = self.mobile_packet_tx {
-                            let _ = tx.send((block_hash, view));
+                            let _ = tx.try_send((block_hash, view));
                         }
                     } else if let Some(data) = self.pending_block_data.remove(&block_hash) {
                         // Case B: BlockData arrived first, cached but not imported
@@ -789,7 +913,7 @@ impl ConsensusOrchestrator {
 
                                 // Notify mobile packet generation (block imported)
                                 if let Some(ref tx) = self.mobile_packet_tx {
-                                    let _ = tx.send((block_hash, view));
+                                    let _ = tx.try_send((block_hash, view));
                                 }
                             }
                             Err(e) => {
@@ -815,16 +939,18 @@ impl ConsensusOrchestrator {
                     self.pending_executions.clear();
                 }
 
-                // Persist consensus state after each commit.
-                // This ensures locked_qc and view survive node restarts.
+                // Persist consensus state after each commit (S3 fix).
+                // Use engine's actual locked_qc/last_committed_qc instead of the
+                // commit_qc, ensuring locked_qc >= commit_qc survives crash recovery.
                 if let Some(ref path) = self.state_file {
                     let scheduled_epoch = self.engine.epoch_manager()
                         .staged_epoch_info()
                         .map(|(epoch, validators, f)| (epoch, validators.to_vec(), f));
                     let snapshot = ConsensusSnapshot {
+                        version: 1,
                         current_view: self.engine.current_view(),
-                        locked_qc: snapshot_qc.clone(),
-                        last_committed_qc: snapshot_qc,
+                        locked_qc: self.engine.locked_qc().clone(),
+                        last_committed_qc: self.engine.last_committed_qc().clone(),
                         consecutive_timeouts: 0, // reset after commit
                         scheduled_epoch_transition: scheduled_epoch,
                     };
@@ -842,6 +968,7 @@ impl ConsensusOrchestrator {
                 }
             }
             EngineOutput::ViewChanged { new_view } => {
+                counter!("n42_view_changes_total").increment(1);
                 info!(new_view, "view changed");
 
                 // Preserve pending data if a committed block is awaiting import.
@@ -864,6 +991,7 @@ impl ConsensusOrchestrator {
                 self.initiate_sync(local_view, target_view);
             }
             EngineOutput::EquivocationDetected { view, validator, hash1, hash2 } => {
+                counter!("n42_equivocations_detected_total").increment(1);
                 warn!(
                     view,
                     validator,
@@ -871,7 +999,21 @@ impl ConsensusOrchestrator {
                     %hash2,
                     "EQUIVOCATION: validator voted for two different blocks in same view"
                 );
-                // Future: slashing evidence could be recorded here.
+                // Record evidence for accountability and future slashing.
+                if let Some(ref state) = self.consensus_state {
+                    state.record_equivocation(view, validator, hash1, hash2);
+                }
+            }
+            EngineOutput::EpochTransition { new_epoch, validator_count } => {
+                info!(
+                    new_epoch,
+                    validator_count,
+                    "epoch transition: validator set updated"
+                );
+                // Update the validator set used for sync QC verification so that
+                // new-epoch blocks can be validated by joining nodes.
+                let updated_vs = self.engine.epoch_manager().current_validator_set().clone();
+                self.validator_set_for_sync = Some(updated_vs);
             }
         }
     }
@@ -991,7 +1133,7 @@ impl ConsensusOrchestrator {
 
                             // Notify mobile packet generation (deferred block now in reth)
                             if let Some(ref tx) = self.mobile_packet_tx {
-                                let _ = tx.send((broadcast.block_hash, deferred_view));
+                                let _ = tx.try_send((broadcast.block_hash, deferred_view));
                             }
 
                             if self.engine.is_current_leader() {
@@ -1042,7 +1184,7 @@ impl ConsensusOrchestrator {
             .map(|b| b.payload_json)
             .unwrap_or_default();
 
-        if self.committed_blocks.len() >= MAX_COMMITTED_BLOCKS {
+        if self.committed_blocks.len() >= max_committed_blocks() {
             self.committed_blocks.pop_front();
         }
         self.committed_blocks.push_back(CommittedBlock {
@@ -1075,14 +1217,16 @@ impl ConsensusOrchestrator {
             }
         }
 
-        // Pick a random connected peer for sync
-        let peer = match self.connected_peers.iter().next().copied() {
-            Some(p) => p,
-            None => {
-                warn!("no connected peers for sync");
-                return;
-            }
-        };
+        // R2 fix: deterministic peer rotation based on view number.
+        // Different views naturally select different peers, avoiding always
+        // hitting the same peer (which causes persistent failure if it's down).
+        let peers: Vec<_> = self.connected_peers.iter().copied().collect();
+        if peers.is_empty() {
+            warn!("no connected peers for sync");
+            return;
+        }
+        let idx = (local_view as usize) % peers.len();
+        let peer = peers[idx];
 
         info!(
             %peer,
@@ -1114,6 +1258,7 @@ impl ConsensusOrchestrator {
         request_id: u64,
         request: n42_network::BlockSyncRequest,
     ) {
+        counter!("n42_sync_requests_served_total").increment(1);
         info!(
             %peer,
             from_view = request.from_view,
@@ -1121,9 +1266,13 @@ impl ConsensusOrchestrator {
             "handling sync request"
         );
 
+        // Limit sync response to prevent OOM from unbounded range requests.
+        const MAX_SYNC_BLOCKS: usize = 128;
+
         let blocks: Vec<SyncBlock> = self.committed_blocks
             .iter()
             .filter(|b| b.view >= request.from_view && b.view <= request.to_view)
+            .take(MAX_SYNC_BLOCKS)
             .map(|b| SyncBlock {
                 view: b.view,
                 block_hash: b.block_hash,
@@ -1186,9 +1335,18 @@ impl ConsensusOrchestrator {
 
             // Verify commit_qc before importing (defect 3 fix).
             // Without this, a malicious peer could inject forged blocks during sync.
-            if let Some(ref vs) = self.validator_set_for_sync {
-                // Check QC signature validity
-                if let Err(e) = verify_qc(&sync_block.commit_qc, vs) {
+            // When no validator set is configured, reject sync blocks entirely
+            // rather than silently skipping verification.
+            let vs = match &self.validator_set_for_sync {
+                Some(vs) => vs,
+                None => {
+                    warn!("cannot verify sync blocks: no validator set configured, rejecting sync response");
+                    return;
+                }
+            };
+            {
+                // Check CommitQC signature validity (S2 fix: use commit message format)
+                if let Err(e) = verify_commit_qc(&sync_block.commit_qc, vs) {
                     warn!(
                         view = sync_block.view,
                         hash = %sync_block.block_hash,
@@ -1227,7 +1385,7 @@ impl ConsensusOrchestrator {
             self.import_and_notify(broadcast).await;
 
             // Store in committed_blocks buffer
-            if self.committed_blocks.len() >= MAX_COMMITTED_BLOCKS {
+            if self.committed_blocks.len() >= max_committed_blocks() {
                 self.committed_blocks.pop_front();
             }
             self.committed_blocks.push_back(CommittedBlock {
@@ -1273,7 +1431,7 @@ mod tests {
     /// Helper: create a test ConsensusEngine with a single validator.
     fn make_test_engine() -> (
         ConsensusEngine,
-        mpsc::UnboundedReceiver<EngineOutput>,
+        mpsc::Receiver<EngineOutput>,
     ) {
         let sk = BlsSecretKey::random().unwrap();
         let pk = sk.public_key();
@@ -1284,7 +1442,7 @@ mod tests {
         };
 
         let vs = ValidatorSet::new(&[validator_info], 0);
-        let (output_tx, output_rx) = mpsc::unbounded_channel();
+        let (output_tx, output_rx) = mpsc::channel(1024);
 
         let engine = ConsensusEngine::new(
             0,
@@ -1471,6 +1629,7 @@ mod tests {
         let state = Arc::new(SharedConsensusState::new(vs));
 
         let (block_ready_tx, block_ready_rx) = mpsc::unbounded_channel();
+        let (leader_payload_tx, leader_payload_rx) = mpsc::unbounded_channel();
         let mut orch = ConsensusOrchestrator {
             engine,
             network,
@@ -1486,7 +1645,8 @@ mod tests {
             slot_time: Duration::ZERO,
             next_build_at: None,
             next_slot_timestamp: None,
-            pending_block_data: HashMap::new(),
+            consecutive_empty_skips: 0,
+            pending_block_data: BTreeMap::new(),
             pending_executions: HashSet::new(),
             pending_finalization: None,
             tx_import_tx: None,
@@ -1498,6 +1658,8 @@ mod tests {
             state_file: None,
             validator_set_for_sync: None,
             mobile_packet_tx: None,
+            leader_payload_rx,
+            leader_payload_tx,
         };
 
         assert!(state.load_committed_qc().is_none(), "should start with no QC");
@@ -1520,6 +1682,7 @@ mod tests {
         let (_net_event_tx, net_event_rx) = mpsc::unbounded_channel::<NetworkEvent>();
 
         let (block_ready_tx, block_ready_rx) = mpsc::unbounded_channel();
+        let (leader_payload_tx, leader_payload_rx) = mpsc::unbounded_channel();
 
         let mut orch = ConsensusOrchestrator {
             engine,
@@ -1536,7 +1699,8 @@ mod tests {
             slot_time: Duration::ZERO,
             next_build_at: None,
             next_slot_timestamp: None,
-            pending_block_data: HashMap::new(),
+            consecutive_empty_skips: 0,
+            pending_block_data: BTreeMap::new(),
             pending_executions: HashSet::new(),
             pending_finalization: None,
             tx_import_tx: None,
@@ -1548,6 +1712,8 @@ mod tests {
             state_file: None,
             validator_set_for_sync: None,
             mobile_packet_tx: None,
+            leader_payload_rx,
+            leader_payload_tx,
         };
 
         // Send a BlockReady hash through the channel.

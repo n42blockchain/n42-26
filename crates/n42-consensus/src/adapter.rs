@@ -9,7 +9,7 @@ use std::fmt::Debug;
 use std::sync::Arc;
 
 use crate::extra_data::extract_qc_from_extra_data;
-use crate::protocol::quorum::verify_qc;
+use crate::protocol::quorum::{verify_qc, verify_commit_qc};
 use crate::validator::ValidatorSet;
 
 /// N42 consensus adapter that integrates with the reth node builder.
@@ -90,9 +90,14 @@ where
         if let Some(ref vs) = self.validator_set {
             let extra_data = block.header().extra_data();
             if let Some(qc) = extract_qc_from_extra_data(extra_data)? {
-                verify_qc(&qc, vs).map_err(|e| {
-                    ConsensusError::Other(e.to_string())
-                })?;
+                // Try PrepareQC format first, then CommitQC format.
+                // The QC in extra_data could be either type depending on
+                // which consensus round produced it.
+                verify_qc(&qc, vs)
+                    .or_else(|_| verify_commit_qc(&qc, vs))
+                    .map_err(|e| {
+                        ConsensusError::Other(e.to_string())
+                    })?;
             }
             // No QC in extra_data is acceptable for:
             // - Genesis block (view 0)

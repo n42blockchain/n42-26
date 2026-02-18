@@ -1,6 +1,6 @@
 use alloy_primitives::keccak256;
 use libp2p::gossipsub::{self, Message, MessageId, TopicHash};
-use n42_primitives::ConsensusMessage;
+use n42_primitives::{ConsensusMessage, VersionedMessage, CONSENSUS_PROTOCOL_VERSION};
 
 use crate::error::NetworkError;
 
@@ -8,16 +8,24 @@ use crate::error::NetworkError;
 /// Full blocks with many transactions can reach several MB.
 const MAX_CONSENSUS_MSG_SIZE: usize = 4 * 1024 * 1024;
 
-/// Encodes a consensus message to bytes using bincode for GossipSub publishing.
+/// Encodes a consensus message to versioned bytes using bincode for GossipSub publishing.
+///
+/// Wraps the message in a `VersionedMessage` envelope so that receivers can
+/// detect version mismatches during rolling upgrades rather than silently
+/// failing to deserialize.
 pub fn encode_consensus_message(msg: &ConsensusMessage) -> Result<Vec<u8>, NetworkError> {
-    bincode::serialize(msg).map_err(|e| NetworkError::Codec(e.to_string()))
+    let versioned = VersionedMessage {
+        version: CONSENSUS_PROTOCOL_VERSION,
+        message: msg.clone(),
+    };
+    bincode::serialize(&versioned).map_err(|e| NetworkError::Codec(e.to_string()))
 }
 
-/// Decodes a consensus message from GossipSub bytes with size limit.
+/// Decodes a versioned consensus message from GossipSub bytes with size limit.
 ///
 /// Rejects payloads exceeding 4MB before deserialization to prevent OOM
-/// from decompression bombs. Uses standard `bincode::deserialize` for
-/// format compatibility with `bincode::serialize`.
+/// from decompression bombs. Checks the protocol version and rejects
+/// messages from incompatible versions.
 pub fn decode_consensus_message(data: &[u8]) -> Result<ConsensusMessage, NetworkError> {
     if data.len() > MAX_CONSENSUS_MSG_SIZE {
         return Err(NetworkError::Codec(format!(
@@ -26,7 +34,25 @@ pub fn decode_consensus_message(data: &[u8]) -> Result<ConsensusMessage, Network
             MAX_CONSENSUS_MSG_SIZE,
         )));
     }
-    bincode::deserialize(data).map_err(|e| NetworkError::Codec(e.to_string()))
+
+    // Try versioned format first (current protocol)
+    match bincode::deserialize::<VersionedMessage>(data) {
+        Ok(versioned) => {
+            if versioned.version != CONSENSUS_PROTOCOL_VERSION {
+                return Err(NetworkError::Codec(format!(
+                    "unsupported protocol version: got {}, expected {}",
+                    versioned.version, CONSENSUS_PROTOCOL_VERSION,
+                )));
+            }
+            Ok(versioned.message)
+        }
+        Err(_) => {
+            // Fallback: try decoding as bare ConsensusMessage for backward
+            // compatibility during upgrade from pre-versioned nodes.
+            bincode::deserialize::<ConsensusMessage>(data)
+                .map_err(|e| NetworkError::Codec(e.to_string()))
+        }
+    }
 }
 
 /// Generates a unique message ID for GossipSub deduplication.

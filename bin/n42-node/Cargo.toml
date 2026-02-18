@@ -20,6 +20,8 @@ n42-primitives.workspace = true
 reth-chainspec.workspace = true
 reth-ethereum-cli.workspace = true
 reth-node-builder.workspace = true
+reth-node-core.workspace = true
+reth-rpc-server-types.workspace = true
 reth-storage-api.workspace = true
 reth-tasks.workspace = true
 
@@ -32,3 +34,8 @@ hex.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 libp2p.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+aes-gcm.workspace = true
+scrypt.workspace = true
+rand.workspace = true

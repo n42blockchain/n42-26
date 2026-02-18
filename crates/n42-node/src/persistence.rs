@@ -14,8 +14,18 @@ use std::path::Path;
 /// - `scheduled_epoch_transition`: preserves staged epoch changes across restarts
 ///
 /// Approximately 520 bytes when serialized as JSON (without epoch data).
+
+/// Current snapshot format version.
+const SNAPSHOT_VERSION: u32 = 1;
+
+fn default_version() -> u32 { SNAPSHOT_VERSION }
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConsensusSnapshot {
+    /// Format version for forward compatibility. Older snapshots without this
+    /// field will default to version 1 via `default_version()`.
+    #[serde(default = "default_version")]
+    pub version: u32,
     pub current_view: u64,
     pub locked_qc: QuorumCertificate,
     pub last_committed_qc: QuorumCertificate,
@@ -25,6 +35,28 @@ pub struct ConsensusSnapshot {
     /// crash before `advance_epoch()` doesn't lose the scheduled transition.
     #[serde(default)]
     pub scheduled_epoch_transition: Option<(u64, Vec<ValidatorInfo>, u32)>,
+}
+
+impl ConsensusSnapshot {
+    /// Validates internal consistency of the snapshot.
+    ///
+    /// Returns `Ok(())` if constraints hold, or `Err` with a description
+    /// of what's inconsistent.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.locked_qc.view > self.current_view {
+            return Err(format!(
+                "locked_qc.view ({}) > current_view ({})",
+                self.locked_qc.view, self.current_view
+            ));
+        }
+        if self.last_committed_qc.view > self.locked_qc.view {
+            return Err(format!(
+                "last_committed_qc.view ({}) > locked_qc.view ({})",
+                self.last_committed_qc.view, self.locked_qc.view
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Atomically saves the consensus snapshot to a JSON file.
@@ -43,7 +75,15 @@ pub fn save_consensus_state(path: &Path, snapshot: &ConsensusSnapshot) -> io::Re
         std::fs::create_dir_all(parent)?;
     }
 
-    std::fs::write(&tmp_path, json.as_bytes())?;
+    // Write + fsync to ensure data hits disk before rename.
+    // Without fsync, a crash after rename could leave a zero-length file
+    // (the rename is metadata-only; data may still be in page cache).
+    {
+        use std::io::Write;
+        let mut file = std::fs::File::create(&tmp_path)?;
+        file.write_all(json.as_bytes())?;
+        file.sync_all()?;
+    }
     std::fs::rename(&tmp_path, path)?;
     Ok(())
 }
@@ -57,6 +97,26 @@ pub fn load_consensus_state(path: &Path) -> io::Result<Option<ConsensusSnapshot>
         Ok(json) => {
             let snapshot: ConsensusSnapshot = serde_json::from_str(&json)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+            // Warn on unknown future versions but don't reject — allows
+            // downgrading nodes to still start (best-effort).
+            if snapshot.version > SNAPSHOT_VERSION {
+                tracing::warn!(
+                    snapshot_version = snapshot.version,
+                    supported_version = SNAPSHOT_VERSION,
+                    "consensus snapshot has newer version than supported; \
+                     loading anyway but some fields may be ignored"
+                );
+            }
+
+            // Validate internal consistency.
+            if let Err(reason) = snapshot.validate() {
+                tracing::warn!(
+                    reason,
+                    "consensus snapshot failed validation; loading anyway"
+                );
+            }
+
             Ok(Some(snapshot))
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
@@ -76,6 +136,7 @@ mod tests {
         let path = dir.join("consensus_state.json");
 
         let snapshot = ConsensusSnapshot {
+            version: 1,
             current_view: 42,
             locked_qc: QuorumCertificate::genesis(),
             last_committed_qc: QuorumCertificate::genesis(),
@@ -90,6 +151,7 @@ mod tests {
             .expect("load should succeed")
             .expect("should return Some");
 
+        assert_eq!(loaded.version, 1);
         assert_eq!(loaded.current_view, 42);
         assert_eq!(loaded.consecutive_timeouts, 3);
         assert_eq!(loaded.locked_qc.view, 0);
@@ -130,6 +192,7 @@ mod tests {
         let path = dir.join("consensus_state.json");
 
         let snapshot = ConsensusSnapshot {
+            version: 1,
             current_view: 1,
             locked_qc: QuorumCertificate::genesis(),
             last_committed_qc: QuorumCertificate::genesis(),
@@ -141,5 +204,212 @@ mod tests {
         assert!(path.exists());
 
         let _ = std::fs::remove_dir_all(std::env::temp_dir().join("n42-test-deep"));
+    }
+
+    #[test]
+    fn test_load_legacy_snapshot_without_version() {
+        // Simulate a legacy snapshot by serializing a current one, then
+        // stripping the "version" field from the JSON. serde(default) should
+        // fill it back with the default value (1).
+        let dir = std::env::temp_dir().join("n42-test-legacy-version");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("consensus_state.json");
+
+        // Create a valid snapshot and serialize it.
+        let snapshot = ConsensusSnapshot {
+            version: 1,
+            current_view: 10,
+            locked_qc: QuorumCertificate::genesis(),
+            last_committed_qc: QuorumCertificate::genesis(),
+            consecutive_timeouts: 0,
+            scheduled_epoch_transition: None,
+        };
+        let mut json_value: serde_json::Value =
+            serde_json::to_value(&snapshot).expect("serialize to value");
+
+        // Remove the "version" field to simulate a legacy format.
+        json_value.as_object_mut().unwrap().remove("version");
+        let legacy_json = serde_json::to_string_pretty(&json_value).unwrap();
+        std::fs::write(&path, legacy_json).unwrap();
+
+        let loaded = load_consensus_state(&path)
+            .expect("should load legacy snapshot")
+            .expect("should return Some");
+
+        assert_eq!(loaded.version, 1, "default version should be 1");
+        assert_eq!(loaded.current_view, 10);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_validate_valid_snapshot() {
+        let snapshot = ConsensusSnapshot {
+            version: 1,
+            current_view: 10,
+            locked_qc: QuorumCertificate::genesis(),       // view 0
+            last_committed_qc: QuorumCertificate::genesis(), // view 0
+            consecutive_timeouts: 0,
+            scheduled_epoch_transition: None,
+        };
+        assert!(snapshot.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_locked_qc_exceeds_current_view() {
+        let mut locked = QuorumCertificate::genesis();
+        locked.view = 20;
+
+        let snapshot = ConsensusSnapshot {
+            version: 1,
+            current_view: 10,
+            locked_qc: locked,
+            last_committed_qc: QuorumCertificate::genesis(),
+            consecutive_timeouts: 0,
+            scheduled_epoch_transition: None,
+        };
+        assert!(snapshot.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_committed_exceeds_locked() {
+        let mut locked = QuorumCertificate::genesis();
+        locked.view = 5;
+        let mut committed = QuorumCertificate::genesis();
+        committed.view = 8;
+
+        let snapshot = ConsensusSnapshot {
+            version: 1,
+            current_view: 10,
+            locked_qc: locked,
+            last_committed_qc: committed,
+            consecutive_timeouts: 0,
+            scheduled_epoch_transition: None,
+        };
+        assert!(snapshot.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_all_views_equal() {
+        // Boundary case: locked_qc.view == last_committed_qc.view == current_view.
+        let mut locked = QuorumCertificate::genesis();
+        locked.view = 5;
+        let mut committed = QuorumCertificate::genesis();
+        committed.view = 5;
+
+        let snapshot = ConsensusSnapshot {
+            version: 1,
+            current_view: 5,
+            locked_qc: locked,
+            last_committed_qc: committed,
+            consecutive_timeouts: 0,
+            scheduled_epoch_transition: None,
+        };
+        assert!(snapshot.validate().is_ok(), "equal views should be valid");
+    }
+
+    #[test]
+    fn test_save_and_load_with_epoch_transition() {
+        use alloy_primitives::Address;
+        use n42_primitives::BlsSecretKey;
+
+        let dir = std::env::temp_dir().join("n42-test-epoch-transition");
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("consensus_state.json");
+
+        // Build a ValidatorInfo for the epoch transition data.
+        let sk = BlsSecretKey::random().expect("BLS key gen");
+        let pk = sk.public_key();
+        let validator = ValidatorInfo {
+            address: Address::with_last_byte(42),
+            bls_public_key: pk,
+        };
+
+        let snapshot = ConsensusSnapshot {
+            version: 1,
+            current_view: 100,
+            locked_qc: QuorumCertificate::genesis(),
+            last_committed_qc: QuorumCertificate::genesis(),
+            consecutive_timeouts: 2,
+            scheduled_epoch_transition: Some((3, vec![validator.clone()], 1)),
+        };
+
+        save_consensus_state(&path, &snapshot).expect("save with epoch transition");
+        let loaded = load_consensus_state(&path)
+            .expect("load")
+            .expect("should return Some");
+
+        assert_eq!(loaded.current_view, 100);
+        let (epoch, validators, ft) = loaded.scheduled_epoch_transition.expect("should have epoch transition");
+        assert_eq!(epoch, 3);
+        assert_eq!(validators.len(), 1);
+        assert_eq!(validators[0].address, Address::with_last_byte(42));
+        assert_eq!(ft, 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_consecutive_save_load_cycles() {
+        let dir = std::env::temp_dir().join("n42-test-consecutive-saves");
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("consensus_state.json");
+
+        // Save and overwrite multiple times — only the latest should persist.
+        for view in [1u64, 10, 100, 1000] {
+            let snapshot = ConsensusSnapshot {
+                version: 1,
+                current_view: view,
+                locked_qc: QuorumCertificate::genesis(),
+                last_committed_qc: QuorumCertificate::genesis(),
+                consecutive_timeouts: 0,
+                scheduled_epoch_transition: None,
+            };
+            save_consensus_state(&path, &snapshot).expect("save should succeed");
+        }
+
+        let loaded = load_consensus_state(&path)
+            .expect("load")
+            .expect("should return Some");
+        assert_eq!(loaded.current_view, 1000, "should load the latest saved state");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_load_legacy_snapshot_without_epoch_transition() {
+        // Simulate a legacy snapshot that has no scheduled_epoch_transition field.
+        let dir = std::env::temp_dir().join("n42-test-legacy-no-epoch");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("consensus_state.json");
+
+        let snapshot = ConsensusSnapshot {
+            version: 1,
+            current_view: 50,
+            locked_qc: QuorumCertificate::genesis(),
+            last_committed_qc: QuorumCertificate::genesis(),
+            consecutive_timeouts: 1,
+            scheduled_epoch_transition: None,
+        };
+        let mut json_value: serde_json::Value =
+            serde_json::to_value(&snapshot).expect("serialize");
+
+        // Remove both optional fields to simulate an old format.
+        json_value.as_object_mut().unwrap().remove("version");
+        json_value.as_object_mut().unwrap().remove("scheduled_epoch_transition");
+        let legacy_json = serde_json::to_string_pretty(&json_value).unwrap();
+        std::fs::write(&path, legacy_json).unwrap();
+
+        let loaded = load_consensus_state(&path)
+            .expect("should load")
+            .expect("should return Some");
+
+        assert_eq!(loaded.version, 1, "default version");
+        assert_eq!(loaded.current_view, 50);
+        assert!(loaded.scheduled_epoch_transition.is_none(), "should default to None");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

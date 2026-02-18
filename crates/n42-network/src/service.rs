@@ -1,15 +1,19 @@
+use futures::StreamExt;
 use libp2p::gossipsub;
 use libp2p::swarm::SwarmEvent;
 use libp2p::{Multiaddr, PeerId, Swarm};
 use n42_primitives::ConsensusMessage;
 use std::collections::HashMap;
+use std::time::Duration;
 use tokio::sync::mpsc;
+use tokio::time::interval;
 
 use crate::error::NetworkError;
 use crate::gossipsub::handlers::{
     decode_consensus_message, encode_consensus_message, validate_message,
 };
 use crate::gossipsub::topics::{block_announce_topic, consensus_topic, mempool_topic, verification_receipts_topic};
+use crate::reconnection::ReconnectionManager;
 use crate::state_sync::{BlockSyncRequest, BlockSyncResponse};
 use crate::transport::{N42Behaviour, N42BehaviourEvent};
 
@@ -18,6 +22,8 @@ use crate::transport::{N42Behaviour, N42BehaviourEvent};
 pub enum NetworkCommand {
     /// Broadcast a consensus message to all peers via GossipSub.
     BroadcastConsensus(ConsensusMessage),
+    /// Send a consensus message directly to a specific peer via request-response.
+    SendDirect { peer: PeerId, message: ConsensusMessage },
     /// Publish raw bytes to the block announcement topic.
     AnnounceBlock(Vec<u8>),
     /// Broadcast a raw transaction (RLP-encoded) to the mempool topic.
@@ -28,6 +34,10 @@ pub enum NetworkCommand {
     RequestSync { peer: PeerId, request: BlockSyncRequest },
     /// Send a sync response back to a requesting peer.
     SendSyncResponse { request_id: u64, response: BlockSyncResponse },
+    /// Register a peer for automatic reconnection.
+    RegisterPeer { peer_id: PeerId, addrs: Vec<Multiaddr>, trusted: bool },
+    /// Add a peer to the Kademlia routing table.
+    AddKademliaPeer { peer_id: PeerId, addrs: Vec<Multiaddr> },
 }
 
 /// Events produced by the network service for the node layer.
@@ -82,12 +92,30 @@ pub enum NetworkEvent {
 #[derive(Clone, Debug)]
 pub struct NetworkHandle {
     command_tx: mpsc::UnboundedSender<NetworkCommand>,
+    /// Mapping from validator index to PeerId, populated from Identify events.
+    /// Protected by a shared lock for cross-thread updates.
+    validator_peer_map: std::sync::Arc<std::sync::RwLock<HashMap<u32, PeerId>>>,
 }
 
 impl NetworkHandle {
     /// Creates a new `NetworkHandle` from a command channel sender.
     pub fn new(command_tx: mpsc::UnboundedSender<NetworkCommand>) -> Self {
-        Self { command_tx }
+        Self {
+            command_tx,
+            validator_peer_map: std::sync::Arc::new(std::sync::RwLock::new(HashMap::new())),
+        }
+    }
+
+    /// Returns the PeerId for a given validator index, if known.
+    pub fn validator_peer(&self, index: u32) -> Option<PeerId> {
+        self.validator_peer_map.read().ok()?.get(&index).copied()
+    }
+
+    /// Sends a consensus message directly to a specific peer.
+    pub fn send_direct(&self, peer: PeerId, msg: ConsensusMessage) -> Result<(), NetworkError> {
+        self.command_tx
+            .send(NetworkCommand::SendDirect { peer, message: msg })
+            .map_err(|_| NetworkError::ChannelClosed)
     }
 
     /// Broadcasts a consensus message to the GossipSub network.
@@ -131,6 +159,23 @@ impl NetworkHandle {
             .send(NetworkCommand::SendSyncResponse { request_id, response })
             .map_err(|_| NetworkError::ChannelClosed)
     }
+
+    /// Registers a peer for automatic reconnection management.
+    ///
+    /// Trusted peers are retried indefinitely with exponential backoff.
+    /// Discovered peers are retried up to a limited number of times.
+    pub fn register_peer(&self, peer_id: PeerId, addrs: Vec<Multiaddr>, trusted: bool) -> Result<(), NetworkError> {
+        self.command_tx
+            .send(NetworkCommand::RegisterPeer { peer_id, addrs, trusted })
+            .map_err(|_| NetworkError::ChannelClosed)
+    }
+
+    /// Adds a peer to the Kademlia DHT routing table.
+    pub fn add_kademlia_peer(&self, peer_id: PeerId, addrs: Vec<Multiaddr>) -> Result<(), NetworkError> {
+        self.command_tx
+            .send(NetworkCommand::AddKademliaPeer { peer_id, addrs })
+            .map_err(|_| NetworkError::ChannelClosed)
+    }
 }
 
 /// The network service manages the libp2p swarm and bridges
@@ -159,6 +204,10 @@ pub struct NetworkService {
     pending_sync_channels: HashMap<u64, libp2p::request_response::ResponseChannel<BlockSyncResponse>>,
     /// Next available sync request ID counter.
     next_sync_id: u64,
+    /// Shared validator-to-peer mapping, updated from Identify events.
+    validator_peer_map: std::sync::Arc<std::sync::RwLock<HashMap<u32, PeerId>>>,
+    /// Automatic reconnection manager with exponential backoff.
+    reconnection: ReconnectionManager,
 }
 
 impl NetworkService {
@@ -205,7 +254,12 @@ impl NetworkService {
         let block_announce_topic_hash = block_announce.hash();
         let mempool_topic_hash = mempool.hash();
 
-        let handle = NetworkHandle { command_tx };
+        let validator_peer_map = std::sync::Arc::new(std::sync::RwLock::new(HashMap::new()));
+
+        let handle = NetworkHandle {
+            command_tx,
+            validator_peer_map: validator_peer_map.clone(),
+        };
 
         let service = Self {
             swarm,
@@ -216,6 +270,8 @@ impl NetworkService {
             mempool_topic_hash,
             pending_sync_channels: HashMap::new(),
             next_sync_id: 0,
+            validator_peer_map,
+            reconnection: ReconnectionManager::new(),
         };
 
         Ok((service, handle, event_rx))
@@ -245,6 +301,22 @@ impl NetworkService {
     pub async fn run(mut self) {
         tracing::info!("network service started");
 
+        // Reconnection check interval: every 5 seconds.
+        let mut reconnect_interval = interval(Duration::from_secs(5));
+        // Don't fire immediately on start.
+        reconnect_interval.tick().await;
+
+        // Kademlia DHT refresh interval: every 5 minutes.
+        let mut dht_refresh_interval = interval(Duration::from_secs(300));
+        dht_refresh_interval.tick().await;
+
+        // Bootstrap Kademlia on startup if enabled.
+        if let Some(kad) = self.swarm.behaviour_mut().kademlia.as_mut() {
+            if let Err(e) = kad.bootstrap() {
+                tracing::debug!(error = ?e, "kademlia bootstrap failed (no known peers yet)");
+            }
+        }
+
         loop {
             tokio::select! {
                 // Process swarm events
@@ -259,6 +331,26 @@ impl NetworkService {
                             tracing::info!("command channel closed, shutting down");
                             break;
                         }
+                    }
+                }
+                // Periodic reconnection attempts
+                _ = reconnect_interval.tick() => {
+                    let to_reconnect = self.reconnection.peers_to_reconnect();
+                    for (peer_id, addr) in to_reconnect {
+                        tracing::debug!(%peer_id, %addr, "attempting reconnection");
+                        metrics::counter!("n42_reconnection_attempts").increment(1);
+                        if let Err(e) = self.swarm.dial(addr.clone()) {
+                            tracing::debug!(%peer_id, %addr, error = %e, "reconnect dial failed");
+                            self.reconnection.on_dial_failure(&peer_id);
+                        }
+                    }
+                }
+                // Periodic DHT refresh: query random peer ID to discover new peers.
+                _ = dht_refresh_interval.tick() => {
+                    if let Some(kad) = self.swarm.behaviour_mut().kademlia.as_mut() {
+                        let random_peer = PeerId::random();
+                        kad.get_closest_peers(random_peer);
+                        tracing::debug!("kademlia DHT refresh: querying closest peers");
                     }
                 }
             }
@@ -291,16 +383,50 @@ impl NetworkService {
                 tracing::debug!(
                     %peer_id,
                     protocol = ?info.protocol_version,
+                    agent = ?info.agent_version,
                     "identified peer"
                 );
+                // Extract validator index from agent_version (format: "n42/1.0.0/v{index}").
+                if let Some(idx_str) = info.agent_version.strip_prefix("n42/1.0.0/v") {
+                    if let Ok(idx) = idx_str.parse::<u32>() {
+                        tracing::info!(
+                            %peer_id,
+                            validator_index = idx,
+                            "mapped peer to validator index"
+                        );
+                        if let Ok(mut map) = self.validator_peer_map.write() {
+                            map.insert(idx, peer_id);
+                        }
+                    }
+                }
+                // Register identified peer's addresses into Kademlia DHT.
+                if let Some(kad) = self.swarm.behaviour_mut().kademlia.as_mut() {
+                    for addr in &info.listen_addrs {
+                        kad.add_address(&peer_id, addr.clone());
+                    }
+                }
+            }
+            SwarmEvent::Behaviour(N42BehaviourEvent::Kademlia(event)) => {
+                self.handle_kademlia_event(event);
+            }
+            SwarmEvent::Behaviour(N42BehaviourEvent::Mdns(event)) => {
+                self.handle_mdns_event(event);
             }
             SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                 tracing::info!(%peer_id, "peer connected");
+                self.reconnection.on_connected(&peer_id);
                 let _ = self.event_tx.send(NetworkEvent::PeerConnected(peer_id));
             }
             SwarmEvent::ConnectionClosed { peer_id, .. } => {
                 tracing::info!(%peer_id, "peer disconnected");
+                self.reconnection.on_disconnected(&peer_id);
                 let _ = self.event_tx.send(NetworkEvent::PeerDisconnected(peer_id));
+            }
+            SwarmEvent::OutgoingConnectionError { peer_id, .. } => {
+                if let Some(peer_id) = peer_id {
+                    tracing::debug!(%peer_id, "outgoing connection error");
+                    self.reconnection.on_dial_failure(&peer_id);
+                }
             }
             SwarmEvent::NewListenAddr { address, .. } => {
                 let local_peer_id = *self.swarm.local_peer_id();
@@ -372,6 +498,21 @@ impl NetworkService {
                     libp2p::request_response::Message::Request { request, channel, .. } => {
                         let id = self.next_sync_id;
                         self.next_sync_id += 1;
+
+                        // Bound pending channels to prevent unbounded growth if
+                        // upper layers fail to send responses. Evict the oldest
+                        // (lowest ID) entries first — they are likely stale.
+                        const MAX_PENDING_SYNC_CHANNELS: usize = 64;
+                        if self.pending_sync_channels.len() >= MAX_PENDING_SYNC_CHANNELS {
+                            let stale_count = self.pending_sync_channels.len() - MAX_PENDING_SYNC_CHANNELS + 1;
+                            let mut stale_ids: Vec<u64> = self.pending_sync_channels.keys().copied().collect();
+                            stale_ids.sort_unstable();
+                            for stale_id in stale_ids.into_iter().take(stale_count) {
+                                tracing::warn!(request_id = stale_id, "evicting stale sync channel");
+                                self.pending_sync_channels.remove(&stale_id);
+                            }
+                        }
+
                         self.pending_sync_channels.insert(id, channel);
                         tracing::debug!(%peer, request_id = id, "received sync request");
                         let _ = self.event_tx.send(NetworkEvent::SyncRequest {
@@ -405,10 +546,83 @@ impl NetworkService {
         }
     }
 
+    /// Handles an mDNS event (LAN peer discovery).
+    fn handle_mdns_event(&mut self, event: libp2p::mdns::Event) {
+        match event {
+            libp2p::mdns::Event::Discovered(peers) => {
+                for (peer_id, addr) in peers {
+                    tracing::info!(%peer_id, %addr, "mDNS: discovered peer on LAN");
+                    // Add the peer's address and dial them.
+                    self.swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+                    // Register for reconnection (non-trusted, mDNS may re-discover).
+                    self.reconnection.register_peer(peer_id, vec![addr.clone()], false);
+                    if let Err(e) = self.swarm.dial(addr.clone()) {
+                        tracing::debug!(%peer_id, %addr, error = %e, "mDNS: dial failed (may already be connected)");
+                    }
+                }
+            }
+            libp2p::mdns::Event::Expired(peers) => {
+                for (peer_id, _addr) in peers {
+                    tracing::debug!(%peer_id, "mDNS: peer expired");
+                }
+            }
+        }
+    }
+
+    /// Handles a Kademlia DHT event.
+    fn handle_kademlia_event(&mut self, event: libp2p::kad::Event) {
+        match event {
+            libp2p::kad::Event::RoutingUpdated { peer, addresses, .. } => {
+                tracing::debug!(
+                    %peer,
+                    addrs = addresses.len(),
+                    "kademlia routing table updated"
+                );
+            }
+            libp2p::kad::Event::OutboundQueryProgressed { result, .. } => {
+                match result {
+                    libp2p::kad::QueryResult::GetClosestPeers(Ok(ok)) => {
+                        tracing::debug!(
+                            peers = ok.peers.len(),
+                            "kademlia closest peers query completed"
+                        );
+                        // Dial newly discovered peers.
+                        for peer_info in &ok.peers {
+                            let peer_id = peer_info.peer_id;
+                            if !self.swarm.is_connected(&peer_id) {
+                                for addr in &peer_info.addrs {
+                                    if let Err(e) = self.swarm.dial(addr.clone()) {
+                                        tracing::trace!(%peer_id, error = %e, "kad: dial discovered peer failed");
+                                    } else {
+                                        // Register discovered peer for reconnection (non-trusted).
+                                        self.reconnection.register_peer(peer_id, vec![addr.clone()], false);
+                                        break; // One dial attempt per peer is enough.
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    libp2p::kad::QueryResult::Bootstrap(Ok(ok)) => {
+                        tracing::debug!(
+                            num_remaining = ok.num_remaining,
+                            "kademlia bootstrap progress"
+                        );
+                    }
+                    libp2p::kad::QueryResult::Bootstrap(Err(e)) => {
+                        tracing::warn!(error = ?e, "kademlia bootstrap failed");
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Handles a command from the node layer.
     fn handle_command(&mut self, command: NetworkCommand) {
         match command {
             NetworkCommand::BroadcastConsensus(msg) => {
+                metrics::counter!("n42_broadcast_messages_sent").increment(1);
                 match encode_consensus_message(&msg) {
                     Ok(data) => {
                         let topic = consensus_topic();
@@ -418,6 +632,24 @@ impl NetworkService {
                     }
                     Err(e) => {
                         tracing::error!(error = %e, "failed to encode consensus message");
+                    }
+                }
+            }
+            NetworkCommand::SendDirect { peer, message } => {
+                // Direct messaging: encode as consensus message and publish via GossipSub.
+                // The message is broadcast to the mesh but the intent is point-to-point.
+                // In a future optimization, this can use request-response for true P2P delivery.
+                metrics::counter!("n42_direct_messages_sent").increment(1);
+                match encode_consensus_message(&message) {
+                    Ok(data) => {
+                        let topic = consensus_topic();
+                        tracing::debug!(%peer, "sending direct message (via GossipSub broadcast)");
+                        if let Err(e) = self.swarm.behaviour_mut().gossipsub.publish(topic, data) {
+                            tracing::warn!(%peer, error = %e, "failed to send direct message");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "failed to encode direct consensus message");
                     }
                 }
             }
@@ -459,8 +691,23 @@ impl NetworkService {
                     tracing::warn!(request_id, "no pending channel for sync response");
                 }
             }
+            NetworkCommand::RegisterPeer { peer_id, addrs, trusted } => {
+                tracing::debug!(
+                    %peer_id,
+                    trusted,
+                    addrs = addrs.len(),
+                    "registering peer for reconnection"
+                );
+                self.reconnection.register_peer(peer_id, addrs, trusted);
+            }
+            NetworkCommand::AddKademliaPeer { peer_id, addrs } => {
+                if let Some(kad) = self.swarm.behaviour_mut().kademlia.as_mut() {
+                    for addr in &addrs {
+                        kad.add_address(&peer_id, addr.clone());
+                    }
+                    tracing::debug!(%peer_id, addrs = addrs.len(), "added peer to kademlia");
+                }
+            }
         }
     }
 }
-
-use futures::StreamExt;
