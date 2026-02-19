@@ -397,4 +397,43 @@ mod tests {
         assert_eq!(PhoneTier::Normal.as_str(), "normal");
         assert_eq!(PhoneTier::Slow.as_str(), "slow");
     }
+
+    #[test]
+    fn test_tier_rapid_transitions() {
+        // Simulate rapid tier changes: Fast → timeout → Normal → more timeouts → Slow → success → Fast
+        let session = MobileSession::new(1, [0u8; 48]);
+        assert_eq!(session.tier(), PhoneTier::Fast);
+
+        // 1 timeout → Normal
+        session.record_send_timeout();
+        assert_eq!(session.tier(), PhoneTier::Normal);
+
+        // 2 more → Slow (total consecutive = 3)
+        session.record_send_timeout();
+        session.record_send_timeout();
+        assert_eq!(session.tier(), PhoneTier::Slow);
+
+        // Success resets consecutive, but high avg_rtt keeps it Normal
+        session.record_rtt(3000); // avg_rtt = 3000ms (between 2000 and 5000)
+        session.record_send_success();
+        assert_eq!(session.tier(), PhoneTier::Normal);
+
+        // Good RTT brings it back to Fast
+        // Need enough low-RTT samples to pull average below 2000ms
+        for _ in 0..10 {
+            session.record_rtt(500);
+        }
+        // avg_rtt = (3000 + 500*10) / 11 = 8000/11 ≈ 727ms < 2000ms
+        assert_eq!(session.tier(), PhoneTier::Fast);
+    }
+
+    #[test]
+    fn test_tier_fast_to_slow_via_high_rtt() {
+        let session = MobileSession::new(1, [0u8; 48]);
+        assert_eq!(session.tier(), PhoneTier::Fast);
+
+        // Single very high RTT sample → immediately Slow
+        session.record_rtt(10000);
+        assert_eq!(session.tier(), PhoneTier::Slow);
+    }
 }

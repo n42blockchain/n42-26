@@ -610,6 +610,10 @@ async fn handle_phone_connection(
                             Ok(Ok(())) => {
                                 if let Some(session) = sessions.read().await.get(&session_id) {
                                     session.record_send_success();
+                                    metrics::counter!("n42_mobile_sends",
+                                        "tier" => session.tier().as_str(),
+                                        "result" => "ok"
+                                    ).increment(1);
                                 }
                             }
                             Ok(Err(e)) => {
@@ -619,7 +623,10 @@ async fn handle_phone_connection(
                             Err(_) => {
                                 if let Some(session) = sessions.read().await.get(&session_id) {
                                     session.record_send_timeout();
-                                    metrics::counter!("n42_mobile_sends", "tier" => session.tier().as_str()).increment(1);
+                                    metrics::counter!("n42_mobile_sends",
+                                        "tier" => session.tier().as_str(),
+                                        "result" => "timeout"
+                                    ).increment(1);
                                 }
                                 metrics::counter!("n42_mobile_send_timeouts").increment(1);
                                 tracing::warn!(session_id, "broadcast send timed out, skipping message");

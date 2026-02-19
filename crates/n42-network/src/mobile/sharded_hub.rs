@@ -277,4 +277,16 @@ mod tests {
         all_ids.dedup();
         assert_eq!(all_ids.len(), 4000, "session IDs must be globally unique across shards");
     }
+
+    #[tokio::test]
+    async fn test_sharded_hub_zero_shard_count_clamps_to_one() {
+        let config = ShardedStarHubConfig {
+            base_port: 19460,
+            shard_count: 0, // edge case: 0 should be clamped to 1
+            ..Default::default()
+        };
+        let (hub, _handle, _event_rx) = ShardedStarHub::new(config);
+        assert_eq!(hub.shard_count(), 1, "shard_count=0 must clamp to 1");
+        assert_eq!(hub.ports(), vec![19460]);
+    }
 }
