@@ -137,6 +137,12 @@ rand = "0.8"
 aes-gcm = "0.10"
 scrypt = { version = "0.11", default-features = false, features = ["std"] }
 
+# Zero-copy
+bytes = "1"
+
+# Compression
+zstd = "0.13"
+
 # Misc
 auto_impl = "1.0"
 derive_more = { version = "1.0", features = ["display"] }

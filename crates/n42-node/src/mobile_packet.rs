@@ -34,6 +34,9 @@ pub enum MobilePacketError {
 
     #[error("packet encode error: {0}")]
     PacketEncode(#[from] PacketError),
+
+    #[error("compression error: {0}")]
+    Compression(String),
 }
 
 /// Runs the mobile packet generation loop.
@@ -127,7 +130,7 @@ pub async fn mobile_packet_loop<P>(
     provider: P,
     chain_spec: Arc<ChainSpec>,
     hub_handle: StarHubHandle,
-    mut phone_connected_rx: mpsc::Receiver<()>,
+    mut phone_connected_rx: mpsc::Receiver<u64>,
 ) where
     P: BlockReader<Block = <EthPrimitives as NodePrimitives>::Block>
         + StateProviderFactory
@@ -223,10 +226,10 @@ pub async fn mobile_packet_loop<P>(
                 }
             }
 
-            _ = phone_connected_rx.recv() => {
-                // A new phone connected. Broadcast all previously-sent codes so the
-                // new phone can populate its cache. Existing phones will just re-insert
-                // (idempotent). Per-session targeted send is a future optimization.
+            session_id = phone_connected_rx.recv() => {
+                let Some(session_id) = session_id else { continue; };
+                // A new phone connected. Send cached codes only to this specific phone
+                // (targeted send via per-session channel, avoiding broadcast to all phones).
                 if previously_sent_codes.is_empty() {
                     continue;
                 }
@@ -240,14 +243,19 @@ pub async fn mobile_packet_loop<P>(
                 match bincode::serialize(&msg) {
                     Ok(data) => {
                         let code_count = msg.codes.len();
-                        let data_len = data.len();
-                        if let Err(e) = hub_handle.broadcast_cache_sync(data) {
-                            warn!(error = %e, "failed to broadcast cache sync to new phone");
+                        let raw_len = data.len();
+                        let compressed = zstd::bulk::compress(&data, 3)
+                            .unwrap_or(data); // fallback to raw on compression failure
+                        let compressed_len = compressed.len();
+                        if let Err(e) = hub_handle.send_to_session(session_id, bytes::Bytes::from(compressed)) {
+                            warn!(error = %e, session_id, "failed to send cache sync to new phone");
                         } else {
                             info!(
                                 codes = code_count,
-                                bytes = data_len,
-                                "broadcast cache sync for new phone connection"
+                                raw_bytes = raw_len,
+                                compressed_bytes = compressed_len,
+                                session_id,
+                                "sent targeted cache sync to new phone"
                             );
                         }
                     }
@@ -342,10 +350,14 @@ where
         "verification packet built (differential)"
     );
 
-    // Step 6: Encode and broadcast.
+    // Step 6: Encode, compress, and broadcast.
     let encoded = encode_packet(&packet)?;
-    let packet_size = encoded.len();
-    let _ = hub_handle.broadcast_packet(encoded);
+    let raw_size = encoded.len();
+    let compressed = zstd::bulk::compress(&encoded, 3)
+        .map_err(|e| MobilePacketError::Compression(e.to_string()))?;
+    let packet_size = compressed.len();
+    debug!(block_number, raw_size, compressed_size = packet_size, "verification packet compressed");
+    let _ = hub_handle.broadcast_packet(bytes::Bytes::from(compressed));
 
     // Step 7: Update previously_sent_codes with ALL codes from this block
     // (not just the ones we sent, since phones that received earlier blocks already have them).
@@ -540,5 +552,26 @@ mod tests {
         // Verify defaults when env vars are not set
         assert_eq!(packet_max_retries(), 10);
         assert_eq!(packet_retry_base_ms(), 200);
+    }
+
+    #[test]
+    fn test_zstd_roundtrip() {
+        let data = vec![0xABu8; 10_000];
+        let compressed = zstd::bulk::compress(&data, 3).unwrap();
+        assert!(compressed.len() < data.len());
+        let decompressed = zstd::bulk::decompress(&compressed, 16 * 1024 * 1024).unwrap();
+        assert_eq!(decompressed, data);
+    }
+
+    #[test]
+    fn test_zstd_witness_like_data_compresses_well() {
+        let mut data = Vec::new();
+        for _ in 0..100 {
+            data.extend_from_slice(&[0x00; 20]); // address
+            data.extend_from_slice(&[0x00; 32]); // storage key
+            data.extend_from_slice(&[0xAB; 32]); // repeated value
+        }
+        let compressed = zstd::bulk::compress(&data, 3).unwrap();
+        assert!(compressed.len() * 2 < data.len(), "should achieve >50% compression");
     }
 }

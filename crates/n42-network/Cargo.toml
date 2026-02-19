@@ -40,6 +40,9 @@ hex.workspace = true
 # Random (jitter for reconnection backoff)
 rand.workspace = true
 
+# Zero-copy
+bytes.workspace = true
+
 # Logging & metrics
 tracing.workspace = true
 metrics.workspace = true

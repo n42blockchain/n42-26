@@ -59,6 +59,8 @@ bincode.workspace = true
 async-trait = "0.1"
 hex.workspace = true
 
+bytes.workspace = true
+zstd.workspace = true
 eyre.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

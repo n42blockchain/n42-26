@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use n42_mobile::receipt::VerificationReceipt;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -7,10 +8,14 @@ use tokio::sync::{broadcast, mpsc, RwLock};
 
 use super::session::MobileSession;
 
-/// Message type prefix for verification packets.
-const MSG_TYPE_PACKET: u8 = 0x01;
-/// Message type prefix for cache sync messages.
-const MSG_TYPE_CACHE_SYNC: u8 = 0x02;
+/// Message type prefix for verification packets (uncompressed).
+pub const MSG_TYPE_PACKET: u8 = 0x01;
+/// Message type prefix for cache sync messages (uncompressed).
+pub const MSG_TYPE_CACHE_SYNC: u8 = 0x02;
+/// Message type prefix for zstd-compressed verification packets.
+pub const MSG_TYPE_PACKET_ZSTD: u8 = 0x03;
+/// Message type prefix for zstd-compressed cache sync messages.
+pub const MSG_TYPE_CACHE_SYNC_ZSTD: u8 = 0x04;
 
 /// Handshake timeout: phones must send their public key within this duration.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -28,15 +33,22 @@ const RECEIPT_READ_TIMEOUT: Duration = Duration::from_secs(10);
 /// Each phone sends ~1 receipt per 8s slot; 2s allows up to 4/slot (4x headroom).
 const MIN_RECEIPT_INTERVAL: Duration = Duration::from_secs(2);
 
+/// Timeout for sending a broadcast message to a single phone.
+/// Covers open_uni + write_all + finish. Slow phones that exceed this
+/// have the current message skipped (connection stays open).
+const BROADCAST_SEND_TIMEOUT: Duration = Duration::from_secs(3);
+
 
 
 /// Commands sent to the star hub from the node layer.
 #[derive(Debug)]
 pub enum HubCommand {
     /// Push a verification packet (serialized bytes) to all connected phones.
-    BroadcastPacket(Vec<u8>),
+    BroadcastPacket(Bytes),
     /// Push a cache sync message to all connected phones.
-    BroadcastCacheSync(Vec<u8>),
+    BroadcastCacheSync(Bytes),
+    /// Send data to a specific session (e.g., targeted CacheSync).
+    SendToSession { session_id: u64, data: Bytes },
     /// Disconnect a specific session.
     DisconnectSession(u64),
 }
@@ -66,9 +78,9 @@ pub enum HubEvent {
 #[derive(Clone, Debug)]
 enum BroadcastMsg {
     /// Verification packet data.
-    Packet(Vec<u8>),
+    Packet(Bytes),
     /// Cache sync message data.
-    CacheSync(Vec<u8>),
+    CacheSync(Bytes),
 }
 
 /// Configuration for the mobile star hub.
@@ -110,16 +122,23 @@ pub struct StarHubHandle {
 
 impl StarHubHandle {
     /// Broadcasts a verification packet to all connected phones.
-    pub fn broadcast_packet(&self, data: Vec<u8>) -> Result<(), crate::error::NetworkError> {
+    pub fn broadcast_packet(&self, data: Bytes) -> Result<(), crate::error::NetworkError> {
         self.command_tx
             .send(HubCommand::BroadcastPacket(data))
             .map_err(|_| crate::error::NetworkError::ChannelClosed)
     }
 
     /// Broadcasts a cache sync message to all connected phones.
-    pub fn broadcast_cache_sync(&self, data: Vec<u8>) -> Result<(), crate::error::NetworkError> {
+    pub fn broadcast_cache_sync(&self, data: Bytes) -> Result<(), crate::error::NetworkError> {
         self.command_tx
             .send(HubCommand::BroadcastCacheSync(data))
+            .map_err(|_| crate::error::NetworkError::ChannelClosed)
+    }
+
+    /// Sends data to a specific session (targeted send).
+    pub fn send_to_session(&self, session_id: u64, data: Bytes) -> Result<(), crate::error::NetworkError> {
+        self.command_tx
+            .send(HubCommand::SendToSession { session_id, data })
             .map_err(|_| crate::error::NetworkError::ChannelClosed)
     }
 }
@@ -162,6 +181,8 @@ pub struct StarHub {
     event_tx: mpsc::UnboundedSender<HubEvent>,
     /// Broadcast sender for pushing data to all connection handlers.
     broadcast_tx: broadcast::Sender<BroadcastMsg>,
+    /// Per-session senders for targeted messages (e.g., CacheSync to a specific phone).
+    session_senders: Arc<RwLock<HashMap<u64, mpsc::Sender<Bytes>>>>,
     /// SHA-256 hash of the server certificate (populated during run()).
     cert_hash: Option<[u8; 32]>,
 }
@@ -185,6 +206,7 @@ impl StarHub {
             command_rx,
             event_tx,
             broadcast_tx,
+            session_senders: Arc::new(RwLock::new(HashMap::new())),
             cert_hash: None,
         };
 
@@ -242,11 +264,13 @@ impl StarHub {
         let event_tx = self.event_tx.clone();
         let max_conns = self.config.max_connections;
         let broadcast_tx = self.broadcast_tx.clone();
+        let session_senders = self.session_senders.clone();
 
         // Spawn connection acceptor
         let accept_sessions = sessions.clone();
         let accept_event_tx = event_tx.clone();
         let accept_endpoint = endpoint.clone();
+        let accept_session_senders = session_senders.clone();
         tokio::spawn(async move {
             let mut session_id_counter: u64 = 1;
             while let Some(incoming) = accept_endpoint.accept().await {
@@ -263,6 +287,11 @@ impl StarHub {
                 let sid = session_id_counter;
                 session_id_counter += 1;
 
+                // Create per-session channel for targeted messages
+                let (session_tx, session_rx) = mpsc::channel::<Bytes>(8);
+                accept_session_senders.write().await.insert(sid, session_tx);
+                let senders = accept_session_senders.clone();
+
                 tokio::spawn(async move {
                     match incoming.await {
                         Ok(connection) => {
@@ -272,12 +301,15 @@ impl StarHub {
                                 sessions,
                                 event_tx,
                                 broadcast_rx,
+                                session_rx,
+                                senders,
                                 max_conns,
                             )
                             .await;
                         }
                         Err(e) => {
                             tracing::debug!(error = %e, "incoming connection failed");
+                            senders.write().await.remove(&sid);
                         }
                     }
                 });
@@ -304,6 +336,14 @@ impl StarHub {
                         "broadcasting cache sync to phones"
                     );
                 }
+                HubCommand::SendToSession { session_id, data } => {
+                    let senders = self.session_senders.read().await;
+                    if let Some(tx) = senders.get(&session_id) {
+                        if tx.try_send(data).is_err() {
+                            tracing::warn!(session_id, "per-session channel full, dropping targeted message");
+                        }
+                    }
+                }
                 HubCommand::DisconnectSession(session_id) => {
                     self.sessions.write().await.remove(&session_id);
                     tracing::debug!(session_id, "disconnected mobile session");
@@ -324,6 +364,8 @@ async fn handle_phone_connection(
     sessions: Arc<RwLock<HashMap<u64, MobileSession>>>,
     event_tx: mpsc::UnboundedSender<HubEvent>,
     mut broadcast_rx: broadcast::Receiver<BroadcastMsg>,
+    mut session_rx: mpsc::Receiver<Bytes>,
+    session_senders: Arc<RwLock<HashMap<u64, mpsc::Sender<Bytes>>>>,
     max_connections: usize,
 ) {
     tracing::debug!(
@@ -485,27 +527,32 @@ async fn handle_phone_connection(
                 match msg {
                     Ok(broadcast_msg) => {
                         let (type_prefix, data) = match &broadcast_msg {
-                            BroadcastMsg::Packet(d) => (MSG_TYPE_PACKET, d.as_slice()),
-                            BroadcastMsg::CacheSync(d) => (MSG_TYPE_CACHE_SYNC, d.as_slice()),
+                            BroadcastMsg::Packet(d) => (MSG_TYPE_PACKET_ZSTD, d.as_ref()),
+                            BroadcastMsg::CacheSync(d) => (MSG_TYPE_CACHE_SYNC_ZSTD, d.as_ref()),
                         };
-                        match connection.open_uni().await {
-                            Ok(mut send) => {
-                                // Write type prefix + payload as a framed message
-                                if send.write_all(&[type_prefix]).await.is_err()
-                                    || send.write_all(data).await.is_err()
-                                    || send.finish().is_err()
-                                {
-                                    tracing::debug!(session_id, "failed to send broadcast, disconnecting");
-                                    break;
-                                }
-                                // P2 fix: read lock + atomic counter instead of write lock
+                        let send_result = tokio::time::timeout(
+                            BROADCAST_SEND_TIMEOUT,
+                            async {
+                                let mut send = connection.open_uni().await?;
+                                send.write_all(&[type_prefix]).await?;
+                                send.write_all(data).await?;
+                                send.finish()?;
+                                Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+                            },
+                        ).await;
+                        match send_result {
+                            Ok(Ok(())) => {
                                 if let Some(session) = sessions.read().await.get(&session_id) {
                                     session.record_packet_sent();
                                 }
                             }
-                            Err(e) => {
-                                tracing::debug!(session_id, error = %e, "failed to open uni stream");
+                            Ok(Err(e)) => {
+                                tracing::debug!(session_id, error = %e, "broadcast send failed, disconnecting");
                                 break;
+                            }
+                            Err(_) => {
+                                metrics::counter!("n42_mobile_send_timeouts").increment(1);
+                                tracing::warn!(session_id, "broadcast send timed out, skipping message");
                             }
                         }
                     }
@@ -519,11 +566,38 @@ async fn handle_phone_connection(
                     }
                 }
             }
+            // Handle targeted messages for this specific session
+            Some(data) = session_rx.recv() => {
+                let send_result = tokio::time::timeout(
+                    BROADCAST_SEND_TIMEOUT,
+                    async {
+                        let mut send = connection.open_uni().await?;
+                        send.write_all(&[MSG_TYPE_CACHE_SYNC_ZSTD]).await?;
+                        send.write_all(&data).await?;
+                        send.finish()?;
+                        Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+                    },
+                ).await;
+                match send_result {
+                    Ok(Ok(())) => {
+                        tracing::debug!(session_id, size = data.len(), "sent targeted message");
+                    }
+                    Ok(Err(e)) => {
+                        tracing::debug!(session_id, error = %e, "targeted send failed, disconnecting");
+                        break;
+                    }
+                    Err(_) => {
+                        metrics::counter!("n42_mobile_send_timeouts").increment(1);
+                        tracing::warn!(session_id, "targeted send timed out, skipping");
+                    }
+                }
+            }
         }
     }
 
-    // Clean up session
+    // Clean up session and per-session sender
     sessions.write().await.remove(&session_id);
+    session_senders.write().await.remove(&session_id);
     let _ = event_tx.send(HubEvent::PhoneDisconnected { session_id });
     tracing::debug!(session_id, "phone disconnected");
 }
@@ -625,10 +699,10 @@ mod tests {
 
     #[test]
     fn test_broadcast_msg_clone() {
-        let msg = BroadcastMsg::Packet(vec![1, 2, 3]);
+        let msg = BroadcastMsg::Packet(Bytes::from(vec![1, 2, 3]));
         let cloned = msg.clone();
         match cloned {
-            BroadcastMsg::Packet(data) => assert_eq!(data, vec![1, 2, 3]),
+            BroadcastMsg::Packet(data) => assert_eq!(&data[..], &[1, 2, 3]),
             _ => panic!("unexpected variant"),
         }
     }
@@ -638,7 +712,7 @@ mod tests {
         let (tx, mut rx1) = broadcast::channel::<BroadcastMsg>(16);
         let mut rx2 = tx.subscribe();
 
-        let data = vec![0xAA, 0xBB];
+        let data = Bytes::from(vec![0xAA, 0xBB]);
         tx.send(BroadcastMsg::Packet(data.clone())).unwrap();
 
         match rx1.try_recv().unwrap() {
@@ -655,15 +729,15 @@ mod tests {
     fn test_broadcast_channel_both_variants() {
         let (tx, mut rx) = broadcast::channel::<BroadcastMsg>(16);
 
-        tx.send(BroadcastMsg::Packet(vec![1])).unwrap();
-        tx.send(BroadcastMsg::CacheSync(vec![2])).unwrap();
+        tx.send(BroadcastMsg::Packet(Bytes::from(vec![1]))).unwrap();
+        tx.send(BroadcastMsg::CacheSync(Bytes::from(vec![2]))).unwrap();
 
         match rx.try_recv().unwrap() {
-            BroadcastMsg::Packet(d) => assert_eq!(d, vec![1]),
+            BroadcastMsg::Packet(d) => assert_eq!(&d[..], &[1]),
             _ => panic!("expected Packet"),
         }
         match rx.try_recv().unwrap() {
-            BroadcastMsg::CacheSync(d) => assert_eq!(d, vec![2]),
+            BroadcastMsg::CacheSync(d) => assert_eq!(&d[..], &[2]),
             _ => panic!("expected CacheSync"),
         }
     }
@@ -672,7 +746,16 @@ mod tests {
     fn test_msg_type_constants() {
         assert_eq!(MSG_TYPE_PACKET, 0x01);
         assert_eq!(MSG_TYPE_CACHE_SYNC, 0x02);
+        assert_eq!(MSG_TYPE_PACKET_ZSTD, 0x03);
+        assert_eq!(MSG_TYPE_CACHE_SYNC_ZSTD, 0x04);
         assert_ne!(MSG_TYPE_PACKET, MSG_TYPE_CACHE_SYNC);
+        // All type prefixes must be distinct
+        let types = [MSG_TYPE_PACKET, MSG_TYPE_CACHE_SYNC, MSG_TYPE_PACKET_ZSTD, MSG_TYPE_CACHE_SYNC_ZSTD];
+        for i in 0..types.len() {
+            for j in (i + 1)..types.len() {
+                assert_ne!(types[i], types[j], "message type prefixes must be unique");
+            }
+        }
     }
 
     #[test]
@@ -695,8 +778,29 @@ mod tests {
         let (_hub, handle, _event_rx) = StarHub::new(config);
 
         // Should succeed while hub exists
-        assert!(handle.broadcast_packet(vec![1, 2, 3]).is_ok());
-        assert!(handle.broadcast_cache_sync(vec![4, 5, 6]).is_ok());
+        assert!(handle.broadcast_packet(Bytes::from(vec![1, 2, 3])).is_ok());
+        assert!(handle.broadcast_cache_sync(Bytes::from(vec![4, 5, 6])).is_ok());
+    }
+
+    #[test]
+    fn test_send_to_session_command() {
+        let config = StarHubConfig::default();
+        let (_hub, handle, _event_rx) = StarHub::new(config);
+        assert!(handle.send_to_session(42, Bytes::from(vec![1, 2, 3])).is_ok());
+    }
+
+    #[test]
+    fn test_bytes_clone_is_zero_copy() {
+        let original = Bytes::from(vec![0u8; 100_000]);
+        let cloned = original.clone();
+        assert_eq!(original.as_ptr(), cloned.as_ptr(),
+            "Bytes::clone should share underlying allocation");
+    }
+
+    #[test]
+    fn test_broadcast_send_timeout_reasonable() {
+        assert!(BROADCAST_SEND_TIMEOUT.as_secs() >= 1);
+        assert!(BROADCAST_SEND_TIMEOUT.as_secs() <= 5, "must leave time for verify in 8s slot");
     }
 
     #[test]

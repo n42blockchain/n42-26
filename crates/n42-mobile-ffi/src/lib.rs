@@ -742,7 +742,7 @@ async fn recv_loop(
 
                         match msg_type {
                             0x01 => {
-                                // VerificationPacket
+                                // VerificationPacket (uncompressed, legacy)
                                 debug!(size = payload.len(), "received verification packet");
                                 let mut queue = lock_or_recover(&pending_packets);
                                 if queue.len() >= MAX_PENDING_PACKETS {
@@ -756,9 +756,34 @@ async fn recv_loop(
                                 }
                                 queue.push_back(payload.to_vec());
                             }
+                            0x03 => {
+                                // VerificationPacket (zstd compressed)
+                                match zstd::bulk::decompress(payload, 16 * 1024 * 1024) {
+                                    Ok(decompressed) => {
+                                        debug!(
+                                            compressed = payload.len(),
+                                            decompressed = decompressed.len(),
+                                            "received verification packet (zstd)"
+                                        );
+                                        let mut queue = lock_or_recover(&pending_packets);
+                                        if queue.len() >= MAX_PENDING_PACKETS {
+                                            dropped_count.fetch_add(1, Ordering::Relaxed);
+                                            warn!(
+                                                queue_len = queue.len(),
+                                                dropped = dropped_count.load(Ordering::Relaxed),
+                                                "packet queue full, dropping oldest packet"
+                                            );
+                                            queue.pop_front();
+                                        }
+                                        queue.push_back(decompressed);
+                                    }
+                                    Err(e) => {
+                                        warn!("zstd decompress failed: {}", e);
+                                    }
+                                }
+                            }
                             0x02 => {
-                                // CacheSyncMessage: pre-populate local code cache with hot bytecodes.
-                                // [C2] Size-limited deserialization prevents OOM from malicious messages.
+                                // CacheSyncMessage (uncompressed, legacy)
                                 const MAX_CACHE_SYNC_SIZE: usize = 16 * 1024 * 1024; // 16MB
                                 if payload.len() > MAX_CACHE_SYNC_SIZE {
                                     warn!("CacheSyncMessage too large ({} bytes), dropping", payload.len());
@@ -779,6 +804,32 @@ async fn recv_loop(
                                     }
                                     Err(e) => {
                                         warn!("failed to decode CacheSyncMessage: {}", e);
+                                    }
+                                }
+                            }
+                            0x04 => {
+                                // CacheSyncMessage (zstd compressed)
+                                match zstd::bulk::decompress(payload, 16 * 1024 * 1024) {
+                                    Ok(decompressed) => {
+                                        match bincode::deserialize::<CacheSyncMessage>(&decompressed) {
+                                            Ok(msg) => {
+                                                let (added, evicted) =
+                                                    apply_cache_sync(msg, &code_cache);
+                                                let cache_size = lock_or_recover(&code_cache).len();
+                                                info!(
+                                                    added,
+                                                    evicted,
+                                                    cache_size,
+                                                    "applied compressed cache sync message"
+                                                );
+                                            }
+                                            Err(e) => {
+                                                warn!("failed to decode CacheSyncMessage: {}", e);
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!("zstd decompress CacheSync failed: {}", e);
                                     }
                                 }
                             }

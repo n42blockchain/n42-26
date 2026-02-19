@@ -5596,6 +5596,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber 0.3.22",
+ "zstd",
 ]
 
 [[package]]
@@ -5604,6 +5605,7 @@ version = "0.1.0"
 dependencies = [
  "alloy-primitives",
  "bincode",
+ "bytes",
  "eyre",
  "futures",
  "hex",
@@ -5634,6 +5636,7 @@ dependencies = [
  "arc-swap",
  "async-trait",
  "bincode",
+ "bytes",
  "eyre",
  "hex",
  "jsonrpsee",
@@ -5678,6 +5681,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "zstd",
 ]
 
 [[package]]

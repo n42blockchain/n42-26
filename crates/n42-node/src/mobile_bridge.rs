@@ -41,8 +41,8 @@ pub struct MobileVerificationBridge {
     /// Optional sender for attestation notifications.
     attestation_tx: Option<mpsc::Sender<AttestationEvent>>,
     /// Optional sender for notifying when a new phone connects.
-    /// Used by `mobile_packet_loop` to trigger CacheSyncMessage broadcast.
-    phone_connected_tx: Option<mpsc::Sender<()>>,
+    /// Carries the session_id so CacheSync can be sent to that specific session.
+    phone_connected_tx: Option<mpsc::Sender<u64>>,
     /// Currently connected session IDs, used to derive connected_count accurately.
     /// Prevents count drift from duplicate connect/disconnect events.
     connected_sessions: HashSet<u64>,
@@ -93,12 +93,12 @@ impl MobileVerificationBridge {
 
     /// Sets the phone-connected notification channel.
     ///
-    /// When a new phone connects, a `()` notification is sent on this channel.
-    /// The `mobile_packet_loop` listens for these notifications to trigger
-    /// CacheSyncMessage broadcasts (sending cached bytecodes to new phones).
+    /// When a new phone connects, its `session_id` is sent on this channel.
+    /// The `mobile_packet_loop` listens for these notifications to send
+    /// targeted CacheSyncMessage to the specific new phone.
     pub fn with_phone_connected_tx(
         mut self,
-        tx: mpsc::Sender<()>,
+        tx: mpsc::Sender<u64>,
     ) -> Self {
         self.phone_connected_tx = Some(tx);
         self
@@ -123,9 +123,9 @@ impl MobileVerificationBridge {
                         connected = self.connected_sessions.len(),
                         "mobile verifier connected"
                     );
-                    // Notify mobile_packet_loop to send CacheSyncMessage.
+                    // Notify mobile_packet_loop to send targeted CacheSync to this session.
                     if let Some(ref tx) = self.phone_connected_tx {
-                        let _ = tx.try_send(());
+                        let _ = tx.try_send(session_id);
                     }
                 }
                 HubEvent::PhoneDisconnected { session_id } => {
