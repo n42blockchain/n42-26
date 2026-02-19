@@ -1,5 +1,6 @@
 use alloy_primitives::B256;
 use std::collections::{HashMap, HashSet};
+use tracing::warn;
 
 use crate::receipt::VerificationReceipt;
 
@@ -94,13 +95,15 @@ impl ReceiptAggregator {
     ///
     /// `default_threshold` is the number of valid receipts required
     /// for attestation (typically 2/3 of connected phones).
-    /// Must be at least 1; threshold=0 would cause all blocks to be
-    /// immediately "attested" with zero receipts.
+    /// If `default_threshold` is 0, it is clamped to 1 to prevent
+    /// blocks from being "attested" with zero receipts.
     pub fn new(default_threshold: u32, max_tracked_blocks: usize) -> Self {
-        debug_assert!(
-            default_threshold >= 1,
-            "attestation threshold must be at least 1"
-        );
+        let default_threshold = if default_threshold == 0 {
+            warn!("attestation threshold 0 is invalid, clamping to 1");
+            1
+        } else {
+            default_threshold
+        };
         Self {
             blocks: HashMap::new(),
             default_threshold,
@@ -178,8 +181,15 @@ impl ReceiptAggregator {
     }
 
     /// Updates the default threshold (e.g., when phone count changes).
+    ///
+    /// If `threshold` is 0, it is clamped to 1.
     pub fn set_default_threshold(&mut self, threshold: u32) {
-        self.default_threshold = threshold;
+        self.default_threshold = if threshold == 0 {
+            warn!("attestation threshold 0 is invalid, clamping to 1");
+            1
+        } else {
+            threshold
+        };
     }
 }
 
@@ -395,5 +405,43 @@ mod tests {
 
         let ratio = status.validity_ratio();
         assert!((ratio - 0.75).abs() < f64::EPSILON, "expected 0.75, got {ratio}");
+    }
+
+    #[test]
+    fn test_aggregator_threshold_zero_clamp() {
+        // threshold=0 should be clamped to 1 in production builds.
+        let mut agg = ReceiptAggregator::new(0, 100);
+        let bh = hash(40);
+        agg.register_block(bh, 4000);
+
+        // Before any receipt, the block should NOT be attested (threshold=1 after clamp).
+        assert!(!agg.get_status(&bh).unwrap().is_attested());
+
+        // One valid receipt should now trigger attestation (threshold=1).
+        let r = mock_receipt(bh, 4000, true, true, pubkey(1));
+        let result = agg.process_receipt(&r);
+        assert_eq!(result, Some(true), "clamped threshold=1 should attest on first valid receipt");
+    }
+
+    #[test]
+    fn test_set_default_threshold() {
+        let mut agg = ReceiptAggregator::new(5, 100);
+
+        // Register block with old threshold.
+        let bh1 = hash(60);
+        agg.register_block(bh1, 6000);
+        assert_eq!(agg.get_status(&bh1).unwrap().threshold, 5);
+
+        // Update threshold; new blocks should use the new value.
+        agg.set_default_threshold(3);
+        let bh2 = hash(61);
+        agg.register_block(bh2, 6001);
+        assert_eq!(agg.get_status(&bh2).unwrap().threshold, 3);
+
+        // set_default_threshold(0) should be clamped to 1.
+        agg.set_default_threshold(0);
+        let bh3 = hash(62);
+        agg.register_block(bh3, 6002);
+        assert_eq!(agg.get_status(&bh3).unwrap().threshold, 1);
     }
 }

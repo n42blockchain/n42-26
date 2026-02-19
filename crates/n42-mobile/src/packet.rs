@@ -97,6 +97,9 @@ pub enum PacketError {
     /// Failed to serialize the verification packet.
     #[error("packet serialization failed: {0}")]
     Encode(#[from] bincode::Error),
+    /// Failed to deserialize the verification packet.
+    #[error("packet deserialization failed: {0}")]
+    Decode(bincode::Error),
 }
 
 /// Encodes a verification packet to bytes for transmission.
@@ -106,7 +109,7 @@ pub fn encode_packet(packet: &VerificationPacket) -> Result<Vec<u8>, PacketError
 
 /// Decodes a verification packet from bytes.
 pub fn decode_packet(data: &[u8]) -> Result<VerificationPacket, PacketError> {
-    bincode::deserialize(data).map_err(PacketError::Encode)
+    bincode::deserialize(data).map_err(PacketError::Decode)
 }
 
 #[cfg(test)]
@@ -224,5 +227,16 @@ mod tests {
             block_hashes: vec![],
         };
         assert_eq!(empty_packet.estimated_size(), 200, "empty packet should only have header overhead");
+    }
+
+    #[test]
+    fn test_decode_packet_invalid_data() {
+        let garbage = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        let result = decode_packet(&garbage);
+        assert!(result.is_err(), "garbage data should fail to decode");
+        let err = result.unwrap_err();
+        assert!(matches!(err, PacketError::Decode(_)), "should be a Decode error variant");
+        let msg = format!("{}", err);
+        assert!(msg.contains("deserialization"), "error message should mention deserialization");
     }
 }

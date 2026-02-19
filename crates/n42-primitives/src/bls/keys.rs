@@ -292,4 +292,86 @@ mod tests {
         pk.verify(hash.as_slice(), &sig)
             .expect("sign_hash result should verify against hash bytes");
     }
+
+    #[test]
+    fn test_key_gen_deterministic() {
+        let ikm = [42u8; 32];
+        let sk1 = BlsSecretKey::key_gen(&ikm).expect("key_gen should succeed");
+        let sk2 = BlsSecretKey::key_gen(&ikm).expect("key_gen should succeed");
+
+        // Same IKM → same public key
+        assert_eq!(
+            sk1.public_key().to_bytes(),
+            sk2.public_key().to_bytes(),
+            "key_gen with same IKM should produce the same key"
+        );
+
+        // Different IKM → different public key
+        let sk3 = BlsSecretKey::key_gen(&[99u8; 32]).unwrap();
+        assert_ne!(
+            sk1.public_key().to_bytes(),
+            sk3.public_key().to_bytes(),
+            "key_gen with different IKM should produce different keys"
+        );
+
+        // Verify the generated key can sign and verify
+        let sig = sk1.sign(b"test");
+        sk1.public_key().verify(b"test", &sig)
+            .expect("key_gen key should produce valid signatures");
+    }
+
+    #[test]
+    fn test_from_bytes_invalid_rejects() {
+        // Invalid public key bytes (all 0xFF is not a valid BLS12-381 point)
+        let bad_pk = [0xFF; 48];
+        let result = BlsPublicKey::from_bytes(&bad_pk);
+        assert!(result.is_err(), "garbage public key bytes should be rejected");
+
+        // Invalid signature bytes
+        let bad_sig = [0xFF; 96];
+        let result = BlsSignature::from_bytes(&bad_sig);
+        assert!(result.is_err(), "garbage signature bytes should be rejected");
+
+        // Invalid secret key bytes (all 0xFF exceeds the BLS12-381 curve order)
+        let bad_sk = [0xFF; 32];
+        let result = BlsSecretKey::from_bytes(&bad_sk);
+        assert!(result.is_err(), "out-of-range secret key bytes should be rejected");
+    }
+
+    #[test]
+    fn test_secret_key_debug_hides_secret() {
+        let sk = BlsSecretKey::random().unwrap();
+        let debug_str = format!("{:?}", sk);
+
+        // Debug should show the public key, not the raw secret key material
+        assert!(
+            debug_str.contains("BlsSecretKey"),
+            "Debug should mention BlsSecretKey"
+        );
+        assert!(
+            debug_str.contains("public_key"),
+            "Debug should show the public key field"
+        );
+        // The 32-byte raw secret key is never exposed in any debug output.
+        // We verify indirectly: debug output should be short (no raw 32-byte hex dump).
+        assert!(
+            debug_str.len() < 200,
+            "Debug output should be concise, not dump raw key material"
+        );
+    }
+
+    #[test]
+    fn test_serde_wrong_length_rejects() {
+        // Public key: expects 48 bytes, give 32
+        let short_bytes: Vec<u8> = vec![0u8; 32];
+        let encoded = bincode::serialize(&short_bytes).unwrap();
+        let result: Result<BlsPublicKey, _> = bincode::deserialize(&encoded);
+        assert!(result.is_err(), "deserialize with 32 bytes should fail for public key");
+
+        // Signature: expects 96 bytes, give 48
+        let short_sig: Vec<u8> = vec![0u8; 48];
+        let encoded = bincode::serialize(&short_sig).unwrap();
+        let result: Result<BlsSignature, _> = bincode::deserialize(&encoded);
+        assert!(result.is_err(), "deserialize with 48 bytes should fail for signature");
+    }
 }

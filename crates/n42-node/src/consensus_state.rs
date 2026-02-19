@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
-use tracing::info;
+use tracing::{info, warn};
 
 /// A verification task pushed to mobile subscribers when a block is committed.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -120,6 +120,15 @@ const MAX_ATTESTATION_HISTORY: usize = 1000;
 /// Maximum number of equivocation evidence entries kept.
 const MAX_EQUIVOCATION_LOG: usize = 500;
 
+/// Default attestation threshold for SharedConsensusState.
+/// Configurable via `N42_MIN_ATTESTATION_THRESHOLD` environment variable.
+fn default_attestation_threshold() -> u32 {
+    std::env::var("N42_MIN_ATTESTATION_THRESHOLD")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(10)
+}
+
 /// Shared consensus state between the Orchestrator, PayloadBuilder, and RPC.
 ///
 /// The Orchestrator writes to this state (low frequency, on block commit),
@@ -139,20 +148,31 @@ pub struct SharedConsensusState {
     /// History of attestation events (blocks that reached threshold).
     pub attestation_history: Mutex<VecDeque<AttestationRecord>>,
     /// Log of detected equivocation evidence for accountability.
-    pub equivocation_log: Mutex<Vec<EquivocationEvidence>>,
+    pub equivocation_log: Mutex<VecDeque<EquivocationEvidence>>,
 }
 
 impl SharedConsensusState {
     /// Creates a new shared state with the given validator set and no initial QC.
+    ///
+    /// The attestation threshold is read from `N42_MIN_ATTESTATION_THRESHOLD`
+    /// environment variable (default: 10). A threshold of 0 is clamped to 1
+    /// to prevent blocks from being attested with zero receipts.
     pub fn new(validator_set: ValidatorSet) -> Self {
+        let threshold = default_attestation_threshold();
+        let threshold = if threshold == 0 {
+            warn!("N42_MIN_ATTESTATION_THRESHOLD=0 is invalid, clamping to 1");
+            1
+        } else {
+            threshold
+        };
         let (block_committed_tx, _) = broadcast::channel(64);
         Self {
             latest_committed_qc: ArcSwap::from_pointee(None),
             validator_set: Arc::new(validator_set),
-            attestation_state: Mutex::new(AttestationState::new(10, 100)),
+            attestation_state: Mutex::new(AttestationState::new(threshold, 100)),
             block_committed_tx,
             attestation_history: Mutex::new(VecDeque::new()),
-            equivocation_log: Mutex::new(Vec::new()),
+            equivocation_log: Mutex::new(VecDeque::new()),
         }
     }
 
@@ -219,16 +239,16 @@ impl SharedConsensusState {
         };
         if let Ok(mut log) = self.equivocation_log.lock() {
             if log.len() >= MAX_EQUIVOCATION_LOG {
-                log.remove(0);
+                log.pop_front();
             }
-            log.push(evidence);
+            log.push_back(evidence);
         }
     }
 
     /// Returns all recorded equivocation evidence.
     pub fn get_equivocations(&self) -> Vec<EquivocationEvidence> {
         self.equivocation_log.lock()
-            .map(|log| log.clone())
+            .map(|log| log.iter().cloned().collect())
             .unwrap_or_default()
     }
 
@@ -389,6 +409,32 @@ mod tests {
         assert_eq!(evs[0].validator_index, 2);
         assert_eq!(evs[0].hash1, h1);
         assert_eq!(evs[0].hash2, h2);
+    }
+
+    #[test]
+    fn test_equivocation_log_bounded() {
+        let state = make_state();
+        // Fill beyond MAX_EQUIVOCATION_LOG (500)
+        for i in 0..510u64 {
+            state.record_equivocation(i, 0, B256::repeat_byte(0xAA), B256::repeat_byte(0xBB));
+        }
+        let evs = state.get_equivocations();
+        assert_eq!(evs.len(), 500, "equivocation log should be bounded at 500");
+        // Oldest entries (views 0..9) should have been evicted
+        assert_eq!(evs[0].view, 10, "oldest 10 entries should be evicted");
+        assert_eq!(evs[499].view, 509, "newest entry should be view 509");
+    }
+
+    #[test]
+    fn test_attestation_state_threshold() {
+        // Verify that AttestationState respects threshold
+        let mut att = AttestationState::new(1, 100);
+        let hash = B256::repeat_byte(0xEE);
+        att.register_block(hash, 1);
+
+        let (count, reached) = att.record_attestation(hash, "pk1".into()).unwrap();
+        assert_eq!(count, 1);
+        assert!(reached, "threshold=1, first attestation should reach it");
     }
 
     #[test]

@@ -285,4 +285,61 @@ mod tests {
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), CommitmentError::VerifierMismatch));
     }
+
+    #[test]
+    fn test_verify_against_commitment_wrong_block_number() {
+        let block_hash = B256::from([5u8; 32]);
+        let pubkey = [42u8; 48];
+        let nonce = B256::from([77u8; 32]);
+
+        let (commitment, _) = make_commitment_reveal_pair(
+            block_hash, 100, pubkey, true, true, nonce,
+        );
+
+        // Build a reveal with a different block number.
+        let bad_reveal = VerificationReveal {
+            block_hash,
+            block_number: 200,
+            verifier_pubkey: pubkey,
+            state_root_match: true,
+            receipts_root_match: true,
+            nonce,
+        };
+
+        let result = bad_reveal.verify_against_commitment(&commitment);
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), CommitmentError::BlockNumberMismatch));
+    }
+
+    #[test]
+    fn test_commitment_reveal_bincode_roundtrip() {
+        let block_hash = B256::from([8u8; 32]);
+        let pubkey = [42u8; 48];
+        let nonce = B256::from([55u8; 32]);
+
+        let (commitment, reveal) = make_commitment_reveal_pair(
+            block_hash, 999, pubkey, true, false, nonce,
+        );
+
+        // Commitment roundtrip.
+        let encoded_c = bincode::serialize(&commitment).expect("commitment should serialize");
+        let decoded_c: VerificationCommitment =
+            bincode::deserialize(&encoded_c).expect("commitment should deserialize");
+        assert_eq!(decoded_c.block_hash, commitment.block_hash);
+        assert_eq!(decoded_c.block_number, commitment.block_number);
+        assert_eq!(decoded_c.verifier_pubkey, commitment.verifier_pubkey);
+        assert_eq!(decoded_c.commitment_hash, commitment.commitment_hash);
+
+        // Reveal roundtrip.
+        let encoded_r = bincode::serialize(&reveal).expect("reveal should serialize");
+        let decoded_r: VerificationReveal =
+            bincode::deserialize(&encoded_r).expect("reveal should deserialize");
+        assert_eq!(decoded_r.block_hash, reveal.block_hash);
+        assert_eq!(decoded_r.nonce, reveal.nonce);
+
+        // Deserialized reveal should still verify against deserialized commitment.
+        decoded_r
+            .verify_against_commitment(&decoded_c)
+            .expect("deserialized pair should verify");
+    }
 }

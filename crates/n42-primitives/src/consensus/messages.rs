@@ -261,6 +261,140 @@ mod tests {
     }
 
     #[test]
+    fn test_all_message_variants_serde_roundtrip() {
+        let sig = dummy_signature();
+        let genesis_qc = QuorumCertificate::genesis();
+
+        // Build one of each variant
+        let variants: Vec<ConsensusMessage> = vec![
+            ConsensusMessage::Proposal(Proposal {
+                view: 1,
+                block_hash: B256::repeat_byte(0x11),
+                justify_qc: genesis_qc.clone(),
+                proposer: 0,
+                signature: sig.clone(),
+                prepare_qc: None,
+            }),
+            ConsensusMessage::Vote(Vote {
+                view: 2,
+                block_hash: B256::repeat_byte(0x22),
+                voter: 1,
+                signature: sig.clone(),
+            }),
+            ConsensusMessage::CommitVote(CommitVote {
+                view: 3,
+                block_hash: B256::repeat_byte(0x33),
+                voter: 2,
+                signature: sig.clone(),
+            }),
+            ConsensusMessage::PrepareQC(PrepareQC {
+                view: 4,
+                block_hash: B256::repeat_byte(0x44),
+                qc: genesis_qc.clone(),
+            }),
+            ConsensusMessage::Timeout(TimeoutMessage {
+                view: 5,
+                high_qc: genesis_qc.clone(),
+                sender: 3,
+                signature: sig.clone(),
+            }),
+            ConsensusMessage::NewView(NewView {
+                view: 6,
+                timeout_cert: TimeoutCertificate {
+                    view: 5,
+                    aggregate_signature: sig.clone(),
+                    signers: BitVec::new(),
+                    high_qc: genesis_qc.clone(),
+                },
+                leader: 0,
+                signature: sig.clone(),
+            }),
+            ConsensusMessage::Decide(Decide {
+                view: 7,
+                block_hash: B256::repeat_byte(0x77),
+                commit_qc: genesis_qc.clone(),
+            }),
+        ];
+
+        for (i, msg) in variants.iter().enumerate() {
+            let encoded = bincode::serialize(msg)
+                .unwrap_or_else(|e| panic!("variant {} serialize failed: {}", i, e));
+            let decoded: ConsensusMessage = bincode::deserialize(&encoded)
+                .unwrap_or_else(|e| panic!("variant {} deserialize failed: {}", i, e));
+
+            // Verify variant type matches by checking discriminant via debug
+            let orig_debug = format!("{:?}", msg);
+            let decoded_debug = format!("{:?}", decoded);
+            let orig_variant = orig_debug.split('(').next().unwrap();
+            let decoded_variant = decoded_debug.split('(').next().unwrap();
+            assert_eq!(
+                orig_variant, decoded_variant,
+                "variant {} type should survive serde roundtrip",
+                i
+            );
+        }
+    }
+
+    #[test]
+    fn test_versioned_message_serde_roundtrip() {
+        let sig = dummy_signature();
+        let vote = Vote {
+            view: 100,
+            block_hash: B256::repeat_byte(0xEE),
+            voter: 5,
+            signature: sig,
+        };
+        let versioned = VersionedMessage {
+            version: CONSENSUS_PROTOCOL_VERSION,
+            message: ConsensusMessage::Vote(vote),
+        };
+
+        let encoded = bincode::serialize(&versioned).expect("serialize VersionedMessage");
+        let decoded: VersionedMessage = bincode::deserialize(&encoded)
+            .expect("deserialize VersionedMessage");
+
+        assert_eq!(decoded.version, CONSENSUS_PROTOCOL_VERSION);
+        match decoded.message {
+            ConsensusMessage::Vote(v) => {
+                assert_eq!(v.view, 100);
+                assert_eq!(v.voter, 5);
+                assert_eq!(v.block_hash, B256::repeat_byte(0xEE));
+            }
+            other => panic!("expected Vote, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_timeout_certificate_serde_roundtrip() {
+        let sig = dummy_signature();
+        let genesis_qc = QuorumCertificate::genesis();
+
+        let tc = TimeoutCertificate {
+            view: 42,
+            aggregate_signature: sig,
+            signers: {
+                let mut s = bitvec![u8, Msb0; 0; 4];
+                s.set(0, true);
+                s.set(2, true);
+                s
+            },
+            high_qc: genesis_qc,
+        };
+
+        let encoded = bincode::serialize(&tc).expect("serialize TC");
+        let decoded: TimeoutCertificate = bincode::deserialize(&encoded)
+            .expect("deserialize TC");
+
+        assert_eq!(decoded.view, 42);
+        assert_eq!(decoded.signers.count_ones(), 2);
+        assert!(decoded.signers[0]);
+        assert!(!decoded.signers[1]);
+        assert!(decoded.signers[2]);
+        assert!(!decoded.signers[3]);
+        assert_eq!(decoded.high_qc.view, 0, "high_qc should be genesis");
+    }
+
+    #[test]
     fn test_genesis_qc() {
         // BlsSignature::from_bytes(&[0u8; 96]) may fail because all-zero bytes
         // may not represent a valid BLS point (the point at infinity in compressed

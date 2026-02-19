@@ -214,4 +214,24 @@ mod tests {
         // 32 (block_hash) + 8 (block_number) + 1 (state_root_match) + 1 (receipts_root_match) + 8 (timestamp_ms) = 50
         assert_eq!(receipt1.signing_message().len(), 50);
     }
+
+    #[test]
+    fn test_receipt_bincode_roundtrip() {
+        let sk = BlsSecretKey::key_gen(&[42u8; 32]).unwrap();
+        let block_hash = B256::from([7u8; 32]);
+        let receipt = make_receipt(block_hash, 500, true, false, 99999, &sk);
+
+        let encoded = bincode::serialize(&receipt).expect("receipt should serialize");
+        let decoded: VerificationReceipt =
+            bincode::deserialize(&encoded).expect("receipt should deserialize");
+
+        assert_eq!(decoded.block_hash, receipt.block_hash);
+        assert_eq!(decoded.block_number, receipt.block_number);
+        assert_eq!(decoded.state_root_match, receipt.state_root_match);
+        assert_eq!(decoded.receipts_root_match, receipt.receipts_root_match);
+        assert_eq!(decoded.verifier_pubkey, receipt.verifier_pubkey);
+        assert_eq!(decoded.timestamp_ms, receipt.timestamp_ms);
+        // Signature should survive roundtrip.
+        decoded.verify_signature().expect("deserialized receipt should have valid signature");
+    }
 }

@@ -147,3 +147,165 @@ where
         self.inner.validate_header_against_parent(header, parent)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_primitives::{Address, B256};
+    use bitvec::prelude::*;
+    use n42_chainspec::ValidatorInfo;
+    use n42_primitives::{
+        BlsSecretKey,
+        bls::AggregateSignature,
+        consensus::QuorumCertificate,
+    };
+
+    use crate::extra_data::{encode_qc_to_extra_data, extract_qc_from_extra_data};
+    use crate::protocol::quorum::{verify_qc, verify_commit_qc, signing_message, commit_signing_message};
+    use crate::validator::ValidatorSet;
+
+    /// Helper: create a test validator set of size `n` along with the secret keys.
+    fn test_validator_set(n: usize) -> (Vec<BlsSecretKey>, ValidatorSet) {
+        let sks: Vec<_> = (0..n).map(|_| BlsSecretKey::random().unwrap()).collect();
+        let infos: Vec<_> = sks
+            .iter()
+            .enumerate()
+            .map(|(i, sk)| ValidatorInfo {
+                address: Address::with_last_byte(i as u8),
+                bls_public_key: sk.public_key(),
+            })
+            .collect();
+        let f = ((n as u32).saturating_sub(1)) / 3;
+        let vs = ValidatorSet::new(&infos, f);
+        (sks, vs)
+    }
+
+    #[test]
+    fn test_new_without_validator_set() {
+        let chain_spec = n42_chainspec::n42_dev_chainspec();
+        let consensus = N42Consensus::new(chain_spec);
+        assert!(consensus.validator_set.is_none(), "should have no validator set initially");
+    }
+
+    #[test]
+    fn test_with_validator_set() {
+        let chain_spec = n42_chainspec::n42_dev_chainspec();
+        let (_, vs) = test_validator_set(4);
+        let consensus = N42Consensus::with_validator_set(chain_spec, vs);
+        assert!(consensus.validator_set.is_some(), "should have validator set");
+        let vs_ref = consensus.validator_set.as_ref().unwrap();
+        assert_eq!(vs_ref.len(), 4, "validator set should have 4 validators");
+        assert_eq!(vs_ref.quorum_size(), 3, "quorum should be 2*1+1 = 3");
+    }
+
+    #[test]
+    fn test_set_validator_set() {
+        let chain_spec = n42_chainspec::n42_dev_chainspec();
+        let mut consensus = N42Consensus::new(chain_spec);
+        assert!(consensus.validator_set.is_none());
+
+        let (_, vs) = test_validator_set(7);
+        consensus.set_validator_set(vs);
+        assert!(consensus.validator_set.is_some());
+        assert_eq!(consensus.validator_set.as_ref().unwrap().len(), 7);
+    }
+
+    #[test]
+    fn test_max_extra_data_size() {
+        assert_eq!(
+            N42Consensus::<ChainSpec>::MAX_EXTRA_DATA_SIZE, 4096,
+            "MAX_EXTRA_DATA_SIZE must be 4096 for QC storage"
+        );
+    }
+
+    /// End-to-end test of the QC verification path used by adapter:
+    /// encode QC → extract from extra_data → verify_qc
+    #[test]
+    fn test_qc_extraction_and_verification_path() {
+        let (sks, vs) = test_validator_set(4);
+        let view = 42u64;
+        let block_hash = B256::repeat_byte(0xCC);
+
+        // Build a valid PrepareQC (same as what the leader produces)
+        let msg = signing_message(view, &block_hash);
+        let sigs: Vec<_> = sks[0..3].iter().map(|sk| sk.sign(&msg)).collect();
+        let sig_refs: Vec<_> = sigs.iter().collect();
+        let agg = AggregateSignature::aggregate(&sig_refs).unwrap();
+        let mut signers = bitvec![u8, Msb0; 0; 4];
+        signers.set(0, true);
+        signers.set(1, true);
+        signers.set(2, true);
+
+        let qc = QuorumCertificate {
+            view,
+            block_hash,
+            aggregate_signature: agg,
+            signers,
+        };
+
+        // Encode QC → extra_data (what the block builder does)
+        let extra_data = encode_qc_to_extra_data(&qc).unwrap();
+
+        // Extract QC from extra_data (what adapter.validate_block_post_execution does)
+        let extracted = extract_qc_from_extra_data(&extra_data)
+            .expect("extraction should succeed")
+            .expect("should contain a QC");
+
+        // Verify QC (what adapter does: try verify_qc first)
+        let result = verify_qc(&extracted, &vs);
+        assert!(result.is_ok(), "valid PrepareQC should verify");
+    }
+
+    /// End-to-end test of the CommitQC verification fallback path.
+    /// adapter tries verify_qc first, then falls back to verify_commit_qc.
+    #[test]
+    fn test_commit_qc_verification_fallback_path() {
+        let (sks, vs) = test_validator_set(4);
+        let view = 99u64;
+        let block_hash = B256::repeat_byte(0xDD);
+
+        // Build a CommitQC (signed with "commit" || view || block_hash)
+        let msg = commit_signing_message(view, &block_hash);
+        let sigs: Vec<_> = sks[0..3].iter().map(|sk| sk.sign(&msg)).collect();
+        let sig_refs: Vec<_> = sigs.iter().collect();
+        let agg = AggregateSignature::aggregate(&sig_refs).unwrap();
+        let mut signers = bitvec![u8, Msb0; 0; 4];
+        signers.set(0, true);
+        signers.set(1, true);
+        signers.set(2, true);
+
+        let qc = QuorumCertificate {
+            view,
+            block_hash,
+            aggregate_signature: agg,
+            signers,
+        };
+
+        let extra_data = encode_qc_to_extra_data(&qc).unwrap();
+        let extracted = extract_qc_from_extra_data(&extra_data).unwrap().unwrap();
+
+        // verify_qc should FAIL (different signing message format)
+        let qc_result = verify_qc(&extracted, &vs);
+        assert!(qc_result.is_err(), "CommitQC should fail PrepareQC verification");
+
+        // The adapter's fallback: verify_commit_qc should SUCCEED
+        let fallback_result = verify_qc(&extracted, &vs)
+            .or_else(|_| verify_commit_qc(&extracted, &vs));
+        assert!(fallback_result.is_ok(), "CommitQC should pass via fallback path");
+    }
+
+    #[test]
+    fn test_no_qc_in_extra_data_is_acceptable() {
+        use alloy_primitives::Bytes;
+
+        // Empty extra_data — genesis block scenario
+        let result = extract_qc_from_extra_data(&Bytes::new());
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none(), "empty extra_data should return None");
+
+        // Non-QC extra_data — blocks during initial sync
+        let result = extract_qc_from_extra_data(&Bytes::from_static(b"some other data"));
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none(), "non-QC extra_data should return None");
+    }
+}

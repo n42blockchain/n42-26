@@ -289,6 +289,7 @@ impl StarHub {
             match cmd {
                 HubCommand::BroadcastPacket(data) => {
                     let count = self.broadcast_tx.receiver_count();
+                    metrics::counter!("n42_mobile_packets_broadcast").increment(1);
                     let _ = self.broadcast_tx.send(BroadcastMsg::Packet(data));
                     tracing::debug!(
                         phone_count = count,
@@ -350,22 +351,26 @@ async fn handle_phone_connection(
                     len = data.len(),
                     "invalid handshake: expected 48-byte BLS public key"
                 );
+                metrics::counter!("n42_mobile_handshake_failures").increment(1);
                 connection.close(1u32.into(), b"invalid handshake");
                 return;
             }
             Err(e) => {
                 tracing::debug!(session_id, error = %e, "handshake read failed");
+                metrics::counter!("n42_mobile_handshake_failures").increment(1);
                 connection.close(1u32.into(), b"handshake read error");
                 return;
             }
         },
         Ok(Err(e)) => {
             tracing::debug!(session_id, error = %e, "handshake stream accept failed");
+            metrics::counter!("n42_mobile_handshake_failures").increment(1);
             connection.close(1u32.into(), b"handshake failed");
             return;
         }
         Err(_) => {
             tracing::warn!(session_id, "handshake timeout (5s)");
+            metrics::counter!("n42_mobile_handshake_failures").increment(1);
             connection.close(1u32.into(), b"handshake timeout");
             return;
         }
@@ -374,6 +379,7 @@ async fn handle_phone_connection(
     // Validate public key is non-zero
     if verifier_pubkey == [0u8; 48] {
         tracing::warn!(session_id, "rejected connection: zero public key");
+        metrics::counter!("n42_mobile_handshake_failures").increment(1);
         connection.close(1u32.into(), b"invalid pubkey");
         return;
     }
@@ -443,6 +449,7 @@ async fn handle_phone_connection(
                                 {
                                     Ok(receipt) => {
                                         last_receipt_at = Some(now);
+                                        metrics::counter!("n42_mobile_receipts_received").increment(1);
                                         // P2 fix: read lock + atomic counter instead of write lock
                                         if let Some(session) = sessions.read().await.get(&session_id) {
                                             session.record_receipt();

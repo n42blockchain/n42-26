@@ -99,4 +99,17 @@ mod tests {
         assert_eq!(decoded.tx_count, 128);
         assert_eq!(decoded.block_size, 65536);
     }
+
+    #[test]
+    fn test_decode_garbage_data_fails() {
+        let garbage = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        let result = decode_block_announcement(&garbage);
+        assert!(result.is_err(), "garbage data should fail to decode");
+    }
+
+    #[test]
+    fn test_decode_empty_data_fails() {
+        let result = decode_block_announcement(&[]);
+        assert!(result.is_err(), "empty data should fail to decode");
+    }
 }

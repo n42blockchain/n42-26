@@ -20,7 +20,7 @@ pub extern "system" fn Java_com_n42_verifier_N42Verifier_nativeInit(
     ptr as jlong
 }
 
-/// `N42Verifier.nativeConnect(ptr: Long, host: String, port: Int): Int`
+/// `N42Verifier.nativeConnect(ptr: Long, host: String, port: Int, certHash: ByteArray): Int`
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_n42_verifier_N42Verifier_nativeConnect(
     mut env: JNIEnv,
@@ -28,18 +28,40 @@ pub extern "system" fn Java_com_n42_verifier_N42Verifier_nativeConnect(
     ptr: jlong,
     host: JString,
     port: jint,
+    cert_hash: JByteArray,
 ) -> jint {
     let host_str: String = match env.get_string(&host) {
         Ok(s) => s.into(),
-        Err(_) => return -1,
+        Err(_) => {
+            tracing::warn!(target: "n42::ffi::android", "JNI string conversion failed in nativeConnect");
+            return -1;
+        }
     };
 
     let c_host = match std::ffi::CString::new(host_str) {
         Ok(s) => s,
-        Err(_) => return -1,
+        Err(_) => {
+            tracing::warn!(target: "n42::ffi::android", "CString conversion failed in nativeConnect");
+            return -1;
+        }
     };
 
-    unsafe { crate::n42_connect(ptr as *mut VerifierContext, c_host.as_ptr(), port as u16) }
+    // Extract cert_hash bytes: empty array = dev mode, 32 bytes = pinned
+    let hash_bytes = match env.convert_byte_array(&cert_hash) {
+        Ok(b) => b,
+        Err(_) => {
+            tracing::warn!(target: "n42::ffi::android", "cert_hash byte array conversion failed in nativeConnect");
+            return -1;
+        }
+    };
+
+    let (hash_ptr, hash_len) = if hash_bytes.is_empty() {
+        (std::ptr::null(), 0)
+    } else {
+        (hash_bytes.as_ptr(), hash_bytes.len())
+    };
+
+    unsafe { crate::n42_connect(ptr as *mut VerifierContext, c_host.as_ptr(), port as u16, hash_ptr, hash_len) }
 }
 
 /// `N42Verifier.nativePollPacket(ptr: Long, buffer: ByteArray): Int`
@@ -52,7 +74,10 @@ pub extern "system" fn Java_com_n42_verifier_N42Verifier_nativePollPacket(
 ) -> jint {
     let buf_len = match env.get_array_length(&buffer) {
         Ok(len) => len as usize,
-        Err(_) => return -1,
+        Err(_) => {
+            tracing::warn!(target: "n42::ffi::android", "get_array_length failed in nativePollPacket");
+            return -1;
+        }
     };
 
     let mut temp = vec![0u8; buf_len];
@@ -65,6 +90,7 @@ pub extern "system" fn Java_com_n42_verifier_N42Verifier_nativePollPacket(
             .set_byte_array_region(&buffer, 0, bytemuck_cast_slice(&temp[..result as usize]))
             .is_err()
         {
+            tracing::warn!(target: "n42::ffi::android", "set_byte_array_region failed in nativePollPacket");
             return -1;
         }
     }
@@ -82,7 +108,10 @@ pub extern "system" fn Java_com_n42_verifier_N42Verifier_nativeVerifyAndSend(
 ) -> jint {
     let bytes = match env.convert_byte_array(&data) {
         Ok(b) => b,
-        Err(_) => return -1,
+        Err(_) => {
+            tracing::warn!(target: "n42::ffi::android", "convert_byte_array failed in nativeVerifyAndSend");
+            return -1;
+        }
     };
 
     unsafe { crate::n42_verify_and_send(ptr as *mut VerifierContext, bytes.as_ptr(), bytes.len()) }
@@ -111,7 +140,10 @@ pub extern "system" fn Java_com_n42_verifier_N42Verifier_nativeLastVerifyInfo(
     let s = String::from_utf8_lossy(&buf[..len as usize]);
     match env.new_string(&*s) {
         Ok(js) => js.into_raw(),
-        Err(_) => std::ptr::null_mut(),
+        Err(_) => {
+            tracing::warn!(target: "n42::ffi::android", "new_string failed in nativeLastVerifyInfo");
+            std::ptr::null_mut()
+        }
     }
 }
 
@@ -131,7 +163,10 @@ pub extern "system" fn Java_com_n42_verifier_N42Verifier_nativeGetPubkey(
 
     match env.byte_array_from_slice(&buf) {
         Ok(arr) => arr.into_raw(),
-        Err(_) => std::ptr::null_mut(),
+        Err(_) => {
+            tracing::warn!(target: "n42::ffi::android", "byte_array_from_slice failed in nativeGetPubkey");
+            std::ptr::null_mut()
+        }
     }
 }
 
@@ -158,7 +193,10 @@ pub extern "system" fn Java_com_n42_verifier_N42Verifier_nativeGetStats(
     let s = String::from_utf8_lossy(&buf[..len as usize]);
     match env.new_string(&*s) {
         Ok(js) => js.into_raw(),
-        Err(_) => std::ptr::null_mut(),
+        Err(_) => {
+            tracing::warn!(target: "n42::ffi::android", "new_string failed in nativeGetStats");
+            std::ptr::null_mut()
+        }
     }
 }
 

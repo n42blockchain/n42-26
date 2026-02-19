@@ -523,4 +523,97 @@ epoch_length = 0
             "Default and dev should have the same (empty) validator set"
         );
     }
+
+    #[test]
+    fn test_from_file_invalid_toml() {
+        use std::io::Write;
+
+        let dir = std::env::temp_dir().join("n42_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("bad_config.toml");
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(b"not = [valid toml {{{{").unwrap();
+
+        let result = ConsensusConfig::from_file(&path);
+        assert!(result.is_err(), "invalid TOML should fail");
+        assert!(
+            result.unwrap_err().contains("TOML parse error"),
+            "error should mention TOML parse error"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_dev_multi_zero_requires_validation() {
+        let config = ConsensusConfig::dev_multi(0);
+        assert_eq!(config.validator_set_size, 0);
+        assert!(config.initial_validators.is_empty());
+        // validator_set_size=0 < 3*0+1=1 → validation fails
+        let result = config.validate();
+        assert!(result.is_err(), "dev_multi(0) should fail validation");
+    }
+
+    #[test]
+    fn test_epoch_length_serde_default() {
+        // JSON without epoch_length field should deserialize with epoch_length=0
+        let json = r#"{
+            "slot_time_ms": 8000,
+            "validator_set_size": 1,
+            "fault_tolerance": 0,
+            "base_timeout_ms": 4000,
+            "max_timeout_ms": 8000,
+            "initial_validators": []
+        }"#;
+        let config: ConsensusConfig = serde_json::from_str(json)
+            .expect("should deserialize without epoch_length field");
+        assert_eq!(config.epoch_length, 0, "epoch_length should default to 0");
+    }
+
+    #[test]
+    fn test_dev_multi_deterministic_keys() {
+        // Two calls with same count should produce identical keys
+        let c1 = ConsensusConfig::dev_multi(4);
+        let c2 = ConsensusConfig::dev_multi(4);
+        for i in 0..4 {
+            assert_eq!(
+                c1.initial_validators[i].bls_public_key.to_bytes(),
+                c2.initial_validators[i].bls_public_key.to_bytes(),
+                "validator {} public key should be deterministic",
+                i
+            );
+            assert_eq!(
+                c1.initial_validators[i].address,
+                c2.initial_validators[i].address,
+                "validator {} address should be deterministic",
+                i
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_equal_timeouts() {
+        // base_timeout == max_timeout should be valid (edge of <= check)
+        let mut config = ConsensusConfig::dev();
+        config.base_timeout_ms = 5000;
+        config.max_timeout_ms = 5000;
+        assert!(config.validate().is_ok(), "base == max timeout should be valid");
+    }
+
+    #[test]
+    fn test_dev_multi_7_and_10_validators() {
+        // n=7: f=(7-1)/3=2, quorum=2*2+1=5, need 3*2+1=7 ≤ 7 → valid
+        let c7 = ConsensusConfig::dev_multi(7);
+        assert_eq!(c7.fault_tolerance, 2);
+        assert_eq!(c7.quorum_size(), 5);
+        assert_eq!(c7.initial_validators.len(), 7);
+        assert!(c7.validate().is_ok(), "7-validator config should be valid");
+
+        // n=10: f=(10-1)/3=3, quorum=2*3+1=7, need 3*3+1=10 ≤ 10 → valid
+        let c10 = ConsensusConfig::dev_multi(10);
+        assert_eq!(c10.fault_tolerance, 3);
+        assert_eq!(c10.quorum_size(), 7);
+        assert_eq!(c10.initial_validators.len(), 10);
+        assert!(c10.validate().is_ok(), "10-validator config should be valid");
+    }
 }

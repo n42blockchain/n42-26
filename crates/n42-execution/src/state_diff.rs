@@ -1,6 +1,7 @@
 use alloy_primitives::{Address, U256, B256};
 use revm::database::BundleState;
 use std::collections::BTreeMap;
+use tracing::debug;
 
 /// State diff for a single block: all account and storage changes.
 ///
@@ -66,6 +67,26 @@ impl StateDiff {
     /// Returns true if no accounts changed.
     pub fn is_empty(&self) -> bool {
         self.accounts.is_empty()
+    }
+
+    /// Returns the number of created accounts.
+    pub fn created_count(&self) -> usize {
+        self.accounts.values().filter(|a| a.change_type == AccountChangeType::Created).count()
+    }
+
+    /// Returns the number of modified accounts.
+    pub fn modified_count(&self) -> usize {
+        self.accounts.values().filter(|a| a.change_type == AccountChangeType::Modified).count()
+    }
+
+    /// Returns the number of destroyed accounts.
+    pub fn destroyed_count(&self) -> usize {
+        self.accounts.values().filter(|a| a.change_type == AccountChangeType::Destroyed).count()
+    }
+
+    /// Returns the total number of storage slot changes across all accounts.
+    pub fn total_storage_changes(&self) -> usize {
+        self.accounts.values().map(|a| a.storage.len()).sum()
     }
 
     /// Extracts a state diff from a revm `BundleState`.
@@ -169,6 +190,12 @@ impl StateDiff {
                 );
             }
         }
+
+        debug!(
+            target: "n42::execution",
+            total = accounts.len(),
+            "state diff extracted"
+        );
 
         Self { accounts }
     }
@@ -507,5 +534,86 @@ mod tests {
             diff.accounts[&addr3].change_type,
             AccountChangeType::Destroyed
         );
+    }
+
+    #[test]
+    fn test_state_diff_summary_methods() {
+        let addr1 = Address::with_last_byte(10);
+        let addr2 = Address::with_last_byte(20);
+        let addr3 = Address::with_last_byte(30);
+        let addr4 = Address::with_last_byte(40);
+
+        let mut bundle = BundleState::default();
+        bundle.state.insert(addr1, created_account(100, 0));
+        bundle.state.insert(addr2, modified_account(200, 1, 300, 2));
+
+        let mut destroyed = destroyed_account(400, 3);
+        destroyed.storage.insert(U256::from(0), storage_slot(10, 0));
+        bundle.state.insert(addr3, destroyed);
+
+        let mut modified_with_storage = modified_account(500, 4, 600, 5);
+        modified_with_storage.storage.insert(U256::from(0), storage_slot(0, 42));
+        modified_with_storage.storage.insert(U256::from(1), storage_slot(0, 99));
+        bundle.state.insert(addr4, modified_with_storage);
+
+        let diff = StateDiff::from_bundle_state(&bundle);
+        assert_eq!(diff.len(), 4);
+        assert_eq!(diff.created_count(), 1);
+        assert_eq!(diff.modified_count(), 2);
+        assert_eq!(diff.destroyed_count(), 1);
+        assert_eq!(diff.total_storage_changes(), 3, "1 slot from destroyed + 2 from modified");
+    }
+
+    #[test]
+    fn test_state_diff_summary_empty() {
+        let diff = StateDiff::default();
+        assert_eq!(diff.created_count(), 0);
+        assert_eq!(diff.modified_count(), 0);
+        assert_eq!(diff.destroyed_count(), 0);
+        assert_eq!(diff.total_storage_changes(), 0);
+    }
+
+    #[test]
+    fn test_state_diff_unchanged_storage_filtered() {
+        let addr = Address::with_last_byte(7);
+        let mut account = modified_account(100, 1, 200, 2);
+        // Add a storage slot where value did NOT change.
+        account.storage.insert(
+            U256::from(0),
+            StorageSlot::new_changed(U256::from(42), U256::from(42)),
+        );
+        // Add a storage slot that DID change.
+        account.storage.insert(U256::from(1), storage_slot(0, 99));
+
+        let mut bundle = BundleState::default();
+        bundle.state.insert(addr, account);
+
+        let diff = StateDiff::from_bundle_state(&bundle);
+        let account_diff = diff.accounts.get(&addr).unwrap();
+        assert_eq!(
+            account_diff.storage.len(),
+            1,
+            "unchanged storage slot should be filtered out"
+        );
+        assert!(account_diff.storage.contains_key(&U256::from(1)));
+        assert!(!account_diff.storage.contains_key(&U256::from(0)));
+    }
+
+    #[test]
+    fn test_state_diff_destroyed_with_storage() {
+        let addr = Address::with_last_byte(8);
+        let mut account = destroyed_account(500, 2);
+        account.storage.insert(U256::from(5), storage_slot(100, 0));
+
+        let mut bundle = BundleState::default();
+        bundle.state.insert(addr, account);
+
+        let diff = StateDiff::from_bundle_state(&bundle);
+        let account_diff = diff.accounts.get(&addr).unwrap();
+        assert_eq!(account_diff.change_type, AccountChangeType::Destroyed);
+        assert_eq!(account_diff.storage.len(), 1);
+        let slot = account_diff.storage.get(&U256::from(5)).unwrap();
+        assert_eq!(slot.from, U256::from(100));
+        assert_eq!(slot.to, U256::ZERO);
     }
 }

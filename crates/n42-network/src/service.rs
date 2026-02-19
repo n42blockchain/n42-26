@@ -419,11 +419,13 @@ impl NetworkService {
             }
             SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                 tracing::info!(%peer_id, "peer connected");
+                metrics::gauge!("n42_active_peer_connections").increment(1.0);
                 self.reconnection.on_connected(&peer_id);
                 let _ = self.event_tx.send(NetworkEvent::PeerConnected(peer_id));
             }
             SwarmEvent::ConnectionClosed { peer_id, .. } => {
                 tracing::info!(%peer_id, "peer disconnected");
+                metrics::gauge!("n42_active_peer_connections").decrement(1.0);
                 self.reconnection.on_disconnected(&peer_id);
                 let _ = self.event_tx.send(NetworkEvent::PeerDisconnected(peer_id));
             }
@@ -443,6 +445,8 @@ impl NetworkService {
 
     /// Handles an incoming GossipSub message.
     fn handle_gossipsub_message(&self, source: PeerId, message: gossipsub::Message) {
+        metrics::counter!("n42_gossipsub_messages_received").increment(1);
+
         // Validate the message
         let acceptance = validate_message(
             &message.topic,
@@ -501,6 +505,7 @@ impl NetworkService {
             libp2p::request_response::Event::Message { peer, message, .. } => {
                 match message {
                     libp2p::request_response::Message::Request { request, channel, .. } => {
+                        metrics::counter!("n42_state_sync_requests").increment(1);
                         let id = self.next_sync_id;
                         self.next_sync_id += 1;
 
@@ -714,5 +719,133 @@ impl NetworkService {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_handle_announce_block() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let handle = NetworkHandle::new(tx);
+
+        handle.announce_block(vec![1, 2, 3]).unwrap();
+
+        match rx.try_recv().unwrap() {
+            NetworkCommand::AnnounceBlock(data) => assert_eq!(data, vec![1, 2, 3]),
+            other => panic!("expected AnnounceBlock, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_handle_broadcast_transaction() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let handle = NetworkHandle::new(tx);
+
+        handle.broadcast_transaction(vec![0xAA, 0xBB]).unwrap();
+
+        match rx.try_recv().unwrap() {
+            NetworkCommand::BroadcastTransaction(data) => assert_eq!(data, vec![0xAA, 0xBB]),
+            other => panic!("expected BroadcastTransaction, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_handle_dial() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let handle = NetworkHandle::new(tx);
+
+        let addr: Multiaddr = "/ip4/127.0.0.1/udp/9400/quic-v1".parse().unwrap();
+        handle.dial(addr.clone()).unwrap();
+
+        match rx.try_recv().unwrap() {
+            NetworkCommand::Dial(a) => assert_eq!(a, addr),
+            other => panic!("expected Dial, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_handle_channel_closed_returns_error() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let handle = NetworkHandle::new(tx);
+        drop(rx);
+
+        let result = handle.announce_block(vec![1]);
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), NetworkError::ChannelClosed));
+    }
+
+    #[test]
+    fn test_handle_validator_peer_map() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let handle = NetworkHandle::new(tx);
+
+        // Initially empty.
+        assert!(handle.validator_peer(0).is_none());
+        assert!(handle.validator_peer(99).is_none());
+
+        // Insert a mapping.
+        let peer = PeerId::random();
+        handle.validator_peer_map.write().unwrap().insert(0, peer);
+
+        assert_eq!(handle.validator_peer(0), Some(peer));
+        assert!(handle.validator_peer(1).is_none());
+    }
+
+    #[test]
+    fn test_handle_register_peer() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let handle = NetworkHandle::new(tx);
+
+        let peer = PeerId::random();
+        let addr: Multiaddr = "/ip4/10.0.0.1/udp/9400/quic-v1".parse().unwrap();
+        handle.register_peer(peer, vec![addr], true).unwrap();
+
+        match rx.try_recv().unwrap() {
+            NetworkCommand::RegisterPeer { peer_id, addrs, trusted } => {
+                assert_eq!(peer_id, peer);
+                assert_eq!(addrs.len(), 1);
+                assert!(trusted);
+            }
+            other => panic!("expected RegisterPeer, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_handle_request_sync() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let handle = NetworkHandle::new(tx);
+
+        let peer = PeerId::random();
+        let request = BlockSyncRequest {
+            from_view: 10,
+            to_view: 20,
+            local_committed_view: 5,
+        };
+        handle.request_sync(peer, request).unwrap();
+
+        match rx.try_recv().unwrap() {
+            NetworkCommand::RequestSync { peer: p, request: r } => {
+                assert_eq!(p, peer);
+                assert_eq!(r.from_view, 10);
+                assert_eq!(r.to_view, 20);
+            }
+            other => panic!("expected RequestSync, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_handle_clone_shares_peer_map() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let handle1 = NetworkHandle::new(tx);
+        let handle2 = handle1.clone();
+
+        let peer = PeerId::random();
+        handle1.validator_peer_map.write().unwrap().insert(42, peer);
+
+        // Cloned handle should see the same mapping.
+        assert_eq!(handle2.validator_peer(42), Some(peer));
     }
 }

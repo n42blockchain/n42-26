@@ -3,6 +3,7 @@ use lru::LruCache;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
+use tracing::warn;
 
 /// LRU cache for high-frequency contract bytecodes on mobile devices.
 ///
@@ -21,11 +22,17 @@ impl CodeCache {
     /// Creates a new code cache with the given capacity.
     ///
     /// Typical capacity for mobile devices: 500-2000 contracts.
+    /// If `capacity` is 0, it is clamped to 1 with a warning to prevent panics.
     pub fn new(capacity: usize) -> Self {
+        let capacity = if capacity == 0 {
+            warn!("CodeCache capacity 0 is invalid, clamping to 1");
+            1
+        } else {
+            capacity
+        };
         Self {
-            cache: LruCache::new(
-                NonZeroUsize::new(capacity).expect("cache capacity must be > 0"),
-            ),
+            // SAFETY: capacity is guaranteed > 0 after the clamp above.
+            cache: LruCache::new(NonZeroUsize::new(capacity).unwrap()),
         }
     }
 
@@ -357,5 +364,52 @@ mod tests {
 
         let hash2_entry = top.iter().find(|(h, _)| *h == hash(2));
         assert!(hash2_entry.is_none(), "hash(2) should be removed after decay (count went to 0)");
+    }
+
+    #[test]
+    fn test_code_cache_zero_capacity_clamp() {
+        // capacity=0 should be clamped to 1 instead of panicking.
+        let mut cache = CodeCache::new(0);
+        assert_eq!(cache.len(), 0);
+        cache.insert(hash(1), bytecode(&[0x01]));
+        assert_eq!(cache.len(), 1);
+        // Cache holds exactly 1 item; inserting another evicts the first.
+        cache.insert(hash(2), bytecode(&[0x02]));
+        assert_eq!(cache.len(), 1);
+        assert!(cache.contains(&hash(2)));
+        assert!(!cache.contains(&hash(1)), "clamped capacity=1, oldest should be evicted");
+    }
+
+    #[test]
+    fn test_hot_tracker_decay_zero_removes_all() {
+        let mut tracker = HotContractTracker::new();
+        tracker.record_block_accesses(&[hash(1), hash(2)]);
+        tracker.record_block_accesses(&[hash(1)]);
+        assert_eq!(tracker.top_contracts(10).len(), 2);
+
+        // decay(0.0) should remove all entries (counts become 0).
+        tracker.decay(0.0);
+        assert!(tracker.top_contracts(10).is_empty(), "decay(0.0) should remove all entries");
+    }
+
+    #[test]
+    fn test_hot_tracker_decay_one_keeps_all() {
+        let mut tracker = HotContractTracker::new();
+        tracker.record_block_accesses(&[hash(1), hash(2)]);
+        tracker.record_block_accesses(&[hash(1)]);
+
+        // decay(1.0) should keep all counts unchanged.
+        tracker.decay(1.0);
+        let top = tracker.top_contracts(10);
+        assert_eq!(top.len(), 2);
+        let h1 = top.iter().find(|(h, _)| *h == hash(1));
+        assert_eq!(h1, Some(&(hash(1), 2)), "decay(1.0) should not change counts");
+    }
+
+    #[test]
+    fn test_hot_tracker_empty_top() {
+        let tracker = HotContractTracker::new();
+        assert!(tracker.top_contracts(10).is_empty(), "empty tracker should return empty list");
+        assert_eq!(tracker.blocks_tracked(), 0);
     }
 }

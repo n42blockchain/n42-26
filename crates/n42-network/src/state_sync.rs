@@ -149,6 +149,10 @@ where
 }
 
 /// Writes a length-prefixed bincode-encoded message.
+///
+/// Enforces `MAX_SYNC_MSG_SIZE` on the write side so that oversized
+/// messages fail at the sender with a clear error rather than wasting
+/// network bandwidth only to be rejected by the receiver.
 async fn write_length_prefixed<T, M>(io: &mut T, msg: &M) -> io::Result<()>
 where
     T: AsyncWrite + Unpin + Send,
@@ -156,9 +160,139 @@ where
 {
     let data = bincode::serialize(msg)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    if data.len() > MAX_SYNC_MSG_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("serialized message too large: {} > {}", data.len(), MAX_SYNC_MSG_SIZE),
+        ));
+    }
     let len = (data.len() as u32).to_be_bytes();
     io.write_all(&len).await?;
     io.write_all(&data).await?;
     io.flush().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_primitives::B256;
+    use n42_primitives::consensus::QuorumCertificate;
+
+    fn sample_request() -> BlockSyncRequest {
+        BlockSyncRequest {
+            from_view: 10,
+            to_view: 20,
+            local_committed_view: 8,
+        }
+    }
+
+    fn sample_sync_block() -> SyncBlock {
+        use n42_primitives::BlsSecretKey;
+
+        let sk = BlsSecretKey::random().unwrap();
+        let sig = sk.sign(b"test");
+
+        SyncBlock {
+            view: 15,
+            block_hash: B256::repeat_byte(0xAA),
+            commit_qc: QuorumCertificate {
+                view: 15,
+                block_hash: B256::repeat_byte(0xAA),
+                aggregate_signature: sig,
+                signers: Default::default(),
+            },
+            payload: vec![1, 2, 3, 4],
+        }
+    }
+
+    fn sample_response() -> BlockSyncResponse {
+        BlockSyncResponse {
+            blocks: vec![sample_sync_block()],
+            peer_committed_view: 25,
+        }
+    }
+
+    #[test]
+    fn test_block_sync_request_serde_roundtrip() {
+        let req = sample_request();
+        let bytes = bincode::serialize(&req).unwrap();
+        let decoded: BlockSyncRequest = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(decoded.from_view, req.from_view);
+        assert_eq!(decoded.to_view, req.to_view);
+        assert_eq!(decoded.local_committed_view, req.local_committed_view);
+    }
+
+    #[test]
+    fn test_block_sync_response_serde_roundtrip() {
+        let resp = sample_response();
+        let bytes = bincode::serialize(&resp).unwrap();
+        let decoded: BlockSyncResponse = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(decoded.blocks.len(), 1);
+        assert_eq!(decoded.blocks[0].view, 15);
+        assert_eq!(decoded.blocks[0].block_hash, B256::repeat_byte(0xAA));
+        assert_eq!(decoded.blocks[0].payload, vec![1, 2, 3, 4]);
+        assert_eq!(decoded.peer_committed_view, 25);
+    }
+
+    #[test]
+    fn test_block_sync_response_empty_blocks() {
+        let resp = BlockSyncResponse {
+            blocks: vec![],
+            peer_committed_view: 100,
+        };
+        let bytes = bincode::serialize(&resp).unwrap();
+        let decoded: BlockSyncResponse = bincode::deserialize(&bytes).unwrap();
+        assert!(decoded.blocks.is_empty());
+        assert_eq!(decoded.peer_committed_view, 100);
+    }
+
+    #[tokio::test]
+    async fn test_codec_write_read_request_roundtrip() {
+        let req = sample_request();
+        let mut buf = futures::io::Cursor::new(Vec::new());
+        write_length_prefixed(&mut buf, &req).await.unwrap();
+
+        let data = buf.into_inner();
+        // First 4 bytes are the big-endian length prefix.
+        let len = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
+        assert_eq!(len, data.len() - 4, "length prefix should match payload size");
+
+        let mut reader = futures::io::Cursor::new(data);
+        let decoded: BlockSyncRequest =
+            read_length_prefixed(&mut reader, MAX_SYNC_MSG_SIZE).await.unwrap();
+        assert_eq!(decoded.from_view, req.from_view);
+        assert_eq!(decoded.to_view, req.to_view);
+        assert_eq!(decoded.local_committed_view, req.local_committed_view);
+    }
+
+    #[tokio::test]
+    async fn test_codec_write_read_response_roundtrip() {
+        let resp = sample_response();
+        let mut buf = futures::io::Cursor::new(Vec::new());
+        write_length_prefixed(&mut buf, &resp).await.unwrap();
+
+        let data = buf.into_inner();
+        let mut reader = futures::io::Cursor::new(data);
+        let decoded: BlockSyncResponse =
+            read_length_prefixed(&mut reader, MAX_SYNC_MSG_SIZE).await.unwrap();
+        assert_eq!(decoded.blocks.len(), 1);
+        assert_eq!(decoded.blocks[0].view, 15);
+        assert_eq!(decoded.peer_committed_view, 25);
+    }
+
+    #[tokio::test]
+    async fn test_codec_read_rejects_oversized() {
+        // Fabricate a length prefix that exceeds MAX_SYNC_MSG_SIZE.
+        let fake_len = (MAX_SYNC_MSG_SIZE as u32 + 1).to_be_bytes();
+        let mut data = Vec::new();
+        data.extend_from_slice(&fake_len);
+        data.extend_from_slice(&[0u8; 100]);
+
+        let mut reader = futures::io::Cursor::new(data);
+        let result: io::Result<BlockSyncRequest> =
+            read_length_prefixed(&mut reader, MAX_SYNC_MSG_SIZE).await;
+        assert!(result.is_err(), "oversized message should be rejected");
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+    }
 }

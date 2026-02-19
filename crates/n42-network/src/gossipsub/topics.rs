@@ -66,9 +66,19 @@ mod tests {
             "verification receipts topic should be /n42/verification/1"
         );
 
-        // Also verify that the three topics are distinct from each other.
+        let mempool = mempool_topic();
+        assert_eq!(
+            mempool.hash(),
+            IdentTopic::new("/n42/mempool/1").hash(),
+            "mempool topic should be /n42/mempool/1"
+        );
+
+        // Also verify that all four topics are distinct from each other.
         assert_ne!(consensus.hash(), blocks.hash(), "consensus and blocks topics should differ");
         assert_ne!(consensus.hash(), verification.hash(), "consensus and verification topics should differ");
+        assert_ne!(consensus.hash(), mempool.hash(), "consensus and mempool topics should differ");
         assert_ne!(blocks.hash(), verification.hash(), "blocks and verification topics should differ");
+        assert_ne!(blocks.hash(), mempool.hash(), "blocks and mempool topics should differ");
+        assert_ne!(verification.hash(), mempool.hash(), "verification and mempool topics should differ");
     }
 }

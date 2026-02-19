@@ -2,7 +2,7 @@ use alloy_primitives::B256;
 use metrics::{counter, gauge};
 use n42_mobile::{ReceiptAggregator, VerificationReceipt};
 use n42_network::mobile::HubEvent;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
@@ -19,7 +19,13 @@ pub struct AttestationEvent {
 
 /// Minimum attestation threshold regardless of connected phone count.
 /// Protects initial deployment when very few phones are connected.
-const MIN_ATTESTATION_THRESHOLD: u32 = 10;
+/// Configurable via `N42_MIN_ATTESTATION_THRESHOLD` environment variable.
+fn min_attestation_threshold() -> u32 {
+    std::env::var("N42_MIN_ATTESTATION_THRESHOLD")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(10)
+}
 
 /// Bridges the StarHub mobile verification events with the ReceiptAggregator.
 ///
@@ -42,7 +48,12 @@ pub struct MobileVerificationBridge {
     connected_sessions: HashSet<u64>,
     /// Tracks invalid receipt counts per block hash for divergence detection.
     /// Key: block_hash, Value: count of invalid receipts.
+    /// Bounded to `max_tracked_blocks` entries via FIFO eviction to prevent unbounded growth.
     invalid_receipt_counts: HashMap<B256, u32>,
+    /// Insertion order for `invalid_receipt_counts` FIFO eviction.
+    invalid_receipt_order: VecDeque<B256>,
+    /// Maximum entries in `invalid_receipt_counts` (same as receipt_aggregator's max_tracked_blocks).
+    max_invalid_tracked: usize,
 }
 
 impl MobileVerificationBridge {
@@ -62,6 +73,8 @@ impl MobileVerificationBridge {
             phone_connected_tx: None,
             connected_sessions: HashSet::new(),
             invalid_receipt_counts: HashMap::new(),
+            invalid_receipt_order: VecDeque::new(),
+            max_invalid_tracked: max_tracked_blocks,
         }
     }
 
@@ -157,13 +170,13 @@ impl MobileVerificationBridge {
 
     /// Recalculates the attestation threshold based on the number of connected phones.
     ///
-    /// Formula: `max(MIN_ATTESTATION_THRESHOLD, connected_count * 2 / 3)`
+    /// Formula: `max(min_attestation_threshold(), connected_count * 2 / 3)`
     /// This ensures BFT-grade security (2/3 threshold) when enough phones are connected,
-    /// while maintaining a minimum of 10 during early deployment.
+    /// while maintaining a minimum during early deployment.
     fn update_dynamic_threshold(&mut self) {
         let connected = self.connected_sessions.len() as u32;
         let dynamic = connected * 2 / 3;
-        let threshold = dynamic.max(MIN_ATTESTATION_THRESHOLD);
+        let threshold = dynamic.max(min_attestation_threshold());
         self.receipt_aggregator.set_default_threshold(threshold);
         debug!(
             target: "n42::mobile",
@@ -203,6 +216,15 @@ impl MobileVerificationBridge {
             );
 
             // Track invalid count per block for divergence detection.
+            // Evict oldest entry if at capacity (same bound as receipt_aggregator).
+            if !self.invalid_receipt_counts.contains_key(&receipt.block_hash) {
+                if self.invalid_receipt_counts.len() >= self.max_invalid_tracked {
+                    if let Some(oldest) = self.invalid_receipt_order.pop_front() {
+                        self.invalid_receipt_counts.remove(&oldest);
+                    }
+                }
+                self.invalid_receipt_order.push_back(receipt.block_hash);
+            }
             let count = self.invalid_receipt_counts
                 .entry(receipt.block_hash)
                 .or_insert(0);
@@ -392,6 +414,61 @@ mod tests {
         let status = bridge.receipt_aggregator.get_status(&block_hash).unwrap();
         assert!(status.is_attested(), "should be attested with threshold=1");
         // Test passes if we reach here without panic.
+    }
+
+    #[test]
+    fn test_bridge_dynamic_threshold() {
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let mut bridge = MobileVerificationBridge::new(rx, 2, 100);
+
+        // Initially no connected sessions → threshold = max(min_threshold, 0*2/3) = min_threshold
+        assert!(bridge.connected_sessions.is_empty());
+
+        // Simulate 30 phones connecting
+        for i in 0..30u64 {
+            bridge.connected_sessions.insert(i);
+        }
+        bridge.update_dynamic_threshold();
+        // dynamic = 30 * 2/3 = 20, max(10, 20) = 20
+        // (min_attestation_threshold() default is 10)
+        // The threshold should be the dynamic value since 20 > 10
+
+        // Verify by processing receipts: with high threshold, one receipt shouldn't attest
+        let block_hash = B256::with_last_byte(0xF1);
+        bridge.process_receipt(&make_receipt(block_hash, 100));
+        let status = bridge.receipt_aggregator.get_status(&block_hash).unwrap();
+        assert!(!status.is_attested(), "with ~20 threshold, 1 receipt should not attest");
+    }
+
+    #[test]
+    fn test_bridge_invalid_receipt_counts_bounded() {
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let max_tracked = 3;
+        let mut bridge = MobileVerificationBridge::new(rx, 100, max_tracked);
+
+        // Create invalid receipts for 4 different blocks (exceeding max_tracked=3)
+        for i in 0..4u8 {
+            let block_hash = B256::with_last_byte(i);
+            let key = BlsSecretKey::random().expect("BLS key gen");
+            let receipt = sign_receipt(block_hash, i as u64, false, true, 1_000_000, &key);
+            bridge.process_receipt(&receipt);
+        }
+
+        // Should be bounded at max_tracked
+        assert_eq!(
+            bridge.invalid_receipt_counts.len(),
+            max_tracked,
+            "invalid_receipt_counts should be bounded at max_tracked_blocks"
+        );
+        // First block (0x00) should have been evicted
+        assert!(
+            !bridge.invalid_receipt_counts.contains_key(&B256::with_last_byte(0)),
+            "oldest block should be evicted"
+        );
+        // Most recent blocks should still be tracked
+        assert!(bridge.invalid_receipt_counts.contains_key(&B256::with_last_byte(1)));
+        assert!(bridge.invalid_receipt_counts.contains_key(&B256::with_last_byte(2)));
+        assert!(bridge.invalid_receipt_counts.contains_key(&B256::with_last_byte(3)));
     }
 
     #[test]

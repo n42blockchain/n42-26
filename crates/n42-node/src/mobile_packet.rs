@@ -57,6 +57,24 @@ pub type BlockCommitNotification = (B256, u64);
 /// At ~20 codes per block and 8-second slots, 2000 entries covers ~100 blocks (~13 min).
 const MAX_PREVIOUSLY_SENT_CODES: usize = 2000;
 
+/// Maximum number of retries when block is not yet available in reth.
+/// Configurable via `N42_PACKET_MAX_RETRIES` environment variable.
+fn packet_max_retries() -> u32 {
+    std::env::var("N42_PACKET_MAX_RETRIES")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(10)
+}
+
+/// Base delay for exponential backoff when retrying block fetch.
+/// Configurable via `N42_PACKET_RETRY_BASE_MS` environment variable.
+fn packet_retry_base_ms() -> u64 {
+    std::env::var("N42_PACKET_RETRY_BASE_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(200)
+}
+
 /// Insertion-order bounded code cache (P1 fix).
 ///
 /// Evicts oldest entries (FIFO) when capacity is exceeded, unlike HashMap's
@@ -138,8 +156,8 @@ pub async fn mobile_packet_loop<P>(
                 // Retry with exponential backoff: the block may not be persisted in reth yet
                 // when the orchestrator sends the notification (fcu finalization is async).
                 let mut last_err = None;
-                let max_retries = 10;
-                let base_delay = std::time::Duration::from_millis(200);
+                let max_retries = packet_max_retries();
+                let base_delay = std::time::Duration::from_millis(packet_retry_base_ms());
 
                 for attempt in 0..max_retries {
                     if attempt > 0 {
@@ -421,4 +439,106 @@ fn fix_witness_pre_state(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_primitives::{Bytes, B256};
+
+    #[test]
+    fn test_code_cache_insert_and_contains() {
+        let mut cache = CodeCache::new(10);
+        let hash = B256::repeat_byte(0xAA);
+        let code = Bytes::from(vec![0x60, 0x00]);
+
+        assert!(!cache.contains_key(&hash));
+        assert!(cache.is_empty());
+
+        cache.insert(hash, code.clone());
+        assert!(cache.contains_key(&hash));
+        assert!(!cache.is_empty());
+    }
+
+    #[test]
+    fn test_code_cache_duplicate_insert_noop() {
+        let mut cache = CodeCache::new(10);
+        let hash = B256::repeat_byte(0xBB);
+        let code = Bytes::from(vec![0x60, 0x01]);
+
+        cache.insert(hash, code.clone());
+        cache.insert(hash, code); // duplicate
+
+        // Should only have one entry
+        assert_eq!(cache.order.len(), 1);
+        assert_eq!(cache.map.len(), 1);
+    }
+
+    #[test]
+    fn test_code_cache_fifo_eviction() {
+        let mut cache = CodeCache::new(3);
+
+        let h1 = B256::repeat_byte(0x01);
+        let h2 = B256::repeat_byte(0x02);
+        let h3 = B256::repeat_byte(0x03);
+        let h4 = B256::repeat_byte(0x04);
+
+        cache.insert(h1, Bytes::from(vec![1]));
+        cache.insert(h2, Bytes::from(vec![2]));
+        cache.insert(h3, Bytes::from(vec![3]));
+        assert_eq!(cache.map.len(), 3);
+        assert_eq!(cache.order.len(), 3);
+
+        // Insert 4th — should evict h1 (FIFO)
+        cache.insert(h4, Bytes::from(vec![4]));
+        assert_eq!(cache.map.len(), 3);
+        assert!(!cache.contains_key(&h1), "oldest entry should be evicted");
+        assert!(cache.contains_key(&h2));
+        assert!(cache.contains_key(&h3));
+        assert!(cache.contains_key(&h4));
+    }
+
+    #[test]
+    fn test_code_cache_iter() {
+        let mut cache = CodeCache::new(10);
+        let h1 = B256::repeat_byte(0x01);
+        let h2 = B256::repeat_byte(0x02);
+        cache.insert(h1, Bytes::from(vec![1]));
+        cache.insert(h2, Bytes::from(vec![2]));
+
+        let items: Vec<_> = cache.iter().collect();
+        assert_eq!(items.len(), 2);
+    }
+
+    #[test]
+    fn test_code_cache_zero_capacity() {
+        // Capacity 0 means every insert immediately evicts.
+        let mut cache = CodeCache::new(0);
+        let hash = B256::repeat_byte(0xFF);
+        cache.insert(hash, Bytes::from(vec![0xFF]));
+        // With capacity 0, the while loop evicts until map.len() <= 0
+        assert!(cache.is_empty(), "capacity 0 should keep nothing");
+    }
+
+    #[test]
+    fn test_code_cache_capacity_one() {
+        let mut cache = CodeCache::new(1);
+        let h1 = B256::repeat_byte(0x01);
+        let h2 = B256::repeat_byte(0x02);
+
+        cache.insert(h1, Bytes::from(vec![1]));
+        assert!(cache.contains_key(&h1));
+
+        cache.insert(h2, Bytes::from(vec![2]));
+        assert!(!cache.contains_key(&h1), "h1 should be evicted");
+        assert!(cache.contains_key(&h2));
+        assert_eq!(cache.map.len(), 1);
+    }
+
+    #[test]
+    fn test_packet_retry_defaults() {
+        // Verify defaults when env vars are not set
+        assert_eq!(packet_max_retries(), 10);
+        assert_eq!(packet_retry_base_ms(), 200);
+    }
 }

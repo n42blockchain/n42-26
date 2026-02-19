@@ -67,11 +67,24 @@ fn max_committed_blocks() -> usize {
 
 /// Timeout for a state sync request. If no response arrives within this duration,
 /// the in-flight flag is reset so a new request can be sent.
-const SYNC_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// Configurable via `N42_SYNC_TIMEOUT_SECS` environment variable.
+fn sync_request_timeout() -> Duration {
+    let secs = std::env::var("N42_SYNC_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(30);
+    Duration::from_secs(secs)
+}
 
 /// Maximum consecutive empty block skips before producing a block anyway.
 /// At 8s slots, 3 skips = 24 seconds max gap before liveness kicks in.
-const MAX_CONSECUTIVE_EMPTY_SKIPS: u32 = 3;
+/// Configurable via `N42_MAX_EMPTY_SKIPS` environment variable.
+fn max_consecutive_empty_skips() -> u32 {
+    std::env::var("N42_MAX_EMPTY_SKIPS")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(3)
+}
 
 /// Bridges the consensus engine with the P2P network layer and reth Engine API.
 ///
@@ -549,16 +562,16 @@ impl ConsensusOrchestrator {
     /// If slot_time == 0, triggers immediately (legacy behavior).
     ///
     /// Empty block optimization: when the mempool is likely empty (recent blocks
-    /// were empty), skip up to MAX_CONSECUTIVE_EMPTY_SKIPS slots before producing
+    /// were empty), skip up to max_consecutive_empty_skips() slots before producing
     /// an empty block to maintain liveness.
     async fn schedule_payload_build(&mut self) {
         // Empty block skip optimization.
-        if self.recent_blocks_empty() && self.consecutive_empty_skips < MAX_CONSECUTIVE_EMPTY_SKIPS {
+        if self.recent_blocks_empty() && self.consecutive_empty_skips < max_consecutive_empty_skips() {
             self.consecutive_empty_skips += 1;
             counter!("n42_empty_block_skips_total").increment(1);
             debug!(
                 skip_count = self.consecutive_empty_skips,
-                max = MAX_CONSECUTIVE_EMPTY_SKIPS,
+                max = max_consecutive_empty_skips(),
                 "skipping empty block proposal (low activity)"
             );
             // Re-schedule at the next slot boundary to check again.
@@ -1208,7 +1221,7 @@ impl ConsensusOrchestrator {
         if self.sync_in_flight {
             // Check for stale sync request (peer may have gone silent).
             if let Some(started) = self.sync_started_at {
-                if started.elapsed() > SYNC_REQUEST_TIMEOUT {
+                if started.elapsed() > sync_request_timeout() {
                     warn!(
                         elapsed_secs = started.elapsed().as_secs(),
                         "sync request timed out, resetting"
@@ -1433,7 +1446,7 @@ mod tests {
     use n42_consensus::{ConsensusEngine, ValidatorSet};
     use n42_network::{NetworkCommand, NetworkHandle};
     use n42_primitives::{BlsSecretKey, ConsensusMessage, QuorumCertificate, Vote};
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashSet;
     use std::time::Duration;
 
     /// Helper: create a test ConsensusEngine with a single validator.

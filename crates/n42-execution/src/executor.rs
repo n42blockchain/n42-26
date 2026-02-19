@@ -5,6 +5,8 @@ use reth_evm::{
     ConfigureEvm, Database,
 };
 use reth_primitives_traits::{NodePrimitives, RecoveredBlock};
+use std::time::Instant;
+use tracing::{debug, warn};
 
 /// Result of block execution with witness data.
 pub struct ExecutionWithWitness {
@@ -12,6 +14,8 @@ pub struct ExecutionWithWitness {
     pub output: BlockExecutionOutput<<EthPrimitives as NodePrimitives>::Receipt>,
     /// Execution witness capturing all state accessed during execution.
     pub witness: ExecutionWitness,
+    /// Wall-clock execution time in milliseconds.
+    pub elapsed_ms: u64,
 }
 
 /// Result of block execution with both witness and state diff.
@@ -22,6 +26,8 @@ pub struct FullExecutionResult {
     pub witness: ExecutionWitness,
     /// State diff showing all changes made by this block.
     pub diff: StateDiff,
+    /// Wall-clock execution time in milliseconds.
+    pub elapsed_ms: u64,
 }
 
 /// Executes a block and captures the execution witness.
@@ -37,6 +43,9 @@ pub fn execute_block_with_witness<DB: Database>(
     db: DB,
     block: &RecoveredBlock<<EthPrimitives as NodePrimitives>::Block>,
 ) -> Result<ExecutionWithWitness, BlockExecutionError> {
+    let start = Instant::now();
+    debug!(target: "n42::execution", "execute_block_with_witness starting");
+
     let executor = evm_config.executor(db);
     let mut witness = ExecutionWitness::default();
 
@@ -44,7 +53,16 @@ pub fn execute_block_with_witness<DB: Database>(
         witness = ExecutionWitness::from_state(state);
     })?;
 
-    Ok(ExecutionWithWitness { output, witness })
+    let elapsed_ms = start.elapsed().as_millis() as u64;
+    debug!(
+        target: "n42::execution",
+        elapsed_ms,
+        witness_accounts = witness.hashed_state.accounts.len(),
+        witness_codes = witness.codes.len(),
+        "execute_block_with_witness complete"
+    );
+
+    Ok(ExecutionWithWitness { output, witness, elapsed_ms })
 }
 
 /// Executes a block and captures both witness and state diff.
@@ -59,6 +77,9 @@ pub fn execute_block_full<DB: Database>(
     db: DB,
     block: &RecoveredBlock<<EthPrimitives as NodePrimitives>::Block>,
 ) -> Result<FullExecutionResult, BlockExecutionError> {
+    let start = Instant::now();
+    debug!(target: "n42::execution", "execute_block_full starting");
+
     let executor = evm_config.executor(db);
     let mut witness = ExecutionWitness::default();
 
@@ -69,20 +90,32 @@ pub fn execute_block_full<DB: Database>(
     // Extract state diff from the bundle state in the output
     let diff = StateDiff::from_bundle_state(&output.state);
 
-    // Defensive consistency check: witness accounts should be a superset of diff accounts.
+    // Consistency check: witness accounts should be a superset of diff accounts.
     // The witness captures all state *accessed* (reads + writes), while the diff only
     // captures state that *changed* (writes). So witness.accounts >= diff.accounts.
     // This holds because any changed account must have been accessed during execution.
-    debug_assert!(
-        witness.hashed_state.accounts.len() >= diff.len(),
-        "witness accounts ({}) < diff accounts ({}): possible state inconsistency",
-        witness.hashed_state.accounts.len(),
-        diff.len(),
+    if witness.hashed_state.accounts.len() < diff.len() {
+        warn!(
+            target: "n42::execution",
+            witness = witness.hashed_state.accounts.len(),
+            diff = diff.len(),
+            "witness accounts fewer than diff accounts — possible inconsistency"
+        );
+    }
+
+    let elapsed_ms = start.elapsed().as_millis() as u64;
+    debug!(
+        target: "n42::execution",
+        elapsed_ms,
+        witness_accounts = witness.hashed_state.accounts.len(),
+        diff_accounts = diff.len(),
+        "execute_block_full complete"
     );
 
     Ok(FullExecutionResult {
         output,
         witness,
         diff,
+        elapsed_ms,
     })
 }

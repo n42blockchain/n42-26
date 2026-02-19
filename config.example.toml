@@ -65,6 +65,17 @@
 # The timeout doubles on consecutive failures, capped at this value.
 # N42_MAX_TIMEOUT_MS = "60000"
 
+# ── Operational Tuning ──
+
+# Minimum number of mobile attestations required per block (default: 10).
+# N42_MIN_ATTESTATION_THRESHOLD = "10"
+
+# State sync request timeout in seconds (default: 30).
+# N42_SYNC_TIMEOUT_SECS = "30"
+
+# Maximum consecutive empty blocks a leader skips before building (default: 3).
+# N42_MAX_EMPTY_SKIPS = "3"
+
 # ── Block Production ──
 
 # Block production interval in milliseconds (default: 0 = immediate).
