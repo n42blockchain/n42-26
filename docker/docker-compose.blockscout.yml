@@ -1,0 +1,89 @@
+version: "3.9"
+
+# N42 Blockscout Block Explorer
+#
+# Usage:
+#   1. Start your N42 node with default RPC settings (HTTP on :8545, WS on :8546)
+#   2. docker compose -f docker/docker-compose.blockscout.yml up -d
+#   3. Open http://localhost:4000 in your browser
+#
+# Configuration: edit docker/blockscout.env to customize settings.
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: blockscout
+      POSTGRES_USER: blockscout
+      POSTGRES_PASSWORD: blockscout
+    volumes:
+      - blockscout-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U blockscout"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - blockscout-redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  smart-contract-verifier:
+    image: ghcr.io/blockscout/smart-contract-verifier:latest
+    restart: unless-stopped
+    environment:
+      SMART_CONTRACT_VERIFIER__SERVER__HTTP__ADDR: 0.0.0.0:8050
+    ports:
+      - "8050:8050"
+
+  backend:
+    image: blockscout/blockscout:latest
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      smart-contract-verifier:
+        condition: service_started
+    env_file:
+      - blockscout.env
+    environment:
+      REDIS_URL: redis://redis:6379
+    command: >
+      sh -c "bin/blockscout eval 'Elixir.Explorer.ReleaseTasks.create_and_migrate()' && bin/blockscout start"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "4000:4000"
+
+  frontend:
+    image: ghcr.io/blockscout/frontend:latest
+    restart: unless-stopped
+    depends_on:
+      - backend
+    environment:
+      NEXT_PUBLIC_API_HOST: localhost
+      NEXT_PUBLIC_API_PORT: "4000"
+      NEXT_PUBLIC_API_PROTOCOL: http
+      NEXT_PUBLIC_NETWORK_NAME: N42
+      NEXT_PUBLIC_NETWORK_ID: "4242"
+      NEXT_PUBLIC_NETWORK_CURRENCY_NAME: N42
+      NEXT_PUBLIC_NETWORK_CURRENCY_SYMBOL: N42
+      NEXT_PUBLIC_HOMEPAGE_CHARTS: "['daily_txs']"
+      NEXT_PUBLIC_VISUALIZE_API_HOST: ""
+      NEXT_PUBLIC_IS_TESTNET: "true"
+    ports:
+      - "3000:3000"
+
+volumes:
+  blockscout-db:
+  blockscout-redis:
