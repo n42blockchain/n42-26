@@ -1,8 +1,9 @@
-use bytes::Bytes;
+use bytes::{BufMut, Bytes, BytesMut};
 use n42_mobile::receipt::VerificationReceipt;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc, RwLock};
 
@@ -39,6 +40,42 @@ const MIN_RECEIPT_INTERVAL: Duration = Duration::from_secs(2);
 const BROADCAST_SEND_TIMEOUT: Duration = Duration::from_secs(3);
 
 
+
+/// Combines type prefix + payload into a single contiguous Bytes.
+///
+/// This avoids two separate `write_all` syscalls per phone connection:
+/// instead of writing `[prefix]` then `[data]`, we write `[prefix | data]` once.
+/// For 10K phones this halves the total syscall count per broadcast.
+fn preframe_message(type_prefix: u8, data: &Bytes) -> Bytes {
+    let mut buf = BytesMut::with_capacity(1 + data.len());
+    buf.put_u8(type_prefix);
+    buf.extend_from_slice(data);
+    buf.freeze()
+}
+
+/// Global session ID generator for unique IDs across multiple StarHub shards.
+///
+/// When multiple StarHub instances share a `SessionIdGenerator`, each session
+/// receives a globally unique ID regardless of which shard accepted the connection.
+pub struct SessionIdGenerator(pub AtomicU64);
+
+impl SessionIdGenerator {
+    /// Creates a new generator starting at ID 1.
+    pub fn new() -> Self {
+        Self(AtomicU64::new(1))
+    }
+
+    /// Returns the next unique session ID.
+    pub fn next(&self) -> u64 {
+        self.0.fetch_add(1, Ordering::Relaxed)
+    }
+}
+
+impl Default for SessionIdGenerator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Commands sent to the star hub from the node layer.
 #[derive(Debug)]
@@ -185,6 +222,10 @@ pub struct StarHub {
     session_senders: Arc<RwLock<HashMap<u64, mpsc::Sender<Bytes>>>>,
     /// SHA-256 hash of the server certificate (populated during run()).
     cert_hash: Option<[u8; 32]>,
+    /// Optional shared session ID generator (for multi-shard mode).
+    /// When `Some`, session IDs are allocated from this shared generator to ensure
+    /// global uniqueness across shards. When `None`, a local counter is used.
+    shared_session_id_gen: Option<Arc<SessionIdGenerator>>,
 }
 
 impl StarHub {
@@ -208,8 +249,21 @@ impl StarHub {
             broadcast_tx,
             session_senders: Arc::new(RwLock::new(HashMap::new())),
             cert_hash: None,
+            shared_session_id_gen: None,
         };
 
+        (hub, handle, event_rx)
+    }
+
+    /// Creates a new star hub with a shared session ID generator.
+    ///
+    /// Used by `ShardedStarHub` to ensure globally unique session IDs across shards.
+    pub fn new_with_shared_id_gen(
+        config: StarHubConfig,
+        id_gen: Arc<SessionIdGenerator>,
+    ) -> (Self, StarHubHandle, mpsc::UnboundedReceiver<HubEvent>) {
+        let (mut hub, handle, event_rx) = Self::new(config);
+        hub.shared_session_id_gen = Some(id_gen);
         (hub, handle, event_rx)
     }
 
@@ -271,8 +325,10 @@ impl StarHub {
         let accept_event_tx = event_tx.clone();
         let accept_endpoint = endpoint.clone();
         let accept_session_senders = session_senders.clone();
+        let shared_id_gen = self.shared_session_id_gen.clone();
         tokio::spawn(async move {
-            let mut session_id_counter: u64 = 1;
+            // Use shared generator if available (multi-shard mode), else local counter.
+            let local_id_gen = SessionIdGenerator::new();
             while let Some(incoming) = accept_endpoint.accept().await {
                 // Check connection limit
                 if accept_sessions.read().await.len() >= max_conns {
@@ -284,8 +340,9 @@ impl StarHub {
                 let sessions = accept_sessions.clone();
                 let event_tx = accept_event_tx.clone();
                 let broadcast_rx = broadcast_tx.subscribe();
-                let sid = session_id_counter;
-                session_id_counter += 1;
+                let sid = shared_id_gen.as_ref()
+                    .map(|g| g.next())
+                    .unwrap_or_else(|| local_id_gen.next());
 
                 // Create per-session channel for targeted messages
                 let (session_tx, session_rx) = mpsc::channel::<Bytes>(8);
@@ -322,7 +379,8 @@ impl StarHub {
                 HubCommand::BroadcastPacket(data) => {
                     let count = self.broadcast_tx.receiver_count();
                     metrics::counter!("n42_mobile_packets_broadcast").increment(1);
-                    let _ = self.broadcast_tx.send(BroadcastMsg::Packet(data));
+                    let framed = preframe_message(MSG_TYPE_PACKET_ZSTD, &data);
+                    let _ = self.broadcast_tx.send(BroadcastMsg::Packet(framed));
                     tracing::debug!(
                         phone_count = count,
                         "broadcasting verification packet to phones"
@@ -330,7 +388,8 @@ impl StarHub {
                 }
                 HubCommand::BroadcastCacheSync(data) => {
                     let count = self.broadcast_tx.receiver_count();
-                    let _ = self.broadcast_tx.send(BroadcastMsg::CacheSync(data));
+                    let framed = preframe_message(MSG_TYPE_CACHE_SYNC_ZSTD, &data);
+                    let _ = self.broadcast_tx.send(BroadcastMsg::CacheSync(framed));
                     tracing::debug!(
                         phone_count = count,
                         "broadcasting cache sync to phones"
@@ -495,6 +554,14 @@ async fn handle_phone_connection(
                                         // P2 fix: read lock + atomic counter instead of write lock
                                         if let Some(session) = sessions.read().await.get(&session_id) {
                                             session.record_receipt();
+                                            // Approximate RTT: IDC→phone + verify + phone→IDC
+                                            let now_ms = std::time::SystemTime::now()
+                                                .duration_since(std::time::UNIX_EPOCH)
+                                                .unwrap_or_default()
+                                                .as_millis() as u64;
+                                            if receipt.timestamp_ms > 0 && now_ms > receipt.timestamp_ms {
+                                                session.record_rtt(now_ms - receipt.timestamp_ms);
+                                            }
                                         }
                                         let _ = event_tx.send(HubEvent::ReceiptReceived(receipt));
                                     }
@@ -526,16 +593,15 @@ async fn handle_phone_connection(
             msg = broadcast_rx.recv() => {
                 match msg {
                     Ok(broadcast_msg) => {
-                        let (type_prefix, data) = match &broadcast_msg {
-                            BroadcastMsg::Packet(d) => (MSG_TYPE_PACKET_ZSTD, d.as_ref()),
-                            BroadcastMsg::CacheSync(d) => (MSG_TYPE_CACHE_SYNC_ZSTD, d.as_ref()),
+                        // Data is already pre-framed (type_prefix + payload merged)
+                        let framed_data = match &broadcast_msg {
+                            BroadcastMsg::Packet(d) | BroadcastMsg::CacheSync(d) => d,
                         };
                         let send_result = tokio::time::timeout(
                             BROADCAST_SEND_TIMEOUT,
                             async {
                                 let mut send = connection.open_uni().await?;
-                                send.write_all(&[type_prefix]).await?;
-                                send.write_all(data).await?;
+                                send.write_all(framed_data).await?;
                                 send.finish()?;
                                 Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
                             },
@@ -543,7 +609,7 @@ async fn handle_phone_connection(
                         match send_result {
                             Ok(Ok(())) => {
                                 if let Some(session) = sessions.read().await.get(&session_id) {
-                                    session.record_packet_sent();
+                                    session.record_send_success();
                                 }
                             }
                             Ok(Err(e)) => {
@@ -551,6 +617,10 @@ async fn handle_phone_connection(
                                 break;
                             }
                             Err(_) => {
+                                if let Some(session) = sessions.read().await.get(&session_id) {
+                                    session.record_send_timeout();
+                                    metrics::counter!("n42_mobile_sends", "tier" => session.tier().as_str()).increment(1);
+                                }
                                 metrics::counter!("n42_mobile_send_timeouts").increment(1);
                                 tracing::warn!(session_id, "broadcast send timed out, skipping message");
                             }
@@ -566,14 +636,13 @@ async fn handle_phone_connection(
                     }
                 }
             }
-            // Handle targeted messages for this specific session
+            // Handle targeted messages for this specific session (data is pre-framed)
             Some(data) = session_rx.recv() => {
                 let send_result = tokio::time::timeout(
                     BROADCAST_SEND_TIMEOUT,
                     async {
                         let mut send = connection.open_uni().await?;
-                        send.write_all(&[MSG_TYPE_CACHE_SYNC_ZSTD]).await?;
-                        send.write_all(&data).await?;
+                        send.write_all(&data).await?;  // data is already pre-framed
                         send.finish()?;
                         Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
                     },
@@ -801,6 +870,61 @@ mod tests {
     fn test_broadcast_send_timeout_reasonable() {
         assert!(BROADCAST_SEND_TIMEOUT.as_secs() >= 1);
         assert!(BROADCAST_SEND_TIMEOUT.as_secs() <= 5, "must leave time for verify in 8s slot");
+    }
+
+    #[test]
+    fn test_preframe_message_format() {
+        let data = Bytes::from(vec![0xAA, 0xBB, 0xCC]);
+        let framed = preframe_message(0x03, &data);
+        assert_eq!(framed[0], 0x03, "first byte must be type prefix");
+        assert_eq!(&framed[1..], &[0xAA, 0xBB, 0xCC]);
+    }
+
+    #[test]
+    fn test_preframe_message_zero_copy() {
+        let data = Bytes::from(vec![0xDE; 1000]);
+        let framed = preframe_message(0x01, &data);
+        let cloned = framed.clone();
+        assert_eq!(framed.as_ptr(), cloned.as_ptr(), "Bytes::clone should be zero-copy");
+    }
+
+    #[test]
+    fn test_preframe_empty_data() {
+        let data = Bytes::new();
+        let framed = preframe_message(0x04, &data);
+        assert_eq!(framed.len(), 1);
+        assert_eq!(framed[0], 0x04);
+    }
+
+    #[test]
+    fn test_session_id_generator() {
+        let id_gen = SessionIdGenerator::new();
+        assert_eq!(id_gen.next(), 1);
+        assert_eq!(id_gen.next(), 2);
+        assert_eq!(id_gen.next(), 3);
+    }
+
+    #[test]
+    fn test_session_id_generator_thread_safe() {
+        let id_gen = Arc::new(SessionIdGenerator::new());
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let g = id_gen.clone();
+                std::thread::spawn(move || {
+                    let mut ids = Vec::new();
+                    for _ in 0..1000 {
+                        ids.push(g.next());
+                    }
+                    ids
+                })
+            })
+            .collect();
+        let mut all_ids: Vec<u64> = threads.into_iter()
+            .flat_map(|t| t.join().unwrap())
+            .collect();
+        all_ids.sort();
+        all_ids.dedup();
+        assert_eq!(all_ids.len(), 8000, "all session IDs must be unique");
     }
 
     #[test]

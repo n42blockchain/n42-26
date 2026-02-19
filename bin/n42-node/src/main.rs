@@ -5,7 +5,7 @@ use clap::Parser;
 use n42_chainspec::ConsensusConfig;
 use reth_chainspec::ChainSpecProvider;
 use n42_consensus::{ConsensusEngine, EpochManager, ValidatorSet};
-use n42_network::{build_swarm_with_validator_index, StarHub, StarHubConfig, TransportConfig};
+use n42_network::{build_swarm_with_validator_index, ShardedStarHub, ShardedStarHubConfig, TransportConfig};
 use n42_network::NetworkService;
 use n42_node::mobile_bridge::MobileVerificationBridge;
 use n42_node::mobile_packet::mobile_packet_loop;
@@ -329,28 +329,44 @@ fn main() {
                     }
                 }
 
-                // 2. Start mobile verification StarHub.
+                // Data directory (used by StarHub certs and consensus state persistence).
+                let data_dir: PathBuf = std::env::var("N42_DATA_DIR")
+                    .unwrap_or_else(|_| "./n42-data".to_string())
+                    .into();
+
+                // 2. Start mobile verification StarHub (sharded for 50K+ scaling).
                 let starhub_port: u16 = std::env::var("N42_STARHUB_PORT")
                     .ok()
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(9443);
-                let star_hub_config = StarHubConfig {
-                    bind_addr: format!("0.0.0.0:{starhub_port}").parse().unwrap(),
-                    ..StarHubConfig::default()
+                let shard_count: usize = std::env::var("N42_STARHUB_SHARDS")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(1);
+
+                let sharded_config = ShardedStarHubConfig {
+                    base_port: starhub_port,
+                    shard_count,
+                    max_connections_per_shard: 10_000,
+                    cert_dir: Some(data_dir.join("certs")),
+                    ..Default::default()
                 };
-                let (star_hub, star_hub_handle, hub_event_rx) = StarHub::new(star_hub_config);
+                let (sharded_hub, star_hub_handle, hub_event_rx) =
+                    ShardedStarHub::new(sharded_config);
 
                 info!(
                     target: "n42::cli",
-                    bind_addr = %star_hub.bind_addr(),
-                    "Starting mobile verification StarHub"
+                    base_port = starhub_port,
+                    shard_count,
+                    ports = ?sharded_hub.ports(),
+                    "Starting mobile verification StarHub (sharded)"
                 );
 
                 task_executor.spawn_critical_task(
                     "n42-starhub",
                     Box::pin(async move {
-                        if let Err(e) = star_hub.run().await {
-                            tracing::error!(error = %e, "StarHub exited with error");
+                        if let Err(e) = sharded_hub.run().await {
+                            tracing::error!(error = %e, "ShardedStarHub exited with error");
                         }
                     }),
                 );
@@ -415,9 +431,6 @@ fn main() {
                 info!(target: "n42::cli", "Mobile packet generation loop started");
 
                 // 5. Create ConsensusEngine (with optional state recovery).
-                let data_dir: PathBuf = std::env::var("N42_DATA_DIR")
-                    .unwrap_or_else(|_| "./n42-data".to_string())
-                    .into();
                 let state_file = data_dir.join("consensus_state.json");
 
                 let (output_tx, output_rx) = mpsc::channel(1024);

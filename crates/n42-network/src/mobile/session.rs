@@ -3,6 +3,42 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
+/// Connection quality tier for a mobile phone.
+///
+/// Tiers are computed automatically based on RTT and timeout history.
+/// Currently used for observability (metrics). Future phases may use
+/// tiers to prioritize message delivery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum PhoneTier {
+    /// Low latency (< 2s avg RTT), no consecutive timeouts.
+    Fast = 0,
+    /// Intermediate quality.
+    Normal = 1,
+    /// High latency (> 5s avg RTT) or 3+ consecutive timeouts.
+    Slow = 2,
+}
+
+impl PhoneTier {
+    /// Returns a string label suitable for metrics tags.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PhoneTier::Fast => "fast",
+            PhoneTier::Normal => "normal",
+            PhoneTier::Slow => "slow",
+        }
+    }
+
+    /// Converts from u64 (stored in AtomicU64).
+    fn from_u64(v: u64) -> Self {
+        match v {
+            0 => PhoneTier::Fast,
+            1 => PhoneTier::Normal,
+            _ => PhoneTier::Slow,
+        }
+    }
+}
+
 /// Represents an active QUIC session with a mobile verifier.
 ///
 /// Each connected phone maintains a session on the IDC node, tracking
@@ -28,6 +64,18 @@ pub struct MobileSession {
     pub packets_sent: AtomicU64,
     /// Number of verification receipts received from this phone.
     pub receipts_received: AtomicU64,
+
+    // --- Connection tiering fields (Phase 2 Feature B) ---
+    /// Current connection quality tier (PhoneTier as u64).
+    tier: AtomicU64,
+    /// Total number of send timeouts.
+    timeout_count: AtomicU64,
+    /// Consecutive send timeouts (reset on success).
+    consecutive_timeouts: AtomicU64,
+    /// Cumulative RTT in milliseconds (for computing average).
+    total_rtt_ms: AtomicU64,
+    /// Number of RTT samples collected.
+    rtt_sample_count: AtomicU64,
 }
 
 impl std::fmt::Debug for MobileSession {
@@ -38,6 +86,7 @@ impl std::fmt::Debug for MobileSession {
             .field("cached_code_hashes", &self.cached_code_hashes.len())
             .field("packets_sent", &self.packets_sent.load(Ordering::Relaxed))
             .field("receipts_received", &self.receipts_received.load(Ordering::Relaxed))
+            .field("tier", &self.tier())
             .finish()
     }
 }
@@ -53,7 +102,67 @@ impl MobileSession {
             cached_code_hashes: HashSet::new(),
             packets_sent: AtomicU64::new(0),
             receipts_received: AtomicU64::new(0),
+            tier: AtomicU64::new(PhoneTier::Fast as u64),
+            timeout_count: AtomicU64::new(0),
+            consecutive_timeouts: AtomicU64::new(0),
+            total_rtt_ms: AtomicU64::new(0),
+            rtt_sample_count: AtomicU64::new(0),
         }
+    }
+
+    /// Returns the current connection quality tier.
+    pub fn tier(&self) -> PhoneTier {
+        PhoneTier::from_u64(self.tier.load(Ordering::Relaxed))
+    }
+
+    /// Records a successful send: resets consecutive timeouts, increments packet counter.
+    pub fn record_send_success(&self) {
+        self.consecutive_timeouts.store(0, Ordering::Relaxed);
+        self.record_packet_sent();
+        self.recompute_tier();
+    }
+
+    /// Records a send timeout: increments timeout counters.
+    pub fn record_send_timeout(&self) {
+        self.timeout_count.fetch_add(1, Ordering::Relaxed);
+        self.consecutive_timeouts.fetch_add(1, Ordering::Relaxed);
+        self.recompute_tier();
+    }
+
+    /// Records an RTT sample (in milliseconds) and recomputes tier.
+    pub fn record_rtt(&self, rtt_ms: u64) {
+        self.total_rtt_ms.fetch_add(rtt_ms, Ordering::Relaxed);
+        self.rtt_sample_count.fetch_add(1, Ordering::Relaxed);
+        self.recompute_tier();
+    }
+
+    /// Returns the average RTT in milliseconds, or None if no samples.
+    pub fn avg_rtt_ms(&self) -> Option<u64> {
+        let count = self.rtt_sample_count.load(Ordering::Relaxed);
+        if count == 0 {
+            return None;
+        }
+        Some(self.total_rtt_ms.load(Ordering::Relaxed) / count)
+    }
+
+    /// Recomputes the tier based on consecutive timeouts and average RTT.
+    ///
+    /// - **Fast**: consecutive_timeouts == 0 && avg_rtt < 2000ms (or no RTT data)
+    /// - **Slow**: consecutive_timeouts >= 3 || avg_rtt > 5000ms
+    /// - **Normal**: everything else
+    fn recompute_tier(&self) {
+        let consec = self.consecutive_timeouts.load(Ordering::Relaxed);
+        let avg = self.avg_rtt_ms();
+
+        let new_tier = if consec >= 3 || avg.map_or(false, |r| r > 5000) {
+            PhoneTier::Slow
+        } else if consec == 0 && avg.map_or(true, |r| r < 2000) {
+            PhoneTier::Fast
+        } else {
+            PhoneTier::Normal
+        };
+
+        self.tier.store(new_tier as u64, Ordering::Relaxed);
     }
 
     /// Marks the session as recently active (lock-free).
@@ -199,5 +308,93 @@ mod tests {
         assert!(debug_str.contains("session_id: 99"));
         assert!(debug_str.contains("packets_sent: 2"));
         assert!(debug_str.contains("receipts_received: 1"));
+    }
+
+    // --- Feature B: Connection Tiering tests ---
+
+    #[test]
+    fn test_phone_tier_default() {
+        let session = MobileSession::new(1, [0xAA; 48]);
+        assert_eq!(session.tier(), PhoneTier::Fast);
+    }
+
+    #[test]
+    fn test_tier_degrades_on_timeouts() {
+        let session = MobileSession::new(1, [0u8; 48]);
+        assert_eq!(session.tier(), PhoneTier::Fast);
+
+        session.record_send_timeout();
+        // 1 consecutive timeout: Normal (not 0, not >= 3)
+        assert_eq!(session.tier(), PhoneTier::Normal);
+
+        session.record_send_timeout();
+        assert_eq!(session.tier(), PhoneTier::Normal);
+
+        session.record_send_timeout();
+        // 3 consecutive timeouts: Slow
+        assert_eq!(session.tier(), PhoneTier::Slow);
+    }
+
+    #[test]
+    fn test_tier_recovers_on_success() {
+        let session = MobileSession::new(1, [0u8; 48]);
+
+        // Drive to Slow
+        for _ in 0..3 {
+            session.record_send_timeout();
+        }
+        assert_eq!(session.tier(), PhoneTier::Slow);
+
+        // Success resets consecutive_timeouts → Fast (no RTT data yet)
+        session.record_send_success();
+        assert_eq!(session.tier(), PhoneTier::Fast);
+    }
+
+    #[test]
+    fn test_record_rtt_average() {
+        let session = MobileSession::new(1, [0u8; 48]);
+        assert_eq!(session.avg_rtt_ms(), None);
+
+        session.record_rtt(1000);
+        assert_eq!(session.avg_rtt_ms(), Some(1000));
+
+        session.record_rtt(3000);
+        // avg = (1000 + 3000) / 2 = 2000
+        assert_eq!(session.avg_rtt_ms(), Some(2000));
+    }
+
+    #[test]
+    fn test_tier_slow_on_high_rtt() {
+        let session = MobileSession::new(1, [0u8; 48]);
+
+        // Record high RTT samples: avg > 5000ms → Slow
+        session.record_rtt(6000);
+        session.record_rtt(7000);
+        assert_eq!(session.tier(), PhoneTier::Slow);
+    }
+
+    #[test]
+    fn test_tier_normal_on_moderate_rtt() {
+        let session = MobileSession::new(1, [0u8; 48]);
+
+        // avg_rtt = 3000ms → between 2000 and 5000 → Normal (if consecutive_timeouts == 0)
+        session.record_rtt(3000);
+        assert_eq!(session.tier(), PhoneTier::Normal);
+    }
+
+    #[test]
+    fn test_tier_from_u64_roundtrip() {
+        assert_eq!(PhoneTier::from_u64(PhoneTier::Fast as u64), PhoneTier::Fast);
+        assert_eq!(PhoneTier::from_u64(PhoneTier::Normal as u64), PhoneTier::Normal);
+        assert_eq!(PhoneTier::from_u64(PhoneTier::Slow as u64), PhoneTier::Slow);
+        // Unknown values map to Slow (safe default)
+        assert_eq!(PhoneTier::from_u64(99), PhoneTier::Slow);
+    }
+
+    #[test]
+    fn test_phone_tier_as_str() {
+        assert_eq!(PhoneTier::Fast.as_str(), "fast");
+        assert_eq!(PhoneTier::Normal.as_str(), "normal");
+        assert_eq!(PhoneTier::Slow.as_str(), "slow");
     }
 }

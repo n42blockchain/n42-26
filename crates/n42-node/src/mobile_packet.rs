@@ -5,7 +5,8 @@ use alloy_primitives::{Bytes, B256, U256};
 use n42_execution::{execute_block_with_witness, N42EvmConfig};
 use n42_mobile::code_cache::CacheSyncMessage;
 use n42_mobile::packet::{encode_packet, PacketError, VerificationPacket};
-use n42_network::StarHubHandle;
+use bytes::BufMut;
+use n42_network::ShardedStarHubHandle;
 use reth_chainspec::ChainSpec;
 use reth_ethereum_primitives::EthPrimitives;
 use reth_primitives_traits::NodePrimitives;
@@ -129,7 +130,7 @@ pub async fn mobile_packet_loop<P>(
     mut rx: mpsc::Receiver<BlockCommitNotification>,
     provider: P,
     chain_spec: Arc<ChainSpec>,
-    hub_handle: StarHubHandle,
+    hub_handle: ShardedStarHubHandle,
     mut phone_connected_rx: mpsc::Receiver<u64>,
 ) where
     P: BlockReader<Block = <EthPrimitives as NodePrimitives>::Block>
@@ -247,7 +248,11 @@ pub async fn mobile_packet_loop<P>(
                         let compressed = zstd::bulk::compress(&data, 3)
                             .unwrap_or(data); // fallback to raw on compression failure
                         let compressed_len = compressed.len();
-                        if let Err(e) = hub_handle.send_to_session(session_id, bytes::Bytes::from(compressed)) {
+                        // Pre-frame: prepend type prefix so StarHub does a single write_all
+                        let mut framed = bytes::BytesMut::with_capacity(1 + compressed.len());
+                        framed.put_u8(n42_network::MSG_TYPE_CACHE_SYNC_ZSTD);
+                        framed.extend_from_slice(&compressed);
+                        if let Err(e) = hub_handle.send_to_session(session_id, framed.freeze()) {
                             warn!(error = %e, session_id, "failed to send cache sync to new phone");
                         } else {
                             info!(
@@ -280,7 +285,7 @@ pub async fn mobile_packet_loop<P>(
 fn generate_and_broadcast<P>(
     provider: &P,
     evm_config: &N42EvmConfig,
-    hub_handle: &StarHubHandle,
+    hub_handle: &ShardedStarHubHandle,
     block_hash: B256,
     block_number: u64,
     previously_sent_codes: &mut CodeCache,

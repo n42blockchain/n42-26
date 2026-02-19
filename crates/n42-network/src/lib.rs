@@ -8,7 +8,11 @@ pub mod state_sync;
 pub mod transport;
 
 pub use error::NetworkError;
-pub use mobile::{StarHub, StarHubConfig, StarHubHandle};
+pub use mobile::{
+    StarHub, StarHubConfig, StarHubHandle,
+    ShardedStarHub, ShardedStarHubConfig, ShardedStarHubHandle,
+    MSG_TYPE_CACHE_SYNC_ZSTD,
+};
 pub use service::{NetworkCommand, NetworkEvent, NetworkHandle, NetworkService};
 pub use state_sync::{BlockSyncRequest, BlockSyncResponse, SyncBlock};
 pub use transport::{N42Behaviour, TransportConfig, build_swarm, build_swarm_with_validator_index};
