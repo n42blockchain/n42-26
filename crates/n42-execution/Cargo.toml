@@ -27,6 +27,7 @@ revm.workspace = true
 
 serde.workspace = true
 eyre.workspace = true
+thiserror.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]

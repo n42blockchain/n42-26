@@ -111,6 +111,74 @@ pub fn sign_receipt(
     }
 }
 
+/// Encodes a `VerificationReceipt` with wire header (versioned format).
+///
+/// Format: wire_header(4B) + block_hash(32B) + block_number(8B LE) +
+///         state_root_match(1B) + receipts_root_match(1B) +
+///         verifier_pubkey(48B) + signature(96B) + timestamp_ms(8B LE)
+pub fn encode_receipt(receipt: &VerificationReceipt) -> Vec<u8> {
+    use crate::wire;
+
+    let mut buf = Vec::with_capacity(wire::HEADER_SIZE + 32 + 8 + 1 + 1 + 48 + 96 + 8);
+    wire::encode_header(&mut buf, wire::VERSION_1, 0x00);
+    buf.extend_from_slice(receipt.block_hash.as_slice());
+    buf.extend_from_slice(&receipt.block_number.to_le_bytes());
+    buf.push(receipt.state_root_match as u8);
+    buf.push(receipt.receipts_root_match as u8);
+    buf.extend_from_slice(&receipt.verifier_pubkey);
+    buf.extend_from_slice(&receipt.signature.to_bytes());
+    buf.extend_from_slice(&receipt.timestamp_ms.to_le_bytes());
+    buf
+}
+
+/// Decodes a `VerificationReceipt` from versioned wire format.
+pub fn decode_receipt(data: &[u8]) -> Result<VerificationReceipt, crate::wire::WireError> {
+    use crate::wire::{self, WireError};
+
+    let (_header, payload) = wire::decode_header(data)?;
+
+    // Expected payload: 32 + 8 + 1 + 1 + 48 + 96 + 8 = 194 bytes
+    const RECEIPT_PAYLOAD_SIZE: usize = 32 + 8 + 1 + 1 + 48 + 96 + 8;
+    if payload.len() < RECEIPT_PAYLOAD_SIZE {
+        return Err(WireError::UnexpectedEof(payload.len()));
+    }
+
+    let mut pos = 0;
+    let block_hash = B256::from_slice(&payload[pos..pos + 32]);
+    pos += 32;
+
+    let block_number = u64::from_le_bytes(payload[pos..pos + 8].try_into().unwrap());
+    pos += 8;
+
+    let state_root_match = payload[pos] != 0;
+    pos += 1;
+
+    let receipts_root_match = payload[pos] != 0;
+    pos += 1;
+
+    let mut verifier_pubkey = [0u8; 48];
+    verifier_pubkey.copy_from_slice(&payload[pos..pos + 48]);
+    pos += 48;
+
+    let sig_bytes: [u8; 96] = payload[pos..pos + 96].try_into()
+        .map_err(|_| WireError::UnexpectedEof(pos))?;
+    let signature = BlsSignature::from_bytes(&sig_bytes)
+        .map_err(|_| WireError::InvalidTag(0, pos))?;
+    pos += 96;
+
+    let timestamp_ms = u64::from_le_bytes(payload[pos..pos + 8].try_into().unwrap());
+
+    Ok(VerificationReceipt {
+        block_hash,
+        block_number,
+        state_root_match,
+        receipts_root_match,
+        verifier_pubkey,
+        signature,
+        timestamp_ms,
+    })
+}
+
 /// Receipt verification errors.
 #[derive(Debug, thiserror::Error)]
 pub enum ReceiptError {
@@ -233,5 +301,33 @@ mod tests {
         assert_eq!(decoded.timestamp_ms, receipt.timestamp_ms);
         // Signature should survive roundtrip.
         decoded.verify_signature().expect("deserialized receipt should have valid signature");
+    }
+
+    #[test]
+    fn test_receipt_versioned_roundtrip() {
+        let sk = BlsSecretKey::key_gen(&[42u8; 32]).unwrap();
+        let block_hash = B256::from([8u8; 32]);
+        let receipt = make_receipt(block_hash, 1000, true, true, 555_555, &sk);
+
+        let encoded = encode_receipt(&receipt);
+        let decoded = decode_receipt(&encoded).expect("versioned decode should succeed");
+
+        assert_eq!(decoded.block_hash, receipt.block_hash);
+        assert_eq!(decoded.block_number, receipt.block_number);
+        assert_eq!(decoded.state_root_match, receipt.state_root_match);
+        assert_eq!(decoded.receipts_root_match, receipt.receipts_root_match);
+        assert_eq!(decoded.verifier_pubkey, receipt.verifier_pubkey);
+        assert_eq!(decoded.timestamp_ms, receipt.timestamp_ms);
+        decoded.verify_signature().expect("versioned receipt should have valid signature");
+    }
+
+    #[test]
+    fn test_receipt_versioned_header_check() {
+        let sk = BlsSecretKey::key_gen(&[42u8; 32]).unwrap();
+        let receipt = make_receipt(B256::ZERO, 0, false, false, 0, &sk);
+        let encoded = encode_receipt(&receipt);
+        assert_eq!(encoded[0], 0x4E);
+        assert_eq!(encoded[1], 0x32);
+        assert_eq!(encoded[2], 0x01);
     }
 }

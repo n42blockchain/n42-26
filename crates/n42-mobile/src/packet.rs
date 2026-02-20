@@ -1,4 +1,5 @@
 use alloy_primitives::{Address, Bytes, B256, U256};
+use n42_execution::read_log::{self, ReadLogEntry};
 use serde::{Deserialize, Serialize};
 
 /// A single account's state included in the verification witness.
@@ -112,10 +113,176 @@ pub fn decode_packet(data: &[u8]) -> Result<VerificationPacket, PacketError> {
     bincode::deserialize(data).map_err(PacketError::Decode)
 }
 
+// ─── StreamPacket V1 ────────────────────────────────────────────────────────
+
+/// V2 verification packet using ordered value streams instead of keyed witness.
+///
+/// The core insight: same block + same txs → revm Database calls happen in a
+/// 100% deterministic order. So we drop address/slot keys and send only values
+/// in call order. The phone replays entries sequentially via `StreamReplayDB`.
+///
+/// ## Format (encoded)
+/// ```text
+/// wire_header(4B) + block_metadata + read_log + bytecodes
+/// ```
+#[derive(Debug, Clone)]
+pub struct StreamPacket {
+    /// Hash of the block being verified.
+    pub block_hash: B256,
+    /// Full RLP-encoded block header.
+    pub header_rlp: Bytes,
+    /// EIP-2718 encoded transactions.
+    pub transactions: Vec<Bytes>,
+    /// Ordered state read log entries (replayed sequentially by phone).
+    pub read_log: Vec<ReadLogEntry>,
+    /// Contract bytecodes NOT in the phone's cache: (code_hash, bytecode).
+    pub bytecodes: Vec<(B256, Bytes)>,
+}
+
+impl StreamPacket {
+    /// Returns the approximate serialized size in bytes.
+    pub fn estimated_size(&self) -> usize {
+        let header_size = 4 + 32 + 4 + self.header_rlp.len(); // wire + hash + rlp_len + rlp
+        let tx_size: usize = self.transactions.iter().map(|t| 4 + t.len()).sum();
+        let log_size = self.read_log.len() * 40; // rough estimate
+        let code_size: usize = self.bytecodes.iter().map(|(_, c)| 32 + 4 + c.len()).sum();
+        header_size + tx_size + log_size + code_size
+    }
+}
+
+/// Encodes a `StreamPacket` into compact binary format with wire header.
+pub fn encode_stream_packet(packet: &StreamPacket) -> Vec<u8> {
+    use crate::wire::{self, FLAG_HAS_BYTECODES};
+
+    let flags = if packet.bytecodes.is_empty() { 0x00 } else { FLAG_HAS_BYTECODES };
+    let mut buf = Vec::with_capacity(packet.estimated_size());
+
+    // Wire header
+    wire::encode_header(&mut buf, wire::VERSION_1, flags);
+
+    // Block metadata
+    buf.extend_from_slice(packet.block_hash.as_slice()); // 32B
+
+    // Header RLP
+    buf.extend_from_slice(&(packet.header_rlp.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&packet.header_rlp);
+
+    // Transactions
+    buf.extend_from_slice(&(packet.transactions.len() as u32).to_le_bytes());
+    for tx in &packet.transactions {
+        buf.extend_from_slice(&(tx.len() as u32).to_le_bytes());
+        buf.extend_from_slice(tx);
+    }
+
+    // State read log (delegates to read_log module's compact encoder)
+    let log_bytes = read_log::encode_read_log(&packet.read_log);
+    buf.extend_from_slice(&log_bytes);
+
+    // Bytecodes section
+    buf.extend_from_slice(&(packet.bytecodes.len() as u32).to_le_bytes());
+    for (hash, code) in &packet.bytecodes {
+        buf.extend_from_slice(hash.as_slice());
+        buf.extend_from_slice(&(code.len() as u32).to_le_bytes());
+        buf.extend_from_slice(code);
+    }
+
+    buf
+}
+
+/// Decodes a `StreamPacket` from compact binary format.
+pub fn decode_stream_packet(data: &[u8]) -> Result<StreamPacket, crate::wire::WireError> {
+    use crate::wire::{self, WireError};
+
+    let (_header, payload) = wire::decode_header(data)?;
+    let mut pos: usize = 0;
+
+    // Helper closures
+    let ensure = |pos: usize, need: usize| -> Result<(), WireError> {
+        if pos + need > payload.len() {
+            Err(WireError::LengthOverflow {
+                offset: pos,
+                need,
+                remaining: payload.len().saturating_sub(pos),
+            })
+        } else {
+            Ok(())
+        }
+    };
+
+    // Block hash
+    ensure(pos, 32)?;
+    let block_hash = B256::from_slice(&payload[pos..pos + 32]);
+    pos += 32;
+
+    // Header RLP
+    ensure(pos, 4)?;
+    let header_rlp_len = u32::from_le_bytes(payload[pos..pos + 4].try_into().unwrap()) as usize;
+    pos += 4;
+    ensure(pos, header_rlp_len)?;
+    let header_rlp = Bytes::copy_from_slice(&payload[pos..pos + header_rlp_len]);
+    pos += header_rlp_len;
+
+    // Transactions
+    ensure(pos, 4)?;
+    let tx_count = u32::from_le_bytes(payload[pos..pos + 4].try_into().unwrap()) as usize;
+    pos += 4;
+    let mut transactions = Vec::with_capacity(tx_count);
+    for _ in 0..tx_count {
+        ensure(pos, 4)?;
+        let tx_len = u32::from_le_bytes(payload[pos..pos + 4].try_into().unwrap()) as usize;
+        pos += 4;
+        ensure(pos, tx_len)?;
+        transactions.push(Bytes::copy_from_slice(&payload[pos..pos + tx_len]));
+        pos += tx_len;
+    }
+
+    // State read log
+    let log_data = &payload[pos..];
+    let read_log = read_log::decode_read_log(log_data)
+        .map_err(|_| WireError::InvalidTag(0, pos))?;
+
+    // Advance pos past the read log section:
+    // entry_count(4) + per entry: tag(1) + data_len(2) + data
+    pos += 4; // entry_count
+    let entry_count = u32::from_le_bytes(payload[pos - 4..pos].try_into().unwrap()) as usize;
+    for _ in 0..entry_count {
+        pos += 1; // tag
+        ensure(pos, 2)?;
+        let data_len = u16::from_le_bytes(payload[pos..pos + 2].try_into().unwrap()) as usize;
+        pos += 2;
+        pos += data_len;
+    }
+
+    // Bytecodes section
+    ensure(pos, 4)?;
+    let code_count = u32::from_le_bytes(payload[pos..pos + 4].try_into().unwrap()) as usize;
+    pos += 4;
+    let mut bytecodes = Vec::with_capacity(code_count);
+    for _ in 0..code_count {
+        ensure(pos, 36)?; // 32 hash + 4 len
+        let hash = B256::from_slice(&payload[pos..pos + 32]);
+        pos += 32;
+        let code_len = u32::from_le_bytes(payload[pos..pos + 4].try_into().unwrap()) as usize;
+        pos += 4;
+        ensure(pos, code_len)?;
+        let code = Bytes::copy_from_slice(&payload[pos..pos + code_len]);
+        pos += code_len;
+        bytecodes.push((hash, code));
+    }
+
+    Ok(StreamPacket {
+        block_hash,
+        header_rlp,
+        transactions,
+        read_log,
+        bytecodes,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_primitives::{Address, Bytes, B256, U256};
+    use alloy_primitives::{Address, Bytes, B256, U256, KECCAK256_EMPTY};
 
     /// Helper: creates a minimal VerificationPacket with known contents.
     fn make_packet() -> VerificationPacket {
@@ -238,5 +405,104 @@ mod tests {
         assert!(matches!(err, PacketError::Decode(_)), "should be a Decode error variant");
         let msg = format!("{}", err);
         assert!(msg.contains("deserialization"), "error message should mention deserialization");
+    }
+
+    // ── StreamPacket tests ──
+
+    fn make_stream_packet() -> StreamPacket {
+        StreamPacket {
+            block_hash: B256::from([1u8; 32]),
+            header_rlp: Bytes::from(vec![0xF8; 508]),
+            transactions: vec![
+                Bytes::from(vec![0xAA; 100]),
+                Bytes::from(vec![0xBB; 200]),
+            ],
+            read_log: vec![
+                ReadLogEntry::Account {
+                    nonce: 5,
+                    balance: U256::from(1_000_000u64),
+                    code_hash: B256::from([0xCC; 32]),
+                },
+                ReadLogEntry::Storage(U256::from(42u64)),
+                ReadLogEntry::AccountNotFound,
+                ReadLogEntry::BlockHash(B256::from([0xDD; 32])),
+                ReadLogEntry::Account {
+                    nonce: 0,
+                    balance: U256::ZERO,
+                    code_hash: KECCAK256_EMPTY,
+                },
+            ],
+            bytecodes: vec![
+                (B256::from([0xEE; 32]), Bytes::from(vec![0x60, 0x00, 0xf3])),
+            ],
+        }
+    }
+
+    #[test]
+    fn test_stream_packet_encode_decode_roundtrip() {
+        let packet = make_stream_packet();
+        let encoded = encode_stream_packet(&packet);
+        let decoded = decode_stream_packet(&encoded).expect("should decode");
+
+        assert_eq!(decoded.block_hash, packet.block_hash);
+        assert_eq!(decoded.header_rlp, packet.header_rlp);
+        assert_eq!(decoded.transactions.len(), 2);
+        assert_eq!(decoded.transactions[0], packet.transactions[0]);
+        assert_eq!(decoded.transactions[1], packet.transactions[1]);
+        assert_eq!(decoded.read_log.len(), 5);
+        assert_eq!(decoded.read_log, packet.read_log);
+        assert_eq!(decoded.bytecodes.len(), 1);
+        assert_eq!(decoded.bytecodes[0].0, packet.bytecodes[0].0);
+        assert_eq!(decoded.bytecodes[0].1, packet.bytecodes[0].1);
+    }
+
+    #[test]
+    fn test_stream_packet_empty() {
+        let packet = StreamPacket {
+            block_hash: B256::ZERO,
+            header_rlp: Bytes::new(),
+            transactions: vec![],
+            read_log: vec![],
+            bytecodes: vec![],
+        };
+        let encoded = encode_stream_packet(&packet);
+        let decoded = decode_stream_packet(&encoded).expect("should decode empty packet");
+
+        assert_eq!(decoded.block_hash, B256::ZERO);
+        assert!(decoded.header_rlp.is_empty());
+        assert!(decoded.transactions.is_empty());
+        assert!(decoded.read_log.is_empty());
+        assert!(decoded.bytecodes.is_empty());
+    }
+
+    #[test]
+    fn test_stream_packet_invalid_magic() {
+        let result = decode_stream_packet(&[0xFF, 0xFF, 0x01, 0x00]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_stream_packet_wire_header() {
+        let packet = make_stream_packet();
+        let encoded = encode_stream_packet(&packet);
+        // Check wire header
+        assert_eq!(encoded[0], 0x4E); // 'N'
+        assert_eq!(encoded[1], 0x32); // '2'
+        assert_eq!(encoded[2], 0x01); // VERSION_1
+        // Has bytecodes → FLAG_HAS_BYTECODES set
+        assert_ne!(encoded[3] & 0x01, 0);
+    }
+
+    #[test]
+    fn test_stream_packet_no_bytecodes_flag() {
+        let packet = StreamPacket {
+            block_hash: B256::ZERO,
+            header_rlp: Bytes::new(),
+            transactions: vec![],
+            read_log: vec![],
+            bytecodes: vec![],  // empty
+        };
+        let encoded = encode_stream_packet(&packet);
+        assert_eq!(encoded[3], 0x00); // no FLAG_HAS_BYTECODES
     }
 }

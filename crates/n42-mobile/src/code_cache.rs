@@ -158,6 +158,85 @@ pub struct CacheSyncMessage {
     pub evict_hints: Vec<B256>,
 }
 
+/// Encodes a `CacheSyncMessage` with wire header (versioned format).
+///
+/// Format: wire_header(4B) + codes_count(u32 LE) + for each code: code_hash(32B) + code_len(u32 LE) + bytecode
+///       + evict_count(u32 LE) + for each: code_hash(32B)
+pub fn encode_cache_sync(msg: &CacheSyncMessage) -> Vec<u8> {
+    use crate::wire;
+
+    let estimated = wire::HEADER_SIZE + 4 + msg.codes.iter().map(|(_, c)| 32 + 4 + c.len()).sum::<usize>() + 4 + msg.evict_hints.len() * 32;
+    let mut buf = Vec::with_capacity(estimated);
+
+    wire::encode_header(&mut buf, wire::VERSION_1, 0x00);
+
+    // Codes
+    buf.extend_from_slice(&(msg.codes.len() as u32).to_le_bytes());
+    for (hash, code) in &msg.codes {
+        buf.extend_from_slice(hash.as_slice());
+        buf.extend_from_slice(&(code.len() as u32).to_le_bytes());
+        buf.extend_from_slice(code);
+    }
+
+    // Evict hints
+    buf.extend_from_slice(&(msg.evict_hints.len() as u32).to_le_bytes());
+    for hash in &msg.evict_hints {
+        buf.extend_from_slice(hash.as_slice());
+    }
+
+    buf
+}
+
+/// Decodes a `CacheSyncMessage` from versioned wire format.
+pub fn decode_cache_sync(data: &[u8]) -> Result<CacheSyncMessage, crate::wire::WireError> {
+    use crate::wire::{self, WireError};
+
+    let (_header, payload) = wire::decode_header(data)?;
+    let mut pos = 0;
+
+    let read_u32 = |pos: &mut usize| -> Result<u32, WireError> {
+        if *pos + 4 > payload.len() {
+            return Err(WireError::UnexpectedEof(*pos));
+        }
+        let val = u32::from_le_bytes(payload[*pos..*pos + 4].try_into().unwrap());
+        *pos += 4;
+        Ok(val)
+    };
+
+    let read_bytes = |pos: &mut usize, n: usize| -> Result<&[u8], WireError> {
+        if *pos + n > payload.len() {
+            return Err(WireError::LengthOverflow {
+                offset: *pos,
+                need: n,
+                remaining: payload.len() - *pos,
+            });
+        }
+        let slice = &payload[*pos..*pos + n];
+        *pos += n;
+        Ok(slice)
+    };
+
+    // Codes
+    let code_count = read_u32(&mut pos)? as usize;
+    let mut codes = Vec::with_capacity(code_count);
+    for _ in 0..code_count {
+        let hash = B256::from_slice(read_bytes(&mut pos, 32)?);
+        let code_len = read_u32(&mut pos)? as usize;
+        let bytecode = Bytes::copy_from_slice(read_bytes(&mut pos, code_len)?);
+        codes.push((hash, bytecode));
+    }
+
+    // Evict hints
+    let evict_count = read_u32(&mut pos)? as usize;
+    let mut evict_hints = Vec::with_capacity(evict_count);
+    for _ in 0..evict_count {
+        let hash = B256::from_slice(read_bytes(&mut pos, 32)?);
+        evict_hints.push(hash);
+    }
+
+    Ok(CacheSyncMessage { codes, evict_hints })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -411,5 +490,50 @@ mod tests {
         let tracker = HotContractTracker::new();
         assert!(tracker.top_contracts(10).is_empty(), "empty tracker should return empty list");
         assert_eq!(tracker.blocks_tracked(), 0);
+    }
+
+    // ---- Versioned encode/decode tests ----
+
+    #[test]
+    fn test_cache_sync_versioned_roundtrip() {
+        let msg = CacheSyncMessage {
+            codes: vec![
+                (hash(1), bytecode(&[0x60, 0x00])),
+                (hash(2), bytecode(&[0x60, 0x01, 0x60, 0x00, 0xf3])),
+            ],
+            evict_hints: vec![hash(10), hash(20)],
+        };
+
+        let encoded = encode_cache_sync(&msg);
+        let decoded = decode_cache_sync(&encoded).expect("should decode");
+
+        assert_eq!(decoded.codes.len(), 2);
+        assert_eq!(decoded.codes[0].0, hash(1));
+        assert_eq!(decoded.codes[0].1, bytecode(&[0x60, 0x00]));
+        assert_eq!(decoded.codes[1].0, hash(2));
+        assert_eq!(decoded.codes[1].1, bytecode(&[0x60, 0x01, 0x60, 0x00, 0xf3]));
+        assert_eq!(decoded.evict_hints, vec![hash(10), hash(20)]);
+    }
+
+    #[test]
+    fn test_cache_sync_versioned_empty() {
+        let msg = CacheSyncMessage {
+            codes: vec![],
+            evict_hints: vec![],
+        };
+        let encoded = encode_cache_sync(&msg);
+        let decoded = decode_cache_sync(&encoded).expect("should decode empty");
+        assert!(decoded.codes.is_empty());
+        assert!(decoded.evict_hints.is_empty());
+    }
+
+    #[test]
+    fn test_cache_sync_versioned_header_check() {
+        let msg = CacheSyncMessage { codes: vec![], evict_hints: vec![] };
+        let encoded = encode_cache_sync(&msg);
+        // First 2 bytes should be "N2"
+        assert_eq!(encoded[0], 0x4E);
+        assert_eq!(encoded[1], 0x32);
+        assert_eq!(encoded[2], 0x01); // VERSION_1
     }
 }

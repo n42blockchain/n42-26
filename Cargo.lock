@@ -5545,6 +5545,7 @@ dependencies = [
  "revm",
  "serde",
  "serde_json",
+ "thiserror 2.0.18",
  "tracing",
 ]
 
@@ -9384,6 +9385,7 @@ name = "reth-tasks"
 version = "1.11.0"
 dependencies = [
  "crossbeam-utils",
+ "dashmap",
  "futures-util",
  "metrics",
  "parking_lot",
