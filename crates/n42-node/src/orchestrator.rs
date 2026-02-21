@@ -1,6 +1,9 @@
 use crate::consensus_state::SharedConsensusState;
 use crate::persistence::{self, ConsensusSnapshot};
+use alloy_consensus::Typed2718;
+use alloy_eips::eip7594::BlobTransactionSidecarVariant;
 use alloy_primitives::{Address, B256};
+use alloy_rlp::Encodable;
 use alloy_rpc_types_engine::{ForkchoiceState, PayloadAttributes, PayloadStatusEnum};
 use n42_consensus::{ConsensusEngine, ConsensusEvent, EngineOutput, verify_commit_qc, ValidatorSet};
 use n42_network::{BlockSyncResponse, NetworkEvent, NetworkHandle, PeerId, SyncBlock};
@@ -9,6 +12,7 @@ use reth_ethereum_engine_primitives::EthEngineTypes;
 use reth_node_builder::ConsensusEngineHandle;
 use reth_payload_builder::PayloadBuilderHandle;
 use reth_payload_primitives::{EngineApiMessageVersion, PayloadKind, PayloadTypes};
+use reth_transaction_pool::blobstore::{BlobStore, DiskFileBlobStore};
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -35,6 +39,19 @@ struct BlockDataBroadcast {
     /// Using JSON because reth's payload types implement serde for the Engine API,
     /// and some types use #[serde(untagged)] which bincode doesn't handle reliably.
     payload_json: Vec<u8>,
+}
+
+/// Blob sidecar broadcast via /n42/blobs/1 GossipSub topic.
+///
+/// Leaders broadcast blob sidecars alongside block data so that followers
+/// can insert them into their local DiskFileBlobStore. This enables
+/// EIP-4844 ecosystem compatibility without DA guarantees.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct BlobSidecarBroadcast {
+    block_hash: B256,
+    view: u64,
+    /// (tx_hash, RLP-encoded BlobTransactionSidecarVariant) pairs.
+    sidecars: Vec<(B256, Vec<u8>)>,
 }
 
 /// Deferred finalization for blocks committed by consensus but not yet imported into reth.
@@ -167,6 +184,10 @@ pub struct ConsensusOrchestrator {
     leader_payload_rx: mpsc::UnboundedReceiver<(B256, Vec<u8>)>,
     /// Sender cloned into spawned build tasks for leader payload feedback.
     leader_payload_tx: mpsc::UnboundedSender<(B256, Vec<u8>)>,
+    /// DiskFileBlobStore for EIP-4844 sidecar management.
+    /// When set, the leader broadcasts blob sidecars to followers,
+    /// and followers insert received sidecars into the local store.
+    blob_store: Option<DiskFileBlobStore>,
 }
 
 impl ConsensusOrchestrator {
@@ -210,6 +231,7 @@ impl ConsensusOrchestrator {
             mobile_packet_tx: None,
             leader_payload_rx,
             leader_payload_tx,
+            blob_store: None,
         }
     }
 
@@ -271,7 +293,14 @@ impl ConsensusOrchestrator {
             mobile_packet_tx: None,
             leader_payload_rx,
             leader_payload_tx,
+            blob_store: None,
         }
+    }
+
+    /// Configures the DiskFileBlobStore for EIP-4844 sidecar propagation.
+    pub fn with_blob_store(mut self, blob_store: DiskFileBlobStore) -> Self {
+        self.blob_store = Some(blob_store);
+        self
     }
 
     /// Configures the path for persisting consensus state snapshots.
@@ -421,6 +450,9 @@ impl ConsensusOrchestrator {
                             warn!(%peer, %error, "sync request failed");
                             self.sync_in_flight = false;
                             self.sync_started_at = None;
+                        }
+                        Some(NetworkEvent::BlobSidecarReceived { source: _, data }) => {
+                            self.handle_blob_sidecar(data);
                         }
                         Some(_) => {
                             // Verification receipts are handled by dedicated subsystems.
@@ -701,6 +733,7 @@ impl ConsensusOrchestrator {
                     let network = self.network.clone();
                     let leader_payload_tx = self.leader_payload_tx.clone();
                     let current_view = self.engine.current_view();
+                    let blob_store_clone = self.blob_store.clone();
                     tokio::spawn(async move {
                         // Give the builder time to pack transactions from the pool.
                         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -779,6 +812,54 @@ impl ConsensusOrchestrator {
                                                         }
                                                         Err(e) => {
                                                             error!(error = %e, "failed to serialize block data broadcast");
+                                                        }
+                                                    }
+                                                }
+
+                                                // Broadcast blob sidecars if this block contains blob transactions.
+                                                if let Some(ref blob_store) = blob_store_clone {
+                                                    let blob_tx_hashes: Vec<B256> = payload.block()
+                                                        .body()
+                                                        .transactions()
+                                                        .filter(|tx| tx.is_eip4844())
+                                                        .map(|tx| *tx.tx_hash())
+                                                        .collect();
+
+                                                    if !blob_tx_hashes.is_empty() {
+                                                        match blob_store.get_all(blob_tx_hashes) {
+                                                            Ok(sidecars) if !sidecars.is_empty() => {
+                                                                let encoded_sidecars: Vec<(B256, Vec<u8>)> = sidecars
+                                                                    .into_iter()
+                                                                    .map(|(tx_hash, sidecar)| {
+                                                                        let mut buf = Vec::new();
+                                                                        sidecar.encode(&mut buf);
+                                                                        (tx_hash, buf)
+                                                                    })
+                                                                    .collect();
+
+                                                                let sidecar_count = encoded_sidecars.len();
+                                                                let broadcast = BlobSidecarBroadcast {
+                                                                    block_hash: hash,
+                                                                    view: current_view,
+                                                                    sidecars: encoded_sidecars,
+                                                                };
+
+                                                                if let Ok(encoded) = bincode::serialize(&broadcast) {
+                                                                    info!(
+                                                                        %hash,
+                                                                        blob_count = sidecar_count,
+                                                                        bytes = encoded.len(),
+                                                                        "broadcasting blob sidecars"
+                                                                    );
+                                                                    if let Err(e) = network.broadcast_blob_sidecar(encoded) {
+                                                                        warn!(error = %e, "failed to broadcast blob sidecars");
+                                                                    }
+                                                                }
+                                                            }
+                                                            Ok(_) => {}
+                                                            Err(e) => {
+                                                                warn!(%hash, error = %e, "failed to get blob sidecars from store");
+                                                            }
                                                         }
                                                     }
                                                 }
@@ -1069,6 +1150,46 @@ impl ConsensusOrchestrator {
             }
             self.pending_block_data.insert(hash, data);
         }
+    }
+
+    /// Handles incoming blob sidecar data from the leader via /n42/blobs/1 topic.
+    ///
+    /// Deserializes the broadcast and inserts each sidecar into the local
+    /// DiskFileBlobStore so that blob data is available for subsequent
+    /// payload building and RPC queries.
+    fn handle_blob_sidecar(&self, data: Vec<u8>) {
+        let blob_store = match &self.blob_store {
+            Some(bs) => bs,
+            None => return,
+        };
+
+        let broadcast: BlobSidecarBroadcast = match bincode::deserialize(&data) {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(error = %e, "invalid blob sidecar broadcast");
+                return;
+            }
+        };
+
+        let sidecar_count = broadcast.sidecars.len();
+        for (tx_hash, sidecar_rlp) in broadcast.sidecars {
+            match <BlobTransactionSidecarVariant as alloy_rlp::Decodable>::decode(&mut &sidecar_rlp[..]) {
+                Ok(sidecar) => {
+                    if let Err(e) = blob_store.insert(tx_hash, sidecar) {
+                        debug!(%tx_hash, error = %e, "failed to insert blob sidecar");
+                    }
+                }
+                Err(e) => {
+                    warn!(%tx_hash, error = %e, "failed to decode blob sidecar RLP");
+                }
+            }
+        }
+
+        debug!(
+            block_hash = %broadcast.block_hash,
+            sidecars = sidecar_count,
+            "processed blob sidecar broadcast"
+        );
     }
 
     /// Imports block data into reth via new_payload, then:
@@ -1681,6 +1802,7 @@ mod tests {
             mobile_packet_tx: None,
             leader_payload_rx,
             leader_payload_tx,
+            blob_store: None,
         };
 
         assert!(state.load_committed_qc().is_none(), "should start with no QC");
@@ -1735,6 +1857,7 @@ mod tests {
             mobile_packet_tx: None,
             leader_payload_rx,
             leader_payload_tx,
+            blob_store: None,
         };
 
         // Send a BlockReady hash through the channel.

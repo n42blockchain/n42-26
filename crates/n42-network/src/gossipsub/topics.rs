@@ -35,6 +35,15 @@ pub fn mempool_topic() -> IdentTopic {
     IdentTopic::new("/n42/mempool/1")
 }
 
+/// GossipSub topic for EIP-4844 blob sidecar propagation.
+///
+/// Leaders broadcast blob sidecars alongside block data.
+/// Followers receive and insert into local DiskFileBlobStore.
+/// Best-effort: sidecar availability is NOT required for block acceptance.
+pub fn blob_sidecar_topic() -> IdentTopic {
+    IdentTopic::new("/n42/blobs/1")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -73,12 +82,25 @@ mod tests {
             "mempool topic should be /n42/mempool/1"
         );
 
-        // Also verify that all four topics are distinct from each other.
-        assert_ne!(consensus.hash(), blocks.hash(), "consensus and blocks topics should differ");
-        assert_ne!(consensus.hash(), verification.hash(), "consensus and verification topics should differ");
-        assert_ne!(consensus.hash(), mempool.hash(), "consensus and mempool topics should differ");
-        assert_ne!(blocks.hash(), verification.hash(), "blocks and verification topics should differ");
-        assert_ne!(blocks.hash(), mempool.hash(), "blocks and mempool topics should differ");
-        assert_ne!(verification.hash(), mempool.hash(), "verification and mempool topics should differ");
+        let blobs = blob_sidecar_topic();
+        assert_eq!(
+            blobs.hash(),
+            IdentTopic::new("/n42/blobs/1").hash(),
+            "blob sidecar topic should be /n42/blobs/1"
+        );
+
+        // Also verify that all five topics are distinct from each other.
+        let all = [&consensus, &blocks, &verification, &mempool, &blobs];
+        for i in 0..all.len() {
+            for j in (i + 1)..all.len() {
+                assert_ne!(
+                    all[i].hash(),
+                    all[j].hash(),
+                    "topics at index {} and {} should differ",
+                    i,
+                    j
+                );
+            }
+        }
     }
 }

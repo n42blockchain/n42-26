@@ -12,7 +12,7 @@ use crate::error::NetworkError;
 use crate::gossipsub::handlers::{
     decode_consensus_message, encode_consensus_message, validate_message,
 };
-use crate::gossipsub::topics::{block_announce_topic, consensus_topic, mempool_topic, verification_receipts_topic};
+use crate::gossipsub::topics::{blob_sidecar_topic, block_announce_topic, consensus_topic, mempool_topic, verification_receipts_topic};
 use crate::reconnection::ReconnectionManager;
 use crate::state_sync::{BlockSyncRequest, BlockSyncResponse};
 use crate::transport::{N42Behaviour, N42BehaviourEvent};
@@ -28,6 +28,8 @@ pub enum NetworkCommand {
     AnnounceBlock(Vec<u8>),
     /// Broadcast a raw transaction (RLP-encoded) to the mempool topic.
     BroadcastTransaction(Vec<u8>),
+    /// Broadcast blob sidecar data to the /n42/blobs/1 topic.
+    BroadcastBlobSidecar(Vec<u8>),
     /// Connect to a peer at the given multiaddr.
     Dial(Multiaddr),
     /// Request block sync from a specific peer.
@@ -60,6 +62,11 @@ pub enum NetworkEvent {
     },
     /// A transaction received from the mempool topic.
     TransactionReceived {
+        source: PeerId,
+        data: Vec<u8>,
+    },
+    /// A blob sidecar received from the /n42/blobs/1 topic.
+    BlobSidecarReceived {
         source: PeerId,
         data: Vec<u8>,
     },
@@ -139,6 +146,13 @@ impl NetworkHandle {
             .map_err(|_| NetworkError::ChannelClosed)
     }
 
+    /// Broadcasts blob sidecar data to the /n42/blobs/1 topic.
+    pub fn broadcast_blob_sidecar(&self, data: Vec<u8>) -> Result<(), NetworkError> {
+        self.command_tx
+            .send(NetworkCommand::BroadcastBlobSidecar(data))
+            .map_err(|_| NetworkError::ChannelClosed)
+    }
+
     /// Dials a peer at the given multiaddr.
     pub fn dial(&self, addr: Multiaddr) -> Result<(), NetworkError> {
         self.command_tx
@@ -199,6 +213,8 @@ pub struct NetworkService {
     block_announce_topic_hash: gossipsub::TopicHash,
     /// Topic hash for the mempool topic (cached for routing).
     mempool_topic_hash: gossipsub::TopicHash,
+    /// Topic hash for the blob sidecar topic (cached for routing).
+    blob_sidecar_topic_hash: gossipsub::TopicHash,
     /// Pending sync response channels, keyed by internal request ID.
     /// Maps our internal u64 ID to the libp2p ResponseChannel for sending replies.
     pending_sync_channels: HashMap<u64, libp2p::request_response::ResponseChannel<BlockSyncResponse>>,
@@ -250,9 +266,17 @@ impl NetworkService {
             .subscribe(&mempool)
             .map_err(|e| NetworkError::Subscribe(e.to_string()))?;
 
+        let blob_sidecar = blob_sidecar_topic();
+        swarm
+            .behaviour_mut()
+            .gossipsub
+            .subscribe(&blob_sidecar)
+            .map_err(|e| NetworkError::Subscribe(e.to_string()))?;
+
         let consensus_topic_hash = consensus.hash();
         let block_announce_topic_hash = block_announce.hash();
         let mempool_topic_hash = mempool.hash();
+        let blob_sidecar_topic_hash = blob_sidecar.hash();
 
         let validator_peer_map = std::sync::Arc::new(std::sync::RwLock::new(HashMap::new()));
 
@@ -268,6 +292,7 @@ impl NetworkService {
             consensus_topic_hash,
             block_announce_topic_hash,
             mempool_topic_hash,
+            blob_sidecar_topic_hash,
             pending_sync_channels: HashMap::new(),
             next_sync_id: 0,
             validator_peer_map,
@@ -454,6 +479,7 @@ impl NetworkService {
             &self.consensus_topic_hash,
             &self.block_announce_topic_hash,
             &self.mempool_topic_hash,
+            &self.blob_sidecar_topic_hash,
         );
 
         if !matches!(acceptance, gossipsub::MessageAcceptance::Accept) {
@@ -484,6 +510,12 @@ impl NetworkService {
         } else if message.topic == self.mempool_topic_hash {
             // Transaction from mempool topic
             let _ = self.event_tx.send(NetworkEvent::TransactionReceived {
+                source,
+                data: message.data,
+            });
+        } else if message.topic == self.blob_sidecar_topic_hash {
+            // Blob sidecar from /n42/blobs/1 topic
+            let _ = self.event_tx.send(NetworkEvent::BlobSidecarReceived {
                 source,
                 data: message.data,
             });
@@ -675,6 +707,12 @@ impl NetworkService {
                     tracing::trace!(error = %e, "failed to publish transaction (no peers yet?)");
                 }
             }
+            NetworkCommand::BroadcastBlobSidecar(data) => {
+                let topic = blob_sidecar_topic();
+                if let Err(e) = self.swarm.behaviour_mut().gossipsub.publish(topic, data) {
+                    tracing::warn!(error = %e, "failed to publish blob sidecar");
+                }
+            }
             NetworkCommand::Dial(addr) => {
                 if let Err(e) = self.swarm.dial(addr.clone()) {
                     tracing::warn!(%addr, error = %e, "failed to dial peer");
@@ -833,6 +871,19 @@ mod tests {
                 assert_eq!(r.to_view, 20);
             }
             other => panic!("expected RequestSync, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_handle_broadcast_blob_sidecar() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let handle = NetworkHandle::new(tx);
+
+        handle.broadcast_blob_sidecar(vec![0xDE, 0xAD]).unwrap();
+
+        match rx.try_recv().unwrap() {
+            NetworkCommand::BroadcastBlobSidecar(data) => assert_eq!(data, vec![0xDE, 0xAD]),
+            other => panic!("expected BroadcastBlobSidecar, got {:?}", other),
         }
     }
 

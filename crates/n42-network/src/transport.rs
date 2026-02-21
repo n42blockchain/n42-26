@@ -6,7 +6,7 @@ use libp2p::Swarm;
 use std::time::Duration;
 
 use crate::gossipsub::message_id_fn;
-use crate::gossipsub::topics::{consensus_topic, block_announce_topic, mempool_topic};
+use crate::gossipsub::topics::{blob_sidecar_topic, block_announce_topic, consensus_topic, mempool_topic};
 use crate::state_sync::StateSyncCodec;
 
 /// The composite network behaviour for N42 nodes.
@@ -186,6 +186,15 @@ pub fn build_swarm_with_validator_index(
             mempool_score.invalid_message_deliveries_weight = -2.0;
             mempool_score.invalid_message_deliveries_decay = 0.95;
             peer_score_params.topics.insert(mempool_topic().hash(), mempool_score);
+
+            let mut blob_score = TopicScoreParams::default();
+            blob_score.topic_weight = 0.3;
+            blob_score.first_message_deliveries_weight = 0.5;
+            blob_score.first_message_deliveries_cap = 30.0;
+            blob_score.first_message_deliveries_decay = 0.99;
+            blob_score.invalid_message_deliveries_weight = -3.0;
+            blob_score.invalid_message_deliveries_decay = 0.9;
+            peer_score_params.topics.insert(blob_sidecar_topic().hash(), blob_score);
 
             let thresholds = PeerScoreThresholds {
                 gossip_threshold: -50.0,

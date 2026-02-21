@@ -537,6 +537,8 @@ fn main() {
                 // 6. Start ConsensusOrchestrator with Engine API bridge.
                 //    Now passes genesis_hash and fee_recipient to enable
                 //    payload building → BlockReady → consensus proposal flow.
+                let blob_store = full_node.pool.blob_store().clone();
+
                 let orchestrator = ConsensusOrchestrator::with_engine_api(
                     consensus_engine,
                     net_handle,
@@ -551,7 +553,8 @@ fn main() {
                 .with_tx_pool_bridge(tx_import_tx, tx_broadcast_rx)
                 .with_mobile_packet_tx(mobile_packet_tx)
                 .with_state_persistence(state_file)
-                .with_validator_set(validator_set);
+                .with_validator_set(validator_set)
+                .with_blob_store(blob_store);
 
                 task_executor.spawn_critical_task(
                     "n42-consensus-orchestrator",
