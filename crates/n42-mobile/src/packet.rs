@@ -140,6 +140,17 @@ pub struct StreamPacket {
 }
 
 impl StreamPacket {
+    /// Extracts block number and receipts root from the embedded header RLP.
+    ///
+    /// Returns `None` if the header cannot be decoded. This is a convenience
+    /// method so callers (e.g. FFI) don't need direct alloy-consensus deps.
+    pub fn header_info(&self) -> Option<(u64, B256)> {
+        use alloy_consensus::BlockHeader;
+        use alloy_rlp::Decodable;
+        let header = alloy_consensus::Header::decode(&mut &self.header_rlp[..]).ok()?;
+        Some((header.number, header.receipts_root()))
+    }
+
     /// Returns the approximate serialized size in bytes.
     pub fn estimated_size(&self) -> usize {
         let header_size = 4 + 32 + 4 + self.header_rlp.len(); // wire + hash + rlp_len + rlp
@@ -189,6 +200,12 @@ pub fn encode_stream_packet(packet: &StreamPacket) -> Vec<u8> {
     buf
 }
 
+/// Maximum allowed transaction count per block to prevent OOM from corrupted data.
+/// Ethereum mainnet has ~1500 txs/block max; 100K provides ample headroom.
+const MAX_TX_COUNT: usize = 100_000;
+/// Maximum allowed bytecode count per packet to prevent OOM from corrupted data.
+const MAX_BYTECODE_COUNT: usize = 10_000;
+
 /// Decodes a `StreamPacket` from compact binary format.
 pub fn decode_stream_packet(data: &[u8]) -> Result<StreamPacket, crate::wire::WireError> {
     use crate::wire::{self, WireError};
@@ -226,6 +243,13 @@ pub fn decode_stream_packet(data: &[u8]) -> Result<StreamPacket, crate::wire::Wi
     ensure(pos, 4)?;
     let tx_count = u32::from_le_bytes(payload[pos..pos + 4].try_into().unwrap()) as usize;
     pos += 4;
+    if tx_count > MAX_TX_COUNT {
+        return Err(WireError::LengthOverflow {
+            offset: pos - 4,
+            need: tx_count,
+            remaining: MAX_TX_COUNT,
+        });
+    }
     let mut transactions = Vec::with_capacity(tx_count);
     for _ in 0..tx_count {
         ensure(pos, 4)?;
@@ -248,6 +272,13 @@ pub fn decode_stream_packet(data: &[u8]) -> Result<StreamPacket, crate::wire::Wi
     ensure(pos, 4)?;
     let code_count = u32::from_le_bytes(payload[pos..pos + 4].try_into().unwrap()) as usize;
     pos += 4;
+    if code_count > MAX_BYTECODE_COUNT {
+        return Err(WireError::LengthOverflow {
+            offset: pos - 4,
+            need: code_count,
+            remaining: MAX_BYTECODE_COUNT,
+        });
+    }
     let mut bytecodes = Vec::with_capacity(code_count);
     for _ in 0..code_count {
         ensure(pos, 36)?; // 32 hash + 4 len

@@ -159,7 +159,7 @@ pub struct ConsensusOrchestrator {
     /// Validator set reference for verifying QCs during state sync.
     validator_set_for_sync: Option<ValidatorSet>,
     /// Sender for notifying the mobile packet generation task about committed blocks.
-    /// When set, sends `(block_hash, block_number)` after each BlockCommitted event.
+    /// When set, sends `(block_hash, consensus_view)` after each BlockCommitted event.
     mobile_packet_tx: Option<mpsc::Sender<(B256, u64)>>,
     /// Receiver for leader payload data sent back from the spawned build task.
     /// The leader's build task broadcasts block data to followers but the orchestrator
@@ -287,9 +287,9 @@ impl ConsensusOrchestrator {
     }
 
     /// Configures the mobile packet generation channel.
-    /// When set, the orchestrator sends `(block_hash, block_number)` after each
+    /// When set, the orchestrator sends `(block_hash, consensus_view)` after each
     /// BlockCommitted event, allowing a separate task to generate and broadcast
-    /// VerificationPackets to mobile verifiers.
+    /// StreamPackets to mobile verifiers.
     pub fn with_mobile_packet_tx(
         mut self,
         tx: mpsc::Sender<(B256, u64)>,

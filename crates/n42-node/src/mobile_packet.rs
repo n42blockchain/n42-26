@@ -9,7 +9,7 @@ use n42_network::ShardedStarHubHandle;
 use reth_chainspec::ChainSpec;
 use reth_ethereum_primitives::EthPrimitives;
 use reth_evm::{
-    execute::{BlockExecutionError, Executor},
+    execute::Executor,
     ConfigureEvm,
 };
 use reth_primitives_traits::{BlockBody, NodePrimitives};
@@ -37,7 +37,10 @@ pub enum MobilePacketError {
     Compression(String),
 }
 
-/// A block commit notification: `(block_hash, block_number)`.
+/// A block commit notification: `(block_hash, consensus_view)`.
+///
+/// The second field is the HotStuff-2 consensus view number, NOT the block number.
+/// The actual block number is extracted from the block header inside `generate_and_broadcast_v2`.
 pub type BlockCommitNotification = (B256, u64);
 
 /// Maximum number of previously-sent bytecodes to track for differential transmission.
@@ -132,10 +135,10 @@ pub async fn mobile_packet_loop<P>(
     loop {
         tokio::select! {
             commit = rx.recv() => {
-                let Some((block_hash, block_number)) = commit else {
+                let Some((block_hash, _view)) = commit else {
                     break;
                 };
-                debug!(block_number, %block_hash, "generating mobile stream packet");
+                debug!(%block_hash, "generating mobile stream packet");
 
                 let mut last_err = None;
                 let max_retries = packet_max_retries();
@@ -145,7 +148,7 @@ pub async fn mobile_packet_loop<P>(
                     if attempt > 0 {
                         let delay = base_delay * (1 << attempt.min(4));
                         tokio::time::sleep(delay).await;
-                        debug!(block_number, %block_hash, attempt, "retrying mobile packet generation");
+                        debug!(%block_hash, attempt, "retrying mobile packet generation");
                     }
 
                     match generate_and_broadcast_v2(
@@ -153,13 +156,11 @@ pub async fn mobile_packet_loop<P>(
                         &evm_config,
                         &hub_handle,
                         block_hash,
-                        block_number,
                         &mut previously_sent_codes,
                     ) {
                         Ok(packet_size) => {
                             if attempt > 0 {
                                 info!(
-                                    block_number,
                                     %block_hash,
                                     packet_size,
                                     attempt,
@@ -167,7 +168,6 @@ pub async fn mobile_packet_loop<P>(
                                 );
                             } else {
                                 info!(
-                                    block_number,
                                     %block_hash,
                                     packet_size,
                                     "mobile stream packet broadcast"
@@ -182,7 +182,6 @@ pub async fn mobile_packet_loop<P>(
                                 continue;
                             }
                             warn!(
-                                block_number,
                                 %block_hash,
                                 error = %e,
                                 "failed to generate mobile packet (non-retryable)"
@@ -195,7 +194,6 @@ pub async fn mobile_packet_loop<P>(
 
                 if let Some(e) = last_err {
                     warn!(
-                        block_number,
                         %block_hash,
                         error = %e,
                         max_retries,
@@ -263,7 +261,6 @@ fn generate_and_broadcast_v2<P>(
     evm_config: &N42EvmConfig,
     hub_handle: &ShardedStarHubHandle,
     block_hash: B256,
-    block_number: u64,
     previously_sent_codes: &mut CodeCache,
 ) -> Result<usize, MobilePacketError>
 where
@@ -314,6 +311,7 @@ where
 
     // Step 6: Build header RLP and transactions.
     let header = recovered_block.header();
+    let block_number = header.number();
     let mut header_buf = Vec::new();
     header.encode(&mut header_buf);
     let header_rlp = Bytes::from(header_buf);
@@ -321,10 +319,7 @@ where
     let transactions = recovered_block.body().encoded_2718_transactions();
 
     // Step 7: Differential code filtering — only send new bytecodes.
-    let all_codes: Vec<(B256, Bytes)> = captured_codes
-        .into_iter()
-        .map(|(h, c)| (h, c))
-        .collect();
+    let all_codes: Vec<(B256, Bytes)> = captured_codes.into_iter().collect();
     let total_codes = all_codes.len();
 
     let new_codes: Vec<(B256, Bytes)> = all_codes

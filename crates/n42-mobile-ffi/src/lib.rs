@@ -1,7 +1,11 @@
-use n42_mobile::code_cache::{CacheSyncMessage, CodeCache};
-use n42_mobile::packet::decode_packet;
+use alloy_primitives::B256;
+use n42_mobile::code_cache::{CacheSyncMessage, CodeCache, decode_cache_sync};
+use n42_mobile::packet::{decode_packet, decode_stream_packet};
 use n42_mobile::receipt::sign_receipt;
-use n42_mobile::verifier::{update_cache_after_verify, verify_block};
+use n42_mobile::verifier::{
+    update_cache_after_stream_verify, update_cache_after_verify, verify_block, verify_block_stream,
+};
+use n42_mobile::wire::MAGIC as WIRE_MAGIC;
 use n42_primitives::BlsSecretKey;
 use reth_chainspec::ChainSpec;
 use std::collections::VecDeque;
@@ -78,6 +82,13 @@ impl FfiError {
         warn!(code, error = %self, "FFI error");
         code
     }
+}
+
+/// Detects whether `data` uses the V2 wire format (magic bytes `N2` = `0x4E 0x32`).
+///
+/// Returns `true` for V2 StreamPacket / CacheSyncMessage, `false` for legacy bincode.
+fn is_v2_wire_format(data: &[u8]) -> bool {
+    data.len() >= 2 && data[0] == WIRE_MAGIC[0] && data[1] == WIRE_MAGIC[1]
 }
 
 /// Maximum number of pending packets in the receive queue.
@@ -344,44 +355,93 @@ pub unsafe extern "C" fn n42_verify_and_send(
     let packet_bytes = unsafe { std::slice::from_raw_parts(data, len) };
     let packet_size = len;
 
-    // Decode the packet.
-    let packet = match decode_packet(packet_bytes) {
-        Ok(p) => p,
-        Err(e) => {
-            return FfiError::PacketDecode(e.to_string()).into_code();
-        }
-    };
+    // Auto-detect V2 (wire header magic "N2") vs V1 (legacy bincode) format.
+    let block_number: u64;
+    let block_hash: B256;
+    let tx_count: usize;
+    let witness_count: usize;
+    let uncached_count: usize;
+    let expected_receipts_root: B256;
 
-    let block_number = packet.block_number;
-    let block_hash = packet.block_hash;
-    let tx_count = packet.transactions.len();
-    let witness_count = packet.witness_accounts.len();
-    let uncached_count = packet.uncached_bytecodes.len();
-    let expected_receipts_root = packet.receipts_root;
-
-    // Execute and verify.
     let start = Instant::now();
-    let result = {
-        let mut cache = lock_or_recover(&ctx.code_cache);
-        verify_block(&packet, &mut cache, ctx.chain_spec.clone())
-    };
-    let verify_time_ms = start.elapsed().as_millis() as u64;
+    let result;
 
-    let result = match result {
-        Ok(r) => r,
-        Err(e) => {
-            let mut stats = lock_or_recover(&ctx.stats);
-            stats.blocks_verified += 1;
-            stats.failure_count += 1;
-            return FfiError::VerifyFailed(e.to_string()).into_code();
+    if is_v2_wire_format(packet_bytes) {
+        // ── V2 StreamPacket path ──
+        let packet = match decode_stream_packet(packet_bytes) {
+            Ok(p) => p,
+            Err(e) => {
+                return FfiError::PacketDecode(format!("V2: {e}")).into_code();
+            }
+        };
+
+        block_hash = packet.block_hash;
+        let (bn, er) = packet.header_info().unwrap_or((0, B256::ZERO));
+        block_number = bn;
+        expected_receipts_root = er;
+        tx_count = packet.transactions.len();
+        witness_count = 0; // V2 uses read_log, not witness accounts
+        uncached_count = packet.bytecodes.len();
+
+        let verify_result = {
+            let mut cache = lock_or_recover(&ctx.code_cache);
+            verify_block_stream(&packet, &mut cache, ctx.chain_spec.clone())
+        };
+
+        result = match verify_result {
+            Ok(r) => r,
+            Err(e) => {
+                let mut stats = lock_or_recover(&ctx.stats);
+                stats.blocks_verified += 1;
+                stats.failure_count += 1;
+                return FfiError::VerifyFailed(format!("V2: {e}")).into_code();
+            }
+        };
+
+        // Update code cache with newly received bytecodes.
+        {
+            let mut cache = lock_or_recover(&ctx.code_cache);
+            update_cache_after_stream_verify(&packet, &mut cache);
         }
-    };
+    } else {
+        // ── V1 VerificationPacket path (legacy) ──
+        let packet = match decode_packet(packet_bytes) {
+            Ok(p) => p,
+            Err(e) => {
+                return FfiError::PacketDecode(e.to_string()).into_code();
+            }
+        };
 
-    // Update code cache with newly received bytecodes.
-    {
-        let mut cache = lock_or_recover(&ctx.code_cache);
-        update_cache_after_verify(&packet, &mut cache);
+        block_number = packet.block_number;
+        block_hash = packet.block_hash;
+        tx_count = packet.transactions.len();
+        witness_count = packet.witness_accounts.len();
+        uncached_count = packet.uncached_bytecodes.len();
+        expected_receipts_root = packet.receipts_root;
+
+        let verify_result = {
+            let mut cache = lock_or_recover(&ctx.code_cache);
+            verify_block(&packet, &mut cache, ctx.chain_spec.clone())
+        };
+
+        result = match verify_result {
+            Ok(r) => r,
+            Err(e) => {
+                let mut stats = lock_or_recover(&ctx.stats);
+                stats.blocks_verified += 1;
+                stats.failure_count += 1;
+                return FfiError::VerifyFailed(e.to_string()).into_code();
+            }
+        };
+
+        // Update code cache with newly received bytecodes.
+        {
+            let mut cache = lock_or_recover(&ctx.code_cache);
+            update_cache_after_verify(&packet, &mut cache);
+        }
     }
+
+    let verify_time_ms = start.elapsed().as_millis() as u64;
 
     // Sign the receipt.
     let timestamp_ms = std::time::SystemTime::now()
@@ -719,8 +779,12 @@ fn apply_cache_sync(msg: CacheSyncMessage, cache: &Mutex<CodeCache>) -> (usize, 
 /// Background task that receives packets from the StarHub via QUIC uni-streams.
 ///
 /// StarHub sends data with a 1-byte type prefix:
-/// - 0x01: VerificationPacket
-/// - 0x02: CacheSyncMessage
+/// - 0x01: VerificationPacket (uncompressed, legacy)
+/// - 0x02: CacheSyncMessage (uncompressed)
+/// - 0x03: VerificationPacket / StreamPacket (zstd compressed)
+/// - 0x04: CacheSyncMessage (zstd compressed)
+///
+/// After decompression, V1 (bincode) vs V2 (wire header `0x4E32`) is auto-detected.
 async fn recv_loop(
     connection: quinn::Connection,
     pending_packets: Arc<Mutex<VecDeque<Vec<u8>>>>,
@@ -783,14 +847,21 @@ async fn recv_loop(
                                 }
                             }
                             0x02 => {
-                                // CacheSyncMessage (uncompressed, legacy)
+                                // CacheSyncMessage (uncompressed)
                                 const MAX_CACHE_SYNC_SIZE: usize = 16 * 1024 * 1024; // 16MB
                                 if payload.len() > MAX_CACHE_SYNC_SIZE {
                                     warn!("CacheSyncMessage too large ({} bytes), dropping", payload.len());
                                     continue;
                                 }
-                                match bincode::deserialize::<CacheSyncMessage>(payload)
-                                {
+                                // Auto-detect V2 wire format vs V1 bincode
+                                let msg = if is_v2_wire_format(payload) {
+                                    decode_cache_sync(payload)
+                                        .map_err(|e| format!("V2: {e}"))
+                                } else {
+                                    bincode::deserialize::<CacheSyncMessage>(payload)
+                                        .map_err(|e| format!("V1: {e}"))
+                                };
+                                match msg {
                                     Ok(msg) => {
                                         let (added, evicted) =
                                             apply_cache_sync(msg, &code_cache);
@@ -811,7 +882,15 @@ async fn recv_loop(
                                 // CacheSyncMessage (zstd compressed)
                                 match zstd::bulk::decompress(payload, 16 * 1024 * 1024) {
                                     Ok(decompressed) => {
-                                        match bincode::deserialize::<CacheSyncMessage>(&decompressed) {
+                                        // Auto-detect V2 wire format vs V1 bincode
+                                        let msg = if is_v2_wire_format(&decompressed) {
+                                            decode_cache_sync(&decompressed)
+                                                .map_err(|e| format!("V2: {e}"))
+                                        } else {
+                                            bincode::deserialize::<CacheSyncMessage>(&decompressed)
+                                                .map_err(|e| format!("V1: {e}"))
+                                        };
+                                        match msg {
                                             Ok(msg) => {
                                                 let (added, evicted) =
                                                     apply_cache_sync(msg, &code_cache);
@@ -1442,6 +1521,85 @@ mod tests {
     }
 
     // ── 10: FfiError code mapping test ──
+
+    // ── 10A: V2 wire format auto-detection tests ──
+
+    #[test]
+    fn test_is_v2_wire_format_detection() {
+        // Valid V2 wire header
+        assert!(is_v2_wire_format(&[0x4E, 0x32, 0x01, 0x00]));
+        assert!(is_v2_wire_format(&[0x4E, 0x32, 0x01, 0x00, 0xDE, 0xAD]));
+        // Just magic is enough for detection
+        assert!(is_v2_wire_format(&[0x4E, 0x32]));
+
+        // V1 bincode data (doesn't start with magic)
+        assert!(!is_v2_wire_format(&[0xDE, 0xAD, 0xBE, 0xEF]));
+        assert!(!is_v2_wire_format(&[0x00, 0x00, 0x00, 0x00]));
+
+        // Too short
+        assert!(!is_v2_wire_format(&[0x4E]));
+        assert!(!is_v2_wire_format(&[]));
+    }
+
+    #[test]
+    fn test_verify_v2_packet_enters_v2_path() {
+        // A packet starting with V2 wire header magic should enter the V2 decode path.
+        // Even with truncated data, it should try V2 decode (not V1 bincode).
+        let ctx = unsafe { n42_verifier_init(4242) };
+        assert!(!ctx.is_null());
+
+        // Valid V2 wire header + truncated payload → V2 decode error (not V1 bincode error)
+        let v2_packet = [0x4E, 0x32, 0x01, 0x00, 0xDE, 0xAD, 0xBE, 0xEF];
+        let result = unsafe { n42_verify_and_send(ctx, v2_packet.as_ptr(), v2_packet.len()) };
+        // Should return PacketDecode (error code 1) via the V2 path
+        assert_eq!(result, 1, "V2 packet with truncated data should return PacketDecode error");
+
+        // V1 bincode garbage also produces PacketDecode but via V1 path
+        let v1_packet = [0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04];
+        let result = unsafe { n42_verify_and_send(ctx, v1_packet.as_ptr(), v1_packet.len()) };
+        assert_eq!(result, 1, "V1 garbage should also return PacketDecode error");
+
+        unsafe { n42_verifier_free(ctx) };
+    }
+
+    #[test]
+    fn test_cache_sync_v2_decode() {
+        // Verify that apply_cache_sync works with a V2-encoded CacheSyncMessage.
+        use n42_mobile::code_cache::encode_cache_sync;
+
+        let cache = Mutex::new(CodeCache::new(100));
+
+        let h1 = B256::with_last_byte(0x01);
+        let h2 = B256::with_last_byte(0x02);
+
+        let msg = CacheSyncMessage {
+            codes: vec![
+                (h1, alloy_primitives::Bytes::from(vec![0x60, 0x00])),
+                (h2, alloy_primitives::Bytes::from(vec![0x60, 0x01])),
+            ],
+            evict_hints: vec![],
+        };
+
+        // Encode with V2 wire format
+        let encoded = encode_cache_sync(&msg);
+        assert!(is_v2_wire_format(&encoded), "encoded data should start with V2 magic");
+
+        // Decode back using the same path as recv_loop
+        let decoded = decode_cache_sync(&encoded).expect("V2 decode should succeed");
+        assert_eq!(decoded.codes.len(), 2);
+        assert_eq!(decoded.evict_hints.len(), 0);
+
+        // Apply to cache
+        let (added, evicted) = apply_cache_sync(decoded, &cache);
+        assert_eq!(added, 2);
+        assert_eq!(evicted, 0);
+
+        let mut guard = lock_or_recover(&cache);
+        assert!(guard.get(&h1).is_some());
+        assert!(guard.get(&h2).is_some());
+    }
+
+    // ── 10B: FfiError code mapping test ──
 
     #[test]
     fn test_ffi_error_codes_distinct() {

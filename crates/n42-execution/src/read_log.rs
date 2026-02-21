@@ -180,9 +180,20 @@ pub enum DecodeError {
     #[error("invalid header byte 0x{0:02X} at offset {1}")]
     InvalidTag(u8, usize),
 
+    #[error("invalid field length {len} at offset {offset} (max {max})")]
+    InvalidFieldLen { len: usize, max: usize, offset: usize },
+
     #[error("entry count mismatch: expected {expected}, decoded {decoded}")]
     CountMismatch { expected: u32, decoded: u32 },
+
+    #[error("entry count {0} exceeds maximum {1}")]
+    EntryCountOverflow(u32, u32),
 }
+
+/// Maximum allowed entry count to prevent OOM from corrupted data.
+/// A single Ethereum block with 30M gas can have at most ~1500 unique account reads
+/// and ~30000 storage reads. 1M entries provides ample headroom.
+const MAX_ENTRY_COUNT: u32 = 1_000_000;
 
 /// Returns the number of significant bytes needed to represent a u64 value
 /// in big-endian form (0 for zero).
@@ -284,6 +295,9 @@ pub fn decode_read_log(data: &[u8]) -> Result<Vec<ReadLogEntry>, DecodeError> {
     }
 
     let entry_count = u32::from_le_bytes(data[0..4].try_into().unwrap());
+    if entry_count > MAX_ENTRY_COUNT {
+        return Err(DecodeError::EntryCountOverflow(entry_count, MAX_ENTRY_COUNT));
+    }
     let mut entries = Vec::with_capacity(entry_count as usize);
     let mut pos: usize = 4;
 
@@ -326,6 +340,9 @@ pub fn decode_read_log(data: &[u8]) -> Result<Vec<ReadLogEntry>, DecodeError> {
                 ensure(pos, 1)?;
                 let balance_len = data[pos] as usize;
                 pos += 1;
+                if balance_len > 32 {
+                    return Err(DecodeError::InvalidFieldLen { len: balance_len, max: 32, offset: pos - 1 });
+                }
                 ensure(pos, balance_len)?;
                 let mut buf = [0u8; 32];
                 buf[32 - balance_len..].copy_from_slice(&data[pos..pos + balance_len]);
@@ -591,5 +608,440 @@ mod tests {
         assert_eq!(zero.len() - 4, 1, "zero storage should be 1B");
         assert_eq!(small.len() - 4, 4, "3-byte value storage should be 4B");
         assert_eq!(max.len() - 4, 33, "max storage should be 33B");
+    }
+
+    // ── Nonce boundary tests ──
+
+    #[test]
+    fn test_nonce_boundary_1_byte() {
+        // nonce=1 → 1 byte, nonce=255 → 1 byte
+        for nonce in [1u64, 127, 255] {
+            let log = vec![ReadLogEntry::Account {
+                nonce,
+                balance: U256::ZERO,
+                code_hash: KECCAK256_EMPTY,
+            }];
+            let encoded = encode_read_log(&log);
+            let decoded = decode_read_log(&encoded).unwrap();
+            assert_eq!(decoded, log, "nonce={nonce} roundtrip failed");
+            // 4(count) + 1(header) + 1(nonce) = 6
+            assert_eq!(encoded.len(), 6, "nonce={nonce} should be 1 byte");
+        }
+    }
+
+    #[test]
+    fn test_nonce_boundary_2_bytes() {
+        // nonce=256 → 2 bytes, nonce=65535 → 2 bytes
+        for nonce in [256u64, 0x1234, 65535] {
+            let log = vec![ReadLogEntry::Account {
+                nonce,
+                balance: U256::ZERO,
+                code_hash: KECCAK256_EMPTY,
+            }];
+            let encoded = encode_read_log(&log);
+            let decoded = decode_read_log(&encoded).unwrap();
+            assert_eq!(decoded, log, "nonce={nonce} roundtrip failed");
+            // 4(count) + 1(header) + 2(nonce) = 7
+            assert_eq!(encoded.len(), 7, "nonce={nonce} should be 2 bytes");
+        }
+    }
+
+    #[test]
+    fn test_nonce_boundary_each_byte_count() {
+        // Test every byte count boundary: 3, 4, 5, 6, 7 bytes
+        let cases: &[(u64, usize)] = &[
+            (0x10000, 3),           // 3 bytes
+            (0x1000000, 4),         // 4 bytes
+            (0x100000000, 5),       // 5 bytes
+            (0x10000000000, 6),     // 6 bytes
+            (0x1000000000000, 7),   // 7 bytes
+        ];
+        for &(nonce, expected_nonce_bytes) in cases {
+            let log = vec![ReadLogEntry::Account {
+                nonce,
+                balance: U256::ZERO,
+                code_hash: KECCAK256_EMPTY,
+            }];
+            let encoded = encode_read_log(&log);
+            let decoded = decode_read_log(&encoded).unwrap();
+            assert_eq!(decoded, log, "nonce={nonce:#x} roundtrip failed");
+            assert_eq!(
+                encoded.len(),
+                4 + 1 + expected_nonce_bytes,
+                "nonce={nonce:#x} should be {expected_nonce_bytes} bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn test_nonce_7_byte_max() {
+        // Largest 7-byte nonce: 0x00FFFFFFFFFFFFFF
+        let nonce = 0x00FFFFFFFFFFFFFFu64;
+        let log = vec![ReadLogEntry::Account {
+            nonce,
+            balance: U256::ZERO,
+            code_hash: KECCAK256_EMPTY,
+        }];
+        let encoded = encode_read_log(&log);
+        let decoded = decode_read_log(&encoded).unwrap();
+        assert_eq!(decoded, log);
+        // 4 + 1 + 7 = 12 (uses bits 1-3, not bit6)
+        assert_eq!(encoded.len(), 12);
+    }
+
+    #[test]
+    fn test_nonce_8_byte_boundary() {
+        // Smallest 8-byte nonce: 0x0100000000000000
+        let nonce = 0x0100000000000000u64;
+        let log = vec![ReadLogEntry::Account {
+            nonce,
+            balance: U256::ZERO,
+            code_hash: KECCAK256_EMPTY,
+        }];
+        let encoded = encode_read_log(&log);
+        let decoded = decode_read_log(&encoded).unwrap();
+        assert_eq!(decoded, log);
+        // 4 + 1 + 8 = 13 (uses bit6)
+        assert_eq!(encoded.len(), 13);
+    }
+
+    // ── Balance boundary tests ──
+
+    #[test]
+    fn test_balance_1_byte() {
+        let log = vec![ReadLogEntry::Account {
+            nonce: 0,
+            balance: U256::from(1u64),
+            code_hash: KECCAK256_EMPTY,
+        }];
+        let encoded = encode_read_log(&log);
+        let decoded = decode_read_log(&encoded).unwrap();
+        assert_eq!(decoded, log);
+        // 4(count) + 1(header) + 1(balance_len=1) + 1(balance=1) = 7
+        assert_eq!(encoded.len(), 7);
+    }
+
+    #[test]
+    fn test_balance_max() {
+        let log = vec![ReadLogEntry::Account {
+            nonce: 0,
+            balance: U256::MAX,
+            code_hash: KECCAK256_EMPTY,
+        }];
+        let encoded = encode_read_log(&log);
+        let decoded = decode_read_log(&encoded).unwrap();
+        assert_eq!(decoded, log);
+        // 4(count) + 1(header) + 1(balance_len=32) + 32(balance) = 38
+        assert_eq!(encoded.len(), 38);
+    }
+
+    // ── Contract boundary tests ──
+
+    #[test]
+    fn test_contract_zero_nonce_zero_balance() {
+        // Contract with zero nonce and zero balance (e.g., freshly deployed proxy)
+        let code_hash = B256::from([0xAA; 32]);
+        let log = vec![ReadLogEntry::Account {
+            nonce: 0,
+            balance: U256::ZERO,
+            code_hash,
+        }];
+        let encoded = encode_read_log(&log);
+        let decoded = decode_read_log(&encoded).unwrap();
+        assert_eq!(decoded, log);
+        // 4(count) + 1(header with code_hash bit) + 32(code_hash) = 37
+        assert_eq!(encoded.len(), 37);
+    }
+
+    #[test]
+    fn test_contract_all_max_values() {
+        let code_hash = B256::from([0xFF; 32]);
+        let log = vec![ReadLogEntry::Account {
+            nonce: u64::MAX,
+            balance: U256::MAX,
+            code_hash,
+        }];
+        let encoded = encode_read_log(&log);
+        let decoded = decode_read_log(&encoded).unwrap();
+        assert_eq!(decoded, log);
+        // 4 + 1(header) + 8(nonce) + 1(balance_len) + 32(balance) + 32(code_hash) = 78
+        assert_eq!(encoded.len(), 78);
+    }
+
+    // ── Storage boundary tests ──
+
+    #[test]
+    fn test_storage_1_byte_value() {
+        let log = vec![ReadLogEntry::Storage(U256::from(0xFFu64))];
+        let encoded = encode_read_log(&log);
+        let decoded = decode_read_log(&encoded).unwrap();
+        assert_eq!(decoded, log);
+        // 4 + 1(header=0x81) + 1(value) = 6
+        assert_eq!(encoded.len(), 6);
+    }
+
+    #[test]
+    fn test_storage_2_byte_boundary() {
+        let log = vec![ReadLogEntry::Storage(U256::from(0x100u64))];
+        let encoded = encode_read_log(&log);
+        let decoded = decode_read_log(&encoded).unwrap();
+        assert_eq!(decoded, log);
+        // 4 + 1(header=0x82) + 2 = 7
+        assert_eq!(encoded.len(), 7);
+    }
+
+    // ── Error handling tests ──
+
+    #[test]
+    fn test_decode_too_short() {
+        // Less than 4 bytes
+        assert!(matches!(decode_read_log(&[]), Err(DecodeError::UnexpectedEof(0))));
+        assert!(matches!(decode_read_log(&[0x00]), Err(DecodeError::UnexpectedEof(0))));
+        assert!(matches!(decode_read_log(&[0x00, 0x00, 0x00]), Err(DecodeError::UnexpectedEof(0))));
+    }
+
+    #[test]
+    fn test_decode_corrupted_balance_len() {
+        // Hand-craft: 1 entry, Account header with balance bit set, balance_len = 33 (invalid)
+        let mut data = vec![0x01, 0x00, 0x00, 0x00]; // entry_count = 1
+        let header = ACCT_EXISTS_BIT | ACCT_BALANCE_BIT; // exists + has balance
+        data.push(header);
+        data.push(33); // balance_len = 33 (exceeds 32)
+        data.extend_from_slice(&[0xFF; 33]); // fake balance data
+
+        let result = decode_read_log(&data);
+        assert!(result.is_err(), "balance_len > 32 should be rejected");
+        assert!(matches!(result, Err(DecodeError::InvalidFieldLen { len: 33, max: 32, .. })));
+    }
+
+    #[test]
+    fn test_decode_entry_count_overflow() {
+        // entry_count = MAX_ENTRY_COUNT + 1
+        let count = (MAX_ENTRY_COUNT + 1).to_le_bytes();
+        let result = decode_read_log(&count);
+        assert!(matches!(result, Err(DecodeError::EntryCountOverflow(_, _))));
+    }
+
+    #[test]
+    fn test_decode_invalid_tag_in_gap() {
+        // Tags 0xA1..0xBF are invalid (between Storage max 0xA0 and BlockHash 0xC0)
+        for tag in [0xA1u8, 0xB0, 0xBF] {
+            let data = [0x01, 0x00, 0x00, 0x00, tag];
+            let result = decode_read_log(&data);
+            assert!(matches!(result, Err(DecodeError::InvalidTag(t, _)) if t == tag),
+                "tag 0x{tag:02X} should be rejected");
+        }
+    }
+
+    #[test]
+    fn test_decode_invalid_tag_above_c0() {
+        // Tags 0xC1..0xFF are invalid (only 0xC0 is BlockHash)
+        for tag in [0xC1u8, 0xD0, 0xFF] {
+            let data = [0x01, 0x00, 0x00, 0x00, tag];
+            let result = decode_read_log(&data);
+            assert!(matches!(result, Err(DecodeError::InvalidTag(t, _)) if t == tag),
+                "tag 0x{tag:02X} should be rejected");
+        }
+    }
+
+    #[test]
+    fn test_decode_truncated_account_nonce() {
+        // Account with nonce_len=3, but only 2 bytes of nonce data
+        let mut data = vec![0x01, 0x00, 0x00, 0x00]; // entry_count = 1
+        let header = ACCT_EXISTS_BIT | (3u8 << ACCT_NONCE_LEN_SHIFT);
+        data.push(header);
+        data.extend_from_slice(&[0x01, 0x02]); // only 2 bytes, need 3
+        assert!(decode_read_log(&data).is_err());
+    }
+
+    #[test]
+    fn test_decode_truncated_account_code_hash() {
+        // Contract account, but code_hash truncated
+        let mut data = vec![0x01, 0x00, 0x00, 0x00]; // entry_count = 1
+        let header = ACCT_EXISTS_BIT | ACCT_CODE_HASH_BIT;
+        data.push(header);
+        data.extend_from_slice(&[0xCC; 20]); // only 20 bytes, need 32
+        assert!(decode_read_log(&data).is_err());
+    }
+
+    #[test]
+    fn test_decode_truncated_storage_value() {
+        // Storage header says 8 bytes, but only 4 available
+        let mut data = vec![0x01, 0x00, 0x00, 0x00]; // entry_count = 1
+        data.push(HEADER_STORAGE_BASE + 8); // 8 bytes of value
+        data.extend_from_slice(&[0xFF; 4]); // only 4 bytes
+        assert!(decode_read_log(&data).is_err());
+    }
+
+    #[test]
+    fn test_decode_truncated_block_hash() {
+        // BlockHash header but not enough hash bytes
+        let mut data = vec![0x01, 0x00, 0x00, 0x00]; // entry_count = 1
+        data.push(HEADER_BLOCK_HASH);
+        data.extend_from_slice(&[0xAB; 16]); // only 16 bytes, need 32
+        assert!(decode_read_log(&data).is_err());
+    }
+
+    // ── Multiple entries of same type ──
+
+    #[test]
+    fn test_multiple_account_not_found() {
+        let log = vec![
+            ReadLogEntry::AccountNotFound,
+            ReadLogEntry::AccountNotFound,
+            ReadLogEntry::AccountNotFound,
+        ];
+        let encoded = encode_read_log(&log);
+        let decoded = decode_read_log(&encoded).unwrap();
+        assert_eq!(decoded, log);
+        // 4 + 3 = 7 (3 × 1B header)
+        assert_eq!(encoded.len(), 7);
+    }
+
+    // ── Block hash with zero hash ──
+
+    #[test]
+    fn test_block_hash_zero() {
+        let log = vec![ReadLogEntry::BlockHash(B256::ZERO)];
+        let encoded = encode_read_log(&log);
+        let decoded = decode_read_log(&encoded).unwrap();
+        assert_eq!(decoded, log);
+    }
+
+    // ── significant_bytes helpers ──
+
+    #[test]
+    fn test_significant_bytes_u64() {
+        assert_eq!(significant_bytes_u64(0), 0);
+        assert_eq!(significant_bytes_u64(1), 1);
+        assert_eq!(significant_bytes_u64(255), 1);
+        assert_eq!(significant_bytes_u64(256), 2);
+        assert_eq!(significant_bytes_u64(0xFFFF), 2);
+        assert_eq!(significant_bytes_u64(0x10000), 3);
+        assert_eq!(significant_bytes_u64(0xFFFFFF), 3);
+        assert_eq!(significant_bytes_u64(0x1000000), 4);
+        assert_eq!(significant_bytes_u64(0x100000000), 5);
+        assert_eq!(significant_bytes_u64(0x10000000000), 6);
+        assert_eq!(significant_bytes_u64(0x1000000000000), 7);
+        assert_eq!(significant_bytes_u64(0x100000000000000), 8);
+        assert_eq!(significant_bytes_u64(u64::MAX), 8);
+    }
+
+    #[test]
+    fn test_significant_bytes_be32() {
+        let zero = [0u8; 32];
+        assert_eq!(significant_bytes_be32(&zero), 0);
+
+        let mut one = [0u8; 32];
+        one[31] = 1;
+        assert_eq!(significant_bytes_be32(&one), 1);
+
+        let max = [0xFFu8; 32];
+        assert_eq!(significant_bytes_be32(&max), 32);
+
+        // Only first byte nonzero
+        let mut first = [0u8; 32];
+        first[0] = 0x01;
+        assert_eq!(significant_bytes_be32(&first), 32);
+
+        // Only middle byte nonzero
+        let mut mid = [0u8; 32];
+        mid[16] = 0x42;
+        assert_eq!(significant_bytes_be32(&mid), 16);
+    }
+
+    // ── Trailing bytes tolerance ──
+
+    #[test]
+    fn test_decode_with_trailing_bytes() {
+        // Empty log + trailing garbage — should decode successfully (forward compat)
+        let mut data = vec![0x00, 0x00, 0x00, 0x00]; // entry_count = 0
+        data.extend_from_slice(&[0xFF; 100]); // trailing bytes
+        let decoded = decode_read_log(&data).unwrap();
+        assert!(decoded.is_empty());
+    }
+
+    // ── ReadLogDatabase capture behavior ──
+
+    #[test]
+    fn test_read_log_database_capture() {
+        use revm::{database::CacheDB, database_interface::Database};
+        use alloy_primitives::Address;
+
+        let mut cache_db = CacheDB::new(revm::database::EmptyDB::default());
+        let addr = Address::with_last_byte(0x42);
+        cache_db.insert_account_info(addr, AccountInfo {
+            nonce: 5,
+            balance: U256::from(1000u64),
+            ..Default::default()
+        });
+
+        let mut logged_db = ReadLogDatabase::new(cache_db);
+
+        // basic() should be logged
+        let info = logged_db.basic(addr).unwrap().unwrap();
+        assert_eq!(info.nonce, 5);
+
+        // basic() on non-existent should log AccountNotFound
+        let none = logged_db.basic(Address::ZERO).unwrap();
+        assert!(none.is_none());
+
+        // storage() should be logged
+        let _val = logged_db.storage(addr, U256::ZERO.into()).unwrap();
+
+        // block_hash() should be logged
+        let _hash = logged_db.block_hash(0).unwrap();
+
+        // Verify log contents
+        let log = logged_db.log_handle();
+        let entries = log.lock().unwrap();
+        assert_eq!(entries.len(), 4);
+        assert!(matches!(entries[0], ReadLogEntry::Account { nonce: 5, .. }));
+        assert!(matches!(entries[1], ReadLogEntry::AccountNotFound));
+        assert!(matches!(entries[2], ReadLogEntry::Storage(_)));
+        assert!(matches!(entries[3], ReadLogEntry::BlockHash(_)));
+    }
+
+    #[test]
+    fn test_read_log_database_code_not_logged() {
+        use revm::{database::CacheDB, database_interface::Database};
+        use alloy_primitives::Address;
+
+        let cache_db = CacheDB::new(revm::database::EmptyDB::default());
+        let mut logged_db = ReadLogDatabase::new(cache_db);
+
+        // code_by_hash should NOT be logged
+        let _ = logged_db.code_by_hash(KECCAK256_EMPTY);
+
+        let handle = logged_db.log_handle();
+        let entries = handle.lock().unwrap();
+        assert!(entries.is_empty(), "code_by_hash should not produce log entries");
+    }
+
+    #[test]
+    fn test_read_log_database_captures_bytecode() {
+        use revm::{database::CacheDB, database_interface::Database, bytecode::Bytecode};
+        use alloy_primitives::{Address, keccak256};
+
+        let mut cache_db = CacheDB::new(revm::database::EmptyDB::default());
+        let addr = Address::with_last_byte(0xC0);
+        let code = alloy_primitives::Bytes::from(vec![0x60, 0x00, 0xF3]);
+        let code_hash = keccak256(&code);
+
+        cache_db.insert_account_info(addr, AccountInfo {
+            nonce: 1,
+            balance: U256::ZERO,
+            code_hash,
+            code: Some(Bytecode::new_raw(code.clone())),
+            account_id: None,
+        });
+
+        let mut logged_db = ReadLogDatabase::new(cache_db);
+        let _ = logged_db.basic(addr).unwrap();
+
+        let codes = logged_db.codes_handle();
+        let codes = codes.lock().unwrap();
+        assert_eq!(codes.len(), 1, "should capture contract bytecode");
+        assert!(codes.contains_key(&code_hash));
     }
 }

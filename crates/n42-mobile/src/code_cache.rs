@@ -187,6 +187,11 @@ pub fn encode_cache_sync(msg: &CacheSyncMessage) -> Vec<u8> {
     buf
 }
 
+/// Maximum allowed code count to prevent OOM from corrupted data.
+const MAX_CACHE_SYNC_CODES: usize = 10_000;
+/// Maximum allowed evict hint count to prevent OOM from corrupted data.
+const MAX_CACHE_SYNC_EVICTS: usize = 10_000;
+
 /// Decodes a `CacheSyncMessage` from versioned wire format.
 pub fn decode_cache_sync(data: &[u8]) -> Result<CacheSyncMessage, crate::wire::WireError> {
     use crate::wire::{self, WireError};
@@ -218,6 +223,13 @@ pub fn decode_cache_sync(data: &[u8]) -> Result<CacheSyncMessage, crate::wire::W
 
     // Codes
     let code_count = read_u32(&mut pos)? as usize;
+    if code_count > MAX_CACHE_SYNC_CODES {
+        return Err(WireError::LengthOverflow {
+            offset: pos - 4,
+            need: code_count,
+            remaining: MAX_CACHE_SYNC_CODES,
+        });
+    }
     let mut codes = Vec::with_capacity(code_count);
     for _ in 0..code_count {
         let hash = B256::from_slice(read_bytes(&mut pos, 32)?);
@@ -228,6 +240,13 @@ pub fn decode_cache_sync(data: &[u8]) -> Result<CacheSyncMessage, crate::wire::W
 
     // Evict hints
     let evict_count = read_u32(&mut pos)? as usize;
+    if evict_count > MAX_CACHE_SYNC_EVICTS {
+        return Err(WireError::LengthOverflow {
+            offset: pos - 4,
+            need: evict_count,
+            remaining: MAX_CACHE_SYNC_EVICTS,
+        });
+    }
     let mut evict_hints = Vec::with_capacity(evict_count);
     for _ in 0..evict_count {
         let hash = B256::from_slice(read_bytes(&mut pos, 32)?);
