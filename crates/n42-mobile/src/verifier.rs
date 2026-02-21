@@ -6,7 +6,7 @@ use alloy_consensus::Header;
 use alloy_eips::Decodable2718;
 use alloy_primitives::{Address, B256, KECCAK256_EMPTY, U256};
 use alloy_rlp::Decodable;
-use n42_execution::{read_log::ReadLogEntry, N42EvmConfig};
+use n42_execution::N42EvmConfig;
 use reth_chainspec::ChainSpec;
 use reth_ethereum_primitives::{EthPrimitives, Receipt};
 use reth_evm::{
@@ -218,9 +218,11 @@ pub enum StreamDbError {
 
 impl DBErrorMarker for StreamDbError {}
 
-/// Sequential replay database for mobile verification.
+/// Sequential replay database for mobile verification — zero-allocation cursor on raw bytes.
 ///
-/// Consumes `ReadLogEntry` values in order, ignoring address/slot/number arguments.
+/// Parses read log entries directly from pre-encoded bytes on each Database call,
+/// advancing a byte cursor. No intermediate `Vec<ReadLogEntry>` is ever allocated.
+///
 /// This is safe because:
 /// - Same block + same txs → same revm Database call sequence (deterministic)
 /// - If execution order diverges → wrong values returned → receipts_root mismatch → fail-safe
@@ -232,70 +234,136 @@ impl DBErrorMarker for StreamDbError {}
 /// - Both sides have identical basic/storage/block_hash call counts and order; `code_by_hash` doesn't consume cursor
 #[derive(Debug)]
 pub struct StreamReplayDB {
-    entries: Vec<ReadLogEntry>,
-    cursor: usize,
+    /// Pre-encoded read log bytes (output of `encode_read_log`).
+    data: Vec<u8>,
+    /// Current byte offset into data (starts at 4, past the entry_count header).
+    pos: usize,
+    /// Number of entries consumed so far.
+    entries_consumed: u32,
+    /// Total entry count from the header.
+    entry_count: u32,
+    /// Bytecodes for `code_by_hash` lookups (not part of the cursor stream).
     bytecodes: HashMap<B256, Bytecode>,
 }
 
 impl StreamReplayDB {
-    /// Creates a new replay DB from decoded read log entries and bytecodes.
-    pub fn new(entries: Vec<ReadLogEntry>, bytecodes: HashMap<B256, Bytecode>) -> Self {
+    /// Creates a new replay DB from pre-encoded read log bytes and bytecodes.
+    ///
+    /// `data` is the raw output of `encode_read_log()` — starts with entry_count(4B) header.
+    pub fn new(data: Vec<u8>, bytecodes: HashMap<B256, Bytecode>) -> Self {
+        let entry_count = if data.len() >= 4 {
+            u32::from_le_bytes(data[0..4].try_into().unwrap())
+        } else {
+            0
+        };
+        let pos = if data.len() >= 4 { 4 } else { data.len() };
         Self {
-            entries,
-            cursor: 0,
+            data,
+            pos,
+            entries_consumed: 0,
+            entry_count,
             bytecodes,
         }
     }
 
-    /// Returns the current cursor position (number of entries consumed).
+    /// Returns the number of entries consumed so far.
     pub fn cursor(&self) -> usize {
-        self.cursor
+        self.entries_consumed as usize
     }
 
     /// Returns true if all entries have been consumed.
     pub fn is_exhausted(&self) -> bool {
-        self.cursor >= self.entries.len()
+        self.entries_consumed >= self.entry_count
     }
 
-    fn next_entry(&mut self) -> Result<&ReadLogEntry, StreamDbError> {
-        if self.cursor >= self.entries.len() {
-            return Err(StreamDbError::Exhausted(self.cursor));
-        }
-        let entry = &self.entries[self.cursor];
-        self.cursor += 1;
-        Ok(entry)
-    }
 }
 
 impl revm::database_interface::Database for StreamReplayDB {
     type Error = StreamDbError;
 
     fn basic(&mut self, _address: Address) -> Result<Option<AccountInfo>, Self::Error> {
-        let cursor = self.cursor;
-        let entry = self.next_entry()?;
-        match entry {
-            ReadLogEntry::AccountNotFound => Ok(None),
-            ReadLogEntry::Account { nonce, balance, code_hash } => {
-                // Construct AccountInfo without code — EVM will call code_by_hash when needed.
-                Ok(Some(AccountInfo {
-                    nonce: *nonce,
-                    balance: *balance,
-                    code_hash: *code_hash,
-                    account_id: None,
-                    code: None,
-                }))
-            }
-            ReadLogEntry::Storage(_) => Err(StreamDbError::UnexpectedEntry {
-                cursor,
-                expected: "Account or AccountNotFound",
-                actual: "Storage",
-            }),
-            ReadLogEntry::BlockHash(_) => Err(StreamDbError::UnexpectedEntry {
-                cursor,
-                expected: "Account or AccountNotFound",
-                actual: "BlockHash",
-            }),
+        use n42_execution::read_log::{
+            ACCT_BALANCE_BIT, ACCT_CODE_HASH_BIT, ACCT_NONCE_8B_BIT,
+            ACCT_NONCE_LEN_MASK, ACCT_NONCE_LEN_SHIFT,
+            HEADER_ACCOUNT_NOT_FOUND, HEADER_STORAGE_BASE,
+        };
+
+        let cursor = self.entries_consumed as usize;
+        if self.pos >= self.data.len() {
+            return Err(StreamDbError::Exhausted(cursor));
         }
+        let header = self.data[self.pos];
+        self.pos += 1;
+        self.entries_consumed += 1;
+
+        if header == HEADER_ACCOUNT_NOT_FOUND {
+            return Ok(None);
+        }
+
+        if header >= HEADER_STORAGE_BASE {
+            return Err(StreamDbError::UnexpectedEntry {
+                cursor,
+                expected: "Account",
+                actual: if header <= HEADER_STORAGE_BASE + 32 { "Storage" } else { "BlockHash" },
+            });
+        }
+
+        // Account exists (0x01..0x7F)
+        let nonce_len = if header & ACCT_NONCE_8B_BIT != 0 {
+            8
+        } else {
+            ((header & ACCT_NONCE_LEN_MASK) >> ACCT_NONCE_LEN_SHIFT) as usize
+        };
+        let has_balance = header & ACCT_BALANCE_BIT != 0;
+        let has_code_hash = header & ACCT_CODE_HASH_BIT != 0;
+
+        let nonce = if nonce_len > 0 {
+            if self.pos + nonce_len > self.data.len() {
+                return Err(StreamDbError::Exhausted(cursor));
+            }
+            let mut buf = [0u8; 8];
+            buf[8 - nonce_len..].copy_from_slice(&self.data[self.pos..self.pos + nonce_len]);
+            self.pos += nonce_len;
+            u64::from_be_bytes(buf)
+        } else {
+            0
+        };
+
+        let balance = if has_balance {
+            if self.pos >= self.data.len() {
+                return Err(StreamDbError::Exhausted(cursor));
+            }
+            let balance_len = self.data[self.pos] as usize;
+            self.pos += 1;
+            if self.pos + balance_len > self.data.len() {
+                return Err(StreamDbError::Exhausted(cursor));
+            }
+            let mut buf = [0u8; 32];
+            buf[32 - balance_len..].copy_from_slice(&self.data[self.pos..self.pos + balance_len]);
+            self.pos += balance_len;
+            U256::from_be_bytes(buf)
+        } else {
+            U256::ZERO
+        };
+
+        let code_hash = if has_code_hash {
+            if self.pos + 32 > self.data.len() {
+                return Err(StreamDbError::Exhausted(cursor));
+            }
+            let h = B256::from_slice(&self.data[self.pos..self.pos + 32]);
+            self.pos += 32;
+            h
+        } else {
+            KECCAK256_EMPTY
+        };
+
+        Ok(Some(AccountInfo {
+            nonce,
+            balance,
+            code_hash,
+            account_id: None,
+            code: None,
+        }))
     }
 
     fn code_by_hash(&mut self, code_hash: B256) -> Result<Bytecode, Self::Error> {
@@ -311,43 +379,65 @@ impl revm::database_interface::Database for StreamReplayDB {
         _address: Address,
         _index: U256,
     ) -> Result<U256, Self::Error> {
-        let cursor = self.cursor;
-        let entry = self.next_entry()?;
-        match entry {
-            ReadLogEntry::Storage(value) => Ok(*value),
-            ReadLogEntry::AccountNotFound | ReadLogEntry::Account { .. } => {
-                Err(StreamDbError::UnexpectedEntry {
-                    cursor,
-                    expected: "Storage",
-                    actual: "Account",
-                })
-            }
-            ReadLogEntry::BlockHash(_) => Err(StreamDbError::UnexpectedEntry {
+        use n42_execution::read_log::{HEADER_STORAGE_BASE, HEADER_BLOCK_HASH};
+
+        let cursor = self.entries_consumed as usize;
+        if self.pos >= self.data.len() {
+            return Err(StreamDbError::Exhausted(cursor));
+        }
+        let header = self.data[self.pos];
+        self.pos += 1;
+        self.entries_consumed += 1;
+
+        if header < HEADER_STORAGE_BASE || header > HEADER_STORAGE_BASE + 32 {
+            return Err(StreamDbError::UnexpectedEntry {
                 cursor,
                 expected: "Storage",
-                actual: "BlockHash",
-            }),
+                actual: if header < HEADER_STORAGE_BASE { "Account" } else { "BlockHash" },
+            });
         }
+
+        let value_len = (header - HEADER_STORAGE_BASE) as usize;
+        if value_len == 0 {
+            return Ok(U256::ZERO);
+        }
+
+        if self.pos + value_len > self.data.len() {
+            return Err(StreamDbError::Exhausted(cursor));
+        }
+        let mut buf = [0u8; 32];
+        buf[32 - value_len..].copy_from_slice(&self.data[self.pos..self.pos + value_len]);
+        self.pos += value_len;
+
+        Ok(U256::from_be_bytes(buf))
     }
 
     fn block_hash(&mut self, _number: u64) -> Result<B256, Self::Error> {
-        let cursor = self.cursor;
-        let entry = self.next_entry()?;
-        match entry {
-            ReadLogEntry::BlockHash(hash) => Ok(*hash),
-            ReadLogEntry::AccountNotFound | ReadLogEntry::Account { .. } => {
-                Err(StreamDbError::UnexpectedEntry {
-                    cursor,
-                    expected: "BlockHash",
-                    actual: "Account",
-                })
-            }
-            ReadLogEntry::Storage(_) => Err(StreamDbError::UnexpectedEntry {
+        use n42_execution::read_log::HEADER_BLOCK_HASH;
+
+        let cursor = self.entries_consumed as usize;
+        if self.pos >= self.data.len() {
+            return Err(StreamDbError::Exhausted(cursor));
+        }
+        let header = self.data[self.pos];
+        self.pos += 1;
+        self.entries_consumed += 1;
+
+        if header != HEADER_BLOCK_HASH {
+            return Err(StreamDbError::UnexpectedEntry {
                 cursor,
                 expected: "BlockHash",
-                actual: "Storage",
-            }),
+                actual: if header < 0x80 { "Account" } else { "Storage" },
+            });
         }
+
+        if self.pos + 32 > self.data.len() {
+            return Err(StreamDbError::Exhausted(cursor));
+        }
+        let h = B256::from_slice(&self.data[self.pos..self.pos + 32]);
+        self.pos += 32;
+
+        Ok(h)
     }
 }
 
@@ -410,8 +500,8 @@ pub fn verify_block_stream(
         }
     }
 
-    // 5. Create StreamReplayDB and execute
-    let db = StreamReplayDB::new(packet.read_log.clone(), bytecodes_map);
+    // 5. Create StreamReplayDB from raw bytes — no Vec<ReadLogEntry> allocation
+    let db = StreamReplayDB::new(packet.read_log_data.clone(), bytecodes_map);
     let evm_config = N42EvmConfig::new(chain_spec);
     let mut executor = evm_config.executor(db);
     let result = executor.execute_one(&recovered)?;
@@ -644,20 +734,24 @@ mod tests {
         assert_eq!(cache.get(&hash_b).unwrap(), &code_b);
     }
 
-    // ── StreamReplayDB tests ──
+    // ── StreamReplayDB tests (cursor-based, zero-allocation) ──
+
+    /// Helper: encode entries into raw bytes for StreamReplayDB.
+    fn encode_entries(entries: &[n42_execution::read_log::ReadLogEntry]) -> Vec<u8> {
+        n42_execution::read_log::encode_read_log(entries)
+    }
 
     #[test]
     fn test_stream_replay_db_basic_account() {
+        use n42_execution::read_log::ReadLogEntry;
         use revm::database_interface::Database;
 
-        let entries = vec![
-            ReadLogEntry::Account {
-                nonce: 10,
-                balance: U256::from(5000u64),
-                code_hash: KECCAK256_EMPTY,
-            },
-        ];
-        let mut db = StreamReplayDB::new(entries, HashMap::new());
+        let data = encode_entries(&[ReadLogEntry::Account {
+            nonce: 10,
+            balance: U256::from(5000u64),
+            code_hash: KECCAK256_EMPTY,
+        }]);
+        let mut db = StreamReplayDB::new(data, HashMap::new());
 
         let info = db.basic(Address::ZERO).unwrap().expect("should return Some");
         assert_eq!(info.nonce, 10);
@@ -669,10 +763,11 @@ mod tests {
 
     #[test]
     fn test_stream_replay_db_account_not_found() {
+        use n42_execution::read_log::ReadLogEntry;
         use revm::database_interface::Database;
 
-        let entries = vec![ReadLogEntry::AccountNotFound];
-        let mut db = StreamReplayDB::new(entries, HashMap::new());
+        let data = encode_entries(&[ReadLogEntry::AccountNotFound]);
+        let mut db = StreamReplayDB::new(data, HashMap::new());
 
         let result = db.basic(Address::ZERO).unwrap();
         assert!(result.is_none());
@@ -681,10 +776,11 @@ mod tests {
 
     #[test]
     fn test_stream_replay_db_storage() {
+        use n42_execution::read_log::ReadLogEntry;
         use revm::database_interface::Database;
 
-        let entries = vec![ReadLogEntry::Storage(U256::from(42u64))];
-        let mut db = StreamReplayDB::new(entries, HashMap::new());
+        let data = encode_entries(&[ReadLogEntry::Storage(U256::from(42u64))]);
+        let mut db = StreamReplayDB::new(data, HashMap::new());
 
         let value = db.storage(Address::ZERO, U256::ZERO).unwrap();
         assert_eq!(value, U256::from(42u64));
@@ -693,11 +789,12 @@ mod tests {
 
     #[test]
     fn test_stream_replay_db_block_hash() {
+        use n42_execution::read_log::ReadLogEntry;
         use revm::database_interface::Database;
 
         let hash = B256::from([0xAB; 32]);
-        let entries = vec![ReadLogEntry::BlockHash(hash)];
-        let mut db = StreamReplayDB::new(entries, HashMap::new());
+        let data = encode_entries(&[ReadLogEntry::BlockHash(hash)]);
+        let mut db = StreamReplayDB::new(data, HashMap::new());
 
         let result = db.block_hash(100).unwrap();
         assert_eq!(result, hash);
@@ -706,10 +803,11 @@ mod tests {
 
     #[test]
     fn test_stream_replay_db_exhausted_error() {
+        use n42_execution::read_log::encode_read_log;
         use revm::database_interface::Database;
 
-        let entries = vec![];
-        let mut db = StreamReplayDB::new(entries, HashMap::new());
+        let data = encode_read_log(&[]); // entry_count=0, no entries
+        let mut db = StreamReplayDB::new(data, HashMap::new());
 
         let result = db.basic(Address::ZERO);
         assert!(result.is_err());
@@ -718,11 +816,12 @@ mod tests {
 
     #[test]
     fn test_stream_replay_db_unexpected_entry_type() {
+        use n42_execution::read_log::ReadLogEntry;
         use revm::database_interface::Database;
 
         // Expect Account but get Storage
-        let entries = vec![ReadLogEntry::Storage(U256::ZERO)];
-        let mut db = StreamReplayDB::new(entries, HashMap::new());
+        let data = encode_entries(&[ReadLogEntry::Storage(U256::ZERO)]);
+        let mut db = StreamReplayDB::new(data, HashMap::new());
 
         let result = db.basic(Address::ZERO);
         assert!(result.is_err());
@@ -731,6 +830,7 @@ mod tests {
 
     #[test]
     fn test_stream_replay_db_code_by_hash() {
+        use n42_execution::read_log::encode_read_log;
         use revm::database_interface::Database;
 
         let code_hash = B256::from([0xCC; 32]);
@@ -738,7 +838,8 @@ mod tests {
         let mut codes = HashMap::new();
         codes.insert(code_hash, bytecode.clone());
 
-        let mut db = StreamReplayDB::new(vec![], codes);
+        let data = encode_read_log(&[]); // empty log
+        let mut db = StreamReplayDB::new(data, codes);
 
         // code_by_hash doesn't consume cursor
         let result = db.code_by_hash(code_hash).unwrap();
@@ -748,9 +849,10 @@ mod tests {
 
     #[test]
     fn test_stream_replay_db_mixed_sequence() {
+        use n42_execution::read_log::ReadLogEntry;
         use revm::database_interface::Database;
 
-        let entries = vec![
+        let data = encode_entries(&[
             ReadLogEntry::Account {
                 nonce: 1,
                 balance: U256::from(100u64),
@@ -759,8 +861,8 @@ mod tests {
             ReadLogEntry::Storage(U256::from(42u64)),
             ReadLogEntry::AccountNotFound,
             ReadLogEntry::BlockHash(B256::from([0xBB; 32])),
-        ];
-        let mut db = StreamReplayDB::new(entries, HashMap::new());
+        ]);
+        let mut db = StreamReplayDB::new(data, HashMap::new());
 
         // Consume in order
         let info = db.basic(Address::ZERO).unwrap().unwrap();
@@ -782,12 +884,13 @@ mod tests {
 
     #[test]
     fn test_verify_block_stream_header_hash_mismatch() {
+        use n42_execution::read_log::encode_read_log;
         let (_, header_rlp, _) = make_sealed_header();
         let packet = StreamPacket {
             block_hash: B256::with_last_byte(0xFF), // wrong hash
             header_rlp,
             transactions: vec![],
-            read_log: vec![],
+            read_log_data: encode_read_log(&[]),
             bytecodes: vec![],
         };
 
@@ -800,11 +903,12 @@ mod tests {
 
     #[test]
     fn test_verify_block_stream_bad_header_rlp() {
+        use n42_execution::read_log::encode_read_log;
         let packet = StreamPacket {
             block_hash: B256::ZERO,
             header_rlp: Bytes::from(vec![0xFF, 0xFE, 0xFD]),
             transactions: vec![],
-            read_log: vec![],
+            read_log_data: encode_read_log(&[]),
             bytecodes: vec![],
         };
 
@@ -817,6 +921,7 @@ mod tests {
 
     #[test]
     fn test_update_cache_after_stream_verify() {
+        use n42_execution::read_log::encode_read_log;
         let (_, header_rlp, block_hash) = make_sealed_header();
         let code = Bytes::from(vec![0xAA; 100]);
         let code_hash = keccak256(&code);
@@ -825,7 +930,7 @@ mod tests {
             block_hash,
             header_rlp,
             transactions: vec![],
-            read_log: vec![],
+            read_log_data: encode_read_log(&[]),
             bytecodes: vec![(code_hash, code.clone())],
         };
 

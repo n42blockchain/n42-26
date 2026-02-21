@@ -18,8 +18,6 @@ pub struct ShardedStarHubConfig {
     pub max_connections_per_shard: usize,
     /// Session idle timeout in seconds.
     pub idle_timeout_secs: u64,
-    /// Broadcast channel buffer size per shard.
-    pub broadcast_buffer_size: usize,
     /// Directory for persisting the TLS certificate (shared across shards).
     pub cert_dir: Option<PathBuf>,
 }
@@ -31,7 +29,6 @@ impl Default for ShardedStarHubConfig {
             shard_count: 1,
             max_connections_per_shard: 10_000,
             idle_timeout_secs: 300,
-            broadcast_buffer_size: 256,
             cert_dir: None,
         }
     }
@@ -115,7 +112,6 @@ impl ShardedStarHub {
                 bind_addr: format!("0.0.0.0:{port}").parse().unwrap(),
                 max_connections: config.max_connections_per_shard,
                 idle_timeout_secs: config.idle_timeout_secs,
-                broadcast_buffer_size: config.broadcast_buffer_size,
                 cert_dir: config.cert_dir.clone(),
             };
 

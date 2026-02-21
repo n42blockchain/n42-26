@@ -72,10 +72,9 @@ pub struct MobileSession {
     timeout_count: AtomicU64,
     /// Consecutive send timeouts (reset on success).
     consecutive_timeouts: AtomicU64,
-    /// Cumulative RTT in milliseconds (for computing average).
-    total_rtt_ms: AtomicU64,
-    /// Number of RTT samples collected.
-    rtt_sample_count: AtomicU64,
+    /// EWMA RTT in milliseconds (0 = no data).
+    /// Updated via CAS loop with alpha = EWMA_ALPHA_NUM / EWMA_ALPHA_DEN.
+    ewma_rtt_ms: AtomicU64,
 }
 
 impl std::fmt::Debug for MobileSession {
@@ -91,6 +90,11 @@ impl std::fmt::Debug for MobileSession {
     }
 }
 
+/// EWMA alpha numerator: weight given to new sample (3/10 = 0.3).
+const EWMA_ALPHA_NUM: u64 = 3;
+/// EWMA alpha denominator.
+const EWMA_ALPHA_DEN: u64 = 10;
+
 impl MobileSession {
     /// Creates a new mobile session.
     pub fn new(session_id: u64, verifier_pubkey: [u8; 48]) -> Self {
@@ -105,8 +109,7 @@ impl MobileSession {
             tier: AtomicU64::new(PhoneTier::Fast as u64),
             timeout_count: AtomicU64::new(0),
             consecutive_timeouts: AtomicU64::new(0),
-            total_rtt_ms: AtomicU64::new(0),
-            rtt_sample_count: AtomicU64::new(0),
+            ewma_rtt_ms: AtomicU64::new(0),
         }
     }
 
@@ -129,20 +132,41 @@ impl MobileSession {
         self.recompute_tier();
     }
 
-    /// Records an RTT sample (in milliseconds) and recomputes tier.
+    /// Records an RTT sample (in milliseconds) using EWMA and recomputes tier.
+    ///
+    /// EWMA formula: `new = alpha * sample + (1 - alpha) * old`
+    /// where alpha = EWMA_ALPHA_NUM / EWMA_ALPHA_DEN (0.3).
+    /// Uses a CAS loop for lock-free atomic updates.
     pub fn record_rtt(&self, rtt_ms: u64) {
-        self.total_rtt_ms.fetch_add(rtt_ms, Ordering::Relaxed);
-        self.rtt_sample_count.fetch_add(1, Ordering::Relaxed);
+        loop {
+            let current = self.ewma_rtt_ms.load(Ordering::Relaxed);
+            let new_val = if current == 0 {
+                rtt_ms // first sample: adopt directly
+            } else {
+                (EWMA_ALPHA_NUM * rtt_ms + (EWMA_ALPHA_DEN - EWMA_ALPHA_NUM) * current)
+                    / EWMA_ALPHA_DEN
+            };
+            match self.ewma_rtt_ms.compare_exchange_weak(
+                current,
+                new_val,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(_) => continue,
+            }
+        }
         self.recompute_tier();
     }
 
-    /// Returns the average RTT in milliseconds, or None if no samples.
+    /// Returns the EWMA RTT in milliseconds, or None if no samples.
     pub fn avg_rtt_ms(&self) -> Option<u64> {
-        let count = self.rtt_sample_count.load(Ordering::Relaxed);
-        if count == 0 {
-            return None;
+        let v = self.ewma_rtt_ms.load(Ordering::Relaxed);
+        if v == 0 {
+            None
+        } else {
+            Some(v)
         }
-        Some(self.total_rtt_ms.load(Ordering::Relaxed) / count)
     }
 
     /// Recomputes the tier based on consecutive timeouts and average RTT.
@@ -351,16 +375,59 @@ mod tests {
     }
 
     #[test]
-    fn test_record_rtt_average() {
+    fn test_ewma_rtt_first_sample() {
         let session = MobileSession::new(1, [0u8; 48]);
         assert_eq!(session.avg_rtt_ms(), None);
 
         session.record_rtt(1000);
         assert_eq!(session.avg_rtt_ms(), Some(1000));
+    }
 
+    #[test]
+    fn test_ewma_rtt_converges() {
+        let session = MobileSession::new(1, [0u8; 48]);
+
+        // Establish baseline at 100ms
+        session.record_rtt(100);
+        assert_eq!(session.avg_rtt_ms(), Some(100));
+
+        // Record several 100ms samples to stabilize
+        for _ in 0..9 {
+            session.record_rtt(100);
+        }
+        let stable = session.avg_rtt_ms().unwrap();
+        assert!(stable <= 100, "should stabilize near 100ms, got {stable}");
+
+        // Sudden spike to 5000ms — EWMA should react quickly
+        session.record_rtt(5000);
+        let after_spike = session.avg_rtt_ms().unwrap();
+        // EWMA: 0.3 * 5000 + 0.7 * 100 = 1570
+        assert!(after_spike > 1000, "EWMA should react to spike, got {after_spike}");
+    }
+
+    #[test]
+    fn test_ewma_rtt_decay() {
+        let session = MobileSession::new(1, [0u8; 48]);
+
+        // Start high
+        session.record_rtt(5000);
+        assert_eq!(session.avg_rtt_ms(), Some(5000));
+
+        // Feed low samples — EWMA should decay below 2000 within ~10 samples
+        for _ in 0..15 {
+            session.record_rtt(100);
+        }
+        let final_rtt = session.avg_rtt_ms().unwrap();
+        assert!(final_rtt < 2000, "EWMA should decay below 2000ms, got {final_rtt}");
+    }
+
+    #[test]
+    fn test_ewma_rtt_second_sample() {
+        let session = MobileSession::new(1, [0u8; 48]);
+        session.record_rtt(1000);
         session.record_rtt(3000);
-        // avg = (1000 + 3000) / 2 = 2000
-        assert_eq!(session.avg_rtt_ms(), Some(2000));
+        // EWMA: 0.3 * 3000 + 0.7 * 1000 = 900 + 700 = 1600
+        assert_eq!(session.avg_rtt_ms(), Some(1600));
     }
 
     #[test]
@@ -413,17 +480,18 @@ mod tests {
         session.record_send_timeout();
         assert_eq!(session.tier(), PhoneTier::Slow);
 
-        // Success resets consecutive, but high avg_rtt keeps it Normal
-        session.record_rtt(3000); // avg_rtt = 3000ms (between 2000 and 5000)
+        // Success resets consecutive, but high EWMA RTT keeps it Normal
+        session.record_rtt(3000); // ewma = 3000
         session.record_send_success();
         assert_eq!(session.tier(), PhoneTier::Normal);
 
-        // Good RTT brings it back to Fast
-        // Need enough low-RTT samples to pull average below 2000ms
-        for _ in 0..10 {
+        // Good RTT brings it back to Fast — EWMA decays faster than cumulative average
+        // With alpha=0.3, ~8 samples of 500ms should pull EWMA below 2000ms
+        for _ in 0..8 {
             session.record_rtt(500);
         }
-        // avg_rtt = (3000 + 500*10) / 11 = 8000/11 ≈ 727ms < 2000ms
+        let rtt = session.avg_rtt_ms().unwrap();
+        assert!(rtt < 2000, "EWMA should be below 2000ms, got {rtt}");
         assert_eq!(session.tier(), PhoneTier::Fast);
     }
 

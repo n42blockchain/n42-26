@@ -298,13 +298,15 @@ where
     let _output = executor.execute_one(&recovered_block)
         .map_err(|e| MobilePacketError::Execution(e.to_string()))?;
 
-    // Step 5: Extract the read log and captured codes.
+    // Step 5: Extract the read log and encode immediately to raw bytes.
     // After execution, the executor has consumed the DB. The Arc handles let us
     // recover the logged data. try_unwrap succeeds if no other refs exist.
     let read_log = match Arc::try_unwrap(log_handle) {
         Ok(mutex) => mutex.into_inner().unwrap(),
         Err(arc) => arc.lock().unwrap().clone(),
     };
+    let read_log_count = read_log.len();
+    let read_log_data = n42_execution::read_log::encode_read_log(&read_log);
     let captured_codes = match Arc::try_unwrap(codes_handle) {
         Ok(mutex) => mutex.into_inner().unwrap(),
         Err(arc) => arc.lock().unwrap().clone(),
@@ -332,18 +334,19 @@ where
         .collect();
     let filtered_codes = total_codes - new_codes.len();
 
-    // Step 8: Build StreamPacket.
+    // Step 8: Build StreamPacket with pre-encoded read log bytes.
     let packet = StreamPacket {
         block_hash,
         header_rlp,
         transactions,
-        read_log,
+        read_log_data,
         bytecodes: new_codes,
     };
 
     debug!(
         block_number,
-        read_log_entries = packet.read_log.len(),
+        read_log_entries = read_log_count,
+        read_log_bytes = packet.read_log_data.len(),
         bytecodes = packet.bytecodes.len(),
         filtered_codes,
         total_codes,

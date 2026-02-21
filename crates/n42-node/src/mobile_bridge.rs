@@ -54,6 +54,10 @@ pub struct MobileVerificationBridge {
     invalid_receipt_order: VecDeque<B256>,
     /// Maximum entries in `invalid_receipt_counts` (same as receipt_aggregator's max_tracked_blocks).
     max_invalid_tracked: usize,
+    /// Tracks when the first receipt was received for each block (for attestation latency).
+    block_first_receipt_at: HashMap<B256, std::time::Instant>,
+    /// Insertion order for `block_first_receipt_at` FIFO eviction.
+    block_first_receipt_order: VecDeque<B256>,
 }
 
 impl MobileVerificationBridge {
@@ -75,6 +79,8 @@ impl MobileVerificationBridge {
             invalid_receipt_counts: HashMap::new(),
             invalid_receipt_order: VecDeque::new(),
             max_invalid_tracked: max_tracked_blocks,
+            block_first_receipt_at: HashMap::new(),
+            block_first_receipt_order: VecDeque::new(),
         }
     }
 
@@ -251,6 +257,17 @@ impl MobileVerificationBridge {
             receipt.block_number,
         );
 
+        // Track first receipt time for attestation latency measurement.
+        if !self.block_first_receipt_at.contains_key(&receipt.block_hash) {
+            if self.block_first_receipt_at.len() >= self.max_invalid_tracked {
+                if let Some(oldest) = self.block_first_receipt_order.pop_front() {
+                    self.block_first_receipt_at.remove(&oldest);
+                }
+            }
+            self.block_first_receipt_at.insert(receipt.block_hash, std::time::Instant::now());
+            self.block_first_receipt_order.push_back(receipt.block_hash);
+        }
+
         // Process the receipt through the aggregator.
         match self.receipt_aggregator.process_receipt(receipt) {
             Some(true) => {
@@ -259,6 +276,18 @@ impl MobileVerificationBridge {
                     .get_status(&receipt.block_hash)
                     .map(|s| s.valid_count)
                     .unwrap_or(0);
+
+                // Measure attestation latency: first receipt → threshold reached
+                if let Some(first_at) = self.block_first_receipt_at.get(&receipt.block_hash) {
+                    let latency_ms = first_at.elapsed().as_millis() as u64;
+                    metrics::histogram!("n42_mobile_attestation_latency_ms").record(latency_ms as f64);
+                    info!(
+                        target: "n42::mobile",
+                        block_number = receipt.block_number,
+                        latency_ms,
+                        "attestation latency: first receipt → threshold"
+                    );
+                }
 
                 info!(
                     target: "n42::mobile",
@@ -507,5 +536,65 @@ mod tests {
         }
 
         // Should not panic — test succeeds if we get here.
+    }
+
+    #[test]
+    fn test_attestation_latency_recorded() {
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let mut bridge = MobileVerificationBridge::new(rx, 2, 100);
+
+        let block_hash = B256::with_last_byte(0xE1);
+        let receipt1 = make_receipt(block_hash, 50);
+        let receipt2 = make_receipt(block_hash, 50);
+
+        // First receipt — records first_receipt_at
+        bridge.process_receipt(&receipt1);
+        assert!(
+            bridge.block_first_receipt_at.contains_key(&block_hash),
+            "should track first receipt time"
+        );
+
+        // Second receipt reaches threshold (threshold=2) — latency should be computed
+        bridge.process_receipt(&receipt2);
+
+        let status = bridge.receipt_aggregator.get_status(&block_hash).unwrap();
+        assert!(status.is_attested());
+        // The first_receipt_at entry should still exist
+        assert!(bridge.block_first_receipt_at.contains_key(&block_hash));
+    }
+
+    #[test]
+    fn test_first_receipt_time_bounded() {
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let max_tracked = 3;
+        let mut bridge = MobileVerificationBridge::new(rx, 100, max_tracked);
+
+        // Process receipts for 4 different blocks (exceeding max_tracked=3)
+        for i in 0..4u8 {
+            let block_hash = B256::with_last_byte(0xF0 + i);
+            bridge.process_receipt(&make_receipt(block_hash, i as u64));
+        }
+
+        assert_eq!(
+            bridge.block_first_receipt_at.len(),
+            max_tracked,
+            "block_first_receipt_at should be bounded"
+        );
+        // Oldest (0xF0) should be evicted
+        assert!(!bridge.block_first_receipt_at.contains_key(&B256::with_last_byte(0xF0)));
+    }
+
+    #[test]
+    fn test_attestation_latency_no_panic_without_first_receipt() {
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let mut bridge = MobileVerificationBridge::new(rx, 1, 100);
+
+        // Process receipt directly — first_receipt_at is recorded during process_receipt
+        let block_hash = B256::with_last_byte(0xE2);
+        bridge.process_receipt(&make_receipt(block_hash, 60));
+
+        // Should not panic, and should reach attestation with threshold=1
+        let status = bridge.receipt_aggregator.get_status(&block_hash).unwrap();
+        assert!(status.is_attested());
     }
 }

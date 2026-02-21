@@ -9,6 +9,28 @@
 //! `Database::storage()`, `Database::block_hash()` calls happen in a 100% deterministic
 //! order. JournaledState caches first reads, so the log only contains unique first-time
 //! values.
+//!
+//! ## Compact encoding format
+//!
+//! Each entry starts with a single header byte that encodes both the type and metadata,
+//! eliminating separate tag/data_len fields:
+//!
+//! ```text
+//! 0x00        = AccountNotFound                         (1 byte total)
+//! 0x01-0x7F   = Account exists, flags packed:
+//!   bit0      = 1 (exists marker)
+//!   bit1-3    = nonce byte count (0-7)
+//!   bit4      = balance nonzero
+//!   bit5      = has_code_hash (contract)
+//!   bit6      = nonce uses 8 bytes (overrides bit1-3)
+//! 0x80-0xA0   = Storage, value_len = header - 0x80      (1 + value_len bytes)
+//! 0xC0        = BlockHash                                (1 + 32 bytes)
+//! ```
+//!
+//! Variable-length fields strip leading zeros (big-endian). This is strictly
+//! more compact than pevm's logbin format (which uses 1B length prefix per entry +
+//! reth Compact encoding), especially for common cases like zero-value storage
+//! and empty/zero-balance accounts.
 
 use alloy_primitives::{Bytes, B256, U256};
 use revm::{
@@ -129,18 +151,25 @@ where
     }
 }
 
-// ─── Binary encoding/decoding ───────────────────────────────────────────────
+// ─── Compact binary encoding/decoding ───────────────────────────────────────
 
-/// Tag bytes for read log entry types.
-const TAG_ACCOUNT_NOT_FOUND: u8 = 0x00;
-const TAG_ACCOUNT_EOA: u8 = 0x01;
-const TAG_ACCOUNT_CONTRACT: u8 = 0x02;
-const TAG_STORAGE: u8 = 0x03;
-const TAG_BLOCK_HASH: u8 = 0x04;
+/// Header byte ranges for the compact encoding.
+///
+/// `0x00`       = AccountNotFound
+/// `0x01..0x7F` = Account exists (flags packed in the byte)
+/// `0x80..0xA0` = Storage, value byte count = header − 0x80
+/// `0xC0`       = BlockHash (32-byte hash follows)
+pub const HEADER_ACCOUNT_NOT_FOUND: u8 = 0x00;
+pub const HEADER_STORAGE_BASE: u8 = 0x80;
+pub const HEADER_BLOCK_HASH: u8 = 0xC0;
 
-/// Account flags for conditional field encoding.
-const ACCT_FLAG_NONCE_NONZERO: u8 = 0x01;
-const ACCT_FLAG_BALANCE_NONZERO: u8 = 0x02;
+/// Bit masks within an Account header byte (0x01..0x7F).
+pub const ACCT_EXISTS_BIT: u8 = 0x01;
+pub const ACCT_NONCE_LEN_SHIFT: u8 = 1;
+pub const ACCT_NONCE_LEN_MASK: u8 = 0x0E; // bits 1-3
+pub const ACCT_BALANCE_BIT: u8 = 0x10;     // bit 4
+pub const ACCT_CODE_HASH_BIT: u8 = 0x20;   // bit 5
+pub const ACCT_NONCE_8B_BIT: u8 = 0x40;    // bit 6
 
 /// Errors during read log decoding.
 #[derive(Debug, thiserror::Error)]
@@ -148,75 +177,98 @@ pub enum DecodeError {
     #[error("unexpected end of data at offset {0}")]
     UnexpectedEof(usize),
 
-    #[error("invalid tag 0x{0:02X} at offset {1}")]
+    #[error("invalid header byte 0x{0:02X} at offset {1}")]
     InvalidTag(u8, usize),
 
     #[error("entry count mismatch: expected {expected}, decoded {decoded}")]
     CountMismatch { expected: u32, decoded: u32 },
 }
 
+/// Returns the number of significant bytes needed to represent a u64 value
+/// in big-endian form (0 for zero).
+#[inline]
+fn significant_bytes_u64(v: u64) -> usize {
+    if v == 0 {
+        return 0;
+    }
+    let bits = 64 - v.leading_zeros() as usize;
+    (bits + 7) / 8
+}
+
+/// Returns the number of significant bytes in a 32-byte big-endian value
+/// (0 if all zeros).
+#[inline]
+fn significant_bytes_be32(be: &[u8; 32]) -> usize {
+    for (i, &b) in be.iter().enumerate() {
+        if b != 0 {
+            return 32 - i;
+        }
+    }
+    0
+}
+
 /// Encodes a read log into compact binary format.
 ///
-/// Format:
-/// ```text
-/// entry_count: u32 LE
-/// for each entry:
-///   tag: u8
-///   data_len: u16 LE
-///   data: [u8; data_len]
-/// ```
-///
-/// Entry data formats:
-/// - AccountNotFound: data_len=0
-/// - AccountEOA: flags(1B) + conditional nonce(8B LE) + conditional balance(32B BE)
-/// - AccountContract: flags(1B) + conditional nonce/balance + code_hash(32B)
-/// - Storage: value(32B BE)
-/// - BlockHash: hash(32B)
+/// Format: `entry_count(4B LE) + entries` where each entry is a self-describing
+/// compact byte sequence (see module-level doc for the header byte layout).
 pub fn encode_read_log(log: &[ReadLogEntry]) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(log.len() * 40);
+    let mut buf = Vec::with_capacity(4 + log.len() * 16);
     buf.extend_from_slice(&(log.len() as u32).to_le_bytes());
 
     for entry in log {
         match entry {
             ReadLogEntry::AccountNotFound => {
-                buf.push(TAG_ACCOUNT_NOT_FOUND);
-                buf.extend_from_slice(&0u16.to_le_bytes());
+                buf.push(HEADER_ACCOUNT_NOT_FOUND);
             }
             ReadLogEntry::Account { nonce, balance, code_hash } => {
                 let is_contract = *code_hash != alloy_primitives::KECCAK256_EMPTY;
-                let tag = if is_contract { TAG_ACCOUNT_CONTRACT } else { TAG_ACCOUNT_EOA };
+                let nonce_len = significant_bytes_u64(*nonce);
+                let has_balance = *balance != U256::ZERO;
 
-                let mut flags: u8 = 0;
-                if *nonce != 0 { flags |= ACCT_FLAG_NONCE_NONZERO; }
-                if *balance != U256::ZERO { flags |= ACCT_FLAG_BALANCE_NONZERO; }
-
-                // Calculate data length
-                let mut data_len: usize = 1; // flags byte
-                if *nonce != 0 { data_len += 8; }
-                if *balance != U256::ZERO { data_len += 32; }
-                if is_contract { data_len += 32; } // code_hash
-
-                buf.push(tag);
-                buf.extend_from_slice(&(data_len as u16).to_le_bytes());
-                buf.push(flags);
-                if *nonce != 0 {
-                    buf.extend_from_slice(&nonce.to_le_bytes());
+                let mut header: u8 = ACCT_EXISTS_BIT;
+                if nonce_len <= 7 {
+                    header |= (nonce_len as u8) << ACCT_NONCE_LEN_SHIFT;
+                } else {
+                    header |= ACCT_NONCE_8B_BIT;
                 }
-                if *balance != U256::ZERO {
-                    buf.extend_from_slice(&balance.to_be_bytes::<32>());
+                if has_balance {
+                    header |= ACCT_BALANCE_BIT;
                 }
+                if is_contract {
+                    header |= ACCT_CODE_HASH_BIT;
+                }
+                buf.push(header);
+
+                // Nonce: big-endian, leading zeros stripped
+                if nonce_len > 0 {
+                    let actual_len = if header & ACCT_NONCE_8B_BIT != 0 { 8 } else { nonce_len };
+                    let nonce_be = nonce.to_be_bytes();
+                    buf.extend_from_slice(&nonce_be[8 - actual_len..]);
+                }
+
+                // Balance: length-prefixed, big-endian, leading zeros stripped
+                if has_balance {
+                    let balance_be = balance.to_be_bytes::<32>();
+                    let balance_len = significant_bytes_be32(&balance_be);
+                    buf.push(balance_len as u8);
+                    buf.extend_from_slice(&balance_be[32 - balance_len..]);
+                }
+
+                // Code hash (32B, only for contracts)
                 if is_contract {
                     buf.extend_from_slice(code_hash.as_slice());
                 }
             }
             ReadLogEntry::Storage(value) => {
-                buf.push(TAG_STORAGE);
-                buf.extend_from_slice(&32u16.to_le_bytes());
-                buf.extend_from_slice(&value.to_be_bytes::<32>());
+                let value_be = value.to_be_bytes::<32>();
+                let value_len = significant_bytes_be32(&value_be);
+                buf.push(HEADER_STORAGE_BASE + value_len as u8);
+                if value_len > 0 {
+                    buf.extend_from_slice(&value_be[32 - value_len..]);
+                }
             }
             ReadLogEntry::BlockHash(hash) => {
-                buf.push(TAG_BLOCK_HASH);
-                buf.extend_from_slice(&32u16.to_le_bytes());
+                buf.push(HEADER_BLOCK_HASH);
                 buf.extend_from_slice(hash.as_slice());
             }
         }
@@ -235,86 +287,86 @@ pub fn decode_read_log(data: &[u8]) -> Result<Vec<ReadLogEntry>, DecodeError> {
     let mut entries = Vec::with_capacity(entry_count as usize);
     let mut pos: usize = 4;
 
-    for _ in 0..entry_count {
-        // Read tag
-        if pos >= data.len() {
-            return Err(DecodeError::UnexpectedEof(pos));
+    let ensure = |pos: usize, n: usize| -> Result<(), DecodeError> {
+        if pos + n > data.len() {
+            Err(DecodeError::UnexpectedEof(pos))
+        } else {
+            Ok(())
         }
-        let tag = data[pos];
+    };
+
+    for _ in 0..entry_count {
+        ensure(pos, 1)?;
+        let header = data[pos];
         pos += 1;
 
-        // Read data_len
-        if pos + 2 > data.len() {
-            return Err(DecodeError::UnexpectedEof(pos));
+        if header == HEADER_ACCOUNT_NOT_FOUND {
+            entries.push(ReadLogEntry::AccountNotFound);
+        } else if header < HEADER_STORAGE_BASE {
+            // Account exists (0x01..0x7F)
+            let nonce_len = if header & ACCT_NONCE_8B_BIT != 0 {
+                8
+            } else {
+                ((header & ACCT_NONCE_LEN_MASK) >> ACCT_NONCE_LEN_SHIFT) as usize
+            };
+            let has_balance = header & ACCT_BALANCE_BIT != 0;
+            let has_code_hash = header & ACCT_CODE_HASH_BIT != 0;
+
+            let nonce = if nonce_len > 0 {
+                ensure(pos, nonce_len)?;
+                let mut buf = [0u8; 8];
+                buf[8 - nonce_len..].copy_from_slice(&data[pos..pos + nonce_len]);
+                pos += nonce_len;
+                u64::from_be_bytes(buf)
+            } else {
+                0
+            };
+
+            let balance = if has_balance {
+                ensure(pos, 1)?;
+                let balance_len = data[pos] as usize;
+                pos += 1;
+                ensure(pos, balance_len)?;
+                let mut buf = [0u8; 32];
+                buf[32 - balance_len..].copy_from_slice(&data[pos..pos + balance_len]);
+                pos += balance_len;
+                U256::from_be_bytes(buf)
+            } else {
+                U256::ZERO
+            };
+
+            let code_hash = if has_code_hash {
+                ensure(pos, 32)?;
+                let h = B256::from_slice(&data[pos..pos + 32]);
+                pos += 32;
+                h
+            } else {
+                alloy_primitives::KECCAK256_EMPTY
+            };
+
+            entries.push(ReadLogEntry::Account { nonce, balance, code_hash });
+        } else if header <= HEADER_STORAGE_BASE + 32 {
+            // Storage (0x80..0xA0)
+            let value_len = (header - HEADER_STORAGE_BASE) as usize;
+            let value = if value_len > 0 {
+                ensure(pos, value_len)?;
+                let mut buf = [0u8; 32];
+                buf[32 - value_len..].copy_from_slice(&data[pos..pos + value_len]);
+                pos += value_len;
+                U256::from_be_bytes(buf)
+            } else {
+                U256::ZERO
+            };
+            entries.push(ReadLogEntry::Storage(value));
+        } else if header == HEADER_BLOCK_HASH {
+            // BlockHash (0xC0)
+            ensure(pos, 32)?;
+            let h = B256::from_slice(&data[pos..pos + 32]);
+            pos += 32;
+            entries.push(ReadLogEntry::BlockHash(h));
+        } else {
+            return Err(DecodeError::InvalidTag(header, pos - 1));
         }
-        let data_len = u16::from_le_bytes(data[pos..pos + 2].try_into().unwrap()) as usize;
-        pos += 2;
-
-        if pos + data_len > data.len() {
-            return Err(DecodeError::UnexpectedEof(pos));
-        }
-
-        let entry_data = &data[pos..pos + data_len];
-        pos += data_len;
-
-        let entry = match tag {
-            TAG_ACCOUNT_NOT_FOUND => ReadLogEntry::AccountNotFound,
-            TAG_ACCOUNT_EOA | TAG_ACCOUNT_CONTRACT => {
-                if entry_data.is_empty() {
-                    return Err(DecodeError::UnexpectedEof(pos));
-                }
-                let flags = entry_data[0];
-                let mut dpos: usize = 1;
-
-                let nonce = if flags & ACCT_FLAG_NONCE_NONZERO != 0 {
-                    if dpos + 8 > entry_data.len() {
-                        return Err(DecodeError::UnexpectedEof(pos));
-                    }
-                    let n = u64::from_le_bytes(entry_data[dpos..dpos + 8].try_into().unwrap());
-                    dpos += 8;
-                    n
-                } else {
-                    0
-                };
-
-                let balance = if flags & ACCT_FLAG_BALANCE_NONZERO != 0 {
-                    if dpos + 32 > entry_data.len() {
-                        return Err(DecodeError::UnexpectedEof(pos));
-                    }
-                    let b = U256::from_be_slice(&entry_data[dpos..dpos + 32]);
-                    dpos += 32;
-                    b
-                } else {
-                    U256::ZERO
-                };
-
-                let code_hash = if tag == TAG_ACCOUNT_CONTRACT {
-                    if dpos + 32 > entry_data.len() {
-                        return Err(DecodeError::UnexpectedEof(pos));
-                    }
-                    B256::from_slice(&entry_data[dpos..dpos + 32])
-                } else {
-                    alloy_primitives::KECCAK256_EMPTY
-                };
-
-                ReadLogEntry::Account { nonce, balance, code_hash }
-            }
-            TAG_STORAGE => {
-                if entry_data.len() < 32 {
-                    return Err(DecodeError::UnexpectedEof(pos));
-                }
-                ReadLogEntry::Storage(U256::from_be_slice(&entry_data[..32]))
-            }
-            TAG_BLOCK_HASH => {
-                if entry_data.len() < 32 {
-                    return Err(DecodeError::UnexpectedEof(pos));
-                }
-                ReadLogEntry::BlockHash(B256::from_slice(&entry_data[..32]))
-            }
-            _ => return Err(DecodeError::InvalidTag(tag, pos - data_len)),
-        };
-
-        entries.push(entry);
     }
 
     if entries.len() != entry_count as usize {
@@ -338,6 +390,7 @@ mod tests {
         let encoded = encode_read_log(&log);
         let decoded = decode_read_log(&encoded).unwrap();
         assert!(decoded.is_empty());
+        assert_eq!(encoded.len(), 4); // just the 4B count
     }
 
     #[test]
@@ -346,6 +399,8 @@ mod tests {
         let encoded = encode_read_log(&log);
         let decoded = decode_read_log(&encoded).unwrap();
         assert_eq!(decoded, log);
+        // 4(count) + 1(header=0x00) = 5 bytes
+        assert_eq!(encoded.len(), 5);
     }
 
     #[test]
@@ -358,8 +413,22 @@ mod tests {
         let encoded = encode_read_log(&log);
         let decoded = decode_read_log(&encoded).unwrap();
         assert_eq!(decoded, log);
-        // Minimal encoding: 4(count) + 1(tag) + 2(len) + 1(flags) = 8 bytes
-        assert_eq!(encoded.len(), 8);
+        // 4(count) + 1(header=0x01) = 5 bytes — beats logbin's 2B per entry
+        assert_eq!(encoded.len(), 5);
+    }
+
+    #[test]
+    fn test_encode_decode_eoa_with_nonce() {
+        let log = vec![ReadLogEntry::Account {
+            nonce: 5,
+            balance: U256::ZERO,
+            code_hash: KECCAK256_EMPTY,
+        }];
+        let encoded = encode_read_log(&log);
+        let decoded = decode_read_log(&encoded).unwrap();
+        assert_eq!(decoded, log);
+        // 4(count) + 1(header) + 1(nonce=5) = 6 bytes
+        assert_eq!(encoded.len(), 6);
     }
 
     #[test]
@@ -372,6 +441,23 @@ mod tests {
         let encoded = encode_read_log(&log);
         let decoded = decode_read_log(&encoded).unwrap();
         assert_eq!(decoded, log);
+        // 4(count) + 1(header) + 1(nonce=42) + 1(balance_len=3) + 3(balance=0x0F4240)
+        assert_eq!(encoded.len(), 10);
+    }
+
+    #[test]
+    fn test_encode_decode_eoa_large_nonce() {
+        // nonce that requires 8 bytes (uses bit6)
+        let log = vec![ReadLogEntry::Account {
+            nonce: u64::MAX,
+            balance: U256::ZERO,
+            code_hash: KECCAK256_EMPTY,
+        }];
+        let encoded = encode_read_log(&log);
+        let decoded = decode_read_log(&encoded).unwrap();
+        assert_eq!(decoded, log);
+        // 4(count) + 1(header with bit6) + 8(nonce) = 13 bytes
+        assert_eq!(encoded.len(), 13);
     }
 
     #[test]
@@ -385,6 +471,18 @@ mod tests {
         let encoded = encode_read_log(&log);
         let decoded = decode_read_log(&encoded).unwrap();
         assert_eq!(decoded, log);
+        // 4(count) + 1(header) + 1(nonce=1) + 1(balance_len=2) + 2(balance=500) + 32(code_hash) = 41 bytes
+        assert_eq!(encoded.len(), 41);
+    }
+
+    #[test]
+    fn test_encode_decode_storage_zero() {
+        let log = vec![ReadLogEntry::Storage(U256::ZERO)];
+        let encoded = encode_read_log(&log);
+        let decoded = decode_read_log(&encoded).unwrap();
+        assert_eq!(decoded, log);
+        // 4(count) + 1(header=0x80) = 5 bytes — beats logbin's ~2B per entry
+        assert_eq!(encoded.len(), 5);
     }
 
     #[test]
@@ -393,6 +491,18 @@ mod tests {
         let encoded = encode_read_log(&log);
         let decoded = decode_read_log(&encoded).unwrap();
         assert_eq!(decoded, log);
+        // 4(count) + 1(header=0x84) + 4(value=0xDEADBEEF) = 9 bytes
+        assert_eq!(encoded.len(), 9);
+    }
+
+    #[test]
+    fn test_encode_decode_storage_max() {
+        let log = vec![ReadLogEntry::Storage(U256::MAX)];
+        let encoded = encode_read_log(&log);
+        let decoded = decode_read_log(&encoded).unwrap();
+        assert_eq!(decoded, log);
+        // 4(count) + 1(header=0xA0) + 32(value) = 37 bytes
+        assert_eq!(encoded.len(), 37);
     }
 
     #[test]
@@ -402,6 +512,8 @@ mod tests {
         let encoded = encode_read_log(&log);
         let decoded = decode_read_log(&encoded).unwrap();
         assert_eq!(decoded, log);
+        // 4(count) + 1(header=0xC0) + 32(hash) = 37 bytes
+        assert_eq!(encoded.len(), 37);
     }
 
     #[test]
@@ -430,21 +542,22 @@ mod tests {
 
     #[test]
     fn test_decode_truncated_data() {
-        let result = decode_read_log(&[0x01, 0x00, 0x00]);
+        // entry_count = 1, but no data for the entry
+        let result = decode_read_log(&[0x01, 0x00, 0x00, 0x00]);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_decode_invalid_tag() {
-        // 1 entry, tag 0xFF, data_len 0
-        let data = [0x01, 0x00, 0x00, 0x00, 0xFF, 0x00, 0x00];
+        // 1 entry, invalid header byte 0xD0
+        let data = [0x01, 0x00, 0x00, 0x00, 0xD0];
         let result = decode_read_log(&data);
-        assert!(matches!(result, Err(DecodeError::InvalidTag(0xFF, _))));
+        assert!(matches!(result, Err(DecodeError::InvalidTag(0xD0, _))));
     }
 
     #[test]
     fn test_compact_encoding_saves_space() {
-        // EOA with zero nonce and zero balance → only 1 flag byte
+        // EOA with zero nonce and zero balance → just 1 header byte
         let eoa_zero = vec![ReadLogEntry::Account {
             nonce: 0,
             balance: U256::ZERO,
@@ -452,7 +565,7 @@ mod tests {
         }];
         let encoded_zero = encode_read_log(&eoa_zero);
 
-        // EOA with nonzero nonce and balance → flags + 8 + 32 bytes
+        // EOA with nonzero nonce and balance → header + nonce + len + balance
         let eoa_full = vec![ReadLogEntry::Account {
             nonce: 100,
             balance: U256::from(1_000_000u64),
@@ -463,5 +576,20 @@ mod tests {
         assert!(encoded_zero.len() < encoded_full.len(),
             "zero-value EOA ({} bytes) should be smaller than full EOA ({} bytes)",
             encoded_zero.len(), encoded_full.len());
+    }
+
+    #[test]
+    fn test_variable_length_storage_encoding() {
+        // Zero storage: just 1B header
+        let zero = encode_read_log(&[ReadLogEntry::Storage(U256::ZERO)]);
+        // Small value (3 bytes): 1B header + 3B
+        let small = encode_read_log(&[ReadLogEntry::Storage(U256::from(0x0F4240u64))]);
+        // Max value: 1B header + 32B
+        let max = encode_read_log(&[ReadLogEntry::Storage(U256::MAX)]);
+
+        // All include 4B count prefix, so subtract for per-entry comparison
+        assert_eq!(zero.len() - 4, 1, "zero storage should be 1B");
+        assert_eq!(small.len() - 4, 4, "3-byte value storage should be 4B");
+        assert_eq!(max.len() - 4, 33, "max storage should be 33B");
     }
 }

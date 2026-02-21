@@ -5,9 +5,9 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-use tokio::sync::{broadcast, mpsc, RwLock};
+use tokio::sync::{mpsc, RwLock};
 
-use super::session::MobileSession;
+use super::session::{MobileSession, PhoneTier};
 
 /// Message type prefix for verification packets (uncompressed).
 pub const MSG_TYPE_PACKET: u8 = 0x01;
@@ -111,15 +111,6 @@ pub enum HubEvent {
     },
 }
 
-/// Internal broadcast message sent from the command handler to all connection handlers.
-#[derive(Clone, Debug)]
-enum BroadcastMsg {
-    /// Verification packet data.
-    Packet(Bytes),
-    /// Cache sync message data.
-    CacheSync(Bytes),
-}
-
 /// Configuration for the mobile star hub.
 pub struct StarHubConfig {
     /// Address to bind the QUIC endpoint to.
@@ -128,8 +119,6 @@ pub struct StarHubConfig {
     pub max_connections: usize,
     /// Session idle timeout in seconds.
     pub idle_timeout_secs: u64,
-    /// Broadcast channel buffer size. At ~0.15 msg/sec, 256 provides ~28 min buffer.
-    pub broadcast_buffer_size: usize,
     /// Directory for persisting the TLS certificate. When set, the certificate is
     /// saved on first run and reloaded on subsequent starts, enabling client-side
     /// certificate pinning. When `None`, an ephemeral cert is generated each run.
@@ -142,7 +131,6 @@ impl Default for StarHubConfig {
             bind_addr: "0.0.0.0:9443".parse().unwrap(),
             max_connections: 10_000,
             idle_timeout_secs: 300,
-            broadcast_buffer_size: 256,
             cert_dir: None,
         }
     }
@@ -209,17 +197,17 @@ impl StarHubHandle {
 /// - `0x02` = CacheSyncMessage
 pub struct StarHub {
     /// Active mobile sessions.
-    sessions: Arc<RwLock<HashMap<u64, MobileSession>>>,
+    sessions: Arc<RwLock<HashMap<u64, Arc<MobileSession>>>>,
     /// Configuration.
     config: StarHubConfig,
     /// Command receiver.
     command_rx: mpsc::UnboundedReceiver<HubCommand>,
     /// Event sender to the node layer.
     event_tx: mpsc::UnboundedSender<HubEvent>,
-    /// Broadcast sender for pushing data to all connection handlers.
-    broadcast_tx: broadcast::Sender<BroadcastMsg>,
-    /// Per-session senders for targeted messages (e.g., CacheSync to a specific phone).
-    session_senders: Arc<RwLock<HashMap<u64, mpsc::Sender<Bytes>>>>,
+    /// Per-session senders paired with session Arc for tiered broadcast.
+    /// The command handler iterates these directly, sorted by tier, instead of
+    /// using a broadcast channel.
+    session_senders: Arc<RwLock<HashMap<u64, (mpsc::Sender<Bytes>, Arc<MobileSession>)>>>,
     /// SHA-256 hash of the server certificate (populated during run()).
     cert_hash: Option<[u8; 32]>,
     /// Optional shared session ID generator (for multi-shard mode).
@@ -235,9 +223,6 @@ impl StarHub {
     ) -> (Self, StarHubHandle, mpsc::UnboundedReceiver<HubEvent>) {
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let (event_tx, event_rx) = mpsc::unbounded_channel();
-        // Broadcast channel: buffer recent messages for slow receivers.
-        // If a receiver falls behind, it will receive a Lagged error and skip ahead.
-        let (broadcast_tx, _) = broadcast::channel(config.broadcast_buffer_size);
 
         let handle = StarHubHandle { command_tx };
 
@@ -246,7 +231,6 @@ impl StarHub {
             config,
             command_rx,
             event_tx,
-            broadcast_tx,
             session_senders: Arc::new(RwLock::new(HashMap::new())),
             cert_hash: None,
             shared_session_id_gen: None,
@@ -317,7 +301,6 @@ impl StarHub {
         let sessions = self.sessions.clone();
         let event_tx = self.event_tx.clone();
         let max_conns = self.config.max_connections;
-        let broadcast_tx = self.broadcast_tx.clone();
         let session_senders = self.session_senders.clone();
 
         // Spawn connection acceptor
@@ -339,14 +322,12 @@ impl StarHub {
 
                 let sessions = accept_sessions.clone();
                 let event_tx = accept_event_tx.clone();
-                let broadcast_rx = broadcast_tx.subscribe();
                 let sid = shared_id_gen.as_ref()
                     .map(|g| g.next())
                     .unwrap_or_else(|| local_id_gen.next());
 
-                // Create per-session channel for targeted messages
-                let (session_tx, session_rx) = mpsc::channel::<Bytes>(8);
-                accept_session_senders.write().await.insert(sid, session_tx);
+                // Per-session channel: 32 buffer = ~4 min at 1 msg/8s slot
+                let (session_tx, session_rx) = mpsc::channel::<Bytes>(32);
                 let senders = accept_session_senders.clone();
 
                 tokio::spawn(async move {
@@ -357,7 +338,7 @@ impl StarHub {
                                 connection,
                                 sessions,
                                 event_tx,
-                                broadcast_rx,
+                                session_tx,
                                 session_rx,
                                 senders,
                                 max_conns,
@@ -377,27 +358,54 @@ impl StarHub {
         while let Some(cmd) = self.command_rx.recv().await {
             match cmd {
                 HubCommand::BroadcastPacket(data) => {
-                    let count = self.broadcast_tx.receiver_count();
-                    metrics::counter!("n42_mobile_packets_broadcast").increment(1);
                     let framed = preframe_message(MSG_TYPE_PACKET_ZSTD, &data);
-                    let _ = self.broadcast_tx.send(BroadcastMsg::Packet(framed));
+                    let senders = self.session_senders.read().await;
+                    metrics::counter!("n42_mobile_packets_broadcast").increment(1);
+
+                    // Collect and sort by tier (Fast=0 first)
+                    let mut targets: Vec<_> = senders
+                        .iter()
+                        .map(|(sid, (tx, sess))| (*sid, tx.clone(), sess.tier()))
+                        .collect();
+                    targets.sort_by_key(|(_, _, tier)| *tier as u8);
+
+                    let phone_count = targets.len();
+                    for (sid, tx, _tier) in targets {
+                        if tx.try_send(framed.clone()).is_err() {
+                            tracing::warn!(session_id = sid, "per-session channel full, dropping broadcast");
+                        }
+                    }
                     tracing::debug!(
-                        phone_count = count,
+                        phone_count,
                         "broadcasting verification packet to phones"
                     );
                 }
                 HubCommand::BroadcastCacheSync(data) => {
-                    let count = self.broadcast_tx.receiver_count();
                     let framed = preframe_message(MSG_TYPE_CACHE_SYNC_ZSTD, &data);
-                    let _ = self.broadcast_tx.send(BroadcastMsg::CacheSync(framed));
+                    let senders = self.session_senders.read().await;
+
+                    let mut sent = 0usize;
+                    let mut skipped = 0usize;
+                    for (sid, (tx, sess)) in senders.iter() {
+                        // Skip Slow phones for CacheSync to reduce wasted bandwidth
+                        if sess.tier() == PhoneTier::Slow {
+                            skipped += 1;
+                            continue;
+                        }
+                        if tx.try_send(framed.clone()).is_err() {
+                            tracing::warn!(session_id = sid, "per-session channel full, dropping cache sync");
+                        }
+                        sent += 1;
+                    }
                     tracing::debug!(
-                        phone_count = count,
+                        sent,
+                        skipped,
                         "broadcasting cache sync to phones"
                     );
                 }
                 HubCommand::SendToSession { session_id, data } => {
                     let senders = self.session_senders.read().await;
-                    if let Some(tx) = senders.get(&session_id) {
+                    if let Some((tx, _)) = senders.get(&session_id) {
                         if tx.try_send(data).is_err() {
                             tracing::warn!(session_id, "per-session channel full, dropping targeted message");
                         }
@@ -420,11 +428,11 @@ impl StarHub {
 async fn handle_phone_connection(
     session_id: u64,
     connection: quinn::Connection,
-    sessions: Arc<RwLock<HashMap<u64, MobileSession>>>,
+    sessions: Arc<RwLock<HashMap<u64, Arc<MobileSession>>>>,
     event_tx: mpsc::UnboundedSender<HubEvent>,
-    mut broadcast_rx: broadcast::Receiver<BroadcastMsg>,
+    session_tx: mpsc::Sender<Bytes>,
     mut session_rx: mpsc::Receiver<Bytes>,
-    session_senders: Arc<RwLock<HashMap<u64, mpsc::Sender<Bytes>>>>,
+    session_senders: Arc<RwLock<HashMap<u64, (mpsc::Sender<Bytes>, Arc<MobileSession>)>>>,
     max_connections: usize,
 ) {
     tracing::debug!(
@@ -485,10 +493,9 @@ async fn handle_phone_connection(
         return;
     }
 
-    // Create session and notify node layer.
-    // Re-check connection limit under write lock to close the TOCTOU window
-    // between the initial read-lock check and actual session insertion.
-    let session = MobileSession::new(session_id, verifier_pubkey);
+    // Create session (Arc-wrapped) and register in both maps.
+    // Re-check connection limit under write lock to close the TOCTOU window.
+    let session = Arc::new(MobileSession::new(session_id, verifier_pubkey));
     {
         let mut guard = sessions.write().await;
         if guard.len() >= max_connections {
@@ -496,8 +503,10 @@ async fn handle_phone_connection(
             connection.close(2u32.into(), b"server full");
             return;
         }
-        guard.insert(session_id, session);
+        guard.insert(session_id, session.clone());
     }
+    // Register the per-session sender + session Arc for tiered broadcast
+    session_senders.write().await.insert(session_id, (session_tx, session.clone()));
 
     let _ = event_tx.send(HubEvent::PhoneConnected {
         session_id,
@@ -509,14 +518,13 @@ async fn handle_phone_connection(
     // Per-phone rate limiting: track last receipt time.
     let mut last_receipt_at: Option<Instant> = None;
 
-    // --- Main loop: handle receipts from phone + broadcasts to phone ---
+    // --- Main loop: receipts from phone + outbound messages (broadcast + targeted) ---
     loop {
         tokio::select! {
             // Receive data from the phone (verification receipts)
             stream = connection.accept_uni() => {
                 match stream {
                     Ok(mut recv) => {
-                        // [C4] Timeout prevents slowloris attacks from exhausting the accept loop.
                         let read_result = tokio::time::timeout(
                             RECEIPT_READ_TIMEOUT,
                             recv.read_to_end(MAX_RECEIPT_SIZE as usize),
@@ -524,19 +532,14 @@ async fn handle_phone_connection(
 
                         match read_result {
                             Ok(Ok(data)) => {
-                                // [H2] Per-phone rate limiting: drop receipts arriving too fast.
                                 let now = Instant::now();
                                 if let Some(last) = last_receipt_at {
                                     if now.duration_since(last) < MIN_RECEIPT_INTERVAL {
-                                        tracing::warn!(
-                                            session_id,
-                                            "receipt rate limited, dropping"
-                                        );
+                                        tracing::warn!(session_id, "receipt rate limited, dropping");
                                         continue;
                                     }
                                 }
 
-                                // [C2] Size-limited deserialization prevents OOM.
                                 if data.len() as u64 > MAX_RECEIPT_SIZE {
                                     tracing::warn!(
                                         target: "n42::starhub",
@@ -546,22 +549,18 @@ async fn handle_phone_connection(
                                     );
                                     continue;
                                 }
-                                match bincode::deserialize::<VerificationReceipt>(&data)
-                                {
+                                match bincode::deserialize::<VerificationReceipt>(&data) {
                                     Ok(receipt) => {
                                         last_receipt_at = Some(now);
                                         metrics::counter!("n42_mobile_receipts_received").increment(1);
-                                        // P2 fix: read lock + atomic counter instead of write lock
-                                        if let Some(session) = sessions.read().await.get(&session_id) {
-                                            session.record_receipt();
-                                            // Approximate RTT: IDC→phone + verify + phone→IDC
-                                            let now_ms = std::time::SystemTime::now()
-                                                .duration_since(std::time::UNIX_EPOCH)
-                                                .unwrap_or_default()
-                                                .as_millis() as u64;
-                                            if receipt.timestamp_ms > 0 && now_ms > receipt.timestamp_ms {
-                                                session.record_rtt(now_ms - receipt.timestamp_ms);
-                                            }
+                                        // Use local Arc — no HashMap lookup needed
+                                        session.record_receipt();
+                                        let now_ms = std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_millis() as u64;
+                                        if receipt.timestamp_ms > 0 && now_ms > receipt.timestamp_ms {
+                                            session.record_rtt(now_ms - receipt.timestamp_ms);
                                         }
                                         let _ = event_tx.send(HubEvent::ReceiptReceived(receipt));
                                     }
@@ -589,82 +588,37 @@ async fn handle_phone_connection(
                     }
                 }
             }
-            // Forward broadcast messages to this phone via QUIC uni stream
-            msg = broadcast_rx.recv() => {
-                match msg {
-                    Ok(broadcast_msg) => {
-                        // Data is already pre-framed (type_prefix + payload merged)
-                        let framed_data = match &broadcast_msg {
-                            BroadcastMsg::Packet(d) | BroadcastMsg::CacheSync(d) => d,
-                        };
-                        let send_result = tokio::time::timeout(
-                            BROADCAST_SEND_TIMEOUT,
-                            async {
-                                let mut send = connection.open_uni().await?;
-                                send.write_all(framed_data).await?;
-                                send.finish()?;
-                                Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
-                            },
-                        ).await;
-                        match send_result {
-                            Ok(Ok(())) => {
-                                if let Some(session) = sessions.read().await.get(&session_id) {
-                                    session.record_send_success();
-                                    metrics::counter!("n42_mobile_sends",
-                                        "tier" => session.tier().as_str(),
-                                        "result" => "ok"
-                                    ).increment(1);
-                                }
-                            }
-                            Ok(Err(e)) => {
-                                tracing::debug!(session_id, error = %e, "broadcast send failed, disconnecting");
-                                break;
-                            }
-                            Err(_) => {
-                                if let Some(session) = sessions.read().await.get(&session_id) {
-                                    session.record_send_timeout();
-                                    metrics::counter!("n42_mobile_sends",
-                                        "tier" => session.tier().as_str(),
-                                        "result" => "timeout"
-                                    ).increment(1);
-                                }
-                                metrics::counter!("n42_mobile_send_timeouts").increment(1);
-                                tracing::warn!(session_id, "broadcast send timed out, skipping message");
-                            }
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        tracing::warn!(session_id, skipped = n, "broadcast receiver lagged");
-                        // Continue — some messages were skipped but connection is still valid
-                    }
-                    Err(broadcast::error::RecvError::Closed) => {
-                        tracing::debug!(session_id, "broadcast channel closed");
-                        break;
-                    }
-                }
-            }
-            // Handle targeted messages for this specific session (data is pre-framed)
+            // Outbound messages (broadcast + targeted) via per-session channel
             Some(data) = session_rx.recv() => {
                 let send_result = tokio::time::timeout(
                     BROADCAST_SEND_TIMEOUT,
                     async {
                         let mut send = connection.open_uni().await?;
-                        send.write_all(&data).await?;  // data is already pre-framed
+                        send.write_all(&data).await?;
                         send.finish()?;
                         Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
                     },
                 ).await;
                 match send_result {
                     Ok(Ok(())) => {
-                        tracing::debug!(session_id, size = data.len(), "sent targeted message");
+                        session.record_send_success();
+                        metrics::counter!("n42_mobile_sends",
+                            "tier" => session.tier().as_str(),
+                            "result" => "ok"
+                        ).increment(1);
                     }
                     Ok(Err(e)) => {
-                        tracing::debug!(session_id, error = %e, "targeted send failed, disconnecting");
+                        tracing::debug!(session_id, error = %e, "send failed, disconnecting");
                         break;
                     }
                     Err(_) => {
+                        session.record_send_timeout();
+                        metrics::counter!("n42_mobile_sends",
+                            "tier" => session.tier().as_str(),
+                            "result" => "timeout"
+                        ).increment(1);
                         metrics::counter!("n42_mobile_send_timeouts").increment(1);
-                        tracing::warn!(session_id, "targeted send timed out, skipping");
+                        tracing::warn!(session_id, "send timed out, skipping message");
                     }
                 }
             }
@@ -774,48 +728,102 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_broadcast_msg_clone() {
-        let msg = BroadcastMsg::Packet(Bytes::from(vec![1, 2, 3]));
-        let cloned = msg.clone();
-        match cloned {
-            BroadcastMsg::Packet(data) => assert_eq!(&data[..], &[1, 2, 3]),
-            _ => panic!("unexpected variant"),
-        }
+    fn test_arc_session_send_success() {
+        let session = Arc::new(MobileSession::new(1, [0xAA; 48]));
+        session.record_send_success();
+        assert_eq!(session.packets_sent.load(Ordering::Relaxed), 1);
+        assert_eq!(session.tier(), PhoneTier::Fast);
     }
 
     #[test]
-    fn test_broadcast_channel_delivery() {
-        let (tx, mut rx1) = broadcast::channel::<BroadcastMsg>(16);
-        let mut rx2 = tx.subscribe();
-
-        let data = Bytes::from(vec![0xAA, 0xBB]);
-        tx.send(BroadcastMsg::Packet(data.clone())).unwrap();
-
-        match rx1.try_recv().unwrap() {
-            BroadcastMsg::Packet(d) => assert_eq!(d, data),
-            _ => panic!("expected Packet"),
+    fn test_arc_session_concurrent_access() {
+        let session = Arc::new(MobileSession::new(1, [0u8; 48]));
+        let threads: Vec<_> = (0..4)
+            .map(|_| {
+                let s = session.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..500 {
+                        s.record_send_success();
+                        s.record_rtt(100);
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
         }
-        match rx2.try_recv().unwrap() {
-            BroadcastMsg::Packet(d) => assert_eq!(d, data),
-            _ => panic!("expected Packet"),
-        }
+        assert_eq!(session.packets_sent.load(Ordering::Relaxed), 2000);
+        assert!(session.avg_rtt_ms().is_some());
     }
 
     #[test]
-    fn test_broadcast_channel_both_variants() {
-        let (tx, mut rx) = broadcast::channel::<BroadcastMsg>(16);
+    fn test_broadcast_ordered_by_tier() {
+        // Verify that sorting by tier puts Fast first
+        let fast = Arc::new(MobileSession::new(1, [0u8; 48]));
+        let slow = Arc::new(MobileSession::new(2, [0u8; 48]));
+        let normal = Arc::new(MobileSession::new(3, [0u8; 48]));
 
-        tx.send(BroadcastMsg::Packet(Bytes::from(vec![1]))).unwrap();
-        tx.send(BroadcastMsg::CacheSync(Bytes::from(vec![2]))).unwrap();
+        // Drive slow to Slow tier
+        for _ in 0..3 {
+            slow.record_send_timeout();
+        }
+        assert_eq!(slow.tier(), PhoneTier::Slow);
 
-        match rx.try_recv().unwrap() {
-            BroadcastMsg::Packet(d) => assert_eq!(&d[..], &[1]),
-            _ => panic!("expected Packet"),
+        // Drive normal to Normal tier
+        normal.record_send_timeout();
+        assert_eq!(normal.tier(), PhoneTier::Normal);
+
+        assert_eq!(fast.tier(), PhoneTier::Fast);
+
+        // Simulate the sorting logic from the command handler
+        let mut targets = vec![
+            (2u64, PhoneTier::Slow),
+            (1u64, PhoneTier::Fast),
+            (3u64, PhoneTier::Normal),
+        ];
+        targets.sort_by_key(|(_, tier)| *tier as u8);
+
+        assert_eq!(targets[0].0, 1, "Fast should be first");
+        assert_eq!(targets[1].0, 3, "Normal should be second");
+        assert_eq!(targets[2].0, 2, "Slow should be last");
+    }
+
+    #[test]
+    fn test_cache_sync_skips_slow() {
+        // Verify that Slow tier sessions are skipped for CacheSync
+        let slow_session = Arc::new(MobileSession::new(1, [0u8; 48]));
+        for _ in 0..3 {
+            slow_session.record_send_timeout();
         }
-        match rx.try_recv().unwrap() {
-            BroadcastMsg::CacheSync(d) => assert_eq!(&d[..], &[2]),
-            _ => panic!("expected CacheSync"),
+        assert_eq!(slow_session.tier(), PhoneTier::Slow);
+
+        let fast_session = Arc::new(MobileSession::new(2, [0u8; 48]));
+        assert_eq!(fast_session.tier(), PhoneTier::Fast);
+
+        // Simulate CacheSync skip logic
+        let sessions: Vec<(u64, Arc<MobileSession>)> =
+            vec![(1, slow_session.clone()), (2, fast_session.clone())];
+
+        let mut sent_to = Vec::new();
+        for (sid, sess) in &sessions {
+            if sess.tier() == PhoneTier::Slow {
+                continue;
+            }
+            sent_to.push(*sid);
         }
+        assert_eq!(sent_to, vec![2], "should only send to non-Slow sessions");
+    }
+
+    #[test]
+    fn test_channel_full_drops_gracefully() {
+        // Verify that try_send on a full channel doesn't panic
+        let (tx, _rx) = mpsc::channel::<Bytes>(1);
+
+        // Fill the channel
+        tx.try_send(Bytes::from(vec![1])).unwrap();
+
+        // Next send should fail gracefully (Err, not panic)
+        assert!(tx.try_send(Bytes::from(vec![2])).is_err());
     }
 
     #[test]

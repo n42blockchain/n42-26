@@ -87,6 +87,9 @@ alloy-sol-types = { version = "1.0", default-features = false }
 alloy-evm = { version = "0.27.2", default-features = false }
 revm = { version = "34.0.0", default-features = false, features = ["std"] }
 
+# Testing
+reth-testing-utils = { path = "../reth/testing/testing-utils" }
+
 # Crypto
 blst = "0.3"
 bitvec = { version = "1.0", features = ["serde"] }

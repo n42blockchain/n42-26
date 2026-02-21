@@ -69,3 +69,5 @@ metrics.workspace = true
 
 [dev-dependencies]
 libp2p.workspace = true
+revm.workspace = true
+reth-testing-utils.workspace = true
