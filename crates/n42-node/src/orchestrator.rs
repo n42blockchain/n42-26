@@ -157,6 +157,9 @@ pub struct ConsensusOrchestrator {
     /// Deferred block finalization when Decide arrives before block data.
     /// The committed block hasn't been imported into reth yet.
     pending_finalization: Option<PendingFinalization>,
+    /// Blocks whose `new_payload` returned `Syncing` (parent not yet available).
+    /// Retried after each successful block import.  Bounded to 8 entries.
+    syncing_blocks: VecDeque<Vec<u8>>,
     /// Sender for forwarding received transactions to TxPoolBridge.
     tx_import_tx: Option<mpsc::Sender<Vec<u8>>>,
     /// Receiver for transactions to broadcast from TxPoolBridge.
@@ -220,6 +223,7 @@ impl ConsensusOrchestrator {
             pending_block_data: BTreeMap::new(),
             pending_executions: HashSet::new(),
             pending_finalization: None,
+            syncing_blocks: VecDeque::new(),
             tx_import_tx: None,
             tx_broadcast_rx: None,
             committed_blocks: VecDeque::new(),
@@ -282,6 +286,7 @@ impl ConsensusOrchestrator {
             pending_block_data: BTreeMap::new(),
             pending_executions: HashSet::new(),
             pending_finalization: None,
+            syncing_blocks: VecDeque::new(),
             tx_import_tx: None,
             tx_broadcast_rx: None,
             committed_blocks: VecDeque::new(),
@@ -736,7 +741,9 @@ impl ConsensusOrchestrator {
                     let blob_store_clone = self.blob_store.clone();
                     tokio::spawn(async move {
                         // Give the builder time to pack transactions from the pool.
-                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        // 100ms is sufficient for empty/light blocks; for heavy blocks the
+                        // WaitForPending resolve_kind will wait regardless.
+                        tokio::time::sleep(Duration::from_millis(100)).await;
 
                         // R1 fix: timeout prevents task leak if resolve_kind hangs.
                         // 30s covers extreme cases (8s slot, builds typically < 1s).
@@ -784,13 +791,15 @@ impl ConsensusOrchestrator {
                                                 info!(
                                                     %hash,
                                                     status = ?status.status,
-                                                    "newPayload valid, sending BlockReady"
+                                                    "newPayload valid, broadcasting block data then BlockReady"
                                                 );
-                                                let _ = tx.send(hash);
 
-                                                // Broadcast block data to followers via /n42/blocks/1 topic.
-                                                // Reference: Aptos Raptr uses separate TCP channel;
-                                                // Ethereum uses separate GossipSub topic for beacon_block.
+                                                // Broadcast block data to followers FIRST — give them a
+                                                // head start on speculative pre-import so the block is
+                                                // already in reth when the Proposal arrives.  BlockReady
+                                                // (→ Proposal) travels through two async channels before
+                                                // reaching the network, so sending BlockData first is key
+                                                // for achieving the target 4-second slot time.
                                                 if !payload_json.is_empty() {
                                                     let broadcast = BlockDataBroadcast {
                                                         block_hash: hash,
@@ -815,6 +824,11 @@ impl ConsensusOrchestrator {
                                                         }
                                                     }
                                                 }
+
+                                                // Now send BlockReady → orchestrator → consensus engine
+                                                // → Proposal broadcast.  By this point followers have
+                                                // already received BlockData and started pre-import.
+                                                let _ = tx.send(hash);
 
                                                 // Broadcast blob sidecars if this block contains blob transactions.
                                                 if let Some(ref blob_store) = blob_store_clone {
@@ -1074,12 +1088,13 @@ impl ConsensusOrchestrator {
                     self.pending_executions.clear();
                 }
 
-                // Reset empty block skip counter after a timeout-driven view change.
-                // Without this, each leader independently skips empty blocks, causing
-                // a cascading dead zone where N validators × MAX_SKIPS views pass
-                // without any block production. Timeouts signal that consensus is
-                // struggling — the next leader must build to restore liveness.
-                self.consecutive_empty_skips = 0;
+                // Force the next leader to build after a timeout-driven view change.
+                // Setting to max ensures the skip condition
+                //   `consecutive_empty_skips < max_consecutive_empty_skips()`
+                // evaluates to false, bypassing the empty-block optimization.
+                // Previously, resetting to 0 still allowed skipping (0 < max == true),
+                // causing a cascading dead zone where every leader skips in turn.
+                self.consecutive_empty_skips = max_consecutive_empty_skips();
 
                 // After a view change (timeout recovery), if this node becomes
                 // the new leader, it should trigger payload building.
@@ -1135,21 +1150,24 @@ impl ConsensusOrchestrator {
         };
 
         let hash = broadcast.block_hash;
+        self.pending_executions.remove(&hash);
 
-        if self.pending_executions.remove(&hash) {
-            debug!(%hash, "block data matched pending execution, importing now");
-            self.import_and_notify(broadcast).await;
-        } else {
-            debug!(%hash, pending_execs = ?self.pending_executions, "block data cached (no pending execution)");
-            // Cache for when engine requests it via ExecuteBlock
-            // Bound cache to 16 entries to prevent memory issues
-            if self.pending_block_data.len() >= 16 {
-                if let Some(old_key) = self.pending_block_data.keys().next().copied() {
-                    self.pending_block_data.remove(&old_key);
-                }
+        // Cache raw data as fallback: if speculative import returns Syncing and
+        // ExecuteBlock arrives later, the cached data enables a retry.
+        if self.pending_block_data.len() >= 16 {
+            if let Some(old_key) = self.pending_block_data.keys().next().copied() {
+                self.pending_block_data.remove(&old_key);
             }
-            self.pending_block_data.insert(hash, data);
         }
+        self.pending_block_data.insert(hash, data);
+
+        // Speculative pre-import: call new_payload immediately so the block
+        // is in reth's database when the Proposal arrives.  The consensus
+        // engine's imported_blocks fast path (state_machine.rs:681) lets the
+        // follower vote instantly without waiting for ExecuteBlock → import.
+        // This eliminates ~100-500ms of new_payload latency from the critical path.
+        debug!(%hash, "speculative pre-import: importing block data immediately");
+        self.import_and_notify(broadcast).await;
     }
 
     /// Handles incoming blob sidecar data from the leader via /n42/blobs/1 topic.
@@ -1201,7 +1219,10 @@ impl ConsensusOrchestrator {
     /// to ensure block validity before voting (more conservative, acceptable
     /// with 8-second slots).
     async fn import_and_notify(&mut self, broadcast: BlockDataBroadcast) {
-        let Some(ref engine_handle) = self.beacon_engine else { return; };
+        let engine_handle = match self.beacon_engine {
+            Some(ref h) => h.clone(),
+            None => return,
+        };
 
         // Deserialize the execution payload from JSON
         let execution_data = match serde_json::from_slice(&broadcast.payload_json) {
@@ -1293,6 +1314,71 @@ impl ConsensusOrchestrator {
                         ConsensusEvent::BlockImported(broadcast.block_hash)
                     ) {
                         error!(error = %e, "error processing BlockImported");
+                    }
+
+                    // Retry blocks that previously returned Syncing.
+                    // Now that a new block is in reth, their parent may be available.
+                    if !self.syncing_blocks.is_empty() {
+                        let queued: Vec<Vec<u8>> = self.syncing_blocks.drain(..).collect();
+                        info!(count = queued.len(), "retrying previously-syncing blocks");
+                        for data in queued {
+                            if let Ok(retry_broadcast) = bincode::deserialize::<BlockDataBroadcast>(&data) {
+                                // Re-run import path (inline, not recursive)
+                                let retry_hash = retry_broadcast.block_hash;
+                                let retry_exec = match serde_json::from_slice(&retry_broadcast.payload_json) {
+                                    Ok(d) => d,
+                                    Err(e) => {
+                                        warn!(%retry_hash, error = %e, "failed to deserialize retry payload");
+                                        continue;
+                                    }
+                                };
+                                match engine_handle.new_payload(retry_exec).await {
+                                    Ok(rs) if matches!(rs.status, PayloadStatusEnum::Valid | PayloadStatusEnum::Accepted) => {
+                                        info!(%retry_hash, "syncing block retry succeeded");
+                                        let fcu = ForkchoiceState {
+                                            head_block_hash: retry_hash,
+                                            safe_block_hash: retry_hash,
+                                            finalized_block_hash: retry_hash,
+                                        };
+                                        let _ = engine_handle
+                                            .fork_choice_updated(fcu, None, EngineApiMessageVersion::default())
+                                            .await;
+                                        self.head_block_hash = retry_hash;
+                                        if let Err(e) = self.engine.process_event(
+                                            ConsensusEvent::BlockImported(retry_hash)
+                                        ) {
+                                            error!(error = %e, "error processing BlockImported for retry");
+                                        }
+                                    }
+                                    Ok(rs) if matches!(rs.status, PayloadStatusEnum::Syncing) => {
+                                        // Still not ready — re-queue
+                                        debug!(%retry_hash, "retry still Syncing, re-queuing");
+                                        self.syncing_blocks.push_back(data);
+                                    }
+                                    Ok(rs) => {
+                                        warn!(%retry_hash, status = ?rs.status, "retry rejected");
+                                    }
+                                    Err(e) => {
+                                        warn!(%retry_hash, error = %e, "retry new_payload failed");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else if matches!(status.status, PayloadStatusEnum::Syncing) {
+                    // Parent block not yet processed — cache for retry after parent arrives.
+                    // This commonly happens when a validator is slightly behind (e.g., still
+                    // executing block N-1 when block N arrives).  Without retry, the block
+                    // is permanently lost and the validator can never catch up.
+                    info!(
+                        hash = %broadcast.block_hash,
+                        "new_payload returned Syncing (parent not ready), queuing for retry"
+                    );
+                    if let Ok(data) = bincode::serialize(&broadcast) {
+                        if self.syncing_blocks.len() >= 8 {
+                            self.syncing_blocks.pop_front();
+                        }
+                        self.syncing_blocks.push_back(data);
                     }
                 } else {
                     warn!(
@@ -1791,6 +1877,7 @@ mod tests {
             pending_block_data: BTreeMap::new(),
             pending_executions: HashSet::new(),
             pending_finalization: None,
+            syncing_blocks: VecDeque::new(),
             tx_import_tx: None,
             tx_broadcast_rx: None,
             committed_blocks: VecDeque::new(),
@@ -1846,6 +1933,7 @@ mod tests {
             pending_block_data: BTreeMap::new(),
             pending_executions: HashSet::new(),
             pending_finalization: None,
+            syncing_blocks: VecDeque::new(),
             tx_import_tx: None,
             tx_broadcast_rx: None,
             committed_blocks: VecDeque::new(),

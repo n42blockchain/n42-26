@@ -329,6 +329,61 @@ fn main() {
                     }
                 }
 
+                // Auto-connect to all validators: compute deterministic PeerIds and
+                // dial every other validator's QUIC endpoint.  This is essential for
+                // HotStuff-2 performance — the protocol uses a leader-based star
+                // communication pattern where replicas send votes directly to the
+                // leader.  Without full mesh connectivity, messages must be relayed
+                // through intermediary nodes (e.g., GossipSub forwarding), adding
+                // latency proportional to the number of hops.
+                //
+                // Port convention: consensus_port = base_port + validator_index.
+                // The base_port is inferred from this node's own port and index.
+                let auto_connect = std::env::var("N42_NO_AUTO_CONNECT")
+                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false);
+                let val_count = validator_set.len() as u32;
+                if !auto_connect && val_count > 1 {
+                    let base_port = consensus_port.saturating_sub(my_index as u16);
+                    info!(
+                        target: "n42::cli",
+                        base_port, val_count,
+                        "auto-connecting to all validators (full mesh)"
+                    );
+                    for j in 0..val_count {
+                        if j == my_index {
+                            continue;
+                        }
+                        // Derive the same deterministic Ed25519 PeerId used by validator j.
+                        let peer_seed = alloy_primitives::keccak256(
+                            format!("n42-p2p-key-{}", j).as_bytes()
+                        );
+                        let mut peer_seed_bytes: [u8; 32] = peer_seed.0;
+                        let peer_secret = libp2p::identity::ed25519::SecretKey::try_from_bytes(
+                            &mut peer_seed_bytes
+                        ).expect("valid ed25519 seed from keccak256");
+                        let peer_ed_kp = libp2p::identity::ed25519::Keypair::from(peer_secret);
+                        let peer_kp = libp2p::identity::Keypair::from(peer_ed_kp);
+                        let peer_id = peer_kp.public().to_peer_id();
+
+                        let peer_port = base_port + j as u16;
+                        let peer_addr: libp2p::Multiaddr = format!(
+                            "/ip4/127.0.0.1/udp/{}/quic-v1/p2p/{}",
+                            peer_port, peer_id
+                        ).parse().expect("valid multiaddr");
+
+                        if let Err(e) = net_handle.dial(peer_addr.clone()) {
+                            warn!(target: "n42::cli", error = %e, validator = j, "failed to auto-dial validator");
+                        } else {
+                            info!(target: "n42::cli", validator = j, %peer_id, port = peer_port, "auto-dialing validator");
+                        }
+                        // Register for reconnection so dropped connections are restored.
+                        if let Err(e) = net_handle.register_peer(peer_id, vec![peer_addr], true) {
+                            warn!(target: "n42::cli", error = %e, validator = j, "failed to register for reconnection");
+                        }
+                    }
+                }
+
                 // Data directory (used by StarHub certs and consensus state persistence).
                 let data_dir: PathBuf = std::env::var("N42_DATA_DIR")
                     .unwrap_or_else(|_| "./n42-data".to_string())

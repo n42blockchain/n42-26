@@ -1,0 +1,4 @@
+# Python dependencies for N42 7-node testnet transaction generator
+# Install: pip3 install -r scripts/requirements-testnet.txt
+eth-account>=0.13.0
+requests>=2.31.0

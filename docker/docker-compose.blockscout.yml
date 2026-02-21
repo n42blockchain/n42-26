@@ -81,6 +81,9 @@ services:
       NEXT_PUBLIC_HOMEPAGE_CHARTS: "['daily_txs']"
       NEXT_PUBLIC_VISUALIZE_API_HOST: ""
       NEXT_PUBLIC_IS_TESTNET: "true"
+      NEXT_PUBLIC_APP_HOST: localhost
+      NEXT_PUBLIC_APP_PROTOCOL: http
+      NEXT_PUBLIC_APP_PORT: "3000"
     ports:
       - "3000:3000"
 

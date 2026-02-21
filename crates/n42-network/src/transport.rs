@@ -140,7 +140,11 @@ pub fn build_swarm_with_validator_index(
 ) -> eyre::Result<Swarm<N42Behaviour>> {
     let gossipsub_config = gossipsub::ConfigBuilder::default()
         .heartbeat_interval(config.heartbeat_interval)
-        .validation_mode(gossipsub::ValidationMode::Strict)
+        // Permissive: messages are automatically forwarded after delivery.
+        // Application-level validation is performed in handle_gossipsub_message.
+        // Strict mode blocks forwarding without report_message_validation_result,
+        // which would require plumbing message IDs through the event loop.
+        .validation_mode(gossipsub::ValidationMode::Permissive)
         // 4MB max message size: block data broadcasts via /n42/blocks/1 topic
         // can reach several MB. Without this, libp2p's default (~65KB) would
         // silently drop block data messages.
