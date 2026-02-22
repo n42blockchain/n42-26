@@ -57,6 +57,7 @@ CLEAN=false
 NO_EXPLORER=false
 NO_TX_GEN=false
 NO_MONITOR=false
+NO_MOBILE_SIM=false
 
 for arg in "$@"; do
     case "$arg" in
@@ -64,6 +65,8 @@ for arg in "$@"; do
         --no-explorer)  NO_EXPLORER=true ;;
         --no-tx-gen)    NO_TX_GEN=true ;;
         --no-monitor)   NO_MONITOR=true ;;
+        --no-mobile-sim) NO_MOBILE_SIM=true ;;
+        --mobile-sim)    NO_MOBILE_SIM=false ;;
         -h|--help)
             echo "Usage: $0 [--clean] [--no-explorer] [--no-tx-gen] [--no-monitor]"
             echo ""
@@ -72,6 +75,8 @@ for arg in "$@"; do
             echo "  --no-explorer   Don't start Blockscout"
             echo "  --no-tx-gen     Don't start transaction generator"
             echo "  --no-monitor    Don't start error monitor"
+            echo "  --no-mobile-sim Don't start mobile phone simulator"
+            echo "  --mobile-sim    Start mobile phone simulator (default)"
             exit 0
             ;;
         *)
@@ -107,6 +112,7 @@ fi
 NODE_PIDS=()
 TX_GEN_PID=""
 MONITOR_PID=""
+MOBILE_SIM_PID=""
 BLOCKSCOUT_STARTED=false
 
 cleanup() {
@@ -121,6 +127,11 @@ cleanup() {
     if [[ -n "$MONITOR_PID" ]] && kill -0 "$MONITOR_PID" 2>/dev/null; then
         log "Stopping error monitor (PID $MONITOR_PID)..."
         kill "$MONITOR_PID" 2>/dev/null || true
+    fi
+
+    if [[ -n "$MOBILE_SIM_PID" ]] && kill -0 "$MOBILE_SIM_PID" 2>/dev/null; then
+        log "Stopping mobile simulator (PID $MOBILE_SIM_PID)..."
+        kill "$MOBILE_SIM_PID" 2>/dev/null || true
     fi
 
     if [[ "$BLOCKSCOUT_STARTED" == true ]]; then
@@ -151,6 +162,15 @@ trap cleanup EXIT INT TERM
 if [[ "$CLEAN" == true ]]; then
     warn "Cleaning testnet data at $DATA_DIR..."
     rm -rf "$DATA_DIR"
+
+    # Also wipe Blockscout Docker volumes (database + redis) to avoid stale data
+    if command -v docker &>/dev/null && docker info &>/dev/null 2>&1; then
+        warn "Cleaning Blockscout Docker volumes..."
+        docker compose \
+            -f "$PROJECT_DIR/docker/docker-compose.blockscout.yml" \
+            -p n42-testnet-blockscout \
+            down -v 2>/dev/null || true
+    fi
 fi
 
 mkdir -p "$DATA_DIR"
@@ -178,9 +198,9 @@ log "Python venv ready: $(python3 --version)"
 # Step 1: Build release binary
 # ---------------------------------------------------------------------------
 
-log "Building n42-node (release) - this may take a few minutes..."
+log "Building n42-node and n42-mobile-sim (release) - this may take a few minutes..."
 cd "$PROJECT_DIR"
-cargo build --release --bin n42-node 2>&1 | tail -5
+cargo build --release --bin n42-node --bin n42-mobile-sim 2>&1 | tail -5
 
 BINARY="$PROJECT_DIR/target/release/n42-node"
 if [[ ! -f "$BINARY" ]]; then
@@ -188,6 +208,13 @@ if [[ ! -f "$BINARY" ]]; then
     exit 1
 fi
 log "Binary ready: $BINARY"
+
+MOBILE_SIM_BIN="$PROJECT_DIR/target/release/n42-mobile-sim"
+if [[ -f "$MOBILE_SIM_BIN" ]]; then
+    log "Mobile sim binary ready: $MOBILE_SIM_BIN"
+else
+    warn "n42-mobile-sim binary not found (non-fatal)"
+fi
 
 # ---------------------------------------------------------------------------
 # Step 2: Generate genesis.json with Python
@@ -319,6 +346,27 @@ done
 log "Starting $NUM_VALIDATORS validator nodes..."
 
 ENODES=()
+
+# Pre-generate deterministic devp2p keys for all validators so we can
+# construct valid enode URLs before any node starts.
+log "Generating deterministic devp2p keys..."
+P2P_SECRETS=()
+P2P_PUBKEYS=()
+for i in $(seq 0 $((NUM_VALIDATORS - 1))); do
+    read -r secret pubkey <<< $(python3 -c "
+from eth_utils import keccak
+from eth_keys import keys
+seed = b'n42-devp2p-key-$i'
+sk = keccak(seed)
+pk = keys.PrivateKey(sk)
+# Public key: uncompressed without 0x04 prefix, 128 hex chars
+print(sk.hex(), pk.public_key.to_hex()[2:])
+")
+    P2P_SECRETS+=("$secret")
+    P2P_PUBKEYS+=("$pubkey")
+    echo -e "  ${BLUE}Validator ${i}${NC}: enode_pubkey=${pubkey:0:16}..."
+done
+
 for i in $(seq 0 $((NUM_VALIDATORS - 1))); do
     datadir="$DATA_DIR/validator-${i}"
     http_port=$((BASE_HTTP_RPC + i))
@@ -350,6 +398,10 @@ for i in $(seq 0 $((NUM_VALIDATORS - 1))); do
     N42_BASE_TIMEOUT_MS="20000" \
     N42_MAX_TIMEOUT_MS="60000" \
     N42_STARTUP_DELAY_MS="3000" \
+    N42_REWARD_EPOCH_BLOCKS="50" \
+    N42_DAILY_BASE_REWARD_GWEI="100000000" \
+    N42_REWARD_CURVE_K="4.0" \
+    N42_MIN_ATTESTATION_THRESHOLD="1" \
     "$BINARY" node \
         --chain "$GENESIS_FILE" \
         --datadir "$datadir" \
@@ -363,6 +415,7 @@ for i in $(seq 0 $((NUM_VALIDATORS - 1))); do
         --authrpc.port "$auth_port" \
         --port "$p2p_port" \
         --discovery.port "$p2p_port" \
+        --p2p-secret-key-hex "${P2P_SECRETS[$i]}" \
         --log.file.directory "$datadir/logs" \
         --metrics "127.0.0.1:$metrics_port" \
         ${TRUSTED_PEERS_FLAG} \
@@ -371,8 +424,8 @@ for i in $(seq 0 $((NUM_VALIDATORS - 1))); do
     NODE_PIDS+=($!)
     log "    PID: ${NODE_PIDS[$i]}, log: $log_file"
 
-    # Record enode for subsequent nodes
-    ENODES+=("enode://0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000${i}@127.0.0.1:${p2p_port}")
+    # Record enode with real public key for subsequent nodes
+    ENODES+=("enode://${P2P_PUBKEYS[$i]}@127.0.0.1:${p2p_port}")
 
     # Brief pause for initialization
     sleep 2
@@ -467,6 +520,30 @@ if [[ "$NO_TX_GEN" == false ]]; then
 fi
 
 # ---------------------------------------------------------------------------
+# Step 7.5: Start mobile phone simulator (optional)
+# ---------------------------------------------------------------------------
+
+if [[ "$NO_MOBILE_SIM" == false ]]; then
+    MOBILE_SIM_BINARY="$PROJECT_DIR/target/release/n42-mobile-sim"
+    if [[ -f "$MOBILE_SIM_BINARY" ]]; then
+        STARHUB_PORTS=$(seq -s, $BASE_STARHUB $((BASE_STARHUB + NUM_VALIDATORS - 1)) | sed 's/,$//')
+        log "Starting mobile phone simulator (7 phones)..."
+
+        N42_MIN_ATTESTATION_THRESHOLD=1 \
+        "$MOBILE_SIM_BINARY" \
+            --starhub-ports "$STARHUB_PORTS" \
+            --phone-count 7 \
+            > "$DATA_DIR/mobile-sim.log" 2>&1 &
+
+        MOBILE_SIM_PID=$!
+        log "  Mobile simulator PID: $MOBILE_SIM_PID, phones=7, log: $DATA_DIR/mobile-sim.log"
+    else
+        warn "n42-mobile-sim binary not found, skipping"
+        warn "  Build with: cargo build --release --bin n42-mobile-sim"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
 # Step 8: Start error monitor (optional)
 # ---------------------------------------------------------------------------
 
@@ -518,6 +595,9 @@ if [[ -n "$TX_GEN_PID" ]]; then
 fi
 if [[ -n "$MONITOR_PID" ]]; then
     echo -e "  ${CYAN}Error Monitor:${NC}   PID=$MONITOR_PID"
+fi
+if [[ -n "$MOBILE_SIM_PID" ]]; then
+    echo -e "  ${CYAN}Mobile Sim:${NC}      PID=$MOBILE_SIM_PID  (7 phones)"
 fi
 echo ""
 echo -e "  ${CYAN}Logs:${NC}"

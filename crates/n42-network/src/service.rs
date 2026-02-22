@@ -446,7 +446,10 @@ impl NetworkService {
             libp2p::mdns::Event::Discovered(peers) => {
                 for (peer_id, addr) in peers {
                     tracing::info!(%peer_id, %addr, "mDNS: discovered peer");
-                    self.swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+                    // Do NOT call add_explicit_peer() here — explicit peers are excluded
+                    // from GossipSub mesh formation, causing "Mesh low. Topic contains: 0".
+                    // Instead, just dial and register for reconnection; GossipSub heartbeat
+                    // will naturally add connected peers to the mesh.
                     self.reconnection.register_peer(peer_id, vec![addr.clone()], false);
                     if let Err(e) = self.swarm.dial(addr.clone()) {
                         tracing::debug!(%peer_id, error = %e, "mDNS dial failed");

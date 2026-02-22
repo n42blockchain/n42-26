@@ -166,9 +166,10 @@ impl ConsensusOrchestrator {
         block_hash: B256,
         commit_qc: QuorumCertificate,
     ) {
+        self.committed_block_count += 1;
         counter!("n42_blocks_committed_total").increment(1);
         gauge!("n42_consensus_view").set(view as f64);
-        info!(view, %block_hash, "block committed by consensus");
+        info!(view, block_number = self.committed_block_count, %block_hash, "block committed by consensus");
 
         if let Some(ref state) = self.consensus_state {
             state.update_committed_qc(commit_qc.clone());

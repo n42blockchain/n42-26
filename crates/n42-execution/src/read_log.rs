@@ -122,8 +122,16 @@ where
     }
 
     fn code_by_hash(&mut self, code_hash: B256) -> Result<Bytecode, Self::Error> {
-        // code_by_hash is NOT logged — bytecodes travel via a separate channel.
-        self.inner.code_by_hash(code_hash)
+        let bytecode = self.inner.code_by_hash(code_hash)?;
+        // Capture bytecode for mobile stream transmission (skip empty code hash).
+        // Not written to the read log — bytecodes travel via a separate channel.
+        if code_hash != alloy_primitives::KECCAK256_EMPTY {
+            let mut codes = self.captured_codes.lock().unwrap();
+            codes.entry(code_hash).or_insert_with(|| {
+                Bytes::copy_from_slice(bytecode.original_byte_slice())
+            });
+        }
+        Ok(bytecode)
     }
 
     fn storage(
@@ -991,15 +999,20 @@ mod tests {
         let cache_db = CacheDB::new(revm::database::EmptyDB::default());
         let mut logged_db = ReadLogDatabase::new(cache_db);
 
+        // KECCAK256_EMPTY should not produce log entries or captured codes
         let _ = logged_db.code_by_hash(KECCAK256_EMPTY);
 
         let handle = logged_db.log_handle();
         let entries = handle.lock().unwrap();
         assert!(entries.is_empty(), "code_by_hash should not produce log entries");
+
+        let codes = logged_db.codes_handle();
+        let codes = codes.lock().unwrap();
+        assert!(codes.is_empty(), "KECCAK256_EMPTY should not be captured");
     }
 
     #[test]
-    fn test_read_log_database_captures_bytecode() {
+    fn test_read_log_database_captures_bytecode_from_basic() {
         use revm::{database::CacheDB, database_interface::Database, bytecode::Bytecode};
         use alloy_primitives::{Address, keccak256};
 
@@ -1021,7 +1034,59 @@ mod tests {
 
         let codes = logged_db.codes_handle();
         let codes = codes.lock().unwrap();
-        assert_eq!(codes.len(), 1, "should capture contract bytecode");
+        assert_eq!(codes.len(), 1, "should capture contract bytecode via basic()");
         assert!(codes.contains_key(&code_hash));
+    }
+
+    #[test]
+    fn test_code_by_hash_captures_bytecode() {
+        use revm::{database::CacheDB, database_interface::Database, bytecode::Bytecode};
+        use alloy_primitives::{Address, keccak256};
+
+        let mut cache_db = CacheDB::new(revm::database::EmptyDB::default());
+        let addr = Address::with_last_byte(0xC1);
+        let code = alloy_primitives::Bytes::from(vec![0x60, 0x01, 0x60, 0x00, 0x52, 0xF3]);
+        let code_hash = keccak256(&code);
+
+        // Insert account with bytecode into CacheDB
+        cache_db.insert_account_info(addr, AccountInfo {
+            nonce: 0,
+            balance: U256::ZERO,
+            code_hash,
+            code: Some(Bytecode::new_raw(code.clone())),
+            account_id: None,
+        });
+
+        let mut logged_db = ReadLogDatabase::new(cache_db);
+
+        // code_by_hash should capture the bytecode
+        let result = logged_db.code_by_hash(code_hash).unwrap();
+        assert_eq!(result.original_byte_slice(), &code[..]);
+
+        // No log entries (code_by_hash does not write to read log)
+        let log_handle = logged_db.log_handle();
+        let entries = log_handle.lock().unwrap();
+        assert!(entries.is_empty(), "code_by_hash should not produce log entries");
+
+        // But bytecode should be captured
+        let codes_handle = logged_db.codes_handle();
+        let codes = codes_handle.lock().unwrap();
+        assert_eq!(codes.len(), 1, "code_by_hash should capture bytecode");
+        assert_eq!(codes[&code_hash], code);
+    }
+
+    #[test]
+    fn test_code_by_hash_skips_empty_hash() {
+        use revm::{database::CacheDB, database_interface::Database};
+
+        let cache_db = CacheDB::new(revm::database::EmptyDB::default());
+        let mut logged_db = ReadLogDatabase::new(cache_db);
+
+        // KECCAK256_EMPTY should not be captured
+        let _ = logged_db.code_by_hash(KECCAK256_EMPTY);
+
+        let codes_handle = logged_db.codes_handle();
+        let codes = codes_handle.lock().unwrap();
+        assert!(codes.is_empty(), "KECCAK256_EMPTY should not be captured");
     }
 }

@@ -5599,19 +5599,24 @@ dependencies = [
  "alloy-primitives",
  "alloy-rlp",
  "bincode",
+ "eyre",
  "lru 0.12.5",
  "n42-chainspec",
  "n42-execution",
  "n42-primitives",
+ "quinn",
  "reth-chainspec",
  "reth-ethereum-primitives",
  "reth-evm",
  "reth-primitives-traits",
  "reth-revm",
  "revm",
+ "rustls",
  "serde",
  "thiserror 2.0.18",
+ "tokio",
  "tracing",
+ "zstd",
 ]
 
 [[package]]
@@ -5639,6 +5644,23 @@ dependencies = [
  "tracing",
  "tracing-subscriber 0.3.22",
  "zstd",
+]
+
+[[package]]
+name = "n42-mobile-sim"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives",
+ "bincode",
+ "clap",
+ "eyre",
+ "hex",
+ "n42-chainspec",
+ "n42-mobile",
+ "n42-primitives",
+ "tokio",
+ "tracing",
+ "tracing-subscriber 0.3.22",
 ]
 
 [[package]]

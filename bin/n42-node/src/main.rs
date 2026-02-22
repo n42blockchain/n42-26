@@ -8,6 +8,7 @@ use n42_network::{build_swarm_with_validator_index, ShardedStarHub, ShardedStarH
 use n42_network::NetworkService;
 use n42_node::mobile_bridge::MobileVerificationBridge;
 use n42_node::mobile_packet::mobile_packet_loop;
+use n42_node::mobile_reward::MobileRewardManager;
 use n42_node::persistence;
 use n42_node::rpc::{N42ApiServer, N42RpcServer};
 use n42_node::tx_bridge::TxPoolBridge;
@@ -19,7 +20,7 @@ use reth_ethereum_cli::Cli;
 use reth_node_core::args::DefaultRpcServerArgs;
 use reth_storage_api::{BlockHashReader, BlockNumReader};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
@@ -355,15 +356,56 @@ fn main() {
                     }),
                 );
 
+                // Create MobileRewardManager for EIP-4895 withdrawal-based rewards.
+                // Uses logarithmic curve: 5 min ≈ 50% reward, 24h = 100%.
+                let reward_epoch_blocks = env_u64("N42_REWARD_EPOCH_BLOCKS").unwrap_or(21600); // 24h at 4s
+                let daily_base_reward_gwei = env_u64("N42_DAILY_BASE_REWARD_GWEI").unwrap_or(100_000_000); // 0.1 N42
+                let reward_curve_k: f64 = std::env::var("N42_REWARD_CURVE_K")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(4.0);
+                let max_rewards_per_block = env_usize("N42_MAX_REWARDS_PER_BLOCK").unwrap_or(32);
+
+                let reward_manager = Arc::new(Mutex::new(MobileRewardManager::new(
+                    reward_epoch_blocks,
+                    daily_base_reward_gwei,
+                    reward_curve_k,
+                    max_rewards_per_block,
+                )));
+
+                info!(
+                    target: "n42::cli",
+                    epoch_blocks = reward_epoch_blocks,
+                    daily_base_reward_gwei,
+                    curve_k = reward_curve_k,
+                    max_per_block = max_rewards_per_block,
+                    "mobile reward manager configured (logarithmic curve)"
+                );
+
                 // Start MobileVerificationBridge (receipt aggregation).
                 let (attest_tx, mut attest_rx) = mpsc::channel(256);
                 let (phone_connected_tx, phone_connected_rx) = mpsc::channel(128);
+                let (reward_attest_tx, mut reward_attest_rx) = mpsc::unbounded_channel();
 
                 let mobile_bridge = MobileVerificationBridge::new(hub_event_rx, 10, 1000)
                     .with_attestation_tx(attest_tx)
-                    .with_phone_connected_tx(phone_connected_tx);
+                    .with_phone_connected_tx(phone_connected_tx)
+                    .with_reward_tx(reward_attest_tx);
 
                 task_executor.spawn_critical_task("n42-mobile-bridge", Box::pin(mobile_bridge.run()));
+
+                // Reward attestation tracking task: forwards pubkey hex from bridge to reward manager.
+                let reward_mgr_tracker = reward_manager.clone();
+                task_executor.spawn_critical_task(
+                    "n42-reward-tracker",
+                    Box::pin(async move {
+                        while let Some(pubkey_hex) = reward_attest_rx.recv().await {
+                            if let Ok(mut mgr) = reward_mgr_tracker.lock() {
+                                mgr.record_attestation(&pubkey_hex);
+                            }
+                        }
+                    }),
+                );
 
                 // Log attestation events and record them in shared state.
                 let attestation_state = consensus_state.clone();
@@ -494,7 +536,8 @@ fn main() {
                 .with_mobile_packet_tx(mobile_packet_tx)
                 .with_state_persistence(state_file)
                 .with_validator_set(validator_set)
-                .with_blob_store(full_node.pool.blob_store().clone());
+                .with_blob_store(full_node.pool.blob_store().clone())
+                .with_mobile_reward_manager(reward_manager);
 
                 task_executor.spawn_critical_task(
                     "n42-consensus-orchestrator",

@@ -1,0 +1,26 @@
+[package]
+name = "n42-mobile-sim"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "N42 mobile phone verification simulator"
+
+[[bin]]
+name = "n42-mobile-sim"
+path = "src/main.rs"
+
+[dependencies]
+n42-mobile.workspace = true
+n42-primitives.workspace = true
+n42-chainspec.workspace = true
+
+alloy-primitives.workspace = true
+
+clap = { version = "4", features = ["derive"] }
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+eyre.workspace = true
+hex.workspace = true
+bincode.workspace = true

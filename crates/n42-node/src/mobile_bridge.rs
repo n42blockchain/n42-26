@@ -34,6 +34,8 @@ pub struct MobileVerificationBridge {
     attestation_tx: Option<mpsc::Sender<AttestationEvent>>,
     /// Sends session_id when a new phone connects so CacheSync can be targeted.
     phone_connected_tx: Option<mpsc::Sender<u64>>,
+    /// Sends pubkey hex when a valid attestation is received (for reward tracking).
+    reward_tx: Option<mpsc::UnboundedSender<String>>,
     /// Tracks connected session IDs to prevent count drift from duplicate events.
     connected_sessions: HashSet<u64>,
     /// Per-block invalid receipt counts for divergence detection (FIFO-bounded).
@@ -56,6 +58,7 @@ impl MobileVerificationBridge {
             receipt_aggregator: ReceiptAggregator::new(default_threshold, max_tracked_blocks),
             attestation_tx: None,
             phone_connected_tx: None,
+            reward_tx: None,
             connected_sessions: HashSet::new(),
             invalid_receipt_counts: HashMap::new(),
             invalid_receipt_order: VecDeque::new(),
@@ -72,6 +75,11 @@ impl MobileVerificationBridge {
 
     pub fn with_phone_connected_tx(mut self, tx: mpsc::Sender<u64>) -> Self {
         self.phone_connected_tx = Some(tx);
+        self
+    }
+
+    pub fn with_reward_tx(mut self, tx: mpsc::UnboundedSender<String>) -> Self {
+        self.reward_tx = Some(tx);
         self
     }
 
@@ -159,6 +167,11 @@ impl MobileVerificationBridge {
 
         if receipt.is_valid() {
             counter!("n42_mobile_valid_receipts_total").increment(1);
+            // Notify reward manager of valid attestation
+            if let Some(ref tx) = self.reward_tx {
+                let pubkey_hex = hex::encode(receipt.verifier_pubkey);
+                let _ = tx.send(pubkey_hex);
+            }
         } else {
             counter!("n42_mobile_invalid_receipts_total").increment(1);
             warn!(
@@ -454,5 +467,69 @@ mod tests {
         let block_hash = B256::with_last_byte(0xE2);
         bridge.process_receipt(&make_receipt(block_hash, 60));
         assert!(bridge.receipt_aggregator.get_status(&block_hash).unwrap().is_attested());
+    }
+
+    #[test]
+    fn test_reward_tx_sends_pubkey_on_valid_receipt() {
+        let (_hub_tx, hub_rx) = mpsc::unbounded_channel();
+        let (reward_tx, mut reward_rx) = mpsc::unbounded_channel();
+        let mut bridge = MobileVerificationBridge::new(hub_rx, 1, 100)
+            .with_reward_tx(reward_tx);
+
+        let block_hash = B256::with_last_byte(0xA1);
+        let receipt = make_receipt(block_hash, 100);
+        let expected_pubkey = hex::encode(receipt.verifier_pubkey);
+
+        bridge.process_receipt(&receipt);
+
+        let received = reward_rx.try_recv().expect("reward_tx should receive pubkey");
+        assert_eq!(received, expected_pubkey);
+    }
+
+    #[test]
+    fn test_reward_tx_not_sent_on_invalid_receipt() {
+        let (_hub_tx, hub_rx) = mpsc::unbounded_channel();
+        let (reward_tx, mut reward_rx) = mpsc::unbounded_channel();
+        let mut bridge = MobileVerificationBridge::new(hub_rx, 1, 100)
+            .with_reward_tx(reward_tx);
+
+        let block_hash = B256::with_last_byte(0xA2);
+        let key = BlsSecretKey::random().expect("BLS key gen");
+        // Create invalid receipt: state_root_match = false
+        let invalid_receipt = sign_receipt(block_hash, 200, false, true, 1_000_000, &key);
+
+        bridge.process_receipt(&invalid_receipt);
+
+        // Invalid receipt should NOT trigger reward
+        assert!(reward_rx.try_recv().is_err(), "invalid receipt should not send to reward_tx");
+    }
+
+    #[test]
+    fn test_reward_tx_multiple_valid_receipts() {
+        let (_hub_tx, hub_rx) = mpsc::unbounded_channel();
+        let (reward_tx, mut reward_rx) = mpsc::unbounded_channel();
+        let mut bridge = MobileVerificationBridge::new(hub_rx, 10, 100)
+            .with_reward_tx(reward_tx);
+
+        let block_hash = B256::with_last_byte(0xA3);
+        let receipt1 = make_receipt(block_hash, 300);
+        let receipt2 = make_receipt(block_hash, 300);
+
+        bridge.process_receipt(&receipt1);
+        bridge.process_receipt(&receipt2);
+
+        // Both valid receipts should trigger reward_tx
+        let pk1 = reward_rx.try_recv().expect("first reward");
+        let pk2 = reward_rx.try_recv().expect("second reward");
+        assert_ne!(pk1, pk2, "different BLS keys should produce different pubkey hex");
+    }
+
+    #[test]
+    fn test_no_reward_tx_configured_no_panic() {
+        let (_hub_tx, hub_rx) = mpsc::unbounded_channel();
+        let mut bridge = MobileVerificationBridge::new(hub_rx, 1, 100);
+        // No reward_tx configured — should not panic
+        let block_hash = B256::with_last_byte(0xA4);
+        bridge.process_receipt(&make_receipt(block_hash, 400));
     }
 }

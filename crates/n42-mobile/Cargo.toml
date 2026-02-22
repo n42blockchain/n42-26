@@ -41,3 +41,12 @@ alloy-eips.workspace = true
 # N42 execution & chain spec
 n42-execution.workspace = true
 n42-chainspec.workspace = true
+
+# QUIC client (mobile verifier)
+quinn.workspace = true
+rustls.workspace = true
+eyre.workspace = true
+tokio.workspace = true
+
+# Compression (StarHub sends zstd-compressed packets)
+zstd.workspace = true

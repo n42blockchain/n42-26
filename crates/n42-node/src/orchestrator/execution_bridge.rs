@@ -46,11 +46,29 @@ impl ConsensusOrchestrator {
                 .as_secs()
         });
 
+        // Inject mobile verification rewards as EIP-4895 withdrawals.
+        let mut withdrawals = vec![];
+        if let Some(ref reward_mgr) = self.mobile_reward_manager {
+            if let Ok(mut mgr) = reward_mgr.lock() {
+                // The next block being built is committed_block_count + 1.
+                let next_block_number = self.committed_block_count + 1;
+                mgr.check_epoch_boundary(next_block_number);
+                withdrawals = mgr.take_pending_rewards(next_block_number);
+                if !withdrawals.is_empty() {
+                    info!(
+                        target: "n42::reward",
+                        count = withdrawals.len(),
+                        "injecting mobile rewards as withdrawals"
+                    );
+                }
+            }
+        }
+
         let attrs = PayloadAttributes {
             timestamp,
             prev_randao: B256::ZERO,
             suggested_fee_recipient: self.fee_recipient,
-            withdrawals: Some(vec![]),
+            withdrawals: Some(withdrawals),
             parent_beacon_block_root: Some(B256::ZERO),
         };
 

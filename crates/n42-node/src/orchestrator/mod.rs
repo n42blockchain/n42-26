@@ -3,6 +3,7 @@ mod execution_bridge;
 mod state_mgmt;
 
 use crate::consensus_state::SharedConsensusState;
+use crate::mobile_reward::MobileRewardManager;
 use alloy_primitives::{Address, B256};
 use n42_consensus::{ConsensusEngine, EngineOutput, ValidatorSet};
 use n42_network::{NetworkEvent, NetworkHandle, PeerId};
@@ -13,7 +14,7 @@ use reth_payload_builder::PayloadBuilderHandle;
 use reth_transaction_pool::blobstore::DiskFileBlobStore;
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
@@ -114,6 +115,10 @@ pub struct ConsensusOrchestrator {
     leader_payload_rx: mpsc::UnboundedReceiver<(B256, Vec<u8>)>,
     leader_payload_tx: mpsc::UnboundedSender<(B256, Vec<u8>)>,
     blob_store: Option<DiskFileBlobStore>,
+    /// Mobile verification reward manager for EIP-4895 withdrawal-based rewards.
+    mobile_reward_manager: Option<Arc<Mutex<MobileRewardManager>>>,
+    /// Tracks the number of blocks committed by consensus for accurate epoch boundary detection.
+    committed_block_count: u64,
 }
 
 impl ConsensusOrchestrator {
@@ -159,6 +164,8 @@ impl ConsensusOrchestrator {
             leader_payload_rx,
             leader_payload_tx,
             blob_store: None,
+            mobile_reward_manager: None,
+            committed_block_count: 0,
         }
     }
 
@@ -219,6 +226,8 @@ impl ConsensusOrchestrator {
             leader_payload_rx,
             leader_payload_tx,
             blob_store: None,
+            mobile_reward_manager: None,
+            committed_block_count: 0,
         }
     }
 
@@ -244,6 +253,12 @@ impl ConsensusOrchestrator {
     /// When set, sends `(block_hash, consensus_view)` after each BlockCommitted event.
     pub fn with_mobile_packet_tx(mut self, tx: mpsc::Sender<(B256, u64)>) -> Self {
         self.mobile_packet_tx = Some(tx);
+        self
+    }
+
+    /// Configures the mobile reward manager for EIP-4895 withdrawal-based rewards.
+    pub fn with_mobile_reward_manager(mut self, mgr: Arc<Mutex<MobileRewardManager>>) -> Self {
+        self.mobile_reward_manager = Some(mgr);
         self
     }
 
@@ -661,6 +676,8 @@ mod tests {
             leader_payload_rx,
             leader_payload_tx,
             blob_store: None,
+            mobile_reward_manager: None,
+            committed_block_count: 0,
         };
 
         assert!(state.load_committed_qc().is_none(), "should start with no QC");
@@ -716,6 +733,8 @@ mod tests {
             leader_payload_rx,
             leader_payload_tx,
             blob_store: None,
+            mobile_reward_manager: None,
+            committed_block_count: 0,
         };
 
         let test_hash = B256::repeat_byte(0xFF);
