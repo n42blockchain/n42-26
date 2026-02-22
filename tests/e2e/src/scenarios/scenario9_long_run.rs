@@ -1,4 +1,4 @@
-use alloy_primitives::{keccak256, U256};
+use alloy_primitives::U256;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
@@ -7,35 +7,19 @@ use crate::erc20::Erc20Manager;
 use crate::genesis::{self, TEST_CHAIN_ID};
 use crate::node_manager::{NodeConfig, NodeProcess};
 use crate::rpc_client::RpcClient;
+use crate::test_helpers::{compute_peer_id, cleanup_nodes, env_u64, get_height_safe, wait_for_sync};
 use crate::tx_engine::TxEngine;
-
-/// Computes the deterministic libp2p PeerId for a validator at the given index.
-fn compute_peer_id(validator_index: usize) -> libp2p::PeerId {
-    let seed = keccak256(format!("n42-p2p-key-{}", validator_index).as_bytes());
-    let mut seed_bytes: [u8; 32] = seed.0;
-    let secret = libp2p::identity::ed25519::SecretKey::try_from_bytes(&mut seed_bytes)
-        .expect("valid ed25519 seed");
-    let kp = libp2p::identity::ed25519::Keypair::from(secret);
-    libp2p::identity::Keypair::from(kp).public().to_peer_id()
-}
 
 const NODE_COUNT: usize = 3;
 const PORT_OFFSET_BASE: u16 = 500;
 const PROGRESS_INTERVAL_SECS: u64 = 30;
 
-/// Reads configuration from environment variables with defaults.
 struct LongRunConfig {
-    /// Total test duration in seconds.
     duration_secs: u64,
-    /// Block production interval in milliseconds.
     block_interval_ms: u64,
-    /// When to crash a node (percentage of total duration, 0-100).
     crash_at_percent: u64,
-    /// How long the crashed node stays down in seconds.
     downtime_secs: u64,
-    /// Pacemaker base timeout in milliseconds.
     base_timeout_ms: u64,
-    /// Pacemaker max timeout in milliseconds.
     max_timeout_ms: u64,
 }
 
@@ -54,13 +38,6 @@ impl LongRunConfig {
     fn crash_at_secs(&self) -> u64 {
         self.duration_secs * self.crash_at_percent / 100
     }
-}
-
-fn env_u64(key: &str, default: u64) -> u64 {
-    std::env::var(key)
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(default)
 }
 
 /// Scenario 9: Long-Run 3-Node Stress Test.
@@ -93,7 +70,7 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
     let tmp_dir = tempfile::tempdir()?;
     let genesis_path = genesis::write_genesis_file(tmp_dir.path(), &accounts);
 
-    let peer_ids: Vec<_> = (0..NODE_COUNT).map(|i| compute_peer_id(i)).collect();
+    let peer_ids: Vec<_> = (0..NODE_COUNT).map(compute_peer_id).collect();
 
     // Start 3 nodes.
     let mut nodes: Vec<Option<NodeProcess>> = Vec::with_capacity(NODE_COUNT);
@@ -451,13 +428,10 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
             let mut hashes = Vec::new();
             for (i, node_opt) in nodes.iter().enumerate() {
                 if let Some(node) = node_opt {
-                    match node.rpc.get_block_by_number(sample_h).await {
-                        Ok(block) => {
-                            if let Some(hash) = block.get("hash").and_then(|h| h.as_str()) {
-                                hashes.push((i, hash.to_string()));
-                            }
+                    if let Ok(block) = node.rpc.get_block_by_number(sample_h).await {
+                        if let Some(hash) = block.get("hash").and_then(|h| h.as_str()) {
+                            hashes.push((i, hash.to_string()));
                         }
-                        Err(_) => {}
                     }
                 }
             }
@@ -666,36 +640,3 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
     Ok(())
 }
 
-/// Safely get block height, returning 0 on error.
-async fn get_height_safe(rpc: &RpcClient) -> u64 {
-    rpc.block_number().await.unwrap_or(0)
-}
-
-/// Wait for a node to sync to at least the target height.
-async fn wait_for_sync(rpc: &RpcClient, target: u64, timeout: Duration) -> eyre::Result<()> {
-    let start = Instant::now();
-    let poll = Duration::from_millis(500);
-
-    loop {
-        if start.elapsed() > timeout {
-            let current = get_height_safe(rpc).await;
-            return Err(eyre::eyre!(
-                "sync timeout: current={current}, target={target}"
-            ));
-        }
-        let current = get_height_safe(rpc).await;
-        if current >= target.saturating_sub(1) {
-            return Ok(());
-        }
-        tokio::time::sleep(poll).await;
-    }
-}
-
-/// Stop all running nodes.
-fn cleanup_nodes(nodes: &mut Vec<Option<NodeProcess>>) {
-    for node_opt in nodes.drain(..) {
-        if let Some(node) = node_opt {
-            let _ = node.stop();
-        }
-    }
-}

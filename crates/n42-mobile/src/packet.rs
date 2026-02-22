@@ -1,92 +1,57 @@
 use alloy_primitives::{Address, Bytes, B256, U256};
 use serde::{Deserialize, Serialize};
 
-/// A single account's state included in the verification witness.
+/// A single account's state in the V1 verification witness.
 ///
-/// Contains all data a mobile verifier needs to construct a temporary
-/// in-memory state DB for this account. Storage only includes slots
-/// that are actually accessed during block execution.
+/// Storage contains only the slots accessed during block execution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WitnessAccount {
-    /// Account address.
     pub address: Address,
-    /// Account nonce.
     pub nonce: u64,
-    /// Account balance.
     pub balance: U256,
-    /// Hash of the account's contract code (or keccak256(&[]) for EOAs).
+    /// keccak256(bytecode), or keccak256(&[]) for EOAs.
     pub code_hash: B256,
     /// Storage slots accessed during execution: (slot_key, value).
     pub storage: Vec<(U256, U256)>,
 }
 
-/// The complete verification packet sent from an IDC node to mobile devices.
+/// V1 verification packet sent from an IDC node to mobile devices.
 ///
-/// Contains everything a phone needs to independently re-execute a block
-/// and verify the resulting state root. The packet is designed to be
-/// self-contained — no additional chain state lookups are required.
-///
-/// ## Data flow
-///
-/// 1. IDC executes block, captures `ExecutionWitness` (all state accessed)
-/// 2. IDC compacts witness by removing bytecodes the phone has cached
-/// 3. IDC constructs `VerificationPacket` from header + txs + compact witness
-/// 4. IDC pushes packet to connected phones via QUIC
-/// 5. Phone reconstructs temporary state DB → re-executes txs → verifies roots
+/// Contains everything a phone needs to re-execute a block and verify roots.
+/// Contract bytecodes the phone already has cached are excluded from
+/// `uncached_bytecodes` to reduce packet size.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VerificationPacket {
-    /// Hash of the block being verified.
     pub block_hash: B256,
-    /// Block number.
     pub block_number: u64,
-    /// Parent block hash.
     pub parent_hash: B256,
-    /// Expected post-execution state root (phone verifies this).
     pub state_root: B256,
-    /// Expected transactions root.
     pub transactions_root: B256,
-    /// Expected receipts root.
     pub receipts_root: B256,
-    /// Block timestamp.
     pub timestamp: u64,
-    /// Block gas limit.
     pub gas_limit: u64,
-    /// Beneficiary address (coinbase).
+    /// Block coinbase address.
     pub beneficiary: Address,
-    /// Full RLP-encoded block header.
-    /// Contains all fields needed for EVM execution (base_fee, prevrandao, etc.)
-    /// that aren't covered by the individual convenience fields above.
+    /// Full RLP-encoded block header (contains base_fee, prevrandao, etc.).
     pub header_rlp: Bytes,
-    /// RLP-encoded transactions for re-execution.
     pub transactions: Vec<Bytes>,
-    /// Account states accessed during execution (the witness).
     pub witness_accounts: Vec<WitnessAccount>,
-    /// Contract bytecodes NOT in the phone's cache: (code_hash, bytecode).
-    /// Phone combines these with its local cache to get all needed code.
+    /// Contract bytecodes not in the phone's cache: (code_hash, bytecode).
     pub uncached_bytecodes: Vec<(B256, Bytes)>,
     /// Lowest block number referenced by BLOCKHASH opcode.
-    /// Phone may need ancestor block hashes for verification.
     pub lowest_block_number: Option<u64>,
-    /// Ancestor block hashes needed for BLOCKHASH opcode: (number, hash).
+    /// Ancestor block hashes for BLOCKHASH opcode: (number, hash).
     pub block_hashes: Vec<(u64, B256)>,
 }
 
 impl VerificationPacket {
     /// Returns the approximate serialized size in bytes.
     pub fn estimated_size(&self) -> usize {
-        // Header fields: ~200 bytes + header_rlp
         let header_size = 200 + self.header_rlp.len();
-        // Transactions: sum of encoded sizes
         let tx_size: usize = self.transactions.iter().map(|t| t.len()).sum();
-        // Witness accounts: ~100 bytes per account + storage
-        let witness_size: usize = self
-            .witness_accounts
-            .iter()
-            .map(|a| 100 + a.storage.len() * 64)
-            .sum();
-        // Uncached bytecodes
+        let witness_size: usize =
+            self.witness_accounts.iter().map(|a| 100 + a.storage.len() * 64).sum();
         let code_size: usize = self.uncached_bytecodes.iter().map(|(_, c)| 32 + c.len()).sum();
-
         header_size + tx_size + witness_size + code_size
     }
 }
@@ -94,56 +59,46 @@ impl VerificationPacket {
 /// Errors from packet encoding/decoding.
 #[derive(Debug, thiserror::Error)]
 pub enum PacketError {
-    /// Failed to serialize the verification packet.
     #[error("packet serialization failed: {0}")]
     Encode(#[from] bincode::Error),
-    /// Failed to deserialize the verification packet.
     #[error("packet deserialization failed: {0}")]
     Decode(bincode::Error),
 }
 
-/// Encodes a verification packet to bytes for transmission.
+/// Encodes a V1 verification packet to bytes for transmission.
 pub fn encode_packet(packet: &VerificationPacket) -> Result<Vec<u8>, PacketError> {
     bincode::serialize(packet).map_err(PacketError::Encode)
 }
 
-/// Decodes a verification packet from bytes.
+/// Decodes a V1 verification packet from bytes.
 pub fn decode_packet(data: &[u8]) -> Result<VerificationPacket, PacketError> {
     bincode::deserialize(data).map_err(PacketError::Decode)
 }
 
-// ─── StreamPacket V1 ────────────────────────────────────────────────────────
+// ─── StreamPacket (V2) ──────────────────────────────────────────────────────
 
-/// V2 verification packet using ordered value streams instead of keyed witness.
+/// V2 verification packet using an ordered state read log instead of a keyed witness.
 ///
-/// The core insight: same block + same txs → revm Database calls happen in a
-/// 100% deterministic order. So we drop address/slot keys and send only values
-/// in call order. The phone replays entries by cursor on raw bytes via `StreamReplayDB`.
+/// Since same block + same txs → revm Database calls happen in a deterministic order,
+/// address/slot keys are dropped and only values are sent in call order.
+/// The phone replays entries by cursor on raw bytes via `StreamReplayDB`.
 ///
-/// ## Format (encoded)
-/// ```text
-/// wire_header(4B) + block_metadata + read_log_len(4B) + read_log_data + bytecodes
-/// ```
+/// Wire format: `wire_header(4B) + block_hash(32B) + header_rlp + txs + read_log + bytecodes`
 #[derive(Debug, Clone)]
 pub struct StreamPacket {
-    /// Hash of the block being verified.
     pub block_hash: B256,
-    /// Full RLP-encoded block header.
     pub header_rlp: Bytes,
-    /// EIP-2718 encoded transactions.
     pub transactions: Vec<Bytes>,
     /// Pre-encoded read log bytes (output of `encode_read_log`).
-    /// StreamReplayDB parses directly from these bytes via cursor — no intermediate allocation.
     pub read_log_data: Vec<u8>,
-    /// Contract bytecodes NOT in the phone's cache: (code_hash, bytecode).
+    /// Contract bytecodes not in the phone's cache: (code_hash, bytecode).
     pub bytecodes: Vec<(B256, Bytes)>,
 }
 
 impl StreamPacket {
     /// Extracts block number and receipts root from the embedded header RLP.
     ///
-    /// Returns `None` if the header cannot be decoded. This is a convenience
-    /// method so callers (e.g. FFI) don't need direct alloy-consensus deps.
+    /// Returns `None` if the header cannot be decoded.
     pub fn header_info(&self) -> Option<(u64, B256)> {
         use alloy_consensus::BlockHeader;
         use alloy_rlp::Decodable;
@@ -153,9 +108,9 @@ impl StreamPacket {
 
     /// Returns the approximate serialized size in bytes.
     pub fn estimated_size(&self) -> usize {
-        let header_size = 4 + 32 + 4 + self.header_rlp.len(); // wire + hash + rlp_len + rlp
+        let header_size = 4 + 32 + 4 + self.header_rlp.len();
         let tx_size: usize = self.transactions.iter().map(|t| 4 + t.len()).sum();
-        let log_size = 4 + self.read_log_data.len(); // length prefix + raw bytes
+        let log_size = 4 + self.read_log_data.len();
         let code_size: usize = self.bytecodes.iter().map(|(_, c)| 32 + 4 + c.len()).sum();
         header_size + tx_size + log_size + code_size
     }
@@ -168,28 +123,21 @@ pub fn encode_stream_packet(packet: &StreamPacket) -> Vec<u8> {
     let flags = if packet.bytecodes.is_empty() { 0x00 } else { FLAG_HAS_BYTECODES };
     let mut buf = Vec::with_capacity(packet.estimated_size());
 
-    // Wire header
     wire::encode_header(&mut buf, wire::VERSION_1, flags);
+    buf.extend_from_slice(packet.block_hash.as_slice());
 
-    // Block metadata
-    buf.extend_from_slice(packet.block_hash.as_slice()); // 32B
-
-    // Header RLP
     buf.extend_from_slice(&(packet.header_rlp.len() as u32).to_le_bytes());
     buf.extend_from_slice(&packet.header_rlp);
 
-    // Transactions
     buf.extend_from_slice(&(packet.transactions.len() as u32).to_le_bytes());
     for tx in &packet.transactions {
         buf.extend_from_slice(&(tx.len() as u32).to_le_bytes());
         buf.extend_from_slice(tx);
     }
 
-    // State read log — length-prefixed raw bytes (already encoded by caller)
     buf.extend_from_slice(&(packet.read_log_data.len() as u32).to_le_bytes());
     buf.extend_from_slice(&packet.read_log_data);
 
-    // Bytecodes section
     buf.extend_from_slice(&(packet.bytecodes.len() as u32).to_le_bytes());
     for (hash, code) in &packet.bytecodes {
         buf.extend_from_slice(hash.as_slice());
@@ -200,10 +148,9 @@ pub fn encode_stream_packet(packet: &StreamPacket) -> Vec<u8> {
     buf
 }
 
-/// Maximum allowed transaction count per block to prevent OOM from corrupted data.
-/// Ethereum mainnet has ~1500 txs/block max; 100K provides ample headroom.
+/// Maximum transaction count to prevent OOM from corrupted data.
 const MAX_TX_COUNT: usize = 100_000;
-/// Maximum allowed bytecode count per packet to prevent OOM from corrupted data.
+/// Maximum bytecode count to prevent OOM from corrupted data.
 const MAX_BYTECODE_COUNT: usize = 10_000;
 
 /// Decodes a `StreamPacket` from compact binary format.
@@ -213,7 +160,6 @@ pub fn decode_stream_packet(data: &[u8]) -> Result<StreamPacket, crate::wire::Wi
     let (_header, payload) = wire::decode_header(data)?;
     let mut pos: usize = 0;
 
-    // Helper closures
     let ensure = |pos: usize, need: usize| -> Result<(), WireError> {
         if pos + need > payload.len() {
             Err(WireError::LengthOverflow {
@@ -226,12 +172,10 @@ pub fn decode_stream_packet(data: &[u8]) -> Result<StreamPacket, crate::wire::Wi
         }
     };
 
-    // Block hash
     ensure(pos, 32)?;
     let block_hash = B256::from_slice(&payload[pos..pos + 32]);
     pos += 32;
 
-    // Header RLP
     ensure(pos, 4)?;
     let header_rlp_len = u32::from_le_bytes(payload[pos..pos + 4].try_into().unwrap()) as usize;
     pos += 4;
@@ -239,16 +183,11 @@ pub fn decode_stream_packet(data: &[u8]) -> Result<StreamPacket, crate::wire::Wi
     let header_rlp = Bytes::copy_from_slice(&payload[pos..pos + header_rlp_len]);
     pos += header_rlp_len;
 
-    // Transactions
     ensure(pos, 4)?;
     let tx_count = u32::from_le_bytes(payload[pos..pos + 4].try_into().unwrap()) as usize;
     pos += 4;
     if tx_count > MAX_TX_COUNT {
-        return Err(WireError::LengthOverflow {
-            offset: pos - 4,
-            need: tx_count,
-            remaining: MAX_TX_COUNT,
-        });
+        return Err(WireError::LengthOverflow { offset: pos - 4, need: tx_count, remaining: MAX_TX_COUNT });
     }
     let mut transactions = Vec::with_capacity(tx_count);
     for _ in 0..tx_count {
@@ -260,7 +199,6 @@ pub fn decode_stream_packet(data: &[u8]) -> Result<StreamPacket, crate::wire::Wi
         pos += tx_len;
     }
 
-    // State read log — length-prefixed raw bytes
     ensure(pos, 4)?;
     let read_log_len = u32::from_le_bytes(payload[pos..pos + 4].try_into().unwrap()) as usize;
     pos += 4;
@@ -268,20 +206,15 @@ pub fn decode_stream_packet(data: &[u8]) -> Result<StreamPacket, crate::wire::Wi
     let read_log_data = payload[pos..pos + read_log_len].to_vec();
     pos += read_log_len;
 
-    // Bytecodes section
     ensure(pos, 4)?;
     let code_count = u32::from_le_bytes(payload[pos..pos + 4].try_into().unwrap()) as usize;
     pos += 4;
     if code_count > MAX_BYTECODE_COUNT {
-        return Err(WireError::LengthOverflow {
-            offset: pos - 4,
-            need: code_count,
-            remaining: MAX_BYTECODE_COUNT,
-        });
+        return Err(WireError::LengthOverflow { offset: pos - 4, need: code_count, remaining: MAX_BYTECODE_COUNT });
     }
     let mut bytecodes = Vec::with_capacity(code_count);
     for _ in 0..code_count {
-        ensure(pos, 36)?; // 32 hash + 4 len
+        ensure(pos, 36)?;
         let hash = B256::from_slice(&payload[pos..pos + 32]);
         pos += 32;
         let code_len = u32::from_le_bytes(payload[pos..pos + 4].try_into().unwrap()) as usize;
@@ -292,13 +225,7 @@ pub fn decode_stream_packet(data: &[u8]) -> Result<StreamPacket, crate::wire::Wi
         bytecodes.push((hash, code));
     }
 
-    Ok(StreamPacket {
-        block_hash,
-        header_rlp,
-        transactions,
-        read_log_data,
-        bytecodes,
-    })
+    Ok(StreamPacket { block_hash, header_rlp, transactions, read_log_data, bytecodes })
 }
 
 #[cfg(test)]
@@ -306,24 +233,14 @@ mod tests {
     use super::*;
     use alloy_primitives::{Address, Bytes, B256, U256, KECCAK256_EMPTY};
 
-    /// Helper: creates a minimal VerificationPacket with known contents.
     fn make_packet() -> VerificationPacket {
-        let tx1 = Bytes::from(vec![0xAA; 100]);
-        let tx2 = Bytes::from(vec![0xBB; 200]);
-
         let account = WitnessAccount {
             address: Address::ZERO,
             nonce: 5,
             balance: U256::from(1_000_000u64),
             code_hash: B256::from([0xCC; 32]),
-            storage: vec![
-                (U256::from(0), U256::from(42)),
-                (U256::from(1), U256::from(99)),
-            ],
+            storage: vec![(U256::from(0), U256::from(42)), (U256::from(1), U256::from(99))],
         };
-
-        let uncached_code = (B256::from([0xDD; 32]), Bytes::from(vec![0xEE; 500]));
-
         VerificationPacket {
             block_hash: B256::from([1u8; 32]),
             block_number: 12345,
@@ -335,9 +252,9 @@ mod tests {
             gas_limit: 30_000_000,
             beneficiary: Address::from([0xFF; 20]),
             header_rlp: Bytes::from(vec![0xF8; 508]),
-            transactions: vec![tx1, tx2],
+            transactions: vec![Bytes::from(vec![0xAA; 100]), Bytes::from(vec![0xBB; 200])],
             witness_accounts: vec![account],
-            uncached_bytecodes: vec![uncached_code],
+            uncached_bytecodes: vec![(B256::from([0xDD; 32]), Bytes::from(vec![0xEE; 500]))],
             lowest_block_number: Some(12300),
             block_hashes: vec![(12300, B256::from([6u8; 32]))],
         }
@@ -346,15 +263,10 @@ mod tests {
     #[test]
     fn test_packet_encode_decode_roundtrip() {
         let packet = make_packet();
-
-        // Encode.
         let encoded = encode_packet(&packet).expect("encoding should succeed");
-        assert!(!encoded.is_empty(), "encoded bytes must not be empty");
-
-        // Decode.
+        assert!(!encoded.is_empty());
         let decoded = decode_packet(&encoded).expect("decoding should succeed");
 
-        // Verify all fields match.
         assert_eq!(decoded.block_hash, packet.block_hash);
         assert_eq!(decoded.block_number, packet.block_number);
         assert_eq!(decoded.parent_hash, packet.parent_hash);
@@ -384,21 +296,11 @@ mod tests {
     fn test_estimated_size() {
         let packet = make_packet();
         let size = packet.estimated_size();
-
-        // The packet contains:
-        // - header: 200 bytes + 508 bytes header_rlp = 708 bytes
-        // - transactions: 100 + 200 = 300 bytes
-        // - witness: 1 account with 2 storage slots = 100 + 2*64 = 228 bytes
-        // - uncached bytecodes: 32 + 500 = 532 bytes
-        // Total expected: 708 + 300 + 228 + 532 = 1768
-        let expected = 708 + 300 + 228 + 532;
-        assert_eq!(size, expected, "estimated_size should match manual calculation");
-
-        // The estimated size must be strictly positive for any non-empty packet.
+        // header: 200 + 508 = 708, txs: 300, witness: 100 + 2*64 = 228, codes: 32 + 500 = 532
+        assert_eq!(size, 708 + 300 + 228 + 532);
         assert!(size > 0);
 
-        // An empty packet should still have the header overhead.
-        let empty_packet = VerificationPacket {
+        let empty = VerificationPacket {
             block_hash: B256::ZERO,
             block_number: 0,
             parent_hash: B256::ZERO,
@@ -415,25 +317,19 @@ mod tests {
             lowest_block_number: None,
             block_hashes: vec![],
         };
-        assert_eq!(empty_packet.estimated_size(), 200, "empty packet should only have header overhead");
+        assert_eq!(empty.estimated_size(), 200);
     }
 
     #[test]
     fn test_decode_packet_invalid_data() {
-        let garbage = vec![0xDE, 0xAD, 0xBE, 0xEF];
-        let result = decode_packet(&garbage);
-        assert!(result.is_err(), "garbage data should fail to decode");
-        let err = result.unwrap_err();
-        assert!(matches!(err, PacketError::Decode(_)), "should be a Decode error variant");
-        let msg = format!("{}", err);
-        assert!(msg.contains("deserialization"), "error message should mention deserialization");
+        let result = decode_packet(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        assert!(matches!(result, Err(PacketError::Decode(_))));
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("deserialization"));
     }
-
-    // ── StreamPacket tests ──
 
     fn make_stream_packet() -> StreamPacket {
         use n42_execution::read_log::{encode_read_log, ReadLogEntry};
-
         let read_log = vec![
             ReadLogEntry::Account {
                 nonce: 5,
@@ -443,24 +339,14 @@ mod tests {
             ReadLogEntry::Storage(U256::from(42u64)),
             ReadLogEntry::AccountNotFound,
             ReadLogEntry::BlockHash(B256::from([0xDD; 32])),
-            ReadLogEntry::Account {
-                nonce: 0,
-                balance: U256::ZERO,
-                code_hash: KECCAK256_EMPTY,
-            },
+            ReadLogEntry::Account { nonce: 0, balance: U256::ZERO, code_hash: KECCAK256_EMPTY },
         ];
-
         StreamPacket {
             block_hash: B256::from([1u8; 32]),
             header_rlp: Bytes::from(vec![0xF8; 508]),
-            transactions: vec![
-                Bytes::from(vec![0xAA; 100]),
-                Bytes::from(vec![0xBB; 200]),
-            ],
+            transactions: vec![Bytes::from(vec![0xAA; 100]), Bytes::from(vec![0xBB; 200])],
             read_log_data: encode_read_log(&read_log),
-            bytecodes: vec![
-                (B256::from([0xEE; 32]), Bytes::from(vec![0x60, 0x00, 0xf3])),
-            ],
+            bytecodes: vec![(B256::from([0xEE; 32]), Bytes::from(vec![0x60, 0x00, 0xf3]))],
         }
     }
 
@@ -484,7 +370,6 @@ mod tests {
     #[test]
     fn test_stream_packet_empty() {
         use n42_execution::read_log::encode_read_log;
-
         let packet = StreamPacket {
             block_hash: B256::ZERO,
             header_rlp: Bytes::new(),
@@ -494,7 +379,6 @@ mod tests {
         };
         let encoded = encode_stream_packet(&packet);
         let decoded = decode_stream_packet(&encoded).expect("should decode empty packet");
-
         assert_eq!(decoded.block_hash, B256::ZERO);
         assert!(decoded.header_rlp.is_empty());
         assert!(decoded.transactions.is_empty());
@@ -504,61 +388,48 @@ mod tests {
 
     #[test]
     fn test_stream_packet_invalid_magic() {
-        let result = decode_stream_packet(&[0xFF, 0xFF, 0x01, 0x00]);
-        assert!(result.is_err());
+        assert!(decode_stream_packet(&[0xFF, 0xFF, 0x01, 0x00]).is_err());
     }
 
     #[test]
     fn test_stream_packet_wire_header() {
         let packet = make_stream_packet();
         let encoded = encode_stream_packet(&packet);
-        // Check wire header
-        assert_eq!(encoded[0], 0x4E); // 'N'
-        assert_eq!(encoded[1], 0x32); // '2'
-        assert_eq!(encoded[2], 0x01); // VERSION_1
-        // Has bytecodes → FLAG_HAS_BYTECODES set
-        assert_ne!(encoded[3] & 0x01, 0);
+        assert_eq!(encoded[0], 0x4E);
+        assert_eq!(encoded[1], 0x32);
+        assert_eq!(encoded[2], 0x01);
+        assert_ne!(encoded[3] & 0x01, 0); // FLAG_HAS_BYTECODES set
     }
 
     #[test]
     fn test_stream_packet_no_bytecodes_flag() {
         use n42_execution::read_log::encode_read_log;
-
         let packet = StreamPacket {
             block_hash: B256::ZERO,
             header_rlp: Bytes::new(),
             transactions: vec![],
             read_log_data: encode_read_log(&[]),
-            bytecodes: vec![],  // empty
+            bytecodes: vec![],
         };
         let encoded = encode_stream_packet(&packet);
-        assert_eq!(encoded[3], 0x00); // no FLAG_HAS_BYTECODES
+        assert_eq!(encoded[3], 0x00);
     }
 
-    /// Quantitative comparison: V1 (VerificationPacket) vs V2 (StreamPacket) encoded sizes.
-    ///
-    /// Uses equivalent data to measure savings from dropping address/slot keys
-    /// and using conditional field encoding.
     #[test]
     fn test_v1_v2_size_comparison() {
         use n42_execution::read_log::{encode_read_log, ReadLogEntry};
 
-        // Simulate 10 accounts, mix of EOAs and contracts, with storage slots.
         let mut witness_accounts = Vec::new();
         let mut read_log_entries = Vec::new();
 
         for i in 0u8..10 {
             let is_contract = i % 3 == 0;
-            let code_hash = if is_contract {
-                B256::from([0xC0 + i; 32])
-            } else {
-                KECCAK256_EMPTY
-            };
+            let code_hash =
+                if is_contract { B256::from([0xC0 + i; 32]) } else { KECCAK256_EMPTY };
             let nonce = if i % 2 == 0 { i as u64 * 10 } else { 0 };
             let balance = if i > 3 { U256::from(i as u64 * 1_000_000) } else { U256::ZERO };
             let num_slots = (i % 5) as usize;
 
-            // V1 witness account
             let storage: Vec<(U256, U256)> = (0..num_slots)
                 .map(|s| (U256::from(s), U256::from(s * 100 + i as usize)))
                 .collect();
@@ -570,24 +441,19 @@ mod tests {
                 storage,
             });
 
-            // V2 read log entries (same data, no keys)
             read_log_entries.push(ReadLogEntry::Account { nonce, balance, code_hash });
             for s in 0..num_slots {
                 read_log_entries.push(ReadLogEntry::Storage(U256::from(s * 100 + i as usize)));
             }
         }
-
-        // Add 3 block hash lookups
         for i in 0u8..3 {
             read_log_entries.push(ReadLogEntry::BlockHash(B256::from([0xBB + i; 32])));
         }
 
-        // Shared data
         let header_rlp = Bytes::from(vec![0xF8; 508]);
         let txs = vec![Bytes::from(vec![0xAA; 200]); 5];
         let uncached_code = (B256::from([0xDD; 32]), Bytes::from(vec![0x60; 300]));
 
-        // V1 packet
         let v1 = VerificationPacket {
             block_hash: B256::from([1u8; 32]),
             block_number: 12345,
@@ -609,8 +475,6 @@ mod tests {
                 (12302, B256::from([0xBD; 32])),
             ],
         };
-
-        // V2 packet
         let v2 = StreamPacket {
             block_hash: B256::from([1u8; 32]),
             header_rlp,
@@ -622,21 +486,11 @@ mod tests {
         let v1_encoded = encode_packet(&v1).expect("V1 encode");
         let v2_encoded = encode_stream_packet(&v2);
 
-        // Print detailed comparison for `cargo test -- --nocapture`
-        eprintln!("=== V1 vs V2 Size Comparison ===");
-        eprintln!("V1 (VerificationPacket) raw:  {} bytes", v1_encoded.len());
-        eprintln!("V2 (StreamPacket)       raw:  {} bytes", v2_encoded.len());
-        eprintln!("V2 read_log_data only:        {} bytes", v2.read_log_data.len());
-        eprintln!("Entries in read log:           {}", read_log_entries.len());
-        let savings = v1_encoded.len() as f64 - v2_encoded.len() as f64;
-        let pct = savings / v1_encoded.len() as f64 * 100.0;
-        eprintln!("Raw savings:                  {:.0} bytes ({:.1}%)", savings, pct);
-
-        // V2 must be smaller — no address keys, no slot keys, no redundant header fields
         assert!(
             v2_encoded.len() < v1_encoded.len(),
             "V2 ({} bytes) should be smaller than V1 ({} bytes)",
-            v2_encoded.len(), v1_encoded.len()
+            v2_encoded.len(),
+            v1_encoded.len()
         );
     }
 }

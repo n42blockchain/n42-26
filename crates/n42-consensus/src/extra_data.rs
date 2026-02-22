@@ -20,21 +20,13 @@ const QC_MAGIC: &[u8; 4] = b"N42Q";
 pub fn extract_qc_from_extra_data(
     extra_data: &Bytes,
 ) -> Result<Option<QuorumCertificate>, ConsensusError> {
-    // No extra_data or too short for magic prefix
-    if extra_data.len() < QC_MAGIC.len() {
+    if extra_data.len() < QC_MAGIC.len() || &extra_data[..4] != QC_MAGIC {
         return Ok(None);
     }
 
-    // Check magic prefix
-    if &extra_data[..4] != QC_MAGIC {
-        return Ok(None);
-    }
-
-    // Decode the QC from the remaining bytes
-    let qc_bytes = &extra_data[4..];
-    bincode::deserialize(qc_bytes).map(Some).map_err(|e| {
-        ConsensusError::Other(format!("malformed QC in extra_data: {e}"))
-    })
+    bincode::deserialize(&extra_data[4..])
+        .map(Some)
+        .map_err(|e| ConsensusError::Other(format!("malformed QC in extra_data: {e}")))
 }
 
 /// Encodes a QuorumCertificate into bytes suitable for header extra_data.
@@ -75,61 +67,50 @@ mod tests {
     fn test_encode_decode_roundtrip() {
         let qc = make_test_qc();
 
-        // Encode to extra_data bytes
         let encoded = encode_qc_to_extra_data(&qc).expect("encoding should succeed");
+        assert_eq!(&encoded[..4], b"N42Q");
 
-        // The first 4 bytes must be the magic prefix
-        assert_eq!(&encoded[..4], b"N42Q", "should start with N42Q magic");
-
-        // Decode back
         let decoded = extract_qc_from_extra_data(&encoded)
             .expect("decoding should succeed")
             .expect("should contain a QC");
 
-        // Verify all fields match
-        assert_eq!(decoded.view, qc.view, "view should match");
-        assert_eq!(decoded.block_hash, qc.block_hash, "block_hash should match");
-        assert_eq!(
-            decoded.aggregate_signature, qc.aggregate_signature,
-            "aggregate_signature should match"
-        );
-        assert_eq!(decoded.signers, qc.signers, "signers bitmap should match");
+        assert_eq!(decoded.view, qc.view);
+        assert_eq!(decoded.block_hash, qc.block_hash);
+        assert_eq!(decoded.aggregate_signature, qc.aggregate_signature);
+        assert_eq!(decoded.signers, qc.signers);
     }
 
     #[test]
     fn test_extract_no_magic() {
-        // Bytes that don't start with "N42Q"
         let data = Bytes::from_static(b"ABCDEFGHIJKLMNOP");
         let result = extract_qc_from_extra_data(&data);
-        assert!(result.is_ok(), "should not error on non-magic data");
-        assert!(result.unwrap().is_none(), "should return None when no magic prefix");
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
     }
 
     #[test]
     fn test_extract_empty() {
         let data = Bytes::new();
         let result = extract_qc_from_extra_data(&data);
-        assert!(result.is_ok(), "should not error on empty data");
-        assert!(result.unwrap().is_none(), "should return None for empty bytes");
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
     }
 
     #[test]
     fn test_extract_short() {
-        // Only 3 bytes - shorter than the 4-byte magic prefix
         let data = Bytes::from_static(b"N42");
         let result = extract_qc_from_extra_data(&data);
-        assert!(result.is_ok(), "should not error on short data");
-        assert!(result.unwrap().is_none(), "should return None for 3-byte data");
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
     }
 
     #[test]
     fn test_extract_malformed() {
-        // Magic prefix followed by garbage bytes that can't deserialize into a QC
         let mut data = Vec::from(b"N42Q" as &[u8]);
         data.extend_from_slice(&[0xFF, 0xFE, 0x00, 0x01, 0x02]);
         let data = Bytes::from(data);
 
         let result = extract_qc_from_extra_data(&data);
-        assert!(result.is_err(), "should error on magic prefix + malformed data");
+        assert!(result.is_err());
     }
 }

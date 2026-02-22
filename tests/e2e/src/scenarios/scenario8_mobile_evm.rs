@@ -16,23 +16,14 @@ use crate::node_manager::{NodeConfig, NodeProcess};
 use crate::rpc_client::RpcClient;
 use crate::tx_engine::TxEngine;
 
-/// Scenario 8: Mobile EVM Verification — Full End-to-End via QUIC.
+/// Scenario 8: Mobile EVM Verification via QUIC.
 ///
-/// Tests the complete production-grade mobile verification pipeline:
-///
-/// 1. Start a single-node chain (4s block interval)
-/// 2. Connect to the node's StarHub via QUIC as a mobile verifier
-/// 3. Deploy an ERC-20 contract (creates non-trivial state)
-/// 4. Send mixed transactions: ETH transfers + ERC-20 transfers
-/// 5. Receive real VerificationPackets from the node via QUIC
-/// 6. Run verify_block() — full EVM re-execution with witness data
-/// 7. Compare computed receipts_root against the expected value
-/// 8. Sign the verification receipt with BLS12-381
-/// 9. Send the signed receipt back to the node via QUIC
-/// 10. Verify the full pipeline works end-to-end
-///
-/// This is a TRUE end-to-end test: node execution → witness capture →
-/// packet build → QUIC transport → EVM re-execution → BLS sign → QUIC return.
+/// Tests the mobile verification pipeline:
+/// 1. Start single-node chain, connect via QUIC
+/// 2. Deploy ERC-20 contract, send ETH + ERC-20 transfers
+/// 3. Receive VerificationPackets, run EVM re-execution
+/// 4. Verify receipts_root match, sign with BLS12-381
+/// 5. Send receipts back via QUIC
 pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
     info!("=== Scenario 8: Mobile EVM Verification (FULL E2E via QUIC) ===");
 
@@ -90,7 +81,7 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
     let pubkey_bytes = mobile_pubkey.to_bytes();
 
     info!(
-        pubkey = hex::encode(&pubkey_bytes),
+        pubkey = hex::encode(pubkey_bytes),
         "mobile verifier identity created"
     );
 
@@ -299,7 +290,7 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
     tokio::time::sleep(Duration::from_secs(1)).await;
 
     // Read the node log and verify receipt processing messages.
-    let log_path = format!("/tmp/n42-node-0.log");
+    let log_path = "/tmp/n42-node-0.log".to_string();
     let log_contents = std::fs::read_to_string(&log_path).unwrap_or_default();
     let receipt_log_count = log_contents
         .lines()

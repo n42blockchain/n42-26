@@ -7,7 +7,7 @@ pub enum Phase {
     WaitingForProposal,
     /// Leader has proposed; collecting Round 1 (Prepare) votes.
     Voting,
-    /// QC formed from Round 1; collecting Round 2 (Commit) votes.
+    /// QC formed from Round 1 votes; collecting Round 2 (Commit) votes.
     PreCommit,
     /// Block is committed (terminal state for this view).
     Committed,
@@ -20,26 +20,19 @@ pub enum Phase {
 /// Each view progresses through phases:
 /// `WaitingForProposal → Voting → PreCommit → Committed`
 ///
-/// If a timeout occurs at any point, the phase transitions to `TimedOut`,
-/// triggering the view change (Round 3) protocol.
+/// A timeout at any point transitions to `TimedOut`, triggering view change.
 #[derive(Debug, Clone)]
 pub struct RoundState {
-    /// Current view number (monotonically increasing).
     current_view: ViewNumber,
-    /// Current phase within this view.
     phase: Phase,
-    /// The highest QC this node has seen (used for locking).
-    /// A node is "locked" on this QC and will only vote for proposals
-    /// that extend it (safety rule).
+    /// The highest QC this node has seen (safety lock).
+    /// Nodes only vote for proposals that extend this QC (justify_qc.view >= locked_qc.view).
     locked_qc: QuorumCertificate,
-    /// The QC of the last committed block.
     last_committed_qc: QuorumCertificate,
-    /// Number of consecutive timeouts (for exponential backoff).
     consecutive_timeouts: u32,
 }
 
 impl RoundState {
-    /// Creates a new RoundState starting from genesis.
     pub fn new() -> Self {
         let genesis_qc = QuorumCertificate::genesis();
         Self {
@@ -51,10 +44,9 @@ impl RoundState {
         }
     }
 
-    /// Creates a RoundState from a persisted snapshot (crash recovery).
+    /// Restores state from a persisted snapshot (crash recovery).
     ///
-    /// Restores the critical safety state (locked_qc, last_committed_qc)
-    /// so that the node resumes with its previous locking constraints intact.
+    /// Preserves safety invariants (locked_qc, last_committed_qc) across restarts.
     pub fn from_snapshot(
         view: ViewNumber,
         locked_qc: QuorumCertificate,
@@ -70,46 +62,37 @@ impl RoundState {
         }
     }
 
-    /// Returns the current view number.
     pub fn current_view(&self) -> ViewNumber {
         self.current_view
     }
 
-    /// Returns the current phase.
     pub fn phase(&self) -> Phase {
         self.phase
     }
 
-    /// Returns a reference to the locked QC.
     pub fn locked_qc(&self) -> &QuorumCertificate {
         &self.locked_qc
     }
 
-    /// Returns a reference to the last committed QC.
     pub fn last_committed_qc(&self) -> &QuorumCertificate {
         &self.last_committed_qc
     }
 
-    /// Returns the number of consecutive timeouts.
     pub fn consecutive_timeouts(&self) -> u32 {
         self.consecutive_timeouts
     }
 
-    /// Advances to the voting phase after receiving a valid proposal.
     pub fn enter_voting(&mut self) {
         self.phase = Phase::Voting;
     }
 
-    /// Advances to the pre-commit phase after a QC is formed.
     pub fn enter_pre_commit(&mut self) {
         self.phase = Phase::PreCommit;
     }
 
-    /// Marks the current view as committed.
-    /// Updates the locked QC and last committed QC.
+    /// Marks the current view as committed and updates QC state.
     pub fn commit(&mut self, commit_qc: QuorumCertificate) {
         self.phase = Phase::Committed;
-        // Update locked QC if the commit QC is higher
         if commit_qc.view > self.locked_qc.view {
             self.locked_qc = commit_qc.clone();
         }
@@ -117,36 +100,32 @@ impl RoundState {
         self.consecutive_timeouts = 0;
     }
 
-    /// Advances to the next view (after commit or view change).
+    /// Advances to a new view, resetting the phase.
     pub fn advance_view(&mut self, new_view: ViewNumber) {
         self.current_view = new_view;
         self.phase = Phase::WaitingForProposal;
     }
 
-    /// Transitions to the timed-out phase.
+    /// Transitions to timed-out phase and increments the backoff counter.
     pub fn timeout(&mut self) {
         self.phase = Phase::TimedOut;
         self.consecutive_timeouts += 1;
     }
 
-    /// Resets consecutive_timeouts to 0.
-    /// Called during QC-based view jump to ensure the pacemaker
-    /// uses base_timeout after catching up to the network.
+    /// Resets the consecutive timeout counter after a QC-based view jump.
     pub fn reset_consecutive_timeouts(&mut self) {
         self.consecutive_timeouts = 0;
     }
 
-    /// Updates the locked QC if the new one is higher.
-    /// Called when seeing a QC in a proposal's justify_qc.
+    /// Updates the locked QC if the given QC has a higher view.
     pub fn update_locked_qc(&mut self, qc: &QuorumCertificate) {
         if qc.view > self.locked_qc.view {
             self.locked_qc = qc.clone();
         }
     }
 
-    /// Checks the HotStuff-2 safety rule:
-    /// A proposal is safe to vote on if its justify_qc extends the locked QC
-    /// (i.e., justify_qc.view >= locked_qc.view).
+    /// HotStuff-2 safety rule: a proposal is safe to vote on if its
+    /// justify_qc extends the locked QC (justify_qc.view >= locked_qc.view).
     pub fn is_safe_to_vote(&self, justify_qc: &QuorumCertificate) -> bool {
         justify_qc.view >= self.locked_qc.view
     }
@@ -165,7 +144,6 @@ mod tests {
     use bitvec::prelude::*;
     use n42_primitives::BlsSecretKey;
 
-    /// Helper: create a QuorumCertificate with the given view number.
     fn make_qc(view: ViewNumber) -> QuorumCertificate {
         let sk = BlsSecretKey::random().unwrap();
         let sig = sk.sign(b"test-qc");
@@ -180,71 +158,53 @@ mod tests {
     #[test]
     fn test_initial_state() {
         let state = RoundState::new();
-
-        assert_eq!(state.current_view(), 1, "initial view should be 1");
-        assert_eq!(state.phase(), Phase::WaitingForProposal, "initial phase should be WaitingForProposal");
-        assert_eq!(state.consecutive_timeouts(), 0, "initial timeouts should be 0");
-        assert_eq!(state.locked_qc().view, 0, "locked QC should be genesis (view 0)");
-        assert_eq!(state.last_committed_qc().view, 0, "last committed QC should be genesis (view 0)");
+        assert_eq!(state.current_view(), 1);
+        assert_eq!(state.phase(), Phase::WaitingForProposal);
+        assert_eq!(state.consecutive_timeouts(), 0);
+        assert_eq!(state.locked_qc().view, 0);
+        assert_eq!(state.last_committed_qc().view, 0);
     }
 
     #[test]
     fn test_phase_transitions() {
         let mut state = RoundState::new();
 
-        // WaitingForProposal -> Voting
-        assert_eq!(state.phase(), Phase::WaitingForProposal);
         state.enter_voting();
-        assert_eq!(state.phase(), Phase::Voting, "should be in Voting phase");
+        assert_eq!(state.phase(), Phase::Voting);
 
-        // Voting -> PreCommit
         state.enter_pre_commit();
-        assert_eq!(state.phase(), Phase::PreCommit, "should be in PreCommit phase");
+        assert_eq!(state.phase(), Phase::PreCommit);
 
-        // PreCommit -> Committed
-        let commit_qc = make_qc(1);
-        state.commit(commit_qc);
-        assert_eq!(state.phase(), Phase::Committed, "should be in Committed phase");
+        state.commit(make_qc(1));
+        assert_eq!(state.phase(), Phase::Committed);
     }
 
     #[test]
     fn test_timeout() {
         let mut state = RoundState::new();
 
-        assert_eq!(state.consecutive_timeouts(), 0);
+        state.timeout();
+        assert_eq!(state.phase(), Phase::TimedOut);
+        assert_eq!(state.consecutive_timeouts(), 1);
 
         state.timeout();
-        assert_eq!(state.phase(), Phase::TimedOut, "phase should be TimedOut");
-        assert_eq!(state.consecutive_timeouts(), 1, "consecutive_timeouts should be 1");
+        assert_eq!(state.consecutive_timeouts(), 2);
 
         state.timeout();
-        assert_eq!(state.consecutive_timeouts(), 2, "consecutive_timeouts should be 2");
-
-        state.timeout();
-        assert_eq!(state.consecutive_timeouts(), 3, "consecutive_timeouts should be 3");
+        assert_eq!(state.consecutive_timeouts(), 3);
     }
 
     #[test]
     fn test_advance_view() {
         let mut state = RoundState::new();
 
-        // Enter voting, then timeout
-        state.enter_voting();
         state.timeout();
-        assert_eq!(state.phase(), Phase::TimedOut);
-
-        // Advance to view 2
         state.advance_view(2);
-        assert_eq!(state.current_view(), 2, "view should be 2");
-        assert_eq!(
-            state.phase(),
-            Phase::WaitingForProposal,
-            "phase should reset to WaitingForProposal"
-        );
+        assert_eq!(state.current_view(), 2);
+        assert_eq!(state.phase(), Phase::WaitingForProposal);
 
-        // Advance to view 10
         state.advance_view(10);
-        assert_eq!(state.current_view(), 10, "view should jump to 10");
+        assert_eq!(state.current_view(), 10);
         assert_eq!(state.phase(), Phase::WaitingForProposal);
     }
 
@@ -252,110 +212,57 @@ mod tests {
     fn test_safety_rule() {
         let mut state = RoundState::new();
 
-        // Initially locked on genesis QC (view 0)
-        let qc_view_0 = QuorumCertificate::genesis();
-        assert!(
-            state.is_safe_to_vote(&qc_view_0),
-            "genesis QC (view 0) should be safe when locked on view 0"
-        );
+        assert!(state.is_safe_to_vote(&QuorumCertificate::genesis()));
 
-        // Update locked QC to view 5
-        let qc_view_5 = make_qc(5);
-        state.update_locked_qc(&qc_view_5);
-        assert_eq!(state.locked_qc().view, 5, "locked QC should now be at view 5");
+        state.update_locked_qc(&make_qc(5));
+        assert_eq!(state.locked_qc().view, 5);
 
-        // A justify_qc at view 5 (equal) should be safe
-        let justify_equal = make_qc(5);
-        assert!(
-            state.is_safe_to_vote(&justify_equal),
-            "justify_qc at same view as locked should be safe"
-        );
-
-        // A justify_qc at view 7 (higher) should be safe
-        let justify_higher = make_qc(7);
-        assert!(
-            state.is_safe_to_vote(&justify_higher),
-            "justify_qc with higher view should be safe"
-        );
-
-        // A justify_qc at view 3 (lower) should NOT be safe
-        let justify_lower = make_qc(3);
-        assert!(
-            !state.is_safe_to_vote(&justify_lower),
-            "justify_qc with lower view should NOT be safe"
-        );
+        assert!(state.is_safe_to_vote(&make_qc(5)));
+        assert!(state.is_safe_to_vote(&make_qc(7)));
+        assert!(!state.is_safe_to_vote(&make_qc(3)));
     }
 
     #[test]
     fn test_commit_resets_consecutive_timeouts() {
         let mut state = RoundState::new();
 
-        // Accumulate some timeouts
         state.timeout();
         state.timeout();
         assert_eq!(state.consecutive_timeouts(), 2);
 
-        // Commit resets the counter
         state.advance_view(2);
         state.enter_voting();
         state.enter_pre_commit();
-        let qc = make_qc(2);
-        state.commit(qc);
-        assert_eq!(
-            state.consecutive_timeouts(),
-            0,
-            "consecutive_timeouts should reset to 0 after commit"
-        );
+        state.commit(make_qc(2));
+        assert_eq!(state.consecutive_timeouts(), 0);
     }
 
     #[test]
     fn test_commit_updates_locked_qc() {
         let mut state = RoundState::new();
 
-        // Commit with view 5 QC
-        let qc5 = make_qc(5);
-        state.commit(qc5.clone());
-        assert_eq!(state.locked_qc().view, 5, "locked QC should update to view 5");
-        assert_eq!(
-            state.last_committed_qc().view,
-            5,
-            "last committed QC should be view 5"
-        );
+        state.commit(make_qc(5));
+        assert_eq!(state.locked_qc().view, 5);
+        assert_eq!(state.last_committed_qc().view, 5);
 
-        // Commit with view 3 QC (lower) - locked QC should NOT downgrade
-        let qc3 = make_qc(3);
-        state.commit(qc3);
-        assert_eq!(
-            state.locked_qc().view,
-            5,
-            "locked QC should stay at view 5 (not downgrade to 3)"
-        );
-        assert_eq!(
-            state.last_committed_qc().view,
-            3,
-            "last committed QC updates regardless"
-        );
+        // Lower commit should not downgrade locked_qc
+        state.commit(make_qc(3));
+        assert_eq!(state.locked_qc().view, 5);
+        assert_eq!(state.last_committed_qc().view, 3);
     }
 
     #[test]
     fn test_reset_consecutive_timeouts() {
         let mut state = RoundState::new();
 
-        // Accumulate timeouts
         state.timeout();
         state.timeout();
         state.timeout();
         assert_eq!(state.consecutive_timeouts(), 3);
 
-        // Reset should bring back to 0
         state.reset_consecutive_timeouts();
-        assert_eq!(
-            state.consecutive_timeouts(),
-            0,
-            "consecutive_timeouts should be 0 after reset"
-        );
+        assert_eq!(state.consecutive_timeouts(), 0);
 
-        // Subsequent timeout should start from 1 again
         state.timeout();
         assert_eq!(state.consecutive_timeouts(), 1);
     }
@@ -367,62 +274,41 @@ mod tests {
         assert_eq!(state.phase(), Phase::WaitingForProposal);
     }
 
-    /// update_locked_qc with a lower-view QC must not downgrade the locked QC.
     #[test]
     fn test_update_locked_qc_no_downgrade() {
         let mut state = RoundState::new();
 
-        // Lock on view 10
-        let qc_10 = make_qc(10);
-        state.update_locked_qc(&qc_10);
+        state.update_locked_qc(&make_qc(10));
         assert_eq!(state.locked_qc().view, 10);
 
-        // Attempt to "update" with a lower QC (view 5) — must be no-op
-        let qc_5 = make_qc(5);
-        state.update_locked_qc(&qc_5);
-        assert_eq!(
-            state.locked_qc().view, 10,
-            "locked_qc should not downgrade from 10 to 5"
-        );
+        // Lower view — no-op
+        state.update_locked_qc(&make_qc(5));
+        assert_eq!(state.locked_qc().view, 10);
 
-        // Same view — no-op (not strictly higher)
-        let qc_10b = make_qc(10);
-        state.update_locked_qc(&qc_10b);
-        assert_eq!(state.locked_qc().view, 10, "same view should not change locked_qc");
+        // Same view — no-op
+        state.update_locked_qc(&make_qc(10));
+        assert_eq!(state.locked_qc().view, 10);
 
-        // Higher view — should update
-        let qc_15 = make_qc(15);
-        state.update_locked_qc(&qc_15);
-        assert_eq!(state.locked_qc().view, 15, "higher view should update locked_qc");
+        // Higher view — updates
+        state.update_locked_qc(&make_qc(15));
+        assert_eq!(state.locked_qc().view, 15);
     }
 
-    /// After timeout + advance_view, the phase must reset to WaitingForProposal.
     #[test]
     fn test_advance_view_resets_phase() {
         let mut state = RoundState::new();
 
-        // Enter various phases, then timeout
         state.enter_voting();
-        assert_eq!(state.phase(), Phase::Voting);
         state.timeout();
         assert_eq!(state.phase(), Phase::TimedOut);
 
-        // advance_view should reset phase
         state.advance_view(2);
-        assert_eq!(
-            state.phase(), Phase::WaitingForProposal,
-            "advance_view after timeout should reset phase to WaitingForProposal"
-        );
+        assert_eq!(state.phase(), Phase::WaitingForProposal);
         assert_eq!(state.current_view(), 2);
 
-        // Also verify from PreCommit
         state.enter_voting();
         state.enter_pre_commit();
-        assert_eq!(state.phase(), Phase::PreCommit);
         state.advance_view(3);
-        assert_eq!(
-            state.phase(), Phase::WaitingForProposal,
-            "advance_view from PreCommit should reset phase"
-        );
+        assert_eq!(state.phase(), Phase::WaitingForProposal);
     }
 }

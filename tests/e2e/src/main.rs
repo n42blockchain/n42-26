@@ -4,6 +4,7 @@ mod mobile_sim;
 mod node_manager;
 mod rpc_client;
 mod scenarios;
+mod test_helpers;
 mod tx_engine;
 
 use clap::Parser;

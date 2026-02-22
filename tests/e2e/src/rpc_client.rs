@@ -14,10 +14,6 @@ pub struct RpcClient {
 
 #[derive(Debug, Deserialize)]
 struct JsonRpcResponse<T> {
-    #[allow(dead_code)]
-    jsonrpc: String,
-    #[allow(dead_code)]
-    id: u64,
     result: Option<T>,
     error: Option<JsonRpcError>,
 }

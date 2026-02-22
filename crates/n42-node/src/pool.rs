@@ -10,7 +10,7 @@ use reth_transaction_pool::{
     EthTransactionValidator, PoolConfig, SubPoolLimit, TransactionValidationTaskExecutor,
 };
 
-/// N42 交易池类型别名 — 使用 DiskFileBlobStore 支持 EIP-4844 blob 交易
+/// N42 transaction pool type — uses DiskFileBlobStore for EIP-4844 blob transaction support.
 pub type N42TransactionPool<Provider, Evm> = reth_transaction_pool::Pool<
     TransactionValidationTaskExecutor<
         EthTransactionValidator<Provider, EthPooledTransaction, Evm>,
@@ -19,12 +19,12 @@ pub type N42TransactionPool<Provider, Evm> = reth_transaction_pool::Pool<
     DiskFileBlobStore,
 >;
 
-/// IDC 高带宽节点交易池构建器
+/// IDC high-bandwidth transaction pool builder.
 ///
-/// 与 EthereumPoolBuilder 的差异：
-/// - EIP-4844 blob 交易启用（DiskFileBlobStore，生态兼容用途）
-/// - IDC 优化的池容量（更大的 pending/basefee/queued 限制）
-/// - 更高的单账户槽位限制
+/// Differences from EthereumPoolBuilder:
+/// - EIP-4844 blob transactions enabled (DiskFileBlobStore)
+/// - Larger pending/basefee/queued limits for IDC throughput
+/// - Higher per-account slot limit
 #[derive(Debug, Default, Clone, Copy)]
 #[non_exhaustive]
 pub struct N42PoolBuilder;
@@ -49,8 +49,6 @@ where
     ) -> eyre::Result<Self::Pool> {
         let blob_store = reth_node_builder::components::create_blob_store(ctx)?;
 
-        // 创建验证器 — 完全复用 reth 的 EthTransactionValidator
-        // EIP-4844 默认启用（不再调用 .set_eip4844(false)）
         let validator =
             TransactionValidationTaskExecutor::eth_builder(ctx.provider().clone(), evm_config)
                 .with_local_transactions_config(
@@ -63,10 +61,8 @@ where
                 .with_additional_tasks(ctx.config().txpool.additional_validation_tasks)
                 .build_with_tasks(ctx.task_executor().clone(), blob_store.clone());
 
-        // IDC 优化的池配置
         let pool_config = idc_pool_config(&ctx.pool_config());
 
-        // 构建池 + 启动维护任务 — 复用 reth 的 TxPoolBuilder
         let pool = TxPoolBuilder::new(ctx)
             .with_validator(validator)
             .build_and_spawn_maintenance_task(blob_store, pool_config)?;
@@ -75,9 +71,7 @@ where
     }
 }
 
-/// IDC 机房优化的池配置
-///
-/// 高带宽、大内存场景，提升池容量上限
+/// IDC-optimized pool configuration: higher limits for high-bandwidth, large-memory nodes.
 fn idc_pool_config(base: &PoolConfig) -> PoolConfig {
     PoolConfig {
         pending_limit: SubPoolLimit { max_txs: 50_000, max_size: 100 * 1024 * 1024 },

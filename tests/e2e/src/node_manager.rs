@@ -125,9 +125,6 @@ impl NodeProcess {
             .arg("--ipcdisable")
             .arg("--disable-discovery");
 
-        // Set environment variables.
-        // N42_DATA_DIR must point to the temp data dir so each node starts with
-        // a clean consensus state (no stale consensus_state.json from prior runs).
         cmd.env("N42_VALIDATOR_KEY", &key_hex)
             .env("N42_VALIDATOR_COUNT", config.validator_count.to_string())
             .env("N42_CONSENSUS_PORT", consensus_port.to_string())
@@ -138,7 +135,6 @@ impl NodeProcess {
             cmd.env("N42_BLOCK_INTERVAL_MS", config.block_interval_ms.to_string());
         }
 
-        // Pass pacemaker timeout overrides if specified.
         if let Some(base_timeout) = config.base_timeout_ms {
             cmd.env("N42_BASE_TIMEOUT_MS", base_timeout.to_string());
         }
@@ -149,21 +145,15 @@ impl NodeProcess {
             cmd.env("N42_STARTUP_DELAY_MS", startup_delay.to_string());
         }
 
-        // Pass trusted peers via environment variable for multi-node setups.
         if !config.trusted_peers.is_empty() {
             cmd.env("N42_TRUSTED_PEERS", config.trusted_peers.join(","));
         }
 
-        // Capture stdout and stderr to log files for debugging.
-        // Reth writes structured logs to stdout via tracing; panics go to stderr.
-        let stdout_log = std::fs::File::create(
-            format!("/tmp/n42-node-{}.log", config.validator_index)
-        ).unwrap_or_else(|_| std::fs::File::create("/dev/null").unwrap());
-        let stderr_log = std::fs::File::create(
-            format!("/tmp/n42-node-{}.err.log", config.validator_index)
-        ).unwrap_or_else(|_| std::fs::File::create("/dev/null").unwrap());
-        cmd.stdout(Stdio::from(stdout_log))
-            .stderr(Stdio::from(stderr_log));
+        let stdout_log = std::fs::File::create(format!("/tmp/n42-node-{}.log", config.validator_index))
+            .unwrap_or_else(|_| std::fs::File::create("/dev/null").unwrap());
+        let stderr_log = std::fs::File::create(format!("/tmp/n42-node-{}.err.log", config.validator_index))
+            .unwrap_or_else(|_| std::fs::File::create("/dev/null").unwrap());
+        cmd.stdout(Stdio::from(stdout_log)).stderr(Stdio::from(stderr_log));
 
         info!(
             binary = %config.binary_path.display(),
@@ -193,7 +183,6 @@ impl NodeProcess {
         Ok(node)
     }
 
-    /// Polls eth_blockNumber until the node responds.
     async fn wait_for_rpc_ready(&self, timeout: Duration) -> eyre::Result<()> {
         let start = tokio::time::Instant::now();
         let poll_interval = Duration::from_millis(500);
@@ -216,9 +205,6 @@ impl NodeProcess {
                     tokio::time::sleep(poll_interval).await;
                 }
             }
-
-            // Check if the process has already exited.
-            // We can't call wait() since it would block, but we can try_wait().
         }
     }
 

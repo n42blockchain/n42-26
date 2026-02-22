@@ -58,37 +58,23 @@ pub async fn run(binary_path: std::path::PathBuf) -> eyre::Result<()> {
         Duration::from_secs(300),
     ).await?;
 
-    // === Verification ===
-
-    // Check 1: All receipts have status=1 (success).
     let failed = receipts.iter().filter(|r| r.status != 1).count();
     if failed > 0 {
         return Err(eyre::eyre!("{failed} transactions failed (status != 1)"));
     }
     info!("PASS: all {} transactions succeeded", receipts.len());
 
-    // Check 2: Verify no duplicate tx hashes in receipts.
     let mut seen_hashes = std::collections::HashSet::new();
     for receipt in &receipts {
         if !seen_hashes.insert(receipt.transaction_hash) {
-            return Err(eyre::eyre!(
-                "duplicate transaction hash: {:?}",
-                receipt.transaction_hash
-            ));
+            return Err(eyre::eyre!("duplicate transaction hash: {:?}", receipt.transaction_hash));
         }
     }
     info!("PASS: no duplicate transaction hashes");
 
-    // Check 3: Final balances should reflect transfers (we don't track individual
-    // transfer amounts here, but we check that balances have changed).
-    let mut total_gas_used = U256::ZERO;
-    for receipt in &receipts {
-        // Gas cost = gas_used * effective_gas_price (approximate with max_fee_per_gas).
-        total_gas_used += U256::from(receipt.gas_used);
-    }
+    let total_gas_used: U256 = receipts.iter().map(|r| U256::from(r.gas_used)).sum();
     info!(total_gas_used = %total_gas_used, "total gas consumed");
 
-    // Verify that the sum of all balances equals initial total minus gas fees.
     let initial_total: U256 = initial_balances.iter().sum();
     let mut final_total = U256::ZERO;
     for i in 0..tx_engine.wallet_count() {
@@ -96,7 +82,6 @@ pub async fn run(binary_path: std::path::PathBuf) -> eyre::Result<()> {
         final_total += balance;
     }
 
-    // The difference should be approximately the gas fees (transfers are between test accounts).
     let gas_cost_estimate = total_gas_used * U256::from(max_fee_per_gas);
     info!(
         initial = %initial_total,
@@ -105,7 +90,6 @@ pub async fn run(binary_path: std::path::PathBuf) -> eyre::Result<()> {
         "balance conservation check"
     );
 
-    // Final total should be less than initial (gas was spent), but not by too much.
     if final_total > initial_total {
         return Err(eyre::eyre!("final balance exceeds initial (impossible)"));
     }

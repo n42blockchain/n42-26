@@ -63,23 +63,19 @@ case "${1:-help}" in
             echo "  slot          - Slot/view number"
             exit 1
         fi
-        PUBKEY="$2"
-        SIGNATURE="$3"
-        BLOCK_HASH="$4"
-        SLOT="$5"
-        echo "Submitting attestation for block $BLOCK_HASH at slot $SLOT ..."
-        rpc_call "n42_submitAttestation" "[\"${PUBKEY}\",\"${SIGNATURE}\",\"${BLOCK_HASH}\",${SLOT}]" \
+        echo "Submitting attestation for block $4 at slot $5 ..."
+        rpc_call "n42_submitAttestation" "[\"${2}\",\"${3}\",\"${4}\",${5}]" \
             | python3 -m json.tool 2>/dev/null \
-            || rpc_call "n42_submitAttestation" "[\"${PUBKEY}\",\"${SIGNATURE}\",\"${BLOCK_HASH}\",${SLOT}]"
+            || rpc_call "n42_submitAttestation" "[\"${2}\",\"${3}\",\"${4}\",${5}]"
         ;;
 
-    help|*)
+    *)
         echo "N42 Mobile Verification Simulator"
         echo ""
         echo "Usage: $0 <command> [args...]"
         echo ""
         echo "Commands:"
-        echo "  subscribe                              Subscribe to verification tasks (WebSocket)"
+        echo "  subscribe                              Subscribe to verification tasks"
         echo "  status                                 Query consensus status"
         echo "  validators                             Query validator set"
         echo "  submit <pubkey> <sig> <hash> <slot>    Submit BLS attestation"

@@ -26,16 +26,14 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
-log() { echo -e "${GREEN}[testnet]${NC} $*"; }
-warn() { echo -e "${YELLOW}[testnet]${NC} $*"; }
+log()   { echo -e "${GREEN}[testnet]${NC} $*"; }
+warn()  { echo -e "${YELLOW}[testnet]${NC} $*"; }
 error() { echo -e "${RED}[testnet]${NC} $*"; }
 
 cleanup() {
     log "Stopping all validator nodes..."
     for pid in "${PIDS[@]}"; do
-        if kill -0 "$pid" 2>/dev/null; then
-            kill "$pid" 2>/dev/null || true
-        fi
+        kill -0 "$pid" 2>/dev/null && kill "$pid" 2>/dev/null || true
     done
     wait 2>/dev/null || true
     log "All nodes stopped."
@@ -97,15 +95,9 @@ for i in $(seq 0 $((NUM_VALIDATORS - 1))); do
 
     log "Starting validator ${i} (rpc=:${rpc_port}, p2p=:${p2p_port}, auth=:${auth_port}, consensus=:${consensus_port})"
 
-    # Build trusted-peers list: connect to all previously started nodes.
-    TRUSTED_PEERS_ARG=""
-    if [ ${#ENODES[@]} -gt 0 ]; then
-        TRUSTED_PEERS_ARG=$(IFS=,; echo "${ENODES[*]}")
-    fi
-
     TRUSTED_PEERS_FLAG=""
-    if [ -n "$TRUSTED_PEERS_ARG" ]; then
-        TRUSTED_PEERS_FLAG="--trusted-peers ${TRUSTED_PEERS_ARG}"
+    if [ ${#ENODES[@]} -gt 0 ]; then
+        TRUSTED_PEERS_FLAG="--trusted-peers $(IFS=,; echo "${ENODES[*]}")"
     fi
 
     N42_VALIDATOR_KEY="${KEYS[$i]}" \
@@ -131,11 +123,8 @@ for i in $(seq 0 $((NUM_VALIDATORS - 1))); do
     PIDS+=($!)
     log "  PID: ${PIDS[$i]}, log: ${log_file}"
 
-    # Record this node's enode for subsequent nodes to connect to.
-    # reth devp2p uses TCP for connections.
     ENODES+=("enode://0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000${i}@127.0.0.1:${p2p_port}")
 
-    # Brief pause to let the node initialize before starting the next.
     sleep 2
 done
 
@@ -149,28 +138,23 @@ for i in $(seq 0 $((NUM_VALIDATORS - 1))); do
 done
 log ""
 log "Test commands:"
-echo -e "  ${YELLOW}# Check consensus status:${NC}"
+echo -e "  ${YELLOW}# Consensus status:${NC}"
 echo -e "  ${YELLOW}curl -s http://127.0.0.1:${BASE_RPC_PORT} -X POST -H 'Content-Type: application/json' -d '{\"jsonrpc\":\"2.0\",\"method\":\"n42_consensusStatus\",\"params\":[],\"id\":1}'${NC}"
 echo -e ""
-echo -e "  ${YELLOW}# Check validator set:${NC}"
+echo -e "  ${YELLOW}# Validator set:${NC}"
 echo -e "  ${YELLOW}curl -s http://127.0.0.1:${BASE_RPC_PORT} -X POST -H 'Content-Type: application/json' -d '{\"jsonrpc\":\"2.0\",\"method\":\"n42_validatorSet\",\"params\":[],\"id\":1}'${NC}"
 echo -e ""
-echo -e "  ${YELLOW}# Check block number:${NC}"
+echo -e "  ${YELLOW}# Block number:${NC}"
 echo -e "  ${YELLOW}curl -s http://127.0.0.1:${BASE_RPC_PORT} -X POST -H 'Content-Type: application/json' -d '{\"jsonrpc\":\"2.0\",\"method\":\"eth_blockNumber\",\"params\":[],\"id\":1}'${NC}"
 echo -e ""
-echo -e "  ${YELLOW}# Send a test transaction (requires funded account):${NC}"
-echo -e "  ${YELLOW}curl -s http://127.0.0.1:${BASE_RPC_PORT} -X POST -H 'Content-Type: application/json' -d '{\"jsonrpc\":\"2.0\",\"method\":\"eth_sendTransaction\",\"params\":[{\"from\":\"0x0000000000000000000000000000000000000001\",\"to\":\"0x0000000000000000000000000000000000000002\",\"value\":\"0x1\"}],\"id\":1}'${NC}"
-log ""
 log "Tailing logs from validator 0 (Ctrl+C to stop all):"
 log ""
 
-# Monitor node processes and tail leader log
 while true; do
     for i in $(seq 0 $((NUM_VALIDATORS - 1))); do
         if ! kill -0 "${PIDS[$i]}" 2>/dev/null; then
             error "Validator ${i} (PID ${PIDS[$i]}) has exited!"
             error "Check log: ${BASE_DIR}/validator-${i}.log"
-            # Show last 20 lines of the failed node's log
             tail -20 "${BASE_DIR}/validator-${i}.log" 2>/dev/null || true
         fi
     done

@@ -8,10 +8,7 @@ use n42_mobile::packet::{encode_stream_packet, StreamPacket};
 use n42_network::ShardedStarHubHandle;
 use reth_chainspec::ChainSpec;
 use reth_ethereum_primitives::EthPrimitives;
-use reth_evm::{
-    execute::Executor,
-    ConfigureEvm,
-};
+use reth_evm::{execute::Executor, ConfigureEvm};
 use reth_primitives_traits::{BlockBody, NodePrimitives};
 use reth_provider::BlockHashReader;
 use alloy_eips::BlockHashOrNumber;
@@ -38,16 +35,12 @@ pub enum MobilePacketError {
 }
 
 /// A block commit notification: `(block_hash, consensus_view)`.
-///
-/// The second field is the HotStuff-2 consensus view number, NOT the block number.
-/// The actual block number is extracted from the block header inside `generate_and_broadcast_v2`.
 pub type BlockCommitNotification = (B256, u64);
 
 /// Maximum number of previously-sent bytecodes to track for differential transmission.
 /// At ~20 codes per block and 8-second slots, 2000 entries covers ~100 blocks (~13 min).
 const MAX_PREVIOUSLY_SENT_CODES: usize = 2000;
 
-/// Maximum number of retries when block is not yet available in reth.
 fn packet_max_retries() -> u32 {
     std::env::var("N42_PACKET_MAX_RETRIES")
         .ok()
@@ -55,7 +48,6 @@ fn packet_max_retries() -> u32 {
         .unwrap_or(10)
 }
 
-/// Base delay for exponential backoff when retrying block fetch.
 fn packet_retry_base_ms() -> u64 {
     std::env::var("N42_PACKET_RETRY_BASE_MS")
         .ok()
@@ -63,7 +55,7 @@ fn packet_retry_base_ms() -> u64 {
         .unwrap_or(200)
 }
 
-/// Insertion-order bounded code cache (FIFO eviction).
+/// Insertion-order bounded code cache with FIFO eviction.
 struct CodeCache {
     map: HashMap<B256, Bytes>,
     order: VecDeque<B256>,
@@ -72,11 +64,7 @@ struct CodeCache {
 
 impl CodeCache {
     fn new(capacity: usize) -> Self {
-        Self {
-            map: HashMap::new(),
-            order: VecDeque::new(),
-            capacity,
-        }
+        Self { map: HashMap::new(), order: VecDeque::new(), capacity }
     }
 
     fn contains_key(&self, key: &B256) -> bool {
@@ -105,15 +93,11 @@ impl CodeCache {
     }
 }
 
-/// Runs the mobile packet generation loop (V2 — stream-based).
+/// Runs the mobile packet generation loop (V2 stream format).
 ///
 /// Uses `ReadLogDatabase` to capture ordered state reads during block execution,
-/// then broadcasts a compact `StreamPacket` instead of the legacy `VerificationPacket`.
-///
-/// Key improvements over V1:
-/// - No address/slot keys in the packet — only ordered values
-/// - No pre-state fixup needed — ReadLogDatabase reads from parent state directly
-/// - No preimage resolution needed — real addresses are never transmitted
+/// then broadcasts a compact `StreamPacket`. Only new bytecodes are transmitted
+/// (differential encoding against `previously_sent_codes`).
 pub async fn mobile_packet_loop<P>(
     mut rx: mpsc::Receiver<BlockCommitNotification>,
     provider: P,
@@ -131,23 +115,19 @@ pub async fn mobile_packet_loop<P>(
 
     let evm_config = N42EvmConfig::new(chain_spec);
     let mut previously_sent_codes = CodeCache::new(MAX_PREVIOUSLY_SENT_CODES);
+    let max_retries = packet_max_retries();
+    let base_delay = std::time::Duration::from_millis(packet_retry_base_ms());
 
     loop {
         tokio::select! {
             commit = rx.recv() => {
-                let Some((block_hash, _view)) = commit else {
-                    break;
-                };
+                let Some((block_hash, _view)) = commit else { break };
                 debug!(%block_hash, "generating mobile stream packet");
 
                 let mut last_err = None;
-                let max_retries = packet_max_retries();
-                let base_delay = std::time::Duration::from_millis(packet_retry_base_ms());
-
                 for attempt in 0..max_retries {
                     if attempt > 0 {
-                        let delay = base_delay * (1 << attempt.min(4));
-                        tokio::time::sleep(delay).await;
+                        tokio::time::sleep(base_delay * (1 << attempt.min(4))).await;
                         debug!(%block_hash, attempt, "retrying mobile packet generation");
                     }
 
@@ -160,18 +140,9 @@ pub async fn mobile_packet_loop<P>(
                     ) {
                         Ok(packet_size) => {
                             if attempt > 0 {
-                                info!(
-                                    %block_hash,
-                                    packet_size,
-                                    attempt,
-                                    "mobile stream packet broadcast (after retry)"
-                                );
+                                info!(%block_hash, packet_size, attempt, "mobile stream packet broadcast (after retry)");
                             } else {
-                                info!(
-                                    %block_hash,
-                                    packet_size,
-                                    "mobile stream packet broadcast"
-                                );
+                                info!(%block_hash, packet_size, "mobile stream packet broadcast");
                             }
                             last_err = None;
                             break;
@@ -181,11 +152,7 @@ pub async fn mobile_packet_loop<P>(
                                 last_err = Some(e);
                                 continue;
                             }
-                            warn!(
-                                %block_hash,
-                                error = %e,
-                                "failed to generate mobile packet (non-retryable)"
-                            );
+                            warn!(%block_hash, error = %e, "failed to generate mobile packet (non-retryable)");
                             last_err = None;
                             break;
                         }
@@ -193,33 +160,23 @@ pub async fn mobile_packet_loop<P>(
                 }
 
                 if let Some(e) = last_err {
-                    warn!(
-                        %block_hash,
-                        error = %e,
-                        max_retries,
-                        "failed to generate mobile packet after all retries"
-                    );
+                    warn!(%block_hash, error = %e, max_retries, "failed to generate mobile packet after all retries");
                 }
             }
 
             session_id = phone_connected_rx.recv() => {
-                let Some(session_id) = session_id else { continue; };
+                let Some(session_id) = session_id else { continue };
                 if previously_sent_codes.is_empty() {
                     continue;
                 }
                 let msg = CacheSyncMessage {
-                    codes: previously_sent_codes
-                        .iter()
-                        .map(|(h, c)| (*h, c.clone()))
-                        .collect(),
+                    codes: previously_sent_codes.iter().map(|(h, c)| (*h, c.clone())).collect(),
                     evict_hints: vec![],
                 };
-                // Use versioned wire format for CacheSyncMessage
                 let data = encode_cache_sync(&msg);
                 let code_count = msg.codes.len();
                 let raw_len = data.len();
-                let compressed = zstd::bulk::compress(&data, 3)
-                    .unwrap_or(data);
+                let compressed = zstd::bulk::compress(&data, 3).unwrap_or(data);
                 let compressed_len = compressed.len();
                 let mut framed = bytes::BytesMut::with_capacity(1 + compressed.len());
                 framed.put_u8(n42_network::MSG_TYPE_CACHE_SYNC_ZSTD);
@@ -242,20 +199,10 @@ pub async fn mobile_packet_loop<P>(
     info!("mobile packet generation loop stopped (channel closed)");
 }
 
-/// V2: Generates a stream packet using ReadLogDatabase and broadcasts it.
+/// Generates a V2 stream packet and broadcasts it.
 ///
-/// Flow:
-/// 1. Fetch block + parent state
-/// 2. Wrap state DB with ReadLogDatabase to capture ordered reads
-/// 3. Execute block — log captures all basic/storage/block_hash calls in order
-/// 4. Extract read log + captured bytecodes
-/// 5. Differential filter bytecodes (skip previously sent)
-/// 6. Encode StreamPacket → zstd → broadcast
-///
-/// Key advantages over V1:
-/// - ReadLogDatabase reads from parent state directly → no fix_witness_pre_state needed
-/// - No preimage resolution → no packet_builder dependency
-/// - Compact ordered value stream → better compression
+/// Flow: fetch block → get parent state → wrap with ReadLogDatabase → execute
+/// → extract read log + bytecodes → differential filter → encode → zstd → broadcast.
 fn generate_and_broadcast_v2<P>(
     provider: &P,
     evm_config: &N42EvmConfig,
@@ -269,59 +216,46 @@ where
         + BlockHashReader
         + 'static,
 {
-    // Step 1: Fetch the committed block.
     let recovered_block = provider
-        .recovered_block(
-            BlockHashOrNumber::Hash(block_hash),
-            TransactionVariant::WithHash,
-        )
+        .recovered_block(BlockHashOrNumber::Hash(block_hash), TransactionVariant::WithHash)
         .map_err(|e| MobilePacketError::StateProvider(e.to_string()))?
         .ok_or(MobilePacketError::BlockNotFound(block_hash))?;
 
-    // Step 2: Get parent state provider (pre-execution state).
     let parent_hash = recovered_block.header().parent_hash();
     let state_provider = provider
         .history_by_block_hash(parent_hash)
         .map_err(|e| MobilePacketError::StateProvider(e.to_string()))?;
 
-    // Step 3: Wrap with ReadLogDatabase to capture ordered reads.
     let inner_db = reth_revm::database::StateProviderDatabase::new(&state_provider);
     let logged_db = ReadLogDatabase::new(inner_db);
     let log_handle = logged_db.log_handle();
     let codes_handle = logged_db.codes_handle();
 
-    // Step 4: Execute the block — all DB reads are logged in order.
     let mut executor = evm_config.executor(logged_db);
-    let _output = executor.execute_one(&recovered_block)
+    let _output = executor
+        .execute_one(&recovered_block)
         .map_err(|e| MobilePacketError::Execution(e.to_string()))?;
 
-    // Step 5: Extract the read log and encode immediately to raw bytes.
-    // After execution, the executor has consumed the DB. The Arc handles let us
-    // recover the logged data. try_unwrap succeeds if no other refs exist.
     let read_log = match Arc::try_unwrap(log_handle) {
         Ok(mutex) => mutex.into_inner().unwrap(),
         Err(arc) => arc.lock().unwrap().clone(),
     };
     let read_log_count = read_log.len();
     let read_log_data = n42_execution::read_log::encode_read_log(&read_log);
+
     let captured_codes = match Arc::try_unwrap(codes_handle) {
         Ok(mutex) => mutex.into_inner().unwrap(),
         Err(arc) => arc.lock().unwrap().clone(),
     };
 
-    // Step 6: Build header RLP and transactions.
     let header = recovered_block.header();
     let block_number = header.number();
     let mut header_buf = Vec::new();
     header.encode(&mut header_buf);
-    let header_rlp = Bytes::from(header_buf);
-
     let transactions = recovered_block.body().encoded_2718_transactions();
 
-    // Step 7: Differential code filtering — only send new bytecodes.
     let all_codes: Vec<(B256, Bytes)> = captured_codes.into_iter().collect();
     let total_codes = all_codes.len();
-
     let new_codes: Vec<(B256, Bytes)> = all_codes
         .iter()
         .filter(|(hash, _)| !previously_sent_codes.contains_key(hash))
@@ -329,10 +263,9 @@ where
         .collect();
     let filtered_codes = total_codes - new_codes.len();
 
-    // Step 8: Build StreamPacket with pre-encoded read log bytes.
     let packet = StreamPacket {
         block_hash,
-        header_rlp,
+        header_rlp: Bytes::from(header_buf),
         transactions,
         read_log_data,
         bytecodes: new_codes,
@@ -350,7 +283,6 @@ where
         "stream packet built (V2 differential)"
     );
 
-    // Step 9: Encode, compress, and broadcast.
     let encoded = encode_stream_packet(&packet);
     let raw_size = encoded.len();
     let compressed = zstd::bulk::compress(&encoded, 3)
@@ -359,7 +291,6 @@ where
     debug!(block_number, raw_size, compressed_size = packet_size, "stream packet compressed");
     let _ = hub_handle.broadcast_packet(bytes::Bytes::from(compressed));
 
-    // Step 10: Update previously_sent_codes with ALL codes from this block.
     for (hash, code) in all_codes {
         previously_sent_codes.insert(hash, code);
     }
@@ -381,7 +312,7 @@ mod tests {
         assert!(!cache.contains_key(&hash));
         assert!(cache.is_empty());
 
-        cache.insert(hash, code.clone());
+        cache.insert(hash, code);
         assert!(cache.contains_key(&hash));
         assert!(!cache.is_empty());
     }
@@ -393,7 +324,7 @@ mod tests {
         let code = Bytes::from(vec![0x60, 0x01]);
 
         cache.insert(hash, code.clone());
-        cache.insert(hash, code); // duplicate
+        cache.insert(hash, code);
 
         assert_eq!(cache.order.len(), 1);
         assert_eq!(cache.map.len(), 1);
@@ -412,7 +343,6 @@ mod tests {
         cache.insert(h2, Bytes::from(vec![2]));
         cache.insert(h3, Bytes::from(vec![3]));
         assert_eq!(cache.map.len(), 3);
-        assert_eq!(cache.order.len(), 3);
 
         cache.insert(h4, Bytes::from(vec![4]));
         assert_eq!(cache.map.len(), 3);
@@ -425,20 +355,16 @@ mod tests {
     #[test]
     fn test_code_cache_iter() {
         let mut cache = CodeCache::new(10);
-        let h1 = B256::repeat_byte(0x01);
-        let h2 = B256::repeat_byte(0x02);
-        cache.insert(h1, Bytes::from(vec![1]));
-        cache.insert(h2, Bytes::from(vec![2]));
+        cache.insert(B256::repeat_byte(0x01), Bytes::from(vec![1]));
+        cache.insert(B256::repeat_byte(0x02), Bytes::from(vec![2]));
 
-        let items: Vec<_> = cache.iter().collect();
-        assert_eq!(items.len(), 2);
+        assert_eq!(cache.iter().count(), 2);
     }
 
     #[test]
     fn test_code_cache_zero_capacity() {
         let mut cache = CodeCache::new(0);
-        let hash = B256::repeat_byte(0xFF);
-        cache.insert(hash, Bytes::from(vec![0xFF]));
+        cache.insert(B256::repeat_byte(0xFF), Bytes::from(vec![0xFF]));
         assert!(cache.is_empty(), "capacity 0 should keep nothing");
     }
 
@@ -449,8 +375,6 @@ mod tests {
         let h2 = B256::repeat_byte(0x02);
 
         cache.insert(h1, Bytes::from(vec![1]));
-        assert!(cache.contains_key(&h1));
-
         cache.insert(h2, Bytes::from(vec![2]));
         assert!(!cache.contains_key(&h1), "h1 should be evicted");
         assert!(cache.contains_key(&h2));

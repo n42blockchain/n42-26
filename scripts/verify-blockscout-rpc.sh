@@ -44,11 +44,9 @@ check_rpc() {
         return
     }
 
-    # Check if response contains an error indicating the method is not available
     if echo "$response" | grep -q '"error"'; then
         local error_code
         error_code=$(echo "$response" | grep -o '"code":[0-9-]*' | head -1 | cut -d: -f2)
-        # -32601 = method not found, -32600 = invalid request
         if [ "$error_code" = "-32601" ]; then
             if [ "$required" = "true" ]; then
                 echo -e "  ${RED}FAIL${NC} ${name} (${method}) - method not found"
@@ -58,7 +56,6 @@ check_rpc() {
                 WARN=$((WARN + 1))
             fi
         else
-            # Method exists but returned an error (e.g., invalid params) - that's OK
             echo -e "  ${GREEN}PASS${NC} ${name} (${method}) - method available"
             PASS=$((PASS + 1))
         fi
@@ -76,7 +73,6 @@ echo "RPC endpoint: ${RPC_URL}"
 echo "WS  endpoint: ${WS_URL}"
 echo ""
 
-# --- Core eth methods (required) ---
 echo "--- Core eth_* methods (required) ---"
 check_rpc "Block number"          "eth_blockNumber"         "[]"
 check_rpc "Chain ID"              "eth_chainId"             "[]"
@@ -89,38 +85,32 @@ check_rpc "Get code"              "eth_getCode"             "[\"0x00000000000000
 check_rpc "Gas price"             "eth_gasPrice"            "[]"
 echo ""
 
-# --- Debug methods (required for internal transactions) ---
 echo "--- Debug methods (required for Blockscout internal txs) ---"
 check_rpc "Trace transaction"     "debug_traceTransaction"    "[\"0x0000000000000000000000000000000000000000000000000000000000000000\",{\"tracer\":\"callTracer\"}]"
 check_rpc "Trace block by number" "debug_traceBlockByNumber"  "[\"0x0\",{\"tracer\":\"callTracer\"}]"
 echo ""
 
-# --- Net/Web3 methods (required) ---
 echo "--- Net/Web3 methods (required) ---"
 check_rpc "Net version"           "net_version"             "[]"
 check_rpc "Net peer count"        "net_peerCount"           "[]"
 check_rpc "Web3 client version"   "web3_clientVersion"      "[]"
 echo ""
 
-# --- Trace methods (optional, Parity-style) ---
 echo "--- Trace methods (optional) ---"
 check_rpc "Trace block"           "trace_block"             "[\"0x0\"]"                "false"
 check_rpc "Trace replay block"    "trace_replayBlockTransactions" "[\"0x0\",[\"trace\"]]"  "false"
 echo ""
 
-# --- Txpool methods (optional) ---
 echo "--- Txpool methods (optional) ---"
 check_rpc "Txpool content"        "txpool_content"          "[]"                       "false"
 check_rpc "Txpool status"         "txpool_status"           "[]"                       "false"
 echo ""
 
-# --- N42 custom methods ---
 echo "--- N42 custom methods ---"
 check_rpc "Consensus status"      "n42_consensusStatus"     "[]"                       "false"
 check_rpc "Validator set"         "n42_validatorSet"        "[]"                       "false"
 echo ""
 
-# --- WebSocket check ---
 echo "--- WebSocket connectivity ---"
 if command -v websocat &> /dev/null; then
     ws_response=$(echo '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}' | \
@@ -138,7 +128,6 @@ else
 fi
 echo ""
 
-# --- Summary ---
 echo "============================================"
 TOTAL=$((PASS + FAIL + WARN))
 echo -e " Results: ${GREEN}${PASS} passed${NC}, ${RED}${FAIL} failed${NC}, ${YELLOW}${WARN} warnings${NC} / ${TOTAL} total"

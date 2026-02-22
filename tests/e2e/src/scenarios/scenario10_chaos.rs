@@ -21,6 +21,9 @@ use crate::genesis::{generate_test_accounts, write_genesis_file, TEST_CHAIN_ID};
 use crate::mobile_sim::run_mobile_fleet;
 use crate::node_manager::{NodeConfig, NodeProcess};
 use crate::rpc_client::RpcClient;
+use crate::test_helpers::{
+    cleanup_nodes, compute_peer_id, get_height_safe, wait_for_height_increase, wait_for_sync,
+};
 use crate::tx_engine::TxEngine;
 
 const NODE_COUNT: usize = 7;
@@ -28,75 +31,6 @@ const BLOCK_INTERVAL_MS: u64 = 500;
 const BASE_TIMEOUT_MS: u64 = 3000;
 const MAX_TIMEOUT_MS: u64 = 10000;
 const PORT_OFFSET_BASE: u16 = 600;
-
-// ---------------------------------------------------------------------------
-// Helpers (same pattern as scenario9)
-// ---------------------------------------------------------------------------
-
-fn compute_peer_id(validator_index: usize) -> libp2p::PeerId {
-    let seed = alloy_primitives::keccak256(format!("n42-p2p-key-{}", validator_index).as_bytes());
-    let mut seed_bytes: [u8; 32] = seed.0;
-    let secret = libp2p::identity::ed25519::SecretKey::try_from_bytes(&mut seed_bytes)
-        .expect("valid ed25519 seed");
-    let kp = libp2p::identity::ed25519::Keypair::from(secret);
-    libp2p::identity::Keypair::from(kp).public().to_peer_id()
-}
-
-async fn get_height_safe(rpc: &RpcClient) -> u64 {
-    match rpc.block_number().await {
-        Ok(h) => h,
-        Err(_) => 0,
-    }
-}
-
-async fn wait_for_sync(rpc: &RpcClient, target: u64, timeout: Duration) -> eyre::Result<()> {
-    let start = tokio::time::Instant::now();
-    let poll = Duration::from_millis(500);
-    let target_min = target.saturating_sub(1);
-
-    loop {
-        if start.elapsed() > timeout {
-            let current = get_height_safe(rpc).await;
-            return Err(eyre::eyre!(
-                "sync timeout: current={current}, target={target}"
-            ));
-        }
-        let h = get_height_safe(rpc).await;
-        if h >= target_min {
-            return Ok(());
-        }
-        tokio::time::sleep(poll).await;
-    }
-}
-
-/// Waits until the node's height increases above `baseline`, or timeout.
-async fn wait_for_height_increase(
-    rpc: &RpcClient,
-    baseline: u64,
-    min_increase: u64,
-    timeout: Duration,
-) -> u64 {
-    let start = tokio::time::Instant::now();
-    let poll = Duration::from_millis(500);
-    loop {
-        let h = get_height_safe(rpc).await;
-        if h >= baseline + min_increase {
-            return h;
-        }
-        if start.elapsed() > timeout {
-            return h;
-        }
-        tokio::time::sleep(poll).await;
-    }
-}
-
-fn cleanup_nodes(nodes: &mut Vec<Option<NodeProcess>>) {
-    for node_opt in nodes.drain(..) {
-        if let Some(node) = node_opt {
-            let _ = node.stop();
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Main scenario entry point

@@ -60,67 +60,55 @@ pub enum VerifyError {
     },
 }
 
-/// Re-executes a block using the reth EVM and verifies the receipts root.
-///
-/// This is the core mobile verification function. It takes a `VerificationPacket`
-/// containing the block header, transactions, and witness data, reconstructs the
-/// EVM state, re-executes all transactions, and checks whether the computed
-/// receipts root matches the expected value from the block header.
-///
-/// # Arguments
-///
-/// * `packet` - The verification packet from the IDC node
-/// * `code_cache` - Local bytecode cache (read for existing codes)
-/// * `chain_spec` - Chain specification for EVM configuration
-///
-/// # Returns
-///
-/// `VerificationResult` indicating whether the receipts root matches.
-pub fn verify_block(
-    packet: &VerificationPacket,
-    code_cache: &mut CodeCache,
-    chain_spec: Arc<ChainSpec>,
-) -> Result<VerificationResult, VerifyError> {
-    // 1. Decode header from RLP and verify hash
-    let header = Header::decode(&mut &packet.header_rlp[..])?;
-    let sealed_header = SealedHeader::seal_slow(header);
-
-    if sealed_header.hash() != packet.block_hash {
+/// Decodes the header RLP and verifies the hash matches `expected_hash`.
+fn decode_and_verify_header(
+    header_rlp: &[u8],
+    expected_hash: B256,
+) -> Result<SealedHeader, VerifyError> {
+    let header = Header::decode(&mut &header_rlp[..])?;
+    let sealed = SealedHeader::seal_slow(header);
+    if sealed.hash() != expected_hash {
         return Err(VerifyError::HeaderHashMismatch {
-            expected: packet.block_hash,
-            actual: sealed_header.hash(),
+            expected: expected_hash,
+            actual: sealed.hash(),
         });
     }
+    Ok(sealed)
+}
 
-    // 2. Decode transactions from EIP-2718 envelopes
-    let txs: Vec<EthTx> = packet
-        .transactions
+/// Decodes EIP-2718 transactions and assembles a recovered block.
+fn decode_and_recover(
+    sealed_header: SealedHeader,
+    transactions: &[alloy_primitives::Bytes],
+) -> Result<RecoveredBlock<reth_ethereum_primitives::Block>, VerifyError> {
+    let txs: Vec<EthTx> = transactions
         .iter()
         .map(|rlp| EthTx::decode_2718(&mut &rlp[..]))
         .collect::<Result<_, _>>()
         .map_err(VerifyError::TxDecode)?;
 
-    // 3. Assemble the block and recover senders
     let body = alloy_consensus::BlockBody {
         transactions: txs,
         ommers: vec![],
         withdrawals: None,
     };
     let block = SealedBlock::from_sealed_parts(sealed_header, body);
-    let recovered =
-        RecoveredBlock::try_recover_sealed(block).map_err(|_| VerifyError::SenderRecovery)?;
+    RecoveredBlock::try_recover_sealed(block).map_err(|_| VerifyError::SenderRecovery)
+}
 
-    // 4. Build CachedReads from witness + code_cache + uncached_bytecodes
+/// Re-executes a block using the V1 `VerificationPacket` and verifies the receipts root.
+pub fn verify_block(
+    packet: &VerificationPacket,
+    code_cache: &mut CodeCache,
+    chain_spec: Arc<ChainSpec>,
+) -> Result<VerificationResult, VerifyError> {
+    let sealed_header = decode_and_verify_header(&packet.header_rlp, packet.block_hash)?;
+    let recovered = decode_and_recover(sealed_header, &packet.transactions)?;
     let mut cached_reads = build_cached_reads(packet, code_cache)?;
 
-    // 5. Execute the block using the same reth EVM as the main node.
-    //    EmptyDB serves as fallback — all needed state is in CachedReads.
     let evm_config = N42EvmConfig::new(chain_spec);
     let db = cached_reads.as_db_mut(EmptyDB::default());
-    let mut executor = evm_config.executor(db);
-    let result = executor.execute_one(&recovered)?;
-
-    // 6. Compute receipts root and compare
+    let result = evm_config.executor(db).execute_one(&recovered)?;
     let computed = Receipt::calculate_receipt_root_no_memo(&result.receipts);
 
     Ok(VerificationResult {
@@ -129,26 +117,17 @@ pub fn verify_block(
     })
 }
 
-/// Builds a `CachedReads` database from the verification packet's witness data.
-///
-/// Combines account state from the witness, bytecodes from the local cache and
-/// the packet's uncached_bytecodes, and ancestor block hashes for the BLOCKHASH
-/// opcode.
+/// Builds a `CachedReads` database from the V1 packet's witness data.
 fn build_cached_reads(
     packet: &VerificationPacket,
     code_cache: &mut CodeCache,
 ) -> Result<CachedReads, VerifyError> {
     let mut cached = CachedReads::default();
 
-    // Build O(1) lookup table for uncached bytecodes (avoids O(N*M) linear scan).
-    let uncached_map: std::collections::HashMap<&B256, &alloy_primitives::Bytes> = packet
-        .uncached_bytecodes
-        .iter()
-        .map(|(h, b)| (h, b))
-        .collect();
+    let uncached_map: HashMap<&B256, &alloy_primitives::Bytes> =
+        packet.uncached_bytecodes.iter().map(|(h, b)| (h, b)).collect();
 
     for wa in &packet.witness_accounts {
-        // Resolve bytecode: code_cache → uncached_bytecodes → None (EOA)
         let bytecode = if wa.code_hash == KECCAK256_EMPTY {
             None
         } else {
@@ -169,12 +148,9 @@ fn build_cached_reads(
             account_id: None,
             code: bytecode,
         };
-
-        let storage = wa.storage.iter().cloned().collect();
-        cached.insert_account(wa.address, info, storage);
+        cached.insert_account(wa.address, info, wa.storage.iter().cloned().collect());
     }
 
-    // Ancestor block hashes for BLOCKHASH opcode
     for (num, hash) in &packet.block_hashes {
         cached.block_hashes.insert(*num, *hash);
     }
@@ -182,17 +158,14 @@ fn build_cached_reads(
     Ok(cached)
 }
 
-/// Updates the local code cache with newly received bytecodes after successful verification.
-///
-/// Call this after `verify_block()` succeeds to reduce future packet sizes —
-/// bytecodes cached locally will be excluded from subsequent packets by the IDC node.
+/// Updates the code cache with new bytecodes from a V1 packet after successful verification.
 pub fn update_cache_after_verify(packet: &VerificationPacket, code_cache: &mut CodeCache) {
     for (hash, code) in &packet.uncached_bytecodes {
         code_cache.insert(*hash, code.clone());
     }
 }
 
-/// Updates the local code cache with bytecodes from a `StreamPacket`.
+/// Updates the code cache with bytecodes from a V2 `StreamPacket`.
 pub fn update_cache_after_stream_verify(packet: &StreamPacket, code_cache: &mut CodeCache) {
     for (hash, code) in &packet.bytecodes {
         code_cache.insert(*hash, code.clone());
@@ -201,7 +174,7 @@ pub fn update_cache_after_stream_verify(packet: &StreamPacket, code_cache: &mut 
 
 // ─── StreamReplayDB ─────────────────────────────────────────────────────────
 
-/// Error type for StreamReplayDB — implements DBErrorMarker.
+/// Error type for `StreamReplayDB`.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum StreamDbError {
     #[error("stream exhausted at cursor {0}")]
@@ -220,36 +193,20 @@ impl DBErrorMarker for StreamDbError {}
 
 /// Sequential replay database for mobile verification — zero-allocation cursor on raw bytes.
 ///
-/// Parses read log entries directly from pre-encoded bytes on each Database call,
+/// Parses read log entries directly from pre-encoded bytes on each `Database` call,
 /// advancing a byte cursor. No intermediate `Vec<ReadLogEntry>` is ever allocated.
 ///
-/// This is safe because:
-/// - Same block + same txs → same revm Database call sequence (deterministic)
-/// - If execution order diverges → wrong values returned → receipts_root mismatch → fail-safe
+/// This is safe because same block + same txs → same revm `Database` call sequence
+/// (deterministic). If execution order diverges → wrong values → receipts_root mismatch.
 ///
-/// ## Code handling difference (IDC vs phone)
-///
-/// - IDC: `basic()` returns AccountInfo with `code=Some(...)` → EVM uses directly, no `code_by_hash` call
-/// - Phone: stream Account has no code → AccountInfo with `code=None` → EVM calls `code_by_hash` → lookup from bytecodes map
-/// - Both sides have identical basic/storage/block_hash call counts and order; `code_by_hash` doesn't consume cursor
-///
-/// ## Lazy code resolution
-///
-/// `code_by_hash` first checks `bytecodes` (from the current packet), then falls back to
-/// `code_cache` (local persistent cache). This avoids eagerly cloning the entire cache
-/// into the HashMap — only codes actually needed at runtime are looked up.
+/// `code_by_hash` does NOT consume the cursor — bytecodes are in a separate lookup map.
+/// It first checks `bytecodes` (from the current packet), then falls back to `code_cache`.
 pub struct StreamReplayDB<'a> {
-    /// Pre-encoded read log bytes (output of `encode_read_log`).
     data: Vec<u8>,
-    /// Current byte offset into data (starts at 4, past the entry_count header).
     pos: usize,
-    /// Number of entries consumed so far.
     entries_consumed: u32,
-    /// Total entry count from the header.
     entry_count: u32,
-    /// Bytecodes from the current packet for `code_by_hash` lookups.
     bytecodes: HashMap<B256, Bytecode>,
-    /// Fallback code cache for codes not in the current packet.
     code_cache: Option<&'a mut CodeCache>,
 }
 
@@ -266,51 +223,33 @@ impl std::fmt::Debug for StreamReplayDB<'_> {
     }
 }
 
+fn parse_stream_header(data: &[u8]) -> (u32, usize) {
+    if data.len() >= 4 {
+        (u32::from_le_bytes(data[0..4].try_into().unwrap()), 4)
+    } else {
+        (0, data.len())
+    }
+}
+
 impl<'a> StreamReplayDB<'a> {
-    /// Creates a new replay DB from pre-encoded read log bytes, packet bytecodes,
-    /// and an optional fallback code cache for lazy resolution.
+    /// Creates a new replay DB with a fallback code cache for lazy resolution.
     ///
-    /// `data` is the raw output of `encode_read_log()` — starts with entry_count(4B) header.
+    /// `data` is the raw output of `encode_read_log()` — starts with entry_count (4B) header.
     pub fn new(
         data: Vec<u8>,
         bytecodes: HashMap<B256, Bytecode>,
         code_cache: &'a mut CodeCache,
     ) -> Self {
-        let entry_count = if data.len() >= 4 {
-            u32::from_le_bytes(data[0..4].try_into().unwrap())
-        } else {
-            0
-        };
-        let pos = if data.len() >= 4 { 4 } else { data.len() };
-        Self {
-            data,
-            pos,
-            entries_consumed: 0,
-            entry_count,
-            bytecodes,
-            code_cache: Some(code_cache),
-        }
+        let (entry_count, pos) = parse_stream_header(&data);
+        Self { data, pos, entries_consumed: 0, entry_count, bytecodes, code_cache: Some(code_cache) }
     }
 
     /// Creates a replay DB without a code cache fallback.
     ///
-    /// Use this when all needed bytecodes are already in the `bytecodes` map
-    /// (e.g., in integration tests or when the code cache is unavailable).
+    /// Use when all needed bytecodes are already in the `bytecodes` map.
     pub fn new_without_cache(data: Vec<u8>, bytecodes: HashMap<B256, Bytecode>) -> Self {
-        let entry_count = if data.len() >= 4 {
-            u32::from_le_bytes(data[0..4].try_into().unwrap())
-        } else {
-            0
-        };
-        let pos = if data.len() >= 4 { 4 } else { data.len() };
-        Self {
-            data,
-            pos,
-            entries_consumed: 0,
-            entry_count,
-            bytecodes,
-            code_cache: None,
-        }
+        let (entry_count, pos) = parse_stream_header(&data);
+        Self { data, pos, entries_consumed: 0, entry_count, bytecodes, code_cache: None }
     }
 
     /// Returns the number of entries consumed so far.
@@ -322,7 +261,6 @@ impl<'a> StreamReplayDB<'a> {
     pub fn is_exhausted(&self) -> bool {
         self.entries_consumed >= self.entry_count
     }
-
 }
 
 impl revm::database_interface::Database for StreamReplayDB<'_> {
@@ -330,9 +268,8 @@ impl revm::database_interface::Database for StreamReplayDB<'_> {
 
     fn basic(&mut self, _address: Address) -> Result<Option<AccountInfo>, Self::Error> {
         use n42_execution::read_log::{
-            ACCT_BALANCE_BIT, ACCT_CODE_HASH_BIT, ACCT_NONCE_8B_BIT,
-            ACCT_NONCE_LEN_MASK, ACCT_NONCE_LEN_SHIFT,
-            HEADER_ACCOUNT_NOT_FOUND, HEADER_STORAGE_BASE,
+            ACCT_BALANCE_BIT, ACCT_CODE_HASH_BIT, ACCT_NONCE_8B_BIT, ACCT_NONCE_LEN_MASK,
+            ACCT_NONCE_LEN_SHIFT, HEADER_ACCOUNT_NOT_FOUND, HEADER_STORAGE_BASE,
         };
 
         let cursor = self.entries_consumed as usize;
@@ -355,7 +292,6 @@ impl revm::database_interface::Database for StreamReplayDB<'_> {
             });
         }
 
-        // Account exists (0x01..0x7F)
         let nonce_len = if header & ACCT_NONCE_8B_BIT != 0 {
             8
         } else {
@@ -411,25 +347,16 @@ impl revm::database_interface::Database for StreamReplayDB<'_> {
             KECCAK256_EMPTY
         };
 
-        Ok(Some(AccountInfo {
-            nonce,
-            balance,
-            code_hash,
-            account_id: None,
-            code: None,
-        }))
+        Ok(Some(AccountInfo { nonce, balance, code_hash, account_id: None, code: None }))
     }
 
     fn code_by_hash(&mut self, code_hash: B256) -> Result<Bytecode, Self::Error> {
-        // Does NOT consume cursor — bytecodes are in a separate lookup map.
-        // First check packet bytecodes, then fall back to local code cache.
         if let Some(code) = self.bytecodes.get(&code_hash) {
             return Ok(code.clone());
         }
         if let Some(cache) = self.code_cache.as_mut() {
             if let Some(code) = cache.get(&code_hash) {
                 let bytecode = Bytecode::new_raw(code.clone());
-                // Cache in bytecodes map for subsequent lookups of the same code
                 self.bytecodes.insert(code_hash, bytecode.clone());
                 return Ok(bytecode);
             }
@@ -437,11 +364,7 @@ impl revm::database_interface::Database for StreamReplayDB<'_> {
         Err(StreamDbError::MissingCode(code_hash))
     }
 
-    fn storage(
-        &mut self,
-        _address: Address,
-        _index: U256,
-    ) -> Result<U256, Self::Error> {
+    fn storage(&mut self, _address: Address, _index: U256) -> Result<U256, Self::Error> {
         use n42_execution::read_log::HEADER_STORAGE_BASE;
 
         let cursor = self.entries_consumed as usize;
@@ -452,7 +375,7 @@ impl revm::database_interface::Database for StreamReplayDB<'_> {
         self.pos += 1;
         self.entries_consumed += 1;
 
-        if header < HEADER_STORAGE_BASE || header > HEADER_STORAGE_BASE + 32 {
+        if !(HEADER_STORAGE_BASE..=HEADER_STORAGE_BASE + 32).contains(&header) {
             return Err(StreamDbError::UnexpectedEntry {
                 cursor,
                 expected: "Storage",
@@ -471,7 +394,6 @@ impl revm::database_interface::Database for StreamReplayDB<'_> {
         let mut buf = [0u8; 32];
         buf[32 - value_len..].copy_from_slice(&self.data[self.pos..self.pos + value_len]);
         self.pos += value_len;
-
         Ok(U256::from_be_bytes(buf))
     }
 
@@ -499,77 +421,34 @@ impl revm::database_interface::Database for StreamReplayDB<'_> {
         }
         let h = B256::from_slice(&self.data[self.pos..self.pos + 32]);
         self.pos += 32;
-
         Ok(h)
     }
 }
 
-/// Re-executes a block using the V2 stream-based verification packet.
+/// Re-executes a block using the V2 `StreamPacket` and verifies the receipts root.
 ///
-/// This is the new verification entry point for `StreamPacket`. Instead of
-/// building a keyed CachedReads database, it uses `StreamReplayDB` to replay
-/// state reads in the exact order they occurred during IDC execution.
-///
-/// # Arguments
-///
-/// * `packet` - The stream packet from the IDC node
-/// * `code_cache` - Local bytecode cache (for resolving code_by_hash)
-/// * `chain_spec` - Chain specification for EVM configuration
+/// Uses `StreamReplayDB` to replay state reads in the exact order they occurred
+/// during IDC execution — no intermediate `Vec<ReadLogEntry>` allocation.
 pub fn verify_block_stream(
     packet: &StreamPacket,
     code_cache: &mut CodeCache,
     chain_spec: Arc<ChainSpec>,
 ) -> Result<VerificationResult, VerifyError> {
-    // 1. Decode header from RLP, extract receipts_root, verify hash
-    let header = Header::decode(&mut &packet.header_rlp[..])?;
+    let sealed_header = decode_and_verify_header(&packet.header_rlp, packet.block_hash)?;
     let expected_receipts_root = {
         use alloy_consensus::BlockHeader;
-        header.receipts_root()
+        sealed_header.receipts_root()
     };
-    let sealed_header = SealedHeader::seal_slow(header);
+    let recovered = decode_and_recover(sealed_header, &packet.transactions)?;
 
-    if sealed_header.hash() != packet.block_hash {
-        return Err(VerifyError::HeaderHashMismatch {
-            expected: packet.block_hash,
-            actual: sealed_header.hash(),
-        });
-    }
-
-    // 2. Decode transactions from EIP-2718 envelopes
-    let txs: Vec<EthTx> = packet
-        .transactions
+    let bytecodes_map: HashMap<B256, Bytecode> = packet
+        .bytecodes
         .iter()
-        .map(|rlp| EthTx::decode_2718(&mut &rlp[..]))
-        .collect::<Result<_, _>>()
-        .map_err(VerifyError::TxDecode)?;
+        .map(|(hash, code)| (*hash, Bytecode::new_raw(code.clone())))
+        .collect();
 
-    // 3. Assemble the block and recover senders
-    let body = alloy_consensus::BlockBody {
-        transactions: txs,
-        ommers: vec![],
-        withdrawals: None,
-    };
-    let block = SealedBlock::from_sealed_parts(sealed_header, body);
-    let recovered =
-        RecoveredBlock::try_recover_sealed(block).map_err(|_| VerifyError::SenderRecovery)?;
-
-    // 4. Build bytecodes map from packet only — cache lookup is deferred to StreamReplayDB.
-    //    Only packet.bytecodes are pre-loaded (typically 0-5 new codes per block).
-    //    Local code_cache (potentially 500-2000 entries) is passed by reference to avoid
-    //    eagerly cloning the entire cache into the HashMap.
-    let mut bytecodes_map: HashMap<B256, Bytecode> = HashMap::with_capacity(packet.bytecodes.len());
-    for (hash, code) in &packet.bytecodes {
-        bytecodes_map.insert(*hash, Bytecode::new_raw(code.clone()));
-    }
-
-    // 5. Create StreamReplayDB from raw bytes — no Vec<ReadLogEntry> allocation.
-    //    Passes code_cache for lazy fallback lookups in code_by_hash().
     let db = StreamReplayDB::new(packet.read_log_data.clone(), bytecodes_map, code_cache);
-    let evm_config = N42EvmConfig::new(chain_spec);
-    let mut executor = evm_config.executor(db);
-    let result = executor.execute_one(&recovered)?;
-
-    // 6. Compute receipts root and compare (uses expected_receipts_root extracted at step 1)
+    let result = N42EvmConfig::new(chain_spec).executor(db).execute_one(&recovered)?;
     let computed = Receipt::calculate_receipt_root_no_memo(&result.receipts);
 
     Ok(VerificationResult {
@@ -586,7 +465,6 @@ mod tests {
     use alloy_primitives::{keccak256, Address, Bytes, U256, KECCAK256_EMPTY};
     use alloy_rlp::Encodable;
 
-    /// Helper: create a default Header, RLP-encode it, and compute its hash.
     fn make_sealed_header() -> (Header, Bytes, B256) {
         let header = Header::default();
         let mut buf = Vec::new();
@@ -597,7 +475,6 @@ mod tests {
         (header, header_rlp, hash)
     }
 
-    /// Helper: create a minimal empty-block VerificationPacket with valid header.
     fn make_empty_block_packet() -> VerificationPacket {
         let (header, header_rlp, block_hash) = make_sealed_header();
         use alloy_consensus::BlockHeader;
@@ -620,14 +497,11 @@ mod tests {
         }
     }
 
-    // ── build_cached_reads tests ──
-
     #[test]
     fn test_build_cached_reads_empty() {
         let packet = make_empty_block_packet();
         let mut cache = CodeCache::new(10);
-        let result = build_cached_reads(&packet, &mut cache);
-        assert!(result.is_ok(), "empty packet should build CachedReads successfully");
+        assert!(build_cached_reads(&packet, &mut cache).is_ok());
     }
 
     #[test]
@@ -637,20 +511,17 @@ mod tests {
             address: Address::with_last_byte(0x01),
             nonce: 1,
             balance: U256::from(1000),
-            code_hash: KECCAK256_EMPTY, // EOA
+            code_hash: KECCAK256_EMPTY,
             storage: vec![],
         });
-
         let mut cache = CodeCache::new(10);
-        let result = build_cached_reads(&packet, &mut cache);
-        assert!(result.is_ok(), "EOA account (KECCAK_EMPTY code_hash) should not require bytecode");
+        assert!(build_cached_reads(&packet, &mut cache).is_ok());
     }
 
     #[test]
     fn test_build_cached_reads_contract_from_uncached() {
         let code = Bytes::from(vec![0x60, 0x00, 0x60, 0x00, 0xf3]);
         let code_hash = keccak256(&code);
-
         let mut packet = make_empty_block_packet();
         packet.witness_accounts.push(WitnessAccount {
             address: Address::with_last_byte(0x02),
@@ -660,17 +531,14 @@ mod tests {
             storage: vec![],
         });
         packet.uncached_bytecodes.push((code_hash, code));
-
         let mut cache = CodeCache::new(10);
-        let result = build_cached_reads(&packet, &mut cache);
-        assert!(result.is_ok(), "contract bytecode should be resolved from uncached_bytecodes");
+        assert!(build_cached_reads(&packet, &mut cache).is_ok());
     }
 
     #[test]
     fn test_build_cached_reads_contract_from_cache() {
         let code = Bytes::from(vec![0x60, 0x01, 0x60, 0x00, 0xf3]);
         let code_hash = keccak256(&code);
-
         let mut packet = make_empty_block_packet();
         packet.witness_accounts.push(WitnessAccount {
             address: Address::with_last_byte(0x03),
@@ -679,19 +547,14 @@ mod tests {
             code_hash,
             storage: vec![],
         });
-        // Do NOT put code in uncached_bytecodes — it's in the local cache.
-
         let mut cache = CodeCache::new(10);
         cache.insert(code_hash, code);
-
-        let result = build_cached_reads(&packet, &mut cache);
-        assert!(result.is_ok(), "contract bytecode should be resolved from local CodeCache");
+        assert!(build_cached_reads(&packet, &mut cache).is_ok());
     }
 
     #[test]
     fn test_build_cached_reads_missing_bytecode_error() {
-        let code_hash = B256::with_last_byte(0xFF); // not in cache or uncached
-
+        let code_hash = B256::with_last_byte(0xFF);
         let mut packet = make_empty_block_packet();
         packet.witness_accounts.push(WitnessAccount {
             address: Address::with_last_byte(0x04),
@@ -700,15 +563,9 @@ mod tests {
             code_hash,
             storage: vec![],
         });
-
         let mut cache = CodeCache::new(10);
         let result = build_cached_reads(&packet, &mut cache);
-        assert!(result.is_err(), "missing bytecode should return error");
-        let err = result.unwrap_err();
-        assert!(
-            matches!(err, VerifyError::MissingBytecode(h) if h == code_hash),
-            "error should be MissingBytecode with correct hash"
-        );
+        assert!(matches!(result, Err(VerifyError::MissingBytecode(h)) if h == code_hash));
     }
 
     #[test]
@@ -717,54 +574,41 @@ mod tests {
         let hash_100 = B256::with_last_byte(0x64);
         let hash_101 = B256::with_last_byte(0x65);
         packet.block_hashes = vec![(100, hash_100), (101, hash_101)];
-
         let mut cache = CodeCache::new(10);
         let cached = build_cached_reads(&packet, &mut cache).unwrap();
         assert_eq!(cached.block_hashes.get(&100), Some(&hash_100));
         assert_eq!(cached.block_hashes.get(&101), Some(&hash_101));
     }
 
-    // ── verify_block error path tests ──
-
     #[test]
     fn test_verify_block_header_hash_mismatch() {
         let mut packet = make_empty_block_packet();
-        // Tamper with block_hash
         packet.block_hash = B256::with_last_byte(0xFF);
-
         let mut cache = CodeCache::new(10);
         let chain_spec = n42_chainspec::n42_dev_chainspec();
         let result = verify_block(&packet, &mut cache, chain_spec);
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), VerifyError::HeaderHashMismatch { .. }));
+        assert!(matches!(result, Err(VerifyError::HeaderHashMismatch { .. })));
     }
 
     #[test]
     fn test_verify_block_bad_header_rlp() {
         let mut packet = make_empty_block_packet();
-        packet.header_rlp = Bytes::from(vec![0xFF, 0xFE, 0xFD]); // invalid RLP
-
+        packet.header_rlp = Bytes::from(vec![0xFF, 0xFE, 0xFD]);
         let mut cache = CodeCache::new(10);
         let chain_spec = n42_chainspec::n42_dev_chainspec();
         let result = verify_block(&packet, &mut cache, chain_spec);
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), VerifyError::HeaderDecode(_)));
+        assert!(matches!(result, Err(VerifyError::HeaderDecode(_))));
     }
 
     #[test]
     fn test_verify_block_bad_transaction() {
         let mut packet = make_empty_block_packet();
-        // Add invalid transaction bytes
         packet.transactions.push(Bytes::from(vec![0xFF, 0xFE]));
-
         let mut cache = CodeCache::new(10);
         let chain_spec = n42_chainspec::n42_dev_chainspec();
         let result = verify_block(&packet, &mut cache, chain_spec);
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), VerifyError::TxDecode(_)));
+        assert!(matches!(result, Err(VerifyError::TxDecode(_))));
     }
-
-    // ── update_cache_after_verify test ──
 
     #[test]
     fn test_update_cache_after_verify() {
@@ -772,23 +616,15 @@ mod tests {
         let hash_a = keccak256(&code_a);
         let code_b = Bytes::from(vec![0xBB; 200]);
         let hash_b = keccak256(&code_b);
-
         let mut packet = make_empty_block_packet();
         packet.uncached_bytecodes = vec![(hash_a, code_a.clone()), (hash_b, code_b.clone())];
-
         let mut cache = CodeCache::new(10);
-        assert!(cache.is_empty());
-
         update_cache_after_verify(&packet, &mut cache);
-
         assert_eq!(cache.len(), 2);
         assert_eq!(cache.get(&hash_a).unwrap(), &code_a);
         assert_eq!(cache.get(&hash_b).unwrap(), &code_b);
     }
 
-    // ── StreamReplayDB tests (cursor-based, zero-allocation) ──
-
-    /// Helper: encode entries into raw bytes for StreamReplayDB.
     fn encode_entries(entries: &[n42_execution::read_log::ReadLogEntry]) -> Vec<u8> {
         n42_execution::read_log::encode_read_log(entries)
     }
@@ -804,12 +640,11 @@ mod tests {
             code_hash: KECCAK256_EMPTY,
         }]);
         let mut db = StreamReplayDB::new_without_cache(data, HashMap::new());
-
         let info = db.basic(Address::ZERO).unwrap().expect("should return Some");
         assert_eq!(info.nonce, 10);
         assert_eq!(info.balance, U256::from(5000u64));
         assert_eq!(info.code_hash, KECCAK256_EMPTY);
-        assert!(info.code.is_none()); // StreamReplayDB always returns code=None
+        assert!(info.code.is_none());
         assert!(db.is_exhausted());
     }
 
@@ -820,9 +655,7 @@ mod tests {
 
         let data = encode_entries(&[ReadLogEntry::AccountNotFound]);
         let mut db = StreamReplayDB::new_without_cache(data, HashMap::new());
-
-        let result = db.basic(Address::ZERO).unwrap();
-        assert!(result.is_none());
+        assert!(db.basic(Address::ZERO).unwrap().is_none());
         assert!(db.is_exhausted());
     }
 
@@ -833,9 +666,7 @@ mod tests {
 
         let data = encode_entries(&[ReadLogEntry::Storage(U256::from(42u64))]);
         let mut db = StreamReplayDB::new_without_cache(data, HashMap::new());
-
-        let value = db.storage(Address::ZERO, U256::ZERO).unwrap();
-        assert_eq!(value, U256::from(42u64));
+        assert_eq!(db.storage(Address::ZERO, U256::ZERO).unwrap(), U256::from(42u64));
         assert!(db.is_exhausted());
     }
 
@@ -847,9 +678,7 @@ mod tests {
         let hash = B256::from([0xAB; 32]);
         let data = encode_entries(&[ReadLogEntry::BlockHash(hash)]);
         let mut db = StreamReplayDB::new_without_cache(data, HashMap::new());
-
-        let result = db.block_hash(100).unwrap();
-        assert_eq!(result, hash);
+        assert_eq!(db.block_hash(100).unwrap(), hash);
         assert!(db.is_exhausted());
     }
 
@@ -858,12 +687,9 @@ mod tests {
         use n42_execution::read_log::encode_read_log;
         use revm::database_interface::Database;
 
-        let data = encode_read_log(&[]); // entry_count=0, no entries
+        let data = encode_read_log(&[]);
         let mut db = StreamReplayDB::new_without_cache(data, HashMap::new());
-
-        let result = db.basic(Address::ZERO);
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), StreamDbError::Exhausted(0)));
+        assert!(matches!(db.basic(Address::ZERO), Err(StreamDbError::Exhausted(0))));
     }
 
     #[test]
@@ -871,13 +697,9 @@ mod tests {
         use n42_execution::read_log::ReadLogEntry;
         use revm::database_interface::Database;
 
-        // Expect Account but get Storage
         let data = encode_entries(&[ReadLogEntry::Storage(U256::ZERO)]);
         let mut db = StreamReplayDB::new_without_cache(data, HashMap::new());
-
-        let result = db.basic(Address::ZERO);
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), StreamDbError::UnexpectedEntry { .. }));
+        assert!(matches!(db.basic(Address::ZERO), Err(StreamDbError::UnexpectedEntry { .. })));
     }
 
     #[test]
@@ -889,14 +711,11 @@ mod tests {
         let bytecode = Bytecode::new_raw(Bytes::from(vec![0x60, 0x00]));
         let mut codes = HashMap::new();
         codes.insert(code_hash, bytecode.clone());
-
-        let data = encode_read_log(&[]); // empty log
+        let data = encode_read_log(&[]);
         let mut db = StreamReplayDB::new_without_cache(data, codes);
-
-        // code_by_hash doesn't consume cursor
         let result = db.code_by_hash(code_hash).unwrap();
         assert_eq!(result.original_byte_slice(), bytecode.original_byte_slice());
-        assert_eq!(db.cursor(), 0); // not advanced
+        assert_eq!(db.cursor(), 0);
     }
 
     #[test]
@@ -905,52 +724,35 @@ mod tests {
         use revm::database_interface::Database;
 
         let data = encode_entries(&[
-            ReadLogEntry::Account {
-                nonce: 1,
-                balance: U256::from(100u64),
-                code_hash: KECCAK256_EMPTY,
-            },
+            ReadLogEntry::Account { nonce: 1, balance: U256::from(100u64), code_hash: KECCAK256_EMPTY },
             ReadLogEntry::Storage(U256::from(42u64)),
             ReadLogEntry::AccountNotFound,
             ReadLogEntry::BlockHash(B256::from([0xBB; 32])),
         ]);
         let mut db = StreamReplayDB::new_without_cache(data, HashMap::new());
 
-        // Consume in order
-        let info = db.basic(Address::ZERO).unwrap().unwrap();
-        assert_eq!(info.nonce, 1);
-
-        let val = db.storage(Address::ZERO, U256::ZERO).unwrap();
-        assert_eq!(val, U256::from(42u64));
-
-        let none = db.basic(Address::ZERO).unwrap();
-        assert!(none.is_none());
-
-        let hash = db.block_hash(0).unwrap();
-        assert_eq!(hash, B256::from([0xBB; 32]));
-
+        assert_eq!(db.basic(Address::ZERO).unwrap().unwrap().nonce, 1);
+        assert_eq!(db.storage(Address::ZERO, U256::ZERO).unwrap(), U256::from(42u64));
+        assert!(db.basic(Address::ZERO).unwrap().is_none());
+        assert_eq!(db.block_hash(0).unwrap(), B256::from([0xBB; 32]));
         assert!(db.is_exhausted());
     }
-
-    // ── verify_block_stream error path tests ──
 
     #[test]
     fn test_verify_block_stream_header_hash_mismatch() {
         use n42_execution::read_log::encode_read_log;
         let (_, header_rlp, _) = make_sealed_header();
         let packet = StreamPacket {
-            block_hash: B256::with_last_byte(0xFF), // wrong hash
+            block_hash: B256::with_last_byte(0xFF),
             header_rlp,
             transactions: vec![],
             read_log_data: encode_read_log(&[]),
             bytecodes: vec![],
         };
-
         let mut cache = CodeCache::new(10);
         let chain_spec = n42_chainspec::n42_dev_chainspec();
         let result = verify_block_stream(&packet, &mut cache, chain_spec);
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), VerifyError::HeaderHashMismatch { .. }));
+        assert!(matches!(result, Err(VerifyError::HeaderHashMismatch { .. })));
     }
 
     #[test]
@@ -963,12 +765,10 @@ mod tests {
             read_log_data: encode_read_log(&[]),
             bytecodes: vec![],
         };
-
         let mut cache = CodeCache::new(10);
         let chain_spec = n42_chainspec::n42_dev_chainspec();
         let result = verify_block_stream(&packet, &mut cache, chain_spec);
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), VerifyError::HeaderDecode(_)));
+        assert!(matches!(result, Err(VerifyError::HeaderDecode(_))));
     }
 
     #[test]
@@ -977,7 +777,6 @@ mod tests {
         let (_, header_rlp, block_hash) = make_sealed_header();
         let code = Bytes::from(vec![0xAA; 100]);
         let code_hash = keccak256(&code);
-
         let packet = StreamPacket {
             block_hash,
             header_rlp,
@@ -985,14 +784,11 @@ mod tests {
             read_log_data: encode_read_log(&[]),
             bytecodes: vec![(code_hash, code.clone())],
         };
-
         let mut cache = CodeCache::new(10);
         update_cache_after_stream_verify(&packet, &mut cache);
         assert_eq!(cache.len(), 1);
         assert_eq!(cache.get(&code_hash).unwrap(), &code);
     }
-
-    // ── Additional StreamReplayDB boundary tests ──
 
     #[test]
     fn test_stream_replay_db_storage_zero() {
@@ -1001,9 +797,7 @@ mod tests {
 
         let data = encode_entries(&[ReadLogEntry::Storage(U256::ZERO)]);
         let mut db = StreamReplayDB::new_without_cache(data, HashMap::new());
-
-        let value = db.storage(Address::ZERO, U256::ZERO).unwrap();
-        assert_eq!(value, U256::ZERO);
+        assert_eq!(db.storage(Address::ZERO, U256::ZERO).unwrap(), U256::ZERO);
         assert!(db.is_exhausted());
     }
 
@@ -1014,9 +808,7 @@ mod tests {
 
         let data = encode_entries(&[ReadLogEntry::Storage(U256::MAX)]);
         let mut db = StreamReplayDB::new_without_cache(data, HashMap::new());
-
-        let value = db.storage(Address::ZERO, U256::ZERO).unwrap();
-        assert_eq!(value, U256::MAX);
+        assert_eq!(db.storage(Address::ZERO, U256::ZERO).unwrap(), U256::MAX);
     }
 
     #[test]
@@ -1031,7 +823,6 @@ mod tests {
             code_hash,
         }]);
         let mut db = StreamReplayDB::new_without_cache(data, HashMap::new());
-
         let info = db.basic(Address::ZERO).unwrap().expect("should return Some");
         assert_eq!(info.nonce, 1);
         assert_eq!(info.balance, U256::from(5000u64));
@@ -1050,7 +841,6 @@ mod tests {
             code_hash: KECCAK256_EMPTY,
         }]);
         let mut db = StreamReplayDB::new_without_cache(data, HashMap::new());
-
         let info = db.basic(Address::ZERO).unwrap().unwrap();
         assert_eq!(info.nonce, u64::MAX);
         assert_eq!(info.balance, U256::MAX);
@@ -1064,10 +854,7 @@ mod tests {
         let missing_hash = B256::from([0xDD; 32]);
         let data = encode_read_log(&[]);
         let mut db = StreamReplayDB::new_without_cache(data, HashMap::new());
-
-        let result = db.code_by_hash(missing_hash);
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), StreamDbError::MissingCode(h) if h == missing_hash));
+        assert!(matches!(db.code_by_hash(missing_hash), Err(StreamDbError::MissingCode(h)) if h == missing_hash));
     }
 
     #[test]
@@ -1087,13 +874,11 @@ mod tests {
         }]);
         let mut db = StreamReplayDB::new_without_cache(data, codes);
 
-        // Multiple code_by_hash calls should not advance cursor
         let _ = db.code_by_hash(code_hash).unwrap();
         let _ = db.code_by_hash(code_hash).unwrap();
         let _ = db.code_by_hash(code_hash).unwrap();
         assert_eq!(db.cursor(), 0);
 
-        // basic() should still work after code_by_hash calls
         let info = db.basic(Address::ZERO).unwrap().unwrap();
         assert_eq!(info.nonce, 1);
         assert_eq!(db.cursor(), 1);
@@ -1104,21 +889,16 @@ mod tests {
         use n42_execution::read_log::ReadLogEntry;
         use revm::database_interface::Database;
 
-        // Expect storage but get an Account entry
         let data = encode_entries(&[ReadLogEntry::Account {
             nonce: 0,
             balance: U256::ZERO,
             code_hash: KECCAK256_EMPTY,
         }]);
         let mut db = StreamReplayDB::new_without_cache(data, HashMap::new());
-
-        let result = db.storage(Address::ZERO, U256::ZERO);
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), StreamDbError::UnexpectedEntry {
-            expected: "Storage",
-            actual: "Account",
-            ..
-        }));
+        assert!(matches!(
+            db.storage(Address::ZERO, U256::ZERO),
+            Err(StreamDbError::UnexpectedEntry { expected: "Storage", actual: "Account", .. })
+        ));
     }
 
     #[test]
@@ -1128,14 +908,10 @@ mod tests {
 
         let data = encode_entries(&[ReadLogEntry::BlockHash(B256::ZERO)]);
         let mut db = StreamReplayDB::new_without_cache(data, HashMap::new());
-
-        let result = db.storage(Address::ZERO, U256::ZERO);
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), StreamDbError::UnexpectedEntry {
-            expected: "Storage",
-            actual: "BlockHash",
-            ..
-        }));
+        assert!(matches!(
+            db.storage(Address::ZERO, U256::ZERO),
+            Err(StreamDbError::UnexpectedEntry { expected: "Storage", actual: "BlockHash", .. })
+        ));
     }
 
     #[test]
@@ -1145,14 +921,10 @@ mod tests {
 
         let data = encode_entries(&[ReadLogEntry::AccountNotFound]);
         let mut db = StreamReplayDB::new_without_cache(data, HashMap::new());
-
-        let result = db.block_hash(0);
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), StreamDbError::UnexpectedEntry {
-            expected: "BlockHash",
-            actual: "Account",
-            ..
-        }));
+        assert!(matches!(
+            db.block_hash(0),
+            Err(StreamDbError::UnexpectedEntry { expected: "BlockHash", actual: "Account", .. })
+        ));
     }
 
     #[test]
@@ -1162,21 +934,16 @@ mod tests {
 
         let data = encode_entries(&[ReadLogEntry::Storage(U256::from(42u64))]);
         let mut db = StreamReplayDB::new_without_cache(data, HashMap::new());
-
-        let result = db.block_hash(0);
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), StreamDbError::UnexpectedEntry {
-            expected: "BlockHash",
-            actual: "Storage",
-            ..
-        }));
+        assert!(matches!(
+            db.block_hash(0),
+            Err(StreamDbError::UnexpectedEntry { expected: "BlockHash", actual: "Storage", .. })
+        ));
     }
 
     #[test]
     fn test_stream_replay_db_empty_data() {
         use revm::database_interface::Database;
 
-        // Empty data (< 4 bytes)
         let mut db = StreamReplayDB::new_without_cache(vec![], HashMap::new());
         assert!(db.is_exhausted());
         assert!(db.basic(Address::ZERO).is_err());
@@ -1186,17 +953,14 @@ mod tests {
     fn test_stream_replay_db_corrupted_balance_len() {
         use revm::database_interface::Database;
 
-        // Hand-craft data with balance_len > 32
         let mut data = vec![0x01, 0x00, 0x00, 0x00]; // entry_count = 1
         let header = n42_execution::read_log::ACCT_EXISTS_BIT
             | n42_execution::read_log::ACCT_BALANCE_BIT;
         data.push(header);
         data.push(33); // balance_len = 33 (invalid)
         data.extend_from_slice(&[0xFF; 33]);
-
         let mut db = StreamReplayDB::new_without_cache(data, HashMap::new());
-        let result = db.basic(Address::ZERO);
-        assert!(result.is_err(), "corrupted balance_len should error, not panic");
+        assert!(db.basic(Address::ZERO).is_err());
     }
 
     #[test]
@@ -1213,13 +977,10 @@ mod tests {
 
         assert_eq!(db.cursor(), 0);
         assert!(!db.is_exhausted());
-
         db.basic(Address::ZERO).unwrap();
         assert_eq!(db.cursor(), 1);
-
         db.storage(Address::ZERO, U256::ZERO).unwrap();
         assert_eq!(db.cursor(), 2);
-
         db.block_hash(0).unwrap();
         assert_eq!(db.cursor(), 3);
         assert!(db.is_exhausted());
@@ -1232,9 +993,7 @@ mod tests {
 
         let data = encode_entries(&[ReadLogEntry::BlockHash(B256::ZERO)]);
         let mut db = StreamReplayDB::new_without_cache(data, HashMap::new());
-
-        let result = db.block_hash(0).unwrap();
-        assert_eq!(result, B256::ZERO);
+        assert_eq!(db.block_hash(0).unwrap(), B256::ZERO);
     }
 
     #[test]
@@ -1244,8 +1003,6 @@ mod tests {
 
         let code_hash = B256::from([0xCC; 32]);
         let code = Bytes::from(vec![0x60, 0x00, 0xF3]);
-
-        // Put code only in the local cache, not in the packet bytecodes
         let mut cache = CodeCache::new(10);
         cache.insert(code_hash, code.clone());
 
@@ -1254,20 +1011,16 @@ mod tests {
             balance: U256::ZERO,
             code_hash,
         }]);
-
-        // Packet bytecodes is empty — code should be found via lazy cache fallback
         let mut db = StreamReplayDB::new(data, HashMap::new(), &mut cache);
 
         let info = db.basic(Address::ZERO).unwrap().unwrap();
         assert_eq!(info.code_hash, code_hash);
-        assert!(info.code.is_none()); // basic() always returns None for code
+        assert!(info.code.is_none());
 
-        // code_by_hash should find it via the cache fallback
         let resolved = db.code_by_hash(code_hash).unwrap();
         assert_eq!(resolved.original_byte_slice(), &code[..]);
-        assert_eq!(db.cursor(), 1); // code_by_hash doesn't advance cursor
+        assert_eq!(db.cursor(), 1);
 
-        // Second call should hit the cached bytecodes map (populated on first lookup)
         let resolved2 = db.code_by_hash(code_hash).unwrap();
         assert_eq!(resolved2.original_byte_slice(), &code[..]);
     }
@@ -1278,8 +1031,8 @@ mod tests {
         use revm::database_interface::Database;
 
         let code_hash = B256::from([0xDD; 32]);
-        let packet_code = Bytes::from(vec![0x60, 0x01]); // newer version
-        let cache_code = Bytes::from(vec![0x60, 0x00]); // older cached version
+        let packet_code = Bytes::from(vec![0x60, 0x01]);
+        let cache_code = Bytes::from(vec![0x60, 0x00]);
 
         let mut cache = CodeCache::new(10);
         cache.insert(code_hash, cache_code);
@@ -1289,8 +1042,6 @@ mod tests {
 
         let data = encode_read_log(&[]);
         let mut db = StreamReplayDB::new(data, codes, &mut cache);
-
-        // Packet bytecodes should take precedence over cache
         let resolved = db.code_by_hash(code_hash).unwrap();
         assert_eq!(resolved.original_byte_slice(), &packet_code[..]);
     }

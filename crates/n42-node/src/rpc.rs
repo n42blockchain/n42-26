@@ -14,7 +14,6 @@ use std::sync::Arc;
 use tokio::sync::broadcast;
 use tracing::{info, warn};
 
-/// Response for n42_consensusStatus.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConsensusStatusResponse {
@@ -24,7 +23,6 @@ pub struct ConsensusStatusResponse {
     pub has_committed_qc: bool,
 }
 
-/// Response for n42_validatorSet.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ValidatorInfoResponse {
@@ -32,7 +30,6 @@ pub struct ValidatorInfoResponse {
     pub public_key: String,
 }
 
-/// Response for n42_submitAttestation.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AttestationResponse {
@@ -41,7 +38,6 @@ pub struct AttestationResponse {
     pub threshold_reached: bool,
 }
 
-/// Response for n42_health.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HealthResponse {
@@ -50,7 +46,6 @@ pub struct HealthResponse {
     pub validator_count: u32,
 }
 
-/// Response for n42_attestationStats.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AttestationStatsResponse {
@@ -59,7 +54,6 @@ pub struct AttestationStatsResponse {
     pub latest_block: Option<u64>,
 }
 
-/// Response for n42_equivocations.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EquivocationsResponse {
@@ -70,22 +64,17 @@ pub struct EquivocationsResponse {
 /// N42-specific RPC API.
 #[rpc(server, namespace = "n42")]
 pub trait N42Api {
-    /// Returns the node health status for load balancers and K8s probes.
-    /// Returns "ok" when consensus has committed at least one block,
-    /// "syncing" when no block has been committed yet.
+    /// Returns "ok" when consensus has committed at least one block, "syncing" otherwise.
     #[method(name = "health")]
     async fn health(&self) -> RpcResult<HealthResponse>;
 
-    /// Returns the current consensus status.
     #[method(name = "consensusStatus")]
     async fn consensus_status(&self) -> RpcResult<ConsensusStatusResponse>;
 
-    /// Returns the current validator set.
     #[method(name = "validatorSet")]
     async fn validator_set(&self) -> RpcResult<Vec<ValidatorInfoResponse>>;
 
-    /// Mobile subscribes to verification tasks. Pushes a notification each time
-    /// a new block is committed by consensus.
+    /// Pushes a notification each time a new block is committed by consensus.
     #[subscription(name = "subscribeVerification", unsubscribe = "unsubscribeVerification", item = VerificationTask)]
     async fn subscribe_verification(&self) -> SubscriptionResult;
 
@@ -99,20 +88,16 @@ pub trait N42Api {
         slot: u64,
     ) -> RpcResult<AttestationResponse>;
 
-    /// Returns the attestation record for a specific block hash.
     #[method(name = "blockAttestation")]
     async fn block_attestation(&self, block_hash: B256) -> RpcResult<Option<AttestationRecord>>;
 
-    /// Returns summary statistics about mobile attestation history.
     #[method(name = "attestationStats")]
     async fn attestation_stats(&self) -> RpcResult<AttestationStatsResponse>;
 
-    /// Returns all recorded equivocation evidence.
     #[method(name = "equivocations")]
     async fn equivocations(&self) -> RpcResult<EquivocationsResponse>;
 }
 
-/// Implementation of the N42 RPC API.
 pub struct N42RpcServer {
     consensus_state: Arc<SharedConsensusState>,
 }
@@ -127,9 +112,8 @@ impl N42RpcServer {
 impl N42ApiServer for N42RpcServer {
     async fn health(&self) -> RpcResult<HealthResponse> {
         let has_qc = self.consensus_state.load_committed_qc().is_some();
-        let status = if has_qc { "ok" } else { "syncing" };
         Ok(HealthResponse {
-            status: status.to_string(),
+            status: if has_qc { "ok" } else { "syncing" }.to_string(),
             has_committed_qc: has_qc,
             validator_count: self.consensus_state.validator_set.len(),
         })
@@ -138,11 +122,7 @@ impl N42ApiServer for N42RpcServer {
     async fn consensus_status(&self) -> RpcResult<ConsensusStatusResponse> {
         let committed_qc = self.consensus_state.load_committed_qc();
         let (view, block_hash, has_qc) = match committed_qc.as_ref() {
-            Some(qc) => (
-                Some(qc.view),
-                Some(format!("{:?}", qc.block_hash)),
-                true,
-            ),
+            Some(qc) => (Some(qc.view), Some(format!("{:?}", qc.block_hash)), true),
             None => (None, None, false),
         };
 
@@ -188,16 +168,13 @@ impl N42ApiServer for N42RpcServer {
                         )
                         .expect("VerificationTask serialization cannot fail");
                         if sink.send(msg).await.is_err() {
-                            break; // client disconnected
+                            break;
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         warn!(skipped = n, "verification subscription lagged");
-                        continue;
                     }
-                    Err(broadcast::error::RecvError::Closed) => {
-                        break; // channel closed
-                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
         });
@@ -212,11 +189,8 @@ impl N42ApiServer for N42RpcServer {
         block_hash: B256,
         slot: u64,
     ) -> RpcResult<AttestationResponse> {
-        // 1. Decode pubkey hex -> 48 bytes -> BlsPublicKey
-        let pubkey_hex = pubkey.strip_prefix("0x").unwrap_or(&pubkey);
-        let pubkey_bytes = hex::decode(pubkey_hex).map_err(|e| {
-            ErrorObjectOwned::owned(-32602, format!("invalid pubkey hex: {e}"), None::<()>)
-        })?;
+        let pubkey_bytes = hex::decode(pubkey.strip_prefix("0x").unwrap_or(&pubkey))
+            .map_err(|e| ErrorObjectOwned::owned(-32602, format!("invalid pubkey hex: {e}"), None::<()>))?;
 
         let pubkey_array: [u8; 48] = pubkey_bytes.try_into().map_err(|v: Vec<u8>| {
             ErrorObjectOwned::owned(
@@ -226,15 +200,11 @@ impl N42ApiServer for N42RpcServer {
             )
         })?;
 
-        let bls_pubkey = BlsPublicKey::from_bytes(&pubkey_array).map_err(|e| {
-            ErrorObjectOwned::owned(-32602, format!("invalid BLS public key: {e}"), None::<()>)
-        })?;
+        let bls_pubkey = BlsPublicKey::from_bytes(&pubkey_array)
+            .map_err(|e| ErrorObjectOwned::owned(-32602, format!("invalid BLS public key: {e}"), None::<()>))?;
 
-        // 2. Decode signature hex -> 96 bytes -> BlsSignature
-        let sig_hex = signature.strip_prefix("0x").unwrap_or(&signature);
-        let sig_bytes = hex::decode(sig_hex).map_err(|e| {
-            ErrorObjectOwned::owned(-32602, format!("invalid signature hex: {e}"), None::<()>)
-        })?;
+        let sig_bytes = hex::decode(signature.strip_prefix("0x").unwrap_or(&signature))
+            .map_err(|e| ErrorObjectOwned::owned(-32602, format!("invalid signature hex: {e}"), None::<()>))?;
 
         let sig_array: [u8; 96] = sig_bytes.try_into().map_err(|v: Vec<u8>| {
             ErrorObjectOwned::owned(
@@ -244,50 +214,24 @@ impl N42ApiServer for N42RpcServer {
             )
         })?;
 
-        let bls_sig = BlsSignature::from_bytes(&sig_array).map_err(|e| {
-            ErrorObjectOwned::owned(-32602, format!("invalid BLS signature: {e}"), None::<()>)
+        let bls_sig = BlsSignature::from_bytes(&sig_array)
+            .map_err(|e| ErrorObjectOwned::owned(-32602, format!("invalid BLS signature: {e}"), None::<()>))?;
+
+        bls_pubkey.verify(block_hash.as_slice(), &bls_sig).map_err(|e| {
+            ErrorObjectOwned::owned(-32003, format!("BLS signature verification failed: {e}"), None::<()>)
         })?;
 
-        // 3. Verify BLS signature over block_hash
-        bls_pubkey
-            .verify(block_hash.as_slice(), &bls_sig)
-            .map_err(|e| {
-                ErrorObjectOwned::owned(
-                    -32003,
-                    format!("BLS signature verification failed: {e}"),
-                    None::<()>,
-                )
-            })?;
-
-        // 4. Record attestation
         let canonical_pubkey_hex = hex::encode(pubkey_array);
-        let mut att_state =
-            self.consensus_state
-                .attestation_state
-                .lock()
-                .map_err(|_| {
-                    ErrorObjectOwned::owned(
-                        -32603,
-                        "internal error: attestation state lock poisoned",
-                        None::<()>,
-                    )
-                })?;
+        let mut att_state = self.consensus_state.attestation_state.lock().map_err(|_| {
+            ErrorObjectOwned::owned(-32603, "internal error: attestation state lock poisoned", None::<()>)
+        })?;
 
         match att_state.record_attestation(block_hash, canonical_pubkey_hex) {
             Some((count, threshold_reached)) => {
                 if threshold_reached {
-                    info!(
-                        %block_hash,
-                        slot,
-                        count,
-                        "mobile attestation threshold reached"
-                    );
+                    info!(%block_hash, slot, count, "mobile attestation threshold reached");
                 }
-                Ok(AttestationResponse {
-                    accepted: true,
-                    attestation_count: count,
-                    threshold_reached,
-                })
+                Ok(AttestationResponse { accepted: true, attestation_count: count, threshold_reached })
             }
             None => Err(ErrorObjectOwned::owned(
                 -32001,
@@ -312,10 +256,7 @@ impl N42ApiServer for N42RpcServer {
 
     async fn equivocations(&self) -> RpcResult<EquivocationsResponse> {
         let evidence = self.consensus_state.get_equivocations();
-        Ok(EquivocationsResponse {
-            total: evidence.len(),
-            evidence,
-        })
+        Ok(EquivocationsResponse { total: evidence.len(), evidence })
     }
 }
 
@@ -334,14 +275,12 @@ mod tests {
     }
 
     fn make_rpc_with_validators(count: usize) -> N42RpcServer {
-        let mut validators = Vec::new();
-        for _ in 0..count {
-            let sk = BlsSecretKey::random().unwrap();
-            validators.push(ValidatorInfo {
-                address: Address::ZERO,
-                bls_public_key: sk.public_key(),
-            });
-        }
+        let validators: Vec<_> = (0..count)
+            .map(|_| {
+                let sk = BlsSecretKey::random().unwrap();
+                ValidatorInfo { address: Address::ZERO, bls_public_key: sk.public_key() }
+            })
+            .collect();
         let vs = ValidatorSet::new(&validators, 0);
         let state = Arc::new(SharedConsensusState::new(vs));
         N42RpcServer::new(state)
@@ -428,28 +367,19 @@ mod tests {
     #[tokio::test]
     async fn test_submit_attestation_invalid_hex() {
         let rpc = make_rpc();
-        let result = rpc.submit_attestation(
-            "not_hex".into(),
-            "0000".into(),
-            B256::ZERO,
-            0,
-        ).await;
+        let result = rpc
+            .submit_attestation("not_hex".into(), "0000".into(), B256::ZERO, 0)
+            .await;
         assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert_eq!(err.code(), -32602);
+        assert_eq!(result.unwrap_err().code(), -32602);
     }
 
     #[tokio::test]
     async fn test_submit_attestation_wrong_pubkey_length() {
         let rpc = make_rpc();
-        // Valid hex, but only 32 bytes instead of required 48
-        let short_pubkey = hex::encode([0u8; 32]);
-        let result = rpc.submit_attestation(
-            short_pubkey,
-            hex::encode([0u8; 96]),
-            B256::ZERO,
-            0,
-        ).await;
+        let result = rpc
+            .submit_attestation(hex::encode([0u8; 32]), hex::encode([0u8; 96]), B256::ZERO, 0)
+            .await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert_eq!(err.code(), -32602);
@@ -460,15 +390,14 @@ mod tests {
     async fn test_submit_attestation_wrong_sig_length() {
         let rpc = make_rpc();
         let sk = BlsSecretKey::random().unwrap();
-        let pubkey_hex = hex::encode(sk.public_key().to_bytes());
-        // Valid hex, but only 48 bytes instead of required 96
-        let short_sig = hex::encode([0u8; 48]);
-        let result = rpc.submit_attestation(
-            pubkey_hex,
-            short_sig,
-            B256::ZERO,
-            0,
-        ).await;
+        let result = rpc
+            .submit_attestation(
+                hex::encode(sk.public_key().to_bytes()),
+                hex::encode([0u8; 48]),
+                B256::ZERO,
+                0,
+            )
+            .await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert_eq!(err.code(), -32602);
@@ -481,33 +410,38 @@ mod tests {
         let sk = BlsSecretKey::random().unwrap();
         let block_hash = B256::repeat_byte(0xCC);
         let sig = sk.sign(block_hash.as_slice());
-        let pubkey_hex = hex::encode(sk.public_key().to_bytes());
-        let sig_hex = hex::encode(sig.to_bytes());
 
-        // Block not registered for attestation tracking → error -32001
-        let result = rpc.submit_attestation(pubkey_hex, sig_hex, block_hash, 1).await;
+        let result = rpc
+            .submit_attestation(
+                hex::encode(sk.public_key().to_bytes()),
+                hex::encode(sig.to_bytes()),
+                block_hash,
+                1,
+            )
+            .await;
         assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert_eq!(err.code(), -32001);
+        assert_eq!(result.unwrap_err().code(), -32001);
     }
 
     #[tokio::test]
     async fn test_submit_attestation_valid() {
         let vs = ValidatorSet::new(&[], 0);
         let state = Arc::new(SharedConsensusState::new(vs));
-
-        // Register block for attestation tracking
         let block_hash = B256::repeat_byte(0xDD);
         state.notify_block_committed(block_hash, 10);
 
         let rpc = N42RpcServer::new(state);
-
         let sk = BlsSecretKey::random().unwrap();
         let sig = sk.sign(block_hash.as_slice());
-        let pubkey_hex = hex::encode(sk.public_key().to_bytes());
-        let sig_hex = hex::encode(sig.to_bytes());
 
-        let result = rpc.submit_attestation(pubkey_hex, sig_hex, block_hash, 10).await;
+        let result = rpc
+            .submit_attestation(
+                hex::encode(sk.public_key().to_bytes()),
+                hex::encode(sig.to_bytes()),
+                block_hash,
+                10,
+            )
+            .await;
         assert!(result.is_ok());
         let resp = result.unwrap();
         assert!(resp.accepted);
@@ -528,9 +462,7 @@ mod tests {
         assert_eq!(r.block_number, 5);
         assert_eq!(r.valid_count, 3);
 
-        // Unknown hash
-        let none = rpc.block_attestation(B256::ZERO).await.unwrap();
-        assert!(none.is_none());
+        assert!(rpc.block_attestation(B256::ZERO).await.unwrap().is_none());
     }
 
     #[tokio::test]

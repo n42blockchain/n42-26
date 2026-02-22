@@ -106,9 +106,7 @@ start_log_watcher() {
     local log_files=()
     for i in $(seq 0 $((NUM_NODES - 1))); do
         local lf="$DATA_DIR/validator-${i}.log"
-        if [[ -f "$lf" ]]; then
-            log_files+=("$lf")
-        fi
+        [[ -f "$lf" ]] && log_files+=("$lf")
     done
 
     if [[ ${#log_files[@]} -eq 0 ]]; then
@@ -116,7 +114,6 @@ start_log_watcher() {
         return 1
     fi
 
-    # tail -F follows through renames/rotations
     tail -F "${log_files[@]}" 2>/dev/null | while IFS= read -r line; do
         if echo "$line" | grep -qEi "$ERROR_PATTERNS"; then
             log_error "$line"
@@ -186,14 +183,13 @@ log_info "Starting health check loop (every ${HEALTH_CHECK_INTERVAL}s)"
 while true; do
     sleep "$HEALTH_CHECK_INTERVAL"
 
-    # --- Check PIDs (crash detection) ---
+    # Check PIDs for crashes
     for i in $(seq 0 $((NUM_NODES - 1))); do
         if [[ $i -lt ${#NODE_PIDS[@]} ]]; then
             local_pid="${NODE_PIDS[$i]}"
             if [[ -n "$local_pid" ]] && ! kill -0 "$local_pid" 2>/dev/null; then
                 log_crash "Validator $i (PID $local_pid) has CRASHED!"
 
-                # Capture last 50 lines of log
                 local crash_log_file="$DATA_DIR/validator-${i}.log"
                 if [[ -f "$crash_log_file" ]]; then
                     echo "--- Last 50 lines of validator $i log at $(ts) ---" >> "$CRASH_LOG"
@@ -201,7 +197,6 @@ while true; do
                     echo "--- End of crash context ---" >> "$CRASH_LOG"
                 fi
 
-                # Snapshot all node block heights
                 echo "--- Block height snapshot at crash time ---" >> "$CRASH_LOG"
                 for j in $(seq 0 $((NUM_NODES - 1))); do
                     local port=$((BASE_HTTP_RPC + j))
@@ -211,13 +206,12 @@ while true; do
                 done
                 echo "--- End snapshot ---" >> "$CRASH_LOG"
 
-                # Clear the PID so we don't keep alerting
                 NODE_PIDS[$i]=""
             fi
         fi
     done
 
-    # --- Query block heights from all nodes ---
+    # Query block heights from all nodes
     declare -a HEIGHTS=()
     local alive_count=0
     local max_height=0
@@ -236,28 +230,28 @@ while true; do
         fi
     done
 
-    # --- Report status ---
+    # Report status
     local height_summary=""
     for i in $(seq 0 $((NUM_NODES - 1))); do
         height_summary+="v${i}=${HEIGHTS[$i]:-?} "
     done
     log_info "Health: ${alive_count}/${NUM_NODES} alive  blocks: ${height_summary}"
 
-    # --- Check for block height divergence ---
+    # Check for block height divergence
     if [[ $alive_count -ge 2 && $min_height -ge 0 ]]; then
         local divergence=$((max_height - min_height))
         if [[ $divergence -gt $MAX_HEIGHT_DIVERGENCE ]]; then
-            log_warn "Block height divergence: $divergence blocks (max=$max_height min=$min_height) — possible fork or sync issue"
+            log_warn "Block height divergence: $divergence blocks (max=$max_height min=$min_height)"
         fi
     fi
 
-    # --- Check for stalled chain (no block progress in 2 check intervals) ---
+    # Check for stalled chain (no block progress)
     if [[ -n "${LAST_MAX_HEIGHT:-}" && "$max_height" -le "$LAST_MAX_HEIGHT" && $alive_count -gt 0 ]]; then
-        log_warn "Chain may be stalled: block height unchanged at $max_height for ${HEALTH_CHECK_INTERVAL}s"
+        log_warn "Chain may be stalled: block height unchanged at $max_height"
     fi
     LAST_MAX_HEIGHT=$max_height
 
-    # --- Try consensus status on node 0 ---
+    # Check consensus status on node 0
     local consensus_result
     consensus_result=$(rpc_call "$BASE_HTTP_RPC" "n42_consensusStatus")
     if [[ -n "$consensus_result" ]] && echo "$consensus_result" | grep -q '"error"'; then

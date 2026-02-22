@@ -1,10 +1,5 @@
 //! Full integration test suite for the N42 HotStuff-2 consensus engine.
-//!
-//! Tests cover: genesis bootstrap, multi-node consensus, mobile verification,
-//! fault tolerance, boundary conditions, stress performance, and stability.
-//!
-//! The `TestHarness` simulates multiple consensus engines exchanging messages
-//! via synchronous routing—no real network, fully deterministic.
+//! Tests genesis bootstrap, multi-node consensus, mobile verification, fault tolerance, and stability.
 
 use alloy_primitives::{Address, B256};
 use n42_chainspec::ValidatorInfo;
@@ -18,31 +13,18 @@ use n42_primitives::consensus::{
 use n42_primitives::BlsSecretKey;
 use tokio::sync::mpsc;
 
-// ══════════════════════════════════════════════════════════════════════════════
-// Deterministic key generators (TEST ONLY)
-// ══════════════════════════════════════════════════════════════════════════════
-
-/// Deterministic BLS secret key from a small index.
-/// The bytes are arranged so that the big-endian scalar is small and valid.
 fn test_bls_key(index: u32) -> BlsSecretKey {
     let mut bytes = [0u8; 32];
-    // Place (index+1) in the last 4 bytes (big-endian) → small valid scalar
-    let val = (index + 1) as u32;
-    bytes[28..32].copy_from_slice(&val.to_be_bytes());
+    bytes[28..32].copy_from_slice(&((index + 1) as u32).to_be_bytes());
     BlsSecretKey::from_bytes(&bytes).expect("deterministic BLS key should be valid")
 }
 
-/// Deterministic BLS signing key for mobile verifiers from an index.
 fn test_mobile_bls_key(index: u32) -> BlsSecretKey {
     let mut bytes = [0u8; 32];
     bytes[..4].copy_from_slice(&index.to_le_bytes());
     bytes[31] = 0xED;
     BlsSecretKey::key_gen(&bytes).expect("deterministic mobile BLS key should be valid")
 }
-
-// ══════════════════════════════════════════════════════════════════════════════
-// TestHarness
-// ══════════════════════════════════════════════════════════════════════════════
 
 struct TestHarness {
     engines: Vec<ConsensusEngine>,
@@ -95,7 +77,6 @@ impl TestHarness {
         }
     }
 
-    /// Drains all pending outputs from engine `idx`.
     fn drain_outputs(&mut self, idx: usize) -> Vec<EngineOutput> {
         let mut outputs = Vec::new();
         while let Ok(o) = self.output_rxs[idx].try_recv() {
@@ -104,23 +85,16 @@ impl TestHarness {
         outputs
     }
 
-    /// Drains outputs from all engines. Returns a Vec of Vecs.
     fn drain_all_outputs(&mut self) -> Vec<Vec<EngineOutput>> {
         (0..self.engines.len())
             .map(|i| self.drain_outputs(i))
             .collect()
     }
 
-    /// Returns the number of validators.
     fn n(&self) -> usize {
         self.engines.len()
     }
 
-    /// Runs a full two-round consensus for the given view and block hash.
-    ///
-    /// For n=1: everything completes in one `BlockReady` call.
-    /// For n>=2: routes Proposal → Votes → PrepareQC → CommitVotes → Committed,
-    /// then advances all non-leader engines to the next view.
     fn run_consensus_round(&mut self, view: ViewNumber, block_hash: B256) {
         let n = self.n();
         let leader = (view % n as u64) as usize;
@@ -149,18 +123,15 @@ impl TestHarness {
             .process_event(ConsensusEvent::BlockReady(block_hash))
             .expect("leader BlockReady should succeed");
 
-        let leader_outputs = self.drain_outputs(leader);
-        let proposal = leader_outputs
-            .iter()
+        let proposal = self.drain_outputs(leader)
+            .into_iter()
             .find_map(|o| match o {
-                EngineOutput::BroadcastMessage(msg @ ConsensusMessage::Proposal(_)) => {
-                    Some(msg.clone())
-                }
+                EngineOutput::BroadcastMessage(msg @ ConsensusMessage::Proposal(_)) => Some(msg),
                 _ => None,
             })
             .expect("leader should broadcast Proposal");
 
-        // ── Step 2: Route Proposal to all non-leaders ──
+
         for i in 0..n {
             if i != leader {
                 self.engines[i]
@@ -169,10 +140,6 @@ impl TestHarness {
             }
         }
 
-        // ── Step 2.5: Simulate block data import for non-leaders ──
-        // In production, the leader broadcasts block data via /n42/blocks/1 topic
-        // and the orchestrator sends BlockImported after new_payload succeeds.
-        // In this test harness, we simulate immediate block data availability.
         let proposal_block_hash = match &proposal {
             ConsensusMessage::Proposal(p) => p.block_hash,
             _ => unreachable!(),
@@ -185,11 +152,9 @@ impl TestHarness {
             }
         }
 
-        // ── Step 3: Route Votes from non-leaders to leader ──
         for i in 0..n {
             if i != leader {
-                let outputs = self.drain_outputs(i);
-                for output in outputs {
+                for output in self.drain_outputs(i) {
                     if let EngineOutput::SendToValidator(target, msg) = output {
                         if target == leader as u32 {
                             self.engines[leader]
@@ -201,14 +166,10 @@ impl TestHarness {
             }
         }
 
-        // ── Step 4: Route PrepareQC from leader to all non-leaders ──
-        let leader_outputs = self.drain_outputs(leader);
-        let prepare_qc = leader_outputs
-            .iter()
+        let prepare_qc = self.drain_outputs(leader)
+            .into_iter()
             .find_map(|o| match o {
-                EngineOutput::BroadcastMessage(msg @ ConsensusMessage::PrepareQC(_)) => {
-                    Some(msg.clone())
-                }
+                EngineOutput::BroadcastMessage(msg @ ConsensusMessage::PrepareQC(_)) => Some(msg),
                 _ => None,
             })
             .expect("leader should broadcast PrepareQC");
@@ -221,14 +182,9 @@ impl TestHarness {
             }
         }
 
-        // ── Step 5: Route CommitVotes from non-leaders to leader ──
-        // After quorum is reached, the leader commits and advances view.
-        // Late commit votes from remaining validators will get ViewMismatch,
-        // which is expected behavior—we ignore those errors.
         for i in 0..n {
             if i != leader {
-                let outputs = self.drain_outputs(i);
-                for output in outputs {
+                for output in self.drain_outputs(i) {
                     if let EngineOutput::SendToValidator(target, msg) = output {
                         if target == leader as u32 {
                             let _ = self.engines[leader]
@@ -239,60 +195,46 @@ impl TestHarness {
             }
         }
 
-        // ── Step 6: Route Decide from leader to all followers ──
         let leader_outputs = self.drain_outputs(leader);
-
-        // Record committed block from leader outputs
         for output in &leader_outputs {
-            if let EngineOutput::BlockCommitted {
-                view: v,
-                block_hash: h,
-                ..
-            } = output
-            {
+            if let EngineOutput::BlockCommitted { view: v, block_hash: h, .. } = output {
                 self.committed_blocks.push((*v, *h));
             }
         }
 
-        // Extract and route Decide messages to all non-leaders
         let decide_msgs: Vec<_> = leader_outputs
             .into_iter()
-            .filter(|o| matches!(o, EngineOutput::BroadcastMessage(ConsensusMessage::Decide(_))))
+            .filter_map(|o| match o {
+                EngineOutput::BroadcastMessage(msg @ ConsensusMessage::Decide(_)) => Some(msg),
+                _ => None,
+            })
             .collect();
 
-        for output in &decide_msgs {
-            if let EngineOutput::BroadcastMessage(msg) = output {
-                for i in 0..n {
-                    if i != leader {
-                        let _ = self.engines[i]
-                            .process_event(ConsensusEvent::Message(msg.clone()));
-                    }
+        for msg in &decide_msgs {
+            for i in 0..n {
+                if i != leader {
+                    let _ = self.engines[i]
+                        .process_event(ConsensusEvent::Message(msg.clone()));
                 }
             }
         }
 
-        // Drain follower outputs (Decide triggers BlockCommitted on followers,
-        // but we only count committed blocks once per view from the leader above).
         for i in 0..n {
             if i != leader {
                 self.drain_outputs(i);
             }
         }
 
-        // ── Step 7: Safety net — re-deliver Decide to any engines still behind ──
         let next_view = view + 1;
         for i in 0..n {
             if self.engines[i].current_view() < next_view {
-                for output in &decide_msgs {
-                    if let EngineOutput::BroadcastMessage(msg) = output {
-                        let _ = self.engines[i]
-                            .process_event(ConsensusEvent::Message(msg.clone()));
-                    }
+                for msg in &decide_msgs {
+                    let _ = self.engines[i]
+                        .process_event(ConsensusEvent::Message(msg.clone()));
                 }
             }
         }
 
-        // Drain any remaining outputs
         self.drain_all_outputs();
     }
 
@@ -487,39 +429,35 @@ impl TestHarness {
         committed
     }
 
-    /// Triggers timeout on a single engine.
+    #[allow(dead_code)]
     fn trigger_timeout(&mut self, idx: usize) {
         self.engines[idx]
             .on_timeout()
             .expect("timeout should succeed");
     }
 
-    /// Simulates a full view-change flow: all engines timeout → TC formed → NewView.
     fn run_timeout_view_change(&mut self, view: ViewNumber) {
         let n = self.n();
 
-        // Step 1: All engines timeout
         for i in 0..n {
             self.engines[i]
                 .on_timeout()
                 .expect("timeout should succeed");
         }
 
-        // Step 2: Collect all timeout broadcast messages
-        let all_outputs: Vec<Vec<EngineOutput>> =
-            (0..n).map(|i| self.drain_outputs(i)).collect();
+        let timeout_msgs: Vec<_> = self.drain_all_outputs()
+            .into_iter()
+            .enumerate()
+            .flat_map(|(i, outputs)| {
+                outputs.into_iter().filter_map(move |o| match o {
+                    EngineOutput::BroadcastMessage(msg @ ConsensusMessage::Timeout(_)) => {
+                        Some((i, msg))
+                    }
+                    _ => None,
+                })
+            })
+            .collect();
 
-        let mut timeout_msgs: Vec<(usize, ConsensusMessage)> = Vec::new();
-        for (i, outputs) in all_outputs.iter().enumerate() {
-            for output in outputs {
-                if let EngineOutput::BroadcastMessage(msg @ ConsensusMessage::Timeout(_)) = output
-                {
-                    timeout_msgs.push((i, msg.clone()));
-                }
-            }
-        }
-
-        // Step 3: Route all timeout messages to all other engines
         for (from, msg) in &timeout_msgs {
             for i in 0..n {
                 if i != *from {
@@ -529,22 +467,17 @@ impl TestHarness {
             }
         }
 
-        // Step 4: Find NewView from the next leader
         let next_view = view + 1;
         let next_leader = (next_view % n as u64) as usize;
 
-        let all_outputs: Vec<Vec<EngineOutput>> =
-            (0..n).map(|i| self.drain_outputs(i)).collect();
-
-        let new_view_msg = all_outputs.iter().flatten().find_map(|o| match o {
-            EngineOutput::BroadcastMessage(msg @ ConsensusMessage::NewView(_)) => {
-                Some(msg.clone())
-            }
-            _ => None,
-        });
-
-        // Step 5: Route NewView to non-next-leader engines
-        if let Some(nv) = new_view_msg {
+        if let Some(nv) = self.drain_all_outputs()
+            .into_iter()
+            .flatten()
+            .find_map(|o| match o {
+                EngineOutput::BroadcastMessage(msg @ ConsensusMessage::NewView(_)) => Some(msg),
+                _ => None,
+            })
+        {
             for i in 0..n {
                 if i != next_leader && self.engines[i].current_view() < next_view {
                     let _ = self.engines[i]

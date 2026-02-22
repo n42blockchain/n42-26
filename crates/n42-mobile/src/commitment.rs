@@ -3,17 +3,17 @@ use serde::{Deserialize, Serialize};
 
 use crate::serde_helpers::pubkey_48;
 
-/// Commitment-first verification protocol.
-///
-/// Prevents mobile devices from copying verification results from peers:
-///
-/// 1. **Commit phase**: Phone computes result, sends `VerificationCommitment`
-///    containing `commitment_hash = keccak256(block_hash || result || nonce)`
-/// 2. **Reveal phase**: Phone sends `VerificationReveal` with actual result + nonce
-/// 3. **Verify**: IDC checks that `keccak256(block_hash || result || nonce) == commitment_hash`
-///
-/// A phone that copies another phone's result cannot produce a matching
-/// commitment because it doesn't know the original nonce ahead of time.
+// Commitment-first verification protocol.
+//
+// Prevents mobile devices from copying verification results from peers:
+//
+// 1. Commit phase: Phone computes result, sends `VerificationCommitment`
+//    containing `commitment_hash = keccak256(block_hash || result || nonce)`
+// 2. Reveal phase: Phone sends `VerificationReveal` with actual result + nonce
+// 3. Verify: IDC checks that `keccak256(block_hash || result || nonce) == commitment_hash`
+//
+// A phone that copies another phone's result cannot produce a matching
+// commitment because it doesn't know the original nonce ahead of time.
 
 /// Phase 1: Commitment sent by the phone before revealing the result.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -69,27 +69,18 @@ impl VerificationReveal {
         &self,
         commitment: &VerificationCommitment,
     ) -> Result<(), CommitmentError> {
-        // Check block hash matches
         if self.block_hash != commitment.block_hash {
             return Err(CommitmentError::BlockMismatch);
         }
-
-        // Check block number matches
         if self.block_number != commitment.block_number {
             return Err(CommitmentError::BlockNumberMismatch);
         }
-
-        // Check verifier matches
         if self.verifier_pubkey != commitment.verifier_pubkey {
             return Err(CommitmentError::VerifierMismatch);
         }
-
-        // Check commitment hash matches
-        let expected_hash = self.compute_commitment_hash();
-        if expected_hash != commitment.commitment_hash {
+        if self.compute_commitment_hash() != commitment.commitment_hash {
             return Err(CommitmentError::HashMismatch);
         }
-
         Ok(())
     }
 }

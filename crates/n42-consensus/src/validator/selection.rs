@@ -54,15 +54,10 @@ mod tests {
     fn test_round_robin() {
         let vs = make_validator_set(4);
 
-        // Views 0-7 should cycle through validators 0,1,2,3,0,1,2,3
         let expected = [0u32, 1, 2, 3, 0, 1, 2, 3];
         for (view, &expected_leader) in expected.iter().enumerate() {
             let leader = LeaderSelector::leader_for_view(view as u64, &vs);
-            assert_eq!(
-                leader, expected_leader,
-                "view {} should select leader {}",
-                view, expected_leader
-            );
+            assert_eq!(leader, expected_leader);
         }
     }
 
@@ -88,18 +83,16 @@ mod tests {
     #[test]
     fn test_leader_for_view_empty_set() {
         let vs = ValidatorSet::new(&[], 0);
-        // Empty set should return 0 (guard clause)
         let leader = LeaderSelector::leader_for_view(5, &vs);
-        assert_eq!(leader, 0, "empty set should return leader index 0");
+        assert_eq!(leader, 0);
     }
 
     #[test]
     fn test_leader_for_view_single_validator() {
         let vs = make_validator_set(1);
-        // Single validator is always the leader
         for view in 0..10u64 {
             let leader = LeaderSelector::leader_for_view(view, &vs);
-            assert_eq!(leader, 0, "single validator should always be leader 0");
+            assert_eq!(leader, 0);
         }
     }
 }

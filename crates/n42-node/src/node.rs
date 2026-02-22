@@ -19,11 +19,10 @@ use std::sync::Arc;
 
 /// N42 node type configuration.
 ///
-/// Holds shared consensus state that is injected into the PayloadBuilder
-/// and made available to the on_node_started hook for the Orchestrator.
+/// Holds shared consensus state injected into the PayloadBuilder and available
+/// to the `on_node_started` hook for the Orchestrator.
 #[derive(Debug, Clone)]
 pub struct N42Node {
-    /// Shared consensus state between Orchestrator and PayloadBuilder.
     pub consensus_state: Arc<SharedConsensusState>,
 }
 
@@ -78,32 +77,23 @@ mod tests {
     use super::*;
     use n42_consensus::ValidatorSet;
 
+    fn make_node() -> N42Node {
+        let state = Arc::new(SharedConsensusState::new(ValidatorSet::new(&[], 0)));
+        N42Node::new(state)
+    }
+
     #[test]
     fn test_n42_node_with_state() {
-        let vs = ValidatorSet::new(&[], 0);
-        let state = Arc::new(SharedConsensusState::new(vs));
-        let node = N42Node::new(state);
-        let _ = node;
+        let _ = make_node();
     }
 
     #[test]
     fn test_n42_node_clone() {
-        let vs = ValidatorSet::new(&[], 0);
-        let state = Arc::new(SharedConsensusState::new(vs));
-        let node = N42Node::new(state);
-        let cloned = node.clone();
-        let _ = cloned;
+        let _ = make_node().clone();
     }
 
     #[test]
     fn test_n42_node_debug() {
-        let vs = ValidatorSet::new(&[], 0);
-        let state = Arc::new(SharedConsensusState::new(vs));
-        let node = N42Node::new(state);
-        let debug_str = format!("{:?}", node);
-        assert!(
-            debug_str.contains("N42Node"),
-            "Debug output should contain 'N42Node'"
-        );
+        assert!(format!("{:?}", make_node()).contains("N42Node"));
     }
 }

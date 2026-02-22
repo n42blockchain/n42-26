@@ -1,6 +1,10 @@
 use alloy_primitives::B256;
+use futures::prelude::*;
+use libp2p::request_response;
+use libp2p::StreamProtocol;
 use n42_primitives::consensus::QuorumCertificate;
 use serde::{Deserialize, Serialize};
+use std::io;
 
 /// Block sync request: asks a peer for blocks in a view range.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -18,37 +22,29 @@ pub struct BlockSyncRequest {
 pub struct BlockSyncResponse {
     /// Blocks in view order.
     pub blocks: Vec<SyncBlock>,
-    /// Peer's latest committed view (helps detect if we need more rounds).
+    /// Peer's latest committed view.
     pub peer_committed_view: u64,
 }
 
 /// A single committed block for sync purposes.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SyncBlock {
-    /// View this block was committed at.
     pub view: u64,
-    /// Block hash.
     pub block_hash: B256,
-    /// CommitQC proving the block was committed.
     pub commit_qc: QuorumCertificate,
-    /// Serialized payload data (JSON or RLP encoded block content).
+    /// Serialized block payload (RLP or JSON encoded).
     pub payload: Vec<u8>,
 }
 
 // ── libp2p request-response codec ──
 
-use futures::prelude::*;
-use libp2p::request_response;
-use libp2p::StreamProtocol;
-use std::io;
-
 /// Protocol identifier for block sync.
 pub const SYNC_PROTOCOL: &str = "/n42/sync/1";
 
-/// Maximum size for sync messages (16 MB — supports batches of blocks).
+/// Maximum sync message size (16 MB — supports batches of blocks).
 const MAX_SYNC_MSG_SIZE: usize = 16 * 1024 * 1024;
 
-/// Codec for serializing/deserializing block sync requests and responses.
+/// Codec for serializing/deserializing block sync messages.
 #[derive(Clone, Debug, Default)]
 pub struct StateSyncCodec;
 
@@ -69,9 +65,7 @@ impl request_response::Codec for StateSyncCodec {
         'life2: 'async_trait,
         Self: 'async_trait,
     {
-        Box::pin(async move {
-            read_length_prefixed(io, MAX_SYNC_MSG_SIZE).await
-        })
+        Box::pin(read_length_prefixed(io, MAX_SYNC_MSG_SIZE))
     }
 
     fn read_response<'life0, 'life1, 'life2, 'async_trait, T>(
@@ -86,9 +80,7 @@ impl request_response::Codec for StateSyncCodec {
         'life2: 'async_trait,
         Self: 'async_trait,
     {
-        Box::pin(async move {
-            read_length_prefixed(io, MAX_SYNC_MSG_SIZE).await
-        })
+        Box::pin(read_length_prefixed(io, MAX_SYNC_MSG_SIZE))
     }
 
     fn write_request<'life0, 'life1, 'life2, 'async_trait, T>(
@@ -104,9 +96,7 @@ impl request_response::Codec for StateSyncCodec {
         'life2: 'async_trait,
         Self: 'async_trait,
     {
-        Box::pin(async move {
-            write_length_prefixed(io, &req).await
-        })
+        Box::pin(async move { write_length_prefixed(io, &req).await })
     }
 
     fn write_response<'life0, 'life1, 'life2, 'async_trait, T>(
@@ -122,13 +112,11 @@ impl request_response::Codec for StateSyncCodec {
         'life2: 'async_trait,
         Self: 'async_trait,
     {
-        Box::pin(async move {
-            write_length_prefixed(io, &res).await
-        })
+        Box::pin(async move { write_length_prefixed(io, &res).await })
     }
 }
 
-/// Reads a length-prefixed bincode-encoded message.
+/// Reads a length-prefixed bincode-encoded message (big-endian u32 length header).
 async fn read_length_prefixed<T, M>(io: &mut T, max_size: usize) -> io::Result<M>
 where
     T: AsyncRead + Unpin + Send,
@@ -140,7 +128,7 @@ where
     if len > max_size {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("message too large: {} > {}", len, max_size),
+            format!("message too large: {len} > {max_size}"),
         ));
     }
     let mut buf = vec![0u8; len];
@@ -148,11 +136,10 @@ where
     bincode::deserialize(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
-/// Writes a length-prefixed bincode-encoded message.
+/// Writes a length-prefixed bincode-encoded message (big-endian u32 length header).
 ///
-/// Enforces `MAX_SYNC_MSG_SIZE` on the write side so that oversized
-/// messages fail at the sender with a clear error rather than wasting
-/// network bandwidth only to be rejected by the receiver.
+/// Enforces `MAX_SYNC_MSG_SIZE` at the sender so oversized messages fail early
+/// rather than wasting bandwidth only to be rejected by the receiver.
 async fn write_length_prefixed<T, M>(io: &mut T, msg: &M) -> io::Result<()>
 where
     T: AsyncWrite + Unpin + Send,
@@ -163,14 +150,12 @@ where
     if data.len() > MAX_SYNC_MSG_SIZE {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("serialized message too large: {} > {}", data.len(), MAX_SYNC_MSG_SIZE),
+            format!("serialized message too large: {} > {MAX_SYNC_MSG_SIZE}", data.len()),
         ));
     }
-    let len = (data.len() as u32).to_be_bytes();
-    io.write_all(&len).await?;
+    io.write_all(&(data.len() as u32).to_be_bytes()).await?;
     io.write_all(&data).await?;
-    io.flush().await?;
-    Ok(())
+    io.flush().await
 }
 
 #[cfg(test)]
@@ -180,19 +165,13 @@ mod tests {
     use n42_primitives::consensus::QuorumCertificate;
 
     fn sample_request() -> BlockSyncRequest {
-        BlockSyncRequest {
-            from_view: 10,
-            to_view: 20,
-            local_committed_view: 8,
-        }
+        BlockSyncRequest { from_view: 10, to_view: 20, local_committed_view: 8 }
     }
 
     fn sample_sync_block() -> SyncBlock {
         use n42_primitives::BlsSecretKey;
-
         let sk = BlsSecretKey::random().unwrap();
         let sig = sk.sign(b"test");
-
         SyncBlock {
             view: 15,
             block_hash: B256::repeat_byte(0xAA),
@@ -207,10 +186,7 @@ mod tests {
     }
 
     fn sample_response() -> BlockSyncResponse {
-        BlockSyncResponse {
-            blocks: vec![sample_sync_block()],
-            peer_committed_view: 25,
-        }
+        BlockSyncResponse { blocks: vec![sample_sync_block()], peer_committed_view: 25 }
     }
 
     #[test]
@@ -237,10 +213,7 @@ mod tests {
 
     #[test]
     fn test_block_sync_response_empty_blocks() {
-        let resp = BlockSyncResponse {
-            blocks: vec![],
-            peer_committed_view: 100,
-        };
+        let resp = BlockSyncResponse { blocks: vec![], peer_committed_view: 100 };
         let bytes = bincode::serialize(&resp).unwrap();
         let decoded: BlockSyncResponse = bincode::deserialize(&bytes).unwrap();
         assert!(decoded.blocks.is_empty());
@@ -254,13 +227,11 @@ mod tests {
         write_length_prefixed(&mut buf, &req).await.unwrap();
 
         let data = buf.into_inner();
-        // First 4 bytes are the big-endian length prefix.
         let len = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
-        assert_eq!(len, data.len() - 4, "length prefix should match payload size");
+        assert_eq!(len, data.len() - 4);
 
         let mut reader = futures::io::Cursor::new(data);
-        let decoded: BlockSyncRequest =
-            read_length_prefixed(&mut reader, MAX_SYNC_MSG_SIZE).await.unwrap();
+        let decoded: BlockSyncRequest = read_length_prefixed(&mut reader, MAX_SYNC_MSG_SIZE).await.unwrap();
         assert_eq!(decoded.from_view, req.from_view);
         assert_eq!(decoded.to_view, req.to_view);
         assert_eq!(decoded.local_committed_view, req.local_committed_view);
@@ -274,8 +245,7 @@ mod tests {
 
         let data = buf.into_inner();
         let mut reader = futures::io::Cursor::new(data);
-        let decoded: BlockSyncResponse =
-            read_length_prefixed(&mut reader, MAX_SYNC_MSG_SIZE).await.unwrap();
+        let decoded: BlockSyncResponse = read_length_prefixed(&mut reader, MAX_SYNC_MSG_SIZE).await.unwrap();
         assert_eq!(decoded.blocks.len(), 1);
         assert_eq!(decoded.blocks[0].view, 15);
         assert_eq!(decoded.peer_committed_view, 25);
@@ -283,7 +253,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_codec_read_rejects_oversized() {
-        // Fabricate a length prefix that exceeds MAX_SYNC_MSG_SIZE.
         let fake_len = (MAX_SYNC_MSG_SIZE as u32 + 1).to_be_bytes();
         let mut data = Vec::new();
         data.extend_from_slice(&fake_len);
@@ -292,7 +261,7 @@ mod tests {
         let mut reader = futures::io::Cursor::new(data);
         let result: io::Result<BlockSyncRequest> =
             read_length_prefixed(&mut reader, MAX_SYNC_MSG_SIZE).await;
-        assert!(result.is_err(), "oversized message should be rejected");
+        assert!(result.is_err());
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
     }
 }

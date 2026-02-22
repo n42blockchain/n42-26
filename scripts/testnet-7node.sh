@@ -113,26 +113,22 @@ cleanup() {
     echo ""
     log "Shutting down testnet..."
 
-    # Stop tx generator
     if [[ -n "$TX_GEN_PID" ]] && kill -0 "$TX_GEN_PID" 2>/dev/null; then
         log "Stopping transaction generator (PID $TX_GEN_PID)..."
         kill "$TX_GEN_PID" 2>/dev/null || true
     fi
 
-    # Stop error monitor
     if [[ -n "$MONITOR_PID" ]] && kill -0 "$MONITOR_PID" 2>/dev/null; then
         log "Stopping error monitor (PID $MONITOR_PID)..."
         kill "$MONITOR_PID" 2>/dev/null || true
     fi
 
-    # Stop Blockscout
     if [[ "$BLOCKSCOUT_STARTED" == true ]]; then
         log "Stopping Blockscout..."
         docker compose -f "$PROJECT_DIR/docker/docker-compose.blockscout.yml" \
             -p n42-testnet-blockscout down 2>/dev/null || true
     fi
 
-    # Stop validator nodes
     if [[ ${#NODE_PIDS[@]} -gt 0 ]]; then
         log "Stopping ${#NODE_PIDS[@]} validator nodes..."
         for pid in "${NODE_PIDS[@]}"; do
@@ -142,7 +138,6 @@ cleanup() {
         done
     fi
 
-    # Wait for all children
     wait 2>/dev/null || true
     log "All services stopped."
 }
@@ -183,7 +178,7 @@ log "Python venv ready: $(python3 --version)"
 # Step 1: Build release binary
 # ---------------------------------------------------------------------------
 
-log "Building n42-node (release)... this may take a few minutes on first run."
+log "Building n42-node (release) - this may take a few minutes..."
 cd "$PROJECT_DIR"
 cargo build --release --bin n42-node 2>&1 | tail -5
 
@@ -337,7 +332,6 @@ for i in $(seq 0 $((NUM_VALIDATORS - 1))); do
 
     mkdir -p "$datadir"
 
-    # Build trusted-peers from previously started nodes
     TRUSTED_PEERS_FLAG=""
     if [[ ${#ENODES[@]} -gt 0 ]]; then
         TRUSTED_PEERS_FLAG="--trusted-peers $(IFS=,; echo "${ENODES[*]}")"
@@ -410,12 +404,12 @@ while [[ $waited -lt $MAX_WAIT ]]; do
 
     sleep 3
     waited=$((waited + 3))
-    [[ $((waited % 15)) -eq 0 ]] && info "Still waiting for blocks... (${waited}s / ${MAX_WAIT}s)"
+    [[ $((waited % 15)) -eq 0 ]] && info "Waiting for blocks... (${waited}s / ${MAX_WAIT}s)"
 done
 
 if [[ $waited -ge $MAX_WAIT ]]; then
-    warn "Timeout waiting for blocks. Nodes may still be syncing."
-    warn "Check logs at $DATA_DIR/validator-*.log"
+    warn "Timeout waiting for blocks (nodes may still be syncing)"
+    warn "Check logs: $DATA_DIR/validator-*.log"
 fi
 
 # ---------------------------------------------------------------------------
@@ -425,13 +419,11 @@ fi
 if [[ "$NO_EXPLORER" == false ]]; then
     log "Starting Blockscout block explorer..."
 
-    # Check Docker
     if ! command -v docker &>/dev/null; then
-        warn "Docker not found. Skipping Blockscout."
+        warn "Docker not found - skipping Blockscout"
     elif ! docker info &>/dev/null 2>&1; then
-        warn "Docker daemon not running. Skipping Blockscout."
+        warn "Docker daemon not running - skipping Blockscout"
     else
-        # Create docker-compose override to point at node 0's RPC
         cat > "$DATA_DIR/docker-compose.blockscout-override.yml" << YAMLEOF
 # Auto-generated override for 7-node testnet
 # Points Blockscout at node 0's RPC (port $BASE_HTTP_RPC)
@@ -535,7 +527,7 @@ echo "    Error events:  $DATA_DIR/testnet-errors.log"
 echo "    Crash events:  $DATA_DIR/testnet-crashes.log"
 echo ""
 echo -e "  ${YELLOW}Quick commands:${NC}"
-echo "    # Check block number on node 0:"
+echo "    # Check block number:"
 echo "    curl -s http://127.0.0.1:$BASE_HTTP_RPC -X POST -H 'Content-Type: application/json' \\"
 echo "      -d '{\"jsonrpc\":\"2.0\",\"method\":\"eth_blockNumber\",\"params\":[],\"id\":1}'"
 echo ""

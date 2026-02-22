@@ -10,38 +10,32 @@ use std::collections::HashMap;
 /// Errors that can occur when building a verification packet from witness data.
 #[derive(Debug, thiserror::Error)]
 pub enum PacketBuildError {
-    /// A hashed account key has no preimage in the witness keys.
     #[error("missing preimage for hashed account key {0}")]
     MissingAccountPreimage(B256),
 
-    /// A hashed storage key has no preimage in the witness keys.
     #[error("missing preimage for hashed storage key {0}")]
     MissingStoragePreimage(B256),
 }
 
 /// Builds a `VerificationPacket` from execution witness data and a sealed block.
 ///
-/// This is the critical bridge between the node's EVM execution (which produces
-/// `ExecutionWitness` with hashed state keys) and the mobile verifier (which needs
-/// real addresses and slot keys to reconstruct state).
+/// The witness contains hashed state keys; this function resolves them back to
+/// real addresses and slot keys using the preimage entries in `witness.keys`.
 ///
-/// ## Algorithm
-///
-/// 1. Build preimage maps from `witness.keys`: 20-byte values → Address, 32-byte → slot key
-/// 2. Resolve `hashed_state.accounts` back to real addresses using the preimage map
+/// Algorithm:
+/// 1. Build preimage maps: 20-byte values → Address, 32-byte values → slot key
+/// 2. Resolve `hashed_state.accounts` back to real addresses
 /// 3. Resolve `hashed_state.storages` slots back to real U256 keys
-/// 4. Construct `WitnessAccount` entries with real addresses and storage slots
-/// 5. Hash each bytecode in `witness.codes` to produce `(code_hash, bytecode)` pairs
-/// 6. RLP-encode the block header
-/// 7. EIP-2718 encode each transaction
-/// 8. Assemble the final `VerificationPacket`
+/// 4. Hash each bytecode in `witness.codes` to produce `(code_hash, bytecode)` pairs
+/// 5. RLP-encode the block header and EIP-2718 encode each transaction
+/// 6. Assemble the final `VerificationPacket`
 pub fn build_verification_packet(
     witness: &ExecutionWitness,
     block: &SealedBlock<<EthPrimitives as NodePrimitives>::Block>,
     block_hashes: &[(u64, B256)],
 ) -> Result<VerificationPacket, PacketBuildError> {
-    // Step 1: Build preimage mappings from witness.keys.
-    // keys contains raw unhashed values: 20-byte entries are addresses, 32-byte entries are slot keys.
+    // Build preimage mappings from witness.keys.
+    // 20-byte entries are addresses; 32-byte entries are slot keys.
     let mut address_preimages: HashMap<B256, Address> = HashMap::new();
     let mut slot_preimages: HashMap<B256, B256> = HashMap::new();
 
@@ -49,44 +43,33 @@ pub fn build_verification_packet(
         match key.len() {
             20 => {
                 let addr = Address::from_slice(key);
-                let hashed = keccak256(addr);
-                address_preimages.insert(hashed, addr);
+                address_preimages.insert(keccak256(addr), addr);
             }
             32 => {
                 let slot = B256::from_slice(key);
-                let hashed = keccak256(slot);
-                slot_preimages.insert(hashed, slot);
+                slot_preimages.insert(keccak256(slot), slot);
             }
-            _ => {
-                // Other key lengths are not expected; skip them.
-            }
+            _ => {}
         }
     }
 
-    // Step 2-3: Convert hashed accounts and storages to WitnessAccount entries.
+    // Resolve hashed accounts and storages into WitnessAccount entries.
     let mut witness_accounts = Vec::new();
 
     for (hashed_addr, maybe_account) in &witness.hashed_state.accounts {
-        // Skip destroyed accounts (value is None).
-        let account = match maybe_account {
-            Some(a) => a,
-            None => continue,
-        };
+        let Some(account) = maybe_account else { continue };
 
-        // Resolve hashed address → real address.
         let address = address_preimages
             .get(hashed_addr)
             .copied()
-            .ok_or_else(|| PacketBuildError::MissingAccountPreimage(*hashed_addr))?;
+            .ok_or(PacketBuildError::MissingAccountPreimage(*hashed_addr))?;
 
-        // Resolve storage slots for this account.
         let storage = if let Some(hashed_storage) = witness.hashed_state.storages.get(hashed_addr) {
             let mut slots = Vec::with_capacity(hashed_storage.storage.len());
             for (hashed_slot, value) in &hashed_storage.storage {
                 let real_slot = slot_preimages
                     .get(hashed_slot)
-                    .ok_or_else(|| PacketBuildError::MissingStoragePreimage(*hashed_slot))?;
-                // Convert B256 slot key to U256 for the WitnessAccount format.
+                    .ok_or(PacketBuildError::MissingStoragePreimage(*hashed_slot))?;
                 slots.push((U256::from_be_bytes(real_slot.0), *value));
             }
             slots
@@ -94,35 +77,23 @@ pub fn build_verification_packet(
             Vec::new()
         };
 
-        let code_hash = account.bytecode_hash.unwrap_or(KECCAK_EMPTY);
-
         witness_accounts.push(WitnessAccount {
             address,
             nonce: account.nonce,
             balance: account.balance,
-            code_hash,
+            code_hash: account.bytecode_hash.unwrap_or(KECCAK_EMPTY),
             storage,
         });
     }
 
-    // Step 5: Build uncached_bytecodes from witness.codes.
-    let uncached_bytecodes: Vec<(B256, Bytes)> = witness
-        .codes
-        .iter()
-        .map(|code| (keccak256(code), code.clone()))
-        .collect();
+    let uncached_bytecodes: Vec<(B256, Bytes)> =
+        witness.codes.iter().map(|code| (keccak256(code), code.clone())).collect();
 
-    // Step 6: RLP-encode the block header.
+    use alloy_consensus::BlockHeader;
     let header = block.header();
     let mut header_buf = Vec::new();
     header.encode(&mut header_buf);
-    let header_rlp = Bytes::from(header_buf);
 
-    // Step 7: EIP-2718 encode each transaction.
-    let transactions = block.body().encoded_2718_transactions();
-
-    // Step 8: Assemble the VerificationPacket.
-    use alloy_consensus::BlockHeader;
     Ok(VerificationPacket {
         block_hash: block.hash(),
         block_number: header.number(),
@@ -133,8 +104,8 @@ pub fn build_verification_packet(
         timestamp: header.timestamp(),
         gas_limit: header.gas_limit(),
         beneficiary: header.beneficiary(),
-        header_rlp,
-        transactions,
+        header_rlp: Bytes::from(header_buf),
+        transactions: block.body().encoded_2718_transactions(),
         witness_accounts,
         uncached_bytecodes,
         lowest_block_number: witness.lowest_block_number,
@@ -149,21 +120,23 @@ mod tests {
     use reth_trie_common::{HashedPostState, HashedStorage};
     use reth_primitives_traits::Account;
 
+    fn make_witness_with_keys(addr: Address, slot: B256) -> ExecutionWitness {
+        ExecutionWitness {
+            hashed_state: HashedPostState::default(),
+            codes: vec![],
+            keys: vec![
+                Bytes::copy_from_slice(addr.as_slice()),
+                Bytes::copy_from_slice(slot.as_slice()),
+            ],
+            lowest_block_number: None,
+        }
+    }
+
     #[test]
     fn test_build_preimage_maps() {
         let addr = Address::with_last_byte(0x42);
         let slot = B256::with_last_byte(0x01);
-
-        let witness = ExecutionWitness {
-            hashed_state: HashedPostState::default(),
-            codes: vec![],
-            keys: vec![Bytes::copy_from_slice(addr.as_slice()), Bytes::copy_from_slice(slot.as_slice())],
-            lowest_block_number: None,
-        };
-
-        // The preimage maps should contain the address and slot.
-        let hashed_addr = keccak256(addr);
-        let hashed_slot = keccak256(slot);
+        let witness = make_witness_with_keys(addr, slot);
 
         let mut addr_map = HashMap::new();
         let mut slot_map = HashMap::new();
@@ -181,8 +154,8 @@ mod tests {
             }
         }
 
-        assert_eq!(addr_map.get(&hashed_addr), Some(&addr));
-        assert_eq!(slot_map.get(&hashed_slot), Some(&slot));
+        assert_eq!(addr_map.get(&keccak256(addr)), Some(&addr));
+        assert_eq!(slot_map.get(&keccak256(slot)), Some(&slot));
     }
 
     #[test]
@@ -191,7 +164,6 @@ mod tests {
         let hashed_addr = keccak256(addr);
 
         let mut hashed_state = HashedPostState::default();
-        // Insert a destroyed account (None value).
         hashed_state.accounts.insert(hashed_addr, None);
 
         let witness = ExecutionWitness {
@@ -201,8 +173,6 @@ mod tests {
             lowest_block_number: None,
         };
 
-        // We can't easily construct a SealedBlock in unit tests, but we can verify
-        // the account filtering logic by checking the preimage map + iteration.
         let mut address_preimages = HashMap::new();
         for key in &witness.keys {
             if key.len() == 20 {
@@ -211,21 +181,23 @@ mod tests {
             }
         }
 
-        let mut accounts = Vec::new();
-        for (hashed, maybe_account) in &witness.hashed_state.accounts {
-            if let Some(account) = maybe_account {
-                if let Some(real_addr) = address_preimages.get(hashed) {
-                    accounts.push((*real_addr, account.clone()));
-                }
-            }
-        }
+        let accounts: Vec<_> = witness
+            .hashed_state
+            .accounts
+            .iter()
+            .filter_map(|(hashed, maybe_account)| {
+                maybe_account.as_ref().and_then(|a| {
+                    address_preimages.get(hashed).map(|addr| (*addr, a.clone()))
+                })
+            })
+            .collect();
 
         assert!(accounts.is_empty(), "destroyed accounts should be skipped");
     }
 
     #[test]
     fn test_uncached_bytecodes_hash() {
-        let code = Bytes::from(vec![0x60, 0x00, 0x60, 0x00, 0xf3]); // PUSH0 PUSH0 RETURN
+        let code = Bytes::from(vec![0x60, 0x00, 0x60, 0x00, 0xf3]);
         let expected_hash = keccak256(&code);
 
         let witness = ExecutionWitness {
@@ -235,11 +207,8 @@ mod tests {
             lowest_block_number: None,
         };
 
-        let uncached: Vec<(B256, Bytes)> = witness
-            .codes
-            .iter()
-            .map(|c| (keccak256(c), c.clone()))
-            .collect();
+        let uncached: Vec<(B256, Bytes)> =
+            witness.codes.iter().map(|c| (keccak256(c), c.clone())).collect();
 
         assert_eq!(uncached.len(), 1);
         assert_eq!(uncached[0].0, expected_hash);
@@ -248,17 +217,12 @@ mod tests {
 
     #[test]
     fn test_build_with_account_and_storage() {
-        // Set up an account with a storage slot in the witness.
         let addr = Address::with_last_byte(0x42);
         let hashed_addr = keccak256(addr);
         let slot = B256::with_last_byte(0x01);
         let hashed_slot = keccak256(slot);
 
-        let account = Account {
-            nonce: 5,
-            balance: U256::from(1000),
-            bytecode_hash: Some(KECCAK_EMPTY),
-        };
+        let account = Account { nonce: 5, balance: U256::from(1000), bytecode_hash: Some(KECCAK_EMPTY) };
 
         let mut hashed_state = HashedPostState::default();
         hashed_state.accounts.insert(hashed_addr, Some(account));
@@ -277,7 +241,6 @@ mod tests {
             lowest_block_number: None,
         };
 
-        // Build preimage maps and resolve accounts (same logic as build_verification_packet).
         let mut address_preimages = HashMap::new();
         let mut slot_preimages = HashMap::new();
         for key in &witness.keys {
@@ -294,33 +257,23 @@ mod tests {
             }
         }
 
-        // Resolve the account.
         let (ha, maybe_acct) = witness.hashed_state.accounts.iter().next().unwrap();
         let acct = maybe_acct.unwrap();
-        let resolved_addr = address_preimages.get(ha).unwrap();
-        assert_eq!(*resolved_addr, addr);
+        assert_eq!(*address_preimages.get(ha).unwrap(), addr);
         assert_eq!(acct.nonce, 5);
         assert_eq!(acct.balance, U256::from(1000));
 
-        // Resolve storage slots.
         let hs = witness.hashed_state.storages.get(ha).unwrap();
         let (hs_key, hs_val) = hs.storage.iter().next().unwrap();
-        let real_slot = slot_preimages.get(hs_key).unwrap();
-        assert_eq!(*real_slot, slot);
+        assert_eq!(*slot_preimages.get(hs_key).unwrap(), slot);
         assert_eq!(*hs_val, U256::from(42));
     }
 
     #[test]
     fn test_missing_account_preimage() {
-        // Create a witness with hashed account but no preimage key.
         let addr = Address::with_last_byte(0x99);
         let hashed_addr = keccak256(addr);
-
-        let account = Account {
-            nonce: 1,
-            balance: U256::from(100),
-            bytecode_hash: Some(KECCAK_EMPTY),
-        };
+        let account = Account { nonce: 1, balance: U256::from(100), bytecode_hash: Some(KECCAK_EMPTY) };
 
         let mut hashed_state = HashedPostState::default();
         hashed_state.accounts.insert(hashed_addr, Some(account));
@@ -328,30 +281,23 @@ mod tests {
         let witness = ExecutionWitness {
             hashed_state,
             codes: vec![],
-            keys: vec![], // no preimage!
+            keys: vec![],
             lowest_block_number: None,
         };
 
-        // Reproduce the preimage resolution logic.
-        let mut address_preimages: HashMap<B256, Address> = HashMap::new();
-        for key in &witness.keys {
-            if key.len() == 20 {
-                let a = Address::from_slice(key);
-                address_preimages.insert(keccak256(a), a);
-            }
-        }
+        let address_preimages: HashMap<B256, Address> = HashMap::new();
 
-        // Should fail to find the preimage.
         for (ha, maybe_acct) in &witness.hashed_state.accounts {
             if maybe_acct.is_some() {
                 let result = address_preimages
                     .get(ha)
                     .copied()
                     .ok_or_else(|| PacketBuildError::MissingAccountPreimage(*ha));
-                assert!(result.is_err(), "should fail when preimage is missing");
-                assert!(
-                    matches!(result.unwrap_err(), PacketBuildError::MissingAccountPreimage(h) if h == *ha)
-                );
+                assert!(result.is_err());
+                assert!(matches!(
+                    result.unwrap_err(),
+                    PacketBuildError::MissingAccountPreimage(h) if h == *ha
+                ));
             }
         }
     }

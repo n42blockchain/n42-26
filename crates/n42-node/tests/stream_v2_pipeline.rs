@@ -24,229 +24,53 @@ use revm::{
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// Minimal ERC-20 token contract runtime bytecode.
-///
-/// Supports:
-/// - `transfer(address,uint256)` selector 0xa9059cbb
-/// - `balanceOf(address)` selector 0x70a08231
-///
-/// Storage layout (Solidity-compatible):
-/// - `balances[addr]` at slot `keccak256(abi.encode(addr, 0))`
-///
-/// Written in raw EVM assembly for deterministic, dependency-free compilation.
+/// Minimal ERC-20 token contract: transfer(address,uint256) and balanceOf(address)
+/// Compiled to EVM bytecode for deterministic testing.
 fn minimal_erc20_bytecode() -> Bytes {
-    // We use a minimal contract that:
-    // 1. Checks function selector
-    // 2. For transfer: reads sender balance (SLOAD), reads receiver balance (SLOAD),
-    //    updates both (SSTORE), returns true
-    // 3. For balanceOf: reads balance (SLOAD), returns it
-    //
-    // This exercises: basic() (sender, contract, coinbase), storage() (2-4 SLOADs),
-    // code_by_hash() (contract code lookup)
-    //
-    // Assembly:
-    // PUSH0 CALLDATALOAD PUSH1 0xE0 SHR    ; get selector
-    // DUP1 PUSH4 0xa9059cbb EQ PUSH2 transfer JUMPI  ; check transfer
-    // DUP1 PUSH4 0x70a08231 EQ PUSH2 balanceOf JUMPI ; check balanceOf
-    // PUSH0 PUSH0 REVERT                    ; fallback: revert
-    //
-    // transfer: (offset ~0x1a)
-    //   JUMPDEST
-    //   POP                                   ; drop selector
-    //   ; compute slot for balances[caller]
-    //   CALLER PUSH0 MSTORE                   ; mem[0..32] = caller
-    //   PUSH0 PUSH1 0x20 MSTORE              ; mem[32..64] = 0 (slot index)
-    //   PUSH1 0x40 PUSH0 SHA3                ; slot_sender = keccak256(mem[0..64])
-    //   DUP1 SLOAD                           ; balance_sender
-    //   ; load amount from calldata
-    //   PUSH1 0x24 CALLDATALOAD              ; amount
-    //   DUP1 DUP3 LT PUSH2 revert_label JUMPI  ; if balance < amount, revert
-    //   ; new_sender_bal = balance - amount
-    //   SWAP1 SUB                            ; new_sender_balance on stack
-    //   SWAP1                                ; slot_sender on top
-    //   SSTORE                               ; store new balance
-    //   ; compute slot for balances[to]
-    //   PUSH1 0x04 CALLDATALOAD              ; to address (as uint256)
-    //   PUSH0 MSTORE                         ; mem[0..32] = to
-    //   PUSH0 PUSH1 0x20 MSTORE             ; mem[32..64] = 0
-    //   PUSH1 0x40 PUSH0 SHA3               ; slot_to
-    //   DUP1 SLOAD                          ; balance_to
-    //   ; remaining amount was consumed by SUB, need it again
-    //   PUSH1 0x24 CALLDATALOAD             ; re-read amount
-    //   ADD                                  ; new_to_balance
-    //   SWAP1 SSTORE                        ; store
-    //   ; return true (1)
-    //   PUSH1 0x01 PUSH0 MSTORE
-    //   PUSH1 0x20 PUSH0 RETURN
-    //
-    // balanceOf: (offset ~0x5c)
-    //   JUMPDEST
-    //   POP
-    //   PUSH1 0x04 CALLDATALOAD PUSH0 MSTORE
-    //   PUSH0 PUSH1 0x20 MSTORE
-    //   PUSH1 0x40 PUSH0 SHA3
-    //   SLOAD
-    //   PUSH0 MSTORE
-    //   PUSH1 0x20 PUSH0 RETURN
-    //
-    // revert_label:
-    //   JUMPDEST PUSH0 PUSH0 REVERT
-    //
-    // Rather than hand-assemble 100+ bytes with offset errors, use Solidity-compiled bytecode
-    // from a known minimal ERC-20 contract.
-    //
-    // Compiled from:
-    //   contract T {
-    //     mapping(address=>uint256) public b;
-    //     function transfer(address t, uint256 a) external returns(bool) {
-    //       b[msg.sender] -= a;
-    //       b[t] += a;
-    //       return true;
-    //     }
-    //   }
-    // with solc 0.8.28, --optimize --optimize-runs=200
-    //
-    // We inline the runtime bytecode here for reproducibility.
-
-    // Instead of fighting with raw assembly, use a known-good approach:
-    // Write a contract using only PUSH/SLOAD/SSTORE/MSTORE/SHA3/CALLDATALOAD/CALLER etc.
-    // Build it programmatically:
     let mut code = Vec::new();
 
-    // ── Selector dispatch ──
-    // PUSH0 CALLDATALOAD → load first 32 bytes
-    code.extend_from_slice(&[0x5F, 0x35]);
-    // PUSH1 0xE0 SHR → shift right 224 bits to get 4-byte selector
-    code.extend_from_slice(&[0x60, 0xE0, 0x1C]);
-    // DUP1
-    code.push(0x80);
-    // PUSH4 0xa9059cbb (transfer selector)
-    code.extend_from_slice(&[0x63, 0xa9, 0x05, 0x9c, 0xbb]);
-    // EQ PUSH1 <transfer_offset> JUMPI
-    code.push(0x14);
-    let transfer_jump_pos = code.len();
-    code.extend_from_slice(&[0x61, 0x00, 0x00]); // placeholder for 2-byte offset
-    code.push(0x57);
+    // Selector dispatch
+    code.extend_from_slice(&[0x5F, 0x35, 0x60, 0xE0, 0x1C, 0x80]);
 
-    // DUP1
-    code.push(0x80);
-    // PUSH4 0x70a08231 (balanceOf selector)
-    code.extend_from_slice(&[0x63, 0x70, 0xa0, 0x82, 0x31]);
-    // EQ PUSH1 <balanceof_offset> JUMPI
-    code.push(0x14);
-    let balanceof_jump_pos = code.len();
-    code.extend_from_slice(&[0x61, 0x00, 0x00]); // placeholder
-    code.push(0x57);
+    let transfer_jump_pos = code.len() + 1;
+    code.extend_from_slice(&[0x63, 0xa9, 0x05, 0x9c, 0xbb, 0x14, 0x61, 0x00, 0x00, 0x57, 0x80]);
 
-    // Fallback: STOP
-    code.push(0x00);
+    let balanceof_jump_pos = code.len() + 1;
+    code.extend_from_slice(&[0x63, 0x70, 0xa0, 0x82, 0x31, 0x14, 0x61, 0x00, 0x00, 0x57, 0x00]);
 
-    // ── transfer(address to, uint256 amount) ──
+    // transfer(address to, uint256 amount)
     let transfer_offset = code.len();
-    code.push(0x5B); // JUMPDEST
-    code.push(0x50); // POP selector
+    code.extend_from_slice(&[
+        0x5B, 0x50, 0x33, 0x5F, 0x52, 0x5F, 0x60, 0x20, 0x52, 0x60, 0x40, 0x5F, 0x20,
+        0x80, 0x54, 0x60, 0x24, 0x35, 0x80, 0x82, 0x10,
+    ]);
 
-    // Compute slot for balances[caller]: keccak256(abi.encode(caller, 0))
-    // CALLER PUSH0 MSTORE
-    code.extend_from_slice(&[0x33, 0x5F, 0x52]);
-    // PUSH0 PUSH1 0x20 MSTORE (slot_index = 0 at mem[32..64])
-    code.extend_from_slice(&[0x5F, 0x60, 0x20, 0x52]);
-    // PUSH1 0x40 PUSH0 SHA3 → slot_sender
-    code.extend_from_slice(&[0x60, 0x40, 0x5F, 0x20]);
-    // DUP1 SLOAD → [slot_sender, balance_sender]
-    code.extend_from_slice(&[0x80, 0x54]);
-
-    // PUSH1 0x24 CALLDATALOAD → amount
-    code.extend_from_slice(&[0x60, 0x24, 0x35]);
-    // Stack: [slot_sender, balance_sender, amount]
-
-    // DUP1 DUP3 → [slot_sender, balance_sender, amount, amount, balance_sender]
-    code.extend_from_slice(&[0x80, 0x82]);
-    // LT → balance_sender < amount?
-    code.push(0x10);
-    // PUSH2 <revert_offset> JUMPI
-    let revert_jump_pos = code.len();
-    code.extend_from_slice(&[0x61, 0x00, 0x00]); // placeholder
-    code.push(0x57);
-
-    // Stack: [slot_sender, balance_sender, amount]
-    // new_sender_bal = balance_sender - amount
-    // SWAP1 → [slot_sender, amount, balance_sender]
-    code.push(0x90);
-    // SUB → [slot_sender, balance_sender - amount]
-    code.push(0x03);
-    // Hmm, SUB pops a then b and pushes a - b
-    // Stack before SUB: [..., amount, balance_sender]
-    // SUB → amount - balance_sender? No:
-    // SUB: a = pop(), b = pop(), push(a - b) → a = balance_sender, b = amount?
-    // No. The SWAP1 makes it: [slot_sender, amount, balance_sender]
-    // SUB pops balance_sender (top), then amount → pushes balance_sender - amount ✓
-    // Actually EVM SUB: a = stack[0], b = stack[1], result = a - b
-    // So stack top is `a`, next is `b`, result is a - b.
-    // After SWAP1: top = balance_sender, next = amount
-    // SUB: balance_sender - amount ✓ Good.
-
-    // Stack: [slot_sender, new_balance]
-    // SWAP1 SSTORE → store new_balance at slot_sender
-    code.extend_from_slice(&[0x90, 0x55]);
-
-    // Compute slot for balances[to]: keccak256(abi.encode(to, 0))
-    // PUSH1 0x04 CALLDATALOAD → to (as uint256)
-    code.extend_from_slice(&[0x60, 0x04, 0x35]);
-    // PUSH0 MSTORE
-    code.extend_from_slice(&[0x5F, 0x52]);
-    // PUSH0 PUSH1 0x20 MSTORE
-    code.extend_from_slice(&[0x5F, 0x60, 0x20, 0x52]);
-    // PUSH1 0x40 PUSH0 SHA3 → slot_to
-    code.extend_from_slice(&[0x60, 0x40, 0x5F, 0x20]);
-    // DUP1 SLOAD → [slot_to, balance_to]
-    code.extend_from_slice(&[0x80, 0x54]);
-
-    // PUSH1 0x24 CALLDATALOAD → re-read amount
-    code.extend_from_slice(&[0x60, 0x24, 0x35]);
-    // ADD → new_to_balance
-    code.push(0x01);
-    // SWAP1 SSTORE → store new_to_balance at slot_to
-    code.extend_from_slice(&[0x90, 0x55]);
-
-    // Return true (1)
-    // PUSH1 1 PUSH0 MSTORE PUSH1 0x20 PUSH0 RETURN
+    let revert_jump_pos = code.len() + 1;
+    code.extend_from_slice(&[0x61, 0x00, 0x00, 0x57, 0x90, 0x03, 0x90, 0x55]);
+    code.extend_from_slice(&[0x60, 0x04, 0x35, 0x5F, 0x52, 0x5F, 0x60, 0x20, 0x52]);
+    code.extend_from_slice(&[0x60, 0x40, 0x5F, 0x20, 0x80, 0x54, 0x60, 0x24, 0x35, 0x01, 0x90, 0x55]);
     code.extend_from_slice(&[0x60, 0x01, 0x5F, 0x52, 0x60, 0x20, 0x5F, 0xF3]);
 
-    // ── balanceOf(address) ──
+    // balanceOf(address)
     let balanceof_offset = code.len();
-    code.push(0x5B); // JUMPDEST
-    code.push(0x50); // POP selector
+    code.extend_from_slice(&[
+        0x5B, 0x50, 0x60, 0x04, 0x35, 0x5F, 0x52, 0x5F, 0x60, 0x20, 0x52,
+        0x60, 0x40, 0x5F, 0x20, 0x54, 0x5F, 0x52, 0x60, 0x20, 0x5F, 0xF3,
+    ]);
 
-    // PUSH1 0x04 CALLDATALOAD PUSH0 MSTORE
-    code.extend_from_slice(&[0x60, 0x04, 0x35, 0x5F, 0x52]);
-    // PUSH0 PUSH1 0x20 MSTORE
-    code.extend_from_slice(&[0x5F, 0x60, 0x20, 0x52]);
-    // PUSH1 0x40 PUSH0 SHA3
-    code.extend_from_slice(&[0x60, 0x40, 0x5F, 0x20]);
-    // SLOAD
-    code.push(0x54);
-    // PUSH0 MSTORE PUSH1 0x20 PUSH0 RETURN
-    code.extend_from_slice(&[0x5F, 0x52, 0x60, 0x20, 0x5F, 0xF3]);
-
-    // ── revert label ──
+    // revert label
     let revert_offset = code.len();
-    code.push(0x5B); // JUMPDEST
-    // PUSH0 PUSH0 REVERT
-    code.extend_from_slice(&[0x5F, 0x5F, 0xFD]);
+    code.extend_from_slice(&[0x5B, 0x5F, 0x5F, 0xFD]);
 
-    // ── Patch jump targets ──
-    let transfer_be = (transfer_offset as u16).to_be_bytes();
-    code[transfer_jump_pos + 1] = transfer_be[0];
-    code[transfer_jump_pos + 2] = transfer_be[1];
-
-    let balanceof_be = (balanceof_offset as u16).to_be_bytes();
-    code[balanceof_jump_pos + 1] = balanceof_be[0];
-    code[balanceof_jump_pos + 2] = balanceof_be[1];
-
-    let revert_be = (revert_offset as u16).to_be_bytes();
-    code[revert_jump_pos + 1] = revert_be[0];
-    code[revert_jump_pos + 2] = revert_be[1];
+    // Patch jump targets
+    let patch_offset = |code: &mut Vec<u8>, pos: usize, target: usize| {
+        let be = (target as u16).to_be_bytes();
+        code[pos] = be[0];
+        code[pos + 1] = be[1];
+    };
+    patch_offset(&mut code, transfer_jump_pos, transfer_offset);
+    patch_offset(&mut code, balanceof_jump_pos, balanceof_offset);
+    patch_offset(&mut code, revert_jump_pos, revert_offset);
 
     Bytes::from(code)
 }

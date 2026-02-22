@@ -55,9 +55,7 @@ pub enum WireError {
     InvalidTag(u8, usize),
 }
 
-/// Encodes a wire header into a buffer.
-///
-/// Writes 4 bytes: magic(2) + version(1) + flags(1).
+/// Encodes a wire header into `buf`: `magic(2B) + version(1B) + flags(1B)`.
 pub fn encode_header(buf: &mut Vec<u8>, version: u8, flags: u8) {
     buf.extend_from_slice(&MAGIC);
     buf.push(version);
@@ -66,15 +64,11 @@ pub fn encode_header(buf: &mut Vec<u8>, version: u8, flags: u8) {
 
 /// Decoded wire header.
 pub struct WireHeader {
-    /// Protocol version.
     pub version: u8,
-    /// Flags byte.
     pub flags: u8,
 }
 
-/// Decodes a wire header from the beginning of `data`.
-///
-/// Returns the decoded header and the remaining payload slice.
+/// Decodes the wire header from `data`, returning the header and remaining payload.
 pub fn decode_header(data: &[u8]) -> Result<(WireHeader, &[u8]), WireError> {
     if data.len() < HEADER_SIZE {
         return Err(WireError::TooShort(data.len()));

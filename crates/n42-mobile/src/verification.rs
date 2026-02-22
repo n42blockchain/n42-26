@@ -6,22 +6,15 @@ use crate::receipt::VerificationReceipt;
 
 /// Aggregated verification status for a single block.
 ///
-/// Tracks mobile verification progress and determines when
-/// sufficient attestation has been collected.
+/// Tracks receipt counts and determines when the attestation threshold is met.
 #[derive(Debug)]
 pub struct BlockVerificationStatus {
-    /// Block hash being verified.
     pub block_hash: B256,
-    /// Block number.
     pub block_number: u64,
-    /// Total number of valid receipts received.
     pub valid_count: u32,
-    /// Total number of invalid receipts (state root mismatch).
     pub invalid_count: u32,
-    /// Required threshold: number of valid receipts needed for attestation.
-    /// Typically 2/3 of connected phones.
+    /// Number of valid receipts required for attestation (typically 2/3 of phones).
     pub threshold: u32,
-    /// Verifier pubkeys that have submitted receipts (for deduplication).
     seen_verifiers: HashSet<[u8; 48]>,
 }
 
@@ -38,22 +31,16 @@ impl BlockVerificationStatus {
         }
     }
 
-    /// Adds a receipt to the verification status.
-    ///
-    /// Returns `true` if the receipt was new (not a duplicate).
-    /// Duplicate receipts from the same verifier are ignored.
+    /// Adds a receipt. Returns `true` if the receipt was new (not a duplicate).
     pub fn add_receipt(&mut self, receipt: &VerificationReceipt) -> bool {
-        // Skip duplicates
         if !self.seen_verifiers.insert(receipt.verifier_pubkey) {
             return false;
         }
-
         if receipt.is_valid() {
             self.valid_count = self.valid_count.saturating_add(1);
         } else {
             self.invalid_count = self.invalid_count.saturating_add(1);
         }
-
         true
     }
 
@@ -67,75 +54,60 @@ impl BlockVerificationStatus {
         self.valid_count + self.invalid_count
     }
 
-    /// Returns the fraction of valid receipts (0.0 - 1.0).
+    /// Returns the fraction of valid receipts (0.0–1.0).
     pub fn validity_ratio(&self) -> f64 {
         let total = self.total_receipts();
-        if total == 0 {
-            return 0.0;
-        }
-        self.valid_count as f64 / total as f64
+        if total == 0 { 0.0 } else { self.valid_count as f64 / total as f64 }
     }
 }
 
 /// Aggregates verification receipts across multiple blocks.
 ///
-/// Maintains verification status for recent blocks and determines
-/// when attestation thresholds are met.
+/// Maintains per-block status for recent blocks and evicts old ones when at capacity.
 pub struct ReceiptAggregator {
-    /// Per-block verification status.
     blocks: HashMap<B256, BlockVerificationStatus>,
-    /// Default threshold for new blocks (2/3 of connected phones).
     default_threshold: u32,
-    /// Maximum number of blocks to track (older blocks are evicted).
     max_tracked_blocks: usize,
+}
+
+fn clamp_threshold(threshold: u32) -> u32 {
+    if threshold == 0 {
+        warn!("attestation threshold 0 is invalid, clamping to 1");
+        1
+    } else {
+        threshold
+    }
 }
 
 impl ReceiptAggregator {
     /// Creates a new receipt aggregator.
     ///
-    /// `default_threshold` is the number of valid receipts required
-    /// for attestation (typically 2/3 of connected phones).
-    /// If `default_threshold` is 0, it is clamped to 1 to prevent
-    /// blocks from being "attested" with zero receipts.
+    /// `default_threshold` is clamped to 1 if 0, preventing attestation with zero receipts.
     pub fn new(default_threshold: u32, max_tracked_blocks: usize) -> Self {
-        let default_threshold = if default_threshold == 0 {
-            warn!("attestation threshold 0 is invalid, clamping to 1");
-            1
-        } else {
-            default_threshold
-        };
         Self {
             blocks: HashMap::new(),
-            default_threshold,
+            default_threshold: clamp_threshold(default_threshold),
             max_tracked_blocks,
         }
     }
 
-    /// Registers a new block for verification tracking.
+    /// Registers a new block for tracking. Idempotent — existing blocks are not reset.
     ///
-    /// Idempotent: if the block is already tracked, this is a no-op.
-    /// This prevents resetting receipt counts when multiple phones
-    /// send receipts for the same block (each receipt triggers
-    /// `process_receipt` which calls `register_block`).
+    /// Evicts the oldest block (by block number) when at capacity.
     pub fn register_block(&mut self, block_hash: B256, block_number: u64) {
         if self.blocks.contains_key(&block_hash) {
             return;
         }
-
-        // Evict oldest block if at capacity.
-        // O(N) scan over max_tracked_blocks (typically 1000); acceptable since
-        // register_block is called at most once per new block, not per receipt.
         if self.blocks.len() >= self.max_tracked_blocks {
-            if let Some(oldest_hash) = self
+            if let Some(oldest) = self
                 .blocks
                 .iter()
-                .min_by_key(|(_, status)| status.block_number)
-                .map(|(hash, _)| *hash)
+                .min_by_key(|(_, s)| s.block_number)
+                .map(|(h, _)| *h)
             {
-                self.blocks.remove(&oldest_hash);
+                self.blocks.remove(&oldest);
             }
         }
-
         self.blocks.insert(
             block_hash,
             BlockVerificationStatus::new(block_hash, block_number, self.default_threshold),
@@ -144,18 +116,15 @@ impl ReceiptAggregator {
 
     /// Processes a verification receipt.
     ///
-    /// Returns `Some(true)` if this receipt caused the attestation threshold
-    /// to be reached, `Some(false)` if the receipt was accepted but threshold
-    /// not yet met, or `None` if the block is not tracked or receipt is duplicate.
+    /// Returns `Some(true)` if this receipt caused the threshold to be reached,
+    /// `Some(false)` if accepted but threshold not yet met,
+    /// or `None` if the block is untracked or the receipt is a duplicate.
     pub fn process_receipt(&mut self, receipt: &VerificationReceipt) -> Option<bool> {
         let status = self.blocks.get_mut(&receipt.block_hash)?;
         let was_attested = status.is_attested();
-        let is_new = status.add_receipt(receipt);
-
-        if !is_new {
+        if !status.add_receipt(receipt) {
             return None;
         }
-
         if !was_attested && status.is_attested() {
             tracing::info!(
                 block_hash = %receipt.block_hash,
@@ -180,16 +149,9 @@ impl ReceiptAggregator {
         self.blocks.len()
     }
 
-    /// Updates the default threshold (e.g., when phone count changes).
-    ///
-    /// If `threshold` is 0, it is clamped to 1.
+    /// Updates the default threshold for newly registered blocks (clamped to 1 if 0).
     pub fn set_default_threshold(&mut self, threshold: u32) {
-        self.default_threshold = if threshold == 0 {
-            warn!("attestation threshold 0 is invalid, clamping to 1");
-            1
-        } else {
-            threshold
-        };
+        self.default_threshold = clamp_threshold(threshold);
     }
 }
 

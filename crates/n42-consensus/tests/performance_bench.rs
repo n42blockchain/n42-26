@@ -1,7 +1,5 @@
 //! Performance benchmark for N42 consensus + mobile verification.
-//!
 //! Measures wall-clock time for each component to determine minimum block interval.
-//! Run with: cargo test -p n42-consensus --test performance_bench -- --nocapture
 
 use alloy_primitives::{Address, B256};
 use n42_chainspec::ValidatorInfo;
@@ -15,12 +13,9 @@ use n42_primitives::BlsSecretKey;
 use std::time::Instant;
 use tokio::sync::mpsc;
 
-// ── Deterministic key generators ──
-
 fn test_bls_key(index: u32) -> BlsSecretKey {
     let mut bytes = [0u8; 32];
-    let val = (index + 1) as u32;
-    bytes[28..32].copy_from_slice(&val.to_be_bytes());
+    bytes[28..32].copy_from_slice(&((index + 1) as u32).to_be_bytes());
     BlsSecretKey::from_bytes(&bytes).expect("deterministic BLS key should be valid")
 }
 
@@ -31,10 +26,9 @@ fn test_mobile_bls_key(index: u32) -> BlsSecretKey {
     BlsSecretKey::key_gen(&bytes).expect("deterministic mobile BLS key should be valid")
 }
 
-// ── Harness (simplified for benchmarking) ──
-
 struct BenchHarness {
     engines: Vec<ConsensusEngine>,
+    #[allow(dead_code)]
     secret_keys: Vec<BlsSecretKey>,
     output_rxs: Vec<mpsc::Receiver<EngineOutput>>,
     validator_set: ValidatorSet,
@@ -87,11 +81,10 @@ impl BenchHarness {
 
     fn drain_all(&mut self) {
         for i in 0..self.engines.len() {
-            while self.output_rxs[i].try_recv().is_ok() {}
+            let _ = self.output_rxs[i].try_recv();
         }
     }
 
-    /// Full consensus round, returns elapsed time.
     fn run_consensus_round_timed(&mut self, view: ViewNumber, block_hash: B256) -> std::time::Duration {
         let n = self.engines.len();
         let leader = (view % n as u64) as usize;
@@ -105,26 +98,23 @@ impl BenchHarness {
             return start.elapsed();
         }
 
-        // Step 1: Leader proposes
         self.engines[leader]
             .process_event(ConsensusEvent::BlockReady(block_hash))
             .unwrap();
-        let outputs = self.drain_outputs(leader);
-        let proposal = outputs
-            .iter()
+
+        let proposal = self.drain_outputs(leader)
+            .into_iter()
             .find_map(|o| match o {
-                EngineOutput::BroadcastMessage(msg @ ConsensusMessage::Proposal(_)) => {
-                    Some(msg.clone())
-                }
+                EngineOutput::BroadcastMessage(msg @ ConsensusMessage::Proposal(_)) => Some(msg),
                 _ => None,
             })
             .unwrap();
 
-        // Step 2: Route Proposal
         let proposal_block_hash = match &proposal {
             ConsensusMessage::Proposal(p) => p.block_hash,
             _ => unreachable!(),
         };
+
         for i in 0..n {
             if i != leader {
                 self.engines[i]
@@ -133,7 +123,6 @@ impl BenchHarness {
             }
         }
 
-        // Step 2.5: Simulate block data import for non-leaders (deferred voting)
         for i in 0..n {
             if i != leader {
                 self.engines[i]
@@ -142,11 +131,9 @@ impl BenchHarness {
             }
         }
 
-        // Step 3: Route Votes
         for i in 0..n {
             if i != leader {
-                let outputs = self.drain_outputs(i);
-                for output in outputs {
+                for output in self.drain_outputs(i) {
                     if let EngineOutput::SendToValidator(target, msg) = output {
                         if target == leader as u32 {
                             self.engines[leader]
@@ -158,14 +145,10 @@ impl BenchHarness {
             }
         }
 
-        // Step 4: Route PrepareQC
-        let outputs = self.drain_outputs(leader);
-        let prepare_qc = outputs
-            .iter()
+        let prepare_qc = self.drain_outputs(leader)
+            .into_iter()
             .find_map(|o| match o {
-                EngineOutput::BroadcastMessage(msg @ ConsensusMessage::PrepareQC(_)) => {
-                    Some(msg.clone())
-                }
+                EngineOutput::BroadcastMessage(msg @ ConsensusMessage::PrepareQC(_)) => Some(msg),
                 _ => None,
             })
             .unwrap();
@@ -178,11 +161,9 @@ impl BenchHarness {
             }
         }
 
-        // Step 5: Route CommitVotes
         for i in 0..n {
             if i != leader {
-                let outputs = self.drain_outputs(i);
-                for output in outputs {
+                for output in self.drain_outputs(i) {
                     if let EngineOutput::SendToValidator(target, msg) = output {
                         if target == leader as u32 {
                             let _ = self.engines[leader]
@@ -193,30 +174,31 @@ impl BenchHarness {
             }
         }
 
-        // Step 6: Route Decide from leader to followers
-        let leader_outputs_final = self.drain_outputs(leader);
-        for output in &leader_outputs_final {
-            if let EngineOutput::BroadcastMessage(msg @ ConsensusMessage::Decide(_)) = output {
-                for i in 0..n {
-                    if i != leader {
-                        let _ = self.engines[i]
-                            .process_event(ConsensusEvent::Message(msg.clone()));
-                    }
+        let decide_msgs: Vec<_> = self.drain_outputs(leader)
+            .into_iter()
+            .filter_map(|o| match o {
+                EngineOutput::BroadcastMessage(msg @ ConsensusMessage::Decide(_)) => Some(msg),
+                _ => None,
+            })
+            .collect();
+
+        for msg in &decide_msgs {
+            for i in 0..n {
+                if i != leader {
+                    let _ = self.engines[i]
+                        .process_event(ConsensusEvent::Message(msg.clone()));
                 }
             }
         }
 
         let elapsed = start.elapsed();
 
-        // Re-deliver Decide to any engines still behind
         let next_view = view + 1;
         for i in 0..n {
             if self.engines[i].current_view() < next_view {
-                for output in &leader_outputs_final {
-                    if let EngineOutput::BroadcastMessage(msg @ ConsensusMessage::Decide(_)) = output {
-                        let _ = self.engines[i]
-                            .process_event(ConsensusEvent::Message(msg.clone()));
-                    }
+                for msg in &decide_msgs {
+                    let _ = self.engines[i]
+                        .process_event(ConsensusEvent::Message(msg.clone()));
                 }
             }
         }
@@ -225,10 +207,6 @@ impl BenchHarness {
         elapsed
     }
 }
-
-// ══════════════════════════════════════════════════════════════════════════════
-// Component-level Benchmarks
-// ══════════════════════════════════════════════════════════════════════════════
 
 #[test]
 fn bench_bls_operations() {
@@ -240,25 +218,20 @@ fn bench_bls_operations() {
     let pk = sk.public_key();
     let message = signing_message(1, &B256::repeat_byte(0xAA));
 
-    // ── BLS Sign ──
     let iterations = 1000;
     let start = Instant::now();
     for _ in 0..iterations {
         let _ = sk.sign(&message);
     }
-    let sign_time = start.elapsed() / iterations;
-    println!("  BLS Sign:       {:>8.1} us/op", sign_time.as_nanos() as f64 / 1000.0);
+    println!("  BLS Sign:       {:>8.1} us/op", start.elapsed().as_nanos() as f64 / iterations as f64 / 1000.0);
 
-    // ── BLS Verify ──
     let sig = sk.sign(&message);
     let start = Instant::now();
     for _ in 0..iterations {
         pk.verify(&message, &sig).unwrap();
     }
-    let verify_time = start.elapsed() / iterations;
-    println!("  BLS Verify:     {:>8.1} us/op", verify_time.as_nanos() as f64 / 1000.0);
+    println!("  BLS Verify:     {:>8.1} us/op", start.elapsed().as_nanos() as f64 / iterations as f64 / 1000.0);
 
-    // ── BLS Aggregate (various sizes) ──
     println!("\n  BLS QC Build (sign + verify + aggregate):");
     for &n in &[4, 10, 67, 100, 333, 500] {
         let keys: Vec<BlsSecretKey> = (0..n as u32).map(test_bls_key).collect();
@@ -307,27 +280,22 @@ fn bench_bls_mobile_operations() {
     println!("{}\n", "=".repeat(70));
 
     let sk = test_mobile_bls_key(0);
-
-    // ── BLS Sign ──
     let iterations = 10_000;
     let block_hash = B256::repeat_byte(0xCC);
+
     let start = Instant::now();
     for i in 0..iterations {
         let _ = n42_mobile::sign_receipt(block_hash, 1, true, true, i as u64, &sk);
     }
-    let sign_time = start.elapsed() / iterations;
-    println!("  BLS Sign Receipt:  {:>6.1} us/op", sign_time.as_nanos() as f64 / 1000.0);
+    println!("  BLS Sign Receipt:  {:>6.1} us/op", start.elapsed().as_nanos() as f64 / iterations as f64 / 1000.0);
 
-    // ── BLS Verify ──
     let receipt = n42_mobile::sign_receipt(block_hash, 1, true, true, 12345, &sk);
     let start = Instant::now();
     for _ in 0..iterations {
         receipt.verify_signature().unwrap();
     }
-    let verify_time = start.elapsed() / iterations;
-    println!("  BLS Verify Receipt: {:>6.1} us/op", verify_time.as_nanos() as f64 / 1000.0);
+    println!("  BLS Verify Receipt: {:>6.1} us/op", start.elapsed().as_nanos() as f64 / iterations as f64 / 1000.0);
 
-    // ── Receipt Aggregation (various sizes) ──
     println!("\n  Receipt Aggregation (sign + verify + aggregate):");
     for &(total_receipts, threshold) in &[
         (500, 334),
@@ -364,10 +332,6 @@ fn bench_bls_mobile_operations() {
     }
 }
 
-// ══════════════════════════════════════════════════════════════════════════════
-// Full-System Benchmarks: Two Target Configurations
-// ══════════════════════════════════════════════════════════════════════════════
-
 #[test]
 fn bench_config_500_nodes_500_mobiles() {
     println!("\n{}", "=".repeat(70));
@@ -378,61 +342,47 @@ fn bench_config_500_nodes_500_mobiles() {
     let mobiles_per_node = 500u32;
     let total_mobiles = n as u32 * mobiles_per_node;
 
-    // ── Key generation time ──
     let start = Instant::now();
     let mut harness = BenchHarness::new(n);
-    let keygen_time = start.elapsed();
-    println!("  Key generation ({} BLS keys): {:.1} ms", n, keygen_time.as_millis());
+    println!("  Key generation ({} BLS keys): {:.1} ms", n, start.elapsed().as_millis());
     println!("  Quorum: {}/{} (f={})", harness.validator_set.quorum_size(), n, harness.validator_set.fault_tolerance());
 
-    // ── Consensus round (3 runs, take median) ──
-    let mut round_times = Vec::new();
-    for i in 0..3u64 {
-        let view = i + 1;
-        let hash = B256::repeat_byte(view as u8);
-        let t = harness.run_consensus_round_timed(view, hash);
-        round_times.push(t);
-        println!("  Consensus round {} time: {:.1} ms", view, t.as_nanos() as f64 / 1_000_000.0);
-    }
+    let mut round_times: Vec<_> = (0..3u64)
+        .map(|i| {
+            let hash = B256::repeat_byte((i + 1) as u8);
+            let t = harness.run_consensus_round_timed(i + 1, hash);
+            println!("  Consensus round {} time: {:.1} ms", i + 1, t.as_nanos() as f64 / 1_000_000.0);
+            t
+        })
+        .collect();
     round_times.sort();
-    let median_consensus = round_times[1];
-    println!("  Consensus round (median): {:.1} ms\n", median_consensus.as_nanos() as f64 / 1_000_000.0);
+    println!("  Consensus round (median): {:.1} ms\n", round_times[1].as_nanos() as f64 / 1_000_000.0);
 
-    // ── Mobile receipt processing (per-node: 500 receipts) ──
     let block_hash = B256::repeat_byte(0xDD);
     let start = Instant::now();
-    let mut aggregator = n42_mobile::ReceiptAggregator::new(
-        mobiles_per_node * 2 / 3 + 1, 10,
-    );
+    let mut aggregator = n42_mobile::ReceiptAggregator::new(mobiles_per_node * 2 / 3 + 1, 10);
     aggregator.register_block(block_hash, 1);
     for i in 0..mobiles_per_node {
-        let key = test_mobile_bls_key(i);
-        let receipt = n42_mobile::sign_receipt(block_hash, 1, true, true, i as u64, &key);
+        let receipt = n42_mobile::sign_receipt(block_hash, 1, true, true, i as u64, &test_mobile_bls_key(i));
         receipt.verify_signature().unwrap();
         aggregator.process_receipt(&receipt);
     }
     let per_node_mobile_time = start.elapsed();
     println!("  Per-node mobile processing ({} receipts): {:.1} ms", mobiles_per_node, per_node_mobile_time.as_millis());
 
-    // ── Total mobile (all nodes, parallel in real system) ──
     let start = Instant::now();
-    let mut total_aggregator = n42_mobile::ReceiptAggregator::new(
-        total_mobiles * 2 / 3 + 1, 10,
-    );
+    let mut total_aggregator = n42_mobile::ReceiptAggregator::new(total_mobiles * 2 / 3 + 1, 10);
     total_aggregator.register_block(block_hash, 1);
     for i in 0..total_mobiles {
-        let key = test_mobile_bls_key(i);
-        let receipt = n42_mobile::sign_receipt(block_hash, 1, true, true, i as u64, &key);
+        let receipt = n42_mobile::sign_receipt(block_hash, 1, true, true, i as u64, &test_mobile_bls_key(i));
         receipt.verify_signature().unwrap();
         total_aggregator.process_receipt(&receipt);
     }
-    let total_mobile_time = start.elapsed();
-    println!("  Total mobile processing ({} receipts, sequential): {:.0} ms", total_mobiles, total_mobile_time.as_millis());
+    println!("  Total mobile processing ({} receipts, sequential): {:.0} ms", total_mobiles, start.elapsed().as_millis());
     println!("  Total mobile processing (parallel, per-node): {:.1} ms\n", per_node_mobile_time.as_millis());
 
-    // ── Summary ──
     println!("  --- Minimum Block Interval Analysis ---");
-    println!("  Consensus crypto (local, all-in-one):   {:.0} ms", median_consensus.as_nanos() as f64 / 1_000_000.0);
+    println!("  Consensus crypto (local, all-in-one):   {:.0} ms", round_times[1].as_nanos() as f64 / 1_000_000.0);
     println!("  Mobile verification (per-node, parallel): {:.0} ms", per_node_mobile_time.as_millis());
     println!("  Note: Mobile verification is NOT on the consensus critical path.");
     println!("  Note: Real-world adds network latency (~4 hops × 50ms = 200ms).");
@@ -448,69 +398,51 @@ fn bench_config_100_nodes_2500_mobiles() {
     let mobiles_per_node = 2500u32;
     let total_mobiles = n as u32 * mobiles_per_node;
 
-    // ── Key generation time ──
     let start = Instant::now();
     let mut harness = BenchHarness::new(n);
-    let keygen_time = start.elapsed();
-    println!("  Key generation ({} BLS keys): {:.1} ms", n, keygen_time.as_millis());
+    println!("  Key generation ({} BLS keys): {:.1} ms", n, start.elapsed().as_millis());
     println!("  Quorum: {}/{} (f={})", harness.validator_set.quorum_size(), n, harness.validator_set.fault_tolerance());
 
-    // ── Consensus round (5 runs, take median) ──
-    let mut round_times = Vec::new();
-    for i in 0..5u64 {
-        let view = i + 1;
-        let hash = B256::repeat_byte(view as u8);
-        let t = harness.run_consensus_round_timed(view, hash);
-        round_times.push(t);
-        println!("  Consensus round {} time: {:.1} ms", view, t.as_nanos() as f64 / 1_000_000.0);
-    }
+    let mut round_times: Vec<_> = (0..5u64)
+        .map(|i| {
+            let hash = B256::repeat_byte((i + 1) as u8);
+            let t = harness.run_consensus_round_timed(i + 1, hash);
+            println!("  Consensus round {} time: {:.1} ms", i + 1, t.as_nanos() as f64 / 1_000_000.0);
+            t
+        })
+        .collect();
     round_times.sort();
-    let median_consensus = round_times[2];
-    println!("  Consensus round (median): {:.1} ms\n", median_consensus.as_nanos() as f64 / 1_000_000.0);
+    println!("  Consensus round (median): {:.1} ms\n", round_times[2].as_nanos() as f64 / 1_000_000.0);
 
-    // ── Mobile receipt processing (per-node: 2500 receipts) ──
     let block_hash = B256::repeat_byte(0xEE);
     let start = Instant::now();
-    let mut aggregator = n42_mobile::ReceiptAggregator::new(
-        mobiles_per_node * 2 / 3 + 1, 10,
-    );
+    let mut aggregator = n42_mobile::ReceiptAggregator::new(mobiles_per_node * 2 / 3 + 1, 10);
     aggregator.register_block(block_hash, 1);
     for i in 0..mobiles_per_node {
-        let key = test_mobile_bls_key(i);
-        let receipt = n42_mobile::sign_receipt(block_hash, 1, true, true, i as u64, &key);
+        let receipt = n42_mobile::sign_receipt(block_hash, 1, true, true, i as u64, &test_mobile_bls_key(i));
         receipt.verify_signature().unwrap();
         aggregator.process_receipt(&receipt);
     }
     let per_node_mobile_time = start.elapsed();
     println!("  Per-node mobile processing ({} receipts): {:.1} ms", mobiles_per_node, per_node_mobile_time.as_millis());
 
-    // ── Total mobile (all nodes, parallel in real system) ──
     let start = Instant::now();
-    let mut total_aggregator = n42_mobile::ReceiptAggregator::new(
-        total_mobiles * 2 / 3 + 1, 10,
-    );
+    let mut total_aggregator = n42_mobile::ReceiptAggregator::new(total_mobiles * 2 / 3 + 1, 10);
     total_aggregator.register_block(block_hash, 1);
     for i in 0..total_mobiles {
-        let key = test_mobile_bls_key(i);
-        let receipt = n42_mobile::sign_receipt(block_hash, 1, true, true, i as u64, &key);
+        let receipt = n42_mobile::sign_receipt(block_hash, 1, true, true, i as u64, &test_mobile_bls_key(i));
         receipt.verify_signature().unwrap();
         total_aggregator.process_receipt(&receipt);
     }
-    let total_mobile_time = start.elapsed();
-    println!("  Total mobile processing ({} receipts, sequential): {:.0} ms", total_mobiles, total_mobile_time.as_millis());
+    println!("  Total mobile processing ({} receipts, sequential): {:.0} ms", total_mobiles, start.elapsed().as_millis());
     println!("  Total mobile processing (parallel, per-node): {:.1} ms\n", per_node_mobile_time.as_millis());
 
-    // ── Summary ──
     println!("  --- Minimum Block Interval Analysis ---");
-    println!("  Consensus crypto (local, all-in-one):   {:.0} ms", median_consensus.as_nanos() as f64 / 1_000_000.0);
+    println!("  Consensus crypto (local, all-in-one):   {:.0} ms", round_times[2].as_nanos() as f64 / 1_000_000.0);
     println!("  Mobile verification (per-node, parallel): {:.0} ms", per_node_mobile_time.as_millis());
     println!("  Note: Mobile verification is NOT on the consensus critical path.");
     println!("  Note: Real-world adds network latency (~4 hops × 50ms = 200ms).");
 }
-
-// ══════════════════════════════════════════════════════════════════════════════
-// Comparative Summary
-// ══════════════════════════════════════════════════════════════════════════════
 
 #[test]
 fn bench_comparative_summary() {

@@ -1,4 +1,3 @@
-use alloy_primitives::keccak256;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -6,19 +5,7 @@ use tracing::{error, info, warn};
 
 use crate::genesis;
 use crate::node_manager::{NodeConfig, NodeProcess};
-
-/// Computes the deterministic libp2p PeerId for a validator at the given index.
-///
-/// Uses the same derivation as the node binary: keccak256("n42-p2p-key-{index}")
-/// as the Ed25519 secret key seed.
-fn compute_peer_id(validator_index: usize) -> libp2p::PeerId {
-    let seed = keccak256(format!("n42-p2p-key-{}", validator_index).as_bytes());
-    let mut seed_bytes: [u8; 32] = seed.0;
-    let secret = libp2p::identity::ed25519::SecretKey::try_from_bytes(&mut seed_bytes)
-        .expect("valid ed25519 seed");
-    let kp = libp2p::identity::ed25519::Keypair::from(secret);
-    libp2p::identity::Keypair::from(kp).public().to_peer_id()
-}
+use crate::test_helpers::compute_peer_id;
 
 /// Scenario 4: Multi-node consensus test.
 ///
@@ -56,7 +43,7 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
 /// V4. Leader rotation fairness (each validator produces roughly equal blocks)
 /// V5. Block interval stability (average interval within [7,9] seconds)
 async fn run_multi_node_test(
-    binary_path: &PathBuf,
+    binary_path: &std::path::Path,
     node_count: usize,
     duration: Duration,
     port_offset_base: u16,
@@ -74,7 +61,7 @@ async fn run_multi_node_test(
     let genesis_path = genesis::write_genesis_file(tmp_dir.path(), &accounts);
 
     // Compute deterministic PeerIds for all nodes.
-    let peer_ids: Vec<_> = (0..node_count).map(|i| compute_peer_id(i)).collect();
+    let peer_ids: Vec<_> = (0..node_count).map(compute_peer_id).collect();
     for (i, pid) in peer_ids.iter().enumerate() {
         info!(node = i, peer_id = %pid, "computed deterministic PeerId");
     }
@@ -95,7 +82,7 @@ async fn run_multi_node_test(
             .collect();
 
         let config = NodeConfig {
-            binary_path: binary_path.clone(),
+            binary_path: binary_path.to_path_buf(),
             genesis_path: genesis_path.clone(),
             validator_index: i,
             validator_count: node_count,
@@ -301,7 +288,7 @@ async fn run_multi_node_test(
 
     if !intervals.is_empty() {
         let avg_interval: f64 = intervals.iter().sum::<u64>() as f64 / intervals.len() as f64;
-        if avg_interval < 7.0 || avg_interval > 9.0 {
+        if !(7.0..=9.0).contains(&avg_interval) {
             for node in nodes {
                 let _ = node.stop();
             }

@@ -5,41 +5,34 @@ use libp2p::gossipsub::IdentTopic;
 /// All consensus messages (Proposal, Vote, CommitVote, Timeout, NewView)
 /// are published to this single topic. With 100-500 validators and small
 /// message sizes (~128-500 bytes), a single topic provides sufficient
-/// throughput without the complexity of per-message-type routing.
+/// throughput without per-message-type routing complexity.
 pub fn consensus_topic() -> IdentTopic {
     IdentTopic::new("/n42/consensus/1")
 }
 
 /// GossipSub topic for block announcements (header-first dissemination).
 ///
-/// Block headers are announced on this topic first. Full block bodies
-/// are fetched on-demand via request-response after header validation.
+/// Block headers are announced first; full bodies are fetched on-demand
+/// via request-response after header validation.
 pub fn block_announce_topic() -> IdentTopic {
     IdentTopic::new("/n42/blocks/1")
 }
 
 /// GossipSub topic for mobile verification receipt aggregates.
-///
-/// Aggregated verification receipts from mobile nodes are published here
-/// for other IDC nodes to observe mobile attestation coverage.
 pub fn verification_receipts_topic() -> IdentTopic {
     IdentTopic::new("/n42/verification/1")
 }
 
 /// GossipSub topic for transaction pool (mempool) synchronization.
-///
-/// Transactions submitted via RPC to any node are broadcast to all peers
-/// via this topic. This ensures that when a different node becomes leader,
-/// its transaction pool contains transactions from other nodes.
 pub fn mempool_topic() -> IdentTopic {
     IdentTopic::new("/n42/mempool/1")
 }
 
 /// GossipSub topic for EIP-4844 blob sidecar propagation.
 ///
-/// Leaders broadcast blob sidecars alongside block data.
-/// Followers receive and insert into local DiskFileBlobStore.
-/// Best-effort: sidecar availability is NOT required for block acceptance.
+/// Leaders broadcast blob sidecars alongside block data. Followers
+/// receive and insert into local DiskFileBlobStore. Best-effort:
+/// sidecar availability is NOT required for block acceptance.
 pub fn blob_sidecar_topic() -> IdentTopic {
     IdentTopic::new("/n42/blobs/1")
 }
@@ -50,55 +43,26 @@ mod tests {
 
     #[test]
     fn test_topic_strings() {
-        // Verify each topic function returns the expected topic string.
-        // IdentTopic stores the raw string; its hash is derived from it.
-        // We compare the hash against a freshly-created IdentTopic with the
-        // expected string to confirm they match.
-        let consensus = consensus_topic();
-        assert_eq!(
-            consensus.hash(),
-            IdentTopic::new("/n42/consensus/1").hash(),
-            "consensus topic should be /n42/consensus/1"
-        );
+        assert_eq!(consensus_topic().hash(), IdentTopic::new("/n42/consensus/1").hash());
+        assert_eq!(block_announce_topic().hash(), IdentTopic::new("/n42/blocks/1").hash());
+        assert_eq!(verification_receipts_topic().hash(), IdentTopic::new("/n42/verification/1").hash());
+        assert_eq!(mempool_topic().hash(), IdentTopic::new("/n42/mempool/1").hash());
+        assert_eq!(blob_sidecar_topic().hash(), IdentTopic::new("/n42/blobs/1").hash());
 
-        let blocks = block_announce_topic();
-        assert_eq!(
-            blocks.hash(),
-            IdentTopic::new("/n42/blocks/1").hash(),
-            "block announce topic should be /n42/blocks/1"
-        );
-
-        let verification = verification_receipts_topic();
-        assert_eq!(
-            verification.hash(),
-            IdentTopic::new("/n42/verification/1").hash(),
-            "verification receipts topic should be /n42/verification/1"
-        );
-
-        let mempool = mempool_topic();
-        assert_eq!(
-            mempool.hash(),
-            IdentTopic::new("/n42/mempool/1").hash(),
-            "mempool topic should be /n42/mempool/1"
-        );
-
-        let blobs = blob_sidecar_topic();
-        assert_eq!(
-            blobs.hash(),
-            IdentTopic::new("/n42/blobs/1").hash(),
-            "blob sidecar topic should be /n42/blobs/1"
-        );
-
-        // Also verify that all five topics are distinct from each other.
-        let all = [&consensus, &blocks, &verification, &mempool, &blobs];
+        // All five topics must be distinct.
+        let all = [
+            consensus_topic(),
+            block_announce_topic(),
+            verification_receipts_topic(),
+            mempool_topic(),
+            blob_sidecar_topic(),
+        ];
         for i in 0..all.len() {
             for j in (i + 1)..all.len() {
                 assert_ne!(
                     all[i].hash(),
                     all[j].hash(),
-                    "topics at index {} and {} should differ",
-                    i,
-                    j
+                    "topics at index {i} and {j} should differ"
                 );
             }
         }

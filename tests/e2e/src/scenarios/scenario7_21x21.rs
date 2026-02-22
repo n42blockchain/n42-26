@@ -1,4 +1,3 @@
-use alloy_primitives::keccak256;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -6,16 +5,7 @@ use tracing::{error, info, warn};
 
 use crate::genesis;
 use crate::node_manager::{NodeConfig, NodeProcess};
-
-/// Computes the deterministic libp2p PeerId for a validator at the given index.
-fn compute_peer_id(validator_index: usize) -> libp2p::PeerId {
-    let seed = keccak256(format!("n42-p2p-key-{}", validator_index).as_bytes());
-    let mut seed_bytes: [u8; 32] = seed.0;
-    let secret = libp2p::identity::ed25519::SecretKey::try_from_bytes(&mut seed_bytes)
-        .expect("valid ed25519 seed");
-    let kp = libp2p::identity::ed25519::Keypair::from(secret);
-    libp2p::identity::Keypair::from(kp).public().to_peer_id()
-}
+use crate::test_helpers::compute_peer_id;
 
 const NODE_COUNT: usize = 21;
 const BLOCKS_PER_VALIDATOR: u64 = 21;
@@ -53,7 +43,7 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
     let genesis_path = genesis::write_genesis_file(tmp_dir.path(), &accounts);
 
     // Compute deterministic PeerIds for all nodes.
-    let peer_ids: Vec<_> = (0..NODE_COUNT).map(|i| compute_peer_id(i)).collect();
+    let peer_ids: Vec<_> = (0..NODE_COUNT).map(compute_peer_id).collect();
     for (i, pid) in peer_ids.iter().enumerate() {
         info!(node = i, peer_id = %pid, "computed deterministic PeerId");
     }
@@ -347,8 +337,7 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
             "block interval stats"
         );
 
-        // For 4s target, allow [3, 6] second range (generous for E2E variability).
-        if avg_interval < 3.0 || avg_interval > 6.0 {
+        if !(3.0..=6.0).contains(&avg_interval) {
             for node in nodes {
                 let _ = node.stop();
             }

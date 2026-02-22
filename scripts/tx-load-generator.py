@@ -41,7 +41,7 @@ from eth_account import Account
 # CRITICAL: Use eth_utils.keccak (Keccak-256), NOT hashlib.sha3_256 (NIST SHA3-256).
 # Python's hashlib.sha3_256 uses NIST SHA3 padding (0x06) while Ethereum uses
 # original Keccak padding (0x01). They produce DIFFERENT outputs for the same input.
-from eth_utils import keccak
+from eth_utils import keccak, to_checksum_address
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -61,8 +61,8 @@ DEPLOY_GAS = 1_500_000
 MAX_FEE_PER_GAS = 2_000_000_000       # 2 gwei
 MAX_PRIORITY_FEE = 1_000_000_000      # 1 gwei
 
-# Transaction mix
-TRANSFER_RATIO = 0.7  # 70% native transfers, 30% ERC-20
+# ERC-20 mix: one transfer every N TXs (≈ every 2 blocks at 2tx/s, 4s slot)
+ERC20_TX_INTERVAL = 16
 
 # Reliability parameters
 STATS_INTERVAL = 30          # seconds between stats reports
@@ -73,6 +73,16 @@ BACKOFF_MAX = 30             # maximum backoff seconds
 
 # ERC-20 transfer(address,uint256) function selector
 ERC20_TRANSFER_SELECTOR = bytes.fromhex("a9059cbb")
+
+
+def _encode_erc20_transfer(to_address: str, amount: int) -> bytes:
+    """ABI-encode transfer(address,uint256) calldata."""
+    to_bytes = bytes.fromhex(to_address[2:])
+    return (
+        ERC20_TRANSFER_SELECTOR +
+        b"\x00" * 12 + to_bytes +
+        amount.to_bytes(32, "big")
+    )
 
 # Resolve project root from script location
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -162,7 +172,7 @@ class RpcClient:
         return int(self._call("eth_getBalance", [address, "latest"]), 16)
 
     def get_nonce(self, address: str) -> int:
-        return int(self._call("eth_getTransactionCount", [address, "latest"]), 16)
+        return int(self._call("eth_getTransactionCount", [address, "pending"]), 16)
 
     def send_raw_transaction(self, raw_tx_hex: str) -> str:
         return self._call("eth_sendRawTransaction", [raw_tx_hex])
@@ -253,10 +263,7 @@ class AccountManager:
                     i, acct.address,
                 )
                 sys.exit(1)
-            log.info(
-                "Account %d: %s  balance=%.4f N42",
-                i, acct.address, balance / 1e18,
-            )
+            log.info("Account %d: %s  balance=%.4f N42", i, acct.address, balance / 1e18)
 
 
 # ---------------------------------------------------------------------------
@@ -279,8 +286,7 @@ class Stats:
         except Exception:
             block = -1
         log.info(
-            "STATS  sent=%d (native=%d erc20=%d) failed=%d  "
-            "elapsed=%.0fs  rate=%.2f tx/s  block=%d",
+            "STATS sent=%d (native=%d erc20=%d) failed=%d elapsed=%.0fs rate=%.2f tx/s block=%d",
             self.sent, self.native_sent, self.erc20_sent, self.failed,
             elapsed, self.sent / max(elapsed, 1), block,
         )
@@ -328,29 +334,73 @@ class TxGenerator:
         tx_hash = self.rpc.send_raw_transaction(raw_hex)
         log.info("Deploy TX sent: %s", tx_hash)
 
-        # Poll for receipt
         for attempt in range(120):
             if shutdown_event.is_set():
                 raise SystemExit("Shutdown during deploy")
             try:
                 receipt = self.rpc.get_receipt(tx_hash)
-                if receipt is not None:
-                    status = int(receipt.get("status", "0x0"), 16)
-                    if status != 1:
-                        raise RuntimeError(f"Deploy reverted, receipt: {receipt}")
-                    addr = receipt.get("contractAddress")
-                    if not addr:
-                        raise RuntimeError("Deploy receipt missing contractAddress")
-                    log.info("TestUSDT deployed at %s (block %s)",
-                             addr, receipt.get("blockNumber"))
-                    return addr
+                if receipt is None:
+                    time.sleep(2)
+                    continue
+
+                status = int(receipt.get("status", "0x0"), 16)
+                if status != 1:
+                    raise RuntimeError(f"Deploy reverted, receipt: {receipt}")
+
+                raw_addr = receipt.get("contractAddress")
+                if not raw_addr:
+                    raise RuntimeError("Deploy receipt missing contractAddress")
+
+                addr = to_checksum_address(raw_addr)
+                log.info("TestUSDT deployed at %s (block %s)",
+                         addr, receipt.get("blockNumber"))
+                return addr
             except RuntimeError:
                 raise
             except Exception:
-                pass
-            time.sleep(2)
+                time.sleep(2)
 
         raise RuntimeError("Timeout waiting for deploy receipt (240s)")
+
+    # -- Phase 1b: Distribute tokens to test accounts -------------------------
+
+    def distribute_tokens(self):
+        """Send USDT from deployer (account 0) to all other test accounts."""
+        if not self.usdt_address:
+            return
+        log.info("Phase 1b: Distributing USDT to %d test accounts...",
+                 NUM_ACCOUNTS - 1)
+        contract = to_checksum_address(self.usdt_address)
+        amount = 1_000_000 * 10**6  # 1M USDT each (6 decimals)
+
+        for i in range(1, NUM_ACCOUNTS):
+            if shutdown_event.is_set():
+                return
+            to_addr = self.acct_mgr.accounts[i].address
+            calldata = _encode_erc20_transfer(to_addr, amount)
+            acct = self.acct_mgr.accounts[0]
+            nonce = self.acct_mgr.get_and_increment(0)
+            tx = {
+                "type": 2,
+                "chainId": CHAIN_ID,
+                "nonce": nonce,
+                "maxFeePerGas": MAX_FEE_PER_GAS,
+                "maxPriorityFeePerGas": MAX_PRIORITY_FEE,
+                "gas": ERC20_TRANSFER_GAS,
+                "to": contract,
+                "value": 0,
+                "data": "0x" + calldata.hex(),
+            }
+            signed = Account.sign_transaction(tx, acct.private_key)
+            raw_hex = "0x" + signed.raw_transaction.hex()
+            try:
+                tx_hash = self.rpc.send_raw_transaction(raw_hex)
+                log.info("  Sent 1M USDT to account %d: %s", i, tx_hash)
+            except Exception as e:
+                log.warning("  Failed to send USDT to account %d: %s", i, e)
+        log.info("Waiting for distribution TXs to be mined...")
+        time.sleep(8)
+        log.info("USDT distribution complete")
 
     # -- Phase 2: Continuous transaction generation ----------------------------
 
@@ -387,14 +437,7 @@ class TxGenerator:
         to_addr = self.acct_mgr.accounts[to_idx].address
         # 1-1000 USDT (6 decimals)
         amount = random.randint(1, 1000) * 10**6
-
-        # ABI-encode transfer(address,uint256)
-        to_bytes = bytes.fromhex(to_addr[2:])
-        calldata = (
-            ERC20_TRANSFER_SELECTOR
-            + b"\x00" * 12 + to_bytes
-            + amount.to_bytes(32, "big")
-        )
+        calldata = _encode_erc20_transfer(to_addr, amount)
 
         nonce = self.acct_mgr.get_and_increment(from_idx)
         tx = {
@@ -424,8 +467,9 @@ class TxGenerator:
         log.info("Phase 2: Starting continuous TX generation at %d tx/sec", self.rate)
 
         while not shutdown_event.is_set():
-            # --- Layer 3: Periodic full nonce sync ---
             now = time.time()
+
+            # Layer 3: Periodic full nonce sync
             if now - last_nonce_sync > NONCE_SYNC_INTERVAL:
                 try:
                     self.acct_mgr.sync_all_nonces(self.rpc)
@@ -439,11 +483,11 @@ class TxGenerator:
             round_idx += 1
 
             try:
-                # 70% native transfers, 30% ERC-20
-                if random.random() < TRANSFER_RATIO:
-                    self._send_native_transfer(from_idx, to_idx)
-                else:
+                # One ERC-20 transfer every ERC20_TX_INTERVAL TXs (≈ every 2 blocks)
+                if self.usdt_address and round_idx % ERC20_TX_INTERVAL == 0:
                     self._send_erc20_transfer(from_idx, to_idx)
+                else:
+                    self._send_native_transfer(from_idx, to_idx)
 
                 self.stats.sent += 1
                 consecutive_errors = 0
@@ -456,25 +500,22 @@ class TxGenerator:
                     consecutive_errors, from_idx, e,
                 )
 
-                # --- Layer 2: Error-recovery nonce sync ---
+                # Layer 2: Error-recovery nonce sync
                 self.acct_mgr.rollback(from_idx)
                 try:
                     self.acct_mgr.sync_nonce(from_idx, self.rpc)
                 except Exception:
                     pass
 
-                # Exponential backoff after too many consecutive errors
+                # Layer 1: Exponential backoff after too many consecutive errors
                 if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
                     backoff = min(
                         BACKOFF_MIN * (2 ** (consecutive_errors - MAX_CONSECUTIVE_ERRORS)),
                         BACKOFF_MAX,
                     )
-                    log.warning(
-                        "Backing off %.1fs after %d consecutive errors",
-                        backoff, consecutive_errors,
-                    )
+                    log.warning("Backing off %.1fs after %d consecutive errors",
+                                backoff, consecutive_errors)
                     shutdown_event.wait(backoff)
-                    # Full nonce resync after backoff
                     try:
                         self.acct_mgr.sync_all_nonces(self.rpc)
                         last_nonce_sync = time.time()
@@ -482,7 +523,6 @@ class TxGenerator:
                         pass
                     continue
 
-            # Pace to target rate
             shutdown_event.wait(interval)
 
 
@@ -547,6 +587,9 @@ def main():
     if not args.no_erc20:
         try:
             gen.usdt_address = gen.deploy_erc20()
+            gen.distribute_tokens()
+            # Re-sync nonces after deploy + distribution TXs
+            acct_mgr.sync_all_nonces(rpc)
         except SystemExit:
             return
         except Exception as e:
@@ -563,10 +606,7 @@ def main():
     stats_thread = threading.Thread(target=_stats_loop, daemon=True)
     stats_thread.start()
 
-    # Phase 2: Continuous generation
     gen.run()
-
-    # Final report
     gen.stats.report(rpc)
     log.info("TX generator shutdown complete")
 

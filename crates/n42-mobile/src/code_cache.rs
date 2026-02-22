@@ -5,24 +5,17 @@ use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use tracing::warn;
 
-/// LRU cache for high-frequency contract bytecodes on mobile devices.
+/// LRU cache for contract bytecodes on mobile devices.
 ///
-/// Mobile verifiers cache commonly-used contract bytecodes locally
-/// (ERC-20, DEX routers, etc.) to reduce verification packet sizes.
-/// The IDC node tracks which codes each phone has cached and excludes
-/// them from the `VerificationPacket.uncached_bytecodes` field.
-///
+/// Reduces verification packet sizes — the IDC node tracks which codes each
+/// phone has cached and excludes them from `VerificationPacket.uncached_bytecodes`.
 /// Cache keys are `keccak256(bytecode)` (the code hash).
 pub struct CodeCache {
-    /// LRU cache: code_hash → bytecode.
     cache: LruCache<B256, Bytes>,
 }
 
 impl CodeCache {
-    /// Creates a new code cache with the given capacity.
-    ///
-    /// Typical capacity for mobile devices: 500-2000 contracts.
-    /// If `capacity` is 0, it is clamped to 1 with a warning to prevent panics.
+    /// Creates a new code cache with the given capacity (clamped to 1 if 0).
     pub fn new(capacity: usize) -> Self {
         let capacity = if capacity == 0 {
             warn!("CodeCache capacity 0 is invalid, clamping to 1");
@@ -30,10 +23,7 @@ impl CodeCache {
         } else {
             capacity
         };
-        Self {
-            // SAFETY: capacity is guaranteed > 0 after the clamp above.
-            cache: LruCache::new(NonZeroUsize::new(capacity).unwrap()),
-        }
+        Self { cache: LruCache::new(NonZeroUsize::new(capacity).unwrap()) }
     }
 
     /// Inserts a bytecode into the cache.
@@ -51,10 +41,9 @@ impl CodeCache {
         self.cache.contains(code_hash)
     }
 
-    /// Returns the set of all cached code hashes.
+    /// Returns all cached code hashes.
     ///
-    /// Used by the IDC node to determine which bytecodes to exclude
-    /// from the verification packet for this phone.
+    /// Used by the IDC node to determine which bytecodes to exclude from packets.
     pub fn cached_hashes(&self) -> Vec<B256> {
         self.cache.iter().map(|(k, _)| *k).collect()
     }
@@ -69,9 +58,7 @@ impl CodeCache {
         self.cache.is_empty()
     }
 
-    /// Removes a specific entry from the cache.
-    ///
-    /// Used by CacheSyncMessage evict hints to free memory for rarely-used contracts.
+    /// Removes an entry from the cache (used by evict hints from `CacheSyncMessage`).
     pub fn remove(&mut self, code_hash: &B256) -> Option<Bytes> {
         self.cache.pop(code_hash)
     }
@@ -84,13 +71,10 @@ impl CodeCache {
 
 /// Tracks hot contract usage across all mobile verifiers.
 ///
-/// The IDC node maintains this tracker to identify frequently-accessed
-/// contracts and proactively push their bytecodes to phones during
-/// cache sync, even before those contracts appear in a verification packet.
+/// The IDC node uses this to proactively push frequently-accessed bytecodes
+/// to phones during cache sync, before they appear in a verification packet.
 pub struct HotContractTracker {
-    /// Cumulative access count per code hash.
     access_counts: HashMap<B256, u64>,
-    /// Number of blocks tracked.
     blocks_tracked: u64,
 }
 
@@ -103,10 +87,7 @@ impl HotContractTracker {
         }
     }
 
-    /// Records contract accesses from a block's execution witness.
-    ///
-    /// Call this after each block execution with the set of code hashes
-    /// that were accessed during execution.
+    /// Records contract accesses for a block's execution.
     pub fn record_block_accesses(&mut self, code_hashes: &[B256]) {
         self.blocks_tracked += 1;
         for hash in code_hashes {
@@ -127,10 +108,10 @@ impl HotContractTracker {
         self.blocks_tracked
     }
 
-    /// Decays all access counts by the given factor (0.0 - 1.0).
+    /// Decays all access counts by `factor` (0.0–1.0), removing entries that reach zero.
     ///
-    /// Call periodically (e.g., every epoch) to prevent stale contracts
-    /// from occupying top positions indefinitely.
+    /// Call periodically (e.g., every epoch) to prevent stale contracts from
+    /// occupying top positions indefinitely.
     pub fn decay(&mut self, factor: f64) {
         let factor = factor.clamp(0.0, 1.0);
         self.access_counts.retain(|_, count| {
@@ -148,8 +129,8 @@ impl Default for HotContractTracker {
 
 /// Cache synchronization message sent from IDC to mobile devices.
 ///
-/// Periodically, the IDC pushes hot contract bytecodes to phones
-/// so they can pre-populate their caches before verification packets arrive.
+/// Periodically, the IDC pushes hot contract bytecodes to phones so they can
+/// pre-populate their caches before verification packets arrive.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CacheSyncMessage {
     /// Bytecodes to add to the cache: (code_hash, bytecode).
@@ -158,14 +139,16 @@ pub struct CacheSyncMessage {
     pub evict_hints: Vec<B256>,
 }
 
-/// Encodes a `CacheSyncMessage` with wire header (versioned format).
+/// Encodes a `CacheSyncMessage` with a wire header.
 ///
-/// Format: wire_header(4B) + codes_count(u32 LE) + for each code: code_hash(32B) + code_len(u32 LE) + bytecode
-///       + evict_count(u32 LE) + for each: code_hash(32B)
+/// Format: `wire_header(4B) + codes_count(u32LE) + [code_hash(32B) + code_len(u32LE) + bytecode]...`
+///       `+ evict_count(u32LE) + [code_hash(32B)]...`
 pub fn encode_cache_sync(msg: &CacheSyncMessage) -> Vec<u8> {
     use crate::wire;
 
-    let estimated = wire::HEADER_SIZE + 4 + msg.codes.iter().map(|(_, c)| 32 + 4 + c.len()).sum::<usize>() + 4 + msg.evict_hints.len() * 32;
+    let codes_size: usize = msg.codes.iter().map(|(_, c)| 32 + 4 + c.len()).sum();
+    let estimated =
+        wire::HEADER_SIZE + 4 + codes_size + 4 + msg.evict_hints.len() * 32;
     let mut buf = Vec::with_capacity(estimated);
 
     wire::encode_header(&mut buf, wire::VERSION_1, 0x00);

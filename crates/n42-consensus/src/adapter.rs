@@ -76,7 +76,6 @@ where
         result: &BlockExecutionResult<N::Receipt>,
         receipt_root_bloom: Option<reth_consensus::ReceiptRootBloom>,
     ) -> Result<(), ConsensusError> {
-        // First: standard Ethereum validation (gas, receipts, state root, etc.)
         <EthBeaconConsensus<C> as FullConsensus<N>>::validate_block_post_execution(
             &self.inner,
             block,
@@ -84,24 +83,13 @@ where
             receipt_root_bloom,
         )?;
 
-        // Extract and verify QC from block extra_data.
-        // If the validator set is loaded and the header contains a QC,
-        // verify the aggregate BLS signature against the signer public keys.
         if let Some(ref vs) = self.validator_set {
             let extra_data = block.header().extra_data();
             if let Some(qc) = extract_qc_from_extra_data(extra_data)? {
-                // Try PrepareQC format first, then CommitQC format.
-                // The QC in extra_data could be either type depending on
-                // which consensus round produced it.
                 verify_qc(&qc, vs)
                     .or_else(|_| verify_commit_qc(&qc, vs))
-                    .map_err(|e| {
-                        ConsensusError::Other(e.to_string())
-                    })?;
+                    .map_err(|e| ConsensusError::Other(e.to_string()))?;
             }
-            // No QC in extra_data is acceptable for:
-            // - Genesis block (view 0)
-            // - Blocks during initial sync before consensus engine activation
         }
 
         Ok(())
@@ -184,7 +172,7 @@ mod tests {
     fn test_new_without_validator_set() {
         let chain_spec = n42_chainspec::n42_dev_chainspec();
         let consensus = N42Consensus::new(chain_spec);
-        assert!(consensus.validator_set.is_none(), "should have no validator set initially");
+        assert!(consensus.validator_set.is_none());
     }
 
     #[test]
@@ -192,10 +180,10 @@ mod tests {
         let chain_spec = n42_chainspec::n42_dev_chainspec();
         let (_, vs) = test_validator_set(4);
         let consensus = N42Consensus::with_validator_set(chain_spec, vs);
-        assert!(consensus.validator_set.is_some(), "should have validator set");
+        assert!(consensus.validator_set.is_some());
         let vs_ref = consensus.validator_set.as_ref().unwrap();
-        assert_eq!(vs_ref.len(), 4, "validator set should have 4 validators");
-        assert_eq!(vs_ref.quorum_size(), 3, "quorum should be 2*1+1 = 3");
+        assert_eq!(vs_ref.len(), 4);
+        assert_eq!(vs_ref.quorum_size(), 3);
     }
 
     #[test]
@@ -226,7 +214,6 @@ mod tests {
         let view = 42u64;
         let block_hash = B256::repeat_byte(0xCC);
 
-        // Build a valid PrepareQC (same as what the leader produces)
         let msg = signing_message(view, &block_hash);
         let sigs: Vec<_> = sks[0..3].iter().map(|sk| sk.sign(&msg)).collect();
         let sig_refs: Vec<_> = sigs.iter().collect();
@@ -243,17 +230,13 @@ mod tests {
             signers,
         };
 
-        // Encode QC → extra_data (what the block builder does)
         let extra_data = encode_qc_to_extra_data(&qc).unwrap();
-
-        // Extract QC from extra_data (what adapter.validate_block_post_execution does)
         let extracted = extract_qc_from_extra_data(&extra_data)
             .expect("extraction should succeed")
             .expect("should contain a QC");
 
-        // Verify QC (what adapter does: try verify_qc first)
         let result = verify_qc(&extracted, &vs);
-        assert!(result.is_ok(), "valid PrepareQC should verify");
+        assert!(result.is_ok());
     }
 
     /// End-to-end test of the CommitQC verification fallback path.
@@ -264,7 +247,6 @@ mod tests {
         let view = 99u64;
         let block_hash = B256::repeat_byte(0xDD);
 
-        // Build a CommitQC (signed with "commit" || view || block_hash)
         let msg = commit_signing_message(view, &block_hash);
         let sigs: Vec<_> = sks[0..3].iter().map(|sk| sk.sign(&msg)).collect();
         let sig_refs: Vec<_> = sigs.iter().collect();
@@ -284,28 +266,23 @@ mod tests {
         let extra_data = encode_qc_to_extra_data(&qc).unwrap();
         let extracted = extract_qc_from_extra_data(&extra_data).unwrap().unwrap();
 
-        // verify_qc should FAIL (different signing message format)
-        let qc_result = verify_qc(&extracted, &vs);
-        assert!(qc_result.is_err(), "CommitQC should fail PrepareQC verification");
+        assert!(verify_qc(&extracted, &vs).is_err());
 
-        // The adapter's fallback: verify_commit_qc should SUCCEED
         let fallback_result = verify_qc(&extracted, &vs)
             .or_else(|_| verify_commit_qc(&extracted, &vs));
-        assert!(fallback_result.is_ok(), "CommitQC should pass via fallback path");
+        assert!(fallback_result.is_ok());
     }
 
     #[test]
     fn test_no_qc_in_extra_data_is_acceptable() {
         use alloy_primitives::Bytes;
 
-        // Empty extra_data — genesis block scenario
         let result = extract_qc_from_extra_data(&Bytes::new());
         assert!(result.is_ok());
-        assert!(result.unwrap().is_none(), "empty extra_data should return None");
+        assert!(result.unwrap().is_none());
 
-        // Non-QC extra_data — blocks during initial sync
         let result = extract_qc_from_extra_data(&Bytes::from_static(b"some other data"));
         assert!(result.is_ok());
-        assert!(result.unwrap().is_none(), "non-QC extra_data should return None");
+        assert!(result.unwrap().is_none());
     }
 }

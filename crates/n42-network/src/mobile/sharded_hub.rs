@@ -7,18 +7,16 @@ use super::star_hub::{HubEvent, SessionIdGenerator, StarHub, StarHubConfig, Star
 
 /// Configuration for a sharded star hub.
 ///
-/// Multiple QUIC endpoints share the load across different ports,
-/// enabling linear scaling beyond single-socket limits (~10K connections).
+/// Multiple QUIC endpoints share load across different ports, enabling linear
+/// scaling beyond single-socket limits (~10K connections per socket).
 pub struct ShardedStarHubConfig {
-    /// Base port for the first shard. Subsequent shards use base_port+1, +2, etc.
+    /// Base port for the first shard; subsequent shards use base_port+N.
     pub base_port: u16,
-    /// Number of shards (QUIC endpoints). Default: 1.
+    /// Number of QUIC endpoint shards (minimum: 1).
     pub shard_count: usize,
-    /// Maximum connections per shard. Default: 10,000.
     pub max_connections_per_shard: usize,
-    /// Session idle timeout in seconds.
     pub idle_timeout_secs: u64,
-    /// Directory for persisting the TLS certificate (shared across shards).
+    /// Shared TLS certificate directory across shards (for client-side pinning).
     pub cert_dir: Option<PathBuf>,
 }
 
@@ -37,26 +35,23 @@ impl Default for ShardedStarHubConfig {
 /// A collection of `StarHub` instances, each on a different port.
 ///
 /// `shard_count=1` degrades to exactly one `StarHub` with no overhead.
-/// All shards share a global `SessionIdGenerator` for unique IDs and
-/// the same TLS certificate for client-side pinning.
+/// All shards share a `SessionIdGenerator` for globally unique IDs.
 pub struct ShardedStarHub {
     shards: Vec<(StarHub, u16)>,
 }
 
 /// Handle for sending commands to all shards.
 ///
-/// Method signatures mirror `StarHubHandle` so callers don't need
-/// to know whether they're talking to one shard or many.
+/// Mirrors `StarHubHandle` so callers are unaware of shard topology.
 #[derive(Clone, Debug)]
 pub struct ShardedStarHubHandle {
     shard_handles: Vec<StarHubHandle>,
 }
 
 impl ShardedStarHubHandle {
-    /// Broadcasts a verification packet to all shards (all connected phones).
+    /// Broadcasts a verification packet to all shards.
     ///
-    /// `Bytes::clone()` is O(1) (reference count bump), so fan-out to N shards
-    /// does not copy the payload.
+    /// `Bytes::clone()` is O(1), so fan-out to N shards copies no payload.
     pub fn broadcast_packet(&self, data: Bytes) -> Result<(), crate::error::NetworkError> {
         for handle in &self.shard_handles {
             handle.broadcast_packet(data.clone())?;
@@ -64,7 +59,6 @@ impl ShardedStarHubHandle {
         Ok(())
     }
 
-    /// Broadcasts a cache sync message to all shards.
     pub fn broadcast_cache_sync(&self, data: Bytes) -> Result<(), crate::error::NetworkError> {
         for handle in &self.shard_handles {
             handle.broadcast_cache_sync(data.clone())?;
@@ -72,11 +66,9 @@ impl ShardedStarHubHandle {
         Ok(())
     }
 
-    /// Sends data to a specific session.
+    /// Sends data to a specific session by fan-outing to all shards.
     ///
-    /// Fan-out to all shards — the shard that doesn't own this session ID
-    /// will silently drop the message (channel not found). With globally
-    /// unique IDs, exactly one shard will match.
+    /// Only the shard owning the session ID will match; others silently drop.
     pub fn send_to_session(
         &self,
         session_id: u64,
@@ -90,10 +82,7 @@ impl ShardedStarHubHandle {
 }
 
 impl ShardedStarHub {
-    /// Creates a sharded star hub with N shards.
-    ///
-    /// Returns the hub (for spawning), a unified handle (for sending commands),
-    /// and a merged event receiver (all shard events on one channel).
+    /// Creates N shards, returning the hub, a unified handle, and merged event receiver.
     pub fn new(
         config: ShardedStarHubConfig,
     ) -> (Self, ShardedStarHubHandle, mpsc::UnboundedReceiver<HubEvent>) {
@@ -102,8 +91,6 @@ impl ShardedStarHub {
 
         let mut shards = Vec::with_capacity(shard_count);
         let mut shard_handles = Vec::with_capacity(shard_count);
-
-        // Merged event channel: all shard events flow into one receiver.
         let (merged_event_tx, merged_event_rx) = mpsc::unbounded_channel();
 
         for i in 0..shard_count {
@@ -118,7 +105,6 @@ impl ShardedStarHub {
             let (hub, handle, mut event_rx) =
                 StarHub::new_with_shared_id_gen(shard_config, shared_id_gen.clone());
 
-            // Spawn a forwarder task to merge this shard's events into the unified channel.
             let fwd_tx = merged_event_tx.clone();
             tokio::spawn(async move {
                 while let Some(event) = event_rx.recv().await {
@@ -132,24 +118,18 @@ impl ShardedStarHub {
             shard_handles.push(handle);
         }
 
-        let hub = Self { shards };
-        let handle = ShardedStarHubHandle { shard_handles };
-        (hub, handle, merged_event_rx)
+        (Self { shards }, ShardedStarHubHandle { shard_handles }, merged_event_rx)
     }
 
-    /// Returns the ports assigned to each shard.
     pub fn ports(&self) -> Vec<u16> {
         self.shards.iter().map(|(_, port)| *port).collect()
     }
 
-    /// Returns the number of shards.
     pub fn shard_count(&self) -> usize {
         self.shards.len()
     }
 
-    /// Runs all shards concurrently.
-    ///
-    /// Returns when any shard exits (with error or cleanly).
+    /// Runs all shards concurrently. Returns when any shard exits.
     pub async fn run(self) -> eyre::Result<()> {
         let mut join_set = tokio::task::JoinSet::new();
 
@@ -160,24 +140,22 @@ impl ShardedStarHub {
             });
         }
 
-        // Wait for the first shard to exit.
         if let Some(result) = join_set.join_next().await {
             match result {
-                Ok(Ok(())) => {
-                    tracing::info!("a StarHub shard exited cleanly");
-                }
+                Ok(Ok(())) => tracing::info!("a StarHub shard exited cleanly"),
                 Ok(Err(e)) => {
                     tracing::error!(error = %e, "a StarHub shard exited with error");
+                    join_set.abort_all();
                     return Err(e);
                 }
                 Err(e) => {
                     tracing::error!(error = %e, "a StarHub shard task panicked");
+                    join_set.abort_all();
                     return Err(eyre::eyre!("shard task panicked: {e}"));
                 }
             }
         }
 
-        // Abort remaining shards on exit.
         join_set.abort_all();
         Ok(())
     }
@@ -197,26 +175,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_sharded_hub_single_shard() {
-        let config = ShardedStarHubConfig {
-            base_port: 19443,
-            shard_count: 1,
-            ..Default::default()
-        };
+        let config = ShardedStarHubConfig { base_port: 19443, shard_count: 1, ..Default::default() };
         let (hub, handle, _event_rx) = ShardedStarHub::new(config);
         assert_eq!(hub.shard_count(), 1);
         assert_eq!(hub.ports(), vec![19443]);
-
-        // Should be able to send commands
         assert!(handle.broadcast_packet(Bytes::from(vec![1, 2, 3])).is_ok());
     }
 
     #[tokio::test]
     async fn test_sharded_hub_port_assignment() {
-        let config = ShardedStarHubConfig {
-            base_port: 19443,
-            shard_count: 3,
-            ..Default::default()
-        };
+        let config = ShardedStarHubConfig { base_port: 19443, shard_count: 3, ..Default::default() };
         let (hub, _handle, _event_rx) = ShardedStarHub::new(config);
         assert_eq!(hub.shard_count(), 3);
         assert_eq!(hub.ports(), vec![19443, 19444, 19445]);
@@ -224,65 +192,42 @@ mod tests {
 
     #[tokio::test]
     async fn test_sharded_hub_broadcast_fans_out() {
-        let config = ShardedStarHubConfig {
-            base_port: 19446,
-            shard_count: 3,
-            ..Default::default()
-        };
+        let config = ShardedStarHubConfig { base_port: 19446, shard_count: 3, ..Default::default() };
         let (_hub, handle, _event_rx) = ShardedStarHub::new(config);
-
-        // broadcast_packet should succeed for all shards
         assert!(handle.broadcast_packet(Bytes::from(vec![0xAA])).is_ok());
         assert!(handle.broadcast_cache_sync(Bytes::from(vec![0xBB])).is_ok());
     }
 
     #[tokio::test]
     async fn test_sharded_handle_clone_cheap() {
-        let config = ShardedStarHubConfig {
-            base_port: 19449,
-            shard_count: 2,
-            ..Default::default()
-        };
+        let config = ShardedStarHubConfig { base_port: 19449, shard_count: 2, ..Default::default() };
         let (_hub, handle, _event_rx) = ShardedStarHub::new(config);
         let cloned = handle.clone();
-
-        // Both handles should work independently
         assert!(handle.broadcast_packet(Bytes::from(vec![1])).is_ok());
         assert!(cloned.broadcast_packet(Bytes::from(vec![2])).is_ok());
     }
 
     #[test]
     fn test_session_id_uniqueness() {
-        use std::sync::Arc;
-
         let id_gen = Arc::new(SessionIdGenerator::new());
         let handles: Vec<_> = (0..4)
             .map(|_| {
                 let g = id_gen.clone();
-                std::thread::spawn(move || {
-                    (0..1000).map(|_| g.next()).collect::<Vec<_>>()
-                })
+                std::thread::spawn(move || (0..1000).map(|_| g.next()).collect::<Vec<_>>())
             })
             .collect();
-
-        let mut all_ids: Vec<u64> = handles
-            .into_iter()
-            .flat_map(|h| h.join().unwrap())
-            .collect();
+        let mut all_ids: Vec<u64> =
+            handles.into_iter().flat_map(|h| h.join().unwrap()).collect();
         all_ids.sort();
         all_ids.dedup();
-        assert_eq!(all_ids.len(), 4000, "session IDs must be globally unique across shards");
+        assert_eq!(all_ids.len(), 4000, "session IDs must be globally unique");
     }
 
     #[tokio::test]
     async fn test_sharded_hub_zero_shard_count_clamps_to_one() {
-        let config = ShardedStarHubConfig {
-            base_port: 19460,
-            shard_count: 0, // edge case: 0 should be clamped to 1
-            ..Default::default()
-        };
+        let config = ShardedStarHubConfig { base_port: 19460, shard_count: 0, ..Default::default() };
         let (hub, _handle, _event_rx) = ShardedStarHub::new(config);
-        assert_eq!(hub.shard_count(), 1, "shard_count=0 must clamp to 1");
+        assert_eq!(hub.shard_count(), 1);
         assert_eq!(hub.ports(), vec![19460]);
     }
 }

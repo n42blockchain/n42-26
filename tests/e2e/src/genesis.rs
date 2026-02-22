@@ -18,7 +18,6 @@ pub struct TestAccount {
     pub address: Address,
 }
 
-/// Generates deterministic test private keys using keccak256(b"n42-test-key-{i}").
 pub fn generate_test_accounts() -> Vec<TestAccount> {
     (0..NUM_TEST_ACCOUNTS)
         .map(|i| {

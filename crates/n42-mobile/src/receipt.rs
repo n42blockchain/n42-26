@@ -6,38 +6,28 @@ use crate::serde_helpers::pubkey_48;
 
 /// Verification receipt returned from a mobile device to the IDC node.
 ///
-/// After re-executing a block using the verification packet, the phone
-/// produces this receipt indicating whether the execution result matches
-/// the expected state root and receipts root.
-///
-/// Receipts use BLS12-381 signatures for aggregation compatibility.
+/// Produced after re-executing a block, indicating whether the computed
+/// state root and receipts root match the expected values.
+/// Uses BLS12-381 signatures for aggregation compatibility.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VerificationReceipt {
-    /// Hash of the verified block.
     pub block_hash: B256,
-    /// Block number.
     pub block_number: u64,
-    /// Whether the computed state root matches the expected one.
     pub state_root_match: bool,
-    /// Whether the computed receipts root matches the expected one.
     pub receipts_root_match: bool,
     /// BLS12-381 public key of the verifier (48 bytes).
     #[serde(with = "pubkey_48")]
     pub verifier_pubkey: [u8; 48],
     /// BLS12-381 signature over the receipt content.
     pub signature: BlsSignature,
-    /// Timestamp when verification completed (milliseconds since epoch).
+    /// Milliseconds since UNIX epoch when verification completed.
     pub timestamp_ms: u64,
 }
 
-/// Builds the canonical signing message from receipt fields.
+/// Builds the canonical signing message for a receipt.
 ///
-/// Format: block_hash (32B) || block_number (8B LE) ||
-///         state_root_match (1B) || receipts_root_match (1B) ||
-///         timestamp_ms (8B LE)
-///
-/// This is the single source of truth for the receipt signing format,
-/// used by both `sign_receipt()` and `VerificationReceipt::verify_signature()`.
+/// Format: `block_hash(32B) || block_number(8B LE) || state_root_match(1B)`
+///       `|| receipts_root_match(1B) || timestamp_ms(8B LE)`
 fn build_signing_message(
     block_hash: &B256,
     block_number: u64,
@@ -55,13 +45,12 @@ fn build_signing_message(
 }
 
 impl VerificationReceipt {
-    /// Returns true if the receipt indicates successful verification
-    /// (both state root and receipts root match).
+    /// Returns true if both state root and receipts root match.
     pub fn is_valid(&self) -> bool {
         self.state_root_match && self.receipts_root_match
     }
 
-    /// Constructs the signing message for this receipt.
+    /// Constructs the canonical signing message for this receipt.
     pub fn signing_message(&self) -> Vec<u8> {
         build_signing_message(
             &self.block_hash,
@@ -76,16 +65,13 @@ impl VerificationReceipt {
     pub fn verify_signature(&self) -> Result<(), ReceiptError> {
         let pubkey = BlsPublicKey::from_bytes(&self.verifier_pubkey)
             .map_err(|_| ReceiptError::InvalidPublicKey)?;
-        let msg = self.signing_message();
         pubkey
-            .verify(&msg, &self.signature)
+            .verify(&self.signing_message(), &self.signature)
             .map_err(|_| ReceiptError::InvalidSignature)
     }
 }
 
-/// Creates a signed verification receipt.
-///
-/// Called by the mobile verifier after executing the block.
+/// Creates a signed verification receipt after executing a block.
 pub fn sign_receipt(
     block_hash: B256,
     block_number: u64,
@@ -111,11 +97,11 @@ pub fn sign_receipt(
     }
 }
 
-/// Encodes a `VerificationReceipt` with wire header (versioned format).
+/// Encodes a `VerificationReceipt` with a wire header.
 ///
-/// Format: wire_header(4B) + block_hash(32B) + block_number(8B LE) +
-///         state_root_match(1B) + receipts_root_match(1B) +
-///         verifier_pubkey(48B) + signature(96B) + timestamp_ms(8B LE)
+/// Format: `wire_header(4B) + block_hash(32B) + block_number(8B LE)`
+///       `+ state_root_match(1B) + receipts_root_match(1B)`
+///       `+ verifier_pubkey(48B) + signature(96B) + timestamp_ms(8B LE)`
 pub fn encode_receipt(receipt: &VerificationReceipt) -> Vec<u8> {
     use crate::wire;
 
@@ -137,22 +123,20 @@ pub fn decode_receipt(data: &[u8]) -> Result<VerificationReceipt, crate::wire::W
 
     let (_header, payload) = wire::decode_header(data)?;
 
-    // Expected payload: 32 + 8 + 1 + 1 + 48 + 96 + 8 = 194 bytes
+    // Payload: block_hash(32) + block_number(8) + 2 flags(2) + pubkey(48) + sig(96) + ts(8) = 194
     const RECEIPT_PAYLOAD_SIZE: usize = 32 + 8 + 1 + 1 + 48 + 96 + 8;
     if payload.len() < RECEIPT_PAYLOAD_SIZE {
         return Err(WireError::UnexpectedEof(payload.len()));
     }
 
     let mut pos = 0;
+
     let block_hash = B256::from_slice(&payload[pos..pos + 32]);
     pos += 32;
-
     let block_number = u64::from_le_bytes(payload[pos..pos + 8].try_into().unwrap());
     pos += 8;
-
     let state_root_match = payload[pos] != 0;
     pos += 1;
-
     let receipts_root_match = payload[pos] != 0;
     pos += 1;
 
@@ -160,10 +144,10 @@ pub fn decode_receipt(data: &[u8]) -> Result<VerificationReceipt, crate::wire::W
     verifier_pubkey.copy_from_slice(&payload[pos..pos + 48]);
     pos += 48;
 
-    let sig_bytes: [u8; 96] = payload[pos..pos + 96].try_into()
-        .map_err(|_| WireError::UnexpectedEof(pos))?;
-    let signature = BlsSignature::from_bytes(&sig_bytes)
-        .map_err(|_| WireError::InvalidTag(0, pos))?;
+    let sig_bytes: [u8; 96] =
+        payload[pos..pos + 96].try_into().map_err(|_| WireError::UnexpectedEof(pos))?;
+    let signature =
+        BlsSignature::from_bytes(&sig_bytes).map_err(|_| WireError::InvalidTag(0, pos))?;
     pos += 96;
 
     let timestamp_ms = u64::from_le_bytes(payload[pos..pos + 8].try_into().unwrap());

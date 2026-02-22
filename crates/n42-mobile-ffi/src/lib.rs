@@ -1,40 +1,33 @@
 use alloy_primitives::B256;
-use n42_mobile::code_cache::{CacheSyncMessage, CodeCache, decode_cache_sync};
+use n42_mobile::code_cache::CodeCache;
 use n42_mobile::packet::{decode_packet, decode_stream_packet};
 use n42_mobile::receipt::sign_receipt;
 use n42_mobile::verifier::{
     update_cache_after_stream_verify, update_cache_after_verify, verify_block, verify_block_stream,
 };
-use n42_mobile::wire::MAGIC as WIRE_MAGIC;
 use n42_primitives::BlsSecretKey;
-use reth_chainspec::ChainSpec;
-use std::collections::VecDeque;
 use std::ffi::{CStr, c_char, c_int};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, Instant};
-use tracing::{debug, error, info, warn};
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
+use tracing::{error, info, warn};
 
-// ── Safety helpers ──
+mod context;
+mod transport;
 
-/// Recovers from a poisoned mutex instead of panicking.
-///
-/// If a thread panics while holding the mutex, subsequent `.lock()` calls
-/// return `Err(PoisonError)`. This helper logs a warning and recovers the
-/// inner data, preventing cascading panics across FFI boundaries.
-fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|poisoned| {
-        warn!("mutex poisoned, recovering");
-        poisoned.into_inner()
-    })
-}
+use context::{
+    DEFAULT_CODE_CACHE_CAPACITY, LastVerifyInfo, QuicConnection, VerifyStats,
+    lock_or_recover, safe_cint,
+};
+use transport::{connect_quic, is_v2_wire_format, recv_loop};
+#[cfg(test)]
+use transport::apply_cache_sync;
 
-/// Safely converts `usize` to `c_int`, returning -1 on overflow.
-///
-/// Prevents undefined behavior when packet sizes exceed `c_int::MAX` (~2GB).
-fn safe_cint(val: usize) -> c_int {
-    c_int::try_from(val).unwrap_or(-1)
-}
+pub use context::VerifierContext;
+
+// ── Android JNI bridge ──
+#[cfg(target_os = "android")]
+mod android;
 
 /// FFI error type for structured error reporting.
 ///
@@ -67,7 +60,7 @@ enum FfiError {
 }
 
 impl FfiError {
-    /// Maps to a C error code and logs the error via tracing.
+    /// Maps to a C error code and logs the error.
     fn into_code(self) -> c_int {
         let code = match &self {
             Self::NullContext | Self::NullBuffer | Self::NullHost | Self::InvalidData => -1,
@@ -84,80 +77,17 @@ impl FfiError {
     }
 }
 
-/// Detects whether `data` uses the V2 wire format (magic bytes `N2` = `0x4E 0x32`).
-///
-/// Returns `true` for V2 StreamPacket / CacheSyncMessage, `false` for legacy bincode.
-fn is_v2_wire_format(data: &[u8]) -> bool {
-    data.len() >= 2 && data[0] == WIRE_MAGIC[0] && data[1] == WIRE_MAGIC[1]
-}
-
-/// Maximum number of pending packets in the receive queue.
-const MAX_PENDING_PACKETS: usize = 64;
-
-/// Default code cache capacity (number of contract bytecodes).
-const DEFAULT_CODE_CACHE_CAPACITY: usize = 1000;
-
-/// Statistics tracked across verification sessions.
-#[derive(Debug, Default)]
-struct VerifyStats {
-    blocks_verified: u64,
-    success_count: u64,
-    failure_count: u64,
-    total_verify_time_ms: u64,
-}
-
-/// Information about the last verification (exposed to UI via JSON).
-#[derive(Debug, serde::Serialize)]
-struct LastVerifyInfo {
-    block_number: u64,
-    block_hash: String,
-    receipts_root_match: bool,
-    computed_receipts_root: String,
-    expected_receipts_root: String,
-    tx_count: usize,
-    witness_accounts: usize,
-    uncached_bytecodes: usize,
-    packet_size_bytes: usize,
-    verify_time_ms: u64,
-    signature: String,
-}
-
-/// QUIC connection to a StarHub node.
-struct QuicConnection {
-    connection: quinn::Connection,
-    pending_packets: Arc<Mutex<VecDeque<Vec<u8>>>>,
-    /// Counter for packets dropped due to full queue.
-    dropped_count: Arc<AtomicU64>,
-    /// Handle to the background receiver task.
-    _recv_task: tokio::task::JoinHandle<()>,
-}
-
-/// The main verifier context, opaque to C callers.
-pub struct VerifierContext {
-    #[allow(dead_code)]
-    chain_id: u64,
-    chain_spec: Arc<ChainSpec>,
-    signing_key: BlsSecretKey,
-    pubkey_bytes: [u8; 48],
-    code_cache: Arc<Mutex<CodeCache>>,
-    runtime: tokio::runtime::Runtime,
-    connection: Mutex<Option<QuicConnection>>,
-    stats: Mutex<VerifyStats>,
-    last_info: Mutex<Option<LastVerifyInfo>>,
-}
-
 // ── C FFI API ──
 
 /// Initializes a new verifier context.
 ///
-/// Creates a BLS12-381 keypair, CodeCache, and tokio runtime.
+/// Creates a BLS12-381 keypair, a `CodeCache`, and a tokio runtime.
 /// Returns a pointer to the context, or null on failure.
 ///
 /// # Safety
 /// The returned pointer must be freed with `n42_verifier_free`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn n42_verifier_init(chain_id: u64) -> *mut VerifierContext {
-    // Initialize tracing (once).
     static INIT: std::sync::Once = std::sync::Once::new();
     INIT.call_once(|| {
         let _ = tracing_subscriber::fmt()
@@ -175,13 +105,7 @@ pub unsafe extern "C" fn n42_verifier_init(chain_id: u64) -> *mut VerifierContex
             return std::ptr::null_mut();
         }
     };
-
-    let pubkey = signing_key.public_key();
-    let pubkey_bytes = pubkey.to_bytes();
-
-    // Use the N42 dev chain spec. The chain_id parameter is reserved for future
-    // multi-chain support; currently all mobile verifiers use the same spec.
-    let chain_spec = n42_chainspec::n42_dev_chainspec();
+    let pubkey_bytes = signing_key.public_key().to_bytes();
 
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -198,7 +122,7 @@ pub unsafe extern "C" fn n42_verifier_init(chain_id: u64) -> *mut VerifierContex
 
     let ctx = Box::new(VerifierContext {
         chain_id,
-        chain_spec,
+        chain_spec: n42_chainspec::n42_dev_chainspec(),
         signing_key,
         pubkey_bytes,
         code_cache: Arc::new(Mutex::new(CodeCache::new(DEFAULT_CODE_CACHE_CAPACITY))),
@@ -215,14 +139,13 @@ pub unsafe extern "C" fn n42_verifier_init(chain_id: u64) -> *mut VerifierContex
 /// Connects to a StarHub QUIC server.
 ///
 /// Sends the BLS public key as the handshake message.
-/// Returns 0 on success, -1 on error.
+/// Returns 0 on success, negative on error.
 ///
 /// # Safety
 /// `ctx` must be a valid pointer from `n42_verifier_init`.
 /// `host` must be a valid null-terminated C string.
-/// `cert_hash` is NULL for dev mode (accept any certificate), or points to 32 bytes
-/// containing the SHA-256 hash of the expected server certificate.
-/// `cert_hash_len` must be 0 (dev mode) or 32 (pinned). Other values return -1.
+/// `cert_hash` is NULL (dev mode, accept any cert) or 32 bytes (SHA-256 of server cert).
+/// `cert_hash_len` must be 0 or 32.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn n42_connect(
     ctx: *mut VerifierContext,
@@ -239,7 +162,6 @@ pub unsafe extern "C" fn n42_connect(
     if host.is_null() {
         return FfiError::NullHost.into_code();
     }
-
     let host_str = match unsafe { CStr::from_ptr(host) }.to_str() {
         Ok(s) => s.to_string(),
         Err(_) => return FfiError::NullHost.into_code(),
@@ -256,39 +178,32 @@ pub unsafe extern "C" fn n42_connect(
     };
 
     let pubkey_bytes = ctx.pubkey_bytes;
-
     match ctx.runtime.block_on(connect_quic(&host_str, port, &pubkey_bytes, expected_cert_hash)) {
         Ok((connection, pending_packets)) => {
-            // Spawn background task to receive packets from QUIC streams.
             let conn_clone = connection.clone();
             let packets_clone = pending_packets.clone();
             let cache_clone = ctx.code_cache.clone();
-            let dropped = Arc::new(AtomicU64::new(0));
+            let dropped = Arc::new(std::sync::atomic::AtomicU64::new(0));
             let dropped_clone = dropped.clone();
             let recv_task = ctx.runtime.spawn(async move {
                 recv_loop(conn_clone, packets_clone, cache_clone, dropped_clone).await;
             });
-
-            let quic_conn = QuicConnection {
+            *lock_or_recover(&ctx.connection) = Some(QuicConnection {
                 connection,
                 pending_packets,
                 dropped_count: dropped,
                 _recv_task: recv_task,
-            };
-            *lock_or_recover(&ctx.connection) = Some(quic_conn);
+            });
             info!(%host_str, port, "connected to StarHub");
             0
         }
-        Err(e) => {
-            FfiError::ConnectFailed(e).into_code()
-        }
+        Err(e) => FfiError::ConnectFailed(e).into_code(),
     }
 }
 
 /// Polls for the next pending verification packet (non-blocking).
 ///
-/// Copies packet data to `out_buf`. Returns the number of bytes written,
-/// 0 if no packet is available, or -1 on error.
+/// Copies packet data to `out_buf`. Returns bytes written, 0 if no packet, or -1 on error.
 ///
 /// # Safety
 /// `ctx` must be valid. `out_buf` must have at least `buf_len` bytes.
@@ -317,22 +232,20 @@ pub unsafe extern "C" fn n42_poll_packet(
     match queue.pop_front() {
         Some(data) => {
             if data.len() > buf_len {
-                // Buffer too small; put it back.
                 let need = data.len();
                 queue.push_front(data);
                 return FfiError::BufferTooSmall { need, have: buf_len }.into_code();
             }
-            unsafe {
-                std::ptr::copy_nonoverlapping(data.as_ptr(), out_buf, data.len());
-            }
+            unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), out_buf, data.len()) }
             safe_cint(data.len())
         }
         None => 0,
     }
 }
 
-/// Verifies a packet (EVM execution + BLS signature) and sends the receipt.
+/// Verifies a packet (EVM re-execution + BLS signature) and sends the receipt.
 ///
+/// Auto-detects V2 wire format (magic `N2`) vs V1 (legacy bincode).
 /// Returns 0 on success, non-zero on error.
 ///
 /// # Safety
@@ -353,162 +266,108 @@ pub unsafe extern "C" fn n42_verify_and_send(
     }
 
     let packet_bytes = unsafe { std::slice::from_raw_parts(data, len) };
-    let packet_size = len;
-
-    // Auto-detect V2 (wire header magic "N2") vs V1 (legacy bincode) format.
-    let block_number: u64;
-    let block_hash: B256;
-    let tx_count: usize;
-    let witness_count: usize;
-    let uncached_count: usize;
-    let expected_receipts_root: B256;
-
     let start = Instant::now();
-    let result;
 
-    if is_v2_wire_format(packet_bytes) {
-        // ── V2 StreamPacket path ──
-        let packet = match decode_stream_packet(packet_bytes) {
-            Ok(p) => p,
-            Err(e) => {
-                return FfiError::PacketDecode(format!("V2: {e}")).into_code();
+    // Decode the packet and run EVM verification.
+    let (block_hash, block_number, expected_receipts_root, tx_count, witness_count, uncached_count, result) =
+        if is_v2_wire_format(packet_bytes) {
+            let packet = match decode_stream_packet(packet_bytes) {
+                Ok(p) => p,
+                Err(e) => return FfiError::PacketDecode(format!("V2: {e}")).into_code(),
+            };
+            let block_hash = packet.block_hash;
+            let (block_number, expected_rr) = packet.header_info().unwrap_or((0, B256::ZERO));
+            let tx_count = packet.transactions.len();
+            let uncached_count = packet.bytecodes.len();
+
+            let verify_result = {
+                let mut cache = lock_or_recover(&ctx.code_cache);
+                verify_block_stream(&packet, &mut cache, ctx.chain_spec.clone())
+            };
+            let result = match verify_result {
+                Ok(r) => r,
+                Err(e) => {
+                    lock_or_recover(&ctx.stats).blocks_verified += 1;
+                    lock_or_recover(&ctx.stats).failure_count += 1;
+                    return FfiError::VerifyFailed(format!("V2: {e}")).into_code();
+                }
+            };
+            {
+                let mut cache = lock_or_recover(&ctx.code_cache);
+                update_cache_after_stream_verify(&packet, &mut cache);
             }
-        };
+            (block_hash, block_number, expected_rr, tx_count, 0usize, uncached_count, result)
+        } else {
+            let packet = match decode_packet(packet_bytes) {
+                Ok(p) => p,
+                Err(e) => return FfiError::PacketDecode(e.to_string()).into_code(),
+            };
+            let block_hash = packet.block_hash;
+            let block_number = packet.block_number;
+            let expected_rr = packet.receipts_root;
+            let tx_count = packet.transactions.len();
+            let witness_count = packet.witness_accounts.len();
+            let uncached_count = packet.uncached_bytecodes.len();
 
-        block_hash = packet.block_hash;
-        let (bn, er) = packet.header_info().unwrap_or((0, B256::ZERO));
-        block_number = bn;
-        expected_receipts_root = er;
-        tx_count = packet.transactions.len();
-        witness_count = 0; // V2 uses read_log, not witness accounts
-        uncached_count = packet.bytecodes.len();
-
-        let verify_result = {
-            let mut cache = lock_or_recover(&ctx.code_cache);
-            verify_block_stream(&packet, &mut cache, ctx.chain_spec.clone())
-        };
-
-        result = match verify_result {
-            Ok(r) => r,
-            Err(e) => {
-                let mut stats = lock_or_recover(&ctx.stats);
-                stats.blocks_verified += 1;
-                stats.failure_count += 1;
-                return FfiError::VerifyFailed(format!("V2: {e}")).into_code();
+            let verify_result = {
+                let mut cache = lock_or_recover(&ctx.code_cache);
+                verify_block(&packet, &mut cache, ctx.chain_spec.clone())
+            };
+            let result = match verify_result {
+                Ok(r) => r,
+                Err(e) => {
+                    lock_or_recover(&ctx.stats).blocks_verified += 1;
+                    lock_or_recover(&ctx.stats).failure_count += 1;
+                    return FfiError::VerifyFailed(e.to_string()).into_code();
+                }
+            };
+            {
+                let mut cache = lock_or_recover(&ctx.code_cache);
+                update_cache_after_verify(&packet, &mut cache);
             }
+            (block_hash, block_number, expected_rr, tx_count, witness_count, uncached_count, result)
         };
-
-        // Update code cache with newly received bytecodes.
-        {
-            let mut cache = lock_or_recover(&ctx.code_cache);
-            update_cache_after_stream_verify(&packet, &mut cache);
-        }
-    } else {
-        // ── V1 VerificationPacket path (legacy) ──
-        let packet = match decode_packet(packet_bytes) {
-            Ok(p) => p,
-            Err(e) => {
-                return FfiError::PacketDecode(e.to_string()).into_code();
-            }
-        };
-
-        block_number = packet.block_number;
-        block_hash = packet.block_hash;
-        tx_count = packet.transactions.len();
-        witness_count = packet.witness_accounts.len();
-        uncached_count = packet.uncached_bytecodes.len();
-        expected_receipts_root = packet.receipts_root;
-
-        let verify_result = {
-            let mut cache = lock_or_recover(&ctx.code_cache);
-            verify_block(&packet, &mut cache, ctx.chain_spec.clone())
-        };
-
-        result = match verify_result {
-            Ok(r) => r,
-            Err(e) => {
-                let mut stats = lock_or_recover(&ctx.stats);
-                stats.blocks_verified += 1;
-                stats.failure_count += 1;
-                return FfiError::VerifyFailed(e.to_string()).into_code();
-            }
-        };
-
-        // Update code cache with newly received bytecodes.
-        {
-            let mut cache = lock_or_recover(&ctx.code_cache);
-            update_cache_after_verify(&packet, &mut cache);
-        }
-    }
 
     let verify_time_ms = start.elapsed().as_millis() as u64;
-
-    // Sign the receipt.
     let timestamp_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
 
-    let receipt = sign_receipt(
-        block_hash,
-        block_number,
-        // state_root_match: always true because mobile verifiers only re-execute
-        // transactions and verify receipts_root. Full state_root verification would
-        // require the complete state trie, which is infeasible on mobile devices.
-        true,
-        result.receipts_root_match,
-        timestamp_ms,
-        &ctx.signing_key,
-    );
+    // Mobile verifiers only verify receipts_root; state_root requires the full trie.
+    let receipt = sign_receipt(block_hash, block_number, true, result.receipts_root_match, timestamp_ms, &ctx.signing_key);
 
-    // Update stats.
     {
         let mut stats = lock_or_recover(&ctx.stats);
         stats.blocks_verified += 1;
-        if result.receipts_root_match {
-            stats.success_count += 1;
-        } else {
-            stats.failure_count += 1;
-        }
+        if result.receipts_root_match { stats.success_count += 1; } else { stats.failure_count += 1; }
         stats.total_verify_time_ms += verify_time_ms;
     }
 
-    // Store last verify info.
     let sig_bytes = receipt.signature.to_bytes();
-    {
-        let info = LastVerifyInfo {
-            block_number,
-            block_hash: format!("{:#x}", block_hash),
-            receipts_root_match: result.receipts_root_match,
-            computed_receipts_root: format!("{:#x}", result.computed_receipts_root),
-            expected_receipts_root: format!("{:#x}", expected_receipts_root),
-            tx_count,
-            witness_accounts: witness_count,
-            uncached_bytecodes: uncached_count,
-            packet_size_bytes: packet_size,
-            verify_time_ms,
-            signature: hex::encode(sig_bytes),
-        };
-        *lock_or_recover(&ctx.last_info) = Some(info);
-    }
-
-    info!(
+    *lock_or_recover(&ctx.last_info) = Some(LastVerifyInfo {
         block_number,
-        match_ = result.receipts_root_match,
+        block_hash: format!("{:#x}", block_hash),
+        receipts_root_match: result.receipts_root_match,
+        computed_receipts_root: format!("{:#x}", result.computed_receipts_root),
+        expected_receipts_root: format!("{:#x}", expected_receipts_root),
+        tx_count,
+        witness_accounts: witness_count,
+        uncached_bytecodes: uncached_count,
+        packet_size_bytes: len,
         verify_time_ms,
-        "block verified"
-    );
+        signature: hex::encode(sig_bytes),
+    });
+
+    info!(block_number, match_ = result.receipts_root_match, verify_time_ms, "block verified");
 
     // Send receipt via QUIC.
     let conn_guard = lock_or_recover(&ctx.connection);
     if let Some(conn) = conn_guard.as_ref() {
         let receipt_bytes = match bincode::serialize(&receipt) {
             Ok(b) => b,
-            Err(e) => {
-                return FfiError::SerializeFailed(e.to_string()).into_code();
-            }
+            Err(e) => return FfiError::SerializeFailed(e.to_string()).into_code(),
         };
-
         let connection = conn.connection.clone();
         ctx.runtime.spawn(async move {
             match connection.open_uni().await {
@@ -518,9 +377,7 @@ pub unsafe extern "C" fn n42_verify_and_send(
                     }
                     let _ = stream.finish();
                 }
-                Err(e) => {
-                    warn!("failed to open uni stream for receipt: {}", e);
-                }
+                Err(e) => warn!("failed to open uni stream for receipt: {}", e),
             }
         });
     }
@@ -528,9 +385,9 @@ pub unsafe extern "C" fn n42_verify_and_send(
     0
 }
 
-/// Gets information about the last verification as JSON.
+/// Gets information about the last verification as a null-terminated JSON string.
 ///
-/// Returns the number of bytes written, or -1 on error.
+/// Returns bytes written (excluding null terminator), 0 if no data, or -1 on error.
 ///
 /// # Safety
 /// `ctx` must be valid. `out_buf` must have at least `buf_len` bytes.
@@ -566,22 +423,19 @@ pub unsafe extern "C" fn n42_last_verify_info(
 
     unsafe {
         std::ptr::copy_nonoverlapping(json.as_ptr(), out_buf as *mut u8, json.len());
-        *out_buf.add(json.len()) = 0; // null-terminate
+        *out_buf.add(json.len()) = 0;
     }
     safe_cint(json.len())
 }
 
-/// Gets the BLS12-381 public key (48 bytes).
+/// Gets the BLS12-381 public key (48 bytes) into `out_buf`.
 ///
 /// Returns 0 on success, -1 on error.
 ///
 /// # Safety
 /// `ctx` must be valid. `out_buf` must have at least 48 bytes.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn n42_get_pubkey(
-    ctx: *mut VerifierContext,
-    out_buf: *mut u8,
-) -> c_int {
+pub unsafe extern "C" fn n42_get_pubkey(ctx: *mut VerifierContext, out_buf: *mut u8) -> c_int {
     let ctx = match unsafe { ctx.as_ref() } {
         Some(c) => c,
         None => return FfiError::NullContext.into_code(),
@@ -591,15 +445,13 @@ pub unsafe extern "C" fn n42_get_pubkey(
         return FfiError::NullBuffer.into_code();
     }
 
-    unsafe {
-        std::ptr::copy_nonoverlapping(ctx.pubkey_bytes.as_ptr(), out_buf, 48);
-    }
+    unsafe { std::ptr::copy_nonoverlapping(ctx.pubkey_bytes.as_ptr(), out_buf, 48) }
     0
 }
 
-/// Gets verifier statistics as JSON.
+/// Gets verifier statistics as a null-terminated JSON string.
 ///
-/// Returns the number of bytes written, or -1 on error.
+/// Returns bytes written (excluding null terminator), or -1 on error.
 ///
 /// # Safety
 /// `ctx` must be valid. `out_buf` must have at least `buf_len` bytes.
@@ -624,29 +476,26 @@ pub unsafe extern "C" fn n42_get_stats(
     } else {
         0
     };
-
+    let success_rate = if stats.blocks_verified > 0 {
+        (stats.success_count as f64 / stats.blocks_verified as f64 * 100.0) as u64
+    } else {
+        0
+    };
     let dropped = {
         let conn_guard = lock_or_recover(&ctx.connection);
-        conn_guard
-            .as_ref()
-            .map(|c| c.dropped_count.load(Ordering::Relaxed))
-            .unwrap_or(0)
+        conn_guard.as_ref().map(|c| c.dropped_count.load(Ordering::Relaxed)).unwrap_or(0)
     };
 
-    let json = serde_json::json!({
+    let json_str = serde_json::json!({
         "blocks_verified": stats.blocks_verified,
         "success_count": stats.success_count,
         "failure_count": stats.failure_count,
         "avg_time_ms": avg_time,
-        "success_rate": if stats.blocks_verified > 0 {
-            (stats.success_count as f64 / stats.blocks_verified as f64 * 100.0) as u64
-        } else {
-            0
-        },
+        "success_rate": success_rate,
         "dropped_packets": dropped,
-    });
+    })
+    .to_string();
 
-    let json_str = json.to_string();
     if json_str.len() + 1 > buf_len {
         return FfiError::BufferTooSmall { need: json_str.len() + 1, have: buf_len }.into_code();
     }
@@ -660,7 +509,7 @@ pub unsafe extern "C" fn n42_get_stats(
 
 /// Disconnects from the StarHub server.
 ///
-/// Returns 0 on success, -1 if not connected.
+/// Returns 0 on success, -2 if not connected.
 ///
 /// # Safety
 /// `ctx` must be valid.
@@ -692,9 +541,7 @@ pub unsafe extern "C" fn n42_verifier_free(ctx: *mut VerifierContext) {
         return;
     }
     let ctx = unsafe { Box::from_raw(ctx) };
-    // Close QUIC connection and abort the background recv_task to prevent
-    // use-after-free: the task holds an Arc<Mutex<VecDeque>> that would
-    // otherwise outlive the VerifierContext.
+    // Close QUIC and abort the recv task before dropping to prevent use-after-free.
     let mut guard = lock_or_recover(&ctx.connection);
     if let Some(conn) = guard.take() {
         conn.connection.close(0u32.into(), b"shutdown");
@@ -702,313 +549,14 @@ pub unsafe extern "C" fn n42_verifier_free(ctx: *mut VerifierContext) {
     }
     drop(guard);
     info!("verifier context freed");
-    // ctx dropped here, runtime shuts down
-}
-
-// ── Internal helpers ──
-
-/// Establishes a QUIC connection to the StarHub and performs the BLS pubkey handshake.
-async fn connect_quic(
-    host: &str,
-    port: u16,
-    pubkey: &[u8; 48],
-    expected_cert_hash: Option<[u8; 32]>,
-) -> Result<(quinn::Connection, Arc<Mutex<VecDeque<Vec<u8>>>>), Box<dyn std::error::Error + Send + Sync>>
-{
-    // Configure QUIC client with certificate pinning (or skip-verify for dev mode).
-    let crypto = rustls::ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(PinnedCertVerification {
-            expected_hash: expected_cert_hash,
-        }))
-        .with_no_client_auth();
-
-    let mut transport = quinn::TransportConfig::default();
-    transport.max_idle_timeout(Some(
-        quinn::IdleTimeout::try_from(std::time::Duration::from_secs(300)).unwrap(),
-    ));
-    transport.keep_alive_interval(Some(std::time::Duration::from_secs(15)));
-
-    let mut client_config = quinn::ClientConfig::new(Arc::new(
-        quinn::crypto::rustls::QuicClientConfig::try_from(crypto)?,
-    ));
-    client_config.transport_config(Arc::new(transport));
-
-    let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse()?)?;
-    endpoint.set_default_client_config(client_config);
-
-    let addr = format!("{}:{}", host, port);
-    let connection = tokio::time::timeout(
-        Duration::from_secs(10),
-        endpoint.connect(addr.parse()?, "n42-starhub")?,
-    )
-    .await
-    .map_err(|_| -> Box<dyn std::error::Error + Send + Sync> {
-        "QUIC connect timed out after 10s".into()
-    })??;
-
-    info!("QUIC connection established, sending BLS pubkey handshake");
-
-    // Handshake: send 48-byte BLS public key via uni-stream.
-    let mut handshake_stream = connection.open_uni().await?;
-    handshake_stream.write_all(pubkey).await?;
-    handshake_stream.finish()?;
-
-    let pending = Arc::new(Mutex::new(VecDeque::with_capacity(MAX_PENDING_PACKETS)));
-
-    Ok((connection, pending))
-}
-
-/// Applies a `CacheSyncMessage` to the code cache.
-///
-/// Inserts new bytecodes and removes evict hints. Returns `(added, evicted)` counts.
-/// Evict hints for keys not in the cache are silently ignored.
-fn apply_cache_sync(msg: CacheSyncMessage, cache: &Mutex<CodeCache>) -> (usize, usize) {
-    let mut guard = lock_or_recover(cache);
-    let added = msg.codes.len();
-    for (hash, code) in msg.codes {
-        guard.insert(hash, code);
-    }
-    let evicted = msg.evict_hints.len();
-    for hash in &msg.evict_hints {
-        guard.remove(hash);
-    }
-    (added, evicted)
-}
-
-/// Background task that receives packets from the StarHub via QUIC uni-streams.
-///
-/// StarHub sends data with a 1-byte type prefix:
-/// - 0x01: VerificationPacket (uncompressed, legacy)
-/// - 0x02: CacheSyncMessage (uncompressed)
-/// - 0x03: VerificationPacket / StreamPacket (zstd compressed)
-/// - 0x04: CacheSyncMessage (zstd compressed)
-///
-/// After decompression, V1 (bincode) vs V2 (wire header `0x4E32`) is auto-detected.
-async fn recv_loop(
-    connection: quinn::Connection,
-    pending_packets: Arc<Mutex<VecDeque<Vec<u8>>>>,
-    code_cache: Arc<Mutex<CodeCache>>,
-    dropped_count: Arc<AtomicU64>,
-) {
-    loop {
-        match connection.accept_uni().await {
-            Ok(mut stream) => {
-                // Read all data from the stream (max 16MB).
-                match stream.read_to_end(16 * 1024 * 1024).await {
-                    Ok(data) => {
-                        if data.is_empty() {
-                            continue;
-                        }
-
-                        let msg_type = data[0];
-                        let payload = &data[1..];
-
-                        match msg_type {
-                            0x01 => {
-                                // VerificationPacket (uncompressed, legacy)
-                                debug!(size = payload.len(), "received verification packet");
-                                let mut queue = lock_or_recover(&pending_packets);
-                                if queue.len() >= MAX_PENDING_PACKETS {
-                                    dropped_count.fetch_add(1, Ordering::Relaxed);
-                                    warn!(
-                                        queue_len = queue.len(),
-                                        dropped = dropped_count.load(Ordering::Relaxed),
-                                        "packet queue full, dropping oldest packet"
-                                    );
-                                    queue.pop_front();
-                                }
-                                queue.push_back(payload.to_vec());
-                            }
-                            0x03 => {
-                                // VerificationPacket (zstd compressed)
-                                match zstd::bulk::decompress(payload, 16 * 1024 * 1024) {
-                                    Ok(decompressed) => {
-                                        debug!(
-                                            compressed = payload.len(),
-                                            decompressed = decompressed.len(),
-                                            "received verification packet (zstd)"
-                                        );
-                                        let mut queue = lock_or_recover(&pending_packets);
-                                        if queue.len() >= MAX_PENDING_PACKETS {
-                                            dropped_count.fetch_add(1, Ordering::Relaxed);
-                                            warn!(
-                                                queue_len = queue.len(),
-                                                dropped = dropped_count.load(Ordering::Relaxed),
-                                                "packet queue full, dropping oldest packet"
-                                            );
-                                            queue.pop_front();
-                                        }
-                                        queue.push_back(decompressed);
-                                    }
-                                    Err(e) => {
-                                        warn!("zstd decompress failed: {}", e);
-                                    }
-                                }
-                            }
-                            0x02 => {
-                                // CacheSyncMessage (uncompressed)
-                                const MAX_CACHE_SYNC_SIZE: usize = 16 * 1024 * 1024; // 16MB
-                                if payload.len() > MAX_CACHE_SYNC_SIZE {
-                                    warn!("CacheSyncMessage too large ({} bytes), dropping", payload.len());
-                                    continue;
-                                }
-                                // Auto-detect V2 wire format vs V1 bincode
-                                let msg = if is_v2_wire_format(payload) {
-                                    decode_cache_sync(payload)
-                                        .map_err(|e| format!("V2: {e}"))
-                                } else {
-                                    bincode::deserialize::<CacheSyncMessage>(payload)
-                                        .map_err(|e| format!("V1: {e}"))
-                                };
-                                match msg {
-                                    Ok(msg) => {
-                                        let (added, evicted) =
-                                            apply_cache_sync(msg, &code_cache);
-                                        let cache_size = lock_or_recover(&code_cache).len();
-                                        info!(
-                                            added,
-                                            evicted,
-                                            cache_size,
-                                            "applied cache sync message"
-                                        );
-                                    }
-                                    Err(e) => {
-                                        warn!("failed to decode CacheSyncMessage: {}", e);
-                                    }
-                                }
-                            }
-                            0x04 => {
-                                // CacheSyncMessage (zstd compressed)
-                                match zstd::bulk::decompress(payload, 16 * 1024 * 1024) {
-                                    Ok(decompressed) => {
-                                        // Auto-detect V2 wire format vs V1 bincode
-                                        let msg = if is_v2_wire_format(&decompressed) {
-                                            decode_cache_sync(&decompressed)
-                                                .map_err(|e| format!("V2: {e}"))
-                                        } else {
-                                            bincode::deserialize::<CacheSyncMessage>(&decompressed)
-                                                .map_err(|e| format!("V1: {e}"))
-                                        };
-                                        match msg {
-                                            Ok(msg) => {
-                                                let (added, evicted) =
-                                                    apply_cache_sync(msg, &code_cache);
-                                                let cache_size = lock_or_recover(&code_cache).len();
-                                                info!(
-                                                    added,
-                                                    evicted,
-                                                    cache_size,
-                                                    "applied compressed cache sync message"
-                                                );
-                                            }
-                                            Err(e) => {
-                                                warn!("failed to decode CacheSyncMessage: {}", e);
-                                            }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        warn!("zstd decompress CacheSync failed: {}", e);
-                                    }
-                                }
-                            }
-                            _ => {
-                                warn!(msg_type, "unknown message type from StarHub");
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        debug!("stream read error: {}", e);
-                    }
-                }
-            }
-            Err(e) => {
-                warn!("connection closed: {}", e);
-                break;
-            }
-        }
-    }
-}
-
-// ── Android JNI bridge ──
-// Maps Kotlin N42Verifier native methods to the C FFI functions.
-#[cfg(target_os = "android")]
-mod android;
-
-/// Certificate verifier that validates the server certificate against a pinned
-/// SHA-256 hash. When `expected_hash` is `None` (dev mode), all certificates
-/// are accepted (equivalent to the previous `SkipServerVerification`).
-///
-/// In production, the expected hash should be the SHA-256 of the StarHub's
-/// DER-encoded certificate, obtained via an out-of-band channel or initial
-/// trust-on-first-use (TOFU).
-#[derive(Debug)]
-struct PinnedCertVerification {
-    expected_hash: Option<[u8; 32]>,
-}
-
-impl rustls::client::danger::ServerCertVerifier for PinnedCertVerification {
-    fn verify_server_cert(
-        &self,
-        end_entity: &rustls::pki_types::CertificateDer<'_>,
-        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        _server_name: &rustls::pki_types::ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        if let Some(expected) = &self.expected_hash {
-            use sha2::{Sha256, Digest};
-            let mut hasher = Sha256::new();
-            hasher.update(end_entity.as_ref());
-            let actual: [u8; 32] = hasher.finalize().into();
-            if actual != *expected {
-                return Err(rustls::Error::General(format!(
-                    "certificate hash mismatch: expected {}, got {}",
-                    hex::encode(expected),
-                    hex::encode(actual),
-                )));
-            }
-        }
-        // Dev mode (no expected hash) or hash matches: accept.
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        vec![
-            rustls::SignatureScheme::RSA_PKCS1_SHA256,
-            rustls::SignatureScheme::RSA_PKCS1_SHA384,
-            rustls::SignatureScheme::RSA_PKCS1_SHA512,
-            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
-            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
-            rustls::SignatureScheme::ED25519,
-            rustls::SignatureScheme::RSA_PSS_SHA256,
-            rustls::SignatureScheme::RSA_PSS_SHA384,
-            rustls::SignatureScheme::RSA_PSS_SHA512,
-        ]
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use n42_mobile::code_cache::CacheSyncMessage;
+    use std::collections::VecDeque;
+    use std::sync::atomic::AtomicU64;
 
     #[test]
     fn test_verify_stats_default() {
@@ -1041,41 +589,35 @@ mod tests {
         assert!(json.contains("\"tx_count\":10"));
         assert!(json.contains("\"verify_time_ms\":150"));
 
-        // Verify round-trip: deserialize back.
-        let parsed: serde_json::Value =
-            serde_json::from_str(&json).expect("should parse as valid JSON");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
         assert_eq!(parsed["block_number"], 42);
         assert_eq!(parsed["witness_accounts"], 5);
     }
 
     #[test]
     fn test_stats_json_format() {
-        // Simulate the JSON generation from n42_get_stats.
         let stats = VerifyStats {
             blocks_verified: 100,
             success_count: 95,
             failure_count: 5,
             total_verify_time_ms: 15000,
         };
-
         let avg_time = stats.total_verify_time_ms / stats.blocks_verified;
         let success_rate =
             (stats.success_count as f64 / stats.blocks_verified as f64 * 100.0) as u64;
-
         let json = serde_json::json!({
             "blocks_verified": stats.blocks_verified,
             "success_count": stats.success_count,
             "failure_count": stats.failure_count,
             "avg_time_ms": avg_time,
             "success_rate": success_rate,
-        });
-
-        let json_str = json.to_string();
-        assert!(json_str.contains("\"blocks_verified\":100"));
-        assert!(json_str.contains("\"success_count\":95"));
-        assert!(json_str.contains("\"failure_count\":5"));
-        assert!(json_str.contains("\"avg_time_ms\":150"));
-        assert!(json_str.contains("\"success_rate\":95"));
+        })
+        .to_string();
+        assert!(json.contains("\"blocks_verified\":100"));
+        assert!(json.contains("\"success_count\":95"));
+        assert!(json.contains("\"failure_count\":5"));
+        assert!(json.contains("\"avg_time_ms\":150"));
+        assert!(json.contains("\"success_rate\":95"));
     }
 
     #[test]
@@ -1090,7 +632,6 @@ mod tests {
         use alloy_primitives::{Bytes, B256};
 
         let cache = Mutex::new(CodeCache::new(100));
-
         let h1 = B256::with_last_byte(0x01);
         let h2 = B256::with_last_byte(0x02);
         let h3 = B256::with_last_byte(0x03);
@@ -1100,48 +641,39 @@ mod tests {
                 (h1, Bytes::from(vec![0x60, 0x00])),
                 (h2, Bytes::from(vec![0x60, 0x01])),
             ],
-            evict_hints: vec![h3], // h3 not in cache — should not panic
+            evict_hints: vec![h3],
         };
-
         let (added, evicted) = apply_cache_sync(msg, &cache);
         assert_eq!(added, 2);
         assert_eq!(evicted, 1);
 
         let mut guard = lock_or_recover(&cache);
-        assert!(guard.get(&h1).is_some(), "h1 should be in cache");
-        assert!(guard.get(&h2).is_some(), "h2 should be in cache");
+        assert!(guard.get(&h1).is_some());
+        assert!(guard.get(&h2).is_some());
         assert_eq!(guard.len(), 2);
-
-        // Now evict h1 via a second sync message.
         drop(guard);
-        let msg2 = CacheSyncMessage {
-            codes: vec![],
-            evict_hints: vec![h1],
-        };
+
+        let msg2 = CacheSyncMessage { codes: vec![], evict_hints: vec![h1] };
         let (added2, evicted2) = apply_cache_sync(msg2, &cache);
         assert_eq!(added2, 0);
         assert_eq!(evicted2, 1);
 
         let mut guard = lock_or_recover(&cache);
-        assert!(guard.get(&h1).is_none(), "h1 should have been evicted");
+        assert!(guard.get(&h1).is_none());
         assert_eq!(guard.len(), 1);
     }
 
     #[test]
     fn test_safe_cint_overflow() {
-        // Values larger than c_int::MAX should return -1.
         assert_eq!(safe_cint(c_int::MAX as usize + 1), -1);
         assert_eq!(safe_cint(usize::MAX), -1);
     }
 
-    // ── 5A: FFI lifecycle tests ──
-
     #[test]
     fn test_init_and_free() {
         let ctx = unsafe { n42_verifier_init(4242) };
-        assert!(!ctx.is_null(), "n42_verifier_init should return non-null");
+        assert!(!ctx.is_null());
         unsafe { n42_verifier_free(ctx) };
-        // Should not crash.
     }
 
     #[test]
@@ -1150,8 +682,8 @@ mod tests {
         assert!(!ctx.is_null());
         let mut pubkey = [0u8; 48];
         let result = unsafe { n42_get_pubkey(ctx, pubkey.as_mut_ptr()) };
-        assert_eq!(result, 0, "n42_get_pubkey should succeed");
-        assert_ne!(pubkey, [0u8; 48], "pubkey should be non-zero");
+        assert_eq!(result, 0);
+        assert_ne!(pubkey, [0u8; 48]);
         unsafe { n42_verifier_free(ctx) };
     }
 
@@ -1160,10 +692,8 @@ mod tests {
         let ctx = unsafe { n42_verifier_init(4242) };
         assert!(!ctx.is_null());
         let mut buf = vec![0u8; 4096];
-        let len = unsafe {
-            n42_get_stats(ctx, buf.as_mut_ptr() as *mut c_char, buf.len())
-        };
-        assert!(len > 0, "n42_get_stats should return valid JSON");
+        let len = unsafe { n42_get_stats(ctx, buf.as_mut_ptr() as *mut c_char, buf.len()) };
+        assert!(len > 0);
         let json_str = std::str::from_utf8(&buf[..len as usize]).expect("valid UTF-8");
         let parsed: serde_json::Value = serde_json::from_str(json_str).expect("valid JSON");
         assert!(parsed.get("blocks_verified").is_some());
@@ -1175,30 +705,31 @@ mod tests {
         let ctx = unsafe { n42_verifier_init(4242) };
         assert!(!ctx.is_null());
         let result = unsafe { n42_disconnect(ctx) };
-        assert_eq!(result, -2, "disconnect when not connected should return -2 (NotConnected)");
+        assert_eq!(result, -2);
         unsafe { n42_verifier_free(ctx) };
     }
-
-    // ── 5B: Null pointer guard tests ──
 
     #[test]
     fn test_connect_null_ctx() {
         let host = std::ffi::CString::new("127.0.0.1").unwrap();
-        let result = unsafe { n42_connect(std::ptr::null_mut(), host.as_ptr(), 9443, std::ptr::null(), 0) };
+        let result =
+            unsafe { n42_connect(std::ptr::null_mut(), host.as_ptr(), 9443, std::ptr::null(), 0) };
         assert_eq!(result, -1);
     }
 
     #[test]
     fn test_poll_null_ctx() {
         let mut buf = [0u8; 1024];
-        let result = unsafe { n42_poll_packet(std::ptr::null_mut(), buf.as_mut_ptr(), buf.len()) };
+        let result =
+            unsafe { n42_poll_packet(std::ptr::null_mut(), buf.as_mut_ptr(), buf.len()) };
         assert_eq!(result, -1);
     }
 
     #[test]
     fn test_verify_null_ctx() {
         let data = [0u8; 64];
-        let result = unsafe { n42_verify_and_send(std::ptr::null_mut(), data.as_ptr(), data.len()) };
+        let result =
+            unsafe { n42_verify_and_send(std::ptr::null_mut(), data.as_ptr(), data.len()) };
         assert_eq!(result, -1);
     }
 
@@ -1212,57 +743,59 @@ mod tests {
     #[test]
     fn test_get_stats_null_ctx() {
         let mut buf = [0u8; 1024];
-        let result = unsafe { n42_get_stats(std::ptr::null_mut(), buf.as_mut_ptr() as *mut c_char, buf.len()) };
+        let result = unsafe {
+            n42_get_stats(std::ptr::null_mut(), buf.as_mut_ptr() as *mut c_char, buf.len())
+        };
         assert_eq!(result, -1);
     }
 
     #[test]
     fn test_last_verify_info_null_ctx() {
         let mut buf = [0u8; 1024];
-        let result = unsafe { n42_last_verify_info(std::ptr::null_mut(), buf.as_mut_ptr() as *mut c_char, buf.len()) };
+        let result = unsafe {
+            n42_last_verify_info(
+                std::ptr::null_mut(),
+                buf.as_mut_ptr() as *mut c_char,
+                buf.len(),
+            )
+        };
         assert_eq!(result, -1);
     }
 
     #[test]
     fn test_free_null_ctx() {
-        // Should not crash.
         unsafe { n42_verifier_free(std::ptr::null_mut()) };
     }
-
-    // ── 5C: TLS pinning tests ──
 
     #[test]
     fn test_connect_invalid_cert_hash_len() {
         let ctx = unsafe { n42_verifier_init(4242) };
         assert!(!ctx.is_null());
         let host = std::ffi::CString::new("127.0.0.1").unwrap();
-        let fake_hash = [0u8; 16]; // invalid: must be 0 or 32
-        let result = unsafe { n42_connect(ctx, host.as_ptr(), 9443, fake_hash.as_ptr(), 16) };
-        assert_eq!(result, -4, "cert_hash_len != 0 and != 32 should return -4 (InvalidCertHashLen)");
+        let fake_hash = [0u8; 16];
+        let result =
+            unsafe { n42_connect(ctx, host.as_ptr(), 9443, fake_hash.as_ptr(), 16) };
+        assert_eq!(result, -4);
         unsafe { n42_verifier_free(ctx) };
     }
 
     #[test]
     fn test_connect_null_cert_hash_dev_mode() {
-        // Verify that null cert_hash with len=0 doesn't crash (dev mode path).
-        // This will still fail to connect (no server) but should not panic.
         let ctx = unsafe { n42_verifier_init(4242) };
         assert!(!ctx.is_null());
         let host = std::ffi::CString::new("127.0.0.1").unwrap();
         let result = unsafe { n42_connect(ctx, host.as_ptr(), 19999, std::ptr::null(), 0) };
-        // Connection will fail (no server), but the cert_hash dev mode path should not crash.
-        assert_eq!(result, -5, "connect to non-existent server returns -5 (ConnectFailed)");
+        assert_eq!(result, -5);
         unsafe { n42_verifier_free(ctx) };
     }
-
-    // ── 6A: Input validation tests (new error codes) ──
 
     #[test]
     fn test_connect_null_host() {
         let ctx = unsafe { n42_verifier_init(4242) };
         assert!(!ctx.is_null());
-        let result = unsafe { n42_connect(ctx, std::ptr::null(), 9443, std::ptr::null(), 0) };
-        assert_eq!(result, -1, "null host should return -1 (NullHost)");
+        let result =
+            unsafe { n42_connect(ctx, std::ptr::null(), 9443, std::ptr::null(), 0) };
+        assert_eq!(result, -1);
         unsafe { n42_verifier_free(ctx) };
     }
 
@@ -1271,7 +804,7 @@ mod tests {
         let ctx = unsafe { n42_verifier_init(4242) };
         assert!(!ctx.is_null());
         let result = unsafe { n42_poll_packet(ctx, std::ptr::null_mut(), 1024) };
-        assert_eq!(result, -1, "null out_buf should return -1 (NullBuffer)");
+        assert_eq!(result, -1);
         unsafe { n42_verifier_free(ctx) };
     }
 
@@ -1280,7 +813,7 @@ mod tests {
         let ctx = unsafe { n42_verifier_init(4242) };
         assert!(!ctx.is_null());
         let result = unsafe { n42_verify_and_send(ctx, std::ptr::null(), 10) };
-        assert_eq!(result, -1, "null data should return -1 (InvalidData)");
+        assert_eq!(result, -1);
         unsafe { n42_verifier_free(ctx) };
     }
 
@@ -1290,7 +823,7 @@ mod tests {
         assert!(!ctx.is_null());
         let data = [0u8; 1];
         let result = unsafe { n42_verify_and_send(ctx, data.as_ptr(), 0) };
-        assert_eq!(result, -1, "zero length should return -1 (InvalidData)");
+        assert_eq!(result, -1);
         unsafe { n42_verifier_free(ctx) };
     }
 
@@ -1299,7 +832,7 @@ mod tests {
         let ctx = unsafe { n42_verifier_init(4242) };
         assert!(!ctx.is_null());
         let result = unsafe { n42_get_pubkey(ctx, std::ptr::null_mut()) };
-        assert_eq!(result, -1, "null out_buf should return -1 (NullBuffer)");
+        assert_eq!(result, -1);
         unsafe { n42_verifier_free(ctx) };
     }
 
@@ -1307,12 +840,11 @@ mod tests {
     fn test_last_verify_info_null_outbuf() {
         let ctx = unsafe { n42_verifier_init(4242) };
         assert!(!ctx.is_null());
-        let result = unsafe { n42_last_verify_info(ctx, std::ptr::null_mut(), 1024) };
-        assert_eq!(result, -1, "null out_buf should return -1 (NullBuffer)");
+        let result =
+            unsafe { n42_last_verify_info(ctx, std::ptr::null_mut(), 1024) };
+        assert_eq!(result, -1);
         unsafe { n42_verifier_free(ctx) };
     }
-
-    // ── 6B: Functional path tests ──
 
     #[test]
     fn test_poll_packet_not_connected() {
@@ -1320,7 +852,7 @@ mod tests {
         assert!(!ctx.is_null());
         let mut buf = [0u8; 1024];
         let result = unsafe { n42_poll_packet(ctx, buf.as_mut_ptr(), buf.len()) };
-        assert_eq!(result, -2, "poll when not connected should return -2 (NotConnected)");
+        assert_eq!(result, -2);
         unsafe { n42_verifier_free(ctx) };
     }
 
@@ -1329,8 +861,9 @@ mod tests {
         let ctx = unsafe { n42_verifier_init(4242) };
         assert!(!ctx.is_null());
         let mut buf = [0u8; 4096];
-        let result = unsafe { n42_last_verify_info(ctx, buf.as_mut_ptr() as *mut c_char, buf.len()) };
-        assert_eq!(result, 0, "no verification data should return 0");
+        let result =
+            unsafe { n42_last_verify_info(ctx, buf.as_mut_ptr() as *mut c_char, buf.len()) };
+        assert_eq!(result, 0);
         unsafe { n42_verifier_free(ctx) };
     }
 
@@ -1339,8 +872,9 @@ mod tests {
         let ctx = unsafe { n42_verifier_init(4242) };
         assert!(!ctx.is_null());
         let mut buf = [0u8; 2];
-        let result = unsafe { n42_get_stats(ctx, buf.as_mut_ptr() as *mut c_char, buf.len()) };
-        assert_eq!(result, -3, "buffer too small should return -3 (BufferTooSmall)");
+        let result =
+            unsafe { n42_get_stats(ctx, buf.as_mut_ptr() as *mut c_char, buf.len()) };
+        assert_eq!(result, -3);
         unsafe { n42_verifier_free(ctx) };
     }
 
@@ -1350,11 +884,9 @@ mod tests {
         assert!(!ctx.is_null());
         let garbage = [0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04];
         let result = unsafe { n42_verify_and_send(ctx, garbage.as_ptr(), garbage.len()) };
-        assert_eq!(result, 1, "garbage data should return 1 (PacketDecode)");
+        assert_eq!(result, 1);
         unsafe { n42_verifier_free(ctx) };
     }
-
-    // ── 6C: Buffer boundary test ──
 
     #[test]
     fn test_last_verify_info_buffer_too_small() {
@@ -1375,21 +907,19 @@ mod tests {
             signature: "00".into(),
         });
         let mut buf = [0u8; 2];
-        let result = unsafe { n42_last_verify_info(ctx, buf.as_mut_ptr() as *mut c_char, buf.len()) };
-        assert_eq!(result, -3, "buffer too small should return -3 (BufferTooSmall)");
+        let result =
+            unsafe { n42_last_verify_info(ctx, buf.as_mut_ptr() as *mut c_char, buf.len()) };
+        assert_eq!(result, -3);
         unsafe { n42_verifier_free(ctx) };
     }
-
-    // ── 7: PinnedCertVerification unit tests ──
 
     #[test]
     fn test_pinned_cert_dev_mode_accepts_any() {
         use rustls::client::danger::ServerCertVerifier;
         use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+        use transport::PinnedCertVerification;
 
-        let cert_bytes = b"arbitrary DER data for dev mode test";
-        let cert = CertificateDer::from(cert_bytes.to_vec());
-
+        let cert = CertificateDer::from(b"arbitrary DER data for dev mode test".to_vec());
         let verifier = PinnedCertVerification { expected_hash: None };
         let result = verifier.verify_server_cert(
             &cert,
@@ -1398,19 +928,19 @@ mod tests {
             &[],
             UnixTime::now(),
         );
-        assert!(result.is_ok(), "dev mode (no hash) should accept any certificate");
+        assert!(result.is_ok());
     }
 
     #[test]
     fn test_pinned_cert_hash_match() {
         use rustls::client::danger::ServerCertVerifier;
         use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-        use sha2::{Sha256, Digest};
+        use sha2::{Digest, Sha256};
+        use transport::PinnedCertVerification;
 
         let cert_bytes = b"test certificate DER data";
         let cert = CertificateDer::from(cert_bytes.to_vec());
         let expected: [u8; 32] = Sha256::digest(cert_bytes).into();
-
         let verifier = PinnedCertVerification { expected_hash: Some(expected) };
         let result = verifier.verify_server_cert(
             &cert,
@@ -1419,19 +949,17 @@ mod tests {
             &[],
             UnixTime::now(),
         );
-        assert!(result.is_ok(), "matching hash should be accepted");
+        assert!(result.is_ok());
     }
 
     #[test]
     fn test_pinned_cert_hash_mismatch() {
         use rustls::client::danger::ServerCertVerifier;
         use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+        use transport::PinnedCertVerification;
 
-        let cert_bytes = b"test certificate DER data";
-        let cert = CertificateDer::from(cert_bytes.to_vec());
-        let wrong_hash = [0xAA; 32];
-
-        let verifier = PinnedCertVerification { expected_hash: Some(wrong_hash) };
+        let cert = CertificateDer::from(b"test certificate DER data".to_vec());
+        let verifier = PinnedCertVerification { expected_hash: Some([0xAA; 32]) };
         let result = verifier.verify_server_cert(
             &cert,
             &[],
@@ -1439,27 +967,23 @@ mod tests {
             &[],
             UnixTime::now(),
         );
-        assert!(result.is_err(), "mismatched hash should be rejected");
-        let err_msg = format!("{}", result.unwrap_err());
-        assert!(err_msg.contains("certificate hash mismatch"), "error should mention hash mismatch");
+        assert!(result.is_err());
+        assert!(format!("{}", result.unwrap_err()).contains("certificate hash mismatch"));
     }
-
-    // ── 8: Queue overflow test ──
 
     #[test]
     fn test_queue_overflow_drops_oldest() {
+        use context::MAX_PENDING_PACKETS;
+
         let pending = Arc::new(Mutex::new(VecDeque::with_capacity(MAX_PENDING_PACKETS)));
         let dropped = Arc::new(AtomicU64::new(0));
 
-        // Fill to capacity.
         {
             let mut q = pending.lock().unwrap();
             for i in 0..MAX_PENDING_PACKETS {
                 q.push_back(vec![i as u8]);
             }
         }
-
-        // Simulate recv_loop overflow: add one more.
         {
             let mut q = pending.lock().unwrap();
             if q.len() >= MAX_PENDING_PACKETS {
@@ -1472,22 +996,18 @@ mod tests {
         let q = pending.lock().unwrap();
         assert_eq!(q.len(), MAX_PENDING_PACKETS);
         assert_eq!(dropped.load(Ordering::Relaxed), 1);
-        assert_eq!(q.front().unwrap()[0], 1, "oldest (0) should be dropped");
-        assert_eq!(q.back().unwrap()[0], 0xFF, "newest should be at back");
+        assert_eq!(q.front().unwrap()[0], 1);
+        assert_eq!(q.back().unwrap()[0], 0xFF);
     }
-
-    // ── 9: Concurrency + mutex poison recovery tests ──
 
     #[test]
     fn test_mutex_poison_recovery() {
         let mutex = Mutex::new(42u32);
-        // Poison by panicking while holding the lock.
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _guard = mutex.lock().unwrap();
             panic!("intentional");
         }));
         assert!(mutex.is_poisoned());
-        // lock_or_recover should work.
         let guard = lock_or_recover(&mutex);
         assert_eq!(*guard, 42);
     }
@@ -1502,11 +1022,7 @@ mod tests {
                     for _ in 0..100 {
                         let mut s = lock_or_recover(&stats);
                         s.blocks_verified += 1;
-                        if i % 2 == 0 {
-                            s.success_count += 1;
-                        } else {
-                            s.failure_count += 1;
-                        }
+                        if i % 2 == 0 { s.success_count += 1; } else { s.failure_count += 1; }
                         s.total_verify_time_ms += 10;
                     }
                 })
@@ -1520,58 +1036,38 @@ mod tests {
         assert_eq!(s.success_count + s.failure_count, 400);
     }
 
-    // ── 10: FfiError code mapping test ──
-
-    // ── 10A: V2 wire format auto-detection tests ──
-
     #[test]
     fn test_is_v2_wire_format_detection() {
-        // Valid V2 wire header
         assert!(is_v2_wire_format(&[0x4E, 0x32, 0x01, 0x00]));
         assert!(is_v2_wire_format(&[0x4E, 0x32, 0x01, 0x00, 0xDE, 0xAD]));
-        // Just magic is enough for detection
         assert!(is_v2_wire_format(&[0x4E, 0x32]));
-
-        // V1 bincode data (doesn't start with magic)
         assert!(!is_v2_wire_format(&[0xDE, 0xAD, 0xBE, 0xEF]));
         assert!(!is_v2_wire_format(&[0x00, 0x00, 0x00, 0x00]));
-
-        // Too short
         assert!(!is_v2_wire_format(&[0x4E]));
         assert!(!is_v2_wire_format(&[]));
     }
 
     #[test]
     fn test_verify_v2_packet_enters_v2_path() {
-        // A packet starting with V2 wire header magic should enter the V2 decode path.
-        // Even with truncated data, it should try V2 decode (not V1 bincode).
         let ctx = unsafe { n42_verifier_init(4242) };
         assert!(!ctx.is_null());
-
-        // Valid V2 wire header + truncated payload → V2 decode error (not V1 bincode error)
         let v2_packet = [0x4E, 0x32, 0x01, 0x00, 0xDE, 0xAD, 0xBE, 0xEF];
         let result = unsafe { n42_verify_and_send(ctx, v2_packet.as_ptr(), v2_packet.len()) };
-        // Should return PacketDecode (error code 1) via the V2 path
-        assert_eq!(result, 1, "V2 packet with truncated data should return PacketDecode error");
-
-        // V1 bincode garbage also produces PacketDecode but via V1 path
+        assert_eq!(result, 1);
         let v1_packet = [0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04];
         let result = unsafe { n42_verify_and_send(ctx, v1_packet.as_ptr(), v1_packet.len()) };
-        assert_eq!(result, 1, "V1 garbage should also return PacketDecode error");
-
+        assert_eq!(result, 1);
         unsafe { n42_verifier_free(ctx) };
     }
 
     #[test]
     fn test_cache_sync_v2_decode() {
-        // Verify that apply_cache_sync works with a V2-encoded CacheSyncMessage.
+        use alloy_primitives::B256;
         use n42_mobile::code_cache::encode_cache_sync;
 
         let cache = Mutex::new(CodeCache::new(100));
-
         let h1 = B256::with_last_byte(0x01);
         let h2 = B256::with_last_byte(0x02);
-
         let msg = CacheSyncMessage {
             codes: vec![
                 (h1, alloy_primitives::Bytes::from(vec![0x60, 0x00])),
@@ -1579,17 +1075,13 @@ mod tests {
             ],
             evict_hints: vec![],
         };
-
-        // Encode with V2 wire format
         let encoded = encode_cache_sync(&msg);
-        assert!(is_v2_wire_format(&encoded), "encoded data should start with V2 magic");
+        assert!(is_v2_wire_format(&encoded));
 
-        // Decode back using the same path as recv_loop
-        let decoded = decode_cache_sync(&encoded).expect("V2 decode should succeed");
+        let decoded = n42_mobile::code_cache::decode_cache_sync(&encoded).expect("V2 decode should succeed");
         assert_eq!(decoded.codes.len(), 2);
         assert_eq!(decoded.evict_hints.len(), 0);
 
-        // Apply to cache
         let (added, evicted) = apply_cache_sync(decoded, &cache);
         assert_eq!(added, 2);
         assert_eq!(evicted, 0);
@@ -1598,8 +1090,6 @@ mod tests {
         assert!(guard.get(&h1).is_some());
         assert!(guard.get(&h2).is_some());
     }
-
-    // ── 10B: FfiError code mapping test ──
 
     #[test]
     fn test_ffi_error_codes_distinct() {

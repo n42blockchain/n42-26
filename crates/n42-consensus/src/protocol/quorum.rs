@@ -13,22 +13,17 @@ use crate::validator::ValidatorSet;
 /// once 2f+1 votes are received.
 #[derive(Debug)]
 pub struct VoteCollector {
-    /// View this collector is gathering votes for.
     view: ViewNumber,
-    /// Block hash being voted on.
     block_hash: B256,
     /// Collected signatures indexed by validator index.
     votes: HashMap<u32, BlsSignature>,
-    /// Total validators in the set.
     set_size: u32,
-    /// Validator indices whose signatures have already been verified
-    /// (in process_vote/process_commit_vote). Skipped during build_qc
-    /// to avoid redundant pairing operations (~50% savings).
+    /// Validators whose signatures were already verified by the caller.
+    /// Skipped during `build_qc_with_message` to avoid redundant BLS pairings.
     verified: HashSet<u32>,
 }
 
 impl VoteCollector {
-    /// Creates a new vote collector for the given view and block.
     pub fn new(view: ViewNumber, block_hash: B256, set_size: u32) -> Self {
         Self {
             view,
@@ -39,7 +34,7 @@ impl VoteCollector {
         }
     }
 
-    /// Adds a vote. Returns `Err` if duplicate.
+    /// Adds a vote. Returns `Err` if the validator has already voted.
     pub fn add_vote(
         &mut self,
         validator_index: u32,
@@ -56,8 +51,7 @@ impl VoteCollector {
     }
 
     /// Adds a vote that has already been signature-verified by the caller.
-    /// The `verified` set is checked in `build_qc_with_message()` to skip
-    /// redundant re-verification, saving ~50% of pairing operations.
+    /// Marks the validator in `verified` to skip re-verification in `build_qc_with_message`.
     pub fn add_verified_vote(
         &mut self,
         validator_index: u32,
@@ -68,42 +62,29 @@ impl VoteCollector {
         Ok(())
     }
 
-    /// Returns the block hash this collector is gathering votes for.
     pub fn block_hash(&self) -> B256 {
         self.block_hash
     }
 
-    /// Returns the current number of collected votes.
     pub fn vote_count(&self) -> usize {
         self.votes.len()
     }
 
-    /// Checks if we have enough votes for a quorum.
     pub fn has_quorum(&self, quorum_size: usize) -> bool {
         self.votes.len() >= quorum_size
     }
 
-    /// Builds a QuorumCertificate by aggregating collected signatures.
-    ///
-    /// Verifies each vote against the validator's public key before aggregating.
-    /// Uses the standard signing message (view || block_hash).
-    /// Returns an error if there aren't enough valid votes for a quorum.
-    pub fn build_qc(
-        &self,
-        validator_set: &ValidatorSet,
-    ) -> ConsensusResult<QuorumCertificate> {
+    /// Builds a QuorumCertificate using the standard vote signing message.
+    pub fn build_qc(&self, validator_set: &ValidatorSet) -> ConsensusResult<QuorumCertificate> {
         let message = signing_message(self.view, &self.block_hash);
         self.build_qc_with_message(validator_set, &message)
     }
 
-    /// Builds a QuorumCertificate using a custom signing message for verification.
+    /// Builds a QuorumCertificate using a custom signing message.
     ///
-    /// This is needed for CommitVote (Round 2) which uses a different message
-    /// format ("commit" || view || block_hash) than the standard Round 1 vote.
-    ///
-    /// Votes with invalid signatures are skipped (defense-in-depth). The QC is
-    /// formed from the remaining valid votes, failing only if fewer than
-    /// `quorum_size` valid votes remain.
+    /// Used for CommitVote (Round 2) which uses `commit_signing_message` instead of the
+    /// standard `signing_message`. Votes with invalid signatures are skipped (defense-in-depth);
+    /// the QC fails only if fewer than `quorum_size` valid votes remain.
     pub fn build_qc_with_message(
         &self,
         validator_set: &ValidatorSet,
@@ -118,20 +99,15 @@ impl VoteCollector {
             });
         }
 
-        // Verify each vote and collect valid signatures, skipping invalid ones.
-        // Votes already verified in process_vote() (tracked in `self.verified`)
-        // are not re-verified, saving ~50% of pairing operations.
         let mut valid_sigs: Vec<&BlsSignature> = Vec::new();
         let mut signers = bitvec![u8, Msb0; 0; self.set_size as usize];
 
         for (&idx, sig) in &self.votes {
-            // Bounds check first
             if idx >= self.set_size {
                 tracing::warn!(view = self.view, idx, "skipping out-of-range validator in QC build");
                 continue;
             }
 
-            // Skip re-verification for votes already verified in process_vote().
             if self.verified.contains(&idx) {
                 valid_sigs.push(sig);
                 signers.set(idx as usize, true);
@@ -153,7 +129,6 @@ impl VoteCollector {
             signers.set(idx as usize, true);
         }
 
-        // Check we still have enough valid votes after filtering
         if valid_sigs.len() < quorum_size {
             return Err(ConsensusError::InsufficientVotes {
                 view: self.view,
@@ -163,7 +138,6 @@ impl VoteCollector {
         }
 
         let aggregate_signature = AggregateSignature::aggregate(&valid_sigs)?;
-
         Ok(QuorumCertificate {
             view: self.view,
             block_hash: self.block_hash,
@@ -176,18 +150,13 @@ impl VoteCollector {
 /// Collects timeout messages for a specific view and produces a TimeoutCertificate.
 #[derive(Debug)]
 pub struct TimeoutCollector {
-    /// View this collector is gathering timeouts for.
     view: ViewNumber,
-    /// Collected timeout signatures indexed by validator index.
     timeouts: HashMap<u32, (BlsSignature, QuorumCertificate)>,
-    /// Total validators in the set.
     set_size: u32,
-    /// Validator indices whose timeout signatures have already been verified.
     verified: HashSet<u32>,
 }
 
 impl TimeoutCollector {
-    /// Creates a new timeout collector for the given view.
     pub fn new(view: ViewNumber, set_size: u32) -> Self {
         Self {
             view,
@@ -197,12 +166,11 @@ impl TimeoutCollector {
         }
     }
 
-    /// Returns the view this collector is gathering timeouts for.
     pub fn view(&self) -> ViewNumber {
         self.view
     }
 
-    /// Adds a timeout message. Returns `Err` if duplicate.
+    /// Adds a timeout message. Returns `Err` if the validator has already submitted one.
     pub fn add_timeout(
         &mut self,
         validator_index: u32,
@@ -219,7 +187,7 @@ impl TimeoutCollector {
         Ok(())
     }
 
-    /// Adds a timeout message that has already been signature-verified.
+    /// Adds a timeout message that has already been signature-verified by the caller.
     pub fn add_verified_timeout(
         &mut self,
         validator_index: u32,
@@ -231,25 +199,19 @@ impl TimeoutCollector {
         Ok(())
     }
 
-    /// Returns the current number of collected timeouts.
     pub fn timeout_count(&self) -> usize {
         self.timeouts.len()
     }
 
-    /// Checks if we have enough timeouts for a quorum.
     pub fn has_quorum(&self, quorum_size: usize) -> bool {
         self.timeouts.len() >= quorum_size
     }
 
-    /// Builds a TimeoutCertificate by aggregating collected timeout signatures.
+    /// Builds a TimeoutCertificate from collected timeout signatures.
     ///
     /// Timeout messages with invalid signatures are skipped (defense-in-depth).
-    /// The TC is formed from the remaining valid timeouts, failing only if fewer
-    /// than `quorum_size` valid timeouts remain.
-    pub fn build_tc(
-        &self,
-        validator_set: &ValidatorSet,
-    ) -> ConsensusResult<TimeoutCertificate> {
+    /// The TC fails only if fewer than `quorum_size` valid timeouts remain.
+    pub fn build_tc(&self, validator_set: &ValidatorSet) -> ConsensusResult<TimeoutCertificate> {
         let quorum_size = validator_set.quorum_size();
         if self.timeouts.len() < quorum_size {
             return Err(ConsensusError::InsufficientVotes {
@@ -259,22 +221,17 @@ impl TimeoutCollector {
             });
         }
 
-        // Build the timeout signing message: ("timeout" || view)
         let message = timeout_signing_message(self.view);
-
-        // Find the highest QC among all timeout messages
         let mut highest_qc: Option<&QuorumCertificate> = None;
         let mut valid_sigs: Vec<&BlsSignature> = Vec::new();
         let mut signers = bitvec![u8, Msb0; 0; self.set_size as usize];
 
         for (&idx, (sig, high_qc)) in &self.timeouts {
-            // Bounds check first
             if idx >= self.set_size {
                 tracing::warn!(view = self.view, idx, "skipping out-of-range validator in TC build");
                 continue;
             }
 
-            // Skip re-verification for already-verified timeouts.
             if self.verified.contains(&idx) {
                 valid_sigs.push(sig);
                 signers.set(idx as usize, true);
@@ -297,14 +254,11 @@ impl TimeoutCollector {
             }
             valid_sigs.push(sig);
             signers.set(idx as usize, true);
-
-            // Track highest QC
             if highest_qc.as_ref().is_none_or(|hq| high_qc.view > hq.view) {
                 highest_qc = Some(high_qc);
             }
         }
 
-        // Check we still have enough valid timeouts after filtering
         if valid_sigs.len() < quorum_size {
             return Err(ConsensusError::InsufficientVotes {
                 view: self.view,
@@ -330,10 +284,10 @@ impl TimeoutCollector {
     }
 }
 
-/// Collects signer public keys from a signers bitmap.
+/// Collects and validates signer public keys from a signers bitmap.
 ///
-/// Shared helper for `verify_qc` and `verify_tc` to avoid duplicating
-/// the signer-count check and public-key collection logic.
+/// Validates bitmap length against the validator set (prevents short bitmaps from
+/// bypassing quorum checks), then collects the public keys of all set bits.
 fn collect_signer_keys<'a>(
     signers: &BitVec<u8, Msb0>,
     validator_set: &'a ValidatorSet,
@@ -341,8 +295,6 @@ fn collect_signer_keys<'a>(
     view: ViewNumber,
     cert_kind: &str,
 ) -> ConsensusResult<Vec<&'a BlsPublicKey>> {
-    // Validate bitmap length matches the validator set to prevent short bitmaps
-    // from bypassing quorum checks (higher-indexed validators would be invisible).
     let expected_len = validator_set.len() as usize;
     if signers.len() != expected_len {
         let reason = format!(
@@ -350,18 +302,20 @@ fn collect_signer_keys<'a>(
             signers.len(),
             expected_len,
         );
-        return match cert_kind {
-            "TC" => Err(ConsensusError::InvalidTC { view, reason }),
-            _ => Err(ConsensusError::InvalidQC { view, reason }),
+        return if cert_kind == "TC" {
+            Err(ConsensusError::InvalidTC { view, reason })
+        } else {
+            Err(ConsensusError::InvalidQC { view, reason })
         };
     }
 
     let signer_count = signers.iter().filter(|b| **b).count();
     if signer_count < quorum_size {
         let reason = format!("insufficient signers: have {signer_count}, need {quorum_size}");
-        return match cert_kind {
-            "TC" => Err(ConsensusError::InvalidTC { view, reason }),
-            _ => Err(ConsensusError::InvalidQC { view, reason }),
+        return if cert_kind == "TC" {
+            Err(ConsensusError::InvalidTC { view, reason })
+        } else {
+            Err(ConsensusError::InvalidQC { view, reason })
         };
     }
 
@@ -373,14 +327,10 @@ fn collect_signer_keys<'a>(
         .collect::<ConsensusResult<Vec<_>>>()
 }
 
-/// Verifies a QuorumCertificate against the validator set.
-pub fn verify_qc(
-    qc: &QuorumCertificate,
-    validator_set: &ValidatorSet,
-) -> ConsensusResult<()> {
+/// Verifies a QuorumCertificate (Round 1) against the validator set.
+pub fn verify_qc(qc: &QuorumCertificate, validator_set: &ValidatorSet) -> ConsensusResult<()> {
     let quorum_size = validator_set.quorum_size();
     let signer_pks = collect_signer_keys(&qc.signers, validator_set, quorum_size, qc.view, "QC")?;
-
     let message = signing_message(qc.view, &qc.block_hash);
     AggregateSignature::verify_aggregate(&message, &qc.aggregate_signature, &signer_pks)
         .map_err(|_| ConsensusError::InvalidQC {
@@ -389,35 +339,16 @@ pub fn verify_qc(
         })
 }
 
-/// Constructs the signing message for votes: view (8 bytes LE) || block_hash (32 bytes).
-pub fn signing_message(view: ViewNumber, block_hash: &B256) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(40);
-    msg.extend_from_slice(&view.to_le_bytes());
-    msg.extend_from_slice(block_hash.as_slice());
-    msg
-}
-
-/// Constructs the signing message for commit votes: "commit" || view || block_hash.
-pub fn commit_signing_message(view: ViewNumber, block_hash: &B256) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(46);
-    msg.extend_from_slice(b"commit");
-    msg.extend_from_slice(&view.to_le_bytes());
-    msg.extend_from_slice(block_hash.as_slice());
-    msg
-}
-
 /// Verifies a CommitQC (Round 2) against the validator set.
 ///
-/// Unlike `verify_qc()` which uses the standard `signing_message` format
-/// (view || block_hash), this function uses `commit_signing_message` format
-/// ("commit" || view || block_hash) matching how CommitVotes are signed.
+/// Uses `commit_signing_message` format ("commit" || view || block_hash)
+/// rather than the standard `signing_message` format.
 pub fn verify_commit_qc(
     qc: &QuorumCertificate,
     validator_set: &ValidatorSet,
 ) -> ConsensusResult<()> {
     let quorum_size = validator_set.quorum_size();
     let signer_pks = collect_signer_keys(&qc.signers, validator_set, quorum_size, qc.view, "QC")?;
-
     let message = commit_signing_message(qc.view, &qc.block_hash);
     AggregateSignature::verify_aggregate(&message, &qc.aggregate_signature, &signer_pks)
         .map_err(|_| ConsensusError::InvalidQC {
@@ -427,17 +358,9 @@ pub fn verify_commit_qc(
 }
 
 /// Verifies a TimeoutCertificate against the validator set.
-///
-/// Checks that:
-/// 1. Enough signers participated (quorum)
-/// 2. The aggregated signature is valid over `timeout_signing_message(tc.view)`
-pub fn verify_tc(
-    tc: &TimeoutCertificate,
-    validator_set: &ValidatorSet,
-) -> ConsensusResult<()> {
+pub fn verify_tc(tc: &TimeoutCertificate, validator_set: &ValidatorSet) -> ConsensusResult<()> {
     let quorum_size = validator_set.quorum_size();
     let signer_pks = collect_signer_keys(&tc.signers, validator_set, quorum_size, tc.view, "TC")?;
-
     let message = timeout_signing_message(tc.view);
     AggregateSignature::verify_aggregate(&message, &tc.aggregate_signature, &signer_pks)
         .map_err(|_| ConsensusError::InvalidTC {
@@ -446,7 +369,24 @@ pub fn verify_tc(
         })
 }
 
-/// Constructs the signing message for timeout: "timeout" || view (8 bytes LE).
+/// Signing message for Round 1 votes: view (8 bytes LE) || block_hash (32 bytes).
+pub fn signing_message(view: ViewNumber, block_hash: &B256) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(40);
+    msg.extend_from_slice(&view.to_le_bytes());
+    msg.extend_from_slice(block_hash.as_slice());
+    msg
+}
+
+/// Signing message for Round 2 commit votes: "commit" || view (8 bytes LE) || block_hash (32 bytes).
+pub fn commit_signing_message(view: ViewNumber, block_hash: &B256) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(46);
+    msg.extend_from_slice(b"commit");
+    msg.extend_from_slice(&view.to_le_bytes());
+    msg.extend_from_slice(block_hash.as_slice());
+    msg
+}
+
+/// Signing message for timeout messages: "timeout" || view (8 bytes LE).
 pub fn timeout_signing_message(view: ViewNumber) -> Vec<u8> {
     let mut msg = Vec::with_capacity(15);
     msg.extend_from_slice(b"timeout");
@@ -461,7 +401,6 @@ mod tests {
     use n42_chainspec::ValidatorInfo;
     use n42_primitives::BlsSecretKey;
 
-    /// Helper: create a test validator set of size `n` along with the secret keys.
     fn test_validator_set(n: usize) -> (Vec<BlsSecretKey>, ValidatorSet) {
         let sks: Vec<_> = (0..n).map(|_| BlsSecretKey::random().unwrap()).collect();
         let infos: Vec<_> = sks
@@ -484,18 +423,17 @@ mod tests {
         let block_hash = B256::repeat_byte(0xBB);
         let mut collector = VoteCollector::new(view, block_hash, vs.len());
 
-        assert_eq!(collector.vote_count(), 0, "initially no votes");
-        assert!(!collector.has_quorum(vs.quorum_size()), "no quorum with 0 votes");
+        assert_eq!(collector.vote_count(), 0);
+        assert!(!collector.has_quorum(vs.quorum_size()));
 
-        // Add 3 votes (quorum = 2*1+1 = 3 for n=4)
         let msg = signing_message(view, &block_hash);
         for i in 0..3u32 {
             let sig = sks[i as usize].sign(&msg);
             collector.add_vote(i, sig).expect("adding vote should succeed");
         }
 
-        assert_eq!(collector.vote_count(), 3, "should have 3 votes");
-        assert!(collector.has_quorum(vs.quorum_size()), "should have quorum with 3 votes");
+        assert_eq!(collector.vote_count(), 3);
+        assert!(collector.has_quorum(vs.quorum_size()));
     }
 
     #[test]
@@ -508,24 +446,16 @@ mod tests {
         let msg = signing_message(view, &block_hash);
         let sig = sks[0].sign(&msg);
 
-        // First vote succeeds
         collector.add_vote(0, sig.clone()).expect("first vote should succeed");
 
-        // Duplicate vote should fail
-        let sig2 = sks[0].sign(&msg);
-        let result = collector.add_vote(0, sig2);
-        assert!(result.is_err(), "duplicate vote should return error");
-
-        // Verify it's specifically a DuplicateVote error
+        let result = collector.add_vote(0, sks[0].sign(&msg));
+        assert!(result.is_err());
         match result.unwrap_err() {
-            ConsensusError::DuplicateVote {
-                view: v,
-                validator_index: idx,
-            } => {
+            ConsensusError::DuplicateVote { view: v, validator_index: idx } => {
                 assert_eq!(v, view);
                 assert_eq!(idx, 0);
             }
-            other => panic!("expected DuplicateVote error, got: {:?}", other),
+            other => panic!("expected DuplicateVote, got: {:?}", other),
         }
     }
 
@@ -536,27 +466,22 @@ mod tests {
         let block_hash = B256::repeat_byte(0xDD);
         let mut collector = VoteCollector::new(view, block_hash, vs.len());
 
-        // Sign with 3 validators (indices 0, 1, 2) to meet quorum of 3
         let msg = signing_message(view, &block_hash);
         for i in 0..3u32 {
             let sig = sks[i as usize].sign(&msg);
             collector.add_vote(i, sig).unwrap();
         }
 
-        // Build QC should succeed
         let qc = collector.build_qc(&vs).expect("build_qc should succeed");
-        assert_eq!(qc.view, view, "QC view should match");
-        assert_eq!(qc.block_hash, block_hash, "QC block_hash should match");
-        assert_eq!(qc.signer_count(), 3, "QC should have 3 signers");
+        assert_eq!(qc.view, view);
+        assert_eq!(qc.block_hash, block_hash);
+        assert_eq!(qc.signer_count(), 3);
+        assert!(qc.signers[0]);
+        assert!(qc.signers[1]);
+        assert!(qc.signers[2]);
+        assert!(!qc.signers[3]);
 
-        // Verify signers bitmap: bits 0, 1, 2 set; bit 3 unset
-        assert!(qc.signers[0], "signer 0 should be set");
-        assert!(qc.signers[1], "signer 1 should be set");
-        assert!(qc.signers[2], "signer 2 should be set");
-        assert!(!qc.signers[3], "signer 3 should not be set");
-
-        // verify_qc should succeed
-        verify_qc(&qc, &vs).expect("verify_qc should succeed for valid QC");
+        verify_qc(&qc, &vs).expect("verify_qc should succeed");
     }
 
     #[test]
@@ -565,7 +490,6 @@ mod tests {
         let view = 10u64;
         let block_hash = B256::repeat_byte(0xEE);
 
-        // Build a QC with only 1 signer (quorum requires 3)
         let msg = signing_message(view, &block_hash);
         let sig = sks[0].sign(&msg);
         let agg_sig =
@@ -583,18 +507,13 @@ mod tests {
         };
 
         let result = verify_qc(&qc, &vs);
-        assert!(result.is_err(), "verify_qc should fail with insufficient signers");
-
+        assert!(result.is_err());
         match result.unwrap_err() {
             ConsensusError::InvalidQC { view: v, reason } => {
                 assert_eq!(v, view);
-                assert!(
-                    reason.contains("insufficient signers"),
-                    "error reason should mention insufficient signers, got: {}",
-                    reason
-                );
+                assert!(reason.contains("insufficient signers"), "got: {reason}");
             }
-            other => panic!("expected InvalidQC error, got: {:?}", other),
+            other => panic!("expected InvalidQC, got: {:?}", other),
         }
     }
 
@@ -602,21 +521,11 @@ mod tests {
     fn test_signing_message() {
         let view: ViewNumber = 42;
         let block_hash = B256::repeat_byte(0xFF);
-
         let msg = signing_message(view, &block_hash);
 
-        // Should be 8 bytes (view LE) + 32 bytes (block hash) = 40 bytes
-        assert_eq!(msg.len(), 40, "signing message should be 40 bytes");
-
-        // First 8 bytes: view 42 in little-endian
-        assert_eq!(&msg[..8], &42u64.to_le_bytes(), "first 8 bytes should be view in LE");
-
-        // Last 32 bytes: block hash
-        assert_eq!(
-            &msg[8..],
-            block_hash.as_slice(),
-            "last 32 bytes should be block hash"
-        );
+        assert_eq!(msg.len(), 40);
+        assert_eq!(&msg[..8], &42u64.to_le_bytes());
+        assert_eq!(&msg[8..], block_hash.as_slice());
     }
 
     #[test]
@@ -624,18 +533,9 @@ mod tests {
         let view: ViewNumber = 99;
         let msg = timeout_signing_message(view);
 
-        // Should be 7 bytes ("timeout") + 8 bytes (view LE) = 15 bytes
-        assert_eq!(msg.len(), 15, "timeout signing message should be 15 bytes");
-
-        // First 7 bytes: "timeout"
-        assert_eq!(&msg[..7], b"timeout", "should start with 'timeout'");
-
-        // Last 8 bytes: view in LE
-        assert_eq!(
-            &msg[7..],
-            &99u64.to_le_bytes(),
-            "last 8 bytes should be view in LE"
-        );
+        assert_eq!(msg.len(), 15);
+        assert_eq!(&msg[..7], b"timeout");
+        assert_eq!(&msg[7..], &99u64.to_le_bytes());
     }
 
     #[test]
@@ -644,11 +544,10 @@ mod tests {
         let block_hash = B256::repeat_byte(0x11);
         let msg = commit_signing_message(view, &block_hash);
 
-        // Should be 6 bytes ("commit") + 8 bytes (view LE) + 32 bytes (block hash) = 46 bytes
-        assert_eq!(msg.len(), 46, "commit signing message should be 46 bytes");
-        assert_eq!(&msg[..6], b"commit", "should start with 'commit'");
-        assert_eq!(&msg[6..14], &7u64.to_le_bytes(), "view bytes should match");
-        assert_eq!(&msg[14..], block_hash.as_slice(), "block hash should match");
+        assert_eq!(msg.len(), 46);
+        assert_eq!(&msg[..6], b"commit");
+        assert_eq!(&msg[6..14], &7u64.to_le_bytes());
+        assert_eq!(&msg[14..], block_hash.as_slice());
     }
 
     #[test]
@@ -658,14 +557,11 @@ mod tests {
         let block_hash = B256::repeat_byte(0xAA);
         let mut collector = VoteCollector::new(view, block_hash, vs.len());
 
-        // Add only 1 vote (quorum is 3)
         let msg = signing_message(view, &block_hash);
-        let sig = sks[0].sign(&msg);
-        collector.add_vote(0, sig).unwrap();
+        collector.add_vote(0, sks[0].sign(&msg)).unwrap();
 
         let result = collector.build_qc(&vs);
-        assert!(result.is_err(), "build_qc should fail with insufficient votes");
-
+        assert!(result.is_err());
         match result.unwrap_err() {
             ConsensusError::InsufficientVotes { have, need, .. } => {
                 assert_eq!(have, 1);
@@ -675,10 +571,6 @@ mod tests {
         }
     }
 
-    // ── Level 1: Defense-in-depth tests for invalid signature skipping ──
-
-    /// build_qc should skip votes with invalid signatures and still form a QC
-    /// if enough valid votes remain.
     #[test]
     fn test_build_qc_skips_invalid_signature() {
         let (sks, vs) = test_validator_set(4);
@@ -686,31 +578,25 @@ mod tests {
         let block_hash = B256::repeat_byte(0xF1);
         let mut collector = VoteCollector::new(view, block_hash, vs.len());
 
-        // 3 valid votes from validators 0, 1, 2
         let msg = signing_message(view, &block_hash);
         for i in 0..3u32 {
             let sig = sks[i as usize].sign(&msg);
             collector.add_vote(i, sig).unwrap();
         }
 
-        // 1 invalid vote from validator 3 (signed with wrong message)
+        // Invalid vote: signed with wrong block hash
         let wrong_msg = signing_message(view, &B256::repeat_byte(0xFF));
-        let bad_sig = sks[3].sign(&wrong_msg);
-        collector.add_vote(3, bad_sig).unwrap();
+        collector.add_vote(3, sks[3].sign(&wrong_msg)).unwrap();
 
-        // build_qc should succeed with 3 valid signatures, skipping the invalid one
         let qc = collector.build_qc(&vs).expect("QC should form from valid votes");
-        assert_eq!(qc.signer_count(), 3, "QC should have 3 signers (invalid skipped)");
+        assert_eq!(qc.signer_count(), 3);
         assert!(qc.signers[0]);
         assert!(qc.signers[1]);
         assert!(qc.signers[2]);
-        assert!(!qc.signers[3], "invalid signer should be excluded");
-
-        // QC should verify successfully
+        assert!(!qc.signers[3]);
         verify_qc(&qc, &vs).expect("QC should verify");
     }
 
-    /// build_qc should fail if too many invalid signatures reduce valid count below quorum.
     #[test]
     fn test_build_qc_fails_with_too_many_invalid() {
         let (sks, vs) = test_validator_set(4);
@@ -718,23 +604,18 @@ mod tests {
         let block_hash = B256::repeat_byte(0xF2);
         let mut collector = VoteCollector::new(view, block_hash, vs.len());
 
-        // 2 valid votes (quorum is 3)
         let msg = signing_message(view, &block_hash);
         for i in 0..2u32 {
-            let sig = sks[i as usize].sign(&msg);
-            collector.add_vote(i, sig).unwrap();
+            collector.add_vote(i, sks[i as usize].sign(&msg)).unwrap();
         }
 
-        // 2 invalid votes
         let wrong_msg = signing_message(99, &block_hash);
         for i in 2..4u32 {
-            let bad_sig = sks[i as usize].sign(&wrong_msg);
-            collector.add_vote(i, bad_sig).unwrap();
+            collector.add_vote(i, sks[i as usize].sign(&wrong_msg)).unwrap();
         }
 
-        // 4 raw votes but only 2 valid → below quorum
         let result = collector.build_qc(&vs);
-        assert!(result.is_err(), "should fail with insufficient valid votes");
+        assert!(result.is_err());
         match result.unwrap_err() {
             ConsensusError::InsufficientVotes { have, need, .. } => {
                 assert_eq!(have, 2);
@@ -744,57 +625,45 @@ mod tests {
         }
     }
 
-    /// build_tc should skip timeout messages with invalid signatures.
     #[test]
     fn test_build_tc_skips_invalid_signature() {
         let (sks, vs) = test_validator_set(4);
         let view = 5u64;
         let genesis_qc = QuorumCertificate::genesis();
-
         let mut collector = TimeoutCollector::new(view, vs.len());
         let msg = timeout_signing_message(view);
 
-        // 3 valid timeouts
         for i in 0..3u32 {
-            let sig = sks[i as usize].sign(&msg);
-            collector.add_timeout(i, sig, genesis_qc.clone()).unwrap();
+            collector.add_timeout(i, sks[i as usize].sign(&msg), genesis_qc.clone()).unwrap();
         }
 
-        // 1 invalid timeout (wrong message)
+        // Invalid timeout: wrong view
         let wrong_msg = timeout_signing_message(999);
-        let bad_sig = sks[3].sign(&wrong_msg);
-        collector.add_timeout(3, bad_sig, genesis_qc.clone()).unwrap();
+        collector.add_timeout(3, sks[3].sign(&wrong_msg), genesis_qc.clone()).unwrap();
 
-        // TC should form with 3 valid, skipping the invalid one
         let tc = collector.build_tc(&vs).expect("TC should form from valid timeouts");
         assert_eq!(tc.signers.iter().filter(|b| **b).count(), 3);
         assert!(tc.signers[0]);
         assert!(tc.signers[1]);
         assert!(tc.signers[2]);
-        assert!(!tc.signers[3], "invalid signer should be excluded");
+        assert!(!tc.signers[3]);
     }
 
-    /// build_tc should fail if too many invalid signatures reduce count below quorum.
     #[test]
     fn test_build_tc_fails_with_too_many_invalid() {
         let (sks, vs) = test_validator_set(4);
         let view = 6u64;
         let genesis_qc = QuorumCertificate::genesis();
-
         let mut collector = TimeoutCollector::new(view, vs.len());
         let msg = timeout_signing_message(view);
 
-        // 2 valid timeouts
         for i in 0..2u32 {
-            let sig = sks[i as usize].sign(&msg);
-            collector.add_timeout(i, sig, genesis_qc.clone()).unwrap();
+            collector.add_timeout(i, sks[i as usize].sign(&msg), genesis_qc.clone()).unwrap();
         }
 
-        // 2 invalid timeouts
         let wrong_msg = timeout_signing_message(999);
         for i in 2..4u32 {
-            let bad_sig = sks[i as usize].sign(&wrong_msg);
-            collector.add_timeout(i, bad_sig, genesis_qc.clone()).unwrap();
+            collector.add_timeout(i, sks[i as usize].sign(&wrong_msg), genesis_qc.clone()).unwrap();
         }
 
         let result = collector.build_tc(&vs);
@@ -808,14 +677,13 @@ mod tests {
         }
     }
 
-    /// build_tc should track the highest QC among valid timeouts only.
     #[test]
     fn test_build_tc_highest_qc_from_valid_only() {
         let (sks, vs) = test_validator_set(4);
         let view = 7u64;
-        let genesis_qc = QuorumCertificate::genesis(); // view 0
+        let genesis_qc = QuorumCertificate::genesis();
 
-        // Build a "higher" QC (view 5) for the invalid timeout
+        // Higher QC that will be attached to the invalid timeout
         let higher_qc = QuorumCertificate {
             view: 5,
             block_hash: B256::repeat_byte(0xAB),
@@ -826,52 +694,40 @@ mod tests {
         let mut collector = TimeoutCollector::new(view, vs.len());
         let msg = timeout_signing_message(view);
 
-        // 3 valid timeouts with genesis QC (view 0)
         for i in 0..3u32 {
-            let sig = sks[i as usize].sign(&msg);
-            collector.add_timeout(i, sig, genesis_qc.clone()).unwrap();
+            collector.add_timeout(i, sks[i as usize].sign(&msg), genesis_qc.clone()).unwrap();
         }
 
-        // 1 invalid timeout with higher QC (view 5) — should be skipped
         let wrong_msg = timeout_signing_message(999);
-        let bad_sig = sks[3].sign(&wrong_msg);
-        collector.add_timeout(3, bad_sig, higher_qc).unwrap();
+        collector.add_timeout(3, sks[3].sign(&wrong_msg), higher_qc).unwrap();
 
         let tc = collector.build_tc(&vs).expect("TC should form");
         // high_qc should be genesis (view 0), not the invalid timeout's view 5
-        assert_eq!(tc.high_qc.view, 0, "high_qc should come from valid timeouts only");
+        assert_eq!(tc.high_qc.view, 0);
     }
 
-    // ── CommitQC verification tests (S1/S2 fix) ──
-
-    /// verify_commit_qc should succeed for a valid CommitQC built with commit_signing_message.
     #[test]
     fn test_verify_commit_qc_valid() {
         let (sks, vs) = test_validator_set(4);
         let view = 10u64;
         let block_hash = B256::repeat_byte(0xC1);
 
-        // Build a CommitQC using commit_signing_message format
         let mut collector = VoteCollector::new(view, block_hash, vs.len());
         let msg = commit_signing_message(view, &block_hash);
         for i in 0..3u32 {
-            let sig = sks[i as usize].sign(&msg);
-            collector.add_vote(i, sig).unwrap();
+            collector.add_vote(i, sks[i as usize].sign(&msg)).unwrap();
         }
         let commit_qc = collector.build_qc_with_message(&vs, &msg).unwrap();
 
-        // verify_commit_qc should succeed
-        verify_commit_qc(&commit_qc, &vs).expect("verify_commit_qc should succeed for valid CommitQC");
+        verify_commit_qc(&commit_qc, &vs).expect("verify_commit_qc should succeed");
     }
 
-    /// verify_commit_qc should reject a CommitQC with insufficient signers.
     #[test]
     fn test_verify_commit_qc_insufficient_signers() {
         let (sks, vs) = test_validator_set(4);
         let view = 11u64;
         let block_hash = B256::repeat_byte(0xC2);
 
-        // Build a QC with only 1 signer (quorum requires 3)
         let msg = commit_signing_message(view, &block_hash);
         let sig = sks[0].sign(&msg);
         let agg_sig = AggregateSignature::aggregate(&[&sig]).unwrap();
@@ -888,7 +744,7 @@ mod tests {
         };
 
         let result = verify_commit_qc(&qc, &vs);
-        assert!(result.is_err(), "verify_commit_qc should fail with insufficient signers");
+        assert!(result.is_err());
         match result.unwrap_err() {
             ConsensusError::InvalidQC { view: v, reason } => {
                 assert_eq!(v, view);
@@ -898,71 +754,55 @@ mod tests {
         }
     }
 
-    /// verify_qc() should REJECT a CommitQC (signed with commit format).
-    /// This ensures PrepareQC verification can't accidentally accept CommitQCs.
     #[test]
     fn test_verify_qc_rejects_commit_qc() {
         let (sks, vs) = test_validator_set(4);
         let view = 12u64;
         let block_hash = B256::repeat_byte(0xC3);
 
-        // Build a QC using commit_signing_message format
         let mut collector = VoteCollector::new(view, block_hash, vs.len());
         let msg = commit_signing_message(view, &block_hash);
         for i in 0..3u32 {
-            let sig = sks[i as usize].sign(&msg);
-            collector.add_vote(i, sig).unwrap();
+            collector.add_vote(i, sks[i as usize].sign(&msg)).unwrap();
         }
         let commit_qc = collector.build_qc_with_message(&vs, &msg).unwrap();
 
-        // verify_qc (prepare format) should FAIL for this CommitQC
         let result = verify_qc(&commit_qc, &vs);
-        assert!(result.is_err(), "verify_qc should reject a CommitQC (different signing format)");
+        assert!(result.is_err(), "verify_qc should reject a CommitQC");
     }
 
-    /// verify_commit_qc() should REJECT a PrepareQC (signed with standard format).
     #[test]
     fn test_verify_commit_qc_rejects_prepare_qc() {
         let (sks, vs) = test_validator_set(4);
         let view = 13u64;
         let block_hash = B256::repeat_byte(0xC4);
 
-        // Build a QC using standard signing_message format (PrepareQC)
         let mut collector = VoteCollector::new(view, block_hash, vs.len());
         let msg = signing_message(view, &block_hash);
         for i in 0..3u32 {
-            let sig = sks[i as usize].sign(&msg);
-            collector.add_vote(i, sig).unwrap();
+            collector.add_vote(i, sks[i as usize].sign(&msg)).unwrap();
         }
         let prepare_qc = collector.build_qc(&vs).unwrap();
 
-        // verify_commit_qc should FAIL for this PrepareQC
         let result = verify_commit_qc(&prepare_qc, &vs);
-        assert!(result.is_err(), "verify_commit_qc should reject a PrepareQC (different signing format)");
+        assert!(result.is_err(), "verify_commit_qc should reject a PrepareQC");
     }
 
-    // ── TimeoutCollector tests ──
-
-    /// Duplicate add_timeout for the same validator should return DuplicateVote.
     #[test]
     fn test_timeout_collector_duplicate_rejected() {
         let (sks, _vs) = test_validator_set(4);
         let view = 10u64;
         let genesis_qc = QuorumCertificate::genesis();
-
         let mut collector = TimeoutCollector::new(view, 4);
         let msg = timeout_signing_message(view);
         let sig = sks[0].sign(&msg);
 
-        // First add succeeds
         collector
             .add_timeout(0, sig.clone(), genesis_qc.clone())
             .expect("first timeout should succeed");
 
-        // Duplicate add returns DuplicateVote
-        let sig2 = sks[0].sign(&msg);
-        let result = collector.add_timeout(0, sig2, genesis_qc.clone());
-        assert!(result.is_err(), "duplicate timeout should return error");
+        let result = collector.add_timeout(0, sks[0].sign(&msg), genesis_qc);
+        assert!(result.is_err());
         match result.unwrap_err() {
             ConsensusError::DuplicateVote { view: v, validator_index } => {
                 assert_eq!(v, view);
@@ -972,14 +812,12 @@ mod tests {
         }
     }
 
-    /// TimeoutCollector::view() should return the view passed at construction.
     #[test]
     fn test_timeout_collector_view_getter() {
-        let view = 42u64;
-        let collector = TimeoutCollector::new(view, 4);
-        assert_eq!(collector.view(), view, "view() should return construction view");
+        let collector = TimeoutCollector::new(42, 4);
+        assert_eq!(collector.view(), 42);
 
         let collector2 = TimeoutCollector::new(0, 7);
-        assert_eq!(collector2.view(), 0, "view() should return 0 for genesis view");
+        assert_eq!(collector2.view(), 0);
     }
 }

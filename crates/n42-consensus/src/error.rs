@@ -91,7 +91,6 @@ mod tests {
 
     #[test]
     fn test_error_display_formats() {
-        // Verify each variant produces a human-readable message containing key info.
         let cases: Vec<(ConsensusError, &[&str])> = vec![
             (
                 ConsensusError::InvalidSignature { view: 5, validator_index: 3 },
@@ -141,22 +140,17 @@ mod tests {
         for (err, keywords) in &cases {
             let s = err.to_string();
             for kw in *keywords {
-                assert!(
-                    s.contains(kw),
-                    "Display for {:?} should contain '{}', got: {}",
-                    err, kw, s
-                );
+                assert!(s.contains(kw), "Display for {:?} should contain '{}'", err, kw);
             }
         }
     }
 
     #[test]
     fn test_bls_error_from_conversion() {
-        // BlsError converts into ConsensusError::Bls via From
         let bls_err = n42_primitives::bls::BlsError::SigningFailed;
         let consensus_err: ConsensusError = bls_err.into();
         let display = consensus_err.to_string();
-        assert!(display.contains("BLS"), "should mention BLS");
+        assert!(display.contains("BLS"));
     }
 
     #[test]

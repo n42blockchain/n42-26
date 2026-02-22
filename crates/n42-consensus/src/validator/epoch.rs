@@ -82,31 +82,32 @@ impl EpochManager {
         assert!(!schedule.is_empty(), "epoch schedule must not be empty");
 
         let mut historical = BTreeMap::new();
-        let last_idx = schedule.len() - 1;
 
-        for (i, (epoch, validators, f)) in schedule.iter().enumerate() {
+        // Add all but the last entry to historical
+        for (epoch, validators, f) in &schedule[..schedule.len() - 1] {
             let set = ValidatorSet::new(validators, *f);
-            if i < last_idx {
-                historical.insert(*epoch, set);
-            } else {
-                // Trim historical to MAX_HISTORICAL_EPOCHS
-                while historical.len() > MAX_HISTORICAL_EPOCHS {
-                    if let Some(oldest) = historical.keys().next().copied() {
-                        historical.remove(&oldest);
-                    }
-                }
-                return Self {
-                    epoch_length,
-                    current_epoch: *epoch,
-                    current_set: set,
-                    next_set: None,
-                    staged_info: None,
-                    historical_sets: historical,
-                };
+            historical.insert(*epoch, set);
+        }
+
+        // Trim historical to MAX_HISTORICAL_EPOCHS
+        while historical.len() > MAX_HISTORICAL_EPOCHS {
+            if let Some(oldest) = historical.keys().next().copied() {
+                historical.remove(&oldest);
             }
         }
 
-        unreachable!()
+        // Use the last entry as current
+        let (current_epoch, validators, f) = &schedule[schedule.len() - 1];
+        let current_set = ValidatorSet::new(validators, *f);
+
+        Self {
+            epoch_length,
+            current_epoch: *current_epoch,
+            current_set,
+            next_set: None,
+            staged_info: None,
+            historical_sets: historical,
+        }
     }
 
     /// Returns the epoch length (0 = disabled).
@@ -190,21 +191,13 @@ impl EpochManager {
     /// The current set moves to historical storage.
     /// Returns true if an epoch transition occurred, false if no staged set was available.
     pub fn advance_epoch(&mut self) -> bool {
-        let next_set = match self.next_set.take() {
-            Some(set) => set,
-            None => return false,
+        let Some(next_set) = self.next_set.take() else {
+            return false;
         };
+
         self.staged_info = None;
-
-        // Archive current set
         self.historical_sets.insert(self.current_epoch, self.current_set.clone());
-
-        // Trim oldest entries if we exceed the limit
-        while self.historical_sets.len() > MAX_HISTORICAL_EPOCHS {
-            if let Some(oldest) = self.historical_sets.keys().next().copied() {
-                self.historical_sets.remove(&oldest);
-            }
-        }
+        self.trim_historical();
 
         self.current_epoch += 1;
         self.current_set = next_set;
@@ -226,6 +219,15 @@ impl EpochManager {
     /// Returns whether a next epoch validator set has been staged.
     pub fn has_staged_next(&self) -> bool {
         self.next_set.is_some()
+    }
+
+    /// Trims historical sets to maintain MAX_HISTORICAL_EPOCHS limit.
+    fn trim_historical(&mut self) {
+        while self.historical_sets.len() > MAX_HISTORICAL_EPOCHS {
+            if let Some(oldest) = self.historical_sets.keys().next().copied() {
+                self.historical_sets.remove(&oldest);
+            }
+        }
     }
 }
 

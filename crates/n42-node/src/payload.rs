@@ -18,10 +18,7 @@ use reth_storage_api::StateProviderFactory;
 use reth_transaction_pool::{PoolTransaction, TransactionPool};
 use std::sync::Arc;
 
-/// N42 payload builder that injects the latest committed QC into block `extra_data`.
-///
-/// This is the outer builder (implements `PayloadBuilderBuilder`) that creates
-/// `N42InnerPayloadBuilder` instances for the `BasicPayloadServiceBuilder`.
+/// Outer payload builder that creates `N42InnerPayloadBuilder` instances.
 #[derive(Clone, Debug)]
 pub struct N42PayloadBuilder {
     consensus_state: Arc<SharedConsensusState>,
@@ -59,8 +56,7 @@ where
         evm_config: Evm,
     ) -> eyre::Result<Self::PayloadBuilder> {
         let conf = ctx.payload_builder_config();
-        let chain = ctx.chain_spec().chain();
-        let gas_limit = conf.gas_limit_for(chain);
+        let gas_limit = conf.gas_limit_for(ctx.chain_spec().chain());
 
         Ok(N42InnerPayloadBuilder {
             client: ctx.provider().clone(),
@@ -74,10 +70,11 @@ where
     }
 }
 
-/// Inner payload builder that builds blocks using the standard Ethereum payload flow.
+/// Inner payload builder using the standard Ethereum payload flow.
 ///
-/// Holds a reference to `SharedConsensusState` for future use (e.g., QC storage
-/// once a custom Engine API payload type is implemented).
+/// Note: QC data is NOT injected into extra_data because the Engine API enforces
+/// a 32-byte limit incompatible with N42's QC encoding (~200 bytes). The QC is
+/// stored separately in `SharedConsensusState`.
 #[derive(Debug, Clone)]
 pub struct N42InnerPayloadBuilder<Pool, Client, Evm> {
     client: Client,
@@ -86,18 +83,6 @@ pub struct N42InnerPayloadBuilder<Pool, Client, Evm> {
     base_config: EthereumBuilderConfig,
     #[allow(dead_code)]
     consensus_state: Arc<SharedConsensusState>,
-}
-
-impl<Pool, Client, Evm> N42InnerPayloadBuilder<Pool, Client, Evm> {
-    /// Returns the builder config for the current build.
-    ///
-    /// Note: QC data is NOT injected into extra_data because the alloy Engine API
-    /// layer (`ExecutionPayload::try_into_block_with_sidecar`) enforces a 32-byte
-    /// limit on extra_data, which is incompatible with N42's QC encoding (~200 bytes).
-    /// The QC is stored separately in `SharedConsensusState` for consensus purposes.
-    fn build_config(&self) -> EthereumBuilderConfig {
-        self.base_config.clone()
-    }
 }
 
 impl<Pool, Client, Evm> PayloadBuilder for N42InnerPayloadBuilder<Pool, Client, Evm>
@@ -113,12 +98,11 @@ where
         &self,
         args: BuildArguments<EthPayloadBuilderAttributes, EthBuiltPayload>,
     ) -> Result<BuildOutcome<EthBuiltPayload>, PayloadBuilderError> {
-        let config = self.build_config();
         default_ethereum_payload(
             self.evm_config.clone(),
             self.client.clone(),
             self.pool.clone(),
-            config,
+            self.base_config.clone(),
             args,
             |attributes| self.pool.best_transactions_with_attributes(attributes),
         )
@@ -135,14 +119,12 @@ where
         &self,
         config: PayloadConfig<Self::Attributes>,
     ) -> Result<EthBuiltPayload, PayloadBuilderError> {
-        let builder_config = self.build_config();
         let args = BuildArguments::new(Default::default(), config, Default::default(), None);
-
         default_ethereum_payload(
             self.evm_config.clone(),
             self.client.clone(),
             self.pool.clone(),
-            builder_config,
+            self.base_config.clone(),
             args,
             |attributes| self.pool.best_transactions_with_attributes(attributes),
         )?

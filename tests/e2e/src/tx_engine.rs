@@ -59,7 +59,6 @@ impl TxEngine {
         self.wallets[index].address
     }
 
-    /// Builds and signs an EIP-1559 transfer transaction.
     pub fn build_transfer(
         &mut self,
         from_index: usize,
@@ -90,13 +89,9 @@ impl TxEngine {
         let mut encoded = Vec::new();
         signed.encode_2718(&mut encoded);
 
-        // Compute tx hash from the signed transaction.
-        let tx_hash = *signed.hash();
-
-        Ok((tx_hash, encoded))
+        Ok((*signed.hash(), encoded))
     }
 
-    /// Builds and signs a contract deployment transaction.
     pub fn build_deploy(
         &mut self,
         from_index: usize,
@@ -126,12 +121,9 @@ impl TxEngine {
         let mut encoded = Vec::new();
         signed.encode_2718(&mut encoded);
 
-        let tx_hash = *signed.hash();
-
-        Ok((tx_hash, encoded))
+        Ok((*signed.hash(), encoded))
     }
 
-    /// Builds and signs a contract call transaction.
     pub fn build_contract_call(
         &mut self,
         from_index: usize,
@@ -163,9 +155,7 @@ impl TxEngine {
         let mut encoded = Vec::new();
         signed.encode_2718(&mut encoded);
 
-        let tx_hash = *signed.hash();
-
-        Ok((tx_hash, encoded))
+        Ok((*signed.hash(), encoded))
     }
 
     /// Sends a batch of transfer transactions at a given rate.

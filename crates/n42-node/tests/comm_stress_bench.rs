@@ -1,12 +1,5 @@
 //! IDC-Phone Communication Stack Stress Benchmark
-//!
-//! Validates performance of all Phase 1-3 optimizations under simulated production load:
-//!
-//! - Phase 1: Zero-copy (Bytes), zstd compression
-//! - Phase 2: Pre-framing, connection tiering overhead
-//! - Phase 3: EWMA RTT, Arc free-lock, tiered broadcast, channel fan-out
-//!
-//! Run: `cargo test -p n42-node --test comm_stress_bench -- --nocapture`
+//! Tests Phase 1-3 optimizations: zero-copy, pre-framing, and tiered broadcast.
 
 use bytes::{BufMut, Bytes, BytesMut};
 use n42_network::mobile::{MobileSession, PhoneTier};
@@ -15,11 +8,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, RwLock};
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Pre-frames a message (same logic as star_hub.rs).
 fn preframe_message(type_prefix: u8, data: &Bytes) -> Bytes {
     let mut buf = BytesMut::with_capacity(1 + data.len());
     buf.put_u8(type_prefix);
@@ -27,52 +15,35 @@ fn preframe_message(type_prefix: u8, data: &Bytes) -> Bytes {
     buf.freeze()
 }
 
-/// Generates witness-like data: repeating patterns of address (20B) + slot (32B) + value (32B).
 fn generate_witness_data(num_accounts: usize) -> Vec<u8> {
     let mut data = Vec::with_capacity(num_accounts * 84);
     for i in 0..num_accounts {
-        // 20-byte address (varying)
-        let addr_byte = (i % 256) as u8;
-        data.extend_from_slice(&[addr_byte; 20]);
-        // 32-byte storage key (mostly zero with some variation)
+        data.extend_from_slice(&[(i % 256) as u8; 20]);
         let mut slot = [0u8; 32];
         slot[31] = (i % 256) as u8;
         slot[30] = ((i / 256) % 256) as u8;
         data.extend_from_slice(&slot);
-        // 32-byte value (semi-random pattern)
         let mut val = [0u8; 32];
         val[0] = 0xAB;
-        val[1] = addr_byte;
+        val[1] = (i % 256) as u8;
         val[31] = (i % 7) as u8;
         data.extend_from_slice(&val);
     }
     data
 }
 
-/// Creates N MobileSession instances with varied tiers.
 fn create_sessions(n: usize) -> Vec<Arc<MobileSession>> {
-    let mut sessions = Vec::with_capacity(n);
-    for i in 0..n {
-        let session = Arc::new(MobileSession::new(i as u64, [0xAA; 48]));
-        // Distribute tiers: 70% Fast, 20% Normal, 10% Slow
-        match i % 10 {
-            0 => {
-                // Slow: 3 consecutive timeouts
-                session.record_send_timeout();
-                session.record_send_timeout();
-                session.record_send_timeout();
+    (0..n)
+        .map(|i| {
+            let session = Arc::new(MobileSession::new(i as u64, [0xAA; 48]));
+            match i % 10 {
+                0 => (0..3).for_each(|_| session.record_send_timeout()),
+                1 | 2 => session.record_send_timeout(),
+                _ => {}
             }
-            1 | 2 => {
-                // Normal: 1 timeout
-                session.record_send_timeout();
-            }
-            _ => {
-                // Fast: default
-            }
-        }
-        sessions.push(session);
-    }
-    sessions
+            session
+        })
+        .collect()
 }
 
 struct BenchResult {
@@ -96,11 +67,6 @@ impl BenchResult {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Benchmarks
-// ---------------------------------------------------------------------------
-
-/// Benchmark 1: Bytes::clone (O(1)) vs Vec<u8>::clone (O(n))
 fn bench_zero_copy() -> Vec<BenchResult> {
     let sizes = [1_000, 10_000, 100_000, 500_000]; // 1KB, 10KB, 100KB, 500KB
     let iters = 10_000u64;
@@ -153,48 +119,36 @@ fn bench_zero_copy() -> Vec<BenchResult> {
     results
 }
 
-/// Benchmark 2: Pre-framing (Phase 2) — single allocation vs double write
 fn bench_preframe() -> Vec<BenchResult> {
     let sizes = [10_000, 100_000, 500_000];
     let iters = 50_000u64;
-    let mut results = Vec::new();
 
-    for &size in &sizes {
-        let payload = Bytes::from(vec![0xAB; size]);
+    sizes
+        .iter()
+        .map(|&size| {
+            let payload = Bytes::from(vec![0xAB; size]);
 
-        // Two separate allocations (pre-Phase 2)
-        let start = Instant::now();
-        for _ in 0..iters {
-            let prefix = Bytes::from_static(&[0x03]);
-            let data = payload.clone();
-            std::hint::black_box((&prefix, &data));
-        }
-        let two_alloc_us = start.elapsed().as_micros() as u64;
+            let start = Instant::now();
+            for _ in 0..iters {
+                let framed = preframe_message(0x03, &payload);
+                std::hint::black_box(&framed);
+            }
+            let preframe_us = start.elapsed().as_micros() as u64;
 
-        // Pre-framed single allocation (Phase 2)
-        let start = Instant::now();
-        for _ in 0..iters {
-            let framed = preframe_message(0x03, &payload);
-            std::hint::black_box(&framed);
-        }
-        let preframe_us = start.elapsed().as_micros() as u64;
-
-        results.push(BenchResult {
-            name: format!("preframe {}KB (Phase 2)", size / 1000),
-            iterations: iters,
-            total_us: preframe_us,
-            per_op_us: preframe_us as f64 / iters as f64,
-            throughput: format!(
-                "{:.0} MB/s",
-                (size as f64 * iters as f64) / (preframe_us as f64)
-            ),
-        });
-        let _ = two_alloc_us; // baseline reference
-    }
-    results
+            BenchResult {
+                name: format!("preframe {}KB (Phase 2)", size / 1000),
+                iterations: iters,
+                total_us: preframe_us,
+                per_op_us: preframe_us as f64 / iters as f64,
+                throughput: format!(
+                    "{:.0} MB/s",
+                    (size as f64 * iters as f64) / (preframe_us as f64)
+                ),
+            }
+        })
+        .collect()
 }
 
-/// Benchmark 3: zstd compression on witness-like data (Phase 1)
 fn bench_compression() -> Vec<BenchResult> {
     let account_counts = [100, 500, 1500]; // ~8KB, ~42KB, ~126KB
     let iters = 1_000u64;
