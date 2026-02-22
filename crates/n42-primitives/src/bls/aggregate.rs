@@ -6,8 +6,7 @@ use blst::BLST_ERROR;
 pub struct AggregateSignature;
 
 impl AggregateSignature {
-    /// Aggregate multiple BLS signatures into one.
-    /// Returns the aggregated signature.
+    /// Aggregate multiple BLS signatures into a single signature.
     pub fn aggregate(signatures: &[&BlsSignature]) -> Result<BlsSignature, BlsError> {
         if signatures.is_empty() {
             return Err(BlsError::SigningFailed);
@@ -73,18 +72,12 @@ mod tests {
     fn test_aggregate_wrong_message() {
         let sk1 = BlsSecretKey::random().unwrap();
         let sk2 = BlsSecretKey::random().unwrap();
-
         let pk1 = sk1.public_key();
         let pk2 = sk2.public_key();
-
         let sig1 = sk1.sign(b"correct message");
         let sig2 = sk2.sign(b"correct message");
-
         let agg_sig = AggregateSignature::aggregate(&[&sig1, &sig2]).unwrap();
-
-        let result =
-            AggregateSignature::verify_aggregate(b"wrong message", &agg_sig, &[&pk1, &pk2]);
-        assert!(result.is_err(), "aggregate verify should fail for wrong message");
+        assert!(AggregateSignature::verify_aggregate(b"wrong message", &agg_sig, &[&pk1, &pk2]).is_err());
     }
 
     #[test]
@@ -99,11 +92,8 @@ mod tests {
         let sk = BlsSecretKey::random().unwrap();
         let pk = sk.public_key();
         let sig = sk.sign(message);
-
-        let agg_sig =
-            AggregateSignature::aggregate(&[&sig]).expect("aggregation of one sig should succeed");
-
+        let agg_sig = AggregateSignature::aggregate(&[&sig]).expect("aggregation should succeed");
         AggregateSignature::verify_aggregate(message, &agg_sig, &[&pk])
-            .expect("single-sig aggregate verification should succeed");
+            .expect("single-sig verification should succeed");
     }
 }

@@ -13,13 +13,9 @@ fn scalar_from_u64(val: u64) -> blst_scalar {
     s
 }
 
-/// Batch-verify multiple (message, signature, public_key) tuples using
-/// blst's multi-pairing API with random scalars for security.
-///
-/// This is significantly faster than individual verification when there
-/// are many signatures (saves ~50% pairing operations). Each tuple is
-/// weighted by a random 64-bit scalar to prevent rogue-key style attacks
-/// on the batch verification equation.
+/// Batch-verify multiple (message, signature, public_key) tuples.
+/// Uses blst's multi-pairing with random 64-bit scalars for rogue-key attack protection.
+/// Significantly faster than individual verification (~50% savings with many signatures).
 pub fn batch_verify(
     messages: &[&[u8]],
     signatures: &[&BlsSignature],
@@ -38,26 +34,19 @@ pub fn batch_verify(
         return public_keys[0].verify(messages[0], signatures[0]);
     }
 
-    // Generate random 64-bit scalars for each signature.
-    // First scalar is fixed to 1 (optimization: saves one scalar multiplication).
     let mut rands: Vec<blst_scalar> = Vec::with_capacity(messages.len());
-
-    // First scalar = 1
     rands.push(scalar_from_u64(1));
 
-    // Remaining scalars: random 64-bit values
     for _ in 1..messages.len() {
         let mut rand_bytes = [0u8; 8];
         getrandom::fill(&mut rand_bytes).map_err(|_| BlsError::SigningFailed)?;
         let mut val = u64::from_le_bytes(rand_bytes);
-        // Ensure non-zero (extremely unlikely but be safe)
         if val == 0 {
             val = 1;
         }
         rands.push(scalar_from_u64(val));
     }
 
-    // Collect raw blst types for the API call.
     let sigs: Vec<&Signature> = signatures.iter().map(|s| s.inner()).collect();
     let pks: Vec<&blst::min_pk::PublicKey> = public_keys.iter().map(|pk| pk.inner()).collect();
 
@@ -65,11 +54,11 @@ pub fn batch_verify(
         messages,
         DST,
         &pks,
-        false, // pks_validate: false (we trust our own validator set keys)
+        false,
         &sigs,
-        true,  // sigs_groupcheck: true (verify signatures are in the group)
+        true,
         &rands,
-        64,    // rand_bits: 64 bits of randomness per scalar
+        64,
     );
 
     if result != BLST_ERROR::BLST_SUCCESS {
@@ -111,8 +100,6 @@ pub fn batch_verify_with_fallback(
     }
 
     if bad_indices.is_empty() {
-        // Rare case: batch failed but all individual checks pass.
-        // This can happen with certain edge cases. Treat as valid.
         Ok(())
     } else {
         Err(bad_indices)

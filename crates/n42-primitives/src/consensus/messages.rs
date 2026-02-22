@@ -29,26 +29,17 @@ impl QuorumCertificate {
         self.signers.count_ones()
     }
 
-    /// Creates a genesis QC (no signatures, view 0).
-    ///
-    /// Uses a deterministic dummy BLS signature derived from a fixed secret key.
-    /// This signature will never be verified in practice — the genesis QC is a
-    /// special case that consensus code treats as a sentinel value.
+    /// Creates a genesis QC (no signatures, view 0) with a deterministic dummy signature.
+    /// The signature is never verified; the genesis QC is a sentinel value.
     pub fn genesis() -> Self {
         use crate::bls::BlsSecretKey;
 
-        // Deterministic key material so every call produces the same genesis QC.
-        // Use a deterministic key derived from fixed bytes. This is safe because:
-        // 1. The genesis QC is a sentinel value, never verified cryptographically.
-        // 2. If from_bytes fails, we use a zeroed-out signature as fallback.
         let ikm = [1u8; 32];
         let dummy_sig = match BlsSecretKey::from_bytes(&ikm) {
             Ok(sk) => sk.sign(b"genesis"),
             Err(_) => {
-                // Fallback: create signature from fixed bytes (all zeros).
-                // This path should never be reached with valid blst implementation.
                 BlsSignature::from_bytes(&[0u8; 96])
-                    .unwrap_or_else(|_| panic!("failed to create fallback genesis signature"))
+                    .unwrap_or_else(|_| panic!("failed to create genesis signature"))
             }
         };
 
@@ -206,10 +197,8 @@ mod tests {
     use super::*;
     use crate::bls::BlsSecretKey;
 
-    /// Helper: create a dummy BlsSignature by signing an arbitrary message with a random key.
     fn dummy_signature() -> BlsSignature {
-        let sk = BlsSecretKey::random().unwrap();
-        sk.sign(b"dummy")
+        BlsSecretKey::random().unwrap().sign(b"dummy")
     }
 
     #[test]
@@ -265,7 +254,6 @@ mod tests {
         let sig = dummy_signature();
         let genesis_qc = QuorumCertificate::genesis();
 
-        // Build one of each variant
         let variants: Vec<ConsensusMessage> = vec![
             ConsensusMessage::Proposal(Proposal {
                 view: 1,
@@ -322,16 +310,9 @@ mod tests {
             let decoded: ConsensusMessage = bincode::deserialize(&encoded)
                 .unwrap_or_else(|e| panic!("variant {} deserialize failed: {}", i, e));
 
-            // Verify variant type matches by checking discriminant via debug
-            let orig_debug = format!("{:?}", msg);
-            let decoded_debug = format!("{:?}", decoded);
-            let orig_variant = orig_debug.split('(').next().unwrap();
-            let decoded_variant = decoded_debug.split('(').next().unwrap();
-            assert_eq!(
-                orig_variant, decoded_variant,
-                "variant {} type should survive serde roundtrip",
-                i
-            );
+            let orig_variant = format!("{:?}", msg).split('(').next().unwrap().to_string();
+            let decoded_variant = format!("{:?}", decoded).split('(').next().unwrap().to_string();
+            assert_eq!(orig_variant, decoded_variant);
         }
     }
 
@@ -396,34 +377,17 @@ mod tests {
 
     #[test]
     fn test_genesis_qc() {
-        // BlsSignature::from_bytes(&[0u8; 96]) may fail because all-zero bytes
-        // may not represent a valid BLS point (the point at infinity in compressed
-        // form has a specific encoding in BLS12-381). If it panics, this test
-        // will catch it. If it succeeds, we validate the fields.
-        //
-        // We use std::panic::catch_unwind to handle the case where genesis()
-        // panics due to invalid zero-byte signature parsing.
         let result = std::panic::catch_unwind(|| QuorumCertificate::genesis());
-
         match result {
             Ok(qc) => {
-                assert_eq!(qc.view, 0, "genesis QC should have view 0");
-                assert_eq!(qc.block_hash, B256::ZERO, "genesis QC should have zero block_hash");
-                assert_eq!(
-                    qc.signer_count(),
-                    0,
-                    "genesis QC should have no signers"
-                );
-                assert!(qc.signers.is_empty(), "genesis QC signers bitvec should be empty");
+                assert_eq!(qc.view, 0);
+                assert_eq!(qc.block_hash, B256::ZERO);
+                assert_eq!(qc.signer_count(), 0);
+                assert!(qc.signers.is_empty());
             }
             Err(_) => {
-                // genesis() panicked because [0u8; 96] is not a valid BLS signature.
-                // This is a known limitation documented in the genesis() implementation.
-                // The panic message is: "cannot create genesis QC signature placeholder"
                 eprintln!(
-                    "NOTE: QuorumCertificate::genesis() panics because [0u8; 96] is not a \
-                     valid BLS signature. This is a known issue that should be addressed \
-                     (e.g., by using Option<BlsSignature> or a sentinel value)."
+                    "NOTE: QuorumCertificate::genesis() panics if [0u8; 96] is not valid BLS signature"
                 );
             }
         }

@@ -31,13 +31,8 @@ pub struct FullExecutionResult {
 }
 
 /// Executes a block and captures the execution witness.
-///
-/// Uses `execute_with_state_closure` to access the EVM state after execution
-/// (before `take_bundle()` consumes it) to record all accessed state for
-/// witness generation.
-///
-/// The witness contains all state needed for an independent verifier to
-/// re-execute the block without access to the full state trie.
+/// Uses `execute_with_state_closure` to access the state after execution.
+/// Witness contains all state needed for independent re-execution.
 pub fn execute_block_with_witness<DB: Database>(
     evm_config: &N42EvmConfig,
     db: DB,
@@ -66,12 +61,7 @@ pub fn execute_block_with_witness<DB: Database>(
 }
 
 /// Executes a block and captures both witness and state diff.
-///
-/// This is the primary execution method for distribution nodes (IDC),
-/// which need:
-/// 1. The execution output for consensus (receipts, state root)
-/// 2. The witness for mobile device verification
-/// 3. The state diff for light node sync and audit
+/// Primary method for distribution nodes: execution output, witness, and diff.
 pub fn execute_block_full<DB: Database>(
     evm_config: &N42EvmConfig,
     db: DB,
@@ -87,19 +77,14 @@ pub fn execute_block_full<DB: Database>(
         witness = ExecutionWitness::from_state(state);
     })?;
 
-    // Extract state diff from the bundle state in the output
     let diff = StateDiff::from_bundle_state(&output.state);
 
-    // Consistency check: witness accounts should be a superset of diff accounts.
-    // The witness captures all state *accessed* (reads + writes), while the diff only
-    // captures state that *changed* (writes). So witness.accounts >= diff.accounts.
-    // This holds because any changed account must have been accessed during execution.
     if witness.hashed_state.accounts.len() < diff.len() {
         warn!(
             target: "n42::execution",
             witness = witness.hashed_state.accounts.len(),
             diff = diff.len(),
-            "witness accounts fewer than diff accounts — possible inconsistency"
+            "witness accounts < diff accounts"
         );
     }
 

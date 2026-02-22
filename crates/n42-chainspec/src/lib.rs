@@ -39,12 +39,8 @@ pub struct ValidatorInfo {
 
 impl ConsensusConfig {
     /// Load consensus configuration from a TOML or JSON file.
-    ///
-    /// The format is determined by file extension:
-    /// - `.toml` → TOML
-    /// - anything else → JSON
-    ///
-    /// The loaded configuration is validated before returning.
+    /// Format is determined by file extension (`.toml` or else JSON).
+    /// The configuration is validated before returning.
     pub fn from_file(path: &std::path::Path) -> Result<Self, String> {
         let content = std::fs::read_to_string(path)
             .map_err(|e| format!("failed to read config {}: {e}", path.display()))?;
@@ -65,7 +61,6 @@ impl ConsensusConfig {
             slot_time_ms: 8000,
             validator_set_size: 1,
             fault_tolerance: 0,
-            // Single-node: short timeouts are fine since solo commits are instant.
             base_timeout_ms: 4000,
             max_timeout_ms: 8000,
             initial_validators: Vec::new(),
@@ -74,10 +69,8 @@ impl ConsensusConfig {
     }
 
     /// Create a dev/test configuration with `count` deterministic validators.
-    ///
-    /// Keys are generated deterministically: validator `i` gets a 32-byte secret
-    /// key with value `(i+1)` in big-endian at the last 4 bytes. This matches
-    /// the key generation in `scripts/local-testnet.sh`.
+    /// Keys are deterministic: validator `i` uses bytes `[0; 28] + (i+1).to_be_bytes()`.
+    /// This matches `scripts/local-testnet.sh`.
     pub fn dev_multi(count: usize) -> Self {
         let mut validators = Vec::with_capacity(count);
         for i in 0..count {
@@ -97,9 +90,6 @@ impl ConsensusConfig {
             slot_time_ms: 8000,
             validator_set_size: count as u32,
             fault_tolerance: f,
-            // Multi-node: timeout must exceed slot_time + build_time + consensus_round.
-            // Production pipeline: up to 8s slot delay + 700ms build + 2s consensus = ~11s.
-            // 20s base gives comfortable margin; exponential backoff handles failures.
             base_timeout_ms: 20000,
             max_timeout_ms: 60000,
             initial_validators: validators,

@@ -1,14 +1,11 @@
 //! Ordered state read log for deterministic replay.
 //!
-//! `ReadLogDatabase` wraps any revm `Database` and records all first-time reads
-//! (basic, storage, block_hash) into an ordered log. The log entries, when replayed
-//! in the same order on the mobile side via `StreamReplayDB`, reconstruct the exact
-//! same EVM execution without needing address/slot keys.
+//! Records all first-time reads (basic, storage, block_hash) into an ordered log.
+//! Replaying these in the same order on mobile via `StreamReplayDB` reconstructs
+//! the exact same EVM execution without needing address/slot keys.
 //!
-//! This works because: same block + same transactions → revm `Database::basic()`,
-//! `Database::storage()`, `Database::block_hash()` calls happen in a 100% deterministic
-//! order. JournaledState caches first reads, so the log only contains unique first-time
-//! values.
+//! Works because: same block + txs → deterministic `Database::basic()`,
+//! `Database::storage()`, `Database::block_hash()` call order.
 //!
 //! ## Compact encoding format
 //!
@@ -60,10 +57,7 @@ pub enum ReadLogEntry {
 }
 
 /// Wraps a database and captures all first-time reads into an ordered log.
-///
-/// Uses `Arc<Mutex<Vec<ReadLogEntry>>>` because reth's executor moves/consumes
-/// the DB. After execution completes, the Arc allows extracting the log.
-/// Single-threaded execution means no contention on the Mutex.
+/// Uses `Arc<Mutex<Vec<ReadLogEntry>>>` for shared ownership after DB is consumed.
 #[derive(Debug)]
 pub struct ReadLogDatabase<DB> {
     inner: DB,
@@ -195,27 +189,16 @@ pub enum DecodeError {
 /// and ~30000 storage reads. 1M entries provides ample headroom.
 const MAX_ENTRY_COUNT: u32 = 1_000_000;
 
-/// Returns the number of significant bytes needed to represent a u64 value
-/// in big-endian form (0 for zero).
+/// Returns the number of significant bytes in a u64 value (0 for zero).
 #[inline]
 fn significant_bytes_u64(v: u64) -> usize {
-    if v == 0 {
-        return 0;
-    }
-    let bits = 64 - v.leading_zeros() as usize;
-    (bits + 7) / 8
+    if v == 0 { 0 } else { (64 - v.leading_zeros() as usize + 7) / 8 }
 }
 
-/// Returns the number of significant bytes in a 32-byte big-endian value
-/// (0 if all zeros).
+/// Returns the number of significant bytes in a 32-byte big-endian value (0 if all zeros).
 #[inline]
 fn significant_bytes_be32(be: &[u8; 32]) -> usize {
-    for (i, &b) in be.iter().enumerate() {
-        if b != 0 {
-            return 32 - i;
-        }
-    }
-    0
+    be.iter().position(|&b| b != 0).map(|i| 32 - i).unwrap_or(0)
 }
 
 /// Encodes a read log into compact binary format.
@@ -301,7 +284,7 @@ pub fn decode_read_log(data: &[u8]) -> Result<Vec<ReadLogEntry>, DecodeError> {
     let mut entries = Vec::with_capacity(entry_count as usize);
     let mut pos: usize = 4;
 
-    let ensure = |pos: usize, n: usize| -> Result<(), DecodeError> {
+    let ensure = |pos: usize, n: usize| {
         if pos + n > data.len() {
             Err(DecodeError::UnexpectedEof(pos))
         } else {
@@ -430,7 +413,6 @@ mod tests {
         let encoded = encode_read_log(&log);
         let decoded = decode_read_log(&encoded).unwrap();
         assert_eq!(decoded, log);
-        // 4(count) + 1(header=0x01) = 5 bytes — beats logbin's 2B per entry
         assert_eq!(encoded.len(), 5);
     }
 
@@ -1005,12 +987,10 @@ mod tests {
     #[test]
     fn test_read_log_database_code_not_logged() {
         use revm::{database::CacheDB, database_interface::Database};
-        use alloy_primitives::Address;
 
         let cache_db = CacheDB::new(revm::database::EmptyDB::default());
         let mut logged_db = ReadLogDatabase::new(cache_db);
 
-        // code_by_hash should NOT be logged
         let _ = logged_db.code_by_hash(KECCAK256_EMPTY);
 
         let handle = logged_db.log_handle();

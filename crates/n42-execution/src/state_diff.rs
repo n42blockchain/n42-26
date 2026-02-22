@@ -4,12 +4,7 @@ use std::collections::BTreeMap;
 use tracing::debug;
 
 /// State diff for a single block: all account and storage changes.
-///
-/// Extracted from revm's `BundleState` after block execution. This provides
-/// a compact representation of what changed, useful for:
-/// - Light node incremental sync
-/// - Mobile device state updates
-/// - Audit/debugging of state transitions
+/// Extracted from revm's `BundleState` for incremental sync and state updates.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct StateDiff {
     /// Per-account changes in this block.
@@ -97,23 +92,19 @@ impl StateDiff {
         let mut accounts = BTreeMap::new();
 
         for (address, bundle_account) in &bundle.state {
-            // Determine account change type
             let was_destroyed = bundle_account.was_destroyed();
             let original_info = bundle_account.original_info.as_ref();
             let current_info = bundle_account.info.as_ref();
 
-            // Validate: destroyed accounts should not have current info
             debug_assert!(
                 !(was_destroyed && current_info.is_some()),
                 "account {address:?} marked destroyed but still has current info"
             );
 
-            let change_type = if was_destroyed {
-                AccountChangeType::Destroyed
-            } else if original_info.is_none() && current_info.is_some() {
-                AccountChangeType::Created
-            } else {
-                AccountChangeType::Modified
+            let change_type = match (was_destroyed, original_info.is_some(), current_info.is_some()) {
+                (true, _, _) => AccountChangeType::Destroyed,
+                (false, false, true) => AccountChangeType::Created,
+                _ => AccountChangeType::Modified,
             };
 
             // Extract balance change

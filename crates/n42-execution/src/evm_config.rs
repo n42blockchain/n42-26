@@ -13,14 +13,9 @@ use std::sync::Arc;
 /// The inner EthEvmConfig type we delegate to.
 type InnerConfig = EthEvmConfig<ChainSpec>;
 
-/// N42 EVM configuration.
-///
-/// Wraps `EthEvmConfig<ChainSpec>` to provide the standard Ethereum EVM execution
-/// while allowing N42-specific extensions for witness generation and state diff tracking.
-///
-/// All `ConfigureEvm` methods delegate to the inner `EthEvmConfig`. The wrapper gives us
-/// a distinct type that can be extended with additional functionality without breaking
-/// the reth trait system.
+/// N42 EVM configuration wrapping `EthEvmConfig<ChainSpec>`.
+/// All `ConfigureEvm` methods delegate to the inner config.
+/// Provides a distinct type for N42-specific extensions.
 #[derive(Debug, Clone)]
 pub struct N42EvmConfig {
     /// Inner Ethereum EVM configuration.
@@ -144,22 +139,14 @@ mod tests {
     fn test_evm_config_chain_spec() {
         let chain_spec = n42_dev_chainspec();
         let config = N42EvmConfig::new(chain_spec.clone());
-
-        // chain_spec() should return the same Arc
-        assert!(
-            Arc::ptr_eq(config.chain_spec(), &chain_spec),
-            "chain_spec should return the same Arc"
-        );
+        assert!(Arc::ptr_eq(config.chain_spec(), &chain_spec));
     }
 
     #[test]
     fn test_evm_config_inner() {
         let chain_spec = n42_dev_chainspec();
         let config = N42EvmConfig::new(chain_spec);
-
-        // inner() should return a reference to the inner EthEvmConfig
         let _inner = config.inner();
-        // Just verify it doesn't panic and the inner type is accessible
     }
 
     #[test]
@@ -179,11 +166,7 @@ mod tests {
     fn test_evm_config_debug() {
         let chain_spec = n42_dev_chainspec();
         let config = N42EvmConfig::new(chain_spec);
-
         let debug_str = format!("{:?}", config);
-        assert!(
-            !debug_str.is_empty(),
-            "Debug output should not be empty"
-        );
+        assert!(!debug_str.is_empty());
     }
 }

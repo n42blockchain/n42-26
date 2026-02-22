@@ -6,10 +6,7 @@ use std::collections::HashSet;
 use tracing::debug;
 
 /// Witness data captured during block execution.
-///
-/// Contains all state accessed during EVM execution, which is sufficient
-/// for an independent verifier (e.g., a mobile device) to re-execute the block
-/// without access to the full state trie.
+/// Contains all state accessed during EVM execution for independent verification.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ExecutionWitness {
     /// Hashed post-state: all accounts and storage slots accessed/modified.
@@ -45,11 +42,8 @@ impl ExecutionWitness {
         self.codes.iter().map(|c| c.len()).sum()
     }
 
-    /// Compacts the witness by excluding bytecodes that the verifier already has cached.
-    ///
-    /// Mobile devices maintain a local LRU cache of frequently-used contract bytecodes
-    /// (e.g., ERC-20, DEX routers). This method strips those cached codes from the witness
-    /// to reduce the data that needs to be transmitted.
+    /// Compacts the witness by excluding cached bytecodes.
+    /// Removes bytecodes from `cached_code_hashes` to reduce transmission size.
     pub fn compact(&self, cached_code_hashes: &HashSet<B256>) -> CompactWitness {
         let mut uncached_codes = Vec::new();
         let mut seen_cached = HashSet::new();
@@ -85,11 +79,8 @@ impl ExecutionWitness {
     }
 }
 
-/// A compact witness that excludes bytecodes the verifier already has cached.
-///
-/// This is the format sent to mobile devices for verification. It reduces bandwidth
-/// by only including contract bytecodes that the mobile device doesn't have in its
-/// local cache.
+/// A compact witness excluding cached bytecodes.
+/// Sent to mobile devices, includes only uncached bytecodes to reduce bandwidth.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct CompactWitness {
     /// Hashed post-state for trie verification.
@@ -110,7 +101,6 @@ mod tests {
     use alloy_primitives::{keccak256, Bytes, B256};
     use std::collections::HashSet;
 
-    /// Helper: create a simple bytecode for testing.
     fn bytecode(data: &[u8]) -> Bytes {
         Bytes::from(data.to_vec())
     }
@@ -118,12 +108,9 @@ mod tests {
     #[test]
     fn test_execution_witness_default() {
         let witness = ExecutionWitness::default();
-        assert!(witness.codes.is_empty(), "default witness should have no codes");
-        assert!(witness.keys.is_empty(), "default witness should have no keys");
-        assert!(
-            witness.lowest_block_number.is_none(),
-            "default witness should have no lowest_block_number"
-        );
+        assert!(witness.codes.is_empty());
+        assert!(witness.keys.is_empty());
+        assert!(witness.lowest_block_number.is_none());
     }
 
     #[test]
@@ -138,23 +125,15 @@ mod tests {
     fn test_compact_no_cached_codes() {
         let code_a = bytecode(&[0xAA, 0xBB, 0xCC]);
         let code_b = bytecode(&[0xDD, 0xEE]);
-
         let witness = ExecutionWitness {
             hashed_state: HashedPostState::default(),
             codes: vec![code_a.clone(), code_b.clone()],
             keys: vec![bytecode(&[1, 2, 3])],
             lowest_block_number: Some(100),
         };
-
-        // No cached hashes → all codes should be included
         let cached: HashSet<B256> = HashSet::new();
         let compact = witness.compact(&cached);
-
-        assert_eq!(
-            compact.uncached_codes.len(),
-            2,
-            "all codes should be uncached when cache is empty"
-        );
+        assert_eq!(compact.uncached_codes.len(), 2);
         assert_eq!(compact.keys.len(), 1);
         assert_eq!(compact.lowest_block_number, Some(100));
     }
@@ -163,30 +142,18 @@ mod tests {
     fn test_compact_all_cached() {
         let code_a = bytecode(&[0xAA, 0xBB, 0xCC]);
         let code_b = bytecode(&[0xDD, 0xEE]);
-
         let hash_a = keccak256(&code_a);
         let hash_b = keccak256(&code_b);
-
         let witness = ExecutionWitness {
             hashed_state: HashedPostState::default(),
             codes: vec![code_a, code_b],
             keys: vec![],
             lowest_block_number: None,
         };
-
-        // All codes are cached → uncached_codes should be empty
         let cached: HashSet<B256> = HashSet::from([hash_a, hash_b]);
         let compact = witness.compact(&cached);
-
-        assert!(
-            compact.uncached_codes.is_empty(),
-            "all codes are cached, uncached_codes should be empty"
-        );
-        assert_eq!(
-            compact.cached_code_hashes.len(),
-            2,
-            "both code hashes should be referenced"
-        );
+        assert!(compact.uncached_codes.is_empty());
+        assert_eq!(compact.cached_code_hashes.len(), 2);
     }
 
     #[test]
@@ -194,33 +161,19 @@ mod tests {
         let code_a = bytecode(&[0xAA, 0xBB, 0xCC]);
         let code_b = bytecode(&[0xDD, 0xEE]);
         let code_c = bytecode(&[0xFF]);
-
         let hash_a = keccak256(&code_a);
-        // hash_b is NOT cached
         let hash_c = keccak256(&code_c);
-
         let witness = ExecutionWitness {
             hashed_state: HashedPostState::default(),
             codes: vec![code_a, code_b.clone(), code_c],
             keys: vec![],
             lowest_block_number: None,
         };
-
-        // Only code_a and code_c are cached
         let cached: HashSet<B256> = HashSet::from([hash_a, hash_c]);
         let compact = witness.compact(&cached);
-
-        assert_eq!(
-            compact.uncached_codes.len(),
-            1,
-            "only code_b should be uncached"
-        );
+        assert_eq!(compact.uncached_codes.len(), 1);
         assert_eq!(compact.uncached_codes[0], code_b);
-        assert_eq!(
-            compact.cached_code_hashes.len(),
-            2,
-            "code_a and code_c hashes should be referenced"
-        );
+        assert_eq!(compact.cached_code_hashes.len(), 2);
     }
 
     #[test]
@@ -318,26 +271,18 @@ mod tests {
 
     #[test]
     fn test_compact_deduplicates_cached_hashes() {
-        // Same bytecode appearing multiple times should only produce one cached hash entry.
         let code = bytecode(&[0xAA, 0xBB, 0xCC]);
         let hash = keccak256(&code);
-
         let witness = ExecutionWitness {
             hashed_state: HashedPostState::default(),
             codes: vec![code.clone(), code.clone(), code],
             keys: vec![],
             lowest_block_number: None,
         };
-
         let cached: HashSet<B256> = HashSet::from([hash]);
         let compact = witness.compact(&cached);
-
-        assert!(compact.uncached_codes.is_empty(), "all copies are cached");
-        assert_eq!(
-            compact.cached_code_hashes.len(),
-            1,
-            "duplicate cached hashes should be deduplicated"
-        );
+        assert!(compact.uncached_codes.is_empty());
+        assert_eq!(compact.cached_code_hashes.len(), 1);
         assert_eq!(compact.cached_code_hashes[0], hash);
     }
 

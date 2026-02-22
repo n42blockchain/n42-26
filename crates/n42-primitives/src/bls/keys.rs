@@ -200,10 +200,9 @@ mod tests {
     fn test_key_generation() {
         let sk = BlsSecretKey::random().expect("key generation should succeed");
         let pk = sk.public_key();
-        // Public key bytes should be 48 bytes and not all zeros.
         let pk_bytes = pk.to_bytes();
         assert_eq!(pk_bytes.len(), 48);
-        assert!(pk_bytes.iter().any(|&b| b != 0), "public key should not be all zeros");
+        assert!(pk_bytes.iter().any(|&b| b != 0));
     }
 
     #[test]
@@ -211,19 +210,16 @@ mod tests {
         let sk = BlsSecretKey::random().unwrap();
         let pk = sk.public_key();
         let message = b"hello world";
-
         let sig = sk.sign(message);
-        pk.verify(message, &sig).expect("verification should succeed for correct message");
+        pk.verify(message, &sig).expect("verification should succeed");
     }
 
     #[test]
     fn test_verify_wrong_message() {
         let sk = BlsSecretKey::random().unwrap();
         let pk = sk.public_key();
-
         let sig = sk.sign(b"message one");
-        let result = pk.verify(b"message two", &sig);
-        assert!(result.is_err(), "verification should fail for wrong message");
+        assert!(pk.verify(b"message two", &sig).is_err());
     }
 
     #[test]
@@ -232,10 +228,8 @@ mod tests {
         let sk2 = BlsSecretKey::random().unwrap();
         let pk2 = sk2.public_key();
         let message = b"test message";
-
         let sig = sk1.sign(message);
-        let result = pk2.verify(message, &sig);
-        assert!(result.is_err(), "verification should fail with wrong public key");
+        assert!(pk2.verify(message, &sig).is_err());
     }
 
     #[test]
@@ -322,42 +316,18 @@ mod tests {
 
     #[test]
     fn test_from_bytes_invalid_rejects() {
-        // Invalid public key bytes (all 0xFF is not a valid BLS12-381 point)
-        let bad_pk = [0xFF; 48];
-        let result = BlsPublicKey::from_bytes(&bad_pk);
-        assert!(result.is_err(), "garbage public key bytes should be rejected");
-
-        // Invalid signature bytes
-        let bad_sig = [0xFF; 96];
-        let result = BlsSignature::from_bytes(&bad_sig);
-        assert!(result.is_err(), "garbage signature bytes should be rejected");
-
-        // Invalid secret key bytes (all 0xFF exceeds the BLS12-381 curve order)
-        let bad_sk = [0xFF; 32];
-        let result = BlsSecretKey::from_bytes(&bad_sk);
-        assert!(result.is_err(), "out-of-range secret key bytes should be rejected");
+        assert!(BlsPublicKey::from_bytes(&[0xFF; 48]).is_err());
+        assert!(BlsSignature::from_bytes(&[0xFF; 96]).is_err());
+        assert!(BlsSecretKey::from_bytes(&[0xFF; 32]).is_err());
     }
 
     #[test]
     fn test_secret_key_debug_hides_secret() {
         let sk = BlsSecretKey::random().unwrap();
         let debug_str = format!("{:?}", sk);
-
-        // Debug should show the public key, not the raw secret key material
-        assert!(
-            debug_str.contains("BlsSecretKey"),
-            "Debug should mention BlsSecretKey"
-        );
-        assert!(
-            debug_str.contains("public_key"),
-            "Debug should show the public key field"
-        );
-        // The 32-byte raw secret key is never exposed in any debug output.
-        // We verify indirectly: debug output should be short (no raw 32-byte hex dump).
-        assert!(
-            debug_str.len() < 200,
-            "Debug output should be concise, not dump raw key material"
-        );
+        assert!(debug_str.contains("BlsSecretKey"));
+        assert!(debug_str.contains("public_key"));
+        assert!(debug_str.len() < 200, "debug output should be concise");
     }
 
     #[test]
