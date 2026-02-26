@@ -30,19 +30,19 @@ fn env_bool(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn env_u64(name: &str) -> Option<u64> {
+fn env_parse<T: std::str::FromStr>(name: &str) -> Option<T> {
     std::env::var(name).ok().and_then(|s| s.parse().ok())
 }
 
-fn env_u16(name: &str) -> Option<u16> {
-    std::env::var(name).ok().and_then(|s| s.parse().ok())
+fn override_timeout_from_env(name: &str, target: &mut u64) {
+    if let Some(ms) = env_parse::<u64>(name) {
+        info!(target: "n42::cli", env = name, value = ms, "overriding timeout from env");
+        *target = ms;
+    } else if std::env::var(name).is_ok() {
+        warn!(target: "n42::cli", env = name, "env var is not a valid u64, ignoring");
+    }
 }
 
-fn env_usize(name: &str) -> Option<usize> {
-    std::env::var(name).ok().and_then(|s| s.parse().ok())
-}
-
-/// Derives a deterministic Ed25519 keypair from a validator index.
 fn derive_ed25519_keypair(index: u32) -> libp2p::identity::Keypair {
     let seed = alloy_primitives::keccak256(format!("n42-p2p-key-{}", index).as_bytes());
     let mut seed_bytes: [u8; 32] = seed.0;
@@ -70,7 +70,6 @@ fn main() {
     if let Err(err) = Cli::<EthereumChainSpecParser>::parse().run(async move |builder, _| {
         info!(target: "n42::cli", "Launching N42 node");
 
-        // Load consensus configuration.
         // Priority: N42_CONSENSUS_CONFIG file > N42_VALIDATOR_COUNT dev mode.
         let mut consensus_config = match std::env::var("N42_CONSENSUS_CONFIG") {
             Ok(path) => {
@@ -79,7 +78,7 @@ fn main() {
                     .unwrap_or_else(|e| panic!("Failed to load consensus config: {e}"))
             }
             Err(_) => {
-                let num_validators = env_usize("N42_VALIDATOR_COUNT").unwrap_or(1);
+                let num_validators = env_parse("N42_VALIDATOR_COUNT").unwrap_or(1);
                 if num_validators > 1 {
                     info!(target: "n42::cli", count = num_validators, "multi-validator dev mode");
                     ConsensusConfig::dev_multi(num_validators)
@@ -90,21 +89,9 @@ fn main() {
             }
         };
 
-        // Override pacemaker timeouts from environment if set.
-        if let Some(ms) = env_u64("N42_BASE_TIMEOUT_MS") {
-            info!(target: "n42::cli", base_timeout_ms = ms, "overriding base timeout from env");
-            consensus_config.base_timeout_ms = ms;
-        } else if std::env::var("N42_BASE_TIMEOUT_MS").is_ok() {
-            warn!(target: "n42::cli", "N42_BASE_TIMEOUT_MS is not a valid u64, ignoring");
-        }
-        if let Some(ms) = env_u64("N42_MAX_TIMEOUT_MS") {
-            info!(target: "n42::cli", max_timeout_ms = ms, "overriding max timeout from env");
-            consensus_config.max_timeout_ms = ms;
-        } else if std::env::var("N42_MAX_TIMEOUT_MS").is_ok() {
-            warn!(target: "n42::cli", "N42_MAX_TIMEOUT_MS is not a valid u64, ignoring");
-        }
+        override_timeout_from_env("N42_BASE_TIMEOUT_MS", &mut consensus_config.base_timeout_ms);
+        override_timeout_from_env("N42_MAX_TIMEOUT_MS", &mut consensus_config.max_timeout_ms);
 
-        // Load or generate validator identity.
         // Priority: N42_KEYSTORE_PATH (encrypted) > N42_VALIDATOR_KEY (plaintext) > random (dev).
         let secret_key = if let Ok(ks_path) = std::env::var("N42_KEYSTORE_PATH") {
             let password = std::env::var("N42_KEYSTORE_PASSWORD")
@@ -125,7 +112,6 @@ fn main() {
             BlsSecretKey::random().expect("Failed to generate random BLS key")
         };
 
-        // Build validator set.
         let validator_set = if consensus_config.initial_validators.is_empty() {
             ValidatorSet::new(
                 &[n42_chainspec::ValidatorInfo {
@@ -218,7 +204,6 @@ fn main() {
                     "starting N42 consensus subsystem"
                 );
 
-                // Build libp2p swarm and start NetworkService.
                 let keypair = derive_ed25519_keypair(my_index);
                 let local_peer_id = keypair.public().to_peer_id();
                 info!(target: "n42::cli", %local_peer_id, "P2P identity (deterministic)");
@@ -241,7 +226,7 @@ fn main() {
                 let (mut net_service, net_handle, net_event_rx) =
                     NetworkService::new(swarm).expect("Failed to create NetworkService");
 
-                let consensus_port = env_u16("N42_CONSENSUS_PORT").unwrap_or(9400);
+                let consensus_port: u16 = env_parse("N42_CONSENSUS_PORT").unwrap_or(9400);
                 let listen_addr: libp2p::Multiaddr =
                     format!("/ip4/0.0.0.0/udp/{}/quic-v1", consensus_port).parse().unwrap();
 
@@ -256,17 +241,13 @@ fn main() {
                     Box::pin(net_service.run()),
                 );
 
-                // Dial trusted peers from N42_TRUSTED_PEERS (comma-separated multiaddrs).
                 let trusted_peers_str = std::env::var("N42_TRUSTED_PEERS").unwrap_or_default();
                 for peer_addr_str in trusted_peers_str.split(',').map(str::trim).filter(|s| !s.is_empty()) {
                     match peer_addr_str.parse::<libp2p::Multiaddr>() {
                         Ok(addr) => {
-                            let maybe_peer_id = addr.iter().find_map(|proto| {
-                                if let libp2p::multiaddr::Protocol::P2p(peer_id) = proto {
-                                    Some(peer_id)
-                                } else {
-                                    None
-                                }
+                            let maybe_peer_id = addr.iter().find_map(|proto| match proto {
+                                libp2p::multiaddr::Protocol::P2p(peer_id) => Some(peer_id),
+                                _ => None,
                             });
 
                             if let Err(e) = net_handle.dial(addr.clone()) {
@@ -326,9 +307,8 @@ fn main() {
                     .unwrap_or_else(|_| "./n42-data".to_string())
                     .into();
 
-                // Start mobile verification StarHub (sharded for 50K+ connections).
-                let starhub_port = env_u16("N42_STARHUB_PORT").unwrap_or(9443);
-                let shard_count = env_usize("N42_STARHUB_SHARDS").unwrap_or(1);
+                let starhub_port = env_parse("N42_STARHUB_PORT").unwrap_or(9443);
+                let shard_count = env_parse("N42_STARHUB_SHARDS").unwrap_or(1);
 
                 let (sharded_hub, star_hub_handle, hub_event_rx) =
                     ShardedStarHub::new(ShardedStarHubConfig {
@@ -356,15 +336,10 @@ fn main() {
                     }),
                 );
 
-                // Create MobileRewardManager for EIP-4895 withdrawal-based rewards.
-                // Uses logarithmic curve: 5 min ≈ 50% reward, 24h = 100%.
-                let reward_epoch_blocks = env_u64("N42_REWARD_EPOCH_BLOCKS").unwrap_or(21600); // 24h at 4s
-                let daily_base_reward_gwei = env_u64("N42_DAILY_BASE_REWARD_GWEI").unwrap_or(100_000_000); // 0.1 N42
-                let reward_curve_k: f64 = std::env::var("N42_REWARD_CURVE_K")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(4.0);
-                let max_rewards_per_block = env_usize("N42_MAX_REWARDS_PER_BLOCK").unwrap_or(32);
+                let reward_epoch_blocks = env_parse("N42_REWARD_EPOCH_BLOCKS").unwrap_or(21600); // 24h at 4s
+                let daily_base_reward_gwei = env_parse("N42_DAILY_BASE_REWARD_GWEI").unwrap_or(100_000_000); // 0.1 N42
+                let reward_curve_k: f64 = env_parse("N42_REWARD_CURVE_K").unwrap_or(4.0);
+                let max_rewards_per_block = env_parse("N42_MAX_REWARDS_PER_BLOCK").unwrap_or(32);
 
                 let reward_manager = Arc::new(Mutex::new(MobileRewardManager::new(
                     reward_epoch_blocks,
@@ -382,7 +357,6 @@ fn main() {
                     "mobile reward manager configured (logarithmic curve)"
                 );
 
-                // Start MobileVerificationBridge (receipt aggregation).
                 let (attest_tx, mut attest_rx) = mpsc::channel(256);
                 let (phone_connected_tx, phone_connected_rx) = mpsc::channel(128);
                 let (reward_attest_tx, mut reward_attest_rx) = mpsc::unbounded_channel();
@@ -394,7 +368,6 @@ fn main() {
 
                 task_executor.spawn_critical_task("n42-mobile-bridge", Box::pin(mobile_bridge.run()));
 
-                // Reward attestation tracking task: forwards pubkey hex from bridge to reward manager.
                 let reward_mgr_tracker = reward_manager.clone();
                 task_executor.spawn_critical_task(
                     "n42-reward-tracker",
@@ -407,7 +380,6 @@ fn main() {
                     }),
                 );
 
-                // Log attestation events and record them in shared state.
                 let attestation_state = consensus_state.clone();
                 task_executor.spawn_critical_task(
                     "n42-attestation-logger",
@@ -429,7 +401,6 @@ fn main() {
                     }),
                 );
 
-                // Start mobile packet generation loop (V2 stream format).
                 let (mobile_packet_tx, mobile_packet_rx) = mpsc::channel(128);
                 task_executor.spawn_critical_task(
                     "n42-mobile-packet",
@@ -443,7 +414,6 @@ fn main() {
                 );
                 info!(target: "n42::cli", "Mobile packet generation loop started");
 
-                // Create ConsensusEngine with optional state recovery.
                 let state_file = data_dir.join("consensus_state.json");
 
                 let make_epoch_manager = || -> EpochManager {
@@ -507,7 +477,6 @@ fn main() {
                     )
                 };
 
-                // Start TxPoolBridge for P2P mempool sync.
                 let (tx_import_tx, tx_import_rx) = mpsc::channel::<Vec<u8>>(4096);
                 let (tx_broadcast_tx, tx_broadcast_rx) = mpsc::channel::<Vec<u8>>(4096);
 
@@ -520,7 +489,6 @@ fn main() {
                 );
                 info!(target: "n42::cli", "TxPoolBridge started for P2P mempool sync");
 
-                // Start ConsensusOrchestrator with Engine API bridge.
                 let orchestrator = ConsensusOrchestrator::with_engine_api(
                     consensus_engine,
                     net_handle,

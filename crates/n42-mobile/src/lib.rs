@@ -19,10 +19,7 @@ pub use verifier::{
     verify_block, verify_block_stream,
 };
 
-/// Derives an ETH address from a 48-byte BLS public key.
-///
-/// Uses `keccak256(pubkey_bytes)[12..]` for deterministic derivation,
-/// consistent with the testnet mapping convention.
+/// Derives an ETH address via `keccak256(pubkey_bytes)[12..]`.
 pub fn bls_pubkey_to_address(pubkey: &[u8; 48]) -> alloy_primitives::Address {
     let hash = alloy_primitives::keccak256(pubkey);
     alloy_primitives::Address::from_slice(&hash[12..])

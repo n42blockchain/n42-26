@@ -16,13 +16,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 impl ConsensusOrchestrator {
-    /// Triggers payload building by calling fork_choice_updated with PayloadAttributes.
-    ///
-    /// When `slot_timestamp` is provided, it is used as the block's timestamp
-    /// for wall-clock-aligned slot timing. Otherwise uses the current system time.
-    ///
-    /// A spawned task resolves the payload, inserts it via new_payload, and sends
-    /// the block hash through `block_ready_rx` to feed the consensus engine.
+    /// Triggers payload building via fork_choice_updated, then spawns a task to resolve it.
     pub(super) async fn do_trigger_payload_build(&self, slot_timestamp: Option<u64>) {
         let beacon_engine = match &self.beacon_engine {
             Some(e) => e,
@@ -46,7 +40,6 @@ impl ConsensusOrchestrator {
                 .as_secs()
         });
 
-        // Inject mobile verification rewards as EIP-4895 withdrawals.
         let mut withdrawals = vec![];
         if let Some(ref reward_mgr) = self.mobile_reward_manager {
             if let Ok(mut mgr) = reward_mgr.lock() {
@@ -152,11 +145,7 @@ impl ConsensusOrchestrator {
         });
     }
 
-    /// Handles incoming block data from the leader via /n42/blocks/1 topic.
-    ///
-    /// Supports two arrival orders:
-    ///   1. ExecuteBlock(hash) arrives first — data cached, imported on arrival.
-    ///   2. BlockData arrives first — cached in pending_block_data, imported when ExecuteBlock arrives.
+    /// Handles incoming block data from the leader, caching and pre-importing.
     pub(super) async fn handle_block_data(&mut self, data: Vec<u8>) {
         debug!(bytes = data.len(), "handle_block_data called");
         let broadcast: BlockDataBroadcast = match bincode::deserialize(&data) {
@@ -170,7 +159,6 @@ impl ConsensusOrchestrator {
         let hash = broadcast.block_hash;
         self.pending_executions.remove(&hash);
 
-        // Bound cache to 16 entries; evict oldest on overflow.
         if self.pending_block_data.len() >= 16 {
             if let Some(old_key) = self.pending_block_data.keys().next().copied() {
                 self.pending_block_data.remove(&old_key);
@@ -178,16 +166,11 @@ impl ConsensusOrchestrator {
         }
         self.pending_block_data.insert(hash, data);
 
-        // Speculative pre-import: call new_payload immediately so the block is in reth's
-        // database when the Proposal arrives. This eliminates new_payload latency from
-        // the critical voting path.
+        // Pre-import so the block is in reth when the Proposal arrives.
         debug!(%hash, "speculative pre-import");
         self.import_and_notify(broadcast).await;
     }
 
-    /// Handles incoming blob sidecar data from the leader via /n42/blobs/1 topic.
-    ///
-    /// Inserts each sidecar into the local DiskFileBlobStore for EIP-4844 compatibility.
     pub(super) fn handle_blob_sidecar(&self, data: Vec<u8>) {
         let blob_store = match &self.blob_store {
             Some(bs) => bs,
@@ -225,8 +208,7 @@ impl ConsensusOrchestrator {
         );
     }
 
-    /// Imports a block into reth via new_payload, advances the chain head, and notifies
-    /// the consensus engine. On Syncing status, queues the block for retry.
+    /// Imports a block via new_payload; queues for retry on Syncing status.
     pub(super) async fn import_and_notify(&mut self, broadcast: BlockDataBroadcast) {
         let engine_handle = match self.beacon_engine {
             Some(ref h) => h.clone(),
@@ -267,7 +249,6 @@ impl ConsensusOrchestrator {
         engine_handle: &ConsensusEngineHandle<EthEngineTypes>,
         status: &alloy_rpc_types_engine::PayloadStatus,
     ) {
-        // Cross-check engine's validated hash to detect substitution attacks.
         if let Some(ref valid_hash) = status.latest_valid_hash {
             if *valid_hash != broadcast.block_hash {
                 warn!(
@@ -438,8 +419,7 @@ async fn handle_built_payload(
 
                 broadcast_block_data(&network, &leader_payload_tx, hash, current_view, &payload_json);
 
-                // Send BlockReady after broadcasting block data — followers get a head start
-                // on pre-import before the Proposal arrives via the consensus channel.
+                // BlockReady after broadcast: followers pre-import before Proposal arrives.
                 let _ = block_ready_tx.send(hash);
 
                 broadcast_blob_sidecars(&network, &payload, hash, current_view, blob_store);

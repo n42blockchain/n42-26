@@ -7,6 +7,14 @@ use tracing::{debug, info};
 
 use crate::receipt::VerificationReceipt;
 
+/// Max decompressed size for zstd payloads (16 MB).
+const ZSTD_MAX_SIZE: usize = 16 * 1024 * 1024;
+
+fn zstd_decompress(payload: &[u8]) -> eyre::Result<Vec<u8>> {
+    zstd::bulk::decompress(payload, ZSTD_MAX_SIZE)
+        .map_err(|e| eyre::eyre!("zstd decompress failed: {e}"))
+}
+
 /// Message received from a StarHub QUIC stream.
 pub enum ReceivedMessage {
     /// A VerificationPacket (decompressed if zstd).
@@ -26,7 +34,6 @@ pub struct QuicMobileClient {
 }
 
 impl QuicMobileClient {
-    /// Connects to a StarHub server and performs the BLS pubkey handshake.
     pub async fn connect(addr: SocketAddr, bls_key: BlsSecretKey) -> eyre::Result<Self> {
         let pubkey = bls_key.public_key().to_bytes();
 
@@ -78,9 +85,6 @@ impl QuicMobileClient {
     }
 
     /// Receives the next message (Packet or CacheSync) from the QUIC connection.
-    ///
-    /// Returns a `ReceivedMessage` enum. The caller is responsible for handling
-    /// both Packet and CacheSync messages.
     pub async fn receive_message(&self, timeout: Duration) -> eyre::Result<ReceivedMessage> {
         let mut recv = tokio::time::timeout(timeout, self.conn.accept_uni())
             .await
@@ -97,25 +101,15 @@ impl QuicMobileClient {
 
         match msg_type {
             0x01 => Ok(ReceivedMessage::Packet(payload.to_vec())),
-            0x03 => {
-                let decompressed = zstd::bulk::decompress(payload, 16 * 1024 * 1024)
-                    .map_err(|e| eyre::eyre!("zstd decompress failed: {e}"))?;
-                Ok(ReceivedMessage::Packet(decompressed))
-            }
+            0x03 => Ok(ReceivedMessage::Packet(zstd_decompress(payload)?)),
             0x02 => Ok(ReceivedMessage::CacheSync(payload.to_vec())),
-            0x04 => {
-                let decompressed = zstd::bulk::decompress(payload, 16 * 1024 * 1024)
-                    .map_err(|e| eyre::eyre!("zstd cache sync decompress failed: {e}"))?;
-                Ok(ReceivedMessage::CacheSync(decompressed))
-            }
+            0x04 => Ok(ReceivedMessage::CacheSync(zstd_decompress(payload)?)),
             other => Err(eyre::eyre!("unknown message type: 0x{:02x}", other)),
         }
     }
 
     /// Receives a single VerificationPacket, skipping CacheSync messages.
-    ///
-    /// The `timeout` applies as an overall deadline: if no VerificationPacket arrives
-    /// within `timeout` (even if CacheSync messages keep arriving), this returns an error.
+    /// The `timeout` applies as an overall deadline across all interim CacheSync messages.
     pub async fn receive_packet(&self, timeout: Duration) -> eyre::Result<Vec<u8>> {
         let deadline = tokio::time::Instant::now() + timeout;
 
@@ -135,7 +129,6 @@ impl QuicMobileClient {
         }
     }
 
-    /// Sends a signed VerificationReceipt back to the node via QUIC.
     pub async fn send_receipt(&self, receipt: &VerificationReceipt) -> eyre::Result<()> {
         let data = bincode::serialize(receipt)
             .map_err(|e| eyre::eyre!("receipt serialization failed: {e}"))?;
@@ -147,29 +140,24 @@ impl QuicMobileClient {
         Ok(())
     }
 
-    /// Returns the BLS secret key.
     pub fn bls_key(&self) -> &BlsSecretKey {
         &self.bls_key
     }
 
-    /// Returns the 48-byte BLS public key.
     pub fn pubkey(&self) -> &[u8; 48] {
         &self.pubkey
     }
 
-    /// Returns true if the QUIC connection is closed.
     pub fn is_closed(&self) -> bool {
         self.conn.close_reason().is_some()
     }
 
-    /// Closes the QUIC connection gracefully.
     pub fn close(&self) {
         self.conn.close(0u32.into(), b"client shutdown");
     }
 }
 
-/// Custom certificate verifier that accepts any self-signed certificate.
-/// StarHub uses rcgen-generated self-signed certs.
+/// Accepts any certificate (StarHub uses self-signed certs).
 #[derive(Debug)]
 struct SkipServerVerification;
 

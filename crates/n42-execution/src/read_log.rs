@@ -39,20 +39,17 @@ use revm::{
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-/// A single entry in the ordered state read log.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReadLogEntry {
-    /// Account does not exist at the queried address.
     AccountNotFound,
-    /// Account exists with the given state.
     Account {
         nonce: u64,
         balance: U256,
         code_hash: B256,
     },
-    /// Storage value at a slot (key is implicit from call order).
+    /// Key is implicit from call order.
     Storage(U256),
-    /// Block hash for a block number (number is implicit from call order).
+    /// Number is implicit from call order.
     BlockHash(B256),
 }
 
@@ -66,7 +63,6 @@ pub struct ReadLogDatabase<DB> {
 }
 
 impl<DB> ReadLogDatabase<DB> {
-    /// Creates a new read-log wrapper around the given database.
     pub fn new(inner: DB) -> Self {
         Self {
             inner,
@@ -76,15 +72,23 @@ impl<DB> ReadLogDatabase<DB> {
     }
 
     /// Returns a clone of the Arc holding the read log.
-    ///
     /// Call this before passing the DB to the executor (which consumes self).
     pub fn log_handle(&self) -> Arc<Mutex<Vec<ReadLogEntry>>> {
         Arc::clone(&self.log)
     }
 
-    /// Returns a clone of the Arc holding captured bytecodes.
     pub fn codes_handle(&self) -> Arc<Mutex<HashMap<B256, Bytes>>> {
         Arc::clone(&self.captured_codes)
+    }
+
+    /// Captures non-empty bytecode into the shared code map (idempotent).
+    fn capture_bytecode(&self, code_hash: B256, bytecode: &Bytecode) {
+        if code_hash != alloy_primitives::KECCAK256_EMPTY {
+            let mut codes = self.captured_codes.lock().unwrap();
+            codes
+                .entry(code_hash)
+                .or_insert_with(|| Bytes::copy_from_slice(bytecode.original_byte_slice()));
+        }
     }
 }
 
@@ -98,18 +102,10 @@ where
         let result = self.inner.basic(address)?;
         let mut log = self.log.lock().unwrap();
         match &result {
-            None => {
-                log.push(ReadLogEntry::AccountNotFound);
-            }
+            None => log.push(ReadLogEntry::AccountNotFound),
             Some(info) => {
-                // Capture bytecode if present (for the bytecodes section).
                 if let Some(ref code) = info.code {
-                    if info.code_hash != alloy_primitives::KECCAK256_EMPTY {
-                        let mut codes = self.captured_codes.lock().unwrap();
-                        codes.entry(info.code_hash).or_insert_with(|| {
-                            Bytes::copy_from_slice(code.original_byte_slice())
-                        });
-                    }
+                    self.capture_bytecode(info.code_hash, code);
                 }
                 log.push(ReadLogEntry::Account {
                     nonce: info.nonce,
@@ -123,14 +119,7 @@ where
 
     fn code_by_hash(&mut self, code_hash: B256) -> Result<Bytecode, Self::Error> {
         let bytecode = self.inner.code_by_hash(code_hash)?;
-        // Capture bytecode for mobile stream transmission (skip empty code hash).
-        // Not written to the read log — bytecodes travel via a separate channel.
-        if code_hash != alloy_primitives::KECCAK256_EMPTY {
-            let mut codes = self.captured_codes.lock().unwrap();
-            codes.entry(code_hash).or_insert_with(|| {
-                Bytes::copy_from_slice(bytecode.original_byte_slice())
-            });
-        }
+        self.capture_bytecode(code_hash, &bytecode);
         Ok(bytecode)
     }
 
@@ -155,17 +144,12 @@ where
 
 // ─── Compact binary encoding/decoding ───────────────────────────────────────
 
-/// Header byte ranges for the compact encoding.
-///
-/// `0x00`       = AccountNotFound
-/// `0x01..0x7F` = Account exists (flags packed in the byte)
-/// `0x80..0xA0` = Storage, value byte count = header − 0x80
-/// `0xC0`       = BlockHash (32-byte hash follows)
+// Header byte ranges (see module-level doc for full encoding spec).
 pub const HEADER_ACCOUNT_NOT_FOUND: u8 = 0x00;
 pub const HEADER_STORAGE_BASE: u8 = 0x80;
 pub const HEADER_BLOCK_HASH: u8 = 0xC0;
 
-/// Bit masks within an Account header byte (0x01..0x7F).
+// Bit masks within an Account header byte (0x01..0x7F).
 pub const ACCT_EXISTS_BIT: u8 = 0x01;
 pub const ACCT_NONCE_LEN_SHIFT: u8 = 1;
 pub const ACCT_NONCE_LEN_MASK: u8 = 0x0E; // bits 1-3
@@ -173,7 +157,6 @@ pub const ACCT_BALANCE_BIT: u8 = 0x10;     // bit 4
 pub const ACCT_CODE_HASH_BIT: u8 = 0x20;   // bit 5
 pub const ACCT_NONCE_8B_BIT: u8 = 0x40;    // bit 6
 
-/// Errors during read log decoding.
 #[derive(Debug, thiserror::Error)]
 pub enum DecodeError {
     #[error("unexpected end of data at offset {0}")]
@@ -185,34 +168,25 @@ pub enum DecodeError {
     #[error("invalid field length {len} at offset {offset} (max {max})")]
     InvalidFieldLen { len: usize, max: usize, offset: usize },
 
-    #[error("entry count mismatch: expected {expected}, decoded {decoded}")]
-    CountMismatch { expected: u32, decoded: u32 },
-
     #[error("entry count {0} exceeds maximum {1}")]
     EntryCountOverflow(u32, u32),
 }
 
-/// Maximum allowed entry count to prevent OOM from corrupted data.
-/// A single Ethereum block with 30M gas can have at most ~1500 unique account reads
-/// and ~30000 storage reads. 1M entries provides ample headroom.
+/// Max entry count to prevent OOM from corrupted data (ample headroom for 30M gas blocks).
 const MAX_ENTRY_COUNT: u32 = 1_000_000;
 
-/// Returns the number of significant bytes in a u64 value (0 for zero).
 #[inline]
 fn significant_bytes_u64(v: u64) -> usize {
     if v == 0 { 0 } else { (64 - v.leading_zeros() as usize + 7) / 8 }
 }
 
-/// Returns the number of significant bytes in a 32-byte big-endian value (0 if all zeros).
 #[inline]
 fn significant_bytes_be32(be: &[u8; 32]) -> usize {
     be.iter().position(|&b| b != 0).map(|i| 32 - i).unwrap_or(0)
 }
 
 /// Encodes a read log into compact binary format.
-///
-/// Format: `entry_count(4B LE) + entries` where each entry is a self-describing
-/// compact byte sequence (see module-level doc for the header byte layout).
+/// Format: `entry_count(4B LE) + entries` (see module-level doc for layout).
 pub fn encode_read_log(log: &[ReadLogEntry]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(4 + log.len() * 16);
     buf.extend_from_slice(&(log.len() as u32).to_le_bytes());
@@ -241,14 +215,12 @@ pub fn encode_read_log(log: &[ReadLogEntry]) -> Vec<u8> {
                 }
                 buf.push(header);
 
-                // Nonce: big-endian, leading zeros stripped
                 if nonce_len > 0 {
                     let actual_len = if header & ACCT_NONCE_8B_BIT != 0 { 8 } else { nonce_len };
                     let nonce_be = nonce.to_be_bytes();
                     buf.extend_from_slice(&nonce_be[8 - actual_len..]);
                 }
 
-                // Balance: length-prefixed, big-endian, leading zeros stripped
                 if has_balance {
                     let balance_be = balance.to_be_bytes::<32>();
                     let balance_len = significant_bytes_be32(&balance_be);
@@ -256,7 +228,6 @@ pub fn encode_read_log(log: &[ReadLogEntry]) -> Vec<u8> {
                     buf.extend_from_slice(&balance_be[32 - balance_len..]);
                 }
 
-                // Code hash (32B, only for contracts)
                 if is_contract {
                     buf.extend_from_slice(code_hash.as_slice());
                 }
@@ -308,7 +279,6 @@ pub fn decode_read_log(data: &[u8]) -> Result<Vec<ReadLogEntry>, DecodeError> {
         if header == HEADER_ACCOUNT_NOT_FOUND {
             entries.push(ReadLogEntry::AccountNotFound);
         } else if header < HEADER_STORAGE_BASE {
-            // Account exists (0x01..0x7F)
             let nonce_len = if header & ACCT_NONCE_8B_BIT != 0 {
                 8
             } else {
@@ -354,7 +324,6 @@ pub fn decode_read_log(data: &[u8]) -> Result<Vec<ReadLogEntry>, DecodeError> {
 
             entries.push(ReadLogEntry::Account { nonce, balance, code_hash });
         } else if header <= HEADER_STORAGE_BASE + 32 {
-            // Storage (0x80..0xA0)
             let value_len = (header - HEADER_STORAGE_BASE) as usize;
             let value = if value_len > 0 {
                 ensure(pos, value_len)?;
@@ -367,7 +336,6 @@ pub fn decode_read_log(data: &[u8]) -> Result<Vec<ReadLogEntry>, DecodeError> {
             };
             entries.push(ReadLogEntry::Storage(value));
         } else if header == HEADER_BLOCK_HASH {
-            // BlockHash (0xC0)
             ensure(pos, 32)?;
             let h = B256::from_slice(&data[pos..pos + 32]);
             pos += 32;
@@ -375,13 +343,6 @@ pub fn decode_read_log(data: &[u8]) -> Result<Vec<ReadLogEntry>, DecodeError> {
         } else {
             return Err(DecodeError::InvalidTag(header, pos - 1));
         }
-    }
-
-    if entries.len() != entry_count as usize {
-        return Err(DecodeError::CountMismatch {
-            expected: entry_count,
-            decoded: entries.len() as u32,
-        });
     }
 
     Ok(entries)

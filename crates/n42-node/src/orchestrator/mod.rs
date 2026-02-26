@@ -21,34 +21,24 @@ use tokio::time::Instant;
 use metrics::{counter, gauge};
 use tracing::{error, info, warn};
 
-/// Block data broadcast message sent via /n42/blocks/1 GossipSub topic.
-///
-/// The leader broadcasts this alongside the Proposal so followers can import
-/// the block before voting, eliminating new_payload latency from the critical path.
+/// Block data broadcast via /n42/blocks/1 GossipSub topic.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct BlockDataBroadcast {
     block_hash: B256,
     view: u64,
-    /// JSON-serialized execution payload (reth Engine API format).
-    /// JSON is used because some reth types use `#[serde(untagged)]` which bincode
-    /// does not handle reliably.
+    /// JSON-serialized execution payload (bincode can't handle reth's `#[serde(untagged)]`).
     payload_json: Vec<u8>,
 }
 
 /// Blob sidecar broadcast via /n42/blobs/1 GossipSub topic.
-///
-/// Leaders broadcast blob sidecars so followers can populate their local
-/// DiskFileBlobStore for EIP-4844 compatibility.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct BlobSidecarBroadcast {
     block_hash: B256,
     view: u64,
-    /// (tx_hash, RLP-encoded BlobTransactionSidecarVariant) pairs.
     sidecars: Vec<(B256, Vec<u8>)>,
 }
 
-/// Deferred finalization for blocks committed by consensus but not yet imported into reth.
-/// Handles the f=0 race condition where Decide arrives before BlockData.
+/// Deferred finalization: Decide arrived before BlockData (f=0 race).
 struct PendingFinalization {
     view: u64,
     block_hash: B256,
@@ -56,7 +46,6 @@ struct PendingFinalization {
     commit_qc: QuorumCertificate,
 }
 
-/// A committed block stored in the ring buffer for serving sync requests.
 struct CommittedBlock {
     view: u64,
     block_hash: B256,
@@ -66,13 +55,8 @@ struct CommittedBlock {
 
 /// Bridges the consensus engine with the P2P network layer and reth Engine API.
 ///
-/// Runs as a background task (`spawn_critical`) and drives four concurrent event sources
-/// via `tokio::select!`:
-///
-/// 1. **Network events** — translated to `ConsensusEvent::Message` and fed to the engine
-/// 2. **Engine outputs** — dispatched to network or Engine API
-/// 3. **Pacemaker timeout** — triggers `engine.on_timeout()` for view change
-/// 4. **BlockReady channel** — payload built by PayloadBuilder, fed to consensus engine
+/// Runs as a background task via `tokio::select!` over network events, engine outputs,
+/// pacemaker timeouts, and BlockReady signals.
 pub struct ConsensusOrchestrator {
     engine: ConsensusEngine,
     network: NetworkHandle,
@@ -85,24 +69,16 @@ pub struct ConsensusOrchestrator {
     block_ready_tx: mpsc::UnboundedSender<B256>,
     block_ready_rx: mpsc::UnboundedReceiver<B256>,
     fee_recipient: Address,
-    /// When zero, blocks are built immediately. When non-zero, builds trigger at
-    /// wall-clock boundaries: `boundary = ceil(now / slot_time) * slot_time`.
     slot_time: Duration,
     next_build_at: Option<Instant>,
     next_slot_timestamp: Option<u64>,
     consecutive_empty_skips: u32,
-    /// Cache of block data received from network but not yet requested by the engine.
-    /// Bounded to 16 entries.
     pending_block_data: BTreeMap<B256, Vec<u8>>,
     pending_executions: HashSet<B256>,
     pending_finalization: Option<PendingFinalization>,
-    /// Blocks whose `new_payload` returned Syncing; retried after each successful import.
-    /// Bounded to 8 entries.
     syncing_blocks: VecDeque<Vec<u8>>,
     tx_import_tx: Option<mpsc::Sender<Vec<u8>>>,
     tx_broadcast_rx: Option<mpsc::Receiver<Vec<u8>>>,
-    /// Ring buffer of recently committed blocks for serving sync requests.
-    /// Bounded to max_committed_blocks() entries.
     committed_blocks: VecDeque<CommittedBlock>,
     connected_peers: HashSet<PeerId>,
     sync_in_flight: bool,
@@ -110,20 +86,14 @@ pub struct ConsensusOrchestrator {
     state_file: Option<PathBuf>,
     validator_set_for_sync: Option<ValidatorSet>,
     mobile_packet_tx: Option<mpsc::Sender<(B256, u64)>>,
-    /// Leader build task sends payload data back so committed_blocks can be populated
-    /// for state sync serving.
     leader_payload_rx: mpsc::UnboundedReceiver<(B256, Vec<u8>)>,
     leader_payload_tx: mpsc::UnboundedSender<(B256, Vec<u8>)>,
     blob_store: Option<DiskFileBlobStore>,
-    /// Mobile verification reward manager for EIP-4895 withdrawal-based rewards.
     mobile_reward_manager: Option<Arc<Mutex<MobileRewardManager>>>,
-    /// Tracks the number of blocks committed by consensus for accurate epoch boundary detection.
     committed_block_count: u64,
 }
 
 impl ConsensusOrchestrator {
-    /// Creates a new orchestrator without Engine API integration.
-    /// Used for testing and non-block-producing scenarios.
     pub fn new(
         engine: ConsensusEngine,
         network: NetworkHandle,
@@ -169,7 +139,6 @@ impl ConsensusOrchestrator {
         }
     }
 
-    /// Creates an orchestrator with full Engine API integration.
     pub fn with_engine_api(
         engine: ConsensusEngine,
         network: NetworkHandle,
@@ -231,38 +200,31 @@ impl ConsensusOrchestrator {
         }
     }
 
-    /// Configures the DiskFileBlobStore for EIP-4844 sidecar propagation.
     pub fn with_blob_store(mut self, blob_store: DiskFileBlobStore) -> Self {
         self.blob_store = Some(blob_store);
         self
     }
 
-    /// Configures the path for persisting consensus state snapshots.
     pub fn with_state_persistence(mut self, path: PathBuf) -> Self {
         self.state_file = Some(path);
         self
     }
 
-    /// Configures the validator set used for verifying QCs during state sync.
     pub fn with_validator_set(mut self, vs: ValidatorSet) -> Self {
         self.validator_set_for_sync = Some(vs);
         self
     }
 
-    /// Configures the mobile packet generation channel.
-    /// When set, sends `(block_hash, consensus_view)` after each BlockCommitted event.
     pub fn with_mobile_packet_tx(mut self, tx: mpsc::Sender<(B256, u64)>) -> Self {
         self.mobile_packet_tx = Some(tx);
         self
     }
 
-    /// Configures the mobile reward manager for EIP-4895 withdrawal-based rewards.
     pub fn with_mobile_reward_manager(mut self, mgr: Arc<Mutex<MobileRewardManager>>) -> Self {
         self.mobile_reward_manager = Some(mgr);
         self
     }
 
-    /// Configures the transaction pool bridge channels.
     pub fn with_tx_pool_bridge(
         mut self,
         tx_import_tx: mpsc::Sender<Vec<u8>>,
@@ -273,9 +235,7 @@ impl ConsensusOrchestrator {
         self
     }
 
-    /// Runs the orchestrator event loop.
-    ///
-    /// Never returns under normal operation. Should be spawned as a critical background task.
+    /// Runs the orchestrator event loop. Never returns under normal operation.
     pub async fn run(mut self) {
         info!(
             view = self.engine.current_view(),

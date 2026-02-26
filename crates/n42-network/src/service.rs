@@ -136,11 +136,6 @@ impl NetworkHandle {
 
 /// The network service drives the libp2p swarm and bridges messages between
 /// the P2P network and the node layer.
-///
-/// Runs as a background task, selecting over:
-/// 1. Swarm events (incoming messages, peer connections)
-/// 2. Commands from the node layer (broadcast, dial)
-/// 3. Periodic reconnection and DHT refresh timers
 pub struct NetworkService {
     swarm: Swarm<N42Behaviour>,
     command_rx: mpsc::UnboundedReceiver<NetworkCommand>,
@@ -159,11 +154,6 @@ pub struct NetworkService {
 
 impl NetworkService {
     /// Creates a new network service. Returns the service, a handle, and event receiver.
-    ///
-    /// The caller should:
-    /// 1. Use `NetworkHandle` to send commands (broadcast, dial)
-    /// 2. Read from `event_rx` to receive network events
-    /// 3. Spawn the service with `service.run()`
     pub fn new(
         mut swarm: Swarm<N42Behaviour>,
     ) -> Result<(Self, NetworkHandle, mpsc::UnboundedReceiver<NetworkEvent>), NetworkError> {
@@ -214,7 +204,6 @@ impl NetworkService {
         Ok((service, handle, event_rx))
     }
 
-    /// Starts listening on the given address.
     pub fn listen_on(&mut self, addr: Multiaddr) -> Result<(), NetworkError> {
         self.swarm
             .listen_on(addr)
@@ -222,12 +211,11 @@ impl NetworkService {
             .map_err(|e| NetworkError::Listen(e.to_string()))
     }
 
-    /// Dials a peer at the given multiaddr.
     pub fn dial(&mut self, addr: Multiaddr) -> Result<(), NetworkError> {
         self.swarm.dial(addr).map_err(|e| NetworkError::Dial(e.to_string()))
     }
 
-    /// Runs the network service event loop. Should be spawned as a background task.
+    /// Runs the event loop. Should be spawned as a background task.
     pub async fn run(mut self) {
         tracing::info!("network service started");
 
@@ -300,7 +288,7 @@ impl NetworkService {
             )) => {
                 tracing::debug!(%peer_id, protocol = ?info.protocol_version, "identified peer");
 
-                // Extract validator index from agent_version (format: "n42/1.0.0/v{index}").
+                // agent_version format: "n42/1.0.0/v{index}"
                 if let Some(idx_str) = info.agent_version.strip_prefix("n42/1.0.0/v") {
                     if let Ok(idx) = idx_str.parse::<u32>() {
                         tracing::info!(%peer_id, validator_index = idx, "mapped peer to validator");
@@ -319,10 +307,7 @@ impl NetworkService {
             SwarmEvent::Behaviour(N42BehaviourEvent::Kademlia(event)) => {
                 self.handle_kademlia_event(event);
             }
-            SwarmEvent::Behaviour(N42BehaviourEvent::ConnectionLimits(event)) => {
-                // connection_limits::Behaviour emits void::Void — unreachable at runtime.
-                match event {}
-            }
+            SwarmEvent::Behaviour(N42BehaviourEvent::ConnectionLimits(event)) => match event {},
             SwarmEvent::Behaviour(N42BehaviourEvent::Mdns(event)) => {
                 self.handle_mdns_event(event);
             }
@@ -402,8 +387,7 @@ impl NetworkService {
                     let id = self.next_sync_id;
                     self.next_sync_id += 1;
 
-                    // Evict stale channels to bound memory growth when upper layers
-                    // fail to send responses. Oldest (lowest ID) entries evicted first.
+                    // Evict oldest stale channels to bound memory growth.
                     const MAX_PENDING: usize = 64;
                     if self.pending_sync_channels.len() >= MAX_PENDING {
                         let stale_count = self.pending_sync_channels.len() - MAX_PENDING + 1;
@@ -446,10 +430,8 @@ impl NetworkService {
             libp2p::mdns::Event::Discovered(peers) => {
                 for (peer_id, addr) in peers {
                     tracing::info!(%peer_id, %addr, "mDNS: discovered peer");
-                    // Do NOT call add_explicit_peer() here — explicit peers are excluded
-                    // from GossipSub mesh formation, causing "Mesh low. Topic contains: 0".
-                    // Instead, just dial and register for reconnection; GossipSub heartbeat
-                    // will naturally add connected peers to the mesh.
+                    // Avoid add_explicit_peer() — explicit peers are excluded from
+                    // GossipSub mesh formation. Dial instead and let heartbeat add them.
                     self.reconnection.register_peer(peer_id, vec![addr.clone()], false);
                     if let Err(e) = self.swarm.dial(addr.clone()) {
                         tracing::debug!(%peer_id, error = %e, "mDNS dial failed");
@@ -500,52 +482,34 @@ impl NetworkService {
         }
     }
 
+    /// Publish raw data to a gossipsub topic.
+    fn gossipsub_publish(&mut self, topic: gossipsub::IdentTopic, data: Vec<u8>, label: &str) {
+        if let Err(e) = self.swarm.behaviour_mut().gossipsub.publish(topic, data) {
+            tracing::warn!(error = %e, "failed to publish {label}");
+        }
+    }
+
+    /// Encode a consensus message and publish it to the consensus topic.
+    fn publish_consensus(&mut self, msg: &ConsensusMessage, label: &str) {
+        match encode_consensus_message(msg) {
+            Ok(data) => self.gossipsub_publish(consensus_topic(), data, label),
+            Err(e) => tracing::error!(error = %e, "failed to encode {label}"),
+        }
+    }
+
     fn handle_command(&mut self, command: NetworkCommand) {
         match command {
             NetworkCommand::BroadcastConsensus(msg) => {
                 metrics::counter!("n42_broadcast_messages_sent").increment(1);
-                match encode_consensus_message(&msg) {
-                    Ok(data) => {
-                        if let Err(e) = self
-                            .swarm
-                            .behaviour_mut()
-                            .gossipsub
-                            .publish(consensus_topic(), data)
-                        {
-                            tracing::warn!(error = %e, "failed to publish consensus message");
-                        }
-                    }
-                    Err(e) => tracing::error!(error = %e, "failed to encode consensus message"),
-                }
+                self.publish_consensus(&msg, "consensus message");
             }
             NetworkCommand::SendDirect { peer, message } => {
-                // Encoded as a consensus broadcast; true point-to-point delivery
-                // via request-response is a future optimization.
                 metrics::counter!("n42_direct_messages_sent").increment(1);
-                match encode_consensus_message(&message) {
-                    Ok(data) => {
-                        tracing::debug!(%peer, "sending direct message via GossipSub");
-                        if let Err(e) = self
-                            .swarm
-                            .behaviour_mut()
-                            .gossipsub
-                            .publish(consensus_topic(), data)
-                        {
-                            tracing::warn!(%peer, error = %e, "failed to send direct message");
-                        }
-                    }
-                    Err(e) => tracing::error!(error = %e, "failed to encode direct message"),
-                }
+                tracing::debug!(%peer, "sending direct message via GossipSub");
+                self.publish_consensus(&message, "direct message");
             }
             NetworkCommand::AnnounceBlock(data) => {
-                if let Err(e) = self
-                    .swarm
-                    .behaviour_mut()
-                    .gossipsub
-                    .publish(block_announce_topic(), data)
-                {
-                    tracing::warn!(error = %e, "failed to publish block announcement");
-                }
+                self.gossipsub_publish(block_announce_topic(), data, "block announcement");
             }
             NetworkCommand::BroadcastTransaction(data) => {
                 if let Err(e) =
@@ -555,14 +519,7 @@ impl NetworkService {
                 }
             }
             NetworkCommand::BroadcastBlobSidecar(data) => {
-                if let Err(e) = self
-                    .swarm
-                    .behaviour_mut()
-                    .gossipsub
-                    .publish(blob_sidecar_topic(), data)
-                {
-                    tracing::warn!(error = %e, "failed to publish blob sidecar");
-                }
+                self.gossipsub_publish(blob_sidecar_topic(), data, "blob sidecar");
             }
             NetworkCommand::Dial(addr) => {
                 if let Err(e) = self.swarm.dial(addr.clone()) {

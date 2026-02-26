@@ -14,8 +14,6 @@ pub struct AttestationEvent {
     pub valid_count: u32,
 }
 
-/// Minimum attestation threshold regardless of connected phone count.
-/// Configurable via `N42_MIN_ATTESTATION_THRESHOLD` environment variable.
 fn min_attestation_threshold() -> u32 {
     std::env::var("N42_MIN_ATTESTATION_THRESHOLD")
         .ok()
@@ -24,24 +22,17 @@ fn min_attestation_threshold() -> u32 {
 }
 
 /// Bridges StarHub mobile verification events with the ReceiptAggregator.
-///
-/// Processes HubEvents and aggregates verification receipts to determine block
-/// attestation status. When a block reaches the threshold, an `AttestationEvent`
-/// is sent on the optional notification channel.
 pub struct MobileVerificationBridge {
     hub_event_rx: mpsc::UnboundedReceiver<HubEvent>,
     receipt_aggregator: ReceiptAggregator,
     attestation_tx: Option<mpsc::Sender<AttestationEvent>>,
-    /// Sends session_id when a new phone connects so CacheSync can be targeted.
     phone_connected_tx: Option<mpsc::Sender<u64>>,
-    /// Sends pubkey hex when a valid attestation is received (for reward tracking).
     reward_tx: Option<mpsc::UnboundedSender<String>>,
-    /// Tracks connected session IDs to prevent count drift from duplicate events.
     connected_sessions: HashSet<u64>,
     /// Per-block invalid receipt counts for divergence detection (FIFO-bounded).
     invalid_receipt_counts: HashMap<B256, u32>,
     invalid_receipt_order: VecDeque<B256>,
-    /// Per-block first-receipt timestamps for attestation latency measurement (FIFO-bounded).
+    /// Per-block first-receipt timestamps for attestation latency (FIFO-bounded).
     block_first_receipt_at: HashMap<B256, std::time::Instant>,
     block_first_receipt_order: VecDeque<B256>,
     max_tracked: usize,
@@ -83,7 +74,25 @@ impl MobileVerificationBridge {
         self
     }
 
-    /// Runs the bridge event loop until the channel closes.
+    /// Evicts the oldest entry from a FIFO-bounded map when at capacity, then inserts the key.
+    fn fifo_ensure_entry<V>(
+        map: &mut HashMap<B256, V>,
+        order: &mut VecDeque<B256>,
+        key: B256,
+        max: usize,
+    ) -> bool {
+        if map.contains_key(&key) {
+            return false;
+        }
+        if map.len() >= max {
+            if let Some(oldest) = order.pop_front() {
+                map.remove(&oldest);
+            }
+        }
+        order.push_back(key);
+        true
+    }
+
     pub async fn run(mut self) {
         info!(target: "n42::mobile", "mobile verification bridge started");
 
@@ -143,7 +152,6 @@ impl MobileVerificationBridge {
         info!(target: "n42::mobile", "mobile verification bridge shutting down");
     }
 
-    /// Recalculates the attestation threshold: `max(min_threshold, connected * 2 / 3)`.
     fn update_dynamic_threshold(&mut self) {
         let connected = self.connected_sessions.len() as u32;
         let threshold = (connected * 2 / 3).max(min_attestation_threshold());
@@ -151,8 +159,6 @@ impl MobileVerificationBridge {
         debug!(target: "n42::mobile", connected, threshold, "attestation threshold updated");
     }
 
-    /// Processes a verification receipt through the aggregator.
-    ///
     /// Public for testing; production code calls this via the event loop.
     pub fn process_receipt(&mut self, receipt: &VerificationReceipt) {
         if let Err(e) = receipt.verify_signature() {
@@ -167,7 +173,6 @@ impl MobileVerificationBridge {
 
         if receipt.is_valid() {
             counter!("n42_mobile_valid_receipts_total").increment(1);
-            // Notify reward manager of valid attestation
             if let Some(ref tx) = self.reward_tx {
                 let pubkey_hex = hex::encode(receipt.verifier_pubkey);
                 let _ = tx.send(pubkey_hex);
@@ -183,15 +188,12 @@ impl MobileVerificationBridge {
                 "mobile verifier reported INVALID block execution"
             );
 
-            // Track invalid count per block for divergence detection (FIFO-evict at capacity).
-            if !self.invalid_receipt_counts.contains_key(&receipt.block_hash) {
-                if self.invalid_receipt_counts.len() >= self.max_tracked {
-                    if let Some(oldest) = self.invalid_receipt_order.pop_front() {
-                        self.invalid_receipt_counts.remove(&oldest);
-                    }
-                }
-                self.invalid_receipt_order.push_back(receipt.block_hash);
-            }
+            Self::fifo_ensure_entry(
+                &mut self.invalid_receipt_counts,
+                &mut self.invalid_receipt_order,
+                receipt.block_hash,
+                self.max_tracked,
+            );
             let count = self.invalid_receipt_counts.entry(receipt.block_hash).or_insert(0);
             *count += 1;
 
@@ -211,15 +213,13 @@ impl MobileVerificationBridge {
 
         self.receipt_aggregator.register_block(receipt.block_hash, receipt.block_number);
 
-        // Track first-receipt time for attestation latency (FIFO-evict at capacity).
-        if !self.block_first_receipt_at.contains_key(&receipt.block_hash) {
-            if self.block_first_receipt_at.len() >= self.max_tracked {
-                if let Some(oldest) = self.block_first_receipt_order.pop_front() {
-                    self.block_first_receipt_at.remove(&oldest);
-                }
-            }
+        if Self::fifo_ensure_entry(
+            &mut self.block_first_receipt_at,
+            &mut self.block_first_receipt_order,
+            receipt.block_hash,
+            self.max_tracked,
+        ) {
             self.block_first_receipt_at.insert(receipt.block_hash, std::time::Instant::now());
-            self.block_first_receipt_order.push_back(receipt.block_hash);
         }
 
         match self.receipt_aggregator.process_receipt(receipt) {

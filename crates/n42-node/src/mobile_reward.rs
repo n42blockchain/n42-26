@@ -9,33 +9,16 @@ const MAX_REWARD_QUEUE_SIZE: usize = 1_000_000;
 
 /// Manages mobile verification rewards using EIP-4895 Withdrawals.
 ///
-/// Tracks attestation counts per epoch (keyed by BLS pubkey hex), computes
-/// rewards at epoch boundaries, and dispenses them in bounded batches via
-/// the Withdrawal mechanism (direct balance increase, no transaction needed).
-///
-/// Design decisions:
-/// - Uses EIP-4895 Withdrawals: no gas, no nonce, no signature required.
-///   reth's block executor handles them as direct balance additions.
-/// - BLS pubkey -> ETH address: `keccak256(pubkey_bytes)[12..]` (deterministic).
-/// - Max 32 rewards per block to keep block size bounded at scale (1M+ verifiers).
-/// - Logarithmic reward curve: reward(n) = R_max * ln(1 + k*n) / ln(1 + k*N)
-///   where n = attestation count, N = blocks_per_epoch, k = curve steepness.
-///   This means 5 minutes of verification yields ~50% of daily reward,
-///   discouraging 24/7 operation on mobile devices.
+/// Uses a logarithmic reward curve: `reward(n) = R_max * ln(1 + k*n) / ln(1 + k*N)`
+/// where n = attestation count, N = blocks_per_epoch, k = curve steepness.
+/// 5 minutes of verification yields ~50% of daily reward, discouraging 24/7 operation.
 pub struct MobileRewardManager {
-    /// Current epoch's attestation counts: bls_pubkey_hex -> count.
     epoch_attestations: HashMap<String, u64>,
-    /// Pending rewards queue (Withdrawal format).
     reward_queue: VecDeque<Withdrawal>,
-    /// Block number of the last epoch boundary distribution.
     last_distribution_block: u64,
-    /// Number of blocks per epoch.
     blocks_per_epoch: u64,
-    /// Full epoch reward in Gwei (0.1 N42 = 100_000_000 Gwei for 24h continuous verification).
     daily_base_reward_gwei: u64,
-    /// Logarithmic curve steepness parameter. Higher k = steeper early gains.
     curve_k: f64,
-    /// Maximum rewards to inject per block.
     max_rewards_per_block: usize,
 }
 
@@ -57,7 +40,6 @@ impl MobileRewardManager {
         }
     }
 
-    /// Records a valid attestation from a mobile verifier.
     pub fn record_attestation(&mut self, pubkey_hex: &str) {
         *self.epoch_attestations.entry(pubkey_hex.to_string()).or_insert(0) += 1;
         let short_key = if pubkey_hex.len() >= 16 { &pubkey_hex[..16] } else { pubkey_hex };
@@ -69,14 +51,12 @@ impl MobileRewardManager {
         );
     }
 
-    /// Checks if the current block is at an epoch boundary. If so, computes
-    /// rewards for all attestors and enqueues them.
+    /// At epoch boundaries, computes rewards for all attestors and enqueues them.
     pub fn check_epoch_boundary(&mut self, current_block: u64) {
         if self.blocks_per_epoch == 0 {
             return;
         }
 
-        // Check if we've crossed an epoch boundary since last distribution
         let current_epoch = current_block / self.blocks_per_epoch;
         let last_epoch = self.last_distribution_block / self.blocks_per_epoch;
 
@@ -84,7 +64,6 @@ impl MobileRewardManager {
             return;
         }
 
-        // Not yet reached the first epoch boundary
         if current_block < self.blocks_per_epoch {
             return;
         }
@@ -95,7 +74,6 @@ impl MobileRewardManager {
             return;
         }
 
-        // Check queue capacity before adding more rewards
         if self.reward_queue.len() >= MAX_REWARD_QUEUE_SIZE {
             warn!(
                 target: "n42::reward",
@@ -109,12 +87,11 @@ impl MobileRewardManager {
         let validator_count = self.epoch_attestations.len();
         let mut total_reward_gwei = 0u64;
 
-        // Cache fields needed for log reward computation to avoid borrow conflict with drain().
+        // Cache fields to avoid borrow conflict with drain().
         let blocks_per_epoch = self.blocks_per_epoch;
         let daily_base_reward_gwei = self.daily_base_reward_gwei;
         let curve_k = self.curve_k;
 
-        // Compute rewards for each attestor (cap additions to stay within queue limit)
         let remaining_capacity = MAX_REWARD_QUEUE_SIZE - self.reward_queue.len();
         let mut added = 0usize;
         for (pubkey_hex, count) in self.epoch_attestations.drain() {
@@ -135,8 +112,8 @@ impl MobileRewardManager {
 
             let address = bls_pubkey_hex_to_address(&pubkey_hex);
             let withdrawal = Withdrawal {
-                index: 0, // placeholder; real index assigned in take_pending_rewards()
-                validator_index: 0, // not used in our context
+                index: 0,
+                validator_index: 0,
                 address,
                 amount: reward_gwei,
             };
@@ -157,17 +134,12 @@ impl MobileRewardManager {
         self.last_distribution_block = current_block;
     }
 
-    /// Takes up to `max_rewards_per_block` pending rewards for inclusion in the next block.
-    ///
-    /// Withdrawal indices are computed as `block_number * max_rewards_per_block + i`
-    /// to guarantee global uniqueness across all blocks, regardless of which validator
-    /// proposes the block. Each validator maintains its own MobileRewardManager, so
-    /// using block_number (which is unique) avoids index collisions.
+    /// Takes up to `max_rewards_per_block` pending rewards.
+    /// Withdrawal indices: `block_number * max_rewards_per_block + i` for global uniqueness.
     pub fn take_pending_rewards(&mut self, block_number: u64) -> Vec<Withdrawal> {
         let count = self.reward_queue.len().min(self.max_rewards_per_block);
         let mut rewards: Vec<Withdrawal> = self.reward_queue.drain(..count).collect();
 
-        // Assign globally unique withdrawal indices based on block number.
         let base_index = block_number.saturating_mul(self.max_rewards_per_block as u64);
         for (i, w) in rewards.iter_mut().enumerate() {
             w.index = base_index + i as u64;
@@ -187,24 +159,16 @@ impl MobileRewardManager {
         rewards
     }
 
-    /// Returns the number of pending rewards in the queue.
     pub fn pending_count(&self) -> usize {
         self.reward_queue.len()
     }
 
-    /// Returns the number of unique attestors in the current epoch.
     pub fn epoch_attestation_count(&self) -> usize {
         self.epoch_attestations.len()
     }
 }
 
-/// Computes logarithmic curve reward.
-///
-/// `reward(n) = R_max * ln(1 + k*n) / ln(1 + k*N)`
-///
-/// where n = attestation_count, N = blocks_per_epoch, R_max = daily_base_reward_gwei.
-/// The curve ensures 5 minutes (~75 blocks at 4s) yields ~50% of the daily reward,
-/// while 24 hours yields 100%.
+/// `reward(n) = R_max * ln(1 + k*n) / ln(1 + k*N)`, capped at R_max.
 fn compute_log_reward_inner(
     attestation_count: u64,
     blocks_per_epoch: u64,
@@ -227,9 +191,6 @@ fn compute_log_reward_inner(
     (reward as u64).min(daily_base_reward_gwei)
 }
 
-/// Converts a BLS public key hex string to an ETH address.
-///
-/// Delegates to `n42_mobile::bls_pubkey_to_address` for the actual derivation.
 /// Returns `Address::ZERO` if the hex string is invalid or not exactly 48 bytes.
 fn bls_pubkey_hex_to_address(pubkey_hex: &str) -> Address {
     match hex::decode(pubkey_hex) {

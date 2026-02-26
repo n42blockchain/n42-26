@@ -11,8 +11,6 @@ use metrics::{counter, gauge};
 use tracing::{debug, error, info, warn};
 
 impl ConsensusOrchestrator {
-    /// Returns true if the last few committed blocks all had empty (or near-empty) payloads.
-    /// Used to decide whether to skip empty-block proposals.
     pub(super) fn recent_blocks_empty(&self) -> bool {
         let check_count = 3.min(self.committed_blocks.len());
         if check_count == 0 {
@@ -25,10 +23,7 @@ impl ConsensusOrchestrator {
             .all(|b| b.payload.is_empty() || b.payload.len() < 512)
     }
 
-    /// Schedules the next payload build, applying empty-block skip optimization.
-    ///
-    /// If slot_time > 0, computes the next wall-clock boundary and delays until then.
-    /// If the mempool looks empty and skip budget remains, defers to the next slot.
+    /// Schedules the next payload build, skipping if recent blocks are empty.
     pub(super) async fn schedule_payload_build(&mut self) {
         if self.recent_blocks_empty()
             && self.consecutive_empty_skips < max_consecutive_empty_skips()
@@ -64,10 +59,7 @@ impl ConsensusOrchestrator {
         }
     }
 
-    /// Computes the next wall-clock-aligned slot boundary.
-    ///
     /// Returns `(slot_timestamp_secs, delay_until_boundary)`.
-    /// Slot boundaries are defined as the smallest multiple of `slot_ms` greater than `now_ms`.
     pub(super) fn next_slot_boundary(&self) -> (u64, Duration) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -88,7 +80,6 @@ impl ConsensusOrchestrator {
         (slot_timestamp, Duration::from_millis(delay_ms))
     }
 
-    /// Dispatches an engine output to the appropriate destination.
     pub(super) async fn handle_engine_output(&mut self, output: EngineOutput) {
         match output {
             EngineOutput::BroadcastMessage(msg) => {
@@ -272,15 +263,14 @@ impl ConsensusOrchestrator {
         counter!("n42_view_changes_total").increment(1);
         info!(new_view, "view changed");
 
-        // Preserve pending state if a committed block is awaiting import.
-        // ViewChanged fires immediately after BlockCommitted in f=0 configs.
+        // ViewChanged fires immediately after BlockCommitted in f=0 configs;
+        // preserve pending state if a committed block is awaiting import.
         if self.pending_finalization.is_none() {
             self.pending_block_data.clear();
             self.pending_executions.clear();
         }
 
-        // Force the next leader to build by exhausting the empty-skip budget.
-        // Resetting to 0 would still allow skipping; setting to max bypasses it.
+        // Exhaust the empty-skip budget to force the next leader to build.
         self.consecutive_empty_skips = max_consecutive_empty_skips();
 
         if self.engine.is_current_leader() {
@@ -289,8 +279,6 @@ impl ConsensusOrchestrator {
         }
     }
 
-    /// Populates the committed_blocks entry for a leader-built block when
-    /// the build task sends back the payload data.
     pub(super) fn handle_leader_payload_feedback(&mut self, hash: B256, data: Vec<u8>) {
         if let Some(block) = self.committed_blocks.iter_mut().rev().find(|b| b.block_hash == hash) {
             if block.payload.is_empty() {

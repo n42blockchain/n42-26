@@ -26,15 +26,9 @@ struct Args {
     duration: u64,
 }
 
-/// Generates a deterministic BLS key from an index.
 fn deterministic_bls_key(index: usize) -> BlsSecretKey {
     let seed = alloy_primitives::keccak256(format!("n42-mobile-key-{index}").as_bytes());
     BlsSecretKey::key_gen(&seed.0).expect("BLS key generation from deterministic seed")
-}
-
-/// Derives an ETH address from a BLS public key (for reward distribution).
-fn bls_pubkey_to_address(pubkey: &[u8; 48]) -> alloy_primitives::Address {
-    n42_mobile::bls_pubkey_to_address(pubkey)
 }
 
 #[tokio::main]
@@ -71,7 +65,6 @@ async fn main() -> eyre::Result<()> {
         }));
     }
 
-    // Wait for all phone tasks
     for handle in handles {
         let _ = handle.await;
     }
@@ -82,7 +75,7 @@ async fn main() -> eyre::Result<()> {
 async fn run_phone(phone_idx: usize, ports: &[u16], duration_secs: u64) -> eyre::Result<()> {
     let bls_key = deterministic_bls_key(phone_idx);
     let pubkey = bls_key.public_key().to_bytes();
-    let eth_addr = bls_pubkey_to_address(&pubkey);
+    let eth_addr = n42_mobile::bls_pubkey_to_address(&pubkey);
 
     info!(
         phone = phone_idx,
@@ -104,13 +97,12 @@ async fn run_phone(phone_idx: usize, ports: &[u16], duration_secs: u64) -> eyre:
         None
     };
 
-    // Outer reconnection loop
+    let deadline_reached = || deadline.is_some_and(|dl| tokio::time::Instant::now() >= dl);
+
     loop {
-        if let Some(dl) = deadline {
-            if tokio::time::Instant::now() >= dl {
-                info!(phone = phone_idx, verified_count, "duration reached, stopping");
-                return Ok(());
-            }
+        if deadline_reached() {
+            info!(phone = phone_idx, verified_count, "duration reached, stopping");
+            return Ok(());
         }
 
         info!(phone = phone_idx, %addr, "connecting to StarHub");
@@ -125,17 +117,13 @@ async fn run_phone(phone_idx: usize, ports: &[u16], duration_secs: u64) -> eyre:
         };
         info!(phone = phone_idx, "QUIC handshake complete");
 
-        // Inner receive loop — breaks on connection death
         loop {
-            if let Some(dl) = deadline {
-                if tokio::time::Instant::now() >= dl {
-                    client.close();
-                    info!(phone = phone_idx, verified_count, "duration reached, stopping");
-                    return Ok(());
-                }
+            if deadline_reached() {
+                client.close();
+                info!(phone = phone_idx, verified_count, "duration reached, stopping");
+                return Ok(());
             }
 
-            // Detect dead connection before blocking on accept_uni
             if client.is_closed() {
                 warn!(phone = phone_idx, "connection closed, will reconnect");
                 break;
@@ -256,7 +244,6 @@ async fn run_phone(phone_idx: usize, ports: &[u16], duration_secs: u64) -> eyre:
             }
         }
 
-        // Brief delay before reconnecting
         info!(phone = phone_idx, "reconnecting in 3s...");
         tokio::time::sleep(Duration::from_secs(3)).await;
     }
