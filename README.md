@@ -52,6 +52,10 @@ A high-performance blockchain system combining **HotStuff-2** BFT consensus with
 - **reth v1.11.0 Integration**: Full EVM execution with Ethereum-compatible block/transaction format
 - **Execution Witness**: State witness generation for mobile re-execution
 - **Mobile Verification Protocol**: Ed25519 receipts, commit-reveal anti-copying, LRU code cache
+- **QUIC Mobile Client**: `QuicMobileClient` for phone-side connection to StarHub with deadline-based timeouts
+- **Mobile Reward System**: EIP-4895 withdrawal-based rewards distributed per epoch (logarithmic scaling)
+- **Mobile FFI SDK**: `n42-mobile-ffi` crate exposing C/JNI bindings for Android and iOS integration
+- **Mobile Simulator**: `n42-mobile-sim` binary for load testing with deterministic BLS key generation
 - **libp2p GossipSub**: QUIC transport with content-based message deduplication
 - **QUIC Star-Hub**: High-concurrency mobile connections (up to 10,000 per node)
 
@@ -59,7 +63,9 @@ A high-performance blockchain system combining **HotStuff-2** BFT consensus with
 
 ```
 n42-26/
-├── bin/n42-node/                  # CLI entry point (reth NodeBuilder)
+├── bin/
+│   ├── n42-node/                  # CLI entry point (reth NodeBuilder)
+│   └── n42-mobile-sim/            # Mobile verifier simulator for load testing
 └── crates/
     ├── n42-primitives/            # BLS keys, consensus message types
     ├── n42-chainspec/             # Chain config, ValidatorInfo
@@ -67,6 +73,8 @@ n42-26/
     ├── n42-execution/             # EVM config wrapper, witness & state diff
     ├── n42-network/               # libp2p GossipSub + QUIC StarHub
     ├── n42-mobile/                # Mobile verification protocol (no reth deps)
+    │                              #   quic_client, receipt, verifier, code_cache
+    ├── n42-mobile-ffi/            # C/JNI FFI bindings for Android & iOS
     └── n42-node/                  # Node type assembly + ConsensusOrchestrator
 ```
 
@@ -118,9 +126,11 @@ Mobile devices perform **parallel block verification** as an additional security
 ```
 1. IDC executes block → captures ExecutionWitness
 2. Witness compacted (remove cached bytecodes) → VerificationPacket
-3. Packet pushed to phones via QUIC
+3. Packet pushed to phones via QUIC (QuicMobileClient)
 4. Phone re-executes → generates VerificationReceipt (Ed25519)
 5. IDC aggregates receipts → threshold (2/3) attestation
+6. Per-epoch: MobileRewardManager calculates logarithmic rewards
+7. Rewards injected as EIP-4895 withdrawals into next block's PayloadAttributes
 ```
 
 ### Anti-Copying (Commit-Reveal)
@@ -132,6 +142,20 @@ Phone:  commitment_hash = keccak256(block_hash || result || random_nonce)
         ──── send reveal (result + nonce) ────▶ IDC
 IDC:    verify hash(block_hash || result || nonce) == commitment_hash
 ```
+
+### Reward System (EIP-4895 Withdrawals)
+
+Verification rewards are distributed per **epoch** (default: 21,600 blocks ≈ 24h at 4s block time):
+
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| Epoch length | 21,600 blocks | Reward settlement interval |
+| Max rewards per block | 32 | Throughput cap for large validator sets |
+| Reward queue limit | 1,000,000 | Prevents unbounded memory growth |
+| Address derivation | `keccak256(bls_pubkey_bytes)[12..]` | BLS pubkey → ETH address |
+| Scaling | Logarithmic | Diminishing returns per attestation count |
+
+Rewards are injected as `Withdrawal` entries in `PayloadAttributes` — no transaction signing, gas, or nonce required.
 
 ### Performance (Ed25519 vs BLS)
 
@@ -197,11 +221,14 @@ cargo build
 
 # With custom chain spec
 ./target/debug/n42-node node --chain /path/to/genesis.json
+
+# Mobile simulator (connect to running node's StarHub)
+./target/debug/n42-mobile-sim --starhub-ports 9100,9101,9102 --phone-count 100 --duration 60
 ```
 
 ## Testing
 
-### Integration Tests (39 tests, 7 modules)
+### Integration Tests (7 modules)
 
 ```bash
 # Run all integration tests
@@ -236,20 +263,28 @@ cargo test -p n42-consensus --test performance_bench --release -- --nocapture
 ### Unit Tests
 
 ```bash
-# All workspace tests
+# All workspace tests (208 tests across all crates)
 cargo test --workspace
 
 # Specific crate
 cargo test -p n42-consensus
 cargo test -p n42-primitives
-cargo test -p n42-mobile
+cargo test -p n42-mobile    # 94 tests: receipt, reward, bridge, verifier, quic_client
 ```
+
+| Crate | Tests |
+|-------|------:|
+| n42-mobile | 94 |
+| n42-node | 107 |
+| stream_v2_pipeline | 6 |
+| comm_stress_bench | 1 |
+| **Total** | **208** |
 
 ## Crate Dependency Graph
 
 ```
-bin/n42-node
-  └── n42-node
+bin/n42-node                    bin/n42-mobile-sim
+  └── n42-node                    └── n42-mobile ─── ed25519-dalek
       ├── n42-consensus ──┬── n42-primitives ── blst (BLS12-381)
       │                   └── n42-chainspec ──── n42-primitives
       ├── n42-execution ──┬── reth-evm, reth-revm
@@ -258,9 +293,16 @@ bin/n42-node
       │                   ├── n42-mobile ─── ed25519-dalek
       │                   └── libp2p (gossipsub, quic)
       └── reth-node-builder, reth-ethereum-*
+
+n42-mobile-ffi (Android/iOS SDK)
+  ├── n42-mobile
+  ├── n42-primitives
+  ├── n42-chainspec
+  └── n42-execution
 ```
 
 Key design: **n42-mobile** has zero reth dependencies — only `alloy-primitives`, `ed25519-dalek`, `lru`, `serde`.
+**n42-mobile-ffi** compiles as `staticlib` + `cdylib`, exposing a C ABI and JNI bridge for Android.
 
 ## Key Types
 
@@ -298,6 +340,18 @@ aggregator.register_block(block_hash, block_number);
 if aggregator.process_receipt(&receipt) == Some(true) {
     println!("Block attested by sufficient mobile verifiers");
 }
+
+// QUIC client (phone-side connection)
+let client = QuicMobileClient::connect("127.0.0.1:9100", &ed25519_pubkey).await?;
+let packet = client.receive_packet(Duration::from_secs(30)).await?;
+client.send_receipt(&receipt_bytes).await?;
+
+// Reward distribution (IDC side, per epoch)
+let mut rewards = MobileRewardManager::new(blocks_per_epoch, base_reward_wei);
+rewards.record_attestation(&bls_pubkey_hex);
+// On payload build:
+let withdrawals = rewards.take_pending_rewards(committed_block_number);
+payload_attributes.withdrawals = Some(withdrawals);
 ```
 
 ## Configuration
