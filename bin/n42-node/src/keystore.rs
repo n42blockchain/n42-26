@@ -28,8 +28,8 @@ impl Keystore {
     pub fn encrypt(secret_key_bytes: &[u8; 32], password: &str) -> Result<Self, String> {
         let mut salt = [0u8; 32];
         let mut nonce_bytes = [0u8; 12];
-        rand::thread_rng().fill_bytes(&mut salt);
-        rand::thread_rng().fill_bytes(&mut nonce_bytes);
+        rand::rng().fill_bytes(&mut salt);
+        rand::rng().fill_bytes(&mut nonce_bytes);
 
         let scrypt_log_n: u8 = 13; // N=8192
         let scrypt_r: u32 = 8;

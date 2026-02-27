@@ -17,7 +17,7 @@ resolver = "2"
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.86"
+rust-version = "1.93"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
@@ -70,19 +70,19 @@ reth-rpc-server-types = { path = "../reth/crates/rpc/rpc-server-types" }
 reth-node-core = { path = "../reth/crates/node/core" }
 
 # Alloy
-alloy-consensus = { version = "1.0", default-features = false }
-alloy-eips = { version = "1.0", default-features = false }
-alloy-primitives = { version = "1.0", default-features = false, features = ["serde"] }
-alloy-rlp = { version = "0.3", default-features = false }
-alloy-genesis = { version = "1.0", default-features = false }
-alloy-rpc-types-engine = { version = "1.0", default-features = false }
+alloy-consensus = { version = "1.7.3", default-features = false }
+alloy-eips = { version = "1.7.3", default-features = false }
+alloy-primitives = { version = "1.5.6", default-features = false, features = ["serde"] }
+alloy-rlp = { version = "0.3.13", default-features = false }
+alloy-genesis = { version = "1.7.3", default-features = false }
+alloy-rpc-types-engine = { version = "1.7.3", default-features = false }
 
 # Alloy signing & network
-alloy-signer = { version = "1.0", default-features = false }
-alloy-signer-local = { version = "1.0", default-features = false }
-alloy-network = { version = "1.0", default-features = false }
-alloy-rpc-types-eth = { version = "1.0", default-features = false }
-alloy-sol-types = { version = "1.0", default-features = false }
+alloy-signer = { version = "1.7.3", default-features = false }
+alloy-signer-local = { version = "1.7.3", default-features = false }
+alloy-network = { version = "1.7.3", default-features = false }
+alloy-rpc-types-eth = { version = "1.7.3", default-features = false }
+alloy-sol-types = { version = "1.5.6", default-features = false }
 
 # EVM
 alloy-evm = { version = "0.27.2", default-features = false }
@@ -106,7 +106,7 @@ toml = "0.8"
 bincode = "1.3"
 
 # Async
-tokio = { version = "1.0", features = ["full"] }
+tokio = { version = "1.44.2", features = ["full"] }
 
 # Error handling
 eyre = "0.6"
@@ -135,7 +135,7 @@ hex = "0.4"
 sha2 = "0.10"
 
 # Random
-rand = "0.8"
+rand = "0.9"
 
 # Keystore crypto
 aes-gcm = "0.10"
@@ -149,4 +149,4 @@ zstd = "0.13"
 
 # Misc
 auto_impl = "1.0"
-derive_more = { version = "1.0", features = ["display"] }
+derive_more = { version = "2", default-features = false, features = ["full"] }
