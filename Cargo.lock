@@ -247,23 +247,6 @@ dependencies = [
 
 [[package]]
 name = "alloy-evm"
-version = "0.27.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d2ccfe6d724ceabd5518350cfb34f17dd3a6c3cc33579eee94d98101d3a511ff"
-dependencies = [
- "alloy-consensus",
- "alloy-eips",
- "alloy-hardforks",
- "alloy-primitives",
- "alloy-sol-types",
- "auto_impl",
- "derive_more",
- "revm",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "alloy-evm"
 version = "0.28.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c766c49df3a611b3a4dab6a3b92a27ad5a16f742db9e1204ccf9ba14651ce5d1"
@@ -5553,7 +5536,7 @@ name = "n42-execution"
 version = "0.1.0"
 dependencies = [
  "alloy-eips",
- "alloy-evm 0.27.2",
+ "alloy-evm",
  "alloy-primitives",
  "alloy-rpc-types-engine",
  "bincode",
@@ -7363,7 +7346,7 @@ dependencies = [
  "alloy-chains",
  "alloy-consensus",
  "alloy-eips",
- "alloy-evm 0.28.0",
+ "alloy-evm",
  "alloy-genesis",
  "alloy-primitives",
  "alloy-trie",
@@ -7853,7 +7836,7 @@ dependencies = [
  "alloy-consensus",
  "alloy-eip7928",
  "alloy-eips",
- "alloy-evm 0.28.0",
+ "alloy-evm",
  "alloy-primitives",
  "alloy-rlp",
  "alloy-rpc-types-engine",
@@ -8152,7 +8135,7 @@ version = "1.11.1"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
- "alloy-evm 0.28.0",
+ "alloy-evm",
  "alloy-primitives",
  "auto_impl",
  "derive_more",
@@ -8175,7 +8158,7 @@ version = "1.11.1"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
- "alloy-evm 0.28.0",
+ "alloy-evm",
  "alloy-primitives",
  "alloy-rpc-types-engine",
  "reth-chainspec",
@@ -8192,7 +8175,7 @@ dependencies = [
 name = "reth-execution-errors"
 version = "1.11.1"
 dependencies = [
- "alloy-evm 0.28.0",
+ "alloy-evm",
  "alloy-primitives",
  "alloy-rlp",
  "nybbles",
@@ -8206,7 +8189,7 @@ version = "1.11.1"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
- "alloy-evm 0.28.0",
+ "alloy-evm",
  "alloy-primitives",
  "derive_more",
  "reth-ethereum-primitives",
@@ -8979,7 +8962,7 @@ dependencies = [
  "alloy-dyn-abi",
  "alloy-eip7928",
  "alloy-eips",
- "alloy-evm 0.28.0",
+ "alloy-evm",
  "alloy-genesis",
  "alloy-network",
  "alloy-primitives",
@@ -9124,7 +9107,7 @@ name = "reth-rpc-convert"
 version = "1.11.1"
 dependencies = [
  "alloy-consensus",
- "alloy-evm 0.28.0",
+ "alloy-evm",
  "alloy-json-rpc",
  "alloy-network",
  "alloy-primitives",
@@ -9175,7 +9158,7 @@ dependencies = [
  "alloy-consensus",
  "alloy-dyn-abi",
  "alloy-eips",
- "alloy-evm 0.28.0",
+ "alloy-evm",
  "alloy-json-rpc",
  "alloy-network",
  "alloy-primitives",
@@ -9217,7 +9200,7 @@ version = "1.11.1"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
- "alloy-evm 0.28.0",
+ "alloy-evm",
  "alloy-network",
  "alloy-primitives",
  "alloy-rpc-client",
