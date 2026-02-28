@@ -28,3 +28,4 @@ thiserror.workspace = true
 # Misc
 derive_more.workspace = true
 getrandom = "0.3"
+zeroize.workspace = true

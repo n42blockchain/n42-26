@@ -5753,6 +5753,7 @@ dependencies = [
  "reth-primitives-traits",
  "serde",
  "thiserror 2.0.18",
+ "zeroize",
 ]
 
 [[package]]

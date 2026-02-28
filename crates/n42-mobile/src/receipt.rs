@@ -133,7 +133,11 @@ pub fn decode_receipt(data: &[u8]) -> Result<VerificationReceipt, crate::wire::W
 
     let block_hash = B256::from_slice(&payload[pos..pos + 32]);
     pos += 32;
-    let block_number = u64::from_le_bytes(payload[pos..pos + 8].try_into().unwrap());
+    let block_number = u64::from_le_bytes(
+        payload[pos..pos + 8]
+            .try_into()
+            .map_err(|_| WireError::UnexpectedEof(pos + 8))?,
+    );
     pos += 8;
     let state_root_match = payload[pos] != 0;
     pos += 1;
@@ -150,7 +154,11 @@ pub fn decode_receipt(data: &[u8]) -> Result<VerificationReceipt, crate::wire::W
         BlsSignature::from_bytes(&sig_bytes).map_err(|_| WireError::InvalidTag(0, pos))?;
     pos += 96;
 
-    let timestamp_ms = u64::from_le_bytes(payload[pos..pos + 8].try_into().unwrap());
+    let timestamp_ms = u64::from_le_bytes(
+        payload[pos..pos + 8]
+            .try_into()
+            .map_err(|_| WireError::UnexpectedEof(pos + 8))?,
+    );
 
     Ok(VerificationReceipt {
         block_hash,

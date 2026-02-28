@@ -79,7 +79,7 @@ pub fn decode_header(data: &[u8]) -> Result<(WireHeader, &[u8]), WireError> {
     }
 
     let version = data[2];
-    if version > VERSION_1 {
+    if version != VERSION_1 {
         return Err(WireError::UnsupportedVersion(version));
     }
 
@@ -143,6 +143,14 @@ mod tests {
         let data = [MAGIC[0], MAGIC[1], 0xFF, 0x00];
         let result = decode_header(&data);
         assert!(matches!(result, Err(WireError::UnsupportedVersion(0xFF))));
+    }
+
+    #[test]
+    fn test_version_zero_rejected() {
+        // version=0x00 is below VERSION_1; strict equality check must reject it.
+        let data = [MAGIC[0], MAGIC[1], 0x00, 0x00];
+        let result = decode_header(&data);
+        assert!(matches!(result, Err(WireError::UnsupportedVersion(0x00))));
     }
 
     #[test]

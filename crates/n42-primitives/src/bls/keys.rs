@@ -4,6 +4,7 @@ use blst::min_pk::{PublicKey, SecretKey, Signature};
 use blst::BLST_ERROR;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use zeroize::Zeroize;
 
 use super::DST;
 
@@ -58,6 +59,18 @@ impl BlsSecretKey {
 
     pub fn sign_hash(&self, hash: &B256) -> BlsSignature {
         self.sign(hash.as_slice())
+    }
+}
+
+impl Drop for BlsSecretKey {
+    fn drop(&mut self) {
+        // Best-effort zeroize: serialize the scalar to a stack buffer and zero it.
+        // This zeros the serialized copy but cannot zero blst's internal C
+        // representation (blst_scalar is an opaque C struct with no Rust-visible
+        // mutable bytes). For deployments that require stronger guarantees, use a
+        // BLS library with native zeroize support (e.g., blst fork with ZeroizeOnDrop).
+        let mut bytes = self.0.serialize();
+        bytes.zeroize();
     }
 }
 

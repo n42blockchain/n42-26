@@ -93,6 +93,7 @@ reth-testing-utils = { path = "../reth/testing/testing-utils" }
 
 # Crypto
 blst = "0.3"
+zeroize = { version = "1", features = ["derive"] }
 bitvec = { version = "1.0", features = ["serde"] }
 ed25519-dalek = { version = "2", features = ["serde", "rand_core"] }
 

@@ -315,7 +315,10 @@ impl ConsensusEngine {
                     let new_current = self.round_state.current_view();
                     if view == new_current {
                         return self.dispatch_message(msg);
-                    } else if view > new_current && view <= new_current + FUTURE_VIEW_WINDOW {
+                    } else if view > new_current
+                        && view <= new_current + FUTURE_VIEW_WINDOW
+                        && self.future_msg_buffer.len() < MAX_FUTURE_MESSAGES
+                    {
                         self.future_msg_buffer.push((view, msg));
                     }
                 }
