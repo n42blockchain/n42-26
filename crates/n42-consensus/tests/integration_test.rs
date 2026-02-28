@@ -1055,8 +1055,10 @@ mod fault_tolerance {
         let view = 1u64;
 
         // Create a vote for a past view (0 < current_view=1).
-        // Past-view votes bypass future-message buffering and go directly to
-        // dispatch_message, which rejects them via ViewMismatch.
+        // Past-view votes are silently discarded (Ok(())) rather than returning an
+        // error: with GossipSub multi-path delivery, duplicate stale messages are
+        // normal and should not generate noise.  The engine's safety invariants are
+        // unaffected — a stale vote never enters any vote collector.
         let msg = signing_message(0, &B256::repeat_byte(0xBB));
         let sig = harness.secret_keys[0].sign(&msg);
         let vote = Vote {
@@ -1075,19 +1077,18 @@ mod fault_tolerance {
             .unwrap();
         harness.drain_outputs(leader);
 
+        // Stale past-view vote must be silently discarded — no error, no state change.
         let result = harness.engines[leader]
             .process_event(ConsensusEvent::Message(ConsensusMessage::Vote(vote)));
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            ConsensusError::ViewMismatch {
-                current,
-                received,
-            } => {
-                assert_eq!(current, 1);
-                assert_eq!(received, 0);
-            }
-            other => panic!("expected ViewMismatch, got: {:?}", other),
-        }
+        assert!(result.is_ok(), "past-view vote should be silently discarded, got: {:?}", result);
+
+        // The engine produced no new outputs from the discarded vote.
+        let spurious_outputs = harness.drain_outputs(leader);
+        assert!(
+            spurious_outputs.is_empty(),
+            "discarded past-view vote must not produce any output, got: {:?}",
+            spurious_outputs,
+        );
     }
 
     #[test]
@@ -2027,7 +2028,16 @@ mod byzantine_signature {
             }
         }
 
-        // Byzantine validator 3 sends invalid commit vote
+        // Block committed once leader + validator 0 + validator 2 reached quorum (3/4).
+        // The view has already advanced to 2 by this point.
+        let leader_outputs = harness.drain_outputs(leader);
+        let committed = leader_outputs.iter().any(|o| matches!(o, EngineOutput::BlockCommitted { .. }));
+        assert!(committed, "block should commit with honest commit votes");
+
+        // Byzantine validator 3 sends a commit vote whose signature covers the wrong
+        // signing message (view=999 instead of view=1).  By the time this arrives,
+        // the engine is already at view=2, so the message is stale (view=1 <
+        // current_view=2) and silently discarded — not an error.
         harness.drain_outputs(3);
         let wrong_msg = commit_signing_message(999, &block_hash);
         let bad_sig = harness.secret_keys[3].sign(&wrong_msg);
@@ -2039,12 +2049,11 @@ mod byzantine_signature {
         };
         let result = harness.engines[leader]
             .process_event(ConsensusEvent::Message(ConsensusMessage::CommitVote(bad_cv)));
-        assert!(result.is_err(), "invalid commit vote should be rejected");
-
-        // Block should still be committed (leader + 0 + 2 = 3 ≥ quorum)
-        let leader_outputs = harness.drain_outputs(leader);
-        let committed = leader_outputs.iter().any(|o| matches!(o, EngineOutput::BlockCommitted { .. }));
-        assert!(committed, "block should commit with honest commit votes despite Byzantine");
+        assert!(
+            result.is_ok(),
+            "stale commit vote (view=1, engine at view=2) must be silently discarded, got: {:?}",
+            result,
+        );
     }
 
     /// Byzantine validators send timeout messages with invalid signatures during view change.
