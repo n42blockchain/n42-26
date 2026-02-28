@@ -364,6 +364,7 @@ fn main() {
                 let mobile_bridge = MobileVerificationBridge::new(hub_event_rx, 10, 1000)
                     .with_attestation_tx(attest_tx)
                     .with_phone_connected_tx(phone_connected_tx)
+                    .with_consensus_state(consensus_state.clone())
                     .with_reward_tx(reward_attest_tx);
 
                 task_executor.spawn_critical_task("n42-mobile-bridge", Box::pin(mobile_bridge.run()));

@@ -78,7 +78,7 @@ pub fn save_consensus_state(path: &Path, snapshot: &ConsensusSnapshot) -> io::Re
 /// Loads a consensus snapshot from a JSON file.
 ///
 /// Returns `Ok(None)` if the file does not exist (fresh start).
-/// Returns `Err` if the file exists but cannot be parsed.
+/// Returns `Err` if the file exists but cannot be parsed or fails validation.
 pub fn load_consensus_state(path: &Path) -> io::Result<Option<ConsensusSnapshot>> {
     match std::fs::read_to_string(path) {
         Ok(json) => {
