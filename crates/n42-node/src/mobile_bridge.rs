@@ -4,10 +4,10 @@ use n42_mobile::{ReceiptAggregator, VerificationReceipt};
 use n42_network::mobile::HubEvent;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, info, warn};
 
-use crate::consensus_state::SharedConsensusState;
+use crate::consensus_state::{SharedConsensusState, VerificationTask};
 
 /// Notification sent when a block reaches the mobile attestation threshold.
 #[derive(Debug, Clone)]
@@ -36,6 +36,9 @@ pub struct MobileVerificationBridge {
     /// Optional shared consensus state; when set, verifier pubkeys are
     /// authorized/deauthorized in `SharedConsensusState` on connect/disconnect.
     consensus_state: Option<Arc<SharedConsensusState>>,
+    /// Subscription to committed-block notifications for registering blocks that
+    /// are eligible to receive mobile receipts.
+    verification_task_rx: Option<broadcast::Receiver<VerificationTask>>,
     /// Per-block invalid receipt counts for divergence detection (FIFO-bounded).
     invalid_receipt_counts: HashMap<B256, u32>,
     invalid_receipt_order: VecDeque<B256>,
@@ -59,6 +62,7 @@ impl MobileVerificationBridge {
             reward_tx: None,
             connected_sessions: HashMap::new(),
             consensus_state: None,
+            verification_task_rx: None,
             invalid_receipt_counts: HashMap::new(),
             invalid_receipt_order: VecDeque::new(),
             block_first_receipt_at: HashMap::new(),
@@ -85,6 +89,7 @@ impl MobileVerificationBridge {
     /// Attaches shared consensus state so that verifier pubkeys are authorized/
     /// deauthorized in `SharedConsensusState` as phones connect and disconnect.
     pub fn with_consensus_state(mut self, state: Arc<SharedConsensusState>) -> Self {
+        self.verification_task_rx = Some(state.block_committed_tx.subscribe());
         self.consensus_state = Some(state);
         self
     }
@@ -119,65 +124,100 @@ impl MobileVerificationBridge {
     pub async fn run(mut self) {
         info!(target: "n42::mobile", "mobile verification bridge started");
 
-        while let Some(event) = self.hub_event_rx.recv().await {
-            match event {
-                HubEvent::PhoneConnected { session_id, verifier_pubkey } => {
-                    self.connected_sessions.insert(session_id, verifier_pubkey);
-                    if let Some(ref state) = self.consensus_state {
-                        state.authorize_verifier(verifier_pubkey);
-                    }
-                    gauge!("n42_mobile_connected_phones").set(self.connected_sessions.len() as f64);
-                    self.update_dynamic_threshold();
-                    debug!(
-                        target: "n42::mobile",
-                        session_id,
-                        connected = self.connected_sessions.len(),
-                        "mobile verifier connected"
-                    );
-                    if let Some(ref tx) = self.phone_connected_tx {
-                        let _ = tx.try_send(session_id);
-                    }
-                }
-                HubEvent::PhoneDisconnected { session_id } => {
-                    match self.connected_sessions.remove(&session_id) {
-                        Some(pubkey) => {
+        loop {
+            tokio::select! {
+                event = self.hub_event_rx.recv() => {
+                    let Some(event) = event else { break };
+                    match event {
+                        HubEvent::PhoneConnected { session_id, verifier_pubkey } => {
+                            self.connected_sessions.insert(session_id, verifier_pubkey);
                             if let Some(ref state) = self.consensus_state {
-                                state.deauthorize_verifier(&pubkey);
+                                state.authorize_verifier(verifier_pubkey);
                             }
-                        }
-                        None => {
-                            warn!(
+                            gauge!("n42_mobile_connected_phones").set(self.connected_sessions.len() as f64);
+                            self.update_dynamic_threshold();
+                            debug!(
                                 target: "n42::mobile",
                                 session_id,
-                                "disconnect for unknown session (duplicate event?)"
+                                connected = self.connected_sessions.len(),
+                                "mobile verifier connected"
+                            );
+                            if let Some(ref tx) = self.phone_connected_tx {
+                                let _ = tx.try_send(session_id);
+                            }
+                        }
+                        HubEvent::PhoneDisconnected { session_id } => {
+                            match self.connected_sessions.remove(&session_id) {
+                                Some(pubkey) => {
+                                    if let Some(ref state) = self.consensus_state {
+                                        state.deauthorize_verifier(&pubkey);
+                                    }
+                                }
+                                None => {
+                                    warn!(
+                                        target: "n42::mobile",
+                                        session_id,
+                                        "disconnect for unknown session (duplicate event?)"
+                                    );
+                                }
+                            }
+                            gauge!("n42_mobile_connected_phones").set(self.connected_sessions.len() as f64);
+                            self.update_dynamic_threshold();
+                            debug!(
+                                target: "n42::mobile",
+                                session_id,
+                                connected = self.connected_sessions.len(),
+                                "mobile verifier disconnected"
+                            );
+                        }
+                        HubEvent::ReceiptReceived(receipt) => {
+                            info!(
+                                target: "n42::mobile",
+                                block_number = receipt.block_number,
+                                %receipt.block_hash,
+                                "verification receipt received from mobile verifier"
+                            );
+                            self.process_receipt(&receipt);
+                        }
+                        HubEvent::CacheInventoryReceived { session_id, code_hashes } => {
+                            debug!(
+                                target: "n42::mobile",
+                                session_id,
+                                count = code_hashes.len(),
+                                "cache inventory received"
                             );
                         }
                     }
-                    gauge!("n42_mobile_connected_phones").set(self.connected_sessions.len() as f64);
-                    self.update_dynamic_threshold();
-                    debug!(
-                        target: "n42::mobile",
-                        session_id,
-                        connected = self.connected_sessions.len(),
-                        "mobile verifier disconnected"
-                    );
                 }
-                HubEvent::ReceiptReceived(receipt) => {
-                    info!(
-                        target: "n42::mobile",
-                        block_number = receipt.block_number,
-                        %receipt.block_hash,
-                        "verification receipt received from mobile verifier"
-                    );
-                    self.process_receipt(&receipt);
-                }
-                HubEvent::CacheInventoryReceived { session_id, code_hashes } => {
-                    debug!(
-                        target: "n42::mobile",
-                        session_id,
-                        count = code_hashes.len(),
-                        "cache inventory received"
-                    );
+                task = async {
+                    // When verification_task_rx is None, yield a never-completing
+                    // future so tokio::select! does not busy-loop on a ready None.
+                    match self.verification_task_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    match task {
+                        Ok(task) => {
+                            self.register_dispatched_block(task.block_hash, task.block_number);
+                            debug!(
+                                target: "n42::mobile",
+                                block_hash = %task.block_hash,
+                                block_number = task.block_number,
+                                "registered dispatched block for mobile receipt tracking"
+                            );
+                        }
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            warn!(
+                                target: "n42::mobile",
+                                skipped = n,
+                                "mobile bridge lagged on committed-block notifications"
+                            );
+                        }
+                        Err(broadcast::error::RecvError::Closed) => {
+                            self.verification_task_rx = None;
+                        }
+                    }
                 }
             }
         }
@@ -331,12 +371,17 @@ impl MobileVerificationBridge {
 mod tests {
     use super::*;
     use alloy_primitives::B256;
+    use n42_consensus::ValidatorSet;
     use n42_mobile::receipt::sign_receipt;
     use n42_primitives::BlsSecretKey;
 
     fn make_receipt(block_hash: B256, block_number: u64) -> VerificationReceipt {
         let key = BlsSecretKey::random().expect("BLS key gen");
         sign_receipt(block_hash, block_number, true, true, 1_000_000, &key)
+    }
+
+    fn make_consensus_state() -> Arc<SharedConsensusState> {
+        Arc::new(SharedConsensusState::new(ValidatorSet::new(&[], 0)))
     }
 
     #[test]
@@ -621,5 +666,33 @@ mod tests {
             reward_rx.try_recv().is_err(),
             "receipt for untracked block must not trigger reward"
         );
+    }
+
+    #[tokio::test]
+    async fn test_bridge_registers_committed_blocks_from_consensus_state() {
+        let (_hub_tx, hub_rx) = mpsc::unbounded_channel();
+        let state = make_consensus_state();
+        let mut bridge = MobileVerificationBridge::new(hub_rx, 1, 100)
+            .with_consensus_state(state.clone());
+
+        state.notify_block_committed(B256::with_last_byte(0xC1), 77);
+
+        let run_once = tokio::time::timeout(std::time::Duration::from_millis(50), async {
+            tokio::select! {
+                task = async {
+                    match bridge.verification_task_rx.as_mut() {
+                        Some(rx) => rx.recv().await.ok(),
+                        None => None,
+                    }
+                } => task,
+            }
+        }).await.expect("should receive committed-block notification");
+
+        let task = run_once.expect("verification task should be present");
+        bridge.register_dispatched_block(task.block_hash, task.block_number);
+
+        let status = bridge.receipt_aggregator.get_status(&task.block_hash);
+        assert!(status.is_some(), "committed block should be registered for receipt tracking");
+        assert_eq!(status.unwrap().block_number, 77);
     }
 }
