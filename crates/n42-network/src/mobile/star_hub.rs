@@ -434,6 +434,18 @@ async fn handle_phone_connection(
                                 }
                                 match bincode::deserialize::<VerificationReceipt>(&data) {
                                     Ok(receipt) => {
+                                        // Security: reject receipts whose claimed identity differs
+                                        // from the key supplied during the QUIC handshake.  A
+                                        // malicious client must not be able to inject attestations
+                                        // on behalf of another verifier's pubkey.
+                                        if receipt.verifier_pubkey != verifier_pubkey {
+                                            tracing::warn!(
+                                                session_id,
+                                                "receipt verifier_pubkey mismatch with handshake key, dropping"
+                                            );
+                                            metrics::counter!("n42_mobile_receipt_pubkey_mismatch").increment(1);
+                                            continue;
+                                        }
                                         last_receipt_at = Some(now);
                                         metrics::counter!("n42_mobile_receipts_received").increment(1);
                                         session.record_receipt();

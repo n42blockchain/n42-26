@@ -95,7 +95,10 @@ pub fn load_consensus_state(path: &Path) -> io::Result<Option<ConsensusSnapshot>
             }
 
             if let Err(reason) = snapshot.validate() {
-                tracing::warn!(reason, "consensus snapshot failed validation; loading anyway");
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("consensus snapshot failed validation: {reason}"),
+                ));
             }
 
             Ok(Some(snapshot))
@@ -221,6 +224,34 @@ mod tests {
             ..genesis_snapshot(10)
         };
         assert!(snapshot.validate().is_err());
+    }
+
+    #[test]
+    fn test_load_invalid_snapshot_rejected() {
+        // Persist a snapshot whose locked_qc.view > current_view (violates invariant).
+        let dir = std::env::temp_dir().join("n42-test-invalid-snapshot");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("consensus_state.json");
+
+        let mut locked = QuorumCertificate::genesis();
+        locked.view = 99;
+        let snapshot = ConsensusSnapshot {
+            current_view: 10,
+            locked_qc: locked,
+            ..genesis_snapshot(10)
+        };
+        // Write without validation (bypass save_consensus_state sanity checks).
+        let json = serde_json::to_string_pretty(&snapshot).unwrap();
+        std::fs::write(&path, json).unwrap();
+
+        let result = load_consensus_state(&path);
+        assert!(result.is_err(), "load_consensus_state must reject a snapshot that fails validation");
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("failed validation"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

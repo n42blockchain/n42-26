@@ -137,6 +137,9 @@ pub struct SharedConsensusState {
     pub block_committed_tx: broadcast::Sender<VerificationTask>,
     attestation_history: Mutex<VecDeque<AttestationRecord>>,
     equivocation_log: Mutex<VecDeque<EquivocationEvidence>>,
+    /// BLS pubkeys of verifiers that have completed a QUIC handshake with StarHub.
+    /// Only keys in this set are accepted by `submit_attestation` (RPC path).
+    authorized_verifiers: Mutex<HashSet<[u8; 48]>>,
 }
 
 impl SharedConsensusState {
@@ -158,6 +161,7 @@ impl SharedConsensusState {
             block_committed_tx,
             attestation_history: Mutex::new(VecDeque::new()),
             equivocation_log: Mutex::new(VecDeque::new()),
+            authorized_verifiers: Mutex::new(HashSet::new()),
         }
     }
 
@@ -223,6 +227,28 @@ impl SharedConsensusState {
             .lock()
             .map(|log| log.iter().cloned().collect())
             .unwrap_or_default()
+    }
+
+    /// Marks a verifier pubkey as authorized (called when a QUIC handshake completes).
+    pub fn authorize_verifier(&self, pubkey: [u8; 48]) {
+        if let Ok(mut set) = self.authorized_verifiers.lock() {
+            set.insert(pubkey);
+        }
+    }
+
+    /// Removes a verifier pubkey from the authorized set (called on QUIC disconnect).
+    pub fn deauthorize_verifier(&self, pubkey: &[u8; 48]) {
+        if let Ok(mut set) = self.authorized_verifiers.lock() {
+            set.remove(pubkey);
+        }
+    }
+
+    /// Returns `true` if the pubkey has been authorized via a QUIC handshake.
+    pub fn is_authorized_verifier(&self, pubkey: &[u8; 48]) -> bool {
+        self.authorized_verifiers
+            .lock()
+            .map(|set| set.contains(pubkey))
+            .unwrap_or(false)
     }
 
     /// Registers the block for attestation tracking and notifies RPC subscribers.
@@ -386,6 +412,23 @@ mod tests {
         let (count, reached) = att.record_attestation(hash, "pk1".into()).unwrap();
         assert_eq!(count, 1);
         assert!(reached, "threshold=1, first attestation should reach it");
+    }
+
+    #[test]
+    fn test_authorized_verifiers() {
+        let state = make_state();
+        let pubkey = [0x42u8; 48];
+
+        // Initially not authorized.
+        assert!(!state.is_authorized_verifier(&pubkey));
+
+        // After authorize, should be authorized.
+        state.authorize_verifier(pubkey);
+        assert!(state.is_authorized_verifier(&pubkey));
+
+        // After deauthorize, should no longer be authorized.
+        state.deauthorize_verifier(&pubkey);
+        assert!(!state.is_authorized_verifier(&pubkey));
     }
 
     #[test]

@@ -2,9 +2,12 @@ use alloy_primitives::B256;
 use metrics::{counter, gauge};
 use n42_mobile::{ReceiptAggregator, VerificationReceipt};
 use n42_network::mobile::HubEvent;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
+
+use crate::consensus_state::SharedConsensusState;
 
 /// Notification sent when a block reaches the mobile attestation threshold.
 #[derive(Debug, Clone)]
@@ -28,7 +31,11 @@ pub struct MobileVerificationBridge {
     attestation_tx: Option<mpsc::Sender<AttestationEvent>>,
     phone_connected_tx: Option<mpsc::Sender<u64>>,
     reward_tx: Option<mpsc::UnboundedSender<String>>,
-    connected_sessions: HashSet<u64>,
+    /// Maps session_id → verifier BLS pubkey for deauthorization on disconnect.
+    connected_sessions: HashMap<u64, [u8; 48]>,
+    /// Optional shared consensus state; when set, verifier pubkeys are
+    /// authorized/deauthorized in `SharedConsensusState` on connect/disconnect.
+    consensus_state: Option<Arc<SharedConsensusState>>,
     /// Per-block invalid receipt counts for divergence detection (FIFO-bounded).
     invalid_receipt_counts: HashMap<B256, u32>,
     invalid_receipt_order: VecDeque<B256>,
@@ -50,7 +57,8 @@ impl MobileVerificationBridge {
             attestation_tx: None,
             phone_connected_tx: None,
             reward_tx: None,
-            connected_sessions: HashSet::new(),
+            connected_sessions: HashMap::new(),
+            consensus_state: None,
             invalid_receipt_counts: HashMap::new(),
             invalid_receipt_order: VecDeque::new(),
             block_first_receipt_at: HashMap::new(),
@@ -72,6 +80,21 @@ impl MobileVerificationBridge {
     pub fn with_reward_tx(mut self, tx: mpsc::UnboundedSender<String>) -> Self {
         self.reward_tx = Some(tx);
         self
+    }
+
+    /// Attaches shared consensus state so that verifier pubkeys are authorized/
+    /// deauthorized in `SharedConsensusState` as phones connect and disconnect.
+    pub fn with_consensus_state(mut self, state: Arc<SharedConsensusState>) -> Self {
+        self.consensus_state = Some(state);
+        self
+    }
+
+    /// Registers a block dispatched to mobile verifiers for tracking.
+    ///
+    /// Must be called by the node when it sends a verification task to phones.
+    /// Receipts for blocks not registered here are silently dropped.
+    pub fn register_dispatched_block(&mut self, block_hash: B256, block_number: u64) {
+        self.receipt_aggregator.register_block(block_hash, block_number);
     }
 
     /// Evicts the oldest entry from a FIFO-bounded map when at capacity, then inserts the key.
@@ -98,8 +121,11 @@ impl MobileVerificationBridge {
 
         while let Some(event) = self.hub_event_rx.recv().await {
             match event {
-                HubEvent::PhoneConnected { session_id, .. } => {
-                    self.connected_sessions.insert(session_id);
+                HubEvent::PhoneConnected { session_id, verifier_pubkey } => {
+                    self.connected_sessions.insert(session_id, verifier_pubkey);
+                    if let Some(ref state) = self.consensus_state {
+                        state.authorize_verifier(verifier_pubkey);
+                    }
                     gauge!("n42_mobile_connected_phones").set(self.connected_sessions.len() as f64);
                     self.update_dynamic_threshold();
                     debug!(
@@ -113,12 +139,19 @@ impl MobileVerificationBridge {
                     }
                 }
                 HubEvent::PhoneDisconnected { session_id } => {
-                    if !self.connected_sessions.remove(&session_id) {
-                        warn!(
-                            target: "n42::mobile",
-                            session_id,
-                            "disconnect for unknown session (duplicate event?)"
-                        );
+                    match self.connected_sessions.remove(&session_id) {
+                        Some(pubkey) => {
+                            if let Some(ref state) = self.consensus_state {
+                                state.deauthorize_verifier(&pubkey);
+                            }
+                        }
+                        None => {
+                            warn!(
+                                target: "n42::mobile",
+                                session_id,
+                                "disconnect for unknown session (duplicate event?)"
+                            );
+                        }
                     }
                     gauge!("n42_mobile_connected_phones").set(self.connected_sessions.len() as f64);
                     self.update_dynamic_threshold();
@@ -160,6 +193,10 @@ impl MobileVerificationBridge {
     }
 
     /// Public for testing; production code calls this via the event loop.
+    ///
+    /// Receipts for blocks not registered via `register_dispatched_block` are
+    /// silently dropped (aggregator returns `None`). This prevents arbitrary
+    /// block hashes from being injected by a malicious verifier.
     pub fn process_receipt(&mut self, receipt: &VerificationReceipt) {
         if let Err(e) = receipt.verify_signature() {
             warn!(
@@ -171,13 +208,7 @@ impl MobileVerificationBridge {
             return;
         }
 
-        if receipt.is_valid() {
-            counter!("n42_mobile_valid_receipts_total").increment(1);
-            if let Some(ref tx) = self.reward_tx {
-                let pubkey_hex = hex::encode(receipt.verifier_pubkey);
-                let _ = tx.send(pubkey_hex);
-            }
-        } else {
+        if !receipt.is_valid() {
             counter!("n42_mobile_invalid_receipts_total").increment(1);
             warn!(
                 target: "n42::mobile",
@@ -209,9 +240,15 @@ impl MobileVerificationBridge {
                     "CRITICAL: potential state divergence — invalid receipts exceeded 1/3 of connected verifiers"
                 );
             }
+        } else {
+            counter!("n42_mobile_valid_receipts_total").increment(1);
         }
 
-        self.receipt_aggregator.register_block(receipt.block_hash, receipt.block_number);
+        // `register_block` is intentionally NOT called here. Blocks must be
+        // registered via `register_dispatched_block` when the node dispatches
+        // a verification task. Any receipt for a block not in the aggregator
+        // returns `None` and is silently discarded without counting towards the
+        // attestation threshold or triggering a reward.
 
         if Self::fifo_ensure_entry(
             &mut self.block_first_receipt_at,
@@ -224,6 +261,13 @@ impl MobileVerificationBridge {
 
         match self.receipt_aggregator.process_receipt(receipt) {
             Some(true) => {
+                // New unique receipt for a dispatched block; threshold just crossed.
+                if receipt.is_valid() {
+                    if let Some(ref tx) = self.reward_tx {
+                        let _ = tx.send(hex::encode(receipt.verifier_pubkey));
+                    }
+                }
+
                 let valid_count = self
                     .receipt_aggregator
                     .get_status(&receipt.block_hash)
@@ -259,6 +303,12 @@ impl MobileVerificationBridge {
                 }
             }
             Some(false) => {
+                // New unique receipt for a dispatched block; threshold not yet reached.
+                if receipt.is_valid() {
+                    if let Some(ref tx) = self.reward_tx {
+                        let _ = tx.send(hex::encode(receipt.verifier_pubkey));
+                    }
+                }
                 debug!(
                     target: "n42::mobile",
                     block_number = receipt.block_number,
@@ -266,10 +316,11 @@ impl MobileVerificationBridge {
                 );
             }
             None => {
+                // Block not dispatched by this node, or duplicate receipt from same verifier.
                 warn!(
                     target: "n42::mobile",
                     block_number = receipt.block_number,
-                    "receipt for untracked block"
+                    "receipt for untracked block or duplicate verifier, dropping"
                 );
             }
         }
@@ -294,6 +345,7 @@ mod tests {
         let mut bridge = MobileVerificationBridge::new(rx, 2, 100);
 
         let block_hash = B256::with_last_byte(0x01);
+        bridge.register_dispatched_block(block_hash, 1);
         bridge.process_receipt(&make_receipt(block_hash, 1));
 
         let status = bridge.receipt_aggregator.get_status(&block_hash);
@@ -316,6 +368,7 @@ mod tests {
         let mut bridge = MobileVerificationBridge::new(rx, 1, 100).with_attestation_tx(attest_tx);
 
         let block_hash = B256::with_last_byte(0x03);
+        bridge.register_dispatched_block(block_hash, 10);
         bridge.process_receipt(&make_receipt(block_hash, 10));
 
         let event = attest_rx.try_recv().expect("attestation event should be sent");
@@ -334,6 +387,8 @@ mod tests {
         let hash_a = B256::with_last_byte(0x0A);
         let hash_b = B256::with_last_byte(0x0B);
 
+        bridge.register_dispatched_block(hash_a, 10);
+        bridge.register_dispatched_block(hash_b, 11);
         bridge.process_receipt(&make_receipt(hash_a, 10));
         bridge.process_receipt(&make_receipt(hash_a, 10));
         bridge.process_receipt(&make_receipt(hash_b, 11));
@@ -353,6 +408,7 @@ mod tests {
         let mut bridge = MobileVerificationBridge::new(rx, 2, 100);
 
         let block_hash = B256::with_last_byte(0x0C);
+        bridge.register_dispatched_block(block_hash, 20);
         let receipt = make_receipt(block_hash, 20);
         bridge.process_receipt(&receipt);
         bridge.process_receipt(&receipt);
@@ -367,6 +423,7 @@ mod tests {
         let mut bridge = MobileVerificationBridge::new(rx, 1, 100);
 
         let block_hash = B256::with_last_byte(0x0D);
+        bridge.register_dispatched_block(block_hash, 30);
         bridge.process_receipt(&make_receipt(block_hash, 30));
 
         assert!(bridge.receipt_aggregator.get_status(&block_hash).unwrap().is_attested());
@@ -378,11 +435,12 @@ mod tests {
         let mut bridge = MobileVerificationBridge::new(rx, 2, 100);
 
         for i in 0..30u64 {
-            bridge.connected_sessions.insert(i);
+            bridge.connected_sessions.insert(i, [0u8; 48]);
         }
         bridge.update_dynamic_threshold();
 
         let block_hash = B256::with_last_byte(0xF1);
+        bridge.register_dispatched_block(block_hash, 100);
         bridge.process_receipt(&make_receipt(block_hash, 100));
         assert!(
             !bridge.receipt_aggregator.get_status(&block_hash).unwrap().is_attested(),
@@ -437,6 +495,7 @@ mod tests {
         let mut bridge = MobileVerificationBridge::new(rx, 2, 100);
 
         let block_hash = B256::with_last_byte(0xE1);
+        bridge.register_dispatched_block(block_hash, 50);
         bridge.process_receipt(&make_receipt(block_hash, 50));
         assert!(bridge.block_first_receipt_at.contains_key(&block_hash));
 
@@ -465,6 +524,7 @@ mod tests {
         let mut bridge = MobileVerificationBridge::new(rx, 1, 100);
 
         let block_hash = B256::with_last_byte(0xE2);
+        bridge.register_dispatched_block(block_hash, 60);
         bridge.process_receipt(&make_receipt(block_hash, 60));
         assert!(bridge.receipt_aggregator.get_status(&block_hash).unwrap().is_attested());
     }
@@ -480,6 +540,8 @@ mod tests {
         let receipt = make_receipt(block_hash, 100);
         let expected_pubkey = hex::encode(receipt.verifier_pubkey);
 
+        // Block must be registered (dispatched) before receipts are accepted.
+        bridge.register_dispatched_block(block_hash, 100);
         bridge.process_receipt(&receipt);
 
         let received = reward_rx.try_recv().expect("reward_tx should receive pubkey");
@@ -498,6 +560,7 @@ mod tests {
         // Create invalid receipt: state_root_match = false
         let invalid_receipt = sign_receipt(block_hash, 200, false, true, 1_000_000, &key);
 
+        bridge.register_dispatched_block(block_hash, 200);
         bridge.process_receipt(&invalid_receipt);
 
         // Invalid receipt should NOT trigger reward
@@ -515,6 +578,7 @@ mod tests {
         let receipt1 = make_receipt(block_hash, 300);
         let receipt2 = make_receipt(block_hash, 300);
 
+        bridge.register_dispatched_block(block_hash, 300);
         bridge.process_receipt(&receipt1);
         bridge.process_receipt(&receipt2);
 
@@ -530,6 +594,32 @@ mod tests {
         let mut bridge = MobileVerificationBridge::new(hub_rx, 1, 100);
         // No reward_tx configured — should not panic
         let block_hash = B256::with_last_byte(0xA4);
+        bridge.register_dispatched_block(block_hash, 400);
         bridge.process_receipt(&make_receipt(block_hash, 400));
+    }
+
+    #[test]
+    fn test_untracked_block_receipt_dropped() {
+        // Receipts for blocks not registered via register_dispatched_block must be
+        // dropped without affecting attestation state or triggering a reward.
+        let (_hub_tx, hub_rx) = mpsc::unbounded_channel();
+        let (reward_tx, mut reward_rx) = mpsc::unbounded_channel();
+        let mut bridge = MobileVerificationBridge::new(hub_rx, 1, 100)
+            .with_reward_tx(reward_tx);
+
+        let block_hash = B256::with_last_byte(0xB1);
+        // Deliberately NOT calling register_dispatched_block.
+        bridge.process_receipt(&make_receipt(block_hash, 500));
+
+        // Aggregator must not have a status entry for the block.
+        assert!(
+            bridge.receipt_aggregator.get_status(&block_hash).is_none(),
+            "unregistered block must not appear in aggregator"
+        );
+        // No reward should be sent.
+        assert!(
+            reward_rx.try_recv().is_err(),
+            "receipt for untracked block must not trigger reward"
+        );
     }
 }

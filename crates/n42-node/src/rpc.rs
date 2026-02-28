@@ -221,6 +221,17 @@ impl N42ApiServer for N42RpcServer {
             ErrorObjectOwned::owned(-32003, format!("BLS signature verification failed: {e}"), None::<()>)
         })?;
 
+        // Security: only accept attestations from verifiers that completed a QUIC
+        // handshake with StarHub. Self-signed BLS proofs alone are not sufficient;
+        // the pubkey must also be in the authorized set populated by the bridge.
+        if !self.consensus_state.is_authorized_verifier(&pubkey_array) {
+            return Err(ErrorObjectOwned::owned(
+                -32004,
+                "verifier not authorized: pubkey not registered via QUIC handshake",
+                None::<()>,
+            ));
+        }
+
         let canonical_pubkey_hex = hex::encode(pubkey_array);
         let mut att_state = self.consensus_state.attestation_state.lock().map_err(|_| {
             ErrorObjectOwned::owned(-32603, "internal error: attestation state lock poisoned", None::<()>)
@@ -406,8 +417,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_submit_attestation_unknown_block() {
-        let rpc = make_rpc();
+        let vs = ValidatorSet::new(&[], 0);
+        let state = Arc::new(SharedConsensusState::new(vs));
         let sk = BlsSecretKey::random().unwrap();
+        // Authorize so we pass the identity check and reach the "unknown block" error.
+        state.authorize_verifier(sk.public_key().to_bytes());
+
+        let rpc = N42RpcServer::new(state);
         let block_hash = B256::repeat_byte(0xCC);
         let sig = sk.sign(block_hash.as_slice());
 
@@ -430,8 +446,11 @@ mod tests {
         let block_hash = B256::repeat_byte(0xDD);
         state.notify_block_committed(block_hash, 10);
 
-        let rpc = N42RpcServer::new(state);
         let sk = BlsSecretKey::random().unwrap();
+        // Authorize the verifier to simulate a completed QUIC handshake.
+        state.authorize_verifier(sk.public_key().to_bytes());
+
+        let rpc = N42RpcServer::new(state);
         let sig = sk.sign(block_hash.as_slice());
 
         let result = rpc
@@ -446,6 +465,33 @@ mod tests {
         let resp = result.unwrap();
         assert!(resp.accepted);
         assert_eq!(resp.attestation_count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_submit_attestation_unauthorized_pubkey() {
+        // A valid BLS signature from an unregistered pubkey must be rejected.
+        let vs = ValidatorSet::new(&[], 0);
+        let state = Arc::new(SharedConsensusState::new(vs));
+        let block_hash = B256::repeat_byte(0xDE);
+        state.notify_block_committed(block_hash, 11);
+        // Deliberately NOT calling state.authorize_verifier(...).
+
+        let rpc = N42RpcServer::new(state);
+        let sk = BlsSecretKey::random().unwrap();
+        let sig = sk.sign(block_hash.as_slice());
+
+        let result = rpc
+            .submit_attestation(
+                hex::encode(sk.public_key().to_bytes()),
+                hex::encode(sig.to_bytes()),
+                block_hash,
+                11,
+            )
+            .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.code(), -32004, "unauthorized verifier must return -32004");
+        assert!(err.message().contains("not authorized"));
     }
 
     #[tokio::test]
