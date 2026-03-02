@@ -13,7 +13,7 @@ const MAX_REWARD_QUEUE_SIZE: usize = 1_000_000;
 /// where n = attestation count, N = blocks_per_epoch, k = curve steepness.
 /// 5 minutes of verification yields ~50% of daily reward, discouraging 24/7 operation.
 pub struct MobileRewardManager {
-    epoch_attestations: HashMap<String, u64>,
+    epoch_attestations: HashMap<[u8; 48], u64>,
     reward_queue: VecDeque<Withdrawal>,
     last_distribution_block: u64,
     blocks_per_epoch: u64,
@@ -40,13 +40,13 @@ impl MobileRewardManager {
         }
     }
 
-    pub fn record_attestation(&mut self, pubkey_hex: &str) {
-        *self.epoch_attestations.entry(pubkey_hex.to_string()).or_insert(0) += 1;
-        let short_key = if pubkey_hex.len() >= 16 { &pubkey_hex[..16] } else { pubkey_hex };
+    pub fn record_attestation(&mut self, pubkey: &[u8; 48]) {
+        let count = self.epoch_attestations.entry(*pubkey).or_insert(0);
+        *count += 1;
         debug!(
             target: "n42::reward",
-            pubkey = short_key,
-            count = self.epoch_attestations[pubkey_hex],
+            pubkey = hex::encode(&pubkey[..8]),
+            count = *count,
             "attestation recorded"
         );
     }
@@ -94,7 +94,7 @@ impl MobileRewardManager {
 
         let remaining_capacity = MAX_REWARD_QUEUE_SIZE - self.reward_queue.len();
         let mut added = 0usize;
-        for (pubkey_hex, count) in self.epoch_attestations.drain() {
+        for (pubkey, count) in self.epoch_attestations.drain() {
             if added >= remaining_capacity {
                 warn!(
                     target: "n42::reward",
@@ -110,7 +110,7 @@ impl MobileRewardManager {
             );
             total_reward_gwei = total_reward_gwei.saturating_add(reward_gwei);
 
-            let address = bls_pubkey_hex_to_address(&pubkey_hex);
+            let address = bls_pubkey_to_address(&pubkey);
             let withdrawal = Withdrawal {
                 index: 0,
                 validator_index: 0,
@@ -204,30 +204,17 @@ fn compute_log_reward_inner(
     (reward as u64).min(daily_base_reward_gwei)
 }
 
-/// Returns `Address::ZERO` if the hex string is invalid or not exactly 48 bytes.
-fn bls_pubkey_hex_to_address(pubkey_hex: &str) -> Address {
-    match hex::decode(pubkey_hex) {
-        Ok(pubkey_bytes) if pubkey_bytes.len() == 48 => {
-            let pubkey: [u8; 48] = pubkey_bytes.try_into().unwrap();
-            n42_mobile::bls_pubkey_to_address(&pubkey)
-        }
-        _ => {
-            tracing::warn!(
-                target: "n42::reward",
-                pubkey_hex_len = pubkey_hex.len(),
-                "invalid BLS pubkey hex, returning zero address"
-            );
-            Address::ZERO
-        }
-    }
+/// Derives an EVM address from a raw 48-byte BLS12-381 public key.
+fn bls_pubkey_to_address(pubkey: &[u8; 48]) -> Address {
+    n42_mobile::bls_pubkey_to_address(pubkey)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn test_pubkey_hex(idx: u8) -> String {
-        hex::encode([idx; 48])
+    fn test_pubkey(idx: u8) -> [u8; 48] {
+        [idx; 48]
     }
 
     /// Helper: compute expected log reward for assertions.
@@ -244,7 +231,7 @@ mod tests {
     #[test]
     fn test_record_attestation() {
         let mut mgr = MobileRewardManager::new(100, 100_000_000, 4.0, 32);
-        let pk = test_pubkey_hex(1);
+        let pk = test_pubkey(1);
 
         mgr.record_attestation(&pk);
         assert_eq!(mgr.epoch_attestation_count(), 1);
@@ -257,7 +244,7 @@ mod tests {
     #[test]
     fn test_epoch_boundary_no_early_distribution() {
         let mut mgr = MobileRewardManager::new(100, 100_000_000, 4.0, 32);
-        let pk = test_pubkey_hex(1);
+        let pk = test_pubkey(1);
         mgr.record_attestation(&pk);
 
         // Block 50: not at epoch boundary
@@ -270,8 +257,8 @@ mod tests {
     fn test_epoch_boundary_distribution() {
         let mut mgr = MobileRewardManager::new(100, 100_000_000, 4.0, 32);
 
-        let pk1 = test_pubkey_hex(1);
-        let pk2 = test_pubkey_hex(2);
+        let pk1 = test_pubkey(1);
+        let pk2 = test_pubkey(2);
 
         for _ in 0..10 {
             mgr.record_attestation(&pk1);
@@ -310,7 +297,7 @@ mod tests {
         let mut mgr = MobileRewardManager::new(100, 100_000_000, 4.0, 2);
 
         for i in 0..5u8 {
-            let pk = test_pubkey_hex(i);
+            let pk = test_pubkey(i);
             mgr.record_attestation(&pk);
         }
 
@@ -334,14 +321,14 @@ mod tests {
     fn test_no_double_distribution() {
         let mut mgr = MobileRewardManager::new(100, 100_000_000, 4.0, 32);
 
-        let pk = test_pubkey_hex(1);
+        let pk = test_pubkey(1);
         mgr.record_attestation(&pk);
 
         mgr.check_epoch_boundary(100);
         assert_eq!(mgr.pending_count(), 1);
 
         // Same block shouldn't trigger again
-        mgr.record_attestation(&test_pubkey_hex(2));
+        mgr.record_attestation(&test_pubkey(2));
         mgr.check_epoch_boundary(100);
         assert_eq!(mgr.pending_count(), 1); // no new rewards added
     }
@@ -351,7 +338,7 @@ mod tests {
         let mut mgr = MobileRewardManager::new(100, 100_000_000, 4.0, 32);
 
         for i in 0..3u8 {
-            mgr.record_attestation(&test_pubkey_hex(i));
+            mgr.record_attestation(&test_pubkey(i));
         }
         mgr.check_epoch_boundary(100);
 
@@ -361,7 +348,7 @@ mod tests {
         assert_eq!(indices, vec![100 * 32, 100 * 32 + 1, 100 * 32 + 2]);
 
         // Next epoch - different block, different index range
-        mgr.record_attestation(&test_pubkey_hex(10));
+        mgr.record_attestation(&test_pubkey(10));
         mgr.check_epoch_boundary(200);
 
         let rewards2 = mgr.take_pending_rewards(200);
@@ -370,11 +357,11 @@ mod tests {
 
     #[test]
     fn test_bls_pubkey_to_address_deterministic() {
-        let addr1 = bls_pubkey_hex_to_address(&test_pubkey_hex(1));
-        let addr2 = bls_pubkey_hex_to_address(&test_pubkey_hex(1));
+        let addr1 = bls_pubkey_to_address(&test_pubkey(1));
+        let addr2 = bls_pubkey_to_address(&test_pubkey(1));
         assert_eq!(addr1, addr2);
 
-        let addr3 = bls_pubkey_hex_to_address(&test_pubkey_hex(2));
+        let addr3 = bls_pubkey_to_address(&test_pubkey(2));
         assert_ne!(addr1, addr3);
     }
 
@@ -386,30 +373,27 @@ mod tests {
     }
 
     #[test]
-    fn test_short_pubkey_hex_no_panic() {
+    fn test_distinct_pubkeys_tracked_separately() {
         let mut mgr = MobileRewardManager::new(100, 100_000_000, 4.0, 32);
-        // Short strings (< 16 chars) should not panic
-        mgr.record_attestation("ab");
-        mgr.record_attestation("");
-        mgr.record_attestation("0123456789abcde"); // exactly 15 chars
+        // Three distinct pubkeys, each recorded once
+        mgr.record_attestation(&test_pubkey(0xAA));
+        mgr.record_attestation(&test_pubkey(0xBB));
+        mgr.record_attestation(&test_pubkey(0xCC));
         assert_eq!(mgr.epoch_attestation_count(), 3);
     }
 
     #[test]
-    fn test_invalid_hex_address_returns_zero() {
-        // Invalid hex should produce Address::ZERO
-        let addr = bls_pubkey_hex_to_address("not_valid_hex!!!");
-        assert_eq!(addr, Address::ZERO);
-
-        // Empty string should produce Address::ZERO
-        let addr2 = bls_pubkey_hex_to_address("");
-        assert_eq!(addr2, Address::ZERO);
+    fn test_bls_pubkey_to_address_non_zero() {
+        // A non-zero pubkey must produce a non-zero address.
+        let pk = test_pubkey(1);
+        let addr = bls_pubkey_to_address(&pk);
+        assert_ne!(addr, Address::ZERO);
     }
 
     #[test]
     fn test_zero_blocks_per_epoch_no_distribution() {
         let mut mgr = MobileRewardManager::new(0, 100_000_000, 4.0, 32);
-        let pk = test_pubkey_hex(1);
+        let pk = test_pubkey(1);
         mgr.record_attestation(&pk);
 
         // Should return early without distributing
@@ -431,7 +415,7 @@ mod tests {
 
         // Epoch 1: 3 validators
         for i in 0..3u8 {
-            mgr.record_attestation(&test_pubkey_hex(i));
+            mgr.record_attestation(&test_pubkey(i));
         }
         mgr.check_epoch_boundary(10);
         assert_eq!(mgr.pending_count(), 3);
@@ -443,7 +427,7 @@ mod tests {
 
         // Epoch 2: 2 more validators (queue should grow)
         for i in 10..12u8 {
-            mgr.record_attestation(&test_pubkey_hex(i));
+            mgr.record_attestation(&test_pubkey(i));
         }
         mgr.check_epoch_boundary(20);
         assert_eq!(mgr.pending_count(), 3); // 1 leftover + 2 new
@@ -458,12 +442,11 @@ mod tests {
 
     #[test]
     fn test_reward_address_matches_expected_derivation() {
-        let pk = test_pubkey_hex(42);
-        let addr = bls_pubkey_hex_to_address(&pk);
+        let pk = test_pubkey(42);
+        let addr = bls_pubkey_to_address(&pk);
 
-        // Manually compute expected address
-        let bytes = hex::decode(&pk).unwrap();
-        let hash = alloy_primitives::keccak256(&bytes);
+        // Manually compute expected address: keccak256(pubkey_bytes)[12..]
+        let hash = alloy_primitives::keccak256(&pk);
         let expected = Address::from_slice(&hash[12..]);
         assert_eq!(addr, expected);
         assert_ne!(addr, Address::ZERO);
@@ -474,7 +457,7 @@ mod tests {
         // With log curve, even u64::MAX base reward shouldn't overflow.
         // n=2, N=1 → n capped to 1, ratio = 1.0, reward = R_max
         let mut mgr = MobileRewardManager::new(1, u64::MAX, 4.0, 32);
-        let pk = test_pubkey_hex(1);
+        let pk = test_pubkey(1);
 
         mgr.record_attestation(&pk);
         mgr.record_attestation(&pk);
@@ -491,7 +474,7 @@ mod tests {
         let mut mgr = MobileRewardManager::new(100, 1_000, 4.0, 32);
 
         for i in 0..100u8 {
-            mgr.record_attestation(&test_pubkey_hex(i));
+            mgr.record_attestation(&test_pubkey(i));
         }
         assert_eq!(mgr.epoch_attestation_count(), 100);
 

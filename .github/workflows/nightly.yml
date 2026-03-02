@@ -26,6 +26,11 @@ jobs:
         with:
           cache-on-failure: true
 
+      - name: Security audit
+        run: |
+          cargo install cargo-audit --locked --quiet
+          cargo audit
+
       - name: Build n42-node binary
         run: cargo build --release -p n42-node
         env:

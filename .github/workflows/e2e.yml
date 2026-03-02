@@ -21,6 +21,19 @@ jobs:
         with:
           cache-on-failure: true
 
+      - name: Check (all targets)
+        run: cargo check --all-targets
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+        env:
+          RUSTFLAGS: ""
+
+      - name: Unit tests
+        run: cargo test --workspace --exclude e2e-test
+        env:
+          RUST_LOG: error
+
       - name: Build n42-node binary
         run: cargo build --release -p n42-node
         env:

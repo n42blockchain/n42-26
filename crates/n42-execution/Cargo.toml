@@ -29,6 +29,7 @@ serde.workspace = true
 eyre.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+metrics.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

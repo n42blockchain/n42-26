@@ -112,6 +112,8 @@ impl ReceiptAggregator {
             block_hash,
             BlockVerificationStatus::new(block_hash, block_number, self.default_threshold),
         );
+        // TTL = 256 blocks ≈ 34 minutes at 8-second slots.
+        self.prune_old_blocks(block_number, 256);
     }
 
     /// Processes a verification receipt.
@@ -152,6 +154,17 @@ impl ReceiptAggregator {
     /// Updates the default threshold for newly registered blocks (clamped to 1 if 0).
     pub fn set_default_threshold(&mut self, threshold: u32) {
         self.default_threshold = clamp_threshold(threshold);
+    }
+
+    /// Removes blocks whose block number is older than `current_block - ttl_blocks`.
+    ///
+    /// Prevents unbounded memory growth when `max_tracked_blocks` is large and blocks
+    /// accumulate over time without being explicitly evicted.
+    ///
+    /// `ttl_blocks = 256` ≈ 34 minutes at 8-second slots.
+    pub fn prune_old_blocks(&mut self, current_block: u64, ttl_blocks: u64) {
+        let cutoff = current_block.saturating_sub(ttl_blocks);
+        self.blocks.retain(|_, s| s.block_number >= cutoff);
     }
 }
 

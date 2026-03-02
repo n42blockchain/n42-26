@@ -99,20 +99,32 @@ impl Default for StarHubConfig {
 /// Handle for sending commands to the running `StarHub`. Cheaply cloneable.
 #[derive(Clone, Debug)]
 pub struct StarHubHandle {
-    command_tx: mpsc::UnboundedSender<HubCommand>,
+    command_tx: mpsc::Sender<HubCommand>,
 }
 
 impl StarHubHandle {
+    /// Sends a command, dropping silently (with warn + counter) if the buffer is full.
+    /// Returns `Err(ChannelClosed)` only when the hub has shut down.
+    fn try_command(&self, cmd: HubCommand, label: &str) -> Result<(), crate::error::NetworkError> {
+        match self.command_tx.try_send(cmd) {
+            Ok(()) => Ok(()),
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                Err(crate::error::NetworkError::ChannelClosed)
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                tracing::warn!(label, "StarHub command channel full, dropping");
+                metrics::counter!("n42_starhub_drops_total").increment(1);
+                Ok(())
+            }
+        }
+    }
+
     pub fn broadcast_packet(&self, data: Bytes) -> Result<(), crate::error::NetworkError> {
-        self.command_tx
-            .send(HubCommand::BroadcastPacket(data))
-            .map_err(|_| crate::error::NetworkError::ChannelClosed)
+        self.try_command(HubCommand::BroadcastPacket(data), "broadcast_packet")
     }
 
     pub fn broadcast_cache_sync(&self, data: Bytes) -> Result<(), crate::error::NetworkError> {
-        self.command_tx
-            .send(HubCommand::BroadcastCacheSync(data))
-            .map_err(|_| crate::error::NetworkError::ChannelClosed)
+        self.try_command(HubCommand::BroadcastCacheSync(data), "broadcast_cache_sync")
     }
 
     pub fn send_to_session(
@@ -120,9 +132,7 @@ impl StarHubHandle {
         session_id: u64,
         data: Bytes,
     ) -> Result<(), crate::error::NetworkError> {
-        self.command_tx
-            .send(HubCommand::SendToSession { session_id, data })
-            .map_err(|_| crate::error::NetworkError::ChannelClosed)
+        self.try_command(HubCommand::SendToSession { session_id, data }, "send_to_session")
     }
 }
 
@@ -149,8 +159,8 @@ type SessionSenders = Arc<RwLock<HashMap<u64, (mpsc::Sender<Bytes>, Arc<MobileSe
 pub struct StarHub {
     sessions: Arc<RwLock<HashMap<u64, Arc<MobileSession>>>>,
     config: StarHubConfig,
-    command_rx: mpsc::UnboundedReceiver<HubCommand>,
-    event_tx: mpsc::UnboundedSender<HubEvent>,
+    command_rx: mpsc::Receiver<HubCommand>,
+    event_tx: mpsc::Sender<HubEvent>,
     /// Per-session senders with session Arc for tiered broadcast.
     session_senders: SessionSenders,
     cert_hash: Option<[u8; 32]>,
@@ -162,9 +172,9 @@ impl StarHub {
     /// Creates a new star hub and returns the hub, handle, and event receiver.
     pub fn new(
         config: StarHubConfig,
-    ) -> (Self, StarHubHandle, mpsc::UnboundedReceiver<HubEvent>) {
-        let (command_tx, command_rx) = mpsc::unbounded_channel();
-        let (event_tx, event_rx) = mpsc::unbounded_channel();
+    ) -> (Self, StarHubHandle, mpsc::Receiver<HubEvent>) {
+        let (command_tx, command_rx) = mpsc::channel(4096);
+        let (event_tx, event_rx) = mpsc::channel(4096);
 
         let hub = Self {
             sessions: Arc::new(RwLock::new(HashMap::new())),
@@ -183,7 +193,7 @@ impl StarHub {
     pub fn new_with_shared_id_gen(
         config: StarHubConfig,
         id_gen: Arc<SessionIdGenerator>,
-    ) -> (Self, StarHubHandle, mpsc::UnboundedReceiver<HubEvent>) {
+    ) -> (Self, StarHubHandle, mpsc::Receiver<HubEvent>) {
         let (mut hub, handle, event_rx) = Self::new(config);
         hub.shared_session_id_gen = Some(id_gen);
         (hub, handle, event_rx)
@@ -342,7 +352,7 @@ async fn handle_phone_connection(
     session_id: u64,
     connection: quinn::Connection,
     sessions: Arc<RwLock<HashMap<u64, Arc<MobileSession>>>>,
-    event_tx: mpsc::UnboundedSender<HubEvent>,
+    event_tx: mpsc::Sender<HubEvent>,
     session_tx: mpsc::Sender<Bytes>,
     mut session_rx: mpsc::Receiver<Bytes>,
     session_senders: SessionSenders,
@@ -404,7 +414,7 @@ async fn handle_phone_connection(
         guard.insert(session_id, session.clone());
     }
     session_senders.write().await.insert(session_id, (session_tx, session.clone()));
-    let _ = event_tx.send(HubEvent::PhoneConnected { session_id, verifier_pubkey });
+    let _ = event_tx.try_send(HubEvent::PhoneConnected { session_id, verifier_pubkey });
     tracing::debug!(session_id, "handshake complete, session active");
 
     let mut last_receipt_at: Option<Instant> = None;
@@ -456,7 +466,7 @@ async fn handle_phone_connection(
                                         if receipt.timestamp_ms > 0 && now_ms > receipt.timestamp_ms {
                                             session.record_rtt(now_ms - receipt.timestamp_ms);
                                         }
-                                        let _ = event_tx.send(HubEvent::ReceiptReceived(receipt));
+                                        let _ = event_tx.try_send(HubEvent::ReceiptReceived(receipt));
                                     }
                                     Err(e) => {
                                         tracing::warn!(session_id, error = %e, "failed to decode receipt");
@@ -516,7 +526,7 @@ async fn handle_phone_connection(
 
     sessions.write().await.remove(&session_id);
     session_senders.write().await.remove(&session_id);
-    let _ = event_tx.send(HubEvent::PhoneDisconnected { session_id });
+    let _ = event_tx.try_send(HubEvent::PhoneDisconnected { session_id });
     tracing::debug!(session_id, "phone disconnected");
 }
 

@@ -92,6 +92,9 @@ pub struct ConsensusOrchestrator {
     blob_store: Option<DiskFileBlobStore>,
     mobile_reward_manager: Option<Arc<Mutex<MobileRewardManager>>>,
     committed_block_count: u64,
+    /// Timestamp when the current view started (recorded on ViewChanged).
+    /// Used to measure commit latency: time from view start to BlockCommitted.
+    view_started_at: Option<tokio::time::Instant>,
     /// Epoch schedule loaded from `epoch_schedule.json`.
     /// Used to pre-stage the next epoch's validator set at each epoch transition.
     epoch_schedule: Option<EpochSchedule>,
@@ -140,6 +143,7 @@ impl ConsensusOrchestrator {
             blob_store: None,
             mobile_reward_manager: None,
             committed_block_count: 0,
+            view_started_at: None,
             epoch_schedule: None,
         }
     }
@@ -202,6 +206,7 @@ impl ConsensusOrchestrator {
             blob_store: None,
             mobile_reward_manager: None,
             committed_block_count: 0,
+            view_started_at: None,
             epoch_schedule: None,
         }
     }
@@ -653,6 +658,7 @@ mod tests {
             blob_store: None,
             mobile_reward_manager: None,
             committed_block_count: 0,
+            view_started_at: None,
             epoch_schedule: None,
         };
 
@@ -711,6 +717,7 @@ mod tests {
             blob_store: None,
             mobile_reward_manager: None,
             committed_block_count: 0,
+            view_started_at: None,
             epoch_schedule: None,
         };
 

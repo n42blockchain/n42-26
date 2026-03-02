@@ -5541,6 +5541,7 @@ dependencies = [
  "alloy-rpc-types-engine",
  "bincode",
  "eyre",
+ "metrics",
  "n42-chainspec",
  "reth-chainspec",
  "reth-ethereum-primitives",

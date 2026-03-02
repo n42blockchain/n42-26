@@ -148,13 +148,29 @@ impl Default for ConsensusConfig {
 /// N42 chain ID.
 pub const N42_CHAIN_ID: u64 = 4242;
 
+/// Returns the effective chain ID, allowing override via `N42_CHAIN_ID` environment variable.
+///
+/// This enables testnet/devnet deployments to use a different chain ID without recompiling.
+/// The constant `N42_CHAIN_ID = 4242` is used as the default.
+///
+/// # Example
+/// ```bash
+/// N42_CHAIN_ID=1337 ./n42-node
+/// ```
+fn effective_chain_id() -> u64 {
+    std::env::var("N42_CHAIN_ID")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(N42_CHAIN_ID)
+}
+
 /// Create the N42 dev chain spec (reth ChainSpec) for testing.
 /// This enables all Ethereum hardforks up through Cancun to get a modern EVM.
 pub fn n42_dev_chainspec() -> Arc<ChainSpec> {
     let genesis = Genesis::default();
 
     let spec = ChainSpecBuilder::default()
-        .chain(Chain::from_id(N42_CHAIN_ID))
+        .chain(Chain::from_id(effective_chain_id()))
         .genesis(genesis)
         .cancun_activated()
         .build();
@@ -195,7 +211,7 @@ pub fn n42_dev_chainspec_with_alloc(validators: &[ValidatorInfo]) -> Arc<ChainSp
     let genesis = Genesis { alloc, ..Default::default() };
     Arc::new(
         ChainSpecBuilder::default()
-            .chain(Chain::from_id(N42_CHAIN_ID))
+            .chain(Chain::from_id(effective_chain_id()))
             .genesis(genesis)
             .cancun_activated()
             .build(),
@@ -213,7 +229,7 @@ pub fn n42_chainspec_from_genesis(genesis_path: &Path) -> Result<Arc<ChainSpec>,
         .map_err(|e| format!("parse genesis {}: {e}", genesis_path.display()))?;
     Ok(Arc::new(
         ChainSpecBuilder::default()
-            .chain(Chain::from_id(N42_CHAIN_ID))
+            .chain(Chain::from_id(effective_chain_id()))
             .genesis(genesis)
             .cancun_activated()
             .build(),
@@ -605,5 +621,25 @@ epoch_length = 0
         assert_eq!(c10.quorum_size(), 7);
         assert_eq!(c10.initial_validators.len(), 10);
         assert!(c10.validate().is_ok(), "10-validator config should be valid");
+    }
+
+    #[test]
+    fn test_chain_id_default() {
+        // Without env override, effective_chain_id() returns the compile-time constant.
+        // (Only safe to assert when N42_CHAIN_ID env var is not set in the test environment.)
+        if std::env::var("N42_CHAIN_ID").is_err() {
+            assert_eq!(effective_chain_id(), N42_CHAIN_ID);
+        }
+    }
+
+    #[test]
+    fn test_chain_id_env_override() {
+        // Temporarily set the env var to a custom value and verify it takes effect.
+        // NOTE: env vars are process-wide; this test must not run concurrently with
+        // other tests that call effective_chain_id(). Mark tests appropriately in CI.
+        unsafe { std::env::set_var("N42_CHAIN_ID", "1337") };
+        let id = effective_chain_id();
+        unsafe { std::env::remove_var("N42_CHAIN_ID") };
+        assert_eq!(id, 1337, "N42_CHAIN_ID env var should override the default chain ID");
     }
 }

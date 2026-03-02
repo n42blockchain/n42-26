@@ -7,7 +7,7 @@ use n42_primitives::QuorumCertificate;
 use reth_payload_primitives::EngineApiMessageVersion;
 use std::time::Duration;
 use tokio::time::Instant;
-use metrics::{counter, gauge};
+use metrics::{counter, gauge, histogram};
 use tracing::{debug, error, info, warn};
 
 impl ConsensusOrchestrator {
@@ -107,6 +107,7 @@ impl ConsensusOrchestrator {
                 self.handle_view_changed(new_view).await;
             }
             EngineOutput::SyncRequired { local_view, target_view } => {
+                counter!("n42_sync_required_total").increment(1);
                 self.initiate_sync(local_view, target_view);
             }
             EngineOutput::EquivocationDetected { view, validator, hash1, hash2 } => {
@@ -124,6 +125,9 @@ impl ConsensusOrchestrator {
             }
             EngineOutput::EpochTransition { new_epoch, validator_count } => {
                 info!(new_epoch, validator_count, "epoch transition: validator set updated");
+                counter!("n42_epoch_transitions_total").increment(1);
+                gauge!("n42_epoch_validator_count").set(validator_count as f64);
+
                 let updated_vs = self.engine.epoch_manager().current_validator_set().clone();
                 self.validator_set_for_sync = Some(updated_vs);
 
@@ -173,6 +177,9 @@ impl ConsensusOrchestrator {
         self.committed_block_count += 1;
         counter!("n42_blocks_committed_total").increment(1);
         gauge!("n42_consensus_view").set(view as f64);
+        if let Some(t) = self.view_started_at.take() {
+            histogram!("n42_consensus_commit_latency_ms").record(t.elapsed().as_millis() as f64);
+        }
         info!(view, block_number = self.committed_block_count, %block_hash, "block committed by consensus");
 
         if let Some(ref state) = self.consensus_state {
@@ -274,6 +281,7 @@ impl ConsensusOrchestrator {
 
     async fn handle_view_changed(&mut self, new_view: u64) {
         counter!("n42_view_changes_total").increment(1);
+        self.view_started_at = Some(tokio::time::Instant::now());
         info!(new_view, "view changed");
 
         // ViewChanged fires immediately after BlockCommitted in f=0 configs;

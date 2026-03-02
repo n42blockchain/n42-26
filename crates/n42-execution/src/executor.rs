@@ -7,6 +7,7 @@ use reth_evm::{
 use reth_primitives_traits::{NodePrimitives, RecoveredBlock};
 use std::time::Instant;
 use tracing::{debug, warn};
+use metrics::histogram;
 
 /// Result of block execution with witness data.
 pub struct ExecutionWithWitness {
@@ -49,6 +50,7 @@ pub fn execute_block_with_witness<DB: Database>(
     })?;
 
     let elapsed_ms = start.elapsed().as_millis() as u64;
+    histogram!("n42_execution_block_ms").record(elapsed_ms as f64);
     debug!(
         target: "n42::execution",
         elapsed_ms,
@@ -89,6 +91,7 @@ pub fn execute_block_full<DB: Database>(
     }
 
     let elapsed_ms = start.elapsed().as_millis() as u64;
+    histogram!("n42_execution_block_ms").record(elapsed_ms as f64);
     debug!(
         target: "n42::execution",
         elapsed_ms,

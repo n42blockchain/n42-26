@@ -30,7 +30,7 @@ pub struct MobileVerificationBridge {
     receipt_aggregator: ReceiptAggregator,
     attestation_tx: Option<mpsc::Sender<AttestationEvent>>,
     phone_connected_tx: Option<mpsc::Sender<u64>>,
-    reward_tx: Option<mpsc::UnboundedSender<String>>,
+    reward_tx: Option<mpsc::UnboundedSender<[u8; 48]>>,
     /// Maps session_id → verifier BLS pubkey for deauthorization on disconnect.
     connected_sessions: HashMap<u64, [u8; 48]>,
     /// Optional shared consensus state; when set, verifier pubkeys are
@@ -81,7 +81,7 @@ impl MobileVerificationBridge {
         self
     }
 
-    pub fn with_reward_tx(mut self, tx: mpsc::UnboundedSender<String>) -> Self {
+    pub fn with_reward_tx(mut self, tx: mpsc::UnboundedSender<[u8; 48]>) -> Self {
         self.reward_tx = Some(tx);
         self
     }
@@ -304,7 +304,7 @@ impl MobileVerificationBridge {
                 // New unique receipt for a dispatched block; threshold just crossed.
                 if receipt.is_valid() {
                     if let Some(ref tx) = self.reward_tx {
-                        let _ = tx.send(hex::encode(receipt.verifier_pubkey));
+                        let _ = tx.send(receipt.verifier_pubkey);
                     }
                 }
 
@@ -346,7 +346,7 @@ impl MobileVerificationBridge {
                 // New unique receipt for a dispatched block; threshold not yet reached.
                 if receipt.is_valid() {
                     if let Some(ref tx) = self.reward_tx {
-                        let _ = tx.send(hex::encode(receipt.verifier_pubkey));
+                        let _ = tx.send(receipt.verifier_pubkey);
                     }
                 }
                 debug!(
@@ -583,7 +583,7 @@ mod tests {
 
         let block_hash = B256::with_last_byte(0xA1);
         let receipt = make_receipt(block_hash, 100);
-        let expected_pubkey = hex::encode(receipt.verifier_pubkey);
+        let expected_pubkey = receipt.verifier_pubkey;
 
         // Block must be registered (dispatched) before receipts are accepted.
         bridge.register_dispatched_block(block_hash, 100);
@@ -630,7 +630,7 @@ mod tests {
         // Both valid receipts should trigger reward_tx
         let pk1 = reward_rx.try_recv().expect("first reward");
         let pk2 = reward_rx.try_recv().expect("second reward");
-        assert_ne!(pk1, pk2, "different BLS keys should produce different pubkey hex");
+        assert_ne!(pk1, pk2, "different BLS keys should produce different pubkeys");
     }
 
     #[test]

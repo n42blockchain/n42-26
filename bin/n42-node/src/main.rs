@@ -374,9 +374,9 @@ fn main() {
                 task_executor.spawn_critical_task(
                     "n42-reward-tracker",
                     Box::pin(async move {
-                        while let Some(pubkey_hex) = reward_attest_rx.recv().await {
+                        while let Some(pubkey) = reward_attest_rx.recv().await {
                             if let Ok(mut mgr) = reward_mgr_tracker.lock() {
-                                mgr.record_attestation(&pubkey_hex);
+                                mgr.record_attestation(&pubkey);
                             }
                         }
                     }),

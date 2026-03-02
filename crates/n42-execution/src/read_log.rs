@@ -37,7 +37,20 @@ use revm::{
     state::AccountInfo,
 };
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
+
+/// Acquires a mutex lock, recovering from poisoned state instead of panicking.
+///
+/// If the previous holder panicked while holding the lock, the mutex becomes "poisoned".
+/// Rather than propagating the panic to all subsequent callers (which would crash the node),
+/// we recover the inner value and log a warning. The recovered data is valid; the poison
+/// only means the previous holder didn't finish cleanly.
+fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poisoned| {
+        tracing::warn!("read_log mutex poisoned, recovering inner value");
+        poisoned.into_inner()
+    })
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReadLogEntry {
@@ -84,7 +97,7 @@ impl<DB> ReadLogDatabase<DB> {
     /// Captures non-empty bytecode into the shared code map (idempotent).
     fn capture_bytecode(&self, code_hash: B256, bytecode: &Bytecode) {
         if code_hash != alloy_primitives::KECCAK256_EMPTY {
-            let mut codes = self.captured_codes.lock().unwrap();
+            let mut codes = lock_or_recover(&self.captured_codes);
             codes
                 .entry(code_hash)
                 .or_insert_with(|| Bytes::copy_from_slice(bytecode.original_byte_slice()));
@@ -100,7 +113,7 @@ where
 
     fn basic(&mut self, address: alloy_primitives::Address) -> Result<Option<AccountInfo>, Self::Error> {
         let result = self.inner.basic(address)?;
-        let mut log = self.log.lock().unwrap();
+        let mut log = lock_or_recover(&self.log);
         match &result {
             None => log.push(ReadLogEntry::AccountNotFound),
             Some(info) => {
@@ -129,14 +142,14 @@ where
         index: StorageKey,
     ) -> Result<U256, Self::Error> {
         let value = self.inner.storage(address, index)?;
-        let mut log = self.log.lock().unwrap();
+        let mut log = lock_or_recover(&self.log);
         log.push(ReadLogEntry::Storage(value));
         Ok(value)
     }
 
     fn block_hash(&mut self, number: u64) -> Result<B256, Self::Error> {
         let hash = self.inner.block_hash(number)?;
-        let mut log = self.log.lock().unwrap();
+        let mut log = lock_or_recover(&self.log);
         log.push(ReadLogEntry::BlockHash(hash));
         Ok(hash)
     }

@@ -149,7 +149,7 @@ impl ConsensusOrchestrator {
 
             if timed_out {
                 warn!(
-                    elapsed_secs = self.sync_started_at.unwrap().elapsed().as_secs(),
+                    elapsed_secs = self.sync_started_at.map_or(0, |t| t.elapsed().as_secs()),
                     "sync request timed out, resetting"
                 );
                 self.sync_in_flight = false;
