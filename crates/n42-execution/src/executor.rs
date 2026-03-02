@@ -82,12 +82,16 @@ pub fn execute_block_full<DB: Database>(
     let diff = StateDiff::from_bundle_state(&output.state);
 
     if witness.hashed_state.accounts.len() < diff.len() {
+        // This can happen legitimately when accounts are first created (CREATE
+        // opcode) or coinbase rewards are applied without an explicit read — the
+        // account appears in diff but not in the read-set captured by from_state.
         warn!(
             target: "n42::execution",
             witness = witness.hashed_state.accounts.len(),
             diff = diff.len(),
             "witness accounts < diff accounts"
         );
+        histogram!("n42_execution_witness_gap").record((diff.len() - witness.hashed_state.accounts.len()) as f64);
     }
 
     let elapsed_ms = start.elapsed().as_millis() as u64;

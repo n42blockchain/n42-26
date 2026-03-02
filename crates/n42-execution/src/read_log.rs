@@ -47,7 +47,12 @@ use std::sync::{Arc, Mutex, MutexGuard};
 /// only means the previous holder didn't finish cleanly.
 fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|poisoned| {
+        // A poison means a previous EVM execution thread panicked while holding
+        // this lock.  The data itself is still valid (partial writes are not
+        // possible for our append-only log), so recover and continue.  The
+        // counter lets operators detect if this happens in production.
         tracing::warn!("read_log mutex poisoned, recovering inner value");
+        metrics::counter!("n42_read_log_mutex_poison_total").increment(1);
         poisoned.into_inner()
     })
 }

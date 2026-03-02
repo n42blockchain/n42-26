@@ -414,7 +414,12 @@ async fn handle_phone_connection(
         guard.insert(session_id, session.clone());
     }
     session_senders.write().await.insert(session_id, (session_tx, session.clone()));
-    let _ = event_tx.try_send(HubEvent::PhoneConnected { session_id, verifier_pubkey });
+    if event_tx.try_send(HubEvent::PhoneConnected { session_id, verifier_pubkey }).is_err() {
+        // Channel full: the bridge won't see this connection, so its threshold
+        // and authorized-verifier state will be stale.  Warn loudly.
+        tracing::warn!(session_id, "event channel full, PhoneConnected event dropped");
+        metrics::counter!("n42_hub_event_drops_total").increment(1);
+    }
     tracing::debug!(session_id, "handshake complete, session active");
 
     let mut last_receipt_at: Option<Instant> = None;
@@ -466,7 +471,10 @@ async fn handle_phone_connection(
                                         if receipt.timestamp_ms > 0 && now_ms > receipt.timestamp_ms {
                                             session.record_rtt(now_ms - receipt.timestamp_ms);
                                         }
-                                        let _ = event_tx.try_send(HubEvent::ReceiptReceived(receipt));
+                                        if event_tx.try_send(HubEvent::ReceiptReceived(receipt)).is_err() {
+                                            metrics::counter!("n42_hub_event_drops_total").increment(1);
+                                            tracing::debug!(session_id, "event channel full, receipt dropped");
+                                        }
                                     }
                                     Err(e) => {
                                         tracing::warn!(session_id, error = %e, "failed to decode receipt");
@@ -526,7 +534,12 @@ async fn handle_phone_connection(
 
     sessions.write().await.remove(&session_id);
     session_senders.write().await.remove(&session_id);
-    let _ = event_tx.try_send(HubEvent::PhoneDisconnected { session_id });
+    if event_tx.try_send(HubEvent::PhoneDisconnected { session_id }).is_err() {
+        // Dropping PhoneDisconnected means the bridge won't decrement its
+        // connected count, causing the attestation threshold to remain too high.
+        tracing::warn!(session_id, "event channel full, PhoneDisconnected event dropped");
+        metrics::counter!("n42_hub_event_drops_total").increment(1);
+    }
     tracing::debug!(session_id, "phone disconnected");
 }
 

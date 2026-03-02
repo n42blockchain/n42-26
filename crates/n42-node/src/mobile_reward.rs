@@ -92,32 +92,51 @@ impl MobileRewardManager {
         let daily_base_reward_gwei = self.daily_base_reward_gwei;
         let curve_k = self.curve_k;
 
+        // Collect all entries before processing: this ensures the HashMap is
+        // always fully cleared even if we hit the capacity cap mid-loop.
+        // Using drain() inside a `break`-able loop would silently drop the
+        // remaining entries (Drain::drop clears the HashMap), causing those
+        // validators to lose their rewards without any log message.
+        let entries: Vec<([u8; 48], u64)> = self.epoch_attestations.drain().collect();
+
         let remaining_capacity = MAX_REWARD_QUEUE_SIZE - self.reward_queue.len();
+        if entries.len() > remaining_capacity {
+            warn!(
+                target: "n42::reward",
+                total = entries.len(),
+                capacity = remaining_capacity,
+                discarded = entries.len() - remaining_capacity,
+                "reward queue near capacity; excess validator rewards discarded for this epoch"
+            );
+        }
+
         let mut added = 0usize;
-        for (pubkey, count) in self.epoch_attestations.drain() {
-            if added >= remaining_capacity {
-                warn!(
-                    target: "n42::reward",
-                    added,
-                    remaining_capacity,
-                    "reward queue capacity reached during epoch distribution"
-                );
-                break;
+        for (pubkey, count) in entries.iter().take(remaining_capacity) {
+            let reward_gwei = compute_log_reward_inner(
+                *count, blocks_per_epoch, daily_base_reward_gwei, curve_k,
+            );
+
+            if reward_gwei == 0 {
+                continue;
             }
 
-            let reward_gwei = compute_log_reward_inner(
-                count, blocks_per_epoch, daily_base_reward_gwei, curve_k,
-            );
-            total_reward_gwei = total_reward_gwei.saturating_add(reward_gwei);
+            let address = bls_pubkey_to_address(pubkey);
+            if address.is_zero() {
+                warn!(
+                    target: "n42::reward",
+                    pubkey = hex::encode(&pubkey[..8]),
+                    "bls_pubkey_to_address returned zero address, skipping reward"
+                );
+                continue;
+            }
 
-            let address = bls_pubkey_to_address(&pubkey);
-            let withdrawal = Withdrawal {
+            total_reward_gwei = total_reward_gwei.saturating_add(reward_gwei);
+            self.reward_queue.push_back(Withdrawal {
                 index: 0,
                 validator_index: 0,
                 address,
                 amount: reward_gwei,
-            };
-            self.reward_queue.push_back(withdrawal);
+            });
             added += 1;
         }
 
@@ -125,7 +144,8 @@ impl MobileRewardManager {
             target: "n42::reward",
             current_block,
             epoch = current_epoch,
-            validator_count,
+            eligible_validators = validator_count,
+            rewarded = added,
             total_reward_gwei,
             queue_size = self.reward_queue.len(),
             "epoch reward distribution computed"

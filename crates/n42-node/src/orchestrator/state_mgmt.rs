@@ -4,41 +4,57 @@ use alloy_primitives::B256;
 use n42_consensus::verify_commit_qc;
 use n42_network::{BlockSyncResponse, PeerId, SyncBlock};
 use n42_primitives::QuorumCertificate;
+use std::sync::LazyLock;
 use std::time::Duration;
 use tokio::time::Instant;
 use metrics::counter;
 use tracing::{debug, error, info, warn};
 
 // ── Configuration constants ──
+//
+// These are read once at first access and cached for the process lifetime.
+// Reading env vars on every call (which happens each view change / slot boundary)
+// would issue a syscall on every hot-path invocation; LazyLock eliminates that.
 
-/// Maximum committed blocks retained in the ring buffer for sync serving.
-/// At 8-second slots, 10,000 blocks ≈ ~22 hours of history.
-/// Configurable via `N42_SYNC_BUFFER_SIZE`.
-pub(super) fn max_committed_blocks() -> usize {
+static CFG_SYNC_BUFFER_SIZE: LazyLock<usize> = LazyLock::new(|| {
     std::env::var("N42_SYNC_BUFFER_SIZE")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(10_000)
+});
+
+static CFG_SYNC_TIMEOUT_SECS: LazyLock<u64> = LazyLock::new(|| {
+    std::env::var("N42_SYNC_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(30)
+});
+
+static CFG_MAX_EMPTY_SKIPS: LazyLock<u32> = LazyLock::new(|| {
+    std::env::var("N42_MAX_EMPTY_SKIPS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3)
+});
+
+/// Maximum committed blocks retained in the ring buffer for sync serving.
+/// At 8-second slots, 10,000 blocks ≈ ~22 hours of history.
+/// Configurable via `N42_SYNC_BUFFER_SIZE` (read once at startup).
+pub(super) fn max_committed_blocks() -> usize {
+    *CFG_SYNC_BUFFER_SIZE
 }
 
 /// Timeout for a state sync request; resets the in-flight flag on expiry.
-/// Configurable via `N42_SYNC_TIMEOUT_SECS`.
+/// Configurable via `N42_SYNC_TIMEOUT_SECS` (read once at startup).
 pub(super) fn sync_request_timeout() -> Duration {
-    let secs = std::env::var("N42_SYNC_TIMEOUT_SECS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(30);
-    Duration::from_secs(secs)
+    Duration::from_secs(*CFG_SYNC_TIMEOUT_SECS)
 }
 
 /// Maximum consecutive empty-block skips before producing a block for liveness.
 /// At 8s slots, 3 skips = 24 seconds max gap.
-/// Configurable via `N42_MAX_EMPTY_SKIPS`.
+/// Configurable via `N42_MAX_EMPTY_SKIPS` (read once at startup).
 pub(super) fn max_consecutive_empty_skips() -> u32 {
-    std::env::var("N42_MAX_EMPTY_SKIPS")
-        .ok()
-        .and_then(|s| s.parse::<u32>().ok())
-        .unwrap_or(3)
+    *CFG_MAX_EMPTY_SKIPS
 }
 
 // ── State persistence ──
