@@ -1,0 +1,44 @@
+name: Nightly Long-Run Tests
+
+on:
+  schedule:
+    # Every day at 02:00 UTC.
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    inputs:
+      scenario_filter:
+        description: "Comma-separated scenario numbers to run (default: 7,8,9,10)"
+        required: false
+        default: "7,8,9,10"
+
+jobs:
+  long-run:
+    name: Long-Running E2E Scenarios
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Build n42-node binary
+        run: cargo build --release -p n42-node
+        env:
+          RUSTFLAGS: "-C target-cpu=native"
+
+      - name: Run long-running E2E scenarios
+        run: >
+          cargo test -p tests-e2e --
+          --test-threads=1
+          --nocapture
+        env:
+          RUST_LOG: info
+          # Use workflow_dispatch input if provided, otherwise default to 7,8,9,10.
+          E2E_SCENARIO_FILTER: ${{ github.event.inputs.scenario_filter || '7,8,9,10' }}
+          # Scenario 9 long-run: use 10 minutes in CI instead of production 30+ minutes.
+          LONG_RUN_DURATION_SECS: "600"

@@ -126,6 +126,19 @@ impl ConsensusOrchestrator {
                 info!(new_epoch, validator_count, "epoch transition: validator set updated");
                 let updated_vs = self.engine.epoch_manager().current_validator_set().clone();
                 self.validator_set_for_sync = Some(updated_vs);
+
+                // Pre-stage the validator set for the epoch after next, if scheduled.
+                if let Some(schedule) = &self.epoch_schedule {
+                    if let Some((validators, threshold)) = schedule.get_for_epoch(new_epoch + 1) {
+                        self.engine.epoch_manager_mut().stage_next_epoch(validators, threshold);
+                        info!(
+                            next_epoch = new_epoch + 1,
+                            validator_count = validators.len(),
+                            threshold,
+                            "staged next epoch validator set from schedule"
+                        );
+                    }
+                }
             }
         }
     }

@@ -9,6 +9,7 @@ use n42_network::NetworkService;
 use n42_node::mobile_bridge::MobileVerificationBridge;
 use n42_node::mobile_packet::mobile_packet_loop;
 use n42_node::mobile_reward::MobileRewardManager;
+use n42_node::epoch_schedule::EpochSchedule;
 use n42_node::persistence;
 use n42_node::rpc::{N42ApiServer, N42RpcServer};
 use n42_node::tx_bridge::TxPoolBridge;
@@ -454,6 +455,14 @@ fn main() {
                         );
                         epoch_manager.stage_next_epoch(validators, f);
                     }
+                    if !snapshot.authorized_verifiers.is_empty() {
+                        consensus_state.restore_authorized_verifiers(&snapshot.authorized_verifiers);
+                        info!(
+                            target: "n42::cli",
+                            count = snapshot.authorized_verifiers.len(),
+                            "restored authorized verifiers from snapshot"
+                        );
+                    }
                     ConsensusEngine::with_recovered_state(
                         my_index,
                         secret_key,
@@ -490,7 +499,33 @@ fn main() {
                 );
                 info!(target: "n42::cli", "TxPoolBridge started for P2P mempool sync");
 
-                let orchestrator = ConsensusOrchestrator::with_engine_api(
+                // Load epoch schedule from $N42_DATA_DIR/epoch_schedule.json (optional).
+                let epoch_schedule_path = data_dir.join("epoch_schedule.json");
+                let epoch_schedule = match EpochSchedule::load(&epoch_schedule_path) {
+                    Ok(Some(schedule)) => {
+                        info!(
+                            target: "n42::cli",
+                            path = %epoch_schedule_path.display(),
+                            epoch_count = schedule.len(),
+                            "epoch schedule loaded"
+                        );
+                        Some(schedule)
+                    }
+                    Ok(None) => {
+                        // File absent: dynamic validator rotation not configured (static set).
+                        None
+                    }
+                    Err(e) => {
+                        warn!(
+                            target: "n42::cli",
+                            error = %e,
+                            "failed to load epoch schedule, proceeding without dynamic validator rotation"
+                        );
+                        None
+                    }
+                };
+
+                let mut orchestrator = ConsensusOrchestrator::with_engine_api(
                     consensus_engine,
                     net_handle,
                     net_event_rx,
@@ -507,6 +542,12 @@ fn main() {
                 .with_validator_set(validator_set)
                 .with_blob_store(full_node.pool.blob_store().clone())
                 .with_mobile_reward_manager(reward_manager);
+
+                if let Some(schedule) = epoch_schedule {
+                    orchestrator = orchestrator.with_epoch_schedule(schedule);
+                }
+
+                let orchestrator = orchestrator;
 
                 task_executor.spawn_critical_task(
                     "n42-consensus-orchestrator",

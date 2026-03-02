@@ -8,3 +8,4 @@ pub mod scenario7_21x21;
 pub mod scenario8_mobile_evm;
 pub mod scenario9_long_run;
 pub mod scenario10_chaos;
+pub mod scenario11_quic_10k;

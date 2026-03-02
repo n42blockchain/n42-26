@@ -30,6 +30,35 @@ pub struct ConsensusSnapshot {
     /// Staged epoch transition; persisted so a crash before `advance_epoch()` doesn't lose it.
     #[serde(default)]
     pub scheduled_epoch_transition: Option<(u64, Vec<ValidatorInfo>, u32)>,
+    /// BLS pubkeys (48 bytes each, hex-encoded) of verifiers that completed a QUIC handshake.
+    /// Persisted so that authorized verifiers survive node restarts without requiring
+    /// each phone to re-establish a QUIC connection from scratch.
+    #[serde(default, with = "authorized_verifiers_hex")]
+    pub authorized_verifiers: Vec<[u8; 48]>,
+}
+
+/// Serde helper: serialize/deserialize `Vec<[u8; 48]>` as hex strings for human-readable JSON.
+mod authorized_verifiers_hex {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(keys: &[[u8; 48]], s: S) -> Result<S::Ok, S::Error> {
+        let hex_keys: Vec<String> = keys.iter().map(hex::encode).collect();
+        hex_keys.serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<[u8; 48]>, D::Error> {
+        let hex_keys: Vec<String> = Vec::deserialize(d)?;
+        hex_keys
+            .iter()
+            .map(|s| {
+                let bytes = hex::decode(s).map_err(serde::de::Error::custom)?;
+                let arr: [u8; 48] = bytes
+                    .try_into()
+                    .map_err(|_| serde::de::Error::custom("expected 48-byte BLS pubkey"))?;
+                Ok(arr)
+            })
+            .collect()
+    }
 }
 
 impl ConsensusSnapshot {
@@ -121,6 +150,7 @@ mod tests {
             last_committed_qc: QuorumCertificate::genesis(),
             consecutive_timeouts: 0,
             scheduled_epoch_transition: None,
+            authorized_verifiers: Vec::new(),
         }
     }
 
@@ -337,6 +367,111 @@ mod tests {
         assert_eq!(loaded.version, 1);
         assert_eq!(loaded.current_view, 50);
         assert!(loaded.scheduled_epoch_transition.is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_save_and_load_authorized_verifiers() {
+        let dir = std::env::temp_dir().join("n42-test-authorized-verifiers");
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("consensus_state.json");
+
+        let pubkey1 = [0x11u8; 48];
+        let pubkey2 = [0x22u8; 48];
+        let snapshot = ConsensusSnapshot {
+            authorized_verifiers: vec![pubkey1, pubkey2],
+            ..genesis_snapshot(55)
+        };
+        save_consensus_state(&path, &snapshot).unwrap();
+
+        let loaded = load_consensus_state(&path).unwrap().unwrap();
+        assert_eq!(loaded.authorized_verifiers.len(), 2);
+        assert!(loaded.authorized_verifiers.contains(&pubkey1));
+        assert!(loaded.authorized_verifiers.contains(&pubkey2));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_save_and_load_empty_authorized_verifiers() {
+        let dir = std::env::temp_dir().join("n42-test-empty-verifiers");
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("consensus_state.json");
+
+        let snapshot = ConsensusSnapshot {
+            authorized_verifiers: vec![],
+            ..genesis_snapshot(60)
+        };
+        save_consensus_state(&path, &snapshot).unwrap();
+
+        let loaded = load_consensus_state(&path).unwrap().unwrap();
+        assert!(loaded.authorized_verifiers.is_empty(), "empty vec should round-trip correctly");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_load_invalid_hex_pubkey() {
+        let dir = std::env::temp_dir().join("n42-test-invalid-hex-pubkey");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("consensus_state.json");
+
+        // Build valid JSON with an invalid hex string in authorized_verifiers.
+        let snapshot = genesis_snapshot(80);
+        let mut json_value: serde_json::Value = serde_json::to_value(&snapshot).unwrap();
+        json_value["authorized_verifiers"] =
+            serde_json::json!(["not_valid_hex!!"]);
+        std::fs::write(&path, serde_json::to_string_pretty(&json_value).unwrap()).unwrap();
+
+        let result = load_consensus_state(&path);
+        assert!(result.is_err(), "invalid hex in authorized_verifiers must cause a parse error");
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_load_wrong_length_hex_pubkey() {
+        let dir = std::env::temp_dir().join("n42-test-wrong-len-hex-pubkey");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("consensus_state.json");
+
+        // Valid hex but only 32 bytes (64 hex chars) instead of 48 bytes (96 hex chars).
+        let short_hex = hex::encode([0xAAu8; 32]);
+        let snapshot = genesis_snapshot(81);
+        let mut json_value: serde_json::Value = serde_json::to_value(&snapshot).unwrap();
+        json_value["authorized_verifiers"] = serde_json::json!([short_hex]);
+        std::fs::write(&path, serde_json::to_string_pretty(&json_value).unwrap()).unwrap();
+
+        let result = load_consensus_state(&path);
+        assert!(result.is_err(), "wrong-length hex pubkey must cause a parse error");
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_load_legacy_snapshot_without_authorized_verifiers() {
+        let dir = std::env::temp_dir().join("n42-test-legacy-no-verifiers");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("consensus_state.json");
+
+        // Write a snapshot JSON that omits `authorized_verifiers` (legacy format).
+        let snapshot = genesis_snapshot(77);
+        let mut json_value: serde_json::Value = serde_json::to_value(&snapshot).unwrap();
+        json_value.as_object_mut().unwrap().remove("authorized_verifiers");
+        std::fs::write(&path, serde_json::to_string_pretty(&json_value).unwrap()).unwrap();
+
+        let loaded = load_consensus_state(&path).unwrap().unwrap();
+        assert_eq!(loaded.current_view, 77);
+        assert!(
+            loaded.authorized_verifiers.is_empty(),
+            "missing field should default to empty vec"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

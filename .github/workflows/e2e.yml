@@ -1,0 +1,38 @@
+name: E2E Tests
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+jobs:
+  e2e:
+    name: E2E Scenario Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Build n42-node binary
+        run: cargo build --release -p n42-node
+        env:
+          RUSTFLAGS: "-C target-cpu=native"
+
+      - name: Run E2E scenarios (1-6, < 15 min total)
+        run: >
+          cargo test -p tests-e2e --
+          --test-threads=1
+          --nocapture
+        env:
+          RUST_LOG: info
+          # Only run stable/fast scenarios in CI (1-6).
+          # Scenarios 7-10 are long-running and run in the nightly workflow.
+          E2E_SCENARIO_FILTER: "1,2,3,4,5,6"

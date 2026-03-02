@@ -29,6 +29,12 @@ pub use context::VerifierContext;
 #[cfg(target_os = "android")]
 mod android;
 
+// ── iOS integration documentation and C header ──
+// ios.rs contains Swift integration docs, build instructions, and the C header constant.
+// It has no platform-specific runtime code, so we compile it everywhere for IDE support.
+#[cfg_attr(not(target_os = "ios"), allow(dead_code))]
+mod ios;
+
 /// FFI error type for structured error reporting.
 ///
 /// Each variant maps to a distinct C error code, enabling callers to

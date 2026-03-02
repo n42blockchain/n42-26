@@ -46,7 +46,7 @@ tokio.workspace = true
 clap = { version = "4", features = ["derive"] }
 
 # Temp files
-tempfile = "3"
+tempfile.workspace = true
 
 # Random
 rand.workspace = true

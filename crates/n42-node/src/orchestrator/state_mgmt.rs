@@ -44,6 +44,22 @@ pub(super) fn max_consecutive_empty_skips() -> u32 {
 // ── State persistence ──
 
 impl ConsensusOrchestrator {
+    /// Collects the staged epoch transition info from the epoch manager for persistence.
+    fn collect_scheduled_epoch(&self) -> Option<(u64, Vec<n42_chainspec::ValidatorInfo>, u32)> {
+        self.engine
+            .epoch_manager()
+            .staged_epoch_info()
+            .map(|(epoch, validators, f)| (epoch, validators.to_vec(), f))
+    }
+
+    /// Collects the authorized verifier BLS pubkeys from consensus state for persistence.
+    fn collect_authorized_verifiers(&self) -> Vec<[u8; 48]> {
+        self.consensus_state
+            .as_ref()
+            .map(|s| s.snapshot_authorized_verifiers())
+            .unwrap_or_default()
+    }
+
     /// Persists the current consensus state to disk.
     /// Called after each BlockCommitted event and on graceful shutdown.
     pub(super) fn save_consensus_state(&self) {
@@ -52,19 +68,14 @@ impl ConsensusOrchestrator {
             None => return,
         };
 
-        let scheduled_epoch = self
-            .engine
-            .epoch_manager()
-            .staged_epoch_info()
-            .map(|(epoch, validators, f)| (epoch, validators.to_vec(), f));
-
         let snapshot = ConsensusSnapshot {
             version: 1,
             current_view: self.engine.current_view(),
             locked_qc: self.engine.locked_qc().clone(),
             last_committed_qc: self.engine.last_committed_qc().clone(),
             consecutive_timeouts: 0,
-            scheduled_epoch_transition: scheduled_epoch,
+            scheduled_epoch_transition: self.collect_scheduled_epoch(),
+            authorized_verifiers: self.collect_authorized_verifiers(),
         };
 
         if let Err(e) = persistence::save_consensus_state(path, &snapshot) {
@@ -81,19 +92,14 @@ impl ConsensusOrchestrator {
             None => return,
         };
 
-        let scheduled_epoch = self
-            .engine
-            .epoch_manager()
-            .staged_epoch_info()
-            .map(|(epoch, validators, f)| (epoch, validators.to_vec(), f));
-
         let snapshot = ConsensusSnapshot {
             version: 1,
             current_view: self.engine.current_view(),
             locked_qc: self.engine.locked_qc().clone(),
             last_committed_qc: self.engine.last_committed_qc().clone(),
             consecutive_timeouts: self.engine.consecutive_timeouts(),
-            scheduled_epoch_transition: scheduled_epoch,
+            scheduled_epoch_transition: self.collect_scheduled_epoch(),
+            authorized_verifiers: self.collect_authorized_verifiers(),
         };
 
         if let Err(e) = persistence::save_consensus_state(path, &snapshot) {

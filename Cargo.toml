@@ -148,6 +148,9 @@ bytes = "1"
 # Compression
 zstd = "0.13"
 
+# Testing
+tempfile = "3"
+
 # Misc
 auto_impl = "1.0"
 derive_more = { version = "2", default-features = false, features = ["full"] }

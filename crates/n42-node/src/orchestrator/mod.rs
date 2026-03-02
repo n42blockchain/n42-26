@@ -3,6 +3,7 @@ mod execution_bridge;
 mod state_mgmt;
 
 use crate::consensus_state::SharedConsensusState;
+use crate::epoch_schedule::EpochSchedule;
 use crate::mobile_reward::MobileRewardManager;
 use alloy_primitives::{Address, B256};
 use n42_consensus::{ConsensusEngine, EngineOutput, ValidatorSet};
@@ -91,6 +92,9 @@ pub struct ConsensusOrchestrator {
     blob_store: Option<DiskFileBlobStore>,
     mobile_reward_manager: Option<Arc<Mutex<MobileRewardManager>>>,
     committed_block_count: u64,
+    /// Epoch schedule loaded from `epoch_schedule.json`.
+    /// Used to pre-stage the next epoch's validator set at each epoch transition.
+    epoch_schedule: Option<EpochSchedule>,
 }
 
 impl ConsensusOrchestrator {
@@ -136,6 +140,7 @@ impl ConsensusOrchestrator {
             blob_store: None,
             mobile_reward_manager: None,
             committed_block_count: 0,
+            epoch_schedule: None,
         }
     }
 
@@ -197,6 +202,7 @@ impl ConsensusOrchestrator {
             blob_store: None,
             mobile_reward_manager: None,
             committed_block_count: 0,
+            epoch_schedule: None,
         }
     }
 
@@ -222,6 +228,15 @@ impl ConsensusOrchestrator {
 
     pub fn with_mobile_reward_manager(mut self, mgr: Arc<Mutex<MobileRewardManager>>) -> Self {
         self.mobile_reward_manager = Some(mgr);
+        self
+    }
+
+    /// Attaches an epoch schedule for dynamic validator set rotation.
+    ///
+    /// When set, the orchestrator consults the schedule at each `EpochTransition`
+    /// event and automatically stages the next epoch's validator set.
+    pub fn with_epoch_schedule(mut self, schedule: EpochSchedule) -> Self {
+        self.epoch_schedule = Some(schedule);
         self
     }
 
@@ -638,6 +653,7 @@ mod tests {
             blob_store: None,
             mobile_reward_manager: None,
             committed_block_count: 0,
+            epoch_schedule: None,
         };
 
         assert!(state.load_committed_qc().is_none(), "should start with no QC");
@@ -695,6 +711,7 @@ mod tests {
             blob_store: None,
             mobile_reward_manager: None,
             committed_block_count: 0,
+            epoch_schedule: None,
         };
 
         let test_hash = B256::repeat_byte(0xFF);

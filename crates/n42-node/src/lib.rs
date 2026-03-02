@@ -1,6 +1,7 @@
 mod node;
 mod components;
 pub mod consensus_state;
+pub mod epoch_schedule;
 pub mod mobile_bridge;
 pub mod mobile_packet;
 pub mod mobile_reward;

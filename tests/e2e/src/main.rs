@@ -11,6 +11,17 @@ use clap::Parser;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
+/// Parses a comma-separated list of scenario numbers from `E2E_SCENARIO_FILTER`.
+///
+/// Invalid entries are silently ignored. Returns an empty vec if the string is empty
+/// or contains no valid numbers.
+fn parse_scenario_filter(filter: &str) -> Vec<u32> {
+    filter
+        .split(',')
+        .filter_map(|s| s.trim().parse::<u32>().ok())
+        .collect()
+}
+
 #[derive(Parser)]
 #[command(name = "e2e-test", about = "N42 End-to-End Test Suite")]
 struct Cli {
@@ -48,10 +59,17 @@ async fn main() -> eyre::Result<()> {
     info!(binary = %binary_path.display(), "using n42-node binary");
 
     // Determine which scenarios to run.
-    let scenarios: Vec<u32> = if cli.all {
-        vec![1, 2, 3, 4, 5, 6]
-    } else if let Some(s) = cli.scenario {
+    //
+    // Priority: --scenario CLI flag > --all flag > E2E_SCENARIO_FILTER env var > default (1).
+    //
+    // E2E_SCENARIO_FILTER accepts a comma-separated list of scenario numbers, e.g. "1,2,3".
+    // This is used by CI workflows to limit which scenarios run in a given job.
+    let scenarios: Vec<u32> = if let Some(s) = cli.scenario {
         vec![s]
+    } else if cli.all {
+        vec![1, 2, 3, 4, 5, 6]
+    } else if let Ok(filter) = std::env::var("E2E_SCENARIO_FILTER") {
+        parse_scenario_filter(&filter)
     } else {
         // Default: run scenario 1 (smoke test).
         vec![1]
@@ -74,6 +92,7 @@ async fn main() -> eyre::Result<()> {
             8 => scenarios::scenario8_mobile_evm::run(binary_path.clone()).await,
             9 => scenarios::scenario9_long_run::run(binary_path.clone()).await,
             10 => scenarios::scenario10_chaos::run(binary_path.clone()).await,
+            11 => scenarios::scenario11_quic_10k::run(binary_path.clone()).await,
             _ => {
                 info!(scenario, "unknown scenario, skipping");
                 continue;

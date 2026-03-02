@@ -251,6 +251,27 @@ impl SharedConsensusState {
             .unwrap_or(false)
     }
 
+    /// Restores a set of authorized verifiers from a persisted snapshot.
+    ///
+    /// Replaces the current set entirely with the snapshot contents.
+    /// Called once on node startup after loading `ConsensusSnapshot::authorized_verifiers`.
+    pub fn restore_authorized_verifiers(&self, verifiers: &[[u8; 48]]) {
+        if let Ok(mut set) = self.authorized_verifiers.lock() {
+            set.clear();
+            set.extend(verifiers.iter().copied());
+        }
+    }
+
+    /// Returns a snapshot of the currently authorized verifier pubkeys.
+    ///
+    /// Used by `state_mgmt` to persist the set to disk on each block commit.
+    pub fn snapshot_authorized_verifiers(&self) -> Vec<[u8; 48]> {
+        self.authorized_verifiers
+            .lock()
+            .map(|set| set.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
     /// Registers the block for attestation tracking and notifies RPC subscribers.
     pub fn notify_block_committed(&self, block_hash: B256, view: u64) {
         match self.attestation_state.lock() {
