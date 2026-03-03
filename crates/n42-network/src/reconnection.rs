@@ -67,6 +67,11 @@ impl ReconnectionManager {
         self.peers.len()
     }
 
+    /// Returns true if the peer is registered as trusted.
+    pub fn is_trusted(&self, peer_id: &PeerId) -> bool {
+        self.peers.get(peer_id).is_some_and(|s| s.is_trusted)
+    }
+
     /// Called when a connection is established. Resets backoff state.
     pub fn on_connected(&mut self, peer_id: &PeerId) {
         if let Some(state) = self.peers.get_mut(peer_id) {
@@ -103,7 +108,18 @@ impl ReconnectionManager {
     ///
     /// Excludes connected peers, discovered peers past their retry limit,
     /// and peers whose backoff has not yet expired.
-    pub fn peers_to_reconnect(&self) -> Vec<(PeerId, Multiaddr)> {
+    /// Also cleans up exhausted discovered peers from the registry.
+    pub fn peers_to_reconnect(&mut self) -> Vec<(PeerId, Multiaddr)> {
+        // Remove non-trusted peers that have exhausted their retry budget.
+        let max_attempts = self.max_attempts_discovered;
+        self.peers.retain(|peer_id, state| {
+            if !state.is_trusted && state.consecutive_failures >= max_attempts {
+                tracing::debug!(%peer_id, failures = state.consecutive_failures, "removing exhausted discovered peer");
+                false
+            } else {
+                true
+            }
+        });
         let now = Instant::now();
         self.peers
             .iter()

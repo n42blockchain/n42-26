@@ -115,7 +115,7 @@ impl N42ApiServer for N42RpcServer {
         Ok(HealthResponse {
             status: if has_qc { "ok" } else { "syncing" }.to_string(),
             has_committed_qc: has_qc,
-            validator_count: self.consensus_state.validator_set.len(),
+            validator_count: self.consensus_state.validator_count(),
         })
     }
 
@@ -129,7 +129,7 @@ impl N42ApiServer for N42RpcServer {
         Ok(ConsensusStatusResponse {
             latest_committed_view: view,
             latest_committed_block_hash: block_hash,
-            validator_count: self.consensus_state.validator_set.len(),
+            validator_count: self.consensus_state.validator_count(),
             has_committed_qc: has_qc,
         })
     }
@@ -153,7 +153,7 @@ impl N42ApiServer for N42RpcServer {
         pending: PendingSubscriptionSink,
     ) -> SubscriptionResult {
         let sink = pending.accept().await?;
-        let mut rx = self.consensus_state.block_committed_tx.subscribe();
+        let mut rx = self.consensus_state.subscribe_block_committed();
 
         info!("mobile verification subscriber connected");
 
@@ -161,12 +161,17 @@ impl N42ApiServer for N42RpcServer {
             loop {
                 match rx.recv().await {
                     Ok(task) => {
-                        let msg = SubscriptionMessage::new(
+                        let msg = match SubscriptionMessage::new(
                             sink.method_name(),
                             sink.subscription_id(),
                             &task,
-                        )
-                        .expect("VerificationTask serialization cannot fail");
+                        ) {
+                            Ok(m) => m,
+                            Err(e) => {
+                                tracing::error!(error = %e, "failed to serialize VerificationTask");
+                                continue;
+                            }
+                        };
                         if sink.send(msg).await.is_err() {
                             break;
                         }

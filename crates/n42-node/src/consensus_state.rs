@@ -13,7 +13,9 @@ use tracing::{info, warn};
 #[serde(rename_all = "camelCase")]
 pub struct VerificationTask {
     pub block_hash: B256,
-    pub block_number: u64,
+    /// Consensus view at which this block was committed.
+    #[serde(rename = "blockNumber")]
+    pub view: u64,
 }
 
 /// Per-block mobile attestation tracking.
@@ -47,15 +49,14 @@ impl AttestationState {
 
     /// Register a new block for attestation tracking, evicting the oldest if at capacity.
     pub fn register_block(&mut self, block_hash: B256, block_number: u64) {
-        if self.blocks.len() >= self.max_blocks {
-            if let Some(oldest_hash) = self
+        if self.blocks.len() >= self.max_blocks
+            && let Some(oldest_hash) = self
                 .blocks
                 .iter()
                 .min_by_key(|(_, v)| v.block_number)
                 .map(|(k, _)| *k)
-            {
-                self.blocks.remove(&oldest_hash);
-            }
+        {
+            self.blocks.remove(&oldest_hash);
         }
 
         self.blocks.entry(block_hash).or_insert(BlockAttestations {
@@ -109,6 +110,8 @@ pub struct EquivocationEvidence {
 
 const MAX_ATTESTATION_HISTORY: usize = 1000;
 const MAX_EQUIVOCATION_LOG: usize = 500;
+/// Maximum number of recent blocks tracked for attestation.
+const MAX_TRACKED_ATTESTATION_BLOCKS: usize = 100;
 
 fn default_attestation_threshold() -> u32 {
     std::env::var("N42_MIN_ATTESTATION_THRESHOLD")
@@ -131,10 +134,10 @@ fn unix_now_secs() -> u64 {
 #[derive(Debug)]
 pub struct SharedConsensusState {
     /// Latest committed QC; `None` before any block is committed.
-    pub latest_committed_qc: ArcSwap<Option<QuorumCertificate>>,
-    pub validator_set: Arc<ValidatorSet>,
-    pub attestation_state: Mutex<AttestationState>,
-    pub block_committed_tx: broadcast::Sender<VerificationTask>,
+    pub(crate) latest_committed_qc: ArcSwap<Option<QuorumCertificate>>,
+    pub(crate) validator_set: Arc<ValidatorSet>,
+    pub(crate) attestation_state: Mutex<AttestationState>,
+    pub(crate) block_committed_tx: broadcast::Sender<VerificationTask>,
     attestation_history: Mutex<VecDeque<AttestationRecord>>,
     equivocation_log: Mutex<VecDeque<EquivocationEvidence>>,
     /// BLS pubkeys of verifiers that have completed a QUIC handshake with StarHub.
@@ -153,16 +156,26 @@ impl SharedConsensusState {
         } else {
             threshold
         };
-        let (block_committed_tx, _) = broadcast::channel(64);
+        let (block_committed_tx, _) = broadcast::channel(512);
         Self {
             latest_committed_qc: ArcSwap::from_pointee(None),
             validator_set: Arc::new(validator_set),
-            attestation_state: Mutex::new(AttestationState::new(threshold, 100)),
+            attestation_state: Mutex::new(AttestationState::new(threshold, MAX_TRACKED_ATTESTATION_BLOCKS)),
             block_committed_tx,
             attestation_history: Mutex::new(VecDeque::new()),
             equivocation_log: Mutex::new(VecDeque::new()),
             authorized_verifiers: Mutex::new(HashSet::new()),
         }
+    }
+
+    /// Returns the number of validators in the current set.
+    pub fn validator_count(&self) -> u32 {
+        self.validator_set.len()
+    }
+
+    /// Creates a new broadcast subscriber for block-committed events.
+    pub fn subscribe_block_committed(&self) -> broadcast::Receiver<VerificationTask> {
+        self.block_committed_tx.subscribe()
     }
 
     pub fn update_committed_qc(&self, qc: QuorumCertificate) {
@@ -180,29 +193,30 @@ impl SharedConsensusState {
             valid_count,
             timestamp: unix_now_secs(),
         };
-        if let Ok(mut history) = self.attestation_history.lock() {
-            if history.len() >= MAX_ATTESTATION_HISTORY {
-                history.pop_front();
-            }
-            history.push_back(record);
+        let mut history = self.attestation_history.lock().unwrap_or_else(|e| {
+            tracing::error!("attestation_history mutex poisoned: {e}");
+            e.into_inner()
+        });
+        if history.len() >= MAX_ATTESTATION_HISTORY {
+            history.pop_front();
         }
+        history.push_back(record);
     }
 
     pub fn get_block_attestation(&self, block_hash: &B256) -> Option<AttestationRecord> {
-        self.attestation_history
-            .lock()
-            .ok()?
-            .iter()
-            .find(|r| r.block_hash == *block_hash)
-            .cloned()
+        let history = self.attestation_history.lock().unwrap_or_else(|e| {
+            tracing::error!("attestation_history mutex poisoned: {e}");
+            e.into_inner()
+        });
+        history.iter().find(|r| r.block_hash == *block_hash).cloned()
     }
 
     /// Returns `(total, earliest_block_number, latest_block_number)`.
     pub fn attestation_stats(&self) -> (usize, Option<u64>, Option<u64>) {
-        let history = match self.attestation_history.lock() {
-            Ok(h) => h,
-            Err(_) => return (0, None, None),
-        };
+        let history = self.attestation_history.lock().unwrap_or_else(|e| {
+            tracing::error!("attestation_history mutex poisoned: {e}");
+            e.into_inner()
+        });
         (history.len(), history.front().map(|r| r.block_number), history.back().map(|r| r.block_number))
     }
 
@@ -214,41 +228,49 @@ impl SharedConsensusState {
             hash2,
             detected_at: unix_now_secs(),
         };
-        if let Ok(mut log) = self.equivocation_log.lock() {
-            if log.len() >= MAX_EQUIVOCATION_LOG {
-                log.pop_front();
-            }
-            log.push_back(evidence);
+        let mut log = self.equivocation_log.lock().unwrap_or_else(|e| {
+            tracing::error!("equivocation_log mutex poisoned: {e}");
+            e.into_inner()
+        });
+        if log.len() >= MAX_EQUIVOCATION_LOG {
+            log.pop_front();
         }
+        log.push_back(evidence);
     }
 
     pub fn get_equivocations(&self) -> Vec<EquivocationEvidence> {
-        self.equivocation_log
-            .lock()
-            .map(|log| log.iter().cloned().collect())
-            .unwrap_or_default()
+        let log = self.equivocation_log.lock().unwrap_or_else(|e| {
+            tracing::error!("equivocation_log mutex poisoned: {e}");
+            e.into_inner()
+        });
+        log.iter().cloned().collect()
     }
 
     /// Marks a verifier pubkey as authorized (called when a QUIC handshake completes).
     pub fn authorize_verifier(&self, pubkey: [u8; 48]) {
-        if let Ok(mut set) = self.authorized_verifiers.lock() {
-            set.insert(pubkey);
-        }
+        let mut set = self.authorized_verifiers.lock().unwrap_or_else(|e| {
+            tracing::error!("authorized_verifiers mutex poisoned: {e}");
+            e.into_inner()
+        });
+        set.insert(pubkey);
     }
 
     /// Removes a verifier pubkey from the authorized set (called on QUIC disconnect).
     pub fn deauthorize_verifier(&self, pubkey: &[u8; 48]) {
-        if let Ok(mut set) = self.authorized_verifiers.lock() {
-            set.remove(pubkey);
-        }
+        let mut set = self.authorized_verifiers.lock().unwrap_or_else(|e| {
+            tracing::error!("authorized_verifiers mutex poisoned: {e}");
+            e.into_inner()
+        });
+        set.remove(pubkey);
     }
 
     /// Returns `true` if the pubkey has been authorized via a QUIC handshake.
     pub fn is_authorized_verifier(&self, pubkey: &[u8; 48]) -> bool {
-        self.authorized_verifiers
-            .lock()
-            .map(|set| set.contains(pubkey))
-            .unwrap_or(false)
+        let set = self.authorized_verifiers.lock().unwrap_or_else(|e| {
+            tracing::error!("authorized_verifiers mutex poisoned: {e}");
+            e.into_inner()
+        });
+        set.contains(pubkey)
     }
 
     /// Restores a set of authorized verifiers from a persisted snapshot.
@@ -256,39 +278,43 @@ impl SharedConsensusState {
     /// Replaces the current set entirely with the snapshot contents.
     /// Called once on node startup after loading `ConsensusSnapshot::authorized_verifiers`.
     pub fn restore_authorized_verifiers(&self, verifiers: &[[u8; 48]]) {
-        if let Ok(mut set) = self.authorized_verifiers.lock() {
-            set.clear();
-            set.extend(verifiers.iter().copied());
-        }
+        let mut set = self.authorized_verifiers.lock().unwrap_or_else(|e| {
+            tracing::error!("authorized_verifiers mutex poisoned: {e}");
+            e.into_inner()
+        });
+        set.clear();
+        set.extend(verifiers.iter().copied());
     }
 
     /// Returns a snapshot of the currently authorized verifier pubkeys.
     ///
     /// Used by `state_mgmt` to persist the set to disk on each block commit.
     pub fn snapshot_authorized_verifiers(&self) -> Vec<[u8; 48]> {
-        self.authorized_verifiers
-            .lock()
-            .map(|set| set.iter().copied().collect())
-            .unwrap_or_default()
+        let set = self.authorized_verifiers.lock().unwrap_or_else(|e| {
+            tracing::error!("authorized_verifiers mutex poisoned: {e}");
+            e.into_inner()
+        });
+        set.iter().copied().collect()
     }
 
     /// Registers the block for attestation tracking and notifies RPC subscribers.
     pub fn notify_block_committed(&self, block_hash: B256, view: u64) {
-        match self.attestation_state.lock() {
-            Ok(mut att_state) => att_state.register_block(block_hash, view),
-            Err(e) => tracing::error!("attestation_state mutex poisoned: {e}"),
-        }
+        let mut att_state = self.attestation_state.lock().unwrap_or_else(|e| {
+            tracing::error!("attestation_state mutex poisoned: {e}");
+            e.into_inner()
+        });
+        att_state.register_block(block_hash, view);
 
-        let task = VerificationTask { block_hash, block_number: view };
-        if self.block_committed_tx.receiver_count() > 0 {
-            if let Ok(n) = self.block_committed_tx.send(task) {
-                info!(
-                    %block_hash,
-                    view,
-                    receivers = n,
-                    "verification task broadcast to mobile subscribers"
-                );
-            }
+        let task = VerificationTask { block_hash, view };
+        if self.block_committed_tx.receiver_count() > 0
+            && let Ok(n) = self.block_committed_tx.send(task)
+        {
+            info!(
+                %block_hash,
+                view,
+                receivers = n,
+                "verification task broadcast to mobile subscribers"
+            );
         }
     }
 }
@@ -365,7 +391,7 @@ mod tests {
 
         let task = rx.try_recv().unwrap();
         assert_eq!(task.block_hash, hash);
-        assert_eq!(task.block_number, 42);
+        assert_eq!(task.view, 42);
 
         let att = state.attestation_state.lock().unwrap();
         assert_eq!(att.get_attestation_count(&hash), Some(0));

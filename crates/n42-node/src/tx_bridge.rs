@@ -131,10 +131,10 @@ where
         if self.recently_imported_set.contains(&hash) {
             return;
         }
-        if self.recently_imported_order.len() >= RECENT_TX_CAPACITY {
-            if let Some(evicted) = self.recently_imported_order.pop_front() {
-                self.recently_imported_set.remove(&evicted);
-            }
+        if self.recently_imported_order.len() >= RECENT_TX_CAPACITY
+            && let Some(evicted) = self.recently_imported_order.pop_front()
+        {
+            self.recently_imported_set.remove(&evicted);
         }
         self.recently_imported_order.push_back(hash);
         self.recently_imported_set.insert(hash);
@@ -167,10 +167,10 @@ mod tests {
             if self.set.contains(&hash) {
                 return;
             }
-            if self.order.len() >= RECENT_TX_CAPACITY {
-                if let Some(evicted) = self.order.pop_front() {
-                    self.set.remove(&evicted);
-                }
+            if self.order.len() >= RECENT_TX_CAPACITY
+                && let Some(evicted) = self.order.pop_front()
+            {
+                self.set.remove(&evicted);
             }
             self.order.push_back(hash);
             self.set.insert(hash);

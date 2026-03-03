@@ -2,7 +2,7 @@ use n42_primitives::consensus::{ConsensusMessage, NewView, TimeoutMessage};
 
 use crate::error::{ConsensusError, ConsensusResult};
 use crate::validator::LeaderSelector;
-use super::quorum::{TimeoutCollector, timeout_signing_message};
+use super::quorum::{TimeoutCollector, newview_signing_message, timeout_signing_message};
 use super::round::Phase;
 use super::state_machine::{ConsensusEngine, EngineOutput, FUTURE_VIEW_WINDOW};
 
@@ -58,66 +58,8 @@ impl ConsensusEngine {
             return Ok(());
         }
 
-        // Future-view timeout: advance to that view for TC formation.
-        //
-        // After crash/recovery, nodes may be at different views. Without view
-        // synchronization, they cannot form TCs (which require quorum timeouts at the
-        // SAME view). When a validator provides signed evidence of timing out at view V,
-        // we join that view's timeout collection.
         if timeout.view > view {
-            if timeout.view > view + FUTURE_VIEW_WINDOW {
-                return Ok(());
-            }
-
-            // Verify BLS signature BEFORE advancing to prevent unauthenticated view jumps.
-            let pk = self.validator_set().get_public_key(timeout.sender)?;
-            let msg = timeout_signing_message(timeout.view);
-            pk.verify(&msg, &timeout.signature).map_err(|_| ConsensusError::InvalidSignature {
-                view: timeout.view,
-                validator_index: timeout.sender,
-            })?;
-
-            tracing::info!(
-                current_view = view,
-                timeout_view = timeout.view,
-                sender = timeout.sender,
-                "advancing to higher timeout view for synchronization"
-            );
-
-            self.advance_to_view(timeout.view)?;
-            self.round_state.timeout();
-
-            // Second reset: advance_to_view resets with consecutive_timeouts=0, but timeout()
-            // just incremented the counter. This applies the correct exponential backoff.
-            self.pacemaker.reset_for_view(timeout.view, self.round_state.consecutive_timeouts());
-
-            // Conditional creation: advance_to_view may have replayed buffered messages that
-            // already created and populated a timeout_collector. Overwriting would lose those.
-            let n_validators = self.validator_set().len();
-            if self.timeout_collector.as_ref().is_none_or(|tc| tc.view() != timeout.view) {
-                self.timeout_collector = Some(TimeoutCollector::new(timeout.view, n_validators));
-            }
-
-            if let Some(ref mut collector) = self.timeout_collector {
-                collector.add_verified_timeout(
-                    timeout.sender,
-                    timeout.signature.clone(),
-                    timeout.high_qc.clone(),
-                )?;
-            }
-
-            // Broadcast our own timeout so other nodes can converge and form a TC.
-            let own_msg = timeout_signing_message(timeout.view);
-            let own_sig = self.secret_key.sign(&own_msg);
-            let own_timeout = TimeoutMessage {
-                view: timeout.view,
-                high_qc: self.round_state.locked_qc().clone(),
-                sender: self.my_index,
-                signature: own_sig,
-            };
-            self.emit(EngineOutput::BroadcastMessage(ConsensusMessage::Timeout(own_timeout.clone())))?;
-
-            return self.process_timeout(own_timeout);
+            return self.handle_future_view_timeout(view, timeout);
         }
 
         // Current-view timeout processing.
@@ -137,7 +79,18 @@ impl ConsensusEngine {
             .timeout_collector
             .get_or_insert_with(|| TimeoutCollector::new(view, n_validators));
 
-        collector.add_verified_timeout(timeout.sender, timeout.signature, timeout.high_qc)?;
+        match collector.add_verified_timeout(timeout.sender, timeout.signature, timeout.high_qc) {
+            Ok(()) => {}
+            Err(ConsensusError::DuplicateVote { .. }) => {
+                tracing::debug!(
+                    view,
+                    sender = timeout.sender,
+                    "ignoring duplicate timeout (GossipSub multi-path)"
+                );
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        }
 
         tracing::debug!(
             view,
@@ -153,6 +106,77 @@ impl ConsensusEngine {
         }
 
         Ok(())
+    }
+
+    /// Handles a timeout from a future view: verifies, advances, and re-broadcasts.
+    fn handle_future_view_timeout(
+        &mut self,
+        current_view: u64,
+        timeout: TimeoutMessage,
+    ) -> ConsensusResult<()> {
+        if timeout.view > current_view + FUTURE_VIEW_WINDOW {
+            return Ok(());
+        }
+
+        // Verify BLS signature BEFORE advancing to prevent unauthenticated view jumps.
+        let pk = self.validator_set().get_public_key(timeout.sender)?;
+        let msg = timeout_signing_message(timeout.view);
+        pk.verify(&msg, &timeout.signature).map_err(|_| ConsensusError::InvalidSignature {
+            view: timeout.view,
+            validator_index: timeout.sender,
+        })?;
+
+        tracing::info!(
+            current_view,
+            timeout_view = timeout.view,
+            sender = timeout.sender,
+            "advancing to higher timeout view for synchronization"
+        );
+
+        self.advance_to_view(timeout.view)?;
+        self.round_state.timeout();
+
+        // Second reset: advance_to_view resets with consecutive_timeouts=0, but timeout()
+        // just incremented the counter. This applies the correct exponential backoff.
+        self.pacemaker.reset_for_view(timeout.view, self.round_state.consecutive_timeouts());
+
+        // Conditional creation: advance_to_view may have replayed buffered messages that
+        // already created and populated a timeout_collector. Overwriting would lose those.
+        let n_validators = self.validator_set().len();
+        if self.timeout_collector.as_ref().is_none_or(|tc| tc.view() != timeout.view) {
+            self.timeout_collector = Some(TimeoutCollector::new(timeout.view, n_validators));
+        }
+
+        if let Some(ref mut collector) = self.timeout_collector {
+            match collector.add_verified_timeout(
+                timeout.sender,
+                timeout.signature.clone(),
+                timeout.high_qc.clone(),
+            ) {
+                Ok(()) => {}
+                Err(ConsensusError::DuplicateVote { .. }) => {
+                    tracing::debug!(
+                        view = timeout.view,
+                        sender = timeout.sender,
+                        "ignoring duplicate timeout (GossipSub multi-path)"
+                    );
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        // Broadcast our own timeout so other nodes can converge and form a TC.
+        let own_msg = timeout_signing_message(timeout.view);
+        let own_sig = self.secret_key.sign(&own_msg);
+        let own_timeout = TimeoutMessage {
+            view: timeout.view,
+            high_qc: self.round_state.locked_qc().clone(),
+            sender: self.my_index,
+            signature: own_sig,
+        };
+        self.emit(EngineOutput::BroadcastMessage(ConsensusMessage::Timeout(own_timeout.clone())))?;
+
+        self.process_timeout(own_timeout)
     }
 
     /// Processes a NewView message from the new leader.
@@ -174,7 +198,7 @@ impl ConsensusEngine {
 
         // Verify leader's signature to prevent Byzantine nodes from forging NewView messages.
         let pk = self.validator_set().get_public_key(nv.leader)?;
-        let nv_msg = timeout_signing_message(nv.view);
+        let nv_msg = newview_signing_message(nv.view);
         pk.verify(&nv_msg, &nv.signature).map_err(|_| ConsensusError::InvalidSignature {
             view: nv.view,
             validator_index: nv.leader,
@@ -233,7 +257,7 @@ impl ConsensusEngine {
 
         self.round_state.update_locked_qc(&tc.high_qc);
 
-        let nv_message = timeout_signing_message(next_view);
+        let nv_message = newview_signing_message(next_view);
         let nv_sig = self.secret_key.sign(&nv_message);
 
         let new_view = NewView {

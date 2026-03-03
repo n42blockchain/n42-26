@@ -109,7 +109,7 @@ impl RoundState {
     /// Transitions to timed-out phase and increments the backoff counter.
     pub fn timeout(&mut self) {
         self.phase = Phase::TimedOut;
-        self.consecutive_timeouts += 1;
+        self.consecutive_timeouts = self.consecutive_timeouts.saturating_add(1);
     }
 
     /// Resets the consecutive timeout counter after a QC-based view jump.

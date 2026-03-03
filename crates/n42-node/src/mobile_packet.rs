@@ -176,7 +176,10 @@ pub async fn mobile_packet_loop<P>(
                 let data = encode_cache_sync(&msg);
                 let code_count = msg.codes.len();
                 let raw_len = data.len();
-                let compressed = zstd::bulk::compress(&data, 3).unwrap_or(data);
+                let compressed = zstd::bulk::compress(&data, 3).unwrap_or_else(|e| {
+                    warn!(error = %e, "zstd compression failed for cache sync, sending uncompressed");
+                    data
+                });
                 let compressed_len = compressed.len();
                 let mut framed = bytes::BytesMut::with_capacity(1 + compressed.len());
                 framed.put_u8(n42_network::MSG_TYPE_CACHE_SYNC_ZSTD);
@@ -237,15 +240,15 @@ where
         .map_err(|e| MobilePacketError::Execution(e.to_string()))?;
 
     let read_log = match Arc::try_unwrap(log_handle) {
-        Ok(mutex) => mutex.into_inner().unwrap(),
-        Err(arc) => arc.lock().unwrap().clone(),
+        Ok(mutex) => mutex.into_inner().unwrap_or_else(|e| e.into_inner()),
+        Err(arc) => arc.lock().unwrap_or_else(|e| e.into_inner()).clone(),
     };
     let read_log_count = read_log.len();
     let read_log_data = n42_execution::read_log::encode_read_log(&read_log);
 
     let captured_codes = match Arc::try_unwrap(codes_handle) {
-        Ok(mutex) => mutex.into_inner().unwrap(),
-        Err(arc) => arc.lock().unwrap().clone(),
+        Ok(mutex) => mutex.into_inner().unwrap_or_else(|e| e.into_inner()),
+        Err(arc) => arc.lock().unwrap_or_else(|e| e.into_inner()).clone(),
     };
 
     let header = recovered_block.header();

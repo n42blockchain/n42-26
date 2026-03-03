@@ -15,24 +15,21 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
-impl ConsensusOrchestrator {
-    /// Triggers payload building via fork_choice_updated, then spawns a task to resolve it.
-    pub(super) async fn do_trigger_payload_build(&mut self, slot_timestamp: Option<u64>) {
-        let beacon_engine = match &self.beacon_engine {
-            Some(e) => e,
-            None => {
-                debug!("no beacon engine configured, skipping payload build");
-                return;
-            }
-        };
-        let payload_builder = match &self.payload_builder {
-            Some(pb) => pb.clone(),
-            None => {
-                debug!("no payload builder configured, skipping payload build");
-                return;
-            }
-        };
+/// Delay before resolving the built payload, allowing the builder to pack transactions.
+const BUILDER_WARMUP_DELAY: Duration = Duration::from_millis(100);
 
+/// Maximum time to wait for a payload build to complete.
+const PAYLOAD_BUILD_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Maximum number of cached pending block data entries.
+const MAX_PENDING_BLOCK_DATA: usize = 16;
+
+/// Maximum number of blocks in the syncing retry queue.
+const MAX_SYNCING_QUEUE_SIZE: usize = 8;
+
+impl ConsensusOrchestrator {
+    /// Builds `PayloadAttributes` with timestamp correction and reward withdrawal injection.
+    fn build_payload_attributes(&mut self, slot_timestamp: Option<u64>) -> PayloadAttributes {
         let mut timestamp = slot_timestamp.unwrap_or_else(|| {
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -57,28 +54,49 @@ impl ConsensusOrchestrator {
 
         let mut withdrawals = vec![];
         if let Some(ref reward_mgr) = self.mobile_reward_manager {
-            if let Ok(mut mgr) = reward_mgr.lock() {
-                // The next block being built is committed_block_count + 1.
-                let next_block_number = self.committed_block_count + 1;
-                mgr.check_epoch_boundary(next_block_number);
-                withdrawals = mgr.take_pending_rewards(next_block_number);
-                if !withdrawals.is_empty() {
-                    info!(
-                        target: "n42::reward",
-                        count = withdrawals.len(),
-                        "injecting mobile rewards as withdrawals"
-                    );
-                }
+            let mut mgr = reward_mgr.lock().unwrap_or_else(|e| {
+                error!("mobile_reward_manager mutex poisoned: {e}");
+                e.into_inner()
+            });
+            let next_block_number = self.committed_block_count + 1;
+            mgr.check_epoch_boundary(next_block_number);
+            withdrawals = mgr.take_pending_rewards(next_block_number);
+            if !withdrawals.is_empty() {
+                info!(
+                    target: "n42::reward",
+                    count = withdrawals.len(),
+                    "injecting mobile rewards as withdrawals"
+                );
             }
         }
 
-        let attrs = PayloadAttributes {
+        PayloadAttributes {
             timestamp,
             prev_randao: B256::ZERO,
             suggested_fee_recipient: self.fee_recipient,
             withdrawals: Some(withdrawals),
             parent_beacon_block_root: Some(B256::ZERO),
+        }
+    }
+
+    /// Triggers payload building via fork_choice_updated, then spawns a task to resolve it.
+    pub(super) async fn do_trigger_payload_build(&mut self, slot_timestamp: Option<u64>) {
+        if self.beacon_engine.is_none() {
+            debug!("no beacon engine configured, skipping payload build");
+            return;
+        }
+        let payload_builder = match &self.payload_builder {
+            Some(pb) => pb.clone(),
+            None => {
+                debug!("no payload builder configured, skipping payload build");
+                return;
+            }
         };
+
+        // Build attrs before borrowing beacon_engine to avoid borrow conflict.
+        let attrs = self.build_payload_attributes(slot_timestamp);
+        let beacon_engine = self.beacon_engine.as_ref().unwrap();
+        let timestamp = attrs.timestamp;
 
         let fcu_state = ForkchoiceState {
             head_block_hash: self.head_block_hash,
@@ -128,10 +146,10 @@ impl ConsensusOrchestrator {
 
         tokio::spawn(async move {
             // Allow builder time to pack transactions from the pool.
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            tokio::time::sleep(BUILDER_WARMUP_DELAY).await;
 
             let resolve_result = tokio::time::timeout(
-                Duration::from_secs(30),
+                PAYLOAD_BUILD_TIMEOUT,
                 payload_builder.resolve_kind(payload_id, PayloadKind::WaitForPending),
             )
             .await;
@@ -139,7 +157,7 @@ impl ConsensusOrchestrator {
             let payload_opt = match resolve_result {
                 Ok(result) => result,
                 Err(_) => {
-                    error!("payload build timed out after 30s");
+                    error!("payload build timed out after {}s", PAYLOAD_BUILD_TIMEOUT.as_secs());
                     return;
                 }
             };
@@ -177,10 +195,10 @@ impl ConsensusOrchestrator {
         let hash = broadcast.block_hash;
         self.pending_executions.remove(&hash);
 
-        if self.pending_block_data.len() >= 16 {
-            if let Some(old_key) = self.pending_block_data.keys().next().copied() {
-                self.pending_block_data.remove(&old_key);
-            }
+        if self.pending_block_data.len() >= MAX_PENDING_BLOCK_DATA
+            && let Some(old_key) = self.pending_block_data.keys().next().copied()
+        {
+            self.pending_block_data.remove(&old_key);
         }
         self.pending_block_data.insert(hash, data);
 
@@ -233,8 +251,9 @@ impl ConsensusOrchestrator {
             None => return,
         };
 
-        let execution_data = match serde_json::from_slice(&broadcast.payload_json) {
-            Ok(data) => data,
+        // Parse once as Value, extract timestamp, then deserialize into the typed struct.
+        let parsed_value: serde_json::Value = match serde_json::from_slice(&broadcast.payload_json) {
+            Ok(v) => v,
             Err(e) => {
                 warn!(hash = %broadcast.block_hash, "failed to deserialize execution payload: {e}");
                 return;
@@ -243,13 +262,19 @@ impl ConsensusOrchestrator {
 
         // Extract the block timestamp to keep last_committed_timestamp up to date
         // for followers as well (prevents stale timestamp on leader switch).
-        if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&broadcast.payload_json) {
-            if let Some(ts_hex) = parsed.get("timestamp").and_then(|t| t.as_str()) {
-                if let Ok(ts) = u64::from_str_radix(ts_hex.trim_start_matches("0x"), 16) {
-                    self.last_committed_timestamp = self.last_committed_timestamp.max(ts);
-                }
-            }
+        if let Some(ts_hex) = parsed_value.get("timestamp").and_then(|t| t.as_str())
+            && let Ok(ts) = u64::from_str_radix(ts_hex.trim_start_matches("0x"), 16)
+        {
+            self.last_committed_timestamp = self.last_committed_timestamp.max(ts);
         }
+
+        let execution_data = match serde_json::from_value(parsed_value) {
+            Ok(data) => data,
+            Err(e) => {
+                warn!(hash = %broadcast.block_hash, "failed to convert execution payload from Value: {e}");
+                return;
+            }
+        };
 
         match engine_handle.new_payload(execution_data).await {
             Ok(status) => {
@@ -277,15 +302,15 @@ impl ConsensusOrchestrator {
         engine_handle: &ConsensusEngineHandle<EthEngineTypes>,
         status: &alloy_rpc_types_engine::PayloadStatus,
     ) {
-        if let Some(ref valid_hash) = status.latest_valid_hash {
-            if *valid_hash != broadcast.block_hash {
-                warn!(
-                    expected = %broadcast.block_hash,
-                    engine_hash = %valid_hash,
-                    "block hash mismatch between broadcast and engine, skipping"
-                );
-                return;
-            }
+        if let Some(ref valid_hash) = status.latest_valid_hash
+            && *valid_hash != broadcast.block_hash
+        {
+            warn!(
+                expected = %broadcast.block_hash,
+                engine_hash = %valid_hash,
+                "block hash mismatch between broadcast and engine, skipping"
+            );
+            return;
         }
 
         info!(hash = %broadcast.block_hash, "block imported from leader");
@@ -336,8 +361,10 @@ impl ConsensusOrchestrator {
         self.pending_block_data.clear();
         self.pending_executions.clear();
 
-        if let Some(ref tx) = self.mobile_packet_tx {
-            let _ = tx.try_send((broadcast.block_hash, deferred_view));
+        if let Some(ref tx) = self.mobile_packet_tx
+            && let Err(e) = tx.try_send((broadcast.block_hash, deferred_view))
+        {
+            warn!(view = deferred_view, hash = %broadcast.block_hash, error = %e, "mobile_packet_tx full or closed, deferred verification packet lost");
         }
 
         if self.engine.is_current_leader() {
@@ -352,18 +379,20 @@ impl ConsensusOrchestrator {
     fn queue_syncing_block(&mut self, broadcast: &BlockDataBroadcast) {
         info!(hash = %broadcast.block_hash, "new_payload returned Syncing, queuing for retry");
         if let Ok(data) = bincode::serialize(broadcast) {
-            if self.syncing_blocks.len() >= 8 {
+            if self.syncing_blocks.len() >= MAX_SYNCING_QUEUE_SIZE {
                 self.syncing_blocks.pop_front();
             }
-            self.syncing_blocks.push_back(data);
+            self.syncing_blocks.push_back((data, 0));
         }
     }
 
     async fn retry_syncing_blocks(&mut self, engine_handle: &ConsensusEngineHandle<EthEngineTypes>) {
-        let queued: Vec<Vec<u8>> = self.syncing_blocks.drain(..).collect();
+        let queued: Vec<(Vec<u8>, u32)> = self.syncing_blocks.drain(..).collect();
         info!(count = queued.len(), "retrying previously-syncing blocks");
 
-        for data in queued {
+        const MAX_SYNCING_RETRIES: u32 = 3;
+
+        for (data, retry_count) in queued {
             let retry_broadcast = match bincode::deserialize::<BlockDataBroadcast>(&data) {
                 Ok(b) => b,
                 Err(_) => continue,
@@ -402,8 +431,13 @@ impl ConsensusOrchestrator {
                     }
                 }
                 Ok(rs) if matches!(rs.status, PayloadStatusEnum::Syncing) => {
-                    debug!(%retry_hash, "retry still Syncing, re-queuing");
-                    self.syncing_blocks.push_back(data);
+                    let next_retry = retry_count + 1;
+                    if next_retry >= MAX_SYNCING_RETRIES {
+                        warn!(%retry_hash, retries = next_retry, "syncing block exceeded max retries, dropping");
+                    } else {
+                        debug!(%retry_hash, retry = next_retry, "retry still Syncing, re-queuing");
+                        self.syncing_blocks.push_back((data, next_retry));
+                    }
                 }
                 Ok(rs) => {
                     warn!(%retry_hash, status = ?rs.status, "retry rejected");

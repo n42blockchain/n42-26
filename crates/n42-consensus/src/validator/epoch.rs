@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use super::set::ValidatorSet;
+use crate::error::{ConsensusError, ConsensusResult};
 use n42_chainspec::ValidatorInfo;
 
 /// Maximum number of historical epoch validator sets to retain.
@@ -75,11 +76,15 @@ impl EpochManager {
     /// Creates an EpochManager from a predefined schedule of validator sets.
     /// Each entry in the schedule is (epoch, validators, fault_tolerance).
     /// The last entry's validator set becomes the current set.
+    ///
+    /// Returns `Err(ConsensusError::EpochScheduleEmpty)` if the schedule is empty.
     pub fn from_schedule(
         epoch_length: u64,
         schedule: &[(u64, Vec<ValidatorInfo>, u32)],
-    ) -> Self {
-        assert!(!schedule.is_empty(), "epoch schedule must not be empty");
+    ) -> ConsensusResult<Self> {
+        if schedule.is_empty() {
+            return Err(ConsensusError::EpochScheduleEmpty);
+        }
 
         let mut historical = BTreeMap::new();
 
@@ -100,14 +105,14 @@ impl EpochManager {
         let (current_epoch, validators, f) = &schedule[schedule.len() - 1];
         let current_set = ValidatorSet::new(validators, *f);
 
-        Self {
+        Ok(Self {
             epoch_length,
             current_epoch: *current_epoch,
             current_set,
             next_set: None,
             staged_info: None,
             historical_sets: historical,
-        }
+        })
     }
 
     /// Returns the epoch length (0 = disabled).
@@ -147,7 +152,7 @@ impl EpochManager {
         if self.epoch_length == 0 || view <= 1 {
             return false;
         }
-        (view.saturating_sub(1)) % self.epoch_length == 0
+        (view.saturating_sub(1)).is_multiple_of(self.epoch_length)
     }
 
     /// Returns the validator set that should be used for verifying a QC at the given view.
@@ -381,7 +386,7 @@ mod tests {
             (2, infos3.clone(), 1),
         ];
 
-        let em = EpochManager::from_schedule(10, &schedule);
+        let em = EpochManager::from_schedule(10, &schedule).unwrap();
 
         assert_eq!(em.current_epoch(), 2);
         assert_eq!(em.current_validator_set().len(), 6);

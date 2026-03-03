@@ -24,6 +24,8 @@ pub enum BlsError {
     InvalidSignature,
     #[error("invalid secret key bytes")]
     InvalidSecretKey,
+    #[error("batch too large: {size} exceeds max {max}")]
+    BatchTooLarge { size: usize, max: usize },
 }
 
 #[derive(Clone)]

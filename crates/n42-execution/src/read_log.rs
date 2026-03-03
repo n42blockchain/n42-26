@@ -195,7 +195,7 @@ const MAX_ENTRY_COUNT: u32 = 500_000;
 
 #[inline]
 fn significant_bytes_u64(v: u64) -> usize {
-    if v == 0 { 0 } else { (64 - v.leading_zeros() as usize + 7) / 8 }
+    if v == 0 { 0 } else { (64 - v.leading_zeros() as usize).div_ceil(8) }
 }
 
 #[inline]

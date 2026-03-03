@@ -67,11 +67,10 @@ pub enum HubCommand {
 
 /// Events produced by the star hub for the node layer.
 #[derive(Debug)]
-#[allow(clippy::large_enum_variant)]
 pub enum HubEvent {
     PhoneConnected { session_id: u64, verifier_pubkey: [u8; 48] },
     PhoneDisconnected { session_id: u64 },
-    ReceiptReceived(VerificationReceipt),
+    ReceiptReceived(Box<VerificationReceipt>),
     CacheInventoryReceived { session_id: u64, code_hashes: Vec<[u8; 32]> },
 }
 
@@ -327,10 +326,10 @@ impl StarHub {
                 }
                 HubCommand::SendToSession { session_id, data } => {
                     let senders = self.session_senders.read().await;
-                    if let Some((tx, _)) = senders.get(&session_id) {
-                        if tx.try_send(data).is_err() {
-                            tracing::warn!(session_id, "channel full, dropping targeted message");
-                        }
+                    if let Some((tx, _)) = senders.get(&session_id)
+                        && tx.try_send(data).is_err()
+                    {
+                        tracing::warn!(session_id, "channel full, dropping targeted message");
                     }
                 }
                 HubCommand::DisconnectSession(session_id) => {
@@ -446,16 +445,16 @@ async fn handle_phone_connection(
                         match read_result {
                             Ok(Ok(data)) => {
                                 let now = Instant::now();
-                                if let Some(last) = last_receipt_at {
-                                    if now.duration_since(last) < MIN_RECEIPT_INTERVAL {
-                                        rate_violations += 1;
-                                        tracing::warn!(session_id, rate_violations, "receipt rate limited");
-                                        if rate_violations >= 5 {
-                                            tracing::warn!(session_id, "rate limit exceeded 5 times, disconnecting");
-                                            break;
-                                        }
-                                        continue;
+                                if let Some(last) = last_receipt_at
+                                    && now.duration_since(last) < MIN_RECEIPT_INTERVAL
+                                {
+                                    rate_violations += 1;
+                                    tracing::warn!(session_id, rate_violations, "receipt rate limited");
+                                    if rate_violations >= 5 {
+                                        tracing::warn!(session_id, "rate limit exceeded 5 times, disconnecting");
+                                        break;
                                     }
+                                    continue;
                                 }
                                 if data.len() as u64 > MAX_RECEIPT_SIZE {
                                     tracing::warn!(session_id, size = data.len(), "receipt too large");
@@ -486,7 +485,7 @@ async fn handle_phone_connection(
                                         if receipt.timestamp_ms > 0 && now_ms > receipt.timestamp_ms {
                                             session.record_rtt(now_ms - receipt.timestamp_ms);
                                         }
-                                        if event_tx.try_send(HubEvent::ReceiptReceived(receipt)).is_err() {
+                                        if event_tx.try_send(HubEvent::ReceiptReceived(Box::new(receipt))).is_err() {
                                             metrics::counter!("n42_hub_event_drops_total").increment(1);
                                             tracing::debug!(session_id, "event channel full, receipt dropped");
                                         }

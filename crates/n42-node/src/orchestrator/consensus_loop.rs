@@ -10,9 +10,15 @@ use tokio::time::Instant;
 use metrics::{counter, gauge, histogram};
 use tracing::{debug, error, info, warn};
 
+/// Number of recent blocks to check for emptiness before skipping proposal.
+const EMPTY_BLOCK_CHECK_WINDOW: usize = 3;
+
+/// Payload size below which a block is considered "empty" (no meaningful transactions).
+const EMPTY_BLOCK_SIZE_THRESHOLD: usize = 512;
+
 impl ConsensusOrchestrator {
     pub(super) fn recent_blocks_empty(&self) -> bool {
-        let check_count = 3.min(self.committed_blocks.len());
+        let check_count = EMPTY_BLOCK_CHECK_WINDOW.min(self.committed_blocks.len());
         if check_count == 0 {
             return false;
         }
@@ -20,7 +26,7 @@ impl ConsensusOrchestrator {
             .iter()
             .rev()
             .take(check_count)
-            .all(|b| b.payload.is_empty() || b.payload.len() < 512)
+            .all(|b| b.payload.is_empty() || b.payload.len() < EMPTY_BLOCK_SIZE_THRESHOLD)
     }
 
     /// Schedules the next payload build, skipping if recent blocks are empty.
@@ -91,7 +97,9 @@ impl ConsensusOrchestrator {
                 if let Some(peer_id) = self.network.validator_peer(target) {
                     if let Err(e) = self.network.send_direct(peer_id, msg.clone()) {
                         warn!(target_validator = target, error = %e, "direct send failed, falling back to broadcast");
-                        let _ = self.network.broadcast_consensus(msg);
+                        if let Err(e2) = self.network.broadcast_consensus(msg) {
+                            error!(target_validator = target, error = %e2, "broadcast fallback also failed");
+                        }
                     }
                 } else {
                     // Peer not yet identified — broadcast as fallback; this is normal
@@ -137,16 +145,16 @@ impl ConsensusOrchestrator {
                 self.validator_set_for_sync = Some(updated_vs);
 
                 // Pre-stage the validator set for the epoch after next, if scheduled.
-                if let Some(schedule) = &self.epoch_schedule {
-                    if let Some((validators, threshold)) = schedule.get_for_epoch(new_epoch + 1) {
-                        self.engine.epoch_manager_mut().stage_next_epoch(validators, threshold);
-                        info!(
-                            next_epoch = new_epoch + 1,
-                            validator_count = validators.len(),
-                            threshold,
-                            "staged next epoch validator set from schedule"
-                        );
-                    }
+                if let Some(schedule) = &self.epoch_schedule
+                    && let Some((validators, threshold)) = schedule.get_for_epoch(new_epoch + 1)
+                {
+                    self.engine.epoch_manager_mut().stage_next_epoch(validators, threshold);
+                    info!(
+                        next_epoch = new_epoch + 1,
+                        validator_count = validators.len(),
+                        threshold,
+                        "staged next epoch validator set from schedule"
+                    );
                 }
             }
         }
@@ -247,8 +255,10 @@ impl ConsensusOrchestrator {
             debug!(view, %block_hash, "block finalized in reth");
             self.pending_block_data.clear();
             self.pending_executions.clear();
-            if let Some(ref tx) = self.mobile_packet_tx {
-                let _ = tx.try_send((block_hash, view));
+            if let Some(ref tx) = self.mobile_packet_tx
+                && let Err(e) = tx.try_send((block_hash, view))
+            {
+                warn!(view, %block_hash, error = %e, "mobile_packet_tx full or closed, verification packet lost");
             }
         } else if let Some(data) = self.pending_block_data.remove(&block_hash) {
             // Case B: BlockData cached but not yet imported.
@@ -258,30 +268,32 @@ impl ConsensusOrchestrator {
                     self.import_and_notify(broadcast).await;
                     self.pending_block_data.clear();
                     self.pending_executions.clear();
-                    if let Some(ref tx) = self.mobile_packet_tx {
-                        let _ = tx.try_send((block_hash, view));
+                    if let Some(ref tx) = self.mobile_packet_tx
+                        && let Err(e) = tx.try_send((block_hash, view))
+                    {
+                        warn!(view, %block_hash, error = %e, "mobile_packet_tx full or closed, verification packet lost");
                     }
                 }
                 Err(e) => {
                     warn!(%block_hash, error = %e, "failed to deserialize cached block data");
-                    self.pending_finalization = Some(super::PendingFinalization {
-                        view,
-                        block_hash,
-                        commit_qc,
-                    });
-                    self.pending_executions.insert(block_hash);
+                    self.defer_finalization(view, block_hash, commit_qc);
                 }
             }
         } else {
             // Case C: Decide arrived before BlockData — defer finalization.
             info!(view, %block_hash, "block not yet in reth, deferring finalization");
-            self.pending_finalization = Some(super::PendingFinalization {
-                view,
-                block_hash,
-                commit_qc,
-            });
-            self.pending_executions.insert(block_hash);
+            self.defer_finalization(view, block_hash, commit_qc);
         }
+    }
+
+    /// Records a deferred finalization when block data has not yet been imported.
+    fn defer_finalization(&mut self, view: u64, block_hash: B256, commit_qc: QuorumCertificate) {
+        self.pending_finalization = Some(super::PendingFinalization {
+            view,
+            block_hash,
+            commit_qc,
+        });
+        self.pending_executions.insert(block_hash);
     }
 
     async fn handle_view_changed(&mut self, new_view: u64) {
@@ -291,7 +303,25 @@ impl ConsensusOrchestrator {
 
         // ViewChanged fires immediately after BlockCommitted in f=0 configs;
         // preserve pending state if a committed block is awaiting import.
-        if self.pending_finalization.is_none() {
+        if let Some(ref pf) = self.pending_finalization {
+            // If pending_finalization is stale (more than 2 views behind), force-clear
+            // to prevent indefinite hangs when block data was evicted or lost.
+            if new_view > pf.view + 2 {
+                warn!(
+                    pending_view = pf.view,
+                    new_view,
+                    hash = %pf.block_hash,
+                    "pending_finalization stale (>2 views behind), clearing and requesting sync"
+                );
+                counter!("n42_pending_finalization_stale_total").increment(1);
+                let stale_view = pf.view;
+                self.pending_finalization = None;
+                self.pending_block_data.clear();
+                self.pending_executions.clear();
+                // Trigger sync to recover the missing block
+                self.initiate_sync(stale_view, new_view);
+            }
+        } else {
             self.pending_block_data.clear();
             self.pending_executions.clear();
         }
@@ -306,13 +336,12 @@ impl ConsensusOrchestrator {
     }
 
     pub(super) fn handle_leader_payload_feedback(&mut self, hash: B256, data: Vec<u8>) {
-        if let Some(block) = self.committed_blocks.iter_mut().rev().find(|b| b.block_hash == hash) {
-            if block.payload.is_empty() {
-                if let Ok(broadcast) = bincode::deserialize::<super::BlockDataBroadcast>(&data) {
-                    block.payload = broadcast.payload_json;
-                    debug!(%hash, "populated committed block payload from leader build task");
-                }
-            }
+        if let Some(block) = self.committed_blocks.iter_mut().rev().find(|b| b.block_hash == hash)
+            && block.payload.is_empty()
+            && let Ok(broadcast) = bincode::deserialize::<super::BlockDataBroadcast>(&data)
+        {
+            block.payload = broadcast.payload_json;
+            debug!(%hash, "populated committed block payload from leader build task");
         }
     }
 }

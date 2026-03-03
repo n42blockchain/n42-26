@@ -284,6 +284,22 @@ impl TimeoutCollector {
     }
 }
 
+/// Distinguishes QC vs TC for error reporting in shared validation logic.
+#[derive(Debug, Clone, Copy)]
+enum CertKind {
+    QC,
+    TC,
+}
+
+impl CertKind {
+    fn invalid_error(self, view: ViewNumber, reason: String) -> ConsensusError {
+        match self {
+            CertKind::QC => ConsensusError::InvalidQC { view, reason },
+            CertKind::TC => ConsensusError::InvalidTC { view, reason },
+        }
+    }
+}
+
 /// Collects and validates signer public keys from a signers bitmap.
 ///
 /// Validates bitmap length against the validator set (prevents short bitmaps from
@@ -293,7 +309,7 @@ fn collect_signer_keys<'a>(
     validator_set: &'a ValidatorSet,
     quorum_size: usize,
     view: ViewNumber,
-    cert_kind: &str,
+    cert_kind: CertKind,
 ) -> ConsensusResult<Vec<&'a BlsPublicKey>> {
     let expected_len = validator_set.len() as usize;
     if signers.len() != expected_len {
@@ -302,21 +318,13 @@ fn collect_signer_keys<'a>(
             signers.len(),
             expected_len,
         );
-        return if cert_kind == "TC" {
-            Err(ConsensusError::InvalidTC { view, reason })
-        } else {
-            Err(ConsensusError::InvalidQC { view, reason })
-        };
+        return Err(cert_kind.invalid_error(view, reason));
     }
 
     let signer_count = signers.iter().filter(|b| **b).count();
     if signer_count < quorum_size {
         let reason = format!("insufficient signers: have {signer_count}, need {quorum_size}");
-        return if cert_kind == "TC" {
-            Err(ConsensusError::InvalidTC { view, reason })
-        } else {
-            Err(ConsensusError::InvalidQC { view, reason })
-        };
+        return Err(cert_kind.invalid_error(view, reason));
     }
 
     signers
@@ -330,7 +338,7 @@ fn collect_signer_keys<'a>(
 /// Verifies a QuorumCertificate (Round 1) against the validator set.
 pub fn verify_qc(qc: &QuorumCertificate, validator_set: &ValidatorSet) -> ConsensusResult<()> {
     let quorum_size = validator_set.quorum_size();
-    let signer_pks = collect_signer_keys(&qc.signers, validator_set, quorum_size, qc.view, "QC")?;
+    let signer_pks = collect_signer_keys(&qc.signers, validator_set, quorum_size, qc.view, CertKind::QC)?;
     let message = signing_message(qc.view, &qc.block_hash);
     AggregateSignature::verify_aggregate(&message, &qc.aggregate_signature, &signer_pks)
         .map_err(|_| ConsensusError::InvalidQC {
@@ -348,7 +356,7 @@ pub fn verify_commit_qc(
     validator_set: &ValidatorSet,
 ) -> ConsensusResult<()> {
     let quorum_size = validator_set.quorum_size();
-    let signer_pks = collect_signer_keys(&qc.signers, validator_set, quorum_size, qc.view, "QC")?;
+    let signer_pks = collect_signer_keys(&qc.signers, validator_set, quorum_size, qc.view, CertKind::QC)?;
     let message = commit_signing_message(qc.view, &qc.block_hash);
     AggregateSignature::verify_aggregate(&message, &qc.aggregate_signature, &signer_pks)
         .map_err(|_| ConsensusError::InvalidQC {
@@ -360,7 +368,7 @@ pub fn verify_commit_qc(
 /// Verifies a TimeoutCertificate against the validator set.
 pub fn verify_tc(tc: &TimeoutCertificate, validator_set: &ValidatorSet) -> ConsensusResult<()> {
     let quorum_size = validator_set.quorum_size();
-    let signer_pks = collect_signer_keys(&tc.signers, validator_set, quorum_size, tc.view, "TC")?;
+    let signer_pks = collect_signer_keys(&tc.signers, validator_set, quorum_size, tc.view, CertKind::TC)?;
     let message = timeout_signing_message(tc.view);
     AggregateSignature::verify_aggregate(&message, &tc.aggregate_signature, &signer_pks)
         .map_err(|_| ConsensusError::InvalidTC {
@@ -370,27 +378,36 @@ pub fn verify_tc(tc: &TimeoutCertificate, validator_set: &ValidatorSet) -> Conse
 }
 
 /// Signing message for Round 1 votes: view (8 bytes LE) || block_hash (32 bytes).
-pub fn signing_message(view: ViewNumber, block_hash: &B256) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(40);
-    msg.extend_from_slice(&view.to_le_bytes());
-    msg.extend_from_slice(block_hash.as_slice());
+pub fn signing_message(view: ViewNumber, block_hash: &B256) -> [u8; 40] {
+    let mut msg = [0u8; 40];
+    msg[..8].copy_from_slice(&view.to_le_bytes());
+    msg[8..].copy_from_slice(block_hash.as_slice());
     msg
 }
 
 /// Signing message for Round 2 commit votes: "commit" || view (8 bytes LE) || block_hash (32 bytes).
-pub fn commit_signing_message(view: ViewNumber, block_hash: &B256) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(46);
-    msg.extend_from_slice(b"commit");
-    msg.extend_from_slice(&view.to_le_bytes());
-    msg.extend_from_slice(block_hash.as_slice());
+pub fn commit_signing_message(view: ViewNumber, block_hash: &B256) -> [u8; 46] {
+    let mut msg = [0u8; 46];
+    msg[..6].copy_from_slice(b"commit");
+    msg[6..14].copy_from_slice(&view.to_le_bytes());
+    msg[14..].copy_from_slice(block_hash.as_slice());
     msg
 }
 
 /// Signing message for timeout messages: "timeout" || view (8 bytes LE).
-pub fn timeout_signing_message(view: ViewNumber) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(15);
-    msg.extend_from_slice(b"timeout");
-    msg.extend_from_slice(&view.to_le_bytes());
+pub fn timeout_signing_message(view: ViewNumber) -> [u8; 15] {
+    let mut msg = [0u8; 15];
+    msg[..7].copy_from_slice(b"timeout");
+    msg[7..].copy_from_slice(&view.to_le_bytes());
+    msg
+}
+
+/// Signing message for NewView messages: "newview" || view (8 bytes LE).
+/// Distinct from `timeout_signing_message` to prevent cross-domain replay.
+pub fn newview_signing_message(view: ViewNumber) -> [u8; 15] {
+    let mut msg = [0u8; 15];
+    msg[..7].copy_from_slice(b"newview");
+    msg[7..].copy_from_slice(&view.to_le_bytes());
     msg
 }
 

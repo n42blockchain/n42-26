@@ -61,7 +61,7 @@ struct CommittedBlock {
 pub struct ConsensusOrchestrator {
     engine: ConsensusEngine,
     network: NetworkHandle,
-    net_event_rx: mpsc::UnboundedReceiver<NetworkEvent>,
+    net_event_rx: mpsc::Receiver<NetworkEvent>,
     output_rx: mpsc::Receiver<EngineOutput>,
     beacon_engine: Option<ConsensusEngineHandle<EthEngineTypes>>,
     payload_builder: Option<PayloadBuilderHandle<EthEngineTypes>>,
@@ -77,7 +77,9 @@ pub struct ConsensusOrchestrator {
     pending_block_data: BTreeMap<B256, Vec<u8>>,
     pending_executions: HashSet<B256>,
     pending_finalization: Option<PendingFinalization>,
-    syncing_blocks: VecDeque<Vec<u8>>,
+    /// Blocks that returned `Syncing` from new_payload, queued for retry.
+    /// Each entry is `(serialized_data, retry_count)` — dropped after 3 retries.
+    syncing_blocks: VecDeque<(Vec<u8>, u32)>,
     tx_import_tx: Option<mpsc::Sender<Vec<u8>>>,
     tx_broadcast_rx: Option<mpsc::Receiver<Vec<u8>>>,
     committed_blocks: VecDeque<CommittedBlock>,
@@ -110,7 +112,7 @@ impl ConsensusOrchestrator {
     pub fn new(
         engine: ConsensusEngine,
         network: NetworkHandle,
-        net_event_rx: mpsc::UnboundedReceiver<NetworkEvent>,
+        net_event_rx: mpsc::Receiver<NetworkEvent>,
         output_rx: mpsc::Receiver<EngineOutput>,
     ) -> Self {
         let (block_ready_tx, block_ready_rx) = mpsc::unbounded_channel();
@@ -155,10 +157,11 @@ impl ConsensusOrchestrator {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn with_engine_api(
         engine: ConsensusEngine,
         network: NetworkHandle,
-        net_event_rx: mpsc::UnboundedReceiver<NetworkEvent>,
+        net_event_rx: mpsc::Receiver<NetworkEvent>,
         output_rx: mpsc::Receiver<EngineOutput>,
         beacon_engine: ConsensusEngineHandle<EthEngineTypes>,
         payload_builder: PayloadBuilderHandle<EthEngineTypes>,
@@ -241,6 +244,14 @@ impl ConsensusOrchestrator {
 
     pub fn with_mobile_reward_manager(mut self, mgr: Arc<Mutex<MobileRewardManager>>) -> Self {
         self.mobile_reward_manager = Some(mgr);
+        self
+    }
+
+    /// Restores the committed block count from a persisted snapshot.
+    /// Without this, the counter starts at 0 after restart, which can cause
+    /// the `MobileRewardManager` to re-trigger epoch boundary rewards.
+    pub fn with_committed_block_count(mut self, count: u64) -> Self {
+        self.committed_block_count = count;
         self
     }
 
@@ -334,10 +345,10 @@ impl ConsensusOrchestrator {
                         None => std::future::pending().await,
                     }
                 } => {
-                    if let Some(data) = tx_data {
-                        if let Err(e) = self.network.broadcast_transaction(data) {
-                            tracing::debug!(error = %e, "failed to broadcast transaction");
-                        }
+                    if let Some(data) = tx_data
+                        && let Err(e) = self.network.broadcast_transaction(data)
+                    {
+                        tracing::debug!(error = %e, "failed to broadcast transaction");
                     }
                 }
 
@@ -402,7 +413,7 @@ impl ConsensusOrchestrator {
             NetworkEvent::ConsensusMessage { source: _, message } => {
                 counter!("n42_consensus_messages_received").increment(1);
                 if let Err(e) = self.engine.process_event(
-                    n42_consensus::ConsensusEvent::Message(message)
+                    n42_consensus::ConsensusEvent::Message(*message)
                 ) {
                     if matches!(e, n42_consensus::N42ConsensusError::SafetyViolation { .. }) {
                         debug!(error = %e, "benign safety check (QC ordering race)");
@@ -487,7 +498,7 @@ mod tests {
     fn test_orchestrator_construction() {
         let (engine, output_rx) = make_test_engine();
         let (network, _cmd_rx) = make_test_network();
-        let (_net_event_tx, net_event_rx) = mpsc::unbounded_channel();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
         let _ = ConsensusOrchestrator::new(engine, network, net_event_rx, output_rx);
     }
 
@@ -502,7 +513,7 @@ mod tests {
     async fn test_handle_engine_output_broadcast() {
         let (engine, output_rx) = make_test_engine();
         let (network, mut cmd_rx) = make_test_network();
-        let (_net_event_tx, net_event_rx) = mpsc::unbounded_channel();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
         let mut orch = ConsensusOrchestrator::new(engine, network, net_event_rx, output_rx);
 
         let sk = BlsSecretKey::random().unwrap();
@@ -528,7 +539,7 @@ mod tests {
     async fn test_handle_engine_output_send_to_validator() {
         let (engine, output_rx) = make_test_engine();
         let (network, mut cmd_rx) = make_test_network();
-        let (_net_event_tx, net_event_rx) = mpsc::unbounded_channel();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
         let mut orch = ConsensusOrchestrator::new(engine, network, net_event_rx, output_rx);
 
         let sk = BlsSecretKey::random().unwrap();
@@ -557,7 +568,7 @@ mod tests {
     async fn test_handle_engine_output_execute_block() {
         let (engine, output_rx) = make_test_engine();
         let (network, _cmd_rx) = make_test_network();
-        let (_net_event_tx, net_event_rx) = mpsc::unbounded_channel();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
         let mut orch = ConsensusOrchestrator::new(engine, network, net_event_rx, output_rx);
         orch.handle_engine_output(EngineOutput::ExecuteBlock(B256::repeat_byte(0xCC)))
             .await;
@@ -567,7 +578,7 @@ mod tests {
     async fn test_handle_engine_output_block_committed() {
         let (engine, output_rx) = make_test_engine();
         let (network, _cmd_rx) = make_test_network();
-        let (_net_event_tx, net_event_rx) = mpsc::unbounded_channel();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
         let mut orch = ConsensusOrchestrator::new(engine, network, net_event_rx, output_rx);
 
         let commit_qc = QuorumCertificate::genesis();
@@ -589,7 +600,7 @@ mod tests {
     async fn test_handle_engine_output_view_changed() {
         let (engine, output_rx) = make_test_engine();
         let (network, _cmd_rx) = make_test_network();
-        let (_net_event_tx, net_event_rx) = mpsc::unbounded_channel();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
         let mut orch = ConsensusOrchestrator::new(engine, network, net_event_rx, output_rx);
         orch.handle_engine_output(EngineOutput::ViewChanged { new_view: 5 })
             .await;
@@ -599,7 +610,7 @@ mod tests {
     async fn test_orchestrator_exits_on_net_event_channel_close() {
         let (engine, output_rx) = make_test_engine();
         let (network, _cmd_rx) = make_test_network();
-        let (net_event_tx, net_event_rx) = mpsc::unbounded_channel::<NetworkEvent>();
+        let (net_event_tx, net_event_rx) = mpsc::channel::<NetworkEvent>(8192);
         let orch = ConsensusOrchestrator::new(engine, network, net_event_rx, output_rx);
         drop(net_event_tx);
 
@@ -614,66 +625,33 @@ mod tests {
     async fn test_orchestrator_processes_peer_events() {
         let (engine, output_rx) = make_test_engine();
         let (network, _cmd_rx) = make_test_network();
-        let (net_event_tx, net_event_rx) = mpsc::unbounded_channel::<NetworkEvent>();
+        let (net_event_tx, net_event_rx) = mpsc::channel::<NetworkEvent>(8192);
         let orch = ConsensusOrchestrator::new(engine, network, net_event_rx, output_rx);
 
         let peer_id = libp2p::PeerId::random();
-        net_event_tx.send(NetworkEvent::PeerConnected(peer_id)).unwrap();
+        net_event_tx.try_send(NetworkEvent::PeerConnected(peer_id)).unwrap();
         drop(net_event_tx);
 
         let result = tokio::time::timeout(Duration::from_secs(5), orch.run()).await;
         assert!(result.is_ok(), "orchestrator should exit after processing events");
     }
 
-    #[tokio::test]
-    async fn test_block_committed_updates_shared_state() {
+    fn make_test_orchestrator_with_state(
+        state: Option<Arc<SharedConsensusState>>,
+    ) -> ConsensusOrchestrator {
         let (engine, output_rx) = make_test_engine();
         let (network, _cmd_rx) = make_test_network();
-        let (_net_event_tx, net_event_rx) = mpsc::unbounded_channel();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let mut orch = ConsensusOrchestrator::new(engine, network, net_event_rx, output_rx);
+        orch.consensus_state = state;
+        orch
+    }
 
+    #[tokio::test]
+    async fn test_block_committed_updates_shared_state() {
         let vs = ValidatorSet::new(&[], 0);
         let state = Arc::new(SharedConsensusState::new(vs));
-
-        let (block_ready_tx, block_ready_rx) = mpsc::unbounded_channel();
-        let (leader_payload_tx, leader_payload_rx) = mpsc::unbounded_channel();
-        let mut orch = ConsensusOrchestrator {
-            engine,
-            network,
-            net_event_rx,
-            output_rx,
-            beacon_engine: None,
-            payload_builder: None,
-            consensus_state: Some(state.clone()),
-            head_block_hash: B256::ZERO,
-            block_ready_tx,
-            block_ready_rx,
-            fee_recipient: Address::ZERO,
-            slot_time: Duration::ZERO,
-            next_build_at: None,
-            next_slot_timestamp: None,
-            consecutive_empty_skips: 0,
-            pending_block_data: BTreeMap::new(),
-            pending_executions: HashSet::new(),
-            pending_finalization: None,
-            syncing_blocks: VecDeque::new(),
-            tx_import_tx: None,
-            tx_broadcast_rx: None,
-            committed_blocks: VecDeque::new(),
-            connected_peers: HashSet::new(),
-            sync_in_flight: false,
-            sync_started_at: None,
-            state_file: None,
-            validator_set_for_sync: None,
-            mobile_packet_tx: None,
-            leader_payload_rx,
-            leader_payload_tx,
-            blob_store: None,
-            mobile_reward_manager: None,
-            committed_block_count: 0,
-            last_committed_timestamp: 0,
-            view_started_at: None,
-            epoch_schedule: None,
-        };
+        let mut orch = make_test_orchestrator_with_state(Some(state.clone()));
 
         assert!(state.load_committed_qc().is_none(), "should start with no QC");
 
@@ -690,50 +668,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_block_ready_channel() {
-        let (engine, output_rx) = make_test_engine();
-        let (network, _cmd_rx) = make_test_network();
-        let (_net_event_tx, net_event_rx) = mpsc::unbounded_channel::<NetworkEvent>();
-
-        let (block_ready_tx, block_ready_rx) = mpsc::unbounded_channel();
-        let (leader_payload_tx, leader_payload_rx) = mpsc::unbounded_channel();
-        let mut orch = ConsensusOrchestrator {
-            engine,
-            network,
-            net_event_rx,
-            output_rx,
-            beacon_engine: None,
-            payload_builder: None,
-            consensus_state: None,
-            head_block_hash: B256::ZERO,
-            block_ready_tx: block_ready_tx.clone(),
-            block_ready_rx,
-            fee_recipient: Address::ZERO,
-            slot_time: Duration::ZERO,
-            next_build_at: None,
-            next_slot_timestamp: None,
-            consecutive_empty_skips: 0,
-            pending_block_data: BTreeMap::new(),
-            pending_executions: HashSet::new(),
-            pending_finalization: None,
-            syncing_blocks: VecDeque::new(),
-            tx_import_tx: None,
-            tx_broadcast_rx: None,
-            committed_blocks: VecDeque::new(),
-            connected_peers: HashSet::new(),
-            sync_in_flight: false,
-            sync_started_at: None,
-            state_file: None,
-            validator_set_for_sync: None,
-            mobile_packet_tx: None,
-            leader_payload_rx,
-            leader_payload_tx,
-            blob_store: None,
-            mobile_reward_manager: None,
-            committed_block_count: 0,
-            last_committed_timestamp: 0,
-            view_started_at: None,
-            epoch_schedule: None,
-        };
+        let mut orch = make_test_orchestrator_with_state(None);
+        let block_ready_tx = orch.block_ready_tx.clone();
 
         let test_hash = B256::repeat_byte(0xFF);
         block_ready_tx.send(test_hash).unwrap();
@@ -747,7 +683,7 @@ mod tests {
     fn test_sync_timeout_resets_in_flight() {
         let (engine, output_rx) = make_test_engine();
         let (network, _cmd_rx) = make_test_network();
-        let (_net_event_tx, net_event_rx) = mpsc::unbounded_channel();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
         let mut orch = ConsensusOrchestrator::new(engine, network, net_event_rx, output_rx);
 
         orch.connected_peers.insert(libp2p::PeerId::random());

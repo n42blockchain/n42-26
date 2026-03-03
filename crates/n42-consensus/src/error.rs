@@ -83,6 +83,14 @@ pub enum ConsensusError {
     /// The consensus output channel is full or closed.
     #[error("consensus output channel full or closed")]
     OutputChannelClosed,
+
+    /// Epoch schedule is empty (cannot create EpochManager).
+    #[error("epoch schedule must not be empty")]
+    EpochScheduleEmpty,
+
+    /// Batch verification input exceeds the maximum allowed size.
+    #[error("batch verification size {size} exceeds maximum {max}")]
+    BatchTooLarge { size: usize, max: usize },
 }
 
 /// Result type for consensus operations.

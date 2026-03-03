@@ -22,6 +22,7 @@ const MAX_FUTURE_MESSAGES: usize = 256;
 
 /// Events fed into the consensus engine.
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)] // Message is the dominant hot-path variant; boxing adds unnecessary allocation
 pub enum ConsensusEvent {
     /// A consensus message received from the network.
     Message(ConsensusMessage),
@@ -172,6 +173,7 @@ impl ConsensusEngine {
     ///
     /// Restores safety invariants (locked_qc, last_committed_qc) so the node
     /// resumes with its previous locking commitments intact.
+    #[allow(clippy::too_many_arguments)] // recovery needs all safety-critical fields
     pub fn with_recovered_state(
         my_index: u32,
         secret_key: BlsSecretKey,
@@ -184,7 +186,11 @@ impl ConsensusEngine {
         last_committed_qc: QuorumCertificate,
         consecutive_timeouts: u32,
     ) -> Self {
-        let safe_consecutive_timeouts = consecutive_timeouts.min(128);
+        /// Maximum consecutive timeouts preserved from a snapshot to prevent
+        /// absurdly long backoff durations on recovery.
+        const MAX_RECOVERED_CONSECUTIVE_TIMEOUTS: u32 = 128;
+
+        let safe_consecutive_timeouts = consecutive_timeouts.min(MAX_RECOVERED_CONSECUTIVE_TIMEOUTS);
         if safe_consecutive_timeouts != consecutive_timeouts {
             tracing::warn!(
                 original = consecutive_timeouts,
@@ -338,13 +344,12 @@ impl ConsensusEngine {
         // With GossipSub multi-path delivery, messages may arrive via multiple mesh routes;
         // after the first copy advances our view, subsequent copies are dropped early.
         // Decide and NewView are exempt as they handle past-view logic internally.
-        if let Some(view) = msg_view {
-            if view < current_view
-                && !matches!(msg, ConsensusMessage::Decide(_) | ConsensusMessage::NewView(_))
-            {
-                tracing::trace!(current_view, msg_view = view, "discarding stale consensus message");
-                return Ok(());
-            }
+        if let Some(view) = msg_view
+            && view < current_view
+            && !matches!(msg, ConsensusMessage::Decide(_) | ConsensusMessage::NewView(_))
+        {
+            tracing::trace!(current_view, msg_view = view, "discarding stale consensus message");
+            return Ok(());
         }
 
         self.dispatch_message(msg)
@@ -508,10 +513,40 @@ impl ConsensusEngine {
     }
 
     pub(super) fn emit(&self, output: EngineOutput) -> ConsensusResult<()> {
-        self.output_tx.try_send(output).map_err(|e| {
-            tracing::error!("consensus output channel full or closed: {}", e);
-            crate::error::ConsensusError::OutputChannelClosed
-        })
+        // BlockCommitted events are critical — losing them desynchronizes consensus
+        // and execution. Retry up to 3 times with a brief sleep between attempts.
+        let is_block_committed = matches!(output, EngineOutput::BlockCommitted { .. });
+
+        match self.output_tx.try_send(output) {
+            Ok(()) => Ok(()),
+            Err(first_err) => {
+                if is_block_committed {
+                    let mut val = first_err.into_inner();
+                    for attempt in 1..=3 {
+                        std::thread::yield_now();
+                        match self.output_tx.try_send(val) {
+                            Ok(()) => {
+                                tracing::warn!(attempt, "BlockCommitted delivered after retry");
+                                return Ok(());
+                            }
+                            Err(retry_err) => {
+                                tracing::error!(
+                                    attempt,
+                                    "BlockCommitted retry failed: {}",
+                                    retry_err
+                                );
+                                val = retry_err.into_inner();
+                            }
+                        }
+                    }
+                    tracing::error!("CRITICAL: BlockCommitted lost after 3 retries");
+                    Err(crate::error::ConsensusError::OutputChannelClosed)
+                } else {
+                    tracing::error!("consensus output channel full or closed: {}", first_err);
+                    Err(crate::error::ConsensusError::OutputChannelClosed)
+                }
+            }
+        }
     }
 }
 

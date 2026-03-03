@@ -35,6 +35,11 @@ pub struct ConsensusSnapshot {
     /// each phone to re-establish a QUIC connection from scratch.
     #[serde(default, with = "authorized_verifiers_hex")]
     pub authorized_verifiers: Vec<[u8; 48]>,
+    /// Number of blocks committed since genesis. Persisted so that the
+    /// `MobileRewardManager` does not recompute epoch boundaries from 0
+    /// on restart, which could cause duplicate reward payouts.
+    #[serde(default)]
+    pub committed_block_count: u64,
 }
 
 /// Serde helper: serialize/deserialize `Vec<[u8; 48]>` as hex strings for human-readable JSON.
@@ -151,6 +156,7 @@ mod tests {
             consecutive_timeouts: 0,
             scheduled_epoch_transition: None,
             authorized_verifiers: Vec::new(),
+            committed_block_count: 0,
         }
     }
 

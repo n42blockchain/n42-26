@@ -28,7 +28,7 @@ pub fn batch_verify(
     }
 
     if messages.len() > MAX_BATCH_SIZE {
-        return Err(BlsError::VerificationFailed(BLST_ERROR::BLST_BAD_ENCODING));
+        return Err(BlsError::BatchTooLarge { size: messages.len(), max: MAX_BATCH_SIZE });
     }
 
     if messages.is_empty() {

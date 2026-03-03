@@ -94,7 +94,12 @@ impl ShardedStarHub {
         let (merged_event_tx, merged_event_rx) = mpsc::unbounded_channel();
 
         for i in 0..shard_count {
-            let port = config.base_port + i as u16;
+            let port = config.base_port.checked_add(i as u16).unwrap_or_else(|| {
+                panic!(
+                    "port overflow: base_port={} + shard_index={} exceeds u16::MAX",
+                    config.base_port, i
+                )
+            });
             let shard_config = StarHubConfig {
                 bind_addr: format!("0.0.0.0:{port}").parse().unwrap(),
                 max_connections: config.max_connections_per_shard,

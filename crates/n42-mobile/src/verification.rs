@@ -98,15 +98,14 @@ impl ReceiptAggregator {
         if self.blocks.contains_key(&block_hash) {
             return;
         }
-        if self.blocks.len() >= self.max_tracked_blocks {
-            if let Some(oldest) = self
+        if self.blocks.len() >= self.max_tracked_blocks
+            && let Some(oldest) = self
                 .blocks
                 .iter()
                 .min_by_key(|(_, s)| s.block_number)
                 .map(|(h, _)| *h)
-            {
-                self.blocks.remove(&oldest);
-            }
+        {
+            self.blocks.remove(&oldest);
         }
         self.blocks.insert(
             block_hash,

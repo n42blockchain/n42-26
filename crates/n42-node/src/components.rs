@@ -71,11 +71,6 @@ where
     }
 }
 
-/// Loads a `ValidatorSet` from a `ConsensusConfig`. Also used by orchestrator startup.
-pub fn load_validator_set(config: &ConsensusConfig) -> ValidatorSet {
-    ValidatorSet::new(&config.initial_validators, config.fault_tolerance)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -104,9 +99,4 @@ mod tests {
         let _ = (builder.clone(), builder);
     }
 
-    #[test]
-    fn test_load_validator_set_empty() {
-        let vs = load_validator_set(&ConsensusConfig::dev());
-        assert_eq!(vs.len(), 0);
-    }
 }

@@ -245,12 +245,14 @@ pub fn build_swarm_with_validator_index(
 
 /// Builds per-topic peer scoring parameters.
 fn build_peer_score_params() -> PeerScoreParams {
-    let mut params = PeerScoreParams::default();
     // Disable IP co-location penalty: in testnet all validators run on the
     // same machine (127.0.0.1), causing gossipsub to penalize every peer for
     // sharing an IP.  In production, validators are on distinct IPs so this
     // has no effect.  Setting the weight to 0 disables the penalty entirely.
-    params.ip_colocation_factor_weight = 0.0;
+    let mut params = PeerScoreParams {
+        ip_colocation_factor_weight: 0.0,
+        ..Default::default()
+    };
 
     params.topics.insert(
         consensus_topic().hash(),

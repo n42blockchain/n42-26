@@ -26,6 +26,12 @@ struct ValidatorEntry {
 impl ValidatorSet {
     /// Creates a new validator set from chain configuration.
     pub fn new(validators: &[ValidatorInfo], fault_tolerance: u32) -> Self {
+        debug_assert!(
+            fault_tolerance <= (validators.len() as u32).saturating_sub(1) / 3,
+            "fault_tolerance ({fault_tolerance}) exceeds BFT bound for {} validators",
+            validators.len(),
+        );
+
         let entries = validators
             .iter()
             .map(|v| ValidatorEntry {
@@ -51,8 +57,9 @@ impl ValidatorSet {
     }
 
     /// Returns the quorum size: 2f + 1.
+    /// Uses u64 arithmetic internally to prevent overflow when f is large.
     pub fn quorum_size(&self) -> usize {
-        (2 * self.fault_tolerance + 1) as usize
+        (2u64 * self.fault_tolerance as u64 + 1) as usize
     }
 
     /// Returns the fault tolerance f.

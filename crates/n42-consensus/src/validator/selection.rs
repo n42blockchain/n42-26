@@ -11,7 +11,16 @@ pub struct LeaderSelector;
 
 impl LeaderSelector {
     /// Returns the leader's validator index for the given view.
+    ///
+    /// # Panics
+    /// Debug-asserts that the validator set is non-empty. In release builds,
+    /// returns 0 for empty sets (callers should ensure non-empty sets via
+    /// `ValidatorSet::new` validation).
     pub fn leader_for_view(view: ViewNumber, validator_set: &ValidatorSet) -> u32 {
+        debug_assert!(
+            !validator_set.is_empty(),
+            "leader_for_view called with empty validator set"
+        );
         if validator_set.is_empty() {
             return 0;
         }
@@ -81,10 +90,10 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "leader_for_view called with empty validator set")]
     fn test_leader_for_view_empty_set() {
         let vs = ValidatorSet::new(&[], 0);
-        let leader = LeaderSelector::leader_for_view(5, &vs);
-        assert_eq!(leader, 0);
+        let _leader = LeaderSelector::leader_for_view(5, &vs);
     }
 
     #[test]

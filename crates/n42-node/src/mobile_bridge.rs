@@ -118,10 +118,10 @@ impl MobileVerificationBridge {
         if map.contains_key(&key) {
             return false;
         }
-        if map.len() >= max {
-            if let Some(oldest) = order.pop_front() {
-                map.remove(&oldest);
-            }
+        if map.len() >= max
+            && let Some(oldest) = order.pop_front()
+        {
+            map.remove(&oldest);
         }
         order.push_back(key);
         true
@@ -205,11 +205,11 @@ impl MobileVerificationBridge {
                 } => {
                     match task {
                         Ok(task) => {
-                            self.register_dispatched_block(task.block_hash, task.block_number);
+                            self.register_dispatched_block(task.block_hash, task.view);
                             debug!(
                                 target: "n42::mobile",
                                 block_hash = %task.block_hash,
-                                block_number = task.block_number,
+                                view = task.view,
                                 "registered dispatched block for mobile receipt tracking"
                             );
                         }
@@ -308,10 +308,10 @@ impl MobileVerificationBridge {
         match self.receipt_aggregator.process_receipt(receipt) {
             Some(true) => {
                 // New unique receipt for a dispatched block; threshold just crossed.
-                if receipt.is_valid() {
-                    if let Some(ref tx) = self.reward_tx {
-                        let _ = tx.send(receipt.verifier_pubkey);
-                    }
+                if receipt.is_valid()
+                    && let Some(ref tx) = self.reward_tx
+                {
+                    let _ = tx.send(receipt.verifier_pubkey);
                 }
 
                 let valid_count = self
@@ -350,10 +350,10 @@ impl MobileVerificationBridge {
             }
             Some(false) => {
                 // New unique receipt for a dispatched block; threshold not yet reached.
-                if receipt.is_valid() {
-                    if let Some(ref tx) = self.reward_tx {
-                        let _ = tx.send(receipt.verifier_pubkey);
-                    }
+                if receipt.is_valid()
+                    && let Some(ref tx) = self.reward_tx
+                {
+                    let _ = tx.send(receipt.verifier_pubkey);
                 }
                 debug!(
                     target: "n42::mobile",
@@ -528,7 +528,7 @@ mod tests {
         let receipt = make_receipt(block_hash, 42);
 
         tx.send(HubEvent::PhoneConnected { session_id: 1, verifier_pubkey: [0u8; 48] }).unwrap();
-        tx.send(HubEvent::ReceiptReceived(receipt)).unwrap();
+        tx.send(HubEvent::ReceiptReceived(Box::new(receipt))).unwrap();
         tx.send(HubEvent::CacheInventoryReceived { session_id: 1, code_hashes: vec![[0xAA; 32]] })
             .unwrap();
         tx.send(HubEvent::PhoneDisconnected { session_id: 1 }).unwrap();
@@ -695,7 +695,7 @@ mod tests {
         }).await.expect("should receive committed-block notification");
 
         let task = run_once.expect("verification task should be present");
-        bridge.register_dispatched_block(task.block_hash, task.block_number);
+        bridge.register_dispatched_block(task.block_hash, task.view);
 
         let status = bridge.receipt_aggregator.get_status(&task.block_hash);
         assert!(status.is_some(), "committed block should be registered for receipt tracking");

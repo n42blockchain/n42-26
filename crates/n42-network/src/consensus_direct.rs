@@ -4,6 +4,8 @@ use libp2p::StreamProtocol;
 use serde::{Deserialize, Serialize};
 use std::io;
 
+use crate::codec;
+
 /// Protocol identifier for consensus direct messaging.
 pub const CONSENSUS_DIRECT_PROTOCOL: &str = "/n42/consensus-direct/1";
 
@@ -49,7 +51,7 @@ impl request_response::Codec for ConsensusDirectCodec {
         'life2: 'async_trait,
         Self: 'async_trait,
     {
-        Box::pin(read_length_prefixed(io, MAX_CONSENSUS_DIRECT_SIZE))
+        Box::pin(codec::read_length_prefixed(io, MAX_CONSENSUS_DIRECT_SIZE))
     }
 
     fn read_response<'life0, 'life1, 'life2, 'async_trait, T>(
@@ -64,7 +66,7 @@ impl request_response::Codec for ConsensusDirectCodec {
         'life2: 'async_trait,
         Self: 'async_trait,
     {
-        Box::pin(read_length_prefixed(io, MAX_CONSENSUS_DIRECT_SIZE))
+        Box::pin(codec::read_length_prefixed(io, MAX_CONSENSUS_DIRECT_SIZE))
     }
 
     fn write_request<'life0, 'life1, 'life2, 'async_trait, T>(
@@ -80,7 +82,7 @@ impl request_response::Codec for ConsensusDirectCodec {
         'life2: 'async_trait,
         Self: 'async_trait,
     {
-        Box::pin(async move { write_length_prefixed(io, &req).await })
+        Box::pin(async move { codec::write_length_prefixed(io, &req, MAX_CONSENSUS_DIRECT_SIZE).await })
     }
 
     fn write_response<'life0, 'life1, 'life2, 'async_trait, T>(
@@ -96,56 +98,8 @@ impl request_response::Codec for ConsensusDirectCodec {
         'life2: 'async_trait,
         Self: 'async_trait,
     {
-        Box::pin(async move { write_length_prefixed(io, &res).await })
+        Box::pin(async move { codec::write_length_prefixed(io, &res, MAX_CONSENSUS_DIRECT_SIZE).await })
     }
-}
-
-/// Reads a length-prefixed bincode-encoded message (big-endian u32 length header).
-async fn read_length_prefixed<T, M>(io: &mut T, max_size: usize) -> io::Result<M>
-where
-    T: AsyncRead + Unpin + Send,
-    M: serde::de::DeserializeOwned,
-{
-    let mut len_buf = [0u8; 4];
-    io.read_exact(&mut len_buf).await?;
-    let len = u32::from_be_bytes(len_buf) as usize;
-    if len > max_size {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("message too large: {len} > {max_size}"),
-        ));
-    }
-    let mut buf = vec![0u8; len];
-    io.read_exact(&mut buf).await?;
-    bincode::deserialize(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
-}
-
-/// Writes a length-prefixed bincode-encoded message (big-endian u32 length header).
-async fn write_length_prefixed<T, M>(io: &mut T, msg: &M) -> io::Result<()>
-where
-    T: AsyncWrite + Unpin + Send,
-    M: serde::Serialize,
-{
-    let data =
-        bincode::serialize(msg).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    if data.len() > MAX_CONSENSUS_DIRECT_SIZE {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "serialized message too large: {} > {MAX_CONSENSUS_DIRECT_SIZE}",
-                data.len()
-            ),
-        ));
-    }
-    let len_u32 = u32::try_from(data.len()).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("serialized message length {} overflows u32", data.len()),
-        )
-    })?;
-    io.write_all(&len_u32.to_be_bytes()).await?;
-    io.write_all(&data).await?;
-    io.flush().await
 }
 
 #[cfg(test)]
@@ -191,7 +145,7 @@ mod tests {
     async fn test_codec_write_read_request_roundtrip() {
         let req = sample_request();
         let mut buf = futures::io::Cursor::new(Vec::new());
-        write_length_prefixed(&mut buf, &req).await.unwrap();
+        codec::write_length_prefixed(&mut buf, &req, MAX_CONSENSUS_DIRECT_SIZE).await.unwrap();
 
         let data = buf.into_inner();
         let len = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
@@ -199,7 +153,7 @@ mod tests {
 
         let mut reader = futures::io::Cursor::new(data);
         let decoded: ConsensusDirectRequest =
-            read_length_prefixed(&mut reader, MAX_CONSENSUS_DIRECT_SIZE)
+            codec::read_length_prefixed(&mut reader, MAX_CONSENSUS_DIRECT_SIZE)
                 .await
                 .unwrap();
         assert_eq!(decoded.message_bytes, req.message_bytes);
@@ -209,12 +163,12 @@ mod tests {
     async fn test_codec_write_read_response_roundtrip() {
         let resp = sample_response_accepted();
         let mut buf = futures::io::Cursor::new(Vec::new());
-        write_length_prefixed(&mut buf, &resp).await.unwrap();
+        codec::write_length_prefixed(&mut buf, &resp, MAX_CONSENSUS_DIRECT_SIZE).await.unwrap();
 
         let data = buf.into_inner();
         let mut reader = futures::io::Cursor::new(data);
         let decoded: ConsensusDirectResponse =
-            read_length_prefixed(&mut reader, MAX_CONSENSUS_DIRECT_SIZE)
+            codec::read_length_prefixed(&mut reader, MAX_CONSENSUS_DIRECT_SIZE)
                 .await
                 .unwrap();
         assert!(decoded.accepted);
@@ -229,7 +183,7 @@ mod tests {
 
         let mut reader = futures::io::Cursor::new(data);
         let result: io::Result<ConsensusDirectRequest> =
-            read_length_prefixed(&mut reader, MAX_CONSENSUS_DIRECT_SIZE).await;
+            codec::read_length_prefixed(&mut reader, MAX_CONSENSUS_DIRECT_SIZE).await;
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
     }

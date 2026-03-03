@@ -354,12 +354,12 @@ impl revm::database_interface::Database for StreamReplayDB<'_> {
         if let Some(code) = self.bytecodes.get(&code_hash) {
             return Ok(code.clone());
         }
-        if let Some(cache) = self.code_cache.as_mut() {
-            if let Some(code) = cache.get(&code_hash) {
-                let bytecode = Bytecode::new_raw(code.clone());
-                self.bytecodes.insert(code_hash, bytecode.clone());
-                return Ok(bytecode);
-            }
+        if let Some(cache) = self.code_cache.as_mut()
+            && let Some(code) = cache.get(&code_hash)
+        {
+            let bytecode = Bytecode::new_raw(code.clone());
+            self.bytecodes.insert(code_hash, bytecode.clone());
+            return Ok(bytecode);
         }
         Err(StreamDbError::MissingCode(code_hash))
     }

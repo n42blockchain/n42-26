@@ -496,12 +496,15 @@ fn main() {
                     }
                 };
 
+                let mut restored_block_count: u64 = 0;
                 let consensus_engine = if let Some(snapshot) = snapshot {
+                    restored_block_count = snapshot.committed_block_count;
                     info!(
                         target: "n42::cli",
                         view = snapshot.current_view,
                         locked_qc_view = snapshot.locked_qc.view,
                         last_committed_view = snapshot.last_committed_qc.view,
+                        committed_block_count = snapshot.committed_block_count,
                         "recovered consensus state from snapshot"
                     );
                     let mut epoch_manager = make_epoch_manager();
@@ -599,7 +602,8 @@ fn main() {
                 .with_state_persistence(state_file)
                 .with_validator_set(validator_set)
                 .with_blob_store(full_node.pool.blob_store().clone())
-                .with_mobile_reward_manager(reward_manager);
+                .with_mobile_reward_manager(reward_manager)
+                .with_committed_block_count(restored_block_count);
 
                 if let Some(schedule) = epoch_schedule {
                     orchestrator = orchestrator.with_epoch_schedule(schedule);

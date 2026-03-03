@@ -76,6 +76,20 @@ impl ConsensusOrchestrator {
             .unwrap_or_default()
     }
 
+    /// Builds a snapshot of the current consensus state for persistence.
+    fn build_snapshot(&self) -> ConsensusSnapshot {
+        ConsensusSnapshot {
+            version: 1,
+            current_view: self.engine.current_view(),
+            locked_qc: self.engine.locked_qc().clone(),
+            last_committed_qc: self.engine.last_committed_qc().clone(),
+            consecutive_timeouts: self.engine.consecutive_timeouts(),
+            scheduled_epoch_transition: self.collect_scheduled_epoch(),
+            authorized_verifiers: self.collect_authorized_verifiers(),
+            committed_block_count: self.committed_block_count,
+        }
+    }
+
     /// Persists the current consensus state to disk.
     /// Called after each BlockCommitted event and on graceful shutdown.
     pub(super) fn save_consensus_state(&self) {
@@ -84,16 +98,7 @@ impl ConsensusOrchestrator {
             None => return,
         };
 
-        let snapshot = ConsensusSnapshot {
-            version: 1,
-            current_view: self.engine.current_view(),
-            locked_qc: self.engine.locked_qc().clone(),
-            last_committed_qc: self.engine.last_committed_qc().clone(),
-            consecutive_timeouts: 0,
-            scheduled_epoch_transition: self.collect_scheduled_epoch(),
-            authorized_verifiers: self.collect_authorized_verifiers(),
-        };
-
+        let snapshot = self.build_snapshot();
         if let Err(e) = persistence::save_consensus_state(path, &snapshot) {
             error!(error = %e, "failed to save consensus state");
         } else {
@@ -108,16 +113,7 @@ impl ConsensusOrchestrator {
             None => return,
         };
 
-        let snapshot = ConsensusSnapshot {
-            version: 1,
-            current_view: self.engine.current_view(),
-            locked_qc: self.engine.locked_qc().clone(),
-            last_committed_qc: self.engine.last_committed_qc().clone(),
-            consecutive_timeouts: self.engine.consecutive_timeouts(),
-            scheduled_epoch_transition: self.collect_scheduled_epoch(),
-            authorized_verifiers: self.collect_authorized_verifiers(),
-        };
-
+        let snapshot = self.build_snapshot();
         if let Err(e) = persistence::save_consensus_state(path, &snapshot) {
             error!(error = %e, "failed to persist final consensus state on shutdown");
         } else {

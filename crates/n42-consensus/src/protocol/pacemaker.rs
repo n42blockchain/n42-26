@@ -30,8 +30,11 @@ impl Pacemaker {
     /// Returns the timeout duration for the given number of consecutive timeouts.
     ///
     /// Uses exponential backoff: `base * 2^consecutive_timeouts`, capped at `max_timeout`.
+    /// Maximum exponent for backoff calculation to avoid overflow.
+    const MAX_BACKOFF_EXPONENT: u32 = 63;
+
     pub fn timeout_duration(&self, consecutive_timeouts: u32) -> Duration {
-        let exp = consecutive_timeouts.min(63);
+        let exp = consecutive_timeouts.min(Self::MAX_BACKOFF_EXPONENT);
         let multiplier = 1u64.checked_shl(exp).unwrap_or(u64::MAX);
         let timeout_ms = self
             .base_timeout
