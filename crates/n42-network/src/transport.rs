@@ -5,6 +5,7 @@ use libp2p::swarm::behaviour::toggle::Toggle;
 use libp2p::Swarm;
 use std::time::Duration;
 
+use crate::consensus_direct::ConsensusDirectCodec;
 use crate::gossipsub::message_id_fn;
 use crate::gossipsub::topics::{blob_sidecar_topic, block_announce_topic, consensus_topic, mempool_topic};
 use crate::state_sync::StateSyncCodec;
@@ -19,6 +20,8 @@ pub struct N42Behaviour {
     pub gossipsub: gossipsub::Behaviour,
     pub identify: libp2p::identify::Behaviour,
     pub state_sync: libp2p::request_response::Behaviour<StateSyncCodec>,
+    /// Point-to-point consensus messaging (votes, proposals to specific validators).
+    pub consensus_direct: libp2p::request_response::Behaviour<ConsensusDirectCodec>,
     /// Disabled in production; enabled in dev/test via `enable_mdns`.
     pub mdns: Toggle<libp2p::mdns::tokio::Behaviour>,
     /// Disabled in dev/test; enabled in production via `enable_kademlia`.
@@ -75,9 +78,11 @@ impl TransportConfig {
             mesh_outbound_min,
             enable_mdns: false,
             enable_kademlia: false,
-            max_established_incoming: 128,
-            max_established_outgoing: 64,
-            max_established_total: 192,
+            // Scale connection limits with network size so that every validator
+            // can maintain direct connections to all peers when needed.
+            max_established_incoming: 128u32.max(max_peers as u32 + 16),
+            max_established_outgoing: 64u32.max(max_peers as u32 + 16),
+            max_established_total: 192u32.max((max_peers as u32 + 16) * 2),
         }
     }
 }
@@ -172,6 +177,15 @@ pub fn build_swarm_with_validator_index(
                 libp2p::request_response::Config::default(),
             );
 
+            let consensus_direct = libp2p::request_response::Behaviour::new(
+                [(
+                    libp2p::StreamProtocol::new(crate::consensus_direct::CONSENSUS_DIRECT_PROTOCOL),
+                    libp2p::request_response::ProtocolSupport::Full,
+                )],
+                libp2p::request_response::Config::default()
+                    .with_request_timeout(Duration::from_secs(5)),
+            );
+
             let mdns = if config.enable_mdns {
                 let mdns_config = libp2p::mdns::Config {
                     ttl: Duration::from_secs(300),
@@ -215,6 +229,7 @@ pub fn build_swarm_with_validator_index(
                 gossipsub,
                 identify,
                 state_sync,
+                consensus_direct,
                 mdns,
                 kademlia,
                 connection_limits: libp2p::connection_limits::Behaviour::new(limits),
@@ -231,6 +246,11 @@ pub fn build_swarm_with_validator_index(
 /// Builds per-topic peer scoring parameters.
 fn build_peer_score_params() -> PeerScoreParams {
     let mut params = PeerScoreParams::default();
+    // Disable IP co-location penalty: in testnet all validators run on the
+    // same machine (127.0.0.1), causing gossipsub to penalize every peer for
+    // sharing an IP.  In production, validators are on distinct IPs so this
+    // has no effect.  Setting the weight to 0 disables the penalty entirely.
+    params.ip_colocation_factor_weight = 0.0;
 
     params.topics.insert(
         consensus_topic().hash(),
@@ -357,15 +377,16 @@ mod tests {
 
     #[test]
     fn test_connection_limits_from_network_size() {
+        // Small network: uses default minimums.
         let small = TransportConfig::for_network_size(3);
-        let large = TransportConfig::for_network_size(500);
-        let default = TransportConfig::default();
+        assert_eq!(small.max_established_incoming, 128); // max(128, 2+16) = 128
+        assert_eq!(small.max_established_outgoing, 64);  // max(64, 2+16) = 64
+        assert_eq!(small.max_established_total, 192);    // max(192, (2+16)*2) = 192
 
-        assert_eq!(small.max_established_incoming, default.max_established_incoming);
-        assert_eq!(small.max_established_outgoing, default.max_established_outgoing);
-        assert_eq!(small.max_established_total, default.max_established_total);
-        assert_eq!(large.max_established_incoming, default.max_established_incoming);
-        assert_eq!(large.max_established_outgoing, default.max_established_outgoing);
-        assert_eq!(large.max_established_total, default.max_established_total);
+        // Large network: scales up beyond defaults.
+        let large = TransportConfig::for_network_size(500);
+        assert_eq!(large.max_established_incoming, 499 + 16);  // max(128, 499+16) = 515
+        assert_eq!(large.max_established_outgoing, 499 + 16);  // max(64, 499+16) = 515
+        assert_eq!(large.max_established_total, (499 + 16) * 2); // max(192, 515*2) = 1030
     }
 }

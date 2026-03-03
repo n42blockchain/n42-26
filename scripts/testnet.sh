@@ -197,12 +197,14 @@ compute_timeouts() {
         *)
             # Generic scaling for large clusters
             # STARTUP_DELAY must exceed total node launch time (N * interval)
-            # plus ~60s for gossipsub mesh formation
-            BASE_TIMEOUT_MS=$((30000 + (NUM_VALIDATORS - 21) * 500))
-            MAX_TIMEOUT_MS=$((BASE_TIMEOUT_MS * 3))
+            # plus ~60s for gossipsub mesh formation.
+            # CRITICAL: BASE_TIMEOUT must be >= STARTUP_DELAY so that non-leader
+            # nodes do not timeout before the leader's first proposal arrives.
             STARTUP_DELAY_MS=$(( (NUM_VALIDATORS * 1000) + 60000 ))
+            BASE_TIMEOUT_MS=$(( STARTUP_DELAY_MS + 30000 ))
+            MAX_TIMEOUT_MS=$((BASE_TIMEOUT_MS * 3))
             NODE_START_INTERVAL=1
-            MAX_BLOCK_WAIT=$(( (NUM_VALIDATORS * 2) + 180 ))
+            MAX_BLOCK_WAIT=$(( (NUM_VALIDATORS * 3) + 180 ))
             ;;
     esac
 }

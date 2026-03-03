@@ -93,8 +93,13 @@ impl ConsensusOrchestrator {
                         warn!(target_validator = target, error = %e, "direct send failed, falling back to broadcast");
                         let _ = self.network.broadcast_consensus(msg);
                     }
-                } else if let Err(e) = self.network.broadcast_consensus(msg) {
-                    error!(error = %e, "failed to send message to validator (broadcast fallback)");
+                } else {
+                    // Peer not yet identified — broadcast as fallback; this is normal
+                    // during startup or when the Identify exchange hasn't completed.
+                    debug!(target_validator = target, "validator peer unknown, broadcasting");
+                    if let Err(e) = self.network.broadcast_consensus(msg) {
+                        error!(error = %e, "failed to send message to validator (broadcast fallback)");
+                    }
                 }
             }
             EngineOutput::ExecuteBlock(block_hash) => {

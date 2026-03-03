@@ -1,3 +1,4 @@
+pub mod consensus_direct;
 pub mod dissemination;
 pub mod error;
 pub mod gossipsub;
@@ -13,6 +14,7 @@ pub use mobile::{
     StarHubHandle, MSG_TYPE_CACHE_SYNC_ZSTD,
 };
 pub use service::{NetworkCommand, NetworkEvent, NetworkHandle, NetworkService};
+pub use consensus_direct::{ConsensusDirectCodec, ConsensusDirectRequest, ConsensusDirectResponse};
 pub use state_sync::{BlockSyncRequest, BlockSyncResponse, SyncBlock};
 pub use transport::{
     build_swarm, build_swarm_with_validator_index, N42Behaviour, TransportConfig,

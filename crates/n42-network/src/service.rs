@@ -9,6 +9,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::interval;
 
+use crate::consensus_direct::{ConsensusDirectRequest, ConsensusDirectResponse};
 use crate::error::NetworkError;
 use crate::gossipsub::handlers::{decode_consensus_message, encode_consensus_message, validate_message};
 use crate::gossipsub::topics::{
@@ -295,6 +296,9 @@ impl NetworkService {
             SwarmEvent::Behaviour(N42BehaviourEvent::StateSync(event)) => {
                 self.handle_state_sync_event(event);
             }
+            SwarmEvent::Behaviour(N42BehaviourEvent::ConsensusDirect(event)) => {
+                self.handle_consensus_direct_event(event);
+            }
             SwarmEvent::Behaviour(N42BehaviourEvent::Identify(
                 libp2p::identify::Event::Received { peer_id, info, .. },
             )) => {
@@ -440,6 +444,47 @@ impl NetworkService {
         }
     }
 
+    fn handle_consensus_direct_event(
+        &mut self,
+        event: libp2p::request_response::Event<ConsensusDirectRequest, ConsensusDirectResponse>,
+    ) {
+        match event {
+            libp2p::request_response::Event::Message { peer, message, .. } => match message {
+                libp2p::request_response::Message::Request { request, channel, .. } => {
+                    metrics::counter!("n42_direct_messages_received").increment(1);
+                    match decode_consensus_message(&request.message_bytes) {
+                        Ok(msg) => {
+                            let _ = self.event_tx.send(NetworkEvent::ConsensusMessage {
+                                source: peer,
+                                message: msg,
+                            });
+                            let _ = self.swarm.behaviour_mut().consensus_direct.send_response(
+                                channel,
+                                ConsensusDirectResponse { accepted: true },
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(%peer, error = %e, "invalid consensus direct message");
+                            let _ = self.swarm.behaviour_mut().consensus_direct.send_response(
+                                channel,
+                                ConsensusDirectResponse { accepted: false },
+                            );
+                        }
+                    }
+                }
+                libp2p::request_response::Message::Response { .. } => {
+                    // ACK received — fire-and-forget semantics, no action needed.
+                }
+            },
+            libp2p::request_response::Event::OutboundFailure { peer, error, .. } => {
+                tracing::debug!(%peer, ?error, "consensus direct send failed");
+                metrics::counter!("n42_direct_send_failures").increment(1);
+            }
+            libp2p::request_response::Event::InboundFailure { .. } => {}
+            libp2p::request_response::Event::ResponseSent { .. } => {}
+        }
+    }
+
     fn handle_mdns_event(&mut self, event: libp2p::mdns::Event) {
         match event {
             libp2p::mdns::Event::Discovered(peers) => {
@@ -526,8 +571,18 @@ impl NetworkService {
             }
             NetworkCommand::SendDirect { peer, message } => {
                 metrics::counter!("n42_direct_messages_sent").increment(1);
-                tracing::debug!(%peer, "sending direct message via GossipSub");
-                self.publish_consensus(&message, "direct message");
+                // Use request-response for true point-to-point delivery instead of gossipsub.
+                match encode_consensus_message(&message) {
+                    Ok(bytes) => {
+                        let req = ConsensusDirectRequest { message_bytes: bytes };
+                        self.swarm.behaviour_mut().consensus_direct.send_request(&peer, req);
+                        tracing::debug!(%peer, "sending direct message via request-response");
+                    }
+                    Err(e) => {
+                        tracing::warn!(%peer, error = %e, "failed to encode direct message, falling back to broadcast");
+                        self.publish_consensus(&message, "direct fallback");
+                    }
+                }
             }
             NetworkCommand::AnnounceBlock(data) => {
                 self.gossipsub_publish(block_announce_topic(), data, "block announcement");
