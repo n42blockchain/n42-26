@@ -82,6 +82,7 @@ pub struct NodeProcess {
     pub p2p_port: u16,
     pub consensus_port: u16,
     pub starhub_port: u16,
+    pub validator_index: usize,
     /// Wrapped in Option so it can be extracted for restart tests via `stop_keep_data`.
     data_dir: Option<TempDir>,
     pub rpc: RpcClient,
@@ -176,13 +177,14 @@ impl NodeProcess {
 
         let rpc = RpcClient::new(format!("http://127.0.0.1:{http_port}"));
 
-        let node = NodeProcess {
+        let mut node = NodeProcess {
             child,
             http_port,
             ws_port,
             p2p_port,
             consensus_port,
             starhub_port,
+            validator_index: config.validator_index,
             data_dir: Some(data_dir),
             rpc,
         };
@@ -193,16 +195,38 @@ impl NodeProcess {
         Ok(node)
     }
 
-    async fn wait_for_rpc_ready(&self, timeout: Duration) -> eyre::Result<()> {
+    async fn wait_for_rpc_ready(&mut self, timeout: Duration) -> eyre::Result<()> {
         let start = tokio::time::Instant::now();
         let poll_interval = Duration::from_millis(500);
 
         loop {
             if start.elapsed() > timeout {
+                let stderr_tail = Self::read_stderr_tail(self.validator_index);
                 return Err(eyre::eyre!(
-                    "node did not become ready within {} seconds",
-                    timeout.as_secs()
+                    "node did not become ready within {} seconds\n\
+                     --- last 20 lines of /tmp/n42-node-{}.err.log ---\n{}",
+                    timeout.as_secs(),
+                    self.validator_index,
+                    stderr_tail,
                 ));
+            }
+
+            // Detect early crash: if the process has already exited, report immediately
+            // instead of waiting the full timeout.
+            match self.child.try_wait() {
+                Ok(Some(status)) => {
+                    let stderr_tail = Self::read_stderr_tail(self.validator_index);
+                    return Err(eyre::eyre!(
+                        "node process exited before becoming ready (status: {status})\n\
+                         --- last 20 lines of /tmp/n42-node-{}.err.log ---\n{}",
+                        self.validator_index,
+                        stderr_tail,
+                    ));
+                }
+                Ok(None) => {} // still running
+                Err(e) => {
+                    return Err(eyre::eyre!("failed to check node process status: {e}"));
+                }
             }
 
             match self.rpc.block_number().await {
@@ -215,6 +239,19 @@ impl NodeProcess {
                     tokio::time::sleep(poll_interval).await;
                 }
             }
+        }
+    }
+
+    /// Reads the last 20 lines of the node's stderr log file for diagnostics.
+    fn read_stderr_tail(validator_index: usize) -> String {
+        let path = format!("/tmp/n42-node-{validator_index}.err.log");
+        match std::fs::read_to_string(&path) {
+            Ok(content) => {
+                let lines: Vec<&str> = content.lines().collect();
+                let start = lines.len().saturating_sub(20);
+                lines[start..].join("\n")
+            }
+            Err(_) => "(stderr log not found)".to_string(),
         }
     }
 
