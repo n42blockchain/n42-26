@@ -54,6 +54,12 @@ impl MobileVerificationBridge {
         default_threshold: u32,
         max_tracked_blocks: usize,
     ) -> Self {
+        let default_threshold = if default_threshold == 0 {
+            warn!(target: "n42::mobile", "default_threshold is 0, clamping to 1");
+            1
+        } else {
+            default_threshold
+        };
         Self {
             hub_event_rx,
             receipt_aggregator: ReceiptAggregator::new(default_threshold, max_tracked_blocks),

@@ -54,6 +54,7 @@ fn derive_ed25519_keypair(index: u32) -> libp2p::identity::Keypair {
 
 fn main() {
     if std::env::var_os("RUST_BACKTRACE").is_none() {
+        // SAFETY: Called from main() before any threads are spawned.
         unsafe { std::env::set_var("RUST_BACKTRACE", "1") };
     }
 
@@ -76,7 +77,10 @@ fn main() {
             Ok(path) => {
                 info!(target: "n42::cli", path, "loading consensus config from file");
                 ConsensusConfig::from_file(std::path::Path::new(&path))
-                    .unwrap_or_else(|e| panic!("Failed to load consensus config: {e}"))
+                    .unwrap_or_else(|e| {
+                        eprintln!("ERROR: Failed to load consensus config from {path}: {e}");
+                        std::process::exit(1);
+                    })
             }
             Err(_) => {
                 let num_validators = env_parse("N42_VALIDATOR_COUNT").unwrap_or(1);
@@ -93,21 +97,62 @@ fn main() {
         override_timeout_from_env("N42_BASE_TIMEOUT_MS", &mut consensus_config.base_timeout_ms);
         override_timeout_from_env("N42_MAX_TIMEOUT_MS", &mut consensus_config.max_timeout_ms);
 
+        if consensus_config.base_timeout_ms == 0 {
+            eprintln!("ERROR: N42_BASE_TIMEOUT_MS must be > 0");
+            std::process::exit(1);
+        }
+        if consensus_config.max_timeout_ms == 0 {
+            eprintln!("ERROR: N42_MAX_TIMEOUT_MS must be > 0");
+            std::process::exit(1);
+        }
+        if consensus_config.base_timeout_ms > consensus_config.max_timeout_ms {
+            eprintln!(
+                "ERROR: N42_BASE_TIMEOUT_MS ({}) must be <= N42_MAX_TIMEOUT_MS ({})",
+                consensus_config.base_timeout_ms, consensus_config.max_timeout_ms
+            );
+            std::process::exit(1);
+        }
+
+        if let Err(e) = consensus_config.validate() {
+            eprintln!("ERROR: consensus config validation failed: {e}");
+            std::process::exit(1);
+        }
+
         // Priority: N42_KEYSTORE_PATH (encrypted) > N42_VALIDATOR_KEY (plaintext) > random (dev).
         let secret_key = if let Ok(ks_path) = std::env::var("N42_KEYSTORE_PATH") {
-            let password = std::env::var("N42_KEYSTORE_PASSWORD")
-                .expect("N42_KEYSTORE_PASSWORD required when using N42_KEYSTORE_PATH");
+            let password = std::env::var("N42_KEYSTORE_PASSWORD").unwrap_or_else(|_| {
+                eprintln!("ERROR: N42_KEYSTORE_PASSWORD required when using N42_KEYSTORE_PATH");
+                std::process::exit(1);
+            });
             info!(target: "n42::cli", path = ks_path, "loading validator key from encrypted keystore");
             let ks = keystore::Keystore::load(std::path::Path::new(&ks_path))
-                .unwrap_or_else(|e| panic!("Failed to load keystore: {e}"));
+                .unwrap_or_else(|e| {
+                    eprintln!("ERROR: Failed to load keystore from {ks_path}: {e}");
+                    std::process::exit(1);
+                });
             let key_bytes = ks.decrypt(&password)
-                .unwrap_or_else(|e| panic!("Failed to decrypt keystore: {e}"));
-            BlsSecretKey::from_bytes(&key_bytes).expect("Invalid BLS secret key in keystore")
+                .unwrap_or_else(|e| {
+                    eprintln!("ERROR: Failed to decrypt keystore: {e}");
+                    std::process::exit(1);
+                });
+            BlsSecretKey::from_bytes(&key_bytes).unwrap_or_else(|e| {
+                eprintln!("ERROR: Invalid BLS secret key in keystore: {e}");
+                std::process::exit(1);
+            })
         } else if let Ok(hex_key) = std::env::var("N42_VALIDATOR_KEY") {
             warn!(target: "n42::cli", "using plaintext N42_VALIDATOR_KEY — use N42_KEYSTORE_PATH for production");
-            let bytes = hex::decode(&hex_key).expect("N42_VALIDATOR_KEY must be valid hex");
-            let key_bytes: [u8; 32] = bytes.try_into().expect("N42_VALIDATOR_KEY must be exactly 32 bytes");
-            BlsSecretKey::from_bytes(&key_bytes).expect("Invalid BLS secret key")
+            let bytes = hex::decode(&hex_key).unwrap_or_else(|e| {
+                eprintln!("ERROR: N42_VALIDATOR_KEY must be valid hex: {e}");
+                std::process::exit(1);
+            });
+            let key_bytes: [u8; 32] = bytes.try_into().unwrap_or_else(|v: Vec<u8>| {
+                eprintln!("ERROR: N42_VALIDATOR_KEY must be exactly 32 bytes, got {}", v.len());
+                std::process::exit(1);
+            });
+            BlsSecretKey::from_bytes(&key_bytes).unwrap_or_else(|e| {
+                eprintln!("ERROR: Invalid BLS secret key from N42_VALIDATOR_KEY: {e}");
+                std::process::exit(1);
+            })
         } else {
             warn!(target: "n42::cli", "No validator key configured, generating random key (dev mode)");
             BlsSecretKey::random().expect("Failed to generate random BLS key")
@@ -341,6 +386,19 @@ fn main() {
                 let daily_base_reward_gwei = env_parse("N42_DAILY_BASE_REWARD_GWEI").unwrap_or(100_000_000); // 0.1 N42
                 let reward_curve_k: f64 = env_parse("N42_REWARD_CURVE_K").unwrap_or(4.0);
                 let max_rewards_per_block = env_parse("N42_MAX_REWARDS_PER_BLOCK").unwrap_or(32);
+
+                if reward_epoch_blocks == 0 {
+                    eprintln!("ERROR: N42_REWARD_EPOCH_BLOCKS must be > 0");
+                    std::process::exit(1);
+                }
+                if reward_curve_k <= 0.0 || !reward_curve_k.is_finite() {
+                    eprintln!("ERROR: N42_REWARD_CURVE_K must be a positive finite number, got {reward_curve_k}");
+                    std::process::exit(1);
+                }
+                if max_rewards_per_block == 0 {
+                    eprintln!("ERROR: N42_MAX_REWARDS_PER_BLOCK must be > 0");
+                    std::process::exit(1);
+                }
 
                 let reward_manager = Arc::new(Mutex::new(MobileRewardManager::new(
                     reward_epoch_blocks,

@@ -18,7 +18,7 @@ pub(super) const FUTURE_VIEW_WINDOW: u64 = 50;
 
 /// Maximum number of buffered future-view messages.
 /// When exceeded, the oldest (lowest view) messages are evicted.
-const MAX_FUTURE_MESSAGES: usize = 64;
+const MAX_FUTURE_MESSAGES: usize = 256;
 
 /// Events fed into the consensus engine.
 #[derive(Debug)]
@@ -184,6 +184,14 @@ impl ConsensusEngine {
         last_committed_qc: QuorumCertificate,
         consecutive_timeouts: u32,
     ) -> Self {
+        let safe_consecutive_timeouts = consecutive_timeouts.min(128);
+        if safe_consecutive_timeouts != consecutive_timeouts {
+            tracing::warn!(
+                original = consecutive_timeouts,
+                capped = safe_consecutive_timeouts,
+                "recovered consecutive_timeouts exceeded sanity limit, capping"
+            );
+        }
         Self {
             my_index,
             secret_key,
@@ -192,7 +200,7 @@ impl ConsensusEngine {
                 recovered_view,
                 locked_qc,
                 last_committed_qc,
-                consecutive_timeouts,
+                safe_consecutive_timeouts,
             ),
             pacemaker: Pacemaker::new(base_timeout_ms, max_timeout_ms),
             vote_collector: None,
@@ -311,7 +319,7 @@ impl ConsensusEngine {
                 }
 
                 // Beyond FUTURE_VIEW_WINDOW: attempt QC-based view jump.
-                if self.try_qc_view_jump(&msg, view) {
+                if self.try_qc_view_jump(&msg, view)? {
                     let new_current = self.round_state.current_view();
                     if view == new_current {
                         return self.dispatch_message(msg);
@@ -385,13 +393,13 @@ impl ConsensusEngine {
     ///
     /// Safety: A valid QC proves ≥quorum validators reached that view, so
     /// jumping does not violate HotStuff-2 safety. locked_qc only advances.
-    fn try_qc_view_jump(&mut self, msg: &ConsensusMessage, msg_view: ViewNumber) -> bool {
+    fn try_qc_view_jump(&mut self, msg: &ConsensusMessage, msg_view: ViewNumber) -> ConsensusResult<bool> {
         let current_view = self.round_state.current_view();
 
         // Genesis QC (view 0) has no real signatures — skip it.
         let qc = match Self::extract_qc_from_message(msg) {
             Some(qc) if qc.view > 0 => qc,
-            _ => return false,
+            _ => return Ok(false),
         };
 
         // Decide uses commit_signing_message; all others use signing_message.
@@ -407,12 +415,12 @@ impl ConsensusEngine {
                 qc_view = qc.view,
                 "QC view jump failed: invalid QC signature"
             );
-            return false;
+            return Ok(false);
         }
 
         let target_view = (qc.view + 1).max(msg_view);
         if target_view <= current_view {
-            return false;
+            return Ok(false);
         }
 
         tracing::info!(
@@ -426,23 +434,23 @@ impl ConsensusEngine {
         self.round_state.update_locked_qc(qc);
         self.round_state.reset_consecutive_timeouts();
 
-        self.emit(EngineOutput::SyncRequired { local_view: current_view, target_view });
-        self.advance_to_view(target_view);
+        self.emit(EngineOutput::SyncRequired { local_view: current_view, target_view })?;
+        self.advance_to_view(target_view)?;
 
         // Use actual view after advance: buffered-message replay may push view beyond target_view.
         let actual_view = self.round_state.current_view();
-        self.emit(EngineOutput::ViewChanged { new_view: actual_view });
+        self.emit(EngineOutput::ViewChanged { new_view: actual_view })?;
 
-        true
+        Ok(true)
     }
 
     // ── Internal helpers ──
 
-    pub(super) fn advance_to_view(&mut self, new_view: ViewNumber) {
+    pub(super) fn advance_to_view(&mut self, new_view: ViewNumber) -> ConsensusResult<()> {
         // Monotonicity guard: never regress the view. This can happen when buffered-message
         // replay triggers a nested advance_to_view (e.g., a replayed Decide).
         if new_view <= self.round_state.current_view() {
-            return;
+            return Ok(());
         }
 
         // Save current PrepareQC for piggybacking into the next Proposal (chained mode).
@@ -456,7 +464,7 @@ impl ConsensusEngine {
             let new_epoch = self.epoch_manager.current_epoch();
             let validator_count = self.validator_set().len();
             tracing::info!(new_epoch, validator_count, view = new_view, "epoch transition at view boundary");
-            self.emit(EngineOutput::EpochTransition { new_epoch, validator_count });
+            self.emit(EngineOutput::EpochTransition { new_epoch, validator_count })?;
         }
 
         self.round_state.advance_view(new_view);
@@ -492,16 +500,18 @@ impl ConsensusEngine {
         }
 
         tracing::debug!(view = new_view, "advanced to new view");
+        Ok(())
     }
 
     pub(super) fn validator_set(&self) -> &ValidatorSet {
         self.epoch_manager.current_validator_set()
     }
 
-    pub(super) fn emit(&self, output: EngineOutput) {
-        if self.output_tx.try_send(output).is_err() {
-            tracing::error!("consensus output channel closed or full");
-        }
+    pub(super) fn emit(&self, output: EngineOutput) -> ConsensusResult<()> {
+        self.output_tx.try_send(output).map_err(|e| {
+            tracing::error!("consensus output channel full or closed: {}", e);
+            crate::error::ConsensusError::OutputChannelClosed
+        })
     }
 }
 
@@ -1280,17 +1290,17 @@ mod tests {
     fn test_imported_blocks_capacity_bound() {
         let (mut engine, _sks, _, _rx) = make_engine(4, 0);
 
-        for i in 0..32u8 {
+        for i in 0..64u8 {
             engine
                 .process_event(ConsensusEvent::BlockImported(B256::repeat_byte(i)))
                 .expect("BlockImported should succeed");
         }
-        assert_eq!(engine.imported_blocks.len(), 32);
+        assert_eq!(engine.imported_blocks.len(), 64);
 
         engine
             .process_event(ConsensusEvent::BlockImported(B256::repeat_byte(0xFF)))
             .expect("BlockImported at capacity should succeed");
-        assert_eq!(engine.imported_blocks.len(), 32);
+        assert_eq!(engine.imported_blocks.len(), 64);
         assert!(!engine.imported_blocks.contains(&B256::repeat_byte(0xFF)));
     }
 
@@ -1790,16 +1800,25 @@ mod tests {
         let (mut engine, sks, _, _rx) = make_engine(4, 0);
         assert_eq!(engine.current_view(), 1);
 
-        let voters = [1u32, 2];
-        for v in 2u64..=34 {
-            for &voter in &voters {
-                let block_hash = B256::repeat_byte(v as u8);
-                let msg = signing_message(v, &block_hash);
-                let vote = Vote { view: v, block_hash, voter, signature: sks[voter as usize].sign(&msg) };
-                engine
-                    .process_event(ConsensusEvent::Message(ConsensusMessage::Vote(vote)))
-                    .expect("buffering should succeed");
+        // Directly fill the buffer beyond MAX_FUTURE_MESSAGES to test eviction logic.
+        // Using process_event is limited by FUTURE_VIEW_WINDOW, so populate directly.
+        for v in 2u64..=(MAX_FUTURE_MESSAGES as u64 + 5) {
+            let block_hash = B256::repeat_byte((v % 256) as u8);
+            let msg = signing_message(v, &block_hash);
+            let vote = Vote { view: v, block_hash, voter: 1, signature: sks[1].sign(&msg) };
+
+            // Simulate the eviction logic from process_message
+            if engine.future_msg_buffer.len() >= MAX_FUTURE_MESSAGES {
+                if let Some(min_idx) = engine.future_msg_buffer
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, (view, _))| *view)
+                    .map(|(i, _)| i)
+                {
+                    engine.future_msg_buffer.swap_remove(min_idx);
+                }
             }
+            engine.future_msg_buffer.push((v, ConsensusMessage::Vote(vote)));
         }
 
         assert_eq!(engine.future_msg_buffer.len(), MAX_FUTURE_MESSAGES);

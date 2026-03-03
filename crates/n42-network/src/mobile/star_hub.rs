@@ -22,7 +22,7 @@ const MAX_RECEIPT_SIZE: u64 = 64 * 1024;
 /// Timeout for reading a single receipt stream.
 const RECEIPT_READ_TIMEOUT: Duration = Duration::from_secs(10);
 /// Minimum interval between receipts from the same phone (rate limit).
-const MIN_RECEIPT_INTERVAL: Duration = Duration::from_secs(2);
+const MIN_RECEIPT_INTERVAL: Duration = Duration::from_millis(500);
 /// Timeout for sending a broadcast message to a single phone.
 const BROADCAST_SEND_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -414,15 +414,24 @@ async fn handle_phone_connection(
         guard.insert(session_id, session.clone());
     }
     session_senders.write().await.insert(session_id, (session_tx, session.clone()));
-    if event_tx.try_send(HubEvent::PhoneConnected { session_id, verifier_pubkey }).is_err() {
-        // Channel full: the bridge won't see this connection, so its threshold
-        // and authorized-verifier state will be stale.  Warn loudly.
-        tracing::warn!(session_id, "event channel full, PhoneConnected event dropped");
-        metrics::counter!("n42_hub_event_drops_total").increment(1);
+    let pk = verifier_pubkey;
+    for attempt in 0..3 {
+        match event_tx.try_send(HubEvent::PhoneConnected { session_id, verifier_pubkey: pk }) {
+            Ok(()) => break,
+            Err(_) if attempt < 2 => {
+                tracing::warn!(session_id, attempt, "event channel full, retrying");
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            Err(_) => {
+                tracing::error!(session_id, "event channel full after retries, PhoneConnected event dropped");
+                metrics::counter!("n42_hub_event_drops_total").increment(1);
+            }
+        }
     }
     tracing::debug!(session_id, "handshake complete, session active");
 
     let mut last_receipt_at: Option<Instant> = None;
+    let mut rate_violations: u32 = 0;
 
     loop {
         tokio::select! {
@@ -439,7 +448,12 @@ async fn handle_phone_connection(
                                 let now = Instant::now();
                                 if let Some(last) = last_receipt_at {
                                     if now.duration_since(last) < MIN_RECEIPT_INTERVAL {
-                                        tracing::warn!(session_id, "receipt rate limited");
+                                        rate_violations += 1;
+                                        tracing::warn!(session_id, rate_violations, "receipt rate limited");
+                                        if rate_violations >= 5 {
+                                            tracing::warn!(session_id, "rate limit exceeded 5 times, disconnecting");
+                                            break;
+                                        }
                                         continue;
                                     }
                                 }
@@ -462,6 +476,7 @@ async fn handle_phone_connection(
                                             continue;
                                         }
                                         last_receipt_at = Some(now);
+                                        rate_violations = 0; // reset consecutive violation count on success
                                         metrics::counter!("n42_mobile_receipts_received").increment(1);
                                         session.record_receipt();
                                         let now_ms = std::time::SystemTime::now()
@@ -534,11 +549,18 @@ async fn handle_phone_connection(
 
     sessions.write().await.remove(&session_id);
     session_senders.write().await.remove(&session_id);
-    if event_tx.try_send(HubEvent::PhoneDisconnected { session_id }).is_err() {
-        // Dropping PhoneDisconnected means the bridge won't decrement its
-        // connected count, causing the attestation threshold to remain too high.
-        tracing::warn!(session_id, "event channel full, PhoneDisconnected event dropped");
-        metrics::counter!("n42_hub_event_drops_total").increment(1);
+    for attempt in 0..3 {
+        match event_tx.try_send(HubEvent::PhoneDisconnected { session_id }) {
+            Ok(()) => break,
+            Err(_) if attempt < 2 => {
+                tracing::warn!(session_id, attempt, "event channel full, retrying");
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            Err(_) => {
+                tracing::error!(session_id, "event channel full after retries, PhoneDisconnected event dropped");
+                metrics::counter!("n42_hub_event_drops_total").increment(1);
+            }
+        }
     }
     tracing::debug!(session_id, "phone disconnected");
 }

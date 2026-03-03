@@ -93,10 +93,10 @@ fn enqueue_packet(
     let mut queue = lock_or_recover(pending_packets);
     if queue.len() >= MAX_PENDING_PACKETS {
         dropped_count.fetch_add(1, Ordering::Relaxed);
-        warn!(
+        tracing::error!(
             queue_len = queue.len(),
-            dropped = dropped_count.load(Ordering::Relaxed),
-            "packet queue full, dropping oldest packet"
+            total_dropped = dropped_count.load(Ordering::Relaxed),
+            "packet queue full, dropping oldest packet — mobile verification falling behind"
         );
         queue.pop_front();
     }
@@ -186,8 +186,8 @@ pub(crate) async fn recv_loop(
                             _ => warn!(msg_type, "unknown message type from StarHub"),
                         }
                     }
-                    Ok(_) => {} // empty stream, skip
-                    Err(e) => debug!("stream read error: {}", e),
+                    Ok(_) => debug!("received empty stream, skipping"),
+                    Err(e) => warn!("stream read error: {}", e),
                 }
             }
             Err(e) => {

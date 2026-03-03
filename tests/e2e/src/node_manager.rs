@@ -91,15 +91,21 @@ impl NodeProcess {
     /// Starts an N42 node with the given configuration (new temp data directory).
     pub async fn start(config: &NodeConfig) -> eyre::Result<Self> {
         let data_dir = TempDir::new()?;
-        Self::start_inner(config, data_dir).await
+        Self::start_inner(config, data_dir, &[]).await
+    }
+
+    /// Starts an N42 node with extra environment variables.
+    pub async fn start_with_env(config: &NodeConfig, extra_env: Vec<(&str, &str)>) -> eyre::Result<Self> {
+        let data_dir = TempDir::new()?;
+        Self::start_inner(config, data_dir, &extra_env).await
     }
 
     /// Starts an N42 node reusing an existing data directory (for restart tests).
     pub async fn start_with_datadir(config: &NodeConfig, data_dir: TempDir) -> eyre::Result<Self> {
-        Self::start_inner(config, data_dir).await
+        Self::start_inner(config, data_dir, &[]).await
     }
 
-    async fn start_inner(config: &NodeConfig, data_dir: TempDir) -> eyre::Result<Self> {
+    async fn start_inner(config: &NodeConfig, data_dir: TempDir, extra_env: &[(&str, &str)]) -> eyre::Result<Self> {
         // Generate the deterministic validator key for this index.
         let key_bytes = n42_chainspec::ConsensusConfig::deterministic_key_bytes(config.validator_index);
         let key_hex = hex::encode(key_bytes);
@@ -147,6 +153,10 @@ impl NodeProcess {
 
         if !config.trusted_peers.is_empty() {
             cmd.env("N42_TRUSTED_PEERS", config.trusted_peers.join(","));
+        }
+
+        for (key, value) in extra_env {
+            cmd.env(key, value);
         }
 
         let stdout_log = std::fs::File::create(format!("/tmp/n42-node-{}.log", config.validator_index))

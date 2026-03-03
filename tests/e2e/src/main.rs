@@ -25,7 +25,7 @@ fn parse_scenario_filter(filter: &str) -> Vec<u32> {
 #[derive(Parser)]
 #[command(name = "e2e-test", about = "N42 End-to-End Test Suite")]
 struct Cli {
-    /// Run a specific scenario (1-10), or omit to run all.
+    /// Run a specific scenario (1-13), or omit to run all.
     #[arg(long)]
     scenario: Option<u32>,
 
@@ -67,7 +67,7 @@ async fn main() -> eyre::Result<()> {
     let scenarios: Vec<u32> = if let Some(s) = cli.scenario {
         vec![s]
     } else if cli.all {
-        vec![1, 2, 3, 4, 5, 6]
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
     } else if let Ok(filter) = std::env::var("E2E_SCENARIO_FILTER") {
         parse_scenario_filter(&filter)
     } else {
@@ -93,6 +93,8 @@ async fn main() -> eyre::Result<()> {
             9 => scenarios::scenario9_long_run::run(binary_path.clone()).await,
             10 => scenarios::scenario10_chaos::run(binary_path.clone()).await,
             11 => scenarios::scenario11_quic_10k::run(binary_path.clone()).await,
+            12 => scenarios::scenario12_blockscout_rpc::run(binary_path.clone()).await,
+            13 => scenarios::scenario13_rewards::run(binary_path.clone()).await,
             _ => {
                 info!(scenario, "unknown scenario, skipping");
                 continue;

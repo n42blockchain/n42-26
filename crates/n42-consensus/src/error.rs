@@ -79,6 +79,10 @@ pub enum ConsensusError {
     /// Internal BLS cryptographic error.
     #[error("BLS error: {0}")]
     Bls(#[from] n42_primitives::bls::BlsError),
+
+    /// The consensus output channel is full or closed.
+    #[error("consensus output channel full or closed")]
+    OutputChannelClosed,
 }
 
 /// Result type for consensus operations.

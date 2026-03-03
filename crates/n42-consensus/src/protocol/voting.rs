@@ -36,7 +36,7 @@ impl ConsensusEngine {
                     validator: vote.voter,
                     hash1: prev_hash,
                     hash2: vote.block_hash,
-                });
+                })?;
                 return Ok(());
             }
         } else {
@@ -114,7 +114,7 @@ impl ConsensusEngine {
 
         let block_hash = qc.block_hash;
         let prepare_qc_msg = PrepareQC { view, block_hash, qc };
-        self.emit(EngineOutput::BroadcastMessage(ConsensusMessage::PrepareQC(prepare_qc_msg)));
+        self.emit(EngineOutput::BroadcastMessage(ConsensusMessage::PrepareQC(prepare_qc_msg)))?;
 
         // Leader self-vote for CommitVote (Round 2).
         let commit_msg = commit_signing_message(view, &block_hash);
@@ -210,12 +210,10 @@ impl ConsensusEngine {
             block_hash,
             commit_qc: commit_qc.clone(),
         };
-        self.emit(EngineOutput::BroadcastMessage(ConsensusMessage::Decide(decide)));
-        self.emit(EngineOutput::BlockCommitted { view, block_hash, commit_qc });
+        self.emit(EngineOutput::BroadcastMessage(ConsensusMessage::Decide(decide)))?;
+        self.emit(EngineOutput::BlockCommitted { view, block_hash, commit_qc })?;
 
         let next_view = view.saturating_add(1);
-        self.advance_to_view(next_view);
-
-        Ok(())
+        self.advance_to_view(next_view)
     }
 }

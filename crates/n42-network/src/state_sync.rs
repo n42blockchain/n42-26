@@ -153,7 +153,10 @@ where
             format!("serialized message too large: {} > {MAX_SYNC_MSG_SIZE}", data.len()),
         ));
     }
-    io.write_all(&(data.len() as u32).to_be_bytes()).await?;
+    let len_u32 = u32::try_from(data.len()).map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidData, format!("serialized message length {} overflows u32", data.len()))
+    })?;
+    io.write_all(&len_u32.to_be_bytes()).await?;
     io.write_all(&data).await?;
     io.flush().await
 }

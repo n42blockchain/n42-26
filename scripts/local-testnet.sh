@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 #
+# DEPRECATED: Consider using scripts/testnet.sh --nodes N --debug instead.
+# This script uses debug builds and /tmp data directory.
+# The unified testnet.sh provides more features (genesis, Blockscout, TX gen).
+#
 # Launch a local N42 testnet with multiple validator nodes.
 #
 # Usage:
@@ -7,6 +11,9 @@
 #
 # Defaults to 3 validators. Each node gets unique ports and data directory.
 # Press Ctrl+C to stop all nodes.
+
+echo -e "\033[1;33m[DEPRECATED] local-testnet.sh is deprecated. Consider: scripts/testnet.sh --nodes N --debug\033[0m"
+echo ""
 
 set -euo pipefail
 

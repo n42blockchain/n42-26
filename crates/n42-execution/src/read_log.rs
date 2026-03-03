@@ -191,7 +191,7 @@ pub enum DecodeError {
 }
 
 /// Max entry count to prevent OOM from corrupted data (ample headroom for 30M gas blocks).
-const MAX_ENTRY_COUNT: u32 = 1_000_000;
+const MAX_ENTRY_COUNT: u32 = 500_000;
 
 #[inline]
 fn significant_bytes_u64(v: u64) -> usize {
@@ -302,6 +302,9 @@ pub fn decode_read_log(data: &[u8]) -> Result<Vec<ReadLogEntry>, DecodeError> {
             } else {
                 ((header & ACCT_NONCE_LEN_MASK) >> ACCT_NONCE_LEN_SHIFT) as usize
             };
+            if nonce_len > 8 {
+                return Err(DecodeError::InvalidFieldLen { len: nonce_len, max: 8, offset: pos.saturating_sub(1) });
+            }
             let has_balance = header & ACCT_BALANCE_BIT != 0;
             let has_code_hash = header & ACCT_CODE_HASH_BIT != 0;
 

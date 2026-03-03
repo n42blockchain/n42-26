@@ -17,7 +17,7 @@ use tracing::{debug, error, info, warn};
 
 impl ConsensusOrchestrator {
     /// Triggers payload building via fork_choice_updated, then spawns a task to resolve it.
-    pub(super) async fn do_trigger_payload_build(&self, slot_timestamp: Option<u64>) {
+    pub(super) async fn do_trigger_payload_build(&mut self, slot_timestamp: Option<u64>) {
         let beacon_engine = match &self.beacon_engine {
             Some(e) => e,
             None => {
@@ -33,12 +33,27 @@ impl ConsensusOrchestrator {
             }
         };
 
-        let timestamp = slot_timestamp.unwrap_or_else(|| {
+        let mut timestamp = slot_timestamp.unwrap_or_else(|| {
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs()
         });
+
+        // Engine API requires: payload_attributes.timestamp > head_block.timestamp.
+        // Without this guard, fast block production (slot_time=0, or single-node f=0)
+        // can produce two blocks within the same wall-clock second, causing
+        // "Invalid payload attributes: invalid timestamp" errors.
+        if timestamp <= self.last_committed_timestamp {
+            let bumped = self.last_committed_timestamp + 1;
+            warn!(
+                proposed = timestamp,
+                last_committed = self.last_committed_timestamp,
+                bumped_to = bumped,
+                "timestamp <= last committed block, bumping to avoid Engine API rejection"
+            );
+            timestamp = bumped;
+        }
 
         let mut withdrawals = vec![];
         if let Some(ref reward_mgr) = self.mobile_reward_manager {
@@ -80,6 +95,9 @@ impl ConsensusOrchestrator {
             Ok(result) => {
                 debug!(status = ?result.payload_status.status, "fork_choice_updated response");
                 if let Some(payload_id) = result.payload_id {
+                    // Record the timestamp we used so subsequent builds guarantee
+                    // strictly increasing timestamps even in fast-commit scenarios.
+                    self.last_committed_timestamp = self.last_committed_timestamp.max(timestamp);
                     info!(?payload_id, "payload building started, spawning resolve task");
                     self.spawn_payload_resolve_task(
                         beacon_engine.clone(),
@@ -222,6 +240,16 @@ impl ConsensusOrchestrator {
                 return;
             }
         };
+
+        // Extract the block timestamp to keep last_committed_timestamp up to date
+        // for followers as well (prevents stale timestamp on leader switch).
+        if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&broadcast.payload_json) {
+            if let Some(ts_hex) = parsed.get("timestamp").and_then(|t| t.as_str()) {
+                if let Ok(ts) = u64::from_str_radix(ts_hex.trim_start_matches("0x"), 16) {
+                    self.last_committed_timestamp = self.last_committed_timestamp.max(ts);
+                }
+            }
+        }
 
         match engine_handle.new_payload(execution_data).await {
             Ok(status) => {

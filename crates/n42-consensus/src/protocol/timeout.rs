@@ -45,7 +45,7 @@ impl ConsensusEngine {
 
         self.emit(EngineOutput::BroadcastMessage(
             ConsensusMessage::Timeout(timeout_msg.clone()),
-        ));
+        ))?;
 
         self.process_timeout(timeout_msg)
     }
@@ -84,7 +84,7 @@ impl ConsensusEngine {
                 "advancing to higher timeout view for synchronization"
             );
 
-            self.advance_to_view(timeout.view);
+            self.advance_to_view(timeout.view)?;
             self.round_state.timeout();
 
             // Second reset: advance_to_view resets with consecutive_timeouts=0, but timeout()
@@ -115,7 +115,7 @@ impl ConsensusEngine {
                 sender: self.my_index,
                 signature: own_sig,
             };
-            self.emit(EngineOutput::BroadcastMessage(ConsensusMessage::Timeout(own_timeout.clone())));
+            self.emit(EngineOutput::BroadcastMessage(ConsensusMessage::Timeout(own_timeout.clone())))?;
 
             return self.process_timeout(own_timeout);
         }
@@ -203,12 +203,10 @@ impl ConsensusEngine {
 
         tracing::info!(old_view = view, new_view = nv.view, "received NewView, advancing");
 
-        self.advance_to_view(nv.view);
+        self.advance_to_view(nv.view)?;
         // Use actual view after advance: buffered-message replay may push view beyond nv.view.
         let actual_view = self.round_state.current_view();
-        self.emit(EngineOutput::ViewChanged { new_view: actual_view });
-
-        Ok(())
+        self.emit(EngineOutput::ViewChanged { new_view: actual_view })
     }
 
     /// Builds a TC from the current timeout_collector and broadcasts NewView.
@@ -245,13 +243,11 @@ impl ConsensusEngine {
             signature: nv_sig,
         };
 
-        self.emit(EngineOutput::BroadcastMessage(ConsensusMessage::NewView(new_view)));
+        self.emit(EngineOutput::BroadcastMessage(ConsensusMessage::NewView(new_view)))?;
 
-        self.advance_to_view(next_view);
+        self.advance_to_view(next_view)?;
         // Use actual view: advance_to_view may replay buffered messages pushing view further.
         let actual_view = self.round_state.current_view();
-        self.emit(EngineOutput::ViewChanged { new_view: actual_view });
-
-        Ok(())
+        self.emit(EngineOutput::ViewChanged { new_view: actual_view })
     }
 }

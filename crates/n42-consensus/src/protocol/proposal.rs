@@ -7,6 +7,8 @@ use super::quorum::{commit_signing_message, signing_message};
 use super::round::Phase;
 use super::state_machine::{ConsensusEngine, EngineOutput, PendingProposal};
 
+const MAX_IMPORTED_BLOCKS: usize = 64;
+
 impl ConsensusEngine {
     /// Called when this node (as leader) has a block ready to propose.
     pub(super) fn on_block_ready(&mut self, block_hash: B256) -> ConsensusResult<()> {
@@ -58,7 +60,7 @@ impl ConsensusEngine {
             let _ = collector.add_vote(self.my_index, leader_vote_sig);
         }
 
-        self.emit(EngineOutput::BroadcastMessage(ConsensusMessage::Proposal(proposal)));
+        self.emit(EngineOutput::BroadcastMessage(ConsensusMessage::Proposal(proposal)))?;
 
         // Check if quorum already reached (single-validator scenario).
         self.try_form_prepare_qc()
@@ -119,7 +121,7 @@ impl ConsensusEngine {
         }
 
         self.round_state.enter_voting();
-        self.emit(EngineOutput::ExecuteBlock(proposal.block_hash));
+        self.emit(EngineOutput::ExecuteBlock(proposal.block_hash))?;
 
         // If the block was already imported (BlockData arrived before Proposal), vote immediately.
         if self.imported_blocks.remove(&proposal.block_hash) {
@@ -167,9 +169,7 @@ impl ConsensusEngine {
         self.emit(EngineOutput::SendToValidator(
             leader,
             ConsensusMessage::CommitVote(commit_vote),
-        ));
-
-        Ok(())
+        ))
     }
 
     /// Sends a Round 1 vote for the given view and block hash.
@@ -188,9 +188,7 @@ impl ConsensusEngine {
         self.emit(EngineOutput::SendToValidator(
             leader,
             ConsensusMessage::Vote(vote),
-        ));
-
-        Ok(())
+        ))
     }
 
     /// Handles the BlockImported event from the orchestrator.
@@ -204,12 +202,12 @@ impl ConsensusEngine {
                 tracing::debug!(view = pending.view, %block_hash, "block imported, sending deferred vote");
                 self.send_vote(pending.view, pending.block_hash)?;
             } else {
-                if self.imported_blocks.len() < 32 {
+                if self.imported_blocks.len() < MAX_IMPORTED_BLOCKS {
                     self.imported_blocks.insert(block_hash);
                 }
                 self.pending_proposal = Some(pending);
             }
-        } else if self.imported_blocks.len() < 32 {
+        } else if self.imported_blocks.len() < MAX_IMPORTED_BLOCKS {
             self.imported_blocks.insert(block_hash);
         }
         Ok(())

@@ -190,7 +190,7 @@ while true; do
             if [[ -n "$local_pid" ]] && ! kill -0 "$local_pid" 2>/dev/null; then
                 log_crash "Validator $i (PID $local_pid) has CRASHED!"
 
-                local crash_log_file="$DATA_DIR/validator-${i}.log"
+                crash_log_file="$DATA_DIR/validator-${i}.log"
                 if [[ -f "$crash_log_file" ]]; then
                     echo "--- Last 50 lines of validator $i log at $(ts) ---" >> "$CRASH_LOG"
                     tail -50 "$crash_log_file" >> "$CRASH_LOG" 2>/dev/null
@@ -199,8 +199,7 @@ while true; do
 
                 echo "--- Block height snapshot at crash time ---" >> "$CRASH_LOG"
                 for j in $(seq 0 $((NUM_NODES - 1))); do
-                    local port=$((BASE_HTTP_RPC + j))
-                    local height
+                    port=$((BASE_HTTP_RPC + j))
                     height=$(get_block_number "$port")
                     echo "  Validator $j (port $port): block $height" >> "$CRASH_LOG"
                 done
@@ -213,13 +212,12 @@ while true; do
 
     # Query block heights from all nodes
     declare -a HEIGHTS=()
-    local alive_count=0
-    local max_height=0
-    local min_height=999999999
+    alive_count=0
+    max_height=0
+    min_height=999999999
 
     for i in $(seq 0 $((NUM_NODES - 1))); do
-        local port=$((BASE_HTTP_RPC + i))
-        local height
+        port=$((BASE_HTTP_RPC + i))
         height=$(get_block_number "$port")
         HEIGHTS+=("$height")
 
@@ -231,7 +229,7 @@ while true; do
     done
 
     # Report status
-    local height_summary=""
+    height_summary=""
     for i in $(seq 0 $((NUM_NODES - 1))); do
         height_summary+="v${i}=${HEIGHTS[$i]:-?} "
     done
@@ -239,7 +237,7 @@ while true; do
 
     # Check for block height divergence
     if [[ $alive_count -ge 2 && $min_height -ge 0 ]]; then
-        local divergence=$((max_height - min_height))
+        divergence=$((max_height - min_height))
         if [[ $divergence -gt $MAX_HEIGHT_DIVERGENCE ]]; then
             log_warn "Block height divergence: $divergence blocks (max=$max_height min=$min_height)"
         fi
@@ -252,7 +250,6 @@ while true; do
     LAST_MAX_HEIGHT=$max_height
 
     # Check consensus status on node 0
-    local consensus_result
     consensus_result=$(rpc_call "$BASE_HTTP_RPC" "n42_consensusStatus")
     if [[ -n "$consensus_result" ]] && echo "$consensus_result" | grep -q '"error"'; then
         log_warn "Consensus status error on node 0: $consensus_result"

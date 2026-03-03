@@ -71,7 +71,13 @@ impl NetworkHandle {
 
     /// Returns the PeerId for a given validator index, if known.
     pub fn validator_peer(&self, index: u32) -> Option<PeerId> {
-        self.validator_peer_map.read().ok()?.get(&index).copied()
+        match self.validator_peer_map.read() {
+            Ok(map) => map.get(&index).copied(),
+            Err(e) => {
+                tracing::error!("validator_peer_map lock poisoned: {}", e);
+                None
+            }
+        }
     }
 
     pub fn send_direct(&self, peer: PeerId, msg: ConsensusMessage) -> Result<(), NetworkError> {
@@ -118,6 +124,12 @@ impl NetworkHandle {
         addrs: Vec<Multiaddr>,
         trusted: bool,
     ) -> Result<(), NetworkError> {
+        const MAX_ADDRS_PER_PEER: usize = 16;
+        if addrs.len() > MAX_ADDRS_PER_PEER {
+            return Err(NetworkError::Dial(format!(
+                "too many addresses for peer ({}), max is {}", addrs.len(), MAX_ADDRS_PER_PEER
+            )));
+        }
         self.send(NetworkCommand::RegisterPeer { peer_id, addrs, trusted })
     }
 
@@ -292,8 +304,11 @@ impl NetworkService {
                 if let Some(idx_str) = info.agent_version.strip_prefix("n42/1.0.0/v") {
                     if let Ok(idx) = idx_str.parse::<u32>() {
                         tracing::info!(%peer_id, validator_index = idx, "mapped peer to validator");
-                        if let Ok(mut map) = self.validator_peer_map.write() {
-                            map.insert(idx, peer_id);
+                        match self.validator_peer_map.write() {
+                            Ok(mut map) => { map.insert(idx, peer_id); }
+                            Err(e) => {
+                                tracing::error!("validator_peer_map lock poisoned on write: {}", e);
+                            }
                         }
                     }
                 }
@@ -484,8 +499,14 @@ impl NetworkService {
 
     /// Publish raw data to a gossipsub topic.
     fn gossipsub_publish(&mut self, topic: gossipsub::IdentTopic, data: Vec<u8>, label: &str) {
-        if let Err(e) = self.swarm.behaviour_mut().gossipsub.publish(topic, data) {
-            tracing::warn!(error = %e, "failed to publish {label}");
+        match self.swarm.behaviour_mut().gossipsub.publish(topic, data) {
+            Ok(_) => {}
+            Err(gossipsub::PublishError::InsufficientPeers) => {
+                tracing::debug!("failed to publish {label}: InsufficientPeers");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to publish {label}");
+            }
         }
     }
 

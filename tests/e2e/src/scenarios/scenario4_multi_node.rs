@@ -27,6 +27,9 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
     // Test 3: 5 nodes (f=1, quorum=3) — 100s for ~10 blocks at 8s interval
     run_multi_node_test(&binary_path, 5, Duration::from_secs(100), 200, 8000).await?;
 
+    // Test 3.5: 7 nodes (f=2, quorum=5) — 100s for ~10 blocks at 8s interval
+    run_multi_node_test(&binary_path, 7, Duration::from_secs(100), 150, 8000).await?;
+
     // Test 4: 21 nodes (f=6, quorum=13) — 100s for ~10 blocks at 8s interval
     run_multi_node_test(&binary_path, 21, Duration::from_secs(100), 300, 8000).await?;
 

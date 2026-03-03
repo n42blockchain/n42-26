@@ -20,7 +20,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 use metrics::{counter, gauge};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Block data broadcast via /n42/blocks/1 GossipSub topic.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -92,6 +92,12 @@ pub struct ConsensusOrchestrator {
     blob_store: Option<DiskFileBlobStore>,
     mobile_reward_manager: Option<Arc<Mutex<MobileRewardManager>>>,
     committed_block_count: u64,
+    /// Tracks the timestamp of the last built/committed block to prevent
+    /// "invalid timestamp" errors from the Engine API.  The Engine API requires
+    /// `new_payload_attributes.timestamp > head_block.timestamp` (strictly greater).
+    /// Without this guard, fast block production (slot_time=0 or f=0 single-node)
+    /// can produce two blocks within the same wall-clock second, violating the rule.
+    last_committed_timestamp: u64,
     /// Timestamp when the current view started (recorded on ViewChanged).
     /// Used to measure commit latency: time from view start to BlockCommitted.
     view_started_at: Option<tokio::time::Instant>,
@@ -143,6 +149,7 @@ impl ConsensusOrchestrator {
             blob_store: None,
             mobile_reward_manager: None,
             committed_block_count: 0,
+            last_committed_timestamp: 0,
             view_started_at: None,
             epoch_schedule: None,
         }
@@ -206,6 +213,7 @@ impl ConsensusOrchestrator {
             blob_store: None,
             mobile_reward_manager: None,
             committed_block_count: 0,
+            last_committed_timestamp: 0,
             view_started_at: None,
             epoch_schedule: None,
         }
@@ -396,7 +404,11 @@ impl ConsensusOrchestrator {
                 if let Err(e) = self.engine.process_event(
                     n42_consensus::ConsensusEvent::Message(message)
                 ) {
-                    warn!(error = %e, "error processing consensus message");
+                    if matches!(e, n42_consensus::N42ConsensusError::SafetyViolation { .. }) {
+                        debug!(error = %e, "benign safety check (QC ordering race)");
+                    } else {
+                        warn!(error = %e, "error processing consensus message");
+                    }
                 }
             }
             NetworkEvent::PeerConnected(peer_id) => {
@@ -658,6 +670,7 @@ mod tests {
             blob_store: None,
             mobile_reward_manager: None,
             committed_block_count: 0,
+            last_committed_timestamp: 0,
             view_started_at: None,
             epoch_schedule: None,
         };
@@ -717,6 +730,7 @@ mod tests {
             blob_store: None,
             mobile_reward_manager: None,
             committed_block_count: 0,
+            last_committed_timestamp: 0,
             view_started_at: None,
             epoch_schedule: None,
         };

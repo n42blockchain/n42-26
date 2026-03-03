@@ -13,6 +13,8 @@ fn scalar_from_u64(val: u64) -> blst_scalar {
     s
 }
 
+const MAX_BATCH_SIZE: usize = 10_000;
+
 /// Batch-verify multiple (message, signature, public_key) tuples.
 /// Uses blst's multi-pairing with random 64-bit scalars for rogue-key attack protection.
 /// Significantly faster than individual verification (~50% savings with many signatures).
@@ -22,6 +24,10 @@ pub fn batch_verify(
     public_keys: &[&BlsPublicKey],
 ) -> Result<(), BlsError> {
     if messages.len() != signatures.len() || signatures.len() != public_keys.len() {
+        return Err(BlsError::VerificationFailed(BLST_ERROR::BLST_BAD_ENCODING));
+    }
+
+    if messages.len() > MAX_BATCH_SIZE {
         return Err(BlsError::VerificationFailed(BLST_ERROR::BLST_BAD_ENCODING));
     }
 
@@ -39,7 +45,7 @@ pub fn batch_verify(
 
     for _ in 1..messages.len() {
         let mut rand_bytes = [0u8; 8];
-        getrandom::fill(&mut rand_bytes).map_err(|_| BlsError::SigningFailed)?;
+        getrandom::fill(&mut rand_bytes).map_err(|_| BlsError::RandomGenerationFailed)?;
         let mut val = u64::from_le_bytes(rand_bytes);
         if val == 0 {
             val = 1;
@@ -79,6 +85,10 @@ pub fn batch_verify_with_fallback(
     public_keys: &[&BlsPublicKey],
 ) -> Result<(), Vec<usize>> {
     if messages.len() != signatures.len() || signatures.len() != public_keys.len() {
+        return Err((0..messages.len()).collect());
+    }
+
+    if messages.len() > MAX_BATCH_SIZE {
         return Err((0..messages.len()).collect());
     }
 

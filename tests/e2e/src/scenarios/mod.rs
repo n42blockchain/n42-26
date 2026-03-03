@@ -9,3 +9,5 @@ pub mod scenario8_mobile_evm;
 pub mod scenario9_long_run;
 pub mod scenario10_chaos;
 pub mod scenario11_quic_10k;
+pub mod scenario12_blockscout_rpc;
+pub mod scenario13_rewards;

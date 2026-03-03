@@ -31,7 +31,8 @@ impl Pacemaker {
     ///
     /// Uses exponential backoff: `base * 2^consecutive_timeouts`, capped at `max_timeout`.
     pub fn timeout_duration(&self, consecutive_timeouts: u32) -> Duration {
-        let multiplier = 1u64.checked_shl(consecutive_timeouts).unwrap_or(u64::MAX);
+        let exp = consecutive_timeouts.min(63);
+        let multiplier = 1u64.checked_shl(exp).unwrap_or(u64::MAX);
         let timeout_ms = self
             .base_timeout
             .as_millis()

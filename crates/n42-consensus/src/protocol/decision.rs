@@ -55,7 +55,7 @@ impl ConsensusEngine {
             self.emit(EngineOutput::SyncRequired {
                 local_view: current_view,
                 target_view: decide.view,
-            });
+            })?;
         }
 
         tracing::info!(view = decide.view, %decide.block_hash, "received Decide, committing block");
@@ -67,11 +67,9 @@ impl ConsensusEngine {
             view: decide.view,
             block_hash: decide.block_hash,
             commit_qc: decide.commit_qc,
-        });
+        })?;
 
         let next_view = decide.view.saturating_add(1);
-        self.advance_to_view(next_view);
-
-        Ok(())
+        self.advance_to_view(next_view)
     }
 }

@@ -14,6 +14,8 @@ pub enum BlsError {
     KeyGeneration,
     #[error("BLS signing failed")]
     SigningFailed,
+    #[error("random number generation failed")]
+    RandomGenerationFailed,
     #[error("BLS verification failed: {0:?}")]
     VerificationFailed(BLST_ERROR),
     #[error("invalid public key bytes")]
