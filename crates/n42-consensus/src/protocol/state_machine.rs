@@ -523,7 +523,9 @@ impl ConsensusEngine {
                 if is_block_committed {
                     let mut val = first_err.into_inner();
                     for attempt in 1..=3 {
-                        std::thread::yield_now();
+                        // Brief sleep to give the consumer a chance to drain the channel.
+                        // thread::yield_now is insufficient in async runtimes.
+                        std::thread::sleep(std::time::Duration::from_millis(1));
                         match self.output_tx.try_send(val) {
                             Ok(()) => {
                                 tracing::warn!(attempt, "BlockCommitted delivered after retry");

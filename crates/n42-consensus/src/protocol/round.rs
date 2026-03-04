@@ -96,12 +96,19 @@ impl RoundState {
         if commit_qc.view > self.locked_qc.view {
             self.locked_qc = commit_qc.clone();
         }
-        self.last_committed_qc = commit_qc;
+        // Enforce monotonicity: last_committed_qc should never regress.
+        if commit_qc.view >= self.last_committed_qc.view {
+            self.last_committed_qc = commit_qc;
+        }
         self.consecutive_timeouts = 0;
     }
 
     /// Advances to a new view, resetting the phase.
+    /// Enforces monotonicity: the view can only move forward.
     pub fn advance_view(&mut self, new_view: ViewNumber) {
+        if new_view <= self.current_view {
+            return;
+        }
         self.current_view = new_view;
         self.phase = Phase::WaitingForProposal;
     }
@@ -245,10 +252,15 @@ mod tests {
         assert_eq!(state.locked_qc().view, 5);
         assert_eq!(state.last_committed_qc().view, 5);
 
-        // Lower commit should not downgrade locked_qc
+        // Lower commit should not downgrade locked_qc or last_committed_qc
         state.commit(make_qc(3));
         assert_eq!(state.locked_qc().view, 5);
-        assert_eq!(state.last_committed_qc().view, 3);
+        assert_eq!(state.last_committed_qc().view, 5);
+
+        // Higher commit should update both
+        state.commit(make_qc(7));
+        assert_eq!(state.locked_qc().view, 7);
+        assert_eq!(state.last_committed_qc().view, 7);
     }
 
     #[test]

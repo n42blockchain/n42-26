@@ -59,7 +59,9 @@ where
                                 let tx: &TransactionSigned = pooled_tx.transaction.transaction();
                                 let encoded = alloy_rlp::encode(tx);
                                 debug!(%tx_hash, bytes = encoded.len(), "broadcasting local transaction");
-                                let _ = self.broadcast_tx.try_send(encoded);
+                                if let Err(e) = self.broadcast_tx.try_send(encoded) {
+                                    tracing::warn!(%tx_hash, error = %e, "broadcast channel full, transaction not propagated");
+                                }
                             }
                         }
                         None => {

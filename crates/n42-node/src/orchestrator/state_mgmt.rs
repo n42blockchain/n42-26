@@ -2,7 +2,7 @@ use super::{BlockDataBroadcast, CommittedBlock, ConsensusOrchestrator};
 use crate::persistence::{self, ConsensusSnapshot};
 use alloy_primitives::B256;
 use n42_consensus::verify_commit_qc;
-use n42_network::{BlockSyncResponse, PeerId, SyncBlock};
+use n42_network::{BlockSyncResponse, PeerId, SyncBlock, MAX_BLOCKS_PER_SYNC_REQUEST};
 use n42_primitives::QuorumCertificate;
 use std::sync::LazyLock;
 use std::time::Duration;
@@ -181,9 +181,12 @@ impl ConsensusOrchestrator {
 
         info!(%peer, local_view, target_view, "initiating state sync");
 
+        // Cap to_view so the request doesn't exceed MAX_BLOCKS_PER_SYNC_REQUEST.
+        // The peer will reject oversized ranges; capping here avoids a wasted round-trip.
+        let capped_to_view = target_view.min(local_view + MAX_BLOCKS_PER_SYNC_REQUEST);
         let request = n42_network::BlockSyncRequest {
             from_view: local_view + 1,
-            to_view: target_view,
+            to_view: capped_to_view,
             local_committed_view: local_view,
         };
 
@@ -205,6 +208,14 @@ impl ConsensusOrchestrator {
         request: n42_network::BlockSyncRequest,
     ) {
         counter!("n42_sync_requests_served_total").increment(1);
+
+        // Validate the request range to prevent malicious peers from requesting
+        // unbounded ranges.
+        if let Err(reason) = request.validate() {
+            warn!(%peer, %reason, "rejecting invalid sync request");
+            return;
+        }
+
         info!(
             %peer,
             from_view = request.from_view,

@@ -7,6 +7,14 @@ use super::round::Phase;
 use super::state_machine::{ConsensusEngine, EngineOutput, FUTURE_VIEW_WINDOW};
 
 impl ConsensusEngine {
+    /// Verifies a QC embedded in a timeout or NewView message.
+    /// Genesis QC (view 0) is exempt — it has no real aggregate signatures.
+    /// Uses `verify_qc_any_domain` because locked_qc may be either a prepare or commit QC.
+    fn verify_embedded_qc(&self, qc: &n42_primitives::consensus::QuorumCertificate) -> ConsensusResult<()> {
+        if qc.view == 0 { return Ok(()); }
+        super::quorum::verify_qc_any_domain(qc, self.validator_set())
+    }
+
     /// Handles a view timeout triggered by the pacemaker.
     pub fn on_timeout(&mut self) -> ConsensusResult<()> {
         let view = self.round_state.current_view();
@@ -70,6 +78,14 @@ impl ConsensusEngine {
             validator_index: timeout.sender,
         })?;
 
+        // Verify the embedded high_qc to prevent Byzantine validators from injecting
+        // forged QCs that could manipulate the locked_qc via TC formation.
+        self.verify_embedded_qc(&timeout.high_qc).map_err(|e| {
+            tracing::warn!(view, sender = timeout.sender, qc_view = timeout.high_qc.view,
+                "rejecting timeout with invalid high_qc: {e}");
+            e
+        })?;
+
         let n_validators = self.validator_set().len();
         let quorum_size = self.validator_set().quorum_size();
         let next_view = view.saturating_add(1);
@@ -124,6 +140,15 @@ impl ConsensusEngine {
         pk.verify(&msg, &timeout.signature).map_err(|_| ConsensusError::InvalidSignature {
             view: timeout.view,
             validator_index: timeout.sender,
+        })?;
+
+        // Verify the embedded high_qc to prevent Byzantine validators from injecting
+        // forged QCs via future-view timeouts.
+        self.verify_embedded_qc(&timeout.high_qc).map_err(|e| {
+            tracing::warn!(current_view, timeout_view = timeout.view, sender = timeout.sender,
+                qc_view = timeout.high_qc.view,
+                "rejecting future timeout with invalid high_qc: {e}");
+            e
         })?;
 
         tracing::info!(
@@ -218,10 +243,7 @@ impl ConsensusEngine {
         super::quorum::verify_tc(&nv.timeout_cert, self.validator_set())?;
 
         // Verify TC's high_qc signature to prevent injection of forged QCs.
-        // Genesis QC (view 0) is exempt — it has no real signatures.
-        if nv.timeout_cert.high_qc.view > 0 {
-            super::quorum::verify_qc(&nv.timeout_cert.high_qc, self.validator_set())?;
-        }
+        self.verify_embedded_qc(&nv.timeout_cert.high_qc)?;
 
         self.round_state.update_locked_qc(&nv.timeout_cert.high_qc);
 

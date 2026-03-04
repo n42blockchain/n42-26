@@ -377,7 +377,7 @@ mod tests {
 
     #[test]
     fn test_genesis_qc() {
-        let result = std::panic::catch_unwind(|| QuorumCertificate::genesis());
+        let result = std::panic::catch_unwind(QuorumCertificate::genesis);
         match result {
             Ok(qc) => {
                 assert_eq!(qc.view, 0);

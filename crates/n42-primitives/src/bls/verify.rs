@@ -85,7 +85,10 @@ pub fn batch_verify_with_fallback(
     public_keys: &[&BlsPublicKey],
 ) -> Result<(), Vec<usize>> {
     if messages.len() != signatures.len() || signatures.len() != public_keys.len() {
-        return Err((0..messages.len()).collect());
+        // Input length mismatch is a programming error; return all valid indices as bad
+        // to ensure the caller treats it as a total failure without out-of-bounds risk.
+        let min_len = messages.len().min(signatures.len()).min(public_keys.len());
+        return Err((0..min_len).collect());
     }
 
     if messages.len() > MAX_BATCH_SIZE {

@@ -57,10 +57,28 @@ impl EpochSchedule {
                 let entries: Vec<EpochEntry> = serde_json::from_str(&json)
                     .map_err(|e| format!("failed to parse {}: {e}", path.display()))?;
 
-                let map: BTreeMap<u64, (Vec<ValidatorInfo>, u32)> = entries
-                    .into_iter()
-                    .map(|e| (e.start_epoch, (e.validators, e.threshold)))
-                    .collect();
+                // Validate entries before inserting.
+                let mut map: BTreeMap<u64, (Vec<ValidatorInfo>, u32)> = BTreeMap::new();
+                for entry in entries {
+                    if entry.validators.is_empty() {
+                        return Err(format!(
+                            "epoch {} has empty validator set",
+                            entry.start_epoch
+                        ));
+                    }
+                    if entry.threshold as usize > entry.validators.len() {
+                        return Err(format!(
+                            "epoch {} threshold ({}) exceeds validator count ({})",
+                            entry.start_epoch, entry.threshold, entry.validators.len()
+                        ));
+                    }
+                    if map.insert(entry.start_epoch, (entry.validators, entry.threshold)).is_some() {
+                        return Err(format!(
+                            "duplicate epoch entry for start_epoch {}",
+                            entry.start_epoch
+                        ));
+                    }
+                }
 
                 tracing::info!(
                     epoch_count = map.len(),
@@ -150,13 +168,13 @@ mod tests {
         let dir = TempDir::new().unwrap();
 
         let validators = make_validators(4);
-        let entries = vec![EpochEntry { start_epoch: 5, validators: validators.clone(), threshold: 14 }];
+        let entries = vec![EpochEntry { start_epoch: 5, validators: validators.clone(), threshold: 3 }];
         let path = write_entries(&entries, dir.path());
 
         let schedule = EpochSchedule::load(&path).unwrap().unwrap();
         let (loaded_validators, threshold) = schedule.get_for_epoch(5).unwrap();
         assert_eq!(loaded_validators.len(), 4);
-        assert_eq!(threshold, 14);
+        assert_eq!(threshold, 3);
     }
 
     #[test]

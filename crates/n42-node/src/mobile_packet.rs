@@ -176,13 +176,16 @@ pub async fn mobile_packet_loop<P>(
                 let data = encode_cache_sync(&msg);
                 let code_count = msg.codes.len();
                 let raw_len = data.len();
-                let compressed = zstd::bulk::compress(&data, 3).unwrap_or_else(|e| {
-                    warn!(error = %e, "zstd compression failed for cache sync, sending uncompressed");
-                    data
-                });
+                let (compressed, msg_type) = match zstd::bulk::compress(&data, 3) {
+                    Ok(c) => (c, n42_network::MSG_TYPE_CACHE_SYNC_ZSTD),
+                    Err(e) => {
+                        warn!(error = %e, "zstd compression failed for cache sync, sending uncompressed");
+                        (data, n42_network::MSG_TYPE_CACHE_SYNC)
+                    }
+                };
                 let compressed_len = compressed.len();
                 let mut framed = bytes::BytesMut::with_capacity(1 + compressed.len());
-                framed.put_u8(n42_network::MSG_TYPE_CACHE_SYNC_ZSTD);
+                framed.put_u8(msg_type);
                 framed.extend_from_slice(&compressed);
                 if let Err(e) = hub_handle.send_to_session(session_id, framed.freeze()) {
                     warn!(error = %e, session_id, "failed to send cache sync to new phone");

@@ -8,6 +8,9 @@ use std::io;
 
 use crate::codec;
 
+/// Maximum number of blocks that can be requested in a single sync request.
+pub const MAX_BLOCKS_PER_SYNC_REQUEST: u64 = 128;
+
 /// Block sync request: asks a peer for blocks in a view range.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BlockSyncRequest {
@@ -17,6 +20,27 @@ pub struct BlockSyncRequest {
     pub to_view: u64,
     /// Requester's committed view (for peer to gauge how far behind we are).
     pub local_committed_view: u64,
+}
+
+impl BlockSyncRequest {
+    /// Validates the request range. Returns an error string if invalid.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.from_view > self.to_view {
+            return Err(format!(
+                "invalid sync range: from_view ({}) > to_view ({})",
+                self.from_view, self.to_view
+            ));
+        }
+        // Inclusive range [from_view, to_view] contains (to_view - from_view + 1) views.
+        let block_count = self.to_view - self.from_view + 1;
+        if block_count > MAX_BLOCKS_PER_SYNC_REQUEST {
+            return Err(format!(
+                "sync range too large: {} blocks (max {})",
+                block_count, MAX_BLOCKS_PER_SYNC_REQUEST
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Block sync response: contains committed blocks for the requested range.

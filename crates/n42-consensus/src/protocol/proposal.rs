@@ -93,6 +93,20 @@ impl ConsensusEngine {
             validator_index: proposal.proposer,
         })?;
 
+        // Verify the justify_qc's aggregate BLS signature to prevent a Byzantine leader
+        // from injecting a forged QC that manipulates honest nodes' locked_qc.
+        // Genesis QC (view 0) is exempt — it has no real aggregate signatures.
+        // Uses verify_qc_any_domain because justify_qc may be either a prepare QC or commit QC.
+        if proposal.justify_qc.view > 0 {
+            super::quorum::verify_qc_any_domain(&proposal.justify_qc, self.validator_set()).map_err(|e| {
+                tracing::warn!(
+                    view, proposer = proposal.proposer, qc_view = proposal.justify_qc.view,
+                    "rejecting proposal with invalid justify_qc: {e}"
+                );
+                e
+            })?;
+        }
+
         if !self.round_state.is_safe_to_vote(&proposal.justify_qc) {
             return Err(ConsensusError::SafetyViolation {
                 qc_view: proposal.justify_qc.view,

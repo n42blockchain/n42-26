@@ -334,6 +334,7 @@ impl StarHub {
                 }
                 HubCommand::DisconnectSession(session_id) => {
                     self.sessions.write().await.remove(&session_id);
+                    self.session_senders.write().await.remove(&session_id);
                     tracing::debug!(session_id, "disconnected mobile session");
                 }
             }

@@ -62,11 +62,21 @@ impl Keystore {
     pub fn decrypt(&self, password: &str) -> Result<[u8; 32], String> {
         let salt =
             hex::decode(&self.salt).map_err(|e| format!("invalid salt hex: {e}"))?;
+        if salt.len() != 32 {
+            return Err(format!("invalid salt length: expected 32 bytes, got {}", salt.len()));
+        }
         let nonce_bytes =
             hex::decode(&self.nonce).map_err(|e| format!("invalid nonce hex: {e}"))?;
+        if nonce_bytes.len() != 12 {
+            return Err(format!("invalid nonce length: expected 12 bytes, got {}", nonce_bytes.len()));
+        }
         let ciphertext =
             hex::decode(&self.ciphertext).map_err(|e| format!("invalid ciphertext hex: {e}"))?;
 
+        // Validate scrypt parameters to prevent resource exhaustion from malformed keystores.
+        if self.scrypt_log_n > 20 {
+            return Err(format!("scrypt_log_n {} is unreasonably large (max 20)", self.scrypt_log_n));
+        }
         let params = ScryptParams::new(self.scrypt_log_n, self.scrypt_r, self.scrypt_p, 32)
             .map_err(|e| format!("scrypt params: {e}"))?;
         let mut derived_key = [0u8; 32];

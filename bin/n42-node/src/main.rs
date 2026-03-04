@@ -179,13 +179,32 @@ fn main() {
             .iter()
             .position(|pk| pk.to_bytes() == my_pubkey.to_bytes())
             .map(|i| i as u32)
-            .unwrap_or(0);
+            .unwrap_or_else(|| {
+                if consensus_config.initial_validators.is_empty() {
+                    // Dev mode with auto-generated validator set — index 0 is correct.
+                    0
+                } else {
+                    warn!(
+                        target: "n42::cli",
+                        "this node's BLS public key not found in the validator set; \
+                         defaulting to observer mode (index 0, no block rewards)"
+                    );
+                    0
+                }
+            });
 
         let fee_recipient = consensus_config
             .initial_validators
             .get(my_index as usize)
             .map(|v| v.address)
-            .unwrap_or(Address::ZERO);
+            .unwrap_or_else(|| {
+                warn!(
+                    target: "n42::cli",
+                    "no fee recipient address found for validator index {my_index}, \
+                     block rewards will be sent to Address::ZERO"
+                );
+                Address::ZERO
+            });
 
         info!(
             target: "n42::cli",
@@ -363,7 +382,7 @@ fn main() {
                         max_connections_per_shard: 10_000,
                         cert_dir: Some(data_dir.join("certs")),
                         ..Default::default()
-                    });
+                    }).expect("Failed to create ShardedStarHub — check base_port + shard_count");
 
                 info!(
                     target: "n42::cli",

@@ -85,7 +85,7 @@ impl ShardedStarHub {
     /// Creates N shards, returning the hub, a unified handle, and merged event receiver.
     pub fn new(
         config: ShardedStarHubConfig,
-    ) -> (Self, ShardedStarHubHandle, mpsc::UnboundedReceiver<HubEvent>) {
+    ) -> eyre::Result<(Self, ShardedStarHubHandle, mpsc::UnboundedReceiver<HubEvent>)> {
         let shard_count = config.shard_count.max(1);
         let shared_id_gen = Arc::new(SessionIdGenerator::new());
 
@@ -94,14 +94,14 @@ impl ShardedStarHub {
         let (merged_event_tx, merged_event_rx) = mpsc::unbounded_channel();
 
         for i in 0..shard_count {
-            let port = config.base_port.checked_add(i as u16).unwrap_or_else(|| {
-                panic!(
+            let port = config.base_port.checked_add(i as u16).ok_or_else(|| {
+                eyre::eyre!(
                     "port overflow: base_port={} + shard_index={} exceeds u16::MAX",
                     config.base_port, i
                 )
-            });
+            })?;
             let shard_config = StarHubConfig {
-                bind_addr: format!("0.0.0.0:{port}").parse().unwrap(),
+                bind_addr: format!("0.0.0.0:{port}").parse()?,
                 max_connections: config.max_connections_per_shard,
                 idle_timeout_secs: config.idle_timeout_secs,
                 cert_dir: config.cert_dir.clone(),
@@ -123,7 +123,7 @@ impl ShardedStarHub {
             shard_handles.push(handle);
         }
 
-        (Self { shards }, ShardedStarHubHandle { shard_handles }, merged_event_rx)
+        Ok((Self { shards }, ShardedStarHubHandle { shard_handles }, merged_event_rx))
     }
 
     pub fn ports(&self) -> Vec<u16> {
@@ -181,7 +181,7 @@ mod tests {
     #[tokio::test]
     async fn test_sharded_hub_single_shard() {
         let config = ShardedStarHubConfig { base_port: 19443, shard_count: 1, ..Default::default() };
-        let (hub, handle, _event_rx) = ShardedStarHub::new(config);
+        let (hub, handle, _event_rx) = ShardedStarHub::new(config).unwrap();
         assert_eq!(hub.shard_count(), 1);
         assert_eq!(hub.ports(), vec![19443]);
         assert!(handle.broadcast_packet(Bytes::from(vec![1, 2, 3])).is_ok());
@@ -190,7 +190,7 @@ mod tests {
     #[tokio::test]
     async fn test_sharded_hub_port_assignment() {
         let config = ShardedStarHubConfig { base_port: 19443, shard_count: 3, ..Default::default() };
-        let (hub, _handle, _event_rx) = ShardedStarHub::new(config);
+        let (hub, _handle, _event_rx) = ShardedStarHub::new(config).unwrap();
         assert_eq!(hub.shard_count(), 3);
         assert_eq!(hub.ports(), vec![19443, 19444, 19445]);
     }
@@ -198,7 +198,7 @@ mod tests {
     #[tokio::test]
     async fn test_sharded_hub_broadcast_fans_out() {
         let config = ShardedStarHubConfig { base_port: 19446, shard_count: 3, ..Default::default() };
-        let (_hub, handle, _event_rx) = ShardedStarHub::new(config);
+        let (_hub, handle, _event_rx) = ShardedStarHub::new(config).unwrap();
         assert!(handle.broadcast_packet(Bytes::from(vec![0xAA])).is_ok());
         assert!(handle.broadcast_cache_sync(Bytes::from(vec![0xBB])).is_ok());
     }
@@ -206,7 +206,7 @@ mod tests {
     #[tokio::test]
     async fn test_sharded_handle_clone_cheap() {
         let config = ShardedStarHubConfig { base_port: 19449, shard_count: 2, ..Default::default() };
-        let (_hub, handle, _event_rx) = ShardedStarHub::new(config);
+        let (_hub, handle, _event_rx) = ShardedStarHub::new(config).unwrap();
         let cloned = handle.clone();
         assert!(handle.broadcast_packet(Bytes::from(vec![1])).is_ok());
         assert!(cloned.broadcast_packet(Bytes::from(vec![2])).is_ok());
@@ -231,7 +231,7 @@ mod tests {
     #[tokio::test]
     async fn test_sharded_hub_zero_shard_count_clamps_to_one() {
         let config = ShardedStarHubConfig { base_port: 19460, shard_count: 0, ..Default::default() };
-        let (hub, _handle, _event_rx) = ShardedStarHub::new(config);
+        let (hub, _handle, _event_rx) = ShardedStarHub::new(config).unwrap();
         assert_eq!(hub.shard_count(), 1);
         assert_eq!(hub.ports(), vec![19460]);
     }

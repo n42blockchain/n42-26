@@ -90,6 +90,14 @@ impl ConsensusSnapshot {
 /// Uses temp-file + rename to prevent corruption from partial writes.
 /// On POSIX systems, `rename` is atomic within the same filesystem.
 pub fn save_consensus_state(path: &Path, snapshot: &ConsensusSnapshot) -> io::Result<()> {
+    // Validate snapshot before persisting to avoid writing corrupted state.
+    snapshot.validate().map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("refusing to persist invalid snapshot: {e}"),
+        )
+    })?;
+
     let json = serde_json::to_string_pretty(snapshot)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 

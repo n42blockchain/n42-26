@@ -71,15 +71,23 @@ impl ConsensusConfig {
     /// Create a dev/test configuration with `count` deterministic validators.
     /// Keys are deterministic: validator `i` uses bytes `[0; 28] + (i+1).to_be_bytes()`.
     /// This matches `scripts/local-testnet.sh`.
+    ///
+    /// # Panics
+    /// Panics if `count > 65535` (exceeds practical validator set limits).
     pub fn dev_multi(count: usize) -> Self {
+        assert!(count <= 65535, "dev_multi: count {count} exceeds max 65535");
         let mut validators = Vec::with_capacity(count);
         for i in 0..count {
             let key_bytes = Self::deterministic_key_bytes(i);
             let sk = n42_primitives::BlsSecretKey::from_bytes(&key_bytes)
                 .expect("deterministic BLS key should be valid");
             let pk = sk.public_key();
+            // Use last 2 bytes for address to support up to 65535 validators.
+            let mut addr_bytes = [0u8; 20];
+            let val = (i + 1) as u16;
+            addr_bytes[18..20].copy_from_slice(&val.to_be_bytes());
             validators.push(ValidatorInfo {
-                address: Address::with_last_byte((i + 1) as u8),
+                address: Address::from(addr_bytes),
                 bls_public_key: pk,
             });
         }
@@ -116,8 +124,11 @@ impl ConsensusConfig {
     ///
     /// Checks:
     /// - `validator_set_size >= 3f + 1` (Byzantine fault tolerance requirement)
+    /// - `initial_validators.len()` matches `validator_set_size` (if validators are provided)
     /// - `base_timeout_ms <= max_timeout_ms`
+    /// - `base_timeout_ms > 0` and `max_timeout_ms > 0`
     /// - `slot_time_ms > 0`
+    /// - No duplicate validator addresses or BLS public keys
     pub fn validate(&self) -> Result<(), String> {
         let min_validators = 3 * self.fault_tolerance + 1;
         if self.validator_set_size < min_validators {
@@ -126,14 +137,43 @@ impl ConsensusConfig {
                 self.validator_set_size, min_validators, self.fault_tolerance
             ));
         }
+        // If validators are provided, their count must match validator_set_size.
+        if !self.initial_validators.is_empty()
+            && self.initial_validators.len() as u32 != self.validator_set_size
+        {
+            return Err(format!(
+                "initial_validators count ({}) does not match validator_set_size ({})",
+                self.initial_validators.len(),
+                self.validator_set_size
+            ));
+        }
         if self.base_timeout_ms > self.max_timeout_ms {
             return Err(format!(
                 "base_timeout_ms ({}) must be <= max_timeout_ms ({})",
                 self.base_timeout_ms, self.max_timeout_ms
             ));
         }
+        if self.base_timeout_ms == 0 {
+            return Err("base_timeout_ms must be > 0".to_string());
+        }
+        if self.max_timeout_ms == 0 {
+            return Err("max_timeout_ms must be > 0".to_string());
+        }
         if self.slot_time_ms == 0 {
             return Err("slot_time_ms must be > 0".to_string());
+        }
+        // Check for duplicate validator addresses.
+        if !self.initial_validators.is_empty() {
+            let mut seen_addrs = std::collections::HashSet::new();
+            let mut seen_pks = std::collections::HashSet::new();
+            for v in &self.initial_validators {
+                if !seen_addrs.insert(v.address) {
+                    return Err(format!("duplicate validator address: {:?}", v.address));
+                }
+                if !seen_pks.insert(v.bls_public_key.to_bytes()) {
+                    return Err("duplicate BLS public key in validator set".to_string());
+                }
+            }
         }
         Ok(())
     }
@@ -158,10 +198,19 @@ pub const N42_CHAIN_ID: u64 = 4242;
 /// N42_CHAIN_ID=1337 ./n42-node
 /// ```
 fn effective_chain_id() -> u64 {
-    std::env::var("N42_CHAIN_ID")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(N42_CHAIN_ID)
+    match std::env::var("N42_CHAIN_ID") {
+        Ok(s) => match s.parse::<u64>() {
+            Ok(id) => id,
+            Err(_) => {
+                eprintln!(
+                    "WARNING: N42_CHAIN_ID env var '{}' is not a valid u64, using default {}",
+                    s, N42_CHAIN_ID
+                );
+                N42_CHAIN_ID
+            }
+        },
+        Err(_) => N42_CHAIN_ID,
+    }
 }
 
 /// Create the N42 dev chain spec (reth ChainSpec) for testing.

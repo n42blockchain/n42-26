@@ -365,6 +365,39 @@ pub fn verify_commit_qc(
         })
 }
 
+/// Verifies a QC that may be either a PrepareQC (Round 1) or CommitQC (Round 2).
+///
+/// The `locked_qc` can originate from either:
+/// - Round 1 (prepare path): signed with `signing_message` (view || block_hash)
+/// - Round 2 (commit path): signed with `commit_signing_message` ("commit" || view || block_hash)
+///
+/// When a QC is embedded as `high_qc` in timeout messages or `justify_qc` in proposals,
+/// we cannot know its signing domain a priori. This function collects signer keys once
+/// and tries both message formats to avoid redundant bitmap validation and key collection.
+pub fn verify_qc_any_domain(
+    qc: &QuorumCertificate,
+    validator_set: &ValidatorSet,
+) -> ConsensusResult<()> {
+    let quorum_size = validator_set.quorum_size();
+    let signer_pks = collect_signer_keys(
+        &qc.signers, validator_set, quorum_size, qc.view, CertKind::QC,
+    )?;
+
+    // Try prepare (Round 1) message format first (most common path).
+    let prepare_msg = signing_message(qc.view, &qc.block_hash);
+    if AggregateSignature::verify_aggregate(&prepare_msg, &qc.aggregate_signature, &signer_pks).is_ok() {
+        return Ok(());
+    }
+
+    // Fall back to commit (Round 2) message format.
+    let commit_msg = commit_signing_message(qc.view, &qc.block_hash);
+    AggregateSignature::verify_aggregate(&commit_msg, &qc.aggregate_signature, &signer_pks)
+        .map_err(|_| ConsensusError::InvalidQC {
+            view: qc.view,
+            reason: "aggregated signature verification failed (tried both prepare and commit domains)".to_string(),
+        })
+}
+
 /// Verifies a TimeoutCertificate against the validator set.
 pub fn verify_tc(tc: &TimeoutCertificate, validator_set: &ValidatorSet) -> ConsensusResult<()> {
     let quorum_size = validator_set.quorum_size();
