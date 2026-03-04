@@ -1,5 +1,6 @@
 mod consensus_loop;
 mod execution_bridge;
+pub mod observer;
 mod state_mgmt;
 
 use crate::consensus_state::SharedConsensusState;
@@ -24,19 +25,19 @@ use tracing::{debug, error, info, warn};
 
 /// Block data broadcast via /n42/blocks/1 GossipSub topic.
 #[derive(serde::Serialize, serde::Deserialize)]
-struct BlockDataBroadcast {
-    block_hash: B256,
-    view: u64,
+pub(crate) struct BlockDataBroadcast {
+    pub(crate) block_hash: B256,
+    pub(crate) view: u64,
     /// JSON-serialized execution payload (bincode can't handle reth's `#[serde(untagged)]`).
-    payload_json: Vec<u8>,
+    pub(crate) payload_json: Vec<u8>,
 }
 
 /// Blob sidecar broadcast via /n42/blobs/1 GossipSub topic.
 #[derive(serde::Serialize, serde::Deserialize)]
-struct BlobSidecarBroadcast {
-    block_hash: B256,
-    view: u64,
-    sidecars: Vec<(B256, Vec<u8>)>,
+pub(crate) struct BlobSidecarBroadcast {
+    pub(crate) block_hash: B256,
+    pub(crate) view: u64,
+    pub(crate) sidecars: Vec<(B256, Vec<u8>)>,
 }
 
 /// Deferred finalization: Decide arrived before BlockData (f=0 race).
@@ -47,11 +48,11 @@ struct PendingFinalization {
     commit_qc: QuorumCertificate,
 }
 
-struct CommittedBlock {
-    view: u64,
-    block_hash: B256,
-    commit_qc: QuorumCertificate,
-    payload: Vec<u8>,
+pub(crate) struct CommittedBlock {
+    pub(crate) view: u64,
+    pub(crate) block_hash: B256,
+    pub(crate) commit_qc: QuorumCertificate,
+    pub(crate) payload: Vec<u8>,
 }
 
 /// Bridges the consensus engine with the P2P network layer and reth Engine API.
@@ -179,7 +180,7 @@ impl ConsensusOrchestrator {
         let slot_time = Duration::from_millis(slot_time_ms);
 
         if slot_time_ms > 0 {
-            info!(slot_time_ms, "wall-clock-aligned slot timing configured");
+            info!(target: "n42::cl::orchestrator", slot_time_ms, "wall-clock-aligned slot timing configured");
         }
 
         Self {
@@ -277,10 +278,13 @@ impl ConsensusOrchestrator {
     /// Runs the orchestrator event loop. Never returns under normal operation.
     pub async fn run(mut self) {
         info!(
+            target: "n42::cl::orchestrator",
+            version = env!("CARGO_PKG_VERSION"),
+            consensus = "HotStuff-2",
+            validators = self.engine.validator_count(),
             view = self.engine.current_view(),
-            phase = ?self.engine.current_phase(),
             head = %self.head_block_hash,
-            "consensus orchestrator started"
+            "N42 consensus layer initialized"
         );
 
         self.initialize_startup_schedule().await;
@@ -302,9 +306,9 @@ impl ConsensusOrchestrator {
                 _ = &mut timeout => {
                     let view = self.engine.current_view();
                     counter!("n42_view_timeouts_total").increment(1);
-                    warn!(view, "pacemaker timeout, initiating view change");
+                    warn!(target: "n42::cl::orchestrator", view, "pacemaker timeout, initiating view change");
                     if let Err(e) = self.engine.on_timeout() {
-                        error!(view, error = %e, "error handling timeout");
+                        error!(target: "n42::cl::orchestrator", view, error = %e, "error handling timeout");
                     }
                 }
 
@@ -312,7 +316,7 @@ impl ConsensusOrchestrator {
                     match event {
                         Some(ev) => self.handle_network_event(ev).await,
                         None => {
-                            info!("network event channel closed, shutting down orchestrator");
+                            info!(target: "n42::cl::orchestrator", "network event channel closed, shutting down orchestrator");
                             break;
                         }
                     }
@@ -322,7 +326,7 @@ impl ConsensusOrchestrator {
                     match output {
                         Some(engine_output) => self.handle_engine_output(engine_output).await,
                         None => {
-                            info!("engine output channel closed, shutting down orchestrator");
+                            info!(target: "n42::cl::orchestrator", "engine output channel closed, shutting down orchestrator");
                             break;
                         }
                     }
@@ -330,11 +334,11 @@ impl ConsensusOrchestrator {
 
                 block_hash = self.block_ready_rx.recv() => {
                     if let Some(hash) = block_hash {
-                        info!(%hash, view = self.engine.current_view(), "payload built, feeding BlockReady to consensus");
+                        info!(target: "n42::cl::orchestrator", %hash, view = self.engine.current_view(), "payload built, feeding BlockReady to consensus");
                         if let Err(e) = self.engine.process_event(
                             n42_consensus::ConsensusEvent::BlockReady(hash)
                         ) {
-                            error!(error = %e, "error processing BlockReady event");
+                            error!(target: "n42::cl::orchestrator", error = %e, "error processing BlockReady event");
                         }
                     }
                 }
@@ -348,7 +352,7 @@ impl ConsensusOrchestrator {
                     if let Some(data) = tx_data
                         && let Err(e) = self.network.broadcast_transaction(data)
                     {
-                        tracing::debug!(error = %e, "failed to broadcast transaction");
+                        tracing::debug!(target: "n42::cl::orchestrator", error = %e, "failed to broadcast transaction");
                     }
                 }
 
@@ -366,9 +370,9 @@ impl ConsensusOrchestrator {
                         // Startup delay completed: reset pacemaker so the full base_timeout starts now.
                         let view = self.engine.current_view();
                         self.engine.pacemaker_mut().reset_for_view(view, 0);
-                        info!("startup delay completed, triggering first payload build");
+                        info!(target: "n42::cl::orchestrator", "startup delay completed, triggering first payload build");
                     } else {
-                        info!(slot_timestamp = ?slot_ts, "slot boundary reached, triggering payload build");
+                        info!(target: "n42::cl::orchestrator", slot_timestamp = ?slot_ts, "slot boundary reached, triggering payload build");
                     }
 
                     self.do_trigger_payload_build(slot_ts).await;
@@ -376,7 +380,7 @@ impl ConsensusOrchestrator {
             }
         }
 
-        info!(view = self.engine.current_view(), "orchestrator shutting down, persisting final state");
+        info!(target: "n42::cl::orchestrator", view = self.engine.current_view(), "orchestrator shutting down, persisting final state");
         self.save_shutdown_state();
     }
 
@@ -396,6 +400,7 @@ impl ConsensusOrchestrator {
         if startup_delay_ms > 0 {
             let startup_delay = Duration::from_millis(startup_delay_ms);
             info!(
+                target: "n42::cl::orchestrator",
                 delay_ms = startup_delay_ms,
                 validators = n,
                 "leader for view 1, waiting for GossipSub mesh formation"
@@ -403,7 +408,7 @@ impl ConsensusOrchestrator {
             self.next_build_at = Some(Instant::now() + startup_delay);
             self.engine.pacemaker_mut().extend_deadline(startup_delay);
         } else {
-            info!("this node is leader for view 1, triggering genesis payload build");
+            info!(target: "n42::cl::orchestrator", "this node is leader for view 1, triggering genesis payload build");
             self.schedule_payload_build().await;
         }
     }
@@ -416,24 +421,24 @@ impl ConsensusOrchestrator {
                     n42_consensus::ConsensusEvent::Message(*message)
                 ) {
                     if matches!(e, n42_consensus::N42ConsensusError::SafetyViolation { .. }) {
-                        debug!(error = %e, "benign safety check (QC ordering race)");
+                        debug!(target: "n42::cl::orchestrator", error = %e, "benign safety check (QC ordering race)");
                     } else {
-                        warn!(error = %e, "error processing consensus message");
+                        warn!(target: "n42::cl::orchestrator", error = %e, "error processing consensus message");
                     }
                 }
             }
             NetworkEvent::PeerConnected(peer_id) => {
-                info!(%peer_id, "consensus peer connected");
+                info!(target: "n42::cl::orchestrator", %peer_id, "consensus peer connected");
                 self.connected_peers.insert(peer_id);
                 gauge!("n42_connected_peers").set(self.connected_peers.len() as f64);
             }
             NetworkEvent::PeerDisconnected(peer_id) => {
-                warn!(%peer_id, "consensus peer disconnected");
+                warn!(target: "n42::cl::orchestrator", %peer_id, "consensus peer disconnected");
                 self.connected_peers.remove(&peer_id);
                 gauge!("n42_connected_peers").set(self.connected_peers.len() as f64);
             }
             NetworkEvent::BlockAnnouncement { source, data } => {
-                tracing::debug!(%source, bytes = data.len(), "received block data broadcast");
+                tracing::debug!(target: "n42::cl::orchestrator", %source, bytes = data.len(), "received block data broadcast");
                 self.handle_block_data(data).await;
             }
             NetworkEvent::TransactionReceived { source: _, data } => {
@@ -448,7 +453,7 @@ impl ConsensusOrchestrator {
                 self.handle_sync_response(peer, response).await;
             }
             NetworkEvent::SyncRequestFailed { peer, error } => {
-                warn!(%peer, %error, "sync request failed");
+                warn!(target: "n42::cl::orchestrator", %peer, %error, "sync request failed");
                 self.sync_in_flight = false;
                 self.sync_started_at = None;
             }
@@ -470,7 +475,6 @@ mod tests {
     use n42_consensus::{ConsensusEngine, ValidatorSet};
     use n42_network::{NetworkCommand, NetworkHandle};
     use n42_primitives::{BlsSecretKey, ConsensusMessage, QuorumCertificate, Vote};
-    use std::collections::HashSet;
     use std::time::Duration;
 
     fn make_test_engine() -> (ConsensusEngine, mpsc::Receiver<EngineOutput>) {

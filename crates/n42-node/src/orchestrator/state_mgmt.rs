@@ -100,9 +100,9 @@ impl ConsensusOrchestrator {
 
         let snapshot = self.build_snapshot();
         if let Err(e) = persistence::save_consensus_state(path, &snapshot) {
-            error!(error = %e, "failed to save consensus state");
+            error!(target: "n42::cl::sync", error = %e, "failed to save consensus state");
         } else {
-            debug!(view = snapshot.current_view, "consensus state persisted");
+            debug!(target: "n42::cl::sync", view = snapshot.current_view, "consensus state persisted");
         }
     }
 
@@ -115,9 +115,9 @@ impl ConsensusOrchestrator {
 
         let snapshot = self.build_snapshot();
         if let Err(e) = persistence::save_consensus_state(path, &snapshot) {
-            error!(error = %e, "failed to persist final consensus state on shutdown");
+            error!(target: "n42::cl::sync", error = %e, "failed to persist final consensus state on shutdown");
         } else {
-            info!(view = snapshot.current_view, "final consensus state persisted");
+            info!(target: "n42::cl::sync", view = snapshot.current_view, "final consensus state persisted");
         }
     }
 
@@ -161,25 +161,26 @@ impl ConsensusOrchestrator {
 
             if timed_out {
                 warn!(
+                    target: "n42::cl::sync",
                     elapsed_secs = self.sync_started_at.map_or(0, |t| t.elapsed().as_secs()),
                     "sync request timed out, resetting"
                 );
                 self.sync_in_flight = false;
                 self.sync_started_at = None;
             } else {
-                debug!(local_view, target_view, "sync already in flight, skipping");
+                debug!(target: "n42::cl::sync", local_view, target_view, "sync already in flight, skipping");
                 return;
             }
         }
 
         let peers: Vec<_> = self.connected_peers.iter().copied().collect();
         if peers.is_empty() {
-            warn!("no connected peers for sync");
+            warn!(target: "n42::cl::sync", "no connected peers for sync");
             return;
         }
         let peer = peers[(local_view as usize) % peers.len()];
 
-        info!(%peer, local_view, target_view, "initiating state sync");
+        info!(target: "n42::cl::sync", %peer, local_view, target_view, "initiating state sync");
 
         // Cap to_view so the request doesn't exceed MAX_BLOCKS_PER_SYNC_REQUEST.
         // The peer will reject oversized ranges; capping here avoids a wasted round-trip.
@@ -191,7 +192,7 @@ impl ConsensusOrchestrator {
         };
 
         if let Err(e) = self.network.request_sync(peer, request) {
-            error!(error = %e, "failed to send sync request");
+            error!(target: "n42::cl::sync", error = %e, "failed to send sync request");
             return;
         }
 
@@ -212,11 +213,12 @@ impl ConsensusOrchestrator {
         // Validate the request range to prevent malicious peers from requesting
         // unbounded ranges.
         if let Err(reason) = request.validate() {
-            warn!(%peer, %reason, "rejecting invalid sync request");
+            warn!(target: "n42::cl::sync", %peer, %reason, "rejecting invalid sync request");
             return;
         }
 
-        info!(
+        debug!(
+            target: "n42::cl::sync",
             %peer,
             from_view = request.from_view,
             to_view = request.to_view,
@@ -244,7 +246,7 @@ impl ConsensusOrchestrator {
             .map(|b| b.view)
             .unwrap_or(0);
 
-        info!(%peer, blocks_sent = blocks.len(), peer_committed_view, "sending sync response");
+        debug!(target: "n42::cl::sync", %peer, blocks_sent = blocks.len(), peer_committed_view, "sending sync response");
 
         let response = BlockSyncResponse {
             blocks,
@@ -252,7 +254,7 @@ impl ConsensusOrchestrator {
         };
 
         if let Err(e) = self.network.send_sync_response(request_id, response) {
-            error!(error = %e, "failed to send sync response");
+            error!(target: "n42::cl::sync", error = %e, "failed to send sync response");
         }
     }
 
@@ -267,6 +269,7 @@ impl ConsensusOrchestrator {
         self.sync_started_at = None;
 
         info!(
+            target: "n42::cl::sync",
             %peer,
             blocks = response.blocks.len(),
             peer_committed_view = response.peer_committed_view,
@@ -274,14 +277,14 @@ impl ConsensusOrchestrator {
         );
 
         if response.blocks.is_empty() {
-            debug!("sync response contains no blocks");
+            debug!(target: "n42::cl::sync", "sync response contains no blocks");
             return;
         }
 
         let mut imported = 0u64;
         for sync_block in &response.blocks {
             if sync_block.payload.is_empty() {
-                debug!(view = sync_block.view, "skipping sync block with empty payload");
+                debug!(target: "n42::cl::sync", view = sync_block.view, "skipping sync block with empty payload");
                 continue;
             }
 
@@ -310,11 +313,12 @@ impl ConsensusOrchestrator {
             imported += 1;
         }
 
-        info!(imported, peer_committed_view = response.peer_committed_view, "state sync blocks imported");
+        info!(target: "n42::cl::sync", imported, peer_committed_view = response.peer_committed_view, "state sync blocks imported");
 
         let local_view = self.engine.current_view();
         if response.peer_committed_view > local_view + 3 {
             info!(
+                target: "n42::cl::sync",
                 local_view,
                 peer_committed_view = response.peer_committed_view,
                 "still behind after sync, requesting more blocks"
@@ -329,13 +333,14 @@ impl ConsensusOrchestrator {
         let vs = match &self.validator_set_for_sync {
             Some(vs) => vs,
             None => {
-                warn!("cannot verify sync blocks: no validator set configured, rejecting sync response");
+                warn!(target: "n42::cl::sync", "cannot verify sync blocks: no validator set configured, rejecting sync response");
                 return false;
             }
         };
 
         if let Err(e) = verify_commit_qc(&sync_block.commit_qc, vs) {
             warn!(
+                target: "n42::cl::sync",
                 view = sync_block.view,
                 hash = %sync_block.block_hash,
                 error = %e,
@@ -346,6 +351,7 @@ impl ConsensusOrchestrator {
 
         if sync_block.commit_qc.block_hash != sync_block.block_hash {
             warn!(
+                target: "n42::cl::sync",
                 view = sync_block.view,
                 block_hash = %sync_block.block_hash,
                 qc_hash = %sync_block.commit_qc.block_hash,
@@ -356,6 +362,7 @@ impl ConsensusOrchestrator {
 
         if sync_block.commit_qc.view != sync_block.view {
             warn!(
+                target: "n42::cl::sync",
                 block_view = sync_block.view,
                 qc_view = sync_block.commit_qc.view,
                 "sync block commit_qc view mismatch, skipping"

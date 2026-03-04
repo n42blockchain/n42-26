@@ -86,7 +86,7 @@ alloy-sol-types = { version = "1.5.6", default-features = false }
 
 # EVM
 alloy-evm = { version = "0.28.0", default-features = false }
-revm = { version = "34.0.0", default-features = false, features = ["std"] }
+revm = { version = "36.0.0", default-features = false, features = ["std"] }
 
 # Testing
 reth-testing-utils = { path = "../reth/testing/testing-utils" }

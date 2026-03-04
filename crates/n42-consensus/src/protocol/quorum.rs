@@ -104,7 +104,7 @@ impl VoteCollector {
 
         for (&idx, sig) in &self.votes {
             if idx >= self.set_size {
-                tracing::warn!(view = self.view, idx, "skipping out-of-range validator in QC build");
+                tracing::warn!(target: "n42::cl::quorum", view = self.view, idx, "skipping out-of-range validator in QC build");
                 continue;
             }
 
@@ -117,12 +117,12 @@ impl VoteCollector {
             let pk = match validator_set.get_public_key(idx) {
                 Ok(pk) => pk,
                 Err(_) => {
-                    tracing::warn!(view = self.view, idx, "skipping unknown validator in QC build");
+                    tracing::warn!(target: "n42::cl::quorum", view = self.view, idx, "skipping unknown validator in QC build");
                     continue;
                 }
             };
             if pk.verify(message, sig).is_err() {
-                tracing::warn!(view = self.view, idx, "skipping invalid signature in QC build");
+                tracing::warn!(target: "n42::cl::quorum", view = self.view, idx, "skipping invalid signature in QC build");
                 continue;
             }
             valid_sigs.push(sig);
@@ -228,7 +228,7 @@ impl TimeoutCollector {
 
         for (&idx, (sig, high_qc)) in &self.timeouts {
             if idx >= self.set_size {
-                tracing::warn!(view = self.view, idx, "skipping out-of-range validator in TC build");
+                tracing::warn!(target: "n42::cl::quorum", view = self.view, idx, "skipping out-of-range validator in TC build");
                 continue;
             }
 
@@ -244,12 +244,12 @@ impl TimeoutCollector {
             let pk = match validator_set.get_public_key(idx) {
                 Ok(pk) => pk,
                 Err(_) => {
-                    tracing::warn!(view = self.view, idx, "skipping unknown validator in TC build");
+                    tracing::warn!(target: "n42::cl::quorum", view = self.view, idx, "skipping unknown validator in TC build");
                     continue;
                 }
             };
             if pk.verify(&message, sig).is_err() {
-                tracing::warn!(view = self.view, idx, "skipping invalid timeout signature in TC build");
+                tracing::warn!(target: "n42::cl::quorum", view = self.view, idx, "skipping invalid timeout signature in TC build");
                 continue;
             }
             valid_sigs.push(sig);

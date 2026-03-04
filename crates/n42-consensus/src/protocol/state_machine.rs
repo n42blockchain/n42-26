@@ -192,7 +192,7 @@ impl ConsensusEngine {
 
         let safe_consecutive_timeouts = consecutive_timeouts.min(MAX_RECOVERED_CONSECUTIVE_TIMEOUTS);
         if safe_consecutive_timeouts != consecutive_timeouts {
-            tracing::warn!(
+            tracing::warn!(target: "n42::cl::engine",
                 original = consecutive_timeouts,
                 capped = safe_consecutive_timeouts,
                 "recovered consecutive_timeouts exceeded sanity limit, capping"
@@ -314,7 +314,7 @@ impl ConsensusEngine {
                             self.future_msg_buffer.swap_remove(min_idx);
                         }
                     }
-                    tracing::debug!(
+                    tracing::debug!(target: "n42::cl::engine",
                         current_view,
                         msg_view = view,
                         buffered = self.future_msg_buffer.len(),
@@ -348,7 +348,7 @@ impl ConsensusEngine {
             && view < current_view
             && !matches!(msg, ConsensusMessage::Decide(_) | ConsensusMessage::NewView(_))
         {
-            tracing::trace!(current_view, msg_view = view, "discarding stale consensus message");
+            tracing::trace!(target: "n42::cl::engine", current_view, msg_view = view, "discarding stale consensus message");
             return Ok(());
         }
 
@@ -414,7 +414,7 @@ impl ConsensusEngine {
             super::quorum::verify_qc(qc, self.validator_set())
         };
         if verify_result.is_err() {
-            tracing::debug!(
+            tracing::debug!(target: "n42::cl::engine",
                 current_view,
                 msg_view,
                 qc_view = qc.view,
@@ -428,7 +428,7 @@ impl ConsensusEngine {
             return Ok(false);
         }
 
-        tracing::info!(
+        tracing::info!(target: "n42::cl::engine",
             current_view,
             target_view,
             qc_view = qc.view,
@@ -468,7 +468,7 @@ impl ConsensusEngine {
         {
             let new_epoch = self.epoch_manager.current_epoch();
             let validator_count = self.validator_set().len();
-            tracing::info!(new_epoch, validator_count, view = new_view, "epoch transition at view boundary");
+            tracing::info!(target: "n42::cl::engine", new_epoch, validator_count, view = new_view, "epoch transition at view boundary");
             self.emit(EngineOutput::EpochTransition { new_epoch, validator_count })?;
         }
 
@@ -495,16 +495,16 @@ impl ConsensusEngine {
         }
 
         if !to_replay.is_empty() {
-            tracing::debug!(view = new_view, replaying = to_replay.len(), "replaying buffered future-view messages");
+            tracing::debug!(target: "n42::cl::engine", view = new_view, replaying = to_replay.len(), "replaying buffered future-view messages");
         }
 
         for msg in to_replay {
             if let Err(e) = self.dispatch_message(msg) {
-                tracing::debug!(view = new_view, error = %e, "buffered message replay failed");
+                tracing::debug!(target: "n42::cl::engine", view = new_view, error = %e, "buffered message replay failed");
             }
         }
 
-        tracing::debug!(view = new_view, "advanced to new view");
+        tracing::debug!(target: "n42::cl::engine", view = new_view, "advanced to new view");
         Ok(())
     }
 
@@ -528,11 +528,11 @@ impl ConsensusEngine {
                         std::thread::sleep(std::time::Duration::from_millis(1));
                         match self.output_tx.try_send(val) {
                             Ok(()) => {
-                                tracing::warn!(attempt, "BlockCommitted delivered after retry");
+                                tracing::warn!(target: "n42::cl::engine", attempt, "BlockCommitted delivered after retry");
                                 return Ok(());
                             }
                             Err(retry_err) => {
-                                tracing::error!(
+                                tracing::error!(target: "n42::cl::engine",
                                     attempt,
                                     "BlockCommitted retry failed: {}",
                                     retry_err
@@ -541,10 +541,10 @@ impl ConsensusEngine {
                             }
                         }
                     }
-                    tracing::error!("CRITICAL: BlockCommitted lost after 3 retries");
+                    tracing::error!(target: "n42::cl::engine", "CRITICAL: BlockCommitted lost after 3 retries");
                     Err(crate::error::ConsensusError::OutputChannelClosed)
                 } else {
-                    tracing::error!("consensus output channel full or closed: {}", first_err);
+                    tracing::error!(target: "n42::cl::engine", "consensus output channel full or closed: {}", first_err);
                     Err(crate::error::ConsensusError::OutputChannelClosed)
                 }
             }

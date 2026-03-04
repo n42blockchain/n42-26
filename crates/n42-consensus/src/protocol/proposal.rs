@@ -15,12 +15,12 @@ impl ConsensusEngine {
         let view = self.round_state.current_view();
 
         if !self.is_current_leader() {
-            tracing::debug!(view, "not leader, ignoring block ready");
+            tracing::debug!(target: "n42::cl::proposal", view, "not leader, ignoring block ready");
             return Ok(());
         }
 
         if self.round_state.phase() != Phase::WaitingForProposal {
-            tracing::debug!(view, phase = ?self.round_state.phase(), "not in proposal phase");
+            tracing::debug!(target: "n42::cl::proposal", view, phase = ?self.round_state.phase(), "not in proposal phase");
             return Ok(());
         }
 
@@ -38,7 +38,7 @@ impl ConsensusEngine {
             prepare_qc: piggybacked_qc.clone(),
         };
 
-        tracing::info!(
+        tracing::debug!(target: "n42::cl::proposal",
             view, %block_hash,
             chained = piggybacked_qc.is_some(),
             "proposing block"
@@ -99,7 +99,7 @@ impl ConsensusEngine {
         // Uses verify_qc_any_domain because justify_qc may be either a prepare QC or commit QC.
         if proposal.justify_qc.view > 0 {
             super::quorum::verify_qc_any_domain(&proposal.justify_qc, self.validator_set()).map_err(|e| {
-                tracing::warn!(
+                tracing::warn!(target: "n42::cl::proposal",
                     view, proposer = proposal.proposer, qc_view = proposal.justify_qc.view,
                     "rejecting proposal with invalid justify_qc: {e}"
                 );
@@ -120,7 +120,7 @@ impl ConsensusEngine {
         if let Some(ref piggybacked_qc) = proposal.prepare_qc {
             match super::quorum::verify_qc(piggybacked_qc, self.validator_set()) {
                 Ok(()) => {
-                    tracing::debug!(
+                    tracing::debug!(target: "n42::cl::proposal",
                         view,
                         qc_view = piggybacked_qc.view,
                         "accepted piggybacked PrepareQC from proposal"
@@ -129,7 +129,7 @@ impl ConsensusEngine {
                 }
                 Err(e) => {
                     // Invalid piggybacked QC is not fatal — the proposal itself is valid.
-                    tracing::warn!(view, error = %e, "rejected invalid piggybacked PrepareQC, ignoring");
+                    tracing::warn!(target: "n42::cl::proposal", view, error = %e, "rejected invalid piggybacked PrepareQC, ignoring");
                 }
             }
         }
@@ -139,10 +139,10 @@ impl ConsensusEngine {
 
         // If the block was already imported (BlockData arrived before Proposal), vote immediately.
         if self.imported_blocks.remove(&proposal.block_hash) {
-            tracing::debug!(view, block_hash = %proposal.block_hash, "block already imported, voting immediately");
+            tracing::debug!(target: "n42::cl::proposal", view, block_hash = %proposal.block_hash, "block already imported, voting immediately");
             self.send_vote(view, proposal.block_hash)?;
         } else {
-            tracing::debug!(view, block_hash = %proposal.block_hash, "deferring vote until block data imported");
+            tracing::debug!(target: "n42::cl::proposal", view, block_hash = %proposal.block_hash, "deferring vote until block data imported");
             self.pending_proposal = Some(PendingProposal {
                 view: proposal.view,
                 block_hash: proposal.block_hash,
@@ -167,7 +167,7 @@ impl ConsensusEngine {
         self.round_state.update_locked_qc(&pqc.qc);
         self.round_state.enter_pre_commit();
 
-        tracing::debug!(view, block_hash = %pqc.block_hash, "received valid PrepareQC, sending commit vote");
+        tracing::debug!(target: "n42::cl::proposal", view, block_hash = %pqc.block_hash, "received valid PrepareQC, sending commit vote");
 
         let commit_msg = commit_signing_message(view, &pqc.block_hash);
         let commit_sig = self.secret_key.sign(&commit_msg);
@@ -213,7 +213,7 @@ impl ConsensusEngine {
     pub(super) fn on_block_imported(&mut self, block_hash: B256) -> ConsensusResult<()> {
         if let Some(pending) = self.pending_proposal.take() {
             if pending.block_hash == block_hash {
-                tracing::debug!(view = pending.view, %block_hash, "block imported, sending deferred vote");
+                tracing::debug!(target: "n42::cl::proposal", view = pending.view, %block_hash, "block imported, sending deferred vote");
                 self.send_vote(pending.view, pending.block_hash)?;
             } else {
                 if self.imported_blocks.len() < MAX_IMPORTED_BLOCKS {

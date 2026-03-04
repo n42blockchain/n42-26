@@ -44,6 +44,7 @@ impl ConsensusOrchestrator {
         if timestamp <= self.last_committed_timestamp {
             let bumped = self.last_committed_timestamp + 1;
             warn!(
+                target: "n42::cl::exec_bridge",
                 proposed = timestamp,
                 last_committed = self.last_committed_timestamp,
                 bumped_to = bumped,
@@ -55,7 +56,7 @@ impl ConsensusOrchestrator {
         let mut withdrawals = vec![];
         if let Some(ref reward_mgr) = self.mobile_reward_manager {
             let mut mgr = reward_mgr.lock().unwrap_or_else(|e| {
-                error!("mobile_reward_manager mutex poisoned: {e}");
+                error!(target: "n42::cl::exec_bridge", "mobile_reward_manager mutex poisoned: {e}");
                 e.into_inner()
             });
             let next_block_number = self.committed_block_count + 1;
@@ -63,7 +64,7 @@ impl ConsensusOrchestrator {
             withdrawals = mgr.take_pending_rewards(next_block_number);
             if !withdrawals.is_empty() {
                 info!(
-                    target: "n42::reward",
+                    target: "n42::cl::exec_bridge",
                     count = withdrawals.len(),
                     "injecting mobile rewards as withdrawals"
                 );
@@ -82,13 +83,13 @@ impl ConsensusOrchestrator {
     /// Triggers payload building via fork_choice_updated, then spawns a task to resolve it.
     pub(super) async fn do_trigger_payload_build(&mut self, slot_timestamp: Option<u64>) {
         if self.beacon_engine.is_none() {
-            debug!("no beacon engine configured, skipping payload build");
+            debug!(target: "n42::cl::exec_bridge", "no beacon engine configured, skipping payload build");
             return;
         }
         let payload_builder = match &self.payload_builder {
             Some(pb) => pb.clone(),
             None => {
-                debug!("no payload builder configured, skipping payload build");
+                debug!(target: "n42::cl::exec_bridge", "no payload builder configured, skipping payload build");
                 return;
             }
         };
@@ -104,30 +105,30 @@ impl ConsensusOrchestrator {
             finalized_block_hash: self.head_block_hash,
         };
 
-        info!(head = %self.head_block_hash, timestamp, "triggering payload build via fork_choice_updated");
+        debug!(target: "n42::cl::exec_bridge", head = %self.head_block_hash, timestamp, "triggering payload build via fork_choice_updated");
 
         match beacon_engine
             .fork_choice_updated(fcu_state, Some(attrs), EngineApiMessageVersion::default())
             .await
         {
             Ok(result) => {
-                debug!(status = ?result.payload_status.status, "fork_choice_updated response");
+                debug!(target: "n42::cl::exec_bridge", status = ?result.payload_status.status, "fork_choice_updated response");
                 if let Some(payload_id) = result.payload_id {
                     // Record the timestamp we used so subsequent builds guarantee
                     // strictly increasing timestamps even in fast-commit scenarios.
                     self.last_committed_timestamp = self.last_committed_timestamp.max(timestamp);
-                    info!(?payload_id, "payload building started, spawning resolve task");
+                    debug!(target: "n42::cl::exec_bridge", ?payload_id, "payload building started, spawning resolve task");
                     self.spawn_payload_resolve_task(
                         beacon_engine.clone(),
                         payload_builder,
                         payload_id,
                     );
                 } else {
-                    warn!("fork_choice_updated did not return payload_id");
+                    warn!(target: "n42::cl::exec_bridge", "fork_choice_updated did not return payload_id");
                 }
             }
             Err(e) => {
-                error!(error = %e, "fork_choice_updated failed");
+                error!(target: "n42::cl::exec_bridge", error = %e, "fork_choice_updated failed");
             }
         }
     }
@@ -157,7 +158,7 @@ impl ConsensusOrchestrator {
             let payload_opt = match resolve_result {
                 Ok(result) => result,
                 Err(_) => {
-                    error!("payload build timed out after {}s", PAYLOAD_BUILD_TIMEOUT.as_secs());
+                    error!(target: "n42::cl::exec_bridge", "payload build timed out after {}s", PAYLOAD_BUILD_TIMEOUT.as_secs());
                     return;
                 }
             };
@@ -175,19 +176,19 @@ impl ConsensusOrchestrator {
                     )
                     .await;
                 }
-                Some(Err(e)) => error!(error = %e, "payload build failed"),
-                None => warn!("payload not found (already resolved or expired)"),
+                Some(Err(e)) => error!(target: "n42::cl::exec_bridge", error = %e, "payload build failed"),
+                None => warn!(target: "n42::cl::exec_bridge", "payload not found (already resolved or expired)"),
             }
         });
     }
 
     /// Handles incoming block data from the leader, caching and pre-importing.
     pub(super) async fn handle_block_data(&mut self, data: Vec<u8>) {
-        debug!(bytes = data.len(), "handle_block_data called");
+        debug!(target: "n42::cl::exec_bridge", bytes = data.len(), "handle_block_data called");
         let broadcast: BlockDataBroadcast = match bincode::deserialize(&data) {
             Ok(b) => b,
             Err(e) => {
-                warn!("invalid block data broadcast: {e}");
+                warn!(target: "n42::cl::exec_bridge", "invalid block data broadcast: {e}");
                 return;
             }
         };
@@ -203,7 +204,7 @@ impl ConsensusOrchestrator {
         self.pending_block_data.insert(hash, data);
 
         // Pre-import so the block is in reth when the Proposal arrives.
-        debug!(%hash, "speculative pre-import");
+        debug!(target: "n42::cl::exec_bridge", %hash, "speculative pre-import");
         self.import_and_notify(broadcast).await;
     }
 
@@ -216,7 +217,7 @@ impl ConsensusOrchestrator {
         let broadcast: BlobSidecarBroadcast = match bincode::deserialize(&data) {
             Ok(b) => b,
             Err(e) => {
-                warn!(error = %e, "invalid blob sidecar broadcast");
+                warn!(target: "n42::cl::exec_bridge", error = %e, "invalid blob sidecar broadcast");
                 return;
             }
         };
@@ -228,16 +229,17 @@ impl ConsensusOrchestrator {
             ) {
                 Ok(sidecar) => {
                     if let Err(e) = blob_store.insert(tx_hash, sidecar) {
-                        debug!(%tx_hash, error = %e, "failed to insert blob sidecar");
+                        debug!(target: "n42::cl::exec_bridge", %tx_hash, error = %e, "failed to insert blob sidecar");
                     }
                 }
                 Err(e) => {
-                    warn!(%tx_hash, error = %e, "failed to decode blob sidecar RLP");
+                    warn!(target: "n42::cl::exec_bridge", %tx_hash, error = %e, "failed to decode blob sidecar RLP");
                 }
             }
         }
 
         debug!(
+            target: "n42::cl::exec_bridge",
             block_hash = %broadcast.block_hash,
             sidecars = sidecar_count,
             "processed blob sidecar broadcast"
@@ -255,7 +257,7 @@ impl ConsensusOrchestrator {
         let parsed_value: serde_json::Value = match serde_json::from_slice(&broadcast.payload_json) {
             Ok(v) => v,
             Err(e) => {
-                warn!(hash = %broadcast.block_hash, "failed to deserialize execution payload: {e}");
+                warn!(target: "n42::cl::exec_bridge", hash = %broadcast.block_hash, "failed to deserialize execution payload: {e}");
                 return;
             }
         };
@@ -271,7 +273,7 @@ impl ConsensusOrchestrator {
         let execution_data = match serde_json::from_value(parsed_value) {
             Ok(data) => data,
             Err(e) => {
-                warn!(hash = %broadcast.block_hash, "failed to convert execution payload from Value: {e}");
+                warn!(target: "n42::cl::exec_bridge", hash = %broadcast.block_hash, "failed to convert execution payload from Value: {e}");
                 return;
             }
         };
@@ -284,6 +286,7 @@ impl ConsensusOrchestrator {
                     self.queue_syncing_block(&broadcast);
                 } else {
                     warn!(
+                        target: "n42::cl::exec_bridge",
                         hash = %broadcast.block_hash,
                         status = ?status.status,
                         "new_payload rejected block"
@@ -291,7 +294,7 @@ impl ConsensusOrchestrator {
                 }
             }
             Err(e) => {
-                error!(hash = %broadcast.block_hash, error = %e, "new_payload failed");
+                error!(target: "n42::cl::exec_bridge", hash = %broadcast.block_hash, error = %e, "new_payload failed");
             }
         }
     }
@@ -306,6 +309,7 @@ impl ConsensusOrchestrator {
             && *valid_hash != broadcast.block_hash
         {
             warn!(
+                target: "n42::cl::exec_bridge",
                 expected = %broadcast.block_hash,
                 engine_hash = %valid_hash,
                 "block hash mismatch between broadcast and engine, skipping"
@@ -313,7 +317,7 @@ impl ConsensusOrchestrator {
             return;
         }
 
-        info!(hash = %broadcast.block_hash, "block imported from leader");
+        debug!(target: "n42::cl::exec_bridge", hash = %broadcast.block_hash, "block imported from leader");
 
         let fcu_state = ForkchoiceState {
             head_block_hash: broadcast.block_hash,
@@ -325,6 +329,7 @@ impl ConsensusOrchestrator {
             .await
         {
             error!(
+                target: "n42::cl::exec_bridge",
                 hash = %broadcast.block_hash,
                 error = %e,
                 "fork_choice_updated failed for imported block"
@@ -338,7 +343,7 @@ impl ConsensusOrchestrator {
             .engine
             .process_event(ConsensusEvent::BlockImported(broadcast.block_hash))
         {
-            error!(error = %e, "error processing BlockImported");
+            error!(target: "n42::cl::exec_bridge", error = %e, "error processing BlockImported");
         }
 
         if !self.syncing_blocks.is_empty() {
@@ -353,6 +358,7 @@ impl ConsensusOrchestrator {
         };
 
         info!(
+            target: "n42::cl::exec_bridge",
             view = deferred_view,
             hash = %broadcast.block_hash,
             "completing deferred finalization"
@@ -364,11 +370,12 @@ impl ConsensusOrchestrator {
         if let Some(ref tx) = self.mobile_packet_tx
             && let Err(e) = tx.try_send((broadcast.block_hash, deferred_view))
         {
-            warn!(view = deferred_view, hash = %broadcast.block_hash, error = %e, "mobile_packet_tx full or closed, deferred verification packet lost");
+            warn!(target: "n42::cl::exec_bridge", view = deferred_view, hash = %broadcast.block_hash, error = %e, "mobile_packet_tx full or closed, deferred verification packet lost");
         }
 
         if self.engine.is_current_leader() {
-            info!(
+            debug!(
+                target: "n42::cl::exec_bridge",
                 next_view = self.engine.current_view(),
                 "leader for next view, triggering payload build"
             );
@@ -377,7 +384,7 @@ impl ConsensusOrchestrator {
     }
 
     fn queue_syncing_block(&mut self, broadcast: &BlockDataBroadcast) {
-        info!(hash = %broadcast.block_hash, "new_payload returned Syncing, queuing for retry");
+        info!(target: "n42::cl::exec_bridge", hash = %broadcast.block_hash, "new_payload returned Syncing, queuing for retry");
         if let Ok(data) = bincode::serialize(broadcast) {
             if self.syncing_blocks.len() >= MAX_SYNCING_QUEUE_SIZE {
                 self.syncing_blocks.pop_front();
@@ -388,7 +395,7 @@ impl ConsensusOrchestrator {
 
     async fn retry_syncing_blocks(&mut self, engine_handle: &ConsensusEngineHandle<EthEngineTypes>) {
         let queued: Vec<(Vec<u8>, u32)> = self.syncing_blocks.drain(..).collect();
-        info!(count = queued.len(), "retrying previously-syncing blocks");
+        info!(target: "n42::cl::exec_bridge", count = queued.len(), "retrying previously-syncing blocks");
 
         const MAX_SYNCING_RETRIES: u32 = 3;
 
@@ -401,7 +408,7 @@ impl ConsensusOrchestrator {
             let retry_exec = match serde_json::from_slice(&retry_broadcast.payload_json) {
                 Ok(d) => d,
                 Err(e) => {
-                    warn!(%retry_hash, error = %e, "failed to deserialize retry payload");
+                    warn!(target: "n42::cl::exec_bridge", %retry_hash, error = %e, "failed to deserialize retry payload");
                     continue;
                 }
             };
@@ -413,7 +420,7 @@ impl ConsensusOrchestrator {
                         PayloadStatusEnum::Valid | PayloadStatusEnum::Accepted
                     ) =>
                 {
-                    info!(%retry_hash, "syncing block retry succeeded");
+                    info!(target: "n42::cl::exec_bridge", %retry_hash, "syncing block retry succeeded");
                     let fcu = ForkchoiceState {
                         head_block_hash: retry_hash,
                         safe_block_hash: retry_hash,
@@ -427,23 +434,23 @@ impl ConsensusOrchestrator {
                         .engine
                         .process_event(ConsensusEvent::BlockImported(retry_hash))
                     {
-                        error!(error = %e, "error processing BlockImported for retry");
+                        error!(target: "n42::cl::exec_bridge", error = %e, "error processing BlockImported for retry");
                     }
                 }
                 Ok(rs) if matches!(rs.status, PayloadStatusEnum::Syncing) => {
                     let next_retry = retry_count + 1;
                     if next_retry >= MAX_SYNCING_RETRIES {
-                        warn!(%retry_hash, retries = next_retry, "syncing block exceeded max retries, dropping");
+                        warn!(target: "n42::cl::exec_bridge", %retry_hash, retries = next_retry, "syncing block exceeded max retries, dropping");
                     } else {
-                        debug!(%retry_hash, retry = next_retry, "retry still Syncing, re-queuing");
+                        debug!(target: "n42::cl::exec_bridge", %retry_hash, retry = next_retry, "retry still Syncing, re-queuing");
                         self.syncing_blocks.push_back((data, next_retry));
                     }
                 }
                 Ok(rs) => {
-                    warn!(%retry_hash, status = ?rs.status, "retry rejected");
+                    warn!(target: "n42::cl::exec_bridge", %retry_hash, status = ?rs.status, "retry rejected");
                 }
                 Err(e) => {
-                    warn!(%retry_hash, error = %e, "retry new_payload failed");
+                    warn!(target: "n42::cl::exec_bridge", %retry_hash, error = %e, "retry new_payload failed");
                 }
             }
         }
@@ -469,7 +476,7 @@ async fn handle_built_payload(
     let payload_json = match serde_json::to_vec(&execution_data) {
         Ok(json) => json,
         Err(e) => {
-            error!(%hash, error = %e, "CRITICAL: failed to serialize execution payload");
+            error!(target: "n42::cl::exec_bridge", %hash, error = %e, "CRITICAL: failed to serialize execution payload");
             return;
         }
     };
@@ -477,7 +484,7 @@ async fn handle_built_payload(
     match engine_handle.new_payload(execution_data).await {
         Ok(status) => match status.status {
             PayloadStatusEnum::Valid | PayloadStatusEnum::Accepted => {
-                info!(%hash, status = ?status.status, "newPayload valid, broadcasting block data");
+                debug!(target: "n42::cl::exec_bridge", %hash, status = ?status.status, "newPayload valid, broadcasting block data");
 
                 broadcast_block_data(&network, &leader_payload_tx, hash, current_view, &payload_json);
 
@@ -487,11 +494,11 @@ async fn handle_built_payload(
                 broadcast_blob_sidecars(&network, &payload, hash, current_view, blob_store);
             }
             _ => {
-                error!(%hash, status = ?status.status, "newPayload returned non-valid status");
+                error!(target: "n42::cl::exec_bridge", %hash, status = ?status.status, "newPayload returned non-valid status");
             }
         },
         Err(e) => {
-            error!(%hash, error = %e, "newPayload failed");
+            error!(target: "n42::cl::exec_bridge", %hash, error = %e, "newPayload failed");
         }
     }
 }
@@ -513,14 +520,14 @@ fn broadcast_block_data(
     };
     match bincode::serialize(&broadcast) {
         Ok(encoded) => {
-            info!(%hash, bytes = encoded.len(), "broadcasting block data to followers");
+            debug!(target: "n42::cl::exec_bridge", %hash, bytes = encoded.len(), "broadcasting block data to followers");
             if let Err(e) = network.announce_block(encoded.clone()) {
-                warn!(error = %e, "failed to broadcast block data");
+                warn!(target: "n42::cl::exec_bridge", error = %e, "failed to broadcast block data");
             }
             let _ = leader_payload_tx.send((hash, encoded));
         }
         Err(e) => {
-            error!(error = %e, "failed to serialize block data broadcast");
+            error!(target: "n42::cl::exec_bridge", error = %e, "failed to serialize block data broadcast");
         }
     }
 }
@@ -568,15 +575,15 @@ fn broadcast_blob_sidecars(
             };
 
             if let Ok(encoded) = bincode::serialize(&broadcast) {
-                info!(%hash, blob_count = sidecar_count, bytes = encoded.len(), "broadcasting blob sidecars");
+                debug!(target: "n42::cl::exec_bridge", %hash, blob_count = sidecar_count, bytes = encoded.len(), "broadcasting blob sidecars");
                 if let Err(e) = network.broadcast_blob_sidecar(encoded) {
-                    warn!(error = %e, "failed to broadcast blob sidecars");
+                    warn!(target: "n42::cl::exec_bridge", error = %e, "failed to broadcast blob sidecars");
                 }
             }
         }
         Ok(_) => {}
         Err(e) => {
-            warn!(%hash, error = %e, "failed to get blob sidecars from store");
+            warn!(target: "n42::cl::exec_bridge", %hash, error = %e, "failed to get blob sidecars from store");
         }
     }
 }

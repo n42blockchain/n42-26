@@ -22,12 +22,12 @@ impl ConsensusEngine {
         if self.round_state.phase() == Phase::TimedOut {
             // Already timed out in this view: own timeout was already broadcast.
             // Only reset the pacemaker deadline so the select! loop doesn't spin.
-            tracing::warn!(view, "view timed out (repeat, resetting pacemaker only)");
+            tracing::warn!(target: "n42::cl::timeout", view, "view timed out (repeat, resetting pacemaker only)");
             self.pacemaker.reset_for_view(view, self.round_state.consecutive_timeouts());
             return Ok(());
         }
 
-        tracing::warn!(view, "view timed out");
+        tracing::warn!(target: "n42::cl::timeout", view, "view timed out");
         self.round_state.timeout();
 
         // Reset pacemaker BEFORE processing to prevent the select! loop from spinning
@@ -81,7 +81,7 @@ impl ConsensusEngine {
         // Verify the embedded high_qc to prevent Byzantine validators from injecting
         // forged QCs that could manipulate the locked_qc via TC formation.
         self.verify_embedded_qc(&timeout.high_qc).map_err(|e| {
-            tracing::warn!(view, sender = timeout.sender, qc_view = timeout.high_qc.view,
+            tracing::warn!(target: "n42::cl::timeout", view, sender = timeout.sender, qc_view = timeout.high_qc.view,
                 "rejecting timeout with invalid high_qc: {e}");
             e
         })?;
@@ -98,7 +98,7 @@ impl ConsensusEngine {
         match collector.add_verified_timeout(timeout.sender, timeout.signature, timeout.high_qc) {
             Ok(()) => {}
             Err(ConsensusError::DuplicateVote { .. }) => {
-                tracing::debug!(
+                tracing::debug!(target: "n42::cl::timeout",
                     view,
                     sender = timeout.sender,
                     "ignoring duplicate timeout (GossipSub multi-path)"
@@ -108,7 +108,7 @@ impl ConsensusEngine {
             Err(e) => return Err(e),
         }
 
-        tracing::debug!(
+        tracing::debug!(target: "n42::cl::timeout",
             view,
             sender = timeout.sender,
             count = collector.timeout_count(),
@@ -145,13 +145,13 @@ impl ConsensusEngine {
         // Verify the embedded high_qc to prevent Byzantine validators from injecting
         // forged QCs via future-view timeouts.
         self.verify_embedded_qc(&timeout.high_qc).map_err(|e| {
-            tracing::warn!(current_view, timeout_view = timeout.view, sender = timeout.sender,
+            tracing::warn!(target: "n42::cl::timeout", current_view, timeout_view = timeout.view, sender = timeout.sender,
                 qc_view = timeout.high_qc.view,
                 "rejecting future timeout with invalid high_qc: {e}");
             e
         })?;
 
-        tracing::info!(
+        tracing::info!(target: "n42::cl::timeout",
             current_view,
             timeout_view = timeout.view,
             sender = timeout.sender,
@@ -180,7 +180,7 @@ impl ConsensusEngine {
             ) {
                 Ok(()) => {}
                 Err(ConsensusError::DuplicateVote { .. }) => {
-                    tracing::debug!(
+                    tracing::debug!(target: "n42::cl::timeout",
                         view = timeout.view,
                         sender = timeout.sender,
                         "ignoring duplicate timeout (GossipSub multi-path)"
@@ -247,7 +247,7 @@ impl ConsensusEngine {
 
         self.round_state.update_locked_qc(&nv.timeout_cert.high_qc);
 
-        tracing::info!(old_view = view, new_view = nv.view, "received NewView, advancing");
+        tracing::info!(target: "n42::cl::timeout", old_view = view, new_view = nv.view, "received NewView, advancing");
 
         self.advance_to_view(nv.view)?;
         // Use actual view after advance: buffered-message replay may push view beyond nv.view.
@@ -267,12 +267,12 @@ impl ConsensusEngine {
         let tc = match self.timeout_collector.as_ref() {
             Some(c) => c.build_tc(self.validator_set())?,
             None => {
-                tracing::warn!(view = current_view, "timeout_collector disappeared during TC formation");
+                tracing::warn!(target: "n42::cl::timeout", view = current_view, "timeout_collector disappeared during TC formation");
                 return Ok(());
             }
         };
 
-        tracing::info!(
+        tracing::info!(target: "n42::cl::timeout",
             view = current_view,
             "TC formed, I am the new leader for view {}", next_view
         );

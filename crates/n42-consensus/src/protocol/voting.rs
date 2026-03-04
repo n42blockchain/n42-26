@@ -24,7 +24,7 @@ impl ConsensusEngine {
         // is Byzantine behavior.
         if let Some(&prev_hash) = self.equivocation_tracker.get(&vote.voter) {
             if prev_hash != vote.block_hash {
-                tracing::warn!(
+                tracing::warn!(target: "n42::cl::voting",
                     view,
                     validator = vote.voter,
                     %prev_hash,
@@ -50,7 +50,7 @@ impl ConsensusEngine {
         };
 
         if vote.block_hash != expected_hash {
-            tracing::debug!(view, voter = vote.voter, "ignoring vote for different block");
+            tracing::debug!(target: "n42::cl::voting", view, voter = vote.voter, "ignoring vote for different block");
             return Ok(());
         }
 
@@ -65,13 +65,13 @@ impl ConsensusEngine {
         let collector = match self.vote_collector.as_mut() {
             Some(c) => c,
             None => {
-                tracing::warn!(view, "vote_collector not initialized, ignoring vote");
+                tracing::warn!(target: "n42::cl::voting", view, "vote_collector not initialized, ignoring vote");
                 return Ok(());
             }
         };
         collector.add_verified_vote(vote.voter, vote.signature)?;
 
-        tracing::debug!(
+        tracing::debug!(target: "n42::cl::voting",
             view,
             voter = vote.voter,
             count = collector.vote_count(),
@@ -100,13 +100,13 @@ impl ConsensusEngine {
         let collector = match self.vote_collector.as_ref() {
             Some(c) => c,
             None => {
-                tracing::warn!(view, "vote_collector not initialized in try_form_prepare_qc");
+                tracing::warn!(target: "n42::cl::voting", view, "vote_collector not initialized in try_form_prepare_qc");
                 return Ok(());
             }
         };
         let qc = collector.build_qc(self.validator_set())?;
 
-        tracing::info!(view, signers = qc.signer_count(), "QC formed, entering pre-commit");
+        tracing::debug!(target: "n42::cl::voting", view, signers = qc.signer_count(), "QC formed, entering pre-commit");
 
         self.prepare_qc = Some(qc.clone());
         self.round_state.enter_pre_commit();
@@ -147,7 +147,7 @@ impl ConsensusEngine {
         };
 
         if cv.block_hash != expected_hash {
-            tracing::debug!(view, voter = cv.voter, "ignoring commit vote for different block");
+            tracing::debug!(target: "n42::cl::voting", view, voter = cv.voter, "ignoring commit vote for different block");
             return Ok(());
         }
 
@@ -161,13 +161,13 @@ impl ConsensusEngine {
         let collector = match self.commit_collector.as_mut() {
             Some(c) => c,
             None => {
-                tracing::warn!(view, "commit_collector not initialized, ignoring commit vote");
+                tracing::warn!(target: "n42::cl::voting", view, "commit_collector not initialized, ignoring commit vote");
                 return Ok(());
             }
         };
         collector.add_verified_vote(cv.voter, cv.signature)?;
 
-        tracing::debug!(
+        tracing::debug!(target: "n42::cl::voting",
             view,
             voter = cv.voter,
             count = collector.vote_count(),
@@ -201,7 +201,7 @@ impl ConsensusEngine {
         let commit_msg = commit_signing_message(view, &block_hash);
         let commit_qc = collector.build_qc_with_message(self.validator_set(), &commit_msg)?;
 
-        tracing::info!(view, %block_hash, "block committed!");
+        tracing::info!(target: "n42::cl::voting", view, %block_hash, "block committed!");
 
         self.round_state.commit(commit_qc.clone());
 

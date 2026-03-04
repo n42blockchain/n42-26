@@ -13,7 +13,7 @@ impl ConsensusEngine {
         let current_view = self.round_state.current_view();
 
         if decide.view < current_view {
-            tracing::debug!(decide_view = decide.view, current_view, "ignoring stale Decide");
+            tracing::debug!(target: "n42::cl::decision", decide_view = decide.view, current_view, "ignoring stale Decide");
             return Ok(());
         }
 
@@ -46,7 +46,7 @@ impl ConsensusEngine {
 
         const SYNC_GAP_THRESHOLD: u64 = 3;
         if decide.view > current_view + SYNC_GAP_THRESHOLD {
-            tracing::warn!(
+            tracing::warn!(target: "n42::cl::decision",
                 current_view,
                 decide_view = decide.view,
                 gap = decide.view - current_view,
@@ -58,7 +58,7 @@ impl ConsensusEngine {
             })?;
         }
 
-        tracing::info!(view = decide.view, %decide.block_hash, "received Decide, committing block");
+        tracing::info!(target: "n42::cl::decision", view = decide.view, %decide.block_hash, "received Decide, committing block");
 
         self.round_state.update_locked_qc(&decide.commit_qc);
         self.round_state.commit(decide.commit_qc.clone());

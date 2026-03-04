@@ -13,7 +13,7 @@ use n42_node::epoch_schedule::EpochSchedule;
 use n42_node::persistence;
 use n42_node::rpc::{N42ApiServer, N42RpcServer};
 use n42_node::tx_bridge::TxPoolBridge;
-use n42_node::{ConsensusOrchestrator, N42Node, SharedConsensusState};
+use n42_node::{ConsensusOrchestrator, ObserverOrchestrator, N42Node, SharedConsensusState};
 use n42_primitives::BlsSecretKey;
 use reth_chainspec::ChainSpecProvider;
 use reth_ethereum_cli::chainspec::EthereumChainSpecParser;
@@ -41,6 +41,42 @@ fn override_timeout_from_env(name: &str, target: &mut u64) {
         *target = ms;
     } else if std::env::var(name).is_ok() {
         warn!(target: "n42::cli", env = name, "env var is not a valid u64, ignoring");
+    }
+}
+
+/// Connects to trusted peers specified in the `N42_TRUSTED_PEERS` environment variable.
+///
+/// The variable should contain a comma-separated list of libp2p multiaddrs.
+/// Each peer is dialed and registered for automatic reconnection + Kademlia.
+fn connect_trusted_peers(net_handle: &n42_network::NetworkHandle) {
+    let trusted_peers_str = std::env::var("N42_TRUSTED_PEERS").unwrap_or_default();
+    for peer_addr_str in trusted_peers_str.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        match peer_addr_str.parse::<libp2p::Multiaddr>() {
+            Ok(addr) => {
+                let maybe_peer_id = addr.iter().find_map(|proto| match proto {
+                    libp2p::multiaddr::Protocol::P2p(peer_id) => Some(peer_id),
+                    _ => None,
+                });
+
+                if let Err(e) = net_handle.dial(addr.clone()) {
+                    warn!(target: "n42::cli", error = %e, %addr, "failed to dial trusted peer");
+                } else {
+                    info!(target: "n42::cli", %addr, "dialing trusted peer");
+                }
+
+                if let Some(peer_id) = maybe_peer_id {
+                    if let Err(e) = net_handle.register_peer(peer_id, vec![addr.clone()], true) {
+                        warn!(target: "n42::cli", error = %e, "failed to register trusted peer for reconnection");
+                    }
+                    if let Err(e) = net_handle.add_kademlia_peer(peer_id, vec![addr]) {
+                        warn!(target: "n42::cli", error = %e, "failed to add trusted peer to kademlia");
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(target: "n42::cli", error = %e, addr = peer_addr_str, "invalid trusted peer multiaddr");
+            }
+        }
     }
 }
 
@@ -269,6 +305,61 @@ fn main() {
                     "starting N42 consensus subsystem"
                 );
 
+                // ── Observer mode ──────────────────────────────────────
+                if env_bool("N42_OBSERVER_MODE") {
+                    info!(target: "n42::cli", "Starting in OBSERVER mode (no consensus participation)");
+
+                    let keypair = libp2p::identity::Keypair::generate_ed25519();
+                    let local_peer_id = keypair.public().to_peer_id();
+                    info!(target: "n42::cli", %local_peer_id, "Observer P2P identity (random)");
+
+                    let mut transport_config =
+                        TransportConfig::for_network_size(validator_set.len() as usize);
+                    transport_config.enable_mdns = env_bool("N42_ENABLE_MDNS");
+                    transport_config.enable_kademlia = env_bool("N42_ENABLE_DHT");
+
+                    let swarm =
+                        build_swarm_with_validator_index(keypair, transport_config, None)
+                            .expect("Failed to build libp2p swarm");
+
+                    let (mut net_service, net_handle, net_event_rx) =
+                        NetworkService::new(swarm).expect("Failed to create NetworkService");
+
+                    let consensus_port: u16 = env_parse("N42_CONSENSUS_PORT").unwrap_or(9400);
+                    let listen_addr: libp2p::Multiaddr =
+                        format!("/ip4/0.0.0.0/udp/{}/quic-v1", consensus_port).parse().unwrap();
+
+                    if let Err(e) = net_service.listen_on(listen_addr.clone()) {
+                        warn!(target: "n42::cli", error = %e, %listen_addr, "Failed to listen on consensus P2P address");
+                    } else {
+                        info!(target: "n42::cli", %listen_addr, "Observer P2P listening");
+                    }
+
+                    task_executor.spawn_critical_task(
+                        "n42-p2p-network",
+                        Box::pin(net_service.run()),
+                    );
+
+                    connect_trusted_peers(&net_handle);
+
+                    let observer = ObserverOrchestrator::new(
+                        net_handle,
+                        net_event_rx,
+                        beacon_engine_handle,
+                        head_block_hash,
+                    ).with_validator_set(validator_set)
+                     .with_blob_store(full_node.pool.blob_store().clone());
+
+                    task_executor.spawn_critical_task(
+                        "n42-observer-orchestrator",
+                        Box::pin(observer.run()),
+                    );
+
+                    info!(target: "n42::cli", "Observer node started — EL sync via reth eth P2P, CL data via GossipSub");
+                    return Ok(());
+                }
+
+                // ── Normal consensus mode ──────────────────────────────
                 let keypair = derive_ed25519_keypair(my_index);
                 let local_peer_id = keypair.public().to_peer_id();
                 info!(target: "n42::cli", %local_peer_id, "P2P identity (deterministic)");
@@ -306,35 +397,7 @@ fn main() {
                     Box::pin(net_service.run()),
                 );
 
-                let trusted_peers_str = std::env::var("N42_TRUSTED_PEERS").unwrap_or_default();
-                for peer_addr_str in trusted_peers_str.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-                    match peer_addr_str.parse::<libp2p::Multiaddr>() {
-                        Ok(addr) => {
-                            let maybe_peer_id = addr.iter().find_map(|proto| match proto {
-                                libp2p::multiaddr::Protocol::P2p(peer_id) => Some(peer_id),
-                                _ => None,
-                            });
-
-                            if let Err(e) = net_handle.dial(addr.clone()) {
-                                warn!(target: "n42::cli", error = %e, %addr, "failed to dial trusted peer");
-                            } else {
-                                info!(target: "n42::cli", %addr, "dialing trusted peer");
-                            }
-
-                            if let Some(peer_id) = maybe_peer_id {
-                                if let Err(e) = net_handle.register_peer(peer_id, vec![addr.clone()], true) {
-                                    warn!(target: "n42::cli", error = %e, "failed to register trusted peer for reconnection");
-                                }
-                                if let Err(e) = net_handle.add_kademlia_peer(peer_id, vec![addr]) {
-                                    warn!(target: "n42::cli", error = %e, "failed to add trusted peer to kademlia");
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            warn!(target: "n42::cli", error = %e, addr = peer_addr_str, "invalid trusted peer multiaddr");
-                        }
-                    }
-                }
+                connect_trusted_peers(&net_handle);
 
                 // Auto-connect to higher-index validators only (i < j initiates the connection),
                 // avoiding duplicate connections. Port convention: base_port + validator_index.
