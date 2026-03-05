@@ -148,7 +148,12 @@ impl MobileVerificationBridge {
                     match event {
                         HubEvent::PhoneConnected { session_id, verifier_pubkey } => {
                             // Check registration status before authorizing
-                            let registered = if let Some(ref staking_mgr) = self.staking_manager {
+                            let open_verification = std::env::var("N42_OPEN_VERIFICATION")
+                                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                                .unwrap_or(false);
+                            let registered = if open_verification {
+                                true // Open verification mode: accept all verifiers
+                            } else if let Some(ref staking_mgr) = self.staking_manager {
                                 let mgr = staking_mgr.lock().unwrap_or_else(|e| e.into_inner());
                                 mgr.is_registered(&verifier_pubkey)
                             } else {

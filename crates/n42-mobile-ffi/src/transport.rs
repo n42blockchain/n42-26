@@ -29,10 +29,11 @@ pub(crate) async fn connect_quic(
     (quinn::Connection, Arc<Mutex<VecDeque<Vec<u8>>>>),
     Box<dyn std::error::Error + Send + Sync>,
 > {
-    let crypto = rustls::ClientConfig::builder()
+    let mut crypto = rustls::ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(PinnedCertVerification { expected_hash: expected_cert_hash }))
         .with_no_client_auth();
+    crypto.alpn_protocols = vec![b"n42-mobile/1".to_vec()];
 
     let mut transport = quinn::TransportConfig::default();
     transport.max_idle_timeout(Some(

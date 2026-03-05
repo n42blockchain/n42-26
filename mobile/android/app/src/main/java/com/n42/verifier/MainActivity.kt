@@ -32,8 +32,8 @@ data class LogEntry(
 class VerifierViewModel : ViewModel() {
     var isConnected by mutableStateOf(false)
         private set
-    var serverHost by mutableStateOf("192.168.1.100")
-    var serverPort by mutableStateOf("9443")
+    var serverHost by mutableStateOf("192.168.0.56")
+    var serverPort by mutableStateOf("9500")
     var blsKeyHex by mutableStateOf("")
         private set
     var blocksVerified by mutableStateOf(0L)
@@ -54,9 +54,14 @@ class VerifierViewModel : ViewModel() {
 
     fun initialize() {
         viewModelScope.launch(Dispatchers.IO) {
-            val v = N42Verifier.create() ?: return@launch
+            android.util.Log.i("N42Verifier", "Initializing verifier...")
+            val v = N42Verifier.create() ?: run {
+                android.util.Log.e("N42Verifier", "Failed to create verifier!")
+                return@launch
+            }
             verifier = v
             blsKeyHex = v.getPublicKeyHex()
+            android.util.Log.i("N42Verifier", "Verifier initialized, BLS key: ${blsKeyHex.take(16)}...")
             statusText = "Ready"
         }
     }
@@ -68,7 +73,9 @@ class VerifierViewModel : ViewModel() {
 
         viewModelScope.launch(Dispatchers.IO) {
             statusText = "Connecting..."
+            android.util.Log.i("N42Verifier", "Connecting to $host:$port ...")
             val ok = v.connect(host, port)
+            android.util.Log.i("N42Verifier", "Connect result: $ok")
             isConnected = ok
             statusText = if (ok) "Connected" else "Connection failed"
 

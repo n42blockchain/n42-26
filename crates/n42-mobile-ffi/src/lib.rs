@@ -78,7 +78,25 @@ impl FfiError {
             Self::VerifyFailed(_) => 2,
             Self::SerializeFailed(_) => 3,
         };
+        let msg = format!("FFI error (code={}): {}", code, self);
         warn!(code, error = %self, "FFI error");
+        #[cfg(target_os = "android")]
+        {
+            if let Ok(tag) = std::ffi::CString::new("N42-FFI") {
+                if let Ok(cmsg) = std::ffi::CString::new(msg.as_str()) {
+                    unsafe {
+                        unsafe extern "C" {
+                            fn __android_log_write(prio: i32, tag: *const c_char, text: *const c_char) -> i32;
+                        }
+                        __android_log_write(6, tag.as_ptr() as *const c_char, cmsg.as_ptr() as *const c_char); // 6 = ERROR
+                    }
+                }
+            }
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            let _ = msg;
+        }
         code
     }
 }
@@ -184,7 +202,20 @@ pub unsafe extern "C" fn n42_connect(
     };
 
     let pubkey_bytes = ctx.pubkey_bytes;
-    match ctx.runtime.block_on(connect_quic(&host_str, port, &pubkey_bytes, expected_cert_hash)) {
+    // Log connection attempt details for debugging
+    info!(host = %host_str, port, cert_pinned = expected_cert_hash.is_some(), "attempting QUIC connection");
+    let connect_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ctx.runtime.block_on(connect_quic(&host_str, port, &pubkey_bytes, expected_cert_hash))
+    }));
+    let connect_result = match connect_result {
+        Ok(r) => r,
+        Err(panic_err) => {
+            let msg = format!("panic in connect_quic: {:?}", panic_err);
+            error!("{}", msg);
+            return FfiError::ConnectFailed(msg.into()).into_code();
+        }
+    };
+    match connect_result {
         Ok((connection, pending_packets)) => {
             let conn_clone = connection.clone();
             let packets_clone = pending_packets.clone();

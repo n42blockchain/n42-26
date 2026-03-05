@@ -493,6 +493,7 @@ start_validators() {
         N42_DAILY_BASE_REWARD_GWEI="100000000" \
         N42_REWARD_CURVE_K="4.0" \
         N42_MIN_ATTESTATION_THRESHOLD="1" \
+        N42_OPEN_VERIFICATION="1" \
         "$BINARY" node \
             --chain "$GENESIS_FILE" \
             --datadir "$datadir" \

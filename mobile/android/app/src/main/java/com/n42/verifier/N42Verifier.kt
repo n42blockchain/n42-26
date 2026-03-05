@@ -27,7 +27,7 @@ class N42Verifier private constructor(private val nativePtr: Long) {
 
         // Native methods (JNI)
         @JvmStatic private external fun nativeInit(chainId: Long): Long
-        @JvmStatic private external fun nativeConnect(ptr: Long, host: String, port: Int): Int
+        @JvmStatic private external fun nativeConnect(ptr: Long, host: String, port: Int, certHash: ByteArray): Int
         @JvmStatic private external fun nativePollPacket(ptr: Long, buffer: ByteArray): Int
         @JvmStatic private external fun nativeVerifyAndSend(ptr: Long, data: ByteArray): Int
         @JvmStatic private external fun nativeLastVerifyInfo(ptr: Long): String?
@@ -43,8 +43,10 @@ class N42Verifier private constructor(private val nativePtr: Long) {
     /**
      * Connect to a StarHub QUIC server.
      */
-    fun connect(host: String, port: Int = 9443): Boolean {
-        val result = nativeConnect(nativePtr, host, port)
+    fun connect(host: String, port: Int = 9443, certHash: ByteArray = ByteArray(0)): Boolean {
+        android.util.Log.i("N42Verifier", "nativeConnect($host, $port, certHash.size=${certHash.size})")
+        val result = nativeConnect(nativePtr, host, port, certHash)
+        android.util.Log.i("N42Verifier", "nativeConnect returned: $result")
         isConnected = result == 0
         return isConnected
     }
