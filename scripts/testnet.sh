@@ -512,6 +512,7 @@ start_validators() {
             --max-outbound-peers "$NUM_VALIDATORS" \
             --max-inbound-peers "$NUM_VALIDATORS" \
             --metrics "127.0.0.1:$metrics_port" \
+            --builder.gaslimit 120000000 \
             ${p2p_key_flag} \
             ${TRUSTED_PEERS_FLAG} \
             > "$log_file" 2>&1 &

@@ -78,7 +78,7 @@ fn idc_pool_config(base: &PoolConfig) -> PoolConfig {
         basefee_limit: SubPoolLimit { max_txs: 25_000, max_size: 50 * 1024 * 1024 },
         queued_limit: SubPoolLimit { max_txs: 25_000, max_size: 50 * 1024 * 1024 },
         blob_limit: SubPoolLimit { max_txs: 256, max_size: 50 * 1024 * 1024 },
-        max_account_slots: 64,
+        max_account_slots: 1024,
         ..base.clone()
     }
 }

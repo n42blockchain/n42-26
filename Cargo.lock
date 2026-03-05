@@ -1639,6 +1639,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "blake3"
+version = "1.8.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2468ef7d57b3fb7e16b576e8377cdbde2320c60e1491e961d11da40fc4f02a2d"
+dependencies = [
+ "arrayref",
+ "arrayvec",
+ "cc",
+ "cfg-if",
+ "constant_time_eq",
+ "cpufeatures",
+]
+
+[[package]]
 name = "block-buffer"
 version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2109,6 +2123,12 @@ dependencies = [
  "quote",
  "unicode-xid",
 ]
+
+[[package]]
+name = "constant_time_eq"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
 
 [[package]]
 name = "convert_case"
@@ -2740,7 +2760,7 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 
 [[package]]
 name = "e2e-test"
-version = "0.2.0"
+version = "0.2.6"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -5513,7 +5533,7 @@ dependencies = [
 
 [[package]]
 name = "n42-chainspec"
-version = "0.2.0"
+version = "0.2.6"
 dependencies = [
  "alloy-consensus",
  "alloy-genesis",
@@ -5529,7 +5549,7 @@ dependencies = [
 
 [[package]]
 name = "n42-consensus"
-version = "0.2.0"
+version = "0.2.6"
 dependencies = [
  "alloy-primitives",
  "bincode",
@@ -5551,7 +5571,7 @@ dependencies = [
 
 [[package]]
 name = "n42-execution"
-version = "0.2.0"
+version = "0.2.6"
 dependencies = [
  "alloy-eips",
  "alloy-evm 0.28.1",
@@ -5579,7 +5599,7 @@ dependencies = [
 
 [[package]]
 name = "n42-mobile"
-version = "0.2.0"
+version = "0.2.6"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -5608,7 +5628,7 @@ dependencies = [
 
 [[package]]
 name = "n42-mobile-ffi"
-version = "0.2.0"
+version = "0.2.6"
 dependencies = [
  "alloy-primitives",
  "bincode",
@@ -5635,7 +5655,7 @@ dependencies = [
 
 [[package]]
 name = "n42-mobile-sim"
-version = "0.2.0"
+version = "0.2.6"
 dependencies = [
  "alloy-primitives",
  "bincode",
@@ -5652,7 +5672,7 @@ dependencies = [
 
 [[package]]
 name = "n42-network"
-version = "0.2.0"
+version = "0.2.6"
 dependencies = [
  "alloy-primitives",
  "bincode",
@@ -5677,7 +5697,7 @@ dependencies = [
 
 [[package]]
 name = "n42-node"
-version = "0.2.0"
+version = "0.2.6"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -5740,7 +5760,7 @@ dependencies = [
 
 [[package]]
 name = "n42-node-bin"
-version = "0.2.0"
+version = "0.2.6"
 dependencies = [
  "aes-gcm",
  "alloy-primitives",
@@ -5771,7 +5791,7 @@ dependencies = [
 
 [[package]]
 name = "n42-primitives"
-version = "0.2.0"
+version = "0.2.6"
 dependencies = [
  "alloy-primitives",
  "bincode",
@@ -5784,6 +5804,30 @@ dependencies = [
  "serde",
  "thiserror 2.0.18",
  "zeroize",
+]
+
+[[package]]
+name = "n42-stress"
+version = "0.2.6"
+dependencies = [
+ "alloy-consensus",
+ "alloy-eips",
+ "alloy-network",
+ "alloy-primitives",
+ "alloy-rlp",
+ "alloy-signer",
+ "alloy-signer-local",
+ "clap",
+ "eyre",
+ "hex",
+ "rand 0.9.2",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tiny-keccak",
+ "tokio",
+ "tracing",
+ "tracing-subscriber 0.3.22",
 ]
 
 [[package]]
@@ -7400,6 +7444,7 @@ dependencies = [
  "alloy-primitives",
  "alloy-rlp",
  "backon",
+ "blake3",
  "clap",
  "comfy-table",
  "crossterm",
@@ -7413,6 +7458,7 @@ dependencies = [
  "metrics",
  "parking_lot",
  "ratatui",
+ "rayon",
  "reqwest",
  "reth-chainspec",
  "reth-cli",
@@ -7451,6 +7497,7 @@ dependencies = [
  "reth-prune-types",
  "reth-revm",
  "reth-stages",
+ "reth-stages-types",
  "reth-static-file",
  "reth-static-file-types",
  "reth-storage-api",
@@ -9035,6 +9082,7 @@ dependencies = [
  "reth-rpc-server-types",
  "reth-storage-api",
  "reth-tasks",
+ "reth-tracing",
  "reth-transaction-pool",
  "reth-trie-common",
  "revm 36.0.0",
@@ -11199,6 +11247,15 @@ checksum = "2e70e4c5a0e0a8a4823ad65dfe1a6930e4f4d756dcd9dd7939022b5e8c501215"
 dependencies = [
  "num-conv",
  "time-core",
+]
+
+[[package]]
+name = "tiny-keccak"
+version = "2.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2c9d3793400a45f954c52e73d068316d76b6f4e36977e3fcebb13a2721e80237"
+dependencies = [
+ "crunchy",
 ]
 
 [[package]]
