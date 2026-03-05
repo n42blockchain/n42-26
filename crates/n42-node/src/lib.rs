@@ -11,6 +11,7 @@ pub mod payload;
 pub mod persistence;
 pub mod pool;
 pub mod rpc;
+pub mod staking;
 pub mod tx_bridge;
 
 pub use consensus_state::SharedConsensusState;

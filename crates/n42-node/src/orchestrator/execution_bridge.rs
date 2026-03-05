@@ -53,6 +53,16 @@ impl ConsensusOrchestrator {
             timestamp = bumped;
         }
 
+        // 1. Pre-fetch staked BLS pubkeys (lock StakingManager, then release).
+        //    This avoids holding both locks simultaneously and prevents deadlocks.
+        let staked_pubkeys = if let Some(ref staking_mgr) = self.staking_manager {
+            let mgr = staking_mgr.lock().unwrap_or_else(|e| e.into_inner());
+            mgr.staked_bls_pubkeys()
+        } else {
+            std::collections::HashSet::new()
+        };
+
+        // 2. Compute mobile rewards (lock MobileRewardManager).
         let mut withdrawals = vec![];
         if let Some(ref reward_mgr) = self.mobile_reward_manager {
             let mut mgr = reward_mgr.lock().unwrap_or_else(|e| {
@@ -60,7 +70,7 @@ impl ConsensusOrchestrator {
                 e.into_inner()
             });
             let next_block_number = self.committed_block_count + 1;
-            mgr.check_epoch_boundary(next_block_number);
+            mgr.check_epoch_boundary(next_block_number, &staked_pubkeys);
             withdrawals = mgr.take_pending_rewards(next_block_number);
             if !withdrawals.is_empty() {
                 info!(
@@ -68,6 +78,32 @@ impl ConsensusOrchestrator {
                     count = withdrawals.len(),
                     "injecting mobile rewards as withdrawals"
                 );
+            }
+        }
+
+        // 3. Staking integration: resolve reward addresses and inject cooldown returns.
+        //    Re-acquire StakingManager lock for address resolution and cooldown checks.
+        if let Some(ref staking_mgr) = self.staking_manager {
+            let mut staking = staking_mgr.lock().unwrap_or_else(|e| e.into_inner());
+
+            // Reward address resolution: BLS-derived keccak → staker's actual EVM address.
+            for w in &mut withdrawals {
+                if let Some(addr) = staking.staker_address_by_reward(w.address) {
+                    w.address = addr;
+                }
+            }
+
+            // Cooldown expiration checks + return withdrawals.
+            let next_block_number = self.committed_block_count + 1;
+            staking.check_cooldowns(next_block_number);
+            let returns = staking.take_pending_returns(next_block_number, 8);
+            if !returns.is_empty() {
+                info!(
+                    target: "n42::cl::exec_bridge",
+                    count = returns.len(),
+                    "injecting staking returns as withdrawals"
+                );
+                withdrawals.extend(returns);
             }
         }
 
@@ -145,7 +181,7 @@ impl ConsensusOrchestrator {
         let current_view = self.engine.current_view();
         let blob_store = self.blob_store.clone();
 
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             // Allow builder time to pack transactions from the pool.
             tokio::time::sleep(BUILDER_WARMUP_DELAY).await;
 
@@ -178,6 +214,18 @@ impl ConsensusOrchestrator {
                 }
                 Some(Err(e)) => error!(target: "n42::cl::exec_bridge", error = %e, "payload build failed"),
                 None => warn!(target: "n42::cl::exec_bridge", "payload not found (already resolved or expired)"),
+            }
+        });
+
+        // Monitor the JoinHandle so that panics/cancellations in the payload
+        // resolve task are logged rather than silently swallowed.
+        tokio::spawn(async move {
+            if let Err(e) = handle.await {
+                error!(
+                    target: "n42::cl::exec_bridge",
+                    error = %e,
+                    "payload resolve task terminated unexpectedly (panic or cancellation)"
+                );
             }
         });
     }

@@ -12,6 +12,7 @@ use n42_node::mobile_reward::MobileRewardManager;
 use n42_node::epoch_schedule::EpochSchedule;
 use n42_node::persistence;
 use n42_node::rpc::{N42ApiServer, N42RpcServer};
+use n42_node::staking::StakingManager;
 use n42_node::tx_bridge::TxPoolBridge;
 use n42_node::{ConsensusOrchestrator, ObserverOrchestrator, N42Node, SharedConsensusState};
 use n42_primitives::BlsSecretKey;
@@ -89,6 +90,21 @@ fn derive_ed25519_keypair(index: u32) -> libp2p::identity::Keypair {
 }
 
 fn main() {
+    // Install a global panic hook so that panics in ANY thread or tokio task
+    // produce visible output on stderr.  Without this, panics in non-critical
+    // `tokio::spawn` tasks silently disappear (the JoinHandle is dropped and
+    // nobody observes the error).  This is the primary defence against the
+    // "node crashed with no logs" failure mode.
+    std::panic::set_hook(Box::new(|info| {
+        let thread = std::thread::current();
+        let name = thread.name().unwrap_or("<unnamed>");
+        // Capture backtrace regardless of RUST_BACKTRACE setting.
+        let bt = std::backtrace::Backtrace::force_capture();
+        eprintln!(
+            "\n!!! PANIC in thread '{name}' !!!\n{info}\n\nBacktrace:\n{bt}\n"
+        );
+    }));
+
     if std::env::var_os("RUST_BACKTRACE").is_none() {
         // SAFETY: Called from main() before any threads are spawned.
         unsafe { std::env::set_var("RUST_BACKTRACE", "1") };
@@ -253,11 +269,24 @@ fn main() {
         let consensus_state = Arc::new(SharedConsensusState::new(validator_set.clone()));
         let n42_node = N42Node::new(consensus_state.clone());
 
+        // Create staking manager early so it can be shared with RPC.
+        let data_dir: PathBuf = std::env::var("N42_DATA_DIR")
+            .unwrap_or_else(|_| "./n42-data".to_string())
+            .into();
+        let staking_state_file = data_dir.join("staking_state.json");
+        let staking_manager = Arc::new(Mutex::new(
+            StakingManager::load_or_new(&staking_state_file),
+        ));
+        info!(target: "n42::cli", "StakingManager initialized");
+
         let rpc_consensus_state = consensus_state.clone();
+        let rpc_staking_manager = staking_manager.clone();
         let handle = builder
             .node(n42_node)
             .extend_rpc_modules(move |ctx| {
-                ctx.modules.merge_configured(N42RpcServer::new(rpc_consensus_state).into_rpc())?;
+                let rpc_server = N42RpcServer::new(rpc_consensus_state)
+                    .with_staking_manager(rpc_staking_manager);
+                ctx.modules.merge_configured(rpc_server.into_rpc())?;
                 info!(target: "n42::cli", "N42 RPC namespace registered");
                 Ok(())
             })
@@ -431,10 +460,6 @@ fn main() {
                     }
                 }
 
-                let data_dir: PathBuf = std::env::var("N42_DATA_DIR")
-                    .unwrap_or_else(|_| "./n42-data".to_string())
-                    .into();
-
                 let starhub_port = env_parse("N42_STARHUB_PORT").unwrap_or(9443);
                 let shard_count = env_parse("N42_STARHUB_SHARDS").unwrap_or(1);
 
@@ -468,6 +493,7 @@ fn main() {
                 let daily_base_reward_gwei = env_parse("N42_DAILY_BASE_REWARD_GWEI").unwrap_or(100_000_000); // 0.1 N42
                 let reward_curve_k: f64 = env_parse("N42_REWARD_CURVE_K").unwrap_or(4.0);
                 let max_rewards_per_block = env_parse("N42_MAX_REWARDS_PER_BLOCK").unwrap_or(32);
+                let unstaked_reward_ratio: f64 = env_parse("N42_UNSTAKED_REWARD_RATIO").unwrap_or(0.1);
 
                 if reward_epoch_blocks == 0 {
                     eprintln!("ERROR: N42_REWARD_EPOCH_BLOCKS must be > 0");
@@ -481,12 +507,17 @@ fn main() {
                     eprintln!("ERROR: N42_MAX_REWARDS_PER_BLOCK must be > 0");
                     std::process::exit(1);
                 }
+                if !(0.0..=1.0).contains(&unstaked_reward_ratio) || !unstaked_reward_ratio.is_finite() {
+                    eprintln!("ERROR: N42_UNSTAKED_REWARD_RATIO must be between 0.0 and 1.0, got {unstaked_reward_ratio}");
+                    std::process::exit(1);
+                }
 
                 let reward_manager = Arc::new(Mutex::new(MobileRewardManager::new(
                     reward_epoch_blocks,
                     daily_base_reward_gwei,
                     reward_curve_k,
                     max_rewards_per_block,
+                    unstaked_reward_ratio,
                 )));
 
                 info!(
@@ -495,7 +526,8 @@ fn main() {
                     daily_base_reward_gwei,
                     curve_k = reward_curve_k,
                     max_per_block = max_rewards_per_block,
-                    "mobile reward manager configured (logarithmic curve)"
+                    unstaked_reward_ratio,
+                    "mobile reward manager configured (logarithmic curve, tiered rewards)"
                 );
 
                 let (attest_tx, mut attest_rx) = mpsc::channel(256);
@@ -506,7 +538,8 @@ fn main() {
                     .with_attestation_tx(attest_tx)
                     .with_phone_connected_tx(phone_connected_tx)
                     .with_consensus_state(consensus_state.clone())
-                    .with_reward_tx(reward_attest_tx);
+                    .with_reward_tx(reward_attest_tx)
+                    .with_staking_manager(staking_manager.clone());
 
                 task_executor.spawn_critical_task("n42-mobile-bridge", Box::pin(mobile_bridge.run()));
 
@@ -685,6 +718,7 @@ fn main() {
                 .with_validator_set(validator_set)
                 .with_blob_store(full_node.pool.blob_store().clone())
                 .with_mobile_reward_manager(reward_manager)
+                .with_staking_manager(staking_manager.clone())
                 .with_committed_block_count(restored_block_count);
 
                 if let Some(schedule) = epoch_schedule {

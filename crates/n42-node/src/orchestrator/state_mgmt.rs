@@ -104,6 +104,12 @@ impl ConsensusOrchestrator {
         } else {
             debug!(target: "n42::cl::sync", view = snapshot.current_view, "consensus state persisted");
         }
+
+        // Also persist staking state
+        if let Some(ref staking_mgr) = self.staking_manager {
+            let mgr = staking_mgr.lock().unwrap_or_else(|e| e.into_inner());
+            mgr.save();
+        }
     }
 
     /// Persists consensus state on shutdown, including consecutive_timeouts.
@@ -299,6 +305,14 @@ impl ConsensusOrchestrator {
             };
 
             self.import_and_notify(broadcast).await;
+
+            // Fix #3: Scan sync-imported blocks for staking transactions.
+            if let Some(ref staking_mgr) = self.staking_manager
+                && !sync_block.payload.is_empty()
+            {
+                let mut mgr = staking_mgr.lock().unwrap_or_else(|e| e.into_inner());
+                mgr.scan_committed_block(sync_block.view, &sync_block.payload);
+            }
 
             if self.committed_blocks.len() >= max_committed_blocks() {
                 self.committed_blocks.pop_front();

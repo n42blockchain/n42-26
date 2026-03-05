@@ -1,6 +1,6 @@
 use alloy_eips::eip4895::Withdrawal;
 use alloy_primitives::Address;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use tracing::{debug, info, warn};
 
 /// Maximum pending rewards in the queue to prevent unbounded memory growth.
@@ -20,6 +20,8 @@ pub struct MobileRewardManager {
     daily_base_reward_gwei: u64,
     curve_k: f64,
     max_rewards_per_block: usize,
+    /// Reward multiplier for non-staked (registered-only) verifiers. Default: 0.1 (10%).
+    unstaked_reward_ratio: f64,
 }
 
 impl MobileRewardManager {
@@ -28,6 +30,7 @@ impl MobileRewardManager {
         daily_base_reward_gwei: u64,
         curve_k: f64,
         max_per_block: usize,
+        unstaked_reward_ratio: f64,
     ) -> Self {
         Self {
             epoch_attestations: HashMap::new(),
@@ -37,6 +40,7 @@ impl MobileRewardManager {
             daily_base_reward_gwei,
             curve_k,
             max_rewards_per_block: max_per_block,
+            unstaked_reward_ratio,
         }
     }
 
@@ -52,7 +56,9 @@ impl MobileRewardManager {
     }
 
     /// At epoch boundaries, computes rewards for all attestors and enqueues them.
-    pub fn check_epoch_boundary(&mut self, current_block: u64) {
+    /// `staked_pubkeys` determines the reward multiplier: staked verifiers get 100%,
+    /// non-staked get `unstaked_reward_ratio` (default 10%).
+    pub fn check_epoch_boundary(&mut self, current_block: u64, staked_pubkeys: &HashSet<[u8; 48]>) {
         if self.blocks_per_epoch == 0 {
             return;
         }
@@ -111,11 +117,16 @@ impl MobileRewardManager {
             );
         }
 
+        let unstaked_ratio = self.unstaked_reward_ratio;
         let mut added = 0usize;
         for (pubkey, count) in entries.iter().take(remaining_capacity) {
-            let reward_gwei = compute_log_reward_inner(
+            let base_reward_gwei = compute_log_reward_inner(
                 *count, blocks_per_epoch, daily_base_reward_gwei, curve_k,
             );
+
+            // Apply staking multiplier: 100% for staked, unstaked_reward_ratio for others
+            let multiplier = if staked_pubkeys.contains(pubkey) { 1.0 } else { unstaked_ratio };
+            let reward_gwei = (base_reward_gwei as f64 * multiplier) as u64;
 
             if reward_gwei == 0 {
                 continue;
@@ -238,6 +249,15 @@ mod tests {
         [idx; 48]
     }
 
+    /// All pubkeys staked by default in tests (backward-compatible behavior).
+    fn all_staked(pubkeys: &[[u8; 48]]) -> HashSet<[u8; 48]> {
+        pubkeys.iter().copied().collect()
+    }
+
+    fn empty_staked() -> HashSet<[u8; 48]> {
+        HashSet::new()
+    }
+
     /// Helper: compute expected log reward for assertions.
     fn expected_log_reward(n: u64, big_n: u64, r_max: u64, k: f64) -> u64 {
         if n == 0 || big_n == 0 {
@@ -251,7 +271,7 @@ mod tests {
 
     #[test]
     fn test_record_attestation() {
-        let mut mgr = MobileRewardManager::new(100, 100_000_000, 4.0, 32);
+        let mut mgr = MobileRewardManager::new(100, 100_000_000, 4.0, 32, 0.1);
         let pk = test_pubkey(1);
 
         mgr.record_attestation(&pk);
@@ -264,19 +284,19 @@ mod tests {
 
     #[test]
     fn test_epoch_boundary_no_early_distribution() {
-        let mut mgr = MobileRewardManager::new(100, 100_000_000, 4.0, 32);
+        let mut mgr = MobileRewardManager::new(100, 100_000_000, 4.0, 32, 0.1);
         let pk = test_pubkey(1);
         mgr.record_attestation(&pk);
 
         // Block 50: not at epoch boundary
-        mgr.check_epoch_boundary(50);
+        mgr.check_epoch_boundary(50, &all_staked(&[pk]));
         assert_eq!(mgr.pending_count(), 0);
         assert_eq!(mgr.epoch_attestation_count(), 1);
     }
 
     #[test]
     fn test_epoch_boundary_distribution() {
-        let mut mgr = MobileRewardManager::new(100, 100_000_000, 4.0, 32);
+        let mut mgr = MobileRewardManager::new(100, 100_000_000, 4.0, 32, 0.1);
 
         let pk1 = test_pubkey(1);
         let pk2 = test_pubkey(2);
@@ -288,8 +308,9 @@ mod tests {
             mgr.record_attestation(&pk2);
         }
 
+        let staked = all_staked(&[pk1, pk2]);
         // Block 100: epoch boundary
-        mgr.check_epoch_boundary(100);
+        mgr.check_epoch_boundary(100, &staked);
 
         assert_eq!(mgr.pending_count(), 2);
         assert_eq!(mgr.epoch_attestation_count(), 0); // cleared after distribution
@@ -315,14 +336,16 @@ mod tests {
 
     #[test]
     fn test_take_pending_bounded() {
-        let mut mgr = MobileRewardManager::new(100, 100_000_000, 4.0, 2);
+        let mut mgr = MobileRewardManager::new(100, 100_000_000, 4.0, 2, 0.1);
 
+        let mut pks = Vec::new();
         for i in 0..5u8 {
             let pk = test_pubkey(i);
             mgr.record_attestation(&pk);
+            pks.push(pk);
         }
 
-        mgr.check_epoch_boundary(100);
+        mgr.check_epoch_boundary(100, &all_staked(&pks));
         assert_eq!(mgr.pending_count(), 5);
 
         let batch1 = mgr.take_pending_rewards(100);
@@ -340,28 +363,31 @@ mod tests {
 
     #[test]
     fn test_no_double_distribution() {
-        let mut mgr = MobileRewardManager::new(100, 100_000_000, 4.0, 32);
+        let mut mgr = MobileRewardManager::new(100, 100_000_000, 4.0, 32, 0.1);
 
         let pk = test_pubkey(1);
         mgr.record_attestation(&pk);
 
-        mgr.check_epoch_boundary(100);
+        mgr.check_epoch_boundary(100, &all_staked(&[pk]));
         assert_eq!(mgr.pending_count(), 1);
 
         // Same block shouldn't trigger again
         mgr.record_attestation(&test_pubkey(2));
-        mgr.check_epoch_boundary(100);
+        mgr.check_epoch_boundary(100, &all_staked(&[pk, test_pubkey(2)]));
         assert_eq!(mgr.pending_count(), 1); // no new rewards added
     }
 
     #[test]
     fn test_withdrawal_index_block_based() {
-        let mut mgr = MobileRewardManager::new(100, 100_000_000, 4.0, 32);
+        let mut mgr = MobileRewardManager::new(100, 100_000_000, 4.0, 32, 0.1);
 
+        let mut pks = Vec::new();
         for i in 0..3u8 {
-            mgr.record_attestation(&test_pubkey(i));
+            let pk = test_pubkey(i);
+            mgr.record_attestation(&pk);
+            pks.push(pk);
         }
-        mgr.check_epoch_boundary(100);
+        mgr.check_epoch_boundary(100, &all_staked(&pks));
 
         let rewards = mgr.take_pending_rewards(100);
         let indices: Vec<u64> = rewards.iter().map(|w| w.index).collect();
@@ -369,8 +395,9 @@ mod tests {
         assert_eq!(indices, vec![100 * 32, 100 * 32 + 1, 100 * 32 + 2]);
 
         // Next epoch - different block, different index range
-        mgr.record_attestation(&test_pubkey(10));
-        mgr.check_epoch_boundary(200);
+        let pk10 = test_pubkey(10);
+        mgr.record_attestation(&pk10);
+        mgr.check_epoch_boundary(200, &all_staked(&[pk10]));
 
         let rewards2 = mgr.take_pending_rewards(200);
         assert_eq!(rewards2[0].index, 200 * 32); // based on block 200
@@ -388,14 +415,14 @@ mod tests {
 
     #[test]
     fn test_empty_epoch() {
-        let mut mgr = MobileRewardManager::new(100, 100_000_000, 4.0, 32);
-        mgr.check_epoch_boundary(100);
+        let mut mgr = MobileRewardManager::new(100, 100_000_000, 4.0, 32, 0.1);
+        mgr.check_epoch_boundary(100, &empty_staked());
         assert_eq!(mgr.pending_count(), 0);
     }
 
     #[test]
     fn test_distinct_pubkeys_tracked_separately() {
-        let mut mgr = MobileRewardManager::new(100, 100_000_000, 4.0, 32);
+        let mut mgr = MobileRewardManager::new(100, 100_000_000, 4.0, 32, 0.1);
         // Three distinct pubkeys, each recorded once
         mgr.record_attestation(&test_pubkey(0xAA));
         mgr.record_attestation(&test_pubkey(0xBB));
@@ -413,32 +440,35 @@ mod tests {
 
     #[test]
     fn test_zero_blocks_per_epoch_no_distribution() {
-        let mut mgr = MobileRewardManager::new(0, 100_000_000, 4.0, 32);
+        let mut mgr = MobileRewardManager::new(0, 100_000_000, 4.0, 32, 0.1);
         let pk = test_pubkey(1);
         mgr.record_attestation(&pk);
 
         // Should return early without distributing
-        mgr.check_epoch_boundary(100);
+        mgr.check_epoch_boundary(100, &all_staked(&[pk]));
         assert_eq!(mgr.pending_count(), 0);
         assert_eq!(mgr.epoch_attestation_count(), 1);
     }
 
     #[test]
     fn test_take_empty_queue_returns_empty() {
-        let mut mgr = MobileRewardManager::new(100, 100_000_000, 4.0, 32);
+        let mut mgr = MobileRewardManager::new(100, 100_000_000, 4.0, 32, 0.1);
         let rewards = mgr.take_pending_rewards(1);
         assert!(rewards.is_empty());
     }
 
     #[test]
     fn test_multi_epoch_drain_across_blocks() {
-        let mut mgr = MobileRewardManager::new(10, 1_000_000, 4.0, 2);
+        let mut mgr = MobileRewardManager::new(10, 1_000_000, 4.0, 2, 0.1);
 
         // Epoch 1: 3 validators
+        let mut pks1 = Vec::new();
         for i in 0..3u8 {
-            mgr.record_attestation(&test_pubkey(i));
+            let pk = test_pubkey(i);
+            mgr.record_attestation(&pk);
+            pks1.push(pk);
         }
-        mgr.check_epoch_boundary(10);
+        mgr.check_epoch_boundary(10, &all_staked(&pks1));
         assert_eq!(mgr.pending_count(), 3);
 
         // Drain partial: take 2
@@ -447,10 +477,13 @@ mod tests {
         assert_eq!(mgr.pending_count(), 1);
 
         // Epoch 2: 2 more validators (queue should grow)
+        let mut pks2 = Vec::new();
         for i in 10..12u8 {
-            mgr.record_attestation(&test_pubkey(i));
+            let pk = test_pubkey(i);
+            mgr.record_attestation(&pk);
+            pks2.push(pk);
         }
-        mgr.check_epoch_boundary(20);
+        mgr.check_epoch_boundary(20, &all_staked(&pks2));
         assert_eq!(mgr.pending_count(), 3); // 1 leftover + 2 new
 
         // Drain all
@@ -477,12 +510,12 @@ mod tests {
     fn test_reward_no_overflow_with_max_base() {
         // With log curve, even u64::MAX base reward shouldn't overflow.
         // n=2, N=1 → n capped to 1, ratio = 1.0, reward = R_max
-        let mut mgr = MobileRewardManager::new(1, u64::MAX, 4.0, 32);
+        let mut mgr = MobileRewardManager::new(1, u64::MAX, 4.0, 32, 0.1);
         let pk = test_pubkey(1);
 
         mgr.record_attestation(&pk);
         mgr.record_attestation(&pk);
-        mgr.check_epoch_boundary(1);
+        mgr.check_epoch_boundary(1, &all_staked(&[pk]));
 
         let rewards = mgr.take_pending_rewards(1);
         assert_eq!(rewards.len(), 1);
@@ -492,14 +525,17 @@ mod tests {
 
     #[test]
     fn test_many_unique_validators() {
-        let mut mgr = MobileRewardManager::new(100, 1_000, 4.0, 32);
+        let mut mgr = MobileRewardManager::new(100, 1_000, 4.0, 32, 0.1);
 
+        let mut pks = Vec::new();
         for i in 0..100u8 {
-            mgr.record_attestation(&test_pubkey(i));
+            let pk = test_pubkey(i);
+            mgr.record_attestation(&pk);
+            pks.push(pk);
         }
         assert_eq!(mgr.epoch_attestation_count(), 100);
 
-        mgr.check_epoch_boundary(100);
+        mgr.check_epoch_boundary(100, &all_staked(&pks));
         assert_eq!(mgr.pending_count(), 100);
 
         // Drain in batches of 32
@@ -594,12 +630,8 @@ mod tests {
 
     // --- P1c: precision guarantee tests ---
 
-    /// n=1 must yield a positive reward (not truncated to 0).
-    /// This guards against extremely small k or R_max values silently producing zero.
     #[test]
     fn test_precision_single_attestation_minimum() {
-        // With R_max = 1_000_000 Gwei and epoch = 21600 blocks, a single attestation
-        // must produce at least 1 Gwei reward (not truncated to 0).
         let reward = compute_log_reward_inner(1, 21600, 1_000_000, 4.0);
         assert!(
             reward >= 1,
@@ -608,24 +640,18 @@ mod tests {
         );
     }
 
-    /// attestation_count > blocks_per_epoch must be capped at R_max (no overflow).
-    /// Guards the `.min(blocks_per_epoch)` clamp in the implementation.
     #[test]
     fn test_precision_overflow_guard() {
         let r_max = 100_000_000u64;
         let epoch = 21600u64;
 
-        // Exactly at the boundary
         let at_max = compute_log_reward_inner(epoch, epoch, r_max, 4.0);
-        // Well above the boundary
         let over_max = compute_log_reward_inner(epoch * 100, epoch, r_max, 4.0);
 
         assert_eq!(at_max, r_max, "n==N should yield exactly R_max");
         assert_eq!(over_max, r_max, "n>>N should also yield exactly R_max (capped)");
     }
 
-    /// Reward must be strictly monotone in attestation_count over the full [1..N] range.
-    /// A single counter-example would indicate precision loss at some scale.
     #[test]
     fn test_precision_monotonic() {
         let epoch = 1000u64;
@@ -642,5 +668,66 @@ mod tests {
             );
             prev_reward = reward;
         }
+    }
+
+    // --- Tiered reward tests ---
+
+    #[test]
+    fn test_tiered_reward_staked_gets_full() {
+        let mut mgr = MobileRewardManager::new(100, 100_000_000, 4.0, 32, 0.1);
+        let pk = test_pubkey(1);
+
+        for _ in 0..10 {
+            mgr.record_attestation(&pk);
+        }
+
+        mgr.check_epoch_boundary(100, &all_staked(&[pk]));
+        let rewards = mgr.take_pending_rewards(100);
+        assert_eq!(rewards.len(), 1);
+
+        let expected = expected_log_reward(10, 100, 100_000_000, 4.0);
+        assert_eq!(rewards[0].amount, expected);
+    }
+
+    #[test]
+    fn test_tiered_reward_unstaked_gets_reduced() {
+        let mut mgr = MobileRewardManager::new(100, 100_000_000, 4.0, 32, 0.1);
+        let pk = test_pubkey(1);
+
+        for _ in 0..10 {
+            mgr.record_attestation(&pk);
+        }
+
+        // Empty staked set — pk is unstaked
+        mgr.check_epoch_boundary(100, &empty_staked());
+        let rewards = mgr.take_pending_rewards(100);
+        assert_eq!(rewards.len(), 1);
+
+        let full_reward = expected_log_reward(10, 100, 100_000_000, 4.0);
+        let expected = (full_reward as f64 * 0.1) as u64;
+        assert_eq!(rewards[0].amount, expected);
+    }
+
+    #[test]
+    fn test_tiered_reward_mixed_staked_and_unstaked() {
+        let mut mgr = MobileRewardManager::new(100, 100_000_000, 4.0, 32, 0.1);
+        let staked_pk = test_pubkey(1);
+        let unstaked_pk = test_pubkey(2);
+
+        for _ in 0..10 {
+            mgr.record_attestation(&staked_pk);
+            mgr.record_attestation(&unstaked_pk);
+        }
+
+        // Only staked_pk is in the staked set
+        mgr.check_epoch_boundary(100, &all_staked(&[staked_pk]));
+        let rewards = mgr.take_pending_rewards(100);
+        assert_eq!(rewards.len(), 2);
+
+        let full_reward = expected_log_reward(10, 100, 100_000_000, 4.0);
+        let reduced_reward = (full_reward as f64 * 0.1) as u64;
+
+        let total: u64 = rewards.iter().map(|w| w.amount).sum();
+        assert_eq!(total, full_reward + reduced_reward);
     }
 }

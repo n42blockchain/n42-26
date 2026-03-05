@@ -6,6 +6,7 @@ mod state_mgmt;
 use crate::consensus_state::SharedConsensusState;
 use crate::epoch_schedule::EpochSchedule;
 use crate::mobile_reward::MobileRewardManager;
+use crate::staking::StakingManager;
 use alloy_primitives::{Address, B256};
 use n42_consensus::{ConsensusEngine, EngineOutput, ValidatorSet};
 use n42_network::{NetworkEvent, NetworkHandle, PeerId};
@@ -94,6 +95,7 @@ pub struct ConsensusOrchestrator {
     leader_payload_tx: mpsc::UnboundedSender<(B256, Vec<u8>)>,
     blob_store: Option<DiskFileBlobStore>,
     mobile_reward_manager: Option<Arc<Mutex<MobileRewardManager>>>,
+    staking_manager: Option<Arc<Mutex<StakingManager>>>,
     committed_block_count: u64,
     /// Tracks the timestamp of the last built/committed block to prevent
     /// "invalid timestamp" errors from the Engine API.  The Engine API requires
@@ -151,6 +153,7 @@ impl ConsensusOrchestrator {
             leader_payload_tx,
             blob_store: None,
             mobile_reward_manager: None,
+            staking_manager: None,
             committed_block_count: 0,
             last_committed_timestamp: 0,
             view_started_at: None,
@@ -216,6 +219,7 @@ impl ConsensusOrchestrator {
             leader_payload_tx,
             blob_store: None,
             mobile_reward_manager: None,
+            staking_manager: None,
             committed_block_count: 0,
             last_committed_timestamp: 0,
             view_started_at: None,
@@ -245,6 +249,11 @@ impl ConsensusOrchestrator {
 
     pub fn with_mobile_reward_manager(mut self, mgr: Arc<Mutex<MobileRewardManager>>) -> Self {
         self.mobile_reward_manager = Some(mgr);
+        self
+    }
+
+    pub fn with_staking_manager(mut self, mgr: Arc<Mutex<StakingManager>>) -> Self {
+        self.staking_manager = Some(mgr);
         self
     }
 

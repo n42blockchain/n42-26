@@ -201,7 +201,8 @@ impl ConsensusOrchestrator {
         }
         let epoch = self.engine.epoch_manager().current_epoch();
         let peers = self.connected_peers.len();
-        let short_hash = &format!("{block_hash}")[..10];
+        let hash_str = format!("{block_hash}");
+        let short_hash = hash_str.get(..10).unwrap_or(&hash_str);
         info!(
             target: "n42::cl::slot_notifier",
             view,
@@ -219,6 +220,15 @@ impl ConsensusOrchestrator {
 
         self.store_committed_block(view, block_hash, commit_qc.clone());
         self.head_block_hash = block_hash;
+
+        // Scan committed block for staking/unstaking transactions.
+        if let Some(ref staking_mgr) = self.staking_manager
+            && let Some(data) = self.committed_blocks.back().map(|b| b.payload.as_slice())
+            && !data.is_empty()
+        {
+            let mut mgr = staking_mgr.lock().unwrap_or_else(|e| e.into_inner());
+            mgr.scan_committed_block(self.committed_block_count, data);
+        }
 
         self.finalize_committed_block(view, block_hash, commit_qc).await;
         self.save_consensus_state();

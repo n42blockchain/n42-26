@@ -1,5 +1,5 @@
 use alloy_genesis::{Genesis, GenesisAccount};
-use alloy_primitives::{Address, U256};
+use alloy_primitives::{address, Address, U256};
 use n42_primitives::BlsPublicKey;
 use reth_chainspec::{Chain, ChainSpec, ChainSpecBuilder};
 use serde::{Deserialize, Serialize};
@@ -227,18 +227,29 @@ pub fn n42_dev_chainspec() -> Arc<ChainSpec> {
     Arc::new(spec)
 }
 
-/// 10,000 ETH in wei.
-fn ten_thousand_eth() -> U256 {
+/// 10,000 N in wei.
+fn ten_thousand_n() -> U256 {
     U256::from(10_000) * U256::from(10).pow(U256::from(18))
+}
+
+/// Treasury address for initial token distribution.
+/// Derived from a BIP-39 mnemonic via BIP-44 path m/44'/60'/0'/0/0.
+/// The mnemonic and private key are stored securely outside the codebase.
+pub const TREASURY_ADDRESS: Address = address!("8e182397c01d36E43c31e81BA52eE6480C80C8C2");
+
+/// 3 billion N in wei (3,000,000,000 * 10^18).
+fn three_billion_n() -> U256 {
+    U256::from(3_000_000_000u64) * U256::from(10).pow(U256::from(18))
 }
 
 /// Create a dev chain spec with pre-funded allocations.
 ///
-/// Each validator address receives 10,000 ETH. Additionally, 10 test accounts
-/// (addresses 0x10..0x19) each receive 10,000 ETH for transaction testing.
+/// Each validator address receives 10,000 N. Additionally, 10 test accounts
+/// (addresses 0x10..0x19) each receive 10,000 N for transaction testing.
+/// The treasury address receives 3 billion N for staker distribution and testing.
 pub fn n42_dev_chainspec_with_alloc(validators: &[ValidatorInfo]) -> Arc<ChainSpec> {
     let mut alloc = std::collections::BTreeMap::new();
-    let balance = ten_thousand_eth();
+    let balance = ten_thousand_n();
 
     // Fund validator addresses.
     for v in validators {
@@ -256,6 +267,12 @@ pub fn n42_dev_chainspec_with_alloc(validators: &[ValidatorInfo]) -> Arc<ChainSp
             ..Default::default()
         });
     }
+
+    // Fund treasury with 3 billion N for staker distribution.
+    alloc.insert(TREASURY_ADDRESS, GenesisAccount {
+        balance: three_billion_n(),
+        ..Default::default()
+    });
 
     let genesis = Genesis { alloc, ..Default::default() };
     Arc::new(
@@ -520,15 +537,15 @@ epoch_length = 0
             let addr = Address::with_last_byte(0x10 + i);
             let account = genesis.alloc.get(&addr)
                 .expect("test account should have allocation");
-            assert_eq!(account.balance, ten_thousand_eth());
+            assert_eq!(account.balance, ten_thousand_n());
         }
     }
 
     #[test]
     fn test_dev_chainspec_with_alloc_empty_validators() {
         let spec = n42_dev_chainspec_with_alloc(&[]);
-        // Should still have the 10 test accounts.
-        assert_eq!(spec.genesis.alloc.len(), 10);
+        // Should have 10 test accounts + 1 treasury.
+        assert_eq!(spec.genesis.alloc.len(), 11);
     }
 
     #[test]

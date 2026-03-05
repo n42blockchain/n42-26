@@ -3,11 +3,12 @@ use metrics::{counter, gauge};
 use n42_mobile::{ReceiptAggregator, VerificationReceipt};
 use n42_network::mobile::HubEvent;
 use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, info, warn};
 
 use crate::consensus_state::{SharedConsensusState, VerificationTask};
+use crate::staking::StakingManager;
 
 /// Notification sent when a block reaches the mobile attestation threshold.
 #[derive(Debug, Clone)]
@@ -36,6 +37,8 @@ pub struct MobileVerificationBridge {
     /// Optional shared consensus state; when set, verifier pubkeys are
     /// authorized/deauthorized in `SharedConsensusState` on connect/disconnect.
     consensus_state: Option<Arc<SharedConsensusState>>,
+    /// Optional staking manager; when set, only staked verifiers are authorized.
+    staking_manager: Option<Arc<Mutex<StakingManager>>>,
     /// Subscription to committed-block notifications for registering blocks that
     /// are eligible to receive mobile receipts.
     verification_task_rx: Option<broadcast::Receiver<VerificationTask>>,
@@ -68,6 +71,7 @@ impl MobileVerificationBridge {
             reward_tx: None,
             connected_sessions: HashMap::new(),
             consensus_state: None,
+            staking_manager: None,
             verification_task_rx: None,
             invalid_receipt_counts: HashMap::new(),
             invalid_receipt_order: VecDeque::new(),
@@ -89,6 +93,13 @@ impl MobileVerificationBridge {
 
     pub fn with_reward_tx(mut self, tx: mpsc::UnboundedSender<[u8; 48]>) -> Self {
         self.reward_tx = Some(tx);
+        self
+    }
+
+    /// Attaches a staking manager for verifier authorization checks.
+    /// When set, only registered (staked or registered) verifiers are authorized.
+    pub fn with_staking_manager(mut self, mgr: Arc<Mutex<StakingManager>>) -> Self {
+        self.staking_manager = Some(mgr);
         self
     }
 
@@ -136,6 +147,24 @@ impl MobileVerificationBridge {
                     let Some(event) = event else { break };
                     match event {
                         HubEvent::PhoneConnected { session_id, verifier_pubkey } => {
+                            // Check registration status before authorizing
+                            let registered = if let Some(ref staking_mgr) = self.staking_manager {
+                                let mgr = staking_mgr.lock().unwrap_or_else(|e| e.into_inner());
+                                mgr.is_registered(&verifier_pubkey)
+                            } else {
+                                true // Backward compatible: no StakingManager = allow all (dev mode)
+                            };
+
+                            if !registered {
+                                warn!(
+                                    target: "n42::mobile",
+                                    session_id,
+                                    pubkey = hex::encode(&verifier_pubkey[..8]),
+                                    "phone verifier not registered, rejecting"
+                                );
+                                continue;
+                            }
+
                             self.connected_sessions.insert(session_id, verifier_pubkey);
                             if let Some(ref state) = self.consensus_state {
                                 state.authorize_verifier(verifier_pubkey);

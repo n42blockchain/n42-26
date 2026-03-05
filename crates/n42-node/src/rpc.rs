@@ -1,8 +1,9 @@
 use crate::consensus_state::{AttestationRecord, EquivocationEvidence, SharedConsensusState};
+use crate::staking::{StakingManager, StakeStatus, MIN_STAKE_WEI, UNSTAKE_COOLDOWN_BLOCKS, STAKING_ADDRESS};
 // VerificationTask is used by the #[subscription(item = ...)] macro attribute.
 #[allow(unused_imports)]
 use crate::consensus_state::VerificationTask;
-use alloy_primitives::B256;
+use alloy_primitives::{Address, B256};
 use jsonrpsee::core::RpcResult;
 use jsonrpsee::core::SubscriptionResult;
 use jsonrpsee::proc_macros::rpc;
@@ -10,7 +11,7 @@ use jsonrpsee::types::ErrorObjectOwned;
 use jsonrpsee::{PendingSubscriptionSink, SubscriptionMessage};
 use n42_primitives::{BlsPublicKey, BlsSignature};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 use tracing::{info, warn};
 
@@ -61,6 +62,29 @@ pub struct EquivocationsResponse {
     pub evidence: Vec<EquivocationEvidence>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StakingStatusResponse {
+    pub staked: bool,
+    pub registered: bool,
+    pub amount: String,
+    pub bls_pubkey: String,
+    pub status: String,
+    pub cooldown_remaining_blocks: u64,
+    pub staked_at_block: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StakingInfoResponse {
+    pub total_staked: String,
+    pub staker_count: u64,
+    pub registered_count: u64,
+    pub min_stake: String,
+    pub cooldown_blocks: u64,
+    pub staking_address: String,
+}
+
 /// N42-specific RPC API.
 #[rpc(server, namespace = "n42")]
 pub trait N42Api {
@@ -96,15 +120,32 @@ pub trait N42Api {
 
     #[method(name = "equivocations")]
     async fn equivocations(&self) -> RpcResult<EquivocationsResponse>;
+
+    /// Returns staking status for a given address.
+    #[method(name = "stakingStatus")]
+    async fn staking_status(&self, address: Address) -> RpcResult<StakingStatusResponse>;
+
+    /// Returns global staking information.
+    #[method(name = "stakingInfo")]
+    async fn staking_info(&self) -> RpcResult<StakingInfoResponse>;
 }
 
 pub struct N42RpcServer {
     consensus_state: Arc<SharedConsensusState>,
+    staking_manager: Option<Arc<Mutex<StakingManager>>>,
 }
 
 impl N42RpcServer {
     pub fn new(consensus_state: Arc<SharedConsensusState>) -> Self {
-        Self { consensus_state }
+        Self {
+            consensus_state,
+            staking_manager: None,
+        }
+    }
+
+    pub fn with_staking_manager(mut self, mgr: Arc<Mutex<StakingManager>>) -> Self {
+        self.staking_manager = Some(mgr);
+        self
     }
 }
 
@@ -273,6 +314,100 @@ impl N42ApiServer for N42RpcServer {
     async fn equivocations(&self) -> RpcResult<EquivocationsResponse> {
         let evidence = self.consensus_state.get_equivocations();
         Ok(EquivocationsResponse { total: evidence.len(), evidence })
+    }
+
+    async fn staking_status(&self, address: Address) -> RpcResult<StakingStatusResponse> {
+        let staking_mgr = match &self.staking_manager {
+            Some(mgr) => mgr,
+            None => {
+                return Ok(StakingStatusResponse {
+                    staked: false,
+                    registered: false,
+                    amount: "0".to_string(),
+                    bls_pubkey: String::new(),
+                    status: "no_staking_manager".to_string(),
+                    cooldown_remaining_blocks: 0,
+                    staked_at_block: 0,
+                });
+            }
+        };
+
+        let mgr = staking_mgr.lock().map_err(|_| {
+            ErrorObjectOwned::owned(-32603, "staking manager lock poisoned", None::<()>)
+        })?;
+
+        if let Some(entry) = mgr.get_stake(&address) {
+            let (status_str, cooldown_remaining) = match entry.status {
+                StakeStatus::Active => ("active".to_string(), 0u64),
+                StakeStatus::Unstaking { initiated_block } => {
+                    let end = initiated_block + UNSTAKE_COOLDOWN_BLOCKS;
+                    let current = mgr.last_scanned_block();
+                    let remaining = end.saturating_sub(current);
+                    ("unstaking".to_string(), remaining)
+                }
+            };
+            let is_staked = matches!(entry.status, StakeStatus::Active)
+                && entry.amount >= MIN_STAKE_WEI;
+            Ok(StakingStatusResponse {
+                staked: is_staked,
+                registered: true, // staked implies registered
+                amount: format!("{}", entry.amount),
+                bls_pubkey: hex::encode(entry.bls_pubkey),
+                status: status_str,
+                cooldown_remaining_blocks: cooldown_remaining,
+                staked_at_block: entry.staked_at_block,
+            })
+        } else if let Some(reg) = mgr.get_registration(&address) {
+            Ok(StakingStatusResponse {
+                staked: false,
+                registered: true,
+                amount: "0".to_string(),
+                bls_pubkey: hex::encode(reg.bls_pubkey),
+                status: "registered".to_string(),
+                cooldown_remaining_blocks: 0,
+                staked_at_block: 0,
+            })
+        } else {
+            Ok(StakingStatusResponse {
+                staked: false,
+                registered: false,
+                amount: "0".to_string(),
+                bls_pubkey: String::new(),
+                status: "not_registered".to_string(),
+                cooldown_remaining_blocks: 0,
+                staked_at_block: 0,
+            })
+        }
+    }
+
+    async fn staking_info(&self) -> RpcResult<StakingInfoResponse> {
+        let staking_mgr = match &self.staking_manager {
+            Some(mgr) => mgr,
+            None => {
+                return Ok(StakingInfoResponse {
+                    total_staked: "0".to_string(),
+                    staker_count: 0,
+                    registered_count: 0,
+                    min_stake: format!("{MIN_STAKE_WEI}"),
+                    cooldown_blocks: UNSTAKE_COOLDOWN_BLOCKS,
+                    staking_address: format!("{STAKING_ADDRESS}"),
+                });
+            }
+        };
+
+        let mgr = staking_mgr.lock().map_err(|_| {
+            ErrorObjectOwned::owned(-32603, "staking manager lock poisoned", None::<()>)
+        })?;
+
+        let (total, count) = mgr.total_staked();
+        Ok(StakingInfoResponse {
+            total_staked: format!("{total}"),
+            staker_count: count,
+            registered_count: mgr.registration_count() as u64,
+            min_stake: format!("{MIN_STAKE_WEI}"),
+            cooldown_blocks: UNSTAKE_COOLDOWN_BLOCKS,
+            staking_address: format!("{STAKING_ADDRESS}"),
+        })
     }
 }
 
