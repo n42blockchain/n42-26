@@ -109,14 +109,47 @@ where
         &self,
         args: BuildArguments<EthPayloadBuilderAttributes, EthBuiltPayload>,
     ) -> Result<BuildOutcome<EthBuiltPayload>, PayloadBuilderError> {
-        default_ethereum_payload(
+        let build_start = std::time::Instant::now();
+        let result = default_ethereum_payload(
             self.evm_config.clone(),
             self.client.clone(),
             self.pool.clone(),
             self.base_config.clone(),
             args,
             |attributes| self.pool.best_transactions_with_attributes(attributes),
-        )
+        );
+
+        let elapsed_ms = build_start.elapsed().as_millis() as u64;
+        match &result {
+            Ok(BuildOutcome::Better { payload, .. }) => {
+                let tx_count = payload.block().body().transactions().count();
+                let gas_used = payload.block().header().gas_used;
+                metrics::histogram!("n42_payload_build_ms").record(elapsed_ms as f64);
+                metrics::gauge!("n42_payload_tx_count").set(tx_count as f64);
+                metrics::gauge!("n42_payload_gas_used").set(gas_used as f64);
+                if tx_count > 0 || elapsed_ms > 50 {
+                    tracing::info!(
+                        target: "n42::payload",
+                        elapsed_ms,
+                        tx_count,
+                        gas_used,
+                        gas_limit = payload.block().header().gas_limit,
+                        "payload built"
+                    );
+                }
+            }
+            Ok(BuildOutcome::Aborted { .. }) => {
+                tracing::debug!(target: "n42::payload", elapsed_ms, "payload build aborted (no improvement)");
+            }
+            Ok(BuildOutcome::Cancelled) | Ok(BuildOutcome::Freeze(_)) => {
+                tracing::debug!(target: "n42::payload", elapsed_ms, "payload build cancelled/frozen");
+            }
+            Err(e) => {
+                tracing::warn!(target: "n42::payload", elapsed_ms, error = %e, "payload build error");
+            }
+        }
+
+        result
     }
 
     fn on_missing_payload(

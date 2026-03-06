@@ -16,7 +16,18 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 /// Delay before resolving the built payload, allowing the builder to pack transactions.
-const BUILDER_WARMUP_DELAY: Duration = Duration::from_millis(10);
+/// Configurable via `N42_BUILDER_WARMUP_MS` (default: 10).
+/// Set to 0 in high-throughput scenarios where the tx pool is always filled.
+fn builder_warmup_delay() -> Duration {
+    static DELAY: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *DELAY.get_or_init(|| {
+        let ms: u64 = std::env::var("N42_BUILDER_WARMUP_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(10);
+        Duration::from_millis(ms)
+    })
+}
 
 /// Maximum time to wait for a payload build to complete.
 const PAYLOAD_BUILD_TIMEOUT: Duration = Duration::from_secs(30);
@@ -212,7 +223,10 @@ impl ConsensusOrchestrator {
 
         let handle = tokio::spawn(async move {
             // Allow builder time to pack transactions from the pool.
-            tokio::time::sleep(BUILDER_WARMUP_DELAY).await;
+            let warmup = builder_warmup_delay();
+            if !warmup.is_zero() {
+                tokio::time::sleep(warmup).await;
+            }
 
             let resolve_result = tokio::time::timeout(
                 PAYLOAD_BUILD_TIMEOUT,

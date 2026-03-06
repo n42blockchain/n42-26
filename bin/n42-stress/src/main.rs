@@ -25,7 +25,7 @@ use tokio::sync::Semaphore;
 #[command(name = "n42-stress")]
 struct Cli {
     /// Target TPS (0 = unlimited)
-    #[arg(long, default_value = "500")]
+    #[arg(long, default_value = "2000")]
     target_tps: u64,
 
     /// Test duration in seconds
@@ -51,6 +51,11 @@ struct Cli {
     /// Step mode: auto-increase TPS to find max
     #[arg(long)]
     step: bool,
+
+    /// Pre-fill mode: flood the tx pool before measurement starts.
+    /// Value = number of txs to pre-send (e.g., 10000).
+    #[arg(long, default_value = "0")]
+    prefill: u64,
 
     /// RPC endpoints (comma-separated)
     #[arg(long, default_value = "http://127.0.0.1:18545,http://127.0.0.1:18546,http://127.0.0.1:18547,http://127.0.0.1:18548,http://127.0.0.1:18549,http://127.0.0.1:18550,http://127.0.0.1:18551")]
@@ -607,9 +612,57 @@ async fn main() -> Result<()> {
 
     let accounts = create_accounts(cli.accounts, rpc_urls.len());
     let targets: Vec<Address> = accounts.iter().map(|a| a.address).collect();
+    let semaphore = Arc::new(Semaphore::new(cli.concurrency));
 
     // Parallel nonce sync
     sync_nonces_parallel(&accounts, &rpc_urls, &client).await;
+
+    // Pre-fill tx pool if requested — flood the pool before measurement starts
+    // so that the first blocks have full capacity.
+    if cli.prefill > 0 {
+        let prefill_start = Instant::now();
+        let prefill_total = cli.prefill as usize;
+        let batch_sz = cli.batch_size;
+        let apb = cli.accounts_per_batch.min(accounts.len()).max(1);
+        let num_groups = accounts.len().div_ceil(apb);
+        let mut group_idx = 0usize;
+        let mut sent = 0usize;
+
+        tracing::info!(txs = prefill_total, "Pre-filling tx pool...");
+
+        while sent < prefill_total {
+            let group_start = (group_idx % num_groups) * apb;
+            let group_end = (group_start + apb).min(accounts.len());
+            let group = &accounts[group_start..group_end];
+            let rpc_url = rpc_urls[group[0].rpc_idx].clone();
+
+            let this_batch = batch_sz.min(prefill_total - sent);
+            let (raw_txs, _) = sign_mixed_batch(group, &targets, this_batch, group.len());
+            let c = client.clone();
+            let sem = semaphore.clone();
+            let permit = sem.acquire_owned().await.unwrap();
+            tokio::spawn(async move {
+                let _ = send_batch(&c, &rpc_url, &raw_txs).await;
+                drop(permit);
+            });
+
+            sent += this_batch;
+            group_idx += 1;
+        }
+
+        // Wait for in-flight requests to complete
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        if let Ok((pending, queued)) = get_txpool_status(&client, &rpc_urls[0]).await {
+            tracing::info!(
+                prefill = prefill_total,
+                elapsed_ms = prefill_start.elapsed().as_millis(),
+                pool_pending = pending,
+                pool_queued = queued,
+                "Pre-fill complete"
+            );
+        }
+    }
 
     let start_block = get_block_number(&client, &rpc_urls[0]).await?;
 
@@ -631,10 +684,9 @@ async fn main() -> Result<()> {
 
     let stats = Arc::new(Stats::new());
     stats.start_block.store(start_block, Ordering::Relaxed);
-    let semaphore = Arc::new(Semaphore::new(cli.concurrency));
 
     if cli.step {
-        let tps_levels = [500, 1000, 2000, 3000, 5000, 7500, 10000];
+        let tps_levels = [500, 1000, 2000, 3000, 5000, 7500, 10000, 15000, 20000];
         let step_duration = Duration::from_secs(60);
 
         for &target_tps in &tps_levels {
