@@ -22,7 +22,7 @@ const BUILDER_WARMUP_DELAY: Duration = Duration::from_millis(10);
 const PAYLOAD_BUILD_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Maximum number of cached pending block data entries.
-const MAX_PENDING_BLOCK_DATA: usize = 16;
+pub(super) const MAX_PENDING_BLOCK_DATA: usize = 16;
 
 /// Maximum number of blocks in the syncing retry queue.
 const MAX_SYNCING_QUEUE_SIZE: usize = 8;
@@ -530,9 +530,15 @@ impl ConsensusOrchestrator {
 
 // ── Free functions for the spawned payload build task ──
 
+/// Leader deferred-import: skip `new_payload` during block building, broadcast immediately.
+///
+/// The leader already executed all transactions during payload building.  Calling `new_payload`
+/// would re-execute them, doubling EVM time on the critical path.  The block is imported into
+/// reth later during `finalize_committed_block()` via a **background task** (not blocking the
+/// event loop).
 async fn handle_built_payload(
     payload: EthBuiltPayload,
-    engine_handle: ConsensusEngineHandle<EthEngineTypes>,
+    _engine_handle: ConsensusEngineHandle<EthEngineTypes>,
     network: NetworkHandle,
     block_ready_tx: mpsc::UnboundedSender<B256>,
     leader_payload_tx: mpsc::UnboundedSender<(B256, Vec<u8>)>,
@@ -552,26 +558,13 @@ async fn handle_built_payload(
         }
     };
 
-    match engine_handle.new_payload(execution_data).await {
-        Ok(status) => match status.status {
-            PayloadStatusEnum::Valid | PayloadStatusEnum::Accepted => {
-                debug!(target: "n42::cl::exec_bridge", %hash, status = ?status.status, "newPayload valid, broadcasting block data");
+    debug!(target: "n42::cl::exec_bridge", %hash, "leader deferred import: broadcasting block data (skipping new_payload)");
 
-                broadcast_block_data(&network, &leader_payload_tx, hash, current_view, &payload_json);
+    broadcast_block_data(&network, &leader_payload_tx, hash, current_view, &payload_json);
 
-                // BlockReady after broadcast: followers pre-import before Proposal arrives.
-                let _ = block_ready_tx.send(hash);
+    let _ = block_ready_tx.send(hash);
 
-                broadcast_blob_sidecars(&network, &payload, hash, current_view, blob_store);
-            }
-            _ => {
-                error!(target: "n42::cl::exec_bridge", %hash, status = ?status.status, "newPayload returned non-valid status");
-            }
-        },
-        Err(e) => {
-            error!(target: "n42::cl::exec_bridge", %hash, error = %e, "newPayload failed");
-        }
-    }
+    broadcast_blob_sidecars(&network, &payload, hash, current_view, blob_store);
 }
 
 fn broadcast_block_data(

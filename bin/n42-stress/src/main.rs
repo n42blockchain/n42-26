@@ -708,8 +708,16 @@ async fn main() -> Result<()> {
                 tracing::info!(pending, queued, "txpool after step");
             }
 
-            // Ceiling detection
-            if effective_tps < target_tps as f64 * 0.5 && target_tps > 500 {
+            // Ceiling detection: check if blocks stopped advancing
+            if blocks == 0 && target_tps > 500 {
+                tracing::warn!(
+                    target = target_tps,
+                    "STALL DETECTED - no new blocks produced, stopping"
+                );
+                break;
+            }
+
+            if effective_tps < target_tps as f64 * 0.3 && target_tps > 500 {
                 tracing::info!(
                     effective = format!("{:.0}", effective_tps),
                     target = target_tps,
@@ -718,9 +726,23 @@ async fn main() -> Result<()> {
                 break;
             }
 
-            // Wait for pool to drain between steps
-            tracing::info!("Waiting 10s for pool drain...");
-            tokio::time::sleep(Duration::from_secs(10)).await;
+            // Wait for pool to drain between steps (up to 60s)
+            tracing::info!("Waiting for pool to drain...");
+            let drain_start = Instant::now();
+            loop {
+                if drain_start.elapsed() > Duration::from_secs(60) {
+                    tracing::warn!("Pool drain timeout (60s), continuing anyway");
+                    break;
+                }
+                if let Ok((pending, queued)) = get_txpool_status(&client, &rpc_urls[0]).await {
+                    if pending + queued < 1000 {
+                        tracing::info!(pending, queued, elapsed_ms = drain_start.elapsed().as_millis(), "Pool drained");
+                        break;
+                    }
+                    tracing::info!(pending, queued, "Draining pool...");
+                }
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
         }
     } else {
         let start = Instant::now();

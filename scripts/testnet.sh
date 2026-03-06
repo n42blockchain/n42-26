@@ -364,7 +364,7 @@ genesis = {
         "terminalTotalDifficultyPassed": True,
     },
     "nonce": "0x0", "timestamp": "0x0", "extraData": "0x",
-    "gasLimit": "0xBEBC200", "difficulty": "0x0",
+    "gasLimit": "0x1DCD6500", "difficulty": "0x0",
     "mixHash": "0x" + "0" * 64,
     "coinbase": "0x0000000000000000000000000000000000000000",
     "alloc": {
@@ -517,7 +517,7 @@ start_validators() {
             --max-outbound-peers "$NUM_VALIDATORS" \
             --max-inbound-peers "$NUM_VALIDATORS" \
             --metrics "127.0.0.1:$metrics_port" \
-            --builder.gaslimit 200000000 \
+            --builder.gaslimit 500000000 \
             --builder.interval 50ms \
             --txpool.additional-validation-tasks 16 \
             --disable-tx-gossip \

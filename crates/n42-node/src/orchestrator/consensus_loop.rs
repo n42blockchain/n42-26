@@ -4,6 +4,8 @@ use alloy_primitives::B256;
 use alloy_rpc_types_engine::{ForkchoiceState, PayloadStatusEnum};
 use n42_consensus::EngineOutput;
 use n42_primitives::QuorumCertificate;
+use reth_ethereum_engine_primitives::EthEngineTypes;
+use reth_node_builder::ConsensusEngineHandle;
 use reth_payload_primitives::EngineApiMessageVersion;
 use std::time::Duration;
 use tokio::time::Instant;
@@ -234,10 +236,10 @@ impl ConsensusOrchestrator {
         self.finalize_committed_block(view, block_hash, commit_qc).await;
         self.save_consensus_state();
 
-        if self.engine.is_current_leader() {
-            debug!(target: "n42::cl::consensus_loop", next_view = self.engine.current_view(), "leader for next view");
-            self.schedule_payload_build().await;
-        }
+        // Note: if finalize_committed_block spawned a background import (Case B),
+        // we do NOT schedule the next payload build here. It will be triggered by
+        // handle_import_done when the background import completes.
+        // Case A (block already in reth) schedules the build immediately.
     }
 
     async fn finalize_committed_block(
@@ -279,7 +281,8 @@ impl ConsensusOrchestrator {
         };
 
         if finalized {
-            // Case A: Block already in reth (leader path, or fast follower).
+            // Case A: Block already in reth (leader built + new_payload already done,
+            // OR block was previously imported by a follower).
             debug!(target: "n42::cl::consensus_loop", view, %block_hash, "block finalized in reth");
             self.pending_block_data.clear();
             self.pending_executions.clear();
@@ -288,29 +291,80 @@ impl ConsensusOrchestrator {
             {
                 warn!(target: "n42::cl::consensus_loop", view, %block_hash, error = %e, "mobile_packet_tx full or closed, verification packet lost");
             }
-        } else if let Some(data) = self.pending_block_data.remove(&block_hash) {
-            // Case B: BlockData cached but not yet imported.
-            info!(target: "n42::cl::consensus_loop", view, %block_hash, "block data cached, importing for deferred finalization");
-            match bincode::deserialize(&data) {
-                Ok(broadcast) => {
-                    self.import_and_notify(broadcast).await;
-                    self.pending_block_data.clear();
-                    self.pending_executions.clear();
-                    if let Some(ref tx) = self.mobile_packet_tx
-                        && let Err(e) = tx.try_send((block_hash, view))
-                    {
-                        warn!(target: "n42::cl::consensus_loop", view, %block_hash, error = %e, "mobile_packet_tx full or closed, verification packet lost");
-                    }
-                }
-                Err(e) => {
-                    warn!(target: "n42::cl::consensus_loop", %block_hash, error = %e, "failed to deserialize cached block data");
-                    self.defer_finalization(view, block_hash, commit_qc);
-                }
+            // Case A: block already in reth — build immediately (no import delay risk).
+            if self.engine.is_current_leader() {
+                debug!(target: "n42::cl::consensus_loop", next_view = self.engine.current_view(), "leader: immediate build (Case A)");
+                self.do_trigger_payload_build(None).await;
             }
+        } else if let Some(data) = self.pending_block_data.remove(&block_hash) {
+            // Case B: BlockData cached but not yet imported (deferred import path).
+            // Spawn background task to avoid blocking the consensus event loop.
+            info!(target: "n42::cl::consensus_loop", view, %block_hash, "spawning background import for deferred finalization");
+            self.pending_block_data.clear();
+            self.pending_executions.clear();
+            let done_tx = self.import_done_tx.clone();
+            let eh = engine_handle.clone();
+            tokio::spawn(async move {
+                let success = Self::background_import(eh, &data, block_hash).await;
+                let _ = done_tx.send((block_hash, view, success));
+            });
         } else {
             // Case C: Decide arrived before BlockData — defer finalization.
             info!(target: "n42::cl::consensus_loop", view, %block_hash, "block not yet in reth, deferring finalization");
             self.defer_finalization(view, block_hash, commit_qc);
+        }
+    }
+
+    /// Runs `new_payload` + `fork_choice_updated` in a background task.
+    /// Returns true if the block was successfully imported.
+    async fn background_import(
+        engine_handle: ConsensusEngineHandle<EthEngineTypes>,
+        data: &[u8],
+        block_hash: B256,
+    ) -> bool {
+        let broadcast: super::BlockDataBroadcast = match bincode::deserialize(data) {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(target: "n42::cl::consensus_loop", %block_hash, error = %e, "bg import: failed to deserialize block data");
+                return false;
+            }
+        };
+        let execution_data = match serde_json::from_slice(&broadcast.payload_json) {
+            Ok(d) => d,
+            Err(e) => {
+                warn!(target: "n42::cl::consensus_loop", %block_hash, error = %e, "bg import: failed to parse execution payload");
+                return false;
+            }
+        };
+        match engine_handle.new_payload(execution_data).await {
+            Ok(status)
+                if matches!(
+                    status.status,
+                    PayloadStatusEnum::Valid | PayloadStatusEnum::Accepted
+                ) =>
+            {
+                let fcu = ForkchoiceState {
+                    head_block_hash: block_hash,
+                    safe_block_hash: block_hash,
+                    finalized_block_hash: block_hash,
+                };
+                if let Err(e) = engine_handle
+                    .fork_choice_updated(fcu, None, EngineApiMessageVersion::default())
+                    .await
+                {
+                    error!(target: "n42::cl::consensus_loop", %block_hash, error = %e, "bg import: fcu failed");
+                }
+                info!(target: "n42::cl::consensus_loop", %block_hash, "bg import: block imported successfully");
+                true
+            }
+            Ok(status) => {
+                warn!(target: "n42::cl::consensus_loop", %block_hash, status = ?status.status, "bg import: new_payload rejected");
+                false
+            }
+            Err(e) => {
+                error!(target: "n42::cl::consensus_loop", %block_hash, error = %e, "bg import: new_payload failed");
+                false
+            }
         }
     }
 
@@ -364,13 +418,60 @@ impl ConsensusOrchestrator {
         }
     }
 
-    pub(super) fn handle_leader_payload_feedback(&mut self, hash: B256, data: Vec<u8>) {
+    /// Called when a background import task completes.
+    pub(super) async fn handle_import_done(&mut self, hash: B256, view: u64, success: bool) {
+        if success {
+            info!(target: "n42::cl::consensus_loop", %hash, view, "background import completed, updating head");
+            self.head_block_hash = hash;
+            if let Some(ref tx) = self.mobile_packet_tx
+                && let Err(e) = tx.try_send((hash, view))
+            {
+                warn!(target: "n42::cl::consensus_loop", view, %hash, error = %e, "mobile_packet_tx full or closed");
+            }
+            if self.engine.is_current_leader() {
+                debug!(target: "n42::cl::consensus_loop", next_view = self.engine.current_view(), "leader: scheduling build after bg import");
+                self.schedule_payload_build().await;
+            }
+        } else {
+            warn!(target: "n42::cl::consensus_loop", %hash, view, "background import FAILED, requesting sync");
+            counter!("n42_bg_import_failures_total").increment(1);
+            self.initiate_sync(view, self.engine.current_view());
+        }
+    }
+
+    pub(super) async fn handle_leader_payload_feedback(&mut self, hash: B256, data: Vec<u8>) {
+        // Cache the block data for deferred import during finalization.
+        // The leader skips new_payload during building (deferred-import optimization),
+        // so the block data must be available in pending_block_data for Case B in
+        // finalize_committed_block().  GossipSub does not echo to self, so without
+        // this cache the leader's own block would fall to Case C (missing data).
+        if !self.pending_block_data.contains_key(&hash) {
+            if self.pending_block_data.len() >= super::execution_bridge::MAX_PENDING_BLOCK_DATA {
+                if let Some(old_key) = self.pending_block_data.keys().next().copied() {
+                    self.pending_block_data.remove(&old_key);
+                }
+            }
+            self.pending_block_data.insert(hash, data.clone());
+            debug!(target: "n42::cl::consensus_loop", %hash, "cached leader block data for deferred import");
+        }
+
         if let Some(block) = self.committed_blocks.iter_mut().rev().find(|b| b.block_hash == hash)
             && block.payload.is_empty()
             && let Ok(broadcast) = bincode::deserialize::<super::BlockDataBroadcast>(&data)
         {
             block.payload = broadcast.payload_json;
             debug!(target: "n42::cl::consensus_loop", %hash, "populated committed block payload from leader build task");
+        }
+
+        // If a deferred finalization is pending for this hash, complete it now.
+        // This handles the race where commit arrives before leader_payload_rx.
+        let should_finalize = self.pending_finalization.as_ref()
+            .is_some_and(|pf| pf.block_hash == hash);
+        if should_finalize {
+            info!(target: "n42::cl::consensus_loop", %hash, "leader block data arrived, completing deferred finalization");
+            if let Some(pf) = self.pending_finalization.take() {
+                self.finalize_committed_block(pf.view, pf.block_hash, pf.commit_qc).await;
+            }
         }
     }
 }

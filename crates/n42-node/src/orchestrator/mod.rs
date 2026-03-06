@@ -93,6 +93,10 @@ pub struct ConsensusOrchestrator {
     mobile_packet_tx: Option<mpsc::Sender<(B256, u64)>>,
     leader_payload_rx: mpsc::UnboundedReceiver<(B256, Vec<u8>)>,
     leader_payload_tx: mpsc::UnboundedSender<(B256, Vec<u8>)>,
+    /// Receives notifications when a background `import_and_notify` task completes.
+    /// Tuple: (block_hash, view, success).
+    import_done_rx: mpsc::UnboundedReceiver<(B256, u64, bool)>,
+    import_done_tx: mpsc::UnboundedSender<(B256, u64, bool)>,
     blob_store: Option<DiskFileBlobStore>,
     mobile_reward_manager: Option<Arc<Mutex<MobileRewardManager>>>,
     staking_manager: Option<Arc<Mutex<StakingManager>>>,
@@ -120,6 +124,7 @@ impl ConsensusOrchestrator {
     ) -> Self {
         let (block_ready_tx, block_ready_rx) = mpsc::unbounded_channel();
         let (leader_payload_tx, leader_payload_rx) = mpsc::unbounded_channel();
+        let (import_done_tx, import_done_rx) = mpsc::unbounded_channel();
         Self {
             engine,
             network,
@@ -151,6 +156,8 @@ impl ConsensusOrchestrator {
             mobile_packet_tx: None,
             leader_payload_rx,
             leader_payload_tx,
+            import_done_rx,
+            import_done_tx,
             blob_store: None,
             mobile_reward_manager: None,
             staking_manager: None,
@@ -175,6 +182,7 @@ impl ConsensusOrchestrator {
     ) -> Self {
         let (block_ready_tx, block_ready_rx) = mpsc::unbounded_channel();
         let (leader_payload_tx, leader_payload_rx) = mpsc::unbounded_channel();
+        let (import_done_tx, import_done_rx) = mpsc::unbounded_channel();
 
         let slot_time_ms: u64 = std::env::var("N42_BLOCK_INTERVAL_MS")
             .ok()
@@ -217,6 +225,8 @@ impl ConsensusOrchestrator {
             mobile_packet_tx: None,
             leader_payload_rx,
             leader_payload_tx,
+            import_done_rx,
+            import_done_tx,
             blob_store: None,
             mobile_reward_manager: None,
             staking_manager: None,
@@ -367,7 +377,13 @@ impl ConsensusOrchestrator {
 
                 payload_data = self.leader_payload_rx.recv() => {
                     if let Some((hash, data)) = payload_data {
-                        self.handle_leader_payload_feedback(hash, data);
+                        self.handle_leader_payload_feedback(hash, data).await;
+                    }
+                }
+
+                import_result = self.import_done_rx.recv() => {
+                    if let Some((hash, view, success)) = import_result {
+                        self.handle_import_done(hash, view, success).await;
                     }
                 }
 

@@ -7,6 +7,7 @@ use reth_ethereum_engine_primitives::{
     EthBuiltPayload, EthPayloadAttributes, EthPayloadBuilderAttributes,
 };
 use reth_ethereum_payload_builder::{default_ethereum_payload, EthereumBuilderConfig};
+use std::time::Duration;
 use reth_ethereum_primitives::{EthPrimitives, TransactionSigned};
 use reth_evm::{ConfigureEvm, NextBlockEnvAttributes};
 use reth_node_api::{FullNodeTypes, NodeTypes, PrimitivesTy, TxTy};
@@ -58,13 +59,23 @@ where
         let conf = ctx.payload_builder_config();
         let gas_limit = conf.gas_limit_for(ctx.chain_spec().chain());
 
+        // Build time budget: leave headroom within the slot for consensus + import.
+        // Default: 3 seconds (fits comfortably in a 4-second slot).
+        let build_budget = Duration::from_millis(
+            std::env::var("N42_BUILD_TIME_BUDGET_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(3000),
+        );
+
         Ok(N42InnerPayloadBuilder {
             client: ctx.provider().clone(),
             pool,
             evm_config,
             base_config: EthereumBuilderConfig::new()
                 .with_gas_limit(gas_limit)
-                .with_max_blobs_per_block(conf.max_blobs_per_block()),
+                .with_max_blobs_per_block(conf.max_blobs_per_block())
+                .with_build_time_budget(build_budget),
             consensus_state: self.consensus_state,
         })
     }
