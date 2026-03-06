@@ -263,12 +263,18 @@ impl ConsensusOrchestrator {
             finalized_block_hash: block_hash,
         };
 
+        let fcu_start = std::time::Instant::now();
         let finalized = match engine_handle
             .fork_choice_updated(fcu_state, None, EngineApiMessageVersion::default())
             .await
         {
             Ok(result) => {
-                debug!(target: "n42::cl::consensus_loop", view, %block_hash, status = ?result.payload_status.status, "fcu result");
+                let elapsed_ms = fcu_start.elapsed().as_millis() as u64;
+                if elapsed_ms > 5 {
+                    info!(target: "n42::cl::consensus_loop", view, %block_hash, status = ?result.payload_status.status, elapsed_ms, "finalize fcu (waited for engine)");
+                } else {
+                    debug!(target: "n42::cl::consensus_loop", view, %block_hash, status = ?result.payload_status.status, elapsed_ms, "finalize fcu result");
+                }
                 matches!(
                     result.payload_status.status,
                     PayloadStatusEnum::Valid | PayloadStatusEnum::Accepted

@@ -543,15 +543,21 @@ impl ConsensusOrchestrator {
 
 // ── Free functions for the spawned payload build task ──
 
-/// Leader deferred-import: skip `new_payload` during block building, broadcast immediately.
+/// Leader pipelined import: broadcast block data, trigger consensus, then import eagerly.
 ///
-/// The leader already executed all transactions during payload building.  Calling `new_payload`
-/// would re-execute them, doubling EVM time on the critical path.  The block is imported into
-/// reth later during `finalize_committed_block()` via a **background task** (not blocking the
-/// event loop).
+/// The leader already executed all transactions during payload building.  Instead of calling
+/// `new_payload` synchronously (which would double EVM time on the critical path), we:
+///   1. Broadcast block data + blob sidecars to followers
+///   2. Send BlockReady to trigger consensus voting immediately
+///   3. Call `new_payload` + `fcu` eagerly while consensus is running in parallel
+///
+/// If the eager import completes before `finalize_committed_block()` runs, that function
+/// will find the block already in reth (Case A) and trigger the next build immediately —
+/// eliminating the ~200ms pipeline stall from the background import path (Case B).
+/// If consensus is faster than import, Case B still works as a fallback.
 async fn handle_built_payload(
     payload: EthBuiltPayload,
-    _engine_handle: ConsensusEngineHandle<EthEngineTypes>,
+    engine_handle: ConsensusEngineHandle<EthEngineTypes>,
     network: NetworkHandle,
     block_ready_tx: mpsc::UnboundedSender<B256>,
     leader_payload_tx: mpsc::UnboundedSender<(B256, Vec<u8>)>,
@@ -572,13 +578,44 @@ async fn handle_built_payload(
     };
 
     let block_timestamp = payload.block().header().timestamp;
-    debug!(target: "n42::cl::exec_bridge", %hash, block_timestamp, "leader deferred import: broadcasting block data (skipping new_payload)");
+    debug!(target: "n42::cl::exec_bridge", %hash, block_timestamp, "leader pipelined import: broadcasting block data");
 
+    // 1. Broadcast block data + blob sidecars to followers
     broadcast_block_data(&network, &leader_payload_tx, hash, current_view, &payload_json, block_timestamp);
+    broadcast_blob_sidecars(&network, &payload, hash, current_view, blob_store);
 
+    // 2. Trigger consensus voting immediately (non-blocking channel send)
     let _ = block_ready_tx.send(hash);
 
-    broadcast_blob_sidecars(&network, &payload, hash, current_view, blob_store);
+    // 3. Eager import: run new_payload + fcu while consensus votes in parallel.
+    //    This is the key pipelining optimization — by the time finalize_committed_block
+    //    runs after consensus commit, the block is likely already in reth (Case A).
+    let import_start = std::time::Instant::now();
+    match engine_handle.new_payload(execution_data).await {
+        Ok(status) if matches!(status.status, PayloadStatusEnum::Valid | PayloadStatusEnum::Accepted) => {
+            let np_elapsed = import_start.elapsed().as_millis() as u64;
+            let fcu = ForkchoiceState {
+                head_block_hash: hash,
+                safe_block_hash: hash,
+                finalized_block_hash: hash,
+            };
+            if let Err(e) = engine_handle
+                .fork_choice_updated(fcu, None, EngineApiMessageVersion::default())
+                .await
+            {
+                info!(target: "n42::cl::exec_bridge", %hash, np_elapsed, error = %e, "eager import: fcu failed");
+            } else {
+                info!(target: "n42::cl::exec_bridge", %hash, elapsed_ms = import_start.elapsed().as_millis() as u64, np_elapsed, "eager import: block imported successfully");
+                metrics::counter!("n42_eager_import_hits_total").increment(1);
+            }
+        }
+        Ok(status) => {
+            info!(target: "n42::cl::exec_bridge", %hash, status = ?status.status, elapsed_ms = import_start.elapsed().as_millis() as u64, "eager import: new_payload not accepted");
+        }
+        Err(e) => {
+            info!(target: "n42::cl::exec_bridge", %hash, error = %e, "eager import: new_payload failed");
+        }
+    }
 }
 
 fn broadcast_block_data(
