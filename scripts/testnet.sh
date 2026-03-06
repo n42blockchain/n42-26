@@ -367,7 +367,12 @@ genesis = {
     "gasLimit": "0xBEBC200", "difficulty": "0x0",
     "mixHash": "0x" + "0" * 64,
     "coinbase": "0x0000000000000000000000000000000000000000",
-    "alloc": {a["address"]: {"balance": INITIAL_BALANCE} for a in accounts},
+    "alloc": {
+        # Genesis master account: 30 billion N42
+        "0xe3778939cdCa78b70fc36dE06B0E862333D6D8dc": {"balance": "0x60EF6B1ABA6F072330000000"},
+        # Test accounts: 100M N42 each
+        **{a["address"]: {"balance": INITIAL_BALANCE} for a in accounts},
+    },
     "number": "0x0", "gasUsed": "0x0",
     "parentHash": "0x" + "0" * 64,
     "baseFeePerGas": "0x3B9ACA00",

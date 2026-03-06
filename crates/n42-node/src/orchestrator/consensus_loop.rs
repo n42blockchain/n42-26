@@ -172,14 +172,15 @@ impl ConsensusOrchestrator {
             "ExecuteBlock requested"
         );
 
-        if let Some(data) = self.pending_block_data.remove(&block_hash) {
-            match bincode::deserialize(&data) {
-                Ok(broadcast) => {
-                    self.import_and_notify(broadcast).await;
-                }
-                Err(e) => {
-                    warn!(target: "n42::cl::consensus_loop", %block_hash, error = %e, "failed to deserialize cached block data");
-                }
+        if self.pending_block_data.contains_key(&block_hash) {
+            // Block data already cached — notify consensus immediately for fast voting.
+            // Actual EVM execution deferred to finalize_committed_block() (Case B).
+            debug!(target: "n42::cl::consensus_loop", %block_hash, "block data available, notifying consensus (deferred execution)");
+            if let Err(e) = self
+                .engine
+                .process_event(n42_consensus::ConsensusEvent::BlockImported(block_hash))
+            {
+                error!(target: "n42::cl::consensus_loop", %block_hash, error = %e, "error processing BlockImported");
             }
         } else {
             self.pending_executions.insert(block_hash);

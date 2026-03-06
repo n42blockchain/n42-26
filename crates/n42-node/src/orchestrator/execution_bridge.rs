@@ -230,7 +230,16 @@ impl ConsensusOrchestrator {
         });
     }
 
-    /// Handles incoming block data from the leader, caching and pre-importing.
+    /// Handles incoming block data from the leader.
+    ///
+    /// **Async execution optimization**: Instead of executing the block (new_payload)
+    /// before voting, we immediately notify the consensus engine that block data is
+    /// available.  This allows followers to vote without waiting for EVM execution.
+    /// Actual execution is deferred to `finalize_committed_block()` (Case B).
+    ///
+    /// Safety: HotStuff-2 safety depends on the QC chain, not execution results.
+    /// The leader already executed the block when building it.  If execution fails
+    /// at finalization time, the node will detect the inconsistency and trigger sync.
     pub(super) async fn handle_block_data(&mut self, data: Vec<u8>) {
         debug!(target: "n42::cl::exec_bridge", bytes = data.len(), "handle_block_data called");
         let broadcast: BlockDataBroadcast = match bincode::deserialize(&data) {
@@ -244,6 +253,14 @@ impl ConsensusOrchestrator {
         let hash = broadcast.block_hash;
         self.pending_executions.remove(&hash);
 
+        // Extract timestamp for follower tracking (needed before execution).
+        if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&broadcast.payload_json)
+            && let Some(ts_hex) = parsed.get("timestamp").and_then(|t| t.as_str())
+            && let Ok(ts) = u64::from_str_radix(ts_hex.trim_start_matches("0x"), 16)
+        {
+            self.last_committed_timestamp = self.last_committed_timestamp.max(ts);
+        }
+
         if self.pending_block_data.len() >= MAX_PENDING_BLOCK_DATA
             && let Some(old_key) = self.pending_block_data.keys().next().copied()
         {
@@ -251,9 +268,15 @@ impl ConsensusOrchestrator {
         }
         self.pending_block_data.insert(hash, data);
 
-        // Pre-import so the block is in reth when the Proposal arrives.
-        debug!(target: "n42::cl::exec_bridge", %hash, "speculative pre-import");
-        self.import_and_notify(broadcast).await;
+        // Notify consensus immediately — enables voting without EVM execution.
+        // Execution will happen at finalization time (finalize_committed_block Case B).
+        debug!(target: "n42::cl::exec_bridge", %hash, "block data cached, notifying consensus (deferred execution)");
+        if let Err(e) = self
+            .engine
+            .process_event(ConsensusEvent::BlockImported(hash))
+        {
+            error!(target: "n42::cl::exec_bridge", error = %e, "error processing BlockImported for deferred execution");
+        }
     }
 
     pub(super) fn handle_blob_sidecar(&self, data: Vec<u8>) {
