@@ -7,7 +7,6 @@ use reth_ethereum_engine_primitives::{
     EthBuiltPayload, EthPayloadAttributes, EthPayloadBuilderAttributes,
 };
 use reth_ethereum_payload_builder::{default_ethereum_payload, EthereumBuilderConfig};
-use std::time::Duration;
 use reth_ethereum_primitives::{EthPrimitives, TransactionSigned};
 use reth_evm::{ConfigureEvm, NextBlockEnvAttributes};
 use reth_node_api::{FullNodeTypes, NodeTypes, PrimitivesTy, TxTy};
@@ -59,23 +58,13 @@ where
         let conf = ctx.payload_builder_config();
         let gas_limit = conf.gas_limit_for(ctx.chain_spec().chain());
 
-        // Build time budget: leave headroom within the slot for consensus + import.
-        // Default: 3 seconds (fits comfortably in a 4-second slot).
-        let build_budget = Duration::from_millis(
-            std::env::var("N42_BUILD_TIME_BUDGET_MS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(3000),
-        );
-
         Ok(N42InnerPayloadBuilder {
             client: ctx.provider().clone(),
             pool,
             evm_config,
             base_config: EthereumBuilderConfig::new()
                 .with_gas_limit(gas_limit)
-                .with_max_blobs_per_block(conf.max_blobs_per_block())
-                .with_build_time_budget(build_budget),
+                .with_max_blobs_per_block(conf.max_blobs_per_block()),
             consensus_state: self.consensus_state,
         })
     }
@@ -109,6 +98,12 @@ where
         &self,
         args: BuildArguments<EthPayloadBuilderAttributes, EthBuiltPayload>,
     ) -> Result<BuildOutcome<EthBuiltPayload>, PayloadBuilderError> {
+        // Log pool depth before building — key diagnostic for TPS bottleneck analysis.
+        let pool_pending = self.pool.pool_size().pending;
+        let pool_queued = self.pool.pool_size().queued;
+        metrics::gauge!("n42_pool_pending_at_build").set(pool_pending as f64);
+        metrics::gauge!("n42_pool_queued_at_build").set(pool_queued as f64);
+
         let build_start = std::time::Instant::now();
         let result = default_ethereum_payload(
             self.evm_config.clone(),
@@ -124,6 +119,12 @@ where
             Ok(BuildOutcome::Better { payload, .. }) => {
                 let tx_count = payload.block().body().transactions().count();
                 let gas_used = payload.block().header().gas_used;
+                let gas_limit = payload.block().header().gas_limit;
+                let gas_pct = if gas_limit > 0 {
+                    (gas_used as f64 / gas_limit as f64) * 100.0
+                } else {
+                    0.0
+                };
                 metrics::histogram!("n42_payload_build_ms").record(elapsed_ms as f64);
                 metrics::gauge!("n42_payload_tx_count").set(tx_count as f64);
                 metrics::gauge!("n42_payload_gas_used").set(gas_used as f64);
@@ -133,7 +134,10 @@ where
                         elapsed_ms,
                         tx_count,
                         gas_used,
-                        gas_limit = payload.block().header().gas_limit,
+                        gas_limit,
+                        gas_pct = format!("{:.1}%", gas_pct),
+                        pool_pending,
+                        pool_queued,
                         "payload built"
                     );
                 }

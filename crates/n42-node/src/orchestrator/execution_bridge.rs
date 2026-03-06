@@ -622,6 +622,7 @@ impl ConsensusOrchestrator {
 /// will find the block already in reth (Case A) and trigger the next build immediately —
 /// eliminating the ~200ms pipeline stall from the background import path (Case B).
 /// If consensus is faster than import, Case B still works as a fallback.
+#[allow(clippy::too_many_arguments)]
 async fn handle_built_payload(
     payload: EthBuiltPayload,
     engine_handle: ConsensusEngineHandle<EthEngineTypes>,

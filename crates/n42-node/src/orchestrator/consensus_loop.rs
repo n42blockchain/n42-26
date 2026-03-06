@@ -320,10 +320,10 @@ impl ConsensusOrchestrator {
             // flow before the data was cached. Drain the leader_payload_rx to recover.
             while let Ok((hash, data)) = self.leader_payload_rx.try_recv() {
                 if !self.pending_block_data.contains_key(&hash) {
-                    if self.pending_block_data.len() >= super::execution_bridge::MAX_PENDING_BLOCK_DATA {
-                        if let Some(old_key) = self.pending_block_data.keys().next().copied() {
-                            self.pending_block_data.remove(&old_key);
-                        }
+                    if self.pending_block_data.len() >= super::execution_bridge::MAX_PENDING_BLOCK_DATA
+                        && let Some(old_key) = self.pending_block_data.keys().next().copied()
+                    {
+                        self.pending_block_data.remove(&old_key);
                     }
                     self.pending_block_data.insert(hash, data);
                 }
@@ -561,10 +561,10 @@ impl ConsensusOrchestrator {
         // finalize_committed_block().  GossipSub does not echo to self, so without
         // this cache the leader's own block would fall to Case C (missing data).
         if !self.pending_block_data.contains_key(&hash) {
-            if self.pending_block_data.len() >= super::execution_bridge::MAX_PENDING_BLOCK_DATA {
-                if let Some(old_key) = self.pending_block_data.keys().next().copied() {
-                    self.pending_block_data.remove(&old_key);
-                }
+            if self.pending_block_data.len() >= super::execution_bridge::MAX_PENDING_BLOCK_DATA
+                && let Some(old_key) = self.pending_block_data.keys().next().copied()
+            {
+                self.pending_block_data.remove(&old_key);
             }
             self.pending_block_data.insert(hash, data.clone());
             debug!(target: "n42::cl::consensus_loop", %hash, "cached leader block data for deferred import");
