@@ -339,7 +339,7 @@ import json, os
 from eth_account import Account
 from eth_utils import keccak
 
-NUM_ACCOUNTS = 10
+NUM_ACCOUNTS = 600
 CHAIN_ID = 4242
 INITIAL_BALANCE = "0x4B3B4CA85A86C47A098A224000000"  # 100M N42 per account
 
@@ -364,7 +364,7 @@ genesis = {
         "terminalTotalDifficultyPassed": True,
     },
     "nonce": "0x0", "timestamp": "0x0", "extraData": "0x",
-    "gasLimit": "0x1C9C380", "difficulty": "0x0",
+    "gasLimit": "0xBEBC200", "difficulty": "0x0",
     "mixHash": "0x" + "0" * 64,
     "coinbase": "0x0000000000000000000000000000000000000000",
     "alloc": {a["address"]: {"balance": INITIAL_BALANCE} for a in accounts},
@@ -499,7 +499,7 @@ start_validators() {
             --datadir "$datadir" \
             --http \
             --http.port "$http_port" \
-            --http.api eth,net,web3,debug,trace,txpool,rpc \
+            --http.api eth,net,web3,txpool,rpc \
             --http.corsdomain "*" \
             --ws \
             --ws.port "$ws_port" \
@@ -512,7 +512,13 @@ start_validators() {
             --max-outbound-peers "$NUM_VALIDATORS" \
             --max-inbound-peers "$NUM_VALIDATORS" \
             --metrics "127.0.0.1:$metrics_port" \
-            --builder.gaslimit 120000000 \
+            --builder.gaslimit 200000000 \
+            --builder.interval 50ms \
+            --txpool.additional-validation-tasks 16 \
+            --disable-tx-gossip \
+            --rpc.max-connections 1000 \
+            --rpc.max-request-size 50 \
+            --rpc.max-response-size 50 \
             ${p2p_key_flag} \
             ${TRUSTED_PEERS_FLAG} \
             > "$log_file" 2>&1 &

@@ -1,0 +1,16 @@
+[package]
+name = "n42-evm-bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "N42 EVM single-core benchmark: ETH transfer & ERC-20 transfer"
+
+[[bin]]
+name = "n42-evm-bench"
+path = "src/main.rs"
+
+[dependencies]
+revm = { workspace = true, features = ["std"] }
+alloy-primitives.workspace = true
+hex.workspace = true

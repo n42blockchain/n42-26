@@ -3,6 +3,7 @@ members = [
     "bin/n42-node",
     "bin/n42-mobile-sim",
     "bin/n42-stress",
+    "bin/n42-evm-bench",
     "crates/n42-primitives",
     "crates/n42-chainspec",
     "crates/n42-consensus",

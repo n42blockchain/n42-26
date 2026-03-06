@@ -58,7 +58,7 @@ where
                 .with_max_tx_input_bytes(ctx.config().txpool.max_tx_input_bytes)
                 .with_max_tx_gas_limit(ctx.config().txpool.max_tx_gas_limit)
                 .with_minimum_priority_fee(ctx.config().txpool.minimum_priority_fee)
-                .with_additional_tasks(ctx.config().txpool.additional_validation_tasks)
+                .with_additional_tasks(ctx.config().txpool.additional_validation_tasks.max(16))
                 .build_with_tasks(ctx.task_executor().clone(), blob_store.clone());
 
         let pool_config = idc_pool_config(&ctx.pool_config());
@@ -78,7 +78,7 @@ fn idc_pool_config(base: &PoolConfig) -> PoolConfig {
         basefee_limit: SubPoolLimit { max_txs: 25_000, max_size: 50 * 1024 * 1024 },
         queued_limit: SubPoolLimit { max_txs: 25_000, max_size: 50 * 1024 * 1024 },
         blob_limit: SubPoolLimit { max_txs: 256, max_size: 50 * 1024 * 1024 },
-        max_account_slots: 1024,
+        max_account_slots: 4096,
         ..base.clone()
     }
 }

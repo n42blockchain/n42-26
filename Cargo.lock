@@ -5570,6 +5570,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "n42-evm-bench"
+version = "0.2.6"
+dependencies = [
+ "alloy-primitives",
+ "hex",
+ "revm 36.0.0",
+]
+
+[[package]]
 name = "n42-execution"
 version = "0.2.6"
 dependencies = [

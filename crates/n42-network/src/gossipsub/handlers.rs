@@ -86,7 +86,7 @@ pub fn validate_message(
     // Block data can reach several MB; consensus messages are small (~130-500 bytes).
     // Mempool transactions capped at 128KB; blob sidecars at 1MB.
     let max_size = if topic == block_topic_hash {
-        4 * 1024 * 1024 // 4MB for block data
+        8 * 1024 * 1024 // 8MB for high-throughput block data
     } else if topic == blob_sidecar_topic_hash {
         1024 * 1024 // 1MB for blob sidecars
     } else if topic == mempool_topic_hash {

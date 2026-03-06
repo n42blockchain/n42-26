@@ -126,8 +126,8 @@ pub fn build_swarm_with_validator_index(
         // Permissive: messages forwarded automatically after delivery.
         // Application-level validation is in handle_gossipsub_message.
         .validation_mode(gossipsub::ValidationMode::Permissive)
-        // 4MB max: block broadcasts can reach several MB.
-        .max_transmit_size(4 * 1024 * 1024)
+        // 8MB max: high-throughput blocks can reach several MB.
+        .max_transmit_size(8 * 1024 * 1024)
         .mesh_n(config.mesh_d)
         .mesh_n_low(config.mesh_d_low)
         .mesh_n_high(config.mesh_d_high)

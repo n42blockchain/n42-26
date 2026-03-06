@@ -16,7 +16,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 /// Delay before resolving the built payload, allowing the builder to pack transactions.
-const BUILDER_WARMUP_DELAY: Duration = Duration::from_millis(100);
+const BUILDER_WARMUP_DELAY: Duration = Duration::from_millis(10);
 
 /// Maximum time to wait for a payload build to complete.
 const PAYLOAD_BUILD_TIMEOUT: Duration = Duration::from_secs(30);
