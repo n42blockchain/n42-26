@@ -299,8 +299,13 @@ impl ConsensusOrchestrator {
             }
             // Case A: block already in reth — build immediately (no import delay risk).
             if self.engine.is_current_leader() {
-                debug!(target: "n42::cl::consensus_loop", next_view = self.engine.current_view(), "leader: immediate build (Case A)");
-                self.do_trigger_payload_build(None).await;
+                if self.speculative_build_hash == Some(block_hash) {
+                    debug!(target: "n42::cl::consensus_loop", next_view = self.engine.current_view(), "leader: speculative build already in progress (Case A)");
+                    // Don't clear yet — let handle_view_changed see it too.
+                } else {
+                    debug!(target: "n42::cl::consensus_loop", next_view = self.engine.current_view(), "leader: immediate build (Case A)");
+                    self.do_trigger_payload_build(None).await;
+                }
             }
         } else if let Some(data) = self.pending_block_data.remove(&block_hash) {
             // Case B: BlockData cached but not yet imported (deferred import path).
@@ -473,10 +478,16 @@ impl ConsensusOrchestrator {
             // the build once the import completes and head is current.
             if self.bg_import_in_flight || !self.bg_import_queue.is_empty() {
                 debug!(target: "n42::cl::consensus_loop", new_view, in_flight = self.bg_import_in_flight, queued = self.bg_import_queue.len(), "leader after view change, deferring build until bg imports complete");
+                self.speculative_build_hash = None;
+            } else if self.speculative_build_hash.take().is_some() {
+                debug!(target: "n42::cl::consensus_loop", new_view, "speculative build already in progress, skipping view-change build");
             } else {
                 debug!(target: "n42::cl::consensus_loop", new_view, "became leader after view change, triggering payload build");
                 self.do_trigger_payload_build(None).await;
             }
+        } else {
+            // Not leader for this view — clear any stale speculative build.
+            self.speculative_build_hash = None;
         }
     }
 
@@ -509,6 +520,36 @@ impl ConsensusOrchestrator {
             self.spawn_bg_import(data, next_hash, next_view);
         } else if self.engine.is_current_leader() {
             debug!(target: "n42::cl::consensus_loop", next_view = self.engine.current_view(), "leader: immediate build after all bg imports done");
+            self.do_trigger_payload_build(None).await;
+        }
+    }
+
+    /// Called when an eager import task (leader or follower) completes successfully.
+    /// The block is now in reth — if this node is the leader for the NEXT view,
+    /// start building speculatively before consensus commits the current block.
+    pub(super) async fn handle_eager_import_done(&mut self, hash: B256, block_ts: u64) {
+        // Update head and timestamp so finalize_committed_block will see Case A.
+        self.head_block_hash = hash;
+        if block_ts > 0 {
+            self.last_committed_timestamp = self.last_committed_timestamp.max(block_ts);
+        }
+
+        let current_view = self.engine.current_view();
+        let next_view = current_view + 1;
+        let is_current = self.engine.is_current_leader();
+        let is_next = self.engine.is_leader_for_view(next_view);
+
+        if (is_current || is_next) && !self.bg_import_in_flight {
+            info!(
+                target: "n42::cl::consensus_loop",
+                %hash,
+                current_view,
+                is_current,
+                is_next,
+                "speculative build: eager import done, starting next build"
+            );
+            counter!("n42_speculative_builds_total").increment(1);
+            self.speculative_build_hash = Some(hash);
             self.do_trigger_payload_build(None).await;
         }
     }

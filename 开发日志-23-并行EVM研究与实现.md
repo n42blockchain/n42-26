@@ -149,6 +149,56 @@ Build (7ms) → Consensus (~200ms) → Import (~200ms) → 下一个 Build
 
 ---
 
+## Phase 1.5：Speculative Build（推测性构建）
+
+### 设计决策
+
+Leader 轮换采用 `view % n` 的 round-robin 机制。7 节点每 7 个 view 才轮到同一 leader。
+因此 speculative build 的核心受益者是：**下一个 view 的 leader（当前是 follower）**。
+
+### 架构
+
+```
+当前 leader (node A) 构建 Block N
+     │
+     ├── 广播 Block N → followers
+     │
+     ├── Leader eager import: new_payload + fcu → 信号 eager_import_done_tx
+     │
+     └── Follower (node B, 下一个 leader):
+           ├── 收到 Block N → follower eager import
+           ├── Eager import 完成 → 信号 eager_import_done_tx
+           ├── handle_eager_import_done: is_leader_for_view(V+1)? → YES
+           ├── ★ 立即开始构建 Block N+1（不等 consensus commit）
+           └── ViewChanged(V+1) → speculative build 已在进行，跳过重复构建
+```
+
+### 改动
+
+| 文件 | 改动 |
+|------|------|
+| `state_machine.rs` | 新增 `is_leader_for_view(view)` 方法 |
+| `mod.rs` | 新增 `eager_import_done_tx/rx` 信号通道 + `speculative_build_hash` |
+| `mod.rs` (event loop) | 新增 `eager_import_done_rx` 分支 |
+| `execution_bridge.rs` | Leader/follower eager import 成功后发送信号 |
+| `consensus_loop.rs` | 新增 `handle_eager_import_done()`，修改 `finalize/view_changed` 避免双重构建 |
+
+### 时序优化
+
+```
+优化前（下一个 leader 视角）：
+  Consensus(200ms) → ViewChanged → trigger_build → warmup(10ms) → build(3ms) → broadcast
+  总延迟: ~213ms 从 consensus 开始到下一个块广播
+
+优化后：
+  Eager import(100ms) → speculative build starts → build(3ms) ready
+  ...meanwhile consensus(200ms) → ViewChanged → build already done → broadcast
+  总延迟: ~200ms（consensus 时间主导，build 被隐藏）
+  节省: ~13ms per block
+```
+
+---
+
 ## 后续优化方向
 
 ### 短期（提升现有 TPS 到 5000+）

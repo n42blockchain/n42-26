@@ -208,6 +208,7 @@ impl ConsensusOrchestrator {
         let leader_payload_tx = self.leader_payload_tx.clone();
         let current_view = self.engine.current_view();
         let blob_store = self.blob_store.clone();
+        let eager_import_done_tx = self.eager_import_done_tx.clone();
 
         let handle = tokio::spawn(async move {
             // Allow builder time to pack transactions from the pool.
@@ -237,6 +238,7 @@ impl ConsensusOrchestrator {
                         leader_payload_tx,
                         current_view,
                         blob_store,
+                        eager_import_done_tx,
                     )
                     .await;
                 }
@@ -309,6 +311,8 @@ impl ConsensusOrchestrator {
             let eh = engine_handle.clone();
             let payload_json = broadcast.payload_json;
             let view = broadcast.view;
+            let block_ts = broadcast.timestamp;
+            let eager_done_tx = self.eager_import_done_tx.clone();
             tokio::spawn(async move {
                 let execution_data = match serde_json::from_slice(&payload_json) {
                     Ok(data) => data,
@@ -331,6 +335,7 @@ impl ConsensusOrchestrator {
                         } else {
                             info!(target: "n42::cl::exec_bridge", %hash, view, elapsed_ms = import_start.elapsed().as_millis() as u64, np_elapsed, "follower eager import: block imported");
                             metrics::counter!("n42_follower_eager_import_hits_total").increment(1);
+                            let _ = eager_done_tx.send((hash, block_ts));
                         }
                     }
                     Ok(status) => {
@@ -498,12 +503,20 @@ impl ConsensusOrchestrator {
         }
 
         if self.engine.is_current_leader() {
-            debug!(
-                target: "n42::cl::exec_bridge",
-                next_view = self.engine.current_view(),
-                "leader for next view, triggering immediate payload build"
-            );
-            self.do_trigger_payload_build(None).await;
+            if self.speculative_build_hash == Some(broadcast.block_hash) {
+                debug!(
+                    target: "n42::cl::exec_bridge",
+                    next_view = self.engine.current_view(),
+                    "leader: speculative build already in progress (deferred finalization)"
+                );
+            } else {
+                debug!(
+                    target: "n42::cl::exec_bridge",
+                    next_view = self.engine.current_view(),
+                    "leader for next view, triggering immediate payload build"
+                );
+                self.do_trigger_payload_build(None).await;
+            }
         }
     }
 
@@ -603,6 +616,7 @@ async fn handle_built_payload(
     leader_payload_tx: mpsc::UnboundedSender<(B256, Vec<u8>)>,
     current_view: u64,
     blob_store: Option<DiskFileBlobStore>,
+    eager_import_done_tx: mpsc::UnboundedSender<(B256, u64)>,
 ) {
     let hash = payload.block().hash();
 
@@ -647,6 +661,7 @@ async fn handle_built_payload(
             } else {
                 info!(target: "n42::cl::exec_bridge", %hash, elapsed_ms = import_start.elapsed().as_millis() as u64, np_elapsed, "eager import: block imported successfully");
                 metrics::counter!("n42_eager_import_hits_total").increment(1);
+                let _ = eager_import_done_tx.send((hash, block_timestamp));
             }
         }
         Ok(status) => {

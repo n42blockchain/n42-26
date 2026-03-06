@@ -107,6 +107,14 @@ pub struct ConsensusOrchestrator {
     /// Queue of pending imports waiting for the current bg import to finish.
     /// Entries: (serialized_block_data, block_hash, view).
     bg_import_queue: VecDeque<(Vec<u8>, B256, u64)>,
+    /// Speculative build: eager import tasks notify when a block is imported to reth.
+    /// Allows the next leader to start building before consensus commits the current block.
+    eager_import_done_tx: mpsc::UnboundedSender<(B256, u64)>,
+    eager_import_done_rx: mpsc::UnboundedReceiver<(B256, u64)>,
+    /// Hash of the block whose speculative build is in progress.
+    /// Set when build is triggered by eager import (before consensus commit).
+    /// Cleared on ViewChanged or when finalize confirms the block.
+    speculative_build_hash: Option<B256>,
     mobile_reward_manager: Option<Arc<Mutex<MobileRewardManager>>>,
     staking_manager: Option<Arc<Mutex<StakingManager>>>,
     committed_block_count: u64,
@@ -134,6 +142,7 @@ impl ConsensusOrchestrator {
         let (block_ready_tx, block_ready_rx) = mpsc::unbounded_channel();
         let (leader_payload_tx, leader_payload_rx) = mpsc::unbounded_channel();
         let (import_done_tx, import_done_rx) = mpsc::unbounded_channel();
+        let (eager_import_done_tx, eager_import_done_rx) = mpsc::unbounded_channel();
         Self {
             engine,
             network,
@@ -170,6 +179,9 @@ impl ConsensusOrchestrator {
             blob_store: None,
             bg_import_in_flight: false,
             bg_import_queue: VecDeque::new(),
+            eager_import_done_tx,
+            eager_import_done_rx,
+            speculative_build_hash: None,
             mobile_reward_manager: None,
             staking_manager: None,
             committed_block_count: 0,
@@ -194,6 +206,7 @@ impl ConsensusOrchestrator {
         let (block_ready_tx, block_ready_rx) = mpsc::unbounded_channel();
         let (leader_payload_tx, leader_payload_rx) = mpsc::unbounded_channel();
         let (import_done_tx, import_done_rx) = mpsc::unbounded_channel();
+        let (eager_import_done_tx, eager_import_done_rx) = mpsc::unbounded_channel();
 
         let slot_time_ms: u64 = std::env::var("N42_BLOCK_INTERVAL_MS")
             .ok()
@@ -241,6 +254,9 @@ impl ConsensusOrchestrator {
             blob_store: None,
             bg_import_in_flight: false,
             bg_import_queue: VecDeque::new(),
+            eager_import_done_tx,
+            eager_import_done_rx,
+            speculative_build_hash: None,
             mobile_reward_manager: None,
             staking_manager: None,
             committed_block_count: 0,
@@ -397,6 +413,12 @@ impl ConsensusOrchestrator {
                 import_result = self.import_done_rx.recv() => {
                     if let Some((hash, view, success, block_ts)) = import_result {
                         self.handle_import_done(hash, view, success, block_ts).await;
+                    }
+                }
+
+                eager_done = self.eager_import_done_rx.recv() => {
+                    if let Some((hash, block_ts)) = eager_done {
+                        self.handle_eager_import_done(hash, block_ts).await;
                     }
                 }
 

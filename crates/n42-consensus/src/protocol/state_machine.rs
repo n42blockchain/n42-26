@@ -264,6 +264,11 @@ impl ConsensusEngine {
         )
     }
 
+    /// Checks if this node is the leader for a specific view.
+    pub fn is_leader_for_view(&self, view: u64) -> bool {
+        LeaderSelector::is_leader(self.my_index, view, self.validator_set())
+    }
+
     pub fn locked_qc(&self) -> &QuorumCertificate {
         self.round_state.locked_qc()
     }
