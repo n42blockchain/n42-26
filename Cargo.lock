@@ -5575,6 +5575,8 @@ version = "0.2.6"
 dependencies = [
  "alloy-primitives",
  "hex",
+ "n42-parallel-evm",
+ "rayon",
  "revm 36.0.0",
 ]
 
@@ -5727,6 +5729,7 @@ dependencies = [
  "n42-execution",
  "n42-mobile",
  "n42-network",
+ "n42-parallel-evm",
  "n42-primitives",
  "reth-basic-payload-builder",
  "reth-chain-state",
@@ -5794,6 +5797,21 @@ dependencies = [
  "scrypt",
  "serde",
  "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "n42-parallel-evm"
+version = "0.2.6"
+dependencies = [
+ "alloy-primitives",
+ "dashmap",
+ "metrics",
+ "parking_lot",
+ "rayon",
+ "revm 36.0.0",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
 ]

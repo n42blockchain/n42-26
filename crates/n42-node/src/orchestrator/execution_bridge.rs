@@ -294,13 +294,53 @@ impl ConsensusOrchestrator {
         self.pending_block_data.insert(hash, data);
 
         // Notify consensus immediately — enables voting without EVM execution.
-        // Execution will happen at finalization time (finalize_committed_block Case B).
         debug!(target: "n42::cl::exec_bridge", %hash, "block data cached, notifying consensus (deferred execution)");
         if let Err(e) = self
             .engine
             .process_event(ConsensusEvent::BlockImported(hash))
         {
             error!(target: "n42::cl::exec_bridge", error = %e, "error processing BlockImported for deferred execution");
+        }
+
+        // Follower eager import: start new_payload + fcu in parallel with consensus voting.
+        // By the time finalize_committed_block runs after consensus commit, the block is
+        // likely already in reth (Case A), eliminating the ~200ms background import stall.
+        if let Some(ref engine_handle) = self.beacon_engine {
+            let eh = engine_handle.clone();
+            let payload_json = broadcast.payload_json;
+            let view = broadcast.view;
+            tokio::spawn(async move {
+                let execution_data = match serde_json::from_slice(&payload_json) {
+                    Ok(data) => data,
+                    Err(_) => return,
+                };
+                let import_start = std::time::Instant::now();
+                match eh.new_payload(execution_data).await {
+                    Ok(status) if matches!(status.status, PayloadStatusEnum::Valid | PayloadStatusEnum::Accepted) => {
+                        let np_elapsed = import_start.elapsed().as_millis() as u64;
+                        let fcu = ForkchoiceState {
+                            head_block_hash: hash,
+                            safe_block_hash: hash,
+                            finalized_block_hash: hash,
+                        };
+                        if let Err(e) = eh
+                            .fork_choice_updated(fcu, None, EngineApiMessageVersion::default())
+                            .await
+                        {
+                            info!(target: "n42::cl::exec_bridge", %hash, view, np_elapsed, error = %e, "follower eager import: fcu failed");
+                        } else {
+                            info!(target: "n42::cl::exec_bridge", %hash, view, elapsed_ms = import_start.elapsed().as_millis() as u64, np_elapsed, "follower eager import: block imported");
+                            metrics::counter!("n42_follower_eager_import_hits_total").increment(1);
+                        }
+                    }
+                    Ok(status) => {
+                        debug!(target: "n42::cl::exec_bridge", %hash, view, status = ?status.status, "follower eager import: not accepted");
+                    }
+                    Err(e) => {
+                        debug!(target: "n42::cl::exec_bridge", %hash, view, error = %e, "follower eager import: failed");
+                    }
+                }
+            });
         }
     }
 
