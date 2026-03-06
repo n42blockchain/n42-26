@@ -297,6 +297,12 @@ impl ConsensusOrchestrator {
         let hash = broadcast.block_hash;
         self.pending_executions.remove(&hash);
 
+        // Pipeline: follower received block data — create timing entry.
+        // `build_complete` is set immediately (the leader already built it).
+        let mut timing = super::PipelineTiming::new_follower();
+        timing.build_complete = Some(tokio::time::Instant::now());
+        self.record_pipeline_timing(hash, timing);
+
         // Update timestamp tracking from the broadcast's direct field.
         if broadcast.timestamp > 0 {
             self.last_committed_timestamp = self.last_committed_timestamp.max(broadcast.timestamp);

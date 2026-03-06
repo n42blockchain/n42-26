@@ -202,6 +202,16 @@ impl ConsensusOrchestrator {
         if let Some(ms) = elapsed_ms {
             histogram!("n42_consensus_commit_latency_ms").record(ms as f64);
         }
+
+        // Pipeline: record commit time and emit summary.
+        let pipeline_summary = if let Some(mut timing) = self.pipeline_timings.remove(&block_hash) {
+            timing.committed = Some(Instant::now());
+            timing.emit_metrics();
+            Some(timing.summary())
+        } else {
+            None
+        };
+
         let epoch = self.engine.epoch_manager().current_epoch();
         let peers = self.connected_peers.len();
         let hash_str = format!("{block_hash}");
@@ -213,6 +223,7 @@ impl ConsensusOrchestrator {
             epoch,
             peers,
             elapsed_ms = elapsed_ms.unwrap_or(0),
+            pipeline = pipeline_summary.as_deref().unwrap_or("-"),
             "view committed"
         );
 
@@ -495,6 +506,10 @@ impl ConsensusOrchestrator {
     pub(super) async fn handle_import_done(&mut self, hash: B256, view: u64, success: bool, block_timestamp: u64) {
         self.bg_import_in_flight = false;
         if success {
+            // Pipeline: background import complete — record timing.
+            if let Some(timing) = self.pipeline_timings.get_mut(&hash) {
+                timing.import_complete = Some(Instant::now());
+            }
             info!(target: "n42::cl::consensus_loop", %hash, view, "background import completed, updating head");
             self.head_block_hash = hash;
             if block_timestamp > 0 {

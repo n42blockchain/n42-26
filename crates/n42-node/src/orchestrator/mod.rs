@@ -15,13 +15,13 @@ use reth_ethereum_engine_primitives::EthEngineTypes;
 use reth_node_builder::ConsensusEngineHandle;
 use reth_payload_builder::PayloadBuilderHandle;
 use reth_transaction_pool::blobstore::DiskFileBlobStore;
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
-use metrics::{counter, gauge};
+use metrics::{counter, gauge, histogram};
 use tracing::{debug, error, info, warn};
 
 /// Block data broadcast via /n42/blocks/1 GossipSub topic.
@@ -43,6 +43,89 @@ pub(crate) struct BlobSidecarBroadcast {
     pub(crate) block_hash: B256,
     pub(crate) view: u64,
     pub(crate) sidecars: Vec<(B256, Vec<u8>)>,
+}
+
+/// Per-block pipeline timing tracker.
+///
+/// The consensus slot interval acts as a "bus clock": within each tick,
+/// build / import / consensus / communication stages run in parallel.
+/// This struct records wall-clock timestamps for each stage so we can
+/// quantify overlap and identify serialization bottlenecks.
+///
+/// ```text
+/// Slot N clock tick ──────────────────────────────────────── slot_time
+/// ├── [Build]           tx_pack + evm_exec + state_root
+/// ├── [Broadcast]       block data + blob sidecars
+/// ├── [Consensus]       voting rounds (overlaps with import)
+/// ├── [Import]          new_payload + fcu (overlaps with consensus)
+/// └── [Commit]          finalize
+/// ```
+#[derive(Debug, Clone)]
+pub(crate) struct PipelineTiming {
+    /// When we first learned about this block (build trigger or block_data received).
+    pub(crate) created: Instant,
+    /// Role of this node for the block.
+    pub(crate) is_leader: bool,
+    /// Leader: payload resolved & broadcast. Follower: block data received.
+    pub(crate) build_complete: Option<Instant>,
+    /// Eager import (new_payload + fcu) completed.
+    pub(crate) import_complete: Option<Instant>,
+    /// Consensus committed (Decide received or CommitQC formed).
+    pub(crate) committed: Option<Instant>,
+}
+
+impl PipelineTiming {
+    fn new_leader() -> Self {
+        Self { created: Instant::now(), is_leader: true, build_complete: None, import_complete: None, committed: None }
+    }
+    fn new_follower() -> Self {
+        Self { created: Instant::now(), is_leader: false, build_complete: None, import_complete: None, committed: None }
+    }
+
+    /// Produces a one-line summary of pipeline stage durations (ms).
+    fn summary(&self) -> String {
+        let role = if self.is_leader { "L" } else { "F" };
+        let build_ms = self.build_complete.map(|t| t.duration_since(self.created).as_millis() as u64);
+        let import_ms = self.import_complete.map(|t| t.duration_since(self.created).as_millis() as u64);
+        let commit_ms = self.committed.map(|t| t.duration_since(self.created).as_millis() as u64);
+        // Overlap: how much of import happened during consensus (before commit)
+        let import_before_commit = match (self.import_complete, self.committed) {
+            (Some(imp), Some(com)) if imp <= com => Some(com.duration_since(imp).as_millis() as u64),
+            _ => None,
+        };
+        format!(
+            "role={role} build={build}ms import={import}ms commit={commit}ms import_headroom={headroom}ms",
+            build = build_ms.map(|v| v.to_string()).unwrap_or_else(|| "-".into()),
+            import = import_ms.map(|v| v.to_string()).unwrap_or_else(|| "-".into()),
+            commit = commit_ms.map(|v| v.to_string()).unwrap_or_else(|| "-".into()),
+            headroom = import_before_commit.map(|v| v.to_string()).unwrap_or_else(|| "-".into()),
+        )
+    }
+
+    /// Emit per-stage metrics histograms.
+    fn emit_metrics(&self) {
+        if let Some(t) = self.build_complete {
+            histogram!("n42_pipeline_build_ms").record(t.duration_since(self.created).as_millis() as f64);
+        }
+        if let Some(t) = self.import_complete {
+            histogram!("n42_pipeline_import_ms").record(t.duration_since(self.created).as_millis() as f64);
+        }
+        if let Some(t) = self.committed {
+            let total = t.duration_since(self.created).as_millis() as f64;
+            histogram!("n42_pipeline_total_ms").record(total);
+        }
+        // Overlap ratio: what fraction of total time was "useful work" vs waiting
+        if let (Some(build), Some(import), Some(commit)) = (self.build_complete, self.import_complete, self.committed) {
+            let build_dur = build.duration_since(self.created).as_millis() as f64;
+            let import_dur = import.duration_since(self.created).as_millis() as f64;
+            let total = commit.duration_since(self.created).as_millis() as f64;
+            if total > 0.0 {
+                // Parallelism ratio: (build + import) / total.  >1.0 means good overlap.
+                let parallelism = (build_dur + import_dur) / total;
+                gauge!("n42_pipeline_parallelism").set(parallelism);
+            }
+        }
+    }
 }
 
 /// Deferred finalization: Decide arrived before BlockData (f=0 race).
@@ -130,6 +213,10 @@ pub struct ConsensusOrchestrator {
     /// Epoch schedule loaded from `epoch_schedule.json`.
     /// Used to pre-stage the next epoch's validator set at each epoch transition.
     epoch_schedule: Option<EpochSchedule>,
+    /// Per-block pipeline timing tracker. Populated incrementally as events flow
+    /// through the orchestrator. Logged and emitted as metrics at commit time.
+    /// Bounded to 32 entries; older entries are evicted.
+    pipeline_timings: HashMap<B256, PipelineTiming>,
 }
 
 impl ConsensusOrchestrator {
@@ -188,6 +275,7 @@ impl ConsensusOrchestrator {
             last_committed_timestamp: 0,
             view_started_at: None,
             epoch_schedule: None,
+            pipeline_timings: HashMap::new(),
         }
     }
 
@@ -263,6 +351,7 @@ impl ConsensusOrchestrator {
             last_committed_timestamp: 0,
             view_started_at: None,
             epoch_schedule: None,
+            pipeline_timings: HashMap::new(),
         }
     }
 
@@ -382,6 +471,13 @@ impl ConsensusOrchestrator {
 
                 block_hash = self.block_ready_rx.recv() => {
                     if let Some(hash) = block_hash {
+                        // Pipeline: leader build complete — record timing.
+                        // `created` is set now (build + broadcast finished);
+                        // `build_complete` also set immediately since the build just resolved.
+                        let mut timing = PipelineTiming::new_leader();
+                        timing.build_complete = Some(Instant::now());
+                        self.record_pipeline_timing(hash, timing);
+
                         info!(target: "n42::cl::orchestrator", %hash, view = self.engine.current_view(), "payload built, feeding BlockReady to consensus");
                         if let Err(e) = self.engine.process_event(
                             n42_consensus::ConsensusEvent::BlockReady(hash)
@@ -418,6 +514,10 @@ impl ConsensusOrchestrator {
 
                 eager_done = self.eager_import_done_rx.recv() => {
                     if let Some((hash, block_ts)) = eager_done {
+                        // Pipeline: import complete — record timing.
+                        if let Some(timing) = self.pipeline_timings.get_mut(&hash) {
+                            timing.import_complete = Some(Instant::now());
+                        }
                         self.handle_eager_import_done(hash, block_ts).await;
                     }
                 }
@@ -471,6 +571,22 @@ impl ConsensusOrchestrator {
             info!(target: "n42::cl::orchestrator", "this node is leader for view 1, triggering genesis payload build");
             self.schedule_payload_build().await;
         }
+    }
+
+    /// Records a pipeline timing entry for a block, with bounded map size.
+    fn record_pipeline_timing(&mut self, hash: B256, timing: PipelineTiming) {
+        const MAX_PIPELINE_ENTRIES: usize = 32;
+        if self.pipeline_timings.len() >= MAX_PIPELINE_ENTRIES {
+            // Evict oldest entry (smallest `created` timestamp).
+            if let Some(oldest) = self.pipeline_timings
+                .iter()
+                .min_by_key(|(_, t)| t.created)
+                .map(|(k, _)| *k)
+            {
+                self.pipeline_timings.remove(&oldest);
+            }
+        }
+        self.pipeline_timings.insert(hash, timing);
     }
 
     async fn handle_network_event(&mut self, event: NetworkEvent) {
