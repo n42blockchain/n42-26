@@ -143,29 +143,57 @@ impl ConsensusOrchestrator {
 
         debug!(target: "n42::cl::exec_bridge", head = %self.head_block_hash, timestamp, "triggering payload build via fork_choice_updated");
 
-        match beacon_engine
-            .fork_choice_updated(fcu_state, Some(attrs), EngineApiMessageVersion::default())
-            .await
-        {
-            Ok(result) => {
-                debug!(target: "n42::cl::exec_bridge", status = ?result.payload_status.status, "fork_choice_updated response");
-                if let Some(payload_id) = result.payload_id {
-                    // Record the timestamp we used so subsequent builds guarantee
-                    // strictly increasing timestamps even in fast-commit scenarios.
-                    self.last_committed_timestamp = self.last_committed_timestamp.max(timestamp);
-                    debug!(target: "n42::cl::exec_bridge", ?payload_id, "payload building started, spawning resolve task");
-                    self.spawn_payload_resolve_task(
-                        beacon_engine.clone(),
-                        payload_builder,
-                        payload_id,
-                    );
-                } else {
-                    warn!(target: "n42::cl::exec_bridge", "fork_choice_updated did not return payload_id");
+        // Try FCU; on "invalid payload attributes" (timestamp race), retry once with
+        // a conservatively bumped timestamp.  This handles the edge case where
+        // last_committed_timestamp doesn't perfectly track reth's internal head.
+        let mut last_err = None;
+        for attempt in 0..2u8 {
+            let try_attrs = if attempt == 0 {
+                attrs.clone()
+            } else {
+                // Retry: bump timestamp aggressively to guarantee > head.timestamp.
+                // Use +2 because consecutive fast blocks bump by +1 each, and our
+                // last_committed_timestamp tracking can be 1 behind the actual head.
+                let bumped_ts = self.last_committed_timestamp.max(attrs.timestamp) + 2;
+                warn!(target: "n42::cl::exec_bridge", bumped_ts, "retrying FCU with bumped timestamp");
+                let mut retry_attrs = attrs.clone();
+                retry_attrs.timestamp = bumped_ts;
+                retry_attrs
+            };
+            let used_ts = try_attrs.timestamp;
+
+            match beacon_engine
+                .fork_choice_updated(fcu_state, Some(try_attrs), EngineApiMessageVersion::default())
+                .await
+            {
+                Ok(result) => {
+                    debug!(target: "n42::cl::exec_bridge", status = ?result.payload_status.status, "fork_choice_updated response");
+                    if let Some(payload_id) = result.payload_id {
+                        // Record the timestamp we used so subsequent builds guarantee
+                        // strictly increasing timestamps even in fast-commit scenarios.
+                        self.last_committed_timestamp = self.last_committed_timestamp.max(used_ts);
+                        debug!(target: "n42::cl::exec_bridge", ?payload_id, "payload building started, spawning resolve task");
+                        self.spawn_payload_resolve_task(
+                            beacon_engine.clone(),
+                            payload_builder,
+                            payload_id,
+                        );
+                    } else {
+                        warn!(target: "n42::cl::exec_bridge", "fork_choice_updated did not return payload_id");
+                    }
+                    last_err = None;
+                    break;
+                }
+                Err(e) => {
+                    if attempt == 0 {
+                        warn!(target: "n42::cl::exec_bridge", error = %e, "fork_choice_updated failed, will retry with bumped timestamp");
+                    }
+                    last_err = Some(e);
                 }
             }
-            Err(e) => {
-                error!(target: "n42::cl::exec_bridge", error = %e, "fork_choice_updated failed");
-            }
+        }
+        if let Some(e) = last_err {
+            error!(target: "n42::cl::exec_bridge", error = %e, "fork_choice_updated failed after retry");
         }
     }
 
@@ -253,12 +281,9 @@ impl ConsensusOrchestrator {
         let hash = broadcast.block_hash;
         self.pending_executions.remove(&hash);
 
-        // Extract timestamp for follower tracking (needed before execution).
-        if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&broadcast.payload_json)
-            && let Some(ts_hex) = parsed.get("timestamp").and_then(|t| t.as_str())
-            && let Ok(ts) = u64::from_str_radix(ts_hex.trim_start_matches("0x"), 16)
-        {
-            self.last_committed_timestamp = self.last_committed_timestamp.max(ts);
+        // Update timestamp tracking from the broadcast's direct field.
+        if broadcast.timestamp > 0 {
+            self.last_committed_timestamp = self.last_committed_timestamp.max(broadcast.timestamp);
         }
 
         if self.pending_block_data.len() >= MAX_PENDING_BLOCK_DATA
@@ -324,27 +349,15 @@ impl ConsensusOrchestrator {
             None => return,
         };
 
-        // Parse once as Value, extract timestamp, then deserialize into the typed struct.
-        let parsed_value: serde_json::Value = match serde_json::from_slice(&broadcast.payload_json) {
-            Ok(v) => v,
-            Err(e) => {
-                warn!(target: "n42::cl::exec_bridge", hash = %broadcast.block_hash, "failed to deserialize execution payload: {e}");
-                return;
-            }
-        };
-
-        // Extract the block timestamp to keep last_committed_timestamp up to date
-        // for followers as well (prevents stale timestamp on leader switch).
-        if let Some(ts_hex) = parsed_value.get("timestamp").and_then(|t| t.as_str())
-            && let Ok(ts) = u64::from_str_radix(ts_hex.trim_start_matches("0x"), 16)
-        {
-            self.last_committed_timestamp = self.last_committed_timestamp.max(ts);
+        // Update timestamp from the direct field.
+        if broadcast.timestamp > 0 {
+            self.last_committed_timestamp = self.last_committed_timestamp.max(broadcast.timestamp);
         }
 
-        let execution_data = match serde_json::from_value(parsed_value) {
+        let execution_data = match serde_json::from_slice(&broadcast.payload_json) {
             Ok(data) => data,
             Err(e) => {
-                warn!(target: "n42::cl::exec_bridge", hash = %broadcast.block_hash, "failed to convert execution payload from Value: {e}");
+                warn!(target: "n42::cl::exec_bridge", hash = %broadcast.block_hash, "failed to deserialize execution payload: {e}");
                 return;
             }
         };
@@ -448,9 +461,9 @@ impl ConsensusOrchestrator {
             debug!(
                 target: "n42::cl::exec_bridge",
                 next_view = self.engine.current_view(),
-                "leader for next view, triggering payload build"
+                "leader for next view, triggering immediate payload build"
             );
-            self.schedule_payload_build().await;
+            self.do_trigger_payload_build(None).await;
         }
     }
 
@@ -558,9 +571,10 @@ async fn handle_built_payload(
         }
     };
 
-    debug!(target: "n42::cl::exec_bridge", %hash, "leader deferred import: broadcasting block data (skipping new_payload)");
+    let block_timestamp = payload.block().header().timestamp;
+    debug!(target: "n42::cl::exec_bridge", %hash, block_timestamp, "leader deferred import: broadcasting block data (skipping new_payload)");
 
-    broadcast_block_data(&network, &leader_payload_tx, hash, current_view, &payload_json);
+    broadcast_block_data(&network, &leader_payload_tx, hash, current_view, &payload_json, block_timestamp);
 
     let _ = block_ready_tx.send(hash);
 
@@ -573,6 +587,7 @@ fn broadcast_block_data(
     hash: B256,
     current_view: u64,
     payload_json: &[u8],
+    timestamp: u64,
 ) {
     if payload_json.is_empty() {
         return;
@@ -581,6 +596,7 @@ fn broadcast_block_data(
         block_hash: hash,
         view: current_view,
         payload_json: payload_json.to_vec(),
+        timestamp,
     };
     match bincode::serialize(&broadcast) {
         Ok(encoded) => {

@@ -70,6 +70,11 @@ impl ConsensusEngine {
         })?;
 
         let next_view = decide.view.saturating_add(1);
-        self.advance_to_view(next_view)
+        self.advance_to_view(next_view)?;
+
+        // Notify the orchestrator that the view has advanced so the next leader
+        // can start building immediately instead of waiting for a pacemaker timeout.
+        let actual_view = self.round_state.current_view();
+        self.emit(EngineOutput::ViewChanged { new_view: actual_view })
     }
 }

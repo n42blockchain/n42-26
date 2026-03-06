@@ -31,6 +31,10 @@ pub(crate) struct BlockDataBroadcast {
     pub(crate) view: u64,
     /// JSON-serialized execution payload (bincode can't handle reth's `#[serde(untagged)]`).
     pub(crate) payload_json: Vec<u8>,
+    /// Block timestamp (seconds since epoch). Stored directly to avoid JSON re-parsing.
+    /// Defaults to 0 for backwards compatibility with older serialized broadcasts.
+    #[serde(default)]
+    pub(crate) timestamp: u64,
 }
 
 /// Blob sidecar broadcast via /n42/blobs/1 GossipSub topic.
@@ -95,9 +99,14 @@ pub struct ConsensusOrchestrator {
     leader_payload_tx: mpsc::UnboundedSender<(B256, Vec<u8>)>,
     /// Receives notifications when a background `import_and_notify` task completes.
     /// Tuple: (block_hash, view, success).
-    import_done_rx: mpsc::UnboundedReceiver<(B256, u64, bool)>,
-    import_done_tx: mpsc::UnboundedSender<(B256, u64, bool)>,
+    import_done_rx: mpsc::UnboundedReceiver<(B256, u64, bool, u64)>,
+    import_done_tx: mpsc::UnboundedSender<(B256, u64, bool, u64)>,
     blob_store: Option<DiskFileBlobStore>,
+    /// True while a background import task is running.
+    bg_import_in_flight: bool,
+    /// Queue of pending imports waiting for the current bg import to finish.
+    /// Entries: (serialized_block_data, block_hash, view).
+    bg_import_queue: VecDeque<(Vec<u8>, B256, u64)>,
     mobile_reward_manager: Option<Arc<Mutex<MobileRewardManager>>>,
     staking_manager: Option<Arc<Mutex<StakingManager>>>,
     committed_block_count: u64,
@@ -159,6 +168,8 @@ impl ConsensusOrchestrator {
             import_done_rx,
             import_done_tx,
             blob_store: None,
+            bg_import_in_flight: false,
+            bg_import_queue: VecDeque::new(),
             mobile_reward_manager: None,
             staking_manager: None,
             committed_block_count: 0,
@@ -228,6 +239,8 @@ impl ConsensusOrchestrator {
             import_done_rx,
             import_done_tx,
             blob_store: None,
+            bg_import_in_flight: false,
+            bg_import_queue: VecDeque::new(),
             mobile_reward_manager: None,
             staking_manager: None,
             committed_block_count: 0,
@@ -382,8 +395,8 @@ impl ConsensusOrchestrator {
                 }
 
                 import_result = self.import_done_rx.recv() => {
-                    if let Some((hash, view, success)) = import_result {
-                        self.handle_import_done(hash, view, success).await;
+                    if let Some((hash, view, success, block_ts)) = import_result {
+                        self.handle_import_done(hash, view, success, block_ts).await;
                     }
                 }
 

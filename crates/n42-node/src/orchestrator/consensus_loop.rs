@@ -298,42 +298,88 @@ impl ConsensusOrchestrator {
             }
         } else if let Some(data) = self.pending_block_data.remove(&block_hash) {
             // Case B: BlockData cached but not yet imported (deferred import path).
-            // Spawn background task to avoid blocking the consensus event loop.
-            info!(target: "n42::cl::consensus_loop", view, %block_hash, "spawning background import for deferred finalization");
+            info!(target: "n42::cl::consensus_loop", view, %block_hash, "queueing background import for deferred finalization");
             self.pending_block_data.clear();
             self.pending_executions.clear();
-            let done_tx = self.import_done_tx.clone();
-            let eh = engine_handle.clone();
-            tokio::spawn(async move {
-                let success = Self::background_import(eh, &data, block_hash).await;
-                let _ = done_tx.send((block_hash, view, success));
-            });
+            self.enqueue_bg_import(data, block_hash, view);
         } else {
-            // Case C: Decide arrived before BlockData — defer finalization.
-            info!(target: "n42::cl::consensus_loop", view, %block_hash, "block not yet in reth, deferring finalization");
-            self.defer_finalization(view, block_hash, commit_qc);
+            // Block data not found — this commonly happens when the leader's own block
+            // data (sent via leader_payload_tx) hasn't been processed by the select loop
+            // yet because block_ready_rx was processed first, triggering the consensus
+            // flow before the data was cached. Drain the leader_payload_rx to recover.
+            while let Ok((hash, data)) = self.leader_payload_rx.try_recv() {
+                if !self.pending_block_data.contains_key(&hash) {
+                    if self.pending_block_data.len() >= super::execution_bridge::MAX_PENDING_BLOCK_DATA {
+                        if let Some(old_key) = self.pending_block_data.keys().next().copied() {
+                            self.pending_block_data.remove(&old_key);
+                        }
+                    }
+                    self.pending_block_data.insert(hash, data);
+                }
+            }
+            if let Some(data) = self.pending_block_data.remove(&block_hash) {
+                // Recovered! Proceed as Case B.
+                info!(target: "n42::cl::consensus_loop", view, %block_hash, "recovered block data from leader_payload_rx, proceeding as Case B");
+                self.pending_block_data.clear();
+                self.pending_executions.clear();
+                self.enqueue_bg_import(data, block_hash, view);
+            } else {
+                // Case C: Decide arrived before BlockData — defer finalization.
+                info!(target: "n42::cl::consensus_loop", view, %block_hash, "block not yet in reth, deferring finalization");
+                self.defer_finalization(view, block_hash, commit_qc);
+            }
         }
     }
 
+    /// Enqueues a block for background import. If no import is in flight, spawns immediately.
+    /// Otherwise queues for sequential processing (parent must be imported before child).
+    fn enqueue_bg_import(&mut self, data: Vec<u8>, block_hash: B256, view: u64) {
+        if self.bg_import_in_flight {
+            debug!(target: "n42::cl::consensus_loop", view, %block_hash, queue_len = self.bg_import_queue.len(), "bg import busy, queueing");
+            self.bg_import_queue.push_back((data, block_hash, view));
+        } else {
+            self.spawn_bg_import(data, block_hash, view);
+        }
+    }
+
+    /// Spawns a single background import task.
+    fn spawn_bg_import(&mut self, data: Vec<u8>, block_hash: B256, view: u64) {
+        self.bg_import_in_flight = true;
+        let done_tx = self.import_done_tx.clone();
+        let eh = match &self.beacon_engine {
+            Some(h) => h.clone(),
+            None => return,
+        };
+        info!(target: "n42::cl::consensus_loop", view, %block_hash, "spawning background import");
+        tokio::spawn(async move {
+            let (success, block_ts) = Self::background_import(eh, &data, block_hash).await;
+            let _ = done_tx.send((block_hash, view, success, block_ts));
+        });
+    }
+
     /// Runs `new_payload` + `fork_choice_updated` in a background task.
-    /// Returns true if the block was successfully imported.
+    /// Returns (success, block_timestamp).
     async fn background_import(
         engine_handle: ConsensusEngineHandle<EthEngineTypes>,
         data: &[u8],
         block_hash: B256,
-    ) -> bool {
+    ) -> (bool, u64) {
         let broadcast: super::BlockDataBroadcast = match bincode::deserialize(data) {
             Ok(b) => b,
             Err(e) => {
                 warn!(target: "n42::cl::consensus_loop", %block_hash, error = %e, "bg import: failed to deserialize block data");
-                return false;
+                return (false, 0);
             }
         };
+
+        // Use the direct timestamp field from the broadcast struct.
+        let block_timestamp = broadcast.timestamp;
+
         let execution_data = match serde_json::from_slice(&broadcast.payload_json) {
             Ok(d) => d,
             Err(e) => {
                 warn!(target: "n42::cl::consensus_loop", %block_hash, error = %e, "bg import: failed to parse execution payload");
-                return false;
+                return (false, 0);
             }
         };
         match engine_handle.new_payload(execution_data).await {
@@ -355,15 +401,15 @@ impl ConsensusOrchestrator {
                     error!(target: "n42::cl::consensus_loop", %block_hash, error = %e, "bg import: fcu failed");
                 }
                 info!(target: "n42::cl::consensus_loop", %block_hash, "bg import: block imported successfully");
-                true
+                (true, block_timestamp)
             }
             Ok(status) => {
                 warn!(target: "n42::cl::consensus_loop", %block_hash, status = ?status.status, "bg import: new_payload rejected");
-                false
+                (false, 0)
             }
             Err(e) => {
                 error!(target: "n42::cl::consensus_loop", %block_hash, error = %e, "bg import: new_payload failed");
-                false
+                (false, 0)
             }
         }
     }
@@ -404,38 +450,60 @@ impl ConsensusOrchestrator {
                 // Trigger sync to recover the missing block
                 self.initiate_sync(stale_view, new_view);
             }
-        } else {
-            self.pending_block_data.clear();
-            self.pending_executions.clear();
         }
+        // NOTE: We intentionally do NOT clear pending_block_data here.
+        // The cache is bounded by MAX_PENDING_BLOCK_DATA (16 entries) via LRU eviction
+        // in handle_block_data. Clearing it would destroy block data that arrives
+        // BEFORE Decide (common in fast consensus), causing finalize_committed_block
+        // to fall into Case C (deferred finalization) and triggering cascading timeouts.
+        self.pending_executions.clear();
 
         // Exhaust the empty-skip budget to force the next leader to build.
         self.consecutive_empty_skips = max_consecutive_empty_skips();
 
         if self.engine.is_current_leader() {
-            debug!(target: "n42::cl::consensus_loop", new_view, "became leader after view change, triggering payload build");
-            self.schedule_payload_build().await;
+            // If a background import is in flight, do NOT build here — the head_block_hash
+            // hasn't been updated yet (race condition). handle_import_done will trigger
+            // the build once the import completes and head is current.
+            if self.bg_import_in_flight || !self.bg_import_queue.is_empty() {
+                debug!(target: "n42::cl::consensus_loop", new_view, in_flight = self.bg_import_in_flight, queued = self.bg_import_queue.len(), "leader after view change, deferring build until bg imports complete");
+            } else {
+                debug!(target: "n42::cl::consensus_loop", new_view, "became leader after view change, triggering payload build");
+                self.do_trigger_payload_build(None).await;
+            }
         }
     }
 
     /// Called when a background import task completes.
-    pub(super) async fn handle_import_done(&mut self, hash: B256, view: u64, success: bool) {
+    pub(super) async fn handle_import_done(&mut self, hash: B256, view: u64, success: bool, block_timestamp: u64) {
+        self.bg_import_in_flight = false;
         if success {
             info!(target: "n42::cl::consensus_loop", %hash, view, "background import completed, updating head");
             self.head_block_hash = hash;
+            if block_timestamp > 0 {
+                self.last_committed_timestamp = self.last_committed_timestamp.max(block_timestamp);
+            }
             if let Some(ref tx) = self.mobile_packet_tx
                 && let Err(e) = tx.try_send((hash, view))
             {
                 warn!(target: "n42::cl::consensus_loop", view, %hash, error = %e, "mobile_packet_tx full or closed");
             }
-            if self.engine.is_current_leader() {
-                debug!(target: "n42::cl::consensus_loop", next_view = self.engine.current_view(), "leader: scheduling build after bg import");
-                self.schedule_payload_build().await;
-            }
         } else {
             warn!(target: "n42::cl::consensus_loop", %hash, view, "background import FAILED, requesting sync");
             counter!("n42_bg_import_failures_total").increment(1);
+            // Clear the queue — parent failed so children would fail too.
+            self.bg_import_queue.clear();
             self.initiate_sync(view, self.engine.current_view());
+            return;
+        }
+
+        // Process next queued import, or trigger build if queue is empty.
+        if let Some((data, next_hash, next_view)) = self.bg_import_queue.pop_front() {
+            debug!(target: "n42::cl::consensus_loop", view = next_view, %next_hash, remaining = self.bg_import_queue.len(), "processing next queued bg import");
+            self.spawn_bg_import(data, next_hash, next_view);
+        } else if self.engine.is_current_leader() {
+            debug!(target: "n42::cl::consensus_loop", next_view = self.engine.current_view(), "leader: immediate build after all bg imports done");
+            self.do_trigger_payload_build(None).await;
         }
     }
 
@@ -453,6 +521,13 @@ impl ConsensusOrchestrator {
             }
             self.pending_block_data.insert(hash, data.clone());
             debug!(target: "n42::cl::consensus_loop", %hash, "cached leader block data for deferred import");
+        }
+
+        // Use the direct timestamp field from the broadcast struct.
+        if let Ok(broadcast) = bincode::deserialize::<super::BlockDataBroadcast>(&data)
+            && broadcast.timestamp > 0
+        {
+            self.last_committed_timestamp = self.last_committed_timestamp.max(broadcast.timestamp);
         }
 
         if let Some(block) = self.committed_blocks.iter_mut().rev().find(|b| b.block_hash == hash)

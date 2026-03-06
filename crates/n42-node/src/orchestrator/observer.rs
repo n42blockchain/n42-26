@@ -357,6 +357,7 @@ impl ObserverOrchestrator {
                 block_hash: sync_block.block_hash,
                 view: sync_block.view,
                 payload_json: sync_block.payload,
+                timestamp: 0,
             };
 
             // Import directly — no serialize/deserialize round-trip

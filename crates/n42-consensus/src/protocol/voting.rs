@@ -214,6 +214,11 @@ impl ConsensusEngine {
         self.emit(EngineOutput::BlockCommitted { view, block_hash, commit_qc })?;
 
         let next_view = view.saturating_add(1);
-        self.advance_to_view(next_view)
+        self.advance_to_view(next_view)?;
+
+        // Notify the orchestrator that the view has advanced so the next leader
+        // can start building immediately instead of waiting for a pacemaker timeout.
+        let actual_view = self.round_state.current_view();
+        self.emit(EngineOutput::ViewChanged { new_view: actual_view })
     }
 }
