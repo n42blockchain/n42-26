@@ -177,6 +177,30 @@ impl ConsensusConfig {
         }
         Ok(())
     }
+
+    /// Recommended `(slot_time_ms, base_timeout_ms, max_timeout_ms)` for a given network topology.
+    ///
+    /// Based on HotStuff-2 two-round protocol and real-world RTT measurements:
+    /// - Quorum = 2f+1, only needs the (2f+1)-th fastest validator to respond
+    /// - Total consensus ≈ 2.5 × quorum_RTT (2 rounds + Decide broadcast)
+    ///
+    /// ```text
+    /// Topology           quorum_RTT  consensus   recommended_slot  base_timeout
+    /// ─────────────────  ──────────  ──────────  ────────────────  ────────────
+    /// Local/single DC    <5ms        <15ms       1000ms            4000ms
+    /// Same continent     30-80ms     100-200ms   1000ms            4000ms
+    /// 3 continents       150-200ms   400-500ms   2000ms            8000ms
+    /// Global (7 cont.)   250-300ms   650-750ms   3000ms            12000ms
+    /// ```
+    pub fn recommended_timing(topology: &str) -> (u64, u64, u64) {
+        match topology {
+            "local" => (1000, 4000, 8000),
+            "regional" => (1000, 4000, 16000),
+            "continental" => (2000, 8000, 30000),
+            "global" => (3000, 12000, 60000),
+            _ => (3000, 12000, 60000), // default to global (safest)
+        }
+    }
 }
 
 impl Default for ConsensusConfig {

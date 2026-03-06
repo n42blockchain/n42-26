@@ -198,9 +198,14 @@ impl ConsensusOrchestrator {
         self.committed_block_count += 1;
         counter!("n42_blocks_committed_total").increment(1);
         gauge!("n42_consensus_view").set(view as f64);
-        let elapsed_ms = self.view_started_at.take().map(|t| t.elapsed().as_millis() as u64);
+        let elapsed = self.view_started_at.take().map(|t| t.elapsed());
+        let elapsed_ms = elapsed.map(|d| d.as_millis() as u64);
         if let Some(ms) = elapsed_ms {
             histogram!("n42_consensus_commit_latency_ms").record(ms as f64);
+        }
+        // Adaptive timeout: feed observed consensus latency to pacemaker.
+        if let Some(d) = elapsed {
+            self.engine.pacemaker_mut().observe_commit_latency(d);
         }
 
         // Pipeline: record commit time and emit summary.
