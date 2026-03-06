@@ -313,14 +313,14 @@ impl ConsensusOrchestrator {
             {
                 warn!(target: "n42::cl::consensus_loop", view, %block_hash, error = %e, "mobile_packet_tx full or closed, verification packet lost");
             }
-            // Case A: block already in reth — build immediately (no import delay risk).
+            // Case A: block already in reth — schedule next build via slot timing.
             if self.engine.is_current_leader() {
                 if self.speculative_build_hash == Some(block_hash) {
                     debug!(target: "n42::cl::consensus_loop", next_view = self.engine.current_view(), "leader: speculative build already in progress (Case A)");
                     // Don't clear yet — let handle_view_changed see it too.
                 } else {
-                    debug!(target: "n42::cl::consensus_loop", next_view = self.engine.current_view(), "leader: immediate build (Case A)");
-                    self.do_trigger_payload_build(None).await;
+                    debug!(target: "n42::cl::consensus_loop", next_view = self.engine.current_view(), "leader: scheduling next build (Case A)");
+                    self.schedule_payload_build().await;
                 }
             }
         } else if let Some(data) = self.pending_block_data.remove(&block_hash) {
@@ -454,6 +454,10 @@ impl ConsensusOrchestrator {
     async fn handle_view_changed(&mut self, new_view: u64) {
         counter!("n42_view_changes_total").increment(1);
         self.view_started_at = Some(tokio::time::Instant::now());
+        // Note: building_on_parent is NOT cleared here. It's keyed on parent hash,
+        // not view number. If a build is in-flight for the current parent, it should
+        // still be guarded even after a view change. The guard naturally expires when
+        // head_block_hash changes (a new block is imported/committed).
         info!(target: "n42::cl::consensus_loop", new_view, "view changed");
 
         // ViewChanged fires immediately after BlockCommitted in f=0 configs;
@@ -498,8 +502,8 @@ impl ConsensusOrchestrator {
             } else if self.speculative_build_hash.take().is_some() {
                 debug!(target: "n42::cl::consensus_loop", new_view, "speculative build already in progress, skipping view-change build");
             } else {
-                debug!(target: "n42::cl::consensus_loop", new_view, "became leader after view change, triggering payload build");
-                self.do_trigger_payload_build(None).await;
+                debug!(target: "n42::cl::consensus_loop", new_view, "became leader after view change, scheduling payload build");
+                self.schedule_payload_build().await;
             }
         } else {
             // Not leader for this view — clear any stale speculative build.
@@ -539,8 +543,8 @@ impl ConsensusOrchestrator {
             debug!(target: "n42::cl::consensus_loop", view = next_view, %next_hash, remaining = self.bg_import_queue.len(), "processing next queued bg import");
             self.spawn_bg_import(data, next_hash, next_view);
         } else if self.engine.is_current_leader() {
-            debug!(target: "n42::cl::consensus_loop", next_view = self.engine.current_view(), "leader: immediate build after all bg imports done");
-            self.do_trigger_payload_build(None).await;
+            debug!(target: "n42::cl::consensus_loop", next_view = self.engine.current_view(), "leader: scheduling build after all bg imports done");
+            self.schedule_payload_build().await;
         }
     }
 
@@ -560,17 +564,24 @@ impl ConsensusOrchestrator {
         let is_next = self.engine.is_leader_for_view(next_view);
 
         if (is_current || is_next) && !self.bg_import_in_flight {
+            // Guard: only build ONE speculative block ahead. Without this check,
+            // each speculative build → eager import → triggers another build,
+            // creating a runaway chain of thousands of uncommitted blocks.
+            if self.speculative_build_hash.is_some() {
+                debug!(target: "n42::cl::consensus_loop", %hash, current_view, "speculative build already done, skipping chain extension");
+                return;
+            }
             info!(
                 target: "n42::cl::consensus_loop",
                 %hash,
                 current_view,
                 is_current,
                 is_next,
-                "speculative build: eager import done, starting next build"
+                "speculative build: eager import done, scheduling next build"
             );
             counter!("n42_speculative_builds_total").increment(1);
             self.speculative_build_hash = Some(hash);
-            self.do_trigger_payload_build(None).await;
+            self.schedule_payload_build().await;
         }
     }
 

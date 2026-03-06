@@ -198,6 +198,11 @@ pub struct ConsensusOrchestrator {
     /// Set when build is triggered by eager import (before consensus commit).
     /// Cleared on ViewChanged or when finalize confirms the block.
     speculative_build_hash: Option<B256>,
+    /// Parent hash for which a payload build task is currently running.
+    /// Prevents duplicate builds based on the same parent, which produce different
+    /// blocks at the same height and flood reth with conflicting `new_payload` calls
+    /// — triggering pipeline sync and chain stalls.
+    building_on_parent: Option<B256>,
     mobile_reward_manager: Option<Arc<Mutex<MobileRewardManager>>>,
     staking_manager: Option<Arc<Mutex<StakingManager>>>,
     committed_block_count: u64,
@@ -269,6 +274,7 @@ impl ConsensusOrchestrator {
             eager_import_done_tx,
             eager_import_done_rx,
             speculative_build_hash: None,
+            building_on_parent: None,
             mobile_reward_manager: None,
             staking_manager: None,
             committed_block_count: 0,
@@ -345,6 +351,7 @@ impl ConsensusOrchestrator {
             eager_import_done_tx,
             eager_import_done_rx,
             speculative_build_hash: None,
+            building_on_parent: None,
             mobile_reward_manager: None,
             staking_manager: None,
             committed_block_count: 0,
@@ -447,6 +454,17 @@ impl ConsensusOrchestrator {
                     if let Err(e) = self.engine.on_timeout() {
                         error!(target: "n42::cl::orchestrator", view, error = %e, "error handling timeout");
                     }
+                    // Recovery: if we're still the leader after a repeat timeout and
+                    // no build is in progress, schedule a build retry.
+                    // This handles the case where FCU returned SYNCING earlier and
+                    // the leader couldn't propose, causing a permanent stall.
+                    if self.engine.is_current_leader()
+                        && self.next_build_at.is_none()
+                        && self.speculative_build_hash.is_none()
+                    {
+                        info!(target: "n42::cl::orchestrator", view, "leader timeout recovery: scheduling build retry");
+                        self.schedule_build_retry();
+                    }
                 }
 
                 event = self.net_event_rx.recv() => {
@@ -527,10 +545,23 @@ impl ConsensusOrchestrator {
                     self.next_build_at = None;
 
                     if slot_ts.is_none() {
-                        // Startup delay completed: reset pacemaker so the full base_timeout starts now.
+                        // Retry or startup delay: verify we're still the leader before building.
+                        if !self.engine.is_current_leader() {
+                            debug!(target: "n42::cl::orchestrator", "build timer fired but no longer leader, skipping");
+                            continue;
+                        }
                         let view = self.engine.current_view();
-                        self.engine.pacemaker_mut().reset_for_view(view, 0);
-                        info!(target: "n42::cl::orchestrator", "startup delay completed, triggering first payload build");
+                        if self.speculative_build_hash.is_some() {
+                            debug!(target: "n42::cl::orchestrator", view, "build timer fired but speculative build in progress, skipping");
+                            continue;
+                        }
+                        // Check if this is a startup delay or a retry.
+                        if view <= 1 {
+                            self.engine.pacemaker_mut().reset_for_view(view, 0);
+                            info!(target: "n42::cl::orchestrator", "startup delay completed, triggering first payload build");
+                        } else {
+                            info!(target: "n42::cl::orchestrator", view, "build retry timer fired, re-attempting payload build");
+                        }
                     } else {
                         info!(target: "n42::cl::orchestrator", slot_timestamp = ?slot_ts, "slot boundary reached, triggering payload build");
                     }

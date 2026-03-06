@@ -141,6 +141,20 @@ impl ConsensusOrchestrator {
             }
         };
 
+        // Guard: prevent duplicate builds on the same parent hash.
+        // Without this, eager import + speculative build can race with the finalize path,
+        // spawning multiple resolve tasks that produce different blocks at the same height
+        // (same parent, different timestamps). This floods reth with conflicting new_payload
+        // calls, triggering pipeline sync and permanent chain stalls.
+        let parent = self.head_block_hash;
+        if let Some(building_parent) = self.building_on_parent {
+            if building_parent == parent {
+                debug!(target: "n42::cl::exec_bridge", %parent, "build already in progress on this parent, skipping");
+                return;
+            }
+        }
+        self.building_on_parent = Some(parent);
+
         // Build attrs before borrowing beacon_engine to avoid borrow conflict.
         let attrs = self.build_payload_attributes(slot_timestamp);
         let beacon_engine = self.beacon_engine.as_ref().unwrap();
@@ -190,7 +204,13 @@ impl ConsensusOrchestrator {
                             payload_id,
                         );
                     } else {
-                        warn!(target: "n42::cl::exec_bridge", "fork_choice_updated did not return payload_id");
+                        warn!(target: "n42::cl::exec_bridge", "fork_choice_updated did not return payload_id, scheduling retry");
+                        // FCU returned SYNCING — reth hasn't caught up yet.
+                        // Clear both guards so the retry can re-attempt.
+                        self.building_on_parent = None;
+                        self.speculative_build_hash = None;
+                        // Schedule a retry so the leader doesn't permanently stall.
+                        self.schedule_build_retry();
                     }
                     last_err = None;
                     break;
@@ -205,7 +225,29 @@ impl ConsensusOrchestrator {
         }
         if let Some(e) = last_err {
             error!(target: "n42::cl::exec_bridge", error = %e, "fork_choice_updated failed after retry");
+            // Clear both guards so retry can re-attempt.
+            self.building_on_parent = None;
+            self.speculative_build_hash = None;
+            // Also schedule retry on FCU error — the execution layer may recover.
+            self.schedule_build_retry();
         }
+    }
+
+    /// Schedules a delayed build retry when FCU returns SYNCING or no payload_id.
+    ///
+    /// Uses the existing `next_build_at` / build_timer mechanism in the main select! loop.
+    /// The leader will re-attempt `do_trigger_payload_build` after the delay.
+    /// Each call resets the timer, providing natural exponential spacing if called repeatedly.
+    pub(super) fn schedule_build_retry(&mut self) {
+        if !self.engine.is_current_leader() {
+            return;
+        }
+        // Retry after 2 seconds — enough time for reth to complete pipeline sync.
+        let retry_at = tokio::time::Instant::now() + Duration::from_secs(2);
+        info!(target: "n42::cl::exec_bridge", "build retry scheduled in 2s (reth may be syncing)");
+        self.next_build_at = Some(retry_at);
+        // Clear slot_timestamp to indicate this is a retry, not a scheduled slot.
+        self.next_slot_timestamp = None;
     }
 
     fn spawn_payload_resolve_task(
