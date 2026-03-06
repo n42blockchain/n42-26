@@ -14,10 +14,8 @@ path = "src/main.rs"
 alloy-primitives.workspace = true
 alloy-consensus = { workspace = true, features = ["k256"] }
 alloy-eips.workspace = true
-alloy-network.workspace = true
 alloy-signer.workspace = true
 alloy-signer-local.workspace = true
-alloy-rlp.workspace = true
 
 tokio.workspace = true
 eyre.workspace = true
@@ -28,5 +26,4 @@ serde.workspace = true
 serde_json.workspace = true
 reqwest = { version = "0.12", features = ["json"] }
 hex.workspace = true
-rand.workspace = true
 tiny-keccak = { version = "2", features = ["keccak"] }

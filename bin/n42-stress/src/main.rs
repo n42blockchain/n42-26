@@ -324,11 +324,8 @@ async fn sync_nonces_parallel(
         }));
     }
 
-    // Limit concurrency with chunks
-    for chunk in handles.chunks_mut(64) {
-        for handle in chunk.iter_mut() {
-            let _ = handle.await;
-        }
+    for handle in handles {
+        let _ = handle.await;
     }
 
     tracing::info!(
@@ -338,6 +335,7 @@ async fn sync_nonces_parallel(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_test(
     accounts: &[Arc<TestAccount>],
     targets: &[Address],
@@ -362,7 +360,7 @@ async fn run_test(
 
     let mut group_idx: usize = 0;
     // Divide accounts into groups of `apb` for multi-account batching
-    let num_groups = (num_accounts + apb - 1) / apb;
+    let num_groups = num_accounts.div_ceil(apb);
 
     while start.elapsed() < duration {
         let group_start = (group_idx % num_groups) * apb;
@@ -502,7 +500,7 @@ async fn analyze_blocks(
     };
 
     // P50/P95 block TPS
-    block_tps_values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    block_tps_values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let p50_tps = if !block_tps_values.is_empty() {
         block_tps_values[block_tps_values.len() / 2]
     } else {
@@ -560,7 +558,7 @@ async fn analyze_blocks(
             block_with_tps.push((blocks[i].number, blocks[i].tx_count, tps, blocks[i].gas_used, blocks[i].gas_limit));
         }
     }
-    block_with_tps.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
+    block_with_tps.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
     for (i, (num, txs, tps, gas_used, gas_limit)) in block_with_tps.iter().take(5).enumerate() {
         let util = if *gas_limit > 0 { (*gas_used as f64 / *gas_limit as f64) * 100.0 } else { 0.0 };
         tracing::info!(

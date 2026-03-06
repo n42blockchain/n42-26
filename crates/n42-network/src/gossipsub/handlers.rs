@@ -197,7 +197,7 @@ mod tests {
     fn test_validate_message_block_topic_oversized_rejected() {
         let consensus_hash = consensus_topic().hash();
         let block_hash = block_announce_topic().hash();
-        let oversized = vec![0u8; 4 * 1024 * 1024 + 1];
+        let oversized = vec![0u8; 8 * 1024 * 1024 + 1];
 
         let result = validate_message(&block_hash, &oversized, &consensus_hash, &block_hash, &mem_hash(), &blob_hash());
         assert!(matches!(result, gossipsub::MessageAcceptance::Reject));

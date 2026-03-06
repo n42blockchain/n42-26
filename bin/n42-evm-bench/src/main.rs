@@ -32,9 +32,10 @@ fn bench_eth_transfer() {
     println!("--- ETH Transfer (21000 gas) ---");
 
     let mut db = CacheDB::<EmptyDB>::default();
-    let mut sender_info = AccountInfo::default();
-    sender_info.balance = U256::from(u128::MAX);
-    db.insert_account_info(SENDER, sender_info);
+    db.insert_account_info(SENDER, AccountInfo {
+        balance: U256::from(u128::MAX),
+        ..Default::default()
+    });
 
     let warmup = 1_000;
     let iterations = 100_000;
@@ -59,10 +60,11 @@ fn bench_eth_transfer() {
 
     // Reset state for clean measurement
     let mut db = CacheDB::<EmptyDB>::default();
-    let mut sender_info = AccountInfo::default();
-    sender_info.balance = U256::from(u128::MAX);
-    sender_info.nonce = 0;
-    db.insert_account_info(SENDER, sender_info);
+    db.insert_account_info(SENDER, AccountInfo {
+        balance: U256::from(u128::MAX),
+        nonce: 0,
+        ..Default::default()
+    });
 
     let ctx = Context::mainnet().with_db(&mut db);
     let mut evm = ctx.build_mainnet();
@@ -95,10 +97,10 @@ fn bench_erc20_transfer() {
     println!("--- ERC-20 Transfer (2x SLOAD + 2x SSTORE contract call) ---");
 
     let mut db = CacheDB::<EmptyDB>::default();
-
-    let mut sender_info = AccountInfo::default();
-    sender_info.balance = U256::from(u128::MAX);
-    db.insert_account_info(SENDER, sender_info);
+    db.insert_account_info(SENDER, AccountInfo {
+        balance: U256::from(u128::MAX),
+        ..Default::default()
+    });
 
     // Hand-crafted bytecode: SLOAD slot 0 (sender), SUB 1, SSTORE;
     // SLOAD slot 1 (receiver), ADD 1, SSTORE; RETURN(32, 0)
@@ -146,10 +148,11 @@ fn bench_erc20_transfer() {
 
     // Reset
     let mut db = CacheDB::<EmptyDB>::default();
-    let mut sender_info = AccountInfo::default();
-    sender_info.balance = U256::from(u128::MAX);
-    sender_info.nonce = 0;
-    db.insert_account_info(SENDER, sender_info);
+    db.insert_account_info(SENDER, AccountInfo {
+        balance: U256::from(u128::MAX),
+        nonce: 0,
+        ..Default::default()
+    });
 
     let mut contract_info = AccountInfo::default();
     contract_info.code = Some(revm::bytecode::Bytecode::new_legacy(bytecode.into()));
