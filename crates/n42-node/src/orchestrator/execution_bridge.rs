@@ -147,11 +147,11 @@ impl ConsensusOrchestrator {
         // (same parent, different timestamps). This floods reth with conflicting new_payload
         // calls, triggering pipeline sync and permanent chain stalls.
         let parent = self.head_block_hash;
-        if let Some(building_parent) = self.building_on_parent {
-            if building_parent == parent {
-                debug!(target: "n42::cl::exec_bridge", %parent, "build already in progress on this parent, skipping");
-                return;
-            }
+        if let Some(building_parent) = self.building_on_parent
+            && building_parent == parent
+        {
+            debug!(target: "n42::cl::exec_bridge", %parent, "build already in progress on this parent, skipping");
+            return;
         }
         self.building_on_parent = Some(parent);
 
@@ -262,6 +262,7 @@ impl ConsensusOrchestrator {
         let current_view = self.engine.current_view();
         let blob_store = self.blob_store.clone();
         let eager_import_done_tx = self.eager_import_done_tx.clone();
+        let build_complete_tx = self.build_complete_tx.clone();
 
         let handle = tokio::spawn(async move {
             // Allow builder time to pack transactions from the pool.
@@ -305,6 +306,8 @@ impl ConsensusOrchestrator {
 
         // Monitor the JoinHandle so that panics/cancellations in the payload
         // resolve task are logged rather than silently swallowed.
+        // Also sends the build-complete signal so `building_on_parent` is cleared
+        // even on failure/timeout/panic — preventing permanent build stalls.
         tokio::spawn(async move {
             if let Err(e) = handle.await {
                 error!(
@@ -313,6 +316,8 @@ impl ConsensusOrchestrator {
                     "payload resolve task terminated unexpectedly (panic or cancellation)"
                 );
             }
+            // Signal completion regardless of success/failure/panic.
+            let _ = build_complete_tx.send(());
         });
     }
 

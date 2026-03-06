@@ -203,6 +203,11 @@ pub struct ConsensusOrchestrator {
     /// blocks at the same height and flood reth with conflicting `new_payload` calls
     /// — triggering pipeline sync and chain stalls.
     building_on_parent: Option<B256>,
+    /// Notifies the orchestrator when a payload resolve task finishes (success or failure).
+    /// Used to clear `building_on_parent` so new builds are not permanently blocked
+    /// when a resolve task takes longer than the pacemaker timeout.
+    build_complete_tx: mpsc::UnboundedSender<()>,
+    build_complete_rx: mpsc::UnboundedReceiver<()>,
     mobile_reward_manager: Option<Arc<Mutex<MobileRewardManager>>>,
     staking_manager: Option<Arc<Mutex<StakingManager>>>,
     committed_block_count: u64,
@@ -235,6 +240,7 @@ impl ConsensusOrchestrator {
         let (leader_payload_tx, leader_payload_rx) = mpsc::unbounded_channel();
         let (import_done_tx, import_done_rx) = mpsc::unbounded_channel();
         let (eager_import_done_tx, eager_import_done_rx) = mpsc::unbounded_channel();
+        let (build_complete_tx, build_complete_rx) = mpsc::unbounded_channel();
         Self {
             engine,
             network,
@@ -275,6 +281,8 @@ impl ConsensusOrchestrator {
             eager_import_done_rx,
             speculative_build_hash: None,
             building_on_parent: None,
+            build_complete_tx,
+            build_complete_rx,
             mobile_reward_manager: None,
             staking_manager: None,
             committed_block_count: 0,
@@ -301,6 +309,7 @@ impl ConsensusOrchestrator {
         let (leader_payload_tx, leader_payload_rx) = mpsc::unbounded_channel();
         let (import_done_tx, import_done_rx) = mpsc::unbounded_channel();
         let (eager_import_done_tx, eager_import_done_rx) = mpsc::unbounded_channel();
+        let (build_complete_tx, build_complete_rx) = mpsc::unbounded_channel();
 
         let slot_time_ms: u64 = std::env::var("N42_BLOCK_INTERVAL_MS")
             .ok()
@@ -352,6 +361,8 @@ impl ConsensusOrchestrator {
             eager_import_done_rx,
             speculative_build_hash: None,
             building_on_parent: None,
+            build_complete_tx,
+            build_complete_rx,
             mobile_reward_manager: None,
             staking_manager: None,
             committed_block_count: 0,
@@ -489,6 +500,10 @@ impl ConsensusOrchestrator {
 
                 block_hash = self.block_ready_rx.recv() => {
                     if let Some(hash) = block_hash {
+                        // Build succeeded — clear the parent guard immediately so future
+                        // builds for the same parent (after view change) are not blocked.
+                        self.building_on_parent = None;
+
                         // Pipeline: leader build complete — record timing.
                         // `created` is set now (build + broadcast finished);
                         // `build_complete` also set immediately since the build just resolved.
@@ -527,6 +542,17 @@ impl ConsensusOrchestrator {
                 import_result = self.import_done_rx.recv() => {
                     if let Some((hash, view, success, block_ts)) = import_result {
                         self.handle_import_done(hash, view, success, block_ts).await;
+                    }
+                }
+
+                _ = self.build_complete_rx.recv() => {
+                    // Payload resolve task finished (success or failure).
+                    // Clear the parent guard so future builds are not permanently blocked.
+                    // On success, block_ready_rx already cleared it; this handles failure paths
+                    // (build error, timeout, panic) where no BlockReady signal is sent.
+                    if self.building_on_parent.is_some() {
+                        debug!(target: "n42::cl::orchestrator", "build task completed, clearing building_on_parent guard");
+                        self.building_on_parent = None;
                     }
                 }
 
