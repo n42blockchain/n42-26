@@ -1,7 +1,16 @@
 /target
-.claude/mind.mv2
-.claude/mind.mv2.lock
 /n42-data/
+
+# Claude Code config
+**/.claude/
+
+# Android build artifacts
+mobile/android/.gradle/
+mobile/android/app/build/
+mobile/android/local.properties
+
+# Python cache
+__pycache__/
 
 # Binary artifacts (built via cross-compilation)
 *.a
