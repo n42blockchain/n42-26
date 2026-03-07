@@ -785,11 +785,10 @@ mod multi_node_consensus {
 
 mod mobile_verification {
     use super::*;
-    use n42_mobile::commitment::compute_commitment;
-    use n42_mobile::{
-        sign_receipt, CommitmentError, ReceiptAggregator, VerificationCommitment,
-        VerificationReveal,
-    };
+    use n42_mobile::{sign_receipt, ReceiptAggregator};
+
+    /// The expected receipts root used by test receipts.
+    const TEST_RR: B256 = B256::new([0xAA; 32]);
 
     #[test]
     fn test_mobile_receipt_signing() {
@@ -798,9 +797,9 @@ mod mobile_verification {
 
         for i in 0..10u32 {
             let key = test_mobile_bls_key(i);
-            let receipt = sign_receipt(block_hash, block_number, true, true, 1_700_000_000_000, &key);
+            let receipt = sign_receipt(block_hash, block_number, TEST_RR, 1_700_000_000_000, &key);
 
-            assert!(receipt.is_valid());
+            assert!(receipt.matches_expected(&TEST_RR));
             assert_eq!(receipt.block_hash, block_hash);
             assert_eq!(receipt.block_number, block_number);
             assert_eq!(receipt.verifier_pubkey, key.public_key().to_bytes());
@@ -819,16 +818,15 @@ mod mobile_verification {
         let threshold = 7u32;
 
         let mut aggregator = ReceiptAggregator::new(threshold, 100);
-        aggregator.register_block(block_hash, block_number);
+        aggregator.register_block(block_hash, block_number, Some(TEST_RR));
 
         for i in 0..10u32 {
             let key = test_mobile_bls_key(i);
-            let receipt = sign_receipt(block_hash, block_number, true, true, 1_000_000 + i as u64, &key);
+            let receipt = sign_receipt(block_hash, block_number, TEST_RR, 1_000_000 + i as u64, &key);
 
             let result = aggregator.process_receipt(&receipt);
 
             if i < threshold - 1 {
-                // Not yet reached threshold
                 assert_eq!(
                     result,
                     Some(false),
@@ -836,7 +834,6 @@ mod mobile_verification {
                     i
                 );
             } else if i == threshold - 1 {
-                // Exactly reached threshold
                 assert_eq!(
                     result,
                     Some(true),
@@ -857,136 +854,19 @@ mod mobile_verification {
         let block_number = 50u64;
 
         let mut aggregator = ReceiptAggregator::new(5, 100);
-        aggregator.register_block(block_hash, block_number);
+        aggregator.register_block(block_hash, block_number, Some(TEST_RR));
 
         let key = test_mobile_bls_key(0);
-        let receipt = sign_receipt(block_hash, block_number, true, true, 1_000_000, &key);
+        let receipt = sign_receipt(block_hash, block_number, TEST_RR, 1_000_000, &key);
 
-        // First submission accepted
         let result = aggregator.process_receipt(&receipt);
         assert_eq!(result, Some(false));
 
-        // Duplicate submission rejected (returns None)
         let result = aggregator.process_receipt(&receipt);
         assert_eq!(result, None, "duplicate receipt should be rejected");
 
         let status = aggregator.get_status(&block_hash).unwrap();
         assert_eq!(status.total_receipts(), 1, "should still have only 1 receipt");
-    }
-
-    #[test]
-    fn test_commitment_reveal_success() {
-        let block_hash = B256::repeat_byte(0xCD);
-        let block_number = 200u64;
-
-        for i in 0..5u32 {
-            let key = test_mobile_bls_key(i);
-            let verifier_pubkey = key.public_key().to_bytes();
-            let nonce = B256::repeat_byte(i as u8 + 1);
-
-            let commitment_hash = compute_commitment(
-                &block_hash,
-                block_number,
-                true,
-                true,
-                &nonce,
-            );
-
-            let commitment = VerificationCommitment {
-                block_hash,
-                block_number,
-                verifier_pubkey,
-                commitment_hash,
-                timestamp_ms: 1_000_000,
-            };
-
-            let reveal = VerificationReveal {
-                block_hash,
-                block_number,
-                verifier_pubkey,
-                state_root_match: true,
-                receipts_root_match: true,
-                nonce,
-            };
-
-            reveal
-                .verify_against_commitment(&commitment)
-                .expect("valid commitment-reveal should succeed");
-        }
-    }
-
-    #[test]
-    fn test_commitment_reveal_copying_detected() {
-        let block_hash = B256::repeat_byte(0xEF);
-        let block_number = 300u64;
-
-        // Phone A creates a valid commitment
-        let key_a = test_mobile_bls_key(0);
-        let pubkey_a = key_a.public_key().to_bytes();
-        let nonce_a = B256::repeat_byte(0xAA);
-
-        let commitment_hash_a = compute_commitment(
-            &block_hash,
-            block_number,
-            true,
-            true,
-            &nonce_a,
-        );
-
-        let commitment_a = VerificationCommitment {
-            block_hash,
-            block_number,
-            verifier_pubkey: pubkey_a,
-            commitment_hash: commitment_hash_a,
-            timestamp_ms: 1_000_000,
-        };
-
-        // Phone B tries to copy Phone A's result with a DIFFERENT nonce
-        let key_b = test_mobile_bls_key(1);
-        let pubkey_b = key_b.public_key().to_bytes();
-        let nonce_b = B256::repeat_byte(0xBB);
-
-        // B creates its own commitment
-        let commitment_hash_b = compute_commitment(
-            &block_hash,
-            block_number,
-            true,
-            true,
-            &nonce_b,
-        );
-
-        let commitment_b = VerificationCommitment {
-            block_hash,
-            block_number,
-            verifier_pubkey: pubkey_b,
-            commitment_hash: commitment_hash_b,
-            timestamp_ms: 1_000_001,
-        };
-
-        // B tries to reveal using A's nonce (copying attempt)
-        let bad_reveal = VerificationReveal {
-            block_hash,
-            block_number,
-            verifier_pubkey: pubkey_b,
-            state_root_match: true,
-            receipts_root_match: true,
-            nonce: nonce_a, // Using A's nonce!
-        };
-
-        let result = bad_reveal.verify_against_commitment(&commitment_b);
-        assert!(result.is_err(), "copying should be detected");
-        assert!(
-            matches!(result.unwrap_err(), CommitmentError::HashMismatch),
-            "should be HashMismatch error"
-        );
-
-        // B can't use A's commitment either (verifier mismatch)
-        let result2 = bad_reveal.verify_against_commitment(&commitment_a);
-        assert!(result2.is_err());
-        assert!(matches!(
-            result2.unwrap_err(),
-            CommitmentError::VerifierMismatch
-        ));
     }
 
     #[test]
@@ -999,11 +879,11 @@ mod mobile_verification {
 
         // Step 2: Simulate mobile verifiers signing receipts
         let mut aggregator = ReceiptAggregator::new(7, 100);
-        aggregator.register_block(block_hash, 1);
+        aggregator.register_block(block_hash, 1, Some(TEST_RR));
 
         for i in 0..10u32 {
             let key = test_mobile_bls_key(i);
-            let receipt = sign_receipt(block_hash, 1, true, true, 2_000_000 + i as u64, &key);
+            let receipt = sign_receipt(block_hash, 1, TEST_RR, 2_000_000 + i as u64, &key);
 
             receipt.verify_signature().unwrap();
             aggregator.process_receipt(&receipt);
@@ -1644,7 +1524,8 @@ mod stress_performance {
         let threshold = 667u32;
 
         let mut aggregator = ReceiptAggregator::new(threshold, 10);
-        aggregator.register_block(block_hash, block_number);
+        let expected_rr = B256::repeat_byte(0xAA);
+        aggregator.register_block(block_hash, block_number, Some(expected_rr));
 
         let mut threshold_reached_at = None;
 
@@ -1653,8 +1534,7 @@ mod stress_performance {
             let receipt = sign_receipt(
                 block_hash,
                 block_number,
-                true,
-                true,
+                expected_rr,
                 3_000_000 + i as u64,
                 &key,
             );

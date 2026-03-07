@@ -29,9 +29,11 @@ type EthTx = <EthPrimitives as NodePrimitives>::SignedTx;
 /// Block verification result.
 #[derive(Debug, Clone)]
 pub struct VerificationResult {
-    /// Whether the computed receipts root matches the expected value.
-    pub receipts_root_match: bool,
     /// The computed receipts root from re-execution.
+    ///
+    /// The phone returns this value to the IDC node, which checks it
+    /// against the expected receipts root. This ensures the phone
+    /// actually executed the block rather than echoing a known answer.
     pub computed_receipts_root: B256,
 }
 
@@ -112,7 +114,6 @@ pub fn verify_block(
     let computed = Receipt::calculate_receipt_root_no_memo(&result.receipts);
 
     Ok(VerificationResult {
-        receipts_root_match: computed == packet.receipts_root,
         computed_receipts_root: computed,
     })
 }
@@ -435,10 +436,6 @@ pub fn verify_block_stream(
     chain_spec: Arc<ChainSpec>,
 ) -> Result<VerificationResult, VerifyError> {
     let sealed_header = decode_and_verify_header(&packet.header_rlp, packet.block_hash)?;
-    let expected_receipts_root = {
-        use alloy_consensus::BlockHeader;
-        sealed_header.receipts_root()
-    };
     let recovered = decode_and_recover(sealed_header, &packet.transactions)?;
 
     let bytecodes_map: HashMap<B256, Bytecode> = packet
@@ -452,7 +449,6 @@ pub fn verify_block_stream(
     let computed = Receipt::calculate_receipt_root_no_memo(&result.receipts);
 
     Ok(VerificationResult {
-        receipts_root_match: computed == expected_receipts_root,
         computed_receipts_root: computed,
     })
 }
@@ -484,7 +480,6 @@ mod tests {
             parent_hash: header.parent_hash(),
             state_root: header.state_root(),
             transactions_root: header.transactions_root(),
-            receipts_root: header.receipts_root(),
             timestamp: header.timestamp(),
             gas_limit: header.gas_limit(),
             beneficiary: header.beneficiary(),

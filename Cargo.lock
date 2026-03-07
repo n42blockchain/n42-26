@@ -2760,7 +2760,7 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 
 [[package]]
 name = "e2e-test"
-version = "0.2.6"
+version = "0.3.1"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -5533,7 +5533,7 @@ dependencies = [
 
 [[package]]
 name = "n42-chainspec"
-version = "0.2.6"
+version = "0.3.1"
 dependencies = [
  "alloy-consensus",
  "alloy-genesis",
@@ -5549,7 +5549,7 @@ dependencies = [
 
 [[package]]
 name = "n42-consensus"
-version = "0.2.6"
+version = "0.3.1"
 dependencies = [
  "alloy-primitives",
  "bincode",
@@ -5571,7 +5571,7 @@ dependencies = [
 
 [[package]]
 name = "n42-evm-bench"
-version = "0.2.6"
+version = "0.3.1"
 dependencies = [
  "alloy-primitives",
  "hex",
@@ -5582,7 +5582,7 @@ dependencies = [
 
 [[package]]
 name = "n42-execution"
-version = "0.2.6"
+version = "0.3.1"
 dependencies = [
  "alloy-eips",
  "alloy-evm 0.28.1",
@@ -5610,7 +5610,7 @@ dependencies = [
 
 [[package]]
 name = "n42-mobile"
-version = "0.2.6"
+version = "0.3.1"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -5618,6 +5618,7 @@ dependencies = [
  "alloy-rlp",
  "bincode",
  "eyre",
+ "hex",
  "lru 0.12.5",
  "n42-chainspec",
  "n42-execution",
@@ -5639,7 +5640,7 @@ dependencies = [
 
 [[package]]
 name = "n42-mobile-ffi"
-version = "0.2.6"
+version = "0.3.1"
 dependencies = [
  "alloy-primitives",
  "bincode",
@@ -5666,7 +5667,7 @@ dependencies = [
 
 [[package]]
 name = "n42-mobile-sim"
-version = "0.2.6"
+version = "0.3.1"
 dependencies = [
  "alloy-primitives",
  "bincode",
@@ -5683,7 +5684,7 @@ dependencies = [
 
 [[package]]
 name = "n42-network"
-version = "0.2.6"
+version = "0.3.1"
 dependencies = [
  "alloy-primitives",
  "bincode",
@@ -5708,7 +5709,7 @@ dependencies = [
 
 [[package]]
 name = "n42-node"
-version = "0.2.6"
+version = "0.3.1"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -5772,7 +5773,7 @@ dependencies = [
 
 [[package]]
 name = "n42-node-bin"
-version = "0.2.6"
+version = "0.3.1"
 dependencies = [
  "aes-gcm",
  "alloy-primitives",
@@ -5803,7 +5804,7 @@ dependencies = [
 
 [[package]]
 name = "n42-parallel-evm"
-version = "0.2.6"
+version = "0.3.1"
 dependencies = [
  "alloy-primitives",
  "dashmap",
@@ -5818,7 +5819,7 @@ dependencies = [
 
 [[package]]
 name = "n42-primitives"
-version = "0.2.6"
+version = "0.3.1"
 dependencies = [
  "alloy-primitives",
  "bincode",
@@ -5835,7 +5836,7 @@ dependencies = [
 
 [[package]]
 name = "n42-stress"
-version = "0.2.6"
+version = "0.3.1"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",

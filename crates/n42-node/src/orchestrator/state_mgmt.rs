@@ -311,8 +311,15 @@ impl ConsensusOrchestrator {
             if let Some(ref staking_mgr) = self.staking_manager
                 && !sync_block.payload.is_empty()
             {
-                let mut mgr = staking_mgr.lock().unwrap_or_else(|e| e.into_inner());
-                mgr.scan_committed_block(sync_block.view, &sync_block.payload);
+                match super::decompress_payload(&sync_block.payload) {
+                    Ok(decompressed) => {
+                        let mut mgr = staking_mgr.lock().unwrap_or_else(|e| e.into_inner());
+                        mgr.scan_committed_block(sync_block.view, &decompressed);
+                    }
+                    Err(e) => {
+                        warn!(target: "n42::cl::sync", view = sync_block.view, error = %e, "failed to decompress sync payload for staking scan");
+                    }
+                }
             }
 
             if self.committed_blocks.len() >= max_committed_blocks() {

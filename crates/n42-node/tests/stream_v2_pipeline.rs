@@ -637,8 +637,8 @@ fn run_full_v2_packet_test(
     let result = verify_block_stream(&decoded, &mut code_cache, chain_spec)
         .expect("verify_block_stream should succeed");
 
-    assert!(
-        result.receipts_root_match,
+    assert_eq!(
+        result.computed_receipts_root, receipts_root,
         "receipts root must match! computed={:#x}, expected={:#x}",
         result.computed_receipts_root, receipts_root
     );

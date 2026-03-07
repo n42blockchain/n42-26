@@ -97,10 +97,9 @@ int n42_verify_and_send(VerifierContext* ctx, const uint8_t* data, size_t len);
 /**
  * Get information about the last verification as a JSON string.
  *
- * JSON fields: block_number, block_hash, receipts_root_match,
- * computed_receipts_root, expected_receipts_root, tx_count,
- * witness_accounts, uncached_bytecodes, packet_size_bytes,
- * verify_time_ms, signature.
+ * JSON fields: block_number, block_hash, computed_receipts_root,
+ * tx_count, witness_accounts, uncached_bytecodes,
+ * packet_size_bytes, verify_time_ms, signature.
  *
  * @param ctx      Valid context.
  * @param out_buf  Buffer for the null-terminated JSON string.

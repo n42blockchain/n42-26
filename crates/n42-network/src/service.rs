@@ -9,6 +9,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::interval;
 
+use crate::block_direct::{BlockDirectRequest, BlockDirectResponse};
 use crate::consensus_direct::{ConsensusDirectRequest, ConsensusDirectResponse};
 use crate::error::NetworkError;
 use crate::gossipsub::handlers::{decode_consensus_message, encode_consensus_message, validate_message};
@@ -28,6 +29,8 @@ pub enum NetworkCommand {
     AnnounceBlock(Vec<u8>),
     BroadcastTransaction(Vec<u8>),
     BroadcastBlobSidecar(Vec<u8>),
+    /// Send block data directly to a specific peer (leader → validator).
+    SendBlockDirect { peer: PeerId, data: Vec<u8> },
     Dial(Multiaddr),
     RequestSync { peer: PeerId, request: BlockSyncRequest },
     SendSyncResponse { request_id: u64, response: BlockSyncResponse },
@@ -98,6 +101,19 @@ impl NetworkHandle {
 
     pub fn broadcast_blob_sidecar(&self, data: Vec<u8>) -> Result<(), NetworkError> {
         self.send(NetworkCommand::BroadcastBlobSidecar(data))
+    }
+
+    /// Sends block data directly to a specific validator peer.
+    pub fn send_block_direct(&self, peer: PeerId, data: Vec<u8>) -> Result<(), NetworkError> {
+        self.send(NetworkCommand::SendBlockDirect { peer, data })
+    }
+
+    /// Returns all known validator peers (index → PeerId).
+    pub fn all_validator_peers(&self) -> Vec<(u32, PeerId)> {
+        match self.validator_peer_map.read() {
+            Ok(map) => map.iter().map(|(&idx, &pid)| (idx, pid)).collect(),
+            Err(_) => Vec::new(),
+        }
     }
 
     pub fn dial(&self, addr: Multiaddr) -> Result<(), NetworkError> {
@@ -301,6 +317,9 @@ impl NetworkService {
             SwarmEvent::Behaviour(N42BehaviourEvent::ConsensusDirect(event)) => {
                 self.handle_consensus_direct_event(event);
             }
+            SwarmEvent::Behaviour(N42BehaviourEvent::BlockDirect(event)) => {
+                self.handle_block_direct_event(event);
+            }
             SwarmEvent::Behaviour(N42BehaviourEvent::Identify(
                 libp2p::identify::Event::Received { peer_id, info, .. },
             )) => {
@@ -341,25 +360,18 @@ impl NetworkService {
         tracing::debug!(%peer_id, protocol = ?info.protocol_version, "identified peer");
 
         // agent_version format: "n42/1.0.0/v{index}"
+        // Security note: validator index is self-reported via agent_version.
+        // Real authentication happens at the BLS signature level in consensus.
+        // A fake mapping only causes direct-push fallback to GossipSub.
         if let Some(idx_str) = info.agent_version.strip_prefix("n42/1.0.0/v")
             && let Ok(idx) = idx_str.parse::<u32>()
         {
-            // Only allow validator index registration from trusted/known peers
-            // to prevent arbitrary nodes from injecting fake mappings.
-            if self.reconnection.is_trusted(&peer_id) {
-                tracing::info!(%peer_id, validator_index = idx, "mapped peer to validator");
-                match self.validator_peer_map.write() {
-                    Ok(mut map) => { map.insert(idx, peer_id); }
-                    Err(e) => {
-                        tracing::error!("validator_peer_map lock poisoned on write: {}", e);
-                    }
+            tracing::info!(%peer_id, validator_index = idx, "mapped peer to validator");
+            match self.validator_peer_map.write() {
+                Ok(mut map) => { map.insert(idx, peer_id); }
+                Err(e) => {
+                    tracing::error!("validator_peer_map lock poisoned on write: {}", e);
                 }
-            } else {
-                tracing::debug!(
-                    %peer_id,
-                    validator_index = idx,
-                    "ignoring validator index from untrusted peer"
-                );
             }
         }
 
@@ -512,6 +524,37 @@ impl NetworkService {
         }
     }
 
+    fn handle_block_direct_event(
+        &mut self,
+        event: libp2p::request_response::Event<BlockDirectRequest, BlockDirectResponse>,
+    ) {
+        match event {
+            libp2p::request_response::Event::Message { peer, message, .. } => match message {
+                libp2p::request_response::Message::Request { request, channel, .. } => {
+                    metrics::counter!("n42_block_direct_received").increment(1);
+                    tracing::debug!(%peer, bytes = request.data.len(), "received block via direct push");
+                    self.emit_event(NetworkEvent::BlockAnnouncement {
+                        source: peer,
+                        data: request.data,
+                    });
+                    let _ = self.swarm.behaviour_mut().block_direct.send_response(
+                        channel,
+                        BlockDirectResponse { accepted: true },
+                    );
+                }
+                libp2p::request_response::Message::Response { .. } => {
+                    // ACK received — fire-and-forget.
+                }
+            },
+            libp2p::request_response::Event::OutboundFailure { peer, error, .. } => {
+                tracing::debug!(%peer, ?error, "block direct send failed");
+                metrics::counter!("n42_block_direct_send_failures").increment(1);
+            }
+            libp2p::request_response::Event::InboundFailure { .. } => {}
+            libp2p::request_response::Event::ResponseSent { .. } => {}
+        }
+    }
+
     fn handle_mdns_event(&mut self, event: libp2p::mdns::Event) {
         match event {
             libp2p::mdns::Event::Discovered(peers) => {
@@ -636,6 +679,11 @@ impl NetworkService {
             }
             NetworkCommand::BroadcastBlobSidecar(data) => {
                 self.gossipsub_publish(blob_sidecar_topic(), data, "blob sidecar");
+            }
+            NetworkCommand::SendBlockDirect { peer, data } => {
+                metrics::counter!("n42_block_direct_sent").increment(1);
+                let req = BlockDirectRequest { data };
+                self.swarm.behaviour_mut().block_direct.send_request(&peer, req);
             }
             NetworkCommand::Dial(addr) => {
                 if let Err(e) = self.swarm.dial(addr.clone()) {

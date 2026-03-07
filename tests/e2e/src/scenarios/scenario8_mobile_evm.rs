@@ -169,19 +169,9 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
                     Ok(vr) => {
                         info!(
                             block_number = packet.block_number,
-                            receipts_root_match = vr.receipts_root_match,
                             computed = %vr.computed_receipts_root,
-                            expected = %packet.receipts_root,
                             verify_ms,
                             "verify_block() completed"
-                        );
-
-                        assert!(
-                            vr.receipts_root_match,
-                            "receipts_root MISMATCH at block {}: computed {} != expected {}",
-                            packet.block_number,
-                            vr.computed_receipts_root,
-                            packet.receipts_root,
                         );
 
                         // Update code cache with newly received bytecodes
@@ -196,13 +186,11 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
                         let receipt = sign_receipt(
                             packet.block_hash,
                             packet.block_number,
-                            true,  // state_root_match (not yet verified separately)
-                            true,  // receipts_root_match (verified above)
+                            vr.computed_receipts_root,
                             timestamp_ms,
                             &mobile_key,
                         );
 
-                        assert!(receipt.is_valid(), "signed receipt should be valid");
                         assert!(
                             receipt.verify_signature().is_ok(),
                             "BLS signature should verify"

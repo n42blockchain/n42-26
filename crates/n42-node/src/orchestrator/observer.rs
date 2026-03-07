@@ -201,7 +201,14 @@ impl ObserverOrchestrator {
             self.highest_seen_view = view;
         }
 
-        let execution_data = match serde_json::from_slice(&broadcast.payload_json) {
+        let payload_json = match super::decompress_payload(&broadcast.payload_json) {
+            Ok(d) => d,
+            Err(e) => {
+                warn!(target: "n42::observer", %hash, error = %e, "failed to decompress payload");
+                return;
+            }
+        };
+        let execution_data = match serde_json::from_slice(&payload_json) {
             Ok(d) => d,
             Err(e) => {
                 warn!(target: "n42::observer", %hash, error = %e, "failed to parse execution payload JSON");

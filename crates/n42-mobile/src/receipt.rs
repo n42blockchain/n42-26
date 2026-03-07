@@ -6,15 +6,17 @@ use crate::serde_helpers::pubkey_48;
 
 /// Verification receipt returned from a mobile device to the IDC node.
 ///
-/// Produced after re-executing a block, indicating whether the computed
-/// state root and receipts root match the expected values.
-/// Uses BLS12-381 signatures for aggregation compatibility.
+/// After re-executing a block, the phone computes the receipts root and
+/// returns it to the IDC node. The IDC node checks the value against the
+/// expected receipts root to confirm the phone actually executed the block.
+/// Uses BLS12-381 signatures to prevent tampering.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VerificationReceipt {
     pub block_hash: B256,
     pub block_number: u64,
-    pub state_root_match: bool,
-    pub receipts_root_match: bool,
+    /// The receipts root computed by re-executing the block on the phone.
+    /// The IDC node compares this against the expected value.
+    pub computed_receipts_root: B256,
     /// BLS12-381 public key of the verifier (48 bytes).
     #[serde(with = "pubkey_48")]
     pub verifier_pubkey: [u8; 48],
@@ -26,28 +28,32 @@ pub struct VerificationReceipt {
 
 /// Builds the canonical signing message for a receipt.
 ///
-/// Format: `block_hash(32B) || block_number(8B LE) || state_root_match(1B)`
-///       `|| receipts_root_match(1B) || timestamp_ms(8B LE)`
-fn build_signing_message(
+/// Format: `block_hash(32B) || block_number(8B LE) || computed_receipts_root(32B)`
+///
+/// `timestamp_ms` is intentionally excluded from the signed data so that all
+/// phones attesting to the same `(block_hash, block_number, receipts_root)`
+/// produce signatures over an identical 72-byte message. This enables efficient
+/// BLS aggregate verification via `fast_aggregate_verify` (2 pairings regardless
+/// of participant count), mirroring the Ethereum beacon-chain approach where
+/// per-validator timing is metadata, not part of the signed attestation.
+pub fn build_signing_message(
     block_hash: &B256,
     block_number: u64,
-    state_root_match: bool,
-    receipts_root_match: bool,
-    timestamp_ms: u64,
+    computed_receipts_root: &B256,
 ) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(50);
+    let mut msg = Vec::with_capacity(72);
     msg.extend_from_slice(block_hash.as_slice());
     msg.extend_from_slice(&block_number.to_le_bytes());
-    msg.push(state_root_match as u8);
-    msg.push(receipts_root_match as u8);
-    msg.extend_from_slice(&timestamp_ms.to_le_bytes());
+    msg.extend_from_slice(computed_receipts_root.as_slice());
     msg
 }
 
 impl VerificationReceipt {
-    /// Returns true if both state root and receipts root match.
-    pub fn is_valid(&self) -> bool {
-        self.state_root_match && self.receipts_root_match
+    /// Checks whether the computed receipts root matches the expected value.
+    ///
+    /// This is called on the IDC side after receiving the receipt from the phone.
+    pub fn matches_expected(&self, expected_receipts_root: &B256) -> bool {
+        self.computed_receipts_root == *expected_receipts_root
     }
 
     /// Constructs the canonical signing message for this receipt.
@@ -55,9 +61,7 @@ impl VerificationReceipt {
         build_signing_message(
             &self.block_hash,
             self.block_number,
-            self.state_root_match,
-            self.receipts_root_match,
-            self.timestamp_ms,
+            &self.computed_receipts_root,
         )
     }
 
@@ -75,22 +79,20 @@ impl VerificationReceipt {
 pub fn sign_receipt(
     block_hash: B256,
     block_number: u64,
-    state_root_match: bool,
-    receipts_root_match: bool,
+    computed_receipts_root: B256,
     timestamp_ms: u64,
     signing_key: &BlsSecretKey,
 ) -> VerificationReceipt {
     let verifier_pubkey = signing_key.public_key().to_bytes();
     let msg = build_signing_message(
-        &block_hash, block_number, state_root_match, receipts_root_match, timestamp_ms,
+        &block_hash, block_number, &computed_receipts_root,
     );
     let signature = signing_key.sign(&msg);
 
     VerificationReceipt {
         block_hash,
         block_number,
-        state_root_match,
-        receipts_root_match,
+        computed_receipts_root,
         verifier_pubkey,
         signature,
         timestamp_ms,
@@ -100,17 +102,16 @@ pub fn sign_receipt(
 /// Encodes a `VerificationReceipt` with a wire header.
 ///
 /// Format: `wire_header(4B) + block_hash(32B) + block_number(8B LE)`
-///       `+ state_root_match(1B) + receipts_root_match(1B)`
+///       `+ computed_receipts_root(32B)`
 ///       `+ verifier_pubkey(48B) + signature(96B) + timestamp_ms(8B LE)`
 pub fn encode_receipt(receipt: &VerificationReceipt) -> Vec<u8> {
     use crate::wire;
 
-    let mut buf = Vec::with_capacity(wire::HEADER_SIZE + 32 + 8 + 1 + 1 + 48 + 96 + 8);
+    let mut buf = Vec::with_capacity(wire::HEADER_SIZE + 32 + 8 + 32 + 48 + 96 + 8);
     wire::encode_header(&mut buf, wire::VERSION_1, 0x00);
     buf.extend_from_slice(receipt.block_hash.as_slice());
     buf.extend_from_slice(&receipt.block_number.to_le_bytes());
-    buf.push(receipt.state_root_match as u8);
-    buf.push(receipt.receipts_root_match as u8);
+    buf.extend_from_slice(receipt.computed_receipts_root.as_slice());
     buf.extend_from_slice(&receipt.verifier_pubkey);
     buf.extend_from_slice(&receipt.signature.to_bytes());
     buf.extend_from_slice(&receipt.timestamp_ms.to_le_bytes());
@@ -123,8 +124,8 @@ pub fn decode_receipt(data: &[u8]) -> Result<VerificationReceipt, crate::wire::W
 
     let (_header, payload) = wire::decode_header(data)?;
 
-    // Payload: block_hash(32) + block_number(8) + 2 flags(2) + pubkey(48) + sig(96) + ts(8) = 194
-    const RECEIPT_PAYLOAD_SIZE: usize = 32 + 8 + 1 + 1 + 48 + 96 + 8;
+    // Payload: block_hash(32) + block_number(8) + computed_receipts_root(32) + pubkey(48) + sig(96) + ts(8) = 224
+    const RECEIPT_PAYLOAD_SIZE: usize = 32 + 8 + 32 + 48 + 96 + 8;
     if payload.len() < RECEIPT_PAYLOAD_SIZE {
         return Err(WireError::UnexpectedEof(payload.len()));
     }
@@ -139,10 +140,8 @@ pub fn decode_receipt(data: &[u8]) -> Result<VerificationReceipt, crate::wire::W
             .map_err(|_| WireError::UnexpectedEof(pos + 8))?,
     );
     pos += 8;
-    let state_root_match = payload[pos] != 0;
-    pos += 1;
-    let receipts_root_match = payload[pos] != 0;
-    pos += 1;
+    let computed_receipts_root = B256::from_slice(&payload[pos..pos + 32]);
+    pos += 32;
 
     let mut verifier_pubkey = [0u8; 48];
     verifier_pubkey.copy_from_slice(&payload[pos..pos + 48]);
@@ -163,8 +162,7 @@ pub fn decode_receipt(data: &[u8]) -> Result<VerificationReceipt, crate::wire::W
     Ok(VerificationReceipt {
         block_hash,
         block_number,
-        state_root_match,
-        receipts_root_match,
+        computed_receipts_root,
         verifier_pubkey,
         signature,
         timestamp_ms,
@@ -192,29 +190,26 @@ mod tests {
     fn make_receipt(
         block_hash: B256,
         block_number: u64,
-        state_root_match: bool,
-        receipts_root_match: bool,
+        computed_receipts_root: B256,
         timestamp_ms: u64,
         sk: &BlsSecretKey,
     ) -> VerificationReceipt {
-        sign_receipt(block_hash, block_number, state_root_match, receipts_root_match, timestamp_ms, sk)
+        sign_receipt(block_hash, block_number, computed_receipts_root, timestamp_ms, sk)
     }
 
     #[test]
     fn test_sign_and_verify() {
         let sk = BlsSecretKey::key_gen(&[42u8; 32]).unwrap();
         let block_hash = B256::from([1u8; 32]);
-        let receipt = make_receipt(block_hash, 100, true, true, 1_700_000_000_000, &sk);
+        let computed_rr = B256::from([0xAA; 32]);
+        let receipt = make_receipt(block_hash, 100, computed_rr, 1_700_000_000_000, &sk);
 
-        // The verifier pubkey should match the signing key's public key.
         assert_eq!(receipt.verifier_pubkey, sk.public_key().to_bytes());
         assert_eq!(receipt.block_hash, block_hash);
         assert_eq!(receipt.block_number, 100);
-        assert!(receipt.state_root_match);
-        assert!(receipt.receipts_root_match);
+        assert_eq!(receipt.computed_receipts_root, computed_rr);
         assert_eq!(receipt.timestamp_ms, 1_700_000_000_000);
 
-        // Signature verification must succeed.
         receipt.verify_signature().expect("signature should be valid");
     }
 
@@ -222,64 +217,50 @@ mod tests {
     fn test_verify_tampered_receipt() {
         let sk = BlsSecretKey::key_gen(&[42u8; 32]).unwrap();
         let block_hash = B256::from([1u8; 32]);
-        let mut receipt = make_receipt(block_hash, 100, true, true, 1_700_000_000_000, &sk);
+        let mut receipt = make_receipt(block_hash, 100, B256::from([0xAA; 32]), 1_700_000_000_000, &sk);
 
-        // Tamper with the block number after signing.
         receipt.block_number = 999;
 
-        // Verification must fail because the signing message changed.
         let result = receipt.verify_signature();
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), ReceiptError::InvalidSignature));
     }
 
     #[test]
-    fn test_is_valid() {
+    fn test_matches_expected() {
         let sk = BlsSecretKey::key_gen(&[42u8; 32]).unwrap();
         let block_hash = B256::from([2u8; 32]);
+        let expected = B256::from([0xBB; 32]);
 
-        // Both true → is_valid returns true.
-        let receipt = make_receipt(block_hash, 1, true, true, 0, &sk);
-        assert!(receipt.is_valid());
-
-        // state_root_match false → is_valid returns false.
-        let receipt = make_receipt(block_hash, 1, false, true, 0, &sk);
-        assert!(!receipt.is_valid());
-
-        // receipts_root_match false → is_valid returns false.
-        let receipt = make_receipt(block_hash, 1, true, false, 0, &sk);
-        assert!(!receipt.is_valid());
-
-        // Both false → is_valid returns false.
-        let receipt = make_receipt(block_hash, 1, false, false, 0, &sk);
-        assert!(!receipt.is_valid());
+        let receipt = make_receipt(block_hash, 1, expected, 0, &sk);
+        assert!(receipt.matches_expected(&expected));
+        assert!(!receipt.matches_expected(&B256::from([0xCC; 32])));
     }
 
     #[test]
     fn test_signing_message_deterministic() {
         let sk = BlsSecretKey::key_gen(&[42u8; 32]).unwrap();
         let block_hash = B256::from([3u8; 32]);
+        let rr = B256::from([0xDD; 32]);
 
-        let receipt1 = make_receipt(block_hash, 50, true, false, 12345, &sk);
-        let receipt2 = make_receipt(block_hash, 50, true, false, 12345, &sk);
+        let receipt1 = make_receipt(block_hash, 50, rr, 12345, &sk);
+        let receipt2 = make_receipt(block_hash, 50, rr, 12345, &sk);
 
-        // Same fields must produce the same signing message.
         assert_eq!(receipt1.signing_message(), receipt2.signing_message());
 
-        // Different fields must produce a different signing message.
-        let receipt3 = make_receipt(block_hash, 51, true, false, 12345, &sk);
+        let receipt3 = make_receipt(block_hash, 51, rr, 12345, &sk);
         assert_ne!(receipt1.signing_message(), receipt3.signing_message());
 
-        // Verify the signing message has the expected length:
-        // 32 (block_hash) + 8 (block_number) + 1 (state_root_match) + 1 (receipts_root_match) + 8 (timestamp_ms) = 50
-        assert_eq!(receipt1.signing_message().len(), 50);
+        // 32 (block_hash) + 8 (block_number) + 32 (computed_receipts_root) = 72
+        // timestamp_ms is excluded from signed data to enable BLS aggregation.
+        assert_eq!(receipt1.signing_message().len(), 72);
     }
 
     #[test]
     fn test_receipt_bincode_roundtrip() {
         let sk = BlsSecretKey::key_gen(&[42u8; 32]).unwrap();
         let block_hash = B256::from([7u8; 32]);
-        let receipt = make_receipt(block_hash, 500, true, false, 99999, &sk);
+        let receipt = make_receipt(block_hash, 500, B256::from([0xEE; 32]), 99999, &sk);
 
         let encoded = bincode::serialize(&receipt).expect("receipt should serialize");
         let decoded: VerificationReceipt =
@@ -287,11 +268,9 @@ mod tests {
 
         assert_eq!(decoded.block_hash, receipt.block_hash);
         assert_eq!(decoded.block_number, receipt.block_number);
-        assert_eq!(decoded.state_root_match, receipt.state_root_match);
-        assert_eq!(decoded.receipts_root_match, receipt.receipts_root_match);
+        assert_eq!(decoded.computed_receipts_root, receipt.computed_receipts_root);
         assert_eq!(decoded.verifier_pubkey, receipt.verifier_pubkey);
         assert_eq!(decoded.timestamp_ms, receipt.timestamp_ms);
-        // Signature should survive roundtrip.
         decoded.verify_signature().expect("deserialized receipt should have valid signature");
     }
 
@@ -299,15 +278,14 @@ mod tests {
     fn test_receipt_versioned_roundtrip() {
         let sk = BlsSecretKey::key_gen(&[42u8; 32]).unwrap();
         let block_hash = B256::from([8u8; 32]);
-        let receipt = make_receipt(block_hash, 1000, true, true, 555_555, &sk);
+        let receipt = make_receipt(block_hash, 1000, B256::from([0xFF; 32]), 555_555, &sk);
 
         let encoded = encode_receipt(&receipt);
         let decoded = decode_receipt(&encoded).expect("versioned decode should succeed");
 
         assert_eq!(decoded.block_hash, receipt.block_hash);
         assert_eq!(decoded.block_number, receipt.block_number);
-        assert_eq!(decoded.state_root_match, receipt.state_root_match);
-        assert_eq!(decoded.receipts_root_match, receipt.receipts_root_match);
+        assert_eq!(decoded.computed_receipts_root, receipt.computed_receipts_root);
         assert_eq!(decoded.verifier_pubkey, receipt.verifier_pubkey);
         assert_eq!(decoded.timestamp_ms, receipt.timestamp_ms);
         decoded.verify_signature().expect("versioned receipt should have valid signature");
@@ -316,7 +294,7 @@ mod tests {
     #[test]
     fn test_receipt_versioned_header_check() {
         let sk = BlsSecretKey::key_gen(&[42u8; 32]).unwrap();
-        let receipt = make_receipt(B256::ZERO, 0, false, false, 0, &sk);
+        let receipt = make_receipt(B256::ZERO, 0, B256::ZERO, 0, &sk);
         let encoded = encode_receipt(&receipt);
         assert_eq!(encoded[0], 0x4E);
         assert_eq!(encoded[1], 0x32);

@@ -46,9 +46,7 @@ pub(crate) struct VerifyStats {
 pub(crate) struct LastVerifyInfo {
     pub block_number: u64,
     pub block_hash: String,
-    pub receipts_root_match: bool,
     pub computed_receipts_root: String,
-    pub expected_receipts_root: String,
     pub tx_count: usize,
     pub witness_accounts: usize,
     pub uncached_bytecodes: usize,

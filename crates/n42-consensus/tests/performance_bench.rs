@@ -285,11 +285,11 @@ fn bench_bls_mobile_operations() {
 
     let start = Instant::now();
     for i in 0..iterations {
-        let _ = n42_mobile::sign_receipt(block_hash, 1, true, true, i as u64, &sk);
+        let _ = n42_mobile::sign_receipt(block_hash, 1, B256::repeat_byte(0xAA), i as u64, &sk);
     }
     println!("  BLS Sign Receipt:  {:>6.1} us/op", start.elapsed().as_nanos() as f64 / iterations as f64 / 1000.0);
 
-    let receipt = n42_mobile::sign_receipt(block_hash, 1, true, true, 12345, &sk);
+    let receipt = n42_mobile::sign_receipt(block_hash, 1, B256::repeat_byte(0xAA), 12345, &sk);
     let start = Instant::now();
     for _ in 0..iterations {
         receipt.verify_signature().unwrap();
@@ -306,13 +306,13 @@ fn bench_bls_mobile_operations() {
 
         let mut aggregator =
             n42_mobile::ReceiptAggregator::new(threshold, 10);
-        aggregator.register_block(block_hash, 1);
+        aggregator.register_block(block_hash, 1, Some(B256::repeat_byte(0xAA)));
 
         let mut threshold_reached = false;
         for i in 0..total_receipts {
             let key = test_mobile_bls_key(i);
             let receipt =
-                n42_mobile::sign_receipt(block_hash, 1, true, true, 1_000_000 + i as u64, &key);
+                n42_mobile::sign_receipt(block_hash, 1, B256::repeat_byte(0xAA), 1_000_000 + i as u64, &key);
             receipt.verify_signature().unwrap();
             if let Some(true) = aggregator.process_receipt(&receipt) {
                 if !threshold_reached {
@@ -361,9 +361,9 @@ fn bench_config_500_nodes_500_mobiles() {
     let block_hash = B256::repeat_byte(0xDD);
     let start = Instant::now();
     let mut aggregator = n42_mobile::ReceiptAggregator::new(mobiles_per_node * 2 / 3 + 1, 10);
-    aggregator.register_block(block_hash, 1);
+    aggregator.register_block(block_hash, 1, Some(B256::repeat_byte(0xAA)));
     for i in 0..mobiles_per_node {
-        let receipt = n42_mobile::sign_receipt(block_hash, 1, true, true, i as u64, &test_mobile_bls_key(i));
+        let receipt = n42_mobile::sign_receipt(block_hash, 1, B256::repeat_byte(0xAA), i as u64, &test_mobile_bls_key(i));
         receipt.verify_signature().unwrap();
         aggregator.process_receipt(&receipt);
     }
@@ -372,9 +372,9 @@ fn bench_config_500_nodes_500_mobiles() {
 
     let start = Instant::now();
     let mut total_aggregator = n42_mobile::ReceiptAggregator::new(total_mobiles * 2 / 3 + 1, 10);
-    total_aggregator.register_block(block_hash, 1);
+    total_aggregator.register_block(block_hash, 1, Some(B256::repeat_byte(0xAA)));
     for i in 0..total_mobiles {
-        let receipt = n42_mobile::sign_receipt(block_hash, 1, true, true, i as u64, &test_mobile_bls_key(i));
+        let receipt = n42_mobile::sign_receipt(block_hash, 1, B256::repeat_byte(0xAA), i as u64, &test_mobile_bls_key(i));
         receipt.verify_signature().unwrap();
         total_aggregator.process_receipt(&receipt);
     }
@@ -417,9 +417,9 @@ fn bench_config_100_nodes_2500_mobiles() {
     let block_hash = B256::repeat_byte(0xEE);
     let start = Instant::now();
     let mut aggregator = n42_mobile::ReceiptAggregator::new(mobiles_per_node * 2 / 3 + 1, 10);
-    aggregator.register_block(block_hash, 1);
+    aggregator.register_block(block_hash, 1, Some(B256::repeat_byte(0xAA)));
     for i in 0..mobiles_per_node {
-        let receipt = n42_mobile::sign_receipt(block_hash, 1, true, true, i as u64, &test_mobile_bls_key(i));
+        let receipt = n42_mobile::sign_receipt(block_hash, 1, B256::repeat_byte(0xAA), i as u64, &test_mobile_bls_key(i));
         receipt.verify_signature().unwrap();
         aggregator.process_receipt(&receipt);
     }
@@ -428,9 +428,9 @@ fn bench_config_100_nodes_2500_mobiles() {
 
     let start = Instant::now();
     let mut total_aggregator = n42_mobile::ReceiptAggregator::new(total_mobiles * 2 / 3 + 1, 10);
-    total_aggregator.register_block(block_hash, 1);
+    total_aggregator.register_block(block_hash, 1, Some(B256::repeat_byte(0xAA)));
     for i in 0..total_mobiles {
-        let receipt = n42_mobile::sign_receipt(block_hash, 1, true, true, i as u64, &test_mobile_bls_key(i));
+        let receipt = n42_mobile::sign_receipt(block_hash, 1, B256::repeat_byte(0xAA), i as u64, &test_mobile_bls_key(i));
         receipt.verify_signature().unwrap();
         total_aggregator.process_receipt(&receipt);
     }
@@ -467,10 +467,10 @@ fn bench_comparative_summary() {
     let block_hash = B256::repeat_byte(0xF1);
     let start = Instant::now();
     let mut agg_a = n42_mobile::ReceiptAggregator::new(334, 10);
-    agg_a.register_block(block_hash, 1);
+    agg_a.register_block(block_hash, 1, Some(B256::repeat_byte(0xAA)));
     for i in 0..500u32 {
         let key = test_mobile_bls_key(i);
-        let receipt = n42_mobile::sign_receipt(block_hash, 1, true, true, i as u64, &key);
+        let receipt = n42_mobile::sign_receipt(block_hash, 1, B256::repeat_byte(0xAA), i as u64, &key);
         receipt.verify_signature().unwrap();
         agg_a.process_receipt(&receipt);
     }
@@ -493,10 +493,10 @@ fn bench_comparative_summary() {
     let block_hash = B256::repeat_byte(0xF2);
     let start = Instant::now();
     let mut agg_b = n42_mobile::ReceiptAggregator::new(1667, 10);
-    agg_b.register_block(block_hash, 1);
+    agg_b.register_block(block_hash, 1, Some(B256::repeat_byte(0xAA)));
     for i in 0..2500u32 {
         let key = test_mobile_bls_key(i);
-        let receipt = n42_mobile::sign_receipt(block_hash, 1, true, true, i as u64, &key);
+        let receipt = n42_mobile::sign_receipt(block_hash, 1, B256::repeat_byte(0xAA), i as u64, &key);
         receipt.verify_signature().unwrap();
         agg_b.process_receipt(&receipt);
     }

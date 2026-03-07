@@ -11,6 +11,7 @@ use reth_node_builder::ConsensusEngineHandle;
 use reth_payload_builder::{EthBuiltPayload, PayloadBuilderHandle, PayloadId};
 use reth_payload_primitives::{EngineApiMessageVersion, PayloadKind, PayloadTypes};
 use reth_transaction_pool::blobstore::{BlobStore, DiskFileBlobStore};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -263,6 +264,7 @@ impl ConsensusOrchestrator {
         let blob_store = self.blob_store.clone();
         let eager_import_done_tx = self.eager_import_done_tx.clone();
         let build_complete_tx = self.build_complete_tx.clone();
+        let block_guard = self.eager_import_block_guard.clone();
 
         let handle = tokio::spawn(async move {
             // Allow builder time to pack transactions from the pool.
@@ -296,6 +298,7 @@ impl ConsensusOrchestrator {
                         current_view,
                         blob_store,
                         eager_import_done_tx,
+                        block_guard,
                     )
                     .await;
                 }
@@ -342,6 +345,13 @@ impl ConsensusOrchestrator {
         };
 
         let hash = broadcast.block_hash;
+
+        // Dedup: skip if we already have this block (direct push + GossipSub overlap).
+        if self.pending_block_data.contains_key(&hash) {
+            debug!(target: "n42::cl::exec_bridge", %hash, "duplicate block data, skipping");
+            return;
+        }
+
         self.pending_executions.remove(&hash);
 
         // Pipeline: follower received block data — create timing entry.
@@ -376,34 +386,43 @@ impl ConsensusOrchestrator {
         // likely already in reth (Case A), eliminating the ~200ms background import stall.
         if let Some(ref engine_handle) = self.beacon_engine {
             let eh = engine_handle.clone();
-            let payload_json = broadcast.payload_json;
+            let payload_compressed = broadcast.payload_json;
             let view = broadcast.view;
             let block_ts = broadcast.timestamp;
             let eager_done_tx = self.eager_import_done_tx.clone();
+            let block_guard = self.eager_import_block_guard.clone();
             tokio::spawn(async move {
-                let execution_data = match serde_json::from_slice(&payload_json) {
+                let payload_json = match super::decompress_payload(&payload_compressed) {
+                    Ok(d) => d,
+                    Err(_) => return,
+                };
+                // Deserialize first, then use typed accessor for block number.
+                let execution_data: alloy_rpc_types_engine::ExecutionData = match serde_json::from_slice(&payload_json) {
                     Ok(data) => data,
                     Err(_) => return,
                 };
+                // Guard against duplicate imports for the same block number with different hashes.
+                // Sending new_payload for the same block number but different hash triggers
+                // reth pipeline sync and causes chain stalls.
+                let block_number = execution_data.block_number();
+                let prev = block_guard.fetch_max(block_number, std::sync::atomic::Ordering::SeqCst);
+                if prev >= block_number {
+                    info!(target: "n42::cl::exec_bridge", %hash, view, block_number, prev, "follower eager import: skipping duplicate block number");
+                    return;
+                }
+                // Follower eager import: only run new_payload (no FCU).
+                // new_payload inserts the block into reth's engine tree so that
+                // finalize_committed_block's FCU can accept it instantly (Case A).
+                // We intentionally skip fork_choice_updated here to avoid changing
+                // the canonical chain — speculative blocks may not match what consensus
+                // ultimately commits, and premature FCU causes reorgs that stall the chain.
                 let import_start = std::time::Instant::now();
                 match eh.new_payload(execution_data).await {
                     Ok(status) if matches!(status.status, PayloadStatusEnum::Valid | PayloadStatusEnum::Accepted) => {
                         let np_elapsed = import_start.elapsed().as_millis() as u64;
-                        let fcu = ForkchoiceState {
-                            head_block_hash: hash,
-                            safe_block_hash: hash,
-                            finalized_block_hash: hash,
-                        };
-                        if let Err(e) = eh
-                            .fork_choice_updated(fcu, None, EngineApiMessageVersion::default())
-                            .await
-                        {
-                            info!(target: "n42::cl::exec_bridge", %hash, view, np_elapsed, error = %e, "follower eager import: fcu failed");
-                        } else {
-                            info!(target: "n42::cl::exec_bridge", %hash, view, elapsed_ms = import_start.elapsed().as_millis() as u64, np_elapsed, "follower eager import: block imported");
-                            metrics::counter!("n42_follower_eager_import_hits_total").increment(1);
-                            let _ = eager_done_tx.send((hash, block_ts));
-                        }
+                        info!(target: "n42::cl::exec_bridge", %hash, view, np_elapsed, "follower eager import: new_payload accepted (no FCU)");
+                        metrics::counter!("n42_follower_eager_import_hits_total").increment(1);
+                        let _ = eager_done_tx.send((hash, block_ts));
                     }
                     Ok(status) => {
                         debug!(target: "n42::cl::exec_bridge", %hash, view, status = ?status.status, "follower eager import: not accepted");
@@ -466,7 +485,14 @@ impl ConsensusOrchestrator {
             self.last_committed_timestamp = self.last_committed_timestamp.max(broadcast.timestamp);
         }
 
-        let execution_data = match serde_json::from_slice(&broadcast.payload_json) {
+        let payload_json = match super::decompress_payload(&broadcast.payload_json) {
+            Ok(d) => d,
+            Err(e) => {
+                warn!(target: "n42::cl::exec_bridge", hash = %broadcast.block_hash, "failed to decompress payload: {e}");
+                return;
+            }
+        };
+        let execution_data = match serde_json::from_slice(&payload_json) {
             Ok(data) => data,
             Err(e) => {
                 warn!(target: "n42::cl::exec_bridge", hash = %broadcast.block_hash, "failed to deserialize execution payload: {e}");
@@ -609,7 +635,11 @@ impl ConsensusOrchestrator {
                 Err(_) => continue,
             };
             let retry_hash = retry_broadcast.block_hash;
-            let retry_exec = match serde_json::from_slice(&retry_broadcast.payload_json) {
+            let retry_payload = match super::decompress_payload(&retry_broadcast.payload_json) {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+            let retry_exec = match serde_json::from_slice(&retry_payload) {
                 Ok(d) => d,
                 Err(e) => {
                     warn!(target: "n42::cl::exec_bridge", %retry_hash, error = %e, "failed to deserialize retry payload");
@@ -685,6 +715,7 @@ async fn handle_built_payload(
     current_view: u64,
     blob_store: Option<DiskFileBlobStore>,
     eager_import_done_tx: mpsc::UnboundedSender<(B256, u64)>,
+    block_guard: Arc<std::sync::atomic::AtomicU64>,
 ) {
     let hash = payload.block().hash();
 
@@ -712,25 +743,26 @@ async fn handle_built_payload(
     // 3. Eager import: run new_payload + fcu while consensus votes in parallel.
     //    This is the key pipelining optimization — by the time finalize_committed_block
     //    runs after consensus commit, the block is likely already in reth (Case A).
+    //
+    //    Guard: prevent importing the same block number with different hashes,
+    //    which triggers reth pipeline sync and chain stalls.
+    let block_number = payload.block().header().number;
+    let prev = block_guard.fetch_max(block_number, std::sync::atomic::Ordering::SeqCst);
+    if prev >= block_number {
+        debug!(target: "n42::cl::exec_bridge", %hash, block_number, prev, "leader eager import: skipping duplicate block number");
+        return;
+    }
+    // Leader eager import: only run new_payload (no FCU).
+    // Inserts block into reth's engine tree so finalize_committed_block's FCU
+    // can accept it instantly. We skip FCU to avoid changing canonical chain —
+    // only finalize_committed_block (after consensus commit) should do FCU.
     let import_start = std::time::Instant::now();
     match engine_handle.new_payload(execution_data).await {
         Ok(status) if matches!(status.status, PayloadStatusEnum::Valid | PayloadStatusEnum::Accepted) => {
             let np_elapsed = import_start.elapsed().as_millis() as u64;
-            let fcu = ForkchoiceState {
-                head_block_hash: hash,
-                safe_block_hash: hash,
-                finalized_block_hash: hash,
-            };
-            if let Err(e) = engine_handle
-                .fork_choice_updated(fcu, None, EngineApiMessageVersion::default())
-                .await
-            {
-                info!(target: "n42::cl::exec_bridge", %hash, np_elapsed, error = %e, "eager import: fcu failed");
-            } else {
-                info!(target: "n42::cl::exec_bridge", %hash, elapsed_ms = import_start.elapsed().as_millis() as u64, np_elapsed, "eager import: block imported successfully");
-                metrics::counter!("n42_eager_import_hits_total").increment(1);
-                let _ = eager_import_done_tx.send((hash, block_timestamp));
-            }
+            info!(target: "n42::cl::exec_bridge", %hash, np_elapsed, "eager import: new_payload accepted (no FCU)");
+            metrics::counter!("n42_eager_import_hits_total").increment(1);
+            let _ = eager_import_done_tx.send((hash, block_timestamp));
         }
         Ok(status) => {
             info!(target: "n42::cl::exec_bridge", %hash, status = ?status.status, elapsed_ms = import_start.elapsed().as_millis() as u64, "eager import: new_payload not accepted");
@@ -752,24 +784,64 @@ fn broadcast_block_data(
     if payload_json.is_empty() {
         return;
     }
+    let compressed = super::compress_payload(payload_json);
+    let raw_len = payload_json.len();
+    let compressed_len = compressed.len();
+    debug!(
+        target: "n42::cl::exec_bridge",
+        %hash,
+        raw_len,
+        compressed_len,
+        ratio = format_args!("{:.1}%", compressed_len as f64 / raw_len.max(1) as f64 * 100.0),
+        "payload compressed with zstd"
+    );
     let broadcast = BlockDataBroadcast {
         block_hash: hash,
         view: current_view,
-        payload_json: payload_json.to_vec(),
+        payload_json: compressed,
         timestamp,
     };
-    match bincode::serialize(&broadcast) {
-        Ok(encoded) => {
-            debug!(target: "n42::cl::exec_bridge", %hash, bytes = encoded.len(), "broadcasting block data to followers");
-            if let Err(e) = network.announce_block(encoded.clone()) {
-                warn!(target: "n42::cl::exec_bridge", error = %e, "failed to broadcast block data");
-            }
-            let _ = leader_payload_tx.send((hash, encoded));
-        }
+    let encoded = match bincode::serialize(&broadcast) {
+        Ok(enc) => enc,
         Err(e) => {
             error!(target: "n42::cl::exec_bridge", error = %e, "failed to serialize block data broadcast");
+            return;
         }
+    };
+
+    // Leader direct push: send to all known validator peers via QUIC unicast.
+    // This bypasses GossipSub mesh flooding for large payloads.
+    let validator_peers = network.all_validator_peers();
+    let direct_count = validator_peers.len();
+    for (_idx, peer_id) in &validator_peers {
+        let _ = network.send_block_direct(*peer_id, encoded.clone());
     }
+
+    // GossipSub fallback: only used when direct push hasn't covered all peers
+    // (e.g. during startup, before Identify exchange completes).
+    // When direct push is active, skip GossipSub to avoid redundant large-message
+    // flooding that causes 10-30s propagation delays through the mesh.
+    if direct_count == 0 {
+        if let Err(e) = network.announce_block(encoded.clone()) {
+            warn!(target: "n42::cl::exec_bridge", error = %e, "failed to broadcast block data via gossipsub fallback");
+        }
+        info!(
+            target: "n42::cl::exec_bridge",
+            %hash,
+            bytes = encoded.len(),
+            "block data broadcast: gossipsub only (no validator peers known)"
+        );
+    } else {
+        info!(
+            target: "n42::cl::exec_bridge",
+            %hash,
+            bytes = encoded.len(),
+            direct_peers = direct_count,
+            "block data broadcast: direct push only (skipping gossipsub)"
+        );
+    }
+
+    let _ = leader_payload_tx.send((hash, encoded));
 }
 
 fn broadcast_blob_sidecars(

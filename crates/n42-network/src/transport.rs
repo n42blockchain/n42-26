@@ -5,6 +5,7 @@ use libp2p::swarm::behaviour::toggle::Toggle;
 use libp2p::Swarm;
 use std::time::Duration;
 
+use crate::block_direct::BlockDirectCodec;
 use crate::consensus_direct::ConsensusDirectCodec;
 use crate::gossipsub::message_id_fn;
 use crate::gossipsub::topics::{blob_sidecar_topic, block_announce_topic, consensus_topic, mempool_topic};
@@ -22,6 +23,8 @@ pub struct N42Behaviour {
     pub state_sync: libp2p::request_response::Behaviour<StateSyncCodec>,
     /// Point-to-point consensus messaging (votes, proposals to specific validators).
     pub consensus_direct: libp2p::request_response::Behaviour<ConsensusDirectCodec>,
+    /// Direct block data push from leader to validators (bypasses GossipSub).
+    pub block_direct: libp2p::request_response::Behaviour<BlockDirectCodec>,
     /// Disabled in production; enabled in dev/test via `enable_mdns`.
     pub mdns: Toggle<libp2p::mdns::tokio::Behaviour>,
     /// Disabled in dev/test; enabled in production via `enable_kademlia`.
@@ -166,7 +169,8 @@ pub fn build_swarm_with_validator_index(
             };
             let identify = libp2p::identify::Behaviour::new(
                 libp2p::identify::Config::new("/n42/1.0.0".into(), key.public())
-                    .with_agent_version(agent_version),
+                    .with_agent_version(agent_version)
+                    .with_interval(Duration::from_secs(10)),
             );
 
             let state_sync = libp2p::request_response::Behaviour::new(
@@ -184,6 +188,15 @@ pub fn build_swarm_with_validator_index(
                 )],
                 libp2p::request_response::Config::default()
                     .with_request_timeout(Duration::from_secs(5)),
+            );
+
+            let block_direct = libp2p::request_response::Behaviour::new(
+                [(
+                    libp2p::StreamProtocol::new(crate::block_direct::BLOCK_DIRECT_PROTOCOL),
+                    libp2p::request_response::ProtocolSupport::Full,
+                )],
+                libp2p::request_response::Config::default()
+                    .with_request_timeout(Duration::from_secs(30)),
             );
 
             let mdns = if config.enable_mdns {
@@ -230,6 +243,7 @@ pub fn build_swarm_with_validator_index(
                 identify,
                 state_sync,
                 consensus_direct,
+                block_direct,
                 mdns,
                 kademlia,
                 connection_limits: libp2p::connection_limits::Behaviour::new(limits),

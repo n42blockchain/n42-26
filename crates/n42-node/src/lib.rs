@@ -1,5 +1,6 @@
 mod node;
 mod components;
+pub mod attestation_store;
 pub mod consensus_state;
 pub mod epoch_schedule;
 pub mod mobile_bridge;

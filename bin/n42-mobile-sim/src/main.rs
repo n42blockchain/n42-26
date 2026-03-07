@@ -177,7 +177,7 @@ async fn run_phone(phone_idx: usize, ports: &[u16], duration_secs: u64) -> eyre:
 
                     match result {
                         Ok(vr) => {
-                            if !vr.receipts_root_match {
+                            if vr.computed_receipts_root != receipts_root {
                                 error!(
                                     phone = phone_idx,
                                     block_number,
@@ -197,8 +197,7 @@ async fn run_phone(phone_idx: usize, ports: &[u16], duration_secs: u64) -> eyre:
                             let receipt = sign_receipt(
                                 packet.block_hash,
                                 block_number,
-                                true,
-                                vr.receipts_root_match,
+                                vr.computed_receipts_root,
                                 timestamp_ms,
                                 client.bls_key(),
                             );
@@ -209,12 +208,13 @@ async fn run_phone(phone_idx: usize, ports: &[u16], duration_secs: u64) -> eyre:
                             }
 
                             verified_count += 1;
+                            let receipts_match = vr.computed_receipts_root == receipts_root;
                             info!(
                                 phone = phone_idx,
                                 block_number,
                                 tx_count,
                                 verify_ms,
-                                receipts_match = vr.receipts_root_match,
+                                receipts_match,
                                 verified_count,
                                 "block verified & attested"
                             );

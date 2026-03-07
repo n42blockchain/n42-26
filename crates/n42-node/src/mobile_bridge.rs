@@ -1,12 +1,13 @@
 use alloy_primitives::B256;
 use metrics::{counter, gauge};
-use n42_mobile::{ReceiptAggregator, VerificationReceipt};
+use n42_mobile::{AttestationBuilder, ReceiptAggregator, VerificationReceipt};
 use n42_network::mobile::HubEvent;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, info, warn};
 
+use crate::attestation_store::AttestationStore;
 use crate::consensus_state::{SharedConsensusState, VerificationTask};
 use crate::staking::StakingManager;
 
@@ -49,6 +50,11 @@ pub struct MobileVerificationBridge {
     block_first_receipt_at: HashMap<B256, std::time::Instant>,
     block_first_receipt_order: VecDeque<B256>,
     max_tracked: usize,
+    /// Per-block BLS aggregate signature builders.
+    /// Created when a block is registered with `expected_receipts_root = Some(...)`.
+    attestation_builders: HashMap<B256, AttestationBuilder>,
+    /// Persistent store for completed aggregated attestations and reward tracking.
+    attestation_store: Option<Arc<Mutex<AttestationStore>>>,
 }
 
 impl MobileVerificationBridge {
@@ -78,6 +84,8 @@ impl MobileVerificationBridge {
             block_first_receipt_at: HashMap::new(),
             block_first_receipt_order: VecDeque::new(),
             max_tracked: max_tracked_blocks,
+            attestation_builders: HashMap::new(),
+            attestation_store: None,
         }
     }
 
@@ -103,6 +111,14 @@ impl MobileVerificationBridge {
         self
     }
 
+    /// Attaches an attestation store for BLS aggregate signature persistence.
+    /// When set, completed attestations are persisted to disk and verifier
+    /// reward points are tracked across restarts.
+    pub fn with_attestation_store(mut self, store: Arc<Mutex<AttestationStore>>) -> Self {
+        self.attestation_store = Some(store);
+        self
+    }
+
     /// Attaches shared consensus state so that verifier pubkeys are authorized/
     /// deauthorized in `SharedConsensusState` as phones connect and disconnect.
     pub fn with_consensus_state(mut self, state: Arc<SharedConsensusState>) -> Self {
@@ -115,8 +131,20 @@ impl MobileVerificationBridge {
     ///
     /// Must be called by the node when it sends a verification task to phones.
     /// Receipts for blocks not registered here are silently dropped.
-    pub fn register_dispatched_block(&mut self, block_hash: B256, block_number: u64) {
-        self.receipt_aggregator.register_block(block_hash, block_number);
+    pub fn register_dispatched_block(
+        &mut self,
+        block_hash: B256,
+        block_number: u64,
+        expected_receipts_root: Option<B256>,
+    ) {
+        self.receipt_aggregator.register_block(block_hash, block_number, expected_receipts_root);
+
+        // Create an AttestationBuilder for BLS aggregation when we know the expected root.
+        if let Some(receipts_root) = expected_receipts_root {
+            self.attestation_builders
+                .entry(block_hash)
+                .or_insert_with(|| AttestationBuilder::new(block_hash, block_number, receipts_root));
+        }
     }
 
     /// Evicts the oldest entry from a FIFO-bounded map when at capacity, then inserts the key.
@@ -173,6 +201,12 @@ impl MobileVerificationBridge {
                             self.connected_sessions.insert(session_id, verifier_pubkey);
                             if let Some(ref state) = self.consensus_state {
                                 state.authorize_verifier(verifier_pubkey);
+                            }
+                            // Register verifier in the attestation store's registry
+                            // so it gets a bitfield index for aggregate signatures.
+                            if let Some(ref store) = self.attestation_store {
+                                let mut s = store.lock().unwrap_or_else(|e| e.into_inner());
+                                s.registry_mut().register(verifier_pubkey);
                             }
                             gauge!("n42_mobile_connected_phones").set(self.connected_sessions.len() as f64);
                             self.update_dynamic_threshold();
@@ -239,7 +273,7 @@ impl MobileVerificationBridge {
                 } => {
                     match task {
                         Ok(task) => {
-                            self.register_dispatched_block(task.block_hash, task.view);
+                            self.register_dispatched_block(task.block_hash, task.view, None);
                             debug!(
                                 target: "n42::mobile",
                                 block_hash = %task.block_hash,
@@ -272,6 +306,85 @@ impl MobileVerificationBridge {
         debug!(target: "n42::mobile", connected, threshold, "attestation threshold updated");
     }
 
+    /// Builds a BLS aggregate attestation from collected signatures and persists it.
+    ///
+    /// Called when the attestation threshold is reached. The builder is consumed
+    /// (removed from the map) to produce the final aggregate.
+    fn finalize_attestation(&mut self, block_hash: B256, block_number: u64, valid_count: u32) {
+        let Some(builder) = self.attestation_builders.remove(&block_hash) else {
+            return;
+        };
+
+        let sig_count = builder.count();
+        if sig_count == 0 {
+            return;
+        }
+
+        match builder.build() {
+            Ok(attestation) => {
+                info!(
+                    target: "n42::mobile",
+                    block_number,
+                    %block_hash,
+                    participant_count = attestation.participant_count,
+                    valid_count,
+                    "BLS aggregate attestation built"
+                );
+                counter!("n42_mobile_aggregate_attestations_total").increment(1);
+
+                // Batch-send participant pubkeys for reward tracking.
+                // Only verifiers who contributed to the finalized aggregate
+                // attestation earn reward points for this block.
+                if let Some(ref tx) = self.reward_tx {
+                    if let Some(ref store) = self.attestation_store {
+                        let s = store.lock().unwrap_or_else(|e| e.into_inner());
+                        let mut rewarded = 0u32;
+                        for (byte_idx, &byte) in attestation.participant_bitfield.iter().enumerate() {
+                            for bit in 0..8u32 {
+                                if byte & (1 << bit) != 0 {
+                                    let index = byte_idx as u32 * 8 + bit;
+                                    if let Some(pubkey) = s.registry().pubkey_at(index) {
+                                        let _ = tx.send(*pubkey);
+                                        rewarded += 1;
+                                    }
+                                }
+                            }
+                        }
+                        debug!(
+                            target: "n42::mobile",
+                            block_number,
+                            rewarded,
+                            "reward pubkeys sent for finalized attestation"
+                        );
+                    }
+                }
+
+                if let Some(ref store) = self.attestation_store {
+                    let mut s = store.lock().unwrap_or_else(|e| e.into_inner());
+                    s.record_attestation(&attestation);
+                    if let Err(e) = s.save() {
+                        warn!(
+                            target: "n42::mobile",
+                            block_number,
+                            error = %e,
+                            "failed to persist attestation store"
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(
+                    target: "n42::mobile",
+                    block_number,
+                    %block_hash,
+                    sig_count,
+                    error = %e,
+                    "failed to build BLS aggregate attestation"
+                );
+            }
+        }
+    }
+
     /// Public for testing; production code calls this via the event loop.
     ///
     /// Receipts for blocks not registered via `register_dispatched_block` are
@@ -288,15 +401,25 @@ impl MobileVerificationBridge {
             return;
         }
 
-        if !receipt.is_valid() {
+        // Check validity: compare computed_receipts_root against expected.
+        let is_valid = self
+            .receipt_aggregator
+            .get_status(&receipt.block_hash)
+            .and_then(|s| {
+                s.expected_receipts_root
+                    .as_ref()
+                    .map(|expected| receipt.matches_expected(expected))
+            })
+            .unwrap_or(true); // No expected root or untracked block → defer to aggregator
+
+        if !is_valid {
             counter!("n42_mobile_invalid_receipts_total").increment(1);
             warn!(
                 target: "n42::mobile",
                 block_number = receipt.block_number,
                 %receipt.block_hash,
-                state_root_match = receipt.state_root_match,
-                receipts_root_match = receipt.receipts_root_match,
-                "mobile verifier reported INVALID block execution"
+                computed = %receipt.computed_receipts_root,
+                "mobile verifier reported MISMATCHED receipts root"
             );
 
             Self::fifo_ensure_entry(
@@ -339,15 +462,19 @@ impl MobileVerificationBridge {
             self.block_first_receipt_at.insert(receipt.block_hash, std::time::Instant::now());
         }
 
+        // Feed valid receipts into the BLS attestation builder.
+        if is_valid
+            && let Some(ref store) = self.attestation_store
+        {
+            let store_guard = store.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(builder) = self.attestation_builders.get_mut(&receipt.block_hash) {
+                builder.add_receipt(receipt, store_guard.registry());
+            }
+        }
+
         match self.receipt_aggregator.process_receipt(receipt) {
             Some(true) => {
                 // New unique receipt for a dispatched block; threshold just crossed.
-                if receipt.is_valid()
-                    && let Some(ref tx) = self.reward_tx
-                {
-                    let _ = tx.send(receipt.verifier_pubkey);
-                }
-
                 let valid_count = self
                     .receipt_aggregator
                     .get_status(&receipt.block_hash)
@@ -365,6 +492,9 @@ impl MobileVerificationBridge {
                         "attestation latency: first receipt → threshold"
                     );
                 }
+
+                // Build BLS aggregate signature and persist.
+                self.finalize_attestation(receipt.block_hash, receipt.block_number, valid_count);
 
                 info!(
                     target: "n42::mobile",
@@ -384,11 +514,6 @@ impl MobileVerificationBridge {
             }
             Some(false) => {
                 // New unique receipt for a dispatched block; threshold not yet reached.
-                if receipt.is_valid()
-                    && let Some(ref tx) = self.reward_tx
-                {
-                    let _ = tx.send(receipt.verifier_pubkey);
-                }
                 debug!(
                     target: "n42::mobile",
                     block_number = receipt.block_number,
@@ -415,9 +540,12 @@ mod tests {
     use n42_mobile::receipt::sign_receipt;
     use n42_primitives::BlsSecretKey;
 
+    /// The expected receipts root used in test receipts.
+    const TEST_RR: B256 = B256::new([0xAA; 32]);
+
     fn make_receipt(block_hash: B256, block_number: u64) -> VerificationReceipt {
         let key = BlsSecretKey::random().expect("BLS key gen");
-        sign_receipt(block_hash, block_number, true, true, 1_000_000, &key)
+        sign_receipt(block_hash, block_number, TEST_RR, 1_000_000, &key)
     }
 
     fn make_consensus_state() -> Arc<SharedConsensusState> {
@@ -430,7 +558,7 @@ mod tests {
         let mut bridge = MobileVerificationBridge::new(rx, 2, 100);
 
         let block_hash = B256::with_last_byte(0x01);
-        bridge.register_dispatched_block(block_hash, 1);
+        bridge.register_dispatched_block(block_hash, 1, Some(TEST_RR));
         bridge.process_receipt(&make_receipt(block_hash, 1));
 
         let status = bridge.receipt_aggregator.get_status(&block_hash);
@@ -453,7 +581,7 @@ mod tests {
         let mut bridge = MobileVerificationBridge::new(rx, 1, 100).with_attestation_tx(attest_tx);
 
         let block_hash = B256::with_last_byte(0x03);
-        bridge.register_dispatched_block(block_hash, 10);
+        bridge.register_dispatched_block(block_hash, 10, Some(TEST_RR));
         bridge.process_receipt(&make_receipt(block_hash, 10));
 
         let event = attest_rx.try_recv().expect("attestation event should be sent");
@@ -472,8 +600,8 @@ mod tests {
         let hash_a = B256::with_last_byte(0x0A);
         let hash_b = B256::with_last_byte(0x0B);
 
-        bridge.register_dispatched_block(hash_a, 10);
-        bridge.register_dispatched_block(hash_b, 11);
+        bridge.register_dispatched_block(hash_a, 10, Some(TEST_RR));
+        bridge.register_dispatched_block(hash_b, 11, Some(TEST_RR));
         bridge.process_receipt(&make_receipt(hash_a, 10));
         bridge.process_receipt(&make_receipt(hash_a, 10));
         bridge.process_receipt(&make_receipt(hash_b, 11));
@@ -493,7 +621,7 @@ mod tests {
         let mut bridge = MobileVerificationBridge::new(rx, 2, 100);
 
         let block_hash = B256::with_last_byte(0x0C);
-        bridge.register_dispatched_block(block_hash, 20);
+        bridge.register_dispatched_block(block_hash, 20, Some(TEST_RR));
         let receipt = make_receipt(block_hash, 20);
         bridge.process_receipt(&receipt);
         bridge.process_receipt(&receipt);
@@ -508,7 +636,7 @@ mod tests {
         let mut bridge = MobileVerificationBridge::new(rx, 1, 100);
 
         let block_hash = B256::with_last_byte(0x0D);
-        bridge.register_dispatched_block(block_hash, 30);
+        bridge.register_dispatched_block(block_hash, 30, Some(TEST_RR));
         bridge.process_receipt(&make_receipt(block_hash, 30));
 
         assert!(bridge.receipt_aggregator.get_status(&block_hash).unwrap().is_attested());
@@ -525,7 +653,7 @@ mod tests {
         bridge.update_dynamic_threshold();
 
         let block_hash = B256::with_last_byte(0xF1);
-        bridge.register_dispatched_block(block_hash, 100);
+        bridge.register_dispatched_block(block_hash, 100, Some(TEST_RR));
         bridge.process_receipt(&make_receipt(block_hash, 100));
         assert!(
             !bridge.receipt_aggregator.get_status(&block_hash).unwrap().is_attested(),
@@ -539,10 +667,13 @@ mod tests {
         let max_tracked = 3;
         let mut bridge = MobileVerificationBridge::new(rx, 100, max_tracked);
 
+        let wrong_rr = B256::from([0xFF; 32]); // Mismatched receipts root
         for i in 0..4u8 {
             let block_hash = B256::with_last_byte(i);
+            // Register with expected TEST_RR, but send receipt with wrong computed root.
+            bridge.register_dispatched_block(block_hash, i as u64, Some(TEST_RR));
             let key = BlsSecretKey::random().expect("BLS key gen");
-            let receipt = sign_receipt(block_hash, i as u64, false, true, 1_000_000, &key);
+            let receipt = sign_receipt(block_hash, i as u64, wrong_rr, 1_000_000, &key);
             bridge.process_receipt(&receipt);
         }
 
@@ -580,7 +711,7 @@ mod tests {
         let mut bridge = MobileVerificationBridge::new(rx, 2, 100);
 
         let block_hash = B256::with_last_byte(0xE1);
-        bridge.register_dispatched_block(block_hash, 50);
+        bridge.register_dispatched_block(block_hash, 50, Some(TEST_RR));
         bridge.process_receipt(&make_receipt(block_hash, 50));
         assert!(bridge.block_first_receipt_at.contains_key(&block_hash));
 
@@ -609,68 +740,121 @@ mod tests {
         let mut bridge = MobileVerificationBridge::new(rx, 1, 100);
 
         let block_hash = B256::with_last_byte(0xE2);
-        bridge.register_dispatched_block(block_hash, 60);
+        bridge.register_dispatched_block(block_hash, 60, Some(TEST_RR));
         bridge.process_receipt(&make_receipt(block_hash, 60));
         assert!(bridge.receipt_aggregator.get_status(&block_hash).unwrap().is_attested());
     }
 
     #[test]
-    fn test_reward_tx_sends_pubkey_on_valid_receipt() {
+    fn test_reward_tx_sends_pubkeys_on_finalized_attestation() {
+        use crate::attestation_store::AttestationStore;
+
+        let store_path = std::env::temp_dir().join("n42-test-reward-finalized.json");
+        let _ = std::fs::remove_file(&store_path);
+        let store = Arc::new(Mutex::new(
+            AttestationStore::new(store_path.clone()).unwrap(),
+        ));
+
         let (_hub_tx, hub_rx) = mpsc::unbounded_channel();
         let (reward_tx, mut reward_rx) = mpsc::unbounded_channel();
-        let mut bridge = MobileVerificationBridge::new(hub_rx, 1, 100)
-            .with_reward_tx(reward_tx);
+        // threshold = 2: need 2 receipts to finalize
+        let mut bridge = MobileVerificationBridge::new(hub_rx, 2, 100)
+            .with_reward_tx(reward_tx)
+            .with_attestation_store(store.clone());
 
         let block_hash = B256::with_last_byte(0xA1);
-        let receipt = make_receipt(block_hash, 100);
-        let expected_pubkey = receipt.verifier_pubkey;
 
-        // Block must be registered (dispatched) before receipts are accepted.
-        bridge.register_dispatched_block(block_hash, 100);
-        bridge.process_receipt(&receipt);
+        // Create 2 verifiers with real BLS keys and register them.
+        let keys: Vec<_> = (0..2u64)
+            .map(|i| {
+                let mut seed = [0u8; 32];
+                seed[0..8].copy_from_slice(&i.to_le_bytes());
+                BlsSecretKey::key_gen(&seed).unwrap()
+            })
+            .collect();
+        {
+            let mut s = store.lock().unwrap();
+            for key in &keys {
+                s.registry_mut().register(key.public_key().to_bytes());
+            }
+        }
 
-        let received = reward_rx.try_recv().expect("reward_tx should receive pubkey");
-        assert_eq!(received, expected_pubkey);
+        bridge.register_dispatched_block(block_hash, 100, Some(TEST_RR));
+
+        // First receipt: threshold not reached, no reward yet.
+        let receipt1 = sign_receipt(block_hash, 100, TEST_RR, 1_000_000, &keys[0]);
+        bridge.process_receipt(&receipt1);
+        assert!(reward_rx.try_recv().is_err(), "no reward before finalization");
+
+        // Second receipt: threshold reached → finalize → batch reward.
+        let receipt2 = sign_receipt(block_hash, 100, TEST_RR, 1_000_000, &keys[1]);
+        bridge.process_receipt(&receipt2);
+
+        // Both participants should receive reward pubkeys.
+        let pk1 = reward_rx.try_recv().expect("first participant reward");
+        let pk2 = reward_rx.try_recv().expect("second participant reward");
+        assert_ne!(pk1, pk2, "different participants should have different pubkeys");
+        assert!(reward_rx.try_recv().is_err(), "only 2 participants");
+
+        let _ = std::fs::remove_file(&store_path);
     }
 
     #[test]
     fn test_reward_tx_not_sent_on_invalid_receipt() {
+        use crate::attestation_store::AttestationStore;
+
+        let store_path = std::env::temp_dir().join("n42-test-reward-invalid.json");
+        let _ = std::fs::remove_file(&store_path);
+        let store = Arc::new(Mutex::new(
+            AttestationStore::new(store_path.clone()).unwrap(),
+        ));
+
         let (_hub_tx, hub_rx) = mpsc::unbounded_channel();
         let (reward_tx, mut reward_rx) = mpsc::unbounded_channel();
         let mut bridge = MobileVerificationBridge::new(hub_rx, 1, 100)
-            .with_reward_tx(reward_tx);
+            .with_reward_tx(reward_tx)
+            .with_attestation_store(store);
 
         let block_hash = B256::with_last_byte(0xA2);
         let key = BlsSecretKey::random().expect("BLS key gen");
-        // Create invalid receipt: state_root_match = false
-        let invalid_receipt = sign_receipt(block_hash, 200, false, true, 1_000_000, &key);
+        let wrong_rr = B256::from([0xFF; 32]);
+        let invalid_receipt = sign_receipt(block_hash, 200, wrong_rr, 1_000_000, &key);
 
-        bridge.register_dispatched_block(block_hash, 200);
+        bridge.register_dispatched_block(block_hash, 200, Some(TEST_RR));
         bridge.process_receipt(&invalid_receipt);
 
-        // Invalid receipt should NOT trigger reward
+        // Invalid receipt should NOT trigger reward (attestation won't finalize with valid sigs)
         assert!(reward_rx.try_recv().is_err(), "invalid receipt should not send to reward_tx");
+
+        let _ = std::fs::remove_file(&store_path);
     }
 
     #[test]
-    fn test_reward_tx_multiple_valid_receipts() {
+    fn test_reward_tx_not_sent_before_threshold() {
+        use crate::attestation_store::AttestationStore;
+
+        let store_path = std::env::temp_dir().join("n42-test-reward-below-threshold.json");
+        let _ = std::fs::remove_file(&store_path);
+        let store = Arc::new(Mutex::new(
+            AttestationStore::new(store_path.clone()).unwrap(),
+        ));
+
         let (_hub_tx, hub_rx) = mpsc::unbounded_channel();
         let (reward_tx, mut reward_rx) = mpsc::unbounded_channel();
+        // threshold = 10, we only send 2
         let mut bridge = MobileVerificationBridge::new(hub_rx, 10, 100)
-            .with_reward_tx(reward_tx);
+            .with_reward_tx(reward_tx)
+            .with_attestation_store(store);
 
         let block_hash = B256::with_last_byte(0xA3);
-        let receipt1 = make_receipt(block_hash, 300);
-        let receipt2 = make_receipt(block_hash, 300);
+        bridge.register_dispatched_block(block_hash, 300, Some(TEST_RR));
+        bridge.process_receipt(&make_receipt(block_hash, 300));
+        bridge.process_receipt(&make_receipt(block_hash, 300));
 
-        bridge.register_dispatched_block(block_hash, 300);
-        bridge.process_receipt(&receipt1);
-        bridge.process_receipt(&receipt2);
+        // Below threshold: no finalization, no rewards
+        assert!(reward_rx.try_recv().is_err(), "no reward before threshold reached");
 
-        // Both valid receipts should trigger reward_tx
-        let pk1 = reward_rx.try_recv().expect("first reward");
-        let pk2 = reward_rx.try_recv().expect("second reward");
-        assert_ne!(pk1, pk2, "different BLS keys should produce different pubkeys");
+        let _ = std::fs::remove_file(&store_path);
     }
 
     #[test]
@@ -679,7 +863,7 @@ mod tests {
         let mut bridge = MobileVerificationBridge::new(hub_rx, 1, 100);
         // No reward_tx configured — should not panic
         let block_hash = B256::with_last_byte(0xA4);
-        bridge.register_dispatched_block(block_hash, 400);
+        bridge.register_dispatched_block(block_hash, 400, Some(TEST_RR));
         bridge.process_receipt(&make_receipt(block_hash, 400));
     }
 
@@ -708,6 +892,130 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_bridge_builds_aggregate_attestation() {
+        use crate::attestation_store::AttestationStore;
+        use std::path::PathBuf;
+
+        let store_path = std::env::temp_dir().join("n42-test-bridge-aggregate.json");
+        let _ = std::fs::remove_file(&store_path);
+        let store = Arc::new(Mutex::new(
+            AttestationStore::new(store_path.clone()).unwrap(),
+        ));
+
+        let (_hub_tx, hub_rx) = mpsc::unbounded_channel();
+        let mut bridge = MobileVerificationBridge::new(hub_rx, 2, 100)
+            .with_attestation_store(store.clone());
+
+        let block_hash = B256::with_last_byte(0xD1);
+        let block_number = 42u64;
+
+        // Create 3 verifiers with real BLS keys.
+        let keys: Vec<_> = (0..3u64)
+            .map(|i| {
+                let mut seed = [0u8; 32];
+                seed[0..8].copy_from_slice(&i.to_le_bytes());
+                BlsSecretKey::key_gen(&seed).unwrap()
+            })
+            .collect();
+
+        // Register verifiers in the store's registry (simulating PhoneConnected).
+        {
+            let mut s = store.lock().unwrap();
+            for key in &keys {
+                s.registry_mut().register(key.public_key().to_bytes());
+            }
+        }
+
+        // Register block for tracking.
+        bridge.register_dispatched_block(block_hash, block_number, Some(TEST_RR));
+
+        // Send 2 valid receipts (threshold = 2).
+        for key in &keys[..2] {
+            let receipt = sign_receipt(block_hash, block_number, TEST_RR, 1_000_000, key);
+            bridge.process_receipt(&receipt);
+        }
+
+        // Threshold should have been reached; aggregate should be built and stored.
+        {
+            let s = store.lock().unwrap();
+            assert_eq!(s.total_attestations(), 1, "one aggregate attestation should be stored");
+
+            let att = s.latest_attestation().expect("should have latest attestation");
+            assert_eq!(att.block_hash, block_hash);
+            assert_eq!(att.block_number, block_number);
+            assert_eq!(att.participant_count, 2);
+            assert_eq!(att.receipts_root, TEST_RR);
+
+            // Verify the aggregate signature.
+            att.verify(s.registry())
+                .expect("aggregate signature should verify against registry");
+
+            // Check reward points.
+            let pk0_hex = hex::encode(keys[0].public_key().to_bytes());
+            let pk1_hex = hex::encode(keys[1].public_key().to_bytes());
+            let pk2_hex = hex::encode(keys[2].public_key().to_bytes());
+            assert_eq!(s.get_reward_points(&pk0_hex).unwrap().blocks_attested, 1);
+            assert_eq!(s.get_reward_points(&pk1_hex).unwrap().blocks_attested, 1);
+            assert!(
+                s.get_reward_points(&pk2_hex).is_none(),
+                "verifier 2 did not participate, should have no points"
+            );
+        }
+
+        // The builder should have been consumed (removed from the map).
+        assert!(
+            !bridge.attestation_builders.contains_key(&block_hash),
+            "builder should be removed after finalization"
+        );
+
+        let _ = std::fs::remove_file(&store_path);
+    }
+
+    #[test]
+    fn test_bridge_no_aggregate_without_store() {
+        let (_hub_tx, hub_rx) = mpsc::unbounded_channel();
+        let mut bridge = MobileVerificationBridge::new(hub_rx, 1, 100);
+        // No attestation_store configured.
+
+        let block_hash = B256::with_last_byte(0xD2);
+        bridge.register_dispatched_block(block_hash, 1, Some(TEST_RR));
+
+        // A builder is created even without a store, but no signatures will be
+        // added because the builder.add_receipt needs a registry from the store.
+        let receipt = make_receipt(block_hash, 1);
+        bridge.process_receipt(&receipt);
+
+        // Should still work (threshold reached), just no aggregate stored.
+        assert!(bridge.receipt_aggregator.get_status(&block_hash).unwrap().is_attested());
+    }
+
+    #[test]
+    fn test_bridge_no_aggregate_without_expected_root() {
+        use crate::attestation_store::AttestationStore;
+
+        let store_path = std::env::temp_dir().join("n42-test-bridge-no-root.json");
+        let _ = std::fs::remove_file(&store_path);
+        let store = Arc::new(Mutex::new(
+            AttestationStore::new(store_path.clone()).unwrap(),
+        ));
+
+        let (_hub_tx, hub_rx) = mpsc::unbounded_channel();
+        let mut bridge = MobileVerificationBridge::new(hub_rx, 1, 100)
+            .with_attestation_store(store.clone());
+
+        let block_hash = B256::with_last_byte(0xD3);
+        // Register without expected_receipts_root → no builder should be created.
+        bridge.register_dispatched_block(block_hash, 1, None);
+
+        assert!(
+            !bridge.attestation_builders.contains_key(&block_hash),
+            "no builder should exist when expected_receipts_root is None"
+        );
+
+        let _ = std::fs::remove_file(&store_path);
+    }
+
     #[tokio::test]
     async fn test_bridge_registers_committed_blocks_from_consensus_state() {
         let (_hub_tx, hub_rx) = mpsc::unbounded_channel();
@@ -729,7 +1037,7 @@ mod tests {
         }).await.expect("should receive committed-block notification");
 
         let task = run_once.expect("verification task should be present");
-        bridge.register_dispatched_block(task.block_hash, task.view);
+        bridge.register_dispatched_block(task.block_hash, task.view, None);
 
         let status = bridge.receipt_aggregator.get_status(&task.block_hash);
         assert!(status.is_some(), "committed block should be registered for receipt tracking");

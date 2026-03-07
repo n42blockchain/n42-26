@@ -306,14 +306,14 @@ pub unsafe extern "C" fn n42_verify_and_send(
     let start = Instant::now();
 
     // Decode the packet and run EVM verification.
-    let (block_hash, block_number, expected_receipts_root, tx_count, witness_count, uncached_count, result) =
+    let (block_hash, block_number, tx_count, witness_count, uncached_count, result) =
         if is_v2_wire_format(packet_bytes) {
             let packet = match decode_stream_packet(packet_bytes) {
                 Ok(p) => p,
                 Err(e) => return FfiError::PacketDecode(format!("V2: {e}")).into_code(),
             };
             let block_hash = packet.block_hash;
-            let (block_number, expected_rr) = packet.header_info().unwrap_or((0, B256::ZERO));
+            let (block_number, _header_rr) = packet.header_info().unwrap_or((0, B256::ZERO));
             let tx_count = packet.transactions.len();
             let uncached_count = packet.bytecodes.len();
 
@@ -333,7 +333,7 @@ pub unsafe extern "C" fn n42_verify_and_send(
                 let mut cache = lock_or_recover(&ctx.code_cache);
                 update_cache_after_stream_verify(&packet, &mut cache);
             }
-            (block_hash, block_number, expected_rr, tx_count, 0usize, uncached_count, result)
+            (block_hash, block_number, tx_count, 0usize, uncached_count, result)
         } else {
             let packet = match decode_packet(packet_bytes) {
                 Ok(p) => p,
@@ -341,7 +341,6 @@ pub unsafe extern "C" fn n42_verify_and_send(
             };
             let block_hash = packet.block_hash;
             let block_number = packet.block_number;
-            let expected_rr = packet.receipts_root;
             let tx_count = packet.transactions.len();
             let witness_count = packet.witness_accounts.len();
             let uncached_count = packet.uncached_bytecodes.len();
@@ -362,7 +361,7 @@ pub unsafe extern "C" fn n42_verify_and_send(
                 let mut cache = lock_or_recover(&ctx.code_cache);
                 update_cache_after_verify(&packet, &mut cache);
             }
-            (block_hash, block_number, expected_rr, tx_count, witness_count, uncached_count, result)
+            (block_hash, block_number, tx_count, witness_count, uncached_count, result)
         };
 
     let verify_time_ms = start.elapsed().as_millis() as u64;
@@ -371,13 +370,12 @@ pub unsafe extern "C" fn n42_verify_and_send(
         .unwrap_or_default()
         .as_millis() as u64;
 
-    // Mobile verifiers only verify receipts_root; state_root requires the full trie.
-    let receipt = sign_receipt(block_hash, block_number, true, result.receipts_root_match, timestamp_ms, &ctx.signing_key);
+    let receipt = sign_receipt(block_hash, block_number, result.computed_receipts_root, timestamp_ms, &ctx.signing_key);
 
     {
         let mut stats = lock_or_recover(&ctx.stats);
         stats.blocks_verified += 1;
-        if result.receipts_root_match { stats.success_count += 1; } else { stats.failure_count += 1; }
+        stats.success_count += 1;
         stats.total_verify_time_ms += verify_time_ms;
     }
 
@@ -385,9 +383,7 @@ pub unsafe extern "C" fn n42_verify_and_send(
     *lock_or_recover(&ctx.last_info) = Some(LastVerifyInfo {
         block_number,
         block_hash: format!("{:#x}", block_hash),
-        receipts_root_match: result.receipts_root_match,
         computed_receipts_root: format!("{:#x}", result.computed_receipts_root),
-        expected_receipts_root: format!("{:#x}", expected_receipts_root),
         tx_count,
         witness_accounts: witness_count,
         uncached_bytecodes: uncached_count,
@@ -396,7 +392,7 @@ pub unsafe extern "C" fn n42_verify_and_send(
         signature: hex::encode(sig_bytes),
     });
 
-    info!(block_number, match_ = result.receipts_root_match, verify_time_ms, "block verified");
+    info!(block_number, computed_rr = %result.computed_receipts_root, verify_time_ms, "block verified");
 
     // Send receipt via QUIC.
     let conn_guard = lock_or_recover(&ctx.connection);
@@ -609,9 +605,7 @@ mod tests {
         let info = LastVerifyInfo {
             block_number: 42,
             block_hash: "0x1234".to_string(),
-            receipts_root_match: true,
             computed_receipts_root: "0xaaaa".to_string(),
-            expected_receipts_root: "0xbbbb".to_string(),
             tx_count: 10,
             witness_accounts: 5,
             uncached_bytecodes: 2,
@@ -622,7 +616,7 @@ mod tests {
 
         let json = serde_json::to_string(&info).expect("serialization should succeed");
         assert!(json.contains("\"block_number\":42"));
-        assert!(json.contains("\"receipts_root_match\":true"));
+        assert!(json.contains("\"computed_receipts_root\":\"0xaaaa\""));
         assert!(json.contains("\"tx_count\":10"));
         assert!(json.contains("\"verify_time_ms\":150"));
 
@@ -933,9 +927,7 @@ mod tests {
         *lock_or_recover(&ctx_ref.last_info) = Some(LastVerifyInfo {
             block_number: 1,
             block_hash: "0x00".into(),
-            receipts_root_match: true,
             computed_receipts_root: "0x00".into(),
-            expected_receipts_root: "0x00".into(),
             tx_count: 0,
             witness_accounts: 0,
             uncached_bytecodes: 0,

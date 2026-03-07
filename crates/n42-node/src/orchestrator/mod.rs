@@ -24,12 +24,35 @@ use tokio::time::Instant;
 use metrics::{counter, gauge, histogram};
 use tracing::{debug, error, info, warn};
 
+/// zstd magic bytes: all zstd frames start with 0x28B52FFD.
+const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
+
+/// Compress payload JSON with zstd (level 3 — good speed/ratio tradeoff).
+pub(crate) fn compress_payload(json: &[u8]) -> Vec<u8> {
+    zstd::bulk::compress(json, 3).unwrap_or_else(|e| {
+        tracing::warn!(target: "n42::cl", len = json.len(), error = %e, "zstd compression failed, sending uncompressed");
+        json.to_vec()
+    })
+}
+
+/// Decompress payload if zstd-compressed; pass through raw JSON unchanged.
+/// Backward-compatible: old nodes send uncompressed JSON, new nodes send zstd.
+pub(crate) fn decompress_payload(data: &[u8]) -> std::io::Result<Vec<u8>> {
+    if data.len() >= 4 && data[..4] == ZSTD_MAGIC {
+        zstd::bulk::decompress(data, 64 * 1024 * 1024) // 64 MB max
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    } else {
+        Ok(data.to_vec())
+    }
+}
+
 /// Block data broadcast via /n42/blocks/1 GossipSub topic.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub(crate) struct BlockDataBroadcast {
     pub(crate) block_hash: B256,
     pub(crate) view: u64,
-    /// JSON-serialized execution payload (bincode can't handle reth's `#[serde(untagged)]`).
+    /// Execution payload — zstd-compressed JSON (or raw JSON from older peers).
+    /// Use `decompress_payload()` before `serde_json::from_slice()`.
     pub(crate) payload_json: Vec<u8>,
     /// Block timestamp (seconds since epoch). Stored directly to avoid JSON re-parsing.
     /// Defaults to 0 for backwards compatibility with older serialized broadcasts.
@@ -227,6 +250,10 @@ pub struct ConsensusOrchestrator {
     /// through the orchestrator. Logged and emitted as metrics at commit time.
     /// Bounded to 32 entries; older entries are evicted.
     pipeline_timings: HashMap<B256, PipelineTiming>,
+    /// Guards follower eager import: tracks the last block number sent to reth
+    /// via new_payload. Prevents multiple eager imports for the same block number
+    /// with different hashes, which triggers reth pipeline sync and chain stalls.
+    eager_import_block_guard: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl ConsensusOrchestrator {
@@ -290,6 +317,7 @@ impl ConsensusOrchestrator {
             view_started_at: None,
             epoch_schedule: None,
             pipeline_timings: HashMap::new(),
+            eager_import_block_guard: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -370,6 +398,7 @@ impl ConsensusOrchestrator {
             view_started_at: None,
             epoch_schedule: None,
             pipeline_timings: HashMap::new(),
+            eager_import_block_guard: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 

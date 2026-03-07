@@ -245,8 +245,15 @@ impl ConsensusOrchestrator {
             && let Some(data) = self.committed_blocks.back().map(|b| b.payload.as_slice())
             && !data.is_empty()
         {
-            let mut mgr = staking_mgr.lock().unwrap_or_else(|e| e.into_inner());
-            mgr.scan_committed_block(self.committed_block_count, data);
+            match super::decompress_payload(data) {
+                Ok(decompressed) => {
+                    let mut mgr = staking_mgr.lock().unwrap_or_else(|e| e.into_inner());
+                    mgr.scan_committed_block(self.committed_block_count, &decompressed);
+                }
+                Err(e) => {
+                    warn!(target: "n42::cl::consensus_loop", error = %e, "failed to decompress payload for staking scan");
+                }
+            }
         }
 
         self.finalize_committed_block(view, block_hash, commit_qc).await;
@@ -302,9 +309,53 @@ impl ConsensusOrchestrator {
             }
         };
 
+        // If FCU failed (block not yet in reth engine tree), check if an eager import
+        // (new_payload only, no FCU) completed during the FCU round-trip. If so, retry
+        // FCU — the block should now be in the engine tree and FCU will succeed.
+        let finalized = if !finalized {
+            let mut found_match = false;
+            while let Ok((hash, ts)) = self.eager_import_done_rx.try_recv() {
+                if ts > 0 {
+                    self.last_committed_timestamp = self.last_committed_timestamp.max(ts);
+                }
+                if let Some(timing) = self.pipeline_timings.get_mut(&hash) {
+                    timing.import_complete = Some(Instant::now());
+                }
+                if hash == block_hash {
+                    found_match = true;
+                }
+            }
+            if found_match {
+                info!(target: "n42::cl::consensus_loop", view, %block_hash, "eager import completed during FCU, retrying");
+                counter!("n42_eager_import_rescued_total").increment(1);
+                let retry_fcu = ForkchoiceState {
+                    head_block_hash: block_hash,
+                    safe_block_hash: block_hash,
+                    finalized_block_hash: block_hash,
+                };
+                match engine_handle
+                    .fork_choice_updated(retry_fcu, None, EngineApiMessageVersion::default())
+                    .await
+                {
+                    Ok(result) => matches!(
+                        result.payload_status.status,
+                        PayloadStatusEnum::Valid | PayloadStatusEnum::Accepted
+                    ),
+                    Err(e) => {
+                        warn!(target: "n42::cl::consensus_loop", view, %block_hash, error = %e, "retry fcu failed");
+                        false
+                    }
+                }
+            } else {
+                false
+            }
+        } else {
+            true
+        };
+
         if finalized {
             // Case A: Block already in reth (leader built + new_payload already done,
-            // OR block was previously imported by a follower).
+            // OR block was previously imported by a follower, OR rescued by eager import).
             debug!(target: "n42::cl::consensus_loop", view, %block_hash, "block finalized in reth");
             self.pending_block_data.clear();
             self.pending_executions.clear();
@@ -402,7 +453,14 @@ impl ConsensusOrchestrator {
         // Use the direct timestamp field from the broadcast struct.
         let block_timestamp = broadcast.timestamp;
 
-        let execution_data = match serde_json::from_slice(&broadcast.payload_json) {
+        let payload_json = match super::decompress_payload(&broadcast.payload_json) {
+            Ok(d) => d,
+            Err(e) => {
+                warn!(target: "n42::cl::consensus_loop", %block_hash, error = %e, "bg import: failed to decompress payload");
+                return (false, 0);
+            }
+        };
+        let execution_data = match serde_json::from_slice(&payload_json) {
             Ok(d) => d,
             Err(e) => {
                 warn!(target: "n42::cl::consensus_loop", %block_hash, error = %e, "bg import: failed to parse execution payload");
@@ -549,40 +607,22 @@ impl ConsensusOrchestrator {
     }
 
     /// Called when an eager import task (leader or follower) completes successfully.
-    /// The block is now in reth — if this node is the leader for the NEXT view,
-    /// start building speculatively before consensus commits the current block.
+    /// The block is now in reth's engine tree (via new_payload only, no FCU).
+    /// We record this so finalize_committed_block knows the block is pre-validated
+    /// and its FCU will succeed immediately (Case A).
     pub(super) async fn handle_eager_import_done(&mut self, hash: B256, block_ts: u64) {
-        // Update head and timestamp so finalize_committed_block will see Case A.
-        self.head_block_hash = hash;
+        // Record the pre-imported block hash. When finalize_committed_block runs,
+        // it will find this block already in reth's engine tree, making FCU instant.
+        // We do NOT update head_block_hash here — that should only change via FCU
+        // in finalize_committed_block, to avoid canonical chain reorgs from
+        // speculative blocks that consensus may not ultimately commit.
         if block_ts > 0 {
             self.last_committed_timestamp = self.last_committed_timestamp.max(block_ts);
         }
-
-        let current_view = self.engine.current_view();
-        let next_view = current_view + 1;
-        let is_current = self.engine.is_current_leader();
-        let is_next = self.engine.is_leader_for_view(next_view);
-
-        if (is_current || is_next) && !self.bg_import_in_flight {
-            // Guard: only build ONE speculative block ahead. Without this check,
-            // each speculative build → eager import → triggers another build,
-            // creating a runaway chain of thousands of uncommitted blocks.
-            if self.speculative_build_hash.is_some() {
-                debug!(target: "n42::cl::consensus_loop", %hash, current_view, "speculative build already done, skipping chain extension");
-                return;
-            }
-            info!(
-                target: "n42::cl::consensus_loop",
-                %hash,
-                current_view,
-                is_current,
-                is_next,
-                "speculative build: eager import done, scheduling next build"
-            );
-            counter!("n42_speculative_builds_total").increment(1);
-            self.speculative_build_hash = Some(hash);
-            self.schedule_payload_build().await;
+        if let Some(timing) = self.pipeline_timings.get_mut(&hash) {
+            timing.import_complete = Some(Instant::now());
         }
+        debug!(target: "n42::cl::consensus_loop", %hash, "eager import done: block in engine tree (awaiting consensus commit)");
     }
 
     pub(super) async fn handle_leader_payload_feedback(&mut self, hash: B256, data: Vec<u8>) {

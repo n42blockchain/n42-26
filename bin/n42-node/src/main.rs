@@ -8,6 +8,7 @@ use n42_network::{build_swarm_with_validator_index, ShardedStarHub, ShardedStarH
 use n42_network::NetworkService;
 use n42_node::mobile_bridge::MobileVerificationBridge;
 use n42_node::mobile_packet::mobile_packet_loop;
+use n42_node::attestation_store::AttestationStore;
 use n42_node::mobile_reward::MobileRewardManager;
 use n42_node::epoch_schedule::EpochSchedule;
 use n42_node::persistence;
@@ -534,12 +535,19 @@ fn main() {
                 let (phone_connected_tx, phone_connected_rx) = mpsc::channel(128);
                 let (reward_attest_tx, mut reward_attest_rx) = mpsc::unbounded_channel();
 
+                let attestation_store_path = data_dir.join("attestation_store.json");
+                let attestation_store = Arc::new(Mutex::new(
+                    AttestationStore::new(attestation_store_path)
+                        .expect("failed to initialize attestation store"),
+                ));
+
                 let mobile_bridge = MobileVerificationBridge::new(hub_event_rx, 10, 1000)
                     .with_attestation_tx(attest_tx)
                     .with_phone_connected_tx(phone_connected_tx)
                     .with_consensus_state(consensus_state.clone())
                     .with_reward_tx(reward_attest_tx)
-                    .with_staking_manager(staking_manager.clone());
+                    .with_staking_manager(staking_manager.clone())
+                    .with_attestation_store(attestation_store.clone());
 
                 task_executor.spawn_critical_task("n42-mobile-bridge", Box::pin(mobile_bridge.run()));
 

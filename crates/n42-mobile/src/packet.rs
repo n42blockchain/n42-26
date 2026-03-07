@@ -27,7 +27,6 @@ pub struct VerificationPacket {
     pub parent_hash: B256,
     pub state_root: B256,
     pub transactions_root: B256,
-    pub receipts_root: B256,
     pub timestamp: u64,
     pub gas_limit: u64,
     /// Block coinbase address.
@@ -247,7 +246,6 @@ mod tests {
             parent_hash: B256::from([2u8; 32]),
             state_root: B256::from([3u8; 32]),
             transactions_root: B256::from([4u8; 32]),
-            receipts_root: B256::from([5u8; 32]),
             timestamp: 1_700_000_000,
             gas_limit: 30_000_000,
             beneficiary: Address::from([0xFF; 20]),
@@ -272,7 +270,6 @@ mod tests {
         assert_eq!(decoded.parent_hash, packet.parent_hash);
         assert_eq!(decoded.state_root, packet.state_root);
         assert_eq!(decoded.transactions_root, packet.transactions_root);
-        assert_eq!(decoded.receipts_root, packet.receipts_root);
         assert_eq!(decoded.timestamp, packet.timestamp);
         assert_eq!(decoded.gas_limit, packet.gas_limit);
         assert_eq!(decoded.beneficiary, packet.beneficiary);
@@ -306,7 +303,6 @@ mod tests {
             parent_hash: B256::ZERO,
             state_root: B256::ZERO,
             transactions_root: B256::ZERO,
-            receipts_root: B256::ZERO,
             timestamp: 0,
             gas_limit: 0,
             beneficiary: Address::ZERO,
@@ -460,7 +456,6 @@ mod tests {
             parent_hash: B256::from([2u8; 32]),
             state_root: B256::from([3u8; 32]),
             transactions_root: B256::from([4u8; 32]),
-            receipts_root: B256::from([5u8; 32]),
             timestamp: 1_700_000_000,
             gas_limit: 30_000_000,
             beneficiary: Address::from([0xFF; 20]),

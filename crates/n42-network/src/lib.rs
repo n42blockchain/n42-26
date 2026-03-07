@@ -1,3 +1,4 @@
+pub mod block_direct;
 pub mod codec;
 pub mod consensus_direct;
 pub mod dissemination;

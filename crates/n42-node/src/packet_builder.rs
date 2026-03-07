@@ -100,7 +100,6 @@ pub fn build_verification_packet(
         parent_hash: header.parent_hash(),
         state_root: header.state_root(),
         transactions_root: header.transactions_root(),
-        receipts_root: header.receipts_root(),
         timestamp: header.timestamp(),
         gas_limit: header.gas_limit(),
         beneficiary: header.beneficiary(),
