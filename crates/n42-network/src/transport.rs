@@ -10,6 +10,7 @@ use crate::consensus_direct::ConsensusDirectCodec;
 use crate::gossipsub::message_id_fn;
 use crate::gossipsub::topics::{blob_sidecar_topic, block_announce_topic, consensus_topic, mempool_topic};
 use crate::state_sync::StateSyncCodec;
+use crate::tx_forward::TxForwardCodec;
 
 /// The composite network behaviour for N42 nodes.
 ///
@@ -25,6 +26,8 @@ pub struct N42Behaviour {
     pub consensus_direct: libp2p::request_response::Behaviour<ConsensusDirectCodec>,
     /// Direct block data push from leader to validators (bypasses GossipSub).
     pub block_direct: libp2p::request_response::Behaviour<BlockDirectCodec>,
+    /// Transaction forwarding from non-leader validators to current leader.
+    pub tx_forward: libp2p::request_response::Behaviour<TxForwardCodec>,
     /// Disabled in production; enabled in dev/test via `enable_mdns`.
     pub mdns: Toggle<libp2p::mdns::tokio::Behaviour>,
     /// Disabled in dev/test; enabled in production via `enable_kademlia`.
@@ -199,6 +202,15 @@ pub fn build_swarm_with_validator_index(
                     .with_request_timeout(Duration::from_secs(30)),
             );
 
+            let tx_forward = libp2p::request_response::Behaviour::new(
+                [(
+                    libp2p::StreamProtocol::new(crate::tx_forward::TX_FORWARD_PROTOCOL),
+                    libp2p::request_response::ProtocolSupport::Full,
+                )],
+                libp2p::request_response::Config::default()
+                    .with_request_timeout(Duration::from_secs(5)),
+            );
+
             let mdns = if config.enable_mdns {
                 let mdns_config = libp2p::mdns::Config {
                     ttl: Duration::from_secs(300),
@@ -244,6 +256,7 @@ pub fn build_swarm_with_validator_index(
                 state_sync,
                 consensus_direct,
                 block_direct,
+                tx_forward,
                 mdns,
                 kademlia,
                 connection_limits: libp2p::connection_limits::Behaviour::new(limits),

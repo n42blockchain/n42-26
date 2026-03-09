@@ -108,6 +108,8 @@ impl ConsensusEngine {
 
         tracing::debug!(target: "n42::cl::voting", view, signers = qc.signer_count(), "QC formed, entering pre-commit");
 
+        self.view_timing.prepare_qc_formed = Some(std::time::Instant::now());
+        self.view_timing.prepare_vote_count = collector.vote_count() as u32;
         self.prepare_qc = Some(qc.clone());
         self.round_state.enter_pre_commit();
         self.round_state.update_locked_qc(&qc);
@@ -201,7 +203,12 @@ impl ConsensusEngine {
         let commit_msg = commit_signing_message(view, &block_hash);
         let commit_qc = collector.build_qc_with_message(self.validator_set(), &commit_msg)?;
 
-        tracing::info!(target: "n42::cl::voting", view, %block_hash, "block committed!");
+        self.view_timing.commit_qc_formed = Some(std::time::Instant::now());
+        self.view_timing.commit_vote_count = collector.vote_count() as u32;
+
+        tracing::info!(target: "n42::cl::voting", view, %block_hash,
+            consensus_timing = %self.view_timing.summary(),
+            "block committed!");
 
         self.round_state.commit(commit_qc.clone());
 

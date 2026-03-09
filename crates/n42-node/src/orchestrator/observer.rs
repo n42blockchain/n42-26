@@ -216,6 +216,13 @@ impl ObserverOrchestrator {
             }
         };
 
+        // Compact Block: inject execution output to skip EVM re-execution.
+        if let Some(ref exec_compressed) = broadcast.execution_output
+            && super::execution_bridge::compact_block_enabled()
+        {
+            super::execution_bridge::inject_compact_block(&hash, exec_compressed);
+        }
+
         match self.beacon_engine.new_payload(execution_data).await {
             Ok(status) => {
                 if matches!(status.status, PayloadStatusEnum::Valid | PayloadStatusEnum::Accepted) {
@@ -365,6 +372,7 @@ impl ObserverOrchestrator {
                 view: sync_block.view,
                 payload_json: sync_block.payload,
                 timestamp: 0,
+                execution_output: None,
             };
 
             // Import directly — no serialize/deserialize round-trip
@@ -532,8 +540,10 @@ mod tests {
 
     fn make_test_network() -> (NetworkHandle, mpsc::UnboundedReceiver<NetworkCommand>) {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
-        (NetworkHandle::new(cmd_tx), cmd_rx)
+        let (ptx, _prx) = mpsc::unbounded_channel();
+        (NetworkHandle::new(cmd_tx, ptx), cmd_rx)
     }
+
 
     #[test]
     fn test_observer_construction() {

@@ -62,7 +62,7 @@ parse_args() {
     NO_MONITOR=false
     NO_MOBILE_SIM=false
     DATA_DIR=""
-    BLOCK_INTERVAL_MS=4000
+    BLOCK_INTERVAL_MS=2000
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -181,8 +181,8 @@ compute_timeouts() {
             MAX_BLOCK_WAIT=90
             ;;
         7)
-            BASE_TIMEOUT_MS=20000
-            MAX_TIMEOUT_MS=60000
+            BASE_TIMEOUT_MS=10000
+            MAX_TIMEOUT_MS=30000
             STARTUP_DELAY_MS=3000
             NODE_START_INTERVAL=2
             MAX_BLOCK_WAIT=120
@@ -339,7 +339,7 @@ import json, os
 from eth_account import Account
 from eth_utils import keccak
 
-NUM_ACCOUNTS = 600
+NUM_ACCOUNTS = 5000
 CHAIN_ID = 4242
 INITIAL_BALANCE = "0x4B3B4CA85A86C47A098A224000000"  # 100M N42 per account
 
@@ -364,7 +364,7 @@ genesis = {
         "terminalTotalDifficultyPassed": True,
     },
     "nonce": "0x0", "timestamp": "0x0", "extraData": "0x",
-    "gasLimit": "0x1DCD6500", "difficulty": "0x0",
+    "gasLimit": "0x77359400", "difficulty": "0x0",
     "mixHash": "0x" + "0" * 64,
     "coinbase": "0x0000000000000000000000000000000000000000",
     "alloc": {
@@ -499,6 +499,7 @@ start_validators() {
         N42_REWARD_CURVE_K="4.0" \
         N42_MIN_ATTESTATION_THRESHOLD="1" \
         N42_OPEN_VERIFICATION="1" \
+        N42_MAX_TXS_PER_BLOCK="${N42_MAX_TXS_PER_BLOCK:-40000}" \
         "$BINARY" node \
             --chain "$GENESIS_FILE" \
             --datadir "$datadir" \
@@ -517,13 +518,13 @@ start_validators() {
             --max-outbound-peers "$NUM_VALIDATORS" \
             --max-inbound-peers "$NUM_VALIDATORS" \
             --metrics "127.0.0.1:$metrics_port" \
-            --builder.gaslimit 500000000 \
+            --builder.gaslimit 2000000000 \
             --builder.interval 50ms \
             --txpool.additional-validation-tasks 16 \
-            --disable-tx-gossip \
             --rpc.max-connections 1000 \
             --rpc.max-request-size 50 \
             --rpc.max-response-size 50 \
+            --disable-tx-gossip \
             ${p2p_key_flag} \
             ${TRUSTED_PEERS_FLAG} \
             > "$log_file" 2>&1 &

@@ -10,4 +10,4 @@ mod timeout;
 pub use quorum::{VoteCollector, TimeoutCollector};
 pub use round::{RoundState, Phase};
 pub use pacemaker::Pacemaker;
-pub use state_machine::{ConsensusEngine, ConsensusEvent, EngineOutput};
+pub use state_machine::{ConsensusEngine, ConsensusEvent, EngineOutput, ViewTiming};

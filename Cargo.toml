@@ -45,7 +45,7 @@ reth-ethereum-engine-primitives = { path = "../reth/crates/ethereum/engine-primi
 reth-ethereum-primitives = { path = "../reth/crates/ethereum/primitives" }
 reth-evm = { path = "../reth/crates/evm/evm" }
 reth-evm-ethereum = { path = "../reth/crates/ethereum/evm" }
-reth-execution-types = { path = "../reth/crates/evm/execution-types" }
+reth-execution-types = { path = "../reth/crates/evm/execution-types", features = ["serde"] }
 reth-node-api = { path = "../reth/crates/node/api" }
 reth-node-builder = { path = "../reth/crates/node/builder" }
 reth-node-ethereum = { path = "../reth/crates/ethereum/node" }
@@ -74,8 +74,8 @@ reth-rpc-server-types = { path = "../reth/crates/rpc/rpc-server-types" }
 reth-node-core = { path = "../reth/crates/node/core" }
 
 # Alloy
-alloy-consensus = { version = "1.7.3", default-features = false }
-alloy-eips = { version = "1.7.3", default-features = false }
+alloy-consensus = { version = "1.7.3", default-features = false, features = ["serde"] }
+alloy-eips = { version = "1.7.3", default-features = false, features = ["serde"] }
 alloy-primitives = { version = "1.5.6", default-features = false, features = ["serde"] }
 alloy-rlp = { version = "0.3.13", default-features = false }
 alloy-genesis = { version = "1.7.3", default-features = false }
@@ -90,7 +90,7 @@ alloy-sol-types = { version = "1.5.6", default-features = false }
 
 # EVM
 alloy-evm = { version = "0.28.0", default-features = false }
-revm = { version = "36.0.0", default-features = false, features = ["std"] }
+revm = { version = "36.0.0", default-features = false, features = ["std", "serde"] }
 
 # Testing
 reth-testing-utils = { path = "../reth/testing/testing-utils" }

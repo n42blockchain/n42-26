@@ -217,6 +217,9 @@ impl ConsensusOrchestrator {
             None
         };
 
+        let consensus_timing = self.engine.last_committed_view_timing()
+            .map(|t| t.summary())
+            .unwrap_or_else(|| "-".to_string());
         let epoch = self.engine.epoch_manager().current_epoch();
         let peers = self.connected_peers.len();
         let hash_str = format!("{block_hash}");
@@ -229,6 +232,7 @@ impl ConsensusOrchestrator {
             peers,
             elapsed_ms = elapsed_ms.unwrap_or(0),
             pipeline = pipeline_summary.as_deref().unwrap_or("-"),
+            consensus_timing = %consensus_timing,
             "view committed"
         );
 
@@ -467,6 +471,14 @@ impl ConsensusOrchestrator {
                 return (false, 0);
             }
         };
+
+        // Compact Block: inject execution output into payload cache before new_payload.
+        if let Some(ref exec_compressed) = broadcast.execution_output
+            && super::execution_bridge::compact_block_enabled()
+        {
+            super::execution_bridge::inject_compact_block(&block_hash, exec_compressed);
+        }
+
         match engine_handle.new_payload(execution_data).await {
             Ok(status)
                 if matches!(

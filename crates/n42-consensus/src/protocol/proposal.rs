@@ -60,6 +60,7 @@ impl ConsensusEngine {
             let _ = collector.add_vote(self.my_index, leader_vote_sig);
         }
 
+        self.view_timing.proposal_sent = Some(std::time::Instant::now());
         self.emit(EngineOutput::BroadcastMessage(ConsensusMessage::Proposal(proposal)))?;
 
         // Check if quorum already reached (single-validator scenario).
@@ -135,6 +136,7 @@ impl ConsensusEngine {
         }
 
         self.round_state.enter_voting();
+        self.view_timing.proposal_received = Some(std::time::Instant::now());
         self.emit(EngineOutput::ExecuteBlock(proposal.block_hash))?;
 
         // If the block was already imported (BlockData arrived before Proposal), vote immediately.
@@ -180,6 +182,7 @@ impl ConsensusEngine {
             signature: commit_sig,
         };
 
+        self.view_timing.commit_vote_sent = Some(std::time::Instant::now());
         self.emit(EngineOutput::SendToValidator(
             leader,
             ConsensusMessage::CommitVote(commit_vote),
@@ -199,6 +202,7 @@ impl ConsensusEngine {
             signature: vote_sig,
         };
 
+        self.view_timing.vote_sent = Some(std::time::Instant::now());
         self.emit(EngineOutput::SendToValidator(
             leader,
             ConsensusMessage::Vote(vote),

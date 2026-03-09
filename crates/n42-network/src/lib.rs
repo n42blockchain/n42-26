@@ -9,6 +9,7 @@ pub mod reconnection;
 pub mod service;
 pub mod state_sync;
 pub mod transport;
+pub mod tx_forward;
 
 pub use error::NetworkError;
 pub use mobile::{

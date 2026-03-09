@@ -5574,10 +5574,14 @@ name = "n42-evm-bench"
 version = "0.3.1"
 dependencies = [
  "alloy-primitives",
+ "bincode",
  "hex",
  "n42-parallel-evm",
  "rayon",
  "revm 36.0.0",
+ "serde",
+ "serde_json",
+ "zstd",
 ]
 
 [[package]]
@@ -5743,6 +5747,7 @@ dependencies = [
  "reth-ethereum-primitives",
  "reth-evm",
  "reth-evm-ethereum",
+ "reth-execution-types",
  "reth-network-api",
  "reth-node-api",
  "reth-node-builder",
@@ -8242,6 +8247,7 @@ dependencies = [
  "reth-storage-errors",
  "reth-trie-common",
  "revm 36.0.0",
+ "tracing",
 ]
 
 [[package]]

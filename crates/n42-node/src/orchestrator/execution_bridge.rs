@@ -1,12 +1,13 @@
-use super::{BlobSidecarBroadcast, BlockDataBroadcast, ConsensusOrchestrator};
+use super::{BlobSidecarBroadcast, BlockDataBroadcast, CompactBlockExecution, ConsensusOrchestrator};
 use alloy_consensus::Typed2718;
 use alloy_eips::eip7594::BlobTransactionSidecarVariant;
-use alloy_primitives::B256;
+use alloy_primitives::{Address, B256};
 use alloy_rlp::Encodable;
 use alloy_rpc_types_engine::{ForkchoiceState, PayloadAttributes, PayloadStatusEnum};
 use n42_consensus::ConsensusEvent;
 use n42_network::NetworkHandle;
 use reth_ethereum_engine_primitives::EthEngineTypes;
+use reth_execution_types::{BlockExecutionOutput, BlockExecutionResult};
 use reth_node_builder::ConsensusEngineHandle;
 use reth_payload_builder::{EthBuiltPayload, PayloadBuilderHandle, PayloadId};
 use reth_payload_primitives::{EngineApiMessageVersion, PayloadKind, PayloadTypes};
@@ -15,6 +16,87 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
+
+/// Whether Compact Block (follower EVM skip) is enabled.
+/// Controlled by `N42_COMPACT_BLOCK` env var: "0" to disable, anything else or absent = enabled.
+pub(super) fn compact_block_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("N42_COMPACT_BLOCK").map(|v| v != "0").unwrap_or(true)
+    })
+}
+
+type CachedPayloadData = (BlockExecutionOutput<reth_ethereum_primitives::Receipt>, Vec<Address>);
+
+/// Take execution output from broadcast cache and serialize it for followers.
+fn take_and_serialize_execution_output(hash: &B256) -> Option<Vec<u8>> {
+    let (output, senders) =
+        reth_evm::payload_cache::take_broadcast_execution::<CachedPayloadData>(hash)?;
+
+    let ser_start = std::time::Instant::now();
+    let compact = CompactBlockExecution {
+        bundle_state: output.state,
+        receipts: output.result.receipts,
+        requests: output.result.requests,
+        gas_used: output.result.gas_used,
+        blob_gas_used: output.result.blob_gas_used,
+        senders,
+    };
+    // Use serde_json (not bincode) because Receipt/BundleState serde impls use
+    // custom formats (e.g., alloy_serde::quantity for hex u64) incompatible with bincode.
+    match serde_json::to_vec(&compact) {
+        Ok(serialized) => {
+            let compressed = super::compress_payload(&serialized);
+            let ser_ms = ser_start.elapsed().as_millis() as u64;
+            info!(
+                target: "n42::cl::exec_bridge",
+                %hash,
+                raw_kb = serialized.len() / 1024,
+                compressed_kb = compressed.len() / 1024,
+                ser_ms,
+                "N42_COMPACT_BLOCK: execution output serialized for broadcast"
+            );
+            metrics::counter!("n42_compact_block_serialized").increment(1);
+            metrics::histogram!("n42_compact_block_size_bytes").record(compressed.len() as f64);
+            Some(compressed)
+        }
+        Err(e) => {
+            warn!(target: "n42::cl::exec_bridge", %hash, error = %e, "compact block: failed to serialize execution output");
+            None
+        }
+    }
+}
+
+/// Deserialize compact block execution output and inject into payload cache.
+pub(super) fn inject_compact_block(hash: &B256, compressed: &[u8]) -> bool {
+    let decompressed = match super::decompress_payload(compressed) {
+        Ok(d) => d,
+        Err(e) => {
+            warn!(target: "n42::cl::exec_bridge", %hash, error = %e, "compact block: failed to decompress");
+            return false;
+        }
+    };
+    let compact: CompactBlockExecution = match serde_json::from_slice(&decompressed) {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(target: "n42::cl::exec_bridge", %hash, error = %e, "compact block: failed to deserialize");
+            return false;
+        }
+    };
+    let output = BlockExecutionOutput {
+        state: compact.bundle_state,
+        result: BlockExecutionResult {
+            receipts: compact.receipts,
+            requests: compact.requests,
+            gas_used: compact.gas_used,
+            blob_gas_used: compact.blob_gas_used,
+        },
+    };
+    reth_evm::payload_cache::store_payload_execution(*hash, (output, compact.senders));
+    info!(target: "n42::cl::exec_bridge", %hash, "N42_COMPACT_BLOCK: injected execution output into payload cache");
+    metrics::counter!("n42_compact_block_cache_injected").increment(1);
+    true
+}
 
 /// Delay before resolving the built payload, allowing the builder to pack transactions.
 /// Configurable via `N42_BUILDER_WARMUP_MS` (default: 10).
@@ -387,20 +469,35 @@ impl ConsensusOrchestrator {
         if let Some(ref engine_handle) = self.beacon_engine {
             let eh = engine_handle.clone();
             let payload_compressed = broadcast.payload_json;
+            let execution_output_compressed = broadcast.execution_output;
             let view = broadcast.view;
             let block_ts = broadcast.timestamp;
             let eager_done_tx = self.eager_import_done_tx.clone();
             let block_guard = self.eager_import_block_guard.clone();
             tokio::spawn(async move {
+                let decompress_start = std::time::Instant::now();
                 let payload_json = match super::decompress_payload(&payload_compressed) {
                     Ok(d) => d,
                     Err(_) => return,
                 };
+                let decompress_ms = decompress_start.elapsed().as_millis() as u64;
                 // Deserialize first, then use typed accessor for block number.
+                let deser_start = std::time::Instant::now();
                 let execution_data: alloy_rpc_types_engine::ExecutionData = match serde_json::from_slice(&payload_json) {
                     Ok(data) => data,
                     Err(_) => return,
                 };
+                let deser_ms = deser_start.elapsed().as_millis() as u64;
+                info!(
+                    target: "n42::cl::exec_bridge",
+                    %hash,
+                    compressed_kb = payload_compressed.len() / 1024,
+                    decompressed_kb = payload_json.len() / 1024,
+                    decompress_ms,
+                    deser_ms,
+                    has_compact_block = execution_output_compressed.is_some(),
+                    "N42_DECOMPRESS: follower payload decoded"
+                );
                 // Guard against duplicate imports for the same block number with different hashes.
                 // Sending new_payload for the same block number but different hash triggers
                 // reth pipeline sync and causes chain stalls.
@@ -410,6 +507,13 @@ impl ConsensusOrchestrator {
                     info!(target: "n42::cl::exec_bridge", %hash, view, block_number, prev, "follower eager import: skipping duplicate block number");
                     return;
                 }
+
+                // Compact Block: inject execution output into payload cache before new_payload.
+                // This lets reth skip EVM re-execution (cache hit path), reducing import from
+                // ~209ms to ~22ms. Safety: state root is still verified by reth's new_payload.
+                let compact_injected = execution_output_compressed.as_ref()
+                    .is_some_and(|exec| compact_block_enabled() && inject_compact_block(&hash, exec));
+
                 // Follower eager import: only run new_payload (no FCU).
                 // new_payload inserts the block into reth's engine tree so that
                 // finalize_committed_block's FCU can accept it instantly (Case A).
@@ -420,15 +524,28 @@ impl ConsensusOrchestrator {
                 match eh.new_payload(execution_data).await {
                     Ok(status) if matches!(status.status, PayloadStatusEnum::Valid | PayloadStatusEnum::Accepted) => {
                         let np_elapsed = import_start.elapsed().as_millis() as u64;
-                        info!(target: "n42::cl::exec_bridge", %hash, view, np_elapsed, "follower eager import: new_payload accepted (no FCU)");
+                        info!(
+                            target: "n42::cl::exec_bridge",
+                            %hash, view, np_elapsed, compact_injected,
+                            "follower eager import: new_payload accepted (no FCU)"
+                        );
+                        if compact_injected {
+                            metrics::counter!("n42_compact_block_cache_hits").increment(1);
+                        }
                         metrics::counter!("n42_follower_eager_import_hits_total").increment(1);
                         let _ = eager_done_tx.send((hash, block_ts));
                     }
                     Ok(status) => {
-                        debug!(target: "n42::cl::exec_bridge", %hash, view, status = ?status.status, "follower eager import: not accepted");
+                        debug!(target: "n42::cl::exec_bridge", %hash, view, status = ?status.status, compact_injected, "follower eager import: not accepted");
+                        if compact_injected {
+                            metrics::counter!("n42_compact_block_cache_misses").increment(1);
+                        }
                     }
                     Err(e) => {
-                        debug!(target: "n42::cl::exec_bridge", %hash, view, error = %e, "follower eager import: failed");
+                        debug!(target: "n42::cl::exec_bridge", %hash, view, error = %e, compact_injected, "follower eager import: failed");
+                        if compact_injected {
+                            metrics::counter!("n42_compact_block_cache_misses").increment(1);
+                        }
                     }
                 }
             });
@@ -499,6 +616,13 @@ impl ConsensusOrchestrator {
                 return;
             }
         };
+
+        // Compact Block: inject execution output into payload cache before new_payload.
+        if let Some(ref exec_compressed) = broadcast.execution_output
+            && compact_block_enabled()
+        {
+            inject_compact_block(&broadcast.block_hash, exec_compressed);
+        }
 
         match engine_handle.new_payload(execution_data).await {
             Ok(status) => {
@@ -647,6 +771,13 @@ impl ConsensusOrchestrator {
                 }
             };
 
+            // Compact Block: inject on retry path too.
+            if let Some(ref exec_compressed) = retry_broadcast.execution_output
+                && compact_block_enabled()
+            {
+                inject_compact_block(&retry_hash, exec_compressed);
+            }
+
             match engine_handle.new_payload(retry_exec).await {
                 Ok(rs)
                     if matches!(
@@ -722,6 +853,7 @@ async fn handle_built_payload(
     let execution_data =
         <EthEngineTypes as PayloadTypes>::block_to_payload(payload.block().clone());
 
+    let ser_start = std::time::Instant::now();
     let payload_json = match serde_json::to_vec(&execution_data) {
         Ok(json) => json,
         Err(e) => {
@@ -729,12 +861,29 @@ async fn handle_built_payload(
             return;
         }
     };
+    let ser_ms = ser_start.elapsed().as_millis() as u64;
 
     let block_timestamp = payload.block().header().timestamp;
-    debug!(target: "n42::cl::exec_bridge", %hash, block_timestamp, "leader pipelined import: broadcasting block data");
+    let tx_count = payload.block().body().transactions().count();
+    info!(
+        target: "n42::cl::exec_bridge",
+        %hash,
+        tx_count,
+        payload_kb = payload_json.len() / 1024,
+        ser_ms,
+        block_timestamp,
+        "N42_LEADER_SERIALIZE: payload serialized"
+    );
+
+    // Compact Block: serialize execution output for followers to skip EVM re-execution.
+    let execution_output_bytes = if compact_block_enabled() {
+        take_and_serialize_execution_output(&hash)
+    } else {
+        None
+    };
 
     // 1. Broadcast block data + blob sidecars to followers
-    broadcast_block_data(&network, &leader_payload_tx, hash, current_view, &payload_json, block_timestamp);
+    broadcast_block_data(&network, &leader_payload_tx, hash, current_view, &payload_json, block_timestamp, execution_output_bytes);
     broadcast_blob_sidecars(&network, &payload, hash, current_view, blob_store);
 
     // 2. Trigger consensus voting immediately (non-blocking channel send)
@@ -780,26 +929,33 @@ fn broadcast_block_data(
     current_view: u64,
     payload_json: &[u8],
     timestamp: u64,
+    execution_output: Option<Vec<u8>>,
 ) {
     if payload_json.is_empty() {
         return;
     }
+    let compress_start = std::time::Instant::now();
     let compressed = super::compress_payload(payload_json);
+    let compress_ms = compress_start.elapsed().as_millis() as u64;
     let raw_len = payload_json.len();
     let compressed_len = compressed.len();
-    debug!(
+    let exec_kb = execution_output.as_ref().map_or(0, |v| v.len() / 1024);
+    info!(
         target: "n42::cl::exec_bridge",
         %hash,
-        raw_len,
-        compressed_len,
+        raw_kb = raw_len / 1024,
+        compressed_kb = compressed_len / 1024,
+        exec_kb,
         ratio = format_args!("{:.1}%", compressed_len as f64 / raw_len.max(1) as f64 * 100.0),
-        "payload compressed with zstd"
+        compress_ms,
+        "N42_COMPRESS: payload compressed"
     );
     let broadcast = BlockDataBroadcast {
         block_hash: hash,
         view: current_view,
         payload_json: compressed,
         timestamp,
+        execution_output,
     };
     let encoded = match bincode::serialize(&broadcast) {
         Ok(enc) => enc,
@@ -813,8 +969,20 @@ fn broadcast_block_data(
     // This bypasses GossipSub mesh flooding for large payloads.
     let validator_peers = network.all_validator_peers();
     let direct_count = validator_peers.len();
+    let send_start = std::time::Instant::now();
     for (_idx, peer_id) in &validator_peers {
         let _ = network.send_block_direct(*peer_id, encoded.clone());
+    }
+    let send_ms = send_start.elapsed().as_millis() as u64;
+    if direct_count > 0 {
+        info!(
+            target: "n42::cl::exec_bridge",
+            %hash,
+            encoded_kb = encoded.len() / 1024,
+            direct_count,
+            send_ms,
+            "N42_DIRECT_PUSH: sent to all validator peers"
+        );
     }
 
     // GossipSub fallback: only used when direct push hasn't covered all peers

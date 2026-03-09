@@ -72,13 +72,16 @@ where
 }
 
 /// IDC-optimized pool configuration: higher limits for high-bandwidth, large-memory nodes.
+///
+/// With 2G gas limit and 2s slot, each block can hold ~95k txs.
+/// Pool must buffer several blocks worth of txs during burst injection.
 fn idc_pool_config(base: &PoolConfig) -> PoolConfig {
     PoolConfig {
-        pending_limit: SubPoolLimit { max_txs: 50_000, max_size: 100 * 1024 * 1024 },
-        basefee_limit: SubPoolLimit { max_txs: 25_000, max_size: 50 * 1024 * 1024 },
-        queued_limit: SubPoolLimit { max_txs: 25_000, max_size: 50 * 1024 * 1024 },
+        pending_limit: SubPoolLimit { max_txs: 200_000, max_size: 400 * 1024 * 1024 },
+        basefee_limit: SubPoolLimit { max_txs: 100_000, max_size: 200 * 1024 * 1024 },
+        queued_limit: SubPoolLimit { max_txs: 100_000, max_size: 200 * 1024 * 1024 },
         blob_limit: SubPoolLimit { max_txs: 256, max_size: 50 * 1024 * 1024 },
-        max_account_slots: 4096,
+        max_account_slots: 16_384,
         ..base.clone()
     }
 }

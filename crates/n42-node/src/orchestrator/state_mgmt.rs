@@ -303,6 +303,7 @@ impl ConsensusOrchestrator {
                 view: sync_block.view,
                 payload_json: sync_block.payload.clone(),
                 timestamp: 0,
+                execution_output: None,
             };
 
             self.import_and_notify(broadcast).await;

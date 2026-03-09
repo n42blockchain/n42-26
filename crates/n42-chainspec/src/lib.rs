@@ -1,5 +1,5 @@
 use alloy_genesis::{Genesis, GenesisAccount};
-use alloy_primitives::{address, Address, U256};
+use alloy_primitives::{address, bytes, Address, Bytes, U256};
 use n42_primitives::BlsPublicKey;
 use reth_chainspec::{Chain, ChainSpec, ChainSpecBuilder};
 use serde::{Deserialize, Serialize};
@@ -261,6 +261,17 @@ fn ten_thousand_n() -> U256 {
 /// The mnemonic and private key are stored securely outside the codebase.
 pub const TREASURY_ADDRESS: Address = address!("8e182397c01d36E43c31e81BA52eE6480C80C8C2");
 
+/// Pre-deployed stress-test storage burner contract address.
+/// Used by `n42-stress --erc20-ratio` for mixed tx workloads.
+pub const STRESS_CONTRACT_ADDRESS: Address = address!("000000000000000000000000000000000000C042");
+
+/// Runtime bytecode for the stress-test storage burner contract.
+/// On any call, it does:
+///   1. counters[caller]++ (SLOAD + SSTORE)
+///   2. values[caller] = timestamp (SSTORE)
+/// Gas cost: ~45k (similar to ERC-20 transfer).
+pub static STRESS_CONTRACT_BYTECODE: Bytes = bytes!("33600052600060205260406000208054600101905560016020526040600020429055600160005260206000f3");
+
 /// 3 billion N in wei (3,000,000,000 * 10^18).
 fn three_billion_n() -> U256 {
     U256::from(3_000_000_000u64) * U256::from(10).pow(U256::from(18))
@@ -295,6 +306,16 @@ pub fn n42_dev_chainspec_with_alloc(validators: &[ValidatorInfo]) -> Arc<ChainSp
     // Fund treasury with 3 billion N for staker distribution.
     alloc.insert(TREASURY_ADDRESS, GenesisAccount {
         balance: three_billion_n(),
+        ..Default::default()
+    });
+
+    // Pre-deploy stress-test storage burner contract at a known address.
+    // This contract does 2 SSTOREs per call (counter++ and timestamp write),
+    // consuming ~45k gas — similar to an ERC-20 transfer.
+    // Used by n42-stress --erc20-ratio for mixed tx workloads.
+    alloc.insert(STRESS_CONTRACT_ADDRESS, GenesisAccount {
+        balance: U256::ZERO,
+        code: Some(STRESS_CONTRACT_BYTECODE.clone()),
         ..Default::default()
     });
 

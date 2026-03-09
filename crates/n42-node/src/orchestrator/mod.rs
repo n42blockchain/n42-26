@@ -47,6 +47,10 @@ pub(crate) fn decompress_payload(data: &[u8]) -> std::io::Result<Vec<u8>> {
 }
 
 /// Block data broadcast via /n42/blocks/1 GossipSub topic.
+///
+/// NOTE: Serialized with bincode. Adding new fields requires all nodes to upgrade
+/// simultaneously — bincode does not support missing trailing fields on deserialization.
+/// New→old is fine (bincode ignores trailing bytes), but old→new will fail.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub(crate) struct BlockDataBroadcast {
     pub(crate) block_hash: B256,
@@ -58,6 +62,23 @@ pub(crate) struct BlockDataBroadcast {
     /// Defaults to 0 for backwards compatibility with older serialized broadcasts.
     #[serde(default)]
     pub(crate) timestamp: u64,
+    /// Compact Block: zstd-compressed bincode of `CompactBlockExecution`.
+    /// When present, followers inject this into payload_cache to skip EVM re-execution.
+    /// None for backwards compatibility with older peers.
+    #[serde(default)]
+    pub(crate) execution_output: Option<Vec<u8>>,
+}
+
+/// Serializable proxy for `(BlockExecutionOutput<Receipt>, Vec<Address>)`.
+/// `BlockExecutionResult` from alloy-evm doesn't derive serde, so we flatten it.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct CompactBlockExecution {
+    pub(crate) bundle_state: revm::database::states::BundleState,
+    pub(crate) receipts: Vec<reth_ethereum_primitives::Receipt>,
+    pub(crate) requests: alloy_eips::eip7685::Requests,
+    pub(crate) gas_used: u64,
+    pub(crate) blob_gas_used: u64,
+    pub(crate) senders: Vec<Address>,
 }
 
 /// Blob sidecar broadcast via /n42/blobs/1 GossipSub topic.
@@ -246,6 +267,8 @@ pub struct ConsensusOrchestrator {
     /// Epoch schedule loaded from `epoch_schedule.json`.
     /// Used to pre-stage the next epoch's validator set at each epoch transition.
     epoch_schedule: Option<EpochSchedule>,
+    /// Buffer for batching tx forwards to the current leader.
+    tx_forward_buffer: Vec<Vec<u8>>,
     /// Per-block pipeline timing tracker. Populated incrementally as events flow
     /// through the orchestrator. Logged and emitted as metrics at commit time.
     /// Bounded to 32 entries; older entries are evicted.
@@ -316,6 +339,7 @@ impl ConsensusOrchestrator {
             last_committed_timestamp: 0,
             view_started_at: None,
             epoch_schedule: None,
+            tx_forward_buffer: Vec::new(),
             pipeline_timings: HashMap::new(),
             eager_import_block_guard: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
@@ -397,6 +421,7 @@ impl ConsensusOrchestrator {
             last_committed_timestamp: 0,
             view_started_at: None,
             epoch_schedule: None,
+            tx_forward_buffer: Vec::new(),
             pipeline_timings: HashMap::new(),
             eager_import_block_guard: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
@@ -486,6 +511,17 @@ impl ConsensusOrchestrator {
             };
             tokio::pin!(build_timer);
 
+            // TX forward flush timer: flush partial batches every 50ms.
+            let tx_buf_has_data = !self.tx_forward_buffer.is_empty();
+            let tx_flush_timer = async {
+                if tx_buf_has_data {
+                    tokio::time::sleep(Duration::from_millis(50)).await
+                } else {
+                    std::future::pending::<()>().await
+                }
+            };
+            tokio::pin!(tx_flush_timer);
+
             tokio::select! {
                 _ = &mut timeout => {
                     let view = self.engine.current_view();
@@ -555,10 +591,23 @@ impl ConsensusOrchestrator {
                         None => std::future::pending().await,
                     }
                 } => {
-                    if let Some(data) = tx_data
-                        && let Err(e) = self.network.broadcast_transaction(data)
-                    {
-                        tracing::debug!(target: "n42::cl::orchestrator", error = %e, "failed to broadcast transaction");
+                    // TX Forward to Leader: instead of GossipSub broadcast, buffer txs
+                    // and forward to the current leader in batches.
+                    if let Some(data) = tx_data {
+                        self.tx_forward_buffer.push(data);
+                    }
+                    // Batch-drain up to 63 more from the channel.
+                    if let Some(rx) = self.tx_broadcast_rx.as_mut() {
+                        for _ in 0..63 {
+                            match rx.try_recv() {
+                                Ok(data) => { self.tx_forward_buffer.push(data); }
+                                Err(_) => break,
+                            }
+                        }
+                    }
+                    // Flush if buffer is large enough.
+                    if self.tx_forward_buffer.len() >= 64 {
+                        self.flush_tx_forward_buffer();
                     }
                 }
 
@@ -593,6 +642,10 @@ impl ConsensusOrchestrator {
                         }
                         self.handle_eager_import_done(hash, block_ts).await;
                     }
+                }
+
+                _ = &mut tx_flush_timer => {
+                    self.flush_tx_forward_buffer();
                 }
 
                 _ = &mut build_timer => {
@@ -675,6 +728,54 @@ impl ConsensusOrchestrator {
         self.pipeline_timings.insert(hash, timing);
     }
 
+    /// Flush buffered txs to the current leader via the tx_forward protocol.
+    fn flush_tx_forward_buffer(&mut self) {
+        if self.tx_forward_buffer.is_empty() {
+            return;
+        }
+        let leader_idx = self.engine.current_leader_index();
+        let validator_peers = self.network.all_validator_peers();
+
+        // If we are the leader, feed txs directly into the local pool.
+        if self.engine.is_current_leader() {
+            let txs = std::mem::take(&mut self.tx_forward_buffer);
+            let count = txs.len();
+            if let Some(ref tx_import) = self.tx_import_tx {
+                for data in txs {
+                    let _ = tx_import.try_send(data);
+                }
+            }
+            counter!("n42_tx_forward_local").increment(count as u64);
+            return;
+        }
+
+        // Find the leader's PeerId.
+        let leader_peer = validator_peers.iter().find(|(idx, _)| *idx == leader_idx).map(|(_, pid)| *pid);
+
+        match leader_peer {
+            Some(peer) => {
+                let txs = std::mem::take(&mut self.tx_forward_buffer);
+                let count = txs.len();
+                debug!(target: "n42::cl::orchestrator", count, leader_idx, %peer, "flushing tx forward buffer to leader");
+                let _ = self.network.forward_tx_batch(peer, txs);
+                counter!("n42_tx_forward_batches").increment(1);
+                counter!("n42_tx_forward_txs").increment(count as u64);
+            }
+            None => {
+                // Leader not connected yet — fall back to keeping in buffer.
+                // If buffer grows too large, drop oldest to prevent memory bloat.
+                let buf_len = self.tx_forward_buffer.len();
+                warn!(target: "n42::cl::orchestrator", leader_idx, buf_len, peers = validator_peers.len(), "leader peer not found for tx forward");
+                if buf_len > 4096 {
+                    let excess = buf_len - 2048;
+                    self.tx_forward_buffer.drain(..excess);
+                    counter!("n42_tx_forward_dropped").increment(excess as u64);
+                    warn!(target: "n42::cl::orchestrator", leader_idx, "leader peer not found, dropped oldest txs from forward buffer");
+                }
+            }
+        }
+    }
+
     async fn handle_network_event(&mut self, event: NetworkEvent) {
         match event {
             NetworkEvent::ConsensusMessage { source: _, message } => {
@@ -707,6 +808,16 @@ impl ConsensusOrchestrator {
                 if let Some(ref tx) = self.tx_import_tx {
                     let _ = tx.try_send(data);
                 }
+            }
+            NetworkEvent::TxForwardReceived { source: _, txs } => {
+                // Leader receives forwarded txs from validators — feed into local pool.
+                let count = txs.len();
+                if let Some(ref tx_import) = self.tx_import_tx {
+                    for data in txs {
+                        let _ = tx_import.try_send(data);
+                    }
+                }
+                counter!("n42_tx_forward_imported").increment(count as u64);
             }
             NetworkEvent::SyncRequest { peer, request_id, request } => {
                 self.handle_sync_request(peer, request_id, request);
@@ -755,15 +866,21 @@ mod tests {
         (engine, output_rx)
     }
 
-    fn make_test_network() -> (NetworkHandle, mpsc::UnboundedReceiver<NetworkCommand>) {
+    /// Returns (handle, normal_cmd_rx, priority_cmd_rx).
+    fn make_test_network() -> (
+        NetworkHandle,
+        mpsc::UnboundedReceiver<NetworkCommand>,
+        mpsc::UnboundedReceiver<NetworkCommand>,
+    ) {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
-        (NetworkHandle::new(cmd_tx), cmd_rx)
+        let (ptx, prx) = mpsc::unbounded_channel();
+        (NetworkHandle::new(cmd_tx, ptx), cmd_rx, prx)
     }
 
     #[test]
     fn test_orchestrator_construction() {
         let (engine, output_rx) = make_test_engine();
-        let (network, _cmd_rx) = make_test_network();
+        let (network, _cmd_rx, _prx) = make_test_network();
         let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
         let _ = ConsensusOrchestrator::new(engine, network, net_event_rx, output_rx);
     }
@@ -778,7 +895,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_engine_output_broadcast() {
         let (engine, output_rx) = make_test_engine();
-        let (network, mut cmd_rx) = make_test_network();
+        let (network, _cmd_rx, mut cmd_rx) = make_test_network();
         let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
         let mut orch = ConsensusOrchestrator::new(engine, network, net_event_rx, output_rx);
 
@@ -804,7 +921,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_engine_output_send_to_validator() {
         let (engine, output_rx) = make_test_engine();
-        let (network, mut cmd_rx) = make_test_network();
+        let (network, _cmd_rx, mut cmd_rx) = make_test_network();
         let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
         let mut orch = ConsensusOrchestrator::new(engine, network, net_event_rx, output_rx);
 
@@ -833,7 +950,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_engine_output_execute_block() {
         let (engine, output_rx) = make_test_engine();
-        let (network, _cmd_rx) = make_test_network();
+        let (network, _cmd_rx, _prx) = make_test_network();
         let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
         let mut orch = ConsensusOrchestrator::new(engine, network, net_event_rx, output_rx);
         orch.handle_engine_output(EngineOutput::ExecuteBlock(B256::repeat_byte(0xCC)))
@@ -843,7 +960,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_engine_output_block_committed() {
         let (engine, output_rx) = make_test_engine();
-        let (network, _cmd_rx) = make_test_network();
+        let (network, _cmd_rx, _prx) = make_test_network();
         let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
         let mut orch = ConsensusOrchestrator::new(engine, network, net_event_rx, output_rx);
 
@@ -865,7 +982,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_engine_output_view_changed() {
         let (engine, output_rx) = make_test_engine();
-        let (network, _cmd_rx) = make_test_network();
+        let (network, _cmd_rx, _prx) = make_test_network();
         let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
         let mut orch = ConsensusOrchestrator::new(engine, network, net_event_rx, output_rx);
         orch.handle_engine_output(EngineOutput::ViewChanged { new_view: 5 })
@@ -875,7 +992,7 @@ mod tests {
     #[tokio::test]
     async fn test_orchestrator_exits_on_net_event_channel_close() {
         let (engine, output_rx) = make_test_engine();
-        let (network, _cmd_rx) = make_test_network();
+        let (network, _cmd_rx, _prx) = make_test_network();
         let (net_event_tx, net_event_rx) = mpsc::channel::<NetworkEvent>(8192);
         let orch = ConsensusOrchestrator::new(engine, network, net_event_rx, output_rx);
         drop(net_event_tx);
@@ -890,7 +1007,7 @@ mod tests {
     #[tokio::test]
     async fn test_orchestrator_processes_peer_events() {
         let (engine, output_rx) = make_test_engine();
-        let (network, _cmd_rx) = make_test_network();
+        let (network, _cmd_rx, _prx) = make_test_network();
         let (net_event_tx, net_event_rx) = mpsc::channel::<NetworkEvent>(8192);
         let orch = ConsensusOrchestrator::new(engine, network, net_event_rx, output_rx);
 
@@ -906,7 +1023,7 @@ mod tests {
         state: Option<Arc<SharedConsensusState>>,
     ) -> ConsensusOrchestrator {
         let (engine, output_rx) = make_test_engine();
-        let (network, _cmd_rx) = make_test_network();
+        let (network, _cmd_rx, _prx) = make_test_network();
         let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
         let mut orch = ConsensusOrchestrator::new(engine, network, net_event_rx, output_rx);
         orch.consensus_state = state;
@@ -948,7 +1065,7 @@ mod tests {
     #[test]
     fn test_sync_timeout_resets_in_flight() {
         let (engine, output_rx) = make_test_engine();
-        let (network, _cmd_rx) = make_test_network();
+        let (network, _cmd_rx, _prx) = make_test_network();
         let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
         let mut orch = ConsensusOrchestrator::new(engine, network, net_event_rx, output_rx);
 

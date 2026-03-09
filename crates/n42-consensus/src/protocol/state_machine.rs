@@ -4,6 +4,7 @@ use n42_primitives::{
     consensus::{ConsensusMessage, QuorumCertificate, ViewNumber},
 };
 use std::collections::{HashMap, HashSet};
+use std::time::Instant;
 use tokio::sync::mpsc;
 
 use crate::error::ConsensusResult;
@@ -11,6 +12,89 @@ use crate::validator::{EpochManager, LeaderSelector, ValidatorSet};
 use super::pacemaker::Pacemaker;
 use super::quorum::{TimeoutCollector, VoteCollector};
 use super::round::{Phase, RoundState};
+
+/// Per-view timing tracker for diagnosing consensus commit latency.
+#[derive(Debug, Clone)]
+pub struct ViewTiming {
+    /// When this view started (advance_to_view or engine creation).
+    pub view_start: Instant,
+    /// Leader: when proposal was broadcast.
+    pub proposal_sent: Option<Instant>,
+    /// Follower: when proposal was received.
+    pub proposal_received: Option<Instant>,
+    /// Follower: when vote was sent to leader.
+    pub vote_sent: Option<Instant>,
+    /// Leader: when PrepareQC was formed (Round 1 quorum reached).
+    pub prepare_qc_formed: Option<Instant>,
+    /// Follower: when PrepareQC was received and CommitVote sent.
+    pub commit_vote_sent: Option<Instant>,
+    /// Leader: when CommitQC was formed (Round 2 quorum reached = commit).
+    pub commit_qc_formed: Option<Instant>,
+    /// Number of Round 1 votes collected when PrepareQC formed.
+    pub prepare_vote_count: u32,
+    /// Number of Round 2 votes collected when CommitQC formed.
+    pub commit_vote_count: u32,
+}
+
+impl ViewTiming {
+    fn new() -> Self {
+        Self {
+            view_start: Instant::now(),
+            proposal_sent: None,
+            proposal_received: None,
+            vote_sent: None,
+            prepare_qc_formed: None,
+            commit_vote_sent: None,
+            commit_qc_formed: None,
+            prepare_vote_count: 0,
+            commit_vote_count: 0,
+        }
+    }
+
+    /// Returns a human-readable summary of the timing breakdown.
+    pub fn summary(&self) -> String {
+        let ms = |opt: Option<Instant>| -> String {
+            opt.map(|t| format!("{}ms", t.duration_since(self.view_start).as_millis()))
+                .unwrap_or_else(|| "-".to_string())
+        };
+
+        // Calculate inter-stage deltas
+        let prepare_delta = self.prepare_qc_formed
+            .and_then(|pqc| self.proposal_sent.map(|p| pqc.duration_since(p).as_millis()));
+        let commit_delta = self.commit_qc_formed
+            .and_then(|cqc| self.prepare_qc_formed.map(|pqc| cqc.duration_since(pqc).as_millis()));
+        let vote_delta = self.vote_sent
+            .and_then(|v| self.proposal_received.map(|p| v.duration_since(p).as_millis()));
+        let total = self.commit_qc_formed
+            .map(|t| t.duration_since(self.view_start).as_millis());
+
+        let d = |opt: Option<u128>| -> String {
+            opt.map(|v| format!("{v}ms")).unwrap_or_else(|| "-".to_string())
+        };
+
+        if self.proposal_sent.is_some() {
+            // Leader view
+            format!(
+                "leader proposal=@{} R1_collect={} R2_collect={} total={} votes={}+{}",
+                ms(self.proposal_sent),
+                d(prepare_delta),
+                d(commit_delta),
+                d(total),
+                self.prepare_vote_count,
+                self.commit_vote_count,
+            )
+        } else {
+            // Follower view
+            format!(
+                "follower proposal=@{} vote_delay={} commit_vote=@{} total=@{}",
+                ms(self.proposal_received),
+                d(vote_delta),
+                ms(self.commit_vote_sent),
+                ms(self.commit_qc_formed),
+            )
+        }
+    }
+}
 
 /// Maximum number of views ahead a future message can be to be buffered.
 /// Messages beyond this window trigger a QC-based view jump attempt.
@@ -119,6 +203,10 @@ pub struct ConsensusEngine {
     pub(super) equivocation_tracker: HashMap<u32, B256>,
     /// Buffer for messages arriving for future views (within FUTURE_VIEW_WINDOW).
     pub(super) future_msg_buffer: Vec<(ViewNumber, ConsensusMessage)>,
+    /// Per-view timing for commit latency diagnosis.
+    pub(super) view_timing: ViewTiming,
+    /// Timing from the last committed view (preserved across advance_to_view).
+    last_committed_timing: Option<ViewTiming>,
 }
 
 impl ConsensusEngine {
@@ -166,6 +254,8 @@ impl ConsensusEngine {
             imported_blocks: HashSet::new(),
             equivocation_tracker: HashMap::new(),
             future_msg_buffer: Vec::new(),
+            view_timing: ViewTiming::new(),
+            last_committed_timing: None,
         }
     }
 
@@ -219,6 +309,8 @@ impl ConsensusEngine {
             imported_blocks: HashSet::new(),
             equivocation_tracker: HashMap::new(),
             future_msg_buffer: Vec::new(),
+            view_timing: ViewTiming::new(),
+            last_committed_timing: None,
         }
     }
 
@@ -256,12 +348,22 @@ impl ConsensusEngine {
         &mut self.epoch_manager
     }
 
+    /// Returns the timing from the last committed view.
+    pub fn last_committed_view_timing(&self) -> Option<&ViewTiming> {
+        self.last_committed_timing.as_ref()
+    }
+
     pub fn is_current_leader(&self) -> bool {
         LeaderSelector::is_leader(
             self.my_index,
             self.round_state.current_view(),
             self.validator_set(),
         )
+    }
+
+    /// Returns the validator index of the current leader.
+    pub fn current_leader_index(&self) -> u32 {
+        LeaderSelector::leader_for_view(self.round_state.current_view(), self.validator_set())
     }
 
     /// Checks if this node is the leader for a specific view.
@@ -486,6 +588,11 @@ impl ConsensusEngine {
         self.pending_proposal = None;
         self.imported_blocks.clear();
         self.equivocation_tracker.clear();
+        // Preserve timing from committed view for external reading.
+        if self.view_timing.commit_qc_formed.is_some() {
+            self.last_committed_timing = Some(self.view_timing.clone());
+        }
+        self.view_timing = ViewTiming::new();
 
         // Replay buffered messages for the new view; re-buffer those still in window.
         let drained: Vec<(ViewNumber, ConsensusMessage)> = self.future_msg_buffer.drain(..).collect();
