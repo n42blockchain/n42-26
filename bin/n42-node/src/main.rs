@@ -696,6 +696,16 @@ fn main() {
                     .expect("failed to spawn tx-bridge thread");
                 info!(target: "n42::cli", "TxPoolBridge started on dedicated runtime");
 
+                // Binary TCP injection server for high-speed TX ingestion.
+                // Bypasses JSON-RPC overhead. Enable with N42_INJECT_PORT=19900.
+                if std::env::var("N42_INJECT_PORT").is_ok() {
+                    let inject_pool = full_node.pool.clone();
+                    task_executor.spawn_critical_task(
+                        "n42-inject-server",
+                        Box::pin(n42_node::inject::run_inject_server(inject_pool)),
+                    );
+                }
+
                 // Load epoch schedule from $N42_DATA_DIR/epoch_schedule.json (optional).
                 let epoch_schedule_path = data_dir.join("epoch_schedule.json");
                 let epoch_schedule = match EpochSchedule::load(&epoch_schedule_path) {

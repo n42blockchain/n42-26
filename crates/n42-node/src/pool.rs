@@ -108,7 +108,7 @@ where
 /// Pool must buffer several blocks worth of txs during burst injection.
 fn idc_pool_config(base: &PoolConfig) -> PoolConfig {
     PoolConfig {
-        pending_limit: SubPoolLimit { max_txs: 200_000, max_size: 400 * 1024 * 1024 },
+        pending_limit: SubPoolLimit { max_txs: 100_000, max_size: 200 * 1024 * 1024 },
         basefee_limit: SubPoolLimit { max_txs: 100_000, max_size: 200 * 1024 * 1024 },
         queued_limit: SubPoolLimit { max_txs: 100_000, max_size: 200 * 1024 * 1024 },
         blob_limit: SubPoolLimit { max_txs: 256, max_size: 50 * 1024 * 1024 },

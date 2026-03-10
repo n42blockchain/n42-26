@@ -523,6 +523,7 @@ start_validators() {
         N42_MIN_PROPOSE_DELAY_MS="${N42_MIN_PROPOSE_DELAY_MS:-0}" \
         N42_SKIP_TX_VERIFY="${N42_SKIP_TX_VERIFY:-0}" \
         N42_POOL_VALIDATION_THREADS="${N42_POOL_VALIDATION_THREADS:-2}" \
+        N42_INJECT_PORT="${N42_INJECT_PORT:+$((${N42_INJECT_PORT} + i))}" \
         "$BINARY" node \
             --chain "$GENESIS_FILE" \
             --datadir "$datadir" \

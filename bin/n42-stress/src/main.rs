@@ -21,6 +21,8 @@ use alloy_signer_local::PrivateKeySigner;
 use clap::Parser;
 use eyre::Result;
 use std::io::{BufReader, BufWriter, Read as IoRead, Write as IoWrite};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -98,6 +100,18 @@ struct Cli {
     /// Skips all signing — pure I/O send for maximum injection rate.
     #[arg(long)]
     presign_load: Option<String>,
+
+    /// Wave mode: inject exactly <cap> txs, wait for block, repeat.
+    /// Keeps pool_pending ≈ cap, preventing pool overload.
+    /// Usage: --wave 48000 --presign-load txdata.bin
+    #[arg(long, default_value = "0")]
+    wave: u64,
+
+    /// Binary TCP injection endpoints (comma-separated host:port).
+    /// Bypasses JSON-RPC, sends raw EIP-2718 txs over TCP for maximum injection speed.
+    /// Usage: --inject 127.0.0.1:19900,127.0.0.1:19901,... --presign-load txdata.bin
+    #[arg(long)]
+    inject: Option<String>,
 
     /// RPC endpoints (comma-separated)
     #[arg(long, default_value = "http://127.0.0.1:18545,http://127.0.0.1:18546,http://127.0.0.1:18547,http://127.0.0.1:18548,http://127.0.0.1:18549,http://127.0.0.1:18550,http://127.0.0.1:18551")]
@@ -981,6 +995,240 @@ fn load_presigned(path: &str) -> Result<Vec<Vec<String>>> {
     Ok(grouped)
 }
 
+/// Load pre-signed transactions as raw binary bytes (no hex encoding).
+/// Returns Vec[rpc_idx] = Vec<Vec<u8>> where each inner Vec is an EIP-2718 encoded tx.
+fn load_presigned_binary(path: &str, num_endpoints: usize) -> Result<Vec<Vec<Vec<u8>>>> {
+    let start = Instant::now();
+    let file = std::fs::File::open(path)?;
+    let file_size = file.metadata()?.len();
+    let mut r = BufReader::with_capacity(8 * 1024 * 1024, file);
+
+    // Read header
+    let mut magic = [0u8; 4];
+    r.read_exact(&mut magic)?;
+    if &magic != FILE_MAGIC {
+        eyre::bail!("Invalid file magic");
+    }
+
+    let mut version = [0u8; 1];
+    r.read_exact(&mut version)?;
+    if version[0] != FILE_VERSION {
+        eyre::bail!("Unsupported file version: {}", version[0]);
+    }
+
+    let mut chain_id_buf = [0u8; 8];
+    r.read_exact(&mut chain_id_buf)?;
+    let chain_id = u64::from_le_bytes(chain_id_buf);
+    if chain_id != CHAIN_ID {
+        eyre::bail!("Chain ID mismatch: file={}, expected={}", chain_id, CHAIN_ID);
+    }
+
+    let mut num_rpcs_buf = [0u8; 4];
+    r.read_exact(&mut num_rpcs_buf)?;
+    let file_num_rpcs = u32::from_le_bytes(num_rpcs_buf) as usize;
+
+    let mut total_txs_buf = [0u8; 8];
+    r.read_exact(&mut total_txs_buf)?;
+    let total_txs = u64::from_le_bytes(total_txs_buf);
+
+    tracing::info!(
+        path, file_size_mb = file_size / (1024 * 1024),
+        file_num_rpcs, total_txs, num_endpoints,
+        "Loading pre-signed transactions (binary)..."
+    );
+
+    // Read per-RPC tx data, preserving nonce ordering per account.
+    // Each file RPC group maps to one inject endpoint.
+    let mut file_groups: Vec<Vec<Vec<u8>>> = Vec::with_capacity(file_num_rpcs);
+    let mut tx_buf = vec![0u8; 65536];
+
+    for _ in 0..file_num_rpcs {
+        let mut count_buf = [0u8; 8];
+        r.read_exact(&mut count_buf)?;
+        let tx_count = u64::from_le_bytes(count_buf) as usize;
+
+        let mut txs = Vec::with_capacity(tx_count);
+        for _ in 0..tx_count {
+            let mut len_buf = [0u8; 2];
+            r.read_exact(&mut len_buf)?;
+            let tx_len = u16::from_le_bytes(len_buf) as usize;
+            r.read_exact(&mut tx_buf[..tx_len])?;
+            txs.push(tx_buf[..tx_len].to_vec());
+        }
+        file_groups.push(txs);
+    }
+
+    // Map file RPC groups to inject endpoints.
+    // If same count, 1:1 mapping. Otherwise merge groups into available endpoints.
+    let mut grouped: Vec<Vec<Vec<u8>>> = vec![Vec::new(); num_endpoints];
+    for (i, txs) in file_groups.into_iter().enumerate() {
+        grouped[i % num_endpoints].extend(txs);
+    }
+
+    let elapsed = start.elapsed();
+    let loaded = grouped.iter().map(|g| g.len()).sum::<usize>();
+    tracing::info!(
+        total_loaded = loaded,
+        elapsed_ms = elapsed.as_millis(),
+        per_endpoint = grouped.iter().map(|g| g.len().to_string()).collect::<Vec<_>>().join(","),
+        "Binary load complete"
+    );
+
+    Ok(grouped)
+}
+
+/// Binary TCP injection mode: stream raw txs over TCP to node inject servers.
+async fn run_inject_mode(
+    endpoints: &[String],
+    presigned: Vec<Vec<Vec<u8>>>,
+    batch_size: usize,
+    stats: &Arc<Stats>,
+    rpc_urls: &[String],
+    client: &reqwest::Client,
+    start_block: u64,
+    duration_secs: u64,
+) {
+    let start = Instant::now();
+    let stop = Arc::new(AtomicBool::new(false));
+
+    // Monitor using RPC (injection via TCP, monitoring via JSON-RPC)
+    let monitor_client = client.clone();
+    let monitor_rpc = rpc_urls[0].clone();
+    let monitor_stats = stats.clone();
+    let monitor_stop = stop.clone();
+    let monitor_handle = tokio::spawn(async move {
+        let mut last_block = start_block;
+        let mut last_time = Instant::now();
+        let mut interval = tokio::time::interval(Duration::from_secs(2));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            if monitor_stop.load(Ordering::Relaxed) {
+                break;
+            }
+            let now_block = get_block_number(&monitor_client, &monitor_rpc).await.unwrap_or(last_block);
+            if now_block > last_block {
+                let mut recent_txs = 0u64;
+                let check_from = if now_block > last_block + 5 { now_block - 5 } else { last_block };
+                for b in (check_from + 1)..=now_block {
+                    if let Ok(info) = get_block_info(&monitor_client, &monitor_rpc, b).await {
+                        recent_txs += info.tx_count;
+                    }
+                }
+                let dt = last_time.elapsed().as_secs_f64();
+                let sent = monitor_stats.sent.load(Ordering::Relaxed);
+                let pool = get_txpool_status(&monitor_client, &monitor_rpc).await.unwrap_or((0, 0));
+                tracing::info!(
+                    blocks = now_block - start_block,
+                    recent_block_txs = recent_txs,
+                    block_tps = format!("{:.0}", recent_txs as f64 / dt.max(0.1)),
+                    inject_sent = sent,
+                    inject_err = monitor_stats.rpc_errors.load(Ordering::Relaxed),
+                    pool_pending = pool.0,
+                    "INJECT_MONITOR"
+                );
+                last_block = now_block;
+                last_time = Instant::now();
+            }
+        }
+    });
+
+    // Duration guard
+    let dur_stop = stop.clone();
+    let dur_guard = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(duration_secs)).await;
+        dur_stop.store(true, Ordering::Relaxed);
+        tracing::info!(duration_secs, "Inject duration reached");
+    });
+
+    // Spawn one TCP sender per endpoint
+    let mut handles = Vec::new();
+    for (idx, txs) in presigned.into_iter().enumerate() {
+        if txs.is_empty() {
+            continue;
+        }
+        let endpoint = endpoints[idx % endpoints.len()].clone();
+        let stats = stats.clone();
+        let stop = stop.clone();
+        let bs = batch_size;
+
+        handles.push(tokio::spawn(async move {
+            // Connect to inject server
+            let mut stream = match TcpStream::connect(&endpoint).await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!(endpoint, error = %e, "failed to connect to inject server");
+                    return;
+                }
+            };
+            let _ = stream.set_nodelay(true);
+            tracing::info!(endpoint, txs = txs.len(), batch_size = bs, "TCP inject connected");
+
+            for chunk in txs.chunks(bs) {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+
+                // Build binary batch: [u32 num_txs] [u16 tx_len, tx_bytes] × n
+                let num_txs = chunk.len() as u32;
+                let total_size: usize = 4 + chunk.iter().map(|tx| 2 + tx.len()).sum::<usize>();
+                let mut buf = Vec::with_capacity(total_size);
+                buf.extend_from_slice(&num_txs.to_le_bytes());
+                for tx in chunk {
+                    buf.extend_from_slice(&(tx.len() as u16).to_le_bytes());
+                    buf.extend_from_slice(tx);
+                }
+
+                // Send batch
+                if let Err(e) = stream.write_all(&buf).await {
+                    stats.rpc_errors.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+                    tracing::warn!(endpoint, error = %e, "TCP write failed");
+                    break;
+                }
+
+                // Read ACK: u32 accepted
+                let mut ack = [0u8; 4];
+                match stream.read_exact(&mut ack).await {
+                    Ok(_) => {
+                        let accepted = u32::from_le_bytes(ack) as u64;
+                        stats.sent.fetch_add(accepted, Ordering::Relaxed);
+                        let rejected = chunk.len() as u64 - accepted;
+                        if rejected > 0 {
+                            stats.rpc_errors.fetch_add(rejected, Ordering::Relaxed);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(endpoint, error = %e, "TCP ACK read failed");
+                        break;
+                    }
+                }
+            }
+
+            // Send close signal
+            let _ = stream.write_all(&0u32.to_le_bytes()).await;
+            tracing::info!(endpoint, "TCP inject sender done");
+        }));
+    }
+
+    for h in handles {
+        let _ = h.await;
+    }
+
+    stop.store(true, Ordering::Relaxed);
+    dur_guard.abort();
+    monitor_handle.abort();
+
+    let sent = stats.sent.load(Ordering::Relaxed);
+    let elapsed = start.elapsed().as_secs_f64();
+    tracing::info!(
+        injection_tps = format!("{:.0}", sent as f64 / elapsed.max(1.0)),
+        sent,
+        errors = stats.rpc_errors.load(Ordering::Relaxed),
+        duration = format!("{:.1}s", elapsed),
+        "TCP injection complete"
+    );
+}
+
 /// Send pre-signed transactions with rate limiting.
 #[allow(clippy::too_many_arguments)]
 async fn run_presign_send(
@@ -1084,6 +1332,138 @@ async fn run_presign_send(
 
     // Wait for in-flight requests
     tokio::time::sleep(Duration::from_millis(2000)).await;
+}
+
+/// Wave mode: inject exactly `wave_cap` txs, wait for new block, repeat.
+/// Keeps pool_pending ≈ cap, preventing pool overload and ensuring fast builds.
+async fn run_wave_mode(
+    presigned: Vec<Vec<String>>,
+    rpc_urls: &[String],
+    client: &reqwest::Client,
+    stats: &Arc<Stats>,
+    semaphore: &Arc<Semaphore>,
+    batch_size: usize,
+    wave_cap: usize,
+    duration: Duration,
+) {
+    let num_rpcs = presigned.len();
+    let per_rpc_cap = wave_cap / num_rpcs;
+
+    // Flatten into per-RPC cursors
+    let mut cursors: Vec<usize> = vec![0; num_rpcs];
+    let start = Instant::now();
+    let mut wave_num = 0u64;
+    let mut last_block = get_block_number(client, &rpc_urls[0]).await.unwrap_or(0);
+
+    tracing::info!(
+        wave_cap, per_rpc_cap, num_rpcs, batch_size,
+        "wave mode starting"
+    );
+
+    loop {
+        if start.elapsed() >= duration {
+            break;
+        }
+
+        // Check if we have enough txs left
+        let mut have_txs = false;
+        for (rpc_idx, cursor) in cursors.iter().enumerate() {
+            if *cursor < presigned[rpc_idx].len() {
+                have_txs = true;
+                break;
+            }
+        }
+        if !have_txs {
+            tracing::info!("all presigned txs exhausted");
+            break;
+        }
+
+        let wave_start = Instant::now();
+
+        // Send one wave: per_rpc_cap txs to each RPC, in parallel
+        let mut inject_handles = Vec::new();
+        let mut wave_total = 0usize;
+
+        for rpc_idx in 0..num_rpcs {
+            let cursor = cursors[rpc_idx];
+            let remaining = presigned[rpc_idx].len() - cursor;
+            let take = remaining.min(per_rpc_cap);
+            if take == 0 {
+                continue;
+            }
+            wave_total += take;
+            let end = cursor + take;
+            cursors[rpc_idx] = end;
+
+            // Fire ALL batches in parallel (not sequential) for max injection speed
+            for chunk in presigned[rpc_idx][cursor..end].chunks(batch_size) {
+                let rpc_url = rpc_urls[rpc_idx].clone();
+                let client = client.clone();
+                let stats = stats.clone();
+                let sem = semaphore.clone();
+                let batch: Vec<String> = chunk.to_vec();
+
+                inject_handles.push(tokio::spawn(async move {
+                    let permit = sem.acquire_owned().await.unwrap();
+                    let result = send_batch(&client, &rpc_url, &batch).await;
+                    drop(permit);
+                    (result.ok as u64, result.rpc_error as u64)
+                }));
+            }
+        }
+
+        // Wait for all injection to complete
+        let mut wave_ok = 0u64;
+        let mut wave_err = 0u64;
+        for h in inject_handles {
+            if let Ok((ok, err)) = h.await {
+                wave_ok += ok;
+                wave_err += err;
+            }
+        }
+        stats.sent.fetch_add(wave_ok, Ordering::Relaxed);
+        stats.rpc_errors.fetch_add(wave_err, Ordering::Relaxed);
+
+        let inject_ms = wave_start.elapsed().as_millis() as u64;
+
+        // Wait for new block
+        let wait_start = Instant::now();
+        loop {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            if let Ok(bn) = get_block_number(client, &rpc_urls[0]).await {
+                if bn > last_block {
+                    last_block = bn;
+                    break;
+                }
+            }
+            if wait_start.elapsed() > Duration::from_secs(30) {
+                tracing::warn!("wave timeout waiting for new block");
+                break;
+            }
+        }
+
+        let wait_ms = wait_start.elapsed().as_millis() as u64;
+        let total_ms = wave_start.elapsed().as_millis() as u64;
+        wave_num += 1;
+
+        // Get pool status
+        let (pending, queued) = get_txpool_status(client, &rpc_urls[0]).await.unwrap_or((0, 0));
+
+        tracing::info!(
+            wave = wave_num,
+            txs = wave_total,
+            ok = wave_ok,
+            err = wave_err,
+            inject_ms,
+            wait_ms,
+            total_ms,
+            block = last_block,
+            pool_pending = pending,
+            pool_queued = queued,
+            tps = format!("{:.0}", wave_total as f64 / (total_ms as f64 / 1000.0).max(0.001)),
+            "WAVE"
+        );
+    }
 }
 
 /// Run test with parallel senders (one per RPC endpoint).
@@ -1403,6 +1783,59 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    // === Binary TCP inject mode ===
+    if let Some(ref inject_endpoints) = cli.inject {
+        let load_path = cli.presign_load.as_ref()
+            .ok_or_else(|| eyre::eyre!("--inject requires --presign-load"))?;
+        let endpoints: Vec<String> = inject_endpoints.split(',').map(|s| s.trim().to_string()).collect();
+
+        tracing::info!("=== N42 BINARY TCP INJECT MODE ===");
+        tracing::info!(endpoints = endpoints.len(), "TCP inject endpoints");
+
+        let presigned = load_presigned_binary(load_path, endpoints.len())?;
+
+        let start_block = get_block_number(&client, &rpc_urls[0]).await?;
+        if let Ok(info) = get_block_info(&client, &rpc_urls[0], start_block).await {
+            tracing::info!(
+                block = start_block,
+                gas_limit = info.gas_limit,
+                gas_limit_M = info.gas_limit / 1_000_000,
+                "Chain active"
+            );
+        }
+
+        let stats = Arc::new(Stats::new());
+        stats.start_block.store(start_block, Ordering::Relaxed);
+
+        run_inject_mode(
+            &endpoints, presigned, cli.batch_size, &stats,
+            &rpc_urls, &client, start_block, cli.duration,
+        ).await;
+
+        // Wait for pool drain
+        tracing::info!("Waiting for pending pool to drain...");
+        let drain_start = Instant::now();
+        loop {
+            if drain_start.elapsed() > Duration::from_secs(120) {
+                tracing::warn!("Pool drain timeout (120s)");
+                break;
+            }
+            if let Ok((pending, queued)) = get_txpool_status(&client, &rpc_urls[0]).await {
+                if pending < 500 {
+                    tracing::info!(pending, queued, drain_ms = drain_start.elapsed().as_millis(), "Pool drained");
+                    break;
+                }
+                tracing::info!(pending, queued, "Draining...");
+            }
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        }
+
+        let final_block = get_block_number(&client, &rpc_urls[0]).await?;
+        analyze_blocks(&client, &rpc_urls[0], start_block, final_block).await;
+
+        return Ok(());
+    }
+
     // === Blast mode: pre-sign N txs, then blast at max speed ===
     if cli.blast > 0 {
         tracing::info!("=== N42 BLAST MODE v10 ===");
@@ -1557,6 +1990,79 @@ async fn main() -> Result<()> {
             "Summary"
         );
 
+        analyze_blocks(&client, &rpc_urls[0], start_block, final_block).await;
+
+        return Ok(());
+    }
+
+    // === Wave mode: synchronized injection, one wave per block ===
+    if cli.wave > 0 {
+        let load_path = cli.presign_load.as_ref()
+            .ok_or_else(|| eyre::eyre!("--wave requires --presign-load"))?;
+        tracing::info!("=== N42 Wave Mode: cap={} ===", cli.wave);
+        let presigned = load_presigned(load_path)?;
+
+        let start_block = get_block_number(&client, &rpc_urls[0]).await?;
+        if let Ok(info) = get_block_info(&client, &rpc_urls[0], start_block).await {
+            tracing::info!(
+                block = start_block,
+                gas_limit = info.gas_limit,
+                gas_limit_M = info.gas_limit / 1_000_000,
+                "Chain active"
+            );
+        }
+
+        let stats = Arc::new(Stats::new());
+        stats.start_block.store(start_block, Ordering::Relaxed);
+        let start = Instant::now();
+
+        let reporter = spawn_reporter(
+            stats.clone(), client.clone(), rpc_urls[0].clone(), start, start_block,
+        );
+
+        run_wave_mode(
+            presigned, &rpc_urls, &client, &stats, &semaphore,
+            cli.batch_size, cli.wave as usize,
+            Duration::from_secs(cli.duration),
+        ).await;
+
+        reporter.abort();
+
+        let sent = stats.sent.load(Ordering::Relaxed);
+        let rpc_err = stats.rpc_errors.load(Ordering::Relaxed);
+        let elapsed = start.elapsed().as_secs_f64();
+        let end_block = get_block_number(&client, &rpc_urls[0]).await?;
+        let blocks = end_block - start_block;
+
+        tracing::info!("=== WAVE RESULT ===");
+        tracing::info!(
+            total_txs = sent,
+            total_blocks = blocks,
+            total_time = format!("{:.1}s", elapsed),
+            overall_tps = format!("{:.0}", sent as f64 / elapsed.max(1.0)),
+            avg_tx_per_block = sent / blocks.max(1),
+            rpc_err,
+            "Complete"
+        );
+
+        // Wait for pool drain
+        tracing::info!("Waiting for pending pool to drain...");
+        let drain_start = Instant::now();
+        loop {
+            if drain_start.elapsed() > Duration::from_secs(120) {
+                tracing::warn!("Pool drain timeout (120s)");
+                break;
+            }
+            if let Ok((pending, _)) = get_txpool_status(&client, &rpc_urls[0]).await {
+                if pending < 500 {
+                    tracing::info!(pending, drain_ms = drain_start.elapsed().as_millis(), "Pool drained");
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+
+        let final_block = get_block_number(&client, &rpc_urls[0]).await?;
         analyze_blocks(&client, &rpc_urls[0], start_block, final_block).await;
 
         return Ok(());
