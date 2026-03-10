@@ -45,16 +45,43 @@ impl ConsensusOrchestrator {
                 "skipping empty block proposal (low activity)"
             );
             if !self.slot_time.is_zero() {
-                let (slot_ts, delay) = self.next_slot_boundary();
-                self.next_build_at = Some(Instant::now() + delay);
-                self.next_slot_timestamp = Some(slot_ts);
+                if self.fast_propose {
+                    // In fast propose mode, retry empty checks after slot_time delay
+                    // without grid alignment.
+                    self.next_build_at = Some(Instant::now() + self.slot_time);
+                    self.next_slot_timestamp = None;
+                } else {
+                    let (slot_ts, delay) = self.next_slot_boundary();
+                    self.next_build_at = Some(Instant::now() + delay);
+                    self.next_slot_timestamp = Some(slot_ts);
+                }
             }
             return;
         }
         self.consecutive_empty_skips = 0;
 
-        if self.slot_time.is_zero() {
-            self.do_trigger_payload_build(None).await;
+        if self.slot_time.is_zero() || self.fast_propose {
+            // Fast propose: skip slot boundary alignment. Use a small configurable
+            // delay to let transactions accumulate in the pool.
+            let min_delay_ms: u64 = std::env::var("N42_MIN_PROPOSE_DELAY_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            if min_delay_ms > 0 {
+                let delay = Duration::from_millis(min_delay_ms);
+                self.next_build_at = Some(Instant::now() + delay);
+                self.next_slot_timestamp = None;
+                info!(
+                    target: "n42::cl::consensus_loop",
+                    min_delay_ms,
+                    "fast propose: scheduled build after minimum delay"
+                );
+            } else {
+                if self.fast_propose {
+                    info!(target: "n42::cl::consensus_loop", "fast propose: triggering immediate payload build");
+                }
+                self.do_trigger_payload_build(None).await;
+            }
         } else {
             let (slot_ts, delay) = self.next_slot_boundary();
             let deadline = Instant::now() + delay;
@@ -98,20 +125,14 @@ impl ConsensusOrchestrator {
                 }
             }
             EngineOutput::SendToValidator(target, msg) => {
+                // Direct send + broadcast for reliability. Direct send via request-response
+                // can silently fail (QUIC transport issues), so always broadcast as backup.
+                // The consensus engine deduplicates votes by (view, voter).
                 if let Some(peer_id) = self.network.validator_peer(target) {
-                    if let Err(e) = self.network.send_direct(peer_id, msg.clone()) {
-                        warn!(target: "n42::cl::consensus_loop", target_validator = target, error = %e, "direct send failed, falling back to broadcast");
-                        if let Err(e2) = self.network.broadcast_consensus(msg) {
-                            error!(target: "n42::cl::consensus_loop", target_validator = target, error = %e2, "broadcast fallback also failed");
-                        }
-                    }
-                } else {
-                    // Peer not yet identified — broadcast as fallback; this is normal
-                    // during startup or when the Identify exchange hasn't completed.
-                    debug!(target: "n42::cl::consensus_loop", target_validator = target, "validator peer unknown, broadcasting");
-                    if let Err(e) = self.network.broadcast_consensus(msg) {
-                        error!(target: "n42::cl::consensus_loop", error = %e, "failed to send message to validator (broadcast fallback)");
-                    }
+                    let _ = self.network.send_direct(peer_id, msg.clone());
+                }
+                if let Err(e) = self.network.broadcast_consensus(msg) {
+                    error!(target: "n42::cl::consensus_loop", target_validator = target, error = %e, "broadcast failed");
                 }
             }
             EngineOutput::ExecuteBlock(block_hash) => {
@@ -167,17 +188,18 @@ impl ConsensusOrchestrator {
     }
 
     async fn handle_execute_block(&mut self, block_hash: B256) {
-        debug!(
+        let has_data = self.pending_block_data.contains_key(&block_hash);
+        info!(
             target: "n42::cl::consensus_loop",
             %block_hash,
-            pending_data = self.pending_block_data.contains_key(&block_hash),
+            pending_data = has_data,
             "ExecuteBlock requested"
         );
 
-        if self.pending_block_data.contains_key(&block_hash) {
+        if has_data {
             // Block data already cached — notify consensus immediately for fast voting.
             // Actual EVM execution deferred to finalize_committed_block() (Case B).
-            debug!(target: "n42::cl::consensus_loop", %block_hash, "block data available, notifying consensus (deferred execution)");
+            info!(target: "n42::cl::consensus_loop", %block_hash, "block data available, sending BlockImported to consensus");
             if let Err(e) = self
                 .engine
                 .process_event(n42_consensus::ConsensusEvent::BlockImported(block_hash))
@@ -297,11 +319,7 @@ impl ConsensusOrchestrator {
         {
             Ok(result) => {
                 let elapsed_ms = fcu_start.elapsed().as_millis() as u64;
-                if elapsed_ms > 5 {
-                    info!(target: "n42::cl::consensus_loop", view, %block_hash, status = ?result.payload_status.status, elapsed_ms, "finalize fcu (waited for engine)");
-                } else {
-                    debug!(target: "n42::cl::consensus_loop", view, %block_hash, status = ?result.payload_status.status, elapsed_ms, "finalize fcu result");
-                }
+                info!(target: "n42::cl::consensus_loop", view, %block_hash, status = ?result.payload_status.status, elapsed_ms, "N42_FCU: finalize fcu");
                 matches!(
                     result.payload_status.status,
                     PayloadStatusEnum::Valid | PayloadStatusEnum::Accepted
@@ -337,14 +355,19 @@ impl ConsensusOrchestrator {
                     safe_block_hash: block_hash,
                     finalized_block_hash: block_hash,
                 };
+                let retry_start = std::time::Instant::now();
                 match engine_handle
                     .fork_choice_updated(retry_fcu, None, EngineApiMessageVersion::default())
                     .await
                 {
-                    Ok(result) => matches!(
-                        result.payload_status.status,
-                        PayloadStatusEnum::Valid | PayloadStatusEnum::Accepted
-                    ),
+                    Ok(result) => {
+                        let retry_ms = retry_start.elapsed().as_millis() as u64;
+                        info!(target: "n42::cl::consensus_loop", view, %block_hash, status = ?result.payload_status.status, retry_ms, "N42_FCU_RETRY: retry fcu after eager import");
+                        matches!(
+                            result.payload_status.status,
+                            PayloadStatusEnum::Valid | PayloadStatusEnum::Accepted
+                        )
+                    }
                     Err(e) => {
                         warn!(target: "n42::cl::consensus_loop", view, %block_hash, error = %e, "retry fcu failed");
                         false
@@ -528,6 +551,15 @@ impl ConsensusOrchestrator {
         // not view number. If a build is in-flight for the current parent, it should
         // still be guarded even after a view change. The guard naturally expires when
         // head_block_hash changes (a new block is imported/committed).
+
+        // Reset eager import block guard on view change: the previous view's proposal
+        // was not committed, so the new leader may propose a different block at the
+        // same height. The guard must allow reimporting the same block number.
+        self.eager_import_block_guard.store(
+            self.committed_block_count,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+
         info!(target: "n42::cl::consensus_loop", new_view, "view changed");
 
         // ViewChanged fires immediately after BlockCommitted in f=0 configs;

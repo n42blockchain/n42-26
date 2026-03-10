@@ -5,10 +5,12 @@ use reth_node_builder::{
     node::{FullNodeTypes, NodeTypes},
     BuilderContext, PrimitivesTy,
 };
+use reth_tasks::{RuntimeBuilder, RuntimeConfig, TokioConfig};
 use reth_transaction_pool::{
     blobstore::DiskFileBlobStore, CoinbaseTipOrdering, EthPooledTransaction,
     EthTransactionValidator, PoolConfig, SubPoolLimit, TransactionValidationTaskExecutor,
 };
+use tracing::info;
 
 /// N42 transaction pool type — uses DiskFileBlobStore for EIP-4844 blob transaction support.
 pub type N42TransactionPool<Provider, Evm> = reth_transaction_pool::Pool<
@@ -49,6 +51,35 @@ where
     ) -> eyre::Result<Self::Pool> {
         let blob_store = reth_node_builder::components::create_blob_store(ctx)?;
 
+        // Dedicated runtime for TX pool validation tasks.
+        // Isolates ECDSA recovery + DB read CPU from consensus/GossipSub,
+        // preventing R1_collect latency spikes under high TX load.
+        let validation_threads: usize = std::env::var("N42_POOL_VALIDATION_THREADS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4);
+
+        // Leak the runtime so it lives as long as the process — avoids
+        // "Cannot drop a runtime in a context where blocking is not allowed"
+        // since build_pool() is async and Runtime::drop needs blocking.
+        let pool_runtime: &'static _ = Box::leak(Box::new(
+            RuntimeBuilder::new(
+                RuntimeConfig::default().with_tokio(TokioConfig::Owned {
+                    worker_threads: Some(validation_threads),
+                    thread_keep_alive: std::time::Duration::from_secs(60),
+                    thread_name: "pool-val",
+                }),
+            )
+            .build()?,
+        ));
+
+        info!(
+            target: "n42::pool",
+            threads = validation_threads,
+            "TX pool validation running on dedicated runtime"
+        );
+
+        let additional_tasks = ctx.config().txpool.additional_validation_tasks.max(16);
         let validator =
             TransactionValidationTaskExecutor::eth_builder(ctx.provider().clone(), evm_config)
                 .with_local_transactions_config(
@@ -58,8 +89,8 @@ where
                 .with_max_tx_input_bytes(ctx.config().txpool.max_tx_input_bytes)
                 .with_max_tx_gas_limit(ctx.config().txpool.max_tx_gas_limit)
                 .with_minimum_priority_fee(ctx.config().txpool.minimum_priority_fee)
-                .with_additional_tasks(ctx.config().txpool.additional_validation_tasks.max(16))
-                .build_with_tasks(ctx.task_executor().clone(), blob_store.clone());
+                .with_additional_tasks(additional_tasks)
+                .build_with_tasks(pool_runtime.clone(), blob_store.clone());
 
         let pool_config = idc_pool_config(&ctx.pool_config());
 

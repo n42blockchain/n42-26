@@ -1,11 +1,17 @@
-//! N42 High-Performance TPS Stress Test v9
+//! N42 High-Performance TPS Stress Test v10
 //!
-//! v9 improvements over v8:
-//! - Pipelined signing and sending: signer task fills channel, sender task drains it
-//! - Removes batch_interval sleep — signing throughput controls rate naturally
-//! - Larger batch sizes at high TPS (up to 6000 tx/batch)
-//! - Multiple signer threads per RPC for high TPS targets
-//! - ~2x throughput vs v8 by overlapping sign and send
+//! v10 improvements over v9:
+//! - `--blast N` mode: pre-sign N txs, blast at max speed with optimal settings
+//! - Smaller batch size default (500) for faster HTTP round trips
+//! - HTTP/1.1 forced (avoids HTTP/2 single-connection multiplexing bottleneck)
+//! - Higher per-RPC concurrency (32 inflight batches vs 4 pipeline depth)
+//! - Real-time block TPS monitoring during blast
+//! - Default accounts increased to 5000
+//!
+//! v9 features retained:
+//! - Pipelined signing and sending for --step mode
+//! - Pre-sign save/load for binary tx files
+//! - Backpressure monitoring
 
 use alloy_consensus::{SignableTransaction, TxEip1559};
 use alloy_eips::eip2718::Encodable2718;
@@ -14,6 +20,7 @@ use alloy_signer::SignerSync;
 use alloy_signer_local::PrivateKeySigner;
 use clap::Parser;
 use eyre::Result;
+use std::io::{BufReader, BufWriter, Read as IoRead, Write as IoWrite};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -32,11 +39,11 @@ struct Cli {
     duration: u64,
 
     /// Number of sender accounts
-    #[arg(long, default_value = "3000")]
+    #[arg(long, default_value = "5000")]
     accounts: usize,
 
     /// Batch size for JSON-RPC batch requests
-    #[arg(long, default_value = "2000")]
+    #[arg(long, default_value = "500")]
     batch_size: usize,
 
     /// Number of accounts per batch (multi-account mixing)
@@ -55,6 +62,12 @@ struct Cli {
     #[arg(long)]
     step: bool,
 
+    /// Blast mode: pre-sign N txs, then blast at max speed.
+    /// Optimal for measuring node throughput ceiling.
+    /// Example: --blast 5000000 signs 5M txs then sends as fast as possible.
+    #[arg(long, default_value = "0")]
+    blast: u64,
+
     /// Pre-fill mode: flood the tx pool before measurement starts.
     /// Value = number of txs to pre-send (e.g., 10000).
     #[arg(long, default_value = "0")]
@@ -67,6 +80,24 @@ struct Cli {
     /// Pool resume threshold: resume sending when pool_pending drops below this
     #[arg(long, default_value = "100000")]
     resume_pool: u64,
+
+    /// Pre-sign mode: sign N transactions into memory first, then blast-send.
+    /// Removes signing from the hot path for maximum injection rate.
+    /// Example: --presign 3000000 signs 3M txs, then sends in 30s = 100K TPS injection.
+    #[arg(long, default_value = "0")]
+    presign: u64,
+
+    /// Save pre-signed transactions to binary file for reuse.
+    /// Usage: --presign-save txdata.bin --presign 5000000 --accounts 5000
+    /// Requires chain connection to sync nonces. File can be reused with --presign-load.
+    #[arg(long)]
+    presign_save: Option<String>,
+
+    /// Load pre-signed transactions from binary file and blast-send.
+    /// Usage: --presign-load txdata.bin
+    /// Skips all signing — pure I/O send for maximum injection rate.
+    #[arg(long)]
+    presign_load: Option<String>,
 
     /// RPC endpoints (comma-separated)
     #[arg(long, default_value = "http://127.0.0.1:18545,http://127.0.0.1:18546,http://127.0.0.1:18547,http://127.0.0.1:18548,http://127.0.0.1:18549,http://127.0.0.1:18550,http://127.0.0.1:18551")]
@@ -632,6 +663,429 @@ async fn sender_loop(
     signer_handle.abort();
 }
 
+/// Pre-sign all transactions into memory, grouped by RPC endpoint.
+/// Returns Vec[rpc_idx] = Vec<raw_tx_hex>.
+fn presign_all(
+    accounts: &[Arc<TestAccount>],
+    targets: &[Address],
+    total: u64,
+    num_rpcs: usize,
+    erc20_ratio: u8,
+) -> Vec<Vec<String>> {
+    let num_accounts = accounts.len();
+    let txs_per_account = (total as usize) / num_accounts;
+    let remainder = (total as usize) % num_accounts;
+
+    tracing::info!(
+        total, num_accounts, txs_per_account,
+        remainder, num_rpcs, erc20_ratio,
+        "Pre-signing transactions..."
+    );
+
+    let start = Instant::now();
+
+    // Parallel signing using std::thread::scope (CPU-bound work)
+    let per_account_results: Vec<(usize, Vec<String>)> = std::thread::scope(|s| {
+        let handles: Vec<_> = accounts.iter().enumerate().map(|(acct_idx, account)| {
+            let targets = targets;
+            s.spawn(move || {
+                let count = txs_per_account + if acct_idx < remainder { 1 } else { 0 };
+                if count == 0 {
+                    return (account.rpc_idx, Vec::new());
+                }
+                let nonce_start = account.nonce.fetch_add(count as u64, Ordering::Relaxed);
+                let mut txs = Vec::with_capacity(count);
+                for j in 0..count {
+                    let nonce = nonce_start + j as u64;
+                    let tx_index = acct_idx * txs_per_account + j;
+                    let is_contract_call = erc20_ratio > 0 && (tx_index % 100) < erc20_ratio as usize;
+
+                    let tx = if is_contract_call {
+                        TxEip1559 {
+                            chain_id: CHAIN_ID,
+                            nonce,
+                            gas_limit: CONTRACT_CALL_GAS,
+                            max_fee_per_gas: MAX_FEE_PER_GAS,
+                            max_priority_fee_per_gas: MAX_PRIORITY_FEE,
+                            to: TxKind::Call(STRESS_CONTRACT),
+                            value: U256::ZERO,
+                            input: Bytes::new(),
+                            access_list: Default::default(),
+                        }
+                    } else {
+                        let to = targets[(nonce as usize) % targets.len()];
+                        TxEip1559 {
+                            chain_id: CHAIN_ID,
+                            nonce,
+                            gas_limit: TRANSFER_GAS,
+                            max_fee_per_gas: MAX_FEE_PER_GAS,
+                            max_priority_fee_per_gas: MAX_PRIORITY_FEE,
+                            to: TxKind::Call(to),
+                            value: U256::from(TRANSFER_VALUE),
+                            input: Bytes::new(),
+                            access_list: Default::default(),
+                        }
+                    };
+                    let sig_hash = tx.signature_hash();
+                    let sig = account.signer.sign_hash_sync(&sig_hash).expect("sign");
+                    let signed = tx.into_signed(sig);
+                    let mut buf = Vec::with_capacity(128);
+                    signed.encode_2718(&mut buf);
+                    txs.push(format!("0x{}", hex::encode(&buf)));
+                }
+                (account.rpc_idx, txs)
+            })
+        }).collect();
+
+        handles.into_iter().map(|h| h.join().expect("thread join")).collect()
+    });
+
+    // Group by RPC endpoint
+    let mut grouped: Vec<Vec<String>> = vec![Vec::new(); num_rpcs];
+    let mut total_signed = 0usize;
+    for (rpc_idx, txs) in per_account_results {
+        total_signed += txs.len();
+        grouped[rpc_idx].extend(txs);
+    }
+
+    let elapsed = start.elapsed();
+    let sign_rate = total_signed as f64 / elapsed.as_secs_f64();
+    tracing::info!(
+        total_signed,
+        elapsed_ms = elapsed.as_millis(),
+        sign_rate = format!("{:.0}/s", sign_rate),
+        per_rpc = grouped.iter().map(|g| g.len()).collect::<Vec<_>>().as_slice().iter()
+            .map(|n| n.to_string()).collect::<Vec<_>>().join(","),
+        "Pre-sign complete"
+    );
+
+    grouped
+}
+
+/// Binary file format for pre-signed transactions:
+/// Header: b"N42T" (4) + version (1) + chain_id (8) + num_rpcs (4) + total_txs (8) = 25 bytes
+/// Per-RPC: tx_count (8 bytes), then for each tx: tx_len (2 bytes) + tx_bytes
+const FILE_MAGIC: &[u8; 4] = b"N42T";
+const FILE_VERSION: u8 = 1;
+
+/// Pre-sign transactions and save to binary file (raw RLP, not hex).
+fn presign_and_save(
+    accounts: &[Arc<TestAccount>],
+    targets: &[Address],
+    total: u64,
+    num_rpcs: usize,
+    erc20_ratio: u8,
+    path: &str,
+) -> Result<()> {
+    let num_accounts = accounts.len();
+    let txs_per_account = (total as usize) / num_accounts;
+    let remainder = (total as usize) % num_accounts;
+
+    tracing::info!(
+        total, num_accounts, txs_per_account, remainder, num_rpcs, path,
+        "Pre-signing and saving to file..."
+    );
+
+    let start = Instant::now();
+
+    // Parallel signing — returns raw RLP bytes (not hex) grouped by rpc_idx
+    let per_account_results: Vec<(usize, Vec<Vec<u8>>)> = std::thread::scope(|s| {
+        let handles: Vec<_> = accounts.iter().enumerate().map(|(acct_idx, account)| {
+            let targets = targets;
+            s.spawn(move || {
+                let count = txs_per_account + if acct_idx < remainder { 1 } else { 0 };
+                if count == 0 {
+                    return (account.rpc_idx, Vec::new());
+                }
+                let nonce_start = account.nonce.fetch_add(count as u64, Ordering::Relaxed);
+                let mut txs = Vec::with_capacity(count);
+                for j in 0..count {
+                    let nonce = nonce_start + j as u64;
+                    let tx_index = acct_idx * txs_per_account + j;
+                    let is_contract_call = erc20_ratio > 0 && (tx_index % 100) < erc20_ratio as usize;
+
+                    let tx = if is_contract_call {
+                        TxEip1559 {
+                            chain_id: CHAIN_ID,
+                            nonce,
+                            gas_limit: CONTRACT_CALL_GAS,
+                            max_fee_per_gas: MAX_FEE_PER_GAS,
+                            max_priority_fee_per_gas: MAX_PRIORITY_FEE,
+                            to: TxKind::Call(STRESS_CONTRACT),
+                            value: U256::ZERO,
+                            input: Bytes::new(),
+                            access_list: Default::default(),
+                        }
+                    } else {
+                        let to = targets[(nonce as usize) % targets.len()];
+                        TxEip1559 {
+                            chain_id: CHAIN_ID,
+                            nonce,
+                            gas_limit: TRANSFER_GAS,
+                            max_fee_per_gas: MAX_FEE_PER_GAS,
+                            max_priority_fee_per_gas: MAX_PRIORITY_FEE,
+                            to: TxKind::Call(to),
+                            value: U256::from(TRANSFER_VALUE),
+                            input: Bytes::new(),
+                            access_list: Default::default(),
+                        }
+                    };
+                    let sig_hash = tx.signature_hash();
+                    let sig = account.signer.sign_hash_sync(&sig_hash).expect("sign");
+                    let signed = tx.into_signed(sig);
+                    let mut buf = Vec::with_capacity(128);
+                    signed.encode_2718(&mut buf);
+                    txs.push(buf);
+                }
+                (account.rpc_idx, txs)
+            })
+        }).collect();
+
+        handles.into_iter().map(|h| h.join().expect("thread join")).collect()
+    });
+
+    // Group by RPC
+    let mut grouped: Vec<Vec<Vec<u8>>> = vec![Vec::new(); num_rpcs];
+    let mut total_signed = 0usize;
+    for (rpc_idx, txs) in per_account_results {
+        total_signed += txs.len();
+        grouped[rpc_idx].extend(txs);
+    }
+
+    let sign_elapsed = start.elapsed();
+    let sign_rate = total_signed as f64 / sign_elapsed.as_secs_f64();
+    tracing::info!(
+        total_signed,
+        sign_ms = sign_elapsed.as_millis(),
+        sign_rate = format!("{:.0}/s", sign_rate),
+        "Signing complete, writing file..."
+    );
+
+    // Write binary file
+    let file = std::fs::File::create(path)?;
+    let mut w = BufWriter::with_capacity(8 * 1024 * 1024, file);
+
+    // Header
+    w.write_all(FILE_MAGIC)?;
+    w.write_all(&[FILE_VERSION])?;
+    w.write_all(&CHAIN_ID.to_le_bytes())?;
+    w.write_all(&(num_rpcs as u32).to_le_bytes())?;
+    w.write_all(&(total_signed as u64).to_le_bytes())?;
+
+    // Per-RPC tx data
+    let mut total_bytes = 25u64; // header size
+    for rpc_txs in &grouped {
+        w.write_all(&(rpc_txs.len() as u64).to_le_bytes())?;
+        total_bytes += 8;
+        for tx_bytes in rpc_txs {
+            let len = tx_bytes.len() as u16;
+            w.write_all(&len.to_le_bytes())?;
+            w.write_all(tx_bytes)?;
+            total_bytes += 2 + tx_bytes.len() as u64;
+        }
+    }
+    w.flush()?;
+
+    let total_elapsed = start.elapsed();
+    tracing::info!(
+        path,
+        total_txs = total_signed,
+        file_size_mb = total_bytes / (1024 * 1024),
+        sign_ms = sign_elapsed.as_millis(),
+        write_ms = (total_elapsed - sign_elapsed).as_millis(),
+        total_ms = total_elapsed.as_millis(),
+        per_rpc = grouped.iter().map(|g| g.len().to_string()).collect::<Vec<_>>().join(","),
+        "Pre-signed transactions saved"
+    );
+
+    Ok(())
+}
+
+/// Load pre-signed transactions from binary file → Vec[rpc_idx] = Vec<hex_string>.
+fn load_presigned(path: &str) -> Result<Vec<Vec<String>>> {
+    let start = Instant::now();
+    let file = std::fs::File::open(path)?;
+    let file_size = file.metadata()?.len();
+    let mut r = BufReader::with_capacity(8 * 1024 * 1024, file);
+
+    // Read header
+    let mut magic = [0u8; 4];
+    r.read_exact(&mut magic)?;
+    if &magic != FILE_MAGIC {
+        eyre::bail!("Invalid file magic: expected N42T, got {:?}", magic);
+    }
+
+    let mut version = [0u8; 1];
+    r.read_exact(&mut version)?;
+    if version[0] != FILE_VERSION {
+        eyre::bail!("Unsupported file version: {}", version[0]);
+    }
+
+    let mut chain_id_buf = [0u8; 8];
+    r.read_exact(&mut chain_id_buf)?;
+    let chain_id = u64::from_le_bytes(chain_id_buf);
+    if chain_id != CHAIN_ID {
+        eyre::bail!("Chain ID mismatch: file={}, expected={}", chain_id, CHAIN_ID);
+    }
+
+    let mut num_rpcs_buf = [0u8; 4];
+    r.read_exact(&mut num_rpcs_buf)?;
+    let num_rpcs = u32::from_le_bytes(num_rpcs_buf) as usize;
+
+    let mut total_txs_buf = [0u8; 8];
+    r.read_exact(&mut total_txs_buf)?;
+    let total_txs = u64::from_le_bytes(total_txs_buf);
+
+    tracing::info!(
+        path, file_size_mb = file_size / (1024 * 1024),
+        num_rpcs, total_txs,
+        "Loading pre-signed transactions..."
+    );
+
+    // Read per-RPC tx data
+    let mut grouped: Vec<Vec<String>> = Vec::with_capacity(num_rpcs);
+    let mut loaded = 0u64;
+    let mut tx_buf = vec![0u8; 65536]; // reusable buffer
+
+    for rpc_idx in 0..num_rpcs {
+        let mut count_buf = [0u8; 8];
+        r.read_exact(&mut count_buf)?;
+        let tx_count = u64::from_le_bytes(count_buf) as usize;
+
+        let mut txs = Vec::with_capacity(tx_count);
+        for _ in 0..tx_count {
+            let mut len_buf = [0u8; 2];
+            r.read_exact(&mut len_buf)?;
+            let tx_len = u16::from_le_bytes(len_buf) as usize;
+            r.read_exact(&mut tx_buf[..tx_len])?;
+            txs.push(format!("0x{}", hex::encode(&tx_buf[..tx_len])));
+            loaded += 1;
+        }
+
+        if rpc_idx == 0 || rpc_idx == num_rpcs - 1 {
+            tracing::info!(rpc_idx, txs = txs.len(), "RPC group loaded");
+        }
+        grouped.push(txs);
+    }
+
+    let elapsed = start.elapsed();
+    let load_rate = loaded as f64 / elapsed.as_secs_f64();
+    tracing::info!(
+        total_loaded = loaded,
+        elapsed_ms = elapsed.as_millis(),
+        load_rate = format!("{:.0}/s", load_rate),
+        mem_estimate_mb = loaded as u64 * 240 / (1024 * 1024),
+        "Pre-signed transactions loaded"
+    );
+
+    Ok(grouped)
+}
+
+/// Send pre-signed transactions with rate limiting.
+#[allow(clippy::too_many_arguments)]
+async fn run_presign_send(
+    presigned: Vec<Vec<String>>,
+    rpc_urls: &[String],
+    client: &reqwest::Client,
+    stats: &Arc<Stats>,
+    semaphore: &Arc<Semaphore>,
+    batch_size: usize,
+    target_tps: u64,
+    max_pool: u64,
+    resume_pool: u64,
+    stop: &Arc<AtomicBool>,
+) {
+    let bp_active = Arc::new(AtomicBool::new(false));
+    let bp_monitor = spawn_backpressure_monitor(
+        client.clone(), rpc_urls[0].clone(), bp_active.clone(),
+        max_pool, resume_pool, stats.clone(), stop.clone(),
+    );
+
+    let num_rpcs = presigned.len();
+    let per_rpc_tps = if target_tps > 0 {
+        (target_tps / num_rpcs as u64).max(1)
+    } else {
+        0
+    };
+
+    let mut handles = Vec::new();
+    for (rpc_idx, txs) in presigned.into_iter().enumerate() {
+        if txs.is_empty() {
+            continue;
+        }
+        let rpc_url = rpc_urls[rpc_idx].clone();
+        let client = client.clone();
+        let stats = stats.clone();
+        let semaphore = semaphore.clone();
+        let bp_active = bp_active.clone();
+        let stop = stop.clone();
+        let bs = batch_size;
+
+        // Rate limiter per RPC
+        let batch_interval = if per_rpc_tps > 0 {
+            let batches_per_sec = (per_rpc_tps as f64 / bs as f64).ceil() as u64;
+            Some(Duration::from_secs_f64(1.0 / batches_per_sec.max(1) as f64))
+        } else {
+            None
+        };
+
+        tracing::info!(
+            rpc_idx, txs = txs.len(), batch_size = bs,
+            per_rpc_tps,
+            batch_interval_ms = batch_interval.map(|d| d.as_millis() as u64).unwrap_or(0),
+            "presign sender starting"
+        );
+
+        handles.push(tokio::spawn(async move {
+            let mut last_send = Instant::now();
+            for chunk in txs.chunks(bs) {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+
+                // Respect backpressure
+                while bp_active.load(Ordering::Relaxed) {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+
+                // Rate limiting
+                if let Some(interval) = batch_interval {
+                    let since_last = last_send.elapsed();
+                    if since_last < interval {
+                        tokio::time::sleep(interval - since_last).await;
+                    }
+                }
+                last_send = Instant::now();
+
+                let permit = semaphore.clone().acquire_owned().await.unwrap();
+                let client_clone = client.clone();
+                let stats_clone = stats.clone();
+                let rpc_url_clone = rpc_url.clone();
+                let batch: Vec<String> = chunk.to_vec();
+
+                tokio::spawn(async move {
+                    let result = send_batch(&client_clone, &rpc_url_clone, &batch).await;
+                    stats_clone.sent.fetch_add(result.ok as u64, Ordering::Relaxed);
+                    stats_clone.rpc_errors.fetch_add(result.rpc_error as u64, Ordering::Relaxed);
+                    stats_clone.http_errors.fetch_add(result.http_error as u64, Ordering::Relaxed);
+                    stats_clone.rpc_latency_ns.fetch_add(result.latency.as_nanos() as u64, Ordering::Relaxed);
+                    stats_clone.rpc_latency_count.fetch_add(1, Ordering::Relaxed);
+                    drop(permit);
+                });
+            }
+        }));
+    }
+
+    for h in handles {
+        let _ = h.await;
+    }
+
+    bp_monitor.abort();
+
+    // Wait for in-flight requests
+    tokio::time::sleep(Duration::from_millis(2000)).await;
+}
+
 /// Run test with parallel senders (one per RPC endpoint).
 #[allow(clippy::too_many_arguments)]
 async fn run_test(
@@ -904,7 +1358,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let rpc_urls: Vec<String> = cli.rpc.split(',').map(|s| s.trim().to_string()).collect();
 
-    tracing::info!("=== N42 TPS Stress Test v9 (Pipelined Sign + Send) ===");
+    tracing::info!("=== N42 TPS Stress Test v10 (Blast Mode + Optimized Injection) ===");
     tracing::info!(
         target_tps = cli.target_tps,
         duration = cli.duration,
@@ -915,11 +1369,16 @@ async fn main() -> Result<()> {
         concurrency = cli.concurrency,
         max_pool = cli.max_pool,
         resume_pool = cli.resume_pool,
+        blast = cli.blast,
         rpc_count = rpc_urls.len(),
         "Configuration"
     );
 
+    // Force HTTP/1.1 to avoid HTTP/2 single-connection multiplexing bottleneck.
+    // With HTTP/1.1, reqwest opens multiple TCP connections per host,
+    // allowing true parallel batch processing on the server side.
     let client = reqwest::Client::builder()
+        .http1_only()
         .pool_max_idle_per_host(cli.concurrency)
         .pool_idle_timeout(Duration::from_secs(30))
         .tcp_keepalive(Duration::from_secs(15))
@@ -933,6 +1392,329 @@ async fn main() -> Result<()> {
 
     // Parallel nonce sync
     sync_nonces_parallel(&accounts, &rpc_urls, &client).await;
+
+    // === Pre-sign save mode: sign and save to file, then exit ===
+    if let Some(ref save_path) = cli.presign_save {
+        let total = if cli.presign > 0 { cli.presign } else { 5_000_000 };
+        tracing::info!("=== N42 Pre-sign Save Mode ===");
+        presign_and_save(
+            &accounts, &targets, total, rpc_urls.len(), cli.erc20_ratio, save_path,
+        )?;
+        return Ok(());
+    }
+
+    // === Blast mode: pre-sign N txs, then blast at max speed ===
+    if cli.blast > 0 {
+        tracing::info!("=== N42 BLAST MODE v10 ===");
+        tracing::info!(
+            total_txs = cli.blast,
+            accounts = cli.accounts,
+            batch_size = cli.batch_size,
+            rpcs = rpc_urls.len(),
+            "Pre-signing transactions (all CPU cores)..."
+        );
+
+        let presigned = presign_all(
+            &accounts, &targets, cli.blast, rpc_urls.len(), cli.erc20_ratio,
+        );
+
+        let start_block = get_block_number(&client, &rpc_urls[0]).await?;
+        if let Ok(info) = get_block_info(&client, &rpc_urls[0], start_block).await {
+            tracing::info!(
+                block = start_block,
+                gas_limit = info.gas_limit,
+                gas_limit_M = info.gas_limit / 1_000_000,
+                max_eth_transfers = info.gas_limit / TRANSFER_GAS,
+                "Chain active"
+            );
+        }
+
+        let stats = Arc::new(Stats::new());
+        stats.start_block.store(start_block, Ordering::Relaxed);
+        let start = Instant::now();
+
+        // Real-time block TPS monitor (every 2s)
+        let monitor_client = client.clone();
+        let monitor_rpc = rpc_urls[0].clone();
+        let monitor_stats = stats.clone();
+        let monitor_stop = stop.clone();
+        let monitor_start_block = start_block;
+        let monitor_handle = tokio::spawn(async move {
+            let mut last_block = monitor_start_block;
+            let mut last_time = Instant::now();
+            let mut interval = tokio::time::interval(Duration::from_secs(2));
+            interval.tick().await; // skip first immediate tick
+            loop {
+                interval.tick().await;
+                if monitor_stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                let now_block = get_block_number(&monitor_client, &monitor_rpc).await.unwrap_or(last_block);
+                if now_block > last_block {
+                    // Fetch latest blocks for real-time TPS
+                    let mut recent_txs = 0u64;
+                    let check_from = if now_block > last_block + 5 { now_block - 5 } else { last_block };
+                    for b in (check_from + 1)..=now_block {
+                        if let Ok(info) = get_block_info(&monitor_client, &monitor_rpc, b).await {
+                            recent_txs += info.tx_count;
+                        }
+                    }
+                    let dt = last_time.elapsed().as_secs_f64();
+                    let sent = monitor_stats.sent.load(Ordering::Relaxed);
+                    let rpc_err = monitor_stats.rpc_errors.load(Ordering::Relaxed);
+                    let pool = get_txpool_status(&monitor_client, &monitor_rpc).await.unwrap_or((0, 0));
+
+                    tracing::info!(
+                        blocks = now_block - monitor_start_block,
+                        recent_block_txs = recent_txs,
+                        block_tps = format!("{:.0}", recent_txs as f64 / dt.max(0.1)),
+                        injection_sent = sent,
+                        injection_err = rpc_err,
+                        injection_tps = format!("{:.0}", sent as f64 / start.elapsed().as_secs_f64().max(0.1)),
+                        pool_pending = pool.0,
+                        pool_queued = pool.1,
+                        "BLAST_MONITOR"
+                    );
+                    last_block = now_block;
+                    last_time = Instant::now();
+                }
+            }
+        });
+
+        // Blast send: use target_tps for rate limiting (0 = unlimited)
+        let blast_tps = cli.target_tps;
+        if blast_tps > 0 {
+            tracing::info!(target_tps = blast_tps, "Blast with rate limiting (sustained mode)");
+        } else {
+            tracing::info!("Blast with NO rate limiting (max speed)");
+        }
+        stop.store(false, Ordering::Relaxed);
+
+        // Auto-stop after --duration seconds (if blast has enough txs)
+        let duration_stop = stop.clone();
+        let duration_secs = cli.duration;
+        let duration_guard = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(duration_secs)).await;
+            duration_stop.store(true, Ordering::Relaxed);
+            tracing::info!(duration_secs, "Blast duration reached, stopping injection");
+        });
+
+        run_presign_send(
+            presigned, &rpc_urls, &client, &stats, &semaphore,
+            cli.batch_size, blast_tps, cli.max_pool, cli.resume_pool, &stop,
+        ).await;
+
+        duration_guard.abort();
+
+        stop.store(true, Ordering::Relaxed);
+        monitor_handle.abort();
+
+        let sent = stats.sent.load(Ordering::Relaxed);
+        let rpc_err = stats.rpc_errors.load(Ordering::Relaxed);
+        let http_err = stats.http_errors.load(Ordering::Relaxed);
+        let elapsed = start.elapsed().as_secs_f64();
+        let end_block = get_block_number(&client, &rpc_urls[0]).await?;
+        let blocks = end_block - start_block;
+
+        tracing::info!("=== BLAST INJECTION COMPLETE ===");
+        tracing::info!(
+            injection_tps = format!("{:.0}", sent as f64 / elapsed.max(1.0)),
+            sent, rpc_err, http_err, blocks,
+            duration = format!("{:.1}s", elapsed),
+            avg_rpc_latency_ms = format!("{:.1}", stats.avg_rpc_latency_ms()),
+            bp_pauses = stats.backpressure_pauses.load(Ordering::Relaxed),
+            "Injection phase done, waiting for pool drain..."
+        );
+
+        // Wait for pool drain
+        let drain_start = Instant::now();
+        loop {
+            if drain_start.elapsed() > Duration::from_secs(120) {
+                tracing::warn!("Pool drain timeout (120s)");
+                break;
+            }
+            if let Ok((pending, queued)) = get_txpool_status(&client, &rpc_urls[0]).await {
+                if pending < 500 {
+                    tracing::info!(pending, queued, drain_ms = drain_start.elapsed().as_millis(), "Pool drained");
+                    break;
+                }
+                tracing::info!(pending, queued, "Draining...");
+            }
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        }
+
+        let final_block = get_block_number(&client, &rpc_urls[0]).await?;
+        let total_blocks = final_block - start_block;
+        let total_elapsed = start.elapsed().as_secs_f64();
+
+        tracing::info!("=== BLAST RESULT ===");
+        tracing::info!(
+            total_txs = sent,
+            total_blocks,
+            total_time = format!("{:.1}s", total_elapsed),
+            sustained_tps = format!("{:.0}", sent as f64 / total_elapsed.max(1.0)),
+            avg_tx_per_block = sent / total_blocks.max(1),
+            "Summary"
+        );
+
+        analyze_blocks(&client, &rpc_urls[0], start_block, final_block).await;
+
+        return Ok(());
+    }
+
+    // === Pre-sign load mode: load from file and blast-send ===
+    if let Some(ref load_path) = cli.presign_load {
+        tracing::info!("=== N42 Pre-sign Load + Blast Send Mode ===");
+        let presigned = load_presigned(load_path)?;
+
+        let start_block = get_block_number(&client, &rpc_urls[0]).await?;
+        if let Ok(info) = get_block_info(&client, &rpc_urls[0], start_block).await {
+            tracing::info!(
+                block = start_block,
+                gas_limit = info.gas_limit,
+                gas_limit_M = info.gas_limit / 1_000_000,
+                "Chain active"
+            );
+        }
+
+        let stats = Arc::new(Stats::new());
+        stats.start_block.store(start_block, Ordering::Relaxed);
+        let start = Instant::now();
+
+        let reporter = spawn_reporter(
+            stats.clone(), client.clone(), rpc_urls[0].clone(), start, start_block,
+        );
+
+        stop.store(false, Ordering::Relaxed);
+        run_presign_send(
+            presigned, &rpc_urls, &client, &stats, &semaphore,
+            cli.batch_size, cli.target_tps, cli.max_pool, cli.resume_pool, &stop,
+        ).await;
+
+        reporter.abort();
+
+        let sent = stats.sent.load(Ordering::Relaxed);
+        let rpc_err = stats.rpc_errors.load(Ordering::Relaxed);
+        let http_err = stats.http_errors.load(Ordering::Relaxed);
+        let elapsed = start.elapsed().as_secs_f64();
+        let end_block = get_block_number(&client, &rpc_urls[0]).await?;
+        let blocks = end_block - start_block;
+
+        tracing::info!("=== PRE-SIGN LOAD RESULT ===");
+        tracing::info!(
+            effective_tps = format!("{:.1}", sent as f64 / elapsed.max(1.0)),
+            injection_tps = format!("{:.1}", (sent + rpc_err) as f64 / elapsed.max(1.0)),
+            sent, rpc_err, http_err, blocks,
+            avg_tx_per_block = sent / blocks.max(1),
+            duration = format!("{:.1}s", elapsed),
+            avg_rpc_latency_ms = format!("{:.1}", stats.avg_rpc_latency_ms()),
+            bp_pauses = stats.backpressure_pauses.load(Ordering::Relaxed),
+            bp_total_ms = stats.backpressure_ms.load(Ordering::Relaxed),
+            "Complete"
+        );
+
+        // Wait for pool drain
+        tracing::info!("Waiting for pending pool to drain...");
+        let drain_start = Instant::now();
+        loop {
+            if drain_start.elapsed() > Duration::from_secs(120) {
+                tracing::warn!("Pool drain timeout (120s)");
+                break;
+            }
+            if let Ok((pending, queued)) = get_txpool_status(&client, &rpc_urls[0]).await {
+                if pending < 500 {
+                    tracing::info!(pending, queued, "Pool drained");
+                    break;
+                }
+                tracing::info!(pending, queued, "Draining...");
+            }
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        }
+
+        let final_block = get_block_number(&client, &rpc_urls[0]).await?;
+        analyze_blocks(&client, &rpc_urls[0], start_block, final_block).await;
+
+        return Ok(());
+    }
+
+    // === Pre-sign mode (in-memory): sign all txs upfront, then blast-send ===
+    if cli.presign > 0 {
+        tracing::info!("=== N42 Pre-sign Mode (legacy, use --blast for v10) ===");
+
+        let presigned = presign_all(
+            &accounts, &targets, cli.presign, rpc_urls.len(), cli.erc20_ratio,
+        );
+
+        let start_block = get_block_number(&client, &rpc_urls[0]).await?;
+        if let Ok(info) = get_block_info(&client, &rpc_urls[0], start_block).await {
+            tracing::info!(
+                block = start_block,
+                gas_limit = info.gas_limit,
+                gas_limit_M = info.gas_limit / 1_000_000,
+                "Chain active"
+            );
+        }
+
+        let stats = Arc::new(Stats::new());
+        stats.start_block.store(start_block, Ordering::Relaxed);
+        let start = Instant::now();
+
+        let reporter = spawn_reporter(
+            stats.clone(), client.clone(), rpc_urls[0].clone(), start, start_block,
+        );
+
+        stop.store(false, Ordering::Relaxed);
+        run_presign_send(
+            presigned, &rpc_urls, &client, &stats, &semaphore,
+            cli.batch_size, cli.target_tps, cli.max_pool, cli.resume_pool, &stop,
+        ).await;
+
+        reporter.abort();
+
+        let sent = stats.sent.load(Ordering::Relaxed);
+        let rpc_err = stats.rpc_errors.load(Ordering::Relaxed);
+        let http_err = stats.http_errors.load(Ordering::Relaxed);
+        let elapsed = start.elapsed().as_secs_f64();
+        let end_block = get_block_number(&client, &rpc_urls[0]).await?;
+        let blocks = end_block - start_block;
+
+        tracing::info!("=== PRE-SIGN RESULT ===");
+        tracing::info!(
+            presign_total = cli.presign,
+            effective_tps = format!("{:.1}", sent as f64 / elapsed.max(1.0)),
+            injection_tps = format!("{:.1}", cli.presign as f64 / elapsed.max(1.0)),
+            sent, rpc_err, http_err, blocks,
+            avg_tx_per_block = sent / blocks.max(1),
+            duration = format!("{:.1}s", elapsed),
+            avg_rpc_latency_ms = format!("{:.1}", stats.avg_rpc_latency_ms()),
+            bp_pauses = stats.backpressure_pauses.load(Ordering::Relaxed),
+            bp_total_ms = stats.backpressure_ms.load(Ordering::Relaxed),
+            "Complete"
+        );
+
+        // Wait for pool to drain and blocks to be produced
+        tracing::info!("Waiting for pending pool to drain...");
+        let drain_start = Instant::now();
+        loop {
+            if drain_start.elapsed() > Duration::from_secs(120) {
+                tracing::warn!("Pool drain timeout (120s)");
+                break;
+            }
+            if let Ok((pending, queued)) = get_txpool_status(&client, &rpc_urls[0]).await {
+                if pending < 500 {
+                    tracing::info!(pending, queued, "Pool drained");
+                    break;
+                }
+                tracing::info!(pending, queued, "Draining...");
+            }
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        }
+
+        let final_block = get_block_number(&client, &rpc_urls[0]).await?;
+        analyze_blocks(&client, &rpc_urls[0], start_block, final_block).await;
+
+        return Ok(());
+    }
 
     // Pre-fill tx pool if requested
     if cli.prefill > 0 {
@@ -1000,8 +1782,8 @@ async fn main() -> Result<()> {
     stats.start_block.store(start_block, Ordering::Relaxed);
 
     if cli.step {
-        // Extended TPS levels to push 2G gas limit (~47K TPS theoretical max)
-        let tps_levels = [1000, 3000, 5000, 7500, 10000, 15000, 20000, 30000, 40000, 50000];
+        // Extended TPS levels to push 2G gas limit (~95K TPS theoretical max)
+        let tps_levels = [3000, 7500, 15000, 25000, 40000, 60000, 80000, 100000];
         let step_duration = Duration::from_secs(cli.duration);
 
         for &target_tps in &tps_levels {
@@ -1013,26 +1795,19 @@ async fn main() -> Result<()> {
             let start = Instant::now();
 
             // Scale accounts_per_batch with TPS level to minimize nonce gaps
-            let apb = if target_tps >= 20000 {
-                1000 // 1000 accounts/batch → 2 tx per account
-            } else if target_tps >= 10000 {
-                500  // 500 accounts/batch → 4 tx per account
-            } else if target_tps >= 5000 {
-                200  // 200 accounts/batch → 10 tx per account
+            let apb = if target_tps >= 40000 {
+                2000 // 2000 accounts/batch
+            } else if target_tps >= 15000 {
+                1000 // 1000 accounts/batch
+            } else if target_tps >= 7500 {
+                500  // 500 accounts/batch
             } else {
                 cli.accounts_per_batch
             };
 
-            // Scale batch_size with TPS level — larger batches reduce per-batch overhead
-            let bs = if target_tps >= 30000 {
-                6000  // 6K tx/batch → fewer HTTP roundtrips
-            } else if target_tps >= 20000 {
-                4000
-            } else if target_tps >= 7500 {
-                2000
-            } else {
-                cli.batch_size
-            };
+            // v10: use smaller batches (500) for faster HTTP round trips
+            // Smaller payload = faster serialize/deserialize = lower latency
+            let bs = cli.batch_size; // default 500 in v10
 
             tracing::info!("========================================");
             tracing::info!(

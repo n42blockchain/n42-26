@@ -330,26 +330,45 @@ build_binaries() {
 
 generate_genesis() {
     GENESIS_FILE="$DATA_DIR/genesis.json"
+    ACCOUNTS_CACHE="$SCRIPT_DIR/testnet-accounts-cache.json"
 
     if [[ ! -f "$GENESIS_FILE" ]] || [[ "$CLEAN" == true ]]; then
         log "Generating genesis.json with pre-funded test accounts..."
 
-        DATA_DIR="$DATA_DIR" python3 << 'PYEOF'
-import json, os
-from eth_account import Account
-from eth_utils import keccak
+        DATA_DIR="$DATA_DIR" ACCOUNTS_CACHE="$ACCOUNTS_CACHE" python3 << 'PYEOF'
+import json, os, time
 
 NUM_ACCOUNTS = 5000
 CHAIN_ID = 4242
 INITIAL_BALANCE = "0x4B3B4CA85A86C47A098A224000000"  # 100M N42 per account
 
 data_dir = os.environ["DATA_DIR"]
-accounts = []
-for i in range(NUM_ACCOUNTS):
-    private_key = keccak(f"n42-test-key-{i}".encode())
-    acct = Account.from_key(private_key)
-    accounts.append({"key": private_key.hex(), "address": acct.address})
-    print(f"  Account {i}: {acct.address}")
+cache_file = os.environ.get("ACCOUNTS_CACHE", "")
+
+# Try loading from cache first (instant, no eth_account dependency)
+if cache_file and os.path.exists(cache_file):
+    t0 = time.time()
+    with open(cache_file) as f:
+        accounts = json.load(f)
+    print(f"  Loaded {len(accounts)} accounts from cache ({time.time()-t0:.2f}s)")
+else:
+    # Generate from scratch (slow: ~30s for 5000 accounts)
+    from eth_account import Account
+    from eth_utils import keccak
+    t0 = time.time()
+    accounts = []
+    for i in range(NUM_ACCOUNTS):
+        private_key = keccak(f"n42-test-key-{i}".encode())
+        acct = Account.from_key(private_key)
+        accounts.append({"key": private_key.hex(), "address": acct.address})
+        if i % 500 == 0:
+            print(f"  Account {i}/{NUM_ACCOUNTS}...")
+    print(f"  Generated {len(accounts)} accounts ({time.time()-t0:.2f}s)")
+    # Save cache for future use
+    if cache_file:
+        with open(cache_file, "w") as f:
+            json.dump(accounts, f, indent=2)
+        print(f"  Saved accounts cache to {cache_file}")
 
 genesis = {
     "config": {
@@ -499,7 +518,11 @@ start_validators() {
         N42_REWARD_CURVE_K="4.0" \
         N42_MIN_ATTESTATION_THRESHOLD="1" \
         N42_OPEN_VERIFICATION="1" \
-        N42_MAX_TXS_PER_BLOCK="${N42_MAX_TXS_PER_BLOCK:-40000}" \
+        N42_MAX_TXS_PER_BLOCK="${N42_MAX_TXS_PER_BLOCK:-24000}" \
+        N42_FAST_PROPOSE="${N42_FAST_PROPOSE:-0}" \
+        N42_MIN_PROPOSE_DELAY_MS="${N42_MIN_PROPOSE_DELAY_MS:-0}" \
+        N42_SKIP_TX_VERIFY="${N42_SKIP_TX_VERIFY:-0}" \
+        N42_POOL_VALIDATION_THREADS="${N42_POOL_VALIDATION_THREADS:-2}" \
         "$BINARY" node \
             --chain "$GENESIS_FILE" \
             --datadir "$datadir" \

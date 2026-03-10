@@ -271,6 +271,13 @@ pub fn build_swarm_with_validator_index(
 }
 
 /// Builds per-topic peer scoring parameters.
+///
+/// IMPORTANT: `mesh_message_deliveries_weight` is explicitly set to 0.0 for all topics.
+/// The libp2p default penalizes peers for not delivering enough mesh messages, which
+/// causes a fatal deadlock on clean startup: no blocks → no messages → peers penalized →
+/// peers pruned from mesh → consensus messages undeliverable → permanent chain stall.
+/// In a permissioned validator network, BLS signature verification provides message
+/// authenticity guarantees; GossipSub delivery scoring is unnecessary.
 fn build_peer_score_params() -> PeerScoreParams {
     // Disable IP co-location penalty: in testnet all validators run on the
     // same machine (127.0.0.1), causing gossipsub to penalize every peer for
@@ -288,6 +295,7 @@ fn build_peer_score_params() -> PeerScoreParams {
             first_message_deliveries_weight: 1.0,
             first_message_deliveries_cap: 100.0,
             first_message_deliveries_decay: 0.99,
+            mesh_message_deliveries_weight: 0.0,
             invalid_message_deliveries_weight: -10.0,
             invalid_message_deliveries_decay: 0.9,
             ..Default::default()
@@ -301,6 +309,7 @@ fn build_peer_score_params() -> PeerScoreParams {
             first_message_deliveries_weight: 1.0,
             first_message_deliveries_cap: 50.0,
             first_message_deliveries_decay: 0.99,
+            mesh_message_deliveries_weight: 0.0,
             invalid_message_deliveries_weight: -5.0,
             invalid_message_deliveries_decay: 0.9,
             ..Default::default()
@@ -311,6 +320,7 @@ fn build_peer_score_params() -> PeerScoreParams {
         mempool_topic().hash(),
         TopicScoreParams {
             topic_weight: 0.2,
+            mesh_message_deliveries_weight: 0.0,
             invalid_message_deliveries_weight: -2.0,
             invalid_message_deliveries_decay: 0.95,
             ..Default::default()
@@ -324,6 +334,7 @@ fn build_peer_score_params() -> PeerScoreParams {
             first_message_deliveries_weight: 0.5,
             first_message_deliveries_cap: 30.0,
             first_message_deliveries_decay: 0.99,
+            mesh_message_deliveries_weight: 0.0,
             invalid_message_deliveries_weight: -3.0,
             invalid_message_deliveries_decay: 0.9,
             ..Default::default()

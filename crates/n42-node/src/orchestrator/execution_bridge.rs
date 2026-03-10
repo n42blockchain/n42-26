@@ -15,6 +15,7 @@ use reth_transaction_pool::blobstore::{BlobStore, DiskFileBlobStore};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
+use tokio::time::Instant;
 use tracing::{debug, error, info, warn};
 
 /// Whether Compact Block (follower EVM skip) is enabled.
@@ -69,6 +70,9 @@ fn take_and_serialize_execution_output(hash: &B256) -> Option<Vec<u8>> {
 
 /// Deserialize compact block execution output and inject into payload cache.
 pub(super) fn inject_compact_block(hash: &B256, compressed: &[u8]) -> bool {
+    let inject_start = std::time::Instant::now();
+
+    let decompress_start = std::time::Instant::now();
     let decompressed = match super::decompress_payload(compressed) {
         Ok(d) => d,
         Err(e) => {
@@ -76,6 +80,9 @@ pub(super) fn inject_compact_block(hash: &B256, compressed: &[u8]) -> bool {
             return false;
         }
     };
+    let decompress_ms = decompress_start.elapsed().as_millis() as u64;
+
+    let deser_start = std::time::Instant::now();
     let compact: CompactBlockExecution = match serde_json::from_slice(&decompressed) {
         Ok(c) => c,
         Err(e) => {
@@ -83,6 +90,9 @@ pub(super) fn inject_compact_block(hash: &B256, compressed: &[u8]) -> bool {
             return false;
         }
     };
+    let deser_ms = deser_start.elapsed().as_millis() as u64;
+
+    let store_start = std::time::Instant::now();
     let output = BlockExecutionOutput {
         state: compact.bundle_state,
         result: BlockExecutionResult {
@@ -93,8 +103,16 @@ pub(super) fn inject_compact_block(hash: &B256, compressed: &[u8]) -> bool {
         },
     };
     reth_evm::payload_cache::store_payload_execution(*hash, (output, compact.senders));
-    info!(target: "n42::cl::exec_bridge", %hash, "N42_COMPACT_BLOCK: injected execution output into payload cache");
+    let store_ms = store_start.elapsed().as_millis() as u64;
+
+    let total_ms = inject_start.elapsed().as_millis() as u64;
+    info!(target: "n42::cl::exec_bridge", %hash,
+        compressed_kb = compressed.len() / 1024,
+        decompressed_kb = decompressed.len() / 1024,
+        decompress_ms, deser_ms, store_ms, total_ms,
+        "N42_COMPACT_INJECT: execution output injected into payload cache");
     metrics::counter!("n42_compact_block_cache_injected").increment(1);
+    metrics::histogram!("n42_compact_inject_ms").record(total_ms as f64);
     true
 }
 
@@ -237,6 +255,7 @@ impl ConsensusOrchestrator {
             return;
         }
         self.building_on_parent = Some(parent);
+        self.build_triggered_at = Some(Instant::now());
 
         // Build attrs before borrowing beacon_engine to avoid borrow conflict.
         let attrs = self.build_payload_attributes(slot_timestamp);
@@ -291,6 +310,7 @@ impl ConsensusOrchestrator {
                         // FCU returned SYNCING — reth hasn't caught up yet.
                         // Clear both guards so the retry can re-attempt.
                         self.building_on_parent = None;
+                        self.build_triggered_at = None;
                         self.speculative_build_hash = None;
                         // Schedule a retry so the leader doesn't permanently stall.
                         self.schedule_build_retry();
@@ -310,6 +330,7 @@ impl ConsensusOrchestrator {
             error!(target: "n42::cl::exec_bridge", error = %e, "fork_choice_updated failed after retry");
             // Clear both guards so retry can re-attempt.
             self.building_on_parent = None;
+            self.build_triggered_at = None;
             self.speculative_build_hash = None;
             // Also schedule retry on FCU error — the execution layer may recover.
             self.schedule_build_retry();
@@ -985,29 +1006,25 @@ fn broadcast_block_data(
         );
     }
 
-    // GossipSub fallback: only used when direct push hasn't covered all peers
-    // (e.g. during startup, before Identify exchange completes).
-    // When direct push is active, skip GossipSub to avoid redundant large-message
-    // flooding that causes 10-30s propagation delays through the mesh.
-    if direct_count == 0 {
-        if let Err(e) = network.announce_block(encoded.clone()) {
-            warn!(target: "n42::cl::exec_bridge", error = %e, "failed to broadcast block data via gossipsub fallback");
-        }
-        info!(
-            target: "n42::cl::exec_bridge",
-            %hash,
-            bytes = encoded.len(),
-            "block data broadcast: gossipsub only (no validator peers known)"
-        );
-    } else {
-        info!(
-            target: "n42::cl::exec_bridge",
-            %hash,
-            bytes = encoded.len(),
-            direct_peers = direct_count,
-            "block data broadcast: direct push only (skipping gossipsub)"
-        );
+    // Always broadcast via GossipSub as a reliability fallback.
+    // Direct push (request-response) can silently fail due to QUIC transport
+    // issues, causing validators to miss block data and unable to vote.
+    // The receiver deduplicates via pending_block_data.contains_key(&hash).
+    let gossip_start = std::time::Instant::now();
+    if let Err(e) = network.announce_block(encoded.clone()) {
+        warn!(target: "n42::cl::exec_bridge", error = %e, "failed to broadcast block data via gossipsub");
     }
+    let gossip_ms = gossip_start.elapsed().as_millis() as u64;
+    info!(
+        target: "n42::cl::exec_bridge",
+        %hash,
+        encoded_kb = encoded.len() / 1024,
+        direct_peers = direct_count,
+        send_ms,
+        gossip_ms,
+        total_broadcast_ms = send_ms + gossip_ms,
+        "N42_BROADCAST: direct push + gossipsub complete"
+    );
 
     let _ = leader_payload_tx.send((hash, encoded));
 }

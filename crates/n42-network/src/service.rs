@@ -460,6 +460,7 @@ impl NetworkService {
 
     fn handle_gossipsub_message(&self, source: PeerId, message: gossipsub::Message) {
         metrics::counter!("n42_gossipsub_messages_received").increment(1);
+        tracing::info!(target: "n42::net", %source, topic = %message.topic, bytes = message.data.len(), "gossipsub message received");
 
         let acceptance = validate_message(
             &message.topic,

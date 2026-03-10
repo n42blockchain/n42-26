@@ -141,10 +141,10 @@ impl ConsensusEngine {
 
         // If the block was already imported (BlockData arrived before Proposal), vote immediately.
         if self.imported_blocks.remove(&proposal.block_hash) {
-            tracing::debug!(target: "n42::cl::proposal", view, block_hash = %proposal.block_hash, "block already imported, voting immediately");
+            tracing::info!(target: "n42::cl::proposal", view, block_hash = %proposal.block_hash, "block already imported, voting immediately");
             self.send_vote(view, proposal.block_hash)?;
         } else {
-            tracing::debug!(target: "n42::cl::proposal", view, block_hash = %proposal.block_hash, "deferring vote until block data imported");
+            tracing::info!(target: "n42::cl::proposal", view, block_hash = %proposal.block_hash, imported_count = self.imported_blocks.len(), "deferring vote until block data imported");
             self.pending_proposal = Some(PendingProposal {
                 view: proposal.view,
                 block_hash: proposal.block_hash,
@@ -202,6 +202,7 @@ impl ConsensusEngine {
             signature: vote_sig,
         };
 
+        tracing::info!(target: "n42::cl::proposal", view, %block_hash, voter = self.my_index, target_leader = leader, "sending vote to leader");
         self.view_timing.vote_sent = Some(std::time::Instant::now());
         self.emit(EngineOutput::SendToValidator(
             leader,
@@ -217,7 +218,7 @@ impl ConsensusEngine {
     pub(super) fn on_block_imported(&mut self, block_hash: B256) -> ConsensusResult<()> {
         if let Some(pending) = self.pending_proposal.take() {
             if pending.block_hash == block_hash {
-                tracing::debug!(target: "n42::cl::proposal", view = pending.view, %block_hash, "block imported, sending deferred vote");
+                tracing::info!(target: "n42::cl::proposal", view = pending.view, %block_hash, "block imported, sending deferred vote");
                 self.send_vote(pending.view, pending.block_hash)?;
             } else {
                 if self.imported_blocks.len() < MAX_IMPORTED_BLOCKS {

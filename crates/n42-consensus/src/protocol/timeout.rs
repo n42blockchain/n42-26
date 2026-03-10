@@ -20,10 +20,34 @@ impl ConsensusEngine {
         let view = self.round_state.current_view();
 
         if self.round_state.phase() == Phase::TimedOut {
-            // Already timed out in this view: own timeout was already broadcast.
-            // Only reset the pacemaker deadline so the select! loop doesn't spin.
-            tracing::warn!(target: "n42::cl::timeout", view, "view timed out (repeat, resetting pacemaker only)");
+            // Already timed out in this view: reset pacemaker and re-broadcast timeout.
+            // Re-broadcasting ensures validators who missed the first message (network
+            // jitter, late join) can still collect our vote for TC formation.
+            tracing::warn!(target: "n42::cl::timeout", view, "view timed out (repeat, re-broadcasting timeout)");
             self.pacemaker.reset_for_view(view, self.round_state.consecutive_timeouts());
+
+            let message = timeout_signing_message(view);
+            let signature = self.secret_key.sign(&message);
+            let timeout_msg = TimeoutMessage {
+                view,
+                high_qc: self.round_state.locked_qc().clone(),
+                sender: self.my_index,
+                signature,
+            };
+            self.emit(EngineOutput::BroadcastMessage(
+                ConsensusMessage::Timeout(timeout_msg),
+            ))?;
+
+            // Check if quorum was reached while we were waiting (messages may have
+            // arrived between repeats). Only the next leader can form the TC.
+            let quorum_size = self.validator_set().quorum_size();
+            let next_view = view.saturating_add(1);
+            let next_leader = LeaderSelector::leader_for_view(next_view, self.validator_set());
+            if let Some(ref collector) = self.timeout_collector {
+                if collector.has_quorum(quorum_size) && next_leader == self.my_index {
+                    self.try_form_tc_and_advance(view, next_view)?;
+                }
+            }
             return Ok(());
         }
 
@@ -39,7 +63,12 @@ impl ConsensusEngine {
         self.pending_proposal = None;
         self.imported_blocks.clear();
 
-        self.timeout_collector = Some(TimeoutCollector::new(view, self.validator_set().len()));
+        // Preserve any timeouts already collected from validators who timed out before us.
+        // Unconditional replacement would discard those votes, potentially preventing
+        // quorum from ever being reached (permanent stall).
+        let n_validators = self.validator_set().len();
+        self.timeout_collector
+            .get_or_insert_with(|| TimeoutCollector::new(view, n_validators));
 
         let message = timeout_signing_message(view);
         let signature = self.secret_key.sign(&message);

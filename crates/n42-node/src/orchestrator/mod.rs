@@ -119,9 +119,6 @@ pub(crate) struct PipelineTiming {
 }
 
 impl PipelineTiming {
-    fn new_leader() -> Self {
-        Self { created: Instant::now(), is_leader: true, build_complete: None, import_complete: None, committed: None }
-    }
     fn new_follower() -> Self {
         Self { created: Instant::now(), is_leader: false, build_complete: None, import_complete: None, committed: None }
     }
@@ -247,6 +244,9 @@ pub struct ConsensusOrchestrator {
     /// blocks at the same height and flood reth with conflicting `new_payload` calls
     /// — triggering pipeline sync and chain stalls.
     building_on_parent: Option<B256>,
+    /// When the current payload build was triggered. Used to measure actual build duration
+    /// in PipelineTiming (created → build_complete). Reset when build finishes or is cancelled.
+    build_triggered_at: Option<Instant>,
     /// Notifies the orchestrator when a payload resolve task finishes (success or failure).
     /// Used to clear `building_on_parent` so new builds are not permanently blocked
     /// when a resolve task takes longer than the pacemaker timeout.
@@ -277,6 +277,10 @@ pub struct ConsensusOrchestrator {
     /// via new_payload. Prevents multiple eager imports for the same block number
     /// with different hashes, which triggers reth pipeline sync and chain stalls.
     eager_import_block_guard: Arc<std::sync::atomic::AtomicU64>,
+    /// Fast propose mode: skip slot boundary alignment, build immediately after
+    /// ViewChanged/BlockCommitted. Consensus voting naturally paces block production.
+    /// Enabled by `N42_FAST_PROPOSE=1`. Default: false (grid-aligned slots).
+    fast_propose: bool,
 }
 
 impl ConsensusOrchestrator {
@@ -331,6 +335,7 @@ impl ConsensusOrchestrator {
             eager_import_done_rx,
             speculative_build_hash: None,
             building_on_parent: None,
+            build_triggered_at: None,
             build_complete_tx,
             build_complete_rx,
             mobile_reward_manager: None,
@@ -342,6 +347,10 @@ impl ConsensusOrchestrator {
             tx_forward_buffer: Vec::new(),
             pipeline_timings: HashMap::new(),
             eager_import_block_guard: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            fast_propose: std::env::var("N42_FAST_PROPOSE")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0) > 0,
         }
     }
 
@@ -369,8 +378,13 @@ impl ConsensusOrchestrator {
             .unwrap_or(0);
         let slot_time = Duration::from_millis(slot_time_ms);
 
+        let fast_propose = std::env::var("N42_FAST_PROPOSE")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0) > 0;
+
         if slot_time_ms > 0 {
-            info!(target: "n42::cl::orchestrator", slot_time_ms, "wall-clock-aligned slot timing configured");
+            info!(target: "n42::cl::orchestrator", slot_time_ms, fast_propose, "slot timing configured");
         }
 
         Self {
@@ -413,6 +427,7 @@ impl ConsensusOrchestrator {
             eager_import_done_rx,
             speculative_build_hash: None,
             building_on_parent: None,
+            build_triggered_at: None,
             build_complete_tx,
             build_complete_rx,
             mobile_reward_manager: None,
@@ -424,6 +439,7 @@ impl ConsensusOrchestrator {
             tx_forward_buffer: Vec::new(),
             pipeline_timings: HashMap::new(),
             eager_import_block_guard: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            fast_propose,
         }
     }
 
@@ -522,7 +538,14 @@ impl ConsensusOrchestrator {
             };
             tokio::pin!(tx_flush_timer);
 
+            // Biased select: consensus-critical channels are checked FIRST.
+            // Without biased, tokio randomly permutes branch order on each poll,
+            // causing consensus votes to compete with high-frequency TX events.
+            // Under 20K+ TPS, this random scheduling delays R1_collect by 500-1000ms.
             tokio::select! {
+                biased;
+
+                // === Priority 1: Safety-critical ===
                 _ = &mut timeout => {
                     let view = self.engine.current_view();
                     counter!("n42_view_timeouts_total").increment(1);
@@ -543,16 +566,7 @@ impl ConsensusOrchestrator {
                     }
                 }
 
-                event = self.net_event_rx.recv() => {
-                    match event {
-                        Some(ev) => self.handle_network_event(ev).await,
-                        None => {
-                            info!(target: "n42::cl::orchestrator", "network event channel closed, shutting down orchestrator");
-                            break;
-                        }
-                    }
-                }
-
+                // === Priority 2: Consensus engine outputs (Vote broadcast, ViewChanged, Decide) ===
                 output = self.output_rx.recv() => {
                     match output {
                         Some(engine_output) => self.handle_engine_output(engine_output).await,
@@ -563,17 +577,34 @@ impl ConsensusOrchestrator {
                     }
                 }
 
+                // === Priority 3: Network events (incoming votes, proposals, block data) ===
+                event = self.net_event_rx.recv() => {
+                    match event {
+                        Some(ev) => self.handle_network_event(ev).await,
+                        None => {
+                            info!(target: "n42::cl::orchestrator", "network event channel closed, shutting down orchestrator");
+                            break;
+                        }
+                    }
+                }
+
+                // === Priority 4: Block build completion ===
                 block_hash = self.block_ready_rx.recv() => {
                     if let Some(hash) = block_hash {
                         // Build succeeded — clear the parent guard immediately so future
                         // builds for the same parent (after view change) are not blocked.
                         self.building_on_parent = None;
 
-                        // Pipeline: leader build complete — record timing.
-                        // `created` is set now (build + broadcast finished);
-                        // `build_complete` also set immediately since the build just resolved.
-                        let mut timing = PipelineTiming::new_leader();
-                        timing.build_complete = Some(Instant::now());
+                        // Pipeline: leader build complete — use build_triggered_at as the
+                        // starting point so build duration is accurately measured.
+                        let now = Instant::now();
+                        let timing = PipelineTiming {
+                            created: self.build_triggered_at.take().unwrap_or(now),
+                            is_leader: true,
+                            build_complete: Some(now),
+                            import_complete: None,
+                            committed: None,
+                        };
                         self.record_pipeline_timing(hash, timing);
 
                         info!(target: "n42::cl::orchestrator", %hash, view = self.engine.current_view(), "payload built, feeding BlockReady to consensus");
@@ -585,52 +616,10 @@ impl ConsensusOrchestrator {
                     }
                 }
 
-                tx_data = async {
-                    match self.tx_broadcast_rx.as_mut() {
-                        Some(rx) => rx.recv().await,
-                        None => std::future::pending().await,
-                    }
-                } => {
-                    // TX Forward to Leader: instead of GossipSub broadcast, buffer txs
-                    // and forward to the current leader in batches.
-                    if let Some(data) = tx_data {
-                        self.tx_forward_buffer.push(data);
-                    }
-                    // Batch-drain up to 63 more from the channel.
-                    if let Some(rx) = self.tx_broadcast_rx.as_mut() {
-                        for _ in 0..63 {
-                            match rx.try_recv() {
-                                Ok(data) => { self.tx_forward_buffer.push(data); }
-                                Err(_) => break,
-                            }
-                        }
-                    }
-                    // Flush if buffer is large enough.
-                    if self.tx_forward_buffer.len() >= 64 {
-                        self.flush_tx_forward_buffer();
-                    }
-                }
-
-                payload_data = self.leader_payload_rx.recv() => {
-                    if let Some((hash, data)) = payload_data {
-                        self.handle_leader_payload_feedback(hash, data).await;
-                    }
-                }
-
+                // === Priority 5: Import and build lifecycle ===
                 import_result = self.import_done_rx.recv() => {
                     if let Some((hash, view, success, block_ts)) = import_result {
                         self.handle_import_done(hash, view, success, block_ts).await;
-                    }
-                }
-
-                _ = self.build_complete_rx.recv() => {
-                    // Payload resolve task finished (success or failure).
-                    // Clear the parent guard so future builds are not permanently blocked.
-                    // On success, block_ready_rx already cleared it; this handles failure paths
-                    // (build error, timeout, panic) where no BlockReady signal is sent.
-                    if self.building_on_parent.is_some() {
-                        debug!(target: "n42::cl::orchestrator", "build task completed, clearing building_on_parent guard");
-                        self.building_on_parent = None;
                     }
                 }
 
@@ -644,10 +633,25 @@ impl ConsensusOrchestrator {
                     }
                 }
 
-                _ = &mut tx_flush_timer => {
-                    self.flush_tx_forward_buffer();
+                payload_data = self.leader_payload_rx.recv() => {
+                    if let Some((hash, data)) = payload_data {
+                        self.handle_leader_payload_feedback(hash, data).await;
+                    }
                 }
 
+                _ = self.build_complete_rx.recv() => {
+                    // Payload resolve task finished (success or failure).
+                    // Clear the parent guard so future builds are not permanently blocked.
+                    // On success, block_ready_rx already cleared it; this handles failure paths
+                    // (build error, timeout, panic) where no BlockReady signal is sent.
+                    if self.building_on_parent.is_some() {
+                        debug!(target: "n42::cl::orchestrator", "build task completed, clearing building_on_parent guard");
+                        self.building_on_parent = None;
+                        self.build_triggered_at = None;
+                    }
+                }
+
+                // === Priority 6: Slot timing ===
                 _ = &mut build_timer => {
                     let slot_ts = self.next_slot_timestamp.take();
                     self.next_build_at = None;
@@ -676,6 +680,48 @@ impl ConsensusOrchestrator {
 
                     self.do_trigger_payload_build(slot_ts).await;
                 }
+
+                // === Priority 7: TX forwarding (lowest priority) ===
+                // Under high load, TX events fire thousands of times per second.
+                // Deferring them ensures consensus votes are never delayed by TX buffering.
+                tx_data = async {
+                    match self.tx_broadcast_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    // TX Forward to Leader: instead of GossipSub broadcast, buffer txs
+                    // and forward to the current leader in batches.
+                    if let Some(data) = tx_data {
+                        self.tx_forward_buffer.push(data);
+                    }
+                    // Batch-drain up to 63 more from the channel.
+                    if let Some(rx) = self.tx_broadcast_rx.as_mut() {
+                        for _ in 0..63 {
+                            match rx.try_recv() {
+                                Ok(data) => { self.tx_forward_buffer.push(data); }
+                                Err(_) => break,
+                            }
+                        }
+                    }
+                    // Flush if buffer is large enough.
+                    if self.tx_forward_buffer.len() >= 64 {
+                        self.flush_tx_forward_buffer();
+                    }
+                }
+
+                _ = &mut tx_flush_timer => {
+                    self.flush_tx_forward_buffer();
+                }
+
+            }
+
+            // Eagerly drain all pending consensus engine outputs after each iteration.
+            // The consensus engine can emit multiple outputs per event (e.g., Vote +
+            // ViewChanged). Processing them immediately avoids waiting for the next
+            // select! iteration, which may be delayed by lower-priority branches.
+            while let Ok(engine_output) = self.output_rx.try_recv() {
+                self.handle_engine_output(engine_output).await;
             }
         }
 
@@ -780,13 +826,27 @@ impl ConsensusOrchestrator {
         match event {
             NetworkEvent::ConsensusMessage { source: _, message } => {
                 counter!("n42_consensus_messages_received").increment(1);
-                if let Err(e) = self.engine.process_event(
+                use n42_primitives::ConsensusMessage as CM;
+                let msg_type = match message.as_ref() {
+                    CM::Proposal(_) => "Proposal",
+                    CM::Vote(_) => "Vote",
+                    CM::CommitVote(_) => "CommitVote",
+                    CM::Timeout(_) => "Timeout",
+                    CM::NewView(_) => "NewView",
+                    CM::Decide(_) => "Decide",
+                    _ => "Other",
+                };
+                debug!(target: "n42::cl::orchestrator", msg_type, view = self.engine.current_view(), "processing consensus message");
+                match self.engine.process_event(
                     n42_consensus::ConsensusEvent::Message(*message)
                 ) {
-                    if matches!(e, n42_consensus::N42ConsensusError::SafetyViolation { .. }) {
-                        debug!(target: "n42::cl::orchestrator", error = %e, "benign safety check (QC ordering race)");
-                    } else {
-                        warn!(target: "n42::cl::orchestrator", error = %e, "error processing consensus message");
+                    Ok(()) => {}
+                    Err(e) => {
+                        if matches!(e, n42_consensus::N42ConsensusError::SafetyViolation { .. }) {
+                            debug!(target: "n42::cl::orchestrator", error = %e, "benign safety check (QC ordering race)");
+                        } else {
+                            warn!(target: "n42::cl::orchestrator", error = %e, "error processing consensus message");
+                        }
                     }
                 }
             }

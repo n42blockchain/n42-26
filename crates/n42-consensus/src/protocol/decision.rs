@@ -60,6 +60,12 @@ impl ConsensusEngine {
 
         tracing::info!(target: "n42::cl::decision", view = decide.view, %decide.block_hash, "received Decide, committing block");
 
+        // Record the moment the follower learned the block is committed.
+        // Without this, advance_to_view() skips saving view_timing (it requires
+        // commit_qc_formed to be set), causing the orchestrator's consensus_timing
+        // log to show stale data from this node's last leader view.
+        self.view_timing.commit_qc_formed = Some(std::time::Instant::now());
+
         self.round_state.update_locked_qc(&decide.commit_qc);
         self.round_state.commit(decide.commit_qc.clone());
 
