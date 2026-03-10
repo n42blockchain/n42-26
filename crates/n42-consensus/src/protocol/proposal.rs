@@ -5,7 +5,7 @@ use crate::error::{ConsensusError, ConsensusResult};
 use crate::validator::LeaderSelector;
 use super::quorum::{commit_signing_message, signing_message};
 use super::round::Phase;
-use super::state_machine::{ConsensusEngine, EngineOutput, PendingProposal};
+use super::state_machine::{ConsensusEngine, EngineOutput};
 
 const MAX_IMPORTED_BLOCKS: usize = 64;
 
@@ -137,19 +137,25 @@ impl ConsensusEngine {
 
         self.round_state.enter_voting();
         self.view_timing.proposal_received = Some(std::time::Instant::now());
+
+        // Trigger eager import in background (needed for finalization).
         self.emit(EngineOutput::ExecuteBlock(proposal.block_hash))?;
 
-        // If the block was already imported (BlockData arrived before Proposal), vote immediately.
-        if self.imported_blocks.remove(&proposal.block_hash) {
-            tracing::info!(target: "n42::cl::proposal", view, block_hash = %proposal.block_hash, "block already imported, voting immediately");
-            self.send_vote(view, proposal.block_hash)?;
-        } else {
-            tracing::info!(target: "n42::cl::proposal", view, block_hash = %proposal.block_hash, imported_count = self.imported_blocks.len(), "deferring vote until block data imported");
-            self.pending_proposal = Some(PendingProposal {
-                view: proposal.view,
-                block_hash: proposal.block_hash,
-            });
-        }
+        // Optimistic Voting: vote immediately after Proposal validation.
+        //
+        // R1 vote signs (view, block_hash) — it does NOT commit to block validity.
+        // The Proposal has already been fully verified: leader identity, BLS signature,
+        // justify_qc aggregate signature, and HotStuff-2 safety rules.
+        //
+        // Block validity (EVM execution) is verified during finalization:
+        //   - new_payload validates the block in reth's engine tree
+        //   - FCU commits it to the canonical chain
+        //   - If invalid: FCU fails → view change recovers
+        //
+        // This eliminates the ~300-500ms vote_delay caused by waiting for BlockData
+        // arrival and new_payload completion before voting.
+        tracing::info!(target: "n42::cl::proposal", view, block_hash = %proposal.block_hash, "optimistic vote: voting immediately after proposal validation");
+        self.send_vote(view, proposal.block_hash)?;
 
         Ok(())
     }
@@ -212,21 +218,11 @@ impl ConsensusEngine {
 
     /// Handles the BlockImported event from the orchestrator.
     ///
-    /// Supports two arrival orders (reference: Aptos Baby Raptr):
-    /// 1. Proposal first, BlockData later — pending_proposal is set — vote now.
-    /// 2. BlockData first, Proposal later — cache in imported_blocks — vote when Proposal arrives.
+    /// With Optimistic Voting, R1 votes are sent immediately upon Proposal validation
+    /// (no waiting for BlockData). This handler only tracks imported blocks for
+    /// diagnostics and eager import coordination.
     pub(super) fn on_block_imported(&mut self, block_hash: B256) -> ConsensusResult<()> {
-        if let Some(pending) = self.pending_proposal.take() {
-            if pending.block_hash == block_hash {
-                tracing::info!(target: "n42::cl::proposal", view = pending.view, %block_hash, "block imported, sending deferred vote");
-                self.send_vote(pending.view, pending.block_hash)?;
-            } else {
-                if self.imported_blocks.len() < MAX_IMPORTED_BLOCKS {
-                    self.imported_blocks.insert(block_hash);
-                }
-                self.pending_proposal = Some(pending);
-            }
-        } else if self.imported_blocks.len() < MAX_IMPORTED_BLOCKS {
+        if self.imported_blocks.len() < MAX_IMPORTED_BLOCKS {
             self.imported_blocks.insert(block_hash);
         }
         Ok(())

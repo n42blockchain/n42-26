@@ -191,6 +191,9 @@ pub(crate) struct CommittedBlock {
 pub struct ConsensusOrchestrator {
     engine: ConsensusEngine,
     network: NetworkHandle,
+    /// High-priority: consensus messages only (Vote, Proposal, PrepareQC, etc.)
+    consensus_event_rx: mpsc::Receiver<NetworkEvent>,
+    /// Lower-priority: data events (BlockData, TX, Sync, Peers)
     net_event_rx: mpsc::Receiver<NetworkEvent>,
     output_rx: mpsc::Receiver<EngineOutput>,
     beacon_engine: Option<ConsensusEngineHandle<EthEngineTypes>>,
@@ -290,6 +293,8 @@ impl ConsensusOrchestrator {
         net_event_rx: mpsc::Receiver<NetworkEvent>,
         output_rx: mpsc::Receiver<EngineOutput>,
     ) -> Self {
+        // Tests use this constructor; create a dummy consensus channel.
+        let (_dummy_tx, consensus_event_rx) = mpsc::channel(1);
         let (block_ready_tx, block_ready_rx) = mpsc::unbounded_channel();
         let (leader_payload_tx, leader_payload_rx) = mpsc::unbounded_channel();
         let (import_done_tx, import_done_rx) = mpsc::unbounded_channel();
@@ -298,6 +303,7 @@ impl ConsensusOrchestrator {
         Self {
             engine,
             network,
+            consensus_event_rx,
             net_event_rx,
             output_rx,
             beacon_engine: None,
@@ -358,6 +364,7 @@ impl ConsensusOrchestrator {
     pub fn with_engine_api(
         engine: ConsensusEngine,
         network: NetworkHandle,
+        consensus_event_rx: mpsc::Receiver<NetworkEvent>,
         net_event_rx: mpsc::Receiver<NetworkEvent>,
         output_rx: mpsc::Receiver<EngineOutput>,
         beacon_engine: ConsensusEngineHandle<EthEngineTypes>,
@@ -390,6 +397,7 @@ impl ConsensusOrchestrator {
         Self {
             engine,
             network,
+            consensus_event_rx,
             net_event_rx,
             output_rx,
             beacon_engine: Some(beacon_engine),
@@ -577,13 +585,15 @@ impl ConsensusOrchestrator {
                     }
                 }
 
-                // === Priority 3: Network events (incoming votes, proposals, block data) ===
-                event = self.net_event_rx.recv() => {
+                // === Priority 3: Consensus network events (high-priority, dedicated channel) ===
+                // Consensus messages (votes, proposals, QCs) are routed to a separate channel
+                // so they are never queued behind high-volume TX/BlockData events.
+                event = self.consensus_event_rx.recv() => {
                     match event {
                         Some(ev) => self.handle_network_event(ev).await,
                         None => {
-                            info!(target: "n42::cl::orchestrator", "network event channel closed, shutting down orchestrator");
-                            break;
+                            // Consensus channel closed is not fatal — may be observer mode
+                            debug!(target: "n42::cl::orchestrator", "consensus event channel closed");
                         }
                     }
                 }
@@ -616,7 +626,20 @@ impl ConsensusOrchestrator {
                     }
                 }
 
-                // === Priority 5: Import and build lifecycle ===
+                // === Priority 5: Data network events (TX forward, block data, sync, peers) ===
+                // Lower priority than consensus — under high TPS these fire thousands of
+                // times per second but should never delay vote/proposal processing.
+                event = self.net_event_rx.recv() => {
+                    match event {
+                        Some(ev) => self.handle_network_event(ev).await,
+                        None => {
+                            info!(target: "n42::cl::orchestrator", "network event channel closed, shutting down orchestrator");
+                            break;
+                        }
+                    }
+                }
+
+                // === Priority 6: Import and build lifecycle ===
                 import_result = self.import_done_rx.recv() => {
                     if let Some((hash, view, success, block_ts)) = import_result {
                         self.handle_import_done(hash, view, success, block_ts).await;
@@ -651,7 +674,7 @@ impl ConsensusOrchestrator {
                     }
                 }
 
-                // === Priority 6: Slot timing ===
+                // === Priority 7: Slot timing ===
                 _ = &mut build_timer => {
                     let slot_ts = self.next_slot_timestamp.take();
                     self.next_build_at = None;
@@ -681,7 +704,7 @@ impl ConsensusOrchestrator {
                     self.do_trigger_payload_build(slot_ts).await;
                 }
 
-                // === Priority 7: TX forwarding (lowest priority) ===
+                // === Priority 8: TX forwarding (lowest priority) ===
                 // Under high load, TX events fire thousands of times per second.
                 // Deferring them ensures consensus votes are never delayed by TX buffering.
                 tx_data = async {

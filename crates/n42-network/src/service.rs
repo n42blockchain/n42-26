@@ -191,6 +191,9 @@ pub struct NetworkService {
     command_rx: mpsc::UnboundedReceiver<NetworkCommand>,
     /// High-priority commands (block data, consensus) — drained before `command_rx`.
     priority_rx: mpsc::UnboundedReceiver<NetworkCommand>,
+    /// High-priority channel for consensus messages (Vote, Proposal, PrepareQC, etc.).
+    consensus_event_tx: mpsc::Sender<NetworkEvent>,
+    /// Lower-priority channel for data events (BlockData, TX, Sync, Peers).
     event_tx: mpsc::Sender<NetworkEvent>,
     consensus_topic_hash: gossipsub::TopicHash,
     block_announce_topic_hash: gossipsub::TopicHash,
@@ -210,12 +213,18 @@ pub struct NetworkService {
 }
 
 impl NetworkService {
-    /// Creates a new network service. Returns the service, a handle, and event receiver.
+    /// Creates a new network service. Returns the service, a handle, a consensus event
+    /// receiver (high-priority), and a data event receiver (lower-priority).
+    ///
+    /// Splitting the channels ensures that consensus messages (Vote, Proposal, CommitVote,
+    /// PrepareQC, Decide, Timeout, NewView) are never queued behind high-volume data
+    /// events (TxForward, BlockAnnouncement, TransactionReceived).
     pub fn new(
         mut swarm: Swarm<N42Behaviour>,
-    ) -> Result<(Self, NetworkHandle, mpsc::Receiver<NetworkEvent>), NetworkError> {
+    ) -> Result<(Self, NetworkHandle, mpsc::Receiver<NetworkEvent>, mpsc::Receiver<NetworkEvent>), NetworkError> {
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let (priority_tx, priority_rx) = mpsc::unbounded_channel();
+        let (consensus_event_tx, consensus_event_rx) = mpsc::channel(2048);
         let (event_tx, event_rx) = mpsc::channel(8192);
 
         // TX gossip is disabled by default (TX Forward to Leader replaces it).
@@ -262,6 +271,7 @@ impl NetworkService {
             swarm,
             command_rx,
             priority_rx,
+            consensus_event_tx,
             event_tx,
             consensus_topic_hash,
             block_announce_topic_hash,
@@ -276,7 +286,7 @@ impl NetworkService {
             tx_gossip_disabled,
         };
 
-        Ok((service, handle, event_rx))
+        Ok((service, handle, consensus_event_rx, event_rx))
     }
 
     pub fn listen_on(&mut self, addr: Multiaddr) -> Result<(), NetworkError> {
@@ -737,12 +747,19 @@ impl NetworkService {
         }
     }
 
-    /// Sends a network event to the node layer.
+    /// Sends a network event to the node layer via the appropriate channel.
     ///
-    /// Distinguishes backpressure (Full → warn + drop) from shutdown (Closed → warn).
-    /// The main loop exits via `command_rx` closure, so no return value is needed.
+    /// Consensus messages AND block data go to the high-priority channel so they
+    /// are never delayed by high-volume TX events in the data channel.
+    /// BlockData is critical for follower import pipeline — deprioritizing it
+    /// delays block import → delays voting → delays commit.
     fn emit_event(&self, event: NetworkEvent) {
-        match self.event_tx.try_send(event) {
+        let tx = if matches!(event, NetworkEvent::ConsensusMessage { .. } | NetworkEvent::BlockAnnouncement { .. }) {
+            &self.consensus_event_tx
+        } else {
+            &self.event_tx
+        };
+        match tx.try_send(event) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => {
                 metrics::counter!("n42_network_event_drops_total").increment(1);

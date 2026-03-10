@@ -352,7 +352,7 @@ fn main() {
                         build_swarm_with_validator_index(keypair, transport_config, None)
                             .expect("Failed to build libp2p swarm");
 
-                    let (mut net_service, net_handle, net_event_rx) =
+                    let (mut net_service, net_handle, _consensus_event_rx, net_event_rx) =
                         NetworkService::new(swarm).expect("Failed to create NetworkService");
 
                     let consensus_port: u16 = env_parse("N42_CONSENSUS_PORT").unwrap_or(9400);
@@ -409,7 +409,7 @@ fn main() {
                     build_swarm_with_validator_index(keypair, transport_config, Some(my_index))
                         .expect("Failed to build libp2p swarm");
 
-                let (mut net_service, net_handle, net_event_rx) =
+                let (mut net_service, net_handle, consensus_event_rx, net_event_rx) =
                     NetworkService::new(swarm).expect("Failed to create NetworkService");
 
                 let consensus_port: u16 = env_parse("N42_CONSENSUS_PORT").unwrap_or(9400);
@@ -674,14 +674,27 @@ fn main() {
                 let (tx_import_tx, tx_import_rx) = mpsc::channel::<Vec<u8>>(4096);
                 let (tx_broadcast_tx, tx_broadcast_rx) = mpsc::channel::<Vec<u8>>(4096);
 
-                task_executor.spawn_critical_task(
-                    "n42-tx-pool-bridge",
-                    Box::pin(
-                        TxPoolBridge::new(full_node.pool.clone(), tx_import_rx, tx_broadcast_tx)
-                            .run(),
-                    ),
-                );
-                info!(target: "n42::cli", "TxPoolBridge started for P2P mempool sync");
+                // Run TxPoolBridge on a dedicated runtime to isolate TX pool
+                // ingestion from the consensus event loop. Under high TPS, pool
+                // operations (validation, nonce checks) consume significant CPU
+                // and would otherwise compete with consensus message processing.
+                let pool_for_bridge = full_node.pool.clone();
+                std::thread::Builder::new()
+                    .name("n42-tx-pool-bridge".into())
+                    .spawn(move || {
+                        let rt = tokio::runtime::Builder::new_multi_thread()
+                            .worker_threads(2)
+                            .thread_name("tx-bridge-worker")
+                            .enable_all()
+                            .build()
+                            .expect("failed to create tx-bridge runtime");
+                        rt.block_on(
+                            TxPoolBridge::new(pool_for_bridge, tx_import_rx, tx_broadcast_tx)
+                                .run(),
+                        );
+                    })
+                    .expect("failed to spawn tx-bridge thread");
+                info!(target: "n42::cli", "TxPoolBridge started on dedicated runtime");
 
                 // Load epoch schedule from $N42_DATA_DIR/epoch_schedule.json (optional).
                 let epoch_schedule_path = data_dir.join("epoch_schedule.json");
@@ -712,6 +725,7 @@ fn main() {
                 let mut orchestrator = ConsensusOrchestrator::with_engine_api(
                     consensus_engine,
                     net_handle,
+                    consensus_event_rx,
                     net_event_rx,
                     output_rx,
                     beacon_engine_handle,

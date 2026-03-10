@@ -156,8 +156,10 @@ pub enum EngineOutput {
     },
 }
 
-/// Pending proposal awaiting block data import before voting (follower path).
+/// Pending proposal state (retained for timeout cleanup; with optimistic voting,
+/// R1 votes are sent immediately and this struct is rarely populated).
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub(super) struct PendingProposal {
     pub(super) view: ViewNumber,
     pub(super) block_hash: B256,
@@ -855,7 +857,7 @@ mod tests {
     }
 
     #[test]
-    fn test_engine_valid_proposal_defers_vote() {
+    fn test_engine_valid_proposal_votes_immediately() {
         use crate::protocol::quorum::signing_message;
         let (mut engine, sks, _, mut rx) = make_engine(4, 0);
 
@@ -881,22 +883,9 @@ mod tests {
             outputs.push(output);
         }
 
+        // Optimistic Voting: vote is sent immediately with the Proposal, no BlockData wait.
         assert!(outputs.iter().any(|o| matches!(o, EngineOutput::ExecuteBlock(h) if *h == block_hash)));
-        assert!(!outputs.iter().any(|o| matches!(o, EngineOutput::SendToValidator(_, ConsensusMessage::Vote(_)))));
-        assert!(engine.pending_proposal.is_some());
-
-        // BlockImported triggers the deferred vote.
-        engine
-            .process_event(ConsensusEvent::BlockImported(block_hash))
-            .expect("BlockImported should succeed");
-
-        let mut outputs = vec![];
-        while let Ok(output) = rx.try_recv() {
-            outputs.push(output);
-        }
-
         assert!(outputs.iter().any(|o| matches!(o, EngineOutput::SendToValidator(_, ConsensusMessage::Vote(_)))));
-        assert!(engine.pending_proposal.is_none());
     }
 
     #[test]
@@ -930,13 +919,12 @@ mod tests {
             outputs.push(output);
         }
 
+        // Optimistic Voting: vote sent immediately regardless of BlockData status.
         assert!(outputs.iter().any(|o| matches!(o, EngineOutput::SendToValidator(_, ConsensusMessage::Vote(_)))));
-        assert!(engine.pending_proposal.is_none());
-        assert!(!engine.imported_blocks.contains(&block_hash));
     }
 
     #[test]
-    fn test_engine_timeout_clears_pending_proposal() {
+    fn test_engine_timeout_clears_state() {
         use crate::protocol::quorum::signing_message;
         let (mut engine, sks, _, mut rx) = make_engine(4, 0);
         let block_hash = B256::repeat_byte(0xEE);
@@ -955,10 +943,10 @@ mod tests {
             .expect("proposal should succeed");
         while rx.try_recv().is_ok() {}
 
-        assert!(engine.pending_proposal.is_some());
-
+        // With optimistic voting, vote was already sent. Timeout still clears state.
         engine.on_timeout().expect("timeout should succeed");
         assert!(engine.pending_proposal.is_none());
+        assert!(engine.imported_blocks.is_empty());
     }
 
     #[test]
@@ -1404,35 +1392,16 @@ mod tests {
     }
 
     #[test]
-    fn test_block_imported_hash_mismatch_caches_and_restores() {
-        use crate::protocol::quorum::signing_message;
-
-        let (mut engine, sks, _, mut rx) = make_engine(4, 0);
-        let proposal_hash = B256::repeat_byte(0xAA);
-        let other_hash = B256::repeat_byte(0xBB);
-
-        let msg = signing_message(1, &proposal_hash);
-        let proposal = n42_primitives::consensus::Proposal {
-            view: 1,
-            block_hash: proposal_hash,
-            justify_qc: QuorumCertificate::genesis(),
-            proposer: 1,
-            signature: sks[1].sign(&msg),
-            prepare_qc: None,
-        };
-        engine
-            .process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(proposal)))
-            .expect("proposal should succeed");
-        while rx.try_recv().is_ok() {}
-        assert!(engine.pending_proposal.is_some());
+    fn test_block_imported_caches_hash() {
+        let (mut engine, _sks, _, _rx) = make_engine(4, 0);
+        let hash = B256::repeat_byte(0xBB);
 
         engine
-            .process_event(ConsensusEvent::BlockImported(other_hash))
-            .expect("mismatched BlockImported should succeed");
+            .process_event(ConsensusEvent::BlockImported(hash))
+            .expect("BlockImported should succeed");
 
-        assert!(engine.pending_proposal.is_some());
-        assert_eq!(engine.pending_proposal.as_ref().unwrap().block_hash, proposal_hash);
-        assert!(engine.imported_blocks.contains(&other_hash));
+        // With optimistic voting, on_block_imported simply tracks the hash.
+        assert!(engine.imported_blocks.contains(&hash));
     }
 
     #[test]
