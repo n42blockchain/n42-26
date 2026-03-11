@@ -98,10 +98,10 @@ index 343a6ca5b6..f54c6c8390 100644
  name = "sketches-ddsketch"
  version = "0.3.1"
 diff --git a/crates/engine/tree/src/tree/payload_validator.rs b/crates/engine/tree/src/tree/payload_validator.rs
-index f97bc0bf3a..c6aa006734 100644
+index f97bc0bf3a..f83fdad94a 100644
 --- a/crates/engine/tree/src/tree/payload_validator.rs
 +++ b/crates/engine/tree/src/tree/payload_validator.rs
-@@ -459,12 +459,28 @@ where
+@@ -459,12 +459,32 @@ where
              withdrawals: input.withdrawals().map(|w| w.to_vec()),
          };
  
@@ -118,7 +118,11 @@ index f97bc0bf3a..c6aa006734 100644
 -        let strategy = self.plan_state_root_computation();
 +        // Force Synchronous on cache hit: StateRootTask expects execution updates via
 +        // channels, but we skip EVM, so it would timeout (~1s waste).
-+        let strategy = if is_cache_hit {
++        // Force Synchronous on skip/defer state root: StateRootTask spawns 20 proof worker
++        // threads per block, but the result is discarded when state root is skipped/deferred.
++        // On single-machine testnets this causes thread storms (30K+ thread spawns).
++        let n42_skip_root = reth_evm::n42_skip_state_root() || reth_evm::n42_defer_state_root();
++        let strategy = if is_cache_hit || n42_skip_root {
 +            StateRootStrategy::Synchronous
 +        } else {
 +            self.plan_state_root_computation()
@@ -131,7 +135,7 @@ index f97bc0bf3a..c6aa006734 100644
              "Decided which state root algorithm to run"
          );
  
-@@ -527,12 +543,37 @@ where
+@@ -527,12 +547,37 @@ where
          // The receipt root task is spawned before execution and receives receipts incrementally
          // as transactions complete, allowing parallel computation during execution.
          let execute_block_start = Instant::now();
@@ -171,7 +175,7 @@ index f97bc0bf3a..c6aa006734 100644
  
          // After executing the block we can stop prewarming transactions
          handle.stop_prewarming_execution();
-@@ -614,6 +655,28 @@ where
+@@ -614,6 +659,28 @@ where
          );
  
          let root_time = Instant::now();
@@ -200,7 +204,7 @@ index f97bc0bf3a..c6aa006734 100644
          let mut maybe_state_root = None;
          let mut state_root_task_failed = false;
          #[cfg(feature = "trie-debug")]
-@@ -736,13 +799,25 @@ where
+@@ -736,13 +803,25 @@ where
              (root, Arc::new(updates), root_time.elapsed())
          };
  
