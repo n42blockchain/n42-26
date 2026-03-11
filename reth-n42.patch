@@ -1,19 +1,3 @@
-# N42 patches on reth (commit e63ebac380)
-# Base: v1.11.0-397-ge63ebac380 (post v1.11.2)
-#
-# Apply:
-#   cd reth && git checkout e63ebac380 && git apply ../n42-26/reth-n42.patch
-#
-# Changes:
-#   1. Payload cache (dual-slot: leader self-import + compact block broadcast)
-#   2. Leader payload packing instrumentation (N42_PAYLOAD_PACK/FINISH logs)
-#   3. N42_SKIP_STATE_ROOT: benchmark mode, skip state root entirely
-#   4. N42_DEFER_STATE_ROOT: defer state root from consensus critical path (B256::ZERO placeholder)
-#   5. N42_SKIP_TX_VERIFY: skip transaction signature verification in pool
-#   6. Pool OrdMap: im::OrdMap replaces BTreeMap for O(log n) clone in pending pool
-#   7. Packing optimizations: no_updates(), skip RLP length, defer to_consensus()
-#   8. Gas limit override via N42_GAS_LIMIT env var
-#
 diff --git a/Cargo.lock b/Cargo.lock
 index 343a6ca5b6..f54c6c8390 100644
 --- a/Cargo.lock
@@ -569,6 +553,77 @@ index ee19f749b3..89f39caa82 100644
  #[cfg(any(test, feature = "test-utils"))]
  /// test helpers for mocking executor
  pub mod test_utils;
+diff --git a/crates/evm/evm/src/payload_cache.rs b/crates/evm/evm/src/payload_cache.rs
+new file mode 100644
+index 0000000000..5d086f2e4b
+--- /dev/null
++++ b/crates/evm/evm/src/payload_cache.rs
+@@ -0,0 +1,65 @@
++//! Global single-entry cache for leader payload execution results.
++//!
++//! When the payload builder (leader) finishes building a block, it caches
++//! the execution output here. When `validate_block_with_state` (new_payload)
++//! processes the same block, it can skip EVM re-execution by retrieving the
++//! cached result.
++//!
++//! Two cache slots exist:
++//! - `CACHE`: consumed by the leader's own `new_payload` (take semantics)
++//! - `BROADCAST_CACHE`: consumed by `handle_built_payload` for serialization
++//!   to followers (Compact Block). Separated so the leader's `take` doesn't
++//!   consume the data needed for broadcast.
++
++use alloy_primitives::B256;
++use std::any::Any;
++use std::sync::{Mutex, OnceLock};
++
++struct CachedPayload {
++    block_hash: B256,
++    data: Box<dyn Any + Send + Sync>,
++}
++
++type CacheSlot = OnceLock<Mutex<Option<CachedPayload>>>;
++
++static CACHE: CacheSlot = OnceLock::new();
++
++/// Secondary cache for broadcast to followers (Compact Block).
++static BROADCAST_CACHE: CacheSlot = OnceLock::new();
++
++fn store(slot: &CacheSlot, block_hash: B256, data: impl Any + Send + Sync + 'static) {
++    let cache = slot.get_or_init(|| Mutex::new(None));
++    *cache.lock().unwrap() = Some(CachedPayload { block_hash, data: Box::new(data) });
++}
++
++fn take<T: 'static>(slot: &CacheSlot, block_hash: &B256) -> Option<T> {
++    let cache = slot.get_or_init(|| Mutex::new(None));
++    let mut guard = cache.lock().unwrap();
++    if let Some(entry) = guard.as_ref() {
++        if &entry.block_hash == block_hash {
++            let entry = guard.take().unwrap();
++            return entry.data.downcast::<T>().ok().map(|b| *b);
++        }
++    }
++    None
++}
++
++/// Store payload execution data keyed by block hash (for leader's own new_payload).
++pub fn store_payload_execution(block_hash: B256, data: impl Any + Send + Sync + 'static) {
++    store(&CACHE, block_hash, data);
++}
++
++/// Take (remove) the cached payload execution data if the block hash matches.
++pub fn take_payload_execution<T: 'static>(block_hash: &B256) -> Option<T> {
++    take::<T>(&CACHE, block_hash)
++}
++
++/// Store a clone of execution data for broadcast to followers (Compact Block).
++pub fn store_broadcast_execution(block_hash: B256, data: impl Any + Send + Sync + 'static) {
++    store(&BROADCAST_CACHE, block_hash, data);
++}
++
++/// Take broadcast execution data if block hash matches.
++pub fn take_broadcast_execution<T: 'static>(block_hash: &B256) -> Option<T> {
++    take::<T>(&BROADCAST_CACHE, block_hash)
++}
 diff --git a/crates/rpc/rpc-eth-types/src/utils.rs b/crates/rpc/rpc-eth-types/src/utils.rs
 index 5df161d33b..f53429864c 100644
 --- a/crates/rpc/rpc-eth-types/src/utils.rs
