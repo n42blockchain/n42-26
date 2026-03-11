@@ -802,6 +802,26 @@ impl ConsensusOrchestrator {
         if self.tx_forward_buffer.is_empty() {
             return;
         }
+
+        // N42_DISABLE_TX_FORWARD=1: keep txs in local pool only (for sync inject benchmarks).
+        // Txs are still accepted into the local pool but never forwarded to leader.
+        static DISABLE_TX_FORWARD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let disabled = *DISABLE_TX_FORWARD.get_or_init(|| {
+            std::env::var("N42_DISABLE_TX_FORWARD").map(|v| v == "1").unwrap_or(false)
+        });
+        if disabled {
+            // Feed all buffered txs into local pool and return (no forwarding).
+            if let Some(ref tx_import) = self.tx_import_tx {
+                let txs = std::mem::take(&mut self.tx_forward_buffer);
+                for data in txs {
+                    let _ = tx_import.try_send(data);
+                }
+            } else {
+                self.tx_forward_buffer.clear();
+            }
+            return;
+        }
+
         let leader_idx = self.engine.current_leader_index();
         let validator_peers = self.network.all_validator_peers();
 

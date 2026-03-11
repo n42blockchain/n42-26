@@ -1,21 +1,66 @@
 //! Binary TCP injection server for high-speed transaction ingestion.
 //!
-//! Accepts raw EIP-2718 encoded transactions over TCP, bypassing JSON-RPC overhead.
-//! Transactions are decoded, sender recovered, and batch-inserted into the pool.
+//! Accepts EIP-2718 encoded transactions with pre-recovered sender over TCP,
+//! bypassing both JSON-RPC overhead and ECDSA signature recovery.
+//! Transactions are inserted directly into the pool as pre-validated —
+//! skipping the entire validation pipeline.
 //!
-//! Protocol (per batch):
-//!   Client → Server: [u32 LE num_txs] [u16 LE tx_len, tx_bytes] × num_txs
+//! Protocol v2 (per batch):
+//!   Client → Server: [u32 LE num_txs] [u16 LE tx_len, tx_bytes, 20-byte sender] × num_txs
 //!   Server → Client: [u32 LE accepted_count]
 //!   num_txs = 0 → close connection gracefully.
 
+use alloy_consensus::{transaction::Recovered, Transaction};
+use alloy_primitives::{Address, U256};
 use reth_ethereum_primitives::TransactionSigned;
-use reth_primitives_traits::SignedTransaction;
-use reth_transaction_pool::{EthPooledTransaction, PoolTransaction, TransactionPool};
+use reth_transaction_pool::{
+    blobstore::BlobStore, AddedTransactionOutcome, CoinbaseTipOrdering, EthPooledTransaction,
+    Pool, PoolResult, PoolTransaction, TransactionOrigin,
+    TransactionValidationOutcome, TransactionValidator,
+    validate::ValidTransaction,
+};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, error, info, warn};
+
+/// Trait for direct pool injection, bypassing the validation pipeline.
+pub trait DirectPoolInject: Send + Sync + 'static {
+    /// Insert pre-validated transactions directly into the pool.
+    /// Skips TransactionValidationTaskExecutor entirely.
+    fn add_prevalidated(
+        &self,
+        txs: Vec<EthPooledTransaction>,
+    ) -> Vec<PoolResult<AddedTransactionOutcome>>;
+}
+
+/// Implement DirectPoolInject for any reth Pool with EthPooledTransaction.
+impl<V, S> DirectPoolInject for Pool<V, CoinbaseTipOrdering<EthPooledTransaction>, S>
+where
+    V: TransactionValidator<Transaction = EthPooledTransaction> + 'static,
+    S: BlobStore + 'static,
+{
+    fn add_prevalidated(
+        &self,
+        txs: Vec<EthPooledTransaction>,
+    ) -> Vec<PoolResult<AddedTransactionOutcome>> {
+        let outcomes = txs.into_iter().map(|tx| {
+            // Use tx nonce as state_nonce so the pool sees NO nonce gap.
+            // ancestor(tx_nonce, state_nonce) returns None when equal → NO_NONCE_GAPS → Pending.
+            let nonce = tx.transaction().nonce();
+            TransactionValidationOutcome::Valid {
+                balance: U256::MAX,
+                state_nonce: nonce,
+                bytecode_hash: None,
+                transaction: ValidTransaction::Valid(tx),
+                propagate: false,
+                authorities: None,
+            }
+        });
+        self.inner().add_transactions(TransactionOrigin::External, outcomes)
+    }
+}
 
 /// Global counters for monitoring.
 pub struct InjectStats {
@@ -40,9 +85,9 @@ impl InjectStats {
 ///
 /// Reads port from `N42_INJECT_PORT` env var (default: 19900).
 /// Each node in testnet gets port = base + node_index.
-pub async fn run_inject_server<Pool>(pool: Pool)
+pub async fn run_inject_server<P>(pool: P)
 where
-    Pool: TransactionPool<Transaction = EthPooledTransaction> + Clone + 'static,
+    P: DirectPoolInject + Clone,
 {
     let port: u16 = std::env::var("N42_INJECT_PORT")
         .ok()
@@ -59,7 +104,7 @@ where
 
     let stats = Arc::new(InjectStats::new());
 
-    info!(target: "n42::inject", port, "binary injection server listening");
+    info!(target: "n42::inject", port, "binary injection server listening (direct pool insert)");
 
     // Stats reporter
     let stats_clone = stats.clone();
@@ -100,13 +145,13 @@ where
     }
 }
 
-async fn handle_client<Pool>(
+async fn handle_client<P>(
     mut stream: TcpStream,
-    pool: Pool,
+    pool: P,
     stats: &Arc<InjectStats>,
 ) -> eyre::Result<()>
 where
-    Pool: TransactionPool<Transaction = EthPooledTransaction>,
+    P: DirectPoolInject,
 {
     // Set TCP_NODELAY for low latency
     stream.set_nodelay(true)?;
@@ -143,6 +188,11 @@ where
             }
             stream.read_exact(&mut tx_buf[..tx_len]).await?;
 
+            // Read pre-recovered sender address (20 bytes)
+            let mut sender_buf = [0u8; 20];
+            stream.read_exact(&mut sender_buf).await?;
+            let sender = Address::from(sender_buf);
+
             // Decode EIP-2718 encoded transaction
             let tx: TransactionSigned =
                 match alloy_eips::eip2718::Decodable2718::decode_2718(&mut &tx_buf[..tx_len]) {
@@ -153,14 +203,8 @@ where
                     }
                 };
 
-            // Recover sender
-            let recovered = match tx.try_into_recovered() {
-                Ok(r) => r,
-                Err(_) => {
-                    batch_decode_errors += 1;
-                    continue;
-                }
-            };
+            // Skip ECDSA recovery — use pre-recovered sender from client
+            let recovered = Recovered::new_unchecked(tx, sender);
 
             // Convert to pooled transaction
             match EthPooledTransaction::try_from_consensus(recovered) {
@@ -175,9 +219,10 @@ where
             stats.decode_errors.fetch_add(batch_decode_errors, Ordering::Relaxed);
         }
 
-        // Batch insert into pool
+        // Direct pool insert — bypasses validation pipeline entirely.
+        // Transactions are treated as pre-validated with Valid outcome.
         let batch_size = pooled_txs.len();
-        let results = pool.add_external_transactions(pooled_txs).await;
+        let results = pool.add_prevalidated(pooled_txs);
         let accepted = results.iter().filter(|r| r.is_ok()).count();
         let pool_errors = batch_size - accepted;
 
