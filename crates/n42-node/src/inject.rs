@@ -5,6 +5,10 @@
 //! Transactions are inserted directly into the pool as pre-validated —
 //! skipping the entire validation pipeline.
 //!
+//! **SECURITY WARNING**: The sender address is trusted without ECDSA verification.
+//! This server MUST NOT be exposed on production networks — it is intended solely
+//! for local/testnet stress testing where the client is trusted.
+//!
 //! Protocol v2 (per batch):
 //!   Client → Server: [u32 LE num_txs] [u16 LE tx_len, tx_bytes, 20-byte sender] × num_txs
 //!   Server → Client: [u32 LE accepted_count]
@@ -15,7 +19,7 @@ use alloy_primitives::{Address, U256};
 use reth_ethereum_primitives::TransactionSigned;
 use reth_transaction_pool::{
     blobstore::BlobStore, AddedTransactionOutcome, CoinbaseTipOrdering, EthPooledTransaction,
-    Pool, PoolResult, PoolTransaction, TransactionOrigin,
+    Pool, PoolResult, PoolTransaction, TransactionOrigin, TransactionPool,
     TransactionValidationOutcome, TransactionValidator,
     validate::ValidTransaction,
 };
@@ -33,6 +37,9 @@ pub trait DirectPoolInject: Send + Sync + 'static {
         &self,
         txs: Vec<EthPooledTransaction>,
     ) -> Vec<PoolResult<AddedTransactionOutcome>>;
+
+    /// Returns the current number of transactions in the pending sub-pool.
+    fn pending_count(&self) -> usize;
 }
 
 /// Implement DirectPoolInject for any reth Pool with EthPooledTransaction.
@@ -60,6 +67,10 @@ where
         });
         self.inner().add_transactions(TransactionOrigin::External, outcomes)
     }
+
+    fn pending_count(&self) -> usize {
+        self.pool_size().pending
+    }
 }
 
 /// Global counters for monitoring.
@@ -70,14 +81,20 @@ pub struct InjectStats {
     pub pool_errors: AtomicU64,
 }
 
-impl InjectStats {
-    pub fn new() -> Self {
+impl Default for InjectStats {
+    fn default() -> Self {
         Self {
             received: AtomicU64::new(0),
             accepted: AtomicU64::new(0),
             decode_errors: AtomicU64::new(0),
             pool_errors: AtomicU64::new(0),
         }
+    }
+}
+
+impl InjectStats {
+    pub fn new() -> Self {
+        Self::default()
     }
 }
 
@@ -145,6 +162,18 @@ where
     }
 }
 
+/// Pool high-water mark: reject injection when pending count exceeds this.
+/// Prevents pool eviction which causes nonce gaps and permanently stuck txs.
+fn inject_high_water() -> usize {
+    static HIGH_WATER: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *HIGH_WATER.get_or_init(|| {
+        std::env::var("N42_INJECT_HIGH_WATER")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(90_000)
+    })
+}
+
 async fn handle_client<P>(
     mut stream: TcpStream,
     pool: P,
@@ -158,6 +187,8 @@ where
 
     // Reusable buffer for reading tx data
     let mut tx_buf = vec![0u8; 65536];
+    let high_water = inject_high_water();
+    let mut gate_logged = false;
 
     loop {
         // Read batch header: u32 LE num_txs
@@ -219,8 +250,24 @@ where
             stats.decode_errors.fetch_add(batch_decode_errors, Ordering::Relaxed);
         }
 
+        // Pool gate: reject entire batch when pool is near capacity.
+        // This prevents eviction which causes nonce gaps → permanently stuck txs.
+        // ACK v3: [u32 accepted][u32 pool_pending] — second word is pool size hint.
+        let pending = pool.pending_count();
+        if pending >= high_water {
+            if !gate_logged {
+                info!(target: "n42::inject", pending, high_water, "pool gate: rejecting injection (pool near limit)");
+                gate_logged = true;
+            }
+            // ACK v3: accepted=0, pool_pending hint
+            let mut ack = [0u8; 8];
+            ack[4..8].copy_from_slice(&(pending as u32).to_le_bytes());
+            stream.write_all(&ack).await?;
+            continue;
+        }
+        gate_logged = false;
+
         // Direct pool insert — bypasses validation pipeline entirely.
-        // Transactions are treated as pre-validated with Valid outcome.
         let batch_size = pooled_txs.len();
         let results = pool.add_prevalidated(pooled_txs);
         let accepted = results.iter().filter(|r| r.is_ok()).count();
@@ -231,8 +278,11 @@ where
             stats.pool_errors.fetch_add(pool_errors as u64, Ordering::Relaxed);
         }
 
-        // Send ACK: u32 LE accepted_count
-        let ack = (accepted as u32).to_le_bytes();
+        // ACK v3: [u32 accepted][u32 pool_pending]
+        let new_pending = pool.pending_count();
+        let mut ack = [0u8; 8];
+        ack[0..4].copy_from_slice(&(accepted as u32).to_le_bytes());
+        ack[4..8].copy_from_slice(&(new_pending as u32).to_le_bytes());
         stream.write_all(&ack).await?;
     }
 

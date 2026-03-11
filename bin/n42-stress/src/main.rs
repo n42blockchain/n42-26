@@ -782,6 +782,9 @@ fn presign_all(
 const FILE_MAGIC: &[u8; 4] = b"N42T";
 const FILE_VERSION: u8 = 2;
 
+/// Raw EIP-2718 encoded transaction bytes paired with 20-byte sender address.
+type RawTxWithSender = (Vec<u8>, [u8; 20]);
+
 /// Pre-sign transactions and save to binary file (raw RLP, not hex).
 fn presign_and_save(
     accounts: &[Arc<TestAccount>],
@@ -995,7 +998,7 @@ fn load_presigned(path: &str) -> Result<Vec<Vec<String>>> {
         total_loaded = loaded,
         elapsed_ms = elapsed.as_millis(),
         load_rate = format!("{:.0}/s", load_rate),
-        mem_estimate_mb = loaded as u64 * 240 / (1024 * 1024),
+        mem_estimate_mb = loaded * 240 / (1024 * 1024),
         "Pre-signed transactions loaded"
     );
 
@@ -1004,7 +1007,7 @@ fn load_presigned(path: &str) -> Result<Vec<Vec<String>>> {
 
 /// Load pre-signed transactions as raw binary bytes with sender addresses (v2 format).
 /// Returns Vec[rpc_idx] = Vec<(tx_bytes, sender_20bytes)>.
-fn load_presigned_binary(path: &str, num_endpoints: usize) -> Result<Vec<Vec<(Vec<u8>, [u8; 20])>>> {
+fn load_presigned_binary(path: &str, num_endpoints: usize) -> Result<Vec<Vec<RawTxWithSender>>> {
     let start = Instant::now();
     let file = std::fs::File::open(path)?;
     let file_size = file.metadata()?.len();
@@ -1045,7 +1048,7 @@ fn load_presigned_binary(path: &str, num_endpoints: usize) -> Result<Vec<Vec<(Ve
     );
 
     // Read per-RPC tx data with sender, preserving nonce ordering per account.
-    let mut file_groups: Vec<Vec<(Vec<u8>, [u8; 20])>> = Vec::with_capacity(file_num_rpcs);
+    let mut file_groups: Vec<Vec<RawTxWithSender>> = Vec::with_capacity(file_num_rpcs);
     let mut tx_buf = vec![0u8; 65536];
 
     for _ in 0..file_num_rpcs {
@@ -1067,7 +1070,7 @@ fn load_presigned_binary(path: &str, num_endpoints: usize) -> Result<Vec<Vec<(Ve
     }
 
     // Map file RPC groups to inject endpoints.
-    let mut grouped: Vec<Vec<(Vec<u8>, [u8; 20])>> = vec![Vec::new(); num_endpoints];
+    let mut grouped: Vec<Vec<RawTxWithSender>> = vec![Vec::new(); num_endpoints];
     for (i, txs) in file_groups.into_iter().enumerate() {
         grouped[i % num_endpoints].extend(txs);
     }
@@ -1085,9 +1088,10 @@ fn load_presigned_binary(path: &str, num_endpoints: usize) -> Result<Vec<Vec<(Ve
 }
 
 /// Binary TCP injection mode: stream raw txs with sender over TCP to node inject servers.
+#[allow(clippy::too_many_arguments)]
 async fn run_inject_mode(
     endpoints: &[String],
-    presigned: Vec<Vec<(Vec<u8>, [u8; 20])>>,
+    presigned: Vec<Vec<RawTxWithSender>>,
     batch_size: usize,
     target_tps: u64,
     stats: &Arc<Stats>,
@@ -1149,7 +1153,7 @@ async fn run_inject_mode(
         tracing::info!(duration_secs, "Inject duration reached");
     });
 
-    // Spawn one TCP sender per endpoint
+    // Spawn one TCP sender per endpoint with dynamic rate control
     let mut handles = Vec::new();
     for (idx, txs) in presigned.into_iter().enumerate() {
         if txs.is_empty() {
@@ -1181,15 +1185,25 @@ async fn run_inject_mode(
             } else {
                 Duration::ZERO
             };
-            let mut batch_start;
 
-            for chunk in txs.chunks(bs) {
+            // Dynamic rate control thresholds
+            const POOL_LOW: u64 = 50_000;   // below: full speed
+            const POOL_HIGH: u64 = 80_000;  // above: pause until LOW
+            let mut pool_gated = false;
+            let mut gate_wait_ms = 0u64;
+
+            // Index-based iteration for retry support
+            let chunks: Vec<&[RawTxWithSender]> = txs.chunks(bs).collect();
+            let mut chunk_idx = 0;
+
+            while chunk_idx < chunks.len() {
                 if stop.load(Ordering::Relaxed) {
                     break;
                 }
-                batch_start = Instant::now();
+                let chunk = chunks[chunk_idx];
+                let batch_start = Instant::now();
 
-                // Build binary batch v2: [u32 num_txs] [u16 tx_len, tx_bytes, 20-byte sender] × n
+                // Build binary batch: [u32 num_txs] [u16 tx_len, tx_bytes, 20-byte sender] × n
                 let num_txs = chunk.len() as u32;
                 let total_size: usize = 4 + chunk.iter().map(|(tx, _)| 2 + tx.len() + 20).sum::<usize>();
                 let mut buf = Vec::with_capacity(total_size);
@@ -1207,16 +1221,49 @@ async fn run_inject_mode(
                     break;
                 }
 
-                // Read ACK: u32 accepted
-                let mut ack = [0u8; 4];
+                // Read ACK v3: [u32 accepted][u32 pool_pending]
+                // Falls back to v2 (4-byte ACK) if server doesn't send pool hint.
+                let mut ack = [0u8; 8];
                 match stream.read_exact(&mut ack).await {
                     Ok(_) => {
-                        let accepted = u32::from_le_bytes(ack) as u64;
+                        let accepted = u32::from_le_bytes(ack[0..4].try_into().unwrap()) as u64;
+                        let pool_pending = u32::from_le_bytes(ack[4..8].try_into().unwrap()) as u64;
+
+                        if accepted == 0 && pool_pending > 0 {
+                            // Server rejected: pool gate active. Retry same batch.
+                            if !pool_gated {
+                                tracing::info!(endpoint, pool_pending, "pool gate: server rejected batch, waiting...");
+                                pool_gated = true;
+                            }
+                            gate_wait_ms += 200;
+                            tokio::time::sleep(Duration::from_millis(200)).await;
+                            continue; // retry same chunk_idx
+                        }
+
+                        if pool_gated {
+                            tracing::info!(endpoint, pool_pending, gate_wait_ms, "pool gate: resumed injection");
+                            pool_gated = false;
+                            gate_wait_ms = 0;
+                        }
+
                         stats.sent.fetch_add(accepted, Ordering::Relaxed);
                         let rejected = chunk.len() as u64 - accepted;
                         if rejected > 0 {
                             stats.rpc_errors.fetch_add(rejected, Ordering::Relaxed);
                         }
+
+                        // Dynamic rate: if pool is getting full, apply rate limiting
+                        if pool_pending > POOL_HIGH {
+                            // Wait until pool drops (server will gate, but add client delay too)
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        } else if pool_pending > POOL_LOW && !batch_interval.is_zero() {
+                            // Normal rate limiting
+                            let elapsed = batch_start.elapsed();
+                            if elapsed < batch_interval {
+                                tokio::time::sleep(batch_interval - elapsed).await;
+                            }
+                        }
+                        // pool < POOL_LOW: full speed, no sleep
                     }
                     Err(e) => {
                         tracing::warn!(endpoint, error = %e, "TCP ACK read failed");
@@ -1224,13 +1271,7 @@ async fn run_inject_mode(
                     }
                 }
 
-                // Rate limit: sleep if we're ahead of schedule
-                if !batch_interval.is_zero() {
-                    let elapsed = batch_start.elapsed();
-                    if elapsed < batch_interval {
-                        tokio::time::sleep(batch_interval - elapsed).await;
-                    }
-                }
+                chunk_idx += 1;
             }
 
             // Send close signal
@@ -1261,7 +1302,7 @@ async fn run_inject_mode(
 /// Send a wave of txs over a single TCP stream. Returns (accepted, errors).
 async fn tcp_send_wave(
     stream: &mut TcpStream,
-    txs: &[(Vec<u8>, [u8; 20])],
+    txs: &[RawTxWithSender],
     batch_size: usize,
 ) -> (u64, u64) {
     let mut total_ok = 0u64;
@@ -1318,7 +1359,7 @@ async fn tcp_send_wave(
 #[allow(clippy::too_many_arguments)]
 async fn run_sync_inject_mode(
     endpoints: &[String],
-    presigned: Vec<Vec<(Vec<u8>, [u8; 20])>>,
+    presigned: Vec<Vec<RawTxWithSender>>,
     batch_size: usize,
     wave_cap: usize,
     rpc_urls: &[String],
@@ -1354,7 +1395,7 @@ async fn run_sync_inject_mode(
         });
 
         // Convert presigned into per-endpoint owned data
-        let mut ep_data: Vec<(String, String, Vec<(Vec<u8>, [u8; 20])>)> = Vec::new();
+        let mut ep_data: Vec<(String, String, Vec<RawTxWithSender>)> = Vec::new();
         for (idx, txs) in presigned.into_iter().enumerate() {
             if idx < num_eps {
                 ep_data.push((
@@ -1391,8 +1432,8 @@ async fn run_sync_inject_mode(
 
                 // Wait for this node's pool to be ready
                 for _ in 0..50 {
-                    if let Ok((pending, _)) = get_txpool_status(&client, &rpc_url).await {
-                        if pending < 500 { break; }
+                    if let Ok((pending, _)) = get_txpool_status(&client, &rpc_url).await && pending < 500 {
+                        break;
                     }
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
@@ -1422,8 +1463,8 @@ async fn run_sync_inject_mode(
                     loop {
                         tokio::time::sleep(Duration::from_millis(5)).await;
                         if stop.load(Ordering::Relaxed) { break; }
-                        if let Ok((pending, _)) = get_txpool_status(&client, &rpc_url).await {
-                            if pending < 500 { break; }
+                        if let Ok((pending, _)) = get_txpool_status(&client, &rpc_url).await && pending < 500 {
+                            break;
                         }
                         if drain_start.elapsed() > Duration::from_secs(30) {
                             tracing::warn!(endpoint, "per-node drain timeout");
@@ -1506,8 +1547,8 @@ async fn run_sync_inject_mode(
 
     // Wait for pool to be empty before first wave
     for _ in 0..50 {
-        if let Ok((pending, _)) = get_txpool_status(client, &rpc_urls[0]).await {
-            if pending < 500 { break; }
+        if let Ok((pending, _)) = get_txpool_status(client, &rpc_urls[0]).await && pending < 500 {
+            break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -1612,7 +1653,7 @@ async fn run_sync_inject_mode(
 
     if n > 0 {
         let p50 = drain_times[n / 2];
-        let p95 = drain_times[(n as f64 * 0.95) as usize];
+        let p95 = drain_times[((n as f64 * 0.95) as usize).min(n - 1)];
         let avg = total_drain_ms / n as u64;
         let sustained_tps = total_wave_txs as f64 / (total_drain_ms as f64 / 1000.0).max(0.001);
 
