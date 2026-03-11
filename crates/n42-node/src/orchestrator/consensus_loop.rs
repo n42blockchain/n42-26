@@ -384,6 +384,13 @@ impl ConsensusOrchestrator {
             // Case A: Block already in reth (leader built + new_payload already done,
             // OR block was previously imported by a follower, OR rescued by eager import).
             debug!(target: "n42::cl::consensus_loop", view, %block_hash, "block finalized in reth");
+
+            // Deferred state root mode: log that state root verification is pending.
+            // Future: spawn async state root computation here using reth's provider.
+            if reth_evm::n42_defer_state_root() {
+                debug!(target: "n42::cl::consensus_loop", view, %block_hash,
+                    "N42_DEFER_STATE_ROOT: block finalized with deferred state root (B256::ZERO)");
+            }
             self.pending_block_data.clear();
             self.pending_executions.clear();
             if let Some(ref tx) = self.mobile_packet_tx

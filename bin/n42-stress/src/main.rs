@@ -1070,9 +1070,31 @@ fn load_presigned_binary(path: &str, num_endpoints: usize) -> Result<Vec<Vec<Raw
     }
 
     // Map file RPC groups to inject endpoints.
+    // When file has fewer groups than endpoints, redistribute by sender address
+    // to ensure each account's txs stay on the same endpoint (preserving nonce order).
     let mut grouped: Vec<Vec<RawTxWithSender>> = vec![Vec::new(); num_endpoints];
-    for (i, txs) in file_groups.into_iter().enumerate() {
-        grouped[i % num_endpoints].extend(txs);
+    if file_groups.len() >= num_endpoints {
+        // File has enough groups: map groups directly to endpoints
+        for (i, txs) in file_groups.into_iter().enumerate() {
+            grouped[i % num_endpoints].extend(txs);
+        }
+    } else {
+        // File has fewer groups (e.g., 1 RPC): redistribute by sender
+        // Group txs by sender, then assign each sender's batch to an endpoint
+        let all_txs: Vec<RawTxWithSender> = file_groups.into_iter().flatten().collect();
+        let mut sender_groups: std::collections::HashMap<[u8; 20], Vec<RawTxWithSender>> =
+            std::collections::HashMap::new();
+        for tx in all_txs {
+            sender_groups.entry(tx.1).or_default().push(tx);
+        }
+        // Distribute senders round-robin across endpoints
+        for (i, (_sender, txs)) in sender_groups.into_iter().enumerate() {
+            grouped[i % num_endpoints].extend(txs);
+        }
+        tracing::info!(
+            "Redistributed single-group presign across {} endpoints by sender",
+            num_endpoints
+        );
     }
 
     let elapsed = start.elapsed();

@@ -1,0 +1,681 @@
+# N42 patches on reth v1.11.0 (commit 09859a2621)
+# Base: v1.11.0-360-g09859a2621
+#
+# Apply:
+#   cd reth && git checkout 09859a2621 && git apply ../n42-26/reth-n42.patch
+#
+# Changes:
+#   1. Payload cache (dual-slot: leader self-import + compact block broadcast)
+#   2. Leader payload packing instrumentation (N42_PAYLOAD_PACK/FINISH logs)
+#   3. N42_SKIP_STATE_ROOT: benchmark mode, skip state root entirely
+#   4. N42_DEFER_STATE_ROOT: defer state root from consensus critical path (B256::ZERO placeholder)
+#   5. N42_SKIP_TX_VERIFY: skip transaction signature verification in pool
+#   6. Pool OrdMap: im::OrdMap replaces BTreeMap for O(log n) clone in pending pool
+#   7. Packing optimizations: no_updates(), skip RLP length, defer to_consensus()
+#   8. Gas limit override via N42_GAS_LIMIT env var
+#
+diff --git a/Cargo.lock b/Cargo.lock
+index 2cab64c019..27f006dd8e 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -1698,6 +1698,15 @@ dependencies = [
+  "serde_core",
+ ]
+ 
++[[package]]
++name = "bitmaps"
++version = "2.1.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "031043d04099746d8db04daf1fa424b2bc8bd69d92b25962dcde24da39ab64a2"
++dependencies = [
++ "typenum",
++]
++
+ [[package]]
+ name = "bitvec"
+ version = "1.0.1"
+@@ -4956,6 +4965,20 @@ dependencies = [
+  "windows-sys 0.59.0",
+ ]
+ 
++[[package]]
++name = "im"
++version = "15.1.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "d0acd33ff0285af998aaf9b57342af478078f53492322fafc47450e09397e0e9"
++dependencies = [
++ "bitmaps",
++ "rand_core 0.6.4",
++ "rand_xoshiro 0.6.0",
++ "sized-chunks",
++ "typenum",
++ "version_check",
++]
++
+ [[package]]
+ name = "impl-codec"
+ version = "0.6.0"
+@@ -5901,7 +5924,7 @@ dependencies = [
+  "ordered-float",
+  "quanta",
+  "rand 0.9.2",
+- "rand_xoshiro",
++ "rand_xoshiro 0.7.0",
+  "sketches-ddsketch",
+ ]
+ 
+@@ -7272,6 +7295,15 @@ dependencies = [
+  "rand_core 0.9.5",
+ ]
+ 
++[[package]]
++name = "rand_xoshiro"
++version = "0.6.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "6f97cdb2a36ed4183de61b2f824cc45c9f1037f28afe0a322e9fff4c108b5aaa"
++dependencies = [
++ "rand_core 0.6.4",
++]
++
+ [[package]]
+ name = "rand_xoshiro"
+ version = "0.7.0"
+@@ -8751,6 +8783,7 @@ dependencies = [
+  "reth-storage-errors",
+  "reth-trie-common",
+  "revm",
++ "tracing",
+ ]
+ 
+ [[package]]
+@@ -10413,6 +10446,7 @@ dependencies = [
+  "bitflags 2.10.0",
+  "futures",
+  "futures-util",
++ "im",
+  "metrics",
+  "parking_lot",
+  "paste",
+@@ -11634,6 +11668,16 @@ version = "1.0.2"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "b2aa850e253778c88a04c3d7323b043aeda9d3e30d5971937c1855769763678e"
+ 
++[[package]]
++name = "sized-chunks"
++version = "0.6.5"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "16d69225bde7a69b235da73377861095455d298f2b970996eec25ddbb42b3d1e"
++dependencies = [
++ "bitmaps",
++ "typenum",
++]
++
+ [[package]]
+ name = "sketches-ddsketch"
+ version = "0.3.0"
+diff --git a/crates/engine/tree/src/tree/payload_validator.rs b/crates/engine/tree/src/tree/payload_validator.rs
+index f97bc0bf3a..c6aa006734 100644
+--- a/crates/engine/tree/src/tree/payload_validator.rs
++++ b/crates/engine/tree/src/tree/payload_validator.rs
+@@ -459,12 +459,28 @@ where
+             withdrawals: input.withdrawals().map(|w| w.to_vec()),
+         };
+ 
++        // Check leader payload cache early to influence state root strategy.
++        // If cache hit, we skip EVM and force Synchronous to avoid StateRootTask timeout.
++        let block_hash_for_cache = input.hash();
++        type CachedPayloadData<R> = (BlockExecutionOutput<R>, Vec<Address>);
++        let cache_hit = reth_evm::payload_cache::take_payload_execution::<
++            CachedPayloadData<N::Receipt>,
++        >(&block_hash_for_cache);
++        let is_cache_hit = cache_hit.is_some();
++
+         // Plan the strategy used for state root computation.
+-        let strategy = self.plan_state_root_computation();
++        // Force Synchronous on cache hit: StateRootTask expects execution updates via
++        // channels, but we skip EVM, so it would timeout (~1s waste).
++        let strategy = if is_cache_hit {
++            StateRootStrategy::Synchronous
++        } else {
++            self.plan_state_root_computation()
++        };
+ 
+         debug!(
+             target: "engine::tree::payload_validator",
+             ?strategy,
++            is_cache_hit,
+             "Decided which state root algorithm to run"
+         );
+ 
+@@ -527,12 +543,37 @@ where
+         // The receipt root task is spawned before execution and receives receipts incrementally
+         // as transactions complete, allowing parallel computation during execution.
+         let execute_block_start = Instant::now();
+-        let (output, senders, receipt_root_rx) =
++
++        let (output, senders, receipt_root_rx) = if let Some((cached_output, cached_senders)) =
++            cache_hit
++        {
++            // Leader cache hit: skip EVM re-execution, reuse payload builder's results
++            info!(
++                target: "engine::tree::payload_validator",
++                block_number = input.num_hash().number,
++                %block_hash_for_cache,
++                "N42_PAYLOAD_CACHE_HIT: skipping EVM re-execution for leader-built block"
++            );
++            // Create a dummy channel — receiver will get RecvError, producing None for
++            // receipt_root_bloom, causing validate_block_post_execution to compute it from
++            // the cached receipts instead.
++            let (_tx, rx) = tokio::sync::oneshot::channel();
++            (cached_output, cached_senders, rx)
++        } else {
+             match self.execute_block(state_provider, env, &input, &mut handle) {
+                 Ok(output) => output,
+                 Err(err) => return self.handle_execution_error(input, err, &parent_block),
+-            };
++            }
++        };
++
+         let execution_duration = execute_block_start.elapsed();
++        info!(
++            target: "engine::tree::payload_validator",
++            block_number = input.num_hash().number,
++            evm_ms = execution_duration.as_millis() as u64,
++            is_cache_hit,
++            "N42_NEW_PAYLOAD_EVM: block execution complete"
++        );
+ 
+         // After executing the block we can stop prewarming transactions
+         handle.stop_prewarming_execution();
+@@ -614,6 +655,28 @@ where
+         );
+ 
+         let root_time = Instant::now();
++
++        // N42: skip or defer state root computation
++        // - SKIP mode: permanently skip, no async verification (benchmark only)
++        // - DEFER mode: skip on critical path, async verification after consensus commit
++        //   Sentinel: block.header().state_root() == B256::ZERO means leader deferred
++        let n42_skip_root = reth_evm::n42_skip_state_root()
++            || (reth_evm::n42_defer_state_root() && block.header().state_root() == B256::ZERO);
++        let (state_root, trie_output, root_elapsed) = if n42_skip_root {
++            let mode = if reth_evm::n42_skip_state_root() { "SKIP" } else { "DEFER" };
++            info!(
++                target: "engine::tree::payload_validator",
++                block_number = block.header().number(),
++                mode,
++                "N42_STATE_ROOT_{}: skipping state root computation on follower", mode
++            );
++            (block.header().state_root(), Arc::new(TrieUpdates::default()), Duration::ZERO)
++        // NOTE: Delayed state root was removed. When compact block cache hits,
++        // the Synchronous strategy already achieves root_ms=0. Deferring state root
++        // causes sparse trie corruption (empty TrieUpdates → stale anchor) which breaks
++        // StateRootTask for subsequent non-compact blocks.
++        } else {
++
+         let mut maybe_state_root = None;
+         let mut state_root_task_failed = false;
+         #[cfg(feature = "trie-debug")]
+@@ -736,13 +799,25 @@ where
+             (root, Arc::new(updates), root_time.elapsed())
+         };
+ 
++        (state_root, trie_output, root_elapsed)
++
++        }; // end of n42_skip_state_root branch
++
+         self.metrics.block_validation.record_state_root(&trie_output, root_elapsed.as_secs_f64());
+         self.metrics
+             .record_state_root_gas_bucket(block.header().gas_used(), root_elapsed.as_secs_f64());
+-        debug!(target: "engine::tree::payload_validator", ?root_elapsed, "Calculated state root");
++        info!(
++            target: "engine::tree::payload_validator",
++            block_number = block.header().number(),
++            gas_used = block.header().gas_used(),
++            root_ms = root_elapsed.as_millis() as u64,
++            evm_ms = execution_duration.as_millis() as u64,
++            total_ms = (execution_duration + root_elapsed).as_millis() as u64,
++            "N42_NEW_PAYLOAD_TOTAL: EVM + state root complete"
++        );
+ 
+-        // ensure state root matches
+-        if state_root != block.header().state_root() {
++        // ensure state root matches (skip check in benchmark/defer mode)
++        if !n42_skip_root && state_root != block.header().state_root() {
+             #[cfg(feature = "trie-debug")]
+             Self::write_trie_debug_recorders(block.header().number(), &trie_debug_recorders);
+ 
+diff --git a/crates/ethereum/payload/src/lib.rs b/crates/ethereum/payload/src/lib.rs
+index 745a0e337b..7882c695f5 100644
+--- a/crates/ethereum/payload/src/lib.rs
++++ b/crates/ethereum/payload/src/lib.rs
+@@ -21,7 +21,7 @@ use reth_consensus_common::validation::MAX_RLP_BLOCK_SIZE;
+ use reth_errors::{BlockExecutionError, BlockValidationError, ConsensusError};
+ use reth_ethereum_primitives::{EthPrimitives, TransactionSigned};
+ use reth_evm::{
+-    execute::{BlockBuilder, BlockBuilderOutcome},
++    execute::{BlockBuilder, BlockBuilderOutcome, BlockExecutionOutput},
+     ConfigureEvm, Evm, NextBlockEnvAttributes,
+ };
+ use reth_evm_ethereum::EthEvmConfig;
+@@ -38,7 +38,7 @@ use reth_transaction_pool::{
+ };
+ use revm::context_interface::Block as _;
+ use std::sync::Arc;
+-use tracing::{debug, trace, warn};
++use tracing::{debug, info, trace, warn};
+ 
+ mod config;
+ pub use config::*;
+@@ -213,7 +213,44 @@ where
+ 
+     let withdrawals_rlp_length = attributes.withdrawals().length();
+ 
+-    while let Some(pool_tx) = best_txs.next() {
++    // N42: per-block transaction count limit to prevent oversized blocks.
++    let max_txs_per_block: usize = std::env::var("N42_MAX_TXS_PER_BLOCK")
++        .ok()
++        .and_then(|v| v.parse().ok())
++        .unwrap_or(80_000);
++    // N42: build time budget — stop packing when exceeded (checked every 256 txs).
++    let build_time_budget = std::time::Duration::from_millis(
++        std::env::var("N42_BUILD_TIME_BUDGET_MS")
++            .ok()
++            .and_then(|v| v.parse().ok())
++            .unwrap_or(1000u64),
++    );
++    let mut tx_count: usize = 0;
++
++    let packing_start = std::time::Instant::now();
++    let mut evm_exec_total = std::time::Duration::ZERO;
++    let mut iter_total = std::time::Duration::ZERO;
++    let mut consensus_total = std::time::Duration::ZERO;
++
++    // Optimization 1: Stop processing new arrivals during packing.
++    // The iterator already holds a snapshot; new txs arriving mid-pack only add
++    // overhead via broadcast channel polling (48K × try_recv calls).
++    best_txs.no_updates();
++
++    while let Some(pool_tx) = {
++        let iter_start = std::time::Instant::now();
++        let tx = best_txs.next();
++        iter_total += iter_start.elapsed();
++        tx
++    } {
++        if tx_count >= max_txs_per_block {
++            break;
++        }
++        // Check build time budget every 256 transactions to avoid per-tx syscall overhead.
++        if tx_count & 0xFF == 0 && tx_count > 0 && packing_start.elapsed() >= build_time_budget {
++            debug!(target: "payload_builder", tx_count, "build time budget exceeded, stopping packing");
++            break;
++        }
+         // ensure we still have capacity for this transaction
+         if cumulative_gas_used + pool_tx.gas_limit() > block_gas_limit {
+             // we can't fit this transaction into the block, so we need to mark it as invalid
+@@ -231,24 +268,34 @@ where
+             return Ok(BuildOutcome::Cancelled)
+         }
+ 
+-        // convert tx to a signed transaction
++        // Optimization 3: Defer to_consensus() conversion — only needed for txs
++        // that pass the gas check above. Also track its cost separately.
++        let consensus_start = std::time::Instant::now();
+         let tx = pool_tx.to_consensus();
++        consensus_total += consensus_start.elapsed();
+ 
+-        let tx_rlp_len = tx.inner().length();
+-
+-        let estimated_block_size_with_tx =
+-            block_transactions_rlp_length + tx_rlp_len + withdrawals_rlp_length + 1024; // 1Kb of overhead for the block header
++        // Optimization 2: Skip RLP length computation and block size check
++        // for non-Osaka chains. The MAX_RLP_BLOCK_SIZE limit only applies to Osaka.
++        // This saves ~2µs/tx of RLP encoding traversal.
++        let tx_rlp_len = if is_osaka {
++            let len = tx.inner().length();
++            let estimated_block_size_with_tx =
++                block_transactions_rlp_length + len + withdrawals_rlp_length + 1024;
+ 
+-        if is_osaka && estimated_block_size_with_tx > MAX_RLP_BLOCK_SIZE {
+-            best_txs.mark_invalid(
+-                &pool_tx,
+-                &InvalidPoolTransactionError::OversizedData {
+-                    size: estimated_block_size_with_tx,
+-                    limit: MAX_RLP_BLOCK_SIZE,
+-                },
+-            );
+-            continue
+-        }
++            if estimated_block_size_with_tx > MAX_RLP_BLOCK_SIZE {
++                best_txs.mark_invalid(
++                    &pool_tx,
++                    &InvalidPoolTransactionError::OversizedData {
++                        size: estimated_block_size_with_tx,
++                        limit: MAX_RLP_BLOCK_SIZE,
++                    },
++                );
++                continue
++            }
++            len
++        } else {
++            0
++        };
+ 
+         // There's only limited amount of blob space available per block, so we need to check if
+         // the EIP-4844 can still fit in the block
+@@ -303,6 +350,7 @@ where
+             };
+         }
+ 
++        let evm_start = std::time::Instant::now();
+         let gas_used = match builder.execute_transaction(tx.clone()) {
+             Ok(gas_used) => gas_used,
+             Err(BlockExecutionError::Validation(BlockValidationError::InvalidTx {
+@@ -328,6 +376,8 @@ where
+             Err(err) => return Err(PayloadBuilderError::evm(err)),
+         };
+ 
++        evm_exec_total += evm_start.elapsed();
++
+         // add to the total blob gas used if the transaction successfully executed
+         if let Some(blob_hashes) = tx.blob_versioned_hashes() {
+             block_blob_count += blob_hashes.len() as u64;
+@@ -345,6 +395,7 @@ where
+             tx.effective_tip_per_gas(base_fee).expect("fee is always valid; execution succeeded");
+         total_fees += U256::from(miner_fee) * U256::from(gas_used);
+         cumulative_gas_used += gas_used;
++        tx_count += 1;
+ 
+         // Add blob tx sidecar to the payload.
+         if let Some(sidecar) = blob_tx_sidecar {
+@@ -352,6 +403,26 @@ where
+         }
+     }
+ 
++    let packing_elapsed = packing_start.elapsed();
++    let other_ms = packing_elapsed
++        .saturating_sub(evm_exec_total)
++        .saturating_sub(iter_total)
++        .saturating_sub(consensus_total)
++        .as_millis() as u64;
++    info!(
++        target: "payload_builder",
++        id = %attributes.id,
++        tx_count,
++        cumulative_gas_used,
++        packing_ms = packing_elapsed.as_millis() as u64,
++        evm_exec_ms = evm_exec_total.as_millis() as u64,
++        pool_overhead_ms = packing_elapsed.saturating_sub(evm_exec_total).as_millis() as u64,
++        iter_ms = iter_total.as_millis() as u64,
++        consensus_ms = consensus_total.as_millis() as u64,
++        other_ms,
++        "N42_PAYLOAD_PACK: tx packing complete"
++    );
++
+     // check if we have a better block
+     if !is_better_payload(best_payload.as_ref(), total_fees) {
+         // Release db
+@@ -360,14 +431,52 @@ where
+         return Ok(BuildOutcome::Aborted { fees: total_fees, cached_reads })
+     }
+ 
++    let finish_start = std::time::Instant::now();
+     let BlockBuilderOutcome { execution_result, block, .. } =
+         builder.finish(state_provider.as_ref())?;
++    let finish_elapsed = finish_start.elapsed();
++    info!(
++        target: "payload_builder",
++        id = %attributes.id,
++        finish_ms = finish_elapsed.as_millis() as u64,
++        "N42_PAYLOAD_FINISH: builder.finish() complete (includes state root)"
++    );
++
++    // Seal the block first to get the hash, then cache execution output.
++    let senders = block.senders().to_vec();
++    let sealed_block = Arc::new(block.into_sealed_block());
+ 
++    // Extract requests before moving execution_result into cache (avoids expensive clone).
+     let requests = chain_spec
+         .is_prague_active_at_timestamp(attributes.timestamp)
+-        .then_some(execution_result.requests);
+-
+-    let sealed_block = Arc::new(block.into_sealed_block());
++        .then(|| execution_result.requests.clone());
++
++    // Cache execution output for leader's new_payload AND broadcast to followers.
++    // Two separate cache slots: CACHE (leader take-once) and BROADCAST_CACHE (compact block).
++    // Clone first for broadcast, then move into leader cache.
++    {
++        let bundle_state = db.take_bundle();
++        let block_hash = sealed_block.hash();
++        let execution_output = BlockExecutionOutput {
++            state: bundle_state,
++            result: execution_result,
++        };
++        // Broadcast cache: consumed by handle_built_payload → compact block serialization.
++        reth_evm::payload_cache::store_broadcast_execution(
++            block_hash,
++            (execution_output.clone(), senders.clone()),
++        );
++        // Leader cache: consumed by leader's own new_payload (take semantics).
++        reth_evm::payload_cache::store_payload_execution(
++            block_hash,
++            (execution_output, senders),
++        );
++        info!(
++            target: "payload_builder",
++            %block_hash,
++            "N42_PAYLOAD_CACHE: cached execution output for new_payload + broadcast"
++        );
++    }
+     debug!(target: "payload_builder", id=%attributes.id, sealed_block_header = ?sealed_block.sealed_header(), "sealed built block");
+ 
+     if is_osaka && sealed_block.rlp_length() > MAX_RLP_BLOCK_SIZE {
+diff --git a/crates/evm/evm/Cargo.toml b/crates/evm/evm/Cargo.toml
+index 0e98e9b004..747cdd1103 100644
+--- a/crates/evm/evm/Cargo.toml
++++ b/crates/evm/evm/Cargo.toml
+@@ -28,6 +28,7 @@ alloy-eips.workspace = true
+ alloy-evm.workspace = true
+ alloy-consensus.workspace = true
+ 
++tracing.workspace = true
+ auto_impl.workspace = true
+ derive_more.workspace = true
+ futures-util.workspace = true
+diff --git a/crates/evm/evm/src/execute.rs b/crates/evm/evm/src/execute.rs
+index 595097df34..9c231f009d 100644
+--- a/crates/evm/evm/src/execute.rs
++++ b/crates/evm/evm/src/execute.rs
+@@ -464,6 +464,7 @@ where
+         ) -> CommitChanges,
+     ) -> Result<Option<u64>, BlockExecutionError> {
+         let (tx_env, tx) = tx.into_parts();
++
+         if let Some(gas_used) =
+             self.executor.execute_transaction_with_commit_condition((tx_env, &tx), f)?
+         {
+@@ -485,10 +486,35 @@ where
+         db.merge_transitions(BundleRetention::Reverts);
+ 
+         // calculate the state root
++        let hash_start = std::time::Instant::now();
+         let hashed_state = state.hashed_post_state(&db.bundle_state);
+-        let (state_root, trie_updates) = state
+-            .state_root_with_updates(hashed_state.clone())
+-            .map_err(BlockExecutionError::other)?;
++        let hash_elapsed = hash_start.elapsed();
++
++        let (state_root, trie_updates) = if crate::n42_skip_state_root() || crate::n42_defer_state_root() {
++            let mode = if crate::n42_skip_state_root() { "SKIP" } else { "DEFER" };
++            tracing::info!(
++                target: "evm::execute",
++                hash_ms = hash_elapsed.as_millis() as u64,
++                mode,
++                "N42_STATE_ROOT_{}: using B256::ZERO placeholder in leader finish()", mode
++            );
++            (alloy_primitives::B256::ZERO, Default::default())
++        } else {
++            let root_start = std::time::Instant::now();
++            let result = state
++                .state_root_with_updates(hashed_state.clone())
++                .map_err(BlockExecutionError::other)?;
++            let root_elapsed = root_start.elapsed();
++
++            tracing::info!(
++                target: "evm::execute",
++                hash_ms = hash_elapsed.as_millis() as u64,
++                root_ms = root_elapsed.as_millis() as u64,
++                total_ms = (hash_elapsed + root_elapsed).as_millis() as u64,
++                "N42_STATE_ROOT: leader finish() breakdown"
++            );
++            result
++        };
+ 
+         let (transactions, senders) =
+             self.transactions.into_iter().map(|tx| tx.into_parts()).unzip();
+diff --git a/crates/evm/evm/src/lib.rs b/crates/evm/evm/src/lib.rs
+index ee19f749b3..89f39caa82 100644
+--- a/crates/evm/evm/src/lib.rs
++++ b/crates/evm/evm/src/lib.rs
+@@ -52,6 +52,30 @@ pub use engine::{ConfigureEngineEvm, ConvertTx, ExecutableTxIterator, Executable
+ #[cfg(feature = "metrics")]
+ pub mod metrics;
+ pub mod noop;
++#[cfg(feature = "std")]
++pub mod payload_cache;
++/// Returns true if N42_SKIP_STATE_ROOT=1 is set (cached, read once at startup).
++/// Used for benchmark testing to measure throughput without state root overhead.
++#[cfg(feature = "std")]
++pub fn n42_skip_state_root() -> bool {
++    static SKIP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *SKIP.get_or_init(|| std::env::var("N42_SKIP_STATE_ROOT").map_or(false, |v| v == "1"))
++}
++
++/// Returns true if N42_DEFER_STATE_ROOT=1 is set (cached, read once at startup).
++///
++/// When enabled, state root computation is removed from the consensus critical path:
++/// - Leader uses B256::ZERO as placeholder in block header during finish()
++/// - Follower skips state root validation for blocks with B256::ZERO state root
++/// - State root is computed asynchronously after consensus commit for verification
++///
++/// Unlike `n42_skip_state_root` (which permanently skips), defer mode still verifies
++/// state root correctness — just not on the critical path.
++#[cfg(feature = "std")]
++pub fn n42_defer_state_root() -> bool {
++    static DEFER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *DEFER.get_or_init(|| std::env::var("N42_DEFER_STATE_ROOT").map_or(false, |v| v == "1"))
++}
+ #[cfg(any(test, feature = "test-utils"))]
+ /// test helpers for mocking executor
+ pub mod test_utils;
+diff --git a/crates/rpc/rpc-eth-types/src/utils.rs b/crates/rpc/rpc-eth-types/src/utils.rs
+index 5df161d33b..f53429864c 100644
+--- a/crates/rpc/rpc-eth-types/src/utils.rs
++++ b/crates/rpc/rpc-eth-types/src/utils.rs
+@@ -40,8 +40,19 @@ pub fn recover_raw_transaction<T: SignedTransaction>(data: &[u8]) -> EthResult<R
+     let transaction =
+         T::decode_2718_exact(data).map_err(|_| EthApiError::FailedToDecodeSignedTransaction)?;
+ 
+-    SignedTransaction::try_into_recovered(transaction)
+-        .or(Err(EthApiError::InvalidTransactionSignature))
++    // N42_SKIP_TX_VERIFY: skip EIP-2 low-s check for benchmarking (all test txs are correctly signed)
++    static SKIP_VERIFY: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
++        std::env::var("N42_SKIP_TX_VERIFY").map(|v| v == "1").unwrap_or(false)
++    });
++
++    if *SKIP_VERIFY {
++        transaction.recover_signer_unchecked()
++            .map(|signer| Recovered::new_unchecked(transaction, signer))
++            .map_err(|_| EthApiError::InvalidTransactionSignature)
++    } else {
++        SignedTransaction::try_into_recovered(transaction)
++            .or(Err(EthApiError::InvalidTransactionSignature))
++    }
+ }
+ 
+ /// Performs a binary search within a given block range to find the desired block number.
+diff --git a/crates/transaction-pool/Cargo.toml b/crates/transaction-pool/Cargo.toml
+index c5b9a7f4a0..74ce8e1bb3 100644
+--- a/crates/transaction-pool/Cargo.toml
++++ b/crates/transaction-pool/Cargo.toml
+@@ -56,6 +56,7 @@ serde_json.workspace = true
+ bitflags.workspace = true
+ auto_impl.workspace = true
+ smallvec.workspace = true
++im = "15"
+ 
+ # testing
+ rand = { workspace = true, optional = true }
+diff --git a/crates/transaction-pool/src/pool/best.rs b/crates/transaction-pool/src/pool/best.rs
+index 836eac6cc0..6094b8249a 100644
+--- a/crates/transaction-pool/src/pool/best.rs
++++ b/crates/transaction-pool/src/pool/best.rs
+@@ -8,8 +8,9 @@ use alloy_consensus::Transaction;
+ use alloy_primitives::map::AddressSet;
+ use core::fmt;
+ use reth_primitives_traits::transaction::error::InvalidTransactionError;
++use im::OrdMap;
+ use std::{
+-    collections::{BTreeMap, BTreeSet, HashSet, VecDeque},
++    collections::{BTreeSet, HashSet, VecDeque},
+     sync::Arc,
+ };
+ use tokio::sync::broadcast::{error::TryRecvError, Receiver};
+@@ -84,7 +85,7 @@ impl<T: TransactionOrdering> Iterator for BestTransactionsWithFees<T> {
+ pub struct BestTransactions<T: TransactionOrdering> {
+     /// Contains a copy of _all_ transactions of the pending pool at the point in time this
+     /// iterator was created.
+-    pub(crate) all: BTreeMap<TransactionId, PendingTransaction<T>>,
++    pub(crate) all: OrdMap<TransactionId, PendingTransaction<T>>,
+     /// Transactions that can be executed right away: these have the expected nonce.
+     ///
+     /// Once an `independent` transaction with the nonce `N` is returned, it unlocks `N+1`, which
+diff --git a/crates/transaction-pool/src/pool/pending.rs b/crates/transaction-pool/src/pool/pending.rs
+index 38ec6655a6..b15ade684e 100644
+--- a/crates/transaction-pool/src/pool/pending.rs
++++ b/crates/transaction-pool/src/pool/pending.rs
+@@ -8,10 +8,11 @@ use crate::{
+     },
+     Priority, SubPoolLimit, TransactionOrdering, ValidPoolTransaction,
+ };
++use im::OrdMap;
+ use rustc_hash::{FxHashMap, FxHashSet};
+ use std::{
+     cmp::Ordering,
+-    collections::{hash_map::Entry, BTreeMap},
++    collections::hash_map::Entry,
+     ops::Bound::Unbounded,
+     sync::Arc,
+ };
+@@ -36,7 +37,11 @@ pub struct PendingPool<T: TransactionOrdering> {
+     /// This way we can determine when transactions were submitted to the pool.
+     submission_id: u64,
+     /// _All_ Transactions that are currently inside the pool grouped by their identifier.
+-    by_id: BTreeMap<TransactionId, PendingTransaction<T>>,
++    ///
++    /// Uses `im::OrdMap` (persistent data structure) instead of `BTreeMap` for O(log n) clone
++    /// in `best()`. This eliminates the O(n) BTreeMap clone bottleneck that caused
++    /// pool_overhead to spike from 5ms to 500ms+ when pending pool exceeds 30K transactions.
++    by_id: OrdMap<TransactionId, PendingTransaction<T>>,
+     /// The highest nonce transactions for each sender - like the `independent` set, but the
+     /// highest instead of lowest nonce.
+     highest_nonces: FxHashMap<SenderId, PendingTransaction<T>>,
+@@ -80,7 +85,7 @@ impl<T: TransactionOrdering> PendingPool<T> {
+     /// # Returns
+     ///
+     /// Returns all transactions by id.
+-    fn clear_transactions(&mut self) -> BTreeMap<TransactionId, PendingTransaction<T>> {
++    fn clear_transactions(&mut self) -> OrdMap<TransactionId, PendingTransaction<T>> {
+         self.independent_transactions.clear();
+         self.highest_nonces.clear();
+         self.size_of.reset();
+@@ -525,7 +530,7 @@ impl<T: TransactionOrdering> PendingPool<T> {
+     }
+ 
+     /// All transactions grouped by id
+-    pub const fn by_id(&self) -> &BTreeMap<TransactionId, PendingTransaction<T>> {
++    pub fn by_id(&self) -> &OrdMap<TransactionId, PendingTransaction<T>> {
+         &self.by_id
+     }
+ 
