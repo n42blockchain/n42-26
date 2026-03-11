@@ -1,0 +1,29 @@
+[package]
+name = "n42-jmt"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "N42 Jellyfish Merkle Tree with Blake3 hashing, 16-shard parallelism, and Prometheus metrics"
+
+[dependencies]
+n42-execution.workspace = true
+
+jmt.workspace = true
+blake3.workspace = true
+
+alloy-primitives.workspace = true
+
+serde.workspace = true
+bincode.workspace = true
+tracing.workspace = true
+metrics.workspace = true
+anyhow = "1"
+eyre.workspace = true
+thiserror.workspace = true
+
+rayon.workspace = true
+parking_lot.workspace = true
+
+[dev-dependencies]
+rand.workspace = true
