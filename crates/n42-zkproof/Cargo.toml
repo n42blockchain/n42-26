@@ -6,6 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 description = "ZK sidecar proof system for N42 block execution verification"
 
+[features]
+default = []
+sp1 = ["dep:sp1-sdk"]
+
 [dependencies]
 alloy-primitives.workspace = true
 serde.workspace = true
@@ -15,6 +19,11 @@ tokio.workspace = true
 tracing.workspace = true
 metrics.workspace = true
 thiserror.workspace = true
+
+# SP1 (optional, behind "sp1" feature flag)
+# default-features = false avoids pulling in the "network" feature which
+# depends on alloy 0.14.x and conflicts with the workspace's alloy 1.x.
+sp1-sdk = { version = "4.0", optional = true, default-features = false }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }

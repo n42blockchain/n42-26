@@ -315,13 +315,23 @@ impl ConsensusOrchestrator {
         if let Some(ref scheduler) = self.zk_scheduler {
             if let Some(data) = self.pending_block_data.get(&block_hash) {
                 let block_count = self.committed_block_count;
+                // Extract decompressed CompactBlockExecution JSON from the raw
+                // BlockDataBroadcast. This is the same decompress path used by
+                // JMT and staking scan.
+                let bundle_json = match Self::extract_bundle_state_json(data) {
+                    Some(json) => json,
+                    None => {
+                        warn!(target: "n42::zk", block_count, "ZK input: failed to extract bundle_state_json, using empty (proof will be incomplete)");
+                        Vec::new()
+                    }
+                };
                 let input = n42_zkproof::BlockExecutionInput {
                     block_hash,
                     block_number: block_count,
                     parent_hash: self.head_block_hash,
                     header_rlp: Vec::new(),
                     transactions_rlp: Vec::new(),
-                    bundle_state_json: data.clone(),
+                    bundle_state_json: bundle_json,
                     parent_state_root: B256::ZERO,
                 };
                 scheduler.on_block_committed(block_count, input);
@@ -789,5 +799,13 @@ impl ConsensusOrchestrator {
         let decompressed = zstd::bulk::decompress(exec_bytes, 64 * 1024 * 1024).ok()?;
         let compact: super::CompactBlockExecution = serde_json::from_slice(&decompressed).ok()?;
         Some(n42_execution::state_diff::StateDiff::from_bundle_state(&compact.bundle_state))
+    }
+
+    /// Extract decompressed CompactBlockExecution JSON bytes from raw BlockDataBroadcast.
+    /// Returns `None` if the data is missing, malformed, or has no execution output.
+    fn extract_bundle_state_json(data: &[u8]) -> Option<Vec<u8>> {
+        let broadcast: super::BlockDataBroadcast = bincode::deserialize(data).ok()?;
+        let exec_bytes = broadcast.execution_output.as_ref()?;
+        zstd::bulk::decompress(exec_bytes, 64 * 1024 * 1024).ok()
     }
 }

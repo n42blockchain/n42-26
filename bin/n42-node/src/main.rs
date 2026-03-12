@@ -297,9 +297,46 @@ fn main() {
         info!(target: "n42::cli", "StakingManager initialized");
 
         // ZK proof sidecar: create scheduler if N42_ZK_PROOF=1.
+        // N42_ZK_BACKEND: "mock" (default) or "sp1" (requires sp1 feature + guest ELF)
+        // N42_ZK_MODE: "mock" (default), "cpu" (real proof, slow)
         let zk_scheduler = if env_bool("N42_ZK_PROOF") {
             let interval: u64 = env_parse("N42_ZK_INTERVAL").unwrap_or(300);
-            let prover: Arc<dyn n42_zkproof::ZkProver> = Arc::new(MockProver::new());
+            let backend = std::env::var("N42_ZK_BACKEND").unwrap_or_else(|_| "mock".to_string());
+            let prover: Arc<dyn n42_zkproof::ZkProver> = match backend.as_str() {
+                #[cfg(feature = "sp1")]
+                "sp1" => {
+                    let mode_str = std::env::var("N42_ZK_MODE").unwrap_or_else(|_| "mock".to_string());
+                    let mode = n42_zkproof::Sp1Mode::from_str_lossy(&mode_str);
+                    match n42_zkproof::Sp1Prover::from_env(mode) {
+                        Ok(p) => {
+                            info!(target: "n42::cli", ?mode, "SP1 prover backend loaded");
+                            Arc::new(p)
+                        }
+                        Err(e) => {
+                            warn!(target: "n42::cli", error=%e, "SP1 prover init failed, falling back to mock");
+                            Arc::new(MockProver::new())
+                        }
+                    }
+                }
+                #[cfg(not(feature = "sp1"))]
+                "sp1" => {
+                    warn!(
+                        target: "n42::cli",
+                        "N42_ZK_BACKEND=sp1 but binary was built without --features sp1, falling back to mock"
+                    );
+                    Arc::new(MockProver::new())
+                }
+                "mock" => Arc::new(MockProver::new()),
+                other => {
+                    warn!(
+                        target: "n42::cli",
+                        backend = other,
+                        "unknown ZK backend, falling back to mock"
+                    );
+                    Arc::new(MockProver::new())
+                }
+            };
+            let backend_name = prover.name().to_string();
             let store = Arc::new(ProofStore::new(1000));
             let zk_state = consensus_state.clone();
             let callback: n42_zkproof::ProofCallback = Arc::new(move |block_number, block_hash| {
@@ -308,7 +345,7 @@ fn main() {
             let scheduler = Arc::new(
                 ProofScheduler::new(prover, interval, store).with_callback(callback),
             );
-            info!(target: "n42::cli", interval, "ZK proof sidecar enabled (mock backend)");
+            info!(target: "n42::cli", interval, backend = %backend_name, "ZK proof sidecar enabled");
             Some(scheduler)
         } else {
             None

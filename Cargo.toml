@@ -17,10 +17,13 @@ members = [
     "crates/n42-zkproof",
     "tests/e2e",
 ]
+exclude = [
+    "crates/n42-zkproof-guest",  # Built with SP1 RISC-V toolchain, not host toolchain
+]
 resolver = "2"
 
 [workspace.package]
-version = "0.3.1"
+version = "0.4.2"
 edition = "2024"
 rust-version = "1.93"
 license = "MIT OR Apache-2.0"

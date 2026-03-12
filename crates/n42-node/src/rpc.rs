@@ -117,6 +117,7 @@ pub struct ZkProofResponse {
     pub verified: bool,
     pub proof_hex: String,
     pub public_values_hex: String,
+    pub created_at: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -127,6 +128,9 @@ pub struct ZkStatusResponse {
     pub proof_interval: u64,
     pub proofs_stored: usize,
     pub latest_proof_block: Option<u64>,
+    pub total_generated: u64,
+    pub total_failed: u64,
+    pub in_progress: usize,
 }
 
 /// N42-specific RPC API.
@@ -188,6 +192,10 @@ pub trait N42Api {
     /// Returns the ZK proof for a given block number.
     #[method(name = "zkProof")]
     async fn zk_proof(&self, block_number: u64) -> RpcResult<ZkProofResponse>;
+
+    /// Returns the ZK proof for a given block hash.
+    #[method(name = "zkProofByHash")]
+    async fn zk_proof_by_hash(&self, block_hash: B256) -> RpcResult<ZkProofResponse>;
 
     /// Returns the latest generated ZK proof.
     #[method(name = "zkLatest")]
@@ -581,6 +589,20 @@ impl N42ApiServer for N42RpcServer {
         Ok(proof_result_to_response(&result))
     }
 
+    async fn zk_proof_by_hash(&self, block_hash: B256) -> RpcResult<ZkProofResponse> {
+        let scheduler = self.zk_scheduler.as_ref().ok_or_else(|| {
+            ErrorObjectOwned::owned(-32001, "ZK proof not enabled on this node", None::<()>)
+        })?;
+        let result = scheduler.proof_store().get_by_hash(&block_hash).ok_or_else(|| {
+            ErrorObjectOwned::owned(
+                -32001,
+                format!("no ZK proof found for block hash {block_hash:?}"),
+                None::<()>,
+            )
+        })?;
+        Ok(proof_result_to_response(&result))
+    }
+
     async fn zk_latest(&self) -> RpcResult<ZkProofResponse> {
         let scheduler = self.zk_scheduler.as_ref().ok_or_else(|| {
             ErrorObjectOwned::owned(-32001, "ZK proof not enabled on this node", None::<()>)
@@ -595,28 +617,48 @@ impl N42ApiServer for N42RpcServer {
         let scheduler = self.zk_scheduler.as_ref().ok_or_else(|| {
             ErrorObjectOwned::owned(-32001, "ZK proof not enabled on this node", None::<()>)
         })?;
-        let _result = scheduler.proof_store().get_by_block(block_number).ok_or_else(|| {
+        let result = scheduler.proof_store().get_by_block(block_number).ok_or_else(|| {
             ErrorObjectOwned::owned(
                 -32001,
                 format!("no ZK proof found for block {block_number}"),
                 None::<()>,
             )
         })?;
-        // The proof was already self-verified at generation time.
-        // Full re-verification requires the prover instance; return the cached result.
-        Ok(_result.verified)
+        // Re-verify using the prover instance. Use spawn_blocking to avoid
+        // blocking the tokio thread (SP1 verification involves crypto work).
+        let prover = scheduler.prover().clone();
+        let verify_result = tokio::task::spawn_blocking(move || prover.verify(&result))
+            .await
+            .map_err(|e| {
+                ErrorObjectOwned::owned(-32603, format!("verification task failed: {e}"), None::<()>)
+            })?;
+        match verify_result {
+            Ok(valid) => Ok(valid),
+            Err(e) => {
+                warn!(target: "n42::zk::rpc", block_number, error = %e, "ZK proof re-verification error");
+                Err(ErrorObjectOwned::owned(
+                    -32603,
+                    format!("verification error: {e}"),
+                    None::<()>,
+                ))
+            }
+        }
     }
 
     async fn zk_status(&self) -> RpcResult<ZkStatusResponse> {
         match &self.zk_scheduler {
             Some(scheduler) => {
                 let latest_block = scheduler.proof_store().latest().map(|p| p.block_number);
+                let stats = scheduler.proof_store().stats();
                 Ok(ZkStatusResponse {
                     enabled: true,
                     backend: scheduler.backend_name().to_string(),
                     proof_interval: scheduler.proof_interval(),
                     proofs_stored: scheduler.proof_store().len(),
                     latest_proof_block: latest_block,
+                    total_generated: stats.generated,
+                    total_failed: stats.failed,
+                    in_progress: scheduler.in_progress_count(),
                 })
             }
             None => Ok(ZkStatusResponse {
@@ -625,6 +667,9 @@ impl N42ApiServer for N42RpcServer {
                 proof_interval: 0,
                 proofs_stored: 0,
                 latest_proof_block: None,
+                total_generated: 0,
+                total_failed: 0,
+                in_progress: 0,
             }),
         }
     }
@@ -641,6 +686,7 @@ fn proof_result_to_response(result: &n42_zkproof::ZkProofResult) -> ZkProofRespo
         verified: result.verified,
         proof_hex: hex::encode(&result.proof_bytes),
         public_values_hex: hex::encode(&result.public_values),
+        created_at: result.created_at,
     }
 }
 
