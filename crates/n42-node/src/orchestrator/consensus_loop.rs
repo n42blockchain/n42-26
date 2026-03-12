@@ -310,18 +310,21 @@ impl ConsensusOrchestrator {
         }
 
         // ZK proof sidecar: schedule proof generation (async, non-blocking).
+        // Uses committed_block_count (monotonically increasing) for interval check,
+        // not view (which can skip on timeouts).
         if let Some(ref scheduler) = self.zk_scheduler {
             if let Some(data) = self.pending_block_data.get(&block_hash) {
+                let block_count = self.committed_block_count;
                 let input = n42_zkproof::BlockExecutionInput {
                     block_hash,
-                    block_number: view,
+                    block_number: block_count,
                     parent_hash: self.head_block_hash,
                     header_rlp: Vec::new(),
                     transactions_rlp: Vec::new(),
                     bundle_state_json: data.clone(),
                     parent_state_root: B256::ZERO,
                 };
-                scheduler.on_block_committed(view, input);
+                scheduler.on_block_committed(block_count, input);
             }
         }
 

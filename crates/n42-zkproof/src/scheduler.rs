@@ -1,11 +1,14 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use metrics::{counter, gauge, histogram};
 use tracing::{info, warn};
 
 use crate::prover::{BlockExecutionInput, ZkProver};
 use crate::store::ProofStore;
+
+/// Optional callback invoked after a proof is successfully generated.
+/// Used to update SharedConsensusState or other external state.
+pub type ProofCallback = Arc<dyn Fn(u64, alloy_primitives::B256) + Send + Sync>;
 
 /// Schedules ZK proof generation at configurable block intervals.
 ///
@@ -16,8 +19,7 @@ pub struct ProofScheduler {
     prover: Arc<dyn ZkProver>,
     proof_interval: u64,
     proof_store: Arc<ProofStore>,
-    proofs_generated: AtomicU64,
-    proofs_failed: AtomicU64,
+    on_proof_generated: Option<ProofCallback>,
 }
 
 impl ProofScheduler {
@@ -38,9 +40,15 @@ impl ProofScheduler {
             prover,
             proof_interval: interval,
             proof_store,
-            proofs_generated: AtomicU64::new(0),
-            proofs_failed: AtomicU64::new(0),
+            on_proof_generated: None,
         }
+    }
+
+    /// Sets a callback invoked after each successful proof generation.
+    /// Typically used to update `SharedConsensusState.zk_latest_proof`.
+    pub fn with_callback(mut self, cb: ProofCallback) -> Self {
+        self.on_proof_generated = Some(cb);
+        self
     }
 
     /// Called by the orchestrator after each block commit.
@@ -55,6 +63,7 @@ impl ProofScheduler {
 
         let prover = Arc::clone(&self.prover);
         let store = Arc::clone(&self.proof_store);
+        let callback = self.on_proof_generated.clone();
 
         tokio::task::spawn_blocking(move || {
             info!(target: "n42::zk", block_number, "starting ZK proof generation");
@@ -73,7 +82,11 @@ impl ProofScheduler {
                         verified = result.verified,
                         "ZK proof generated"
                     );
+                    let block_hash = result.block_hash;
                     store.insert(result);
+                    if let Some(cb) = callback {
+                        cb(block_number, block_hash);
+                    }
                 }
                 Err(e) => {
                     counter!("n42_zk_proof_failed_total").increment(1);
@@ -86,10 +99,6 @@ impl ProofScheduler {
                 }
             }
         });
-
-        // Update local counters (approximate — the spawn_blocking hasn't
-        // finished yet, but we track the *attempt* count).
-        self.proofs_generated.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Returns the configured proof interval.
@@ -107,13 +116,6 @@ impl ProofScheduler {
         self.prover.name()
     }
 
-    /// Returns (attempts, failures) counts.
-    pub fn stats(&self) -> (u64, u64) {
-        (
-            self.proofs_generated.load(Ordering::Relaxed),
-            self.proofs_failed.load(Ordering::Relaxed),
-        )
-    }
 }
 
 #[cfg(test)]

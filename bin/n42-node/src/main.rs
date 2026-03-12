@@ -301,7 +301,13 @@ fn main() {
             let interval: u64 = env_parse("N42_ZK_INTERVAL").unwrap_or(300);
             let prover: Arc<dyn n42_zkproof::ZkProver> = Arc::new(MockProver::new());
             let store = Arc::new(ProofStore::new(1000));
-            let scheduler = Arc::new(ProofScheduler::new(prover, interval, store));
+            let zk_state = consensus_state.clone();
+            let callback: n42_zkproof::ProofCallback = Arc::new(move |block_number, block_hash| {
+                zk_state.update_zk_proof(block_number, block_hash);
+            });
+            let scheduler = Arc::new(
+                ProofScheduler::new(prover, interval, store).with_callback(callback),
+            );
             info!(target: "n42::cli", interval, "ZK proof sidecar enabled (mock backend)");
             Some(scheduler)
         } else {
