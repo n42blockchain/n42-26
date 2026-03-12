@@ -18,6 +18,7 @@ use n42_node::epoch_schedule::EpochSchedule;
 use n42_node::persistence;
 use n42_node::rpc::{N42ApiServer, N42RpcServer};
 use n42_node::staking::StakingManager;
+use n42_zkproof::{MockProver, ProofScheduler, ProofStore};
 use n42_node::tx_bridge::TxPoolBridge;
 use n42_node::{ConsensusOrchestrator, ObserverOrchestrator, N42Node, SharedConsensusState};
 use n42_primitives::BlsSecretKey;
@@ -295,13 +296,29 @@ fn main() {
         ));
         info!(target: "n42::cli", "StakingManager initialized");
 
+        // ZK proof sidecar: create scheduler if N42_ZK_PROOF=1.
+        let zk_scheduler = if env_bool("N42_ZK_PROOF") {
+            let interval: u64 = env_parse("N42_ZK_INTERVAL").unwrap_or(300);
+            let prover: Arc<dyn n42_zkproof::ZkProver> = Arc::new(MockProver::new());
+            let store = Arc::new(ProofStore::new(1000));
+            let scheduler = Arc::new(ProofScheduler::new(prover, interval, store));
+            info!(target: "n42::cli", interval, "ZK proof sidecar enabled (mock backend)");
+            Some(scheduler)
+        } else {
+            None
+        };
+
         let rpc_consensus_state = consensus_state.clone();
         let rpc_staking_manager = staking_manager.clone();
+        let rpc_zk_scheduler = zk_scheduler.clone();
         let handle = builder
             .node(n42_node)
             .extend_rpc_modules(move |ctx| {
-                let rpc_server = N42RpcServer::new(rpc_consensus_state)
+                let mut rpc_server = N42RpcServer::new(rpc_consensus_state)
                     .with_staking_manager(rpc_staking_manager);
+                if let Some(scheduler) = rpc_zk_scheduler {
+                    rpc_server = rpc_server.with_zk_scheduler(scheduler);
+                }
                 ctx.modules.merge_configured(rpc_server.into_rpc())?;
                 info!(target: "n42::cli", "N42 RPC namespace registered");
                 Ok(())
@@ -775,6 +792,9 @@ fn main() {
 
                 if let Some(schedule) = epoch_schedule {
                     orchestrator = orchestrator.with_epoch_schedule(schedule);
+                }
+                if let Some(scheduler) = zk_scheduler {
+                    orchestrator = orchestrator.with_zk_scheduler(scheduler);
                 }
 
                 let orchestrator = orchestrator;

@@ -5,6 +5,7 @@ use crate::staking::{StakingManager, StakeStatus, MIN_STAKE_WEI, UNSTAKE_COOLDOW
 use crate::consensus_state::VerificationTask;
 use alloy_primitives::{Address, B256, U256};
 use n42_jmt::ShardedJmt;
+use n42_zkproof::ProofScheduler;
 use jsonrpsee::core::RpcResult;
 use jsonrpsee::core::SubscriptionResult;
 use jsonrpsee::proc_macros::rpc;
@@ -104,6 +105,30 @@ pub struct JmtProofResponse {
     pub root: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ZkProofResponse {
+    pub block_number: u64,
+    pub block_hash: String,
+    pub proof_type: String,
+    pub prover_backend: String,
+    pub proof_size: usize,
+    pub generation_ms: u64,
+    pub verified: bool,
+    pub proof_hex: String,
+    pub public_values_hex: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ZkStatusResponse {
+    pub enabled: bool,
+    pub backend: String,
+    pub proof_interval: u64,
+    pub proofs_stored: usize,
+    pub latest_proof_block: Option<u64>,
+}
+
 /// N42-specific RPC API.
 #[rpc(server, namespace = "n42")]
 pub trait N42Api {
@@ -159,12 +184,29 @@ pub trait N42Api {
     /// Returns the current JMT version (block count since genesis).
     #[method(name = "jmtVersion")]
     async fn jmt_version(&self) -> RpcResult<u64>;
+
+    /// Returns the ZK proof for a given block number.
+    #[method(name = "zkProof")]
+    async fn zk_proof(&self, block_number: u64) -> RpcResult<ZkProofResponse>;
+
+    /// Returns the latest generated ZK proof.
+    #[method(name = "zkLatest")]
+    async fn zk_latest(&self) -> RpcResult<ZkProofResponse>;
+
+    /// Verifies the ZK proof for a given block number.
+    #[method(name = "zkVerify")]
+    async fn zk_verify(&self, block_number: u64) -> RpcResult<bool>;
+
+    /// Returns ZK proof subsystem status and statistics.
+    #[method(name = "zkStatus")]
+    async fn zk_status(&self) -> RpcResult<ZkStatusResponse>;
 }
 
 pub struct N42RpcServer {
     consensus_state: Arc<SharedConsensusState>,
     staking_manager: Option<Arc<Mutex<StakingManager>>>,
     jmt: Option<Arc<Mutex<ShardedJmt>>>,
+    zk_scheduler: Option<Arc<ProofScheduler>>,
 }
 
 impl N42RpcServer {
@@ -173,6 +215,7 @@ impl N42RpcServer {
             consensus_state,
             staking_manager: None,
             jmt: None,
+            zk_scheduler: None,
         }
     }
 
@@ -183,6 +226,11 @@ impl N42RpcServer {
 
     pub fn with_jmt(mut self, jmt: Arc<Mutex<ShardedJmt>>) -> Self {
         self.jmt = Some(jmt);
+        self
+    }
+
+    pub fn with_zk_scheduler(mut self, scheduler: Arc<ProofScheduler>) -> Self {
+        self.zk_scheduler = Some(scheduler);
         self
     }
 }
@@ -517,6 +565,82 @@ impl N42ApiServer for N42RpcServer {
             ErrorObjectOwned::owned(-32603, "JMT lock poisoned", None::<()>)
         })?;
         Ok(tree.version())
+    }
+
+    async fn zk_proof(&self, block_number: u64) -> RpcResult<ZkProofResponse> {
+        let scheduler = self.zk_scheduler.as_ref().ok_or_else(|| {
+            ErrorObjectOwned::owned(-32001, "ZK proof not enabled on this node", None::<()>)
+        })?;
+        let result = scheduler.proof_store().get_by_block(block_number).ok_or_else(|| {
+            ErrorObjectOwned::owned(
+                -32001,
+                format!("no ZK proof found for block {block_number}"),
+                None::<()>,
+            )
+        })?;
+        Ok(proof_result_to_response(&result))
+    }
+
+    async fn zk_latest(&self) -> RpcResult<ZkProofResponse> {
+        let scheduler = self.zk_scheduler.as_ref().ok_or_else(|| {
+            ErrorObjectOwned::owned(-32001, "ZK proof not enabled on this node", None::<()>)
+        })?;
+        let result = scheduler.proof_store().latest().ok_or_else(|| {
+            ErrorObjectOwned::owned(-32001, "no ZK proofs generated yet", None::<()>)
+        })?;
+        Ok(proof_result_to_response(&result))
+    }
+
+    async fn zk_verify(&self, block_number: u64) -> RpcResult<bool> {
+        let scheduler = self.zk_scheduler.as_ref().ok_or_else(|| {
+            ErrorObjectOwned::owned(-32001, "ZK proof not enabled on this node", None::<()>)
+        })?;
+        let _result = scheduler.proof_store().get_by_block(block_number).ok_or_else(|| {
+            ErrorObjectOwned::owned(
+                -32001,
+                format!("no ZK proof found for block {block_number}"),
+                None::<()>,
+            )
+        })?;
+        // The proof was already self-verified at generation time.
+        // Full re-verification requires the prover instance; return the cached result.
+        Ok(_result.verified)
+    }
+
+    async fn zk_status(&self) -> RpcResult<ZkStatusResponse> {
+        match &self.zk_scheduler {
+            Some(scheduler) => {
+                let latest_block = scheduler.proof_store().latest().map(|p| p.block_number);
+                Ok(ZkStatusResponse {
+                    enabled: true,
+                    backend: scheduler.backend_name().to_string(),
+                    proof_interval: scheduler.proof_interval(),
+                    proofs_stored: scheduler.proof_store().len(),
+                    latest_proof_block: latest_block,
+                })
+            }
+            None => Ok(ZkStatusResponse {
+                enabled: false,
+                backend: String::new(),
+                proof_interval: 0,
+                proofs_stored: 0,
+                latest_proof_block: None,
+            }),
+        }
+    }
+}
+
+fn proof_result_to_response(result: &n42_zkproof::ZkProofResult) -> ZkProofResponse {
+    ZkProofResponse {
+        block_number: result.block_number,
+        block_hash: format!("{:?}", result.block_hash),
+        proof_type: format!("{}", result.proof_type),
+        prover_backend: result.prover_backend.clone(),
+        proof_size: result.proof_bytes.len(),
+        generation_ms: result.generation_ms,
+        verified: result.verified,
+        proof_hex: hex::encode(&result.proof_bytes),
+        public_values_hex: hex::encode(&result.public_values),
     }
 }
 

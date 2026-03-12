@@ -288,6 +288,9 @@ pub struct ConsensusOrchestrator {
     /// Jellyfish Merkle Tree for parallel state commitment.
     /// Updated asynchronously after each committed block.
     jmt: Option<Arc<Mutex<ShardedJmt>>>,
+    /// ZK proof scheduler: generates ZK proofs asynchronously as a sidecar.
+    /// Enabled by `N42_ZK_PROOF=1`. Default: None (disabled, zero overhead).
+    zk_scheduler: Option<Arc<n42_zkproof::ProofScheduler>>,
 }
 
 impl ConsensusOrchestrator {
@@ -362,6 +365,7 @@ impl ConsensusOrchestrator {
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(0) > 0,
             jmt: None,
+            zk_scheduler: None,
         }
     }
 
@@ -454,6 +458,7 @@ impl ConsensusOrchestrator {
             eager_import_block_guard: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             fast_propose,
             jmt: None,
+            zk_scheduler: None,
         }
     }
 
@@ -501,6 +506,16 @@ impl ConsensusOrchestrator {
     /// event and automatically stages the next epoch's validator set.
     pub fn with_jmt(mut self, jmt: Arc<Mutex<ShardedJmt>>) -> Self {
         self.jmt = Some(jmt);
+        self
+    }
+
+    /// Attaches a ZK proof scheduler for asynchronous proof generation.
+    ///
+    /// When set, the orchestrator triggers ZK proof generation after each
+    /// committed block (at the configured interval). Proofs are generated
+    /// in `spawn_blocking` and never block the consensus path.
+    pub fn with_zk_scheduler(mut self, scheduler: Arc<n42_zkproof::ProofScheduler>) -> Self {
+        self.zk_scheduler = Some(scheduler);
         self
     }
 

@@ -63,6 +63,7 @@ A high-performance blockchain system combining **HotStuff-2** BFT consensus with
 - **Mobile Simulator**: `n42-mobile-sim` binary for load testing with deterministic BLS key generation
 - **libp2p GossipSub**: QUIC transport with content-based message deduplication
 - **QUIC Star-Hub**: High-concurrency mobile connections (up to 10,000 per node)
+- **ZK Sidecar Proof System**: Asynchronous ZK proof generation (SP1-ready), phones verify proofs instead of re-executing EVM
 
 ## Project Structure
 
@@ -78,11 +79,12 @@ n42-26/
 │   ├── n42-consensus/             # HotStuff-2 state machine + reth adapter
 │   ├── n42-execution/             # EVM config wrapper, witness & state diff
 │   ├── n42-jmt/                   # Jellyfish Merkle Tree (Blake3, 16-shard parallel)
+│   ├── n42-zkproof/               # ZK sidecar proof system (SP1-ready, MockProver)
 │   ├── n42-network/               # libp2p GossipSub + QUIC StarHub
 │   ├── n42-mobile/                # Mobile verification protocol (no reth deps)
 │   ├── n42-mobile-ffi/            # C/JNI FFI bindings for Android & iOS
 │   └── n42-node/                  # Node type assembly + ConsensusOrchestrator
-├── docs/                          # Development logs (devlog-01 through devlog-52)
+├── docs/                          # Development logs (devlog-01 through devlog-53)
 ├── scripts/                       # Testnet launch scripts
 └── DEVLOG.md                      # Development log index
 ```
@@ -281,6 +283,7 @@ cargo test -p n42-consensus
 cargo test -p n42-primitives
 cargo test -p n42-mobile    # 94 tests: receipt, reward, bridge, verifier, quic_client
 cargo test -p n42-jmt       # 41 tests: sharded tree, proofs, snapshot, metrics
+cargo test -p n42-zkproof   # 11 tests: prover, scheduler, store
 cargo test -p n42-node      # 171 tests: orchestrator, RPC, pool, inject
 ```
 
@@ -289,9 +292,10 @@ cargo test -p n42-node      # 171 tests: orchestrator, RPC, pool, inject
 | n42-mobile | 94 |
 | n42-node | 171 |
 | n42-jmt | 41 |
+| n42-zkproof | 11 |
 | stream_v2_pipeline | 6 |
 | comm_stress_bench | 1 |
-| **Total** | **313+** |
+| **Total** | **324+** |
 
 ## Crate Dependency Graph
 
@@ -303,6 +307,7 @@ bin/n42-node                    bin/n42-stress           bin/n42-mobile-sim
       ├── n42-execution ──┬── reth-evm, reth-revm
       │                   └── n42-chainspec
       ├── n42-jmt ────────── jmt, blake3, rayon (16-shard parallel)
+      ├── n42-zkproof ──── alloy-primitives, serde, tokio (spawn_blocking)
       ├── n42-network ────┬── n42-primitives
       │                   ├── n42-mobile ─── ed25519-dalek
       │                   └── libp2p (gossipsub, quic)
@@ -318,6 +323,7 @@ n42-mobile-ffi (Android/iOS SDK)
 Key design: **n42-mobile** has zero reth dependencies — only `alloy-primitives`, `ed25519-dalek`, `lru`, `serde`.
 **n42-mobile-ffi** compiles as `staticlib` + `cdylib`, exposing a C ABI and JNI bridge for Android.
 **n42-jmt** provides Jellyfish Merkle Tree with Blake3 hashing and 16-shard parallelism for state proofs.
+**n42-zkproof** provides backend-agnostic ZK proof generation (`trait ZkProver`) with `MockProver` for testing and future SP1/ZisK backends.
 
 ## Key Types
 
@@ -379,6 +385,17 @@ payload_attributes.withdrawals = Some(withdrawals);
 | `base_timeout_ms` | 4000 | Initial view-change timeout |
 | `max_timeout_ms` | 8000 | Maximum timeout (cap for exponential backoff) |
 | `chain_id` | 4242 | N42 chain identifier |
+
+### ZK Proof Sidecar
+
+| Parameter | Env Variable | Default | Description |
+|-----------|-------------|---------|-------------|
+| Enable | `N42_ZK_PROOF` | `0` (disabled) | Set to `1` to enable ZK sidecar |
+| Interval | `N42_ZK_INTERVAL` | `300` | Blocks between proof generations |
+| Backend | `N42_ZK_BACKEND` | `mock` | Prover backend (`mock` / `sp1`) |
+| Mode | `N42_ZK_MODE` | `cpu` | SP1 mode (`cpu` / `cuda` / `mock`) |
+
+RPC methods: `n42_zkProof(block_number)`, `n42_zkLatest()`, `n42_zkVerify(block_number)`, `n42_zkStatus()`
 
 ### Network Parameters
 

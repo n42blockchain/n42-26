@@ -146,6 +146,8 @@ pub struct SharedConsensusState {
     /// Latest JMT (Jellyfish Merkle Tree) root and version.
     /// Updated asynchronously after each committed block's state diff is applied.
     pub(crate) jmt_root: ArcSwap<Option<(u64, B256)>>,
+    /// Latest ZK proof block number and hash (updated by ProofScheduler).
+    pub(crate) zk_latest_proof: ArcSwap<Option<(u64, B256)>>,
 }
 
 impl SharedConsensusState {
@@ -169,6 +171,7 @@ impl SharedConsensusState {
             equivocation_log: Mutex::new(VecDeque::new()),
             authorized_verifiers: Mutex::new(HashSet::new()),
             jmt_root: ArcSwap::from_pointee(None),
+            zk_latest_proof: ArcSwap::from_pointee(None),
         }
     }
 
@@ -309,6 +312,16 @@ impl SharedConsensusState {
     /// Loads the latest JMT root hash and version, if available.
     pub fn load_jmt_root(&self) -> Arc<Option<(u64, B256)>> {
         self.jmt_root.load_full()
+    }
+
+    /// Updates the latest ZK proof block number and hash.
+    pub fn update_zk_proof(&self, block_number: u64, block_hash: B256) {
+        self.zk_latest_proof.store(Arc::new(Some((block_number, block_hash))));
+    }
+
+    /// Loads the latest ZK proof info (block_number, block_hash), if available.
+    pub fn load_zk_latest_proof(&self) -> Arc<Option<(u64, B256)>> {
+        self.zk_latest_proof.load_full()
     }
 
     /// Registers the block for attestation tracking and notifies RPC subscribers.

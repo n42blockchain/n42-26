@@ -14,6 +14,7 @@ members = [
     "crates/n42-node",
     "crates/n42-parallel-evm",
     "crates/n42-jmt",
+    "crates/n42-zkproof",
     "tests/e2e",
 ]
 resolver = "2"
@@ -36,6 +37,7 @@ n42-network = { path = "crates/n42-network" }
 n42-node = { path = "crates/n42-node" }
 n42-parallel-evm = { path = "crates/n42-parallel-evm" }
 n42-jmt = { path = "crates/n42-jmt" }
+n42-zkproof = { path = "crates/n42-zkproof" }
 
 # reth dependencies (local path)
 reth-chainspec = { path = "../reth/crates/chainspec" }
