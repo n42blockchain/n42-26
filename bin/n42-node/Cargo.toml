@@ -29,6 +29,7 @@ alloy-primitives.workspace = true
 
 jsonrpsee.workspace = true
 clap = { version = "4", features = ["derive"] }
+tikv-jemallocator = { version = "0.6", optional = true }
 eyre.workspace = true
 hex.workspace = true
 tokio.workspace = true
@@ -39,3 +40,7 @@ serde_json.workspace = true
 aes-gcm.workspace = true
 scrypt.workspace = true
 rand.workspace = true
+
+[features]
+default = ["jemalloc"]
+jemalloc = ["tikv-jemallocator"]

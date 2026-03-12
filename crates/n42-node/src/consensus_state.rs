@@ -143,6 +143,9 @@ pub struct SharedConsensusState {
     /// BLS pubkeys of verifiers that have completed a QUIC handshake with StarHub.
     /// Only keys in this set are accepted by `submit_attestation` (RPC path).
     authorized_verifiers: Mutex<HashSet<[u8; 48]>>,
+    /// Latest JMT (Jellyfish Merkle Tree) root and version.
+    /// Updated asynchronously after each committed block's state diff is applied.
+    pub(crate) jmt_root: ArcSwap<Option<(u64, B256)>>,
 }
 
 impl SharedConsensusState {
@@ -165,6 +168,7 @@ impl SharedConsensusState {
             attestation_history: Mutex::new(VecDeque::new()),
             equivocation_log: Mutex::new(VecDeque::new()),
             authorized_verifiers: Mutex::new(HashSet::new()),
+            jmt_root: ArcSwap::from_pointee(None),
         }
     }
 
@@ -295,6 +299,16 @@ impl SharedConsensusState {
             e.into_inner()
         });
         set.iter().copied().collect()
+    }
+
+    /// Updates the latest JMT root hash and version (called from background JMT update task).
+    pub fn update_jmt_root(&self, version: u64, root: B256) {
+        self.jmt_root.store(Arc::new(Some((version, root))));
+    }
+
+    /// Loads the latest JMT root hash and version, if available.
+    pub fn load_jmt_root(&self) -> Arc<Option<(u64, B256)>> {
+        self.jmt_root.load_full()
     }
 
     /// Registers the block for attestation tracking and notifies RPC subscribers.

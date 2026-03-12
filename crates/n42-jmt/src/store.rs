@@ -32,6 +32,8 @@ pub struct MemTreeStore {
     /// Versions that have been pruned (stale nodes removed).
     /// Tracks the minimum retained version for future GC.
     min_retained_version: RwLock<Version>,
+    /// The latest version written to this store.
+    latest_version: RwLock<Version>,
 }
 
 impl MemTreeStore {
@@ -67,6 +69,22 @@ impl MemTreeStore {
         });
 
         *self.min_retained_version.write() = cutoff;
+    }
+
+    /// Dump all live key-value pairs at the latest version.
+    ///
+    /// Returns `(KeyHash bytes, value bytes)` for each key that has a live value.
+    /// Used for snapshot persistence.
+    pub fn dump_latest(&self) -> Vec<([u8; 32], Vec<u8>)> {
+        let values = self.values.read();
+        let latest = *self.latest_version.read();
+        let mut result = Vec::new();
+        for (key_hash, versions) in values.iter() {
+            if let Some((_, ValueEntry::Live(val))) = versions.range(..=latest).next_back() {
+                result.push((key_hash.0, val.clone()));
+            }
+        }
+        result
     }
 }
 
@@ -118,12 +136,20 @@ impl TreeWriter for MemTreeStore {
         }
 
         let mut values = self.values.write();
+        let mut max_version = 0u64;
         for ((version, key_hash), maybe_value) in node_batch.values() {
             let entry = match maybe_value {
                 Some(value) => ValueEntry::Live(value.clone()),
                 None => ValueEntry::Deleted, // record tombstone for deletions
             };
             values.entry(*key_hash).or_default().insert(*version, entry);
+            max_version = max_version.max(*version);
+        }
+
+        // Track the latest version written.
+        let mut latest = self.latest_version.write();
+        if max_version > *latest {
+            *latest = max_version;
         }
         Ok(())
     }

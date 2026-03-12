@@ -1,5 +1,9 @@
 mod keystore;
 
+#[cfg(feature = "jemalloc")]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use alloy_primitives::Address;
 use clap::Parser;
 use n42_chainspec::ConsensusConfig;
@@ -124,6 +128,17 @@ fn main() {
 
     if let Err(err) = Cli::<EthereumChainSpecParser>::parse().run(async move |builder, _| {
         info!(target: "n42::cli", "Launching N42 node");
+
+        // Warn about benchmark/debug env vars that weaken security.
+        for (var, desc) in [
+            ("N42_SKIP_TX_VERIFY", "signature verification bypassed"),
+            ("N42_SKIP_STATE_ROOT", "state root computation skipped"),
+            ("N42_DEFER_STATE_ROOT", "state root computation deferred"),
+        ] {
+            if std::env::var(var).map_or(false, |v| v == "1") {
+                warn!(target: "n42::cli", var, desc, "BENCHMARK MODE: {var}=1 — NOT FOR PRODUCTION");
+            }
+        }
 
         // Priority: N42_CONSENSUS_CONFIG file > N42_VALIDATOR_COUNT dev mode.
         let mut consensus_config = match std::env::var("N42_CONSENSUS_CONFIG") {
@@ -463,12 +478,15 @@ fn main() {
 
                 let starhub_port = env_parse("N42_STARHUB_PORT").unwrap_or(9443);
                 let shard_count = env_parse("N42_STARHUB_SHARDS").unwrap_or(1);
+                let low_mem = env_bool("N42_LOW_MEMORY");
+                let max_conns_per_shard: usize = env_parse("N42_STARHUB_MAX_CONNS")
+                    .unwrap_or(if low_mem { 100 } else { 10_000 });
 
                 let (sharded_hub, star_hub_handle, hub_event_rx) =
                     ShardedStarHub::new(ShardedStarHubConfig {
                         base_port: starhub_port,
                         shard_count,
-                        max_connections_per_shard: 10_000,
+                        max_connections_per_shard: max_conns_per_shard,
                         cert_dir: Some(data_dir.join("certs")),
                         ..Default::default()
                     }).expect("Failed to create ShardedStarHub — check base_port + shard_count");
@@ -610,7 +628,7 @@ fn main() {
                     }
                 };
 
-                let (output_tx, output_rx) = mpsc::channel(1024);
+                let (output_tx, output_rx) = mpsc::channel(if low_mem { 64 } else { 1024 });
                 let snapshot = match persistence::load_consensus_state(&state_file) {
                     Ok(snap) => snap,
                     Err(e) => {
@@ -671,19 +689,21 @@ fn main() {
                     )
                 };
 
-                let (tx_import_tx, tx_import_rx) = mpsc::channel::<Vec<u8>>(4096);
-                let (tx_broadcast_tx, tx_broadcast_rx) = mpsc::channel::<Vec<u8>>(4096);
+                let tx_chan_size = if low_mem { 256 } else { 4096 };
+                let (tx_import_tx, tx_import_rx) = mpsc::channel::<Vec<u8>>(tx_chan_size);
+                let (tx_broadcast_tx, tx_broadcast_rx) = mpsc::channel::<Vec<u8>>(tx_chan_size);
 
                 // Run TxPoolBridge on a dedicated runtime to isolate TX pool
                 // ingestion from the consensus event loop. Under high TPS, pool
                 // operations (validation, nonce checks) consume significant CPU
                 // and would otherwise compete with consensus message processing.
                 let pool_for_bridge = full_node.pool.clone();
+                let bridge_workers = if low_mem { 1 } else { 2 };
                 std::thread::Builder::new()
                     .name("n42-tx-pool-bridge".into())
                     .spawn(move || {
                         let rt = tokio::runtime::Builder::new_multi_thread()
-                            .worker_threads(2)
+                            .worker_threads(bridge_workers)
                             .thread_name("tx-bridge-worker")
                             .enable_all()
                             .build()

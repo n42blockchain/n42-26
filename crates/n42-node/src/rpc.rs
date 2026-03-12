@@ -3,7 +3,8 @@ use crate::staking::{StakingManager, StakeStatus, MIN_STAKE_WEI, UNSTAKE_COOLDOW
 // VerificationTask is used by the #[subscription(item = ...)] macro attribute.
 #[allow(unused_imports)]
 use crate::consensus_state::VerificationTask;
-use alloy_primitives::{Address, B256};
+use alloy_primitives::{Address, B256, U256};
+use n42_jmt::ShardedJmt;
 use jsonrpsee::core::RpcResult;
 use jsonrpsee::core::SubscriptionResult;
 use jsonrpsee::proc_macros::rpc;
@@ -85,6 +86,24 @@ pub struct StakingInfoResponse {
     pub staking_address: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JmtRootResponse {
+    pub version: u64,
+    pub root: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JmtProofResponse {
+    pub shard_index: u8,
+    pub key_hash: String,
+    pub value: Option<String>,
+    pub proof_hex: String,
+    pub shard_roots: Vec<String>,
+    pub root: String,
+}
+
 /// N42-specific RPC API.
 #[rpc(server, namespace = "n42")]
 pub trait N42Api {
@@ -128,11 +147,24 @@ pub trait N42Api {
     /// Returns global staking information.
     #[method(name = "stakingInfo")]
     async fn staking_info(&self) -> RpcResult<StakingInfoResponse>;
+
+    /// Returns the latest JMT root hash and version.
+    #[method(name = "jmtRoot")]
+    async fn jmt_root(&self) -> RpcResult<JmtRootResponse>;
+
+    /// Generates a JMT proof for an account, or a storage slot if `storage_slot` is provided.
+    #[method(name = "jmtProof")]
+    async fn jmt_proof(&self, address: Address, storage_slot: Option<U256>) -> RpcResult<JmtProofResponse>;
+
+    /// Returns the current JMT version (block count since genesis).
+    #[method(name = "jmtVersion")]
+    async fn jmt_version(&self) -> RpcResult<u64>;
 }
 
 pub struct N42RpcServer {
     consensus_state: Arc<SharedConsensusState>,
     staking_manager: Option<Arc<Mutex<StakingManager>>>,
+    jmt: Option<Arc<Mutex<ShardedJmt>>>,
 }
 
 impl N42RpcServer {
@@ -140,11 +172,17 @@ impl N42RpcServer {
         Self {
             consensus_state,
             staking_manager: None,
+            jmt: None,
         }
     }
 
     pub fn with_staking_manager(mut self, mgr: Arc<Mutex<StakingManager>>) -> Self {
         self.staking_manager = Some(mgr);
+        self
+    }
+
+    pub fn with_jmt(mut self, jmt: Arc<Mutex<ShardedJmt>>) -> Self {
+        self.jmt = Some(jmt);
         self
     }
 }
@@ -408,6 +446,77 @@ impl N42ApiServer for N42RpcServer {
             cooldown_blocks: UNSTAKE_COOLDOWN_BLOCKS,
             staking_address: format!("{STAKING_ADDRESS}"),
         })
+    }
+
+    async fn jmt_root(&self) -> RpcResult<JmtRootResponse> {
+        let jmt_root = self.consensus_state.load_jmt_root();
+        match jmt_root.as_ref() {
+            Some((version, root)) => Ok(JmtRootResponse {
+                version: *version,
+                root: format!("{root:?}"),
+            }),
+            None => Err(ErrorObjectOwned::owned(
+                -32001,
+                "JMT not initialized or no blocks committed yet",
+                None::<()>,
+            )),
+        }
+    }
+
+    async fn jmt_proof(
+        &self,
+        address: Address,
+        storage_slot: Option<U256>,
+    ) -> RpcResult<JmtProofResponse> {
+        let jmt = self.jmt.as_ref().ok_or_else(|| {
+            ErrorObjectOwned::owned(-32001, "JMT not enabled on this node", None::<()>)
+        })?;
+
+        let key_hash = match storage_slot {
+            Some(slot) => n42_jmt::storage_key(&address, &slot),
+            None => n42_jmt::account_key(&address),
+        };
+
+        let tree = jmt.lock().map_err(|_| {
+            ErrorObjectOwned::owned(-32603, "JMT lock poisoned", None::<()>)
+        })?;
+
+        let root = tree.root_hash().map_err(|e| {
+            ErrorObjectOwned::owned(-32603, format!("JMT root error: {e}"), None::<()>)
+        })?;
+
+        let proof = n42_jmt::proof::build_proof(&tree, key_hash).map_err(|e| {
+            ErrorObjectOwned::owned(-32603, format!("JMT proof error: {e}"), None::<()>)
+        })?;
+
+        match proof {
+            Some(p) => Ok(JmtProofResponse {
+                shard_index: p.shard_index,
+                key_hash: hex::encode(p.key),
+                value: p.value.as_ref().map(hex::encode),
+                proof_hex: hex::encode(&p.proof_bytes),
+                shard_roots: p.shard_roots.iter().map(hex::encode).collect(),
+                root: format!("{root:?}"),
+            }),
+            None => Ok(JmtProofResponse {
+                shard_index: (key_hash.0[0] >> 4),
+                key_hash: hex::encode(key_hash.0),
+                value: None,
+                proof_hex: String::new(),
+                shard_roots: Vec::new(),
+                root: format!("{root:?}"),
+            }),
+        }
+    }
+
+    async fn jmt_version(&self) -> RpcResult<u64> {
+        let jmt = self.jmt.as_ref().ok_or_else(|| {
+            ErrorObjectOwned::owned(-32001, "JMT not enabled on this node", None::<()>)
+        })?;
+        let tree = jmt.lock().map_err(|_| {
+            ErrorObjectOwned::owned(-32603, "JMT lock poisoned", None::<()>)
+        })?;
+        Ok(tree.version())
     }
 }
 

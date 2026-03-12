@@ -7,6 +7,7 @@ use crate::consensus_state::SharedConsensusState;
 use crate::epoch_schedule::EpochSchedule;
 use crate::mobile_reward::MobileRewardManager;
 use crate::staking::StakingManager;
+use n42_jmt::ShardedJmt;
 use alloy_primitives::{Address, B256};
 use n42_consensus::{ConsensusEngine, EngineOutput, ValidatorSet};
 use n42_network::{NetworkEvent, NetworkHandle, PeerId};
@@ -284,6 +285,9 @@ pub struct ConsensusOrchestrator {
     /// ViewChanged/BlockCommitted. Consensus voting naturally paces block production.
     /// Enabled by `N42_FAST_PROPOSE=1`. Default: false (grid-aligned slots).
     fast_propose: bool,
+    /// Jellyfish Merkle Tree for parallel state commitment.
+    /// Updated asynchronously after each committed block.
+    jmt: Option<Arc<Mutex<ShardedJmt>>>,
 }
 
 impl ConsensusOrchestrator {
@@ -357,6 +361,7 @@ impl ConsensusOrchestrator {
                 .ok()
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(0) > 0,
+            jmt: None,
         }
     }
 
@@ -448,6 +453,7 @@ impl ConsensusOrchestrator {
             pipeline_timings: HashMap::new(),
             eager_import_block_guard: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             fast_propose,
+            jmt: None,
         }
     }
 
@@ -493,6 +499,11 @@ impl ConsensusOrchestrator {
     ///
     /// When set, the orchestrator consults the schedule at each `EpochTransition`
     /// event and automatically stages the next epoch's validator set.
+    pub fn with_jmt(mut self, jmt: Arc<Mutex<ShardedJmt>>) -> Self {
+        self.jmt = Some(jmt);
+        self
+    }
+
     pub fn with_epoch_schedule(mut self, schedule: EpochSchedule) -> Self {
         self.epoch_schedule = Some(schedule);
         self

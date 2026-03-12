@@ -1,5 +1,5 @@
 diff --git a/Cargo.lock b/Cargo.lock
-index 343a6ca5b6..f54c6c8390 100644
+index 343a6ca5b..f54c6c839 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
 @@ -1686,6 +1686,15 @@ dependencies = [
@@ -98,7 +98,7 @@ index 343a6ca5b6..f54c6c8390 100644
  name = "sketches-ddsketch"
  version = "0.3.1"
 diff --git a/crates/engine/tree/src/tree/payload_validator.rs b/crates/engine/tree/src/tree/payload_validator.rs
-index f97bc0bf3a..f83fdad94a 100644
+index f97bc0bf3..b6d10bad6 100644
 --- a/crates/engine/tree/src/tree/payload_validator.rs
 +++ b/crates/engine/tree/src/tree/payload_validator.rs
 @@ -459,12 +459,32 @@ where
@@ -175,7 +175,109 @@ index f97bc0bf3a..f83fdad94a 100644
  
          // After executing the block we can stop prewarming transactions
          handle.stop_prewarming_execution();
-@@ -614,6 +659,28 @@ where
+@@ -546,6 +591,84 @@ where
+         // needed. This frees up resources while state root computation continues.
+         let valid_block_tx = handle.terminate_caching(Some(output.clone()));
+ 
++        // N42: check whether state root can be skipped BEFORE expensive post-execution work.
++        // This allows the fast path below to avoid ~920ms of convert_to_block + tx_root +
++        // hashed_state computation when the leader's payload cache was hit.
++        let n42_skip_root = reth_evm::n42_skip_state_root() || reth_evm::n42_defer_state_root();
++
++        // N42 fast path: cache hit + skip/defer state root → skip ALL expensive post-validation.
++        // The leader already validated this block. Skip convert_to_block (90K tx RLP decode),
++        // calculate_tx_root (Merkle root of 90K txs), hashed_post_state (keccak256 of all
++        // state changes), and validate_post_execution. This reduces follower new_payload from
++        // ~1000ms to ~10ms for 90K-tx blocks.
++        if is_cache_hit && n42_skip_root {
++            let block = convert_to_block(input)?;
++            let block = block.with_senders(senders);
++
++            if let Some(valid_block_tx) = valid_block_tx {
++                let _ = valid_block_tx.send(());
++            }
++
++            let _state_root = block.header().state_root();
++            let trie_output = Arc::new(TrieUpdates::default());
++            let mode = if reth_evm::n42_skip_state_root() { "SKIP" } else { "DEFER" };
++            info!(
++                target: "engine::tree::payload_validator",
++                block_number = block.header().number(),
++                mode,
++                "N42_CACHE_HIT_FAST_PATH: skipping post-validation + state root (leader-validated block)"
++            );
++
++            let root_elapsed = Duration::ZERO;
++            self.metrics.block_validation.record_state_root(&trie_output, 0.0);
++            self.metrics.record_state_root_gas_bucket(block.header().gas_used(), 0.0);
++            info!(
++                target: "engine::tree::payload_validator",
++                block_number = block.header().number(),
++                gas_used = block.header().gas_used(),
++                root_ms = 0u64,
++                evm_ms = execution_duration.as_millis() as u64,
++                total_ms = execution_duration.as_millis() as u64,
++                "N42_NEW_PAYLOAD_TOTAL: EVM + state root complete"
++            );
++
++            // Use empty hashed state — with skip/defer root, trie updates are empty
++            // and the deferred trie task produces nothing useful.
++            let hashed_state = HashedPostState::default();
++
++            let changeset_provider =
++                ensure_ok_post_block!(overlay_factory.database_provider_ro(), block);
++
++            // Wrap hashed_state in LazyHashedPostState for spawn_deferred_trie_task
++            let hashed_state_lazy: LazyHashedPostState =
++                self.payload_processor.executor().spawn_blocking_named(
++                    "hash-post-state-noop", move || hashed_state,
++                );
++
++            let timing_stats = state_provider_stats.map(|stats| {
++                self.calculate_timing_stats(
++                    &block,
++                    stats,
++                    cache_stats,
++                    &output,
++                    execution_duration,
++                    root_elapsed,
++                )
++            });
++
++            let executed_block = self.spawn_deferred_trie_task(
++                block,
++                output,
++                &ctx,
++                hashed_state_lazy,
++                trie_output,
++                changeset_provider,
++            );
++            return Ok((executed_block, timing_stats));
++        }
++
++        // Standard path: full post-execution validation
++
+         // Spawn hashed post state computation in background so it runs concurrently with
+         // block conversion and receipt root computation. This is a pure CPU-bound task
+         // (keccak256 hashing of all changed addresses and storage slots).
+@@ -586,10 +709,12 @@ where
+             receipt_root_rx
+                 .blocking_recv()
+                 .inspect_err(|_| {
+-                    tracing::error!(
+-                        target: "engine::tree::payload_validator",
+-                        "Receipt root task dropped sender without result, receipt root calculation likely aborted"
+-                    );
++                    if !is_cache_hit {
++                        tracing::error!(
++                            target: "engine::tree::payload_validator",
++                            "Receipt root task dropped sender without result, receipt root calculation likely aborted"
++                        );
++                    }
+                 })
+                 .ok()
+         };
+@@ -614,6 +739,28 @@ where
          );
  
          let root_time = Instant::now();
@@ -204,7 +306,7 @@ index f97bc0bf3a..f83fdad94a 100644
          let mut maybe_state_root = None;
          let mut state_root_task_failed = false;
          #[cfg(feature = "trie-debug")]
-@@ -736,13 +803,25 @@ where
+@@ -736,13 +883,25 @@ where
              (root, Arc::new(updates), root_time.elapsed())
          };
  
@@ -234,7 +336,7 @@ index f97bc0bf3a..f83fdad94a 100644
              Self::write_trie_debug_recorders(block.header().number(), &trie_debug_recorders);
  
 diff --git a/crates/ethereum/payload/src/lib.rs b/crates/ethereum/payload/src/lib.rs
-index 745a0e337b..7882c695f5 100644
+index 745a0e337..7562c598b 100644
 --- a/crates/ethereum/payload/src/lib.rs
 +++ b/crates/ethereum/payload/src/lib.rs
 @@ -21,7 +21,7 @@ use reth_consensus_common::validation::MAX_RLP_BLOCK_SIZE;
@@ -255,22 +357,28 @@ index 745a0e337b..7882c695f5 100644
  
  mod config;
  pub use config::*;
-@@ -213,7 +213,44 @@ where
+@@ -213,7 +213,50 @@ where
  
      let withdrawals_rlp_length = attributes.withdrawals().length();
  
 -    while let Some(pool_tx) = best_txs.next() {
 +    // N42: per-block transaction count limit to prevent oversized blocks.
-+    let max_txs_per_block: usize = std::env::var("N42_MAX_TXS_PER_BLOCK")
-+        .ok()
-+        .and_then(|v| v.parse().ok())
-+        .unwrap_or(80_000);
-+    // N42: build time budget — stop packing when exceeded (checked every 256 txs).
-+    let build_time_budget = std::time::Duration::from_millis(
-+        std::env::var("N42_BUILD_TIME_BUDGET_MS")
++    static MAX_TXS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
++    let max_txs_per_block = *MAX_TXS.get_or_init(|| {
++        std::env::var("N42_MAX_TXS_PER_BLOCK")
 +            .ok()
 +            .and_then(|v| v.parse().ok())
-+            .unwrap_or(1000u64),
++            .unwrap_or(80_000)
++    });
++    // N42: build time budget — stop packing when exceeded (checked every 256 txs).
++    static BUILD_BUDGET_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
++    let build_time_budget = std::time::Duration::from_millis(
++        *BUILD_BUDGET_MS.get_or_init(|| {
++            std::env::var("N42_BUILD_TIME_BUDGET_MS")
++                .ok()
++                .and_then(|v| v.parse().ok())
++                .unwrap_or(1000u64)
++        }),
 +    );
 +    let mut tx_count: usize = 0;
 +
@@ -301,7 +409,7 @@ index 745a0e337b..7882c695f5 100644
          // ensure we still have capacity for this transaction
          if cumulative_gas_used + pool_tx.gas_limit() > block_gas_limit {
              // we can't fit this transaction into the block, so we need to mark it as invalid
-@@ -231,24 +268,34 @@ where
+@@ -231,24 +274,34 @@ where
              return Ok(BuildOutcome::Cancelled)
          }
  
@@ -351,7 +459,7 @@ index 745a0e337b..7882c695f5 100644
  
          // There's only limited amount of blob space available per block, so we need to check if
          // the EIP-4844 can still fit in the block
-@@ -303,6 +350,7 @@ where
+@@ -303,6 +356,7 @@ where
              };
          }
  
@@ -359,7 +467,7 @@ index 745a0e337b..7882c695f5 100644
          let gas_used = match builder.execute_transaction(tx.clone()) {
              Ok(gas_used) => gas_used,
              Err(BlockExecutionError::Validation(BlockValidationError::InvalidTx {
-@@ -328,6 +376,8 @@ where
+@@ -328,6 +382,8 @@ where
              Err(err) => return Err(PayloadBuilderError::evm(err)),
          };
  
@@ -368,7 +476,7 @@ index 745a0e337b..7882c695f5 100644
          // add to the total blob gas used if the transaction successfully executed
          if let Some(blob_hashes) = tx.blob_versioned_hashes() {
              block_blob_count += blob_hashes.len() as u64;
-@@ -345,6 +395,7 @@ where
+@@ -345,6 +401,7 @@ where
              tx.effective_tip_per_gas(base_fee).expect("fee is always valid; execution succeeded");
          total_fees += U256::from(miner_fee) * U256::from(gas_used);
          cumulative_gas_used += gas_used;
@@ -376,7 +484,7 @@ index 745a0e337b..7882c695f5 100644
  
          // Add blob tx sidecar to the payload.
          if let Some(sidecar) = blob_tx_sidecar {
-@@ -352,6 +403,26 @@ where
+@@ -352,6 +409,26 @@ where
          }
      }
  
@@ -403,7 +511,7 @@ index 745a0e337b..7882c695f5 100644
      // check if we have a better block
      if !is_better_payload(best_payload.as_ref(), total_fees) {
          // Release db
-@@ -360,14 +431,52 @@ where
+@@ -360,14 +437,52 @@ where
          return Ok(BuildOutcome::Aborted { fees: total_fees, cached_reads })
      }
  
@@ -460,7 +568,7 @@ index 745a0e337b..7882c695f5 100644
  
      if is_osaka && sealed_block.rlp_length() > MAX_RLP_BLOCK_SIZE {
 diff --git a/crates/evm/evm/Cargo.toml b/crates/evm/evm/Cargo.toml
-index 0e98e9b004..747cdd1103 100644
+index 0e98e9b00..747cdd110 100644
 --- a/crates/evm/evm/Cargo.toml
 +++ b/crates/evm/evm/Cargo.toml
 @@ -28,6 +28,7 @@ alloy-eips.workspace = true
@@ -472,7 +580,7 @@ index 0e98e9b004..747cdd1103 100644
  derive_more.workspace = true
  futures-util.workspace = true
 diff --git a/crates/evm/evm/src/execute.rs b/crates/evm/evm/src/execute.rs
-index 595097df34..9c231f009d 100644
+index 595097df3..daff7baaf 100644
 --- a/crates/evm/evm/src/execute.rs
 +++ b/crates/evm/evm/src/execute.rs
 @@ -464,6 +464,7 @@ where
@@ -483,7 +591,7 @@ index 595097df34..9c231f009d 100644
          if let Some(gas_used) =
              self.executor.execute_transaction_with_commit_condition((tx_env, &tx), f)?
          {
-@@ -485,10 +486,35 @@ where
+@@ -485,10 +486,43 @@ where
          db.merge_transitions(BundleRetention::Reverts);
  
          // calculate the state root
@@ -494,14 +602,22 @@ index 595097df34..9c231f009d 100644
 -            .map_err(BlockExecutionError::other)?;
 +        let hash_elapsed = hash_start.elapsed();
 +
-+        let (state_root, trie_updates) = if crate::n42_skip_state_root() || crate::n42_defer_state_root() {
-+            let mode = if crate::n42_skip_state_root() { "SKIP" } else { "DEFER" };
-+            tracing::info!(
-+                target: "evm::execute",
-+                hash_ms = hash_elapsed.as_millis() as u64,
-+                mode,
-+                "N42_STATE_ROOT_{}: using B256::ZERO placeholder in leader finish()", mode
-+            );
++        #[cfg(feature = "std")]
++        let n42_skip = crate::n42_skip_state_root() || crate::n42_defer_state_root();
++        #[cfg(not(feature = "std"))]
++        let n42_skip = false;
++
++        let (state_root, trie_updates) = if n42_skip {
++            #[cfg(feature = "std")]
++            {
++                let mode = if crate::n42_skip_state_root() { "SKIP" } else { "DEFER" };
++                tracing::info!(
++                    target: "evm::execute",
++                    hash_ms = hash_elapsed.as_millis() as u64,
++                    mode,
++                    "N42_STATE_ROOT_{}: using B256::ZERO placeholder in leader finish()", mode
++                );
++            }
 +            (alloy_primitives::B256::ZERO, Default::default())
 +        } else {
 +            let root_start = std::time::Instant::now();
@@ -523,7 +639,7 @@ index 595097df34..9c231f009d 100644
          let (transactions, senders) =
              self.transactions.into_iter().map(|tx| tx.into_parts()).unzip();
 diff --git a/crates/evm/evm/src/lib.rs b/crates/evm/evm/src/lib.rs
-index ee19f749b3..89f39caa82 100644
+index ee19f749b..89f39caa8 100644
 --- a/crates/evm/evm/src/lib.rs
 +++ b/crates/evm/evm/src/lib.rs
 @@ -52,6 +52,30 @@ pub use engine::{ConfigureEngineEvm, ConvertTx, ExecutableTxIterator, Executable
@@ -557,79 +673,8 @@ index ee19f749b3..89f39caa82 100644
  #[cfg(any(test, feature = "test-utils"))]
  /// test helpers for mocking executor
  pub mod test_utils;
-diff --git a/crates/evm/evm/src/payload_cache.rs b/crates/evm/evm/src/payload_cache.rs
-new file mode 100644
-index 0000000000..5d086f2e4b
---- /dev/null
-+++ b/crates/evm/evm/src/payload_cache.rs
-@@ -0,0 +1,65 @@
-+//! Global single-entry cache for leader payload execution results.
-+//!
-+//! When the payload builder (leader) finishes building a block, it caches
-+//! the execution output here. When `validate_block_with_state` (new_payload)
-+//! processes the same block, it can skip EVM re-execution by retrieving the
-+//! cached result.
-+//!
-+//! Two cache slots exist:
-+//! - `CACHE`: consumed by the leader's own `new_payload` (take semantics)
-+//! - `BROADCAST_CACHE`: consumed by `handle_built_payload` for serialization
-+//!   to followers (Compact Block). Separated so the leader's `take` doesn't
-+//!   consume the data needed for broadcast.
-+
-+use alloy_primitives::B256;
-+use std::any::Any;
-+use std::sync::{Mutex, OnceLock};
-+
-+struct CachedPayload {
-+    block_hash: B256,
-+    data: Box<dyn Any + Send + Sync>,
-+}
-+
-+type CacheSlot = OnceLock<Mutex<Option<CachedPayload>>>;
-+
-+static CACHE: CacheSlot = OnceLock::new();
-+
-+/// Secondary cache for broadcast to followers (Compact Block).
-+static BROADCAST_CACHE: CacheSlot = OnceLock::new();
-+
-+fn store(slot: &CacheSlot, block_hash: B256, data: impl Any + Send + Sync + 'static) {
-+    let cache = slot.get_or_init(|| Mutex::new(None));
-+    *cache.lock().unwrap() = Some(CachedPayload { block_hash, data: Box::new(data) });
-+}
-+
-+fn take<T: 'static>(slot: &CacheSlot, block_hash: &B256) -> Option<T> {
-+    let cache = slot.get_or_init(|| Mutex::new(None));
-+    let mut guard = cache.lock().unwrap();
-+    if let Some(entry) = guard.as_ref() {
-+        if &entry.block_hash == block_hash {
-+            let entry = guard.take().unwrap();
-+            return entry.data.downcast::<T>().ok().map(|b| *b);
-+        }
-+    }
-+    None
-+}
-+
-+/// Store payload execution data keyed by block hash (for leader's own new_payload).
-+pub fn store_payload_execution(block_hash: B256, data: impl Any + Send + Sync + 'static) {
-+    store(&CACHE, block_hash, data);
-+}
-+
-+/// Take (remove) the cached payload execution data if the block hash matches.
-+pub fn take_payload_execution<T: 'static>(block_hash: &B256) -> Option<T> {
-+    take::<T>(&CACHE, block_hash)
-+}
-+
-+/// Store a clone of execution data for broadcast to followers (Compact Block).
-+pub fn store_broadcast_execution(block_hash: B256, data: impl Any + Send + Sync + 'static) {
-+    store(&BROADCAST_CACHE, block_hash, data);
-+}
-+
-+/// Take broadcast execution data if block hash matches.
-+pub fn take_broadcast_execution<T: 'static>(block_hash: &B256) -> Option<T> {
-+    take::<T>(&BROADCAST_CACHE, block_hash)
-+}
 diff --git a/crates/rpc/rpc-eth-types/src/utils.rs b/crates/rpc/rpc-eth-types/src/utils.rs
-index 5df161d33b..f53429864c 100644
+index 5df161d33..f53429864 100644
 --- a/crates/rpc/rpc-eth-types/src/utils.rs
 +++ b/crates/rpc/rpc-eth-types/src/utils.rs
 @@ -40,8 +40,19 @@ pub fn recover_raw_transaction<T: SignedTransaction>(data: &[u8]) -> EthResult<R
@@ -655,7 +700,7 @@ index 5df161d33b..f53429864c 100644
  
  /// Performs a binary search within a given block range to find the desired block number.
 diff --git a/crates/transaction-pool/Cargo.toml b/crates/transaction-pool/Cargo.toml
-index e817665876..a201dcc7ad 100644
+index e81766587..a201dcc7a 100644
 --- a/crates/transaction-pool/Cargo.toml
 +++ b/crates/transaction-pool/Cargo.toml
 @@ -56,6 +56,7 @@ serde_json.workspace = true
@@ -667,7 +712,7 @@ index e817665876..a201dcc7ad 100644
  # testing
  rand = { workspace = true, optional = true }
 diff --git a/crates/transaction-pool/src/pool/best.rs b/crates/transaction-pool/src/pool/best.rs
-index 836eac6cc0..6094b8249a 100644
+index 836eac6cc..6094b8249 100644
 --- a/crates/transaction-pool/src/pool/best.rs
 +++ b/crates/transaction-pool/src/pool/best.rs
 @@ -8,8 +8,9 @@ use alloy_consensus::Transaction;
@@ -691,7 +736,7 @@ index 836eac6cc0..6094b8249a 100644
      ///
      /// Once an `independent` transaction with the nonce `N` is returned, it unlocks `N+1`, which
 diff --git a/crates/transaction-pool/src/pool/pending.rs b/crates/transaction-pool/src/pool/pending.rs
-index 38ec6655a6..b15ade684e 100644
+index 38ec6655a..b15ade684 100644
 --- a/crates/transaction-pool/src/pool/pending.rs
 +++ b/crates/transaction-pool/src/pool/pending.rs
 @@ -8,10 +8,11 @@ use crate::{

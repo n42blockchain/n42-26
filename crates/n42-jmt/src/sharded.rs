@@ -48,6 +48,17 @@ impl ShardedJmt {
         }
     }
 
+    /// Construct from pre-built shards (used by snapshot restore).
+    pub(crate) fn from_parts(shards: Vec<Mutex<N42JmtTree>>, version: Version) -> Self {
+        assert_eq!(shards.len(), SHARD_COUNT);
+        Self { shards, version }
+    }
+
+    /// Access the internal shards (used by snapshot).
+    pub(crate) fn shards(&self) -> &[Mutex<N42JmtTree>] {
+        &self.shards
+    }
+
     /// Current global version.
     pub fn version(&self) -> Version {
         self.version

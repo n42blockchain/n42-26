@@ -1082,8 +1082,8 @@ fn load_presigned_binary(path: &str, num_endpoints: usize) -> Result<Vec<Vec<Raw
         // File has fewer groups (e.g., 1 RPC): redistribute by sender
         // Group txs by sender, then assign each sender's batch to an endpoint
         let all_txs: Vec<RawTxWithSender> = file_groups.into_iter().flatten().collect();
-        let mut sender_groups: std::collections::HashMap<[u8; 20], Vec<RawTxWithSender>> =
-            std::collections::HashMap::new();
+        let mut sender_groups: std::collections::BTreeMap<[u8; 20], Vec<RawTxWithSender>> =
+            std::collections::BTreeMap::new();
         for tx in all_txs {
             sender_groups.entry(tx.1).or_default().push(tx);
         }

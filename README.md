@@ -50,6 +50,11 @@ A high-performance blockchain system combining **HotStuff-2** BFT consensus with
 - **HotStuff-2 Consensus**: 2-round optimistic commit with 3-round timeout recovery
 - **BLS12-381 Signatures**: Aggregated signatures for compact quorum certificates
 - **reth v1.11.0 Integration**: Full EVM execution with Ethereum-compatible block/transaction format
+- **Jellyfish Merkle Tree (JMT)**: Blake3 hashing, 16-shard parallel updates, Merkle proofs via RPC
+- **Compact Block Propagation**: Leader caches execution output, followers skip EVM re-execution (cache hit ~3ms)
+- **Optimistic Voting**: Followers vote immediately after proposal validation, before block import
+- **TX Forward to Leader**: O(n) message complexity replacing O(n²) gossip for transactions
+- **Binary TCP Injection**: High-throughput transaction injection for stress testing (122K tx/s)
 - **Execution Witness**: State witness generation for mobile re-execution
 - **Mobile Verification Protocol**: Ed25519 receipts, commit-reveal anti-copying, LRU code cache
 - **QUIC Mobile Client**: `QuicMobileClient` for phone-side connection to StarHub with deadline-based timeouts
@@ -65,17 +70,21 @@ A high-performance blockchain system combining **HotStuff-2** BFT consensus with
 n42-26/
 ├── bin/
 │   ├── n42-node/                  # CLI entry point (reth NodeBuilder)
+│   ├── n42-stress/                # High-throughput stress testing tool
 │   └── n42-mobile-sim/            # Mobile verifier simulator for load testing
-└── crates/
-    ├── n42-primitives/            # BLS keys, consensus message types
-    ├── n42-chainspec/             # Chain config, ValidatorInfo
-    ├── n42-consensus/             # HotStuff-2 state machine + reth adapter
-    ├── n42-execution/             # EVM config wrapper, witness & state diff
-    ├── n42-network/               # libp2p GossipSub + QUIC StarHub
-    ├── n42-mobile/                # Mobile verification protocol (no reth deps)
-    │                              #   quic_client, receipt, verifier, code_cache
-    ├── n42-mobile-ffi/            # C/JNI FFI bindings for Android & iOS
-    └── n42-node/                  # Node type assembly + ConsensusOrchestrator
+├── crates/
+│   ├── n42-primitives/            # BLS keys, consensus message types
+│   ├── n42-chainspec/             # Chain config, ValidatorInfo
+│   ├── n42-consensus/             # HotStuff-2 state machine + reth adapter
+│   ├── n42-execution/             # EVM config wrapper, witness & state diff
+│   ├── n42-jmt/                   # Jellyfish Merkle Tree (Blake3, 16-shard parallel)
+│   ├── n42-network/               # libp2p GossipSub + QUIC StarHub
+│   ├── n42-mobile/                # Mobile verification protocol (no reth deps)
+│   ├── n42-mobile-ffi/            # C/JNI FFI bindings for Android & iOS
+│   └── n42-node/                  # Node type assembly + ConsensusOrchestrator
+├── docs/                          # Development logs (devlog-01 through devlog-52)
+├── scripts/                       # Testnet launch scripts
+└── DEVLOG.md                      # Development log index
 ```
 
 ## Consensus Protocol
@@ -168,24 +177,25 @@ Rewards are injected as `Withdrawal` entries in `PayloadAttributes` — no trans
 
 ## Performance Benchmarks
 
-Measured in release mode on a single machine (Apple Silicon):
+### TPS Records (7 nodes, LAN, Apple Silicon)
 
-### Configuration Comparison
+| Mode | TPS | Block Cap | Notes |
+|------|----:|----------:|-------|
+| TCP Inject + Pool Gate + Fast Propose | **45,668** | 48K | Zero nonce gaps, zero stuck tx |
+| TCP Inject + Fast Propose | **47,527** | 48K | Sustained injection 122K tx/s |
+| Sync Wave + Fast Propose | **25,797** | 48K | Inject→drain→inject cycle |
+| Cache Hit Fast Path | **90,949** | 90K | Peak single-block TPS |
+| 2s Slot + All Optimizations | **13,858** | 48K | Production-like timing |
 
-| Metric | 500N x 500M | 100N x 2500M |
-|--------|:-----------:|:------------:|
-| Consensus nodes | 500 | 100 |
-| Mobiles per node | 500 | 2,500 |
-| Total mobiles | 250,000 | 250,000 |
-| Fault tolerance (f) | 166 | 33 |
-| Quorum size (2f+1) | 333 | 67 |
-| Leader crypto (2 rounds) | 632 ms | 128 ms |
-| Per-node mobile verification | 32 ms | 162 ms |
-| **Estimated min block interval** | **~882 ms** | **~377 ms** |
+### Key Optimizations
 
-> Minimum block interval = leader crypto + network latency (200ms) + block execution (50ms)
->
-> Mobile verification is **not** on the consensus critical path — it runs in parallel.
+| Optimization | Impact |
+|--------------|--------|
+| Compact Block (cache hit) | Follower import: 209ms → 3ms |
+| Optimistic Voting | R1 vote_delay: 363ms → 0ms |
+| OrdMap + Packing | Pool overhead: 430ms → 23ms |
+| Channel Split + Dedicated Runtime | R2 p50: 369ms → 221ms |
+| TX Forward to Leader | O(n²) gossip → O(n) direct |
 
 ### BLS QC Build Time (sign + verify + aggregate)
 
@@ -263,32 +273,36 @@ cargo test -p n42-consensus --test performance_bench --release -- --nocapture
 ### Unit Tests
 
 ```bash
-# All workspace tests (208 tests across all crates)
+# All workspace tests
 cargo test --workspace
 
 # Specific crate
 cargo test -p n42-consensus
 cargo test -p n42-primitives
 cargo test -p n42-mobile    # 94 tests: receipt, reward, bridge, verifier, quic_client
+cargo test -p n42-jmt       # 41 tests: sharded tree, proofs, snapshot, metrics
+cargo test -p n42-node      # 171 tests: orchestrator, RPC, pool, inject
 ```
 
 | Crate | Tests |
 |-------|------:|
 | n42-mobile | 94 |
-| n42-node | 107 |
+| n42-node | 171 |
+| n42-jmt | 41 |
 | stream_v2_pipeline | 6 |
 | comm_stress_bench | 1 |
-| **Total** | **208** |
+| **Total** | **313+** |
 
 ## Crate Dependency Graph
 
 ```
-bin/n42-node                    bin/n42-mobile-sim
-  └── n42-node                    └── n42-mobile ─── ed25519-dalek
+bin/n42-node                    bin/n42-stress           bin/n42-mobile-sim
+  └── n42-node                    └── reth, alloy          └── n42-mobile ─── ed25519-dalek
       ├── n42-consensus ──┬── n42-primitives ── blst (BLS12-381)
       │                   └── n42-chainspec ──── n42-primitives
       ├── n42-execution ──┬── reth-evm, reth-revm
       │                   └── n42-chainspec
+      ├── n42-jmt ────────── jmt, blake3, rayon (16-shard parallel)
       ├── n42-network ────┬── n42-primitives
       │                   ├── n42-mobile ─── ed25519-dalek
       │                   └── libp2p (gossipsub, quic)
@@ -303,6 +317,7 @@ n42-mobile-ffi (Android/iOS SDK)
 
 Key design: **n42-mobile** has zero reth dependencies — only `alloy-primitives`, `ed25519-dalek`, `lru`, `serde`.
 **n42-mobile-ffi** compiles as `staticlib` + `cdylib`, exposing a C ABI and JNI bridge for Android.
+**n42-jmt** provides Jellyfish Merkle Tree with Blake3 hashing and 16-shard parallelism for state proofs.
 
 ## Key Types
 

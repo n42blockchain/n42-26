@@ -31,13 +31,22 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 # Port allocation — no conflicts between nodes:
 #   Node i: HTTP=18545+i  WS=18645+i  Auth=18751+i  P2P=30303+i
 #           Consensus=9400+i  StarHub=9500+i  Metrics=19001+i
-BASE_HTTP_RPC=18545
-BASE_WS=18645
-BASE_AUTH=18751
+# Port allocation: each range has 400-slot gap to support up to 400 nodes.
+# Range layout (for N nodes):
+#   HTTP:      18000 .. 18000+N-1
+#   WS:        18400 .. 18400+N-1
+#   AUTH:      18800 .. 18800+N-1
+#   METRICS:   19200 .. 19200+N-1
+#   P2P:       30303 .. 30303+N-1
+#   CONSENSUS:  9000 ..  9000+N-1
+#   STARHUB:    9400 ..  9400+N-1
+BASE_HTTP_RPC=18000
+BASE_WS=18400
+BASE_AUTH=18800
+BASE_METRICS=19200
 BASE_P2P=30303
-BASE_CONSENSUS=9400
-BASE_METRICS=19001
-BASE_STARHUB=9500
+BASE_CONSENSUS=9000
+BASE_STARHUB=9400
 
 CHAIN_ID=4242
 
@@ -131,8 +140,8 @@ parse_args() {
     done
 
     # Validate node count
-    if [[ "$NUM_VALIDATORS" -lt 1 || "$NUM_VALIDATORS" -gt 200 ]]; then
-        echo -e "${RED}Invalid node count: $NUM_VALIDATORS (must be 1-200)${NC}"
+    if [[ "$NUM_VALIDATORS" -lt 1 || "$NUM_VALIDATORS" -gt 400 ]]; then
+        echo -e "${RED}Invalid node count: $NUM_VALIDATORS (must be 1-400)${NC}"
         exit 1
     fi
 
@@ -200,13 +209,27 @@ compute_timeouts() {
             # plus ~60s for gossipsub mesh formation.
             # CRITICAL: BASE_TIMEOUT must be >= STARTUP_DELAY so that non-leader
             # nodes do not timeout before the leader's first proposal arrives.
-            STARTUP_DELAY_MS=$(( (NUM_VALIDATORS * 1000) + 60000 ))
+            if [[ "$NUM_VALIDATORS" -ge 200 ]]; then
+                NODE_START_INTERVAL=2
+            else
+                NODE_START_INTERVAL=1
+            fi
+            STARTUP_DELAY_MS=$(( (NUM_VALIDATORS * NODE_START_INTERVAL * 1000) + 60000 ))
             BASE_TIMEOUT_MS=$(( STARTUP_DELAY_MS + 30000 ))
             MAX_TIMEOUT_MS=$((BASE_TIMEOUT_MS * 3))
-            NODE_START_INTERVAL=1
-            MAX_BLOCK_WAIT=$(( (NUM_VALIDATORS * 3) + 180 ))
+            MAX_BLOCK_WAIT=$(( (NUM_VALIDATORS * NODE_START_INTERVAL * 3) + 180 ))
             ;;
     esac
+
+    # Auto-enable low-memory mode for large local testnets unless explicitly set
+    if [[ -z "${N42_LOW_MEMORY:-}" ]] && [[ "$NUM_VALIDATORS" -gt 20 ]]; then
+        local total_ram_mb=$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo 2>/dev/null || echo 0)
+        local needed_mb=$((NUM_VALIDATORS * 1200))  # ~1.2GB per node at full config
+        if [[ "$needed_mb" -gt "$total_ram_mb" ]] || [[ "$NUM_VALIDATORS" -gt 50 ]]; then
+            export N42_LOW_MEMORY=1
+            echo -e "${YELLOW}[auto] N42_LOW_MEMORY=1 enabled (${NUM_VALIDATORS} nodes, ${total_ram_mb}MB RAM)${NC}"
+        fi
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -383,7 +406,7 @@ genesis = {
         "terminalTotalDifficultyPassed": True,
     },
     "nonce": "0x0", "timestamp": "0x0", "extraData": "0x",
-    "gasLimit": "0x77359400", "difficulty": "0x0",
+    "gasLimit": hex(int(os.environ.get("N42_GAS_LIMIT", "2000000000"))), "difficulty": "0x0",
     "mixHash": "0x" + "0" * 64,
     "coinbase": "0x0000000000000000000000000000000000000000",
     "alloc": {
@@ -467,7 +490,11 @@ print(sk.hex(), pk.public_key.to_hex()[2:])
 # ---------------------------------------------------------------------------
 
 start_validators() {
-    log "Starting $NUM_VALIDATORS validator node(s)..."
+    if [[ "${N42_LOW_MEMORY:-0}" == "1" ]]; then
+        log "Starting $NUM_VALIDATORS validator node(s) [LOW_MEMORY mode: ~200MB/node]..."
+    else
+        log "Starting $NUM_VALIDATORS validator node(s) [standard mode: ~5GB/node]..."
+    fi
     ENODES=()
 
     for i in $(seq 0 $((NUM_VALIDATORS - 1))); do
@@ -501,6 +528,19 @@ start_validators() {
             mdns_flag="false"
         fi
 
+        # Low-memory mode: reduce reth caches, pool sizes, and thread counts
+        # for dense local testnets. Activated when N42_LOW_MEMORY=1.
+        local low_mem_flags=""
+        if [[ "${N42_LOW_MEMORY:-0}" == "1" ]]; then
+            low_mem_flags="--engine.cross-block-cache-size 64 --engine.disable-state-cache --engine.prewarming-threads 1 --engine.storage-worker-count 2 --engine.account-worker-count 2 --rpc.max-connections 50 --txpool.additional-validation-tasks 2"
+            export TOKIO_WORKER_THREADS=2
+            export RAYON_NUM_THREADS=2
+            export N42_WORKER_THREADS=2
+        else
+            low_mem_flags="--rpc.max-connections 1000 --txpool.additional-validation-tasks 16"
+            unset TOKIO_WORKER_THREADS 2>/dev/null || true
+        fi
+
         RUST_LOG="info,libp2p_mdns=off,libp2p_gossipsub::behaviour=error" \
         N42_VALIDATOR_KEY="${KEYS[$i]}" \
         N42_VALIDATOR_COUNT="$NUM_VALIDATORS" \
@@ -523,6 +563,7 @@ start_validators() {
         N42_MIN_PROPOSE_DELAY_MS="${N42_MIN_PROPOSE_DELAY_MS:-0}" \
         N42_SKIP_TX_VERIFY="${N42_SKIP_TX_VERIFY:-0}" \
         N42_POOL_VALIDATION_THREADS="${N42_POOL_VALIDATION_THREADS:-2}" \
+        N42_LOW_MEMORY="${N42_LOW_MEMORY:-0}" \
         N42_INJECT_PORT="${N42_INJECT_PORT:+$((${N42_INJECT_PORT} + i))}" \
         "$BINARY" node \
             --chain "$GENESIS_FILE" \
@@ -542,13 +583,12 @@ start_validators() {
             --max-outbound-peers "$NUM_VALIDATORS" \
             --max-inbound-peers "$NUM_VALIDATORS" \
             --metrics "127.0.0.1:$metrics_port" \
-            --builder.gaslimit 2000000000 \
+            --builder.gaslimit ${N42_GAS_LIMIT:-2000000000} \
             --builder.interval 50ms \
-            --txpool.additional-validation-tasks 16 \
-            --rpc.max-connections 1000 \
             --rpc.max-request-size 50 \
             --rpc.max-response-size 50 \
             --disable-tx-gossip \
+            ${low_mem_flags} \
             ${p2p_key_flag} \
             ${TRUSTED_PEERS_FLAG} \
             > "$log_file" 2>&1 &

@@ -54,10 +54,14 @@ where
         // Dedicated runtime for TX pool validation tasks.
         // Isolates ECDSA recovery + DB read CPU from consensus/GossipSub,
         // preventing R1_collect latency spikes under high TX load.
+        let low_mem = std::env::var("N42_LOW_MEMORY")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let default_threads: usize = if low_mem { 1 } else { 4 };
         let validation_threads: usize = std::env::var("N42_POOL_VALIDATION_THREADS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(4);
+            .unwrap_or(default_threads);
 
         // Leak the runtime so it lives as long as the process — avoids
         // "Cannot drop a runtime in a context where blocking is not allowed"
@@ -106,13 +110,32 @@ where
 ///
 /// With 2G gas limit and 2s slot, each block can hold ~95k txs.
 /// Pool must buffer several blocks worth of txs during burst injection.
+///
+/// When `N42_LOW_MEMORY=1`, limits are reduced ~20× to save ~570 MB per node,
+/// suitable for local multi-node testnets where memory is the bottleneck.
 fn idc_pool_config(base: &PoolConfig) -> PoolConfig {
-    PoolConfig {
-        pending_limit: SubPoolLimit { max_txs: 100_000, max_size: 200 * 1024 * 1024 },
-        basefee_limit: SubPoolLimit { max_txs: 100_000, max_size: 200 * 1024 * 1024 },
-        queued_limit: SubPoolLimit { max_txs: 100_000, max_size: 200 * 1024 * 1024 },
-        blob_limit: SubPoolLimit { max_txs: 256, max_size: 50 * 1024 * 1024 },
-        max_account_slots: 16_384,
-        ..base.clone()
+    let low_mem = std::env::var("N42_LOW_MEMORY")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
+    if low_mem {
+        info!(target: "n42::pool", "LOW_MEMORY mode: pool limits reduced (5K txs, 10MB per subpool)");
+        PoolConfig {
+            pending_limit: SubPoolLimit { max_txs: 5_000, max_size: 10 * 1024 * 1024 },
+            basefee_limit: SubPoolLimit { max_txs: 5_000, max_size: 10 * 1024 * 1024 },
+            queued_limit: SubPoolLimit { max_txs: 5_000, max_size: 10 * 1024 * 1024 },
+            blob_limit: SubPoolLimit { max_txs: 16, max_size: 4 * 1024 * 1024 },
+            max_account_slots: 1_024,
+            ..base.clone()
+        }
+    } else {
+        PoolConfig {
+            pending_limit: SubPoolLimit { max_txs: 100_000, max_size: 200 * 1024 * 1024 },
+            basefee_limit: SubPoolLimit { max_txs: 100_000, max_size: 200 * 1024 * 1024 },
+            queued_limit: SubPoolLimit { max_txs: 100_000, max_size: 200 * 1024 * 1024 },
+            blob_limit: SubPoolLimit { max_txs: 256, max_size: 50 * 1024 * 1024 },
+            max_account_slots: 16_384,
+            ..base.clone()
+        }
     }
 }

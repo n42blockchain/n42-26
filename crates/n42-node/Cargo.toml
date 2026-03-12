@@ -14,6 +14,7 @@ n42-execution.workspace = true
 n42-mobile.workspace = true
 n42-network.workspace = true
 n42-parallel-evm.workspace = true
+n42-jmt.workspace = true
 
 reth-chainspec.workspace = true
 reth-consensus.workspace = true

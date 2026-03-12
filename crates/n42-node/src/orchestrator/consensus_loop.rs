@@ -7,6 +7,7 @@ use n42_primitives::QuorumCertificate;
 use reth_ethereum_engine_primitives::EthEngineTypes;
 use reth_node_builder::ConsensusEngineHandle;
 use reth_payload_primitives::EngineApiMessageVersion;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::Instant;
 use metrics::{counter, gauge, histogram};
@@ -265,6 +266,48 @@ impl ConsensusOrchestrator {
 
         self.store_committed_block(view, block_hash, commit_qc.clone());
         self.head_block_hash = block_hash;
+
+        // JMT background update: extract BundleState from pending block data.
+        if let Some(ref jmt) = self.jmt {
+            let diff = self.pending_block_data.get(&block_hash)
+                .and_then(|data| Self::extract_state_diff_for_jmt(data));
+            if let Some(diff) = diff {
+                let jmt = Arc::clone(jmt);
+                let state = self.consensus_state.clone();
+                let block_count = self.committed_block_count;
+                tokio::task::spawn_blocking(move || {
+                    let start = std::time::Instant::now();
+                    let mut tree = jmt.lock().unwrap_or_else(|e| e.into_inner());
+                    match tree.apply_diff(&diff) {
+                        Ok((version, root)) => {
+                            let elapsed_ms = start.elapsed().as_millis();
+                            gauge!("n42_jmt_latest_root").set(version as f64);
+                            info!(
+                                target: "n42::jmt",
+                                version,
+                                %root,
+                                accounts = diff.len(),
+                                storage_changes = diff.total_storage_changes(),
+                                elapsed_ms,
+                                "JMT updated"
+                            );
+                            if let Some(ref state) = state {
+                                state.update_jmt_root(version, root);
+                            }
+                            // Prune old versions every 100 blocks to reclaim memory.
+                            if block_count.is_multiple_of(100) {
+                                tree.prune(200);
+                            }
+                        }
+                        Err(e) => {
+                            warn!(target: "n42::jmt", error = %e, "JMT apply_diff failed");
+                        }
+                    }
+                });
+            } else {
+                debug!(target: "n42::jmt", %block_hash, "no block data available for JMT update (will catch up)");
+            }
+        }
 
         // Scan committed block for staking/unstaking transactions.
         if let Some(ref staking_mgr) = self.staking_manager
@@ -717,5 +760,15 @@ impl ConsensusOrchestrator {
                 self.finalize_committed_block(pf.view, pf.block_hash, pf.commit_qc).await;
             }
         }
+    }
+
+    /// Try to extract a `StateDiff` from serialized `BlockDataBroadcast` for JMT update.
+    /// Returns `None` if the data is missing, malformed, or has no compact block execution.
+    fn extract_state_diff_for_jmt(data: &[u8]) -> Option<n42_execution::state_diff::StateDiff> {
+        let broadcast: super::BlockDataBroadcast = bincode::deserialize(data).ok()?;
+        let exec_bytes = broadcast.execution_output.as_ref()?;
+        let decompressed = zstd::bulk::decompress(exec_bytes, 64 * 1024 * 1024).ok()?;
+        let compact: super::CompactBlockExecution = serde_json::from_slice(&decompressed).ok()?;
+        Some(n42_execution::state_diff::StateDiff::from_bundle_state(&compact.bundle_state))
     }
 }
