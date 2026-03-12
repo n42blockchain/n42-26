@@ -261,7 +261,7 @@ impl ConsensusOrchestrator {
 
         if let Some(ref state) = self.consensus_state {
             state.update_committed_qc(commit_qc.clone());
-            state.notify_block_committed(block_hash, view);
+            state.notify_block_committed(block_hash, self.committed_block_count);
         }
 
         self.store_committed_block(view, block_hash, commit_qc.clone());

@@ -193,7 +193,7 @@ pub struct ConsensusOrchestrator {
     engine: ConsensusEngine,
     network: NetworkHandle,
     /// High-priority: consensus messages only (Vote, Proposal, PrepareQC, etc.)
-    consensus_event_rx: mpsc::Receiver<NetworkEvent>,
+    consensus_event_rx: Option<mpsc::Receiver<NetworkEvent>>,
     /// Lower-priority: data events (BlockData, TX, Sync, Peers)
     net_event_rx: mpsc::Receiver<NetworkEvent>,
     output_rx: mpsc::Receiver<EngineOutput>,
@@ -301,7 +301,6 @@ impl ConsensusOrchestrator {
         output_rx: mpsc::Receiver<EngineOutput>,
     ) -> Self {
         // Tests use this constructor; create a dummy consensus channel.
-        let (_dummy_tx, consensus_event_rx) = mpsc::channel(1);
         let (block_ready_tx, block_ready_rx) = mpsc::unbounded_channel();
         let (leader_payload_tx, leader_payload_rx) = mpsc::unbounded_channel();
         let (import_done_tx, import_done_rx) = mpsc::unbounded_channel();
@@ -310,7 +309,7 @@ impl ConsensusOrchestrator {
         Self {
             engine,
             network,
-            consensus_event_rx,
+            consensus_event_rx: None,
             net_event_rx,
             output_rx,
             beacon_engine: None,
@@ -406,7 +405,7 @@ impl ConsensusOrchestrator {
         Self {
             engine,
             network,
-            consensus_event_rx,
+            consensus_event_rx: Some(consensus_event_rx),
             net_event_rx,
             output_rx,
             beacon_engine: Some(beacon_engine),
@@ -614,11 +613,17 @@ impl ConsensusOrchestrator {
                 // === Priority 3: Consensus network events (high-priority, dedicated channel) ===
                 // Consensus messages (votes, proposals, QCs) are routed to a separate channel
                 // so they are never queued behind high-volume TX/BlockData events.
-                event = self.consensus_event_rx.recv() => {
+                event = async {
+                    match self.consensus_event_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
                     match event {
                         Some(ev) => self.handle_network_event(ev).await,
                         None => {
-                            // Consensus channel closed is not fatal — may be observer mode
+                            // Consensus channel closed is not fatal — may be observer mode.
+                            self.consensus_event_rx = None;
                             debug!(target: "n42::cl::orchestrator", "consensus event channel closed");
                         }
                     }

@@ -13,9 +13,8 @@ use tracing::{info, warn};
 #[serde(rename_all = "camelCase")]
 pub struct VerificationTask {
     pub block_hash: B256,
-    /// Consensus view at which this block was committed.
-    #[serde(rename = "blockNumber")]
-    pub view: u64,
+    /// Monotonic committed block number used by mobile verification and rewards.
+    pub block_number: u64,
 }
 
 /// Per-block mobile attestation tracking.
@@ -325,20 +324,20 @@ impl SharedConsensusState {
     }
 
     /// Registers the block for attestation tracking and notifies RPC subscribers.
-    pub fn notify_block_committed(&self, block_hash: B256, view: u64) {
+    pub fn notify_block_committed(&self, block_hash: B256, block_number: u64) {
         let mut att_state = self.attestation_state.lock().unwrap_or_else(|e| {
             tracing::error!("attestation_state mutex poisoned: {e}");
             e.into_inner()
         });
-        att_state.register_block(block_hash, view);
+        att_state.register_block(block_hash, block_number);
 
-        let task = VerificationTask { block_hash, view };
+        let task = VerificationTask { block_hash, block_number };
         if self.block_committed_tx.receiver_count() > 0
             && let Ok(n) = self.block_committed_tx.send(task)
         {
             info!(
                 %block_hash,
-                view,
+                block_number,
                 receivers = n,
                 "verification task broadcast to mobile subscribers"
             );
@@ -418,7 +417,7 @@ mod tests {
 
         let task = rx.try_recv().unwrap();
         assert_eq!(task.block_hash, hash);
-        assert_eq!(task.view, 42);
+        assert_eq!(task.block_number, 42);
 
         let att = state.attestation_state.lock().unwrap();
         assert_eq!(att.get_attestation_count(&hash), Some(0));

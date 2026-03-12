@@ -199,7 +199,7 @@ fn save_attestation_snapshot(path: &Path, snapshot: &AttestationSnapshot) -> io:
         std::fs::create_dir_all(parent)?;
     }
 
-    let tmp_path = path.with_extension("json.tmp");
+    let tmp_path = path.with_extension("tmp");
     {
         use std::io::Write;
         let mut file = std::fs::File::create(&tmp_path)?;

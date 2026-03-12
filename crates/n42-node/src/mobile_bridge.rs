@@ -273,11 +273,11 @@ impl MobileVerificationBridge {
                 } => {
                     match task {
                         Ok(task) => {
-                            self.register_dispatched_block(task.block_hash, task.view, None);
+                            self.register_dispatched_block(task.block_hash, task.block_number, None);
                             debug!(
                                 target: "n42::mobile",
                                 block_hash = %task.block_hash,
-                                view = task.view,
+                                block_number = task.block_number,
                                 "registered dispatched block for mobile receipt tracking"
                             );
                         }
@@ -895,7 +895,6 @@ mod tests {
     #[test]
     fn test_bridge_builds_aggregate_attestation() {
         use crate::attestation_store::AttestationStore;
-        use std::path::PathBuf;
 
         let store_path = std::env::temp_dir().join("n42-test-bridge-aggregate.json");
         let _ = std::fs::remove_file(&store_path);
@@ -1037,7 +1036,7 @@ mod tests {
         }).await.expect("should receive committed-block notification");
 
         let task = run_once.expect("verification task should be present");
-        bridge.register_dispatched_block(task.block_hash, task.view, None);
+        bridge.register_dispatched_block(task.block_hash, task.block_number, None);
 
         let status = bridge.receipt_aggregator.get_status(&task.block_hash);
         assert!(status.is_some(), "committed block should be registered for receipt tracking");

@@ -692,8 +692,10 @@ fn main() {
                 let snapshot = match persistence::load_consensus_state(&state_file) {
                     Ok(snap) => snap,
                     Err(e) => {
-                        warn!(target: "n42::cli", error = %e, "failed to load consensus snapshot, starting fresh");
-                        None
+                        return Err(eyre::eyre!(
+                            "failed to load consensus snapshot at {}: {e}",
+                            state_file.display()
+                        ));
                     }
                 };
 
