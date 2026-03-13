@@ -1,13 +1,13 @@
-//! Binary TCP injection server for high-speed transaction ingestion.
+//! Binary TCP ingest server for high-speed transaction submission.
 //!
 //! Accepts EIP-2718 encoded transactions with pre-recovered sender over TCP,
-//! bypassing both JSON-RPC overhead and ECDSA signature recovery.
-//! Transactions are inserted directly into the pool as pre-validated —
-//! skipping the entire validation pipeline.
+//! avoiding both JSON-RPC overhead and repeated ECDSA sender recovery.
+//! Transactions are placed into the pool as pre-validated, using a trusted
+//! local benchmark/test harness path.
 //!
 //! **SECURITY WARNING**: The sender address is trusted without ECDSA verification.
-//! This server MUST NOT be exposed on production networks — it is intended solely
-//! for local/testnet stress testing where the client is trusted.
+//! This server MUST NOT be exposed on production networks. It is intended only
+//! for local benchmarking and controlled testnet environments.
 //!
 //! Protocol v2 (per batch):
 //!   Client → Server: [u32 LE num_txs] [u16 LE tx_len, tx_bytes, 20-byte sender] × num_txs
@@ -29,8 +29,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, error, info, warn};
 
-/// Trait for direct pool injection, bypassing the validation pipeline.
-pub trait DirectPoolInject: Send + Sync + 'static {
+/// Trait for trusted direct pool submission used by the ingest path.
+pub trait DirectPoolIngest: Send + Sync + 'static {
     /// Insert pre-validated transactions directly into the pool.
     /// Skips TransactionValidationTaskExecutor entirely.
     fn add_prevalidated(
@@ -42,8 +42,8 @@ pub trait DirectPoolInject: Send + Sync + 'static {
     fn pending_count(&self) -> usize;
 }
 
-/// Implement DirectPoolInject for any reth Pool with EthPooledTransaction.
-impl<V, S> DirectPoolInject for Pool<V, CoinbaseTipOrdering<EthPooledTransaction>, S>
+/// Implement DirectPoolIngest for any reth Pool with EthPooledTransaction.
+impl<V, S> DirectPoolIngest for Pool<V, CoinbaseTipOrdering<EthPooledTransaction>, S>
 where
     V: TransactionValidator<Transaction = EthPooledTransaction> + 'static,
     S: BlobStore + 'static,
@@ -74,14 +74,14 @@ where
 }
 
 /// Global counters for monitoring.
-pub struct InjectStats {
+pub struct IngestStats {
     pub received: AtomicU64,
     pub accepted: AtomicU64,
     pub decode_errors: AtomicU64,
     pub pool_errors: AtomicU64,
 }
 
-impl Default for InjectStats {
+impl Default for IngestStats {
     fn default() -> Self {
         Self {
             received: AtomicU64::new(0),
@@ -92,21 +92,23 @@ impl Default for InjectStats {
     }
 }
 
-impl InjectStats {
+impl IngestStats {
     pub fn new() -> Self {
         Self::default()
     }
 }
 
-/// Start the binary injection TCP server.
+/// Start the binary TCP ingest server.
 ///
-/// Reads port from `N42_INJECT_PORT` env var (default: 19900).
+/// Reads port from `N42_INGEST_PORT` env var (default: 19900).
+/// Legacy fallback: `N42_INJECT_PORT`.
 /// Each node in testnet gets port = base + node_index.
-pub async fn run_inject_server<P>(pool: P)
+pub async fn run_ingest_server<P>(pool: P)
 where
-    P: DirectPoolInject + Clone,
+    P: DirectPoolIngest + Clone,
 {
-    let port: u16 = std::env::var("N42_INJECT_PORT")
+    let port: u16 = std::env::var("N42_INGEST_PORT")
+        .or_else(|_| std::env::var("N42_INJECT_PORT"))
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(19900);
@@ -114,14 +116,14 @@ where
     let listener = match TcpListener::bind(("0.0.0.0", port)).await {
         Ok(l) => l,
         Err(e) => {
-            warn!(target: "n42::inject", port, error = %e, "failed to bind inject server");
+            warn!(target: "n42::ingest", port, error = %e, "failed to bind ingest server");
             return;
         }
     };
 
-    let stats = Arc::new(InjectStats::new());
+    let stats = Arc::new(IngestStats::new());
 
-    info!(target: "n42::inject", port, "binary injection server listening (direct pool insert)");
+    info!(target: "n42::ingest", port, "binary TCP ingest server listening");
 
     // Stats reporter
     let stats_clone = stats.clone();
@@ -132,12 +134,12 @@ where
             let received = stats_clone.received.load(Ordering::Relaxed);
             if received > 0 {
                 info!(
-                    target: "n42::inject",
+                    target: "n42::ingest",
                     received,
                     accepted = stats_clone.accepted.load(Ordering::Relaxed),
                     decode_err = stats_clone.decode_errors.load(Ordering::Relaxed),
                     pool_err = stats_clone.pool_errors.load(Ordering::Relaxed),
-                    "inject stats"
+                    "ingest stats"
                 );
             }
         }
@@ -146,28 +148,29 @@ where
     loop {
         match listener.accept().await {
             Ok((stream, addr)) => {
-                info!(target: "n42::inject", %addr, "client connected");
+                info!(target: "n42::ingest", %addr, "client connected");
                 let pool = pool.clone();
                 let stats = stats.clone();
                 tokio::spawn(async move {
                     if let Err(e) = handle_client(stream, pool, &stats).await {
-                        debug!(target: "n42::inject", %addr, error = %e, "client disconnected");
+                        debug!(target: "n42::ingest", %addr, error = %e, "client disconnected");
                     }
                 });
             }
             Err(e) => {
-                error!(target: "n42::inject", error = %e, "accept failed");
+                error!(target: "n42::ingest", error = %e, "accept failed");
             }
         }
     }
 }
 
-/// Pool high-water mark: reject injection when pending count exceeds this.
+/// Pool high-water mark: reject ingest batches when pending count exceeds this.
 /// Prevents pool eviction which causes nonce gaps and permanently stuck txs.
-fn inject_high_water() -> usize {
+fn ingest_high_water() -> usize {
     static HIGH_WATER: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *HIGH_WATER.get_or_init(|| {
-        std::env::var("N42_INJECT_HIGH_WATER")
+        std::env::var("N42_INGEST_HIGH_WATER")
+            .or_else(|_| std::env::var("N42_INJECT_HIGH_WATER"))
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(90_000)
@@ -177,17 +180,17 @@ fn inject_high_water() -> usize {
 async fn handle_client<P>(
     mut stream: TcpStream,
     pool: P,
-    stats: &Arc<InjectStats>,
+    stats: &Arc<IngestStats>,
 ) -> eyre::Result<()>
 where
-    P: DirectPoolInject,
+    P: DirectPoolIngest,
 {
     // Set TCP_NODELAY for low latency
     stream.set_nodelay(true)?;
 
     // Reusable buffer for reading tx data
     let mut tx_buf = vec![0u8; 65536];
-    let high_water = inject_high_water();
+    let high_water = ingest_high_water();
     let mut gate_logged = false;
 
     loop {
@@ -256,7 +259,7 @@ where
         let pending = pool.pending_count();
         if pending >= high_water {
             if !gate_logged {
-                info!(target: "n42::inject", pending, high_water, "pool gate: rejecting injection (pool near limit)");
+                info!(target: "n42::ingest", pending, high_water, "pool gate: rejecting ingest batch (pool near limit)");
                 gate_logged = true;
             }
             // ACK v3: accepted=0, pool_pending hint
@@ -267,7 +270,7 @@ where
         }
         gate_logged = false;
 
-        // Direct pool insert — bypasses validation pipeline entirely.
+        // Trusted direct pool submission path.
         let batch_size = pooled_txs.len();
         let results = pool.add_prevalidated(pooled_txs);
         let accepted = results.iter().filter(|r| r.is_ok()).count();

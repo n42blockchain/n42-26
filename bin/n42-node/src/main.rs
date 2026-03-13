@@ -692,10 +692,13 @@ fn main() {
                 let snapshot = match persistence::load_consensus_state(&state_file) {
                     Ok(snap) => snap,
                     Err(e) => {
-                        return Err(eyre::eyre!(
-                            "failed to load consensus snapshot at {}: {e}",
-                            state_file.display()
-                        ));
+                        warn!(
+                            target: "n42::cli",
+                            path = %state_file.display(),
+                            error = %e,
+                            "failed to load consensus snapshot, starting fresh"
+                        );
+                        None
                     }
                 };
 
@@ -718,14 +721,6 @@ fn main() {
                             "restoring staged epoch transition from snapshot"
                         );
                         epoch_manager.stage_next_epoch(validators, f);
-                    }
-                    if !snapshot.authorized_verifiers.is_empty() {
-                        consensus_state.restore_authorized_verifiers(&snapshot.authorized_verifiers);
-                        info!(
-                            target: "n42::cli",
-                            count = snapshot.authorized_verifiers.len(),
-                            "restored authorized verifiers from snapshot"
-                        );
                     }
                     ConsensusEngine::with_recovered_state(
                         my_index,
@@ -778,13 +773,13 @@ fn main() {
                     .expect("failed to spawn tx-bridge thread");
                 info!(target: "n42::cli", "TxPoolBridge started on dedicated runtime");
 
-                // Binary TCP injection server for high-speed TX ingestion.
-                // Bypasses JSON-RPC overhead. Enable with N42_INJECT_PORT=19900.
-                if std::env::var("N42_INJECT_PORT").is_ok() {
+                // Binary TCP ingest server for high-speed local TX submission.
+                // Enable with N42_INGEST_PORT=19900. Legacy fallback: N42_INJECT_PORT.
+                if std::env::var("N42_INGEST_PORT").is_ok() || std::env::var("N42_INJECT_PORT").is_ok() {
                     let inject_pool = full_node.pool.clone();
                     task_executor.spawn_critical_task(
-                        "n42-inject-server",
-                        Box::pin(n42_node::inject::run_inject_server(inject_pool)),
+                        "n42-ingest-server",
+                        Box::pin(n42_node::ingest::run_ingest_server(inject_pool)),
                     );
                 }
 

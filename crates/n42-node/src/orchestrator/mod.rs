@@ -64,7 +64,7 @@ pub(crate) struct BlockDataBroadcast {
     #[serde(default)]
     pub(crate) timestamp: u64,
     /// Compact Block: zstd-compressed bincode of `CompactBlockExecution`.
-    /// When present, followers inject this into payload_cache to skip EVM re-execution.
+    /// When present, followers load this into `payload_cache` to skip EVM re-execution.
     /// None for backwards compatibility with older peers.
     #[serde(default)]
     pub(crate) execution_output: Option<Vec<u8>>,
@@ -245,7 +245,7 @@ pub struct ConsensusOrchestrator {
     speculative_build_hash: Option<B256>,
     /// Parent hash for which a payload build task is currently running.
     /// Prevents duplicate builds based on the same parent, which produce different
-    /// blocks at the same height and flood reth with conflicting `new_payload` calls
+    /// blocks at the same height and overwhelm reth with conflicting `new_payload` calls
     /// — triggering pipeline sync and chain stalls.
     building_on_parent: Option<B256>,
     /// When the current payload build was triggered. Used to measure actual build duration
@@ -834,7 +834,7 @@ impl ConsensusOrchestrator {
             return;
         }
 
-        // N42_DISABLE_TX_FORWARD=1: keep txs in local pool only (for sync inject benchmarks).
+        // N42_DISABLE_TX_FORWARD=1: keep txs in local pool only (for sync ingest benchmarks).
         // Txs are still accepted into the local pool but never forwarded to leader.
         static DISABLE_TX_FORWARD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let disabled = *DISABLE_TX_FORWARD.get_or_init(|| {

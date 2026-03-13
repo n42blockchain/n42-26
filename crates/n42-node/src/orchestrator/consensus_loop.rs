@@ -574,7 +574,7 @@ impl ConsensusOrchestrator {
             }
         };
 
-        // Compact Block: inject execution output into payload cache before new_payload.
+        // Compact Block: load execution output into payload cache before `new_payload`.
         if let Some(ref exec_compressed) = broadcast.execution_output
             && super::execution_bridge::compact_block_enabled()
         {

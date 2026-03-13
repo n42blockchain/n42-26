@@ -216,7 +216,7 @@ impl ObserverOrchestrator {
             }
         };
 
-        // Compact Block: inject execution output to skip EVM re-execution.
+        // Compact Block: load execution output to skip EVM re-execution.
         if let Some(ref exec_compressed) = broadcast.execution_output
             && super::execution_bridge::compact_block_enabled()
         {

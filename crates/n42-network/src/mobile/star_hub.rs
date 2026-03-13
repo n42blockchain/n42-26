@@ -549,18 +549,9 @@ async fn handle_phone_connection(
 
     sessions.write().await.remove(&session_id);
     session_senders.write().await.remove(&session_id);
-    for attempt in 0..3 {
-        match event_tx.try_send(HubEvent::PhoneDisconnected { session_id }) {
-            Ok(()) => break,
-            Err(_) if attempt < 2 => {
-                tracing::warn!(session_id, attempt, "event channel full, retrying");
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-            Err(_) => {
-                tracing::error!(session_id, "event channel full after retries, PhoneDisconnected event dropped");
-                metrics::counter!("n42_hub_event_drops_total").increment(1);
-            }
-        }
+    if let Err(e) = event_tx.send(HubEvent::PhoneDisconnected { session_id }).await {
+        tracing::error!(session_id, error = %e, "failed to deliver PhoneDisconnected event");
+        metrics::counter!("n42_hub_event_drops_total").increment(1);
     }
     tracing::debug!(session_id, "phone disconnected");
 }

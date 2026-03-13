@@ -1,11 +1,11 @@
 //! N42 High-Performance TPS Stress Test v10
 //!
 //! v10 improvements over v9:
-//! - `--blast N` mode: pre-sign N txs, blast at max speed with optimal settings
+//! - `--burst N` mode: pre-sign N txs, then send at the configured maximum rate
 //! - Smaller batch size default (500) for faster HTTP round trips
 //! - HTTP/1.1 forced (avoids HTTP/2 single-connection multiplexing bottleneck)
 //! - Higher per-RPC concurrency (32 inflight batches vs 4 pipeline depth)
-//! - Real-time block TPS monitoring during blast
+//! - Real-time block TPS monitoring during high-rate send runs
 //! - Default accounts increased to 5000
 //!
 //! v9 features retained:
@@ -64,13 +64,13 @@ struct Cli {
     #[arg(long)]
     step: bool,
 
-    /// Blast mode: pre-sign N txs, then blast at max speed.
+    /// Burst mode: pre-sign N txs, then send at the configured maximum rate.
     /// Optimal for measuring node throughput ceiling.
-    /// Example: --blast 5000000 signs 5M txs then sends as fast as possible.
-    #[arg(long, default_value = "0")]
-    blast: u64,
+    /// Example: --burst 5000000 signs 5M txs then sends as fast as possible.
+    #[arg(long, visible_alias = "blast", default_value = "0")]
+    burst: u64,
 
-    /// Pre-fill mode: flood the tx pool before measurement starts.
+    /// Pre-fill mode: warm the tx pool before measurement starts.
     /// Value = number of txs to pre-send (e.g., 10000).
     #[arg(long, default_value = "0")]
     prefill: u64,
@@ -83,9 +83,9 @@ struct Cli {
     #[arg(long, default_value = "100000")]
     resume_pool: u64,
 
-    /// Pre-sign mode: sign N transactions into memory first, then blast-send.
-    /// Removes signing from the hot path for maximum injection rate.
-    /// Example: --presign 3000000 signs 3M txs, then sends in 30s = 100K TPS injection.
+    /// Pre-sign mode: sign N transactions into memory first, then send at high rate.
+    /// Removes signing from the hot path for maximum submission rate.
+    /// Example: --presign 3000000 signs 3M txs, then sends in 30s = 100K TPS submission.
     #[arg(long, default_value = "0")]
     presign: u64,
 
@@ -95,23 +95,23 @@ struct Cli {
     #[arg(long)]
     presign_save: Option<String>,
 
-    /// Load pre-signed transactions from binary file and blast-send.
+    /// Load pre-signed transactions from binary file and send at high rate.
     /// Usage: --presign-load txdata.bin
     /// Skips all signing — pure I/O send for maximum injection rate.
     #[arg(long)]
     presign_load: Option<String>,
 
-    /// Wave mode: inject exactly <cap> txs, wait for block, repeat.
+    /// Wave mode: submit exactly <cap> txs, wait for block, repeat.
     /// Keeps pool_pending ≈ cap, preventing pool overload.
     /// Usage: --wave 48000 --presign-load txdata.bin
     #[arg(long, default_value = "0")]
     wave: u64,
 
-    /// Binary TCP injection endpoints (comma-separated host:port).
-    /// Bypasses JSON-RPC, sends raw EIP-2718 txs over TCP for maximum injection speed.
-    /// Usage: --inject 127.0.0.1:19900,127.0.0.1:19901,... --presign-load txdata.bin
-    #[arg(long)]
-    inject: Option<String>,
+    /// Binary TCP ingest endpoints (comma-separated host:port).
+    /// Uses a local high-throughput submission path instead of JSON-RPC.
+    /// Usage: --ingest 127.0.0.1:19900,127.0.0.1:19901,... --presign-load txdata.bin
+    #[arg(long, visible_alias = "inject")]
+    ingest: Option<String>,
 
     /// RPC endpoints (comma-separated)
     #[arg(long, default_value = "http://127.0.0.1:18545,http://127.0.0.1:18546,http://127.0.0.1:18547,http://127.0.0.1:18548,http://127.0.0.1:18549,http://127.0.0.1:18550,http://127.0.0.1:18551")]
@@ -1069,7 +1069,7 @@ fn load_presigned_binary(path: &str, num_endpoints: usize) -> Result<Vec<Vec<Raw
         file_groups.push(txs);
     }
 
-    // Map file RPC groups to inject endpoints.
+    // Map file RPC groups to ingest endpoints.
     // When file has fewer groups than endpoints, redistribute by sender address
     // to ensure each account's txs stay on the same endpoint (preserving nonce order).
     let mut grouped: Vec<Vec<RawTxWithSender>> = vec![Vec::new(); num_endpoints];
@@ -1109,9 +1109,9 @@ fn load_presigned_binary(path: &str, num_endpoints: usize) -> Result<Vec<Vec<Raw
     Ok(grouped)
 }
 
-/// Binary TCP injection mode: stream raw txs with sender over TCP to node inject servers.
+/// Binary TCP ingest mode: stream raw txs with sender over TCP to node ingest servers.
 #[allow(clippy::too_many_arguments)]
-async fn run_inject_mode(
+async fn run_ingest_mode(
     endpoints: &[String],
     presigned: Vec<Vec<RawTxWithSender>>,
     batch_size: usize,
@@ -1125,7 +1125,7 @@ async fn run_inject_mode(
     let start = Instant::now();
     let stop = Arc::new(AtomicBool::new(false));
 
-    // Monitor using RPC (injection via TCP, monitoring via JSON-RPC)
+    // Monitor using RPC (ingest via TCP, monitoring via JSON-RPC)
     let monitor_client = client.clone();
     let monitor_rpc = rpc_urls[0].clone();
     let monitor_stats = stats.clone();
@@ -1156,10 +1156,10 @@ async fn run_inject_mode(
                     blocks = now_block - start_block,
                     recent_block_txs = recent_txs,
                     block_tps = format!("{:.0}", recent_txs as f64 / dt.max(0.1)),
-                    inject_sent = sent,
-                    inject_err = monitor_stats.rpc_errors.load(Ordering::Relaxed),
+                    submitted = sent,
+                    submit_err = monitor_stats.rpc_errors.load(Ordering::Relaxed),
                     pool_pending = pool.0,
-                    "INJECT_MONITOR"
+                    "INGEST_MONITOR"
                 );
                 last_block = now_block;
                 last_time = Instant::now();
@@ -1172,7 +1172,7 @@ async fn run_inject_mode(
     let dur_guard = tokio::spawn(async move {
         tokio::time::sleep(Duration::from_secs(duration_secs)).await;
         dur_stop.store(true, Ordering::Relaxed);
-        tracing::info!(duration_secs, "Inject duration reached");
+        tracing::info!(duration_secs, "ingest duration reached");
     });
 
     // Spawn one TCP sender per endpoint with dynamic rate control
@@ -1189,16 +1189,16 @@ async fn run_inject_mode(
         let per_ep_tps = if target_tps > 0 { (target_tps / num_endpoints).max(1) } else { 0 };
 
         handles.push(tokio::spawn(async move {
-            // Connect to inject server
+            // Connect to ingest server
             let mut stream = match TcpStream::connect(&endpoint).await {
                 Ok(s) => s,
                 Err(e) => {
-                    tracing::error!(endpoint, error = %e, "failed to connect to inject server");
+                    tracing::error!(endpoint, error = %e, "failed to connect to ingest server");
                     return;
                 }
             };
             let _ = stream.set_nodelay(true);
-            tracing::info!(endpoint, txs = txs.len(), batch_size = bs, per_ep_tps, "TCP inject connected");
+            tracing::info!(endpoint, txs = txs.len(), batch_size = bs, per_ep_tps, "TCP ingest connected");
 
             // Rate limiter: compute interval between batches
             let batch_interval = if per_ep_tps > 0 {
@@ -1298,7 +1298,7 @@ async fn run_inject_mode(
 
             // Send close signal
             let _ = stream.write_all(&0u32.to_le_bytes()).await;
-            tracing::info!(endpoint, "TCP inject sender done");
+            tracing::info!(endpoint, "TCP ingest sender done");
         }));
     }
 
@@ -1370,16 +1370,16 @@ async fn tcp_send_wave(
     (total_ok, total_err)
 }
 
-/// Synchronized TCP injection: inject exactly `wave_cap` txs per wave,
-/// wait for pool to drain, then inject next wave.
+/// Synchronized TCP ingest: submit exactly `wave_cap` txs per wave,
+/// wait for pool to drain, then submit the next wave.
 ///
 /// When N42_DISABLE_TX_FORWARD=1: runs per-node independent async loops.
-/// Each node independently: inject cap → poll own pool → drain → inject next.
+/// Each node independently: submit cap → poll own pool → drain → submit next.
 /// This ensures each leader always has cap txs ready, with zero idle time.
 ///
-/// When TX Forward enabled: global wave mode (inject cap/N to each, wait for all drain).
+/// When TX Forward enabled: global wave mode (submit cap/N to each, wait for all drain).
 #[allow(clippy::too_many_arguments)]
-async fn run_sync_inject_mode(
+async fn run_sync_ingest_mode(
     endpoints: &[String],
     presigned: Vec<Vec<RawTxWithSender>>,
     batch_size: usize,
@@ -1396,11 +1396,11 @@ async fn run_sync_inject_mode(
     let stop = Arc::new(AtomicBool::new(false));
 
     if disable_forward {
-        // === Per-node independent injection mode ===
-        // Each node gets its own async loop: inject cap → poll own pool → inject next.
+        // === Per-node independent ingest mode ===
+        // Each node gets its own async loop: submit cap → poll own pool → submit next.
         tracing::info!(
             wave_cap, num_eps, batch_size, per_node_cap = wave_cap,
-            "SYNC_INJECT per-node mode (TX Forward OFF)"
+            "SYNC_INGEST per-node mode (TX Forward OFF)"
         );
 
         // Shared stats for aggregation
@@ -1448,7 +1448,7 @@ async fn run_sync_inject_mode(
                         return;
                     }
                 };
-                tracing::info!(endpoint, txs = txs.len(), cap, "per-node inject started");
+                tracing::info!(endpoint, txs = txs.len(), cap, "per-node ingest started");
 
                 let mut cursor = 0usize;
 
@@ -1471,11 +1471,11 @@ async fn run_sync_inject_mode(
                         break;
                     }
 
-                    // Inject cap txs
-                    let inject_start = Instant::now();
+                    // Submit cap txs
+                    let ingest_start = Instant::now();
                     let slice = &txs[cursor..cursor + take];
                     let (ok, err) = tcp_send_wave(&mut stream, slice, bs).await;
-                    let inject_ms = inject_start.elapsed().as_millis() as u64;
+                    let ingest_ms = ingest_start.elapsed().as_millis() as u64;
                     cursor += take;
                     g_sent.fetch_add(ok, Ordering::Relaxed);
                     g_err.fetch_add(err, Ordering::Relaxed);
@@ -1501,7 +1501,7 @@ async fn run_sync_inject_mode(
                     tracing::info!(
                         wave, node = endpoint,
                         txs = ok, err,
-                        inject_ms, drain_ms,
+                        ingest_ms, drain_ms,
                         view_tps = format!("{:.0}", tps),
                         "NODE_WAVE"
                     );
@@ -1525,7 +1525,7 @@ async fn run_sync_inject_mode(
         let waves = global_waves.load(Ordering::Relaxed);
         let drain_total = global_drain_ms.load(Ordering::Relaxed);
 
-        tracing::info!("=== SYNC INJECT RESULT (per-node) ===");
+        tracing::info!("=== SYNC INGEST RESULT (per-node) ===");
         tracing::info!(
             waves,
             total_txs = sent,
@@ -1550,11 +1550,11 @@ async fn run_sync_inject_mode(
         match TcpStream::connect(ep).await {
             Ok(s) => {
                 let _ = s.set_nodelay(true);
-                tracing::info!(endpoint = ep, "sync-inject TCP connected");
+                tracing::info!(endpoint = ep, "sync-ingest TCP connected");
                 streams.push(Some(s));
             }
             Err(e) => {
-                tracing::error!(endpoint = ep, error = %e, "sync-inject TCP connect failed");
+                tracing::error!(endpoint = ep, error = %e, "sync-ingest TCP connect failed");
                 streams.push(None);
             }
         }
@@ -1635,7 +1635,7 @@ async fn run_sync_inject_mode(
                 if pending < 500 { break; }
             }
             if drain_start.elapsed() > Duration::from_secs(30) {
-                tracing::warn!(pending = drain_pending, "sync-inject drain timeout");
+                tracing::warn!(pending = drain_pending, "sync-ingest drain timeout");
                 break;
             }
         }
@@ -1679,7 +1679,7 @@ async fn run_sync_inject_mode(
         let avg = total_drain_ms / n as u64;
         let sustained_tps = total_wave_txs as f64 / (total_drain_ms as f64 / 1000.0).max(0.001);
 
-        tracing::info!("=== SYNC INJECT RESULT ===");
+        tracing::info!("=== SYNC INGEST RESULT ===");
         tracing::info!(
             waves = n,
             total_txs = total_sent,
@@ -1806,7 +1806,7 @@ async fn run_presign_send(
     tokio::time::sleep(Duration::from_millis(2000)).await;
 }
 
-/// Wave mode: inject exactly `wave_cap` txs, wait for new block, repeat.
+/// Wave mode: submit exactly `wave_cap` txs, wait for new block, repeat.
 /// Keeps pool_pending ≈ cap, preventing pool overload and ensuring fast builds.
 async fn run_wave_mode(
     presigned: Vec<Vec<String>>,
@@ -2210,7 +2210,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let rpc_urls: Vec<String> = cli.rpc.split(',').map(|s| s.trim().to_string()).collect();
 
-    tracing::info!("=== N42 TPS Stress Test v10 (Blast Mode + Optimized Injection) ===");
+    tracing::info!("=== N42 TPS Stress Test v10 (Burst Mode + Optimized Submission) ===");
     tracing::info!(
         target_tps = cli.target_tps,
         duration = cli.duration,
@@ -2221,7 +2221,7 @@ async fn main() -> Result<()> {
         concurrency = cli.concurrency,
         max_pool = cli.max_pool,
         resume_pool = cli.resume_pool,
-        blast = cli.blast,
+        burst = cli.burst,
         rpc_count = rpc_urls.len(),
         "Configuration"
     );
@@ -2255,14 +2255,14 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // === Binary TCP inject mode ===
-    if let Some(ref inject_endpoints) = cli.inject {
+    // === Binary TCP ingest mode ===
+    if let Some(ref ingest_endpoints) = cli.ingest {
         let load_path = cli.presign_load.as_ref()
-            .ok_or_else(|| eyre::eyre!("--inject requires --presign-load"))?;
-        let endpoints: Vec<String> = inject_endpoints.split(',').map(|s| s.trim().to_string()).collect();
+            .ok_or_else(|| eyre::eyre!("--ingest requires --presign-load"))?;
+        let endpoints: Vec<String> = ingest_endpoints.split(',').map(|s| s.trim().to_string()).collect();
 
-        tracing::info!("=== N42 BINARY TCP INJECT MODE ===");
-        tracing::info!(endpoints = endpoints.len(), "TCP inject endpoints");
+        tracing::info!("=== N42 BINARY TCP INGEST MODE ===");
+        tracing::info!(endpoints = endpoints.len(), "TCP ingest endpoints");
 
         let presigned = load_presigned_binary(load_path, endpoints.len())?;
 
@@ -2277,10 +2277,10 @@ async fn main() -> Result<()> {
         }
 
         if cli.wave > 0 {
-            // Synchronized TCP inject: wave_cap txs per wave, wait for pool drain
-            tracing::info!("=== SYNC TCP INJECT MODE (wave={}) ===", cli.wave);
+            // Synchronized TCP ingest: wave_cap txs per wave, wait for pool drain
+            tracing::info!("=== SYNC TCP INGEST MODE (wave={}) ===", cli.wave);
 
-            run_sync_inject_mode(
+            run_sync_ingest_mode(
                 &endpoints, presigned, cli.batch_size, cli.wave as usize,
                 &rpc_urls, &client, start_block, cli.duration,
             ).await;
@@ -2293,7 +2293,7 @@ async fn main() -> Result<()> {
         let stats = Arc::new(Stats::new());
         stats.start_block.store(start_block, Ordering::Relaxed);
 
-        run_inject_mode(
+        run_ingest_mode(
             &endpoints, presigned, cli.batch_size, cli.target_tps, &stats,
             &rpc_urls, &client, start_block, cli.duration,
         ).await;
@@ -2322,11 +2322,11 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // === Blast mode: pre-sign N txs, then blast at max speed ===
-    if cli.blast > 0 {
-        tracing::info!("=== N42 BLAST MODE v10 ===");
+    // === Burst mode: pre-sign N txs, then send at the configured maximum rate ===
+    if cli.burst > 0 {
+        tracing::info!("=== N42 BURST MODE v10 ===");
         tracing::info!(
-            total_txs = cli.blast,
+            total_txs = cli.burst,
             accounts = cli.accounts,
             batch_size = cli.batch_size,
             rpcs = rpc_urls.len(),
@@ -2334,7 +2334,7 @@ async fn main() -> Result<()> {
         );
 
         let presigned = presign_all(
-            &accounts, &targets, cli.blast, rpc_urls.len(), cli.erc20_ratio,
+            &accounts, &targets, cli.burst, rpc_urls.len(), cli.erc20_ratio,
         );
 
         let start_block = get_block_number(&client, &rpc_urls[0]).await?;
@@ -2387,12 +2387,12 @@ async fn main() -> Result<()> {
                         blocks = now_block - monitor_start_block,
                         recent_block_txs = recent_txs,
                         block_tps = format!("{:.0}", recent_txs as f64 / dt.max(0.1)),
-                        injection_sent = sent,
-                        injection_err = rpc_err,
-                        injection_tps = format!("{:.0}", sent as f64 / start.elapsed().as_secs_f64().max(0.1)),
+                        submitted = sent,
+                        submit_err = rpc_err,
+                        submit_tps = format!("{:.0}", sent as f64 / start.elapsed().as_secs_f64().max(0.1)),
                         pool_pending = pool.0,
                         pool_queued = pool.1,
-                        "BLAST_MONITOR"
+                        "BURST_MONITOR"
                     );
                     last_block = now_block;
                     last_time = Instant::now();
@@ -2400,22 +2400,22 @@ async fn main() -> Result<()> {
             }
         });
 
-        // Blast send: use target_tps for rate limiting (0 = unlimited)
+        // Burst send: use target_tps for rate limiting (0 = unlimited)
         let blast_tps = cli.target_tps;
         if blast_tps > 0 {
-            tracing::info!(target_tps = blast_tps, "Blast with rate limiting (sustained mode)");
+            tracing::info!(target_tps = blast_tps, "Burst mode with rate limiting");
         } else {
-            tracing::info!("Blast with NO rate limiting (max speed)");
+            tracing::info!("Burst mode with no rate limiting");
         }
         stop.store(false, Ordering::Relaxed);
 
-        // Auto-stop after --duration seconds (if blast has enough txs)
+        // Auto-stop after --duration seconds (if the burst batch is large enough)
         let duration_stop = stop.clone();
         let duration_secs = cli.duration;
         let duration_guard = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(duration_secs)).await;
             duration_stop.store(true, Ordering::Relaxed);
-            tracing::info!(duration_secs, "Blast duration reached, stopping injection");
+            tracing::info!(duration_secs, "burst duration reached, stopping send loop");
         });
 
         run_presign_send(
@@ -2435,14 +2435,14 @@ async fn main() -> Result<()> {
         let end_block = get_block_number(&client, &rpc_urls[0]).await?;
         let blocks = end_block - start_block;
 
-        tracing::info!("=== BLAST INJECTION COMPLETE ===");
+        tracing::info!("=== BURST SEND COMPLETE ===");
         tracing::info!(
-            injection_tps = format!("{:.0}", sent as f64 / elapsed.max(1.0)),
+            submit_tps = format!("{:.0}", sent as f64 / elapsed.max(1.0)),
             sent, rpc_err, http_err, blocks,
             duration = format!("{:.1}s", elapsed),
             avg_rpc_latency_ms = format!("{:.1}", stats.avg_rpc_latency_ms()),
             bp_pauses = stats.backpressure_pauses.load(Ordering::Relaxed),
-            "Injection phase done, waiting for pool drain..."
+            "Send phase done, waiting for pool drain..."
         );
 
         // Wait for pool drain
@@ -2466,7 +2466,7 @@ async fn main() -> Result<()> {
         let total_blocks = final_block - start_block;
         let total_elapsed = start.elapsed().as_secs_f64();
 
-        tracing::info!("=== BLAST RESULT ===");
+        tracing::info!("=== BURST RESULT ===");
         tracing::info!(
             total_txs = sent,
             total_blocks,
@@ -2481,7 +2481,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // === Wave mode: synchronized injection, one wave per block ===
+    // === Wave mode: synchronized submission, one wave per block ===
     if cli.wave > 0 {
         let load_path = cli.presign_load.as_ref()
             .ok_or_else(|| eyre::eyre!("--wave requires --presign-load"))?;
@@ -2554,9 +2554,9 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // === Pre-sign load mode: load from file and blast-send ===
+    // === Pre-sign load mode: load from file and send at high rate ===
     if let Some(ref load_path) = cli.presign_load {
-        tracing::info!("=== N42 Pre-sign Load + Blast Send Mode ===");
+        tracing::info!("=== N42 Pre-sign Load + High-Rate Send Mode ===");
         let presigned = load_presigned(load_path)?;
 
         let start_block = get_block_number(&client, &rpc_urls[0]).await?;
@@ -2595,7 +2595,7 @@ async fn main() -> Result<()> {
         tracing::info!("=== PRE-SIGN LOAD RESULT ===");
         tracing::info!(
             effective_tps = format!("{:.1}", sent as f64 / elapsed.max(1.0)),
-            injection_tps = format!("{:.1}", (sent + rpc_err) as f64 / elapsed.max(1.0)),
+            submit_tps = format!("{:.1}", (sent + rpc_err) as f64 / elapsed.max(1.0)),
             sent, rpc_err, http_err, blocks,
             avg_tx_per_block = sent / blocks.max(1),
             duration = format!("{:.1}s", elapsed),
@@ -2629,9 +2629,9 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // === Pre-sign mode (in-memory): sign all txs upfront, then blast-send ===
+    // === Pre-sign mode (in-memory): sign all txs upfront, then send at high rate ===
     if cli.presign > 0 {
-        tracing::info!("=== N42 Pre-sign Mode (legacy, use --blast for v10) ===");
+        tracing::info!("=== N42 Pre-sign Mode (legacy, use --burst for v10) ===");
 
         let presigned = presign_all(
             &accounts, &targets, cli.presign, rpc_urls.len(), cli.erc20_ratio,

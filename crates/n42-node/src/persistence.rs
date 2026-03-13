@@ -30,9 +30,8 @@ pub struct ConsensusSnapshot {
     /// Staged epoch transition; persisted so a crash before `advance_epoch()` doesn't lose it.
     #[serde(default)]
     pub scheduled_epoch_transition: Option<(u64, Vec<ValidatorInfo>, u32)>,
-    /// BLS pubkeys (48 bytes each, hex-encoded) of verifiers that completed a QUIC handshake.
-    /// Persisted so that authorized verifiers survive node restarts without requiring
-    /// each phone to re-establish a QUIC connection from scratch.
+    /// Legacy field kept for snapshot-format compatibility.
+    /// Authorization is a live session property and is no longer restored across restart.
     #[serde(default, with = "authorized_verifiers_hex")]
     pub authorized_verifiers: Vec<[u8; 48]>,
     /// Number of blocks committed since genesis. Persisted so that the
@@ -294,6 +293,35 @@ mod tests {
         let err = result.unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
         assert!(err.to_string().contains("failed validation"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_invalid_snapshot_can_be_discarded_by_startup_path() {
+        let dir = std::env::temp_dir().join("n42-test-invalid-snapshot-startup-fallback");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("consensus_state.json");
+
+        let mut locked = QuorumCertificate::genesis();
+        locked.view = 99;
+        let snapshot = ConsensusSnapshot {
+            current_view: 10,
+            locked_qc: locked,
+            ..genesis_snapshot(10)
+        };
+        std::fs::write(&path, serde_json::to_string_pretty(&snapshot).unwrap()).unwrap();
+
+        // Match bin/n42-node startup semantics: if snapshot loading fails, log and continue fresh.
+        let startup_snapshot = match load_consensus_state(&path) {
+            Ok(snap) => snap,
+            Err(_) => None,
+        };
+        assert!(
+            startup_snapshot.is_none(),
+            "startup path should discard invalid snapshots and continue fresh"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

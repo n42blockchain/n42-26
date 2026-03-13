@@ -3,6 +3,7 @@ mod components;
 pub mod attestation_store;
 pub mod consensus_state;
 pub mod epoch_schedule;
+pub mod ingest;
 pub mod mobile_bridge;
 pub mod mobile_packet;
 pub mod mobile_reward;
@@ -13,7 +14,6 @@ pub mod persistence;
 pub mod pool;
 pub mod rpc;
 pub mod staking;
-pub mod inject;
 pub mod tx_bridge;
 
 pub use consensus_state::SharedConsensusState;

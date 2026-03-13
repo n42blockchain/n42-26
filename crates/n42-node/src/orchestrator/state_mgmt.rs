@@ -68,14 +68,6 @@ impl ConsensusOrchestrator {
             .map(|(epoch, validators, f)| (epoch, validators.to_vec(), f))
     }
 
-    /// Collects the authorized verifier BLS pubkeys from consensus state for persistence.
-    fn collect_authorized_verifiers(&self) -> Vec<[u8; 48]> {
-        self.consensus_state
-            .as_ref()
-            .map(|s| s.snapshot_authorized_verifiers())
-            .unwrap_or_default()
-    }
-
     /// Builds a snapshot of the current consensus state for persistence.
     fn build_snapshot(&self) -> ConsensusSnapshot {
         ConsensusSnapshot {
@@ -85,7 +77,7 @@ impl ConsensusOrchestrator {
             last_committed_qc: self.engine.last_committed_qc().clone(),
             consecutive_timeouts: self.engine.consecutive_timeouts(),
             scheduled_epoch_transition: self.collect_scheduled_epoch(),
-            authorized_verifiers: self.collect_authorized_verifiers(),
+            authorized_verifiers: Vec::new(),
             committed_block_count: self.committed_block_count,
         }
     }

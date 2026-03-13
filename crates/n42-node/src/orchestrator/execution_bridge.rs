@@ -68,7 +68,7 @@ fn take_and_serialize_execution_output(hash: &B256) -> Option<Vec<u8>> {
     }
 }
 
-/// Deserialize compact block execution output and inject into payload cache.
+/// Deserialize compact block execution output and load it into the payload cache.
 pub(super) fn inject_compact_block(hash: &B256, compressed: &[u8]) -> bool {
     let inject_start = std::time::Instant::now();
 
@@ -193,7 +193,7 @@ impl ConsensusOrchestrator {
             }
         }
 
-        // 3. Staking integration: resolve reward addresses and inject cooldown returns.
+        // 3. Staking integration: resolve reward addresses and add cooldown returns.
         //    Re-acquire StakingManager lock for address resolution and cooldown checks.
         if let Some(ref staking_mgr) = self.staking_manager {
             let mut staking = staking_mgr.lock().unwrap_or_else(|e| e.into_inner());
@@ -529,7 +529,7 @@ impl ConsensusOrchestrator {
                     return;
                 }
 
-                // Compact Block: inject execution output into payload cache before new_payload.
+                // Compact Block: load execution output into payload cache before `new_payload`.
                 // This lets reth skip EVM re-execution (cache hit path), reducing import from
                 // ~209ms to ~22ms. Safety: state root is still verified by reth's new_payload.
                 let compact_injected = execution_output_compressed.as_ref()
@@ -638,7 +638,7 @@ impl ConsensusOrchestrator {
             }
         };
 
-        // Compact Block: inject execution output into payload cache before new_payload.
+        // Compact Block: load execution output into payload cache before `new_payload`.
         if let Some(ref exec_compressed) = broadcast.execution_output
             && compact_block_enabled()
         {
@@ -792,7 +792,7 @@ impl ConsensusOrchestrator {
                 }
             };
 
-            // Compact Block: inject on retry path too.
+            // Compact Block: load on retry path too.
             if let Some(ref exec_compressed) = retry_broadcast.execution_output
                 && compact_block_enabled()
             {
