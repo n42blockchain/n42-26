@@ -7,9 +7,10 @@ use crate::consensus_state::SharedConsensusState;
 use crate::epoch_schedule::EpochSchedule;
 use crate::mobile_reward::MobileRewardManager;
 use crate::staking::StakingManager;
-use n42_jmt::ShardedJmt;
 use alloy_primitives::{Address, B256};
+use metrics::{counter, gauge, histogram};
 use n42_consensus::{ConsensusEngine, EngineOutput, ValidatorSet};
+use n42_jmt::ShardedJmt;
 use n42_network::{NetworkEvent, NetworkHandle, PeerId};
 use n42_primitives::QuorumCertificate;
 use reth_ethereum_engine_primitives::EthEngineTypes;
@@ -22,7 +23,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
-use metrics::{counter, gauge, histogram};
 use tracing::{debug, error, info, warn};
 
 /// zstd magic bytes: all zstd frames start with 0x28B52FFD.
@@ -121,43 +121,69 @@ pub(crate) struct PipelineTiming {
 
 impl PipelineTiming {
     fn new_follower() -> Self {
-        Self { created: Instant::now(), is_leader: false, build_complete: None, import_complete: None, committed: None }
+        Self {
+            created: Instant::now(),
+            is_leader: false,
+            build_complete: None,
+            import_complete: None,
+            committed: None,
+        }
     }
 
     /// Produces a one-line summary of pipeline stage durations (ms).
     fn summary(&self) -> String {
         let role = if self.is_leader { "L" } else { "F" };
-        let build_ms = self.build_complete.map(|t| t.duration_since(self.created).as_millis() as u64);
-        let import_ms = self.import_complete.map(|t| t.duration_since(self.created).as_millis() as u64);
-        let commit_ms = self.committed.map(|t| t.duration_since(self.created).as_millis() as u64);
+        let build_ms = self
+            .build_complete
+            .map(|t| t.duration_since(self.created).as_millis() as u64);
+        let import_ms = self
+            .import_complete
+            .map(|t| t.duration_since(self.created).as_millis() as u64);
+        let commit_ms = self
+            .committed
+            .map(|t| t.duration_since(self.created).as_millis() as u64);
         // Overlap: how much of import happened during consensus (before commit)
         let import_before_commit = match (self.import_complete, self.committed) {
-            (Some(imp), Some(com)) if imp <= com => Some(com.duration_since(imp).as_millis() as u64),
+            (Some(imp), Some(com)) if imp <= com => {
+                Some(com.duration_since(imp).as_millis() as u64)
+            }
             _ => None,
         };
         format!(
             "role={role} build={build}ms import={import}ms commit={commit}ms import_headroom={headroom}ms",
-            build = build_ms.map(|v| v.to_string()).unwrap_or_else(|| "-".into()),
-            import = import_ms.map(|v| v.to_string()).unwrap_or_else(|| "-".into()),
-            commit = commit_ms.map(|v| v.to_string()).unwrap_or_else(|| "-".into()),
-            headroom = import_before_commit.map(|v| v.to_string()).unwrap_or_else(|| "-".into()),
+            build = build_ms
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "-".into()),
+            import = import_ms
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "-".into()),
+            commit = commit_ms
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "-".into()),
+            headroom = import_before_commit
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "-".into()),
         )
     }
 
     /// Emit per-stage metrics histograms.
     fn emit_metrics(&self) {
         if let Some(t) = self.build_complete {
-            histogram!("n42_pipeline_build_ms").record(t.duration_since(self.created).as_millis() as f64);
+            histogram!("n42_pipeline_build_ms")
+                .record(t.duration_since(self.created).as_millis() as f64);
         }
         if let Some(t) = self.import_complete {
-            histogram!("n42_pipeline_import_ms").record(t.duration_since(self.created).as_millis() as f64);
+            histogram!("n42_pipeline_import_ms")
+                .record(t.duration_since(self.created).as_millis() as f64);
         }
         if let Some(t) = self.committed {
             let total = t.duration_since(self.created).as_millis() as f64;
             histogram!("n42_pipeline_total_ms").record(total);
         }
         // Overlap ratio: what fraction of total time was "useful work" vs waiting
-        if let (Some(build), Some(import), Some(commit)) = (self.build_complete, self.import_complete, self.committed) {
+        if let (Some(build), Some(import), Some(commit)) =
+            (self.build_complete, self.import_complete, self.committed)
+        {
             let build_dur = build.duration_since(self.created).as_millis() as f64;
             let import_dur = import.duration_since(self.created).as_millis() as f64;
             let total = commit.duration_since(self.created).as_millis() as f64;
@@ -362,9 +388,81 @@ impl ConsensusOrchestrator {
             fast_propose: std::env::var("N42_FAST_PROPOSE")
                 .ok()
                 .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(0) > 0,
+                .unwrap_or(0)
+                > 0,
             jmt: None,
             zk_scheduler: None,
+        }
+    }
+
+    pub(super) async fn enqueue_mobile_packet(
+        &self,
+        block_hash: B256,
+        view: u64,
+        reason: &'static str,
+    ) {
+        let Some(tx) = self.mobile_packet_tx.as_ref().cloned() else {
+            return;
+        };
+
+        match tx.try_send((block_hash, view)) {
+            Ok(()) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                warn!(
+                    target: "n42::cl::mobile",
+                    %block_hash,
+                    view,
+                    reason,
+                    "mobile packet channel closed"
+                );
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Full(packet)) => {
+                warn!(
+                    target: "n42::cl::mobile",
+                    %block_hash,
+                    view,
+                    reason,
+                    "mobile packet channel full, waiting to enqueue"
+                );
+                if let Err(error) = tx.send(packet).await {
+                    warn!(
+                        target: "n42::cl::mobile",
+                        %block_hash,
+                        view,
+                        reason,
+                        error = %error,
+                        "mobile packet enqueue failed after backpressure wait"
+                    );
+                }
+            }
+        }
+    }
+
+    pub(super) async fn enqueue_tx_import(&self, data: Vec<u8>, reason: &'static str) {
+        let Some(tx) = self.tx_import_tx.as_ref().cloned() else {
+            return;
+        };
+
+        match tx.try_send(data) {
+            Ok(()) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                warn!(target: "n42::cl::tx", reason, "tx import channel closed");
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Full(data)) => {
+                warn!(
+                    target: "n42::cl::tx",
+                    reason,
+                    "tx import channel full, waiting to enqueue"
+                );
+                if let Err(error) = tx.send(data).await {
+                    warn!(
+                        target: "n42::cl::tx",
+                        reason,
+                        error = %error,
+                        "tx import enqueue failed after backpressure wait"
+                    );
+                }
+            }
         }
     }
 
@@ -396,7 +494,8 @@ impl ConsensusOrchestrator {
         let fast_propose = std::env::var("N42_FAST_PROPOSE")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(0) > 0;
+            .unwrap_or(0)
+            > 0;
 
         if slot_time_ms > 0 {
             info!(target: "n42::cl::orchestrator", slot_time_ms, fast_propose, "slot timing configured");
@@ -760,12 +859,12 @@ impl ConsensusOrchestrator {
                     }
                     // Flush if buffer is large enough.
                     if self.tx_forward_buffer.len() >= 64 {
-                        self.flush_tx_forward_buffer();
+                        self.flush_tx_forward_buffer().await;
                     }
                 }
 
                 _ = &mut tx_flush_timer => {
-                    self.flush_tx_forward_buffer();
+                    self.flush_tx_forward_buffer().await;
                 }
 
             }
@@ -792,9 +891,7 @@ impl ConsensusOrchestrator {
         let startup_delay_ms: u64 = std::env::var("N42_STARTUP_DELAY_MS")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or_else(|| {
-                if n <= 1 { 0 } else { 5000 + n * 500 }
-            });
+            .unwrap_or_else(|| if n <= 1 { 0 } else { 5000 + n * 500 });
 
         if startup_delay_ms > 0 {
             let startup_delay = Duration::from_millis(startup_delay_ms);
@@ -817,7 +914,8 @@ impl ConsensusOrchestrator {
         const MAX_PIPELINE_ENTRIES: usize = 32;
         if self.pipeline_timings.len() >= MAX_PIPELINE_ENTRIES {
             // Evict oldest entry (smallest `created` timestamp).
-            if let Some(oldest) = self.pipeline_timings
+            if let Some(oldest) = self
+                .pipeline_timings
                 .iter()
                 .min_by_key(|(_, t)| t.created)
                 .map(|(k, _)| *k)
@@ -829,7 +927,7 @@ impl ConsensusOrchestrator {
     }
 
     /// Flush buffered txs to the current leader via the tx_forward protocol.
-    fn flush_tx_forward_buffer(&mut self) {
+    async fn flush_tx_forward_buffer(&mut self) {
         if self.tx_forward_buffer.is_empty() {
             return;
         }
@@ -838,17 +936,17 @@ impl ConsensusOrchestrator {
         // Txs are still accepted into the local pool but never forwarded to leader.
         static DISABLE_TX_FORWARD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let disabled = *DISABLE_TX_FORWARD.get_or_init(|| {
-            std::env::var("N42_DISABLE_TX_FORWARD").map(|v| v == "1").unwrap_or(false)
+            std::env::var("N42_DISABLE_TX_FORWARD")
+                .map(|v| v == "1")
+                .unwrap_or(false)
         });
         if disabled {
             // Feed all buffered txs into local pool and return (no forwarding).
-            if let Some(ref tx_import) = self.tx_import_tx {
-                let txs = std::mem::take(&mut self.tx_forward_buffer);
+            let txs = std::mem::take(&mut self.tx_forward_buffer);
+            if self.tx_import_tx.is_some() {
                 for data in txs {
-                    let _ = tx_import.try_send(data);
+                    self.enqueue_tx_import(data, "tx forward disabled").await;
                 }
-            } else {
-                self.tx_forward_buffer.clear();
             }
             return;
         }
@@ -860,9 +958,9 @@ impl ConsensusOrchestrator {
         if self.engine.is_current_leader() {
             let txs = std::mem::take(&mut self.tx_forward_buffer);
             let count = txs.len();
-            if let Some(ref tx_import) = self.tx_import_tx {
+            if self.tx_import_tx.is_some() {
                 for data in txs {
-                    let _ = tx_import.try_send(data);
+                    self.enqueue_tx_import(data, "leader local tx import").await;
                 }
             }
             counter!("n42_tx_forward_local").increment(count as u64);
@@ -870,7 +968,10 @@ impl ConsensusOrchestrator {
         }
 
         // Find the leader's PeerId.
-        let leader_peer = validator_peers.iter().find(|(idx, _)| *idx == leader_idx).map(|(_, pid)| *pid);
+        let leader_peer = validator_peers
+            .iter()
+            .find(|(idx, _)| *idx == leader_idx)
+            .map(|(_, pid)| *pid);
 
         match leader_peer {
             Some(peer) => {
@@ -911,9 +1012,10 @@ impl ConsensusOrchestrator {
                     _ => "Other",
                 };
                 debug!(target: "n42::cl::orchestrator", msg_type, view = self.engine.current_view(), "processing consensus message");
-                match self.engine.process_event(
-                    n42_consensus::ConsensusEvent::Message(*message)
-                ) {
+                match self
+                    .engine
+                    .process_event(n42_consensus::ConsensusEvent::Message(*message))
+                {
                     Ok(()) => {}
                     Err(e) => {
                         if matches!(e, n42_consensus::N42ConsensusError::SafetyViolation { .. }) {
@@ -939,21 +1041,22 @@ impl ConsensusOrchestrator {
                 self.handle_block_data(data).await;
             }
             NetworkEvent::TransactionReceived { source: _, data } => {
-                if let Some(ref tx) = self.tx_import_tx {
-                    let _ = tx.try_send(data);
-                }
+                self.enqueue_tx_import(data, "p2p transaction received").await;
             }
             NetworkEvent::TxForwardReceived { source: _, txs } => {
                 // Leader receives forwarded txs from validators — feed into local pool.
                 let count = txs.len();
-                if let Some(ref tx_import) = self.tx_import_tx {
-                    for data in txs {
-                        let _ = tx_import.try_send(data);
-                    }
+                for data in txs {
+                    self.enqueue_tx_import(data, "validator tx forward received")
+                        .await;
                 }
                 counter!("n42_tx_forward_imported").increment(count as u64);
             }
-            NetworkEvent::SyncRequest { peer, request_id, request } => {
+            NetworkEvent::SyncRequest {
+                peer,
+                request_id,
+                request,
+            } => {
                 self.handle_sync_request(peer, request_id, request);
             }
             NetworkEvent::SyncResponse { peer, response } => {
@@ -1023,7 +1126,10 @@ mod tests {
     fn test_engine_initial_state() {
         let (engine, _output_rx) = make_test_engine();
         assert_eq!(engine.current_view(), 1, "initial view should be 1");
-        assert!(engine.is_current_leader(), "single validator should be leader");
+        assert!(
+            engine.is_current_leader(),
+            "single validator should be leader"
+        );
     }
 
     #[tokio::test]
@@ -1146,11 +1252,16 @@ mod tests {
         let orch = ConsensusOrchestrator::new(engine, network, net_event_rx, output_rx);
 
         let peer_id = libp2p::PeerId::random();
-        net_event_tx.try_send(NetworkEvent::PeerConnected(peer_id)).unwrap();
+        net_event_tx
+            .try_send(NetworkEvent::PeerConnected(peer_id))
+            .unwrap();
         drop(net_event_tx);
 
         let result = tokio::time::timeout(Duration::from_secs(5), orch.run()).await;
-        assert!(result.is_ok(), "orchestrator should exit after processing events");
+        assert!(
+            result.is_ok(),
+            "orchestrator should exit after processing events"
+        );
     }
 
     fn make_test_orchestrator_with_state(
@@ -1170,7 +1281,10 @@ mod tests {
         let state = Arc::new(SharedConsensusState::new(vs));
         let mut orch = make_test_orchestrator_with_state(Some(state.clone()));
 
-        assert!(state.load_committed_qc().is_none(), "should start with no QC");
+        assert!(
+            state.load_committed_qc().is_none(),
+            "should start with no QC"
+        );
 
         let commit_qc = QuorumCertificate::genesis();
         orch.handle_engine_output(EngineOutput::BlockCommitted {
@@ -1180,7 +1294,10 @@ mod tests {
         })
         .await;
 
-        assert!(state.load_committed_qc().is_some(), "should have QC after commit");
+        assert!(
+            state.load_committed_qc().is_some(),
+            "should have QC after commit"
+        );
     }
 
     #[tokio::test]

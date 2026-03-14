@@ -116,16 +116,19 @@ fn main() {
         unsafe { std::env::set_var("RUST_BACKTRACE", "1") };
     }
 
-    // Enable HTTP RPC and permissive CORS by default.
+    // Leave HTTP RPC disabled by default for release-oriented startup.
     //
     // NOTE: Do NOT call with_http_api()/with_ws_api() here — reth's
     // RpcModuleSelection::Display wraps output in brackets that its own
     // FromStr parser rejects. Use reth's built-in defaults (eth,net,web3).
-    // WS is not enabled by default to avoid port conflicts in multi-node setups.
-    let _ = DefaultRpcServerArgs::default()
-        .with_http(true)
-        .with_http_corsdomain(Some("*".to_string()))
-        .try_init();
+    // Operators can still opt in via `--http` or `N42_ENABLE_HTTP_RPC=1`.
+    // Leave CORS unset unless explicitly configured.
+    let rpc_defaults = if env_bool("N42_ENABLE_HTTP_RPC") {
+        DefaultRpcServerArgs::default().with_http(true)
+    } else {
+        DefaultRpcServerArgs::default()
+    };
+    let _ = rpc_defaults.try_init();
 
     if let Err(err) = Cli::<EthereumChainSpecParser>::parse().run(async move |builder, _| {
         info!(target: "n42::cli", "Launching N42 node");
@@ -423,16 +426,20 @@ fn main() {
                     transport_config.enable_mdns = env_bool("N42_ENABLE_MDNS");
                     transport_config.enable_kademlia = env_bool("N42_ENABLE_DHT");
 
-                    let swarm =
-                        build_swarm_with_validator_index(keypair, transport_config, None)
-                            .expect("Failed to build libp2p swarm");
+                    let swarm = build_swarm_with_validator_index(keypair, transport_config, None)
+                        .map_err(|e| eyre::eyre!("failed to build observer libp2p swarm: {e}"))?;
 
                     let (mut net_service, net_handle, _consensus_event_rx, net_event_rx) =
-                        NetworkService::new(swarm).expect("Failed to create NetworkService");
+                        NetworkService::new(swarm)
+                            .map_err(|e| eyre::eyre!("failed to create observer network service: {e}"))?;
 
                     let consensus_port: u16 = env_parse("N42_CONSENSUS_PORT").unwrap_or(9400);
-                    let listen_addr: libp2p::Multiaddr =
-                        format!("/ip4/0.0.0.0/udp/{}/quic-v1", consensus_port).parse().unwrap();
+                    let listen_addr: libp2p::Multiaddr = format!(
+                        "/ip4/0.0.0.0/udp/{}/quic-v1",
+                        consensus_port
+                    )
+                    .parse()
+                    .map_err(|e| eyre::eyre!("failed to parse observer listen address: {e}"))?;
 
                     if let Err(e) = net_service.listen_on(listen_addr.clone()) {
                         warn!(target: "n42::cli", error = %e, %listen_addr, "Failed to listen on consensus P2P address");
@@ -482,14 +489,19 @@ fn main() {
 
                 let swarm =
                     build_swarm_with_validator_index(keypair, transport_config, Some(my_index))
-                        .expect("Failed to build libp2p swarm");
+                        .map_err(|e| eyre::eyre!("failed to build consensus libp2p swarm: {e}"))?;
 
                 let (mut net_service, net_handle, consensus_event_rx, net_event_rx) =
-                    NetworkService::new(swarm).expect("Failed to create NetworkService");
+                    NetworkService::new(swarm)
+                        .map_err(|e| eyre::eyre!("failed to create consensus network service: {e}"))?;
 
                 let consensus_port: u16 = env_parse("N42_CONSENSUS_PORT").unwrap_or(9400);
-                let listen_addr: libp2p::Multiaddr =
-                    format!("/ip4/0.0.0.0/udp/{}/quic-v1", consensus_port).parse().unwrap();
+                let listen_addr: libp2p::Multiaddr = format!(
+                    "/ip4/0.0.0.0/udp/{}/quic-v1",
+                    consensus_port
+                )
+                .parse()
+                .map_err(|e| eyre::eyre!("failed to parse consensus listen address: {e}"))?;
 
                 if let Err(e) = net_service.listen_on(listen_addr.clone()) {
                     warn!(target: "n42::cli", error = %e, %listen_addr, "Failed to listen on consensus p2p address");
@@ -518,12 +530,18 @@ fn main() {
                         let peer_keypair = derive_ed25519_keypair(j);
                         let peer_id = peer_keypair.public().to_peer_id();
                         let peer_port = base_port + j as u16;
-                        let peer_addr: libp2p::Multiaddr = format!(
+                        let peer_addr: libp2p::Multiaddr = match format!(
                             "/ip4/127.0.0.1/udp/{}/quic-v1/p2p/{}",
                             peer_port, peer_id
                         )
                         .parse()
-                        .expect("valid multiaddr");
+                        {
+                            Ok(addr) => addr,
+                            Err(error) => {
+                                warn!(target: "n42::cli", error = %error, validator = j, "failed to build auto-connect multiaddr");
+                                continue;
+                            }
+                        };
 
                         if let Err(e) = net_handle.dial(peer_addr.clone()) {
                             warn!(target: "n42::cli", error = %e, validator = j, "failed to auto-dial validator");
@@ -549,7 +567,7 @@ fn main() {
                         max_connections_per_shard: max_conns_per_shard,
                         cert_dir: Some(data_dir.join("certs")),
                         ..Default::default()
-                    }).expect("Failed to create ShardedStarHub — check base_port + shard_count");
+                    }).map_err(|e| eyre::eyre!("failed to create ShardedStarHub: {e}"))?;
 
                 info!(
                     target: "n42::cli",
@@ -616,7 +634,7 @@ fn main() {
                 let attestation_store_path = data_dir.join("attestation_store.json");
                 let attestation_store = Arc::new(Mutex::new(
                     AttestationStore::new(attestation_store_path)
-                        .expect("failed to initialize attestation store"),
+                        .map_err(|e| eyre::eyre!("failed to initialize attestation store: {e}"))?,
                 ));
 
                 let mobile_bridge = MobileVerificationBridge::new(hub_event_rx, 10, 1000)
@@ -759,18 +777,24 @@ fn main() {
                 std::thread::Builder::new()
                     .name("n42-tx-pool-bridge".into())
                     .spawn(move || {
-                        let rt = tokio::runtime::Builder::new_multi_thread()
+                        let rt = match tokio::runtime::Builder::new_multi_thread()
                             .worker_threads(bridge_workers)
                             .thread_name("tx-bridge-worker")
                             .enable_all()
                             .build()
-                            .expect("failed to create tx-bridge runtime");
+                        {
+                            Ok(rt) => rt,
+                            Err(error) => {
+                                tracing::error!(error = %error, "failed to create tx-bridge runtime");
+                                return;
+                            }
+                        };
                         rt.block_on(
                             TxPoolBridge::new(pool_for_bridge, tx_import_rx, tx_broadcast_tx)
                                 .run(),
                         );
                     })
-                    .expect("failed to spawn tx-bridge thread");
+                    .map_err(|e| eyre::eyre!("failed to spawn tx-bridge thread: {e}"))?;
                 info!(target: "n42::cli", "TxPoolBridge started on dedicated runtime");
 
                 // Binary TCP ingest server for high-speed local TX submission.

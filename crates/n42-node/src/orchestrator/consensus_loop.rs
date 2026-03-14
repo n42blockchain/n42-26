@@ -2,6 +2,7 @@ use super::ConsensusOrchestrator;
 use super::state_mgmt::max_consecutive_empty_skips;
 use alloy_primitives::B256;
 use alloy_rpc_types_engine::{ForkchoiceState, PayloadStatusEnum};
+use metrics::{counter, gauge, histogram};
 use n42_consensus::EngineOutput;
 use n42_primitives::QuorumCertificate;
 use reth_ethereum_engine_primitives::EthEngineTypes;
@@ -10,7 +11,6 @@ use reth_payload_primitives::EngineApiMessageVersion;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::Instant;
-use metrics::{counter, gauge, histogram};
 use tracing::{debug, error, info, warn};
 
 /// Number of recent blocks to check for emptiness before skipping proposal.
@@ -139,17 +139,30 @@ impl ConsensusOrchestrator {
             EngineOutput::ExecuteBlock(block_hash) => {
                 self.handle_execute_block(block_hash).await;
             }
-            EngineOutput::BlockCommitted { view, block_hash, commit_qc } => {
-                self.handle_block_committed(view, block_hash, commit_qc).await;
+            EngineOutput::BlockCommitted {
+                view,
+                block_hash,
+                commit_qc,
+            } => {
+                self.handle_block_committed(view, block_hash, commit_qc)
+                    .await;
             }
             EngineOutput::ViewChanged { new_view } => {
                 self.handle_view_changed(new_view).await;
             }
-            EngineOutput::SyncRequired { local_view, target_view } => {
+            EngineOutput::SyncRequired {
+                local_view,
+                target_view,
+            } => {
                 counter!("n42_sync_required_total").increment(1);
                 self.initiate_sync(local_view, target_view);
             }
-            EngineOutput::EquivocationDetected { view, validator, hash1, hash2 } => {
+            EngineOutput::EquivocationDetected {
+                view,
+                validator,
+                hash1,
+                hash2,
+            } => {
                 counter!("n42_equivocations_detected_total").increment(1);
                 warn!(
                     target: "n42::cl::consensus_loop",
@@ -163,7 +176,10 @@ impl ConsensusOrchestrator {
                     state.record_equivocation(view, validator, hash1, hash2);
                 }
             }
-            EngineOutput::EpochTransition { new_epoch, validator_count } => {
+            EngineOutput::EpochTransition {
+                new_epoch,
+                validator_count,
+            } => {
                 info!(target: "n42::cl::consensus_loop", new_epoch, validator_count, "epoch transition: validator set updated");
                 counter!("n42_epoch_transitions_total").increment(1);
                 gauge!("n42_epoch_validator_count").set(validator_count as f64);
@@ -175,7 +191,9 @@ impl ConsensusOrchestrator {
                 if let Some(schedule) = &self.epoch_schedule
                     && let Some((validators, threshold)) = schedule.get_for_epoch(new_epoch + 1)
                 {
-                    self.engine.epoch_manager_mut().stage_next_epoch(validators, threshold);
+                    self.engine
+                        .epoch_manager_mut()
+                        .stage_next_epoch(validators, threshold);
                     info!(
                         target: "n42::cl::consensus_loop",
                         next_epoch = new_epoch + 1,
@@ -240,7 +258,9 @@ impl ConsensusOrchestrator {
             None
         };
 
-        let consensus_timing = self.engine.last_committed_view_timing()
+        let consensus_timing = self
+            .engine
+            .last_committed_view_timing()
             .map(|t| t.summary())
             .unwrap_or_else(|| "-".to_string());
         let epoch = self.engine.epoch_manager().current_epoch();
@@ -269,7 +289,9 @@ impl ConsensusOrchestrator {
 
         // JMT background update: extract BundleState from pending block data.
         if let Some(ref jmt) = self.jmt {
-            let diff = self.pending_block_data.get(&block_hash)
+            let diff = self
+                .pending_block_data
+                .get(&block_hash)
                 .and_then(|data| Self::extract_state_diff_for_jmt(data));
             if let Some(diff) = diff {
                 let jmt = Arc::clone(jmt);
@@ -354,7 +376,8 @@ impl ConsensusOrchestrator {
             }
         }
 
-        self.finalize_committed_block(view, block_hash, commit_qc).await;
+        self.finalize_committed_block(view, block_hash, commit_qc)
+            .await;
         self.save_consensus_state();
 
         // Note: if finalize_committed_block spawned a background import (Case B),
@@ -465,11 +488,8 @@ impl ConsensusOrchestrator {
             }
             self.pending_block_data.clear();
             self.pending_executions.clear();
-            if let Some(ref tx) = self.mobile_packet_tx
-                && let Err(e) = tx.try_send((block_hash, view))
-            {
-                warn!(target: "n42::cl::consensus_loop", view, %block_hash, error = %e, "mobile_packet_tx full or closed, verification packet lost");
-            }
+            self.enqueue_mobile_packet(block_hash, view, "block finalized")
+                .await;
             // Case A: block already in reth — schedule next build via slot timing.
             if self.engine.is_current_leader() {
                 if self.speculative_build_hash == Some(block_hash) {
@@ -493,7 +513,8 @@ impl ConsensusOrchestrator {
             // flow before the data was cached. Drain the leader_payload_rx to recover.
             while let Ok((hash, data)) = self.leader_payload_rx.try_recv() {
                 if !self.pending_block_data.contains_key(&hash) {
-                    if self.pending_block_data.len() >= super::execution_bridge::MAX_PENDING_BLOCK_DATA
+                    if self.pending_block_data.len()
+                        >= super::execution_bridge::MAX_PENDING_BLOCK_DATA
                         && let Some(old_key) = self.pending_block_data.keys().next().copied()
                     {
                         self.pending_block_data.remove(&old_key);
@@ -537,7 +558,9 @@ impl ConsensusOrchestrator {
         info!(target: "n42::cl::consensus_loop", view, %block_hash, "spawning background import");
         tokio::spawn(async move {
             let (success, block_ts) = Self::background_import(eh, &data, block_hash).await;
-            let _ = done_tx.send((block_hash, view, success, block_ts));
+            if done_tx.send((block_hash, view, success, block_ts)).is_err() {
+                debug!(target: "n42::cl::consensus_loop", view, %block_hash, "background import completion receiver dropped");
+            }
         });
     }
 
@@ -693,7 +716,13 @@ impl ConsensusOrchestrator {
     }
 
     /// Called when a background import task completes.
-    pub(super) async fn handle_import_done(&mut self, hash: B256, view: u64, success: bool, block_timestamp: u64) {
+    pub(super) async fn handle_import_done(
+        &mut self,
+        hash: B256,
+        view: u64,
+        success: bool,
+        block_timestamp: u64,
+    ) {
         self.bg_import_in_flight = false;
         if success {
             // Pipeline: background import complete — record timing.
@@ -705,11 +734,8 @@ impl ConsensusOrchestrator {
             if block_timestamp > 0 {
                 self.last_committed_timestamp = self.last_committed_timestamp.max(block_timestamp);
             }
-            if let Some(ref tx) = self.mobile_packet_tx
-                && let Err(e) = tx.try_send((hash, view))
-            {
-                warn!(target: "n42::cl::consensus_loop", view, %hash, error = %e, "mobile_packet_tx full or closed");
-            }
+            self.enqueue_mobile_packet(hash, view, "background import completed")
+                .await;
         } else {
             warn!(target: "n42::cl::consensus_loop", %hash, view, "background import FAILED, requesting sync");
             counter!("n42_bg_import_failures_total").increment(1);
@@ -771,7 +797,11 @@ impl ConsensusOrchestrator {
             self.last_committed_timestamp = self.last_committed_timestamp.max(broadcast.timestamp);
         }
 
-        if let Some(block) = self.committed_blocks.iter_mut().rev().find(|b| b.block_hash == hash)
+        if let Some(block) = self
+            .committed_blocks
+            .iter_mut()
+            .rev()
+            .find(|b| b.block_hash == hash)
             && block.payload.is_empty()
             && let Ok(broadcast) = bincode::deserialize::<super::BlockDataBroadcast>(&data)
         {
@@ -781,12 +811,15 @@ impl ConsensusOrchestrator {
 
         // If a deferred finalization is pending for this hash, complete it now.
         // This handles the race where commit arrives before leader_payload_rx.
-        let should_finalize = self.pending_finalization.as_ref()
+        let should_finalize = self
+            .pending_finalization
+            .as_ref()
             .is_some_and(|pf| pf.block_hash == hash);
         if should_finalize {
             info!(target: "n42::cl::consensus_loop", %hash, "leader block data arrived, completing deferred finalization");
             if let Some(pf) = self.pending_finalization.take() {
-                self.finalize_committed_block(pf.view, pf.block_hash, pf.commit_qc).await;
+                self.finalize_committed_block(pf.view, pf.block_hash, pf.commit_qc)
+                    .await;
             }
         }
     }
@@ -798,7 +831,9 @@ impl ConsensusOrchestrator {
         let exec_bytes = broadcast.execution_output.as_ref()?;
         let decompressed = zstd::bulk::decompress(exec_bytes, 64 * 1024 * 1024).ok()?;
         let compact: super::CompactBlockExecution = serde_json::from_slice(&decompressed).ok()?;
-        Some(n42_execution::state_diff::StateDiff::from_bundle_state(&compact.bundle_state))
+        Some(n42_execution::state_diff::StateDiff::from_bundle_state(
+            &compact.bundle_state,
+        ))
     }
 
     /// Extract decompressed CompactBlockExecution JSON bytes from raw BlockDataBroadcast.

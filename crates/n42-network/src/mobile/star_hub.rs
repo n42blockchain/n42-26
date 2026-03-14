@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{RwLock, mpsc};
 
 use super::session::{MobileSession, PhoneTier};
 
@@ -68,10 +68,18 @@ pub enum HubCommand {
 /// Events produced by the star hub for the node layer.
 #[derive(Debug)]
 pub enum HubEvent {
-    PhoneConnected { session_id: u64, verifier_pubkey: [u8; 48] },
-    PhoneDisconnected { session_id: u64 },
+    PhoneConnected {
+        session_id: u64,
+        verifier_pubkey: [u8; 48],
+    },
+    PhoneDisconnected {
+        session_id: u64,
+    },
     ReceiptReceived(Box<VerificationReceipt>),
-    CacheInventoryReceived { session_id: u64, code_hashes: Vec<[u8; 32]> },
+    CacheInventoryReceived {
+        session_id: u64,
+        code_hashes: Vec<[u8; 32]>,
+    },
 }
 
 /// Configuration for the mobile star hub.
@@ -102,36 +110,51 @@ pub struct StarHubHandle {
 }
 
 impl StarHubHandle {
-    /// Sends a command, dropping silently (with warn + counter) if the buffer is full.
-    /// Returns `Err(ChannelClosed)` only when the hub has shut down.
-    fn try_command(&self, cmd: HubCommand, label: &str) -> Result<(), crate::error::NetworkError> {
+    /// Sends a command to the hub, waiting for bounded-channel capacity instead of
+    /// dropping mobile traffic under load.
+    async fn send_command(
+        &self,
+        cmd: HubCommand,
+        label: &'static str,
+    ) -> Result<(), crate::error::NetworkError> {
         match self.command_tx.try_send(cmd) {
             Ok(()) => Ok(()),
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                 Err(crate::error::NetworkError::ChannelClosed)
             }
-            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                tracing::warn!(label, "StarHub command channel full, dropping");
-                metrics::counter!("n42_starhub_drops_total").increment(1);
-                Ok(())
+            Err(tokio::sync::mpsc::error::TrySendError::Full(cmd)) => {
+                tracing::warn!(label, "StarHub command channel full, waiting for capacity");
+                self.command_tx
+                    .send(cmd)
+                    .await
+                    .map_err(|_| crate::error::NetworkError::ChannelClosed)
             }
         }
     }
 
-    pub fn broadcast_packet(&self, data: Bytes) -> Result<(), crate::error::NetworkError> {
-        self.try_command(HubCommand::BroadcastPacket(data), "broadcast_packet")
+    pub async fn broadcast_packet(
+        &self,
+        data: Bytes,
+    ) -> Result<(), crate::error::NetworkError> {
+        self.send_command(HubCommand::BroadcastPacket(data), "broadcast_packet")
+            .await
     }
 
-    pub fn broadcast_cache_sync(&self, data: Bytes) -> Result<(), crate::error::NetworkError> {
-        self.try_command(HubCommand::BroadcastCacheSync(data), "broadcast_cache_sync")
+    pub async fn broadcast_cache_sync(
+        &self,
+        data: Bytes,
+    ) -> Result<(), crate::error::NetworkError> {
+        self.send_command(HubCommand::BroadcastCacheSync(data), "broadcast_cache_sync")
+            .await
     }
 
-    pub fn send_to_session(
+    pub async fn send_to_session(
         &self,
         session_id: u64,
         data: Bytes,
     ) -> Result<(), crate::error::NetworkError> {
-        self.try_command(HubCommand::SendToSession { session_id, data }, "send_to_session")
+        self.send_command(HubCommand::SendToSession { session_id, data }, "send_to_session")
+            .await
     }
 }
 
@@ -169,9 +192,7 @@ pub struct StarHub {
 
 impl StarHub {
     /// Creates a new star hub and returns the hub, handle, and event receiver.
-    pub fn new(
-        config: StarHubConfig,
-    ) -> (Self, StarHubHandle, mpsc::Receiver<HubEvent>) {
+    pub fn new(config: StarHubConfig) -> (Self, StarHubHandle, mpsc::Receiver<HubEvent>) {
         let (command_tx, command_rx) = mpsc::channel(4096);
         let (event_tx, event_rx) = mpsc::channel(4096);
 
@@ -221,10 +242,15 @@ impl StarHub {
     /// Sets up the QUIC endpoint, accepts connections, and processes commands.
     /// Should be spawned as a background task.
     pub async fn run(mut self) -> eyre::Result<()> {
-        let (server_config, cert_hash) =
-            build_server_config(self.config.cert_dir.as_deref(), self.config.idle_timeout_secs)?;
+        let (server_config, cert_hash) = build_server_config(
+            self.config.cert_dir.as_deref(),
+            self.config.idle_timeout_secs,
+        )?;
         self.cert_hash = Some(cert_hash);
-        tracing::info!(cert_hash = hex::encode(cert_hash), "StarHub certificate hash");
+        tracing::info!(
+            cert_hash = hex::encode(cert_hash),
+            "StarHub certificate hash"
+        );
 
         let endpoint = quinn::Endpoint::server(server_config, self.config.bind_addr)?;
         tracing::info!(
@@ -264,14 +290,8 @@ impl StarHub {
                     match incoming.await {
                         Ok(connection) => {
                             handle_phone_connection(
-                                sid,
-                                connection,
-                                sessions,
-                                event_tx,
-                                session_tx,
-                                session_rx,
-                                senders,
-                                max_conns,
+                                sid, connection, sessions, event_tx, session_tx, session_rx,
+                                senders, max_conns,
                             )
                             .await;
                         }
@@ -294,13 +314,20 @@ impl StarHub {
                     // Fast phones first (tier sorted ascending: Fast=0, Normal=1, Slow=2).
                     let mut targets: Vec<_> = senders
                         .iter()
-                        .map(|(sid, (tx, sess))| (*sid, tx.clone(), sess.tier()))
+                        .map(|(sid, (tx, sess))| (*sid, tx.clone(), sess.clone(), sess.tier()))
                         .collect();
-                    targets.sort_by_key(|(_, _, tier)| *tier as u8);
+                    targets.sort_by_key(|(_, _, _, tier)| *tier as u8);
 
                     let phone_count = targets.len();
-                    for (sid, tx, _) in targets {
+                    for (sid, tx, sess, _) in targets {
                         if tx.try_send(framed.clone()).is_err() {
+                            sess.record_send_timeout();
+                            metrics::counter!(
+                                "n42_mobile_send_queue_overflows",
+                                "kind" => "broadcast",
+                                "tier" => sess.tier().as_str()
+                            )
+                            .increment(1);
                             tracing::warn!(session_id = sid, "channel full, dropping broadcast");
                         }
                     }
@@ -318,6 +345,13 @@ impl StarHub {
                             continue;
                         }
                         if tx.try_send(framed.clone()).is_err() {
+                            sess.record_send_timeout();
+                            metrics::counter!(
+                                "n42_mobile_send_queue_overflows",
+                                "kind" => "cache_sync",
+                                "tier" => sess.tier().as_str()
+                            )
+                            .increment(1);
                             tracing::warn!(session_id = sid, "channel full, dropping cache sync");
                         }
                         sent += 1;
@@ -326,9 +360,16 @@ impl StarHub {
                 }
                 HubCommand::SendToSession { session_id, data } => {
                     let senders = self.session_senders.read().await;
-                    if let Some((tx, _)) = senders.get(&session_id)
+                    if let Some((tx, sess)) = senders.get(&session_id)
                         && tx.try_send(data).is_err()
                     {
+                        sess.record_send_timeout();
+                        metrics::counter!(
+                            "n42_mobile_send_queue_overflows",
+                            "kind" => "targeted",
+                            "tier" => sess.tier().as_str()
+                        )
+                        .increment(1);
                         tracing::warn!(session_id, "channel full, dropping targeted message");
                     }
                 }
@@ -361,39 +402,44 @@ async fn handle_phone_connection(
     tracing::debug!(session_id, remote = %connection.remote_address(), "phone connected, awaiting handshake");
 
     // Handshake: read 48-byte BLS12-381 public key from first uni stream.
-    let verifier_pubkey = match tokio::time::timeout(HANDSHAKE_TIMEOUT, connection.accept_uni()).await {
-        Ok(Ok(mut recv)) => match recv.read_to_end(48).await {
-            Ok(data) if data.len() == 48 => {
-                let mut pubkey = [0u8; 48];
-                pubkey.copy_from_slice(&data);
-                pubkey
-            }
-            Ok(data) => {
-                tracing::warn!(session_id, len = data.len(), "invalid handshake: expected 48-byte pubkey");
+    let verifier_pubkey =
+        match tokio::time::timeout(HANDSHAKE_TIMEOUT, connection.accept_uni()).await {
+            Ok(Ok(mut recv)) => match recv.read_to_end(48).await {
+                Ok(data) if data.len() == 48 => {
+                    let mut pubkey = [0u8; 48];
+                    pubkey.copy_from_slice(&data);
+                    pubkey
+                }
+                Ok(data) => {
+                    tracing::warn!(
+                        session_id,
+                        len = data.len(),
+                        "invalid handshake: expected 48-byte pubkey"
+                    );
+                    metrics::counter!("n42_mobile_handshake_failures").increment(1);
+                    connection.close(1u32.into(), b"invalid handshake");
+                    return;
+                }
+                Err(e) => {
+                    tracing::debug!(session_id, error = %e, "handshake read failed");
+                    metrics::counter!("n42_mobile_handshake_failures").increment(1);
+                    connection.close(1u32.into(), b"handshake read error");
+                    return;
+                }
+            },
+            Ok(Err(e)) => {
+                tracing::debug!(session_id, error = %e, "handshake stream accept failed");
                 metrics::counter!("n42_mobile_handshake_failures").increment(1);
-                connection.close(1u32.into(), b"invalid handshake");
+                connection.close(1u32.into(), b"handshake failed");
                 return;
             }
-            Err(e) => {
-                tracing::debug!(session_id, error = %e, "handshake read failed");
+            Err(_) => {
+                tracing::warn!(session_id, "handshake timeout");
                 metrics::counter!("n42_mobile_handshake_failures").increment(1);
-                connection.close(1u32.into(), b"handshake read error");
+                connection.close(1u32.into(), b"handshake timeout");
                 return;
             }
-        },
-        Ok(Err(e)) => {
-            tracing::debug!(session_id, error = %e, "handshake stream accept failed");
-            metrics::counter!("n42_mobile_handshake_failures").increment(1);
-            connection.close(1u32.into(), b"handshake failed");
-            return;
-        }
-        Err(_) => {
-            tracing::warn!(session_id, "handshake timeout");
-            metrics::counter!("n42_mobile_handshake_failures").increment(1);
-            connection.close(1u32.into(), b"handshake timeout");
-            return;
-        }
-    };
+        };
 
     if verifier_pubkey == [0u8; 48] {
         tracing::warn!(session_id, "rejected: zero public key");
@@ -413,20 +459,23 @@ async fn handle_phone_connection(
         }
         guard.insert(session_id, session.clone());
     }
-    session_senders.write().await.insert(session_id, (session_tx, session.clone()));
-    let pk = verifier_pubkey;
-    for attempt in 0..3 {
-        match event_tx.try_send(HubEvent::PhoneConnected { session_id, verifier_pubkey: pk }) {
-            Ok(()) => break,
-            Err(_) if attempt < 2 => {
-                tracing::warn!(session_id, attempt, "event channel full, retrying");
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-            Err(_) => {
-                tracing::error!(session_id, "event channel full after retries, PhoneConnected event dropped");
-                metrics::counter!("n42_hub_event_drops_total").increment(1);
-            }
-        }
+    session_senders
+        .write()
+        .await
+        .insert(session_id, (session_tx, session.clone()));
+    if let Err(e) = event_tx
+        .send(HubEvent::PhoneConnected {
+            session_id,
+            verifier_pubkey,
+        })
+        .await
+    {
+        tracing::error!(session_id, error = %e, "failed to deliver PhoneConnected event");
+        metrics::counter!("n42_hub_event_drops_total").increment(1);
+        sessions.write().await.remove(&session_id);
+        session_senders.write().await.remove(&session_id);
+        connection.close(3u32.into(), b"hub event delivery failed");
+        return;
     }
     tracing::debug!(session_id, "handshake complete, session active");
 
@@ -486,9 +535,13 @@ async fn handle_phone_connection(
                                         if receipt.timestamp_ms > 0 && now_ms > receipt.timestamp_ms {
                                             session.record_rtt(now_ms - receipt.timestamp_ms);
                                         }
-                                        if event_tx.try_send(HubEvent::ReceiptReceived(Box::new(receipt))).is_err() {
+                                        if let Err(e) = event_tx
+                                            .send(HubEvent::ReceiptReceived(Box::new(receipt)))
+                                            .await
+                                        {
                                             metrics::counter!("n42_hub_event_drops_total").increment(1);
-                                            tracing::debug!(session_id, "event channel full, receipt dropped");
+                                            tracing::error!(session_id, error = %e, "failed to deliver receipt event");
+                                            break;
                                         }
                                     }
                                     Err(e) => {
@@ -549,7 +602,10 @@ async fn handle_phone_connection(
 
     sessions.write().await.remove(&session_id);
     session_senders.write().await.remove(&session_id);
-    if let Err(e) = event_tx.send(HubEvent::PhoneDisconnected { session_id }).await {
+    if let Err(e) = event_tx
+        .send(HubEvent::PhoneDisconnected { session_id })
+        .await
+    {
         tracing::error!(session_id, error = %e, "failed to deliver PhoneDisconnected event");
         metrics::counter!("n42_hub_event_drops_total").increment(1);
     }
@@ -629,7 +685,10 @@ fn build_server_config(
     if let Ok(idle_timeout) = quinn::IdleTimeout::try_from(idle_duration) {
         transport.max_idle_timeout(Some(idle_timeout));
     } else {
-        tracing::warn!(idle_timeout_secs, "idle_timeout_secs exceeds QUIC max, using default");
+        tracing::warn!(
+            idle_timeout_secs,
+            "idle_timeout_secs exceeds QUIC max, using default"
+        );
     }
     server_config.transport_config(Arc::new(transport));
 
@@ -722,7 +781,12 @@ mod tests {
 
     #[test]
     fn test_msg_type_constants() {
-        let types = [MSG_TYPE_PACKET, MSG_TYPE_CACHE_SYNC, MSG_TYPE_PACKET_ZSTD, MSG_TYPE_CACHE_SYNC_ZSTD];
+        let types = [
+            MSG_TYPE_PACKET,
+            MSG_TYPE_CACHE_SYNC,
+            MSG_TYPE_PACKET_ZSTD,
+            MSG_TYPE_CACHE_SYNC_ZSTD,
+        ];
         for i in 0..types.len() {
             for j in (i + 1)..types.len() {
                 assert_ne!(types[i], types[j], "message type prefixes must be unique");
@@ -743,17 +807,54 @@ mod tests {
         assert_eq!(hub.max_connections(), 10_000);
     }
 
-    #[test]
-    fn test_hub_handle_send_commands() {
+    #[tokio::test]
+    async fn test_hub_handle_send_commands() {
         let (_hub, handle, _event_rx) = StarHub::new(StarHubConfig::default());
-        assert!(handle.broadcast_packet(Bytes::from(vec![1, 2, 3])).is_ok());
-        assert!(handle.broadcast_cache_sync(Bytes::from(vec![4, 5, 6])).is_ok());
+        assert!(handle.broadcast_packet(Bytes::from(vec![1, 2, 3])).await.is_ok());
+        assert!(
+            handle
+                .broadcast_cache_sync(Bytes::from(vec![4, 5, 6]))
+                .await
+                .is_ok()
+        );
     }
 
-    #[test]
-    fn test_send_to_session_command() {
+    #[tokio::test]
+    async fn test_send_to_session_command() {
         let (_hub, handle, _event_rx) = StarHub::new(StarHubConfig::default());
-        assert!(handle.send_to_session(42, Bytes::from(vec![1, 2, 3])).is_ok());
+        assert!(
+            handle
+                .send_to_session(42, Bytes::from(vec![1, 2, 3]))
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_hub_handle_waits_for_command_capacity() {
+        let (command_tx, mut command_rx) = mpsc::channel(1);
+        let handle = StarHubHandle { command_tx: command_tx.clone() };
+
+        command_tx
+            .send(HubCommand::BroadcastPacket(Bytes::from(vec![0x01])))
+            .await
+            .unwrap();
+
+        let drain_fut = async {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            command_rx.recv().await
+        };
+
+        let (send_result, first) = tokio::join!(
+            handle.broadcast_packet(Bytes::from(vec![0x02])),
+            drain_fut
+        );
+        assert!(send_result.is_ok());
+
+        let first = first.expect("expected buffered command");
+        assert!(matches!(first, HubCommand::BroadcastPacket(_)));
+        let second = command_rx.recv().await.expect("expected awaited command");
+        assert!(matches!(second, HubCommand::BroadcastPacket(_)));
     }
 
     #[test]
@@ -809,8 +910,10 @@ mod tests {
                 std::thread::spawn(move || (0..1000).map(|_| g.next()).collect::<Vec<_>>())
             })
             .collect();
-        let mut all_ids: Vec<u64> =
-            threads.into_iter().flat_map(|t| t.join().unwrap()).collect();
+        let mut all_ids: Vec<u64> = threads
+            .into_iter()
+            .flat_map(|t| t.join().unwrap())
+            .collect();
         all_ids.sort();
         all_ids.dedup();
         assert_eq!(all_ids.len(), 8000, "all session IDs must be unique");

@@ -1,4 +1,6 @@
-use super::{BlobSidecarBroadcast, BlockDataBroadcast, CompactBlockExecution, ConsensusOrchestrator};
+use super::{
+    BlobSidecarBroadcast, BlockDataBroadcast, CompactBlockExecution, ConsensusOrchestrator,
+};
 use alloy_consensus::Typed2718;
 use alloy_eips::eip7594::BlobTransactionSidecarVariant;
 use alloy_primitives::{Address, B256};
@@ -23,11 +25,16 @@ use tracing::{debug, error, info, warn};
 pub(super) fn compact_block_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var("N42_COMPACT_BLOCK").map(|v| v != "0").unwrap_or(true)
+        std::env::var("N42_COMPACT_BLOCK")
+            .map(|v| v != "0")
+            .unwrap_or(true)
     })
 }
 
-type CachedPayloadData = (BlockExecutionOutput<reth_ethereum_primitives::Receipt>, Vec<Address>);
+type CachedPayloadData = (
+    BlockExecutionOutput<reth_ethereum_primitives::Receipt>,
+    Vec<Address>,
+);
 
 /// Take execution output from broadcast cache and serialize it for followers.
 fn take_and_serialize_execution_output(hash: &B256) -> Option<Vec<u8>> {
@@ -290,7 +297,11 @@ impl ConsensusOrchestrator {
             let used_ts = try_attrs.timestamp;
 
             match beacon_engine
-                .fork_choice_updated(fcu_state, Some(try_attrs), EngineApiMessageVersion::default())
+                .fork_choice_updated(
+                    fcu_state,
+                    Some(try_attrs),
+                    EngineApiMessageVersion::default(),
+                )
                 .await
             {
                 Ok(result) => {
@@ -405,8 +416,12 @@ impl ConsensusOrchestrator {
                     )
                     .await;
                 }
-                Some(Err(e)) => error!(target: "n42::cl::exec_bridge", error = %e, "payload build failed"),
-                None => warn!(target: "n42::cl::exec_bridge", "payload not found (already resolved or expired)"),
+                Some(Err(e)) => {
+                    error!(target: "n42::cl::exec_bridge", error = %e, "payload build failed")
+                }
+                None => {
+                    warn!(target: "n42::cl::exec_bridge", "payload not found (already resolved or expired)")
+                }
             }
         });
 
@@ -423,7 +438,9 @@ impl ConsensusOrchestrator {
                 );
             }
             // Signal completion regardless of success/failure/panic.
-            let _ = build_complete_tx.send(());
+            if build_complete_tx.send(()).is_err() {
+                debug!(target: "n42::cl::exec_bridge", "build completion receiver dropped");
+            }
         });
     }
 
@@ -504,10 +521,11 @@ impl ConsensusOrchestrator {
                 let decompress_ms = decompress_start.elapsed().as_millis() as u64;
                 // Deserialize first, then use typed accessor for block number.
                 let deser_start = std::time::Instant::now();
-                let execution_data: alloy_rpc_types_engine::ExecutionData = match serde_json::from_slice(&payload_json) {
-                    Ok(data) => data,
-                    Err(_) => return,
-                };
+                let execution_data: alloy_rpc_types_engine::ExecutionData =
+                    match serde_json::from_slice(&payload_json) {
+                        Ok(data) => data,
+                        Err(_) => return,
+                    };
                 let deser_ms = deser_start.elapsed().as_millis() as u64;
                 info!(
                     target: "n42::cl::exec_bridge",
@@ -532,8 +550,9 @@ impl ConsensusOrchestrator {
                 // Compact Block: load execution output into payload cache before `new_payload`.
                 // This lets reth skip EVM re-execution (cache hit path), reducing import from
                 // ~209ms to ~22ms. Safety: state root is still verified by reth's new_payload.
-                let compact_injected = execution_output_compressed.as_ref()
-                    .is_some_and(|exec| compact_block_enabled() && inject_compact_block(&hash, exec));
+                let compact_injected = execution_output_compressed.as_ref().is_some_and(|exec| {
+                    compact_block_enabled() && inject_compact_block(&hash, exec)
+                });
 
                 // Follower eager import: only run new_payload (no FCU).
                 // new_payload inserts the block into reth's engine tree so that
@@ -543,7 +562,12 @@ impl ConsensusOrchestrator {
                 // ultimately commits, and premature FCU causes reorgs that stall the chain.
                 let import_start = std::time::Instant::now();
                 match eh.new_payload(execution_data).await {
-                    Ok(status) if matches!(status.status, PayloadStatusEnum::Valid | PayloadStatusEnum::Accepted) => {
+                    Ok(status)
+                        if matches!(
+                            status.status,
+                            PayloadStatusEnum::Valid | PayloadStatusEnum::Accepted
+                        ) =>
+                    {
                         let np_elapsed = import_start.elapsed().as_millis() as u64;
                         info!(
                             target: "n42::cl::exec_bridge",
@@ -554,7 +578,9 @@ impl ConsensusOrchestrator {
                             metrics::counter!("n42_compact_block_cache_hits").increment(1);
                         }
                         metrics::counter!("n42_follower_eager_import_hits_total").increment(1);
-                        let _ = eager_done_tx.send((hash, block_ts));
+                        if eager_done_tx.send((hash, block_ts)).is_err() {
+                            debug!(target: "n42::cl::exec_bridge", %hash, view, "eager import completion receiver dropped");
+                        }
                     }
                     Ok(status) => {
                         debug!(target: "n42::cl::exec_bridge", %hash, view, status = ?status.status, compact_injected, "follower eager import: not accepted");
@@ -647,8 +673,12 @@ impl ConsensusOrchestrator {
 
         match engine_handle.new_payload(execution_data).await {
             Ok(status) => {
-                if matches!(status.status, PayloadStatusEnum::Valid | PayloadStatusEnum::Accepted) {
-                    self.handle_valid_import(&broadcast, &engine_handle, &status).await;
+                if matches!(
+                    status.status,
+                    PayloadStatusEnum::Valid | PayloadStatusEnum::Accepted
+                ) {
+                    self.handle_valid_import(&broadcast, &engine_handle, &status)
+                        .await;
                 } else if matches!(status.status, PayloadStatusEnum::Syncing) {
                     self.queue_syncing_block(&broadcast);
                 } else {
@@ -734,11 +764,12 @@ impl ConsensusOrchestrator {
         self.pending_block_data.clear();
         self.pending_executions.clear();
 
-        if let Some(ref tx) = self.mobile_packet_tx
-            && let Err(e) = tx.try_send((broadcast.block_hash, deferred_view))
-        {
-            warn!(target: "n42::cl::exec_bridge", view = deferred_view, hash = %broadcast.block_hash, error = %e, "mobile_packet_tx full or closed, deferred verification packet lost");
-        }
+        self.enqueue_mobile_packet(
+            broadcast.block_hash,
+            deferred_view,
+            "deferred finalization completed",
+        )
+        .await;
 
         if self.engine.is_current_leader() {
             if self.speculative_build_hash == Some(broadcast.block_hash) {
@@ -768,7 +799,10 @@ impl ConsensusOrchestrator {
         }
     }
 
-    async fn retry_syncing_blocks(&mut self, engine_handle: &ConsensusEngineHandle<EthEngineTypes>) {
+    async fn retry_syncing_blocks(
+        &mut self,
+        engine_handle: &ConsensusEngineHandle<EthEngineTypes>,
+    ) {
         let queued: Vec<(Vec<u8>, u32)> = self.syncing_blocks.drain(..).collect();
         info!(target: "n42::cl::exec_bridge", count = queued.len(), "retrying previously-syncing blocks");
 
@@ -904,11 +938,21 @@ async fn handle_built_payload(
     };
 
     // 1. Broadcast block data + blob sidecars to followers
-    broadcast_block_data(&network, &leader_payload_tx, hash, current_view, &payload_json, block_timestamp, execution_output_bytes);
+    broadcast_block_data(
+        &network,
+        &leader_payload_tx,
+        hash,
+        current_view,
+        &payload_json,
+        block_timestamp,
+        execution_output_bytes,
+    );
     broadcast_blob_sidecars(&network, &payload, hash, current_view, blob_store);
 
     // 2. Trigger consensus voting immediately (non-blocking channel send)
-    let _ = block_ready_tx.send(hash);
+    if block_ready_tx.send(hash).is_err() {
+        debug!(target: "n42::cl::exec_bridge", %hash, "block_ready receiver dropped");
+    }
 
     // 3. Eager import: run new_payload + fcu while consensus votes in parallel.
     //    This is the key pipelining optimization — by the time finalize_committed_block
@@ -928,11 +972,18 @@ async fn handle_built_payload(
     // only finalize_committed_block (after consensus commit) should do FCU.
     let import_start = std::time::Instant::now();
     match engine_handle.new_payload(execution_data).await {
-        Ok(status) if matches!(status.status, PayloadStatusEnum::Valid | PayloadStatusEnum::Accepted) => {
+        Ok(status)
+            if matches!(
+                status.status,
+                PayloadStatusEnum::Valid | PayloadStatusEnum::Accepted
+            ) =>
+        {
             let np_elapsed = import_start.elapsed().as_millis() as u64;
             info!(target: "n42::cl::exec_bridge", %hash, np_elapsed, "eager import: new_payload accepted (no FCU)");
             metrics::counter!("n42_eager_import_hits_total").increment(1);
-            let _ = eager_import_done_tx.send((hash, block_timestamp));
+            if eager_import_done_tx.send((hash, block_timestamp)).is_err() {
+                debug!(target: "n42::cl::exec_bridge", %hash, "leader eager import completion receiver dropped");
+            }
         }
         Ok(status) => {
             info!(target: "n42::cl::exec_bridge", %hash, status = ?status.status, elapsed_ms = import_start.elapsed().as_millis() as u64, "eager import: new_payload not accepted");
@@ -1026,7 +1077,9 @@ fn broadcast_block_data(
         "N42_BROADCAST: direct push + gossipsub complete"
     );
 
-    let _ = leader_payload_tx.send((hash, encoded));
+    if leader_payload_tx.send((hash, encoded)).is_err() {
+        debug!(target: "n42::cl::exec_bridge", %hash, "leader payload feedback receiver dropped");
+    }
 }
 
 fn broadcast_blob_sidecars(

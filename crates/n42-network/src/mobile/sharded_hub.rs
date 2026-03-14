@@ -52,16 +52,19 @@ impl ShardedStarHubHandle {
     /// Broadcasts a verification packet to all shards.
     ///
     /// `Bytes::clone()` is O(1), so fan-out to N shards copies no payload.
-    pub fn broadcast_packet(&self, data: Bytes) -> Result<(), crate::error::NetworkError> {
+    pub async fn broadcast_packet(&self, data: Bytes) -> Result<(), crate::error::NetworkError> {
         for handle in &self.shard_handles {
-            handle.broadcast_packet(data.clone())?;
+            handle.broadcast_packet(data.clone()).await?;
         }
         Ok(())
     }
 
-    pub fn broadcast_cache_sync(&self, data: Bytes) -> Result<(), crate::error::NetworkError> {
+    pub async fn broadcast_cache_sync(
+        &self,
+        data: Bytes,
+    ) -> Result<(), crate::error::NetworkError> {
         for handle in &self.shard_handles {
-            handle.broadcast_cache_sync(data.clone())?;
+            handle.broadcast_cache_sync(data.clone()).await?;
         }
         Ok(())
     }
@@ -69,13 +72,13 @@ impl ShardedStarHubHandle {
     /// Sends data to a specific session by fan-outing to all shards.
     ///
     /// Only the shard owning the session ID will match; others silently drop.
-    pub fn send_to_session(
+    pub async fn send_to_session(
         &self,
         session_id: u64,
         data: Bytes,
     ) -> Result<(), crate::error::NetworkError> {
         for handle in &self.shard_handles {
-            handle.send_to_session(session_id, data.clone())?;
+            handle.send_to_session(session_id, data.clone()).await?;
         }
         Ok(())
     }
@@ -184,7 +187,7 @@ mod tests {
         let (hub, handle, _event_rx) = ShardedStarHub::new(config).unwrap();
         assert_eq!(hub.shard_count(), 1);
         assert_eq!(hub.ports(), vec![19443]);
-        assert!(handle.broadcast_packet(Bytes::from(vec![1, 2, 3])).is_ok());
+        assert!(handle.broadcast_packet(Bytes::from(vec![1, 2, 3])).await.is_ok());
     }
 
     #[tokio::test]
@@ -199,8 +202,8 @@ mod tests {
     async fn test_sharded_hub_broadcast_fans_out() {
         let config = ShardedStarHubConfig { base_port: 19446, shard_count: 3, ..Default::default() };
         let (_hub, handle, _event_rx) = ShardedStarHub::new(config).unwrap();
-        assert!(handle.broadcast_packet(Bytes::from(vec![0xAA])).is_ok());
-        assert!(handle.broadcast_cache_sync(Bytes::from(vec![0xBB])).is_ok());
+        assert!(handle.broadcast_packet(Bytes::from(vec![0xAA])).await.is_ok());
+        assert!(handle.broadcast_cache_sync(Bytes::from(vec![0xBB])).await.is_ok());
     }
 
     #[tokio::test]
@@ -208,8 +211,8 @@ mod tests {
         let config = ShardedStarHubConfig { base_port: 19449, shard_count: 2, ..Default::default() };
         let (_hub, handle, _event_rx) = ShardedStarHub::new(config).unwrap();
         let cloned = handle.clone();
-        assert!(handle.broadcast_packet(Bytes::from(vec![1])).is_ok());
-        assert!(cloned.broadcast_packet(Bytes::from(vec![2])).is_ok());
+        assert!(handle.broadcast_packet(Bytes::from(vec![1])).await.is_ok());
+        assert!(cloned.broadcast_packet(Bytes::from(vec![2])).await.is_ok());
     }
 
     #[test]

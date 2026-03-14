@@ -59,8 +59,17 @@ where
                                 let tx: &TransactionSigned = pooled_tx.transaction.transaction();
                                 let encoded = alloy_rlp::encode(tx);
                                 debug!(%tx_hash, bytes = encoded.len(), "broadcasting local transaction");
-                                if let Err(e) = self.broadcast_tx.try_send(encoded) {
-                                    tracing::warn!(%tx_hash, error = %e, "broadcast channel full, transaction not propagated");
+                                match self.broadcast_tx.try_send(encoded) {
+                                    Ok(()) => {}
+                                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                        tracing::warn!(%tx_hash, "broadcast channel closed, stopping propagation");
+                                    }
+                                    Err(tokio::sync::mpsc::error::TrySendError::Full(encoded)) => {
+                                        tracing::warn!(%tx_hash, "broadcast channel full, waiting to propagate");
+                                        if let Err(error) = self.broadcast_tx.send(encoded).await {
+                                            tracing::warn!(%tx_hash, error = %error, "broadcast propagation failed after backpressure wait");
+                                        }
+                                    }
                                 }
                             }
                         }

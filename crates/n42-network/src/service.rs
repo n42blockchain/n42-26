@@ -3,7 +3,7 @@ use libp2p::gossipsub;
 use libp2p::swarm::SwarmEvent;
 use libp2p::{Multiaddr, PeerId, Swarm};
 use n42_primitives::ConsensusMessage;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -12,8 +12,9 @@ use tokio::time::interval;
 use crate::block_direct::{BlockDirectRequest, BlockDirectResponse};
 use crate::consensus_direct::{ConsensusDirectRequest, ConsensusDirectResponse};
 use crate::error::NetworkError;
-use crate::tx_forward::{TxForwardRequest, TxForwardResponse};
-use crate::gossipsub::handlers::{decode_consensus_message, encode_consensus_message, validate_message};
+use crate::gossipsub::handlers::{
+    decode_consensus_message, encode_consensus_message, validate_message,
+};
 use crate::gossipsub::topics::{
     blob_sidecar_topic, block_announce_topic, consensus_topic, mempool_topic,
     verification_receipts_topic,
@@ -21,41 +22,92 @@ use crate::gossipsub::topics::{
 use crate::reconnection::ReconnectionManager;
 use crate::state_sync::{BlockSyncRequest, BlockSyncResponse};
 use crate::transport::{N42Behaviour, N42BehaviourEvent};
+use crate::tx_forward::{TxForwardRequest, TxForwardResponse};
 
 /// Commands sent to the network service from the node layer.
 #[derive(Debug)]
 pub enum NetworkCommand {
     BroadcastConsensus(ConsensusMessage),
-    SendDirect { peer: PeerId, message: ConsensusMessage },
+    SendDirect {
+        peer: PeerId,
+        message: ConsensusMessage,
+    },
     AnnounceBlock(Vec<u8>),
     BroadcastTransaction(Vec<u8>),
     BroadcastBlobSidecar(Vec<u8>),
     /// Send block data directly to a specific peer (leader → validator).
-    SendBlockDirect { peer: PeerId, data: Vec<u8> },
+    SendBlockDirect {
+        peer: PeerId,
+        data: Vec<u8>,
+    },
     /// Forward a batch of RLP-encoded transactions to the current leader.
-    ForwardTxBatch { peer: PeerId, txs: Vec<Vec<u8>> },
+    ForwardTxBatch {
+        peer: PeerId,
+        txs: Vec<Vec<u8>>,
+    },
     Dial(Multiaddr),
-    RequestSync { peer: PeerId, request: BlockSyncRequest },
-    SendSyncResponse { request_id: u64, response: BlockSyncResponse },
-    RegisterPeer { peer_id: PeerId, addrs: Vec<Multiaddr>, trusted: bool },
-    AddKademliaPeer { peer_id: PeerId, addrs: Vec<Multiaddr> },
+    RequestSync {
+        peer: PeerId,
+        request: BlockSyncRequest,
+    },
+    SendSyncResponse {
+        request_id: u64,
+        response: BlockSyncResponse,
+    },
+    RegisterPeer {
+        peer_id: PeerId,
+        addrs: Vec<Multiaddr>,
+        trusted: bool,
+    },
+    AddKademliaPeer {
+        peer_id: PeerId,
+        addrs: Vec<Multiaddr>,
+    },
 }
 
 /// Events produced by the network service for the node layer.
 #[derive(Debug)]
 pub enum NetworkEvent {
-    ConsensusMessage { source: PeerId, message: Box<ConsensusMessage> },
-    BlockAnnouncement { source: PeerId, data: Vec<u8> },
-    VerificationReceipt { source: PeerId, data: Vec<u8> },
-    TransactionReceived { source: PeerId, data: Vec<u8> },
-    BlobSidecarReceived { source: PeerId, data: Vec<u8> },
+    ConsensusMessage {
+        source: PeerId,
+        message: Box<ConsensusMessage>,
+    },
+    BlockAnnouncement {
+        source: PeerId,
+        data: Vec<u8>,
+    },
+    VerificationReceipt {
+        source: PeerId,
+        data: Vec<u8>,
+    },
+    TransactionReceived {
+        source: PeerId,
+        data: Vec<u8>,
+    },
+    BlobSidecarReceived {
+        source: PeerId,
+        data: Vec<u8>,
+    },
     PeerConnected(PeerId),
     PeerDisconnected(PeerId),
     /// Batch of transactions forwarded from a non-leader validator.
-    TxForwardReceived { source: PeerId, txs: Vec<Vec<u8>> },
-    SyncRequest { peer: PeerId, request_id: u64, request: BlockSyncRequest },
-    SyncResponse { peer: PeerId, response: BlockSyncResponse },
-    SyncRequestFailed { peer: PeerId, error: String },
+    TxForwardReceived {
+        source: PeerId,
+        txs: Vec<Vec<u8>>,
+    },
+    SyncRequest {
+        peer: PeerId,
+        request_id: u64,
+        request: BlockSyncRequest,
+    },
+    SyncResponse {
+        peer: PeerId,
+        response: BlockSyncResponse,
+    },
+    SyncRequestFailed {
+        peer: PeerId,
+        error: String,
+    },
 }
 
 /// Handle for sending commands to the running `NetworkService`.
@@ -137,7 +189,11 @@ impl NetworkHandle {
         self.send(NetworkCommand::Dial(addr))
     }
 
-    pub fn request_sync(&self, peer: PeerId, request: BlockSyncRequest) -> Result<(), NetworkError> {
+    pub fn request_sync(
+        &self,
+        peer: PeerId,
+        request: BlockSyncRequest,
+    ) -> Result<(), NetworkError> {
         self.send(NetworkCommand::RequestSync { peer, request })
     }
 
@@ -146,7 +202,10 @@ impl NetworkHandle {
         request_id: u64,
         response: BlockSyncResponse,
     ) -> Result<(), NetworkError> {
-        self.send(NetworkCommand::SendSyncResponse { request_id, response })
+        self.send(NetworkCommand::SendSyncResponse {
+            request_id,
+            response,
+        })
     }
 
     /// Registers a peer for automatic reconnection.
@@ -160,10 +219,16 @@ impl NetworkHandle {
         const MAX_ADDRS_PER_PEER: usize = 16;
         if addrs.len() > MAX_ADDRS_PER_PEER {
             return Err(NetworkError::Dial(format!(
-                "too many addresses for peer ({}), max is {}", addrs.len(), MAX_ADDRS_PER_PEER
+                "too many addresses for peer ({}), max is {}",
+                addrs.len(),
+                MAX_ADDRS_PER_PEER
             )));
         }
-        self.send(NetworkCommand::RegisterPeer { peer_id, addrs, trusted })
+        self.send(NetworkCommand::RegisterPeer {
+            peer_id,
+            addrs,
+            trusted,
+        })
     }
 
     pub fn add_kademlia_peer(
@@ -175,12 +240,16 @@ impl NetworkHandle {
     }
 
     fn send(&self, cmd: NetworkCommand) -> Result<(), NetworkError> {
-        self.command_tx.send(cmd).map_err(|_| NetworkError::ChannelClosed)
+        self.command_tx
+            .send(cmd)
+            .map_err(|_| NetworkError::ChannelClosed)
     }
 
     /// Send via the high-priority channel (block data, consensus, sync).
     fn send_priority(&self, cmd: NetworkCommand) -> Result<(), NetworkError> {
-        self.priority_tx.send(cmd).map_err(|_| NetworkError::ChannelClosed)
+        self.priority_tx
+            .send(cmd)
+            .map_err(|_| NetworkError::ChannelClosed)
     }
 }
 
@@ -195,6 +264,8 @@ pub struct NetworkService {
     consensus_event_tx: mpsc::Sender<NetworkEvent>,
     /// Lower-priority channel for data events (BlockData, TX, Sync, Peers).
     event_tx: mpsc::Sender<NetworkEvent>,
+    /// Reliable consensus/block events that could not be delivered immediately.
+    pending_reliable_events: VecDeque<NetworkEvent>,
     consensus_topic_hash: gossipsub::TopicHash,
     block_announce_topic_hash: gossipsub::TopicHash,
     mempool_topic_hash: gossipsub::TopicHash,
@@ -221,7 +292,15 @@ impl NetworkService {
     /// events (TxForward, BlockAnnouncement, TransactionReceived).
     pub fn new(
         mut swarm: Swarm<N42Behaviour>,
-    ) -> Result<(Self, NetworkHandle, mpsc::Receiver<NetworkEvent>, mpsc::Receiver<NetworkEvent>), NetworkError> {
+    ) -> Result<
+        (
+            Self,
+            NetworkHandle,
+            mpsc::Receiver<NetworkEvent>,
+            mpsc::Receiver<NetworkEvent>,
+        ),
+        NetworkError,
+    > {
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let (priority_tx, priority_rx) = mpsc::unbounded_channel();
         let (consensus_event_tx, consensus_event_rx) = mpsc::channel(2048);
@@ -231,7 +310,9 @@ impl NetworkService {
         // Set N42_ENABLE_TX_GOSSIP=1 to re-enable legacy GossipSub tx flooding.
         let tx_gossip_disabled = std::env::var("N42_ENABLE_TX_GOSSIP").is_err();
         if tx_gossip_disabled {
-            tracing::info!("TX gossip disabled (default): using TX Forward to Leader. Set N42_ENABLE_TX_GOSSIP=1 to re-enable.");
+            tracing::info!(
+                "TX gossip disabled (default): using TX Forward to Leader. Set N42_ENABLE_TX_GOSSIP=1 to re-enable."
+            );
         }
 
         let topics = [
@@ -253,7 +334,13 @@ impl NetworkService {
                 .map_err(|e| NetworkError::Subscribe(e.to_string()))?;
         }
 
-        let [consensus, block_announce, verification, mempool, blob_sidecar] = topics;
+        let [
+            consensus,
+            block_announce,
+            verification,
+            mempool,
+            blob_sidecar,
+        ] = topics;
         let consensus_topic_hash = consensus.hash();
         let block_announce_topic_hash = block_announce.hash();
         let verification_receipts_topic_hash = verification.hash();
@@ -273,6 +360,7 @@ impl NetworkService {
             priority_rx,
             consensus_event_tx,
             event_tx,
+            pending_reliable_events: VecDeque::new(),
             consensus_topic_hash,
             block_announce_topic_hash,
             mempool_topic_hash,
@@ -297,7 +385,9 @@ impl NetworkService {
     }
 
     pub fn dial(&mut self, addr: Multiaddr) -> Result<(), NetworkError> {
-        self.swarm.dial(addr).map_err(|e| NetworkError::Dial(e.to_string()))
+        self.swarm
+            .dial(addr)
+            .map_err(|e| NetworkError::Dial(e.to_string()))
     }
 
     /// Runs the event loop. Should be spawned as a background task.
@@ -317,6 +407,18 @@ impl NetworkService {
         }
 
         loop {
+            while let Some(event) = self.pending_reliable_events.pop_front() {
+                let tx = self.consensus_event_tx.clone();
+                if tx.send(event).await.is_err() {
+                    metrics::counter!("n42_network_event_drops_total").increment(1);
+                    tracing::warn!(
+                        "consensus event channel closed while draining reliable backlog"
+                    );
+                    self.pending_reliable_events.clear();
+                    break;
+                }
+            }
+
             // Drain all pending priority commands first (block data, consensus).
             // This ensures block transmission is never delayed by tx broadcast backlog.
             while let Ok(cmd) = self.priority_rx.try_recv() {
@@ -377,9 +479,10 @@ impl NetworkService {
             })) => {
                 self.handle_gossipsub_message(propagation_source, message);
             }
-            SwarmEvent::Behaviour(N42BehaviourEvent::Gossipsub(
-                gossipsub::Event::Subscribed { peer_id, topic },
-            )) => {
+            SwarmEvent::Behaviour(N42BehaviourEvent::Gossipsub(gossipsub::Event::Subscribed {
+                peer_id,
+                topic,
+            })) => {
                 tracing::debug!(%peer_id, %topic, "peer subscribed to topic");
             }
             SwarmEvent::Behaviour(N42BehaviourEvent::StateSync(event)) => {
@@ -427,7 +530,10 @@ impl NetworkService {
                 }
                 self.emit_event(NetworkEvent::PeerDisconnected(peer_id));
             }
-            SwarmEvent::OutgoingConnectionError { peer_id: Some(peer_id), .. } => {
+            SwarmEvent::OutgoingConnectionError {
+                peer_id: Some(peer_id),
+                ..
+            } => {
                 tracing::debug!(%peer_id, "outgoing connection error");
                 self.reconnection.on_dial_failure(&peer_id);
             }
@@ -454,7 +560,9 @@ impl NetworkService {
             self.peer_validator_map.retain(|_, v| *v != idx);
             self.peer_validator_map.insert(peer_id, idx);
             match self.validator_peer_map.write() {
-                Ok(mut map) => { map.insert(idx, peer_id); }
+                Ok(mut map) => {
+                    map.insert(idx, peer_id);
+                }
                 Err(e) => {
                     tracing::error!("validator_peer_map lock poisoned on write: {}", e);
                 }
@@ -468,7 +576,7 @@ impl NetworkService {
         }
     }
 
-    fn handle_gossipsub_message(&self, source: PeerId, message: gossipsub::Message) {
+    fn handle_gossipsub_message(&mut self, source: PeerId, message: gossipsub::Message) {
         metrics::counter!("n42_gossipsub_messages_received").increment(1);
         tracing::info!(target: "n42::net", %source, topic = %message.topic, bytes = message.data.len(), "gossipsub message received");
 
@@ -492,7 +600,10 @@ impl NetworkService {
                 match decode_consensus_message(&message.data) {
                     Ok(msg) => {
                         tracing::trace!(%source, "received consensus message");
-                        NetworkEvent::ConsensusMessage { source, message: Box::new(msg) }
+                        NetworkEvent::ConsensusMessage {
+                            source,
+                            message: Box::new(msg),
+                        }
                     }
                     Err(e) => {
                         tracing::warn!(%source, error = %e, "failed to decode consensus message");
@@ -500,17 +611,23 @@ impl NetworkService {
                     }
                 }
             }
-            _ if *topic == self.block_announce_topic_hash => {
-                NetworkEvent::BlockAnnouncement { source, data: message.data }
-            }
-            _ if *topic == self.mempool_topic_hash => {
-                NetworkEvent::TransactionReceived { source, data: message.data }
-            }
-            _ if *topic == self.blob_sidecar_topic_hash => {
-                NetworkEvent::BlobSidecarReceived { source, data: message.data }
-            }
+            _ if *topic == self.block_announce_topic_hash => NetworkEvent::BlockAnnouncement {
+                source,
+                data: message.data,
+            },
+            _ if *topic == self.mempool_topic_hash => NetworkEvent::TransactionReceived {
+                source,
+                data: message.data,
+            },
+            _ if *topic == self.blob_sidecar_topic_hash => NetworkEvent::BlobSidecarReceived {
+                source,
+                data: message.data,
+            },
             _ if *topic == self.verification_receipts_topic_hash => {
-                NetworkEvent::VerificationReceipt { source, data: message.data }
+                NetworkEvent::VerificationReceipt {
+                    source,
+                    data: message.data,
+                }
             }
             _ => {
                 tracing::warn!(%source, %topic, "received message on unknown topic");
@@ -527,7 +644,9 @@ impl NetworkService {
     ) {
         match event {
             libp2p::request_response::Event::Message { peer, message, .. } => match message {
-                libp2p::request_response::Message::Request { request, channel, .. } => {
+                libp2p::request_response::Message::Request {
+                    request, channel, ..
+                } => {
                     metrics::counter!("n42_state_sync_requests").increment(1);
                     let id = self.next_sync_id;
                     self.next_sync_id = self.next_sync_id.wrapping_add(1);
@@ -547,7 +666,11 @@ impl NetworkService {
 
                     self.pending_sync_channels.insert(id, channel);
                     tracing::debug!(%peer, request_id = id, "received sync request");
-                    self.emit_event(NetworkEvent::SyncRequest { peer, request_id: id, request });
+                    self.emit_event(NetworkEvent::SyncRequest {
+                        peer,
+                        request_id: id,
+                        request,
+                    });
                 }
                 libp2p::request_response::Message::Response { response, .. } => {
                     tracing::debug!(%peer, blocks = response.blocks.len(), "received sync response");
@@ -576,7 +699,9 @@ impl NetworkService {
     ) {
         match event {
             libp2p::request_response::Event::Message { peer, message, .. } => match message {
-                libp2p::request_response::Message::Request { request, channel, .. } => {
+                libp2p::request_response::Message::Request {
+                    request, channel, ..
+                } => {
                     metrics::counter!("n42_direct_messages_received").increment(1);
                     match decode_consensus_message(&request.message_bytes) {
                         Ok(msg) => {
@@ -584,10 +709,11 @@ impl NetworkService {
                                 source: peer,
                                 message: Box::new(msg),
                             });
-                            let _ = self.swarm.behaviour_mut().consensus_direct.send_response(
-                                channel,
-                                ConsensusDirectResponse { accepted: true },
-                            );
+                            let _ = self
+                                .swarm
+                                .behaviour_mut()
+                                .consensus_direct
+                                .send_response(channel, ConsensusDirectResponse { accepted: true });
                         }
                         Err(e) => {
                             tracing::warn!(%peer, error = %e, "invalid consensus direct message");
@@ -617,7 +743,9 @@ impl NetworkService {
     ) {
         match event {
             libp2p::request_response::Event::Message { peer, message, .. } => match message {
-                libp2p::request_response::Message::Request { request, channel, .. } => {
+                libp2p::request_response::Message::Request {
+                    request, channel, ..
+                } => {
                     metrics::counter!("n42_block_direct_received").increment(1);
                     // Verify sender is a known validator
                     if let Some(&validator_idx) = self.peer_validator_map.get(&peer) {
@@ -626,17 +754,19 @@ impl NetworkService {
                             source: peer,
                             data: request.data,
                         });
-                        let _ = self.swarm.behaviour_mut().block_direct.send_response(
-                            channel,
-                            BlockDirectResponse { accepted: true },
-                        );
+                        let _ = self
+                            .swarm
+                            .behaviour_mut()
+                            .block_direct
+                            .send_response(channel, BlockDirectResponse { accepted: true });
                     } else {
                         tracing::warn!(%peer, bytes = request.data.len(), "rejected block direct push from non-validator peer");
                         metrics::counter!("n42_block_direct_rejected_non_validator").increment(1);
-                        let _ = self.swarm.behaviour_mut().block_direct.send_response(
-                            channel,
-                            BlockDirectResponse { accepted: false },
-                        );
+                        let _ = self
+                            .swarm
+                            .behaviour_mut()
+                            .block_direct
+                            .send_response(channel, BlockDirectResponse { accepted: false });
                     }
                 }
                 libp2p::request_response::Message::Response { .. } => {
@@ -658,7 +788,9 @@ impl NetworkService {
     ) {
         match event {
             libp2p::request_response::Event::Message { peer, message, .. } => match message {
-                libp2p::request_response::Message::Request { request, channel, .. } => {
+                libp2p::request_response::Message::Request {
+                    request, channel, ..
+                } => {
                     let count = request.txs.len();
                     metrics::counter!("n42_tx_forward_batches_received").increment(1);
                     metrics::counter!("n42_tx_forward_txs_received").increment(count as u64);
@@ -668,16 +800,18 @@ impl NetworkService {
                             source: peer,
                             txs: request.txs,
                         });
-                        let _ = self.swarm.behaviour_mut().tx_forward.send_response(
-                            channel,
-                            TxForwardResponse { accepted: true },
-                        );
+                        let _ = self
+                            .swarm
+                            .behaviour_mut()
+                            .tx_forward
+                            .send_response(channel, TxForwardResponse { accepted: true });
                     } else {
                         tracing::warn!(%peer, count, "rejected tx forward from non-validator peer");
-                        let _ = self.swarm.behaviour_mut().tx_forward.send_response(
-                            channel,
-                            TxForwardResponse { accepted: false },
-                        );
+                        let _ = self
+                            .swarm
+                            .behaviour_mut()
+                            .tx_forward
+                            .send_response(channel, TxForwardResponse { accepted: false });
                     }
                 }
                 libp2p::request_response::Message::Response { .. } => {}
@@ -697,7 +831,8 @@ impl NetworkService {
                     tracing::info!(%peer_id, %addr, "mDNS: discovered peer");
                     // Avoid add_explicit_peer() — explicit peers are excluded from
                     // GossipSub mesh formation. Dial instead and let heartbeat add them.
-                    self.reconnection.register_peer(peer_id, vec![addr.clone()], false);
+                    self.reconnection
+                        .register_peer(peer_id, vec![addr.clone()], false);
                     if let Err(e) = self.swarm.dial(addr.clone()) {
                         tracing::debug!(%peer_id, error = %e, "mDNS dial failed");
                     }
@@ -713,7 +848,9 @@ impl NetworkService {
 
     fn handle_kademlia_event(&mut self, event: libp2p::kad::Event) {
         match event {
-            libp2p::kad::Event::RoutingUpdated { peer, addresses, .. } => {
+            libp2p::kad::Event::RoutingUpdated {
+                peer, addresses, ..
+            } => {
                 tracing::debug!(%peer, addrs = addresses.len(), "kademlia routing updated");
             }
             libp2p::kad::Event::OutboundQueryProgressed { result, .. } => match result {
@@ -736,7 +873,10 @@ impl NetworkService {
                     }
                 }
                 libp2p::kad::QueryResult::Bootstrap(Ok(ok)) => {
-                    tracing::debug!(num_remaining = ok.num_remaining, "kademlia bootstrap progress");
+                    tracing::debug!(
+                        num_remaining = ok.num_remaining,
+                        "kademlia bootstrap progress"
+                    );
                 }
                 libp2p::kad::QueryResult::Bootstrap(Err(e)) => {
                     tracing::warn!(error = ?e, "kademlia bootstrap failed");
@@ -753,17 +893,28 @@ impl NetworkService {
     /// are never delayed by high-volume TX events in the data channel.
     /// BlockData is critical for follower import pipeline — deprioritizing it
     /// delays block import → delays voting → delays commit.
-    fn emit_event(&self, event: NetworkEvent) {
-        let tx = if matches!(event, NetworkEvent::ConsensusMessage { .. } | NetworkEvent::BlockAnnouncement { .. }) {
+    fn emit_event(&mut self, event: NetworkEvent) {
+        let reliable = matches!(
+            event,
+            NetworkEvent::ConsensusMessage { .. } | NetworkEvent::BlockAnnouncement { .. }
+        );
+        let tx = if matches!(
+            event,
+            NetworkEvent::ConsensusMessage { .. } | NetworkEvent::BlockAnnouncement { .. }
+        ) {
             &self.consensus_event_tx
         } else {
             &self.event_tx
         };
         match tx.try_send(event) {
             Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                metrics::counter!("n42_network_event_drops_total").increment(1);
-                tracing::warn!("event channel full, dropping event");
+            Err(mpsc::error::TrySendError::Full(event)) => {
+                if reliable {
+                    self.pending_reliable_events.push_back(event);
+                } else {
+                    metrics::counter!("n42_network_event_drops_total").increment(1);
+                    tracing::warn!("event channel full, dropping event");
+                }
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 tracing::warn!("event channel closed, consumer gone");
@@ -803,8 +954,13 @@ impl NetworkService {
                 // Use request-response for true point-to-point delivery instead of gossipsub.
                 match encode_consensus_message(&message) {
                     Ok(bytes) => {
-                        let req = ConsensusDirectRequest { message_bytes: bytes };
-                        self.swarm.behaviour_mut().consensus_direct.send_request(&peer, req);
+                        let req = ConsensusDirectRequest {
+                            message_bytes: bytes,
+                        };
+                        self.swarm
+                            .behaviour_mut()
+                            .consensus_direct
+                            .send_request(&peer, req);
                         tracing::debug!(%peer, "sending direct message via request-response");
                     }
                     Err(e) => {
@@ -827,14 +983,20 @@ impl NetworkService {
             NetworkCommand::SendBlockDirect { peer, data } => {
                 metrics::counter!("n42_block_direct_sent").increment(1);
                 let req = BlockDirectRequest { data };
-                self.swarm.behaviour_mut().block_direct.send_request(&peer, req);
+                self.swarm
+                    .behaviour_mut()
+                    .block_direct
+                    .send_request(&peer, req);
             }
             NetworkCommand::ForwardTxBatch { peer, txs } => {
                 let count = txs.len();
                 metrics::counter!("n42_tx_forward_batches_sent").increment(1);
                 metrics::counter!("n42_tx_forward_txs_sent").increment(count as u64);
                 let req = TxForwardRequest { txs };
-                self.swarm.behaviour_mut().tx_forward.send_request(&peer, req);
+                self.swarm
+                    .behaviour_mut()
+                    .tx_forward
+                    .send_request(&peer, req);
             }
             NetworkCommand::Dial(addr) => {
                 if let Err(e) = self.swarm.dial(addr.clone()) {
@@ -848,9 +1010,15 @@ impl NetworkService {
                     to_view = request.to_view,
                     "sending sync request"
                 );
-                self.swarm.behaviour_mut().state_sync.send_request(&peer, request);
+                self.swarm
+                    .behaviour_mut()
+                    .state_sync
+                    .send_request(&peer, request);
             }
-            NetworkCommand::SendSyncResponse { request_id, response } => {
+            NetworkCommand::SendSyncResponse {
+                request_id,
+                response,
+            } => {
                 if let Some(channel) = self.pending_sync_channels.remove(&request_id) {
                     let block_count = response.blocks.len();
                     if self
@@ -868,7 +1036,11 @@ impl NetworkService {
                     tracing::warn!(request_id, "no pending channel for sync response");
                 }
             }
-            NetworkCommand::RegisterPeer { peer_id, addrs, trusted } => {
+            NetworkCommand::RegisterPeer {
+                peer_id,
+                addrs,
+                trusted,
+            } => {
                 tracing::debug!(%peer_id, trusted, addrs = addrs.len(), "registering peer");
                 self.reconnection.register_peer(peer_id, addrs, trusted);
             }
@@ -957,7 +1129,11 @@ mod tests {
         let addr: Multiaddr = "/ip4/10.0.0.1/udp/9400/quic-v1".parse().unwrap();
         handle.register_peer(peer, vec![addr], true).unwrap();
         match rx.try_recv().unwrap() {
-            NetworkCommand::RegisterPeer { peer_id, addrs, trusted } => {
+            NetworkCommand::RegisterPeer {
+                peer_id,
+                addrs,
+                trusted,
+            } => {
                 assert_eq!(peer_id, peer);
                 assert_eq!(addrs.len(), 1);
                 assert!(trusted);
@@ -970,10 +1146,17 @@ mod tests {
     fn test_handle_request_sync() {
         let (handle, mut rx, _prx) = test_handle();
         let peer = PeerId::random();
-        let request = BlockSyncRequest { from_view: 10, to_view: 20, local_committed_view: 5 };
+        let request = BlockSyncRequest {
+            from_view: 10,
+            to_view: 20,
+            local_committed_view: 5,
+        };
         handle.request_sync(peer, request).unwrap();
         match rx.try_recv().unwrap() {
-            NetworkCommand::RequestSync { peer: p, request: r } => {
+            NetworkCommand::RequestSync {
+                peer: p,
+                request: r,
+            } => {
                 assert_eq!(p, peer);
                 assert_eq!(r.from_view, 10);
                 assert_eq!(r.to_view, 20);
@@ -1014,5 +1197,4 @@ mod tests {
             other => panic!("expected SendBlockDirect, got {other:?}"),
         }
     }
-
 }

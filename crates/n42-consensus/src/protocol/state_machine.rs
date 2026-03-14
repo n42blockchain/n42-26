@@ -7,11 +7,11 @@ use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 use tokio::sync::mpsc;
 
-use crate::error::ConsensusResult;
-use crate::validator::{EpochManager, LeaderSelector, ValidatorSet};
 use super::pacemaker::Pacemaker;
 use super::quorum::{TimeoutCollector, VoteCollector};
 use super::round::{Phase, RoundState};
+use crate::error::ConsensusResult;
+use crate::validator::{EpochManager, LeaderSelector, ValidatorSet};
 
 /// Per-view timing tracker for diagnosing consensus commit latency.
 #[derive(Debug, Clone)]
@@ -59,17 +59,25 @@ impl ViewTiming {
         };
 
         // Calculate inter-stage deltas
-        let prepare_delta = self.prepare_qc_formed
-            .and_then(|pqc| self.proposal_sent.map(|p| pqc.duration_since(p).as_millis()));
-        let commit_delta = self.commit_qc_formed
-            .and_then(|cqc| self.prepare_qc_formed.map(|pqc| cqc.duration_since(pqc).as_millis()));
-        let vote_delta = self.vote_sent
-            .and_then(|v| self.proposal_received.map(|p| v.duration_since(p).as_millis()));
-        let total = self.commit_qc_formed
+        let prepare_delta = self.prepare_qc_formed.and_then(|pqc| {
+            self.proposal_sent
+                .map(|p| pqc.duration_since(p).as_millis())
+        });
+        let commit_delta = self.commit_qc_formed.and_then(|cqc| {
+            self.prepare_qc_formed
+                .map(|pqc| cqc.duration_since(pqc).as_millis())
+        });
+        let vote_delta = self.vote_sent.and_then(|v| {
+            self.proposal_received
+                .map(|p| v.duration_since(p).as_millis())
+        });
+        let total = self
+            .commit_qc_formed
             .map(|t| t.duration_since(self.view_start).as_millis());
 
         let d = |opt: Option<u128>| -> String {
-            opt.map(|v| format!("{v}ms")).unwrap_or_else(|| "-".to_string())
+            opt.map(|v| format!("{v}ms"))
+                .unwrap_or_else(|| "-".to_string())
         };
 
         if self.proposal_sent.is_some() {
@@ -133,9 +141,7 @@ pub enum EngineOutput {
         commit_qc: QuorumCertificate,
     },
     /// View change occurred; new view started.
-    ViewChanged {
-        new_view: ViewNumber,
-    },
+    ViewChanged { new_view: ViewNumber },
     /// Node is behind: detected a view gap larger than threshold.
     /// The orchestrator should initiate state sync to catch up.
     SyncRequired {
@@ -282,7 +288,8 @@ impl ConsensusEngine {
         /// absurdly long backoff durations on recovery.
         const MAX_RECOVERED_CONSECUTIVE_TIMEOUTS: u32 = 128;
 
-        let safe_consecutive_timeouts = consecutive_timeouts.min(MAX_RECOVERED_CONSECUTIVE_TIMEOUTS);
+        let safe_consecutive_timeouts =
+            consecutive_timeouts.min(MAX_RECOVERED_CONSECUTIVE_TIMEOUTS);
         if safe_consecutive_timeouts != consecutive_timeouts {
             tracing::warn!(target: "n42::cl::engine",
                 original = consecutive_timeouts,
@@ -407,14 +414,18 @@ impl ConsensusEngine {
         // Timeout messages within FUTURE_VIEW_WINDOW are also exempt — process_timeout
         // handles view synchronization for these.
         if let Some(view) = msg_view {
-            let is_exempt = matches!(msg, ConsensusMessage::Decide(_) | ConsensusMessage::NewView(_))
-                || (matches!(msg, ConsensusMessage::Timeout(_)) && view <= current_view + FUTURE_VIEW_WINDOW);
+            let is_exempt = matches!(
+                msg,
+                ConsensusMessage::Decide(_) | ConsensusMessage::NewView(_)
+            ) || (matches!(msg, ConsensusMessage::Timeout(_))
+                && view <= current_view + FUTURE_VIEW_WINDOW);
 
             if view > current_view && !is_exempt {
                 if view <= current_view + FUTURE_VIEW_WINDOW {
                     if self.future_msg_buffer.len() >= MAX_FUTURE_MESSAGES {
                         // Evict the oldest (lowest view) entry.
-                        if let Some(min_idx) = self.future_msg_buffer
+                        if let Some(min_idx) = self
+                            .future_msg_buffer
                             .iter()
                             .enumerate()
                             .min_by_key(|(_, (v, _))| *v)
@@ -455,7 +466,10 @@ impl ConsensusEngine {
         // Decide and NewView are exempt as they handle past-view logic internally.
         if let Some(view) = msg_view
             && view < current_view
-            && !matches!(msg, ConsensusMessage::Decide(_) | ConsensusMessage::NewView(_))
+            && !matches!(
+                msg,
+                ConsensusMessage::Decide(_) | ConsensusMessage::NewView(_)
+            )
         {
             tracing::trace!(target: "n42::cl::engine", current_view, msg_view = view, "discarding stale consensus message");
             return Ok(());
@@ -507,7 +521,11 @@ impl ConsensusEngine {
     ///
     /// Safety: A valid QC proves ≥quorum validators reached that view, so
     /// jumping does not violate HotStuff-2 safety. locked_qc only advances.
-    fn try_qc_view_jump(&mut self, msg: &ConsensusMessage, msg_view: ViewNumber) -> ConsensusResult<bool> {
+    fn try_qc_view_jump(
+        &mut self,
+        msg: &ConsensusMessage,
+        msg_view: ViewNumber,
+    ) -> ConsensusResult<bool> {
         let current_view = self.round_state.current_view();
 
         // Genesis QC (view 0) has no real signatures — skip it.
@@ -548,12 +566,17 @@ impl ConsensusEngine {
         self.round_state.update_locked_qc(qc);
         self.round_state.reset_consecutive_timeouts();
 
-        self.emit(EngineOutput::SyncRequired { local_view: current_view, target_view })?;
+        self.emit(EngineOutput::SyncRequired {
+            local_view: current_view,
+            target_view,
+        })?;
         self.advance_to_view(target_view)?;
 
         // Use actual view after advance: buffered-message replay may push view beyond target_view.
         let actual_view = self.round_state.current_view();
-        self.emit(EngineOutput::ViewChanged { new_view: actual_view })?;
+        self.emit(EngineOutput::ViewChanged {
+            new_view: actual_view,
+        })?;
 
         Ok(true)
     }
@@ -578,11 +601,15 @@ impl ConsensusEngine {
             let new_epoch = self.epoch_manager.current_epoch();
             let validator_count = self.validator_set().len();
             tracing::info!(target: "n42::cl::engine", new_epoch, validator_count, view = new_view, "epoch transition at view boundary");
-            self.emit(EngineOutput::EpochTransition { new_epoch, validator_count })?;
+            self.emit(EngineOutput::EpochTransition {
+                new_epoch,
+                validator_count,
+            })?;
         }
 
         self.round_state.advance_view(new_view);
-        self.pacemaker.reset_for_view(new_view, self.round_state.consecutive_timeouts());
+        self.pacemaker
+            .reset_for_view(new_view, self.round_state.consecutive_timeouts());
         self.vote_collector = None;
         self.commit_collector = None;
         self.timeout_collector = None;
@@ -597,7 +624,8 @@ impl ConsensusEngine {
         self.view_timing = ViewTiming::new();
 
         // Replay buffered messages for the new view; re-buffer those still in window.
-        let drained: Vec<(ViewNumber, ConsensusMessage)> = self.future_msg_buffer.drain(..).collect();
+        let drained: Vec<(ViewNumber, ConsensusMessage)> =
+            self.future_msg_buffer.drain(..).collect();
         let mut to_replay = Vec::new();
         for (view, msg) in drained {
             if view == new_view {
@@ -627,40 +655,89 @@ impl ConsensusEngine {
     }
 
     pub(super) fn emit(&self, output: EngineOutput) -> ConsensusResult<()> {
-        // BlockCommitted events are critical — losing them desynchronizes consensus
-        // and execution. Retry up to 3 times with a brief sleep between attempts.
+        const MAX_OUTPUT_SEND_RETRIES: u32 = 3;
+        const OUTPUT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(1);
+
+        // Treat bounded-channel backpressure as recoverable. Only a closed channel
+        // is immediately fatal to consensus.
         let is_block_committed = matches!(output, EngineOutput::BlockCommitted { .. });
+        let output_kind = match &output {
+            EngineOutput::BroadcastMessage(_) => "BroadcastMessage",
+            EngineOutput::SendToValidator(_, _) => "SendToValidator",
+            EngineOutput::ExecuteBlock(_) => "ExecuteBlock",
+            EngineOutput::BlockCommitted { .. } => "BlockCommitted",
+            EngineOutput::ViewChanged { .. } => "ViewChanged",
+            EngineOutput::SyncRequired { .. } => "SyncRequired",
+            EngineOutput::EquivocationDetected { .. } => "EquivocationDetected",
+            EngineOutput::EpochTransition { .. } => "EpochTransition",
+        };
 
         match self.output_tx.try_send(output) {
             Ok(()) => Ok(()),
-            Err(first_err) => {
-                if is_block_committed {
-                    let mut val = first_err.into_inner();
-                    for attempt in 1..=3 {
-                        // Brief sleep to give the consumer a chance to drain the channel.
-                        // thread::yield_now is insufficient in async runtimes.
-                        std::thread::sleep(std::time::Duration::from_millis(1));
-                        match self.output_tx.try_send(val) {
-                            Ok(()) => {
-                                tracing::warn!(target: "n42::cl::engine", attempt, "BlockCommitted delivered after retry");
-                                return Ok(());
-                            }
-                            Err(retry_err) => {
-                                tracing::error!(target: "n42::cl::engine",
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                tracing::error!(
+                    target: "n42::cl::engine",
+                    output = output_kind,
+                    "consensus output channel closed"
+                );
+                Err(crate::error::ConsensusError::OutputChannelClosed)
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Full(output)) => {
+                let mut pending = output;
+
+                for attempt in 1..=MAX_OUTPUT_SEND_RETRIES {
+                    // Brief sleep to give the consumer a chance to drain the channel.
+                    // thread::yield_now is insufficient in async runtimes.
+                    std::thread::sleep(OUTPUT_RETRY_DELAY);
+                    match self.output_tx.try_send(pending) {
+                        Ok(()) => {
+                            if is_block_committed {
+                                tracing::warn!(
+                                    target: "n42::cl::engine",
                                     attempt,
-                                    "BlockCommitted retry failed: {}",
-                                    retry_err
+                                    "BlockCommitted delivered after retry"
                                 );
-                                val = retry_err.into_inner();
+                            } else {
+                                tracing::warn!(
+                                    target: "n42::cl::engine",
+                                    output = output_kind,
+                                    attempt,
+                                    "consensus output delivered after retry"
+                                );
                             }
+                            return Ok(());
+                        }
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                            tracing::error!(
+                                target: "n42::cl::engine",
+                                output = output_kind,
+                                attempt,
+                                "consensus output channel closed during retry"
+                            );
+                            return Err(crate::error::ConsensusError::OutputChannelClosed);
+                        }
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(output)) => {
+                            pending = output;
                         }
                     }
-                    tracing::error!(target: "n42::cl::engine", "CRITICAL: BlockCommitted lost after 3 retries");
-                    Err(crate::error::ConsensusError::OutputChannelClosed)
-                } else {
-                    tracing::error!(target: "n42::cl::engine", "consensus output channel full or closed: {}", first_err);
-                    Err(crate::error::ConsensusError::OutputChannelClosed)
                 }
+
+                if is_block_committed {
+                    tracing::error!(
+                        target: "n42::cl::engine",
+                        "CRITICAL: BlockCommitted lost after {} retries",
+                        MAX_OUTPUT_SEND_RETRIES
+                    );
+                } else {
+                    tracing::error!(
+                        target: "n42::cl::engine",
+                        output = output_kind,
+                        retries = MAX_OUTPUT_SEND_RETRIES,
+                        "consensus output channel remained full after retries"
+                    );
+                }
+
+                Err(crate::error::ConsensusError::OutputChannelClosed)
             }
         }
     }
@@ -683,9 +760,10 @@ mod tests {
     use n42_chainspec::ValidatorInfo;
     use n42_primitives::consensus::{CommitVote, Decide, Vote};
 
-    fn make_engine(
+    fn make_engine_with_output_capacity(
         n: usize,
         my_index: u32,
+        output_capacity: usize,
     ) -> (
         ConsensusEngine,
         Vec<n42_primitives::BlsSecretKey>,
@@ -706,7 +784,7 @@ mod tests {
         let f = ((n as u32).saturating_sub(1)) / 3;
         let vs = ValidatorSet::new(&infos, f);
 
-        let (output_tx, output_rx) = mpsc::channel(1024);
+        let (output_tx, output_rx) = mpsc::channel(output_capacity);
         let engine = ConsensusEngine::new(
             my_index,
             sks[my_index as usize].clone(),
@@ -717,6 +795,18 @@ mod tests {
         );
 
         (engine, sks, vs, output_rx)
+    }
+
+    fn make_engine(
+        n: usize,
+        my_index: u32,
+    ) -> (
+        ConsensusEngine,
+        Vec<n42_primitives::BlsSecretKey>,
+        ValidatorSet,
+        mpsc::Receiver<EngineOutput>,
+    ) {
+        make_engine_with_output_capacity(n, my_index, 1024)
     }
 
     fn build_test_commit_qc(
@@ -732,7 +822,9 @@ mod tests {
             let msg = commit_signing_message(view, &block_hash);
             collector.add_vote(i, sks[i as usize].sign(&msg)).unwrap();
         }
-        collector.build_qc_with_message(vs, &commit_signing_message(view, &block_hash)).unwrap()
+        collector
+            .build_qc_with_message(vs, &commit_signing_message(view, &block_hash))
+            .unwrap()
     }
 
     fn build_test_prepare_qc(
@@ -761,10 +853,16 @@ mod tests {
     #[test]
     fn test_engine_is_leader() {
         let (engine, _, _, _rx) = make_engine(4, 1);
-        assert!(engine.is_current_leader(), "validator 1 should be leader at view 1");
+        assert!(
+            engine.is_current_leader(),
+            "validator 1 should be leader at view 1"
+        );
 
         let (engine, _, _, _rx) = make_engine(4, 0);
-        assert!(!engine.is_current_leader(), "validator 0 should NOT be leader at view 1");
+        assert!(
+            !engine.is_current_leader(),
+            "validator 0 should NOT be leader at view 1"
+        );
     }
 
     #[test]
@@ -773,6 +871,33 @@ mod tests {
         let debug_str = format!("{:?}", engine);
         assert!(debug_str.contains("ConsensusEngine"));
         assert!(debug_str.contains("my_index"));
+    }
+
+    #[test]
+    fn test_emit_retries_non_block_committed_output_when_channel_is_full() {
+        let (engine, _, _, mut rx) = make_engine_with_output_capacity(1, 0, 1);
+
+        engine
+            .emit(EngineOutput::ExecuteBlock(B256::repeat_byte(0xAB)))
+            .expect("first output should fill the channel");
+
+        let drain = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+
+            let first = rx.blocking_recv().expect("expected first output");
+            let second = rx.blocking_recv().expect("expected retried output");
+            (first, second)
+        });
+
+        engine
+            .emit(EngineOutput::ViewChanged { new_view: 2 })
+            .expect("backpressure on non-critical outputs should be retried");
+
+        let (first, second) = drain.join().expect("drain thread should complete");
+        assert!(
+            matches!(first, EngineOutput::ExecuteBlock(hash) if hash == B256::repeat_byte(0xAB))
+        );
+        assert!(matches!(second, EngineOutput::ViewChanged { new_view: 2 }));
     }
 
     #[test]
@@ -802,10 +927,21 @@ mod tests {
             outputs.push(output);
         }
 
-        assert!(outputs.iter().any(|o| matches!(o, EngineOutput::BroadcastMessage(ConsensusMessage::Proposal(_)))));
-        assert!(outputs.iter().any(|o| matches!(o, EngineOutput::BroadcastMessage(ConsensusMessage::PrepareQC(_)))));
-        assert!(outputs.iter().any(|o| matches!(o, EngineOutput::BroadcastMessage(ConsensusMessage::Decide(_)))));
-        assert!(outputs.iter().any(|o| matches!(o, EngineOutput::BlockCommitted { block_hash: h, .. } if *h == block_hash)));
+        assert!(outputs.iter().any(|o| matches!(
+            o,
+            EngineOutput::BroadcastMessage(ConsensusMessage::Proposal(_))
+        )));
+        assert!(outputs.iter().any(|o| matches!(
+            o,
+            EngineOutput::BroadcastMessage(ConsensusMessage::PrepareQC(_))
+        )));
+        assert!(outputs.iter().any(|o| matches!(
+            o,
+            EngineOutput::BroadcastMessage(ConsensusMessage::Decide(_))
+        )));
+        assert!(outputs.iter().any(
+            |o| matches!(o, EngineOutput::BlockCommitted { block_hash: h, .. } if *h == block_hash)
+        ));
     }
 
     #[test]
@@ -825,7 +961,9 @@ mod tests {
         };
 
         // Stale proposals are silently discarded by the pre-filter.
-        let result = engine.process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(proposal)));
+        let result = engine.process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(
+            proposal,
+        )));
         assert!(result.is_ok());
     }
 
@@ -845,10 +983,14 @@ mod tests {
             prepare_qc: None,
         };
 
-        let result = engine.process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(proposal)));
+        let result = engine.process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(
+            proposal,
+        )));
         assert!(result.is_err());
         match result.unwrap_err() {
-            crate::error::ConsensusError::InvalidProposer { expected, actual, .. } => {
+            crate::error::ConsensusError::InvalidProposer {
+                expected, actual, ..
+            } => {
                 assert_eq!(expected, 1);
                 assert_eq!(actual, 0);
             }
@@ -873,7 +1015,9 @@ mod tests {
         };
 
         engine
-            .process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(proposal)))
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(
+                proposal,
+            )))
             .expect("valid proposal should be accepted");
 
         assert_eq!(engine.current_phase(), Phase::Voting);
@@ -884,8 +1028,15 @@ mod tests {
         }
 
         // Optimistic Voting: vote is sent immediately with the Proposal, no BlockData wait.
-        assert!(outputs.iter().any(|o| matches!(o, EngineOutput::ExecuteBlock(h) if *h == block_hash)));
-        assert!(outputs.iter().any(|o| matches!(o, EngineOutput::SendToValidator(_, ConsensusMessage::Vote(_)))));
+        assert!(
+            outputs
+                .iter()
+                .any(|o| matches!(o, EngineOutput::ExecuteBlock(h) if *h == block_hash))
+        );
+        assert!(outputs.iter().any(|o| matches!(
+            o,
+            EngineOutput::SendToValidator(_, ConsensusMessage::Vote(_))
+        )));
     }
 
     #[test]
@@ -911,7 +1062,9 @@ mod tests {
         };
 
         engine
-            .process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(proposal)))
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(
+                proposal,
+            )))
             .expect("valid proposal should be accepted");
 
         let mut outputs = vec![];
@@ -920,7 +1073,10 @@ mod tests {
         }
 
         // Optimistic Voting: vote sent immediately regardless of BlockData status.
-        assert!(outputs.iter().any(|o| matches!(o, EngineOutput::SendToValidator(_, ConsensusMessage::Vote(_)))));
+        assert!(outputs.iter().any(|o| matches!(
+            o,
+            EngineOutput::SendToValidator(_, ConsensusMessage::Vote(_))
+        )));
     }
 
     #[test]
@@ -939,7 +1095,9 @@ mod tests {
             prepare_qc: None,
         };
         engine
-            .process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(proposal)))
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(
+                proposal,
+            )))
             .expect("proposal should succeed");
         while rx.try_recv().is_ok() {}
 
@@ -957,7 +1115,10 @@ mod tests {
 
         assert_eq!(engine.current_phase(), Phase::TimedOut);
         let output = rx.try_recv().expect("should have timeout output");
-        assert!(matches!(output, EngineOutput::BroadcastMessage(ConsensusMessage::Timeout(_))));
+        assert!(matches!(
+            output,
+            EngineOutput::BroadcastMessage(ConsensusMessage::Timeout(_))
+        ));
     }
 
     #[test]
@@ -1002,20 +1163,35 @@ mod tests {
         // Two more validators vote (leader already has 1 self-vote).
         for i in [0u32, 2] {
             let msg = signing_message(view, &block_hash);
-            let vote = Vote { view, block_hash, voter: i, signature: sks[i as usize].sign(&msg) };
+            let vote = Vote {
+                view,
+                block_hash,
+                voter: i,
+                signature: sks[i as usize].sign(&msg),
+            };
             engine
                 .process_event(ConsensusEvent::Message(ConsensusMessage::Vote(vote)))
                 .expect("vote should succeed");
         }
 
         let mut outputs = vec![];
-        while let Ok(o) = rx.try_recv() { outputs.push(o); }
-        assert!(outputs.iter().any(|o| matches!(o, EngineOutput::BroadcastMessage(ConsensusMessage::PrepareQC(_)))));
+        while let Ok(o) = rx.try_recv() {
+            outputs.push(o);
+        }
+        assert!(outputs.iter().any(|o| matches!(
+            o,
+            EngineOutput::BroadcastMessage(ConsensusMessage::PrepareQC(_))
+        )));
 
         // Two commit votes (leader already self-voted for Round 2).
         for i in [0u32, 2] {
             let msg = commit_signing_message(view, &block_hash);
-            let cv = CommitVote { view, block_hash, voter: i, signature: sks[i as usize].sign(&msg) };
+            let cv = CommitVote {
+                view,
+                block_hash,
+                voter: i,
+                signature: sks[i as usize].sign(&msg),
+            };
             engine
                 .process_event(ConsensusEvent::Message(ConsensusMessage::CommitVote(cv)))
                 .expect("commit vote should succeed");
@@ -1025,8 +1201,13 @@ mod tests {
         assert_eq!(engine.current_phase(), Phase::WaitingForProposal);
 
         outputs.clear();
-        while let Ok(o) = rx.try_recv() { outputs.push(o); }
-        assert!(outputs.iter().any(|o| matches!(o, EngineOutput::BroadcastMessage(ConsensusMessage::Decide(_)))));
+        while let Ok(o) = rx.try_recv() {
+            outputs.push(o);
+        }
+        assert!(outputs.iter().any(|o| matches!(
+            o,
+            EngineOutput::BroadcastMessage(ConsensusMessage::Decide(_))
+        )));
         assert!(outputs.iter().any(|o| matches!(o, EngineOutput::BlockCommitted { block_hash: h, view: v, .. } if *h == block_hash && *v == view)));
     }
 
@@ -1048,7 +1229,9 @@ mod tests {
             prepare_qc: None,
         };
         engine
-            .process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(proposal)))
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(
+                proposal,
+            )))
             .expect("proposal should succeed");
         engine
             .process_event(ConsensusEvent::BlockImported(block_hash))
@@ -1062,21 +1245,34 @@ mod tests {
         }
         let qc = collector.build_qc(&vs).unwrap();
 
-        let prepare_qc = n42_primitives::consensus::PrepareQC { view, block_hash, qc };
+        let prepare_qc = n42_primitives::consensus::PrepareQC {
+            view,
+            block_hash,
+            qc,
+        };
         engine
-            .process_event(ConsensusEvent::Message(ConsensusMessage::PrepareQC(prepare_qc)))
+            .process_event(ConsensusEvent::Message(ConsensusMessage::PrepareQC(
+                prepare_qc,
+            )))
             .expect("PrepareQC should succeed");
 
         assert_eq!(engine.current_phase(), Phase::PreCommit);
 
         let mut outputs = vec![];
-        while let Ok(o) = rx.try_recv() { outputs.push(o); }
-        let has_commit_vote = outputs.iter().any(|o| matches!(
-            o,
-            EngineOutput::SendToValidator(1, ConsensusMessage::CommitVote(cv))
-            if cv.view == view && cv.block_hash == block_hash
-        ));
-        assert!(has_commit_vote, "validator should send CommitVote to leader");
+        while let Ok(o) = rx.try_recv() {
+            outputs.push(o);
+        }
+        let has_commit_vote = outputs.iter().any(|o| {
+            matches!(
+                o,
+                EngineOutput::SendToValidator(1, ConsensusMessage::CommitVote(cv))
+                if cv.view == view && cv.block_hash == block_hash
+            )
+        });
+        assert!(
+            has_commit_vote,
+            "validator should send CommitVote to leader"
+        );
     }
 
     #[test]
@@ -1103,7 +1299,10 @@ mod tests {
         let result = engine.process_event(ConsensusEvent::Message(ConsensusMessage::Vote(vote)));
         assert!(result.is_err());
         match result.unwrap_err() {
-            crate::error::ConsensusError::InvalidSignature { view: v, validator_index } => {
+            crate::error::ConsensusError::InvalidSignature {
+                view: v,
+                validator_index,
+            } => {
                 assert_eq!(v, view);
                 assert_eq!(validator_index, 0);
             }
@@ -1155,7 +1354,12 @@ mod tests {
 
         for i in [0u32, 2] {
             let msg = signing_message(view, &block_hash);
-            let vote = Vote { view, block_hash, voter: i, signature: sks[i as usize].sign(&msg) };
+            let vote = Vote {
+                view,
+                block_hash,
+                voter: i,
+                signature: sks[i as usize].sign(&msg),
+            };
             engine
                 .process_event(ConsensusEvent::Message(ConsensusMessage::Vote(vote)))
                 .expect("vote should succeed");
@@ -1170,10 +1374,14 @@ mod tests {
             signature: sks[0].sign(&wrong_msg),
         };
 
-        let result = engine.process_event(ConsensusEvent::Message(ConsensusMessage::CommitVote(cv)));
+        let result =
+            engine.process_event(ConsensusEvent::Message(ConsensusMessage::CommitVote(cv)));
         assert!(result.is_err());
         match result.unwrap_err() {
-            crate::error::ConsensusError::InvalidSignature { view: v, validator_index } => {
+            crate::error::ConsensusError::InvalidSignature {
+                view: v,
+                validator_index,
+            } => {
                 assert_eq!(v, view);
                 assert_eq!(validator_index, 0);
             }
@@ -1200,10 +1408,14 @@ mod tests {
             signature: sks[2].sign(&wrong_msg),
         };
 
-        let result = engine.process_event(ConsensusEvent::Message(ConsensusMessage::Timeout(timeout)));
+        let result =
+            engine.process_event(ConsensusEvent::Message(ConsensusMessage::Timeout(timeout)));
         assert!(result.is_err());
         match result.unwrap_err() {
-            crate::error::ConsensusError::InvalidSignature { view: v, validator_index } => {
+            crate::error::ConsensusError::InvalidSignature {
+                view: v,
+                validator_index,
+            } => {
                 assert_eq!(v, view);
                 assert_eq!(validator_index, 2);
             }
@@ -1255,12 +1467,22 @@ mod tests {
             .expect("valid vote from 2");
 
         let mut outputs = vec![];
-        while let Ok(o) = rx.try_recv() { outputs.push(o); }
-        assert!(outputs.iter().any(|o| matches!(o, EngineOutput::BroadcastMessage(ConsensusMessage::PrepareQC(_)))));
+        while let Ok(o) = rx.try_recv() {
+            outputs.push(o);
+        }
+        assert!(outputs.iter().any(|o| matches!(
+            o,
+            EngineOutput::BroadcastMessage(ConsensusMessage::PrepareQC(_))
+        )));
 
         for i in [0u32, 2] {
             let msg = commit_signing_message(view, &block_hash);
-            let cv = CommitVote { view, block_hash, voter: i, signature: sks[i as usize].sign(&msg) };
+            let cv = CommitVote {
+                view,
+                block_hash,
+                voter: i,
+                signature: sks[i as usize].sign(&msg),
+            };
             engine
                 .process_event(ConsensusEvent::Message(ConsensusMessage::CommitVote(cv)))
                 .expect("commit vote should succeed");
@@ -1268,9 +1490,18 @@ mod tests {
 
         assert_eq!(engine.current_view(), 2);
         let mut outputs = vec![];
-        while let Ok(o) = rx.try_recv() { outputs.push(o); }
-        assert!(outputs.iter().any(|o| matches!(o, EngineOutput::BroadcastMessage(ConsensusMessage::Decide(_)))));
-        assert!(outputs.iter().any(|o| matches!(o, EngineOutput::BlockCommitted { .. })));
+        while let Ok(o) = rx.try_recv() {
+            outputs.push(o);
+        }
+        assert!(outputs.iter().any(|o| matches!(
+            o,
+            EngineOutput::BroadcastMessage(ConsensusMessage::Decide(_))
+        )));
+        assert!(
+            outputs
+                .iter()
+                .any(|o| matches!(o, EngineOutput::BlockCommitted { .. }))
+        );
     }
 
     #[test]
@@ -1280,7 +1511,11 @@ mod tests {
         let view = 1u64;
 
         let commit_qc = build_test_commit_qc(view, block_hash, &sks, &vs, &[0, 1, 2]);
-        let decide = Decide { view, block_hash, commit_qc };
+        let decide = Decide {
+            view,
+            block_hash,
+            commit_qc,
+        };
 
         engine
             .process_event(ConsensusEvent::Message(ConsensusMessage::Decide(decide)))
@@ -1290,12 +1525,16 @@ mod tests {
         assert_eq!(engine.current_phase(), Phase::WaitingForProposal);
 
         let mut outputs = vec![];
-        while let Ok(o) = rx.try_recv() { outputs.push(o); }
-        let has_committed = outputs.iter().any(|o| matches!(
-            o,
-            EngineOutput::BlockCommitted { block_hash: h, view: v, .. }
-            if *h == block_hash && *v == view
-        ));
+        while let Ok(o) = rx.try_recv() {
+            outputs.push(o);
+        }
+        let has_committed = outputs.iter().any(|o| {
+            matches!(
+                o,
+                EngineOutput::BlockCommitted { block_hash: h, view: v, .. }
+                if *h == block_hash && *v == view
+            )
+        });
         assert!(has_committed);
     }
 
@@ -1307,9 +1546,12 @@ mod tests {
         for v in 1u64..=4 {
             let bh = B256::repeat_byte(v as u8);
             let cqc = build_test_commit_qc(v, bh, &sks, &vs, &[0, 1, 2]);
-            let _ = engine.process_event(ConsensusEvent::Message(
-                ConsensusMessage::Decide(Decide { view: v, block_hash: bh, commit_qc: cqc }),
-            ));
+            let _ =
+                engine.process_event(ConsensusEvent::Message(ConsensusMessage::Decide(Decide {
+                    view: v,
+                    block_hash: bh,
+                    commit_qc: cqc,
+                })));
             while rx.try_recv().is_ok() {}
         }
         assert_eq!(engine.current_view(), 5);
@@ -1345,9 +1587,12 @@ mod tests {
             signers,
         };
 
-        let result = engine.process_event(ConsensusEvent::Message(
-            ConsensusMessage::Decide(Decide { view, block_hash, commit_qc: weak_qc }),
-        ));
+        let result =
+            engine.process_event(ConsensusEvent::Message(ConsensusMessage::Decide(Decide {
+                view,
+                block_hash,
+                commit_qc: weak_qc,
+            })));
         assert!(result.is_err());
         match result.unwrap_err() {
             crate::error::ConsensusError::InsufficientVotes { have, need, .. } => {
@@ -1360,15 +1605,17 @@ mod tests {
 
     #[test]
     fn test_decide_rejects_forged_signature() {
-        use bitvec::prelude::*;
         use crate::protocol::quorum::signing_message;
+        use bitvec::prelude::*;
 
         let (mut engine, sks, _vs, _rx) = make_engine(4, 0);
         let block_hash = B256::repeat_byte(0xD4);
         let view = 1u64;
 
         let wrong_msg = signing_message(view, &block_hash);
-        let sigs: Vec<_> = (0..3u32).map(|i| sks[i as usize].sign(&wrong_msg)).collect();
+        let sigs: Vec<_> = (0..3u32)
+            .map(|i| sks[i as usize].sign(&wrong_msg))
+            .collect();
         let sig_refs: Vec<_> = sigs.iter().collect();
         let agg_sig = n42_primitives::bls::AggregateSignature::aggregate(&sig_refs).unwrap();
 
@@ -1377,10 +1624,18 @@ mod tests {
         signers.set(1, true);
         signers.set(2, true);
 
-        let forged_qc = QuorumCertificate { view, block_hash, aggregate_signature: agg_sig, signers };
-        let result = engine.process_event(ConsensusEvent::Message(
-            ConsensusMessage::Decide(Decide { view, block_hash, commit_qc: forged_qc }),
-        ));
+        let forged_qc = QuorumCertificate {
+            view,
+            block_hash,
+            aggregate_signature: agg_sig,
+            signers,
+        };
+        let result =
+            engine.process_event(ConsensusEvent::Message(ConsensusMessage::Decide(Decide {
+                view,
+                block_hash,
+                commit_qc: forged_qc,
+            })));
         assert!(result.is_err());
         match result.unwrap_err() {
             crate::error::ConsensusError::InvalidQC { view: v, reason } => {
@@ -1443,15 +1698,29 @@ mod tests {
         };
 
         engine
-            .process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(proposal)))
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(
+                proposal,
+            )))
             .expect("far-future proposal with valid QC should trigger view jump");
 
         assert_eq!(engine.current_view(), far_view);
 
         let mut outputs = vec![];
-        while let Ok(o) = rx.try_recv() { outputs.push(o); }
-        assert!(outputs.iter().any(|o| matches!(o, EngineOutput::SyncRequired { local_view: 1, target_view: 100 })));
-        assert!(outputs.iter().any(|o| matches!(o, EngineOutput::ViewChanged { new_view: 100 })));
+        while let Ok(o) = rx.try_recv() {
+            outputs.push(o);
+        }
+        assert!(outputs.iter().any(|o| matches!(
+            o,
+            EngineOutput::SyncRequired {
+                local_view: 1,
+                target_view: 100
+            }
+        )));
+        assert!(
+            outputs
+                .iter()
+                .any(|o| matches!(o, EngineOutput::ViewChanged { new_view: 100 }))
+        );
     }
 
     #[test]
@@ -1491,7 +1760,12 @@ mod tests {
         let far_view = 100u64;
         let block_hash = B256::repeat_byte(0xAA);
         let msg = signing_message(far_view, &block_hash);
-        let vote = Vote { view: far_view, block_hash, voter: 2, signature: sks[2].sign(&msg) };
+        let vote = Vote {
+            view: far_view,
+            block_hash,
+            voter: 2,
+            signature: sks[2].sign(&msg),
+        };
 
         engine
             .process_event(ConsensusEvent::Message(ConsensusMessage::Vote(vote)))
@@ -1502,8 +1776,8 @@ mod tests {
 
     #[test]
     fn test_far_future_invalid_qc_is_dropped() {
-        use bitvec::prelude::*;
         use crate::protocol::quorum::signing_message;
+        use bitvec::prelude::*;
 
         let (mut engine, sks, _, _rx) = make_engine(4, 0);
         assert_eq!(engine.current_view(), 1);
@@ -1512,7 +1786,9 @@ mod tests {
         let block_hash = B256::repeat_byte(0xBB);
 
         let wrong_msg = signing_message(99, &B256::repeat_byte(0xFF));
-        let sigs: Vec<_> = (0..3u32).map(|i| sks[i as usize].sign(&wrong_msg)).collect();
+        let sigs: Vec<_> = (0..3u32)
+            .map(|i| sks[i as usize].sign(&wrong_msg))
+            .collect();
         let sig_refs: Vec<_> = sigs.iter().collect();
         let agg_sig = n42_primitives::bls::AggregateSignature::aggregate(&sig_refs).unwrap();
 
@@ -1539,7 +1815,9 @@ mod tests {
         };
 
         engine
-            .process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(proposal)))
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(
+                proposal,
+            )))
             .expect("far-future proposal with invalid QC should be silently dropped");
 
         assert_eq!(engine.current_view(), 1);
@@ -1564,7 +1842,9 @@ mod tests {
         };
 
         engine
-            .process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(proposal)))
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(
+                proposal,
+            )))
             .expect("far-future proposal with genesis QC should be silently dropped");
 
         assert_eq!(engine.current_view(), 1);
@@ -1595,7 +1875,9 @@ mod tests {
         };
 
         engine
-            .process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(proposal)))
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(
+                proposal,
+            )))
             .expect("should trigger view jump");
 
         assert_eq!(engine.current_view(), 100);
@@ -1624,7 +1906,9 @@ mod tests {
         };
 
         engine
-            .process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(proposal)))
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(
+                proposal,
+            )))
             .expect("should trigger view jump");
 
         while rx.try_recv().is_ok() {}
@@ -1640,13 +1924,17 @@ mod tests {
 
         let commit_qc = build_test_commit_qc(1, B256::repeat_byte(0x01), &sks, &vs, &[0, 1, 2]);
         let _ = engine.process_event(ConsensusEvent::Message(ConsensusMessage::Decide(Decide {
-            view: 1, block_hash: B256::repeat_byte(0x01), commit_qc,
+            view: 1,
+            block_hash: B256::repeat_byte(0x01),
+            commit_qc,
         })));
         while rx.try_recv().is_ok() {}
 
         let commit_qc2 = build_test_commit_qc(2, B256::repeat_byte(0x02), &sks, &vs, &[0, 1, 2]);
         let _ = engine.process_event(ConsensusEvent::Message(ConsensusMessage::Decide(Decide {
-            view: 2, block_hash: B256::repeat_byte(0x02), commit_qc: commit_qc2,
+            view: 2,
+            block_hash: B256::repeat_byte(0x02),
+            commit_qc: commit_qc2,
         })));
         while rx.try_recv().is_ok() {}
 
@@ -1670,7 +1958,11 @@ mod tests {
 
         while rx.try_recv().is_ok() {}
         assert_eq!(engine.current_view(), 200);
-        assert_eq!(engine.locked_qc().view, 50, "locked_qc should NOT downgrade from 50 to 30");
+        assert_eq!(
+            engine.locked_qc().view,
+            50,
+            "locked_qc should NOT downgrade from 50 to 30"
+        );
     }
 
     #[test]
@@ -1683,7 +1975,12 @@ mod tests {
         let view = 51u64;
         let block_hash = B256::repeat_byte(0xFF);
         let msg = signing_message(view, &block_hash);
-        let vote = Vote { view, block_hash, voter: 2, signature: sks[2].sign(&msg) };
+        let vote = Vote {
+            view,
+            block_hash,
+            voter: 2,
+            signature: sks[2].sign(&msg),
+        };
 
         engine
             .process_event(ConsensusEvent::Message(ConsensusMessage::Vote(vote)))
@@ -1701,7 +1998,11 @@ mod tests {
         let far_view = 100u64;
         let block_hash = B256::repeat_byte(0xAB);
         let commit_qc = build_test_commit_qc(far_view, block_hash, &sks, &vs, &[0, 1, 2]);
-        let decide = Decide { view: far_view, block_hash, commit_qc };
+        let decide = Decide {
+            view: far_view,
+            block_hash,
+            commit_qc,
+        };
 
         engine
             .process_event(ConsensusEvent::Message(ConsensusMessage::Decide(decide)))
@@ -1710,9 +2011,19 @@ mod tests {
         assert_eq!(engine.current_view(), 101);
 
         let mut outputs = vec![];
-        while let Ok(o) = rx.try_recv() { outputs.push(o); }
-        assert!(outputs.iter().any(|o| matches!(o, EngineOutput::SyncRequired { .. })));
-        assert!(outputs.iter().any(|o| matches!(o, EngineOutput::BlockCommitted { .. })));
+        while let Ok(o) = rx.try_recv() {
+            outputs.push(o);
+        }
+        assert!(
+            outputs
+                .iter()
+                .any(|o| matches!(o, EngineOutput::SyncRequired { .. }))
+        );
+        assert!(
+            outputs
+                .iter()
+                .any(|o| matches!(o, EngineOutput::BlockCommitted { .. }))
+        );
     }
 
     #[test]
@@ -1722,18 +2033,34 @@ mod tests {
         engine.on_timeout().expect("first timeout");
         let t1 = engine.consecutive_timeouts();
         let mut outputs = vec![];
-        while let Ok(o) = rx.try_recv() { outputs.push(o); }
-        let broadcast_count_1 = outputs.iter()
-            .filter(|o| matches!(o, EngineOutput::BroadcastMessage(ConsensusMessage::Timeout(_))))
+        while let Ok(o) = rx.try_recv() {
+            outputs.push(o);
+        }
+        let broadcast_count_1 = outputs
+            .iter()
+            .filter(|o| {
+                matches!(
+                    o,
+                    EngineOutput::BroadcastMessage(ConsensusMessage::Timeout(_))
+                )
+            })
             .count();
         assert_eq!(broadcast_count_1, 1);
 
         engine.on_timeout().expect("repeat timeout");
         assert_eq!(engine.consecutive_timeouts(), t1);
         let mut outputs = vec![];
-        while let Ok(o) = rx.try_recv() { outputs.push(o); }
-        let broadcast_count_2 = outputs.iter()
-            .filter(|o| matches!(o, EngineOutput::BroadcastMessage(ConsensusMessage::Timeout(_))))
+        while let Ok(o) = rx.try_recv() {
+            outputs.push(o);
+        }
+        let broadcast_count_2 = outputs
+            .iter()
+            .filter(|o| {
+                matches!(
+                    o,
+                    EngineOutput::BroadcastMessage(ConsensusMessage::Timeout(_))
+                )
+            })
             .count();
         assert_eq!(broadcast_count_2, 0);
     }
@@ -1821,8 +2148,13 @@ mod tests {
             .expect("timeout from 1 should form TC");
 
         let mut outputs = vec![];
-        while let Ok(o) = rx.try_recv() { outputs.push(o); }
-        assert!(outputs.iter().any(|o| matches!(o, EngineOutput::BroadcastMessage(ConsensusMessage::NewView(_)))));
+        while let Ok(o) = rx.try_recv() {
+            outputs.push(o);
+        }
+        assert!(outputs.iter().any(|o| matches!(
+            o,
+            EngineOutput::BroadcastMessage(ConsensusMessage::NewView(_))
+        )));
         assert_eq!(engine.current_view(), 2);
     }
 
@@ -1851,8 +2183,13 @@ mod tests {
         }
 
         let mut outputs = vec![];
-        while let Ok(o) = rx.try_recv() { outputs.push(o); }
-        assert!(!outputs.iter().any(|o| matches!(o, EngineOutput::BroadcastMessage(ConsensusMessage::NewView(_)))));
+        while let Ok(o) = rx.try_recv() {
+            outputs.push(o);
+        }
+        assert!(!outputs.iter().any(|o| matches!(
+            o,
+            EngineOutput::BroadcastMessage(ConsensusMessage::NewView(_))
+        )));
         assert_eq!(engine.current_view(), 1);
     }
 
@@ -1865,7 +2202,12 @@ mod tests {
 
         let view5_hash = B256::repeat_byte(0x55);
         let msg = signing_message(5, &view5_hash);
-        let vote = Vote { view: 5, block_hash: view5_hash, voter: 2, signature: sks[2].sign(&msg) };
+        let vote = Vote {
+            view: 5,
+            block_hash: view5_hash,
+            voter: 2,
+            signature: sks[2].sign(&msg),
+        };
         engine
             .process_event(ConsensusEvent::Message(ConsensusMessage::Vote(vote)))
             .expect("future Vote should be buffered");
@@ -1877,9 +2219,12 @@ mod tests {
         for v in 1u64..=4 {
             let bh = B256::repeat_byte(v as u8);
             let cqc = build_test_commit_qc(v, bh, &sks, &vs, &[0, 1, 2]);
-            let _ = engine.process_event(ConsensusEvent::Message(
-                ConsensusMessage::Decide(Decide { view: v, block_hash: bh, commit_qc: cqc }),
-            ));
+            let _ =
+                engine.process_event(ConsensusEvent::Message(ConsensusMessage::Decide(Decide {
+                    view: v,
+                    block_hash: bh,
+                    commit_qc: cqc,
+                })));
             while rx.try_recv().is_ok() {}
         }
 
@@ -1894,9 +2239,12 @@ mod tests {
         for v in 1u64..=9 {
             let bh = B256::repeat_byte(v as u8);
             let cqc = build_test_commit_qc(v, bh, &sks, &vs, &[0, 1, 2]);
-            let _ = engine.process_event(ConsensusEvent::Message(
-                ConsensusMessage::Decide(Decide { view: v, block_hash: bh, commit_qc: cqc }),
-            ));
+            let _ =
+                engine.process_event(ConsensusEvent::Message(ConsensusMessage::Decide(Decide {
+                    view: v,
+                    block_hash: bh,
+                    commit_qc: cqc,
+                })));
         }
         while rx.try_recv().is_ok() {}
         assert_eq!(engine.current_view(), 10);
@@ -1923,11 +2271,17 @@ mod tests {
         for v in 2u64..=(MAX_FUTURE_MESSAGES as u64 + 5) {
             let block_hash = B256::repeat_byte((v % 256) as u8);
             let msg = signing_message(v, &block_hash);
-            let vote = Vote { view: v, block_hash, voter: 1, signature: sks[1].sign(&msg) };
+            let vote = Vote {
+                view: v,
+                block_hash,
+                voter: 1,
+                signature: sks[1].sign(&msg),
+            };
 
             // Simulate the eviction logic from process_message
             if engine.future_msg_buffer.len() >= MAX_FUTURE_MESSAGES {
-                if let Some(min_idx) = engine.future_msg_buffer
+                if let Some(min_idx) = engine
+                    .future_msg_buffer
                     .iter()
                     .enumerate()
                     .min_by_key(|(_, (view, _))| *view)
@@ -1936,13 +2290,23 @@ mod tests {
                     engine.future_msg_buffer.swap_remove(min_idx);
                 }
             }
-            engine.future_msg_buffer.push((v, ConsensusMessage::Vote(vote)));
+            engine
+                .future_msg_buffer
+                .push((v, ConsensusMessage::Vote(vote)));
         }
 
         assert_eq!(engine.future_msg_buffer.len(), MAX_FUTURE_MESSAGES);
 
-        let min_view = engine.future_msg_buffer.iter().map(|(v, _)| *v).min().unwrap_or(0);
-        assert!(min_view >= 3, "lowest view in buffer should be >= 3 after eviction, got {min_view}");
+        let min_view = engine
+            .future_msg_buffer
+            .iter()
+            .map(|(v, _)| *v)
+            .min()
+            .unwrap_or(0);
+        assert!(
+            min_view >= 3,
+            "lowest view in buffer should be >= 3 after eviction, got {min_view}"
+        );
     }
 
     #[test]
@@ -1967,14 +2331,21 @@ mod tests {
         };
 
         engine
-            .process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(proposal)))
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(
+                proposal,
+            )))
             .expect("far-future proposal should trigger QC jump");
 
         let mut outputs = vec![];
-        while let Ok(o) = rx.try_recv() { outputs.push(o); }
+        while let Ok(o) = rx.try_recv() {
+            outputs.push(o);
+        }
 
         let sync = outputs.iter().find_map(|o| match o {
-            EngineOutput::SyncRequired { local_view, target_view } => Some((*local_view, *target_view)),
+            EngineOutput::SyncRequired {
+                local_view,
+                target_view,
+            } => Some((*local_view, *target_view)),
             _ => None,
         });
         assert!(sync.is_some());
@@ -2002,19 +2373,26 @@ mod tests {
         };
 
         engine
-            .process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(proposal)))
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(
+                proposal,
+            )))
             .expect("should trigger QC jump to view 80");
 
         let actual_view = engine.current_view();
         assert!(actual_view >= 80);
 
         let mut outputs = vec![];
-        while let Ok(o) = rx.try_recv() { outputs.push(o); }
+        while let Ok(o) = rx.try_recv() {
+            outputs.push(o);
+        }
 
-        let view_changed_values: Vec<ViewNumber> = outputs.iter().filter_map(|o| match o {
-            EngineOutput::ViewChanged { new_view } => Some(*new_view),
-            _ => None,
-        }).collect();
+        let view_changed_values: Vec<ViewNumber> = outputs
+            .iter()
+            .filter_map(|o| match o {
+                EngineOutput::ViewChanged { new_view } => Some(*new_view),
+                _ => None,
+            })
+            .collect();
 
         assert!(!view_changed_values.is_empty());
 

@@ -32,6 +32,9 @@ pub enum MobilePacketError {
 
     #[error("compression error: {0}")]
     Compression(String),
+
+    #[error("starhub error: {0}")]
+    Hub(String),
 }
 
 /// A block commit notification: `(block_hash, consensus_view)`.
@@ -137,7 +140,9 @@ pub async fn mobile_packet_loop<P>(
                         &hub_handle,
                         block_hash,
                         &mut previously_sent_codes,
-                    ) {
+                    )
+                    .await
+                    {
                         Ok(packet_size) => {
                             if attempt > 0 {
                                 info!(%block_hash, packet_size, attempt, "mobile stream packet broadcast (after retry)");
@@ -187,7 +192,7 @@ pub async fn mobile_packet_loop<P>(
                 let mut framed = bytes::BytesMut::with_capacity(1 + compressed.len());
                 framed.put_u8(msg_type);
                 framed.extend_from_slice(&compressed);
-                if let Err(e) = hub_handle.send_to_session(session_id, framed.freeze()) {
+                if let Err(e) = hub_handle.send_to_session(session_id, framed.freeze()).await {
                     warn!(error = %e, session_id, "failed to send cache sync to new phone");
                 } else {
                     info!(
@@ -209,7 +214,7 @@ pub async fn mobile_packet_loop<P>(
 ///
 /// Flow: fetch block → get parent state → wrap with ReadLogDatabase → execute
 /// → extract read log + bytecodes → differential filter → encode → zstd → broadcast.
-fn generate_and_broadcast_v2<P>(
+async fn generate_and_broadcast_v2<P>(
     provider: &P,
     evm_config: &N42EvmConfig,
     hub_handle: &ShardedStarHubHandle,
@@ -222,80 +227,88 @@ where
         + BlockHashReader
         + 'static,
 {
-    let recovered_block = provider
-        .recovered_block(BlockHashOrNumber::Hash(block_hash), TransactionVariant::WithHash)
-        .map_err(|e| MobilePacketError::StateProvider(e.to_string()))?
-        .ok_or(MobilePacketError::BlockNotFound(block_hash))?;
+    let (compressed, packet_size, all_codes) = {
+        let recovered_block = provider
+            .recovered_block(BlockHashOrNumber::Hash(block_hash), TransactionVariant::WithHash)
+            .map_err(|e| MobilePacketError::StateProvider(e.to_string()))?
+            .ok_or(MobilePacketError::BlockNotFound(block_hash))?;
 
-    let parent_hash = recovered_block.header().parent_hash();
-    let state_provider = provider
-        .history_by_block_hash(parent_hash)
-        .map_err(|e| MobilePacketError::StateProvider(e.to_string()))?;
+        let parent_hash = recovered_block.header().parent_hash();
+        let state_provider = provider
+            .history_by_block_hash(parent_hash)
+            .map_err(|e| MobilePacketError::StateProvider(e.to_string()))?;
 
-    let inner_db = reth_revm::database::StateProviderDatabase::new(&state_provider);
-    let logged_db = ReadLogDatabase::new(inner_db);
-    let log_handle = logged_db.log_handle();
-    let codes_handle = logged_db.codes_handle();
+        let inner_db = reth_revm::database::StateProviderDatabase::new(&state_provider);
+        let logged_db = ReadLogDatabase::new(inner_db);
+        let log_handle = logged_db.log_handle();
+        let codes_handle = logged_db.codes_handle();
 
-    let mut executor = evm_config.executor(logged_db);
-    let _output = executor
-        .execute_one(&recovered_block)
-        .map_err(|e| MobilePacketError::Execution(e.to_string()))?;
+        let mut executor = evm_config.executor(logged_db);
+        let _output = executor
+            .execute_one(&recovered_block)
+            .map_err(|e| MobilePacketError::Execution(e.to_string()))?;
 
-    let read_log = match Arc::try_unwrap(log_handle) {
-        Ok(mutex) => mutex.into_inner().unwrap_or_else(|e| e.into_inner()),
-        Err(arc) => arc.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+        let read_log = match Arc::try_unwrap(log_handle) {
+            Ok(mutex) => mutex.into_inner().unwrap_or_else(|e| e.into_inner()),
+            Err(arc) => arc.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+        };
+        let read_log_count = read_log.len();
+        let read_log_data = n42_execution::read_log::encode_read_log(&read_log);
+
+        let captured_codes = match Arc::try_unwrap(codes_handle) {
+            Ok(mutex) => mutex.into_inner().unwrap_or_else(|e| e.into_inner()),
+            Err(arc) => arc.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+        };
+
+        let header = recovered_block.header();
+        let block_number = header.number();
+        let mut header_buf = Vec::new();
+        header.encode(&mut header_buf);
+        let transactions = recovered_block.body().encoded_2718_transactions();
+
+        let all_codes: Vec<(B256, Bytes)> = captured_codes.into_iter().collect();
+        let total_codes = all_codes.len();
+        let new_codes: Vec<(B256, Bytes)> = all_codes
+            .iter()
+            .filter(|(hash, _)| !previously_sent_codes.contains_key(hash))
+            .cloned()
+            .collect();
+        let filtered_codes = total_codes - new_codes.len();
+
+        let packet = StreamPacket {
+            block_hash,
+            header_rlp: Bytes::from(header_buf),
+            transactions,
+            read_log_data,
+            bytecodes: new_codes,
+        };
+
+        debug!(
+            block_number,
+            read_log_entries = read_log_count,
+            read_log_bytes = packet.read_log_data.len(),
+            bytecodes = packet.bytecodes.len(),
+            filtered_codes,
+            total_codes,
+            txs = packet.transactions.len(),
+            estimated_size = packet.estimated_size(),
+            "stream packet built (V2 differential)"
+        );
+
+        let encoded = encode_stream_packet(&packet);
+        let raw_size = encoded.len();
+        let compressed = zstd::bulk::compress(&encoded, 3)
+            .map_err(|e| MobilePacketError::Compression(e.to_string()))?;
+        let packet_size = compressed.len();
+        debug!(block_number, raw_size, compressed_size = packet_size, "stream packet compressed");
+
+        (bytes::Bytes::from(compressed), packet_size, all_codes)
     };
-    let read_log_count = read_log.len();
-    let read_log_data = n42_execution::read_log::encode_read_log(&read_log);
 
-    let captured_codes = match Arc::try_unwrap(codes_handle) {
-        Ok(mutex) => mutex.into_inner().unwrap_or_else(|e| e.into_inner()),
-        Err(arc) => arc.lock().unwrap_or_else(|e| e.into_inner()).clone(),
-    };
-
-    let header = recovered_block.header();
-    let block_number = header.number();
-    let mut header_buf = Vec::new();
-    header.encode(&mut header_buf);
-    let transactions = recovered_block.body().encoded_2718_transactions();
-
-    let all_codes: Vec<(B256, Bytes)> = captured_codes.into_iter().collect();
-    let total_codes = all_codes.len();
-    let new_codes: Vec<(B256, Bytes)> = all_codes
-        .iter()
-        .filter(|(hash, _)| !previously_sent_codes.contains_key(hash))
-        .cloned()
-        .collect();
-    let filtered_codes = total_codes - new_codes.len();
-
-    let packet = StreamPacket {
-        block_hash,
-        header_rlp: Bytes::from(header_buf),
-        transactions,
-        read_log_data,
-        bytecodes: new_codes,
-    };
-
-    debug!(
-        block_number,
-        read_log_entries = read_log_count,
-        read_log_bytes = packet.read_log_data.len(),
-        bytecodes = packet.bytecodes.len(),
-        filtered_codes,
-        total_codes,
-        txs = packet.transactions.len(),
-        estimated_size = packet.estimated_size(),
-        "stream packet built (V2 differential)"
-    );
-
-    let encoded = encode_stream_packet(&packet);
-    let raw_size = encoded.len();
-    let compressed = zstd::bulk::compress(&encoded, 3)
-        .map_err(|e| MobilePacketError::Compression(e.to_string()))?;
-    let packet_size = compressed.len();
-    debug!(block_number, raw_size, compressed_size = packet_size, "stream packet compressed");
-    let _ = hub_handle.broadcast_packet(bytes::Bytes::from(compressed));
+    hub_handle
+        .broadcast_packet(compressed)
+        .await
+        .map_err(|e| MobilePacketError::Hub(e.to_string()))?;
 
     for (hash, code) in all_codes {
         previously_sent_codes.insert(hash, code);

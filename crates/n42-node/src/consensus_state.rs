@@ -43,7 +43,11 @@ impl std::fmt::Debug for AttestationState {
 
 impl AttestationState {
     pub fn new(threshold: u32, max_blocks: usize) -> Self {
-        Self { blocks: HashMap::new(), threshold, max_blocks }
+        Self {
+            blocks: HashMap::new(),
+            threshold,
+            max_blocks,
+        }
     }
 
     /// Register a new block for attestation tracking, evicting the oldest if at capacity.
@@ -82,7 +86,9 @@ impl AttestationState {
     }
 
     pub fn get_attestation_count(&self, block_hash: &B256) -> Option<u32> {
-        self.blocks.get(block_hash).map(|b| b.attesters.len() as u32)
+        self.blocks
+            .get(block_hash)
+            .map(|b| b.attesters.len() as u32)
     }
 }
 
@@ -164,7 +170,10 @@ impl SharedConsensusState {
         Self {
             latest_committed_qc: ArcSwap::from_pointee(None),
             validator_set: Arc::new(validator_set),
-            attestation_state: Mutex::new(AttestationState::new(threshold, MAX_TRACKED_ATTESTATION_BLOCKS)),
+            attestation_state: Mutex::new(AttestationState::new(
+                threshold,
+                MAX_TRACKED_ATTESTATION_BLOCKS,
+            )),
             block_committed_tx,
             attestation_history: Mutex::new(VecDeque::new()),
             equivocation_log: Mutex::new(VecDeque::new()),
@@ -214,7 +223,10 @@ impl SharedConsensusState {
             tracing::error!("attestation_history mutex poisoned: {e}");
             e.into_inner()
         });
-        history.iter().find(|r| r.block_hash == *block_hash).cloned()
+        history
+            .iter()
+            .find(|r| r.block_hash == *block_hash)
+            .cloned()
     }
 
     /// Returns `(total, earliest_block_number, latest_block_number)`.
@@ -223,7 +235,11 @@ impl SharedConsensusState {
             tracing::error!("attestation_history mutex poisoned: {e}");
             e.into_inner()
         });
-        (history.len(), history.front().map(|r| r.block_number), history.back().map(|r| r.block_number))
+        (
+            history.len(),
+            history.front().map(|r| r.block_number),
+            history.back().map(|r| r.block_number),
+        )
     }
 
     pub fn record_equivocation(&self, view: u64, validator_index: u32, hash1: B256, hash2: B256) {
@@ -279,30 +295,6 @@ impl SharedConsensusState {
         set.contains(pubkey)
     }
 
-    /// Restores a set of authorized verifiers from a persisted snapshot.
-    ///
-    /// Replaces the current set entirely with the snapshot contents.
-    /// Called once on node startup after loading `ConsensusSnapshot::authorized_verifiers`.
-    pub fn restore_authorized_verifiers(&self, verifiers: &[[u8; 48]]) {
-        let mut set = self.authorized_verifiers.lock().unwrap_or_else(|e| {
-            tracing::error!("authorized_verifiers mutex poisoned: {e}");
-            e.into_inner()
-        });
-        set.clear();
-        set.extend(verifiers.iter().copied());
-    }
-
-    /// Returns a snapshot of the currently authorized verifier pubkeys.
-    ///
-    /// Used by `state_mgmt` to persist the set to disk on each block commit.
-    pub fn snapshot_authorized_verifiers(&self) -> Vec<[u8; 48]> {
-        let set = self.authorized_verifiers.lock().unwrap_or_else(|e| {
-            tracing::error!("authorized_verifiers mutex poisoned: {e}");
-            e.into_inner()
-        });
-        set.iter().copied().collect()
-    }
-
     /// Updates the latest JMT root hash and version (called from background JMT update task).
     pub fn update_jmt_root(&self, version: u64, root: B256) {
         self.jmt_root.store(Arc::new(Some((version, root))));
@@ -315,7 +307,8 @@ impl SharedConsensusState {
 
     /// Updates the latest ZK proof block number and hash.
     pub fn update_zk_proof(&self, block_number: u64, block_hash: B256) {
-        self.zk_latest_proof.store(Arc::new(Some((block_number, block_hash))));
+        self.zk_latest_proof
+            .store(Arc::new(Some((block_number, block_hash))));
     }
 
     /// Loads the latest ZK proof info (block_number, block_hash), if available.
@@ -331,7 +324,10 @@ impl SharedConsensusState {
         });
         att_state.register_block(block_hash, block_number);
 
-        let task = VerificationTask { block_hash, block_number };
+        let task = VerificationTask {
+            block_hash,
+            block_number,
+        };
         if self.block_committed_tx.receiver_count() > 0
             && let Ok(n) = self.block_committed_tx.send(task)
         {
@@ -387,7 +383,10 @@ mod tests {
     #[test]
     fn test_attestation_unknown_block() {
         let mut att = AttestationState::new(3, 100);
-        assert!(att.record_attestation(B256::repeat_byte(0xCC), "pk1".into()).is_none());
+        assert!(
+            att.record_attestation(B256::repeat_byte(0xCC), "pk1".into())
+                .is_none()
+        );
     }
 
     #[test]
@@ -402,7 +401,10 @@ mod tests {
         att.register_block(h3, 3);
 
         assert_eq!(att.blocks.len(), 2);
-        assert!(att.get_attestation_count(&h1).is_none(), "h1 should be evicted");
+        assert!(
+            att.get_attestation_count(&h1).is_none(),
+            "h1 should be evicted"
+        );
         assert!(att.get_attestation_count(&h2).is_some());
         assert!(att.get_attestation_count(&h3).is_some());
     }
