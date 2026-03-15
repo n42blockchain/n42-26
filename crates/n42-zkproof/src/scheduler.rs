@@ -45,7 +45,11 @@ impl ProofScheduler {
         proof_interval: u64,
         proof_store: Arc<ProofStore>,
     ) -> Self {
-        let interval = if proof_interval == 0 { 300 } else { proof_interval };
+        let interval = if proof_interval == 0 {
+            300
+        } else {
+            proof_interval
+        };
         let max_concurrent = max_concurrent_proofs();
         gauge!("n42_zk_proof_interval").set(interval as f64);
         info!(
@@ -152,12 +156,18 @@ impl ProofScheduler {
                 }
             }
             // Remove from in-progress set.
-            in_progress.lock().unwrap_or_else(|e| e.into_inner()).remove(&block_number);
+            in_progress
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&block_number);
         });
     }
 
     fn remove_in_progress(&self, block_number: u64) {
-        self.in_progress.lock().unwrap_or_else(|e| e.into_inner()).remove(&block_number);
+        self.in_progress
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&block_number);
     }
 
     /// Returns the configured proof interval.
@@ -182,7 +192,10 @@ impl ProofScheduler {
 
     /// Returns the number of blocks currently being proved.
     pub fn in_progress_count(&self) -> usize {
-        self.in_progress.lock().unwrap_or_else(|e| e.into_inner()).len()
+        self.in_progress
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
     }
 }
 
@@ -210,12 +223,16 @@ mod tests {
     /// A prover that always fails, for testing scheduler error handling.
     struct FailingProver;
     impl ZkProver for FailingProver {
-        fn name(&self) -> &str { "failing" }
+        fn name(&self) -> &str {
+            "failing"
+        }
         fn prove(&self, _input: &BlockExecutionInput) -> Result<ZkProofResult, ZkProofError> {
             Err(ZkProofError::Prover("intentional test failure".to_string()))
         }
         fn verify(&self, _result: &ZkProofResult) -> Result<bool, ZkProofError> {
-            Err(ZkProofError::Verification("intentional test failure".to_string()))
+            Err(ZkProofError::Verification(
+                "intentional test failure".to_string(),
+            ))
         }
     }
 
@@ -224,11 +241,19 @@ mod tests {
         call_count: AtomicU64,
     }
     impl CountingProver {
-        fn new() -> Self { Self { call_count: AtomicU64::new(0) } }
-        fn count(&self) -> u64 { self.call_count.load(Ordering::SeqCst) }
+        fn new() -> Self {
+            Self {
+                call_count: AtomicU64::new(0),
+            }
+        }
+        fn count(&self) -> u64 {
+            self.call_count.load(Ordering::SeqCst)
+        }
     }
     impl ZkProver for CountingProver {
-        fn name(&self) -> &str { "counting" }
+        fn name(&self) -> &str {
+            "counting"
+        }
         fn prove(&self, input: &BlockExecutionInput) -> Result<ZkProofResult, ZkProofError> {
             self.call_count.fetch_add(1, Ordering::SeqCst);
             // Delegate to MockProver for actual result.
@@ -250,7 +275,9 @@ mod tests {
         scheduler.on_block_committed(5, make_input(5));
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-        let proof = store.get_by_block(5).expect("proof should be generated for block 5");
+        let proof = store
+            .get_by_block(5)
+            .expect("proof should be generated for block 5");
         assert_eq!(proof.block_number, 5);
         assert_eq!(proof.proof_type, ProofType::Mock);
     }
@@ -355,7 +382,11 @@ mod tests {
         scheduler.on_block_committed(10, make_input(10));
         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
 
-        assert_eq!(callback_count.load(Ordering::SeqCst), 0, "callback should not fire on failure");
+        assert_eq!(
+            callback_count.load(Ordering::SeqCst),
+            0,
+            "callback should not fire on failure"
+        );
         assert!(store.is_empty(), "store should be empty on failure");
     }
 
@@ -435,7 +466,11 @@ mod tests {
         scheduler.on_block_committed(3, make_input(3));
         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
 
-        assert_eq!(counting.count(), 3, "block 0 skipped, 1/2/3 should generate");
+        assert_eq!(
+            counting.count(),
+            3,
+            "block 0 skipped, 1/2/3 should generate"
+        );
         assert!(!store.contains(0));
         assert!(store.contains(1));
         assert!(store.contains(2));

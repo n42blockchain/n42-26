@@ -109,7 +109,7 @@ bitvec = { version = "1.0", features = ["serde"] }
 ed25519-dalek = { version = "2", features = ["serde", "rand_core"] }
 
 # Caching
-lru = "0.12"
+lru = "0.16"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }

@@ -6,7 +6,7 @@ use tracing::{info, warn};
 use alloy_primitives::U256;
 use n42_mobile::code_cache::CodeCache;
 use n42_mobile::packet::decode_packet;
-use n42_mobile::receipt::{sign_receipt, VerificationReceipt};
+use n42_mobile::receipt::{VerificationReceipt, sign_receipt};
 use n42_mobile::verifier::{update_cache_after_verify, verify_block};
 use n42_primitives::BlsSecretKey;
 
@@ -121,8 +121,14 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
         let to_idx = ((i as usize) + 1) % wallet_count;
         let to_addr = tx_engine.address(to_idx);
         let amount = U256::from(1_000_000u128); // 1 USDT
-        let (_, raw_tx) =
-            erc20.build_transfer_tx(&mut tx_engine, from_idx, to_addr, amount, max_fee, priority_fee)?;
+        let (_, raw_tx) = erc20.build_transfer_tx(
+            &mut tx_engine,
+            from_idx,
+            to_addr,
+            amount,
+            max_fee,
+            priority_fee,
+        )?;
         rpc.send_raw_transaction(&raw_tx).await?;
     }
 
@@ -202,8 +208,7 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
 
                         info!(
                             block_number = packet.block_number,
-                            receipts_sent,
-                            "signed receipt sent back to node"
+                            receipts_sent, "signed receipt sent back to node"
                         );
 
                         verified_count += 1;
@@ -213,7 +218,10 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
 
                         // Stop after verifying at least one block with transactions
                         if verified_with_txs && verified_count >= 2 {
-                            info!("verified {} blocks (including blocks with txs), stopping", verified_count);
+                            info!(
+                                "verified {} blocks (including blocks with txs), stopping",
+                                verified_count
+                            );
                             break;
                         }
                     }
@@ -287,8 +295,7 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
 
     info!(
         receipt_log_count,
-        receipts_sent,
-        "node-side receipt processing verification"
+        receipts_sent, "node-side receipt processing verification"
     );
 
     assert!(
@@ -302,22 +309,10 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
     );
 
     info!("=== Scenario 8 PASSED ===");
-    info!(
-        "  Blocks verified via QUIC: {}",
-        verified_count
-    );
-    info!(
-        "  Blocks with transactions verified: {}",
-        verified_with_txs
-    );
-    info!(
-        "  BLS-signed receipts sent: {}",
-        receipts_sent
-    );
-    info!(
-        "  Code cache entries: {}",
-        code_cache.len()
-    );
+    info!("  Blocks verified via QUIC: {}", verified_count);
+    info!("  Blocks with transactions verified: {}", verified_with_txs);
+    info!("  BLS-signed receipts sent: {}", receipts_sent);
+    info!("  Code cache entries: {}", code_cache.len());
 
     let _ = node.stop();
     Ok(())
@@ -366,10 +361,7 @@ async fn connect_to_starhub(port: u16, pubkey: &[u8; 48]) -> eyre::Result<quinn:
 ///
 /// Reads a uni stream from the server. The first byte is the message type
 /// (0x01 = packet, 0x02 = cache sync). Returns the packet data (without prefix).
-async fn receive_packet(
-    conn: &quinn::Connection,
-    timeout: Duration,
-) -> eyre::Result<Vec<u8>> {
+async fn receive_packet(conn: &quinn::Connection, timeout: Duration) -> eyre::Result<Vec<u8>> {
     let mut recv = tokio::time::timeout(timeout, conn.accept_uni())
         .await
         .map_err(|_| eyre::eyre!("timeout waiting for uni stream"))??;
@@ -393,17 +385,12 @@ async fn receive_packet(
             // CacheSyncMessage — skip and try again
             Err(eyre::eyre!("received cache sync message, not a packet"))
         }
-        other => {
-            Err(eyre::eyre!("unknown message type: 0x{:02x}", other))
-        }
+        other => Err(eyre::eyre!("unknown message type: 0x{:02x}", other)),
     }
 }
 
 /// Sends a signed VerificationReceipt back to the node via QUIC.
-async fn send_receipt(
-    conn: &quinn::Connection,
-    receipt: &VerificationReceipt,
-) -> eyre::Result<()> {
+async fn send_receipt(conn: &quinn::Connection, receipt: &VerificationReceipt) -> eyre::Result<()> {
     let data = bincode::serialize(receipt)
         .map_err(|e| eyre::eyre!("receipt serialization failed: {e}"))?;
 

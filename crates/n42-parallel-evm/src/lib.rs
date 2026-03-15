@@ -12,8 +12,8 @@ use alloy_primitives::{Address, Log, U256};
 use mv_memory::MvMemory;
 use parallel_db::{ParallelDb, SharedReadSet};
 use parking_lot::Mutex;
-use revm::context::{BlockEnv, CfgEnv, Context, TxEnv};
 use revm::context::Journal;
+use revm::context::{BlockEnv, CfgEnv, Context, TxEnv};
 use revm::context_interface::result::ResultAndState;
 use revm::database_interface::DatabaseRef;
 use revm::handler::MainBuilder;
@@ -88,7 +88,9 @@ where
             let num_workers = rayon::current_num_threads().min(num_txs);
             for _ in 0..num_workers {
                 s.spawn(|_| {
-                    worker_loop(&scheduler, txs, base_db, &mv, &cfg_env, &block_env, &outputs);
+                    worker_loop(
+                        &scheduler, txs, base_db, &mv, &cfg_env, &block_env, &outputs,
+                    );
                 });
             }
         });
@@ -160,7 +162,8 @@ fn worker_loop<DB>(
             Task::Execute(tx_idx) => {
                 mv.clear_tx(tx_idx);
 
-                let output = execute_single_tx(tx_idx, &txs[tx_idx], base_db, mv, cfg_env, block_env);
+                let output =
+                    execute_single_tx(tx_idx, &txs[tx_idx], base_db, mv, cfg_env, block_env);
 
                 if let Some(ref out) = output {
                     for (addr, write) in &out.account_writes {
@@ -209,31 +212,38 @@ where
     let db = ParallelDb::new(tx_idx, base_db, mv, read_set.clone());
 
     // Build the EVM context and execute.
-    let mut ctx: Context<BlockEnv, TxEnv, CfgEnv, ParallelDb<'_, DB>, Journal<ParallelDb<'_, DB>>, ()> =
-        Context::new(db, cfg_env.spec);
+    let mut ctx: Context<
+        BlockEnv,
+        TxEnv,
+        CfgEnv,
+        ParallelDb<'_, DB>,
+        Journal<ParallelDb<'_, DB>>,
+        (),
+    > = Context::new(db, cfg_env.spec);
     ctx.block = block_env.clone();
     ctx.cfg = cfg_env.clone();
 
     let mut evm = ctx.build_mainnet();
 
-    let ResultAndState { result, state } = match revm::handler::ExecuteEvm::transact(&mut evm, tx_env.clone()) {
-        Ok(r) => r,
-        Err(e) => {
-            debug!(target: "n42::parallel_evm", tx_idx, error = %e, "tx execution error");
-            let rs = match Arc::try_unwrap(read_set) {
-                Ok(mutex) => mutex.into_inner(),
-                Err(arc) => arc.lock().clone(),
-            };
-            return Some(TxOutputInternal {
-                gas_used: 0,
-                success: false,
-                logs: vec![],
-                account_writes: vec![],
-                storage_writes: vec![],
-                read_set: rs,
-            });
-        }
-    };
+    let ResultAndState { result, state } =
+        match revm::handler::ExecuteEvm::transact(&mut evm, tx_env.clone()) {
+            Ok(r) => r,
+            Err(e) => {
+                debug!(target: "n42::parallel_evm", tx_idx, error = %e, "tx execution error");
+                let rs = match Arc::try_unwrap(read_set) {
+                    Ok(mutex) => mutex.into_inner(),
+                    Err(arc) => arc.lock().clone(),
+                };
+                return Some(TxOutputInternal {
+                    gas_used: 0,
+                    success: false,
+                    logs: vec![],
+                    account_writes: vec![],
+                    storage_writes: vec![],
+                    read_set: rs,
+                });
+            }
+        };
 
     let gas_used = result.gas_used();
     let success = result.is_success();
@@ -330,10 +340,9 @@ fn build_output(
             let account = state_changes
                 .entry(addr)
                 .or_insert_with(|| Account::new_not_existing(tx_idx));
-            account.storage.insert(
-                slot,
-                EvmStorageSlot::new_changed(U256::ZERO, value, tx_idx),
-            );
+            account
+                .storage
+                .insert(slot, EvmStorageSlot::new_changed(U256::ZERO, value, tx_idx));
         }
     }
 
@@ -360,7 +369,9 @@ where
 
     for (tx_idx, tx_env) in txs.iter().enumerate() {
         let output = execute_single_tx(tx_idx, tx_env, base_db, &mv, cfg_env, block_env)
-            .ok_or_else(|| ParallelEvmError::Database(format!("execution failed for tx {tx_idx}")))?;
+            .ok_or_else(|| {
+                ParallelEvmError::Database(format!("execution failed for tx {tx_idx}"))
+            })?;
 
         // Write to MvMemory so subsequent txs see this tx's state.
         for (addr, write) in &output.account_writes {
@@ -395,12 +406,14 @@ where
             let account = state_changes
                 .entry(addr)
                 .or_insert_with(|| Account::new_not_existing(tx_idx));
-            account.storage.insert(
-                slot,
-                EvmStorageSlot::new_changed(U256::ZERO, value, tx_idx),
-            );
+            account
+                .storage
+                .insert(slot, EvmStorageSlot::new_changed(U256::ZERO, value, tx_idx));
         }
     }
 
-    Ok(ParallelExecutionOutput { results, state_changes })
+    Ok(ParallelExecutionOutput {
+        results,
+        state_changes,
+    })
 }

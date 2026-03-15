@@ -1,4 +1,4 @@
-use alloy_primitives::{Bytes, B256};
+use alloy_primitives::{B256, Bytes};
 use reth_revm::witness::ExecutionWitnessRecord;
 use reth_trie_common::HashedPostState;
 use revm::database::State;
@@ -98,7 +98,7 @@ pub struct CompactWitness {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_primitives::{keccak256, Bytes, B256};
+    use alloy_primitives::{B256, Bytes, keccak256};
     use std::collections::HashSet;
 
     fn bytecode(data: &[u8]) -> Bytes {
@@ -186,8 +186,7 @@ mod tests {
         };
 
         let json = serde_json::to_string(&witness).expect("json serialize");
-        let deserialized: ExecutionWitness =
-            serde_json::from_str(&json).expect("json deserialize");
+        let deserialized: ExecutionWitness = serde_json::from_str(&json).expect("json deserialize");
 
         assert_eq!(deserialized.codes.len(), 2);
         assert_eq!(deserialized.keys.len(), 1);
@@ -223,8 +222,7 @@ mod tests {
         };
 
         let json = serde_json::to_string(&compact).expect("json serialize");
-        let deserialized: CompactWitness =
-            serde_json::from_str(&json).expect("json deserialize");
+        let deserialized: CompactWitness = serde_json::from_str(&json).expect("json deserialize");
 
         assert_eq!(deserialized.uncached_codes.len(), 1);
         assert_eq!(deserialized.cached_code_hashes.len(), 1);
@@ -242,8 +240,7 @@ mod tests {
         };
 
         let encoded = bincode::serialize(&compact).expect("bincode serialize");
-        let decoded: CompactWitness =
-            bincode::deserialize(&encoded).expect("bincode deserialize");
+        let decoded: CompactWitness = bincode::deserialize(&encoded).expect("bincode deserialize");
 
         assert_eq!(decoded.keys.len(), 1);
         assert!(decoded.uncached_codes.is_empty());

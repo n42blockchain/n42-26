@@ -33,9 +33,8 @@ pub fn extract_qc_from_extra_data(
 ///
 /// Prepends the 4-byte magic prefix "N42Q" before the bincode-encoded QC.
 pub fn encode_qc_to_extra_data(qc: &QuorumCertificate) -> Result<Bytes, ConsensusError> {
-    let qc_bytes = bincode::serialize(qc).map_err(|e| {
-        ConsensusError::Other(format!("QC serialization failed: {e}"))
-    })?;
+    let qc_bytes = bincode::serialize(qc)
+        .map_err(|e| ConsensusError::Other(format!("QC serialization failed: {e}")))?;
 
     let mut data = Vec::with_capacity(4 + qc_bytes.len());
     data.extend_from_slice(QC_MAGIC);

@@ -13,6 +13,9 @@ pub enum NetworkError {
     #[error("dial error: {0}")]
     Dial(String),
 
+    #[error("network service channel full")]
+    ChannelFull,
+
     #[error("network service channel closed")]
     ChannelClosed,
 }

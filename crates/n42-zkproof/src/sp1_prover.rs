@@ -16,7 +16,7 @@ use sp1_sdk::{Prover, SP1ProvingKey, SP1Stdin, SP1VerifyingKey};
 use tracing::{info, warn};
 
 use crate::error::ZkProofError;
-use crate::prover::{unix_now, BlockExecutionInput, ProofType, ZkProofResult, ZkProver};
+use crate::prover::{BlockExecutionInput, ProofType, ZkProofResult, ZkProver, unix_now};
 
 /// SP1 prover mode.
 #[derive(Debug, Clone, Copy)]
@@ -68,7 +68,12 @@ impl Sp1Prover {
             "SP1 prover initialized"
         );
 
-        Ok(Self { prover, pk, vk, mode })
+        Ok(Self {
+            prover,
+            pk,
+            vk,
+            mode,
+        })
     }
 
     /// Load guest ELF from a file path.
@@ -104,9 +109,8 @@ impl ZkProver for Sp1Prover {
         let start = Instant::now();
 
         // Serialize input for the guest.
-        let input_bytes = bincode::serialize(input).map_err(|e| {
-            ZkProofError::Serialization(format!("failed to serialize input: {e}"))
-        })?;
+        let input_bytes = bincode::serialize(input)
+            .map_err(|e| ZkProofError::Serialization(format!("failed to serialize input: {e}")))?;
 
         // Write input to SP1 stdin.
         let mut stdin = SP1Stdin::new();
@@ -134,9 +138,8 @@ impl ZkProver for Sp1Prover {
         }
 
         // Serialize proof for storage.
-        let proof_bytes = bincode::serialize(&proof).map_err(|e| {
-            ZkProofError::Serialization(format!("failed to serialize proof: {e}"))
-        })?;
+        let proof_bytes = bincode::serialize(&proof)
+            .map_err(|e| ZkProofError::Serialization(format!("failed to serialize proof: {e}")))?;
 
         let proof_type = match self.mode {
             Sp1Mode::Mock => ProofType::Mock,
@@ -157,10 +160,8 @@ impl ZkProver for Sp1Prover {
     }
 
     fn verify(&self, result: &ZkProofResult) -> Result<bool, ZkProofError> {
-        let proof: sp1_sdk::SP1ProofWithPublicValues =
-            bincode::deserialize(&result.proof_bytes).map_err(|e| {
-                ZkProofError::Verification(format!("failed to deserialize proof: {e}"))
-            })?;
+        let proof: sp1_sdk::SP1ProofWithPublicValues = bincode::deserialize(&result.proof_bytes)
+            .map_err(|e| ZkProofError::Verification(format!("failed to deserialize proof: {e}")))?;
 
         Ok(Prover::verify(&self.prover, &proof, &self.vk).is_ok())
     }
@@ -217,14 +218,20 @@ mod tests {
         // Safety: this is test-only and uses a very specific path.
         let key = "N42_ZK_GUEST_ELF";
         let prev = std::env::var(key).ok();
-        unsafe { std::env::set_var(key, "/tmp/__n42_zkproof_test_nonexistent_elf__"); }
+        unsafe {
+            std::env::set_var(key, "/tmp/__n42_zkproof_test_nonexistent_elf__");
+        }
 
         let result = Sp1Prover::from_env(Sp1Mode::Mock);
 
         // Restore previous value.
         match prev {
-            Some(v) => unsafe { std::env::set_var(key, v); },
-            None => unsafe { std::env::remove_var(key); },
+            Some(v) => unsafe {
+                std::env::set_var(key, v);
+            },
+            None => unsafe {
+                std::env::remove_var(key);
+            },
         }
 
         let err = match result {
@@ -262,7 +269,9 @@ mod tests {
         let elf = match find_guest_elf() {
             Some(elf) => elf,
             None => {
-                eprintln!("SKIP: guest ELF not found, run: cd crates/n42-zkproof-guest && cargo prove build");
+                eprintln!(
+                    "SKIP: guest ELF not found, run: cd crates/n42-zkproof-guest && cargo prove build"
+                );
                 return;
             }
         };
@@ -286,8 +295,14 @@ mod tests {
         assert_eq!(result.prover_backend, "sp1");
         assert_eq!(result.proof_type, crate::prover::ProofType::Mock);
         assert!(result.verified, "SP1 mock proof should self-verify");
-        assert!(!result.proof_bytes.is_empty(), "proof bytes should not be empty");
-        assert!(!result.public_values.is_empty(), "public values should not be empty");
+        assert!(
+            !result.proof_bytes.is_empty(),
+            "proof bytes should not be empty"
+        );
+        assert!(
+            !result.public_values.is_empty(),
+            "public values should not be empty"
+        );
         assert!(result.created_at > 0);
 
         // Re-verify the proof.

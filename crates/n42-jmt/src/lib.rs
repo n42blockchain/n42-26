@@ -13,4 +13,4 @@ pub use proof::{JmtProof, VerifyError};
 pub use sharded::ShardedJmt;
 pub use snapshot::{JmtSnapshot, load_snapshot, save_snapshot};
 pub use store::MemTreeStore;
-pub use tree::{decode_code_hash, encode_account_value, N42JmtTree};
+pub use tree::{N42JmtTree, decode_code_hash, encode_account_value};

@@ -338,13 +338,20 @@ fn collect_signer_keys<'a>(
 /// Verifies a QuorumCertificate (Round 1) against the validator set.
 pub fn verify_qc(qc: &QuorumCertificate, validator_set: &ValidatorSet) -> ConsensusResult<()> {
     let quorum_size = validator_set.quorum_size();
-    let signer_pks = collect_signer_keys(&qc.signers, validator_set, quorum_size, qc.view, CertKind::QC)?;
+    let signer_pks = collect_signer_keys(
+        &qc.signers,
+        validator_set,
+        quorum_size,
+        qc.view,
+        CertKind::QC,
+    )?;
     let message = signing_message(qc.view, &qc.block_hash);
-    AggregateSignature::verify_aggregate(&message, &qc.aggregate_signature, &signer_pks)
-        .map_err(|_| ConsensusError::InvalidQC {
+    AggregateSignature::verify_aggregate(&message, &qc.aggregate_signature, &signer_pks).map_err(
+        |_| ConsensusError::InvalidQC {
             view: qc.view,
             reason: "aggregated signature verification failed".to_string(),
-        })
+        },
+    )
 }
 
 /// Verifies a CommitQC (Round 2) against the validator set.
@@ -356,13 +363,20 @@ pub fn verify_commit_qc(
     validator_set: &ValidatorSet,
 ) -> ConsensusResult<()> {
     let quorum_size = validator_set.quorum_size();
-    let signer_pks = collect_signer_keys(&qc.signers, validator_set, quorum_size, qc.view, CertKind::QC)?;
+    let signer_pks = collect_signer_keys(
+        &qc.signers,
+        validator_set,
+        quorum_size,
+        qc.view,
+        CertKind::QC,
+    )?;
     let message = commit_signing_message(qc.view, &qc.block_hash);
-    AggregateSignature::verify_aggregate(&message, &qc.aggregate_signature, &signer_pks)
-        .map_err(|_| ConsensusError::InvalidQC {
+    AggregateSignature::verify_aggregate(&message, &qc.aggregate_signature, &signer_pks).map_err(
+        |_| ConsensusError::InvalidQC {
             view: qc.view,
             reason: "commit QC aggregated signature verification failed".to_string(),
-        })
+        },
+    )
 }
 
 /// Verifies a QC that may be either a PrepareQC (Round 1) or CommitQC (Round 2).
@@ -380,34 +394,50 @@ pub fn verify_qc_any_domain(
 ) -> ConsensusResult<()> {
     let quorum_size = validator_set.quorum_size();
     let signer_pks = collect_signer_keys(
-        &qc.signers, validator_set, quorum_size, qc.view, CertKind::QC,
+        &qc.signers,
+        validator_set,
+        quorum_size,
+        qc.view,
+        CertKind::QC,
     )?;
 
     // Try prepare (Round 1) message format first (most common path).
     let prepare_msg = signing_message(qc.view, &qc.block_hash);
-    if AggregateSignature::verify_aggregate(&prepare_msg, &qc.aggregate_signature, &signer_pks).is_ok() {
+    if AggregateSignature::verify_aggregate(&prepare_msg, &qc.aggregate_signature, &signer_pks)
+        .is_ok()
+    {
         return Ok(());
     }
 
     // Fall back to commit (Round 2) message format.
     let commit_msg = commit_signing_message(qc.view, &qc.block_hash);
-    AggregateSignature::verify_aggregate(&commit_msg, &qc.aggregate_signature, &signer_pks)
-        .map_err(|_| ConsensusError::InvalidQC {
+    AggregateSignature::verify_aggregate(&commit_msg, &qc.aggregate_signature, &signer_pks).map_err(
+        |_| ConsensusError::InvalidQC {
             view: qc.view,
-            reason: "aggregated signature verification failed (tried both prepare and commit domains)".to_string(),
-        })
+            reason:
+                "aggregated signature verification failed (tried both prepare and commit domains)"
+                    .to_string(),
+        },
+    )
 }
 
 /// Verifies a TimeoutCertificate against the validator set.
 pub fn verify_tc(tc: &TimeoutCertificate, validator_set: &ValidatorSet) -> ConsensusResult<()> {
     let quorum_size = validator_set.quorum_size();
-    let signer_pks = collect_signer_keys(&tc.signers, validator_set, quorum_size, tc.view, CertKind::TC)?;
+    let signer_pks = collect_signer_keys(
+        &tc.signers,
+        validator_set,
+        quorum_size,
+        tc.view,
+        CertKind::TC,
+    )?;
     let message = timeout_signing_message(tc.view);
-    AggregateSignature::verify_aggregate(&message, &tc.aggregate_signature, &signer_pks)
-        .map_err(|_| ConsensusError::InvalidTC {
+    AggregateSignature::verify_aggregate(&message, &tc.aggregate_signature, &signer_pks).map_err(
+        |_| ConsensusError::InvalidTC {
             view: tc.view,
             reason: "aggregated signature verification failed".to_string(),
-        })
+        },
+    )
 }
 
 /// Signing message for Round 1 votes: view (8 bytes LE) || block_hash (32 bytes).
@@ -459,6 +489,7 @@ mod tests {
             .map(|(i, sk)| ValidatorInfo {
                 address: Address::with_last_byte(i as u8),
                 bls_public_key: sk.public_key(),
+                p2p_peer_id: None,
             })
             .collect();
         let f = ((n as u32).saturating_sub(1)) / 3;
@@ -479,7 +510,9 @@ mod tests {
         let msg = signing_message(view, &block_hash);
         for i in 0..3u32 {
             let sig = sks[i as usize].sign(&msg);
-            collector.add_vote(i, sig).expect("adding vote should succeed");
+            collector
+                .add_vote(i, sig)
+                .expect("adding vote should succeed");
         }
 
         assert_eq!(collector.vote_count(), 3);
@@ -496,12 +529,17 @@ mod tests {
         let msg = signing_message(view, &block_hash);
         let sig = sks[0].sign(&msg);
 
-        collector.add_vote(0, sig.clone()).expect("first vote should succeed");
+        collector
+            .add_vote(0, sig.clone())
+            .expect("first vote should succeed");
 
         let result = collector.add_vote(0, sks[0].sign(&msg));
         assert!(result.is_err());
         match result.unwrap_err() {
-            ConsensusError::DuplicateVote { view: v, validator_index: idx } => {
+            ConsensusError::DuplicateVote {
+                view: v,
+                validator_index: idx,
+            } => {
                 assert_eq!(v, view);
                 assert_eq!(idx, 0);
             }
@@ -542,8 +580,7 @@ mod tests {
 
         let msg = signing_message(view, &block_hash);
         let sig = sks[0].sign(&msg);
-        let agg_sig =
-            n42_primitives::bls::AggregateSignature::aggregate(&[&sig]).unwrap();
+        let agg_sig = n42_primitives::bls::AggregateSignature::aggregate(&[&sig]).unwrap();
 
         let qc = QuorumCertificate {
             view,
@@ -638,7 +675,9 @@ mod tests {
         let wrong_msg = signing_message(view, &B256::repeat_byte(0xFF));
         collector.add_vote(3, sks[3].sign(&wrong_msg)).unwrap();
 
-        let qc = collector.build_qc(&vs).expect("QC should form from valid votes");
+        let qc = collector
+            .build_qc(&vs)
+            .expect("QC should form from valid votes");
         assert_eq!(qc.signer_count(), 3);
         assert!(qc.signers[0]);
         assert!(qc.signers[1]);
@@ -661,7 +700,9 @@ mod tests {
 
         let wrong_msg = signing_message(99, &block_hash);
         for i in 2..4u32 {
-            collector.add_vote(i, sks[i as usize].sign(&wrong_msg)).unwrap();
+            collector
+                .add_vote(i, sks[i as usize].sign(&wrong_msg))
+                .unwrap();
         }
 
         let result = collector.build_qc(&vs);
@@ -684,14 +725,20 @@ mod tests {
         let msg = timeout_signing_message(view);
 
         for i in 0..3u32 {
-            collector.add_timeout(i, sks[i as usize].sign(&msg), genesis_qc.clone()).unwrap();
+            collector
+                .add_timeout(i, sks[i as usize].sign(&msg), genesis_qc.clone())
+                .unwrap();
         }
 
         // Invalid timeout: wrong view
         let wrong_msg = timeout_signing_message(999);
-        collector.add_timeout(3, sks[3].sign(&wrong_msg), genesis_qc.clone()).unwrap();
+        collector
+            .add_timeout(3, sks[3].sign(&wrong_msg), genesis_qc.clone())
+            .unwrap();
 
-        let tc = collector.build_tc(&vs).expect("TC should form from valid timeouts");
+        let tc = collector
+            .build_tc(&vs)
+            .expect("TC should form from valid timeouts");
         assert_eq!(tc.signers.iter().filter(|b| **b).count(), 3);
         assert!(tc.signers[0]);
         assert!(tc.signers[1]);
@@ -708,12 +755,16 @@ mod tests {
         let msg = timeout_signing_message(view);
 
         for i in 0..2u32 {
-            collector.add_timeout(i, sks[i as usize].sign(&msg), genesis_qc.clone()).unwrap();
+            collector
+                .add_timeout(i, sks[i as usize].sign(&msg), genesis_qc.clone())
+                .unwrap();
         }
 
         let wrong_msg = timeout_signing_message(999);
         for i in 2..4u32 {
-            collector.add_timeout(i, sks[i as usize].sign(&wrong_msg), genesis_qc.clone()).unwrap();
+            collector
+                .add_timeout(i, sks[i as usize].sign(&wrong_msg), genesis_qc.clone())
+                .unwrap();
         }
 
         let result = collector.build_tc(&vs);
@@ -745,11 +796,15 @@ mod tests {
         let msg = timeout_signing_message(view);
 
         for i in 0..3u32 {
-            collector.add_timeout(i, sks[i as usize].sign(&msg), genesis_qc.clone()).unwrap();
+            collector
+                .add_timeout(i, sks[i as usize].sign(&msg), genesis_qc.clone())
+                .unwrap();
         }
 
         let wrong_msg = timeout_signing_message(999);
-        collector.add_timeout(3, sks[3].sign(&wrong_msg), higher_qc).unwrap();
+        collector
+            .add_timeout(3, sks[3].sign(&wrong_msg), higher_qc)
+            .unwrap();
 
         let tc = collector.build_tc(&vs).expect("TC should form");
         // high_qc should be genesis (view 0), not the invalid timeout's view 5
@@ -835,7 +890,10 @@ mod tests {
         let prepare_qc = collector.build_qc(&vs).unwrap();
 
         let result = verify_commit_qc(&prepare_qc, &vs);
-        assert!(result.is_err(), "verify_commit_qc should reject a PrepareQC");
+        assert!(
+            result.is_err(),
+            "verify_commit_qc should reject a PrepareQC"
+        );
     }
 
     #[test]
@@ -854,7 +912,10 @@ mod tests {
         let result = collector.add_timeout(0, sks[0].sign(&msg), genesis_qc);
         assert!(result.is_err());
         match result.unwrap_err() {
-            ConsensusError::DuplicateVote { view: v, validator_index } => {
+            ConsensusError::DuplicateVote {
+                view: v,
+                validator_index,
+            } => {
                 assert_eq!(v, view);
                 assert_eq!(validator_index, 0);
             }

@@ -11,7 +11,10 @@ use n42_primitives::BlsSecretKey;
 use tracing::{error, info, warn};
 
 #[derive(Parser, Debug)]
-#[command(name = "n42-mobile-sim", about = "N42 mobile phone verification simulator")]
+#[command(
+    name = "n42-mobile-sim",
+    about = "N42 mobile phone verification simulator"
+)]
 struct Args {
     /// Comma-separated StarHub ports (e.g. 9500,9501,9502)
     #[arg(long, value_delimiter = ',')]
@@ -35,8 +38,7 @@ fn deterministic_bls_key(index: usize) -> BlsSecretKey {
 async fn main() -> eyre::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
@@ -101,7 +103,10 @@ async fn run_phone(phone_idx: usize, ports: &[u16], duration_secs: u64) -> eyre:
 
     loop {
         if deadline_reached() {
-            info!(phone = phone_idx, verified_count, "duration reached, stopping");
+            info!(
+                phone = phone_idx,
+                verified_count, "duration reached, stopping"
+            );
             return Ok(());
         }
 
@@ -120,7 +125,10 @@ async fn run_phone(phone_idx: usize, ports: &[u16], duration_secs: u64) -> eyre:
         loop {
             if deadline_reached() {
                 client.close();
-                info!(phone = phone_idx, verified_count, "duration reached, stopping");
+                info!(
+                    phone = phone_idx,
+                    verified_count, "duration reached, stopping"
+                );
                 return Ok(());
             }
 
@@ -130,29 +138,28 @@ async fn run_phone(phone_idx: usize, ports: &[u16], duration_secs: u64) -> eyre:
             }
 
             match client.receive_message(Duration::from_secs(8)).await {
-                Ok(ReceivedMessage::CacheSync(sync_data)) => {
-                    match decode_cache_sync(&sync_data) {
-                        Ok(sync_msg) => {
-                            let added = sync_msg.codes.len();
-                            let evicted = sync_msg.evict_hints.len();
-                            for (hash, code) in &sync_msg.codes {
-                                code_cache.insert(*hash, code.clone());
-                            }
-                            for hash in &sync_msg.evict_hints {
-                                code_cache.remove(hash);
-                            }
-                            info!(
-                                phone = phone_idx,
-                                added, evicted,
-                                cache_size = code_cache.len(),
-                                "cache sync applied"
-                            );
+                Ok(ReceivedMessage::CacheSync(sync_data)) => match decode_cache_sync(&sync_data) {
+                    Ok(sync_msg) => {
+                        let added = sync_msg.codes.len();
+                        let evicted = sync_msg.evict_hints.len();
+                        for (hash, code) in &sync_msg.codes {
+                            code_cache.insert(*hash, code.clone());
                         }
-                        Err(e) => {
-                            warn!(phone = phone_idx, error = %e, "failed to decode cache sync");
+                        for hash in &sync_msg.evict_hints {
+                            code_cache.remove(hash);
                         }
+                        info!(
+                            phone = phone_idx,
+                            added,
+                            evicted,
+                            cache_size = code_cache.len(),
+                            "cache sync applied"
+                        );
                     }
-                }
+                    Err(e) => {
+                        warn!(phone = phone_idx, error = %e, "failed to decode cache sync");
+                    }
+                },
                 Ok(ReceivedMessage::Packet(packet_data)) => {
                     let packet = match decode_stream_packet(&packet_data) {
                         Ok(p) => p,

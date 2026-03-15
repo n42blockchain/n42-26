@@ -1,13 +1,13 @@
-use crate::{state_diff::StateDiff, witness::ExecutionWitness, N42EvmConfig};
+use crate::{N42EvmConfig, state_diff::StateDiff, witness::ExecutionWitness};
+use metrics::histogram;
 use reth_ethereum_primitives::EthPrimitives;
 use reth_evm::{
-    execute::{BlockExecutionError, BlockExecutionOutput, Executor},
     ConfigureEvm, Database,
+    execute::{BlockExecutionError, BlockExecutionOutput, Executor},
 };
 use reth_primitives_traits::{NodePrimitives, RecoveredBlock};
 use std::time::Instant;
 use tracing::{debug, warn};
-use metrics::histogram;
 
 /// Result of block execution with witness data.
 pub struct ExecutionWithWitness {
@@ -59,7 +59,11 @@ pub fn execute_block_with_witness<DB: Database>(
         "execute_block_with_witness complete"
     );
 
-    Ok(ExecutionWithWitness { output, witness, elapsed_ms })
+    Ok(ExecutionWithWitness {
+        output,
+        witness,
+        elapsed_ms,
+    })
 }
 
 /// Executes a block and captures both witness and state diff.
@@ -91,7 +95,8 @@ pub fn execute_block_full<DB: Database>(
             diff = diff.len(),
             "witness accounts < diff accounts"
         );
-        histogram!("n42_execution_witness_gap").record((diff.len() - witness.hashed_state.accounts.len()) as f64);
+        histogram!("n42_execution_witness_gap")
+            .record((diff.len() - witness.hashed_state.accounts.len()) as f64);
     }
 
     let elapsed_ms = start.elapsed().as_millis() as u64;

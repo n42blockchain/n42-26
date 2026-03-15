@@ -10,8 +10,8 @@ use n42_execution::N42EvmConfig;
 use reth_chainspec::ChainSpec;
 use reth_ethereum_primitives::{EthPrimitives, Receipt};
 use reth_evm::{
-    execute::{BlockExecutionError, Executor},
     ConfigureEvm,
+    execute::{BlockExecutionError, Executor},
 };
 use reth_primitives_traits::{NodePrimitives, RecoveredBlock, SealedBlock, SealedHeader};
 use reth_revm::cached::CachedReads;
@@ -125,8 +125,11 @@ fn build_cached_reads(
 ) -> Result<CachedReads, VerifyError> {
     let mut cached = CachedReads::default();
 
-    let uncached_map: HashMap<&B256, &alloy_primitives::Bytes> =
-        packet.uncached_bytecodes.iter().map(|(h, b)| (h, b)).collect();
+    let uncached_map: HashMap<&B256, &alloy_primitives::Bytes> = packet
+        .uncached_bytecodes
+        .iter()
+        .map(|(h, b)| (h, b))
+        .collect();
 
     for wa in &packet.witness_accounts {
         let bytecode = if wa.code_hash == KECCAK256_EMPTY {
@@ -242,7 +245,14 @@ impl<'a> StreamReplayDB<'a> {
         code_cache: &'a mut CodeCache,
     ) -> Self {
         let (entry_count, pos) = parse_stream_header(&data);
-        Self { data, pos, entries_consumed: 0, entry_count, bytecodes, code_cache: Some(code_cache) }
+        Self {
+            data,
+            pos,
+            entries_consumed: 0,
+            entry_count,
+            bytecodes,
+            code_cache: Some(code_cache),
+        }
     }
 
     /// Creates a replay DB without a code cache fallback.
@@ -250,7 +260,14 @@ impl<'a> StreamReplayDB<'a> {
     /// Use when all needed bytecodes are already in the `bytecodes` map.
     pub fn new_without_cache(data: Vec<u8>, bytecodes: HashMap<B256, Bytecode>) -> Self {
         let (entry_count, pos) = parse_stream_header(&data);
-        Self { data, pos, entries_consumed: 0, entry_count, bytecodes, code_cache: None }
+        Self {
+            data,
+            pos,
+            entries_consumed: 0,
+            entry_count,
+            bytecodes,
+            code_cache: None,
+        }
     }
 
     /// Returns the number of entries consumed so far.
@@ -289,7 +306,11 @@ impl revm::database_interface::Database for StreamReplayDB<'_> {
             return Err(StreamDbError::UnexpectedEntry {
                 cursor,
                 expected: "Account",
-                actual: if header <= HEADER_STORAGE_BASE + 32 { "Storage" } else { "BlockHash" },
+                actual: if header <= HEADER_STORAGE_BASE + 32 {
+                    "Storage"
+                } else {
+                    "BlockHash"
+                },
             });
         }
 
@@ -348,7 +369,13 @@ impl revm::database_interface::Database for StreamReplayDB<'_> {
             KECCAK256_EMPTY
         };
 
-        Ok(Some(AccountInfo { nonce, balance, code_hash, account_id: None, code: None }))
+        Ok(Some(AccountInfo {
+            nonce,
+            balance,
+            code_hash,
+            account_id: None,
+            code: None,
+        }))
     }
 
     fn code_by_hash(&mut self, code_hash: B256) -> Result<Bytecode, Self::Error> {
@@ -380,7 +407,11 @@ impl revm::database_interface::Database for StreamReplayDB<'_> {
             return Err(StreamDbError::UnexpectedEntry {
                 cursor,
                 expected: "Storage",
-                actual: if header < HEADER_STORAGE_BASE { "Account" } else { "BlockHash" },
+                actual: if header < HEADER_STORAGE_BASE {
+                    "Account"
+                } else {
+                    "BlockHash"
+                },
             });
         }
 
@@ -445,7 +476,9 @@ pub fn verify_block_stream(
         .collect();
 
     let db = StreamReplayDB::new(packet.read_log_data.clone(), bytecodes_map, code_cache);
-    let result = N42EvmConfig::new(chain_spec).executor(db).execute_one(&recovered)?;
+    let result = N42EvmConfig::new(chain_spec)
+        .executor(db)
+        .execute_one(&recovered)?;
     let computed = Receipt::calculate_receipt_root_no_memo(&result.receipts);
 
     Ok(VerificationResult {
@@ -458,7 +491,7 @@ mod tests {
     use super::*;
     use crate::packet::WitnessAccount;
     use alloy_consensus::Header;
-    use alloy_primitives::{keccak256, Address, Bytes, U256, KECCAK256_EMPTY};
+    use alloy_primitives::{Address, Bytes, KECCAK256_EMPTY, U256, keccak256};
     use alloy_rlp::Encodable;
 
     fn make_sealed_header() -> (Header, Bytes, B256) {
@@ -582,7 +615,10 @@ mod tests {
         let mut cache = CodeCache::new(10);
         let chain_spec = n42_chainspec::n42_dev_chainspec();
         let result = verify_block(&packet, &mut cache, chain_spec);
-        assert!(matches!(result, Err(VerifyError::HeaderHashMismatch { .. })));
+        assert!(matches!(
+            result,
+            Err(VerifyError::HeaderHashMismatch { .. })
+        ));
     }
 
     #[test]
@@ -635,7 +671,10 @@ mod tests {
             code_hash: KECCAK256_EMPTY,
         }]);
         let mut db = StreamReplayDB::new_without_cache(data, HashMap::new());
-        let info = db.basic(Address::ZERO).unwrap().expect("should return Some");
+        let info = db
+            .basic(Address::ZERO)
+            .unwrap()
+            .expect("should return Some");
         assert_eq!(info.nonce, 10);
         assert_eq!(info.balance, U256::from(5000u64));
         assert_eq!(info.code_hash, KECCAK256_EMPTY);
@@ -661,7 +700,10 @@ mod tests {
 
         let data = encode_entries(&[ReadLogEntry::Storage(U256::from(42u64))]);
         let mut db = StreamReplayDB::new_without_cache(data, HashMap::new());
-        assert_eq!(db.storage(Address::ZERO, U256::ZERO).unwrap(), U256::from(42u64));
+        assert_eq!(
+            db.storage(Address::ZERO, U256::ZERO).unwrap(),
+            U256::from(42u64)
+        );
         assert!(db.is_exhausted());
     }
 
@@ -684,7 +726,10 @@ mod tests {
 
         let data = encode_read_log(&[]);
         let mut db = StreamReplayDB::new_without_cache(data, HashMap::new());
-        assert!(matches!(db.basic(Address::ZERO), Err(StreamDbError::Exhausted(0))));
+        assert!(matches!(
+            db.basic(Address::ZERO),
+            Err(StreamDbError::Exhausted(0))
+        ));
     }
 
     #[test]
@@ -694,7 +739,10 @@ mod tests {
 
         let data = encode_entries(&[ReadLogEntry::Storage(U256::ZERO)]);
         let mut db = StreamReplayDB::new_without_cache(data, HashMap::new());
-        assert!(matches!(db.basic(Address::ZERO), Err(StreamDbError::UnexpectedEntry { .. })));
+        assert!(matches!(
+            db.basic(Address::ZERO),
+            Err(StreamDbError::UnexpectedEntry { .. })
+        ));
     }
 
     #[test]
@@ -719,7 +767,11 @@ mod tests {
         use revm::database_interface::Database;
 
         let data = encode_entries(&[
-            ReadLogEntry::Account { nonce: 1, balance: U256::from(100u64), code_hash: KECCAK256_EMPTY },
+            ReadLogEntry::Account {
+                nonce: 1,
+                balance: U256::from(100u64),
+                code_hash: KECCAK256_EMPTY,
+            },
             ReadLogEntry::Storage(U256::from(42u64)),
             ReadLogEntry::AccountNotFound,
             ReadLogEntry::BlockHash(B256::from([0xBB; 32])),
@@ -727,7 +779,10 @@ mod tests {
         let mut db = StreamReplayDB::new_without_cache(data, HashMap::new());
 
         assert_eq!(db.basic(Address::ZERO).unwrap().unwrap().nonce, 1);
-        assert_eq!(db.storage(Address::ZERO, U256::ZERO).unwrap(), U256::from(42u64));
+        assert_eq!(
+            db.storage(Address::ZERO, U256::ZERO).unwrap(),
+            U256::from(42u64)
+        );
         assert!(db.basic(Address::ZERO).unwrap().is_none());
         assert_eq!(db.block_hash(0).unwrap(), B256::from([0xBB; 32]));
         assert!(db.is_exhausted());
@@ -747,7 +802,10 @@ mod tests {
         let mut cache = CodeCache::new(10);
         let chain_spec = n42_chainspec::n42_dev_chainspec();
         let result = verify_block_stream(&packet, &mut cache, chain_spec);
-        assert!(matches!(result, Err(VerifyError::HeaderHashMismatch { .. })));
+        assert!(matches!(
+            result,
+            Err(VerifyError::HeaderHashMismatch { .. })
+        ));
     }
 
     #[test]
@@ -818,7 +876,10 @@ mod tests {
             code_hash,
         }]);
         let mut db = StreamReplayDB::new_without_cache(data, HashMap::new());
-        let info = db.basic(Address::ZERO).unwrap().expect("should return Some");
+        let info = db
+            .basic(Address::ZERO)
+            .unwrap()
+            .expect("should return Some");
         assert_eq!(info.nonce, 1);
         assert_eq!(info.balance, U256::from(5000u64));
         assert_eq!(info.code_hash, code_hash);
@@ -849,7 +910,9 @@ mod tests {
         let missing_hash = B256::from([0xDD; 32]);
         let data = encode_read_log(&[]);
         let mut db = StreamReplayDB::new_without_cache(data, HashMap::new());
-        assert!(matches!(db.code_by_hash(missing_hash), Err(StreamDbError::MissingCode(h)) if h == missing_hash));
+        assert!(
+            matches!(db.code_by_hash(missing_hash), Err(StreamDbError::MissingCode(h)) if h == missing_hash)
+        );
     }
 
     #[test]
@@ -892,7 +955,11 @@ mod tests {
         let mut db = StreamReplayDB::new_without_cache(data, HashMap::new());
         assert!(matches!(
             db.storage(Address::ZERO, U256::ZERO),
-            Err(StreamDbError::UnexpectedEntry { expected: "Storage", actual: "Account", .. })
+            Err(StreamDbError::UnexpectedEntry {
+                expected: "Storage",
+                actual: "Account",
+                ..
+            })
         ));
     }
 
@@ -905,7 +972,11 @@ mod tests {
         let mut db = StreamReplayDB::new_without_cache(data, HashMap::new());
         assert!(matches!(
             db.storage(Address::ZERO, U256::ZERO),
-            Err(StreamDbError::UnexpectedEntry { expected: "Storage", actual: "BlockHash", .. })
+            Err(StreamDbError::UnexpectedEntry {
+                expected: "Storage",
+                actual: "BlockHash",
+                ..
+            })
         ));
     }
 
@@ -918,7 +989,11 @@ mod tests {
         let mut db = StreamReplayDB::new_without_cache(data, HashMap::new());
         assert!(matches!(
             db.block_hash(0),
-            Err(StreamDbError::UnexpectedEntry { expected: "BlockHash", actual: "Account", .. })
+            Err(StreamDbError::UnexpectedEntry {
+                expected: "BlockHash",
+                actual: "Account",
+                ..
+            })
         ));
     }
 
@@ -931,7 +1006,11 @@ mod tests {
         let mut db = StreamReplayDB::new_without_cache(data, HashMap::new());
         assert!(matches!(
             db.block_hash(0),
-            Err(StreamDbError::UnexpectedEntry { expected: "BlockHash", actual: "Storage", .. })
+            Err(StreamDbError::UnexpectedEntry {
+                expected: "BlockHash",
+                actual: "Storage",
+                ..
+            })
         ));
     }
 
@@ -949,8 +1028,8 @@ mod tests {
         use revm::database_interface::Database;
 
         let mut data = vec![0x01, 0x00, 0x00, 0x00]; // entry_count = 1
-        let header = n42_execution::read_log::ACCT_EXISTS_BIT
-            | n42_execution::read_log::ACCT_BALANCE_BIT;
+        let header =
+            n42_execution::read_log::ACCT_EXISTS_BIT | n42_execution::read_log::ACCT_BALANCE_BIT;
         data.push(header);
         data.push(33); // balance_len = 33 (invalid)
         data.extend_from_slice(&[0xFF; 33]);

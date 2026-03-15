@@ -1,7 +1,7 @@
-mod set;
-mod selection;
 pub mod epoch;
+mod selection;
+mod set;
 
-pub use set::ValidatorSet;
-pub use selection::LeaderSelector;
 pub use epoch::EpochManager;
+pub use selection::LeaderSelector;
+pub use set::ValidatorSet;

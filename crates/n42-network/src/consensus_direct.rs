@@ -1,6 +1,6 @@
 use futures::prelude::*;
-use libp2p::request_response;
 use libp2p::StreamProtocol;
+use libp2p::request_response;
 use serde::{Deserialize, Serialize};
 use std::io;
 
@@ -82,7 +82,9 @@ impl request_response::Codec for ConsensusDirectCodec {
         'life2: 'async_trait,
         Self: 'async_trait,
     {
-        Box::pin(async move { codec::write_length_prefixed(io, &req, MAX_CONSENSUS_DIRECT_SIZE).await })
+        Box::pin(
+            async move { codec::write_length_prefixed(io, &req, MAX_CONSENSUS_DIRECT_SIZE).await },
+        )
     }
 
     fn write_response<'life0, 'life1, 'life2, 'async_trait, T>(
@@ -98,7 +100,9 @@ impl request_response::Codec for ConsensusDirectCodec {
         'life2: 'async_trait,
         Self: 'async_trait,
     {
-        Box::pin(async move { codec::write_length_prefixed(io, &res, MAX_CONSENSUS_DIRECT_SIZE).await })
+        Box::pin(
+            async move { codec::write_length_prefixed(io, &res, MAX_CONSENSUS_DIRECT_SIZE).await },
+        )
     }
 }
 
@@ -145,7 +149,9 @@ mod tests {
     async fn test_codec_write_read_request_roundtrip() {
         let req = sample_request();
         let mut buf = futures::io::Cursor::new(Vec::new());
-        codec::write_length_prefixed(&mut buf, &req, MAX_CONSENSUS_DIRECT_SIZE).await.unwrap();
+        codec::write_length_prefixed(&mut buf, &req, MAX_CONSENSUS_DIRECT_SIZE)
+            .await
+            .unwrap();
 
         let data = buf.into_inner();
         let len = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
@@ -163,7 +169,9 @@ mod tests {
     async fn test_codec_write_read_response_roundtrip() {
         let resp = sample_response_accepted();
         let mut buf = futures::io::Cursor::new(Vec::new());
-        codec::write_length_prefixed(&mut buf, &resp, MAX_CONSENSUS_DIRECT_SIZE).await.unwrap();
+        codec::write_length_prefixed(&mut buf, &resp, MAX_CONSENSUS_DIRECT_SIZE)
+            .await
+            .unwrap();
 
         let data = buf.into_inner();
         let mut reader = futures::io::Cursor::new(data);

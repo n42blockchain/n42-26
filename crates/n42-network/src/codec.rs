@@ -30,8 +30,8 @@ where
     T: AsyncWrite + Unpin + Send,
     M: serde::Serialize,
 {
-    let data = bincode::serialize(msg)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let data =
+        bincode::serialize(msg).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     if data.len() > max_size {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,

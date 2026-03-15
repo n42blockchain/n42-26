@@ -120,12 +120,15 @@ impl MobileRewardManager {
         let unstaked_ratio = self.unstaked_reward_ratio;
         let mut added = 0usize;
         for (pubkey, count) in entries.iter().take(remaining_capacity) {
-            let base_reward_gwei = compute_log_reward_inner(
-                *count, blocks_per_epoch, daily_base_reward_gwei, curve_k,
-            );
+            let base_reward_gwei =
+                compute_log_reward_inner(*count, blocks_per_epoch, daily_base_reward_gwei, curve_k);
 
             // Apply staking multiplier: 100% for staked, unstaked_reward_ratio for others
-            let multiplier = if staked_pubkeys.contains(pubkey) { 1.0 } else { unstaked_ratio };
+            let multiplier = if staked_pubkeys.contains(pubkey) {
+                1.0
+            } else {
+                unstaked_ratio
+            };
             let reward_gwei = (base_reward_gwei as f64 * multiplier) as u64;
 
             if reward_gwei == 0 {
@@ -560,14 +563,23 @@ mod tests {
     #[test]
     fn test_log_reward_full_epoch() {
         // n == N → ratio = 1.0 → full reward
-        assert_eq!(compute_log_reward_inner(21600, 21600, 100_000_000, 4.0), 100_000_000);
+        assert_eq!(
+            compute_log_reward_inner(21600, 21600, 100_000_000, 4.0),
+            100_000_000
+        );
     }
 
     #[test]
     fn test_log_reward_capped_at_max() {
         // n > N should be capped to N, yielding exactly R_max
-        assert_eq!(compute_log_reward_inner(50000, 21600, 100_000_000, 4.0), 100_000_000);
-        assert_eq!(compute_log_reward_inner(u64::MAX, 21600, 100_000_000, 4.0), 100_000_000);
+        assert_eq!(
+            compute_log_reward_inner(50000, 21600, 100_000_000, 4.0),
+            100_000_000
+        );
+        assert_eq!(
+            compute_log_reward_inner(u64::MAX, 21600, 100_000_000, 4.0),
+            100_000_000
+        );
     }
 
     #[test]
@@ -581,7 +593,9 @@ mod tests {
         assert!(
             reward >= expected_min && reward <= expected_max,
             "5-min reward {} should be ~50% of 100M (between {} and {})",
-            reward, expected_min, expected_max
+            reward,
+            expected_min,
+            expected_max
         );
     }
 
@@ -596,7 +610,9 @@ mod tests {
         assert!(
             reward >= expected_min && reward <= expected_max,
             "1-hour reward {} should be ~72% of 100M (between {} and {})",
-            reward, expected_min, expected_max
+            reward,
+            expected_min,
+            expected_max
         );
     }
 
@@ -608,7 +624,9 @@ mod tests {
             assert!(
                 reward > prev,
                 "reward({}) = {} should be > reward at previous step = {}",
-                n, reward, prev
+                n,
+                reward,
+                prev
             );
             prev = reward;
         }
@@ -624,7 +642,8 @@ mod tests {
         assert!(
             first_segment > second_segment,
             "first 75 blocks gain ({}) should exceed next 75 blocks gain ({})",
-            first_segment, second_segment
+            first_segment,
+            second_segment
         );
     }
 
@@ -649,7 +668,10 @@ mod tests {
         let over_max = compute_log_reward_inner(epoch * 100, epoch, r_max, 4.0);
 
         assert_eq!(at_max, r_max, "n==N should yield exactly R_max");
-        assert_eq!(over_max, r_max, "n>>N should also yield exactly R_max (capped)");
+        assert_eq!(
+            over_max, r_max,
+            "n>>N should also yield exactly R_max (capped)"
+        );
     }
 
     #[test]

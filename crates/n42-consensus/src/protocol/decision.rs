@@ -1,7 +1,7 @@
 use n42_primitives::consensus::Decide;
 
-use crate::error::{ConsensusError, ConsensusResult};
 use super::state_machine::{ConsensusEngine, EngineOutput};
+use crate::error::{ConsensusError, ConsensusResult};
 
 impl ConsensusEngine {
     /// Processes a Decide message from the leader.
@@ -81,6 +81,8 @@ impl ConsensusEngine {
         // Notify the orchestrator that the view has advanced so the next leader
         // can start building immediately instead of waiting for a pacemaker timeout.
         let actual_view = self.round_state.current_view();
-        self.emit(EngineOutput::ViewChanged { new_view: actual_view })
+        self.emit(EngineOutput::ViewChanged {
+            new_view: actual_view,
+        })
     }
 }

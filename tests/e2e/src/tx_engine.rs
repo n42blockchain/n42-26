@@ -26,8 +26,8 @@ impl TxEngine {
         let wallets = accounts
             .iter()
             .map(|acc| {
-                let signer = PrivateKeySigner::from_bytes(&acc.private_key)
-                    .expect("valid private key");
+                let signer =
+                    PrivateKeySigner::from_bytes(&acc.private_key).expect("valid private key");
                 Wallet {
                     address: signer.address(),
                     signer,
@@ -172,7 +172,10 @@ impl TxEngine {
         let mut tx_hashes = Vec::with_capacity(total_tx as usize);
         let wallet_count = self.wallets.len();
 
-        info!(total_tx, tx_per_second, duration_secs, "starting transfer batch");
+        info!(
+            total_tx,
+            tx_per_second, duration_secs, "starting transfer batch"
+        );
 
         for i in 0..total_tx {
             let from_idx = (i as usize) % wallet_count;
@@ -180,7 +183,9 @@ impl TxEngine {
             let to_addr = self.wallets[to_idx].address;
 
             // Random transfer amount: 0.01 to 1 N42 (in wei).
-            let amount = U256::from(rand::random::<u64>() % 990_000_000_000_000_000 + 10_000_000_000_000_000);
+            let amount = U256::from(
+                rand::random::<u64>() % 990_000_000_000_000_000 + 10_000_000_000_000_000,
+            );
 
             let (tx_hash, raw_tx) = self.build_transfer(
                 from_idx,
@@ -215,14 +220,23 @@ impl TxEngine {
         let start = tokio::time::Instant::now();
 
         for (i, hash) in tx_hashes.iter().enumerate() {
-            let remaining = timeout.checked_sub(start.elapsed())
-                .ok_or_else(|| eyre::eyre!("timeout waiting for receipts ({}/{} received)", i, tx_hashes.len()))?;
+            let remaining = timeout.checked_sub(start.elapsed()).ok_or_else(|| {
+                eyre::eyre!(
+                    "timeout waiting for receipts ({}/{} received)",
+                    i,
+                    tx_hashes.len()
+                )
+            })?;
 
             let receipt = rpc.wait_for_receipt(*hash, remaining).await?;
             receipts.push(receipt);
 
             if (i + 1) % 100 == 0 {
-                info!(confirmed = i + 1, total = tx_hashes.len(), "receipt progress");
+                info!(
+                    confirmed = i + 1,
+                    total = tx_hashes.len(),
+                    "receipt progress"
+                );
             }
         }
 

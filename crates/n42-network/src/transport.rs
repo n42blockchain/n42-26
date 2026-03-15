@@ -2,13 +2,15 @@ use libp2p::gossipsub::{self, PeerScoreParams, PeerScoreThresholds, TopicScorePa
 use libp2p::identity::Keypair;
 use libp2p::swarm::NetworkBehaviour;
 use libp2p::swarm::behaviour::toggle::Toggle;
-use libp2p::Swarm;
+use libp2p::{PeerId, Swarm};
 use std::time::Duration;
 
 use crate::block_direct::BlockDirectCodec;
 use crate::consensus_direct::ConsensusDirectCodec;
 use crate::gossipsub::message_id_fn;
-use crate::gossipsub::topics::{blob_sidecar_topic, block_announce_topic, consensus_topic, mempool_topic};
+use crate::gossipsub::topics::{
+    blob_sidecar_topic, block_announce_topic, consensus_topic, mempool_topic,
+};
 use crate::state_sync::StateSyncCodec;
 use crate::tx_forward::TxForwardCodec;
 
@@ -73,7 +75,8 @@ impl TransportConfig {
         let mesh_d_low = 6.min(max_peers);
         let mesh_d_high = 12.min(max_peers).max(mesh_d);
         let mesh_outbound_min =
-            2.min(mesh_d / 2).min(if mesh_d_low > 0 { mesh_d_low - 1 } else { 0 });
+            2.min(mesh_d / 2)
+                .min(if mesh_d_low > 0 { mesh_d_low - 1 } else { 0 });
 
         Self {
             heartbeat_interval: Duration::from_secs(1),
@@ -116,6 +119,24 @@ impl Default for TransportConfig {
 /// Uses QUIC for low-latency encrypted transport (TLS 1.3 built-in).
 pub fn build_swarm(keypair: Keypair, config: TransportConfig) -> eyre::Result<Swarm<N42Behaviour>> {
     build_swarm_with_validator_index(keypair, config, None)
+}
+
+/// Derives the deterministic libp2p keypair currently used for validator P2P identities.
+pub fn deterministic_validator_keypair(index: u32) -> eyre::Result<Keypair> {
+    let seed = alloy_primitives::keccak256(format!("n42-p2p-key-{index}").as_bytes());
+    let mut seed_bytes: [u8; 32] = seed.0;
+    let secret = libp2p::identity::ed25519::SecretKey::try_from_bytes(&mut seed_bytes)
+        .map_err(|error| eyre::eyre!("failed to derive deterministic ed25519 key: {error}"))?;
+    Ok(Keypair::from(libp2p::identity::ed25519::Keypair::from(
+        secret,
+    )))
+}
+
+/// Returns the deterministic PeerId currently assigned to a validator index.
+pub fn deterministic_validator_peer_id(index: u32) -> eyre::Result<PeerId> {
+    Ok(deterministic_validator_keypair(index)?
+        .public()
+        .to_peer_id())
 }
 
 /// Builds the swarm with an optional validator index for directed messaging.
@@ -420,13 +441,13 @@ mod tests {
         // Small network: uses default minimums.
         let small = TransportConfig::for_network_size(3);
         assert_eq!(small.max_established_incoming, 128); // max(128, 2+16) = 128
-        assert_eq!(small.max_established_outgoing, 64);  // max(64, 2+16) = 64
-        assert_eq!(small.max_established_total, 192);    // max(192, (2+16)*2) = 192
+        assert_eq!(small.max_established_outgoing, 64); // max(64, 2+16) = 64
+        assert_eq!(small.max_established_total, 192); // max(192, (2+16)*2) = 192
 
         // Large network: scales up beyond defaults.
         let large = TransportConfig::for_network_size(500);
-        assert_eq!(large.max_established_incoming, 499 + 16);  // max(128, 499+16) = 515
-        assert_eq!(large.max_established_outgoing, 499 + 16);  // max(64, 499+16) = 515
+        assert_eq!(large.max_established_incoming, 499 + 16); // max(128, 499+16) = 515
+        assert_eq!(large.max_established_outgoing, 499 + 16); // max(64, 499+16) = 515
         assert_eq!(large.max_established_total, (499 + 16) * 2); // max(192, 515*2) = 1030
     }
 }

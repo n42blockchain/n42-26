@@ -7,20 +7,16 @@
 //! 4. Both sides produce identical receipts → receipts_root match proves correctness
 
 use alloy_consensus::{Header, TxLegacy};
-use alloy_primitives::{keccak256, Address, Bytes, TxKind, B256, U256};
-use n42_execution::read_log::{encode_read_log, ReadLogDatabase};
+use alloy_primitives::{Address, B256, Bytes, TxKind, U256, keccak256};
+use n42_execution::read_log::{ReadLogDatabase, encode_read_log};
 use n42_mobile::verifier::StreamReplayDB;
 use reth_chainspec::{ChainSpecBuilder, EthereumHardfork, ForkCondition, MAINNET};
 use reth_ethereum_primitives::{Block, BlockBody, Receipt, Transaction};
 use reth_evm::execute::{BasicBlockExecutor, Executor};
 use reth_evm_ethereum::EthEvmConfig;
-use reth_primitives_traits::{crypto::secp256k1::public_key_to_address, RecoveredBlock};
+use reth_primitives_traits::{RecoveredBlock, crypto::secp256k1::public_key_to_address};
 use reth_testing_utils::generators::{self, sign_tx_with_key_pair};
-use revm::{
-    bytecode::Bytecode,
-    database::CacheDB,
-    state::AccountInfo,
-};
+use revm::{bytecode::Bytecode, database::CacheDB, state::AccountInfo};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -33,29 +29,35 @@ fn minimal_erc20_bytecode() -> Bytes {
     code.extend_from_slice(&[0x5F, 0x35, 0x60, 0xE0, 0x1C, 0x80]);
 
     let transfer_jump_pos = code.len() + 1;
-    code.extend_from_slice(&[0x63, 0xa9, 0x05, 0x9c, 0xbb, 0x14, 0x61, 0x00, 0x00, 0x57, 0x80]);
+    code.extend_from_slice(&[
+        0x63, 0xa9, 0x05, 0x9c, 0xbb, 0x14, 0x61, 0x00, 0x00, 0x57, 0x80,
+    ]);
 
     let balanceof_jump_pos = code.len() + 1;
-    code.extend_from_slice(&[0x63, 0x70, 0xa0, 0x82, 0x31, 0x14, 0x61, 0x00, 0x00, 0x57, 0x00]);
+    code.extend_from_slice(&[
+        0x63, 0x70, 0xa0, 0x82, 0x31, 0x14, 0x61, 0x00, 0x00, 0x57, 0x00,
+    ]);
 
     // transfer(address to, uint256 amount)
     let transfer_offset = code.len();
     code.extend_from_slice(&[
-        0x5B, 0x50, 0x33, 0x5F, 0x52, 0x5F, 0x60, 0x20, 0x52, 0x60, 0x40, 0x5F, 0x20,
-        0x80, 0x54, 0x60, 0x24, 0x35, 0x80, 0x82, 0x10,
+        0x5B, 0x50, 0x33, 0x5F, 0x52, 0x5F, 0x60, 0x20, 0x52, 0x60, 0x40, 0x5F, 0x20, 0x80, 0x54,
+        0x60, 0x24, 0x35, 0x80, 0x82, 0x10,
     ]);
 
     let revert_jump_pos = code.len() + 1;
     code.extend_from_slice(&[0x61, 0x00, 0x00, 0x57, 0x90, 0x03, 0x90, 0x55]);
     code.extend_from_slice(&[0x60, 0x04, 0x35, 0x5F, 0x52, 0x5F, 0x60, 0x20, 0x52]);
-    code.extend_from_slice(&[0x60, 0x40, 0x5F, 0x20, 0x80, 0x54, 0x60, 0x24, 0x35, 0x01, 0x90, 0x55]);
+    code.extend_from_slice(&[
+        0x60, 0x40, 0x5F, 0x20, 0x80, 0x54, 0x60, 0x24, 0x35, 0x01, 0x90, 0x55,
+    ]);
     code.extend_from_slice(&[0x60, 0x01, 0x5F, 0x52, 0x60, 0x20, 0x5F, 0xF3]);
 
     // balanceOf(address)
     let balanceof_offset = code.len();
     code.extend_from_slice(&[
-        0x5B, 0x50, 0x60, 0x04, 0x35, 0x5F, 0x52, 0x5F, 0x60, 0x20, 0x52,
-        0x60, 0x40, 0x5F, 0x20, 0x54, 0x5F, 0x52, 0x60, 0x20, 0x5F, 0xF3,
+        0x5B, 0x50, 0x60, 0x04, 0x35, 0x5F, 0x52, 0x5F, 0x60, 0x20, 0x52, 0x60, 0x40, 0x5F, 0x20,
+        0x54, 0x5F, 0x52, 0x60, 0x20, 0x5F, 0xF3,
     ]);
 
     // revert label
@@ -139,7 +141,9 @@ fn run_pipeline_test(
         senders.clone(),
     );
 
-    let idc_result = idc_executor.execute_one(&block).expect("IDC execution should succeed");
+    let idc_result = idc_executor
+        .execute_one(&block)
+        .expect("IDC execution should succeed");
 
     // Extract read log and captured codes
     let read_log = match Arc::try_unwrap(log_handle) {
@@ -447,12 +451,7 @@ fn test_v2_pipeline_mixed_block() {
         ..Header::default()
     };
 
-    run_pipeline_test(
-        db,
-        header,
-        vec![tx1, tx2],
-        vec![sender_a, sender_b],
-    );
+    run_pipeline_test(db, header, vec![tx1, tx2], vec![sender_a, sender_b]);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -467,7 +466,7 @@ fn test_v2_pipeline_mixed_block() {
 use alloy_eips::Encodable2718;
 use alloy_rlp::Encodable;
 use n42_mobile::code_cache::CodeCache;
-use n42_mobile::packet::{encode_stream_packet, decode_stream_packet, StreamPacket};
+use n42_mobile::packet::{StreamPacket, decode_stream_packet, encode_stream_packet};
 use n42_mobile::verifier::verify_block_stream;
 use reth_primitives_traits::SealedHeader;
 
@@ -504,8 +503,7 @@ fn run_full_v2_packet_test(
             senders.clone(),
         );
 
-        let mut executor =
-            BasicBlockExecutor::new(evm_config.clone(), base_db.clone());
+        let mut executor = BasicBlockExecutor::new(evm_config.clone(), base_db.clone());
         let result = executor
             .execute_one(&block)
             .expect("pre-execution should succeed");
@@ -531,11 +529,16 @@ fn run_full_v2_packet_test(
     );
 
     let mut idc_executor = BasicBlockExecutor::new(evm_config, logged_db);
-    let idc_result = idc_executor.execute_one(&block).expect("IDC execution should succeed");
+    let idc_result = idc_executor
+        .execute_one(&block)
+        .expect("IDC execution should succeed");
     let idc_root = Receipt::calculate_receipt_root_no_memo(&idc_result.receipts);
 
     // Verify our pre-computed root matches
-    assert_eq!(idc_root, header.receipts_root, "pre-computed receipts_root must match");
+    assert_eq!(
+        idc_root, header.receipts_root,
+        "pre-computed receipts_root must match"
+    );
 
     // Extract read log and captured codes
     let read_log = match Arc::try_unwrap(log_handle) {
@@ -587,7 +590,11 @@ fn run_full_v2_packet_test(
     eprintln!("  Encoded size:     {} bytes", encoded.len());
 
     // Verify wire header magic
-    assert_eq!(&encoded[0..2], &[0x4E, 0x32], "wire header magic must be 'N2'");
+    assert_eq!(
+        &encoded[0..2],
+        &[0x4E, 0x32],
+        "wire header magic must be 'N2'"
+    );
     assert_eq!(encoded[2], 0x01, "wire header version must be 1");
 
     // ── Step 4: zstd compress (simulating network transit) ──
@@ -626,9 +633,7 @@ fn run_full_v2_packet_test(
     );
 
     // Verify header_info convenience method
-    let (block_number, receipts_root) = decoded
-        .header_info()
-        .expect("header_info should succeed");
+    let (block_number, receipts_root) = decoded.header_info().expect("header_info should succeed");
     eprintln!("  Block number:     {}", block_number);
     eprintln!("  Receipts root:    {:#x}", receipts_root);
 

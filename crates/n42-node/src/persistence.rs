@@ -1,4 +1,5 @@
 use n42_chainspec::ValidatorInfo;
+use n42_consensus::ValidatorSet;
 use n42_primitives::consensus::QuorumCertificate;
 use serde::{Deserialize, Serialize};
 use std::io;
@@ -79,6 +80,38 @@ impl ConsensusSnapshot {
                 "last_committed_qc.view ({}) > locked_qc.view ({})",
                 self.last_committed_qc.view, self.locked_qc.view
             ));
+        }
+        if let Some((target_epoch, validators, fault_tolerance)) = &self.scheduled_epoch_transition
+        {
+            if *target_epoch == 0 {
+                return Err("scheduled_epoch_transition target epoch must be > 0".to_string());
+            }
+            if validators.is_empty() {
+                return Err("scheduled_epoch_transition has empty validator set".to_string());
+            }
+            ValidatorSet::validate_params(validators.len(), *fault_tolerance)
+                .map_err(|e| format!("scheduled_epoch_transition invalid: {e}"))?;
+            let peer_id_presence = validators
+                .iter()
+                .filter(|validator| validator.p2p_peer_id.is_some())
+                .count();
+            if peer_id_presence != 0 && peer_id_presence != validators.len() {
+                return Err(
+                    "scheduled_epoch_transition must either define p2p_peer_id for all validators or omit it for all"
+                        .to_string(),
+                );
+            }
+            let mut seen_peer_ids = std::collections::HashSet::new();
+            for validator in validators {
+                if let Some(peer_id) = validator.parsed_p2p_peer_id().map_err(|error| {
+                    format!("scheduled_epoch_transition has invalid p2p_peer_id: {error}")
+                })? && !seen_peer_ids.insert(peer_id)
+                {
+                    return Err(format!(
+                        "scheduled_epoch_transition has duplicate validator p2p_peer_id: {peer_id}"
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -173,7 +206,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let path = dir.join("consensus_state.json");
 
-        let snapshot = ConsensusSnapshot { consecutive_timeouts: 3, ..genesis_snapshot(42) };
+        let snapshot = ConsensusSnapshot {
+            consecutive_timeouts: 3,
+            ..genesis_snapshot(42)
+        };
         save_consensus_state(&path, &snapshot).expect("save should succeed");
         assert!(path.exists());
 
@@ -289,10 +325,33 @@ mod tests {
         std::fs::write(&path, json).unwrap();
 
         let result = load_consensus_state(&path);
-        assert!(result.is_err(), "load_consensus_state must reject a snapshot that fails validation");
+        assert!(
+            result.is_err(),
+            "load_consensus_state must reject a snapshot that fails validation"
+        );
         let err = result.unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
         assert!(err.to_string().contains("failed validation"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_load_invalid_snapshot_with_bad_staged_epoch_rejected() {
+        let dir = std::env::temp_dir().join("n42-test-invalid-staged-epoch");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("consensus_state.json");
+
+        let snapshot = ConsensusSnapshot {
+            scheduled_epoch_transition: Some((1, vec![], 1)),
+            ..genesis_snapshot(10)
+        };
+        std::fs::write(&path, serde_json::to_string_pretty(&snapshot).unwrap()).unwrap();
+
+        let result = load_consensus_state(&path);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -350,15 +409,20 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let path = dir.join("consensus_state.json");
 
-        let sk = BlsSecretKey::random().expect("BLS key gen");
-        let validator = ValidatorInfo {
-            address: Address::with_last_byte(42),
-            bls_public_key: sk.public_key(),
-        };
+        let validators: Vec<_> = (0..4u8)
+            .map(|i| {
+                let sk = BlsSecretKey::random().expect("BLS key gen");
+                ValidatorInfo {
+                    address: Address::with_last_byte(42 + i),
+                    bls_public_key: sk.public_key(),
+                    p2p_peer_id: None,
+                }
+            })
+            .collect();
 
         let snapshot = ConsensusSnapshot {
             consecutive_timeouts: 2,
-            scheduled_epoch_transition: Some((3, vec![validator.clone()], 1)),
+            scheduled_epoch_transition: Some((3, validators.clone(), 1)),
             ..genesis_snapshot(100)
         };
 
@@ -368,7 +432,7 @@ mod tests {
         assert_eq!(loaded.current_view, 100);
         let (epoch, validators, ft) = loaded.scheduled_epoch_transition.unwrap();
         assert_eq!(epoch, 3);
-        assert_eq!(validators.len(), 1);
+        assert_eq!(validators.len(), 4);
         assert_eq!(validators[0].address, Address::with_last_byte(42));
         assert_eq!(ft, 1);
 
@@ -398,7 +462,10 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("consensus_state.json");
 
-        let snapshot = ConsensusSnapshot { consecutive_timeouts: 1, ..genesis_snapshot(50) };
+        let snapshot = ConsensusSnapshot {
+            consecutive_timeouts: 1,
+            ..genesis_snapshot(50)
+        };
         let mut json_value: serde_json::Value = serde_json::to_value(&snapshot).unwrap();
         let obj = json_value.as_object_mut().unwrap();
         obj.remove("version");
@@ -448,7 +515,10 @@ mod tests {
         save_consensus_state(&path, &snapshot).unwrap();
 
         let loaded = load_consensus_state(&path).unwrap().unwrap();
-        assert!(loaded.authorized_verifiers.is_empty(), "empty vec should round-trip correctly");
+        assert!(
+            loaded.authorized_verifiers.is_empty(),
+            "empty vec should round-trip correctly"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -463,12 +533,14 @@ mod tests {
         // Build valid JSON with an invalid hex string in authorized_verifiers.
         let snapshot = genesis_snapshot(80);
         let mut json_value: serde_json::Value = serde_json::to_value(&snapshot).unwrap();
-        json_value["authorized_verifiers"] =
-            serde_json::json!(["not_valid_hex!!"]);
+        json_value["authorized_verifiers"] = serde_json::json!(["not_valid_hex!!"]);
         std::fs::write(&path, serde_json::to_string_pretty(&json_value).unwrap()).unwrap();
 
         let result = load_consensus_state(&path);
-        assert!(result.is_err(), "invalid hex in authorized_verifiers must cause a parse error");
+        assert!(
+            result.is_err(),
+            "invalid hex in authorized_verifiers must cause a parse error"
+        );
         assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -489,7 +561,10 @@ mod tests {
         std::fs::write(&path, serde_json::to_string_pretty(&json_value).unwrap()).unwrap();
 
         let result = load_consensus_state(&path);
-        assert!(result.is_err(), "wrong-length hex pubkey must cause a parse error");
+        assert!(
+            result.is_err(),
+            "wrong-length hex pubkey must cause a parse error"
+        );
         assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -505,7 +580,10 @@ mod tests {
         // Write a snapshot JSON that omits `authorized_verifiers` (legacy format).
         let snapshot = genesis_snapshot(77);
         let mut json_value: serde_json::Value = serde_json::to_value(&snapshot).unwrap();
-        json_value.as_object_mut().unwrap().remove("authorized_verifiers");
+        json_value
+            .as_object_mut()
+            .unwrap()
+            .remove("authorized_verifiers");
         std::fs::write(&path, serde_json::to_string_pretty(&json_value).unwrap()).unwrap();
 
         let loaded = load_consensus_state(&path).unwrap().unwrap();

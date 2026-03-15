@@ -95,7 +95,7 @@ pub struct StarHubConfig {
 impl Default for StarHubConfig {
     fn default() -> Self {
         Self {
-            bind_addr: "0.0.0.0:9443".parse().unwrap(),
+            bind_addr: SocketAddr::from(([0, 0, 0, 0], 9443)),
             max_connections: 10_000,
             idle_timeout_secs: 300,
             cert_dir: None,
@@ -132,10 +132,7 @@ impl StarHubHandle {
         }
     }
 
-    pub async fn broadcast_packet(
-        &self,
-        data: Bytes,
-    ) -> Result<(), crate::error::NetworkError> {
+    pub async fn broadcast_packet(&self, data: Bytes) -> Result<(), crate::error::NetworkError> {
         self.send_command(HubCommand::BroadcastPacket(data), "broadcast_packet")
             .await
     }
@@ -153,8 +150,11 @@ impl StarHubHandle {
         session_id: u64,
         data: Bytes,
     ) -> Result<(), crate::error::NetworkError> {
-        self.send_command(HubCommand::SendToSession { session_id, data }, "send_to_session")
-            .await
+        self.send_command(
+            HubCommand::SendToSession { session_id, data },
+            "send_to_session",
+        )
+        .await
     }
 }
 
@@ -810,7 +810,12 @@ mod tests {
     #[tokio::test]
     async fn test_hub_handle_send_commands() {
         let (_hub, handle, _event_rx) = StarHub::new(StarHubConfig::default());
-        assert!(handle.broadcast_packet(Bytes::from(vec![1, 2, 3])).await.is_ok());
+        assert!(
+            handle
+                .broadcast_packet(Bytes::from(vec![1, 2, 3]))
+                .await
+                .is_ok()
+        );
         assert!(
             handle
                 .broadcast_cache_sync(Bytes::from(vec![4, 5, 6]))
@@ -833,7 +838,9 @@ mod tests {
     #[tokio::test]
     async fn test_hub_handle_waits_for_command_capacity() {
         let (command_tx, mut command_rx) = mpsc::channel(1);
-        let handle = StarHubHandle { command_tx: command_tx.clone() };
+        let handle = StarHubHandle {
+            command_tx: command_tx.clone(),
+        };
 
         command_tx
             .send(HubCommand::BroadcastPacket(Bytes::from(vec![0x01])))
@@ -845,10 +852,8 @@ mod tests {
             command_rx.recv().await
         };
 
-        let (send_result, first) = tokio::join!(
-            handle.broadcast_packet(Bytes::from(vec![0x02])),
-            drain_fut
-        );
+        let (send_result, first) =
+            tokio::join!(handle.broadcast_packet(Bytes::from(vec![0x02])), drain_fut);
         assert!(send_result.is_ok());
 
         let first = first.expect("expected buffered command");

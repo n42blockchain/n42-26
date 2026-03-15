@@ -49,7 +49,10 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
     // Give the node extra time for StarHub to begin listening.
     tokio::time::sleep(Duration::from_secs(8)).await;
 
-    info!(starhub_port, "node started, beginning 10K QUIC connection test");
+    info!(
+        starhub_port,
+        "node started, beginning 10K QUIC connection test"
+    );
 
     // ── 2. Launch 10,000 concurrent QUIC connections ──
     let target_connections: usize = std::env::var("E2E_QUIC_10K_COUNT")
@@ -66,8 +69,7 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
 
     info!(
         target_connections,
-        concurrency_limit,
-        "launching concurrent QUIC connections"
+        concurrency_limit, "launching concurrent QUIC connections"
     );
 
     let start = std::time::Instant::now();
@@ -163,12 +165,9 @@ async fn simulate_quic_handshake(index: usize, host: &str) -> eyre::Result<()> {
     // The TCP handshake is sufficient to exercise the server's connection
     // acceptance path and measure the OS / tokio overhead of 10K connections.
     let addr: std::net::SocketAddr = host.parse()?;
-    let stream = tokio::time::timeout(
-        Duration::from_secs(5),
-        tokio::net::TcpStream::connect(addr),
-    )
-    .await
-    .map_err(|_| eyre::eyre!("connect timeout for index {index}"))?;
+    let stream = tokio::time::timeout(Duration::from_secs(5), tokio::net::TcpStream::connect(addr))
+        .await
+        .map_err(|_| eyre::eyre!("connect timeout for index {index}"))?;
 
     match stream {
         Ok(mut tcp) => {

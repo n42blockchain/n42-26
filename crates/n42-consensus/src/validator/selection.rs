@@ -1,5 +1,5 @@
-use n42_primitives::consensus::ViewNumber;
 use super::set::ValidatorSet;
+use n42_primitives::consensus::ViewNumber;
 
 /// Leader selection strategy based on round-robin rotation.
 ///
@@ -28,11 +28,7 @@ impl LeaderSelector {
     }
 
     /// Checks if the given validator is the leader for the given view.
-    pub fn is_leader(
-        validator_index: u32,
-        view: ViewNumber,
-        validator_set: &ValidatorSet,
-    ) -> bool {
+    pub fn is_leader(validator_index: u32, view: ViewNumber, validator_set: &ValidatorSet) -> bool {
         Self::leader_for_view(view, validator_set) == validator_index
     }
 }
@@ -52,6 +48,7 @@ mod tests {
                 ValidatorInfo {
                     address: Address::with_last_byte(i as u8),
                     bls_public_key: sk.public_key(),
+                    p2p_peer_id: None,
                 }
             })
             .collect();

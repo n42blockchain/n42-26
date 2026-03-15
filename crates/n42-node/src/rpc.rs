@@ -1,17 +1,19 @@
 use crate::consensus_state::{AttestationRecord, EquivocationEvidence, SharedConsensusState};
-use crate::staking::{StakingManager, StakeStatus, MIN_STAKE_WEI, UNSTAKE_COOLDOWN_BLOCKS, STAKING_ADDRESS};
+use crate::staking::{
+    MIN_STAKE_WEI, STAKING_ADDRESS, StakeStatus, StakingManager, UNSTAKE_COOLDOWN_BLOCKS,
+};
 // VerificationTask is used by the #[subscription(item = ...)] macro attribute.
 #[allow(unused_imports)]
 use crate::consensus_state::VerificationTask;
 use alloy_primitives::{Address, B256, U256};
-use n42_jmt::ShardedJmt;
-use n42_zkproof::ProofScheduler;
 use jsonrpsee::core::RpcResult;
 use jsonrpsee::core::SubscriptionResult;
 use jsonrpsee::proc_macros::rpc;
 use jsonrpsee::types::ErrorObjectOwned;
 use jsonrpsee::{PendingSubscriptionSink, SubscriptionMessage};
+use n42_jmt::ShardedJmt;
 use n42_primitives::{BlsPublicKey, BlsSignature};
+use n42_zkproof::ProofScheduler;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
@@ -183,7 +185,11 @@ pub trait N42Api {
 
     /// Generates a JMT proof for an account, or a storage slot if `storage_slot` is provided.
     #[method(name = "jmtProof")]
-    async fn jmt_proof(&self, address: Address, storage_slot: Option<U256>) -> RpcResult<JmtProofResponse>;
+    async fn jmt_proof(
+        &self,
+        address: Address,
+        storage_slot: Option<U256>,
+    ) -> RpcResult<JmtProofResponse>;
 
     /// Returns the current JMT version (block count since genesis).
     #[method(name = "jmtVersion")]
@@ -270,23 +276,31 @@ impl N42ApiServer for N42RpcServer {
     }
 
     async fn validator_set(&self) -> RpcResult<Vec<ValidatorInfoResponse>> {
-        let vs = &self.consensus_state.validator_set;
+        let Some(vs) = self.consensus_state.try_load_validator_set() else {
+            return Err(ErrorObjectOwned::owned(
+                -32603,
+                "validator set unavailable",
+                None::<()>,
+            ));
+        };
         let mut result = Vec::with_capacity(vs.len() as usize);
         for i in 0..vs.len() {
-            if let Ok(pk) = vs.get_public_key(i) {
-                result.push(ValidatorInfoResponse {
-                    index: i,
-                    public_key: hex::encode(pk.to_bytes()),
-                });
-            }
+            let pk = vs.get_public_key(i).map_err(|e| {
+                ErrorObjectOwned::owned(
+                    -32603,
+                    format!("failed to read validator public key at index {i}: {e}"),
+                    None::<()>,
+                )
+            })?;
+            result.push(ValidatorInfoResponse {
+                index: i,
+                public_key: hex::encode(pk.to_bytes()),
+            });
         }
         Ok(result)
     }
 
-    async fn subscribe_verification(
-        &self,
-        pending: PendingSubscriptionSink,
-    ) -> SubscriptionResult {
+    async fn subscribe_verification(&self, pending: PendingSubscriptionSink) -> SubscriptionResult {
         let sink = pending.accept().await?;
         let mut rx = self.consensus_state.subscribe_block_committed();
 
@@ -329,8 +343,10 @@ impl N42ApiServer for N42RpcServer {
         block_hash: B256,
         slot: u64,
     ) -> RpcResult<AttestationResponse> {
-        let pubkey_bytes = hex::decode(pubkey.strip_prefix("0x").unwrap_or(&pubkey))
-            .map_err(|e| ErrorObjectOwned::owned(-32602, format!("invalid pubkey hex: {e}"), None::<()>))?;
+        let pubkey_bytes =
+            hex::decode(pubkey.strip_prefix("0x").unwrap_or(&pubkey)).map_err(|e| {
+                ErrorObjectOwned::owned(-32602, format!("invalid pubkey hex: {e}"), None::<()>)
+            })?;
 
         let pubkey_array: [u8; 48] = pubkey_bytes.try_into().map_err(|v: Vec<u8>| {
             ErrorObjectOwned::owned(
@@ -340,11 +356,14 @@ impl N42ApiServer for N42RpcServer {
             )
         })?;
 
-        let bls_pubkey = BlsPublicKey::from_bytes(&pubkey_array)
-            .map_err(|e| ErrorObjectOwned::owned(-32602, format!("invalid BLS public key: {e}"), None::<()>))?;
+        let bls_pubkey = BlsPublicKey::from_bytes(&pubkey_array).map_err(|e| {
+            ErrorObjectOwned::owned(-32602, format!("invalid BLS public key: {e}"), None::<()>)
+        })?;
 
-        let sig_bytes = hex::decode(signature.strip_prefix("0x").unwrap_or(&signature))
-            .map_err(|e| ErrorObjectOwned::owned(-32602, format!("invalid signature hex: {e}"), None::<()>))?;
+        let sig_bytes =
+            hex::decode(signature.strip_prefix("0x").unwrap_or(&signature)).map_err(|e| {
+                ErrorObjectOwned::owned(-32602, format!("invalid signature hex: {e}"), None::<()>)
+            })?;
 
         let sig_array: [u8; 96] = sig_bytes.try_into().map_err(|v: Vec<u8>| {
             ErrorObjectOwned::owned(
@@ -354,12 +373,19 @@ impl N42ApiServer for N42RpcServer {
             )
         })?;
 
-        let bls_sig = BlsSignature::from_bytes(&sig_array)
-            .map_err(|e| ErrorObjectOwned::owned(-32602, format!("invalid BLS signature: {e}"), None::<()>))?;
-
-        bls_pubkey.verify(block_hash.as_slice(), &bls_sig).map_err(|e| {
-            ErrorObjectOwned::owned(-32003, format!("BLS signature verification failed: {e}"), None::<()>)
+        let bls_sig = BlsSignature::from_bytes(&sig_array).map_err(|e| {
+            ErrorObjectOwned::owned(-32602, format!("invalid BLS signature: {e}"), None::<()>)
         })?;
+
+        bls_pubkey
+            .verify(block_hash.as_slice(), &bls_sig)
+            .map_err(|e| {
+                ErrorObjectOwned::owned(
+                    -32003,
+                    format!("BLS signature verification failed: {e}"),
+                    None::<()>,
+                )
+            })?;
 
         // Security: only accept attestations from verifiers that completed a QUIC
         // handshake with StarHub. Self-signed BLS proofs alone are not sufficient;
@@ -374,7 +400,11 @@ impl N42ApiServer for N42RpcServer {
 
         let canonical_pubkey_hex = hex::encode(pubkey_array);
         let mut att_state = self.consensus_state.attestation_state.lock().map_err(|_| {
-            ErrorObjectOwned::owned(-32603, "internal error: attestation state lock poisoned", None::<()>)
+            ErrorObjectOwned::owned(
+                -32603,
+                "internal error: attestation state lock poisoned",
+                None::<()>,
+            )
         })?;
 
         match att_state.record_attestation(block_hash, canonical_pubkey_hex) {
@@ -382,7 +412,11 @@ impl N42ApiServer for N42RpcServer {
                 if threshold_reached {
                     info!(%block_hash, slot, count, "mobile attestation threshold reached");
                 }
-                Ok(AttestationResponse { accepted: true, attestation_count: count, threshold_reached })
+                Ok(AttestationResponse {
+                    accepted: true,
+                    attestation_count: count,
+                    threshold_reached,
+                })
             }
             None => Err(ErrorObjectOwned::owned(
                 -32001,
@@ -407,7 +441,10 @@ impl N42ApiServer for N42RpcServer {
 
     async fn equivocations(&self) -> RpcResult<EquivocationsResponse> {
         let evidence = self.consensus_state.get_equivocations();
-        Ok(EquivocationsResponse { total: evidence.len(), evidence })
+        Ok(EquivocationsResponse {
+            total: evidence.len(),
+            evidence,
+        })
     }
 
     async fn staking_status(&self, address: Address) -> RpcResult<StakingStatusResponse> {
@@ -440,8 +477,8 @@ impl N42ApiServer for N42RpcServer {
                     ("unstaking".to_string(), remaining)
                 }
             };
-            let is_staked = matches!(entry.status, StakeStatus::Active)
-                && entry.amount >= MIN_STAKE_WEI;
+            let is_staked =
+                matches!(entry.status, StakeStatus::Active) && entry.amount >= MIN_STAKE_WEI;
             Ok(StakingStatusResponse {
                 staked: is_staked,
                 registered: true, // staked implies registered
@@ -533,9 +570,9 @@ impl N42ApiServer for N42RpcServer {
             None => n42_jmt::account_key(&address),
         };
 
-        let tree = jmt.lock().map_err(|_| {
-            ErrorObjectOwned::owned(-32603, "JMT lock poisoned", None::<()>)
-        })?;
+        let tree = jmt
+            .lock()
+            .map_err(|_| ErrorObjectOwned::owned(-32603, "JMT lock poisoned", None::<()>))?;
 
         let root = tree.root_hash().map_err(|e| {
             ErrorObjectOwned::owned(-32603, format!("JMT root error: {e}"), None::<()>)
@@ -569,9 +606,9 @@ impl N42ApiServer for N42RpcServer {
         let jmt = self.jmt.as_ref().ok_or_else(|| {
             ErrorObjectOwned::owned(-32001, "JMT not enabled on this node", None::<()>)
         })?;
-        let tree = jmt.lock().map_err(|_| {
-            ErrorObjectOwned::owned(-32603, "JMT lock poisoned", None::<()>)
-        })?;
+        let tree = jmt
+            .lock()
+            .map_err(|_| ErrorObjectOwned::owned(-32603, "JMT lock poisoned", None::<()>))?;
         Ok(tree.version())
     }
 
@@ -579,13 +616,16 @@ impl N42ApiServer for N42RpcServer {
         let scheduler = self.zk_scheduler.as_ref().ok_or_else(|| {
             ErrorObjectOwned::owned(-32001, "ZK proof not enabled on this node", None::<()>)
         })?;
-        let result = scheduler.proof_store().get_by_block(block_number).ok_or_else(|| {
-            ErrorObjectOwned::owned(
-                -32001,
-                format!("no ZK proof found for block {block_number}"),
-                None::<()>,
-            )
-        })?;
+        let result = scheduler
+            .proof_store()
+            .get_by_block(block_number)
+            .ok_or_else(|| {
+                ErrorObjectOwned::owned(
+                    -32001,
+                    format!("no ZK proof found for block {block_number}"),
+                    None::<()>,
+                )
+            })?;
         Ok(proof_result_to_response(&result))
     }
 
@@ -593,13 +633,16 @@ impl N42ApiServer for N42RpcServer {
         let scheduler = self.zk_scheduler.as_ref().ok_or_else(|| {
             ErrorObjectOwned::owned(-32001, "ZK proof not enabled on this node", None::<()>)
         })?;
-        let result = scheduler.proof_store().get_by_hash(&block_hash).ok_or_else(|| {
-            ErrorObjectOwned::owned(
-                -32001,
-                format!("no ZK proof found for block hash {block_hash:?}"),
-                None::<()>,
-            )
-        })?;
+        let result = scheduler
+            .proof_store()
+            .get_by_hash(&block_hash)
+            .ok_or_else(|| {
+                ErrorObjectOwned::owned(
+                    -32001,
+                    format!("no ZK proof found for block hash {block_hash:?}"),
+                    None::<()>,
+                )
+            })?;
         Ok(proof_result_to_response(&result))
     }
 
@@ -617,20 +660,27 @@ impl N42ApiServer for N42RpcServer {
         let scheduler = self.zk_scheduler.as_ref().ok_or_else(|| {
             ErrorObjectOwned::owned(-32001, "ZK proof not enabled on this node", None::<()>)
         })?;
-        let result = scheduler.proof_store().get_by_block(block_number).ok_or_else(|| {
-            ErrorObjectOwned::owned(
-                -32001,
-                format!("no ZK proof found for block {block_number}"),
-                None::<()>,
-            )
-        })?;
+        let result = scheduler
+            .proof_store()
+            .get_by_block(block_number)
+            .ok_or_else(|| {
+                ErrorObjectOwned::owned(
+                    -32001,
+                    format!("no ZK proof found for block {block_number}"),
+                    None::<()>,
+                )
+            })?;
         // Re-verify using the prover instance. Use spawn_blocking to avoid
         // blocking the tokio thread (SP1 verification involves crypto work).
         let prover = scheduler.prover().clone();
         let verify_result = tokio::task::spawn_blocking(move || prover.verify(&result))
             .await
             .map_err(|e| {
-                ErrorObjectOwned::owned(-32603, format!("verification task failed: {e}"), None::<()>)
+                ErrorObjectOwned::owned(
+                    -32603,
+                    format!("verification task failed: {e}"),
+                    None::<()>,
+                )
             })?;
         match verify_result {
             Ok(valid) => Ok(valid),
@@ -693,9 +743,9 @@ fn proof_result_to_response(result: &n42_zkproof::ZkProofResult) -> ZkProofRespo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use n42_consensus::ValidatorSet;
-    use n42_chainspec::ValidatorInfo;
     use alloy_primitives::Address;
+    use n42_chainspec::ValidatorInfo;
+    use n42_consensus::ValidatorSet;
     use n42_primitives::{BlsSecretKey, QuorumCertificate};
 
     fn make_rpc() -> N42RpcServer {
@@ -708,7 +758,11 @@ mod tests {
         let validators: Vec<_> = (0..count)
             .map(|_| {
                 let sk = BlsSecretKey::random().unwrap();
-                ValidatorInfo { address: Address::ZERO, bls_public_key: sk.public_key() }
+                ValidatorInfo {
+                    address: Address::ZERO,
+                    bls_public_key: sk.public_key(),
+                    p2p_peer_id: None,
+                }
             })
             .collect();
         let vs = ValidatorSet::new(&validators, 0);
@@ -808,7 +862,12 @@ mod tests {
     async fn test_submit_attestation_wrong_pubkey_length() {
         let rpc = make_rpc();
         let result = rpc
-            .submit_attestation(hex::encode([0u8; 32]), hex::encode([0u8; 96]), B256::ZERO, 0)
+            .submit_attestation(
+                hex::encode([0u8; 32]),
+                hex::encode([0u8; 96]),
+                B256::ZERO,
+                0,
+            )
             .await;
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -909,7 +968,11 @@ mod tests {
             .await;
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert_eq!(err.code(), -32004, "unauthorized verifier must return -32004");
+        assert_eq!(
+            err.code(),
+            -32004,
+            "unauthorized verifier must return -32004"
+        );
         assert!(err.message().contains("not authorized"));
     }
 

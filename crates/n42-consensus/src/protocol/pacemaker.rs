@@ -66,14 +66,22 @@ impl Pacemaker {
             return self.base_timeout;
         }
         // Compute p95 of recent latencies.
-        let mut sorted: Vec<u64> = self.recent_latencies.iter().map(|d| d.as_millis() as u64).collect();
+        let mut sorted: Vec<u64> = self
+            .recent_latencies
+            .iter()
+            .map(|d| d.as_millis() as u64)
+            .collect();
         sorted.sort_unstable();
         let p95_idx = (sorted.len() * 95 / 100).min(sorted.len().saturating_sub(1));
         let p95_ms = sorted[p95_idx];
         // Effective base = max(configured, 2 × p95), capped at max_timeout.
         let adaptive_ms = p95_ms.saturating_mul(2);
         let effective = self.base_timeout.as_millis() as u64;
-        Duration::from_millis(effective.max(adaptive_ms).min(self.max_timeout.as_millis() as u64))
+        Duration::from_millis(
+            effective
+                .max(adaptive_ms)
+                .min(self.max_timeout.as_millis() as u64),
+        )
     }
 
     /// Returns the timeout duration for the given number of consecutive timeouts.

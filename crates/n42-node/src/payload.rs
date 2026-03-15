@@ -6,12 +6,12 @@ use reth_chainspec::{ChainSpecProvider, EthChainSpec, EthereumHardforks};
 use reth_ethereum_engine_primitives::{
     EthBuiltPayload, EthPayloadAttributes, EthPayloadBuilderAttributes,
 };
-use reth_ethereum_payload_builder::{default_ethereum_payload, EthereumBuilderConfig};
+use reth_ethereum_payload_builder::{EthereumBuilderConfig, default_ethereum_payload};
 use reth_ethereum_primitives::{EthPrimitives, TransactionSigned};
 use reth_evm::{ConfigureEvm, NextBlockEnvAttributes};
 use reth_node_api::{FullNodeTypes, NodeTypes, PrimitivesTy, TxTy};
 use reth_node_builder::{
-    components::PayloadBuilderBuilder, BuilderContext, PayloadBuilderConfig, PayloadTypes,
+    BuilderContext, PayloadBuilderConfig, PayloadTypes, components::PayloadBuilderBuilder,
 };
 use reth_payload_builder_primitives::PayloadBuilderError;
 use reth_storage_api::StateProviderFactory;
@@ -37,15 +37,13 @@ where
     Pool: TransactionPool<Transaction: PoolTransaction<Consensus = TxTy<Node::Types>>>
         + Unpin
         + 'static,
-    Evm: ConfigureEvm<
-            Primitives = PrimitivesTy<Types>,
-            NextBlockEnvCtx = NextBlockEnvAttributes,
-        > + 'static,
+    Evm: ConfigureEvm<Primitives = PrimitivesTy<Types>, NextBlockEnvCtx = NextBlockEnvAttributes>
+        + 'static,
     Types::Payload: PayloadTypes<
-        BuiltPayload = EthBuiltPayload,
-        PayloadAttributes = EthPayloadAttributes,
-        PayloadBuilderAttributes = EthPayloadBuilderAttributes,
-    >,
+            BuiltPayload = EthBuiltPayload,
+            PayloadAttributes = EthPayloadAttributes,
+            PayloadBuilderAttributes = EthPayloadBuilderAttributes,
+        >,
 {
     type PayloadBuilder = N42InnerPayloadBuilder<Pool, Node::Provider, Evm>;
 

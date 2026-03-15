@@ -1,6 +1,6 @@
 use alloy_primitives::keccak256;
 use libp2p::gossipsub::{self, Message, MessageId, TopicHash};
-use n42_primitives::{ConsensusMessage, VersionedMessage, CONSENSUS_PROTOCOL_VERSION};
+use n42_primitives::{CONSENSUS_PROTOCOL_VERSION, ConsensusMessage, VersionedMessage};
 
 use crate::error::NetworkError;
 
@@ -112,9 +112,11 @@ pub fn validate_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gossipsub::topics::{
+        blob_sidecar_topic, block_announce_topic, consensus_topic, mempool_topic,
+    };
     use alloy_primitives::B256;
     use n42_primitives::{BlsSecretKey, ConsensusMessage, Vote};
-    use crate::gossipsub::topics::{blob_sidecar_topic, block_announce_topic, consensus_topic, mempool_topic};
 
     fn dummy_consensus_vote() -> ConsensusMessage {
         let sk = BlsSecretKey::random().unwrap();
@@ -160,7 +162,14 @@ mod tests {
         let topic_hash = consensus_topic().hash();
         let block_hash = block_announce_topic().hash();
 
-        let result = validate_message(&topic_hash, &encoded, &topic_hash, &block_hash, &mem_hash(), &blob_hash());
+        let result = validate_message(
+            &topic_hash,
+            &encoded,
+            &topic_hash,
+            &block_hash,
+            &mem_hash(),
+            &blob_hash(),
+        );
         assert!(matches!(result, gossipsub::MessageAcceptance::Accept));
     }
 
@@ -169,7 +178,14 @@ mod tests {
         let topic_hash = consensus_topic().hash();
         let block_hash = block_announce_topic().hash();
 
-        let result = validate_message(&topic_hash, &[], &topic_hash, &block_hash, &mem_hash(), &blob_hash());
+        let result = validate_message(
+            &topic_hash,
+            &[],
+            &topic_hash,
+            &block_hash,
+            &mem_hash(),
+            &blob_hash(),
+        );
         assert!(matches!(result, gossipsub::MessageAcceptance::Reject));
     }
 
@@ -179,7 +195,14 @@ mod tests {
         let block_hash = block_announce_topic().hash();
         let oversized = vec![0u8; 1_048_576 + 1];
 
-        let result = validate_message(&topic_hash, &oversized, &topic_hash, &block_hash, &mem_hash(), &blob_hash());
+        let result = validate_message(
+            &topic_hash,
+            &oversized,
+            &topic_hash,
+            &block_hash,
+            &mem_hash(),
+            &blob_hash(),
+        );
         assert!(matches!(result, gossipsub::MessageAcceptance::Reject));
     }
 
@@ -189,7 +212,14 @@ mod tests {
         let block_hash = block_announce_topic().hash();
         let large_data = vec![0u8; 2 * 1024 * 1024];
 
-        let result = validate_message(&block_hash, &large_data, &consensus_hash, &block_hash, &mem_hash(), &blob_hash());
+        let result = validate_message(
+            &block_hash,
+            &large_data,
+            &consensus_hash,
+            &block_hash,
+            &mem_hash(),
+            &blob_hash(),
+        );
         assert!(matches!(result, gossipsub::MessageAcceptance::Accept));
     }
 
@@ -199,7 +229,14 @@ mod tests {
         let block_hash = block_announce_topic().hash();
         let oversized = vec![0u8; 8 * 1024 * 1024 + 1];
 
-        let result = validate_message(&block_hash, &oversized, &consensus_hash, &block_hash, &mem_hash(), &blob_hash());
+        let result = validate_message(
+            &block_hash,
+            &oversized,
+            &consensus_hash,
+            &block_hash,
+            &mem_hash(),
+            &blob_hash(),
+        );
         assert!(matches!(result, gossipsub::MessageAcceptance::Reject));
     }
 
@@ -209,7 +246,14 @@ mod tests {
         let block_hash = block_announce_topic().hash();
         let garbage = vec![0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04];
 
-        let result = validate_message(&topic_hash, &garbage, &topic_hash, &block_hash, &mem_hash(), &blob_hash());
+        let result = validate_message(
+            &topic_hash,
+            &garbage,
+            &topic_hash,
+            &block_hash,
+            &mem_hash(),
+            &blob_hash(),
+        );
         assert!(matches!(result, gossipsub::MessageAcceptance::Reject));
     }
 
@@ -219,7 +263,14 @@ mod tests {
         let block_hash = block_announce_topic().hash();
         let other = libp2p::gossipsub::IdentTopic::new("other").hash();
 
-        let result = validate_message(&other, &[1, 2, 3], &consensus_topic_hash, &block_hash, &mem_hash(), &blob_hash());
+        let result = validate_message(
+            &other,
+            &[1, 2, 3],
+            &consensus_topic_hash,
+            &block_hash,
+            &mem_hash(),
+            &blob_hash(),
+        );
         assert!(matches!(result, gossipsub::MessageAcceptance::Accept));
     }
 
@@ -229,7 +280,14 @@ mod tests {
         let block_hash = block_announce_topic().hash();
         let other = libp2p::gossipsub::IdentTopic::new("other").hash();
 
-        let result = validate_message(&other, &[], &consensus_topic_hash, &block_hash, &mem_hash(), &blob_hash());
+        let result = validate_message(
+            &other,
+            &[],
+            &consensus_topic_hash,
+            &block_hash,
+            &mem_hash(),
+            &blob_hash(),
+        );
         assert!(matches!(result, gossipsub::MessageAcceptance::Reject));
     }
 
@@ -240,11 +298,25 @@ mod tests {
         let mp_hash = mem_hash();
 
         let data = vec![0u8; 64 * 1024];
-        let result = validate_message(&mp_hash, &data, &consensus_hash, &block_hash, &mp_hash, &blob_hash());
+        let result = validate_message(
+            &mp_hash,
+            &data,
+            &consensus_hash,
+            &block_hash,
+            &mp_hash,
+            &blob_hash(),
+        );
         assert!(matches!(result, gossipsub::MessageAcceptance::Accept));
 
         let oversized = vec![0u8; 128 * 1024 + 1];
-        let result = validate_message(&mp_hash, &oversized, &consensus_hash, &block_hash, &mp_hash, &blob_hash());
+        let result = validate_message(
+            &mp_hash,
+            &oversized,
+            &consensus_hash,
+            &block_hash,
+            &mp_hash,
+            &blob_hash(),
+        );
         assert!(matches!(result, gossipsub::MessageAcceptance::Reject));
     }
 }

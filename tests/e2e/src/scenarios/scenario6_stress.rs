@@ -82,7 +82,11 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
             "block height regressed too much after restart: before={height_before}, after={height_after} (max allowed rollback={max_rollback})"
         ));
     }
-    info!(before = height_before, after = height_after, "PASS: node restart - state preserved (rollback <= {max_rollback} blocks)");
+    info!(
+        before = height_before,
+        after = height_after,
+        "PASS: node restart - state preserved (rollback <= {max_rollback} blocks)"
+    );
 
     // --- Sub-test 8: Block height consistency ---
     test_block_height_consistency(&node2.rpc).await?;
@@ -115,7 +119,11 @@ async fn test_empty_blocks(rpc: &RpcClient) -> eyre::Result<()> {
     }
 
     let end_block = rpc.block_number().await?;
-    info!(start = start_block, end = end_block, "PASS: empty blocks produced normally");
+    info!(
+        start = start_block,
+        end = end_block,
+        "PASS: empty blocks produced normally"
+    );
     Ok(())
 }
 
@@ -138,15 +146,11 @@ async fn test_full_pool(
 
         let amount = U256::from(1_000_000_000_000_000u64); // 0.001 N42
 
-        match tx_engine.build_transfer(
-            from_idx, to_addr, amount, max_fee, priority_fee, 21000,
-        ) {
-            Ok((_, raw_tx)) => {
-                match rpc.send_raw_transaction(&raw_tx).await {
-                    Ok(_) => sent += 1,
-                    Err(_) => errors += 1,
-                }
-            }
+        match tx_engine.build_transfer(from_idx, to_addr, amount, max_fee, priority_fee, 21000) {
+            Ok((_, raw_tx)) => match rpc.send_raw_transaction(&raw_tx).await {
+                Ok(_) => sent += 1,
+                Err(_) => errors += 1,
+            },
             Err(_) => errors += 1,
         }
 
@@ -155,7 +159,10 @@ async fn test_full_pool(
         }
     }
 
-    info!(sent, errors, "PASS: full pool test complete (some rejections expected)");
+    info!(
+        sent,
+        errors, "PASS: full pool test complete (some rejections expected)"
+    );
 
     // Wait for the pool to drain.
     tokio::time::sleep(Duration::from_secs(30)).await;
@@ -177,12 +184,13 @@ async fn test_large_transfer(
 
     let to_addr = tx_engine.address(6);
 
-    let (tx_hash, raw_tx) = tx_engine.build_transfer(
-        5, to_addr, transfer_amount, max_fee, priority_fee, 21000,
-    )?;
+    let (tx_hash, raw_tx) =
+        tx_engine.build_transfer(5, to_addr, transfer_amount, max_fee, priority_fee, 21000)?;
 
     rpc.send_raw_transaction(&raw_tx).await?;
-    let receipt = rpc.wait_for_receipt(tx_hash, Duration::from_secs(60)).await?;
+    let receipt = rpc
+        .wait_for_receipt(tx_hash, Duration::from_secs(60))
+        .await?;
 
     if receipt.status != 1 {
         return Err(eyre::eyre!("large transfer failed"));
@@ -200,12 +208,13 @@ async fn test_zero_transfer(
     info!("sub-test 4: zero-value transfer");
 
     let to_addr = tx_engine.address(1);
-    let (tx_hash, raw_tx) = tx_engine.build_transfer(
-        0, to_addr, U256::ZERO, max_fee, priority_fee, 21000,
-    )?;
+    let (tx_hash, raw_tx) =
+        tx_engine.build_transfer(0, to_addr, U256::ZERO, max_fee, priority_fee, 21000)?;
 
     rpc.send_raw_transaction(&raw_tx).await?;
-    let receipt = rpc.wait_for_receipt(tx_hash, Duration::from_secs(60)).await?;
+    let receipt = rpc
+        .wait_for_receipt(tx_hash, Duration::from_secs(60))
+        .await?;
 
     if receipt.status != 1 {
         return Err(eyre::eyre!("zero-value transfer failed"));
@@ -226,11 +235,18 @@ async fn test_self_transfer(
     let balance_before = rpc.get_balance(self_addr).await?;
 
     let (tx_hash, raw_tx) = tx_engine.build_transfer(
-        2, self_addr, U256::from(1_000_000_000_000_000_000u128), max_fee, priority_fee, 21000,
+        2,
+        self_addr,
+        U256::from(1_000_000_000_000_000_000u128),
+        max_fee,
+        priority_fee,
+        21000,
     )?;
 
     rpc.send_raw_transaction(&raw_tx).await?;
-    let receipt = rpc.wait_for_receipt(tx_hash, Duration::from_secs(60)).await?;
+    let receipt = rpc
+        .wait_for_receipt(tx_hash, Duration::from_secs(60))
+        .await?;
 
     if receipt.status != 1 {
         return Err(eyre::eyre!("self-transfer failed"));
@@ -259,9 +275,7 @@ async fn test_invalid_transactions(
     let huge_amount = U256::MAX / U256::from(2u64);
     let to_addr = tx_engine.address(0);
 
-    let result = tx_engine.build_transfer(
-        9, to_addr, huge_amount, max_fee, priority_fee, 21000,
-    );
+    let result = tx_engine.build_transfer(9, to_addr, huge_amount, max_fee, priority_fee, 21000);
 
     if let Ok((_, raw_tx)) = result {
         match rpc.send_raw_transaction(&raw_tx).await {
@@ -275,7 +289,12 @@ async fn test_invalid_transactions(
 
     // 6b: Gas limit too low.
     let low_gas_result = tx_engine.build_transfer(
-        0, to_addr, U256::from(1u64), max_fee, priority_fee, 100, // way too low
+        0,
+        to_addr,
+        U256::from(1u64),
+        max_fee,
+        priority_fee,
+        100, // way too low
     );
 
     if let Ok((_, raw_tx)) = low_gas_result {

@@ -288,9 +288,7 @@ mod tests {
 
         for v in 0..10u64 {
             let val = format!("v{v}").into_bytes();
-            let (_, batch) = tree
-                .put_value_set(vec![(key, Some(val))], v)
-                .unwrap();
+            let (_, batch) = tree.put_value_set(vec![(key, Some(val))], v).unwrap();
             store.write_node_batch(&batch.node_batch).unwrap();
         }
 

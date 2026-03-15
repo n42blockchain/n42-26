@@ -368,7 +368,12 @@ mod tests {
 
     #[test]
     fn test_proof_type_serde_roundtrip() {
-        for pt in [ProofType::Mock, ProofType::Core, ProofType::Compressed, ProofType::Groth16] {
+        for pt in [
+            ProofType::Mock,
+            ProofType::Core,
+            ProofType::Compressed,
+            ProofType::Groth16,
+        ] {
             let json = serde_json::to_string(&pt).unwrap();
             let decoded: ProofType = serde_json::from_str(&json).unwrap();
             assert_eq!(decoded, pt);

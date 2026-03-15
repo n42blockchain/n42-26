@@ -94,14 +94,13 @@ where
     }
 
     async fn handle_network_transaction(&mut self, tx_bytes: Vec<u8>) {
-        let tx: TransactionSigned =
-            match alloy_rlp::Decodable::decode(&mut tx_bytes.as_slice()) {
-                Ok(tx) => tx,
-                Err(e) => {
-                    warn!(error = %e, "failed to decode network transaction");
-                    return;
-                }
-            };
+        let tx: TransactionSigned = match alloy_rlp::Decodable::decode(&mut tx_bytes.as_slice()) {
+            Ok(tx) => tx,
+            Err(e) => {
+                warn!(error = %e, "failed to decode network transaction");
+                return;
+            }
+        };
 
         let tx_hash = *tx.tx_hash();
 
@@ -220,7 +219,10 @@ mod tests {
 
         let overflow = B256::repeat_byte(0xFF);
         tracker.mark_imported(overflow);
-        assert!(!tracker.is_recently_imported(&first_hash), "first hash should be evicted");
+        assert!(
+            !tracker.is_recently_imported(&first_hash),
+            "first hash should be evicted"
+        );
         assert!(tracker.is_recently_imported(&overflow));
         assert_eq!(tracker.order.len(), RECENT_TX_CAPACITY);
         assert_eq!(tracker.set.len(), RECENT_TX_CAPACITY);
@@ -255,9 +257,16 @@ mod tests {
         }
 
         tracker.mark_imported(B256::repeat_byte(0xFF));
-        assert!(!tracker.is_recently_imported(&target), "target should be evicted cleanly");
+        assert!(
+            !tracker.is_recently_imported(&target),
+            "target should be evicted cleanly"
+        );
         assert_eq!(tracker.order.len(), RECENT_TX_CAPACITY);
-        assert_eq!(tracker.set.len(), RECENT_TX_CAPACITY, "set and order must stay in sync");
+        assert_eq!(
+            tracker.set.len(),
+            RECENT_TX_CAPACITY,
+            "set and order must stay in sync"
+        );
     }
 
     #[test]

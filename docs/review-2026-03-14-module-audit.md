@@ -138,6 +138,65 @@ Fix:
 - orchestrator `tx_import` delivery now uses a shared helper that waits on `Full` and only treats `Closed` as terminal
 - local-leader and tx-forward-disabled re-ingest paths now use the same reliable enqueue logic
 
+### 9. Startup and leader-payload handling no longer hide failures behind panic or silent decode loss
+
+Areas:
+
+- `bin/n42-node/src/main.rs`
+- `crates/n42-node/src/orchestrator/consensus_loop.rs`
+- `crates/n42-node/src/orchestrator/execution_bridge.rs`
+
+Problems:
+
+- deterministic libp2p key derivation still used `expect`, turning an initialization defect into a panic
+- dev-mode random BLS fallback also still used `expect`
+- leader payload feedback deserialized the same `BlockDataBroadcast` twice and silently ignored decode failures
+- JMT / bundle extraction paths used `ok()?`, which meant malformed payload side data disappeared without enough diagnostics
+- payload-build path still had a guarded `unwrap()` on `beacon_engine`
+
+Fix:
+
+- deterministic ed25519 derivation now returns `eyre::Result` and startup propagates a structured error instead of panicking
+- random BLS key generation now exits with an explicit startup error instead of unwinding
+- leader payload feedback now decodes once, logs malformed broadcasts, and reuses the decoded struct
+- JMT / bundle extraction now log decode, decompress, and JSON parse failures with block hash context
+- payload build now handles a missing `beacon_engine` without panic and resets its in-flight markers before returning
+
+### 10. NetworkService no longer drops several important data-plane events immediately under queue pressure
+
+Area:
+
+- `crates/n42-network/src/service.rs`
+
+Problem:
+
+- `emit_event()` only treated consensus/block traffic as reliable
+- sync requests/responses, forwarded transaction batches, verification receipts, blob sidecars, and peer lifecycle events still went through the lower-priority channel as fire-and-forget
+- under consumer backpressure those events could be dropped immediately, degrading sync progress, tx forwarding, receipt propagation, and peer-state visibility
+
+Fix:
+
+- added a separate bounded-drain reliable backlog for important data-plane events
+- `SyncRequest`, `SyncResponse`, `SyncRequestFailed`, `TxForwardReceived`, `VerificationReceipt`, `BlobSidecarReceived`, `PeerConnected`, and `PeerDisconnected` now retry through that backlog instead of being dropped on first `Full`
+- ordinary mempool gossip remains best-effort
+
+### 11. request-response ACK / rejection failures are now observable
+
+Area:
+
+- `crates/n42-network/src/service.rs`
+
+Problem:
+
+- direct-consensus, block-direct, and tx-forward handlers all used `let _ = send_response(...)`
+- if the response channel was already gone, the node lost that signal silently
+- this made it harder to distinguish invalid input from peer disconnect / request-response teardown races
+
+Fix:
+
+- all those `send_response(...)` calls now log explicit warnings on failure
+- behavior remains fire-and-forget, but the failure mode is no longer silent
+
 ## Key findings by module
 
 ### `n42-node`
@@ -148,6 +207,9 @@ Strengths:
 - snapshot validation now rejects invalid state
 - mobile authorization path is significantly tighter than before
 - startup now avoids forcing HTTP RPC on, and several initialization paths fail with surfaced errors instead of panic-based aborts
+- reward participant fanout no longer uses an unbounded queue; finalized-attestation rewards now obey bounded backpressure
+- orchestrator internal completion signals (`BlockReady`, eager-import done, bg-import done, build-complete) no longer use unbounded queues
+- leader payload feedback and JMT / proof-side bundle extraction now emit structured diagnostics instead of silently swallowing malformed data
 
 Risks still worth tracking:
 
@@ -162,6 +224,10 @@ Strengths:
 - clear split between validator networking and mobile QUIC ingress
 - recent fixes improved lifecycle reliability around connect/disconnect
 - failed `PhoneConnected` event delivery now cleans up the just-registered session instead of leaking connection slots
+- sharded mobile event fan-in is now bounded, so a stalled bridge no longer creates unbounded cross-shard event growth
+- `NetworkHandle` control-plane queues are now bounded, so external command producers no longer have an infinite buffering path into the swarm task
+- important data-plane events now have a reliable backlog instead of being dropped immediately on first queue saturation
+- request-response ACK / rejection failures are now logged instead of silently discarded
 
 Risks still worth tracking:
 

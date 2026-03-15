@@ -1,5 +1,5 @@
 use alloy_primitives::B256;
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use n42_consensus::ValidatorSet;
 use n42_primitives::QuorumCertificate;
 use serde::{Deserialize, Serialize};
@@ -140,7 +140,7 @@ fn unix_now_secs() -> u64 {
 pub struct SharedConsensusState {
     /// Latest committed QC; `None` before any block is committed.
     pub(crate) latest_committed_qc: ArcSwap<Option<QuorumCertificate>>,
-    pub(crate) validator_set: Arc<ValidatorSet>,
+    pub(crate) validator_set: Arc<ArcSwapOption<ValidatorSet>>,
     pub(crate) attestation_state: Mutex<AttestationState>,
     pub(crate) block_committed_tx: broadcast::Sender<VerificationTask>,
     attestation_history: Mutex<VecDeque<AttestationRecord>>,
@@ -169,7 +169,7 @@ impl SharedConsensusState {
         let (block_committed_tx, _) = broadcast::channel(512);
         Self {
             latest_committed_qc: ArcSwap::from_pointee(None),
-            validator_set: Arc::new(validator_set),
+            validator_set: Arc::new(ArcSwapOption::from_pointee(validator_set)),
             attestation_state: Mutex::new(AttestationState::new(
                 threshold,
                 MAX_TRACKED_ATTESTATION_BLOCKS,
@@ -185,7 +185,31 @@ impl SharedConsensusState {
 
     /// Returns the number of validators in the current set.
     pub fn validator_count(&self) -> u32 {
-        self.validator_set.len()
+        self.validator_set
+            .load_full()
+            .map(|vs| vs.len())
+            .unwrap_or_default()
+    }
+
+    /// Loads the current validator set snapshot, if initialized.
+    pub fn try_load_validator_set(&self) -> Option<Arc<ValidatorSet>> {
+        self.validator_set.load_full()
+    }
+
+    /// Loads the current validator set snapshot.
+    pub fn load_validator_set(&self) -> Arc<ValidatorSet> {
+        self.try_load_validator_set().unwrap_or_else(|| {
+            tracing::error!("validator_set unexpectedly uninitialized");
+            Arc::new(
+                ValidatorSet::try_new(&[], 0)
+                    .expect("empty validator set should always be valid"),
+            )
+        })
+    }
+
+    /// Replaces the current validator set snapshot.
+    pub fn update_validator_set(&self, validator_set: ValidatorSet) {
+        self.validator_set.store(Some(Arc::new(validator_set)));
     }
 
     /// Creates a new broadcast subscriber for block-committed events.
@@ -328,15 +352,25 @@ impl SharedConsensusState {
             block_hash,
             block_number,
         };
-        if self.block_committed_tx.receiver_count() > 0
-            && let Ok(n) = self.block_committed_tx.send(task)
-        {
-            info!(
-                %block_hash,
-                block_number,
-                receivers = n,
-                "verification task broadcast to mobile subscribers"
-            );
+        if self.block_committed_tx.receiver_count() > 0 {
+            match self.block_committed_tx.send(task) {
+                Ok(n) => {
+                    info!(
+                        %block_hash,
+                        block_number,
+                        receivers = n,
+                        "verification task broadcast to mobile subscribers"
+                    );
+                }
+                Err(error) => {
+                    warn!(
+                        %block_hash,
+                        block_number,
+                        error = %error,
+                        "verification task broadcast had subscribers but delivery failed"
+                    );
+                }
+            }
         }
     }
 }

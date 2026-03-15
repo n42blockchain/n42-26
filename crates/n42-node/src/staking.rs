@@ -1,5 +1,5 @@
 use alloy_eips::eip4895::Withdrawal;
-use alloy_primitives::{address, Address, U256};
+use alloy_primitives::{Address, U256, address};
 use reth_primitives_traits::SignerRecoverable;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -412,8 +412,7 @@ impl StakingManager {
         if let Some(staker) = self.bls_to_staker.get(bls_pubkey)
             && let Some(entry) = self.stakes.get(staker)
         {
-            return matches!(entry.status, StakeStatus::Active)
-                && entry.amount >= MIN_STAKE_WEI;
+            return matches!(entry.status, StakeStatus::Active) && entry.amount >= MIN_STAKE_WEI;
         }
         false
     }
@@ -657,9 +656,9 @@ mod hex_bytes_48 {
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 48], D::Error> {
         let s = String::deserialize(d)?;
         let bytes = hex::decode(&s).map_err(serde::de::Error::custom)?;
-        bytes
-            .try_into()
-            .map_err(|v: Vec<u8>| serde::de::Error::custom(format!("expected 48 bytes, got {}", v.len())))
+        bytes.try_into().map_err(|v: Vec<u8>| {
+            serde::de::Error::custom(format!("expected 48 bytes, got {}", v.len()))
+        })
     }
 }
 
@@ -765,7 +764,9 @@ mod tests {
         assert!(!mgr.is_staked(&bls));
         assert!(matches!(
             mgr.get_stake(&staker).unwrap().status,
-            StakeStatus::Unstaking { initiated_block: 200 }
+            StakeStatus::Unstaking {
+                initiated_block: 200
+            }
         ));
 
         // Before cooldown
@@ -795,15 +796,28 @@ mod tests {
 
         let reward_addr = bls_pubkey_to_reward_address(&bls);
         assert_eq!(mgr.staker_address_by_reward(reward_addr), Some(staker));
-        assert_ne!(reward_addr, staker, "reward addr should differ from staker addr");
+        assert_ne!(
+            reward_addr, staker,
+            "reward addr should differ from staker addr"
+        );
     }
 
     #[test]
     fn test_total_staked() {
         let mut mgr = StakingManager::new();
 
-        mgr.handle_stake(Address::with_last_byte(1), make_bls_pubkey(1), ether(32), 100);
-        mgr.handle_stake(Address::with_last_byte(2), make_bls_pubkey(2), ether(64), 100);
+        mgr.handle_stake(
+            Address::with_last_byte(1),
+            make_bls_pubkey(1),
+            ether(32),
+            100,
+        );
+        mgr.handle_stake(
+            Address::with_last_byte(2),
+            make_bls_pubkey(2),
+            ether(64),
+            100,
+        );
 
         let (total, count) = mgr.total_staked();
         assert_eq!(count, 2);
@@ -818,7 +832,12 @@ mod tests {
         {
             let mut mgr = StakingManager::new();
             mgr.state_file = Some(path.clone());
-            mgr.handle_stake(Address::with_last_byte(1), make_bls_pubkey(1), ether(50), 100);
+            mgr.handle_stake(
+                Address::with_last_byte(1),
+                make_bls_pubkey(1),
+                ether(50),
+                100,
+            );
             mgr.save();
         }
 
@@ -839,7 +858,12 @@ mod tests {
         {
             let mut mgr = StakingManager::new();
             mgr.state_file = Some(path.clone());
-            mgr.handle_stake(Address::with_last_byte(1), make_bls_pubkey(1), ether(32), 100);
+            mgr.handle_stake(
+                Address::with_last_byte(1),
+                make_bls_pubkey(1),
+                ether(32),
+                100,
+            );
             mgr.handle_unstake(Address::with_last_byte(1), 200);
             mgr.check_cooldowns(200 + UNSTAKE_COOLDOWN_BLOCKS);
             assert_eq!(mgr.pending_returns.len(), 1);
@@ -847,7 +871,11 @@ mod tests {
         }
 
         let mgr = StakingManager::load_or_new(&path);
-        assert_eq!(mgr.pending_returns.len(), 1, "pending_returns must survive restart");
+        assert_eq!(
+            mgr.pending_returns.len(),
+            1,
+            "pending_returns must survive restart"
+        );
         assert_eq!(mgr.pending_returns[0].address, Address::with_last_byte(1));
         assert_eq!(mgr.pending_returns[0].amount, 32_000_000_000u64);
     }
@@ -869,9 +897,11 @@ mod tests {
         mgr.handle_unstake(staker, 200);
         mgr.handle_unstake(staker, 300); // Should be ignored
 
-        if let StakeStatus::Unstaking { initiated_block } = mgr.get_stake(&staker).unwrap().status
-        {
-            assert_eq!(initiated_block, 200, "second unstake should not update block");
+        if let StakeStatus::Unstaking { initiated_block } = mgr.get_stake(&staker).unwrap().status {
+            assert_eq!(
+                initiated_block, 200,
+                "second unstake should not update block"
+            );
         } else {
             panic!("expected Unstaking status");
         }
@@ -907,7 +937,10 @@ mod tests {
         let zero_bls = [0u8; 48];
 
         mgr.handle_stake(staker, zero_bls, ether(32), 100);
-        assert!(mgr.stakes.is_empty(), "all-zero BLS pubkey must be rejected");
+        assert!(
+            mgr.stakes.is_empty(),
+            "all-zero BLS pubkey must be rejected"
+        );
     }
 
     #[test]
@@ -937,8 +970,18 @@ mod tests {
     fn test_monotonic_withdrawal_index() {
         let mut mgr = StakingManager::new();
 
-        mgr.handle_stake(Address::with_last_byte(1), make_bls_pubkey(1), ether(32), 100);
-        mgr.handle_stake(Address::with_last_byte(2), make_bls_pubkey(2), ether(32), 100);
+        mgr.handle_stake(
+            Address::with_last_byte(1),
+            make_bls_pubkey(1),
+            ether(32),
+            100,
+        );
+        mgr.handle_stake(
+            Address::with_last_byte(2),
+            make_bls_pubkey(2),
+            ether(32),
+            100,
+        );
 
         mgr.handle_unstake(Address::with_last_byte(1), 200);
         mgr.handle_unstake(Address::with_last_byte(2), 201);
@@ -946,7 +989,10 @@ mod tests {
         mgr.check_cooldowns(200 + UNSTAKE_COOLDOWN_BLOCKS + 1);
         let returns = mgr.take_pending_returns(500, 8);
         assert_eq!(returns.len(), 2);
-        assert!(returns[0].index < returns[1].index, "withdrawal indices must be monotonically increasing");
+        assert!(
+            returns[0].index < returns[1].index,
+            "withdrawal indices must be monotonically increasing"
+        );
         assert_ne!(returns[0].index, returns[1].index);
     }
 
@@ -974,8 +1020,14 @@ mod tests {
 
         mgr.handle_register(sender, bls, 100);
 
-        assert!(mgr.is_registered(&bls), "registered pubkey should pass is_registered");
-        assert!(!mgr.is_staked(&bls), "registered-only pubkey should not pass is_staked");
+        assert!(
+            mgr.is_registered(&bls),
+            "registered pubkey should pass is_registered"
+        );
+        assert!(
+            !mgr.is_staked(&bls),
+            "registered-only pubkey should not pass is_staked"
+        );
         assert_eq!(mgr.staker_address(&bls), Some(sender));
         assert!(mgr.get_registration(&sender).is_some());
         assert_eq!(mgr.registration_count(), 1);
@@ -1018,7 +1070,11 @@ mod tests {
         mgr.handle_stake(addr, bls, ether(32), 200);
         assert!(mgr.is_staked(&bls));
         assert!(mgr.is_registered(&bls)); // staked also counts as registered
-        assert_eq!(mgr.registration_count(), 0, "registration should be removed after stake upgrade");
+        assert_eq!(
+            mgr.registration_count(),
+            0,
+            "registration should be removed after stake upgrade"
+        );
         assert!(mgr.get_registration(&addr).is_none());
         assert!(mgr.get_stake(&addr).is_some());
     }
@@ -1081,7 +1137,10 @@ mod tests {
         mgr.handle_stake(addr, bls_b, ether(32), 200);
         assert!(mgr.is_staked(&bls_b));
         assert!(!mgr.is_registered(&bls_a), "old BLS key must be cleaned up");
-        assert!(mgr.staker_address(&bls_a).is_none(), "old BLS mapping must be removed");
+        assert!(
+            mgr.staker_address(&bls_a).is_none(),
+            "old BLS mapping must be removed"
+        );
 
         // Another user should be able to register the old BLS key A
         let addr2 = Address::with_last_byte(0x37);
@@ -1099,7 +1158,12 @@ mod tests {
             let mut mgr = StakingManager::new();
             mgr.state_file = Some(path.clone());
             mgr.handle_register(Address::with_last_byte(0x34), make_bls_pubkey(34), 100);
-            mgr.handle_stake(Address::with_last_byte(0x35), make_bls_pubkey(35), ether(32), 100);
+            mgr.handle_stake(
+                Address::with_last_byte(0x35),
+                make_bls_pubkey(35),
+                ether(32),
+                100,
+            );
             mgr.save();
         }
 

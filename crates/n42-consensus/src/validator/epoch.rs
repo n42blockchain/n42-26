@@ -1,7 +1,7 @@
-use std::collections::BTreeMap;
 use super::set::ValidatorSet;
 use crate::error::{ConsensusError, ConsensusResult};
 use n42_chainspec::ValidatorInfo;
+use std::collections::BTreeMap;
 
 /// Maximum number of historical epoch validator sets to retain.
 /// Needed for verifying QCs from recent past epochs.
@@ -58,11 +58,7 @@ impl EpochManager {
 
     /// Creates an EpochManager starting from a specific epoch.
     /// Used when a node starts from a snapshot at a non-genesis epoch.
-    pub fn from_epoch(
-        validator_set: ValidatorSet,
-        epoch_length: u64,
-        starting_epoch: u64,
-    ) -> Self {
+    pub fn from_epoch(validator_set: ValidatorSet, epoch_length: u64, starting_epoch: u64) -> Self {
         Self {
             epoch_length,
             current_epoch: starting_epoch,
@@ -90,7 +86,7 @@ impl EpochManager {
 
         // Add all but the last entry to historical
         for (epoch, validators, f) in &schedule[..schedule.len() - 1] {
-            let set = ValidatorSet::new(validators, *f);
+            let set = ValidatorSet::try_new(validators, *f)?;
             historical.insert(*epoch, set);
         }
 
@@ -103,7 +99,7 @@ impl EpochManager {
 
         // Use the last entry as current
         let (current_epoch, validators, f) = &schedule[schedule.len() - 1];
-        let current_set = ValidatorSet::new(validators, *f);
+        let current_set = ValidatorSet::try_new(validators, *f)?;
 
         Ok(Self {
             epoch_length,
@@ -179,17 +175,22 @@ impl EpochManager {
 
     /// Stages a new validator set for the next epoch.
     /// The set will be activated when `advance_epoch()` is called.
-    pub fn stage_next_epoch(&mut self, validators: &[ValidatorInfo], fault_tolerance: u32) {
-        self.next_set = Some(ValidatorSet::new(validators, fault_tolerance));
+    pub fn stage_next_epoch(
+        &mut self,
+        validators: &[ValidatorInfo],
+        fault_tolerance: u32,
+    ) -> ConsensusResult<()> {
+        self.next_set = Some(ValidatorSet::try_new(validators, fault_tolerance)?);
         self.staged_info = Some((validators.to_vec(), fault_tolerance));
+        Ok(())
     }
 
     /// Returns the staged epoch transition info for persistence.
     /// Returns `(next_epoch_number, validators, fault_tolerance)`.
     pub fn staged_epoch_info(&self) -> Option<(u64, &[ValidatorInfo], u32)> {
-        self.staged_info.as_ref().map(|(validators, f)| {
-            (self.current_epoch + 1, validators.as_slice(), *f)
-        })
+        self.staged_info
+            .as_ref()
+            .map(|(validators, f)| (self.current_epoch + 1, validators.as_slice(), *f))
     }
 
     /// Advances to the next epoch, activating the staged validator set.
@@ -201,7 +202,8 @@ impl EpochManager {
         };
 
         self.staged_info = None;
-        self.historical_sets.insert(self.current_epoch, self.current_set.clone());
+        self.historical_sets
+            .insert(self.current_epoch, self.current_set.clone());
         self.trim_historical();
 
         self.current_epoch += 1;
@@ -243,13 +245,16 @@ mod tests {
     use n42_primitives::BlsSecretKey;
 
     fn make_validator_infos(count: usize) -> Vec<ValidatorInfo> {
-        (0..count).map(|i| {
-            let sk = BlsSecretKey::random().unwrap();
-            ValidatorInfo {
-                address: Address::with_last_byte(i as u8),
-                bls_public_key: sk.public_key(),
-            }
-        }).collect()
+        (0..count)
+            .map(|i| {
+                let sk = BlsSecretKey::random().unwrap();
+                ValidatorInfo {
+                    address: Address::with_last_byte(i as u8),
+                    bls_public_key: sk.public_key(),
+                    p2p_peer_id: None,
+                }
+            })
+            .collect()
     }
 
     #[test]
@@ -275,7 +280,7 @@ mod tests {
         let em = EpochManager::with_epoch_length(vs, 10);
 
         assert!(em.epochs_enabled());
-        assert_eq!(em.epoch_for_view(1), 0);  // views 1-10 → epoch 0
+        assert_eq!(em.epoch_for_view(1), 0); // views 1-10 → epoch 0
         assert_eq!(em.epoch_for_view(10), 0);
         assert_eq!(em.epoch_for_view(11), 1); // views 11-20 → epoch 1
         assert_eq!(em.epoch_for_view(20), 1);
@@ -288,11 +293,11 @@ mod tests {
         let vs = ValidatorSet::new(&infos, 1);
         let em = EpochManager::with_epoch_length(vs, 10);
 
-        assert!(!em.is_epoch_boundary(1));  // first view, not a boundary
+        assert!(!em.is_epoch_boundary(1)); // first view, not a boundary
         assert!(!em.is_epoch_boundary(10)); // last view of epoch 0
-        assert!(em.is_epoch_boundary(11));  // first view of epoch 1
+        assert!(em.is_epoch_boundary(11)); // first view of epoch 1
         assert!(!em.is_epoch_boundary(12));
-        assert!(em.is_epoch_boundary(21));  // first view of epoch 2
+        assert!(em.is_epoch_boundary(21)); // first view of epoch 2
     }
 
     #[test]
@@ -306,7 +311,7 @@ mod tests {
         assert_eq!(em.current_validator_set().len(), 4);
 
         // Stage next epoch
-        em.stage_next_epoch(&infos2, 1);
+        em.stage_next_epoch(&infos2, 1).unwrap();
         assert!(em.has_staged_next());
 
         // Advance
@@ -335,7 +340,7 @@ mod tests {
         let vs = ValidatorSet::new(&infos1, 1);
         let mut em = EpochManager::with_epoch_length(vs, 10);
 
-        em.stage_next_epoch(&infos2, 1);
+        em.stage_next_epoch(&infos2, 1).unwrap();
         em.advance_epoch();
 
         // Current epoch (1) should use new set
@@ -354,7 +359,7 @@ mod tests {
         // Advance through 5 epochs
         for i in 0..5 {
             let new_infos = make_validator_infos(4 + i);
-            em.stage_next_epoch(&new_infos, 1);
+            em.stage_next_epoch(&new_infos, 1).unwrap();
             em.advance_epoch();
         }
 
@@ -392,7 +397,7 @@ mod tests {
         assert_eq!(em.current_validator_set().len(), 6);
         // epochs 0 and 1 should be in history
         assert_eq!(em.historical_epoch_count(), 2);
-        assert_eq!(em.validator_set_for_view(5).len(), 4);  // epoch 0
+        assert_eq!(em.validator_set_for_view(5).len(), 4); // epoch 0
         assert_eq!(em.validator_set_for_view(15).len(), 5); // epoch 1
         assert_eq!(em.validator_set_for_view(25).len(), 6); // epoch 2 (current)
     }

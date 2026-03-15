@@ -58,9 +58,8 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
         let start_idx = node_idx * 5;
         let dur = test_duration;
 
-        let handle = tokio::spawn(async move {
-            mobile_sim::run_mobile_fleet(url, 5, dur, start_idx).await
-        });
+        let handle =
+            tokio::spawn(async move { mobile_sim::run_mobile_fleet(url, 5, dur, start_idx).await });
         mobile_handles.push(handle);
     }
 
@@ -82,13 +81,15 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
             let priority_fee = gas_price / 10;
 
             // Send 5 tx/sec for a portion of the test duration.
-            let _ = tx_engine.send_transfers_at_rate(
-                &rpc,
-                5,
-                40, // ~40 seconds of transactions
-                max_fee,
-                priority_fee,
-            ).await;
+            let _ = tx_engine
+                .send_transfers_at_rate(
+                    &rpc,
+                    5,
+                    40, // ~40 seconds of transactions
+                    max_fee,
+                    priority_fee,
+                )
+                .await;
         }
     });
 
@@ -115,11 +116,7 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
 
     // === Verification ===
 
-    info!(
-        total_accepted,
-        total_errors,
-        "mobile attestation results"
-    );
+    info!(total_accepted, total_errors, "mobile attestation results");
 
     // Check 1: At least some attestations were accepted.
     if total_accepted == 0 {

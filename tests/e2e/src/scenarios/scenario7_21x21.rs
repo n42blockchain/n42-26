@@ -35,7 +35,8 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
         block_interval_ms = BLOCK_INTERVAL_MS,
         max_duration_secs = MAX_DURATION_SECS,
         "target: each validator produces {} blocks ({} total)",
-        BLOCKS_PER_VALIDATOR, REQUIRED_BLOCKS,
+        BLOCKS_PER_VALIDATOR,
+        REQUIRED_BLOCKS,
     );
 
     let accounts = genesis::generate_test_accounts();
@@ -58,7 +59,10 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
             .filter(|&j| j != i)
             .map(|j| {
                 let peer_port = 9400 + PORT_OFFSET_BASE + (j as u16) * 10;
-                format!("/ip4/127.0.0.1/udp/{}/quic-v1/p2p/{}", peer_port, peer_ids[j])
+                format!(
+                    "/ip4/127.0.0.1/udp/{}/quic-v1/p2p/{}",
+                    peer_port, peer_ids[j]
+                )
             })
             .collect();
 
@@ -93,7 +97,10 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
     info!(started = nodes.len(), "all {} nodes started", NODE_COUNT);
 
     // Allow time for P2P mesh to stabilize.
-    info!("waiting 20s for P2P mesh stabilization with {} nodes", NODE_COUNT);
+    info!(
+        "waiting 20s for P2P mesh stabilization with {} nodes",
+        NODE_COUNT
+    );
     tokio::time::sleep(Duration::from_secs(20)).await;
 
     // Adaptive wait: poll block heights until we reach the target.
@@ -169,10 +176,15 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
         }
         return Err(eyre::eyre!(
             "V1 FAILED: height divergence > 1: max={}, min={}, heights={:?}",
-            max_height, min_height, heights
+            max_height,
+            min_height,
+            heights
         ));
     }
-    info!("V1 PASS: height consistency (max-min={}) within tolerance", max_height - min_height);
+    info!(
+        "V1 PASS: height consistency (max-min={}) within tolerance",
+        max_height - min_height
+    );
 
     // === V2: Minimum block count (>= 441) ===
     if min_height < REQUIRED_BLOCKS {
@@ -181,10 +193,16 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
         }
         return Err(eyre::eyre!(
             "V2 FAILED: min_height={} < required {}, reached_target={}",
-            min_height, REQUIRED_BLOCKS, reached_target
+            min_height,
+            REQUIRED_BLOCKS,
+            reached_target
         ));
     }
-    info!(min_height, required = REQUIRED_BLOCKS, "V2 PASS: minimum block count");
+    info!(
+        min_height,
+        required = REQUIRED_BLOCKS,
+        "V2 PASS: minimum block count"
+    );
 
     // === V3: Block hash consistency (sampled across the chain) ===
     let sample_heights = [
@@ -222,12 +240,16 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
             }
             return Err(eyre::eyre!(
                 "V3 FAILED: block hash mismatch at height {}: {:?}",
-                sample_h, hashes
+                sample_h,
+                hashes
             ));
         }
         info!(height = sample_h, hash = %ref_hash, "V3: block hash consistent");
     }
-    info!("V3 PASS: block hash consistency across {} sample heights", sample_heights.len());
+    info!(
+        "V3 PASS: block hash consistency across {} sample heights",
+        sample_heights.len()
+    );
 
     // === V4: Each validator produced >= 21 blocks ===
     let mut miner_counts: HashMap<String, u64> = HashMap::new();
@@ -264,7 +286,10 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
     let mut v4_failures = Vec::new();
     for (miner, &count) in &miner_counts {
         if count < BLOCKS_PER_VALIDATOR {
-            v4_failures.push(format!("{}: {} blocks (need {})", miner, count, BLOCKS_PER_VALIDATOR));
+            v4_failures.push(format!(
+                "{}: {} blocks (need {})",
+                miner, count, BLOCKS_PER_VALIDATOR
+            ));
         }
     }
     if !v4_failures.is_empty() {
@@ -282,7 +307,8 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
         min_per_validator = miner_counts.values().min().unwrap_or(&0),
         max_per_validator = miner_counts.values().max().unwrap_or(&0),
         "V4 PASS: all {} validators produced >= {} blocks",
-        NODE_COUNT, BLOCKS_PER_VALIDATOR
+        NODE_COUNT,
+        BLOCKS_PER_VALIDATOR
     );
 
     // === V5: Leader rotation fairness ===
@@ -295,7 +321,10 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
             }
             return Err(eyre::eyre!(
                 "V5 FAILED: unfair rotation: miner {} produced {} blocks (expected ~{:.0}, ratio={:.2})",
-                miner, count, expected_per, ratio
+                miner,
+                count,
+                expected_per,
+                ratio
             ));
         }
     }
@@ -312,10 +341,12 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
         let b1 = nodes[0].rpc.get_block_by_number(h - 1).await;
         let b2 = nodes[0].rpc.get_block_by_number(h).await;
         if let (Ok(b1), Ok(b2)) = (b1, b2) {
-            let t1 = b1.get("timestamp")
+            let t1 = b1
+                .get("timestamp")
                 .and_then(|t| t.as_str())
                 .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok());
-            let t2 = b2.get("timestamp")
+            let t2 = b2
+                .get("timestamp")
                 .and_then(|t| t.as_str())
                 .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok());
             if let (Some(t1), Some(t2)) = (t1, t2) {

@@ -83,9 +83,8 @@ impl JmtProof {
         }
 
         // Step 2: Deserialize shard proof.
-        let proof: SparseMerkleProof<Blake3Hasher> =
-            bincode::deserialize(&self.proof_bytes)
-                .map_err(|e| VerifyError::DeserializationFailed(e.to_string()))?;
+        let proof: SparseMerkleProof<Blake3Hasher> = bincode::deserialize(&self.proof_bytes)
+            .map_err(|e| VerifyError::DeserializationFailed(e.to_string()))?;
 
         // Step 3: Verify shard proof against shard root.
         let shard_root = RootHash(self.shard_roots[self.shard_index as usize]);
@@ -144,7 +143,7 @@ pub fn build_proof(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{account_key, ShardedJmt};
+    use crate::{ShardedJmt, account_key};
     use alloy_primitives::{Address, U256};
     use n42_execution::state_diff::{AccountChangeType, AccountDiff, StateDiff, ValueChange};
     use std::collections::BTreeMap;

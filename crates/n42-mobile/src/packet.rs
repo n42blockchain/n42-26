@@ -1,4 +1,4 @@
-use alloy_primitives::{Address, Bytes, B256, U256};
+use alloy_primitives::{Address, B256, Bytes, U256};
 use serde::{Deserialize, Serialize};
 
 /// A single account's state in the V1 verification witness.
@@ -48,9 +48,16 @@ impl VerificationPacket {
     pub fn estimated_size(&self) -> usize {
         let header_size = 200 + self.header_rlp.len();
         let tx_size: usize = self.transactions.iter().map(|t| t.len()).sum();
-        let witness_size: usize =
-            self.witness_accounts.iter().map(|a| 100 + a.storage.len() * 64).sum();
-        let code_size: usize = self.uncached_bytecodes.iter().map(|(_, c)| 32 + c.len()).sum();
+        let witness_size: usize = self
+            .witness_accounts
+            .iter()
+            .map(|a| 100 + a.storage.len() * 64)
+            .sum();
+        let code_size: usize = self
+            .uncached_bytecodes
+            .iter()
+            .map(|(_, c)| 32 + c.len())
+            .sum();
         header_size + tx_size + witness_size + code_size
     }
 }
@@ -119,7 +126,11 @@ impl StreamPacket {
 pub fn encode_stream_packet(packet: &StreamPacket) -> Vec<u8> {
     use crate::wire::{self, FLAG_HAS_BYTECODES};
 
-    let flags = if packet.bytecodes.is_empty() { 0x00 } else { FLAG_HAS_BYTECODES };
+    let flags = if packet.bytecodes.is_empty() {
+        0x00
+    } else {
+        FLAG_HAS_BYTECODES
+    };
     let mut buf = Vec::with_capacity(packet.estimated_size());
 
     wire::encode_header(&mut buf, wire::VERSION_1, flags);
@@ -186,7 +197,11 @@ pub fn decode_stream_packet(data: &[u8]) -> Result<StreamPacket, crate::wire::Wi
     let tx_count = u32::from_le_bytes(payload[pos..pos + 4].try_into().unwrap()) as usize;
     pos += 4;
     if tx_count > MAX_TX_COUNT {
-        return Err(WireError::LengthOverflow { offset: pos - 4, need: tx_count, remaining: MAX_TX_COUNT });
+        return Err(WireError::LengthOverflow {
+            offset: pos - 4,
+            need: tx_count,
+            remaining: MAX_TX_COUNT,
+        });
     }
     let mut transactions = Vec::with_capacity(tx_count);
     for _ in 0..tx_count {
@@ -209,7 +224,11 @@ pub fn decode_stream_packet(data: &[u8]) -> Result<StreamPacket, crate::wire::Wi
     let code_count = u32::from_le_bytes(payload[pos..pos + 4].try_into().unwrap()) as usize;
     pos += 4;
     if code_count > MAX_BYTECODE_COUNT {
-        return Err(WireError::LengthOverflow { offset: pos - 4, need: code_count, remaining: MAX_BYTECODE_COUNT });
+        return Err(WireError::LengthOverflow {
+            offset: pos - 4,
+            need: code_count,
+            remaining: MAX_BYTECODE_COUNT,
+        });
     }
     let mut bytecodes = Vec::with_capacity(code_count);
     for _ in 0..code_count {
@@ -224,13 +243,19 @@ pub fn decode_stream_packet(data: &[u8]) -> Result<StreamPacket, crate::wire::Wi
         bytecodes.push((hash, code));
     }
 
-    Ok(StreamPacket { block_hash, header_rlp, transactions, read_log_data, bytecodes })
+    Ok(StreamPacket {
+        block_hash,
+        header_rlp,
+        transactions,
+        read_log_data,
+        bytecodes,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_primitives::{Address, Bytes, B256, U256, KECCAK256_EMPTY};
+    use alloy_primitives::{Address, B256, Bytes, KECCAK256_EMPTY, U256};
 
     fn make_packet() -> VerificationPacket {
         let account = WitnessAccount {
@@ -238,7 +263,10 @@ mod tests {
             nonce: 5,
             balance: U256::from(1_000_000u64),
             code_hash: B256::from([0xCC; 32]),
-            storage: vec![(U256::from(0), U256::from(42)), (U256::from(1), U256::from(99))],
+            storage: vec![
+                (U256::from(0), U256::from(42)),
+                (U256::from(1), U256::from(99)),
+            ],
         };
         VerificationPacket {
             block_hash: B256::from([1u8; 32]),
@@ -277,14 +305,35 @@ mod tests {
         assert_eq!(decoded.transactions[0], packet.transactions[0]);
         assert_eq!(decoded.transactions[1], packet.transactions[1]);
         assert_eq!(decoded.witness_accounts.len(), 1);
-        assert_eq!(decoded.witness_accounts[0].address, packet.witness_accounts[0].address);
-        assert_eq!(decoded.witness_accounts[0].nonce, packet.witness_accounts[0].nonce);
-        assert_eq!(decoded.witness_accounts[0].balance, packet.witness_accounts[0].balance);
-        assert_eq!(decoded.witness_accounts[0].code_hash, packet.witness_accounts[0].code_hash);
-        assert_eq!(decoded.witness_accounts[0].storage, packet.witness_accounts[0].storage);
+        assert_eq!(
+            decoded.witness_accounts[0].address,
+            packet.witness_accounts[0].address
+        );
+        assert_eq!(
+            decoded.witness_accounts[0].nonce,
+            packet.witness_accounts[0].nonce
+        );
+        assert_eq!(
+            decoded.witness_accounts[0].balance,
+            packet.witness_accounts[0].balance
+        );
+        assert_eq!(
+            decoded.witness_accounts[0].code_hash,
+            packet.witness_accounts[0].code_hash
+        );
+        assert_eq!(
+            decoded.witness_accounts[0].storage,
+            packet.witness_accounts[0].storage
+        );
         assert_eq!(decoded.uncached_bytecodes.len(), 1);
-        assert_eq!(decoded.uncached_bytecodes[0].0, packet.uncached_bytecodes[0].0);
-        assert_eq!(decoded.uncached_bytecodes[0].1, packet.uncached_bytecodes[0].1);
+        assert_eq!(
+            decoded.uncached_bytecodes[0].0,
+            packet.uncached_bytecodes[0].0
+        );
+        assert_eq!(
+            decoded.uncached_bytecodes[0].1,
+            packet.uncached_bytecodes[0].1
+        );
         assert_eq!(decoded.lowest_block_number, packet.lowest_block_number);
         assert_eq!(decoded.block_hashes, packet.block_hashes);
     }
@@ -325,7 +374,7 @@ mod tests {
     }
 
     fn make_stream_packet() -> StreamPacket {
-        use n42_execution::read_log::{encode_read_log, ReadLogEntry};
+        use n42_execution::read_log::{ReadLogEntry, encode_read_log};
         let read_log = vec![
             ReadLogEntry::Account {
                 nonce: 5,
@@ -335,7 +384,11 @@ mod tests {
             ReadLogEntry::Storage(U256::from(42u64)),
             ReadLogEntry::AccountNotFound,
             ReadLogEntry::BlockHash(B256::from([0xDD; 32])),
-            ReadLogEntry::Account { nonce: 0, balance: U256::ZERO, code_hash: KECCAK256_EMPTY },
+            ReadLogEntry::Account {
+                nonce: 0,
+                balance: U256::ZERO,
+                code_hash: KECCAK256_EMPTY,
+            },
         ];
         StreamPacket {
             block_hash: B256::from([1u8; 32]),
@@ -413,17 +466,24 @@ mod tests {
 
     #[test]
     fn test_v1_v2_size_comparison() {
-        use n42_execution::read_log::{encode_read_log, ReadLogEntry};
+        use n42_execution::read_log::{ReadLogEntry, encode_read_log};
 
         let mut witness_accounts = Vec::new();
         let mut read_log_entries = Vec::new();
 
         for i in 0u8..10 {
             let is_contract = i % 3 == 0;
-            let code_hash =
-                if is_contract { B256::from([0xC0 + i; 32]) } else { KECCAK256_EMPTY };
+            let code_hash = if is_contract {
+                B256::from([0xC0 + i; 32])
+            } else {
+                KECCAK256_EMPTY
+            };
             let nonce = if i % 2 == 0 { i as u64 * 10 } else { 0 };
-            let balance = if i > 3 { U256::from(i as u64 * 1_000_000) } else { U256::ZERO };
+            let balance = if i > 3 {
+                U256::from(i as u64 * 1_000_000)
+            } else {
+                U256::ZERO
+            };
             let num_slots = (i % 5) as usize;
 
             let storage: Vec<(U256, U256)> = (0..num_slots)
@@ -437,7 +497,11 @@ mod tests {
                 storage,
             });
 
-            read_log_entries.push(ReadLogEntry::Account { nonce, balance, code_hash });
+            read_log_entries.push(ReadLogEntry::Account {
+                nonce,
+                balance,
+                code_hash,
+            });
             for s in 0..num_slots {
                 read_log_entries.push(ReadLogEntry::Storage(U256::from(s * 100 + i as usize)));
             }

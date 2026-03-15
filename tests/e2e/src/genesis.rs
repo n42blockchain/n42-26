@@ -1,5 +1,5 @@
 use alloy_primitives::{Address, B256, U256, keccak256};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
 /// Number of pre-funded test accounts.
@@ -24,7 +24,10 @@ pub fn generate_test_accounts() -> Vec<TestAccount> {
             let seed = format!("n42-test-key-{i}");
             let private_key = keccak256(seed.as_bytes());
             let address = private_key_to_address(&private_key);
-            TestAccount { private_key, address }
+            TestAccount {
+                private_key,
+                address,
+            }
         })
         .collect()
 }
@@ -33,8 +36,7 @@ pub fn generate_test_accounts() -> Vec<TestAccount> {
 fn private_key_to_address(private_key: &B256) -> Address {
     use alloy_signer_local::PrivateKeySigner;
 
-    let signer = PrivateKeySigner::from_bytes(private_key)
-        .expect("valid private key");
+    let signer = PrivateKeySigner::from_bytes(private_key).expect("valid private key");
     signer.address()
 }
 

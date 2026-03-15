@@ -5,15 +5,15 @@
 //! 2. ERC-20 style transfer (SLOAD/SSTORE contract call) — single-core
 //! 3. Parallel ETH transfers — Block-STM multi-core
 
-use alloy_primitives::{address, Address, TxKind, U256};
+use alloy_primitives::{Address, TxKind, U256, address};
 use revm::{
+    Context, ExecuteCommitEvm, MainBuilder, MainContext,
     context::{BlockEnv, CfgEnv, TxEnv},
     database::{CacheDB, EmptyDB},
     state::AccountInfo,
-    Context, ExecuteCommitEvm, MainBuilder, MainContext,
 };
-use std::time::Instant;
 use std::net::UdpSocket;
+use std::time::Instant;
 
 const SENDER: Address = address!("1000000000000000000000000000000000000001");
 const RECEIVER: Address = address!("2000000000000000000000000000000000000002");
@@ -46,18 +46,18 @@ fn bench_mixed_block() {
 
     // ERC-20 contract bytecode (same as bench_erc20_transfer)
     let bytecode: Vec<u8> = vec![
-        0x60, 0x00, 0x54,       // PUSH1 0, SLOAD (sender bal)
+        0x60, 0x00, 0x54, // PUSH1 0, SLOAD (sender bal)
         0x60, 0x01, 0x90, 0x03, // PUSH1 1, SWAP1, SUB
-        0x60, 0x00, 0x55,       // PUSH1 0, SSTORE
-        0x60, 0x01, 0x54,       // PUSH1 1, SLOAD (receiver bal)
-        0x60, 0x01, 0x01,       // PUSH1 1, ADD
-        0x60, 0x01, 0x55,       // PUSH1 1, SSTORE
-        0x60, 0x01,             // PUSH1 1 (true)
-        0x60, 0x00,             // PUSH1 0 (memory offset)
-        0x52,                   // MSTORE
-        0x60, 0x20,             // PUSH1 32
-        0x60, 0x00,             // PUSH1 0
-        0xf3,                   // RETURN
+        0x60, 0x00, 0x55, // PUSH1 0, SSTORE
+        0x60, 0x01, 0x54, // PUSH1 1, SLOAD (receiver bal)
+        0x60, 0x01, 0x01, // PUSH1 1, ADD
+        0x60, 0x01, 0x55, // PUSH1 1, SSTORE
+        0x60, 0x01, // PUSH1 1 (true)
+        0x60, 0x00, // PUSH1 0 (memory offset)
+        0x52, // MSTORE
+        0x60, 0x20, // PUSH1 32
+        0x60, 0x00, // PUSH1 0
+        0xf3, // RETURN
     ];
 
     let block_sizes = [1_000, 5_000, 10_000, 23_809, 50_000, 100_000];
@@ -70,19 +70,25 @@ fn bench_mixed_block() {
 
         // Deploy ERC-20 contract
         let mut contract_info = AccountInfo::default();
-        contract_info.code = Some(revm::bytecode::Bytecode::new_legacy(bytecode.clone().into()));
+        contract_info.code = Some(revm::bytecode::Bytecode::new_legacy(
+            bytecode.clone().into(),
+        ));
         contract_info.code_hash = contract_info.code.as_ref().unwrap().hash_slow();
         db.insert_account_info(ERC20_ADDR, contract_info);
-        db.insert_account_storage(ERC20_ADDR, U256::ZERO, U256::from(u128::MAX)).unwrap();
+        db.insert_account_storage(ERC20_ADDR, U256::ZERO, U256::from(u128::MAX))
+            .unwrap();
 
         // Create unique senders for all txs
         for i in 0..total_txs {
             let sender = Address::from_word(U256::from(0x10000 + i as u64).into());
-            db.insert_account_info(sender, AccountInfo {
-                balance: U256::from(u128::MAX),
-                nonce: 0,
-                ..Default::default()
-            });
+            db.insert_account_info(
+                sender,
+                AccountInfo {
+                    balance: U256::from(u128::MAX),
+                    nonce: 0,
+                    ..Default::default()
+                },
+            );
         }
 
         let ctx = Context::mainnet().with_db(&mut db);
@@ -108,7 +114,8 @@ fn bench_mixed_block() {
 
         // Execute ERC-20 transfers (10%)
         for i in 0..erc20_count {
-            let sender = Address::from_word(U256::from(0x10000 + transfer_count as u64 + i as u64).into());
+            let sender =
+                Address::from_word(U256::from(0x10000 + transfer_count as u64 + i as u64).into());
             let tx = TxEnv::builder()
                 .caller(sender)
                 .kind(TxKind::Call(ERC20_ADDR))
@@ -142,10 +149,13 @@ fn bench_eth_transfer() {
     println!("--- ETH Transfer (21000 gas) ---");
 
     let mut db = CacheDB::<EmptyDB>::default();
-    db.insert_account_info(SENDER, AccountInfo {
-        balance: U256::from(u128::MAX),
-        ..Default::default()
-    });
+    db.insert_account_info(
+        SENDER,
+        AccountInfo {
+            balance: U256::from(u128::MAX),
+            ..Default::default()
+        },
+    );
 
     let warmup = 1_000;
     let iterations = 100_000;
@@ -170,11 +180,14 @@ fn bench_eth_transfer() {
 
     // Reset state for clean measurement
     let mut db = CacheDB::<EmptyDB>::default();
-    db.insert_account_info(SENDER, AccountInfo {
-        balance: U256::from(u128::MAX),
-        nonce: 0,
-        ..Default::default()
-    });
+    db.insert_account_info(
+        SENDER,
+        AccountInfo {
+            balance: U256::from(u128::MAX),
+            nonce: 0,
+            ..Default::default()
+        },
+    );
 
     let ctx = Context::mainnet().with_db(&mut db);
     let mut evm = ctx.build_mainnet();
@@ -207,35 +220,41 @@ fn bench_erc20_transfer() {
     println!("--- ERC-20 Transfer (2x SLOAD + 2x SSTORE contract call) ---");
 
     let mut db = CacheDB::<EmptyDB>::default();
-    db.insert_account_info(SENDER, AccountInfo {
-        balance: U256::from(u128::MAX),
-        ..Default::default()
-    });
+    db.insert_account_info(
+        SENDER,
+        AccountInfo {
+            balance: U256::from(u128::MAX),
+            ..Default::default()
+        },
+    );
 
     // Hand-crafted bytecode: SLOAD slot 0 (sender), SUB 1, SSTORE;
     // SLOAD slot 1 (receiver), ADD 1, SSTORE; RETURN(32, 0)
     let bytecode: Vec<u8> = vec![
-        0x60, 0x00, 0x54,       // PUSH1 0, SLOAD (sender bal)
+        0x60, 0x00, 0x54, // PUSH1 0, SLOAD (sender bal)
         0x60, 0x01, 0x90, 0x03, // PUSH1 1, SWAP1, SUB
-        0x60, 0x00, 0x55,       // PUSH1 0, SSTORE
-        0x60, 0x01, 0x54,       // PUSH1 1, SLOAD (receiver bal)
-        0x60, 0x01, 0x01,       // PUSH1 1, ADD
-        0x60, 0x01, 0x55,       // PUSH1 1, SSTORE
-        0x60, 0x01,             // PUSH1 1 (true)
-        0x60, 0x00,             // PUSH1 0 (memory offset)
-        0x52,                   // MSTORE
-        0x60, 0x20,             // PUSH1 32
-        0x60, 0x00,             // PUSH1 0
-        0xf3,                   // RETURN
+        0x60, 0x00, 0x55, // PUSH1 0, SSTORE
+        0x60, 0x01, 0x54, // PUSH1 1, SLOAD (receiver bal)
+        0x60, 0x01, 0x01, // PUSH1 1, ADD
+        0x60, 0x01, 0x55, // PUSH1 1, SSTORE
+        0x60, 0x01, // PUSH1 1 (true)
+        0x60, 0x00, // PUSH1 0 (memory offset)
+        0x52, // MSTORE
+        0x60, 0x20, // PUSH1 32
+        0x60, 0x00, // PUSH1 0
+        0xf3, // RETURN
     ];
 
     let mut contract_info = AccountInfo::default();
-    contract_info.code = Some(revm::bytecode::Bytecode::new_legacy(bytecode.clone().into()));
+    contract_info.code = Some(revm::bytecode::Bytecode::new_legacy(
+        bytecode.clone().into(),
+    ));
     contract_info.code_hash = contract_info.code.as_ref().unwrap().hash_slow();
     db.insert_account_info(ERC20_ADDR, contract_info);
 
     // Initial sender balance in contract storage slot 0
-    db.insert_account_storage(ERC20_ADDR, U256::ZERO, U256::from(u128::MAX)).unwrap();
+    db.insert_account_storage(ERC20_ADDR, U256::ZERO, U256::from(u128::MAX))
+        .unwrap();
 
     let iterations: u64 = 100_000;
 
@@ -258,17 +277,21 @@ fn bench_erc20_transfer() {
 
     // Reset
     let mut db = CacheDB::<EmptyDB>::default();
-    db.insert_account_info(SENDER, AccountInfo {
-        balance: U256::from(u128::MAX),
-        nonce: 0,
-        ..Default::default()
-    });
+    db.insert_account_info(
+        SENDER,
+        AccountInfo {
+            balance: U256::from(u128::MAX),
+            nonce: 0,
+            ..Default::default()
+        },
+    );
 
     let mut contract_info = AccountInfo::default();
     contract_info.code = Some(revm::bytecode::Bytecode::new_legacy(bytecode.into()));
     contract_info.code_hash = contract_info.code.as_ref().unwrap().hash_slow();
     db.insert_account_info(ERC20_ADDR, contract_info);
-    db.insert_account_storage(ERC20_ADDR, U256::ZERO, U256::from(u128::MAX)).unwrap();
+    db.insert_account_storage(ERC20_ADDR, U256::ZERO, U256::from(u128::MAX))
+        .unwrap();
 
     let ctx = Context::mainnet().with_db(&mut db);
     let mut evm = ctx.build_mainnet();
@@ -339,18 +362,24 @@ fn bench_parallel_transfers() {
 
         // Sequential: force sequential path with high threshold.
         // SAFETY: benchmark is single-threaded at this point.
-        unsafe { std::env::set_var("N42_PARALLEL_THRESHOLD", &format!("{}", num_txs + 1)); }
+        unsafe {
+            std::env::set_var("N42_PARALLEL_THRESHOLD", &format!("{}", num_txs + 1));
+        }
         let seq_start = Instant::now();
         let seq_result =
             n42_parallel_evm::parallel_execute(&txs, &db, cfg_env.clone(), block_env.clone());
         let seq_elapsed = seq_start.elapsed();
 
         // Parallel: force parallel path with threshold=1.
-        unsafe { std::env::set_var("N42_PARALLEL_THRESHOLD", "1"); }
+        unsafe {
+            std::env::set_var("N42_PARALLEL_THRESHOLD", "1");
+        }
         let par_start = Instant::now();
         let par_result = n42_parallel_evm::parallel_execute(&txs, &db, cfg_env, block_env);
         let par_elapsed = par_start.elapsed();
-        unsafe { std::env::remove_var("N42_PARALLEL_THRESHOLD"); }
+        unsafe {
+            std::env::remove_var("N42_PARALLEL_THRESHOLD");
+        }
 
         let seq_ok = seq_result.is_ok();
         let par_ok = par_result.is_ok();
@@ -394,7 +423,9 @@ fn bench_serialization_compression() {
             let mut buf = Vec::with_capacity(num_txs * 220);
             buf.push(b'[');
             for i in 0..num_txs {
-                if i > 0 { buf.push(b','); }
+                if i > 0 {
+                    buf.push(b',');
+                }
                 buf.extend_from_slice(tx_template.as_bytes());
             }
             buf.push(b']');
@@ -595,25 +626,30 @@ fn bench_full_pipeline_timeline() {
 
     // ERC-20 bytecode
     let bytecode: Vec<u8> = vec![
-        0x60, 0x00, 0x54, 0x60, 0x01, 0x90, 0x03, 0x60, 0x00, 0x55,
-        0x60, 0x01, 0x54, 0x60, 0x01, 0x01, 0x60, 0x01, 0x55,
-        0x60, 0x01, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3,
+        0x60, 0x00, 0x54, 0x60, 0x01, 0x90, 0x03, 0x60, 0x00, 0x55, 0x60, 0x01, 0x54, 0x60, 0x01,
+        0x01, 0x60, 0x01, 0x55, 0x60, 0x01, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3,
     ];
 
     // ============ Stage 1: EVM Execution ============
     let mut db = CacheDB::<EmptyDB>::default();
     let mut contract_info = AccountInfo::default();
-    contract_info.code = Some(revm::bytecode::Bytecode::new_legacy(bytecode.clone().into()));
+    contract_info.code = Some(revm::bytecode::Bytecode::new_legacy(
+        bytecode.clone().into(),
+    ));
     contract_info.code_hash = contract_info.code.as_ref().unwrap().hash_slow();
     db.insert_account_info(ERC20_ADDR, contract_info);
-    db.insert_account_storage(ERC20_ADDR, U256::ZERO, U256::from(u128::MAX)).unwrap();
+    db.insert_account_storage(ERC20_ADDR, U256::ZERO, U256::from(u128::MAX))
+        .unwrap();
     for i in 0..total_txs {
         let sender = Address::from_word(U256::from(0x10000 + i as u64).into());
-        db.insert_account_info(sender, AccountInfo {
-            balance: U256::from(u128::MAX),
-            nonce: 0,
-            ..Default::default()
-        });
+        db.insert_account_info(
+            sender,
+            AccountInfo {
+                balance: U256::from(u128::MAX),
+                nonce: 0,
+                ..Default::default()
+            },
+        );
     }
 
     let ctx = Context::mainnet().with_db(&mut db);
@@ -635,7 +671,8 @@ fn bench_full_pipeline_timeline() {
         let _ = evm.transact_commit(tx);
     }
     for i in 0..erc20_count {
-        let sender = Address::from_word(U256::from(0x10000 + transfer_count as u64 + i as u64).into());
+        let sender =
+            Address::from_word(U256::from(0x10000 + transfer_count as u64 + i as u64).into());
         let tx = TxEnv::builder()
             .caller(sender)
             .kind(TxKind::Call(ERC20_ADDR))
@@ -656,7 +693,9 @@ fn bench_full_pipeline_timeline() {
     let mut payload_json = Vec::with_capacity(total_txs * 220);
     payload_json.push(b'[');
     for i in 0..total_txs {
-        if i > 0 { payload_json.push(b','); }
+        if i > 0 {
+            payload_json.push(b',');
+        }
         payload_json.extend_from_slice(tx_template.as_bytes());
     }
     payload_json.push(b']');
@@ -730,24 +769,61 @@ fn bench_full_pipeline_timeline() {
     let total_serial = leader_serial + consensus_time_ms + finalize_time_ms;
 
     println!("  Block: {total_txs} txs ({transfer_count} transfer + {erc20_count} ERC-20)");
-    println!("  Total gas: {:.0}M ({:.1}% of 500M)", total_gas as f64 / 1e6, total_gas as f64 / 5e8 * 100.0);
-    println!("  Raw payload: {:.1}MB  Compressed: {:.1}MB  Ratio: {:.0}%",
+    println!(
+        "  Total gas: {:.0}M ({:.1}% of 500M)",
+        total_gas as f64 / 1e6,
+        total_gas as f64 / 5e8 * 100.0
+    );
+    println!(
+        "  Raw payload: {:.1}MB  Compressed: {:.1}MB  Ratio: {:.0}%",
         raw_size as f64 / 1_048_576.0,
         compressed_size as f64 / 1_048_576.0,
-        compressed_size as f64 / raw_size as f64 * 100.0);
+        compressed_size as f64 / raw_size as f64 * 100.0
+    );
     println!();
     println!("  ┌─────────────────────────────────────────────────────────────┐");
     println!("  │ Stage                          │  Time (ms) │  % of total  │");
     println!("  ├─────────────────────────────────────────────────────────────┤");
-    println!("  │ 1. EVM execution (leader)      │ {:>9.1}  │ {:>9.1}%   │", evm_ms, evm_ms / total_serial * 100.0);
-    println!("  │ 2. Serialize to JSON           │ {:>9.1}  │ {:>9.1}%   │", ser_ms, ser_ms / total_serial * 100.0);
-    println!("  │ 3. zstd compress               │ {:>9.1}  │ {:>9.1}%   │", comp_ms, comp_ms / total_serial * 100.0);
-    println!("  │ 4. Network send (6 followers)  │ {:>9.1}  │ {:>9.1}%   │", net_ms, net_ms / total_serial * 100.0);
-    println!("  │ 5. zstd decompress (follower)  │ {:>9.1}  │ {:>9.1}%   │", dec_ms, dec_ms / total_serial * 100.0);
-    println!("  │ 6. Consensus voting            │ {:>9.1}  │ {:>9.1}%   │", consensus_time_ms, consensus_time_ms / total_serial * 100.0);
-    println!("  │ 7. Finalize FCU                │ {:>9.1}  │ {:>9.1}%   │", finalize_time_ms, finalize_time_ms / total_serial * 100.0);
+    println!(
+        "  │ 1. EVM execution (leader)      │ {:>9.1}  │ {:>9.1}%   │",
+        evm_ms,
+        evm_ms / total_serial * 100.0
+    );
+    println!(
+        "  │ 2. Serialize to JSON           │ {:>9.1}  │ {:>9.1}%   │",
+        ser_ms,
+        ser_ms / total_serial * 100.0
+    );
+    println!(
+        "  │ 3. zstd compress               │ {:>9.1}  │ {:>9.1}%   │",
+        comp_ms,
+        comp_ms / total_serial * 100.0
+    );
+    println!(
+        "  │ 4. Network send (6 followers)  │ {:>9.1}  │ {:>9.1}%   │",
+        net_ms,
+        net_ms / total_serial * 100.0
+    );
+    println!(
+        "  │ 5. zstd decompress (follower)  │ {:>9.1}  │ {:>9.1}%   │",
+        dec_ms,
+        dec_ms / total_serial * 100.0
+    );
+    println!(
+        "  │ 6. Consensus voting            │ {:>9.1}  │ {:>9.1}%   │",
+        consensus_time_ms,
+        consensus_time_ms / total_serial * 100.0
+    );
+    println!(
+        "  │ 7. Finalize FCU                │ {:>9.1}  │ {:>9.1}%   │",
+        finalize_time_ms,
+        finalize_time_ms / total_serial * 100.0
+    );
     println!("  ├─────────────────────────────────────────────────────────────┤");
-    println!("  │ Total (serial, no overlap)     │ {:>9.1}  │  100.0%     │", total_serial);
+    println!(
+        "  │ Total (serial, no overlap)     │ {:>9.1}  │  100.0%     │",
+        total_serial
+    );
     println!("  └─────────────────────────────────────────────────────────────┘");
     println!();
     println!("  *** Pipeline with parallelism (actual expected timeline) ***");
@@ -774,26 +850,46 @@ fn bench_full_pipeline_timeline() {
     let pipeline_total = leader_build + parallel_mid + finalize_time_ms;
 
     println!("  Leader build (EVM+ser+comp):    {:>7.1}ms", leader_build);
-    println!("  ├─ Consensus path (net+vote):   {:>7.1}ms  (parallel)", consensus_path);
-    println!("  ├─ Follower path (net+dec+EVM): {:>7.1}ms  (parallel)", follower_path);
+    println!(
+        "  ├─ Consensus path (net+vote):   {:>7.1}ms  (parallel)",
+        consensus_path
+    );
+    println!(
+        "  ├─ Follower path (net+dec+EVM): {:>7.1}ms  (parallel)",
+        follower_path
+    );
     println!("  └─ Bottleneck of parallel:      {:>7.1}ms", parallel_mid);
-    println!("  Finalize FCU:                   {:>7.1}ms", finalize_time_ms);
+    println!(
+        "  Finalize FCU:                   {:>7.1}ms",
+        finalize_time_ms
+    );
     println!("  ─────────────────────────────────────────");
-    println!("  Pipeline total:                 {:>7.1}ms", pipeline_total);
+    println!(
+        "  Pipeline total:                 {:>7.1}ms",
+        pipeline_total
+    );
     println!();
 
     // TPS projections at different slot times
     let tps_per_ms = total_txs as f64 / pipeline_total;
     println!("  *** TPS projections ***");
-    println!("  If slot = pipeline_total ({:.0}ms):  {:.0} TPS", pipeline_total, tps_per_ms * 1000.0);
+    println!(
+        "  If slot = pipeline_total ({:.0}ms):  {:.0} TPS",
+        pipeline_total,
+        tps_per_ms * 1000.0
+    );
     for slot_ms in [500.0, 1000.0, 2000.0, 4000.0] {
         if slot_ms >= pipeline_total {
             let idle = slot_ms - pipeline_total;
-            println!("  If slot = {slot_ms:.0}ms:  {:.0} TPS  (idle {idle:.0}ms = {:.0}%)",
+            println!(
+                "  If slot = {slot_ms:.0}ms:  {:.0} TPS  (idle {idle:.0}ms = {:.0}%)",
                 total_txs as f64 / (slot_ms / 1000.0),
-                idle / slot_ms * 100.0);
+                idle / slot_ms * 100.0
+            );
         } else {
-            println!("  If slot = {slot_ms:.0}ms:  *** CANNOT FIT — need {pipeline_total:.0}ms ***");
+            println!(
+                "  If slot = {slot_ms:.0}ms:  *** CANNOT FIT — need {pipeline_total:.0}ms ***"
+            );
         }
     }
 
@@ -805,10 +901,14 @@ fn bench_full_pipeline_timeline() {
         let s = (start * scale) as usize;
         let e = (end * scale) as usize;
         let width = e.saturating_sub(s).max(1);
-        format!("  {:>width_pad$}{}{} {label} ({:.0}ms)",
-            "", "█".repeat(width), "",
+        format!(
+            "  {:>width_pad$}{}{} {label} ({:.0}ms)",
+            "",
+            "█".repeat(width),
+            "",
             end - start,
-            width_pad = s)
+            width_pad = s
+        )
     };
 
     // Timeline bars
@@ -822,13 +922,49 @@ fn bench_full_pipeline_timeline() {
     let to_w = |v: f64| -> usize { (v * scale).max(1.0) as usize };
     let to_pad = |v: f64| -> usize { (v * scale) as usize };
 
-    println!("  Timeline (ms): 0{:>w$}{:.0}", pipeline_total, w = to_pad(pipeline_total));
-    println!("  Leader EVM:    {:pad$}{}", "", "█".repeat(to_w(t1 - t0)), pad = to_pad(t0));
-    println!("  Ser+Compress:  {:pad$}{}", "", "█".repeat(to_w(t2 - t1)), pad = to_pad(t1));
-    println!("  Net send(×6):  {:pad$}{}", "", "▓".repeat(to_w(t3 - t2)), pad = to_pad(t2));
-    println!("  Consensus:     {:pad$}{}", "", "░".repeat(to_w(consensus_path)), pad = to_pad(t2));
-    println!("  F.EagerImport: {:pad$}{}", "", "▒".repeat(to_w(follower_path)), pad = to_pad(t2));
-    println!("  Finalize:      {:pad$}{}", "", "█".repeat(to_w(t5 - t4)), pad = to_pad(t4));
+    println!(
+        "  Timeline (ms): 0{:>w$}{:.0}",
+        pipeline_total,
+        w = to_pad(pipeline_total)
+    );
+    println!(
+        "  Leader EVM:    {:pad$}{}",
+        "",
+        "█".repeat(to_w(t1 - t0)),
+        pad = to_pad(t0)
+    );
+    println!(
+        "  Ser+Compress:  {:pad$}{}",
+        "",
+        "█".repeat(to_w(t2 - t1)),
+        pad = to_pad(t1)
+    );
+    println!(
+        "  Net send(×6):  {:pad$}{}",
+        "",
+        "▓".repeat(to_w(t3 - t2)),
+        pad = to_pad(t2)
+    );
+    println!(
+        "  Consensus:     {:pad$}{}",
+        "",
+        "░".repeat(to_w(consensus_path)),
+        pad = to_pad(t2)
+    );
+    println!(
+        "  F.EagerImport: {:pad$}{}",
+        "",
+        "▒".repeat(to_w(follower_path)),
+        pad = to_pad(t2)
+    );
+    println!(
+        "  Finalize:      {:pad$}{}",
+        "",
+        "█".repeat(to_w(t5 - t4)),
+        pad = to_pad(t4)
+    );
     println!();
-    println!("  Legend: █=sequential(blocking)  ▓=network  ░=consensus(parallel)  ▒=follower(parallel)");
+    println!(
+        "  Legend: █=sequential(blocking)  ▓=network  ░=consensus(parallel)  ▒=follower(parallel)"
+    );
 }

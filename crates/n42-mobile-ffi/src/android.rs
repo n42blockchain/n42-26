@@ -3,9 +3,9 @@
 //! Maps Kotlin `N42Verifier` native methods to the C FFI API functions.
 //! These functions are only compiled when targeting Android (`cfg(target_os = "android")`).
 
+use jni::JNIEnv;
 use jni::objects::{JByteArray, JClass, JString};
 use jni::sys::{jbyteArray, jint, jlong, jstring};
-use jni::JNIEnv;
 
 use crate::VerifierContext;
 
@@ -67,7 +67,13 @@ pub extern "system" fn Java_com_n42_verifier_N42Verifier_nativeConnect(
     };
 
     unsafe {
-        crate::n42_connect(ptr as *mut VerifierContext, c_host.as_ptr(), port as u16, hash_ptr, hash_len)
+        crate::n42_connect(
+            ptr as *mut VerifierContext,
+            c_host.as_ptr(),
+            port as u16,
+            hash_ptr,
+            hash_len,
+        )
     }
 }
 
@@ -88,12 +94,14 @@ pub extern "system" fn Java_com_n42_verifier_N42Verifier_nativePollPacket(
     };
 
     let mut temp = vec![0u8; buf_len];
-    let result = unsafe {
-        crate::n42_poll_packet(ptr as *mut VerifierContext, temp.as_mut_ptr(), buf_len)
-    };
+    let result =
+        unsafe { crate::n42_poll_packet(ptr as *mut VerifierContext, temp.as_mut_ptr(), buf_len) };
 
     if result > 0 {
-        if env.set_byte_array_region(&buffer, 0, as_jbytes(&temp[..result as usize])).is_err() {
+        if env
+            .set_byte_array_region(&buffer, 0, as_jbytes(&temp[..result as usize]))
+            .is_err()
+        {
             tracing::warn!(target: "n42::ffi::android", "set_byte_array_region failed in nativePollPacket");
             return -1;
         }
@@ -117,9 +125,7 @@ pub extern "system" fn Java_com_n42_verifier_N42Verifier_nativeVerifyAndSend(
             return -1;
         }
     };
-    unsafe {
-        crate::n42_verify_and_send(ptr as *mut VerifierContext, bytes.as_ptr(), bytes.len())
-    }
+    unsafe { crate::n42_verify_and_send(ptr as *mut VerifierContext, bytes.as_ptr(), bytes.len()) }
 }
 
 /// `N42Verifier.nativeLastVerifyInfo(ptr: Long): String?`

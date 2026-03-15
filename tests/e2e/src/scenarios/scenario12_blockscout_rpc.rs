@@ -1,6 +1,6 @@
+use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::time::Duration;
-use serde_json::{json, Value};
 use tracing::{info, warn};
 
 use crate::genesis;
@@ -82,15 +82,21 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
                                 if code == -32601 {
                                     // Method not found
                                     if required {
-                                        tracing::error!("  FAIL {name} ({method}) - method not found");
+                                        tracing::error!(
+                                            "  FAIL {name} ({method}) - method not found"
+                                        );
                                         *fail += 1;
                                     } else {
-                                        warn!("  WARN {name} ({method}) - method not found (optional)");
+                                        warn!(
+                                            "  WARN {name} ({method}) - method not found (optional)"
+                                        );
                                         *warn_count += 1;
                                     }
                                 } else {
                                     // Other error (e.g. invalid params) means the method exists
-                                    info!("  PASS {name} ({method}) - method available (error code={code})");
+                                    info!(
+                                        "  PASS {name} ({method}) - method available (error code={code})"
+                                    );
                                     *pass += 1;
                                 }
                             } else if parsed.get("result").is_some() {
@@ -98,7 +104,9 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
                                 *pass += 1;
                             } else {
                                 if required {
-                                    tracing::error!("  FAIL {name} ({method}) - unexpected response");
+                                    tracing::error!(
+                                        "  FAIL {name} ({method}) - unexpected response"
+                                    );
                                     *fail += 1;
                                 } else {
                                     warn!("  WARN {name} ({method}) - unexpected response");
@@ -144,21 +152,53 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
     // --- Core eth_* methods (required) ---
     info!("--- Core eth_* methods (required) ---");
 
-    check_rpc(&client, &url, "Block number", "eth_blockNumber",
-        json!([]), true, &mut pass, &mut fail, &mut warn_count).await;
+    check_rpc(
+        &client,
+        &url,
+        "Block number",
+        "eth_blockNumber",
+        json!([]),
+        true,
+        &mut pass,
+        &mut fail,
+        &mut warn_count,
+    )
+    .await;
 
-    check_rpc(&client, &url, "Chain ID", "eth_chainId",
-        json!([]), true, &mut pass, &mut fail, &mut warn_count).await;
+    check_rpc(
+        &client,
+        &url,
+        "Chain ID",
+        "eth_chainId",
+        json!([]),
+        true,
+        &mut pass,
+        &mut fail,
+        &mut warn_count,
+    )
+    .await;
 
-    check_rpc(&client, &url, "Get block by number", "eth_getBlockByNumber",
-        json!(["0x1", true]), true, &mut pass, &mut fail, &mut warn_count).await;
+    check_rpc(
+        &client,
+        &url,
+        "Get block by number",
+        "eth_getBlockByNumber",
+        json!(["0x1", true]),
+        true,
+        &mut pass,
+        &mut fail,
+        &mut warn_count,
+    )
+    .await;
 
     // Use block 1's hash for getBlockByHash test
     let block1_hash = {
-        let body = json!({"jsonrpc":"2.0","method":"eth_getBlockByNumber","params":["0x1",false],"id":99});
+        let body =
+            json!({"jsonrpc":"2.0","method":"eth_getBlockByNumber","params":["0x1",false],"id":99});
         if let Ok(resp) = client.post(&url).json(&body).send().await {
             if let Ok(text) = resp.text().await {
-                serde_json::from_str::<Value>(&text).ok()
+                serde_json::from_str::<Value>(&text)
+                    .ok()
                     .and_then(|v| v["result"]["hash"].as_str().map(String::from))
                     .unwrap_or_else(|| zero_hash.to_string())
             } else {
@@ -169,63 +209,206 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
         }
     };
 
-    check_rpc(&client, &url, "Get block by hash", "eth_getBlockByHash",
-        json!([block1_hash, true]), true, &mut pass, &mut fail, &mut warn_count).await;
+    check_rpc(
+        &client,
+        &url,
+        "Get block by hash",
+        "eth_getBlockByHash",
+        json!([block1_hash, true]),
+        true,
+        &mut pass,
+        &mut fail,
+        &mut warn_count,
+    )
+    .await;
 
-    check_rpc(&client, &url, "Get tx receipt", "eth_getTransactionReceipt",
-        json!([zero_hash]), true, &mut pass, &mut fail, &mut warn_count).await;
+    check_rpc(
+        &client,
+        &url,
+        "Get tx receipt",
+        "eth_getTransactionReceipt",
+        json!([zero_hash]),
+        true,
+        &mut pass,
+        &mut fail,
+        &mut warn_count,
+    )
+    .await;
 
-    check_rpc(&client, &url, "Get logs", "eth_getLogs",
-        json!([{"fromBlock": "0x0", "toBlock": "0x1"}]), true, &mut pass, &mut fail, &mut warn_count).await;
+    check_rpc(
+        &client,
+        &url,
+        "Get logs",
+        "eth_getLogs",
+        json!([{"fromBlock": "0x0", "toBlock": "0x1"}]),
+        true,
+        &mut pass,
+        &mut fail,
+        &mut warn_count,
+    )
+    .await;
 
-    check_rpc(&client, &url, "Get balance", "eth_getBalance",
-        json!([zero_addr, "latest"]), true, &mut pass, &mut fail, &mut warn_count).await;
+    check_rpc(
+        &client,
+        &url,
+        "Get balance",
+        "eth_getBalance",
+        json!([zero_addr, "latest"]),
+        true,
+        &mut pass,
+        &mut fail,
+        &mut warn_count,
+    )
+    .await;
 
-    check_rpc(&client, &url, "Get code", "eth_getCode",
-        json!([zero_addr, "latest"]), true, &mut pass, &mut fail, &mut warn_count).await;
+    check_rpc(
+        &client,
+        &url,
+        "Get code",
+        "eth_getCode",
+        json!([zero_addr, "latest"]),
+        true,
+        &mut pass,
+        &mut fail,
+        &mut warn_count,
+    )
+    .await;
 
-    check_rpc(&client, &url, "Gas price", "eth_gasPrice",
-        json!([]), true, &mut pass, &mut fail, &mut warn_count).await;
+    check_rpc(
+        &client,
+        &url,
+        "Gas price",
+        "eth_gasPrice",
+        json!([]),
+        true,
+        &mut pass,
+        &mut fail,
+        &mut warn_count,
+    )
+    .await;
 
     // --- Debug methods (required for Blockscout internal txs) ---
     info!("--- Debug methods (required) ---");
 
-    check_rpc(&client, &url, "Trace transaction", "debug_traceTransaction",
-        json!([zero_hash, {"tracer": "callTracer"}]), true, &mut pass, &mut fail, &mut warn_count).await;
+    check_rpc(
+        &client,
+        &url,
+        "Trace transaction",
+        "debug_traceTransaction",
+        json!([zero_hash, {"tracer": "callTracer"}]),
+        true,
+        &mut pass,
+        &mut fail,
+        &mut warn_count,
+    )
+    .await;
 
-    check_rpc(&client, &url, "Trace block by number", "debug_traceBlockByNumber",
-        json!(["0x1", {"tracer": "callTracer"}]), true, &mut pass, &mut fail, &mut warn_count).await;
+    check_rpc(
+        &client,
+        &url,
+        "Trace block by number",
+        "debug_traceBlockByNumber",
+        json!(["0x1", {"tracer": "callTracer"}]),
+        true,
+        &mut pass,
+        &mut fail,
+        &mut warn_count,
+    )
+    .await;
 
     // --- Net/Web3 methods (required) ---
     info!("--- Net/Web3 methods (required) ---");
 
-    check_rpc(&client, &url, "Net version", "net_version",
-        json!([]), true, &mut pass, &mut fail, &mut warn_count).await;
+    check_rpc(
+        &client,
+        &url,
+        "Net version",
+        "net_version",
+        json!([]),
+        true,
+        &mut pass,
+        &mut fail,
+        &mut warn_count,
+    )
+    .await;
 
-    check_rpc(&client, &url, "Web3 client version", "web3_clientVersion",
-        json!([]), true, &mut pass, &mut fail, &mut warn_count).await;
+    check_rpc(
+        &client,
+        &url,
+        "Web3 client version",
+        "web3_clientVersion",
+        json!([]),
+        true,
+        &mut pass,
+        &mut fail,
+        &mut warn_count,
+    )
+    .await;
 
     // --- Trace methods (optional, warn-only) ---
     info!("--- Trace methods (optional) ---");
 
-    check_rpc(&client, &url, "Trace block", "trace_block",
-        json!(["0x1"]), false, &mut pass, &mut fail, &mut warn_count).await;
+    check_rpc(
+        &client,
+        &url,
+        "Trace block",
+        "trace_block",
+        json!(["0x1"]),
+        false,
+        &mut pass,
+        &mut fail,
+        &mut warn_count,
+    )
+    .await;
 
-    check_rpc(&client, &url, "Trace replay block", "trace_replayBlockTransactions",
-        json!(["0x1", ["trace"]]), false, &mut pass, &mut fail, &mut warn_count).await;
+    check_rpc(
+        &client,
+        &url,
+        "Trace replay block",
+        "trace_replayBlockTransactions",
+        json!(["0x1", ["trace"]]),
+        false,
+        &mut pass,
+        &mut fail,
+        &mut warn_count,
+    )
+    .await;
 
     // --- N42 custom methods ---
     info!("--- N42 custom methods ---");
 
-    check_rpc(&client, &url, "Consensus status", "n42_consensusStatus",
-        json!([]), false, &mut pass, &mut fail, &mut warn_count).await;
+    check_rpc(
+        &client,
+        &url,
+        "Consensus status",
+        "n42_consensusStatus",
+        json!([]),
+        false,
+        &mut pass,
+        &mut fail,
+        &mut warn_count,
+    )
+    .await;
 
-    check_rpc(&client, &url, "Validator set", "n42_validatorSet",
-        json!([]), false, &mut pass, &mut fail, &mut warn_count).await;
+    check_rpc(
+        &client,
+        &url,
+        "Validator set",
+        "n42_validatorSet",
+        json!([]),
+        false,
+        &mut pass,
+        &mut fail,
+        &mut warn_count,
+    )
+    .await;
 
     // --- Summary ---
     let total = pass + fail + warn_count;
-    info!(pass, fail, warn_count, total, "Blockscout RPC compatibility results");
+    info!(
+        pass,
+        fail, warn_count, total, "Blockscout RPC compatibility results"
+    );
 
     let _ = node.stop();
 

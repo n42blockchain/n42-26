@@ -1,7 +1,7 @@
 use alloy_primitives::B256;
 use futures::prelude::*;
-use libp2p::request_response;
 use libp2p::StreamProtocol;
+use libp2p::request_response;
 use n42_primitives::consensus::QuorumCertificate;
 use serde::{Deserialize, Serialize};
 use std::io;
@@ -149,7 +149,11 @@ mod tests {
     use n42_primitives::consensus::QuorumCertificate;
 
     fn sample_request() -> BlockSyncRequest {
-        BlockSyncRequest { from_view: 10, to_view: 20, local_committed_view: 8 }
+        BlockSyncRequest {
+            from_view: 10,
+            to_view: 20,
+            local_committed_view: 8,
+        }
     }
 
     fn sample_sync_block() -> SyncBlock {
@@ -170,7 +174,10 @@ mod tests {
     }
 
     fn sample_response() -> BlockSyncResponse {
-        BlockSyncResponse { blocks: vec![sample_sync_block()], peer_committed_view: 25 }
+        BlockSyncResponse {
+            blocks: vec![sample_sync_block()],
+            peer_committed_view: 25,
+        }
     }
 
     #[test]
@@ -197,7 +204,10 @@ mod tests {
 
     #[test]
     fn test_block_sync_response_empty_blocks() {
-        let resp = BlockSyncResponse { blocks: vec![], peer_committed_view: 100 };
+        let resp = BlockSyncResponse {
+            blocks: vec![],
+            peer_committed_view: 100,
+        };
         let bytes = bincode::serialize(&resp).unwrap();
         let decoded: BlockSyncResponse = bincode::deserialize(&bytes).unwrap();
         assert!(decoded.blocks.is_empty());
@@ -208,14 +218,18 @@ mod tests {
     async fn test_codec_write_read_request_roundtrip() {
         let req = sample_request();
         let mut buf = futures::io::Cursor::new(Vec::new());
-        codec::write_length_prefixed(&mut buf, &req, MAX_SYNC_MSG_SIZE).await.unwrap();
+        codec::write_length_prefixed(&mut buf, &req, MAX_SYNC_MSG_SIZE)
+            .await
+            .unwrap();
 
         let data = buf.into_inner();
         let len = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
         assert_eq!(len, data.len() - 4);
 
         let mut reader = futures::io::Cursor::new(data);
-        let decoded: BlockSyncRequest = codec::read_length_prefixed(&mut reader, MAX_SYNC_MSG_SIZE).await.unwrap();
+        let decoded: BlockSyncRequest = codec::read_length_prefixed(&mut reader, MAX_SYNC_MSG_SIZE)
+            .await
+            .unwrap();
         assert_eq!(decoded.from_view, req.from_view);
         assert_eq!(decoded.to_view, req.to_view);
         assert_eq!(decoded.local_committed_view, req.local_committed_view);
@@ -225,11 +239,16 @@ mod tests {
     async fn test_codec_write_read_response_roundtrip() {
         let resp = sample_response();
         let mut buf = futures::io::Cursor::new(Vec::new());
-        codec::write_length_prefixed(&mut buf, &resp, MAX_SYNC_MSG_SIZE).await.unwrap();
+        codec::write_length_prefixed(&mut buf, &resp, MAX_SYNC_MSG_SIZE)
+            .await
+            .unwrap();
 
         let data = buf.into_inner();
         let mut reader = futures::io::Cursor::new(data);
-        let decoded: BlockSyncResponse = codec::read_length_prefixed(&mut reader, MAX_SYNC_MSG_SIZE).await.unwrap();
+        let decoded: BlockSyncResponse =
+            codec::read_length_prefixed(&mut reader, MAX_SYNC_MSG_SIZE)
+                .await
+                .unwrap();
         assert_eq!(decoded.blocks.len(), 1);
         assert_eq!(decoded.blocks[0].view, 15);
         assert_eq!(decoded.peer_committed_view, 25);

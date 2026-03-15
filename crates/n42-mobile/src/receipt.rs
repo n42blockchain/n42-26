@@ -84,9 +84,7 @@ pub fn sign_receipt(
     signing_key: &BlsSecretKey,
 ) -> VerificationReceipt {
     let verifier_pubkey = signing_key.public_key().to_bytes();
-    let msg = build_signing_message(
-        &block_hash, block_number, &computed_receipts_root,
-    );
+    let msg = build_signing_message(&block_hash, block_number, &computed_receipts_root);
     let signature = signing_key.sign(&msg);
 
     VerificationReceipt {
@@ -147,8 +145,9 @@ pub fn decode_receipt(data: &[u8]) -> Result<VerificationReceipt, crate::wire::W
     verifier_pubkey.copy_from_slice(&payload[pos..pos + 48]);
     pos += 48;
 
-    let sig_bytes: [u8; 96] =
-        payload[pos..pos + 96].try_into().map_err(|_| WireError::UnexpectedEof(pos))?;
+    let sig_bytes: [u8; 96] = payload[pos..pos + 96]
+        .try_into()
+        .map_err(|_| WireError::UnexpectedEof(pos))?;
     let signature =
         BlsSignature::from_bytes(&sig_bytes).map_err(|_| WireError::InvalidTag(0, pos))?;
     pos += 96;
@@ -194,7 +193,13 @@ mod tests {
         timestamp_ms: u64,
         sk: &BlsSecretKey,
     ) -> VerificationReceipt {
-        sign_receipt(block_hash, block_number, computed_receipts_root, timestamp_ms, sk)
+        sign_receipt(
+            block_hash,
+            block_number,
+            computed_receipts_root,
+            timestamp_ms,
+            sk,
+        )
     }
 
     #[test]
@@ -210,20 +215,31 @@ mod tests {
         assert_eq!(receipt.computed_receipts_root, computed_rr);
         assert_eq!(receipt.timestamp_ms, 1_700_000_000_000);
 
-        receipt.verify_signature().expect("signature should be valid");
+        receipt
+            .verify_signature()
+            .expect("signature should be valid");
     }
 
     #[test]
     fn test_verify_tampered_receipt() {
         let sk = BlsSecretKey::key_gen(&[42u8; 32]).unwrap();
         let block_hash = B256::from([1u8; 32]);
-        let mut receipt = make_receipt(block_hash, 100, B256::from([0xAA; 32]), 1_700_000_000_000, &sk);
+        let mut receipt = make_receipt(
+            block_hash,
+            100,
+            B256::from([0xAA; 32]),
+            1_700_000_000_000,
+            &sk,
+        );
 
         receipt.block_number = 999;
 
         let result = receipt.verify_signature();
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), ReceiptError::InvalidSignature));
+        assert!(matches!(
+            result.unwrap_err(),
+            ReceiptError::InvalidSignature
+        ));
     }
 
     #[test]
@@ -268,10 +284,15 @@ mod tests {
 
         assert_eq!(decoded.block_hash, receipt.block_hash);
         assert_eq!(decoded.block_number, receipt.block_number);
-        assert_eq!(decoded.computed_receipts_root, receipt.computed_receipts_root);
+        assert_eq!(
+            decoded.computed_receipts_root,
+            receipt.computed_receipts_root
+        );
         assert_eq!(decoded.verifier_pubkey, receipt.verifier_pubkey);
         assert_eq!(decoded.timestamp_ms, receipt.timestamp_ms);
-        decoded.verify_signature().expect("deserialized receipt should have valid signature");
+        decoded
+            .verify_signature()
+            .expect("deserialized receipt should have valid signature");
     }
 
     #[test]
@@ -285,10 +306,15 @@ mod tests {
 
         assert_eq!(decoded.block_hash, receipt.block_hash);
         assert_eq!(decoded.block_number, receipt.block_number);
-        assert_eq!(decoded.computed_receipts_root, receipt.computed_receipts_root);
+        assert_eq!(
+            decoded.computed_receipts_root,
+            receipt.computed_receipts_root
+        );
         assert_eq!(decoded.verifier_pubkey, receipt.verifier_pubkey);
         assert_eq!(decoded.timestamp_ms, receipt.timestamp_ms);
-        decoded.verify_signature().expect("versioned receipt should have valid signature");
+        decoded
+            .verify_signature()
+            .expect("versioned receipt should have valid signature");
     }
 
     #[test]

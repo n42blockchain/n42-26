@@ -16,9 +16,8 @@ pub use packet::{PacketError, StreamPacket, VerificationPacket, WitnessAccount};
 pub use receipt::{ReceiptError, VerificationReceipt, sign_receipt};
 pub use verification::{BlockVerificationStatus, ReceiptAggregator};
 pub use verifier::{
-    StreamReplayDB, VerificationResult, VerifyError,
-    update_cache_after_stream_verify, update_cache_after_verify,
-    verify_block, verify_block_stream,
+    StreamReplayDB, VerificationResult, VerifyError, update_cache_after_stream_verify,
+    update_cache_after_verify, verify_block, verify_block_stream,
 };
 
 /// Derives an ETH address via `keccak256(pubkey_bytes)[12..]`.

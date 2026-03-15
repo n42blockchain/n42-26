@@ -21,12 +21,12 @@ use alloy_signer_local::PrivateKeySigner;
 use clap::Parser;
 use eyre::Result;
 use std::io::{BufReader, BufWriter, Read as IoRead, Write as IoWrite};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tiny_keccak::{Hasher, Keccak};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 use tokio::sync::Semaphore;
 
 #[derive(Parser)]
@@ -114,7 +114,10 @@ struct Cli {
     ingest: Option<String>,
 
     /// RPC endpoints (comma-separated)
-    #[arg(long, default_value = "http://127.0.0.1:18545,http://127.0.0.1:18546,http://127.0.0.1:18547,http://127.0.0.1:18548,http://127.0.0.1:18549,http://127.0.0.1:18550,http://127.0.0.1:18551")]
+    #[arg(
+        long,
+        default_value = "http://127.0.0.1:18545,http://127.0.0.1:18546,http://127.0.0.1:18547,http://127.0.0.1:18548,http://127.0.0.1:18549,http://127.0.0.1:18550,http://127.0.0.1:18551"
+    )]
     rpc: String,
 }
 
@@ -310,11 +313,7 @@ struct BatchResult {
     needs_resync: bool,
 }
 
-async fn send_batch(
-    client: &reqwest::Client,
-    rpc_url: &str,
-    raw_txs: &[String],
-) -> BatchResult {
+async fn send_batch(client: &reqwest::Client, rpc_url: &str, raw_txs: &[String]) -> BatchResult {
     let batch: Vec<serde_json::Value> = raw_txs
         .iter()
         .enumerate()
@@ -340,8 +339,10 @@ async fn send_batch(
                     if let Some(err) = r.get("error") {
                         rpc_error += 1;
                         let msg = err.get("message").and_then(|m| m.as_str()).unwrap_or("");
-                        if msg.contains("nonce") || msg.contains("already known")
-                            || msg.contains("replacement") || msg.contains("underpriced")
+                        if msg.contains("nonce")
+                            || msg.contains("already known")
+                            || msg.contains("replacement")
+                            || msg.contains("underpriced")
                         {
                             nonce_errors += 1;
                         }
@@ -351,16 +352,28 @@ async fn send_batch(
                 }
                 let total = ok + rpc_error;
                 let needs_resync = total > 0 && nonce_errors * 2 > total;
-                BatchResult { ok, rpc_error, http_error: 0, latency, needs_resync }
+                BatchResult {
+                    ok,
+                    rpc_error,
+                    http_error: 0,
+                    latency,
+                    needs_resync,
+                }
             }
             Err(_) => BatchResult {
-                ok: 0, rpc_error: 0, http_error: raw_txs.len(),
-                latency: start.elapsed(), needs_resync: false,
+                ok: 0,
+                rpc_error: 0,
+                http_error: raw_txs.len(),
+                latency: start.elapsed(),
+                needs_resync: false,
             },
         },
         Err(_) => BatchResult {
-            ok: 0, rpc_error: 0, http_error: raw_txs.len(),
-            latency: start.elapsed(), needs_resync: false,
+            ok: 0,
+            rpc_error: 0,
+            http_error: raw_txs.len(),
+            latency: start.elapsed(),
+            needs_resync: false,
         },
     }
 }
@@ -377,7 +390,13 @@ async fn rpc_call(
         "params": params,
         "id": 1
     });
-    let resp: serde_json::Value = client.post(rpc_url).json(&payload).send().await?.json().await?;
+    let resp: serde_json::Value = client
+        .post(rpc_url)
+        .json(&payload)
+        .send()
+        .await?
+        .json()
+        .await?;
     Ok(resp)
 }
 
@@ -386,8 +405,13 @@ fn parse_hex_u64(hex: &str) -> u64 {
 }
 
 async fn get_nonce(client: &reqwest::Client, rpc_url: &str, address: &Address) -> Result<u64> {
-    let resp = rpc_call(client, rpc_url, "eth_getTransactionCount",
-        serde_json::json!([format!("{address:?}"), "pending"])).await?;
+    let resp = rpc_call(
+        client,
+        rpc_url,
+        "eth_getTransactionCount",
+        serde_json::json!([format!("{address:?}"), "pending"]),
+    )
+    .await?;
     Ok(parse_hex_u64(resp["result"].as_str().unwrap_or("0x0")))
 }
 
@@ -413,10 +437,18 @@ struct BlockInfo {
 }
 
 async fn get_block_info(client: &reqwest::Client, rpc_url: &str, block: u64) -> Result<BlockInfo> {
-    let resp = rpc_call(client, rpc_url, "eth_getBlockByNumber",
-        serde_json::json!([format!("0x{:x}", block), false])).await?;
+    let resp = rpc_call(
+        client,
+        rpc_url,
+        "eth_getBlockByNumber",
+        serde_json::json!([format!("0x{:x}", block), false]),
+    )
+    .await?;
     let b = &resp["result"];
-    let tx_count = b["transactions"].as_array().map(|a| a.len() as u64).unwrap_or(0);
+    let tx_count = b["transactions"]
+        .as_array()
+        .map(|a| a.len() as u64)
+        .unwrap_or(0);
     Ok(BlockInfo {
         number: block,
         timestamp: parse_hex_u64(b["timestamp"].as_str().unwrap_or("0x0")),
@@ -555,8 +587,8 @@ async fn sender_loop(
     // Cap batch size: at most 20 txs per account, and respect per-RPC TPS target
     let actual_batch_size = if target_tps > 0 {
         batch_size
-            .min(apb * 20)                              // max 20 txs/account/batch
-            .min((target_tps as usize * 2).max(50))     // don't overshoot 2x per-RPC TPS
+            .min(apb * 20) // max 20 txs/account/batch
+            .min((target_tps as usize * 2).max(50)) // don't overshoot 2x per-RPC TPS
     } else {
         batch_size.min(apb * 20)
     };
@@ -575,7 +607,11 @@ async fn sender_loop(
     };
 
     tracing::debug!(
-        rpc_idx, num_accounts, apb, actual_batch_size, pipeline_depth,
+        rpc_idx,
+        num_accounts,
+        apb,
+        actual_batch_size,
+        pipeline_depth,
         batch_interval_ms = batch_interval.map(|d| d.as_millis() as u64).unwrap_or(0),
         "sender_loop v9 (pipelined) started"
     );
@@ -598,10 +634,9 @@ async fn sender_loop(
             if signer_bp.load(Ordering::Relaxed) {
                 let pause_start = Instant::now();
                 tokio::time::sleep(Duration::from_millis(50)).await;
-                signer_stats.backpressure_ms.fetch_add(
-                    pause_start.elapsed().as_millis() as u64,
-                    Ordering::Relaxed,
-                );
+                signer_stats
+                    .backpressure_ms
+                    .fetch_add(pause_start.elapsed().as_millis() as u64, Ordering::Relaxed);
                 continue;
             }
 
@@ -615,17 +650,27 @@ async fn sender_loop(
             let er = erc20_ratio;
             let sign_result = tokio::task::spawn_blocking(move || {
                 sign_mixed_batch(&group, &targets_clone, bs, gl, er)
-            }).await;
+            })
+            .await;
 
             let (raw_txs, sign_time, _nonce_info) = match sign_result {
                 Ok(r) => r,
                 Err(_) => continue,
             };
 
-            signer_stats.sign_time_ns.fetch_add(sign_time.as_nanos() as u64, Ordering::Relaxed);
-            signer_stats.sign_count.fetch_add(raw_txs.len() as u64, Ordering::Relaxed);
+            signer_stats
+                .sign_time_ns
+                .fetch_add(sign_time.as_nanos() as u64, Ordering::Relaxed);
+            signer_stats
+                .sign_count
+                .fetch_add(raw_txs.len() as u64, Ordering::Relaxed);
 
-            let batch = SignedBatch { raw_txs, sign_time, group_start, group_end };
+            let batch = SignedBatch {
+                raw_txs,
+                sign_time,
+                group_start,
+                group_end,
+            };
             if batch_tx.send(batch).await.is_err() {
                 break; // receiver dropped
             }
@@ -659,11 +704,21 @@ async fn sender_loop(
 
         tokio::spawn(async move {
             let result = send_batch(&client_clone, &rpc_url_clone, &batch.raw_txs).await;
-            stats_clone.sent.fetch_add(result.ok as u64, Ordering::Relaxed);
-            stats_clone.rpc_errors.fetch_add(result.rpc_error as u64, Ordering::Relaxed);
-            stats_clone.http_errors.fetch_add(result.http_error as u64, Ordering::Relaxed);
-            stats_clone.rpc_latency_ns.fetch_add(result.latency.as_nanos() as u64, Ordering::Relaxed);
-            stats_clone.rpc_latency_count.fetch_add(1, Ordering::Relaxed);
+            stats_clone
+                .sent
+                .fetch_add(result.ok as u64, Ordering::Relaxed);
+            stats_clone
+                .rpc_errors
+                .fetch_add(result.rpc_error as u64, Ordering::Relaxed);
+            stats_clone
+                .http_errors
+                .fetch_add(result.http_error as u64, Ordering::Relaxed);
+            stats_clone
+                .rpc_latency_ns
+                .fetch_add(result.latency.as_nanos() as u64, Ordering::Relaxed);
+            stats_clone
+                .rpc_latency_count
+                .fetch_add(1, Ordering::Relaxed);
 
             if result.needs_resync {
                 stats_clone.nonce_resyncs.fetch_add(1, Ordering::Relaxed);
@@ -691,8 +746,12 @@ fn presign_all(
     let remainder = (total as usize) % num_accounts;
 
     tracing::info!(
-        total, num_accounts, txs_per_account,
-        remainder, num_rpcs, erc20_ratio,
+        total,
+        num_accounts,
+        txs_per_account,
+        remainder,
+        num_rpcs,
+        erc20_ratio,
         "Pre-signing transactions..."
     );
 
@@ -700,58 +759,66 @@ fn presign_all(
 
     // Parallel signing using std::thread::scope (CPU-bound work)
     let per_account_results: Vec<(usize, Vec<String>)> = std::thread::scope(|s| {
-        let handles: Vec<_> = accounts.iter().enumerate().map(|(acct_idx, account)| {
-            let targets = targets;
-            s.spawn(move || {
-                let count = txs_per_account + if acct_idx < remainder { 1 } else { 0 };
-                if count == 0 {
-                    return (account.rpc_idx, Vec::new());
-                }
-                let nonce_start = account.nonce.fetch_add(count as u64, Ordering::Relaxed);
-                let mut txs = Vec::with_capacity(count);
-                for j in 0..count {
-                    let nonce = nonce_start + j as u64;
-                    let tx_index = acct_idx * txs_per_account + j;
-                    let is_contract_call = erc20_ratio > 0 && (tx_index % 100) < erc20_ratio as usize;
+        let handles: Vec<_> = accounts
+            .iter()
+            .enumerate()
+            .map(|(acct_idx, account)| {
+                let targets = targets;
+                s.spawn(move || {
+                    let count = txs_per_account + if acct_idx < remainder { 1 } else { 0 };
+                    if count == 0 {
+                        return (account.rpc_idx, Vec::new());
+                    }
+                    let nonce_start = account.nonce.fetch_add(count as u64, Ordering::Relaxed);
+                    let mut txs = Vec::with_capacity(count);
+                    for j in 0..count {
+                        let nonce = nonce_start + j as u64;
+                        let tx_index = acct_idx * txs_per_account + j;
+                        let is_contract_call =
+                            erc20_ratio > 0 && (tx_index % 100) < erc20_ratio as usize;
 
-                    let tx = if is_contract_call {
-                        TxEip1559 {
-                            chain_id: CHAIN_ID,
-                            nonce,
-                            gas_limit: CONTRACT_CALL_GAS,
-                            max_fee_per_gas: MAX_FEE_PER_GAS,
-                            max_priority_fee_per_gas: MAX_PRIORITY_FEE,
-                            to: TxKind::Call(STRESS_CONTRACT),
-                            value: U256::ZERO,
-                            input: Bytes::new(),
-                            access_list: Default::default(),
-                        }
-                    } else {
-                        let to = targets[(nonce as usize) % targets.len()];
-                        TxEip1559 {
-                            chain_id: CHAIN_ID,
-                            nonce,
-                            gas_limit: TRANSFER_GAS,
-                            max_fee_per_gas: MAX_FEE_PER_GAS,
-                            max_priority_fee_per_gas: MAX_PRIORITY_FEE,
-                            to: TxKind::Call(to),
-                            value: U256::from(TRANSFER_VALUE),
-                            input: Bytes::new(),
-                            access_list: Default::default(),
-                        }
-                    };
-                    let sig_hash = tx.signature_hash();
-                    let sig = account.signer.sign_hash_sync(&sig_hash).expect("sign");
-                    let signed = tx.into_signed(sig);
-                    let mut buf = Vec::with_capacity(128);
-                    signed.encode_2718(&mut buf);
-                    txs.push(format!("0x{}", hex::encode(&buf)));
-                }
-                (account.rpc_idx, txs)
+                        let tx = if is_contract_call {
+                            TxEip1559 {
+                                chain_id: CHAIN_ID,
+                                nonce,
+                                gas_limit: CONTRACT_CALL_GAS,
+                                max_fee_per_gas: MAX_FEE_PER_GAS,
+                                max_priority_fee_per_gas: MAX_PRIORITY_FEE,
+                                to: TxKind::Call(STRESS_CONTRACT),
+                                value: U256::ZERO,
+                                input: Bytes::new(),
+                                access_list: Default::default(),
+                            }
+                        } else {
+                            let to = targets[(nonce as usize) % targets.len()];
+                            TxEip1559 {
+                                chain_id: CHAIN_ID,
+                                nonce,
+                                gas_limit: TRANSFER_GAS,
+                                max_fee_per_gas: MAX_FEE_PER_GAS,
+                                max_priority_fee_per_gas: MAX_PRIORITY_FEE,
+                                to: TxKind::Call(to),
+                                value: U256::from(TRANSFER_VALUE),
+                                input: Bytes::new(),
+                                access_list: Default::default(),
+                            }
+                        };
+                        let sig_hash = tx.signature_hash();
+                        let sig = account.signer.sign_hash_sync(&sig_hash).expect("sign");
+                        let signed = tx.into_signed(sig);
+                        let mut buf = Vec::with_capacity(128);
+                        signed.encode_2718(&mut buf);
+                        txs.push(format!("0x{}", hex::encode(&buf)));
+                    }
+                    (account.rpc_idx, txs)
+                })
             })
-        }).collect();
+            .collect();
 
-        handles.into_iter().map(|h| h.join().expect("thread join")).collect()
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("thread join"))
+            .collect()
     });
 
     // Group by RPC endpoint
@@ -768,8 +835,15 @@ fn presign_all(
         total_signed,
         elapsed_ms = elapsed.as_millis(),
         sign_rate = format!("{:.0}/s", sign_rate),
-        per_rpc = grouped.iter().map(|g| g.len()).collect::<Vec<_>>().as_slice().iter()
-            .map(|n| n.to_string()).collect::<Vec<_>>().join(","),
+        per_rpc = grouped
+            .iter()
+            .map(|g| g.len())
+            .collect::<Vec<_>>()
+            .as_slice()
+            .iter()
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join(","),
         "Pre-sign complete"
     );
 
@@ -799,7 +873,12 @@ fn presign_and_save(
     let remainder = (total as usize) % num_accounts;
 
     tracing::info!(
-        total, num_accounts, txs_per_account, remainder, num_rpcs, path,
+        total,
+        num_accounts,
+        txs_per_account,
+        remainder,
+        num_rpcs,
+        path,
         "Pre-signing and saving to file..."
     );
 
@@ -807,58 +886,66 @@ fn presign_and_save(
 
     // Parallel signing — returns raw RLP bytes (not hex) grouped by rpc_idx
     let per_account_results: Vec<(usize, Vec<(Vec<u8>, Address)>)> = std::thread::scope(|s| {
-        let handles: Vec<_> = accounts.iter().enumerate().map(|(acct_idx, account)| {
-            let targets = targets;
-            s.spawn(move || {
-                let count = txs_per_account + if acct_idx < remainder { 1 } else { 0 };
-                if count == 0 {
-                    return (account.rpc_idx, Vec::new());
-                }
-                let nonce_start = account.nonce.fetch_add(count as u64, Ordering::Relaxed);
-                let mut txs = Vec::with_capacity(count);
-                for j in 0..count {
-                    let nonce = nonce_start + j as u64;
-                    let tx_index = acct_idx * txs_per_account + j;
-                    let is_contract_call = erc20_ratio > 0 && (tx_index % 100) < erc20_ratio as usize;
+        let handles: Vec<_> = accounts
+            .iter()
+            .enumerate()
+            .map(|(acct_idx, account)| {
+                let targets = targets;
+                s.spawn(move || {
+                    let count = txs_per_account + if acct_idx < remainder { 1 } else { 0 };
+                    if count == 0 {
+                        return (account.rpc_idx, Vec::new());
+                    }
+                    let nonce_start = account.nonce.fetch_add(count as u64, Ordering::Relaxed);
+                    let mut txs = Vec::with_capacity(count);
+                    for j in 0..count {
+                        let nonce = nonce_start + j as u64;
+                        let tx_index = acct_idx * txs_per_account + j;
+                        let is_contract_call =
+                            erc20_ratio > 0 && (tx_index % 100) < erc20_ratio as usize;
 
-                    let tx = if is_contract_call {
-                        TxEip1559 {
-                            chain_id: CHAIN_ID,
-                            nonce,
-                            gas_limit: CONTRACT_CALL_GAS,
-                            max_fee_per_gas: MAX_FEE_PER_GAS,
-                            max_priority_fee_per_gas: MAX_PRIORITY_FEE,
-                            to: TxKind::Call(STRESS_CONTRACT),
-                            value: U256::ZERO,
-                            input: Bytes::new(),
-                            access_list: Default::default(),
-                        }
-                    } else {
-                        let to = targets[(nonce as usize) % targets.len()];
-                        TxEip1559 {
-                            chain_id: CHAIN_ID,
-                            nonce,
-                            gas_limit: TRANSFER_GAS,
-                            max_fee_per_gas: MAX_FEE_PER_GAS,
-                            max_priority_fee_per_gas: MAX_PRIORITY_FEE,
-                            to: TxKind::Call(to),
-                            value: U256::from(TRANSFER_VALUE),
-                            input: Bytes::new(),
-                            access_list: Default::default(),
-                        }
-                    };
-                    let sig_hash = tx.signature_hash();
-                    let sig = account.signer.sign_hash_sync(&sig_hash).expect("sign");
-                    let signed = tx.into_signed(sig);
-                    let mut buf = Vec::with_capacity(128);
-                    signed.encode_2718(&mut buf);
-                    txs.push((buf, account.address));
-                }
-                (account.rpc_idx, txs)
+                        let tx = if is_contract_call {
+                            TxEip1559 {
+                                chain_id: CHAIN_ID,
+                                nonce,
+                                gas_limit: CONTRACT_CALL_GAS,
+                                max_fee_per_gas: MAX_FEE_PER_GAS,
+                                max_priority_fee_per_gas: MAX_PRIORITY_FEE,
+                                to: TxKind::Call(STRESS_CONTRACT),
+                                value: U256::ZERO,
+                                input: Bytes::new(),
+                                access_list: Default::default(),
+                            }
+                        } else {
+                            let to = targets[(nonce as usize) % targets.len()];
+                            TxEip1559 {
+                                chain_id: CHAIN_ID,
+                                nonce,
+                                gas_limit: TRANSFER_GAS,
+                                max_fee_per_gas: MAX_FEE_PER_GAS,
+                                max_priority_fee_per_gas: MAX_PRIORITY_FEE,
+                                to: TxKind::Call(to),
+                                value: U256::from(TRANSFER_VALUE),
+                                input: Bytes::new(),
+                                access_list: Default::default(),
+                            }
+                        };
+                        let sig_hash = tx.signature_hash();
+                        let sig = account.signer.sign_hash_sync(&sig_hash).expect("sign");
+                        let signed = tx.into_signed(sig);
+                        let mut buf = Vec::with_capacity(128);
+                        signed.encode_2718(&mut buf);
+                        txs.push((buf, account.address));
+                    }
+                    (account.rpc_idx, txs)
+                })
             })
-        }).collect();
+            .collect();
 
-        handles.into_iter().map(|h| h.join().expect("thread join")).collect()
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("thread join"))
+            .collect()
     });
 
     // Group by RPC: each entry is (tx_bytes, sender_address)
@@ -912,7 +999,11 @@ fn presign_and_save(
         sign_ms = sign_elapsed.as_millis(),
         write_ms = (total_elapsed - sign_elapsed).as_millis(),
         total_ms = total_elapsed.as_millis(),
-        per_rpc = grouped.iter().map(|g| g.len().to_string()).collect::<Vec<_>>().join(","),
+        per_rpc = grouped
+            .iter()
+            .map(|g| g.len().to_string())
+            .collect::<Vec<_>>()
+            .join(","),
         "Pre-signed transactions saved"
     );
 
@@ -944,7 +1035,11 @@ fn load_presigned(path: &str) -> Result<Vec<Vec<String>>> {
     r.read_exact(&mut chain_id_buf)?;
     let chain_id = u64::from_le_bytes(chain_id_buf);
     if chain_id != CHAIN_ID {
-        eyre::bail!("Chain ID mismatch: file={}, expected={}", chain_id, CHAIN_ID);
+        eyre::bail!(
+            "Chain ID mismatch: file={}, expected={}",
+            chain_id,
+            CHAIN_ID
+        );
     }
 
     let mut num_rpcs_buf = [0u8; 4];
@@ -956,8 +1051,11 @@ fn load_presigned(path: &str) -> Result<Vec<Vec<String>>> {
     let total_txs = u64::from_le_bytes(total_txs_buf);
 
     tracing::info!(
-        path, file_size_mb = file_size / (1024 * 1024),
-        num_rpcs, total_txs, file_version,
+        path,
+        file_size_mb = file_size / (1024 * 1024),
+        num_rpcs,
+        total_txs,
+        file_version,
         "Loading pre-signed transactions..."
     );
 
@@ -1023,14 +1121,22 @@ fn load_presigned_binary(path: &str, num_endpoints: usize) -> Result<Vec<Vec<Raw
     let mut version = [0u8; 1];
     r.read_exact(&mut version)?;
     if version[0] != FILE_VERSION {
-        eyre::bail!("Unsupported file version: {} (expected {})", version[0], FILE_VERSION);
+        eyre::bail!(
+            "Unsupported file version: {} (expected {})",
+            version[0],
+            FILE_VERSION
+        );
     }
 
     let mut chain_id_buf = [0u8; 8];
     r.read_exact(&mut chain_id_buf)?;
     let chain_id = u64::from_le_bytes(chain_id_buf);
     if chain_id != CHAIN_ID {
-        eyre::bail!("Chain ID mismatch: file={}, expected={}", chain_id, CHAIN_ID);
+        eyre::bail!(
+            "Chain ID mismatch: file={}, expected={}",
+            chain_id,
+            CHAIN_ID
+        );
     }
 
     let mut num_rpcs_buf = [0u8; 4];
@@ -1042,8 +1148,11 @@ fn load_presigned_binary(path: &str, num_endpoints: usize) -> Result<Vec<Vec<Raw
     let total_txs = u64::from_le_bytes(total_txs_buf);
 
     tracing::info!(
-        path, file_size_mb = file_size / (1024 * 1024),
-        file_num_rpcs, total_txs, num_endpoints,
+        path,
+        file_size_mb = file_size / (1024 * 1024),
+        file_num_rpcs,
+        total_txs,
+        num_endpoints,
         "Loading pre-signed transactions (binary v2 with sender)..."
     );
 
@@ -1102,7 +1211,11 @@ fn load_presigned_binary(path: &str, num_endpoints: usize) -> Result<Vec<Vec<Raw
     tracing::info!(
         total_loaded = loaded,
         elapsed_ms = elapsed.as_millis(),
-        per_endpoint = grouped.iter().map(|g| g.len().to_string()).collect::<Vec<_>>().join(","),
+        per_endpoint = grouped
+            .iter()
+            .map(|g| g.len().to_string())
+            .collect::<Vec<_>>()
+            .join(","),
         "Binary v2 load complete (with sender)"
     );
 
@@ -1140,10 +1253,16 @@ async fn run_ingest_mode(
             if monitor_stop.load(Ordering::Relaxed) {
                 break;
             }
-            let now_block = get_block_number(&monitor_client, &monitor_rpc).await.unwrap_or(last_block);
+            let now_block = get_block_number(&monitor_client, &monitor_rpc)
+                .await
+                .unwrap_or(last_block);
             if now_block > last_block {
                 let mut recent_txs = 0u64;
-                let check_from = if now_block > last_block + 5 { now_block - 5 } else { last_block };
+                let check_from = if now_block > last_block + 5 {
+                    now_block - 5
+                } else {
+                    last_block
+                };
                 for b in (check_from + 1)..=now_block {
                     if let Ok(info) = get_block_info(&monitor_client, &monitor_rpc, b).await {
                         recent_txs += info.tx_count;
@@ -1151,7 +1270,9 @@ async fn run_ingest_mode(
                 }
                 let dt = last_time.elapsed().as_secs_f64();
                 let sent = monitor_stats.sent.load(Ordering::Relaxed);
-                let pool = get_txpool_status(&monitor_client, &monitor_rpc).await.unwrap_or((0, 0));
+                let pool = get_txpool_status(&monitor_client, &monitor_rpc)
+                    .await
+                    .unwrap_or((0, 0));
                 tracing::info!(
                     blocks = now_block - start_block,
                     recent_block_txs = recent_txs,
@@ -1186,7 +1307,11 @@ async fn run_ingest_mode(
         let stop = stop.clone();
         let bs = batch_size;
         let num_endpoints = endpoints.len().max(1) as u64;
-        let per_ep_tps = if target_tps > 0 { (target_tps / num_endpoints).max(1) } else { 0 };
+        let per_ep_tps = if target_tps > 0 {
+            (target_tps / num_endpoints).max(1)
+        } else {
+            0
+        };
 
         handles.push(tokio::spawn(async move {
             // Connect to ingest server
@@ -1198,7 +1323,13 @@ async fn run_ingest_mode(
                 }
             };
             let _ = stream.set_nodelay(true);
-            tracing::info!(endpoint, txs = txs.len(), batch_size = bs, per_ep_tps, "TCP ingest connected");
+            tracing::info!(
+                endpoint,
+                txs = txs.len(),
+                batch_size = bs,
+                per_ep_tps,
+                "TCP ingest connected"
+            );
 
             // Rate limiter: compute interval between batches
             let batch_interval = if per_ep_tps > 0 {
@@ -1209,8 +1340,8 @@ async fn run_ingest_mode(
             };
 
             // Dynamic rate control thresholds
-            const POOL_LOW: u64 = 50_000;   // below: full speed
-            const POOL_HIGH: u64 = 80_000;  // above: pause until LOW
+            const POOL_LOW: u64 = 50_000; // below: full speed
+            const POOL_HIGH: u64 = 80_000; // above: pause until LOW
             let mut pool_gated = false;
             let mut gate_wait_ms = 0u64;
 
@@ -1227,7 +1358,8 @@ async fn run_ingest_mode(
 
                 // Build binary batch: [u32 num_txs] [u16 tx_len, tx_bytes, 20-byte sender] × n
                 let num_txs = chunk.len() as u32;
-                let total_size: usize = 4 + chunk.iter().map(|(tx, _)| 2 + tx.len() + 20).sum::<usize>();
+                let total_size: usize =
+                    4 + chunk.iter().map(|(tx, _)| 2 + tx.len() + 20).sum::<usize>();
                 let mut buf = Vec::with_capacity(total_size);
                 buf.extend_from_slice(&num_txs.to_le_bytes());
                 for (tx, sender) in chunk {
@@ -1238,7 +1370,9 @@ async fn run_ingest_mode(
 
                 // Send batch
                 if let Err(e) = stream.write_all(&buf).await {
-                    stats.rpc_errors.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+                    stats
+                        .rpc_errors
+                        .fetch_add(chunk.len() as u64, Ordering::Relaxed);
                     tracing::warn!(endpoint, error = %e, "TCP write failed");
                     break;
                 }
@@ -1254,7 +1388,11 @@ async fn run_ingest_mode(
                         if accepted == 0 && pool_pending > 0 {
                             // Server rejected: pool gate active. Retry same batch.
                             if !pool_gated {
-                                tracing::info!(endpoint, pool_pending, "pool gate: server rejected batch, waiting...");
+                                tracing::info!(
+                                    endpoint,
+                                    pool_pending,
+                                    "pool gate: server rejected batch, waiting..."
+                                );
                                 pool_gated = true;
                             }
                             gate_wait_ms += 200;
@@ -1263,7 +1401,12 @@ async fn run_ingest_mode(
                         }
 
                         if pool_gated {
-                            tracing::info!(endpoint, pool_pending, gate_wait_ms, "pool gate: resumed injection");
+                            tracing::info!(
+                                endpoint,
+                                pool_pending,
+                                gate_wait_ms,
+                                "pool gate: resumed injection"
+                            );
                             pool_gated = false;
                             gate_wait_ms = 0;
                         }
@@ -1390,7 +1533,9 @@ async fn run_sync_ingest_mode(
     duration_secs: u64,
 ) {
     let num_eps = endpoints.len();
-    let disable_forward = std::env::var("N42_DISABLE_TX_FORWARD").map(|v| v == "1").unwrap_or(false);
+    let disable_forward = std::env::var("N42_DISABLE_TX_FORWARD")
+        .map(|v| v == "1")
+        .unwrap_or(false);
     let start = Instant::now();
     let deadline = Duration::from_secs(duration_secs);
     let stop = Arc::new(AtomicBool::new(false));
@@ -1399,7 +1544,10 @@ async fn run_sync_ingest_mode(
         // === Per-node independent ingest mode ===
         // Each node gets its own async loop: submit cap → poll own pool → submit next.
         tracing::info!(
-            wave_cap, num_eps, batch_size, per_node_cap = wave_cap,
+            wave_cap,
+            num_eps,
+            batch_size,
+            per_node_cap = wave_cap,
             "SYNC_INGEST per-node mode (TX Forward OFF)"
         );
 
@@ -1420,11 +1568,7 @@ async fn run_sync_ingest_mode(
         let mut ep_data: Vec<(String, String, Vec<RawTxWithSender>)> = Vec::new();
         for (idx, txs) in presigned.into_iter().enumerate() {
             if idx < num_eps {
-                ep_data.push((
-                    endpoints[idx].clone(),
-                    rpc_urls[idx].clone(),
-                    txs,
-                ));
+                ep_data.push((endpoints[idx].clone(), rpc_urls[idx].clone(), txs));
             }
         }
 
@@ -1442,7 +1586,10 @@ async fn run_sync_ingest_mode(
             handles.push(tokio::spawn(async move {
                 // Connect TCP
                 let mut stream = match TcpStream::connect(&endpoint).await {
-                    Ok(s) => { let _ = s.set_nodelay(true); s }
+                    Ok(s) => {
+                        let _ = s.set_nodelay(true);
+                        s
+                    }
                     Err(e) => {
                         tracing::error!(endpoint, error = %e, "per-node TCP connect failed");
                         return;
@@ -1454,14 +1601,18 @@ async fn run_sync_ingest_mode(
 
                 // Wait for this node's pool to be ready
                 for _ in 0..50 {
-                    if let Ok((pending, _)) = get_txpool_status(&client, &rpc_url).await && pending < 500 {
+                    if let Ok((pending, _)) = get_txpool_status(&client, &rpc_url).await
+                        && pending < 500
+                    {
                         break;
                     }
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
 
                 loop {
-                    if stop.load(Ordering::Relaxed) { break; }
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
 
                     // Check remaining txs
                     let remaining = txs.len() - cursor;
@@ -1484,8 +1635,12 @@ async fn run_sync_ingest_mode(
                     let drain_start = Instant::now();
                     loop {
                         tokio::time::sleep(Duration::from_millis(5)).await;
-                        if stop.load(Ordering::Relaxed) { break; }
-                        if let Ok((pending, _)) = get_txpool_status(&client, &rpc_url).await && pending < 500 {
+                        if stop.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        if let Ok((pending, _)) = get_txpool_status(&client, &rpc_url).await
+                            && pending < 500
+                        {
                             break;
                         }
                         if drain_start.elapsed() > Duration::from_secs(30) {
@@ -1499,9 +1654,12 @@ async fn run_sync_ingest_mode(
 
                     let tps = ok as f64 / (drain_ms as f64 / 1000.0).max(0.001);
                     tracing::info!(
-                        wave, node = endpoint,
-                        txs = ok, err,
-                        ingest_ms, drain_ms,
+                        wave,
+                        node = endpoint,
+                        txs = ok,
+                        err,
+                        ingest_ms,
+                        drain_ms,
                         view_tps = format!("{:.0}", tps),
                         "NODE_WAVE"
                     );
@@ -1533,7 +1691,10 @@ async fn run_sync_ingest_mode(
             elapsed = format!("{:.1}s", elapsed),
             total_drain_ms = drain_total,
             avg_drain_ms = drain_total / waves.max(1),
-            sustained_tps = format!("{:.0}", sent as f64 / (drain_total as f64 / 1000.0).max(0.001)),
+            sustained_tps = format!(
+                "{:.0}",
+                sent as f64 / (drain_total as f64 / 1000.0).max(0.001)
+            ),
             wall_tps = format!("{:.0}", sent as f64 / elapsed.max(1.0)),
             per_node_tps = format!("{:.0}", sent as f64 / elapsed.max(1.0) / num_eps as f64),
             "Complete"
@@ -1569,19 +1730,26 @@ async fn run_sync_ingest_mode(
 
     // Wait for pool to be empty before first wave
     for _ in 0..50 {
-        if let Ok((pending, _)) = get_txpool_status(client, &rpc_urls[0]).await && pending < 500 {
+        if let Ok((pending, _)) = get_txpool_status(client, &rpc_urls[0]).await
+            && pending < 500
+        {
             break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
     tracing::info!(
-        wave_cap, per_ep_cap, num_eps, batch_size,
+        wave_cap,
+        per_ep_cap,
+        num_eps,
+        batch_size,
         "SYNC_INJECT global wave mode (TX Forward ON)"
     );
 
     loop {
-        if start.elapsed() >= deadline { break; }
+        if start.elapsed() >= deadline {
+            break;
+        }
 
         let mut wave_txs = 0usize;
         for (idx, cursor) in cursors.iter().enumerate() {
@@ -1609,7 +1777,9 @@ async fn run_sync_ingest_mode(
         for idx in 0..num_eps {
             let (start_cursor, end_cursor) = ep_ranges[idx];
             let take = end_cursor - start_cursor;
-            if take == 0 { continue; }
+            if take == 0 {
+                continue;
+            }
 
             if let Some(ref mut stream) = streams[idx] {
                 let slice = &presigned[idx][start_cursor..end_cursor];
@@ -1632,7 +1802,9 @@ async fn run_sync_ingest_mode(
             tokio::time::sleep(Duration::from_millis(10)).await;
             if let Ok((pending, _)) = get_txpool_status(client, &rpc_urls[0]).await {
                 drain_pending = pending;
-                if pending < 500 { break; }
+                if pending < 500 {
+                    break;
+                }
             }
             if drain_start.elapsed() > Duration::from_secs(30) {
                 tracing::warn!(pending = drain_pending, "sync-ingest drain timeout");
@@ -1717,8 +1889,13 @@ async fn run_presign_send(
 ) {
     let bp_active = Arc::new(AtomicBool::new(false));
     let bp_monitor = spawn_backpressure_monitor(
-        client.clone(), rpc_urls[0].clone(), bp_active.clone(),
-        max_pool, resume_pool, stats.clone(), stop.clone(),
+        client.clone(),
+        rpc_urls[0].clone(),
+        bp_active.clone(),
+        max_pool,
+        resume_pool,
+        stats.clone(),
+        stop.clone(),
     );
 
     let num_rpcs = presigned.len();
@@ -1750,7 +1927,9 @@ async fn run_presign_send(
         };
 
         tracing::info!(
-            rpc_idx, txs = txs.len(), batch_size = bs,
+            rpc_idx,
+            txs = txs.len(),
+            batch_size = bs,
             per_rpc_tps,
             batch_interval_ms = batch_interval.map(|d| d.as_millis() as u64).unwrap_or(0),
             "presign sender starting"
@@ -1785,11 +1964,21 @@ async fn run_presign_send(
 
                 tokio::spawn(async move {
                     let result = send_batch(&client_clone, &rpc_url_clone, &batch).await;
-                    stats_clone.sent.fetch_add(result.ok as u64, Ordering::Relaxed);
-                    stats_clone.rpc_errors.fetch_add(result.rpc_error as u64, Ordering::Relaxed);
-                    stats_clone.http_errors.fetch_add(result.http_error as u64, Ordering::Relaxed);
-                    stats_clone.rpc_latency_ns.fetch_add(result.latency.as_nanos() as u64, Ordering::Relaxed);
-                    stats_clone.rpc_latency_count.fetch_add(1, Ordering::Relaxed);
+                    stats_clone
+                        .sent
+                        .fetch_add(result.ok as u64, Ordering::Relaxed);
+                    stats_clone
+                        .rpc_errors
+                        .fetch_add(result.rpc_error as u64, Ordering::Relaxed);
+                    stats_clone
+                        .http_errors
+                        .fetch_add(result.http_error as u64, Ordering::Relaxed);
+                    stats_clone
+                        .rpc_latency_ns
+                        .fetch_add(result.latency.as_nanos() as u64, Ordering::Relaxed);
+                    stats_clone
+                        .rpc_latency_count
+                        .fetch_add(1, Ordering::Relaxed);
                     drop(permit);
                 });
             }
@@ -1828,7 +2017,10 @@ async fn run_wave_mode(
     let mut last_block = get_block_number(client, &rpc_urls[0]).await.unwrap_or(0);
 
     tracing::info!(
-        wave_cap, per_rpc_cap, num_rpcs, batch_size,
+        wave_cap,
+        per_rpc_cap,
+        num_rpcs,
+        batch_size,
         "wave mode starting"
     );
 
@@ -1919,7 +2111,9 @@ async fn run_wave_mode(
         wave_num += 1;
 
         // Get pool status
-        let (pending, queued) = get_txpool_status(client, &rpc_urls[0]).await.unwrap_or((0, 0));
+        let (pending, queued) = get_txpool_status(client, &rpc_urls[0])
+            .await
+            .unwrap_or((0, 0));
 
         tracing::info!(
             wave = wave_num,
@@ -1932,7 +2126,10 @@ async fn run_wave_mode(
             block = last_block,
             pool_pending = pending,
             pool_queued = queued,
-            tps = format!("{:.0}", wave_total as f64 / (total_ms as f64 / 1000.0).max(0.001)),
+            tps = format!(
+                "{:.0}",
+                wave_total as f64 / (total_ms as f64 / 1000.0).max(0.001)
+            ),
             "WAVE"
         );
     }
@@ -1969,15 +2166,19 @@ async fn run_test(
     // Per-RPC accounts_per_batch: use as many accounts as possible per batch
     // to minimize txs-per-account (reducing nonce gap damage).
     // Each sender has its own partition, so accounts_per_batch is NOT divided by num_rpcs.
-    let per_rpc_apb = |partition_size: usize| -> usize {
-        accounts_per_batch.min(partition_size).max(1)
-    };
+    let per_rpc_apb =
+        |partition_size: usize| -> usize { accounts_per_batch.min(partition_size).max(1) };
 
     // Shared backpressure flag
     let bp_active = Arc::new(AtomicBool::new(false));
     let bp_monitor = spawn_backpressure_monitor(
-        client.clone(), rpc_urls[0].clone(), bp_active.clone(),
-        max_pool, resume_pool, stats.clone(), stop.clone(),
+        client.clone(),
+        rpc_urls[0].clone(),
+        bp_active.clone(),
+        max_pool,
+        resume_pool,
+        stats.clone(),
+        stop.clone(),
     );
 
     // Spawn sender tasks
@@ -1988,8 +2189,11 @@ async fn run_test(
         }
         let apb = per_rpc_apb(partition.len());
         tracing::info!(
-            rpc_idx, accounts = partition.len(), apb,
-            per_rpc_tps, batch_size,
+            rpc_idx,
+            accounts = partition.len(),
+            apb,
+            per_rpc_tps,
+            batch_size,
             "spawning sender"
         );
 
@@ -2046,10 +2250,13 @@ fn spawn_reporter(
             let resyncs = stats.nonce_resyncs.load(Ordering::Relaxed);
 
             tracing::info!(
-                sent, rpc_err, http_err,
+                sent,
+                rpc_err,
+                http_err,
                 elapsed = format!("{:.0}s", elapsed),
                 effective_tps = format!("{:.1}", sent as f64 / elapsed.max(1.0)),
-                block, blocks,
+                block,
+                blocks,
                 avg_tx_per_block = if blocks > 0 { sent / blocks } else { 0 },
                 rpc_lat_ms = format!("{:.1}", stats.avg_rpc_latency_ms()),
                 sign_us = format!("{:.1}", stats.avg_sign_us()),
@@ -2065,18 +2272,17 @@ fn spawn_reporter(
 }
 
 /// Detailed per-block analysis with timestamps for accurate TPS
-async fn analyze_blocks(
-    client: &reqwest::Client,
-    rpc_url: &str,
-    start_block: u64,
-    end_block: u64,
-) {
+async fn analyze_blocks(client: &reqwest::Client, rpc_url: &str, start_block: u64, end_block: u64) {
     if end_block <= start_block {
         return;
     }
 
     let block_count = end_block - start_block;
-    let analysis_start = if block_count > 50 { end_block - 50 } else { start_block };
+    let analysis_start = if block_count > 50 {
+        end_block - 50
+    } else {
+        start_block
+    };
     let actual_count = end_block - analysis_start;
 
     let mut blocks = Vec::new();
@@ -2131,7 +2337,8 @@ async fn analyze_blocks(
     } else {
         0.0
     };
-    let p95_idx = ((block_tps_values.len() as f64 * 0.95) as usize).min(block_tps_values.len().saturating_sub(1));
+    let p95_idx = ((block_tps_values.len() as f64 * 0.95) as usize)
+        .min(block_tps_values.len().saturating_sub(1));
     let p95_tps = if !block_tps_values.is_empty() {
         block_tps_values[p95_idx]
     } else {
@@ -2179,12 +2386,22 @@ async fn analyze_blocks(
         let dt = blocks[i].timestamp.saturating_sub(blocks[i - 1].timestamp);
         if dt > 0 {
             let tps = blocks[i].tx_count as f64 / dt as f64;
-            block_with_tps.push((blocks[i].number, blocks[i].tx_count, tps, blocks[i].gas_used, blocks[i].gas_limit));
+            block_with_tps.push((
+                blocks[i].number,
+                blocks[i].tx_count,
+                tps,
+                blocks[i].gas_used,
+                blocks[i].gas_limit,
+            ));
         }
     }
     block_with_tps.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
     for (i, (num, txs, tps, gas_used, gas_limit)) in block_with_tps.iter().take(5).enumerate() {
-        let util = if *gas_limit > 0 { (*gas_used as f64 / *gas_limit as f64) * 100.0 } else { 0.0 };
+        let util = if *gas_limit > 0 {
+            (*gas_used as f64 / *gas_limit as f64) * 100.0
+        } else {
+            0.0
+        };
         tracing::info!(
             rank = i + 1,
             block = num,
@@ -2202,8 +2419,7 @@ async fn analyze_blocks(
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
@@ -2247,19 +2463,33 @@ async fn main() -> Result<()> {
 
     // === Pre-sign save mode: sign and save to file, then exit ===
     if let Some(ref save_path) = cli.presign_save {
-        let total = if cli.presign > 0 { cli.presign } else { 5_000_000 };
+        let total = if cli.presign > 0 {
+            cli.presign
+        } else {
+            5_000_000
+        };
         tracing::info!("=== N42 Pre-sign Save Mode ===");
         presign_and_save(
-            &accounts, &targets, total, rpc_urls.len(), cli.erc20_ratio, save_path,
+            &accounts,
+            &targets,
+            total,
+            rpc_urls.len(),
+            cli.erc20_ratio,
+            save_path,
         )?;
         return Ok(());
     }
 
     // === Binary TCP ingest mode ===
     if let Some(ref ingest_endpoints) = cli.ingest {
-        let load_path = cli.presign_load.as_ref()
+        let load_path = cli
+            .presign_load
+            .as_ref()
             .ok_or_else(|| eyre::eyre!("--ingest requires --presign-load"))?;
-        let endpoints: Vec<String> = ingest_endpoints.split(',').map(|s| s.trim().to_string()).collect();
+        let endpoints: Vec<String> = ingest_endpoints
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .collect();
 
         tracing::info!("=== N42 BINARY TCP INGEST MODE ===");
         tracing::info!(endpoints = endpoints.len(), "TCP ingest endpoints");
@@ -2281,9 +2511,16 @@ async fn main() -> Result<()> {
             tracing::info!("=== SYNC TCP INGEST MODE (wave={}) ===", cli.wave);
 
             run_sync_ingest_mode(
-                &endpoints, presigned, cli.batch_size, cli.wave as usize,
-                &rpc_urls, &client, start_block, cli.duration,
-            ).await;
+                &endpoints,
+                presigned,
+                cli.batch_size,
+                cli.wave as usize,
+                &rpc_urls,
+                &client,
+                start_block,
+                cli.duration,
+            )
+            .await;
 
             let final_block = get_block_number(&client, &rpc_urls[0]).await?;
             analyze_blocks(&client, &rpc_urls[0], start_block, final_block).await;
@@ -2294,9 +2531,17 @@ async fn main() -> Result<()> {
         stats.start_block.store(start_block, Ordering::Relaxed);
 
         run_ingest_mode(
-            &endpoints, presigned, cli.batch_size, cli.target_tps, &stats,
-            &rpc_urls, &client, start_block, cli.duration,
-        ).await;
+            &endpoints,
+            presigned,
+            cli.batch_size,
+            cli.target_tps,
+            &stats,
+            &rpc_urls,
+            &client,
+            start_block,
+            cli.duration,
+        )
+        .await;
 
         // Wait for pool drain
         tracing::info!("Waiting for pending pool to drain...");
@@ -2308,7 +2553,12 @@ async fn main() -> Result<()> {
             }
             if let Ok((pending, queued)) = get_txpool_status(&client, &rpc_urls[0]).await {
                 if pending < 500 {
-                    tracing::info!(pending, queued, drain_ms = drain_start.elapsed().as_millis(), "Pool drained");
+                    tracing::info!(
+                        pending,
+                        queued,
+                        drain_ms = drain_start.elapsed().as_millis(),
+                        "Pool drained"
+                    );
                     break;
                 }
                 tracing::info!(pending, queued, "Draining...");
@@ -2334,7 +2584,11 @@ async fn main() -> Result<()> {
         );
 
         let presigned = presign_all(
-            &accounts, &targets, cli.burst, rpc_urls.len(), cli.erc20_ratio,
+            &accounts,
+            &targets,
+            cli.burst,
+            rpc_urls.len(),
+            cli.erc20_ratio,
         );
 
         let start_block = get_block_number(&client, &rpc_urls[0]).await?;
@@ -2368,11 +2622,17 @@ async fn main() -> Result<()> {
                 if monitor_stop.load(Ordering::Relaxed) {
                     break;
                 }
-                let now_block = get_block_number(&monitor_client, &monitor_rpc).await.unwrap_or(last_block);
+                let now_block = get_block_number(&monitor_client, &monitor_rpc)
+                    .await
+                    .unwrap_or(last_block);
                 if now_block > last_block {
                     // Fetch latest blocks for real-time TPS
                     let mut recent_txs = 0u64;
-                    let check_from = if now_block > last_block + 5 { now_block - 5 } else { last_block };
+                    let check_from = if now_block > last_block + 5 {
+                        now_block - 5
+                    } else {
+                        last_block
+                    };
                     for b in (check_from + 1)..=now_block {
                         if let Ok(info) = get_block_info(&monitor_client, &monitor_rpc, b).await {
                             recent_txs += info.tx_count;
@@ -2381,7 +2641,9 @@ async fn main() -> Result<()> {
                     let dt = last_time.elapsed().as_secs_f64();
                     let sent = monitor_stats.sent.load(Ordering::Relaxed);
                     let rpc_err = monitor_stats.rpc_errors.load(Ordering::Relaxed);
-                    let pool = get_txpool_status(&monitor_client, &monitor_rpc).await.unwrap_or((0, 0));
+                    let pool = get_txpool_status(&monitor_client, &monitor_rpc)
+                        .await
+                        .unwrap_or((0, 0));
 
                     tracing::info!(
                         blocks = now_block - monitor_start_block,
@@ -2389,7 +2651,10 @@ async fn main() -> Result<()> {
                         block_tps = format!("{:.0}", recent_txs as f64 / dt.max(0.1)),
                         submitted = sent,
                         submit_err = rpc_err,
-                        submit_tps = format!("{:.0}", sent as f64 / start.elapsed().as_secs_f64().max(0.1)),
+                        submit_tps = format!(
+                            "{:.0}",
+                            sent as f64 / start.elapsed().as_secs_f64().max(0.1)
+                        ),
                         pool_pending = pool.0,
                         pool_queued = pool.1,
                         "BURST_MONITOR"
@@ -2419,9 +2684,18 @@ async fn main() -> Result<()> {
         });
 
         run_presign_send(
-            presigned, &rpc_urls, &client, &stats, &semaphore,
-            cli.batch_size, blast_tps, cli.max_pool, cli.resume_pool, &stop,
-        ).await;
+            presigned,
+            &rpc_urls,
+            &client,
+            &stats,
+            &semaphore,
+            cli.batch_size,
+            blast_tps,
+            cli.max_pool,
+            cli.resume_pool,
+            &stop,
+        )
+        .await;
 
         duration_guard.abort();
 
@@ -2438,7 +2712,10 @@ async fn main() -> Result<()> {
         tracing::info!("=== BURST SEND COMPLETE ===");
         tracing::info!(
             submit_tps = format!("{:.0}", sent as f64 / elapsed.max(1.0)),
-            sent, rpc_err, http_err, blocks,
+            sent,
+            rpc_err,
+            http_err,
+            blocks,
             duration = format!("{:.1}s", elapsed),
             avg_rpc_latency_ms = format!("{:.1}", stats.avg_rpc_latency_ms()),
             bp_pauses = stats.backpressure_pauses.load(Ordering::Relaxed),
@@ -2454,7 +2731,12 @@ async fn main() -> Result<()> {
             }
             if let Ok((pending, queued)) = get_txpool_status(&client, &rpc_urls[0]).await {
                 if pending < 500 {
-                    tracing::info!(pending, queued, drain_ms = drain_start.elapsed().as_millis(), "Pool drained");
+                    tracing::info!(
+                        pending,
+                        queued,
+                        drain_ms = drain_start.elapsed().as_millis(),
+                        "Pool drained"
+                    );
                     break;
                 }
                 tracing::info!(pending, queued, "Draining...");
@@ -2483,7 +2765,9 @@ async fn main() -> Result<()> {
 
     // === Wave mode: synchronized submission, one wave per block ===
     if cli.wave > 0 {
-        let load_path = cli.presign_load.as_ref()
+        let load_path = cli
+            .presign_load
+            .as_ref()
             .ok_or_else(|| eyre::eyre!("--wave requires --presign-load"))?;
         tracing::info!("=== N42 Wave Mode: cap={} ===", cli.wave);
         let presigned = load_presigned(load_path)?;
@@ -2503,14 +2787,24 @@ async fn main() -> Result<()> {
         let start = Instant::now();
 
         let reporter = spawn_reporter(
-            stats.clone(), client.clone(), rpc_urls[0].clone(), start, start_block,
+            stats.clone(),
+            client.clone(),
+            rpc_urls[0].clone(),
+            start,
+            start_block,
         );
 
         run_wave_mode(
-            presigned, &rpc_urls, &client, &stats, &semaphore,
-            cli.batch_size, cli.wave as usize,
+            presigned,
+            &rpc_urls,
+            &client,
+            &stats,
+            &semaphore,
+            cli.batch_size,
+            cli.wave as usize,
             Duration::from_secs(cli.duration),
-        ).await;
+        )
+        .await;
 
         reporter.abort();
 
@@ -2541,7 +2835,11 @@ async fn main() -> Result<()> {
             }
             if let Ok((pending, _)) = get_txpool_status(&client, &rpc_urls[0]).await {
                 if pending < 500 {
-                    tracing::info!(pending, drain_ms = drain_start.elapsed().as_millis(), "Pool drained");
+                    tracing::info!(
+                        pending,
+                        drain_ms = drain_start.elapsed().as_millis(),
+                        "Pool drained"
+                    );
                     break;
                 }
             }
@@ -2574,14 +2872,27 @@ async fn main() -> Result<()> {
         let start = Instant::now();
 
         let reporter = spawn_reporter(
-            stats.clone(), client.clone(), rpc_urls[0].clone(), start, start_block,
+            stats.clone(),
+            client.clone(),
+            rpc_urls[0].clone(),
+            start,
+            start_block,
         );
 
         stop.store(false, Ordering::Relaxed);
         run_presign_send(
-            presigned, &rpc_urls, &client, &stats, &semaphore,
-            cli.batch_size, cli.target_tps, cli.max_pool, cli.resume_pool, &stop,
-        ).await;
+            presigned,
+            &rpc_urls,
+            &client,
+            &stats,
+            &semaphore,
+            cli.batch_size,
+            cli.target_tps,
+            cli.max_pool,
+            cli.resume_pool,
+            &stop,
+        )
+        .await;
 
         reporter.abort();
 
@@ -2596,7 +2907,10 @@ async fn main() -> Result<()> {
         tracing::info!(
             effective_tps = format!("{:.1}", sent as f64 / elapsed.max(1.0)),
             submit_tps = format!("{:.1}", (sent + rpc_err) as f64 / elapsed.max(1.0)),
-            sent, rpc_err, http_err, blocks,
+            sent,
+            rpc_err,
+            http_err,
+            blocks,
             avg_tx_per_block = sent / blocks.max(1),
             duration = format!("{:.1}s", elapsed),
             avg_rpc_latency_ms = format!("{:.1}", stats.avg_rpc_latency_ms()),
@@ -2634,7 +2948,11 @@ async fn main() -> Result<()> {
         tracing::info!("=== N42 Pre-sign Mode (legacy, use --burst for v10) ===");
 
         let presigned = presign_all(
-            &accounts, &targets, cli.presign, rpc_urls.len(), cli.erc20_ratio,
+            &accounts,
+            &targets,
+            cli.presign,
+            rpc_urls.len(),
+            cli.erc20_ratio,
         );
 
         let start_block = get_block_number(&client, &rpc_urls[0]).await?;
@@ -2652,14 +2970,27 @@ async fn main() -> Result<()> {
         let start = Instant::now();
 
         let reporter = spawn_reporter(
-            stats.clone(), client.clone(), rpc_urls[0].clone(), start, start_block,
+            stats.clone(),
+            client.clone(),
+            rpc_urls[0].clone(),
+            start,
+            start_block,
         );
 
         stop.store(false, Ordering::Relaxed);
         run_presign_send(
-            presigned, &rpc_urls, &client, &stats, &semaphore,
-            cli.batch_size, cli.target_tps, cli.max_pool, cli.resume_pool, &stop,
-        ).await;
+            presigned,
+            &rpc_urls,
+            &client,
+            &stats,
+            &semaphore,
+            cli.batch_size,
+            cli.target_tps,
+            cli.max_pool,
+            cli.resume_pool,
+            &stop,
+        )
+        .await;
 
         reporter.abort();
 
@@ -2675,7 +3006,10 @@ async fn main() -> Result<()> {
             presign_total = cli.presign,
             effective_tps = format!("{:.1}", sent as f64 / elapsed.max(1.0)),
             injection_tps = format!("{:.1}", cli.presign as f64 / elapsed.max(1.0)),
-            sent, rpc_err, http_err, blocks,
+            sent,
+            rpc_err,
+            http_err,
+            blocks,
             avg_tx_per_block = sent / blocks.max(1),
             duration = format!("{:.1}s", elapsed),
             avg_rpc_latency_ms = format!("{:.1}", stats.avg_rpc_latency_ms()),
@@ -2726,7 +3060,8 @@ async fn main() -> Result<()> {
             let rpc_url = rpc_urls[group[0].rpc_idx].clone();
 
             let this_batch = batch_sz.min(prefill_total - sent);
-            let (raw_txs, _, _) = sign_mixed_batch(group, &targets, this_batch, group.len(), cli.erc20_ratio);
+            let (raw_txs, _, _) =
+                sign_mixed_batch(group, &targets, this_batch, group.len(), cli.erc20_ratio);
             let c = client.clone();
             let sem = semaphore.clone();
             let permit = sem.acquire_owned().await.unwrap();
@@ -2792,7 +3127,7 @@ async fn main() -> Result<()> {
             } else if target_tps >= 15000 {
                 1000 // 1000 accounts/batch
             } else if target_tps >= 7500 {
-                500  // 500 accounts/batch
+                500 // 500 accounts/batch
             } else {
                 cli.accounts_per_batch
             };
@@ -2811,15 +3146,31 @@ async fn main() -> Result<()> {
             );
 
             let reporter = spawn_reporter(
-                stats.clone(), client.clone(), rpc_urls[0].clone(), start, sb,
+                stats.clone(),
+                client.clone(),
+                rpc_urls[0].clone(),
+                start,
+                sb,
             );
 
             stop.store(false, Ordering::Relaxed);
             run_test(
-                &accounts, &targets, &rpc_urls, &client, &stats, &semaphore,
-                target_tps, bs, apb, cli.erc20_ratio, step_duration,
-                cli.max_pool, cli.resume_pool, &stop,
-            ).await;
+                &accounts,
+                &targets,
+                &rpc_urls,
+                &client,
+                &stats,
+                &semaphore,
+                target_tps,
+                bs,
+                apb,
+                cli.erc20_ratio,
+                step_duration,
+                cli.max_pool,
+                cli.resume_pool,
+                &stop,
+            )
+            .await;
 
             reporter.abort();
 
@@ -2840,7 +3191,10 @@ async fn main() -> Result<()> {
             tracing::info!(
                 target_tps,
                 effective_tps = format!("{:.1}", effective_tps),
-                sent, rpc_err, http_err, blocks,
+                sent,
+                rpc_err,
+                http_err,
+                blocks,
                 avg_tx_per_block = sent / blocks.max(1),
                 fail_rate = format!("{:.1}%", fail_rate),
                 avg_rpc_latency_ms = format!("{:.1}", stats.avg_rpc_latency_ms()),
@@ -2858,7 +3212,10 @@ async fn main() -> Result<()> {
             }
 
             if blocks == 0 && target_tps > 500 {
-                tracing::warn!(target = target_tps, "STALL DETECTED - no new blocks produced, stopping");
+                tracing::warn!(
+                    target = target_tps,
+                    "STALL DETECTED - no new blocks produced, stopping"
+                );
                 break;
             }
 
@@ -2881,7 +3238,12 @@ async fn main() -> Result<()> {
                 }
                 if let Ok((pending, queued)) = get_txpool_status(&client, &rpc_urls[0]).await {
                     if pending < 500 {
-                        tracing::info!(pending, queued, elapsed_ms = drain_start.elapsed().as_millis(), "Pending pool drained");
+                        tracing::info!(
+                            pending,
+                            queued,
+                            elapsed_ms = drain_start.elapsed().as_millis(),
+                            "Pending pool drained"
+                        );
                         break;
                     }
                     tracing::info!(pending, queued, "Draining pending pool...");
@@ -2892,16 +3254,31 @@ async fn main() -> Result<()> {
     } else {
         let start = Instant::now();
         let reporter = spawn_reporter(
-            stats.clone(), client.clone(), rpc_urls[0].clone(), start, start_block,
+            stats.clone(),
+            client.clone(),
+            rpc_urls[0].clone(),
+            start,
+            start_block,
         );
 
         stop.store(false, Ordering::Relaxed);
         run_test(
-            &accounts, &targets, &rpc_urls, &client, &stats, &semaphore,
-            cli.target_tps, cli.batch_size, cli.accounts_per_batch,
-            cli.erc20_ratio, Duration::from_secs(cli.duration),
-            cli.max_pool, cli.resume_pool, &stop,
-        ).await;
+            &accounts,
+            &targets,
+            &rpc_urls,
+            &client,
+            &stats,
+            &semaphore,
+            cli.target_tps,
+            cli.batch_size,
+            cli.accounts_per_batch,
+            cli.erc20_ratio,
+            Duration::from_secs(cli.duration),
+            cli.max_pool,
+            cli.resume_pool,
+            &stop,
+        )
+        .await;
 
         reporter.abort();
 
@@ -2916,7 +3293,10 @@ async fn main() -> Result<()> {
         tracing::info!(
             target_tps = cli.target_tps,
             effective_tps = format!("{:.1}", sent as f64 / elapsed.max(1.0)),
-            sent, rpc_err, http_err, blocks,
+            sent,
+            rpc_err,
+            http_err,
+            blocks,
             avg_tx_per_block = sent / blocks.max(1),
             duration = format!("{:.0}s", elapsed),
             avg_rpc_latency_ms = format!("{:.1}", stats.avg_rpc_latency_ms()),

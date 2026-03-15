@@ -11,16 +11,17 @@ pub mod state_sync;
 pub mod transport;
 pub mod tx_forward;
 
+pub use consensus_direct::{ConsensusDirectCodec, ConsensusDirectRequest, ConsensusDirectResponse};
 pub use error::NetworkError;
 pub use mobile::{
-    ShardedStarHub, ShardedStarHubConfig, ShardedStarHubHandle, StarHub, StarHubConfig,
-    StarHubHandle, MSG_TYPE_CACHE_SYNC, MSG_TYPE_CACHE_SYNC_ZSTD,
+    MSG_TYPE_CACHE_SYNC, MSG_TYPE_CACHE_SYNC_ZSTD, ShardedStarHub, ShardedStarHubConfig,
+    ShardedStarHubHandle, StarHub, StarHubConfig, StarHubHandle,
 };
 pub use service::{NetworkCommand, NetworkEvent, NetworkHandle, NetworkService};
-pub use consensus_direct::{ConsensusDirectCodec, ConsensusDirectRequest, ConsensusDirectResponse};
-pub use state_sync::{BlockSyncRequest, BlockSyncResponse, SyncBlock, MAX_BLOCKS_PER_SYNC_REQUEST};
+pub use state_sync::{BlockSyncRequest, BlockSyncResponse, MAX_BLOCKS_PER_SYNC_REQUEST, SyncBlock};
 pub use transport::{
-    build_swarm, build_swarm_with_validator_index, N42Behaviour, TransportConfig,
+    N42Behaviour, TransportConfig, build_swarm, build_swarm_with_validator_index,
+    deterministic_validator_keypair, deterministic_validator_peer_id,
 };
 
 // Re-export libp2p types used by consumers.

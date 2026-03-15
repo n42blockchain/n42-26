@@ -1,3 +1,4 @@
+use arc_swap::ArcSwapOption;
 use reth_chainspec::{ChainSpec, EthChainSpec, EthereumHardforks};
 use reth_consensus::{Consensus, ConsensusError, FullConsensus, HeaderValidator};
 use reth_ethereum_consensus::EthBeaconConsensus;
@@ -9,7 +10,7 @@ use std::fmt::Debug;
 use std::sync::Arc;
 
 use crate::extra_data::extract_qc_from_extra_data;
-use crate::protocol::quorum::{verify_qc, verify_commit_qc};
+use crate::protocol::quorum::{verify_commit_qc, verify_qc};
 use crate::validator::ValidatorSet;
 
 /// N42 consensus adapter that integrates with the reth node builder.
@@ -28,7 +29,7 @@ pub struct N42Consensus<C = ChainSpec> {
     inner: EthBeaconConsensus<C>,
     /// Validator set for QC verification.
     /// None during initial sync when validator set is not yet loaded.
-    validator_set: Option<ValidatorSet>,
+    validator_set: Arc<ArcSwapOption<ValidatorSet>>,
 }
 
 impl<C> N42Consensus<C>
@@ -46,22 +47,33 @@ where
         Self {
             inner: EthBeaconConsensus::new(chain_spec)
                 .with_max_extra_data_size(Self::MAX_EXTRA_DATA_SIZE),
-            validator_set: None,
+            validator_set: Arc::new(ArcSwapOption::empty()),
         }
     }
 
     /// Create a new N42 consensus adapter with a validator set for QC verification.
     pub fn with_validator_set(chain_spec: Arc<C>, validator_set: ValidatorSet) -> Self {
+        Self::with_validator_set_store(
+            chain_spec,
+            Arc::new(ArcSwapOption::from_pointee(validator_set)),
+        )
+    }
+
+    /// Create a new N42 consensus adapter backed by a shared validator-set store.
+    pub fn with_validator_set_store(
+        chain_spec: Arc<C>,
+        validator_set: Arc<ArcSwapOption<ValidatorSet>>,
+    ) -> Self {
         Self {
             inner: EthBeaconConsensus::new(chain_spec)
                 .with_max_extra_data_size(Self::MAX_EXTRA_DATA_SIZE),
-            validator_set: Some(validator_set),
+            validator_set,
         }
     }
 
     /// Sets or updates the validator set.
     pub fn set_validator_set(&mut self, validator_set: ValidatorSet) {
-        self.validator_set = Some(validator_set);
+        self.validator_set.store(Some(Arc::new(validator_set)));
     }
 }
 
@@ -83,11 +95,11 @@ where
             receipt_root_bloom,
         )?;
 
-        if let Some(ref vs) = self.validator_set {
+        if let Some(vs) = self.validator_set.load_full() {
             let extra_data = block.header().extra_data();
             if let Some(qc) = extract_qc_from_extra_data(extra_data)? {
-                verify_qc(&qc, vs)
-                    .or_else(|_| verify_commit_qc(&qc, vs))
+                verify_qc(&qc, &vs)
+                    .or_else(|_| verify_commit_qc(&qc, &vs))
                     .map_err(|e| ConsensusError::Other(e.to_string()))?;
             }
         }
@@ -142,14 +154,12 @@ mod tests {
     use alloy_primitives::{Address, B256};
     use bitvec::prelude::*;
     use n42_chainspec::ValidatorInfo;
-    use n42_primitives::{
-        BlsSecretKey,
-        bls::AggregateSignature,
-        consensus::QuorumCertificate,
-    };
+    use n42_primitives::{BlsSecretKey, bls::AggregateSignature, consensus::QuorumCertificate};
 
     use crate::extra_data::{encode_qc_to_extra_data, extract_qc_from_extra_data};
-    use crate::protocol::quorum::{verify_qc, verify_commit_qc, signing_message, commit_signing_message};
+    use crate::protocol::quorum::{
+        commit_signing_message, signing_message, verify_commit_qc, verify_qc,
+    };
     use crate::validator::ValidatorSet;
 
     /// Helper: create a test validator set of size `n` along with the secret keys.
@@ -161,6 +171,7 @@ mod tests {
             .map(|(i, sk)| ValidatorInfo {
                 address: Address::with_last_byte(i as u8),
                 bls_public_key: sk.public_key(),
+                p2p_peer_id: None,
             })
             .collect();
         let f = ((n as u32).saturating_sub(1)) / 3;
@@ -172,7 +183,7 @@ mod tests {
     fn test_new_without_validator_set() {
         let chain_spec = n42_chainspec::n42_dev_chainspec();
         let consensus = N42Consensus::new(chain_spec);
-        assert!(consensus.validator_set.is_none());
+        assert!(consensus.validator_set.load_full().is_none());
     }
 
     #[test]
@@ -180,8 +191,9 @@ mod tests {
         let chain_spec = n42_chainspec::n42_dev_chainspec();
         let (_, vs) = test_validator_set(4);
         let consensus = N42Consensus::with_validator_set(chain_spec, vs);
-        assert!(consensus.validator_set.is_some());
-        let vs_ref = consensus.validator_set.as_ref().unwrap();
+        let loaded = consensus.validator_set.load_full();
+        assert!(loaded.is_some());
+        let vs_ref = loaded.as_ref().unwrap();
         assert_eq!(vs_ref.len(), 4);
         assert_eq!(vs_ref.quorum_size(), 3);
     }
@@ -190,18 +202,20 @@ mod tests {
     fn test_set_validator_set() {
         let chain_spec = n42_chainspec::n42_dev_chainspec();
         let mut consensus = N42Consensus::new(chain_spec);
-        assert!(consensus.validator_set.is_none());
+        assert!(consensus.validator_set.load_full().is_none());
 
         let (_, vs) = test_validator_set(7);
         consensus.set_validator_set(vs);
-        assert!(consensus.validator_set.is_some());
-        assert_eq!(consensus.validator_set.as_ref().unwrap().len(), 7);
+        let loaded = consensus.validator_set.load_full();
+        assert!(loaded.is_some());
+        assert_eq!(loaded.as_ref().unwrap().len(), 7);
     }
 
     #[test]
     fn test_max_extra_data_size() {
         assert_eq!(
-            N42Consensus::<ChainSpec>::MAX_EXTRA_DATA_SIZE, 4096,
+            N42Consensus::<ChainSpec>::MAX_EXTRA_DATA_SIZE,
+            4096,
             "MAX_EXTRA_DATA_SIZE must be 4096 for QC storage"
         );
     }
@@ -268,8 +282,8 @@ mod tests {
 
         assert!(verify_qc(&extracted, &vs).is_err());
 
-        let fallback_result = verify_qc(&extracted, &vs)
-            .or_else(|_| verify_commit_qc(&extracted, &vs));
+        let fallback_result =
+            verify_qc(&extracted, &vs).or_else(|_| verify_commit_qc(&extracted, &vs));
         assert!(fallback_result.is_ok());
     }
 

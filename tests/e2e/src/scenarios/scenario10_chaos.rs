@@ -17,7 +17,7 @@ use tempfile::TempDir;
 use tracing::{error, info, warn};
 
 use crate::erc20::Erc20Manager;
-use crate::genesis::{generate_test_accounts, write_genesis_file, TEST_CHAIN_ID};
+use crate::genesis::{TEST_CHAIN_ID, generate_test_accounts, write_genesis_file};
 use crate::mobile_sim::run_mobile_fleet;
 use crate::node_manager::{NodeConfig, NodeProcess};
 use crate::rpc_client::RpcClient;
@@ -122,16 +122,15 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
 
     // Deploy ERC20
     info!("deploying ERC20 contract");
-    let erc20 = match Erc20Manager::deploy(&mut tx_engine, &node0_rpc, 0, max_fee, priority_fee)
-        .await
-    {
-        Ok(erc20) => erc20,
-        Err(e) => {
-            error!(error = %e, "failed to deploy ERC20");
-            cleanup_nodes(&mut nodes);
-            return Err(e);
-        }
-    };
+    let erc20 =
+        match Erc20Manager::deploy(&mut tx_engine, &node0_rpc, 0, max_fee, priority_fee).await {
+            Ok(erc20) => erc20,
+            Err(e) => {
+                error!(error = %e, "failed to deploy ERC20");
+                cleanup_nodes(&mut nodes);
+                return Err(e);
+            }
+        };
 
     let total_supply = erc20.total_supply(&node0_rpc).await.unwrap_or_default();
     info!(%total_supply, "ERC20 deployed");
@@ -147,12 +146,7 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
 
     // Start mobile fleet in background
     let mobile_duration = Duration::from_secs(120); // runs across all cases
-    let mobile_handle = tokio::spawn(run_mobile_fleet(
-        node0_url.clone(),
-        7,
-        mobile_duration,
-        0,
-    ));
+    let mobile_handle = tokio::spawn(run_mobile_fleet(node0_url.clone(), 7, mobile_duration, 0));
 
     // Send transactions for ~20s
     let case1_start = tokio::time::Instant::now();
@@ -197,7 +191,12 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
     }
 
     let height_after_phase1 = get_height_safe(&node0_rpc).await;
-    info!(height_after_phase1, eth_txs = eth_tx_hashes.len(), erc20_txs = erc20_tx_hashes.len(), "Case 1 complete");
+    info!(
+        height_after_phase1,
+        eth_txs = eth_tx_hashes.len(),
+        erc20_txs = erc20_tx_hashes.len(),
+        "Case 1 complete"
+    );
 
     // -----------------------------------------------------------------------
     // Case 2: Single node crash — node-6 stops (6/7 > quorum=5)
@@ -310,10 +309,7 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
     // T+0s: Restart node-4 → 5/7 = quorum → resume
     info!("restarting node-4 (5/7 = quorum)");
     let node4 = NodeProcess::start_with_datadir(&configs[4], data_dir_4).await?;
-    let node4_rpc = RpcClient::new(format!(
-        "http://127.0.0.1:{}",
-        8545 + PORT_OFFSET_BASE + 40
-    ));
+    let node4_rpc = RpcClient::new(format!("http://127.0.0.1:{}", 8545 + PORT_OFFSET_BASE + 40));
     let target_height = get_height_safe(&node0_rpc).await;
     if let Err(e) = wait_for_sync(&node4_rpc, target_height, Duration::from_secs(30)).await {
         warn!(error = %e, "node-4 sync timeout (may still be catching up)");
@@ -335,10 +331,7 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
     // T+15s: Restart node-5 → 6/7
     info!("restarting node-5 (6/7)");
     let node5 = NodeProcess::start_with_datadir(&configs[5], data_dir_5).await?;
-    let node5_rpc = RpcClient::new(format!(
-        "http://127.0.0.1:{}",
-        8545 + PORT_OFFSET_BASE + 50
-    ));
+    let node5_rpc = RpcClient::new(format!("http://127.0.0.1:{}", 8545 + PORT_OFFSET_BASE + 50));
     let target_height = get_height_safe(&node0_rpc).await;
     if let Err(e) = wait_for_sync(&node5_rpc, target_height, Duration::from_secs(30)).await {
         warn!(error = %e, "node-5 sync timeout");
@@ -351,10 +344,7 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
     // T+30s: Restart node-6 → 7/7
     info!("restarting node-6 (7/7)");
     let node6 = NodeProcess::start_with_datadir(&configs[6], data_dir_6).await?;
-    let node6_rpc = RpcClient::new(format!(
-        "http://127.0.0.1:{}",
-        8545 + PORT_OFFSET_BASE + 60
-    ));
+    let node6_rpc = RpcClient::new(format!("http://127.0.0.1:{}", 8545 + PORT_OFFSET_BASE + 60));
     let target_height = get_height_safe(&node0_rpc).await;
     if let Err(e) = wait_for_sync(&node6_rpc, target_height, Duration::from_secs(45)).await {
         warn!(error = %e, "node-6 sync timeout");
@@ -406,7 +396,8 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
     // have a large sync gap, so we check the first 6 nodes (0-5) for tight consistency,
     // and only require node-6 to be alive (V10 covers that).
     {
-        let heights_excl_6: Vec<u64> = heights.iter()
+        let heights_excl_6: Vec<u64> = heights
+            .iter()
             .filter(|(i, _)| *i != 6)
             .map(|(_, h)| *h)
             .collect();
@@ -414,10 +405,16 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
         let min_h6 = heights_excl_6.iter().copied().min().unwrap_or(0);
         let diff = max_h6 - min_h6;
         if diff <= 5 {
-            info!(diff, max_h6, min_h6, "V1 PASS: height consistency (nodes 0-5, diff={diff} <= 5)");
+            info!(
+                diff,
+                max_h6, min_h6, "V1 PASS: height consistency (nodes 0-5, diff={diff} <= 5)"
+            );
             pass_count += 1;
         } else {
-            error!(diff, max_h6, min_h6, "V1 FAIL: height inconsistency among nodes 0-5");
+            error!(
+                diff,
+                max_h6, min_h6, "V1 FAIL: height inconsistency among nodes 0-5"
+            );
             fail_count += 1;
         }
     }
@@ -491,10 +488,16 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
     {
         let stall_diff = height_after_stall.saturating_sub(height_before_stall);
         if stall_diff <= 2 {
-            info!(stall_diff, "V4 PASS: f+1 stall verified (diff={stall_diff} <= 2)");
+            info!(
+                stall_diff,
+                "V4 PASS: f+1 stall verified (diff={stall_diff} <= 2)"
+            );
             pass_count += 1;
         } else {
-            error!(stall_diff, "V4 FAIL: consensus did not stall with 4/7 nodes");
+            error!(
+                stall_diff,
+                "V4 FAIL: consensus did not stall with 4/7 nodes"
+            );
             fail_count += 1;
         }
     }
@@ -515,8 +518,7 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
         } else if recovery_blocks >= 1 || late_recovery >= 1 {
             info!(
                 recovery_blocks,
-                late_recovery,
-                "V5 PASS: consensus resumed after recovery (>= 1 new block)"
+                late_recovery, "V5 PASS: consensus resumed after recovery (>= 1 new block)"
             );
             pass_count += 1;
         } else {
@@ -543,7 +545,13 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
                 let h = get_height_safe(&node.rpc).await;
                 let diff = max_height.saturating_sub(h);
                 if diff > 5 {
-                    error!(node = idx, height = h, max_height, diff, "recovered node behind");
+                    error!(
+                        node = idx,
+                        height = h,
+                        max_height,
+                        diff,
+                        "recovered node behind"
+                    );
                     recovered_ok = false;
                 }
             }
@@ -555,7 +563,12 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
                 error!(node = 6, height = h6, "node-6 has too few blocks");
                 recovered_ok = false;
             } else {
-                info!(node = 6, height = h6, max_height, "node-6 alive with pre-crash blocks");
+                info!(
+                    node = 6,
+                    height = h6,
+                    max_height,
+                    "node-6 alive with pre-crash blocks"
+                );
             }
         }
         if recovered_ok {
@@ -646,10 +659,7 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
             );
             pass_count += 1;
         } else {
-            error!(
-                distinct_miners,
-                "V9 FAIL: insufficient leader rotation"
-            );
+            error!(distinct_miners, "V9 FAIL: insufficient leader rotation");
             fail_count += 1;
         }
     }

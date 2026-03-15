@@ -1,11 +1,11 @@
 use alloy_primitives::B256;
 use n42_primitives::consensus::{ConsensusMessage, PrepareQC, Proposal, ViewNumber};
 
-use crate::error::{ConsensusError, ConsensusResult};
-use crate::validator::LeaderSelector;
 use super::quorum::{commit_signing_message, signing_message};
 use super::round::Phase;
 use super::state_machine::{ConsensusEngine, EngineOutput};
+use crate::error::{ConsensusError, ConsensusResult};
+use crate::validator::LeaderSelector;
 
 const MAX_IMPORTED_BLOCKS: usize = 64;
 
@@ -45,10 +45,14 @@ impl ConsensusEngine {
         );
 
         self.vote_collector = Some(crate::protocol::quorum::VoteCollector::new(
-            view, block_hash, self.validator_set().len(),
+            view,
+            block_hash,
+            self.validator_set().len(),
         ));
         self.commit_collector = Some(crate::protocol::quorum::VoteCollector::new(
-            view, block_hash, self.validator_set().len(),
+            view,
+            block_hash,
+            self.validator_set().len(),
         ));
         self.round_state.enter_voting();
 
@@ -57,11 +61,13 @@ impl ConsensusEngine {
         let leader_vote_msg = signing_message(view, &block_hash);
         let leader_vote_sig = self.secret_key.sign(&leader_vote_msg);
         if let Some(ref mut collector) = self.vote_collector {
-            let _ = collector.add_vote(self.my_index, leader_vote_sig);
+            collector.add_verified_vote(self.my_index, leader_vote_sig)?;
         }
 
         self.view_timing.proposal_sent = Some(std::time::Instant::now());
-        self.emit(EngineOutput::BroadcastMessage(ConsensusMessage::Proposal(proposal)))?;
+        self.emit(EngineOutput::BroadcastMessage(ConsensusMessage::Proposal(
+            proposal,
+        )))?;
 
         // Check if quorum already reached (single-validator scenario).
         self.try_form_prepare_qc()
@@ -89,23 +95,25 @@ impl ConsensusEngine {
 
         let pk = self.validator_set().get_public_key(proposal.proposer)?;
         let msg = signing_message(view, &proposal.block_hash);
-        pk.verify(&msg, &proposal.signature).map_err(|_| ConsensusError::InvalidSignature {
-            view,
-            validator_index: proposal.proposer,
-        })?;
+        pk.verify(&msg, &proposal.signature)
+            .map_err(|_| ConsensusError::InvalidSignature {
+                view,
+                validator_index: proposal.proposer,
+            })?;
 
         // Verify the justify_qc's aggregate BLS signature to prevent a Byzantine leader
         // from injecting a forged QC that manipulates honest nodes' locked_qc.
         // Genesis QC (view 0) is exempt — it has no real aggregate signatures.
         // Uses verify_qc_any_domain because justify_qc may be either a prepare QC or commit QC.
         if proposal.justify_qc.view > 0 {
-            super::quorum::verify_qc_any_domain(&proposal.justify_qc, self.validator_set()).map_err(|e| {
-                tracing::warn!(target: "n42::cl::proposal",
-                    view, proposer = proposal.proposer, qc_view = proposal.justify_qc.view,
-                    "rejecting proposal with invalid justify_qc: {e}"
-                );
-                e
-            })?;
+            super::quorum::verify_qc_any_domain(&proposal.justify_qc, self.validator_set())
+                .map_err(|e| {
+                    tracing::warn!(target: "n42::cl::proposal",
+                        view, proposer = proposal.proposer, qc_view = proposal.justify_qc.view,
+                        "rejecting proposal with invalid justify_qc: {e}"
+                    );
+                    e
+                })?;
         }
 
         if !self.round_state.is_safe_to_vote(&proposal.justify_qc) {

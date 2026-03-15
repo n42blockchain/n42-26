@@ -78,7 +78,11 @@ impl AttestationStore {
             total = snapshot.total_attestations,
             "attestation store loaded"
         );
-        Ok(Self { snapshot, path, dirty: false })
+        Ok(Self {
+            snapshot,
+            path,
+            dirty: false,
+        })
     }
 
     /// Records a completed aggregated attestation.
@@ -93,11 +97,7 @@ impl AttestationStore {
                     let index = byte_idx as u32 * 8 + bit;
                     if let Some(pubkey) = self.snapshot.registry.pubkey_at(index) {
                         let key = hex::encode(pubkey);
-                        let entry = self
-                            .snapshot
-                            .reward_points
-                            .entry(key)
-                            .or_default();
+                        let entry = self.snapshot.reward_points.entry(key).or_default();
                         entry.blocks_attested += 1;
                         entry.points += 1;
                         entry.last_attested_block = attestation.block_number;
@@ -346,11 +346,11 @@ mod tests {
             store.record_attestation(&make_mock_attestation(i as u64));
         }
 
+        assert_eq!(store.snapshot.attestations.len(), MAX_STORED_ATTESTATIONS);
         assert_eq!(
-            store.snapshot.attestations.len(),
-            MAX_STORED_ATTESTATIONS
+            store.total_attestations(),
+            (MAX_STORED_ATTESTATIONS + 10) as u64
         );
-        assert_eq!(store.total_attestations(), (MAX_STORED_ATTESTATIONS + 10) as u64);
 
         // Oldest should be evicted.
         assert_eq!(
@@ -407,7 +407,10 @@ mod tests {
         let mut store = AttestationStore::new(path.clone()).unwrap();
         // No changes made — save should skip.
         store.save().unwrap();
-        assert!(!path.exists(), "no file should be created when nothing is dirty");
+        assert!(
+            !path.exists(),
+            "no file should be created when nothing is dirty"
+        );
 
         cleanup(&path);
     }

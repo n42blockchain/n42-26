@@ -7,7 +7,9 @@ use crate::erc20::Erc20Manager;
 use crate::genesis::{self, TEST_CHAIN_ID};
 use crate::node_manager::{NodeConfig, NodeProcess};
 use crate::rpc_client::RpcClient;
-use crate::test_helpers::{compute_peer_id, cleanup_nodes, env_u64, get_height_safe, wait_for_sync};
+use crate::test_helpers::{
+    cleanup_nodes, compute_peer_id, env_u64, get_height_safe, wait_for_sync,
+};
 use crate::tx_engine::TxEngine;
 
 const NODE_COUNT: usize = 3;
@@ -82,7 +84,10 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
             .filter(|&j| j != i)
             .map(|j| {
                 let peer_port = 9400 + PORT_OFFSET_BASE + (j as u16) * 10;
-                format!("/ip4/127.0.0.1/udp/{}/quic-v1/p2p/{}", peer_port, peer_ids[j])
+                format!(
+                    "/ip4/127.0.0.1/udp/{}/quic-v1/p2p/{}",
+                    peer_port, peer_ids[j]
+                )
             })
             .collect();
 
@@ -135,13 +140,7 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
     let priority_fee = gas_price / 10;
 
     // Deploy ERC20 contract.
-    let erc20 = Erc20Manager::deploy(
-        &mut tx_engine,
-        &node0_rpc,
-        0,
-        max_fee,
-        priority_fee,
-    ).await?;
+    let erc20 = Erc20Manager::deploy(&mut tx_engine, &node0_rpc, 0, max_fee, priority_fee).await?;
     info!(contract = %erc20.contract_address, "ERC20 deployed");
 
     let total_supply = erc20.total_supply(&node0_rpc).await?;
@@ -149,7 +148,10 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
 
     let initial_height = node0_rpc.block_number().await?;
     let node0_rpc = &node0_rpc;
-    info!(initial_height, "Phase 1 complete: all nodes up, ERC20 deployed");
+    info!(
+        initial_height,
+        "Phase 1 complete: all nodes up, ERC20 deployed"
+    );
 
     // ── Phase 2-4: Main loop ──
 
@@ -182,7 +184,10 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
     // Transaction send interval: slightly faster than block interval to ensure every block has txs.
     let tx_interval = Duration::from_millis(cfg.block_interval_ms.saturating_sub(50).max(100));
 
-    info!("entering main loop, tx_interval={}ms", tx_interval.as_millis());
+    info!(
+        "entering main loop, tx_interval={}ms",
+        tx_interval.as_millis()
+    );
 
     loop {
         let elapsed = test_start.elapsed();
@@ -229,7 +234,9 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
 
                         // Wait for node-2 to sync.
                         let target_height = get_height_safe(node0_rpc).await;
-                        match wait_for_sync(&node.rpc, target_height, Duration::from_secs(120)).await {
+                        match wait_for_sync(&node.rpc, target_height, Duration::from_secs(120))
+                            .await
+                        {
                             Ok(()) => {
                                 sync_time_ms = sync_start.elapsed().as_millis() as u64;
                                 let synced_height = get_height_safe(&node.rpc).await;
@@ -328,7 +335,11 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
             let height = get_height_safe(node0_rpc).await;
             let total_txs = total_eth_txs + total_erc20_txs;
             let elapsed_secs = elapsed.as_secs();
-            let tps = if elapsed_secs > 0 { total_txs as f64 / elapsed_secs as f64 } else { 0.0 };
+            let tps = if elapsed_secs > 0 {
+                total_txs as f64 / elapsed_secs as f64
+            } else {
+                0.0
+            };
             let node2_status = if nodes[2].is_some() { "UP" } else { "DOWN" };
             info!(
                 elapsed_secs,
@@ -376,10 +387,20 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
         let max_h = heights.iter().map(|(_, h)| *h).max().unwrap_or(0);
         let min_h = heights.iter().map(|(_, h)| *h).min().unwrap_or(0);
         if max_h - min_h <= 2 {
-            info!(max_h, min_h, diff = max_h - min_h, "V1 PASS: height consistency");
+            info!(
+                max_h,
+                min_h,
+                diff = max_h - min_h,
+                "V1 PASS: height consistency"
+            );
             pass_count += 1;
         } else {
-            error!(max_h, min_h, diff = max_h - min_h, "V1 FAIL: height divergence > 2");
+            error!(
+                max_h,
+                min_h,
+                diff = max_h - min_h,
+                "V1 FAIL: height divergence > 2"
+            );
             fail_count += 1;
         }
     } else {
@@ -392,7 +413,11 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
     // Allow 20% for fast intervals (consensus round-trip dominates at <1s slots)
     // or 50% for normal intervals.
     let theoretical_blocks = cfg.duration_secs * 1000 / cfg.block_interval_ms;
-    let tolerance = if cfg.block_interval_ms < 2000 { 0.20 } else { 0.50 };
+    let tolerance = if cfg.block_interval_ms < 2000 {
+        0.20
+    } else {
+        0.50
+    };
     let min_expected = (theoretical_blocks as f64 * tolerance) as u64;
     let actual_max_height = heights.iter().map(|(_, h)| *h).max().unwrap_or(0);
     let actual_blocks = actual_max_height.saturating_sub(initial_height);
@@ -466,7 +491,10 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
         let step = eth_tx_hashes.len() / sample_size;
         let mut ok = 0;
         let mut failed = 0;
-        for i in (0..eth_tx_hashes.len()).step_by(step.max(1)).take(sample_size) {
+        for i in (0..eth_tx_hashes.len())
+            .step_by(step.max(1))
+            .take(sample_size)
+        {
             match node0_rpc.get_transaction_receipt(eth_tx_hashes[i]).await {
                 Ok(Some(receipt)) if receipt.status == 1 => ok += 1,
                 Ok(Some(receipt)) => {
@@ -501,10 +529,16 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
 
     // === V5: ERC20 balance conservation ===
     let final_supply = erc20.total_supply(node0_rpc).await.unwrap_or(U256::ZERO);
-    let deployer_balance = erc20.balance_of(node0_rpc, tx_engine.address(0)).await.unwrap_or(U256::ZERO);
+    let deployer_balance = erc20
+        .balance_of(node0_rpc, tx_engine.address(0))
+        .await
+        .unwrap_or(U256::ZERO);
     let mut recipient_total = U256::ZERO;
     for i in 1..tx_engine.wallet_count() {
-        let bal = erc20.balance_of(node0_rpc, tx_engine.address(i)).await.unwrap_or(U256::ZERO);
+        let bal = erc20
+            .balance_of(node0_rpc, tx_engine.address(i))
+            .await
+            .unwrap_or(U256::ZERO);
         recipient_total += bal;
     }
     let sum = deployer_balance + recipient_total;
@@ -542,10 +576,7 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
         let node2_alive = nodes[2].is_some();
         info!(
             final_height,
-            blocks_at_crash,
-            blocks_after_crash,
-            node2_alive,
-            "V6 debug: system resilience check"
+            blocks_at_crash, blocks_after_crash, node2_alive, "V6 debug: system resilience check"
         );
         // The system survived if: node-2 was properly killed and restarted,
         // and the overall block count is reasonable (we already checked this in V2).
@@ -605,7 +636,11 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
 
     let total_txs = total_eth_txs + total_erc20_txs;
     let elapsed_secs = test_start.elapsed().as_secs();
-    let tps = if elapsed_secs > 0 { total_txs as f64 / elapsed_secs as f64 } else { 0.0 };
+    let tps = if elapsed_secs > 0 {
+        total_txs as f64 / elapsed_secs as f64
+    } else {
+        0.0
+    };
 
     info!("──────────────────────────────────────────────");
     info!("  Final Report");
@@ -639,4 +674,3 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
     info!("=== Scenario 9 PASSED ({pass_count}/7 verifications) ===");
     Ok(())
 }
-

@@ -19,6 +19,12 @@ pub struct AttestationEvent {
     pub valid_count: u32,
 }
 
+#[derive(Debug, Clone)]
+struct FinalizedAttestation {
+    event: AttestationEvent,
+    reward_pubkeys: Vec<[u8; 48]>,
+}
+
 fn min_attestation_threshold() -> u32 {
     std::env::var("N42_MIN_ATTESTATION_THRESHOLD")
         .ok()
@@ -28,11 +34,11 @@ fn min_attestation_threshold() -> u32 {
 
 /// Bridges StarHub mobile verification events with the ReceiptAggregator.
 pub struct MobileVerificationBridge {
-    hub_event_rx: mpsc::UnboundedReceiver<HubEvent>,
+    hub_event_rx: mpsc::Receiver<HubEvent>,
     receipt_aggregator: ReceiptAggregator,
     attestation_tx: Option<mpsc::Sender<AttestationEvent>>,
     phone_connected_tx: Option<mpsc::Sender<u64>>,
-    reward_tx: Option<mpsc::UnboundedSender<[u8; 48]>>,
+    reward_tx: Option<mpsc::Sender<[u8; 48]>>,
     /// Maps session_id → verifier BLS pubkey for deauthorization on disconnect.
     connected_sessions: HashMap<u64, [u8; 48]>,
     /// Optional shared consensus state; when set, verifier pubkeys are
@@ -59,7 +65,7 @@ pub struct MobileVerificationBridge {
 
 impl MobileVerificationBridge {
     pub fn new(
-        hub_event_rx: mpsc::UnboundedReceiver<HubEvent>,
+        hub_event_rx: mpsc::Receiver<HubEvent>,
         default_threshold: u32,
         max_tracked_blocks: usize,
     ) -> Self {
@@ -99,7 +105,7 @@ impl MobileVerificationBridge {
         self
     }
 
-    pub fn with_reward_tx(mut self, tx: mpsc::UnboundedSender<[u8; 48]>) -> Self {
+    pub fn with_reward_tx(mut self, tx: mpsc::Sender<[u8; 48]>) -> Self {
         self.reward_tx = Some(tx);
         self
     }
@@ -320,14 +326,19 @@ impl MobileVerificationBridge {
     ///
     /// Called when the attestation threshold is reached. The builder is consumed
     /// (removed from the map) to produce the final aggregate.
-    fn finalize_attestation(&mut self, block_hash: B256, block_number: u64, valid_count: u32) {
+    fn finalize_attestation(
+        &mut self,
+        block_hash: B256,
+        block_number: u64,
+        valid_count: u32,
+    ) -> Vec<[u8; 48]> {
         let Some(builder) = self.attestation_builders.remove(&block_hash) else {
-            return;
+            return Vec::new();
         };
 
         let sig_count = builder.count();
         if sig_count == 0 {
-            return;
+            return Vec::new();
         }
 
         match builder.build() {
@@ -342,43 +353,23 @@ impl MobileVerificationBridge {
                 );
                 counter!("n42_mobile_aggregate_attestations_total").increment(1);
 
-                // Batch-send participant pubkeys for reward tracking.
-                // Only verifiers who contributed to the finalized aggregate
-                // attestation earn reward points for this block.
-                if let Some(ref tx) = self.reward_tx {
-                    if let Some(ref store) = self.attestation_store {
-                        let s = store.lock().unwrap_or_else(|e| e.into_inner());
-                        let mut rewarded = 0u32;
-                        'reward_emit: for (byte_idx, &byte) in
-                            attestation.participant_bitfield.iter().enumerate()
-                        {
-                            for bit in 0..8u32 {
-                                if byte & (1 << bit) != 0 {
-                                    let index = byte_idx as u32 * 8 + bit;
-                                    if let Some(pubkey) = s.registry().pubkey_at(index) {
-                                        if let Err(error) = tx.send(*pubkey) {
-                                            warn!(
-                                                target: "n42::mobile",
-                                                block_number,
-                                                %block_hash,
-                                                error = %error,
-                                                "reward channel closed while emitting attestation participants"
-                                            );
-                                            break 'reward_emit;
-                                        }
-                                        rewarded += 1;
-                                    }
+                let reward_pubkeys = if let Some(ref store) = self.attestation_store {
+                    let s = store.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut reward_pubkeys = Vec::new();
+                    for (byte_idx, &byte) in attestation.participant_bitfield.iter().enumerate() {
+                        for bit in 0..8u32 {
+                            if byte & (1 << bit) != 0 {
+                                let index = byte_idx as u32 * 8 + bit;
+                                if let Some(pubkey) = s.registry().pubkey_at(index) {
+                                    reward_pubkeys.push(*pubkey);
                                 }
                             }
                         }
-                        debug!(
-                            target: "n42::mobile",
-                            block_number,
-                            rewarded,
-                            "reward pubkeys sent for finalized attestation"
-                        );
                     }
-                }
+                    reward_pubkeys
+                } else {
+                    Vec::new()
+                };
 
                 if let Some(ref store) = self.attestation_store {
                     let mut s = store.lock().unwrap_or_else(|e| e.into_inner());
@@ -392,6 +383,15 @@ impl MobileVerificationBridge {
                         );
                     }
                 }
+
+                debug!(
+                    target: "n42::mobile",
+                    block_number,
+                    rewarded = reward_pubkeys.len(),
+                    "reward pubkeys prepared for finalized attestation"
+                );
+
+                return reward_pubkeys;
             }
             Err(e) => {
                 warn!(
@@ -404,9 +404,14 @@ impl MobileVerificationBridge {
                 );
             }
         }
+
+        Vec::new()
     }
 
-    fn process_receipt_inner(&mut self, receipt: &VerificationReceipt) -> Option<AttestationEvent> {
+    fn process_receipt_inner(
+        &mut self,
+        receipt: &VerificationReceipt,
+    ) -> Option<FinalizedAttestation> {
         if let Err(e) = receipt.verify_signature() {
             warn!(
                 target: "n42::mobile",
@@ -512,7 +517,11 @@ impl MobileVerificationBridge {
                 }
 
                 // Build BLS aggregate signature and persist.
-                self.finalize_attestation(receipt.block_hash, receipt.block_number, valid_count);
+                let reward_pubkeys = self.finalize_attestation(
+                    receipt.block_hash,
+                    receipt.block_number,
+                    valid_count,
+                );
 
                 info!(
                     target: "n42::mobile",
@@ -522,10 +531,13 @@ impl MobileVerificationBridge {
                     "block reached attestation threshold"
                 );
 
-                return Some(AttestationEvent {
-                    block_hash: receipt.block_hash,
-                    block_number: receipt.block_number,
-                    valid_count,
+                return Some(FinalizedAttestation {
+                    event: AttestationEvent {
+                        block_hash: receipt.block_hash,
+                        block_number: receipt.block_number,
+                        valid_count,
+                    },
+                    reward_pubkeys,
                 });
             }
             Some(false) => {
@@ -547,6 +559,106 @@ impl MobileVerificationBridge {
         }
 
         None
+    }
+
+    fn try_emit_reward_pubkeys(
+        &self,
+        block_hash: B256,
+        block_number: u64,
+        reward_pubkeys: &[[u8; 48]],
+    ) {
+        let Some(ref tx) = self.reward_tx else {
+            return;
+        };
+
+        let mut rewarded = 0usize;
+        for pubkey in reward_pubkeys {
+            match tx.try_send(*pubkey) {
+                Ok(()) => {
+                    rewarded += 1;
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    warn!(
+                        target: "n42::mobile",
+                        block_number,
+                        %block_hash,
+                        "reward channel closed while emitting attestation participants"
+                    );
+                    break;
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    warn!(
+                        target: "n42::mobile",
+                        block_number,
+                        %block_hash,
+                        "reward channel full in synchronous path, dropping remaining participants"
+                    );
+                    break;
+                }
+            }
+        }
+
+        debug!(
+            target: "n42::mobile",
+            block_number,
+            rewarded,
+            "reward pubkeys sent for finalized attestation"
+        );
+    }
+
+    async fn emit_reward_pubkeys(
+        &self,
+        block_hash: B256,
+        block_number: u64,
+        reward_pubkeys: Vec<[u8; 48]>,
+    ) {
+        let Some(ref tx) = self.reward_tx else {
+            return;
+        };
+
+        let mut rewarded = 0usize;
+        for pubkey in reward_pubkeys {
+            match tx.try_send(pubkey) {
+                Ok(()) => {
+                    rewarded += 1;
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    warn!(
+                        target: "n42::mobile",
+                        block_number,
+                        %block_hash,
+                        "reward channel closed while emitting attestation participants"
+                    );
+                    break;
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Full(pubkey)) => {
+                    warn!(
+                        target: "n42::mobile",
+                        block_number,
+                        %block_hash,
+                        "reward channel full, waiting to enqueue"
+                    );
+                    if let Err(error) = tx.send(pubkey).await {
+                        warn!(
+                            target: "n42::mobile",
+                            block_number,
+                            %block_hash,
+                            error = %error,
+                            "failed to deliver reward participant after backpressure wait"
+                        );
+                        break;
+                    }
+                    rewarded += 1;
+                }
+            }
+        }
+
+        debug!(
+            target: "n42::mobile",
+            block_number,
+            rewarded,
+            "reward pubkeys sent for finalized attestation"
+        );
     }
 
     fn try_emit_attestation_event(&self, event: AttestationEvent) {
@@ -614,20 +726,39 @@ impl MobileVerificationBridge {
         }
     }
 
+    fn try_emit_finalized_attestation(&self, finalized: FinalizedAttestation) {
+        self.try_emit_reward_pubkeys(
+            finalized.event.block_hash,
+            finalized.event.block_number,
+            &finalized.reward_pubkeys,
+        );
+        self.try_emit_attestation_event(finalized.event);
+    }
+
+    async fn emit_finalized_attestation(&self, finalized: FinalizedAttestation) {
+        self.emit_reward_pubkeys(
+            finalized.event.block_hash,
+            finalized.event.block_number,
+            finalized.reward_pubkeys,
+        )
+        .await;
+        self.emit_attestation_event(finalized.event).await;
+    }
+
     /// Public for testing; production code calls this via the async event loop.
     ///
     /// Receipts for blocks not registered via `register_dispatched_block` are
     /// silently dropped (aggregator returns `None`). This prevents arbitrary
     /// block hashes from being injected by a malicious verifier.
     pub fn process_receipt(&mut self, receipt: &VerificationReceipt) {
-        if let Some(event) = self.process_receipt_inner(receipt) {
-            self.try_emit_attestation_event(event);
+        if let Some(finalized) = self.process_receipt_inner(receipt) {
+            self.try_emit_finalized_attestation(finalized);
         }
     }
 
     async fn process_receipt_async(&mut self, receipt: &VerificationReceipt) {
-        if let Some(event) = self.process_receipt_inner(receipt) {
-            self.emit_attestation_event(event).await;
+        if let Some(finalized) = self.process_receipt_inner(receipt) {
+            self.emit_finalized_attestation(finalized).await;
         }
     }
 }
@@ -652,9 +783,17 @@ mod tests {
         Arc::new(SharedConsensusState::new(ValidatorSet::new(&[], 0)))
     }
 
+    fn make_hub_channel() -> (mpsc::Sender<HubEvent>, mpsc::Receiver<HubEvent>) {
+        mpsc::channel(32)
+    }
+
+    fn make_reward_channel() -> (mpsc::Sender<[u8; 48]>, mpsc::Receiver<[u8; 48]>) {
+        mpsc::channel(32)
+    }
+
     #[test]
     fn test_bridge_processes_receipts() {
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = make_hub_channel();
         let mut bridge = MobileVerificationBridge::new(rx, 2, 100);
 
         let block_hash = B256::with_last_byte(0x01);
@@ -676,7 +815,7 @@ mod tests {
 
     #[test]
     fn test_bridge_attestation_notification() {
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = make_hub_channel();
         let (attest_tx, mut attest_rx) = mpsc::channel(256);
         let mut bridge = MobileVerificationBridge::new(rx, 1, 100).with_attestation_tx(attest_tx);
 
@@ -696,7 +835,7 @@ mod tests {
 
     #[test]
     fn test_bridge_multiple_blocks() {
-        let (_tx, rx) = mpsc::unbounded_channel();
+        let (_tx, rx) = make_hub_channel();
         let mut bridge = MobileVerificationBridge::new(rx, 2, 100);
 
         let hash_a = B256::with_last_byte(0x0A);
@@ -719,7 +858,7 @@ mod tests {
 
     #[test]
     fn test_bridge_duplicate_receipt_ignored() {
-        let (_tx, rx) = mpsc::unbounded_channel();
+        let (_tx, rx) = make_hub_channel();
         let mut bridge = MobileVerificationBridge::new(rx, 2, 100);
 
         let block_hash = B256::with_last_byte(0x0C);
@@ -738,7 +877,7 @@ mod tests {
 
     #[test]
     fn test_bridge_no_attestation_tx() {
-        let (_tx, rx) = mpsc::unbounded_channel();
+        let (_tx, rx) = make_hub_channel();
         let mut bridge = MobileVerificationBridge::new(rx, 1, 100);
 
         let block_hash = B256::with_last_byte(0x0D);
@@ -756,7 +895,7 @@ mod tests {
 
     #[test]
     fn test_bridge_dynamic_threshold() {
-        let (_tx, rx) = mpsc::unbounded_channel();
+        let (_tx, rx) = make_hub_channel();
         let mut bridge = MobileVerificationBridge::new(rx, 2, 100);
 
         for i in 0..30u64 {
@@ -779,7 +918,7 @@ mod tests {
 
     #[test]
     fn test_bridge_invalid_receipt_counts_bounded() {
-        let (_tx, rx) = mpsc::unbounded_channel();
+        let (_tx, rx) = make_hub_channel();
         let max_tracked = 3;
         let mut bridge = MobileVerificationBridge::new(rx, 100, max_tracked);
 
@@ -818,25 +957,25 @@ mod tests {
 
     #[test]
     fn test_bridge_handles_all_event_types() {
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = make_hub_channel();
         let mut bridge = MobileVerificationBridge::new(rx, 2, 100);
 
         let block_hash = B256::with_last_byte(0x02);
         let receipt = make_receipt(block_hash, 42);
 
-        tx.send(HubEvent::PhoneConnected {
+        tx.blocking_send(HubEvent::PhoneConnected {
             session_id: 1,
             verifier_pubkey: [0u8; 48],
         })
         .unwrap();
-        tx.send(HubEvent::ReceiptReceived(Box::new(receipt)))
+        tx.blocking_send(HubEvent::ReceiptReceived(Box::new(receipt)))
             .unwrap();
-        tx.send(HubEvent::CacheInventoryReceived {
+        tx.blocking_send(HubEvent::CacheInventoryReceived {
             session_id: 1,
             code_hashes: vec![[0xAA; 32]],
         })
         .unwrap();
-        tx.send(HubEvent::PhoneDisconnected { session_id: 1 })
+        tx.blocking_send(HubEvent::PhoneDisconnected { session_id: 1 })
             .unwrap();
 
         while let Ok(event) = bridge.hub_event_rx.try_recv() {
@@ -848,7 +987,7 @@ mod tests {
 
     #[test]
     fn test_attestation_latency_recorded() {
-        let (_tx, rx) = mpsc::unbounded_channel();
+        let (_tx, rx) = make_hub_channel();
         let mut bridge = MobileVerificationBridge::new(rx, 2, 100);
 
         let block_hash = B256::with_last_byte(0xE1);
@@ -869,7 +1008,7 @@ mod tests {
 
     #[test]
     fn test_first_receipt_time_bounded() {
-        let (_tx, rx) = mpsc::unbounded_channel();
+        let (_tx, rx) = make_hub_channel();
         let max_tracked = 3;
         let mut bridge = MobileVerificationBridge::new(rx, 100, max_tracked);
 
@@ -887,7 +1026,7 @@ mod tests {
 
     #[test]
     fn test_attestation_latency_no_panic_without_first_receipt() {
-        let (_tx, rx) = mpsc::unbounded_channel();
+        let (_tx, rx) = make_hub_channel();
         let mut bridge = MobileVerificationBridge::new(rx, 1, 100);
 
         let block_hash = B256::with_last_byte(0xE2);
@@ -912,8 +1051,8 @@ mod tests {
             AttestationStore::new(store_path.clone()).unwrap(),
         ));
 
-        let (_hub_tx, hub_rx) = mpsc::unbounded_channel();
-        let (reward_tx, mut reward_rx) = mpsc::unbounded_channel();
+        let (_hub_tx, hub_rx) = make_hub_channel();
+        let (reward_tx, mut reward_rx) = make_reward_channel();
         // threshold = 2: need 2 receipts to finalize
         let mut bridge = MobileVerificationBridge::new(hub_rx, 2, 100)
             .with_reward_tx(reward_tx)
@@ -972,8 +1111,8 @@ mod tests {
             AttestationStore::new(store_path.clone()).unwrap(),
         ));
 
-        let (_hub_tx, hub_rx) = mpsc::unbounded_channel();
-        let (reward_tx, mut reward_rx) = mpsc::unbounded_channel();
+        let (_hub_tx, hub_rx) = make_hub_channel();
+        let (reward_tx, mut reward_rx) = make_reward_channel();
         let mut bridge = MobileVerificationBridge::new(hub_rx, 1, 100)
             .with_reward_tx(reward_tx)
             .with_attestation_store(store);
@@ -1005,8 +1144,8 @@ mod tests {
             AttestationStore::new(store_path.clone()).unwrap(),
         ));
 
-        let (_hub_tx, hub_rx) = mpsc::unbounded_channel();
-        let (reward_tx, mut reward_rx) = mpsc::unbounded_channel();
+        let (_hub_tx, hub_rx) = make_hub_channel();
+        let (reward_tx, mut reward_rx) = make_reward_channel();
         // threshold = 10, we only send 2
         let mut bridge = MobileVerificationBridge::new(hub_rx, 10, 100)
             .with_reward_tx(reward_tx)
@@ -1028,7 +1167,7 @@ mod tests {
 
     #[test]
     fn test_no_reward_tx_configured_no_panic() {
-        let (_hub_tx, hub_rx) = mpsc::unbounded_channel();
+        let (_hub_tx, hub_rx) = make_hub_channel();
         let mut bridge = MobileVerificationBridge::new(hub_rx, 1, 100);
         // No reward_tx configured — should not panic
         let block_hash = B256::with_last_byte(0xA4);
@@ -1040,8 +1179,8 @@ mod tests {
     fn test_untracked_block_receipt_dropped() {
         // Receipts for blocks not registered via register_dispatched_block must be
         // dropped without affecting attestation state or triggering a reward.
-        let (_hub_tx, hub_rx) = mpsc::unbounded_channel();
-        let (reward_tx, mut reward_rx) = mpsc::unbounded_channel();
+        let (_hub_tx, hub_rx) = make_hub_channel();
+        let (reward_tx, mut reward_rx) = make_reward_channel();
         let mut bridge = MobileVerificationBridge::new(hub_rx, 1, 100).with_reward_tx(reward_tx);
 
         let block_hash = B256::with_last_byte(0xB1);
@@ -1070,7 +1209,7 @@ mod tests {
             AttestationStore::new(store_path.clone()).unwrap(),
         ));
 
-        let (_hub_tx, hub_rx) = mpsc::unbounded_channel();
+        let (_hub_tx, hub_rx) = make_hub_channel();
         let mut bridge =
             MobileVerificationBridge::new(hub_rx, 2, 100).with_attestation_store(store.clone());
 
@@ -1147,7 +1286,7 @@ mod tests {
 
     #[test]
     fn test_bridge_no_aggregate_without_store() {
-        let (_hub_tx, hub_rx) = mpsc::unbounded_channel();
+        let (_hub_tx, hub_rx) = make_hub_channel();
         let mut bridge = MobileVerificationBridge::new(hub_rx, 1, 100);
         // No attestation_store configured.
 
@@ -1179,7 +1318,7 @@ mod tests {
             AttestationStore::new(store_path.clone()).unwrap(),
         ));
 
-        let (_hub_tx, hub_rx) = mpsc::unbounded_channel();
+        let (_hub_tx, hub_rx) = make_hub_channel();
         let mut bridge =
             MobileVerificationBridge::new(hub_rx, 1, 100).with_attestation_store(store.clone());
 
@@ -1197,7 +1336,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_bridge_registers_committed_blocks_from_consensus_state() {
-        let (_hub_tx, hub_rx) = mpsc::unbounded_channel();
+        let (_hub_tx, hub_rx) = make_hub_channel();
         let state = make_consensus_state();
         let mut bridge =
             MobileVerificationBridge::new(hub_rx, 1, 100).with_consensus_state(state.clone());

@@ -103,10 +103,16 @@ impl MvMemory {
     /// Remove all entries written by `tx_idx` (used before re-execution).
     pub fn clear_tx(&self, tx_idx: TxIdx) {
         for entry in self.accounts.iter() {
-            entry.write().unwrap_or_else(|e| e.into_inner()).remove(&tx_idx);
+            entry
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&tx_idx);
         }
         for entry in self.storage.iter() {
-            entry.write().unwrap_or_else(|e| e.into_inner()).remove(&tx_idx);
+            entry
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&tx_idx);
         }
     }
 

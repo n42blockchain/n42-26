@@ -2,8 +2,8 @@
 //!
 //! Tests the full flow: prover → scheduler → store → query.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use alloy_primitives::B256;
 use n42_zkproof::{
@@ -37,8 +37,8 @@ async fn test_full_proof_lifecycle() {
         log.lock().unwrap().push((block_number, block_hash));
     });
 
-    let scheduler = ProofScheduler::new(prover.clone(), 10, Arc::clone(&store))
-        .with_callback(callback);
+    let scheduler =
+        ProofScheduler::new(prover.clone(), 10, Arc::clone(&store)).with_callback(callback);
 
     // Simulate 50 blocks being committed (only multiples of 10 generate proofs).
     for block in 1..=50 {
@@ -51,7 +51,9 @@ async fn test_full_proof_lifecycle() {
     // Verify: blocks 10, 20, 30, 40, 50 should have proofs.
     assert_eq!(store.len(), 5);
     for block in [10, 20, 30, 40, 50] {
-        let proof = store.get_by_block(block).unwrap_or_else(|| panic!("missing proof for block {block}"));
+        let proof = store
+            .get_by_block(block)
+            .unwrap_or_else(|| panic!("missing proof for block {block}"));
         assert_eq!(proof.block_number, block);
         assert_eq!(proof.proof_type, ProofType::Mock);
         assert!(proof.verified);
@@ -77,7 +79,10 @@ async fn test_full_proof_lifecycle() {
     assert_eq!(log.len(), 5);
     let logged_blocks: Vec<u64> = log.iter().map(|(b, _)| *b).collect();
     for block in [10, 20, 30, 40, 50] {
-        assert!(logged_blocks.contains(&block), "callback missing block {block}");
+        assert!(
+            logged_blocks.contains(&block),
+            "callback missing block {block}"
+        );
     }
 }
 
@@ -208,8 +213,13 @@ async fn test_store_hash_lookup_after_scheduler() {
 fn test_scheduler_reports_backend_name() {
     struct CustomProver;
     impl ZkProver for CustomProver {
-        fn name(&self) -> &str { "custom-v2" }
-        fn prove(&self, input: &BlockExecutionInput) -> Result<ZkProofResult, n42_zkproof::ZkProofError> {
+        fn name(&self) -> &str {
+            "custom-v2"
+        }
+        fn prove(
+            &self,
+            input: &BlockExecutionInput,
+        ) -> Result<ZkProofResult, n42_zkproof::ZkProofError> {
             MockProver::new().prove(input)
         }
         fn verify(&self, result: &ZkProofResult) -> Result<bool, n42_zkproof::ZkProofError> {
@@ -236,9 +246,8 @@ async fn test_concurrent_rapid_blocks() {
         cc.fetch_add(1, Ordering::SeqCst);
     });
 
-    let scheduler = Arc::new(
-        ProofScheduler::new(prover, 10, Arc::clone(&store)).with_callback(callback),
-    );
+    let scheduler =
+        Arc::new(ProofScheduler::new(prover, 10, Arc::clone(&store)).with_callback(callback));
 
     // Spawn 5 tasks, each committing 50 blocks (only multiples of 10 trigger proofs).
     // This yields 25 unique proof-eligible blocks spread across tasks.
@@ -265,7 +274,10 @@ async fn test_concurrent_rapid_blocks() {
 
     // Some blocks may be skipped due to concurrency limit, but most should succeed.
     let generated = callback_count.load(Ordering::SeqCst);
-    assert!(generated >= 50, "expected at least 50 proofs, got {generated}");
+    assert!(
+        generated >= 50,
+        "expected at least 50 proofs, got {generated}"
+    );
     assert_eq!(store.len() as u64, generated);
 }
 
@@ -299,7 +311,10 @@ async fn test_created_at_lifecycle() {
     tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
 
     let proof = store.get_by_block(10).unwrap();
-    assert!(proof.created_at > 0, "created_at should be set by MockProver");
+    assert!(
+        proof.created_at > 0,
+        "created_at should be set by MockProver"
+    );
     // Should be within last 10 seconds.
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

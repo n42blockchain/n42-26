@@ -1,9 +1,11 @@
 use alloy_genesis::{Genesis, GenesisAccount};
-use alloy_primitives::{address, bytes, Address, Bytes, U256};
+use alloy_primitives::{Address, Bytes, U256, address, bytes};
+use libp2p::PeerId;
 use n42_primitives::BlsPublicKey;
 use reth_chainspec::{Chain, ChainSpec, ChainSpecBuilder};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use std::str::FromStr;
 use std::sync::Arc;
 
 /// N42 consensus-specific configuration, separate from the EVM chain spec.
@@ -35,6 +37,25 @@ pub struct ValidatorInfo {
     pub address: Address,
     /// Validator's BLS public key (for consensus signing).
     pub bls_public_key: BlsPublicKey,
+    /// Optional libp2p PeerId bound to this validator for direct P2P traffic.
+    ///
+    /// When configured, the node must present the matching libp2p private key
+    /// via `N42_P2P_KEY`; deterministic index-derived PeerIds are no longer accepted
+    /// for this validator.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p2p_peer_id: Option<String>,
+}
+
+impl ValidatorInfo {
+    pub fn parsed_p2p_peer_id(&self) -> Result<Option<PeerId>, String> {
+        self.p2p_peer_id
+            .as_deref()
+            .map(|peer_id| {
+                PeerId::from_str(peer_id)
+                    .map_err(|error| format!("invalid validator p2p_peer_id {peer_id}: {error}"))
+            })
+            .transpose()
+    }
 }
 
 impl ConsensusConfig {
@@ -89,10 +110,15 @@ impl ConsensusConfig {
             validators.push(ValidatorInfo {
                 address: Address::from(addr_bytes),
                 bls_public_key: pk,
+                p2p_peer_id: None,
             });
         }
 
-        let f = if count >= 4 { ((count as u32) - 1) / 3 } else { 0 };
+        let f = if count >= 4 {
+            ((count as u32) - 1) / 3
+        } else {
+            0
+        };
 
         Self {
             slot_time_ms: 8000,
@@ -128,7 +154,7 @@ impl ConsensusConfig {
     /// - `base_timeout_ms <= max_timeout_ms`
     /// - `base_timeout_ms > 0` and `max_timeout_ms > 0`
     /// - `slot_time_ms > 0`
-    /// - No duplicate validator addresses or BLS public keys
+    /// - No duplicate validator addresses, BLS public keys, or configured p2p_peer_id values
     pub fn validate(&self) -> Result<(), String> {
         let min_validators = 3 * self.fault_tolerance + 1;
         if self.validator_set_size < min_validators {
@@ -166,12 +192,29 @@ impl ConsensusConfig {
         if !self.initial_validators.is_empty() {
             let mut seen_addrs = std::collections::HashSet::new();
             let mut seen_pks = std::collections::HashSet::new();
+            let mut seen_peer_ids = std::collections::HashSet::new();
+            let peer_id_presence = self
+                .initial_validators
+                .iter()
+                .filter(|validator| validator.p2p_peer_id.is_some())
+                .count();
+            if peer_id_presence != 0 && peer_id_presence != self.initial_validators.len() {
+                return Err(
+                    "initial_validators must either all define p2p_peer_id or all omit it"
+                        .to_string(),
+                );
+            }
             for v in &self.initial_validators {
                 if !seen_addrs.insert(v.address) {
                     return Err(format!("duplicate validator address: {:?}", v.address));
                 }
                 if !seen_pks.insert(v.bls_public_key.to_bytes()) {
                     return Err("duplicate BLS public key in validator set".to_string());
+                }
+                if let Some(peer_id) = v.parsed_p2p_peer_id()? {
+                    if !seen_peer_ids.insert(peer_id) {
+                        return Err(format!("duplicate validator p2p_peer_id: {peer_id}"));
+                    }
                 }
             }
         }
@@ -270,7 +313,9 @@ pub const STRESS_CONTRACT_ADDRESS: Address = address!("0000000000000000000000000
 ///   1. counters[caller]++ (SLOAD + SSTORE)
 ///   2. values[caller] = timestamp (SSTORE)
 /// Gas cost: ~45k (similar to ERC-20 transfer).
-pub static STRESS_CONTRACT_BYTECODE: Bytes = bytes!("33600052600060205260406000208054600101905560016020526040600020429055600160005260206000f3");
+pub static STRESS_CONTRACT_BYTECODE: Bytes = bytes!(
+    "33600052600060205260406000208054600101905560016020526040600020429055600160005260206000f3"
+);
 
 /// 3 billion N in wei (3,000,000,000 * 10^18).
 fn three_billion_n() -> U256 {
@@ -288,38 +333,53 @@ pub fn n42_dev_chainspec_with_alloc(validators: &[ValidatorInfo]) -> Arc<ChainSp
 
     // Fund validator addresses.
     for v in validators {
-        alloc.insert(v.address, GenesisAccount {
-            balance,
-            ..Default::default()
-        });
+        alloc.insert(
+            v.address,
+            GenesisAccount {
+                balance,
+                ..Default::default()
+            },
+        );
     }
 
     // Fund 10 test accounts (0x10..0x19).
     for i in 0..10u8 {
         let addr = Address::with_last_byte(0x10 + i);
-        alloc.insert(addr, GenesisAccount {
-            balance,
-            ..Default::default()
-        });
+        alloc.insert(
+            addr,
+            GenesisAccount {
+                balance,
+                ..Default::default()
+            },
+        );
     }
 
     // Fund treasury with 3 billion N for staker distribution.
-    alloc.insert(TREASURY_ADDRESS, GenesisAccount {
-        balance: three_billion_n(),
-        ..Default::default()
-    });
+    alloc.insert(
+        TREASURY_ADDRESS,
+        GenesisAccount {
+            balance: three_billion_n(),
+            ..Default::default()
+        },
+    );
 
     // Pre-deploy stress-test storage burner contract at a known address.
     // This contract does 2 SSTOREs per call (counter++ and timestamp write),
     // consuming ~45k gas — similar to an ERC-20 transfer.
     // Used by n42-stress --erc20-ratio for mixed tx workloads.
-    alloc.insert(STRESS_CONTRACT_ADDRESS, GenesisAccount {
-        balance: U256::ZERO,
-        code: Some(STRESS_CONTRACT_BYTECODE.clone()),
-        ..Default::default()
-    });
+    alloc.insert(
+        STRESS_CONTRACT_ADDRESS,
+        GenesisAccount {
+            balance: U256::ZERO,
+            code: Some(STRESS_CONTRACT_BYTECODE.clone()),
+            ..Default::default()
+        },
+    );
 
-    let genesis = Genesis { alloc, ..Default::default() };
+    let genesis = Genesis {
+        alloc,
+        ..Default::default()
+    };
     Arc::new(
         ChainSpecBuilder::default()
             .chain(Chain::from_id(effective_chain_id()))
@@ -356,10 +416,19 @@ mod tests {
         let config = ConsensusConfig::dev();
 
         assert_eq!(config.slot_time_ms, 8000, "dev slot time should be 8000ms");
-        assert_eq!(config.validator_set_size, 1, "dev validator set size should be 1");
+        assert_eq!(
+            config.validator_set_size, 1,
+            "dev validator set size should be 1"
+        );
         assert_eq!(config.fault_tolerance, 0, "dev fault tolerance should be 0");
-        assert_eq!(config.base_timeout_ms, 4000, "dev base timeout should be 4000ms");
-        assert_eq!(config.max_timeout_ms, 8000, "dev max timeout should be 8000ms");
+        assert_eq!(
+            config.base_timeout_ms, 4000,
+            "dev base timeout should be 4000ms"
+        );
+        assert_eq!(
+            config.max_timeout_ms, 8000,
+            "dev max timeout should be 8000ms"
+        );
         assert!(
             config.initial_validators.is_empty(),
             "dev initial_validators should be empty"
@@ -371,7 +440,11 @@ mod tests {
         // With fault_tolerance = 1, quorum_size = 2*1+1 = 3.
         let mut config = ConsensusConfig::dev();
         config.fault_tolerance = 1;
-        assert_eq!(config.quorum_size(), 3, "quorum size should be 2f+1 = 3 when f=1");
+        assert_eq!(
+            config.quorum_size(),
+            3,
+            "quorum size should be 2f+1 = 3 when f=1"
+        );
 
         // With fault_tolerance = 0, quorum_size = 1.
         let config0 = ConsensusConfig::dev();
@@ -380,7 +453,11 @@ mod tests {
         // With fault_tolerance = 3, quorum_size = 7.
         let mut config3 = ConsensusConfig::dev();
         config3.fault_tolerance = 3;
-        assert_eq!(config3.quorum_size(), 7, "quorum size should be 2f+1 = 7 when f=3");
+        assert_eq!(
+            config3.quorum_size(),
+            7,
+            "quorum size should be 2f+1 = 7 when f=3"
+        );
     }
 
     #[test]
@@ -403,17 +480,26 @@ mod tests {
         let mut bad = ConsensusConfig::dev();
         bad.validator_set_size = 3;
         bad.fault_tolerance = 1; // needs 3*1+1=4 validators, only have 3
-        assert!(bad.validate().is_err(), "should reject f=1 with only 3 validators");
+        assert!(
+            bad.validate().is_err(),
+            "should reject f=1 with only 3 validators"
+        );
 
         // Valid: 4 validators, f=1
         bad.validator_set_size = 4;
-        assert!(bad.validate().is_ok(), "should accept f=1 with 4 validators");
+        assert!(
+            bad.validate().is_ok(),
+            "should accept f=1 with 4 validators"
+        );
 
         // Invalid: base_timeout > max_timeout
         let mut bad_timeout = ConsensusConfig::dev();
         bad_timeout.base_timeout_ms = 10000;
         bad_timeout.max_timeout_ms = 5000;
-        assert!(bad_timeout.validate().is_err(), "should reject base > max timeout");
+        assert!(
+            bad_timeout.validate().is_err(),
+            "should reject base > max timeout"
+        );
 
         // Invalid: slot_time_ms = 0
         let mut bad_slot = ConsensusConfig::dev();
@@ -436,15 +522,21 @@ mod tests {
         assert_ne!(pk1, pk2);
 
         // Addresses should match pattern.
-        assert_eq!(config.initial_validators[0].address, Address::with_last_byte(1));
-        assert_eq!(config.initial_validators[1].address, Address::with_last_byte(2));
+        assert_eq!(
+            config.initial_validators[0].address,
+            Address::with_last_byte(1)
+        );
+        assert_eq!(
+            config.initial_validators[1].address,
+            Address::with_last_byte(2)
+        );
     }
 
     #[test]
     fn test_consensus_config_dev_multi_4() {
         let config = ConsensusConfig::dev_multi(4);
         assert_eq!(config.fault_tolerance, 1); // (4-1)/3 = 1
-        assert_eq!(config.quorum_size(), 3);   // 2*1+1 = 3
+        assert_eq!(config.quorum_size(), 3); // 2*1+1 = 3
         assert!(config.validate().is_ok());
     }
 
@@ -573,14 +665,21 @@ epoch_length = 0
         let genesis = &spec.genesis;
         // Validator addresses should be funded.
         for v in &config.initial_validators {
-            let account = genesis.alloc.get(&v.address)
+            let account = genesis
+                .alloc
+                .get(&v.address)
                 .expect("validator should have allocation");
-            assert!(account.balance > U256::ZERO, "validator balance should be non-zero");
+            assert!(
+                account.balance > U256::ZERO,
+                "validator balance should be non-zero"
+            );
         }
         // Test accounts should be funded.
         for i in 0..10u8 {
             let addr = Address::with_last_byte(0x10 + i);
-            let account = genesis.alloc.get(&addr)
+            let account = genesis
+                .alloc
+                .get(&addr)
                 .expect("test account should have allocation");
             assert_eq!(account.balance, ten_thousand_n());
         }
@@ -630,7 +729,10 @@ epoch_length = 0
         let dev_config = ConsensusConfig::dev();
 
         assert_eq!(default_config.slot_time_ms, dev_config.slot_time_ms);
-        assert_eq!(default_config.validator_set_size, dev_config.validator_set_size);
+        assert_eq!(
+            default_config.validator_set_size,
+            dev_config.validator_set_size
+        );
         assert_eq!(default_config.fault_tolerance, dev_config.fault_tolerance);
         assert_eq!(default_config.base_timeout_ms, dev_config.base_timeout_ms);
         assert_eq!(default_config.max_timeout_ms, dev_config.max_timeout_ms);
@@ -682,8 +784,8 @@ epoch_length = 0
             "max_timeout_ms": 8000,
             "initial_validators": []
         }"#;
-        let config: ConsensusConfig = serde_json::from_str(json)
-            .expect("should deserialize without epoch_length field");
+        let config: ConsensusConfig =
+            serde_json::from_str(json).expect("should deserialize without epoch_length field");
         assert_eq!(config.epoch_length, 0, "epoch_length should default to 0");
     }
 
@@ -700,8 +802,7 @@ epoch_length = 0
                 i
             );
             assert_eq!(
-                c1.initial_validators[i].address,
-                c2.initial_validators[i].address,
+                c1.initial_validators[i].address, c2.initial_validators[i].address,
                 "validator {} address should be deterministic",
                 i
             );
@@ -714,7 +815,31 @@ epoch_length = 0
         let mut config = ConsensusConfig::dev();
         config.base_timeout_ms = 5000;
         config.max_timeout_ms = 5000;
-        assert!(config.validate().is_ok(), "base == max timeout should be valid");
+        assert!(
+            config.validate().is_ok(),
+            "base == max timeout should be valid"
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_partial_p2p_peer_id_configuration() {
+        let mut config = ConsensusConfig::dev_multi(4);
+        config.initial_validators[0].p2p_peer_id = Some(PeerId::random().to_string());
+
+        let error = config.validate().unwrap_err();
+        assert!(error.contains("all define p2p_peer_id or all omit it"));
+    }
+
+    #[test]
+    fn test_validate_rejects_duplicate_p2p_peer_id() {
+        let mut config = ConsensusConfig::dev_multi(4);
+        let peer_id = PeerId::random().to_string();
+        for validator in &mut config.initial_validators {
+            validator.p2p_peer_id = Some(peer_id.clone());
+        }
+
+        let error = config.validate().unwrap_err();
+        assert!(error.contains("duplicate validator p2p_peer_id"));
     }
 
     #[test]
@@ -731,7 +856,10 @@ epoch_length = 0
         assert_eq!(c10.fault_tolerance, 3);
         assert_eq!(c10.quorum_size(), 7);
         assert_eq!(c10.initial_validators.len(), 10);
-        assert!(c10.validate().is_ok(), "10-validator config should be valid");
+        assert!(
+            c10.validate().is_ok(),
+            "10-validator config should be valid"
+        );
     }
 
     #[test]
@@ -751,6 +879,9 @@ epoch_length = 0
         unsafe { std::env::set_var("N42_CHAIN_ID", "1337") };
         let id = effective_chain_id();
         unsafe { std::env::remove_var("N42_CHAIN_ID") };
-        assert_eq!(id, 1337, "N42_CHAIN_ID env var should override the default chain ID");
+        assert_eq!(
+            id, 1337,
+            "N42_CHAIN_ID env var should override the default chain ID"
+        );
     }
 }

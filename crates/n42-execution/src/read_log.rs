@@ -29,7 +29,7 @@
 //! reth Compact encoding), especially for common cases like zero-value storage
 //! and empty/zero-balance accounts.
 
-use alloy_primitives::{Bytes, B256, U256};
+use alloy_primitives::{B256, Bytes, U256};
 use revm::{
     bytecode::Bytecode,
     database_interface::{DBErrorMarker, Database},
@@ -116,7 +116,10 @@ where
 {
     type Error = DB::Error;
 
-    fn basic(&mut self, address: alloy_primitives::Address) -> Result<Option<AccountInfo>, Self::Error> {
+    fn basic(
+        &mut self,
+        address: alloy_primitives::Address,
+    ) -> Result<Option<AccountInfo>, Self::Error> {
         let result = self.inner.basic(address)?;
         let mut log = lock_or_recover(&self.log);
         match &result {
@@ -171,9 +174,9 @@ pub const HEADER_BLOCK_HASH: u8 = 0xC0;
 pub const ACCT_EXISTS_BIT: u8 = 0x01;
 pub const ACCT_NONCE_LEN_SHIFT: u8 = 1;
 pub const ACCT_NONCE_LEN_MASK: u8 = 0x0E; // bits 1-3
-pub const ACCT_BALANCE_BIT: u8 = 0x10;     // bit 4
-pub const ACCT_CODE_HASH_BIT: u8 = 0x20;   // bit 5
-pub const ACCT_NONCE_8B_BIT: u8 = 0x40;    // bit 6
+pub const ACCT_BALANCE_BIT: u8 = 0x10; // bit 4
+pub const ACCT_CODE_HASH_BIT: u8 = 0x20; // bit 5
+pub const ACCT_NONCE_8B_BIT: u8 = 0x40; // bit 6
 
 #[derive(Debug, thiserror::Error)]
 pub enum DecodeError {
@@ -184,7 +187,11 @@ pub enum DecodeError {
     InvalidTag(u8, usize),
 
     #[error("invalid field length {len} at offset {offset} (max {max})")]
-    InvalidFieldLen { len: usize, max: usize, offset: usize },
+    InvalidFieldLen {
+        len: usize,
+        max: usize,
+        offset: usize,
+    },
 
     #[error("entry count {0} exceeds maximum {1}")]
     EntryCountOverflow(u32, u32),
@@ -195,7 +202,11 @@ const MAX_ENTRY_COUNT: u32 = 500_000;
 
 #[inline]
 fn significant_bytes_u64(v: u64) -> usize {
-    if v == 0 { 0 } else { (64 - v.leading_zeros() as usize).div_ceil(8) }
+    if v == 0 {
+        0
+    } else {
+        (64 - v.leading_zeros() as usize).div_ceil(8)
+    }
 }
 
 #[inline]
@@ -214,7 +225,11 @@ pub fn encode_read_log(log: &[ReadLogEntry]) -> Vec<u8> {
             ReadLogEntry::AccountNotFound => {
                 buf.push(HEADER_ACCOUNT_NOT_FOUND);
             }
-            ReadLogEntry::Account { nonce, balance, code_hash } => {
+            ReadLogEntry::Account {
+                nonce,
+                balance,
+                code_hash,
+            } => {
                 let is_contract = *code_hash != alloy_primitives::KECCAK256_EMPTY;
                 let nonce_len = significant_bytes_u64(*nonce);
                 let has_balance = *balance != U256::ZERO;
@@ -234,7 +249,11 @@ pub fn encode_read_log(log: &[ReadLogEntry]) -> Vec<u8> {
                 buf.push(header);
 
                 if nonce_len > 0 {
-                    let actual_len = if header & ACCT_NONCE_8B_BIT != 0 { 8 } else { nonce_len };
+                    let actual_len = if header & ACCT_NONCE_8B_BIT != 0 {
+                        8
+                    } else {
+                        nonce_len
+                    };
                     let nonce_be = nonce.to_be_bytes();
                     buf.extend_from_slice(&nonce_be[8 - actual_len..]);
                 }
@@ -276,7 +295,10 @@ pub fn decode_read_log(data: &[u8]) -> Result<Vec<ReadLogEntry>, DecodeError> {
 
     let entry_count = u32::from_le_bytes(data[0..4].try_into().unwrap());
     if entry_count > MAX_ENTRY_COUNT {
-        return Err(DecodeError::EntryCountOverflow(entry_count, MAX_ENTRY_COUNT));
+        return Err(DecodeError::EntryCountOverflow(
+            entry_count,
+            MAX_ENTRY_COUNT,
+        ));
     }
     let mut entries = Vec::with_capacity(entry_count as usize);
     let mut pos: usize = 4;
@@ -303,7 +325,11 @@ pub fn decode_read_log(data: &[u8]) -> Result<Vec<ReadLogEntry>, DecodeError> {
                 ((header & ACCT_NONCE_LEN_MASK) >> ACCT_NONCE_LEN_SHIFT) as usize
             };
             if nonce_len > 8 {
-                return Err(DecodeError::InvalidFieldLen { len: nonce_len, max: 8, offset: pos.saturating_sub(1) });
+                return Err(DecodeError::InvalidFieldLen {
+                    len: nonce_len,
+                    max: 8,
+                    offset: pos.saturating_sub(1),
+                });
             }
             let has_balance = header & ACCT_BALANCE_BIT != 0;
             let has_code_hash = header & ACCT_CODE_HASH_BIT != 0;
@@ -323,7 +349,11 @@ pub fn decode_read_log(data: &[u8]) -> Result<Vec<ReadLogEntry>, DecodeError> {
                 let balance_len = data[pos] as usize;
                 pos += 1;
                 if balance_len > 32 {
-                    return Err(DecodeError::InvalidFieldLen { len: balance_len, max: 32, offset: pos - 1 });
+                    return Err(DecodeError::InvalidFieldLen {
+                        len: balance_len,
+                        max: 32,
+                        offset: pos - 1,
+                    });
                 }
                 ensure(pos, balance_len)?;
                 let mut buf = [0u8; 32];
@@ -343,7 +373,11 @@ pub fn decode_read_log(data: &[u8]) -> Result<Vec<ReadLogEntry>, DecodeError> {
                 alloy_primitives::KECCAK256_EMPTY
             };
 
-            entries.push(ReadLogEntry::Account { nonce, balance, code_hash });
+            entries.push(ReadLogEntry::Account {
+                nonce,
+                balance,
+                code_hash,
+            });
         } else if header <= HEADER_STORAGE_BASE + 32 {
             let value_len = (header - HEADER_STORAGE_BASE) as usize;
             let value = if value_len > 0 {
@@ -372,7 +406,7 @@ pub fn decode_read_log(data: &[u8]) -> Result<Vec<ReadLogEntry>, DecodeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_primitives::{KECCAK256_EMPTY, U256, B256};
+    use alloy_primitives::{B256, KECCAK256_EMPTY, U256};
 
     #[test]
     fn test_encode_decode_empty_log() {
@@ -562,9 +596,12 @@ mod tests {
         }];
         let encoded_full = encode_read_log(&eoa_full);
 
-        assert!(encoded_zero.len() < encoded_full.len(),
+        assert!(
+            encoded_zero.len() < encoded_full.len(),
             "zero-value EOA ({} bytes) should be smaller than full EOA ({} bytes)",
-            encoded_zero.len(), encoded_full.len());
+            encoded_zero.len(),
+            encoded_full.len()
+        );
     }
 
     #[test]
@@ -622,11 +659,11 @@ mod tests {
     fn test_nonce_boundary_each_byte_count() {
         // Test every byte count boundary: 3, 4, 5, 6, 7 bytes
         let cases: &[(u64, usize)] = &[
-            (0x10000, 3),           // 3 bytes
-            (0x1000000, 4),         // 4 bytes
-            (0x100000000, 5),       // 5 bytes
-            (0x10000000000, 6),     // 6 bytes
-            (0x1000000000000, 7),   // 7 bytes
+            (0x10000, 3),         // 3 bytes
+            (0x1000000, 4),       // 4 bytes
+            (0x100000000, 5),     // 5 bytes
+            (0x10000000000, 6),   // 6 bytes
+            (0x1000000000000, 7), // 7 bytes
         ];
         for &(nonce, expected_nonce_bytes) in cases {
             let log = vec![ReadLogEntry::Account {
@@ -767,9 +804,18 @@ mod tests {
     #[test]
     fn test_decode_too_short() {
         // Less than 4 bytes
-        assert!(matches!(decode_read_log(&[]), Err(DecodeError::UnexpectedEof(0))));
-        assert!(matches!(decode_read_log(&[0x00]), Err(DecodeError::UnexpectedEof(0))));
-        assert!(matches!(decode_read_log(&[0x00, 0x00, 0x00]), Err(DecodeError::UnexpectedEof(0))));
+        assert!(matches!(
+            decode_read_log(&[]),
+            Err(DecodeError::UnexpectedEof(0))
+        ));
+        assert!(matches!(
+            decode_read_log(&[0x00]),
+            Err(DecodeError::UnexpectedEof(0))
+        ));
+        assert!(matches!(
+            decode_read_log(&[0x00, 0x00, 0x00]),
+            Err(DecodeError::UnexpectedEof(0))
+        ));
     }
 
     #[test]
@@ -783,7 +829,14 @@ mod tests {
 
         let result = decode_read_log(&data);
         assert!(result.is_err(), "balance_len > 32 should be rejected");
-        assert!(matches!(result, Err(DecodeError::InvalidFieldLen { len: 33, max: 32, .. })));
+        assert!(matches!(
+            result,
+            Err(DecodeError::InvalidFieldLen {
+                len: 33,
+                max: 32,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -800,8 +853,10 @@ mod tests {
         for tag in [0xA1u8, 0xB0, 0xBF] {
             let data = [0x01, 0x00, 0x00, 0x00, tag];
             let result = decode_read_log(&data);
-            assert!(matches!(result, Err(DecodeError::InvalidTag(t, _)) if t == tag),
-                "tag 0x{tag:02X} should be rejected");
+            assert!(
+                matches!(result, Err(DecodeError::InvalidTag(t, _)) if t == tag),
+                "tag 0x{tag:02X} should be rejected"
+            );
         }
     }
 
@@ -811,8 +866,10 @@ mod tests {
         for tag in [0xC1u8, 0xD0, 0xFF] {
             let data = [0x01, 0x00, 0x00, 0x00, tag];
             let result = decode_read_log(&data);
-            assert!(matches!(result, Err(DecodeError::InvalidTag(t, _)) if t == tag),
-                "tag 0x{tag:02X} should be rejected");
+            assert!(
+                matches!(result, Err(DecodeError::InvalidTag(t, _)) if t == tag),
+                "tag 0x{tag:02X} should be rejected"
+            );
         }
     }
 
@@ -937,16 +994,19 @@ mod tests {
 
     #[test]
     fn test_read_log_database_capture() {
-        use revm::{database::CacheDB, database_interface::Database};
         use alloy_primitives::Address;
+        use revm::{database::CacheDB, database_interface::Database};
 
         let mut cache_db = CacheDB::new(revm::database::EmptyDB::default());
         let addr = Address::with_last_byte(0x42);
-        cache_db.insert_account_info(addr, AccountInfo {
-            nonce: 5,
-            balance: U256::from(1000u64),
-            ..Default::default()
-        });
+        cache_db.insert_account_info(
+            addr,
+            AccountInfo {
+                nonce: 5,
+                balance: U256::from(1000u64),
+                ..Default::default()
+            },
+        );
 
         let mut logged_db = ReadLogDatabase::new(cache_db);
 
@@ -986,7 +1046,10 @@ mod tests {
 
         let handle = logged_db.log_handle();
         let entries = handle.lock().unwrap();
-        assert!(entries.is_empty(), "code_by_hash should not produce log entries");
+        assert!(
+            entries.is_empty(),
+            "code_by_hash should not produce log entries"
+        );
 
         let codes = logged_db.codes_handle();
         let codes = codes.lock().unwrap();
@@ -995,35 +1058,42 @@ mod tests {
 
     #[test]
     fn test_read_log_database_captures_bytecode_from_basic() {
-        use revm::{database::CacheDB, database_interface::Database, bytecode::Bytecode};
         use alloy_primitives::{Address, keccak256};
+        use revm::{bytecode::Bytecode, database::CacheDB, database_interface::Database};
 
         let mut cache_db = CacheDB::new(revm::database::EmptyDB::default());
         let addr = Address::with_last_byte(0xC0);
         let code = alloy_primitives::Bytes::from(vec![0x60, 0x00, 0xF3]);
         let code_hash = keccak256(&code);
 
-        cache_db.insert_account_info(addr, AccountInfo {
-            nonce: 1,
-            balance: U256::ZERO,
-            code_hash,
-            code: Some(Bytecode::new_raw(code.clone())),
-            account_id: None,
-        });
+        cache_db.insert_account_info(
+            addr,
+            AccountInfo {
+                nonce: 1,
+                balance: U256::ZERO,
+                code_hash,
+                code: Some(Bytecode::new_raw(code.clone())),
+                account_id: None,
+            },
+        );
 
         let mut logged_db = ReadLogDatabase::new(cache_db);
         let _ = logged_db.basic(addr).unwrap();
 
         let codes = logged_db.codes_handle();
         let codes = codes.lock().unwrap();
-        assert_eq!(codes.len(), 1, "should capture contract bytecode via basic()");
+        assert_eq!(
+            codes.len(),
+            1,
+            "should capture contract bytecode via basic()"
+        );
         assert!(codes.contains_key(&code_hash));
     }
 
     #[test]
     fn test_code_by_hash_captures_bytecode() {
-        use revm::{database::CacheDB, database_interface::Database, bytecode::Bytecode};
         use alloy_primitives::{Address, keccak256};
+        use revm::{bytecode::Bytecode, database::CacheDB, database_interface::Database};
 
         let mut cache_db = CacheDB::new(revm::database::EmptyDB::default());
         let addr = Address::with_last_byte(0xC1);
@@ -1031,13 +1101,16 @@ mod tests {
         let code_hash = keccak256(&code);
 
         // Insert account with bytecode into CacheDB
-        cache_db.insert_account_info(addr, AccountInfo {
-            nonce: 0,
-            balance: U256::ZERO,
-            code_hash,
-            code: Some(Bytecode::new_raw(code.clone())),
-            account_id: None,
-        });
+        cache_db.insert_account_info(
+            addr,
+            AccountInfo {
+                nonce: 0,
+                balance: U256::ZERO,
+                code_hash,
+                code: Some(Bytecode::new_raw(code.clone())),
+                account_id: None,
+            },
+        );
 
         let mut logged_db = ReadLogDatabase::new(cache_db);
 
@@ -1048,7 +1121,10 @@ mod tests {
         // No log entries (code_by_hash does not write to read log)
         let log_handle = logged_db.log_handle();
         let entries = log_handle.lock().unwrap();
-        assert!(entries.is_empty(), "code_by_hash should not produce log entries");
+        assert!(
+            entries.is_empty(),
+            "code_by_hash should not produce log entries"
+        );
 
         // But bytecode should be captured
         let codes_handle = logged_db.codes_handle();

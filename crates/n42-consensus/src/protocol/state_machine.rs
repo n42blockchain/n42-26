@@ -8,9 +8,12 @@ use std::time::Instant;
 use tokio::sync::mpsc;
 
 use super::pacemaker::Pacemaker;
-use super::quorum::{TimeoutCollector, VoteCollector};
+use super::quorum::{
+    TimeoutCollector, VoteCollector, commit_signing_message, newview_signing_message,
+    signing_message, timeout_signing_message,
+};
 use super::round::{Phase, RoundState};
-use crate::error::ConsensusResult;
+use crate::error::{ConsensusError, ConsensusResult};
 use crate::validator::{EpochManager, LeaderSelector, ValidatorSet};
 
 /// Per-view timing tracker for diagnosing consensus commit latency.
@@ -349,6 +352,54 @@ impl ConsensusEngine {
         self.validator_set().len()
     }
 
+    /// Returns the validator index if the message carries a valid single-validator
+    /// BLS signature under the current validator set.
+    ///
+    /// This is intentionally narrower than full consensus acceptance: it only answers
+    /// "does this peer control a current validator key?" so outer layers can bind a
+    /// `PeerId` to a validator identity without reusing weaker transport metadata.
+    pub fn authenticated_signer(&self, msg: &ConsensusMessage) -> Option<u32> {
+        match msg {
+            ConsensusMessage::Proposal(proposal) => {
+                let pk = self
+                    .validator_set()
+                    .get_public_key(proposal.proposer)
+                    .ok()?;
+                let sig_msg = signing_message(proposal.view, &proposal.block_hash);
+                pk.verify(&sig_msg, &proposal.signature).ok()?;
+                Some(proposal.proposer)
+            }
+            ConsensusMessage::Vote(vote) => {
+                let pk = self.validator_set().get_public_key(vote.voter).ok()?;
+                let sig_msg = signing_message(vote.view, &vote.block_hash);
+                pk.verify(&sig_msg, &vote.signature).ok()?;
+                Some(vote.voter)
+            }
+            ConsensusMessage::CommitVote(commit_vote) => {
+                let pk = self
+                    .validator_set()
+                    .get_public_key(commit_vote.voter)
+                    .ok()?;
+                let sig_msg = commit_signing_message(commit_vote.view, &commit_vote.block_hash);
+                pk.verify(&sig_msg, &commit_vote.signature).ok()?;
+                Some(commit_vote.voter)
+            }
+            ConsensusMessage::Timeout(timeout) => {
+                let pk = self.validator_set().get_public_key(timeout.sender).ok()?;
+                let sig_msg = timeout_signing_message(timeout.view);
+                pk.verify(&sig_msg, &timeout.signature).ok()?;
+                Some(timeout.sender)
+            }
+            ConsensusMessage::NewView(new_view) => {
+                let pk = self.validator_set().get_public_key(new_view.leader).ok()?;
+                let sig_msg = newview_signing_message(new_view.view);
+                pk.verify(&sig_msg, &new_view.signature).ok()?;
+                Some(new_view.leader)
+            }
+            ConsensusMessage::PrepareQC(_) | ConsensusMessage::Decide(_) => None,
+        }
+    }
+
     pub fn epoch_manager(&self) -> &EpochManager {
         &self.epoch_manager
     }
@@ -599,6 +650,7 @@ impl ConsensusEngine {
             && self.epoch_manager.advance_epoch()
         {
             let new_epoch = self.epoch_manager.current_epoch();
+            self.sync_local_validator_index()?;
             let validator_count = self.validator_set().len();
             tracing::info!(target: "n42::cl::engine", new_epoch, validator_count, view = new_view, "epoch transition at view boundary");
             self.emit(EngineOutput::EpochTransition {
@@ -647,6 +699,29 @@ impl ConsensusEngine {
         }
 
         tracing::debug!(target: "n42::cl::engine", view = new_view, "advanced to new view");
+        Ok(())
+    }
+
+    fn sync_local_validator_index(&mut self) -> ConsensusResult<()> {
+        let local_pubkey = self.secret_key.public_key();
+        let new_index = self
+            .validator_set()
+            .index_of_public_key(&local_pubkey)
+            .ok_or(ConsensusError::LocalValidatorNotInSet {
+                epoch: self.epoch_manager.current_epoch(),
+            })?;
+
+        if new_index != self.my_index {
+            tracing::info!(
+                target: "n42::cl::engine",
+                old_index = self.my_index,
+                new_index,
+                epoch = self.epoch_manager.current_epoch(),
+                "updated local validator index for new epoch"
+            );
+            self.my_index = new_index;
+        }
+
         Ok(())
     }
 
@@ -779,6 +854,7 @@ mod tests {
             .map(|(i, sk)| ValidatorInfo {
                 address: Address::with_last_byte(i as u8),
                 bls_public_key: sk.public_key(),
+                p2p_peer_id: None,
             })
             .collect();
         let f = ((n as u32).saturating_sub(1)) / 3;
@@ -841,6 +917,58 @@ mod tests {
             collector.add_vote(i, sks[i as usize].sign(&msg)).unwrap();
         }
         collector.build_qc(vs).unwrap()
+    }
+
+    #[test]
+    fn test_epoch_transition_updates_local_validator_index() {
+        let sks: Vec<_> = (0..4)
+            .map(|_| n42_primitives::BlsSecretKey::random().unwrap())
+            .collect();
+        let infos_epoch_0: Vec<_> = sks
+            .iter()
+            .enumerate()
+            .map(|(i, sk)| ValidatorInfo {
+                address: Address::with_last_byte(i as u8),
+                bls_public_key: sk.public_key(),
+                p2p_peer_id: None,
+            })
+            .collect();
+        let infos_epoch_1 = vec![
+            infos_epoch_0[1].clone(),
+            infos_epoch_0[2].clone(),
+            infos_epoch_0[0].clone(),
+            infos_epoch_0[3].clone(),
+        ];
+
+        let mut epoch_manager =
+            EpochManager::with_epoch_length(ValidatorSet::new(&infos_epoch_0, 1), 2);
+        epoch_manager
+            .stage_next_epoch(&infos_epoch_1, 1)
+            .expect("next epoch should stage");
+
+        let (output_tx, mut output_rx) = mpsc::channel(16);
+        let mut engine = ConsensusEngine::with_epoch_manager(
+            0,
+            sks[0].clone(),
+            epoch_manager,
+            60000,
+            120000,
+            output_tx,
+        );
+
+        engine
+            .advance_to_view(3)
+            .expect("epoch transition should succeed");
+
+        assert_eq!(engine.epoch_manager.current_epoch(), 1);
+        assert_eq!(engine.my_index, 2);
+        assert!(matches!(
+            output_rx.try_recv(),
+            Ok(EngineOutput::EpochTransition {
+                new_epoch: 1,
+                validator_count: 4,
+            })
+        ));
     }
 
     #[test]
@@ -1308,6 +1436,44 @@ mod tests {
             }
             other => panic!("expected InvalidSignature, got: {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_authenticated_signer_accepts_valid_vote_signature() {
+        use crate::protocol::quorum::signing_message;
+
+        let (engine, sks, _, _) = make_engine(4, 0);
+        let block_hash = B256::repeat_byte(0xC1);
+        let vote = Vote {
+            view: 7,
+            block_hash,
+            voter: 2,
+            signature: sks[2].sign(&signing_message(7, &block_hash)),
+        };
+
+        assert_eq!(
+            engine.authenticated_signer(&ConsensusMessage::Vote(vote)),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn test_authenticated_signer_rejects_invalid_vote_signature() {
+        use crate::protocol::quorum::signing_message;
+
+        let (engine, sks, _, _) = make_engine(4, 0);
+        let block_hash = B256::repeat_byte(0xC2);
+        let vote = Vote {
+            view: 7,
+            block_hash,
+            voter: 2,
+            signature: sks[1].sign(&signing_message(7, &block_hash)),
+        };
+
+        assert_eq!(
+            engine.authenticated_signer(&ConsensusMessage::Vote(vote)),
+            None
+        );
     }
 
     #[test]
@@ -2249,13 +2415,13 @@ mod tests {
         while rx.try_recv().is_ok() {}
         assert_eq!(engine.current_view(), 10);
 
-        engine.advance_to_view(5);
+        let _ = engine.advance_to_view(5);
         assert_eq!(engine.current_view(), 10);
 
-        engine.advance_to_view(10);
+        let _ = engine.advance_to_view(10);
         assert_eq!(engine.current_view(), 10);
 
-        engine.advance_to_view(15);
+        let _ = engine.advance_to_view(15);
         assert_eq!(engine.current_view(), 15);
     }
 

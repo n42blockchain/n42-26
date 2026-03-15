@@ -43,8 +43,7 @@ async fn main() -> eyre::Result<()> {
     // Initialize tracing.
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("info")),
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
 
@@ -113,7 +112,12 @@ async fn main() -> eyre::Result<()> {
         }
     }
 
-    info!(passed, failed, total = passed + failed, "test suite complete");
+    info!(
+        passed,
+        failed,
+        total = passed + failed,
+        "test suite complete"
+    );
 
     if failed > 0 {
         std::process::exit(1);

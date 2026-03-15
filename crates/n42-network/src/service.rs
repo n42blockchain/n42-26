@@ -21,7 +21,7 @@ use crate::gossipsub::topics::{
 };
 use crate::reconnection::ReconnectionManager;
 use crate::state_sync::{BlockSyncRequest, BlockSyncResponse};
-use crate::transport::{N42Behaviour, N42BehaviourEvent};
+use crate::transport::{N42Behaviour, N42BehaviourEvent, deterministic_validator_peer_id};
 use crate::tx_forward::{TxForwardRequest, TxForwardResponse};
 
 /// Commands sent to the network service from the node layer.
@@ -58,6 +58,13 @@ pub enum NetworkCommand {
         peer_id: PeerId,
         addrs: Vec<Multiaddr>,
         trusted: bool,
+    },
+    AuthenticateValidatorPeer {
+        peer_id: PeerId,
+        validator_index: u32,
+    },
+    ReplaceExpectedValidatorPeers {
+        peers: HashMap<u32, PeerId>,
     },
     AddKademliaPeer {
         peer_id: PeerId,
@@ -116,18 +123,20 @@ pub enum NetworkEvent {
 /// the network.
 #[derive(Clone, Debug)]
 pub struct NetworkHandle {
-    command_tx: mpsc::UnboundedSender<NetworkCommand>,
+    command_tx: mpsc::Sender<NetworkCommand>,
     /// High-priority channel for block data and consensus commands.
     /// These bypass the potentially deep tx-broadcast backlog in `command_tx`.
-    priority_tx: mpsc::UnboundedSender<NetworkCommand>,
-    /// Validator index → PeerId mapping, populated from Identify events.
+    priority_tx: mpsc::Sender<NetworkCommand>,
+    /// Best-known validator index → PeerId mapping. Identify populates this early,
+    /// and successful consensus-message authentication can later overwrite it with
+    /// a stronger binding for the same validator index.
     validator_peer_map: Arc<RwLock<HashMap<u32, PeerId>>>,
 }
 
 impl NetworkHandle {
     pub fn new(
-        command_tx: mpsc::UnboundedSender<NetworkCommand>,
-        priority_tx: mpsc::UnboundedSender<NetworkCommand>,
+        command_tx: mpsc::Sender<NetworkCommand>,
+        priority_tx: mpsc::Sender<NetworkCommand>,
     ) -> Self {
         Self {
             command_tx,
@@ -231,6 +240,26 @@ impl NetworkHandle {
         })
     }
 
+    /// Promotes a connected peer to an authenticated validator after the caller
+    /// has verified a single-validator consensus message signed by that validator.
+    pub fn authenticate_validator_peer(
+        &self,
+        peer_id: PeerId,
+        validator_index: u32,
+    ) -> Result<(), NetworkError> {
+        self.send(NetworkCommand::AuthenticateValidatorPeer {
+            peer_id,
+            validator_index,
+        })
+    }
+
+    pub fn replace_expected_validator_peers(
+        &self,
+        peers: HashMap<u32, PeerId>,
+    ) -> Result<(), NetworkError> {
+        self.send(NetworkCommand::ReplaceExpectedValidatorPeers { peers })
+    }
+
     pub fn add_kademlia_peer(
         &self,
         peer_id: PeerId,
@@ -240,16 +269,18 @@ impl NetworkHandle {
     }
 
     fn send(&self, cmd: NetworkCommand) -> Result<(), NetworkError> {
-        self.command_tx
-            .send(cmd)
-            .map_err(|_| NetworkError::ChannelClosed)
+        self.command_tx.try_send(cmd).map_err(|error| match error {
+            tokio::sync::mpsc::error::TrySendError::Full(_) => NetworkError::ChannelFull,
+            tokio::sync::mpsc::error::TrySendError::Closed(_) => NetworkError::ChannelClosed,
+        })
     }
 
     /// Send via the high-priority channel (block data, consensus, sync).
     fn send_priority(&self, cmd: NetworkCommand) -> Result<(), NetworkError> {
-        self.priority_tx
-            .send(cmd)
-            .map_err(|_| NetworkError::ChannelClosed)
+        self.priority_tx.try_send(cmd).map_err(|error| match error {
+            tokio::sync::mpsc::error::TrySendError::Full(_) => NetworkError::ChannelFull,
+            tokio::sync::mpsc::error::TrySendError::Closed(_) => NetworkError::ChannelClosed,
+        })
     }
 }
 
@@ -257,15 +288,17 @@ impl NetworkHandle {
 /// the P2P network and the node layer.
 pub struct NetworkService {
     swarm: Swarm<N42Behaviour>,
-    command_rx: mpsc::UnboundedReceiver<NetworkCommand>,
+    command_rx: mpsc::Receiver<NetworkCommand>,
     /// High-priority commands (block data, consensus) — drained before `command_rx`.
-    priority_rx: mpsc::UnboundedReceiver<NetworkCommand>,
+    priority_rx: mpsc::Receiver<NetworkCommand>,
     /// High-priority channel for consensus messages (Vote, Proposal, PrepareQC, etc.).
     consensus_event_tx: mpsc::Sender<NetworkEvent>,
     /// Lower-priority channel for data events (BlockData, TX, Sync, Peers).
     event_tx: mpsc::Sender<NetworkEvent>,
     /// Reliable consensus/block events that could not be delivered immediately.
     pending_reliable_events: VecDeque<NetworkEvent>,
+    /// Reliable data-plane events that could not be delivered immediately.
+    pending_data_events: VecDeque<NetworkEvent>,
     consensus_topic_hash: gossipsub::TopicHash,
     block_announce_topic_hash: gossipsub::TopicHash,
     mempool_topic_hash: gossipsub::TopicHash,
@@ -275,12 +308,25 @@ pub struct NetworkService {
     pending_sync_channels:
         HashMap<u64, libp2p::request_response::ResponseChannel<BlockSyncResponse>>,
     next_sync_id: u64,
+    /// Configured validator index -> expected PeerId bindings.
+    expected_validator_peer_ids: HashMap<u32, PeerId>,
+    /// Best-known validator index → PeerId mapping used for outbound routing.
     validator_peer_map: Arc<RwLock<HashMap<u32, PeerId>>>,
-    /// Reverse map: PeerId → validator_index, for authenticating block direct pushes.
+    /// Reverse map for best-known validator routing information.
     peer_validator_map: HashMap<PeerId, u32>,
+    /// Cryptographically authenticated validator index → PeerId mapping.
+    authenticated_validator_peer_map: HashMap<u32, PeerId>,
+    /// Reverse map used to authorize inbound block_direct / tx_forward traffic.
+    authenticated_peer_validator_map: HashMap<PeerId, u32>,
     reconnection: ReconnectionManager,
     /// When true, skip GossipSub tx publishing/forwarding to avoid event queue flooding.
     tx_gossip_disabled: bool,
+}
+
+fn claimed_validator_index(agent_version: &str) -> Option<u32> {
+    agent_version
+        .strip_prefix("n42/1.0.0/v")
+        .and_then(|idx| idx.parse::<u32>().ok())
 }
 
 impl NetworkService {
@@ -291,7 +337,7 @@ impl NetworkService {
     /// PrepareQC, Decide, Timeout, NewView) are never queued behind high-volume data
     /// events (TxForward, BlockAnnouncement, TransactionReceived).
     pub fn new(
-        mut swarm: Swarm<N42Behaviour>,
+        swarm: Swarm<N42Behaviour>,
     ) -> Result<
         (
             Self,
@@ -301,8 +347,23 @@ impl NetworkService {
         ),
         NetworkError,
     > {
-        let (command_tx, command_rx) = mpsc::unbounded_channel();
-        let (priority_tx, priority_rx) = mpsc::unbounded_channel();
+        Self::new_with_expected_validator_peer_ids(swarm, HashMap::new())
+    }
+
+    pub fn new_with_expected_validator_peer_ids(
+        mut swarm: Swarm<N42Behaviour>,
+        expected_validator_peer_ids: HashMap<u32, PeerId>,
+    ) -> Result<
+        (
+            Self,
+            NetworkHandle,
+            mpsc::Receiver<NetworkEvent>,
+            mpsc::Receiver<NetworkEvent>,
+        ),
+        NetworkError,
+    > {
+        let (command_tx, command_rx) = mpsc::channel(8192);
+        let (priority_tx, priority_rx) = mpsc::channel(2048);
         let (consensus_event_tx, consensus_event_rx) = mpsc::channel(2048);
         let (event_tx, event_rx) = mpsc::channel(8192);
 
@@ -314,7 +375,6 @@ impl NetworkService {
                 "TX gossip disabled (default): using TX Forward to Leader. Set N42_ENABLE_TX_GOSSIP=1 to re-enable."
             );
         }
-
         let topics = [
             consensus_topic(),
             block_announce_topic(),
@@ -361,6 +421,7 @@ impl NetworkService {
             consensus_event_tx,
             event_tx,
             pending_reliable_events: VecDeque::new(),
+            pending_data_events: VecDeque::new(),
             consensus_topic_hash,
             block_announce_topic_hash,
             mempool_topic_hash,
@@ -368,8 +429,11 @@ impl NetworkService {
             verification_receipts_topic_hash,
             pending_sync_channels: HashMap::new(),
             next_sync_id: 0,
+            expected_validator_peer_ids,
             validator_peer_map,
             peer_validator_map: HashMap::new(),
+            authenticated_validator_peer_map: HashMap::new(),
+            authenticated_peer_validator_map: HashMap::new(),
             reconnection: ReconnectionManager::new(),
             tx_gossip_disabled,
         };
@@ -415,6 +479,16 @@ impl NetworkService {
                         "consensus event channel closed while draining reliable backlog"
                     );
                     self.pending_reliable_events.clear();
+                    break;
+                }
+            }
+
+            while let Some(event) = self.pending_data_events.pop_front() {
+                let tx = self.event_tx.clone();
+                if tx.send(event).await.is_err() {
+                    metrics::counter!("n42_network_event_drops_total").increment(1);
+                    tracing::warn!("data event channel closed while draining reliable backlog");
+                    self.pending_data_events.clear();
                     break;
                 }
             }
@@ -519,15 +593,8 @@ impl NetworkService {
                 tracing::info!(%peer_id, "peer disconnected");
                 metrics::gauge!("n42_active_peer_connections").decrement(1.0);
                 self.reconnection.on_disconnected(&peer_id);
-                // Clean up validator mappings for disconnected peer
-                if let Some(idx) = self.peer_validator_map.remove(&peer_id) {
-                    tracing::info!(%peer_id, validator_index = idx, "removed validator mapping for disconnected peer");
-                    if let Ok(mut map) = self.validator_peer_map.write() {
-                        if map.get(&idx) == Some(&peer_id) {
-                            map.remove(&idx);
-                        }
-                    }
-                }
+                self.clear_validator_mapping_for_peer(&peer_id);
+                self.clear_authenticated_validator_peer(&peer_id);
                 self.emit_event(NetworkEvent::PeerDisconnected(peer_id));
             }
             SwarmEvent::OutgoingConnectionError {
@@ -545,26 +612,155 @@ impl NetworkService {
         }
     }
 
+    fn clear_validator_mapping_for_peer(&mut self, peer_id: &PeerId) {
+        if let Some(idx) = self.peer_validator_map.remove(peer_id) {
+            let mut map = self.validator_peer_map.write().unwrap_or_else(|e| {
+                tracing::error!(
+                    "validator_peer_map lock poisoned on disconnect cleanup: {}",
+                    e
+                );
+                e.into_inner()
+            });
+            if map.get(&idx) == Some(peer_id) {
+                map.remove(&idx);
+            }
+        }
+    }
+
+    fn clear_authenticated_validator_peer(&mut self, peer_id: &PeerId) {
+        if let Some(idx) = self.authenticated_peer_validator_map.remove(peer_id) {
+            tracing::info!(
+                %peer_id,
+                validator_index = idx,
+                "removed authenticated validator mapping for disconnected peer"
+            );
+            if self.authenticated_validator_peer_map.get(&idx) == Some(peer_id) {
+                self.authenticated_validator_peer_map.remove(&idx);
+            }
+        }
+    }
+
+    fn authenticate_validator_peer(&mut self, peer_id: PeerId, validator_index: u32) {
+        if !self.swarm.is_connected(&peer_id) {
+            tracing::debug!(
+                %peer_id,
+                validator_index,
+                "skipping validator authentication for disconnected peer"
+            );
+            return;
+        }
+
+        if let Some(previous_peer) = self
+            .authenticated_validator_peer_map
+            .insert(validator_index, peer_id)
+            && previous_peer != peer_id
+        {
+            self.authenticated_peer_validator_map.remove(&previous_peer);
+        }
+
+        if let Some(previous_idx) = self
+            .authenticated_peer_validator_map
+            .insert(peer_id, validator_index)
+            && previous_idx != validator_index
+            && self.authenticated_validator_peer_map.get(&previous_idx) == Some(&peer_id)
+        {
+            self.authenticated_validator_peer_map.remove(&previous_idx);
+        }
+
+        self.peer_validator_map
+            .retain(|_, idx| *idx != validator_index);
+        self.peer_validator_map.insert(peer_id, validator_index);
+        let mut map = self.validator_peer_map.write().unwrap_or_else(|e| {
+            tracing::error!("validator_peer_map lock poisoned on auth write: {}", e);
+            e.into_inner()
+        });
+        map.insert(validator_index, peer_id);
+
+        tracing::info!(
+            %peer_id,
+            validator_index,
+            "peer promoted to authenticated validator"
+        );
+    }
+
+    fn replace_expected_validator_peers(&mut self, peers: HashMap<u32, PeerId>) {
+        self.expected_validator_peer_ids = peers;
+
+        self.authenticated_validator_peer_map
+            .retain(|idx, peer_id| self.expected_validator_peer_ids.get(idx) == Some(peer_id));
+        self.authenticated_peer_validator_map
+            .retain(|peer_id, idx| self.expected_validator_peer_ids.get(idx) == Some(peer_id));
+        self.peer_validator_map
+            .retain(|peer_id, idx| self.expected_validator_peer_ids.get(idx) == Some(peer_id));
+
+        let mut map = self.validator_peer_map.write().unwrap_or_else(|e| {
+            tracing::error!(
+                "validator_peer_map lock poisoned on expected peer replacement: {}",
+                e
+            );
+            e.into_inner()
+        });
+        map.retain(|idx, peer_id| self.expected_validator_peer_ids.get(idx) == Some(peer_id));
+
+        tracing::info!(
+            validator_count = self.expected_validator_peer_ids.len(),
+            authenticated = self.authenticated_validator_peer_map.len(),
+            routed = map.len(),
+            "replaced expected validator peer bindings"
+        );
+    }
+
     fn handle_identify_event(&mut self, peer_id: PeerId, info: libp2p::identify::Info) {
         tracing::debug!(%peer_id, protocol = ?info.protocol_version, "identified peer");
 
-        // agent_version format: "n42/1.0.0/v{index}"
-        // Security note: validator index is self-reported via agent_version.
-        // Real authentication happens at the BLS signature level in consensus.
-        // A fake mapping only causes direct-push fallback to GossipSub.
-        if let Some(idx_str) = info.agent_version.strip_prefix("n42/1.0.0/v")
-            && let Ok(idx) = idx_str.parse::<u32>()
-        {
-            tracing::info!(%peer_id, validator_index = idx, "mapped peer to validator");
-            // Update reverse map: remove any old peer that claimed this index
-            self.peer_validator_map.retain(|_, v| *v != idx);
-            self.peer_validator_map.insert(peer_id, idx);
-            match self.validator_peer_map.write() {
-                Ok(mut map) => {
+        if let Some(idx) = claimed_validator_index(&info.agent_version) {
+            let expected_peer_id = self
+                .expected_validator_peer_ids
+                .get(&idx)
+                .copied()
+                .map(Ok)
+                .unwrap_or_else(|| {
+                    if self.expected_validator_peer_ids.is_empty() {
+                        deterministic_validator_peer_id(idx)
+                    } else {
+                        Err(eyre::eyre!(
+                            "no configured expected peer id for validator index {idx}"
+                        ))
+                    }
+                });
+
+            match expected_peer_id {
+                Ok(expected_peer_id) if expected_peer_id == peer_id => {
+                    tracing::info!(
+                        %peer_id,
+                        validator_index = idx,
+                        "mapped peer to validator from identify metadata"
+                    );
+                    // Update reverse map: remove any old peer that claimed this index
+                    self.peer_validator_map.retain(|_, v| *v != idx);
+                    self.peer_validator_map.insert(peer_id, idx);
+                    let mut map = self.validator_peer_map.write().unwrap_or_else(|e| {
+                        tracing::error!("validator_peer_map lock poisoned on write: {}", e);
+                        e.into_inner()
+                    });
                     map.insert(idx, peer_id);
                 }
-                Err(e) => {
-                    tracing::error!("validator_peer_map lock poisoned on write: {}", e);
+                Ok(expected_peer_id) => {
+                    tracing::warn!(
+                        %peer_id,
+                        %expected_peer_id,
+                        validator_index = idx,
+                        "ignoring validator identify mapping with unexpected peer id"
+                    );
+                    self.clear_validator_mapping_for_peer(&peer_id);
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %peer_id,
+                        validator_index = idx,
+                        error = %error,
+                        "failed to derive expected validator peer id"
+                    );
                 }
             }
         }
@@ -709,18 +905,27 @@ impl NetworkService {
                                 source: peer,
                                 message: Box::new(msg),
                             });
-                            let _ = self
+                            if self
                                 .swarm
                                 .behaviour_mut()
                                 .consensus_direct
-                                .send_response(channel, ConsensusDirectResponse { accepted: true });
+                                .send_response(channel, ConsensusDirectResponse { accepted: true })
+                                .is_err()
+                            {
+                                tracing::warn!(%peer, "failed to send consensus direct ACK");
+                            }
                         }
                         Err(e) => {
                             tracing::warn!(%peer, error = %e, "invalid consensus direct message");
-                            let _ = self.swarm.behaviour_mut().consensus_direct.send_response(
-                                channel,
-                                ConsensusDirectResponse { accepted: false },
-                            );
+                            if self
+                                .swarm
+                                .behaviour_mut()
+                                .consensus_direct
+                                .send_response(channel, ConsensusDirectResponse { accepted: false })
+                                .is_err()
+                            {
+                                tracing::warn!(%peer, "failed to send consensus direct rejection");
+                            }
                         }
                     }
                 }
@@ -747,26 +952,39 @@ impl NetworkService {
                     request, channel, ..
                 } => {
                     metrics::counter!("n42_block_direct_received").increment(1);
-                    // Verify sender is a known validator
-                    if let Some(&validator_idx) = self.peer_validator_map.get(&peer) {
+                    // Accept direct push only from peers that have already proved
+                    // control of a current validator key via a signed consensus message.
+                    if let Some(&validator_idx) = self.authenticated_peer_validator_map.get(&peer) {
                         tracing::debug!(%peer, validator_index = validator_idx, bytes = request.data.len(), "received block via direct push from validator");
                         self.emit_event(NetworkEvent::BlockAnnouncement {
                             source: peer,
                             data: request.data,
                         });
-                        let _ = self
+                        if self
                             .swarm
                             .behaviour_mut()
                             .block_direct
-                            .send_response(channel, BlockDirectResponse { accepted: true });
+                            .send_response(channel, BlockDirectResponse { accepted: true })
+                            .is_err()
+                        {
+                            tracing::warn!(%peer, "failed to send block direct ACK");
+                        }
                     } else {
-                        tracing::warn!(%peer, bytes = request.data.len(), "rejected block direct push from non-validator peer");
+                        tracing::warn!(
+                            %peer,
+                            bytes = request.data.len(),
+                            "rejected block direct push from unauthenticated peer"
+                        );
                         metrics::counter!("n42_block_direct_rejected_non_validator").increment(1);
-                        let _ = self
+                        if self
                             .swarm
                             .behaviour_mut()
                             .block_direct
-                            .send_response(channel, BlockDirectResponse { accepted: false });
+                            .send_response(channel, BlockDirectResponse { accepted: false })
+                            .is_err()
+                        {
+                            tracing::warn!(%peer, "failed to send block direct rejection");
+                        }
                     }
                 }
                 libp2p::request_response::Message::Response { .. } => {
@@ -794,24 +1012,32 @@ impl NetworkService {
                     let count = request.txs.len();
                     metrics::counter!("n42_tx_forward_batches_received").increment(1);
                     metrics::counter!("n42_tx_forward_txs_received").increment(count as u64);
-                    if self.peer_validator_map.contains_key(&peer) {
+                    if self.authenticated_peer_validator_map.contains_key(&peer) {
                         tracing::debug!(%peer, count, "received forwarded tx batch from validator");
                         self.emit_event(NetworkEvent::TxForwardReceived {
                             source: peer,
                             txs: request.txs,
                         });
-                        let _ = self
+                        if self
                             .swarm
                             .behaviour_mut()
                             .tx_forward
-                            .send_response(channel, TxForwardResponse { accepted: true });
+                            .send_response(channel, TxForwardResponse { accepted: true })
+                            .is_err()
+                        {
+                            tracing::warn!(%peer, "failed to send tx forward ACK");
+                        }
                     } else {
-                        tracing::warn!(%peer, count, "rejected tx forward from non-validator peer");
-                        let _ = self
+                        tracing::warn!(%peer, count, "rejected tx forward from unauthenticated peer");
+                        if self
                             .swarm
                             .behaviour_mut()
                             .tx_forward
-                            .send_response(channel, TxForwardResponse { accepted: false });
+                            .send_response(channel, TxForwardResponse { accepted: false })
+                            .is_err()
+                        {
+                            tracing::warn!(%peer, "failed to send tx forward rejection");
+                        }
                     }
                 }
                 libp2p::request_response::Message::Response { .. } => {}
@@ -894,14 +1120,22 @@ impl NetworkService {
     /// BlockData is critical for follower import pipeline — deprioritizing it
     /// delays block import → delays voting → delays commit.
     fn emit_event(&mut self, event: NetworkEvent) {
-        let reliable = matches!(
-            event,
+        let reliable_consensus = matches!(
+            &event,
             NetworkEvent::ConsensusMessage { .. } | NetworkEvent::BlockAnnouncement { .. }
         );
-        let tx = if matches!(
-            event,
-            NetworkEvent::ConsensusMessage { .. } | NetworkEvent::BlockAnnouncement { .. }
-        ) {
+        let reliable_data = matches!(
+            &event,
+            NetworkEvent::VerificationReceipt { .. }
+                | NetworkEvent::BlobSidecarReceived { .. }
+                | NetworkEvent::PeerConnected(_)
+                | NetworkEvent::PeerDisconnected(_)
+                | NetworkEvent::TxForwardReceived { .. }
+                | NetworkEvent::SyncRequest { .. }
+                | NetworkEvent::SyncResponse { .. }
+                | NetworkEvent::SyncRequestFailed { .. }
+        );
+        let tx = if reliable_consensus {
             &self.consensus_event_tx
         } else {
             &self.event_tx
@@ -909,8 +1143,10 @@ impl NetworkService {
         match tx.try_send(event) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(event)) => {
-                if reliable {
+                if reliable_consensus {
                     self.pending_reliable_events.push_back(event);
+                } else if reliable_data {
+                    self.pending_data_events.push_back(event);
                 } else {
                     metrics::counter!("n42_network_event_drops_total").increment(1);
                     tracing::warn!("event channel full, dropping event");
@@ -1044,6 +1280,15 @@ impl NetworkService {
                 tracing::debug!(%peer_id, trusted, addrs = addrs.len(), "registering peer");
                 self.reconnection.register_peer(peer_id, addrs, trusted);
             }
+            NetworkCommand::AuthenticateValidatorPeer {
+                peer_id,
+                validator_index,
+            } => {
+                self.authenticate_validator_peer(peer_id, validator_index);
+            }
+            NetworkCommand::ReplaceExpectedValidatorPeers { peers } => {
+                self.replace_expected_validator_peers(peers);
+            }
             NetworkCommand::AddKademliaPeer { peer_id, addrs } => {
                 if let Some(kad) = self.swarm.behaviour_mut().kademlia.as_mut() {
                     for addr in &addrs {
@@ -1059,16 +1304,17 @@ impl NetworkService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::deterministic_validator_peer_id;
 
     /// Creates a test handle with both normal and priority channels.
     /// Returns (handle, normal_rx, priority_rx).
     fn test_handle() -> (
         NetworkHandle,
-        mpsc::UnboundedReceiver<NetworkCommand>,
-        mpsc::UnboundedReceiver<NetworkCommand>,
+        mpsc::Receiver<NetworkCommand>,
+        mpsc::Receiver<NetworkCommand>,
     ) {
-        let (tx, rx) = mpsc::unbounded_channel();
-        let (ptx, prx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(8);
+        let (ptx, prx) = mpsc::channel(8);
         (NetworkHandle::new(tx, ptx), rx, prx)
     }
 
@@ -1112,6 +1358,17 @@ mod tests {
     }
 
     #[test]
+    fn test_handle_channel_full_returns_error() {
+        let (handle, _rx, mut prx) = test_handle();
+        for _ in 0..8 {
+            handle.announce_block(vec![1]).unwrap();
+        }
+        let result = handle.announce_block(vec![2]);
+        assert!(matches!(result.unwrap_err(), NetworkError::ChannelFull));
+        while prx.try_recv().is_ok() {}
+    }
+
+    #[test]
     fn test_handle_validator_peer_map() {
         let (handle, _rx, _prx) = test_handle();
         assert!(handle.validator_peer(0).is_none());
@@ -1139,6 +1396,40 @@ mod tests {
                 assert!(trusted);
             }
             other => panic!("expected RegisterPeer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_handle_authenticate_validator_peer() {
+        let (handle, mut rx, _prx) = test_handle();
+        let peer = PeerId::random();
+        handle.authenticate_validator_peer(peer, 7).unwrap();
+        match rx.try_recv().unwrap() {
+            NetworkCommand::AuthenticateValidatorPeer {
+                peer_id,
+                validator_index,
+            } => {
+                assert_eq!(peer_id, peer);
+                assert_eq!(validator_index, 7);
+            }
+            other => panic!("expected AuthenticateValidatorPeer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_handle_replace_expected_validator_peers() {
+        let (handle, mut rx, _prx) = test_handle();
+        let peer = PeerId::random();
+        let mut peers = HashMap::new();
+        peers.insert(7, peer);
+        handle
+            .replace_expected_validator_peers(peers.clone())
+            .unwrap();
+        match rx.try_recv().unwrap() {
+            NetworkCommand::ReplaceExpectedValidatorPeers { peers: received } => {
+                assert_eq!(received, peers);
+            }
+            other => panic!("expected ReplaceExpectedValidatorPeers, got {other:?}"),
         }
     }
 
@@ -1196,5 +1487,25 @@ mod tests {
             }
             other => panic!("expected SendBlockDirect, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_claimed_validator_index_parses_expected_format() {
+        assert_eq!(claimed_validator_index("n42/1.0.0/v7"), Some(7));
+        assert_eq!(claimed_validator_index("n42/1.0.0"), None);
+        assert_eq!(claimed_validator_index("n42/1.0.0/vbad"), None);
+    }
+
+    #[test]
+    fn test_deterministic_validator_peer_id_is_stable() {
+        let peer_id = deterministic_validator_peer_id(3).expect("deterministic peer id");
+        assert_eq!(
+            deterministic_validator_peer_id(3).expect("repeat derivation"),
+            peer_id
+        );
+        assert_ne!(
+            deterministic_validator_peer_id(4).expect("different validator"),
+            peer_id
+        );
     }
 }

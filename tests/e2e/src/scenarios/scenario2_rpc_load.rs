@@ -41,22 +41,24 @@ pub async fn run(binary_path: std::path::PathBuf) -> eyre::Result<()> {
     let max_priority_fee_per_gas = gas_price / 10;
 
     // Send 25 tx/sec for 100 seconds = 2500 transactions.
-    let tx_hashes = tx_engine.send_transfers_at_rate(
-        &node.rpc,
-        25,
-        100,
-        max_fee_per_gas,
-        max_priority_fee_per_gas,
-    ).await?;
+    let tx_hashes = tx_engine
+        .send_transfers_at_rate(
+            &node.rpc,
+            25,
+            100,
+            max_fee_per_gas,
+            max_priority_fee_per_gas,
+        )
+        .await?;
 
-    info!(total = tx_hashes.len(), "all transactions sent, waiting for receipts...");
+    info!(
+        total = tx_hashes.len(),
+        "all transactions sent, waiting for receipts..."
+    );
 
     // Wait for all receipts (generous timeout since blocks are 4s apart).
-    let receipts = TxEngine::wait_for_all_receipts(
-        &node.rpc,
-        &tx_hashes,
-        Duration::from_secs(300),
-    ).await?;
+    let receipts =
+        TxEngine::wait_for_all_receipts(&node.rpc, &tx_hashes, Duration::from_secs(300)).await?;
 
     let failed = receipts.iter().filter(|r| r.status != 1).count();
     if failed > 0 {
@@ -67,7 +69,10 @@ pub async fn run(binary_path: std::path::PathBuf) -> eyre::Result<()> {
     let mut seen_hashes = std::collections::HashSet::new();
     for receipt in &receipts {
         if !seen_hashes.insert(receipt.transaction_hash) {
-            return Err(eyre::eyre!("duplicate transaction hash: {:?}", receipt.transaction_hash));
+            return Err(eyre::eyre!(
+                "duplicate transaction hash: {:?}",
+                receipt.transaction_hash
+            ));
         }
     }
     info!("PASS: no duplicate transaction hashes");

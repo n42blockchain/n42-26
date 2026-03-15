@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
-use crate::context::{lock_or_recover, MAX_PENDING_PACKETS};
+use crate::context::{MAX_PENDING_PACKETS, lock_or_recover};
 
 /// Detects whether `data` uses the V2 wire format (magic bytes `N2` = `0x4E 0x32`).
 ///
@@ -31,7 +31,9 @@ pub(crate) async fn connect_quic(
 > {
     let mut crypto = rustls::ClientConfig::builder()
         .dangerous()
-        .with_custom_certificate_verifier(Arc::new(PinnedCertVerification { expected_hash: expected_cert_hash }))
+        .with_custom_certificate_verifier(Arc::new(PinnedCertVerification {
+            expected_hash: expected_cert_hash,
+        }))
         .with_no_client_auth();
     crypto.alpn_protocols = vec![b"n42-mobile/1".to_vec()];
 
@@ -105,11 +107,7 @@ fn enqueue_packet(
 }
 
 /// Processes a cache sync payload (after optional decompression).
-fn handle_cache_sync(
-    payload: &[u8],
-    code_cache: &Arc<Mutex<CodeCache>>,
-    label: &str,
-) {
+fn handle_cache_sync(payload: &[u8], code_cache: &Arc<Mutex<CodeCache>>, label: &str) {
     let msg = if is_v2_wire_format(payload) {
         decode_cache_sync(payload).map_err(|e| format!("V2: {e}"))
     } else {
@@ -119,7 +117,10 @@ fn handle_cache_sync(
         Ok(msg) => {
             let (added, evicted) = apply_cache_sync(msg, code_cache);
             let cache_size = lock_or_recover(code_cache).len();
-            info!(added, evicted, cache_size, "applied {} cache sync message", label);
+            info!(
+                added,
+                evicted, cache_size, "applied {} cache sync message", label
+            );
         }
         Err(e) => warn!("failed to decode CacheSyncMessage ({}): {}", label, e),
     }
@@ -144,53 +145,50 @@ pub(crate) async fn recv_loop(
 
     loop {
         match connection.accept_uni().await {
-            Ok(mut stream) => {
-                match stream.read_to_end(MAX_STREAM_SIZE).await {
-                    Ok(data) if !data.is_empty() => {
-                        let msg_type = data[0];
-                        let payload = &data[1..];
+            Ok(mut stream) => match stream.read_to_end(MAX_STREAM_SIZE).await {
+                Ok(data) if !data.is_empty() => {
+                    let msg_type = data[0];
+                    let payload = &data[1..];
 
-                        match msg_type {
-                            0x01 => {
-                                debug!(size = payload.len(), "received verification packet");
-                                enqueue_packet(payload.to_vec(), &pending_packets, &dropped_count);
-                            }
-                            0x03 => {
-                                match zstd::bulk::decompress(payload, MAX_STREAM_SIZE) {
-                                    Ok(decompressed) => {
-                                        debug!(
-                                            compressed = payload.len(),
-                                            decompressed = decompressed.len(),
-                                            "received verification packet (zstd)"
-                                        );
-                                        enqueue_packet(decompressed, &pending_packets, &dropped_count);
-                                    }
-                                    Err(e) => warn!("zstd decompress failed: {}", e),
-                                }
-                            }
-                            0x02 => {
-                                const MAX_CACHE_SYNC_SIZE: usize = 16 * 1024 * 1024;
-                                if payload.len() > MAX_CACHE_SYNC_SIZE {
-                                    warn!("CacheSyncMessage too large ({} bytes), dropping", payload.len());
-                                } else {
-                                    handle_cache_sync(payload, &code_cache, "uncompressed");
-                                }
-                            }
-                            0x04 => {
-                                match zstd::bulk::decompress(payload, MAX_STREAM_SIZE) {
-                                    Ok(decompressed) => {
-                                        handle_cache_sync(&decompressed, &code_cache, "compressed");
-                                    }
-                                    Err(e) => warn!("zstd decompress CacheSync failed: {}", e),
-                                }
-                            }
-                            _ => warn!(msg_type, "unknown message type from StarHub"),
+                    match msg_type {
+                        0x01 => {
+                            debug!(size = payload.len(), "received verification packet");
+                            enqueue_packet(payload.to_vec(), &pending_packets, &dropped_count);
                         }
+                        0x03 => match zstd::bulk::decompress(payload, MAX_STREAM_SIZE) {
+                            Ok(decompressed) => {
+                                debug!(
+                                    compressed = payload.len(),
+                                    decompressed = decompressed.len(),
+                                    "received verification packet (zstd)"
+                                );
+                                enqueue_packet(decompressed, &pending_packets, &dropped_count);
+                            }
+                            Err(e) => warn!("zstd decompress failed: {}", e),
+                        },
+                        0x02 => {
+                            const MAX_CACHE_SYNC_SIZE: usize = 16 * 1024 * 1024;
+                            if payload.len() > MAX_CACHE_SYNC_SIZE {
+                                warn!(
+                                    "CacheSyncMessage too large ({} bytes), dropping",
+                                    payload.len()
+                                );
+                            } else {
+                                handle_cache_sync(payload, &code_cache, "uncompressed");
+                            }
+                        }
+                        0x04 => match zstd::bulk::decompress(payload, MAX_STREAM_SIZE) {
+                            Ok(decompressed) => {
+                                handle_cache_sync(&decompressed, &code_cache, "compressed");
+                            }
+                            Err(e) => warn!("zstd decompress CacheSync failed: {}", e),
+                        },
+                        _ => warn!(msg_type, "unknown message type from StarHub"),
                     }
-                    Ok(_) => debug!("received empty stream, skipping"),
-                    Err(e) => warn!("stream read error: {}", e),
                 }
-            }
+                Ok(_) => debug!("received empty stream, skipping"),
+                Err(e) => warn!("stream read error: {}", e),
+            },
             Err(e) => {
                 warn!("connection closed: {}", e);
                 break;

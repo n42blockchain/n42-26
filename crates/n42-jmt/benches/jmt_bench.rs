@@ -1,6 +1,6 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId};
 use alloy_primitives::{Address, B256, U256};
-use n42_execution::{StateDiff, AccountDiff, AccountChangeType, ValueChange};
+use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
+use n42_execution::{AccountChangeType, AccountDiff, StateDiff, ValueChange};
 use n42_jmt::ShardedJmt;
 use std::collections::BTreeMap;
 
@@ -16,13 +16,23 @@ fn make_diff(n: usize, slots_per_account: usize) -> StateDiff {
                 ValueChange::new(U256::from(s), U256::from(s + i + 1)),
             );
         }
-        accounts.insert(addr, AccountDiff {
-            change_type: if i % 10 == 0 { AccountChangeType::Created } else { AccountChangeType::Modified },
-            balance: Some(ValueChange::new(U256::from(1000u64), U256::from(1000u64 + i as u64))),
-            nonce: Some(ValueChange::new(i as u64, i as u64 + 1)),
-            code_change: None,
-            storage,
-        });
+        accounts.insert(
+            addr,
+            AccountDiff {
+                change_type: if i % 10 == 0 {
+                    AccountChangeType::Created
+                } else {
+                    AccountChangeType::Modified
+                },
+                balance: Some(ValueChange::new(
+                    U256::from(1000u64),
+                    U256::from(1000u64 + i as u64),
+                )),
+                nonce: Some(ValueChange::new(i as u64, i as u64 + 1)),
+                code_change: None,
+                storage,
+            },
+        );
     }
     StateDiff { accounts }
 }
@@ -48,7 +58,10 @@ fn bench_apply_diff(c: &mut Criterion) {
     for &(accounts, slots) in &[(1_000, 5), (10_000, 2), (5_000, 10)] {
         let diff = make_diff(accounts, slots);
         group.bench_with_input(
-            BenchmarkId::new(format!("{}accts_{}slots", accounts, slots), accounts * (1 + slots)),
+            BenchmarkId::new(
+                format!("{}accts_{}slots", accounts, slots),
+                accounts * (1 + slots),
+            ),
             &diff,
             |b, diff| {
                 b.iter(|| {

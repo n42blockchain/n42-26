@@ -1,13 +1,13 @@
+mod decision;
+mod pacemaker;
+mod proposal;
 pub mod quorum;
 mod round;
-mod pacemaker;
 mod state_machine;
-mod proposal;
-mod voting;
-mod decision;
 mod timeout;
+mod voting;
 
-pub use quorum::{VoteCollector, TimeoutCollector};
-pub use round::{RoundState, Phase};
 pub use pacemaker::Pacemaker;
+pub use quorum::{TimeoutCollector, VoteCollector};
+pub use round::{Phase, RoundState};
 pub use state_machine::{ConsensusEngine, ConsensusEvent, EngineOutput, ViewTiming};

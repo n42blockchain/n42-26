@@ -1,5 +1,5 @@
 use alloy_primitives::{Address, B256, U256};
-use alloy_sol_types::{sol, SolCall, SolValue};
+use alloy_sol_types::{SolCall, SolValue, sol};
 use tracing::info;
 
 use crate::rpc_client::RpcClient;
@@ -76,12 +76,12 @@ impl Erc20Manager {
 
         rpc.send_raw_transaction(&raw_tx).await?;
 
-        let receipt = rpc.wait_for_receipt(
-            tx_hash,
-            std::time::Duration::from_secs(120),
-        ).await?;
+        let receipt = rpc
+            .wait_for_receipt(tx_hash, std::time::Duration::from_secs(120))
+            .await?;
 
-        let contract_address = receipt.contract_address
+        let contract_address = receipt
+            .contract_address
             .ok_or_else(|| eyre::eyre!("deployment receipt missing contract address"))?;
 
         info!(%contract_address, "ERC-20 contract deployed");

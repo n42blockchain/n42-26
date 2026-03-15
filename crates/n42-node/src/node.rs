@@ -6,13 +6,12 @@ use reth_chainspec::ChainSpec;
 use reth_ethereum_engine_primitives::EthEngineTypes;
 use reth_ethereum_primitives::EthPrimitives;
 use reth_node_builder::{
+    Node, NodeAdapter,
     components::{BasicPayloadServiceBuilder, ComponentsBuilder},
     node::{FullNodeTypes, NodeTypes},
-    Node, NodeAdapter,
 };
 use reth_node_ethereum::node::{
-    EthereumAddOns, EthereumEthApiBuilder, EthereumEngineValidatorBuilder,
-    EthereumNetworkBuilder,
+    EthereumAddOns, EthereumEngineValidatorBuilder, EthereumEthApiBuilder, EthereumNetworkBuilder,
 };
 use reth_provider::EthStorage;
 use std::sync::Arc;
@@ -60,11 +59,13 @@ where
             .node_types::<N>()
             .pool(N42PoolBuilder::default())
             .executor(N42ExecutorBuilder::default())
-            .payload(BasicPayloadServiceBuilder::new(
-                N42PayloadBuilder::new(self.consensus_state.clone()),
-            ))
+            .payload(BasicPayloadServiceBuilder::new(N42PayloadBuilder::new(
+                self.consensus_state.clone(),
+            )))
             .network(EthereumNetworkBuilder::default())
-            .consensus(N42ConsensusBuilder::default())
+            .consensus(N42ConsensusBuilder::new(Some(
+                self.consensus_state.validator_set.clone(),
+            )))
     }
 
     fn add_ons(&self) -> Self::AddOns {

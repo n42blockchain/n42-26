@@ -1,7 +1,7 @@
-use alloy_primitives::hex;
 use alloy_primitives::B256;
-use blst::min_pk::{PublicKey, SecretKey, Signature};
+use alloy_primitives::hex;
 use blst::BLST_ERROR;
+use blst::min_pk::{PublicKey, SecretKey, Signature};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zeroize::Zeroize;
@@ -143,7 +143,9 @@ impl<'de> Deserialize<'de> for BlsPublicKey {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let bytes: Vec<u8> = Deserialize::deserialize(deserializer)?;
         if bytes.len() != 48 {
-            return Err(serde::de::Error::custom("expected 48 bytes for BLS public key"));
+            return Err(serde::de::Error::custom(
+                "expected 48 bytes for BLS public key",
+            ));
         }
         let mut arr = [0u8; 48];
         arr.copy_from_slice(&bytes);
@@ -200,7 +202,9 @@ impl<'de> Deserialize<'de> for BlsSignature {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let bytes: Vec<u8> = Deserialize::deserialize(deserializer)?;
         if bytes.len() != 96 {
-            return Err(serde::de::Error::custom("expected 96 bytes for BLS signature"));
+            return Err(serde::de::Error::custom(
+                "expected 96 bytes for BLS signature",
+            ));
         }
         let mut arr = [0u8; 96];
         arr.copy_from_slice(&bytes);
@@ -228,7 +232,8 @@ mod tests {
         let pk = sk.public_key();
         let message = b"hello world";
         let sig = sk.sign(message);
-        pk.verify(message, &sig).expect("verification should succeed");
+        pk.verify(message, &sig)
+            .expect("verification should succeed");
     }
 
     #[test]
@@ -278,7 +283,10 @@ mod tests {
 
         let bytes = pk.to_bytes();
         let pk2 = BlsPublicKey::from_bytes(&bytes).expect("from_bytes should succeed");
-        assert_eq!(pk, pk2, "public key should survive to_bytes/from_bytes roundtrip");
+        assert_eq!(
+            pk, pk2,
+            "public key should survive to_bytes/from_bytes roundtrip"
+        );
     }
 
     #[test]
@@ -288,7 +296,10 @@ mod tests {
 
         let bytes = sig.to_bytes();
         let sig2 = BlsSignature::from_bytes(&bytes).expect("from_bytes should succeed");
-        assert_eq!(sig, sig2, "signature should survive to_bytes/from_bytes roundtrip");
+        assert_eq!(
+            sig, sig2,
+            "signature should survive to_bytes/from_bytes roundtrip"
+        );
     }
 
     #[test]
@@ -327,7 +338,8 @@ mod tests {
 
         // Verify the generated key can sign and verify
         let sig = sk1.sign(b"test");
-        sk1.public_key().verify(b"test", &sig)
+        sk1.public_key()
+            .verify(b"test", &sig)
             .expect("key_gen key should produce valid signatures");
     }
 
@@ -353,12 +365,18 @@ mod tests {
         let short_bytes: Vec<u8> = vec![0u8; 32];
         let encoded = bincode::serialize(&short_bytes).unwrap();
         let result: Result<BlsPublicKey, _> = bincode::deserialize(&encoded);
-        assert!(result.is_err(), "deserialize with 32 bytes should fail for public key");
+        assert!(
+            result.is_err(),
+            "deserialize with 32 bytes should fail for public key"
+        );
 
         // Signature: expects 96 bytes, give 48
         let short_sig: Vec<u8> = vec![0u8; 48];
         let encoded = bincode::serialize(&short_sig).unwrap();
         let result: Result<BlsSignature, _> = bincode::deserialize(&encoded);
-        assert!(result.is_err(), "deserialize with 48 bytes should fail for signature");
+        assert!(
+            result.is_err(),
+            "deserialize with 48 bytes should fail for signature"
+        );
     }
 }

@@ -1,12 +1,12 @@
-use n42_chainspec::ConsensusConfig;
+use arc_swap::ArcSwapOption;
 use n42_consensus::{N42Consensus, ValidatorSet};
 use n42_execution::N42EvmConfig;
 use reth_chainspec::{ChainSpec, EthChainSpec, EthereumHardforks};
 use reth_ethereum_primitives::EthPrimitives;
 use reth_node_builder::{
+    BuilderContext,
     components::{ConsensusBuilder, ExecutorBuilder},
     node::{FullNodeTypes, NodeTypes},
-    BuilderContext,
 };
 use std::sync::Arc;
 use tracing::info;
@@ -33,40 +33,44 @@ where
 /// Loads the validator set from `ConsensusConfig`. If no validators are configured
 /// (e.g. a standard Ethereum chainspec), falls back to N42Consensus without a
 /// validator set (QC verification is skipped).
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 #[non_exhaustive]
-pub struct N42ConsensusBuilder;
+pub struct N42ConsensusBuilder {
+    validator_set: Option<Arc<ArcSwapOption<ValidatorSet>>>,
+}
+
+impl N42ConsensusBuilder {
+    pub fn new(validator_set: Option<Arc<ArcSwapOption<ValidatorSet>>>) -> Self {
+        Self { validator_set }
+    }
+}
 
 impl<Node> ConsensusBuilder<Node> for N42ConsensusBuilder
 where
     Node: FullNodeTypes<
-        Types: NodeTypes<
-            ChainSpec: EthChainSpec + EthereumHardforks,
-            Primitives = EthPrimitives,
-        >,
+        Types: NodeTypes<ChainSpec: EthChainSpec + EthereumHardforks, Primitives = EthPrimitives>,
     >,
 {
     type Consensus = Arc<N42Consensus<<Node::Types as NodeTypes>::ChainSpec>>;
 
     async fn build_consensus(self, ctx: &BuilderContext<Node>) -> eyre::Result<Self::Consensus> {
         let chain_spec = ctx.chain_spec();
-        let consensus_config = ConsensusConfig::dev();
 
-        if consensus_config.initial_validators.is_empty() {
-            info!(target: "n42::consensus", "No initial validators configured, QC verification disabled");
-            Ok(Arc::new(N42Consensus::new(chain_spec)))
-        } else {
-            let validator_set = ValidatorSet::new(
-                &consensus_config.initial_validators,
-                consensus_config.fault_tolerance,
-            );
+        if let Some(validator_set) = self.validator_set {
+            let current = validator_set.load_full();
             info!(
                 target: "n42::consensus",
-                validator_count = validator_set.len(),
-                fault_tolerance = consensus_config.fault_tolerance,
+                validator_count = current.as_ref().map(|vs| vs.len()).unwrap_or(0),
+                fault_tolerance = current.as_ref().map(|vs| vs.fault_tolerance()).unwrap_or(0),
                 "Loaded validator set for consensus"
             );
-            Ok(Arc::new(N42Consensus::with_validator_set(chain_spec, validator_set)))
+            Ok(Arc::new(N42Consensus::with_validator_set_store(
+                chain_spec,
+                validator_set,
+            )))
+        } else {
+            info!(target: "n42::consensus", "No initial validators configured, QC verification disabled");
+            Ok(Arc::new(N42Consensus::new(chain_spec)))
         }
     }
 }
@@ -94,9 +98,8 @@ mod tests {
     }
 
     #[test]
-    fn test_consensus_builder_clone_copy() {
-        let builder = N42ConsensusBuilder;
-        let _ = (builder.clone(), builder);
+    fn test_consensus_builder_clone() {
+        let builder = N42ConsensusBuilder::default();
+        let _ = builder.clone();
     }
-
 }

@@ -91,10 +91,7 @@ where
     fn storage(&mut self, address: Address, index: U256) -> Result<U256, Self::Error> {
         match self.mv.read_storage(self.tx_idx, address, index) {
             MvRead::Value(src_tx, value) => {
-                self.record_read(
-                    LocationKey::Storage(address, index),
-                    ReadOrigin::Tx(src_tx),
-                );
+                self.record_read(LocationKey::Storage(address, index), ReadOrigin::Tx(src_tx));
                 Ok(value)
             }
             MvRead::NotFound => {

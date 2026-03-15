@@ -43,27 +43,20 @@ pub enum ConsensusError {
 
     /// The quorum certificate is invalid (bad signature or insufficient signers).
     #[error("invalid quorum certificate for view {view}: {reason}")]
-    InvalidQC {
-        view: ViewNumber,
-        reason: String,
-    },
+    InvalidQC { view: ViewNumber, reason: String },
 
     /// The timeout certificate is invalid.
     #[error("invalid timeout certificate for view {view}: {reason}")]
-    InvalidTC {
-        view: ViewNumber,
-        reason: String,
-    },
+    InvalidTC { view: ViewNumber, reason: String },
 
     /// The validator index is out of bounds.
     #[error("unknown validator index {index}, set size is {set_size}")]
-    UnknownValidator {
-        index: u32,
-        set_size: u32,
-    },
+    UnknownValidator { index: u32, set_size: u32 },
 
     /// The proposal's justify_qc does not extend the locked QC.
-    #[error("safety violation: proposal QC view {qc_view} does not extend locked QC view {locked_view}")]
+    #[error(
+        "safety violation: proposal QC view {qc_view} does not extend locked QC view {locked_view}"
+    )]
     SafetyViolation {
         qc_view: ViewNumber,
         locked_view: ViewNumber,
@@ -88,6 +81,20 @@ pub enum ConsensusError {
     #[error("epoch schedule must not be empty")]
     EpochScheduleEmpty,
 
+    /// Validator-set parameters do not satisfy the BFT fault-tolerance bound.
+    #[error(
+        "invalid validator set parameters: fault_tolerance ({fault_tolerance}) exceeds max ({max_fault_tolerance}) for {validator_count} validators"
+    )]
+    InvalidValidatorSetParams {
+        validator_count: u32,
+        fault_tolerance: u32,
+        max_fault_tolerance: u32,
+    },
+
+    /// The local validator key is not present in the active epoch's validator set.
+    #[error("local validator key is not present in validator set for epoch {epoch}")]
+    LocalValidatorNotInSet { epoch: u64 },
+
     /// Batch verification input exceeds the maximum allowed size.
     #[error("batch verification size {size} exceeds maximum {max}")]
     BatchTooLarge { size: usize, max: usize },
@@ -105,39 +112,68 @@ mod tests {
     fn test_error_display_formats() {
         let cases: Vec<(ConsensusError, &[&str])> = vec![
             (
-                ConsensusError::InvalidSignature { view: 5, validator_index: 3 },
+                ConsensusError::InvalidSignature {
+                    view: 5,
+                    validator_index: 3,
+                },
                 &["invalid BLS signature", "3", "5"],
             ),
             (
-                ConsensusError::InvalidProposer { view: 10, expected: 1, actual: 2 },
+                ConsensusError::InvalidProposer {
+                    view: 10,
+                    expected: 1,
+                    actual: 2,
+                },
                 &["invalid proposer", "1", "2", "10"],
             ),
             (
-                ConsensusError::InsufficientVotes { view: 1, have: 2, need: 3 },
+                ConsensusError::InsufficientVotes {
+                    view: 1,
+                    have: 2,
+                    need: 3,
+                },
                 &["insufficient votes", "2", "3"],
             ),
             (
-                ConsensusError::ViewMismatch { current: 5, received: 10 },
+                ConsensusError::ViewMismatch {
+                    current: 5,
+                    received: 10,
+                },
                 &["view mismatch", "5", "10"],
             ),
             (
-                ConsensusError::DuplicateVote { view: 1, validator_index: 0 },
+                ConsensusError::DuplicateVote {
+                    view: 1,
+                    validator_index: 0,
+                },
                 &["duplicate vote", "0"],
             ),
             (
-                ConsensusError::InvalidQC { view: 3, reason: "bad sig".into() },
+                ConsensusError::InvalidQC {
+                    view: 3,
+                    reason: "bad sig".into(),
+                },
                 &["invalid quorum certificate", "bad sig", "3"],
             ),
             (
-                ConsensusError::InvalidTC { view: 7, reason: "too few".into() },
+                ConsensusError::InvalidTC {
+                    view: 7,
+                    reason: "too few".into(),
+                },
                 &["invalid timeout certificate", "too few", "7"],
             ),
             (
-                ConsensusError::UnknownValidator { index: 99, set_size: 4 },
+                ConsensusError::UnknownValidator {
+                    index: 99,
+                    set_size: 4,
+                },
                 &["unknown validator", "99", "4"],
             ),
             (
-                ConsensusError::SafetyViolation { qc_view: 1, locked_view: 5 },
+                ConsensusError::SafetyViolation {
+                    qc_view: 1,
+                    locked_view: 5,
+                },
                 &["safety violation", "1", "5"],
             ),
             (
@@ -152,7 +188,12 @@ mod tests {
         for (err, keywords) in &cases {
             let s = err.to_string();
             for kw in *keywords {
-                assert!(s.contains(kw), "Display for {:?} should contain '{}'", err, kw);
+                assert!(
+                    s.contains(kw),
+                    "Display for {:?} should contain '{}'",
+                    err,
+                    kw
+                );
             }
         }
     }

@@ -16,12 +16,12 @@ mod context;
 mod transport;
 
 use context::{
-    DEFAULT_CODE_CACHE_CAPACITY, LastVerifyInfo, QuicConnection, VerifyStats,
-    lock_or_recover, safe_cint,
+    DEFAULT_CODE_CACHE_CAPACITY, LastVerifyInfo, QuicConnection, VerifyStats, lock_or_recover,
+    safe_cint,
 };
-use transport::{connect_quic, is_v2_wire_format, recv_loop};
 #[cfg(test)]
 use transport::apply_cache_sync;
+use transport::{connect_quic, is_v2_wire_format, recv_loop};
 
 pub use context::VerifierContext;
 
@@ -86,9 +86,17 @@ impl FfiError {
                 if let Ok(cmsg) = std::ffi::CString::new(msg.as_str()) {
                     unsafe {
                         unsafe extern "C" {
-                            fn __android_log_write(prio: i32, tag: *const c_char, text: *const c_char) -> i32;
+                            fn __android_log_write(
+                                prio: i32,
+                                tag: *const c_char,
+                                text: *const c_char,
+                            ) -> i32;
                         }
-                        __android_log_write(6, tag.as_ptr() as *const c_char, cmsg.as_ptr() as *const c_char); // 6 = ERROR
+                        __android_log_write(
+                            6,
+                            tag.as_ptr() as *const c_char,
+                            cmsg.as_ptr() as *const c_char,
+                        ); // 6 = ERROR
                     }
                 }
             }
@@ -205,7 +213,12 @@ pub unsafe extern "C" fn n42_connect(
     // Log connection attempt details for debugging
     info!(host = %host_str, port, cert_pinned = expected_cert_hash.is_some(), "attempting QUIC connection");
     let connect_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        ctx.runtime.block_on(connect_quic(&host_str, port, &pubkey_bytes, expected_cert_hash))
+        ctx.runtime.block_on(connect_quic(
+            &host_str,
+            port,
+            &pubkey_bytes,
+            expected_cert_hash,
+        ))
     }));
     let connect_result = match connect_result {
         Ok(r) => r,
@@ -271,7 +284,11 @@ pub unsafe extern "C" fn n42_poll_packet(
             if data.len() > buf_len {
                 let need = data.len();
                 queue.push_front(data);
-                return FfiError::BufferTooSmall { need, have: buf_len }.into_code();
+                return FfiError::BufferTooSmall {
+                    need,
+                    have: buf_len,
+                }
+                .into_code();
             }
             unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), out_buf, data.len()) }
             safe_cint(data.len())
@@ -333,7 +350,14 @@ pub unsafe extern "C" fn n42_verify_and_send(
                 let mut cache = lock_or_recover(&ctx.code_cache);
                 update_cache_after_stream_verify(&packet, &mut cache);
             }
-            (block_hash, block_number, tx_count, 0usize, uncached_count, result)
+            (
+                block_hash,
+                block_number,
+                tx_count,
+                0usize,
+                uncached_count,
+                result,
+            )
         } else {
             let packet = match decode_packet(packet_bytes) {
                 Ok(p) => p,
@@ -361,7 +385,14 @@ pub unsafe extern "C" fn n42_verify_and_send(
                 let mut cache = lock_or_recover(&ctx.code_cache);
                 update_cache_after_verify(&packet, &mut cache);
             }
-            (block_hash, block_number, tx_count, witness_count, uncached_count, result)
+            (
+                block_hash,
+                block_number,
+                tx_count,
+                witness_count,
+                uncached_count,
+                result,
+            )
         };
 
     let verify_time_ms = start.elapsed().as_millis() as u64;
@@ -370,7 +401,13 @@ pub unsafe extern "C" fn n42_verify_and_send(
         .unwrap_or_default()
         .as_millis() as u64;
 
-    let receipt = sign_receipt(block_hash, block_number, result.computed_receipts_root, timestamp_ms, &ctx.signing_key);
+    let receipt = sign_receipt(
+        block_hash,
+        block_number,
+        result.computed_receipts_root,
+        timestamp_ms,
+        &ctx.signing_key,
+    );
 
     {
         let mut stats = lock_or_recover(&ctx.stats);
@@ -451,7 +488,11 @@ pub unsafe extern "C" fn n42_last_verify_info(
     };
 
     if json.len() + 1 > buf_len {
-        return FfiError::BufferTooSmall { need: json.len() + 1, have: buf_len }.into_code();
+        return FfiError::BufferTooSmall {
+            need: json.len() + 1,
+            have: buf_len,
+        }
+        .into_code();
     }
 
     unsafe {
@@ -516,7 +557,10 @@ pub unsafe extern "C" fn n42_get_stats(
     };
     let dropped = {
         let conn_guard = lock_or_recover(&ctx.connection);
-        conn_guard.as_ref().map(|c| c.dropped_count.load(Ordering::Relaxed)).unwrap_or(0)
+        conn_guard
+            .as_ref()
+            .map(|c| c.dropped_count.load(Ordering::Relaxed))
+            .unwrap_or(0)
     };
 
     let json_str = serde_json::json!({
@@ -530,7 +574,11 @@ pub unsafe extern "C" fn n42_get_stats(
     .to_string();
 
     if json_str.len() + 1 > buf_len {
-        return FfiError::BufferTooSmall { need: json_str.len() + 1, have: buf_len }.into_code();
+        return FfiError::BufferTooSmall {
+            need: json_str.len() + 1,
+            have: buf_len,
+        }
+        .into_code();
     }
 
     unsafe {
@@ -660,7 +708,7 @@ mod tests {
 
     #[test]
     fn test_apply_cache_sync() {
-        use alloy_primitives::{Bytes, B256};
+        use alloy_primitives::{B256, Bytes};
 
         let cache = Mutex::new(CodeCache::new(100));
         let h1 = B256::with_last_byte(0x01);
@@ -684,7 +732,10 @@ mod tests {
         assert_eq!(guard.len(), 2);
         drop(guard);
 
-        let msg2 = CacheSyncMessage { codes: vec![], evict_hints: vec![h1] };
+        let msg2 = CacheSyncMessage {
+            codes: vec![],
+            evict_hints: vec![h1],
+        };
         let (added2, evicted2) = apply_cache_sync(msg2, &cache);
         assert_eq!(added2, 0);
         assert_eq!(evicted2, 1);
@@ -743,16 +794,22 @@ mod tests {
     #[test]
     fn test_connect_null_ctx() {
         let host = std::ffi::CString::new("127.0.0.1").unwrap();
-        let result =
-            unsafe { n42_connect(std::ptr::null_mut(), host.as_ptr(), 9443, std::ptr::null(), 0) };
+        let result = unsafe {
+            n42_connect(
+                std::ptr::null_mut(),
+                host.as_ptr(),
+                9443,
+                std::ptr::null(),
+                0,
+            )
+        };
         assert_eq!(result, -1);
     }
 
     #[test]
     fn test_poll_null_ctx() {
         let mut buf = [0u8; 1024];
-        let result =
-            unsafe { n42_poll_packet(std::ptr::null_mut(), buf.as_mut_ptr(), buf.len()) };
+        let result = unsafe { n42_poll_packet(std::ptr::null_mut(), buf.as_mut_ptr(), buf.len()) };
         assert_eq!(result, -1);
     }
 
@@ -775,7 +832,11 @@ mod tests {
     fn test_get_stats_null_ctx() {
         let mut buf = [0u8; 1024];
         let result = unsafe {
-            n42_get_stats(std::ptr::null_mut(), buf.as_mut_ptr() as *mut c_char, buf.len())
+            n42_get_stats(
+                std::ptr::null_mut(),
+                buf.as_mut_ptr() as *mut c_char,
+                buf.len(),
+            )
         };
         assert_eq!(result, -1);
     }
@@ -804,8 +865,7 @@ mod tests {
         assert!(!ctx.is_null());
         let host = std::ffi::CString::new("127.0.0.1").unwrap();
         let fake_hash = [0u8; 16];
-        let result =
-            unsafe { n42_connect(ctx, host.as_ptr(), 9443, fake_hash.as_ptr(), 16) };
+        let result = unsafe { n42_connect(ctx, host.as_ptr(), 9443, fake_hash.as_ptr(), 16) };
         assert_eq!(result, -4);
         unsafe { n42_verifier_free(ctx) };
     }
@@ -824,8 +884,7 @@ mod tests {
     fn test_connect_null_host() {
         let ctx = unsafe { n42_verifier_init(4242) };
         assert!(!ctx.is_null());
-        let result =
-            unsafe { n42_connect(ctx, std::ptr::null(), 9443, std::ptr::null(), 0) };
+        let result = unsafe { n42_connect(ctx, std::ptr::null(), 9443, std::ptr::null(), 0) };
         assert_eq!(result, -1);
         unsafe { n42_verifier_free(ctx) };
     }
@@ -871,8 +930,7 @@ mod tests {
     fn test_last_verify_info_null_outbuf() {
         let ctx = unsafe { n42_verifier_init(4242) };
         assert!(!ctx.is_null());
-        let result =
-            unsafe { n42_last_verify_info(ctx, std::ptr::null_mut(), 1024) };
+        let result = unsafe { n42_last_verify_info(ctx, std::ptr::null_mut(), 1024) };
         assert_eq!(result, -1);
         unsafe { n42_verifier_free(ctx) };
     }
@@ -903,8 +961,7 @@ mod tests {
         let ctx = unsafe { n42_verifier_init(4242) };
         assert!(!ctx.is_null());
         let mut buf = [0u8; 2];
-        let result =
-            unsafe { n42_get_stats(ctx, buf.as_mut_ptr() as *mut c_char, buf.len()) };
+        let result = unsafe { n42_get_stats(ctx, buf.as_mut_ptr() as *mut c_char, buf.len()) };
         assert_eq!(result, -3);
         unsafe { n42_verifier_free(ctx) };
     }
@@ -949,7 +1006,9 @@ mod tests {
         use transport::PinnedCertVerification;
 
         let cert = CertificateDer::from(b"arbitrary DER data for dev mode test".to_vec());
-        let verifier = PinnedCertVerification { expected_hash: None };
+        let verifier = PinnedCertVerification {
+            expected_hash: None,
+        };
         let result = verifier.verify_server_cert(
             &cert,
             &[],
@@ -970,7 +1029,9 @@ mod tests {
         let cert_bytes = b"test certificate DER data";
         let cert = CertificateDer::from(cert_bytes.to_vec());
         let expected: [u8; 32] = Sha256::digest(cert_bytes).into();
-        let verifier = PinnedCertVerification { expected_hash: Some(expected) };
+        let verifier = PinnedCertVerification {
+            expected_hash: Some(expected),
+        };
         let result = verifier.verify_server_cert(
             &cert,
             &[],
@@ -988,7 +1049,9 @@ mod tests {
         use transport::PinnedCertVerification;
 
         let cert = CertificateDer::from(b"test certificate DER data".to_vec());
-        let verifier = PinnedCertVerification { expected_hash: Some([0xAA; 32]) };
+        let verifier = PinnedCertVerification {
+            expected_hash: Some([0xAA; 32]),
+        };
         let result = verifier.verify_server_cert(
             &cert,
             &[],
@@ -1051,7 +1114,11 @@ mod tests {
                     for _ in 0..100 {
                         let mut s = lock_or_recover(&stats);
                         s.blocks_verified += 1;
-                        if i % 2 == 0 { s.success_count += 1; } else { s.failure_count += 1; }
+                        if i % 2 == 0 {
+                            s.success_count += 1;
+                        } else {
+                            s.failure_count += 1;
+                        }
                         s.total_verify_time_ms += 10;
                     }
                 })
@@ -1107,7 +1174,8 @@ mod tests {
         let encoded = encode_cache_sync(&msg);
         assert!(is_v2_wire_format(&encoded));
 
-        let decoded = n42_mobile::code_cache::decode_cache_sync(&encoded).expect("V2 decode should succeed");
+        let decoded =
+            n42_mobile::code_cache::decode_cache_sync(&encoded).expect("V2 decode should succeed");
         assert_eq!(decoded.codes.len(), 2);
         assert_eq!(decoded.evict_hints.len(), 0);
 
@@ -1127,7 +1195,14 @@ mod tests {
         assert_eq!(FfiError::NullHost.into_code(), -1);
         assert_eq!(FfiError::InvalidData.into_code(), -1);
         assert_eq!(FfiError::NotConnected.into_code(), -2);
-        assert_eq!(FfiError::BufferTooSmall { need: 100, have: 10 }.into_code(), -3);
+        assert_eq!(
+            FfiError::BufferTooSmall {
+                need: 100,
+                have: 10
+            }
+            .into_code(),
+            -3
+        );
         assert_eq!(FfiError::InvalidCertHashLen(16).into_code(), -4);
         assert_eq!(FfiError::ConnectFailed("test".into()).into_code(), -5);
         assert_eq!(FfiError::PacketDecode("test".into()).into_code(), 1);

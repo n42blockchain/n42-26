@@ -1,7 +1,7 @@
-use super::keys::{BlsError, BlsPublicKey, BlsSignature};
 use super::DST;
-use blst::min_pk::AggregateSignature as BlstAggSig;
+use super::keys::{BlsError, BlsPublicKey, BlsSignature};
 use blst::BLST_ERROR;
+use blst::min_pk::AggregateSignature as BlstAggSig;
 
 pub struct AggregateSignature;
 
@@ -12,11 +12,9 @@ impl AggregateSignature {
             return Err(BlsError::SigningFailed);
         }
 
-        let sigs: Vec<&blst::min_pk::Signature> =
-            signatures.iter().map(|s| s.inner()).collect();
+        let sigs: Vec<&blst::min_pk::Signature> = signatures.iter().map(|s| s.inner()).collect();
 
-        let agg = BlstAggSig::aggregate(&sigs, true)
-            .map_err(|_| BlsError::SigningFailed)?;
+        let agg = BlstAggSig::aggregate(&sigs, true).map_err(|_| BlsError::SigningFailed)?;
 
         Ok(BlsSignature(agg.to_signature()))
     }
@@ -28,10 +26,11 @@ impl AggregateSignature {
         signature: &BlsSignature,
         public_keys: &[&BlsPublicKey],
     ) -> Result<(), BlsError> {
-        let pks: Vec<&blst::min_pk::PublicKey> =
-            public_keys.iter().map(|pk| pk.inner()).collect();
+        let pks: Vec<&blst::min_pk::PublicKey> = public_keys.iter().map(|pk| pk.inner()).collect();
 
-        let result = signature.inner().fast_aggregate_verify(true, message, DST, &pks);
+        let result = signature
+            .inner()
+            .fast_aggregate_verify(true, message, DST, &pks);
 
         if result != BLST_ERROR::BLST_SUCCESS {
             return Err(BlsError::VerificationFailed(result));
@@ -42,8 +41,8 @@ impl AggregateSignature {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::keys::BlsSecretKey;
+    use super::*;
 
     #[test]
     fn test_aggregate_and_verify() {
@@ -77,13 +76,19 @@ mod tests {
         let sig1 = sk1.sign(b"correct message");
         let sig2 = sk2.sign(b"correct message");
         let agg_sig = AggregateSignature::aggregate(&[&sig1, &sig2]).unwrap();
-        assert!(AggregateSignature::verify_aggregate(b"wrong message", &agg_sig, &[&pk1, &pk2]).is_err());
+        assert!(
+            AggregateSignature::verify_aggregate(b"wrong message", &agg_sig, &[&pk1, &pk2])
+                .is_err()
+        );
     }
 
     #[test]
     fn test_aggregate_empty_signatures() {
         let result = AggregateSignature::aggregate(&[]);
-        assert!(result.is_err(), "aggregating zero signatures should return error");
+        assert!(
+            result.is_err(),
+            "aggregating zero signatures should return error"
+        );
     }
 
     #[test]

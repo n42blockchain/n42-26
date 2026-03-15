@@ -6,7 +6,7 @@ use n42_network::mobile::{MobileSession, PhoneTier};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{RwLock, mpsc};
 
 fn preframe_message(type_prefix: u8, data: &Bytes) -> Bytes {
     let mut buf = BytesMut::with_capacity(1 + data.len());
@@ -174,8 +174,7 @@ fn bench_compression() -> Vec<BenchResult> {
         let compressed = zstd::bulk::compress(&data, 3).unwrap();
         let start = Instant::now();
         for _ in 0..iters {
-            let decompressed =
-                zstd::bulk::decompress(&compressed, 16 * 1024 * 1024).unwrap();
+            let decompressed = zstd::bulk::decompress(&compressed, 16 * 1024 * 1024).unwrap();
             std::hint::black_box(&decompressed);
         }
         let decompress_us = start.elapsed().as_micros() as u64;
@@ -197,7 +196,11 @@ fn bench_compression() -> Vec<BenchResult> {
             ),
         });
         results.push(BenchResult {
-            name: format!("zstd decompress {}acct ({}KB)", count, compressed_size / 1024),
+            name: format!(
+                "zstd decompress {}acct ({}KB)",
+                count,
+                compressed_size / 1024
+            ),
             iterations: iters,
             total_us: decompress_us,
             per_op_us: decompress_us as f64 / iters as f64,
@@ -270,10 +273,8 @@ fn bench_tier_sort() -> Vec<BenchResult> {
 
     for &n in &counts {
         let sessions = create_sessions(n);
-        let data: Vec<(u64, PhoneTier)> = sessions
-            .iter()
-            .map(|s| (s.session_id, s.tier()))
-            .collect();
+        let data: Vec<(u64, PhoneTier)> =
+            sessions.iter().map(|s| (s.session_id, s.tier())).collect();
 
         let start = Instant::now();
         for _ in 0..iters {
@@ -288,10 +289,7 @@ fn bench_tier_sort() -> Vec<BenchResult> {
             iterations: iters,
             total_us: sort_us,
             per_op_us: sort_us as f64 / iters as f64,
-            throughput: format!(
-                "{:.2}ms/sort",
-                sort_us as f64 / iters as f64 / 1000.0
-            ),
+            throughput: format!("{:.2}ms/sort", sort_us as f64 / iters as f64 / 1000.0),
         });
     }
     results
@@ -349,10 +347,8 @@ fn bench_arc_vs_hashmap() -> Vec<BenchResult> {
     let mut results = Vec::new();
 
     let sessions = create_sessions(n);
-    let map: HashMap<u64, Arc<MobileSession>> = sessions
-        .iter()
-        .map(|s| (s.session_id, s.clone()))
-        .collect();
+    let map: HashMap<u64, Arc<MobileSession>> =
+        sessions.iter().map(|s| (s.session_id, s.clone())).collect();
 
     // HashMap lookup pattern (pre-Phase 3)
     let start = Instant::now();
@@ -467,10 +463,7 @@ fn bench_full_broadcast_pipeline() -> Vec<BenchResult> {
             iterations: iters,
             total_us,
             per_op_us: total_us as f64 / iters as f64,
-            throughput: format!(
-                "{:.2}ms/broadcast",
-                total_us as f64 / iters as f64 / 1000.0
-            ),
+            throughput: format!("{:.2}ms/broadcast", total_us as f64 / iters as f64 / 1000.0),
         });
     }
     results
@@ -489,10 +482,7 @@ fn bench_rwlock_contention() -> Vec<BenchResult> {
 
     let sessions = create_sessions(n);
     let map: Arc<RwLock<HashMap<u64, Arc<MobileSession>>>> = Arc::new(RwLock::new(
-        sessions
-            .iter()
-            .map(|s| (s.session_id, s.clone()))
-            .collect(),
+        sessions.iter().map(|s| (s.session_id, s.clone())).collect(),
     ));
 
     // Simulate: 1 writer (registering new sessions) + 7 readers (broadcast path)
@@ -535,10 +525,7 @@ fn bench_rwlock_contention() -> Vec<BenchResult> {
     });
 
     results.push(BenchResult {
-        name: format!(
-            "RwLock 1W+7R {}K sessions (contention)",
-            n / 1000
-        ),
+        name: format!("RwLock 1W+7R {}K sessions (contention)", n / 1000),
         iterations: iters * 8,
         total_us,
         per_op_us: total_us as f64 / (iters * 8) as f64,
@@ -585,12 +572,8 @@ fn bench_bandwidth_estimation() -> Vec<BenchResult> {
 #[test]
 fn comm_stress_benchmark() {
     println!("\n{}", "=".repeat(120));
-    println!(
-        "  IDC-Phone Communication Stack — Stress Benchmark"
-    );
-    println!(
-        "  Phases 1-3 optimization validation"
-    );
+    println!("  IDC-Phone Communication Stack — Stress Benchmark");
+    println!("  Phases 1-3 optimization validation");
     println!("{}\n", "=".repeat(120));
 
     // --- Phase 1: Zero-Copy ---

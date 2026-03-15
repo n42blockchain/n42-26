@@ -21,12 +21,8 @@ pub async fn run(binary_path: std::path::PathBuf) -> eyre::Result<()> {
 
     info!("node started, monitoring block production for 400 seconds");
 
-    let (total_blocks, block_times) = poll_block_production(
-        &node.rpc,
-        Duration::from_secs(400),
-        Duration::from_secs(2),
-    )
-    .await?;
+    let (total_blocks, block_times) =
+        poll_block_production(&node.rpc, Duration::from_secs(400), Duration::from_secs(2)).await?;
 
     verify_block_production(&node.rpc, &accounts, total_blocks, &block_times).await?;
 
@@ -53,7 +49,11 @@ async fn poll_block_production(
                         block_times.push((b, now));
                     }
                     last_block = current;
-                    info!(block = current, elapsed_secs = start.elapsed().as_secs(), "new block");
+                    info!(
+                        block = current,
+                        elapsed_secs = start.elapsed().as_secs(),
+                        "new block"
+                    );
                 }
             }
             Err(e) => error!(error = %e, "failed to query block number"),
@@ -77,7 +77,10 @@ async fn verify_block_production(
             "expected ~88 blocks (70-120 range), got {total_blocks}"
         ));
     }
-    info!(total_blocks, "PASS: block count within expected range (70-120)");
+    info!(
+        total_blocks,
+        "PASS: block count within expected range (70-120)"
+    );
 
     if block_times.len() >= 2 {
         let first_time = block_times.first().unwrap().1;
@@ -90,7 +93,10 @@ async fn verify_block_production(
                 "expected ~4.5s average block interval (3-6s range), got {avg_interval:.2}s"
             ));
         }
-        info!(avg_interval_secs = format!("{avg_interval:.2}"), "PASS: block interval within range");
+        info!(
+            avg_interval_secs = format!("{avg_interval:.2}"),
+            "PASS: block interval within range"
+        );
     }
 
     for account in accounts {

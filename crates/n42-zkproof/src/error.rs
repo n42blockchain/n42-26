@@ -37,8 +37,7 @@ mod tests {
 
     #[test]
     fn test_error_is_std_error() {
-        let e: Box<dyn std::error::Error> =
-            Box::new(ZkProofError::Prover("test".to_string()));
+        let e: Box<dyn std::error::Error> = Box::new(ZkProofError::Prover("test".to_string()));
         assert!(e.to_string().contains("test"));
     }
 

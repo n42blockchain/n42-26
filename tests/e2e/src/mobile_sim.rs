@@ -21,8 +21,7 @@ impl MobileSimulator {
         let seed = format!("n42-mobile-key-{index}");
         let seed_hash = alloy_primitives::keccak256(seed.as_bytes());
         let ikm: [u8; 32] = seed_hash.0;
-        let bls_key = BlsSecretKey::key_gen(&ikm)
-            .expect("valid BLS key from deterministic IKM");
+        let bls_key = BlsSecretKey::key_gen(&ikm).expect("valid BLS key from deterministic IKM");
 
         let pubkey = bls_key.public_key();
         let pubkey_hex = hex::encode(pubkey.to_bytes());
@@ -52,7 +51,10 @@ impl MobileSimulator {
             "submitting attestation"
         );
 
-        match rpc.submit_attestation(&self.pubkey_hex, &sig_hex, block_hash, slot).await {
+        match rpc
+            .submit_attestation(&self.pubkey_hex, &sig_hex, block_hash, slot)
+            .await
+        {
             Ok(resp) => {
                 debug!(
                     accepted = resp.accepted,

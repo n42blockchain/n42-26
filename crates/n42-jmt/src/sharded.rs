@@ -2,7 +2,7 @@ use crate::hasher::Blake3Hasher;
 use crate::keys::{account_key, storage_key};
 use crate::metrics;
 use crate::store::MemTreeStore;
-use crate::tree::{decode_code_hash, encode_account_value, N42JmtTree};
+use crate::tree::{N42JmtTree, decode_code_hash, encode_account_value};
 
 use alloy_primitives::B256;
 use jmt::{KeyHash, OwnedValue, Version};
@@ -42,10 +42,7 @@ impl ShardedJmt {
         let shards = (0..SHARD_COUNT)
             .map(|_| Mutex::new(N42JmtTree::with_store(Arc::new(MemTreeStore::new()))))
             .collect();
-        Self {
-            shards,
-            version: 0,
-        }
+        Self { shards, version: 0 }
     }
 
     /// Construct from pre-built shards (used by snapshot restore).
@@ -354,11 +351,7 @@ mod tests {
         let roots = jmt.shard_roots().unwrap();
         let shard_idx = shard_index(&key);
         proof
-            .verify(
-                jmt::RootHash(roots[shard_idx]),
-                key,
-                val.as_deref(),
-            )
+            .verify(jmt::RootHash(roots[shard_idx]), key, val.as_deref())
             .expect("proof should verify");
     }
 
@@ -406,7 +399,10 @@ mod tests {
                 storage: BTreeMap::new(),
             },
         );
-        jmt.apply_diff(&StateDiff { accounts: accounts2 }).unwrap();
+        jmt.apply_diff(&StateDiff {
+            accounts: accounts2,
+        })
+        .unwrap();
 
         let key = account_key(&addr);
         let val = jmt.get(key).unwrap().unwrap();

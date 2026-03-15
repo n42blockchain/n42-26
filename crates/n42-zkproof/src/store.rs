@@ -1,8 +1,8 @@
 use alloy_primitives::B256;
 use metrics::gauge;
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::prover::ZkProofResult;
 
@@ -432,7 +432,13 @@ mod tests {
         // Block 1 evicted — its hash should no longer resolve.
         assert!(store.get_by_hash(&hash1).is_none());
         // Block 3 should resolve via hash index.
-        assert_eq!(store.get_by_hash(&B256::repeat_byte(0xCC)).unwrap().block_number, 3);
+        assert_eq!(
+            store
+                .get_by_hash(&B256::repeat_byte(0xCC))
+                .unwrap()
+                .block_number,
+            3
+        );
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use alloy_primitives::{Address, B256, U256};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// A minimal JSON-RPC client for interacting with N42 nodes.
@@ -103,11 +103,7 @@ impl RpcClient {
             "id": id,
         });
 
-        let resp = self.client
-            .post(&self.url)
-            .json(&body)
-            .send()
-            .await?;
+        let resp = self.client.post(&self.url).json(&body).send().await?;
 
         let text = resp.text().await?;
         let rpc_resp: JsonRpcResponse<T> = serde_json::from_str(&text)
@@ -117,7 +113,9 @@ impl RpcClient {
             return Err(eyre::eyre!("{err}"));
         }
 
-        rpc_resp.result.ok_or_else(|| eyre::eyre!("null result from {method}"))
+        rpc_resp
+            .result
+            .ok_or_else(|| eyre::eyre!("null result from {method}"))
     }
 
     /// Returns the current block number.
@@ -128,10 +126,9 @@ impl RpcClient {
 
     /// Returns the balance of an address at the latest block.
     pub async fn get_balance(&self, address: Address) -> eyre::Result<U256> {
-        let hex: String = self.call(
-            "eth_getBalance",
-            json!([format!("{address:?}"), "latest"]),
-        ).await?;
+        let hex: String = self
+            .call("eth_getBalance", json!([format!("{address:?}"), "latest"]))
+            .await?;
         Ok(U256::from_str_radix(hex.trim_start_matches("0x"), 16)?)
     }
 
@@ -147,10 +144,10 @@ impl RpcClient {
         &self,
         tx_hash: B256,
     ) -> eyre::Result<Option<TransactionReceipt>> {
-        let result: Option<TransactionReceipt> = self.call(
-            "eth_getTransactionReceipt",
-            json!([format!("{tx_hash:?}")]),
-        ).await.ok();
+        let result: Option<TransactionReceipt> = self
+            .call("eth_getTransactionReceipt", json!([format!("{tx_hash:?}")]))
+            .await
+            .ok();
         Ok(result)
     }
 
@@ -183,10 +180,12 @@ impl RpcClient {
 
     /// Returns the current nonce for an address.
     pub async fn get_nonce(&self, address: Address) -> eyre::Result<u64> {
-        let hex: String = self.call(
-            "eth_getTransactionCount",
-            json!([format!("{address:?}"), "latest"]),
-        ).await?;
+        let hex: String = self
+            .call(
+                "eth_getTransactionCount",
+                json!([format!("{address:?}"), "latest"]),
+            )
+            .await?;
         Ok(u64::from_str_radix(hex.trim_start_matches("0x"), 16)?)
     }
 
@@ -197,19 +196,17 @@ impl RpcClient {
     }
 
     /// Calls eth_call for read-only contract interaction.
-    pub async fn eth_call(
-        &self,
-        to: Address,
-        data: Vec<u8>,
-    ) -> eyre::Result<Vec<u8>> {
+    pub async fn eth_call(&self, to: Address, data: Vec<u8>) -> eyre::Result<Vec<u8>> {
         let hex_data = format!("0x{}", hex::encode(&data));
-        let result: String = self.call(
-            "eth_call",
-            json!([{
+        let result: String = self
+            .call(
+                "eth_call",
+                json!([{
                 "to": format!("{to:?}"),
                 "data": hex_data,
             }, "latest"]),
-        ).await?;
+            )
+            .await?;
         let bytes = hex::decode(result.trim_start_matches("0x"))?;
         Ok(bytes)
     }
@@ -230,13 +227,15 @@ impl RpcClient {
         self.call(
             "n42_submitAttestation",
             json!([pubkey, signature, format!("{block_hash:?}"), slot]),
-        ).await
+        )
+        .await
     }
 
     /// Returns a block by number.
     pub async fn get_block_by_number(&self, number: u64) -> eyre::Result<Value> {
         let hex_num = format!("0x{number:x}");
-        self.call("eth_getBlockByNumber", json!([hex_num, false])).await
+        self.call("eth_getBlockByNumber", json!([hex_num, false]))
+            .await
     }
 
     /// Estimates gas for a transaction.
@@ -254,7 +253,10 @@ impl RpcClient {
             params.insert("to".to_string(), json!(format!("{to:?}")));
         }
         if let Some(data) = data {
-            params.insert("data".to_string(), json!(format!("0x{}", hex::encode(data))));
+            params.insert(
+                "data".to_string(),
+                json!(format!("0x{}", hex::encode(data))),
+            );
         }
         if let Some(value) = value {
             params.insert("value".to_string(), json!(format!("0x{value:x}")));

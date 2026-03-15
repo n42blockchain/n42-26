@@ -8,7 +8,7 @@
 //! Snapshots are written atomically (write to temp file + rename) and
 //! compressed with zstd for compact storage.
 
-use crate::sharded::{ShardedJmt, SHARD_COUNT};
+use crate::sharded::{SHARD_COUNT, ShardedJmt};
 use crate::store::MemTreeStore;
 use crate::tree::N42JmtTree;
 use jmt::KeyHash;
@@ -199,7 +199,10 @@ mod tests {
 
         let restored = ShardedJmt::from_snapshot(snapshot).unwrap();
         let restored_root = restored.root_hash().unwrap();
-        assert_eq!(restored_root, original_root, "restored root must match original");
+        assert_eq!(
+            restored_root, original_root,
+            "restored root must match original"
+        );
         assert_eq!(restored.version(), original_version);
     }
 
@@ -216,7 +219,9 @@ mod tests {
         let snapshot = jmt.snapshot().unwrap();
         save_snapshot(&path, &snapshot).unwrap();
 
-        let loaded = load_snapshot(&path).unwrap().expect("snapshot should exist");
+        let loaded = load_snapshot(&path)
+            .unwrap()
+            .expect("snapshot should exist");
         let restored = ShardedJmt::from_snapshot(loaded).unwrap();
         assert_eq!(restored.root_hash().unwrap(), original_root);
     }

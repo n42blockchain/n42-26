@@ -43,11 +43,26 @@ mod tests {
 
     #[test]
     fn test_topic_strings() {
-        assert_eq!(consensus_topic().hash(), IdentTopic::new("/n42/consensus/1").hash());
-        assert_eq!(block_announce_topic().hash(), IdentTopic::new("/n42/blocks/1").hash());
-        assert_eq!(verification_receipts_topic().hash(), IdentTopic::new("/n42/verification/1").hash());
-        assert_eq!(mempool_topic().hash(), IdentTopic::new("/n42/mempool/1").hash());
-        assert_eq!(blob_sidecar_topic().hash(), IdentTopic::new("/n42/blobs/1").hash());
+        assert_eq!(
+            consensus_topic().hash(),
+            IdentTopic::new("/n42/consensus/1").hash()
+        );
+        assert_eq!(
+            block_announce_topic().hash(),
+            IdentTopic::new("/n42/blocks/1").hash()
+        );
+        assert_eq!(
+            verification_receipts_topic().hash(),
+            IdentTopic::new("/n42/verification/1").hash()
+        );
+        assert_eq!(
+            mempool_topic().hash(),
+            IdentTopic::new("/n42/mempool/1").hash()
+        );
+        assert_eq!(
+            blob_sidecar_topic().hash(),
+            IdentTopic::new("/n42/blobs/1").hash()
+        );
 
         // All five topics must be distinct.
         let all = [

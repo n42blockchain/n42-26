@@ -16,6 +16,7 @@ n42-primitives = { path = "../../crates/n42-primitives" }
 n42-chainspec = { path = "../../crates/n42-chainspec" }
 n42-execution = { path = "../../crates/n42-execution" }
 n42-mobile = { path = "../../crates/n42-mobile" }
+n42-network = { path = "../../crates/n42-network" }
 
 # Alloy
 alloy-primitives.workspace = true
@@ -60,9 +61,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # BLS crypto
 blst.workspace = true
-
-# P2P (for computing deterministic PeerIds in multi-node tests)
-libp2p = { workspace = true, features = ["ed25519"] }
 
 # QUIC (mobile verification E2E)
 quinn.workspace = true

@@ -227,8 +227,8 @@ pub struct ConsensusOrchestrator {
     payload_builder: Option<PayloadBuilderHandle<EthEngineTypes>>,
     consensus_state: Option<Arc<SharedConsensusState>>,
     head_block_hash: B256,
-    block_ready_tx: mpsc::UnboundedSender<B256>,
-    block_ready_rx: mpsc::UnboundedReceiver<B256>,
+    block_ready_tx: mpsc::Sender<B256>,
+    block_ready_rx: mpsc::Receiver<B256>,
     fee_recipient: Address,
     slot_time: Duration,
     next_build_at: Option<Instant>,
@@ -249,12 +249,12 @@ pub struct ConsensusOrchestrator {
     state_file: Option<PathBuf>,
     validator_set_for_sync: Option<ValidatorSet>,
     mobile_packet_tx: Option<mpsc::Sender<(B256, u64)>>,
-    leader_payload_rx: mpsc::UnboundedReceiver<(B256, Vec<u8>)>,
-    leader_payload_tx: mpsc::UnboundedSender<(B256, Vec<u8>)>,
+    leader_payload_rx: mpsc::Receiver<(B256, Vec<u8>)>,
+    leader_payload_tx: mpsc::Sender<(B256, Vec<u8>)>,
     /// Receives notifications when a background `import_and_notify` task completes.
     /// Tuple: (block_hash, view, success).
-    import_done_rx: mpsc::UnboundedReceiver<(B256, u64, bool, u64)>,
-    import_done_tx: mpsc::UnboundedSender<(B256, u64, bool, u64)>,
+    import_done_rx: mpsc::Receiver<(B256, u64, bool, u64)>,
+    import_done_tx: mpsc::Sender<(B256, u64, bool, u64)>,
     blob_store: Option<DiskFileBlobStore>,
     /// True while a background import task is running.
     bg_import_in_flight: bool,
@@ -263,8 +263,8 @@ pub struct ConsensusOrchestrator {
     bg_import_queue: VecDeque<(Vec<u8>, B256, u64)>,
     /// Speculative build: eager import tasks notify when a block is imported to reth.
     /// Allows the next leader to start building before consensus commits the current block.
-    eager_import_done_tx: mpsc::UnboundedSender<(B256, u64)>,
-    eager_import_done_rx: mpsc::UnboundedReceiver<(B256, u64)>,
+    eager_import_done_tx: mpsc::Sender<(B256, u64)>,
+    eager_import_done_rx: mpsc::Receiver<(B256, u64)>,
     /// Hash of the block whose speculative build is in progress.
     /// Set when build is triggered by eager import (before consensus commit).
     /// Cleared on ViewChanged or when finalize confirms the block.
@@ -280,8 +280,8 @@ pub struct ConsensusOrchestrator {
     /// Notifies the orchestrator when a payload resolve task finishes (success or failure).
     /// Used to clear `building_on_parent` so new builds are not permanently blocked
     /// when a resolve task takes longer than the pacemaker timeout.
-    build_complete_tx: mpsc::UnboundedSender<()>,
-    build_complete_rx: mpsc::UnboundedReceiver<()>,
+    build_complete_tx: mpsc::Sender<()>,
+    build_complete_rx: mpsc::Receiver<()>,
     mobile_reward_manager: Option<Arc<Mutex<MobileRewardManager>>>,
     staking_manager: Option<Arc<Mutex<StakingManager>>>,
     committed_block_count: u64,
@@ -317,6 +317,9 @@ pub struct ConsensusOrchestrator {
     /// ZK proof scheduler: generates ZK proofs asynchronously as a sidecar.
     /// Enabled by `N42_ZK_PROOF=1`. Default: None (disabled, zero overhead).
     zk_scheduler: Option<Arc<n42_zkproof::ProofScheduler>>,
+    /// Whether deterministic validator PeerIds may be derived when no explicit
+    /// `p2p_peer_id` bindings are configured.
+    allow_deterministic_validator_peers: bool,
 }
 
 impl ConsensusOrchestrator {
@@ -327,11 +330,11 @@ impl ConsensusOrchestrator {
         output_rx: mpsc::Receiver<EngineOutput>,
     ) -> Self {
         // Tests use this constructor; create a dummy consensus channel.
-        let (block_ready_tx, block_ready_rx) = mpsc::unbounded_channel();
-        let (leader_payload_tx, leader_payload_rx) = mpsc::unbounded_channel();
-        let (import_done_tx, import_done_rx) = mpsc::unbounded_channel();
-        let (eager_import_done_tx, eager_import_done_rx) = mpsc::unbounded_channel();
-        let (build_complete_tx, build_complete_rx) = mpsc::unbounded_channel();
+        let (block_ready_tx, block_ready_rx) = mpsc::channel(256);
+        let (leader_payload_tx, leader_payload_rx) = mpsc::channel(64);
+        let (import_done_tx, import_done_rx) = mpsc::channel(256);
+        let (eager_import_done_tx, eager_import_done_rx) = mpsc::channel(256);
+        let (build_complete_tx, build_complete_rx) = mpsc::channel(256);
         Self {
             engine,
             network,
@@ -392,6 +395,7 @@ impl ConsensusOrchestrator {
                 > 0,
             jmt: None,
             zk_scheduler: None,
+            allow_deterministic_validator_peers: true,
         }
     }
 
@@ -479,11 +483,11 @@ impl ConsensusOrchestrator {
         head_block_hash: B256,
         fee_recipient: Address,
     ) -> Self {
-        let (block_ready_tx, block_ready_rx) = mpsc::unbounded_channel();
-        let (leader_payload_tx, leader_payload_rx) = mpsc::unbounded_channel();
-        let (import_done_tx, import_done_rx) = mpsc::unbounded_channel();
-        let (eager_import_done_tx, eager_import_done_rx) = mpsc::unbounded_channel();
-        let (build_complete_tx, build_complete_rx) = mpsc::unbounded_channel();
+        let (block_ready_tx, block_ready_rx) = mpsc::channel(256);
+        let (leader_payload_tx, leader_payload_rx) = mpsc::channel(64);
+        let (import_done_tx, import_done_rx) = mpsc::channel(256);
+        let (eager_import_done_tx, eager_import_done_rx) = mpsc::channel(256);
+        let (build_complete_tx, build_complete_rx) = mpsc::channel(256);
 
         let slot_time_ms: u64 = std::env::var("N42_BLOCK_INTERVAL_MS")
             .ok()
@@ -557,6 +561,7 @@ impl ConsensusOrchestrator {
             fast_propose,
             jmt: None,
             zk_scheduler: None,
+            allow_deterministic_validator_peers: true,
         }
     }
 
@@ -619,6 +624,11 @@ impl ConsensusOrchestrator {
 
     pub fn with_epoch_schedule(mut self, schedule: EpochSchedule) -> Self {
         self.epoch_schedule = Some(schedule);
+        self
+    }
+
+    pub fn with_allow_deterministic_validator_peers(mut self, allow: bool) -> Self {
+        self.allow_deterministic_validator_peers = allow;
         self
     }
 
@@ -978,9 +988,22 @@ impl ConsensusOrchestrator {
                 let txs = std::mem::take(&mut self.tx_forward_buffer);
                 let count = txs.len();
                 debug!(target: "n42::cl::orchestrator", count, leader_idx, %peer, "flushing tx forward buffer to leader");
-                let _ = self.network.forward_tx_batch(peer, txs);
-                counter!("n42_tx_forward_batches").increment(1);
-                counter!("n42_tx_forward_txs").increment(count as u64);
+                match self.network.forward_tx_batch(peer, txs) {
+                    Ok(()) => {
+                        counter!("n42_tx_forward_batches").increment(1);
+                        counter!("n42_tx_forward_txs").increment(count as u64);
+                    }
+                    Err(error) => {
+                        warn!(
+                            target: "n42::cl::orchestrator",
+                            leader_idx,
+                            %peer,
+                            count,
+                            error = %error,
+                            "failed to forward tx batch to leader"
+                        );
+                    }
+                }
             }
             None => {
                 // Leader not connected yet — fall back to keeping in buffer.
@@ -999,7 +1022,7 @@ impl ConsensusOrchestrator {
 
     async fn handle_network_event(&mut self, event: NetworkEvent) {
         match event {
-            NetworkEvent::ConsensusMessage { source: _, message } => {
+            NetworkEvent::ConsensusMessage { source, message } => {
                 counter!("n42_consensus_messages_received").increment(1);
                 use n42_primitives::ConsensusMessage as CM;
                 let msg_type = match message.as_ref() {
@@ -1011,6 +1034,19 @@ impl ConsensusOrchestrator {
                     CM::Decide(_) => "Decide",
                     _ => "Other",
                 };
+                if let Some(validator_index) = self.engine.authenticated_signer(message.as_ref())
+                    && let Err(error) = self
+                        .network
+                        .authenticate_validator_peer(source, validator_index)
+                {
+                    debug!(
+                        target: "n42::cl::orchestrator",
+                        %source,
+                        validator_index,
+                        error = %error,
+                        "failed to promote authenticated validator peer"
+                    );
+                }
                 debug!(target: "n42::cl::orchestrator", msg_type, view = self.engine.current_view(), "processing consensus message");
                 match self
                     .engine
@@ -1041,7 +1077,8 @@ impl ConsensusOrchestrator {
                 self.handle_block_data(data).await;
             }
             NetworkEvent::TransactionReceived { source: _, data } => {
-                self.enqueue_tx_import(data, "p2p transaction received").await;
+                self.enqueue_tx_import(data, "p2p transaction received")
+                    .await;
             }
             NetworkEvent::TxForwardReceived { source: _, txs } => {
                 // Leader receives forwarded txs from validators — feed into local pool.
@@ -1081,6 +1118,7 @@ impl ConsensusOrchestrator {
 mod tests {
     use super::*;
     use alloy_primitives::{Address, B256};
+    use libp2p::identity::Keypair;
     use n42_chainspec::ValidatorInfo;
     use n42_consensus::{ConsensusEngine, ValidatorSet};
     use n42_network::{NetworkCommand, NetworkHandle};
@@ -1094,6 +1132,7 @@ mod tests {
         let validator_info = ValidatorInfo {
             address: Address::with_last_byte(1),
             bls_public_key: pk,
+            p2p_peer_id: None,
         };
 
         let vs = ValidatorSet::new(&[validator_info], 0);
@@ -1106,11 +1145,11 @@ mod tests {
     /// Returns (handle, normal_cmd_rx, priority_cmd_rx).
     fn make_test_network() -> (
         NetworkHandle,
-        mpsc::UnboundedReceiver<NetworkCommand>,
-        mpsc::UnboundedReceiver<NetworkCommand>,
+        mpsc::Receiver<NetworkCommand>,
+        mpsc::Receiver<NetworkCommand>,
     ) {
-        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
-        let (ptx, prx) = mpsc::unbounded_channel();
+        let (cmd_tx, cmd_rx) = mpsc::channel(8);
+        let (ptx, prx) = mpsc::channel(8);
         (NetworkHandle::new(cmd_tx, ptx), cmd_rx, prx)
     }
 
@@ -1230,6 +1269,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_epoch_transition_refreshes_expected_validator_peers() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, mut cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let mut orch = ConsensusOrchestrator::new(engine, network, net_event_rx, output_rx);
+
+        let peer0 = Keypair::generate_ed25519().public().to_peer_id();
+        let peer1 = Keypair::generate_ed25519().public().to_peer_id();
+        let next_validators = vec![
+            ValidatorInfo {
+                address: Address::with_last_byte(0x10),
+                bls_public_key: BlsSecretKey::random().unwrap().public_key(),
+                p2p_peer_id: Some(peer0.to_string()),
+            },
+            ValidatorInfo {
+                address: Address::with_last_byte(0x11),
+                bls_public_key: BlsSecretKey::random().unwrap().public_key(),
+                p2p_peer_id: Some(peer1.to_string()),
+            },
+        ];
+        orch.engine
+            .epoch_manager_mut()
+            .stage_next_epoch(&next_validators, 0)
+            .unwrap();
+        assert!(orch.engine.epoch_manager_mut().advance_epoch());
+
+        orch.handle_engine_output(EngineOutput::EpochTransition {
+            new_epoch: 1,
+            validator_count: 2,
+        })
+        .await;
+
+        match cmd_rx.try_recv().expect("expected network refresh command") {
+            NetworkCommand::ReplaceExpectedValidatorPeers { peers } => {
+                assert_eq!(peers.get(&0), Some(&peer0));
+                assert_eq!(peers.get(&1), Some(&peer1));
+            }
+            other => panic!("expected ReplaceExpectedValidatorPeers, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_epoch_transition_clears_expected_validator_peers_when_strict_binding_missing() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, mut cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let mut orch = ConsensusOrchestrator::new(engine, network, net_event_rx, output_rx)
+            .with_allow_deterministic_validator_peers(false);
+
+        let next_validators = vec![
+            ValidatorInfo {
+                address: Address::with_last_byte(0x20),
+                bls_public_key: BlsSecretKey::random().unwrap().public_key(),
+                p2p_peer_id: None,
+            },
+            ValidatorInfo {
+                address: Address::with_last_byte(0x21),
+                bls_public_key: BlsSecretKey::random().unwrap().public_key(),
+                p2p_peer_id: None,
+            },
+        ];
+        orch.engine
+            .epoch_manager_mut()
+            .stage_next_epoch(&next_validators, 0)
+            .unwrap();
+        assert!(orch.engine.epoch_manager_mut().advance_epoch());
+
+        orch.handle_engine_output(EngineOutput::EpochTransition {
+            new_epoch: 1,
+            validator_count: 2,
+        })
+        .await;
+
+        match cmd_rx.try_recv().expect("expected network refresh command") {
+            NetworkCommand::ReplaceExpectedValidatorPeers { peers } => {
+                assert!(peers.is_empty());
+            }
+            other => panic!("expected ReplaceExpectedValidatorPeers, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn test_orchestrator_exits_on_net_event_channel_close() {
         let (engine, output_rx) = make_test_engine();
         let (network, _cmd_rx, _prx) = make_test_network();
@@ -1306,7 +1427,7 @@ mod tests {
         let block_ready_tx = orch.block_ready_tx.clone();
 
         let test_hash = B256::repeat_byte(0xFF);
-        block_ready_tx.send(test_hash).unwrap();
+        block_ready_tx.send(test_hash).await.unwrap();
 
         let received = orch.block_ready_rx.try_recv();
         assert!(received.is_ok(), "should receive BlockReady hash");

@@ -1,10 +1,10 @@
 use alloy_consensus::constants::KECCAK_EMPTY;
-use alloy_primitives::{keccak256, Address, Bytes, B256, U256};
+use alloy_primitives::{Address, B256, Bytes, U256, keccak256};
 use alloy_rlp::Encodable;
 use n42_execution::witness::ExecutionWitness;
 use n42_mobile::{VerificationPacket, WitnessAccount};
-use reth_primitives_traits::{BlockBody, NodePrimitives, SealedBlock};
 use reth_ethereum_primitives::EthPrimitives;
+use reth_primitives_traits::{BlockBody, NodePrimitives, SealedBlock};
 use std::collections::HashMap;
 
 /// Errors that can occur when building a verification packet from witness data.
@@ -57,7 +57,9 @@ pub fn build_verification_packet(
     let mut witness_accounts = Vec::new();
 
     for (hashed_addr, maybe_account) in &witness.hashed_state.accounts {
-        let Some(account) = maybe_account else { continue };
+        let Some(account) = maybe_account else {
+            continue;
+        };
 
         let address = address_preimages
             .get(hashed_addr)
@@ -86,8 +88,11 @@ pub fn build_verification_packet(
         });
     }
 
-    let uncached_bytecodes: Vec<(B256, Bytes)> =
-        witness.codes.iter().map(|code| (keccak256(code), code.clone())).collect();
+    let uncached_bytecodes: Vec<(B256, Bytes)> = witness
+        .codes
+        .iter()
+        .map(|code| (keccak256(code), code.clone()))
+        .collect();
 
     use alloy_consensus::BlockHeader;
     let header = block.header();
@@ -115,9 +120,9 @@ pub fn build_verification_packet(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_primitives::{keccak256, Address, Bytes, B256, U256};
-    use reth_trie_common::{HashedPostState, HashedStorage};
+    use alloy_primitives::{Address, B256, Bytes, U256, keccak256};
     use reth_primitives_traits::Account;
+    use reth_trie_common::{HashedPostState, HashedStorage};
 
     fn make_witness_with_keys(addr: Address, slot: B256) -> ExecutionWitness {
         ExecutionWitness {
@@ -185,9 +190,9 @@ mod tests {
             .accounts
             .iter()
             .filter_map(|(hashed, maybe_account)| {
-                maybe_account.as_ref().and_then(|a| {
-                    address_preimages.get(hashed).map(|addr| (*addr, a.clone()))
-                })
+                maybe_account
+                    .as_ref()
+                    .and_then(|a| address_preimages.get(hashed).map(|addr| (*addr, a.clone())))
             })
             .collect();
 
@@ -206,8 +211,11 @@ mod tests {
             lowest_block_number: None,
         };
 
-        let uncached: Vec<(B256, Bytes)> =
-            witness.codes.iter().map(|c| (keccak256(c), c.clone())).collect();
+        let uncached: Vec<(B256, Bytes)> = witness
+            .codes
+            .iter()
+            .map(|c| (keccak256(c), c.clone()))
+            .collect();
 
         assert_eq!(uncached.len(), 1);
         assert_eq!(uncached[0].0, expected_hash);
@@ -221,7 +229,11 @@ mod tests {
         let slot = B256::with_last_byte(0x01);
         let hashed_slot = keccak256(slot);
 
-        let account = Account { nonce: 5, balance: U256::from(1000), bytecode_hash: Some(KECCAK_EMPTY) };
+        let account = Account {
+            nonce: 5,
+            balance: U256::from(1000),
+            bytecode_hash: Some(KECCAK_EMPTY),
+        };
 
         let mut hashed_state = HashedPostState::default();
         hashed_state.accounts.insert(hashed_addr, Some(account));
@@ -272,7 +284,11 @@ mod tests {
     fn test_missing_account_preimage() {
         let addr = Address::with_last_byte(0x99);
         let hashed_addr = keccak256(addr);
-        let account = Account { nonce: 1, balance: U256::from(100), bytecode_hash: Some(KECCAK_EMPTY) };
+        let account = Account {
+            nonce: 1,
+            balance: U256::from(100),
+            bytecode_hash: Some(KECCAK_EMPTY),
+        };
 
         let mut hashed_state = HashedPostState::default();
         hashed_state.accounts.insert(hashed_addr, Some(account));

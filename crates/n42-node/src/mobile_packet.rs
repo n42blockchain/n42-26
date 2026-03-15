@@ -1,17 +1,17 @@
 use alloy_consensus::BlockHeader;
-use alloy_primitives::{Bytes, B256};
+use alloy_eips::BlockHashOrNumber;
+use alloy_primitives::{B256, Bytes};
 use alloy_rlp::Encodable;
 use bytes::BufMut;
-use n42_execution::{read_log::ReadLogDatabase, N42EvmConfig};
-use n42_mobile::code_cache::{encode_cache_sync, CacheSyncMessage};
-use n42_mobile::packet::{encode_stream_packet, StreamPacket};
+use n42_execution::{N42EvmConfig, read_log::ReadLogDatabase};
+use n42_mobile::code_cache::{CacheSyncMessage, encode_cache_sync};
+use n42_mobile::packet::{StreamPacket, encode_stream_packet};
 use n42_network::ShardedStarHubHandle;
 use reth_chainspec::ChainSpec;
 use reth_ethereum_primitives::EthPrimitives;
-use reth_evm::{execute::Executor, ConfigureEvm};
+use reth_evm::{ConfigureEvm, execute::Executor};
 use reth_primitives_traits::{BlockBody, NodePrimitives};
 use reth_provider::BlockHashReader;
-use alloy_eips::BlockHashOrNumber;
 use reth_storage_api::{BlockReader, StateProviderFactory, TransactionVariant};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -67,7 +67,11 @@ struct CodeCache {
 
 impl CodeCache {
     fn new(capacity: usize) -> Self {
-        Self { map: HashMap::new(), order: VecDeque::new(), capacity }
+        Self {
+            map: HashMap::new(),
+            order: VecDeque::new(),
+            capacity,
+        }
     }
 
     fn contains_key(&self, key: &B256) -> bool {
@@ -229,7 +233,10 @@ where
 {
     let (compressed, packet_size, all_codes) = {
         let recovered_block = provider
-            .recovered_block(BlockHashOrNumber::Hash(block_hash), TransactionVariant::WithHash)
+            .recovered_block(
+                BlockHashOrNumber::Hash(block_hash),
+                TransactionVariant::WithHash,
+            )
             .map_err(|e| MobilePacketError::StateProvider(e.to_string()))?
             .ok_or(MobilePacketError::BlockNotFound(block_hash))?;
 
@@ -300,7 +307,12 @@ where
         let compressed = zstd::bulk::compress(&encoded, 3)
             .map_err(|e| MobilePacketError::Compression(e.to_string()))?;
         let packet_size = compressed.len();
-        debug!(block_number, raw_size, compressed_size = packet_size, "stream packet compressed");
+        debug!(
+            block_number,
+            raw_size,
+            compressed_size = packet_size,
+            "stream packet compressed"
+        );
 
         (bytes::Bytes::from(compressed), packet_size, all_codes)
     };
@@ -320,7 +332,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_primitives::{Bytes, B256};
+    use alloy_primitives::{B256, Bytes};
 
     #[test]
     fn test_code_cache_insert_and_contains() {
@@ -424,6 +436,9 @@ mod tests {
             data.extend_from_slice(&[0xAB; 32]);
         }
         let compressed = zstd::bulk::compress(&data, 3).unwrap();
-        assert!(compressed.len() * 2 < data.len(), "should achieve >50% compression");
+        assert!(
+            compressed.len() * 2 < data.len(),
+            "should achieve >50% compression"
+        );
     }
 }

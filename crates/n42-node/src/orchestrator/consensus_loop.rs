@@ -1,5 +1,6 @@
 use super::ConsensusOrchestrator;
 use super::state_mgmt::max_consecutive_empty_skips;
+use crate::expected_validator_peer_ids_with_policy;
 use alloy_primitives::B256;
 use alloy_rpc_types_engine::{ForkchoiceState, PayloadStatusEnum};
 use metrics::{counter, gauge, histogram};
@@ -8,6 +9,7 @@ use n42_primitives::QuorumCertificate;
 use reth_ethereum_engine_primitives::EthEngineTypes;
 use reth_node_builder::ConsensusEngineHandle;
 use reth_payload_primitives::EngineApiMessageVersion;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::Instant;
@@ -130,7 +132,15 @@ impl ConsensusOrchestrator {
                 // can silently fail (QUIC transport issues), so always broadcast as backup.
                 // The consensus engine deduplicates votes by (view, voter).
                 if let Some(peer_id) = self.network.validator_peer(target) {
-                    let _ = self.network.send_direct(peer_id, msg.clone());
+                    if let Err(error) = self.network.send_direct(peer_id, msg.clone()) {
+                        warn!(
+                            target: "n42::cl::consensus_loop",
+                            target_validator = target,
+                            %peer_id,
+                            error = %error,
+                            "direct consensus send failed, falling back to broadcast only"
+                        );
+                    }
                 }
                 if let Err(e) = self.network.broadcast_consensus(msg) {
                     error!(target: "n42::cl::consensus_loop", target_validator = target, error = %e, "broadcast failed");
@@ -185,22 +195,75 @@ impl ConsensusOrchestrator {
                 gauge!("n42_epoch_validator_count").set(validator_count as f64);
 
                 let updated_vs = self.engine.epoch_manager().current_validator_set().clone();
-                self.validator_set_for_sync = Some(updated_vs);
+                self.validator_set_for_sync = Some(updated_vs.clone());
+                if let Some(state) = &self.consensus_state {
+                    state.update_validator_set(updated_vs);
+                }
+                match expected_validator_peer_ids_with_policy(
+                    &self
+                        .engine
+                        .epoch_manager()
+                        .current_validator_set()
+                        .validator_infos(),
+                    self.allow_deterministic_validator_peers,
+                ) {
+                    Ok(peers) => {
+                        if let Err(error) = self.network.replace_expected_validator_peers(peers) {
+                            warn!(
+                                target: "n42::cl::consensus_loop",
+                                error = %error,
+                                "failed to refresh validator peer bindings after epoch transition"
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        warn!(
+                            target: "n42::cl::consensus_loop",
+                            error = %error,
+                            "failed to derive validator peer bindings for new epoch"
+                        );
+                        if let Err(replace_error) = self
+                            .network
+                            .replace_expected_validator_peers(HashMap::new())
+                        {
+                            warn!(
+                                target: "n42::cl::consensus_loop",
+                                error = %replace_error,
+                                "failed to clear validator peer bindings after epoch transition policy error"
+                            );
+                        }
+                    }
+                }
 
                 // Pre-stage the validator set for the epoch after next, if scheduled.
                 if let Some(schedule) = &self.epoch_schedule
                     && let Some((validators, threshold)) = schedule.get_for_epoch(new_epoch + 1)
                 {
-                    self.engine
+                    match self
+                        .engine
                         .epoch_manager_mut()
-                        .stage_next_epoch(validators, threshold);
-                    info!(
-                        target: "n42::cl::consensus_loop",
-                        next_epoch = new_epoch + 1,
-                        validator_count = validators.len(),
-                        threshold,
-                        "staged next epoch validator set from schedule"
-                    );
+                        .stage_next_epoch(validators, threshold)
+                    {
+                        Ok(()) => {
+                            info!(
+                                target: "n42::cl::consensus_loop",
+                                next_epoch = new_epoch + 1,
+                                validator_count = validators.len(),
+                                fault_tolerance = threshold,
+                                "staged next epoch validator set from schedule"
+                            );
+                        }
+                        Err(error) => {
+                            warn!(
+                                target: "n42::cl::consensus_loop",
+                                next_epoch = new_epoch + 1,
+                                validator_count = validators.len(),
+                                fault_tolerance = threshold,
+                                error = %error,
+                                "failed to stage next epoch validator set from schedule"
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -292,7 +355,7 @@ impl ConsensusOrchestrator {
             let diff = self
                 .pending_block_data
                 .get(&block_hash)
-                .and_then(|data| Self::extract_state_diff_for_jmt(data));
+                .and_then(|data| Self::extract_state_diff_for_jmt(block_hash, data));
             if let Some(diff) = diff {
                 let jmt = Arc::clone(jmt);
                 let state = self.consensus_state.clone();
@@ -340,7 +403,7 @@ impl ConsensusOrchestrator {
                 // Extract decompressed CompactBlockExecution JSON from the raw
                 // BlockDataBroadcast. This is the same decompress path used by
                 // JMT and staking scan.
-                let bundle_json = match Self::extract_bundle_state_json(data) {
+                let bundle_json = match Self::extract_bundle_state_json(block_hash, data) {
                     Some(json) => json,
                     None => {
                         warn!(target: "n42::zk", block_count, "ZK input: failed to extract bundle_state_json, using empty (proof will be incomplete)");
@@ -558,7 +621,11 @@ impl ConsensusOrchestrator {
         info!(target: "n42::cl::consensus_loop", view, %block_hash, "spawning background import");
         tokio::spawn(async move {
             let (success, block_ts) = Self::background_import(eh, &data, block_hash).await;
-            if done_tx.send((block_hash, view, success, block_ts)).is_err() {
+            if done_tx
+                .send((block_hash, view, success, block_ts))
+                .await
+                .is_err()
+            {
                 debug!(target: "n42::cl::consensus_loop", view, %block_hash, "background import completion receiver dropped");
             }
         });
@@ -790,8 +857,20 @@ impl ConsensusOrchestrator {
             debug!(target: "n42::cl::consensus_loop", %hash, "cached leader block data for deferred import");
         }
 
-        // Use the direct timestamp field from the broadcast struct.
-        if let Ok(broadcast) = bincode::deserialize::<super::BlockDataBroadcast>(&data)
+        let decoded_broadcast = match bincode::deserialize::<super::BlockDataBroadcast>(&data) {
+            Ok(broadcast) => Some(broadcast),
+            Err(error) => {
+                warn!(
+                    target: "n42::cl::consensus_loop",
+                    %hash,
+                    error = %error,
+                    "failed to decode leader block data broadcast"
+                );
+                None
+            }
+        };
+
+        if let Some(ref broadcast) = decoded_broadcast
             && broadcast.timestamp > 0
         {
             self.last_committed_timestamp = self.last_committed_timestamp.max(broadcast.timestamp);
@@ -803,9 +882,9 @@ impl ConsensusOrchestrator {
             .rev()
             .find(|b| b.block_hash == hash)
             && block.payload.is_empty()
-            && let Ok(broadcast) = bincode::deserialize::<super::BlockDataBroadcast>(&data)
+            && let Some(ref broadcast) = decoded_broadcast
         {
-            block.payload = broadcast.payload_json;
+            block.payload = broadcast.payload_json.clone();
             debug!(target: "n42::cl::consensus_loop", %hash, "populated committed block payload from leader build task");
         }
 
@@ -824,13 +903,68 @@ impl ConsensusOrchestrator {
         }
     }
 
+    fn decode_block_data_broadcast(
+        block_hash: B256,
+        data: &[u8],
+        context: &'static str,
+    ) -> Option<super::BlockDataBroadcast> {
+        match bincode::deserialize(data) {
+            Ok(broadcast) => Some(broadcast),
+            Err(error) => {
+                warn!(
+                    target: "n42::cl::consensus_loop",
+                    %block_hash,
+                    context,
+                    error = %error,
+                    "failed to decode block data broadcast"
+                );
+                None
+            }
+        }
+    }
+
     /// Try to extract a `StateDiff` from serialized `BlockDataBroadcast` for JMT update.
     /// Returns `None` if the data is missing, malformed, or has no compact block execution.
-    fn extract_state_diff_for_jmt(data: &[u8]) -> Option<n42_execution::state_diff::StateDiff> {
-        let broadcast: super::BlockDataBroadcast = bincode::deserialize(data).ok()?;
-        let exec_bytes = broadcast.execution_output.as_ref()?;
-        let decompressed = zstd::bulk::decompress(exec_bytes, 64 * 1024 * 1024).ok()?;
-        let compact: super::CompactBlockExecution = serde_json::from_slice(&decompressed).ok()?;
+    fn extract_state_diff_for_jmt(
+        block_hash: B256,
+        data: &[u8],
+    ) -> Option<n42_execution::state_diff::StateDiff> {
+        let broadcast = Self::decode_block_data_broadcast(block_hash, data, "jmt_state_diff")?;
+        let exec_bytes = match broadcast.execution_output.as_ref() {
+            Some(exec_bytes) => exec_bytes,
+            None => {
+                debug!(
+                    target: "n42::cl::consensus_loop",
+                    %block_hash,
+                    "block data broadcast missing execution output for JMT update"
+                );
+                return None;
+            }
+        };
+        let decompressed = match zstd::bulk::decompress(exec_bytes, 64 * 1024 * 1024) {
+            Ok(decompressed) => decompressed,
+            Err(error) => {
+                warn!(
+                    target: "n42::cl::consensus_loop",
+                    %block_hash,
+                    error = %error,
+                    "failed to decompress execution output for JMT update"
+                );
+                return None;
+            }
+        };
+        let compact: super::CompactBlockExecution = match serde_json::from_slice(&decompressed) {
+            Ok(compact) => compact,
+            Err(error) => {
+                warn!(
+                    target: "n42::cl::consensus_loop",
+                    %block_hash,
+                    error = %error,
+                    "failed to decode compact execution JSON for JMT update"
+                );
+                return None;
+            }
+        };
         Some(n42_execution::state_diff::StateDiff::from_bundle_state(
             &compact.bundle_state,
         ))
@@ -838,9 +972,30 @@ impl ConsensusOrchestrator {
 
     /// Extract decompressed CompactBlockExecution JSON bytes from raw BlockDataBroadcast.
     /// Returns `None` if the data is missing, malformed, or has no execution output.
-    fn extract_bundle_state_json(data: &[u8]) -> Option<Vec<u8>> {
-        let broadcast: super::BlockDataBroadcast = bincode::deserialize(data).ok()?;
-        let exec_bytes = broadcast.execution_output.as_ref()?;
-        zstd::bulk::decompress(exec_bytes, 64 * 1024 * 1024).ok()
+    fn extract_bundle_state_json(block_hash: B256, data: &[u8]) -> Option<Vec<u8>> {
+        let broadcast = Self::decode_block_data_broadcast(block_hash, data, "bundle_state_json")?;
+        let exec_bytes = match broadcast.execution_output.as_ref() {
+            Some(exec_bytes) => exec_bytes,
+            None => {
+                debug!(
+                    target: "n42::cl::consensus_loop",
+                    %block_hash,
+                    "block data broadcast missing execution output for bundle JSON extraction"
+                );
+                return None;
+            }
+        };
+        match zstd::bulk::decompress(exec_bytes, 64 * 1024 * 1024) {
+            Ok(bundle_json) => Some(bundle_json),
+            Err(error) => {
+                warn!(
+                    target: "n42::cl::consensus_loop",
+                    %block_hash,
+                    error = %error,
+                    "failed to decompress execution output for bundle JSON extraction"
+                );
+                None
+            }
+        }
     }
 }

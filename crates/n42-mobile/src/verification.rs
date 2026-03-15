@@ -77,7 +77,11 @@ impl BlockVerificationStatus {
     /// Returns the fraction of valid receipts (0.0–1.0).
     pub fn validity_ratio(&self) -> f64 {
         let total = self.total_receipts();
-        if total == 0 { 0.0 } else { self.valid_count as f64 / total as f64 }
+        if total == 0 {
+            0.0
+        } else {
+            self.valid_count as f64 / total as f64
+        }
     }
 }
 
@@ -291,9 +295,15 @@ mod tests {
         let r2 = mock_receipt(bh, 200, EXPECTED_RR, pk); // same verifier
 
         assert!(status.add_receipt(&r1), "first receipt should be accepted");
-        assert!(!status.add_receipt(&r2), "duplicate verifier should be rejected");
+        assert!(
+            !status.add_receipt(&r2),
+            "duplicate verifier should be rejected"
+        );
 
-        assert_eq!(status.valid_count, 1, "dedup: only one receipt should be counted");
+        assert_eq!(
+            status.valid_count, 1,
+            "dedup: only one receipt should be counted"
+        );
         assert_eq!(status.total_receipts(), 1);
     }
 
@@ -309,7 +319,11 @@ mod tests {
         // Process first valid receipt — not yet attested.
         let r1 = mock_receipt(bh, 1000, EXPECTED_RR, pubkey(1));
         let result1 = agg.process_receipt(&r1);
-        assert_eq!(result1, Some(false), "first receipt should not reach threshold");
+        assert_eq!(
+            result1,
+            Some(false),
+            "first receipt should not reach threshold"
+        );
 
         // Process second valid receipt — threshold reached.
         let r2 = mock_receipt(bh, 1000, EXPECTED_RR, pubkey(2));
@@ -393,7 +407,11 @@ mod tests {
         // With threshold=1, the first valid receipt should trigger attestation.
         let r = mock_receipt(bh, 3000, EXPECTED_RR, pubkey(1));
         let result = agg.process_receipt(&r);
-        assert_eq!(result, Some(true), "threshold=1 should attest on first valid receipt");
+        assert_eq!(
+            result,
+            Some(true),
+            "threshold=1 should attest on first valid receipt"
+        );
         assert!(agg.get_status(&bh).unwrap().is_attested());
     }
 
@@ -412,7 +430,10 @@ mod tests {
         status.add_receipt(&mock_receipt(bh, 500, B256::from([0xBB; 32]), pubkey(4)));
 
         let ratio = status.validity_ratio();
-        assert!((ratio - 0.75).abs() < f64::EPSILON, "expected 0.75, got {ratio}");
+        assert!(
+            (ratio - 0.75).abs() < f64::EPSILON,
+            "expected 0.75, got {ratio}"
+        );
     }
 
     #[test]
@@ -428,7 +449,11 @@ mod tests {
         // One valid receipt should now trigger attestation (threshold=1).
         let r = mock_receipt(bh, 4000, EXPECTED_RR, pubkey(1));
         let result = agg.process_receipt(&r);
-        assert_eq!(result, Some(true), "clamped threshold=1 should attest on first valid receipt");
+        assert_eq!(
+            result,
+            Some(true),
+            "clamped threshold=1 should attest on first valid receipt"
+        );
     }
 
     #[test]

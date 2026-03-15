@@ -43,7 +43,9 @@ impl Scheduler {
     pub fn new(num_txs: usize) -> Self {
         Self {
             num_txs,
-            status: (0..num_txs).map(|_| AtomicU32::new(STATUS_PENDING)).collect(),
+            status: (0..num_txs)
+                .map(|_| AtomicU32::new(STATUS_PENDING))
+                .collect(),
             exec_cursor: AtomicUsize::new(0),
             val_cursor: AtomicUsize::new(0),
             validated_count: AtomicUsize::new(0),
@@ -68,7 +70,12 @@ impl Scheduler {
         // Priority 1: Re-execute transactions marked for redo.
         for i in 0..self.num_txs {
             if self.status[i]
-                .compare_exchange(STATUS_REDO, STATUS_PENDING, Ordering::SeqCst, Ordering::SeqCst)
+                .compare_exchange(
+                    STATUS_REDO,
+                    STATUS_PENDING,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                )
                 .is_ok()
             {
                 return Some(Task::Execute(i));
@@ -121,7 +128,12 @@ impl Scheduler {
         // After yield, try again for redo tasks.
         for i in 0..self.num_txs {
             if self.status[i]
-                .compare_exchange(STATUS_REDO, STATUS_PENDING, Ordering::SeqCst, Ordering::SeqCst)
+                .compare_exchange(
+                    STATUS_REDO,
+                    STATUS_PENDING,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                )
                 .is_ok()
             {
                 return Some(Task::Execute(i));
@@ -130,14 +142,15 @@ impl Scheduler {
 
         // Check validation cursor again.
         let idx = self.val_cursor.load(Ordering::SeqCst);
-        if idx < self.num_txs && self.status[idx].load(Ordering::SeqCst) == STATUS_EXECUTED
+        if idx < self.num_txs
+            && self.status[idx].load(Ordering::SeqCst) == STATUS_EXECUTED
             && self
                 .val_cursor
                 .compare_exchange(idx, idx + 1, Ordering::SeqCst, Ordering::SeqCst)
                 .is_ok()
-            {
-                return Some(Task::Validate(idx));
-            }
+        {
+            return Some(Task::Validate(idx));
+        }
 
         if self.validated_count.load(Ordering::SeqCst) >= self.num_txs {
             return None;
@@ -179,7 +192,10 @@ impl Scheduler {
             {
                 // Decrement validated_count for txs that need re-validation.
                 let revalidate = current - tx_idx;
-                self.validated_count.fetch_sub(revalidate.min(self.validated_count.load(Ordering::SeqCst)), Ordering::SeqCst);
+                self.validated_count.fetch_sub(
+                    revalidate.min(self.validated_count.load(Ordering::SeqCst)),
+                    Ordering::SeqCst,
+                );
                 break;
             }
         }

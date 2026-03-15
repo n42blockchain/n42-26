@@ -1,13 +1,13 @@
 use super::{BlockDataBroadcast, CommittedBlock, ConsensusOrchestrator};
 use crate::persistence::{self, ConsensusSnapshot};
 use alloy_primitives::B256;
+use metrics::counter;
 use n42_consensus::verify_commit_qc;
-use n42_network::{BlockSyncResponse, PeerId, SyncBlock, MAX_BLOCKS_PER_SYNC_REQUEST};
+use n42_network::{BlockSyncResponse, MAX_BLOCKS_PER_SYNC_REQUEST, PeerId, SyncBlock};
 use n42_primitives::QuorumCertificate;
 use std::sync::LazyLock;
 use std::time::Duration;
 use tokio::time::Instant;
-use metrics::counter;
 use tracing::{debug, error, info, warn};
 
 // ── Configuration constants ──
@@ -238,11 +238,7 @@ impl ConsensusOrchestrator {
             })
             .collect();
 
-        let peer_committed_view = self
-            .committed_blocks
-            .back()
-            .map(|b| b.view)
-            .unwrap_or(0);
+        let peer_committed_view = self.committed_blocks.back().map(|b| b.view).unwrap_or(0);
 
         debug!(target: "n42::cl::sync", %peer, blocks_sent = blocks.len(), peer_committed_view, "sending sync response");
 
@@ -258,11 +254,7 @@ impl ConsensusOrchestrator {
 
     /// Handles a sync response containing blocks from a peer.
     /// Verifies QC validity, imports each block into reth, and requests more if still behind.
-    pub(super) async fn handle_sync_response(
-        &mut self,
-        peer: PeerId,
-        response: BlockSyncResponse,
-    ) {
+    pub(super) async fn handle_sync_response(&mut self, peer: PeerId, response: BlockSyncResponse) {
         self.sync_in_flight = false;
         self.sync_started_at = None;
 

@@ -3,10 +3,12 @@ use alloy_primitives::Bytes;
 use alloy_rpc_types_engine::ExecutionData;
 use reth_chainspec::ChainSpec;
 use reth_evm::{
-    ConfigureEvm, ConfigureEngineEvm, EvmEnvFor, ExecutableTxIterator, ExecutionCtxFor,
+    ConfigureEngineEvm, ConfigureEvm, EvmEnvFor, ExecutableTxIterator, ExecutionCtxFor,
 };
 use reth_evm_ethereum::EthEvmConfig;
-use reth_primitives_traits::{BlockTy, HeaderTy, SealedBlock, SealedHeader, SignedTransaction, TxTy};
+use reth_primitives_traits::{
+    BlockTy, HeaderTy, SealedBlock, SealedHeader, SignedTransaction, TxTy,
+};
 use reth_storage_errors::any::AnyError;
 use std::sync::Arc;
 
@@ -56,10 +58,7 @@ impl ConfigureEvm for N42EvmConfig {
         self.inner.block_assembler()
     }
 
-    fn evm_env(
-        &self,
-        header: &HeaderTy<Self::Primitives>,
-    ) -> Result<EvmEnvFor<Self>, Self::Error> {
+    fn evm_env(&self, header: &HeaderTy<Self::Primitives>) -> Result<EvmEnvFor<Self>, Self::Error> {
         self.inner.evm_env(header)
     }
 
@@ -88,10 +87,7 @@ impl ConfigureEvm for N42EvmConfig {
 }
 
 impl ConfigureEngineEvm<ExecutionData> for N42EvmConfig {
-    fn evm_env_for_payload(
-        &self,
-        payload: &ExecutionData,
-    ) -> Result<EvmEnvFor<Self>, Self::Error> {
+    fn evm_env_for_payload(&self, payload: &ExecutionData) -> Result<EvmEnvFor<Self>, Self::Error> {
         self.inner.evm_env_for_payload(payload)
     }
 
@@ -120,7 +116,7 @@ impl ConfigureEngineEvm<ExecutionData> for N42EvmConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use n42_chainspec::{n42_dev_chainspec, N42_CHAIN_ID};
+    use n42_chainspec::{N42_CHAIN_ID, n42_dev_chainspec};
 
     #[test]
     fn test_evm_config_creation() {

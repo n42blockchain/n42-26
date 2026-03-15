@@ -1,8 +1,8 @@
 use n42_primitives::consensus::{CommitVote, ConsensusMessage, PrepareQC, Vote};
 
-use crate::error::{ConsensusError, ConsensusResult};
 use super::quorum::{commit_signing_message, signing_message};
 use super::state_machine::{ConsensusEngine, EngineOutput};
+use crate::error::{ConsensusError, ConsensusResult};
 
 impl ConsensusEngine {
     /// Processes a Round 1 (Prepare) vote from a validator.
@@ -40,7 +40,8 @@ impl ConsensusEngine {
                 return Ok(());
             }
         } else {
-            self.equivocation_tracker.insert(vote.voter, vote.block_hash);
+            self.equivocation_tracker
+                .insert(vote.voter, vote.block_hash);
         }
 
         // Check block hash before verification (read-only borrow of collector).
@@ -57,10 +58,11 @@ impl ConsensusEngine {
         // Verify BLS signature before adding to collector.
         let pk = self.validator_set().get_public_key(vote.voter)?;
         let msg = signing_message(view, &vote.block_hash);
-        pk.verify(&msg, &vote.signature).map_err(|_| ConsensusError::InvalidSignature {
-            view,
-            validator_index: vote.voter,
-        })?;
+        pk.verify(&msg, &vote.signature)
+            .map_err(|_| ConsensusError::InvalidSignature {
+                view,
+                validator_index: vote.voter,
+            })?;
 
         let collector = match self.vote_collector.as_mut() {
             Some(c) => c,
@@ -115,14 +117,20 @@ impl ConsensusEngine {
         self.round_state.update_locked_qc(&qc);
 
         let block_hash = qc.block_hash;
-        let prepare_qc_msg = PrepareQC { view, block_hash, qc };
-        self.emit(EngineOutput::BroadcastMessage(ConsensusMessage::PrepareQC(prepare_qc_msg)))?;
+        let prepare_qc_msg = PrepareQC {
+            view,
+            block_hash,
+            qc,
+        };
+        self.emit(EngineOutput::BroadcastMessage(ConsensusMessage::PrepareQC(
+            prepare_qc_msg,
+        )))?;
 
         // Leader self-vote for CommitVote (Round 2).
         let commit_msg = commit_signing_message(view, &block_hash);
         let commit_sig = self.secret_key.sign(&commit_msg);
         if let Some(ref mut collector) = self.commit_collector {
-            let _ = collector.add_vote(self.my_index, commit_sig);
+            collector.add_verified_vote(self.my_index, commit_sig)?;
         }
 
         self.try_form_commit_qc()
@@ -155,10 +163,11 @@ impl ConsensusEngine {
 
         let pk = self.validator_set().get_public_key(cv.voter)?;
         let msg = commit_signing_message(view, &cv.block_hash);
-        pk.verify(&msg, &cv.signature).map_err(|_| ConsensusError::InvalidSignature {
-            view,
-            validator_index: cv.voter,
-        })?;
+        pk.verify(&msg, &cv.signature)
+            .map_err(|_| ConsensusError::InvalidSignature {
+                view,
+                validator_index: cv.voter,
+            })?;
 
         let collector = match self.commit_collector.as_mut() {
             Some(c) => c,
@@ -217,8 +226,14 @@ impl ConsensusEngine {
             block_hash,
             commit_qc: commit_qc.clone(),
         };
-        self.emit(EngineOutput::BroadcastMessage(ConsensusMessage::Decide(decide)))?;
-        self.emit(EngineOutput::BlockCommitted { view, block_hash, commit_qc })?;
+        self.emit(EngineOutput::BroadcastMessage(ConsensusMessage::Decide(
+            decide,
+        )))?;
+        self.emit(EngineOutput::BlockCommitted {
+            view,
+            block_hash,
+            commit_qc,
+        })?;
 
         let next_view = view.saturating_add(1);
         self.advance_to_view(next_view)?;
@@ -226,6 +241,8 @@ impl ConsensusEngine {
         // Notify the orchestrator that the view has advanced so the next leader
         // can start building immediately instead of waiting for a pacemaker timeout.
         let actual_view = self.round_state.current_view();
-        self.emit(EngineOutput::ViewChanged { new_view: actual_view })
+        self.emit(EngineOutput::ViewChanged {
+            new_view: actual_view,
+        })
     }
 }

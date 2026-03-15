@@ -1,17 +1,22 @@
 use n42_primitives::consensus::{ConsensusMessage, NewView, TimeoutMessage};
 
-use crate::error::{ConsensusError, ConsensusResult};
-use crate::validator::LeaderSelector;
 use super::quorum::{TimeoutCollector, newview_signing_message, timeout_signing_message};
 use super::round::Phase;
 use super::state_machine::{ConsensusEngine, EngineOutput, FUTURE_VIEW_WINDOW};
+use crate::error::{ConsensusError, ConsensusResult};
+use crate::validator::LeaderSelector;
 
 impl ConsensusEngine {
     /// Verifies a QC embedded in a timeout or NewView message.
     /// Genesis QC (view 0) is exempt — it has no real aggregate signatures.
     /// Uses `verify_qc_any_domain` because locked_qc may be either a prepare or commit QC.
-    fn verify_embedded_qc(&self, qc: &n42_primitives::consensus::QuorumCertificate) -> ConsensusResult<()> {
-        if qc.view == 0 { return Ok(()); }
+    fn verify_embedded_qc(
+        &self,
+        qc: &n42_primitives::consensus::QuorumCertificate,
+    ) -> ConsensusResult<()> {
+        if qc.view == 0 {
+            return Ok(());
+        }
         super::quorum::verify_qc_any_domain(qc, self.validator_set())
     }
 
@@ -24,7 +29,8 @@ impl ConsensusEngine {
             // Re-broadcasting ensures validators who missed the first message (network
             // jitter, late join) can still collect our vote for TC formation.
             tracing::warn!(target: "n42::cl::timeout", view, "view timed out (repeat, re-broadcasting timeout)");
-            self.pacemaker.reset_for_view(view, self.round_state.consecutive_timeouts());
+            self.pacemaker
+                .reset_for_view(view, self.round_state.consecutive_timeouts());
 
             let message = timeout_signing_message(view);
             let signature = self.secret_key.sign(&message);
@@ -34,9 +40,9 @@ impl ConsensusEngine {
                 sender: self.my_index,
                 signature,
             };
-            self.emit(EngineOutput::BroadcastMessage(
-                ConsensusMessage::Timeout(timeout_msg),
-            ))?;
+            self.emit(EngineOutput::BroadcastMessage(ConsensusMessage::Timeout(
+                timeout_msg,
+            )))?;
 
             // Check if quorum was reached while we were waiting (messages may have
             // arrived between repeats). Only the next leader can form the TC.
@@ -57,7 +63,8 @@ impl ConsensusEngine {
         // Reset pacemaker BEFORE processing to prevent the select! loop from spinning
         // on a deadline that stays in the past. If process_timeout forms a TC and calls
         // advance_to_view, the pacemaker will be reset again — a harmless double reset.
-        self.pacemaker.reset_for_view(view, self.round_state.consecutive_timeouts());
+        self.pacemaker
+            .reset_for_view(view, self.round_state.consecutive_timeouts());
 
         // Clear pending block data: similar to Tendermint's "prevote nil".
         self.pending_proposal = None;
@@ -80,9 +87,9 @@ impl ConsensusEngine {
             signature,
         };
 
-        self.emit(EngineOutput::BroadcastMessage(
-            ConsensusMessage::Timeout(timeout_msg.clone()),
-        ))?;
+        self.emit(EngineOutput::BroadcastMessage(ConsensusMessage::Timeout(
+            timeout_msg.clone(),
+        )))?;
 
         self.process_timeout(timeout_msg)
     }
@@ -102,10 +109,11 @@ impl ConsensusEngine {
         // Current-view timeout processing.
         let pk = self.validator_set().get_public_key(timeout.sender)?;
         let msg = timeout_signing_message(view);
-        pk.verify(&msg, &timeout.signature).map_err(|_| ConsensusError::InvalidSignature {
-            view,
-            validator_index: timeout.sender,
-        })?;
+        pk.verify(&msg, &timeout.signature)
+            .map_err(|_| ConsensusError::InvalidSignature {
+                view,
+                validator_index: timeout.sender,
+            })?;
 
         // Verify the embedded high_qc to prevent Byzantine validators from injecting
         // forged QCs that could manipulate the locked_qc via TC formation.
@@ -166,10 +174,11 @@ impl ConsensusEngine {
         // Verify BLS signature BEFORE advancing to prevent unauthenticated view jumps.
         let pk = self.validator_set().get_public_key(timeout.sender)?;
         let msg = timeout_signing_message(timeout.view);
-        pk.verify(&msg, &timeout.signature).map_err(|_| ConsensusError::InvalidSignature {
-            view: timeout.view,
-            validator_index: timeout.sender,
-        })?;
+        pk.verify(&msg, &timeout.signature)
+            .map_err(|_| ConsensusError::InvalidSignature {
+                view: timeout.view,
+                validator_index: timeout.sender,
+            })?;
 
         // Verify the embedded high_qc to prevent Byzantine validators from injecting
         // forged QCs via future-view timeouts.
@@ -192,12 +201,17 @@ impl ConsensusEngine {
 
         // Second reset: advance_to_view resets with consecutive_timeouts=0, but timeout()
         // just incremented the counter. This applies the correct exponential backoff.
-        self.pacemaker.reset_for_view(timeout.view, self.round_state.consecutive_timeouts());
+        self.pacemaker
+            .reset_for_view(timeout.view, self.round_state.consecutive_timeouts());
 
         // Conditional creation: advance_to_view may have replayed buffered messages that
         // already created and populated a timeout_collector. Overwriting would lose those.
         let n_validators = self.validator_set().len();
-        if self.timeout_collector.as_ref().is_none_or(|tc| tc.view() != timeout.view) {
+        if self
+            .timeout_collector
+            .as_ref()
+            .is_none_or(|tc| tc.view() != timeout.view)
+        {
             self.timeout_collector = Some(TimeoutCollector::new(timeout.view, n_validators));
         }
 
@@ -228,7 +242,9 @@ impl ConsensusEngine {
             sender: self.my_index,
             signature: own_sig,
         };
-        self.emit(EngineOutput::BroadcastMessage(ConsensusMessage::Timeout(own_timeout.clone())))?;
+        self.emit(EngineOutput::BroadcastMessage(ConsensusMessage::Timeout(
+            own_timeout.clone(),
+        )))?;
 
         self.process_timeout(own_timeout)
     }
@@ -253,10 +269,11 @@ impl ConsensusEngine {
         // Verify leader's signature to prevent Byzantine nodes from forging NewView messages.
         let pk = self.validator_set().get_public_key(nv.leader)?;
         let nv_msg = newview_signing_message(nv.view);
-        pk.verify(&nv_msg, &nv.signature).map_err(|_| ConsensusError::InvalidSignature {
-            view: nv.view,
-            validator_index: nv.leader,
-        })?;
+        pk.verify(&nv_msg, &nv.signature)
+            .map_err(|_| ConsensusError::InvalidSignature {
+                view: nv.view,
+                validator_index: nv.leader,
+            })?;
 
         // TC must be for the previous view (nv.view - 1).
         if nv.timeout_cert.view != nv.view.saturating_sub(1) {
@@ -281,7 +298,9 @@ impl ConsensusEngine {
         self.advance_to_view(nv.view)?;
         // Use actual view after advance: buffered-message replay may push view beyond nv.view.
         let actual_view = self.round_state.current_view();
-        self.emit(EngineOutput::ViewChanged { new_view: actual_view })
+        self.emit(EngineOutput::ViewChanged {
+            new_view: actual_view,
+        })
     }
 
     /// Builds a TC from the current timeout_collector and broadcasts NewView.
@@ -318,11 +337,15 @@ impl ConsensusEngine {
             signature: nv_sig,
         };
 
-        self.emit(EngineOutput::BroadcastMessage(ConsensusMessage::NewView(new_view)))?;
+        self.emit(EngineOutput::BroadcastMessage(ConsensusMessage::NewView(
+            new_view,
+        )))?;
 
         self.advance_to_view(next_view)?;
         // Use actual view: advance_to_view may replay buffered messages pushing view further.
         let actual_view = self.round_state.current_view();
-        self.emit(EngineOutput::ViewChanged { new_view: actual_view })
+        self.emit(EngineOutput::ViewChanged {
+            new_view: actual_view,
+        })
     }
 }

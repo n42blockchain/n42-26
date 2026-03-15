@@ -129,9 +129,7 @@ impl ReconnectionManager {
                         || state.consecutive_failures < self.max_attempts_discovered)
                     && now >= state.next_attempt
             })
-            .filter_map(|(peer_id, state)| {
-                state.addrs.first().map(|addr| (*peer_id, addr.clone()))
-            })
+            .filter_map(|(peer_id, state)| state.addrs.first().map(|addr| (*peer_id, addr.clone())))
             .collect()
     }
 }
@@ -167,8 +165,14 @@ mod tests {
         mgr.on_dial_failure(&peer);
         let after_second = mgr.peers[&peer].current_backoff;
 
-        assert!(after_first > initial / 2, "backoff should increase after failure");
-        assert!(after_second > after_first / 2, "backoff should continue increasing");
+        assert!(
+            after_first > initial / 2,
+            "backoff should increase after failure"
+        );
+        assert!(
+            after_second > after_first / 2,
+            "backoff should continue increasing"
+        );
     }
 
     #[test]

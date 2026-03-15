@@ -1,4 +1,4 @@
-use alloy_primitives::{Address, U256, B256};
+use alloy_primitives::{Address, B256, U256};
 use revm::database::BundleState;
 use std::collections::BTreeMap;
 use tracing::debug;
@@ -66,17 +66,26 @@ impl StateDiff {
 
     /// Returns the number of created accounts.
     pub fn created_count(&self) -> usize {
-        self.accounts.values().filter(|a| a.change_type == AccountChangeType::Created).count()
+        self.accounts
+            .values()
+            .filter(|a| a.change_type == AccountChangeType::Created)
+            .count()
     }
 
     /// Returns the number of modified accounts.
     pub fn modified_count(&self) -> usize {
-        self.accounts.values().filter(|a| a.change_type == AccountChangeType::Modified).count()
+        self.accounts
+            .values()
+            .filter(|a| a.change_type == AccountChangeType::Modified)
+            .count()
     }
 
     /// Returns the number of destroyed accounts.
     pub fn destroyed_count(&self) -> usize {
-        self.accounts.values().filter(|a| a.change_type == AccountChangeType::Destroyed).count()
+        self.accounts
+            .values()
+            .filter(|a| a.change_type == AccountChangeType::Destroyed)
+            .count()
     }
 
     /// Returns the total number of storage slot changes across all accounts.
@@ -101,7 +110,11 @@ impl StateDiff {
                 "account {address:?} marked destroyed but still has current info"
             );
 
-            let change_type = match (was_destroyed, original_info.is_some(), current_info.is_some()) {
+            let change_type = match (
+                was_destroyed,
+                original_info.is_some(),
+                current_info.is_some(),
+            ) {
                 (true, _, _) => AccountChangeType::Destroyed,
                 (false, false, true) => AccountChangeType::Created,
                 _ => AccountChangeType::Modified,
@@ -126,19 +139,12 @@ impl StateDiff {
             // Extract code change (track by code hash)
             let code_change = match (original_info, current_info) {
                 (Some(orig), Some(curr)) if orig.code_hash != curr.code_hash => {
-                    Some(ValueChange::new(
-                        Some(orig.code_hash),
-                        Some(curr.code_hash),
-                    ))
+                    Some(ValueChange::new(Some(orig.code_hash), Some(curr.code_hash)))
                 }
-                (None, Some(curr))
-                    if curr.code_hash != revm::primitives::KECCAK_EMPTY =>
-                {
+                (None, Some(curr)) if curr.code_hash != revm::primitives::KECCAK_EMPTY => {
                     Some(ValueChange::new(None, Some(curr.code_hash)))
                 }
-                (Some(orig), None)
-                    if orig.code_hash != revm::primitives::KECCAK_EMPTY =>
-                {
+                (Some(orig), None) if orig.code_hash != revm::primitives::KECCAK_EMPTY => {
                     Some(ValueChange::new(Some(orig.code_hash), None))
                 }
                 _ => None,
@@ -160,9 +166,7 @@ impl StateDiff {
             }
 
             // Only include accounts that actually changed
-            let has_changes = balance
-                .as_ref()
-                .is_some_and(|v| v.from != v.to)
+            let has_changes = balance.as_ref().is_some_and(|v| v.from != v.to)
                 || nonce.as_ref().is_some_and(|v| v.from != v.to)
                 || code_change.is_some()
                 || !storage.is_empty()
@@ -196,8 +200,8 @@ impl StateDiff {
 mod tests {
     use super::*;
     use alloy_primitives::{Address, B256, U256};
-    use revm::database::{AccountStatus, BundleAccount, BundleState, StorageWithOriginalValues};
     use revm::database::states::StorageSlot;
+    use revm::database::{AccountStatus, BundleAccount, BundleState, StorageWithOriginalValues};
     use revm::state::AccountInfo;
 
     /// Helper: create an AccountInfo with the given balance and nonce.
@@ -304,7 +308,10 @@ mod tests {
         assert_eq!(account_diff.change_type, AccountChangeType::Created);
 
         // Balance: 0 → 1000
-        let bal = account_diff.balance.as_ref().expect("should have balance change");
+        let bal = account_diff
+            .balance
+            .as_ref()
+            .expect("should have balance change");
         assert_eq!(bal.from, U256::ZERO);
         assert_eq!(bal.to, U256::from(1000));
 
@@ -318,9 +325,7 @@ mod tests {
     fn test_state_diff_modified_account() {
         let addr = Address::with_last_byte(2);
         let mut bundle = BundleState::default();
-        bundle
-            .state
-            .insert(addr, modified_account(500, 1, 1000, 2));
+        bundle.state.insert(addr, modified_account(500, 1, 1000, 2));
 
         let diff = StateDiff::from_bundle_state(&bundle);
         assert_eq!(diff.len(), 1);
@@ -358,12 +363,8 @@ mod tests {
     fn test_state_diff_storage_changes() {
         let addr = Address::with_last_byte(4);
         let mut account = modified_account(100, 1, 200, 2);
-        account
-            .storage
-            .insert(U256::from(0), storage_slot(42, 99));
-        account
-            .storage
-            .insert(U256::from(1), storage_slot(0, 100));
+        account.storage.insert(U256::from(0), storage_slot(42, 99));
+        account.storage.insert(U256::from(1), storage_slot(0, 100));
 
         let mut bundle = BundleState::default();
         bundle.state.insert(addr, account);
@@ -447,13 +448,16 @@ mod tests {
     fn test_state_diff_serde_json_roundtrip() {
         let addr = Address::with_last_byte(1);
         let mut diff = StateDiff::default();
-        diff.accounts.insert(addr, AccountDiff {
-            change_type: AccountChangeType::Created,
-            balance: Some(ValueChange::new(U256::ZERO, U256::from(1000))),
-            nonce: Some(ValueChange::new(0u64, 1u64)),
-            code_change: None,
-            storage: BTreeMap::new(),
-        });
+        diff.accounts.insert(
+            addr,
+            AccountDiff {
+                change_type: AccountChangeType::Created,
+                balance: Some(ValueChange::new(U256::ZERO, U256::from(1000))),
+                nonce: Some(ValueChange::new(0u64, 1u64)),
+                code_change: None,
+                storage: BTreeMap::new(),
+            },
+        );
 
         let json = serde_json::to_string(&diff).expect("json serialize");
         let deserialized: StateDiff = serde_json::from_str(&json).expect("json deserialize");
@@ -468,16 +472,25 @@ mod tests {
     fn test_state_diff_bincode_roundtrip() {
         let addr = Address::with_last_byte(2);
         let mut storage = BTreeMap::new();
-        storage.insert(U256::from(0), ValueChange::new(U256::from(10), U256::from(20)));
+        storage.insert(
+            U256::from(0),
+            ValueChange::new(U256::from(10), U256::from(20)),
+        );
 
         let mut diff = StateDiff::default();
-        diff.accounts.insert(addr, AccountDiff {
-            change_type: AccountChangeType::Modified,
-            balance: Some(ValueChange::new(U256::from(100), U256::from(200))),
-            nonce: Some(ValueChange::new(5u64, 6u64)),
-            code_change: Some(ValueChange::new(Some(B256::repeat_byte(0xAA)), Some(B256::repeat_byte(0xBB)))),
-            storage,
-        });
+        diff.accounts.insert(
+            addr,
+            AccountDiff {
+                change_type: AccountChangeType::Modified,
+                balance: Some(ValueChange::new(U256::from(100), U256::from(200))),
+                nonce: Some(ValueChange::new(5u64, 6u64)),
+                code_change: Some(ValueChange::new(
+                    Some(B256::repeat_byte(0xAA)),
+                    Some(B256::repeat_byte(0xBB)),
+                )),
+                storage,
+            },
+        );
 
         let encoded = bincode::serialize(&diff).expect("bincode serialize");
         let decoded: StateDiff = bincode::deserialize(&encoded).expect("bincode deserialize");
@@ -490,7 +503,11 @@ mod tests {
 
     #[test]
     fn test_account_change_type_serde_roundtrip() {
-        for variant in [AccountChangeType::Created, AccountChangeType::Modified, AccountChangeType::Destroyed] {
+        for variant in [
+            AccountChangeType::Created,
+            AccountChangeType::Modified,
+            AccountChangeType::Destroyed,
+        ] {
             let json = serde_json::to_string(&variant).expect("serialize");
             let deserialized: AccountChangeType = serde_json::from_str(&json).expect("deserialize");
             assert_eq!(variant, deserialized);
@@ -505,9 +522,7 @@ mod tests {
 
         let mut bundle = BundleState::default();
         bundle.state.insert(addr1, created_account(100, 0));
-        bundle
-            .state
-            .insert(addr2, modified_account(200, 1, 300, 2));
+        bundle.state.insert(addr2, modified_account(200, 1, 300, 2));
         bundle.state.insert(addr3, destroyed_account(400, 3));
 
         let diff = StateDiff::from_bundle_state(&bundle);
@@ -543,8 +558,12 @@ mod tests {
         bundle.state.insert(addr3, destroyed);
 
         let mut modified_with_storage = modified_account(500, 4, 600, 5);
-        modified_with_storage.storage.insert(U256::from(0), storage_slot(0, 42));
-        modified_with_storage.storage.insert(U256::from(1), storage_slot(0, 99));
+        modified_with_storage
+            .storage
+            .insert(U256::from(0), storage_slot(0, 42));
+        modified_with_storage
+            .storage
+            .insert(U256::from(1), storage_slot(0, 99));
         bundle.state.insert(addr4, modified_with_storage);
 
         let diff = StateDiff::from_bundle_state(&bundle);
@@ -552,7 +571,11 @@ mod tests {
         assert_eq!(diff.created_count(), 1);
         assert_eq!(diff.modified_count(), 2);
         assert_eq!(diff.destroyed_count(), 1);
-        assert_eq!(diff.total_storage_changes(), 3, "1 slot from destroyed + 2 from modified");
+        assert_eq!(
+            diff.total_storage_changes(),
+            3,
+            "1 slot from destroyed + 2 from modified"
+        );
     }
 
     #[test]

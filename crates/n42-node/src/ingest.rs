@@ -14,17 +14,16 @@
 //!   Server → Client: [u32 LE accepted_count]
 //!   num_txs = 0 → close connection gracefully.
 
-use alloy_consensus::{transaction::Recovered, Transaction};
+use alloy_consensus::{Transaction, transaction::Recovered};
 use alloy_primitives::{Address, U256};
 use reth_ethereum_primitives::TransactionSigned;
 use reth_transaction_pool::{
-    blobstore::BlobStore, AddedTransactionOutcome, CoinbaseTipOrdering, EthPooledTransaction,
-    Pool, PoolResult, PoolTransaction, TransactionOrigin, TransactionPool,
-    TransactionValidationOutcome, TransactionValidator,
-    validate::ValidTransaction,
+    AddedTransactionOutcome, CoinbaseTipOrdering, EthPooledTransaction, Pool, PoolResult,
+    PoolTransaction, TransactionOrigin, TransactionPool, TransactionValidationOutcome,
+    TransactionValidator, blobstore::BlobStore, validate::ValidTransaction,
 };
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, error, info, warn};
@@ -65,7 +64,8 @@ where
                 authorities: None,
             }
         });
-        self.inner().add_transactions(TransactionOrigin::External, outcomes)
+        self.inner()
+            .add_transactions(TransactionOrigin::External, outcomes)
     }
 
     fn pending_count(&self) -> usize {
@@ -250,7 +250,9 @@ where
         }
 
         if batch_decode_errors > 0 {
-            stats.decode_errors.fetch_add(batch_decode_errors, Ordering::Relaxed);
+            stats
+                .decode_errors
+                .fetch_add(batch_decode_errors, Ordering::Relaxed);
         }
 
         // Pool gate: reject entire batch when pool is near capacity.
@@ -278,7 +280,9 @@ where
 
         stats.accepted.fetch_add(accepted as u64, Ordering::Relaxed);
         if pool_errors > 0 {
-            stats.pool_errors.fetch_add(pool_errors as u64, Ordering::Relaxed);
+            stats
+                .pool_errors
+                .fetch_add(pool_errors as u64, Ordering::Relaxed);
         }
 
         // ACK v3: [u32 accepted][u32 pool_pending]

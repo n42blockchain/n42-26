@@ -1,7 +1,7 @@
-use alloy_primitives::Address;
-use n42_primitives::BlsPublicKey;
-use n42_chainspec::ValidatorInfo;
 use crate::error::{ConsensusError, ConsensusResult};
+use alloy_primitives::Address;
+use n42_chainspec::ValidatorInfo;
+use n42_primitives::BlsPublicKey;
 
 /// Manages the active validator set for consensus.
 ///
@@ -21,29 +21,48 @@ pub struct ValidatorSet {
 struct ValidatorEntry {
     address: Address,
     public_key: BlsPublicKey,
+    p2p_peer_id: Option<String>,
 }
 
 impl ValidatorSet {
-    /// Creates a new validator set from chain configuration.
-    pub fn new(validators: &[ValidatorInfo], fault_tolerance: u32) -> Self {
-        debug_assert!(
-            fault_tolerance <= (validators.len() as u32).saturating_sub(1) / 3,
-            "fault_tolerance ({fault_tolerance}) exceeds BFT bound for {} validators",
-            validators.len(),
-        );
+    fn max_fault_tolerance_for_len(len: usize) -> u32 {
+        (len as u32).saturating_sub(1) / 3
+    }
+
+    pub fn validate_params(validator_count: usize, fault_tolerance: u32) -> ConsensusResult<()> {
+        let max_fault_tolerance = Self::max_fault_tolerance_for_len(validator_count);
+        if fault_tolerance > max_fault_tolerance {
+            return Err(ConsensusError::InvalidValidatorSetParams {
+                validator_count: validator_count as u32,
+                fault_tolerance,
+                max_fault_tolerance,
+            });
+        }
+        Ok(())
+    }
+
+    pub fn try_new(validators: &[ValidatorInfo], fault_tolerance: u32) -> ConsensusResult<Self> {
+        Self::validate_params(validators.len(), fault_tolerance)?;
 
         let entries = validators
             .iter()
             .map(|v| ValidatorEntry {
                 address: v.address,
                 public_key: v.bls_public_key.clone(),
+                p2p_peer_id: v.p2p_peer_id.clone(),
             })
             .collect();
 
-        Self {
+        Ok(Self {
             validators: entries,
             fault_tolerance,
-        }
+        })
+    }
+
+    /// Creates a new validator set from chain configuration.
+    pub fn new(validators: &[ValidatorInfo], fault_tolerance: u32) -> Self {
+        Self::try_new(validators, fault_tolerance)
+            .unwrap_or_else(|error| panic!("invalid validator set parameters: {error}"))
     }
 
     /// Returns the total number of validators.
@@ -65,6 +84,18 @@ impl ValidatorSet {
     /// Returns the fault tolerance f.
     pub fn fault_tolerance(&self) -> u32 {
         self.fault_tolerance
+    }
+
+    /// Returns a clone of the validator infos backing this set.
+    pub fn validator_infos(&self) -> Vec<ValidatorInfo> {
+        self.validators
+            .iter()
+            .map(|entry| ValidatorInfo {
+                address: entry.address,
+                bls_public_key: entry.public_key.clone(),
+                p2p_peer_id: entry.p2p_peer_id.clone(),
+            })
+            .collect()
     }
 
     /// Gets the BLS public key for a validator by index.
@@ -89,6 +120,14 @@ impl ValidatorSet {
             })
     }
 
+    /// Returns the validator index for the given BLS public key, if present.
+    pub fn index_of_public_key(&self, public_key: &BlsPublicKey) -> Option<u32> {
+        self.validators
+            .iter()
+            .position(|entry| entry.public_key.to_bytes() == public_key.to_bytes())
+            .map(|index| index as u32)
+    }
+
     /// Checks if a validator index is valid.
     pub fn contains(&self, index: u32) -> bool {
         (index as usize) < self.validators.len()
@@ -102,7 +141,10 @@ impl ValidatorSet {
 
     /// Returns public keys for specific indices (matching a signer bitmap).
     /// Used for verifying aggregated signatures against the signing subset.
-    pub fn public_keys_for_signers(&self, signer_indices: &[u32]) -> ConsensusResult<Vec<&BlsPublicKey>> {
+    pub fn public_keys_for_signers(
+        &self,
+        signer_indices: &[u32],
+    ) -> ConsensusResult<Vec<&BlsPublicKey>> {
         signer_indices
             .iter()
             .map(|&idx| self.get_public_key(idx))
@@ -121,6 +163,7 @@ mod tests {
         let info = ValidatorInfo {
             address: Address::with_last_byte(index),
             bls_public_key: sk.public_key(),
+            p2p_peer_id: None,
         };
         (sk, info)
     }
@@ -201,6 +244,20 @@ mod tests {
     }
 
     #[test]
+    fn test_index_of_public_key() {
+        let items: Vec<_> = (0..4u8).map(|i| make_validator_info(i)).collect();
+        let infos: Vec<_> = items.iter().map(|(_, info)| info.clone()).collect();
+        let vs = ValidatorSet::new(&infos, 1);
+
+        for (i, (_, info)) in items.iter().enumerate() {
+            assert_eq!(vs.index_of_public_key(&info.bls_public_key), Some(i as u32));
+        }
+
+        let missing_key = BlsSecretKey::random().unwrap().public_key();
+        assert_eq!(vs.index_of_public_key(&missing_key), None);
+    }
+
+    #[test]
     fn test_public_keys_for_signers() {
         let items: Vec<_> = (0..4u8).map(|i| make_validator_info(i)).collect();
         let infos: Vec<_> = items.iter().map(|(_, info)| info.clone()).collect();
@@ -212,5 +269,19 @@ mod tests {
         assert_eq!(pks[1].to_bytes(), items[2].1.bls_public_key.to_bytes());
 
         assert!(vs.public_keys_for_signers(&[0, 10]).is_err());
+    }
+
+    #[test]
+    fn test_try_new_rejects_invalid_fault_tolerance() {
+        let infos: Vec<_> = (0..4u8).map(|i| make_validator_info(i).1).collect();
+        let err = ValidatorSet::try_new(&infos, 2).unwrap_err();
+        assert!(matches!(
+            err,
+            ConsensusError::InvalidValidatorSetParams {
+                validator_count: 4,
+                fault_tolerance: 2,
+                max_fault_tolerance: 1,
+            }
+        ));
     }
 }

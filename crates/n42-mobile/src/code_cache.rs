@@ -1,4 +1,4 @@
-use alloy_primitives::{Bytes, B256};
+use alloy_primitives::{B256, Bytes};
 use lru::LruCache;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -23,7 +23,9 @@ impl CodeCache {
         } else {
             capacity
         };
-        Self { cache: LruCache::new(NonZeroUsize::new(capacity).unwrap()) }
+        Self {
+            cache: LruCache::new(NonZeroUsize::new(capacity).unwrap()),
+        }
     }
 
     /// Inserts a bytecode into the cache.
@@ -147,8 +149,7 @@ pub fn encode_cache_sync(msg: &CacheSyncMessage) -> Vec<u8> {
     use crate::wire;
 
     let codes_size: usize = msg.codes.iter().map(|(_, c)| 32 + 4 + c.len()).sum();
-    let estimated =
-        wire::HEADER_SIZE + 4 + codes_size + 4 + msg.evict_hints.len() * 32;
+    let estimated = wire::HEADER_SIZE + 4 + codes_size + 4 + msg.evict_hints.len() * 32;
     let mut buf = Vec::with_capacity(estimated);
 
     wire::encode_header(&mut buf, wire::VERSION_1, 0x00);
@@ -242,7 +243,7 @@ pub fn decode_cache_sync(data: &[u8]) -> Result<CacheSyncMessage, crate::wire::W
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_primitives::{Bytes, B256};
+    use alloy_primitives::{B256, Bytes};
 
     /// Helper: creates a B256 hash from a single byte (for readability).
     fn hash(b: u8) -> B256 {
@@ -298,19 +299,28 @@ mod tests {
         let mut cache = CodeCache::new(10);
         let h = hash(5);
 
-        assert!(!cache.contains(&h), "empty cache should not contain any key");
+        assert!(
+            !cache.contains(&h),
+            "empty cache should not contain any key"
+        );
 
         cache.insert(h, bytecode(&[0x01]));
         assert!(cache.contains(&h), "cache should contain the inserted key");
 
-        assert!(!cache.contains(&hash(99)), "cache should not contain a key that was never inserted");
+        assert!(
+            !cache.contains(&hash(99)),
+            "cache should not contain a key that was never inserted"
+        );
     }
 
     #[test]
     fn test_code_cache_cached_hashes() {
         let mut cache = CodeCache::new(10);
 
-        assert!(cache.cached_hashes().is_empty(), "empty cache returns empty hashes");
+        assert!(
+            cache.cached_hashes().is_empty(),
+            "empty cache returns empty hashes"
+        );
 
         let hashes_to_insert = vec![hash(10), hash(20), hash(30)];
         for h in &hashes_to_insert {
@@ -322,7 +332,10 @@ mod tests {
         let mut expected = hashes_to_insert.clone();
         expected.sort();
 
-        assert_eq!(cached, expected, "cached_hashes should return all inserted hashes");
+        assert_eq!(
+            cached, expected,
+            "cached_hashes should return all inserted hashes"
+        );
     }
 
     #[test]
@@ -377,7 +390,10 @@ mod tests {
 
         assert_eq!(decoded.codes.len(), 2);
         assert_eq!(decoded.codes[0].0, hash(1));
-        assert_eq!(decoded.codes[1].1, bytecode(&[0x60, 0x01, 0x60, 0x00, 0xf3]));
+        assert_eq!(
+            decoded.codes[1].1,
+            bytecode(&[0x60, 0x01, 0x60, 0x00, 0xf3])
+        );
         assert_eq!(decoded.evict_hints, vec![hash(10), hash(20)]);
     }
 
@@ -441,10 +457,17 @@ mod tests {
         // hash(2) had count 1, after * 0.5 → 0.5 truncated to 0 → removed.
         // hash(1) had count 10, after * 0.5 → 5.
         let hash1_entry = top.iter().find(|(h, _)| *h == hash(1));
-        assert_eq!(hash1_entry, Some(&(hash(1), 5)), "hash(1) count should be halved to 5");
+        assert_eq!(
+            hash1_entry,
+            Some(&(hash(1), 5)),
+            "hash(1) count should be halved to 5"
+        );
 
         let hash2_entry = top.iter().find(|(h, _)| *h == hash(2));
-        assert!(hash2_entry.is_none(), "hash(2) should be removed after decay (count went to 0)");
+        assert!(
+            hash2_entry.is_none(),
+            "hash(2) should be removed after decay (count went to 0)"
+        );
     }
 
     #[test]
@@ -458,7 +481,10 @@ mod tests {
         cache.insert(hash(2), bytecode(&[0x02]));
         assert_eq!(cache.len(), 1);
         assert!(cache.contains(&hash(2)));
-        assert!(!cache.contains(&hash(1)), "clamped capacity=1, oldest should be evicted");
+        assert!(
+            !cache.contains(&hash(1)),
+            "clamped capacity=1, oldest should be evicted"
+        );
     }
 
     #[test]
@@ -470,7 +496,10 @@ mod tests {
 
         // decay(0.0) should remove all entries (counts become 0).
         tracker.decay(0.0);
-        assert!(tracker.top_contracts(10).is_empty(), "decay(0.0) should remove all entries");
+        assert!(
+            tracker.top_contracts(10).is_empty(),
+            "decay(0.0) should remove all entries"
+        );
     }
 
     #[test]
@@ -484,13 +513,20 @@ mod tests {
         let top = tracker.top_contracts(10);
         assert_eq!(top.len(), 2);
         let h1 = top.iter().find(|(h, _)| *h == hash(1));
-        assert_eq!(h1, Some(&(hash(1), 2)), "decay(1.0) should not change counts");
+        assert_eq!(
+            h1,
+            Some(&(hash(1), 2)),
+            "decay(1.0) should not change counts"
+        );
     }
 
     #[test]
     fn test_hot_tracker_empty_top() {
         let tracker = HotContractTracker::new();
-        assert!(tracker.top_contracts(10).is_empty(), "empty tracker should return empty list");
+        assert!(
+            tracker.top_contracts(10).is_empty(),
+            "empty tracker should return empty list"
+        );
         assert_eq!(tracker.blocks_tracked(), 0);
     }
 
@@ -513,7 +549,10 @@ mod tests {
         assert_eq!(decoded.codes[0].0, hash(1));
         assert_eq!(decoded.codes[0].1, bytecode(&[0x60, 0x00]));
         assert_eq!(decoded.codes[1].0, hash(2));
-        assert_eq!(decoded.codes[1].1, bytecode(&[0x60, 0x01, 0x60, 0x00, 0xf3]));
+        assert_eq!(
+            decoded.codes[1].1,
+            bytecode(&[0x60, 0x01, 0x60, 0x00, 0xf3])
+        );
         assert_eq!(decoded.evict_hints, vec![hash(10), hash(20)]);
     }
 
@@ -531,7 +570,10 @@ mod tests {
 
     #[test]
     fn test_cache_sync_versioned_header_check() {
-        let msg = CacheSyncMessage { codes: vec![], evict_hints: vec![] };
+        let msg = CacheSyncMessage {
+            codes: vec![],
+            evict_hints: vec![],
+        };
         let encoded = encode_cache_sync(&msg);
         // First 2 bytes should be "N2"
         assert_eq!(encoded[0], 0x4E);

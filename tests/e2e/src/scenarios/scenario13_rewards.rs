@@ -37,7 +37,10 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
             .filter(|&j| j != i)
             .map(|j| {
                 let peer_port = 9400 + port_offset_base + (j as u16) * 10;
-                format!("/ip4/127.0.0.1/udp/{}/quic-v1/p2p/{}", peer_port, peer_ids[j])
+                format!(
+                    "/ip4/127.0.0.1/udp/{}/quic-v1/p2p/{}",
+                    peer_port, peer_ids[j]
+                )
             })
             .collect();
 
@@ -54,14 +57,23 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
             startup_delay_ms: Some(2000),
         };
 
-        match NodeProcess::start_with_env(&config, vec![
-            ("N42_REWARD_EPOCH_BLOCKS", "10"),
-            ("N42_DAILY_BASE_REWARD_GWEI", "100000000"),
-            ("N42_REWARD_CURVE_K", "4.0"),
-            ("N42_MIN_ATTESTATION_THRESHOLD", "1"),
-        ]).await {
+        match NodeProcess::start_with_env(
+            &config,
+            vec![
+                ("N42_REWARD_EPOCH_BLOCKS", "10"),
+                ("N42_DAILY_BASE_REWARD_GWEI", "100000000"),
+                ("N42_REWARD_CURVE_K", "4.0"),
+                ("N42_MIN_ATTESTATION_THRESHOLD", "1"),
+            ],
+        )
+        .await
+        {
             Ok(node) => {
-                info!(index = i, http_port = node.http_port, "validator node started");
+                info!(
+                    index = i,
+                    http_port = node.http_port,
+                    "validator node started"
+                );
                 nodes.push(node);
             }
             Err(e) => {
@@ -90,7 +102,11 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
         }
 
         if let Ok(height) = nodes[0].rpc.block_number().await {
-            info!(current_height = height, target = target_blocks, "block progress");
+            info!(
+                current_height = height,
+                target = target_blocks,
+                "block progress"
+            );
             if height >= target_blocks {
                 break;
             }
@@ -123,9 +139,9 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
     let mut reward_total = U256::ZERO;
 
     for (miner_addr, block_count) in &miner_blocks {
-        let addr: Address = miner_addr.parse().map_err(|e| {
-            eyre::eyre!("failed to parse miner address {miner_addr}: {e}")
-        })?;
+        let addr: Address = miner_addr
+            .parse()
+            .map_err(|e| eyre::eyre!("failed to parse miner address {miner_addr}: {e}"))?;
         let balance = nodes[0].rpc.get_balance(addr).await.unwrap_or(U256::ZERO);
 
         // Check if this miner address is one of the pre-funded test accounts
@@ -207,7 +223,10 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
     }
 
     if fairness_ok {
-        info!("V2 PASS: leader rotation is fair across {} validators", miner_blocks.len());
+        info!(
+            "V2 PASS: leader rotation is fair across {} validators",
+            miner_blocks.len()
+        );
     } else {
         warn!("V2 WARNING: leader rotation fairness check has concerns (non-fatal)");
     }

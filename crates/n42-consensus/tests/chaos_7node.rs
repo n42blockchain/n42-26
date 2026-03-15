@@ -6,8 +6,8 @@ use n42_chainspec::ValidatorInfo;
 use n42_consensus::error::ConsensusError;
 use n42_consensus::protocol::quorum::signing_message;
 use n42_consensus::{ConsensusEngine, ConsensusEvent, EngineOutput, ValidatorSet};
-use n42_primitives::consensus::{ConsensusMessage, ViewNumber};
 use n42_primitives::BlsSecretKey;
+use n42_primitives::consensus::{ConsensusMessage, ViewNumber};
 use tokio::sync::mpsc;
 
 fn test_bls_key(index: u32) -> BlsSecretKey {
@@ -36,6 +36,7 @@ impl ChaosHarness {
             .map(|(i, sk)| ValidatorInfo {
                 address: Address::with_last_byte(i as u8),
                 bls_public_key: sk.public_key(),
+                p2p_peer_id: None,
             })
             .collect();
 
@@ -92,7 +93,8 @@ impl ChaosHarness {
             .process_event(ConsensusEvent::BlockReady(block_hash))
             .expect("leader BlockReady should succeed");
 
-        let proposal = self.drain_outputs(leader)
+        let proposal = self
+            .drain_outputs(leader)
             .into_iter()
             .find_map(|o| match o {
                 EngineOutput::BroadcastMessage(msg @ ConsensusMessage::Proposal(_)) => Some(msg),
@@ -134,7 +136,8 @@ impl ChaosHarness {
             }
         }
 
-        let prepare_qc = self.drain_outputs(leader)
+        let prepare_qc = self
+            .drain_outputs(leader)
             .into_iter()
             .find_map(|o| match o {
                 EngineOutput::BroadcastMessage(msg @ ConsensusMessage::PrepareQC(_)) => Some(msg),
@@ -155,8 +158,8 @@ impl ChaosHarness {
                 for output in self.drain_outputs(i) {
                     if let EngineOutput::SendToValidator(target, msg) = output {
                         if target == leader as u32 {
-                            let _ = self.engines[leader]
-                                .process_event(ConsensusEvent::Message(msg));
+                            let _ =
+                                self.engines[leader].process_event(ConsensusEvent::Message(msg));
                         }
                     }
                 }
@@ -165,7 +168,12 @@ impl ChaosHarness {
 
         let leader_outputs = self.drain_outputs(leader);
         for output in &leader_outputs {
-            if let EngineOutput::BlockCommitted { view: v, block_hash: h, .. } = output {
+            if let EngineOutput::BlockCommitted {
+                view: v,
+                block_hash: h,
+                ..
+            } = output
+            {
                 self.committed_blocks.push((*v, *h));
             }
         }
@@ -181,8 +189,7 @@ impl ChaosHarness {
         for msg in &decide_msgs {
             for i in 0..n {
                 if i != leader {
-                    let _ = self.engines[i]
-                        .process_event(ConsensusEvent::Message(msg.clone()));
+                    let _ = self.engines[i].process_event(ConsensusEvent::Message(msg.clone()));
                 }
             }
         }
@@ -191,8 +198,7 @@ impl ChaosHarness {
         for i in 0..n {
             if self.engines[i].current_view() < next_view {
                 for msg in &decide_msgs {
-                    let _ = self.engines[i]
-                        .process_event(ConsensusEvent::Message(msg.clone()));
+                    let _ = self.engines[i].process_event(ConsensusEvent::Message(msg.clone()));
                 }
             }
         }
@@ -204,10 +210,13 @@ impl ChaosHarness {
         let n = self.n();
 
         for i in 0..n {
-            self.engines[i].on_timeout().expect("timeout should succeed");
+            self.engines[i]
+                .on_timeout()
+                .expect("timeout should succeed");
         }
 
-        let timeout_msgs: Vec<_> = self.drain_all_outputs()
+        let timeout_msgs: Vec<_> = self
+            .drain_all_outputs()
             .into_iter()
             .enumerate()
             .flat_map(|(i, outputs)| {
@@ -223,8 +232,7 @@ impl ChaosHarness {
         for (from, msg) in &timeout_msgs {
             for i in 0..n {
                 if i != *from {
-                    let _ = self.engines[i]
-                        .process_event(ConsensusEvent::Message(msg.clone()));
+                    let _ = self.engines[i].process_event(ConsensusEvent::Message(msg.clone()));
                 }
             }
         }
@@ -232,7 +240,8 @@ impl ChaosHarness {
         let next_view = view + 1;
         let next_leader = (next_view % n as u64) as usize;
 
-        if let Some(nv) = self.drain_all_outputs()
+        if let Some(nv) = self
+            .drain_all_outputs()
             .into_iter()
             .flatten()
             .find_map(|o| match o {
@@ -242,8 +251,7 @@ impl ChaosHarness {
         {
             for i in 0..n {
                 if i != next_leader && self.engines[i].current_view() < next_view {
-                    let _ = self.engines[i]
-                        .process_event(ConsensusEvent::Message(nv.clone()));
+                    let _ = self.engines[i].process_event(ConsensusEvent::Message(nv.clone()));
                 }
             }
         }
@@ -268,23 +276,20 @@ impl ChaosHarness {
         };
 
         // Helper: route a broadcast message from `from` with partition-aware delivery
-        let route_broadcast =
-            |harness: &mut ChaosHarness, from: usize, msg: &ConsensusMessage| {
-                // Phase 1: immediate delivery (same group or bridge involved)
-                for i in 0..n {
-                    if i != from && immediate_delivery(from, i) {
-                        let _ = harness.engines[i]
-                            .process_event(ConsensusEvent::Message(msg.clone()));
-                    }
+        let route_broadcast = |harness: &mut ChaosHarness, from: usize, msg: &ConsensusMessage| {
+            // Phase 1: immediate delivery (same group or bridge involved)
+            for i in 0..n {
+                if i != from && immediate_delivery(from, i) {
+                    let _ = harness.engines[i].process_event(ConsensusEvent::Message(msg.clone()));
                 }
-                // Phase 2: delayed delivery (cross-group, no bridge)
-                for i in 0..n {
-                    if i != from && !immediate_delivery(from, i) {
-                        let _ = harness.engines[i]
-                            .process_event(ConsensusEvent::Message(msg.clone()));
-                    }
+            }
+            // Phase 2: delayed delivery (cross-group, no bridge)
+            for i in 0..n {
+                if i != from && !immediate_delivery(from, i) {
+                    let _ = harness.engines[i].process_event(ConsensusEvent::Message(msg.clone()));
                 }
-            };
+            }
+        };
 
         // Step 1: Leader proposes
         self.engines[leader]
@@ -361,8 +366,8 @@ impl ChaosHarness {
                 for output in outputs {
                     if let EngineOutput::SendToValidator(target, msg) = output {
                         if target == leader as u32 {
-                            let _ = self.engines[leader]
-                                .process_event(ConsensusEvent::Message(msg));
+                            let _ =
+                                self.engines[leader].process_event(ConsensusEvent::Message(msg));
                         }
                     }
                 }
@@ -372,7 +377,12 @@ impl ChaosHarness {
         // Step 6: Record commits, route Decide with partition
         let leader_outputs = self.drain_outputs(leader);
         for output in &leader_outputs {
-            if let EngineOutput::BlockCommitted { view: v, block_hash: h, .. } = output {
+            if let EngineOutput::BlockCommitted {
+                view: v,
+                block_hash: h,
+                ..
+            } = output
+            {
                 self.committed_blocks.push((*v, *h));
             }
         }
@@ -394,8 +404,7 @@ impl ChaosHarness {
         for i in 0..n {
             if self.engines[i].current_view() < next_view {
                 for msg in &decide_msgs {
-                    let _ = self.engines[i]
-                        .process_event(ConsensusEvent::Message(msg.clone()));
+                    let _ = self.engines[i].process_event(ConsensusEvent::Message(msg.clone()));
                 }
             }
         }
@@ -419,11 +428,10 @@ impl ChaosHarness {
         let mut committed = false;
 
         // Helper: check process_event result for DuplicateVote
-        let check_result = |result: Result<(), ConsensusError>, dup_count: &mut usize| {
-            match result {
-                Err(ConsensusError::DuplicateVote { .. }) => *dup_count += 1,
-                _ => {}
-            }
+        let check_result = |result: Result<(), ConsensusError>, dup_count: &mut usize| match result
+        {
+            Err(ConsensusError::DuplicateVote { .. }) => *dup_count += 1,
+            _ => {}
         };
 
         // Helper: count EquivocationDetected in outputs
@@ -435,8 +443,7 @@ impl ChaosHarness {
         };
 
         // Step 1: Leader proposes
-        let result = self.engines[leader]
-            .process_event(ConsensusEvent::BlockReady(block_hash));
+        let result = self.engines[leader].process_event(ConsensusEvent::BlockReady(block_hash));
         check_result(result, &mut dup_vote_errors);
 
         let leader_outputs = self.drain_outputs(leader);
@@ -463,8 +470,8 @@ impl ChaosHarness {
         for i in 0..n {
             if i != leader {
                 if rng.next_f64() >= drop_rate {
-                    let result = self.engines[i]
-                        .process_event(ConsensusEvent::Message(proposal.clone()));
+                    let result =
+                        self.engines[i].process_event(ConsensusEvent::Message(proposal.clone()));
                     check_result(result, &mut dup_vote_errors);
 
                     // BlockImported immediately after Proposal
@@ -512,8 +519,8 @@ impl ChaosHarness {
         for i in 0..n {
             if i != leader {
                 if rng.next_f64() >= drop_rate {
-                    let result = self.engines[i]
-                        .process_event(ConsensusEvent::Message(prepare_qc.clone()));
+                    let result =
+                        self.engines[i].process_event(ConsensusEvent::Message(prepare_qc.clone()));
                     check_result(result, &mut dup_vote_errors);
                 }
             }
@@ -542,7 +549,12 @@ impl ChaosHarness {
         let leader_outputs = self.drain_outputs(leader);
         equivocation_events += count_equivocations(&leader_outputs);
         for output in &leader_outputs {
-            if let EngineOutput::BlockCommitted { view: v, block_hash: h, .. } = output {
+            if let EngineOutput::BlockCommitted {
+                view: v,
+                block_hash: h,
+                ..
+            } = output
+            {
                 self.committed_blocks.push((*v, *h));
                 committed = true;
             }
@@ -561,8 +573,7 @@ impl ChaosHarness {
             for i in 0..n {
                 if i != leader {
                     if rng.next_f64() >= drop_rate {
-                        let _ = self.engines[i]
-                            .process_event(ConsensusEvent::Message(msg.clone()));
+                        let _ = self.engines[i].process_event(ConsensusEvent::Message(msg.clone()));
                     }
                 }
             }
@@ -573,8 +584,7 @@ impl ChaosHarness {
         for i in 0..n {
             if self.engines[i].current_view() < next_view {
                 for msg in &decide_msgs {
-                    let _ = self.engines[i]
-                        .process_event(ConsensusEvent::Message(msg.clone()));
+                    let _ = self.engines[i].process_event(ConsensusEvent::Message(msg.clone()));
                 }
             }
         }
@@ -673,7 +683,8 @@ async fn test_timeout_view_change_proposer_suppression() {
 
     // Verification
     // V1: View 4 should have no committed block
-    let committed_views: Vec<ViewNumber> = harness.committed_blocks.iter().map(|(v, _)| *v).collect();
+    let committed_views: Vec<ViewNumber> =
+        harness.committed_blocks.iter().map(|(v, _)| *v).collect();
     assert!(
         !committed_views.contains(&4),
         "view 4 should have no committed block (proposer was silent)"
@@ -790,8 +801,7 @@ async fn test_malicious_forged_votes() {
             signature: wrong_sig,
         });
 
-        let result = harness.engines[leader]
-            .process_event(ConsensusEvent::Message(forged_vote));
+        let result = harness.engines[leader].process_event(ConsensusEvent::Message(forged_vote));
 
         match result {
             Err(ConsensusError::InvalidSignature {
@@ -823,22 +833,19 @@ async fn test_malicious_forged_votes() {
 
         // This vote has a mismatched block_hash — it should be rejected
         // Either Ok (silently ignored) or error due to hash mismatch
-        let result = harness.engines[leader]
-            .process_event(ConsensusEvent::Message(forged_vote));
+        let result = harness.engines[leader].process_event(ConsensusEvent::Message(forged_vote));
 
         // The vote's block_hash doesn't match the collector's expected hash,
         // so it could be ignored or return an error — either is acceptable
         match &result {
             Ok(()) => { /* silently ignored, acceptable */ }
-            Err(ConsensusError::BlockHashMismatch { .. }) => { /* explicitly rejected, acceptable */ }
+            Err(ConsensusError::BlockHashMismatch { .. }) => { /* explicitly rejected, acceptable */
+            }
             Err(ConsensusError::InvalidSignature { .. }) => {
                 // The engine verifies signature against the *proposal's* block_hash,
                 // not the vote's block_hash, so this mismatch causes sig check failure
             }
-            Err(e) => panic!(
-                "unexpected error for wrong-hash vote from node 6: {:?}",
-                e
-            ),
+            Err(e) => panic!("unexpected error for wrong-hash vote from node 6: {:?}", e),
         }
     }
 
@@ -872,8 +879,7 @@ async fn test_malicious_forged_votes() {
 
     for i in 0..7 {
         if i != leader {
-            let _ = harness.engines[i]
-                .process_event(ConsensusEvent::Message(prepare_qc.clone()));
+            let _ = harness.engines[i].process_event(ConsensusEvent::Message(prepare_qc.clone()));
         }
     }
 
@@ -884,8 +890,7 @@ async fn test_malicious_forged_votes() {
             for output in outputs {
                 if let EngineOutput::SendToValidator(target, msg) = output {
                     if target == leader as u32 {
-                        let _ = harness.engines[leader]
-                            .process_event(ConsensusEvent::Message(msg));
+                        let _ = harness.engines[leader].process_event(ConsensusEvent::Message(msg));
                     }
                 }
             }
@@ -895,7 +900,12 @@ async fn test_malicious_forged_votes() {
     // Route Decide
     let leader_outputs = harness.drain_outputs(leader);
     for output in &leader_outputs {
-        if let EngineOutput::BlockCommitted { view: v, block_hash: h, .. } = output {
+        if let EngineOutput::BlockCommitted {
+            view: v,
+            block_hash: h,
+            ..
+        } = output
+        {
             harness.committed_blocks.push((*v, *h));
         }
     }
@@ -911,8 +921,7 @@ async fn test_malicious_forged_votes() {
     for msg in &decide_msgs {
         for i in 0..7 {
             if i != leader {
-                let _ = harness.engines[i]
-                    .process_event(ConsensusEvent::Message(msg.clone()));
+                let _ = harness.engines[i].process_event(ConsensusEvent::Message(msg.clone()));
             }
         }
     }
@@ -942,10 +951,7 @@ async fn test_malicious_forged_votes() {
         "should have committed 5 blocks total"
     );
     for v in 1..=5 {
-        assert!(
-            committed_views.contains(&v),
-            "view {v} should be committed"
-        );
+        assert!(committed_views.contains(&v), "view {v} should be committed");
     }
 
     // V3: All engines at view 6
@@ -996,10 +1002,7 @@ async fn test_network_partition_with_bridge() {
         harness.committed_blocks.len()
     );
     for v in 1..=15 {
-        assert!(
-            committed_views.contains(&v),
-            "view {v} should be committed"
-        );
+        assert!(committed_views.contains(&v), "view {v} should be committed");
     }
 
     // V2: All engines at view 16
@@ -1088,9 +1091,7 @@ async fn test_packet_drop_consensus_resilience() {
     );
 
     // V4: All engines should be at the same view
-    let final_views: Vec<ViewNumber> = (0..7)
-        .map(|i| harness.engines[i].current_view())
-        .collect();
+    let final_views: Vec<ViewNumber> = (0..7).map(|i| harness.engines[i].current_view()).collect();
     let max_view = *final_views.iter().max().unwrap();
     let min_view = *final_views.iter().min().unwrap();
     assert!(
@@ -1118,6 +1119,7 @@ async fn test_timeout_convergence_from_different_views() {
         .map(|(i, sk)| ValidatorInfo {
             address: Address::with_last_byte(i as u8),
             bls_public_key: sk.public_key(),
+            p2p_peer_id: None,
         })
         .collect();
 
@@ -1183,8 +1185,7 @@ async fn test_timeout_convergence_from_different_views() {
             for (from, msg) in pending.drain(..) {
                 for i in 0..n {
                     if i != from {
-                        let _ = engines[i]
-                            .process_event(ConsensusEvent::Message(msg.clone()));
+                        let _ = engines[i].process_event(ConsensusEvent::Message(msg.clone()));
                     }
                 }
             }
@@ -1223,7 +1224,10 @@ async fn test_timeout_convergence_from_different_views() {
         "all engines should converge, got range {min_view}..{max_view}, views: {:?}",
         final_views
     );
-    assert!(max_view >= 22, "converged view should be >= 22, got {max_view}");
+    assert!(
+        max_view >= 22,
+        "converged view should be >= 22, got {max_view}"
+    );
 
     // Phase 2: Transfer engines into a ChaosHarness for normal consensus.
     // Build a harness from the converged engines.
@@ -1258,7 +1262,8 @@ async fn test_timeout_convergence_from_different_views() {
 
     // Verification
     assert_eq!(
-        harness.committed_blocks.len(), 3,
+        harness.committed_blocks.len(),
+        3,
         "should commit 3 blocks post-convergence"
     );
 

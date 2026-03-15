@@ -156,7 +156,10 @@ impl N42JmtTree {
             // Write an empty value set to create a root node at the new version.
             let tree = JellyfishMerkleTree::<_, Blake3Hasher>::new(self.store.as_ref());
             let (root_hash, batch) = tree
-                .put_value_set(std::iter::empty::<(KeyHash, Option<OwnedValue>)>(), new_version)
+                .put_value_set(
+                    std::iter::empty::<(KeyHash, Option<OwnedValue>)>(),
+                    new_version,
+                )
                 .map_err(to_eyre)?;
             self.store
                 .write_node_batch(&batch.node_batch)
@@ -429,8 +432,10 @@ mod tests {
                 storage: BTreeMap::new(),
             },
         );
-        tree.apply_diff(&StateDiff { accounts: accounts2 })
-            .unwrap();
+        tree.apply_diff(&StateDiff {
+            accounts: accounts2,
+        })
+        .unwrap();
 
         // code_hash should still be 0xAA, not zeroed.
         let val2 = tree.get(key).unwrap().unwrap();
@@ -474,8 +479,10 @@ mod tests {
                 storage: BTreeMap::new(),
             },
         );
-        tree.apply_diff(&StateDiff { accounts: accounts2 })
-            .unwrap();
+        tree.apply_diff(&StateDiff {
+            accounts: accounts2,
+        })
+        .unwrap();
 
         let key = account_key(&addr);
         let val = tree.get(key).unwrap().unwrap();
@@ -556,7 +563,11 @@ mod tests {
                 },
             );
         }
-        let (v2, r2) = tree.apply_diff(&StateDiff { accounts: accounts2 }).unwrap();
+        let (v2, r2) = tree
+            .apply_diff(&StateDiff {
+                accounts: accounts2,
+            })
+            .unwrap();
         assert_eq!(v2, 2);
         assert_ne!(r1, r2, "modified accounts should change root");
 
@@ -574,14 +585,21 @@ mod tests {
                 },
             );
         }
-        let (v3, r3) = tree.apply_diff(&StateDiff { accounts: accounts3 }).unwrap();
+        let (v3, r3) = tree
+            .apply_diff(&StateDiff {
+                accounts: accounts3,
+            })
+            .unwrap();
         assert_eq!(v3, 3);
         assert_ne!(r2, r3);
 
         // Verify destroyed accounts are gone.
         for i in 90..100u8 {
             let key = account_key(&Address::with_last_byte(i));
-            assert!(tree.get(key).unwrap().is_none(), "account {i} should be deleted");
+            assert!(
+                tree.get(key).unwrap().is_none(),
+                "account {i} should be deleted"
+            );
         }
         // Verify surviving accounts still exist.
         for i in 0..50u8 {

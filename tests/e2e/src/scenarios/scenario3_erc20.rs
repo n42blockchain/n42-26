@@ -42,7 +42,8 @@ pub async fn run(binary_path: std::path::PathBuf) -> eyre::Result<()> {
         0, // deployer is account[0]
         max_fee,
         priority_fee,
-    ).await?;
+    )
+    .await?;
 
     info!(contract = %erc20.contract_address, "contract deployed");
 
@@ -97,11 +98,8 @@ pub async fn run(binary_path: std::path::PathBuf) -> eyre::Result<()> {
 
     info!("all ERC-20 transfers sent, waiting for receipts...");
 
-    let receipts = TxEngine::wait_for_all_receipts(
-        &node.rpc,
-        &tx_hashes,
-        Duration::from_secs(300),
-    ).await?;
+    let receipts =
+        TxEngine::wait_for_all_receipts(&node.rpc, &tx_hashes, Duration::from_secs(300)).await?;
 
     // === Verification ===
 

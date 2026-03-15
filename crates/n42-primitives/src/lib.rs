@@ -3,6 +3,6 @@ pub mod consensus;
 
 pub use bls::{BlsPublicKey, BlsSecretKey, BlsSignature};
 pub use consensus::{
-    CommitVote, ConsensusMessage, Decide, NewView, PrepareQC, Proposal, QuorumCertificate,
-    TimeoutCertificate, TimeoutMessage, VersionedMessage, Vote, CONSENSUS_PROTOCOL_VERSION,
+    CONSENSUS_PROTOCOL_VERSION, CommitVote, ConsensusMessage, Decide, NewView, PrepareQC, Proposal,
+    QuorumCertificate, TimeoutCertificate, TimeoutMessage, VersionedMessage, Vote,
 };

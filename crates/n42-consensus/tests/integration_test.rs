@@ -4,13 +4,11 @@
 use alloy_primitives::{Address, B256};
 use n42_chainspec::ValidatorInfo;
 use n42_consensus::error::ConsensusError;
-use n42_consensus::protocol::quorum::signing_message;
 use n42_consensus::protocol::Phase;
+use n42_consensus::protocol::quorum::signing_message;
 use n42_consensus::{ConsensusEngine, ConsensusEvent, EngineOutput, LeaderSelector, ValidatorSet};
-use n42_primitives::consensus::{
-    ConsensusMessage, Proposal, QuorumCertificate, ViewNumber, Vote,
-};
 use n42_primitives::BlsSecretKey;
+use n42_primitives::consensus::{ConsensusMessage, Proposal, QuorumCertificate, ViewNumber, Vote};
 use tokio::sync::mpsc;
 
 fn test_bls_key(index: u32) -> BlsSecretKey {
@@ -45,6 +43,7 @@ impl TestHarness {
             .map(|(i, sk)| ValidatorInfo {
                 address: Address::with_last_byte(i as u8),
                 bls_public_key: sk.public_key(),
+                p2p_peer_id: None,
             })
             .collect();
 
@@ -123,14 +122,14 @@ impl TestHarness {
             .process_event(ConsensusEvent::BlockReady(block_hash))
             .expect("leader BlockReady should succeed");
 
-        let proposal = self.drain_outputs(leader)
+        let proposal = self
+            .drain_outputs(leader)
             .into_iter()
             .find_map(|o| match o {
                 EngineOutput::BroadcastMessage(msg @ ConsensusMessage::Proposal(_)) => Some(msg),
                 _ => None,
             })
             .expect("leader should broadcast Proposal");
-
 
         for i in 0..n {
             if i != leader {
@@ -166,7 +165,8 @@ impl TestHarness {
             }
         }
 
-        let prepare_qc = self.drain_outputs(leader)
+        let prepare_qc = self
+            .drain_outputs(leader)
             .into_iter()
             .find_map(|o| match o {
                 EngineOutput::BroadcastMessage(msg @ ConsensusMessage::PrepareQC(_)) => Some(msg),
@@ -187,8 +187,8 @@ impl TestHarness {
                 for output in self.drain_outputs(i) {
                     if let EngineOutput::SendToValidator(target, msg) = output {
                         if target == leader as u32 {
-                            let _ = self.engines[leader]
-                                .process_event(ConsensusEvent::Message(msg));
+                            let _ =
+                                self.engines[leader].process_event(ConsensusEvent::Message(msg));
                         }
                     }
                 }
@@ -197,7 +197,12 @@ impl TestHarness {
 
         let leader_outputs = self.drain_outputs(leader);
         for output in &leader_outputs {
-            if let EngineOutput::BlockCommitted { view: v, block_hash: h, .. } = output {
+            if let EngineOutput::BlockCommitted {
+                view: v,
+                block_hash: h,
+                ..
+            } = output
+            {
                 self.committed_blocks.push((*v, *h));
             }
         }
@@ -213,8 +218,7 @@ impl TestHarness {
         for msg in &decide_msgs {
             for i in 0..n {
                 if i != leader {
-                    let _ = self.engines[i]
-                        .process_event(ConsensusEvent::Message(msg.clone()));
+                    let _ = self.engines[i].process_event(ConsensusEvent::Message(msg.clone()));
                 }
             }
         }
@@ -229,8 +233,7 @@ impl TestHarness {
         for i in 0..n {
             if self.engines[i].current_view() < next_view {
                 for msg in &decide_msgs {
-                    let _ = self.engines[i]
-                        .process_event(ConsensusEvent::Message(msg.clone()));
+                    let _ = self.engines[i].process_event(ConsensusEvent::Message(msg.clone()));
                 }
             }
         }
@@ -249,10 +252,7 @@ impl TestHarness {
         let n = self.n();
         let leader = (view % n as u64) as usize;
 
-        assert!(
-            participating.contains(&leader),
-            "leader must participate"
-        );
+        assert!(participating.contains(&leader), "leader must participate");
 
         // Step 1: Leader proposes
         self.engines[leader]
@@ -338,8 +338,8 @@ impl TestHarness {
                 for output in outputs {
                     if let EngineOutput::SendToValidator(target, msg) = output {
                         if target == leader as u32 {
-                            let _ = self.engines[leader]
-                                .process_event(ConsensusEvent::Message(msg));
+                            let _ =
+                                self.engines[leader].process_event(ConsensusEvent::Message(msg));
                         }
                     }
                 }
@@ -364,15 +364,19 @@ impl TestHarness {
         // Route Decide messages from leader to all other engines
         let decide_msgs: Vec<_> = leader_outputs
             .into_iter()
-            .filter(|o| matches!(o, EngineOutput::BroadcastMessage(ConsensusMessage::Decide(_))))
+            .filter(|o| {
+                matches!(
+                    o,
+                    EngineOutput::BroadcastMessage(ConsensusMessage::Decide(_))
+                )
+            })
             .collect();
 
         for output in &decide_msgs {
             if let EngineOutput::BroadcastMessage(msg) = output {
                 for i in 0..n {
                     if i != leader {
-                        let _ = self.engines[i]
-                            .process_event(ConsensusEvent::Message(msg.clone()));
+                        let _ = self.engines[i].process_event(ConsensusEvent::Message(msg.clone()));
                     }
                 }
             }
@@ -398,14 +402,14 @@ impl TestHarness {
             for i in 0..n {
                 if !participating_set.contains(&i) && self.engines[i].current_view() <= view {
                     // Send Proposal (updates locked_qc from justify_qc, enters Voting)
-                    let _ = self.engines[i]
-                        .process_event(ConsensusEvent::Message(proposal.clone()));
+                    let _ =
+                        self.engines[i].process_event(ConsensusEvent::Message(proposal.clone()));
                     // Send BlockImported (triggers deferred vote)
                     let _ = self.engines[i]
                         .process_event(ConsensusEvent::BlockImported(proposal_block_hash));
                     // Send PrepareQC (updates locked_qc to current round's QC)
-                    let _ = self.engines[i]
-                        .process_event(ConsensusEvent::Message(prepare_qc.clone()));
+                    let _ =
+                        self.engines[i].process_event(ConsensusEvent::Message(prepare_qc.clone()));
                 }
             }
             // Drain catch-up outputs (discard late votes/commit-votes from catch-up)
@@ -417,8 +421,8 @@ impl TestHarness {
                 if self.engines[i].current_view() < next_view {
                     for output in &decide_msgs {
                         if let EngineOutput::BroadcastMessage(msg) = output {
-                            let _ = self.engines[i]
-                                .process_event(ConsensusEvent::Message(msg.clone()));
+                            let _ =
+                                self.engines[i].process_event(ConsensusEvent::Message(msg.clone()));
                         }
                     }
                 }
@@ -445,7 +449,8 @@ impl TestHarness {
                 .expect("timeout should succeed");
         }
 
-        let timeout_msgs: Vec<_> = self.drain_all_outputs()
+        let timeout_msgs: Vec<_> = self
+            .drain_all_outputs()
             .into_iter()
             .enumerate()
             .flat_map(|(i, outputs)| {
@@ -461,8 +466,7 @@ impl TestHarness {
         for (from, msg) in &timeout_msgs {
             for i in 0..n {
                 if i != *from {
-                    let _ = self.engines[i]
-                        .process_event(ConsensusEvent::Message(msg.clone()));
+                    let _ = self.engines[i].process_event(ConsensusEvent::Message(msg.clone()));
                 }
             }
         }
@@ -470,7 +474,8 @@ impl TestHarness {
         let next_view = view + 1;
         let next_leader = (next_view % n as u64) as usize;
 
-        if let Some(nv) = self.drain_all_outputs()
+        if let Some(nv) = self
+            .drain_all_outputs()
             .into_iter()
             .flatten()
             .find_map(|o| match o {
@@ -480,8 +485,7 @@ impl TestHarness {
         {
             for i in 0..n {
                 if i != next_leader && self.engines[i].current_view() < next_view {
-                    let _ = self.engines[i]
-                        .process_event(ConsensusEvent::Message(nv.clone()));
+                    let _ = self.engines[i].process_event(ConsensusEvent::Message(nv.clone()));
                 }
             }
         }
@@ -527,7 +531,10 @@ mod genesis_bootstrap {
         let mut harness = TestHarness::new(1);
 
         assert_eq!(harness.engines[0].current_view(), 1);
-        assert_eq!(harness.engines[0].current_phase(), Phase::WaitingForProposal);
+        assert_eq!(
+            harness.engines[0].current_phase(),
+            Phase::WaitingForProposal
+        );
         assert!(harness.engines[0].is_current_leader());
 
         // First block: instant self-consensus
@@ -661,8 +668,8 @@ mod multi_node_consensus {
                 for output in outputs {
                     if let EngineOutput::SendToValidator(target, msg) = output {
                         if target == leader as u32 {
-                            let _ = harness.engines[leader]
-                                .process_event(ConsensusEvent::Message(msg));
+                            let _ =
+                                harness.engines[leader].process_event(ConsensusEvent::Message(msg));
                         }
                     }
                 }
@@ -671,8 +678,11 @@ mod multi_node_consensus {
 
         // Leader should have committed and advanced
         harness.drain_outputs(leader);
-        assert_eq!(harness.engines[leader].current_view(), 2,
-            "leader should have committed and advanced to view 2");
+        assert_eq!(
+            harness.engines[leader].current_view(),
+            2,
+            "leader should have committed and advanced to view 2"
+        );
     }
 
     #[test]
@@ -687,8 +697,7 @@ mod multi_node_consensus {
         // Ensure leader is in participating set
         assert!(participating.contains(&leader));
 
-        let committed =
-            harness.run_consensus_round_partial(view, block_hash, &participating);
+        let committed = harness.run_consensus_round_partial(view, block_hash, &participating);
         assert!(committed, "5/7 validators should reach consensus");
         assert_eq!(harness.committed_blocks.len(), 1);
     }
@@ -723,7 +732,11 @@ mod multi_node_consensus {
         // Verify view monotonicity and correct block hashes
         for (idx, &(v, h)) in harness.committed_blocks.iter().enumerate() {
             let expected_view = (idx + 1) as u64;
-            assert_eq!(v, expected_view, "block {} should be at view {}", idx, expected_view);
+            assert_eq!(
+                v, expected_view,
+                "block {} should be at view {}",
+                idx, expected_view
+            );
             assert_eq!(h, B256::repeat_byte(expected_view as u8));
         }
 
@@ -785,7 +798,7 @@ mod multi_node_consensus {
 
 mod mobile_verification {
     use super::*;
-    use n42_mobile::{sign_receipt, ReceiptAggregator};
+    use n42_mobile::{ReceiptAggregator, sign_receipt};
 
     /// The expected receipts root used by test receipts.
     const TEST_RR: B256 = B256::new([0xAA; 32]);
@@ -822,7 +835,13 @@ mod mobile_verification {
 
         for i in 0..10u32 {
             let key = test_mobile_bls_key(i);
-            let receipt = sign_receipt(block_hash, block_number, TEST_RR, 1_000_000 + i as u64, &key);
+            let receipt = sign_receipt(
+                block_hash,
+                block_number,
+                TEST_RR,
+                1_000_000 + i as u64,
+                &key,
+            );
 
             let result = aggregator.process_receipt(&receipt);
 
@@ -834,12 +853,7 @@ mod mobile_verification {
                     i
                 );
             } else if i == threshold - 1 {
-                assert_eq!(
-                    result,
-                    Some(true),
-                    "receipt {} should trigger threshold",
-                    i
-                );
+                assert_eq!(result, Some(true), "receipt {} should trigger threshold", i);
             }
         }
 
@@ -866,7 +880,11 @@ mod mobile_verification {
         assert_eq!(result, None, "duplicate receipt should be rejected");
 
         let status = aggregator.get_status(&block_hash).unwrap();
-        assert_eq!(status.total_receipts(), 1, "should still have only 1 receipt");
+        assert_eq!(
+            status.total_receipts(),
+            1,
+            "should still have only 1 receipt"
+        );
     }
 
     #[test]
@@ -891,7 +909,10 @@ mod mobile_verification {
 
         // Step 3: Verify attestation threshold reached
         let status = aggregator.get_status(&block_hash).unwrap();
-        assert!(status.is_attested(), "block should be attested by 10 >= 7 mobiles");
+        assert!(
+            status.is_attested(),
+            "block should be attested by 10 >= 7 mobiles"
+        );
         assert_eq!(status.total_receipts(), 10);
     }
 }
@@ -911,8 +932,7 @@ mod fault_tolerance {
         let block_hash = B256::repeat_byte(0xC1);
         let participating: Vec<usize> = vec![0, 1, 2]; // engine 3 crashed
 
-        let committed =
-            harness.run_consensus_round_partial(view, block_hash, &participating);
+        let committed = harness.run_consensus_round_partial(view, block_hash, &participating);
         assert!(committed, "3/4 validators should reach consensus");
     }
 
@@ -924,8 +944,7 @@ mod fault_tolerance {
         let block_hash = B256::repeat_byte(0xC7);
         let participating: Vec<usize> = vec![0, 1, 2, 3, 4]; // engines 5,6 crashed
 
-        let committed =
-            harness.run_consensus_round_partial(view, block_hash, &participating);
+        let committed = harness.run_consensus_round_partial(view, block_hash, &participating);
         assert!(committed, "5/7 validators should reach consensus");
     }
 
@@ -960,7 +979,11 @@ mod fault_tolerance {
         // Stale past-view vote must be silently discarded — no error, no state change.
         let result = harness.engines[leader]
             .process_event(ConsensusEvent::Message(ConsensusMessage::Vote(vote)));
-        assert!(result.is_ok(), "past-view vote should be silently discarded, got: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "past-view vote should be silently discarded, got: {:?}",
+            result
+        );
 
         // The engine produced no new outputs from the discarded vote.
         let spurious_outputs = harness.drain_outputs(leader);
@@ -1228,10 +1251,9 @@ mod fault_tolerance {
 
         // Non-leader should reject this proposal as a safety violation
         let target = if leader == 0 { 1 } else { 0 };
-        let result = harness.engines[target]
-            .process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(
-                bad_proposal,
-            )));
+        let result = harness.engines[target].process_event(ConsensusEvent::Message(
+            ConsensusMessage::Proposal(bad_proposal),
+        ));
         assert!(result.is_err());
         match result.unwrap_err() {
             ConsensusError::SafetyViolation {
@@ -1264,10 +1286,9 @@ mod fault_tolerance {
             prepare_qc: None,
         };
 
-        let result = harness.engines[2]
-            .process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(
-                bad_proposal,
-            )));
+        let result = harness.engines[2].process_event(ConsensusEvent::Message(
+            ConsensusMessage::Proposal(bad_proposal),
+        ));
         assert!(result.is_err());
         match result.unwrap_err() {
             ConsensusError::InvalidProposer {
@@ -1307,12 +1328,18 @@ mod boundary_conditions {
         let outputs = harness.drain_outputs(0);
 
         // Should contain: Proposal, PrepareQC, BlockCommitted
-        let has_proposal = outputs
-            .iter()
-            .any(|o| matches!(o, EngineOutput::BroadcastMessage(ConsensusMessage::Proposal(_))));
-        let has_qc = outputs
-            .iter()
-            .any(|o| matches!(o, EngineOutput::BroadcastMessage(ConsensusMessage::PrepareQC(_))));
+        let has_proposal = outputs.iter().any(|o| {
+            matches!(
+                o,
+                EngineOutput::BroadcastMessage(ConsensusMessage::Proposal(_))
+            )
+        });
+        let has_qc = outputs.iter().any(|o| {
+            matches!(
+                o,
+                EngineOutput::BroadcastMessage(ConsensusMessage::PrepareQC(_))
+            )
+        });
         let has_committed = outputs
             .iter()
             .any(|o| matches!(o, EngineOutput::BlockCommitted { .. }));
@@ -1331,8 +1358,7 @@ mod boundary_conditions {
 
         // Test with exactly quorum (3): leader + 2 others
         let participating: Vec<usize> = vec![0, 1, 2]; // leader=1, plus 0 and 2
-        let committed =
-            harness.run_consensus_round_partial(view, block_hash, &participating);
+        let committed = harness.run_consensus_round_partial(view, block_hash, &participating);
         assert!(committed, "exactly 3/4 (quorum) should commit");
     }
 
@@ -1355,10 +1381,7 @@ mod boundary_conditions {
 
         let committed =
             harness.run_consensus_round_partial(1, B256::repeat_byte(0xF5), &participating);
-        assert!(
-            !committed,
-            "only 2/4 validators should NOT reach consensus"
-        );
+        assert!(!committed, "only 2/4 validators should NOT reach consensus");
     }
 
     #[test]
@@ -1416,16 +1439,12 @@ mod boundary_conditions {
                 .map(|(i, sk)| ValidatorInfo {
                     address: Address::with_last_byte(i as u8),
                     bls_public_key: sk.public_key(),
+                    p2p_peer_id: None,
                 })
                 .collect();
             let vs = ValidatorSet::new(&infos, f);
 
-            assert_eq!(
-                vs.quorum_size(),
-                expected_quorum,
-                "quorum_size for n={}",
-                n
-            );
+            assert_eq!(vs.quorum_size(), expected_quorum, "quorum_size for n={}", n);
         }
     }
 }
@@ -1517,7 +1536,7 @@ mod stress_performance {
 
     #[test]
     fn test_1000_mobile_receipts() {
-        use n42_mobile::{sign_receipt, ReceiptAggregator};
+        use n42_mobile::{ReceiptAggregator, sign_receipt};
 
         let block_hash = B256::repeat_byte(0xA5);
         let block_number = 1u64;
@@ -1713,7 +1732,9 @@ mod stability {
 
 mod byzantine_signature {
     use super::*;
-    use n42_consensus::protocol::quorum::{commit_signing_message, signing_message, timeout_signing_message};
+    use n42_consensus::protocol::quorum::{
+        commit_signing_message, signing_message, timeout_signing_message,
+    };
     use n42_primitives::consensus::CommitVote;
 
     /// Run consensus round where f Byzantine validators send votes with invalid signatures.
@@ -1737,7 +1758,9 @@ mod byzantine_signature {
         let proposal = leader_outputs
             .iter()
             .find_map(|o| match o {
-                EngineOutput::BroadcastMessage(msg @ ConsensusMessage::Proposal(_)) => Some(msg.clone()),
+                EngineOutput::BroadcastMessage(msg @ ConsensusMessage::Proposal(_)) => {
+                    Some(msg.clone())
+                }
                 _ => None,
             })
             .expect("leader should broadcast Proposal");
@@ -1786,7 +1809,11 @@ mod byzantine_signature {
             };
             let result = harness.engines[leader]
                 .process_event(ConsensusEvent::Message(ConsensusMessage::Vote(bad_vote)));
-            assert!(result.is_err(), "invalid vote from byzantine validator {} should be rejected", i);
+            assert!(
+                result.is_err(),
+                "invalid vote from byzantine validator {} should be rejected",
+                i
+            );
         }
 
         // Step 5: QC should be formed (leader self-vote + 4 honest = 5 ≥ quorum of 5)
@@ -1794,7 +1821,9 @@ mod byzantine_signature {
         let prepare_qc = leader_outputs
             .iter()
             .find_map(|o| match o {
-                EngineOutput::BroadcastMessage(msg @ ConsensusMessage::PrepareQC(_)) => Some(msg.clone()),
+                EngineOutput::BroadcastMessage(msg @ ConsensusMessage::PrepareQC(_)) => {
+                    Some(msg.clone())
+                }
                 _ => None,
             })
             .expect("QC should form from honest validators despite Byzantine ones");
@@ -1815,8 +1844,8 @@ mod byzantine_signature {
                 for output in outputs {
                     if let EngineOutput::SendToValidator(target, msg) = output {
                         if target == leader as u32 {
-                            let _ = harness.engines[leader]
-                                .process_event(ConsensusEvent::Message(msg));
+                            let _ =
+                                harness.engines[leader].process_event(ConsensusEvent::Message(msg));
                         }
                     }
                 }
@@ -1825,8 +1854,13 @@ mod byzantine_signature {
 
         // Block should be committed
         let leader_outputs = harness.drain_outputs(leader);
-        let committed = leader_outputs.iter().any(|o| matches!(o, EngineOutput::BlockCommitted { .. }));
-        assert!(committed, "block should be committed despite Byzantine invalid signatures");
+        let committed = leader_outputs
+            .iter()
+            .any(|o| matches!(o, EngineOutput::BlockCommitted { .. }));
+        assert!(
+            committed,
+            "block should be committed despite Byzantine invalid signatures"
+        );
     }
 
     /// Byzantine validators send commit votes with invalid signatures.
@@ -1843,10 +1877,15 @@ mod byzantine_signature {
             .process_event(ConsensusEvent::BlockReady(block_hash))
             .expect("leader BlockReady");
         let leader_outputs = harness.drain_outputs(leader);
-        let proposal = leader_outputs.iter().find_map(|o| match o {
-            EngineOutput::BroadcastMessage(msg @ ConsensusMessage::Proposal(_)) => Some(msg.clone()),
-            _ => None,
-        }).unwrap();
+        let proposal = leader_outputs
+            .iter()
+            .find_map(|o| match o {
+                EngineOutput::BroadcastMessage(msg @ ConsensusMessage::Proposal(_)) => {
+                    Some(msg.clone())
+                }
+                _ => None,
+            })
+            .unwrap();
 
         let proposal_block_hash_cv = match &proposal {
             ConsensusMessage::Proposal(p) => p.block_hash,
@@ -1881,10 +1920,15 @@ mod byzantine_signature {
 
         // PrepareQC should be formed
         let leader_outputs = harness.drain_outputs(leader);
-        let prepare_qc = leader_outputs.iter().find_map(|o| match o {
-            EngineOutput::BroadcastMessage(msg @ ConsensusMessage::PrepareQC(_)) => Some(msg.clone()),
-            _ => None,
-        }).expect("PrepareQC should form");
+        let prepare_qc = leader_outputs
+            .iter()
+            .find_map(|o| match o {
+                EngineOutput::BroadcastMessage(msg @ ConsensusMessage::PrepareQC(_)) => {
+                    Some(msg.clone())
+                }
+                _ => None,
+            })
+            .expect("PrepareQC should form");
 
         // Route PrepareQC to all non-leaders
         for i in 0..4 {
@@ -1901,8 +1945,7 @@ mod byzantine_signature {
             for output in outputs {
                 if let EngineOutput::SendToValidator(target, msg) = output {
                     if target == leader as u32 {
-                        let _ = harness.engines[leader]
-                            .process_event(ConsensusEvent::Message(msg));
+                        let _ = harness.engines[leader].process_event(ConsensusEvent::Message(msg));
                     }
                 }
             }
@@ -1911,7 +1954,9 @@ mod byzantine_signature {
         // Block committed once leader + validator 0 + validator 2 reached quorum (3/4).
         // The view has already advanced to 2 by this point.
         let leader_outputs = harness.drain_outputs(leader);
-        let committed = leader_outputs.iter().any(|o| matches!(o, EngineOutput::BlockCommitted { .. }));
+        let committed = leader_outputs
+            .iter()
+            .any(|o| matches!(o, EngineOutput::BlockCommitted { .. }));
         assert!(committed, "block should commit with honest commit votes");
 
         // Byzantine validator 3 sends a commit vote whose signature covers the wrong
@@ -1927,8 +1972,9 @@ mod byzantine_signature {
             voter: 3,
             signature: bad_sig,
         };
-        let result = harness.engines[leader]
-            .process_event(ConsensusEvent::Message(ConsensusMessage::CommitVote(bad_cv)));
+        let result = harness.engines[leader].process_event(ConsensusEvent::Message(
+            ConsensusMessage::CommitVote(bad_cv),
+        ));
         assert!(
             result.is_ok(),
             "stale commit vote (view=1, engine at view=2) must be silently discarded, got: {:?}",
@@ -1973,17 +2019,21 @@ mod byzantine_signature {
 
         // Process the invalid timeout on engines that are still at view 1
         for i in 0..3 {
-            let result = harness.engines[i]
-                .process_event(ConsensusEvent::Message(ConsensusMessage::Timeout(bad_timeout.clone())));
-            assert!(result.is_err(), "invalid timeout should be rejected on engine {}", i);
+            let result = harness.engines[i].process_event(ConsensusEvent::Message(
+                ConsensusMessage::Timeout(bad_timeout.clone()),
+            ));
+            assert!(
+                result.is_err(),
+                "invalid timeout should be rejected on engine {}",
+                i
+            );
         }
 
         // Now route honest timeouts — view change should still succeed
         for (sender, msg) in &honest_timeouts {
             for i in 0..3 {
                 if i != *sender {
-                    let _ = harness.engines[i]
-                        .process_event(ConsensusEvent::Message(msg.clone()));
+                    let _ = harness.engines[i].process_event(ConsensusEvent::Message(msg.clone()));
                 }
             }
         }
@@ -1993,12 +2043,18 @@ mod byzantine_signature {
         for i in 0..3 {
             let outputs = harness.drain_outputs(i);
             for output in &outputs {
-                if matches!(output, EngineOutput::BroadcastMessage(ConsensusMessage::NewView(_))) {
+                if matches!(
+                    output,
+                    EngineOutput::BroadcastMessage(ConsensusMessage::NewView(_))
+                ) {
                     any_new_view = true;
                 }
             }
         }
-        assert!(any_new_view, "honest validators should form TC without Byzantine timeout");
+        assert!(
+            any_new_view,
+            "honest validators should form TC without Byzantine timeout"
+        );
     }
 }
 
@@ -2076,13 +2132,21 @@ mod attestation_e2e {
 
         // First attestation
         let sig1 = sk.sign(block_hash.as_slice());
-        pk.verify(block_hash.as_slice(), &sig1).expect("sig1 should verify");
-        assert!(attesters.insert(pk_hex.clone()), "first attestation should be new");
+        pk.verify(block_hash.as_slice(), &sig1)
+            .expect("sig1 should verify");
+        assert!(
+            attesters.insert(pk_hex.clone()),
+            "first attestation should be new"
+        );
 
         // Duplicate attestation (different signature bytes, same key)
         let sig2 = sk.sign(block_hash.as_slice());
-        pk.verify(block_hash.as_slice(), &sig2).expect("sig2 should verify");
-        assert!(!attesters.insert(pk_hex), "duplicate attestation should be rejected");
+        pk.verify(block_hash.as_slice(), &sig2)
+            .expect("sig2 should verify");
+        assert!(
+            !attesters.insert(pk_hex),
+            "duplicate attestation should be rejected"
+        );
 
         assert_eq!(attesters.len(), 1, "should only count one attestation");
     }
@@ -2100,7 +2164,10 @@ mod attestation_e2e {
 
         // Verification against correct block should fail
         let result = pk.verify(correct_hash.as_slice(), &sig);
-        assert!(result.is_err(), "signature for wrong block should fail verification");
+        assert!(
+            result.is_err(),
+            "signature for wrong block should fail verification"
+        );
     }
 
     /// Full pipeline: 10 blocks committed, each gets 5+ mobile attestations.
@@ -2171,13 +2238,24 @@ mod twenty_one_node {
         let harness = TestHarness::new(21);
 
         assert_eq!(harness.validator_set.len(), 21);
-        assert_eq!(harness.validator_set.fault_tolerance(), 6, "f should be 6 for n=21");
-        assert_eq!(harness.validator_set.quorum_size(), 13, "quorum should be 13 for n=21");
+        assert_eq!(
+            harness.validator_set.fault_tolerance(),
+            6,
+            "f should be 6 for n=21"
+        );
+        assert_eq!(
+            harness.validator_set.quorum_size(),
+            13,
+            "quorum should be 13 for n=21"
+        );
 
         // All engines start at view 1, WaitingForProposal
         for i in 0..21 {
             assert_eq!(harness.engines[i].current_view(), 1);
-            assert_eq!(harness.engines[i].current_phase(), Phase::WaitingForProposal);
+            assert_eq!(
+                harness.engines[i].current_phase(),
+                Phase::WaitingForProposal
+            );
         }
 
         // View 1 leader should be validator 1 (1 % 21 = 1)
@@ -2304,7 +2382,10 @@ mod twenty_one_node {
         let block_hash = B256::repeat_byte(0xCC);
         let committed = harness.run_consensus_round_partial(1, block_hash, &participating);
 
-        assert!(committed, "15/21 nodes (6 crashed, f=6) should achieve consensus");
+        assert!(
+            committed,
+            "15/21 nodes (6 crashed, f=6) should achieve consensus"
+        );
         assert_eq!(harness.committed_blocks.len(), 1);
     }
 
@@ -2320,7 +2401,10 @@ mod twenty_one_node {
         let block_hash = B256::repeat_byte(0xDD);
         let committed = harness.run_consensus_round_partial(1, block_hash, &participating);
 
-        assert!(committed, "14/21 nodes (7 crashed) should still achieve consensus (14 >= quorum=13)");
+        assert!(
+            committed,
+            "14/21 nodes (7 crashed) should still achieve consensus (14 >= quorum=13)"
+        );
     }
 
     /// Fault tolerance: 9 crash, only 12 remain.
@@ -2336,7 +2420,10 @@ mod twenty_one_node {
         let block_hash = B256::repeat_byte(0xFF);
         let committed = harness.run_consensus_round_partial(1, block_hash, &participating);
 
-        assert!(!committed, "12/21 nodes (below quorum=13) must NOT achieve consensus");
+        assert!(
+            !committed,
+            "12/21 nodes (below quorum=13) must NOT achieve consensus"
+        );
         assert_eq!(harness.committed_blocks.len(), 0);
     }
 
@@ -2455,8 +2542,8 @@ mod twenty_one_node {
                 for output in outputs {
                     if let EngineOutput::SendToValidator(target, msg) = output {
                         if target == leader as u32 {
-                            let _ = harness.engines[leader]
-                                .process_event(ConsensusEvent::Message(msg));
+                            let _ =
+                                harness.engines[leader].process_event(ConsensusEvent::Message(msg));
                         }
                     }
                 }
@@ -2465,11 +2552,14 @@ mod twenty_one_node {
 
         // Verify commitment
         let leader_outputs = harness.drain_outputs(leader);
-        let committed = leader_outputs.iter().any(|o| {
-            matches!(o, EngineOutput::BlockCommitted { .. })
-        });
+        let committed = leader_outputs
+            .iter()
+            .any(|o| matches!(o, EngineOutput::BlockCommitted { .. }));
 
-        assert!(committed, "block should be committed despite 6 Byzantine nodes");
+        assert!(
+            committed,
+            "block should be committed despite 6 Byzantine nodes"
+        );
     }
 
     /// Timeout: leader crash triggers view change across 21 nodes.
@@ -2600,9 +2690,7 @@ mod twenty_one_node {
         }
 
         // Verify all engines have consistent views
-        let views: Vec<u64> = (0..21)
-            .map(|i| harness.engines[i].current_view())
-            .collect();
+        let views: Vec<u64> = (0..21).map(|i| harness.engines[i].current_view()).collect();
         let max_view = *views.iter().max().unwrap();
         let min_view = *views.iter().min().unwrap();
         assert!(
@@ -2647,8 +2735,7 @@ mod twenty_one_node {
             block_bytes[0..8].copy_from_slice(&view.to_le_bytes());
             let block_hash = B256::from(block_bytes);
 
-            let committed =
-                harness.run_consensus_round_partial(view, block_hash, &participating);
+            let committed = harness.run_consensus_round_partial(view, block_hash, &participating);
 
             assert!(
                 committed,
@@ -2693,9 +2780,7 @@ mod twenty_one_node {
         assert_eq!(harness.committed_blocks.len(), committed);
 
         // Final view consistency check
-        let views: Vec<u64> = (0..21)
-            .map(|i| harness.engines[i].current_view())
-            .collect();
+        let views: Vec<u64> = (0..21).map(|i| harness.engines[i].current_view()).collect();
         let max_view = *views.iter().max().unwrap();
         let min_view = *views.iter().min().unwrap();
 
@@ -2762,8 +2847,7 @@ mod twenty_one_node {
                                 // Byzantine: vote for wrong block hash
                                 if let ConsensusMessage::Vote(vote) = &msg {
                                     let vote_msg = signing_message(vote.view, &wrong_hash);
-                                    let bad_sig =
-                                        harness.secret_keys[i].sign(&vote_msg);
+                                    let bad_sig = harness.secret_keys[i].sign(&vote_msg);
                                     let bad_vote = Vote {
                                         view: vote.view,
                                         block_hash: wrong_hash,
@@ -2790,7 +2874,10 @@ mod twenty_one_node {
         // 14 honest votes for correct_hash → should form PrepareQC
         let leader_outputs = harness.drain_outputs(leader);
         let has_prepare_qc = leader_outputs.iter().any(|o| {
-            matches!(o, EngineOutput::BroadcastMessage(ConsensusMessage::PrepareQC(_)))
+            matches!(
+                o,
+                EngineOutput::BroadcastMessage(ConsensusMessage::PrepareQC(_))
+            )
         });
 
         assert!(
@@ -2829,10 +2916,7 @@ mod twenty_one_node {
         let block_hash = B256::repeat_byte(0xB1);
         let committed = harness.run_consensus_round_partial(1, block_hash, &participating);
 
-        assert!(
-            !committed,
-            "12/21 (one below quorum=13) should NOT commit"
-        );
+        assert!(!committed, "12/21 (one below quorum=13) should NOT commit");
     }
 
     /// Stability: 200 consecutive blocks with 21 nodes.
@@ -2871,11 +2955,7 @@ mod twenty_one_node {
             expected_bytes[0..8].copy_from_slice(&v.to_le_bytes());
             expected_bytes[8..16].copy_from_slice(&(v * 0x1337).to_le_bytes());
             let expected = B256::from(expected_bytes);
-            assert_eq!(
-                h, expected,
-                "block {} (view {}) hash mismatch",
-                idx, v
-            );
+            assert_eq!(h, expected, "block {} (view {}) hash mismatch", idx, v);
         }
 
         // All engines at view 201
@@ -2936,7 +3016,10 @@ mod twenty_one_node {
         // Check: NO vote yet (deferred voting)
         let outputs = harness.drain_outputs(0);
         let has_vote = outputs.iter().any(|o| {
-            matches!(o, EngineOutput::SendToValidator(_, ConsensusMessage::Vote(_)))
+            matches!(
+                o,
+                EngineOutput::SendToValidator(_, ConsensusMessage::Vote(_))
+            )
         });
         assert!(
             !has_vote,
@@ -2950,11 +3033,11 @@ mod twenty_one_node {
 
         let outputs = harness.drain_outputs(0);
         let has_vote = outputs.iter().any(|o| {
-            matches!(o, EngineOutput::SendToValidator(_, ConsensusMessage::Vote(_)))
+            matches!(
+                o,
+                EngineOutput::SendToValidator(_, ConsensusMessage::Vote(_))
+            )
         });
-        assert!(
-            has_vote,
-            "non-leader should emit vote after BlockImported"
-        );
+        assert!(has_vote, "non-leader should emit vote after BlockImported");
     }
 }

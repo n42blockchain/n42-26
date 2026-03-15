@@ -80,7 +80,10 @@ async fn run_multi_node_test(
             .filter(|&j| j != i)
             .map(|j| {
                 let peer_port = 9400 + port_offset_base + (j as u16) * 10;
-                format!("/ip4/127.0.0.1/udp/{}/quic-v1/p2p/{}", peer_port, peer_ids[j])
+                format!(
+                    "/ip4/127.0.0.1/udp/{}/quic-v1/p2p/{}",
+                    peer_port, peer_ids[j]
+                )
             })
             .collect();
 
@@ -112,11 +115,18 @@ async fn run_multi_node_test(
         }
     }
 
-    info!(started = nodes.len(), "all nodes started, running for {}s", duration.as_secs());
+    info!(
+        started = nodes.len(),
+        "all nodes started, running for {}s",
+        duration.as_secs()
+    );
 
     // For large node counts, allow extra time for P2P mesh to stabilize.
     if node_count > 10 {
-        info!("waiting 15s for P2P mesh stabilization with {} nodes", node_count);
+        info!(
+            "waiting 15s for P2P mesh stabilization with {} nodes",
+            node_count
+        );
         tokio::time::sleep(Duration::from_secs(15)).await;
     }
 
@@ -140,7 +150,10 @@ async fn run_multi_node_test(
     let max_height = *heights.iter().max().unwrap_or(&0);
     let min_height = *heights.iter().min().unwrap_or(&0);
 
-    info!(?heights, max_height, min_height, "node block heights collected");
+    info!(
+        ?heights,
+        max_height, min_height, "node block heights collected"
+    );
 
     // === V1: Block height consistency (all nodes within ±1) ===
     if max_height - min_height > 1 {
@@ -149,10 +162,15 @@ async fn run_multi_node_test(
         }
         return Err(eyre::eyre!(
             "V1 FAILED: height divergence > 1: max={}, min={}, heights={:?}",
-            max_height, min_height, heights
+            max_height,
+            min_height,
+            heights
         ));
     }
-    info!("V1 PASS: height consistency (max-min={}) within tolerance", max_height - min_height);
+    info!(
+        "V1 PASS: height consistency (max-min={}) within tolerance",
+        max_height - min_height
+    );
 
     // === V2: Minimum block count ===
     // Dynamically compute expected minimum: (duration / interval) * 0.9 tolerance
@@ -164,13 +182,20 @@ async fn run_multi_node_test(
         }
         return Err(eyre::eyre!(
             "V2 FAILED: min_height={} < expected minimum {}",
-            min_height, expected_min
+            min_height,
+            expected_min
         ));
     }
     info!(min_height, expected_min, "V2 PASS: minimum block count");
 
     // === V3: Block hash consistency (sampled across the chain) ===
-    let sample_heights = [1, min_height / 4, min_height / 2, 3 * min_height / 4, min_height];
+    let sample_heights = [
+        1,
+        min_height / 4,
+        min_height / 2,
+        3 * min_height / 4,
+        min_height,
+    ];
     for &sample_h in &sample_heights {
         if sample_h == 0 {
             continue;
@@ -199,12 +224,16 @@ async fn run_multi_node_test(
             }
             return Err(eyre::eyre!(
                 "V3 FAILED: block hash mismatch at height {}: {:?}",
-                sample_h, hashes
+                sample_h,
+                hashes
             ));
         }
         info!(height = sample_h, hash = %ref_hash, "V3: block hash consistent across all nodes");
     }
-    info!("V3 PASS: block hash consistency across {} sample heights", sample_heights.len());
+    info!(
+        "V3 PASS: block hash consistency across {} sample heights",
+        sample_heights.len()
+    );
 
     // === V4: Leader rotation fairness (check miner field distribution) ===
     let mut miner_counts: HashMap<String, u64> = HashMap::new();
@@ -233,7 +262,10 @@ async fn run_multi_node_test(
                 }
                 return Err(eyre::eyre!(
                     "V4 FAILED: unfair rotation: miner {} produced {} blocks (expected ~{:.0}, ratio={:.2})",
-                    miner, count, expected_per, ratio
+                    miner,
+                    count,
+                    expected_per,
+                    ratio
                 ));
             }
         }
@@ -277,10 +309,12 @@ async fn run_multi_node_test(
         let b1 = nodes[0].rpc.get_block_by_number(h - 1).await;
         let b2 = nodes[0].rpc.get_block_by_number(h).await;
         if let (Ok(b1), Ok(b2)) = (b1, b2) {
-            let t1 = b1.get("timestamp")
+            let t1 = b1
+                .get("timestamp")
                 .and_then(|t| t.as_str())
                 .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok());
-            let t2 = b2.get("timestamp")
+            let t2 = b2
+                .get("timestamp")
                 .and_then(|t| t.as_str())
                 .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok());
             if let (Some(t1), Some(t2)) = (t1, t2) {
@@ -297,7 +331,8 @@ async fn run_multi_node_test(
             }
             return Err(eyre::eyre!(
                 "V5 FAILED: average block interval {:.1}s not within [7,9]: {:?}",
-                avg_interval, intervals
+                avg_interval,
+                intervals
             ));
         }
         info!(

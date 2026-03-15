@@ -266,7 +266,12 @@ impl ConsensusOrchestrator {
 
         // Build attrs before borrowing beacon_engine to avoid borrow conflict.
         let attrs = self.build_payload_attributes(slot_timestamp);
-        let beacon_engine = self.beacon_engine.as_ref().unwrap();
+        let Some(beacon_engine) = self.beacon_engine.as_ref() else {
+            debug!(target: "n42::cl::exec_bridge", "beacon engine disappeared before payload build");
+            self.building_on_parent = None;
+            self.build_triggered_at = None;
+            return;
+        };
         let timestamp = attrs.timestamp;
 
         let fcu_state = ForkchoiceState {
@@ -438,7 +443,7 @@ impl ConsensusOrchestrator {
                 );
             }
             // Signal completion regardless of success/failure/panic.
-            if build_complete_tx.send(()).is_err() {
+            if build_complete_tx.send(()).await.is_err() {
                 debug!(target: "n42::cl::exec_bridge", "build completion receiver dropped");
             }
         });
@@ -578,7 +583,7 @@ impl ConsensusOrchestrator {
                             metrics::counter!("n42_compact_block_cache_hits").increment(1);
                         }
                         metrics::counter!("n42_follower_eager_import_hits_total").increment(1);
-                        if eager_done_tx.send((hash, block_ts)).is_err() {
+                        if eager_done_tx.send((hash, block_ts)).await.is_err() {
                             debug!(target: "n42::cl::exec_bridge", %hash, view, "eager import completion receiver dropped");
                         }
                     }
@@ -791,11 +796,21 @@ impl ConsensusOrchestrator {
 
     fn queue_syncing_block(&mut self, broadcast: &BlockDataBroadcast) {
         info!(target: "n42::cl::exec_bridge", hash = %broadcast.block_hash, "new_payload returned Syncing, queuing for retry");
-        if let Ok(data) = bincode::serialize(broadcast) {
-            if self.syncing_blocks.len() >= MAX_SYNCING_QUEUE_SIZE {
-                self.syncing_blocks.pop_front();
+        match bincode::serialize(broadcast) {
+            Ok(data) => {
+                if self.syncing_blocks.len() >= MAX_SYNCING_QUEUE_SIZE {
+                    self.syncing_blocks.pop_front();
+                }
+                self.syncing_blocks.push_back((data, 0));
             }
-            self.syncing_blocks.push_back((data, 0));
+            Err(error) => {
+                warn!(
+                    target: "n42::cl::exec_bridge",
+                    hash = %broadcast.block_hash,
+                    error = %error,
+                    "failed to serialize syncing block for retry queue"
+                );
+            }
         }
     }
 
@@ -896,11 +911,11 @@ async fn handle_built_payload(
     payload: EthBuiltPayload,
     engine_handle: ConsensusEngineHandle<EthEngineTypes>,
     network: NetworkHandle,
-    block_ready_tx: mpsc::UnboundedSender<B256>,
-    leader_payload_tx: mpsc::UnboundedSender<(B256, Vec<u8>)>,
+    block_ready_tx: mpsc::Sender<B256>,
+    leader_payload_tx: mpsc::Sender<(B256, Vec<u8>)>,
     current_view: u64,
     blob_store: Option<DiskFileBlobStore>,
-    eager_import_done_tx: mpsc::UnboundedSender<(B256, u64)>,
+    eager_import_done_tx: mpsc::Sender<(B256, u64)>,
     block_guard: Arc<std::sync::atomic::AtomicU64>,
 ) {
     let hash = payload.block().hash();
@@ -946,11 +961,12 @@ async fn handle_built_payload(
         &payload_json,
         block_timestamp,
         execution_output_bytes,
-    );
+    )
+    .await;
     broadcast_blob_sidecars(&network, &payload, hash, current_view, blob_store);
 
     // 2. Trigger consensus voting immediately (non-blocking channel send)
-    if block_ready_tx.send(hash).is_err() {
+    if block_ready_tx.send(hash).await.is_err() {
         debug!(target: "n42::cl::exec_bridge", %hash, "block_ready receiver dropped");
     }
 
@@ -981,7 +997,11 @@ async fn handle_built_payload(
             let np_elapsed = import_start.elapsed().as_millis() as u64;
             info!(target: "n42::cl::exec_bridge", %hash, np_elapsed, "eager import: new_payload accepted (no FCU)");
             metrics::counter!("n42_eager_import_hits_total").increment(1);
-            if eager_import_done_tx.send((hash, block_timestamp)).is_err() {
+            if eager_import_done_tx
+                .send((hash, block_timestamp))
+                .await
+                .is_err()
+            {
                 debug!(target: "n42::cl::exec_bridge", %hash, "leader eager import completion receiver dropped");
             }
         }
@@ -994,9 +1014,9 @@ async fn handle_built_payload(
     }
 }
 
-fn broadcast_block_data(
+async fn broadcast_block_data(
     network: &NetworkHandle,
-    leader_payload_tx: &mpsc::UnboundedSender<(B256, Vec<u8>)>,
+    leader_payload_tx: &mpsc::Sender<(B256, Vec<u8>)>,
     hash: B256,
     current_view: u64,
     payload_json: &[u8],
@@ -1042,8 +1062,16 @@ fn broadcast_block_data(
     let validator_peers = network.all_validator_peers();
     let direct_count = validator_peers.len();
     let send_start = std::time::Instant::now();
-    for (_idx, peer_id) in &validator_peers {
-        let _ = network.send_block_direct(*peer_id, encoded.clone());
+    for (idx, peer_id) in &validator_peers {
+        if let Err(error) = network.send_block_direct(*peer_id, encoded.clone()) {
+            tracing::warn!(
+                target: "n42::cl::exec_bridge",
+                validator_index = idx,
+                %peer_id,
+                error = %error,
+                "failed to send direct block payload to validator peer"
+            );
+        }
     }
     let send_ms = send_start.elapsed().as_millis() as u64;
     if direct_count > 0 {
@@ -1077,7 +1105,7 @@ fn broadcast_block_data(
         "N42_BROADCAST: direct push + gossipsub complete"
     );
 
-    if leader_payload_tx.send((hash, encoded)).is_err() {
+    if leader_payload_tx.send((hash, encoded)).await.is_err() {
         debug!(target: "n42::cl::exec_bridge", %hash, "leader payload feedback receiver dropped");
     }
 }
@@ -1124,10 +1152,20 @@ fn broadcast_blob_sidecars(
                 sidecars: encoded_sidecars,
             };
 
-            if let Ok(encoded) = bincode::serialize(&broadcast) {
-                debug!(target: "n42::cl::exec_bridge", %hash, blob_count = sidecar_count, bytes = encoded.len(), "broadcasting blob sidecars");
-                if let Err(e) = network.broadcast_blob_sidecar(encoded) {
-                    warn!(target: "n42::cl::exec_bridge", error = %e, "failed to broadcast blob sidecars");
+            match bincode::serialize(&broadcast) {
+                Ok(encoded) => {
+                    debug!(target: "n42::cl::exec_bridge", %hash, blob_count = sidecar_count, bytes = encoded.len(), "broadcasting blob sidecars");
+                    if let Err(e) = network.broadcast_blob_sidecar(encoded) {
+                        warn!(target: "n42::cl::exec_bridge", error = %e, "failed to broadcast blob sidecars");
+                    }
+                }
+                Err(error) => {
+                    warn!(
+                        target: "n42::cl::exec_bridge",
+                        %hash,
+                        error = %error,
+                        "failed to serialize blob sidecar broadcast"
+                    );
                 }
             }
         }

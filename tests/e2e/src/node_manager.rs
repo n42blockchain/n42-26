@@ -33,7 +33,11 @@ pub struct NodeConfig {
 
 impl NodeConfig {
     /// Creates a config for a single-node dev setup.
-    pub fn single_node(binary_path: PathBuf, genesis_path: PathBuf, block_interval_ms: u64) -> Self {
+    pub fn single_node(
+        binary_path: PathBuf,
+        genesis_path: PathBuf,
+        block_interval_ms: u64,
+    ) -> Self {
         Self {
             binary_path,
             genesis_path,
@@ -96,7 +100,10 @@ impl NodeProcess {
     }
 
     /// Starts an N42 node with extra environment variables.
-    pub async fn start_with_env(config: &NodeConfig, extra_env: Vec<(&str, &str)>) -> eyre::Result<Self> {
+    pub async fn start_with_env(
+        config: &NodeConfig,
+        extra_env: Vec<(&str, &str)>,
+    ) -> eyre::Result<Self> {
         let data_dir = TempDir::new()?;
         Self::start_inner(config, data_dir, &extra_env).await
     }
@@ -106,9 +113,14 @@ impl NodeProcess {
         Self::start_inner(config, data_dir, &[]).await
     }
 
-    async fn start_inner(config: &NodeConfig, data_dir: TempDir, extra_env: &[(&str, &str)]) -> eyre::Result<Self> {
+    async fn start_inner(
+        config: &NodeConfig,
+        data_dir: TempDir,
+        extra_env: &[(&str, &str)],
+    ) -> eyre::Result<Self> {
         // Generate the deterministic validator key for this index.
-        let key_bytes = n42_chainspec::ConsensusConfig::deterministic_key_bytes(config.validator_index);
+        let key_bytes =
+            n42_chainspec::ConsensusConfig::deterministic_key_bytes(config.validator_index);
         let key_hex = hex::encode(key_bytes);
 
         let http_port = config.http_port();
@@ -121,14 +133,20 @@ impl NodeProcess {
         let mut cmd = Command::new(&config.binary_path);
 
         cmd.arg("node")
-            .arg("--chain").arg(&config.genesis_path)
-            .arg("--datadir").arg(data_dir.path())
+            .arg("--chain")
+            .arg(&config.genesis_path)
+            .arg("--datadir")
+            .arg(data_dir.path())
             .arg("--http")
-            .arg("--http.port").arg(http_port.to_string())
+            .arg("--http.port")
+            .arg(http_port.to_string())
             .arg("--ws")
-            .arg("--ws.port").arg(ws_port.to_string())
-            .arg("--authrpc.port").arg(auth_port.to_string())
-            .arg("--port").arg(p2p_port.to_string())
+            .arg("--ws.port")
+            .arg(ws_port.to_string())
+            .arg("--authrpc.port")
+            .arg(auth_port.to_string())
+            .arg("--port")
+            .arg(p2p_port.to_string())
             .arg("--ipcdisable")
             .arg("--disable-discovery");
 
@@ -139,7 +157,10 @@ impl NodeProcess {
             .env("N42_DATA_DIR", data_dir.path());
 
         if config.block_interval_ms > 0 {
-            cmd.env("N42_BLOCK_INTERVAL_MS", config.block_interval_ms.to_string());
+            cmd.env(
+                "N42_BLOCK_INTERVAL_MS",
+                config.block_interval_ms.to_string(),
+            );
         }
 
         if let Some(base_timeout) = config.base_timeout_ms {
@@ -160,11 +181,14 @@ impl NodeProcess {
             cmd.env(key, value);
         }
 
-        let stdout_log = std::fs::File::create(format!("/tmp/n42-node-{}.log", config.validator_index))
-            .unwrap_or_else(|_| std::fs::File::create("/dev/null").unwrap());
-        let stderr_log = std::fs::File::create(format!("/tmp/n42-node-{}.err.log", config.validator_index))
-            .unwrap_or_else(|_| std::fs::File::create("/dev/null").unwrap());
-        cmd.stdout(Stdio::from(stdout_log)).stderr(Stdio::from(stderr_log));
+        let stdout_log =
+            std::fs::File::create(format!("/tmp/n42-node-{}.log", config.validator_index))
+                .unwrap_or_else(|_| std::fs::File::create("/dev/null").unwrap());
+        let stderr_log =
+            std::fs::File::create(format!("/tmp/n42-node-{}.err.log", config.validator_index))
+                .unwrap_or_else(|_| std::fs::File::create("/dev/null").unwrap());
+        cmd.stdout(Stdio::from(stdout_log))
+            .stderr(Stdio::from(stderr_log));
 
         info!(
             binary = %config.binary_path.display(),
@@ -231,11 +255,18 @@ impl NodeProcess {
 
             match self.rpc.block_number().await {
                 Ok(n) => {
-                    info!(block_number = n, http_port = self.http_port, "node is ready");
+                    info!(
+                        block_number = n,
+                        http_port = self.http_port,
+                        "node is ready"
+                    );
                     return Ok(());
                 }
                 Err(_) => {
-                    debug!(http_port = self.http_port, "waiting for node to become ready...");
+                    debug!(
+                        http_port = self.http_port,
+                        "waiting for node to become ready..."
+                    );
                     tokio::time::sleep(poll_interval).await;
                 }
             }
@@ -257,7 +288,10 @@ impl NodeProcess {
 
     /// Stops the node but returns the data directory for reuse in restart tests.
     pub fn stop_keep_data(mut self) -> eyre::Result<TempDir> {
-        info!(http_port = self.http_port, "stopping N42 node (keeping data)");
+        info!(
+            http_port = self.http_port,
+            "stopping N42 node (keeping data)"
+        );
 
         #[cfg(unix)]
         {
@@ -272,7 +306,9 @@ impl NodeProcess {
         }
 
         let _ = self.child.wait();
-        self.data_dir.take().ok_or_else(|| eyre::eyre!("data dir already taken"))
+        self.data_dir
+            .take()
+            .ok_or_else(|| eyre::eyre!("data dir already taken"))
     }
 
     /// Sends SIGTERM and waits for the node process to exit.
@@ -327,8 +363,7 @@ impl Drop for NodeProcess {
 /// Finds the n42-node binary in the cargo build output.
 pub fn find_n42_binary() -> eyre::Result<PathBuf> {
     // Try to find in the cargo target directory.
-    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
-        .unwrap_or_else(|_| ".".to_string());
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
 
     // Walk up to find the workspace root. Prefer release over debug for performance.
     let mut dir = PathBuf::from(&manifest_dir);

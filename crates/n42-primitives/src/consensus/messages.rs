@@ -37,10 +37,8 @@ impl QuorumCertificate {
         let ikm = [1u8; 32];
         let dummy_sig = match BlsSecretKey::from_bytes(&ikm) {
             Ok(sk) => sk.sign(b"genesis"),
-            Err(_) => {
-                BlsSignature::from_bytes(&[0u8; 96])
-                    .unwrap_or_else(|_| panic!("failed to create genesis signature"))
-            }
+            Err(_) => BlsSignature::from_bytes(&[0u8; 96])
+                .unwrap_or_else(|_| panic!("failed to create genesis signature")),
         };
 
         Self {
@@ -246,7 +244,11 @@ mod tests {
             signers,
         };
 
-        assert_eq!(qc.signer_count(), 3, "signer_count should reflect the number of set bits");
+        assert_eq!(
+            qc.signer_count(),
+            3,
+            "signer_count should reflect the number of set bits"
+        );
     }
 
     #[test]
@@ -311,7 +313,11 @@ mod tests {
                 .unwrap_or_else(|e| panic!("variant {} deserialize failed: {}", i, e));
 
             let orig_variant = format!("{:?}", msg).split('(').next().unwrap().to_string();
-            let decoded_variant = format!("{:?}", decoded).split('(').next().unwrap().to_string();
+            let decoded_variant = format!("{:?}", decoded)
+                .split('(')
+                .next()
+                .unwrap()
+                .to_string();
             assert_eq!(orig_variant, decoded_variant);
         }
     }
@@ -331,8 +337,8 @@ mod tests {
         };
 
         let encoded = bincode::serialize(&versioned).expect("serialize VersionedMessage");
-        let decoded: VersionedMessage = bincode::deserialize(&encoded)
-            .expect("deserialize VersionedMessage");
+        let decoded: VersionedMessage =
+            bincode::deserialize(&encoded).expect("deserialize VersionedMessage");
 
         assert_eq!(decoded.version, CONSENSUS_PROTOCOL_VERSION);
         match decoded.message {
@@ -363,8 +369,7 @@ mod tests {
         };
 
         let encoded = bincode::serialize(&tc).expect("serialize TC");
-        let decoded: TimeoutCertificate = bincode::deserialize(&encoded)
-            .expect("deserialize TC");
+        let decoded: TimeoutCertificate = bincode::deserialize(&encoded).expect("deserialize TC");
 
         assert_eq!(decoded.view, 42);
         assert_eq!(decoded.signers.count_ones(), 2);

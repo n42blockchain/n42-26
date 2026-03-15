@@ -1,8 +1,11 @@
+use crate::epoch_schedule::EpochSchedule;
 use super::{BlobSidecarBroadcast, BlockDataBroadcast, CommittedBlock};
 use alloy_eips::eip7594::BlobTransactionSidecarVariant;
 use alloy_primitives::B256;
 use alloy_rpc_types_engine::{ForkchoiceState, PayloadStatusEnum};
-use n42_consensus::{verify_commit_qc, ValidatorSet};
+use metrics::{counter, gauge};
+use n42_chainspec::ValidatorInfo;
+use n42_consensus::{ValidatorSet, verify_commit_qc};
 use n42_network::{BlockSyncResponse, NetworkEvent, NetworkHandle, PeerId, SyncBlock};
 use n42_primitives::QuorumCertificate;
 use reth_ethereum_engine_primitives::EthEngineTypes;
@@ -13,7 +16,6 @@ use std::collections::{HashSet, VecDeque};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
-use metrics::{counter, gauge};
 use tracing::{debug, error, info, warn};
 
 /// Maximum committed blocks retained in the ring buffer for serving sync to other observers.
@@ -30,6 +32,58 @@ const SYNC_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Maximum number of blocks to request per sync batch (matches network layer limit).
 const MAX_SYNC_BATCH: u64 = 128;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SyncTargetSource {
+    ProvenProgress,
+    GossipHint,
+}
+
+fn resolve_validator_set_for_view(
+    view: u64,
+    validator_set: Option<&ValidatorSet>,
+    initial_validators: Option<&[ValidatorInfo]>,
+    initial_fault_tolerance: u32,
+    epoch_length: u64,
+    epoch_schedule: Option<&EpochSchedule>,
+) -> Option<ValidatorSet> {
+    let Some(initial_validators) = initial_validators else {
+        return validator_set.cloned();
+    };
+
+    if epoch_length == 0 {
+        return ValidatorSet::try_new(initial_validators, initial_fault_tolerance).ok();
+    }
+
+    let epoch = view.saturating_sub(1) / epoch_length;
+    let (validators, fault_tolerance) = epoch_schedule
+        .map(|schedule| {
+            schedule.active_config_for_epoch(epoch, initial_validators, initial_fault_tolerance)
+        })
+        .unwrap_or((initial_validators, initial_fault_tolerance));
+
+    ValidatorSet::try_new(validators, fault_tolerance).ok()
+}
+
+fn select_sync_target(
+    local_view: u64,
+    highest_sync_target_view: u64,
+    highest_seen_view: u64,
+    last_gossip_sync_request_to_view: u64,
+) -> Option<(u64, SyncTargetSource)> {
+    if highest_sync_target_view > local_view + 3 {
+        return Some((highest_sync_target_view, SyncTargetSource::ProvenProgress));
+    }
+
+    let capped_gossip_target = highest_seen_view.min(local_view.saturating_add(MAX_SYNC_BATCH));
+    if highest_seen_view > local_view + 3
+        && capped_gossip_target > last_gossip_sync_request_to_view
+    {
+        return Some((highest_seen_view, SyncTargetSource::GossipHint));
+    }
+
+    None
+}
 
 /// Lightweight observer node orchestrator.
 ///
@@ -50,7 +104,13 @@ pub struct ObserverOrchestrator {
     // CL state
     local_view: u64,
     highest_seen_view: u64,
+    highest_sync_target_view: u64,
+    last_gossip_sync_request_to_view: u64,
     validator_set: Option<ValidatorSet>,
+    initial_validators: Option<Vec<ValidatorInfo>>,
+    initial_fault_tolerance: u32,
+    epoch_length: u64,
+    epoch_schedule: Option<EpochSchedule>,
 
     // Sync
     sync_in_flight: bool,
@@ -81,7 +141,13 @@ impl ObserverOrchestrator {
             head_block_hash,
             local_view: 0,
             highest_seen_view: 0,
+            highest_sync_target_view: 0,
+            last_gossip_sync_request_to_view: 0,
             validator_set: None,
+            initial_validators: None,
+            initial_fault_tolerance: 0,
+            epoch_length: 0,
+            epoch_schedule: None,
             sync_in_flight: false,
             sync_started_at: None,
             sync_attempt_counter: 0,
@@ -93,7 +159,15 @@ impl ObserverOrchestrator {
     }
 
     pub fn with_validator_set(mut self, vs: ValidatorSet) -> Self {
+        self.initial_fault_tolerance = vs.fault_tolerance();
+        self.initial_validators = Some(vs.validator_infos());
         self.validator_set = Some(vs);
+        self
+    }
+
+    pub fn with_epoch_schedule(mut self, epoch_length: u64, schedule: EpochSchedule) -> Self {
+        self.epoch_length = epoch_length;
+        self.epoch_schedule = Some(schedule);
         self
     }
 
@@ -160,7 +234,11 @@ impl ObserverOrchestrator {
             NetworkEvent::BlobSidecarReceived { source: _, data } => {
                 self.handle_blob_sidecar(data);
             }
-            NetworkEvent::SyncRequest { peer, request_id, request } => {
+            NetworkEvent::SyncRequest {
+                peer,
+                request_id,
+                request,
+            } => {
                 self.handle_sync_request(peer, request_id, request);
             }
             NetworkEvent::SyncResponse { peer, response } => {
@@ -188,17 +266,26 @@ impl ObserverOrchestrator {
         self.import_block_data(broadcast, None).await;
     }
 
-    /// Core import logic: parses the execution payload, calls new_payload + fork_choice_updated.
+    /// Core import logic: parses the execution payload and submits it to the Engine API.
     ///
     /// `commit_qc` is provided when the block comes from sync (has a real QC); `None` for
-    /// blocks received via GossipSub (which are already finalized by the consensus protocol
-    /// but don't carry a QC in the broadcast).
-    async fn import_block_data(&mut self, broadcast: BlockDataBroadcast, commit_qc: Option<QuorumCertificate>) {
+    /// blocks received via GossipSub. GossipSub blocks without a commit proof are allowed
+    /// to pre-execute via `new_payload`, but they are not promoted to canonical head until
+    /// a sync path supplies a real commit QC.
+    async fn import_block_data(
+        &mut self,
+        broadcast: BlockDataBroadcast,
+        commit_qc: Option<QuorumCertificate>,
+    ) {
         let hash = broadcast.block_hash;
         let view = broadcast.view;
+        let has_commit_proof = commit_qc.is_some();
 
         if view > self.highest_seen_view {
             self.highest_seen_view = view;
+        }
+        if has_commit_proof && view > self.highest_sync_target_view {
+            self.highest_sync_target_view = view;
         }
 
         let payload_json = match super::decompress_payload(&broadcast.payload_json) {
@@ -225,13 +312,27 @@ impl ObserverOrchestrator {
 
         match self.beacon_engine.new_payload(execution_data).await {
             Ok(status) => {
-                if matches!(status.status, PayloadStatusEnum::Valid | PayloadStatusEnum::Accepted) {
+                if matches!(
+                    status.status,
+                    PayloadStatusEnum::Valid | PayloadStatusEnum::Accepted
+                ) {
+                    if !has_commit_proof {
+                        debug!(
+                            target: "n42::observer",
+                            view,
+                            %hash,
+                            "validated gossip block without commit_qc; waiting for sync proof before following head"
+                        );
+                        return;
+                    }
+
                     let fcu_state = ForkchoiceState {
                         head_block_hash: hash,
                         safe_block_hash: hash,
                         finalized_block_hash: hash,
                     };
-                    if let Err(e) = self.beacon_engine
+                    if let Err(e) = self
+                        .beacon_engine
                         .fork_choice_updated(fcu_state, None, EngineApiMessageVersion::default())
                         .await
                     {
@@ -252,11 +353,20 @@ impl ObserverOrchestrator {
                         );
                     }
 
-                    // Store for serving sync to other observers.
-                    // Use the real commit_qc when available (sync blocks), or a placeholder
-                    // for GossipSub blocks (receivers without validator_set will skip QC check).
-                    let qc = commit_qc.unwrap_or_else(QuorumCertificate::genesis);
-                    self.store_committed_block(view, hash, qc, &broadcast.payload_json);
+                    // Only cache blocks for observer sync when we have a real commit QC.
+                    // GossipSub block announcements do not carry commit proofs, and
+                    // synthesizing a placeholder QC causes downstream observer sync
+                    // validation to reject the block.
+                    if let Some(qc) = commit_qc {
+                        self.store_committed_block(view, hash, qc, &broadcast.payload_json);
+                    } else {
+                        debug!(
+                            target: "n42::observer",
+                            view,
+                            %hash,
+                            "skipping observer sync cache for block without commit_qc"
+                        );
+                    }
                 } else if matches!(status.status, PayloadStatusEnum::Syncing) {
                     debug!(target: "n42::observer", %hash, view, "new_payload returned Syncing (reth pipeline catching up)");
                 } else {
@@ -284,7 +394,9 @@ impl ObserverOrchestrator {
         };
 
         for (tx_hash, sidecar_rlp) in broadcast.sidecars {
-            match <BlobTransactionSidecarVariant as alloy_rlp::Decodable>::decode(&mut &sidecar_rlp[..]) {
+            match <BlobTransactionSidecarVariant as alloy_rlp::Decodable>::decode(
+                &mut &sidecar_rlp[..],
+            ) {
                 Ok(sidecar) => {
                     if let Err(e) = blob_store.insert(tx_hash, sidecar) {
                         debug!(target: "n42::observer", %tx_hash, error = %e, "failed to insert blob sidecar");
@@ -309,7 +421,8 @@ impl ObserverOrchestrator {
             return;
         }
 
-        let blocks: Vec<SyncBlock> = self.committed_blocks
+        let blocks: Vec<SyncBlock> = self
+            .committed_blocks
             .iter()
             .filter(|b| b.view >= request.from_view && b.view <= request.to_view)
             .take(128)
@@ -321,10 +434,7 @@ impl ObserverOrchestrator {
             })
             .collect();
 
-        let peer_committed_view = self.committed_blocks
-            .back()
-            .map(|b| b.view)
-            .unwrap_or(0);
+        let peer_committed_view = self.committed_blocks.back().map(|b| b.view).unwrap_or(0);
 
         debug!(target: "n42::observer", %peer, blocks_sent = blocks.len(), "sending sync response");
 
@@ -351,7 +461,23 @@ impl ObserverOrchestrator {
             "received sync response"
         );
 
+        if response.peer_committed_view > self.highest_sync_target_view {
+            self.highest_sync_target_view = response.peer_committed_view;
+        }
+        if response.peer_committed_view > self.highest_seen_view {
+            self.highest_seen_view = response.peer_committed_view;
+        }
+
         if response.blocks.is_empty() {
+            if response.peer_committed_view > self.local_view + 3 {
+                info!(
+                    target: "n42::observer",
+                    local_view = self.local_view,
+                    peer_committed_view = response.peer_committed_view,
+                    "empty sync response but peer reports higher committed view; retrying with next peer"
+                );
+                let _ = self.initiate_sync(self.local_view, response.peer_committed_view);
+            }
             return;
         }
 
@@ -395,15 +521,19 @@ impl ObserverOrchestrator {
     }
 
     fn verify_sync_block_qc(&self, sync_block: &SyncBlock) -> bool {
-        let vs = match &self.validator_set {
-            Some(vs) => vs,
-            None => {
-                // No validator set → skip QC verification (trust reth's EVM execution)
-                return true;
-            }
+        let Some(vs) = resolve_validator_set_for_view(
+            sync_block.view,
+            self.validator_set.as_ref(),
+            self.initial_validators.as_deref(),
+            self.initial_fault_tolerance,
+            self.epoch_length,
+            self.epoch_schedule.as_ref(),
+        ) else {
+            // No validator set → skip QC verification (trust reth's EVM execution)
+            return true;
         };
 
-        if let Err(e) = verify_commit_qc(&sync_block.commit_qc, vs) {
+        if let Err(e) = verify_commit_qc(&sync_block.commit_qc, &vs) {
             warn!(
                 target: "n42::observer",
                 view = sync_block.view,
@@ -437,14 +567,22 @@ impl ObserverOrchestrator {
 
     /// Checks if observer is behind the network and initiates sync if needed.
     fn check_and_initiate_sync(&mut self) {
-        if self.highest_seen_view > self.local_view + 3 {
-            self.initiate_sync(self.local_view, self.highest_seen_view);
+        if let Some((target_view, source)) = select_sync_target(
+            self.local_view,
+            self.highest_sync_target_view,
+            self.highest_seen_view,
+            self.last_gossip_sync_request_to_view,
+        ) && let Some(requested_to_view) = self.initiate_sync(self.local_view, target_view)
+            && source == SyncTargetSource::GossipHint
+        {
+            self.last_gossip_sync_request_to_view = requested_to_view;
         }
     }
 
-    fn initiate_sync(&mut self, local_view: u64, target_view: u64) {
+    fn initiate_sync(&mut self, local_view: u64, target_view: u64) -> Option<u64> {
         if self.sync_in_flight {
-            let timed_out = self.sync_started_at
+            let timed_out = self
+                .sync_started_at
                 .map(|t| t.elapsed() > SYNC_TIMEOUT)
                 .unwrap_or(false);
 
@@ -453,13 +591,13 @@ impl ObserverOrchestrator {
                 self.sync_in_flight = false;
                 self.sync_started_at = None;
             } else {
-                return;
+                return None;
             }
         }
 
         let peers: Vec<_> = self.connected_peers.iter().copied().collect();
         if peers.is_empty() {
-            return;
+            return None;
         }
 
         // Rotate through peers on each attempt to avoid retrying the same unresponsive peer.
@@ -483,14 +621,21 @@ impl ObserverOrchestrator {
 
         if let Err(e) = self.network.request_sync(peer, request) {
             error!(target: "n42::observer", error = %e, "failed to send sync request");
-            return;
+            return None;
         }
 
         self.sync_in_flight = true;
         self.sync_started_at = Some(Instant::now());
+        Some(capped_to_view)
     }
 
-    fn store_committed_block(&mut self, view: u64, block_hash: B256, commit_qc: QuorumCertificate, payload: &[u8]) {
+    fn store_committed_block(
+        &mut self,
+        view: u64,
+        block_hash: B256,
+        commit_qc: QuorumCertificate,
+        payload: &[u8],
+    ) {
         if self.committed_blocks.len() >= MAX_COMMITTED_BLOCKS {
             self.committed_blocks.pop_front();
         }
@@ -536,14 +681,15 @@ impl ObserverOrchestrator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_primitives::Address;
+    use n42_primitives::BlsSecretKey;
     use n42_network::NetworkCommand;
 
-    fn make_test_network() -> (NetworkHandle, mpsc::UnboundedReceiver<NetworkCommand>) {
-        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
-        let (ptx, _prx) = mpsc::unbounded_channel();
+    fn make_test_network() -> (NetworkHandle, mpsc::Receiver<NetworkCommand>) {
+        let (cmd_tx, cmd_rx) = mpsc::channel(8);
+        let (ptx, _prx) = mpsc::channel(8);
         (NetworkHandle::new(cmd_tx, ptx), cmd_rx)
     }
-
 
     #[test]
     fn test_observer_construction() {
@@ -559,5 +705,72 @@ mod tests {
         // return true (trust reth's EVM execution instead of BLS verification).
         // This is verified by code inspection: the first match arm returns true
         // when self.validator_set is None.
+    }
+
+    fn make_validators(count: usize) -> Vec<ValidatorInfo> {
+        (0..count)
+            .map(|i| {
+                let sk = BlsSecretKey::random().unwrap();
+                ValidatorInfo {
+                    address: Address::with_last_byte(i as u8),
+                    bls_public_key: sk.public_key(),
+                    p2p_peer_id: None,
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_resolve_validator_set_for_view_uses_epoch_schedule() {
+        let initial = make_validators(4);
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("epoch_schedule.json");
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&vec![
+                serde_json::json!({
+                    "start_epoch": 2,
+                    "validators": make_validators(5),
+                    "fault_tolerance": 1
+                }),
+                serde_json::json!({
+                    "start_epoch": 4,
+                    "validators": make_validators(7),
+                    "fault_tolerance": 2
+                }),
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+        let schedule = EpochSchedule::load(&path).unwrap().unwrap();
+
+        let vs0 = resolve_validator_set_for_view(1, None, Some(&initial), 1, 10, Some(&schedule))
+            .unwrap();
+        let vs2 = resolve_validator_set_for_view(25, None, Some(&initial), 1, 10, Some(&schedule))
+            .unwrap();
+        let vs4 = resolve_validator_set_for_view(45, None, Some(&initial), 1, 10, Some(&schedule))
+            .unwrap();
+
+        assert_eq!(vs0.len(), 4);
+        assert_eq!(vs2.len(), 5);
+        assert_eq!(vs4.len(), 7);
+    }
+
+    #[test]
+    fn test_select_sync_target_prefers_proven_progress() {
+        let target = select_sync_target(10, 30, 100, 100).unwrap();
+        assert_eq!(target, (30, SyncTargetSource::ProvenProgress));
+    }
+
+    #[test]
+    fn test_select_sync_target_consumes_each_gossip_window_once() {
+        let first = select_sync_target(10, 10, 40, 0).unwrap();
+        assert_eq!(first, (40, SyncTargetSource::GossipHint));
+
+        let second = select_sync_target(10, 10, 40, 40);
+        assert!(second.is_none());
+
+        let third = select_sync_target(30, 30, 200, 138).unwrap();
+        assert_eq!(third, (200, SyncTargetSource::GossipHint));
     }
 }

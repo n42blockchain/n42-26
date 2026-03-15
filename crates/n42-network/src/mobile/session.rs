@@ -69,7 +69,10 @@ impl std::fmt::Debug for MobileSession {
             .field("connected_at", &self.connected_at)
             .field("cached_code_hashes", &self.cached_code_hashes.len())
             .field("packets_sent", &self.packets_sent.load(Ordering::Relaxed))
-            .field("receipts_received", &self.receipts_received.load(Ordering::Relaxed))
+            .field(
+                "receipts_received",
+                &self.receipts_received.load(Ordering::Relaxed),
+            )
             .field("tier", &self.tier())
             .finish()
     }
@@ -338,7 +341,10 @@ mod tests {
         }
         assert!(session.avg_rtt_ms().unwrap() <= 100);
         session.record_rtt(5000);
-        assert!(session.avg_rtt_ms().unwrap() > 1000, "EWMA should react to spike");
+        assert!(
+            session.avg_rtt_ms().unwrap() > 1000,
+            "EWMA should react to spike"
+        );
     }
 
     #[test]
@@ -348,7 +354,10 @@ mod tests {
         for _ in 0..15 {
             session.record_rtt(100);
         }
-        assert!(session.avg_rtt_ms().unwrap() < 2000, "EWMA should decay below 2000ms");
+        assert!(
+            session.avg_rtt_ms().unwrap() < 2000,
+            "EWMA should decay below 2000ms"
+        );
     }
 
     #[test]
@@ -378,7 +387,10 @@ mod tests {
     #[test]
     fn test_tier_from_u64_roundtrip() {
         assert_eq!(PhoneTier::from_u64(PhoneTier::Fast as u64), PhoneTier::Fast);
-        assert_eq!(PhoneTier::from_u64(PhoneTier::Normal as u64), PhoneTier::Normal);
+        assert_eq!(
+            PhoneTier::from_u64(PhoneTier::Normal as u64),
+            PhoneTier::Normal
+        );
         assert_eq!(PhoneTier::from_u64(PhoneTier::Slow as u64), PhoneTier::Slow);
         assert_eq!(PhoneTier::from_u64(99), PhoneTier::Slow);
     }

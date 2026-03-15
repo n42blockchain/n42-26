@@ -295,7 +295,11 @@ mod tests {
 
         assert_eq!(reg.register(pk1), 0);
         assert_eq!(reg.register(pk2), 1);
-        assert_eq!(reg.register(pk1), 0, "re-register should return existing index");
+        assert_eq!(
+            reg.register(pk1),
+            0,
+            "re-register should return existing index"
+        );
         assert_eq!(reg.len(), 2);
         assert_eq!(reg.index_of(&pk1), Some(0));
         assert_eq!(reg.index_of(&pk2), Some(1));
@@ -330,7 +334,9 @@ mod tests {
         assert_eq!(attestation.participant_count, 3);
 
         // Verify the aggregate signature.
-        attestation.verify(&registry).expect("aggregate should verify");
+        attestation
+            .verify(&registry)
+            .expect("aggregate should verify");
     }
 
     #[test]
@@ -346,7 +352,10 @@ mod tests {
         let receipt = sign_receipt(block_hash, 1, receipts_root, 1000, &keys[0]);
 
         assert!(builder.add_receipt(&receipt, &registry));
-        assert!(!builder.add_receipt(&receipt, &registry), "duplicate should be rejected");
+        assert!(
+            !builder.add_receipt(&receipt, &registry),
+            "duplicate should be rejected"
+        );
         assert_eq!(builder.count(), 1);
     }
 
@@ -363,7 +372,10 @@ mod tests {
         let mut builder = AttestationBuilder::new(block_hash, 1, receipts_root);
         let receipt = sign_receipt(wrong_hash, 1, receipts_root, 1000, &keys[0]);
 
-        assert!(!builder.add_receipt(&receipt, &registry), "wrong block_hash should be rejected");
+        assert!(
+            !builder.add_receipt(&receipt, &registry),
+            "wrong block_hash should be rejected"
+        );
     }
 
     #[test]
@@ -379,7 +391,10 @@ mod tests {
         let mut builder = AttestationBuilder::new(block_hash, 1, receipts_root);
         let receipt = sign_receipt(block_hash, 1, wrong_root, 1000, &keys[0]);
 
-        assert!(!builder.add_receipt(&receipt, &registry), "wrong receipts_root should be rejected");
+        assert!(
+            !builder.add_receipt(&receipt, &registry),
+            "wrong receipts_root should be rejected"
+        );
     }
 
     #[test]
@@ -395,7 +410,10 @@ mod tests {
         let mut builder = AttestationBuilder::new(block_hash, 1, receipts_root);
         let receipt = sign_receipt(block_hash, 1, receipts_root, 1000, &keys[1]);
 
-        assert!(!builder.add_receipt(&receipt, &registry), "unregistered verifier should be rejected");
+        assert!(
+            !builder.add_receipt(&receipt, &registry),
+            "unregistered verifier should be rejected"
+        );
     }
 
     #[test]
@@ -432,7 +450,9 @@ mod tests {
         assert_eq!(attestation.participant_bitfield[1] & (1 << 1), 1 << 1); // bit 9 = byte 1, bit 1
 
         // Verify the aggregate signature.
-        attestation.verify(&registry).expect("aggregate should verify");
+        attestation
+            .verify(&registry)
+            .expect("aggregate should verify");
     }
 
     #[test]
@@ -461,10 +481,15 @@ mod tests {
         assert_eq!(decoded.block_number, attestation.block_number);
         assert_eq!(decoded.receipts_root, attestation.receipts_root);
         assert_eq!(decoded.participant_count, attestation.participant_count);
-        assert_eq!(decoded.participant_bitfield, attestation.participant_bitfield);
+        assert_eq!(
+            decoded.participant_bitfield,
+            attestation.participant_bitfield
+        );
 
         // Verify the deserialized attestation.
-        decoded.verify(&registry).expect("deserialized aggregate should verify");
+        decoded
+            .verify(&registry)
+            .expect("deserialized aggregate should verify");
     }
 
     #[test]
@@ -483,19 +508,13 @@ mod tests {
         // Each phone signs with a different timestamp — but the signing message
         // excludes timestamp, so all signatures are over the same 72-byte message.
         for (i, key) in keys.iter().enumerate() {
-            let receipt = sign_receipt(
-                block_hash,
-                1,
-                receipts_root,
-                1000 + i as u64 * 500,
-                key,
-            );
+            let receipt = sign_receipt(block_hash, 1, receipts_root, 1000 + i as u64 * 500, key);
             builder.add_receipt(&receipt, &registry);
         }
 
         let attestation = builder.build().unwrap();
-        attestation.verify(&registry).expect(
-            "different timestamps should not affect aggregate verification"
-        );
+        attestation
+            .verify(&registry)
+            .expect("different timestamps should not affect aggregate verification");
     }
 }

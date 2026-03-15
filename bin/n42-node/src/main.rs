@@ -6,29 +6,33 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 use alloy_primitives::Address;
 use clap::Parser;
-use n42_chainspec::ConsensusConfig;
+use n42_chainspec::{ConsensusConfig, ValidatorInfo};
 use n42_consensus::{ConsensusEngine, EpochManager, ValidatorSet};
-use n42_network::{build_swarm_with_validator_index, ShardedStarHub, ShardedStarHubConfig, TransportConfig};
 use n42_network::NetworkService;
+use n42_network::{
+    ShardedStarHub, ShardedStarHubConfig, TransportConfig, build_swarm_with_validator_index,
+    deterministic_validator_keypair,
+};
+use n42_node::attestation_store::AttestationStore;
+use n42_node::epoch_schedule::EpochSchedule;
 use n42_node::mobile_bridge::MobileVerificationBridge;
 use n42_node::mobile_packet::mobile_packet_loop;
-use n42_node::attestation_store::AttestationStore;
 use n42_node::mobile_reward::MobileRewardManager;
-use n42_node::epoch_schedule::EpochSchedule;
 use n42_node::persistence;
 use n42_node::rpc::{N42ApiServer, N42RpcServer};
 use n42_node::staking::StakingManager;
-use n42_zkproof::{MockProver, ProofScheduler, ProofStore};
 use n42_node::tx_bridge::TxPoolBridge;
-use n42_node::{ConsensusOrchestrator, ObserverOrchestrator, N42Node, SharedConsensusState};
+use n42_node::{ConsensusOrchestrator, N42Node, ObserverOrchestrator, SharedConsensusState};
+use n42_node::{configured_validator_peer_ids, expected_validator_peer_ids_with_policy};
 use n42_primitives::BlsSecretKey;
+use n42_zkproof::{MockProver, ProofScheduler, ProofStore};
 use reth_chainspec::ChainSpecProvider;
-use reth_ethereum_cli::chainspec::EthereumChainSpecParser;
 use reth_ethereum_cli::Cli;
+use reth_ethereum_cli::chainspec::EthereumChainSpecParser;
 use reth_node_core::args::DefaultRpcServerArgs;
 use reth_storage_api::{BlockHashReader, BlockNumReader};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Once};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
@@ -57,7 +61,11 @@ fn override_timeout_from_env(name: &str, target: &mut u64) {
 /// Each peer is dialed and registered for automatic reconnection + Kademlia.
 fn connect_trusted_peers(net_handle: &n42_network::NetworkHandle) {
     let trusted_peers_str = std::env::var("N42_TRUSTED_PEERS").unwrap_or_default();
-    for peer_addr_str in trusted_peers_str.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+    for peer_addr_str in trusted_peers_str
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         match peer_addr_str.parse::<libp2p::Multiaddr>() {
             Ok(addr) => {
                 let maybe_peer_id = addr.iter().find_map(|proto| match proto {
@@ -87,12 +95,97 @@ fn connect_trusted_peers(net_handle: &n42_network::NetworkHandle) {
     }
 }
 
-fn derive_ed25519_keypair(index: u32) -> libp2p::identity::Keypair {
-    let seed = alloy_primitives::keccak256(format!("n42-p2p-key-{}", index).as_bytes());
-    let mut seed_bytes: [u8; 32] = seed.0;
-    let secret = libp2p::identity::ed25519::SecretKey::try_from_bytes(&mut seed_bytes)
-        .expect("valid ed25519 seed from keccak256");
-    libp2p::identity::Keypair::from(libp2p::identity::ed25519::Keypair::from(secret))
+fn build_epoch_manager(
+    initial_validator_set: &ValidatorSet,
+    initial_validator_infos: &[ValidatorInfo],
+    epoch_length: u64,
+    recovery_epoch_schedule: Option<&EpochSchedule>,
+    recovered_view: Option<u64>,
+) -> eyre::Result<EpochManager> {
+    if epoch_length == 0 {
+        return Ok(EpochManager::new(initial_validator_set.clone()));
+    }
+
+    let current_epoch = recovered_view
+        .map(|view| view.saturating_sub(1) / epoch_length)
+        .unwrap_or(0);
+
+    if let Some(schedule) = recovery_epoch_schedule {
+        let recovery_window = schedule.recovery_window(
+            initial_validator_infos,
+            initial_validator_set.fault_tolerance(),
+            current_epoch,
+            3,
+        );
+        EpochManager::from_schedule(epoch_length, &recovery_window)
+            .map_err(|e| eyre::eyre!("failed to reconstruct epoch manager from schedule: {e}"))
+    } else if current_epoch > 0 {
+        Ok(EpochManager::from_epoch(
+            initial_validator_set.clone(),
+            epoch_length,
+            current_epoch,
+        ))
+    } else {
+        Ok(EpochManager::with_epoch_length(
+            initial_validator_set.clone(),
+            epoch_length,
+        ))
+    }
+}
+
+fn derive_ed25519_keypair(index: u32) -> eyre::Result<libp2p::identity::Keypair> {
+    static WARN_DETERMINISTIC_P2P_IDENTITY: Once = Once::new();
+    WARN_DETERMINISTIC_P2P_IDENTITY.call_once(|| {
+        warn!(
+            target: "n42::cli",
+            "validator libp2p identities are still deterministically derived from public validator indices; this is not sufficient for production-grade peer authentication"
+        );
+    });
+    deterministic_validator_keypair(index)
+}
+
+fn load_explicit_p2p_keypair() -> eyre::Result<Option<libp2p::identity::Keypair>> {
+    let Ok(hex_key) = std::env::var("N42_P2P_KEY") else {
+        return Ok(None);
+    };
+
+    let bytes = hex::decode(&hex_key)
+        .map_err(|error| eyre::eyre!("N42_P2P_KEY must be valid hex: {error}"))?;
+    let mut key_bytes: [u8; 32] = bytes.try_into().map_err(|value: Vec<u8>| {
+        eyre::eyre!("N42_P2P_KEY must be exactly 32 bytes, got {}", value.len())
+    })?;
+    let secret = libp2p::identity::ed25519::SecretKey::try_from_bytes(&mut key_bytes)
+        .map_err(|error| eyre::eyre!("N42_P2P_KEY is not a valid ed25519 secret key: {error}"))?;
+
+    Ok(Some(libp2p::identity::Keypair::from(
+        libp2p::identity::ed25519::Keypair::from(secret),
+    )))
+}
+
+fn resolve_validator_p2p_keypair(
+    validator_index: u32,
+    expected_peer_id: Option<libp2p::PeerId>,
+) -> eyre::Result<libp2p::identity::Keypair> {
+    let keypair = if let Some(keypair) = load_explicit_p2p_keypair()? {
+        keypair
+    } else if expected_peer_id.is_some() {
+        return Err(eyre::eyre!(
+            "validator {validator_index} has configured p2p_peer_id but N42_P2P_KEY is not set"
+        ));
+    } else {
+        derive_ed25519_keypair(validator_index)?
+    };
+
+    let local_peer_id = keypair.public().to_peer_id();
+    if let Some(expected_peer_id) = expected_peer_id
+        && local_peer_id != expected_peer_id
+    {
+        return Err(eyre::eyre!(
+            "local libp2p identity mismatch for validator {validator_index}: expected {expected_peer_id}, got {local_peer_id}"
+        ));
+    }
+
+    Ok(keypair)
 }
 
 fn main() {
@@ -106,9 +199,7 @@ fn main() {
         let name = thread.name().unwrap_or("<unnamed>");
         // Capture backtrace regardless of RUST_BACKTRACE setting.
         let bt = std::backtrace::Backtrace::force_capture();
-        eprintln!(
-            "\n!!! PANIC in thread '{name}' !!!\n{info}\n\nBacktrace:\n{bt}\n"
-        );
+        eprintln!("\n!!! PANIC in thread '{name}' !!!\n{info}\n\nBacktrace:\n{bt}\n");
     }));
 
     if std::env::var_os("RUST_BACKTRACE").is_none() {
@@ -128,7 +219,13 @@ fn main() {
     } else {
         DefaultRpcServerArgs::default()
     };
-    let _ = rpc_defaults.try_init();
+    if let Err(error) = rpc_defaults.try_init() {
+        warn!(
+            target: "n42::cli",
+            error = ?error,
+            "failed to apply RPC default server args"
+        );
+    }
 
     if let Err(err) = Cli::<EthereumChainSpecParser>::parse().run(async move |builder, _| {
         info!(target: "n42::cli", "Launching N42 node");
@@ -145,8 +242,10 @@ fn main() {
         }
 
         // Priority: N42_CONSENSUS_CONFIG file > N42_VALIDATOR_COUNT dev mode.
-        let mut consensus_config = match std::env::var("N42_CONSENSUS_CONFIG") {
-            Ok(path) => {
+        let consensus_config_path = std::env::var("N42_CONSENSUS_CONFIG").ok();
+        let consensus_config_from_file = consensus_config_path.is_some();
+        let mut consensus_config = match consensus_config_path {
+            Some(path) => {
                 info!(target: "n42::cli", path, "loading consensus config from file");
                 ConsensusConfig::from_file(std::path::Path::new(&path))
                     .unwrap_or_else(|e| {
@@ -154,7 +253,7 @@ fn main() {
                         std::process::exit(1);
                     })
             }
-            Err(_) => {
+            None => {
                 let num_validators = env_parse("N42_VALIDATOR_COUNT").unwrap_or(1);
                 if num_validators > 1 {
                     info!(target: "n42::cli", count = num_validators, "multi-validator dev mode");
@@ -227,49 +326,129 @@ fn main() {
             })
         } else {
             warn!(target: "n42::cli", "No validator key configured, generating random key (dev mode)");
-            BlsSecretKey::random().expect("Failed to generate random BLS key")
+            BlsSecretKey::random().unwrap_or_else(|error| {
+                eprintln!("ERROR: Failed to generate random BLS key: {error}");
+                std::process::exit(1);
+            })
         };
 
-        let validator_set = if consensus_config.initial_validators.is_empty() {
-            ValidatorSet::new(
+        let initial_validator_set = if consensus_config.initial_validators.is_empty() {
+            ValidatorSet::try_new(
                 &[n42_chainspec::ValidatorInfo {
                     address: Address::ZERO,
                     bls_public_key: secret_key.public_key(),
+                    p2p_peer_id: None,
                 }],
                 0,
             )
         } else {
-            ValidatorSet::new(
+            ValidatorSet::try_new(
                 &consensus_config.initial_validators,
                 consensus_config.fault_tolerance,
             )
+        }
+        .map_err(|e| eyre::eyre!("invalid initial validator set: {e}"))?;
+
+        let data_dir: PathBuf = std::env::var("N42_DATA_DIR")
+            .unwrap_or_else(|_| "./n42-data".to_string())
+            .into();
+        let allow_deterministic_validator_peers =
+            !consensus_config_from_file || env_bool("N42_ALLOW_DETERMINISTIC_P2P");
+        if consensus_config_from_file && allow_deterministic_validator_peers {
+            warn!(
+                target: "n42::cli",
+                "N42_ALLOW_DETERMINISTIC_P2P=1 enables weak, publicly derivable validator PeerIds; this is not suitable for production"
+            );
+        }
+        let epoch_schedule_path = data_dir.join("epoch_schedule.json");
+        let epoch_schedule = match EpochSchedule::load(&epoch_schedule_path) {
+            Ok(Some(schedule)) => {
+                if let Err(error) =
+                    schedule.validate_peer_binding_policy(allow_deterministic_validator_peers)
+                {
+                    eprintln!(
+                        "ERROR: invalid epoch schedule peer binding policy in {}: {error}",
+                        epoch_schedule_path.display()
+                    );
+                    std::process::exit(1);
+                }
+                info!(
+                    target: "n42::cli",
+                    path = %epoch_schedule_path.display(),
+                    epoch_count = schedule.len(),
+                    "epoch schedule loaded"
+                );
+                Some(schedule)
+            }
+            Ok(None) => None,
+            Err(e) => {
+                warn!(
+                    target: "n42::cli",
+                    error = %e,
+                    "failed to load epoch schedule, proceeding without dynamic validator rotation"
+                );
+                None
+            }
         };
 
+        let state_file = data_dir.join("consensus_state.json");
+        let snapshot = match persistence::load_consensus_state(&state_file) {
+            Ok(snap) => snap,
+            Err(e) => {
+                warn!(
+                    target: "n42::cli",
+                    path = %state_file.display(),
+                    error = %e,
+                    "failed to load consensus snapshot, starting fresh"
+                );
+                None
+            }
+        };
+
+        let initial_validator_infos = initial_validator_set.validator_infos();
+        let startup_epoch_manager = build_epoch_manager(
+            &initial_validator_set,
+            &initial_validator_infos,
+            consensus_config.epoch_length,
+            epoch_schedule.as_ref(),
+            snapshot.as_ref().map(|snap| snap.current_view),
+        )?;
+        let startup_validator_set = startup_epoch_manager.current_validator_set().clone();
+        let startup_validator_infos = startup_validator_set.validator_infos();
+        let configured_validator_peer_ids =
+            configured_validator_peer_ids(&startup_validator_infos)?;
+        let expected_validator_peer_ids = expected_validator_peer_ids_with_policy(
+            &startup_validator_infos,
+            allow_deterministic_validator_peers,
+        )?;
+        if startup_validator_set.len() > 1 && configured_validator_peer_ids.is_empty() {
+            warn!(
+                target: "n42::cli",
+                validator_count = startup_validator_set.len(),
+                "no validator p2p_peer_id bindings configured; falling back to deterministic libp2p identities"
+            );
+        }
+
         let my_pubkey = secret_key.public_key();
-        let my_index = validator_set
-            .all_public_keys()
-            .iter()
-            .position(|pk| pk.to_bytes() == my_pubkey.to_bytes())
-            .map(|i| i as u32)
-            .unwrap_or_else(|| {
+        let resolved_my_index = startup_validator_set.index_of_public_key(&my_pubkey);
+        let my_index = resolved_my_index.unwrap_or_else(|| {
                 if consensus_config.initial_validators.is_empty() {
                     // Dev mode with auto-generated validator set — index 0 is correct.
                     0
                 } else {
                     warn!(
                         target: "n42::cli",
-                        "this node's BLS public key not found in the validator set; \
+                        "this node's BLS public key not found in the current epoch validator set; \
                          defaulting to observer mode (index 0, no block rewards)"
                     );
                     0
                 }
             });
 
-        let fee_recipient = consensus_config
-            .initial_validators
-            .get(my_index as usize)
-            .map(|v| v.address)
-            .unwrap_or_else(|| {
+        let fee_recipient = startup_validator_set
+            .get_address(my_index)
+            .copied()
+            .unwrap_or_else(|_| {
                 warn!(
                     target: "n42::cli",
                     "no fee recipient address found for validator index {my_index}, \
@@ -281,18 +460,15 @@ fn main() {
         info!(
             target: "n42::cli",
             validator_index = my_index,
-            validator_count = validator_set.len(),
+            validator_count = startup_validator_set.len(),
             %fee_recipient,
             "validator identity resolved"
         );
 
-        let consensus_state = Arc::new(SharedConsensusState::new(validator_set.clone()));
+        let consensus_state = Arc::new(SharedConsensusState::new(startup_validator_set.clone()));
         let n42_node = N42Node::new(consensus_state.clone());
 
         // Create staking manager early so it can be shared with RPC.
-        let data_dir: PathBuf = std::env::var("N42_DATA_DIR")
-            .unwrap_or_else(|_| "./n42-data".to_string())
-            .into();
         let staking_state_file = data_dir.join("staking_state.json");
         let staking_manager = Arc::new(Mutex::new(
             StakingManager::load_or_new(&staking_state_file),
@@ -407,7 +583,7 @@ fn main() {
                 info!(
                     target: "n42::cli",
                     validator_index = my_index,
-                    validator_count = validator_set.len(),
+                    validator_count = startup_validator_set.len(),
                     %genesis_hash,
                     %head_block_hash,
                     "starting N42 consensus subsystem"
@@ -422,7 +598,7 @@ fn main() {
                     info!(target: "n42::cli", %local_peer_id, "Observer P2P identity (random)");
 
                     let mut transport_config =
-                        TransportConfig::for_network_size(validator_set.len() as usize);
+                        TransportConfig::for_network_size(startup_validator_set.len() as usize);
                     transport_config.enable_mdns = env_bool("N42_ENABLE_MDNS");
                     transport_config.enable_kademlia = env_bool("N42_ENABLE_DHT");
 
@@ -454,13 +630,18 @@ fn main() {
 
                     connect_trusted_peers(&net_handle);
 
-                    let observer = ObserverOrchestrator::new(
+                    let mut observer = ObserverOrchestrator::new(
                         net_handle,
                         net_event_rx,
                         beacon_engine_handle,
                         head_block_hash,
-                    ).with_validator_set(validator_set)
-                     .with_blob_store(full_node.pool.blob_store().clone());
+                    )
+                    .with_validator_set(initial_validator_set.clone())
+                    .with_blob_store(full_node.pool.blob_store().clone());
+                    if let Some(schedule) = epoch_schedule.clone() {
+                        observer =
+                            observer.with_epoch_schedule(consensus_config.epoch_length, schedule);
+                    }
 
                     task_executor.spawn_critical_task(
                         "n42-observer-orchestrator",
@@ -472,12 +653,18 @@ fn main() {
                 }
 
                 // ── Normal consensus mode ──────────────────────────────
-                let keypair = derive_ed25519_keypair(my_index);
+                let local_expected_peer_id = resolved_my_index
+                    .and_then(|index| configured_validator_peer_ids.get(&index).copied());
+                let keypair = resolve_validator_p2p_keypair(my_index, local_expected_peer_id)?;
                 let local_peer_id = keypair.public().to_peer_id();
-                info!(target: "n42::cli", %local_peer_id, "P2P identity (deterministic)");
+                if local_expected_peer_id.is_some() {
+                    info!(target: "n42::cli", %local_peer_id, "P2P identity (configured)");
+                } else {
+                    info!(target: "n42::cli", %local_peer_id, "P2P identity (legacy deterministic fallback)");
+                }
 
                 let mut transport_config =
-                    TransportConfig::for_network_size(validator_set.len() as usize);
+                    TransportConfig::for_network_size(startup_validator_set.len() as usize);
                 transport_config.enable_mdns = env_bool("N42_ENABLE_MDNS");
                 transport_config.enable_kademlia = env_bool("N42_ENABLE_DHT");
                 if transport_config.enable_mdns {
@@ -492,7 +679,10 @@ fn main() {
                         .map_err(|e| eyre::eyre!("failed to build consensus libp2p swarm: {e}"))?;
 
                 let (mut net_service, net_handle, consensus_event_rx, net_event_rx) =
-                    NetworkService::new(swarm)
+                    NetworkService::new_with_expected_validator_peer_ids(
+                        swarm,
+                        expected_validator_peer_ids.clone(),
+                    )
                         .map_err(|e| eyre::eyre!("failed to create consensus network service: {e}"))?;
 
                 let consensus_port: u16 = env_parse("N42_CONSENSUS_PORT").unwrap_or(9400);
@@ -518,7 +708,7 @@ fn main() {
 
                 // Auto-connect to higher-index validators only (i < j initiates the connection),
                 // avoiding duplicate connections. Port convention: base_port + validator_index.
-                let val_count = validator_set.len() as u32;
+                let val_count = startup_validator_set.len() as u32;
                 if !env_bool("N42_NO_AUTO_CONNECT") && val_count > 1 {
                     let base_port = consensus_port.saturating_sub(my_index as u16);
                     info!(
@@ -527,8 +717,11 @@ fn main() {
                         "auto-connecting to higher-index validators"
                     );
                     for j in (my_index + 1)..val_count {
-                        let peer_keypair = derive_ed25519_keypair(j);
-                        let peer_id = peer_keypair.public().to_peer_id();
+                        let peer_id = if let Some(peer_id) = expected_validator_peer_ids.get(&j) {
+                            *peer_id
+                        } else {
+                            n42_network::deterministic_validator_peer_id(j)?
+                        };
                         let peer_port = base_port + j as u16;
                         let peer_addr: libp2p::Multiaddr = match format!(
                             "/ip4/127.0.0.1/udp/{}/quic-v1/p2p/{}",
@@ -629,7 +822,7 @@ fn main() {
 
                 let (attest_tx, mut attest_rx) = mpsc::channel(256);
                 let (phone_connected_tx, phone_connected_rx) = mpsc::channel(128);
-                let (reward_attest_tx, mut reward_attest_rx) = mpsc::unbounded_channel();
+                let (reward_attest_tx, mut reward_attest_rx) = mpsc::channel(1024);
 
                 let attestation_store_path = data_dir.join("attestation_store.json");
                 let attestation_store = Arc::new(Mutex::new(
@@ -652,9 +845,11 @@ fn main() {
                     "n42-reward-tracker",
                     Box::pin(async move {
                         while let Some(pubkey) = reward_attest_rx.recv().await {
-                            if let Ok(mut mgr) = reward_mgr_tracker.lock() {
-                                mgr.record_attestation(&pubkey);
-                            }
+                            let mut mgr = reward_mgr_tracker.lock().unwrap_or_else(|e| {
+                                warn!(target: "n42::mobile", "reward manager mutex poisoned, recovering state");
+                                e.into_inner()
+                            });
+                            mgr.record_attestation(&pubkey);
                         }
                     }),
                 );
@@ -693,35 +888,10 @@ fn main() {
                 );
                 info!(target: "n42::cli", "Mobile packet generation loop started");
 
-                let state_file = data_dir.join("consensus_state.json");
-
-                let make_epoch_manager = || -> EpochManager {
-                    if consensus_config.epoch_length > 0 {
-                        EpochManager::with_epoch_length(
-                            validator_set.clone(),
-                            consensus_config.epoch_length,
-                        )
-                    } else {
-                        EpochManager::new(validator_set.clone())
-                    }
-                };
-
                 let (output_tx, output_rx) = mpsc::channel(if low_mem { 64 } else { 1024 });
-                let snapshot = match persistence::load_consensus_state(&state_file) {
-                    Ok(snap) => snap,
-                    Err(e) => {
-                        warn!(
-                            target: "n42::cli",
-                            path = %state_file.display(),
-                            error = %e,
-                            "failed to load consensus snapshot, starting fresh"
-                        );
-                        None
-                    }
-                };
 
                 let mut restored_block_count: u64 = 0;
-                let consensus_engine = if let Some(snapshot) = snapshot {
+                let consensus_engine = if let Some(snapshot) = snapshot.clone() {
                     restored_block_count = snapshot.committed_block_count;
                     info!(
                         target: "n42::cli",
@@ -731,14 +901,39 @@ fn main() {
                         committed_block_count = snapshot.committed_block_count,
                         "recovered consensus state from snapshot"
                     );
-                    let mut epoch_manager = make_epoch_manager();
-                    if let Some((_, ref validators, f)) = snapshot.scheduled_epoch_transition {
-                        info!(
-                            target: "n42::cli",
-                            new_validators = validators.len(),
-                            "restoring staged epoch transition from snapshot"
-                        );
-                        epoch_manager.stage_next_epoch(validators, f);
+                    let mut epoch_manager = build_epoch_manager(
+                        &initial_validator_set,
+                        &initial_validator_infos,
+                        consensus_config.epoch_length,
+                        epoch_schedule.as_ref(),
+                        Some(snapshot.current_view),
+                    )?;
+                    if let Some((target_epoch, ref validators, f)) =
+                        snapshot.scheduled_epoch_transition
+                    {
+                        let expected_epoch = epoch_manager.current_epoch() + 1;
+                        if target_epoch != expected_epoch {
+                            warn!(
+                                target: "n42::cli",
+                                target_epoch,
+                                expected_epoch,
+                                "discarding staged epoch transition from snapshot with mismatched target epoch"
+                            );
+                        } else if let Err(error) = epoch_manager.stage_next_epoch(validators, f) {
+                            warn!(
+                                target: "n42::cli",
+                                target_epoch,
+                                error = %error,
+                                "discarding invalid staged epoch transition from snapshot"
+                            );
+                        } else {
+                            info!(
+                                target: "n42::cli",
+                                target_epoch,
+                                new_validators = validators.len(),
+                                "restored staged epoch transition from snapshot"
+                            );
+                        }
                     }
                     ConsensusEngine::with_recovered_state(
                         my_index,
@@ -757,7 +952,13 @@ fn main() {
                     ConsensusEngine::with_epoch_manager(
                         my_index,
                         secret_key,
-                        make_epoch_manager(),
+                        build_epoch_manager(
+                            &initial_validator_set,
+                            &initial_validator_infos,
+                            consensus_config.epoch_length,
+                            epoch_schedule.as_ref(),
+                            None,
+                        )?,
                         consensus_config.base_timeout_ms,
                         consensus_config.max_timeout_ms,
                         output_tx,
@@ -807,32 +1008,6 @@ fn main() {
                     );
                 }
 
-                // Load epoch schedule from $N42_DATA_DIR/epoch_schedule.json (optional).
-                let epoch_schedule_path = data_dir.join("epoch_schedule.json");
-                let epoch_schedule = match EpochSchedule::load(&epoch_schedule_path) {
-                    Ok(Some(schedule)) => {
-                        info!(
-                            target: "n42::cli",
-                            path = %epoch_schedule_path.display(),
-                            epoch_count = schedule.len(),
-                            "epoch schedule loaded"
-                        );
-                        Some(schedule)
-                    }
-                    Ok(None) => {
-                        // File absent: dynamic validator rotation not configured (static set).
-                        None
-                    }
-                    Err(e) => {
-                        warn!(
-                            target: "n42::cli",
-                            error = %e,
-                            "failed to load epoch schedule, proceeding without dynamic validator rotation"
-                        );
-                        None
-                    }
-                };
-
                 let mut orchestrator = ConsensusOrchestrator::with_engine_api(
                     consensus_engine,
                     net_handle,
@@ -848,7 +1023,7 @@ fn main() {
                 .with_tx_pool_bridge(tx_import_tx, tx_broadcast_rx)
                 .with_mobile_packet_tx(mobile_packet_tx)
                 .with_state_persistence(state_file)
-                .with_validator_set(validator_set)
+                .with_validator_set(startup_validator_set)
                 .with_blob_store(full_node.pool.blob_store().clone())
                 .with_mobile_reward_manager(reward_manager)
                 .with_staking_manager(staking_manager.clone())
@@ -857,6 +1032,8 @@ fn main() {
                 if let Some(schedule) = epoch_schedule {
                     orchestrator = orchestrator.with_epoch_schedule(schedule);
                 }
+                orchestrator = orchestrator
+                    .with_allow_deterministic_validator_peers(allow_deterministic_validator_peers);
                 if let Some(scheduler) = zk_scheduler {
                     orchestrator = orchestrator.with_zk_scheduler(scheduler);
                 }

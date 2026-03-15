@@ -1,8 +1,8 @@
-use super::keys::{BlsError, BlsPublicKey, BlsSignature};
 use super::DST;
+use super::keys::{BlsError, BlsPublicKey, BlsSignature};
+use blst::BLST_ERROR;
 use blst::blst_scalar;
 use blst::min_pk::Signature;
-use blst::BLST_ERROR;
 
 /// Creates a blst_scalar from a 64-bit little-endian value.
 /// The scalar is stored in a 256-bit field (32 bytes), with the
@@ -28,7 +28,10 @@ pub fn batch_verify(
     }
 
     if messages.len() > MAX_BATCH_SIZE {
-        return Err(BlsError::BatchTooLarge { size: messages.len(), max: MAX_BATCH_SIZE });
+        return Err(BlsError::BatchTooLarge {
+            size: messages.len(),
+            max: MAX_BATCH_SIZE,
+        });
     }
 
     if messages.is_empty() {
@@ -57,14 +60,7 @@ pub fn batch_verify(
     let pks: Vec<&blst::min_pk::PublicKey> = public_keys.iter().map(|pk| pk.inner()).collect();
 
     let result = Signature::verify_multiple_aggregate_signatures(
-        messages,
-        DST,
-        &pks,
-        false,
-        &sigs,
-        true,
-        &rands,
-        64,
+        messages, DST, &pks, false, &sigs, true, &rands, 64,
     );
 
     if result != BLST_ERROR::BLST_SUCCESS {
@@ -121,8 +117,8 @@ pub fn batch_verify_with_fallback(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::keys::BlsSecretKey;
+    use super::*;
 
     #[test]
     fn test_batch_verify_success() {
@@ -165,7 +161,10 @@ mod tests {
         let public_keys = vec![&pk1, &pk2];
 
         let result = batch_verify(&messages, &signatures, &public_keys);
-        assert!(result.is_err(), "batch verify should fail for mismatched lengths");
+        assert!(
+            result.is_err(),
+            "batch verify should fail for mismatched lengths"
+        );
     }
 
     #[test]
@@ -222,7 +221,10 @@ mod tests {
 
         let messages: Vec<&[u8]> = vec![msg.as_ref(), msg.as_ref(), msg.as_ref()];
         let result = batch_verify(&messages, &[&sig1, &sig2, &sig3], &[&pk1, &pk2, &pk3]);
-        assert!(result.is_err(), "batch should fail when one signature is invalid");
+        assert!(
+            result.is_err(),
+            "batch should fail when one signature is invalid"
+        );
     }
 
     #[test]
