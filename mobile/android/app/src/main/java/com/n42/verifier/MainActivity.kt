@@ -12,6 +12,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.ViewModel
@@ -251,18 +252,23 @@ fun ConnectionSection(vm: VerifierViewModel) {
                 enabled = !vm.isConnected
             )
             Spacer(Modifier.height(12.dp))
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
                 Button(
                     onClick = { vm.connect() },
-                    enabled = !vm.isConnected
+                    enabled = !vm.isConnected,
+                    modifier = Modifier.weight(1f)
                 ) {
-                    Text("Connect")
+                    Text("Connect", maxLines = 1, overflow = TextOverflow.Ellipsis)
                 }
                 OutlinedButton(
                     onClick = { vm.disconnect() },
-                    enabled = vm.isConnected
+                    enabled = vm.isConnected,
+                    modifier = Modifier.weight(1f)
                 ) {
-                    Text("Disconnect")
+                    Text("Disconnect", maxLines = 1, overflow = TextOverflow.Ellipsis)
                 }
             }
         }

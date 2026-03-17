@@ -61,12 +61,18 @@ struct ContentView: View {
                     let port = UInt16(serverPort) ?? 9443
                     verifier.connect(host: serverHost, port: port)
                 }
+                .frame(maxWidth: .infinity)
+                .lineLimit(1)
+                .minimumScaleFactor(0.85)
                 .disabled(verifier.isConnected)
                 .buttonStyle(.borderedProminent)
 
                 Button("Disconnect") {
                     verifier.disconnect()
                 }
+                .frame(maxWidth: .infinity)
+                .lineLimit(1)
+                .minimumScaleFactor(0.85)
                 .disabled(!verifier.isConnected)
                 .buttonStyle(.bordered)
             }
