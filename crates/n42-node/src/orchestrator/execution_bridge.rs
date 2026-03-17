@@ -1,6 +1,7 @@
 use super::{
     BlobSidecarBroadcast, BlockDataBroadcast, CompactBlockExecution, ConsensusOrchestrator,
 };
+use crate::ingest::note_virtual_block_credit;
 use alloy_consensus::Typed2718;
 use alloy_eips::eip7594::BlobTransactionSidecarVariant;
 use alloy_primitives::{Address, B256};
@@ -14,8 +15,9 @@ use reth_node_builder::ConsensusEngineHandle;
 use reth_payload_builder::{EthBuiltPayload, PayloadBuilderHandle, PayloadId};
 use reth_payload_primitives::{EngineApiMessageVersion, PayloadKind, PayloadTypes};
 use reth_transaction_pool::blobstore::{BlobStore, DiskFileBlobStore};
-use std::sync::Arc;
-use std::time::Duration;
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tracing::{debug, error, info, warn};
@@ -35,6 +37,54 @@ type CachedPayloadData = (
     BlockExecutionOutput<reth_ethereum_primitives::Receipt>,
     Vec<Address>,
 );
+
+#[derive(Default)]
+struct CompactInjectTracker {
+    order: VecDeque<B256>,
+    counts: HashMap<B256, u64>,
+}
+
+const COMPACT_INJECT_TRACKER_LIMIT: usize = 2048;
+
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn elapsed_since_unix_ms(start_ms: u64) -> Option<u64> {
+    (start_ms > 0).then(|| now_unix_ms().saturating_sub(start_ms))
+}
+
+fn observe_compact_inject_attempt(hash: B256, source: &'static str) -> Option<u64> {
+    static TRACKER: std::sync::OnceLock<Mutex<CompactInjectTracker>> = std::sync::OnceLock::new();
+    let tracker = TRACKER.get_or_init(|| Mutex::new(CompactInjectTracker::default()));
+    let mut tracker = tracker.lock().unwrap_or_else(|e| e.into_inner());
+
+    if let Some(seen) = tracker.counts.get_mut(&hash) {
+        *seen += 1;
+        let duplicate_attempt = *seen;
+        metrics::counter!("n42_compact_inject_duplicate_total").increment(1);
+        info!(
+            target: "n42::cl::exec_bridge",
+            %hash,
+            source,
+            duplicate_attempt,
+            "N42_COMPACT_INJECT_DUP: repeated compact inject attempt"
+        );
+        return Some(duplicate_attempt);
+    }
+
+    tracker.counts.insert(hash, 1);
+    tracker.order.push_back(hash);
+    if tracker.order.len() > COMPACT_INJECT_TRACKER_LIMIT
+        && let Some(evicted) = tracker.order.pop_front()
+    {
+        tracker.counts.remove(&evicted);
+    }
+    None
+}
 
 /// Take execution output from broadcast cache and serialize it for followers.
 fn take_and_serialize_execution_output(hash: &B256) -> Option<Vec<u8>> {
@@ -76,7 +126,8 @@ fn take_and_serialize_execution_output(hash: &B256) -> Option<Vec<u8>> {
 }
 
 /// Deserialize compact block execution output and load it into the payload cache.
-pub(super) fn inject_compact_block(hash: &B256, compressed: &[u8]) -> bool {
+pub(super) fn inject_compact_block(hash: &B256, compressed: &[u8], source: &'static str) -> bool {
+    let duplicate_attempt = observe_compact_inject_attempt(*hash, source);
     let inject_start = std::time::Instant::now();
 
     let decompress_start = std::time::Instant::now();
@@ -114,6 +165,8 @@ pub(super) fn inject_compact_block(hash: &B256, compressed: &[u8]) -> bool {
 
     let total_ms = inject_start.elapsed().as_millis() as u64;
     info!(target: "n42::cl::exec_bridge", %hash,
+        source,
+        duplicate_attempt = duplicate_attempt.unwrap_or_default(),
         compressed_kb = compressed.len() / 1024,
         decompressed_kb = decompressed.len() / 1024,
         decompress_ms, deser_ms, store_ms, total_ms,
@@ -470,10 +523,21 @@ impl ConsensusOrchestrator {
         };
 
         let hash = broadcast.block_hash;
+        let duplicate_bytes = data.len();
 
         // Dedup: skip if we already have this block (direct push + GossipSub overlap).
         if self.pending_block_data.contains_key(&hash) {
-            debug!(target: "n42::cl::exec_bridge", %hash, "duplicate block data, skipping");
+            metrics::counter!("n42_block_data_dup_hash_drop_total").increment(1);
+            metrics::counter!("n42_block_data_dup_hash_drop_bytes_total")
+                .increment(duplicate_bytes as u64);
+            metrics::histogram!("n42_block_data_dup_hash_drop_bytes")
+                .record(duplicate_bytes as f64);
+            debug!(
+                target: "n42::cl::exec_bridge",
+                %hash,
+                bytes = duplicate_bytes,
+                "N42_DUP_HASH_DROP: duplicate block data, skipping"
+            );
             return;
         }
 
@@ -515,6 +579,7 @@ impl ConsensusOrchestrator {
             let execution_output_compressed = broadcast.execution_output;
             let view = broadcast.view;
             let block_ts = broadcast.timestamp;
+            let leader_ready_unix_ms = broadcast.leader_ready_unix_ms;
             let eager_done_tx = self.eager_import_done_tx.clone();
             let block_guard = self.eager_import_block_guard.clone();
             tokio::spawn(async move {
@@ -532,6 +597,10 @@ impl ConsensusOrchestrator {
                         Err(_) => return,
                     };
                 let deser_ms = deser_start.elapsed().as_millis() as u64;
+                let ready_to_decode_ms = elapsed_since_unix_ms(leader_ready_unix_ms);
+                if let Some(elapsed) = ready_to_decode_ms {
+                    metrics::histogram!("n42_follower_ready_to_decode_ms").record(elapsed as f64);
+                }
                 info!(
                     target: "n42::cl::exec_bridge",
                     %hash,
@@ -539,6 +608,9 @@ impl ConsensusOrchestrator {
                     decompressed_kb = payload_json.len() / 1024,
                     decompress_ms,
                     deser_ms,
+                    leader_ready_unix_ms,
+                    has_leader_ready_ts = leader_ready_unix_ms > 0,
+                    ready_to_decode_ms = ready_to_decode_ms.unwrap_or_default(),
                     has_compact_block = execution_output_compressed.is_some(),
                     "N42_DECOMPRESS: follower payload decoded"
                 );
@@ -546,6 +618,7 @@ impl ConsensusOrchestrator {
                 // Sending new_payload for the same block number but different hash triggers
                 // reth pipeline sync and causes chain stalls.
                 let block_number = execution_data.block_number();
+                let tx_count = execution_data.transaction_count();
                 let prev = block_guard.fetch_max(block_number, std::sync::atomic::Ordering::SeqCst);
                 if prev >= block_number {
                     info!(target: "n42::cl::exec_bridge", %hash, view, block_number, prev, "follower eager import: skipping duplicate block number");
@@ -556,8 +629,15 @@ impl ConsensusOrchestrator {
                 // This lets reth skip EVM re-execution (cache hit path), reducing import from
                 // ~209ms to ~22ms. Safety: state root is still verified by reth's new_payload.
                 let compact_injected = execution_output_compressed.as_ref().is_some_and(|exec| {
-                    compact_block_enabled() && inject_compact_block(&hash, exec)
+                    compact_block_enabled() && inject_compact_block(&hash, exec, "block_data_eager")
                 });
+                let ready_to_compact_inject_ms = execution_output_compressed
+                    .as_ref()
+                    .and(elapsed_since_unix_ms(leader_ready_unix_ms));
+                if let Some(elapsed) = ready_to_compact_inject_ms {
+                    metrics::histogram!("n42_follower_ready_to_compact_inject_ms")
+                        .record(elapsed as f64);
+                }
 
                 // Follower eager import: only run new_payload (no FCU).
                 // new_payload inserts the block into reth's engine tree so that
@@ -574,10 +654,38 @@ impl ConsensusOrchestrator {
                         ) =>
                     {
                         let np_elapsed = import_start.elapsed().as_millis() as u64;
+                        let ready_to_accept_ms = elapsed_since_unix_ms(leader_ready_unix_ms);
+                        note_virtual_block_credit(tx_count, "follower_payload_accepted");
+                        if let Some(elapsed) = ready_to_accept_ms {
+                            metrics::histogram!("n42_follower_ready_to_accept_ms")
+                                .record(elapsed as f64);
+                        }
                         info!(
                             target: "n42::cl::exec_bridge",
-                            %hash, view, np_elapsed, compact_injected,
+                            %hash,
+                            view,
+                            np_elapsed,
+                            compact_injected,
+                            leader_ready_unix_ms,
+                            has_leader_ready_ts = leader_ready_unix_ms > 0,
+                            ready_to_decode_ms = ready_to_decode_ms.unwrap_or_default(),
+                            ready_to_compact_inject_ms =
+                                ready_to_compact_inject_ms.unwrap_or_default(),
+                            ready_to_accept_ms = ready_to_accept_ms.unwrap_or_default(),
                             "follower eager import: new_payload accepted (no FCU)"
+                        );
+                        info!(
+                            target: "n42::cl::exec_bridge",
+                            %hash,
+                            view,
+                            leader_ready_unix_ms,
+                            ready_to_decode_ms = ready_to_decode_ms.unwrap_or_default(),
+                            ready_to_compact_inject_ms =
+                                ready_to_compact_inject_ms.unwrap_or_default(),
+                            ready_to_accept_ms = ready_to_accept_ms.unwrap_or_default(),
+                            np_elapsed,
+                            compact_injected,
+                            "N42_FOLLOWER_PATH: ready->decode->inject->accept"
                         );
                         if compact_injected {
                             metrics::counter!("n42_compact_block_cache_hits").increment(1);
@@ -673,7 +781,7 @@ impl ConsensusOrchestrator {
         if let Some(ref exec_compressed) = broadcast.execution_output
             && compact_block_enabled()
         {
-            inject_compact_block(&broadcast.block_hash, exec_compressed);
+            inject_compact_block(&broadcast.block_hash, exec_compressed, "import_and_notify");
         }
 
         match engine_handle.new_payload(execution_data).await {
@@ -845,7 +953,7 @@ impl ConsensusOrchestrator {
             if let Some(ref exec_compressed) = retry_broadcast.execution_output
                 && compact_block_enabled()
             {
-                inject_compact_block(&retry_hash, exec_compressed);
+                inject_compact_block(&retry_hash, exec_compressed, "retry_syncing");
             }
 
             match engine_handle.new_payload(retry_exec).await {
@@ -951,7 +1059,16 @@ async fn handle_built_payload(
     } else {
         None
     };
-
+    let leader_ready_unix_ms = now_unix_ms();
+    info!(
+        target: "n42::cl::exec_bridge",
+        %hash,
+        current_view,
+        leader_ready_unix_ms,
+        tx_count,
+        has_compact_block = execution_output_bytes.is_some(),
+        "N42_LEADER_READY: payload ready for broadcast"
+    );
     // 1. Broadcast block data + blob sidecars to followers
     broadcast_block_data(
         &network,
@@ -961,6 +1078,7 @@ async fn handle_built_payload(
         &payload_json,
         block_timestamp,
         execution_output_bytes,
+        leader_ready_unix_ms,
     )
     .await;
     broadcast_blob_sidecars(&network, &payload, hash, current_view, blob_store);
@@ -1022,6 +1140,7 @@ async fn broadcast_block_data(
     payload_json: &[u8],
     timestamp: u64,
     execution_output: Option<Vec<u8>>,
+    leader_ready_unix_ms: u64,
 ) {
     if payload_json.is_empty() {
         return;
@@ -1048,6 +1167,7 @@ async fn broadcast_block_data(
         payload_json: compressed,
         timestamp,
         execution_output,
+        leader_ready_unix_ms,
     };
     let encoded = match bincode::serialize(&broadcast) {
         Ok(enc) => enc,
@@ -1063,7 +1183,10 @@ async fn broadcast_block_data(
     let direct_count = validator_peers.len();
     let send_start = std::time::Instant::now();
     for (idx, peer_id) in &validator_peers {
-        if let Err(error) = network.send_block_direct(*peer_id, encoded.clone()) {
+        if let Err(error) = network
+            .send_block_direct_reliable(*peer_id, encoded.clone())
+            .await
+        {
             tracing::warn!(
                 target: "n42::cl::exec_bridge",
                 validator_index = idx,
@@ -1090,7 +1213,7 @@ async fn broadcast_block_data(
     // issues, causing validators to miss block data and unable to vote.
     // The receiver deduplicates via pending_block_data.contains_key(&hash).
     let gossip_start = std::time::Instant::now();
-    if let Err(e) = network.announce_block(encoded.clone()) {
+    if let Err(e) = network.announce_block_reliable(encoded.clone()).await {
         warn!(target: "n42::cl::exec_bridge", error = %e, "failed to broadcast block data via gossipsub");
     }
     let gossip_ms = gossip_start.elapsed().as_millis() as u64;

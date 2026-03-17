@@ -12,6 +12,37 @@ use reth_transaction_pool::{
 };
 use tracing::info;
 
+const DEFAULT_POOL_MAX_TXS: usize = 100_000;
+const DEFAULT_POOL_MAX_SIZE_BYTES: usize = 200 * 1024 * 1024;
+
+fn configured_block_cap() -> Option<usize> {
+    std::env::var("N42_MAX_TXS_PER_BLOCK")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|cap| *cap > 0)
+}
+
+fn adaptive_pool_limit_txs() -> usize {
+    std::env::var("N42_POOL_MAX_TXS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|cap| *cap > 0)
+        .unwrap_or_else(|| {
+            configured_block_cap()
+                .map(|cap| DEFAULT_POOL_MAX_TXS.max(cap.saturating_mul(3)))
+                .unwrap_or(DEFAULT_POOL_MAX_TXS)
+        })
+}
+
+fn adaptive_pool_limit_size(max_txs: usize) -> usize {
+    std::env::var("N42_POOL_MAX_SIZE_MB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|mb| *mb > 0)
+        .map(|mb| mb.saturating_mul(1024 * 1024))
+        .unwrap_or_else(|| DEFAULT_POOL_MAX_SIZE_BYTES.max(max_txs.saturating_mul(2 * 1024)))
+}
+
 /// N42 transaction pool type — uses DiskFileBlobStore for EIP-4844 blob transaction support.
 pub type N42TransactionPool<Provider, Evm> = reth_transaction_pool::Pool<
     TransactionValidationTaskExecutor<EthTransactionValidator<Provider, EthPooledTransaction, Evm>>,
@@ -135,18 +166,29 @@ fn idc_pool_config(base: &PoolConfig) -> PoolConfig {
             ..base.clone()
         }
     } else {
+        let max_txs = adaptive_pool_limit_txs();
+        let max_size = adaptive_pool_limit_size(max_txs);
+        if max_txs != DEFAULT_POOL_MAX_TXS || max_size != DEFAULT_POOL_MAX_SIZE_BYTES {
+            info!(
+                target: "n42::pool",
+                block_cap = configured_block_cap(),
+                max_txs,
+                max_size_mb = max_size / (1024 * 1024),
+                "benchmark pool limits scaled for larger block cap"
+            );
+        }
         PoolConfig {
             pending_limit: SubPoolLimit {
-                max_txs: 100_000,
-                max_size: 200 * 1024 * 1024,
+                max_txs,
+                max_size,
             },
             basefee_limit: SubPoolLimit {
-                max_txs: 100_000,
-                max_size: 200 * 1024 * 1024,
+                max_txs,
+                max_size,
             },
             queued_limit: SubPoolLimit {
-                max_txs: 100_000,
-                max_size: 200 * 1024 * 1024,
+                max_txs,
+                max_size,
             },
             blob_limit: SubPoolLimit {
                 max_txs: 256,

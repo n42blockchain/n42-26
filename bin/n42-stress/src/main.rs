@@ -113,6 +113,31 @@ struct Cli {
     #[arg(long, visible_alias = "inject")]
     ingest: Option<String>,
 
+    /// TCP ingest pacer: begin slowing down once pool_pending exceeds this.
+    #[arg(long, default_value = "60000")]
+    ingest_soft_resume: u64,
+
+    /// TCP ingest pacer: target per-node pending ceiling before aggressive delay.
+    #[arg(long, default_value = "72000")]
+    ingest_soft_target: u64,
+
+    /// TCP ingest pacer: near-gate threshold used to avoid the server hard stop.
+    #[arg(long, default_value = "84000")]
+    ingest_hard_target: u64,
+
+    /// TCP ingest pacer: hard cap applied after endpoint spread. Keep default for
+    /// 48K tests; raise it for higher-cap experiments when the server window is larger.
+    #[arg(long, default_value = "89000")]
+    ingest_hard_cap: u64,
+
+    /// TCP ingest pacer: distribute target thresholds across endpoints to reduce lockstep gating.
+    #[arg(long, default_value = "6000")]
+    ingest_target_spread: u64,
+
+    /// TCP ingest pacer: when non-zero, poll txpool_status and wait for the pool window to reopen.
+    #[arg(long, default_value = "0")]
+    ingest_pool_poll_ms: u64,
+
     /// RPC endpoints (comma-separated)
     #[arg(
         long,
@@ -549,9 +574,188 @@ fn spawn_backpressure_monitor(
 /// Signed batch ready to send.
 struct SignedBatch {
     raw_txs: Vec<String>,
-    sign_time: Duration,
     group_start: usize,
     group_end: usize,
+}
+
+#[derive(Clone, Copy)]
+struct IngestPacerConfig {
+    soft_resume: u64,
+    soft_target: u64,
+    hard_target: u64,
+    hard_cap: u64,
+    target_spread: u64,
+    pool_poll_ms: u64,
+}
+
+#[derive(Clone, Copy)]
+struct IngestPacer {
+    soft_resume: u64,
+    soft_target: u64,
+    hard_target: u64,
+    batch_size: u64,
+    jitter_ms: u64,
+}
+
+impl IngestPacerConfig {
+    fn for_endpoint(
+        self,
+        endpoint_idx: usize,
+        endpoint_count: usize,
+        batch_size: usize,
+    ) -> IngestPacer {
+        let spread_slot = if endpoint_count <= 1 || self.target_spread == 0 {
+            0
+        } else {
+            self.target_spread.saturating_mul(endpoint_idx as u64)
+                / (endpoint_count as u64).saturating_sub(1).max(1)
+        };
+        let soft_resume = self.soft_resume.saturating_add(spread_slot / 2);
+        let soft_target = self.soft_target.saturating_add(spread_slot);
+        let hard_target = self
+            .hard_target
+            .max(soft_target.saturating_add(batch_size as u64 * 4))
+            .saturating_add(spread_slot / 2)
+            .min(
+                self.hard_cap
+                    .max(soft_target.saturating_add(batch_size as u64 * 4)),
+            );
+
+        IngestPacer {
+            soft_resume,
+            soft_target,
+            hard_target,
+            batch_size: batch_size.max(1) as u64,
+            jitter_ms: 7 + ((endpoint_idx as u64 * 11) % 17),
+        }
+    }
+}
+
+impl IngestPacer {
+    fn delay_for(self, pool_pending: u64, gate_active: bool) -> Duration {
+        let delay_ms = if gate_active || pool_pending >= self.hard_target {
+            let over = pool_pending.saturating_sub(self.soft_resume);
+            140 + (over / self.batch_size.max(1)).saturating_mul(3)
+        } else if pool_pending >= self.soft_target {
+            let span = self.hard_target.saturating_sub(self.soft_target).max(1);
+            let over = pool_pending.saturating_sub(self.soft_target);
+            35 + over.saturating_mul(95) / span
+        } else if pool_pending >= self.soft_resume {
+            let span = self.soft_target.saturating_sub(self.soft_resume).max(1);
+            let over = pool_pending.saturating_sub(self.soft_resume);
+            8 + over.saturating_mul(32) / span
+        } else {
+            0
+        };
+
+        if delay_ms == 0 {
+            Duration::ZERO
+        } else {
+            let cap_ms = if gate_active { 900 } else { 220 };
+            Duration::from_millis((delay_ms + self.jitter_ms).min(cap_ms))
+        }
+    }
+}
+
+struct IngestAck {
+    accepted: u64,
+    pool_pending: u64,
+    consumed: u64,
+    credit_available: u64,
+}
+
+fn ingest_credit_probe_enabled() -> bool {
+    matches!(
+        std::env::var("N42_INGEST_CREDIT_PROBE").ok().as_deref(),
+        Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES")
+    )
+}
+
+fn ingest_extended_ack_enabled() -> bool {
+    ingest_credit_probe_enabled()
+        || matches!(
+            std::env::var("N42_INGEST_EXTENDED_ACK").ok().as_deref(),
+            Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES")
+        )
+}
+
+async fn read_ingest_ack(
+    stream: &mut TcpStream,
+    credit_probe_enabled: bool,
+    extended_ack_enabled: bool,
+) -> std::io::Result<IngestAck> {
+    if credit_probe_enabled {
+        let mut ack = [0u8; 16];
+        stream.read_exact(&mut ack).await?;
+        Ok(IngestAck {
+            accepted: u32::from_le_bytes(ack[0..4].try_into().unwrap()) as u64,
+            pool_pending: u32::from_le_bytes(ack[4..8].try_into().unwrap()) as u64,
+            consumed: u32::from_le_bytes(ack[8..12].try_into().unwrap()) as u64,
+            credit_available: u32::from_le_bytes(ack[12..16].try_into().unwrap()) as u64,
+        })
+    } else if extended_ack_enabled {
+        let mut ack = [0u8; 12];
+        stream.read_exact(&mut ack).await?;
+        Ok(IngestAck {
+            accepted: u32::from_le_bytes(ack[0..4].try_into().unwrap()) as u64,
+            pool_pending: u32::from_le_bytes(ack[4..8].try_into().unwrap()) as u64,
+            consumed: u32::from_le_bytes(ack[8..12].try_into().unwrap()) as u64,
+            credit_available: 0,
+        })
+    } else {
+        let mut ack = [0u8; 8];
+        stream.read_exact(&mut ack).await?;
+        Ok(IngestAck {
+            accepted: u32::from_le_bytes(ack[0..4].try_into().unwrap()) as u64,
+            pool_pending: u32::from_le_bytes(ack[4..8].try_into().unwrap()) as u64,
+            consumed: 0,
+            credit_available: 0,
+        })
+    }
+}
+
+async fn wait_for_ingest_credit(stream: &mut TcpStream) -> std::io::Result<IngestAck> {
+    stream.write_all(&u32::MAX.to_le_bytes()).await?;
+    read_ingest_ack(stream, true, true).await
+}
+
+async fn wait_for_pool_window(
+    client: &reqwest::Client,
+    rpc_url: &str,
+    stop: &Arc<AtomicBool>,
+    endpoint: &str,
+    pending_before: u64,
+    resume_pending: u64,
+    poll_ms: u64,
+) -> (u64, u64) {
+    if poll_ms == 0 || pending_before < resume_pending {
+        return (0, pending_before);
+    }
+
+    let poll_interval = Duration::from_millis(poll_ms.max(25));
+    let wait_start = Instant::now();
+    let mut observed_pending = pending_before;
+
+    while !stop.load(Ordering::Relaxed) && observed_pending >= resume_pending {
+        tokio::time::sleep(poll_interval).await;
+        match get_txpool_status(client, rpc_url).await {
+            Ok((pending, _)) => observed_pending = pending,
+            Err(_) => break,
+        }
+    }
+
+    let wait_ms = wait_start.elapsed().as_millis() as u64;
+    if wait_ms >= 500 {
+        tracing::info!(
+            endpoint,
+            pending_before,
+            pending_after = observed_pending,
+            wait_ms,
+            "pool pacer: waited for pool window"
+        );
+    }
+
+    (wait_ms, observed_pending)
 }
 
 /// Per-RPC pipelined sender: signer and sender run concurrently via channel.
@@ -667,7 +871,6 @@ async fn sender_loop(
 
             let batch = SignedBatch {
                 raw_txs,
-                sign_time,
                 group_start,
                 group_end,
             };
@@ -1229,6 +1432,7 @@ async fn run_ingest_mode(
     presigned: Vec<Vec<RawTxWithSender>>,
     batch_size: usize,
     target_tps: u64,
+    pacer_cfg: IngestPacerConfig,
     stats: &Arc<Stats>,
     rpc_urls: &[String],
     client: &reqwest::Client,
@@ -1298,11 +1502,15 @@ async fn run_ingest_mode(
 
     // Spawn one TCP sender per endpoint with dynamic rate control
     let mut handles = Vec::new();
+    let credit_probe_enabled = ingest_credit_probe_enabled();
+    let extended_ack_enabled = ingest_extended_ack_enabled();
     for (idx, txs) in presigned.into_iter().enumerate() {
         if txs.is_empty() {
             continue;
         }
         let endpoint = endpoints[idx % endpoints.len()].clone();
+        let rpc_url = rpc_urls[idx % rpc_urls.len()].clone();
+        let rpc_client = client.clone();
         let stats = stats.clone();
         let stop = stop.clone();
         let bs = batch_size;
@@ -1312,6 +1520,7 @@ async fn run_ingest_mode(
         } else {
             0
         };
+        let pacer = pacer_cfg.for_endpoint(idx, endpoints.len().max(1), bs);
 
         handles.push(tokio::spawn(async move {
             // Connect to ingest server
@@ -1328,6 +1537,10 @@ async fn run_ingest_mode(
                 txs = txs.len(),
                 batch_size = bs,
                 per_ep_tps,
+                pacer_soft_resume = pacer.soft_resume,
+                pacer_soft_target = pacer.soft_target,
+                pacer_hard_target = pacer.hard_target,
+                pacer_pool_poll_ms = pacer_cfg.pool_poll_ms,
                 "TCP ingest connected"
             );
 
@@ -1339,30 +1552,80 @@ async fn run_ingest_mode(
                 Duration::ZERO
             };
 
-            // Dynamic rate control thresholds
-            const POOL_LOW: u64 = 50_000; // below: full speed
-            const POOL_HIGH: u64 = 80_000; // above: pause until LOW
             let mut pool_gated = false;
             let mut gate_wait_ms = 0u64;
+            let mut partial_batches = 0u64;
+            let mut deferred_txs = 0u64;
+            let mut zero_credit_acks = 0u64;
+            let mut credit_probe_waits = 0u64;
+            let mut credit_probe_wait_ms = 0u64;
+            let mut credit_remaining = 0u64;
 
             // Index-based iteration for retry support
             let chunks: Vec<&[RawTxWithSender]> = txs.chunks(bs).collect();
             let mut chunk_idx = 0;
+            let mut chunk_offset = 0usize;
 
             while chunk_idx < chunks.len() {
                 if stop.load(Ordering::Relaxed) {
                     break;
                 }
-                let chunk = chunks[chunk_idx];
+                let chunk = &chunks[chunk_idx][chunk_offset..];
                 let batch_start = Instant::now();
 
+                if credit_probe_enabled && credit_remaining == 0 {
+                    if !pool_gated {
+                        tracing::info!(endpoint, "waiting for server-side ingest credit");
+                        pool_gated = true;
+                    }
+                    let wait_start = Instant::now();
+                    match wait_for_ingest_credit(&mut stream).await {
+                        Ok(ack) => {
+                            let waited_ms = wait_start.elapsed().as_millis() as u64;
+                            gate_wait_ms += waited_ms;
+                            credit_probe_wait_ms += waited_ms;
+                            credit_probe_waits += 1;
+                            credit_remaining = ack.credit_available;
+                            if credit_remaining == 0 {
+                                continue;
+                            }
+                            tracing::info!(
+                                endpoint,
+                                pool_pending = ack.pool_pending,
+                                gate_wait_ms,
+                                credit_available = ack.credit_available,
+                                "pool gate: resumed injection"
+                            );
+                            pool_gated = false;
+                            gate_wait_ms = 0;
+                        }
+                        Err(e) => {
+                            tracing::warn!(endpoint, error = %e, "ingest credit wait failed");
+                            break;
+                        }
+                    }
+                }
+
+                let send_len = if credit_probe_enabled {
+                    chunk.len().min(credit_remaining as usize)
+                } else {
+                    chunk.len()
+                };
+                if send_len == 0 {
+                    credit_remaining = 0;
+                    continue;
+                }
+                let send_chunk = &chunk[..send_len];
+
                 // Build binary batch: [u32 num_txs] [u16 tx_len, tx_bytes, 20-byte sender] × n
-                let num_txs = chunk.len() as u32;
-                let total_size: usize =
-                    4 + chunk.iter().map(|(tx, _)| 2 + tx.len() + 20).sum::<usize>();
+                let num_txs = send_chunk.len() as u32;
+                let total_size: usize = 4 + send_chunk
+                    .iter()
+                    .map(|(tx, _)| 2 + tx.len() + 20)
+                    .sum::<usize>();
                 let mut buf = Vec::with_capacity(total_size);
                 buf.extend_from_slice(&num_txs.to_le_bytes());
-                for (tx, sender) in chunk {
+                for (tx, sender) in send_chunk {
                     buf.extend_from_slice(&(tx.len() as u16).to_le_bytes());
                     buf.extend_from_slice(tx);
                     buf.extend_from_slice(sender);
@@ -1372,35 +1635,76 @@ async fn run_ingest_mode(
                 if let Err(e) = stream.write_all(&buf).await {
                     stats
                         .rpc_errors
-                        .fetch_add(chunk.len() as u64, Ordering::Relaxed);
+                        .fetch_add(send_chunk.len() as u64, Ordering::Relaxed);
                     tracing::warn!(endpoint, error = %e, "TCP write failed");
                     break;
                 }
 
-                // Read ACK v3: [u32 accepted][u32 pool_pending]
-                // Falls back to v2 (4-byte ACK) if server doesn't send pool hint.
-                let mut ack = [0u8; 8];
-                match stream.read_exact(&mut ack).await {
-                    Ok(_) => {
-                        let accepted = u32::from_le_bytes(ack[0..4].try_into().unwrap()) as u64;
-                        let pool_pending = u32::from_le_bytes(ack[4..8].try_into().unwrap()) as u64;
+                // Read ACK: legacy [accepted,pool_pending], extended
+                // [accepted,pool_pending,consumed], or credit-probe
+                // [accepted,pool_pending,consumed,credit_available].
+                match read_ingest_ack(&mut stream, credit_probe_enabled, extended_ack_enabled).await
+                {
+                    Ok(IngestAck {
+                        accepted,
+                        pool_pending,
+                        consumed,
+                        credit_available,
+                    }) => {
+                        let chunk_len = send_chunk.len() as u64;
+                        let consumed = if !credit_probe_enabled && !extended_ack_enabled {
+                            if accepted == 0 { 0 } else { chunk_len }
+                        } else {
+                            consumed.min(chunk_len)
+                        };
+                        if credit_probe_enabled {
+                            credit_remaining = credit_remaining.saturating_sub(consumed);
+                        }
 
-                        if accepted == 0 && pool_pending > 0 {
-                            // Server rejected: pool gate active. Retry same batch.
-                            if !pool_gated {
-                                tracing::info!(
-                                    endpoint,
-                                    pool_pending,
-                                    "pool gate: server rejected batch, waiting..."
-                                );
-                                pool_gated = true;
+                        if consumed == 0 && pool_pending > 0 {
+                            if credit_probe_enabled {
+                                // Sender should switch to a lightweight credit probe instead of
+                                // retrying the full batch or polling txpool_status over RPC.
+                                zero_credit_acks += 1;
+                                credit_remaining = credit_available;
+                            } else {
+                                // Legacy behavior: retry the same suffix after a short delay.
+                                if !pool_gated {
+                                    tracing::info!(
+                                        endpoint,
+                                        pool_pending,
+                                        "pool credit exhausted: waiting for retry window"
+                                    );
+                                    pool_gated = true;
+                                }
+                                zero_credit_acks += 1;
+                                let mut waited_for_window = false;
+                                if pacer_cfg.pool_poll_ms > 0 {
+                                    let (wait_ms, _pending_after) = wait_for_pool_window(
+                                        &rpc_client,
+                                        &rpc_url,
+                                        &stop,
+                                        &endpoint,
+                                        pool_pending,
+                                        pacer.soft_target,
+                                        pacer_cfg.pool_poll_ms + pacer.jitter_ms,
+                                    )
+                                    .await;
+                                    if wait_ms > 0 {
+                                        gate_wait_ms += wait_ms;
+                                        waited_for_window = true;
+                                    }
+                                }
+                                if !waited_for_window {
+                                    let gate_delay = pacer.delay_for(pool_pending, true);
+                                    gate_wait_ms += gate_delay.as_millis() as u64;
+                                    tokio::time::sleep(gate_delay).await;
+                                }
                             }
-                            gate_wait_ms += 200;
-                            tokio::time::sleep(Duration::from_millis(200)).await;
                             continue; // retry same chunk_idx
                         }
 
-                        if pool_gated {
+                        if !credit_probe_enabled && pool_gated {
                             tracing::info!(
                                 endpoint,
                                 pool_pending,
@@ -1412,23 +1716,61 @@ async fn run_ingest_mode(
                         }
 
                         stats.sent.fetch_add(accepted, Ordering::Relaxed);
-                        let rejected = chunk.len() as u64 - accepted;
+                        let rejected = consumed.saturating_sub(accepted);
                         if rejected > 0 {
                             stats.rpc_errors.fetch_add(rejected, Ordering::Relaxed);
                         }
+                        if consumed < chunk_len {
+                            partial_batches += 1;
+                            deferred_txs += chunk_len - consumed;
+                            chunk_offset += consumed as usize;
+                        } else {
+                            chunk_offset = chunks[chunk_idx].len();
+                        }
 
-                        // Dynamic rate: if pool is getting full, apply rate limiting
-                        if pool_pending > POOL_HIGH {
-                            // Wait until pool drops (server will gate, but add client delay too)
-                            tokio::time::sleep(Duration::from_millis(100)).await;
-                        } else if pool_pending > POOL_LOW && !batch_interval.is_zero() {
-                            // Normal rate limiting
-                            let elapsed = batch_start.elapsed();
-                            if elapsed < batch_interval {
-                                tokio::time::sleep(batch_interval - elapsed).await;
+                        let mut handled_window_wait = false;
+                        if !credit_probe_enabled
+                            && pacer_cfg.pool_poll_ms > 0
+                            && per_ep_tps == 0
+                            && pool_pending >= pacer.soft_target
+                        {
+                            let (wait_ms, pending_after) = wait_for_pool_window(
+                                &rpc_client,
+                                &rpc_url,
+                                &stop,
+                                &endpoint,
+                                pool_pending,
+                                pacer.soft_resume,
+                                pacer_cfg.pool_poll_ms + pacer.jitter_ms,
+                            )
+                            .await;
+                            if wait_ms > 0 {
+                                handled_window_wait = true;
+                                tracing::debug!(
+                                    endpoint,
+                                    wait_ms,
+                                    pending_after,
+                                    "pool pacer: window wait complete"
+                                );
                             }
                         }
-                        // pool < POOL_LOW: full speed, no sleep
+
+                        let mut delay = pacer.delay_for(pool_pending, false);
+                        if !batch_interval.is_zero() {
+                            let elapsed = batch_start.elapsed();
+                            if elapsed < batch_interval {
+                                let interval_delay = batch_interval - elapsed;
+                                if interval_delay > delay {
+                                    delay = interval_delay;
+                                }
+                            }
+                        }
+                        if handled_window_wait {
+                            delay = Duration::ZERO;
+                        }
+                        if !delay.is_zero() {
+                            tokio::time::sleep(delay).await;
+                        }
                     }
                     Err(e) => {
                         tracing::warn!(endpoint, error = %e, "TCP ACK read failed");
@@ -1436,12 +1778,23 @@ async fn run_ingest_mode(
                     }
                 }
 
-                chunk_idx += 1;
+                if chunk_offset >= chunks[chunk_idx].len() {
+                    chunk_offset = 0;
+                    chunk_idx += 1;
+                }
             }
 
             // Send close signal
             let _ = stream.write_all(&0u32.to_le_bytes()).await;
-            tracing::info!(endpoint, "TCP ingest sender done");
+            tracing::info!(
+                endpoint,
+                partial_batches,
+                deferred_txs,
+                zero_credit_acks,
+                credit_probe_waits,
+                credit_probe_wait_ms,
+                "TCP ingest sender done"
+            );
         }));
     }
 
@@ -1474,38 +1827,59 @@ async fn tcp_send_wave(
     let mut total_err = 0u64;
 
     for chunk in txs.chunks(batch_size) {
-        // Build binary batch: [u32 num_txs] [u16 tx_len, tx_bytes, 20-byte sender] × n
-        let num_txs = chunk.len() as u32;
-        let total_size: usize = 4 + chunk.iter().map(|(tx, _)| 2 + tx.len() + 20).sum::<usize>();
-        let mut buf = Vec::with_capacity(total_size);
-        buf.extend_from_slice(&num_txs.to_le_bytes());
-        for (tx, sender) in chunk {
-            buf.extend_from_slice(&(tx.len() as u16).to_le_bytes());
-            buf.extend_from_slice(tx);
-            buf.extend_from_slice(sender);
-        }
+        let mut offset = 0usize;
+        while offset < chunk.len() {
+            let suffix = &chunk[offset..];
 
-        if let Err(e) = stream.write_all(&buf).await {
-            total_err += chunk.len() as u64;
-            tracing::warn!(error = %e, "TCP write failed in wave");
-            break;
-        }
-
-        // Read ACK
-        let mut ack = [0u8; 4];
-        match stream.read_exact(&mut ack).await {
-            Ok(_) => {
-                let accepted = u32::from_le_bytes(ack) as u64;
-                total_ok += accepted;
-                let rejected = chunk.len() as u64 - accepted;
-                if rejected > 0 {
-                    total_err += rejected;
-                }
+            // Build binary batch: [u32 num_txs] [u16 tx_len, tx_bytes, 20-byte sender] × n
+            let num_txs = suffix.len() as u32;
+            let total_size: usize = 4 + suffix
+                .iter()
+                .map(|(tx, _)| 2 + tx.len() + 20)
+                .sum::<usize>();
+            let mut buf = Vec::with_capacity(total_size);
+            buf.extend_from_slice(&num_txs.to_le_bytes());
+            for (tx, sender) in suffix {
+                buf.extend_from_slice(&(tx.len() as u16).to_le_bytes());
+                buf.extend_from_slice(tx);
+                buf.extend_from_slice(sender);
             }
-            Err(e) => {
-                tracing::warn!(error = %e, "TCP ACK read failed in wave");
-                total_err += chunk.len() as u64;
-                break;
+
+            if let Err(e) = stream.write_all(&buf).await {
+                total_err += suffix.len() as u64;
+                tracing::warn!(error = %e, "TCP write failed in wave");
+                return (total_ok, total_err);
+            }
+
+            let credit_probe_enabled = ingest_credit_probe_enabled();
+            let extended_ack_enabled = ingest_extended_ack_enabled();
+            match read_ingest_ack(stream, credit_probe_enabled, extended_ack_enabled).await {
+                Ok(ack) => {
+                    total_ok += ack.accepted;
+                    let consumed = if !credit_probe_enabled && !extended_ack_enabled {
+                        if ack.accepted == 0 {
+                            0
+                        } else {
+                            suffix.len() as u64
+                        }
+                    } else {
+                        ack.consumed.min(suffix.len() as u64)
+                    };
+                    let rejected = consumed.saturating_sub(ack.accepted);
+                    if rejected > 0 {
+                        total_err += rejected;
+                    }
+                    if consumed == 0 {
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                        continue;
+                    }
+                    offset += consumed as usize;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "TCP ACK read failed in wave");
+                    total_err += suffix.len() as u64;
+                    return (total_ok, total_err);
+                }
             }
         }
     }
@@ -2063,7 +2437,6 @@ async fn run_wave_mode(
             for chunk in presigned[rpc_idx][cursor..end].chunks(batch_size) {
                 let rpc_url = rpc_urls[rpc_idx].clone();
                 let client = client.clone();
-                let stats = stats.clone();
                 let sem = semaphore.clone();
                 let batch: Vec<String> = chunk.to_vec();
 
@@ -2535,6 +2908,14 @@ async fn main() -> Result<()> {
             presigned,
             cli.batch_size,
             cli.target_tps,
+            IngestPacerConfig {
+                soft_resume: cli.ingest_soft_resume,
+                soft_target: cli.ingest_soft_target,
+                hard_target: cli.ingest_hard_target,
+                hard_cap: cli.ingest_hard_cap,
+                target_spread: cli.ingest_target_spread,
+                pool_poll_ms: cli.ingest_pool_poll_ms,
+            },
             &stats,
             &rpc_urls,
             &client,
