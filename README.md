@@ -49,12 +49,13 @@ A high-performance blockchain system combining **HotStuff-2** BFT consensus with
 
 - **HotStuff-2 Consensus**: 2-round optimistic commit with 3-round timeout recovery
 - **BLS12-381 Signatures**: Aggregated signatures for compact quorum certificates
-- **reth v1.11.0 Integration**: Full EVM execution with Ethereum-compatible block/transaction format
+- **reth Latest Upstream Integration**: Tracks `paradigmxyz/reth` `origin/main` at `ae2c916f61`, with N42-specific payload/cache patches applied on top
 - **Jellyfish Merkle Tree (JMT)**: Blake3 hashing, 16-shard parallel updates, Merkle proofs via RPC
 - **Compact Block Propagation**: Leader caches execution output, followers skip EVM re-execution (cache hit ~3ms)
 - **Optimistic Voting**: Followers vote immediately after proposal validation, before block import
 - **TX Forward to Leader**: O(n) message complexity replacing O(n²) gossip for transactions
 - **Binary TCP Injection**: High-throughput transaction injection for stress testing (122K tx/s)
+- **Execution-Spec Shards CI**: Sharded Hive/execution-spec lane for regression testing against upstream reth contracts
 - **Execution Witness**: State witness generation for mobile re-execution
 - **Mobile Verification Protocol**: Ed25519 receipts, commit-reveal anti-copying, LRU code cache
 - **QUIC Mobile Client**: `QuicMobileClient` for phone-side connection to StarHub with deadline-based timeouts
@@ -217,14 +218,40 @@ Both configurations are well within the **8-second slot target**.
 
 ### Prerequisites
 
-- Rust 1.93+
-- reth v1.11.0 source at `../reth` (local path dependency)
+- Rust 1.94+
+- Latest `reth` source checked out at `../reth-latest`
+- Android local builds: JDK 17 recommended for Gradle/Kotlin
 - SP1 toolchain v4.2.1 (optional, for ZK proof guest build): `curl -L https://sp1up.succinct.xyz | bash && sp1up --version v4.2.1`
+
+### Prepare `reth-latest`
+
+```bash
+git clone https://github.com/paradigmxyz/reth.git ../reth-latest
+git -C ../reth-latest checkout ae2c916f6106b31ecbe715663abe183507786480
+git -C ../reth-latest apply ../n42-26/reth-n42.patch
+```
 
 ### Build
 
 ```bash
-cargo build
+# Verify the full workspace against the patched latest reth tree
+cargo check --all-targets
+
+# Main binaries
+cargo build --release -p n42-node-bin -p n42-stress -p e2e-test
+
+# Optional mobile / SDK artifacts
+cargo build --target aarch64-apple-ios-sim -p n42-mobile-ffi
+JAVA_HOME=$(/usr/libexec/java_home -v 17) \
+  ./mobile/android/gradlew :app:compileDebugKotlin
+```
+
+### Regenerate The `reth` Patch
+
+```bash
+git -C ../reth-latest diff --binary origin/main > reth-n42.patch
+git -C ../reth-latest diff --binary --no-index \
+  /dev/null crates/evm/evm/src/payload_cache.rs >> reth-n42.patch
 ```
 
 ### Run
@@ -311,6 +338,12 @@ Use `tests/e2e/README.md` as the source of truth for the current split between:
 - correctness CI
 - manual integrated E2E
 - LAN pressure / timing optimization
+
+Additional lanes introduced in this branch:
+
+- execution-spec shard workflows in `.github/workflows/execution-spec-shards.yml`
+- integrated 7-node smoke via `scripts/test-7node-integrated-smoke.sh`
+- reth image packaging helpers in `.github/scripts/hive/`
 
 ## Crate Dependency Graph
 

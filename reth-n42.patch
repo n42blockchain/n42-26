@@ -1,110 +1,11 @@
-diff --git a/Cargo.lock b/Cargo.lock
-index 343a6ca5b..f54c6c839 100644
---- a/Cargo.lock
-+++ b/Cargo.lock
-@@ -1686,6 +1686,15 @@ dependencies = [
-  "serde_core",
- ]
- 
-+[[package]]
-+name = "bitmaps"
-+version = "2.1.0"
-+source = "registry+https://github.com/rust-lang/crates.io-index"
-+checksum = "031043d04099746d8db04daf1fa424b2bc8bd69d92b25962dcde24da39ab64a2"
-+dependencies = [
-+ "typenum",
-+]
-+
- [[package]]
- name = "bitvec"
- version = "1.0.1"
-@@ -4987,6 +4996,20 @@ dependencies = [
-  "windows-sys 0.59.0",
- ]
- 
-+[[package]]
-+name = "im"
-+version = "15.1.0"
-+source = "registry+https://github.com/rust-lang/crates.io-index"
-+checksum = "d0acd33ff0285af998aaf9b57342af478078f53492322fafc47450e09397e0e9"
-+dependencies = [
-+ "bitmaps",
-+ "rand_core 0.6.4",
-+ "rand_xoshiro 0.6.0",
-+ "sized-chunks",
-+ "typenum",
-+ "version_check",
-+]
-+
- [[package]]
- name = "impl-codec"
- version = "0.6.0"
-@@ -5933,7 +5956,7 @@ dependencies = [
-  "ordered-float",
-  "quanta",
-  "rand 0.9.2",
-- "rand_xoshiro",
-+ "rand_xoshiro 0.7.0",
-  "sketches-ddsketch",
- ]
- 
-@@ -7329,6 +7352,15 @@ dependencies = [
-  "rand_core 0.9.5",
- ]
- 
-+[[package]]
-+name = "rand_xoshiro"
-+version = "0.6.0"
-+source = "registry+https://github.com/rust-lang/crates.io-index"
-+checksum = "6f97cdb2a36ed4183de61b2f824cc45c9f1037f28afe0a322e9fff4c108b5aaa"
-+dependencies = [
-+ "rand_core 0.6.4",
-+]
-+
- [[package]]
- name = "rand_xoshiro"
- version = "0.7.0"
-@@ -8808,6 +8840,7 @@ dependencies = [
-  "reth-storage-errors",
-  "reth-trie-common",
-  "revm",
-+ "tracing",
- ]
- 
- [[package]]
-@@ -10470,6 +10503,7 @@ dependencies = [
-  "bitflags 2.11.0",
-  "futures",
-  "futures-util",
-+ "im",
-  "metrics",
-  "parking_lot",
-  "paste",
-@@ -11692,6 +11726,16 @@ version = "1.0.2"
- source = "registry+https://github.com/rust-lang/crates.io-index"
- checksum = "b2aa850e253778c88a04c3d7323b043aeda9d3e30d5971937c1855769763678e"
- 
-+[[package]]
-+name = "sized-chunks"
-+version = "0.6.5"
-+source = "registry+https://github.com/rust-lang/crates.io-index"
-+checksum = "16d69225bde7a69b235da73377861095455d298f2b970996eec25ddbb42b3d1e"
-+dependencies = [
-+ "bitmaps",
-+ "typenum",
-+]
-+
- [[package]]
- name = "sketches-ddsketch"
- version = "0.3.1"
 diff --git a/crates/engine/tree/src/tree/payload_validator.rs b/crates/engine/tree/src/tree/payload_validator.rs
-index f97bc0bf3..b6d10bad6 100644
+index d246d2c149..4c98e48e71 100644
 --- a/crates/engine/tree/src/tree/payload_validator.rs
 +++ b/crates/engine/tree/src/tree/payload_validator.rs
 @@ -459,12 +459,32 @@ where
              withdrawals: input.withdrawals().map(|w| w.to_vec()),
          };
- 
+
 +        // Check leader payload cache early to influence state root strategy.
 +        // If cache hit, we skip EVM and force Synchronous to avoid StateRootTask timeout.
 +        let block_hash_for_cache = input.hash();
@@ -127,14 +28,14 @@ index f97bc0bf3..b6d10bad6 100644
 +        } else {
 +            self.plan_state_root_computation()
 +        };
- 
+
          debug!(
              target: "engine::tree::payload_validator",
              ?strategy,
 +            is_cache_hit,
              "Decided which state root algorithm to run"
          );
- 
+
 @@ -527,12 +547,37 @@ where
          // The receipt root task is spawned before execution and receives receipts incrementally
          // as transactions complete, allowing parallel computation during execution.
@@ -172,13 +73,13 @@ index f97bc0bf3..b6d10bad6 100644
 +            is_cache_hit,
 +            "N42_NEW_PAYLOAD_EVM: block execution complete"
 +        );
- 
+
          // After executing the block we can stop prewarming transactions
          handle.stop_prewarming_execution();
 @@ -546,6 +591,84 @@ where
          // needed. This frees up resources while state root computation continues.
          let valid_block_tx = handle.terminate_caching(Some(output.clone()));
- 
+
 +        // N42: check whether state root can be skipped BEFORE expensive post-execution work.
 +        // This allows the fast path below to avoid ~920ms of convert_to_block + tx_root +
 +        // hashed_state computation when the leader's payload cache was hit.
@@ -279,7 +180,7 @@ index f97bc0bf3..b6d10bad6 100644
          };
 @@ -614,6 +739,28 @@ where
          );
- 
+
          let root_time = Instant::now();
 +
 +        // N42: skip or defer state root computation
@@ -309,7 +210,7 @@ index f97bc0bf3..b6d10bad6 100644
 @@ -736,13 +883,25 @@ where
              (root, Arc::new(updates), root_time.elapsed())
          };
- 
+
 +        (state_root, trie_output, root_elapsed)
 +
 +        }; // end of n42_skip_state_root branch
@@ -327,16 +228,16 @@ index f97bc0bf3..b6d10bad6 100644
 +            total_ms = (execution_duration + root_elapsed).as_millis() as u64,
 +            "N42_NEW_PAYLOAD_TOTAL: EVM + state root complete"
 +        );
- 
+
 -        // ensure state root matches
 -        if state_root != block.header().state_root() {
 +        // ensure state root matches (skip check in benchmark/defer mode)
 +        if !n42_skip_root && state_root != block.header().state_root() {
              #[cfg(feature = "trie-debug")]
              Self::write_trie_debug_recorders(block.header().number(), &trie_debug_recorders);
- 
+
 diff --git a/crates/ethereum/payload/src/lib.rs b/crates/ethereum/payload/src/lib.rs
-index 745a0e337..7562c598b 100644
+index 745a0e337b..7562c598b7 100644
 --- a/crates/ethereum/payload/src/lib.rs
 +++ b/crates/ethereum/payload/src/lib.rs
 @@ -21,7 +21,7 @@ use reth_consensus_common::validation::MAX_RLP_BLOCK_SIZE;
@@ -354,13 +255,13 @@ index 745a0e337..7562c598b 100644
  use std::sync::Arc;
 -use tracing::{debug, trace, warn};
 +use tracing::{debug, info, trace, warn};
- 
+
  mod config;
  pub use config::*;
 @@ -213,7 +213,50 @@ where
- 
+
      let withdrawals_rlp_length = attributes.withdrawals().length();
- 
+
 -    while let Some(pool_tx) = best_txs.next() {
 +    // N42: per-block transaction count limit to prevent oversized blocks.
 +    static MAX_TXS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
@@ -412,14 +313,14 @@ index 745a0e337..7562c598b 100644
 @@ -231,24 +274,34 @@ where
              return Ok(BuildOutcome::Cancelled)
          }
- 
+
 -        // convert tx to a signed transaction
 +        // Optimization 3: Defer to_consensus() conversion — only needed for txs
 +        // that pass the gas check above. Also track its cost separately.
 +        let consensus_start = std::time::Instant::now();
          let tx = pool_tx.to_consensus();
 +        consensus_total += consensus_start.elapsed();
- 
+
 -        let tx_rlp_len = tx.inner().length();
 -
 -        let estimated_block_size_with_tx =
@@ -431,7 +332,7 @@ index 745a0e337..7562c598b 100644
 +            let len = tx.inner().length();
 +            let estimated_block_size_with_tx =
 +                block_transactions_rlp_length + len + withdrawals_rlp_length + 1024;
- 
+
 -        if is_osaka && estimated_block_size_with_tx > MAX_RLP_BLOCK_SIZE {
 -            best_txs.mark_invalid(
 -                &pool_tx,
@@ -456,13 +357,13 @@ index 745a0e337..7562c598b 100644
 +        } else {
 +            0
 +        };
- 
+
          // There's only limited amount of blob space available per block, so we need to check if
          // the EIP-4844 can still fit in the block
 @@ -303,6 +356,7 @@ where
              };
          }
- 
+
 +        let evm_start = std::time::Instant::now();
          let gas_used = match builder.execute_transaction(tx.clone()) {
              Ok(gas_used) => gas_used,
@@ -470,7 +371,7 @@ index 745a0e337..7562c598b 100644
 @@ -328,6 +382,8 @@ where
              Err(err) => return Err(PayloadBuilderError::evm(err)),
          };
- 
+
 +        evm_exec_total += evm_start.elapsed();
 +
          // add to the total blob gas used if the transaction successfully executed
@@ -481,13 +382,13 @@ index 745a0e337..7562c598b 100644
          total_fees += U256::from(miner_fee) * U256::from(gas_used);
          cumulative_gas_used += gas_used;
 +        tx_count += 1;
- 
+
          // Add blob tx sidecar to the payload.
          if let Some(sidecar) = blob_tx_sidecar {
 @@ -352,6 +409,26 @@ where
          }
      }
- 
+
 +    let packing_elapsed = packing_start.elapsed();
 +    let other_ms = packing_elapsed
 +        .saturating_sub(evm_exec_total)
@@ -514,7 +415,7 @@ index 745a0e337..7562c598b 100644
 @@ -360,14 +437,52 @@ where
          return Ok(BuildOutcome::Aborted { fees: total_fees, cached_reads })
      }
- 
+
 +    let finish_start = std::time::Instant::now();
      let BlockBuilderOutcome { execution_result, block, .. } =
          builder.finish(state_provider.as_ref())?;
@@ -529,7 +430,7 @@ index 745a0e337..7562c598b 100644
 +    // Seal the block first to get the hash, then cache execution output.
 +    let senders = block.senders().to_vec();
 +    let sealed_block = Arc::new(block.into_sealed_block());
- 
+
 +    // Extract requests before moving execution_result into cache (avoids expensive clone).
      let requests = chain_spec
          .is_prague_active_at_timestamp(attributes.timestamp)
@@ -565,35 +466,44 @@ index 745a0e337..7562c598b 100644
 +        );
 +    }
      debug!(target: "payload_builder", id=%attributes.id, sealed_block_header = ?sealed_block.sealed_header(), "sealed built block");
- 
+
      if is_osaka && sealed_block.rlp_length() > MAX_RLP_BLOCK_SIZE {
 diff --git a/crates/evm/evm/Cargo.toml b/crates/evm/evm/Cargo.toml
-index 0e98e9b00..747cdd110 100644
+index 0e98e9b004..747cdd1103 100644
 --- a/crates/evm/evm/Cargo.toml
 +++ b/crates/evm/evm/Cargo.toml
 @@ -28,6 +28,7 @@ alloy-eips.workspace = true
  alloy-evm.workspace = true
  alloy-consensus.workspace = true
- 
+
 +tracing.workspace = true
  auto_impl.workspace = true
  derive_more.workspace = true
  futures-util.workspace = true
 diff --git a/crates/evm/evm/src/execute.rs b/crates/evm/evm/src/execute.rs
-index 595097df3..daff7baaf 100644
+index 595097df34..8dd5609510 100644
 --- a/crates/evm/evm/src/execute.rs
 +++ b/crates/evm/evm/src/execute.rs
-@@ -464,6 +464,7 @@ where
-         ) -> CommitChanges,
-     ) -> Result<Option<u64>, BlockExecutionError> {
-         let (tx_env, tx) = tx.into_parts();
+@@ -478,21 +478,68 @@ where
+         self,
+         state: impl StateProvider,
+     ) -> Result<BlockBuilderOutcome<N>, BlockExecutionError> {
++        let finish_start = std::time::Instant::now();
 +
-         if let Some(gas_used) =
-             self.executor.execute_transaction_with_commit_condition((tx_env, &tx), f)?
-         {
-@@ -485,10 +486,43 @@ where
++        let executor_finish_start = std::time::Instant::now();
+         let (evm, result) = self.executor.finish()?;
++        let executor_finish_ms = executor_finish_start.elapsed().as_millis() as u64;
++
++        let evm_finish_start = std::time::Instant::now();
+         let (db, evm_env) = evm.finish();
++        let evm_finish_ms = evm_finish_start.elapsed().as_millis() as u64;
+
+         // merge all transitions into bundle state
++        let merge_start = std::time::Instant::now();
          db.merge_transitions(BundleRetention::Reverts);
- 
++        let merge_transitions_ms = merge_start.elapsed().as_millis() as u64;
++        let bundle_finalize_ms = executor_finish_ms + evm_finish_ms + merge_transitions_ms;
+
          // calculate the state root
 +        let hash_start = std::time::Instant::now();
          let hashed_state = state.hashed_post_state(&db.bundle_state);
@@ -601,12 +511,14 @@ index 595097df3..daff7baaf 100644
 -            .state_root_with_updates(hashed_state.clone())
 -            .map_err(BlockExecutionError::other)?;
 +        let hash_elapsed = hash_start.elapsed();
++        let state_hash_ms = hash_elapsed.as_millis() as u64;
 +
 +        #[cfg(feature = "std")]
 +        let n42_skip = crate::n42_skip_state_root() || crate::n42_defer_state_root();
 +        #[cfg(not(feature = "std"))]
 +        let n42_skip = false;
 +
++        let mut state_root_ms = 0u64;
 +        let (state_root, trie_updates) = if n42_skip {
 +            #[cfg(feature = "std")]
 +            {
@@ -625,21 +537,56 @@ index 595097df3..daff7baaf 100644
 +                .state_root_with_updates(hashed_state.clone())
 +                .map_err(BlockExecutionError::other)?;
 +            let root_elapsed = root_start.elapsed();
++            state_root_ms = root_elapsed.as_millis() as u64;
 +
 +            tracing::info!(
 +                target: "evm::execute",
-+                hash_ms = hash_elapsed.as_millis() as u64,
-+                root_ms = root_elapsed.as_millis() as u64,
++                hash_ms = state_hash_ms,
++                root_ms = state_root_ms,
 +                total_ms = (hash_elapsed + root_elapsed).as_millis() as u64,
 +                "N42_STATE_ROOT: leader finish() breakdown"
 +            );
 +            result
 +        };
- 
+
          let (transactions, senders) =
              self.transactions.into_iter().map(|tx| tx.into_parts()).unzip();
+
++        let assemble_start = std::time::Instant::now();
+         let block = self.assembler.assemble_block(BlockAssemblerInput {
+             evm_env,
+             execution_ctx: self.ctx,
+@@ -503,8 +550,28 @@ where
+             state_provider: &state,
+             state_root,
+         })?;
++        let assemble_block_ms = assemble_start.elapsed().as_millis() as u64;
+
+         let block = RecoveredBlock::new_unhashed(block, senders);
++        let trie_storage_nodes =
++            trie_updates.storage_tries.values().map(|updates| updates.len()).sum::<usize>();
++        tracing::info!(
++            target: "evm::execute",
++            executor_finish_ms,
++            evm_finish_ms,
++            merge_transitions_ms,
++            bundle_finalize_ms,
++            state_hash_ms,
++            state_root_ms,
++            assemble_block_ms,
++            total_finish_ms = finish_start.elapsed().as_millis() as u64,
++            skipped_state_root = n42_skip,
++            trie_account_nodes = trie_updates.account_nodes.len(),
++            trie_removed_nodes = trie_updates.removed_nodes.len(),
++            trie_storage_tries = trie_updates.storage_tries.len(),
++            trie_storage_nodes,
++            "N42_FINISH_BREAKDOWN: builder.finish() stage breakdown"
++        );
+
+         Ok(BlockBuilderOutcome { execution_result: result, hashed_state, trie_updates, block })
+     }
 diff --git a/crates/evm/evm/src/lib.rs b/crates/evm/evm/src/lib.rs
-index ee19f749b..89f39caa8 100644
+index ee19f749b3..89f39caa82 100644
 --- a/crates/evm/evm/src/lib.rs
 +++ b/crates/evm/evm/src/lib.rs
 @@ -52,6 +52,30 @@ pub use engine::{ConfigureEngineEvm, ConvertTx, ExecutableTxIterator, Executable
@@ -673,14 +620,94 @@ index ee19f749b..89f39caa8 100644
  #[cfg(any(test, feature = "test-utils"))]
  /// test helpers for mocking executor
  pub mod test_utils;
+diff --git a/crates/evm/evm/src/payload_cache.rs b/crates/evm/evm/src/payload_cache.rs
+new file mode 100644
+index 0000000000..590fdeb3a6
+--- /dev/null
++++ b/crates/evm/evm/src/payload_cache.rs
+@@ -0,0 +1,74 @@
++//! Global single-entry cache for leader payload execution results.
++//!
++//! When the payload builder (leader) finishes building a block, it caches
++//! the execution output here. When `validate_block_with_state` (new_payload)
++//! processes the same block, it can skip EVM re-execution by retrieving the
++//! cached result.
++//!
++//! Two cache slots exist:
++//! - `CACHE`: consumed by the leader's own `new_payload` (take semantics)
++//! - `BROADCAST_CACHE`: consumed by `handle_built_payload` for serialization
++//!   to followers (Compact Block). Separated so the leader's `take` doesn't
++//!   consume the data needed for broadcast.
++
++use alloy_primitives::B256;
++use std::any::Any;
++use std::sync::{Mutex, OnceLock};
++
++struct CachedPayload {
++    block_hash: B256,
++    data: Box<dyn Any + Send + Sync>,
++}
++
++type CacheSlot = OnceLock<Mutex<Option<CachedPayload>>>;
++
++static CACHE: CacheSlot = OnceLock::new();
++
++/// Secondary cache for broadcast to followers (Compact Block).
++static BROADCAST_CACHE: CacheSlot = OnceLock::new();
++
++fn store(slot: &CacheSlot, block_hash: B256, data: impl Any + Send + Sync + 'static) {
++    let cache = slot.get_or_init(|| Mutex::new(None));
++    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
++    *guard = Some(CachedPayload { block_hash, data: Box::new(data) });
++}
++
++fn take<T: 'static>(slot: &CacheSlot, block_hash: &B256) -> Option<T> {
++    let cache = slot.get_or_init(|| Mutex::new(None));
++    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
++    if let Some(entry) = guard.as_ref() {
++        if &entry.block_hash == block_hash {
++            if !entry.data.is::<T>() {
++                tracing::warn!(
++                    target: "evm::payload_cache",
++                    %block_hash,
++                    "payload cache type mismatch on downcast"
++                );
++                return None;
++            }
++            let entry = guard.take().unwrap();
++            return entry.data.downcast::<T>().ok().map(|b| *b);
++        }
++    }
++    None
++}
++
++/// Store payload execution data keyed by block hash (for leader's own new_payload).
++pub fn store_payload_execution(block_hash: B256, data: impl Any + Send + Sync + 'static) {
++    store(&CACHE, block_hash, data);
++}
++
++/// Take (remove) the cached payload execution data if the block hash matches.
++pub fn take_payload_execution<T: 'static>(block_hash: &B256) -> Option<T> {
++    take::<T>(&CACHE, block_hash)
++}
++
++/// Store a clone of execution data for broadcast to followers (Compact Block).
++pub fn store_broadcast_execution(block_hash: B256, data: impl Any + Send + Sync + 'static) {
++    store(&BROADCAST_CACHE, block_hash, data);
++}
++
++/// Take broadcast execution data if block hash matches.
++pub fn take_broadcast_execution<T: 'static>(block_hash: &B256) -> Option<T> {
++    take::<T>(&BROADCAST_CACHE, block_hash)
++}
 diff --git a/crates/rpc/rpc-eth-types/src/utils.rs b/crates/rpc/rpc-eth-types/src/utils.rs
-index 5df161d33..f53429864 100644
+index 5df161d33b..f53429864c 100644
 --- a/crates/rpc/rpc-eth-types/src/utils.rs
 +++ b/crates/rpc/rpc-eth-types/src/utils.rs
 @@ -40,8 +40,19 @@ pub fn recover_raw_transaction<T: SignedTransaction>(data: &[u8]) -> EthResult<R
      let transaction =
          T::decode_2718_exact(data).map_err(|_| EthApiError::FailedToDecodeSignedTransaction)?;
- 
+
 -    SignedTransaction::try_into_recovered(transaction)
 -        .or(Err(EthApiError::InvalidTransactionSignature))
 +    // N42_SKIP_TX_VERIFY: skip EIP-2 low-s check for benchmarking (all test txs are correctly signed)
@@ -697,89 +724,85 @@ index 5df161d33..f53429864 100644
 +            .or(Err(EthApiError::InvalidTransactionSignature))
 +    }
  }
- 
+
  /// Performs a binary search within a given block range to find the desired block number.
-diff --git a/crates/transaction-pool/Cargo.toml b/crates/transaction-pool/Cargo.toml
-index e81766587..a201dcc7a 100644
---- a/crates/transaction-pool/Cargo.toml
-+++ b/crates/transaction-pool/Cargo.toml
-@@ -56,6 +56,7 @@ serde_json.workspace = true
- bitflags.workspace = true
- auto_impl.workspace = true
- smallvec.workspace = true
-+im = "15"
- 
- # testing
- rand = { workspace = true, optional = true }
-diff --git a/crates/transaction-pool/src/pool/best.rs b/crates/transaction-pool/src/pool/best.rs
-index 836eac6cc..6094b8249 100644
---- a/crates/transaction-pool/src/pool/best.rs
-+++ b/crates/transaction-pool/src/pool/best.rs
-@@ -8,8 +8,9 @@ use alloy_consensus::Transaction;
- use alloy_primitives::map::AddressSet;
- use core::fmt;
- use reth_primitives_traits::transaction::error::InvalidTransactionError;
-+use im::OrdMap;
- use std::{
--    collections::{BTreeMap, BTreeSet, HashSet, VecDeque},
-+    collections::{BTreeSet, HashSet, VecDeque},
-     sync::Arc,
- };
- use tokio::sync::broadcast::{error::TryRecvError, Receiver};
-@@ -84,7 +85,7 @@ impl<T: TransactionOrdering> Iterator for BestTransactionsWithFees<T> {
- pub struct BestTransactions<T: TransactionOrdering> {
-     /// Contains a copy of _all_ transactions of the pending pool at the point in time this
-     /// iterator was created.
--    pub(crate) all: BTreeMap<TransactionId, PendingTransaction<T>>,
-+    pub(crate) all: OrdMap<TransactionId, PendingTransaction<T>>,
-     /// Transactions that can be executed right away: these have the expected nonce.
-     ///
-     /// Once an `independent` transaction with the nonce `N` is returned, it unlocks `N+1`, which
-diff --git a/crates/transaction-pool/src/pool/pending.rs b/crates/transaction-pool/src/pool/pending.rs
-index 38ec6655a..b15ade684 100644
---- a/crates/transaction-pool/src/pool/pending.rs
-+++ b/crates/transaction-pool/src/pool/pending.rs
-@@ -8,10 +8,11 @@ use crate::{
-     },
-     Priority, SubPoolLimit, TransactionOrdering, ValidPoolTransaction,
- };
-+use im::OrdMap;
- use rustc_hash::{FxHashMap, FxHashSet};
- use std::{
-     cmp::Ordering,
--    collections::{hash_map::Entry, BTreeMap},
-+    collections::hash_map::Entry,
-     ops::Bound::Unbounded,
-     sync::Arc,
- };
-@@ -36,7 +37,11 @@ pub struct PendingPool<T: TransactionOrdering> {
-     /// This way we can determine when transactions were submitted to the pool.
-     submission_id: u64,
-     /// _All_ Transactions that are currently inside the pool grouped by their identifier.
--    by_id: BTreeMap<TransactionId, PendingTransaction<T>>,
-+    ///
-+    /// Uses `im::OrdMap` (persistent data structure) instead of `BTreeMap` for O(log n) clone
-+    /// in `best()`. This eliminates the O(n) BTreeMap clone bottleneck that caused
-+    /// pool_overhead to spike from 5ms to 500ms+ when pending pool exceeds 30K transactions.
-+    by_id: OrdMap<TransactionId, PendingTransaction<T>>,
-     /// The highest nonce transactions for each sender - like the `independent` set, but the
-     /// highest instead of lowest nonce.
-     highest_nonces: FxHashMap<SenderId, PendingTransaction<T>>,
-@@ -80,7 +85,7 @@ impl<T: TransactionOrdering> PendingPool<T> {
-     /// # Returns
-     ///
-     /// Returns all transactions by id.
--    fn clear_transactions(&mut self) -> BTreeMap<TransactionId, PendingTransaction<T>> {
-+    fn clear_transactions(&mut self) -> OrdMap<TransactionId, PendingTransaction<T>> {
-         self.independent_transactions.clear();
-         self.highest_nonces.clear();
-         self.size_of.reset();
-@@ -525,7 +530,7 @@ impl<T: TransactionOrdering> PendingPool<T> {
-     }
- 
-     /// All transactions grouped by id
--    pub const fn by_id(&self) -> &BTreeMap<TransactionId, PendingTransaction<T>> {
-+    pub fn by_id(&self) -> &OrdMap<TransactionId, PendingTransaction<T>> {
-         &self.by_id
-     }
- 
+diff --git a/crates/evm/evm/src/payload_cache.rs b/crates/evm/evm/src/payload_cache.rs
+new file mode 100644
+index 0000000000..590fdeb3a6
+--- /dev/null
++++ b/crates/evm/evm/src/payload_cache.rs
+@@ -0,0 +1,74 @@
++//! Global single-entry cache for leader payload execution results.
++//!
++//! When the payload builder (leader) finishes building a block, it caches
++//! the execution output here. When `validate_block_with_state` (new_payload)
++//! processes the same block, it can skip EVM re-execution by retrieving the
++//! cached result.
++//!
++//! Two cache slots exist:
++//! - `CACHE`: consumed by the leader's own `new_payload` (take semantics)
++//! - `BROADCAST_CACHE`: consumed by `handle_built_payload` for serialization
++//!   to followers (Compact Block). Separated so the leader's `take` doesn't
++//!   consume the data needed for broadcast.
++
++use alloy_primitives::B256;
++use std::any::Any;
++use std::sync::{Mutex, OnceLock};
++
++struct CachedPayload {
++    block_hash: B256,
++    data: Box<dyn Any + Send + Sync>,
++}
++
++type CacheSlot = OnceLock<Mutex<Option<CachedPayload>>>;
++
++static CACHE: CacheSlot = OnceLock::new();
++
++/// Secondary cache for broadcast to followers (Compact Block).
++static BROADCAST_CACHE: CacheSlot = OnceLock::new();
++
++fn store(slot: &CacheSlot, block_hash: B256, data: impl Any + Send + Sync + 'static) {
++    let cache = slot.get_or_init(|| Mutex::new(None));
++    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
++    *guard = Some(CachedPayload { block_hash, data: Box::new(data) });
++}
++
++fn take<T: 'static>(slot: &CacheSlot, block_hash: &B256) -> Option<T> {
++    let cache = slot.get_or_init(|| Mutex::new(None));
++    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
++    if let Some(entry) = guard.as_ref() {
++        if &entry.block_hash == block_hash {
++            if !entry.data.is::<T>() {
++                tracing::warn!(
++                    target: "evm::payload_cache",
++                    %block_hash,
++                    "payload cache type mismatch on downcast"
++                );
++                return None;
++            }
++            let entry = guard.take().unwrap();
++            return entry.data.downcast::<T>().ok().map(|b| *b);
++        }
++    }
++    None
++}
++
++/// Store payload execution data keyed by block hash (for leader's own new_payload).
++pub fn store_payload_execution(block_hash: B256, data: impl Any + Send + Sync + 'static) {
++    store(&CACHE, block_hash, data);
++}
++
++/// Take (remove) the cached payload execution data if the block hash matches.
++pub fn take_payload_execution<T: 'static>(block_hash: &B256) -> Option<T> {
++    take::<T>(&CACHE, block_hash)
++}
++
++/// Store a clone of execution data for broadcast to followers (Compact Block).
++pub fn store_broadcast_execution(block_hash: B256, data: impl Any + Send + Sync + 'static) {
++    store(&BROADCAST_CACHE, block_hash, data);
++}
++
++/// Take broadcast execution data if block hash matches.
++pub fn take_broadcast_execution<T: 'static>(block_hash: &B256) -> Option<T> {
++    take::<T>(&BROADCAST_CACHE, block_hash)
++}
