@@ -28,8 +28,14 @@ pub fn expected_validator_peer_ids_with_policy(
     allow_deterministic_fallback: bool,
 ) -> eyre::Result<HashMap<u32, PeerId>> {
     let configured = configured_validator_peer_ids(validators)?;
-    if !configured.is_empty() {
+    if configured.len() == validators.len() {
         return Ok(configured);
+    }
+
+    if !configured.is_empty() {
+        return Err(eyre::eyre!(
+            "validators must either all define p2p_peer_id or all omit it"
+        ));
     }
 
     if !allow_deterministic_fallback && validators.len() > 1 {
@@ -52,10 +58,14 @@ mod tests {
     use libp2p::identity::Keypair;
     use n42_primitives::BlsSecretKey;
 
-    fn make_validator(peer_id: Option<String>) -> ValidatorInfo {
-        let sk = BlsSecretKey::random().unwrap();
+    fn test_key(seed: u8) -> BlsSecretKey {
+        BlsSecretKey::key_gen(&[seed; 32]).expect("deterministic test key should be valid")
+    }
+
+    fn make_validator(index: u8, peer_id: Option<String>) -> ValidatorInfo {
+        let sk = test_key(0x10 + index);
         ValidatorInfo {
-            address: Address::random(),
+            address: Address::with_last_byte(index),
             bls_public_key: sk.public_key(),
             p2p_peer_id: peer_id,
         }
@@ -66,8 +76,8 @@ mod tests {
         let peer0 = Keypair::generate_ed25519().public().to_peer_id();
         let peer1 = Keypair::generate_ed25519().public().to_peer_id();
         let validators = vec![
-            make_validator(Some(peer0.to_string())),
-            make_validator(Some(peer1.to_string())),
+            make_validator(0, Some(peer0.to_string())),
+            make_validator(1, Some(peer1.to_string())),
         ];
 
         let expected = expected_validator_peer_ids(&validators).unwrap();
@@ -78,7 +88,7 @@ mod tests {
 
     #[test]
     fn test_expected_validator_peer_ids_falls_back_to_deterministic_bindings() {
-        let validators = vec![make_validator(None), make_validator(None)];
+        let validators = vec![make_validator(0, None), make_validator(1, None)];
 
         let expected = expected_validator_peer_ids(&validators).unwrap();
 
@@ -95,10 +105,27 @@ mod tests {
 
     #[test]
     fn test_expected_validator_peer_ids_with_policy_rejects_strict_multi_validator_fallback() {
-        let validators = vec![make_validator(None), make_validator(None)];
+        let validators = vec![make_validator(0, None), make_validator(1, None)];
 
         let error = expected_validator_peer_ids_with_policy(&validators, false).unwrap_err();
 
         assert!(error.to_string().contains("requires explicit p2p_peer_id"));
+    }
+
+    #[test]
+    fn test_expected_validator_peer_ids_with_policy_rejects_partial_bindings() {
+        let peer0 = Keypair::generate_ed25519().public().to_peer_id();
+        let validators = vec![
+            make_validator(0, Some(peer0.to_string())),
+            make_validator(1, None),
+        ];
+
+        let error = expected_validator_peer_ids_with_policy(&validators, true).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("must either all define p2p_peer_id or all omit it")
+        );
     }
 }

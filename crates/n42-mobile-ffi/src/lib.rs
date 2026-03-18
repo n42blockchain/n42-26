@@ -778,7 +778,12 @@ mod tests {
         assert!(len > 0);
         let json_str = std::str::from_utf8(&buf[..len as usize]).expect("valid UTF-8");
         let parsed: serde_json::Value = serde_json::from_str(json_str).expect("valid JSON");
-        assert!(parsed.get("blocks_verified").is_some());
+        assert_eq!(parsed["blocks_verified"], 0);
+        assert_eq!(parsed["success_count"], 0);
+        assert_eq!(parsed["failure_count"], 0);
+        assert_eq!(parsed["avg_time_ms"], 0);
+        assert_eq!(parsed["success_rate"], 0);
+        assert_eq!(parsed["dropped_packets"], 0);
         unsafe { n42_verifier_free(ctx) };
     }
 
@@ -885,6 +890,24 @@ mod tests {
         let ctx = unsafe { n42_verifier_init(4242) };
         assert!(!ctx.is_null());
         let result = unsafe { n42_connect(ctx, std::ptr::null(), 9443, std::ptr::null(), 0) };
+        assert_eq!(result, -1);
+        unsafe { n42_verifier_free(ctx) };
+    }
+
+    #[test]
+    fn test_connect_invalid_utf8_host() {
+        let ctx = unsafe { n42_verifier_init(4242) };
+        assert!(!ctx.is_null());
+        let invalid_host = [0xFFu8, 0x00];
+        let result = unsafe {
+            n42_connect(
+                ctx,
+                invalid_host.as_ptr() as *const c_char,
+                9443,
+                std::ptr::null(),
+                0,
+            )
+        };
         assert_eq!(result, -1);
         unsafe { n42_verifier_free(ctx) };
     }

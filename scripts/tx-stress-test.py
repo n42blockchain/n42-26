@@ -45,13 +45,13 @@ MAX_PRIORITY_FEE = 1_000_000_000  # 1 gwei
 
 # All 7 validator RPC endpoints
 RPC_ENDPOINTS = [
-    "http://127.0.0.1:18545",
-    "http://127.0.0.1:18546",
-    "http://127.0.0.1:18547",
-    "http://127.0.0.1:18548",
-    "http://127.0.0.1:18549",
-    "http://127.0.0.1:18550",
-    "http://127.0.0.1:18551",
+    "http://127.0.0.1:18000",
+    "http://127.0.0.1:18001",
+    "http://127.0.0.1:18002",
+    "http://127.0.0.1:18003",
+    "http://127.0.0.1:18004",
+    "http://127.0.0.1:18005",
+    "http://127.0.0.1:18006",
 ]
 
 STATS_INTERVAL = 10  # seconds
@@ -108,43 +108,35 @@ class PooledRpcClient:
             self._id += 1
             return self._id
 
-    def send_raw_tx(self, raw_hex: str) -> Optional[str]:
+    def _call(self, method: str, params: Optional[list] = None, timeout: int = 5):
         payload = {
             "jsonrpc": "2.0",
-            "method": "eth_sendRawTransaction",
-            "params": [raw_hex],
+            "method": method,
+            "params": params or [],
             "id": self._next_id(),
         }
+        resp = self.session.post(self.url, json=payload, timeout=timeout)
+        resp.raise_for_status()
+        body = resp.json()
+        if not isinstance(body, dict):
+            raise RuntimeError(f"RPC {method}: invalid JSON-RPC body")
+        if "error" in body:
+            raise RuntimeError(f"RPC {method}: {body['error']}")
+        if "result" not in body:
+            raise RuntimeError(f"RPC {method}: missing result")
+        return body["result"]
+
+    def send_raw_tx(self, raw_hex: str) -> Optional[str]:
         try:
-            resp = self.session.post(self.url, json=payload, timeout=5)
-            body = resp.json()
-            if "error" in body:
-                return None
-            return body.get("result")
+            return self._call("eth_sendRawTransaction", [raw_hex], timeout=5)
         except Exception:
             return None
 
     def get_nonce(self, address: str) -> int:
-        payload = {
-            "jsonrpc": "2.0",
-            "method": "eth_getTransactionCount",
-            "params": [address, "pending"],
-            "id": self._next_id(),
-        }
-        resp = self.session.post(self.url, json=payload, timeout=5)
-        body = resp.json()
-        return int(body["result"], 16)
+        return int(self._call("eth_getTransactionCount", [address, "pending"], timeout=5), 16)
 
     def block_number(self) -> int:
-        payload = {
-            "jsonrpc": "2.0",
-            "method": "eth_blockNumber",
-            "params": [],
-            "id": self._next_id(),
-        }
-        resp = self.session.post(self.url, json=payload, timeout=5)
-        body = resp.json()
-        return int(body["result"], 16)
+        return int(self._call("eth_blockNumber", timeout=5), 16)
 
 
 # ---------------------------------------------------------------------------
@@ -328,7 +320,11 @@ def main():
     accounts = generate_accounts(args.accounts)
     targets = [a.address for a in accounts]
     for acct in accounts:
-        acct.nonce = primary.get_nonce(acct.address)
+        try:
+            acct.nonce = primary.get_nonce(acct.address)
+        except Exception as e:
+            log.error("Failed to sync nonce for account %d (%s): %s", acct.index, acct.address, e)
+            sys.exit(1)
         log.info("Account %d: %s nonce=%d", acct.index, acct.address, acct.nonce)
 
     if args.step:
@@ -346,10 +342,23 @@ def main():
 
             # Re-sync nonces
             for acct in accounts:
-                acct.nonce = primary.get_nonce(acct.address)
+                try:
+                    acct.nonce = primary.get_nonce(acct.address)
+                except Exception as e:
+                    log.warning(
+                        "Nonce re-sync failed for account %d (%s): %s; keeping local nonce=%d",
+                        acct.index,
+                        acct.address,
+                        e,
+                        acct.nonce,
+                    )
 
             stats = StressStats()
-            stats.start_block = primary.block_number()
+            try:
+                stats.start_block = primary.block_number()
+            except Exception as e:
+                log.warning("Failed to sample start block for step run: %s", e)
+                stats.start_block = 0
             stats.start_time = time.time()
 
             tps_per_thread = target_tps / len(accounts)
@@ -378,7 +387,11 @@ def main():
             # Final report
             sent, failed = stats.snapshot()
             elapsed = time.time() - stats.start_time
-            end_block = primary.block_number()
+            try:
+                end_block = primary.block_number()
+            except Exception as e:
+                log.warning("Failed to sample end block for step run: %s", e)
+                end_block = stats.start_block
             blocks = end_block - stats.start_block
             effective_tps = sent / max(elapsed, 1)
             avg_tx_block = sent / max(blocks, 1)
@@ -402,7 +415,11 @@ def main():
 
     # Single target mode
     stats = StressStats()
-    stats.start_block = primary.block_number()
+    try:
+        stats.start_block = primary.block_number()
+    except Exception as e:
+        log.warning("Failed to sample start block: %s", e)
+        stats.start_block = 0
 
     tps_per_thread = args.target_tps / len(accounts)
     log.info("Launching %d sender threads (%.1f tps/thread)", len(accounts), tps_per_thread)
@@ -430,7 +447,11 @@ def main():
     # Final
     sent, failed = stats.snapshot()
     elapsed = time.time() - stats.start_time
-    end_block = primary.block_number()
+    try:
+        end_block = primary.block_number()
+    except Exception as e:
+        log.warning("Failed to sample final block: %s", e)
+        end_block = stats.start_block
     blocks = end_block - stats.start_block
     log.info("\n=== FINAL RESULT ===")
     log.info("Target TPS: %d", args.target_tps)

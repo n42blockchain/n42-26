@@ -481,8 +481,12 @@ mod tests {
     use n42_chainspec::ValidatorInfo;
     use n42_primitives::BlsSecretKey;
 
+    fn test_key(seed: u8) -> BlsSecretKey {
+        BlsSecretKey::key_gen(&[seed; 32]).expect("deterministic test key should be valid")
+    }
+
     fn test_validator_set(n: usize) -> (Vec<BlsSecretKey>, ValidatorSet) {
-        let sks: Vec<_> = (0..n).map(|_| BlsSecretKey::random().unwrap()).collect();
+        let sks: Vec<_> = (0..n).map(|i| test_key(0x20 + i as u8)).collect();
         let infos: Vec<_> = sks
             .iter()
             .enumerate()

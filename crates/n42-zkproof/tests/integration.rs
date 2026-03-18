@@ -11,6 +11,24 @@ use n42_zkproof::{
     ZkProofResult, ZkProver,
 };
 
+async fn wait_until(
+    timeout: tokio::time::Duration,
+    mut condition: impl FnMut() -> bool,
+    description: &str,
+) {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if condition() {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for {description}"
+        );
+        tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
+    }
+}
+
 fn make_input(block_number: u64) -> BlockExecutionInput {
     let mut hash_bytes = [0u8; 32];
     hash_bytes[..8].copy_from_slice(&block_number.to_le_bytes());
@@ -45,8 +63,12 @@ async fn test_full_proof_lifecycle() {
         scheduler.on_block_committed(block, make_input(block));
     }
 
-    // Wait for all spawn_blocking tasks to complete.
-    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    wait_until(
+        tokio::time::Duration::from_secs(2),
+        || store.len() == 5 && callback_log.lock().unwrap().len() == 5,
+        "proof lifecycle completion",
+    )
+    .await;
 
     // Verify: blocks 10, 20, 30, 40, 50 should have proofs.
     assert_eq!(store.len(), 5);
@@ -115,7 +137,12 @@ async fn test_store_eviction_under_continuous_generation() {
         }
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     }
-    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+    wait_until(
+        tokio::time::Duration::from_secs(2),
+        || store.len() == 5 && store.block_range().map(|(_, max)| max) == Some(20),
+        "proof-store eviction completion",
+    )
+    .await;
 
     // Only the latest 5 should remain.
     assert_eq!(store.len(), 5);
@@ -201,7 +228,12 @@ async fn test_store_hash_lookup_after_scheduler() {
     let expected_hash = input.block_hash;
 
     scheduler.on_block_committed(10, input);
-    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+    wait_until(
+        tokio::time::Duration::from_secs(2),
+        || store.get_by_hash(&expected_hash).is_some(),
+        "proof lookup by hash",
+    )
+    .await;
 
     let proof = store.get_by_hash(&expected_hash).unwrap();
     assert_eq!(proof.block_number, 10);
@@ -270,7 +302,12 @@ async fn test_concurrent_rapid_blocks() {
         h.await.unwrap();
     }
 
-    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    wait_until(
+        tokio::time::Duration::from_secs(3),
+        || callback_count.load(Ordering::SeqCst) >= 50,
+        "concurrent proof generation",
+    )
+    .await;
 
     // Some blocks may be skipped due to concurrency limit, but most should succeed.
     let generated = callback_count.load(Ordering::SeqCst);
@@ -292,7 +329,12 @@ async fn test_stats_lifecycle_through_scheduler() {
     for block in [10, 20, 30] {
         scheduler.on_block_committed(block, make_input(block));
     }
-    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+    wait_until(
+        tokio::time::Duration::from_secs(2),
+        || store.stats().generated == 3,
+        "scheduler stats generation",
+    )
+    .await;
 
     let stats = store.stats();
     assert_eq!(stats.generated, 3);
@@ -308,7 +350,12 @@ async fn test_created_at_lifecycle() {
     let scheduler = ProofScheduler::new(prover, 10, Arc::clone(&store));
 
     scheduler.on_block_committed(10, make_input(10));
-    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+    wait_until(
+        tokio::time::Duration::from_secs(2),
+        || store.get_by_block(10).is_some(),
+        "created_at proof generation",
+    )
+    .await;
 
     let proof = store.get_by_block(10).unwrap();
     assert!(

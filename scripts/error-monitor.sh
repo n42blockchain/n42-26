@@ -6,7 +6,7 @@
 # detects crashes (PID disappearance), and alerts on block height divergence.
 #
 # Usage:
-#   ./scripts/error-monitor.sh --data-dir DIR --pids PID1,PID2,... --nodes 7
+#   ./scripts/error-monitor.sh --data-dir DIR --pids PID1,PID2,... --nodes 7 [--base-http-rpc 18000]
 #
 # Outputs:
 #   $DATA_DIR/testnet-errors.log   — all error events
@@ -21,7 +21,7 @@ set -uo pipefail
 
 HEALTH_CHECK_INTERVAL=30    # seconds between health checks
 MAX_HEIGHT_DIVERGENCE=10    # blocks — trigger alert if nodes diverge more than this
-BASE_HTTP_RPC=18545         # must match testnet-7node.sh
+BASE_HTTP_RPC=18000         # must match scripts/testnet.sh unless overridden
 
 # Colors
 RED='\033[0;31m'
@@ -43,6 +43,7 @@ while [[ $# -gt 0 ]]; do
         --data-dir)  DATA_DIR="$2";  shift 2 ;;
         --pids)      PIDS_CSV="$2";  shift 2 ;;
         --nodes)     NUM_NODES="$2"; shift 2 ;;
+        --base-http-rpc) BASE_HTTP_RPC="$2"; shift 2 ;;
         *)           echo "Unknown option: $1"; exit 1 ;;
     esac
 done
@@ -100,7 +101,11 @@ log_info "Crash log:  $CRASH_LOG"
 # Background: tail all node logs and filter for error patterns
 # ---------------------------------------------------------------------------
 
-ERROR_PATTERNS='ERROR|FATAL|panic|SIGSEGV|SIGABRT|out of memory|OOM|consensus.*timeout|fork.*detected|database.*corrupt'
+ERROR_PATTERNS='(^|[^[:alnum:]_])(ERROR|FATAL|OOM)([^[:alnum:]_]|$)|panic|SIGSEGV|SIGABRT|out of memory|consensus.*timeout|fork.*detected|database.*corrupt'
+
+strip_ansi() {
+    sed -E $'s/\x1B\\[[0-9;]*[[:alpha:]]//g'
+}
 
 start_log_watcher() {
     local log_files=()
@@ -115,8 +120,9 @@ start_log_watcher() {
     fi
 
     tail -F "${log_files[@]}" 2>/dev/null | while IFS= read -r line; do
-        if echo "$line" | grep -qEi "$ERROR_PATTERNS"; then
-            log_error "$line"
+        clean_line=$(printf '%s\n' "$line" | strip_ansi)
+        if [[ "$clean_line" =~ $ERROR_PATTERNS ]]; then
+            log_error "$clean_line"
         fi
     done &
     TAIL_PID=$!
@@ -148,14 +154,28 @@ rpc_call() {
         "http://127.0.0.1:${port}/" 2>/dev/null
 }
 
+parse_rpc_hex_result() {
+    python3 -c 'import json, sys
+try:
+    body = json.load(sys.stdin)
+    if not isinstance(body, dict) or "error" in body:
+        print("-1")
+    else:
+        value = body.get("result")
+        if isinstance(value, str):
+            print(int(value, 16))
+        else:
+            print("-1")
+except Exception:
+    print("-1")' 2>/dev/null
+}
+
 get_block_number() {
     local port=$1
     local result
     result=$(rpc_call "$port" "eth_blockNumber")
     if [[ -n "$result" ]]; then
-        local hex
-        hex=$(echo "$result" | python3 -c "import sys,json; print(json.load(sys.stdin).get('result','0x0'))" 2>/dev/null)
-        printf '%d' "$hex" 2>/dev/null || echo "-1"
+        echo "$result" | parse_rpc_hex_result
     else
         echo "-1"
     fi

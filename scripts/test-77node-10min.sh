@@ -11,7 +11,7 @@ NUM_VALIDATORS=77
 BLOCK_INTERVAL_MS=8000
 TEST_DURATION=600  # 10 minutes
 DATA_DIR="$HOME/n42-testnet-data-77"
-BASE_HTTP_RPC=18545
+BASE_HTTP_RPC=18000
 
 # Sampling nodes for progress reporting
 SAMPLE_MID=$((NUM_VALIDATORS / 2))
@@ -27,6 +27,41 @@ log()  { echo -e "${GREEN}[77node-test]${NC} $*"; }
 warn() { echo -e "${YELLOW}[77node-test]${NC} $*"; }
 err()  { echo -e "${RED}[77node-test]${NC} $*"; }
 info() { echo -e "${CYAN}[77node-test]${NC} $*"; }
+
+rpc_call() {
+    local port=$1
+    curl -s --max-time 3 \
+        -X POST -H 'Content-Type: application/json' \
+        -d '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}' \
+        "http://127.0.0.1:${port}/" 2>/dev/null
+}
+
+rpc_block_number() {
+    local port=$1
+    local default_value="${2:--1}"
+    rpc_call "$port" | python3 -c 'import json, sys
+default = sys.argv[1]
+try:
+    body = json.load(sys.stdin)
+    if not isinstance(body, dict) or "error" in body:
+        print(default)
+    else:
+        result = body.get("result")
+        print(int(result, 16) if isinstance(result, str) else default)
+except Exception:
+    print(default)' "$default_value" 2>/dev/null
+}
+
+rpc_is_alive() {
+    local port=$1
+    rpc_call "$port" | python3 -c 'import json, sys
+try:
+    body = json.load(sys.stdin)
+    result = body.get("result") if isinstance(body, dict) and "error" not in body else None
+    print("1" if isinstance(result, str) and result.startswith("0x") else "0")
+except Exception:
+    print("0")' 2>/dev/null
+}
 
 # Raise fd limit — 77 nodes need many fds
 ulimit -n 65536 2>/dev/null || true
@@ -73,13 +108,7 @@ while [[ $STARTUP_WAIT -lt $MAX_STARTUP_WAIT ]]; do
         exit 1
     fi
 
-    block_hex=$(curl -s --max-time 3 \
-        -X POST -H 'Content-Type: application/json' \
-        -d '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}' \
-        "http://127.0.0.1:$BASE_HTTP_RPC/" 2>/dev/null | \
-        python3 -c "import sys,json; print(json.load(sys.stdin).get('result','0x0'))" 2>/dev/null || echo "0x0")
-
-    block_num=$(printf '%d' "$block_hex" 2>/dev/null || echo 0)
+    block_num=$(rpc_block_number "$BASE_HTTP_RPC" "0")
     if [[ $block_num -gt 0 ]]; then
         log "First block produced! Block #$block_num"
         break
@@ -99,11 +128,7 @@ fi
 
 # Record initial block numbers (sample a few to be fast)
 log "Recording initial state..."
-INITIAL_V0=$(curl -s --max-time 3 \
-    -X POST -H 'Content-Type: application/json' \
-    -d '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}' \
-    "http://127.0.0.1:$BASE_HTTP_RPC/" 2>/dev/null | \
-    python3 -c "import sys,json; print(int(json.load(sys.stdin).get('result','0x0'),16))" 2>/dev/null || echo "0")
+INITIAL_V0=$(rpc_block_number "$BASE_HTTP_RPC" "0")
 log "Initial block: v0=$INITIAL_V0"
 
 # Run for TEST_DURATION seconds, reporting progress every 30s
@@ -125,23 +150,9 @@ while [[ $ELAPSED -lt $TEST_DURATION ]]; do
     if [[ $((ELAPSED - LAST_REPORT)) -ge $REPORT_INTERVAL ]]; then
         LAST_REPORT=$ELAPSED
 
-        blocks_v0=$(curl -s --max-time 3 \
-            -X POST -H 'Content-Type: application/json' \
-            -d '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}' \
-            "http://127.0.0.1:$BASE_HTTP_RPC/" 2>/dev/null | \
-            python3 -c "import sys,json; print(int(json.load(sys.stdin).get('result','0x0'),16))" 2>/dev/null || echo "?")
-
-        blocks_mid=$(curl -s --max-time 3 \
-            -X POST -H 'Content-Type: application/json' \
-            -d '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}' \
-            "http://127.0.0.1:$((BASE_HTTP_RPC + SAMPLE_MID))/" 2>/dev/null | \
-            python3 -c "import sys,json; print(int(json.load(sys.stdin).get('result','0x0'),16))" 2>/dev/null || echo "?")
-
-        blocks_last=$(curl -s --max-time 3 \
-            -X POST -H 'Content-Type: application/json' \
-            -d '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}' \
-            "http://127.0.0.1:$((BASE_HTTP_RPC + SAMPLE_LAST))/" 2>/dev/null | \
-            python3 -c "import sys,json; print(int(json.load(sys.stdin).get('result','0x0'),16))" 2>/dev/null || echo "?")
+        blocks_v0=$(rpc_block_number "$BASE_HTTP_RPC" "?")
+        blocks_mid=$(rpc_block_number "$((BASE_HTTP_RPC + SAMPLE_MID))" "?")
+        blocks_last=$(rpc_block_number "$((BASE_HTTP_RPC + SAMPLE_LAST))" "?")
 
         remaining=$((TEST_DURATION - ELAPSED))
         info "[${ELAPSED}s/${TEST_DURATION}s] Blocks: v0=$blocks_v0 v${SAMPLE_MID}=$blocks_mid v${SAMPLE_LAST}=$blocks_last (${remaining}s remaining)"
@@ -161,11 +172,7 @@ TOTAL_BLOCK=0
 
 for i in $(seq 0 $((NUM_VALIDATORS - 1))); do
     port=$((BASE_HTTP_RPC + i))
-    b=$(curl -s --max-time 3 \
-        -X POST -H 'Content-Type: application/json' \
-        -d '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}' \
-        "http://127.0.0.1:$port/" 2>/dev/null | \
-        python3 -c "import sys,json; print(int(json.load(sys.stdin).get('result','0x0'),16))" 2>/dev/null || echo "-1")
+    b=$(rpc_block_number "$port" "-1")
 
     FINAL_BLOCKS+=("$b")
 
@@ -205,11 +212,7 @@ done
 # Check node process health
 ALIVE=0
 for i in $(seq 0 $((NUM_VALIDATORS - 1))); do
-    b=$(curl -s --max-time 2 \
-        -X POST -H 'Content-Type: application/json' \
-        -d '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}' \
-        "http://127.0.0.1:$((BASE_HTTP_RPC + i))/" 2>/dev/null | \
-        python3 -c "import sys,json; r=json.load(sys.stdin).get('result'); print('1' if r else '0')" 2>/dev/null || echo "0")
+    b=$(rpc_is_alive "$((BASE_HTTP_RPC + i))")
     [[ "$b" == "1" ]] && ALIVE=$((ALIVE + 1))
 done
 

@@ -270,34 +270,47 @@ cargo test -p n42-consensus --test integration_test -- --nocapture
 ### Performance Benchmarks
 
 ```bash
-# Run benchmarks (release mode recommended)
-cargo test -p n42-consensus --test performance_bench --release -- --nocapture
+# Run ignored benchmark-style tests explicitly
+cargo test -p n42-consensus --test performance_bench --release -- --ignored --nocapture
+cargo test -p n42-node --test comm_stress_bench --release -- --ignored --nocapture
 ```
 
 ### Unit Tests
 
 ```bash
-# All workspace tests
+# All workspace unit/integration tests
 cargo test --workspace
 
 # Specific crate
 cargo test -p n42-consensus
 cargo test -p n42-primitives
-cargo test -p n42-mobile    # 94 tests: receipt, reward, bridge, verifier, quic_client
-cargo test -p n42-jmt       # 41 tests: sharded tree, proofs, snapshot, metrics
-cargo test -p n42-zkproof   # 90 tests: prover, scheduler, store, SP1 e2e
-cargo test -p n42-node      # 171 tests: orchestrator, RPC, pool, inject
+cargo test -p n42-mobile
+cargo test -p n42-jmt
+cargo test -p n42-zkproof
+cargo test -p n42-node
 ```
 
-| Crate | Tests |
-|-------|------:|
-| n42-mobile | 94 |
-| n42-node | 171 |
-| n42-jmt | 41 |
-| n42-zkproof | 90 |
-| stream_v2_pipeline | 6 |
-| comm_stress_bench | 1 |
-| **Total** | **403+** |
+### Real-bin E2E and LAN test lanes
+
+```bash
+# Build the node binary and the E2E harness
+cargo build --release -p n42-node-bin -p e2e-test
+
+# Run correctness-oriented E2E scenarios
+target/release/e2e-test --binary target/release/n42-node --scenario 5
+E2E_SCENARIO_FILTER=1,3,4,5,8,12 \
+  target/release/e2e-test --binary target/release/n42-node
+
+# LAN pressure / timing work
+scripts/testnet.sh
+scripts/step_stress.sh
+```
+
+Use `tests/e2e/README.md` as the source of truth for the current split between:
+
+- correctness CI
+- manual integrated E2E
+- LAN pressure / timing optimization
 
 ## Crate Dependency Graph
 

@@ -2,6 +2,7 @@ use alloy_primitives::B256;
 use n42_primitives::BlsSecretKey;
 use tracing::{debug, error, info, warn};
 
+use crate::quic_test_client;
 use crate::rpc_client::RpcClient;
 
 /// A simulated mobile phone verifier that submits BLS attestations.
@@ -10,6 +11,7 @@ pub struct MobileSimulator {
     pub bls_key: BlsSecretKey,
     pub pubkey_hex: String,
     pub node_url: String,
+    pub starhub_port: u16,
 }
 
 impl MobileSimulator {
@@ -17,7 +19,7 @@ impl MobileSimulator {
     ///
     /// Uses `key_gen` (IKM derivation) instead of `from_bytes` because raw
     /// keccak256 output may exceed the BLS12-381 curve order.
-    pub fn new(index: usize, node_url: String) -> Self {
+    pub fn new(index: usize, node_url: String, starhub_port: u16) -> Self {
         let seed = format!("n42-mobile-key-{index}");
         let seed_hash = alloy_primitives::keccak256(seed.as_bytes());
         let ikm: [u8; 32] = seed_hash.0;
@@ -30,6 +32,7 @@ impl MobileSimulator {
             bls_key,
             pubkey_hex,
             node_url,
+            starhub_port,
         }
     }
 
@@ -77,6 +80,9 @@ impl MobileSimulator {
         rpc: &RpcClient,
         duration: std::time::Duration,
     ) -> eyre::Result<MobileStats> {
+        let pubkey_bytes = self.bls_key.public_key().to_bytes();
+        let quic_conn =
+            quic_test_client::connect_to_starhub(self.starhub_port, &pubkey_bytes).await?;
         let start = tokio::time::Instant::now();
         let poll_interval = std::time::Duration::from_secs(2);
         let mut last_block = 0u64;
@@ -128,6 +134,7 @@ impl MobileSimulator {
             "mobile simulator finished"
         );
 
+        quic_conn.close(0u32.into(), b"mobile simulator complete");
         Ok(stats)
     }
 }
@@ -143,6 +150,7 @@ pub struct MobileStats {
 /// Spawns multiple mobile simulators for a node.
 pub async fn run_mobile_fleet(
     node_url: String,
+    starhub_port: u16,
     count: usize,
     duration: std::time::Duration,
     start_index: usize,
@@ -152,7 +160,7 @@ pub async fn run_mobile_fleet(
     for i in 0..count {
         let url = node_url.clone();
         let handle = tokio::spawn(async move {
-            let sim = MobileSimulator::new(start_index + i, url.clone());
+            let sim = MobileSimulator::new(start_index + i, url.clone(), starhub_port);
             let rpc = RpcClient::new(url);
             sim.run_polling(&rpc, duration).await.unwrap_or_default()
         });

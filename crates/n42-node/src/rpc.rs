@@ -748,6 +748,10 @@ mod tests {
     use n42_consensus::ValidatorSet;
     use n42_primitives::{BlsSecretKey, QuorumCertificate};
 
+    fn test_bls_key(seed: u8) -> BlsSecretKey {
+        BlsSecretKey::key_gen(&[seed; 32]).expect("deterministic BLS key should be valid")
+    }
+
     fn make_rpc() -> N42RpcServer {
         let vs = ValidatorSet::new(&[], 0);
         let state = Arc::new(SharedConsensusState::new(vs));
@@ -756,8 +760,8 @@ mod tests {
 
     fn make_rpc_with_validators(count: usize) -> N42RpcServer {
         let validators: Vec<_> = (0..count)
-            .map(|_| {
-                let sk = BlsSecretKey::random().unwrap();
+            .map(|i| {
+                let sk = test_bls_key(i as u8);
                 ValidatorInfo {
                     address: Address::ZERO,
                     bls_public_key: sk.public_key(),
@@ -817,6 +821,7 @@ mod tests {
         let health = rpc.health().await.unwrap();
         assert_eq!(health.status, "syncing");
         assert!(!health.has_committed_qc);
+        assert_eq!(health.validator_count, 0);
     }
 
     #[tokio::test]
@@ -829,6 +834,15 @@ mod tests {
         let health = rpc.health().await.unwrap();
         assert_eq!(health.status, "ok");
         assert!(health.has_committed_qc);
+        assert_eq!(health.validator_count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_health_reports_validator_count() {
+        let rpc = make_rpc_with_validators(3);
+        let health = rpc.health().await.unwrap();
+        assert_eq!(health.status, "syncing");
+        assert_eq!(health.validator_count, 3);
     }
 
     #[tokio::test]
@@ -878,7 +892,7 @@ mod tests {
     #[tokio::test]
     async fn test_submit_attestation_wrong_sig_length() {
         let rpc = make_rpc();
-        let sk = BlsSecretKey::random().unwrap();
+        let sk = test_bls_key(0x21);
         let result = rpc
             .submit_attestation(
                 hex::encode(sk.public_key().to_bytes()),
@@ -897,7 +911,7 @@ mod tests {
     async fn test_submit_attestation_unknown_block() {
         let vs = ValidatorSet::new(&[], 0);
         let state = Arc::new(SharedConsensusState::new(vs));
-        let sk = BlsSecretKey::random().unwrap();
+        let sk = test_bls_key(0x22);
         // Authorize so we pass the identity check and reach the "unknown block" error.
         state.authorize_verifier(sk.public_key().to_bytes());
 
@@ -924,7 +938,7 @@ mod tests {
         let block_hash = B256::repeat_byte(0xDD);
         state.notify_block_committed(block_hash, 10);
 
-        let sk = BlsSecretKey::random().unwrap();
+        let sk = test_bls_key(0x23);
         // Authorize the verifier to simulate a completed QUIC handshake.
         state.authorize_verifier(sk.public_key().to_bytes());
 
@@ -955,7 +969,7 @@ mod tests {
         // Deliberately NOT calling state.authorize_verifier(...).
 
         let rpc = N42RpcServer::new(state);
-        let sk = BlsSecretKey::random().unwrap();
+        let sk = test_bls_key(0x24);
         let sig = sk.sign(block_hash.as_slice());
 
         let result = rpc

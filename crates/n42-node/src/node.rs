@@ -2,6 +2,7 @@ use crate::components::{N42ConsensusBuilder, N42ExecutorBuilder};
 use crate::consensus_state::SharedConsensusState;
 use crate::payload::N42PayloadBuilder;
 use crate::pool::N42PoolBuilder;
+use n42_consensus::ValidatorSetResolver;
 use reth_chainspec::ChainSpec;
 use reth_ethereum_engine_primitives::EthEngineTypes;
 use reth_ethereum_primitives::EthPrimitives;
@@ -20,14 +21,37 @@ use std::sync::Arc;
 ///
 /// Holds shared consensus state injected into the PayloadBuilder and available
 /// to the `on_node_started` hook for the Orchestrator.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct N42Node {
     pub consensus_state: Arc<SharedConsensusState>,
+    pub validator_set_resolver: Option<ValidatorSetResolver>,
+}
+
+impl std::fmt::Debug for N42Node {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("N42Node")
+            .field(
+                "has_validator_set_resolver",
+                &self.validator_set_resolver.is_some(),
+            )
+            .finish()
+    }
 }
 
 impl N42Node {
     pub fn new(consensus_state: Arc<SharedConsensusState>) -> Self {
-        Self { consensus_state }
+        Self {
+            consensus_state,
+            validator_set_resolver: None,
+        }
+    }
+
+    pub fn with_validator_set_resolver(
+        mut self,
+        validator_set_resolver: ValidatorSetResolver,
+    ) -> Self {
+        self.validator_set_resolver = Some(validator_set_resolver);
+        self
     }
 }
 
@@ -63,9 +87,15 @@ where
                 self.consensus_state.clone(),
             )))
             .network(EthereumNetworkBuilder::default())
-            .consensus(N42ConsensusBuilder::new(Some(
-                self.consensus_state.validator_set.clone(),
-            )))
+            .consensus({
+                let builder =
+                    N42ConsensusBuilder::new(Some(self.consensus_state.validator_set.clone()));
+                if let Some(resolver) = self.validator_set_resolver.clone() {
+                    builder.with_validator_set_resolver(resolver)
+                } else {
+                    builder
+                }
+            })
     }
 
     fn add_ons(&self) -> Self::AddOns {

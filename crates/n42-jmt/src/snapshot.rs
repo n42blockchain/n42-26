@@ -11,6 +11,7 @@
 use crate::sharded::{SHARD_COUNT, ShardedJmt};
 use crate::store::MemTreeStore;
 use crate::tree::N42JmtTree;
+use alloy_primitives::hex;
 use jmt::KeyHash;
 use parking_lot::Mutex;
 use std::path::Path;
@@ -83,14 +84,23 @@ impl ShardedJmt {
             .map(|entries| {
                 let mut tree = N42JmtTree::with_store(Arc::new(MemTreeStore::new()));
                 if !entries.is_empty() {
-                    tree.apply_batch(entries)
-                        .expect("failed to apply snapshot entries to shard");
+                    tree.apply_batch(entries).map_err(|error| {
+                        eyre::eyre!("failed to apply snapshot entries to shard: {error}")
+                    })?;
                 }
-                Mutex::new(tree)
+                Ok(Mutex::new(tree))
             })
-            .collect();
+            .collect::<eyre::Result<_>>()?;
 
         let jmt = ShardedJmt::from_parts(shards, snapshot.version);
+        let restored_root = jmt.root_hash()?;
+        if restored_root.0 != snapshot.root {
+            return Err(eyre::eyre!(
+                "restored snapshot root mismatch: expected 0x{}, got 0x{}",
+                hex::encode(snapshot.root),
+                hex::encode(restored_root.0),
+            ));
+        }
         let elapsed_ms = start.elapsed().as_millis();
         info!(
             target: "n42::jmt",
@@ -207,6 +217,24 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_restore_rejects_root_mismatch() {
+        let mut jmt = ShardedJmt::new();
+        jmt.apply_diff(&make_diff(4)).unwrap();
+
+        let mut snapshot = jmt.snapshot().unwrap();
+        snapshot.root[0] ^= 0xFF;
+
+        let err = match ShardedJmt::from_snapshot(snapshot) {
+            Ok(_) => panic!("restoring a root-mismatched snapshot should fail"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("restored snapshot root mismatch"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn snapshot_file_roundtrip() {
         let mut jmt = ShardedJmt::new();
         let diff = make_diff(100);
@@ -227,9 +255,45 @@ mod tests {
     }
 
     #[test]
+    fn save_snapshot_creates_missing_parent_directories() {
+        let mut jmt = ShardedJmt::new();
+        jmt.apply_diff(&make_diff(8)).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("state").join("jmt.snapshot");
+        let snapshot = jmt.snapshot().unwrap();
+
+        save_snapshot(&path, &snapshot).unwrap();
+
+        assert!(path.exists(), "snapshot file should be created");
+        assert!(
+            path.parent().unwrap().exists(),
+            "missing parent directories should be created"
+        );
+    }
+
+    #[test]
     fn load_nonexistent_file() {
         let result = load_snapshot(Path::new("/tmp/nonexistent_jmt_snapshot_12345"));
         assert!(result.unwrap().is_none());
+    }
+
+    #[test]
+    fn load_snapshot_rejects_corrupt_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("corrupt.snapshot");
+        std::fs::write(&path, b"not-a-zstd-snapshot").unwrap();
+
+        let err = match load_snapshot(&path) {
+            Ok(_) => panic!("loading a corrupt snapshot should fail"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("Unknown frame descriptor")
+                || err.to_string().contains("corrupt")
+                || err.to_string().contains("zstd"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

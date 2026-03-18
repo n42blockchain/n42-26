@@ -23,7 +23,7 @@ COPY n42-26/bin/ /build/n42-26/bin/
 WORKDIR /build/n42-26
 
 # Build release binary
-RUN cargo build --release -p n42-node \
+RUN cargo build --release -p n42-node-bin \
     && strip /build/n42-26/target/release/n42-node
 
 # ── Runtime stage ──

@@ -1,5 +1,5 @@
 use arc_swap::ArcSwapOption;
-use n42_consensus::{N42Consensus, ValidatorSet};
+use n42_consensus::{N42Consensus, ValidatorSet, ValidatorSetResolver};
 use n42_execution::N42EvmConfig;
 use reth_chainspec::{ChainSpec, EthChainSpec, EthereumHardforks};
 use reth_ethereum_primitives::EthPrimitives;
@@ -33,15 +33,39 @@ where
 /// Loads the validator set from `ConsensusConfig`. If no validators are configured
 /// (e.g. a standard Ethereum chainspec), falls back to N42Consensus without a
 /// validator set (QC verification is skipped).
-#[derive(Debug, Default, Clone)]
+#[derive(Default, Clone)]
 #[non_exhaustive]
 pub struct N42ConsensusBuilder {
     validator_set: Option<Arc<ArcSwapOption<ValidatorSet>>>,
+    validator_set_resolver: Option<ValidatorSetResolver>,
+}
+
+impl std::fmt::Debug for N42ConsensusBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("N42ConsensusBuilder")
+            .field("has_validator_set", &self.validator_set.is_some())
+            .field(
+                "has_validator_set_resolver",
+                &self.validator_set_resolver.is_some(),
+            )
+            .finish()
+    }
 }
 
 impl N42ConsensusBuilder {
     pub fn new(validator_set: Option<Arc<ArcSwapOption<ValidatorSet>>>) -> Self {
-        Self { validator_set }
+        Self {
+            validator_set,
+            validator_set_resolver: None,
+        }
+    }
+
+    pub fn with_validator_set_resolver(
+        mut self,
+        validator_set_resolver: ValidatorSetResolver,
+    ) -> Self {
+        self.validator_set_resolver = Some(validator_set_resolver);
+        self
     }
 }
 
@@ -64,10 +88,13 @@ where
                 fault_tolerance = current.as_ref().map(|vs| vs.fault_tolerance()).unwrap_or(0),
                 "Loaded validator set for consensus"
             );
-            Ok(Arc::new(N42Consensus::with_validator_set_store(
-                chain_spec,
-                validator_set,
-            )))
+            Ok(Arc::new(
+                N42Consensus::with_validator_set_store_and_resolver(
+                    chain_spec,
+                    validator_set,
+                    self.validator_set_resolver,
+                ),
+            ))
         } else {
             info!(target: "n42::consensus", "No initial validators configured, QC verification disabled");
             Ok(Arc::new(N42Consensus::new(chain_spec)))

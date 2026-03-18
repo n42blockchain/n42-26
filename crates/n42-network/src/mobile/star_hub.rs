@@ -635,9 +635,9 @@ fn build_server_config(
             tracing::info!("loaded persistent StarHub certificate from {cert_path:?}");
             (cert, key)
         } else {
-            let cert = rcgen::generate_simple_self_signed(vec!["n42-mobile".into()])?;
-            let cert_der = rustls::pki_types::CertificateDer::from(cert.cert);
-            let key_bytes = cert.key_pair.serialize_der();
+            let certified = rcgen::generate_simple_self_signed(vec!["n42-mobile".into()])?;
+            let cert_der = rustls::pki_types::CertificateDer::from(certified.cert);
+            let key_bytes = certified.signing_key.serialize_der();
             let key_der = rustls::pki_types::PrivateKeyDer::try_from(key_bytes.clone())
                 .map_err(|e| eyre::eyre!("key conversion error: {e}"))?;
 
@@ -658,10 +658,11 @@ fn build_server_config(
             (cert_der, key_der)
         }
     } else {
-        let cert = rcgen::generate_simple_self_signed(vec!["n42-mobile".into()])?;
-        let cert_der = rustls::pki_types::CertificateDer::from(cert.cert);
-        let key_der = rustls::pki_types::PrivateKeyDer::try_from(cert.key_pair.serialize_der())
-            .map_err(|e| eyre::eyre!("key conversion error: {e}"))?;
+        let certified = rcgen::generate_simple_self_signed(vec!["n42-mobile".into()])?;
+        let cert_der = rustls::pki_types::CertificateDer::from(certified.cert);
+        let key_der =
+            rustls::pki_types::PrivateKeyDer::try_from(certified.signing_key.serialize_der())
+                .map_err(|e| eyre::eyre!("key conversion error: {e}"))?;
         (cert_der, key_der)
     };
 

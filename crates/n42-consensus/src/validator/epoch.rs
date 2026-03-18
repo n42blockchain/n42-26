@@ -164,6 +164,12 @@ impl EpochManager {
             return &self.current_set;
         }
 
+        if epoch == self.current_epoch + 1
+            && let Some(next_set) = self.next_set.as_ref()
+        {
+            return next_set;
+        }
+
         // Look up historical set
         if let Some(set) = self.historical_sets.get(&epoch) {
             return set;
@@ -244,10 +250,14 @@ mod tests {
     use alloy_primitives::Address;
     use n42_primitives::BlsSecretKey;
 
+    fn test_key(seed: u8) -> BlsSecretKey {
+        BlsSecretKey::key_gen(&[seed; 32]).expect("deterministic test key should be valid")
+    }
+
     fn make_validator_infos(count: usize) -> Vec<ValidatorInfo> {
         (0..count)
             .map(|i| {
-                let sk = BlsSecretKey::random().unwrap();
+                let sk = test_key(0x50 + i as u8);
                 ValidatorInfo {
                     address: Address::with_last_byte(i as u8),
                     bls_public_key: sk.public_key(),
@@ -347,6 +357,21 @@ mod tests {
         assert_eq!(em.validator_set_for_view(11).len(), 5);
 
         // Historical epoch (0) should use old set
+        assert_eq!(em.validator_set_for_view(5).len(), 4);
+    }
+
+    #[test]
+    fn test_validator_set_for_view_uses_staged_next_epoch_before_advance() {
+        let infos1 = make_validator_infos(4);
+        let infos2 = make_validator_infos(5);
+        let vs = ValidatorSet::new(&infos1, 1);
+        let mut em = EpochManager::with_epoch_length(vs, 10);
+
+        em.stage_next_epoch(&infos2, 1).unwrap();
+
+        // View 11 is the first view of epoch 1; it should resolve to the staged set
+        // even before advance_epoch() is called.
+        assert_eq!(em.validator_set_for_view(11).len(), 5);
         assert_eq!(em.validator_set_for_view(5).len(), 4);
     }
 

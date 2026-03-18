@@ -118,8 +118,12 @@ mod tests {
     use alloy_primitives::B256;
     use n42_primitives::{BlsSecretKey, ConsensusMessage, Vote};
 
+    fn test_key(seed: u8) -> BlsSecretKey {
+        BlsSecretKey::key_gen(&[seed; 32]).expect("deterministic test key should be valid")
+    }
+
     fn dummy_consensus_vote() -> ConsensusMessage {
-        let sk = BlsSecretKey::random().unwrap();
+        let sk = test_key(0x11);
         let sig = sk.sign(b"test vote message");
         ConsensusMessage::Vote(Vote {
             view: 1,

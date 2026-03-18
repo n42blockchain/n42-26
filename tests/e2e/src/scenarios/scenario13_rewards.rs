@@ -11,12 +11,16 @@ use crate::test_helpers::compute_peer_id;
 
 /// Scenario 13: Reward Distribution Verification
 ///
-/// Verifies the reward mechanism works correctly with short epoch cycles:
-/// - Starts 3 validators with N42_REWARD_EPOCH_BLOCKS=10 (short cycle)
-/// - Runs for ~30 blocks
-/// - V1: Validator coinbase balances increase (rewards were distributed)
-/// - V2: Rewards are roughly equal across validators (fair leader rotation)
+/// Manual / observability scenario kept for E2E evolution work.
+///
+/// This scenario is intentionally kept runnable because teams still use it during
+/// iterative E2E/LAN work. It is not part of correctness CI because its current
+/// assertions are observational rather than proof of the mobile-reward pipeline.
 pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
+    warn!(
+        binary = %binary_path.display(),
+        "scenario 13 is a manual observability case; it is preserved for E2E evolution but excluded from correctness CI"
+    );
     info!("=== Scenario 13: Reward Distribution Verification ===");
 
     let node_count = 3;
@@ -134,7 +138,7 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
 
     info!(?miner_blocks, "block production by miner");
 
-    // === V1: Check that coinbase addresses have positive balance (received rewards) ===
+    // Observability-only check: current reward delivery may not target coinbase.
     let mut balances: Vec<(String, U256)> = Vec::new();
     let mut reward_total = U256::ZERO;
 
@@ -144,8 +148,6 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
             .map_err(|e| eyre::eyre!("failed to parse miner address {miner_addr}: {e}"))?;
         let balance = nodes[0].rpc.get_balance(addr).await.unwrap_or(U256::ZERO);
 
-        // Check if this miner address is one of the pre-funded test accounts
-        // If so, the "reward" is balance - initial_balance
         let initial = genesis::initial_balance();
         let reward = if balance > initial {
             balance - initial
@@ -165,29 +167,20 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
         reward_total += reward;
     }
 
-    // At least some rewards should have been distributed
     if reward_total == U256::ZERO {
-        // Rewards might go to a different address than the miner field.
-        // Check all validator coinbase addresses directly.
-        warn!("No rewards detected via miner addresses, checking direct validator balances...");
-
-        // The validator coinbase might be derived from the BLS key.
-        // Just verify that blocks are being produced and log results.
-        info!(
+        warn!(
             miners = miner_blocks.len(),
             total_blocks = final_height,
-            "V1 WARNING: Could not verify reward distribution (rewards may use different mechanism)"
+            "V1 OBSERVE: no reward detected via miner addresses; current reward path may use different targets"
         );
     } else {
         info!(
             reward_total = %reward_total,
             miners = balances.len(),
-            "V1 PASS: rewards distributed (total = {})",
-            reward_total
+            "V1 OBSERVE: miner-address balances increased"
         );
     }
 
-    // === V2: Check reward fairness (each validator produces roughly equal blocks) ===
     let expected_per = final_height as f64 / node_count as f64;
     let mut fairness_ok = true;
 
@@ -201,7 +194,6 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
             "leader rotation fairness"
         );
 
-        // Allow wide tolerance: 0.3x to 1.7x expected
         if ratio < 0.3 || ratio > 1.7 {
             warn!(
                 miner = %miner,
@@ -212,7 +204,6 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
         }
     }
 
-    // All validators should have produced blocks
     if miner_blocks.len() < node_count {
         warn!(
             active_miners = miner_blocks.len(),
@@ -224,11 +215,11 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
 
     if fairness_ok {
         info!(
-            "V2 PASS: leader rotation is fair across {} validators",
+            "V2 OBSERVE: leader rotation looks fair across {} validators",
             miner_blocks.len()
         );
     } else {
-        warn!("V2 WARNING: leader rotation fairness check has concerns (non-fatal)");
+        warn!("V2 OBSERVE: leader rotation fairness check has concerns");
     }
 
     info!(
@@ -242,6 +233,6 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
         let _ = node.stop();
     }
 
-    info!("=== Scenario 13 PASSED ===");
+    info!("=== Scenario 13 COMPLETED (manual observability) ===");
     Ok(())
 }

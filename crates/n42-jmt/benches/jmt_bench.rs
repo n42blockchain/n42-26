@@ -1,6 +1,6 @@
-use alloy_primitives::{Address, B256, U256};
+use alloy_primitives::{Address, U256};
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
-use n42_execution::{AccountChangeType, AccountDiff, StateDiff, ValueChange};
+use n42_execution::state_diff::{AccountChangeType, AccountDiff, StateDiff, ValueChange};
 use n42_jmt::ShardedJmt;
 use std::collections::BTreeMap;
 

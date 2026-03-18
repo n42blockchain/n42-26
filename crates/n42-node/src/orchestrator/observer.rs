@@ -1,5 +1,5 @@
-use crate::epoch_schedule::EpochSchedule;
 use super::{BlobSidecarBroadcast, BlockDataBroadcast, CommittedBlock};
+use crate::epoch_schedule::EpochSchedule;
 use alloy_eips::eip7594::BlobTransactionSidecarVariant;
 use alloy_primitives::B256;
 use alloy_rpc_types_engine::{ForkchoiceState, PayloadStatusEnum};
@@ -76,13 +76,53 @@ fn select_sync_target(
     }
 
     let capped_gossip_target = highest_seen_view.min(local_view.saturating_add(MAX_SYNC_BATCH));
-    if highest_seen_view > local_view + 3
-        && capped_gossip_target > last_gossip_sync_request_to_view
+    if highest_seen_view > local_view + 3 && capped_gossip_target > last_gossip_sync_request_to_view
     {
         return Some((highest_seen_view, SyncTargetSource::GossipHint));
     }
 
     None
+}
+
+fn verify_sync_block_qc_against_set(
+    sync_block: &SyncBlock,
+    validator_set: Option<&ValidatorSet>,
+) -> bool {
+    let Some(vs) = validator_set else {
+        // No validator set -> skip QC verification (trust reth's EVM execution)
+        return true;
+    };
+
+    if let Err(e) = verify_commit_qc(&sync_block.commit_qc, vs) {
+        warn!(
+            target: "n42::observer",
+            view = sync_block.view,
+            hash = %sync_block.block_hash,
+            error = %e,
+            "sync block has invalid commit_qc, skipping"
+        );
+        return false;
+    }
+
+    if sync_block.commit_qc.block_hash != sync_block.block_hash {
+        warn!(
+            target: "n42::observer",
+            view = sync_block.view,
+            "sync block commit_qc hash mismatch, skipping"
+        );
+        return false;
+    }
+
+    if sync_block.commit_qc.view != sync_block.view {
+        warn!(
+            target: "n42::observer",
+            view = sync_block.view,
+            "sync block commit_qc view mismatch, skipping"
+        );
+        return false;
+    }
+
+    true
 }
 
 /// Lightweight observer node orchestrator.
@@ -207,7 +247,7 @@ impl ObserverOrchestrator {
                 }
 
                 _ = sync_check_interval.tick() => {
-                    self.check_and_initiate_sync();
+                    self.check_and_initiate_sync().await;
                 }
             }
         }
@@ -239,7 +279,7 @@ impl ObserverOrchestrator {
                 request_id,
                 request,
             } => {
-                self.handle_sync_request(peer, request_id, request);
+                self.handle_sync_request(peer, request_id, request).await;
             }
             NetworkEvent::SyncResponse { peer, response } => {
                 self.handle_sync_response(peer, response).await;
@@ -307,7 +347,11 @@ impl ObserverOrchestrator {
         if let Some(ref exec_compressed) = broadcast.execution_output
             && super::execution_bridge::compact_block_enabled()
         {
-            super::execution_bridge::inject_compact_block(&hash, exec_compressed);
+            super::execution_bridge::inject_compact_block(
+                &hash,
+                exec_compressed,
+                "observer_import",
+            );
         }
 
         match self.beacon_engine.new_payload(execution_data).await {
@@ -410,7 +454,7 @@ impl ObserverOrchestrator {
     }
 
     /// Serves sync requests from other observers.
-    fn handle_sync_request(
+    async fn handle_sync_request(
         &self,
         peer: PeerId,
         request_id: u64,
@@ -443,7 +487,11 @@ impl ObserverOrchestrator {
             peer_committed_view,
         };
 
-        if let Err(e) = self.network.send_sync_response(request_id, response) {
+        if let Err(e) = self
+            .network
+            .send_sync_response_reliable(request_id, response)
+            .await
+        {
             error!(target: "n42::observer", error = %e, "failed to send sync response");
         }
     }
@@ -476,7 +524,9 @@ impl ObserverOrchestrator {
                     peer_committed_view = response.peer_committed_view,
                     "empty sync response but peer reports higher committed view; retrying with next peer"
                 );
-                let _ = self.initiate_sync(self.local_view, response.peer_committed_view);
+                let _ = self
+                    .initiate_sync(self.local_view, response.peer_committed_view)
+                    .await;
             }
             return;
         }
@@ -499,6 +549,7 @@ impl ObserverOrchestrator {
                 payload_json: sync_block.payload,
                 timestamp: 0,
                 execution_output: None,
+                leader_ready_unix_ms: 0,
             };
 
             // Import directly — no serialize/deserialize round-trip
@@ -516,70 +567,38 @@ impl ObserverOrchestrator {
                 peer_committed_view = response.peer_committed_view,
                 "still behind, requesting more blocks"
             );
-            self.initiate_sync(self.local_view, response.peer_committed_view);
+            self.initiate_sync(self.local_view, response.peer_committed_view)
+                .await;
         }
     }
 
     fn verify_sync_block_qc(&self, sync_block: &SyncBlock) -> bool {
-        let Some(vs) = resolve_validator_set_for_view(
+        let resolved = resolve_validator_set_for_view(
             sync_block.view,
             self.validator_set.as_ref(),
             self.initial_validators.as_deref(),
             self.initial_fault_tolerance,
             self.epoch_length,
             self.epoch_schedule.as_ref(),
-        ) else {
-            // No validator set → skip QC verification (trust reth's EVM execution)
-            return true;
-        };
-
-        if let Err(e) = verify_commit_qc(&sync_block.commit_qc, &vs) {
-            warn!(
-                target: "n42::observer",
-                view = sync_block.view,
-                hash = %sync_block.block_hash,
-                error = %e,
-                "sync block has invalid commit_qc, skipping"
-            );
-            return false;
-        }
-
-        if sync_block.commit_qc.block_hash != sync_block.block_hash {
-            warn!(
-                target: "n42::observer",
-                view = sync_block.view,
-                "sync block commit_qc hash mismatch, skipping"
-            );
-            return false;
-        }
-
-        if sync_block.commit_qc.view != sync_block.view {
-            warn!(
-                target: "n42::observer",
-                view = sync_block.view,
-                "sync block commit_qc view mismatch, skipping"
-            );
-            return false;
-        }
-
-        true
+        );
+        verify_sync_block_qc_against_set(sync_block, resolved.as_ref())
     }
 
     /// Checks if observer is behind the network and initiates sync if needed.
-    fn check_and_initiate_sync(&mut self) {
+    async fn check_and_initiate_sync(&mut self) {
         if let Some((target_view, source)) = select_sync_target(
             self.local_view,
             self.highest_sync_target_view,
             self.highest_seen_view,
             self.last_gossip_sync_request_to_view,
-        ) && let Some(requested_to_view) = self.initiate_sync(self.local_view, target_view)
+        ) && let Some(requested_to_view) = self.initiate_sync(self.local_view, target_view).await
             && source == SyncTargetSource::GossipHint
         {
             self.last_gossip_sync_request_to_view = requested_to_view;
         }
     }
 
-    fn initiate_sync(&mut self, local_view: u64, target_view: u64) -> Option<u64> {
+    async fn initiate_sync(&mut self, local_view: u64, target_view: u64) -> Option<u64> {
         if self.sync_in_flight {
             let timed_out = self
                 .sync_started_at
@@ -619,7 +638,7 @@ impl ObserverOrchestrator {
             local_committed_view: local_view,
         };
 
-        if let Err(e) = self.network.request_sync(peer, request) {
+        if let Err(e) = self.network.request_sync_reliable(peer, request).await {
             error!(target: "n42::observer", error = %e, "failed to send sync request");
             return None;
         }
@@ -681,9 +700,10 @@ impl ObserverOrchestrator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_primitives::Address;
-    use n42_primitives::BlsSecretKey;
+    use alloy_primitives::{Address, B256};
+    use bitvec::prelude::*;
     use n42_network::NetworkCommand;
+    use n42_primitives::{BlsSecretKey, QuorumCertificate};
 
     fn make_test_network() -> (NetworkHandle, mpsc::Receiver<NetworkCommand>) {
         let (cmd_tx, cmd_rx) = mpsc::channel(8);
@@ -691,26 +711,80 @@ mod tests {
         (NetworkHandle::new(cmd_tx, ptx), cmd_rx)
     }
 
-    #[test]
-    fn test_observer_construction() {
-        let (_network, _cmd_rx) = make_test_network();
-        let (_net_event_tx, _net_event_rx) = mpsc::channel::<NetworkEvent>(8192);
-        // ConsensusEngineHandle cannot be constructed in unit tests;
-        // integration tests cover the full ObserverOrchestrator flow.
+    fn test_key(seed: u8) -> BlsSecretKey {
+        BlsSecretKey::key_gen(&[seed; 32]).expect("deterministic test key should be valid")
+    }
+
+    fn make_sync_block(view: u64, block_hash: B256, signer_seed: u8) -> (SyncBlock, ValidatorSet) {
+        let key = test_key(signer_seed);
+        let validators = vec![ValidatorInfo {
+            address: Address::with_last_byte(0xEE),
+            bls_public_key: key.public_key(),
+            p2p_peer_id: None,
+        }];
+        let validator_set = ValidatorSet::new(&validators, 0);
+        let signature = key.sign(&n42_consensus::protocol::quorum::commit_signing_message(
+            view,
+            &block_hash,
+        ));
+
+        (
+            SyncBlock {
+                view,
+                block_hash,
+                commit_qc: QuorumCertificate {
+                    view,
+                    block_hash,
+                    aggregate_signature: signature,
+                    signers: bitvec![u8, Msb0; 1],
+                },
+                payload: vec![],
+            },
+            validator_set,
+        )
     }
 
     #[test]
     fn test_verify_sync_block_no_validator_set_passes() {
-        // When no validator set is configured, verify_sync_block_qc should
-        // return true (trust reth's EVM execution instead of BLS verification).
-        // This is verified by code inspection: the first match arm returns true
-        // when self.validator_set is None.
+        let (sync_block, _validator_set) = make_sync_block(7, B256::repeat_byte(0xAA), 0x41);
+        assert!(verify_sync_block_qc_against_set(&sync_block, None));
+    }
+
+    #[test]
+    fn test_verify_sync_block_rejects_hash_mismatch() {
+        let (mut sync_block, validator_set) = make_sync_block(8, B256::repeat_byte(0xAB), 0x42);
+        sync_block.block_hash = B256::repeat_byte(0xCD);
+
+        assert!(!verify_sync_block_qc_against_set(
+            &sync_block,
+            Some(&validator_set)
+        ));
+    }
+
+    #[test]
+    fn test_verify_sync_block_rejects_view_mismatch() {
+        let (mut sync_block, validator_set) = make_sync_block(9, B256::repeat_byte(0xAC), 0x43);
+        sync_block.view = 10;
+
+        assert!(!verify_sync_block_qc_against_set(
+            &sync_block,
+            Some(&validator_set)
+        ));
+    }
+
+    #[test]
+    fn test_verify_sync_block_accepts_valid_commit_qc() {
+        let (sync_block, validator_set) = make_sync_block(11, B256::repeat_byte(0xAD), 0x44);
+        assert!(verify_sync_block_qc_against_set(
+            &sync_block,
+            Some(&validator_set)
+        ));
     }
 
     fn make_validators(count: usize) -> Vec<ValidatorInfo> {
         (0..count)
             .map(|i| {
-                let sk = BlsSecretKey::random().unwrap();
+                let sk = test_key(0x30 + i as u8);
                 ValidatorInfo {
                     address: Address::with_last_byte(i as u8),
                     bls_public_key: sk.public_key(),

@@ -7,7 +7,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 use alloy_primitives::Address;
 use clap::Parser;
 use n42_chainspec::{ConsensusConfig, ValidatorInfo};
-use n42_consensus::{ConsensusEngine, EpochManager, ValidatorSet};
+use n42_consensus::{ConsensusEngine, EpochManager, ValidatorSet, ValidatorSetResolver};
 use n42_network::NetworkService;
 use n42_network::{
     ShardedStarHub, ShardedStarHubConfig, TransportConfig, build_swarm_with_validator_index,
@@ -29,7 +29,7 @@ use n42_zkproof::{MockProver, ProofScheduler, ProofStore};
 use reth_chainspec::ChainSpecProvider;
 use reth_ethereum_cli::Cli;
 use reth_ethereum_cli::chainspec::EthereumChainSpecParser;
-use reth_node_core::args::DefaultRpcServerArgs;
+use reth_node_core::args::{DefaultEngineValues, DefaultRpcServerArgs};
 use reth_storage_api::{BlockHashReader, BlockNumReader};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, Once};
@@ -86,6 +86,12 @@ fn connect_trusted_peers(net_handle: &n42_network::NetworkHandle) {
                     if let Err(e) = net_handle.add_kademlia_peer(peer_id, vec![addr]) {
                         warn!(target: "n42::cli", error = %e, "failed to add trusted peer to kademlia");
                     }
+                } else {
+                    warn!(
+                        target: "n42::cli",
+                        addr = peer_addr_str,
+                        "trusted peer multiaddr is missing /p2p/<peer_id>; dialing once but skipping reconnection and kademlia registration"
+                    );
                 }
             }
             Err(e) => {
@@ -131,6 +137,35 @@ fn build_epoch_manager(
             epoch_length,
         ))
     }
+}
+
+fn build_validator_set_resolver(
+    initial_validator_infos: Vec<ValidatorInfo>,
+    initial_fault_tolerance: u32,
+    epoch_length: u64,
+    epoch_schedule: Option<EpochSchedule>,
+) -> ValidatorSetResolver {
+    Arc::new(move |view: u64| {
+        let (validators, fault_tolerance) = if epoch_length == 0 {
+            (initial_validator_infos.as_slice(), initial_fault_tolerance)
+        } else {
+            let epoch = view.saturating_sub(1) / epoch_length;
+            epoch_schedule
+                .as_ref()
+                .map(|schedule| {
+                    schedule.active_config_for_epoch(
+                        epoch,
+                        initial_validator_infos.as_slice(),
+                        initial_fault_tolerance,
+                    )
+                })
+                .unwrap_or((initial_validator_infos.as_slice(), initial_fault_tolerance))
+        };
+
+        ValidatorSet::try_new(validators, fault_tolerance)
+            .ok()
+            .map(Arc::new)
+    })
 }
 
 fn derive_ed25519_keypair(index: u32) -> eyre::Result<libp2p::identity::Keypair> {
@@ -224,6 +259,17 @@ fn main() {
             target: "n42::cli",
             error = ?error,
             "failed to apply RPC default server args"
+        );
+    }
+
+    // Parallel state-root computation currently falls back repeatedly on this workload,
+    // so make the synchronous path the default unless the operator overrides it explicitly.
+    let engine_defaults = DefaultEngineValues::default().with_state_root_fallback(true);
+    if let Err(error) = engine_defaults.try_init() {
+        warn!(
+            target: "n42::cli",
+            error = ?error,
+            "failed to apply engine default args"
         );
     }
 
@@ -466,7 +512,14 @@ fn main() {
         );
 
         let consensus_state = Arc::new(SharedConsensusState::new(startup_validator_set.clone()));
-        let n42_node = N42Node::new(consensus_state.clone());
+        let validator_set_resolver = build_validator_set_resolver(
+            initial_validator_infos.clone(),
+            startup_validator_set.fault_tolerance(),
+            consensus_config.epoch_length,
+            epoch_schedule.clone(),
+        );
+        let n42_node = N42Node::new(consensus_state.clone())
+            .with_validator_set_resolver(validator_set_resolver);
 
         // Create staking manager early so it can be shared with RPC.
         let staking_state_file = data_dir.join("staking_state.json");
@@ -682,6 +735,7 @@ fn main() {
                     NetworkService::new_with_expected_validator_peer_ids(
                         swarm,
                         expected_validator_peer_ids.clone(),
+                        allow_deterministic_validator_peers,
                     )
                         .map_err(|e| eyre::eyre!("failed to create consensus network service: {e}"))?;
 
@@ -966,7 +1020,8 @@ fn main() {
                 };
 
                 let tx_chan_size = if low_mem { 256 } else { 4096 };
-                let (tx_import_tx, tx_import_rx) = mpsc::channel::<Vec<u8>>(tx_chan_size);
+                let (tx_import_tx, tx_import_rx) =
+                    mpsc::channel::<n42_node::tx_bridge::TxImportBatch>(tx_chan_size);
                 let (tx_broadcast_tx, tx_broadcast_rx) = mpsc::channel::<Vec<u8>>(tx_chan_size);
 
                 // Run TxPoolBridge on a dedicated runtime to isolate TX pool
@@ -978,13 +1033,16 @@ fn main() {
                 std::thread::Builder::new()
                     .name("n42-tx-pool-bridge".into())
                     .spawn(move || {
-                        let rt = match tokio::runtime::Builder::new_multi_thread()
+                        // Keep the bridge runtime alive for the process lifetime. Dropping a
+                        // Tokio runtime from this shutdown path can panic because runtime drop
+                        // performs blocking teardown.
+                        let rt: &'static _ = match tokio::runtime::Builder::new_multi_thread()
                             .worker_threads(bridge_workers)
                             .thread_name("tx-bridge-worker")
                             .enable_all()
                             .build()
                         {
-                            Ok(rt) => rt,
+                            Ok(rt) => Box::leak(Box::new(rt)),
                             Err(error) => {
                                 tracing::error!(error = %error, "failed to create tx-bridge runtime");
                                 return;

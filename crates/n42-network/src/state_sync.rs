@@ -148,6 +148,11 @@ mod tests {
     use alloy_primitives::B256;
     use n42_primitives::consensus::QuorumCertificate;
 
+    fn test_key(seed: u8) -> n42_primitives::BlsSecretKey {
+        n42_primitives::BlsSecretKey::key_gen(&[seed; 32])
+            .expect("deterministic test key should be valid")
+    }
+
     fn sample_request() -> BlockSyncRequest {
         BlockSyncRequest {
             from_view: 10,
@@ -157,8 +162,7 @@ mod tests {
     }
 
     fn sample_sync_block() -> SyncBlock {
-        use n42_primitives::BlsSecretKey;
-        let sk = BlsSecretKey::random().unwrap();
+        let sk = test_key(0x11);
         let sig = sk.sign(b"test");
         SyncBlock {
             view: 15,
@@ -212,6 +216,43 @@ mod tests {
         let decoded: BlockSyncResponse = bincode::deserialize(&bytes).unwrap();
         assert!(decoded.blocks.is_empty());
         assert_eq!(decoded.peer_committed_view, 100);
+    }
+
+    #[test]
+    fn test_block_sync_request_validate_accepts_inclusive_limit() {
+        let req = BlockSyncRequest {
+            from_view: 10,
+            to_view: 10 + MAX_BLOCKS_PER_SYNC_REQUEST - 1,
+            local_committed_view: 9,
+        };
+
+        assert!(req.validate().is_ok());
+    }
+
+    #[test]
+    fn test_block_sync_request_validate_rejects_reverse_range() {
+        let req = BlockSyncRequest {
+            from_view: 20,
+            to_view: 10,
+            local_committed_view: 9,
+        };
+
+        let err = req.validate().unwrap_err();
+        assert!(err.contains("from_view"));
+        assert!(err.contains("to_view"));
+    }
+
+    #[test]
+    fn test_block_sync_request_validate_rejects_oversized_range() {
+        let req = BlockSyncRequest {
+            from_view: 10,
+            to_view: 10 + MAX_BLOCKS_PER_SYNC_REQUEST,
+            local_committed_view: 9,
+        };
+
+        let err = req.validate().unwrap_err();
+        assert!(err.contains("too large"));
+        assert!(err.contains(&MAX_BLOCKS_PER_SYNC_REQUEST.to_string()));
     }
 
     #[tokio::test]

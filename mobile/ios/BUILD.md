@@ -12,17 +12,16 @@
 
 ```bash
 # From project root
-cd ../../
-
-# Temporarily set crate-type to staticlib only (cdylib won't link on iOS due to blst assembly)
-# Option 1: Edit Cargo.toml
-# crate-type = ["staticlib"]
-
-# Build with BLST_PORTABLE to avoid __chkstk_darwin symbol issue
-BLST_PORTABLE=1 cargo build --release --target aarch64-apple-ios -p n42-mobile-ffi
+./scripts/build-ios-ffi.sh --release
 
 # Copy the static library
 cp target/aarch64-apple-ios/release/libn42_mobile_ffi.a mobile/ios/N42Verifier/
+```
+
+If your local toolchain hits a `blst` Darwin assembly issue, retry with:
+
+```bash
+BLST_PORTABLE=1 ./scripts/build-ios-ffi.sh --release
 ```
 
 ## Build the iOS app
@@ -43,5 +42,5 @@ xcodebuild -project mobile/ios/N42Verifier.xcodeproj \
 - The static library is ~40MB (release, ARM64)
 - Minimum iOS deployment target: 16.0
 - The bridging header references the C header at `crates/n42-mobile-ffi/include/n42_mobile.h`
-- `BLST_PORTABLE=1` is required because blst's aarch64 assembly uses `___chkstk_darwin` (macOS only)
+- `BLST_PORTABLE=1` is a fallback for local toolchains that hit `blst` Darwin assembly issues
 - For iOS simulator builds, use `aarch64-apple-ios-sim` target instead

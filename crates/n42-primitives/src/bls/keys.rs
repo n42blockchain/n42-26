@@ -217,6 +217,10 @@ mod tests {
     use super::*;
     use alloy_primitives::B256;
 
+    fn test_key(seed: u8) -> BlsSecretKey {
+        BlsSecretKey::key_gen(&[seed; 32]).expect("deterministic test key should be valid")
+    }
+
     #[test]
     fn test_key_generation() {
         let sk = BlsSecretKey::random().expect("key generation should succeed");
@@ -228,7 +232,7 @@ mod tests {
 
     #[test]
     fn test_sign_and_verify() {
-        let sk = BlsSecretKey::random().unwrap();
+        let sk = test_key(0x11);
         let pk = sk.public_key();
         let message = b"hello world";
         let sig = sk.sign(message);
@@ -238,7 +242,7 @@ mod tests {
 
     #[test]
     fn test_verify_wrong_message() {
-        let sk = BlsSecretKey::random().unwrap();
+        let sk = test_key(0x12);
         let pk = sk.public_key();
         let sig = sk.sign(b"message one");
         assert!(pk.verify(b"message two", &sig).is_err());
@@ -246,8 +250,8 @@ mod tests {
 
     #[test]
     fn test_verify_wrong_key() {
-        let sk1 = BlsSecretKey::random().unwrap();
-        let sk2 = BlsSecretKey::random().unwrap();
+        let sk1 = test_key(0x13);
+        let sk2 = test_key(0x14);
         let pk2 = sk2.public_key();
         let message = b"test message";
         let sig = sk1.sign(message);
@@ -256,7 +260,7 @@ mod tests {
 
     #[test]
     fn test_key_serialization_roundtrip() {
-        let sk = BlsSecretKey::random().unwrap();
+        let sk = test_key(0x15);
         let pk = sk.public_key();
 
         let encoded = bincode::serialize(&pk).expect("serialize should succeed");
@@ -267,7 +271,7 @@ mod tests {
 
     #[test]
     fn test_signature_serialization_roundtrip() {
-        let sk = BlsSecretKey::random().unwrap();
+        let sk = test_key(0x16);
         let sig = sk.sign(b"roundtrip test");
 
         let encoded = bincode::serialize(&sig).expect("serialize should succeed");
@@ -278,7 +282,7 @@ mod tests {
 
     #[test]
     fn test_public_key_from_bytes_roundtrip() {
-        let sk = BlsSecretKey::random().unwrap();
+        let sk = test_key(0x17);
         let pk = sk.public_key();
 
         let bytes = pk.to_bytes();
@@ -291,7 +295,7 @@ mod tests {
 
     #[test]
     fn test_signature_from_bytes_roundtrip() {
-        let sk = BlsSecretKey::random().unwrap();
+        let sk = test_key(0x18);
         let sig = sk.sign(b"bytes roundtrip");
 
         let bytes = sig.to_bytes();
@@ -304,7 +308,7 @@ mod tests {
 
     #[test]
     fn test_sign_hash() {
-        let sk = BlsSecretKey::random().unwrap();
+        let sk = test_key(0x19);
         let pk = sk.public_key();
         let hash = B256::from([0xab; 32]);
 
@@ -352,7 +356,7 @@ mod tests {
 
     #[test]
     fn test_secret_key_debug_hides_secret() {
-        let sk = BlsSecretKey::random().unwrap();
+        let sk = test_key(0x1A);
         let debug_str = format!("{:?}", sk);
         assert!(debug_str.contains("BlsSecretKey"));
         assert!(debug_str.contains("public_key"));

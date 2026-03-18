@@ -9,29 +9,39 @@ use crate::test_helpers::compute_peer_id;
 
 /// Scenario 4: Multi-node consensus test.
 ///
-/// Validates 1, 3, 5, and 21 node configurations all achieve stable consensus
-/// with ~10 blocks each:
+/// Validates a profile of multi-node configurations achieves stable consensus:
 /// - Block interval stable at 8 seconds
 /// - All nodes at consistent height
 /// - Block hashes identical across nodes
 /// - Leader rotation fair (round-robin)
 pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
-    info!("=== Scenario 4: Multi-Node Consensus ===");
+    let profile = std::env::var("E2E_SCENARIO4_PROFILE").unwrap_or_else(|_| "full".to_string());
+    info!(profile, "=== Scenario 4: Multi-Node Consensus ===");
 
-    // Test 1: 1 node solo (f=0, quorum=1) — 100s for ~10 blocks at 8s interval
-    run_multi_node_test(&binary_path, 1, Duration::from_secs(100), 0, 8000).await?;
+    let tests: &[(usize, u64, u16)] = if profile.eq_ignore_ascii_case("correctness") {
+        // Keep correctness CI on smaller, more decisive topologies.
+        // Larger meshes remain available in the default manual/full profile.
+        &[(1, 100, 0), (3, 100, 100), (5, 120, 200)]
+    } else {
+        &[
+            (1, 100, 0),
+            (3, 100, 100),
+            (5, 100, 200),
+            (7, 100, 150),
+            (21, 100, 300),
+        ]
+    };
 
-    // Test 2: 3 nodes (f=0, quorum=1) — 100s for ~10 blocks at 8s interval
-    run_multi_node_test(&binary_path, 3, Duration::from_secs(100), 100, 8000).await?;
-
-    // Test 3: 5 nodes (f=1, quorum=3) — 100s for ~10 blocks at 8s interval
-    run_multi_node_test(&binary_path, 5, Duration::from_secs(100), 200, 8000).await?;
-
-    // Test 3.5: 7 nodes (f=2, quorum=5) — 100s for ~10 blocks at 8s interval
-    run_multi_node_test(&binary_path, 7, Duration::from_secs(100), 150, 8000).await?;
-
-    // Test 4: 21 nodes (f=6, quorum=13) — 100s for ~10 blocks at 8s interval
-    run_multi_node_test(&binary_path, 21, Duration::from_secs(100), 300, 8000).await?;
+    for (node_count, duration_secs, port_offset_base) in tests {
+        run_multi_node_test(
+            &binary_path,
+            *node_count,
+            Duration::from_secs(*duration_secs),
+            *port_offset_base,
+            8000,
+        )
+        .await?;
+    }
 
     info!("=== Scenario 4 PASSED ===");
     Ok(())

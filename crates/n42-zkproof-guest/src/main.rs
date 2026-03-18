@@ -45,31 +45,86 @@ struct PublicValues {
     parent_state_root: B256,
 }
 
-pub fn main() {
-    // Read serialized input from the host.
-    let input_bytes = sp1_zkvm::io::read_vec();
-    let input: BlockExecutionInput =
-        bincode::deserialize(&input_bytes).expect("failed to deserialize BlockExecutionInput");
+fn decode_input(input_bytes: &[u8]) -> Result<BlockExecutionInput, bincode::Error> {
+    bincode::deserialize(input_bytes)
+}
 
-    // Compute SHA-256 of the bundle state data.
-    // This binds the proof to the specific execution state provided by the host.
+fn compute_public_values(input: &BlockExecutionInput) -> PublicValues {
     let mut hasher = Sha256::new();
     hasher.update(&input.bundle_state_json);
     let state_data_hash: [u8; 32] = hasher.finalize().into();
 
-    let tx_count = input.transactions_rlp.len() as u32;
-
-    // Construct public values.
-    let public_values = PublicValues {
+    PublicValues {
         block_hash: input.block_hash,
         block_number: input.block_number,
         parent_hash: input.parent_hash,
         state_data_hash,
-        tx_count,
+        tx_count: input.transactions_rlp.len() as u32,
         parent_state_root: input.parent_state_root,
-    };
+    }
+}
+
+fn encode_public_values(public_values: &PublicValues) -> Result<Vec<u8>, bincode::Error> {
+    bincode::serialize(public_values)
+}
+
+pub fn main() {
+    // Read serialized input from the host.
+    let input_bytes = sp1_zkvm::io::read_vec();
+    let input = decode_input(&input_bytes).expect("failed to deserialize BlockExecutionInput");
+    let public_values = compute_public_values(&input);
 
     // Commit public values — these are visible to the verifier.
-    let pv_bytes = bincode::serialize(&public_values).expect("failed to serialize PublicValues");
+    let pv_bytes = encode_public_values(&public_values).expect("failed to serialize PublicValues");
     sp1_zkvm::io::commit_slice(&pv_bytes);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_input() -> BlockExecutionInput {
+        BlockExecutionInput {
+            block_hash: B256::with_last_byte(0x11),
+            block_number: 42,
+            parent_hash: B256::with_last_byte(0x22),
+            header_rlp: vec![0xAA, 0xBB],
+            transactions_rlp: vec![vec![0x01, 0x02], vec![0x03]],
+            bundle_state_json: br#"{"accounts":2}"#.to_vec(),
+            parent_state_root: B256::with_last_byte(0x33),
+        }
+    }
+
+    #[test]
+    fn computes_public_values_from_input() {
+        let input = sample_input();
+        let public_values = compute_public_values(&input);
+
+        assert_eq!(public_values.block_hash, input.block_hash);
+        assert_eq!(public_values.block_number, input.block_number);
+        assert_eq!(public_values.parent_hash, input.parent_hash);
+        assert_eq!(public_values.tx_count, 2);
+        assert_eq!(public_values.parent_state_root, input.parent_state_root);
+
+        let expected_hash: [u8; 32] = Sha256::digest(&input.bundle_state_json).into();
+        assert_eq!(public_values.state_data_hash, expected_hash);
+    }
+
+    #[test]
+    fn input_and_public_values_roundtrip() {
+        let input = sample_input();
+        let encoded_input = bincode::serialize(&input).unwrap();
+        let decoded_input = decode_input(&encoded_input).unwrap();
+        let public_values = compute_public_values(&decoded_input);
+        let encoded_public_values = encode_public_values(&public_values).unwrap();
+        let decoded_public_values: PublicValues =
+            bincode::deserialize(&encoded_public_values).unwrap();
+
+        assert_eq!(decoded_public_values.block_hash, input.block_hash);
+        assert_eq!(decoded_public_values.tx_count, 2);
+        assert_eq!(
+            decoded_public_values.parent_state_root,
+            input.parent_state_root
+        );
+    }
 }

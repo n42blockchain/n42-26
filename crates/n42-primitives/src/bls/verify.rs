@@ -120,15 +120,19 @@ mod tests {
     use super::super::keys::BlsSecretKey;
     use super::*;
 
+    fn test_key(seed: u8) -> BlsSecretKey {
+        BlsSecretKey::key_gen(&[seed; 32]).expect("deterministic test key should be valid")
+    }
+
     #[test]
     fn test_batch_verify_success() {
         let msg1 = b"message one";
         let msg2 = b"message two";
         let msg3 = b"message three";
 
-        let sk1 = BlsSecretKey::random().unwrap();
-        let sk2 = BlsSecretKey::random().unwrap();
-        let sk3 = BlsSecretKey::random().unwrap();
+        let sk1 = test_key(0x11);
+        let sk2 = test_key(0x12);
+        let sk3 = test_key(0x13);
 
         let pk1 = sk1.public_key();
         let pk2 = sk2.public_key();
@@ -148,8 +152,8 @@ mod tests {
 
     #[test]
     fn test_batch_verify_mismatched_lengths() {
-        let sk1 = BlsSecretKey::random().unwrap();
-        let sk2 = BlsSecretKey::random().unwrap();
+        let sk1 = test_key(0x21);
+        let sk2 = test_key(0x22);
         let pk1 = sk1.public_key();
         let pk2 = sk2.public_key();
         let sig1 = sk1.sign(b"a");
@@ -179,7 +183,7 @@ mod tests {
 
     #[test]
     fn test_batch_verify_single() {
-        let sk = BlsSecretKey::random().unwrap();
+        let sk = test_key(0x31);
         let pk = sk.public_key();
         let msg = b"single message";
         let sig = sk.sign(msg);
@@ -192,7 +196,7 @@ mod tests {
     fn test_batch_verify_same_message_different_signers() {
         // Common in consensus: all validators sign the same message.
         let msg = b"view=5||block_hash=0xAA";
-        let sks: Vec<_> = (0..10).map(|_| BlsSecretKey::random().unwrap()).collect();
+        let sks: Vec<_> = (0..10).map(|i| test_key(0x40 + i as u8)).collect();
         let pks: Vec<_> = sks.iter().map(|sk| sk.public_key()).collect();
         let sigs: Vec<_> = sks.iter().map(|sk| sk.sign(msg)).collect();
 
@@ -206,9 +210,9 @@ mod tests {
 
     #[test]
     fn test_batch_verify_detects_invalid() {
-        let sk1 = BlsSecretKey::random().unwrap();
-        let sk2 = BlsSecretKey::random().unwrap();
-        let sk3 = BlsSecretKey::random().unwrap();
+        let sk1 = test_key(0x51);
+        let sk2 = test_key(0x52);
+        let sk3 = test_key(0x53);
 
         let pk1 = sk1.public_key();
         let pk2 = sk2.public_key();
@@ -230,7 +234,7 @@ mod tests {
     #[test]
     fn test_batch_verify_with_fallback_all_valid() {
         let msg = b"test message";
-        let sks: Vec<_> = (0..5).map(|_| BlsSecretKey::random().unwrap()).collect();
+        let sks: Vec<_> = (0..5).map(|i| test_key(0x60 + i as u8)).collect();
         let pks: Vec<_> = sks.iter().map(|sk| sk.public_key()).collect();
         let sigs: Vec<_> = sks.iter().map(|sk| sk.sign(msg)).collect();
 
@@ -245,7 +249,7 @@ mod tests {
     #[test]
     fn test_batch_verify_with_fallback_identifies_bad() {
         let msg = b"consensus vote";
-        let sks: Vec<_> = (0..5).map(|_| BlsSecretKey::random().unwrap()).collect();
+        let sks: Vec<_> = (0..5).map(|i| test_key(0x70 + i as u8)).collect();
         let pks: Vec<_> = sks.iter().map(|sk| sk.public_key()).collect();
 
         let mut sigs: Vec<_> = sks.iter().map(|sk| sk.sign(msg)).collect();

@@ -123,7 +123,7 @@ impl ConsensusOrchestrator {
     pub(super) async fn handle_engine_output(&mut self, output: EngineOutput) {
         match output {
             EngineOutput::BroadcastMessage(msg) => {
-                if let Err(e) = self.network.broadcast_consensus(msg) {
+                if let Err(e) = self.network.broadcast_consensus_reliable(msg).await {
                     error!(target: "n42::cl::consensus_loop", error = %e, "failed to broadcast consensus message");
                 }
             }
@@ -132,7 +132,11 @@ impl ConsensusOrchestrator {
                 // can silently fail (QUIC transport issues), so always broadcast as backup.
                 // The consensus engine deduplicates votes by (view, voter).
                 if let Some(peer_id) = self.network.validator_peer(target) {
-                    if let Err(error) = self.network.send_direct(peer_id, msg.clone()) {
+                    if let Err(error) = self
+                        .network
+                        .send_direct_reliable(peer_id, msg.clone())
+                        .await
+                    {
                         warn!(
                             target: "n42::cl::consensus_loop",
                             target_validator = target,
@@ -142,7 +146,7 @@ impl ConsensusOrchestrator {
                         );
                     }
                 }
-                if let Err(e) = self.network.broadcast_consensus(msg) {
+                if let Err(e) = self.network.broadcast_consensus_reliable(msg).await {
                     error!(target: "n42::cl::consensus_loop", target_validator = target, error = %e, "broadcast failed");
                 }
             }
@@ -165,7 +169,7 @@ impl ConsensusOrchestrator {
                 target_view,
             } => {
                 counter!("n42_sync_required_total").increment(1);
-                self.initiate_sync(local_view, target_view);
+                self.initiate_sync(local_view, target_view).await;
             }
             EngineOutput::EquivocationDetected {
                 view,
@@ -208,7 +212,11 @@ impl ConsensusOrchestrator {
                     self.allow_deterministic_validator_peers,
                 ) {
                     Ok(peers) => {
-                        if let Err(error) = self.network.replace_expected_validator_peers(peers) {
+                        if let Err(error) = self
+                            .network
+                            .replace_expected_validator_peers_reliable(peers)
+                            .await
+                        {
                             warn!(
                                 target: "n42::cl::consensus_loop",
                                 error = %error,
@@ -224,7 +232,8 @@ impl ConsensusOrchestrator {
                         );
                         if let Err(replace_error) = self
                             .network
-                            .replace_expected_validator_peers(HashMap::new())
+                            .replace_expected_validator_peers_reliable(HashMap::new())
+                            .await
                         {
                             warn!(
                                 target: "n42::cl::consensus_loop",
@@ -602,6 +611,19 @@ impl ConsensusOrchestrator {
     /// Enqueues a block for background import. If no import is in flight, spawns immediately.
     /// Otherwise queues for sequential processing (parent must be imported before child).
     fn enqueue_bg_import(&mut self, data: Vec<u8>, block_hash: B256, view: u64) {
+        if !self.bg_import_hashes.insert(block_hash) {
+            counter!("n42_bg_import_duplicate_enqueue_total").increment(1);
+            info!(
+                target: "n42::cl::consensus_loop",
+                view,
+                %block_hash,
+                in_flight = self.bg_import_in_flight,
+                queued = self.bg_import_queue.len(),
+                "bg import already queued or running, skipping duplicate enqueue"
+            );
+            return;
+        }
+
         if self.bg_import_in_flight {
             debug!(target: "n42::cl::consensus_loop", view, %block_hash, queue_len = self.bg_import_queue.len(), "bg import busy, queueing");
             self.bg_import_queue.push_back((data, block_hash, view));
@@ -616,7 +638,11 @@ impl ConsensusOrchestrator {
         let done_tx = self.import_done_tx.clone();
         let eh = match &self.beacon_engine {
             Some(h) => h.clone(),
-            None => return,
+            None => {
+                self.bg_import_in_flight = false;
+                self.bg_import_hashes.remove(&block_hash);
+                return;
+            }
         };
         info!(target: "n42::cl::consensus_loop", view, %block_hash, "spawning background import");
         tokio::spawn(async move {
@@ -668,7 +694,11 @@ impl ConsensusOrchestrator {
         if let Some(ref exec_compressed) = broadcast.execution_output
             && super::execution_bridge::compact_block_enabled()
         {
-            super::execution_bridge::inject_compact_block(&block_hash, exec_compressed);
+            super::execution_bridge::inject_compact_block(
+                &block_hash,
+                exec_compressed,
+                "consensus_loop",
+            );
         }
 
         match engine_handle.new_payload(execution_data).await {
@@ -750,7 +780,7 @@ impl ConsensusOrchestrator {
                 self.pending_block_data.clear();
                 self.pending_executions.clear();
                 // Trigger sync to recover the missing block
-                self.initiate_sync(stale_view, new_view);
+                self.initiate_sync(stale_view, new_view).await;
             }
         }
         // NOTE: We intentionally do NOT clear pending_block_data here.
@@ -791,6 +821,7 @@ impl ConsensusOrchestrator {
         block_timestamp: u64,
     ) {
         self.bg_import_in_flight = false;
+        self.bg_import_hashes.remove(&hash);
         if success {
             // Pipeline: background import complete — record timing.
             if let Some(timing) = self.pipeline_timings.get_mut(&hash) {
@@ -807,8 +838,10 @@ impl ConsensusOrchestrator {
             warn!(target: "n42::cl::consensus_loop", %hash, view, "background import FAILED, requesting sync");
             counter!("n42_bg_import_failures_total").increment(1);
             // Clear the queue — parent failed so children would fail too.
-            self.bg_import_queue.clear();
-            self.initiate_sync(view, self.engine.current_view());
+            for (_, queued_hash, _) in self.bg_import_queue.drain(..) {
+                self.bg_import_hashes.remove(&queued_hash);
+            }
+            self.initiate_sync(view, self.engine.current_view()).await;
             return;
         }
 

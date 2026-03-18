@@ -71,7 +71,19 @@ impl ConsensusEngine {
                 return Ok(());
             }
         };
-        collector.add_verified_vote(vote.voter, vote.signature)?;
+        match collector.add_verified_vote(vote.voter, vote.signature) {
+            Ok(()) => {}
+            Err(ConsensusError::DuplicateVote { .. }) => {
+                tracing::debug!(
+                    target: "n42::cl::voting",
+                    view,
+                    voter = vote.voter,
+                    "ignoring duplicate vote (dual-path delivery)"
+                );
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        }
 
         tracing::debug!(target: "n42::cl::voting",
             view,
@@ -176,7 +188,19 @@ impl ConsensusEngine {
                 return Ok(());
             }
         };
-        collector.add_verified_vote(cv.voter, cv.signature)?;
+        match collector.add_verified_vote(cv.voter, cv.signature) {
+            Ok(()) => {}
+            Err(ConsensusError::DuplicateVote { .. }) => {
+                tracing::debug!(
+                    target: "n42::cl::voting",
+                    view,
+                    voter = cv.voter,
+                    "ignoring duplicate commit vote (dual-path delivery)"
+                );
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        }
 
         tracing::debug!(target: "n42::cl::voting",
             view,

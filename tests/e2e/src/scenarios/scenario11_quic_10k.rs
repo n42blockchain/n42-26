@@ -4,6 +4,8 @@ use tracing::{info, warn};
 
 use crate::genesis;
 use crate::node_manager::{NodeConfig, NodeProcess};
+use crate::quic_test_client;
+use n42_primitives::BlsSecretKey;
 
 /// Scenario 11: 10 000 concurrent QUIC mobile simulator connections.
 ///
@@ -13,14 +15,13 @@ use crate::node_manager::{NodeConfig, NodeProcess};
 /// - Memory growth stays under 4 GB RSS during the connection phase.
 /// - CPU stays under 80% on average over the test window.
 ///
-/// Because this test is resource-intensive it is **excluded from the default E2E suite**
-/// and from the CI workflow filter `E2E_SCENARIO_FILTER=1,2,3,4,5,6`.  Run manually:
+/// Because this test is resource-intensive it is excluded from the correctness CI suite.
+/// Use it for dedicated LAN pressure / timing work instead. Run manually with:
 ///
 /// ```bash
-/// E2E_SCENARIO_FILTER=11 cargo test -p tests-e2e -- --test-threads=1 --nocapture
+/// cargo build --release -p n42-node-bin -p e2e-test
+/// E2E_SCENARIO_FILTER=11 target/release/e2e-test --binary target/release/n42-node
 /// ```
-///
-/// Or via the nightly workflow with `scenario_filter: "11"`.
 ///
 /// # Implementation notes
 ///
@@ -28,9 +29,9 @@ use crate::node_manager::{NodeConfig, NodeProcess};
 /// Tokio tasks to concurrently establish QUIC connections to the node's StarHub.
 /// Each task:
 /// 1. Connects via QUIC (TLS skip / dev cert).
-/// 2. Sends a 48-byte BLS public key as the handshake message.
-/// 3. Waits for the server to acknowledge (any data or stream close).
-/// 4. Disconnects.
+/// 2. Sends a valid 48-byte BLS public key as the handshake message.
+/// 3. Verifies the QUIC connection survives the immediate post-handshake window.
+/// 4. Disconnects cleanly.
 ///
 /// We measure peak concurrent connections and total elapsed time.
 pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
@@ -145,52 +146,31 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
 }
 
 /// Simulates a single QUIC mobile handshake: connect, send BLS pubkey, disconnect.
-///
-/// Uses a lightweight TCP fallback when Quinn is unavailable in the test environment.
-/// StarHub listens on QUIC (UDP), so TCP connections are expected to be refused;
-/// this is counted as a benign "protocol mismatch" rather than a test failure.
 async fn simulate_quic_handshake(index: usize, host: &str) -> eyre::Result<()> {
-    // Generate a deterministic 48-byte "pubkey" for this simulated phone.
-    // Expand the 32-byte keccak hash to 48 bytes (BLS pubkey length).
+    // Generate a valid deterministic BLS keypair for this simulated phone.
     let seed = format!("n42-stress-key-{index}");
-    let seed_hash = alloy_primitives::keccak256(seed.as_bytes());
-    let mut pubkey_bytes = [0u8; 48];
-    pubkey_bytes[..32].copy_from_slice(&seed_hash.0);
-    pubkey_bytes[32..48].copy_from_slice(&seed_hash.0[..16]);
+    let ikm = alloy_primitives::keccak256(seed.as_bytes()).0;
+    let bls_key = BlsSecretKey::key_gen(&ikm).map_err(|e| {
+        eyre::eyre!("failed to derive deterministic BLS key for index {index}: {e}")
+    })?;
+    let pubkey_bytes = bls_key.public_key().to_bytes();
 
-    // We use a bare TCP connection to avoid requiring full QUIC/TLS setup in the
-    // test environment.  In production, this would be replaced by the real
-    // `n42_connect` FFI call which uses Quinn + rustls.
-    //
-    // The TCP handshake is sufficient to exercise the server's connection
-    // acceptance path and measure the OS / tokio overhead of 10K connections.
     let addr: std::net::SocketAddr = host.parse()?;
-    let stream = tokio::time::timeout(Duration::from_secs(5), tokio::net::TcpStream::connect(addr))
-        .await
-        .map_err(|_| eyre::eyre!("connect timeout for index {index}"))?;
+    let conn = tokio::time::timeout(
+        Duration::from_secs(10),
+        quic_test_client::connect_to_starhub_addr(addr, &pubkey_bytes),
+    )
+    .await
+    .map_err(|_| eyre::eyre!("QUIC connect timeout for index {index}"))??;
 
-    match stream {
-        Ok(mut tcp) => {
-            use tokio::io::AsyncWriteExt;
-            // Send pubkey bytes as a minimal "handshake" payload.
-            let _ = tcp.write_all(&pubkey_bytes).await;
-            let _ = tcp.shutdown().await;
-            Ok(())
-        }
-        Err(e) => {
-            // StarHub listens on QUIC (UDP), not TCP.  A TCP connect refusal is
-            // expected — count it as a benign "protocol mismatch" rather than a failure
-            // for the purpose of this stress test skeleton.
-            //
-            // NOTE: returning Ok(()) here means ConnectionRefused is tallied as a
-            // "success" in the caller's success_rate metric.  This is intentional:
-            // the metric measures "connections that did not encounter unexpected
-            // errors", not "fully completed QUIC handshakes".
-            if e.kind() == std::io::ErrorKind::ConnectionRefused {
-                Ok(())
-            } else {
-                Err(eyre::eyre!("TCP error for index {index}: {e}"))
-            }
-        }
+    // Give the server a short window to reject the handshake if it is malformed.
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    if let Some(reason) = conn.close_reason() {
+        return Err(eyre::eyre!(
+            "server closed QUIC connection for index {index} after handshake: {reason}"
+        ));
     }
+
+    conn.close(0u32.into(), b"client done");
+    Ok(())
 }

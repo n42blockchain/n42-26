@@ -570,6 +570,7 @@ fn bench_bandwidth_estimation() -> Vec<BenchResult> {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[ignore = "manual benchmark; excluded from routine correctness test runs"]
 fn comm_stress_benchmark() {
     println!("\n{}", "=".repeat(120));
     println!("  IDC-Phone Communication Stack — Stress Benchmark");

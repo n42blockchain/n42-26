@@ -410,6 +410,43 @@ pub fn n42_chainspec_from_genesis(genesis_path: &Path) -> Result<Arc<ChainSpec>,
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+    use std::sync::{Mutex, OnceLock, PoisonError};
+    use tempfile::TempDir;
+
+    fn chain_id_env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn with_chain_id_env<T>(value: Option<&str>, f: impl FnOnce() -> T) -> T {
+        let _guard = chain_id_env_lock()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let previous = std::env::var("N42_CHAIN_ID").ok();
+        match value {
+            Some(value) => unsafe { std::env::set_var("N42_CHAIN_ID", value) },
+            None => unsafe { std::env::remove_var("N42_CHAIN_ID") },
+        }
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+
+        match previous {
+            Some(value) => unsafe { std::env::set_var("N42_CHAIN_ID", value) },
+            None => unsafe { std::env::remove_var("N42_CHAIN_ID") },
+        }
+
+        match result {
+            Ok(value) => value,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
+    fn temp_path(filename: &str) -> (TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(filename);
+        (dir, path)
+    }
 
     #[test]
     fn test_consensus_config_dev() {
@@ -462,12 +499,14 @@ mod tests {
 
     #[test]
     fn test_n42_dev_chainspec() {
-        let spec = n42_dev_chainspec();
-        assert_eq!(
-            spec.chain().id(),
-            4242,
-            "n42 dev chain spec should have chain_id 4242"
-        );
+        with_chain_id_env(None, || {
+            let spec = n42_dev_chainspec();
+            assert_eq!(
+                spec.chain().id(),
+                4242,
+                "n42 dev chain spec should have chain_id 4242"
+            );
+        });
     }
 
     #[test]
@@ -564,9 +603,7 @@ mod tests {
         let config = ConsensusConfig::dev_multi(4);
         let json = serde_json::to_string_pretty(&config).unwrap();
 
-        let dir = std::env::temp_dir().join("n42_test");
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("test_config.json");
+        let (_dir, path) = temp_path("test_config.json");
         let mut f = std::fs::File::create(&path).unwrap();
         f.write_all(json.as_bytes()).unwrap();
 
@@ -575,8 +612,6 @@ mod tests {
         assert_eq!(loaded.fault_tolerance, 1);
         assert_eq!(loaded.initial_validators.len(), 4);
         assert!(loaded.validate().is_ok());
-
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -592,9 +627,7 @@ max_timeout_ms = 8000
 initial_validators = []
 epoch_length = 0
 "#;
-        let dir = std::env::temp_dir().join("n42_test");
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("test_config.toml");
+        let (_dir, path) = temp_path("test_config.toml");
         let mut f = std::fs::File::create(&path).unwrap();
         f.write_all(toml_content.as_bytes()).unwrap();
 
@@ -602,8 +635,6 @@ epoch_length = 0
         assert_eq!(loaded.slot_time_ms, 8000);
         assert_eq!(loaded.validator_set_size, 1);
         assert!(loaded.validate().is_ok());
-
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -617,17 +648,13 @@ epoch_length = 0
     fn test_consensus_config_from_file_invalid_json() {
         use std::io::Write;
 
-        let dir = std::env::temp_dir().join("n42_test");
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("bad_config.json");
+        let (_dir, path) = temp_path("bad_config.json");
         let mut f = std::fs::File::create(&path).unwrap();
         f.write_all(b"not valid json {{{").unwrap();
 
         let result = ConsensusConfig::from_file(&path);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("JSON parse error"));
-
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -643,53 +670,65 @@ epoch_length = 0
             "max_timeout_ms": 8000,
             "initial_validators": []
         }"#;
-        let dir = std::env::temp_dir().join("n42_test");
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("invalid_config.json");
+        let (_dir, path) = temp_path("invalid_config.json");
         let mut f = std::fs::File::create(&path).unwrap();
         f.write_all(json.as_bytes()).unwrap();
 
         let result = ConsensusConfig::from_file(&path);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("slot_time_ms"));
-
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn test_dev_chainspec_with_alloc() {
-        let config = ConsensusConfig::dev_multi(3);
-        let spec = n42_dev_chainspec_with_alloc(&config.initial_validators);
-        assert_eq!(spec.chain().id(), N42_CHAIN_ID);
+        with_chain_id_env(None, || {
+            let config = ConsensusConfig::dev_multi(3);
+            let spec = n42_dev_chainspec_with_alloc(&config.initial_validators);
+            assert_eq!(spec.chain().id(), N42_CHAIN_ID);
 
-        let genesis = &spec.genesis;
-        // Validator addresses should be funded.
-        for v in &config.initial_validators {
-            let account = genesis
-                .alloc
-                .get(&v.address)
-                .expect("validator should have allocation");
-            assert!(
-                account.balance > U256::ZERO,
-                "validator balance should be non-zero"
-            );
-        }
-        // Test accounts should be funded.
-        for i in 0..10u8 {
-            let addr = Address::with_last_byte(0x10 + i);
-            let account = genesis
-                .alloc
-                .get(&addr)
-                .expect("test account should have allocation");
-            assert_eq!(account.balance, ten_thousand_n());
-        }
+            let genesis = &spec.genesis;
+            // Validator addresses should be funded.
+            for v in &config.initial_validators {
+                let account = genesis
+                    .alloc
+                    .get(&v.address)
+                    .expect("validator should have allocation");
+                assert!(
+                    account.balance > U256::ZERO,
+                    "validator balance should be non-zero"
+                );
+            }
+            // Test accounts should be funded.
+            for i in 0..10u8 {
+                let addr = Address::with_last_byte(0x10 + i);
+                let account = genesis
+                    .alloc
+                    .get(&addr)
+                    .expect("test account should have allocation");
+                assert_eq!(account.balance, ten_thousand_n());
+            }
+        });
     }
 
     #[test]
     fn test_dev_chainspec_with_alloc_empty_validators() {
-        let spec = n42_dev_chainspec_with_alloc(&[]);
-        // Should have 10 test accounts + 1 treasury.
-        assert_eq!(spec.genesis.alloc.len(), 11);
+        with_chain_id_env(None, || {
+            let spec = n42_dev_chainspec_with_alloc(&[]);
+            // Empty validator set still pre-funds the 10 test accounts, treasury,
+            // and the predeployed stress contract used by LAN pressure tests.
+            assert_eq!(spec.genesis.alloc.len(), 12);
+            assert!(spec.genesis.alloc.contains_key(&TREASURY_ADDRESS));
+            let contract = spec
+                .genesis
+                .alloc
+                .get(&STRESS_CONTRACT_ADDRESS)
+                .expect("stress contract should be predeployed");
+            assert_eq!(
+                contract.code.as_ref(),
+                Some(&STRESS_CONTRACT_BYTECODE),
+                "stress contract bytecode should be present in genesis alloc"
+            );
+        });
     }
 
     #[test]
@@ -704,17 +743,15 @@ epoch_length = 0
             }
         }"#;
 
-        let dir = std::env::temp_dir().join("n42_test_genesis");
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("genesis.json");
+        let (_dir, path) = temp_path("genesis.json");
         let mut f = std::fs::File::create(&path).unwrap();
         f.write_all(genesis_json.as_bytes()).unwrap();
 
-        let spec = n42_chainspec_from_genesis(&path).expect("should load genesis");
-        assert_eq!(spec.chain().id(), N42_CHAIN_ID);
-        assert!(!spec.genesis.alloc.is_empty());
-
-        let _ = std::fs::remove_file(&path);
+        with_chain_id_env(None, || {
+            let spec = n42_chainspec_from_genesis(&path).expect("should load genesis");
+            assert_eq!(spec.chain().id(), N42_CHAIN_ID);
+            assert!(!spec.genesis.alloc.is_empty());
+        });
     }
 
     #[test]
@@ -747,9 +784,7 @@ epoch_length = 0
     fn test_from_file_invalid_toml() {
         use std::io::Write;
 
-        let dir = std::env::temp_dir().join("n42_test");
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("bad_config.toml");
+        let (_dir, path) = temp_path("bad_config.toml");
         let mut f = std::fs::File::create(&path).unwrap();
         f.write_all(b"not = [valid toml {{{{").unwrap();
 
@@ -759,8 +794,6 @@ epoch_length = 0
             result.unwrap_err().contains("TOML parse error"),
             "error should mention TOML parse error"
         );
-
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -843,6 +876,17 @@ epoch_length = 0
     }
 
     #[test]
+    fn test_validate_rejects_invalid_p2p_peer_id() {
+        let mut config = ConsensusConfig::dev_multi(4);
+        for validator in &mut config.initial_validators {
+            validator.p2p_peer_id = Some("not-a-peer-id".to_string());
+        }
+
+        let error = config.validate().unwrap_err();
+        assert!(error.contains("invalid validator p2p_peer_id"));
+    }
+
+    #[test]
     fn test_dev_multi_7_and_10_validators() {
         // n=7: f=(7-1)/3=2, quorum=2*2+1=5, need 3*2+1=7 ≤ 7 → valid
         let c7 = ConsensusConfig::dev_multi(7);
@@ -864,24 +908,26 @@ epoch_length = 0
 
     #[test]
     fn test_chain_id_default() {
-        // Without env override, effective_chain_id() returns the compile-time constant.
-        // (Only safe to assert when N42_CHAIN_ID env var is not set in the test environment.)
-        if std::env::var("N42_CHAIN_ID").is_err() {
+        with_chain_id_env(None, || {
             assert_eq!(effective_chain_id(), N42_CHAIN_ID);
-        }
+        });
     }
 
     #[test]
     fn test_chain_id_env_override() {
-        // Temporarily set the env var to a custom value and verify it takes effect.
-        // NOTE: env vars are process-wide; this test must not run concurrently with
-        // other tests that call effective_chain_id(). Mark tests appropriately in CI.
-        unsafe { std::env::set_var("N42_CHAIN_ID", "1337") };
-        let id = effective_chain_id();
-        unsafe { std::env::remove_var("N42_CHAIN_ID") };
-        assert_eq!(
-            id, 1337,
-            "N42_CHAIN_ID env var should override the default chain ID"
-        );
+        with_chain_id_env(Some("1337"), || {
+            let id = effective_chain_id();
+            assert_eq!(
+                id, 1337,
+                "N42_CHAIN_ID env var should override the default chain ID"
+            );
+        });
+    }
+
+    #[test]
+    fn test_chain_id_invalid_override_falls_back_to_default() {
+        with_chain_id_env(Some("not-a-number"), || {
+            assert_eq!(effective_chain_id(), N42_CHAIN_ID);
+        });
     }
 }

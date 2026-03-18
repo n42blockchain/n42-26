@@ -5,7 +5,7 @@ use alloy_primitives::{Address, B256};
 use n42_chainspec::ValidatorInfo;
 use n42_consensus::error::ConsensusError;
 use n42_consensus::protocol::quorum::signing_message;
-use n42_consensus::{ConsensusEngine, ConsensusEvent, EngineOutput, ValidatorSet};
+use n42_consensus::{ConsensusEngine, ConsensusEvent, EngineOutput, LeaderSelector, ValidatorSet};
 use n42_primitives::BlsSecretKey;
 use n42_primitives::consensus::{ConsensusMessage, ViewNumber};
 use tokio::sync::mpsc;
@@ -73,6 +73,10 @@ impl ChaosHarness {
         self.engines.len()
     }
 
+    fn leader_for_view(&self, view: ViewNumber) -> usize {
+        LeaderSelector::leader_for_view(view, &self.validator_set) as usize
+    }
+
     fn drain_outputs(&mut self, idx: usize) -> Vec<EngineOutput> {
         let mut outputs = Vec::new();
         while let Ok(o) = self.output_rxs[idx].try_recv() {
@@ -87,7 +91,7 @@ impl ChaosHarness {
 
     fn run_consensus_round(&mut self, view: ViewNumber, block_hash: B256) {
         let n = self.n();
-        let leader = (view % n as u64) as usize;
+        let leader = self.leader_for_view(view);
 
         self.engines[leader]
             .process_event(ConsensusEvent::BlockReady(block_hash))
@@ -238,7 +242,7 @@ impl ChaosHarness {
         }
 
         let next_view = view + 1;
-        let next_leader = (next_view % n as u64) as usize;
+        let next_leader = self.leader_for_view(next_view);
 
         if let Some(nv) = self
             .drain_all_outputs()
@@ -263,7 +267,7 @@ impl ChaosHarness {
     /// Same-group and bridge messages delivered in phase 1; cross-group in phase 2.
     fn run_round_with_partition(&mut self, view: ViewNumber, block_hash: B256) {
         let n = self.n();
-        let leader = (view % n as u64) as usize;
+        let leader = self.leader_for_view(view);
 
         let in_group_a = |i: usize| -> bool { i <= 2 };
         let in_group_b = |i: usize| -> bool { i >= 4 && i <= 6 };
@@ -422,7 +426,7 @@ impl ChaosHarness {
         drop_rate: f64,
     ) -> (bool, usize, usize) {
         let n = self.n();
-        let leader = (view % n as u64) as usize;
+        let leader = self.leader_for_view(view);
         let mut dup_vote_errors = 0usize;
         let mut equivocation_events = 0usize;
         let mut committed = false;
@@ -742,8 +746,7 @@ async fn test_malicious_forged_votes() {
     // Phase 2: View 3 — manual round with malicious votes
     let view = 3u64;
     let block_hash = B256::from([3u8; 32]);
-    let leader = (view % 7) as usize; // leader = 3
-    assert_eq!(leader, 3, "leader for view 3 should be node 3");
+    let leader = harness.leader_for_view(view);
 
     // Step a: Leader proposes
     harness.engines[leader]

@@ -206,6 +206,24 @@ mod tests {
     use crate::prover::{MockProver, ProofType, ZkProofResult};
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    async fn wait_until(
+        timeout: tokio::time::Duration,
+        mut condition: impl FnMut() -> bool,
+        description: &str,
+    ) {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if condition() {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for {description}"
+            );
+            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        }
+    }
+
     fn make_input(block_number: u64) -> BlockExecutionInput {
         let mut hash_bytes = [0u8; 32];
         hash_bytes[..8].copy_from_slice(&block_number.to_le_bytes());
@@ -273,7 +291,12 @@ mod tests {
         let scheduler = ProofScheduler::new(prover, 5, Arc::clone(&store));
 
         scheduler.on_block_committed(5, make_input(5));
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        wait_until(
+            tokio::time::Duration::from_secs(1),
+            || store.get_by_block(5).is_some(),
+            "proof generation at interval",
+        )
+        .await;
 
         let proof = store
             .get_by_block(5)
@@ -293,7 +316,12 @@ mod tests {
         scheduler.on_block_committed(10, make_input(10));
         scheduler.on_block_committed(20, make_input(20));
 
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        wait_until(
+            tokio::time::Duration::from_secs(1),
+            || store.get_by_block(10).is_some() && store.get_by_block(20).is_some(),
+            "interval proof generation",
+        )
+        .await;
 
         assert!(store.get_by_block(5).is_none());
         assert!(store.get_by_block(7).is_none());
@@ -360,7 +388,15 @@ mod tests {
         let scheduler = ProofScheduler::new(prover, 10, store).with_callback(callback);
 
         scheduler.on_block_committed(10, make_input(10));
-        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+        wait_until(
+            tokio::time::Duration::from_secs(1),
+            || {
+                callback_count.load(Ordering::SeqCst) == 1
+                    && callback_block.load(Ordering::SeqCst) == 10
+            },
+            "success callback invocation",
+        )
+        .await;
 
         assert_eq!(callback_count.load(Ordering::SeqCst), 1);
         assert_eq!(callback_block.load(Ordering::SeqCst), 10);
@@ -380,7 +416,12 @@ mod tests {
         let scheduler = ProofScheduler::new(prover, 10, Arc::clone(&store)).with_callback(callback);
 
         scheduler.on_block_committed(10, make_input(10));
-        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+        wait_until(
+            tokio::time::Duration::from_secs(1),
+            || store.stats().failed == 1,
+            "failure accounting",
+        )
+        .await;
 
         assert_eq!(
             callback_count.load(Ordering::SeqCst),
@@ -401,7 +442,12 @@ mod tests {
         // This should not panic.
         scheduler.on_block_committed(10, make_input(10));
         scheduler.on_block_committed(20, make_input(20));
-        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+        wait_until(
+            tokio::time::Duration::from_secs(1),
+            || store.stats().failed == 2,
+            "failing prover completion",
+        )
+        .await;
 
         assert!(store.is_empty());
     }
@@ -443,7 +489,12 @@ mod tests {
         for block in [5, 10, 15, 20, 25] {
             scheduler.on_block_committed(block, make_input(block));
         }
-        tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+        wait_until(
+            tokio::time::Duration::from_secs(1),
+            || counting.count() == 5 && store.len() == 5,
+            "multiple interval proofs",
+        )
+        .await;
 
         assert_eq!(counting.count(), 5);
         assert_eq!(store.len(), 5);
@@ -464,7 +515,12 @@ mod tests {
         scheduler.on_block_committed(1, make_input(1));
         scheduler.on_block_committed(2, make_input(2));
         scheduler.on_block_committed(3, make_input(3));
-        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+        wait_until(
+            tokio::time::Duration::from_secs(1),
+            || counting.count() == 3 && store.len() == 3,
+            "interval-one proof generation",
+        )
+        .await;
 
         assert_eq!(
             counting.count(),
@@ -486,7 +542,12 @@ mod tests {
         let scheduler = ProofScheduler::new(counting.clone(), 10, Arc::clone(&store));
 
         scheduler.on_block_committed(10, make_input(10));
-        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+        wait_until(
+            tokio::time::Duration::from_secs(1),
+            || counting.count() == 1 && store.contains(10),
+            "first duplicate-prevention proof",
+        )
+        .await;
 
         // Submit the same block again — should be skipped because proof already exists.
         scheduler.on_block_committed(10, make_input(10));
@@ -524,7 +585,12 @@ mod tests {
         let scheduler = ProofScheduler::new(prover, 10, Arc::clone(&store));
 
         scheduler.on_block_committed(10, make_input(10));
-        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+        wait_until(
+            tokio::time::Duration::from_secs(1),
+            || store.stats().failed == 1,
+            "failure stats update",
+        )
+        .await;
 
         let stats = store.stats();
         assert_eq!(stats.generated, 0);
@@ -539,7 +605,12 @@ mod tests {
 
         scheduler.on_block_committed(5, make_input(5));
         scheduler.on_block_committed(10, make_input(10));
-        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+        wait_until(
+            tokio::time::Duration::from_secs(1),
+            || store.stats().generated == 2,
+            "success stats update",
+        )
+        .await;
 
         let stats = store.stats();
         assert_eq!(stats.generated, 2);

@@ -774,8 +774,12 @@ mod tests {
     /// The expected receipts root used in test receipts.
     const TEST_RR: B256 = B256::new([0xAA; 32]);
 
-    fn make_receipt(block_hash: B256, block_number: u64) -> VerificationReceipt {
-        let key = BlsSecretKey::random().expect("BLS key gen");
+    fn test_key(seed: u8) -> BlsSecretKey {
+        BlsSecretKey::key_gen(&[seed; 32]).expect("deterministic test key should be valid")
+    }
+
+    fn make_receipt(block_hash: B256, block_number: u64, signer_seed: u8) -> VerificationReceipt {
+        let key = test_key(signer_seed);
         sign_receipt(block_hash, block_number, TEST_RR, 1_000_000, &key)
     }
 
@@ -798,13 +802,13 @@ mod tests {
 
         let block_hash = B256::with_last_byte(0x01);
         bridge.register_dispatched_block(block_hash, 1, Some(TEST_RR));
-        bridge.process_receipt(&make_receipt(block_hash, 1));
+        bridge.process_receipt(&make_receipt(block_hash, 1, 0x11));
 
         let status = bridge.receipt_aggregator.get_status(&block_hash);
         assert!(status.is_some());
         assert_eq!(status.unwrap().total_receipts(), 1);
 
-        bridge.process_receipt(&make_receipt(block_hash, 1));
+        bridge.process_receipt(&make_receipt(block_hash, 1, 0x12));
 
         let status = bridge.receipt_aggregator.get_status(&block_hash).unwrap();
         assert_eq!(status.total_receipts(), 2);
@@ -821,7 +825,7 @@ mod tests {
 
         let block_hash = B256::with_last_byte(0x03);
         bridge.register_dispatched_block(block_hash, 10, Some(TEST_RR));
-        bridge.process_receipt(&make_receipt(block_hash, 10));
+        bridge.process_receipt(&make_receipt(block_hash, 10, 0x13));
 
         let event = attest_rx
             .try_recv()
@@ -843,9 +847,9 @@ mod tests {
 
         bridge.register_dispatched_block(hash_a, 10, Some(TEST_RR));
         bridge.register_dispatched_block(hash_b, 11, Some(TEST_RR));
-        bridge.process_receipt(&make_receipt(hash_a, 10));
-        bridge.process_receipt(&make_receipt(hash_a, 10));
-        bridge.process_receipt(&make_receipt(hash_b, 11));
+        bridge.process_receipt(&make_receipt(hash_a, 10, 0x14));
+        bridge.process_receipt(&make_receipt(hash_a, 10, 0x15));
+        bridge.process_receipt(&make_receipt(hash_b, 11, 0x16));
 
         let status_a = bridge.receipt_aggregator.get_status(&hash_a).unwrap();
         assert_eq!(status_a.total_receipts(), 2);
@@ -863,7 +867,7 @@ mod tests {
 
         let block_hash = B256::with_last_byte(0x0C);
         bridge.register_dispatched_block(block_hash, 20, Some(TEST_RR));
-        let receipt = make_receipt(block_hash, 20);
+        let receipt = make_receipt(block_hash, 20, 0x17);
         bridge.process_receipt(&receipt);
         bridge.process_receipt(&receipt);
 
@@ -882,7 +886,7 @@ mod tests {
 
         let block_hash = B256::with_last_byte(0x0D);
         bridge.register_dispatched_block(block_hash, 30, Some(TEST_RR));
-        bridge.process_receipt(&make_receipt(block_hash, 30));
+        bridge.process_receipt(&make_receipt(block_hash, 30, 0x18));
 
         assert!(
             bridge
@@ -905,7 +909,7 @@ mod tests {
 
         let block_hash = B256::with_last_byte(0xF1);
         bridge.register_dispatched_block(block_hash, 100, Some(TEST_RR));
-        bridge.process_receipt(&make_receipt(block_hash, 100));
+        bridge.process_receipt(&make_receipt(block_hash, 100, 0x19));
         assert!(
             !bridge
                 .receipt_aggregator
@@ -927,7 +931,7 @@ mod tests {
             let block_hash = B256::with_last_byte(i);
             // Register with expected TEST_RR, but send receipt with wrong computed root.
             bridge.register_dispatched_block(block_hash, i as u64, Some(TEST_RR));
-            let key = BlsSecretKey::random().expect("BLS key gen");
+            let key = test_key(0x20 + i);
             let receipt = sign_receipt(block_hash, i as u64, wrong_rr, 1_000_000, &key);
             bridge.process_receipt(&receipt);
         }
@@ -961,7 +965,7 @@ mod tests {
         let mut bridge = MobileVerificationBridge::new(rx, 2, 100);
 
         let block_hash = B256::with_last_byte(0x02);
-        let receipt = make_receipt(block_hash, 42);
+        let receipt = make_receipt(block_hash, 42, 0x30);
 
         tx.blocking_send(HubEvent::PhoneConnected {
             session_id: 1,
@@ -992,10 +996,10 @@ mod tests {
 
         let block_hash = B256::with_last_byte(0xE1);
         bridge.register_dispatched_block(block_hash, 50, Some(TEST_RR));
-        bridge.process_receipt(&make_receipt(block_hash, 50));
+        bridge.process_receipt(&make_receipt(block_hash, 50, 0x31));
         assert!(bridge.block_first_receipt_at.contains_key(&block_hash));
 
-        bridge.process_receipt(&make_receipt(block_hash, 50));
+        bridge.process_receipt(&make_receipt(block_hash, 50, 0x32));
         assert!(
             bridge
                 .receipt_aggregator
@@ -1013,7 +1017,11 @@ mod tests {
         let mut bridge = MobileVerificationBridge::new(rx, 100, max_tracked);
 
         for i in 0..4u8 {
-            bridge.process_receipt(&make_receipt(B256::with_last_byte(0xF0 + i), i as u64));
+            bridge.process_receipt(&make_receipt(
+                B256::with_last_byte(0xF0 + i),
+                i as u64,
+                0x40 + i,
+            ));
         }
 
         assert_eq!(bridge.block_first_receipt_at.len(), max_tracked);
@@ -1031,7 +1039,7 @@ mod tests {
 
         let block_hash = B256::with_last_byte(0xE2);
         bridge.register_dispatched_block(block_hash, 60, Some(TEST_RR));
-        bridge.process_receipt(&make_receipt(block_hash, 60));
+        bridge.process_receipt(&make_receipt(block_hash, 60, 0x50));
         assert!(
             bridge
                 .receipt_aggregator
@@ -1118,7 +1126,7 @@ mod tests {
             .with_attestation_store(store);
 
         let block_hash = B256::with_last_byte(0xA2);
-        let key = BlsSecretKey::random().expect("BLS key gen");
+        let key = test_key(0x60);
         let wrong_rr = B256::from([0xFF; 32]);
         let invalid_receipt = sign_receipt(block_hash, 200, wrong_rr, 1_000_000, &key);
 
@@ -1153,8 +1161,8 @@ mod tests {
 
         let block_hash = B256::with_last_byte(0xA3);
         bridge.register_dispatched_block(block_hash, 300, Some(TEST_RR));
-        bridge.process_receipt(&make_receipt(block_hash, 300));
-        bridge.process_receipt(&make_receipt(block_hash, 300));
+        bridge.process_receipt(&make_receipt(block_hash, 300, 0x61));
+        bridge.process_receipt(&make_receipt(block_hash, 300, 0x62));
 
         // Below threshold: no finalization, no rewards
         assert!(
@@ -1172,7 +1180,7 @@ mod tests {
         // No reward_tx configured — should not panic
         let block_hash = B256::with_last_byte(0xA4);
         bridge.register_dispatched_block(block_hash, 400, Some(TEST_RR));
-        bridge.process_receipt(&make_receipt(block_hash, 400));
+        bridge.process_receipt(&make_receipt(block_hash, 400, 0x63));
     }
 
     #[test]
@@ -1185,7 +1193,7 @@ mod tests {
 
         let block_hash = B256::with_last_byte(0xB1);
         // Deliberately NOT calling register_dispatched_block.
-        bridge.process_receipt(&make_receipt(block_hash, 500));
+        bridge.process_receipt(&make_receipt(block_hash, 500, 0x64));
 
         // Aggregator must not have a status entry for the block.
         assert!(
@@ -1295,7 +1303,7 @@ mod tests {
 
         // A builder is created even without a store, but no signatures will be
         // added because the builder.add_receipt needs a registry from the store.
-        let receipt = make_receipt(block_hash, 1);
+        let receipt = make_receipt(block_hash, 1, 0x65);
         bridge.process_receipt(&receipt);
 
         // Should still work (threshold reached), just no aggregate stored.

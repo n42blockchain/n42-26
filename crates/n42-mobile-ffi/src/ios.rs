@@ -113,83 +113,7 @@
 /// ```objc
 /// #include "n42_mobile_ffi.h"
 /// ```
-pub const N42_C_HEADER: &str = r#"
-#pragma once
-#include <stdint.h>
-#include <stddef.h>
-
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-typedef struct VerifierContext VerifierContext;
-
-/**
- * Initialises a new verifier context for the given chain ID.
- * Returns NULL on failure. The caller must free with `n42_verifier_free`.
- */
-VerifierContext* n42_verifier_init(uint64_t chain_id);
-
-/**
- * Connects to a StarHub QUIC server at host:port.
- * `cert_hash` is NULL (dev/accept-any) or a 32-byte SHA-256 of the server cert.
- * Returns 0 on success, negative on error.
- */
-int n42_connect(
-    VerifierContext* ctx,
-    const char* host,
-    uint16_t port,
-    const uint8_t* cert_hash,
-    size_t cert_hash_len
-);
-
-/**
- * Non-blocking poll for the next pending verification packet.
- * Copies bytes into `out_buf`. Returns bytes written, 0 if empty, or negative on error.
- */
-int n42_poll_packet(VerifierContext* ctx, uint8_t* out_buf, size_t buf_len);
-
-/**
- * Verifies a packet (EVM re-execution + BLS signature) and sends the receipt.
- * Auto-detects V1 (legacy bincode) and V2 (magic "N2") wire formats.
- * Returns 0 on success, non-zero on error.
- */
-int n42_verify_and_send(VerifierContext* ctx, const uint8_t* data, size_t len);
-
-/**
- * Copies the last verification result as a null-terminated JSON string into `out_buf`.
- * Returns bytes written (excluding null terminator), 0 if no data, or negative on error.
- */
-int n42_last_verify_info(VerifierContext* ctx, char* out_buf, size_t buf_len);
-
-/**
- * Copies the verifier's BLS12-381 public key (48 bytes) into `out_buf`.
- * Returns 0 on success, -1 on error.
- */
-int n42_get_pubkey(VerifierContext* ctx, uint8_t* out_buf);
-
-/**
- * Copies runtime statistics as a null-terminated JSON string into `out_buf`.
- * Returns bytes written (excluding null terminator), or negative on error.
- */
-int n42_get_stats(VerifierContext* ctx, char* out_buf, size_t buf_len);
-
-/**
- * Disconnects from the StarHub server.
- * Returns 0 on success, -2 if not connected.
- */
-int n42_disconnect(VerifierContext* ctx);
-
-/**
- * Frees the verifier context. Safe to call with NULL (no-op).
- * Must not be called more than once for the same pointer.
- */
-void n42_verifier_free(VerifierContext* ctx);
-
-#ifdef __cplusplus
-}
-#endif
-"#;
+pub const N42_C_HEADER: &str = include_str!("../include/n42_mobile.h");
 
 #[cfg(test)]
 mod tests {
@@ -210,8 +134,9 @@ mod tests {
 
     #[test]
     fn test_header_is_valid_c_syntax_structure() {
-        // Verify the header has proper include guards and extern "C".
-        assert!(N42_C_HEADER.contains("#pragma once"));
+        // Verify the embedded header keeps the actual public include shape.
+        assert!(N42_C_HEADER.contains("#ifndef N42_MOBILE_H"));
+        assert!(N42_C_HEADER.contains("#define N42_MOBILE_H"));
         assert!(N42_C_HEADER.contains("extern \"C\""));
         assert!(N42_C_HEADER.contains("VerifierContext"));
     }

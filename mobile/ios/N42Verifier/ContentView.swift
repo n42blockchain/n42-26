@@ -104,9 +104,11 @@ struct ContentView: View {
                         .font(.subheadline)
 
                     HStack {
-                        Image(systemName: info.receiptsRootMatch ? "checkmark.circle.fill" : "xmark.circle.fill")
-                            .foregroundColor(info.receiptsRootMatch ? .green : .red)
-                        Text("Receipts Root: \(info.receiptsRootMatch ? "Match" : "Mismatch")")
+                        Image(systemName: "checklist")
+                            .foregroundColor(.blue)
+                        Text("Computed Root: \(info.computedReceiptsRoot)")
+                            .font(.caption)
+                            .monospaced()
                     }
 
                     Text("Txs: \(info.txCount) | Witnesses: \(info.witnessAccounts)")

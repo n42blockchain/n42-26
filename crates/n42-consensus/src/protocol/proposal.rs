@@ -84,7 +84,8 @@ impl ConsensusEngine {
             });
         }
 
-        let expected_leader = LeaderSelector::leader_for_view(view, self.validator_set());
+        let view_set = self.validator_set_for_view(view);
+        let expected_leader = LeaderSelector::leader_for_view(view, view_set);
         if proposal.proposer != expected_leader {
             return Err(ConsensusError::InvalidProposer {
                 view,
@@ -93,7 +94,7 @@ impl ConsensusEngine {
             });
         }
 
-        let pk = self.validator_set().get_public_key(proposal.proposer)?;
+        let pk = view_set.get_public_key(proposal.proposer)?;
         let msg = signing_message(view, &proposal.block_hash);
         pk.verify(&msg, &proposal.signature)
             .map_err(|_| ConsensusError::InvalidSignature {
@@ -106,14 +107,17 @@ impl ConsensusEngine {
         // Genesis QC (view 0) is exempt — it has no real aggregate signatures.
         // Uses verify_qc_any_domain because justify_qc may be either a prepare QC or commit QC.
         if proposal.justify_qc.view > 0 {
-            super::quorum::verify_qc_any_domain(&proposal.justify_qc, self.validator_set())
-                .map_err(|e| {
-                    tracing::warn!(target: "n42::cl::proposal",
-                        view, proposer = proposal.proposer, qc_view = proposal.justify_qc.view,
-                        "rejecting proposal with invalid justify_qc: {e}"
-                    );
-                    e
-                })?;
+            super::quorum::verify_qc_any_domain(
+                &proposal.justify_qc,
+                self.validator_set_for_view(proposal.justify_qc.view),
+            )
+            .map_err(|e| {
+                tracing::warn!(target: "n42::cl::proposal",
+                    view, proposer = proposal.proposer, qc_view = proposal.justify_qc.view,
+                    "rejecting proposal with invalid justify_qc: {e}"
+                );
+                e
+            })?;
         }
 
         if !self.round_state.is_safe_to_vote(&proposal.justify_qc) {
@@ -127,7 +131,10 @@ impl ConsensusEngine {
 
         // Chained mode: process piggybacked PrepareQC if present.
         if let Some(ref piggybacked_qc) = proposal.prepare_qc {
-            match super::quorum::verify_qc(piggybacked_qc, self.validator_set()) {
+            match super::quorum::verify_qc(
+                piggybacked_qc,
+                self.validator_set_for_view(piggybacked_qc.view),
+            ) {
                 Ok(()) => {
                     tracing::debug!(target: "n42::cl::proposal",
                         view,
@@ -179,7 +186,21 @@ impl ConsensusEngine {
             });
         }
 
-        super::quorum::verify_qc(&pqc.qc, self.validator_set())?;
+        if pqc.qc.view != pqc.view {
+            return Err(ConsensusError::ViewMismatch {
+                current: pqc.view,
+                received: pqc.qc.view,
+            });
+        }
+
+        if pqc.qc.block_hash != pqc.block_hash {
+            return Err(ConsensusError::BlockHashMismatch {
+                expected: pqc.block_hash,
+                got: pqc.qc.block_hash,
+            });
+        }
+
+        super::quorum::verify_qc(&pqc.qc, self.validator_set_for_view(pqc.qc.view))?;
         self.round_state.update_locked_qc(&pqc.qc);
         self.round_state.enter_pre_commit();
 
@@ -187,7 +208,7 @@ impl ConsensusEngine {
 
         let commit_msg = commit_signing_message(view, &pqc.block_hash);
         let commit_sig = self.secret_key.sign(&commit_msg);
-        let leader = LeaderSelector::leader_for_view(view, self.validator_set());
+        let leader = self.leader_index_for_view(view);
 
         let commit_vote = n42_primitives::consensus::CommitVote {
             view,
@@ -205,7 +226,7 @@ impl ConsensusEngine {
 
     /// Sends a Round 1 vote for the given view and block hash.
     pub(super) fn send_vote(&mut self, view: ViewNumber, block_hash: B256) -> ConsensusResult<()> {
-        let leader = LeaderSelector::leader_for_view(view, self.validator_set());
+        let leader = self.leader_index_for_view(view);
         let vote_msg = signing_message(view, &block_hash);
         let vote_sig = self.secret_key.sign(&vote_msg);
 

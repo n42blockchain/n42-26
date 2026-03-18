@@ -117,7 +117,7 @@ class VerifierViewModel : ViewModel() {
                         lastBlockInfo = info
                         val entry = LogEntry(
                             blockNumber = info.optLong("block_number", 0),
-                            success = info.optBoolean("receipts_root_match", false),
+                            success = success,
                             verifyTimeMs = info.optLong("verify_time_ms", 0),
                         )
                         logEntries = (listOf(entry) + logEntries).take(100)
@@ -312,7 +312,7 @@ fun LatestBlockSection(vm: VerifierViewModel) {
 
             val blockNum = info.optLong("block_number", 0)
             val blockHash = info.optString("block_hash", "")
-            val rootMatch = info.optBoolean("receipts_root_match", false)
+            val computedRoot = info.optString("computed_receipts_root", "")
             val txCount = info.optInt("tx_count", 0)
             val witnesses = info.optInt("witness_accounts", 0)
             val verifyMs = info.optLong("verify_time_ms", 0)
@@ -324,8 +324,9 @@ fun LatestBlockSection(vm: VerifierViewModel) {
                 style = MaterialTheme.typography.bodyMedium
             )
             Text(
-                "Receipts Root: ${if (rootMatch) "\u2705 Match" else "\u274C Mismatch"}",
-                color = if (rootMatch) Color(0xFF4CAF50) else Color.Red
+                "Computed Root: $computedRoot",
+                fontFamily = FontFamily.Monospace,
+                style = MaterialTheme.typography.bodySmall
             )
             Text("Txs: $txCount | Witnesses: $witnesses")
             Text("Verify Time: ${verifyMs}ms | Packet: ${packetSize / 1024.0}KB")

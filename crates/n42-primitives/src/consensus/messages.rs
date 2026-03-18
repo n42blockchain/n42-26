@@ -35,11 +35,9 @@ impl QuorumCertificate {
         use crate::bls::BlsSecretKey;
 
         let ikm = [1u8; 32];
-        let dummy_sig = match BlsSecretKey::from_bytes(&ikm) {
-            Ok(sk) => sk.sign(b"genesis"),
-            Err(_) => BlsSignature::from_bytes(&[0u8; 96])
-                .unwrap_or_else(|_| panic!("failed to create genesis signature")),
-        };
+        let dummy_sig = BlsSecretKey::key_gen(&ikm)
+            .expect("deterministic genesis key derivation should succeed")
+            .sign(b"genesis");
 
         Self {
             view: 0,
@@ -118,7 +116,7 @@ pub struct TimeoutMessage {
     pub high_qc: QuorumCertificate,
     /// Sender's validator index.
     pub sender: ValidatorIndex,
-    /// BLS signature over (view, high_qc.view).
+    /// BLS signature over `timeout_signing_message(view)` (`"timeout" || view`).
     pub signature: BlsSignature,
 }
 
@@ -131,7 +129,7 @@ pub struct NewView {
     pub timeout_cert: TimeoutCertificate,
     /// New leader's validator index.
     pub leader: ValidatorIndex,
-    /// BLS signature over (view, timeout_cert hash).
+    /// BLS signature over `newview_signing_message(view)` (`"newview" || view`).
     pub signature: BlsSignature,
 }
 
@@ -382,19 +380,10 @@ mod tests {
 
     #[test]
     fn test_genesis_qc() {
-        let result = std::panic::catch_unwind(QuorumCertificate::genesis);
-        match result {
-            Ok(qc) => {
-                assert_eq!(qc.view, 0);
-                assert_eq!(qc.block_hash, B256::ZERO);
-                assert_eq!(qc.signer_count(), 0);
-                assert!(qc.signers.is_empty());
-            }
-            Err(_) => {
-                eprintln!(
-                    "NOTE: QuorumCertificate::genesis() panics if [0u8; 96] is not valid BLS signature"
-                );
-            }
-        }
+        let qc = QuorumCertificate::genesis();
+        assert_eq!(qc.view, 0);
+        assert_eq!(qc.block_hash, B256::ZERO);
+        assert_eq!(qc.signer_count(), 0);
+        assert!(qc.signers.is_empty());
     }
 }

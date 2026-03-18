@@ -53,6 +53,12 @@ Benchmark/support utility for execution-focused investigations.
 
 `tests/e2e` provides scenario-oriented coverage rather than just unit coverage.
 
+Keep three lanes separate:
+
+- correctness CI: deterministic real-bin scenarios that gate merges
+- manual integrated E2E: node + tx sender + mobile + explorer flows still used for product evolution
+- LAN pressure / timing: `n42-stress`, `scripts/testnet*.sh`, `scripts/step_stress.sh`, `scripts/sysmon.sh`
+
 ### Structure
 
 ```text
@@ -85,6 +91,15 @@ tests/e2e/src/
 - stress and long-run behavior
 - chaos scenarios
 - high-scale QUIC connection behavior
+
+Not every scenario belongs in correctness CI. Use `tests/e2e/README.md` for the current CI/manual/LAN split.
+
+## Benchmarks and manual stress tests
+
+- `crates/n42-consensus/tests/performance_bench.rs` is preserved as an ignored manual benchmark suite
+- `crates/n42-node/tests/comm_stress_bench.rs` is preserved as an ignored manual communication benchmark
+- `bin/n42-stress` and `scripts/testnet*.sh` remain the primary LAN timing/tuning entrypoints
+- `scripts/test-7node-integrated-smoke.sh` is the fastest repeatable real-bin check for `7-node + tx sender + mobile + Blockscout` without forcing a full `testnet.sh` rebuild cycle
 
 ## Suggested release-gate test buckets
 

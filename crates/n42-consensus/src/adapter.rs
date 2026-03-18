@@ -13,6 +13,9 @@ use crate::extra_data::extract_qc_from_extra_data;
 use crate::protocol::quorum::{verify_commit_qc, verify_qc};
 use crate::validator::ValidatorSet;
 
+/// Resolves the validator set that should verify a QC for a given view.
+pub type ValidatorSetResolver = Arc<dyn Fn(u64) -> Option<Arc<ValidatorSet>> + Send + Sync>;
+
 /// N42 consensus adapter that integrates with the reth node builder.
 ///
 /// Wraps `EthBeaconConsensus` for standard Ethereum validation (gas limits,
@@ -23,13 +26,27 @@ use crate::validator::ValidatorSet;
 /// The adapter is intentionally stateless—it validates individual blocks/headers
 /// against the consensus rules. The stateful consensus engine (`ConsensusEngine`)
 /// runs as a separate background task.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct N42Consensus<C = ChainSpec> {
     /// Inner Ethereum consensus for standard EVM rule checks.
     inner: EthBeaconConsensus<C>,
     /// Validator set for QC verification.
     /// None during initial sync when validator set is not yet loaded.
     validator_set: Arc<ArcSwapOption<ValidatorSet>>,
+    /// Optional epoch-aware validator-set resolver for QC verification.
+    validator_set_resolver: Option<ValidatorSetResolver>,
+}
+
+impl<C> std::fmt::Debug for N42Consensus<C> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("N42Consensus")
+            .field("has_validator_set", &self.validator_set.load().is_some())
+            .field(
+                "has_validator_set_resolver",
+                &self.validator_set_resolver.is_some(),
+            )
+            .finish()
+    }
 }
 
 impl<C> N42Consensus<C>
@@ -48,6 +65,7 @@ where
             inner: EthBeaconConsensus::new(chain_spec)
                 .with_max_extra_data_size(Self::MAX_EXTRA_DATA_SIZE),
             validator_set: Arc::new(ArcSwapOption::empty()),
+            validator_set_resolver: None,
         }
     }
 
@@ -64,16 +82,34 @@ where
         chain_spec: Arc<C>,
         validator_set: Arc<ArcSwapOption<ValidatorSet>>,
     ) -> Self {
+        Self::with_validator_set_store_and_resolver(chain_spec, validator_set, None)
+    }
+
+    /// Create a new N42 consensus adapter backed by a shared validator-set store and
+    /// an optional epoch-aware resolver.
+    pub fn with_validator_set_store_and_resolver(
+        chain_spec: Arc<C>,
+        validator_set: Arc<ArcSwapOption<ValidatorSet>>,
+        validator_set_resolver: Option<ValidatorSetResolver>,
+    ) -> Self {
         Self {
             inner: EthBeaconConsensus::new(chain_spec)
                 .with_max_extra_data_size(Self::MAX_EXTRA_DATA_SIZE),
             validator_set,
+            validator_set_resolver,
         }
     }
 
     /// Sets or updates the validator set.
     pub fn set_validator_set(&mut self, validator_set: ValidatorSet) {
         self.validator_set.store(Some(Arc::new(validator_set)));
+    }
+
+    fn validator_set_for_view(&self, view: u64) -> Option<Arc<ValidatorSet>> {
+        self.validator_set_resolver
+            .as_ref()
+            .and_then(|resolver| resolver(view))
+            .or_else(|| self.validator_set.load_full())
     }
 }
 
@@ -95,13 +131,13 @@ where
             receipt_root_bloom,
         )?;
 
-        if let Some(vs) = self.validator_set.load_full() {
-            let extra_data = block.header().extra_data();
-            if let Some(qc) = extract_qc_from_extra_data(extra_data)? {
-                verify_qc(&qc, &vs)
-                    .or_else(|_| verify_commit_qc(&qc, &vs))
-                    .map_err(|e| ConsensusError::Other(e.to_string()))?;
-            }
+        let extra_data = block.header().extra_data();
+        if let Some(qc) = extract_qc_from_extra_data(extra_data)?
+            && let Some(vs) = self.validator_set_for_view(qc.view)
+        {
+            verify_qc(&qc, &vs)
+                .or_else(|_| verify_commit_qc(&qc, &vs))
+                .map_err(|e| ConsensusError::Other(e.to_string()))?;
         }
 
         Ok(())
@@ -162,9 +198,13 @@ mod tests {
     };
     use crate::validator::ValidatorSet;
 
+    fn test_key(seed: u8) -> BlsSecretKey {
+        BlsSecretKey::key_gen(&[seed; 32]).expect("deterministic test key should be valid")
+    }
+
     /// Helper: create a test validator set of size `n` along with the secret keys.
     fn test_validator_set(n: usize) -> (Vec<BlsSecretKey>, ValidatorSet) {
-        let sks: Vec<_> = (0..n).map(|_| BlsSecretKey::random().unwrap()).collect();
+        let sks: Vec<_> = (0..n).map(|i| test_key(0x60 + i as u8)).collect();
         let infos: Vec<_> = sks
             .iter()
             .enumerate()
@@ -209,6 +249,35 @@ mod tests {
         let loaded = consensus.validator_set.load_full();
         assert!(loaded.is_some());
         assert_eq!(loaded.as_ref().unwrap().len(), 7);
+    }
+
+    #[test]
+    fn test_validator_set_resolver_overrides_current_set_for_matching_view() {
+        let chain_spec = n42_chainspec::n42_dev_chainspec();
+        let (_, current_vs) = test_validator_set(4);
+        let (_, resolved_vs) = test_validator_set(7);
+        let expected_resolved_len = resolved_vs.len();
+        let expected_current_len = current_vs.len();
+        let resolver_vs = resolved_vs.clone();
+        let resolver: ValidatorSetResolver = Arc::new(move |view| {
+            if view == 42 {
+                Some(Arc::new(resolver_vs.clone()))
+            } else {
+                None
+            }
+        });
+
+        let consensus = N42Consensus::with_validator_set_store_and_resolver(
+            chain_spec,
+            Arc::new(ArcSwapOption::from_pointee(current_vs)),
+            Some(resolver),
+        );
+
+        let resolved = consensus.validator_set_for_view(42).unwrap();
+        assert_eq!(resolved.len(), expected_resolved_len);
+
+        let fallback = consensus.validator_set_for_view(1).unwrap();
+        assert_eq!(fallback.len(), expected_current_len);
     }
 
     #[test]

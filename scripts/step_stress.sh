@@ -2,7 +2,7 @@
 # Step stress test: gradually increase load to find TPS ceiling.
 # Each step runs for STEP_DURATION seconds, then ramps up.
 
-RPC=${RPC:-http://127.0.0.1:18545}
+RPC=${RPC:-http://127.0.0.1:18000}
 STEP_DURATION=${STEP_DURATION:-60}
 STRESS_BIN=${STRESS_BIN:-target/release/n42-stress}
 LOG_DIR="/Users/jieliu/n42-testnet-data"
@@ -24,13 +24,24 @@ STEPS=(
 get_block_number() {
     curl -s -X POST "$RPC" -H 'Content-Type: application/json' \
         -d '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}' \
-        | python3 -c "import sys,json; print(int(json.load(sys.stdin)['result'],16))" 2>/dev/null
+        | python3 -c 'import sys,json
+try:
+    body = json.load(sys.stdin)
+    print(int(body.get("result", "0x0"), 16))
+except Exception:
+    print(0)' 2>/dev/null
 }
 
 get_pool_size() {
     curl -s -X POST "$RPC" -H 'Content-Type: application/json' \
         -d '{"jsonrpc":"2.0","method":"txpool_status","params":[],"id":1}' \
-        | python3 -c "import sys,json; r=json.load(sys.stdin)['result']; print(int(r['pending'],16), int(r['queued'],16))" 2>/dev/null
+        | python3 -c 'import sys,json
+try:
+    body = json.load(sys.stdin)
+    result = body.get("result") or {}
+    print(int(result.get("pending", "0x0"), 16), int(result.get("queued", "0x0"), 16))
+except Exception:
+    print("0 0")' 2>/dev/null
 }
 
 for step_params in "${STEPS[@]}"; do

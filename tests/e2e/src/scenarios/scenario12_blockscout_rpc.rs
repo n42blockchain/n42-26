@@ -195,18 +195,22 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
     let block1_hash = {
         let body =
             json!({"jsonrpc":"2.0","method":"eth_getBlockByNumber","params":["0x1",false],"id":99});
-        if let Ok(resp) = client.post(&url).json(&body).send().await {
-            if let Ok(text) = resp.text().await {
-                serde_json::from_str::<Value>(&text)
-                    .ok()
-                    .and_then(|v| v["result"]["hash"].as_str().map(String::from))
-                    .unwrap_or_else(|| zero_hash.to_string())
-            } else {
-                zero_hash.to_string()
-            }
-        } else {
-            zero_hash.to_string()
-        }
+        let resp =
+            client.post(&url).json(&body).send().await.map_err(|e| {
+                eyre::eyre!("failed to query block 1 for eth_getBlockByHash test: {e}")
+            })?;
+        let text = resp.text().await.map_err(|e| {
+            eyre::eyre!("failed to read block 1 response for eth_getBlockByHash test: {e}")
+        })?;
+        let parsed: Value = serde_json::from_str(&text).map_err(|e| {
+            eyre::eyre!("invalid JSON while reading block 1 for eth_getBlockByHash test: {e}")
+        })?;
+        parsed["result"]["hash"]
+            .as_str()
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                eyre::eyre!("block 1 response missing hash for eth_getBlockByHash test: {parsed}")
+            })?
     };
 
     check_rpc(

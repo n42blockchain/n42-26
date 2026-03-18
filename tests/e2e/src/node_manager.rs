@@ -87,6 +87,8 @@ pub struct NodeProcess {
     pub consensus_port: u16,
     pub starhub_port: u16,
     pub validator_index: usize,
+    stdout_log_path: PathBuf,
+    stderr_log_path: PathBuf,
     /// Wrapped in Option so it can be extracted for restart tests via `stop_keep_data`.
     data_dir: Option<TempDir>,
     pub rpc: RpcClient,
@@ -129,6 +131,7 @@ impl NodeProcess {
         let p2p_port = config.p2p_port();
         let consensus_port = config.consensus_port();
         let starhub_port = config.starhub_port();
+        let (stdout_log_path, stderr_log_path) = Self::log_paths(config.validator_index, http_port);
 
         let mut cmd = Command::new(&config.binary_path);
 
@@ -181,12 +184,10 @@ impl NodeProcess {
             cmd.env(key, value);
         }
 
-        let stdout_log =
-            std::fs::File::create(format!("/tmp/n42-node-{}.log", config.validator_index))
-                .unwrap_or_else(|_| std::fs::File::create("/dev/null").unwrap());
-        let stderr_log =
-            std::fs::File::create(format!("/tmp/n42-node-{}.err.log", config.validator_index))
-                .unwrap_or_else(|_| std::fs::File::create("/dev/null").unwrap());
+        let stdout_log = std::fs::File::create(&stdout_log_path)
+            .unwrap_or_else(|_| std::fs::File::create("/dev/null").unwrap());
+        let stderr_log = std::fs::File::create(&stderr_log_path)
+            .unwrap_or_else(|_| std::fs::File::create("/dev/null").unwrap());
         cmd.stdout(Stdio::from(stdout_log))
             .stderr(Stdio::from(stderr_log));
 
@@ -209,6 +210,8 @@ impl NodeProcess {
             consensus_port,
             starhub_port,
             validator_index: config.validator_index,
+            stdout_log_path,
+            stderr_log_path,
             data_dir: Some(data_dir),
             rpc,
         };
@@ -225,12 +228,12 @@ impl NodeProcess {
 
         loop {
             if start.elapsed() > timeout {
-                let stderr_tail = Self::read_stderr_tail(self.validator_index);
+                let stderr_tail = Self::read_stderr_tail(&self.stderr_log_path);
                 return Err(eyre::eyre!(
                     "node did not become ready within {} seconds\n\
-                     --- last 20 lines of /tmp/n42-node-{}.err.log ---\n{}",
+                     --- last 20 lines of {} ---\n{}",
                     timeout.as_secs(),
-                    self.validator_index,
+                    self.stderr_log_path.display(),
                     stderr_tail,
                 ));
             }
@@ -239,11 +242,11 @@ impl NodeProcess {
             // instead of waiting the full timeout.
             match self.child.try_wait() {
                 Ok(Some(status)) => {
-                    let stderr_tail = Self::read_stderr_tail(self.validator_index);
+                    let stderr_tail = Self::read_stderr_tail(&self.stderr_log_path);
                     return Err(eyre::eyre!(
                         "node process exited before becoming ready (status: {status})\n\
-                         --- last 20 lines of /tmp/n42-node-{}.err.log ---\n{}",
-                        self.validator_index,
+                         --- last 20 lines of {} ---\n{}",
+                        self.stderr_log_path.display(),
                         stderr_tail,
                     ));
                 }
@@ -273,10 +276,17 @@ impl NodeProcess {
         }
     }
 
+    fn log_paths(validator_index: usize, http_port: u16) -> (PathBuf, PathBuf) {
+        let stem = format!("/tmp/n42-node-v{validator_index}-p{http_port}");
+        (
+            PathBuf::from(format!("{stem}.log")),
+            PathBuf::from(format!("{stem}.err.log")),
+        )
+    }
+
     /// Reads the last 20 lines of the node's stderr log file for diagnostics.
-    fn read_stderr_tail(validator_index: usize) -> String {
-        let path = format!("/tmp/n42-node-{validator_index}.err.log");
-        match std::fs::read_to_string(&path) {
+    fn read_stderr_tail(path: &std::path::Path) -> String {
+        match std::fs::read_to_string(path) {
             Ok(content) => {
                 let lines: Vec<&str> = content.lines().collect();
                 let start = lines.len().saturating_sub(20);
@@ -284,6 +294,10 @@ impl NodeProcess {
             }
             Err(_) => "(stderr log not found)".to_string(),
         }
+    }
+
+    pub fn stdout_log_path(&self) -> &std::path::Path {
+        &self.stdout_log_path
     }
 
     /// Stops the node but returns the data directory for reuse in restart tests.

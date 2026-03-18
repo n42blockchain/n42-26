@@ -99,6 +99,7 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
 
     // Create standalone RPC client for node-0 (avoids borrow conflicts)
     let node0_url = format!("http://127.0.0.1:{}", 8545 + PORT_OFFSET_BASE);
+    let node0_starhub_port = 9443 + PORT_OFFSET_BASE;
     let node0_rpc = RpcClient::new(node0_url.clone());
 
     // Wait for initial blocks
@@ -146,7 +147,13 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
 
     // Start mobile fleet in background
     let mobile_duration = Duration::from_secs(120); // runs across all cases
-    let mobile_handle = tokio::spawn(run_mobile_fleet(node0_url.clone(), 7, mobile_duration, 0));
+    let mobile_handle = tokio::spawn(run_mobile_fleet(
+        node0_url.clone(),
+        node0_starhub_port,
+        7,
+        mobile_duration,
+        0,
+    ));
 
     // Send transactions for ~20s
     let case1_start = tokio::time::Instant::now();
@@ -602,8 +609,8 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
             );
             pass_count += 1;
         } else if eth_tx_hashes.is_empty() {
-            warn!("V7 PASS (no txs): no transactions were sent");
-            pass_count += 1;
+            error!("V7 FAIL: no ETH transactions were sent during chaos scenario");
+            fail_count += 1;
         } else {
             error!(
                 success_count,
@@ -624,8 +631,8 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
             );
             pass_count += 1;
         } else if mobile_stats.is_empty() {
-            warn!("V8 PASS (lenient): mobile fleet did not run");
-            pass_count += 1;
+            error!("V8 FAIL: mobile fleet did not run or returned no stats");
+            fail_count += 1;
         } else {
             error!("V8 FAIL: no mobile attestations accepted");
             fail_count += 1;

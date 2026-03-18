@@ -49,7 +49,7 @@ from eth_utils import keccak, to_checksum_address
 
 CHAIN_ID = 4242
 NUM_ACCOUNTS = 10
-DEFAULT_RPC = "http://127.0.0.1:18545"
+DEFAULT_RPC = "http://127.0.0.1:18000"
 DEFAULT_RATE = 2  # tx per second
 
 # Gas limits

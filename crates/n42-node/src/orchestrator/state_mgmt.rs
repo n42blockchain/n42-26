@@ -150,7 +150,7 @@ impl ConsensusOrchestrator {
 impl ConsensusOrchestrator {
     /// Initiates a state sync request to a connected peer.
     /// Uses deterministic peer rotation by view number to avoid always hitting the same peer.
-    pub(super) fn initiate_sync(&mut self, local_view: u64, target_view: u64) {
+    pub(super) async fn initiate_sync(&mut self, local_view: u64, target_view: u64) {
         if self.sync_in_flight {
             let timed_out = self
                 .sync_started_at
@@ -189,7 +189,7 @@ impl ConsensusOrchestrator {
             local_committed_view: local_view,
         };
 
-        if let Err(e) = self.network.request_sync(peer, request) {
+        if let Err(e) = self.network.request_sync_reliable(peer, request).await {
             error!(target: "n42::cl::sync", error = %e, "failed to send sync request");
             return;
         }
@@ -200,7 +200,7 @@ impl ConsensusOrchestrator {
 
     /// Handles an incoming sync request from a peer.
     /// Looks up committed blocks in the ring buffer and responds with up to 128 blocks.
-    pub(super) fn handle_sync_request(
+    pub(super) async fn handle_sync_request(
         &self,
         peer: PeerId,
         request_id: u64,
@@ -247,7 +247,11 @@ impl ConsensusOrchestrator {
             peer_committed_view,
         };
 
-        if let Err(e) = self.network.send_sync_response(request_id, response) {
+        if let Err(e) = self
+            .network
+            .send_sync_response_reliable(request_id, response)
+            .await
+        {
             error!(target: "n42::cl::sync", error = %e, "failed to send sync response");
         }
     }
@@ -288,6 +292,7 @@ impl ConsensusOrchestrator {
                 payload_json: sync_block.payload.clone(),
                 timestamp: 0,
                 execution_output: None,
+                leader_ready_unix_ms: 0,
             };
 
             self.import_and_notify(broadcast).await;
@@ -330,7 +335,8 @@ impl ConsensusOrchestrator {
                 peer_committed_view = response.peer_committed_view,
                 "still behind after sync, requesting more blocks"
             );
-            self.initiate_sync(local_view, response.peer_committed_view);
+            self.initiate_sync(local_view, response.peer_committed_view)
+                .await;
         }
     }
 

@@ -14,9 +14,13 @@ use reth_chainspec::{ChainSpecBuilder, EthereumHardfork, ForkCondition, MAINNET}
 use reth_ethereum_primitives::{Block, BlockBody, Receipt, Transaction};
 use reth_evm::execute::{BasicBlockExecutor, Executor};
 use reth_evm_ethereum::EthEvmConfig;
-use reth_primitives_traits::{RecoveredBlock, crypto::secp256k1::public_key_to_address};
-use reth_testing_utils::generators::{self, sign_tx_with_key_pair};
+use reth_primitives_traits::{
+    RecoveredBlock,
+    crypto::secp256k1::public_key_to_address,
+};
+use reth_testing_utils::generators::sign_tx_with_key_pair;
 use revm::{bytecode::Bytecode, database::CacheDB, state::AccountInfo};
+use secp256k1::{Keypair, Secp256k1, SecretKey};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -109,6 +113,18 @@ fn encode_transfer_call(to: Address, amount: U256) -> Bytes {
     // amount: 32 bytes big-endian
     data.extend_from_slice(&amount.to_be_bytes::<32>());
     Bytes::from(data)
+}
+
+fn test_key_pair(seed: u8) -> Keypair {
+    let secret_key = SecretKey::from_slice(&[seed; 32]).expect("test secret key should be valid");
+    let secp = Secp256k1::new();
+    Keypair::from_secret_key(&secp, &secret_key)
+}
+
+fn test_sender(seed: u8) -> (Keypair, Address) {
+    let key_pair = test_key_pair(seed);
+    let sender = public_key_to_address(key_pair.public_key());
+    (key_pair, sender)
 }
 
 /// Execute a block using ReadLogDatabase, then replay using StreamReplayDB,
@@ -226,8 +242,7 @@ fn run_pipeline_test(
 fn test_v2_pipeline_eth_transfer() {
     eprintln!("\n=== V2 Pipeline: ETH Transfer ===");
 
-    let key_pair = generators::generate_key(&mut generators::rng());
-    let sender = public_key_to_address(key_pair.public_key());
+    let (key_pair, sender) = test_sender(0x11);
     let receiver = Address::with_last_byte(0x42);
     let coinbase = Address::with_last_byte(0xFF);
 
@@ -284,8 +299,7 @@ fn test_v2_pipeline_eth_transfer() {
 fn test_v2_pipeline_erc20_transfer() {
     eprintln!("\n=== V2 Pipeline: ERC-20 Transfer ===");
 
-    let key_pair = generators::generate_key(&mut generators::rng());
-    let sender = public_key_to_address(key_pair.public_key());
+    let (key_pair, sender) = test_sender(0x12);
     let receiver = Address::with_last_byte(0x42);
     let contract = Address::with_last_byte(0xC0);
     let coinbase = Address::with_last_byte(0xFF);
@@ -361,10 +375,8 @@ fn test_v2_pipeline_erc20_transfer() {
 fn test_v2_pipeline_mixed_block() {
     eprintln!("\n=== V2 Pipeline: Mixed Block (ETH + ERC-20) ===");
 
-    let key_pair_a = generators::generate_key(&mut generators::rng());
-    let sender_a = public_key_to_address(key_pair_a.public_key());
-    let key_pair_b = generators::generate_key(&mut generators::rng());
-    let sender_b = public_key_to_address(key_pair_b.public_key());
+    let (key_pair_a, sender_a) = test_sender(0x13);
+    let (key_pair_b, sender_b) = test_sender(0x14);
 
     let receiver = Address::with_last_byte(0x42);
     let contract = Address::with_last_byte(0xC0);
@@ -665,8 +677,7 @@ fn run_full_v2_packet_test(
 fn test_v2_full_packet_eth_transfer() {
     eprintln!("\n=== Full V2 Packet: ETH Transfer ===");
 
-    let key_pair = generators::generate_key(&mut generators::rng());
-    let sender = public_key_to_address(key_pair.public_key());
+    let (key_pair, sender) = test_sender(0x21);
     let receiver = Address::with_last_byte(0x42);
     let coinbase = Address::with_last_byte(0xFF);
 
@@ -721,8 +732,7 @@ fn test_v2_full_packet_eth_transfer() {
 fn test_v2_full_packet_erc20_transfer() {
     eprintln!("\n=== Full V2 Packet: ERC-20 Transfer ===");
 
-    let key_pair = generators::generate_key(&mut generators::rng());
-    let sender = public_key_to_address(key_pair.public_key());
+    let (key_pair, sender) = test_sender(0x22);
     let receiver = Address::with_last_byte(0x42);
     let contract = Address::with_last_byte(0xC0);
     let coinbase = Address::with_last_byte(0xFF);
@@ -786,10 +796,8 @@ fn test_v2_full_packet_erc20_transfer() {
 fn test_v2_full_packet_mixed_block() {
     eprintln!("\n=== Full V2 Packet: Mixed Block (ETH + ERC-20) ===");
 
-    let key_pair_a = generators::generate_key(&mut generators::rng());
-    let sender_a = public_key_to_address(key_pair_a.public_key());
-    let key_pair_b = generators::generate_key(&mut generators::rng());
-    let sender_b = public_key_to_address(key_pair_b.public_key());
+    let (key_pair_a, sender_a) = test_sender(0x23);
+    let (key_pair_b, sender_b) = test_sender(0x24);
 
     let receiver = Address::with_last_byte(0x42);
     let contract = Address::with_last_byte(0xC0);

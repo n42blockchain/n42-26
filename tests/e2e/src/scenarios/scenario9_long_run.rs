@@ -528,17 +528,24 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
     }
 
     // === V5: ERC20 balance conservation ===
-    let final_supply = erc20.total_supply(node0_rpc).await.unwrap_or(U256::ZERO);
+    let final_supply = erc20
+        .total_supply(node0_rpc)
+        .await
+        .map_err(|e| eyre::eyre!("V5 FAIL: could not read final ERC20 total supply: {e}"))?;
     let deployer_balance = erc20
         .balance_of(node0_rpc, tx_engine.address(0))
         .await
-        .unwrap_or(U256::ZERO);
+        .map_err(|e| {
+            eyre::eyre!("V5 FAIL: could not read deployer ERC20 balance during verification: {e}")
+        })?;
     let mut recipient_total = U256::ZERO;
     for i in 1..tx_engine.wallet_count() {
-        let bal = erc20
-            .balance_of(node0_rpc, tx_engine.address(i))
-            .await
-            .unwrap_or(U256::ZERO);
+        let bal = erc20.balance_of(node0_rpc, tx_engine.address(i)).await.map_err(|e| {
+            eyre::eyre!(
+                "V5 FAIL: could not read ERC20 balance for recipient {} during verification: {e}",
+                i
+            )
+        })?;
         recipient_total += bal;
     }
     let sum = deployer_balance + recipient_total;

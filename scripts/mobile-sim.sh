@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# Mobile verification simulator for N42.
+# Mobile verification helper for N42 manual testing.
 #
-# Demonstrates the simplified RPC-based mobile verification flow:
-#   1. Subscribe to verification tasks via WebSocket
-#   2. Submit BLS attestation via HTTP RPC
+# This is a lightweight RPC/WebSocket observer and submission helper.
+# It does NOT establish the StarHub QUIC authorization session required by
+# the real end-to-end mobile attestation path. Use the real E2E/mobile
+# simulator for protocol-faithful authorization tests.
 #
 # Prerequisites: wscat (npm install -g wscat) or websocat
 #
@@ -15,8 +16,8 @@
 
 set -euo pipefail
 
-RPC_HTTP="${N42_RPC_HTTP:-http://127.0.0.1:8545}"
-RPC_WS="${N42_RPC_WS:-ws://127.0.0.1:8546}"
+RPC_HTTP="${N42_RPC_HTTP:-http://127.0.0.1:18000}"
+RPC_WS="${N42_RPC_WS:-ws://127.0.0.1:18400}"
 
 rpc_call() {
     local method="$1"
@@ -63,6 +64,7 @@ case "${1:-help}" in
             echo "  slot          - Slot/view number"
             exit 1
         fi
+        echo "Note: the verifier pubkey must already be authorized via StarHub QUIC."
         echo "Submitting attestation for block $4 at slot $5 ..."
         rpc_call "n42_submitAttestation" "[\"${2}\",\"${3}\",\"${4}\",${5}]" \
             | python3 -m json.tool 2>/dev/null \
@@ -80,8 +82,12 @@ case "${1:-help}" in
         echo "  validators                             Query validator set"
         echo "  submit <pubkey> <sig> <hash> <slot>    Submit BLS attestation"
         echo ""
+        echo "Notes:"
+        echo "  submit only works after the pubkey has been authorized via StarHub QUIC."
+        echo "  For real mobile E2E coverage, use tests/e2e or scripts/testnet.sh mobile sim."
+        echo ""
         echo "Environment:"
-        echo "  N42_RPC_HTTP   HTTP RPC endpoint (default: http://127.0.0.1:8545)"
-        echo "  N42_RPC_WS     WebSocket endpoint (default: ws://127.0.0.1:8546)"
+        echo "  N42_RPC_HTTP   HTTP RPC endpoint (default: http://127.0.0.1:18000)"
+        echo "  N42_RPC_WS     WebSocket endpoint (default: ws://127.0.0.1:18400)"
         ;;
 esac

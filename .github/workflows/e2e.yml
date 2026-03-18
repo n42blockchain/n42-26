@@ -1,4 +1,4 @@
-name: E2E Tests
+name: E2E Correctness
 
 on:
   push:
@@ -7,8 +7,8 @@ on:
     branches: [main]
 
 jobs:
-  e2e:
-    name: E2E Scenario Tests
+  checks:
+    name: Lint and Unit Tests
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -30,22 +30,44 @@ jobs:
           RUSTFLAGS: ""
 
       - name: Unit tests
-        run: cargo test --workspace --exclude e2e-test
+        run: cargo test --workspace
         env:
           RUST_LOG: error
 
-      - name: Build n42-node binary
-        run: cargo build --release -p n42-node
+  e2e:
+    name: E2E Correctness - ${{ matrix.shard.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        shard:
+          - name: smoke-consensus
+            filter: "1,3,4"
+          - name: mobile-rpc
+            filter: "5,8,12"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Build n42-node and e2e harness
+        run: cargo build --release -p n42-node-bin -p e2e-test
         env:
           RUSTFLAGS: "-C target-cpu=native"
 
-      - name: Run E2E scenarios (1-6, < 15 min total)
+      - name: Run E2E shard
         run: >
-          cargo test -p tests-e2e --
-          --test-threads=1
-          --nocapture
+          target/release/e2e-test
+          --binary target/release/n42-node
         env:
           RUST_LOG: info
-          # Only run stable/fast scenarios in CI (1-6).
-          # Scenarios 7-10 are long-running and run in the nightly workflow.
-          E2E_SCENARIO_FILTER: "1,2,3,4,5,6"
+          # PR CI only runs correctness-oriented real-bin scenarios.
+          # LAN pressure / timing-diagram scenarios stay in dedicated manual flows.
+          E2E_SCENARIO_FILTER: ${{ matrix.shard.filter }}
+          E2E_SCENARIO4_PROFILE: correctness

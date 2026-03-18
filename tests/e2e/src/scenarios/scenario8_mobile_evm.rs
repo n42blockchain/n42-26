@@ -1,5 +1,4 @@
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::Duration;
 use tracing::{info, warn};
 
@@ -13,6 +12,7 @@ use n42_primitives::BlsSecretKey;
 use crate::erc20::Erc20Manager;
 use crate::genesis::{self, TEST_CHAIN_ID};
 use crate::node_manager::{NodeConfig, NodeProcess};
+use crate::quic_test_client;
 use crate::rpc_client::RpcClient;
 use crate::tx_engine::TxEngine;
 
@@ -85,7 +85,7 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
         "mobile verifier identity created"
     );
 
-    let quic_conn = connect_to_starhub(node.starhub_port, &pubkey_bytes).await?;
+    let quic_conn = quic_test_client::connect_to_starhub(node.starhub_port, &pubkey_bytes).await?;
     info!("QUIC handshake complete — connected to StarHub");
 
     // ─── 4. Deploy ERC-20 contract + send mixed transactions ───
@@ -286,7 +286,7 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
     tokio::time::sleep(Duration::from_secs(1)).await;
 
     // Read the node log and verify receipt processing messages.
-    let log_path = "/tmp/n42-node-0.log".to_string();
+    let log_path = node.stdout_log_path().to_path_buf();
     let log_contents = std::fs::read_to_string(&log_path).unwrap_or_default();
     let receipt_log_count = log_contents
         .lines()
@@ -316,45 +316,6 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
 
     let _ = node.stop();
     Ok(())
-}
-
-// ─── QUIC client helpers ───
-
-/// Connects to the StarHub QUIC server and performs the BLS pubkey handshake.
-async fn connect_to_starhub(port: u16, pubkey: &[u8; 48]) -> eyre::Result<quinn::Connection> {
-    // Build TLS config that accepts self-signed certificates
-    let mut client_crypto = rustls::ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
-        .with_no_client_auth();
-    client_crypto.alpn_protocols = vec![b"n42-mobile/1".to_vec()];
-
-    let client_config = quinn::ClientConfig::new(Arc::new(
-        quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto)
-            .map_err(|e| eyre::eyre!("QUIC client config error: {e}"))?,
-    ));
-
-    let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse()?)?;
-    endpoint.set_default_client_config(client_config);
-
-    // Connect to StarHub
-    let addr = format!("127.0.0.1:{port}").parse()?;
-    let connection = endpoint.connect(addr, "n42-mobile")?;
-    let conn = connection.await?;
-
-    info!(
-        remote = %conn.remote_address(),
-        "QUIC connection established"
-    );
-
-    // Handshake: send 48-byte BLS public key via uni stream
-    let mut send = conn.open_uni().await?;
-    send.write_all(pubkey).await?;
-    send.finish()?;
-
-    info!("BLS pubkey handshake sent");
-
-    Ok(conn)
 }
 
 /// Receives a single VerificationPacket from the QUIC connection.
@@ -399,54 +360,4 @@ async fn send_receipt(conn: &quinn::Connection, receipt: &VerificationReceipt) -
     send.finish()?;
 
     Ok(())
-}
-
-/// Custom certificate verifier that accepts any self-signed certificate.
-/// StarHub uses rcgen-generated self-signed certs.
-#[derive(Debug)]
-struct SkipServerVerification;
-
-impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &rustls::pki_types::CertificateDer<'_>,
-        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        _server_name: &rustls::pki_types::ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        vec![
-            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
-            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
-            rustls::SignatureScheme::ED25519,
-            rustls::SignatureScheme::RSA_PSS_SHA256,
-            rustls::SignatureScheme::RSA_PSS_SHA384,
-            rustls::SignatureScheme::RSA_PSS_SHA512,
-            rustls::SignatureScheme::RSA_PKCS1_SHA256,
-            rustls::SignatureScheme::RSA_PKCS1_SHA384,
-            rustls::SignatureScheme::RSA_PKCS1_SHA512,
-        ]
-    }
 }

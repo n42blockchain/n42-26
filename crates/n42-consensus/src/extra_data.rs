@@ -50,9 +50,13 @@ mod tests {
     use bitvec::prelude::*;
     use n42_primitives::BlsSecretKey;
 
+    fn test_key(seed: u8) -> BlsSecretKey {
+        BlsSecretKey::key_gen(&[seed; 32]).expect("deterministic test key should be valid")
+    }
+
     /// Helper: create a valid QuorumCertificate with a real BLS signature.
     fn make_test_qc() -> QuorumCertificate {
-        let sk = BlsSecretKey::random().unwrap();
+        let sk = test_key(0x11);
         let sig = sk.sign(b"test");
         QuorumCertificate {
             view: 42,

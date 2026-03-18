@@ -825,6 +825,23 @@ mod tests {
     }
 
     #[test]
+    fn test_verify_block_stream_bad_transaction() {
+        use n42_execution::read_log::encode_read_log;
+        let (_, header_rlp, block_hash) = make_sealed_header();
+        let packet = StreamPacket {
+            block_hash,
+            header_rlp,
+            transactions: vec![Bytes::from(vec![0xFF, 0xFE])],
+            read_log_data: encode_read_log(&[]),
+            bytecodes: vec![],
+        };
+        let mut cache = CodeCache::new(10);
+        let chain_spec = n42_chainspec::n42_dev_chainspec();
+        let result = verify_block_stream(&packet, &mut cache, chain_spec);
+        assert!(matches!(result, Err(VerifyError::TxDecode(_))));
+    }
+
+    #[test]
     fn test_update_cache_after_stream_verify() {
         use n42_execution::read_log::encode_read_log;
         let (_, header_rlp, block_hash) = make_sealed_header();

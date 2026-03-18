@@ -7,6 +7,7 @@ use crate::consensus_state::SharedConsensusState;
 use crate::epoch_schedule::EpochSchedule;
 use crate::mobile_reward::MobileRewardManager;
 use crate::staking::StakingManager;
+use crate::tx_bridge::TxImportBatch;
 use alloy_primitives::{Address, B256};
 use metrics::{counter, gauge, histogram};
 use n42_consensus::{ConsensusEngine, EngineOutput, ValidatorSet};
@@ -27,6 +28,10 @@ use tracing::{debug, error, info, warn};
 
 /// zstd magic bytes: all zstd frames start with 0x28B52FFD.
 const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
+
+/// TX forwarding batches are latency-bounded by a 50ms flush timer, so we can
+/// use a larger batch target to reduce cross-task and cross-peer overhead.
+const TX_FORWARD_BATCH_TARGET: usize = 512;
 
 /// Compress payload JSON with zstd (level 3 — good speed/ratio tradeoff).
 pub(crate) fn compress_payload(json: &[u8]) -> Vec<u8> {
@@ -68,6 +73,10 @@ pub(crate) struct BlockDataBroadcast {
     /// None for backwards compatibility with older peers.
     #[serde(default)]
     pub(crate) execution_output: Option<Vec<u8>>,
+    /// Leader wall-clock timestamp in unix milliseconds when payload became ready
+    /// for broadcast. Used only for cross-task timing diagnostics.
+    #[serde(default)]
+    pub(crate) leader_ready_unix_ms: u64,
 }
 
 /// Serializable proxy for `(BlockExecutionOutput<Receipt>, Vec<Address>)`.
@@ -240,7 +249,7 @@ pub struct ConsensusOrchestrator {
     /// Blocks that returned `Syncing` from new_payload, queued for retry.
     /// Each entry is `(serialized_data, retry_count)` — dropped after 3 retries.
     syncing_blocks: VecDeque<(Vec<u8>, u32)>,
-    tx_import_tx: Option<mpsc::Sender<Vec<u8>>>,
+    tx_import_tx: Option<mpsc::Sender<TxImportBatch>>,
     tx_broadcast_rx: Option<mpsc::Receiver<Vec<u8>>>,
     committed_blocks: VecDeque<CommittedBlock>,
     connected_peers: HashSet<PeerId>,
@@ -258,6 +267,9 @@ pub struct ConsensusOrchestrator {
     blob_store: Option<DiskFileBlobStore>,
     /// True while a background import task is running.
     bg_import_in_flight: bool,
+    /// Hashes already queued or in-flight for background import.
+    /// Prevents duplicate Case B work for the same block.
+    bg_import_hashes: HashSet<B256>,
     /// Queue of pending imports waiting for the current bg import to finish.
     /// Entries: (serialized_block_data, block_hash, view).
     bg_import_queue: VecDeque<(Vec<u8>, B256, u64)>,
@@ -371,6 +383,7 @@ impl ConsensusOrchestrator {
             import_done_tx,
             blob_store: None,
             bg_import_in_flight: false,
+            bg_import_hashes: HashSet::new(),
             bg_import_queue: VecDeque::new(),
             eager_import_done_tx,
             eager_import_done_rx,
@@ -443,22 +456,30 @@ impl ConsensusOrchestrator {
     }
 
     pub(super) async fn enqueue_tx_import(&self, data: Vec<u8>, reason: &'static str) {
+        self.enqueue_tx_import_batch(vec![data], reason).await;
+    }
+
+    pub(super) async fn enqueue_tx_import_batch(&self, batch: TxImportBatch, reason: &'static str) {
         let Some(tx) = self.tx_import_tx.as_ref().cloned() else {
             return;
         };
 
-        match tx.try_send(data) {
+        if batch.is_empty() {
+            return;
+        }
+
+        match tx.try_send(batch) {
             Ok(()) => {}
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                 warn!(target: "n42::cl::tx", reason, "tx import channel closed");
             }
-            Err(tokio::sync::mpsc::error::TrySendError::Full(data)) => {
+            Err(tokio::sync::mpsc::error::TrySendError::Full(batch)) => {
                 warn!(
                     target: "n42::cl::tx",
                     reason,
                     "tx import channel full, waiting to enqueue"
                 );
-                if let Err(error) = tx.send(data).await {
+                if let Err(error) = tx.send(batch).await {
                     warn!(
                         target: "n42::cl::tx",
                         reason,
@@ -541,6 +562,7 @@ impl ConsensusOrchestrator {
             import_done_tx,
             blob_store: None,
             bg_import_in_flight: false,
+            bg_import_hashes: HashSet::new(),
             bg_import_queue: VecDeque::new(),
             eager_import_done_tx,
             eager_import_done_rx,
@@ -634,7 +656,7 @@ impl ConsensusOrchestrator {
 
     pub fn with_tx_pool_bridge(
         mut self,
-        tx_import_tx: mpsc::Sender<Vec<u8>>,
+        tx_import_tx: mpsc::Sender<TxImportBatch>,
         tx_broadcast_rx: mpsc::Receiver<Vec<u8>>,
     ) -> Self {
         self.tx_import_tx = Some(tx_import_tx);
@@ -739,7 +761,13 @@ impl ConsensusOrchestrator {
                 }
 
                 // === Priority 4: Block build completion ===
-                block_hash = self.block_ready_rx.recv() => {
+                block_hash = async {
+                    if self.block_ready_rx.is_closed() && self.block_ready_rx.is_empty() {
+                        std::future::pending::<Option<B256>>().await
+                    } else {
+                        self.block_ready_rx.recv().await
+                    }
+                } => {
                     if let Some(hash) = block_hash {
                         // Build succeeded — clear the parent guard immediately so future
                         // builds for the same parent (after view change) are not blocked.
@@ -780,13 +808,25 @@ impl ConsensusOrchestrator {
                 }
 
                 // === Priority 6: Import and build lifecycle ===
-                import_result = self.import_done_rx.recv() => {
+                import_result = async {
+                    if self.import_done_rx.is_closed() && self.import_done_rx.is_empty() {
+                        std::future::pending::<Option<(B256, u64, bool, u64)>>().await
+                    } else {
+                        self.import_done_rx.recv().await
+                    }
+                } => {
                     if let Some((hash, view, success, block_ts)) = import_result {
                         self.handle_import_done(hash, view, success, block_ts).await;
                     }
                 }
 
-                eager_done = self.eager_import_done_rx.recv() => {
+                eager_done = async {
+                    if self.eager_import_done_rx.is_closed() && self.eager_import_done_rx.is_empty() {
+                        std::future::pending::<Option<(B256, u64)>>().await
+                    } else {
+                        self.eager_import_done_rx.recv().await
+                    }
+                } => {
                     if let Some((hash, block_ts)) = eager_done {
                         // Pipeline: import complete — record timing.
                         if let Some(timing) = self.pipeline_timings.get_mut(&hash) {
@@ -796,13 +836,25 @@ impl ConsensusOrchestrator {
                     }
                 }
 
-                payload_data = self.leader_payload_rx.recv() => {
+                payload_data = async {
+                    if self.leader_payload_rx.is_closed() && self.leader_payload_rx.is_empty() {
+                        std::future::pending::<Option<(B256, Vec<u8>)>>().await
+                    } else {
+                        self.leader_payload_rx.recv().await
+                    }
+                } => {
                     if let Some((hash, data)) = payload_data {
                         self.handle_leader_payload_feedback(hash, data).await;
                     }
                 }
 
-                _ = self.build_complete_rx.recv() => {
+                _ = async {
+                    if self.build_complete_rx.is_closed() && self.build_complete_rx.is_empty() {
+                        std::future::pending::<Option<()>>().await
+                    } else {
+                        self.build_complete_rx.recv().await
+                    }
+                } => {
                     // Payload resolve task finished (success or failure).
                     // Clear the parent guard so future builds are not permanently blocked.
                     // On success, block_ready_rx already cleared it; this handles failure paths
@@ -858,9 +910,9 @@ impl ConsensusOrchestrator {
                     if let Some(data) = tx_data {
                         self.tx_forward_buffer.push(data);
                     }
-                    // Batch-drain up to 63 more from the channel.
+                    // Batch-drain up to the configured target before forwarding/importing.
                     if let Some(rx) = self.tx_broadcast_rx.as_mut() {
-                        for _ in 0..63 {
+                        for _ in 1..TX_FORWARD_BATCH_TARGET {
                             match rx.try_recv() {
                                 Ok(data) => { self.tx_forward_buffer.push(data); }
                                 Err(_) => break,
@@ -868,7 +920,7 @@ impl ConsensusOrchestrator {
                         }
                     }
                     // Flush if buffer is large enough.
-                    if self.tx_forward_buffer.len() >= 64 {
+                    if self.tx_forward_buffer.len() >= TX_FORWARD_BATCH_TARGET {
                         self.flush_tx_forward_buffer().await;
                     }
                 }
@@ -936,6 +988,27 @@ impl ConsensusOrchestrator {
         self.pipeline_timings.insert(hash, timing);
     }
 
+    fn trim_tx_forward_buffer(&mut self, leader_idx: u32, reason: &'static str) {
+        if self.tx_forward_buffer.len() > 4096 {
+            let excess = self.tx_forward_buffer.len() - 2048;
+            self.tx_forward_buffer.drain(..excess);
+            counter!("n42_tx_forward_dropped").increment(excess as u64);
+            warn!(
+                target: "n42::cl::orchestrator",
+                leader_idx,
+                dropped = excess,
+                buffer_len = self.tx_forward_buffer.len(),
+                reason,
+                "dropped oldest txs from forward buffer"
+            );
+        }
+    }
+
+    fn restore_failed_tx_forward_batch(&mut self, txs: Vec<Vec<u8>>, leader_idx: u32) {
+        self.tx_forward_buffer = txs;
+        self.trim_tx_forward_buffer(leader_idx, "forward send failure");
+    }
+
     /// Flush buffered txs to the current leader via the tx_forward protocol.
     async fn flush_tx_forward_buffer(&mut self) {
         if self.tx_forward_buffer.is_empty() {
@@ -954,9 +1027,8 @@ impl ConsensusOrchestrator {
             // Feed all buffered txs into local pool and return (no forwarding).
             let txs = std::mem::take(&mut self.tx_forward_buffer);
             if self.tx_import_tx.is_some() {
-                for data in txs {
-                    self.enqueue_tx_import(data, "tx forward disabled").await;
-                }
+                self.enqueue_tx_import_batch(txs, "tx forward disabled")
+                    .await;
             }
             return;
         }
@@ -969,9 +1041,8 @@ impl ConsensusOrchestrator {
             let txs = std::mem::take(&mut self.tx_forward_buffer);
             let count = txs.len();
             if self.tx_import_tx.is_some() {
-                for data in txs {
-                    self.enqueue_tx_import(data, "leader local tx import").await;
-                }
+                self.enqueue_tx_import_batch(txs, "leader local tx import")
+                    .await;
             }
             counter!("n42_tx_forward_local").increment(count as u64);
             return;
@@ -988,12 +1059,13 @@ impl ConsensusOrchestrator {
                 let txs = std::mem::take(&mut self.tx_forward_buffer);
                 let count = txs.len();
                 debug!(target: "n42::cl::orchestrator", count, leader_idx, %peer, "flushing tx forward buffer to leader");
-                match self.network.forward_tx_batch(peer, txs) {
+                match self.network.forward_tx_batch(peer, txs.clone()) {
                     Ok(()) => {
                         counter!("n42_tx_forward_batches").increment(1);
                         counter!("n42_tx_forward_txs").increment(count as u64);
                     }
                     Err(error) => {
+                        self.restore_failed_tx_forward_batch(txs, leader_idx);
                         warn!(
                             target: "n42::cl::orchestrator",
                             leader_idx,
@@ -1010,12 +1082,7 @@ impl ConsensusOrchestrator {
                 // If buffer grows too large, drop oldest to prevent memory bloat.
                 let buf_len = self.tx_forward_buffer.len();
                 warn!(target: "n42::cl::orchestrator", leader_idx, buf_len, peers = validator_peers.len(), "leader peer not found for tx forward");
-                if buf_len > 4096 {
-                    let excess = buf_len - 2048;
-                    self.tx_forward_buffer.drain(..excess);
-                    counter!("n42_tx_forward_dropped").increment(excess as u64);
-                    warn!(target: "n42::cl::orchestrator", leader_idx, "leader peer not found, dropped oldest txs from forward buffer");
-                }
+                self.trim_tx_forward_buffer(leader_idx, "leader peer not found");
             }
         }
     }
@@ -1037,7 +1104,8 @@ impl ConsensusOrchestrator {
                 if let Some(validator_index) = self.engine.authenticated_signer(message.as_ref())
                     && let Err(error) = self
                         .network
-                        .authenticate_validator_peer(source, validator_index)
+                        .authenticate_validator_peer_reliable(source, validator_index)
+                        .await
                 {
                     debug!(
                         target: "n42::cl::orchestrator",
@@ -1083,10 +1151,8 @@ impl ConsensusOrchestrator {
             NetworkEvent::TxForwardReceived { source: _, txs } => {
                 // Leader receives forwarded txs from validators — feed into local pool.
                 let count = txs.len();
-                for data in txs {
-                    self.enqueue_tx_import(data, "validator tx forward received")
-                        .await;
-                }
+                self.enqueue_tx_import_batch(txs, "validator tx forward received")
+                    .await;
                 counter!("n42_tx_forward_imported").increment(count as u64);
             }
             NetworkEvent::SyncRequest {
@@ -1094,7 +1160,7 @@ impl ConsensusOrchestrator {
                 request_id,
                 request,
             } => {
-                self.handle_sync_request(peer, request_id, request);
+                self.handle_sync_request(peer, request_id, request).await;
             }
             NetworkEvent::SyncResponse { peer, response } => {
                 self.handle_sync_response(peer, response).await;
@@ -1125,8 +1191,12 @@ mod tests {
     use n42_primitives::{BlsSecretKey, ConsensusMessage, QuorumCertificate, Vote};
     use std::time::Duration;
 
+    fn test_key(seed: u8) -> BlsSecretKey {
+        BlsSecretKey::key_gen(&[seed; 32]).expect("deterministic test key should be valid")
+    }
+
     fn make_test_engine() -> (ConsensusEngine, mpsc::Receiver<EngineOutput>) {
-        let sk = BlsSecretKey::random().unwrap();
+        let sk = test_key(0x11);
         let pk = sk.public_key();
 
         let validator_info = ValidatorInfo {
@@ -1178,7 +1248,7 @@ mod tests {
         let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
         let mut orch = ConsensusOrchestrator::new(engine, network, net_event_rx, output_rx);
 
-        let sk = BlsSecretKey::random().unwrap();
+        let sk = test_key(0x12);
         let sig = sk.sign(b"test");
         let vote = Vote {
             view: 1,
@@ -1204,7 +1274,7 @@ mod tests {
         let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
         let mut orch = ConsensusOrchestrator::new(engine, network, net_event_rx, output_rx);
 
-        let sk = BlsSecretKey::random().unwrap();
+        let sk = test_key(0x13);
         let sig = sk.sign(b"test");
         let vote = Vote {
             view: 1,
@@ -1280,12 +1350,12 @@ mod tests {
         let next_validators = vec![
             ValidatorInfo {
                 address: Address::with_last_byte(0x10),
-                bls_public_key: BlsSecretKey::random().unwrap().public_key(),
+                bls_public_key: test_key(0x20).public_key(),
                 p2p_peer_id: Some(peer0.to_string()),
             },
             ValidatorInfo {
                 address: Address::with_last_byte(0x11),
-                bls_public_key: BlsSecretKey::random().unwrap().public_key(),
+                bls_public_key: test_key(0x21).public_key(),
                 p2p_peer_id: Some(peer1.to_string()),
             },
         ];
@@ -1321,12 +1391,12 @@ mod tests {
         let next_validators = vec![
             ValidatorInfo {
                 address: Address::with_last_byte(0x20),
-                bls_public_key: BlsSecretKey::random().unwrap().public_key(),
+                bls_public_key: test_key(0x22).public_key(),
                 p2p_peer_id: None,
             },
             ValidatorInfo {
                 address: Address::with_last_byte(0x21),
-                bls_public_key: BlsSecretKey::random().unwrap().public_key(),
+                bls_public_key: test_key(0x23).public_key(),
                 p2p_peer_id: None,
             },
         ];
@@ -1435,7 +1505,25 @@ mod tests {
     }
 
     #[test]
-    fn test_sync_timeout_resets_in_flight() {
+    fn test_restore_failed_tx_forward_batch_preserves_recent_suffix() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let mut orch = ConsensusOrchestrator::new(engine, network, net_event_rx, output_rx);
+
+        let txs: Vec<Vec<u8>> = (0..5000)
+            .map(|i| vec![(i & 0xff) as u8, ((i >> 8) & 0xff) as u8])
+            .collect();
+        let expected_tail = txs[2952..].to_vec();
+
+        orch.restore_failed_tx_forward_batch(txs, 1);
+
+        assert_eq!(orch.tx_forward_buffer.len(), 2048);
+        assert_eq!(orch.tx_forward_buffer, expected_tail);
+    }
+
+    #[tokio::test]
+    async fn test_sync_timeout_resets_in_flight() {
         let (engine, output_rx) = make_test_engine();
         let (network, _cmd_rx, _prx) = make_test_network();
         let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
@@ -1445,7 +1533,7 @@ mod tests {
         orch.sync_in_flight = true;
         orch.sync_started_at = Some(Instant::now() - Duration::from_secs(60));
 
-        orch.initiate_sync(1, 10);
+        orch.initiate_sync(1, 10).await;
 
         assert!(orch.sync_in_flight, "new sync request should be in flight");
         let started = orch.sync_started_at.expect("sync_started_at should be set");

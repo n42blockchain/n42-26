@@ -94,9 +94,13 @@ impl TestHarness {
         self.engines.len()
     }
 
+    fn leader_for_view(&self, view: ViewNumber) -> usize {
+        LeaderSelector::leader_for_view(view, &self.validator_set) as usize
+    }
+
     fn run_consensus_round(&mut self, view: ViewNumber, block_hash: B256) {
         let n = self.n();
-        let leader = (view % n as u64) as usize;
+        let leader = self.leader_for_view(view);
 
         if n == 1 {
             self.engines[0]
@@ -250,7 +254,7 @@ impl TestHarness {
         participating: &[usize],
     ) -> bool {
         let n = self.n();
-        let leader = (view % n as u64) as usize;
+        let leader = self.leader_for_view(view);
 
         assert!(participating.contains(&leader), "leader must participate");
 
@@ -472,7 +476,7 @@ impl TestHarness {
         }
 
         let next_view = view + 1;
-        let next_leader = (next_view % n as u64) as usize;
+        let next_leader = self.leader_for_view(next_view);
 
         if let Some(nv) = self
             .drain_all_outputs()
@@ -580,7 +584,7 @@ mod multi_node_consensus {
     fn test_full_consensus_4v() {
         let mut harness = TestHarness::new(4);
         let view = 1u64;
-        let leader = (view % 4) as usize; // leader = 1
+        let leader = harness.leader_for_view(view);
         let block_hash = B256::repeat_byte(0xF1);
 
         // Step 1: Leader proposes
@@ -690,7 +694,7 @@ mod multi_node_consensus {
         let mut harness = TestHarness::new(7);
         // f=2, quorum=5. Only 5 out of 7 participate.
         let view = 1u64;
-        let leader = (view % 7) as usize; // leader = 1
+        let leader = harness.leader_for_view(view);
         let block_hash = B256::repeat_byte(0xF7);
         let participating: Vec<usize> = (0..5).collect(); // engines 0-4 participate
 
@@ -752,7 +756,7 @@ mod multi_node_consensus {
 
         // 8 blocks = 2 full rotation cycles
         for view in 1..=8u64 {
-            let leader = (view % 4) as usize;
+            let leader = harness.leader_for_view(view);
             let block_hash = B256::repeat_byte(view as u8);
             harness.run_consensus_round(view, block_hash);
 
@@ -766,7 +770,7 @@ mod multi_node_consensus {
         // Each validator should have been leader exactly 2 times
         let mut leader_counts = [0u32; 4];
         for &(v, _) in &harness.committed_blocks {
-            let leader = (v % 4) as usize;
+            let leader = harness.leader_for_view(v);
             leader_counts[leader] += 1;
         }
         for (i, &count) in leader_counts.iter().enumerate() {
@@ -968,7 +972,7 @@ mod fault_tolerance {
         };
 
         // Send to the leader (engine 1 for view 1)
-        let leader = (view % 4) as usize; // 1
+        let leader = harness.leader_for_view(view);
 
         // First make the leader propose so it has a vote collector
         harness.engines[leader]
@@ -998,7 +1002,7 @@ mod fault_tolerance {
     fn test_byzantine_wrong_signature() {
         let mut harness = TestHarness::new(4);
         let view = 1u64;
-        let leader = (view % 4) as usize;
+        let leader = harness.leader_for_view(view);
         let block_hash = B256::repeat_byte(0xBA);
 
         // Leader proposes
@@ -1057,7 +1061,7 @@ mod fault_tolerance {
 
         // Start fresh for this specific test
         let mut harness2 = TestHarness::new(4);
-        let leader2 = (1u64 % 4) as usize;
+        let leader2 = harness2.leader_for_view(1);
 
         harness2.engines[leader2]
             .process_event(ConsensusEvent::BlockReady(block_hash))
@@ -1115,10 +1119,10 @@ mod fault_tolerance {
     }
 
     #[test]
-    fn test_duplicate_vote_rejected() {
+    fn test_duplicate_vote_ignored() {
         let mut harness = TestHarness::new(4);
         let view = 1u64;
-        let leader = (view % 4) as usize;
+        let leader = harness.leader_for_view(view);
         let block_hash = B256::repeat_byte(0xD1);
 
         // Leader proposes
@@ -1147,19 +1151,27 @@ mod fault_tolerance {
             voter: 0,
             signature: sig,
         };
-        let result = harness.engines[leader]
-            .process_event(ConsensusEvent::Message(ConsensusMessage::Vote(dup_vote)));
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            ConsensusError::DuplicateVote {
-                view: v,
-                validator_index,
-            } => {
-                assert_eq!(v, view);
-                assert_eq!(validator_index, 0);
-            }
-            other => panic!("expected DuplicateVote, got: {:?}", other),
-        }
+        harness.engines[leader]
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Vote(dup_vote)))
+            .expect("duplicate vote delivery should be ignored");
+
+        // Another distinct vote should still reach quorum and form PrepareQC.
+        let msg = signing_message(view, &block_hash);
+        let vote = Vote {
+            view,
+            block_hash,
+            voter: 2,
+            signature: harness.secret_keys[2].sign(&msg),
+        };
+        harness.engines[leader]
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Vote(vote)))
+            .expect("distinct vote should still succeed");
+
+        let outputs = harness.drain_outputs(leader);
+        assert!(outputs.iter().any(|o| matches!(
+            o,
+            EngineOutput::BroadcastMessage(ConsensusMessage::PrepareQC(_))
+        )));
     }
 
     #[test]
@@ -1234,7 +1246,7 @@ mod fault_tolerance {
         // All engines now at view 2 with locked_qc at view 1.
         // Try to send a proposal with justify_qc.view < locked_qc.view (view 0 < view 1).
         let view = 2u64;
-        let leader = (view % 4) as usize; // 2
+        let leader = harness.leader_for_view(view);
         let block_hash = B256::repeat_byte(0x5A);
 
         let msg = signing_message(view, &block_hash);
@@ -1747,7 +1759,7 @@ mod byzantine_signature {
     fn test_byzantine_invalid_vote_signatures_7v() {
         let mut harness = TestHarness::new(7);
         let view = 1u64;
-        let leader = (view % 7) as usize; // leader = 1
+        let leader = harness.leader_for_view(view);
         let block_hash = B256::repeat_byte(0xB1);
 
         // Step 1: Leader proposes
@@ -1869,7 +1881,7 @@ mod byzantine_signature {
     fn test_byzantine_invalid_commit_vote_signatures() {
         let mut harness = TestHarness::new(4);
         let view = 1u64;
-        let leader = (view % 4) as usize; // leader = 1
+        let leader = harness.leader_for_view(view);
         let block_hash = B256::repeat_byte(0xB2);
 
         // Run through proposal + voting phase normally
@@ -2296,7 +2308,7 @@ mod twenty_one_node {
         let mut harness = TestHarness::new(21);
 
         for view in 1..=21u64 {
-            let leader = (view % 21) as usize;
+            let leader = harness.leader_for_view(view);
             assert!(
                 harness.engines[leader].is_current_leader(),
                 "view {} leader should be validator {}",
@@ -2434,7 +2446,7 @@ mod twenty_one_node {
         let mut harness = TestHarness::new(21);
         let n = 21;
         let view = 1u64;
-        let leader = (view % n as u64) as usize;
+        let leader = harness.leader_for_view(view);
         let block_hash = B256::repeat_byte(0xBB);
 
         // Step 1: Leader proposes
@@ -2713,7 +2725,7 @@ mod twenty_one_node {
 
             // Rotate which 8 nodes are "down" each round.
             // Ensure the leader for this view is always in the participating set.
-            let leader = (view % 21) as usize;
+            let leader = harness.leader_for_view(view);
 
             let participating: Vec<usize> = (0..21)
                 .filter(|&i| {
@@ -2802,7 +2814,7 @@ mod twenty_one_node {
         let mut harness = TestHarness::new(21);
         let n = 21;
         let view = 1u64;
-        let leader = (view % n as u64) as usize;
+        let leader = harness.leader_for_view(view);
         let correct_hash = B256::repeat_byte(0xAA);
         let wrong_hash = B256::repeat_byte(0x99);
 
@@ -2971,7 +2983,7 @@ mod twenty_one_node {
         // Verify every validator was leader approximately 200/21 ≈ 9-10 times
         let mut leader_counts = [0u32; 21];
         for &(v, _) in &harness.committed_blocks {
-            let leader = (v % 21) as usize;
+            let leader = harness.leader_for_view(v);
             leader_counts[leader] += 1;
         }
         for (i, &count) in leader_counts.iter().enumerate() {
@@ -2989,7 +3001,7 @@ mod twenty_one_node {
     fn test_21v_deferred_voting_behavior() {
         let mut harness = TestHarness::new(21);
         let view = 1u64;
-        let leader = (view % 21) as usize;
+        let leader = harness.leader_for_view(view);
         let block_hash = B256::repeat_byte(0xDF);
 
         // Leader proposes

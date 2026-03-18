@@ -8,7 +8,7 @@
 ## 背景
 
 审计优化后的代码在 7 节点测试网上 90K cap 测试仅跑出 ~45K TPS（avg_block_time=1.85s），
-远低于审计前同配置的 **91,214 TPS**（avg_block_time=1.0s）。
+远低于审计前同配置的 **91,214 TPS**（avg_block_time=1.0s，**Ubuntu 单机 7 节点，不是 MacBook/macOS 基线**）。
 
 ## 根因分析
 
@@ -101,11 +101,12 @@ BLOCK_ANALYSIS blocks=50 total_tx=4456500 avg_block_time="1.0s"
 ### 测试环境
 
 - 7 节点本地测试网（同一台机器）
+- 平台：**Ubuntu**（`90,949` 修复后结果和 `91,214` 审计前基线都来自 Ubuntu 单机环境，不是 MacBook）
 - N42_FAST_PROPOSE=1, N42_DEFER_STATE_ROOT=1, N42_SKIP_TX_VERIFY=1
 - N42_MAX_TXS_PER_BLOCK=90000, N42_INJECT_HIGH_WATER=90000
 - TCP 注入，5M 预签名交易，batch_size=500
 
 ## 结论
 
-Cache Hit Fast Path 成功将 TPS 从 ~45K 恢复到 **90,949**，与审计前 91,214 基本一致。
+Cache Hit Fast Path 成功将 TPS 从 ~45K 恢复到 **90,949**，与审计前 **Ubuntu 单机** 基线 `91,214` 基本一致。
 核心思路：Leader 已完整验证的区块，Follower 无需重复昂贵的后验证操作。

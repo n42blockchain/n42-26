@@ -169,8 +169,20 @@ impl Scheduler {
 
     /// Mark a transaction as validated.
     pub fn finish_validation(&self, tx_idx: TxIdx) {
-        self.status[tx_idx].store(STATUS_VALIDATED, Ordering::SeqCst);
-        self.validated_count.fetch_add(1, Ordering::SeqCst);
+        // A lower-index abort may already have invalidated this tx while its
+        // validation task was still in flight. In that case, keep the REDO
+        // marker instead of reviving the stale execution result.
+        if self.status[tx_idx]
+            .compare_exchange(
+                STATUS_EXECUTED,
+                STATUS_VALIDATED,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+        {
+            self.validated_count.fetch_add(1, Ordering::SeqCst);
+        }
         self.active_workers.fetch_sub(1, Ordering::SeqCst);
     }
 
@@ -190,27 +202,23 @@ impl Scheduler {
                 .compare_exchange(current, tx_idx, Ordering::SeqCst, Ordering::SeqCst)
                 .is_ok()
             {
-                // Decrement validated_count for txs that need re-validation.
-                let revalidate = current - tx_idx;
-                self.validated_count.fetch_sub(
-                    revalidate.min(self.validated_count.load(Ordering::SeqCst)),
-                    Ordering::SeqCst,
-                );
                 break;
             }
         }
 
         // Mark all higher-indexed executed txs as needing redo too,
         // since they might have read stale data from the aborted tx.
+        let mut invalidated_validated = 0usize;
         for i in (tx_idx + 1)..self.num_txs {
             let prev = self.status[i].load(Ordering::SeqCst);
             if prev == STATUS_EXECUTED || prev == STATUS_VALIDATED {
-                if prev == STATUS_VALIDATED {
-                    self.validated_count.fetch_sub(1, Ordering::SeqCst);
-                }
                 self.status[i].store(STATUS_REDO, Ordering::SeqCst);
+                if prev == STATUS_VALIDATED {
+                    invalidated_validated += 1;
+                }
             }
         }
+        self.decrement_validated_count(invalidated_validated);
 
         self.active_workers.fetch_sub(1, Ordering::SeqCst);
     }
@@ -218,5 +226,61 @@ impl Scheduler {
     /// Check if all transactions have been validated.
     pub fn all_done(&self) -> bool {
         self.validated_count.load(Ordering::SeqCst) >= self.num_txs
+    }
+
+    fn decrement_validated_count(&self, count: usize) {
+        if count == 0 {
+            return;
+        }
+
+        let _ = self
+            .validated_count
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                Some(current.saturating_sub(count))
+            });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn abort_and_reschedule_only_decrements_currently_validated_txs_once() {
+        let scheduler = Scheduler::new(4);
+
+        scheduler.status[0].store(STATUS_VALIDATED, Ordering::SeqCst);
+        scheduler.status[1].store(STATUS_VALIDATED, Ordering::SeqCst);
+        scheduler.status[2].store(STATUS_VALIDATED, Ordering::SeqCst);
+        scheduler.validated_count.store(3, Ordering::SeqCst);
+        scheduler.val_cursor.store(3, Ordering::SeqCst);
+        scheduler.active_workers.store(1, Ordering::SeqCst);
+
+        scheduler.abort_and_reschedule(1);
+
+        assert_eq!(scheduler.validated_count.load(Ordering::SeqCst), 1);
+        assert_eq!(scheduler.val_cursor.load(Ordering::SeqCst), 1);
+        assert_eq!(scheduler.status[1].load(Ordering::SeqCst), STATUS_REDO);
+        assert_eq!(scheduler.status[2].load(Ordering::SeqCst), STATUS_REDO);
+    }
+
+    #[test]
+    fn finish_validation_does_not_revive_a_tx_invalidated_by_lower_abort() {
+        let scheduler = Scheduler::new(4);
+
+        scheduler.status[0].store(STATUS_VALIDATED, Ordering::SeqCst);
+        scheduler.status[1].store(STATUS_EXECUTED, Ordering::SeqCst);
+        scheduler.status[2].store(STATUS_EXECUTED, Ordering::SeqCst);
+        scheduler.validated_count.store(1, Ordering::SeqCst);
+        scheduler.val_cursor.store(3, Ordering::SeqCst);
+        scheduler.active_workers.store(1, Ordering::SeqCst);
+
+        scheduler.abort_and_reschedule(1);
+
+        scheduler.active_workers.store(1, Ordering::SeqCst);
+        scheduler.finish_validation(2);
+
+        assert_eq!(scheduler.validated_count.load(Ordering::SeqCst), 1);
+        assert_eq!(scheduler.status[2].load(Ordering::SeqCst), STATUS_REDO);
     }
 }

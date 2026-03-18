@@ -405,13 +405,17 @@ mod tests {
         use alloy_primitives::Address;
         use n42_primitives::BlsSecretKey;
 
+        fn test_key(seed: u8) -> BlsSecretKey {
+            BlsSecretKey::key_gen(&[seed; 32]).expect("deterministic test key should be valid")
+        }
+
         let dir = std::env::temp_dir().join("n42-test-epoch-transition");
         let _ = std::fs::remove_dir_all(&dir);
         let path = dir.join("consensus_state.json");
 
         let validators: Vec<_> = (0..4u8)
             .map(|i| {
-                let sk = BlsSecretKey::random().expect("BLS key gen");
+                let sk = test_key(0x50 + i);
                 ValidatorInfo {
                     address: Address::with_last_byte(42 + i),
                     bls_public_key: sk.public_key(),

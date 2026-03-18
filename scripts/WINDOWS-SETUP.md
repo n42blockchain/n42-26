@@ -135,7 +135,7 @@ chmod +x scripts/testnet-21node.sh
 ### 检查区块高度
 
 ```bash
-curl -s http://127.0.0.1:18545 \
+curl -s http://127.0.0.1:18000 \
   -X POST -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}'
 # 期望：{"result":"0x5",...}  表示第 5 块
@@ -144,7 +144,7 @@ curl -s http://127.0.0.1:18545 \
 ### 检查共识状态
 
 ```bash
-curl -s http://127.0.0.1:18545 \
+curl -s http://127.0.0.1:18000 \
   -X POST -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","method":"n42_consensusStatus","params":[],"id":1}'
 ```
@@ -153,7 +153,7 @@ curl -s http://127.0.0.1:18545 \
 
 ```bash
 for i in $(seq 0 20); do
-  port=$((18545 + i))
+  port=$((18000 + i))
   bn=$(curl -s http://127.0.0.1:$port \
     -X POST -H 'Content-Type: application/json' \
     -d '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}' 2>/dev/null | \
@@ -210,16 +210,16 @@ done
 tail -50 ~/n42-testnet-data-21/validator-0.log
 
 # 常见原因：
-# 1. 端口已被占用 — lsof -i :18545
+# 1. 端口已被占用 — lsof -i :18000
 # 2. 内存不足 — free -h
 # 3. 编译的是 debug 而非 release — 确认使用 --release
 ```
 
-### 端口冲突（18545 已被占用）
+### 端口冲突（18000 已被占用）
 
 ```bash
 # 查看占用
-ss -tlnp | grep 18545
+ss -tlnp | grep 18000
 
-# 或者用另一个基础端口（修改脚本 BASE_HTTP_RPC=28545 等）
+# 或者用另一个基础端口（修改脚本 BASE_HTTP_RPC=28000 等）
 ```

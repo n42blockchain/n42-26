@@ -32,8 +32,9 @@ cargo ndk -t arm64-v8a -o mobile/android/app/src/main/jniLibs build --release -p
 
 ```bash
 # Set up the NDK toolchain
-export CC_aarch64_linux_android=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/darwin-x86_64/bin/aarch64-linux-android26-clang
-export AR_aarch64_linux_android=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/darwin-x86_64/bin/llvm-ar
+export NDK_HOST_TAG=<darwin-arm64|darwin-x86_64|linux-x86_64>
+export CC_aarch64_linux_android=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/$NDK_HOST_TAG/bin/aarch64-linux-android26-clang
+export AR_aarch64_linux_android=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/$NDK_HOST_TAG/bin/llvm-ar
 export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$CC_aarch64_linux_android
 
 cargo build --release --target aarch64-linux-android -p n42-mobile-ffi
@@ -64,4 +65,5 @@ The JNI bridge is implemented in `crates/n42-mobile-ffi/src/android.rs`:
 - Only ARM64 (arm64-v8a) is supported; most modern Android devices use ARM64
 - Minimum Android SDK: 26 (Android 8.0)
 - The `.so` file will be ~30-40MB (release build)
+- Replace `NDK_HOST_TAG` with the host prebuilt directory that exists in your NDK installation
 - `BLST_PORTABLE=1` may be needed if blst assembly causes issues on Android

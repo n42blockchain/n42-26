@@ -9,6 +9,9 @@ use tracing::{debug, info, warn};
 /// Maximum number of recently-seen transaction hashes to track for dedup.
 const RECENT_TX_CAPACITY: usize = 10_000;
 
+/// Batched network transaction import payload sent from the orchestrator.
+pub type TxImportBatch = Vec<Vec<u8>>;
+
 /// Bridges the local transaction pool with the P2P network.
 ///
 /// - **Outbound**: monitors the local pool for new transactions and sends them
@@ -19,7 +22,7 @@ const RECENT_TX_CAPACITY: usize = 10_000;
 /// Uses a FIFO dedup ring buffer (VecDeque + HashSet) to prevent echo broadcasting.
 pub struct TxPoolBridge<Pool> {
     pool: Pool,
-    import_rx: mpsc::Receiver<Vec<u8>>,
+    import_rx: mpsc::Receiver<TxImportBatch>,
     broadcast_tx: mpsc::Sender<Vec<u8>>,
     recently_imported_order: VecDeque<B256>,
     recently_imported_set: HashSet<B256>,
@@ -31,7 +34,7 @@ where
 {
     pub fn new(
         pool: Pool,
-        import_rx: mpsc::Receiver<Vec<u8>>,
+        import_rx: mpsc::Receiver<TxImportBatch>,
         broadcast_tx: mpsc::Sender<Vec<u8>>,
     ) -> Self {
         Self {
@@ -82,7 +85,7 @@ where
 
                 data = self.import_rx.recv() => {
                     match data {
-                        Some(tx_bytes) => self.handle_network_transaction(tx_bytes).await,
+                        Some(tx_batch) => self.handle_network_transactions(tx_batch).await,
                         None => {
                             info!("import channel closed, shutting down TxPoolBridge");
                             break;
@@ -93,43 +96,72 @@ where
         }
     }
 
-    async fn handle_network_transaction(&mut self, tx_bytes: Vec<u8>) {
-        let tx: TransactionSigned = match alloy_rlp::Decodable::decode(&mut tx_bytes.as_slice()) {
-            Ok(tx) => tx,
-            Err(e) => {
-                warn!(error = %e, "failed to decode network transaction");
-                return;
-            }
-        };
-
-        let tx_hash = *tx.tx_hash();
-
-        if self.pool.contains(&tx_hash) {
+    async fn handle_network_transactions(&mut self, tx_batch: TxImportBatch) {
+        if tx_batch.is_empty() {
             return;
         }
 
-        self.mark_imported(tx_hash);
+        let mut pooled_txs = Vec::with_capacity(tx_batch.len());
+        let mut tx_hashes = Vec::with_capacity(tx_batch.len());
 
-        let recovered = match tx.try_into_recovered() {
-            Ok(r) => r,
-            Err(_) => {
-                debug!(%tx_hash, "failed to recover sender from network transaction");
-                return;
+        for tx_bytes in tx_batch {
+            let tx: TransactionSigned = match alloy_rlp::Decodable::decode(&mut tx_bytes.as_slice())
+            {
+                Ok(tx) => tx,
+                Err(e) => {
+                    warn!(error = %e, "failed to decode network transaction");
+                    continue;
+                }
+            };
+
+            let tx_hash = *tx.tx_hash();
+            if self.pool.contains(&tx_hash) {
+                continue;
             }
-        };
 
-        let pooled = match EthPooledTransaction::try_from_consensus(recovered) {
-            Ok(p) => p,
-            Err(e) => {
-                debug!(error = %e, "failed to convert network transaction for pool");
-                return;
-            }
-        };
+            let recovered = match tx.try_into_recovered() {
+                Ok(r) => r,
+                Err(_) => {
+                    debug!(%tx_hash, "failed to recover sender from network transaction");
+                    continue;
+                }
+            };
 
-        match self.pool.add_external_transaction(pooled).await {
-            Ok(_) => debug!(%tx_hash, "imported network transaction into pool"),
-            Err(e) => debug!(error = %e, "failed to import network transaction"),
+            let pooled = match EthPooledTransaction::try_from_consensus(recovered) {
+                Ok(p) => p,
+                Err(e) => {
+                    debug!(%tx_hash, error = %e, "failed to convert network transaction for pool");
+                    continue;
+                }
+            };
+
+            self.mark_imported(tx_hash);
+            tx_hashes.push(tx_hash);
+            pooled_txs.push(pooled);
         }
+
+        if pooled_txs.is_empty() {
+            return;
+        }
+
+        let queued = tx_hashes.len();
+        let results = self.pool.add_external_transactions(pooled_txs).await;
+        let mut imported = 0usize;
+
+        for (tx_hash, result) in tx_hashes.into_iter().zip(results) {
+            match result {
+                Ok(_) => imported += 1,
+                Err(error) => {
+                    debug!(%tx_hash, error = %error, "failed to import network transaction")
+                }
+            }
+        }
+
+        debug!(
+            imported,
+            skipped = queued.saturating_sub(imported),
+            "processed network transaction batch"
+        );
     }
 
     fn is_recently_imported(&self, hash: &B256) -> bool {

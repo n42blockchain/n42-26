@@ -215,10 +215,14 @@ mod tests {
     use n42_primitives::BlsSecretKey;
     use tempfile::TempDir;
 
+    fn test_key(seed: u8) -> BlsSecretKey {
+        BlsSecretKey::key_gen(&[seed; 32]).expect("deterministic test key should be valid")
+    }
+
     fn make_validators(count: usize) -> Vec<ValidatorInfo> {
         (0..count)
             .map(|i| {
-                let sk = BlsSecretKey::random().unwrap();
+                let sk = test_key(0x40 + i as u8);
                 ValidatorInfo {
                     address: Address::with_last_byte(i as u8),
                     bls_public_key: sk.public_key(),

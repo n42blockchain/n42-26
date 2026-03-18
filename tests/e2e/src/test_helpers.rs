@@ -12,17 +12,37 @@ pub async fn wait_for_sync(rpc: &RpcClient, target: u64, timeout: Duration) -> e
     let start = tokio::time::Instant::now();
     let poll = Duration::from_millis(500);
     let target_min = target.saturating_sub(1);
+    let mut last_rpc_error = None;
 
     loop {
         if start.elapsed() > timeout {
-            let current = get_height_safe(rpc).await;
-            return Err(eyre::eyre!(
-                "sync timeout: current={current}, target={target}"
-            ));
+            return match rpc.block_number().await {
+                Ok(current) => {
+                    if let Some(last_rpc_error) = last_rpc_error {
+                        Err(eyre::eyre!(
+                            "sync timeout: current={current}, target={target}, last_rpc_error={last_rpc_error}"
+                        ))
+                    } else {
+                        Err(eyre::eyre!(
+                            "sync timeout: current={current}, target={target}"
+                        ))
+                    }
+                }
+                Err(err) => {
+                    let last_rpc_error = last_rpc_error.unwrap_or_else(|| format!("{err:#}"));
+                    Err(eyre::eyre!(
+                        "sync timeout: current=unknown, target={target}, last_rpc_error={last_rpc_error}"
+                    ))
+                }
+            };
         }
-        let h = get_height_safe(rpc).await;
-        if h >= target_min {
-            return Ok(());
+        match rpc.block_number().await {
+            Ok(h) => {
+                if h >= target_min {
+                    return Ok(());
+                }
+            }
+            Err(err) => last_rpc_error = Some(format!("{err:#}")),
         }
         tokio::time::sleep(poll).await;
     }
@@ -36,13 +56,16 @@ pub async fn wait_for_height_increase(
 ) -> u64 {
     let start = tokio::time::Instant::now();
     let poll = Duration::from_millis(500);
+    let mut last_height = baseline;
     loop {
-        let h = get_height_safe(rpc).await;
-        if h >= baseline + min_increase {
-            return h;
+        if let Ok(h) = rpc.block_number().await {
+            last_height = h;
+            if h >= baseline + min_increase {
+                return h;
+            }
         }
         if start.elapsed() > timeout {
-            return h;
+            return last_height;
         }
         tokio::time::sleep(poll).await;
     }

@@ -17,7 +17,8 @@ impl ConsensusEngine {
             return Ok(());
         }
 
-        let quorum_size = self.validator_set().quorum_size();
+        let commit_set = self.validator_set_for_view(decide.commit_qc.view);
+        let quorum_size = commit_set.quorum_size();
         if decide.commit_qc.signer_count() < quorum_size {
             return Err(ConsensusError::InsufficientVotes {
                 view: decide.view,
@@ -42,7 +43,7 @@ impl ConsensusEngine {
 
         // Verify CommitQC aggregate BLS signature. Without this, a Byzantine leader
         // could forge a Decide with a valid signer bitmap but invalid signature.
-        super::quorum::verify_commit_qc(&decide.commit_qc, self.validator_set())?;
+        super::quorum::verify_commit_qc(&decide.commit_qc, commit_set)?;
 
         const SYNC_GAP_THRESHOLD: u64 = 3;
         if decide.view > current_view + SYNC_GAP_THRESHOLD {

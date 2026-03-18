@@ -55,11 +55,13 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
     let mut mobile_handles = Vec::new();
     for (node_idx, node) in nodes.iter().enumerate() {
         let url = node.http_url();
+        let starhub_port = node.starhub_port;
         let start_idx = node_idx * 5;
         let dur = test_duration;
 
-        let handle =
-            tokio::spawn(async move { mobile_sim::run_mobile_fleet(url, 5, dur, start_idx).await });
+        let handle = tokio::spawn(async move {
+            mobile_sim::run_mobile_fleet(url, starhub_port, 5, dur, start_idx).await
+        });
         mobile_handles.push(handle);
     }
 

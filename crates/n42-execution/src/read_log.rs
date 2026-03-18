@@ -1,6 +1,6 @@
 //! Ordered state read log for deterministic replay.
 //!
-//! Records all first-time reads (basic, storage, block_hash) into an ordered log.
+//! Records state reads (`basic`, `storage`, `block_hash`) into an ordered log.
 //! Replaying these in the same order on mobile via `StreamReplayDB` reconstructs
 //! the exact same EVM execution without needing address/slot keys.
 //!
@@ -319,6 +319,10 @@ pub fn decode_read_log(data: &[u8]) -> Result<Vec<ReadLogEntry>, DecodeError> {
         if header == HEADER_ACCOUNT_NOT_FOUND {
             entries.push(ReadLogEntry::AccountNotFound);
         } else if header < HEADER_STORAGE_BASE {
+            if header & ACCT_EXISTS_BIT == 0 {
+                return Err(DecodeError::InvalidTag(header, pos - 1));
+            }
+
             let nonce_len = if header & ACCT_NONCE_8B_BIT != 0 {
                 8
             } else {
@@ -576,6 +580,18 @@ mod tests {
         let data = [0x01, 0x00, 0x00, 0x00, 0xD0];
         let result = decode_read_log(&data);
         assert!(matches!(result, Err(DecodeError::InvalidTag(0xD0, _))));
+    }
+
+    #[test]
+    fn test_decode_invalid_account_tag_without_exists_bit() {
+        for tag in [0x02u8, 0x10, 0x20, 0x40, 0x7Eu8] {
+            let data = [0x01, 0x00, 0x00, 0x00, tag];
+            let result = decode_read_log(&data);
+            assert!(
+                matches!(result, Err(DecodeError::InvalidTag(t, _)) if t == tag),
+                "account-like tag 0x{tag:02X} without exists bit should be rejected"
+            );
+        }
     }
 
     #[test]

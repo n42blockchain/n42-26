@@ -52,6 +52,10 @@ impl AttestationState {
 
     /// Register a new block for attestation tracking, evicting the oldest if at capacity.
     pub fn register_block(&mut self, block_hash: B256, block_number: u64) {
+        if self.blocks.contains_key(&block_hash) {
+            return;
+        }
+
         if self.blocks.len() >= self.max_blocks
             && let Some(oldest_hash) = self
                 .blocks
@@ -201,8 +205,7 @@ impl SharedConsensusState {
         self.try_load_validator_set().unwrap_or_else(|| {
             tracing::error!("validator_set unexpectedly uninitialized");
             Arc::new(
-                ValidatorSet::try_new(&[], 0)
-                    .expect("empty validator set should always be valid"),
+                ValidatorSet::try_new(&[], 0).expect("empty validator set should always be valid"),
             )
         })
     }
@@ -441,6 +444,21 @@ mod tests {
         );
         assert!(att.get_attestation_count(&h2).is_some());
         assert!(att.get_attestation_count(&h3).is_some());
+    }
+
+    #[test]
+    fn test_attestation_register_block_is_idempotent_at_capacity() {
+        let mut att = AttestationState::new(3, 2);
+        let h1 = B256::repeat_byte(0x01);
+        let h2 = B256::repeat_byte(0x02);
+
+        att.register_block(h1, 1);
+        att.register_block(h2, 2);
+        att.register_block(h2, 2);
+
+        assert_eq!(att.blocks.len(), 2);
+        assert!(att.get_attestation_count(&h1).is_some());
+        assert!(att.get_attestation_count(&h2).is_some());
     }
 
     #[test]

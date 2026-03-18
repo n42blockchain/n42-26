@@ -1,9 +1,10 @@
+use alloy_primitives::{B256, keccak256};
 use futures::StreamExt;
 use libp2p::gossipsub;
 use libp2p::swarm::SwarmEvent;
 use libp2p::{Multiaddr, PeerId, Swarm};
 use n42_primitives::ConsensusMessage;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -23,6 +24,47 @@ use crate::reconnection::ReconnectionManager;
 use crate::state_sync::{BlockSyncRequest, BlockSyncResponse};
 use crate::transport::{N42Behaviour, N42BehaviourEvent, deterministic_validator_peer_id};
 use crate::tx_forward::{TxForwardRequest, TxForwardResponse};
+
+const MAX_PENDING_RELIABLE_EVENTS: usize = 2048;
+const MAX_PENDING_DATA_EVENTS: usize = 8192;
+const RECENT_BLOCK_ANNOUNCEMENT_IDS_LIMIT: usize = 4096;
+const DEFAULT_COMMAND_SEND_TIMEOUT_MS: u64 = 50;
+
+fn command_send_timeout() -> Duration {
+    static TIMEOUT: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *TIMEOUT.get_or_init(|| {
+        Duration::from_millis(
+            std::env::var("N42_NETWORK_SEND_TIMEOUT_MS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(DEFAULT_COMMAND_SEND_TIMEOUT_MS),
+        )
+    })
+}
+
+#[derive(Default)]
+struct RecentBlockAnnouncementDedup {
+    order: VecDeque<B256>,
+    ids: HashSet<B256>,
+}
+
+impl RecentBlockAnnouncementDedup {
+    fn observe(&mut self, data: &[u8]) -> bool {
+        let id = keccak256(data);
+        if self.ids.contains(&id) {
+            return true;
+        }
+
+        self.ids.insert(id);
+        self.order.push_back(id);
+        if self.order.len() > RECENT_BLOCK_ANNOUNCEMENT_IDS_LIMIT
+            && let Some(evicted) = self.order.pop_front()
+        {
+            self.ids.remove(&evicted);
+        }
+        false
+    }
+}
 
 /// Commands sent to the network service from the node layer.
 #[derive(Debug)]
@@ -217,6 +259,33 @@ impl NetworkHandle {
         })
     }
 
+    pub async fn request_sync_reliable(
+        &self,
+        peer: PeerId,
+        request: BlockSyncRequest,
+    ) -> Result<(), NetworkError> {
+        Self::send_with_backpressure(
+            &self.command_tx,
+            NetworkCommand::RequestSync { peer, request },
+        )
+        .await
+    }
+
+    pub async fn send_sync_response_reliable(
+        &self,
+        request_id: u64,
+        response: BlockSyncResponse,
+    ) -> Result<(), NetworkError> {
+        Self::send_with_backpressure(
+            &self.command_tx,
+            NetworkCommand::SendSyncResponse {
+                request_id,
+                response,
+            },
+        )
+        .await
+    }
+
     /// Registers a peer for automatic reconnection.
     /// Trusted peers are retried indefinitely; discovered peers up to a limited count.
     pub fn register_peer(
@@ -253,11 +322,37 @@ impl NetworkHandle {
         })
     }
 
+    pub async fn authenticate_validator_peer_reliable(
+        &self,
+        peer_id: PeerId,
+        validator_index: u32,
+    ) -> Result<(), NetworkError> {
+        Self::send_with_backpressure(
+            &self.command_tx,
+            NetworkCommand::AuthenticateValidatorPeer {
+                peer_id,
+                validator_index,
+            },
+        )
+        .await
+    }
+
     pub fn replace_expected_validator_peers(
         &self,
         peers: HashMap<u32, PeerId>,
     ) -> Result<(), NetworkError> {
         self.send(NetworkCommand::ReplaceExpectedValidatorPeers { peers })
+    }
+
+    pub async fn replace_expected_validator_peers_reliable(
+        &self,
+        peers: HashMap<u32, PeerId>,
+    ) -> Result<(), NetworkError> {
+        Self::send_with_backpressure(
+            &self.command_tx,
+            NetworkCommand::ReplaceExpectedValidatorPeers { peers },
+        )
+        .await
     }
 
     pub fn add_kademlia_peer(
@@ -281,6 +376,61 @@ impl NetworkHandle {
             tokio::sync::mpsc::error::TrySendError::Full(_) => NetworkError::ChannelFull,
             tokio::sync::mpsc::error::TrySendError::Closed(_) => NetworkError::ChannelClosed,
         })
+    }
+
+    async fn send_with_backpressure(
+        tx: &mpsc::Sender<NetworkCommand>,
+        cmd: NetworkCommand,
+    ) -> Result<(), NetworkError> {
+        match tx.try_send(cmd) {
+            Ok(()) => Ok(()),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(cmd)) => {
+                match tokio::time::timeout(command_send_timeout(), tx.send(cmd)).await {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(_)) => Err(NetworkError::ChannelClosed),
+                    Err(_) => Err(NetworkError::ChannelFull),
+                }
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                Err(NetworkError::ChannelClosed)
+            }
+        }
+    }
+
+    pub async fn broadcast_consensus_reliable(
+        &self,
+        msg: ConsensusMessage,
+    ) -> Result<(), NetworkError> {
+        Self::send_with_backpressure(&self.priority_tx, NetworkCommand::BroadcastConsensus(msg))
+            .await
+    }
+
+    pub async fn send_direct_reliable(
+        &self,
+        peer: PeerId,
+        msg: ConsensusMessage,
+    ) -> Result<(), NetworkError> {
+        Self::send_with_backpressure(
+            &self.priority_tx,
+            NetworkCommand::SendDirect { peer, message: msg },
+        )
+        .await
+    }
+
+    pub async fn announce_block_reliable(&self, data: Vec<u8>) -> Result<(), NetworkError> {
+        Self::send_with_backpressure(&self.priority_tx, NetworkCommand::AnnounceBlock(data)).await
+    }
+
+    pub async fn send_block_direct_reliable(
+        &self,
+        peer: PeerId,
+        data: Vec<u8>,
+    ) -> Result<(), NetworkError> {
+        Self::send_with_backpressure(
+            &self.priority_tx,
+            NetworkCommand::SendBlockDirect { peer, data },
+        )
+        .await
     }
 }
 
@@ -321,12 +471,52 @@ pub struct NetworkService {
     reconnection: ReconnectionManager,
     /// When true, skip GossipSub tx publishing/forwarding to avoid event queue flooding.
     tx_gossip_disabled: bool,
+    /// Whether validators without explicit `p2p_peer_id` bindings may fall back
+    /// to deterministic PeerIds derived from their public validator index.
+    allow_deterministic_peer_ids: bool,
+    /// Recent block-announcement payload hashes observed across both GossipSub
+    /// and direct push. This suppresses cross-channel duplicates before they
+    /// reach the consensus/orchestrator task.
+    recent_block_announcements: RecentBlockAnnouncementDedup,
 }
 
 fn claimed_validator_index(agent_version: &str) -> Option<u32> {
     agent_version
         .strip_prefix("n42/1.0.0/v")
         .and_then(|idx| idx.parse::<u32>().ok())
+}
+
+fn expected_peer_id_for_validator(
+    expected_validator_peer_ids: &HashMap<u32, PeerId>,
+    validator_index: u32,
+    allow_deterministic_peer_ids: bool,
+) -> eyre::Result<PeerId> {
+    if let Some(peer_id) = expected_validator_peer_ids.get(&validator_index).copied() {
+        return Ok(peer_id);
+    }
+
+    if allow_deterministic_peer_ids {
+        deterministic_validator_peer_id(validator_index)
+    } else {
+        Err(eyre::eyre!(
+            "no configured expected peer id for validator index {validator_index}"
+        ))
+    }
+}
+
+fn push_bounded_backlog<T>(queue: &mut VecDeque<T>, max_len: usize, item: T, label: &'static str) {
+    if queue.len() >= max_len {
+        metrics::counter!("n42_network_event_drops_total").increment(1);
+        metrics::counter!("n42_network_backlog_overflow_total", "backlog" => label).increment(1);
+        tracing::warn!(
+            backlog = label,
+            max_len,
+            "reliable event backlog full, dropping newest event"
+        );
+        return;
+    }
+
+    queue.push_back(item);
 }
 
 impl NetworkService {
@@ -347,12 +537,13 @@ impl NetworkService {
         ),
         NetworkError,
     > {
-        Self::new_with_expected_validator_peer_ids(swarm, HashMap::new())
+        Self::new_with_expected_validator_peer_ids(swarm, HashMap::new(), true)
     }
 
     pub fn new_with_expected_validator_peer_ids(
         mut swarm: Swarm<N42Behaviour>,
         expected_validator_peer_ids: HashMap<u32, PeerId>,
+        allow_deterministic_peer_ids: bool,
     ) -> Result<
         (
             Self,
@@ -436,6 +627,8 @@ impl NetworkService {
             authenticated_peer_validator_map: HashMap::new(),
             reconnection: ReconnectionManager::new(),
             tx_gossip_disabled,
+            allow_deterministic_peer_ids,
+            recent_block_announcements: RecentBlockAnnouncementDedup::default(),
         };
 
         Ok((service, handle, consensus_event_rx, event_rx))
@@ -503,11 +696,17 @@ impl NetworkService {
                 // biased: check priority channel first each iteration.
                 biased;
 
-                cmd = self.priority_rx.recv() => {
+                cmd = async {
+                    if self.priority_rx.is_closed() && self.priority_rx.is_empty() {
+                        std::future::pending::<Option<NetworkCommand>>().await
+                    } else {
+                        self.priority_rx.recv().await
+                    }
+                } => {
                     match cmd {
                         Some(command) => self.handle_command(command),
                         None => {
-                            // Priority channel closed but normal channel may still work.
+                            tracing::debug!("priority command channel closed");
                         }
                     }
                 }
@@ -714,20 +913,11 @@ impl NetworkService {
         tracing::debug!(%peer_id, protocol = ?info.protocol_version, "identified peer");
 
         if let Some(idx) = claimed_validator_index(&info.agent_version) {
-            let expected_peer_id = self
-                .expected_validator_peer_ids
-                .get(&idx)
-                .copied()
-                .map(Ok)
-                .unwrap_or_else(|| {
-                    if self.expected_validator_peer_ids.is_empty() {
-                        deterministic_validator_peer_id(idx)
-                    } else {
-                        Err(eyre::eyre!(
-                            "no configured expected peer id for validator index {idx}"
-                        ))
-                    }
-                });
+            let expected_peer_id = expected_peer_id_for_validator(
+                &self.expected_validator_peer_ids,
+                idx,
+                self.allow_deterministic_peer_ids,
+            );
 
             match expected_peer_id {
                 Ok(expected_peer_id) if expected_peer_id == peer_id => {
@@ -807,10 +997,21 @@ impl NetworkService {
                     }
                 }
             }
-            _ if *topic == self.block_announce_topic_hash => NetworkEvent::BlockAnnouncement {
-                source,
-                data: message.data,
-            },
+            _ if *topic == self.block_announce_topic_hash => {
+                if self.observe_block_announcement(&message.data, "gossipsub") {
+                    tracing::info!(
+                        %source,
+                        dedup_source = "gossipsub",
+                        bytes = message.data.len(),
+                        "N42_DUP_BLOCK_ANNOUNCEMENT_RAW: dropped duplicate block announcement"
+                    );
+                    return;
+                }
+                NetworkEvent::BlockAnnouncement {
+                    source,
+                    data: message.data,
+                }
+            }
             _ if *topic == self.mempool_topic_hash => NetworkEvent::TransactionReceived {
                 source,
                 data: message.data,
@@ -952,14 +1153,27 @@ impl NetworkService {
                     request, channel, ..
                 } => {
                     metrics::counter!("n42_block_direct_received").increment(1);
+                    let bytes = request.data.len();
                     // Accept direct push only from peers that have already proved
                     // control of a current validator key via a signed consensus message.
                     if let Some(&validator_idx) = self.authenticated_peer_validator_map.get(&peer) {
-                        tracing::debug!(%peer, validator_index = validator_idx, bytes = request.data.len(), "received block via direct push from validator");
-                        self.emit_event(NetworkEvent::BlockAnnouncement {
-                            source: peer,
-                            data: request.data,
-                        });
+                        tracing::debug!(%peer, validator_index = validator_idx, bytes, "received block via direct push from validator");
+                        let is_duplicate =
+                            self.observe_block_announcement(&request.data, "block_direct");
+                        if is_duplicate {
+                            tracing::info!(
+                                %peer,
+                                validator_index = validator_idx,
+                                dedup_source = "block_direct",
+                                bytes,
+                                "N42_DUP_BLOCK_ANNOUNCEMENT_RAW: dropped duplicate block announcement"
+                            );
+                        } else {
+                            self.emit_event(NetworkEvent::BlockAnnouncement {
+                                source: peer,
+                                data: request.data,
+                            });
+                        }
                         if self
                             .swarm
                             .behaviour_mut()
@@ -972,10 +1186,22 @@ impl NetworkService {
                     } else {
                         tracing::warn!(
                             %peer,
-                            bytes = request.data.len(),
+                            bytes,
                             "rejected block direct push from unauthenticated peer"
                         );
                         metrics::counter!("n42_block_direct_rejected_non_validator").increment(1);
+                        metrics::counter!("n42_block_direct_rejected_non_validator_bytes_total")
+                            .increment(bytes as u64);
+                        metrics::histogram!("n42_block_direct_rejected_non_validator_bytes")
+                            .record(bytes as f64);
+                        if bytes > 1024 * 1024 {
+                            metrics::counter!("n42_block_direct_rejected_non_validator_gt_1mb")
+                                .increment(1);
+                        }
+                        if bytes > 3 * 1024 * 1024 {
+                            metrics::counter!("n42_block_direct_rejected_non_validator_gt_3mb")
+                                .increment(1);
+                        }
                         if self
                             .swarm
                             .behaviour_mut()
@@ -998,6 +1224,22 @@ impl NetworkService {
             libp2p::request_response::Event::InboundFailure { .. } => {}
             libp2p::request_response::Event::ResponseSent { .. } => {}
         }
+    }
+
+    fn observe_block_announcement(&mut self, data: &[u8], source: &'static str) -> bool {
+        let duplicate = self.recent_block_announcements.observe(data);
+        if duplicate {
+            metrics::counter!("n42_block_announcement_dup_raw_total", "source" => source)
+                .increment(1);
+            metrics::counter!(
+                "n42_block_announcement_dup_raw_bytes_total",
+                "source" => source
+            )
+            .increment(data.len() as u64);
+            metrics::histogram!("n42_block_announcement_dup_raw_bytes", "source" => source)
+                .record(data.len() as f64);
+        }
+        duplicate
     }
 
     fn handle_tx_forward_event(
@@ -1144,9 +1386,19 @@ impl NetworkService {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(event)) => {
                 if reliable_consensus {
-                    self.pending_reliable_events.push_back(event);
+                    push_bounded_backlog(
+                        &mut self.pending_reliable_events,
+                        MAX_PENDING_RELIABLE_EVENTS,
+                        event,
+                        "consensus",
+                    );
                 } else if reliable_data {
-                    self.pending_data_events.push_back(event);
+                    push_bounded_backlog(
+                        &mut self.pending_data_events,
+                        MAX_PENDING_DATA_EVENTS,
+                        event,
+                        "data",
+                    );
                 } else {
                     metrics::counter!("n42_network_event_drops_total").increment(1);
                     tracing::warn!("event channel full, dropping event");
@@ -1368,6 +1620,37 @@ mod tests {
         while prx.try_recv().is_ok() {}
     }
 
+    #[tokio::test]
+    async fn test_reliable_priority_send_waits_for_capacity() {
+        let (tx, _rx) = mpsc::channel(1);
+        let (ptx, mut prx) = mpsc::channel(1);
+        let handle = NetworkHandle::new(tx, ptx);
+
+        handle.announce_block(vec![1]).unwrap();
+
+        let drain = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let first = prx.recv().await.expect("first queued command");
+            let second = prx.recv().await.expect("reliable queued command");
+            (first, second)
+        });
+
+        handle
+            .announce_block_reliable(vec![2, 3, 4])
+            .await
+            .expect("reliable send should wait for capacity");
+
+        let (first, second) = drain.await.expect("drain task");
+        match first {
+            NetworkCommand::AnnounceBlock(data) => assert_eq!(data, vec![1]),
+            other => panic!("expected first AnnounceBlock, got {other:?}"),
+        }
+        match second {
+            NetworkCommand::AnnounceBlock(data) => assert_eq!(data, vec![2, 3, 4]),
+            other => panic!("expected second AnnounceBlock, got {other:?}"),
+        }
+    }
+
     #[test]
     fn test_handle_validator_peer_map() {
         let (handle, _rx, _prx) = test_handle();
@@ -1490,6 +1773,15 @@ mod tests {
     }
 
     #[test]
+    fn test_recent_block_announcement_dedup_drops_only_repeats() {
+        let mut dedup = RecentBlockAnnouncementDedup::default();
+        assert!(!dedup.observe(b"block-a"));
+        assert!(dedup.observe(b"block-a"));
+        assert!(!dedup.observe(b"block-b"));
+        assert!(dedup.observe(b"block-b"));
+    }
+
+    #[test]
     fn test_claimed_validator_index_parses_expected_format() {
         assert_eq!(claimed_validator_index("n42/1.0.0/v7"), Some(7));
         assert_eq!(claimed_validator_index("n42/1.0.0"), None);
@@ -1507,5 +1799,44 @@ mod tests {
             deterministic_validator_peer_id(4).expect("different validator"),
             peer_id
         );
+    }
+
+    #[test]
+    fn test_expected_peer_id_for_validator_uses_explicit_binding() {
+        let peer_id = PeerId::random();
+        let mut expected = HashMap::new();
+        expected.insert(7, peer_id);
+
+        assert_eq!(
+            expected_peer_id_for_validator(&expected, 7, false).unwrap(),
+            peer_id
+        );
+    }
+
+    #[test]
+    fn test_expected_peer_id_for_validator_respects_strict_policy() {
+        let error = expected_peer_id_for_validator(&HashMap::new(), 3, false).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("no configured expected peer id for validator index 3")
+        );
+    }
+
+    #[test]
+    fn test_expected_peer_id_for_validator_can_use_deterministic_fallback() {
+        assert_eq!(
+            expected_peer_id_for_validator(&HashMap::new(), 3, true).unwrap(),
+            deterministic_validator_peer_id(3).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_push_bounded_backlog_drops_newest_when_full() {
+        let mut queue = VecDeque::from([1, 2]);
+
+        push_bounded_backlog(&mut queue, 2, 3, "test");
+
+        assert_eq!(queue, VecDeque::from([1, 2]));
     }
 }

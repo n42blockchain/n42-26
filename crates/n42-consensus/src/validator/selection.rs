@@ -40,11 +40,15 @@ mod tests {
     use n42_chainspec::ValidatorInfo;
     use n42_primitives::BlsSecretKey;
 
-    /// Helper: create a ValidatorSet with `n` random validators.
+    fn test_key(seed: u8) -> BlsSecretKey {
+        BlsSecretKey::key_gen(&[seed; 32]).expect("deterministic test key should be valid")
+    }
+
+    /// Helper: create a ValidatorSet with `n` deterministic validators.
     fn make_validator_set(n: usize) -> ValidatorSet {
         let infos: Vec<_> = (0..n)
             .map(|i| {
-                let sk = BlsSecretKey::random().unwrap();
+                let sk = test_key(0x30 + i as u8);
                 ValidatorInfo {
                     address: Address::with_last_byte(i as u8),
                     bls_public_key: sk.public_key(),

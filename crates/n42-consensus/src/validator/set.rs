@@ -157,9 +157,13 @@ mod tests {
     use super::*;
     use n42_primitives::BlsSecretKey;
 
-    /// Helper: create a ValidatorInfo with a random BLS key and a deterministic address.
+    fn test_key(seed: u8) -> BlsSecretKey {
+        BlsSecretKey::key_gen(&[seed; 32]).expect("deterministic test key should be valid")
+    }
+
+    /// Helper: create a ValidatorInfo with a deterministic BLS key and address.
     fn make_validator_info(index: u8) -> (BlsSecretKey, ValidatorInfo) {
-        let sk = BlsSecretKey::random().unwrap();
+        let sk = test_key(0x40 + index);
         let info = ValidatorInfo {
             address: Address::with_last_byte(index),
             bls_public_key: sk.public_key(),
@@ -253,7 +257,7 @@ mod tests {
             assert_eq!(vs.index_of_public_key(&info.bls_public_key), Some(i as u32));
         }
 
-        let missing_key = BlsSecretKey::random().unwrap().public_key();
+        let missing_key = test_key(0x7F).public_key();
         assert_eq!(vs.index_of_public_key(&missing_key), None);
     }
 

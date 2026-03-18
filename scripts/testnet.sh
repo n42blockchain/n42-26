@@ -28,9 +28,6 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
-# Port allocation — no conflicts between nodes:
-#   Node i: HTTP=18545+i  WS=18645+i  Auth=18751+i  P2P=30303+i
-#           Consensus=9400+i  StarHub=9500+i  Metrics=19001+i
 # Port allocation: each range has 400-slot gap to support up to 400 nodes.
 # Range layout (for N nodes):
 #   HTTP:      18000 .. 18000+N-1
@@ -128,7 +125,7 @@ parse_args() {
                 echo "  --no-mobile-sim      Don't start mobile phone simulator"
                 echo "  --mobile-sim         Start mobile phone simulator (default)"
                 echo "  --data-dir DIR       Custom data directory (default: ~/n42-testnet-data-N)"
-                echo "  --block-interval MS  Block interval in ms (default: 4000)"
+                echo "  --block-interval MS  Block interval in ms (default: 2000)"
                 exit 0
                 ;;
             *)
@@ -751,6 +748,7 @@ start_error_monitor() {
         --data-dir "$DATA_DIR" \
         --pids "$PIDS_CSV" \
         --nodes "$NUM_VALIDATORS" \
+        --base-http-rpc "$BASE_HTTP_RPC" \
         > "$DATA_DIR/monitor.log" 2>&1 &
 
     MONITOR_PID=$!

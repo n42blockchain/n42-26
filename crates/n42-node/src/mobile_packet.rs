@@ -173,8 +173,7 @@ pub async fn mobile_packet_loop<P>(
                 }
             }
 
-            session_id = phone_connected_rx.recv() => {
-                let Some(session_id) = session_id else { continue };
+            Some(session_id) = phone_connected_rx.recv() => {
                 if previously_sent_codes.is_empty() {
                     continue;
                 }

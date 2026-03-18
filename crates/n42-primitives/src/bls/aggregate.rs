@@ -44,13 +44,17 @@ mod tests {
     use super::super::keys::BlsSecretKey;
     use super::*;
 
+    fn test_key(seed: u8) -> BlsSecretKey {
+        BlsSecretKey::key_gen(&[seed; 32]).expect("deterministic test key should be valid")
+    }
+
     #[test]
     fn test_aggregate_and_verify() {
         let message = b"consensus vote";
 
-        let sk1 = BlsSecretKey::random().unwrap();
-        let sk2 = BlsSecretKey::random().unwrap();
-        let sk3 = BlsSecretKey::random().unwrap();
+        let sk1 = test_key(0x11);
+        let sk2 = test_key(0x12);
+        let sk3 = test_key(0x13);
 
         let pk1 = sk1.public_key();
         let pk2 = sk2.public_key();
@@ -69,8 +73,8 @@ mod tests {
 
     #[test]
     fn test_aggregate_wrong_message() {
-        let sk1 = BlsSecretKey::random().unwrap();
-        let sk2 = BlsSecretKey::random().unwrap();
+        let sk1 = test_key(0x21);
+        let sk2 = test_key(0x22);
         let pk1 = sk1.public_key();
         let pk2 = sk2.public_key();
         let sig1 = sk1.sign(b"correct message");
@@ -94,7 +98,7 @@ mod tests {
     #[test]
     fn test_aggregate_single_signature() {
         let message = b"single signer";
-        let sk = BlsSecretKey::random().unwrap();
+        let sk = test_key(0x31);
         let pk = sk.public_key();
         let sig = sk.sign(message);
         let agg_sig = AggregateSignature::aggregate(&[&sig]).expect("aggregation should succeed");

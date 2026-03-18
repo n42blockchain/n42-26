@@ -118,6 +118,31 @@ impl RpcClient {
             .ok_or_else(|| eyre::eyre!("null result from {method}"))
     }
 
+    async fn call_optional<T: serde::de::DeserializeOwned>(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> eyre::Result<Option<T>> {
+        let id = self.next_id();
+        let body = json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+            "id": id,
+        });
+
+        let resp = self.client.post(&self.url).json(&body).send().await?;
+        let text = resp.text().await?;
+        let rpc_resp: JsonRpcResponse<T> = serde_json::from_str(&text)
+            .map_err(|e| eyre::eyre!("failed to parse RPC response: {e}\nraw: {text}"))?;
+
+        if let Some(err) = rpc_resp.error {
+            return Err(eyre::eyre!("{err}"));
+        }
+
+        Ok(rpc_resp.result)
+    }
+
     /// Returns the current block number.
     pub async fn block_number(&self) -> eyre::Result<u64> {
         let hex: String = self.call("eth_blockNumber", json!([])).await?;
@@ -144,11 +169,8 @@ impl RpcClient {
         &self,
         tx_hash: B256,
     ) -> eyre::Result<Option<TransactionReceipt>> {
-        let result: Option<TransactionReceipt> = self
-            .call("eth_getTransactionReceipt", json!([format!("{tx_hash:?}")]))
+        self.call_optional("eth_getTransactionReceipt", json!([format!("{tx_hash:?}")]))
             .await
-            .ok();
-        Ok(result)
     }
 
     /// Waits for a transaction receipt with polling.
@@ -159,13 +181,21 @@ impl RpcClient {
     ) -> eyre::Result<TransactionReceipt> {
         let start = tokio::time::Instant::now();
         let poll = std::time::Duration::from_millis(500);
+        let mut last_rpc_error = None;
 
         loop {
             if start.elapsed() > timeout {
+                if let Some(last_rpc_error) = last_rpc_error {
+                    return Err(eyre::eyre!(
+                        "timeout waiting for receipt of {tx_hash:?}; last_rpc_error={last_rpc_error}"
+                    ));
+                }
                 return Err(eyre::eyre!("timeout waiting for receipt of {tx_hash:?}"));
             }
-            if let Ok(Some(receipt)) = self.get_transaction_receipt(tx_hash).await {
-                return Ok(receipt);
+            match self.get_transaction_receipt(tx_hash).await {
+                Ok(Some(receipt)) => return Ok(receipt),
+                Ok(None) => {}
+                Err(err) => last_rpc_error = Some(format!("{err:#}")),
             }
             tokio::time::sleep(poll).await;
         }
@@ -264,5 +294,92 @@ impl RpcClient {
 
         let hex: String = self.call("eth_estimateGas", json!([params])).await?;
         Ok(u64::from_str_radix(hex.trim_start_matches("0x"), 16)?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    async fn spawn_rpc_server(responses: Vec<String>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            for body in responses {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 4096];
+                let _ = socket.read(&mut buf).await.unwrap();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        format!("http://{addr}")
+    }
+
+    fn receipt_response_body() -> String {
+        format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"transactionHash\":\"0x{}\",\"status\":\"0x1\",\"blockNumber\":\"0x2\",\"blockHash\":\"0x{}\",\"gasUsed\":\"0x5208\",\"cumulativeGasUsed\":\"0x5208\",\"contractAddress\":null}}}}",
+            "11".repeat(32),
+            "22".repeat(32)
+        )
+    }
+
+    #[tokio::test]
+    async fn test_get_transaction_receipt_none_for_null_result() {
+        let rpc = RpcClient::new(
+            spawn_rpc_server(vec![
+                "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":null}".to_string(),
+            ])
+            .await,
+        );
+
+        let receipt = rpc
+            .get_transaction_receipt(B256::repeat_byte(0x11))
+            .await
+            .unwrap();
+        assert!(receipt.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_get_transaction_receipt_propagates_rpc_error() {
+        let rpc = RpcClient::new(
+            spawn_rpc_server(vec![
+                "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32000,\"message\":\"boom\"}}"
+                    .to_string(),
+            ])
+            .await,
+        );
+
+        let err = rpc
+            .get_transaction_receipt(B256::repeat_byte(0x11))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("boom"));
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_receipt_retries_until_result_available() {
+        let rpc = RpcClient::new(
+            spawn_rpc_server(vec![
+                "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":null}".to_string(),
+                receipt_response_body(),
+            ])
+            .await,
+        );
+
+        let receipt = rpc
+            .wait_for_receipt(B256::repeat_byte(0x11), std::time::Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(receipt.block_number, 2);
+        assert_eq!(receipt.status, 1);
     }
 }

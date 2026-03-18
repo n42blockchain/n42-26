@@ -5,13 +5,35 @@
 
 OUTPUT="${1:-/tmp/n42-sysmon.csv}"
 DURATION="${2:-600}"
+mkdir -p "$(dirname "$OUTPUT")"
 
 echo "timestamp,cpu_user%,cpu_sys%,cpu_idle%,disk_read_KB/s,disk_write_KB/s,net_in_KB/s,net_out_KB/s,reth_rss_MB,n42_node_cpu%" > "$OUTPUT"
+
+detect_net_iface() {
+    if [ -n "${N42_SYSMON_IFACE:-}" ]; then
+        echo "$N42_SYSMON_IFACE"
+        return
+    fi
+
+    route -n get default 2>/dev/null | awk '/interface:/ {print $2; exit}'
+}
+
+NET_IFACE="$(detect_net_iface)"
+if [ -z "$NET_IFACE" ]; then
+    NET_IFACE="en0"
+fi
+
+cleanup() {
+    echo "[sysmon] Done. Output: $OUTPUT"
+}
+
+trap cleanup EXIT
+echo "[sysmon] Sampling interface=$NET_IFACE duration=${DURATION}s output=$OUTPUT"
 
 # Get initial network counters
 get_net_bytes() {
     # macOS: use netstat -ib for interface bytes
-    netstat -ib 2>/dev/null | awk '/^en0/ && !/\*/ {print $7, $10; exit}'
+    netstat -ib 2>/dev/null | awk -v iface="$NET_IFACE" '$1 == iface && !/\*/ {print $7, $10; exit}'
 }
 
 prev_net=($(get_net_bytes))
@@ -63,5 +85,3 @@ for i in $(seq 1 "$DURATION"); do
         echo "[sysmon] ${ts} cpu=${cpu_user}+${cpu_sys}% disk_r=${disk_read} disk_w=${disk_write} net_in=${net_in_kb}KB/s net_out=${net_out_kb}KB/s reth_rss=${reth_rss_mb}MB reth_cpu=${reth_cpu}%"
     fi
 done
-
-echo "[sysmon] Done. Output: $OUTPUT"

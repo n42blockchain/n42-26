@@ -1,4 +1,4 @@
-name: Nightly Long-Run Tests
+name: Nightly E2E Correctness
 
 on:
   schedule:
@@ -7,13 +7,13 @@ on:
   workflow_dispatch:
     inputs:
       scenario_filter:
-        description: "Comma-separated scenario numbers to run (default: 7,8,9,10)"
+        description: "Comma-separated correctness scenario numbers to run (default: 5,8,12)"
         required: false
-        default: "7,8,9,10"
+        default: "5,8,12"
 
 jobs:
-  long-run:
-    name: Long-Running E2E Scenarios
+  nightly-e2e:
+    name: Nightly E2E Scenarios
     runs-on: ubuntu-latest
     timeout-minutes: 90
 
@@ -31,19 +31,20 @@ jobs:
           cargo install cargo-audit --locked --quiet
           cargo audit
 
-      - name: Build n42-node binary
-        run: cargo build --release -p n42-node
+      - name: Build n42-node and e2e harness
+        run: cargo build --release -p n42-node-bin -p e2e-test
         env:
           RUSTFLAGS: "-C target-cpu=native"
 
-      - name: Run long-running E2E scenarios
+      - name: Run nightly correctness scenarios
         run: >
-          cargo test -p tests-e2e --
-          --test-threads=1
-          --nocapture
+          target/release/e2e-test
+          --binary target/release/n42-node
         env:
           RUST_LOG: info
-          # Use workflow_dispatch input if provided, otherwise default to 7,8,9,10.
-          E2E_SCENARIO_FILTER: ${{ github.event.inputs.scenario_filter || '7,8,9,10' }}
-          # Scenario 9 long-run: use 10 minutes in CI instead of production 30+ minutes.
+          # Keep nightly focused on real-bin correctness coverage.
+          # LAN pressure / timing-diagram scenarios run outside this workflow.
+          E2E_SCENARIO_FILTER: ${{ github.event.inputs.scenario_filter || '5,8,12' }}
+          E2E_SCENARIO4_PROFILE: correctness
+          # Some scenarios support shortened CI durations via env knobs.
           LONG_RUN_DURATION_SECS: "600"

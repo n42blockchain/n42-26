@@ -17,7 +17,7 @@ impl ConsensusEngine {
         if qc.view == 0 {
             return Ok(());
         }
-        super::quorum::verify_qc_any_domain(qc, self.validator_set())
+        super::quorum::verify_qc_any_domain(qc, self.validator_set_for_view(qc.view))
     }
 
     /// Handles a view timeout triggered by the pacemaker.
@@ -46,11 +46,10 @@ impl ConsensusEngine {
 
             // Check if quorum was reached while we were waiting (messages may have
             // arrived between repeats). Only the next leader can form the TC.
-            let quorum_size = self.validator_set().quorum_size();
+            let quorum_size = self.validator_set_for_view(view).quorum_size();
             let next_view = view.saturating_add(1);
-            let next_leader = LeaderSelector::leader_for_view(next_view, self.validator_set());
             if let Some(ref collector) = self.timeout_collector {
-                if collector.has_quorum(quorum_size) && next_leader == self.my_index {
+                if collector.has_quorum(quorum_size) && self.is_leader_for_view(next_view) {
                     self.try_form_tc_and_advance(view, next_view)?;
                 }
             }
@@ -73,7 +72,7 @@ impl ConsensusEngine {
         // Preserve any timeouts already collected from validators who timed out before us.
         // Unconditional replacement would discard those votes, potentially preventing
         // quorum from ever being reached (permanent stall).
-        let n_validators = self.validator_set().len();
+        let n_validators = self.validator_set_for_view(view).len();
         self.timeout_collector
             .get_or_insert_with(|| TimeoutCollector::new(view, n_validators));
 
@@ -107,7 +106,8 @@ impl ConsensusEngine {
         }
 
         // Current-view timeout processing.
-        let pk = self.validator_set().get_public_key(timeout.sender)?;
+        let view_set = self.validator_set_for_view(view);
+        let pk = view_set.get_public_key(timeout.sender)?;
         let msg = timeout_signing_message(view);
         pk.verify(&msg, &timeout.signature)
             .map_err(|_| ConsensusError::InvalidSignature {
@@ -123,10 +123,9 @@ impl ConsensusEngine {
             e
         })?;
 
-        let n_validators = self.validator_set().len();
-        let quorum_size = self.validator_set().quorum_size();
+        let n_validators = view_set.len();
+        let quorum_size = view_set.quorum_size();
         let next_view = view.saturating_add(1);
-        let next_leader = LeaderSelector::leader_for_view(next_view, self.validator_set());
 
         let collector = self
             .timeout_collector
@@ -152,7 +151,8 @@ impl ConsensusEngine {
             "received timeout"
         );
 
-        let should_form_tc = collector.has_quorum(quorum_size) && next_leader == self.my_index;
+        let should_form_tc =
+            collector.has_quorum(quorum_size) && self.is_leader_for_view(next_view);
 
         if should_form_tc {
             self.try_form_tc_and_advance(view, next_view)?;
@@ -172,7 +172,9 @@ impl ConsensusEngine {
         }
 
         // Verify BLS signature BEFORE advancing to prevent unauthenticated view jumps.
-        let pk = self.validator_set().get_public_key(timeout.sender)?;
+        let timeout_set = self.validator_set_for_view(timeout.view);
+        let n_validators = timeout_set.len();
+        let pk = timeout_set.get_public_key(timeout.sender)?;
         let msg = timeout_signing_message(timeout.view);
         pk.verify(&msg, &timeout.signature)
             .map_err(|_| ConsensusError::InvalidSignature {
@@ -206,7 +208,6 @@ impl ConsensusEngine {
 
         // Conditional creation: advance_to_view may have replayed buffered messages that
         // already created and populated a timeout_collector. Overwriting would lose those.
-        let n_validators = self.validator_set().len();
         if self
             .timeout_collector
             .as_ref()
@@ -257,7 +258,8 @@ impl ConsensusEngine {
             return Ok(());
         }
 
-        let expected_leader = LeaderSelector::leader_for_view(nv.view, self.validator_set());
+        let new_view_set = self.validator_set_for_view(nv.view);
+        let expected_leader = LeaderSelector::leader_for_view(nv.view, new_view_set);
         if nv.leader != expected_leader {
             return Err(ConsensusError::InvalidProposer {
                 view: nv.view,
@@ -267,7 +269,7 @@ impl ConsensusEngine {
         }
 
         // Verify leader's signature to prevent Byzantine nodes from forging NewView messages.
-        let pk = self.validator_set().get_public_key(nv.leader)?;
+        let pk = new_view_set.get_public_key(nv.leader)?;
         let nv_msg = newview_signing_message(nv.view);
         pk.verify(&nv_msg, &nv.signature)
             .map_err(|_| ConsensusError::InvalidSignature {
@@ -286,7 +288,10 @@ impl ConsensusEngine {
                 ),
             });
         }
-        super::quorum::verify_tc(&nv.timeout_cert, self.validator_set())?;
+        super::quorum::verify_tc(
+            &nv.timeout_cert,
+            self.validator_set_for_view(nv.timeout_cert.view),
+        )?;
 
         // Verify TC's high_qc signature to prevent injection of forged QCs.
         self.verify_embedded_qc(&nv.timeout_cert.high_qc)?;
@@ -313,7 +318,7 @@ impl ConsensusEngine {
         next_view: u64,
     ) -> ConsensusResult<()> {
         let tc = match self.timeout_collector.as_ref() {
-            Some(c) => c.build_tc(self.validator_set())?,
+            Some(c) => c.build_tc(self.validator_set_for_view(current_view))?,
             None => {
                 tracing::warn!(target: "n42::cl::timeout", view = current_view, "timeout_collector disappeared during TC formation");
                 return Ok(());
@@ -330,10 +335,16 @@ impl ConsensusEngine {
         let nv_message = newview_signing_message(next_view);
         let nv_sig = self.secret_key.sign(&nv_message);
 
+        let leader = self.local_validator_index_for_view(next_view).ok_or(
+            ConsensusError::LocalValidatorNotInSet {
+                epoch: self.epoch_manager.current_epoch() + 1,
+            },
+        )?;
+
         let new_view = NewView {
             view: next_view,
             timeout_cert: tc,
-            leader: self.my_index,
+            leader,
             signature: nv_sig,
         };
 

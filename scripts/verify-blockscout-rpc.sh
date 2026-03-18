@@ -6,13 +6,14 @@
 #   ./scripts/verify-blockscout-rpc.sh [RPC_URL] [WS_URL]
 #
 # Defaults:
-#   RPC_URL = http://127.0.0.1:8545
-#   WS_URL  = ws://127.0.0.1:8546
+#   RPC_URL = http://127.0.0.1:18000
+#   WS_URL  = ws://127.0.0.1:18400
+# Override these when targeting a single-node/dev instance on 8545/8546.
 
 set -euo pipefail
 
-RPC_URL="${1:-http://127.0.0.1:8545}"
-WS_URL="${2:-ws://127.0.0.1:8546}"
+RPC_URL="${1:-http://127.0.0.1:18000}"
+WS_URL="${2:-ws://127.0.0.1:18400}"
 
 GREEN='\033[0;32m'
 RED='\033[0;31m'

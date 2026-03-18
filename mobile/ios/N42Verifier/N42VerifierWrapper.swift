@@ -28,7 +28,7 @@ class N42VerifierWrapper: ObservableObject {
         let id = UUID()
         let blockNumber: Int64
         let blockHash: String
-        let receiptsRootMatch: Bool
+        let computedReceiptsRoot: String
         let txCount: Int
         let witnessAccounts: Int
         let verifyTimeMs: Int64
@@ -81,7 +81,7 @@ class N42VerifierWrapper: ObservableObject {
             guard let self = self else { return }
 
             let result = host.withCString { hostPtr in
-                n42_connect(ctx, hostPtr, port)
+                n42_connect(ctx, hostPtr, port, nil, 0)
             }
 
             let connected = result == 0
@@ -142,7 +142,7 @@ class N42VerifierWrapper: ObservableObject {
 
                     // Update stats
                     self.updateStats()
-                    self.updateLastBlockInfo()
+                    self.updateLastBlockInfo(success: success)
                 } else {
                     Thread.sleep(forTimeInterval: 0.1) // 100ms poll
                 }
@@ -168,7 +168,7 @@ class N42VerifierWrapper: ObservableObject {
         }
     }
 
-    private func updateLastBlockInfo() {
+    private func updateLastBlockInfo(success: Bool) {
         guard let ctx = ctx else { return }
 
         var infoBuf = [CChar](repeating: 0, count: 8192)
@@ -182,7 +182,7 @@ class N42VerifierWrapper: ObservableObject {
         let info = BlockInfo(
             blockNumber: dict["block_number"] as? Int64 ?? 0,
             blockHash: dict["block_hash"] as? String ?? "",
-            receiptsRootMatch: dict["receipts_root_match"] as? Bool ?? false,
+            computedReceiptsRoot: dict["computed_receipts_root"] as? String ?? "",
             txCount: dict["tx_count"] as? Int ?? 0,
             witnessAccounts: dict["witness_accounts"] as? Int ?? 0,
             verifyTimeMs: dict["verify_time_ms"] as? Int64 ?? 0,
@@ -191,7 +191,7 @@ class N42VerifierWrapper: ObservableObject {
 
         let entry = LogEntry(
             blockNumber: info.blockNumber,
-            success: info.receiptsRootMatch,
+            success: success,
             verifyTimeMs: info.verifyTimeMs
         )
 

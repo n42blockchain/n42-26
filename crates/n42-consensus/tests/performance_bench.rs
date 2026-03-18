@@ -213,6 +213,7 @@ impl BenchHarness {
 }
 
 #[test]
+#[ignore = "manual benchmark; excluded from routine correctness test runs"]
 fn bench_bls_operations() {
     println!("\n{}", "=".repeat(70));
     println!("  BLS Cryptographic Operations Benchmark");
@@ -285,6 +286,7 @@ fn bench_bls_operations() {
 }
 
 #[test]
+#[ignore = "manual benchmark; excluded from routine correctness test runs"]
 fn bench_bls_mobile_operations() {
     println!("\n{}", "=".repeat(70));
     println!("  BLS12-381 (Mobile) Operations Benchmark");
@@ -350,6 +352,7 @@ fn bench_bls_mobile_operations() {
 }
 
 #[test]
+#[ignore = "manual benchmark; excluded from routine correctness test runs"]
 fn bench_config_500_nodes_500_mobiles() {
     println!("\n{}", "=".repeat(70));
     println!("  Configuration A: 500 Nodes x 500 Mobiles");
@@ -451,6 +454,7 @@ fn bench_config_500_nodes_500_mobiles() {
 }
 
 #[test]
+#[ignore = "manual benchmark; excluded from routine correctness test runs"]
 fn bench_config_100_nodes_2500_mobiles() {
     println!("\n{}", "=".repeat(70));
     println!("  Configuration B: 100 Nodes x 2500 Mobiles");
@@ -552,6 +556,7 @@ fn bench_config_100_nodes_2500_mobiles() {
 }
 
 #[test]
+#[ignore = "manual benchmark; excluded from routine correctness test runs"]
 fn bench_comparative_summary() {
     println!("\n{}", "=".repeat(70));
     println!("  Comparative Performance Summary");

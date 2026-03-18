@@ -2,6 +2,7 @@ mod erc20;
 mod genesis;
 mod mobile_sim;
 mod node_manager;
+mod quic_test_client;
 mod rpc_client;
 mod scenarios;
 mod test_helpers;
@@ -62,7 +63,8 @@ async fn main() -> eyre::Result<()> {
     // Priority: --scenario CLI flag > --all flag > E2E_SCENARIO_FILTER env var > default (1).
     //
     // E2E_SCENARIO_FILTER accepts a comma-separated list of scenario numbers, e.g. "1,2,3".
-    // This is used by CI workflows to limit which scenarios run in a given job.
+    // CI uses it for correctness shards only. `--all` is intentionally broader and
+    // still includes manual / observability scenarios used for ongoing system-test evolution.
     let scenarios: Vec<u32> = if let Some(s) = cli.scenario {
         vec![s]
     } else if cli.all {
