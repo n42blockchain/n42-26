@@ -151,7 +151,10 @@ impl ZkProver for MockProver {
             proof_type: ProofType::Mock,
             prover_backend: "mock".to_string(),
             generation_ms: 0,
-            verified: true,
+            // Mock proofs are NOT cryptographically verified. Setting `verified = true`
+            // here would be misleading: callers checking this field to decide whether
+            // to trust a proof would incorrectly treat a mock proof as production-grade.
+            verified: false,
             created_at: unix_now(),
         })
     }
@@ -248,7 +251,8 @@ mod tests {
         assert_eq!(result.block_number, 42);
         assert_eq!(result.proof_type, ProofType::Mock);
         assert_eq!(result.prover_backend, "mock");
-        assert!(result.verified);
+        // Mock proofs are NOT cryptographically verified; verified=false is correct.
+        assert!(!result.verified);
         assert!(result.is_mock());
 
         let valid = prover.verify(&result).unwrap();

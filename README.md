@@ -64,6 +64,7 @@ A high-performance blockchain system combining **HotStuff-2** BFT consensus with
 - **Mobile Simulator**: `n42-mobile-sim` binary for load testing with deterministic BLS key generation
 - **libp2p GossipSub**: QUIC transport with content-based message deduplication
 - **QUIC Star-Hub**: High-concurrency mobile connections (up to 10,000 per node)
+- **Parallel EVM**: Optimistic parallel EVM execution (`n42-parallel-evm`) for higher throughput
 - **ZK Sidecar Proof System**: Asynchronous ZK proof generation with SP1 zkVM backend, phones verify proofs instead of re-executing EVM
 
 ## Project Structure
@@ -73,12 +74,14 @@ n42-26/
 ├── bin/
 │   ├── n42-node/                  # CLI entry point (reth NodeBuilder)
 │   ├── n42-stress/                # High-throughput stress testing tool
-│   └── n42-mobile-sim/            # Mobile verifier simulator for load testing
+│   ├── n42-mobile-sim/            # Mobile verifier simulator for load testing
+│   └── n42-evm-bench/             # EVM benchmarking utility
 ├── crates/
 │   ├── n42-primitives/            # BLS keys, consensus message types
 │   ├── n42-chainspec/             # Chain config, ValidatorInfo
 │   ├── n42-consensus/             # HotStuff-2 state machine + reth adapter
 │   ├── n42-execution/             # EVM config wrapper, witness & state diff
+│   ├── n42-parallel-evm/          # Optimistic parallel EVM execution
 │   ├── n42-jmt/                   # Jellyfish Merkle Tree (Blake3, 16-shard parallel)
 │   ├── n42-zkproof/               # ZK sidecar proof system (SP1 + MockProver)
 │   ├── n42-zkproof-guest/         # SP1 zkVM guest program (RISC-V ELF)
@@ -218,7 +221,7 @@ Both configurations are well within the **8-second slot target**.
 
 ### Prerequisites
 
-- Rust 1.94+
+- Rust 1.93+
 - Latest `reth` source checked out at `../reth-latest`
 - Android local builds: JDK 17 recommended for Gradle/Kotlin
 - SP1 toolchain v4.2.1 (optional, for ZK proof guest build): `curl -L https://sp1up.succinct.xyz | bash && sp1up --version v4.2.1`

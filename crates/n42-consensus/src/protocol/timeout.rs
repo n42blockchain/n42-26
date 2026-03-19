@@ -8,14 +8,26 @@ use crate::validator::LeaderSelector;
 
 impl ConsensusEngine {
     /// Verifies a QC embedded in a timeout or NewView message.
-    /// Genesis QC (view 0) is exempt — it has no real aggregate signatures.
-    /// Uses `verify_qc_any_domain` because locked_qc may be either a prepare or commit QC.
+    /// Genesis QC (view 0) is exempt only when our own locked_qc is also genesis —
+    /// i.e., the chain has just started and no real QC exists yet.
+    ///
+    /// Allowing any network message to carry a view=0 QC unconditionally would let
+    /// an attacker forge a genesis QC and use it to regress our locked_qc back to
+    /// view 0, violating HotStuff-2's safety monotonicity invariant.
     fn verify_embedded_qc(
         &self,
         qc: &n42_primitives::consensus::QuorumCertificate,
     ) -> ConsensusResult<()> {
         if qc.view == 0 {
-            return Ok(());
+            // Only accept a genesis QC if our own locked_qc is still at genesis.
+            // Once we have advanced past genesis, any incoming view=0 QC is suspicious.
+            if self.round_state.locked_qc().view == 0 {
+                return Ok(());
+            }
+            return Err(crate::error::ConsensusError::InvalidQC {
+                view: 0,
+                reason: "genesis QC rejected: local locked_qc has already advanced".to_string(),
+            });
         }
         super::quorum::verify_qc_any_domain(qc, self.validator_set_for_view(qc.view))
     }

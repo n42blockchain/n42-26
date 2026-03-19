@@ -617,7 +617,13 @@ impl ConsensusEngine {
             return Ok(false);
         }
 
-        let target_view = (qc.view + 1).max(msg_view);
+        // Jump target: prefer msg_view (authenticated via BLS signature for Timeout/Proposal/
+        // NewView messages) but cap the gap between msg_view and qc.view to limit the blast
+        // radius of a single Byzantine validator sending a far-future view with an old QC.
+        // A gap > MAX_VIEW_JUMP_GAP is implausible in normal operation and indicates either
+        // a Byzantine validator or a severely partitioned node; in both cases we clamp.
+        const MAX_VIEW_JUMP_GAP: u64 = 10_000;
+        let target_view = msg_view.min(qc.view.saturating_add(MAX_VIEW_JUMP_GAP));
         if target_view <= current_view {
             return Ok(false);
         }
@@ -761,7 +767,6 @@ impl ConsensusEngine {
 
     pub(super) fn emit(&self, output: EngineOutput) -> ConsensusResult<()> {
         const MAX_OUTPUT_SEND_RETRIES: u32 = 3;
-        const OUTPUT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(1);
 
         // Treat bounded-channel backpressure as recoverable. Only a closed channel
         // is immediately fatal to consensus.
@@ -791,9 +796,13 @@ impl ConsensusEngine {
                 let mut pending = output;
 
                 for attempt in 1..=MAX_OUTPUT_SEND_RETRIES {
-                    // Brief sleep to give the consumer a chance to drain the channel.
-                    // thread::yield_now is insufficient in async runtimes.
-                    std::thread::sleep(OUTPUT_RETRY_DELAY);
+                    // Brief sleep to give the channel consumer a chance to drain.
+                    // 500µs × 3 retries = 1.5ms max blocking per emit() call.
+                    // This is acceptable: channel backpressure is rare (capacity 64-1024),
+                    // and 1.5ms is negligible relative to the 8-second slot target.
+                    // std::thread::sleep is used deliberately here rather than tokio::time::sleep
+                    // because emit() is a sync fn; the short duration minimises worker stall.
+                    std::thread::sleep(std::time::Duration::from_micros(500));
                     match self.output_tx.try_send(pending) {
                         Ok(()) => {
                             if is_block_committed {
@@ -2566,7 +2575,11 @@ mod tests {
     }
 
     #[test]
-    fn test_on_timeout_repeat_is_noop() {
+    fn test_on_timeout_repeat_rebroadcasts() {
+        // Repeat on_timeout() calls intentionally re-broadcast the Timeout message so
+        // validators who missed the first message (network jitter, late join) can still
+        // collect our vote for TC formation. The consecutive_timeouts counter must NOT
+        // increment on repeats (pacemaker backoff should not compound).
         let (mut engine, _, _, mut rx) = make_engine(4, 0);
 
         engine.on_timeout().expect("first timeout");
@@ -2587,6 +2600,7 @@ mod tests {
         assert_eq!(broadcast_count_1, 1);
 
         engine.on_timeout().expect("repeat timeout");
+        // consecutive_timeouts must not increment on repeat (no double backoff).
         assert_eq!(engine.consecutive_timeouts(), t1);
         let mut outputs = vec![];
         while let Ok(o) = rx.try_recv() {
@@ -2601,7 +2615,8 @@ mod tests {
                 )
             })
             .count();
-        assert_eq!(broadcast_count_2, 0);
+        // Repeat timeout re-broadcasts to help late/slow validators collect our vote.
+        assert_eq!(broadcast_count_2, 1);
     }
 
     #[test]

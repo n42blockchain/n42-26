@@ -253,6 +253,14 @@ impl ConsensusEngine {
     pub(super) fn on_block_imported(&mut self, block_hash: B256) -> ConsensusResult<()> {
         if self.imported_blocks.len() < MAX_IMPORTED_BLOCKS {
             self.imported_blocks.insert(block_hash);
+        } else {
+            tracing::warn!(
+                target: "n42::cl::proposal",
+                view = self.round_state.current_view(),
+                limit = MAX_IMPORTED_BLOCKS,
+                %block_hash,
+                "imported_blocks at capacity, discarding entry (diagnostic tracking only)"
+            );
         }
         Ok(())
     }

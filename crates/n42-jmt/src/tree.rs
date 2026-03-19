@@ -32,11 +32,18 @@ pub fn encode_account_value(
 }
 
 /// Decode the code_hash field from a 72-byte account leaf value.
-/// Returns `B256::ZERO` if the value is too short (shouldn't happen with well-formed data).
+/// Returns `B256::ZERO` if the value is too short, and logs a warning so
+/// data corruption does not go unnoticed.
 pub fn decode_code_hash(value: &[u8]) -> B256 {
     if value.len() >= ACCOUNT_VALUE_LEN {
         B256::from_slice(&value[40..72])
     } else {
+        tracing::warn!(
+            target: "n42::jmt",
+            actual_len = value.len(),
+            expected_len = ACCOUNT_VALUE_LEN,
+            "decode_code_hash: account leaf value too short, returning ZERO (possible data corruption)"
+        );
         B256::ZERO
     }
 }

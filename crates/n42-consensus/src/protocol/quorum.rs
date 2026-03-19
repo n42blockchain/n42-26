@@ -90,6 +90,20 @@ impl VoteCollector {
         validator_set: &ValidatorSet,
         message: &[u8],
     ) -> ConsensusResult<QuorumCertificate> {
+        // Guard: the validator_set passed here must match the set_size this collector
+        // was created with. A mismatch (e.g. during epoch transitions) would cause
+        // bitvec index out-of-bounds panics in release builds or UB in debug builds.
+        if validator_set.len() != self.set_size {
+            return Err(ConsensusError::InvalidQC {
+                view: self.view,
+                reason: format!(
+                    "validator_set size mismatch: collector set_size={}, validator_set.len()={}",
+                    self.set_size,
+                    validator_set.len()
+                ),
+            });
+        }
+
         let quorum_size = validator_set.quorum_size();
         if self.votes.len() < quorum_size {
             return Err(ConsensusError::InsufficientVotes {

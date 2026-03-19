@@ -16,12 +16,10 @@ impl ConsensusEngine {
             });
         }
 
-        if !self.is_current_leader() {
-            return Ok(());
-        }
-
-        // Equivocation detection: a validator voting for two different blocks in the same view
-        // is Byzantine behavior.
+        // Equivocation detection runs on ALL nodes, not just the leader.
+        // A Byzantine validator voting for two different blocks in the same view
+        // is a protocol violation that every node should detect and report,
+        // regardless of whether it is currently the leader.
         if let Some(&prev_hash) = self.equivocation_tracker.get(&vote.voter) {
             if prev_hash != vote.block_hash {
                 tracing::warn!(target: "n42::cl::voting",
@@ -42,6 +40,11 @@ impl ConsensusEngine {
         } else {
             self.equivocation_tracker
                 .insert(vote.voter, vote.block_hash);
+        }
+
+        // Only the leader collects votes to form a QC.
+        if !self.is_current_leader() {
+            return Ok(());
         }
 
         // Check block hash before verification (read-only borrow of collector).

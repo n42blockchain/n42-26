@@ -87,14 +87,15 @@ impl ProofScheduler {
             return;
         }
 
-        // Skip if proof already exists for this block.
-        if self.proof_store.contains(block_number) {
-            return;
-        }
-
-        // Skip if proof generation is already in progress for this block.
+        // Check proof_store and in_progress atomically under the same lock to
+        // eliminate the TOCTOU window where two concurrent callers could both
+        // pass the `proof_store.contains` check before either inserts into
+        // `in_progress`, resulting in duplicate proof generation for the same block.
         {
             let mut in_prog = self.in_progress.lock().unwrap_or_else(|e| e.into_inner());
+            if self.proof_store.contains(block_number) {
+                return;
+            }
             if !in_prog.insert(block_number) {
                 return;
             }

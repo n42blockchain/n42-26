@@ -2996,7 +2996,8 @@ mod twenty_one_node {
         }
     }
 
-    /// Verify deferred voting: non-leader should NOT emit vote until BlockImported.
+    /// Verify optimistic voting: non-leader emits vote immediately after Proposal validation,
+    /// without waiting for BlockImported. This eliminates the ~300-500ms vote delay.
     #[test]
     fn test_21v_deferred_voting_behavior() {
         let mut harness = TestHarness::new(21);
@@ -3025,7 +3026,7 @@ mod twenty_one_node {
             .process_event(ConsensusEvent::Message(proposal))
             .expect("should accept Proposal");
 
-        // Check: NO vote yet (deferred voting)
+        // With Optimistic Voting, vote is emitted immediately after Proposal validation.
         let outputs = harness.drain_outputs(0);
         let has_vote = outputs.iter().any(|o| {
             matches!(
@@ -3034,22 +3035,25 @@ mod twenty_one_node {
             )
         });
         assert!(
-            !has_vote,
-            "non-leader should NOT emit vote before BlockImported"
+            has_vote,
+            "non-leader should emit vote immediately after Proposal (optimistic voting)"
         );
 
-        // Now send BlockImported → vote should be emitted
+        // BlockImported after the fact should NOT produce a duplicate vote.
         harness.engines[0]
             .process_event(ConsensusEvent::BlockImported(block_hash))
             .expect("should accept BlockImported");
 
         let outputs = harness.drain_outputs(0);
-        let has_vote = outputs.iter().any(|o| {
+        let has_duplicate_vote = outputs.iter().any(|o| {
             matches!(
                 o,
                 EngineOutput::SendToValidator(_, ConsensusMessage::Vote(_))
             )
         });
-        assert!(has_vote, "non-leader should emit vote after BlockImported");
+        assert!(
+            !has_duplicate_vote,
+            "non-leader should NOT emit a second vote after BlockImported (already voted)"
+        );
     }
 }

@@ -175,7 +175,19 @@ impl EpochManager {
             return set;
         }
 
-        // Fallback to current set (best effort for very old QCs)
+        // Historical set unavailable (epoch too old, beyond MAX_HISTORICAL_EPOCHS).
+        // Log a warning so operators can detect sync/verification issues.
+        // Falling back to current_set is a best-effort measure; callers that need
+        // strict correctness should treat this as an error.
+        tracing::warn!(
+            target: "n42::cl::epoch",
+            view,
+            epoch,
+            current_epoch = self.current_epoch,
+            max_historical = MAX_HISTORICAL_EPOCHS,
+            "validator set for epoch not in history (too old); falling back to current set — \
+             QC verification for this view may be incorrect"
+        );
         &self.current_set
     }
 

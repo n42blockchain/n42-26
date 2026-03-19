@@ -78,7 +78,8 @@ async fn test_full_proof_lifecycle() {
             .unwrap_or_else(|| panic!("missing proof for block {block}"));
         assert_eq!(proof.block_number, block);
         assert_eq!(proof.proof_type, ProofType::Mock);
-        assert!(proof.verified);
+        // Mock proofs are not cryptographically verified; verified=false is correct.
+        assert!(!proof.verified);
 
         // Verify the proof using the prover.
         let valid = prover.verify(&proof).unwrap();
@@ -171,7 +172,8 @@ fn test_proof_result_storage_roundtrip() {
     assert_eq!(restored.public_values, result.public_values);
     assert_eq!(restored.proof_type, result.proof_type);
     assert_eq!(restored.prover_backend, result.prover_backend);
-    assert!(restored.verified);
+    // Mock proofs are not cryptographically verified; verified=false is correct.
+    assert!(!restored.verified);
 
     // Verify the restored proof.
     assert!(prover.verify(&restored).unwrap());

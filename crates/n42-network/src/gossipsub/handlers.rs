@@ -21,9 +21,12 @@ pub fn encode_consensus_message(msg: &ConsensusMessage) -> Result<Vec<u8>, Netwo
 
 /// Decodes a versioned consensus message from GossipSub bytes.
 ///
-/// Rejects payloads exceeding 4MB to prevent OOM. Falls back to bare
-/// `ConsensusMessage` deserialization for backward compatibility with
-/// pre-versioned nodes.
+/// Rejects payloads exceeding 4MB to prevent OOM. The fallback to bare
+/// `ConsensusMessage` deserialization has been intentionally removed:
+/// accepting unversioned messages allows a downgrade attack where a
+/// malicious peer sends pre-versioned (unversioned) messages that bypass
+/// the version check entirely. During rolling upgrades, nodes should be
+/// upgraded before the version is bumped.
 pub fn decode_consensus_message(data: &[u8]) -> Result<ConsensusMessage, NetworkError> {
     if data.len() > MAX_CONSENSUS_MSG_SIZE {
         return Err(NetworkError::Codec(format!(
@@ -33,22 +36,17 @@ pub fn decode_consensus_message(data: &[u8]) -> Result<ConsensusMessage, Network
         )));
     }
 
-    match bincode::deserialize::<VersionedMessage>(data) {
-        Ok(versioned) => {
-            if versioned.version != CONSENSUS_PROTOCOL_VERSION {
-                return Err(NetworkError::Codec(format!(
-                    "unsupported protocol version: got {}, expected {}",
-                    versioned.version, CONSENSUS_PROTOCOL_VERSION,
-                )));
-            }
-            Ok(versioned.message)
-        }
-        Err(_) => {
-            // Fallback for pre-versioned nodes during rolling upgrades.
-            bincode::deserialize::<ConsensusMessage>(data)
-                .map_err(|e| NetworkError::Codec(e.to_string()))
-        }
+    let versioned = bincode::deserialize::<VersionedMessage>(data)
+        .map_err(|e| NetworkError::Codec(e.to_string()))?;
+
+    if versioned.version != CONSENSUS_PROTOCOL_VERSION {
+        return Err(NetworkError::Codec(format!(
+            "unsupported protocol version: got {}, expected {}",
+            versioned.version, CONSENSUS_PROTOCOL_VERSION,
+        )));
     }
+
+    Ok(versioned.message)
 }
 
 /// Generates a unique message ID for GossipSub deduplication.
