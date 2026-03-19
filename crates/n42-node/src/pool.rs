@@ -178,18 +178,9 @@ fn idc_pool_config(base: &PoolConfig) -> PoolConfig {
             );
         }
         PoolConfig {
-            pending_limit: SubPoolLimit {
-                max_txs,
-                max_size,
-            },
-            basefee_limit: SubPoolLimit {
-                max_txs,
-                max_size,
-            },
-            queued_limit: SubPoolLimit {
-                max_txs,
-                max_size,
-            },
+            pending_limit: SubPoolLimit { max_txs, max_size },
+            basefee_limit: SubPoolLimit { max_txs, max_size },
+            queued_limit: SubPoolLimit { max_txs, max_size },
             blob_limit: SubPoolLimit {
                 max_txs: 256,
                 max_size: 50 * 1024 * 1024,

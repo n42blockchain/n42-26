@@ -14,10 +14,7 @@ use reth_chainspec::{ChainSpecBuilder, EthereumHardfork, ForkCondition, MAINNET}
 use reth_ethereum_primitives::{Block, BlockBody, Receipt, Transaction};
 use reth_evm::execute::{BasicBlockExecutor, Executor};
 use reth_evm_ethereum::EthEvmConfig;
-use reth_primitives_traits::{
-    RecoveredBlock,
-    crypto::secp256k1::public_key_to_address,
-};
+use reth_primitives_traits::{RecoveredBlock, crypto::secp256k1::public_key_to_address};
 use reth_testing_utils::generators::sign_tx_with_key_pair;
 use revm::{bytecode::Bytecode, database::CacheDB, state::AccountInfo};
 use secp256k1::{Keypair, Secp256k1, SecretKey};

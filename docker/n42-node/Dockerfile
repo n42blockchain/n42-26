@@ -1,10 +1,10 @@
 # N42 Node — Multi-stage Docker build
 #
-# Build context must include both n42-26/ and reth/ directories.
+# Build context must include both n42-26/ and reth-latest/ directories.
 # Usage: docker build -t n42-node -f docker/n42-node/Dockerfile ../../..
 
 # ── Build stage ──
-FROM rust:1.82-bookworm AS builder
+FROM rust:1.93-bookworm AS builder
 
 WORKDIR /build
 
@@ -12,8 +12,8 @@ WORKDIR /build
 RUN apt-get update && apt-get install -y cmake clang libclang-dev pkg-config libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy reth dependency first (changes less frequently → better layer caching)
-COPY reth/ /build/reth/
+# Copy patched reth dependency first (changes less frequently → better layer caching)
+COPY reth-latest/ /build/reth-latest/
 
 # Copy n42 workspace
 COPY n42-26/Cargo.toml n42-26/Cargo.lock /build/n42-26/

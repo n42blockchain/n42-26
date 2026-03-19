@@ -19,24 +19,43 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: n42-26
+
+      - uses: actions/checkout@v4
+        with:
+          repository: paradigmxyz/reth
+          ref: ae2c916f6106b31ecbe715663abe183507786480
+          path: reth-latest
 
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
+          workspaces: |
+            n42-26 -> target
+
+      - name: Prepare patched reth
+        working-directory: reth-latest
+        run: |
+          git apply --check ../n42-26/reth-n42.patch
+          git apply ../n42-26/reth-n42.patch
 
       - name: Security audit
+        working-directory: n42-26
         run: |
           cargo install cargo-audit --locked --quiet
           cargo audit
 
       - name: Build n42-node and e2e harness
+        working-directory: n42-26
         run: cargo build --release -p n42-node-bin -p e2e-test
         env:
           RUSTFLAGS: "-C target-cpu=native"
 
       - name: Run nightly correctness scenarios
+        working-directory: n42-26
         run: >
           target/release/e2e-test
           --binary target/release/n42-node

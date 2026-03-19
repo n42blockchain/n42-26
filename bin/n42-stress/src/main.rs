@@ -664,59 +664,149 @@ struct IngestAck {
     credit_available: u64,
 }
 
-fn ingest_credit_probe_enabled() -> bool {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IngestAckMode {
+    Unknown,
+    Legacy,
+    Extended,
+    CreditProbe,
+}
+
+impl IngestAckMode {
+    fn has_consumed_field(self) -> bool {
+        !matches!(self, Self::Legacy)
+    }
+
+    fn supports_credit_probe(self) -> bool {
+        matches!(self, Self::CreditProbe)
+    }
+}
+
+fn ingest_credit_probe_requested() -> bool {
     matches!(
         std::env::var("N42_INGEST_CREDIT_PROBE").ok().as_deref(),
         Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES")
     )
 }
 
-fn ingest_extended_ack_enabled() -> bool {
-    ingest_credit_probe_enabled()
-        || matches!(
-            std::env::var("N42_INGEST_EXTENDED_ACK").ok().as_deref(),
-            Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES")
-        )
+fn ingest_extended_ack_requested() -> bool {
+    matches!(
+        std::env::var("N42_INGEST_EXTENDED_ACK").ok().as_deref(),
+        Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES")
+    )
+}
+
+fn decode_ingest_ack(base: [u8; 8], extra: Option<[u8; 4]>, credit: Option<[u8; 4]>) -> IngestAck {
+    IngestAck {
+        accepted: u32::from_le_bytes(base[0..4].try_into().unwrap()) as u64,
+        pool_pending: u32::from_le_bytes(base[4..8].try_into().unwrap()) as u64,
+        consumed: extra
+            .map(|buf| u32::from_le_bytes(buf) as u64)
+            .unwrap_or_default(),
+        credit_available: credit
+            .map(|buf| u32::from_le_bytes(buf) as u64)
+            .unwrap_or_default(),
+    }
+}
+
+async fn try_read_ack_suffix<const N: usize>(
+    stream: &mut TcpStream,
+    timeout_ms: u64,
+) -> std::io::Result<Option<[u8; N]>> {
+    let mut buf = [0u8; N];
+    match tokio::time::timeout(
+        Duration::from_millis(timeout_ms),
+        stream.read_exact(&mut buf),
+    )
+    .await
+    {
+        Ok(Ok(_)) => Ok(Some(buf)),
+        Ok(Err(err)) => Err(err),
+        Err(_) => Ok(None),
+    }
+}
+
+async fn detect_ingest_ack_mode(
+    stream: &mut TcpStream,
+    requested_probe: bool,
+    requested_extended: bool,
+    base: [u8; 8],
+) -> std::io::Result<(IngestAckMode, IngestAck)> {
+    let detect_timeout_ms = if requested_probe || requested_extended {
+        50
+    } else {
+        15
+    };
+    let Some(consumed) = try_read_ack_suffix::<4>(stream, detect_timeout_ms).await? else {
+        return Ok((IngestAckMode::Legacy, decode_ingest_ack(base, None, None)));
+    };
+    let credit = try_read_ack_suffix::<4>(stream, detect_timeout_ms).await?;
+    let mode = if credit.is_some() {
+        IngestAckMode::CreditProbe
+    } else {
+        IngestAckMode::Extended
+    };
+    Ok((mode, decode_ingest_ack(base, Some(consumed), credit)))
 }
 
 async fn read_ingest_ack(
     stream: &mut TcpStream,
-    credit_probe_enabled: bool,
-    extended_ack_enabled: bool,
+    ack_mode: &mut IngestAckMode,
+    requested_probe: bool,
+    requested_extended: bool,
 ) -> std::io::Result<IngestAck> {
-    if credit_probe_enabled {
-        let mut ack = [0u8; 16];
-        stream.read_exact(&mut ack).await?;
-        Ok(IngestAck {
-            accepted: u32::from_le_bytes(ack[0..4].try_into().unwrap()) as u64,
-            pool_pending: u32::from_le_bytes(ack[4..8].try_into().unwrap()) as u64,
-            consumed: u32::from_le_bytes(ack[8..12].try_into().unwrap()) as u64,
-            credit_available: u32::from_le_bytes(ack[12..16].try_into().unwrap()) as u64,
-        })
-    } else if extended_ack_enabled {
-        let mut ack = [0u8; 12];
-        stream.read_exact(&mut ack).await?;
-        Ok(IngestAck {
-            accepted: u32::from_le_bytes(ack[0..4].try_into().unwrap()) as u64,
-            pool_pending: u32::from_le_bytes(ack[4..8].try_into().unwrap()) as u64,
-            consumed: u32::from_le_bytes(ack[8..12].try_into().unwrap()) as u64,
-            credit_available: 0,
-        })
-    } else {
-        let mut ack = [0u8; 8];
-        stream.read_exact(&mut ack).await?;
-        Ok(IngestAck {
-            accepted: u32::from_le_bytes(ack[0..4].try_into().unwrap()) as u64,
-            pool_pending: u32::from_le_bytes(ack[4..8].try_into().unwrap()) as u64,
-            consumed: 0,
-            credit_available: 0,
-        })
+    match ack_mode {
+        IngestAckMode::Legacy => {
+            let mut base = [0u8; 8];
+            stream.read_exact(&mut base).await?;
+            Ok(decode_ingest_ack(base, None, None))
+        }
+        IngestAckMode::Extended => {
+            let mut base = [0u8; 8];
+            let mut consumed = [0u8; 4];
+            stream.read_exact(&mut base).await?;
+            stream.read_exact(&mut consumed).await?;
+            Ok(decode_ingest_ack(base, Some(consumed), None))
+        }
+        IngestAckMode::CreditProbe => {
+            let mut base = [0u8; 8];
+            let mut consumed = [0u8; 4];
+            let mut credit = [0u8; 4];
+            stream.read_exact(&mut base).await?;
+            stream.read_exact(&mut consumed).await?;
+            stream.read_exact(&mut credit).await?;
+            Ok(decode_ingest_ack(base, Some(consumed), Some(credit)))
+        }
+        IngestAckMode::Unknown => {
+            let mut base = [0u8; 8];
+            stream.read_exact(&mut base).await?;
+            let (mode, ack) =
+                detect_ingest_ack_mode(stream, requested_probe, requested_extended, base).await?;
+            *ack_mode = mode;
+            tracing::info!(?mode, "detected ingest ACK mode");
+            Ok(ack)
+        }
     }
 }
 
-async fn wait_for_ingest_credit(stream: &mut TcpStream) -> std::io::Result<IngestAck> {
+async fn wait_for_ingest_credit(
+    stream: &mut TcpStream,
+    ack_mode: &mut IngestAckMode,
+    requested_extended: bool,
+) -> std::io::Result<IngestAck> {
+    debug_assert!(ack_mode.supports_credit_probe());
     stream.write_all(&u32::MAX.to_le_bytes()).await?;
-    read_ingest_ack(stream, true, true).await
+    read_ingest_ack(stream, ack_mode, true, requested_extended).await
+}
+
+fn ack_consumed(ack_mode: IngestAckMode, ack: &IngestAck, chunk_len: u64) -> u64 {
+    if ack_mode.has_consumed_field() {
+        ack.consumed.min(chunk_len)
+    } else if ack.accepted == 0 {
+        0
+    } else {
+        chunk_len
+    }
 }
 
 async fn wait_for_pool_window(
@@ -1502,8 +1592,8 @@ async fn run_ingest_mode(
 
     // Spawn one TCP sender per endpoint with dynamic rate control
     let mut handles = Vec::new();
-    let credit_probe_enabled = ingest_credit_probe_enabled();
-    let extended_ack_enabled = ingest_extended_ack_enabled();
+    let credit_probe_requested = ingest_credit_probe_requested();
+    let extended_ack_requested = ingest_extended_ack_requested();
     for (idx, txs) in presigned.into_iter().enumerate() {
         if txs.is_empty() {
             continue;
@@ -1560,6 +1650,7 @@ async fn run_ingest_mode(
             let mut credit_probe_waits = 0u64;
             let mut credit_probe_wait_ms = 0u64;
             let mut credit_remaining = 0u64;
+            let mut ack_mode = IngestAckMode::Unknown;
 
             // Index-based iteration for retry support
             let chunks: Vec<&[RawTxWithSender]> = txs.chunks(bs).collect();
@@ -1573,13 +1664,18 @@ async fn run_ingest_mode(
                 let chunk = &chunks[chunk_idx][chunk_offset..];
                 let batch_start = Instant::now();
 
-                if credit_probe_enabled && credit_remaining == 0 {
+                if credit_probe_requested
+                    && ack_mode.supports_credit_probe()
+                    && credit_remaining == 0
+                {
                     if !pool_gated {
                         tracing::info!(endpoint, "waiting for server-side ingest credit");
                         pool_gated = true;
                     }
                     let wait_start = Instant::now();
-                    match wait_for_ingest_credit(&mut stream).await {
+                    match wait_for_ingest_credit(&mut stream, &mut ack_mode, extended_ack_requested)
+                        .await
+                    {
                         Ok(ack) => {
                             let waited_ms = wait_start.elapsed().as_millis() as u64;
                             gate_wait_ms += waited_ms;
@@ -1606,7 +1702,7 @@ async fn run_ingest_mode(
                     }
                 }
 
-                let send_len = if credit_probe_enabled {
+                let send_len = if credit_probe_requested && ack_mode.supports_credit_probe() {
                     chunk.len().min(credit_remaining as usize)
                 } else {
                     chunk.len()
@@ -1643,7 +1739,13 @@ async fn run_ingest_mode(
                 // Read ACK: legacy [accepted,pool_pending], extended
                 // [accepted,pool_pending,consumed], or credit-probe
                 // [accepted,pool_pending,consumed,credit_available].
-                match read_ingest_ack(&mut stream, credit_probe_enabled, extended_ack_enabled).await
+                match read_ingest_ack(
+                    &mut stream,
+                    &mut ack_mode,
+                    credit_probe_requested,
+                    extended_ack_requested,
+                )
+                .await
                 {
                     Ok(IngestAck {
                         accepted,
@@ -1652,17 +1754,22 @@ async fn run_ingest_mode(
                         credit_available,
                     }) => {
                         let chunk_len = send_chunk.len() as u64;
-                        let consumed = if !credit_probe_enabled && !extended_ack_enabled {
-                            if accepted == 0 { 0 } else { chunk_len }
-                        } else {
-                            consumed.min(chunk_len)
-                        };
-                        if credit_probe_enabled {
+                        let consumed = ack_consumed(
+                            ack_mode,
+                            &IngestAck {
+                                accepted,
+                                pool_pending,
+                                consumed,
+                                credit_available,
+                            },
+                            chunk_len,
+                        );
+                        if ack_mode.supports_credit_probe() {
                             credit_remaining = credit_remaining.saturating_sub(consumed);
                         }
 
                         if consumed == 0 && pool_pending > 0 {
-                            if credit_probe_enabled {
+                            if credit_probe_requested && ack_mode.supports_credit_probe() {
                                 // Sender should switch to a lightweight credit probe instead of
                                 // retrying the full batch or polling txpool_status over RPC.
                                 zero_credit_acks += 1;
@@ -1704,7 +1811,7 @@ async fn run_ingest_mode(
                             continue; // retry same chunk_idx
                         }
 
-                        if !credit_probe_enabled && pool_gated {
+                        if !ack_mode.supports_credit_probe() && pool_gated {
                             tracing::info!(
                                 endpoint,
                                 pool_pending,
@@ -1729,7 +1836,7 @@ async fn run_ingest_mode(
                         }
 
                         let mut handled_window_wait = false;
-                        if !credit_probe_enabled
+                        if !ack_mode.supports_credit_probe()
                             && pacer_cfg.pool_poll_ms > 0
                             && per_ep_tps == 0
                             && pool_pending >= pacer.soft_target
@@ -1825,6 +1932,9 @@ async fn tcp_send_wave(
 ) -> (u64, u64) {
     let mut total_ok = 0u64;
     let mut total_err = 0u64;
+    let credit_probe_requested = ingest_credit_probe_requested();
+    let extended_ack_requested = ingest_extended_ack_requested();
+    let mut ack_mode = IngestAckMode::Unknown;
 
     for chunk in txs.chunks(batch_size) {
         let mut offset = 0usize;
@@ -1851,20 +1961,17 @@ async fn tcp_send_wave(
                 return (total_ok, total_err);
             }
 
-            let credit_probe_enabled = ingest_credit_probe_enabled();
-            let extended_ack_enabled = ingest_extended_ack_enabled();
-            match read_ingest_ack(stream, credit_probe_enabled, extended_ack_enabled).await {
+            match read_ingest_ack(
+                stream,
+                &mut ack_mode,
+                credit_probe_requested,
+                extended_ack_requested,
+            )
+            .await
+            {
                 Ok(ack) => {
                     total_ok += ack.accepted;
-                    let consumed = if !credit_probe_enabled && !extended_ack_enabled {
-                        if ack.accepted == 0 {
-                            0
-                        } else {
-                            suffix.len() as u64
-                        }
-                    } else {
-                        ack.consumed.min(suffix.len() as u64)
-                    };
+                    let consumed = ack_consumed(ack_mode, &ack, suffix.len() as u64);
                     let rejected = consumed.saturating_sub(ack.accepted);
                     if rejected > 0 {
                         total_err += rejected;

@@ -28,7 +28,14 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: paradigmxyz/reth
-          path: workspace/reth
+          ref: ae2c916f6106b31ecbe715663abe183507786480
+          path: workspace/reth-latest
+
+      - name: Prepare patched reth
+        working-directory: workspace/reth-latest
+        run: |
+          git apply --check ../n42-26/reth-n42.patch
+          git apply ../n42-26/reth-n42.patch
 
       - name: Build client image
         run: |

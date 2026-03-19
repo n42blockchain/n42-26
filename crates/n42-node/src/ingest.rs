@@ -591,11 +591,14 @@ where
         }
         if header_value == CREDIT_WAIT_SENTINEL {
             if !credit_probe_enabled {
+                let pending = pool.pending_count();
                 warn!(
                     target: "n42::ingest",
+                    pending,
                     "received credit probe sentinel while credit probe mode is disabled"
                 );
-                break;
+                write_ack(&mut stream, 0, pending, 0, 0, extended_ack_enabled, false).await?;
+                continue;
             }
             let (pending, credit) = wait_for_credit_probe(
                 &pool,
