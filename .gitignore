@@ -1,5 +1,6 @@
 /target
 /n42-data/
+/.artifacts/
 
 # Claude Code config
 **/.claude/

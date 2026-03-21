@@ -1284,3 +1284,259 @@ async fn test_timeout_convergence_from_different_views() {
         converged_view, next_view, final_view
     );
 }
+
+// ── Node dropout tests ───────────────��──────────────────────────────────────
+//
+// HotStuff-2 with n=7, f=2, quorum=2f+1=5.
+//
+// Active nodes → can reach quorum?
+//   7 → yes (5 of 7)
+//   6 → yes (5 of 6)   1 node offline
+//   5 → yes (5 of 5)   2 nodes offline  ← boundary
+//   4 → NO  (need 5, only 4 active)     ← stall
+//   3 → NO
+//   1 → NO
+//
+// The tests below verify this behaviour by routing messages only to the
+// "active" subset and asserting commit / no-commit accordingly.
+
+/// Helper: run one consensus round routing messages only among `active` nodes.
+/// Returns true if a BlockCommitted was produced (quorum reached).
+fn run_round_with_active_set(
+    harness: &mut ChaosHarness,
+    view: ViewNumber,
+    block_hash: B256,
+    active: &[usize],
+) -> bool {
+    let leader = harness.leader_for_view(view);
+
+    // If the leader is offline, no proposal → no commit.
+    if !active.contains(&leader) {
+        return false;
+    }
+
+    harness.engines[leader]
+        .process_event(ConsensusEvent::BlockReady(block_hash))
+        .expect("leader BlockReady");
+
+    let proposal = harness
+        .drain_outputs(leader)
+        .into_iter()
+        .find_map(|o| match o {
+            EngineOutput::BroadcastMessage(msg @ ConsensusMessage::Proposal(_)) => Some(msg),
+            _ => None,
+        });
+
+    let proposal = match proposal {
+        Some(p) => p,
+        None => return false,
+    };
+
+    let proposal_hash = match &proposal {
+        ConsensusMessage::Proposal(p) => p.block_hash,
+        _ => unreachable!(),
+    };
+
+    // Deliver proposal to active non-leaders.
+    for &i in active {
+        if i != leader {
+            let _ = harness.engines[i].process_event(ConsensusEvent::Message(proposal.clone()));
+            let _ = harness.engines[i]
+                .process_event(ConsensusEvent::BlockImported(proposal_hash));
+        }
+    }
+
+    // Collect R1 votes from active nodes and deliver to leader.
+    for &i in active {
+        if i != leader {
+            for output in harness.drain_outputs(i) {
+                if let EngineOutput::SendToValidator(target, msg) = output {
+                    if target == leader as u32 {
+                        let _ = harness.engines[leader]
+                            .process_event(ConsensusEvent::Message(msg));
+                    }
+                }
+            }
+        }
+    }
+
+    // Check if PrepareQC formed.
+    let prepare_qc = harness
+        .drain_outputs(leader)
+        .into_iter()
+        .find_map(|o| match o {
+            EngineOutput::BroadcastMessage(msg @ ConsensusMessage::PrepareQC(_)) => Some(msg),
+            _ => None,
+        });
+
+    let prepare_qc = match prepare_qc {
+        Some(q) => q,
+        None => {
+            harness.drain_all_outputs();
+            return false;
+        }
+    };
+
+    // Deliver PrepareQC to active non-leaders.
+    for &i in active {
+        if i != leader {
+            let _ = harness.engines[i]
+                .process_event(ConsensusEvent::Message(prepare_qc.clone()));
+        }
+    }
+
+    // Collect R2 (commit) votes from active nodes.
+    for &i in active {
+        if i != leader {
+            for output in harness.drain_outputs(i) {
+                if let EngineOutput::SendToValidator(target, msg) = output {
+                    if target == leader as u32 {
+                        let _ = harness.engines[leader]
+                            .process_event(ConsensusEvent::Message(msg));
+                    }
+                }
+            }
+        }
+    }
+
+    // Check if BlockCommitted produced.
+    let leader_outputs = harness.drain_outputs(leader);
+    let committed = leader_outputs.iter().any(|o| {
+        matches!(o, EngineOutput::BlockCommitted { .. })
+    });
+
+    // Propagate Decide to active nodes.
+    for output in &leader_outputs {
+        if let EngineOutput::BroadcastMessage(msg @ ConsensusMessage::Decide(_)) = output {
+            for &i in active {
+                if i != leader {
+                    let _ = harness.engines[i]
+                        .process_event(ConsensusEvent::Message(msg.clone()));
+                }
+            }
+        }
+    }
+
+    harness.drain_all_outputs();
+    committed
+}
+
+/// 7 nodes active → quorum=5, should commit normally.
+#[test]
+fn test_7node_all_active_commits() {
+    let mut h = ChaosHarness::new(7);
+    let active: Vec<usize> = (0..7).collect();
+    let committed = run_round_with_active_set(
+        &mut h,
+        1,
+        B256::repeat_byte(0x01),
+        &active,
+    );
+    assert!(committed, "7/7 active: should commit (quorum=5 of 7)");
+    eprintln!("7/7 active: committed ✓");
+}
+
+/// 6 nodes active (1 offline) → still 6 ≥ quorum=5, should commit.
+#[test]
+fn test_7node_6active_commits() {
+    let mut h = ChaosHarness::new(7);
+    // Drop node 6 (last validator).
+    let active: Vec<usize> = (0..6).collect();
+    let committed = run_round_with_active_set(
+        &mut h,
+        1,
+        B256::repeat_byte(0x02),
+        &active,
+    );
+    assert!(committed, "6/7 active: should commit (quorum=5 of 7)");
+    eprintln!("6/7 active: committed ✓");
+}
+
+/// 5 nodes active (2 offline) → exactly quorum=5, should commit (boundary).
+#[test]
+fn test_7node_5active_commits_boundary() {
+    let mut h = ChaosHarness::new(7);
+    // Drop nodes 5 and 6.
+    let active: Vec<usize> = (0..5).collect();
+    let committed = run_round_with_active_set(
+        &mut h,
+        1,
+        B256::repeat_byte(0x03),
+        &active,
+    );
+    assert!(committed, "5/7 active: should commit at boundary (quorum=5 of 7)");
+    eprintln!("5/7 active: committed ✓ (boundary)");
+}
+
+/// 4 nodes active (3 offline) → below quorum=5, should NOT commit (stall).
+#[test]
+fn test_7node_4active_stalls() {
+    let mut h = ChaosHarness::new(7);
+    // Drop nodes 4, 5, 6.
+    let active: Vec<usize> = (0..4).collect();
+    let committed = run_round_with_active_set(
+        &mut h,
+        1,
+        B256::repeat_byte(0x04),
+        &active,
+    );
+    assert!(!committed, "4/7 active: should NOT commit (need 5, only 4 active)");
+    eprintln!("4/7 active: stalled ✓ (below quorum)");
+}
+
+/// 3 nodes active → well below quorum=5, should NOT commit.
+#[test]
+fn test_7node_3active_stalls() {
+    let mut h = ChaosHarness::new(7);
+    let active: Vec<usize> = (0..3).collect();
+    let committed = run_round_with_active_set(
+        &mut h,
+        1,
+        B256::repeat_byte(0x05),
+        &active,
+    );
+    assert!(!committed, "3/7 active: should NOT commit (need 5, only 3 active)");
+    eprintln!("3/7 active: stalled ✓");
+}
+
+/// 1 node active → cannot commit alone.
+#[test]
+fn test_7node_1active_stalls() {
+    let mut h = ChaosHarness::new(7);
+    let active: Vec<usize> = vec![0];
+    let committed = run_round_with_active_set(
+        &mut h,
+        1,
+        B256::repeat_byte(0x06),
+        &active,
+    );
+    assert!(!committed, "1/7 active: should NOT commit (need 5, only 1 active)");
+    eprintln!("1/7 active: stalled ✓");
+}
+
+/// Progressive dropout: 7→6→5 all commit; 4→3→1 all stall.
+/// Verifies the quorum boundary is exactly at 5 active nodes.
+#[test]
+fn test_7node_progressive_dropout() {
+    // Each scenario uses a fresh harness (independent validator sets).
+    for active_count in (1..=7).rev() {
+        let mut h = ChaosHarness::new(7);
+        let active: Vec<usize> = (0..active_count).collect();
+        let block_hash = B256::repeat_byte(active_count as u8);
+        let committed = run_round_with_active_set(&mut h, 1, block_hash, &active);
+
+        let quorum = 5usize; // 2f+1 = 2*2+1 = 5
+        let should_commit = active_count >= quorum;
+
+        assert_eq!(
+            committed,
+            should_commit,
+            "{}/{} active: expected committed={}, got committed={}",
+            active_count, 7, should_commit, committed
+        );
+        eprintln!(
+            "{}/7 active: committed={} (expected={}) ✓",
+            active_count, committed, should_commit
+        );
+    }
+}
