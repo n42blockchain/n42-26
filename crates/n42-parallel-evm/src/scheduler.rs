@@ -189,7 +189,9 @@ impl Scheduler {
     /// Mark a transaction for re-execution (validation failed).
     /// Also invalidates all higher-indexed transactions that might have read from this one.
     pub fn abort_and_reschedule(&self, tx_idx: TxIdx) {
-        self.status[tx_idx].store(STATUS_REDO, Ordering::SeqCst);
+        // Use swap to atomically set REDO and capture the previous status,
+        // so we can correctly count this tx if it was already VALIDATED.
+        let prev_self = self.status[tx_idx].swap(STATUS_REDO, Ordering::SeqCst);
 
         // Reset validation cursor to re-validate from this point.
         loop {
@@ -208,7 +210,7 @@ impl Scheduler {
 
         // Mark all higher-indexed executed txs as needing redo too,
         // since they might have read stale data from the aborted tx.
-        let mut invalidated_validated = 0usize;
+        let mut invalidated_validated = if prev_self == STATUS_VALIDATED { 1 } else { 0 };
         for i in (tx_idx + 1)..self.num_txs {
             let prev = self.status[i].load(Ordering::SeqCst);
             if prev == STATUS_EXECUTED || prev == STATUS_VALIDATED {
