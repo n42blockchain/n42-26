@@ -294,9 +294,12 @@ pub fn n42_dev_chainspec() -> Arc<ChainSpec> {
     Arc::new(spec)
 }
 
+/// 1e18 (1 N in wei) as a constant to avoid repeated `pow()` at runtime.
+const WEI_PER_N: U256 = U256::from_limbs([1_000_000_000_000_000_000u64, 0, 0, 0]);
+
 /// 10,000 N in wei.
 fn ten_thousand_n() -> U256 {
-    U256::from(10_000) * U256::from(10).pow(U256::from(18))
+    U256::from(10_000) * WEI_PER_N
 }
 
 /// Treasury address for initial token distribution.
@@ -319,7 +322,7 @@ pub static STRESS_CONTRACT_BYTECODE: Bytes = bytes!(
 
 /// 3 billion N in wei (3,000,000,000 * 10^18).
 fn three_billion_n() -> U256 {
-    U256::from(3_000_000_000u64) * U256::from(10).pow(U256::from(18))
+    U256::from(3_000_000_000u64) * WEI_PER_N
 }
 
 /// Create a dev chain spec with pre-funded allocations.

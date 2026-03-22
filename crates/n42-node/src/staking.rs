@@ -581,13 +581,7 @@ impl StakingManager {
     /// Takes pending return withdrawals for injection into payload_attributes.
     pub fn take_pending_returns(&mut self, _block_number: u64, max: usize) -> Vec<Withdrawal> {
         let count = max.min(self.pending_returns.len());
-        let mut results = Vec::with_capacity(count);
-        for _ in 0..count {
-            if let Some(w) = self.pending_returns.pop_front() {
-                results.push(w);
-            }
-        }
-        results
+        self.pending_returns.drain(..count).collect()
     }
 
     /// Maps a BLS public key to the staker's EVM address (for reward address resolution).

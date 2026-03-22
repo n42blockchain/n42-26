@@ -182,20 +182,30 @@ pub fn decode_stream_packet(data: &[u8]) -> Result<StreamPacket, crate::wire::Wi
         }
     };
 
+    // Reads a little-endian u32 at `pos` after bounds have been checked by `ensure`.
+    let read_u32 = |pos: &mut usize| -> u32 {
+        let val = u32::from_le_bytes([
+            payload[*pos],
+            payload[*pos + 1],
+            payload[*pos + 2],
+            payload[*pos + 3],
+        ]);
+        *pos += 4;
+        val
+    };
+
     ensure(pos, 32)?;
     let block_hash = B256::from_slice(&payload[pos..pos + 32]);
     pos += 32;
 
     ensure(pos, 4)?;
-    let header_rlp_len = u32::from_le_bytes(payload[pos..pos + 4].try_into().unwrap()) as usize;
-    pos += 4;
+    let header_rlp_len = read_u32(&mut pos) as usize;
     ensure(pos, header_rlp_len)?;
     let header_rlp = Bytes::copy_from_slice(&payload[pos..pos + header_rlp_len]);
     pos += header_rlp_len;
 
     ensure(pos, 4)?;
-    let tx_count = u32::from_le_bytes(payload[pos..pos + 4].try_into().unwrap()) as usize;
-    pos += 4;
+    let tx_count = read_u32(&mut pos) as usize;
     if tx_count > MAX_TX_COUNT {
         return Err(WireError::LengthOverflow {
             offset: pos - 4,
@@ -206,23 +216,20 @@ pub fn decode_stream_packet(data: &[u8]) -> Result<StreamPacket, crate::wire::Wi
     let mut transactions = Vec::with_capacity(tx_count);
     for _ in 0..tx_count {
         ensure(pos, 4)?;
-        let tx_len = u32::from_le_bytes(payload[pos..pos + 4].try_into().unwrap()) as usize;
-        pos += 4;
+        let tx_len = read_u32(&mut pos) as usize;
         ensure(pos, tx_len)?;
         transactions.push(Bytes::copy_from_slice(&payload[pos..pos + tx_len]));
         pos += tx_len;
     }
 
     ensure(pos, 4)?;
-    let read_log_len = u32::from_le_bytes(payload[pos..pos + 4].try_into().unwrap()) as usize;
-    pos += 4;
+    let read_log_len = read_u32(&mut pos) as usize;
     ensure(pos, read_log_len)?;
     let read_log_data = payload[pos..pos + read_log_len].to_vec();
     pos += read_log_len;
 
     ensure(pos, 4)?;
-    let code_count = u32::from_le_bytes(payload[pos..pos + 4].try_into().unwrap()) as usize;
-    pos += 4;
+    let code_count = read_u32(&mut pos) as usize;
     if code_count > MAX_BYTECODE_COUNT {
         return Err(WireError::LengthOverflow {
             offset: pos - 4,
@@ -235,8 +242,7 @@ pub fn decode_stream_packet(data: &[u8]) -> Result<StreamPacket, crate::wire::Wi
         ensure(pos, 36)?;
         let hash = B256::from_slice(&payload[pos..pos + 32]);
         pos += 32;
-        let code_len = u32::from_le_bytes(payload[pos..pos + 4].try_into().unwrap()) as usize;
-        pos += 4;
+        let code_len = read_u32(&mut pos) as usize;
         ensure(pos, code_len)?;
         let code = Bytes::copy_from_slice(&payload[pos..pos + code_len]);
         pos += code_len;

@@ -229,7 +229,7 @@ impl std::fmt::Debug for StreamReplayDB<'_> {
 
 fn parse_stream_header(data: &[u8]) -> (u32, usize) {
     if data.len() >= 4 {
-        (u32::from_le_bytes(data[0..4].try_into().unwrap()), 4)
+        (u32::from_le_bytes([data[0], data[1], data[2], data[3]]), 4)
     } else {
         (0, data.len())
     }

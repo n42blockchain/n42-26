@@ -1,5 +1,6 @@
 use crate::hasher::Blake3Hasher;
 use crate::metrics;
+use crate::sharded::combine_shard_roots;
 
 use alloy_primitives::B256;
 use jmt::proof::SparseMerkleProof;
@@ -70,11 +71,7 @@ impl JmtProof {
         }
 
         // Step 1: Verify combined root.
-        let mut hasher = blake3::Hasher::new();
-        for root in &self.shard_roots {
-            hasher.update(root);
-        }
-        let computed = B256::from(*hasher.finalize().as_bytes());
+        let computed = combine_shard_roots(&self.shard_roots);
         if computed != *expected_root {
             return Err(VerifyError::CombinedRootMismatch {
                 expected: *expected_root,

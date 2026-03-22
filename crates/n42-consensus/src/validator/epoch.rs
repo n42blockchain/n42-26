@@ -432,16 +432,18 @@ impl EpochManager {
         }
 
         // Quorum overlap check (Jolteon §4.3 liveness).
-        // Build a HashSet of new addresses, then filter current validators through it —
-        // this avoids materialising a second Vec<ValidatorInfo> for the current set.
+        // Build a HashSet of new addresses, then check each current validator via
+        // `contains_address` — avoids the Vec<ValidatorInfo> allocation from `validator_infos()`.
         let new_addrs: std::collections::HashSet<Address> =
             new_validators.iter().map(|v| v.address).collect();
-        let overlap = self
-            .current_set
-            .validator_infos()
-            .into_iter()
-            .filter(|v| new_addrs.contains(&v.address))
-            .count();
+        let mut overlap = 0usize;
+        for i in 0..self.current_set.len() {
+            if let Ok(addr) = self.current_set.get_address(i) {
+                if new_addrs.contains(addr) {
+                    overlap += 1;
+                }
+            }
+        }
         let required = self.current_set.quorum_size(); // 2f+1
         if overlap < required {
             return Err(ConsensusError::InsufficientQuorumOverlap {

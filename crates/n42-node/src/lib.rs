@@ -28,3 +28,13 @@ pub use validator_peers::{
     configured_validator_peer_ids, expected_validator_peer_ids,
     expected_validator_peer_ids_with_policy,
 };
+
+/// Returns the current wall-clock time in milliseconds since the Unix epoch.
+///
+/// Shared utility used by the orchestrator and ingest subsystems.
+pub(crate) fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}

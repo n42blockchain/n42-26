@@ -97,7 +97,7 @@ impl MvMemory {
 
     /// Get cached code.
     pub fn get_code(&self, hash: &B256) -> Option<Bytecode> {
-        self.code.get(hash).map(|v| v.clone())
+        self.code.get(hash).map(|v| v.value().clone())
     }
 
     /// Remove all entries written by `tx_idx` (used before re-execution).

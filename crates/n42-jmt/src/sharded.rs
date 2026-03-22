@@ -22,6 +22,19 @@ fn shard_index(key: &KeyHash) -> usize {
     (key.0[0] >> 4) as usize
 }
 
+/// Compute the combined root hash from an array of shard roots.
+///
+/// `blake3(shard_0_root || shard_1_root || ... || shard_15_root)`
+///
+/// Shared by `ShardedJmt::root_hash()`, `apply_diff()`, and `JmtProof::verify()`.
+pub fn combine_shard_roots(roots: &[[u8; 32]]) -> B256 {
+    let mut hasher = blake3::Hasher::new();
+    for root in roots {
+        hasher.update(root);
+    }
+    B256::from(*hasher.finalize().as_bytes())
+}
+
 /// 16-shard parallel JMT.
 ///
 /// Each shard is an independent `N42JmtTree` with its own `MemTreeStore`.
@@ -77,11 +90,7 @@ impl ShardedJmt {
     /// `combined_root = blake3(shard_0_root || shard_1_root || ... || shard_15_root)`
     pub fn root_hash(&self) -> eyre::Result<B256> {
         let roots = self.shard_roots()?;
-        let mut hasher = blake3::Hasher::new();
-        for root in &roots {
-            hasher.update(root);
-        }
-        Ok(B256::from(*hasher.finalize().as_bytes()))
+        Ok(combine_shard_roots(&roots))
     }
 
     /// Apply a `StateDiff` across all 16 shards in parallel.
@@ -180,12 +189,12 @@ impl ShardedJmt {
             .collect();
 
         // Phase 4: Combine shard roots.
-        let mut hasher = blake3::Hasher::new();
+        let mut shard_roots = Vec::with_capacity(SHARD_COUNT);
         for result in results {
             let root = result?;
-            hasher.update(root.as_slice());
+            shard_roots.push(root.0);
         }
-        let combined = B256::from(*hasher.finalize().as_bytes());
+        let combined = combine_shard_roots(&shard_roots);
         self.version = new_version;
 
         let ms = start.elapsed().as_secs_f64() * 1000.0;

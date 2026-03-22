@@ -66,10 +66,13 @@ impl ConsensusOrchestrator {
         if self.slot_time.is_zero() || self.fast_propose {
             // Fast propose: skip slot boundary alignment. Use a small configurable
             // delay to let transactions accumulate in the pool.
-            let min_delay_ms: u64 = std::env::var("N42_MIN_PROPOSE_DELAY_MS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0);
+            static MIN_PROPOSE_DELAY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+            let min_delay_ms: u64 = *MIN_PROPOSE_DELAY.get_or_init(|| {
+                std::env::var("N42_MIN_PROPOSE_DELAY_MS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0)
+            });
             if min_delay_ms > 0 {
                 let delay = Duration::from_millis(min_delay_ms);
                 self.next_build_at = Some(Instant::now() + delay);

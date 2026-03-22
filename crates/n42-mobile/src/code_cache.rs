@@ -187,7 +187,12 @@ pub fn decode_cache_sync(data: &[u8]) -> Result<CacheSyncMessage, crate::wire::W
         if *pos + 4 > payload.len() {
             return Err(WireError::UnexpectedEof(*pos));
         }
-        let val = u32::from_le_bytes(payload[*pos..*pos + 4].try_into().unwrap());
+        let val = u32::from_le_bytes([
+            payload[*pos],
+            payload[*pos + 1],
+            payload[*pos + 2],
+            payload[*pos + 3],
+        ]);
         *pos += 4;
         Ok(val)
     };

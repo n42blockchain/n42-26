@@ -43,6 +43,8 @@ pub enum AccountWrite {
 pub enum ParallelEvmError {
     #[error("database error: {0}")]
     Database(String),
+    /// Currently unused: convergence failure falls back to sequential execution.
+    /// Retained for future use if callers want explicit error reporting.
     #[error("execution did not converge after {0} rounds")]
     TooManyRounds(usize),
 }

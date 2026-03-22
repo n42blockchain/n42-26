@@ -125,7 +125,7 @@ pub unsafe extern "C" fn n42_verifier_init(chain_id: u64) -> *mut VerifierContex
         let _ = tracing_subscriber::fmt()
             .with_env_filter(
                 tracing_subscriber::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| "n42_mobile_ffi=info".parse().unwrap()),
+                    .unwrap_or_else(|_| "n42_mobile_ffi=info".parse().expect("static filter")),
             )
             .try_init();
     });
@@ -341,8 +341,9 @@ pub unsafe extern "C" fn n42_verify_and_send(
             let result = match verify_result {
                 Ok(r) => r,
                 Err(e) => {
-                    lock_or_recover(&ctx.stats).blocks_verified += 1;
-                    lock_or_recover(&ctx.stats).failure_count += 1;
+                    let mut stats = lock_or_recover(&ctx.stats);
+                    stats.blocks_verified += 1;
+                    stats.failure_count += 1;
                     return FfiError::VerifyFailed(format!("V2: {e}")).into_code();
                 }
             };
@@ -376,8 +377,9 @@ pub unsafe extern "C" fn n42_verify_and_send(
             let result = match verify_result {
                 Ok(r) => r,
                 Err(e) => {
-                    lock_or_recover(&ctx.stats).blocks_verified += 1;
-                    lock_or_recover(&ctx.stats).failure_count += 1;
+                    let mut stats = lock_or_recover(&ctx.stats);
+                    stats.blocks_verified += 1;
+                    stats.failure_count += 1;
                     return FfiError::VerifyFailed(e.to_string()).into_code();
                 }
             };

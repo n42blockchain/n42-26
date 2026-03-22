@@ -2,6 +2,7 @@ use super::{
     BlobSidecarBroadcast, BlockDataBroadcast, CompactBlockExecution, ConsensusOrchestrator,
 };
 use crate::ingest::note_virtual_block_credit;
+use crate::now_unix_ms;
 use alloy_consensus::Typed2718;
 use alloy_eips::eip7594::BlobTransactionSidecarVariant;
 use alloy_primitives::{Address, B256};
@@ -17,7 +18,7 @@ use reth_payload_primitives::{EngineApiMessageVersion, PayloadKind, PayloadTypes
 use reth_transaction_pool::blobstore::{BlobStore, DiskFileBlobStore};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tracing::{debug, error, info, warn};
@@ -45,13 +46,6 @@ struct CompactInjectTracker {
 }
 
 const COMPACT_INJECT_TRACKER_LIMIT: usize = 2048;
-
-fn now_unix_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
 
 fn elapsed_since_unix_ms(start_ms: u64) -> Option<u64> {
     (start_ms > 0).then(|| now_unix_ms().saturating_sub(start_ms))

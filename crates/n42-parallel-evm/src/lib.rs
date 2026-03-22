@@ -21,7 +21,7 @@ use revm::state::{Account, EvmStorageSlot};
 use scheduler::{Scheduler, Task};
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tracing::{debug, info, warn};
 use types::*;
 
@@ -61,10 +61,13 @@ where
         });
     }
 
-    let parallel_threshold: usize = std::env::var("N42_PARALLEL_THRESHOLD")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(8);
+    static THRESHOLD: OnceLock<usize> = OnceLock::new();
+    let parallel_threshold: usize = *THRESHOLD.get_or_init(|| {
+        std::env::var("N42_PARALLEL_THRESHOLD")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8)
+    });
 
     if num_txs <= parallel_threshold {
         return sequential_execute(txs, base_db, &cfg_env, &block_env);
@@ -195,6 +198,14 @@ fn worker_loop<DB>(
     }
 }
 
+/// Extract the read set from its Arc wrapper, avoiding a clone when possible.
+fn unwrap_read_set(read_set: SharedReadSet) -> Vec<ReadEntry> {
+    match Arc::try_unwrap(read_set) {
+        Ok(mutex) => mutex.into_inner(),
+        Err(arc) => arc.lock().clone(),
+    }
+}
+
 /// Execute a single transaction using revm with the parallel database adapter.
 fn execute_single_tx<DB>(
     tx_idx: TxIdx,
@@ -230,10 +241,7 @@ where
             Ok(r) => r,
             Err(e) => {
                 debug!(target: "n42::parallel_evm", tx_idx, error = %e, "tx execution error");
-                let rs = match Arc::try_unwrap(read_set) {
-                    Ok(mutex) => mutex.into_inner(),
-                    Err(arc) => arc.lock().clone(),
-                };
+                let rs = unwrap_read_set(read_set);
                 return Some(TxOutputInternal {
                     gas_used: 0,
                     success: false,
@@ -265,10 +273,7 @@ where
         }
     }
 
-    let rs = match Arc::try_unwrap(read_set) {
-        Ok(mutex) => mutex.into_inner(),
-        Err(arc) => arc.lock().clone(),
-    };
+    let rs = unwrap_read_set(read_set);
 
     Some(TxOutputInternal {
         gas_used,
@@ -301,6 +306,37 @@ fn validate_read_set(tx_idx: TxIdx, read_set: &[ReadEntry], mv: &MvMemory) -> bo
     true
 }
 
+/// Merge a single transaction's writes into the accumulated state.
+fn merge_tx_state(
+    state_changes: &mut HashMap<Address, Account>,
+    tx_idx: TxIdx,
+    account_writes: Vec<(Address, AccountWrite)>,
+    storage_writes: Vec<(Address, U256, U256)>,
+) {
+    for (addr, write) in account_writes {
+        let account = state_changes
+            .entry(addr)
+            .or_insert_with(|| Account::new_not_existing(tx_idx));
+        match write {
+            AccountWrite::Updated(info) => {
+                account.info = info;
+                account.mark_touch();
+            }
+            AccountWrite::Destroyed => {
+                account.mark_selfdestruct();
+            }
+        }
+    }
+    for (addr, slot, value) in storage_writes {
+        let account = state_changes
+            .entry(addr)
+            .or_insert_with(|| Account::new_not_existing(tx_idx));
+        account
+            .storage
+            .insert(slot, EvmStorageSlot::new_changed(U256::ZERO, value, tx_idx));
+    }
+}
+
 /// Build final output from per-tx results.
 fn build_output(
     outputs: Vec<Mutex<Option<TxOutputInternal>>>,
@@ -319,31 +355,7 @@ fn build_output(
             logs: output.logs,
         });
 
-        // Merge state changes (later tx overwrites earlier for same key).
-        for (addr, write) in output.account_writes {
-            let account = state_changes
-                .entry(addr)
-                .or_insert_with(|| Account::new_not_existing(tx_idx));
-
-            match write {
-                AccountWrite::Updated(info) => {
-                    account.info = info;
-                    account.mark_touch();
-                }
-                AccountWrite::Destroyed => {
-                    account.mark_selfdestruct();
-                }
-            }
-        }
-
-        for (addr, slot, value) in output.storage_writes {
-            let account = state_changes
-                .entry(addr)
-                .or_insert_with(|| Account::new_not_existing(tx_idx));
-            account
-                .storage
-                .insert(slot, EvmStorageSlot::new_changed(U256::ZERO, value, tx_idx));
-        }
+        merge_tx_state(&mut state_changes, tx_idx, output.account_writes, output.storage_writes);
     }
 
     Ok(ParallelExecutionOutput {
@@ -387,29 +399,7 @@ where
             logs: output.logs,
         });
 
-        for (addr, write) in output.account_writes {
-            let account = state_changes
-                .entry(addr)
-                .or_insert_with(|| Account::new_not_existing(tx_idx));
-            match write {
-                AccountWrite::Updated(info) => {
-                    account.info = info;
-                    account.mark_touch();
-                }
-                AccountWrite::Destroyed => {
-                    account.mark_selfdestruct();
-                }
-            }
-        }
-
-        for (addr, slot, value) in output.storage_writes {
-            let account = state_changes
-                .entry(addr)
-                .or_insert_with(|| Account::new_not_existing(tx_idx));
-            account
-                .storage
-                .insert(slot, EvmStorageSlot::new_changed(U256::ZERO, value, tx_idx));
-        }
+        merge_tx_state(&mut state_changes, tx_idx, output.account_writes, output.storage_writes);
     }
 
     Ok(ParallelExecutionOutput {

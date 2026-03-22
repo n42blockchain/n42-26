@@ -25,9 +25,10 @@ impl ConsensusEngine {
         }
 
         let justify_qc = self.round_state.locked_qc().clone();
-        let message = signing_message(view, &block_hash);
-        let signature = self.secret_key.sign(&message);
+        let vote_msg = signing_message(view, &block_hash);
+        let signature = self.secret_key.sign(&vote_msg);
         let piggybacked_qc = self.previous_prepare_qc.take();
+        let chained = piggybacked_qc.is_some();
 
         let proposal = Proposal {
             view,
@@ -35,12 +36,12 @@ impl ConsensusEngine {
             justify_qc,
             proposer: self.my_index,
             signature,
-            prepare_qc: piggybacked_qc.clone(),
+            prepare_qc: piggybacked_qc,
         };
 
         tracing::debug!(target: "n42::cl::proposal",
             view, %block_hash,
-            chained = piggybacked_qc.is_some(),
+            chained,
             "proposing block"
         );
 
@@ -58,8 +59,8 @@ impl ConsensusEngine {
 
         // GossipSub does not deliver messages back to the sender, so the leader
         // must add its own vote directly to the collector.
-        let leader_vote_msg = signing_message(view, &block_hash);
-        let leader_vote_sig = self.secret_key.sign(&leader_vote_msg);
+        // Reuse the vote_msg computed above (same view + block_hash).
+        let leader_vote_sig = self.secret_key.sign(&vote_msg);
         if let Some(ref mut collector) = self.vote_collector {
             collector.add_verified_vote(self.my_index, leader_vote_sig)?;
         }

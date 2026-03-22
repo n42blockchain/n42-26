@@ -20,6 +20,7 @@
 //!                               [u32 LE credit_available]
 //!   num_txs = 0 → close connection gracefully.
 
+use crate::now_unix_ms;
 use alloy_consensus::{Transaction, transaction::Recovered};
 use alloy_primitives::{Address, U256};
 use reth_ethereum_primitives::TransactionSigned;
@@ -32,7 +33,6 @@ use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{Duration, Instant};
@@ -150,13 +150,6 @@ fn adaptive_pool_limit_txs() -> usize {
                 .map(|cap| DEFAULT_POOL_MAX_TXS.max(cap.saturating_mul(3)))
                 .unwrap_or(DEFAULT_POOL_MAX_TXS)
         })
-}
-
-fn now_unix_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
 }
 
 fn ingest_virtual_block_credit_ttl_ms() -> u64 {

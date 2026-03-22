@@ -25,12 +25,13 @@ pub struct VoteCollector {
 
 impl VoteCollector {
     pub fn new(view: ViewNumber, block_hash: B256, set_size: u32) -> Self {
+        let capacity = set_size as usize;
         Self {
             view,
             block_hash,
-            votes: HashMap::new(),
+            votes: HashMap::with_capacity(capacity),
             set_size,
-            verified: HashSet::new(),
+            verified: HashSet::with_capacity(capacity),
         }
     }
 
@@ -113,7 +114,7 @@ impl VoteCollector {
             });
         }
 
-        let mut valid_sigs: Vec<&BlsSignature> = Vec::new();
+        let mut valid_sigs: Vec<&BlsSignature> = Vec::with_capacity(self.votes.len());
         let mut signers = bitvec![u8, Msb0; 0; self.set_size as usize];
 
         for (&idx, sig) in &self.votes {
@@ -172,11 +173,12 @@ pub struct TimeoutCollector {
 
 impl TimeoutCollector {
     pub fn new(view: ViewNumber, set_size: u32) -> Self {
+        let capacity = set_size as usize;
         Self {
             view,
-            timeouts: HashMap::new(),
+            timeouts: HashMap::with_capacity(capacity),
             set_size,
-            verified: HashSet::new(),
+            verified: HashSet::with_capacity(capacity),
         }
     }
 
@@ -237,7 +239,7 @@ impl TimeoutCollector {
 
         let message = timeout_signing_message(self.view);
         let mut highest_qc: Option<&QuorumCertificate> = None;
-        let mut valid_sigs: Vec<&BlsSignature> = Vec::new();
+        let mut valid_sigs: Vec<&BlsSignature> = Vec::with_capacity(self.timeouts.len());
         let mut signers = bitvec![u8, Msb0; 0; self.set_size as usize];
 
         for (&idx, (sig, high_qc)) in &self.timeouts {

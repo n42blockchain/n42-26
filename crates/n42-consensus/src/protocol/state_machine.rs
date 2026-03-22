@@ -168,10 +168,9 @@ pub enum EngineOutput {
 /// Pending proposal state (retained for timeout cleanup; with optimistic voting,
 /// R1 votes are sent immediately and this struct is rarely populated).
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub(super) struct PendingProposal {
-    pub(super) view: ViewNumber,
-    pub(super) block_hash: B256,
+    pub(super) _view: ViewNumber,
+    pub(super) _block_hash: B256,
 }
 
 /// The HotStuff-2 consensus engine.
@@ -195,6 +194,9 @@ pub(super) struct PendingProposal {
 pub struct ConsensusEngine {
     pub(super) my_index: u32,
     pub(super) secret_key: BlsSecretKey,
+    /// Cached public key derived from `secret_key` to avoid repeated BLS scalar
+    /// multiplications in `local_validator_index_for_view` (called on every message).
+    pub(super) local_public_key: n42_primitives::BlsPublicKey,
     pub(super) epoch_manager: EpochManager,
     pub(super) round_state: RoundState,
     pub(super) pacemaker: Pacemaker,
@@ -249,9 +251,11 @@ impl ConsensusEngine {
         max_timeout_ms: u64,
         output_tx: mpsc::Sender<EngineOutput>,
     ) -> Self {
+        let local_public_key = secret_key.public_key();
         Self {
             my_index,
             secret_key,
+            local_public_key,
             epoch_manager,
             round_state: RoundState::new(),
             pacemaker: Pacemaker::new(base_timeout_ms, max_timeout_ms),
@@ -300,9 +304,11 @@ impl ConsensusEngine {
                 "recovered consecutive_timeouts exceeded sanity limit, capping"
             );
         }
+        let local_public_key = secret_key.public_key();
         Self {
             my_index,
             secret_key,
+            local_public_key,
             epoch_manager,
             round_state: RoundState::from_snapshot(
                 recovered_view,
@@ -745,10 +751,9 @@ impl ConsensusEngine {
     }
 
     fn sync_local_validator_index(&mut self) -> ConsensusResult<()> {
-        let local_pubkey = self.secret_key.public_key();
         let new_index = self
             .validator_set()
-            .index_of_public_key(&local_pubkey)
+            .index_of_public_key(&self.local_public_key)
             .ok_or(ConsensusError::LocalValidatorNotInSet {
                 epoch: self.epoch_manager.current_epoch(),
             })?;
@@ -780,9 +785,8 @@ impl ConsensusEngine {
     }
 
     pub(super) fn local_validator_index_for_view(&self, view: ViewNumber) -> Option<u32> {
-        let local_pubkey = self.secret_key.public_key();
         self.validator_set_for_view(view)
-            .index_of_public_key(&local_pubkey)
+            .index_of_public_key(&self.local_public_key)
     }
 
     pub(super) fn emit(&self, output: EngineOutput) -> ConsensusResult<()> {
