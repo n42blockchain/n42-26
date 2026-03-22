@@ -114,6 +114,12 @@ pub enum ConsensusError {
     /// Validator not found in the current set.
     #[error("validator {address} not found in the validator set")]
     ValidatorNotFound { address: alloy_primitives::Address },
+
+    /// A validator set transition is already staged for the next epoch.
+    /// No further proposals are accepted until the staged transition is activated
+    /// at the next epoch boundary.
+    #[error("epoch transition already staged; wait for the current staged set to be activated before proposing further changes")]
+    EpochTransitionAlreadyStaged,
 }
 
 /// Result type for consensus operations.
@@ -198,6 +204,30 @@ mod tests {
                     got: B256::repeat_byte(0xFF),
                 },
                 &["block hash mismatch"],
+            ),
+            (
+                ConsensusError::InsufficientValidators { have: 3, need: 4 },
+                &["insufficient validators", "3", "4"],
+            ),
+            (
+                ConsensusError::InsufficientQuorumOverlap { have: 2, need: 3 },
+                &["quorum overlap", "2", "3"],
+            ),
+            (
+                ConsensusError::ValidatorAlreadyExists {
+                    address: alloy_primitives::Address::ZERO,
+                },
+                &["already exists"],
+            ),
+            (
+                ConsensusError::ValidatorNotFound {
+                    address: alloy_primitives::Address::ZERO,
+                },
+                &["not found"],
+            ),
+            (
+                ConsensusError::EpochTransitionAlreadyStaged,
+                &["already staged"],
             ),
         ];
 

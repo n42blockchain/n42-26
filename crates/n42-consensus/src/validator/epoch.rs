@@ -281,8 +281,15 @@ impl EpochManager {
 
     /// Proposes adding a new validator at the next CommitQC.
     ///
-    /// Fails if the address already exists in the current set or pending additions.
+    /// Fails if:
+    /// - The address already exists in the current set or pending additions.
+    /// - A validator set transition is already staged (wait for epoch boundary first).
     pub fn propose_add_validator(&mut self, info: ValidatorInfo) -> ConsensusResult<()> {
+        // Block proposals when a transition is already staged but not yet activated.
+        if self.has_staged_next() {
+            return Err(ConsensusError::EpochTransitionAlreadyStaged);
+        }
+
         let addr = info.address;
 
         // Check not in current set
@@ -307,9 +314,17 @@ impl EpochManager {
 
     /// Proposes removing a validator at the next CommitQC.
     ///
-    /// Fails if the address is not in the current set, if the resulting
-    /// count would drop below MIN_VALIDATOR_COUNT, or if already pending removal.
+    /// Fails if:
+    /// - The address is not in the current set.
+    /// - The resulting count would drop below MIN_VALIDATOR_COUNT.
+    /// - The address is already pending removal (`ValidatorAlreadyExists`).
+    /// - A validator set transition is already staged (wait for epoch boundary first).
     pub fn propose_remove_validator(&mut self, addr: Address) -> ConsensusResult<()> {
+        // Block proposals when a transition is already staged but not yet activated.
+        if self.has_staged_next() {
+            return Err(ConsensusError::EpochTransitionAlreadyStaged);
+        }
+
         // Must exist in current set
         let current_infos = self.current_set.validator_infos();
         if !current_infos.iter().any(|v| v.address == addr) {
@@ -321,10 +336,13 @@ impl EpochManager {
             return Err(ConsensusError::ValidatorAlreadyExists { address: addr });
         }
 
-        // Check resulting size ≥ MIN_VALIDATOR_COUNT
-        let future_count = current_infos.len() + self.pending_adds.len()
-            - self.pending_removes.len()
-            - 1; // this removal
+        // Check resulting size ≥ MIN_VALIDATOR_COUNT.
+        // Use saturating arithmetic to avoid usize underflow on pathological input.
+        let future_count = current_infos
+            .len()
+            .saturating_add(self.pending_adds.len())
+            .saturating_sub(self.pending_removes.len())
+            .saturating_sub(1); // this removal
         if future_count < MIN_VALIDATOR_COUNT {
             return Err(ConsensusError::InsufficientValidators {
                 have: future_count,
@@ -797,5 +815,153 @@ mod tests {
         assert_eq!(em.current_epoch(), 1);
         assert_eq!(em.current_validator_set().len(), 6);
         assert!(!em.has_staged_next());
+    }
+
+    #[test]
+    fn test_propose_remove_nonexistent() {
+        let infos = make_validator_infos(4);
+        let vs = ValidatorSet::new(&infos, 1);
+        let mut em = EpochManager::with_epoch_length(vs, 10);
+
+        // Address 0xAB is not in the set
+        let err = em.propose_remove_validator(Address::with_last_byte(0xAB)).unwrap_err();
+        assert!(
+            matches!(err, ConsensusError::ValidatorNotFound { .. }),
+            "unexpected error: {err}"
+        );
+        assert!(!em.has_pending_changes());
+    }
+
+    #[test]
+    fn test_reject_duplicate_removal() {
+        // 5 validators so first removal is allowed; second removal of same address must fail.
+        let infos = make_validator_infos(5);
+        let vs = ValidatorSet::new(&infos, 1);
+        let mut em = EpochManager::with_epoch_length(vs, 10);
+
+        em.propose_remove_validator(Address::with_last_byte(0)).unwrap();
+        assert_eq!(em.pending_removes.len(), 1);
+
+        let err = em.propose_remove_validator(Address::with_last_byte(0)).unwrap_err();
+        assert!(
+            matches!(err, ConsensusError::ValidatorAlreadyExists { .. }),
+            "unexpected error: {err}"
+        );
+        // Queue length must stay at 1
+        assert_eq!(em.pending_removes.len(), 1);
+    }
+
+    #[test]
+    fn test_reject_proposal_when_already_staged() {
+        // After commit_pending_changes stages a new set, further proposals must be blocked
+        // until the staged set is activated at the next epoch boundary.
+        let infos = make_validator_infos(5);
+        let vs = ValidatorSet::new(&infos, 1);
+        let mut em = EpochManager::with_epoch_length(vs, 10);
+
+        // Stage a transition via the dynamic path
+        let sk = test_key(0x90);
+        let new_v = ValidatorInfo {
+            address: Address::with_last_byte(0x40),
+            bls_public_key: sk.public_key(),
+            p2p_peer_id: None,
+        };
+        em.propose_add_validator(new_v).unwrap();
+        em.commit_pending_changes().unwrap();
+        assert!(em.has_staged_next());
+
+        // Attempting to propose another add must fail
+        let sk2 = test_key(0x91);
+        let new_v2 = ValidatorInfo {
+            address: Address::with_last_byte(0x41),
+            bls_public_key: sk2.public_key(),
+            p2p_peer_id: None,
+        };
+        let err_add = em.propose_add_validator(new_v2).unwrap_err();
+        assert!(
+            matches!(err_add, ConsensusError::EpochTransitionAlreadyStaged),
+            "unexpected error: {err_add}"
+        );
+
+        // Attempting to propose a remove must also fail
+        let err_rm = em.propose_remove_validator(Address::with_last_byte(0)).unwrap_err();
+        assert!(
+            matches!(err_rm, ConsensusError::EpochTransitionAlreadyStaged),
+            "unexpected error: {err_rm}"
+        );
+
+        // After epoch advance, proposals are allowed again
+        em.advance_epoch();
+        assert!(!em.has_staged_next());
+
+        let sk3 = test_key(0x92);
+        let new_v3 = ValidatorInfo {
+            address: Address::with_last_byte(0x42),
+            bls_public_key: sk3.public_key(),
+            p2p_peer_id: None,
+        };
+        em.propose_add_validator(new_v3).unwrap();
+        assert!(em.has_pending_changes());
+    }
+
+    #[test]
+    fn test_commit_pending_changes_noop() {
+        // commit_pending_changes with no pending changes is a safe no-op.
+        let infos = make_validator_infos(4);
+        let vs = ValidatorSet::new(&infos, 1);
+        let mut em = EpochManager::with_epoch_length(vs, 10);
+
+        assert!(!em.has_pending_changes());
+        em.commit_pending_changes().unwrap(); // must not panic or error
+        assert!(!em.has_staged_next());
+        assert_eq!(em.current_validator_set().len(), 4);
+    }
+
+    #[test]
+    fn test_7_to_4_validator_reduction_chain() {
+        // Verify the safety table from the design doc:
+        // 7→6 ok, 6→5 ok, 5→4 ok (minimum), attempt 4→3 rejected.
+        let infos = make_validator_infos(7);
+        let vs = ValidatorSet::new(&infos, 2); // f=2, quorum=5
+
+        // Each reduction is a separate epoch to ensure quorum overlap is satisfied.
+        // overlap required = current quorum_size = 2f+1
+        // After 7→6: f=1, quorum=4; after 6→5: f=1, quorum=4; after 5→4: f=1, quorum=3.
+
+        // ── Epoch 0: 7 validators → remove one → stage 6 ──
+        let mut em = EpochManager::with_epoch_length(vs, 10);
+        assert_eq!(em.current_validator_set().len(), 7);
+
+        em.propose_remove_validator(Address::with_last_byte(6)).unwrap();
+        em.commit_pending_changes().unwrap();
+        em.advance_epoch(); // epoch 1: 6 validators
+
+        assert_eq!(em.current_validator_set().len(), 6);
+        assert_eq!(em.current_validator_set().fault_tolerance(), 1);
+
+        // ── Epoch 1 → 2: 6 → 5 ──
+        em.propose_remove_validator(Address::with_last_byte(5)).unwrap();
+        em.commit_pending_changes().unwrap();
+        em.advance_epoch(); // epoch 2: 5 validators
+
+        assert_eq!(em.current_validator_set().len(), 5);
+
+        // ── Epoch 2 → 3: 5 → 4 (minimum) ──
+        em.propose_remove_validator(Address::with_last_byte(4)).unwrap();
+        em.commit_pending_changes().unwrap();
+        em.advance_epoch(); // epoch 3: 4 validators
+
+        assert_eq!(em.current_validator_set().len(), 4);
+        assert_eq!(em.current_validator_set().fault_tolerance(), 1); // f=(4-1)/3=1
+
+        // ── Attempt 4 → 3: must be rejected ──
+        let err = em.propose_remove_validator(Address::with_last_byte(3)).unwrap_err();
+        assert!(
+            matches!(err, ConsensusError::InsufficientValidators { have: 3, need: 4 }),
+            "unexpected error: {err}"
+        );
+        // Set is still intact at 4 validators
+        assert_eq!(em.current_validator_set().len(), 4);
+        assert!(!em.has_pending_changes());
     }
 }
