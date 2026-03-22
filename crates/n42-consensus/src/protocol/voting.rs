@@ -248,6 +248,11 @@ impl ConsensusEngine {
 
         self.round_state.commit(commit_qc.clone());
 
+        // Commit-then-Activate: if validator changes were proposed, stage them now.
+        if self.epoch_manager.has_pending_changes() {
+            self.epoch_manager.commit_pending_changes()?;
+        }
+
         let decide = n42_primitives::consensus::Decide {
             view,
             block_hash,

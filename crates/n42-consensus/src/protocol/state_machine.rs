@@ -417,6 +417,26 @@ impl ConsensusEngine {
         &mut self.epoch_manager
     }
 
+    /// Proposes adding a new validator, to be committed at the next CommitQC.
+    ///
+    /// See [`EpochManager::propose_add_validator`] for safety constraints.
+    pub fn propose_add_validator(
+        &mut self,
+        info: n42_chainspec::ValidatorInfo,
+    ) -> crate::error::ConsensusResult<()> {
+        self.epoch_manager.propose_add_validator(info)
+    }
+
+    /// Proposes removing a validator, to be committed at the next CommitQC.
+    ///
+    /// See [`EpochManager::propose_remove_validator`] for safety constraints.
+    pub fn propose_remove_validator(
+        &mut self,
+        addr: alloy_primitives::Address,
+    ) -> crate::error::ConsensusResult<()> {
+        self.epoch_manager.propose_remove_validator(addr)
+    }
+
     /// Returns the timing from the last committed view.
     pub fn last_committed_view_timing(&self) -> Option<&ViewTiming> {
         self.last_committed_timing.as_ref()

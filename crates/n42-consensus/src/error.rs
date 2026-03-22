@@ -98,6 +98,22 @@ pub enum ConsensusError {
     /// Batch verification input exceeds the maximum allowed size.
     #[error("batch verification size {size} exceeds maximum {max}")]
     BatchTooLarge { size: usize, max: usize },
+
+    /// Validator set would fall below the minimum required size.
+    #[error("insufficient validators: have {have}, need at least {need}")]
+    InsufficientValidators { have: usize, need: usize },
+
+    /// New and old validator sets do not have sufficient quorum overlap for safe transition.
+    #[error("insufficient quorum overlap between old and new validator sets: have {have}, need {need}")]
+    InsufficientQuorumOverlap { have: usize, need: usize },
+
+    /// Validator already exists in the current set or pending additions.
+    #[error("validator {address} already exists in the validator set")]
+    ValidatorAlreadyExists { address: alloy_primitives::Address },
+
+    /// Validator not found in the current set.
+    #[error("validator {address} not found in the validator set")]
+    ValidatorNotFound { address: alloy_primitives::Address },
 }
 
 /// Result type for consensus operations.

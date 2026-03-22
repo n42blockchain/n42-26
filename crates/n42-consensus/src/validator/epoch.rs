@@ -1,11 +1,15 @@
 use super::set::ValidatorSet;
 use crate::error::{ConsensusError, ConsensusResult};
+use alloy_primitives::Address;
 use n42_chainspec::ValidatorInfo;
 use std::collections::BTreeMap;
 
 /// Maximum number of historical epoch validator sets to retain.
 /// Needed for verifying QCs from recent past epochs.
 const MAX_HISTORICAL_EPOCHS: usize = 3;
+
+/// Minimum number of validators required for BFT safety (f ≥ 1).
+pub const MIN_VALIDATOR_COUNT: usize = 4;
 
 /// Manages validator set transitions across epochs.
 ///
@@ -15,6 +19,12 @@ const MAX_HISTORICAL_EPOCHS: usize = 3;
 /// When `epoch_length > 0`, every `epoch_length` views constitute one epoch.
 /// The manager tracks the current, next (staged), and historical validator sets
 /// to support cross-epoch QC verification.
+///
+/// Dynamic validator set changes follow the commit-then-activate protocol:
+/// - `propose_add_validator` / `propose_remove_validator` queue changes in-memory.
+/// - `commit_pending_changes` is called at CommitQC time; it validates safety
+///   constraints and calls `stage_next_epoch` to schedule activation.
+/// - `advance_epoch` activates the staged set at the next epoch boundary.
 #[derive(Debug, Clone)]
 pub struct EpochManager {
     /// Number of views per epoch (0 = epochs disabled).
@@ -29,6 +39,10 @@ pub struct EpochManager {
     staged_info: Option<(Vec<ValidatorInfo>, u32)>,
     /// Historical validator sets keyed by epoch number (most recent MAX_HISTORICAL_EPOCHS).
     historical_sets: BTreeMap<u64, ValidatorSet>,
+    /// Validators proposed for addition at the next CommitQC.
+    pending_adds: Vec<ValidatorInfo>,
+    /// Validator addresses proposed for removal at the next CommitQC.
+    pending_removes: Vec<Address>,
 }
 
 impl EpochManager {
@@ -41,6 +55,8 @@ impl EpochManager {
             next_set: None,
             staged_info: None,
             historical_sets: BTreeMap::new(),
+            pending_adds: Vec::new(),
+            pending_removes: Vec::new(),
         }
     }
 
@@ -53,6 +69,8 @@ impl EpochManager {
             next_set: None,
             staged_info: None,
             historical_sets: BTreeMap::new(),
+            pending_adds: Vec::new(),
+            pending_removes: Vec::new(),
         }
     }
 
@@ -66,6 +84,8 @@ impl EpochManager {
             next_set: None,
             staged_info: None,
             historical_sets: BTreeMap::new(),
+            pending_adds: Vec::new(),
+            pending_removes: Vec::new(),
         }
     }
 
@@ -108,6 +128,8 @@ impl EpochManager {
             next_set: None,
             staged_info: None,
             historical_sets: historical,
+            pending_adds: Vec::new(),
+            pending_removes: Vec::new(),
         })
     }
 
@@ -253,6 +275,153 @@ impl EpochManager {
                 self.historical_sets.remove(&oldest);
             }
         }
+    }
+
+    // ── Commit-then-Activate: dynamic validator set changes ──────────────
+
+    /// Proposes adding a new validator at the next CommitQC.
+    ///
+    /// Fails if the address already exists in the current set or pending additions.
+    pub fn propose_add_validator(&mut self, info: ValidatorInfo) -> ConsensusResult<()> {
+        let addr = info.address;
+
+        // Check not in current set
+        let current_infos = self.current_set.validator_infos();
+        if current_infos.iter().any(|v| v.address == addr) {
+            return Err(ConsensusError::ValidatorAlreadyExists { address: addr });
+        }
+
+        // Check not already pending add
+        if self.pending_adds.iter().any(|v| v.address == addr) {
+            return Err(ConsensusError::ValidatorAlreadyExists { address: addr });
+        }
+
+        self.pending_adds.push(info);
+        tracing::info!(
+            target: "n42::cl::epoch",
+            %addr,
+            "validator queued for addition at next CommitQC"
+        );
+        Ok(())
+    }
+
+    /// Proposes removing a validator at the next CommitQC.
+    ///
+    /// Fails if the address is not in the current set, if the resulting
+    /// count would drop below MIN_VALIDATOR_COUNT, or if already pending removal.
+    pub fn propose_remove_validator(&mut self, addr: Address) -> ConsensusResult<()> {
+        // Must exist in current set
+        let current_infos = self.current_set.validator_infos();
+        if !current_infos.iter().any(|v| v.address == addr) {
+            return Err(ConsensusError::ValidatorNotFound { address: addr });
+        }
+
+        // Already pending removal?
+        if self.pending_removes.iter().any(|&a| a == addr) {
+            return Err(ConsensusError::ValidatorAlreadyExists { address: addr });
+        }
+
+        // Check resulting size ≥ MIN_VALIDATOR_COUNT
+        let future_count = current_infos.len() + self.pending_adds.len()
+            - self.pending_removes.len()
+            - 1; // this removal
+        if future_count < MIN_VALIDATOR_COUNT {
+            return Err(ConsensusError::InsufficientValidators {
+                have: future_count,
+                need: MIN_VALIDATOR_COUNT,
+            });
+        }
+
+        self.pending_removes.push(addr);
+        tracing::info!(
+            target: "n42::cl::epoch",
+            %addr,
+            "validator queued for removal at next CommitQC"
+        );
+        Ok(())
+    }
+
+    /// Returns whether there are any pending validator changes.
+    pub fn has_pending_changes(&self) -> bool {
+        !self.pending_adds.is_empty() || !self.pending_removes.is_empty()
+    }
+
+    /// Validates and commits pending changes by staging the new validator set.
+    ///
+    /// Called at CommitQC time. Validates safety constraints (minimum count,
+    /// quorum overlap), then calls `stage_next_epoch`. Clears the pending queues.
+    pub fn commit_pending_changes(&mut self) -> ConsensusResult<()> {
+        if !self.has_pending_changes() {
+            return Ok(());
+        }
+
+        let current_infos = self.current_set.validator_infos();
+        let remove_set: std::collections::HashSet<Address> =
+            self.pending_removes.iter().copied().collect();
+
+        // Build new validator list: current - removes + adds, sorted by address.
+        let mut new_validators: Vec<ValidatorInfo> = current_infos
+            .into_iter()
+            .filter(|v| !remove_set.contains(&v.address))
+            .chain(self.pending_adds.iter().cloned())
+            .collect();
+        new_validators.sort_by_key(|v| v.address);
+
+        // Validate transition safety.
+        self.validate_transition(&new_validators)?;
+
+        // Derive new f = (n - 1) / 3.
+        let new_f = ((new_validators.len() as u32).saturating_sub(1)) / 3;
+
+        self.stage_next_epoch(&new_validators, new_f)?;
+
+        tracing::info!(
+            target: "n42::cl::epoch",
+            adds = self.pending_adds.len(),
+            removes = self.pending_removes.len(),
+            new_count = new_validators.len(),
+            new_f,
+            "pending validator changes committed; staged for next epoch boundary"
+        );
+
+        self.pending_adds.clear();
+        self.pending_removes.clear();
+
+        Ok(())
+    }
+
+    /// Validates that a proposed new validator set satisfies safety invariants:
+    /// - At least MIN_VALIDATOR_COUNT validators.
+    /// - The intersection of current and new address sets is ≥ current quorum_size (2f+1),
+    ///   ensuring the Jolteon quorum-overlap liveness property.
+    fn validate_transition(&self, new_validators: &[ValidatorInfo]) -> ConsensusResult<()> {
+        // Minimum size check.
+        if new_validators.len() < MIN_VALIDATOR_COUNT {
+            return Err(ConsensusError::InsufficientValidators {
+                have: new_validators.len(),
+                need: MIN_VALIDATOR_COUNT,
+            });
+        }
+
+        // Quorum overlap check (Jolteon §4.3 liveness).
+        let current_addrs: std::collections::HashSet<Address> = self
+            .current_set
+            .validator_infos()
+            .into_iter()
+            .map(|v| v.address)
+            .collect();
+        let new_addrs: std::collections::HashSet<Address> =
+            new_validators.iter().map(|v| v.address).collect();
+        let overlap = current_addrs.intersection(&new_addrs).count();
+        let required = self.current_set.quorum_size(); // 2f+1
+        if overlap < required {
+            return Err(ConsensusError::InsufficientQuorumOverlap {
+                have: overlap,
+                need: required,
+            });
+        }
+
+        Ok(())
     }
 }
 
@@ -437,5 +606,196 @@ mod tests {
         assert_eq!(em.validator_set_for_view(5).len(), 4); // epoch 0
         assert_eq!(em.validator_set_for_view(15).len(), 5); // epoch 1
         assert_eq!(em.validator_set_for_view(25).len(), 6); // epoch 2 (current)
+    }
+
+    // ── Commit-then-Activate tests ───────────────────────────────────────
+
+    #[test]
+    fn test_propose_add_validator_success() {
+        let infos = make_validator_infos(4);
+        let vs = ValidatorSet::new(&infos, 1);
+        let mut em = EpochManager::with_epoch_length(vs, 10);
+
+        // Address 0x10 is not in the set (make_validator_infos uses 0x00..0x03)
+        let sk = test_key(0x20);
+        let new_validator = ValidatorInfo {
+            address: Address::with_last_byte(0x10),
+            bls_public_key: sk.public_key(),
+            p2p_peer_id: None,
+        };
+
+        assert!(!em.has_pending_changes());
+        em.propose_add_validator(new_validator).unwrap();
+        assert!(em.has_pending_changes());
+        assert_eq!(em.pending_adds.len(), 1);
+    }
+
+    #[test]
+    fn test_propose_remove_validator_success() {
+        let infos = make_validator_infos(5); // 5 validators so removal stays ≥ 4
+        let vs = ValidatorSet::new(&infos, 1);
+        let mut em = EpochManager::with_epoch_length(vs, 10);
+
+        em.propose_remove_validator(Address::with_last_byte(0)).unwrap();
+        assert!(em.has_pending_changes());
+        assert_eq!(em.pending_removes.len(), 1);
+    }
+
+    #[test]
+    fn test_reject_below_minimum_validators() {
+        let infos = make_validator_infos(4); // exactly 4 = minimum
+        let vs = ValidatorSet::new(&infos, 1);
+        let mut em = EpochManager::with_epoch_length(vs, 10);
+
+        let err = em.propose_remove_validator(Address::with_last_byte(0)).unwrap_err();
+        assert!(
+            matches!(err, ConsensusError::InsufficientValidators { have: 3, need: 4 }),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_reject_duplicate_add() {
+        let infos = make_validator_infos(4);
+        let vs = ValidatorSet::new(&infos, 1);
+        let mut em = EpochManager::with_epoch_length(vs, 10);
+
+        // Address 0x00 already exists in current set
+        let sk = test_key(0x50);
+        let dup = ValidatorInfo {
+            address: Address::with_last_byte(0),
+            bls_public_key: sk.public_key(),
+            p2p_peer_id: None,
+        };
+        let err = em.propose_add_validator(dup).unwrap_err();
+        assert!(
+            matches!(err, ConsensusError::ValidatorAlreadyExists { .. }),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_simultaneous_add_and_remove() {
+        // Start with 5 validators (0x00..0x04), remove 0x00, add 0x10
+        let infos = make_validator_infos(5);
+        let vs = ValidatorSet::new(&infos, 1);
+        let mut em = EpochManager::with_epoch_length(vs, 10);
+
+        let sk = test_key(0x30);
+        let new_v = ValidatorInfo {
+            address: Address::with_last_byte(0x10),
+            bls_public_key: sk.public_key(),
+            p2p_peer_id: None,
+        };
+        em.propose_add_validator(new_v).unwrap();
+        em.propose_remove_validator(Address::with_last_byte(0)).unwrap();
+
+        em.commit_pending_changes().unwrap();
+
+        assert!(!em.has_pending_changes());
+        assert!(em.has_staged_next());
+
+        // Advance epoch and verify new set
+        em.advance_epoch();
+        let new_infos = em.current_validator_set().validator_infos();
+        assert_eq!(new_infos.len(), 5); // 5 - 1 + 1 = 5
+        // 0x00 should be gone, 0x10 should be present
+        assert!(!new_infos.iter().any(|v| v.address == Address::with_last_byte(0)));
+        assert!(new_infos.iter().any(|v| v.address == Address::with_last_byte(0x10)));
+    }
+
+    #[test]
+    fn test_validate_transition_quorum_overlap() {
+        // 4 validators (f=1, quorum=3). New set must overlap ≥ 3 with current.
+        let infos = make_validator_infos(4); // addresses 0x00..0x03
+        let vs = ValidatorSet::new(&infos, 1);
+        let em = EpochManager::with_epoch_length(vs, 10);
+
+        // New set: keep only 0x00 (overlap=1 < 3) — should fail
+        let sk0 = test_key(0x60);
+        let sk1 = test_key(0x61);
+        let sk2 = test_key(0x62);
+        let completely_new: Vec<ValidatorInfo> = vec![
+            ValidatorInfo { address: Address::with_last_byte(0),    bls_public_key: infos[0].bls_public_key.clone(), p2p_peer_id: None },
+            ValidatorInfo { address: Address::with_last_byte(0x20), bls_public_key: sk0.public_key(), p2p_peer_id: None },
+            ValidatorInfo { address: Address::with_last_byte(0x21), bls_public_key: sk1.public_key(), p2p_peer_id: None },
+            ValidatorInfo { address: Address::with_last_byte(0x22), bls_public_key: sk2.public_key(), p2p_peer_id: None },
+        ];
+        let err = em.validate_transition(&completely_new).unwrap_err();
+        assert!(
+            matches!(err, ConsensusError::InsufficientQuorumOverlap { have: 1, need: 3 }),
+            "unexpected error: {err}"
+        );
+
+        // New set: keep 0x00..0x02 (overlap=3 == 3) — should succeed
+        let sk3 = test_key(0x63);
+        let valid_new: Vec<ValidatorInfo> = vec![
+            ValidatorInfo { address: Address::with_last_byte(0), bls_public_key: infos[0].bls_public_key.clone(), p2p_peer_id: None },
+            ValidatorInfo { address: Address::with_last_byte(1), bls_public_key: infos[1].bls_public_key.clone(), p2p_peer_id: None },
+            ValidatorInfo { address: Address::with_last_byte(2), bls_public_key: infos[2].bls_public_key.clone(), p2p_peer_id: None },
+            ValidatorInfo { address: Address::with_last_byte(0x30), bls_public_key: sk3.public_key(), p2p_peer_id: None },
+        ];
+        em.validate_transition(&valid_new).unwrap();
+    }
+
+    #[test]
+    fn test_deterministic_ordering() {
+        // 5 validators; add one with address < existing addresses to verify sorting
+        let infos = make_validator_infos(5); // 0x00..0x04
+        let vs = ValidatorSet::new(&infos, 1);
+        let mut em = EpochManager::with_epoch_length(vs, 10);
+
+        // We'll add a validator with a high address and check it ends up at the end
+        let sk = test_key(0x70);
+        let high_addr_v = ValidatorInfo {
+            address: Address::with_last_byte(0xFF),
+            bls_public_key: sk.public_key(),
+            p2p_peer_id: None,
+        };
+        em.propose_add_validator(high_addr_v).unwrap();
+        em.commit_pending_changes().unwrap();
+        em.advance_epoch();
+
+        let new_infos = em.current_validator_set().validator_infos();
+        // Verify ascending address order
+        for w in new_infos.windows(2) {
+            assert!(w[0].address <= w[1].address, "validators not sorted by address");
+        }
+        // Last element should be 0xFF
+        assert_eq!(new_infos.last().unwrap().address, Address::with_last_byte(0xFF));
+    }
+
+    #[test]
+    fn test_full_epoch_flow() {
+        // 5 validators, epoch_length=10. Propose add, commit, advance at boundary.
+        let infos = make_validator_infos(5);
+        let vs = ValidatorSet::new(&infos, 1);
+        let mut em = EpochManager::with_epoch_length(vs, 10);
+
+        assert_eq!(em.current_validator_set().len(), 5);
+        assert!(!em.has_pending_changes());
+
+        // Stage a new validator
+        let sk = test_key(0x80);
+        let new_v = ValidatorInfo {
+            address: Address::with_last_byte(0x50),
+            bls_public_key: sk.public_key(),
+            p2p_peer_id: None,
+        };
+        em.propose_add_validator(new_v).unwrap();
+        assert!(em.has_pending_changes());
+
+        // Simulate CommitQC: commit_pending_changes stages the new set
+        em.commit_pending_changes().unwrap();
+        assert!(!em.has_pending_changes());
+        assert!(em.has_staged_next());
+        // Current set unchanged yet
+        assert_eq!(em.current_validator_set().len(), 5);
+
+        // Simulate epoch boundary: advance_epoch activates the staged set
+        assert!(em.advance_epoch());
+        assert_eq!(em.current_epoch(), 1);
+        assert_eq!(em.current_validator_set().len(), 6);
+        assert!(!em.has_staged_next());
     }
 }

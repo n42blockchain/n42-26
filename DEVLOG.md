@@ -70,6 +70,8 @@ Logs are split into separate files by phase for easy maintenance:
 | [devlog-50-cachehit-fastpath-90k-tps](docs/devlog-50-cachehit-fastpath-90k-tps.md) | Cache Hit Fast Path: **90,949 TPS** | Performance |
 | [devlog-51-jmt-blake3-integration](docs/devlog-51-jmt-blake3-integration.md) | JMT + Blake3: 16-shard Parallel, Prometheus, Mobile Proofs | Architecture |
 | [devlog-52-jmt-full-integration](docs/devlog-52-jmt-full-integration.md) | JMT Full Integration: Orchestrator, RPC, Snapshot, Dart SDK | Architecture |
+| [devlog-53-zk-sidecar-proof-system](docs/devlog-53-zk-sidecar-proof-system.md) | ZK Sidecar Proof System: SP1 zkVM Backend | Architecture |
+| [devlog-54-dynamic-validator-set](docs/devlog-54-dynamic-validator-set.md) | Commit-then-Activate: Dynamic Validator Set Change Protocol | Feature |
 
 ### Standalone Documents
 
