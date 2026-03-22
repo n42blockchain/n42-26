@@ -279,22 +279,26 @@ impl EpochManager {
 
     // ── Commit-then-Activate: dynamic validator set changes ──────────────
 
-    /// Proposes adding a new validator at the next CommitQC.
-    ///
-    /// Fails if:
-    /// - The address already exists in the current set or pending additions.
-    /// - A validator set transition is already staged (wait for epoch boundary first).
-    pub fn propose_add_validator(&mut self, info: ValidatorInfo) -> ConsensusResult<()> {
-        // Block proposals when a transition is already staged but not yet activated.
+    /// Checks that proposals are allowed: no epoch transition may be staged yet.
+    fn check_proposals_allowed(&self) -> ConsensusResult<()> {
         if self.has_staged_next() {
             return Err(ConsensusError::EpochTransitionAlreadyStaged);
         }
+        Ok(())
+    }
+
+    /// Proposes adding a new validator at the next CommitQC.
+    ///
+    /// Fails if:
+    /// - A validator set transition is already staged (wait for epoch boundary first).
+    /// - The address already exists in the current set or pending additions.
+    pub fn propose_add_validator(&mut self, info: ValidatorInfo) -> ConsensusResult<()> {
+        self.check_proposals_allowed()?;
 
         let addr = info.address;
 
-        // Check not in current set
-        let current_infos = self.current_set.validator_infos();
-        if current_infos.iter().any(|v| v.address == addr) {
+        // Check not in current set (O(n) scan over ValidatorEntry, no Vec alloc)
+        if self.current_set.contains_address(&addr) {
             return Err(ConsensusError::ValidatorAlreadyExists { address: addr });
         }
 
@@ -315,31 +319,26 @@ impl EpochManager {
     /// Proposes removing a validator at the next CommitQC.
     ///
     /// Fails if:
-    /// - The address is not in the current set.
-    /// - The resulting count would drop below MIN_VALIDATOR_COUNT.
-    /// - The address is already pending removal (`ValidatorAlreadyExists`).
     /// - A validator set transition is already staged (wait for epoch boundary first).
+    /// - The address is not in the current set.
+    /// - The address is already pending removal.
+    /// - The resulting count would drop below MIN_VALIDATOR_COUNT.
     pub fn propose_remove_validator(&mut self, addr: Address) -> ConsensusResult<()> {
-        // Block proposals when a transition is already staged but not yet activated.
-        if self.has_staged_next() {
-            return Err(ConsensusError::EpochTransitionAlreadyStaged);
-        }
+        self.check_proposals_allowed()?;
 
-        // Must exist in current set
-        let current_infos = self.current_set.validator_infos();
-        if !current_infos.iter().any(|v| v.address == addr) {
+        // Must exist in current set (O(n) scan, no Vec alloc)
+        if !self.current_set.contains_address(&addr) {
             return Err(ConsensusError::ValidatorNotFound { address: addr });
         }
 
         // Already pending removal?
         if self.pending_removes.iter().any(|&a| a == addr) {
-            return Err(ConsensusError::ValidatorAlreadyExists { address: addr });
+            return Err(ConsensusError::ValidatorAlreadyPendingRemoval { address: addr });
         }
 
         // Check resulting size ≥ MIN_VALIDATOR_COUNT.
-        // Use saturating arithmetic to avoid usize underflow on pathological input.
-        let future_count = current_infos
-            .len()
+        // Uses saturating arithmetic to avoid usize underflow on pathological input.
+        let future_count = (self.current_set.len() as usize)
             .saturating_add(self.pending_adds.len())
             .saturating_sub(self.pending_removes.len())
             .saturating_sub(1); // this removal
@@ -366,9 +365,13 @@ impl EpochManager {
 
     /// Validates and commits pending changes by staging the new validator set.
     ///
-    /// Called at CommitQC time. Validates safety constraints (minimum count,
-    /// quorum overlap), then calls `stage_next_epoch`. Clears the pending queues.
-    pub fn commit_pending_changes(&mut self) -> ConsensusResult<()> {
+    /// Called at CommitQC time by the protocol layer (voting.rs / decision.rs).
+    /// Validates safety constraints (minimum count, quorum overlap), then calls
+    /// `stage_next_epoch`. Clears the pending queues on success.
+    ///
+    /// # Idempotency
+    /// No-op when called with an empty pending queue.
+    pub(crate) fn commit_pending_changes(&mut self) -> ConsensusResult<()> {
         if !self.has_pending_changes() {
             return Ok(());
         }
@@ -385,18 +388,22 @@ impl EpochManager {
             .collect();
         new_validators.sort_by_key(|v| v.address);
 
+        // Capture counts before staging so the log is accurate even if stage fails.
+        let adds_count = self.pending_adds.len();
+        let removes_count = self.pending_removes.len();
+
         // Validate transition safety.
         self.validate_transition(&new_validators)?;
 
-        // Derive new f = (n - 1) / 3.
-        let new_f = ((new_validators.len() as u32).saturating_sub(1)) / 3;
+        // Derive new f = (n - 1) / 3, reusing the shared formula from ValidatorSet.
+        let new_f = ValidatorSet::max_fault_tolerance_for_len(new_validators.len());
 
         self.stage_next_epoch(&new_validators, new_f)?;
 
         tracing::info!(
             target: "n42::cl::epoch",
-            adds = self.pending_adds.len(),
-            removes = self.pending_removes.len(),
+            adds = adds_count,
+            removes = removes_count,
             new_count = new_validators.len(),
             new_f,
             "pending validator changes committed; staged for next epoch boundary"
@@ -411,7 +418,10 @@ impl EpochManager {
     /// Validates that a proposed new validator set satisfies safety invariants:
     /// - At least MIN_VALIDATOR_COUNT validators.
     /// - The intersection of current and new address sets is ≥ current quorum_size (2f+1),
-    ///   ensuring the Jolteon quorum-overlap liveness property.
+    ///   ensuring the Jolteon §4.3 quorum-overlap liveness property.
+    ///
+    /// Accepts the pre-built `new_validators` slice to avoid a redundant
+    /// `validator_infos()` allocation (the caller already holds current_infos).
     fn validate_transition(&self, new_validators: &[ValidatorInfo]) -> ConsensusResult<()> {
         // Minimum size check.
         if new_validators.len() < MIN_VALIDATOR_COUNT {
@@ -422,15 +432,16 @@ impl EpochManager {
         }
 
         // Quorum overlap check (Jolteon §4.3 liveness).
-        let current_addrs: std::collections::HashSet<Address> = self
+        // Build a HashSet of new addresses, then filter current validators through it —
+        // this avoids materialising a second Vec<ValidatorInfo> for the current set.
+        let new_addrs: std::collections::HashSet<Address> =
+            new_validators.iter().map(|v| v.address).collect();
+        let overlap = self
             .current_set
             .validator_infos()
             .into_iter()
-            .map(|v| v.address)
-            .collect();
-        let new_addrs: std::collections::HashSet<Address> =
-            new_validators.iter().map(|v| v.address).collect();
-        let overlap = current_addrs.intersection(&new_addrs).count();
+            .filter(|v| new_addrs.contains(&v.address))
+            .count();
         let required = self.current_set.quorum_size(); // 2f+1
         if overlap < required {
             return Err(ConsensusError::InsufficientQuorumOverlap {
@@ -844,7 +855,7 @@ mod tests {
 
         let err = em.propose_remove_validator(Address::with_last_byte(0)).unwrap_err();
         assert!(
-            matches!(err, ConsensusError::ValidatorAlreadyExists { .. }),
+            matches!(err, ConsensusError::ValidatorAlreadyPendingRemoval { .. }),
             "unexpected error: {err}"
         );
         // Queue length must stay at 1

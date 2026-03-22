@@ -25,7 +25,7 @@ struct ValidatorEntry {
 }
 
 impl ValidatorSet {
-    fn max_fault_tolerance_for_len(len: usize) -> u32 {
+    pub(crate) fn max_fault_tolerance_for_len(len: usize) -> u32 {
         (len as u32).saturating_sub(1) / 3
     }
 
@@ -131,6 +131,11 @@ impl ValidatorSet {
     /// Checks if a validator index is valid.
     pub fn contains(&self, index: u32) -> bool {
         (index as usize) < self.validators.len()
+    }
+
+    /// Returns true if the set contains a validator with the given address.
+    pub fn contains_address(&self, addr: &Address) -> bool {
+        self.validators.iter().any(|v| v.address == *addr)
     }
 
     /// Returns all public keys as references, in index order.

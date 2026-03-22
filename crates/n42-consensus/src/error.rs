@@ -115,6 +115,10 @@ pub enum ConsensusError {
     #[error("validator {address} not found in the validator set")]
     ValidatorNotFound { address: alloy_primitives::Address },
 
+    /// Validator is already queued for removal and cannot be removed again.
+    #[error("validator {address} is already pending removal")]
+    ValidatorAlreadyPendingRemoval { address: alloy_primitives::Address },
+
     /// A validator set transition is already staged for the next epoch.
     /// No further proposals are accepted until the staged transition is activated
     /// at the next epoch boundary.
@@ -224,6 +228,12 @@ mod tests {
                     address: alloy_primitives::Address::ZERO,
                 },
                 &["not found"],
+            ),
+            (
+                ConsensusError::ValidatorAlreadyPendingRemoval {
+                    address: alloy_primitives::Address::ZERO,
+                },
+                &["already pending removal"],
             ),
             (
                 ConsensusError::EpochTransitionAlreadyStaged,
