@@ -69,6 +69,7 @@ parse_args() {
     NO_MOBILE_SIM=false
     DATA_DIR=""
     BLOCK_INTERVAL_MS=2000
+    PUBLIC_IP="localhost"
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -106,6 +107,10 @@ parse_args() {
                 ;;
             --data-dir)
                 DATA_DIR="$2"
+                shift 2
+                ;;
+            --public-ip)
+                PUBLIC_IP="$2"
                 shift 2
                 ;;
             --block-interval)
@@ -668,8 +673,10 @@ services:
       ETHEREUM_JSONRPC_WS_URL: ws://host.docker.internal:${BASE_WS}
   frontend:
     environment:
-      NEXT_PUBLIC_APP_HOST: localhost
+      NEXT_PUBLIC_APP_HOST: ${PUBLIC_IP}
       NEXT_PUBLIC_APP_PROTOCOL: http
+      NEXT_PUBLIC_API_HOST: ${PUBLIC_IP}
+      NEXT_PUBLIC_API_PROTOCOL: http
 YAMLEOF
 
     if docker compose \
