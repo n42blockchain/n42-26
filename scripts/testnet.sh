@@ -571,6 +571,7 @@ start_validators() {
             --chain "$GENESIS_FILE" \
             --datadir "$datadir" \
             --http \
+            --http.addr "0.0.0.0" \
             --http.port "$http_port" \
             --http.api eth,net,web3,txpool,rpc \
             --http.corsdomain "*" \
