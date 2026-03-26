@@ -12,8 +12,10 @@ use reth_primitives_traits::{
 use reth_storage_errors::any::AnyError;
 use std::sync::Arc;
 
-/// The inner EthEvmConfig type we delegate to.
-type InnerConfig = EthEvmConfig<ChainSpec>;
+use crate::evm_factory::N42EvmFactory;
+
+/// The inner EthEvmConfig type we delegate to (parameterized with N42EvmFactory).
+type InnerConfig = EthEvmConfig<ChainSpec, N42EvmFactory>;
 
 /// N42 EVM configuration wrapping `EthEvmConfig<ChainSpec>`.
 /// All `ConfigureEvm` methods delegate to the inner config.
@@ -28,7 +30,7 @@ impl N42EvmConfig {
     /// Creates a new N42 EVM configuration from a chain spec.
     pub fn new(chain_spec: Arc<ChainSpec>) -> Self {
         Self {
-            inner: EthEvmConfig::new(chain_spec),
+            inner: EthEvmConfig::new_with_evm_factory(chain_spec, N42EvmFactory),
         }
     }
 

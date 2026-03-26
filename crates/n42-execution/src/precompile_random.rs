@@ -1,11 +1,42 @@
-//! N42 randomness precompile — pure logic (no EVM registration yet).
+//! N42 randomness precompile — pure logic + revm adapter.
 //!
 //! Three function selectors (first byte of input):
 //! - `0x00`: `getRandom()` → `keccak256(prevrandao)` (32 bytes, 100 gas)
 //! - `0x01`: `getRandomInRange(max)` → `keccak256(prevrandao) % max` (32 bytes, 150 gas)
 //! - `0x02`: `getRandomWithSeed(seed)` → `keccak256(prevrandao || seed)` (32 bytes, 100 gas)
 
-use alloy_primitives::{keccak256, B256, U256};
+use alloy_primitives::{keccak256, Bytes, B256, U256};
+use revm::precompile::{PrecompileError, PrecompileOutput, PrecompileResult};
+use std::cell::Cell;
+
+thread_local! {
+    /// Block's prevrandao, injected before EVM execution.
+    /// Used by the randomness precompile since revm's precompile function signature
+    /// does not provide access to the block environment.
+    static BLOCK_PREVRANDAO: Cell<B256> = const { Cell::new(B256::ZERO) };
+}
+
+/// Set the block's prevrandao for the randomness precompile.
+/// Must be called before each block's EVM execution.
+pub fn set_block_randomness(prevrandao: B256) {
+    BLOCK_PREVRANDAO.set(prevrandao);
+}
+
+/// Get the current block's prevrandao.
+fn get_block_randomness() -> B256 {
+    BLOCK_PREVRANDAO.get()
+}
+
+/// Adapter for revm precompile registration.
+/// Reads prevrandao from thread-local storage set by [`set_block_randomness()`].
+pub fn revm_precompile_fn(input: &[u8], gas_limit: u64) -> PrecompileResult {
+    let prevrandao = get_block_randomness();
+    match execute_randomness(input, gas_limit, prevrandao) {
+        Ok(result) => Ok(PrecompileOutput::new(result.gas_used, Bytes::from(result.output))),
+        Err(PrecompileCallError::OutOfGas) => Err(PrecompileError::OutOfGas),
+        Err(e) => Err(PrecompileError::other(e.to_string())),
+    }
+}
 
 /// N42 randomness precompile address (for future EVM registration).
 pub const RANDOMNESS_ADDRESS: [u8; 20] = {
