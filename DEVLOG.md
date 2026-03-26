@@ -72,6 +72,7 @@ Logs are split into separate files by phase for easy maintenance:
 | [devlog-52-jmt-full-integration](docs/devlog-52-jmt-full-integration.md) | JMT Full Integration: Orchestrator, RPC, Snapshot, Dart SDK | Architecture |
 | [devlog-53-zk-sidecar-proof-system](docs/devlog-53-zk-sidecar-proof-system.md) | ZK Sidecar Proof System: SP1 zkVM Backend | Architecture |
 | [devlog-54-dynamic-validator-set](docs/devlog-54-dynamic-validator-set.md) | Commit-then-Activate: Dynamic Validator Set Change Protocol | Feature |
+| [devlog-55-audit-reth-upgrade-tier1](docs/devlog-55-audit-reth-upgrade-tier1.md) | Go Audit Fix + reth Upgrade + Rotor/Precompile/DA/Auth | Feature |
 
 ### Standalone Documents
 

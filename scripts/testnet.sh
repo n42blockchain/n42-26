@@ -309,7 +309,11 @@ setup_python_venv() {
         log "Creating Python virtual environment at $VENV_DIR..."
         python3 -m venv "$VENV_DIR"
     fi
-    source "$VENV_DIR/bin/activate"
+    if [[ -f "$VENV_DIR/Scripts/activate" ]]; then
+        source "$VENV_DIR/Scripts/activate"
+    else
+        source "$VENV_DIR/bin/activate"
+    fi
 
     if ! python3 -c "import eth_account" 2>/dev/null; then
         log "Installing Python dependencies..."
@@ -330,11 +334,17 @@ build_binaries() {
         build_dir="debug"
     fi
 
-    log "Building n42-node and n42-mobile-sim (${build_dir}) - this may take a few minutes..."
-    cd "$PROJECT_DIR"
-    cargo build $build_flag --bin n42-node --bin n42-mobile-sim 2>&1 | tail -5
-
     BINARY="$PROJECT_DIR/target/${build_dir}/n42-node"
+    # Skip build if binary already exists (e.g., pre-built with --no-default-features on Windows)
+    if [[ -f "$BINARY" ]] || [[ -f "${BINARY}.exe" ]]; then
+        [[ -f "${BINARY}.exe" ]] && [[ ! -f "$BINARY" ]] && BINARY="${BINARY}.exe"
+        log "Binary already exists, skipping build: $BINARY"
+    else
+        log "Building n42-node and n42-mobile-sim (${build_dir}) - this may take a few minutes..."
+        cd "$PROJECT_DIR"
+        cargo build $build_flag --bin n42-node --bin n42-mobile-sim 2>&1 | tail -5
+    fi
+
     if [[ ! -f "$BINARY" ]]; then
         err "Failed to build n42-node binary"
         exit 1

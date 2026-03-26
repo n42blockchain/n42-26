@@ -49,7 +49,7 @@ A high-performance blockchain system combining **HotStuff-2** BFT consensus with
 
 - **HotStuff-2 Consensus**: 2-round optimistic commit with 3-round timeout recovery
 - **BLS12-381 Signatures**: Aggregated signatures for compact quorum certificates
-- **reth Latest Upstream Integration**: Tracks `paradigmxyz/reth` `origin/main` at `ae2c916f61`, with N42-specific payload/cache patches applied on top
+- **reth Latest Upstream Integration**: Tracks `paradigmxyz/reth` `origin/main` at `e3dbdbb115`, with N42-specific payload/cache patches applied on top
 - **Jellyfish Merkle Tree (JMT)**: Blake3 hashing, 16-shard parallel updates, Merkle proofs via RPC
 - **Compact Block Propagation**: Leader caches execution output, followers skip EVM re-execution (cache hit ~3ms)
 - **Optimistic Voting**: Followers vote immediately after proposal validation, before block import
