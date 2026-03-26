@@ -237,6 +237,8 @@ pub struct ConsensusOrchestrator {
     consensus_state: Option<Arc<SharedConsensusState>>,
     head_block_hash: B256,
     last_commit_qc: Option<QuorumCertificate>,
+    /// Cached `keccak256(commit_qc.aggregate_signature)` — avoids re-hashing on every payload build.
+    prev_randao_cache: B256,
     block_ready_tx: mpsc::Sender<B256>,
     block_ready_rx: mpsc::Receiver<B256>,
     fee_recipient: Address,
@@ -361,6 +363,7 @@ impl ConsensusOrchestrator {
             consensus_state: None,
             head_block_hash: B256::ZERO,
             last_commit_qc: None,
+            prev_randao_cache: B256::ZERO,
             block_ready_tx,
             block_ready_rx,
             fee_recipient: Address::ZERO,
@@ -542,6 +545,7 @@ impl ConsensusOrchestrator {
             consensus_state: Some(consensus_state),
             head_block_hash,
             last_commit_qc: None,
+            prev_randao_cache: B256::ZERO,
             block_ready_tx,
             block_ready_rx,
             fee_recipient,
@@ -661,6 +665,7 @@ impl ConsensusOrchestrator {
         self
     }
 
+    /// Installs the admin command receiver for RPC-originated validator reconfig requests.
     pub fn with_admin_rx(mut self, rx: mpsc::Receiver<crate::consensus_state::AdminCommand>) -> Self {
         self.admin_rx = Some(rx);
         self

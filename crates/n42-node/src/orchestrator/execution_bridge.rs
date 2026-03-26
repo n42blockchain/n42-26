@@ -275,9 +275,7 @@ impl ConsensusOrchestrator {
 
         PayloadAttributes {
             timestamp,
-            prev_randao: self.last_commit_qc.as_ref().map(|qc| {
-                alloy_primitives::keccak256(qc.aggregate_signature.to_bytes())
-            }).unwrap_or(B256::ZERO),
+            prev_randao: self.prev_randao_cache,
             suggested_fee_recipient: self.fee_recipient,
             withdrawals: Some(withdrawals),
             parent_beacon_block_root: Some(B256::ZERO),

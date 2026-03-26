@@ -259,6 +259,21 @@ impl N42RpcServer {
         self.zk_scheduler = Some(scheduler);
         self
     }
+    fn parse_bls_pubkey(hex_str: &str) -> RpcResult<BlsPublicKey> {
+        let bytes = hex::decode(hex_str.strip_prefix("0x").unwrap_or(hex_str)).map_err(|e| {
+            ErrorObjectOwned::owned(-32602, format!("invalid pubkey hex: {e}"), None::<()>)
+        })?;
+        let arr: [u8; 48] = bytes.try_into().map_err(|v: Vec<u8>| {
+            ErrorObjectOwned::owned(
+                -32602,
+                format!("pubkey must be exactly 48 bytes, got {}", v.len()),
+                None::<()>,
+            )
+        })?;
+        BlsPublicKey::from_bytes(&arr).map_err(|e| {
+            ErrorObjectOwned::owned(-32602, format!("invalid BLS public key: {e}"), None::<()>)
+        })
+    }
 }
 
 #[async_trait::async_trait]
@@ -355,22 +370,8 @@ impl N42ApiServer for N42RpcServer {
         block_hash: B256,
         slot: u64,
     ) -> RpcResult<AttestationResponse> {
-        let pubkey_bytes =
-            hex::decode(pubkey.strip_prefix("0x").unwrap_or(&pubkey)).map_err(|e| {
-                ErrorObjectOwned::owned(-32602, format!("invalid pubkey hex: {e}"), None::<()>)
-            })?;
-
-        let pubkey_array: [u8; 48] = pubkey_bytes.try_into().map_err(|v: Vec<u8>| {
-            ErrorObjectOwned::owned(
-                -32602,
-                format!("pubkey must be exactly 48 bytes, got {}", v.len()),
-                None::<()>,
-            )
-        })?;
-
-        let bls_pubkey = BlsPublicKey::from_bytes(&pubkey_array).map_err(|e| {
-            ErrorObjectOwned::owned(-32602, format!("invalid BLS public key: {e}"), None::<()>)
-        })?;
+        let bls_pubkey = Self::parse_bls_pubkey(&pubkey)?;
+        let pubkey_array = bls_pubkey.to_bytes();
 
         let sig_bytes =
             hex::decode(signature.strip_prefix("0x").unwrap_or(&signature)).map_err(|e| {
@@ -741,13 +742,7 @@ impl N42ApiServer for N42RpcServer {
         address: Address,
         bls_pubkey: String,
     ) -> RpcResult<String> {
-        let pubkey_bytes = hex::decode(bls_pubkey.strip_prefix("0x").unwrap_or(&bls_pubkey))
-            .map_err(|e| ErrorObjectOwned::owned(-32602, format!("invalid pubkey hex: {e}"), None::<()>))?;
-        let pubkey_array: [u8; 48] = pubkey_bytes.try_into().map_err(|v: Vec<u8>| {
-            ErrorObjectOwned::owned(-32602, format!("pubkey must be 48 bytes, got {}", v.len()), None::<()>)
-        })?;
-        let bls_pk = BlsPublicKey::from_bytes(&pubkey_array)
-            .map_err(|e| ErrorObjectOwned::owned(-32602, format!("invalid BLS key: {e}"), None::<()>))?;
+        let bls_pk = Self::parse_bls_pubkey(&bls_pubkey)?;
 
         let info = n42_chainspec::ValidatorInfo {
             address,

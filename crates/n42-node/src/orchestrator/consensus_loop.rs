@@ -358,9 +358,10 @@ impl ConsensusOrchestrator {
             state.notify_block_committed(block_hash, self.committed_block_count);
         }
 
-        self.store_committed_block(view, block_hash, commit_qc.clone());
-        self.head_block_hash = block_hash;
+        self.prev_randao_cache = alloy_primitives::keccak256(commit_qc.aggregate_signature.to_bytes());
         self.last_commit_qc = Some(commit_qc.clone());
+        self.store_committed_block(view, block_hash, commit_qc);
+        self.head_block_hash = block_hash;
 
         // JMT background update: extract BundleState from pending block data.
         if let Some(ref jmt) = self.jmt {
