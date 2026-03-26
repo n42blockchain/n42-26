@@ -261,6 +261,9 @@ impl ConsensusEngine {
         self.emit(EngineOutput::BroadcastMessage(ConsensusMessage::Decide(
             decide,
         )))?;
+        // Clean up pending tx_root_hash for the committed block.
+        self.pending_tx_roots.remove(&block_hash);
+
         self.emit(EngineOutput::BlockCommitted {
             view,
             block_hash,

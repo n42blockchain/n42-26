@@ -79,6 +79,10 @@ pub struct Proposal {
     /// without waiting for the separate PrepareQC broadcast.
     /// None if the previous view timed out or no QC was formed.
     pub prepare_qc: Option<QuorumCertificate>,
+    /// Transaction root hash for Baby Raptr DA verification.
+    /// Followers compare against actual tx root after block import.
+    #[serde(default)]
+    pub tx_root_hash: Option<B256>,
 }
 
 /// Vote message (Round 1: Prepare).
@@ -262,6 +266,7 @@ mod tests {
                 proposer: 0,
                 signature: sig.clone(),
                 prepare_qc: None,
+                tx_root_hash: None,
             }),
             ConsensusMessage::Vote(Vote {
                 view: 2,

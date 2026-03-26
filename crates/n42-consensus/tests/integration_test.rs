@@ -104,7 +104,7 @@ impl TestHarness {
 
         if n == 1 {
             self.engines[0]
-                .process_event(ConsensusEvent::BlockReady(block_hash))
+                .process_event(ConsensusEvent::BlockReady(block_hash, None))
                 .expect("single-validator BlockReady should succeed");
 
             let outputs = self.drain_outputs(0);
@@ -123,7 +123,7 @@ impl TestHarness {
 
         // ── Step 1: Leader proposes ──
         self.engines[leader]
-            .process_event(ConsensusEvent::BlockReady(block_hash))
+            .process_event(ConsensusEvent::BlockReady(block_hash, None))
             .expect("leader BlockReady should succeed");
 
         let proposal = self
@@ -260,7 +260,7 @@ impl TestHarness {
 
         // Step 1: Leader proposes
         self.engines[leader]
-            .process_event(ConsensusEvent::BlockReady(block_hash))
+            .process_event(ConsensusEvent::BlockReady(block_hash, None))
             .expect("leader BlockReady should succeed");
 
         let leader_outputs = self.drain_outputs(leader);
@@ -589,7 +589,7 @@ mod multi_node_consensus {
 
         // Step 1: Leader proposes
         harness.engines[leader]
-            .process_event(ConsensusEvent::BlockReady(block_hash))
+            .process_event(ConsensusEvent::BlockReady(block_hash, None))
             .unwrap();
         assert_eq!(harness.engines[leader].current_phase(), Phase::Voting);
 
@@ -976,7 +976,7 @@ mod fault_tolerance {
 
         // First make the leader propose so it has a vote collector
         harness.engines[leader]
-            .process_event(ConsensusEvent::BlockReady(B256::repeat_byte(0xBB)))
+            .process_event(ConsensusEvent::BlockReady(B256::repeat_byte(0xBB), None))
             .unwrap();
         harness.drain_outputs(leader);
 
@@ -1007,7 +1007,7 @@ mod fault_tolerance {
 
         // Leader proposes
         harness.engines[leader]
-            .process_event(ConsensusEvent::BlockReady(block_hash))
+            .process_event(ConsensusEvent::BlockReady(block_hash, None))
             .unwrap();
         let outputs = harness.drain_outputs(leader);
         let proposal = outputs
@@ -1064,7 +1064,7 @@ mod fault_tolerance {
         let leader2 = harness2.leader_for_view(1);
 
         harness2.engines[leader2]
-            .process_event(ConsensusEvent::BlockReady(block_hash))
+            .process_event(ConsensusEvent::BlockReady(block_hash, None))
             .unwrap();
         let outputs = harness2.drain_outputs(leader2);
         let proposal2 = outputs
@@ -1127,7 +1127,7 @@ mod fault_tolerance {
 
         // Leader proposes
         harness.engines[leader]
-            .process_event(ConsensusEvent::BlockReady(block_hash))
+            .process_event(ConsensusEvent::BlockReady(block_hash, None))
             .unwrap();
         harness.drain_outputs(leader);
 
@@ -1259,6 +1259,7 @@ mod fault_tolerance {
             proposer: leader as u32,
             signature: sig,
             prepare_qc: None,
+            tx_root_hash: None,
         };
 
         // Non-leader should reject this proposal as a safety violation
@@ -1296,6 +1297,7 @@ mod fault_tolerance {
             proposer: 0, // Wrong! Should be 1
             signature: sig,
             prepare_qc: None,
+            tx_root_hash: None,
         };
 
         let result = harness.engines[2].process_event(ConsensusEvent::Message(
@@ -1328,7 +1330,7 @@ mod boundary_conditions {
 
         // BlockReady should complete both rounds instantly
         harness.engines[0]
-            .process_event(ConsensusEvent::BlockReady(block_hash))
+            .process_event(ConsensusEvent::BlockReady(block_hash, None))
             .unwrap();
 
         assert_eq!(harness.engines[0].current_view(), 2);
@@ -1764,7 +1766,7 @@ mod byzantine_signature {
 
         // Step 1: Leader proposes
         harness.engines[leader]
-            .process_event(ConsensusEvent::BlockReady(block_hash))
+            .process_event(ConsensusEvent::BlockReady(block_hash, None))
             .expect("leader BlockReady");
         let leader_outputs = harness.drain_outputs(leader);
         let proposal = leader_outputs
@@ -1886,7 +1888,7 @@ mod byzantine_signature {
 
         // Run through proposal + voting phase normally
         harness.engines[leader]
-            .process_event(ConsensusEvent::BlockReady(block_hash))
+            .process_event(ConsensusEvent::BlockReady(block_hash, None))
             .expect("leader BlockReady");
         let leader_outputs = harness.drain_outputs(leader);
         let proposal = leader_outputs
@@ -2451,7 +2453,7 @@ mod twenty_one_node {
 
         // Step 1: Leader proposes
         harness.engines[leader]
-            .process_event(ConsensusEvent::BlockReady(block_hash))
+            .process_event(ConsensusEvent::BlockReady(block_hash, None))
             .expect("leader BlockReady should succeed");
 
         let leader_outputs = harness.drain_outputs(leader);
@@ -2820,7 +2822,7 @@ mod twenty_one_node {
 
         // Step 1: Leader proposes correct block
         harness.engines[leader]
-            .process_event(ConsensusEvent::BlockReady(correct_hash))
+            .process_event(ConsensusEvent::BlockReady(correct_hash, None))
             .expect("BlockReady should succeed");
 
         let leader_outputs = harness.drain_outputs(leader);
@@ -3007,7 +3009,7 @@ mod twenty_one_node {
 
         // Leader proposes
         harness.engines[leader]
-            .process_event(ConsensusEvent::BlockReady(block_hash))
+            .process_event(ConsensusEvent::BlockReady(block_hash, None))
             .expect("BlockReady should succeed");
 
         let leader_outputs = harness.drain_outputs(leader);

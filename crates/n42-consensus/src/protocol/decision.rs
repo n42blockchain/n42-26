@@ -75,6 +75,9 @@ impl ConsensusEngine {
             self.epoch_manager.commit_pending_changes()?;
         }
 
+        // Clean up pending tx_root_hash for the committed block.
+        self.pending_tx_roots.remove(&decide.block_hash);
+
         self.emit(EngineOutput::BlockCommitted {
             view: decide.view,
             block_hash: decide.block_hash,

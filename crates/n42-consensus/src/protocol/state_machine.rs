@@ -122,7 +122,8 @@ pub enum ConsensusEvent {
     /// A consensus message received from the network.
     Message(ConsensusMessage),
     /// A block has been executed and is ready for proposal (leader path).
-    BlockReady(B256),
+    /// Tuple: (block_hash, tx_root_hash).
+    BlockReady(B256, Option<B256>),
     /// Block data has been imported into the execution layer (follower path).
     /// Triggers the deferred vote for the pending proposal.
     BlockImported(B256),
@@ -220,6 +221,9 @@ pub struct ConsensusEngine {
     pub(super) view_timing: ViewTiming,
     /// Timing from the last committed view (preserved across advance_to_view).
     last_committed_timing: Option<ViewTiming>,
+    /// Pending tx_root_hash values for Baby Raptr DA verification.
+    /// Maps block_hash -> tx_root_hash for proposals awaiting verification.
+    pub(super) pending_tx_roots: HashMap<B256, B256>,
 }
 
 impl ConsensusEngine {
@@ -271,6 +275,7 @@ impl ConsensusEngine {
             future_msg_buffer: Vec::new(),
             view_timing: ViewTiming::new(),
             last_committed_timing: None,
+            pending_tx_roots: HashMap::new(),
         }
     }
 
@@ -329,6 +334,7 @@ impl ConsensusEngine {
             future_msg_buffer: Vec::new(),
             view_timing: ViewTiming::new(),
             last_committed_timing: None,
+            pending_tx_roots: HashMap::new(),
         }
     }
 
@@ -481,7 +487,7 @@ impl ConsensusEngine {
     pub fn process_event(&mut self, event: ConsensusEvent) -> ConsensusResult<()> {
         match event {
             ConsensusEvent::Message(msg) => self.process_message(msg),
-            ConsensusEvent::BlockReady(block_hash) => self.on_block_ready(block_hash),
+            ConsensusEvent::BlockReady(block_hash, tx_root_hash) => self.on_block_ready(block_hash, tx_root_hash),
             ConsensusEvent::BlockImported(block_hash) => self.on_block_imported(block_hash),
         }
     }
@@ -1210,7 +1216,7 @@ mod tests {
     fn test_engine_block_ready_non_leader() {
         let (mut engine, _, _, _rx) = make_engine(4, 0);
         engine
-            .process_event(ConsensusEvent::BlockReady(B256::repeat_byte(0xAA)))
+            .process_event(ConsensusEvent::BlockReady(B256::repeat_byte(0xAA), None))
             .expect("non-leader block ready should succeed");
         assert_eq!(engine.current_phase(), Phase::WaitingForProposal);
     }
@@ -1221,7 +1227,7 @@ mod tests {
         let block_hash = B256::repeat_byte(0xBB);
 
         engine
-            .process_event(ConsensusEvent::BlockReady(block_hash))
+            .process_event(ConsensusEvent::BlockReady(block_hash, None))
             .expect("leader block ready should succeed");
 
         // Single-validator: consensus completes in one call, advancing to view 2.
@@ -1264,6 +1270,7 @@ mod tests {
             proposer: 1,
             signature: sig,
             prepare_qc: None,
+            tx_root_hash: None,
         };
 
         // Stale proposals are silently discarded by the pre-filter.
@@ -1287,6 +1294,7 @@ mod tests {
             proposer: 0,
             signature: sig,
             prepare_qc: None,
+            tx_root_hash: None,
         };
 
         let result = engine.process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(
@@ -1318,6 +1326,7 @@ mod tests {
             proposer: 1,
             signature: sks[1].sign(&msg),
             prepare_qc: None,
+            tx_root_hash: None,
         };
 
         engine
@@ -1365,6 +1374,7 @@ mod tests {
             proposer: 1,
             signature: sks[1].sign(&msg),
             prepare_qc: None,
+            tx_root_hash: None,
         };
 
         engine
@@ -1399,6 +1409,7 @@ mod tests {
             proposer: 1,
             signature: sks[1].sign(&msg),
             prepare_qc: None,
+            tx_root_hash: None,
         };
         engine
             .process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(
@@ -1460,7 +1471,7 @@ mod tests {
         let view = 1u64;
 
         engine
-            .process_event(ConsensusEvent::BlockReady(block_hash))
+            .process_event(ConsensusEvent::BlockReady(block_hash, None))
             .expect("block ready should succeed");
 
         assert_eq!(engine.current_phase(), Phase::Voting);
@@ -1526,7 +1537,7 @@ mod tests {
         let view = 1u64;
 
         engine
-            .process_event(ConsensusEvent::BlockReady(block_hash))
+            .process_event(ConsensusEvent::BlockReady(block_hash, None))
             .expect("block ready should succeed");
         while rx.try_recv().is_ok() {}
 
@@ -1593,6 +1604,7 @@ mod tests {
             proposer: 1,
             signature: sks[1].sign(&prop_msg),
             prepare_qc: None,
+            tx_root_hash: None,
         };
         engine
             .process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(
@@ -1658,6 +1670,7 @@ mod tests {
             proposer: 1,
             signature: sks[1].sign(&prop_msg),
             prepare_qc: None,
+            tx_root_hash: None,
         };
         engine
             .process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(
@@ -1716,6 +1729,7 @@ mod tests {
             proposer: 1,
             signature: sks[1].sign(&prop_msg),
             prepare_qc: None,
+            tx_root_hash: None,
         };
         engine
             .process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(
@@ -1753,7 +1767,7 @@ mod tests {
         let view = 1u64;
 
         engine
-            .process_event(ConsensusEvent::BlockReady(block_hash))
+            .process_event(ConsensusEvent::BlockReady(block_hash, None))
             .expect("block ready should succeed");
         while rx.try_recv().is_ok() {}
 
@@ -1827,7 +1841,7 @@ mod tests {
         let view = 1u64;
 
         engine
-            .process_event(ConsensusEvent::BlockReady(block_hash))
+            .process_event(ConsensusEvent::BlockReady(block_hash, None))
             .expect("block ready should succeed");
         while rx.try_recv().is_ok() {}
 
@@ -1855,7 +1869,7 @@ mod tests {
         let view = 1u64;
 
         engine
-            .process_event(ConsensusEvent::BlockReady(block_hash))
+            .process_event(ConsensusEvent::BlockReady(block_hash, None))
             .expect("block ready");
         while rx.try_recv().is_ok() {}
 
@@ -1939,7 +1953,7 @@ mod tests {
         let view = 1u64;
 
         engine
-            .process_event(ConsensusEvent::BlockReady(block_hash))
+            .process_event(ConsensusEvent::BlockReady(block_hash, None))
             .expect("block ready");
         while rx.try_recv().is_ok() {}
 
@@ -2202,6 +2216,7 @@ mod tests {
             proposer: 0,
             signature: sks[0].sign(&msg),
             prepare_qc: None,
+            tx_root_hash: None,
         };
 
         engine
@@ -2248,6 +2263,7 @@ mod tests {
             proposer: 0,
             signature: sks[0].sign(&msg),
             prepare_qc: None,
+            tx_root_hash: None,
         };
 
         engine
@@ -2384,6 +2400,7 @@ mod tests {
             proposer: 0,
             signature: sks[0].sign(&msg),
             prepare_qc: None,
+            tx_root_hash: None,
         };
 
         engine
@@ -2411,6 +2428,7 @@ mod tests {
             proposer: 0,
             signature: sks[0].sign(&msg),
             prepare_qc: None,
+            tx_root_hash: None,
         };
 
         engine
@@ -2444,6 +2462,7 @@ mod tests {
             proposer: 0,
             signature: sks[0].sign(&msg),
             prepare_qc: None,
+            tx_root_hash: None,
         };
 
         engine
@@ -2475,6 +2494,7 @@ mod tests {
             proposer: 0,
             signature: sks[0].sign(&msg),
             prepare_qc: None,
+            tx_root_hash: None,
         };
 
         engine
@@ -2906,6 +2926,7 @@ mod tests {
             proposer: 0,
             signature: sks[0].sign(&msg),
             prepare_qc: None,
+            tx_root_hash: None,
         };
 
         engine
@@ -2948,6 +2969,7 @@ mod tests {
             proposer: 0,
             signature: sks[0].sign(&msg),
             prepare_qc: None,
+            tx_root_hash: None,
         };
 
         engine

@@ -11,7 +11,7 @@ const MAX_IMPORTED_BLOCKS: usize = 64;
 
 impl ConsensusEngine {
     /// Called when this node (as leader) has a block ready to propose.
-    pub(super) fn on_block_ready(&mut self, block_hash: B256) -> ConsensusResult<()> {
+    pub(super) fn on_block_ready(&mut self, block_hash: B256, tx_root_hash: Option<B256>) -> ConsensusResult<()> {
         let view = self.round_state.current_view();
 
         if !self.is_current_leader() {
@@ -37,6 +37,7 @@ impl ConsensusEngine {
             proposer: self.my_index,
             signature,
             prepare_qc: piggybacked_qc,
+            tx_root_hash,
         };
 
         tracing::debug!(target: "n42::cl::proposal",
@@ -149,6 +150,11 @@ impl ConsensusEngine {
                     tracing::warn!(target: "n42::cl::proposal", view, error = %e, "rejected invalid piggybacked PrepareQC, ignoring");
                 }
             }
+        }
+
+        // Store pending tx_root_hash for future DA verification if present.
+        if let Some(tx_root) = proposal.tx_root_hash {
+            self.pending_tx_roots.insert(proposal.block_hash, tx_root);
         }
 
         self.round_state.enter_voting();

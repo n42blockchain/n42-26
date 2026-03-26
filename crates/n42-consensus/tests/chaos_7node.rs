@@ -94,7 +94,7 @@ impl ChaosHarness {
         let leader = self.leader_for_view(view);
 
         self.engines[leader]
-            .process_event(ConsensusEvent::BlockReady(block_hash))
+            .process_event(ConsensusEvent::BlockReady(block_hash, None))
             .expect("leader BlockReady should succeed");
 
         let proposal = self
@@ -297,7 +297,7 @@ impl ChaosHarness {
 
         // Step 1: Leader proposes
         self.engines[leader]
-            .process_event(ConsensusEvent::BlockReady(block_hash))
+            .process_event(ConsensusEvent::BlockReady(block_hash, None))
             .expect("leader BlockReady should succeed");
 
         let leader_outputs = self.drain_outputs(leader);
@@ -447,7 +447,7 @@ impl ChaosHarness {
         };
 
         // Step 1: Leader proposes
-        let result = self.engines[leader].process_event(ConsensusEvent::BlockReady(block_hash));
+        let result = self.engines[leader].process_event(ConsensusEvent::BlockReady(block_hash, None));
         check_result(result, &mut dup_vote_errors);
 
         let leader_outputs = self.drain_outputs(leader);
@@ -750,7 +750,7 @@ async fn test_malicious_forged_votes() {
 
     // Step a: Leader proposes
     harness.engines[leader]
-        .process_event(ConsensusEvent::BlockReady(block_hash))
+        .process_event(ConsensusEvent::BlockReady(block_hash, None))
         .expect("leader BlockReady should succeed");
 
     let leader_outputs = harness.drain_outputs(leader);
@@ -1316,7 +1316,7 @@ fn run_round_with_active_set(
     }
 
     harness.engines[leader]
-        .process_event(ConsensusEvent::BlockReady(block_hash))
+        .process_event(ConsensusEvent::BlockReady(block_hash, None))
         .expect("leader BlockReady");
 
     let proposal = harness

@@ -812,7 +812,7 @@ impl ConsensusOrchestrator {
 
                         info!(target: "n42::cl::orchestrator", %hash, view = self.engine.current_view(), "payload built, feeding BlockReady to consensus");
                         if let Err(e) = self.engine.process_event(
-                            n42_consensus::ConsensusEvent::BlockReady(hash)
+                            n42_consensus::ConsensusEvent::BlockReady(hash, None)
                         ) {
                             error!(target: "n42::cl::orchestrator", error = %e, "error processing BlockReady event");
                         }

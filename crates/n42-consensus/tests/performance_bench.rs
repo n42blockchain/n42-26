@@ -95,14 +95,14 @@ impl BenchHarness {
 
         if n == 1 {
             self.engines[0]
-                .process_event(ConsensusEvent::BlockReady(block_hash))
+                .process_event(ConsensusEvent::BlockReady(block_hash, None))
                 .unwrap();
             self.drain_outputs(0);
             return start.elapsed();
         }
 
         self.engines[leader]
-            .process_event(ConsensusEvent::BlockReady(block_hash))
+            .process_event(ConsensusEvent::BlockReady(block_hash, None))
             .unwrap();
 
         let proposal = self
