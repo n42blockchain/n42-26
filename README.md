@@ -230,7 +230,7 @@ Both configurations are well within the **8-second slot target**.
 
 ```bash
 git clone https://github.com/paradigmxyz/reth.git ../reth-latest
-git -C ../reth-latest checkout ae2c916f6106b31ecbe715663abe183507786480
+git -C ../reth-latest checkout e3dbdbb1153848aa91acf088973815872f6b2569
 git -C ../reth-latest apply ../n42-26/reth-n42.patch
 ```
 

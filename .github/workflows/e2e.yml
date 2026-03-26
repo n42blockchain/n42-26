@@ -20,7 +20,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: paradigmxyz/reth
-          ref: ae2c916f6106b31ecbe715663abe183507786480
+          ref: e3dbdbb1153848aa91acf088973815872f6b2569
           path: reth-latest
 
       - uses: dtolnay/rust-toolchain@stable
@@ -74,7 +74,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: paradigmxyz/reth
-          ref: ae2c916f6106b31ecbe715663abe183507786480
+          ref: e3dbdbb1153848aa91acf088973815872f6b2569
           path: reth-latest
 
       - uses: dtolnay/rust-toolchain@stable
