@@ -2,6 +2,7 @@ mod adapter;
 pub mod error;
 pub mod extra_data;
 pub mod protocol;
+pub mod rotor;
 pub mod validator;
 
 pub use adapter::{N42Consensus, ValidatorSetResolver};
