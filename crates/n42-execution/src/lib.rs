@@ -1,5 +1,6 @@
 pub mod evm_config;
 pub mod executor;
+pub mod precompile_random;
 pub mod read_log;
 pub mod state_diff;
 pub mod witness;
