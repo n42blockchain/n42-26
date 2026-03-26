@@ -112,6 +112,11 @@ pub enum NetworkCommand {
         peer_id: PeerId,
         addrs: Vec<Multiaddr>,
     },
+    /// Update validator context for Rotor relay forwarding.
+    SetValidatorContext {
+        my_index: u32,
+        validator_count: u32,
+    },
 }
 
 /// Events produced by the network service for the node layer.
@@ -363,6 +368,14 @@ impl NetworkHandle {
         self.send(NetworkCommand::AddKademliaPeer { peer_id, addrs })
     }
 
+    /// Updates the network layer's validator context for Rotor relay forwarding.
+    pub async fn set_validator_context(&self, my_index: u32, validator_count: u32) {
+        let _ = self.command_tx.try_send(NetworkCommand::SetValidatorContext {
+            my_index,
+            validator_count,
+        });
+    }
+
     fn send(&self, cmd: NetworkCommand) -> Result<(), NetworkError> {
         self.command_tx.try_send(cmd).map_err(|error| match error {
             tokio::sync::mpsc::error::TrySendError::Full(_) => NetworkError::ChannelFull,
@@ -478,6 +491,10 @@ pub struct NetworkService {
     /// and direct push. This suppresses cross-channel duplicates before they
     /// reach the consensus/orchestrator task.
     recent_block_announcements: RecentBlockAnnouncementDedup,
+    /// Local validator index (None if not a validator or if observer mode)
+    my_validator_index: Option<u32>,
+    /// Current validator count for Rotor relay computation
+    validator_count: u32,
 }
 
 fn claimed_validator_index(agent_version: &str) -> Option<u32> {
@@ -629,6 +646,8 @@ impl NetworkService {
             tx_gossip_disabled,
             allow_deterministic_peer_ids,
             recent_block_announcements: RecentBlockAnnouncementDedup::default(),
+            my_validator_index: None,
+            validator_count: 0,
         };
 
         Ok((service, handle, consensus_event_rx, event_rx))
@@ -1102,6 +1121,10 @@ impl NetworkService {
                     metrics::counter!("n42_direct_messages_received").increment(1);
                     match decode_consensus_message(&request.message_bytes) {
                         Ok(msg) => {
+                            // Check if we should relay this proposal to our assigned targets
+                            if let n42_primitives::consensus::ConsensusMessage::Proposal(ref proposal) = msg {
+                                self.maybe_relay_proposal(proposal, &request.message_bytes, peer);
+                            }
                             self.emit_event(NetworkEvent::ConsensusMessage {
                                 source: peer,
                                 message: Box::new(msg),
@@ -1140,6 +1163,82 @@ impl NetworkService {
             }
             libp2p::request_response::Event::InboundFailure { .. } => {}
             libp2p::request_response::Event::ResponseSent { .. } => {}
+        }
+    }
+
+    /// If this node is a Rotor relay for the current view, forward the raw
+    /// proposal bytes to its assigned target validators via consensus_direct.
+    fn maybe_relay_proposal(
+        &mut self,
+        proposal: &n42_primitives::consensus::Proposal,
+        raw_bytes: &[u8],
+        source: libp2p::PeerId,
+    ) {
+        let Some(my_index) = self.my_validator_index else { return };
+        if self.validator_count < 2 {
+            return;
+        }
+
+        // Only relay messages that came directly from the leader
+        let leader_peer = {
+            let map = self
+                .validator_peer_map
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            map.get(&proposal.proposer).copied()
+        };
+        if leader_peer != Some(source) {
+            return; // Not from leader — don't relay (prevents forwarding loops)
+        }
+
+        use n42_consensus::rotor::compute_relay_assignment;
+        let assignment = compute_relay_assignment(
+            proposal.view,
+            self.validator_count,
+            proposal.proposer,
+            3, // DEFAULT_RELAY_COUNT
+        );
+
+        // Find my targets if I'm a relay for this view
+        let my_targets = assignment
+            .relays
+            .iter()
+            .find(|(relay, _)| *relay == my_index)
+            .map(|(_, targets)| targets.clone());
+
+        let Some(targets) = my_targets else { return };
+
+        // Forward to assigned targets
+        let map = self
+            .validator_peer_map
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut forwarded = 0u32;
+        for target_idx in &targets {
+            if *target_idx == my_index {
+                continue;
+            } // Don't send to self
+            if let Some(&peer_id) = map.get(target_idx) {
+                let req = crate::consensus_direct::ConsensusDirectRequest {
+                    message_bytes: raw_bytes.to_vec(),
+                };
+                self.swarm
+                    .behaviour_mut()
+                    .consensus_direct
+                    .send_request(&peer_id, req);
+                forwarded += 1;
+            }
+        }
+        if forwarded > 0 {
+            metrics::counter!("n42_rotor_relayed_msgs").increment(forwarded as u64);
+            tracing::debug!(
+                target: "n42::network::rotor",
+                view = proposal.view,
+                my_index,
+                targets = targets.len(),
+                forwarded,
+                "relayed proposal to targets"
+            );
         }
     }
 
@@ -1548,6 +1647,13 @@ impl NetworkService {
                     }
                     tracing::debug!(%peer_id, addrs = addrs.len(), "added peer to kademlia");
                 }
+            }
+            NetworkCommand::SetValidatorContext {
+                my_index,
+                validator_count,
+            } => {
+                self.my_validator_index = Some(my_index);
+                self.validator_count = validator_count;
             }
         }
     }

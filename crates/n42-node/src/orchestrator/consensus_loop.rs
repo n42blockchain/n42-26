@@ -250,6 +250,14 @@ impl ConsensusOrchestrator {
                     }
                 }
 
+                // Update network's validator context for Rotor relay
+                self.network
+                    .set_validator_context(
+                        self.engine.my_index(),
+                        validator_count,
+                    )
+                    .await;
+
                 // Pre-stage the validator set for the epoch after next, if scheduled.
                 if let Some(schedule) = &self.epoch_schedule
                     && let Some((validators, threshold)) = schedule.get_for_epoch(new_epoch + 1)

@@ -360,6 +360,11 @@ impl ConsensusEngine {
         &mut self.pacemaker
     }
 
+    /// Returns this node's validator index.
+    pub fn my_index(&self) -> u32 {
+        self.my_index
+    }
+
     pub fn validator_count(&self) -> u32 {
         self.validator_set().len()
     }

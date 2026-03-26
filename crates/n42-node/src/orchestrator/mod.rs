@@ -703,6 +703,14 @@ impl ConsensusOrchestrator {
 
         self.initialize_startup_schedule().await;
 
+        // Set validator context for Rotor relay forwarding in network layer
+        self.network
+            .set_validator_context(
+                self.engine.my_index(),
+                self.engine.validator_count(),
+            )
+            .await;
+
         loop {
             let timeout = self.engine.pacemaker().timeout_sleep();
             tokio::pin!(timeout);
