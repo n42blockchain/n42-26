@@ -1106,6 +1106,13 @@ fn main() {
                 .with_staking_manager(staking_manager.clone())
                 .with_committed_block_count(restored_block_count);
 
+                // Restore prev_randao derivation from snapshot's last committed QC.
+                // Without this, first payload after crash recovery uses B256::ZERO.
+                if let Some(ref snap) = snapshot {
+                    orchestrator = orchestrator
+                        .with_recovered_commit_qc(snap.last_committed_qc.clone());
+                }
+
                 if let Some(schedule) = epoch_schedule {
                     orchestrator = orchestrator.with_epoch_schedule(schedule);
                 }

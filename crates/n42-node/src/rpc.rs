@@ -259,6 +259,7 @@ impl N42RpcServer {
         self.zk_scheduler = Some(scheduler);
         self
     }
+
     fn parse_bls_pubkey(hex_str: &str) -> RpcResult<BlsPublicKey> {
         let bytes = hex::decode(hex_str.strip_prefix("0x").unwrap_or(hex_str)).map_err(|e| {
             ErrorObjectOwned::owned(-32602, format!("invalid pubkey hex: {e}"), None::<()>)

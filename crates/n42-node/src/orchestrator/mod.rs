@@ -665,6 +665,14 @@ impl ConsensusOrchestrator {
         self
     }
 
+    /// Restores `prev_randao` derivation state from a recovered CommitQC (crash recovery).
+    /// Without this, the first payload after restart would use `B256::ZERO` as `prev_randao`.
+    pub fn with_recovered_commit_qc(mut self, qc: QuorumCertificate) -> Self {
+        self.prev_randao_cache = alloy_primitives::keccak256(qc.aggregate_signature.to_bytes());
+        self.last_commit_qc = Some(qc);
+        self
+    }
+
     /// Installs the admin command receiver for RPC-originated validator reconfig requests.
     pub fn with_admin_rx(mut self, rx: mpsc::Receiver<crate::consensus_state::AdminCommand>) -> Self {
         self.admin_rx = Some(rx);
@@ -1604,5 +1612,25 @@ mod tests {
         let r1 = keccak256(qc.aggregate_signature.to_bytes());
         let r2 = keccak256(qc.aggregate_signature.to_bytes());
         assert_eq!(r1, r2, "must be deterministic");
+    }
+
+    #[test]
+    fn test_with_recovered_commit_qc_restores_prev_randao() {
+        use alloy_primitives::keccak256;
+
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let orch = ConsensusOrchestrator::new(engine, network, net_event_rx, output_rx);
+
+        // Before recovery: prev_randao_cache is ZERO
+        assert_eq!(orch.prev_randao_cache, B256::ZERO);
+
+        // After recovery: prev_randao_cache matches QC hash
+        let qc = QuorumCertificate::genesis();
+        let expected = keccak256(qc.aggregate_signature.to_bytes());
+        let orch = orch.with_recovered_commit_qc(qc);
+        assert_eq!(orch.prev_randao_cache, expected);
+        assert!(orch.last_commit_qc.is_some());
     }
 }
