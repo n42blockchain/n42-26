@@ -3,9 +3,7 @@ use reth_basic_payload_builder::{
     BuildArguments, BuildOutcome, MissingPayloadBehaviour, PayloadBuilder, PayloadConfig,
 };
 use reth_chainspec::{ChainSpecProvider, EthChainSpec, EthereumHardforks};
-use reth_ethereum_engine_primitives::{
-    EthBuiltPayload, EthPayloadAttributes, EthPayloadBuilderAttributes,
-};
+use reth_ethereum_engine_primitives::{EthBuiltPayload, EthPayloadAttributes};
 use reth_ethereum_payload_builder::{EthereumBuilderConfig, default_ethereum_payload};
 use reth_ethereum_primitives::{EthPrimitives, TransactionSigned};
 use reth_evm::{ConfigureEvm, NextBlockEnvAttributes};
@@ -42,7 +40,6 @@ where
     Types::Payload: PayloadTypes<
             BuiltPayload = EthBuiltPayload,
             PayloadAttributes = EthPayloadAttributes,
-            PayloadBuilderAttributes = EthPayloadBuilderAttributes,
         >,
 {
     type PayloadBuilder = N42InnerPayloadBuilder<Pool, Node::Provider, Evm>;
@@ -89,12 +86,12 @@ where
     Client: StateProviderFactory + ChainSpecProvider<ChainSpec: EthereumHardforks> + Clone,
     Pool: TransactionPool<Transaction: PoolTransaction<Consensus = TransactionSigned>>,
 {
-    type Attributes = EthPayloadBuilderAttributes;
+    type Attributes = EthPayloadAttributes;
     type BuiltPayload = EthBuiltPayload;
 
     fn try_build(
         &self,
-        args: BuildArguments<EthPayloadBuilderAttributes, EthBuiltPayload>,
+        args: BuildArguments<EthPayloadAttributes, EthBuiltPayload>,
     ) -> Result<BuildOutcome<EthBuiltPayload>, PayloadBuilderError> {
         // Log pool depth before building — key diagnostic for TPS bottleneck analysis.
         let pool_pending = self.pool.pool_size().pending;
@@ -165,7 +162,7 @@ where
         &self,
         config: PayloadConfig<Self::Attributes>,
     ) -> Result<EthBuiltPayload, PayloadBuilderError> {
-        let args = BuildArguments::new(Default::default(), config, Default::default(), None);
+        let args = BuildArguments::new(Default::default(), Default::default(), config, Default::default(), None);
         default_ethereum_payload(
             self.evm_config.clone(),
             self.client.clone(),

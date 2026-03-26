@@ -14,7 +14,7 @@ use reth_ethereum_engine_primitives::EthEngineTypes;
 use reth_execution_types::{BlockExecutionOutput, BlockExecutionResult};
 use reth_node_builder::ConsensusEngineHandle;
 use reth_payload_builder::{EthBuiltPayload, PayloadBuilderHandle, PayloadId};
-use reth_payload_primitives::{EngineApiMessageVersion, PayloadKind, PayloadTypes};
+use reth_payload_primitives::{PayloadKind, PayloadTypes};
 use reth_transaction_pool::blobstore::{BlobStore, DiskFileBlobStore};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -354,7 +354,6 @@ impl ConsensusOrchestrator {
                 .fork_choice_updated(
                     fcu_state,
                     Some(try_attrs),
-                    EngineApiMessageVersion::default(),
                 )
                 .await
             {
@@ -831,7 +830,7 @@ impl ConsensusOrchestrator {
             finalized_block_hash: broadcast.block_hash,
         };
         if let Err(e) = engine_handle
-            .fork_choice_updated(fcu_state, None, EngineApiMessageVersion::default())
+            .fork_choice_updated(fcu_state, None)
             .await
         {
             error!(
@@ -966,7 +965,7 @@ impl ConsensusOrchestrator {
                         finalized_block_hash: retry_hash,
                     };
                     let _ = engine_handle
-                        .fork_choice_updated(fcu, None, EngineApiMessageVersion::default())
+                        .fork_choice_updated(fcu, None)
                         .await;
                     self.head_block_hash = retry_hash;
                     if let Err(e) = self

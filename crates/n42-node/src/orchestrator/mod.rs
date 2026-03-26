@@ -541,6 +541,7 @@ impl ConsensusOrchestrator {
             payload_builder: Some(payload_builder),
             consensus_state: Some(consensus_state),
             head_block_hash,
+            last_commit_qc: None,
             block_ready_tx,
             block_ready_rx,
             fee_recipient,

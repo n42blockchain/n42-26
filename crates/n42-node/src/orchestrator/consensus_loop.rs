@@ -8,7 +8,6 @@ use n42_consensus::EngineOutput;
 use n42_primitives::QuorumCertificate;
 use reth_ethereum_engine_primitives::EthEngineTypes;
 use reth_node_builder::ConsensusEngineHandle;
-use reth_payload_primitives::EngineApiMessageVersion;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -485,7 +484,7 @@ impl ConsensusOrchestrator {
 
         let fcu_start = std::time::Instant::now();
         let finalized = match engine_handle
-            .fork_choice_updated(fcu_state, None, EngineApiMessageVersion::default())
+            .fork_choice_updated(fcu_state, None)
             .await
         {
             Ok(result) => {
@@ -528,7 +527,7 @@ impl ConsensusOrchestrator {
                 };
                 let retry_start = std::time::Instant::now();
                 match engine_handle
-                    .fork_choice_updated(retry_fcu, None, EngineApiMessageVersion::default())
+                    .fork_choice_updated(retry_fcu, None)
                     .await
                 {
                     Ok(result) => {
@@ -718,7 +717,7 @@ impl ConsensusOrchestrator {
                     finalized_block_hash: block_hash,
                 };
                 if let Err(e) = engine_handle
-                    .fork_choice_updated(fcu, None, EngineApiMessageVersion::default())
+                    .fork_choice_updated(fcu, None)
                     .await
                 {
                     error!(target: "n42::cl::consensus_loop", %block_hash, error = %e, "bg import: fcu failed");

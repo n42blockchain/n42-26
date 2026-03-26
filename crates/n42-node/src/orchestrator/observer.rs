@@ -10,7 +10,6 @@ use n42_network::{BlockSyncResponse, NetworkEvent, NetworkHandle, PeerId, SyncBl
 use n42_primitives::QuorumCertificate;
 use reth_ethereum_engine_primitives::EthEngineTypes;
 use reth_node_builder::ConsensusEngineHandle;
-use reth_payload_primitives::EngineApiMessageVersion;
 use reth_transaction_pool::blobstore::{BlobStore, DiskFileBlobStore};
 use std::collections::{HashSet, VecDeque};
 use std::time::Duration;
@@ -377,7 +376,7 @@ impl ObserverOrchestrator {
                     };
                     if let Err(e) = self
                         .beacon_engine
-                        .fork_choice_updated(fcu_state, None, EngineApiMessageVersion::default())
+                        .fork_choice_updated(fcu_state, None)
                         .await
                     {
                         error!(target: "n42::observer", %hash, error = %e, "fork_choice_updated failed");
