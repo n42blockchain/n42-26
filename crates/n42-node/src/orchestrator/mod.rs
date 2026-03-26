@@ -1057,6 +1057,50 @@ impl ConsensusOrchestrator {
         }
     }
 
+    /// Broadcasts a consensus message using Rotor relay: send directly to relay nodes,
+    /// then always broadcast via GossipSub as safety net.
+    async fn broadcast_via_rotor(&mut self, msg: n42_primitives::ConsensusMessage) {
+        use n42_consensus::rotor::compute_relay_assignment;
+
+        let view = self.engine.current_view();
+        let validator_count = self.engine.epoch_manager().current_validator_set().len();
+        let leader = self.engine.current_leader_index();
+        let assignment = compute_relay_assignment(view, validator_count, leader, 3);
+
+        let mut direct_ok = 0u32;
+        let mut direct_fail = 0u32;
+        for (relay_idx, _targets) in &assignment.relays {
+            if let Some(peer_id) = self.network.validator_peer(*relay_idx) {
+                match self.network.send_direct_reliable(peer_id, msg.clone()).await {
+                    Ok(()) => direct_ok += 1,
+                    Err(e) => {
+                        warn!(
+                            target: "n42::cl::rotor",
+                            relay = relay_idx,
+                            error = %e,
+                            "rotor: relay direct send failed"
+                        );
+                        direct_fail += 1;
+                    }
+                }
+            } else {
+                direct_fail += 1;
+            }
+        }
+
+        // Always broadcast via GossipSub as safety net
+        if let Err(e) = self.network.broadcast_consensus_reliable(msg).await {
+            error!(target: "n42::cl::rotor", error = %e, "rotor: gossipsub fallback failed");
+        }
+
+        if direct_ok > 0 {
+            counter!("n42_rotor_direct_sends").increment(direct_ok as u64);
+        }
+        if direct_fail > 0 {
+            counter!("n42_rotor_fallback_used").increment(direct_fail as u64);
+        }
+    }
+
     fn restore_failed_tx_forward_batch(&mut self, txs: Vec<Vec<u8>>, leader_idx: u32) {
         self.tx_forward_buffer = txs;
         self.trim_tx_forward_buffer(leader_idx, "forward send failure");

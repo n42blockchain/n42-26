@@ -5,7 +5,7 @@ use alloy_primitives::B256;
 use alloy_rpc_types_engine::{ForkchoiceState, PayloadStatusEnum};
 use metrics::{counter, gauge, histogram};
 use n42_consensus::EngineOutput;
-use n42_primitives::QuorumCertificate;
+use n42_primitives::{ConsensusMessage, QuorumCertificate};
 use reth_ethereum_engine_primitives::EthEngineTypes;
 use reth_node_builder::ConsensusEngineHandle;
 use std::collections::HashMap;
@@ -125,8 +125,12 @@ impl ConsensusOrchestrator {
     pub(super) async fn handle_engine_output(&mut self, output: EngineOutput) {
         match output {
             EngineOutput::BroadcastMessage(msg) => {
-                if let Err(e) = self.network.broadcast_consensus_reliable(msg).await {
-                    error!(target: "n42::cl::consensus_loop", error = %e, "failed to broadcast consensus message");
+                if matches!(&msg, ConsensusMessage::Proposal(_)) && self.engine.is_current_leader() {
+                    self.broadcast_via_rotor(msg).await;
+                } else {
+                    if let Err(e) = self.network.broadcast_consensus_reliable(msg).await {
+                        error!(target: "n42::cl::consensus_loop", error = %e, "failed to broadcast consensus message");
+                    }
                 }
             }
             EngineOutput::SendToValidator(target, msg) => {
