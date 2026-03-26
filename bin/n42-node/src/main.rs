@@ -25,6 +25,7 @@ use n42_node::tx_bridge::TxPoolBridge;
 use n42_node::{ConsensusOrchestrator, N42Node, ObserverOrchestrator, SharedConsensusState};
 use n42_node::{configured_validator_peer_ids, expected_validator_peer_ids_with_policy};
 use n42_primitives::BlsSecretKey;
+use n42_jmt::ShardedJmt;
 use n42_zkproof::{MockProver, ProofScheduler, ProofStore};
 use reth_chainspec::ChainSpecProvider;
 use reth_ethereum_cli::Cli;
@@ -532,6 +533,16 @@ fn main() {
         ));
         info!(target: "n42::cli", "StakingManager initialized");
 
+        // JMT state tree: enabled by N42_JMT=1. Maintains a Jellyfish Merkle Tree
+        // updated on each block commit, serving state proofs via RPC.
+        let jmt: Option<Arc<Mutex<ShardedJmt>>> = if env_bool("N42_JMT") {
+            let jmt = Arc::new(Mutex::new(ShardedJmt::new()));
+            info!(target: "n42::cli", "JMT state tree enabled (16 shards)");
+            Some(jmt)
+        } else {
+            None
+        };
+
         // ZK proof sidecar: create scheduler if N42_ZK_PROOF=1.
         // N42_ZK_BACKEND: "mock" (default) or "sp1" (requires sp1 feature + guest ELF)
         // N42_ZK_MODE: "mock" (default), "cpu" (real proof, slow)
@@ -590,6 +601,7 @@ fn main() {
         let rpc_consensus_state = consensus_state.clone();
         let rpc_staking_manager = staking_manager.clone();
         let rpc_zk_scheduler = zk_scheduler.clone();
+        let rpc_jmt = jmt.clone();
         let handle = builder
             .node(n42_node)
             .extend_rpc_modules(move |ctx| {
@@ -597,6 +609,9 @@ fn main() {
                     .with_staking_manager(rpc_staking_manager);
                 if let Some(scheduler) = rpc_zk_scheduler {
                     rpc_server = rpc_server.with_zk_scheduler(scheduler);
+                }
+                if let Some(ref jmt) = rpc_jmt {
+                    rpc_server = rpc_server.with_jmt(Arc::clone(jmt));
                 }
                 ctx.modules.merge_configured(rpc_server.into_rpc())?;
                 info!(target: "n42::cli", "N42 RPC namespace registered");
@@ -1096,6 +1111,9 @@ fn main() {
                 }
                 orchestrator = orchestrator
                     .with_allow_deterministic_validator_peers(allow_deterministic_validator_peers);
+                if let Some(ref jmt) = jmt {
+                    orchestrator = orchestrator.with_jmt(Arc::clone(jmt));
+                }
                 if let Some(scheduler) = zk_scheduler {
                     orchestrator = orchestrator.with_zk_scheduler(scheduler);
                 }
