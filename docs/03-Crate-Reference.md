@@ -2,19 +2,19 @@
 
 ## Crate matrix
 
-| Crate | Role | Key exports / entrypoints | Depends on |
-|---|---|---|---|
-| `n42-primitives` | shared domain types | BLS keys, signatures, consensus messages | foundational |
-| `n42-chainspec` | configuration and genesis | `ConsensusConfig`, dev/test specs | primitives |
-| `n42-consensus` | deterministic consensus engine | `ConsensusEngine`, `EpochManager`, `ValidatorSet` | primitives, chainspec |
-| `n42-execution` | execution helper layer | `execute_block_full`, witness/state diff | reth stack |
-| `n42-network` | validator and mobile network plumbing | `NetworkService`, `StarHub`, `ShardedStarHub` | primitives, libp2p, quinn |
-| `n42-mobile` | phone-side protocol and verification | packets, receipts, attestation builder | primitives |
-| `n42-mobile-ffi` | mobile SDK bindings | C/JNI exported functions | mobile, chainspec |
-| `n42-node` | orchestration and product assembly | `ConsensusOrchestrator`, RPC, persistence | consensus, network, mobile, JMT, ZK |
-| `n42-parallel-evm` | parallel execution engine | `parallel_execute` | revm |
-| `n42-jmt` | merkle tree and proof serving | `ShardedJmt`, proofs, snapshots | jmt, blake3 |
-| `n42-zkproof` | proof scheduling and storage | `ProofScheduler`, `ProofStore` | SP1/mock backend |
+| Crate | Role | Key exports / entrypoints | Depends on | Production status |
+|---|---|---|---|---|
+| `n42-primitives` | shared domain types | BLS keys, signatures, consensus messages | foundational | ✅ Active |
+| `n42-chainspec` | configuration and genesis | `ConsensusConfig`, dev/test specs | primitives | ✅ Active |
+| `n42-consensus` | deterministic consensus engine | `ConsensusEngine`, `EpochManager`, `ValidatorSet` | primitives, chainspec | ✅ Active |
+| `n42-execution` | execution helper layer | `execute_block_full`, witness/state diff | reth stack | ✅ Active |
+| `n42-network` | validator and mobile network plumbing | `NetworkService`, `StarHub`, `ShardedStarHub` | primitives, libp2p, quinn | ✅ Active |
+| `n42-mobile` | phone-side protocol and verification | packets, receipts, attestation builder | primitives | ✅ Active |
+| `n42-mobile-ffi` | mobile SDK bindings | C/JNI exported functions | mobile, chainspec | ✅ Active |
+| `n42-node` | orchestration and product assembly | `ConsensusOrchestrator`, RPC, persistence | consensus, network, mobile, JMT, ZK | ✅ Active |
+| `n42-parallel-evm` | parallel execution engine | `parallel_execute` | revm | **❌ Dead code** |
+| `n42-jmt` | merkle tree and proof serving | `ShardedJmt`, proofs, snapshots | jmt, blake3 | **❌ Not wired** |
+| `n42-zkproof` | proof scheduling and storage | `ProofScheduler`, `ProofStore` | SP1/mock backend | ✅ Active (conditional) |
 
 ## Module hotspots by crate
 

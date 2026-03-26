@@ -119,13 +119,17 @@ flowchart TD
 
 ## 6. JMT update path
 
+> **⚠️ 未接入生产**：以下流程的代码全部存在（`consensus_loop.rs:366-408`、`rpc.rs:556-625`），但 `ShardedJmt` 从未在 `main.rs` 中构造。orchestrator 和 RPC 的 `jmt` 字段始终为 `None`，所有 JMT 相关代码路径都是死代码。
+
 ```mermaid
 flowchart LR
     A["Committed block"] --> B["Extract state diff"]
-    B --> C["Background JMT apply_diff"]
-    C --> D["Update root/version in SharedConsensusState"]
-    D --> E["RPC jmtRoot / jmtProof"]
+    B -.->|"dead: jmt is None"| C["Background JMT apply_diff"]
+    C -.-> D["Update root/version in SharedConsensusState"]
+    D -.-> E["RPC jmtRoot / jmtProof"]
 ```
+
+**需要修复**：在 `main.rs` 中添加 `ShardedJmt` 构造（参照 ZK scheduler 的 `N42_ZK_PROOF` 环境变量模式），调用 `orchestrator.with_jmt(jmt)` 和 `rpc_server.with_jmt(jmt)`。
 
 ## 7. ZK sidecar path
 
@@ -147,14 +151,53 @@ flowchart TD
     D --> E["Inject EIP-4895 withdrawals into payload attributes"]
 ```
 
+## 9. Staking scan path
+
+```mermaid
+flowchart LR
+    A["Block committed"] --> B["scan_committed_block()"]
+    B --> C["Parse staking contract events"]
+    C --> D["Update stakes/registrations"]
+    D --> E["RPC stakingStatus / stakingInfo"]
+    D --> F["execution_bridge: resolve reward addresses"]
+```
+
+Staking state is persisted to `staking_state.json` and loaded on startup.
+
+## 10. Validator reconfig path
+
+```mermaid
+sequenceDiagram
+    participant RPC
+    participant AdminChannel
+    participant Orchestrator
+    participant Engine
+    participant EpochManager
+
+    RPC->>AdminChannel: AdminCommand::AddValidator(info, reply_tx)
+    AdminChannel->>Orchestrator: recv() in select! loop
+    Orchestrator->>Engine: propose_add_validator(info)
+    Engine->>EpochManager: queue pending_adds
+    Note over EpochManager: At next CommitQC:
+    EpochManager->>EpochManager: commit_pending_changes()
+    EpochManager->>EpochManager: validate_transition() + stage_next_epoch()
+```
+
+> **⚠️ 无鉴权**：`proposeAddValidator`/`proposeRemoveValidator` 端点无权限控制。生产部署前需添加签名验证或 admin token。
+
 ## Where to debug each flow
 
 | Flow | Primary files |
 |---|---|
-| Startup | [`bin/n42-node/src/main.rs`](/Users/jieliu/Documents/n42/n42-26/bin/n42-node/src/main.rs) |
-| Consensus runtime | [`crates/n42-node/src/orchestrator/mod.rs`](/Users/jieliu/Documents/n42/n42-26/crates/n42-node/src/orchestrator/mod.rs), [`crates/n42-node/src/orchestrator/consensus_loop.rs`](/Users/jieliu/Documents/n42/n42-26/crates/n42-node/src/orchestrator/consensus_loop.rs) |
-| P2P network | [`crates/n42-network/src/service.rs`](/Users/jieliu/Documents/n42/n42-26/crates/n42-network/src/service.rs), [`crates/n42-network/src/transport.rs`](/Users/jieliu/Documents/n42/n42-26/crates/n42-network/src/transport.rs) |
-| Mobile QUIC ingress | [`crates/n42-network/src/mobile/star_hub.rs`](/Users/jieliu/Documents/n42/n42-26/crates/n42-network/src/mobile/star_hub.rs) |
-| Mobile aggregation | [`crates/n42-node/src/mobile_bridge.rs`](/Users/jieliu/Documents/n42/n42-26/crates/n42-node/src/mobile_bridge.rs) |
-| Snapshot persistence | [`crates/n42-node/src/persistence.rs`](/Users/jieliu/Documents/n42/n42-26/crates/n42-node/src/persistence.rs) |
-| RPC surface | [`crates/n42-node/src/rpc.rs`](/Users/jieliu/Documents/n42/n42-26/crates/n42-node/src/rpc.rs) |
+| Startup | `bin/n42-node/src/main.rs` |
+| Consensus runtime | `crates/n42-node/src/orchestrator/mod.rs`, `consensus_loop.rs` |
+| P2P network | `crates/n42-network/src/service.rs`, `transport.rs` |
+| Mobile QUIC ingress | `crates/n42-network/src/mobile/star_hub.rs` |
+| Mobile aggregation | `crates/n42-node/src/mobile_bridge.rs` |
+| Reward settlement | `crates/n42-node/src/mobile_reward.rs`, `execution_bridge.rs:232-274` |
+| Staking | `crates/n42-node/src/staking.rs`, `consensus_loop.rs:440-447` |
+| Snapshot persistence | `crates/n42-node/src/persistence.rs` |
+| RPC surface | `crates/n42-node/src/rpc.rs` |
+| Validator reconfig | `consensus_state.rs` (AdminCommand), `orchestrator/mod.rs:1014` (handler) |
+| JMT (stub) | `orchestrator/consensus_loop.rs:366-408` (dead code) |
+| ZK proof | `n42-zkproof/src/scheduler.rs`, `consensus_loop.rs:410-437` |
