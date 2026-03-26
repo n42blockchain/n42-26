@@ -361,6 +361,7 @@ impl ConsensusOrchestrator {
 
         self.store_committed_block(view, block_hash, commit_qc.clone());
         self.head_block_hash = block_hash;
+        self.last_commit_qc = Some(commit_qc.clone());
 
         // JMT background update: extract BundleState from pending block data.
         if let Some(ref jmt) = self.jmt {

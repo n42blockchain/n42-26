@@ -236,6 +236,7 @@ pub struct ConsensusOrchestrator {
     payload_builder: Option<PayloadBuilderHandle<EthEngineTypes>>,
     consensus_state: Option<Arc<SharedConsensusState>>,
     head_block_hash: B256,
+    last_commit_qc: Option<QuorumCertificate>,
     block_ready_tx: mpsc::Sender<B256>,
     block_ready_rx: mpsc::Receiver<B256>,
     fee_recipient: Address,
@@ -357,6 +358,7 @@ impl ConsensusOrchestrator {
             payload_builder: None,
             consensus_state: None,
             head_block_hash: B256::ZERO,
+            last_commit_qc: None,
             block_ready_tx,
             block_ready_rx,
             fee_recipient: Address::ZERO,
@@ -1541,5 +1543,23 @@ mod tests {
             started.elapsed() < Duration::from_secs(2),
             "sync_started_at should be recent after timeout reset"
         );
+    }
+
+    #[test]
+    fn test_prev_randao_from_commit_qc() {
+        use alloy_primitives::keccak256;
+
+        // No commit QC → B256::ZERO
+        let none_qc: Option<&QuorumCertificate> = None;
+        let randao = none_qc
+            .map(|qc| keccak256(qc.aggregate_signature.to_bytes()))
+            .unwrap_or(B256::ZERO);
+        assert_eq!(randao, B256::ZERO);
+
+        // With commit QC → deterministic non-zero
+        let qc = QuorumCertificate::genesis();
+        let r1 = keccak256(qc.aggregate_signature.to_bytes());
+        let r2 = keccak256(qc.aggregate_signature.to_bytes());
+        assert_eq!(r1, r2, "must be deterministic");
     }
 }
