@@ -512,6 +512,10 @@ fn main() {
         );
 
         let consensus_state = Arc::new(SharedConsensusState::new(startup_validator_set.clone()));
+        let (admin_tx, admin_rx) = tokio::sync::mpsc::channel(16);
+        consensus_state.set_admin_channel(admin_tx);
+        // admin_rx will be moved into the on_node_started closure below.
+        let admin_rx = std::sync::Mutex::new(Some(admin_rx));
         let validator_set_resolver = build_validator_set_resolver(
             initial_validator_infos.clone(),
             startup_validator_set.fault_tolerance(),
@@ -1094,6 +1098,9 @@ fn main() {
                     .with_allow_deterministic_validator_peers(allow_deterministic_validator_peers);
                 if let Some(scheduler) = zk_scheduler {
                     orchestrator = orchestrator.with_zk_scheduler(scheduler);
+                }
+                if let Some(rx) = admin_rx.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                    orchestrator = orchestrator.with_admin_rx(rx);
                 }
 
                 let orchestrator = orchestrator;

@@ -1,11 +1,12 @@
-use alloy_primitives::B256;
+use alloy_primitives::{Address, B256};
 use arc_swap::{ArcSwap, ArcSwapOption};
+use n42_chainspec::ValidatorInfo;
 use n42_consensus::ValidatorSet;
 use n42_primitives::QuorumCertificate;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, oneshot};
 use tracing::{info, warn};
 
 /// A verification task pushed to mobile subscribers when a block is committed.
@@ -136,6 +137,18 @@ fn unix_now_secs() -> u64 {
         .as_secs()
 }
 
+/// Admin command sent from RPC to the consensus orchestrator.
+pub enum AdminCommand {
+    AddValidator {
+        info: ValidatorInfo,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    RemoveValidator {
+        address: Address,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+}
+
 /// Shared consensus state between the Orchestrator, PayloadBuilder, and RPC.
 ///
 /// The Orchestrator writes (low frequency, on block commit); the PayloadBuilder
@@ -157,6 +170,8 @@ pub struct SharedConsensusState {
     pub(crate) jmt_root: ArcSwap<Option<(u64, B256)>>,
     /// Latest ZK proof block number and hash (updated by ProofScheduler).
     pub(crate) zk_latest_proof: ArcSwap<Option<(u64, B256)>>,
+    /// Admin command channel sender; set once the orchestrator is wired up.
+    admin_tx: Mutex<Option<tokio::sync::mpsc::Sender<AdminCommand>>>,
 }
 
 impl SharedConsensusState {
@@ -184,6 +199,7 @@ impl SharedConsensusState {
             authorized_verifiers: Mutex::new(HashSet::new()),
             jmt_root: ArcSwap::from_pointee(None),
             zk_latest_proof: ArcSwap::from_pointee(None),
+            admin_tx: Mutex::new(None),
         }
     }
 
@@ -341,6 +357,16 @@ impl SharedConsensusState {
     /// Loads the latest ZK proof info (block_number, block_hash), if available.
     pub fn load_zk_latest_proof(&self) -> Arc<Option<(u64, B256)>> {
         self.zk_latest_proof.load_full()
+    }
+
+    /// Installs the admin command channel sender (called once during node startup).
+    pub fn set_admin_channel(&self, tx: tokio::sync::mpsc::Sender<AdminCommand>) {
+        *self.admin_tx.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
+    }
+
+    /// Returns a clone of the admin command channel sender, if installed.
+    pub fn admin_tx(&self) -> Option<tokio::sync::mpsc::Sender<AdminCommand>> {
+        self.admin_tx.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// Registers the block for attestation tracking and notifies RPC subscribers.

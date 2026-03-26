@@ -214,6 +214,18 @@ pub trait N42Api {
     /// Returns ZK proof subsystem status and statistics.
     #[method(name = "zkStatus")]
     async fn zk_status(&self) -> RpcResult<ZkStatusResponse>;
+
+    /// Proposes adding a new validator. Activates at next CommitQC (commit-then-activate).
+    #[method(name = "proposeAddValidator")]
+    async fn propose_add_validator(
+        &self,
+        address: Address,
+        bls_pubkey: String,
+    ) -> RpcResult<String>;
+
+    /// Proposes removing a validator. Cannot drop below MIN_VALIDATOR_COUNT (4).
+    #[method(name = "proposeRemoveValidator")]
+    async fn propose_remove_validator(&self, address: Address) -> RpcResult<String>;
 }
 
 pub struct N42RpcServer {
@@ -722,6 +734,56 @@ impl N42ApiServer for N42RpcServer {
                 in_progress: 0,
             }),
         }
+    }
+
+    async fn propose_add_validator(
+        &self,
+        address: Address,
+        bls_pubkey: String,
+    ) -> RpcResult<String> {
+        let pubkey_bytes = hex::decode(bls_pubkey.strip_prefix("0x").unwrap_or(&bls_pubkey))
+            .map_err(|e| ErrorObjectOwned::owned(-32602, format!("invalid pubkey hex: {e}"), None::<()>))?;
+        let pubkey_array: [u8; 48] = pubkey_bytes.try_into().map_err(|v: Vec<u8>| {
+            ErrorObjectOwned::owned(-32602, format!("pubkey must be 48 bytes, got {}", v.len()), None::<()>)
+        })?;
+        let bls_pk = BlsPublicKey::from_bytes(&pubkey_array)
+            .map_err(|e| ErrorObjectOwned::owned(-32602, format!("invalid BLS key: {e}"), None::<()>))?;
+
+        let info = n42_chainspec::ValidatorInfo {
+            address,
+            bls_public_key: bls_pk,
+            p2p_peer_id: None,
+        };
+
+        let admin_tx = self.consensus_state.admin_tx()
+            .ok_or_else(|| ErrorObjectOwned::owned(-32603, "admin channel not available", None::<()>))?;
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        admin_tx
+            .send(crate::consensus_state::AdminCommand::AddValidator { info, reply: reply_tx })
+            .await
+            .map_err(|_| ErrorObjectOwned::owned(-32603, "consensus loop unavailable", None::<()>))?;
+
+        reply_rx.await
+            .map_err(|_| ErrorObjectOwned::owned(-32603, "consensus loop dropped reply", None::<()>))?
+            .map(|()| "validator add proposed, activates at next CommitQC".to_string())
+            .map_err(|e| ErrorObjectOwned::owned(-32003, e, None::<()>))
+    }
+
+    async fn propose_remove_validator(&self, address: Address) -> RpcResult<String> {
+        let admin_tx = self.consensus_state.admin_tx()
+            .ok_or_else(|| ErrorObjectOwned::owned(-32603, "admin channel not available", None::<()>))?;
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        admin_tx
+            .send(crate::consensus_state::AdminCommand::RemoveValidator { address, reply: reply_tx })
+            .await
+            .map_err(|_| ErrorObjectOwned::owned(-32603, "consensus loop unavailable", None::<()>))?;
+
+        reply_rx.await
+            .map_err(|_| ErrorObjectOwned::owned(-32603, "consensus loop dropped reply", None::<()>))?
+            .map(|()| "validator remove proposed, activates at next CommitQC".to_string())
+            .map_err(|e| ErrorObjectOwned::owned(-32003, e, None::<()>))
     }
 }
 

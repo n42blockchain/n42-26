@@ -333,6 +333,8 @@ pub struct ConsensusOrchestrator {
     /// Whether deterministic validator PeerIds may be derived when no explicit
     /// `p2p_peer_id` bindings are configured.
     allow_deterministic_validator_peers: bool,
+    /// Admin command receiver for RPC-originated validator reconfig requests.
+    admin_rx: Option<mpsc::Receiver<crate::consensus_state::AdminCommand>>,
 }
 
 impl ConsensusOrchestrator {
@@ -411,6 +413,7 @@ impl ConsensusOrchestrator {
             jmt: None,
             zk_scheduler: None,
             allow_deterministic_validator_peers: true,
+            admin_rx: None,
         }
     }
 
@@ -586,6 +589,7 @@ impl ConsensusOrchestrator {
             jmt: None,
             zk_scheduler: None,
             allow_deterministic_validator_peers: true,
+            admin_rx: None,
         }
     }
 
@@ -653,6 +657,11 @@ impl ConsensusOrchestrator {
 
     pub fn with_allow_deterministic_validator_peers(mut self, allow: bool) -> Self {
         self.allow_deterministic_validator_peers = allow;
+        self
+    }
+
+    pub fn with_admin_rx(mut self, rx: mpsc::Receiver<crate::consensus_state::AdminCommand>) -> Self {
+        self.admin_rx = Some(rx);
         self
     }
 
@@ -931,6 +940,18 @@ impl ConsensusOrchestrator {
                     self.flush_tx_forward_buffer().await;
                 }
 
+                // === Priority 9: Admin commands (validator reconfig from RPC) ===
+                msg = async {
+                    match self.admin_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if let Some(cmd) = msg {
+                        self.handle_admin_command(cmd);
+                    }
+                }
+
             }
 
             // Eagerly drain all pending consensus engine outputs after each iteration.
@@ -988,6 +1009,22 @@ impl ConsensusOrchestrator {
             }
         }
         self.pipeline_timings.insert(hash, timing);
+    }
+
+    fn handle_admin_command(&mut self, cmd: crate::consensus_state::AdminCommand) {
+        use crate::consensus_state::AdminCommand;
+        match cmd {
+            AdminCommand::AddValidator { info, reply } => {
+                let result = self.engine.propose_add_validator(info)
+                    .map_err(|e| e.to_string());
+                let _ = reply.send(result);
+            }
+            AdminCommand::RemoveValidator { address, reply } => {
+                let result = self.engine.propose_remove_validator(address)
+                    .map_err(|e| e.to_string());
+                let _ = reply.send(result);
+            }
+        }
     }
 
     fn trim_tx_forward_buffer(&mut self, leader_idx: u32, reason: &'static str) {
