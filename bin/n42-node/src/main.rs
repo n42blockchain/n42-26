@@ -602,6 +602,7 @@ fn main() {
         let rpc_staking_manager = staking_manager.clone();
         let rpc_zk_scheduler = zk_scheduler.clone();
         let rpc_jmt = jmt.clone();
+        let rpc_admin_token = std::env::var("N42_ADMIN_TOKEN").ok();
         let handle = builder
             .node(n42_node)
             .extend_rpc_modules(move |ctx| {
@@ -612,6 +613,9 @@ fn main() {
                 }
                 if let Some(ref jmt) = rpc_jmt {
                     rpc_server = rpc_server.with_jmt(Arc::clone(jmt));
+                }
+                if let Some(token) = rpc_admin_token {
+                    rpc_server = rpc_server.with_admin_token(token);
                 }
                 ctx.modules.merge_configured(rpc_server.into_rpc())?;
                 info!(target: "n42::cli", "N42 RPC namespace registered");

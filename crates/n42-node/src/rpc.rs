@@ -216,16 +216,23 @@ pub trait N42Api {
     async fn zk_status(&self) -> RpcResult<ZkStatusResponse>;
 
     /// Proposes adding a new validator. Activates at next CommitQC (commit-then-activate).
+    /// Requires a valid admin token as the first parameter.
     #[method(name = "proposeAddValidator")]
     async fn propose_add_validator(
         &self,
+        admin_token: String,
         address: Address,
         bls_pubkey: String,
     ) -> RpcResult<String>;
 
     /// Proposes removing a validator. Cannot drop below MIN_VALIDATOR_COUNT (4).
+    /// Requires a valid admin token as the first parameter.
     #[method(name = "proposeRemoveValidator")]
-    async fn propose_remove_validator(&self, address: Address) -> RpcResult<String>;
+    async fn propose_remove_validator(
+        &self,
+        admin_token: String,
+        address: Address,
+    ) -> RpcResult<String>;
 }
 
 pub struct N42RpcServer {
@@ -233,6 +240,7 @@ pub struct N42RpcServer {
     staking_manager: Option<Arc<Mutex<StakingManager>>>,
     jmt: Option<Arc<Mutex<ShardedJmt>>>,
     zk_scheduler: Option<Arc<ProofScheduler>>,
+    admin_token: Option<String>,
 }
 
 impl N42RpcServer {
@@ -242,6 +250,7 @@ impl N42RpcServer {
             staking_manager: None,
             jmt: None,
             zk_scheduler: None,
+            admin_token: None,
         }
     }
 
@@ -258,6 +267,27 @@ impl N42RpcServer {
     pub fn with_zk_scheduler(mut self, scheduler: Arc<ProofScheduler>) -> Self {
         self.zk_scheduler = Some(scheduler);
         self
+    }
+
+    pub fn with_admin_token(mut self, token: String) -> Self {
+        self.admin_token = Some(token);
+        self
+    }
+
+    fn verify_admin_token(&self, provided: &str) -> RpcResult<()> {
+        match &self.admin_token {
+            Some(expected) if expected == provided => Ok(()),
+            Some(_) => Err(ErrorObjectOwned::owned(
+                -32001,
+                "invalid admin token",
+                None::<()>,
+            )),
+            None => Err(ErrorObjectOwned::owned(
+                -32001,
+                "admin RPC not enabled (set N42_ADMIN_TOKEN)",
+                None::<()>,
+            )),
+        }
     }
 
     fn parse_bls_pubkey(hex_str: &str) -> RpcResult<BlsPublicKey> {
@@ -740,9 +770,11 @@ impl N42ApiServer for N42RpcServer {
 
     async fn propose_add_validator(
         &self,
+        admin_token: String,
         address: Address,
         bls_pubkey: String,
     ) -> RpcResult<String> {
+        self.verify_admin_token(&admin_token)?;
         let bls_pk = Self::parse_bls_pubkey(&bls_pubkey)?;
 
         let info = n42_chainspec::ValidatorInfo {
@@ -766,7 +798,12 @@ impl N42ApiServer for N42RpcServer {
             .map_err(|e| ErrorObjectOwned::owned(-32003, e, None::<()>))
     }
 
-    async fn propose_remove_validator(&self, address: Address) -> RpcResult<String> {
+    async fn propose_remove_validator(
+        &self,
+        admin_token: String,
+        address: Address,
+    ) -> RpcResult<String> {
+        self.verify_admin_token(&admin_token)?;
         let admin_tx = self.consensus_state.admin_tx()
             .ok_or_else(|| ErrorObjectOwned::owned(-32603, "admin channel not available", None::<()>))?;
 
