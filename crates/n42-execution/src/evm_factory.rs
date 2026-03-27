@@ -22,19 +22,27 @@ const RANDOMNESS_PRECOMPILE_ADDR: alloy_primitives::Address =
     address!("0000000000000000000000000000000000000302");
 
 /// Build precompiles for a given spec, adding the N42 randomness precompile.
-///
-/// Uses `OnceLock` per-spec-id would be ideal but `SpecId` has many variants.
-/// Instead we leak a `Box` to get `&'static` — acceptable because this is called
-/// at most once per distinct spec encountered during the process lifetime.
+/// Cached per SpecId — leaked once, reused for all subsequent calls with the same spec.
 fn n42_precompiles(spec: SpecId) -> &'static Precompiles {
-    // We intentionally leak here; the number of distinct specs is small and bounded.
+    use std::sync::Mutex;
+
+    // Bounded cache: SpecId has ~20 variants, so at most ~20 leaked entries.
+    static CACHE: Mutex<Vec<(SpecId, &'static Precompiles)>> = Mutex::new(Vec::new());
+
+    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&(_, precompiles)) = cache.iter().find(|(s, _)| *s == spec) {
+        return precompiles;
+    }
+
     let mut precompiles = Precompiles::new(PrecompileSpecId::from(spec)).clone();
     precompiles.extend([Precompile::new(
         PrecompileId::custom("n42-randomness"),
         RANDOMNESS_PRECOMPILE_ADDR,
         precompile_random::revm_precompile_fn,
     )]);
-    Box::leak(Box::new(precompiles))
+    let leaked: &'static Precompiles = Box::leak(Box::new(precompiles));
+    cache.push((spec, leaked));
+    leaked
 }
 
 /// N42 EVM factory — produces EVMs with Ethereum precompiles + randomness at `0x0302`.

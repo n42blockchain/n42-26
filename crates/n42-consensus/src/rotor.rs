@@ -84,8 +84,8 @@ pub fn compute_default_relay_assignment(
     compute_relay_assignment(view, validator_count, leader, DEFAULT_RELAY_COUNT)
 }
 
-/// Cached relay assignment — avoids recomputing ~500 SHA256 hashes per call.
-/// Caches last 8 views. Thread-safe via Mutex.
+/// Cached relay assignment using the default relay count (3).
+/// Avoids recomputing ~500 SHA256 hashes per call. Caches last 8 views.
 pub fn cached_relay_assignment(
     view: u64,
     validator_count: u32,
@@ -95,23 +95,24 @@ pub fn cached_relay_assignment(
     use std::sync::Mutex;
     use std::collections::VecDeque;
 
-    static CACHE: Mutex<Option<VecDeque<(u64, u32, u32, RelayAssignment)>>> = Mutex::new(None);
+    type CacheEntry = (u64, u32, u32, usize, RelayAssignment);
+    static CACHE: Mutex<Option<VecDeque<CacheEntry>>> = Mutex::new(None);
     const MAX_CACHE: usize = 8;
 
-    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
-    let cache = cache.get_or_insert_with(VecDeque::new);
+    let mut guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    let cache = guard.get_or_insert_with(VecDeque::new);
 
-    // Check cache hit
-    if let Some(entry) = cache.iter().find(|(v, vc, l, _)| *v == view && *vc == validator_count && *l == leader) {
-        return entry.3.clone();
+    if let Some(entry) = cache.iter().find(|(v, vc, l, rc, _)| {
+        *v == view && *vc == validator_count && *l == leader && *rc == relay_count
+    }) {
+        return entry.4.clone();
     }
 
-    // Cache miss — compute and store
     let assignment = compute_relay_assignment(view, validator_count, leader, relay_count);
     if cache.len() >= MAX_CACHE {
         cache.pop_front();
     }
-    cache.push_back((view, validator_count, leader, assignment.clone()));
+    cache.push_back((view, validator_count, leader, relay_count, assignment.clone()));
     assignment
 }
 
