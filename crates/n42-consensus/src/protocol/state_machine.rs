@@ -223,6 +223,7 @@ pub struct ConsensusEngine {
     last_committed_timing: Option<ViewTiming>,
     /// Pending tx_root_hash values for Baby Raptr DA verification.
     /// Maps block_hash -> tx_root_hash for proposals awaiting verification.
+    /// Bounded to 64 entries; oldest evicted when full (prevents OOM from unfinalized proposals).
     pub(super) pending_tx_roots: HashMap<B256, B256>,
 }
 

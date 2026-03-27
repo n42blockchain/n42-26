@@ -153,7 +153,13 @@ impl ConsensusEngine {
         }
 
         // Store pending tx_root_hash for future DA verification if present.
+        // Bounded to 64 entries to prevent OOM from unfinalized proposals.
         if let Some(tx_root) = proposal.tx_root_hash {
+            if self.pending_tx_roots.len() >= 64 {
+                if let Some(&oldest) = self.pending_tx_roots.keys().next() {
+                    self.pending_tx_roots.remove(&oldest);
+                }
+            }
             self.pending_tx_roots.insert(proposal.block_hash, tx_root);
         }
 

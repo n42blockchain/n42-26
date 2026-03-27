@@ -1068,12 +1068,12 @@ impl ConsensusOrchestrator {
     /// Broadcasts a consensus message using Rotor relay: send directly to relay nodes,
     /// then always broadcast via GossipSub as safety net.
     async fn broadcast_via_rotor(&mut self, msg: n42_primitives::ConsensusMessage) {
-        use n42_consensus::rotor::compute_relay_assignment;
+        use n42_consensus::rotor::cached_relay_assignment;
 
         let view = self.engine.current_view();
         let validator_count = self.engine.epoch_manager().current_validator_set().len();
         let leader = self.engine.current_leader_index();
-        let assignment = compute_relay_assignment(view, validator_count, leader, 3);
+        let assignment = cached_relay_assignment(view, validator_count, leader, 3);
 
         let mut direct_ok = 0u32;
         let mut direct_fail = 0u32;

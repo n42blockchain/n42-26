@@ -1191,8 +1191,8 @@ impl NetworkService {
             return; // Not from leader — don't relay (prevents forwarding loops)
         }
 
-        use n42_consensus::rotor::compute_relay_assignment;
-        let assignment = compute_relay_assignment(
+        use n42_consensus::rotor::cached_relay_assignment;
+        let assignment = cached_relay_assignment(
             proposal.view,
             self.validator_count,
             proposal.proposer,
@@ -1208,26 +1208,29 @@ impl NetworkService {
 
         let Some(targets) = my_targets else { return };
 
-        // Forward to assigned targets
-        let map = self
-            .validator_peer_map
-            .read()
-            .unwrap_or_else(|e| e.into_inner());
+        // Collect target peer IDs while holding the lock, then release before sending.
+        let target_peers: Vec<libp2p::PeerId> = {
+            let map = self
+                .validator_peer_map
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            targets
+                .iter()
+                .filter(|&&idx| idx != my_index)
+                .filter_map(|idx| map.get(idx).copied())
+                .collect()
+        };
+
         let mut forwarded = 0u32;
-        for target_idx in &targets {
-            if *target_idx == my_index {
-                continue;
-            } // Don't send to self
-            if let Some(&peer_id) = map.get(target_idx) {
-                let req = crate::consensus_direct::ConsensusDirectRequest {
-                    message_bytes: raw_bytes.to_vec(),
-                };
-                self.swarm
-                    .behaviour_mut()
-                    .consensus_direct
-                    .send_request(&peer_id, req);
-                forwarded += 1;
-            }
+        for peer_id in &target_peers {
+            let req = crate::consensus_direct::ConsensusDirectRequest {
+                message_bytes: raw_bytes.to_vec(),
+            };
+            self.swarm
+                .behaviour_mut()
+                .consensus_direct
+                .send_request(peer_id, req);
+            forwarded += 1;
         }
         if forwarded > 0 {
             metrics::counter!("n42_rotor_relayed_msgs").increment(forwarded as u64);
