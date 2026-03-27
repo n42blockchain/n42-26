@@ -8,5 +8,8 @@ pub mod witness;
 
 pub use evm_config::N42EvmConfig;
 pub use evm_factory::N42EvmFactory;
-pub use executor::{execute_block_full, execute_block_with_witness};
+pub use executor::{
+    ParallelExecutionSummary, execute_block_full, execute_block_parallel,
+    execute_block_with_witness, parallel_evm_enabled,
+};
 pub use read_log::{ReadLogDatabase, ReadLogEntry};

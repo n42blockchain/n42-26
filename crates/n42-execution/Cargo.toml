@@ -8,6 +8,7 @@ description = "N42 EVM execution layer wrapping reth EthEvmConfig"
 
 [dependencies]
 n42-chainspec.workspace = true
+n42-parallel-evm.workspace = true
 
 reth-chainspec.workspace = true
 reth-ethereum-primitives.workspace = true

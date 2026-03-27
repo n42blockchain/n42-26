@@ -6419,6 +6419,7 @@ dependencies = [
  "eyre",
  "metrics",
  "n42-chainspec",
+ "n42-parallel-evm",
  "reth-chainspec",
  "reth-ethereum-primitives",
  "reth-evm",
