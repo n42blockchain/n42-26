@@ -6376,6 +6376,7 @@ dependencies = [
  "arc-swap",
  "bincode",
  "bitvec",
+ "bumpalo",
  "eyre",
  "n42-chainspec",
  "n42-mobile",

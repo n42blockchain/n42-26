@@ -112,6 +112,9 @@ ed25519-dalek = { version = "2", features = ["serde", "rand_core"] }
 # Caching
 lru = "0.16"
 
+# Allocators
+bumpalo = "3"
+
 # Serialization
 borsh = { version = "1.6", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
