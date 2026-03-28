@@ -1,10 +1,9 @@
 use crate::hasher::Blake3Hasher;
 use crate::keys::{account_key, storage_key};
 use crate::metrics;
-use crate::store::MemTreeStore;
+use crate::store::{MemTreeStore, TreeStore};
 
 use alloy_primitives::B256;
-use jmt::storage::TreeWriter;
 use jmt::{JellyfishMerkleTree, KeyHash, OwnedValue, Version};
 use n42_execution::state_diff::{AccountChangeType, StateDiff};
 use std::sync::Arc;
@@ -53,30 +52,39 @@ fn to_eyre(e: anyhow::Error) -> eyre::Report {
     eyre::eyre!("{e:#}")
 }
 
-/// N42 JMT tree backed by an in-memory store.
+/// N42 JMT tree backed by a pluggable store (in-memory or disk).
 ///
 /// Maintains a versioned Jellyfish Merkle Tree using Blake3 hashing.
 /// Each block application increments the version and produces a new root hash.
 ///
 /// The tree is updated incrementally from `StateDiff` (extracted from revm BundleState),
 /// so only changed accounts/slots are touched per block.
-pub struct N42JmtTree {
-    store: Arc<MemTreeStore>,
+///
+/// Generic over `S: TreeStore`; defaults to `MemTreeStore` for backward compatibility.
+pub struct N42JmtTree<S: TreeStore = MemTreeStore> {
+    store: Arc<S>,
     version: Version,
 }
 
-impl N42JmtTree {
-    /// Create a new empty JMT tree at version 0.
+impl N42JmtTree<MemTreeStore> {
+    /// Create a new empty JMT tree at version 0 with in-memory store.
     pub fn new() -> Self {
         Self {
             store: Arc::new(MemTreeStore::new()),
             version: 0,
         }
     }
+}
 
+impl<S: TreeStore> N42JmtTree<S> {
     /// Create a JMT tree wrapping an existing store (for shard use).
-    pub fn with_store(store: Arc<MemTreeStore>) -> Self {
+    pub fn with_store(store: Arc<S>) -> Self {
         Self { store, version: 0 }
+    }
+
+    /// Create a JMT tree wrapping an existing store at a specific version (for disk restore).
+    pub fn with_store_and_version(store: Arc<S>, version: Version) -> Self {
+        Self { store, version }
     }
 
     /// Current tree version (= number of blocks applied).
@@ -220,6 +228,32 @@ impl N42JmtTree {
         Ok((new_version, B256::from(root_hash.0)))
     }
 
+    /// Compute a `NodeBatch` from updates without writing to the store.
+    ///
+    /// Returns `(new_version, root_hash, node_batch)`. The caller is responsible
+    /// for committing the batch (e.g. via `DiskTreeStore::write_batch_in_txn`).
+    /// After a successful commit, call `set_version` to advance this tree.
+    ///
+    /// Empty updates return the current root and an empty batch.
+    pub fn compute_batch(
+        &self,
+        updates: Vec<(KeyHash, Option<OwnedValue>)>,
+    ) -> eyre::Result<(Version, B256, jmt::storage::NodeBatch)> {
+        if updates.is_empty() {
+            let root = self.root_hash()?;
+            return Ok((self.version, root, jmt::storage::NodeBatch::default()));
+        }
+        let new_version = self.version + 1;
+        let tree = JellyfishMerkleTree::<_, Blake3Hasher>::new(self.store.as_ref());
+        let (root_hash, batch) = tree.put_value_set(updates, new_version).map_err(to_eyre)?;
+        Ok((new_version, B256::from(root_hash.0), batch.node_batch))
+    }
+
+    /// Advance the tree version after an external batch commit.
+    pub fn set_version(&mut self, version: Version) {
+        self.version = version;
+    }
+
     /// Generate an inclusion/exclusion proof for a key at the current version.
     ///
     /// Returns `None` if the tree is empty (no data written yet).
@@ -242,19 +276,18 @@ impl N42JmtTree {
     /// Uses `TreeReader::get_value_option` directly instead of `get_with_proof`
     /// to avoid unnecessary proof computation on the hot path.
     pub fn get(&self, key_hash: KeyHash) -> eyre::Result<Option<OwnedValue>> {
-        use jmt::storage::TreeReader;
         self.store
             .get_value_option(self.version, key_hash)
             .map_err(to_eyre)
     }
 
     /// Access the underlying store (for shard merging, persistence, etc.).
-    pub fn store(&self) -> &Arc<MemTreeStore> {
+    pub fn store(&self) -> &Arc<S> {
         &self.store
     }
 }
 
-impl Default for N42JmtTree {
+impl Default for N42JmtTree<MemTreeStore> {
     fn default() -> Self {
         Self::new()
     }

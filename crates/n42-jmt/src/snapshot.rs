@@ -9,7 +9,7 @@
 //! compressed with zstd for compact storage.
 
 use crate::sharded::{SHARD_COUNT, ShardedJmt};
-use crate::store::MemTreeStore;
+use crate::store::{MemTreeStore, TreeStore};
 use crate::tree::N42JmtTree;
 use alloy_primitives::hex;
 use jmt::KeyHash;
@@ -41,7 +41,7 @@ impl JmtSnapshot {
     }
 }
 
-impl ShardedJmt {
+impl<S: TreeStore> ShardedJmt<S> {
     /// Create a snapshot of the current JMT state.
     ///
     /// Collects all live key-value pairs from all 16 shards.
@@ -59,7 +59,9 @@ impl ShardedJmt {
             entries,
         })
     }
+}
 
+impl ShardedJmt<MemTreeStore> {
     /// Reconstruct a ShardedJmt from a snapshot.
     ///
     /// Creates a new tree with 16 shards, distributes all entries by shard index,

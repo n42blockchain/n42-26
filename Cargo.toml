@@ -75,6 +75,7 @@ reth-payload-builder-primitives = { path = "../reth-latest/crates/payload/builde
 reth-payload-primitives = { path = "../reth-latest/crates/payload/primitives" }
 reth-engine-primitives = { path = "../reth-latest/crates/engine/primitives" }
 reth-chain-state = { path = "../reth-latest/crates/chain-state" }
+reth-libmdbx = { path = "../reth-latest/crates/storage/libmdbx-rs" }
 reth-storage-api = { path = "../reth-latest/crates/storage/storage-api" }
 reth-rpc-builder = { path = "../reth-latest/crates/rpc/rpc-builder" }
 reth-rpc-server-types = { path = "../reth-latest/crates/rpc/rpc-server-types" }
@@ -112,6 +113,7 @@ ed25519-dalek = { version = "2", features = ["serde", "rand_core"] }
 lru = "0.16"
 
 # Serialization
+borsh = { version = "1.6", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "0.8"

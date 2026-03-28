@@ -104,8 +104,8 @@ impl JmtProof {
 ///
 /// Collects all shard roots and serializes the shard-level proof.
 /// Returns `None` if the target shard is empty (key guaranteed absent, no proof needed).
-pub fn build_proof(
-    sharded_jmt: &crate::ShardedJmt,
+pub fn build_proof<S: crate::TreeStore>(
+    sharded_jmt: &crate::ShardedJmt<S>,
     key_hash: KeyHash,
 ) -> eyre::Result<Option<JmtProof>> {
     let start = Instant::now();

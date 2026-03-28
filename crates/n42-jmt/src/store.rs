@@ -4,6 +4,30 @@ use jmt::{KeyHash, OwnedValue, Version};
 use parking_lot::RwLock;
 use std::collections::{BTreeMap, HashMap};
 
+/// Unified store trait for JMT backends (in-memory or disk-backed).
+///
+/// Extends `TreeReader + TreeWriter` with diagnostics, pruning, and snapshot support.
+/// Both `MemTreeStore` and `DiskTreeStore` implement this trait, allowing
+/// `N42JmtTree` and `ShardedJmt` to be generic over the storage backend.
+pub trait TreeStore: TreeReader + TreeWriter + Send + Sync + 'static {
+    /// Number of tree nodes currently stored.
+    fn node_count(&self) -> usize;
+
+    /// Number of distinct key hashes with at least one value version.
+    fn key_count(&self) -> usize;
+
+    /// Prune stale nodes and old value versions older than `keep_versions`.
+    ///
+    /// Retains only versions >= (latest_version - keep_versions).
+    fn prune(&self, latest_version: Version, keep_versions: u64);
+
+    /// Dump all live key-value pairs at the latest version.
+    ///
+    /// Returns `(KeyHash bytes, value bytes)` for each key that has a live value.
+    /// Used for snapshot persistence.
+    fn dump_latest(&self) -> Vec<([u8; 32], Vec<u8>)>;
+}
+
 /// Tombstone-aware value entry: tracks both writes and deletions.
 #[derive(Debug, Clone)]
 enum ValueEntry {
@@ -22,8 +46,6 @@ enum ValueEntry {
 ///
 /// Thread-safe via `parking_lot::RwLock` — readers never block each other,
 /// writers only block briefly on HashMap insert.
-///
-/// Future: swap inner maps for reth DB tables via `TreeReader`/`TreeWriter` traits.
 #[derive(Debug, Default)]
 pub struct MemTreeStore {
     nodes: RwLock<HashMap<NodeKey, Node>>,
@@ -125,6 +147,24 @@ impl TreeReader for MemTreeStore {
             Some((_, ValueEntry::Deleted)) => Ok(None), // tombstone → key deleted
             None => Ok(None),
         }
+    }
+}
+
+impl TreeStore for MemTreeStore {
+    fn node_count(&self) -> usize {
+        self.nodes.read().len()
+    }
+
+    fn key_count(&self) -> usize {
+        self.values.read().len()
+    }
+
+    fn prune(&self, latest_version: Version, keep_versions: u64) {
+        MemTreeStore::prune(self, latest_version, keep_versions);
+    }
+
+    fn dump_latest(&self) -> Vec<([u8; 32], Vec<u8>)> {
+        MemTreeStore::dump_latest(self)
     }
 }
 

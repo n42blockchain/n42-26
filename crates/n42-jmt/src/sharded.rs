@@ -1,7 +1,7 @@
 use crate::hasher::Blake3Hasher;
 use crate::keys::{account_key, storage_key};
 use crate::metrics;
-use crate::store::MemTreeStore;
+use crate::store::{MemTreeStore, TreeStore};
 use crate::tree::{N42JmtTree, decode_code_hash, encode_account_value};
 
 use alloy_primitives::B256;
@@ -37,35 +37,39 @@ pub fn combine_shard_roots(roots: &[[u8; 32]]) -> B256 {
 
 /// 16-shard parallel JMT.
 ///
-/// Each shard is an independent `N42JmtTree` with its own `MemTreeStore`.
+/// Each shard is an independent `N42JmtTree` with its own store.
 /// Updates are partitioned by the first nibble of the key hash and applied
 /// in parallel via rayon. The final root is the Blake3 hash of all 16 shard roots
 /// concatenated in order.
 ///
 /// This gives ~10-14x speedup on multi-core machines for large state diffs,
 /// while maintaining deterministic root computation.
-pub struct ShardedJmt {
-    shards: Vec<Mutex<N42JmtTree>>,
+///
+/// Generic over `S: TreeStore`; defaults to `MemTreeStore` for backward compatibility.
+pub struct ShardedJmt<S: TreeStore = MemTreeStore> {
+    shards: Vec<Mutex<N42JmtTree<S>>>,
     version: Version,
 }
 
-impl ShardedJmt {
-    /// Create a new 16-shard JMT.
+impl ShardedJmt<MemTreeStore> {
+    /// Create a new 16-shard JMT with in-memory stores.
     pub fn new() -> Self {
         let shards = (0..SHARD_COUNT)
             .map(|_| Mutex::new(N42JmtTree::with_store(Arc::new(MemTreeStore::new()))))
             .collect();
         Self { shards, version: 0 }
     }
+}
 
+impl<S: TreeStore> ShardedJmt<S> {
     /// Construct from pre-built shards (used by snapshot restore).
-    pub(crate) fn from_parts(shards: Vec<Mutex<N42JmtTree>>, version: Version) -> Self {
+    pub(crate) fn from_parts(shards: Vec<Mutex<N42JmtTree<S>>>, version: Version) -> Self {
         assert_eq!(shards.len(), SHARD_COUNT);
         Self { shards, version }
     }
 
     /// Access the internal shards (used by snapshot).
-    pub(crate) fn shards(&self) -> &[Mutex<N42JmtTree>] {
+    pub(crate) fn shards(&self) -> &[Mutex<N42JmtTree<S>>] {
         &self.shards
     }
 
@@ -93,18 +97,15 @@ impl ShardedJmt {
         Ok(combine_shard_roots(&roots))
     }
 
-    /// Apply a `StateDiff` across all 16 shards in parallel.
+    /// Read existing code_hashes and partition a StateDiff into per-shard update vectors.
     ///
-    /// For Modified accounts without `code_change`, reads existing code_hash
-    /// from the shard to preserve it (see P0-2 fix).
-    ///
-    /// Returns `(new_version, combined_root_hash)`.
-    pub fn apply_diff(&mut self, diff: &StateDiff) -> eyre::Result<(Version, B256)> {
-        let start = Instant::now();
-        let new_version = self.version + 1;
-
+    /// Shared by `apply_diff` and `apply_diff_atomic` to avoid duplication.
+    /// Returns `(per_shard_updates, total_key_count)`.
+    fn prepare_shard_updates(
+        &self,
+        diff: &StateDiff,
+    ) -> eyre::Result<(Vec<Vec<(KeyHash, Option<OwnedValue>)>>, usize)> {
         // Phase 1: Read existing code_hashes for Modified accounts that need them.
-        // Must happen before partition since we need to read from the correct shard.
         let mut existing_code_hashes: std::collections::HashMap<alloy_primitives::Address, B256> =
             std::collections::HashMap::new();
         for (address, account_diff) in &diff.accounts {
@@ -123,7 +124,6 @@ impl ShardedJmt {
         // Phase 2: Partition updates by shard.
         let mut shard_updates: Vec<Vec<(KeyHash, Option<OwnedValue>)>> =
             (0..SHARD_COUNT).map(|_| Vec::new()).collect();
-
         let mut total_keys = 0usize;
 
         for (address, account_diff) in &diff.accounts {
@@ -148,7 +148,6 @@ impl ShardedJmt {
                         .map(|v| v.to)
                         .unwrap_or_default();
                     let nonce = account_diff.nonce.as_ref().map(|v| v.to).unwrap_or(0);
-
                     let code_hash = match &account_diff.code_change {
                         Some(change) => change.to.unwrap_or(B256::ZERO),
                         None => existing_code_hashes
@@ -156,7 +155,6 @@ impl ShardedJmt {
                             .copied()
                             .unwrap_or(B256::ZERO),
                     };
-
                     let value = encode_account_value(&balance, nonce, &code_hash);
                     shard_updates[si].push((key, Some(value)));
                     total_keys += 1;
@@ -175,6 +173,20 @@ impl ShardedJmt {
                 }
             }
         }
+
+        Ok((shard_updates, total_keys))
+    }
+
+    /// Apply a `StateDiff` across all 16 shards in parallel.
+    ///
+    /// For Modified accounts without `code_change`, reads existing code_hash
+    /// from the shard to preserve it (see P0-2 fix).
+    ///
+    /// Returns `(new_version, combined_root_hash)`.
+    pub fn apply_diff(&mut self, diff: &StateDiff) -> eyre::Result<(Version, B256)> {
+        let start = Instant::now();
+        let new_version = self.version + 1;
+        let (shard_updates, total_keys) = self.prepare_shard_updates(diff)?;
 
         // Phase 3: Apply each shard's updates in parallel.
         let results: Vec<eyre::Result<B256>> = self
@@ -262,9 +274,119 @@ impl ShardedJmt {
     }
 }
 
-impl Default for ShardedJmt {
+impl Default for ShardedJmt<MemTreeStore> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl ShardedJmt<crate::DiskTreeStore> {
+    /// Open a disk-backed 16-shard JMT from an MDBX environment directory.
+    ///
+    /// Creates or reopens the MDBX environment at `path`, with one `DiskTreeStore`
+    /// per shard. Restores each shard's version from metadata so the tree can
+    /// resume from where it left off.
+    pub fn open_disk(
+        path: impl AsRef<std::path::Path>,
+        cache_size_per_shard: usize,
+    ) -> eyre::Result<Self> {
+        let env = crate::disk_store::open_jmt_env(path)?;
+
+        let shards = (0..SHARD_COUNT)
+            .map(|i| {
+                let store = Arc::new(crate::DiskTreeStore::open(
+                    env.clone(),
+                    i as u8,
+                    cache_size_per_shard,
+                )?);
+                let version = store.read_latest_version();
+                Ok(Mutex::new(N42JmtTree::with_store_and_version(
+                    store, version,
+                )))
+            })
+            .collect::<eyre::Result<Vec<_>>>()?;
+
+        let version = shards
+            .iter()
+            .map(|s| s.lock().version())
+            .max()
+            .unwrap_or(0);
+        Ok(Self { shards, version })
+    }
+
+    /// Apply a `StateDiff` with atomic single-transaction MDBX commit.
+    ///
+    /// Same logic as `apply_diff`, but:
+    /// - Phase 3 computes `NodeBatch` per shard **without writing** (parallel via rayon)
+    /// - Phase 4 writes all 16 shards in a **single MDBX write transaction** (atomic)
+    ///
+    /// This avoids MDBX's single-writer serialization during parallel computation
+    /// and guarantees all-or-nothing commit across shards.
+    pub fn apply_diff_atomic(&mut self, diff: &StateDiff) -> eyre::Result<(Version, B256)> {
+        let start = Instant::now();
+        let new_version = self.version + 1;
+        let (shard_updates, total_keys) = self.prepare_shard_updates(diff)?;
+
+        // Phase 3: Compute NodeBatch per shard in parallel (NO disk write).
+        let compute_results: Vec<eyre::Result<(Version, B256, jmt::storage::NodeBatch)>> = self
+            .shards
+            .par_iter()
+            .zip(shard_updates.into_par_iter())
+            .map(|(shard, updates)| {
+                let tree = shard.lock();
+                tree.compute_batch(updates)
+            })
+            .collect();
+
+        // Collect results, bail on first error.
+        let mut batches = Vec::with_capacity(SHARD_COUNT);
+        let mut shard_roots = Vec::with_capacity(SHARD_COUNT);
+        for result in compute_results {
+            let (ver, root, batch) = result?;
+            batches.push((ver, batch));
+            shard_roots.push(root.0);
+        }
+
+        // Phase 4: Single MDBX write transaction for all 16 shards.
+        let env = self.shards[0].lock().store().env();
+        let tx = env
+            .begin_rw_txn()
+            .map_err(|e| eyre::eyre!("begin_rw_txn: {e}"))?;
+        for (i, (_, batch)) in batches.iter().enumerate() {
+            if !batch.is_empty() {
+                let tree = self.shards[i].lock();
+                tree.store()
+                    .write_batch_in_txn(&tx, batch)
+                    .map_err(|e| eyre::eyre!("{e}"))?;
+            }
+        }
+        tx.commit()
+            .map_err(|e| eyre::eyre!("atomic commit: {e}"))?;
+
+        // Phase 5: Advance shard versions after successful commit.
+        for (i, (ver, _)) in batches.iter().enumerate() {
+            let mut tree = self.shards[i].lock();
+            if *ver > tree.version() {
+                tree.set_version(*ver);
+            }
+        }
+
+        let combined = combine_shard_roots(&shard_roots);
+        self.version = new_version;
+
+        let ms = start.elapsed().as_secs_f64() * 1000.0;
+        metrics::record_sharded_update(SHARD_COUNT, total_keys, ms);
+        debug!(
+            target: "n42::jmt",
+            version = new_version,
+            shards = SHARD_COUNT,
+            total_keys,
+            update_ms = format!("{ms:.2}"),
+            root = %combined,
+            "sharded JMT updated (atomic)"
+        );
+
+        Ok((new_version, combined))
     }
 }
 
@@ -430,5 +552,112 @@ mod tests {
 
         let roots = jmt.shard_roots().unwrap();
         assert_eq!(roots.len(), SHARD_COUNT);
+    }
+
+    #[test]
+    fn disk_backed_basic() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut jmt = ShardedJmt::open_disk(dir.path(), 1000).unwrap();
+
+        let diff = multi_account_diff(100);
+        let (version, root) = jmt.apply_diff(&diff).unwrap();
+        assert_eq!(version, 1);
+        assert_ne!(root, B256::ZERO);
+
+        // Verify data is readable
+        let key = crate::keys::account_key(&Address::with_last_byte(0));
+        let val = jmt.get(key).unwrap();
+        assert!(val.is_some());
+    }
+
+    #[test]
+    fn disk_backed_persistence() {
+        let dir = tempfile::tempdir().unwrap();
+        let diff = multi_account_diff(50);
+
+        let root1;
+        // Write
+        {
+            let mut jmt = ShardedJmt::open_disk(dir.path(), 1000).unwrap();
+            let (_, root) = jmt.apply_diff(&diff).unwrap();
+            root1 = root;
+        }
+
+        // Reopen and verify
+        {
+            let jmt = ShardedJmt::open_disk(dir.path(), 1000).unwrap();
+            assert_eq!(jmt.version(), 1);
+            let root2 = jmt.root_hash().unwrap();
+            assert_eq!(root1, root2, "root must survive restart");
+        }
+    }
+
+    #[test]
+    fn disk_backed_deterministic() {
+        let diff = multi_account_diff(50);
+
+        let dir1 = tempfile::tempdir().unwrap();
+        let mut jmt1 = ShardedJmt::open_disk(dir1.path(), 1000).unwrap();
+        let (_, r1) = jmt1.apply_diff(&diff).unwrap();
+
+        let dir2 = tempfile::tempdir().unwrap();
+        let mut jmt2 = ShardedJmt::open_disk(dir2.path(), 1000).unwrap();
+        let (_, r2) = jmt2.apply_diff(&diff).unwrap();
+
+        assert_eq!(r1, r2, "same diff should produce same root across disk instances");
+
+        // Also compare with in-memory
+        let mut jmt_mem = ShardedJmt::new();
+        let (_, r_mem) = jmt_mem.apply_diff(&diff).unwrap();
+        assert_eq!(r1, r_mem, "disk and memory roots must match");
+    }
+
+    #[test]
+    fn disk_atomic_matches_regular() {
+        let diff = multi_account_diff(100);
+
+        // Regular per-shard write path
+        let dir1 = tempfile::tempdir().unwrap();
+        let mut jmt1 = ShardedJmt::open_disk(dir1.path(), 1000).unwrap();
+        let (v1, r1) = jmt1.apply_diff(&diff).unwrap();
+
+        // Atomic single-transaction path
+        let dir2 = tempfile::tempdir().unwrap();
+        let mut jmt2 = ShardedJmt::open_disk(dir2.path(), 1000).unwrap();
+        let (v2, r2) = jmt2.apply_diff_atomic(&diff).unwrap();
+
+        assert_eq!(v1, v2, "versions must match");
+        assert_eq!(r1, r2, "atomic root must match regular root");
+
+        // Verify persistence after atomic write
+        drop(jmt2);
+        let jmt2_reopened = ShardedJmt::open_disk(dir2.path(), 1000).unwrap();
+        assert_eq!(jmt2_reopened.version(), v2);
+        assert_eq!(
+            jmt2_reopened.root_hash().unwrap(),
+            r2,
+            "atomic write must persist"
+        );
+    }
+
+    #[test]
+    fn disk_atomic_multi_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut jmt = ShardedJmt::open_disk(dir.path(), 1000).unwrap();
+
+        for i in 0..5u8 {
+            let diff = multi_account_diff((10 + i * 5) as usize);
+            let (ver, root) = jmt.apply_diff_atomic(&diff).unwrap();
+            assert_eq!(ver, (i + 1) as u64);
+            assert_ne!(root, B256::ZERO);
+        }
+
+        assert_eq!(jmt.version(), 5);
+
+        // Verify after reopen
+        drop(jmt);
+        let jmt = ShardedJmt::open_disk(dir.path(), 1000).unwrap();
+        assert_eq!(jmt.version(), 5);
+        assert_ne!(jmt.root_hash().unwrap(), B256::ZERO);
     }
 }
