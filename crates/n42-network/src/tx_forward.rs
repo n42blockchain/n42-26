@@ -18,10 +18,19 @@ pub struct TxForwardRequest {
     pub txs: Vec<Vec<u8>>,
 }
 
-/// Response: simple acknowledgement.
+/// Response: acknowledgement with credit-based flow control.
+///
+/// Inspired by Firedancer's fctl credit system: the leader tells each follower
+/// how many more transactions it can accept, preventing leader overload.
+/// A `remaining_credit` of 0 means "stop sending until I grant more".
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TxForwardResponse {
     pub accepted: bool,
+    /// Remaining TX credit for this follower. Follower must not send more than
+    /// this many transactions until the next response grants more credit.
+    /// `None` means unlimited (backward-compatible default).
+    #[serde(default)]
+    pub remaining_credit: Option<u32>,
 }
 
 /// Codec for the tx forward request-response protocol.

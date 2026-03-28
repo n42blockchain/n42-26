@@ -775,6 +775,9 @@ impl ConsensusOrchestrator {
             std::sync::atomic::Ordering::SeqCst,
         );
 
+        // Reset TX forward credit on view change (leader may have changed).
+        self.tx_forward_credit = None;
+
         info!(target: "n42::cl::consensus_loop", new_view, "view changed");
 
         // ViewChanged fires immediately after BlockCommitted in f=0 configs;

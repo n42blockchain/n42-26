@@ -149,6 +149,10 @@ pub enum NetworkEvent {
         source: PeerId,
         txs: Vec<Vec<u8>>,
     },
+    /// Leader granted (or revoked) TX forward credit to this follower.
+    TxForwardCreditUpdate {
+        remaining_credit: Option<u32>,
+    },
     SyncRequest {
         peer: PeerId,
         request_id: u64,
@@ -1366,7 +1370,7 @@ impl NetworkService {
                             .swarm
                             .behaviour_mut()
                             .tx_forward
-                            .send_response(channel, TxForwardResponse { accepted: true })
+                            .send_response(channel, TxForwardResponse { accepted: true, remaining_credit: None })
                             .is_err()
                         {
                             tracing::warn!(%peer, "failed to send tx forward ACK");
@@ -1377,14 +1381,20 @@ impl NetworkService {
                             .swarm
                             .behaviour_mut()
                             .tx_forward
-                            .send_response(channel, TxForwardResponse { accepted: false })
+                            .send_response(channel, TxForwardResponse { accepted: false, remaining_credit: Some(0) })
                             .is_err()
                         {
                             tracing::warn!(%peer, "failed to send tx forward rejection");
                         }
                     }
                 }
-                libp2p::request_response::Message::Response { .. } => {}
+                libp2p::request_response::Message::Response { response, .. } => {
+                    if response.remaining_credit.is_some() {
+                        self.emit_event(NetworkEvent::TxForwardCreditUpdate {
+                            remaining_credit: response.remaining_credit,
+                        });
+                    }
+                }
             },
             libp2p::request_response::Event::OutboundFailure { peer, error, .. } => {
                 tracing::debug!(%peer, ?error, "tx forward send failed");
@@ -1475,6 +1485,7 @@ impl NetworkService {
                 | NetworkEvent::PeerConnected(_)
                 | NetworkEvent::PeerDisconnected(_)
                 | NetworkEvent::TxForwardReceived { .. }
+                | NetworkEvent::TxForwardCreditUpdate { .. }
                 | NetworkEvent::SyncRequest { .. }
                 | NetworkEvent::SyncResponse { .. }
                 | NetworkEvent::SyncRequestFailed { .. }
