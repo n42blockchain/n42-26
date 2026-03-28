@@ -361,12 +361,12 @@ impl SharedConsensusState {
 
     /// Installs the admin command channel sender (called once during node startup).
     pub fn set_admin_channel(&self, tx: tokio::sync::mpsc::Sender<AdminCommand>) {
-        *self.admin_tx.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
+        *self.admin_tx.lock().unwrap_or_else(|e| { tracing::warn!("mutex poisoned, recovering"); e.into_inner() }) = Some(tx);
     }
 
     /// Returns a clone of the admin command channel sender, if installed.
     pub fn admin_tx(&self) -> Option<tokio::sync::mpsc::Sender<AdminCommand>> {
-        self.admin_tx.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.admin_tx.lock().unwrap_or_else(|e| { tracing::warn!("mutex poisoned, recovering"); e.into_inner() }).clone()
     }
 
     /// Registers the block for attestation tracking and notifies RPC subscribers.

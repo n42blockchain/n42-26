@@ -13,7 +13,7 @@ The primary bootstrap executable:
 
 Primary file:
 
-- [`bin/n42-node/src/main.rs`](/Users/jieliu/Documents/n42/n42-26/bin/n42-node/src/main.rs)
+- [`bin/n42-node/src/main.rs`](bin/n42-node/src/main.rs)
 
 ### `bin/n42-mobile-sim`
 

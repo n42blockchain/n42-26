@@ -34,9 +34,9 @@ Main responsibilities:
 
 Key files:
 
-- [`crates/n42-execution/src/executor.rs`](/Users/jieliu/Documents/n42/n42-26/crates/n42-execution/src/executor.rs)
-- [`crates/n42-execution/src/witness.rs`](/Users/jieliu/Documents/n42/n42-26/crates/n42-execution/src/witness.rs)
-- [`crates/n42-execution/src/state_diff.rs`](/Users/jieliu/Documents/n42/n42-26/crates/n42-execution/src/state_diff.rs)
+- [`crates/n42-execution/src/executor.rs`](crates/n42-execution/src/executor.rs)
+- [`crates/n42-execution/src/witness.rs`](crates/n42-execution/src/witness.rs)
+- [`crates/n42-execution/src/state_diff.rs`](crates/n42-execution/src/state_diff.rs)
 
 ## `n42-parallel-evm`
 

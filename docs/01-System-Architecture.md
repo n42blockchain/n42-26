@@ -56,8 +56,8 @@ Purpose:
 
 Primary code:
 
-- [`crates/n42-consensus/src/`](/Users/jieliu/Documents/n42/n42-26/crates/n42-consensus/src)
-- [`crates/n42-node/src/orchestrator/`](/Users/jieliu/Documents/n42/n42-26/crates/n42-node/src/orchestrator)
+- [`crates/n42-consensus/src/`](crates/n42-consensus/src)
+- [`crates/n42-node/src/orchestrator/`](crates/n42-node/src/orchestrator)
 
 ### 2. Execution plane
 
@@ -70,9 +70,9 @@ Purpose:
 
 Primary code:
 
-- [`crates/n42-execution/src/`](/Users/jieliu/Documents/n42/n42-26/crates/n42-execution/src)
-- [`crates/n42-node/src/payload.rs`](/Users/jieliu/Documents/n42/n42-26/crates/n42-node/src/payload.rs)
-- [`crates/n42-node/src/orchestrator/execution_bridge.rs`](/Users/jieliu/Documents/n42/n42-26/crates/n42-node/src/orchestrator/execution_bridge.rs)
+- [`crates/n42-execution/src/`](crates/n42-execution/src)
+- [`crates/n42-node/src/payload.rs`](crates/n42-node/src/payload.rs)
+- [`crates/n42-node/src/orchestrator/execution_bridge.rs`](crates/n42-node/src/orchestrator/execution_bridge.rs)
 
 ### 3. P2P validator network plane
 
@@ -85,8 +85,8 @@ Purpose:
 
 Primary code:
 
-- [`crates/n42-network/src/service.rs`](/Users/jieliu/Documents/n42/n42-26/crates/n42-network/src/service.rs)
-- [`crates/n42-network/src/transport.rs`](/Users/jieliu/Documents/n42/n42-26/crates/n42-network/src/transport.rs)
+- [`crates/n42-network/src/service.rs`](crates/n42-network/src/service.rs)
+- [`crates/n42-network/src/transport.rs`](crates/n42-network/src/transport.rs)
 
 ### 4. Mobile verification plane
 
@@ -99,9 +99,9 @@ Purpose:
 
 Primary code:
 
-- [`crates/n42-network/src/mobile/star_hub.rs`](/Users/jieliu/Documents/n42/n42-26/crates/n42-network/src/mobile/star_hub.rs)
-- [`crates/n42-node/src/mobile_bridge.rs`](/Users/jieliu/Documents/n42/n42-26/crates/n42-node/src/mobile_bridge.rs)
-- [`crates/n42-mobile/src/`](/Users/jieliu/Documents/n42/n42-26/crates/n42-mobile/src)
+- [`crates/n42-network/src/mobile/star_hub.rs`](crates/n42-network/src/mobile/star_hub.rs)
+- [`crates/n42-node/src/mobile_bridge.rs`](crates/n42-node/src/mobile_bridge.rs)
+- [`crates/n42-mobile/src/`](crates/n42-mobile/src)
 
 ### 5. Proof and state proof plane
 

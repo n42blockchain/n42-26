@@ -90,7 +90,7 @@ flowchart TD
 
 ## Relationship to `docs/`
 
-The lower-case [`docs/`](/Users/jieliu/Documents/n42/n42-26/docs) directory is a chronological engineering journal. It is useful for rationale and history but hard to consume as a system reference.
+The lower-case [`docs/`](docs) directory is a chronological engineering journal. It is useful for rationale and history but hard to consume as a system reference.
 
 This `Docs/` tree is organized around:
 

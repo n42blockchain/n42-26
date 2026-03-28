@@ -54,7 +54,7 @@ pub fn compute_relay_assignment(
             hasher.update((i as u64).to_le_bytes());
             hasher.finalize().into()
         };
-        let j = u64::from_le_bytes(pos_hash[0..8].try_into().unwrap()) % (i as u64 + 1);
+        let j = u64::from_le_bytes(pos_hash[..8].try_into().expect("SHA256 always 32 bytes")) % (i as u64 + 1);
         candidates.swap(i, j as usize);
     }
 

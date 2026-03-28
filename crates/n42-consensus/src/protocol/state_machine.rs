@@ -384,7 +384,10 @@ impl ConsensusEngine {
                     .get_public_key(proposal.proposer)
                     .ok()?;
                 let sig_msg = signing_message(proposal.view, &proposal.block_hash);
-                pk.verify(&sig_msg, &proposal.signature).ok()?;
+                if pk.verify(&sig_msg, &proposal.signature).is_err() {
+                    tracing::debug!(target: "n42::consensus", view = proposal.view, proposer = proposal.proposer, "proposal signature verification failed");
+                    return None;
+                }
                 Some(proposal.proposer)
             }
             ConsensusMessage::Vote(vote) => {
@@ -393,7 +396,10 @@ impl ConsensusEngine {
                     .get_public_key(vote.voter)
                     .ok()?;
                 let sig_msg = signing_message(vote.view, &vote.block_hash);
-                pk.verify(&sig_msg, &vote.signature).ok()?;
+                if pk.verify(&sig_msg, &vote.signature).is_err() {
+                    tracing::debug!(target: "n42::consensus", view = vote.view, voter = vote.voter, "vote signature verification failed");
+                    return None;
+                }
                 Some(vote.voter)
             }
             ConsensusMessage::CommitVote(commit_vote) => {
@@ -402,7 +408,10 @@ impl ConsensusEngine {
                     .get_public_key(commit_vote.voter)
                     .ok()?;
                 let sig_msg = commit_signing_message(commit_vote.view, &commit_vote.block_hash);
-                pk.verify(&sig_msg, &commit_vote.signature).ok()?;
+                if pk.verify(&sig_msg, &commit_vote.signature).is_err() {
+                    tracing::debug!(target: "n42::consensus", view = commit_vote.view, voter = commit_vote.voter, "commit_vote signature verification failed");
+                    return None;
+                }
                 Some(commit_vote.voter)
             }
             ConsensusMessage::Timeout(timeout) => {
@@ -411,7 +420,10 @@ impl ConsensusEngine {
                     .get_public_key(timeout.sender)
                     .ok()?;
                 let sig_msg = timeout_signing_message(timeout.view);
-                pk.verify(&sig_msg, &timeout.signature).ok()?;
+                if pk.verify(&sig_msg, &timeout.signature).is_err() {
+                    tracing::debug!(target: "n42::consensus", view = timeout.view, sender = timeout.sender, "timeout signature verification failed");
+                    return None;
+                }
                 Some(timeout.sender)
             }
             ConsensusMessage::NewView(new_view) => {
@@ -420,7 +432,10 @@ impl ConsensusEngine {
                     .get_public_key(new_view.leader)
                     .ok()?;
                 let sig_msg = newview_signing_message(new_view.view);
-                pk.verify(&sig_msg, &new_view.signature).ok()?;
+                if pk.verify(&sig_msg, &new_view.signature).is_err() {
+                    tracing::debug!(target: "n42::consensus", view = new_view.view, leader = new_view.leader, "new_view signature verification failed");
+                    return None;
+                }
                 Some(new_view.leader)
             }
             ConsensusMessage::PrepareQC(_) | ConsensusMessage::Decide(_) => None,

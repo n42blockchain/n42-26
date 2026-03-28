@@ -158,15 +158,15 @@ sequenceDiagram
 
 ## Files to review first during audits
 
-- [`crates/n42-node/src/orchestrator/mod.rs`](/Users/jieliu/Documents/n42/n42-26/crates/n42-node/src/orchestrator/mod.rs)
-- [`crates/n42-node/src/orchestrator/consensus_loop.rs`](/Users/jieliu/Documents/n42/n42-26/crates/n42-node/src/orchestrator/consensus_loop.rs)
-- [`crates/n42-node/src/mobile_bridge.rs`](/Users/jieliu/Documents/n42/n42-26/crates/n42-node/src/mobile_bridge.rs)
-- [`crates/n42-node/src/rpc.rs`](/Users/jieliu/Documents/n42/n42-26/crates/n42-node/src/rpc.rs)
-- [`crates/n42-node/src/persistence.rs`](/Users/jieliu/Documents/n42/n42-26/crates/n42-node/src/persistence.rs)
+- [`crates/n42-node/src/orchestrator/mod.rs`](crates/n42-node/src/orchestrator/mod.rs)
+- [`crates/n42-node/src/orchestrator/consensus_loop.rs`](crates/n42-node/src/orchestrator/consensus_loop.rs)
+- [`crates/n42-node/src/mobile_bridge.rs`](crates/n42-node/src/mobile_bridge.rs)
+- [`crates/n42-node/src/rpc.rs`](crates/n42-node/src/rpc.rs)
+- [`crates/n42-node/src/persistence.rs`](crates/n42-node/src/persistence.rs)
 
 ## Subsystem drill-downs
 
-- [`Docs/modules/n42-node-orchestrator.md`](/Users/jieliu/Documents/n42/n42-26/Docs/modules/n42-node-orchestrator.md)
-- [`Docs/modules/n42-node-control-plane.md`](/Users/jieliu/Documents/n42/n42-26/Docs/modules/n42-node-control-plane.md)
-- [`Docs/modules/n42-node-mobile-subsystem.md`](/Users/jieliu/Documents/n42/n42-26/Docs/modules/n42-node-mobile-subsystem.md)
-- [`Docs/modules/n42-node-payload-reward-staking.md`](/Users/jieliu/Documents/n42/n42-26/Docs/modules/n42-node-payload-reward-staking.md)
+- [`Docs/modules/n42-node-orchestrator.md`](Docs/modules/n42-node-orchestrator.md)
+- [`Docs/modules/n42-node-control-plane.md`](Docs/modules/n42-node-control-plane.md)
+- [`Docs/modules/n42-node-mobile-subsystem.md`](Docs/modules/n42-node-mobile-subsystem.md)
+- [`Docs/modules/n42-node-payload-reward-staking.md`](Docs/modules/n42-node-payload-reward-staking.md)

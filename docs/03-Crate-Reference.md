@@ -80,10 +80,10 @@
 
 ## Recommended deep dives
 
-- [`Docs/modules/foundations.md`](/Users/jieliu/Documents/n42/n42-26/Docs/modules/foundations.md)
-- [`Docs/modules/n42-node.md`](/Users/jieliu/Documents/n42/n42-26/Docs/modules/n42-node.md)
-- [`Docs/modules/n42-network.md`](/Users/jieliu/Documents/n42/n42-26/Docs/modules/n42-network.md)
-- [`Docs/modules/n42-consensus.md`](/Users/jieliu/Documents/n42/n42-26/Docs/modules/n42-consensus.md)
-- [`Docs/modules/n42-mobile-and-ffi.md`](/Users/jieliu/Documents/n42/n42-26/Docs/modules/n42-mobile-and-ffi.md)
-- [`Docs/modules/data-exec-zk.md`](/Users/jieliu/Documents/n42/n42-26/Docs/modules/data-exec-zk.md)
-- [`Docs/modules/binaries-and-tests.md`](/Users/jieliu/Documents/n42/n42-26/Docs/modules/binaries-and-tests.md)
+- [`Docs/modules/foundations.md`](Docs/modules/foundations.md)
+- [`Docs/modules/n42-node.md`](Docs/modules/n42-node.md)
+- [`Docs/modules/n42-network.md`](Docs/modules/n42-network.md)
+- [`Docs/modules/n42-consensus.md`](Docs/modules/n42-consensus.md)
+- [`Docs/modules/n42-mobile-and-ffi.md`](Docs/modules/n42-mobile-and-ffi.md)
+- [`Docs/modules/data-exec-zk.md`](Docs/modules/data-exec-zk.md)
+- [`Docs/modules/binaries-and-tests.md`](Docs/modules/binaries-and-tests.md)

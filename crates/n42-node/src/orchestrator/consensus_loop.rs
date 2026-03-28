@@ -387,7 +387,7 @@ impl ConsensusOrchestrator {
                 let block_count = self.committed_block_count;
                 tokio::task::spawn_blocking(move || {
                     let start = std::time::Instant::now();
-                    let mut tree = jmt.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut tree = jmt.lock().unwrap_or_else(|e| { tracing::warn!("mutex poisoned, recovering"); e.into_inner() });
                     match tree.apply_diff(&diff) {
                         Ok((version, root)) => {
                             let elapsed_ms = start.elapsed().as_millis();
@@ -455,7 +455,7 @@ impl ConsensusOrchestrator {
         {
             match super::decompress_payload(data) {
                 Ok(decompressed) => {
-                    let mut mgr = staking_mgr.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut mgr = staking_mgr.lock().unwrap_or_else(|e| { tracing::warn!("mutex poisoned, recovering"); e.into_inner() });
                     mgr.scan_committed_block(self.committed_block_count, &decompressed);
                 }
                 Err(e) => {

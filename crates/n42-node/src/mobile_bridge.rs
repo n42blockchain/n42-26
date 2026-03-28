@@ -191,7 +191,7 @@ impl MobileVerificationBridge {
                             let registered = if open_verification {
                                 true // Open verification mode: accept all verifiers
                             } else if let Some(ref staking_mgr) = self.staking_manager {
-                                let mgr = staking_mgr.lock().unwrap_or_else(|e| e.into_inner());
+                                let mgr = staking_mgr.lock().unwrap_or_else(|e| { tracing::warn!("mutex poisoned, recovering"); e.into_inner() });
                                 mgr.is_registered(&verifier_pubkey)
                             } else {
                                 true // Backward compatible: no StakingManager = allow all (dev mode)
@@ -214,7 +214,7 @@ impl MobileVerificationBridge {
                             // Register verifier in the attestation store's registry
                             // so it gets a bitfield index for aggregate signatures.
                             if let Some(ref store) = self.attestation_store {
-                                let mut s = store.lock().unwrap_or_else(|e| e.into_inner());
+                                let mut s = store.lock().unwrap_or_else(|e| { tracing::warn!("mutex poisoned, recovering"); e.into_inner() });
                                 s.registry_mut().register(verifier_pubkey);
                             }
                             gauge!("n42_mobile_connected_phones").set(self.connected_sessions.len() as f64);
@@ -354,7 +354,7 @@ impl MobileVerificationBridge {
                 counter!("n42_mobile_aggregate_attestations_total").increment(1);
 
                 let reward_pubkeys = if let Some(ref store) = self.attestation_store {
-                    let s = store.lock().unwrap_or_else(|e| e.into_inner());
+                    let s = store.lock().unwrap_or_else(|e| { tracing::warn!("mutex poisoned, recovering"); e.into_inner() });
                     let mut reward_pubkeys = Vec::new();
                     for (byte_idx, &byte) in attestation.participant_bitfield.iter().enumerate() {
                         for bit in 0..8u32 {
@@ -372,7 +372,7 @@ impl MobileVerificationBridge {
                 };
 
                 if let Some(ref store) = self.attestation_store {
-                    let mut s = store.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut s = store.lock().unwrap_or_else(|e| { tracing::warn!("mutex poisoned, recovering"); e.into_inner() });
                     s.record_attestation(&attestation);
                     if let Err(e) = s.save() {
                         warn!(
@@ -493,7 +493,7 @@ impl MobileVerificationBridge {
 
         // Feed valid receipts into the BLS attestation builder.
         if is_valid && let Some(ref store) = self.attestation_store {
-            let store_guard = store.lock().unwrap_or_else(|e| e.into_inner());
+            let store_guard = store.lock().unwrap_or_else(|e| { tracing::warn!("mutex poisoned, recovering"); e.into_inner() });
             if let Some(builder) = self.attestation_builders.get_mut(&receipt.block_hash) {
                 builder.add_receipt(receipt, store_guard.registry());
             }

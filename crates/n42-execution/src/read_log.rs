@@ -293,7 +293,7 @@ pub fn decode_read_log(data: &[u8]) -> Result<Vec<ReadLogEntry>, DecodeError> {
         return Err(DecodeError::UnexpectedEof(0));
     }
 
-    let entry_count = u32::from_le_bytes(data[0..4].try_into().unwrap());
+    let entry_count = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
     if entry_count > MAX_ENTRY_COUNT {
         return Err(DecodeError::EntryCountOverflow(
             entry_count,

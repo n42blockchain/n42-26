@@ -143,7 +143,13 @@ impl StakingManager {
             mgr.pending_returns.push_back(Withdrawal {
                 index: pw.index,
                 validator_index: pw.validator_index,
-                address: pw.address.parse().unwrap_or_default(),
+                address: match pw.address.parse() {
+                    Ok(addr) => addr,
+                    Err(e) => {
+                        tracing::warn!(target: "n42::staking", address = %pw.address, error = %e, "invalid withdrawal address, skipping");
+                        continue;
+                    }
+                },
                 amount: pw.amount,
             });
         }

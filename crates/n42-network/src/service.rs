@@ -1188,7 +1188,7 @@ impl NetworkService {
             let map = self
                 .validator_peer_map
                 .read()
-                .unwrap_or_else(|e| e.into_inner());
+                .unwrap_or_else(|e| { tracing::warn!("mutex poisoned, recovering"); e.into_inner() });
             map.get(&proposal.proposer).copied()
         };
         if leader_peer != Some(source) {
@@ -1217,7 +1217,7 @@ impl NetworkService {
             let map = self
                 .validator_peer_map
                 .read()
-                .unwrap_or_else(|e| e.into_inner());
+                .unwrap_or_else(|e| { tracing::warn!("mutex poisoned, recovering"); e.into_inner() });
             targets
                 .iter()
                 .filter(|&&idx| idx != my_index)
