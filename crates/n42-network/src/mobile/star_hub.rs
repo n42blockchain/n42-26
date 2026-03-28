@@ -672,6 +672,9 @@ fn build_server_config(
         hasher.finalize().into()
     };
 
+    // Ensure rustls has a crypto provider (ring) installed.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let mut server_crypto = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(vec![cert_der], key_der)?;

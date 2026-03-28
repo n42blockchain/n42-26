@@ -37,6 +37,10 @@ impl QuicMobileClient {
     pub async fn connect(addr: SocketAddr, bls_key: BlsSecretKey) -> eyre::Result<Self> {
         let pubkey = bls_key.public_key().to_bytes();
 
+        // Ensure rustls has a crypto provider (ring) installed.
+        // No-op if already installed by another call site.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
         // Build TLS config that accepts self-signed certificates
         let mut client_crypto = rustls::ClientConfig::builder()
             .dangerous()

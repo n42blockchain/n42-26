@@ -29,6 +29,9 @@ pub(crate) async fn connect_quic(
     (quinn::Connection, Arc<Mutex<VecDeque<Vec<u8>>>>),
     Box<dyn std::error::Error + Send + Sync>,
 > {
+    // Ensure rustls has a crypto provider (ring) installed.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let mut crypto = rustls::ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(PinnedCertVerification {
