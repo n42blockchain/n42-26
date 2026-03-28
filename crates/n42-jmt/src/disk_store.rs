@@ -13,7 +13,7 @@ use jmt::{KeyHash, OwnedValue, Version};
 use lru::LruCache;
 use parking_lot::Mutex;
 use reth_libmdbx::{
-    Database, DatabaseFlags, Environment, Geometry, PageSize, Transaction, WriteFlags, RO, RW,
+    Database, DatabaseFlags, Environment, Geometry, Transaction, WriteFlags, RO, RW,
 };
 use std::num::NonZeroUsize;
 use std::path::Path;
@@ -544,9 +544,9 @@ pub fn open_jmt_env(path: impl AsRef<Path>) -> eyre::Result<Environment> {
     builder.set_max_dbs(50); // 16 shards * 3 dbs + headroom
     builder.set_geometry(Geometry {
         size: Some(64 * 1024 * 1024..1024 * 1024 * 1024 * 1024), // 64 MB .. 1 TB
-        // 64KB pages: reduces TLB misses ~16x vs default 4KB, pairs well with
-        // OS huge pages (2MB). MDBX max supported page_size is 65536.
-        page_size: Some(PageSize::Set(65536)),
+        // Use OS default page size (4KB). Matches SSD internal page, filesystem
+        // block size, and Linux page cache granularity. Minimizes write amplification
+        // for small JMT node updates (~200-500 bytes per node).
         ..Default::default()
     });
     let env = builder
