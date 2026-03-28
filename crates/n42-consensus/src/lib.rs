@@ -1,5 +1,4 @@
 mod adapter;
-pub mod arena;
 pub mod error;
 pub mod extra_data;
 pub mod protocol;

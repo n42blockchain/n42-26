@@ -22,7 +22,6 @@ bincode.workspace = true
 bitvec.workspace = true
 sha2.workspace = true
 
-bumpalo.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 eyre.workspace = true

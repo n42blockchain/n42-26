@@ -314,9 +314,6 @@ pub struct ConsensusOrchestrator {
     epoch_schedule: Option<EpochSchedule>,
     /// Buffer for batching tx forwards to the current leader.
     tx_forward_buffer: Vec<Vec<u8>>,
-    /// Credit-based flow control for TX forwarding (Firedancer-inspired).
-    /// Tracks remaining TX credit granted by the leader. `None` = unlimited.
-    tx_forward_credit: Option<u32>,
     /// Per-block pipeline timing tracker. Populated incrementally as events flow
     /// through the orchestrator. Logged and emitted as metrics at commit time.
     /// Bounded to 32 entries; older entries are evicted.
@@ -409,7 +406,6 @@ impl ConsensusOrchestrator {
             view_started_at: None,
             epoch_schedule: None,
             tx_forward_buffer: Vec::new(),
-            tx_forward_credit: None,
             pipeline_timings: HashMap::new(),
             eager_import_block_guard: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             fast_propose: std::env::var("N42_FAST_PROPOSE")
@@ -592,7 +588,6 @@ impl ConsensusOrchestrator {
             view_started_at: None,
             epoch_schedule: None,
             tx_forward_buffer: Vec::new(),
-            tx_forward_credit: None,
             pipeline_timings: HashMap::new(),
             eager_import_block_guard: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             fast_propose,
@@ -1143,23 +1138,6 @@ impl ConsensusOrchestrator {
             return;
         }
 
-        // Credit-based flow control: if leader granted limited credit,
-        // only forward up to that many transactions.
-        if let Some(credit) = self.tx_forward_credit {
-            if credit == 0 {
-                // No credit — hold buffer until leader grants more.
-                debug!(target: "n42::cl::orchestrator", buf_len = self.tx_forward_buffer.len(),
-                    "tx forward paused: zero credit from leader");
-                return;
-            }
-            let limit = credit as usize;
-            if self.tx_forward_buffer.len() > limit {
-                // Truncate to credit limit; excess stays in buffer for next flush.
-                debug!(target: "n42::cl::orchestrator", buf_len = self.tx_forward_buffer.len(), limit,
-                    "tx forward trimmed to leader credit");
-            }
-        }
-
         let leader_idx = self.engine.current_leader_index();
         let validator_peers = self.network.all_validator_peers();
 
@@ -1282,12 +1260,8 @@ impl ConsensusOrchestrator {
                     .await;
                 counter!("n42_tx_forward_imported").increment(count as u64);
             }
-            NetworkEvent::TxForwardCreditUpdate { remaining_credit } => {
-                self.tx_forward_credit = remaining_credit;
-                if let Some(credit) = remaining_credit {
-                    debug!(target: "n42::cl::orchestrator", credit, "tx forward credit updated by leader");
-                    gauge!("n42_tx_forward_credit").set(credit as f64);
-                }
+            NetworkEvent::TxForwardCreditUpdate { .. } => {
+                // Reserved for future credit-based flow control.
             }
             NetworkEvent::SyncRequest {
                 peer,

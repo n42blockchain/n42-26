@@ -526,19 +526,24 @@ async fn handle_phone_connection(
                                         }
                                         // Verify BLS signature off the async runtime to
                                         // avoid blocking the event loop (~1.5ms per verify).
+                                        // Move receipt into blocking task, return it on success.
                                         let receipt_box = Box::new(receipt);
-                                        let sig_ok = tokio::task::spawn_blocking({
-                                            let r = receipt_box.clone();
-                                            move || r.verify_signature().is_ok()
+                                        let verified = tokio::task::spawn_blocking(move || {
+                                            if receipt_box.verify_signature().is_ok() {
+                                                Some(receipt_box)
+                                            } else {
+                                                None
+                                            }
                                         })
                                         .await
-                                        .unwrap_or(false);
+                                        .ok()
+                                        .flatten();
 
-                                        if !sig_ok {
+                                        let Some(receipt_box) = verified else {
                                             tracing::warn!(session_id, "receipt BLS signature invalid, dropping");
                                             metrics::counter!("n42_mobile_receipt_sig_invalid").increment(1);
                                             continue;
-                                        }
+                                        };
 
                                         last_receipt_at = Some(now);
                                         rate_violations = 0; // reset consecutive violation count on success
