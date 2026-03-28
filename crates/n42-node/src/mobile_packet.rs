@@ -255,15 +255,15 @@ where
             .map_err(|e| MobilePacketError::Execution(e.to_string()))?;
 
         let read_log = match Arc::try_unwrap(log_handle) {
-            Ok(mutex) => mutex.into_inner().unwrap_or_else(|e| { tracing::warn!("mutex poisoned, recovering"); e.into_inner() }),
-            Err(arc) => arc.lock().unwrap_or_else(|e| { tracing::warn!("mutex poisoned, recovering"); e.into_inner() }).clone(),
+            Ok(mutex) => mutex.into_inner().unwrap_or_else(|e| { tracing::warn!("read_log mutex poisoned, recovering"); e.into_inner() }),
+            Err(arc) => arc.lock().unwrap_or_else(|e| { tracing::warn!("read_log mutex poisoned, recovering"); e.into_inner() }).clone(),
         };
         let read_log_count = read_log.len();
         let read_log_data = n42_execution::read_log::encode_read_log(&read_log);
 
         let captured_codes = match Arc::try_unwrap(codes_handle) {
-            Ok(mutex) => mutex.into_inner().unwrap_or_else(|e| { tracing::warn!("mutex poisoned, recovering"); e.into_inner() }),
-            Err(arc) => arc.lock().unwrap_or_else(|e| { tracing::warn!("mutex poisoned, recovering"); e.into_inner() }).clone(),
+            Ok(mutex) => mutex.into_inner().unwrap_or_else(|e| { tracing::warn!("read_log mutex poisoned, recovering"); e.into_inner() }),
+            Err(arc) => arc.lock().unwrap_or_else(|e| { tracing::warn!("read_log mutex poisoned, recovering"); e.into_inner() }).clone(),
         };
 
         let header = recovered_block.header();

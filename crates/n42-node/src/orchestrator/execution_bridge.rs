@@ -54,7 +54,7 @@ fn elapsed_since_unix_ms(start_ms: u64) -> Option<u64> {
 fn observe_compact_inject_attempt(hash: B256, source: &'static str) -> Option<u64> {
     static TRACKER: std::sync::OnceLock<Mutex<CompactInjectTracker>> = std::sync::OnceLock::new();
     let tracker = TRACKER.get_or_init(|| Mutex::new(CompactInjectTracker::default()));
-    let mut tracker = tracker.lock().unwrap_or_else(|e| { tracing::warn!("mutex poisoned, recovering"); e.into_inner() });
+    let mut tracker = tracker.lock().unwrap_or_else(|e| { tracing::warn!("compact_inject_tracker mutex poisoned, recovering"); e.into_inner() });
 
     if let Some(seen) = tracker.counts.get_mut(&hash) {
         *seen += 1;
@@ -222,7 +222,7 @@ impl ConsensusOrchestrator {
         // 1. Pre-fetch staked BLS pubkeys (lock StakingManager, then release).
         //    This avoids holding both locks simultaneously and prevents deadlocks.
         let staked_pubkeys = if let Some(ref staking_mgr) = self.staking_manager {
-            let mgr = staking_mgr.lock().unwrap_or_else(|e| { tracing::warn!("mutex poisoned, recovering"); e.into_inner() });
+            let mgr = staking_mgr.lock().unwrap_or_else(|e| { tracing::warn!("staking_mgr mutex poisoned, recovering"); e.into_inner() });
             mgr.staked_bls_pubkeys()
         } else {
             std::collections::HashSet::new()
@@ -250,7 +250,7 @@ impl ConsensusOrchestrator {
         // 3. Staking integration: resolve reward addresses and add cooldown returns.
         //    Re-acquire StakingManager lock for address resolution and cooldown checks.
         if let Some(ref staking_mgr) = self.staking_manager {
-            let mut staking = staking_mgr.lock().unwrap_or_else(|e| { tracing::warn!("mutex poisoned, recovering"); e.into_inner() });
+            let mut staking = staking_mgr.lock().unwrap_or_else(|e| { tracing::warn!("staking_mgr mutex poisoned, recovering"); e.into_inner() });
 
             // Reward address resolution: BLS-derived keccak → staker's actual EVM address.
             for w in &mut withdrawals {

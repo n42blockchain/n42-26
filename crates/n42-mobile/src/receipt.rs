@@ -326,5 +326,4 @@ mod tests {
         assert_eq!(encoded[1], 0x32);
         assert_eq!(encoded[2], 0x01);
     }
-
 }
