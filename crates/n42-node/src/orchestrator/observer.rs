@@ -701,14 +701,7 @@ mod tests {
     use super::*;
     use alloy_primitives::{Address, B256};
     use bitvec::prelude::*;
-    use n42_network::NetworkCommand;
     use n42_primitives::{BlsSecretKey, QuorumCertificate};
-
-    fn make_test_network() -> (NetworkHandle, mpsc::Receiver<NetworkCommand>) {
-        let (cmd_tx, cmd_rx) = mpsc::channel(8);
-        let (ptx, _prx) = mpsc::channel(8);
-        (NetworkHandle::new(cmd_tx, ptx), cmd_rx)
-    }
 
     fn test_key(seed: u8) -> BlsSecretKey {
         BlsSecretKey::key_gen(&[seed; 32]).expect("deterministic test key should be valid")

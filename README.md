@@ -49,7 +49,7 @@ A high-performance blockchain system combining **HotStuff-2** BFT consensus with
 
 - **HotStuff-2 Consensus**: 2-round optimistic commit with 3-round timeout recovery
 - **BLS12-381 Signatures**: Aggregated signatures for compact quorum certificates
-- **reth Latest Upstream Integration**: Tracks `paradigmxyz/reth` `origin/main` at `e3dbdbb115`, with N42-specific payload/cache patches applied on top
+- **reth Latest Upstream Integration**: Tracks `paradigmxyz/reth` `origin/main` at `27781443a6e6`, with N42-specific payload/cache patches applied on top
 - **Jellyfish Merkle Tree (JMT)**: Blake3 hashing, 16-shard parallel updates, Merkle proofs via RPC
 - **Compact Block Propagation**: Leader caches execution output, followers skip EVM re-execution (cache hit ~3ms)
 - **Optimistic Voting**: Followers vote immediately after proposal validation, before block import
@@ -222,16 +222,16 @@ Both configurations are well within the **8-second slot target**.
 ### Prerequisites
 
 - Rust 1.93+
-- Latest `reth` source checked out at `../reth-latest`
+- Latest `reth` source checked out at `../reth`
 - Android local builds: JDK 17 recommended for Gradle/Kotlin
 - SP1 toolchain v4.2.1 (optional, for ZK proof guest build): `curl -L https://sp1up.succinct.xyz | bash && sp1up --version v4.2.1`
 
-### Prepare `reth-latest`
+### Prepare `reth`
 
 ```bash
-git clone https://github.com/paradigmxyz/reth.git ../reth-latest
-git -C ../reth-latest checkout e3dbdbb1153848aa91acf088973815872f6b2569
-git -C ../reth-latest apply ../n42-26/reth-n42.patch
+git clone https://github.com/paradigmxyz/reth.git ../reth
+git -C ../reth checkout 27781443a6e6e71c93bbbe05012f0ac9595f9dac
+git -C ../reth apply ../n42-26/reth-n42.patch
 ```
 
 ### Build
@@ -252,8 +252,8 @@ JAVA_HOME=$(/usr/libexec/java_home -v 17) \
 ### Regenerate The `reth` Patch
 
 ```bash
-git -C ../reth-latest diff --binary origin/main > reth-n42.patch
-git -C ../reth-latest diff --binary --no-index \
+git -C ../reth diff --binary origin/main > reth-n42.patch
+git -C ../reth diff --binary --no-index \
   /dev/null crates/evm/evm/src/payload_cache.rs >> reth-n42.patch
 ```
 

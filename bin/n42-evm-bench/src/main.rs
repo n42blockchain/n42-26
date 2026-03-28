@@ -12,7 +12,6 @@ use revm::{
     database::{CacheDB, EmptyDB},
     state::AccountInfo,
 };
-use std::net::UdpSocket;
 use std::time::Instant;
 
 const SENDER: Address = address!("1000000000000000000000000000000000000001");
@@ -765,7 +764,7 @@ fn bench_full_pipeline_timeline() {
     let dec_ms = decompress_time.as_secs_f64() * 1000.0;
 
     let leader_serial = evm_ms + ser_ms + comp_ms + net_ms;
-    let follower_serial = dec_ms + evm_ms; // follower re-executes
+    let _follower_serial = dec_ms + evm_ms; // follower re-executes
     let total_serial = leader_serial + consensus_time_ms + finalize_time_ms;
 
     println!("  Block: {total_txs} txs ({transfer_count} transfer + {erc20_count} ERC-20)");
@@ -897,20 +896,6 @@ fn bench_full_pipeline_timeline() {
     println!("  *** 时序图 (100k tx block) ***");
     println!();
     let scale = 200.0 / pipeline_total; // scale to ~200 chars width
-    let bar = |start: f64, end: f64, label: &str| {
-        let s = (start * scale) as usize;
-        let e = (end * scale) as usize;
-        let width = e.saturating_sub(s).max(1);
-        format!(
-            "  {:>width_pad$}{}{} {label} ({:.0}ms)",
-            "",
-            "█".repeat(width),
-            "",
-            end - start,
-            width_pad = s
-        )
-    };
-
     // Timeline bars
     let t0 = 0.0;
     let t1 = evm_ms; // EVM done
@@ -923,7 +908,7 @@ fn bench_full_pipeline_timeline() {
     let to_pad = |v: f64| -> usize { (v * scale) as usize };
 
     println!(
-        "  Timeline (ms): 0{:>w$}{:.0}",
+        "  Timeline (ms): 0{:>w$}{pipeline_total:.0}",
         pipeline_total,
         w = to_pad(pipeline_total)
     );

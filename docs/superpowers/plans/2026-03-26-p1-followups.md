@@ -21,7 +21,7 @@
 - Modify: `crates/n42-execution/src/lib.rs`
 - Modify: `crates/n42-node/src/components.rs`
 
-**参考实现：** `D:\N42\reth-latest\examples\custom-evm\src\main.rs:44-118`
+**参考实现：** `../reth/examples/custom-evm/src/main.rs:44-118`
 
 ### 设计
 
@@ -131,7 +131,7 @@ impl alloy_evm::EvmFactory for N42EvmFactory {
 }
 ```
 
-**注意：** 上面的类型参数是近似的。实现时需要根据 `alloy_evm::EvmFactory` trait 的确切 associated types 调整。参考 `D:\N42\reth-latest\examples\custom-evm\src\main.rs`。
+**注意：** 上面的类型参数是近似的。实现时需要根据 `alloy_evm::EvmFactory` trait 的确切 associated types 调整。参考 `../reth/examples/custom-evm/src/main.rs`。
 
 - [ ] **Step 3: 修改 N42EvmConfig 使用自定义 factory**
 
@@ -437,6 +437,6 @@ Task 3 (Rotor 转发)       → 独立
 
 | Task | 风险 | 缓解 |
 |------|------|------|
-| Task 1 | **高** — revm v36 的 `EvmFactory` trait 关联类型复杂，预编译函数签名不确定 | 参考 `reth-latest/examples/custom-evm` 实现；如果 prevrandao 不可直接访问，用 thread_local 注入 |
+| Task 1 | **高** — revm v36 的 `EvmFactory` trait 关联类型复杂，预编译函数签名不确定 | 参考 `../reth/examples/custom-evm` 实现；如果 prevrandao 不可直接访问，用 thread_local 注入 |
 | Task 2 | **低** — 路径清晰，只是 JSON 解析 + 事件传递 | ExecutionPayload JSON 字段名需确认 |
 | Task 3 | **中** — NetworkService 需要 validator context，跨模块状态同步 | 用 command channel 异步设置，不阻塞启动 |

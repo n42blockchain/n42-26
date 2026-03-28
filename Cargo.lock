@@ -8825,6 +8825,7 @@ dependencies = [
  "reth-revm",
  "reth-storage-api",
  "reth-tasks",
+ "reth-trie-parallel",
  "serde",
  "tokio",
  "tracing",
@@ -10324,6 +10325,7 @@ dependencies = [
  "reth-payload-builder-primitives",
  "reth-payload-primitives",
  "reth-primitives-traits",
+ "reth-trie-parallel",
  "tokio",
  "tokio-stream",
  "tracing",
@@ -10351,7 +10353,6 @@ dependencies = [
  "alloy-rpc-types-engine",
  "auto_impl",
  "either",
- "op-alloy-rpc-types-engine",
  "reth-chain-state",
  "reth-chainspec",
  "reth-errors",
@@ -11166,6 +11167,8 @@ dependencies = [
 name = "reth-trie-parallel"
 version = "1.11.3"
 dependencies = [
+ "alloy-eip7928",
+ "alloy-evm",
  "alloy-primitives",
  "alloy-rlp",
  "crossbeam-channel",
@@ -11181,6 +11184,7 @@ dependencies = [
  "reth-tasks",
  "reth-trie",
  "reth-trie-sparse",
+ "revm-state",
  "thiserror 2.0.18",
  "tracing",
 ]

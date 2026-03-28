@@ -43,43 +43,43 @@ n42-jmt = { path = "crates/n42-jmt" }
 n42-zkproof = { path = "crates/n42-zkproof" }
 
 # reth dependencies (local path)
-reth-chainspec = { path = "../reth-latest/crates/chainspec" }
-reth-consensus = { path = "../reth-latest/crates/consensus/consensus" }
-reth-db = { path = "../reth-latest/crates/storage/db" }
-reth-db-api = { path = "../reth-latest/crates/storage/db-api" }
-reth-ethereum-consensus = { path = "../reth-latest/crates/ethereum/consensus" }
-reth-ethereum-engine-primitives = { path = "../reth-latest/crates/ethereum/engine-primitives" }
-reth-ethereum-primitives = { path = "../reth-latest/crates/ethereum/primitives" }
-reth-evm = { path = "../reth-latest/crates/evm/evm" }
-reth-evm-ethereum = { path = "../reth-latest/crates/ethereum/evm" }
-reth-execution-types = { path = "../reth-latest/crates/evm/execution-types", features = ["serde"] }
-reth-node-api = { path = "../reth-latest/crates/node/api" }
-reth-node-builder = { path = "../reth-latest/crates/node/builder" }
-reth-node-ethereum = { path = "../reth-latest/crates/ethereum/node" }
-reth-node-types = { path = "../reth-latest/crates/node/types" }
-reth-payload-builder = { path = "../reth-latest/crates/payload/builder" }
+reth-chainspec = { path = "../reth/crates/chainspec" }
+reth-consensus = { path = "../reth/crates/consensus/consensus" }
+reth-db = { path = "../reth/crates/storage/db" }
+reth-db-api = { path = "../reth/crates/storage/db-api" }
+reth-ethereum-consensus = { path = "../reth/crates/ethereum/consensus" }
+reth-ethereum-engine-primitives = { path = "../reth/crates/ethereum/engine-primitives" }
+reth-ethereum-primitives = { path = "../reth/crates/ethereum/primitives" }
+reth-evm = { path = "../reth/crates/evm/evm" }
+reth-evm-ethereum = { path = "../reth/crates/ethereum/evm" }
+reth-execution-types = { path = "../reth/crates/evm/execution-types", features = ["serde"] }
+reth-node-api = { path = "../reth/crates/node/api" }
+reth-node-builder = { path = "../reth/crates/node/builder" }
+reth-node-ethereum = { path = "../reth/crates/ethereum/node" }
+reth-node-types = { path = "../reth/crates/node/types" }
+reth-payload-builder = { path = "../reth/crates/payload/builder" }
 reth-primitives-traits = { version = "0.1.0", default-features = false }
-reth-provider = { path = "../reth-latest/crates/storage/provider" }
-reth-revm = { path = "../reth-latest/crates/revm" }
-reth-tasks = { path = "../reth-latest/crates/tasks" }
-reth-transaction-pool = { path = "../reth-latest/crates/transaction-pool" }
-reth-tracing = { path = "../reth-latest/crates/tracing" }
-reth-storage-errors = { path = "../reth-latest/crates/storage/errors" }
-reth-trie-common = { path = "../reth-latest/crates/trie/common", features = ["serde"] }
-reth-trie-sparse = { path = "../reth-latest/crates/trie/sparse" }
-reth-network-api = { path = "../reth-latest/crates/net/network-api" }
-reth-ethereum-cli = { path = "../reth-latest/crates/ethereum/cli" }
-reth-ethereum-payload-builder = { path = "../reth-latest/crates/ethereum/payload" }
-reth-basic-payload-builder = { path = "../reth-latest/crates/payload/basic" }
-reth-payload-builder-primitives = { path = "../reth-latest/crates/payload/builder-primitives" }
-reth-payload-primitives = { path = "../reth-latest/crates/payload/primitives" }
-reth-engine-primitives = { path = "../reth-latest/crates/engine/primitives" }
-reth-chain-state = { path = "../reth-latest/crates/chain-state" }
-reth-libmdbx = { path = "../reth-latest/crates/storage/libmdbx-rs" }
-reth-storage-api = { path = "../reth-latest/crates/storage/storage-api" }
-reth-rpc-builder = { path = "../reth-latest/crates/rpc/rpc-builder" }
-reth-rpc-server-types = { path = "../reth-latest/crates/rpc/rpc-server-types" }
-reth-node-core = { path = "../reth-latest/crates/node/core" }
+reth-provider = { path = "../reth/crates/storage/provider" }
+reth-revm = { path = "../reth/crates/revm" }
+reth-tasks = { path = "../reth/crates/tasks" }
+reth-transaction-pool = { path = "../reth/crates/transaction-pool" }
+reth-tracing = { path = "../reth/crates/tracing" }
+reth-storage-errors = { path = "../reth/crates/storage/errors" }
+reth-trie-common = { path = "../reth/crates/trie/common", features = ["serde"] }
+reth-trie-sparse = { path = "../reth/crates/trie/sparse" }
+reth-network-api = { path = "../reth/crates/net/network-api" }
+reth-ethereum-cli = { path = "../reth/crates/ethereum/cli" }
+reth-ethereum-payload-builder = { path = "../reth/crates/ethereum/payload" }
+reth-basic-payload-builder = { path = "../reth/crates/payload/basic" }
+reth-payload-builder-primitives = { path = "../reth/crates/payload/builder-primitives" }
+reth-payload-primitives = { path = "../reth/crates/payload/primitives" }
+reth-engine-primitives = { path = "../reth/crates/engine/primitives" }
+reth-chain-state = { path = "../reth/crates/chain-state" }
+reth-libmdbx = { path = "../reth/crates/storage/libmdbx-rs" }
+reth-storage-api = { path = "../reth/crates/storage/storage-api" }
+reth-rpc-builder = { path = "../reth/crates/rpc/rpc-builder" }
+reth-rpc-server-types = { path = "../reth/crates/rpc/rpc-server-types" }
+reth-node-core = { path = "../reth/crates/node/core" }
 
 # Alloy (aligned with reth latest @ e3dbdbb11)
 alloy-consensus = { version = "1.8.2", default-features = false, features = ["serde"] }
@@ -101,7 +101,7 @@ alloy-evm = { version = "0.29.2", default-features = false }
 revm = { version = "36.0.0", default-features = false, features = ["std", "serde"] }
 
 # Testing
-reth-testing-utils = { path = "../reth-latest/testing/testing-utils" }
+reth-testing-utils = { path = "../reth/testing/testing-utils" }
 
 # Crypto
 blst = "0.3"
