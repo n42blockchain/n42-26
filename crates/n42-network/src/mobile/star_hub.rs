@@ -524,6 +524,22 @@ async fn handle_phone_connection(
                                             metrics::counter!("n42_mobile_receipt_pubkey_mismatch").increment(1);
                                             continue;
                                         }
+                                        // Verify BLS signature off the async runtime to
+                                        // avoid blocking the event loop (~1.5ms per verify).
+                                        let receipt_box = Box::new(receipt);
+                                        let sig_ok = tokio::task::spawn_blocking({
+                                            let r = receipt_box.clone();
+                                            move || r.verify_signature().is_ok()
+                                        })
+                                        .await
+                                        .unwrap_or(false);
+
+                                        if !sig_ok {
+                                            tracing::warn!(session_id, "receipt BLS signature invalid, dropping");
+                                            metrics::counter!("n42_mobile_receipt_sig_invalid").increment(1);
+                                            continue;
+                                        }
+
                                         last_receipt_at = Some(now);
                                         rate_violations = 0; // reset consecutive violation count on success
                                         metrics::counter!("n42_mobile_receipts_received").increment(1);
@@ -532,11 +548,11 @@ async fn handle_phone_connection(
                                             .duration_since(std::time::UNIX_EPOCH)
                                             .unwrap_or_default()
                                             .as_millis() as u64;
-                                        if receipt.timestamp_ms > 0 && now_ms > receipt.timestamp_ms {
-                                            session.record_rtt(now_ms - receipt.timestamp_ms);
+                                        if receipt_box.timestamp_ms > 0 && now_ms > receipt_box.timestamp_ms {
+                                            session.record_rtt(now_ms - receipt_box.timestamp_ms);
                                         }
                                         if let Err(e) = event_tx
-                                            .send(HubEvent::ReceiptReceived(Box::new(receipt)))
+                                            .send(HubEvent::ReceiptReceived(receipt_box))
                                             .await
                                         {
                                             metrics::counter!("n42_hub_event_drops_total").increment(1);

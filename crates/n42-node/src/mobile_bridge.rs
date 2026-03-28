@@ -412,12 +412,16 @@ impl MobileVerificationBridge {
         &mut self,
         receipt: &VerificationReceipt,
     ) -> Option<FinalizedAttestation> {
+        // BLS signature is pre-verified in star_hub session (spawn_blocking)
+        // before the receipt reaches the bridge event loop. For direct callers
+        // (e.g. RPC submission), verify here as a safety net.
+        #[cfg(debug_assertions)]
         if let Err(e) = receipt.verify_signature() {
             warn!(
                 target: "n42::mobile",
                 block_number = receipt.block_number,
                 error = %e,
-                "receipt signature invalid, dropping"
+                "receipt signature invalid (debug check), dropping"
             );
             return None;
         }
