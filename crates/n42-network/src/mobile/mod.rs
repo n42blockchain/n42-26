@@ -1,3 +1,4 @@
+pub mod fec;
 pub mod session;
 pub mod sharded_hub;
 pub mod star_hub;
