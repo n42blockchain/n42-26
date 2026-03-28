@@ -1,5 +1,17 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index d0f0f7e68..5231448cc 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -8745,6 +8745,7 @@ dependencies = [
+  "reth-storage-errors",
+  "reth-trie-common",
+  "revm",
++ "tracing",
+ ]
+ 
+ [[package]]
 diff --git a/crates/engine/tree/src/tree/payload_validator.rs b/crates/engine/tree/src/tree/payload_validator.rs
-index 9ece72651..05d2ad746 100644
+index b4edc7463..7479618d1 100644
 --- a/crates/engine/tree/src/tree/payload_validator.rs
 +++ b/crates/engine/tree/src/tree/payload_validator.rs
 @@ -497,12 +497,32 @@ where
@@ -212,15 +224,15 @@ index 9ece72651..05d2ad746 100644
              Self::write_trie_debug_recorders(block.header().number(), &trie_debug_recorders);
  
 diff --git a/crates/ethereum/payload/src/lib.rs b/crates/ethereum/payload/src/lib.rs
-index 4f6342374..f1a226106 100644
+index d71d7490b..f315c953e 100644
 --- a/crates/ethereum/payload/src/lib.rs
 +++ b/crates/ethereum/payload/src/lib.rs
 @@ -22,7 +22,7 @@ use reth_consensus_common::validation::MAX_RLP_BLOCK_SIZE;
  use reth_errors::{BlockExecutionError, BlockValidationError, ConsensusError};
  use reth_ethereum_primitives::{EthPrimitives, TransactionSigned};
  use reth_evm::{
--    execute::{BlockBuilder, BlockBuilderOutcome},
-+    execute::{BlockBuilder, BlockBuilderOutcome, BlockExecutionOutput},
+-    execute::{BlockBuilder, BlockBuilderOutcome, BlockExecutor},
++    execute::{BlockBuilder, BlockBuilderOutcome, BlockExecutionOutput, BlockExecutor},
      ConfigureEvm, Evm, NextBlockEnvAttributes,
  };
  use reth_evm_ethereum::EthEvmConfig;
@@ -233,7 +245,7 @@ index 4f6342374..f1a226106 100644
  
  mod config;
  pub use config::*;
-@@ -229,7 +229,50 @@ where
+@@ -243,7 +243,50 @@ where
      let withdrawals_rlp_length =
          attributes.withdrawals.as_ref().map(|withdrawals| withdrawals.length()).unwrap_or(0);
  
@@ -285,7 +297,7 @@ index 4f6342374..f1a226106 100644
          // ensure we still have capacity for this transaction
          if cumulative_gas_used + pool_tx.gas_limit() > block_gas_limit {
              // we can't fit this transaction into the block, so we need to mark it as invalid
-@@ -247,24 +290,34 @@ where
+@@ -261,24 +304,34 @@ where
              return Ok(BuildOutcome::Cancelled)
          }
  
@@ -297,6 +309,9 @@ index 4f6342374..f1a226106 100644
 +        consensus_total += consensus_start.elapsed();
  
 -        let tx_rlp_len = tx.inner().length();
+-
+-        let estimated_block_size_with_tx =
+-            block_transactions_rlp_length + tx_rlp_len + withdrawals_rlp_length + 1024; // 1Kb of overhead for the block header
 +        // Optimization 2: Skip RLP length computation and block size check
 +        // for non-Osaka chains. The MAX_RLP_BLOCK_SIZE limit only applies to Osaka.
 +        // This saves ~2µs/tx of RLP encoding traversal.
@@ -305,9 +320,6 @@ index 4f6342374..f1a226106 100644
 +            let estimated_block_size_with_tx =
 +                block_transactions_rlp_length + len + withdrawals_rlp_length + 1024;
  
--        let estimated_block_size_with_tx =
--            block_transactions_rlp_length + tx_rlp_len + withdrawals_rlp_length + 1024; // 1Kb of overhead for the block header
--
 -        if is_osaka && estimated_block_size_with_tx > MAX_RLP_BLOCK_SIZE {
 -            best_txs.mark_invalid(
 -                &pool_tx,
@@ -335,7 +347,7 @@ index 4f6342374..f1a226106 100644
  
          // There's only limited amount of blob space available per block, so we need to check if
          // the EIP-4844 can still fit in the block
-@@ -322,6 +375,7 @@ where
+@@ -336,6 +389,7 @@ where
          let miner_fee = tx.effective_tip_per_gas(base_fee);
          let tx_hash = *tx.tx_hash();
  
@@ -343,7 +355,7 @@ index 4f6342374..f1a226106 100644
          let gas_used = match builder.execute_transaction(tx) {
              Ok(gas_used) => gas_used,
              Err(BlockExecutionError::Validation(BlockValidationError::InvalidTx {
-@@ -347,6 +401,8 @@ where
+@@ -361,6 +415,8 @@ where
              Err(err) => return Err(PayloadBuilderError::evm(err)),
          };
  
@@ -352,7 +364,7 @@ index 4f6342374..f1a226106 100644
          // add to the total blob gas used if the transaction successfully executed
          if let Some(blob_count) = tx_blob_count {
              block_blob_count += blob_count;
-@@ -363,6 +419,7 @@ where
+@@ -377,6 +433,7 @@ where
          let miner_fee = miner_fee.expect("fee is always valid; execution succeeded");
          total_fees += U256::from(miner_fee) * U256::from(gas_used);
          cumulative_gas_used += gas_used;
@@ -360,7 +372,7 @@ index 4f6342374..f1a226106 100644
  
          // Add blob tx sidecar to the payload.
          if let Some(sidecar) = blob_tx_sidecar {
-@@ -370,6 +427,26 @@ where
+@@ -384,6 +441,26 @@ where
          }
      }
  
@@ -387,36 +399,21 @@ index 4f6342374..f1a226106 100644
      // check if we have a better block
      if !is_better_payload(best_payload.as_ref(), total_fees) {
          // Release db
-@@ -378,14 +455,52 @@ where
-         return Ok(BuildOutcome::Aborted { fees: total_fees, cached_reads })
-     }
+@@ -418,11 +495,37 @@ where
+         builder.finish(state_provider.as_ref(), None)?
+     };
  
-+    let finish_start = std::time::Instant::now();
-     let BlockBuilderOutcome { execution_result, block, .. } =
-         builder.finish(state_provider.as_ref())?;
-+    let finish_elapsed = finish_start.elapsed();
-+    info!(
-+        target: "payload_builder",
-+        id = %payload_id,
-+        finish_ms = finish_elapsed.as_millis() as u64,
-+        "N42_PAYLOAD_FINISH: builder.finish() complete (includes state root)"
-+    );
-+
-+    // Seal the block first to get the hash, then cache execution output.
-+    let senders = block.senders().to_vec();
-+    let sealed_block = Arc::new(block.into_sealed_block());
- 
-+    // Extract requests before moving execution_result into cache (avoids expensive clone).
++    // Extract requests before moving execution_result into cache.
      let requests = chain_spec
          .is_prague_active_at_timestamp(attributes.timestamp)
 -        .then_some(execution_result.requests);
--
--    let sealed_block = Arc::new(block.into_sealed_block());
 +        .then(|| execution_result.requests.clone());
+ 
++    // Seal the block first to get the hash, then cache execution output.
++    let senders = block.senders().to_vec();
+     let sealed_block = Arc::new(block.into_sealed_block());
 +
 +    // Cache execution output for leader's new_payload AND broadcast to followers.
-+    // Two separate cache slots: CACHE (leader take-once) and BROADCAST_CACHE (compact block).
-+    // Clone first for broadcast, then move into leader cache.
 +    {
 +        let bundle_state = db.take_bundle();
 +        let block_hash = sealed_block.hash();
@@ -424,12 +421,10 @@ index 4f6342374..f1a226106 100644
 +            state: bundle_state,
 +            result: execution_result,
 +        };
-+        // Broadcast cache: consumed by handle_built_payload → compact block serialization.
 +        reth_evm::payload_cache::store_broadcast_execution(
 +            block_hash,
 +            (execution_output.clone(), senders.clone()),
 +        );
-+        // Leader cache: consumed by leader's own new_payload (take semantics).
 +        reth_evm::payload_cache::store_payload_execution(
 +            block_hash,
 +            (execution_output, senders),
@@ -456,12 +451,12 @@ index 4b469c955..b69aaa164 100644
  derive_more.workspace = true
  futures-util.workspace = true
 diff --git a/crates/evm/evm/src/execute.rs b/crates/evm/evm/src/execute.rs
-index 595097df3..8dd560951 100644
+index 76c9f3808..7644e9574 100644
 --- a/crates/evm/evm/src/execute.rs
 +++ b/crates/evm/evm/src/execute.rs
-@@ -478,21 +478,68 @@ where
-         self,
+@@ -484,23 +484,58 @@ where
          state: impl StateProvider,
+         state_root_precomputed: Option<(B256, TrieUpdates)>,
      ) -> Result<BlockBuilderOutcome<N>, BlockExecutionError> {
 +        let finish_start = std::time::Instant::now();
 +
@@ -479,14 +474,12 @@ index 595097df3..8dd560951 100644
 +        let merge_transitions_ms = merge_start.elapsed().as_millis() as u64;
 +        let bundle_finalize_ms = executor_finish_ms + evm_finish_ms + merge_transitions_ms;
  
-         // calculate the state root
 +        let hash_start = std::time::Instant::now();
          let hashed_state = state.hashed_post_state(&db.bundle_state);
--        let (state_root, trie_updates) = state
--            .state_root_with_updates(hashed_state.clone())
--            .map_err(BlockExecutionError::other)?;
-+        let hash_elapsed = hash_start.elapsed();
-+        let state_hash_ms = hash_elapsed.as_millis() as u64;
+-        let (state_root, trie_updates) = match state_root_precomputed {
+-            Some(precomputed) => precomputed,
+-            None => state
++        let state_hash_ms = hash_start.elapsed().as_millis() as u64;
 +
 +        #[cfg(feature = "std")]
 +        let n42_skip = crate::n42_skip_state_root() || crate::n42_defer_state_root();
@@ -500,29 +493,22 @@ index 595097df3..8dd560951 100644
 +                let mode = if crate::n42_skip_state_root() { "SKIP" } else { "DEFER" };
 +                tracing::info!(
 +                    target: "evm::execute",
-+                    hash_ms = hash_elapsed.as_millis() as u64,
 +                    mode,
 +                    "N42_STATE_ROOT_{}: using B256::ZERO placeholder in leader finish()", mode
 +                );
 +            }
 +            (alloy_primitives::B256::ZERO, Default::default())
++        } else if let Some(precomputed) = state_root_precomputed {
++            precomputed
 +        } else {
 +            let root_start = std::time::Instant::now();
 +            let result = state
-+                .state_root_with_updates(hashed_state.clone())
+                 .state_root_with_updates(hashed_state.clone())
+-                .map_err(BlockExecutionError::other)?,
 +                .map_err(BlockExecutionError::other)?;
-+            let root_elapsed = root_start.elapsed();
-+            state_root_ms = root_elapsed.as_millis() as u64;
-+
-+            tracing::info!(
-+                target: "evm::execute",
-+                hash_ms = state_hash_ms,
-+                root_ms = state_root_ms,
-+                total_ms = (hash_elapsed + root_elapsed).as_millis() as u64,
-+                "N42_STATE_ROOT: leader finish() breakdown"
-+            );
++            state_root_ms = root_start.elapsed().as_millis() as u64;
 +            result
-+        };
+         };
  
          let (transactions, senders) =
              self.transactions.into_iter().map(|tx| tx.into_parts()).unzip();
@@ -531,7 +517,7 @@ index 595097df3..8dd560951 100644
          let block = self.assembler.assemble_block(BlockAssemblerInput {
              evm_env,
              execution_ctx: self.ctx,
-@@ -503,8 +550,28 @@ where
+@@ -511,8 +546,28 @@ where
              state_provider: &state,
              state_root,
          })?;
@@ -561,7 +547,7 @@ index 595097df3..8dd560951 100644
          Ok(BlockBuilderOutcome { execution_result: result, hashed_state, trie_updates, block })
      }
 diff --git a/crates/evm/evm/src/lib.rs b/crates/evm/evm/src/lib.rs
-index ee19f749b..89f39caa8 100644
+index 7b01da49e..a2017d8d0 100644
 --- a/crates/evm/evm/src/lib.rs
 +++ b/crates/evm/evm/src/lib.rs
 @@ -52,6 +52,30 @@ pub use engine::{ConfigureEngineEvm, ConvertTx, ExecutableTxIterator, Executable
@@ -621,83 +607,3 @@ index 5df161d33..f53429864 100644
  }
  
  /// Performs a binary search within a given block range to find the desired block number.
-diff --git a/crates/evm/evm/src/payload_cache.rs b/crates/evm/evm/src/payload_cache.rs
-new file mode 100644
-index 000000000..590fdeb3a
---- /dev/null
-+++ b/crates/evm/evm/src/payload_cache.rs
-@@ -0,0 +1,74 @@
-+//! Global single-entry cache for leader payload execution results.
-+//!
-+//! When the payload builder (leader) finishes building a block, it caches
-+//! the execution output here. When `validate_block_with_state` (new_payload)
-+//! processes the same block, it can skip EVM re-execution by retrieving the
-+//! cached result.
-+//!
-+//! Two cache slots exist:
-+//! - `CACHE`: consumed by the leader's own `new_payload` (take semantics)
-+//! - `BROADCAST_CACHE`: consumed by `handle_built_payload` for serialization
-+//!   to followers (Compact Block). Separated so the leader's `take` doesn't
-+//!   consume the data needed for broadcast.
-+
-+use alloy_primitives::B256;
-+use std::any::Any;
-+use std::sync::{Mutex, OnceLock};
-+
-+struct CachedPayload {
-+    block_hash: B256,
-+    data: Box<dyn Any + Send + Sync>,
-+}
-+
-+type CacheSlot = OnceLock<Mutex<Option<CachedPayload>>>;
-+
-+static CACHE: CacheSlot = OnceLock::new();
-+
-+/// Secondary cache for broadcast to followers (Compact Block).
-+static BROADCAST_CACHE: CacheSlot = OnceLock::new();
-+
-+fn store(slot: &CacheSlot, block_hash: B256, data: impl Any + Send + Sync + 'static) {
-+    let cache = slot.get_or_init(|| Mutex::new(None));
-+    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
-+    *guard = Some(CachedPayload { block_hash, data: Box::new(data) });
-+}
-+
-+fn take<T: 'static>(slot: &CacheSlot, block_hash: &B256) -> Option<T> {
-+    let cache = slot.get_or_init(|| Mutex::new(None));
-+    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
-+    if let Some(entry) = guard.as_ref() {
-+        if &entry.block_hash == block_hash {
-+            if !entry.data.is::<T>() {
-+                tracing::warn!(
-+                    target: "evm::payload_cache",
-+                    %block_hash,
-+                    "payload cache type mismatch on downcast"
-+                );
-+                return None;
-+            }
-+            let entry = guard.take().unwrap();
-+            return entry.data.downcast::<T>().ok().map(|b| *b);
-+        }
-+    }
-+    None
-+}
-+
-+/// Store payload execution data keyed by block hash (for leader's own new_payload).
-+pub fn store_payload_execution(block_hash: B256, data: impl Any + Send + Sync + 'static) {
-+    store(&CACHE, block_hash, data);
-+}
-+
-+/// Take (remove) the cached payload execution data if the block hash matches.
-+pub fn take_payload_execution<T: 'static>(block_hash: &B256) -> Option<T> {
-+    take::<T>(&CACHE, block_hash)
-+}
-+
-+/// Store a clone of execution data for broadcast to followers (Compact Block).
-+pub fn store_broadcast_execution(block_hash: B256, data: impl Any + Send + Sync + 'static) {
-+    store(&BROADCAST_CACHE, block_hash, data);
-+}
-+
-+/// Take broadcast execution data if block hash matches.
-+pub fn take_broadcast_execution<T: 'static>(block_hash: &B256) -> Option<T> {
-+    take::<T>(&BROADCAST_CACHE, block_hash)
-+}
