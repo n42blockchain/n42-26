@@ -3315,6 +3315,7 @@ dependencies = [
  "tokio-tungstenite 0.24.0",
  "tracing",
  "tracing-subscriber 0.3.22",
+ "zstd",
 ]
 
 [[package]]

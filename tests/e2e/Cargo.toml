@@ -66,6 +66,7 @@ blst.workspace = true
 quinn.workspace = true
 rustls.workspace = true
 bincode.workspace = true
+zstd.workspace = true
 
 # Error handling
 eyre.workspace = true

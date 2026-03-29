@@ -12,6 +12,9 @@ pub async fn connect_to_starhub_addr(
     addr: SocketAddr,
     pubkey: &[u8; 48],
 ) -> eyre::Result<quinn::Connection> {
+    // Keep the helper safe even when it is called outside the e2e main entrypoint.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let mut client_crypto = rustls::ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(SkipServerVerification))

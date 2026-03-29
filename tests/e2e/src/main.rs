@@ -41,6 +41,10 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
+    // rustls 0.23 no longer auto-selects a process-wide crypto backend when
+    // multiple providers are available in the dependency graph.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     // Initialize tracing.
     tracing_subscriber::fmt()
         .with_env_filter(

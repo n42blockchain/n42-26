@@ -4,9 +4,11 @@ use tracing::{info, warn};
 
 use alloy_primitives::U256;
 use n42_mobile::code_cache::CodeCache;
-use n42_mobile::packet::decode_packet;
+use n42_mobile::packet::{decode_packet, decode_stream_packet};
 use n42_mobile::receipt::{VerificationReceipt, sign_receipt};
-use n42_mobile::verifier::{update_cache_after_verify, verify_block};
+use n42_mobile::verifier::{
+    update_cache_after_stream_verify, update_cache_after_verify, verify_block, verify_block_stream,
+};
 use n42_primitives::BlsSecretKey;
 
 use crate::erc20::Erc20Manager;
@@ -148,92 +150,158 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
         // Try to receive a packet with 8s timeout (slightly longer than block time)
         match receive_packet(&quic_conn, Duration::from_secs(8)).await {
             Ok(packet_data) => {
-                // Decode the VerificationPacket
-                let packet = match decode_packet(&packet_data) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        warn!(error = %e, "failed to decode packet, skipping");
-                        continue;
-                    }
-                };
-
-                info!(
-                    block_number = packet.block_number,
-                    block_hash = %packet.block_hash,
-                    tx_count = packet.transactions.len(),
-                    witness_accounts = packet.witness_accounts.len(),
-                    uncached_bytecodes = packet.uncached_bytecodes.len(),
-                    "received VerificationPacket"
-                );
-
-                // ─── 6. Run verify_block() — REAL EVM re-execution ───
-                let verify_start = std::time::Instant::now();
-                let result = verify_block(&packet, &mut code_cache, chain_spec.clone());
-                let verify_ms = verify_start.elapsed().as_millis();
-
-                match result {
-                    Ok(vr) => {
-                        info!(
-                            block_number = packet.block_number,
-                            computed = %vr.computed_receipts_root,
-                            verify_ms,
-                            "verify_block() completed"
-                        );
-
-                        // Update code cache with newly received bytecodes
-                        update_cache_after_verify(&packet, &mut code_cache);
-
-                        // ─── 7. Sign receipt with BLS12-381 ───
-                        let timestamp_ms = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_millis() as u64;
-
-                        let receipt = sign_receipt(
-                            packet.block_hash,
-                            packet.block_number,
-                            vr.computed_receipts_root,
-                            timestamp_ms,
-                            &mobile_key,
-                        );
-
-                        assert!(
-                            receipt.verify_signature().is_ok(),
-                            "BLS signature should verify"
-                        );
-
-                        // ─── 8. Send receipt back via QUIC ───
-                        send_receipt(&quic_conn, &receipt).await?;
-                        receipts_sent += 1;
-
-                        info!(
-                            block_number = packet.block_number,
-                            receipts_sent, "signed receipt sent back to node"
-                        );
-
-                        verified_count += 1;
-                        if !packet.transactions.is_empty() {
-                            verified_with_txs = true;
+                if let Ok(packet) = decode_stream_packet(&packet_data) {
+                    let (block_number, _) = match packet.header_info() {
+                        Some(info) => info,
+                        None => {
+                            warn!("failed to decode stream packet header, skipping");
+                            continue;
                         }
+                    };
 
-                        // Stop after verifying at least one block with transactions
-                        if verified_with_txs && verified_count >= 2 {
+                    info!(
+                        block_number,
+                        block_hash = %packet.block_hash,
+                        tx_count = packet.transactions.len(),
+                        bytecodes = packet.bytecodes.len(),
+                        read_log_bytes = packet.read_log_data.len(),
+                        "received StreamPacket"
+                    );
+
+                    let verify_start = std::time::Instant::now();
+                    let result = verify_block_stream(&packet, &mut code_cache, chain_spec.clone());
+                    let verify_ms = verify_start.elapsed().as_millis();
+
+                    match result {
+                        Ok(vr) => {
                             info!(
-                                "verified {} blocks (including blocks with txs), stopping",
-                                verified_count
+                                block_number,
+                                computed = %vr.computed_receipts_root,
+                                verify_ms,
+                                "verify_block_stream() completed"
                             );
-                            break;
+
+                            update_cache_after_stream_verify(&packet, &mut code_cache);
+
+                            let timestamp_ms = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis() as u64;
+
+                            let receipt = sign_receipt(
+                                packet.block_hash,
+                                block_number,
+                                vr.computed_receipts_root,
+                                timestamp_ms,
+                                &mobile_key,
+                            );
+
+                            assert!(
+                                receipt.verify_signature().is_ok(),
+                                "BLS signature should verify"
+                            );
+
+                            send_receipt(&quic_conn, &receipt).await?;
+                            receipts_sent += 1;
+
+                            info!(block_number, receipts_sent, "signed receipt sent back to node");
+
+                            verified_count += 1;
+                            if !packet.transactions.is_empty() {
+                                verified_with_txs = true;
+                            }
+                        }
+                        Err(e) => {
+                            warn!(
+                                block_number,
+                                error = %e,
+                                "verify_block_stream() failed"
+                            );
                         }
                     }
-                    Err(e) => {
-                        warn!(
-                            block_number = packet.block_number,
-                            error = %e,
-                            "verify_block() failed"
-                        );
-                        // Don't fail the test on verify errors for early blocks
-                        // that may not have complete witness data
+                } else {
+                    // Decode the legacy VerificationPacket when V2 decode fails.
+                    let packet = match decode_packet(&packet_data) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            warn!(error = %e, "failed to decode packet, skipping");
+                            continue;
+                        }
+                    };
+
+                    info!(
+                        block_number = packet.block_number,
+                        block_hash = %packet.block_hash,
+                        tx_count = packet.transactions.len(),
+                        witness_accounts = packet.witness_accounts.len(),
+                        uncached_bytecodes = packet.uncached_bytecodes.len(),
+                        "received VerificationPacket"
+                    );
+
+                    let verify_start = std::time::Instant::now();
+                    let result = verify_block(&packet, &mut code_cache, chain_spec.clone());
+                    let verify_ms = verify_start.elapsed().as_millis();
+
+                    match result {
+                        Ok(vr) => {
+                            info!(
+                                block_number = packet.block_number,
+                                computed = %vr.computed_receipts_root,
+                                verify_ms,
+                                "verify_block() completed"
+                            );
+
+                            update_cache_after_verify(&packet, &mut code_cache);
+
+                            let timestamp_ms = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis() as u64;
+
+                            let receipt = sign_receipt(
+                                packet.block_hash,
+                                packet.block_number,
+                                vr.computed_receipts_root,
+                                timestamp_ms,
+                                &mobile_key,
+                            );
+
+                            assert!(
+                                receipt.verify_signature().is_ok(),
+                                "BLS signature should verify"
+                            );
+
+                            send_receipt(&quic_conn, &receipt).await?;
+                            receipts_sent += 1;
+
+                            info!(
+                                block_number = packet.block_number,
+                                receipts_sent,
+                                "signed receipt sent back to node"
+                            );
+
+                            verified_count += 1;
+                            if !packet.transactions.is_empty() {
+                                verified_with_txs = true;
+                            }
+                        }
+                        Err(e) => {
+                            warn!(
+                                block_number = packet.block_number,
+                                error = %e,
+                                "verify_block() failed"
+                            );
+                        }
                     }
+                }
+
+                // Stop after verifying at least one block with transactions.
+                if verified_with_txs && verified_count >= 2 {
+                    info!(
+                        "verified {} blocks (including blocks with txs), stopping",
+                        verified_count
+                    );
+                    break;
                 }
             }
             Err(e) => {
@@ -323,30 +391,40 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
 /// Reads a uni stream from the server. The first byte is the message type
 /// (0x01 = packet, 0x02 = cache sync). Returns the packet data (without prefix).
 async fn receive_packet(conn: &quinn::Connection, timeout: Duration) -> eyre::Result<Vec<u8>> {
-    let mut recv = tokio::time::timeout(timeout, conn.accept_uni())
-        .await
-        .map_err(|_| eyre::eyre!("timeout waiting for uni stream"))??;
+    let deadline = tokio::time::Instant::now() + timeout;
 
-    // Read all data (type prefix + payload)
-    let data = recv.read_to_end(10 * 1024 * 1024).await?; // 10MB max
-
-    if data.is_empty() {
-        return Err(eyre::eyre!("received empty stream"));
-    }
-
-    let msg_type = data[0];
-    let payload = &data[1..];
-
-    match msg_type {
-        0x01 => {
-            // VerificationPacket
-            Ok(payload.to_vec())
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(eyre::eyre!("timeout waiting for uni stream"));
         }
-        0x02 => {
-            // CacheSyncMessage — skip and try again
-            Err(eyre::eyre!("received cache sync message, not a packet"))
+
+        let mut recv = tokio::time::timeout(remaining, conn.accept_uni())
+            .await
+            .map_err(|_| eyre::eyre!("timeout waiting for uni stream"))??;
+
+        // Read all data (type prefix + payload)
+        let data = recv.read_to_end(10 * 1024 * 1024).await?; // 10MB max
+
+        if data.is_empty() {
+            return Err(eyre::eyre!("received empty stream"));
         }
-        other => Err(eyre::eyre!("unknown message type: 0x{:02x}", other)),
+
+        let msg_type = data[0];
+        let payload = &data[1..];
+
+        match msg_type {
+            0x01 => return Ok(payload.to_vec()),
+            0x03 => {
+                return zstd::bulk::decompress(payload, 16 * 1024 * 1024)
+                    .map_err(|e| eyre::eyre!("zstd decompress failed: {e}"));
+            }
+            0x02 | 0x04 => {
+                // CacheSyncMessage — skip and keep waiting for the next packet.
+                continue;
+            }
+            other => return Err(eyre::eyre!("unknown message type: 0x{:02x}", other)),
+        }
     }
 }
 

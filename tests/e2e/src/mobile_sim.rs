@@ -5,6 +5,8 @@ use tracing::{debug, error, info, warn};
 use crate::quic_test_client;
 use crate::rpc_client::RpcClient;
 
+const MAX_STARHUB_STREAM_SIZE: usize = 16 * 1024 * 1024;
+
 /// A simulated mobile phone verifier that submits BLS attestations.
 #[allow(dead_code)]
 pub struct MobileSimulator {
@@ -83,6 +85,23 @@ impl MobileSimulator {
         let pubkey_bytes = self.bls_key.public_key().to_bytes();
         let quic_conn =
             quic_test_client::connect_to_starhub(self.starhub_port, &pubkey_bytes).await?;
+        let drain_conn = quic_conn.clone();
+        let drain_task = tokio::spawn(async move {
+            loop {
+                match drain_conn.accept_uni().await {
+                    Ok(mut recv) => {
+                        if let Err(e) = recv.read_to_end(MAX_STARHUB_STREAM_SIZE).await {
+                            debug!(error = %e, "failed to drain StarHub stream");
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        debug!(error = %e, "StarHub connection closed while draining");
+                        break;
+                    }
+                }
+            }
+        });
         let start = tokio::time::Instant::now();
         let poll_interval = std::time::Duration::from_secs(2);
         let mut last_block = 0u64;
@@ -135,6 +154,7 @@ impl MobileSimulator {
         );
 
         quic_conn.close(0u32.into(), b"mobile simulator complete");
+        drain_task.abort();
         Ok(stats)
     }
 }
