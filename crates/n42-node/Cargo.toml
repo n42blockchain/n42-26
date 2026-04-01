@@ -7,6 +7,7 @@ license.workspace = true
 description = "N42 node type definition and component assembly"
 
 [dependencies]
+blake3.workspace = true
 n42-primitives.workspace = true
 n42-chainspec.workspace = true
 n42-consensus.workspace = true
