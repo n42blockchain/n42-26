@@ -40,6 +40,10 @@ pub struct ConsensusSnapshot {
     /// on restart, which could cause duplicate reward payouts.
     #[serde(default)]
     pub committed_block_count: u64,
+    /// Last view in which this node cast a Round-1 vote.
+    /// Persisted to prevent double-voting after crash recovery (BFT safety).
+    #[serde(default)]
+    pub last_voted_view: u64,
 }
 
 /// Serde helper: serialize/deserialize `Vec<[u8; 48]>` as hex strings for human-readable JSON.

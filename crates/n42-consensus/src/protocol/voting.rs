@@ -166,6 +166,30 @@ impl ConsensusEngine {
             return Ok(());
         }
 
+        // Equivocation detection: same validator, same view, different block hash.
+        if let Some(&prev_hash) = self.commit_equivocation_tracker.get(&cv.voter) {
+            if prev_hash != cv.block_hash {
+                tracing::warn!(
+                    target: "n42::cl::voting",
+                    view,
+                    validator = cv.voter,
+                    hash1 = %prev_hash,
+                    hash2 = %cv.block_hash,
+                    "commit-vote equivocation detected"
+                );
+                self.emit(EngineOutput::EquivocationDetected {
+                    view,
+                    validator: cv.voter,
+                    hash1: prev_hash,
+                    hash2: cv.block_hash,
+                })?;
+                return Ok(());
+            }
+        } else {
+            self.commit_equivocation_tracker
+                .insert(cv.voter, cv.block_hash);
+        }
+
         let expected_hash = match self.commit_collector.as_ref() {
             Some(c) => c.block_hash(),
             None => return Ok(()),

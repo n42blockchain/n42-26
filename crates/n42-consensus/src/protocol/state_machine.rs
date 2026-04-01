@@ -216,7 +216,10 @@ pub struct ConsensusEngine {
     /// Block hashes imported before their matching proposal arrived.
     pub(super) imported_blocks: HashSet<B256>,
     /// Tracks which block hash each validator voted for (equivocation detection).
+    /// Tracks R1 (Vote) per validator per view for equivocation detection.
     pub(super) equivocation_tracker: HashMap<u32, B256>,
+    /// Tracks R2 (CommitVote) per validator per view for equivocation detection.
+    pub(super) commit_equivocation_tracker: HashMap<u32, B256>,
     /// Buffer for messages arriving for future views (within FUTURE_VIEW_WINDOW).
     pub(super) future_msg_buffer: Vec<(ViewNumber, ConsensusMessage)>,
     /// Per-view timing for commit latency diagnosis.
@@ -275,6 +278,7 @@ impl ConsensusEngine {
             pending_proposal: None,
             imported_blocks: HashSet::new(),
             equivocation_tracker: HashMap::new(),
+            commit_equivocation_tracker: HashMap::new(),
             future_msg_buffer: Vec::new(),
             view_timing: ViewTiming::new(),
             last_committed_timing: None,
@@ -298,6 +302,7 @@ impl ConsensusEngine {
         locked_qc: QuorumCertificate,
         last_committed_qc: QuorumCertificate,
         consecutive_timeouts: u32,
+        last_voted_view: ViewNumber,
     ) -> Self {
         /// Maximum consecutive timeouts preserved from a snapshot to prevent
         /// absurdly long backoff durations on recovery.
@@ -323,6 +328,7 @@ impl ConsensusEngine {
                 locked_qc,
                 last_committed_qc,
                 safe_consecutive_timeouts,
+                last_voted_view,
             ),
             pacemaker: Pacemaker::new(base_timeout_ms, max_timeout_ms),
             vote_collector: None,
@@ -334,6 +340,7 @@ impl ConsensusEngine {
             pending_proposal: None,
             imported_blocks: HashSet::new(),
             equivocation_tracker: HashMap::new(),
+            commit_equivocation_tracker: HashMap::new(),
             future_msg_buffer: Vec::new(),
             view_timing: ViewTiming::new(),
             last_committed_timing: None,
@@ -502,6 +509,10 @@ impl ConsensusEngine {
 
     pub fn consecutive_timeouts(&self) -> u32 {
         self.round_state.consecutive_timeouts()
+    }
+
+    pub fn last_voted_view(&self) -> u64 {
+        self.round_state.last_voted_view()
     }
 
     // ── Event processing ──
@@ -781,6 +792,7 @@ impl ConsensusEngine {
         self.pending_proposal = None;
         self.imported_blocks.clear();
         self.equivocation_tracker.clear();
+        self.commit_equivocation_tracker.clear();
         // Preserve timing from committed view for external reading.
         if self.view_timing.commit_qc_formed.is_some() {
             self.last_committed_timing = Some(self.view_timing.clone());

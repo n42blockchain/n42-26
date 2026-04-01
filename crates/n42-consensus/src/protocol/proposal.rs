@@ -272,7 +272,23 @@ impl ConsensusEngine {
     }
 
     /// Sends a Round 1 vote for the given view and block hash.
+    ///
+    /// Checks `last_voted_view` to prevent double-voting after crash recovery
+    /// (fundamental BFT safety invariant).
     pub(super) fn send_vote(&mut self, view: ViewNumber, block_hash: B256) -> ConsensusResult<()> {
+        if !self.round_state.may_vote_in(view) {
+            tracing::warn!(
+                target: "n42::cl::proposal",
+                view,
+                last_voted = self.round_state.last_voted_view(),
+                "suppressed duplicate vote (already voted in this view)"
+            );
+            return Ok(());
+        }
+        // Record BEFORE signing/sending so a crash between record and send is safe
+        // (we err on the side of not voting rather than double-voting).
+        self.round_state.record_vote(view);
+
         let leader = self.leader_index_for_view(view);
         let vote_msg = signing_message(view, &block_hash);
         let vote_sig = self.secret_key.sign(&vote_msg);

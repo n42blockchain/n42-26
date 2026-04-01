@@ -30,6 +30,11 @@ pub struct RoundState {
     locked_qc: QuorumCertificate,
     last_committed_qc: QuorumCertificate,
     consecutive_timeouts: u32,
+    /// The last view in which this node cast a Round-1 vote.
+    ///
+    /// Persisted to disk so that after a crash the node will not vote twice
+    /// in the same view (fundamental BFT safety invariant).
+    last_voted_view: ViewNumber,
 }
 
 impl RoundState {
@@ -41,17 +46,20 @@ impl RoundState {
             locked_qc: genesis_qc.clone(),
             last_committed_qc: genesis_qc,
             consecutive_timeouts: 0,
+            last_voted_view: 0,
         }
     }
 
     /// Restores state from a persisted snapshot (crash recovery).
     ///
-    /// Preserves safety invariants (locked_qc, last_committed_qc) across restarts.
+    /// Preserves safety invariants (locked_qc, last_committed_qc, last_voted_view)
+    /// across restarts.
     pub fn from_snapshot(
         view: ViewNumber,
         locked_qc: QuorumCertificate,
         last_committed_qc: QuorumCertificate,
         consecutive_timeouts: u32,
+        last_voted_view: ViewNumber,
     ) -> Self {
         Self {
             current_view: view,
@@ -59,6 +67,7 @@ impl RoundState {
             locked_qc,
             last_committed_qc,
             consecutive_timeouts,
+            last_voted_view,
         }
     }
 
@@ -80,6 +89,27 @@ impl RoundState {
 
     pub fn consecutive_timeouts(&self) -> u32 {
         self.consecutive_timeouts
+    }
+
+    pub fn last_voted_view(&self) -> ViewNumber {
+        self.last_voted_view
+    }
+
+    /// Returns `true` if this node has NOT yet voted in the given view.
+    /// After returning `true`, the caller MUST call `record_vote(view)` before
+    /// actually broadcasting the vote, to prevent double-voting after a crash.
+    pub fn may_vote_in(&self, view: ViewNumber) -> bool {
+        view > self.last_voted_view
+    }
+
+    /// Records that this node has voted in `view`. Must be called before the
+    /// vote is broadcast. The field is persisted in the snapshot so that a
+    /// crash-recovery cannot produce a duplicate vote.
+    pub fn record_vote(&mut self, view: ViewNumber) {
+        // Monotonic: never regress.
+        if view > self.last_voted_view {
+            self.last_voted_view = view;
+        }
     }
 
     pub fn enter_voting(&mut self) {

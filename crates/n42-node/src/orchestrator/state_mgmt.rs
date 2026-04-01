@@ -79,6 +79,7 @@ impl ConsensusOrchestrator {
             scheduled_epoch_transition: self.collect_scheduled_epoch(),
             authorized_verifiers: Vec::new(),
             committed_block_count: self.committed_block_count,
+            last_voted_view: self.engine.last_voted_view(),
         }
     }
 
