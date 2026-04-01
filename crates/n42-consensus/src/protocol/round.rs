@@ -102,14 +102,11 @@ impl RoundState {
         view > self.last_voted_view
     }
 
-    /// Records that this node has voted in `view`. Must be called before the
-    /// vote is broadcast. The field is persisted in the snapshot so that a
-    /// crash-recovery cannot produce a duplicate vote.
+    /// Records that this node has voted in `view`. Must be called immediately
+    /// after `may_vote_in()` returns `true` and before the vote is broadcast.
     pub fn record_vote(&mut self, view: ViewNumber) {
-        // Monotonic: never regress.
-        if view > self.last_voted_view {
-            self.last_voted_view = view;
-        }
+        debug_assert!(view > self.last_voted_view, "record_vote called without may_vote_in guard");
+        self.last_voted_view = view;
     }
 
     pub fn enter_voting(&mut self) {

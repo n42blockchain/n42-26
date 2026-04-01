@@ -1,8 +1,27 @@
+use alloy_primitives::B256;
 use n42_primitives::consensus::{CommitVote, ConsensusMessage, PrepareQC, Vote};
+use std::collections::HashMap;
 
 use super::quorum::{commit_signing_message, signing_message};
 use super::state_machine::{ConsensusEngine, EngineOutput};
 use crate::error::{ConsensusError, ConsensusResult};
+
+/// Checks an equivocation tracker for a validator voting for two different blocks.
+/// Returns `Some((hash1, hash2))` if equivocation detected, `None` otherwise.
+fn check_equivocation(
+    tracker: &mut HashMap<u32, B256>,
+    voter: u32,
+    block_hash: B256,
+) -> Option<(B256, B256)> {
+    if let Some(&prev) = tracker.get(&voter) {
+        if prev != block_hash {
+            return Some((prev, block_hash));
+        }
+    } else {
+        tracker.insert(voter, block_hash);
+    }
+    None
+}
 
 impl ConsensusEngine {
     /// Processes a Round 1 (Prepare) vote from a validator.
@@ -17,29 +36,11 @@ impl ConsensusEngine {
         }
 
         // Equivocation detection runs on ALL nodes, not just the leader.
-        // A Byzantine validator voting for two different blocks in the same view
-        // is a protocol violation that every node should detect and report,
-        // regardless of whether it is currently the leader.
-        if let Some(&prev_hash) = self.equivocation_tracker.get(&vote.voter) {
-            if prev_hash != vote.block_hash {
-                tracing::warn!(target: "n42::cl::voting",
-                    view,
-                    validator = vote.voter,
-                    %prev_hash,
-                    new_hash = %vote.block_hash,
-                    "equivocation detected: validator voted for two different blocks"
-                );
-                self.emit(EngineOutput::EquivocationDetected {
-                    view,
-                    validator: vote.voter,
-                    hash1: prev_hash,
-                    hash2: vote.block_hash,
-                })?;
-                return Ok(());
-            }
-        } else {
-            self.equivocation_tracker
-                .insert(vote.voter, vote.block_hash);
+        if let Some((h1, h2)) = check_equivocation(&mut self.equivocation_tracker, vote.voter, vote.block_hash) {
+            tracing::warn!(target: "n42::cl::voting", view, validator = vote.voter,
+                hash1 = %h1, hash2 = %h2, "vote equivocation detected");
+            self.emit(EngineOutput::EquivocationDetected { view, validator: vote.voter, hash1: h1, hash2: h2 })?;
+            return Ok(());
         }
 
         // Only the leader collects votes to form a QC.
@@ -166,28 +167,12 @@ impl ConsensusEngine {
             return Ok(());
         }
 
-        // Equivocation detection: same validator, same view, different block hash.
-        if let Some(&prev_hash) = self.commit_equivocation_tracker.get(&cv.voter) {
-            if prev_hash != cv.block_hash {
-                tracing::warn!(
-                    target: "n42::cl::voting",
-                    view,
-                    validator = cv.voter,
-                    hash1 = %prev_hash,
-                    hash2 = %cv.block_hash,
-                    "commit-vote equivocation detected"
-                );
-                self.emit(EngineOutput::EquivocationDetected {
-                    view,
-                    validator: cv.voter,
-                    hash1: prev_hash,
-                    hash2: cv.block_hash,
-                })?;
-                return Ok(());
-            }
-        } else {
-            self.commit_equivocation_tracker
-                .insert(cv.voter, cv.block_hash);
+        // Equivocation detection for R2 commits.
+        if let Some((h1, h2)) = check_equivocation(&mut self.commit_equivocation_tracker, cv.voter, cv.block_hash) {
+            tracing::warn!(target: "n42::cl::voting", view, validator = cv.voter,
+                hash1 = %h1, hash2 = %h2, "commit-vote equivocation detected");
+            self.emit(EngineOutput::EquivocationDetected { view, validator: cv.voter, hash1: h1, hash2: h2 })?;
+            return Ok(());
         }
 
         let expected_hash = match self.commit_collector.as_ref() {

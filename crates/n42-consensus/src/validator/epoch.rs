@@ -364,6 +364,11 @@ impl EpochManager {
         !self.pending_adds.is_empty() || !self.pending_removes.is_empty()
     }
 
+    /// Returns the total number of pending add + remove changes (zero-alloc).
+    pub fn pending_change_count(&self) -> usize {
+        self.pending_adds.len() + self.pending_removes.len()
+    }
+
     /// Validates and commits pending changes by staging the new validator set.
     ///
     /// Called at CommitQC time by the protocol layer (voting.rs / decision.rs).

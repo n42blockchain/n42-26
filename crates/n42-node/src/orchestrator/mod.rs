@@ -1082,12 +1082,7 @@ impl ConsensusOrchestrator {
             let next_count = em.peek_next_set().map_or(0, |s| s.len() as usize);
             state.update_epoch_status(crate::consensus_state::EpochStatus {
                 current_epoch: em.current_epoch(),
-                pending_changes: if em.has_pending_changes() {
-                    // Count adds + removes
-                    em.pending_changes_for_proposal().map_or(0, |c| c.len())
-                } else {
-                    0
-                },
+                pending_changes: em.pending_change_count(),
                 staged_next_epoch: em.has_staged_next(),
                 next_epoch_validator_count: next_count,
             });
