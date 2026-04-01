@@ -786,7 +786,17 @@ impl ConsensusOrchestrator {
                 (true, block_timestamp)
             }
             Ok(status) => {
-                warn!(target: "n42::cl::consensus_loop", %block_hash, status = ?status.status, "bg import: new_payload rejected");
+                if matches!(status.status, PayloadStatusEnum::Invalid) {
+                    error!(
+                        target: "n42::cl::consensus_loop",
+                        %block_hash,
+                        validation_error = status.status.validation_error().unwrap_or("unknown"),
+                        "bg import: block INVALID — requesting sync to recover"
+                    );
+                    counter!("n42_invalid_blocks_total").increment(1);
+                } else {
+                    warn!(target: "n42::cl::consensus_loop", %block_hash, status = ?status.status, "bg import: new_payload rejected");
+                }
                 (false, 0)
             }
             Err(e) => {

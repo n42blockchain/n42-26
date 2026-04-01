@@ -688,8 +688,19 @@ impl ConsensusOrchestrator {
                             debug!(target: "n42::cl::exec_bridge", %hash, view, "eager import completion receiver dropped");
                         }
                     }
+                    Ok(status) if matches!(status.status, PayloadStatusEnum::Syncing) => {
+                        // Parent not yet imported — roll back block_guard so this block
+                        // can be retried after the parent arrives.
+                        // CRITICAL: do NOT let further children through while parent is
+                        // still Syncing — they would get InvalidBlockParent from reth
+                        // and be permanently marked as bad blocks.
+                        block_guard.fetch_min(block_number.saturating_sub(1), std::sync::atomic::Ordering::SeqCst);
+                        debug!(target: "n42::cl::exec_bridge", %hash, view, block_number, compact_injected,
+                            "follower eager import: parent not ready (Syncing), rolled back block guard");
+                    }
                     Ok(status) => {
-                        debug!(target: "n42::cl::exec_bridge", %hash, view, status = ?status.status, compact_injected, "follower eager import: not accepted");
+                        warn!(target: "n42::cl::exec_bridge", %hash, view, status = ?status.status, compact_injected,
+                            "follower eager import: rejected (may poison descendant imports)");
                         if compact_injected {
                             metrics::counter!("n42_compact_block_cache_misses").increment(1);
                         }
