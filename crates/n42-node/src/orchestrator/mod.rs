@@ -1070,6 +1070,28 @@ impl ConsensusOrchestrator {
                 let _ = reply.send(result);
             }
         }
+        // Refresh epoch status so RPC immediately reflects pending changes.
+        self.refresh_epoch_status();
+    }
+
+    /// Publishes the current epoch/pending/staged state to `SharedConsensusState`
+    /// so that `n42_validatorSet` RPC returns up-to-date transition info.
+    fn refresh_epoch_status(&self) {
+        if let Some(ref state) = self.consensus_state {
+            let em = self.engine.epoch_manager();
+            let next_count = em.peek_next_set().map_or(0, |s| s.len() as usize);
+            state.update_epoch_status(crate::consensus_state::EpochStatus {
+                current_epoch: em.current_epoch(),
+                pending_changes: if em.has_pending_changes() {
+                    // Count adds + removes
+                    em.pending_changes_for_proposal().map_or(0, |c| c.len())
+                } else {
+                    0
+                },
+                staged_next_epoch: em.has_staged_next(),
+                next_epoch_validator_count: next_count,
+            });
+        }
     }
 
     fn trim_tx_forward_buffer(&mut self, leader_idx: u32, reason: &'static str) {

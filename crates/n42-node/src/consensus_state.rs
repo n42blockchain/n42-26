@@ -137,6 +137,15 @@ fn unix_now_secs() -> u64 {
         .as_secs()
 }
 
+/// Snapshot of epoch / validator-change progress, read by RPC.
+#[derive(Debug, Clone, Default)]
+pub struct EpochStatus {
+    pub current_epoch: u64,
+    pub pending_changes: usize,
+    pub staged_next_epoch: bool,
+    pub next_epoch_validator_count: usize,
+}
+
 /// Admin command sent from RPC to the consensus orchestrator.
 pub enum AdminCommand {
     AddValidator {
@@ -172,6 +181,9 @@ pub struct SharedConsensusState {
     pub(crate) zk_latest_proof: ArcSwap<Option<(u64, B256)>>,
     /// Admin command channel sender; set once the orchestrator is wired up.
     admin_tx: Mutex<Option<tokio::sync::mpsc::Sender<AdminCommand>>>,
+    /// Epoch status snapshot updated by the consensus engine after each relevant event.
+    /// Provides pending/staged info for the `n42_validatorSet` RPC.
+    epoch_status: ArcSwap<EpochStatus>,
 }
 
 impl SharedConsensusState {
@@ -200,6 +212,7 @@ impl SharedConsensusState {
             jmt_root: ArcSwap::from_pointee(None),
             zk_latest_proof: ArcSwap::from_pointee(None),
             admin_tx: Mutex::new(None),
+            epoch_status: ArcSwap::from_pointee(EpochStatus::default()),
         }
     }
 
@@ -367,6 +380,17 @@ impl SharedConsensusState {
     /// Returns a clone of the admin command channel sender, if installed.
     pub fn admin_tx(&self) -> Option<tokio::sync::mpsc::Sender<AdminCommand>> {
         self.admin_tx.lock().unwrap_or_else(|e| { tracing::warn!("admin_tx mutex poisoned, recovering"); e.into_inner() }).clone()
+    }
+
+    /// Updates the epoch status snapshot (called by the orchestrator after admin commands
+    /// and epoch transitions).
+    pub fn update_epoch_status(&self, status: EpochStatus) {
+        self.epoch_status.store(Arc::new(status));
+    }
+
+    /// Loads the current epoch status snapshot.
+    pub fn load_epoch_status(&self) -> Arc<EpochStatus> {
+        self.epoch_status.load_full()
     }
 
     /// Registers the block for attestation tracking and notifies RPC subscribers.

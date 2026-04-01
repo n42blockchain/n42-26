@@ -289,6 +289,9 @@ impl ConsensusOrchestrator {
                         }
                     }
                 }
+
+                // Update RPC-visible epoch status after the transition.
+                self.refresh_epoch_status();
             }
         }
     }
@@ -412,6 +415,9 @@ impl ConsensusOrchestrator {
                 }
             }).await;
         }
+
+        // Refresh RPC-visible epoch status (captures pending→staged transition from CommitQC).
+        self.refresh_epoch_status();
 
         self.store_committed_block(view, block_hash, commit_qc.clone(), validator_changes);
         self.head_block_hash = block_hash;

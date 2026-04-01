@@ -35,6 +35,21 @@ pub struct ValidatorInfoResponse {
     pub public_key: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ValidatorSetResponse {
+    /// Current active validator set.
+    pub active: Vec<ValidatorInfoResponse>,
+    /// Number of pending changes (queued via proposeAdd/Remove, not yet committed).
+    pub pending_changes: usize,
+    /// Whether a next-epoch validator set has been staged (committed, awaiting epoch boundary).
+    pub staged_next_epoch: bool,
+    /// Current epoch number.
+    pub current_epoch: u64,
+    /// Number of validators in the staged next set (0 if none staged).
+    pub next_epoch_validator_count: usize,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AttestationResponse {
@@ -145,8 +160,13 @@ pub trait N42Api {
     #[method(name = "consensusStatus")]
     async fn consensus_status(&self) -> RpcResult<ConsensusStatusResponse>;
 
+    /// Returns the active validator set with epoch transition status.
+    ///
+    /// The response includes `pending_changes` (queued, not yet committed) and
+    /// `staged_next_epoch` (committed, waiting for epoch boundary) so callers
+    /// can understand why a recently proposed validator is not yet visible.
     #[method(name = "validatorSet")]
-    async fn validator_set(&self) -> RpcResult<Vec<ValidatorInfoResponse>>;
+    async fn validator_set(&self) -> RpcResult<ValidatorSetResponse>;
 
     /// Pushes a notification each time a new block is committed by consensus.
     #[subscription(name = "subscribeVerification", unsubscribe = "unsubscribeVerification", item = VerificationTask)]
@@ -333,7 +353,7 @@ impl N42ApiServer for N42RpcServer {
         })
     }
 
-    async fn validator_set(&self) -> RpcResult<Vec<ValidatorInfoResponse>> {
+    async fn validator_set(&self) -> RpcResult<ValidatorSetResponse> {
         let Some(vs) = self.consensus_state.try_load_validator_set() else {
             return Err(ErrorObjectOwned::owned(
                 -32603,
@@ -341,7 +361,7 @@ impl N42ApiServer for N42RpcServer {
                 None::<()>,
             ));
         };
-        let mut result = Vec::with_capacity(vs.len() as usize);
+        let mut active = Vec::with_capacity(vs.len() as usize);
         for i in 0..vs.len() {
             let pk = vs.get_public_key(i).map_err(|e| {
                 ErrorObjectOwned::owned(
@@ -350,12 +370,20 @@ impl N42ApiServer for N42RpcServer {
                     None::<()>,
                 )
             })?;
-            result.push(ValidatorInfoResponse {
+            active.push(ValidatorInfoResponse {
                 index: i,
                 public_key: hex::encode(pk.to_bytes()),
             });
         }
-        Ok(result)
+
+        let epoch = self.consensus_state.load_epoch_status();
+        Ok(ValidatorSetResponse {
+            active,
+            pending_changes: epoch.pending_changes,
+            staged_next_epoch: epoch.staged_next_epoch,
+            current_epoch: epoch.current_epoch,
+            next_epoch_validator_count: epoch.next_epoch_validator_count,
+        })
     }
 
     async fn subscribe_verification(&self, pending: PendingSubscriptionSink) -> SubscriptionResult {
@@ -794,7 +822,7 @@ impl N42ApiServer for N42RpcServer {
 
         reply_rx.await
             .map_err(|_| ErrorObjectOwned::owned(-32603, "consensus loop dropped reply", None::<()>))?
-            .map(|()| "validator add proposed, activates at next CommitQC".to_string())
+            .map(|()| "validator add queued; stages at next CommitQC, activates at next epoch boundary".to_string())
             .map_err(|e| ErrorObjectOwned::owned(-32003, e, None::<()>))
     }
 
@@ -815,7 +843,7 @@ impl N42ApiServer for N42RpcServer {
 
         reply_rx.await
             .map_err(|_| ErrorObjectOwned::owned(-32603, "consensus loop dropped reply", None::<()>))?
-            .map(|()| "validator remove proposed, activates at next CommitQC".to_string())
+            .map(|()| "validator remove queued; stages at next CommitQC, activates at next epoch boundary".to_string())
             .map_err(|e| ErrorObjectOwned::owned(-32003, e, None::<()>))
     }
 }
@@ -903,11 +931,16 @@ mod tests {
     async fn test_validator_set_response() {
         let rpc = make_rpc_with_validators(3);
         let result = rpc.validator_set().await.unwrap();
-        assert_eq!(result.len(), 3);
-        for (i, v) in result.iter().enumerate() {
+        assert_eq!(result.active.len(), 3);
+        for (i, v) in result.active.iter().enumerate() {
             assert_eq!(v.index, i as u32);
             assert!(!v.public_key.is_empty());
         }
+        // Fresh state: no pending or staged changes.
+        assert_eq!(result.pending_changes, 0);
+        assert!(!result.staged_next_epoch);
+        assert_eq!(result.current_epoch, 0);
+        assert_eq!(result.next_epoch_validator_count, 0);
     }
 
     #[tokio::test]
