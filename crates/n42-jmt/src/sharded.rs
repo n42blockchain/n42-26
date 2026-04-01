@@ -101,6 +101,7 @@ impl<S: TreeStore> ShardedJmt<S> {
     ///
     /// Shared by `apply_diff` and `apply_diff_atomic` to avoid duplication.
     /// Returns `(per_shard_updates, total_key_count)`.
+    #[allow(clippy::type_complexity)]
     fn prepare_shard_updates(
         &self,
         diff: &StateDiff,
@@ -134,7 +135,7 @@ impl<S: TreeStore> ShardedJmt<S> {
                 AccountChangeType::Destroyed => {
                     shard_updates[si].push((key, None));
                     total_keys += 1;
-                    for (slot, _) in &account_diff.storage {
+                    for slot in account_diff.storage.keys() {
                         let skey = storage_key(address, slot);
                         let ssi = shard_index(&skey);
                         shard_updates[ssi].push((skey, None));

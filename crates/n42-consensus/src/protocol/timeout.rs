@@ -60,10 +60,10 @@ impl ConsensusEngine {
             // arrived between repeats). Only the next leader can form the TC.
             let quorum_size = self.validator_set_for_view(view).quorum_size();
             let next_view = view.saturating_add(1);
-            if let Some(ref collector) = self.timeout_collector {
-                if collector.has_quorum(quorum_size) && self.is_leader_for_view(next_view) {
-                    self.try_form_tc_and_advance(view, next_view)?;
-                }
+            if let Some(ref collector) = self.timeout_collector
+                && collector.has_quorum(quorum_size) && self.is_leader_for_view(next_view)
+            {
+                self.try_form_tc_and_advance(view, next_view)?;
             }
             return Ok(());
         }

@@ -169,7 +169,7 @@ impl DiskTreeStore {
         tx.put(
             self.meta_db.dbi(),
             META_LATEST_VERSION,
-            &version.to_be_bytes(),
+            version.to_be_bytes(),
             WriteFlags::default(),
         )
         .map_err(|e| anyhow::anyhow!("meta write: {e}"))
@@ -197,7 +197,7 @@ impl DiskTreeStore {
         for ((version, key_hash), maybe_value) in node_batch.values() {
             let key = encode_value_key(key_hash, *version);
             let val = encode_value_entry(maybe_value);
-            tx.put(self.values_db.dbi(), &key, &val, WriteFlags::default())
+            tx.put(self.values_db.dbi(), key, val, WriteFlags::default())
                 .map_err(|e| anyhow::anyhow!("values put: {e}"))?;
             max_version = max_version.max(*version);
         }
@@ -238,10 +238,10 @@ impl DiskTreeStore {
         match cursor.set_range::<Vec<u8>, Vec<u8>>(&search_key) {
             Ok(Some((found_key, found_val))) => {
                 // Exact match: same key_hash and exact version
-                if let Some((fk, fv)) = decode_value_key(&found_key) {
-                    if fk.0 == key_hash.0 && fv == max_version {
-                        return Ok(decode_value_entry(&found_val));
-                    }
+                if let Some((fk, fv)) = decode_value_key(&found_key)
+                    && fk.0 == key_hash.0 && fv == max_version
+                {
+                    return Ok(decode_value_entry(&found_val));
                 }
                 // Overshot (higher version or different key_hash) — go back one
                 self.try_prev_for_key(&mut cursor, &key_hash, max_version)
@@ -262,10 +262,10 @@ impl DiskTreeStore {
     ) -> Result<Option<OwnedValue>> {
         match cursor.prev::<Vec<u8>, Vec<u8>>() {
             Ok(Some((prev_key, prev_val))) => {
-                if let Some((pk, pv)) = decode_value_key(&prev_key) {
-                    if pk.0 == key_hash.0 && pv <= max_version {
-                        return Ok(decode_value_entry(&prev_val));
-                    }
+                if let Some((pk, pv)) = decode_value_key(&prev_key)
+                    && pk.0 == key_hash.0 && pv <= max_version
+                {
+                    return Ok(decode_value_entry(&prev_val));
                 }
                 Ok(None)
             }
@@ -281,10 +281,10 @@ impl DiskTreeStore {
     ) -> Result<Option<OwnedValue>> {
         match cursor.last::<Vec<u8>, Vec<u8>>() {
             Ok(Some((last_key, last_val))) => {
-                if let Some((lk, lv)) = decode_value_key(&last_key) {
-                    if lk.0 == key_hash.0 && lv <= max_version {
-                        return Ok(decode_value_entry(&last_val));
-                    }
+                if let Some((lk, lv)) = decode_value_key(&last_key)
+                    && lk.0 == key_hash.0 && lv <= max_version
+                {
+                    return Ok(decode_value_entry(&last_val));
                 }
                 Ok(None)
             }

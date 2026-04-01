@@ -111,6 +111,7 @@ where
         self.validator_set.store(Some(Arc::new(validator_set)));
     }
 
+    #[cfg(test)]
     fn validator_set_for_view(&self, view: u64) -> Option<Arc<ValidatorSet>> {
         self.validator_set_resolver
             .as_ref()
@@ -139,44 +140,41 @@ where
 
         // Verify parent_beacon_block_root == Blake3(ConsensusEvidence) of parent block.
         // In N42 this field stores the consensus evidence root, not a beacon chain root.
-        if let Some(ref evidence_store) = self.evidence_store {
-            if let Some(claimed_root) = block.header().parent_beacon_block_root() {
-                let block_number = block.header().number();
-                if block_number <= 1 {
-                    // Genesis/block-1: no parent evidence, B256::ZERO is acceptable.
-                    if claimed_root != B256::ZERO {
-                        return Err(ConsensusError::Other(format!(
-                            "block {block_number}: parent_beacon_block_root should be zero for early blocks"
-                        )));
+        if let Some(ref evidence_store) = self.evidence_store
+            && let Some(claimed_root) = block.header().parent_beacon_block_root()
+        {
+            let block_number = block.header().number();
+            if block_number <= 1 && claimed_root != B256::ZERO {
+                return Err(ConsensusError::Other(format!(
+                    "block {block_number}: parent_beacon_block_root should be zero for early blocks"
+                )));
+            } else if block_number > 1 {
+                let parent_number = block_number - 1;
+                match evidence_store.get_root(parent_number) {
+                    Ok(Some(stored_root)) => {
+                        let expected = B256::from(stored_root);
+                        if claimed_root != expected {
+                            return Err(ConsensusError::Other(format!(
+                                "block {block_number}: parent_beacon_block_root mismatch \
+                                 (header={claimed_root}, expected={expected})"
+                            )));
+                        }
                     }
-                } else {
-                    let parent_number = block_number - 1;
-                    match evidence_store.get_root(parent_number) {
-                        Ok(Some(stored_root)) => {
-                            let expected = B256::from(stored_root);
-                            if claimed_root != expected {
-                                return Err(ConsensusError::Other(format!(
-                                    "block {block_number}: parent_beacon_block_root mismatch \
-                                     (header={claimed_root}, expected={expected})"
-                                )));
-                            }
-                        }
-                        Ok(None) => {
-                            tracing::debug!(
-                                target: "n42::consensus",
-                                block_number,
-                                parent_number,
-                                "no consensus evidence for parent, skipping root verification"
-                            );
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                target: "n42::consensus",
-                                block_number,
-                                error = %e,
-                                "evidence store read error, skipping root verification"
-                            );
-                        }
+                    Ok(None) => {
+                        tracing::debug!(
+                            target: "n42::consensus",
+                            block_number,
+                            parent_number,
+                            "no consensus evidence for parent, skipping root verification"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "n42::consensus",
+                            block_number,
+                            error = %e,
+                            "evidence store read error, skipping root verification"
+                        );
                     }
                 }
             }

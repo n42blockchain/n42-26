@@ -211,10 +211,10 @@ impl ConsensusConfig {
                 if !seen_pks.insert(v.bls_public_key.to_bytes()) {
                     return Err("duplicate BLS public key in validator set".to_string());
                 }
-                if let Some(peer_id) = v.parsed_p2p_peer_id()? {
-                    if !seen_peer_ids.insert(peer_id) {
-                        return Err(format!("duplicate validator p2p_peer_id: {peer_id}"));
-                    }
+                if let Some(peer_id) = v.parsed_p2p_peer_id()?
+                    && !seen_peer_ids.insert(peer_id)
+                {
+                    return Err(format!("duplicate validator p2p_peer_id: {peer_id}"));
                 }
             }
         }
@@ -313,8 +313,9 @@ pub const STRESS_CONTRACT_ADDRESS: Address = address!("0000000000000000000000000
 
 /// Runtime bytecode for the stress-test storage burner contract.
 /// On any call, it does:
-///   1. counters[caller]++ (SLOAD + SSTORE)
-///   2. values[caller] = timestamp (SSTORE)
+///   1. `counters[caller]++` (SLOAD + SSTORE)
+///   2. `values[caller] = timestamp` (SSTORE)
+///
 /// Gas cost: ~45k (similar to ERC-20 transfer).
 pub static STRESS_CONTRACT_BYTECODE: Bytes = bytes!(
     "33600052600060205260406000208054600101905560016020526040600020429055600160005260206000f3"

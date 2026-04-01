@@ -22,7 +22,7 @@ mod packed_bits {
 
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<BitVec<u8, Msb0>, D::Error> {
         let (bit_count, raw_bytes): (u16, Vec<u8>) = Deserialize::deserialize(d)?;
-        let needed = ((bit_count as usize) + 7) / 8;
+        let needed = (bit_count as usize).div_ceil(8);
         if raw_bytes.len() != needed {
             return Err(serde::de::Error::custom(format!(
                 "packed_bits: expected {needed} bytes for {bit_count} bits, got {}",

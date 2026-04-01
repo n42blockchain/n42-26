@@ -333,7 +333,7 @@ impl EpochManager {
         }
 
         // Already pending removal?
-        if self.pending_removes.iter().any(|&a| a == addr) {
+        if self.pending_removes.contains(&addr) {
             return Err(ConsensusError::ValidatorAlreadyPendingRemoval { address: addr });
         }
 
@@ -534,10 +534,10 @@ impl EpochManager {
             new_validators.iter().map(|v| v.address).collect();
         let mut overlap = 0usize;
         for i in 0..self.current_set.len() {
-            if let Ok(addr) = self.current_set.get_address(i) {
-                if new_addrs.contains(addr) {
-                    overlap += 1;
-                }
+            if let Ok(addr) = self.current_set.get_address(i)
+                && new_addrs.contains(addr)
+            {
+                overlap += 1;
             }
         }
         let required = self.current_set.quorum_size(); // 2f+1

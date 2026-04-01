@@ -187,7 +187,7 @@ impl EvidenceStore {
         value.extend_from_slice(root);
 
         let tx = self.env.begin_rw_txn()?;
-        tx.put(self.db.dbi(), &key, &value, WriteFlags::default())
+        tx.put(self.db.dbi(), key, value, WriteFlags::default())
             .map_err(|e| eyre::eyre!("evidence put block {block_number}: {e}"))?;
         tx.commit()
             .map_err(|e| eyre::eyre!("evidence commit block {block_number}: {e}"))?;
@@ -246,7 +246,7 @@ pub enum EvidenceDecodeError {
 }
 
 fn packed_byte_len(bit_count: u16) -> usize {
-    ((bit_count as usize) + 7) / 8
+    (bit_count as usize).div_ceil(8)
 }
 
 fn read_u64_le(buf: &[u8], pos: &mut usize) -> Result<u64, EvidenceDecodeError> {

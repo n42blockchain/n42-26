@@ -122,7 +122,7 @@ impl<S: TreeStore> N42JmtTree<S> {
             match account_diff.change_type {
                 AccountChangeType::Destroyed => {
                     updates.push((key, None));
-                    for (slot, _) in &account_diff.storage {
+                    for slot in account_diff.storage.keys() {
                         updates.push((storage_key(address, slot), None));
                     }
                 }
