@@ -11,8 +11,6 @@ use reth_primitives_traits::{
 use std::fmt::Debug;
 use std::sync::Arc;
 
-use crate::extra_data::extract_qc_from_extra_data;
-use crate::protocol::quorum::{verify_commit_qc, verify_qc};
 use crate::validator::ValidatorSet;
 
 /// Resolves the validator set that should verify a QC for a given view.
@@ -60,19 +58,11 @@ impl<C> N42Consensus<C>
 where
     C: EthChainSpec + EthereumHardforks,
 {
-    /// Maximum extra_data size for N42 blocks.
-    ///
-    /// Pre-migration blocks may carry a bincode-encoded QC in extra_data (> 32 bytes).
-    /// This limit must remain large enough to validate those historical blocks during
-    /// sync/replay, even though new blocks use `parent_beacon_block_root` for evidence.
-    const MAX_EXTRA_DATA_SIZE: usize = 4096;
-
     /// Create a new N42 consensus adapter (without validator set).
     /// QC verification is skipped until `set_validator_set` is called.
     pub fn new(chain_spec: Arc<C>) -> Self {
         Self {
-            inner: EthBeaconConsensus::new(chain_spec)
-                .with_max_extra_data_size(Self::MAX_EXTRA_DATA_SIZE),
+            inner: EthBeaconConsensus::new(chain_spec),
             validator_set: Arc::new(ArcSwapOption::empty()),
             validator_set_resolver: None,
             evidence_store: None,
@@ -103,8 +93,7 @@ where
         validator_set_resolver: Option<ValidatorSetResolver>,
     ) -> Self {
         Self {
-            inner: EthBeaconConsensus::new(chain_spec)
-                .with_max_extra_data_size(Self::MAX_EXTRA_DATA_SIZE),
+            inner: EthBeaconConsensus::new(chain_spec),
             validator_set,
             validator_set_resolver,
             evidence_store: None,
@@ -148,17 +137,7 @@ where
             receipt_root_bloom,
         )?;
 
-        // Legacy v1: QC embedded in extra_data (blocks produced before evidence-root migration).
-        let extra_data = block.header().extra_data();
-        if let Some(qc) = extract_qc_from_extra_data(extra_data)?
-            && let Some(vs) = self.validator_set_for_view(qc.view)
-        {
-            verify_qc(&qc, &vs)
-                .or_else(|_| verify_commit_qc(&qc, &vs))
-                .map_err(|e| ConsensusError::Other(e.to_string()))?;
-        }
-
-        // v2: Verify parent_beacon_block_root == Blake3(ConsensusEvidence) of parent block.
+        // Verify parent_beacon_block_root == Blake3(ConsensusEvidence) of parent block.
         // In N42 this field stores the consensus evidence root, not a beacon chain root.
         if let Some(ref evidence_store) = self.evidence_store {
             if let Some(claimed_root) = block.header().parent_beacon_block_root() {

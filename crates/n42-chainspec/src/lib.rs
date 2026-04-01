@@ -288,7 +288,7 @@ pub fn n42_dev_chainspec() -> Arc<ChainSpec> {
     let spec = ChainSpecBuilder::default()
         .chain(Chain::from_id(effective_chain_id()))
         .genesis(genesis)
-        .cancun_activated()
+        .prague_activated()
         .build();
 
     Arc::new(spec)
@@ -387,7 +387,7 @@ pub fn n42_dev_chainspec_with_alloc(validators: &[ValidatorInfo]) -> Arc<ChainSp
         ChainSpecBuilder::default()
             .chain(Chain::from_id(effective_chain_id()))
             .genesis(genesis)
-            .cancun_activated()
+            .prague_activated()
             .build(),
     )
 }
@@ -405,7 +405,7 @@ pub fn n42_chainspec_from_genesis(genesis_path: &Path) -> Result<Arc<ChainSpec>,
         ChainSpecBuilder::default()
             .chain(Chain::from_id(effective_chain_id()))
             .genesis(genesis)
-            .cancun_activated()
+            .prague_activated()
             .build(),
     ))
 }

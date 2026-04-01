@@ -71,6 +71,7 @@ pub fn generate_genesis_json(accounts: &[TestAccount]) -> Value {
             "mergeNetsplitBlock": 0,
             "shanghaiTime": 0,
             "cancunTime": 0,
+            "pragueTime": 0,
             "terminalTotalDifficulty": "0x0",
             "terminalTotalDifficultyPassed": true
         },
