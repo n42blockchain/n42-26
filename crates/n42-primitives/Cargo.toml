@@ -29,3 +29,6 @@ thiserror.workspace = true
 derive_more.workspace = true
 getrandom = "0.3"
 zeroize.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

@@ -1113,4 +1113,113 @@ mod tests {
         assert_eq!(em.current_validator_set().len(), 4);
         assert!(!em.has_pending_changes());
     }
+
+    // ── New method tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_pending_changes_for_proposal_empty() {
+        let infos = make_validator_infos(4);
+        let vs = ValidatorSet::new(&infos, 1);
+        let em = EpochManager::with_epoch_length(vs, 10);
+        assert!(em.pending_changes_for_proposal().is_none());
+    }
+
+    #[test]
+    fn test_pending_changes_for_proposal_roundtrip() {
+        let infos = make_validator_infos(5);
+        let vs = ValidatorSet::new(&infos[..4], 1);
+        let mut em = EpochManager::with_epoch_length(vs, 10);
+        em.propose_add_validator(infos[4].clone()).unwrap();
+        em.propose_remove_validator(infos[0].address).unwrap();
+
+        let changes = em.pending_changes_for_proposal().unwrap();
+        assert_eq!(changes.len(), 2);
+
+        // Simulate follower receiving the changes
+        let vs2 = ValidatorSet::new(&infos[..4], 1);
+        let mut em2 = EpochManager::with_epoch_length(vs2, 10);
+        em2.replace_pending_from_proposal(&changes);
+        assert!(em2.has_pending_changes());
+
+        // Both should produce the same staged set
+        em.commit_pending_changes().unwrap();
+        em2.commit_pending_changes().unwrap();
+        assert_eq!(
+            em.peek_next_set().unwrap().len(),
+            em2.peek_next_set().unwrap().len()
+        );
+    }
+
+    #[test]
+    fn test_clear_pending_changes() {
+        let infos = make_validator_infos(5);
+        let vs = ValidatorSet::new(&infos[..4], 1);
+        let mut em = EpochManager::with_epoch_length(vs, 10);
+        em.propose_add_validator(infos[4].clone()).unwrap();
+        assert!(em.has_pending_changes());
+
+        em.clear_pending_changes();
+        assert!(!em.has_pending_changes());
+        assert!(em.pending_changes_for_proposal().is_none());
+    }
+
+    #[test]
+    fn test_pending_changes_hash_deterministic() {
+        let infos = make_validator_infos(5);
+        let vs = ValidatorSet::new(&infos[..4], 1);
+        let mut em = EpochManager::with_epoch_length(vs, 10);
+        em.propose_add_validator(infos[4].clone()).unwrap();
+
+        let h1 = em.pending_changes_hash();
+        let h2 = em.pending_changes_hash();
+        assert_eq!(h1, h2);
+        assert_ne!(h1, alloy_primitives::B256::ZERO);
+    }
+
+    #[test]
+    fn test_pending_changes_hash_zero_when_empty() {
+        let infos = make_validator_infos(4);
+        let vs = ValidatorSet::new(&infos, 1);
+        let em = EpochManager::with_epoch_length(vs, 10);
+        assert_eq!(em.pending_changes_hash(), alloy_primitives::B256::ZERO);
+    }
+
+    #[test]
+    fn test_peek_next_set() {
+        let infos = make_validator_infos(5);
+        let vs = ValidatorSet::new(&infos[..4], 1);
+        let mut em = EpochManager::with_epoch_length(vs, 10);
+        assert!(em.peek_next_set().is_none());
+
+        em.propose_add_validator(infos[4].clone()).unwrap();
+        em.commit_pending_changes().unwrap();
+        assert!(em.peek_next_set().is_some());
+        assert_eq!(em.peek_next_set().unwrap().len(), 5);
+    }
+
+    #[test]
+    fn test_replace_clears_and_overwrites() {
+        let infos = make_validator_infos(6);
+        let vs = ValidatorSet::new(&infos[..4], 1);
+        let mut em = EpochManager::with_epoch_length(vs, 10);
+
+        // Local pending: add validator 4
+        em.propose_add_validator(infos[4].clone()).unwrap();
+        assert_eq!(em.pending_changes_for_proposal().unwrap().len(), 1);
+
+        // Leader sends different changes: add validator 5
+        let leader_changes = vec![ValidatorChange::Add {
+            address: infos[5].address,
+            bls_public_key: infos[5].bls_public_key.clone(),
+            p2p_peer_id: None,
+        }];
+        em.replace_pending_from_proposal(&leader_changes);
+
+        let changes = em.pending_changes_for_proposal().unwrap();
+        assert_eq!(changes.len(), 1);
+        match &changes[0] {
+            ValidatorChange::Add { address, .. } => assert_eq!(*address, infos[5].address),
+            _ => panic!("expected Add"),
+        }
+    }
 }

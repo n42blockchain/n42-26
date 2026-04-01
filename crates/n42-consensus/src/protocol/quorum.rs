@@ -976,4 +976,44 @@ mod tests {
         let collector2 = TimeoutCollector::new(0, 7);
         assert_eq!(collector2.view(), 0);
     }
+
+    #[test]
+    fn test_proposal_signing_message_differs_from_vote() {
+        let view = 42u64;
+        let hash = B256::repeat_byte(0xAA);
+        let vote_msg = signing_message(view, &hash);
+        let prop_msg = proposal_signing_message(view, &hash, &None);
+        // First 40 bytes match
+        assert_eq!(&vote_msg[..], &prop_msg[..40]);
+        // Proposal has 32 extra zero bytes for no-changes hash
+        assert_eq!(&prop_msg[40..], &[0u8; 32]);
+    }
+
+    #[test]
+    fn test_proposal_signing_message_changes_hash() {
+        let view = 1u64;
+        let hash = B256::repeat_byte(0xBB);
+        let msg_none = proposal_signing_message(view, &hash, &None);
+        let msg_empty = proposal_signing_message(view, &hash, &Some(vec![]));
+        // None and empty vec both produce zero hash
+        assert_eq!(msg_none, msg_empty);
+
+        let changes = Some(vec![n42_primitives::consensus::ValidatorChange::Remove {
+            address: alloy_primitives::Address::repeat_byte(0x01),
+        }]);
+        let msg_with = proposal_signing_message(view, &hash, &changes);
+        // With changes, the hash portion differs
+        assert_ne!(&msg_with[40..], &[0u8; 32]);
+        assert_ne!(msg_with, msg_none);
+    }
+
+    #[test]
+    fn test_proposal_signing_deterministic() {
+        let changes = Some(vec![n42_primitives::consensus::ValidatorChange::Remove {
+            address: alloy_primitives::Address::repeat_byte(0x42),
+        }]);
+        let m1 = proposal_signing_message(1, &B256::ZERO, &changes);
+        let m2 = proposal_signing_message(1, &B256::ZERO, &changes);
+        assert_eq!(m1, m2);
+    }
 }

@@ -465,4 +465,160 @@ mod tests {
         assert_eq!(qc.signer_count(), 0);
         assert!(qc.signers.is_empty());
     }
+
+    // ── packed_bits tests ──────────────────────────────────────────
+
+    #[test]
+    fn packed_bits_roundtrip_bincode() {
+        let mut bv = bitvec![u8, Msb0; 1, 0, 1, 1, 0, 0, 1];
+        let qc = QuorumCertificate {
+            view: 1,
+            block_hash: B256::ZERO,
+            aggregate_signature: dummy_signature(),
+            signers: bv.clone(),
+        };
+        let encoded = bincode::serialize(&qc).unwrap();
+        let decoded: QuorumCertificate = bincode::deserialize(&encoded).unwrap();
+        assert_eq!(decoded.signers, bv);
+        assert_eq!(decoded.signers.len(), 7);
+    }
+
+    #[test]
+    fn packed_bits_roundtrip_json() {
+        let bv = bitvec![u8, Msb0; 1, 1, 0, 1, 0];
+        let qc = QuorumCertificate {
+            view: 1,
+            block_hash: B256::ZERO,
+            aggregate_signature: dummy_signature(),
+            signers: bv.clone(),
+        };
+        let json = serde_json::to_string(&qc).unwrap();
+        let decoded: QuorumCertificate = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.signers, bv);
+    }
+
+    #[test]
+    fn packed_bits_empty() {
+        let bv = BitVec::<u8, Msb0>::new();
+        let qc = QuorumCertificate {
+            view: 1,
+            block_hash: B256::ZERO,
+            aggregate_signature: dummy_signature(),
+            signers: bv.clone(),
+        };
+        let encoded = bincode::serialize(&qc).unwrap();
+        let decoded: QuorumCertificate = bincode::deserialize(&encoded).unwrap();
+        assert!(decoded.signers.is_empty());
+    }
+
+    #[test]
+    fn packed_bits_500_validators() {
+        let mut bv = bitvec![u8, Msb0; 0; 500];
+        bv.set(0, true);
+        bv.set(499, true);
+        let qc = QuorumCertificate {
+            view: 1,
+            block_hash: B256::ZERO,
+            aggregate_signature: dummy_signature(),
+            signers: bv.clone(),
+        };
+        let encoded = bincode::serialize(&qc).unwrap();
+        let decoded: QuorumCertificate = bincode::deserialize(&encoded).unwrap();
+        assert_eq!(decoded.signers.len(), 500);
+        assert!(decoded.signers[0]);
+        assert!(!decoded.signers[1]);
+        assert!(decoded.signers[499]);
+        // Compact: 2 (count) + 8 (bincode len prefix) + 63 (packed bytes) = 73 bytes for signers
+        // vs old format: 2 + 8 + 500 = 510 bytes
+    }
+
+    #[test]
+    fn packed_bits_rejects_length_mismatch() {
+        // Craft a (bit_count=100, raw_bytes=[0u8; 5]) — needs 13 bytes, has 5
+        let bad: (u16, Vec<u8>) = (100, vec![0u8; 5]);
+        let bad_bytes = bincode::serialize(&bad).unwrap();
+        // Wrap in a QC-like structure: prepend view(8) + hash(32) + sig (bincode bytes)
+        // Easier: just test packed_bits directly via QC deserialization
+        // Actually, construct the full bincode manually is complex.
+        // Instead test that a short raw_bytes is rejected via serde_json:
+        let json = r#"{"view":1,"block_hash":"0x0000000000000000000000000000000000000000000000000000000000000000","aggregate_signature":"placeholder","signers":[100,[0,0,0,0,0]]}"#;
+        // This won't parse cleanly because aggregate_signature isn't valid.
+        // Use a simpler approach: serialize a valid QC, tamper with the signers field.
+        let mut bv = bitvec![u8, Msb0; 1, 0, 1];
+        let qc = QuorumCertificate {
+            view: 1,
+            block_hash: B256::ZERO,
+            aggregate_signature: dummy_signature(),
+            signers: bv,
+        };
+        let mut json_val: serde_json::Value = serde_json::to_value(&qc).unwrap();
+        // Tamper signers: set bit_count to 100 but keep 1 byte of data
+        json_val["signers"] = serde_json::json!([100, [0xA0]]);
+        let result: Result<QuorumCertificate, _> = serde_json::from_value(json_val);
+        assert!(result.is_err(), "should reject bit_count > raw_bytes capacity");
+    }
+
+    // ── ValidatorChange tests ──────────────────────────────────────
+
+    #[test]
+    fn validator_change_serde_roundtrip() {
+        let sk = BlsSecretKey::random().unwrap();
+        let changes = vec![
+            ValidatorChange::Add {
+                address: Address::repeat_byte(0x01),
+                bls_public_key: sk.public_key(),
+                p2p_peer_id: Some("12D3KooW...".to_string()),
+            },
+            ValidatorChange::Remove {
+                address: Address::repeat_byte(0x02),
+            },
+        ];
+        let encoded = bincode::serialize(&changes).unwrap();
+        let decoded: Vec<ValidatorChange> = bincode::deserialize(&encoded).unwrap();
+        assert_eq!(decoded.len(), 2);
+        match &decoded[0] {
+            ValidatorChange::Add { address, p2p_peer_id, .. } => {
+                assert_eq!(*address, Address::repeat_byte(0x01));
+                assert_eq!(p2p_peer_id.as_deref(), Some("12D3KooW..."));
+            }
+            _ => panic!("expected Add"),
+        }
+        match &decoded[1] {
+            ValidatorChange::Remove { address } => {
+                assert_eq!(*address, Address::repeat_byte(0x02));
+            }
+            _ => panic!("expected Remove"),
+        }
+    }
+
+    // ── Decide with validator_changes_hash ──────────────────────────
+
+    #[test]
+    fn decide_changes_hash_serde_roundtrip() {
+        let sig = dummy_signature();
+        let genesis_qc = QuorumCertificate::genesis();
+        let decide = Decide {
+            view: 42,
+            block_hash: B256::repeat_byte(0xDD),
+            commit_qc: genesis_qc,
+            validator_changes_hash: B256::repeat_byte(0xAB),
+        };
+        let encoded = bincode::serialize(&decide).unwrap();
+        let decoded: Decide = bincode::deserialize(&encoded).unwrap();
+        assert_eq!(decoded.validator_changes_hash, B256::repeat_byte(0xAB));
+    }
+
+    #[test]
+    fn decide_changes_hash_defaults_to_zero() {
+        // Simulate old Decide without validator_changes_hash (backward compat)
+        let sig = dummy_signature();
+        let genesis_qc = QuorumCertificate::genesis();
+        let old_decide = serde_json::json!({
+            "view": 42,
+            "block_hash": B256::repeat_byte(0xDD),
+            "commit_qc": serde_json::to_value(&genesis_qc).unwrap(),
+        });
+        let decoded: Decide = serde_json::from_value(old_decide).unwrap();
+        assert_eq!(decoded.validator_changes_hash, B256::ZERO);
+    }
 }
