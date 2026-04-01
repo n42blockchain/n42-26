@@ -85,4 +85,8 @@ Logs are split into separate files by phase for easy maintenance:
 
 ---
 
-New entries: append to the corresponding category file, or create a new numbered file (e.g., `devlog-53-xxx.md`) in `docs/`.
+| [devlog-56-consensus-evidence-persistence](docs/devlog-56-consensus-evidence-persistence.md) | Consensus Evidence Persistence, Validator Change Protocol, Prague Upgrade |
+
+---
+
+New entries: append to the corresponding category file, or create a new numbered file (e.g., `devlog-57-xxx.md`) in `docs/`.
