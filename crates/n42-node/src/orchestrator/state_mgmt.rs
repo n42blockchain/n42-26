@@ -336,20 +336,23 @@ impl ConsensusOrchestrator {
                 self.last_evidence_root = alloy_primitives::B256::from(root_bytes);
                 let store = std::sync::Arc::clone(evidence_store);
                 let bn = self.committed_block_count;
-                tokio::task::spawn_blocking(move || {
+                // Keep sync recovery crash-safe: do not persist the updated
+                // snapshot until the matching evidence row is on disk.
+                let _ = tokio::task::spawn_blocking(move || {
                     if let Err(e) = store.put_raw(bn, &encoded, &root_bytes) {
                         tracing::warn!(target: "n42::cl::sync", block = bn, error = %e, "evidence write failed");
                     }
-                });
+                }).await;
             }
 
             // Apply validator changes from the synced block to the epoch manager.
             if let Some(ref changes) = sync_block.validator_changes {
-                self.engine.epoch_manager_mut().replace_pending_from_proposal(changes);
-                if self.engine.epoch_manager().has_pending_changes() {
-                    if let Err(e) = self.engine.epoch_manager_mut().commit_pending_changes() {
-                        tracing::warn!(target: "n42::cl::sync", view = sync_block.view, error = %e, "sync: commit validator changes failed");
-                    }
+                if let Err(e) = self
+                    .engine
+                    .epoch_manager_mut()
+                    .apply_committed_changes_from_sync(changes)
+                {
+                    tracing::warn!(target: "n42::cl::sync", view = sync_block.view, error = %e, "sync: commit validator changes failed");
                 }
             }
 

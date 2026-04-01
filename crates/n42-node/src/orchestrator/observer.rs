@@ -474,6 +474,7 @@ impl ObserverOrchestrator {
                 block_hash: b.block_hash,
                 commit_qc: b.commit_qc.clone(),
                 payload: b.payload.clone(),
+                validator_changes: b.validator_changes.clone(),
             })
             .collect();
 
@@ -732,6 +733,7 @@ mod tests {
                     signers: bitvec![u8, Msb0; 1],
                 },
                 payload: vec![],
+                validator_changes: None,
             },
             validator_set,
         )

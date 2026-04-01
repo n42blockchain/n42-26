@@ -88,8 +88,11 @@ impl ConsensusEngine {
                 "MISSED validator changes from Proposal — epoch transition may diverge; \
                  requesting resync"
             );
+            // Sync API requests the inclusive range (local_view + 1)..=target_view.
+            // We need to re-fetch the committed block at `decide.view`, so report
+            // the local committed view as the block immediately before it.
             self.emit(EngineOutput::SyncRequired {
-                local_view: decide.view,
+                local_view: decide.view.saturating_sub(1),
                 target_view: decide.view,
             })?;
         }

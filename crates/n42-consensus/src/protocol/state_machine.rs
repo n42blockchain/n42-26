@@ -2105,6 +2105,34 @@ mod tests {
     }
 
     #[test]
+    fn test_decide_missing_validator_changes_requests_resync_for_committed_view() {
+        let (mut engine, sks, vs, mut rx) = make_engine(4, 0);
+        let block_hash = B256::repeat_byte(0xD9);
+        let view = 2u64;
+
+        let commit_qc = build_test_commit_qc(view, block_hash, &sks, &vs, &[0, 1, 2]);
+        let decide = Decide {
+            view,
+            block_hash,
+            commit_qc,
+            validator_changes_hash: B256::repeat_byte(0x42),
+        };
+
+        engine
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Decide(decide)))
+            .expect("decide with missed validator changes should still commit");
+
+        let outputs: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(outputs.iter().any(|o| matches!(
+            o,
+            EngineOutput::SyncRequired {
+                local_view: 1,
+                target_view: 2,
+            }
+        )));
+    }
+
+    #[test]
     fn test_decide_stale_ignored() {
         let (mut engine, sks, vs, mut rx) = make_engine(4, 0);
         let block_hash = B256::repeat_byte(0xD2);

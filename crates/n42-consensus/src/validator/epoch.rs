@@ -481,6 +481,20 @@ impl EpochManager {
         }
     }
 
+    /// Applies validator changes recovered from a committed/synced block.
+    ///
+    /// This is narrower than exposing `commit_pending_changes()` publicly:
+    /// callers can only provide the already-committed change set, which we
+    /// stage for the next epoch boundary using the same validation path as the
+    /// normal Proposal -> CommitQC flow.
+    pub fn apply_committed_changes_from_sync(
+        &mut self,
+        changes: &[ValidatorChange],
+    ) -> ConsensusResult<()> {
+        self.replace_pending_from_proposal(changes);
+        self.commit_pending_changes()
+    }
+
     /// Clears all pending validator changes without committing them.
     ///
     /// Called when a follower receives a proposal with no `validator_changes`
@@ -1024,6 +1038,32 @@ mod tests {
         em.commit_pending_changes().unwrap(); // must not panic or error
         assert!(!em.has_staged_next());
         assert_eq!(em.current_validator_set().len(), 4);
+    }
+
+    #[test]
+    fn test_apply_committed_changes_from_sync_stages_next_epoch() {
+        let infos = make_validator_infos(5);
+        let vs = ValidatorSet::new(&infos, 1);
+        let mut em = EpochManager::with_epoch_length(vs, 10);
+
+        let sk = test_key(0x93);
+        let changes = vec![ValidatorChange::Add {
+            address: Address::with_last_byte(0x40),
+            bls_public_key: sk.public_key(),
+            p2p_peer_id: None,
+        }];
+
+        em.apply_committed_changes_from_sync(&changes).unwrap();
+
+        assert!(em.has_staged_next());
+        assert!(!em.has_pending_changes());
+        assert_eq!(em.validator_set_for_view(11).len(), 6);
+        assert!(
+            em.validator_set_for_view(11)
+                .validator_infos()
+                .iter()
+                .any(|v| v.address == Address::with_last_byte(0x40))
+        );
     }
 
     #[test]
