@@ -71,12 +71,24 @@ impl ConsensusEngine {
         self.round_state.commit(decide.commit_qc.clone());
 
         // Commit-then-Activate: if validator changes were proposed, stage them now.
-        // Changes were set by process_proposal(); if this follower missed the
-        // Proposal, pending is empty and this is a no-op.  Validator-change
-        // consistency across an epoch boundary relies on all honest nodes
-        // receiving the Proposal (which is BLS-signed and covers the changes hash).
         if self.epoch_manager.has_pending_changes() {
             self.epoch_manager.commit_pending_changes()?;
+        } else if decide.validator_changes_hash != alloy_primitives::B256::ZERO {
+            // The committed Proposal carried validator changes but this follower
+            // missed it.  Log prominently so the operator notices; the node will
+            // need to resync (or receive the changes in a subsequent Proposal
+            // before the epoch boundary) to avoid validator-set divergence.
+            tracing::error!(
+                target: "n42::cl::decision",
+                view = decide.view,
+                expected_hash = %decide.validator_changes_hash,
+                "MISSED validator changes from Proposal — epoch transition may diverge; \
+                 requesting resync"
+            );
+            self.emit(EngineOutput::SyncRequired {
+                local_view: decide.view,
+                target_view: decide.view,
+            })?;
         }
 
         // Clean up pending tx_root_hash for the committed block.

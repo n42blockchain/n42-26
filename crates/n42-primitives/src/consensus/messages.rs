@@ -222,6 +222,15 @@ pub struct Decide {
     pub block_hash: B256,
     /// The CommitQC that proves 2f+1 validators committed.
     pub commit_qc: QuorumCertificate,
+    /// Blake3 hash of the serialized `validator_changes` from the Proposal.
+    /// Non-zero when the committed Proposal carried validator changes.
+    ///
+    /// Followers that missed the Proposal use this to detect missing changes
+    /// and request resync.  Only the hash is carried (not the full changes)
+    /// because the Decide has no BLS signature — carrying unauthenticated
+    /// data would be a security risk.
+    #[serde(default)]
+    pub validator_changes_hash: B256,
 }
 
 /// Current consensus protocol wire format version.
@@ -370,6 +379,7 @@ mod tests {
                 view: 7,
                 block_hash: B256::repeat_byte(0x77),
                 commit_qc: genesis_qc.clone(),
+                validator_changes_hash: B256::ZERO,
             }),
         ];
 

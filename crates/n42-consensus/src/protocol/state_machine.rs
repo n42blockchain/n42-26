@@ -383,7 +383,7 @@ impl ConsensusEngine {
                     .validator_set_for_view(proposal.view)
                     .get_public_key(proposal.proposer)
                     .ok()?;
-                let sig_msg = crate::protocol::quorum::proposal_signing_message(proposal.view, &proposal.block_hash, &None);
+                let sig_msg = crate::protocol::quorum::proposal_signing_message(proposal.view, &proposal.block_hash, &proposal.validator_changes);
                 if pk.verify(&sig_msg, &proposal.signature).is_err() {
                     tracing::debug!(target: "n42::consensus", view = proposal.view, proposer = proposal.proposer, "proposal signature verification failed");
                     return None;
@@ -2078,6 +2078,7 @@ mod tests {
             view,
             block_hash,
             commit_qc,
+            validator_changes_hash: alloy_primitives::B256::ZERO,
         };
 
         engine
@@ -2114,6 +2115,7 @@ mod tests {
                     view: v,
                     block_hash: bh,
                     commit_qc: cqc,
+                    validator_changes_hash: alloy_primitives::B256::ZERO,
                 })));
             while rx.try_recv().is_ok() {}
         }
@@ -2125,6 +2127,7 @@ mod tests {
                 view: 3,
                 block_hash,
                 commit_qc,
+                validator_changes_hash: alloy_primitives::B256::ZERO,
             })))
             .expect("stale Decide should be ignored without error");
 
@@ -2155,6 +2158,7 @@ mod tests {
                 view,
                 block_hash,
                 commit_qc: weak_qc,
+                validator_changes_hash: alloy_primitives::B256::ZERO,
             })));
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -2198,6 +2202,7 @@ mod tests {
                 view,
                 block_hash,
                 commit_qc: forged_qc,
+                validator_changes_hash: alloy_primitives::B256::ZERO,
             })));
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -2567,6 +2572,7 @@ mod tests {
             view: 1,
             block_hash: B256::repeat_byte(0x01),
             commit_qc,
+            validator_changes_hash: alloy_primitives::B256::ZERO,
         })));
         while rx.try_recv().is_ok() {}
 
@@ -2575,6 +2581,7 @@ mod tests {
             view: 2,
             block_hash: B256::repeat_byte(0x02),
             commit_qc: commit_qc2,
+            validator_changes_hash: alloy_primitives::B256::ZERO,
         })));
         while rx.try_recv().is_ok() {}
 
@@ -2642,6 +2649,7 @@ mod tests {
             view: far_view,
             block_hash,
             commit_qc,
+            validator_changes_hash: alloy_primitives::B256::ZERO,
         };
 
         engine
@@ -2870,6 +2878,7 @@ mod tests {
                     view: v,
                     block_hash: bh,
                     commit_qc: cqc,
+                    validator_changes_hash: alloy_primitives::B256::ZERO,
                 })));
             while rx.try_recv().is_ok() {}
         }
@@ -2890,6 +2899,7 @@ mod tests {
                     view: v,
                     block_hash: bh,
                     commit_qc: cqc,
+                    validator_changes_hash: alloy_primitives::B256::ZERO,
                 })));
         }
         while rx.try_recv().is_ok() {}

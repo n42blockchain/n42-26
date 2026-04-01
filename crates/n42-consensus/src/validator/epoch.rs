@@ -418,6 +418,19 @@ impl EpochManager {
         Ok(())
     }
 
+    /// Returns the Blake3 hash of pending changes, or `B256::ZERO` if none.
+    /// Used by the leader to populate `Decide.validator_changes_hash`.
+    pub fn pending_changes_hash(&self) -> alloy_primitives::B256 {
+        match self.pending_changes_for_proposal() {
+            Some(changes) if !changes.is_empty() => {
+                let encoded = bincode::serialize(&changes)
+                    .expect("ValidatorChange serialization cannot fail");
+                alloy_primitives::B256::from(*blake3::hash(&encoded).as_bytes())
+            }
+            _ => alloy_primitives::B256::ZERO,
+        }
+    }
+
     /// Returns pending validator changes for inclusion in a [`Proposal`] message.
     ///
     /// Returns `None` if there are no pending changes.  Does **not** drain the
