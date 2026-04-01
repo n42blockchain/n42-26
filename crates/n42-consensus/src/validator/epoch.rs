@@ -427,13 +427,21 @@ impl EpochManager {
     /// Used by the leader to populate `Decide.validator_changes_hash`.
     pub fn pending_changes_hash(&self) -> alloy_primitives::B256 {
         match self.pending_changes_for_proposal() {
-            Some(changes) if !changes.is_empty() => {
-                let encoded = bincode::serialize(&changes)
-                    .expect("ValidatorChange serialization cannot fail");
-                alloy_primitives::B256::from(*blake3::hash(&encoded).as_bytes())
-            }
+            Some(ref changes) if !changes.is_empty() => Self::hash_changes(changes),
             _ => alloy_primitives::B256::ZERO,
         }
+    }
+
+    /// Computes the Blake3 hash of an already-captured change list.
+    /// Use this instead of `pending_changes_hash()` when you already hold the Vec
+    /// to avoid a redundant allocation.
+    pub fn hash_changes(changes: &[ValidatorChange]) -> alloy_primitives::B256 {
+        if changes.is_empty() {
+            return alloy_primitives::B256::ZERO;
+        }
+        let encoded =
+            bincode::serialize(changes).expect("ValidatorChange serialization cannot fail");
+        alloy_primitives::B256::from(*blake3::hash(&encoded).as_bytes())
     }
 
     /// Returns pending validator changes for inclusion in a [`Proposal`] message.

@@ -217,6 +217,7 @@ mod tests {
             scheduled_epoch_transition: None,
             authorized_verifiers: Vec::new(),
             committed_block_count: 0,
+            last_voted_view: 0,
         }
     }
 
@@ -238,6 +239,26 @@ mod tests {
         assert_eq!(loaded.current_view, 42);
         assert_eq!(loaded.consecutive_timeouts, 3);
         assert_eq!(loaded.locked_qc.view, 0);
+        assert_eq!(loaded.last_voted_view, 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_last_voted_view_persisted() {
+        let dir = std::env::temp_dir().join("n42-test-last-voted");
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("consensus_state.json");
+
+        let snapshot = ConsensusSnapshot {
+            last_voted_view: 99,
+            ..genesis_snapshot(100)
+        };
+        save_consensus_state(&path, &snapshot).unwrap();
+
+        let loaded = load_consensus_state(&path).unwrap().unwrap();
+        assert_eq!(loaded.last_voted_view, 99);
+        assert_eq!(loaded.current_view, 100);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

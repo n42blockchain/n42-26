@@ -167,7 +167,9 @@ impl ConsensusEngine {
             return Ok(());
         }
 
-        // Equivocation detection for R2 commits.
+        // R2 equivocation detection — leader-only by design: CommitVotes are sent
+        // directly to the leader (not broadcast), so only the leader can observe
+        // conflicting votes from the same validator.
         if let Some((h1, h2)) = check_equivocation(&mut self.commit_equivocation_tracker, cv.voter, cv.block_hash) {
             tracing::warn!(target: "n42::cl::voting", view, validator = cv.voter,
                 hash1 = %h1, hash2 = %h2, "commit-vote equivocation detected");
@@ -259,7 +261,10 @@ impl ConsensusEngine {
 
         // Capture changes BEFORE commit clears pending (needed for Decide + BlockCommitted).
         let committed_changes = self.epoch_manager.pending_changes_for_proposal();
-        let changes_hash = self.epoch_manager.pending_changes_hash();
+        let changes_hash = match &committed_changes {
+            Some(c) => crate::EpochManager::hash_changes(c),
+            None => alloy_primitives::B256::ZERO,
+        };
 
         // Commit-then-Activate: if validator changes were proposed, stage them now.
         if self.epoch_manager.has_pending_changes() {
