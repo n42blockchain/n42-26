@@ -662,6 +662,7 @@ impl ObserverOrchestrator {
             block_hash,
             commit_qc,
             payload: payload.to_vec(),
+            validator_changes: None,
         });
     }
 

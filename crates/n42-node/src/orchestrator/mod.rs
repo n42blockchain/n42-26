@@ -218,6 +218,7 @@ pub(crate) struct CommittedBlock {
     pub(crate) block_hash: B256,
     pub(crate) commit_qc: QuorumCertificate,
     pub(crate) payload: Vec<u8>,
+    pub(crate) validator_changes: Option<Vec<n42_primitives::consensus::ValidatorChange>>,
 }
 
 /// Bridges the consensus engine with the P2P network layer and reth Engine API.

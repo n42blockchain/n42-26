@@ -60,6 +60,10 @@ pub struct SyncBlock {
     pub commit_qc: QuorumCertificate,
     /// Serialized block payload (RLP or JSON encoded).
     pub payload: Vec<u8>,
+    /// Validator changes committed with this block (if any).
+    /// Needed so syncing nodes can reconstruct epoch transitions.
+    #[serde(default)]
+    pub validator_changes: Option<Vec<n42_primitives::consensus::ValidatorChange>>,
 }
 
 // ── libp2p request-response codec ──
@@ -174,6 +178,7 @@ mod tests {
                 signers: Default::default(),
             },
             payload: vec![1, 2, 3, 4],
+            validator_changes: None,
         }
     }
 

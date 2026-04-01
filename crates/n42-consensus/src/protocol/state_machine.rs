@@ -143,6 +143,8 @@ pub enum EngineOutput {
         view: ViewNumber,
         block_hash: B256,
         commit_qc: QuorumCertificate,
+        /// Validator changes committed with this block (if any).
+        validator_changes: Option<Vec<n42_primitives::consensus::ValidatorChange>>,
     },
     /// View change occurred; new view started.
     ViewChanged { new_view: ViewNumber },

@@ -163,8 +163,9 @@ impl ConsensusOrchestrator {
                 view,
                 block_hash,
                 commit_qc,
+                validator_changes,
             } => {
-                self.handle_block_committed(view, block_hash, commit_qc)
+                self.handle_block_committed(view, block_hash, commit_qc, validator_changes)
                     .await;
             }
             EngineOutput::ViewChanged { new_view } => {
@@ -321,6 +322,7 @@ impl ConsensusOrchestrator {
         view: u64,
         block_hash: B256,
         commit_qc: QuorumCertificate,
+        validator_changes: Option<Vec<n42_primitives::consensus::ValidatorChange>>,
     ) {
         self.committed_block_count += 1;
         counter!("n42_blocks_committed_total").increment(1);
@@ -392,7 +394,9 @@ impl ConsensusOrchestrator {
             let store = Arc::clone(evidence_store);
             let block_number = self.committed_block_count;
             let root = self.last_evidence_root;
-            tokio::task::spawn_blocking(move || {
+            // Await the write so evidence is on disk before snapshot persists
+            // committed_block_count — prevents stale root after crash.
+            let _ = tokio::task::spawn_blocking(move || {
                 if let Err(e) = store.put_raw(block_number, &encoded, &root_bytes) {
                     tracing::warn!(
                         target: "n42::cl::evidence",
@@ -406,10 +410,10 @@ impl ConsensusOrchestrator {
                         "consensus evidence stored"
                     );
                 }
-            });
+            }).await;
         }
 
-        self.store_committed_block(view, block_hash, commit_qc.clone());
+        self.store_committed_block(view, block_hash, commit_qc.clone(), validator_changes);
         self.head_block_hash = block_hash;
 
         // JMT background update: extract BundleState from pending block data.

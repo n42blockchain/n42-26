@@ -70,6 +70,9 @@ impl ConsensusEngine {
         self.round_state.update_locked_qc(&decide.commit_qc);
         self.round_state.commit(decide.commit_qc.clone());
 
+        // Capture changes before commit clears them.
+        let committed_changes = self.epoch_manager.pending_changes_for_proposal();
+
         // Commit-then-Activate: if validator changes were proposed, stage them now.
         if self.epoch_manager.has_pending_changes() {
             self.epoch_manager.commit_pending_changes()?;
@@ -98,6 +101,7 @@ impl ConsensusEngine {
             view: decide.view,
             block_hash: decide.block_hash,
             commit_qc: decide.commit_qc,
+            validator_changes: committed_changes,
         })?;
 
         let next_view = decide.view.saturating_add(1);

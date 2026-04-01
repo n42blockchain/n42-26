@@ -125,6 +125,7 @@ impl ConsensusOrchestrator {
         view: u64,
         block_hash: B256,
         commit_qc: QuorumCertificate,
+        validator_changes: Option<Vec<n42_primitives::consensus::ValidatorChange>>,
     ) {
         let payload = self
             .pending_block_data
@@ -141,6 +142,7 @@ impl ConsensusOrchestrator {
             block_hash,
             commit_qc,
             payload,
+            validator_changes,
         });
     }
 }
@@ -235,6 +237,7 @@ impl ConsensusOrchestrator {
                 block_hash: b.block_hash,
                 commit_qc: b.commit_qc.clone(),
                 payload: b.payload.clone(),
+                validator_changes: b.validator_changes.clone(),
             })
             .collect();
 
@@ -312,6 +315,44 @@ impl ConsensusOrchestrator {
                 }
             }
 
+            // Update consensus metadata that payload building depends on.
+            self.committed_block_count += 1;
+            self.prev_randao_cache = alloy_primitives::keccak256(
+                sync_block.commit_qc.aggregate_signature.to_bytes(),
+            );
+
+            // Write evidence to MDBX (same as normal commit path).
+            if let Some(ref evidence_store) = self.evidence_store {
+                let evidence = n42_jmt::ConsensusEvidence {
+                    view: sync_block.view,
+                    block_hash: sync_block.block_hash.0,
+                    aggregate_signature: sync_block.commit_qc.aggregate_signature.to_bytes(),
+                    signer_count: u16::try_from(sync_block.commit_qc.signers.len()).unwrap_or(u16::MAX),
+                    packed_signers: sync_block.commit_qc.signers.as_raw_slice().to_vec(),
+                    mobile: None,
+                };
+                let encoded = evidence.encode();
+                let root_bytes = *blake3::hash(&encoded).as_bytes();
+                self.last_evidence_root = alloy_primitives::B256::from(root_bytes);
+                let store = std::sync::Arc::clone(evidence_store);
+                let bn = self.committed_block_count;
+                tokio::task::spawn_blocking(move || {
+                    if let Err(e) = store.put_raw(bn, &encoded, &root_bytes) {
+                        tracing::warn!(target: "n42::cl::sync", block = bn, error = %e, "evidence write failed");
+                    }
+                });
+            }
+
+            // Apply validator changes from the synced block to the epoch manager.
+            if let Some(ref changes) = sync_block.validator_changes {
+                self.engine.epoch_manager_mut().replace_pending_from_proposal(changes);
+                if self.engine.epoch_manager().has_pending_changes() {
+                    if let Err(e) = self.engine.epoch_manager_mut().commit_pending_changes() {
+                        tracing::warn!(target: "n42::cl::sync", view = sync_block.view, error = %e, "sync: commit validator changes failed");
+                    }
+                }
+            }
+
             if self.committed_blocks.len() >= max_committed_blocks() {
                 self.committed_blocks.pop_front();
             }
@@ -320,10 +361,14 @@ impl ConsensusOrchestrator {
                 block_hash: sync_block.block_hash,
                 commit_qc: sync_block.commit_qc.clone(),
                 payload: sync_block.payload.clone(),
+                validator_changes: sync_block.validator_changes.clone(),
             });
 
             imported += 1;
         }
+
+        // Save snapshot after sync batch to persist updated committed_block_count.
+        self.save_consensus_state();
 
         info!(target: "n42::cl::sync", imported, peer_committed_view = response.peer_committed_view, "state sync blocks imported");
 
