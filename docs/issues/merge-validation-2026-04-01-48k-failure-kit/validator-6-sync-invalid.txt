@@ -1,0 +1,14 @@
+2026-04-01T19:52:09.204729Z WARN  Bad block with existing invalid ancestor hash=0xde157885fa50946a02966e3939f331acd26e47de651df63c469205d3cb9401a4 invalid_ancestor=BlockWithParent { parent: 0x84cff5dcaec414a905038a6a845b73e49d0554af591213151ff9e08299007115, block: NumHash { number: 303, hash: 0xa8abbabbe12b9f7376c08b5826592dd17141f7a7ed79160299e912f2b6d3cf76 } }
+2026-04-01T19:52:09.225222Z WARN  bg import: new_payload rejected block_hash=0xde157885fa50946a02966e3939f331acd26e47de651df63c469205d3cb9401a4 status=Invalid { validation_error: "links to previously rejected block" }
+2026-04-01T19:52:09.225973Z WARN  background import FAILED, requesting sync hash=0xde157885fa50946a02966e3939f331acd26e47de651df63c469205d3cb9401a4 view=316
+2026-04-01T19:52:09.225989Z WARN  sync request timed out, resetting elapsed_secs=60
+2026-04-01T19:52:09.225996Z INFO  initiating state sync peer=12D3KooWQEZaAncNJ74fs5SzpaUQXexTtprYwG26WdJ2iZPfWPco local_view=316 target_view=317
+2026-04-01T19:52:09.253575Z WARN  Encountered invalid block number=309 hash=0xde157885fa50946a02966e3939f331acd26e47de651df63c469205d3cb9401a4
+2026-04-01T19:52:09.608028Z INFO  received sync response peer=12D3KooWQEZaAncNJ74fs5SzpaUQXexTtprYwG26WdJ2iZPfWPco blocks=0 peer_committed_view=316
+2026-04-01T19:52:09.841682Z WARN  Encountered invalid block number=309 hash=0xde157885fa50946a02966e3939f331acd26e47de651df63c469205d3cb9401a4
+2026-04-01T19:52:32.372182Z WARN  pacemaker timeout, initiating view change view=321
+2026-04-01T19:52:32.372225Z WARN  view timed out view=321
+2026-04-01T19:52:32.383609Z WARN  timestamp <= last committed block, bumping to avoid Engine API rejection proposed=1775073152 last_committed=1775073208 bumped_to=1775073209
+2026-04-01T19:52:32.383720Z WARN  fork_choice_updated did not return payload_id, scheduling retry
+2026-04-01T19:53:02.419307Z WARN  pacemaker timeout, initiating view change view=322
+2026-04-01T19:53:02.419333Z WARN  view timed out view=322

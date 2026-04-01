@@ -1,0 +1,12 @@
+2026-04-01T19:52:42.399694Z WARN  timestamp <= last committed block, bumping to avoid Engine API rejection proposed=1775073162 last_committed=1775073208 bumped_to=1775073209
+2026-04-01T19:52:42.399856Z WARN  fork_choice_updated did not return payload_id, scheduling retry
+2026-04-01T19:52:42.399866Z INFO  build retry scheduled in 2s (reth may be syncing)
+2026-04-01T19:52:44.401776Z INFO  build retry timer fired, re-attempting payload build view=322
+2026-04-01T19:52:44.401817Z WARN  timestamp <= last committed block, bumping to avoid Engine API rejection proposed=1775073164 last_committed=1775073208 bumped_to=1775073209
+2026-04-01T19:52:44.401915Z WARN  fork_choice_updated did not return payload_id, scheduling retry
+2026-04-01T19:52:44.401934Z INFO  build retry scheduled in 2s (reth may be syncing)
+2026-04-01T19:53:10.444027Z WARN  timestamp <= last committed block, bumping to avoid Engine API rejection proposed=1775073190 last_committed=1775073208 bumped_to=1775073209
+2026-04-01T19:53:10.444111Z WARN  fork_choice_updated did not return payload_id, scheduling retry
+2026-04-01T19:53:10.444130Z INFO  build retry scheduled in 2s (reth may be syncing)
+2026-04-01T19:53:12.402622Z WARN  pacemaker timeout, initiating view change view=322
+2026-04-01T19:53:12.402678Z WARN  view timed out view=322

@@ -1,0 +1,15 @@
+2026-04-01T19:51:02.124473Z WARN  Bad block with existing invalid ancestor hash=0xedf27497040da1f563a1054d44ed6320fca0568809ddcdfe89ead51e0726c62f invalid_ancestor=BlockWithParent { parent: 0x93b40678143919113ac5ec627681ff32e79af2892e7005c168505abfb9dbf634, block: NumHash { number: 300, hash: 0xd0a58739ace8fc0f6cbb32cea11e2050a2ac56d5fade04cae9cfc1380f6e0579 } }
+2026-04-01T19:51:02.124680Z WARN  bg import: new_payload rejected block_hash=0xedf27497040da1f563a1054d44ed6320fca0568809ddcdfe89ead51e0726c62f status=Invalid { validation_error: "links to previously rejected block" }
+2026-04-01T19:51:02.124937Z WARN  background import FAILED, requesting sync hash=0xedf27497040da1f563a1054d44ed6320fca0568809ddcdfe89ead51e0726c62f view=309
+2026-04-01T19:51:02.124959Z INFO  initiating state sync peer=12D3KooWS3rxnFmCMgUNm2jFXFnEe7tFXNQg7PDX5kLnr7kBV8HV local_view=309 target_view=310
+2026-04-01T19:51:02.149952Z INFO  received sync response peer=12D3KooWS3rxnFmCMgUNm2jFXFnEe7tFXNQg7PDX5kLnr7kBV8HV blocks=0 peer_committed_view=309
+2026-04-01T19:51:07.326029Z WARN  Encountered invalid block number=300 hash=0xd0a58739ace8fc0f6cbb32cea11e2050a2ac56d5fade04cae9cfc1380f6e0579
+2026-04-01T19:51:07.328584Z WARN  Bad block with existing invalid ancestor hash=0x84cff5dcaec414a905038a6a845b73e49d0554af591213151ff9e08299007115 invalid_ancestor=BlockWithParent { parent: 0x93b40678143919113ac5ec627681ff32e79af2892e7005c168505abfb9dbf634, block: NumHash { number: 300, hash: 0xd0a58739ace8fc0f6cbb32cea11e2050a2ac56d5fade04cae9cfc1380f6e0579 } }
+2026-04-01T19:51:07.331044Z WARN  Encountered invalid block number=301 hash=0x6842031e27b20c38adb39a74a4458e6a8c2b2cef82b050f6d667c87eed1ea265
+2026-04-01T19:51:07.335876Z WARN  Encountered invalid block number=302 hash=0x84cff5dcaec414a905038a6a845b73e49d0554af591213151ff9e08299007115
+2026-04-01T19:51:07.340373Z WARN  Encountered invalid block number=303 hash=0xa8abbabbe12b9f7376c08b5826592dd17141f7a7ed79160299e912f2b6d3cf76
+2026-04-01T19:51:07.356124Z WARN  Encountered invalid block number=304 hash=0x2c013ae052989c7a33d65d66c4eff9e6106f7c051b5ed2c0a6e5e427e69dcc7a
+2026-04-01T19:51:07.359745Z WARN  Encountered invalid block number=305 hash=0xedf27497040da1f563a1054d44ed6320fca0568809ddcdfe89ead51e0726c62f
+2026-04-01T19:52:11.922454Z WARN  Bad block with existing invalid ancestor hash=0xc044e2a61b251617b17d79d97471e0786f3b6e2a28a8373d7888314546b9bf93 invalid_ancestor=BlockWithParent { parent: 0x93b40678143919113ac5ec627681ff32e79af2892e7005c168505abfb9dbf634, block: NumHash { number: 300, hash: 0xd0a58739ace8fc0f6cbb32cea11e2050a2ac56d5fade04cae9cfc1380f6e0579 } }
+2026-04-01T19:52:11.928716Z WARN  bg import: new_payload rejected block_hash=0xc044e2a61b251617b17d79d97471e0786f3b6e2a28a8373d7888314546b9bf93 status=Invalid { validation_error: "links to previously rejected block" }
+2026-04-01T19:52:11.928753Z WARN  background import FAILED, requesting sync hash=0xc044e2a61b251617b17d79d97471e0786f3b6e2a28a8373d7888314546b9bf93 view=318
