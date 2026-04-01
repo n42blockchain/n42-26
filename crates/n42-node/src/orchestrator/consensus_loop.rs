@@ -786,7 +786,7 @@ impl ConsensusOrchestrator {
                 (true, block_timestamp)
             }
             Ok(status) => {
-                if matches!(status.status, PayloadStatusEnum::Invalid) {
+                if matches!(&status.status, PayloadStatusEnum::Invalid { .. }) {
                     error!(
                         target: "n42::cl::consensus_loop",
                         %block_hash,
