@@ -372,6 +372,43 @@ impl ConsensusOrchestrator {
 
         self.prev_randao_cache = alloy_primitives::keccak256(commit_qc.aggregate_signature.to_bytes());
         self.last_commit_qc = Some(commit_qc.clone());
+
+        // Build and persist ConsensusEvidence; cache evidence root for next block's
+        // parent_beacon_block_root (replaces the previous hardcoded B256::ZERO).
+        // committed_block_count was incremented above; it equals the new block's number.
+        if let Some(ref evidence_store) = self.evidence_store {
+            let evidence = n42_jmt::ConsensusEvidence {
+                view: commit_qc.view,
+                block_hash: block_hash.0,
+                aggregate_signature: commit_qc.aggregate_signature.to_bytes(),
+                signer_count: u16::try_from(commit_qc.signers.len()).unwrap_or(u16::MAX),
+                packed_signers: commit_qc.signers.as_raw_slice().to_vec(),
+                mobile: None, // TODO: wire AttestationStore for mobile evidence
+            };
+            let encoded = evidence.encode();
+            let root_bytes = *blake3::hash(&encoded).as_bytes();
+            self.last_evidence_root = B256::from(root_bytes);
+
+            let store = Arc::clone(evidence_store);
+            let block_number = self.committed_block_count;
+            let root = self.last_evidence_root;
+            tokio::task::spawn_blocking(move || {
+                if let Err(e) = store.put_raw(block_number, &encoded, &root_bytes) {
+                    tracing::warn!(
+                        target: "n42::cl::evidence",
+                        block_number, error = %e,
+                        "failed to store consensus evidence"
+                    );
+                } else {
+                    tracing::debug!(
+                        target: "n42::cl::evidence",
+                        block_number, %root,
+                        "consensus evidence stored"
+                    );
+                }
+            });
+        }
+
         self.store_committed_block(view, block_hash, commit_qc.clone());
         self.head_block_hash = block_hash;
 

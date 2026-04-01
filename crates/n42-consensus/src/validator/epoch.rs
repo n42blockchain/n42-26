@@ -2,6 +2,7 @@ use super::set::ValidatorSet;
 use crate::error::{ConsensusError, ConsensusResult};
 use alloy_primitives::Address;
 use n42_chainspec::ValidatorInfo;
+use n42_primitives::consensus::ValidatorChange;
 use std::collections::BTreeMap;
 
 /// Maximum number of historical epoch validator sets to retain.
@@ -387,6 +388,8 @@ impl EpochManager {
             .chain(self.pending_adds.iter().cloned())
             .collect();
         new_validators.sort_by_key(|v| v.address);
+        // Reject duplicate addresses (could happen with crafted Add+Remove of same addr).
+        new_validators.dedup_by_key(|v| v.address);
 
         // Capture counts before staging so the log is accurate even if stage fails.
         let adds_count = self.pending_adds.len();
@@ -413,6 +416,86 @@ impl EpochManager {
         self.pending_removes.clear();
 
         Ok(())
+    }
+
+    /// Returns pending validator changes for inclusion in a [`Proposal`] message.
+    ///
+    /// Returns `None` if there are no pending changes.  Does **not** drain the
+    /// pending queues — the leader keeps them so that `commit_pending_changes()`
+    /// still finds them at CommitQC time.
+    pub fn pending_changes_for_proposal(&self) -> Option<Vec<ValidatorChange>> {
+        if !self.has_pending_changes() {
+            return None;
+        }
+        let mut changes = Vec::with_capacity(self.pending_adds.len() + self.pending_removes.len());
+        for info in &self.pending_adds {
+            changes.push(ValidatorChange::Add {
+                address: info.address,
+                bls_public_key: info.bls_public_key.clone(),
+                p2p_peer_id: info.p2p_peer_id.clone(),
+            });
+        }
+        for &addr in &self.pending_removes {
+            changes.push(ValidatorChange::Remove { address: addr });
+        }
+        Some(changes)
+    }
+
+    /// Replaces local pending queues with the leader's proposed changes.
+    ///
+    /// Called by followers in `process_proposal()` so that every validator
+    /// applies the **same** changes at CommitQC time, preventing split-brain.
+    pub fn replace_pending_from_proposal(&mut self, changes: &[ValidatorChange]) {
+        self.pending_adds.clear();
+        self.pending_removes.clear();
+        for change in changes {
+            match change {
+                ValidatorChange::Add {
+                    address,
+                    bls_public_key,
+                    p2p_peer_id,
+                } => {
+                    self.pending_adds.push(ValidatorInfo {
+                        address: *address,
+                        bls_public_key: bls_public_key.clone(),
+                        p2p_peer_id: p2p_peer_id.clone(),
+                    });
+                }
+                ValidatorChange::Remove { address } => {
+                    self.pending_removes.push(*address);
+                }
+            }
+        }
+    }
+
+    /// Clears all pending validator changes without committing them.
+    ///
+    /// Called when a follower receives a proposal with no `validator_changes`
+    /// — any locally queued changes must be discarded to stay consistent
+    /// with the leader (which chose not to include changes).
+    pub fn clear_pending_changes(&mut self) {
+        if self.has_pending_changes() {
+            let adds = self.pending_adds.len();
+            let removes = self.pending_removes.len();
+            self.pending_adds.clear();
+            self.pending_removes.clear();
+            tracing::warn!(
+                target: "n42::cl::epoch",
+                adds,
+                removes,
+                "discarded local pending validator changes (leader proposal had none)"
+            );
+        }
+    }
+
+    /// Returns a reference to the staged next validator set, if any.
+    ///
+    /// Used to pre-check whether the local validator key will be present
+    /// in the next set *before* calling `advance_epoch()`, preventing the
+    /// irrecoverable state where the epoch advances but `sync_local_validator_index`
+    /// fails.
+    pub fn peek_next_set(&self) -> Option<&ValidatorSet> {
+        self.next_set.as_ref()
     }
 
     /// Validates that a proposed new validator set satisfies safety invariants:

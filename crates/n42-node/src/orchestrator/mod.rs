@@ -337,6 +337,12 @@ pub struct ConsensusOrchestrator {
     allow_deterministic_validator_peers: bool,
     /// Admin command receiver for RPC-originated validator reconfig requests.
     admin_rx: Option<mpsc::Receiver<crate::consensus_state::AdminCommand>>,
+    /// MDBX-backed store for per-block consensus evidence (QC + mobile attestation).
+    /// Shares the JMT MDBX environment. Written after each committed block.
+    evidence_store: Option<Arc<n42_jmt::EvidenceStore>>,
+    /// Cached Blake3 hash of the last committed block's `ConsensusEvidence`.
+    /// Used as `parent_beacon_block_root` when building the next block's payload.
+    last_evidence_root: B256,
 }
 
 impl ConsensusOrchestrator {
@@ -417,6 +423,8 @@ impl ConsensusOrchestrator {
             zk_scheduler: None,
             allow_deterministic_validator_peers: true,
             admin_rx: None,
+            evidence_store: None,
+            last_evidence_root: B256::ZERO,
         }
     }
 
@@ -595,6 +603,8 @@ impl ConsensusOrchestrator {
             zk_scheduler: None,
             allow_deterministic_validator_peers: true,
             admin_rx: None,
+            evidence_store: None,
+            last_evidence_root: B256::ZERO,
         }
     }
 
@@ -676,6 +686,18 @@ impl ConsensusOrchestrator {
     /// Installs the admin command receiver for RPC-originated validator reconfig requests.
     pub fn with_admin_rx(mut self, rx: mpsc::Receiver<crate::consensus_state::AdminCommand>) -> Self {
         self.admin_rx = Some(rx);
+        self
+    }
+
+    /// Attaches the MDBX-backed evidence store for persisting per-block consensus evidence.
+    pub fn with_evidence_store(mut self, store: Arc<n42_jmt::EvidenceStore>) -> Self {
+        self.evidence_store = Some(store);
+        self
+    }
+
+    /// Restores the evidence root from the last committed block (crash recovery).
+    pub fn with_recovered_evidence_root(mut self, root: B256) -> Self {
+        self.last_evidence_root = root;
         self
     }
 

@@ -1260,6 +1260,7 @@ mod fault_tolerance {
             signature: sig,
             prepare_qc: None,
             tx_root_hash: None,
+            validator_changes: None,
         };
 
         // Non-leader should reject this proposal as a safety violation
@@ -1298,6 +1299,7 @@ mod fault_tolerance {
             signature: sig,
             prepare_qc: None,
             tx_root_hash: None,
+            validator_changes: None,
         };
 
         let result = harness.engines[2].process_event(ConsensusEvent::Message(

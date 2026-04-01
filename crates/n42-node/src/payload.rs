@@ -67,9 +67,9 @@ where
 
 /// Inner payload builder using the standard Ethereum payload flow.
 ///
-/// Note: QC data is NOT injected into extra_data because the Engine API enforces
-/// a 32-byte limit incompatible with N42's QC encoding (~200 bytes). The QC is
-/// stored separately in `SharedConsensusState`.
+/// Consensus evidence (QC + optional mobile attestation) is stored in the MDBX
+/// `n42_consensus_evidence` table and referenced via `parent_beacon_block_root`
+/// (Blake3 hash of the evidence).  `extra_data` follows standard Ethereum limits.
 #[derive(Debug, Clone)]
 pub struct N42InnerPayloadBuilder<Pool, Client, Evm> {
     client: Client,

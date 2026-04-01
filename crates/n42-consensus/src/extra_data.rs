@@ -4,6 +4,10 @@ use reth_consensus::ConsensusError;
 
 /// Magic prefix identifying N42 QC data in header extra_data.
 /// ASCII "N42Q" = [0x4E, 0x34, 0x32, 0x51]
+///
+/// **Legacy format**: consensus evidence is now stored in the MDBX
+/// `n42_consensus_evidence` table and referenced via `parent_beacon_block_root`.
+/// This encoder/decoder is kept for backward compatibility with pre-migration blocks.
 const QC_MAGIC: &[u8; 4] = b"N42Q";
 
 /// Extracts a QuorumCertificate from a block header's extra_data field.

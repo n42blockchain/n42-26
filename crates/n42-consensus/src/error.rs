@@ -124,6 +124,10 @@ pub enum ConsensusError {
     /// at the next epoch boundary.
     #[error("epoch transition already staged; wait for the current staged set to be activated before proposing further changes")]
     EpochTransitionAlreadyStaged,
+
+    /// A proposal contained too many validator changes (DoS protection).
+    #[error("proposal contains {count} validator changes, max allowed is {max}")]
+    TooManyValidatorChanges { count: usize, max: usize },
 }
 
 /// Result type for consensus operations.

@@ -13,7 +13,7 @@ use super::quorum::{
     signing_message, timeout_signing_message,
 };
 use super::round::{Phase, RoundState};
-use crate::error::{ConsensusError, ConsensusResult};
+use crate::error::ConsensusResult;
 use crate::validator::{EpochManager, LeaderSelector, ValidatorSet};
 
 /// Per-view timing tracker for diagnosing consensus commit latency.
@@ -719,15 +719,50 @@ impl ConsensusEngine {
         // Save current PrepareQC for piggybacking into the next Proposal (chained mode).
         self.previous_prepare_qc = self.prepare_qc.take();
 
-        // Check epoch boundary.
+        // Pre-validate local key presence BEFORE advancing epoch (irreversible).
         if self.epoch_manager.epochs_enabled()
             && self.epoch_manager.is_epoch_boundary(new_view)
-            && self.epoch_manager.advance_epoch()
+            && self.epoch_manager.has_staged_next()
         {
+            let local_in_next = self
+                .epoch_manager
+                .peek_next_set()
+                .and_then(|set| set.index_of_public_key(&self.local_public_key));
+
+            let advanced = self.epoch_manager.advance_epoch();
+            debug_assert!(advanced, "advance_epoch must succeed when has_staged_next is true");
+
             let new_epoch = self.epoch_manager.current_epoch();
-            self.sync_local_validator_index()?;
             let validator_count = self.validator_set().len();
-            tracing::info!(target: "n42::cl::engine", new_epoch, validator_count, view = new_view, "epoch transition at view boundary");
+
+            if let Some(new_index) = local_in_next {
+                if new_index != self.my_index {
+                    tracing::info!(
+                        target: "n42::cl::engine",
+                        old_index = self.my_index,
+                        new_index,
+                        new_epoch,
+                        "updated local validator index for new epoch"
+                    );
+                    self.my_index = new_index;
+                }
+            } else {
+                tracing::error!(
+                    target: "n42::cl::engine",
+                    new_epoch,
+                    validator_count,
+                    "local validator NOT in new epoch's validator set — \
+                     consensus participation disabled; node continues syncing blocks"
+                );
+            }
+
+            tracing::info!(
+                target: "n42::cl::engine",
+                new_epoch,
+                validator_count,
+                view = new_view,
+                "epoch transition at view boundary"
+            );
             self.emit(EngineOutput::EpochTransition {
                 new_epoch,
                 validator_count,
@@ -774,28 +809,6 @@ impl ConsensusEngine {
         }
 
         tracing::debug!(target: "n42::cl::engine", view = new_view, "advanced to new view");
-        Ok(())
-    }
-
-    fn sync_local_validator_index(&mut self) -> ConsensusResult<()> {
-        let new_index = self
-            .validator_set()
-            .index_of_public_key(&self.local_public_key)
-            .ok_or(ConsensusError::LocalValidatorNotInSet {
-                epoch: self.epoch_manager.current_epoch(),
-            })?;
-
-        if new_index != self.my_index {
-            tracing::info!(
-                target: "n42::cl::engine",
-                old_index = self.my_index,
-                new_index,
-                epoch = self.epoch_manager.current_epoch(),
-                "updated local validator index for new epoch"
-            );
-            self.my_index = new_index;
-        }
-
         Ok(())
     }
 
@@ -1292,6 +1305,7 @@ mod tests {
             signature: sig,
             prepare_qc: None,
             tx_root_hash: None,
+            validator_changes: None,
         };
 
         // Stale proposals are silently discarded by the pre-filter.
@@ -1316,6 +1330,7 @@ mod tests {
             signature: sig,
             prepare_qc: None,
             tx_root_hash: None,
+            validator_changes: None,
         };
 
         let result = engine.process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(
@@ -1348,6 +1363,7 @@ mod tests {
             signature: sks[1].sign(&msg),
             prepare_qc: None,
             tx_root_hash: None,
+            validator_changes: None,
         };
 
         engine
@@ -1396,6 +1412,7 @@ mod tests {
             signature: sks[1].sign(&msg),
             prepare_qc: None,
             tx_root_hash: None,
+            validator_changes: None,
         };
 
         engine
@@ -1431,6 +1448,7 @@ mod tests {
             signature: sks[1].sign(&msg),
             prepare_qc: None,
             tx_root_hash: None,
+            validator_changes: None,
         };
         engine
             .process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(
@@ -1626,6 +1644,7 @@ mod tests {
             signature: sks[1].sign(&prop_msg),
             prepare_qc: None,
             tx_root_hash: None,
+            validator_changes: None,
         };
         engine
             .process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(
@@ -1692,6 +1711,7 @@ mod tests {
             signature: sks[1].sign(&prop_msg),
             prepare_qc: None,
             tx_root_hash: None,
+            validator_changes: None,
         };
         engine
             .process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(
@@ -1751,6 +1771,7 @@ mod tests {
             signature: sks[1].sign(&prop_msg),
             prepare_qc: None,
             tx_root_hash: None,
+            validator_changes: None,
         };
         engine
             .process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(
@@ -2057,6 +2078,7 @@ mod tests {
             view,
             block_hash,
             commit_qc,
+            validator_changes: None,
         };
 
         engine
@@ -2093,6 +2115,7 @@ mod tests {
                     view: v,
                     block_hash: bh,
                     commit_qc: cqc,
+                    validator_changes: None,
                 })));
             while rx.try_recv().is_ok() {}
         }
@@ -2104,6 +2127,7 @@ mod tests {
                 view: 3,
                 block_hash,
                 commit_qc,
+                validator_changes: None,
             })))
             .expect("stale Decide should be ignored without error");
 
@@ -2134,6 +2158,7 @@ mod tests {
                 view,
                 block_hash,
                 commit_qc: weak_qc,
+                validator_changes: None,
             })));
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -2177,6 +2202,7 @@ mod tests {
                 view,
                 block_hash,
                 commit_qc: forged_qc,
+                validator_changes: None,
             })));
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -2238,6 +2264,7 @@ mod tests {
             signature: sks[0].sign(&msg),
             prepare_qc: None,
             tx_root_hash: None,
+            validator_changes: None,
         };
 
         engine
@@ -2285,6 +2312,7 @@ mod tests {
             signature: sks[0].sign(&msg),
             prepare_qc: None,
             tx_root_hash: None,
+            validator_changes: None,
         };
 
         engine
@@ -2422,6 +2450,7 @@ mod tests {
             signature: sks[0].sign(&msg),
             prepare_qc: None,
             tx_root_hash: None,
+            validator_changes: None,
         };
 
         engine
@@ -2450,6 +2479,7 @@ mod tests {
             signature: sks[0].sign(&msg),
             prepare_qc: None,
             tx_root_hash: None,
+            validator_changes: None,
         };
 
         engine
@@ -2484,6 +2514,7 @@ mod tests {
             signature: sks[0].sign(&msg),
             prepare_qc: None,
             tx_root_hash: None,
+            validator_changes: None,
         };
 
         engine
@@ -2516,6 +2547,7 @@ mod tests {
             signature: sks[0].sign(&msg),
             prepare_qc: None,
             tx_root_hash: None,
+            validator_changes: None,
         };
 
         engine
@@ -2540,6 +2572,7 @@ mod tests {
             view: 1,
             block_hash: B256::repeat_byte(0x01),
             commit_qc,
+            validator_changes: None,
         })));
         while rx.try_recv().is_ok() {}
 
@@ -2548,6 +2581,7 @@ mod tests {
             view: 2,
             block_hash: B256::repeat_byte(0x02),
             commit_qc: commit_qc2,
+            validator_changes: None,
         })));
         while rx.try_recv().is_ok() {}
 
@@ -2615,6 +2649,7 @@ mod tests {
             view: far_view,
             block_hash,
             commit_qc,
+            validator_changes: None,
         };
 
         engine
@@ -2843,6 +2878,7 @@ mod tests {
                     view: v,
                     block_hash: bh,
                     commit_qc: cqc,
+                    validator_changes: None,
                 })));
             while rx.try_recv().is_ok() {}
         }
@@ -2863,6 +2899,7 @@ mod tests {
                     view: v,
                     block_hash: bh,
                     commit_qc: cqc,
+                    validator_changes: None,
                 })));
         }
         while rx.try_recv().is_ok() {}
@@ -2948,6 +2985,7 @@ mod tests {
             signature: sks[0].sign(&msg),
             prepare_qc: None,
             tx_root_hash: None,
+            validator_changes: None,
         };
 
         engine
@@ -2991,6 +3029,7 @@ mod tests {
             signature: sks[0].sign(&msg),
             prepare_qc: None,
             tx_root_hash: None,
+            validator_changes: None,
         };
 
         engine

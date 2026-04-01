@@ -71,7 +71,7 @@ impl ConsensusOrchestrator {
     /// Builds a snapshot of the current consensus state for persistence.
     fn build_snapshot(&self) -> ConsensusSnapshot {
         ConsensusSnapshot {
-            version: 1,
+            version: 2,
             current_view: self.engine.current_view(),
             locked_qc: self.engine.locked_qc().clone(),
             last_committed_qc: self.engine.last_committed_qc().clone(),

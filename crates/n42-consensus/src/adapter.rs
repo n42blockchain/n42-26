@@ -1,4 +1,6 @@
+use alloy_primitives::B256;
 use arc_swap::ArcSwapOption;
+use n42_jmt::EvidenceStore;
 use reth_chainspec::{ChainSpec, EthChainSpec, EthereumHardforks};
 use reth_consensus::{Consensus, ConsensusError, FullConsensus, HeaderValidator};
 use reth_ethereum_consensus::EthBeaconConsensus;
@@ -35,6 +37,10 @@ pub struct N42Consensus<C = ChainSpec> {
     validator_set: Arc<ArcSwapOption<ValidatorSet>>,
     /// Optional epoch-aware validator-set resolver for QC verification.
     validator_set_resolver: Option<ValidatorSetResolver>,
+    /// Optional evidence store for verifying `parent_beacon_block_root`.
+    /// In N42, this header field stores `Blake3(ConsensusEvidence)` of the
+    /// parent block rather than a beacon chain root.
+    evidence_store: Option<Arc<EvidenceStore>>,
 }
 
 impl<C> std::fmt::Debug for N42Consensus<C> {
@@ -45,6 +51,7 @@ impl<C> std::fmt::Debug for N42Consensus<C> {
                 "has_validator_set_resolver",
                 &self.validator_set_resolver.is_some(),
             )
+            .field("has_evidence_store", &self.evidence_store.is_some())
             .finish()
     }
 }
@@ -53,19 +60,14 @@ impl<C> N42Consensus<C>
 where
     C: EthChainSpec + EthereumHardforks,
 {
-    /// Maximum extra_data size for N42 blocks.
-    /// N42 stores QuorumCertificate (BLS aggregate signature + signer bitmap)
-    /// in the header extra_data field, which exceeds Ethereum's default 32-byte limit.
-    const MAX_EXTRA_DATA_SIZE: usize = 4096;
-
     /// Create a new N42 consensus adapter (without validator set).
     /// QC verification is skipped until `set_validator_set` is called.
     pub fn new(chain_spec: Arc<C>) -> Self {
         Self {
-            inner: EthBeaconConsensus::new(chain_spec)
-                .with_max_extra_data_size(Self::MAX_EXTRA_DATA_SIZE),
+            inner: EthBeaconConsensus::new(chain_spec),
             validator_set: Arc::new(ArcSwapOption::empty()),
             validator_set_resolver: None,
+            evidence_store: None,
         }
     }
 
@@ -93,11 +95,17 @@ where
         validator_set_resolver: Option<ValidatorSetResolver>,
     ) -> Self {
         Self {
-            inner: EthBeaconConsensus::new(chain_spec)
-                .with_max_extra_data_size(Self::MAX_EXTRA_DATA_SIZE),
+            inner: EthBeaconConsensus::new(chain_spec),
             validator_set,
             validator_set_resolver,
+            evidence_store: None,
         }
+    }
+
+    /// Attaches an evidence store for `parent_beacon_block_root` verification.
+    pub fn with_evidence_store(mut self, store: Arc<EvidenceStore>) -> Self {
+        self.evidence_store = Some(store);
+        self
     }
 
     /// Sets or updates the validator set.
@@ -131,6 +139,7 @@ where
             receipt_root_bloom,
         )?;
 
+        // Legacy v1: QC embedded in extra_data (blocks produced before evidence-root migration).
         let extra_data = block.header().extra_data();
         if let Some(qc) = extract_qc_from_extra_data(extra_data)?
             && let Some(vs) = self.validator_set_for_view(qc.view)
@@ -138,6 +147,51 @@ where
             verify_qc(&qc, &vs)
                 .or_else(|_| verify_commit_qc(&qc, &vs))
                 .map_err(|e| ConsensusError::Other(e.to_string()))?;
+        }
+
+        // v2: Verify parent_beacon_block_root == Blake3(ConsensusEvidence) of parent block.
+        // In N42 this field stores the consensus evidence root, not a beacon chain root.
+        if let Some(ref evidence_store) = self.evidence_store {
+            if let Some(claimed_root) = block.header().parent_beacon_block_root() {
+                let block_number = block.header().number();
+                if block_number <= 1 {
+                    // Genesis/block-1: no parent evidence, B256::ZERO is acceptable.
+                    if claimed_root != B256::ZERO {
+                        return Err(ConsensusError::Other(format!(
+                            "block {block_number}: parent_beacon_block_root should be zero for early blocks"
+                        )));
+                    }
+                } else {
+                    let parent_number = block_number - 1;
+                    match evidence_store.get_root(parent_number) {
+                        Ok(Some(stored_root)) => {
+                            let expected = B256::from(stored_root);
+                            if claimed_root != expected {
+                                return Err(ConsensusError::Other(format!(
+                                    "block {block_number}: parent_beacon_block_root mismatch \
+                                     (header={claimed_root}, expected={expected})"
+                                )));
+                            }
+                        }
+                        Ok(None) => {
+                            tracing::debug!(
+                                target: "n42::consensus",
+                                block_number,
+                                parent_number,
+                                "no consensus evidence for parent, skipping root verification"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                target: "n42::consensus",
+                                block_number,
+                                error = %e,
+                                "evidence store read error, skipping root verification"
+                            );
+                        }
+                    }
+                }
+            }
         }
 
         Ok(())
@@ -278,15 +332,6 @@ mod tests {
 
         let fallback = consensus.validator_set_for_view(1).unwrap();
         assert_eq!(fallback.len(), expected_current_len);
-    }
-
-    #[test]
-    fn test_max_extra_data_size() {
-        assert_eq!(
-            N42Consensus::<ChainSpec>::MAX_EXTRA_DATA_SIZE,
-            4096,
-            "MAX_EXTRA_DATA_SIZE must be 4096 for QC storage"
-        );
     }
 
     /// End-to-end test of the QC verification path used by adapter:

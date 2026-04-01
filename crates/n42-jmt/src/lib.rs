@@ -1,4 +1,5 @@
 pub mod disk_store;
+pub mod evidence_store;
 pub mod hasher;
 pub mod keys;
 pub mod metrics;
@@ -14,5 +15,6 @@ pub use proof::{JmtProof, VerifyError};
 pub use sharded::{ShardedJmt, combine_shard_roots};
 pub use snapshot::{JmtSnapshot, load_snapshot, save_snapshot};
 pub use disk_store::{DiskTreeStore, open_jmt_env};
+pub use evidence_store::{ConsensusEvidence, EvidenceStore, MobileEvidence};
 pub use store::{MemTreeStore, TreeStore};
 pub use tree::{N42JmtTree, decode_code_hash, encode_account_value};

@@ -248,6 +248,9 @@ impl ConsensusEngine {
 
         self.round_state.commit(commit_qc.clone());
 
+        // Capture pending changes for Decide relay BEFORE commit clears them.
+        let validator_changes = self.epoch_manager.pending_changes_for_proposal();
+
         // Commit-then-Activate: if validator changes were proposed, stage them now.
         if self.epoch_manager.has_pending_changes() {
             self.epoch_manager.commit_pending_changes()?;
@@ -257,6 +260,7 @@ impl ConsensusEngine {
             view,
             block_hash,
             commit_qc: commit_qc.clone(),
+            validator_changes,
         };
         self.emit(EngineOutput::BroadcastMessage(ConsensusMessage::Decide(
             decide,

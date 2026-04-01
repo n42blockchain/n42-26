@@ -13,7 +13,7 @@ use std::path::Path;
 /// - `last_committed_qc`: tracks the latest committed block
 /// - `consecutive_timeouts`: maintains pacemaker backoff state
 /// - `scheduled_epoch_transition`: preserves staged epoch changes across restarts
-const SNAPSHOT_VERSION: u32 = 1;
+const SNAPSHOT_VERSION: u32 = 2;
 
 fn default_version() -> u32 {
     SNAPSHOT_VERSION
@@ -156,6 +156,22 @@ pub fn save_consensus_state(path: &Path, snapshot: &ConsensusSnapshot) -> io::Re
 pub fn load_consensus_state(path: &Path) -> io::Result<Option<ConsensusSnapshot>> {
     match std::fs::read_to_string(path) {
         Ok(json) => {
+            // v2 changed BitVec serde from per-bool to packed_bits.
+            // Old snapshots cannot be deserialized into the new format,
+            // so we probe the version field first before full deserialization.
+            if let Ok(probe) = serde_json::from_str::<serde_json::Value>(&json) {
+                let ver = probe.get("version").and_then(|v| v.as_u64()).unwrap_or(1);
+                if ver < 2 {
+                    tracing::warn!(
+                        snapshot_version = ver,
+                        "consensus snapshot v{ver} predates packed_bits format (v2); \
+                         discarding old snapshot and starting fresh"
+                    );
+                    let _ = std::fs::remove_file(path);
+                    return Ok(None);
+                }
+            }
+
             let snapshot: ConsensusSnapshot = serde_json::from_str(&json)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
@@ -189,7 +205,7 @@ mod tests {
 
     fn genesis_snapshot(current_view: u64) -> ConsensusSnapshot {
         ConsensusSnapshot {
-            version: 1,
+            version: SNAPSHOT_VERSION,
             current_view,
             locked_qc: QuorumCertificate::genesis(),
             last_committed_qc: QuorumCertificate::genesis(),
@@ -214,7 +230,7 @@ mod tests {
         assert!(path.exists());
 
         let loaded = load_consensus_state(&path).unwrap().unwrap();
-        assert_eq!(loaded.version, 1);
+        assert_eq!(loaded.version, SNAPSHOT_VERSION);
         assert_eq!(loaded.current_view, 42);
         assert_eq!(loaded.consecutive_timeouts, 3);
         assert_eq!(loaded.locked_qc.view, 0);
@@ -255,7 +271,7 @@ mod tests {
     }
 
     #[test]
-    fn test_load_legacy_snapshot_without_version() {
+    fn test_load_legacy_snapshot_without_version_is_discarded() {
         let dir = std::env::temp_dir().join("n42-test-legacy-version");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -266,9 +282,10 @@ mod tests {
         json_value.as_object_mut().unwrap().remove("version");
         std::fs::write(&path, serde_json::to_string_pretty(&json_value).unwrap()).unwrap();
 
-        let loaded = load_consensus_state(&path).unwrap().unwrap();
-        assert_eq!(loaded.version, 1, "default version should be 1");
-        assert_eq!(loaded.current_view, 10);
+        // v2 migration: snapshots without version field are treated as v1 and discarded.
+        let loaded = load_consensus_state(&path).unwrap();
+        assert!(loaded.is_none(), "legacy v1 snapshot should be discarded");
+        assert!(!path.exists(), "discarded snapshot file should be deleted");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -460,7 +477,7 @@ mod tests {
     }
 
     #[test]
-    fn test_load_legacy_snapshot_without_epoch_transition() {
+    fn test_load_legacy_snapshot_without_epoch_transition_is_discarded() {
         let dir = std::env::temp_dir().join("n42-test-legacy-no-epoch");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -476,10 +493,9 @@ mod tests {
         obj.remove("scheduled_epoch_transition");
         std::fs::write(&path, serde_json::to_string_pretty(&json_value).unwrap()).unwrap();
 
-        let loaded = load_consensus_state(&path).unwrap().unwrap();
-        assert_eq!(loaded.version, 1);
-        assert_eq!(loaded.current_view, 50);
-        assert!(loaded.scheduled_epoch_transition.is_none());
+        // v2 migration: no-version snapshots are discarded.
+        let loaded = load_consensus_state(&path).unwrap();
+        assert!(loaded.is_none(), "legacy snapshot without version should be discarded");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

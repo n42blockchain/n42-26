@@ -30,6 +30,10 @@ impl ConsensusEngine {
         let piggybacked_qc = self.previous_prepare_qc.take();
         let chained = piggybacked_qc.is_some();
 
+        // Include any pending validator changes so all nodes apply the same
+        // changes at CommitQC time (consensus-safe commit-then-activate).
+        let validator_changes = self.epoch_manager.pending_changes_for_proposal();
+
         let proposal = Proposal {
             view,
             block_hash,
@@ -38,7 +42,16 @@ impl ConsensusEngine {
             signature,
             prepare_qc: piggybacked_qc,
             tx_root_hash,
+            validator_changes,
         };
+
+        if proposal.validator_changes.is_some() {
+            tracing::info!(target: "n42::cl::proposal",
+                view, %block_hash,
+                changes = ?proposal.validator_changes,
+                "proposing block with validator changes"
+            );
+        }
 
         tracing::debug!(target: "n42::cl::proposal",
             view, %block_hash,
@@ -150,6 +163,21 @@ impl ConsensusEngine {
                     tracing::warn!(target: "n42::cl::proposal", view, error = %e, "rejected invalid piggybacked PrepareQC, ignoring");
                 }
             }
+        }
+
+        // Sync pending validator changes from leader to prevent split-brain.
+        // Limit total changes per proposal to prevent DoS from a Byzantine leader.
+        const MAX_CHANGES_PER_PROPOSAL: usize = 4;
+        if let Some(ref changes) = proposal.validator_changes {
+            if changes.len() > MAX_CHANGES_PER_PROPOSAL {
+                return Err(ConsensusError::TooManyValidatorChanges {
+                    count: changes.len(),
+                    max: MAX_CHANGES_PER_PROPOSAL,
+                });
+            }
+            self.epoch_manager.replace_pending_from_proposal(changes);
+        } else {
+            self.epoch_manager.clear_pending_changes();
         }
 
         // Store pending tx_root_hash for future DA verification if present.

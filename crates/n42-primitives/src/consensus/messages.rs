@@ -1,7 +1,39 @@
 use crate::bls::BlsSignature;
-use alloy_primitives::B256;
+use alloy_primitives::{Address, B256};
 use bitvec::prelude::*;
 use serde::{Deserialize, Serialize};
+
+/// Compact serde helper for `BitVec<u8, Msb0>`.
+///
+/// The default bitvec serde serializes each bit as a separate `bool` (1 byte each
+/// in bincode), making a 500-bit vector occupy 508 bytes instead of 65.
+///
+/// This module serializes as `(u16 bit_count, Vec<u8> packed_bytes)` — the same
+/// layout the raw `BitVec` uses in memory.
+mod packed_bits {
+    use bitvec::prelude::*;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(bv: &BitVec<u8, Msb0>, s: S) -> Result<S::Ok, S::Error> {
+        let bit_count = bv.len() as u16;
+        let raw_bytes: &[u8] = bv.as_raw_slice();
+        (bit_count, raw_bytes).serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<BitVec<u8, Msb0>, D::Error> {
+        let (bit_count, raw_bytes): (u16, Vec<u8>) = Deserialize::deserialize(d)?;
+        let needed = ((bit_count as usize) + 7) / 8;
+        if raw_bytes.len() != needed {
+            return Err(serde::de::Error::custom(format!(
+                "packed_bits: expected {needed} bytes for {bit_count} bits, got {}",
+                raw_bytes.len()
+            )));
+        }
+        let mut bv = BitVec::<u8, Msb0>::from_vec(raw_bytes);
+        bv.truncate(bit_count as usize);
+        Ok(bv)
+    }
+}
 
 /// View number (monotonically increasing round identifier).
 pub type ViewNumber = u64;
@@ -20,6 +52,7 @@ pub struct QuorumCertificate {
     /// Aggregated BLS signature from 2f+1 validators.
     pub aggregate_signature: BlsSignature,
     /// Bitmap indicating which validators signed (1 bit per validator).
+    #[serde(with = "packed_bits")]
     pub signers: BitVec<u8, Msb0>,
 }
 
@@ -56,9 +89,29 @@ pub struct TimeoutCertificate {
     /// Aggregated timeout signature.
     pub aggregate_signature: BlsSignature,
     /// Bitmap of validators that timed out.
+    #[serde(with = "packed_bits")]
     pub signers: BitVec<u8, Msb0>,
     /// The highest QC known by any of the timeout signers.
     pub high_qc: QuorumCertificate,
+}
+
+/// A proposed validator set change, carried in [`Proposal`] messages so that
+/// all validators apply the same changes at CommitQC time.
+///
+/// Without this, `pending_adds` / `pending_removes` in the epoch manager are
+/// local to the node that received the admin RPC call, leading to split-brain
+/// at epoch boundaries.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum ValidatorChange {
+    /// Add a new validator to the set at the next epoch boundary.
+    Add {
+        address: Address,
+        bls_public_key: crate::BlsPublicKey,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        p2p_peer_id: Option<String>,
+    },
+    /// Remove a validator by address at the next epoch boundary.
+    Remove { address: Address },
 }
 
 /// Leader proposal message.
@@ -83,6 +136,16 @@ pub struct Proposal {
     /// Followers compare against actual tx root after block import.
     #[serde(default)]
     pub tx_root_hash: Option<B256>,
+    /// Proposed validator set changes (commit-then-activate protocol).
+    ///
+    /// When the leader has pending validator additions/removals (from admin RPC),
+    /// they are included here so that **all** validators apply identical changes
+    /// at CommitQC time.  Followers replace their own local pending queue with
+    /// the leader's changes upon receiving the proposal.  `None` means the leader
+    /// has no pending changes; followers must clear their own pending queue to
+    /// stay consistent.
+    #[serde(default)]
+    pub validator_changes: Option<Vec<ValidatorChange>>,
 }
 
 /// Vote message (Round 1: Prepare).
@@ -159,11 +222,18 @@ pub struct Decide {
     pub block_hash: B256,
     /// The CommitQC that proves 2f+1 validators committed.
     pub commit_qc: QuorumCertificate,
+    /// Validator changes from the committed Proposal, relayed so followers that
+    /// missed the Proposal still apply the same changes at CommitQC time.
+    /// Without this, a follower that received only the Decide would not stage
+    /// the epoch transition, causing validator-set divergence at the next
+    /// epoch boundary.
+    #[serde(default)]
+    pub validator_changes: Option<Vec<ValidatorChange>>,
 }
 
 /// Current consensus protocol wire format version.
 /// Increment when making breaking changes to message formats.
-pub const CONSENSUS_PROTOCOL_VERSION: u16 = 1;
+pub const CONSENSUS_PROTOCOL_VERSION: u16 = 2;
 
 /// Versioned wrapper for consensus messages on the wire.
 ///
@@ -267,6 +337,7 @@ mod tests {
                 signature: sig.clone(),
                 prepare_qc: None,
                 tx_root_hash: None,
+                validator_changes: None,
             }),
             ConsensusMessage::Vote(Vote {
                 view: 2,
@@ -306,6 +377,7 @@ mod tests {
                 view: 7,
                 block_hash: B256::repeat_byte(0x77),
                 commit_qc: genesis_qc.clone(),
+                validator_changes: None,
             }),
         ];
 

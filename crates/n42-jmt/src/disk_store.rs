@@ -541,7 +541,7 @@ pub fn open_jmt_env(path: impl AsRef<Path>) -> eyre::Result<Environment> {
     std::fs::create_dir_all(path)?;
 
     let mut builder = Environment::builder();
-    builder.set_max_dbs(50); // 16 shards * 3 dbs + headroom
+    builder.set_max_dbs(55); // 16 shards * 3 dbs + evidence table + headroom
     builder.set_geometry(Geometry {
         size: Some(64 * 1024 * 1024..1024 * 1024 * 1024 * 1024), // 64 MB .. 1 TB
         // Use OS default page size (4KB). Matches SSD internal page, filesystem
