@@ -6578,6 +6578,7 @@ dependencies = [
  "async-trait",
  "bincode",
  "bitvec",
+ "blake3",
  "bytes",
  "eyre",
  "hex",
