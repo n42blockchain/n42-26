@@ -32,9 +32,7 @@ impl ConsensusEngine {
         // changes at CommitQC time (consensus-safe commit-then-activate).
         let validator_changes = self.epoch_manager.pending_changes_for_proposal();
 
-        // Proposal signature covers (view, block_hash, changes_hash) — binds
-        // the exact validator changes to the BLS signature so a Byzantine relay
-        // cannot swap them while preserving the signature.
+        // Signature covers changes_hash to prevent Byzantine relay from swapping changes.
         let prop_msg = super::quorum::proposal_signing_message(view, &block_hash, &validator_changes);
         let signature = self.secret_key.sign(&prop_msg);
         let vote_msg = signing_message(view, &block_hash);
@@ -175,8 +173,6 @@ impl ConsensusEngine {
             }
         }
 
-        // Sync pending validator changes from leader to prevent split-brain.
-        // Limit total changes per proposal to prevent DoS from a Byzantine leader.
         const MAX_CHANGES_PER_PROPOSAL: usize = 4;
         if let Some(ref changes) = proposal.validator_changes {
             if changes.len() > MAX_CHANGES_PER_PROPOSAL {

@@ -50,6 +50,7 @@ impl std::fmt::Debug for N42ConsensusBuilder {
                 "has_validator_set_resolver",
                 &self.validator_set_resolver.is_some(),
             )
+            .field("has_evidence_store", &self.evidence_store.is_some())
             .finish()
     }
 }

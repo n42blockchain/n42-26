@@ -526,22 +526,14 @@ fn main() {
         // Consensus evidence store: MDBX table for per-block QC persistence.
         let evidence_store: Option<Arc<n42_jmt::EvidenceStore>> = {
             let evidence_path = data_dir.join("evidence");
-            match n42_jmt::open_jmt_env(&evidence_path) {
-                Ok(env) => match n42_jmt::EvidenceStore::open(env) {
-                    Ok(store) => {
-                        info!(target: "n42::cli", path = %evidence_path.display(), "EvidenceStore initialized");
-                        Some(Arc::new(store))
-                    }
-                    Err(e) => {
-                        warn!(target: "n42::cli", error = %e, "failed to open EvidenceStore");
-                        None
-                    }
-                },
-                Err(e) => {
-                    warn!(target: "n42::cli", error = %e, "failed to open evidence MDBX env");
-                    None
-                }
-            }
+            n42_jmt::open_jmt_env(&evidence_path)
+                .and_then(|env| n42_jmt::EvidenceStore::open(env))
+                .map(|store| {
+                    info!(target: "n42::cli", path = %evidence_path.display(), "EvidenceStore initialized");
+                    Arc::new(store)
+                })
+                .map_err(|e| warn!(target: "n42::cli", error = %e, "EvidenceStore unavailable"))
+                .ok()
         };
 
         let mut n42_node = N42Node::new(consensus_state.clone())

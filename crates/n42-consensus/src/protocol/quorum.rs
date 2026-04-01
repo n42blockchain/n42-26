@@ -480,7 +480,7 @@ pub fn proposal_signing_message(
     msg[8..40].copy_from_slice(block_hash.as_slice());
     let changes_hash = match validator_changes {
         Some(changes) if !changes.is_empty() => {
-            let encoded = bincode::serialize(changes).unwrap_or_default();
+            let encoded = bincode::serialize(changes).expect("ValidatorChange serialization cannot fail");
             *blake3::hash(&encoded).as_bytes()
         }
         _ => [0u8; 32],
