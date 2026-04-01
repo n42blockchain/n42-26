@@ -70,16 +70,11 @@ impl ConsensusEngine {
         self.round_state.update_locked_qc(&decide.commit_qc);
         self.round_state.commit(decide.commit_qc.clone());
 
-        // If the follower missed the Proposal (network loss) but received this
-        // Decide, apply the leader's validator changes now to prevent validator-set
-        // divergence at the next epoch boundary.
-        if !self.epoch_manager.has_pending_changes() {
-            if let Some(ref changes) = decide.validator_changes {
-                self.epoch_manager.replace_pending_from_proposal(changes);
-            }
-        }
-
         // Commit-then-Activate: if validator changes were proposed, stage them now.
+        // Changes were set by process_proposal(); if this follower missed the
+        // Proposal, pending is empty and this is a no-op.  Validator-change
+        // consistency across an epoch boundary relies on all honest nodes
+        // receiving the Proposal (which is BLS-signed and covers the changes hash).
         if self.epoch_manager.has_pending_changes() {
             self.epoch_manager.commit_pending_changes()?;
         }

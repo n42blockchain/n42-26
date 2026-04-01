@@ -222,13 +222,6 @@ pub struct Decide {
     pub block_hash: B256,
     /// The CommitQC that proves 2f+1 validators committed.
     pub commit_qc: QuorumCertificate,
-    /// Validator changes from the committed Proposal, relayed so followers that
-    /// missed the Proposal still apply the same changes at CommitQC time.
-    /// Without this, a follower that received only the Decide would not stage
-    /// the epoch transition, causing validator-set divergence at the next
-    /// epoch boundary.
-    #[serde(default)]
-    pub validator_changes: Option<Vec<ValidatorChange>>,
 }
 
 /// Current consensus protocol wire format version.
@@ -377,7 +370,6 @@ mod tests {
                 view: 7,
                 block_hash: B256::repeat_byte(0x77),
                 commit_qc: genesis_qc.clone(),
-                validator_changes: None,
             }),
         ];
 

@@ -383,7 +383,7 @@ impl ConsensusEngine {
                     .validator_set_for_view(proposal.view)
                     .get_public_key(proposal.proposer)
                     .ok()?;
-                let sig_msg = signing_message(proposal.view, &proposal.block_hash);
+                let sig_msg = crate::protocol::quorum::proposal_signing_message(proposal.view, &proposal.block_hash, &None);
                 if pk.verify(&sig_msg, &proposal.signature).is_err() {
                     tracing::debug!(target: "n42::consensus", view = proposal.view, proposer = proposal.proposer, "proposal signature verification failed");
                     return None;
@@ -1354,7 +1354,7 @@ mod tests {
         let (mut engine, sks, _, mut rx) = make_engine(4, 0);
 
         let block_hash = B256::repeat_byte(0xEE);
-        let msg = signing_message(1, &block_hash);
+        let msg = crate::protocol::quorum::proposal_signing_message(1, &block_hash, &None);
         let proposal = n42_primitives::consensus::Proposal {
             view: 1,
             block_hash,
@@ -1403,7 +1403,7 @@ mod tests {
 
         assert!(engine.imported_blocks.contains(&block_hash));
 
-        let msg = signing_message(1, &block_hash);
+        let msg = crate::protocol::quorum::proposal_signing_message(1, &block_hash, &None);
         let proposal = n42_primitives::consensus::Proposal {
             view: 1,
             block_hash,
@@ -1439,7 +1439,7 @@ mod tests {
         let (mut engine, sks, _, mut rx) = make_engine(4, 0);
         let block_hash = B256::repeat_byte(0xEE);
 
-        let msg = signing_message(1, &block_hash);
+        let msg = crate::protocol::quorum::proposal_signing_message(1, &block_hash, &None);
         let proposal = n42_primitives::consensus::Proposal {
             view: 1,
             block_hash,
@@ -1635,7 +1635,7 @@ mod tests {
         let block_hash = B256::repeat_byte(0xF2);
         let view = 1u64;
 
-        let prop_msg = signing_message(view, &block_hash);
+        let prop_msg = crate::protocol::quorum::proposal_signing_message(view, &block_hash, &None);
         let proposal = n42_primitives::consensus::Proposal {
             view,
             block_hash,
@@ -1702,7 +1702,7 @@ mod tests {
         let wrong_hash = B256::repeat_byte(0xF3);
         let view = 1u64;
 
-        let prop_msg = signing_message(view, &block_hash);
+        let prop_msg = crate::protocol::quorum::proposal_signing_message(view, &block_hash, &None);
         let proposal = n42_primitives::consensus::Proposal {
             view,
             block_hash,
@@ -1762,7 +1762,7 @@ mod tests {
         let block_hash = B256::repeat_byte(0xF4);
         let view = 1u64;
 
-        let prop_msg = crate::protocol::quorum::signing_message(view, &block_hash);
+        let prop_msg = crate::protocol::quorum::proposal_signing_message(view, &block_hash, &None);
         let proposal = n42_primitives::consensus::Proposal {
             view,
             block_hash,
@@ -2078,7 +2078,6 @@ mod tests {
             view,
             block_hash,
             commit_qc,
-            validator_changes: None,
         };
 
         engine
@@ -2115,7 +2114,6 @@ mod tests {
                     view: v,
                     block_hash: bh,
                     commit_qc: cqc,
-                    validator_changes: None,
                 })));
             while rx.try_recv().is_ok() {}
         }
@@ -2127,7 +2125,6 @@ mod tests {
                 view: 3,
                 block_hash,
                 commit_qc,
-                validator_changes: None,
             })))
             .expect("stale Decide should be ignored without error");
 
@@ -2158,7 +2155,6 @@ mod tests {
                 view,
                 block_hash,
                 commit_qc: weak_qc,
-                validator_changes: None,
             })));
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -2202,7 +2198,6 @@ mod tests {
                 view,
                 block_hash,
                 commit_qc: forged_qc,
-                validator_changes: None,
             })));
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -2255,7 +2250,7 @@ mod tests {
         let justify_qc = build_test_prepare_qc(99, B256::repeat_byte(0xEF), &sks, &vs, &[0, 1, 2]);
 
         use crate::protocol::quorum::signing_message;
-        let msg = signing_message(far_view, &block_hash);
+        let msg = crate::protocol::quorum::proposal_signing_message(far_view, &block_hash, &None);
         let proposal = n42_primitives::consensus::Proposal {
             view: far_view,
             block_hash,
@@ -2303,7 +2298,7 @@ mod tests {
         let justify_qc = build_test_commit_qc(99, B256::repeat_byte(0xF4), &sks, &vs, &[0, 1, 2]);
 
         use crate::protocol::quorum::signing_message;
-        let msg = signing_message(far_view, &block_hash);
+        let msg = crate::protocol::quorum::proposal_signing_message(far_view, &block_hash, &None);
         let proposal = n42_primitives::consensus::Proposal {
             view: far_view,
             block_hash,
@@ -2441,7 +2436,7 @@ mod tests {
             signers,
         };
 
-        let msg = signing_message(far_view, &block_hash);
+        let msg = crate::protocol::quorum::proposal_signing_message(far_view, &block_hash, &None);
         let proposal = n42_primitives::consensus::Proposal {
             view: far_view,
             block_hash,
@@ -2470,7 +2465,7 @@ mod tests {
         let far_view = 100u64;
         let block_hash = B256::repeat_byte(0xCC);
 
-        let msg = signing_message(far_view, &block_hash);
+        let msg = crate::protocol::quorum::proposal_signing_message(far_view, &block_hash, &None);
         let proposal = n42_primitives::consensus::Proposal {
             view: far_view,
             block_hash,
@@ -2505,7 +2500,7 @@ mod tests {
         let block_hash = B256::repeat_byte(0xDD);
         let justify_qc = build_test_prepare_qc(99, B256::repeat_byte(0xDE), &sks, &vs, &[0, 1, 2]);
 
-        let msg = signing_message(far_view, &block_hash);
+        let msg = crate::protocol::quorum::proposal_signing_message(far_view, &block_hash, &None);
         let proposal = n42_primitives::consensus::Proposal {
             view: far_view,
             block_hash,
@@ -2538,7 +2533,7 @@ mod tests {
         let block_hash = B256::repeat_byte(0xEE);
         let justify_qc = build_test_prepare_qc(95, B256::repeat_byte(0x95), &sks, &vs, &[0, 1, 2]);
 
-        let msg = signing_message(far_view, &block_hash);
+        let msg = crate::protocol::quorum::proposal_signing_message(far_view, &block_hash, &None);
         let proposal = n42_primitives::consensus::Proposal {
             view: far_view,
             block_hash,
@@ -2572,7 +2567,6 @@ mod tests {
             view: 1,
             block_hash: B256::repeat_byte(0x01),
             commit_qc,
-            validator_changes: None,
         })));
         while rx.try_recv().is_ok() {}
 
@@ -2581,7 +2575,6 @@ mod tests {
             view: 2,
             block_hash: B256::repeat_byte(0x02),
             commit_qc: commit_qc2,
-            validator_changes: None,
         })));
         while rx.try_recv().is_ok() {}
 
@@ -2649,7 +2642,6 @@ mod tests {
             view: far_view,
             block_hash,
             commit_qc,
-            validator_changes: None,
         };
 
         engine
@@ -2878,7 +2870,6 @@ mod tests {
                     view: v,
                     block_hash: bh,
                     commit_qc: cqc,
-                    validator_changes: None,
                 })));
             while rx.try_recv().is_ok() {}
         }
@@ -2899,7 +2890,6 @@ mod tests {
                     view: v,
                     block_hash: bh,
                     commit_qc: cqc,
-                    validator_changes: None,
                 })));
         }
         while rx.try_recv().is_ok() {}
@@ -2976,7 +2966,7 @@ mod tests {
         let block_hash = B256::repeat_byte(0xAB);
         let justify_qc = build_test_prepare_qc(79, B256::repeat_byte(0x79), &sks, &vs, &[0, 1, 2]);
 
-        let msg = signing_message(far_view, &block_hash);
+        let msg = crate::protocol::quorum::proposal_signing_message(far_view, &block_hash, &None);
         let proposal = n42_primitives::consensus::Proposal {
             view: far_view,
             block_hash,
@@ -3020,7 +3010,7 @@ mod tests {
         assert_eq!(engine.current_view(), 1);
 
         let justify_qc = build_test_prepare_qc(79, B256::repeat_byte(0x79), &sks, &vs, &[0, 1, 2]);
-        let msg = signing_message(80, &B256::repeat_byte(0xAB));
+        let msg = crate::protocol::quorum::proposal_signing_message(80, &B256::repeat_byte(0xAB), &None);
         let proposal = n42_primitives::consensus::Proposal {
             view: 80,
             block_hash: B256::repeat_byte(0xAB),

@@ -464,6 +464,31 @@ pub fn signing_message(view: ViewNumber, block_hash: &B256) -> [u8; 40] {
     msg
 }
 
+/// Signing message for Proposals: view || block_hash || changes_hash.
+///
+/// Extends [`signing_message`] with a 32-byte Blake3 hash of the serialized
+/// `validator_changes` (or zeros if no changes).  This binds the proposer's
+/// BLS signature to the exact set of validator changes, preventing a Byzantine
+/// leader or relay from sending different change-lists under the same signature.
+pub fn proposal_signing_message(
+    view: ViewNumber,
+    block_hash: &B256,
+    validator_changes: &Option<Vec<n42_primitives::consensus::ValidatorChange>>,
+) -> [u8; 72] {
+    let mut msg = [0u8; 72];
+    msg[..8].copy_from_slice(&view.to_le_bytes());
+    msg[8..40].copy_from_slice(block_hash.as_slice());
+    let changes_hash = match validator_changes {
+        Some(changes) if !changes.is_empty() => {
+            let encoded = bincode::serialize(changes).unwrap_or_default();
+            *blake3::hash(&encoded).as_bytes()
+        }
+        _ => [0u8; 32],
+    };
+    msg[40..72].copy_from_slice(&changes_hash);
+    msg
+}
+
 /// Signing message for Round 2 commit votes: "commit" || view (8 bytes LE) || block_hash (32 bytes).
 pub fn commit_signing_message(view: ViewNumber, block_hash: &B256) -> [u8; 46] {
     let mut msg = [0u8; 46];

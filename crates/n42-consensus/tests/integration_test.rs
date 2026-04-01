@@ -1249,7 +1249,7 @@ mod fault_tolerance {
         let leader = harness.leader_for_view(view);
         let block_hash = B256::repeat_byte(0x5A);
 
-        let msg = signing_message(view, &block_hash);
+        let msg = n42_consensus::protocol::quorum::proposal_signing_message(view, &block_hash, &None);
         let sig = harness.secret_keys[leader].sign(&msg);
 
         let bad_proposal = Proposal {
@@ -1288,7 +1288,7 @@ mod fault_tolerance {
         // Leader for view 1 is validator 1. Send proposal from validator 0.
         let block_hash = B256::repeat_byte(0x1B);
 
-        let msg = signing_message(view, &block_hash);
+        let msg = n42_consensus::protocol::quorum::proposal_signing_message(view, &block_hash, &None);
         let sig = harness.secret_keys[0].sign(&msg);
 
         let bad_proposal = Proposal {

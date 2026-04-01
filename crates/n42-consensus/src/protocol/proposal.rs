@@ -25,14 +25,19 @@ impl ConsensusEngine {
         }
 
         let justify_qc = self.round_state.locked_qc().clone();
-        let vote_msg = signing_message(view, &block_hash);
-        let signature = self.secret_key.sign(&vote_msg);
         let piggybacked_qc = self.previous_prepare_qc.take();
         let chained = piggybacked_qc.is_some();
 
         // Include any pending validator changes so all nodes apply the same
         // changes at CommitQC time (consensus-safe commit-then-activate).
         let validator_changes = self.epoch_manager.pending_changes_for_proposal();
+
+        // Proposal signature covers (view, block_hash, changes_hash) — binds
+        // the exact validator changes to the BLS signature so a Byzantine relay
+        // cannot swap them while preserving the signature.
+        let prop_msg = super::quorum::proposal_signing_message(view, &block_hash, &validator_changes);
+        let signature = self.secret_key.sign(&prop_msg);
+        let vote_msg = signing_message(view, &block_hash);
 
         let proposal = Proposal {
             view,
@@ -110,8 +115,13 @@ impl ConsensusEngine {
         }
 
         let pk = view_set.get_public_key(proposal.proposer)?;
-        let msg = signing_message(view, &proposal.block_hash);
-        pk.verify(&msg, &proposal.signature)
+        // Verify proposal signature covers (view, block_hash, changes_hash).
+        let prop_msg = super::quorum::proposal_signing_message(
+            view,
+            &proposal.block_hash,
+            &proposal.validator_changes,
+        );
+        pk.verify(&prop_msg, &proposal.signature)
             .map_err(|_| ConsensusError::InvalidSignature {
                 view,
                 validator_index: proposal.proposer,

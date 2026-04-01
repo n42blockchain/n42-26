@@ -60,11 +60,19 @@ impl<C> N42Consensus<C>
 where
     C: EthChainSpec + EthereumHardforks,
 {
+    /// Maximum extra_data size for N42 blocks.
+    ///
+    /// Pre-migration blocks may carry a bincode-encoded QC in extra_data (> 32 bytes).
+    /// This limit must remain large enough to validate those historical blocks during
+    /// sync/replay, even though new blocks use `parent_beacon_block_root` for evidence.
+    const MAX_EXTRA_DATA_SIZE: usize = 4096;
+
     /// Create a new N42 consensus adapter (without validator set).
     /// QC verification is skipped until `set_validator_set` is called.
     pub fn new(chain_spec: Arc<C>) -> Self {
         Self {
-            inner: EthBeaconConsensus::new(chain_spec),
+            inner: EthBeaconConsensus::new(chain_spec)
+                .with_max_extra_data_size(Self::MAX_EXTRA_DATA_SIZE),
             validator_set: Arc::new(ArcSwapOption::empty()),
             validator_set_resolver: None,
             evidence_store: None,
@@ -95,7 +103,8 @@ where
         validator_set_resolver: Option<ValidatorSetResolver>,
     ) -> Self {
         Self {
-            inner: EthBeaconConsensus::new(chain_spec),
+            inner: EthBeaconConsensus::new(chain_spec)
+                .with_max_extra_data_size(Self::MAX_EXTRA_DATA_SIZE),
             validator_set,
             validator_set_resolver,
             evidence_store: None,
