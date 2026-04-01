@@ -1352,7 +1352,7 @@ mod tests {
 
     #[test]
     fn test_engine_valid_proposal_votes_immediately() {
-        use crate::protocol::quorum::signing_message;
+        
         let (mut engine, sks, _, mut rx) = make_engine(4, 0);
 
         let block_hash = B256::repeat_byte(0xEE);
@@ -1395,7 +1395,7 @@ mod tests {
 
     #[test]
     fn test_engine_block_imported_before_proposal() {
-        use crate::protocol::quorum::signing_message;
+        
         let (mut engine, sks, _, mut rx) = make_engine(4, 0);
         let block_hash = B256::repeat_byte(0xEE);
 
@@ -1437,7 +1437,7 @@ mod tests {
 
     #[test]
     fn test_engine_timeout_clears_state() {
-        use crate::protocol::quorum::signing_message;
+        
         let (mut engine, sks, _, mut rx) = make_engine(4, 0);
         let block_hash = B256::repeat_byte(0xEE);
 
@@ -2256,7 +2256,7 @@ mod tests {
         let block_hash = B256::repeat_byte(0xF0);
         let justify_qc = build_test_prepare_qc(99, B256::repeat_byte(0xEF), &sks, &vs, &[0, 1, 2]);
 
-        use crate::protocol::quorum::signing_message;
+        
         let msg = crate::protocol::quorum::proposal_signing_message(far_view, &block_hash, &None);
         let proposal = n42_primitives::consensus::Proposal {
             view: far_view,
@@ -2304,7 +2304,7 @@ mod tests {
         let block_hash = B256::repeat_byte(0xF5);
         let justify_qc = build_test_commit_qc(99, B256::repeat_byte(0xF4), &sks, &vs, &[0, 1, 2]);
 
-        use crate::protocol::quorum::signing_message;
+        
         let msg = crate::protocol::quorum::proposal_signing_message(far_view, &block_hash, &None);
         let proposal = n42_primitives::consensus::Proposal {
             view: far_view,
@@ -2466,7 +2466,7 @@ mod tests {
 
     #[test]
     fn test_far_future_genesis_qc_is_dropped() {
-        use crate::protocol::quorum::signing_message;
+        
 
         let (mut engine, sks, _, _rx) = make_engine(4, 0);
         let far_view = 100u64;
@@ -2495,7 +2495,7 @@ mod tests {
 
     #[test]
     fn test_view_jump_resets_consecutive_timeouts() {
-        use crate::protocol::quorum::signing_message;
+        
 
         let (mut engine, sks, vs, mut rx) = make_engine(4, 0);
 
@@ -2531,7 +2531,7 @@ mod tests {
 
     #[test]
     fn test_view_jump_updates_locked_qc() {
-        use crate::protocol::quorum::signing_message;
+        
 
         let (mut engine, sks, vs, mut rx) = make_engine(4, 0);
         assert_eq!(engine.locked_qc().view, 0);
@@ -2969,7 +2969,7 @@ mod tests {
 
     #[test]
     fn test_qc_jump_emits_sync_required() {
-        use crate::protocol::quorum::signing_message;
+        
 
         let (mut engine, sks, vs, mut rx) = make_engine(4, 0);
         assert_eq!(engine.current_view(), 1);
@@ -3016,7 +3016,7 @@ mod tests {
 
     #[test]
     fn test_stale_view_changed_prevented() {
-        use crate::protocol::quorum::signing_message;
+        
 
         let (mut engine, sks, vs, mut rx) = make_engine(4, 0);
         assert_eq!(engine.current_view(), 1);

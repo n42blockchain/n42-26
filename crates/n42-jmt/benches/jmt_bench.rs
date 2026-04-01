@@ -128,7 +128,8 @@ fn bench_proof_verify(c: &mut Criterion) {
 
     c.bench_function("proof_verify", |b| {
         b.iter(|| {
-            black_box(proof.verify(&root).unwrap());
+            proof.verify(&root).unwrap();
+            black_box(());
         });
     });
 }
