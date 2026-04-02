@@ -2,7 +2,7 @@ use super::ConsensusOrchestrator;
 use super::state_mgmt::max_consecutive_empty_skips;
 use crate::expected_validator_peer_ids_with_policy;
 use alloy_primitives::B256;
-use alloy_rpc_types_engine::{ForkchoiceState, PayloadStatusEnum};
+use alloy_rpc_types_engine::{ExecutionData, ForkchoiceState, PayloadStatusEnum};
 use metrics::{counter, gauge, histogram};
 use n42_consensus::EngineOutput;
 use n42_primitives::{ConsensusMessage, QuorumCertificate};
@@ -749,7 +749,7 @@ impl ConsensusOrchestrator {
                 return (false, 0);
             }
         };
-        let execution_data = match serde_json::from_slice(&payload_json) {
+        let execution_data: ExecutionData = match serde_json::from_slice(&payload_json) {
             Ok(d) => d,
             Err(e) => {
                 warn!(target: "n42::cl::consensus_loop", %block_hash, error = %e, "bg import: failed to parse execution payload");
