@@ -384,8 +384,7 @@ impl ConsensusOrchestrator {
                 peer_committed_view = response.peer_committed_view,
                 "still behind after sync, requesting more blocks"
             );
-            self.initiate_sync(local_view, response.peer_committed_view)
-                .await;
+            self.initiate_sync(local_view, response.peer_committed_view);
         }
     }
 
