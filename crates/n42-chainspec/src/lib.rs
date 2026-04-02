@@ -85,7 +85,7 @@ impl ConsensusConfig {
             base_timeout_ms: 4000,
             max_timeout_ms: 8000,
             initial_validators: Vec::new(),
-            epoch_length: 30,
+            epoch_length: 0,
         }
     }
 
@@ -127,7 +127,7 @@ impl ConsensusConfig {
             base_timeout_ms: 20000,
             max_timeout_ms: 60000,
             initial_validators: validators,
-            epoch_length: 30,
+            epoch_length: 0,
         }
     }
 

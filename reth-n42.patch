@@ -612,7 +612,7 @@ new file mode 100644
 index 000000000..000000001
 --- /dev/null
 +++ b/crates/evm/evm/src/payload_cache.rs
-@@ -0,0 +1,75 @@
+@@ -0,0 +1,74 @@
 +//! Global single-entry cache for leader payload execution results.
 +//!
 +//! When the payload builder (leader) finishes building a block, it caches
