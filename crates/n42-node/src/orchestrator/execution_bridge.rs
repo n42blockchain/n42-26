@@ -607,32 +607,16 @@ impl ConsensusOrchestrator {
                     has_compact_block = execution_output_compressed.is_some(),
                     "N42_DECOMPRESS: follower payload decoded"
                 );
-                // Guard: strict sequential eager import with in-flight lock.
-                //
-                // CRITICAL: reth permanently poisons a block if new_payload is
-                // called when the parent isn't in the engine tree. All descendants
-                // are then irreversibly rejected ("invalid ancestor").
-                //
-                // The guard stores the highest block ACCEPTED by reth, or u64::MAX
-                // while a new_payload call is in-flight.  This ensures:
-                //   - Only block == guard+1 can proceed (no gaps)
-                //   - Only one new_payload in-flight at a time (u64::MAX lock)
-                //   - On failure, guard rolls back so the block retries via bg-import
-                const IN_FLIGHT: u64 = u64::MAX;
+                // Guard against duplicate imports for the same block number with different hashes.
+                // Sending new_payload for the same block number but different hash triggers
+                // reth pipeline sync and causes chain stalls.
                 let block_number = execution_data.block_number();
                 let tx_count = execution_data.transaction_count();
-                let prev = block_guard.load(std::sync::atomic::Ordering::SeqCst);
-                if prev == IN_FLIGHT || block_number != prev + 1 {
-                    return; // in-flight, duplicate, or gap
-                }
-                // CAS: claim the lock (prev → IN_FLIGHT). Only one task can win.
-                if block_guard
-                    .compare_exchange(prev, IN_FLIGHT, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst)
-                    .is_err()
-                {
+                let prev = block_guard.fetch_max(block_number, std::sync::atomic::Ordering::SeqCst);
+                if prev >= block_number {
+                    info!(target: "n42::cl::exec_bridge", %hash, view, block_number, prev, "follower eager import: skipping duplicate block number");
                     return;
                 }
-                // Lock acquired. Advance to block_number on success, rollback to prev on failure.
 
                 // Compact Block: load execution output into payload cache before `new_payload`.
                 // This lets reth skip EVM re-execution (cache hit path), reducing import from
@@ -700,24 +684,17 @@ impl ConsensusOrchestrator {
                             metrics::counter!("n42_compact_block_cache_hits").increment(1);
                         }
                         metrics::counter!("n42_follower_eager_import_hits_total").increment(1);
-                        // SUCCESS: advance guard from IN_FLIGHT to block_number.
-                        block_guard.store(block_number, std::sync::atomic::Ordering::SeqCst);
                         if eager_done_tx.send((hash, block_ts)).await.is_err() {
                             debug!(target: "n42::cl::exec_bridge", %hash, view, "eager import completion receiver dropped");
                         }
                     }
                     Ok(status) => {
-                        // FAILURE: roll back guard from IN_FLIGHT to prev.
-                        block_guard.store(prev, std::sync::atomic::Ordering::SeqCst);
-                        debug!(target: "n42::cl::exec_bridge", %hash, view, status = ?status.status, block_number, compact_injected,
-                            "follower eager import: not accepted, guard rolled back to {prev}");
+                        debug!(target: "n42::cl::exec_bridge", %hash, view, status = ?status.status, compact_injected, "follower eager import: not accepted");
                         if compact_injected {
                             metrics::counter!("n42_compact_block_cache_misses").increment(1);
                         }
                     }
                     Err(e) => {
-                        // FAILURE: roll back guard from IN_FLIGHT to prev.
-                        block_guard.store(prev, std::sync::atomic::Ordering::SeqCst);
                         debug!(target: "n42::cl::exec_bridge", %hash, view, error = %e, compact_injected, "follower eager import: failed");
                         if compact_injected {
                             metrics::counter!("n42_compact_block_cache_misses").increment(1);
@@ -785,32 +762,13 @@ impl ConsensusOrchestrator {
                 return;
             }
         };
-        let execution_data: alloy_rpc_types_engine::ExecutionData = match serde_json::from_slice(&payload_json) {
+        let execution_data = match serde_json::from_slice(&payload_json) {
             Ok(data) => data,
             Err(e) => {
                 warn!(target: "n42::cl::exec_bridge", hash = %broadcast.block_hash, "failed to deserialize execution payload: {e}");
                 return;
             }
         };
-
-        // Guard: acquire IN_FLIGHT lock before new_payload to prevent
-        // sending blocks whose parent isn't in reth's engine tree.
-        let block_number = execution_data.block_number();
-        const IN_FLIGHT: u64 = u64::MAX;
-        let guard = &self.eager_import_block_guard;
-        let prev = guard.load(std::sync::atomic::Ordering::SeqCst);
-        if prev == IN_FLIGHT || block_number != prev + 1 {
-            debug!(target: "n42::cl::exec_bridge", hash = %broadcast.block_hash, block_number, guard = prev,
-                "import_and_notify: skipping new_payload (guard mismatch), queueing for bg import");
-            // Guard blocked — block will be imported via bg import or sync.
-            return;
-            return;
-        }
-        if guard.compare_exchange(prev, IN_FLIGHT, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst).is_err() {
-            // Guard blocked — block will be imported via bg import or sync.
-            return;
-            return;
-        }
 
         // Compact Block: load execution output into payload cache before `new_payload`.
         if let Some(ref exec_compressed) = broadcast.execution_output
@@ -825,25 +783,20 @@ impl ConsensusOrchestrator {
                     status.status,
                     PayloadStatusEnum::Valid | PayloadStatusEnum::Accepted
                 ) {
-                    guard.store(block_number, std::sync::atomic::Ordering::SeqCst);
                     self.handle_valid_import(&broadcast, &engine_handle, &status)
                         .await;
+                } else if matches!(status.status, PayloadStatusEnum::Syncing) {
+                    self.queue_syncing_block(&broadcast);
                 } else {
-                    guard.store(prev, std::sync::atomic::Ordering::SeqCst);
-                    if matches!(status.status, PayloadStatusEnum::Syncing) {
-                        self.queue_syncing_block(&broadcast);
-                    } else {
-                        warn!(
-                            target: "n42::cl::exec_bridge",
-                            hash = %broadcast.block_hash,
-                            status = ?status.status,
-                            "new_payload rejected block"
-                        );
-                    }
+                    warn!(
+                        target: "n42::cl::exec_bridge",
+                        hash = %broadcast.block_hash,
+                        status = ?status.status,
+                        "new_payload rejected block"
+                    );
                 }
             }
             Err(e) => {
-                guard.store(prev, std::sync::atomic::Ordering::SeqCst);
                 error!(target: "n42::cl::exec_bridge", hash = %broadcast.block_hash, error = %e, "new_payload failed");
             }
         }
@@ -970,7 +923,6 @@ impl ConsensusOrchestrator {
         info!(target: "n42::cl::exec_bridge", count = queued.len(), "retrying previously-syncing blocks");
 
         const MAX_SYNCING_RETRIES: u32 = 3;
-        const IN_FLIGHT: u64 = u64::MAX;
 
         for (data, retry_count) in queued {
             let retry_broadcast = match bincode::deserialize::<BlockDataBroadcast>(&data) {
@@ -982,7 +934,7 @@ impl ConsensusOrchestrator {
                 Ok(d) => d,
                 Err(_) => continue,
             };
-            let retry_exec: alloy_rpc_types_engine::ExecutionData = match serde_json::from_slice(&retry_payload) {
+            let retry_exec = match serde_json::from_slice(&retry_payload) {
                 Ok(d) => d,
                 Err(e) => {
                     warn!(target: "n42::cl::exec_bridge", %retry_hash, error = %e, "failed to deserialize retry payload");
@@ -997,25 +949,6 @@ impl ConsensusOrchestrator {
                 inject_compact_block(&retry_hash, exec_compressed, "retry_syncing");
             }
 
-            // Guard: acquire IN_FLIGHT lock before retry new_payload.
-            let retry_block_num = retry_exec.block_number();
-            let rprev = self.eager_import_block_guard.load(std::sync::atomic::Ordering::SeqCst);
-            if rprev == IN_FLIGHT || retry_block_num != rprev + 1 {
-                // Can't import yet — re-queue for later.
-                if retry_count < MAX_SYNCING_RETRIES {
-                    self.syncing_blocks.push_back((data, retry_count + 1));
-                }
-                continue;
-            }
-            if self.eager_import_block_guard.compare_exchange(
-                rprev, IN_FLIGHT, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst
-            ).is_err() {
-                if retry_count < MAX_SYNCING_RETRIES {
-                    self.syncing_blocks.push_back((data, retry_count + 1));
-                }
-                continue;
-            }
-
             match engine_handle.new_payload(retry_exec).await {
                 Ok(rs)
                     if matches!(
@@ -1023,7 +956,6 @@ impl ConsensusOrchestrator {
                         PayloadStatusEnum::Valid | PayloadStatusEnum::Accepted
                     ) =>
                 {
-                    self.eager_import_block_guard.store(retry_block_num, std::sync::atomic::Ordering::SeqCst);
                     info!(target: "n42::cl::exec_bridge", %retry_hash, "syncing block retry succeeded");
                     let fcu = ForkchoiceState {
                         head_block_hash: retry_hash,
@@ -1042,7 +974,6 @@ impl ConsensusOrchestrator {
                     }
                 }
                 Ok(rs) if matches!(rs.status, PayloadStatusEnum::Syncing) => {
-                    self.eager_import_block_guard.store(rprev, std::sync::atomic::Ordering::SeqCst);
                     let next_retry = retry_count + 1;
                     if next_retry >= MAX_SYNCING_RETRIES {
                         warn!(target: "n42::cl::exec_bridge", %retry_hash, retries = next_retry, "syncing block exceeded max retries, dropping");
@@ -1052,11 +983,9 @@ impl ConsensusOrchestrator {
                     }
                 }
                 Ok(rs) => {
-                    self.eager_import_block_guard.store(rprev, std::sync::atomic::Ordering::SeqCst);
                     warn!(target: "n42::cl::exec_bridge", %retry_hash, status = ?rs.status, "retry rejected");
                 }
                 Err(e) => {
-                    self.eager_import_block_guard.store(rprev, std::sync::atomic::Ordering::SeqCst);
                     warn!(target: "n42::cl::exec_bridge", %retry_hash, error = %e, "retry new_payload failed");
                 }
             }
@@ -1158,16 +1087,16 @@ async fn handle_built_payload(
     //
     //    Guard: prevent importing the same block number with different hashes,
     //    which triggers reth pipeline sync and chain stalls.
-    // Guard: same IN_FLIGHT protocol as follower eager import and bg import.
     let block_number = payload.block().header().number;
-    const IN_FLIGHT: u64 = u64::MAX;
-    let prev = block_guard.load(std::sync::atomic::Ordering::SeqCst);
-    if prev == IN_FLIGHT || block_number != prev + 1 {
+    let prev = block_guard.fetch_max(block_number, std::sync::atomic::Ordering::SeqCst);
+    if prev >= block_number {
+        debug!(target: "n42::cl::exec_bridge", %hash, block_number, prev, "leader eager import: skipping duplicate block number");
         return;
     }
-    if block_guard.compare_exchange(prev, IN_FLIGHT, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst).is_err() {
-        return;
-    }
+    // Leader eager import: only run new_payload (no FCU).
+    // Inserts block into reth's engine tree so finalize_committed_block's FCU
+    // can accept it instantly. We skip FCU to avoid changing canonical chain —
+    // only finalize_committed_block (after consensus commit) should do FCU.
     let import_start = std::time::Instant::now();
     match engine_handle.new_payload(execution_data).await {
         Ok(status)
@@ -1176,7 +1105,6 @@ async fn handle_built_payload(
                 PayloadStatusEnum::Valid | PayloadStatusEnum::Accepted
             ) =>
         {
-            block_guard.store(block_number, std::sync::atomic::Ordering::SeqCst);
             let np_elapsed = import_start.elapsed().as_millis() as u64;
             info!(target: "n42::cl::exec_bridge", %hash, np_elapsed, "eager import: new_payload accepted (no FCU)");
             metrics::counter!("n42_eager_import_hits_total").increment(1);
@@ -1189,11 +1117,9 @@ async fn handle_built_payload(
             }
         }
         Ok(status) => {
-            block_guard.store(prev, std::sync::atomic::Ordering::SeqCst);
             info!(target: "n42::cl::exec_bridge", %hash, status = ?status.status, elapsed_ms = import_start.elapsed().as_millis() as u64, "eager import: new_payload not accepted");
         }
         Err(e) => {
-            block_guard.store(prev, std::sync::atomic::Ordering::SeqCst);
             info!(target: "n42::cl::exec_bridge", %hash, error = %e, "eager import: new_payload failed");
         }
     }

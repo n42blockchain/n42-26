@@ -2,7 +2,7 @@ use super::ConsensusOrchestrator;
 use super::state_mgmt::max_consecutive_empty_skips;
 use crate::expected_validator_peer_ids_with_policy;
 use alloy_primitives::B256;
-use alloy_rpc_types_engine::{ExecutionData, ForkchoiceState, PayloadStatusEnum};
+use alloy_rpc_types_engine::{ForkchoiceState, PayloadStatusEnum};
 use metrics::{counter, gauge, histogram};
 use n42_consensus::EngineOutput;
 use n42_primitives::{ConsensusMessage, QuorumCertificate};
@@ -707,10 +707,9 @@ impl ConsensusOrchestrator {
                 return;
             }
         };
-        let guard = self.eager_import_block_guard.clone();
         info!(target: "n42::cl::consensus_loop", view, %block_hash, "spawning background import");
         tokio::spawn(async move {
-            let (success, block_ts) = Self::background_import(eh, &data, block_hash, &guard).await;
+            let (success, block_ts) = Self::background_import(eh, &data, block_hash).await;
             if done_tx
                 .send((block_hash, view, success, block_ts))
                 .await
@@ -722,14 +721,11 @@ impl ConsensusOrchestrator {
     }
 
     /// Runs `new_payload` + `fork_choice_updated` in a background task.
-    /// Uses the same `block_guard` as eager import to prevent sending
-    /// `new_payload` for a block whose parent isn't in reth's engine tree.
     /// Returns (success, block_timestamp).
     async fn background_import(
         engine_handle: ConsensusEngineHandle<EthEngineTypes>,
         data: &[u8],
         block_hash: B256,
-        block_guard: &std::sync::atomic::AtomicU64,
     ) -> (bool, u64) {
         let broadcast: super::BlockDataBroadcast = match bincode::deserialize(data) {
             Ok(b) => b,
@@ -749,38 +745,13 @@ impl ConsensusOrchestrator {
                 return (false, 0);
             }
         };
-        let execution_data: ExecutionData = match serde_json::from_slice(&payload_json) {
+        let execution_data = match serde_json::from_slice(&payload_json) {
             Ok(d) => d,
             Err(e) => {
                 warn!(target: "n42::cl::consensus_loop", %block_hash, error = %e, "bg import: failed to parse execution payload");
                 return (false, 0);
             }
         };
-
-        // Guard: acquire IN_FLIGHT lock on block_guard before calling new_payload.
-        // This ensures bg import and eager import never race — only one new_payload
-        // at a time, with strict parent ordering.
-        let block_number = execution_data.block_number();
-        const IN_FLIGHT: u64 = u64::MAX;
-        let prev = block_guard.load(std::sync::atomic::Ordering::SeqCst);
-        if prev == IN_FLIGHT || block_number != prev + 1 {
-            // Another import is in-flight, or parent not imported yet.
-            // Return false so handle_import_done can retry or request sync.
-            warn!(
-                target: "n42::cl::consensus_loop",
-                %block_hash,
-                block_number,
-                guard = prev,
-                "bg import: skipping new_payload (guard mismatch or in-flight)"
-            );
-            return (false, 0);
-        }
-        if block_guard
-            .compare_exchange(prev, IN_FLIGHT, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst)
-            .is_err()
-        {
-            return (false, 0); // lost race to eager import
-        }
 
         // Compact Block: load execution output into payload cache before `new_payload`.
         if let Some(ref exec_compressed) = broadcast.execution_output
@@ -811,30 +782,14 @@ impl ConsensusOrchestrator {
                 {
                     error!(target: "n42::cl::consensus_loop", %block_hash, error = %e, "bg import: fcu failed");
                 }
-                // SUCCESS: advance guard from IN_FLIGHT to block_number.
-                block_guard.store(block_number, std::sync::atomic::Ordering::SeqCst);
-                info!(target: "n42::cl::consensus_loop", %block_hash, block_number, "bg import: block imported successfully");
+                info!(target: "n42::cl::consensus_loop", %block_hash, "bg import: block imported successfully");
                 (true, block_timestamp)
             }
             Ok(status) => {
-                // FAILURE: roll back guard from IN_FLIGHT to prev.
-                block_guard.store(prev, std::sync::atomic::Ordering::SeqCst);
-                if matches!(&status.status, PayloadStatusEnum::Invalid { .. }) {
-                    error!(
-                        target: "n42::cl::consensus_loop",
-                        %block_hash,
-                        validation_error = status.status.validation_error().unwrap_or("unknown"),
-                        "bg import: block INVALID — requesting sync to recover"
-                    );
-                    counter!("n42_invalid_blocks_total").increment(1);
-                } else {
-                    warn!(target: "n42::cl::consensus_loop", %block_hash, status = ?status.status, "bg import: new_payload rejected");
-                }
+                warn!(target: "n42::cl::consensus_loop", %block_hash, status = ?status.status, "bg import: new_payload rejected");
                 (false, 0)
             }
             Err(e) => {
-                // FAILURE: roll back guard from IN_FLIGHT to prev.
-                block_guard.store(prev, std::sync::atomic::Ordering::SeqCst);
                 error!(target: "n42::cl::consensus_loop", %block_hash, error = %e, "bg import: new_payload failed");
                 (false, 0)
             }
