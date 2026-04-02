@@ -822,7 +822,7 @@ impl N42ApiServer for N42RpcServer {
 
         reply_rx.await
             .map_err(|_| ErrorObjectOwned::owned(-32603, "consensus loop dropped reply", None::<()>))?
-            .map(|()| "validator add queued; stages at next CommitQC, activates at next epoch boundary".to_string())
+            .map(|()| "validator add queued; will be included in Proposal when this node is leader, stages at CommitQC, activates at epoch boundary".to_string())
             .map_err(|e| ErrorObjectOwned::owned(-32003, e, None::<()>))
     }
 
@@ -843,7 +843,7 @@ impl N42ApiServer for N42RpcServer {
 
         reply_rx.await
             .map_err(|_| ErrorObjectOwned::owned(-32603, "consensus loop dropped reply", None::<()>))?
-            .map(|()| "validator remove queued; stages at next CommitQC, activates at next epoch boundary".to_string())
+            .map(|()| "validator remove queued; will be included in Proposal when this node is leader, stages at CommitQC, activates at epoch boundary".to_string())
             .map_err(|e| ErrorObjectOwned::owned(-32003, e, None::<()>))
     }
 }

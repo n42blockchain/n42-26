@@ -173,6 +173,12 @@ impl ConsensusEngine {
             }
         }
 
+        // Apply validator changes from the leader's Proposal.
+        // `Some(changes)` → leader has changes, replace local pending.
+        // `None` → leader has no changes. Do NOT clear local pending —
+        // this node may have pending changes from RPC that haven't been
+        // included in a Proposal yet (the node wasn't leader). They will
+        // be included when this node next becomes leader.
         const MAX_CHANGES_PER_PROPOSAL: usize = 4;
         if let Some(ref changes) = proposal.validator_changes {
             if changes.len() > MAX_CHANGES_PER_PROPOSAL {
@@ -182,8 +188,6 @@ impl ConsensusEngine {
                 });
             }
             self.epoch_manager.replace_pending_from_proposal(changes);
-        } else {
-            self.epoch_manager.clear_pending_changes();
         }
 
         // Store pending tx_root_hash for future DA verification if present.
