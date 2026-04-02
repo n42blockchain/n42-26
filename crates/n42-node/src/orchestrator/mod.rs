@@ -490,20 +490,16 @@ impl ConsensusOrchestrator {
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                 warn!(target: "n42::cl::tx", reason, "tx import channel closed");
             }
-            Err(tokio::sync::mpsc::error::TrySendError::Full(batch)) => {
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_batch)) => {
+                // Drop the batch instead of blocking the consensus loop.
+                // Under high load, waiting for the TX import channel to drain
+                // causes event starvation and invalid-ancestor cascades.
                 warn!(
                     target: "n42::cl::tx",
                     reason,
-                    "tx import channel full, waiting to enqueue"
+                    "tx import channel full, dropping batch to avoid blocking consensus loop"
                 );
-                if let Err(error) = tx.send(batch).await {
-                    warn!(
-                        target: "n42::cl::tx",
-                        reason,
-                        error = %error,
-                        "tx import enqueue failed after backpressure wait"
-                    );
-                }
+                counter!("n42_tx_import_drops_total").increment(1);
             }
         }
     }
@@ -1107,7 +1103,7 @@ impl ConsensusOrchestrator {
 
     /// Broadcasts a consensus message using Rotor relay: send directly to relay nodes,
     /// then always broadcast via GossipSub as safety net.
-    async fn broadcast_via_rotor(&mut self, msg: n42_primitives::ConsensusMessage) {
+    fn broadcast_via_rotor(&mut self, msg: n42_primitives::ConsensusMessage) {
         use n42_consensus::rotor::cached_relay_assignment;
 
         let view = self.engine.current_view();
@@ -1119,7 +1115,9 @@ impl ConsensusOrchestrator {
         let mut direct_fail = 0u32;
         for (relay_idx, _targets) in &assignment.relays {
             if let Some(peer_id) = self.network.validator_peer(*relay_idx) {
-                match self.network.send_direct_reliable(peer_id, msg.clone()).await {
+                // Fire-and-forget: do NOT await relay sends. Blocking the consensus
+                // loop on network I/O causes event starvation under 48K+ load.
+                match self.network.send_direct(peer_id, msg.clone()) {
                     Ok(()) => direct_ok += 1,
                     Err(e) => {
                         warn!(
@@ -1136,8 +1134,8 @@ impl ConsensusOrchestrator {
             }
         }
 
-        // Always broadcast via GossipSub as safety net
-        if let Err(e) = self.network.broadcast_consensus_reliable(msg).await {
+        // Always broadcast via GossipSub as safety net (non-blocking)
+        if let Err(e) = self.network.broadcast_consensus(msg) {
             error!(target: "n42::cl::rotor", error = %e, "rotor: gossipsub fallback failed");
         }
 

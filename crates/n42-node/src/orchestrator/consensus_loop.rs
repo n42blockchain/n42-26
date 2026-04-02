@@ -126,7 +126,7 @@ impl ConsensusOrchestrator {
         match output {
             EngineOutput::BroadcastMessage(msg) => {
                 if matches!(&msg, ConsensusMessage::Proposal(_)) && self.engine.is_current_leader() {
-                    self.broadcast_via_rotor(msg).await;
+                    self.broadcast_via_rotor(msg);
                 } else {
                     // Fire-and-forget: do NOT await — blocking the consensus loop on
                     // network I/O causes event starvation under 48K+ load, leading to
