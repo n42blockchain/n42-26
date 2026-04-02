@@ -278,7 +278,7 @@ impl ConsensusOrchestrator {
             prev_randao: self.prev_randao_cache,
             suggested_fee_recipient: self.fee_recipient,
             withdrawals: Some(withdrawals),
-            parent_beacon_block_root: Some(self.last_evidence_root),
+            parent_beacon_block_root: Some(B256::ZERO),
         }
     }
 
