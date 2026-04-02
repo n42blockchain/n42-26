@@ -1039,6 +1039,7 @@ fn main() {
                         snapshot.locked_qc,
                         snapshot.last_committed_qc,
                         snapshot.consecutive_timeouts,
+                        snapshot.last_voted_view,
                     )
                 } else {
                     info!(target: "n42::cli", "no consensus snapshot found, starting fresh");

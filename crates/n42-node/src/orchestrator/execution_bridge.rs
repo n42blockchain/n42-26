@@ -607,31 +607,32 @@ impl ConsensusOrchestrator {
                     has_compact_block = execution_output_compressed.is_some(),
                     "N42_DECOMPRESS: follower payload decoded"
                 );
-                // Guard against duplicate imports and out-of-order imports.
-                // Sending new_payload for a block whose parent isn't in reth yet
-                // causes reth to permanently mark it as "bad block" (invalid ancestor),
-                // poisoning all descendant blocks irreversibly.
+                // Guard: strict sequential eager import with in-flight lock.
+                //
+                // CRITICAL: reth permanently poisons a block if new_payload is
+                // called when the parent isn't in the engine tree. All descendants
+                // are then irreversibly rejected ("invalid ancestor").
+                //
+                // The guard stores the highest block ACCEPTED by reth, or u64::MAX
+                // while a new_payload call is in-flight.  This ensures:
+                //   - Only block == guard+1 can proceed (no gaps)
+                //   - Only one new_payload in-flight at a time (u64::MAX lock)
+                //   - On failure, guard rolls back so the block retries via bg-import
+                const IN_FLIGHT: u64 = u64::MAX;
                 let block_number = execution_data.block_number();
                 let tx_count = execution_data.transaction_count();
                 let prev = block_guard.load(std::sync::atomic::Ordering::SeqCst);
-                if block_number <= prev {
-                    info!(target: "n42::cl::exec_bridge", %hash, view, block_number, prev, "follower eager import: skipping duplicate block number");
+                if prev == IN_FLIGHT || block_number != prev + 1 {
+                    return; // in-flight, duplicate, or gap
+                }
+                // CAS: claim the lock (prev → IN_FLIGHT). Only one task can win.
+                if block_guard
+                    .compare_exchange(prev, IN_FLIGHT, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst)
+                    .is_err()
+                {
                     return;
                 }
-                if block_number > prev + 1 {
-                    // Parent block hasn't been eagerly imported yet.
-                    // Do NOT send new_payload — reth would return Syncing/Invalid
-                    // and permanently poison this block and all descendants.
-                    // The block will be imported later via finalize_committed_block
-                    // or background import (which processes blocks sequentially).
-                    debug!(target: "n42::cl::exec_bridge", %hash, view, block_number, prev,
-                        "follower eager import: skipping (parent not yet imported, gap={gap})",
-                        gap = block_number - prev
-                    );
-                    return;
-                }
-                // Parent is the previous block — safe to proceed.
-                block_guard.store(block_number, std::sync::atomic::Ordering::SeqCst);
+                // Lock acquired. Advance to block_number on success, rollback to prev on failure.
 
                 // Compact Block: load execution output into payload cache before `new_payload`.
                 // This lets reth skip EVM re-execution (cache hit path), reducing import from
@@ -699,21 +700,24 @@ impl ConsensusOrchestrator {
                             metrics::counter!("n42_compact_block_cache_hits").increment(1);
                         }
                         metrics::counter!("n42_follower_eager_import_hits_total").increment(1);
+                        // SUCCESS: advance guard from IN_FLIGHT to block_number.
+                        block_guard.store(block_number, std::sync::atomic::Ordering::SeqCst);
                         if eager_done_tx.send((hash, block_ts)).await.is_err() {
                             debug!(target: "n42::cl::exec_bridge", %hash, view, "eager import completion receiver dropped");
                         }
                     }
                     Ok(status) => {
-                        // Non-Valid response: roll back guard so retries are possible.
-                        // This block will be imported later via the sequential bg-import path.
-                        block_guard.fetch_min(block_number.saturating_sub(1), std::sync::atomic::Ordering::SeqCst);
+                        // FAILURE: roll back guard from IN_FLIGHT to prev.
+                        block_guard.store(prev, std::sync::atomic::Ordering::SeqCst);
                         debug!(target: "n42::cl::exec_bridge", %hash, view, status = ?status.status, block_number, compact_injected,
-                            "follower eager import: not accepted, rolled back block guard for retry");
+                            "follower eager import: not accepted, guard rolled back to {prev}");
                         if compact_injected {
                             metrics::counter!("n42_compact_block_cache_misses").increment(1);
                         }
                     }
                     Err(e) => {
+                        // FAILURE: roll back guard from IN_FLIGHT to prev.
+                        block_guard.store(prev, std::sync::atomic::Ordering::SeqCst);
                         debug!(target: "n42::cl::exec_bridge", %hash, view, error = %e, compact_injected, "follower eager import: failed");
                         if compact_injected {
                             metrics::counter!("n42_compact_block_cache_misses").increment(1);
