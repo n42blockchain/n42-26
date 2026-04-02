@@ -128,7 +128,10 @@ impl ConsensusOrchestrator {
                 if matches!(&msg, ConsensusMessage::Proposal(_)) && self.engine.is_current_leader() {
                     self.broadcast_via_rotor(msg).await;
                 } else {
-                    if let Err(e) = self.network.broadcast_consensus_reliable(msg).await {
+                    // Fire-and-forget: do NOT await — blocking the consensus loop on
+                    // network I/O causes event starvation under 48K+ load, leading to
+                    // delayed block imports and invalid-ancestor cascades.
+                    if let Err(e) = self.network.broadcast_consensus(msg) {
                         error!(target: "n42::cl::consensus_loop", error = %e, "failed to broadcast consensus message");
                     }
                 }
@@ -138,21 +141,10 @@ impl ConsensusOrchestrator {
                 // can silently fail (QUIC transport issues), so always broadcast as backup.
                 // The consensus engine deduplicates votes by (view, voter).
                 if let Some(peer_id) = self.network.validator_peer(target) {
-                    if let Err(error) = self
-                        .network
-                        .send_direct_reliable(peer_id, msg.clone())
-                        .await
-                    {
-                        warn!(
-                            target: "n42::cl::consensus_loop",
-                            target_validator = target,
-                            %peer_id,
-                            error = %error,
-                            "direct consensus send failed, falling back to broadcast only"
-                        );
-                    }
+                    let _ = self.network.send_direct(peer_id, msg.clone());
                 }
-                if let Err(e) = self.network.broadcast_consensus_reliable(msg).await {
+                // Fire-and-forget broadcast (non-blocking).
+                if let Err(e) = self.network.broadcast_consensus(msg) {
                     error!(target: "n42::cl::consensus_loop", target_validator = target, error = %e, "broadcast failed");
                 }
             }
