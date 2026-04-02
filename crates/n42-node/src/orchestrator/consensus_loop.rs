@@ -168,7 +168,7 @@ impl ConsensusOrchestrator {
                 target_view,
             } => {
                 counter!("n42_sync_required_total").increment(1);
-                self.initiate_sync(local_view, target_view).await;
+                self.initiate_sync(local_view, target_view);
             }
             EngineOutput::EquivocationDetected {
                 view,
@@ -389,9 +389,11 @@ impl ConsensusOrchestrator {
             let store = Arc::clone(evidence_store);
             let block_number = self.committed_block_count;
             let root = self.last_evidence_root;
-            // Await the write so evidence is on disk before snapshot persists
-            // committed_block_count — prevents stale root after crash.
-            let _ = tokio::task::spawn_blocking(move || {
+            // Fire-and-forget: do NOT await MDBX write on the consensus hot path.
+            // Blocking here under 48K load causes event starvation.
+            // Evidence may be lost on crash but this is acceptable — the QC
+            // is already persisted in the consensus snapshot.
+            tokio::task::spawn_blocking(move || {
                 if let Err(e) = store.put_raw(block_number, &encoded, &root_bytes) {
                     tracing::warn!(
                         target: "n42::cl::evidence",
@@ -405,7 +407,7 @@ impl ConsensusOrchestrator {
                         "consensus evidence stored"
                     );
                 }
-            }).await;
+            });
         }
 
         // Refresh RPC-visible epoch status (captures pending→staged transition from CommitQC).
@@ -835,7 +837,7 @@ impl ConsensusOrchestrator {
                 self.pending_block_data.clear();
                 self.pending_executions.clear();
                 // Trigger sync to recover the missing block
-                self.initiate_sync(stale_view, new_view).await;
+                self.initiate_sync(stale_view, new_view);
             }
         }
         // NOTE: We intentionally do NOT clear pending_block_data here.
@@ -896,7 +898,7 @@ impl ConsensusOrchestrator {
             for (_, queued_hash, _) in self.bg_import_queue.drain(..) {
                 self.bg_import_hashes.remove(&queued_hash);
             }
-            self.initiate_sync(view, self.engine.current_view()).await;
+            self.initiate_sync(view, self.engine.current_view());
             return;
         }
 

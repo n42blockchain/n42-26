@@ -153,7 +153,7 @@ impl ConsensusOrchestrator {
 impl ConsensusOrchestrator {
     /// Initiates a state sync request to a connected peer.
     /// Uses deterministic peer rotation by view number to avoid always hitting the same peer.
-    pub(super) async fn initiate_sync(&mut self, local_view: u64, target_view: u64) {
+    pub(super) fn initiate_sync(&mut self, local_view: u64, target_view: u64) {
         if self.sync_in_flight {
             let timed_out = self
                 .sync_started_at
@@ -192,7 +192,7 @@ impl ConsensusOrchestrator {
             local_committed_view: local_view,
         };
 
-        if let Err(e) = self.network.request_sync_reliable(peer, request).await {
+        if let Err(e) = self.network.request_sync(peer, request) {
             error!(target: "n42::cl::sync", error = %e, "failed to send sync request");
             return;
         }
