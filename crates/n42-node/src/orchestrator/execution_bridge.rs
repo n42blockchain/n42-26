@@ -278,7 +278,10 @@ impl ConsensusOrchestrator {
             prev_randao: self.prev_randao_cache,
             suggested_fee_recipient: self.fee_recipient,
             withdrawals: Some(withdrawals),
-            parent_beacon_block_root: Some(B256::ZERO),
+            // EIP-4788: use the parent block hash as a deterministic beacon root.
+            // N42 has no beacon chain; using the head block hash ensures all nodes
+            // derive the same value (they agree on the canonical head).
+            parent_beacon_block_root: Some(self.head_block_hash),
         }
     }
 
