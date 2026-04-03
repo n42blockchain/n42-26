@@ -334,7 +334,6 @@ impl ConsensusOrchestrator {
                 };
                 let encoded = evidence.encode();
                 let root_bytes = *blake3::hash(&encoded).as_bytes();
-                self.last_evidence_root = alloy_primitives::B256::from(root_bytes);
                 let store = std::sync::Arc::clone(evidence_store);
                 let bn = self.committed_block_count;
                 // Keep sync recovery crash-safe: do not persist the updated

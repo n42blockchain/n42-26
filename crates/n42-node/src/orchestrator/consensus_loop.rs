@@ -385,11 +385,9 @@ impl ConsensusOrchestrator {
             };
             let encoded = evidence.encode();
             let root_bytes = *blake3::hash(&encoded).as_bytes();
-            self.last_evidence_root = B256::from(root_bytes);
 
             let store = Arc::clone(evidence_store);
             let block_number = self.committed_block_count;
-            let root = self.last_evidence_root;
             // Fire-and-forget: do NOT await MDBX write on the consensus hot path.
             // Blocking here under 48K load causes event starvation.
             // Evidence may be lost on crash but this is acceptable — the QC
@@ -400,12 +398,6 @@ impl ConsensusOrchestrator {
                         target: "n42::cl::evidence",
                         block_number, error = %e,
                         "failed to store consensus evidence"
-                    );
-                } else {
-                    tracing::debug!(
-                        target: "n42::cl::evidence",
-                        block_number, %root,
-                        "consensus evidence stored"
                     );
                 }
             });

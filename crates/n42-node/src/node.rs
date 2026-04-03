@@ -3,7 +3,6 @@ use crate::consensus_state::SharedConsensusState;
 use crate::payload::N42PayloadBuilder;
 use crate::pool::N42PoolBuilder;
 use n42_consensus::ValidatorSetResolver;
-use n42_jmt::EvidenceStore;
 use reth_chainspec::ChainSpec;
 use reth_ethereum_engine_primitives::EthEngineTypes;
 use reth_ethereum_primitives::EthPrimitives;
@@ -26,7 +25,6 @@ use std::sync::Arc;
 pub struct N42Node {
     pub consensus_state: Arc<SharedConsensusState>,
     pub validator_set_resolver: Option<ValidatorSetResolver>,
-    pub evidence_store: Option<Arc<EvidenceStore>>,
 }
 
 impl std::fmt::Debug for N42Node {
@@ -36,7 +34,6 @@ impl std::fmt::Debug for N42Node {
                 "has_validator_set_resolver",
                 &self.validator_set_resolver.is_some(),
             )
-            .field("has_evidence_store", &self.evidence_store.is_some())
             .finish()
     }
 }
@@ -46,7 +43,6 @@ impl N42Node {
         Self {
             consensus_state,
             validator_set_resolver: None,
-            evidence_store: None,
         }
     }
 
@@ -58,10 +54,6 @@ impl N42Node {
         self
     }
 
-    pub fn with_evidence_store(mut self, store: Arc<EvidenceStore>) -> Self {
-        self.evidence_store = Some(store);
-        self
-    }
 }
 
 impl NodeTypes for N42Node {
@@ -101,9 +93,6 @@ where
                     N42ConsensusBuilder::new(Some(self.consensus_state.validator_set.clone()));
                 if let Some(resolver) = self.validator_set_resolver.clone() {
                     builder = builder.with_validator_set_resolver(resolver);
-                }
-                if let Some(ref store) = self.evidence_store {
-                    builder = builder.with_evidence_store(Arc::clone(store));
                 }
                 builder
             })

@@ -536,11 +536,8 @@ fn main() {
                 .ok()
         };
 
-        let mut n42_node = N42Node::new(consensus_state.clone())
+        let n42_node = N42Node::new(consensus_state.clone())
             .with_validator_set_resolver(validator_set_resolver);
-        if let Some(ref store) = evidence_store {
-            n42_node = n42_node.with_evidence_store(Arc::clone(store));
-        }
 
         // Create staking manager early so it can be shared with RPC.
         let staking_state_file = data_dir.join("staking_state.json");
@@ -1150,22 +1147,6 @@ fn main() {
                 }
                 if let Some(ref store) = evidence_store {
                     orchestrator = orchestrator.with_evidence_store(Arc::clone(store));
-                    // Recover last_evidence_root from MDBX for crash recovery.
-                    if restored_block_count > 0 {
-                        match store.get_root(restored_block_count) {
-                            Ok(Some(root)) => {
-                                orchestrator = orchestrator
-                                    .with_recovered_evidence_root(alloy_primitives::B256::from(root));
-                                info!(target: "n42::cli", block = restored_block_count, "recovered evidence root");
-                            }
-                            Ok(None) => {
-                                info!(target: "n42::cli", block = restored_block_count, "no evidence for last block");
-                            }
-                            Err(e) => {
-                                warn!(target: "n42::cli", error = %e, "failed to recover evidence root");
-                            }
-                        }
-                    }
                 }
 
                 let orchestrator = orchestrator;

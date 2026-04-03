@@ -1,5 +1,4 @@
 use arc_swap::ArcSwapOption;
-use n42_jmt::EvidenceStore;
 use reth_chainspec::{ChainSpec, EthChainSpec, EthereumHardforks};
 use reth_consensus::{Consensus, ConsensusError, FullConsensus, HeaderValidator};
 use reth_ethereum_consensus::EthBeaconConsensus;
@@ -34,10 +33,6 @@ pub struct N42Consensus<C = ChainSpec> {
     validator_set: Arc<ArcSwapOption<ValidatorSet>>,
     /// Optional epoch-aware validator-set resolver for QC verification.
     validator_set_resolver: Option<ValidatorSetResolver>,
-    /// Evidence store for persisting consensus evidence (QC + mobile attestation).
-    /// Evidence is stored in MDBX indexed by block number; `parent_beacon_block_root`
-    /// is NOT used for evidence (always B256::ZERO to satisfy Cancun).
-    evidence_store: Option<Arc<EvidenceStore>>,
 }
 
 impl<C> std::fmt::Debug for N42Consensus<C> {
@@ -48,7 +43,6 @@ impl<C> std::fmt::Debug for N42Consensus<C> {
                 "has_validator_set_resolver",
                 &self.validator_set_resolver.is_some(),
             )
-            .field("has_evidence_store", &self.evidence_store.is_some())
             .finish()
     }
 }
@@ -64,7 +58,6 @@ where
             inner: EthBeaconConsensus::new(chain_spec),
             validator_set: Arc::new(ArcSwapOption::empty()),
             validator_set_resolver: None,
-            evidence_store: None,
         }
     }
 
@@ -95,14 +88,7 @@ where
             inner: EthBeaconConsensus::new(chain_spec),
             validator_set,
             validator_set_resolver,
-            evidence_store: None,
         }
-    }
-
-    /// Attaches an evidence store for consensus evidence persistence.
-    pub fn with_evidence_store(mut self, store: Arc<EvidenceStore>) -> Self {
-        self.evidence_store = Some(store);
-        self
     }
 
     /// Sets or updates the validator set.
@@ -136,8 +122,6 @@ where
             result,
             receipt_root_bloom,
         )
-        // N42 does NOT use parent_beacon_block_root for consensus evidence.
-        // Evidence is stored in MDBX only; the header field is always B256::ZERO.
     }
 }
 

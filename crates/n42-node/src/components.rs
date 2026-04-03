@@ -1,7 +1,6 @@
 use arc_swap::ArcSwapOption;
 use n42_consensus::{N42Consensus, ValidatorSet, ValidatorSetResolver};
 use n42_execution::N42EvmConfig;
-use n42_jmt::EvidenceStore;
 use reth_chainspec::{ChainSpec, EthChainSpec, EthereumHardforks};
 use reth_ethereum_primitives::EthPrimitives;
 use reth_node_builder::{
@@ -39,7 +38,6 @@ where
 pub struct N42ConsensusBuilder {
     validator_set: Option<Arc<ArcSwapOption<ValidatorSet>>>,
     validator_set_resolver: Option<ValidatorSetResolver>,
-    evidence_store: Option<Arc<EvidenceStore>>,
 }
 
 impl std::fmt::Debug for N42ConsensusBuilder {
@@ -50,7 +48,6 @@ impl std::fmt::Debug for N42ConsensusBuilder {
                 "has_validator_set_resolver",
                 &self.validator_set_resolver.is_some(),
             )
-            .field("has_evidence_store", &self.evidence_store.is_some())
             .finish()
     }
 }
@@ -60,7 +57,6 @@ impl N42ConsensusBuilder {
         Self {
             validator_set,
             validator_set_resolver: None,
-            evidence_store: None,
         }
     }
 
@@ -72,10 +68,6 @@ impl N42ConsensusBuilder {
         self
     }
 
-    pub fn with_evidence_store(mut self, store: Arc<EvidenceStore>) -> Self {
-        self.evidence_store = Some(store);
-        self
-    }
 }
 
 impl<Node> ConsensusBuilder<Node> for N42ConsensusBuilder
@@ -89,7 +81,7 @@ where
     async fn build_consensus(self, ctx: &BuilderContext<Node>) -> eyre::Result<Self::Consensus> {
         let chain_spec = ctx.chain_spec();
 
-        let mut consensus = if let Some(validator_set) = self.validator_set {
+        let consensus = if let Some(validator_set) = self.validator_set {
             let current = validator_set.load_full();
             info!(
                 target: "n42::consensus",
@@ -106,10 +98,6 @@ where
             info!(target: "n42::consensus", "No initial validators configured, QC verification disabled");
             N42Consensus::new(chain_spec)
         };
-
-        if let Some(store) = self.evidence_store {
-            consensus = consensus.with_evidence_store(store);
-        }
 
         Ok(Arc::new(consensus))
     }

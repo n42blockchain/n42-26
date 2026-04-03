@@ -341,9 +341,6 @@ pub struct ConsensusOrchestrator {
     /// MDBX-backed store for per-block consensus evidence (QC + mobile attestation).
     /// Shares the JMT MDBX environment. Written after each committed block.
     evidence_store: Option<Arc<n42_jmt::EvidenceStore>>,
-    /// Cached Blake3 hash of the last committed block's `ConsensusEvidence`.
-    /// Stored in MDBX only; NOT placed in block headers.
-    last_evidence_root: B256,
 }
 
 impl ConsensusOrchestrator {
@@ -425,7 +422,6 @@ impl ConsensusOrchestrator {
             allow_deterministic_validator_peers: true,
             admin_rx: None,
             evidence_store: None,
-            last_evidence_root: B256::ZERO,
         }
     }
 
@@ -601,7 +597,6 @@ impl ConsensusOrchestrator {
             allow_deterministic_validator_peers: true,
             admin_rx: None,
             evidence_store: None,
-            last_evidence_root: B256::ZERO,
         }
     }
 
@@ -692,11 +687,6 @@ impl ConsensusOrchestrator {
         self
     }
 
-    /// Restores the evidence root from the last committed block (crash recovery).
-    pub fn with_recovered_evidence_root(mut self, root: B256) -> Self {
-        self.last_evidence_root = root;
-        self
-    }
 
     pub fn with_tx_pool_bridge(
         mut self,
