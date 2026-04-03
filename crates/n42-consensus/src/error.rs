@@ -128,6 +128,10 @@ pub enum ConsensusError {
     /// A proposal contained too many validator changes (DoS protection).
     #[error("proposal contains {count} validator changes, max allowed is {max}")]
     TooManyValidatorChanges { count: usize, max: usize },
+
+    /// Dynamic validator changes require epochs to be enabled (epoch_length > 0).
+    #[error("epochs are disabled (epoch_length=0); dynamic validator changes require epoch_length > 0 in consensus config")]
+    EpochsDisabled,
 }
 
 /// Result type for consensus operations.

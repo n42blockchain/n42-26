@@ -280,8 +280,12 @@ impl EpochManager {
 
     // ── Commit-then-Activate: dynamic validator set changes ──────────────
 
-    /// Checks that proposals are allowed: no epoch transition may be staged yet.
+    /// Checks that proposals are allowed: epochs must be enabled and
+    /// no epoch transition may be staged yet.
     fn check_proposals_allowed(&self) -> ConsensusResult<()> {
+        if self.epoch_length == 0 {
+            return Err(ConsensusError::EpochsDisabled);
+        }
         if self.has_staged_next() {
             return Err(ConsensusError::EpochTransitionAlreadyStaged);
         }
@@ -1234,5 +1238,31 @@ mod tests {
             ValidatorChange::Add { address, .. } => assert_eq!(*address, infos[5].address),
             _ => panic!("expected Add"),
         }
+    }
+
+    #[test]
+    fn test_reject_proposals_when_epochs_disabled() {
+        let infos = make_validator_infos(4);
+        let vs = ValidatorSet::new(&infos, 1);
+        // epoch_length = 0 → epochs disabled
+        let mut em = EpochManager::new(vs);
+
+        let sk = test_key(0x20);
+        let new_v = ValidatorInfo {
+            address: Address::with_last_byte(0x10),
+            bls_public_key: sk.public_key(),
+            p2p_peer_id: None,
+        };
+        let err = em.propose_add_validator(new_v).unwrap_err();
+        assert!(
+            matches!(err, ConsensusError::EpochsDisabled),
+            "expected EpochsDisabled, got: {err}"
+        );
+
+        let err = em.propose_remove_validator(Address::with_last_byte(0)).unwrap_err();
+        assert!(
+            matches!(err, ConsensusError::EpochsDisabled),
+            "expected EpochsDisabled, got: {err}"
+        );
     }
 }
