@@ -195,9 +195,6 @@ impl EvidenceStore {
     }
 
     /// Returns just the 32-byte evidence root for a block (zero-allocation fast path).
-    ///
-    /// Used by [`N42Consensus::validate_block_post_execution`] to verify
-    /// `parent_beacon_block_root` without decoding the full evidence.
     pub fn get_root(&self, block_number: u64) -> eyre::Result<Option<[u8; 32]>> {
         let key = block_number.to_be_bytes();
         let tx = self.env.begin_ro_txn()?;

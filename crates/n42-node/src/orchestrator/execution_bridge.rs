@@ -278,11 +278,12 @@ impl ConsensusOrchestrator {
             prev_randao: self.prev_randao_cache,
             suggested_fee_recipient: self.fee_recipient,
             withdrawals: Some(withdrawals),
-            // N42 has no beacon chain. Pass None to skip EIP-4788 beacon root
-            // contract processing. Some(any_value) triggers the system contract
-            // call which then requires follower re-execution to produce the exact
-            // same stored value — impossible without a real beacon chain.
-            parent_beacon_block_root: None,
+            // N42 has no beacon chain. Use B256::ZERO as a deterministic placeholder.
+            // EIP-4788 system contract call is skipped in the reth patch
+            // (n42_skip_beacon_root), so this value won't cause state divergence
+            // between leader and followers. None is invalid for Cancun — reth
+            // rejects payload attributes without this field.
+            parent_beacon_block_root: Some(B256::ZERO),
         }
     }
 

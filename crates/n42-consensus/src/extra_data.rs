@@ -6,7 +6,7 @@ use reth_consensus::ConsensusError;
 /// ASCII "N42Q" = [0x4E, 0x34, 0x32, 0x51]
 ///
 /// **Legacy format**: consensus evidence is now stored in the MDBX
-/// `n42_consensus_evidence` table and referenced via `parent_beacon_block_root`.
+/// `n42_consensus_evidence` table (indexed by block number).
 /// This encoder/decoder is kept for backward compatibility with pre-migration blocks.
 const QC_MAGIC: &[u8; 4] = b"N42Q";
 

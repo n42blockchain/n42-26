@@ -1,4 +1,3 @@
-use alloy_primitives::B256;
 use arc_swap::ArcSwapOption;
 use n42_jmt::EvidenceStore;
 use reth_chainspec::{ChainSpec, EthChainSpec, EthereumHardforks};
@@ -6,7 +5,7 @@ use reth_consensus::{Consensus, ConsensusError, FullConsensus, HeaderValidator};
 use reth_ethereum_consensus::EthBeaconConsensus;
 use reth_execution_types::BlockExecutionResult;
 use reth_primitives_traits::{
-    AlloyBlockHeader, Block, BlockHeader, NodePrimitives, RecoveredBlock, SealedBlock, SealedHeader,
+    Block, BlockHeader, NodePrimitives, RecoveredBlock, SealedBlock, SealedHeader,
 };
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -35,9 +34,9 @@ pub struct N42Consensus<C = ChainSpec> {
     validator_set: Arc<ArcSwapOption<ValidatorSet>>,
     /// Optional epoch-aware validator-set resolver for QC verification.
     validator_set_resolver: Option<ValidatorSetResolver>,
-    /// Optional evidence store for verifying `parent_beacon_block_root`.
-    /// In N42, this header field stores `Blake3(ConsensusEvidence)` of the
-    /// parent block rather than a beacon chain root.
+    /// Evidence store for persisting consensus evidence (QC + mobile attestation).
+    /// Evidence is stored in MDBX indexed by block number; `parent_beacon_block_root`
+    /// is NOT used for evidence (always B256::ZERO to satisfy Cancun).
     evidence_store: Option<Arc<EvidenceStore>>,
 }
 
@@ -100,7 +99,7 @@ where
         }
     }
 
-    /// Attaches an evidence store for `parent_beacon_block_root` verification.
+    /// Attaches an evidence store for consensus evidence persistence.
     pub fn with_evidence_store(mut self, store: Arc<EvidenceStore>) -> Self {
         self.evidence_store = Some(store);
         self
@@ -136,51 +135,9 @@ where
             block,
             result,
             receipt_root_bloom,
-        )?;
-
-        // Verify parent_beacon_block_root == Blake3(ConsensusEvidence) of parent block.
-        // In N42 this field stores the consensus evidence root, not a beacon chain root.
-        if let Some(ref evidence_store) = self.evidence_store
-            && let Some(claimed_root) = block.header().parent_beacon_block_root()
-        {
-            let block_number = block.header().number();
-            if block_number <= 1 && claimed_root != B256::ZERO {
-                return Err(ConsensusError::Other(format!(
-                    "block {block_number}: parent_beacon_block_root should be zero for early blocks"
-                )));
-            } else if block_number > 1 {
-                let parent_number = block_number - 1;
-                match evidence_store.get_root(parent_number) {
-                    Ok(Some(stored_root)) => {
-                        let expected = B256::from(stored_root);
-                        if claimed_root != expected {
-                            return Err(ConsensusError::Other(format!(
-                                "block {block_number}: parent_beacon_block_root mismatch \
-                                 (header={claimed_root}, expected={expected})"
-                            )));
-                        }
-                    }
-                    Ok(None) => {
-                        tracing::debug!(
-                            target: "n42::consensus",
-                            block_number,
-                            parent_number,
-                            "no consensus evidence for parent, skipping root verification"
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            target: "n42::consensus",
-                            block_number,
-                            error = %e,
-                            "evidence store read error, skipping root verification"
-                        );
-                    }
-                }
-            }
-        }
-
-        Ok(())
+        )
+        // N42 does NOT use parent_beacon_block_root for consensus evidence.
+        // Evidence is stored in MDBX only; the header field is always B256::ZERO.
     }
 }
 

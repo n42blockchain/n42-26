@@ -370,8 +370,9 @@ impl ConsensusOrchestrator {
         self.prev_randao_cache = alloy_primitives::keccak256(commit_qc.aggregate_signature.to_bytes());
         self.last_commit_qc = Some(commit_qc.clone());
 
-        // Build and persist ConsensusEvidence; cache evidence root for next block's
-        // parent_beacon_block_root (replaces the previous hardcoded B256::ZERO).
+        // Build and persist ConsensusEvidence in MDBX for future verification.
+        // Note: evidence root is NOT placed in the block header (parent_beacon_block_root
+        // is always B256::ZERO for Cancun compatibility).
         // committed_block_count was incremented above; it equals the new block's number.
         if let Some(ref evidence_store) = self.evidence_store {
             let evidence = n42_jmt::ConsensusEvidence {

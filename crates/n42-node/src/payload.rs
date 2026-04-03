@@ -68,8 +68,9 @@ where
 /// Inner payload builder using the standard Ethereum payload flow.
 ///
 /// Consensus evidence (QC + optional mobile attestation) is stored in the MDBX
-/// `n42_consensus_evidence` table and referenced via `parent_beacon_block_root`
-/// (Blake3 hash of the evidence).  `extra_data` follows standard Ethereum limits.
+/// `n42_consensus_evidence` table (indexed by block number).
+/// `parent_beacon_block_root` is always B256::ZERO (Cancun placeholder).
+/// `extra_data` follows standard Ethereum limits.
 #[derive(Debug, Clone)]
 pub struct N42InnerPayloadBuilder<Pool, Client, Evm> {
     client: Client,

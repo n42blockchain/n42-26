@@ -342,7 +342,7 @@ pub struct ConsensusOrchestrator {
     /// Shares the JMT MDBX environment. Written after each committed block.
     evidence_store: Option<Arc<n42_jmt::EvidenceStore>>,
     /// Cached Blake3 hash of the last committed block's `ConsensusEvidence`.
-    /// Used as `parent_beacon_block_root` when building the next block's payload.
+    /// Stored in MDBX only; NOT placed in block headers.
     last_evidence_root: B256,
 }
 
