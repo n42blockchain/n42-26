@@ -1259,6 +1259,31 @@ impl ConsensusOrchestrator {
                             debug!(target: "n42::cl::orchestrator", error = %e, "benign safety check (QC ordering race)");
                         } else {
                             warn!(target: "n42::cl::orchestrator", error = %e, "error processing consensus message");
+                            // Bitmap length mismatch means the peer used a different epoch's
+                            // validator set to sign the QC/TC — our epoch state has diverged.
+                            // Trigger sync so we can recover the missing epoch transition.
+                            let is_bitmap_mismatch = matches!(
+                                &e,
+                                n42_consensus::N42ConsensusError::InvalidQC { reason, .. }
+                                    if reason.contains("bitmap length mismatch")
+                            ) || matches!(
+                                &e,
+                                n42_consensus::N42ConsensusError::InvalidTC { reason, .. }
+                                    if reason.contains("bitmap length mismatch")
+                            );
+                            if is_bitmap_mismatch {
+                                warn!(
+                                    target: "n42::cl::orchestrator",
+                                    current_view = self.engine.current_view(),
+                                    "epoch state divergence detected (bitmap mismatch) — triggering sync"
+                                );
+                                let local_view = self.engine.current_view();
+                                // Sync back one full epoch to ensure we capture the
+                                // validator-change block that we missed.
+                                let epoch_len = self.engine.epoch_manager().epoch_length().max(1);
+                                let from = local_view.saturating_sub(epoch_len * 2);
+                                self.initiate_sync(from, local_view);
+                            }
                         }
                     }
                 }
@@ -1454,6 +1479,7 @@ mod tests {
             view: 1,
             block_hash: B256::repeat_byte(0xDD),
             commit_qc,
+            validator_changes: None,
         })
         .await;
 
@@ -1618,6 +1644,7 @@ mod tests {
             view: 1,
             block_hash: B256::repeat_byte(0xEE),
             commit_qc,
+            validator_changes: None,
         })
         .await;
 
@@ -1669,7 +1696,7 @@ mod tests {
         orch.sync_in_flight = true;
         orch.sync_started_at = Some(Instant::now() - Duration::from_secs(60));
 
-        orch.initiate_sync(1, 10).await;
+        orch.initiate_sync(1, 10);
 
         assert!(orch.sync_in_flight, "new sync request should be in flight");
         let started = orch.sync_started_at.expect("sync_started_at should be set");

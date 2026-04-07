@@ -70,8 +70,15 @@ impl ConsensusOrchestrator {
 
     /// Builds a snapshot of the current consensus state for persistence.
     fn build_snapshot(&self) -> ConsensusSnapshot {
+        let em = self.engine.epoch_manager();
+        let current_epoch_validators = if em.epochs_enabled() {
+            let vs = em.current_validator_set();
+            Some((em.current_epoch(), vs.validator_infos(), vs.fault_tolerance()))
+        } else {
+            None
+        };
         ConsensusSnapshot {
-            version: 2,
+            version: 3,
             current_view: self.engine.current_view(),
             locked_qc: self.engine.locked_qc().clone(),
             last_committed_qc: self.engine.last_committed_qc().clone(),
@@ -80,6 +87,7 @@ impl ConsensusOrchestrator {
             authorized_verifiers: Vec::new(),
             committed_block_count: self.committed_block_count,
             last_voted_view: self.engine.last_voted_view(),
+            current_epoch_validators,
         }
     }
 
@@ -346,13 +354,40 @@ impl ConsensusOrchestrator {
             }
 
             // Apply validator changes from the synced block to the epoch manager.
-            if let Some(ref changes) = sync_block.validator_changes {
-                if let Err(e) = self
+            if let Some(ref changes) = sync_block.validator_changes
+                && let Err(e) = self
                     .engine
                     .epoch_manager_mut()
                     .apply_committed_changes_from_sync(changes)
-                {
-                    tracing::warn!(target: "n42::cl::sync", view = sync_block.view, error = %e, "sync: commit validator changes failed");
+            {
+                tracing::warn!(target: "n42::cl::sync", view = sync_block.view, error = %e, "sync: commit validator changes failed");
+            }
+
+            // Advance epoch if this block sits at an epoch boundary.
+            //
+            // During normal consensus `advance_epoch` is called from `advance_to_view`.
+            // The sync path never calls `advance_to_view`, so we must mirror that
+            // logic here: if the view *after* this block is an epoch boundary and a
+            // next-epoch set is staged, activate it now.  This keeps `validator_set_for_sync`
+            // up-to-date so that QC verification of later-epoch sync blocks succeeds.
+            let next_view = sync_block.view.saturating_add(1);
+            if self.engine.epoch_manager().is_epoch_boundary(next_view)
+                && self.engine.epoch_manager().has_staged_next()
+                && self.engine.epoch_manager_mut().advance_epoch()
+            {
+                let new_epoch = self.engine.epoch_manager().current_epoch();
+                let validator_count = self.engine.epoch_manager().current_validator_set().len();
+                info!(
+                    target: "n42::cl::sync",
+                    new_epoch,
+                    validator_count,
+                    view = sync_block.view,
+                    "epoch advanced during block sync"
+                );
+                let updated_vs = self.engine.epoch_manager().current_validator_set().clone();
+                self.validator_set_for_sync = Some(updated_vs.clone());
+                if let Some(ref state) = self.consensus_state {
+                    state.update_validator_set(updated_vs);
                 }
             }
 

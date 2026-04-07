@@ -108,6 +108,7 @@ fn build_epoch_manager(
     epoch_length: u64,
     recovery_epoch_schedule: Option<&EpochSchedule>,
     recovered_view: Option<u64>,
+    snapshot_current_epoch: Option<&(u64, Vec<ValidatorInfo>, u32)>,
 ) -> eyre::Result<EpochManager> {
     if epoch_length == 0 {
         return Ok(EpochManager::new(initial_validator_set.clone()));
@@ -116,6 +117,23 @@ fn build_epoch_manager(
     let current_epoch = recovered_view
         .map(|view| view.saturating_sub(1) / epoch_length)
         .unwrap_or(0);
+
+    // If the snapshot recorded the live validator set for the current epoch, use it
+    // directly.  This ensures that a dynamic `proposeAddValidator` which crossed an
+    // epoch boundary survives a node restart even when `epoch_schedule.json` has not
+    // been updated manually.
+    if let Some((snap_epoch, snap_validators, snap_ft)) = snapshot_current_epoch {
+        if *snap_epoch == current_epoch && !snap_validators.is_empty() {
+            let vs = ValidatorSet::try_new(snap_validators, *snap_ft)
+                .map_err(|e| eyre::eyre!("snapshot current_epoch_validators invalid: {e}"))?;
+            tracing::info!(
+                epoch = snap_epoch,
+                validators = snap_validators.len(),
+                "restored current epoch validator set from snapshot"
+            );
+            return Ok(EpochManager::from_epoch(vs, epoch_length, *snap_epoch));
+        }
+    }
 
     if let Some(schedule) = recovery_epoch_schedule {
         let recovery_window = schedule.recovery_window(
@@ -459,6 +477,7 @@ fn main() {
             consensus_config.epoch_length,
             epoch_schedule.as_ref(),
             snapshot.as_ref().map(|snap| snap.current_view),
+            snapshot.as_ref().and_then(|snap| snap.current_epoch_validators.as_ref()),
         )?;
         let startup_validator_set = startup_epoch_manager.current_validator_set().clone();
         let startup_validator_infos = startup_validator_set.validator_infos();
@@ -997,6 +1016,7 @@ fn main() {
                         consensus_config.epoch_length,
                         epoch_schedule.as_ref(),
                         Some(snapshot.current_view),
+                        snapshot.current_epoch_validators.as_ref(),
                     )?;
                     if let Some((target_epoch, ref validators, f)) =
                         snapshot.scheduled_epoch_transition
@@ -1048,6 +1068,7 @@ fn main() {
                             &initial_validator_infos,
                             consensus_config.epoch_length,
                             epoch_schedule.as_ref(),
+                            None,
                             None,
                         )?,
                         consensus_config.base_timeout_ms,

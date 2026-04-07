@@ -13,7 +13,10 @@ use std::path::Path;
 /// - `last_committed_qc`: tracks the latest committed block
 /// - `consecutive_timeouts`: maintains pacemaker backoff state
 /// - `scheduled_epoch_transition`: preserves staged epoch changes across restarts
-const SNAPSHOT_VERSION: u32 = 2;
+/// - `current_epoch_validators`: the active validator set for the current epoch,
+///   so dynamic `proposeAddValidator` changes survive restart without requiring a
+///   static `epoch_schedule.json` update
+const SNAPSHOT_VERSION: u32 = 3;
 
 fn default_version() -> u32 {
     SNAPSHOT_VERSION
@@ -44,6 +47,16 @@ pub struct ConsensusSnapshot {
     /// Persisted to prevent double-voting after crash recovery (BFT safety).
     #[serde(default)]
     pub last_voted_view: u64,
+    /// Active validator set for the current epoch at the time of the snapshot.
+    ///
+    /// Stored as `(epoch_number, validators, fault_tolerance)`.  On restart this
+    /// is used to seed the EpochManager with the correct validator set even when
+    /// the static `epoch_schedule.json` has not been updated (e.g. after a
+    /// `proposeAddValidator` that crossed an epoch boundary).  The field is
+    /// `None` for snapshots written before this field was introduced (v2 →
+    /// treated as epoch 0 with the genesis validator set).
+    #[serde(default)]
+    pub current_epoch_validators: Option<(u64, Vec<ValidatorInfo>, u32)>,
 }
 
 /// Serde helper: serialize/deserialize `Vec<[u8; 48]>` as hex strings for human-readable JSON.
@@ -218,6 +231,7 @@ mod tests {
             authorized_verifiers: Vec::new(),
             committed_block_count: 0,
             last_voted_view: 0,
+            current_epoch_validators: None,
         }
     }
 
