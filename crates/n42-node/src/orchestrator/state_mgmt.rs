@@ -426,22 +426,10 @@ impl ConsensusOrchestrator {
     /// Returns false and logs a warning if verification fails.
     fn verify_sync_block_qc(&self, sync_block: &SyncBlock) -> bool {
         // Use epoch-aware lookup so a node that has advanced to epoch N can still
-        // verify historical epoch N-1 blocks using the stored historical validator set.
-        // Fall back to validator_set_for_sync only when epochs are disabled.
-        let em = self.engine.epoch_manager();
-        let epoch_vs;
-        let vs: &n42_consensus::ValidatorSet = if em.epochs_enabled() {
-            epoch_vs = em.validator_set_for_view(sync_block.view).clone();
-            &epoch_vs
-        } else {
-            match &self.validator_set_for_sync {
-                Some(vs) => vs,
-                None => {
-                    warn!(target: "n42::cl::sync", "cannot verify sync blocks: no validator set configured, rejecting sync response");
-                    return false;
-                }
-            }
-        };
+        // verify historical epoch N-1 blocks using the stored epoch N-1 validator set.
+        // validator_set_for_view handles epochs-disabled (epoch_length==0) by returning
+        // current_set, so no separate branch is needed.
+        let vs = self.engine.epoch_manager().validator_set_for_view(sync_block.view);
 
         if let Err(e) = verify_commit_qc(&sync_block.commit_qc, vs) {
             warn!(
