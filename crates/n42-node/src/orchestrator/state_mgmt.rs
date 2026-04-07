@@ -425,11 +425,21 @@ impl ConsensusOrchestrator {
     /// Verifies commit QC validity for a sync block.
     /// Returns false and logs a warning if verification fails.
     fn verify_sync_block_qc(&self, sync_block: &SyncBlock) -> bool {
-        let vs = match &self.validator_set_for_sync {
-            Some(vs) => vs,
-            None => {
-                warn!(target: "n42::cl::sync", "cannot verify sync blocks: no validator set configured, rejecting sync response");
-                return false;
+        // Use epoch-aware lookup so a node that has advanced to epoch N can still
+        // verify historical epoch N-1 blocks using the stored historical validator set.
+        // Fall back to validator_set_for_sync only when epochs are disabled.
+        let em = self.engine.epoch_manager();
+        let epoch_vs;
+        let vs: &n42_consensus::ValidatorSet = if em.epochs_enabled() {
+            epoch_vs = em.validator_set_for_view(sync_block.view).clone();
+            &epoch_vs
+        } else {
+            match &self.validator_set_for_sync {
+                Some(vs) => vs,
+                None => {
+                    warn!(target: "n42::cl::sync", "cannot verify sync blocks: no validator set configured, rejecting sync response");
+                    return false;
+                }
             }
         };
 
