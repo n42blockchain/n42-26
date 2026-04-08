@@ -261,6 +261,11 @@ pub struct ConsensusOrchestrator {
     sync_started_at: Option<Instant>,
     state_file: Option<PathBuf>,
     validator_set_for_sync: Option<ValidatorSet>,
+    /// View at which a validator_changes block was applied during sync.
+    /// Guards the epoch-advance check in the sync loop: we only fire advance_epoch
+    /// at a boundary if the staging came from a block we actually replayed in sync
+    /// (not from pre-existing live-consensus state), preventing premature advances.
+    epoch_sync_staged_view: Option<u64>,
     mobile_packet_tx: Option<mpsc::Sender<(B256, u64)>>,
     leader_payload_rx: mpsc::Receiver<(B256, Vec<u8>)>,
     leader_payload_tx: mpsc::Sender<(B256, Vec<u8>)>,
@@ -387,6 +392,7 @@ impl ConsensusOrchestrator {
             sync_started_at: None,
             state_file: None,
             validator_set_for_sync: None,
+            epoch_sync_staged_view: None,
             mobile_packet_tx: None,
             leader_payload_rx,
             leader_payload_tx,
@@ -566,6 +572,7 @@ impl ConsensusOrchestrator {
             sync_started_at: None,
             state_file: None,
             validator_set_for_sync: None,
+            epoch_sync_staged_view: None,
             mobile_packet_tx: None,
             leader_payload_rx,
             leader_payload_tx,

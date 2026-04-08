@@ -354,27 +354,33 @@ impl ConsensusOrchestrator {
             }
 
             // Apply validator changes from the synced block to the epoch manager.
-            if let Some(ref changes) = sync_block.validator_changes
-                && let Err(e) = self
-                    .engine
-                    .epoch_manager_mut()
-                    .apply_committed_changes_from_sync(changes)
-            {
-                tracing::warn!(target: "n42::cl::sync", view = sync_block.view, error = %e, "sync: commit validator changes failed");
+            if let Some(ref changes) = sync_block.validator_changes {
+                match self.engine.epoch_manager_mut().apply_committed_changes_from_sync(changes) {
+                    Ok(()) => {
+                        // Record the view at which the staging occurred so the epoch
+                        // boundary check below can tell live-staged state from sync-staged state.
+                        self.epoch_sync_staged_view = Some(sync_block.view);
+                    }
+                    Err(e) => {
+                        tracing::warn!(target: "n42::cl::sync", view = sync_block.view, error = %e, "sync: commit validator changes failed");
+                    }
+                }
             }
 
-            // Advance epoch if this block sits at an epoch boundary.
+            // Advance epoch at the boundary immediately following this block.
             //
-            // During normal consensus `advance_epoch` is called from `advance_to_view`.
-            // The sync path never calls `advance_to_view`, so we must mirror that
-            // logic here: if the view *after* this block is an epoch boundary and a
-            // next-epoch set is staged, activate it now.  This keeps `validator_set_for_sync`
-            // up-to-date so that QC verification of later-epoch sync blocks succeeds.
+            // IMPORTANT: only fire if the staging was recorded from THIS sync pass
+            // (epoch_sync_staged_view is set and <= current block's view).  Without
+            // this guard, a pre-existing `next_set` from live-consensus staging at a
+            // LATER view would trigger a premature advance at an earlier boundary,
+            // causing the epoch manager to diverge from the actual network state.
             let next_view = sync_block.view.saturating_add(1);
             if self.engine.epoch_manager().is_epoch_boundary(next_view)
                 && self.engine.epoch_manager().has_staged_next()
+                && self.epoch_sync_staged_view.is_some_and(|v| v <= sync_block.view)
                 && self.engine.epoch_manager_mut().advance_epoch()
             {
+                self.epoch_sync_staged_view = None;
                 let new_epoch = self.engine.epoch_manager().current_epoch();
                 let validator_count = self.engine.epoch_manager().current_validator_set().len();
                 info!(
@@ -425,11 +431,28 @@ impl ConsensusOrchestrator {
     /// Verifies commit QC validity for a sync block.
     /// Returns false and logs a warning if verification fails.
     fn verify_sync_block_qc(&self, sync_block: &SyncBlock) -> bool {
-        // Use epoch-aware lookup so a node that has advanced to epoch N can still
-        // verify historical epoch N-1 blocks using the stored epoch N-1 validator set.
-        // validator_set_for_view handles epochs-disabled (epoch_length==0) by returning
-        // current_set, so no separate branch is needed.
-        let vs = self.engine.epoch_manager().validator_set_for_view(sync_block.view);
+        // Identify the validator set by matching the QC's bitmap length rather than
+        // computing epoch_for_view().  epoch_for_view() assumes epoch advances fire
+        // exactly at every boundary, but in practice staging can be delayed past a
+        // boundary (e.g., validator added at view 47 → epoch advances at view 61, not
+        // view 31).  Matching by size is correct because each epoch has a distinct
+        // validator count in the normal add/remove workflow; BLS verification then
+        // confirms we picked the right set.
+        let bitmap_len = sync_block.commit_qc.signers.len();
+        let em = self.engine.epoch_manager();
+        let vs = match em.find_validator_set_by_len(bitmap_len) {
+            Some(vs) => vs,
+            None => {
+                warn!(
+                    target: "n42::cl::sync",
+                    view = sync_block.view,
+                    bitmap_len,
+                    current_epoch = em.current_epoch(),
+                    "no validator set with matching bitmap length; rejecting sync block"
+                );
+                return false;
+            }
+        };
 
         if let Err(e) = verify_commit_qc(&sync_block.commit_qc, vs) {
             warn!(

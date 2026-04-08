@@ -269,6 +269,29 @@ impl EpochManager {
         self.next_set.is_some()
     }
 
+    /// Finds any known validator set (current, historical, or staged next) whose
+    /// size matches the given bitmap length. Used for sync QC verification when
+    /// the epoch of a historical block cannot be reliably determined from view number
+    /// alone (e.g., when staging was delayed past an epoch boundary).
+    ///
+    /// Returns `None` if no matching set is found.
+    pub fn find_validator_set_by_len(&self, len: usize) -> Option<&ValidatorSet> {
+        if self.current_set.len() as usize == len {
+            return Some(&self.current_set);
+        }
+        for set in self.historical_sets.values() {
+            if set.len() as usize == len {
+                return Some(set);
+            }
+        }
+        if let Some(next) = &self.next_set {
+            if next.len() as usize == len {
+                return Some(next);
+            }
+        }
+        None
+    }
+
     /// Trims historical sets to maintain MAX_HISTORICAL_EPOCHS limit.
     fn trim_historical(&mut self) {
         while self.historical_sets.len() > MAX_HISTORICAL_EPOCHS {
