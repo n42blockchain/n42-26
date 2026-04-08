@@ -70,32 +70,44 @@ impl ConsensusEngine {
         self.round_state.update_locked_qc(&decide.commit_qc);
         self.round_state.commit(decide.commit_qc.clone());
 
-        // Capture changes before commit clears them.
-        let committed_changes = self.epoch_manager.pending_changes_for_proposal();
-
-        // Commit-then-Activate: if validator changes were proposed, stage them now.
-        if self.epoch_manager.has_pending_changes() {
-            self.epoch_manager.commit_pending_changes()?;
-        } else if decide.validator_changes_hash != alloy_primitives::B256::ZERO {
-            // The committed Proposal carried validator changes but this follower
-            // missed it.  Log prominently so the operator notices; the node will
-            // need to resync (or receive the changes in a subsequent Proposal
-            // before the epoch boundary) to avoid validator-set divergence.
-            tracing::error!(
-                target: "n42::cl::decision",
-                view = decide.view,
-                expected_hash = %decide.validator_changes_hash,
-                "MISSED validator changes from Proposal — epoch transition may diverge; \
-                 requesting resync"
-            );
-            // Sync API requests the inclusive range (local_view + 1)..=target_view.
-            // We need to re-fetch the committed block at `decide.view`, so report
-            // the local committed view as the block immediately before it.
-            self.emit(EngineOutput::SyncRequired {
-                local_view: decide.view.saturating_sub(1),
-                target_view: decide.view,
-            })?;
-        }
+        // Commit-then-Activate: only commit/stage validator changes when the decided
+        // block actually carried them (hash != ZERO).  Gating on the Decide hash
+        // prevents a node that has locally-queued pending_adds (from an RPC call)
+        // from prematurely staging when *another* leader commits a block with no
+        // changes — which would cause epoch divergence with nodes that never had
+        // those pending_adds.
+        let committed_changes = if decide.validator_changes_hash != alloy_primitives::B256::ZERO {
+            // Capture changes before commit clears them.
+            let changes = self.epoch_manager.pending_changes_for_proposal();
+            if self.epoch_manager.has_pending_changes() {
+                self.epoch_manager.commit_pending_changes()?;
+            } else {
+                // The committed Proposal carried validator changes but this follower
+                // missed it.  Log prominently so the operator notices; the node will
+                // need to resync (or receive the changes in a subsequent Proposal
+                // before the epoch boundary) to avoid validator-set divergence.
+                tracing::error!(
+                    target: "n42::cl::decision",
+                    view = decide.view,
+                    expected_hash = %decide.validator_changes_hash,
+                    "MISSED validator changes from Proposal — epoch transition may diverge; \
+                     requesting resync"
+                );
+                // Sync API requests the inclusive range (local_view + 1)..=target_view.
+                // We need to re-fetch the committed block at `decide.view`, so report
+                // the local committed view as the block immediately before it.
+                self.emit(EngineOutput::SyncRequired {
+                    local_view: decide.view.saturating_sub(1),
+                    target_view: decide.view,
+                })?;
+            }
+            changes
+        } else {
+            // No validator changes in this block.  If this node has local pending_adds
+            // queued from an RPC call, keep them — they will be included in the next
+            // Proposal when this node becomes leader.
+            None
+        };
 
         // Clean up pending tx_root_hash for the committed block.
         self.pending_tx_roots.remove(&decide.block_hash);
