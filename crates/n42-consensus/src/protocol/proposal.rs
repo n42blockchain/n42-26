@@ -37,11 +37,20 @@ impl ConsensusEngine {
         let signature = self.secret_key.sign(&prop_msg);
         let vote_msg = signing_message(view, &block_hash);
 
+        // Use the epoch-aware index for the proposer field.  In the epoch-drift zone
+        // (staging committed but epoch boundary not yet fired), validator_set_for_view
+        // already returns the staged next_set for the current view, so followers compute
+        // expected_leader and look up the proposer's public key using that set.
+        // self.my_index is only updated at the epoch boundary; using it here would send
+        // the OLD index, causing an InvalidProposer rejection whenever the new validator's
+        // address sorts before this node's, shifting this node's position in the set.
+        let proposer = self.local_validator_index_for_view(view).unwrap_or(self.my_index);
+
         let proposal = Proposal {
             view,
             block_hash,
             justify_qc,
-            proposer: self.my_index,
+            proposer,
             signature,
             prepare_qc: piggybacked_qc,
             tx_root_hash,
@@ -132,7 +141,7 @@ impl ConsensusEngine {
         if proposal.justify_qc.view > 0 {
             super::quorum::verify_qc_any_domain(
                 &proposal.justify_qc,
-                self.validator_set_for_view(proposal.justify_qc.view),
+                self.resolve_qc_validator_set(&proposal.justify_qc),
             )
             .map_err(|e| {
                 tracing::warn!(target: "n42::cl::proposal",
@@ -156,7 +165,7 @@ impl ConsensusEngine {
         if let Some(ref piggybacked_qc) = proposal.prepare_qc {
             match super::quorum::verify_qc(
                 piggybacked_qc,
-                self.validator_set_for_view(piggybacked_qc.view),
+                self.resolve_qc_validator_set(piggybacked_qc),
             ) {
                 Ok(()) => {
                     tracing::debug!(target: "n42::cl::proposal",
@@ -251,7 +260,7 @@ impl ConsensusEngine {
             });
         }
 
-        super::quorum::verify_qc(&pqc.qc, self.validator_set_for_view(pqc.qc.view))?;
+        super::quorum::verify_qc(&pqc.qc, self.resolve_qc_validator_set(&pqc.qc))?;
         self.round_state.update_locked_qc(&pqc.qc);
         self.round_state.enter_pre_commit();
 

@@ -29,7 +29,7 @@ impl ConsensusEngine {
                 reason: "genesis QC rejected: local locked_qc has already advanced".to_string(),
             });
         }
-        super::quorum::verify_qc_any_domain(qc, self.validator_set_for_view(qc.view))
+        super::quorum::verify_qc_any_domain(qc, self.resolve_qc_validator_set(qc))
     }
 
     /// Handles a view timeout triggered by the pacemaker.

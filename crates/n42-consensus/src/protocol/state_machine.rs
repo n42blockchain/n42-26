@@ -834,6 +834,45 @@ impl ConsensusEngine {
         self.epoch_manager.validator_set_for_view(view)
     }
 
+    /// Resolves the correct validator set for QC verification.
+    ///
+    /// `validator_set_for_view` uses a mathematical epoch formula that diverges
+    /// from the actual epoch state in the "epoch-drift zone": after a validator-set
+    /// transition the formula may map old views to the wrong epoch number, causing
+    /// it to fall back to the current (larger) set.  For example, after advancing
+    /// from epoch 0 (3 validators) to epoch 1 (4 validators) at view 151, the first
+    /// proposal carries a justify_qc from view 150.  `epoch_for_view(150)` = 4,
+    /// which is neither the current epoch (1) nor in history (only epoch 0 stored),
+    /// so `validator_set_for_view` falls back to the current 4-validator set.
+    /// Verifying a 3-bit bitmap against a 4-validator set then fails.
+    ///
+    /// This method detects the mismatch via bitmap-size comparison and falls back
+    /// to `find_validator_set_by_len`, which searches current / next / historical
+    /// sets by validator count.  BLS verification in the caller confirms correctness.
+    pub(super) fn resolve_qc_validator_set(
+        &self,
+        qc: &n42_primitives::consensus::QuorumCertificate,
+    ) -> &ValidatorSet {
+        let primary = self.validator_set_for_view(qc.view);
+        if primary.len() as usize == qc.signers.len() {
+            return primary;
+        }
+        // Bitmap size doesn't match the primary set — epoch drift has occurred.
+        // Search all known sets by size; BLS in the caller will confirm the match.
+        if let Some(vs) = self.epoch_manager.find_validator_set_by_len(qc.signers.len()) {
+            tracing::debug!(
+                target: "n42::cl::engine",
+                qc_view = qc.view,
+                primary_len = primary.len(),
+                bitmap_len = qc.signers.len(),
+                "epoch-drift fallback: using historical validator set for QC verification"
+            );
+            return vs;
+        }
+        // No set matched the bitmap size; return primary and let BLS fail clearly.
+        primary
+    }
+
     pub(super) fn leader_index_for_view(&self, view: ViewNumber) -> u32 {
         LeaderSelector::leader_for_view(view, self.validator_set_for_view(view))
     }
