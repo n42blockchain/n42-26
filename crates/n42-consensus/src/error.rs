@@ -140,8 +140,9 @@ pub enum ConsensusError {
     InvalidValidatorPubkey { index: u32 },
 
     /// Persistent vote-log fsync failed; the vote MUST be aborted to avoid
-    /// double-voting after a crash. Wrapped as a `String` to keep
-    /// `ConsensusError` simple to construct from any I/O error.
+    /// double-voting after a crash. The IO error message is captured as a
+    /// `String` so this enum stays free of the rest of `io::Error`'s API
+    /// surface (notably its `kind()` is rarely useful past logging).
     #[error("vote log fsync failed: {0}")]
     VoteLogFsync(String),
 }

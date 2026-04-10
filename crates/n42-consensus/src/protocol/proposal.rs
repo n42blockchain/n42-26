@@ -35,13 +35,8 @@ impl ConsensusEngine {
             Some(changes) => crate::EpochManager::hash_changes(changes),
             None => B256::ZERO,
         };
-        // Cache for the leader's R2 commit-vote signing path. Bounded to 64
-        // entries with FIFO eviction, mirroring pending_tx_roots.
-        if self.pending_changes_hashes.len() >= 64
-            && let Some(&oldest) = self.pending_changes_hashes.keys().next()
-        {
-            self.pending_changes_hashes.remove(&oldest);
-        }
+        // Cache for the leader's R2 commit-vote signing path. The
+        // BoundedFifoMap caps the entries and evicts in real insertion order.
         self.pending_changes_hashes.insert(block_hash, changes_hash);
 
         // Signature covers changes_hash to prevent Byzantine relay from swapping changes.
@@ -169,11 +164,7 @@ impl ConsensusEngine {
         // Pass the cached changes_hash for the QC's block (or zero if missing) so the
         // commit-domain fallback path can recompute the same signed message.
         if proposal.justify_qc.view > 0 {
-            let justify_changes_hash = self
-                .pending_changes_hashes
-                .get(&proposal.justify_qc.block_hash)
-                .copied()
-                .unwrap_or_default();
+            let justify_changes_hash = self.cached_changes_hash(&proposal.justify_qc.block_hash);
             super::quorum::verify_qc_any_domain(
                 &proposal.justify_qc,
                 self.resolve_qc_validator_set(&proposal.justify_qc),
@@ -239,23 +230,11 @@ impl ConsensusEngine {
             B256::ZERO
         };
         // Cache the proposal's changes_hash so the R2 commit-vote signing
-        // path can include it (Plan #2 in the HotStuff-2 audit). Bounded
-        // to 64 entries with FIFO eviction, mirroring pending_tx_roots.
-        if self.pending_changes_hashes.len() >= 64
-            && let Some(&oldest) = self.pending_changes_hashes.keys().next()
-        {
-            self.pending_changes_hashes.remove(&oldest);
-        }
+        // path can include it.
         self.pending_changes_hashes.insert(proposal.block_hash, changes_hash);
 
         // Store pending tx_root_hash for future DA verification if present.
-        // Bounded to 64 entries to prevent OOM from unfinalized proposals.
         if let Some(tx_root) = proposal.tx_root_hash {
-            if self.pending_tx_roots.len() >= 64
-                && let Some(&oldest) = self.pending_tx_roots.keys().next()
-            {
-                self.pending_tx_roots.remove(&oldest);
-            }
             self.pending_tx_roots.insert(proposal.block_hash, tx_root);
         }
 
@@ -325,13 +304,9 @@ impl ConsensusEngine {
 
         tracing::debug!(target: "n42::cl::proposal", view, block_hash = %pqc.block_hash, "received valid PrepareQC, sending commit vote");
 
-        // Look up the cached changes_hash from process_proposal so this R2
-        // commit-vote signature binds to the same changes the leader proposed.
-        let changes_hash = self
-            .pending_changes_hashes
-            .get(&pqc.block_hash)
-            .copied()
-            .unwrap_or_default();
+        // Bind this R2 commit-vote signature to the same changes_hash the
+        // leader's proposal carried.
+        let changes_hash = self.cached_changes_hash(&pqc.block_hash);
         let commit_msg = commit_signing_message(view, &pqc.block_hash, &changes_hash);
         let commit_sig = self.secret_key.sign(&commit_msg);
         let leader = self.leader_index_for_view(view);

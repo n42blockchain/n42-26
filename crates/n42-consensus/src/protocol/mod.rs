@@ -1,3 +1,4 @@
+mod bounded_fifo;
 mod decision;
 mod pacemaker;
 mod proposal;

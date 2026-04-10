@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
 
+use super::bounded_fifo::BoundedFifoMap;
 use super::pacemaker::Pacemaker;
 use super::quorum::{
     TimeoutCollector, VoteCollector, commit_signing_message, newview_signing_message,
@@ -234,14 +235,13 @@ pub struct ConsensusEngine {
     last_committed_timing: Option<ViewTiming>,
     /// Pending tx_root_hash values for Baby Raptr DA verification.
     /// Maps block_hash -> tx_root_hash for proposals awaiting verification.
-    /// Bounded to 64 entries; oldest evicted when full (prevents OOM from unfinalized proposals).
-    pub(super) pending_tx_roots: HashMap<B256, B256>,
+    /// Bounded to 64 entries; oldest evicted when full.
+    pub(super) pending_tx_roots: BoundedFifoMap<B256, B256>,
     /// `validator_changes_hash` per pending proposal, captured at process_proposal
     /// (or on_block_ready for the leader). Looked up at R2 commit-vote signing
     /// time so the same `changes_hash` enters the BLS message that
-    /// `verify_commit_qc` will check on the receiving side. Bounded to 64
-    /// entries with FIFO eviction, mirroring `pending_tx_roots`.
-    pub(super) pending_changes_hashes: HashMap<B256, B256>,
+    /// `verify_commit_qc` will check on the receiving side.
+    pub(super) pending_changes_hashes: BoundedFifoMap<B256, B256>,
     /// Durable last-voted-view sink, fsync'd before every R1 vote (HotStuff-2
     /// safety invariant — see `crate::vote_log`). Defaults to `NoopVoteLog`
     /// for tests / single-validator dev mode; production builds inject a
@@ -322,8 +322,8 @@ impl ConsensusEngine {
             future_msg_buffer: Vec::new(),
             view_timing: ViewTiming::new(),
             last_committed_timing: None,
-            pending_tx_roots: HashMap::new(),
-            pending_changes_hashes: HashMap::new(),
+            pending_tx_roots: BoundedFifoMap::new(64),
+            pending_changes_hashes: BoundedFifoMap::new(64),
             vote_log,
         }
     }
@@ -419,8 +419,8 @@ impl ConsensusEngine {
             future_msg_buffer: Vec::new(),
             view_timing: ViewTiming::new(),
             last_committed_timing: None,
-            pending_tx_roots: HashMap::new(),
-            pending_changes_hashes: HashMap::new(),
+            pending_tx_roots: BoundedFifoMap::new(64),
+            pending_changes_hashes: BoundedFifoMap::new(64),
             vote_log,
         }
     }
@@ -493,16 +493,11 @@ impl ConsensusEngine {
                     .validator_set_for_view(commit_vote.view)
                     .get_public_key(commit_vote.voter)
                     .ok()?;
-                // authenticated_signer is called from the orchestrator's network
-                // dispatch path before the engine's main message handler runs, so
-                // we may not have the proposal cached. Use the cache when present
-                // and fall back to ZERO; the canonical verification still happens
-                // in process_commit_vote which has identical fallback semantics.
-                let changes_hash = self
-                    .pending_changes_hashes
-                    .get(&commit_vote.block_hash)
-                    .copied()
-                    .unwrap_or_default();
+                // authenticated_signer is invoked from the orchestrator before
+                // the engine's main message handler runs, so the proposal may
+                // not be cached yet. The canonical verification re-runs in
+                // process_commit_vote with the same fallback semantics.
+                let changes_hash = self.cached_changes_hash(&commit_vote.block_hash);
                 let sig_msg = commit_signing_message(commit_vote.view, &commit_vote.block_hash, &changes_hash);
                 if pk.verify_prevalidated(&sig_msg, &commit_vote.signature).is_err() {
                     tracing::debug!(target: "n42::consensus", view = commit_vote.view, voter = commit_vote.voter, "commit_vote signature verification failed");
@@ -797,11 +792,7 @@ impl ConsensusEngine {
             ConsensusMessage::Proposal(_)
             | ConsensusMessage::Timeout(_)
             | ConsensusMessage::NewView(_) => {
-                let changes_hash = self
-                    .pending_changes_hashes
-                    .get(&qc.block_hash)
-                    .copied()
-                    .unwrap_or_default();
+                let changes_hash = self.cached_changes_hash(&qc.block_hash);
                 super::quorum::verify_qc_any_domain(
                     qc,
                     self.validator_set_for_view(qc.view),
@@ -1025,6 +1016,17 @@ impl ConsensusEngine {
     pub(super) fn local_validator_index_for_view(&self, view: ViewNumber) -> Option<u32> {
         self.validator_set_for_view(view)
             .index_of_public_key(&self.local_public_key)
+    }
+
+    /// Returns the cached `validator_changes_hash` for `block_hash`, or
+    /// `B256::ZERO` (the canonical "no changes" sentinel from
+    /// `EpochManager::hash_changes`) when the proposal isn't in the cache.
+    /// Used by every R2 commit-vote signing/verification path.
+    pub(super) fn cached_changes_hash(&self, block_hash: &B256) -> B256 {
+        self.pending_changes_hashes
+            .get(block_hash)
+            .copied()
+            .unwrap_or_default()
     }
 
     pub(super) fn emit(&self, output: EngineOutput) -> ConsensusResult<()> {

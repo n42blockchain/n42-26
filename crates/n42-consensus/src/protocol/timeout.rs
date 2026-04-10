@@ -34,11 +34,7 @@ impl ConsensusEngine {
                 reason: "genesis QC rejected: local locked_qc has already advanced".to_string(),
             });
         }
-        let changes_hash = self
-            .pending_changes_hashes
-            .get(&qc.block_hash)
-            .copied()
-            .unwrap_or_default();
+        let changes_hash = self.cached_changes_hash(&qc.block_hash);
         super::quorum::verify_qc_any_domain(
             qc,
             self.resolve_qc_validator_set(qc),
