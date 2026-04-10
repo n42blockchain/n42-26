@@ -576,6 +576,7 @@ start_validators() {
         N42_SKIP_TX_VERIFY="${N42_SKIP_TX_VERIFY:-0}" \
         N42_POOL_VALIDATION_THREADS="${N42_POOL_VALIDATION_THREADS:-2}" \
         N42_LOW_MEMORY="${N42_LOW_MEMORY:-0}" \
+        N42_ADMIN_TOKEN="${N42_ADMIN_TOKEN:-}" \
         N42_INJECT_PORT="${N42_INJECT_PORT:+$((${N42_INJECT_PORT} + i))}" \
         "$BINARY" node \
             --chain "$GENESIS_FILE" \

@@ -107,7 +107,10 @@ pub enum ValidatorChange {
     Add {
         address: Address,
         bls_public_key: crate::BlsPublicKey,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        // No `skip_serializing_if`/`default` attrs: bincode is positional and
+        // skipping a field on the wire makes the receiver fail with
+        // "unexpected end of file" — exactly the silent rejection that
+        // prevented dynamic validator changes from propagating.
         p2p_peer_id: Option<String>,
     },
     /// Remove a validator by address at the next epoch boundary.
