@@ -26,3 +26,4 @@ pub use transport::{
 
 // Re-export libp2p types used by consumers.
 pub use libp2p::PeerId;
+pub use libp2p::identity as libp2p_identity;

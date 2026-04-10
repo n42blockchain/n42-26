@@ -2,6 +2,7 @@ mod consensus_loop;
 mod execution_bridge;
 pub mod observer;
 mod state_mgmt;
+mod view_jump_throttle;
 
 use crate::consensus_state::SharedConsensusState;
 use crate::epoch_schedule::EpochSchedule;
@@ -10,7 +11,7 @@ use crate::staking::StakingManager;
 use crate::tx_bridge::TxImportBatch;
 use alloy_primitives::{Address, B256};
 use metrics::{counter, gauge, histogram};
-use n42_consensus::{ConsensusEngine, EngineOutput, ValidatorSet};
+use n42_consensus::{ConsensusEngine, EngineOutput, FUTURE_VIEW_WINDOW, ValidatorSet};
 use n42_jmt::ShardedJmt;
 use n42_network::{NetworkEvent, NetworkHandle, PeerId};
 use n42_primitives::QuorumCertificate;
@@ -346,6 +347,9 @@ pub struct ConsensusOrchestrator {
     /// MDBX-backed store for per-block consensus evidence (QC + mobile attestation).
     /// Shares the JMT MDBX environment. Written after each committed block.
     evidence_store: Option<Arc<n42_jmt::EvidenceStore>>,
+    /// Per-peer rate limiter for messages that would otherwise force the engine
+    /// into the BLS-heavy QC view-jump path. See `view_jump_throttle.rs`.
+    view_jump_throttle: view_jump_throttle::ViewJumpThrottle,
 }
 
 impl ConsensusOrchestrator {
@@ -428,6 +432,7 @@ impl ConsensusOrchestrator {
             allow_deterministic_validator_peers: true,
             admin_rx: None,
             evidence_store: None,
+            view_jump_throttle: view_jump_throttle::ViewJumpThrottle::default(),
         }
     }
 
@@ -604,6 +609,7 @@ impl ConsensusOrchestrator {
             allow_deterministic_validator_peers: true,
             admin_rx: None,
             evidence_store: None,
+            view_jump_throttle: view_jump_throttle::ViewJumpThrottle::default(),
         }
     }
 
@@ -1241,6 +1247,27 @@ impl ConsensusOrchestrator {
                     CM::Decide(_) => "Decide",
                     _ => "Other",
                 };
+
+                // Rate-limit messages that would force the engine into the BLS-heavy
+                // QC view-jump path. We bypass Decide / NewView (they own their view
+                // logic and are cheaper to verify) and Timeout within the buffer
+                // window. Anything else more than FUTURE_VIEW_WINDOW ahead must
+                // consume a token from this peer's bucket or be dropped.
+                let needs_view_jump = !matches!(message.as_ref(), CM::Decide(_) | CM::NewView(_))
+                    && message.view() > self.engine.current_view().saturating_add(FUTURE_VIEW_WINDOW);
+                if needs_view_jump && !self.view_jump_throttle.try_consume(source) {
+                    counter!("n42_view_jump_throttled_total").increment(1);
+                    debug!(
+                        target: "n42::cl::orchestrator",
+                        %source,
+                        msg_type,
+                        msg_view = message.view(),
+                        current_view = self.engine.current_view(),
+                        "view-jump message rate-limited"
+                    );
+                    return;
+                }
+
                 if let Some(validator_index) = self.engine.authenticated_signer(message.as_ref())
                     && let Err(error) = self
                         .network
@@ -1303,6 +1330,7 @@ impl ConsensusOrchestrator {
             NetworkEvent::PeerDisconnected(peer_id) => {
                 warn!(target: "n42::cl::orchestrator", %peer_id, "consensus peer disconnected");
                 self.connected_peers.remove(&peer_id);
+                self.view_jump_throttle.forget(&peer_id);
                 gauge!("n42_connected_peers").set(self.connected_peers.len() as f64);
             }
             NetworkEvent::BlockAnnouncement { source, data } => {

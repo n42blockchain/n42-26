@@ -3,7 +3,7 @@ mod pacemaker;
 mod proposal;
 pub mod quorum;
 mod round;
-mod state_machine;
+pub mod state_machine;
 mod timeout;
 mod voting;
 

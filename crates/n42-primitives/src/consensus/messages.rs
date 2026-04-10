@@ -267,6 +267,22 @@ pub enum ConsensusMessage {
     Decide(Decide),
 }
 
+impl ConsensusMessage {
+    /// Returns the view number this message references. Used by the orchestrator
+    /// to gate rate limits without having to pattern-match on every variant.
+    pub fn view(&self) -> ViewNumber {
+        match self {
+            Self::Proposal(p) => p.view,
+            Self::Vote(v) => v.view,
+            Self::CommitVote(cv) => cv.view,
+            Self::PrepareQC(pqc) => pqc.view,
+            Self::Timeout(t) => t.view,
+            Self::NewView(nv) => nv.view,
+            Self::Decide(d) => d.view,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

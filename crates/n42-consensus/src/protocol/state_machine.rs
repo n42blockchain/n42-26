@@ -109,7 +109,11 @@ impl ViewTiming {
 
 /// Maximum number of views ahead a future message can be to be buffered.
 /// Messages beyond this window trigger a QC-based view jump attempt.
-pub(super) const FUTURE_VIEW_WINDOW: u64 = 50;
+///
+/// Exposed at the crate root so the orchestrator can rate-limit messages
+/// that would force the engine into the view-jump path (which performs an
+/// expensive BLS aggregate verification per message).
+pub const FUTURE_VIEW_WINDOW: u64 = 50;
 
 /// Maximum number of buffered future-view messages.
 /// When exceeded, the oldest (lowest view) messages are evicted.
