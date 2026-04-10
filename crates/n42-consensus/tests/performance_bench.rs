@@ -745,7 +745,7 @@ fn bench_comparative_summary() {
             let _qc = collector.build_qc(&vs).unwrap();
 
             // Round 2: verify commit votes + build commit QC
-            let commit_msg = commit_signing_message(view, &hash);
+            let commit_msg = commit_signing_message(view, &hash, &alloy_primitives::B256::ZERO);
             let commit_sigs: Vec<_> = (0..quorum).map(|i| keys[i].sign(&commit_msg)).collect();
             let mut commit_collector = VoteCollector::new(view, hash, vs.len());
             for (i, sig) in commit_sigs.iter().enumerate() {
@@ -798,7 +798,7 @@ fn bench_comparative_summary() {
             }
             let _qc = collector.build_qc(&vs).unwrap();
 
-            let commit_msg = commit_signing_message(view, &hash);
+            let commit_msg = commit_signing_message(view, &hash, &alloy_primitives::B256::ZERO);
             let commit_sigs: Vec<_> = (0..quorum).map(|i| keys[i].sign(&commit_msg)).collect();
             let mut cc = VoteCollector::new(view, hash, vs.len());
             for (i, sig) in commit_sigs.iter().enumerate() {

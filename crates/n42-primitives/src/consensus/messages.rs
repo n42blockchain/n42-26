@@ -238,7 +238,11 @@ pub struct Decide {
 
 /// Current consensus protocol wire format version.
 /// Increment when making breaking changes to message formats.
-pub const CONSENSUS_PROTOCOL_VERSION: u16 = 2;
+// v3 (HotStuff-2 audit Plan #2): R2 commit-vote signing message now includes
+//     the proposal's `validator_changes_hash`. Old nodes signing under the v2
+//     46-byte format will fail BLS verification on new nodes — this is a
+//     wire-format breaking change requiring a coordinated upgrade.
+pub const CONSENSUS_PROTOCOL_VERSION: u16 = 3;
 
 /// Versioned wrapper for consensus messages on the wire.
 ///

@@ -148,8 +148,15 @@ impl ConsensusEngine {
             prepare_qc_msg,
         )))?;
 
-        // Leader self-vote for CommitVote (Round 2).
-        let commit_msg = commit_signing_message(view, &block_hash);
+        // Leader self-vote for CommitVote (Round 2). Looks up the changes_hash
+        // cached at on_block_ready so this self-vote signs the same domain as
+        // every follower's commit vote.
+        let changes_hash = self
+            .pending_changes_hashes
+            .get(&block_hash)
+            .copied()
+            .unwrap_or_default();
+        let commit_msg = commit_signing_message(view, &block_hash, &changes_hash);
         let commit_sig = self.secret_key.sign(&commit_msg);
         if let Some(ref mut collector) = self.commit_collector {
             collector.add_verified_vote(self.my_index, commit_sig)?;
@@ -185,7 +192,12 @@ impl ConsensusEngine {
 
         let view_set = self.validator_set_for_view(view);
         let pk = view_set.get_public_key(cv.voter)?;
-        let msg = commit_signing_message(view, &cv.block_hash);
+        let changes_hash = self
+            .pending_changes_hashes
+            .get(&cv.block_hash)
+            .copied()
+            .unwrap_or_default();
+        let msg = commit_signing_message(view, &cv.block_hash, &changes_hash);
         pk.verify_prevalidated(&msg, &cv.signature)
             .map_err(|_| ConsensusError::InvalidSignature {
                 view,
@@ -253,7 +265,12 @@ impl ConsensusEngine {
             None => return Ok(()),
         };
         let block_hash = collector.block_hash();
-        let commit_msg = commit_signing_message(view, &block_hash);
+        let changes_hash = self
+            .pending_changes_hashes
+            .get(&block_hash)
+            .copied()
+            .unwrap_or_default();
+        let commit_msg = commit_signing_message(view, &block_hash, &changes_hash);
         let commit_qc = collector.build_qc_with_message(view_set, &commit_msg)?;
 
         self.view_timing.commit_qc_formed = Some(std::time::Instant::now());

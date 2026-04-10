@@ -301,8 +301,9 @@ mod tests {
         let (sks, vs) = test_validator_set(4);
         let view = 99u64;
         let block_hash = B256::repeat_byte(0xDD);
+        let changes_hash = B256::ZERO;
 
-        let msg = commit_signing_message(view, &block_hash);
+        let msg = commit_signing_message(view, &block_hash, &changes_hash);
         let sigs: Vec<_> = sks[0..3].iter().map(|sk| sk.sign(&msg)).collect();
         let sig_refs: Vec<_> = sigs.iter().collect();
         let agg = AggregateSignature::aggregate(&sig_refs).unwrap();
@@ -323,8 +324,8 @@ mod tests {
 
         assert!(verify_qc(&extracted, &vs).is_err());
 
-        let fallback_result =
-            verify_qc(&extracted, &vs).or_else(|_| verify_commit_qc(&extracted, &vs));
+        let fallback_result = verify_qc(&extracted, &vs)
+            .or_else(|_| verify_commit_qc(&extracted, &vs, &changes_hash));
         assert!(fallback_result.is_ok());
     }
 

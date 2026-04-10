@@ -31,6 +31,18 @@ impl ConsensusEngine {
         // Include any pending validator changes so all nodes apply the same
         // changes at CommitQC time (consensus-safe commit-then-activate).
         let validator_changes = self.epoch_manager.pending_changes_for_proposal();
+        let changes_hash = match validator_changes.as_ref() {
+            Some(changes) => crate::EpochManager::hash_changes(changes),
+            None => B256::ZERO,
+        };
+        // Cache for the leader's R2 commit-vote signing path. Bounded to 64
+        // entries with FIFO eviction, mirroring pending_tx_roots.
+        if self.pending_changes_hashes.len() >= 64
+            && let Some(&oldest) = self.pending_changes_hashes.keys().next()
+        {
+            self.pending_changes_hashes.remove(&oldest);
+        }
+        self.pending_changes_hashes.insert(block_hash, changes_hash);
 
         // Signature covers changes_hash to prevent Byzantine relay from swapping changes.
         let prop_msg = super::quorum::proposal_signing_message(view, &block_hash, &validator_changes);
@@ -154,10 +166,18 @@ impl ConsensusEngine {
         // from injecting a forged QC that manipulates honest nodes' locked_qc.
         // Genesis QC (view 0) is exempt — it has no real aggregate signatures.
         // Uses verify_qc_any_domain because justify_qc may be either a prepare QC or commit QC.
+        // Pass the cached changes_hash for the QC's block (or zero if missing) so the
+        // commit-domain fallback path can recompute the same signed message.
         if proposal.justify_qc.view > 0 {
+            let justify_changes_hash = self
+                .pending_changes_hashes
+                .get(&proposal.justify_qc.block_hash)
+                .copied()
+                .unwrap_or_default();
             super::quorum::verify_qc_any_domain(
                 &proposal.justify_qc,
                 self.resolve_qc_validator_set(&proposal.justify_qc),
+                &justify_changes_hash,
             )
             .map_err(|e| {
                 tracing::warn!(target: "n42::cl::proposal",
@@ -205,15 +225,28 @@ impl ConsensusEngine {
         // included in a Proposal yet (the node wasn't leader). They will
         // be included when this node next becomes leader.
         const MAX_CHANGES_PER_PROPOSAL: usize = 4;
-        if let Some(ref changes) = proposal.validator_changes {
+        let changes_hash = if let Some(ref changes) = proposal.validator_changes {
             if changes.len() > MAX_CHANGES_PER_PROPOSAL {
                 return Err(ConsensusError::TooManyValidatorChanges {
                     count: changes.len(),
                     max: MAX_CHANGES_PER_PROPOSAL,
                 });
             }
+            let hash = crate::EpochManager::hash_changes(changes);
             self.epoch_manager.replace_pending_from_proposal(changes);
+            hash
+        } else {
+            B256::ZERO
+        };
+        // Cache the proposal's changes_hash so the R2 commit-vote signing
+        // path can include it (Plan #2 in the HotStuff-2 audit). Bounded
+        // to 64 entries with FIFO eviction, mirroring pending_tx_roots.
+        if self.pending_changes_hashes.len() >= 64
+            && let Some(&oldest) = self.pending_changes_hashes.keys().next()
+        {
+            self.pending_changes_hashes.remove(&oldest);
         }
+        self.pending_changes_hashes.insert(proposal.block_hash, changes_hash);
 
         // Store pending tx_root_hash for future DA verification if present.
         // Bounded to 64 entries to prevent OOM from unfinalized proposals.
@@ -292,7 +325,14 @@ impl ConsensusEngine {
 
         tracing::debug!(target: "n42::cl::proposal", view, block_hash = %pqc.block_hash, "received valid PrepareQC, sending commit vote");
 
-        let commit_msg = commit_signing_message(view, &pqc.block_hash);
+        // Look up the cached changes_hash from process_proposal so this R2
+        // commit-vote signature binds to the same changes the leader proposed.
+        let changes_hash = self
+            .pending_changes_hashes
+            .get(&pqc.block_hash)
+            .copied()
+            .unwrap_or_default();
+        let commit_msg = commit_signing_message(view, &pqc.block_hash, &changes_hash);
         let commit_sig = self.secret_key.sign(&commit_msg);
         let leader = self.leader_index_for_view(view);
 

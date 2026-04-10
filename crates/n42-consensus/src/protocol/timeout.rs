@@ -14,6 +14,11 @@ impl ConsensusEngine {
     /// Allowing any network message to carry a view=0 QC unconditionally would let
     /// an attacker forge a genesis QC and use it to regress our locked_qc back to
     /// view 0, violating HotStuff-2's safety monotonicity invariant.
+    ///
+    /// The R2 commit-domain fallback in `verify_qc_any_domain` reads the
+    /// cached `changes_hash` for this QC's block; on cache miss it falls back
+    /// to zero (acceptable: a TC's high_qc usually points at an already
+    /// committed block whose proposal is no longer in the pending cache).
     fn verify_embedded_qc(
         &self,
         qc: &n42_primitives::consensus::QuorumCertificate,
@@ -29,7 +34,16 @@ impl ConsensusEngine {
                 reason: "genesis QC rejected: local locked_qc has already advanced".to_string(),
             });
         }
-        super::quorum::verify_qc_any_domain(qc, self.resolve_qc_validator_set(qc))
+        let changes_hash = self
+            .pending_changes_hashes
+            .get(&qc.block_hash)
+            .copied()
+            .unwrap_or_default();
+        super::quorum::verify_qc_any_domain(
+            qc,
+            self.resolve_qc_validator_set(qc),
+            &changes_hash,
+        )
     }
 
     /// Handles a view timeout triggered by the pacemaker.

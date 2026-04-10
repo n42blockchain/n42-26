@@ -49,7 +49,14 @@ impl ConsensusEngine {
 
         // Verify CommitQC aggregate BLS signature. Without this, a Byzantine leader
         // could forge a Decide with a valid signer bitmap but invalid signature.
-        super::quorum::verify_commit_qc(&decide.commit_qc, commit_set)?;
+        // The `validator_changes_hash` is part of the signed message (Plan #2 in
+        // the HotStuff-2 audit), so a Byzantine leader cannot substitute a
+        // different changes_hash after collecting commit votes.
+        super::quorum::verify_commit_qc(
+            &decide.commit_qc,
+            commit_set,
+            &decide.validator_changes_hash,
+        )?;
 
         const SYNC_GAP_THRESHOLD: u64 = 3;
         if decide.view > current_view + SYNC_GAP_THRESHOLD {

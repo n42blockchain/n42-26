@@ -236,6 +236,12 @@ pub struct ConsensusEngine {
     /// Maps block_hash -> tx_root_hash for proposals awaiting verification.
     /// Bounded to 64 entries; oldest evicted when full (prevents OOM from unfinalized proposals).
     pub(super) pending_tx_roots: HashMap<B256, B256>,
+    /// `validator_changes_hash` per pending proposal, captured at process_proposal
+    /// (or on_block_ready for the leader). Looked up at R2 commit-vote signing
+    /// time so the same `changes_hash` enters the BLS message that
+    /// `verify_commit_qc` will check on the receiving side. Bounded to 64
+    /// entries with FIFO eviction, mirroring `pending_tx_roots`.
+    pub(super) pending_changes_hashes: HashMap<B256, B256>,
     /// Durable last-voted-view sink, fsync'd before every R1 vote (HotStuff-2
     /// safety invariant — see `crate::vote_log`). Defaults to `NoopVoteLog`
     /// for tests / single-validator dev mode; production builds inject a
@@ -317,6 +323,7 @@ impl ConsensusEngine {
             view_timing: ViewTiming::new(),
             last_committed_timing: None,
             pending_tx_roots: HashMap::new(),
+            pending_changes_hashes: HashMap::new(),
             vote_log,
         }
     }
@@ -413,6 +420,7 @@ impl ConsensusEngine {
             view_timing: ViewTiming::new(),
             last_committed_timing: None,
             pending_tx_roots: HashMap::new(),
+            pending_changes_hashes: HashMap::new(),
             vote_log,
         }
     }
@@ -485,7 +493,17 @@ impl ConsensusEngine {
                     .validator_set_for_view(commit_vote.view)
                     .get_public_key(commit_vote.voter)
                     .ok()?;
-                let sig_msg = commit_signing_message(commit_vote.view, &commit_vote.block_hash);
+                // authenticated_signer is called from the orchestrator's network
+                // dispatch path before the engine's main message handler runs, so
+                // we may not have the proposal cached. Use the cache when present
+                // and fall back to ZERO; the canonical verification still happens
+                // in process_commit_vote which has identical fallback semantics.
+                let changes_hash = self
+                    .pending_changes_hashes
+                    .get(&commit_vote.block_hash)
+                    .copied()
+                    .unwrap_or_default();
+                let sig_msg = commit_signing_message(commit_vote.view, &commit_vote.block_hash, &changes_hash);
                 if pk.verify_prevalidated(&sig_msg, &commit_vote.signature).is_err() {
                     tracing::debug!(target: "n42::consensus", view = commit_vote.view, voter = commit_vote.voter, "commit_vote signature verification failed");
                     return None;
@@ -764,17 +782,31 @@ impl ConsensusEngine {
 
         // Proposal/Timeout/NewView can carry either a prepare QC or a commit QC as
         // their justify/high QC, so the view-jump path must accept both domains.
+        // For Decide we know the exact changes_hash from the message; for others
+        // we fall back to ZERO since the proposal is not yet cached on this
+        // far-behind node (acceptable: the next regular proposal will retry).
         let verify_result = match msg {
-            ConsensusMessage::Decide(_) => {
-                super::quorum::verify_commit_qc(qc, self.validator_set_for_view(qc.view))
-            }
+            ConsensusMessage::Decide(decide) => super::quorum::verify_commit_qc(
+                qc,
+                self.validator_set_for_view(qc.view),
+                &decide.validator_changes_hash,
+            ),
             ConsensusMessage::PrepareQC(_) => {
                 super::quorum::verify_qc(qc, self.validator_set_for_view(qc.view))
             }
             ConsensusMessage::Proposal(_)
             | ConsensusMessage::Timeout(_)
             | ConsensusMessage::NewView(_) => {
-                super::quorum::verify_qc_any_domain(qc, self.validator_set_for_view(qc.view))
+                let changes_hash = self
+                    .pending_changes_hashes
+                    .get(&qc.block_hash)
+                    .copied()
+                    .unwrap_or_default();
+                super::quorum::verify_qc_any_domain(
+                    qc,
+                    self.validator_set_for_view(qc.view),
+                    &changes_hash,
+                )
             }
             ConsensusMessage::Vote(_) | ConsensusMessage::CommitVote(_) => return Ok(false),
         };
@@ -1164,14 +1196,25 @@ mod tests {
         vs: &ValidatorSet,
         signers: &[u32],
     ) -> QuorumCertificate {
+        build_test_commit_qc_with_changes(view, block_hash, sks, vs, signers, &B256::ZERO)
+    }
+
+    fn build_test_commit_qc_with_changes(
+        view: ViewNumber,
+        block_hash: B256,
+        sks: &[n42_primitives::BlsSecretKey],
+        vs: &ValidatorSet,
+        signers: &[u32],
+        changes_hash: &B256,
+    ) -> QuorumCertificate {
         use crate::protocol::quorum::{VoteCollector, commit_signing_message};
         let mut collector = VoteCollector::new(view, block_hash, vs.len());
         for &i in signers {
-            let msg = commit_signing_message(view, &block_hash);
+            let msg = commit_signing_message(view, &block_hash, changes_hash);
             collector.add_vote(i, sks[i as usize].sign(&msg)).unwrap();
         }
         collector
-            .build_qc_with_message(vs, &commit_signing_message(view, &block_hash))
+            .build_qc_with_message(vs, &commit_signing_message(view, &block_hash, changes_hash))
             .unwrap()
     }
 
@@ -1977,7 +2020,7 @@ mod tests {
 
         // Two commit votes (leader already self-voted for Round 2).
         for i in [0u32, 2] {
-            let msg = commit_signing_message(view, &block_hash);
+            let msg = commit_signing_message(view, &block_hash, &alloy_primitives::B256::ZERO);
             let cv = CommitVote {
                 view,
                 block_hash,
@@ -2030,7 +2073,7 @@ mod tests {
         }
         while rx.try_recv().is_ok() {}
 
-        let msg = commit_signing_message(view, &block_hash);
+        let msg = commit_signing_message(view, &block_hash, &alloy_primitives::B256::ZERO);
         let dup_sig = sks[0].sign(&msg);
         let dup_commit_vote = CommitVote {
             view,
@@ -2365,7 +2408,7 @@ mod tests {
         }
         while rx.try_recv().is_ok() {}
 
-        let wrong_msg = commit_signing_message(99, &block_hash);
+        let wrong_msg = commit_signing_message(99, &block_hash, &alloy_primitives::B256::ZERO);
         let cv = CommitVote {
             view,
             block_hash,
@@ -2475,7 +2518,7 @@ mod tests {
         )));
 
         for i in [0u32, 2] {
-            let msg = commit_signing_message(view, &block_hash);
+            let msg = commit_signing_message(view, &block_hash, &alloy_primitives::B256::ZERO);
             let cv = CommitVote {
                 view,
                 block_hash,
@@ -2544,12 +2587,22 @@ mod tests {
         let block_hash = B256::repeat_byte(0xD9);
         let view = 2u64;
 
-        let commit_qc = build_test_commit_qc(view, block_hash, &sks, &vs, &[0, 1, 2]);
+        // The commit_qc must be signed under the same changes_hash that the
+        // Decide carries (Plan #2: R2 signing message binds to changes_hash).
+        let changes_hash = B256::repeat_byte(0x42);
+        let commit_qc = build_test_commit_qc_with_changes(
+            view,
+            block_hash,
+            &sks,
+            &vs,
+            &[0, 1, 2],
+            &changes_hash,
+        );
         let decide = Decide {
             view,
             block_hash,
             commit_qc,
-            validator_changes_hash: B256::repeat_byte(0x42),
+            validator_changes_hash: changes_hash,
         };
 
         engine
@@ -2675,6 +2728,38 @@ mod tests {
                 assert!(reason.contains("commit QC"), "got: {reason}");
             }
             other => panic!("expected InvalidQC, got: {:?}", other),
+        }
+    }
+
+    /// Plan #2 regression: a Byzantine leader cannot attach a fake
+    /// `validator_changes_hash` to a Decide whose CommitQC was signed under
+    /// a different changes_hash. The R2 commit-vote signing message now
+    /// binds the hash, so the BLS aggregate verify catches the mismatch.
+    #[test]
+    fn test_decide_rejects_forged_changes_hash() {
+        let (mut engine, sks, vs, _rx) = make_engine(4, 0);
+        let block_hash = B256::repeat_byte(0xCB);
+        let view = 1u64;
+
+        // Honest commit_qc — signed under ZERO (no validator changes).
+        let honest_commit_qc = build_test_commit_qc(view, block_hash, &sks, &vs, &[0, 1, 2]);
+        // Byzantine leader keeps the same commit_qc but swaps the
+        // changes_hash to something nonzero, hoping followers will commit
+        // their local pending changes.
+        let forged_decide = Decide {
+            view,
+            block_hash,
+            commit_qc: honest_commit_qc,
+            validator_changes_hash: B256::repeat_byte(0xEE),
+        };
+        let err = engine
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Decide(forged_decide)))
+            .expect_err("forged changes_hash must fail commit_qc verification");
+        match err {
+            crate::error::ConsensusError::InvalidQC { reason, .. } => {
+                assert!(reason.contains("commit QC"), "got: {reason}");
+            }
+            other => panic!("expected InvalidQC, got: {other:?}"),
         }
     }
 

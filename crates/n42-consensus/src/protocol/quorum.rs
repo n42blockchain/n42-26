@@ -372,11 +372,14 @@ pub fn verify_qc(qc: &QuorumCertificate, validator_set: &ValidatorSet) -> Consen
 
 /// Verifies a CommitQC (Round 2) against the validator set.
 ///
-/// Uses `commit_signing_message` format ("commit" || view || block_hash)
-/// rather than the standard `signing_message` format.
+/// Caller must pass the `changes_hash` from the proposal that produced this
+/// view's PrepareQC (i.e. `Decide.validator_changes_hash` for the same view),
+/// or `B256::ZERO` when no validator changes were carried. The hash is part
+/// of the signed bytes, so a Byzantine leader cannot swap it after the fact.
 pub fn verify_commit_qc(
     qc: &QuorumCertificate,
     validator_set: &ValidatorSet,
+    changes_hash: &B256,
 ) -> ConsensusResult<()> {
     let quorum_size = validator_set.quorum_size();
     let signer_pks = collect_signer_keys(
@@ -386,7 +389,7 @@ pub fn verify_commit_qc(
         qc.view,
         CertKind::QC,
     )?;
-    let message = commit_signing_message(qc.view, &qc.block_hash);
+    let message = commit_signing_message(qc.view, &qc.block_hash, changes_hash);
     AggregateSignature::verify_aggregate(&message, &qc.aggregate_signature, &signer_pks).map_err(
         |_| ConsensusError::InvalidQC {
             view: qc.view,
@@ -397,16 +400,15 @@ pub fn verify_commit_qc(
 
 /// Verifies a QC that may be either a PrepareQC (Round 1) or CommitQC (Round 2).
 ///
-/// The `locked_qc` can originate from either:
-/// - Round 1 (prepare path): signed with `signing_message` (view || block_hash)
-/// - Round 2 (commit path): signed with `commit_signing_message` ("commit" || view || block_hash)
-///
-/// When a QC is embedded as `high_qc` in timeout messages or `justify_qc` in proposals,
-/// we cannot know its signing domain a priori. This function collects signer keys once
-/// and tries both message formats to avoid redundant bitmap validation and key collection.
+/// Used when a QC is embedded as `high_qc` in a timeout message or `justify_qc`
+/// in a proposal — we don't always know whether the producer signed it under
+/// the prepare or the commit domain. The function tries the prepare format
+/// first (most common) and falls back to the commit format with the supplied
+/// `changes_hash` (or zero, when the caller doesn't have it cached).
 pub fn verify_qc_any_domain(
     qc: &QuorumCertificate,
     validator_set: &ValidatorSet,
+    changes_hash: &B256,
 ) -> ConsensusResult<()> {
     let quorum_size = validator_set.quorum_size();
     let signer_pks = collect_signer_keys(
@@ -426,7 +428,7 @@ pub fn verify_qc_any_domain(
     }
 
     // Fall back to commit (Round 2) message format.
-    let commit_msg = commit_signing_message(qc.view, &qc.block_hash);
+    let commit_msg = commit_signing_message(qc.view, &qc.block_hash, changes_hash);
     AggregateSignature::verify_aggregate(&commit_msg, &qc.aggregate_signature, &signer_pks).map_err(
         |_| ConsensusError::InvalidQC {
             view: qc.view,
@@ -489,12 +491,27 @@ pub fn proposal_signing_message(
     msg
 }
 
-/// Signing message for Round 2 commit votes: "commit" || view (8 bytes LE) || block_hash (32 bytes).
-pub fn commit_signing_message(view: ViewNumber, block_hash: &B256) -> [u8; 46] {
-    let mut msg = [0u8; 46];
+/// Signing message for Round 2 commit votes:
+///   `"commit" (6) || view (8 LE) || block_hash (32) || changes_hash (32)` = 78 bytes.
+///
+/// `changes_hash` is `EpochManager::hash_changes(validator_changes)` from the
+/// proposal that produced this view's PrepareQC, or `B256::ZERO` when no
+/// validator changes were proposed. Including it in the signed message binds
+/// every commit vote (and therefore the aggregated CommitQC) to the exact
+/// validator change set carried by the Decide, so a Byzantine leader cannot
+/// substitute a different `validator_changes_hash` after collecting commit
+/// votes (Finding 8 in the HotStuff-2 audit). Wire-format breaking — bumps
+/// `CONSENSUS_PROTOCOL_VERSION`.
+pub fn commit_signing_message(
+    view: ViewNumber,
+    block_hash: &B256,
+    changes_hash: &B256,
+) -> [u8; 78] {
+    let mut msg = [0u8; 78];
     msg[..6].copy_from_slice(b"commit");
     msg[6..14].copy_from_slice(&view.to_le_bytes());
-    msg[14..].copy_from_slice(block_hash.as_slice());
+    msg[14..46].copy_from_slice(block_hash.as_slice());
+    msg[46..78].copy_from_slice(changes_hash.as_slice());
     msg
 }
 
@@ -674,12 +691,25 @@ mod tests {
     fn test_commit_signing_message_format() {
         let view: ViewNumber = 7;
         let block_hash = B256::repeat_byte(0x11);
-        let msg = commit_signing_message(view, &block_hash);
+        let changes_hash = B256::repeat_byte(0x22);
+        let msg = commit_signing_message(view, &block_hash, &changes_hash);
 
-        assert_eq!(msg.len(), 46);
+        assert_eq!(msg.len(), 78);
         assert_eq!(&msg[..6], b"commit");
         assert_eq!(&msg[6..14], &7u64.to_le_bytes());
-        assert_eq!(&msg[14..], block_hash.as_slice());
+        assert_eq!(&msg[14..46], block_hash.as_slice());
+        assert_eq!(&msg[46..78], changes_hash.as_slice());
+    }
+
+    #[test]
+    fn test_commit_signing_message_includes_changes_hash() {
+        let view: ViewNumber = 5;
+        let block = B256::repeat_byte(0xAB);
+        let m_zero = commit_signing_message(view, &block, &B256::ZERO);
+        let m_set = commit_signing_message(view, &block, &B256::repeat_byte(0xFF));
+        // Different changes_hash values must produce different signed bytes,
+        // otherwise a Byzantine leader could swap changes_hash post-aggregation.
+        assert_ne!(m_zero, m_set);
     }
 
     #[test]
@@ -863,13 +893,13 @@ mod tests {
         let block_hash = B256::repeat_byte(0xC1);
 
         let mut collector = VoteCollector::new(view, block_hash, vs.len());
-        let msg = commit_signing_message(view, &block_hash);
+        let msg = commit_signing_message(view, &block_hash, &alloy_primitives::B256::ZERO);
         for i in 0..3u32 {
             collector.add_vote(i, sks[i as usize].sign(&msg)).unwrap();
         }
         let commit_qc = collector.build_qc_with_message(&vs, &msg).unwrap();
 
-        verify_commit_qc(&commit_qc, &vs).expect("verify_commit_qc should succeed");
+        verify_commit_qc(&commit_qc, &vs, &alloy_primitives::B256::ZERO).expect("verify_commit_qc should succeed");
     }
 
     #[test]
@@ -878,7 +908,7 @@ mod tests {
         let view = 11u64;
         let block_hash = B256::repeat_byte(0xC2);
 
-        let msg = commit_signing_message(view, &block_hash);
+        let msg = commit_signing_message(view, &block_hash, &alloy_primitives::B256::ZERO);
         let sig = sks[0].sign(&msg);
         let agg_sig = AggregateSignature::aggregate(&[&sig]).unwrap();
 
@@ -893,7 +923,7 @@ mod tests {
             },
         };
 
-        let result = verify_commit_qc(&qc, &vs);
+        let result = verify_commit_qc(&qc, &vs, &alloy_primitives::B256::ZERO);
         assert!(result.is_err());
         match result.unwrap_err() {
             ConsensusError::InvalidQC { view: v, reason } => {
@@ -911,7 +941,7 @@ mod tests {
         let block_hash = B256::repeat_byte(0xC3);
 
         let mut collector = VoteCollector::new(view, block_hash, vs.len());
-        let msg = commit_signing_message(view, &block_hash);
+        let msg = commit_signing_message(view, &block_hash, &alloy_primitives::B256::ZERO);
         for i in 0..3u32 {
             collector.add_vote(i, sks[i as usize].sign(&msg)).unwrap();
         }
@@ -934,7 +964,7 @@ mod tests {
         }
         let prepare_qc = collector.build_qc(&vs).unwrap();
 
-        let result = verify_commit_qc(&prepare_qc, &vs);
+        let result = verify_commit_qc(&prepare_qc, &vs, &alloy_primitives::B256::ZERO);
         assert!(
             result.is_err(),
             "verify_commit_qc should reject a PrepareQC"

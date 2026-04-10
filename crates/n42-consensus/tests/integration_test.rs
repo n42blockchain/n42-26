@@ -1980,7 +1980,7 @@ mod byzantine_signature {
         // the engine is already at view=2, so the message is stale (view=1 <
         // current_view=2) and silently discarded — not an error.
         harness.drain_outputs(3);
-        let wrong_msg = commit_signing_message(999, &block_hash);
+        let wrong_msg = commit_signing_message(999, &block_hash, &alloy_primitives::B256::ZERO);
         let bad_sig = harness.secret_keys[3].sign(&wrong_msg);
         let bad_cv = CommitVote {
             view,
