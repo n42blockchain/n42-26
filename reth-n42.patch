@@ -687,3 +687,19 @@ index 000000000..000000001
 +pub fn take_broadcast_execution<T: 'static>(block_hash: &B256) -> Option<T> {
 +    take::<T>(&BROADCAST_CACHE, block_hash)
 +}
+diff --git a/crates/fs-util/src/lib.rs b/crates/fs-util/src/lib.rs
+index d17b7113a..d05756621 100644
+--- a/crates/fs-util/src/lib.rs
++++ b/crates/fs-util/src/lib.rs
+@@ -356,7 +356,10 @@ where
+     // Rename file, not move
+     rename(&tmp_path, file_path)?;
+ 
+-    // fsync() directory
++    // fsync() directory — only on Unix. Windows does not allow opening a
++    // directory as a file, and NTFS journals metadata operations independently
++    // so the rename above is already crash-safe without an explicit dir fsync.
++    #[cfg(unix)]
+     if let Some(parent) = file_path.parent() {
+         OpenOptions::new()
+             .read(true)
