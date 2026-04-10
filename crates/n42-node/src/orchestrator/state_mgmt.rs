@@ -381,6 +381,10 @@ impl ConsensusOrchestrator {
                 && self.engine.epoch_manager_mut().advance_epoch()
             {
                 self.epoch_sync_staged_view = None;
+                // Update my_index to reflect the new validator set — without this,
+                // a newly-added validator would keep voting with the stale index (e.g. 0)
+                // after sync completes, causing signature verification failures on the leader.
+                self.engine.sync_local_validator_index();
                 let new_epoch = self.engine.epoch_manager().current_epoch();
                 let validator_count = self.engine.epoch_manager().current_validator_set().len();
                 info!(

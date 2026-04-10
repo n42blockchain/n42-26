@@ -459,6 +459,33 @@ impl ConsensusEngine {
         &mut self.epoch_manager
     }
 
+    /// Re-derives `my_index` from the current validator set after an external
+    /// epoch advance (e.g. during block sync).  Returns the new index, or `None`
+    /// if this node is not in the current set.
+    pub fn sync_local_validator_index(&mut self) -> Option<u32> {
+        let new_index = self
+            .epoch_manager
+            .current_validator_set()
+            .index_of_public_key(&self.local_public_key);
+        if let Some(idx) = new_index {
+            if idx != self.my_index {
+                tracing::info!(
+                    target: "n42::cl::engine",
+                    old_index = self.my_index,
+                    new_index = idx,
+                    "updated my_index after epoch advance (sync)"
+                );
+                self.my_index = idx;
+            }
+        } else {
+            tracing::warn!(
+                target: "n42::cl::engine",
+                "local key not in current validator set (sync)"
+            );
+        }
+        new_index
+    }
+
     /// Proposes adding a new validator, to be committed at the next CommitQC.
     ///
     /// See [`EpochManager::propose_add_validator`] for safety constraints.
@@ -1126,6 +1153,214 @@ mod tests {
                 validator_count: 4,
             })
         ));
+    }
+
+    /// Tests that `sync_local_validator_index` correctly updates `my_index`
+    /// after an external epoch advance (simulating the sync path).
+    #[test]
+    fn test_sync_local_validator_index_after_epoch_advance() {
+        // Create 3 validators for epoch 0.
+        let sks: Vec<_> = (0..4).map(|i| test_key(0x50 + i as u8)).collect();
+        let infos_epoch_0: Vec<ValidatorInfo> = sks[..3]
+            .iter()
+            .enumerate()
+            .map(|(i, sk)| ValidatorInfo {
+                address: Address::with_last_byte(i as u8),
+                bls_public_key: sk.public_key(),
+                p2p_peer_id: None,
+            })
+            .collect();
+
+        // New validator #3 will be added in epoch 1.
+        let new_validator_info = ValidatorInfo {
+            address: Address::with_last_byte(3),
+            bls_public_key: sks[3].public_key(),
+            p2p_peer_id: None,
+        };
+
+        // Build engine for the NEW validator with my_index=0 (observer default,
+        // simulating a node that started before being added to the set).
+        let epoch_manager = EpochManager::with_epoch_length(
+            ValidatorSet::new(&infos_epoch_0, 0),
+            5,
+        );
+        let (output_tx, _rx) = mpsc::channel(16);
+        let mut engine = ConsensusEngine::with_epoch_manager(
+            0, // wrong index — simulates observer default
+            sks[3].clone(), // but uses validator #3's secret key
+            epoch_manager,
+            60000,
+            120000,
+            output_tx,
+        );
+
+        // Before epoch advance: sync_local_validator_index returns None
+        // because validator #3 is not in the 3-validator set.
+        assert_eq!(engine.sync_local_validator_index(), None);
+        assert_eq!(engine.my_index(), 0); // still observer
+
+        // Simulate sync path: stage next epoch with the new validator added.
+        let mut infos_epoch_1 = infos_epoch_0.clone();
+        infos_epoch_1.push(new_validator_info);
+        engine
+            .epoch_manager_mut()
+            .stage_next_epoch(&infos_epoch_1, 1)
+            .unwrap();
+        engine.epoch_manager_mut().advance_epoch();
+
+        // Now sync_local_validator_index should find our key and update my_index.
+        let new_idx = engine.sync_local_validator_index();
+        assert!(new_idx.is_some(), "validator #3 should be in the new set");
+        assert_eq!(
+            engine.my_index(),
+            new_idx.unwrap(),
+            "my_index should be updated to the correct position in the new set"
+        );
+        // Verify it's not still 0 (unless it actually IS index 0 in the new set).
+        let actual_idx = engine
+            .epoch_manager()
+            .current_validator_set()
+            .index_of_public_key(&sks[3].public_key())
+            .unwrap();
+        assert_eq!(engine.my_index(), actual_idx);
+    }
+
+    /// Tests that a newly-added validator's votes are accepted by the leader
+    /// after epoch transition (validates the voting.rs fix).
+    #[test]
+    fn test_new_validator_votes_accepted_after_epoch() {
+        // Start with 3 validators, epoch_length=5.
+        let sks: Vec<_> = (0..4).map(|i| test_key(0x60 + i as u8)).collect();
+        let infos_epoch_0: Vec<ValidatorInfo> = sks[..3]
+            .iter()
+            .enumerate()
+            .map(|(i, sk)| ValidatorInfo {
+                address: Address::with_last_byte(i as u8),
+                bls_public_key: sk.public_key(),
+                p2p_peer_id: None,
+            })
+            .collect();
+
+        let new_validator_info = ValidatorInfo {
+            address: Address::with_last_byte(3),
+            bls_public_key: sks[3].public_key(),
+            p2p_peer_id: None,
+        };
+
+        let mut infos_epoch_1 = infos_epoch_0.clone();
+        infos_epoch_1.push(new_validator_info);
+
+        // Create 4 engines: 3 original + 1 new validator.
+        let epoch_length = 5u64;
+        let mut engines = Vec::new();
+        let mut rxs = Vec::new();
+
+        for i in 0..4usize {
+            let my_index = if i < 3 { i as u32 } else { 0 }; // new validator starts as observer
+            let epoch_manager = EpochManager::with_epoch_length(
+                ValidatorSet::new(&infos_epoch_0, 0),
+                epoch_length,
+            );
+            let (tx, rx) = mpsc::channel(1024);
+            let engine = ConsensusEngine::with_epoch_manager(
+                my_index,
+                sks[i].clone(),
+                epoch_manager,
+                60000,
+                120000,
+                tx,
+            );
+            engines.push(engine);
+            rxs.push(rx);
+        }
+
+        // Stage next epoch on all engines: add validator #3.
+        for engine in &mut engines {
+            engine
+                .epoch_manager_mut()
+                .stage_next_epoch(&infos_epoch_1, 1)
+                .unwrap();
+        }
+
+        // Advance all engines to view 6 (epoch boundary for epoch_length=5).
+        // This triggers advance_epoch on the live consensus path.
+        for engine in &mut engines {
+            engine.advance_to_view(epoch_length + 1).unwrap();
+        }
+        // Drain EpochTransition outputs.
+        for rx in &mut rxs {
+            while rx.try_recv().is_ok() {}
+        }
+
+        // After epoch transition, the new validator (engine[3]) should have
+        // its my_index updated to its correct position.
+        let new_idx = engines[3]
+            .epoch_manager()
+            .current_validator_set()
+            .index_of_public_key(&sks[3].public_key())
+            .unwrap();
+        assert_eq!(
+            engines[3].my_index(),
+            new_idx,
+            "new validator my_index should be updated after epoch transition"
+        );
+
+        // Now test that the new validator can vote and the leader accepts it.
+        let view = epoch_length + 1; // view 6
+        let vs_epoch_1 = ValidatorSet::new(&infos_epoch_1, 1);
+        let leader = LeaderSelector::leader_for_view(view, &vs_epoch_1);
+
+        // Leader proposes a block.
+        let block_hash = B256::repeat_byte(0xAB);
+        engines[leader as usize]
+            .process_event(ConsensusEvent::BlockReady(block_hash, None))
+            .expect("leader BlockReady should succeed");
+
+        // Get the proposal.
+        let mut proposal = None;
+        while let Ok(o) = rxs[leader as usize].try_recv() {
+            if let EngineOutput::BroadcastMessage(msg @ ConsensusMessage::Proposal(_)) = o {
+                proposal = Some(msg);
+            }
+        }
+        let proposal = proposal.expect("leader should broadcast Proposal");
+
+        // All non-leader validators process the proposal and vote.
+        for i in 0..4 {
+            if i as u32 != leader {
+                engines[i]
+                    .process_event(ConsensusEvent::Message(proposal.clone()))
+                    .expect("should accept Proposal");
+            }
+        }
+
+        // Collect votes from all non-leaders (including the new validator #3)
+        // and send them to the leader.
+        for i in 0..4 {
+            if i as u32 != leader {
+                while let Ok(o) = rxs[i].try_recv() {
+                    if let EngineOutput::SendToValidator(target, msg) = o {
+                        if target == leader {
+                            engines[leader as usize]
+                                .process_event(ConsensusEvent::Message(msg))
+                                .expect("leader should accept vote from any validator including new one");
+                        }
+                    }
+                }
+            }
+        }
+
+        // Leader should have formed a PrepareQC (quorum reached with 4 validators).
+        let mut has_prepare_qc = false;
+        while let Ok(o) = rxs[leader as usize].try_recv() {
+            if matches!(o, EngineOutput::BroadcastMessage(ConsensusMessage::PrepareQC(_))) {
+                has_prepare_qc = true;
+            }
+        }
+        assert!(
+            has_prepare_qc,
+            "leader should form PrepareQC with votes from all 4 validators (including newly added)"
+        );
     }
 
     #[test]

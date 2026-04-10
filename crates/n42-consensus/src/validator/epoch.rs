@@ -284,10 +284,10 @@ impl EpochManager {
                 return Some(set);
             }
         }
-        if let Some(next) = &self.next_set {
-            if next.len() as usize == len {
-                return Some(next);
-            }
+        if let Some(next) = &self.next_set
+            && next.len() as usize == len
+        {
+            return Some(next);
         }
         None
     }

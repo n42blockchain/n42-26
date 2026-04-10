@@ -71,15 +71,16 @@ impl ConsensusEngine {
             "proposing block"
         );
 
+        let view_set_len = self.validator_set_for_view(view).len();
         self.vote_collector = Some(crate::protocol::quorum::VoteCollector::new(
             view,
             block_hash,
-            self.validator_set().len(),
+            view_set_len,
         ));
         self.commit_collector = Some(crate::protocol::quorum::VoteCollector::new(
             view,
             block_hash,
-            self.validator_set().len(),
+            view_set_len,
         ));
         self.round_state.enter_voting();
 

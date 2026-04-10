@@ -59,8 +59,8 @@ impl ConsensusEngine {
             return Ok(());
         }
 
-        // Verify BLS signature before adding to collector.
-        let pk = self.validator_set().get_public_key(vote.voter)?;
+        let view_set = self.validator_set_for_view(view);
+        let pk = view_set.get_public_key(vote.voter)?;
         let msg = signing_message(view, &vote.block_hash);
         pk.verify(&msg, &vote.signature)
             .map_err(|_| ConsensusError::InvalidSignature {
@@ -105,11 +105,12 @@ impl ConsensusEngine {
     /// and self-votes for CommitVote (Round 2).
     pub(super) fn try_form_prepare_qc(&mut self) -> ConsensusResult<()> {
         let view = self.round_state.current_view();
+        let view_set = self.validator_set_for_view(view);
 
         let has_quorum = self
             .vote_collector
             .as_ref()
-            .is_some_and(|c| c.has_quorum(self.validator_set().quorum_size()));
+            .is_some_and(|c| c.has_quorum(view_set.quorum_size()));
 
         if !has_quorum || self.prepare_qc.is_some() {
             return Ok(());
@@ -122,7 +123,7 @@ impl ConsensusEngine {
                 return Ok(());
             }
         };
-        let qc = collector.build_qc(self.validator_set())?;
+        let qc = collector.build_qc(view_set)?;
 
         tracing::debug!(target: "n42::cl::voting", view, signers = qc.signer_count(), "QC formed, entering pre-commit");
 
@@ -187,7 +188,8 @@ impl ConsensusEngine {
             return Ok(());
         }
 
-        let pk = self.validator_set().get_public_key(cv.voter)?;
+        let view_set = self.validator_set_for_view(view);
+        let pk = view_set.get_public_key(cv.voter)?;
         let msg = commit_signing_message(view, &cv.block_hash);
         pk.verify(&msg, &cv.signature)
             .map_err(|_| ConsensusError::InvalidSignature {
@@ -232,23 +234,23 @@ impl ConsensusEngine {
     /// and advances to the next view.
     pub(super) fn try_form_commit_qc(&mut self) -> ConsensusResult<()> {
         let view = self.round_state.current_view();
+        let view_set = self.validator_set_for_view(view);
 
         let has_quorum = self
             .commit_collector
             .as_ref()
-            .is_some_and(|c| c.has_quorum(self.validator_set().quorum_size()));
+            .is_some_and(|c| c.has_quorum(view_set.quorum_size()));
 
         if !has_quorum {
             return Ok(());
         }
-
         let collector = match self.commit_collector.as_ref() {
             Some(c) => c,
             None => return Ok(()),
         };
         let block_hash = collector.block_hash();
         let commit_msg = commit_signing_message(view, &block_hash);
-        let commit_qc = collector.build_qc_with_message(self.validator_set(), &commit_msg)?;
+        let commit_qc = collector.build_qc_with_message(view_set, &commit_msg)?;
 
         self.view_timing.commit_qc_formed = Some(std::time::Instant::now());
         self.view_timing.commit_vote_count = collector.vote_count() as u32;

@@ -6,7 +6,7 @@ use n42_chainspec::ValidatorInfo;
 use n42_consensus::error::ConsensusError;
 use n42_consensus::protocol::Phase;
 use n42_consensus::protocol::quorum::signing_message;
-use n42_consensus::{ConsensusEngine, ConsensusEvent, EngineOutput, LeaderSelector, ValidatorSet};
+use n42_consensus::{ConsensusEngine, ConsensusEvent, EpochManager, EngineOutput, LeaderSelector, ValidatorSet};
 use n42_primitives::BlsSecretKey;
 use n42_primitives::consensus::{ConsensusMessage, Proposal, QuorumCertificate, ViewNumber, Vote};
 use tokio::sync::mpsc;
@@ -3059,5 +3059,420 @@ mod twenty_one_node {
             !has_duplicate_vote,
             "non-leader should NOT emit a second vote after BlockImported (already voted)"
         );
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // Dynamic Validator Addition Tests
+    // ──────────────────────────────────────────────────────────────
+
+    /// Creates an epoch-aware test harness with dynamic validator support.
+    struct EpochTestHarness {
+        engines: Vec<ConsensusEngine>,
+        secret_keys: Vec<BlsSecretKey>,
+        output_rxs: Vec<mpsc::Receiver<EngineOutput>>,
+        committed_blocks: Vec<(ViewNumber, B256)>,
+    }
+
+    impl EpochTestHarness {
+        /// Creates `n` validators with epochs enabled.
+        fn new(n: usize, epoch_length: u64) -> Self {
+            let secret_keys: Vec<BlsSecretKey> = (0..n as u32).map(test_bls_key).collect();
+
+            let infos: Vec<ValidatorInfo> = secret_keys
+                .iter()
+                .enumerate()
+                .map(|(i, sk)| ValidatorInfo {
+                    address: Address::with_last_byte(i as u8),
+                    bls_public_key: sk.public_key(),
+                    p2p_peer_id: None,
+                })
+                .collect();
+
+            let f = (n as u32).saturating_sub(1) / 3;
+            let validator_set = ValidatorSet::new(&infos, f);
+
+            let mut engines = Vec::with_capacity(n);
+            let mut output_rxs = Vec::with_capacity(n);
+
+            for i in 0..n {
+                let (tx, rx) = mpsc::channel(1024);
+                let epoch_manager =
+                    EpochManager::with_epoch_length(validator_set.clone(), epoch_length);
+                let engine = ConsensusEngine::with_epoch_manager(
+                    i as u32,
+                    secret_keys[i].clone(),
+                    epoch_manager,
+                    60_000,
+                    120_000,
+                    tx,
+                );
+                engines.push(engine);
+                output_rxs.push(rx);
+            }
+
+            Self {
+                engines,
+                secret_keys,
+                output_rxs,
+                committed_blocks: Vec::new(),
+            }
+        }
+
+        fn n(&self) -> usize {
+            self.engines.len()
+        }
+
+        fn drain_outputs(&mut self, idx: usize) -> Vec<EngineOutput> {
+            let mut outputs = Vec::new();
+            while let Ok(o) = self.output_rxs[idx].try_recv() {
+                outputs.push(o);
+            }
+            outputs
+        }
+
+        fn drain_all_outputs(&mut self) {
+            for i in 0..self.n() {
+                self.drain_outputs(i);
+            }
+        }
+
+        fn current_validator_set(&self) -> &ValidatorSet {
+            self.engines[0].epoch_manager().current_validator_set()
+        }
+
+        fn leader_for_view(&self, view: ViewNumber) -> usize {
+            LeaderSelector::leader_for_view(view, self.current_validator_set()) as usize
+        }
+
+        /// Adds a new validator engine. Returns its index.
+        fn add_validator_engine(
+            &mut self,
+            secret_key: BlsSecretKey,
+            epoch_manager: EpochManager,
+        ) -> usize {
+            let idx = self.engines.len();
+            let (tx, rx) = mpsc::channel(1024);
+            // New validator starts with my_index=0 (observer default)
+            // because it's not yet in the active set.
+            let engine = ConsensusEngine::with_epoch_manager(
+                0,
+                secret_key.clone(),
+                epoch_manager,
+                60_000,
+                120_000,
+                tx,
+            );
+            self.engines.push(engine);
+            self.output_rxs.push(rx);
+            self.secret_keys.push(secret_key);
+            idx
+        }
+
+        /// Runs a full consensus round with all current engines.
+        fn run_consensus_round(&mut self, view: ViewNumber, block_hash: B256) {
+            let n = self.n();
+            let leader = self.leader_for_view(view);
+
+            // Step 1: Leader proposes
+            self.engines[leader]
+                .process_event(ConsensusEvent::BlockReady(block_hash, None))
+                .expect("leader BlockReady should succeed");
+
+            let proposal = self
+                .drain_outputs(leader)
+                .into_iter()
+                .find_map(|o| match o {
+                    EngineOutput::BroadcastMessage(msg @ ConsensusMessage::Proposal(_)) => {
+                        Some(msg)
+                    }
+                    _ => None,
+                })
+                .expect("leader should broadcast Proposal");
+
+            // Step 2: Non-leaders process proposal
+            for i in 0..n {
+                if i != leader {
+                    let _ = self.engines[i]
+                        .process_event(ConsensusEvent::Message(proposal.clone()));
+                }
+            }
+
+            let proposal_block_hash = match &proposal {
+                ConsensusMessage::Proposal(p) => p.block_hash,
+                _ => unreachable!(),
+            };
+            for i in 0..n {
+                if i != leader {
+                    let _ = self.engines[i]
+                        .process_event(ConsensusEvent::BlockImported(proposal_block_hash));
+                }
+            }
+
+            // Step 3: Route votes to leader
+            for i in 0..n {
+                if i != leader {
+                    for output in self.drain_outputs(i) {
+                        if let EngineOutput::SendToValidator(target, msg) = output {
+                            if target == leader as u32 {
+                                let _ = self.engines[leader]
+                                    .process_event(ConsensusEvent::Message(msg));
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Step 4: Leader broadcasts PrepareQC
+            let leader_outputs = self.drain_outputs(leader);
+            let prepare_qc = leader_outputs
+                .iter()
+                .find_map(|o| match o {
+                    EngineOutput::BroadcastMessage(msg @ ConsensusMessage::PrepareQC(_)) => {
+                        Some(msg.clone())
+                    }
+                    _ => None,
+                });
+
+            let prepare_qc = match prepare_qc {
+                Some(pqc) => pqc,
+                None => {
+                    self.drain_all_outputs();
+                    return; // No quorum
+                }
+            };
+
+            // Step 5: Non-leaders process PrepareQC and send CommitVotes
+            for i in 0..n {
+                if i != leader {
+                    let _ = self.engines[i]
+                        .process_event(ConsensusEvent::Message(prepare_qc.clone()));
+                }
+            }
+
+            for i in 0..n {
+                if i != leader {
+                    for output in self.drain_outputs(i) {
+                        if let EngineOutput::SendToValidator(target, msg) = output {
+                            if target == leader as u32 {
+                                let _ = self.engines[leader]
+                                    .process_event(ConsensusEvent::Message(msg));
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Step 6: Check for committed block and broadcast Decide
+            let leader_outputs = self.drain_outputs(leader);
+            for output in &leader_outputs {
+                if let EngineOutput::BlockCommitted {
+                    view: v,
+                    block_hash: h,
+                    ..
+                } = output
+                {
+                    self.committed_blocks.push((*v, *h));
+                }
+            }
+
+            let decide_msgs: Vec<_> = leader_outputs
+                .into_iter()
+                .filter_map(|o| match o {
+                    EngineOutput::BroadcastMessage(msg @ ConsensusMessage::Decide(_)) => Some(msg),
+                    _ => None,
+                })
+                .collect();
+
+            for msg in &decide_msgs {
+                for i in 0..n {
+                    if i != leader {
+                        let _ = self.engines[i]
+                            .process_event(ConsensusEvent::Message(msg.clone()));
+                    }
+                }
+            }
+
+            self.drain_all_outputs();
+
+            // Catch-up for engines still behind.
+            let next_view = view + 1;
+            for i in 0..n {
+                if self.engines[i].current_view() < next_view {
+                    for msg in &decide_msgs {
+                        let _ = self.engines[i]
+                            .process_event(ConsensusEvent::Message(msg.clone()));
+                    }
+                }
+            }
+            self.drain_all_outputs();
+        }
+    }
+
+    /// Tests the full lifecycle of dynamically adding a validator:
+    /// 1. Run consensus with 4 validators through epoch 0
+    /// 2. Stage a new validator set with 5 validators for next epoch
+    /// 3. Cross the epoch boundary — all engines advance to the 5-validator set
+    /// 4. Verify the new validator participates in consensus with correct votes
+    #[test]
+    fn test_dynamic_validator_addition_full_lifecycle() {
+        let epoch_length = 10u64;
+        let initial_n = 4;
+        let mut harness = EpochTestHarness::new(initial_n, epoch_length);
+
+        // Run epoch 0 to completion (views 1..=epoch_length).
+        // At some point, stage the next epoch with validator #5.
+        for view in 1..=5u64 {
+            let block_hash = B256::repeat_byte(view as u8);
+            harness.run_consensus_round(view, block_hash);
+        }
+        assert_eq!(harness.committed_blocks.len(), 5, "should commit 5 blocks");
+
+        // Prepare new validator #4.
+        let new_sk = test_bls_key(4);
+        let new_info = ValidatorInfo {
+            address: Address::with_last_byte(4),
+            bls_public_key: new_sk.public_key(),
+            p2p_peer_id: None,
+        };
+
+        // Propose adding the new validator on all engines.
+        for engine in &mut harness.engines {
+            engine.propose_add_validator(new_info.clone()).unwrap();
+        }
+
+        // Continue running rounds — pending change will be committed at CommitQC.
+        // The Decide for view epoch_length triggers advance_to_view(epoch_length+1),
+        // which is an epoch boundary, so the epoch advances automatically.
+        for view in 6..=epoch_length {
+            let block_hash = B256::repeat_byte(view as u8);
+            harness.run_consensus_round(view, block_hash);
+        }
+        assert_eq!(harness.committed_blocks.len(), epoch_length as usize);
+
+        // Epoch should have already advanced (Decide for view 10 → advance_to_view(11) → epoch boundary).
+        assert_eq!(
+            harness.engines[0].epoch_manager().current_epoch(),
+            1,
+            "should be in epoch 1 after crossing boundary"
+        );
+        assert_eq!(
+            harness.engines[0].epoch_manager().current_validator_set().len(),
+            5,
+            "should have 5 validators in epoch 1"
+        );
+
+        // Add the new validator engine. Clone epoch manager state from engine 0
+        // which has already advanced to epoch 1 with the 5-validator set.
+        let new_epoch_mgr = {
+            let em = harness.engines[0].epoch_manager();
+            EpochManager::from_epoch(
+                em.current_validator_set().clone(),
+                epoch_length,
+                em.current_epoch(),
+            )
+        };
+        let new_idx = harness.add_validator_engine(new_sk, new_epoch_mgr);
+
+        // Simulate the new validator syncing up: it joined after epoch advanced,
+        // so use sync_local_validator_index to set the correct my_index.
+        harness.engines[new_idx].sync_local_validator_index();
+
+        // Verify the new validator has correct my_index.
+        let expected_idx = harness.engines[new_idx]
+            .epoch_manager()
+            .current_validator_set()
+            .index_of_public_key(&harness.secret_keys[new_idx].public_key())
+            .expect("new validator should be in current set");
+        assert_eq!(
+            harness.engines[new_idx].my_index(),
+            expected_idx,
+            "new validator my_index should be set correctly"
+        );
+
+        // Run 10 more rounds with all 5 validators participating.
+        let start_view = epoch_length + 1;
+        for view in start_view..=(start_view + 9) {
+            let block_hash = B256::repeat_byte(view as u8);
+            harness.run_consensus_round(view, block_hash);
+        }
+
+        let total_expected = epoch_length as usize + 10;
+        assert_eq!(
+            harness.committed_blocks.len(),
+            total_expected,
+            "all blocks should commit with 5 validators"
+        );
+
+        // Verify all engines are in epoch 1 with 5 validators.
+        for (i, engine) in harness.engines.iter().enumerate() {
+            assert_eq!(
+                engine.epoch_manager().current_validator_set().len(),
+                5,
+                "engine {} should have 5 validators",
+                i
+            );
+        }
+    }
+
+    /// Tests that sync_local_validator_index correctly updates my_index
+    /// when epoch is advanced via the sync path (epoch_manager_mut().advance_epoch()).
+    #[test]
+    fn test_sync_path_epoch_advance_updates_my_index() {
+        let epoch_length = 5u64;
+
+        // 3 original validators.
+        let sks: Vec<BlsSecretKey> = (0..4).map(test_bls_key).collect();
+        let infos: Vec<ValidatorInfo> = sks[..3]
+            .iter()
+            .enumerate()
+            .map(|(i, sk)| ValidatorInfo {
+                address: Address::with_last_byte(i as u8),
+                bls_public_key: sk.public_key(),
+                p2p_peer_id: None,
+            })
+            .collect();
+
+        let f = 0u32;
+        let validator_set = ValidatorSet::new(&infos, f);
+
+        // Create engine for the NEW validator (not in initial set).
+        let epoch_manager = EpochManager::with_epoch_length(validator_set, epoch_length);
+        let (tx, _rx) = mpsc::channel(1024);
+        let mut engine = ConsensusEngine::with_epoch_manager(
+            0, // observer default
+            sks[3].clone(),
+            epoch_manager,
+            60_000,
+            120_000,
+            tx,
+        );
+
+        assert_eq!(engine.my_index(), 0, "should start as observer");
+
+        // Simulate sync: stage next epoch with expanded set and advance.
+        let mut infos_expanded = infos.clone();
+        infos_expanded.push(ValidatorInfo {
+            address: Address::with_last_byte(3),
+            bls_public_key: sks[3].public_key(),
+            p2p_peer_id: None,
+        });
+
+        engine
+            .epoch_manager_mut()
+            .stage_next_epoch(&infos_expanded, 1)
+            .unwrap();
+        engine.epoch_manager_mut().advance_epoch();
+
+        // This is what the fix in state_mgmt.rs does:
+        let new_idx = engine.sync_local_validator_index();
+        assert!(new_idx.is_some(), "validator should be found in new set");
+
+        let expected = engine
+            .epoch_manager()
+            .current_validator_set()
+            .index_of_public_key(&sks[3].public_key())
+            .unwrap();
+        assert_eq!(engine.my_index(), expected);
+        assert_ne!(engine.my_index(), 0, "my_index should no longer be 0 (observer)");
     }
 }
