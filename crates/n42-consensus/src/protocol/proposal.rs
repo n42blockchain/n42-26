@@ -141,7 +141,7 @@ impl ConsensusEngine {
             &proposal.block_hash,
             &proposal.validator_changes,
         );
-        pk.verify(&prop_msg, &proposal.signature)
+        pk.verify_prevalidated(&prop_msg, &proposal.signature)
             .map_err(|_| ConsensusError::InvalidSignature {
                 view,
                 validator_index: proposal.proposer,

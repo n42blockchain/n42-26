@@ -99,8 +99,39 @@ impl BlsPublicKey {
         self.0.to_bytes()
     }
 
+    /// Runs blst's `validate()`: checks the point is non-infinity and lies in
+    /// the correct subgroup. Should be called once per key when it enters a
+    /// trust boundary (e.g. `ValidatorSet::try_new`); subsequent verifications
+    /// against the same key can then use [`Self::verify_prevalidated`] to skip
+    /// the redundant subgroup check.
+    pub fn validate(&self) -> Result<(), BlsError> {
+        match self.0.validate() {
+            Ok(()) => Ok(()),
+            Err(e) => Err(BlsError::VerificationFailed(e)),
+        }
+    }
+
+    /// Verifies a signature with full subgroup validation of the public key.
+    /// Use this for keys that have not been pre-validated (e.g. mobile receipts,
+    /// untrusted RPC inputs).
     pub fn verify(&self, message: &[u8], signature: &BlsSignature) -> Result<(), BlsError> {
         let result = signature.0.verify(true, message, DST, &[], &self.0, true);
+        if result != BLST_ERROR::BLST_SUCCESS {
+            return Err(BlsError::VerificationFailed(result));
+        }
+        Ok(())
+    }
+
+    /// Verifies a signature without re-validating the public key's subgroup
+    /// membership. Caller MUST guarantee the key has been validated previously
+    /// (e.g. via [`Self::validate`] at `ValidatorSet::try_new`). Saves one
+    /// 48-byte subgroup check per call on the consensus hot path.
+    pub fn verify_prevalidated(
+        &self,
+        message: &[u8],
+        signature: &BlsSignature,
+    ) -> Result<(), BlsError> {
+        let result = signature.0.verify(true, message, DST, &[], &self.0, false);
         if result != BLST_ERROR::BLST_SUCCESS {
             return Err(BlsError::VerificationFailed(result));
         }

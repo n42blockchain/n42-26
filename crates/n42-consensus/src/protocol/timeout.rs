@@ -139,7 +139,7 @@ impl ConsensusEngine {
         let view_set = self.validator_set_for_view(view);
         let pk = view_set.get_public_key(timeout.sender)?;
         let msg = timeout_signing_message(view);
-        pk.verify(&msg, &timeout.signature)
+        pk.verify_prevalidated(&msg, &timeout.signature)
             .map_err(|_| ConsensusError::InvalidSignature {
                 view,
                 validator_index: timeout.sender,
@@ -206,7 +206,7 @@ impl ConsensusEngine {
         let n_validators = timeout_set.len();
         let pk = timeout_set.get_public_key(timeout.sender)?;
         let msg = timeout_signing_message(timeout.view);
-        pk.verify(&msg, &timeout.signature)
+        pk.verify_prevalidated(&msg, &timeout.signature)
             .map_err(|_| ConsensusError::InvalidSignature {
                 view: timeout.view,
                 validator_index: timeout.sender,
@@ -301,7 +301,7 @@ impl ConsensusEngine {
         // Verify leader's signature to prevent Byzantine nodes from forging NewView messages.
         let pk = new_view_set.get_public_key(nv.leader)?;
         let nv_msg = newview_signing_message(nv.view);
-        pk.verify(&nv_msg, &nv.signature)
+        pk.verify_prevalidated(&nv_msg, &nv.signature)
             .map_err(|_| ConsensusError::InvalidSignature {
                 view: nv.view,
                 validator_index: nv.leader,

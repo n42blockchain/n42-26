@@ -136,7 +136,7 @@ impl VoteCollector {
                     continue;
                 }
             };
-            if pk.verify(message, sig).is_err() {
+            if pk.verify_prevalidated(message, sig).is_err() {
                 tracing::warn!(target: "n42::cl::quorum", view = self.view, idx, "skipping invalid signature in QC build");
                 continue;
             }
@@ -264,7 +264,7 @@ impl TimeoutCollector {
                     continue;
                 }
             };
-            if pk.verify(&message, sig).is_err() {
+            if pk.verify_prevalidated(&message, sig).is_err() {
                 tracing::warn!(target: "n42::cl::quorum", view = self.view, idx, "skipping invalid timeout signature in TC build");
                 continue;
             }

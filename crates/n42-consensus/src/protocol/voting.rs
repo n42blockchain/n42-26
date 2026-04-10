@@ -58,7 +58,7 @@ impl ConsensusEngine {
         let view_set = self.validator_set_for_view(view);
         let pk = view_set.get_public_key(vote.voter)?;
         let msg = signing_message(view, &vote.block_hash);
-        pk.verify(&msg, &vote.signature)
+        pk.verify_prevalidated(&msg, &vote.signature)
             .map_err(|_| ConsensusError::InvalidSignature {
                 view,
                 validator_index: vote.voter,
@@ -186,7 +186,7 @@ impl ConsensusEngine {
         let view_set = self.validator_set_for_view(view);
         let pk = view_set.get_public_key(cv.voter)?;
         let msg = commit_signing_message(view, &cv.block_hash);
-        pk.verify(&msg, &cv.signature)
+        pk.verify_prevalidated(&msg, &cv.signature)
             .map_err(|_| ConsensusError::InvalidSignature {
                 view,
                 validator_index: cv.voter,

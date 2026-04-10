@@ -44,14 +44,23 @@ impl ValidatorSet {
     pub fn try_new(validators: &[ValidatorInfo], fault_tolerance: u32) -> ConsensusResult<Self> {
         Self::validate_params(validators.len(), fault_tolerance)?;
 
-        let entries = validators
-            .iter()
-            .map(|v| ValidatorEntry {
+        // Validate every BLS public key once at construction time (subgroup +
+        // non-infinity check). After this point all consensus signature
+        // verifications can use `verify_prevalidated` and skip the per-call
+        // subgroup check, saving ~10–20% of single-sig BLS verify cost on the
+        // hot path. Aggregate verification (`fast_aggregate_verify`) already
+        // assumes pre-validated keys per blst's contract.
+        let mut entries = Vec::with_capacity(validators.len());
+        for (index, v) in validators.iter().enumerate() {
+            v.bls_public_key
+                .validate()
+                .map_err(|_| ConsensusError::InvalidValidatorPubkey { index: index as u32 })?;
+            entries.push(ValidatorEntry {
                 address: v.address,
                 public_key: v.bls_public_key.clone(),
                 p2p_peer_id: v.p2p_peer_id.clone(),
-            })
-            .collect();
+            });
+        }
 
         Ok(Self {
             validators: entries,

@@ -132,6 +132,12 @@ pub enum ConsensusError {
     /// Dynamic validator changes require epochs to be enabled (epoch_length > 0).
     #[error("epochs are disabled (epoch_length=0); dynamic validator changes require epoch_length > 0 in consensus config")]
     EpochsDisabled,
+
+    /// A validator's BLS public key failed subgroup / non-infinity validation.
+    /// Detected at `ValidatorSet::try_new` so all subsequent verifications can
+    /// safely skip the per-call subgroup check.
+    #[error("validator at index {index} has an invalid BLS public key (failed subgroup check)")]
+    InvalidValidatorPubkey { index: u32 },
 }
 
 /// Result type for consensus operations.
