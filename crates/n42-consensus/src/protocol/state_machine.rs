@@ -4,6 +4,7 @@ use n42_primitives::{
     consensus::{ConsensusMessage, QuorumCertificate, ViewNumber},
 };
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
 
@@ -15,6 +16,7 @@ use super::quorum::{
 use super::round::{Phase, RoundState};
 use crate::error::ConsensusResult;
 use crate::validator::{EpochManager, LeaderSelector, ValidatorSet};
+use crate::vote_log::{NoopVoteLog, VoteLogWriter};
 
 /// Per-view timing tracker for diagnosing consensus commit latency.
 #[derive(Debug, Clone)]
@@ -234,6 +236,11 @@ pub struct ConsensusEngine {
     /// Maps block_hash -> tx_root_hash for proposals awaiting verification.
     /// Bounded to 64 entries; oldest evicted when full (prevents OOM from unfinalized proposals).
     pub(super) pending_tx_roots: HashMap<B256, B256>,
+    /// Durable last-voted-view sink, fsync'd before every R1 vote (HotStuff-2
+    /// safety invariant — see `crate::vote_log`). Defaults to `NoopVoteLog`
+    /// for tests / single-validator dev mode; production builds inject a
+    /// file-backed implementation from the orchestrator.
+    pub(super) vote_log: Arc<dyn VoteLogWriter>,
 }
 
 impl ConsensusEngine {
@@ -265,6 +272,29 @@ impl ConsensusEngine {
         max_timeout_ms: u64,
         output_tx: mpsc::Sender<EngineOutput>,
     ) -> Self {
+        Self::with_epoch_manager_and_vote_log(
+            my_index,
+            secret_key,
+            epoch_manager,
+            base_timeout_ms,
+            max_timeout_ms,
+            output_tx,
+            Arc::new(NoopVoteLog),
+        )
+    }
+
+    /// Like [`Self::with_epoch_manager`] but with an explicit vote-log writer.
+    /// Production builds inject a file-backed `FileVoteLog` from the orchestrator
+    /// so every R1 vote is fsync'd before the signature is broadcast.
+    pub fn with_epoch_manager_and_vote_log(
+        my_index: u32,
+        secret_key: BlsSecretKey,
+        epoch_manager: EpochManager,
+        base_timeout_ms: u64,
+        max_timeout_ms: u64,
+        output_tx: mpsc::Sender<EngineOutput>,
+        vote_log: Arc<dyn VoteLogWriter>,
+    ) -> Self {
         let local_public_key = secret_key.public_key();
         Self {
             my_index,
@@ -287,13 +317,15 @@ impl ConsensusEngine {
             view_timing: ViewTiming::new(),
             last_committed_timing: None,
             pending_tx_roots: HashMap::new(),
+            vote_log,
         }
     }
 
     /// Creates a consensus engine with recovered state from a persisted snapshot.
     ///
     /// Restores safety invariants (locked_qc, last_committed_qc) so the node
-    /// resumes with its previous locking commitments intact.
+    /// resumes with its previous locking commitments intact. Uses a `NoopVoteLog`
+    /// — production callers should use [`Self::with_recovered_state_and_vote_log`].
     #[allow(clippy::too_many_arguments)] // recovery needs all safety-critical fields
     pub fn with_recovered_state(
         my_index: u32,
@@ -307,6 +339,38 @@ impl ConsensusEngine {
         last_committed_qc: QuorumCertificate,
         consecutive_timeouts: u32,
         last_voted_view: ViewNumber,
+    ) -> Self {
+        Self::with_recovered_state_and_vote_log(
+            my_index,
+            secret_key,
+            epoch_manager,
+            base_timeout_ms,
+            max_timeout_ms,
+            output_tx,
+            recovered_view,
+            locked_qc,
+            last_committed_qc,
+            consecutive_timeouts,
+            last_voted_view,
+            Arc::new(NoopVoteLog),
+        )
+    }
+
+    /// Like [`Self::with_recovered_state`] but with an explicit vote-log writer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_recovered_state_and_vote_log(
+        my_index: u32,
+        secret_key: BlsSecretKey,
+        epoch_manager: EpochManager,
+        base_timeout_ms: u64,
+        max_timeout_ms: u64,
+        output_tx: mpsc::Sender<EngineOutput>,
+        recovered_view: ViewNumber,
+        locked_qc: QuorumCertificate,
+        last_committed_qc: QuorumCertificate,
+        consecutive_timeouts: u32,
+        last_voted_view: ViewNumber,
+        vote_log: Arc<dyn VoteLogWriter>,
     ) -> Self {
         /// Maximum consecutive timeouts preserved from a snapshot to prevent
         /// absurdly long backoff durations on recovery.
@@ -349,6 +413,7 @@ impl ConsensusEngine {
             view_timing: ViewTiming::new(),
             last_committed_timing: None,
             pending_tx_roots: HashMap::new(),
+            vote_log,
         }
     }
 

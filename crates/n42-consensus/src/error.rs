@@ -138,6 +138,12 @@ pub enum ConsensusError {
     /// safely skip the per-call subgroup check.
     #[error("validator at index {index} has an invalid BLS public key (failed subgroup check)")]
     InvalidValidatorPubkey { index: u32 },
+
+    /// Persistent vote-log fsync failed; the vote MUST be aborted to avoid
+    /// double-voting after a crash. Wrapped as a `String` to keep
+    /// `ConsensusError` simple to construct from any I/O error.
+    #[error("vote log fsync failed: {0}")]
+    VoteLogFsync(String),
 }
 
 /// Result type for consensus operations.

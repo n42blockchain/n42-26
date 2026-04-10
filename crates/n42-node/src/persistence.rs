@@ -1,9 +1,13 @@
 use n42_chainspec::ValidatorInfo;
-use n42_consensus::ValidatorSet;
+use n42_consensus::error::{ConsensusError, ConsensusResult};
+use n42_consensus::vote_log::map_io_err;
+use n42_consensus::{ValidatorSet, VoteLogWriter};
 use n42_primitives::consensus::QuorumCertificate;
 use serde::{Deserialize, Serialize};
-use std::io;
-use std::path::Path;
+use std::fs::{File, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 /// Snapshot of consensus state persisted to disk.
 ///
@@ -215,10 +219,138 @@ pub fn load_consensus_state(path: &Path) -> io::Result<Option<ConsensusSnapshot>
     }
 }
 
+// ── Vote log: durable last-voted-view storage ───────────────────────────────
+//
+// Single-record file (8 bytes LE) holding the highest view this node has cast
+// an R1 vote in. Overwritten in place + fsync'd on every vote so a crash after
+// signing cannot lose the record. Used by `ConsensusEngine` to gate vote
+// emission via the `VoteLogWriter` trait.
+
+/// Reads the persisted last-voted-view, or `Ok(0)` if the file does not exist
+/// or is shorter than 8 bytes (treat as never voted). Returns `Err` only on
+/// genuine I/O failures (permissions, disk).
+pub fn load_last_voted_view(path: &Path) -> io::Result<u64> {
+    match std::fs::File::open(path) {
+        Ok(mut f) => {
+            let mut buf = [0u8; 8];
+            match f.read_exact(&mut buf) {
+                Ok(()) => Ok(u64::from_le_bytes(buf)),
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(0),
+                Err(e) => Err(e),
+            }
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(0),
+        Err(e) => Err(e),
+    }
+}
+
+/// Persistent file-backed vote log. Always 8 bytes; overwritten in place.
+pub struct FileVoteLog {
+    path: PathBuf,
+    file: Mutex<File>,
+}
+
+impl std::fmt::Debug for FileVoteLog {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FileVoteLog").field("path", &self.path).finish()
+    }
+}
+
+impl FileVoteLog {
+    /// Opens (creating if needed) the vote-log file at `path`. Initializes
+    /// the file to 8 zero bytes if it was missing or shorter, so subsequent
+    /// reads always succeed. Performs one fsync at open time so the empty
+    /// state is durable.
+    pub fn open(path: PathBuf) -> io::Result<Self> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)?;
+        let len = file.metadata()?.len();
+        if len < 8 {
+            file.seek(SeekFrom::Start(0))?;
+            file.write_all(&0u64.to_le_bytes())?;
+            file.sync_all()?;
+        }
+        Ok(Self { path, file: Mutex::new(file) })
+    }
+}
+
+impl VoteLogWriter for FileVoteLog {
+    fn record_vote(&self, view: u64) -> ConsensusResult<()> {
+        let mut guard = self
+            .file
+            .lock()
+            .map_err(|e| ConsensusError::VoteLogFsync(format!("vote log mutex poisoned: {e}")))?;
+        guard.seek(SeekFrom::Start(0)).map_err(map_io_err)?;
+        guard.write_all(&view.to_le_bytes()).map_err(map_io_err)?;
+        // sync_data avoids the metadata fsync (file size is fixed at 8 bytes
+        // and never changes after open), trading ~1 IO op for the same
+        // crash-safety guarantee on the actual content bytes.
+        guard.sync_data().map_err(map_io_err)?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use n42_primitives::consensus::QuorumCertificate;
+
+    #[test]
+    fn vote_log_open_initializes_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vote_log.bin");
+        assert_eq!(load_last_voted_view(&path).unwrap(), 0);
+        let _ = FileVoteLog::open(path.clone()).unwrap();
+        assert_eq!(load_last_voted_view(&path).unwrap(), 0);
+    }
+
+    #[test]
+    fn vote_log_records_and_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vote_log.bin");
+        let log = FileVoteLog::open(path.clone()).unwrap();
+        log.record_vote(42).unwrap();
+        // Drop the writer to release the file handle, then load.
+        drop(log);
+        assert_eq!(load_last_voted_view(&path).unwrap(), 42);
+    }
+
+    #[test]
+    fn vote_log_overwrites_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vote_log.bin");
+        let log = FileVoteLog::open(path.clone()).unwrap();
+        for v in [1u64, 5, 100, u64::MAX] {
+            log.record_vote(v).unwrap();
+            // File stays exactly 8 bytes — overwrite, not append.
+            assert_eq!(std::fs::metadata(&path).unwrap().len(), 8);
+        }
+        drop(log);
+        assert_eq!(load_last_voted_view(&path).unwrap(), u64::MAX);
+    }
+
+    #[test]
+    fn vote_log_round_trip_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vote_log.bin");
+        {
+            let log = FileVoteLog::open(path.clone()).unwrap();
+            log.record_vote(7).unwrap();
+        }
+        // Reopen and verify the previous record persists.
+        assert_eq!(load_last_voted_view(&path).unwrap(), 7);
+        let log = FileVoteLog::open(path.clone()).unwrap();
+        log.record_vote(8).unwrap();
+        drop(log);
+        assert_eq!(load_last_voted_view(&path).unwrap(), 8);
+    }
 
     fn genesis_snapshot(current_view: u64) -> ConsensusSnapshot {
         ConsensusSnapshot {

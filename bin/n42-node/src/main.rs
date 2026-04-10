@@ -482,6 +482,35 @@ fn main() {
             }
         };
 
+        // Open the durable vote log. fsync'd before every R1 vote so a crash
+        // after signing cannot drop the recorded view (HotStuff-2 paper
+        // safety invariant — see crates/n42-consensus/src/vote_log.rs).
+        let vote_log_path = data_dir.join("vote_log.bin");
+        let vote_log: std::sync::Arc<dyn n42_consensus::VoteLogWriter> =
+            match persistence::FileVoteLog::open(vote_log_path.clone()) {
+                Ok(log) => std::sync::Arc::new(log),
+                Err(e) => {
+                    warn!(
+                        target: "n42::cli",
+                        path = %vote_log_path.display(),
+                        error = %e,
+                        "failed to open vote log, falling back to NoopVoteLog (R1 votes will not be \
+                         crash-durable; do not run in production)"
+                    );
+                    std::sync::Arc::new(n42_consensus::NoopVoteLog)
+                }
+            };
+        let last_voted_view_from_disk = persistence::load_last_voted_view(&vote_log_path)
+            .unwrap_or_else(|e| {
+                warn!(
+                    target: "n42::cli",
+                    path = %vote_log_path.display(),
+                    error = %e,
+                    "failed to read last_voted_view from vote log, defaulting to 0"
+                );
+                0
+            });
+
         let initial_validator_infos = initial_validator_set.validator_infos();
         let startup_epoch_manager = build_epoch_manager(
             &initial_validator_set,
@@ -1059,7 +1088,11 @@ fn main() {
                             );
                         }
                     }
-                    ConsensusEngine::with_recovered_state(
+                    // Take the maximum of snapshot and disk: the disk vote_log
+                    // may be ahead if the snapshot was written before the latest
+                    // vote, while the snapshot may be ahead on a fresh datadir.
+                    let lvv = snapshot.last_voted_view.max(last_voted_view_from_disk);
+                    ConsensusEngine::with_recovered_state_and_vote_log(
                         my_index,
                         secret_key,
                         epoch_manager,
@@ -1070,11 +1103,12 @@ fn main() {
                         snapshot.locked_qc,
                         snapshot.last_committed_qc,
                         snapshot.consecutive_timeouts,
-                        snapshot.last_voted_view,
+                        lvv,
+                        vote_log.clone(),
                     )
                 } else {
                     info!(target: "n42::cli", "no consensus snapshot found, starting fresh");
-                    ConsensusEngine::with_epoch_manager(
+                    ConsensusEngine::with_epoch_manager_and_vote_log(
                         my_index,
                         secret_key,
                         build_epoch_manager(
@@ -1089,6 +1123,7 @@ fn main() {
                         consensus_config.base_timeout_ms,
                         consensus_config.max_timeout_ms,
                         output_tx,
+                        vote_log.clone(),
                     )
                 };
 

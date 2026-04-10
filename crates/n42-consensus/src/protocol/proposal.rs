@@ -98,6 +98,9 @@ impl ConsensusEngine {
             return Ok(());
         }
         self.round_state.record_vote(view);
+        // Persist the leader self-vote with the same crash-safety contract as
+        // send_vote(); a fsync failure aborts the proposal.
+        self.vote_log.record_vote(view)?;
         // Reuse the vote_msg computed above (same view + block_hash).
         let leader_vote_sig = self.secret_key.sign(&vote_msg);
         if let Some(ref mut collector) = self.vote_collector {
@@ -331,8 +334,11 @@ impl ConsensusEngine {
             return Ok(());
         }
         // Record BEFORE signing/sending so a crash between record and send is safe
-        // (we err on the side of not voting rather than double-voting).
+        // (we err on the side of not voting rather than double-voting). The
+        // vote_log fsync MUST succeed before we sign — otherwise a crash after
+        // signing but before record could let the recovered node re-vote.
         self.round_state.record_vote(view);
+        self.vote_log.record_vote(view)?;
 
         let leader = self.leader_index_for_view(view);
         let vote_msg = signing_message(view, &block_hash);
