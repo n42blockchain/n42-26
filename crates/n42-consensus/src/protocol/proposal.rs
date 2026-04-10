@@ -265,6 +265,16 @@ impl ConsensusEngine {
         self.round_state.update_locked_qc(&pqc.qc);
         self.round_state.enter_pre_commit();
 
+        if !self.is_local_validator_active_for_view(view) {
+            tracing::debug!(
+                target: "n42::cl::proposal",
+                view,
+                my_index = self.my_index,
+                "observer (or stale my_index): skipping commit vote"
+            );
+            return Ok(());
+        }
+
         tracing::debug!(target: "n42::cl::proposal", view, block_hash = %pqc.block_hash, "received valid PrepareQC, sending commit vote");
 
         let commit_msg = commit_signing_message(view, &pqc.block_hash);
@@ -290,6 +300,15 @@ impl ConsensusEngine {
     /// Checks `last_voted_view` to prevent double-voting after crash recovery
     /// (fundamental BFT safety invariant).
     pub(super) fn send_vote(&mut self, view: ViewNumber, block_hash: B256) -> ConsensusResult<()> {
+        if !self.is_local_validator_active_for_view(view) {
+            tracing::debug!(
+                target: "n42::cl::proposal",
+                view,
+                my_index = self.my_index,
+                "observer (or stale my_index): skipping vote"
+            );
+            return Ok(());
+        }
         if !self.round_state.may_vote_in(view) {
             tracing::warn!(
                 target: "n42::cl::proposal",

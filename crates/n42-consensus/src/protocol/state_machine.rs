@@ -486,6 +486,19 @@ impl ConsensusEngine {
         new_index
     }
 
+    /// Returns true iff `self.my_index` corresponds to `self.local_public_key`
+    /// in the validator set for the given view. Catches the observer-default
+    /// case where `my_index = 0` but the local key is not validator 0 — using
+    /// that index would sign messages with a key that doesn't match the public
+    /// key the leader will look up to verify the signature.
+    pub(super) fn is_local_validator_active_for_view(&self, view: ViewNumber) -> bool {
+        let view_set = self.validator_set_for_view(view);
+        match view_set.get_public_key(self.my_index) {
+            Ok(pk) => pk == &self.local_public_key,
+            Err(_) => false,
+        }
+    }
+
     /// Proposes adding a new validator, to be committed at the next CommitQC.
     ///
     /// See [`EpochManager::propose_add_validator`] for safety constraints.
@@ -820,6 +833,14 @@ impl ConsensusEngine {
         self.imported_blocks.clear();
         self.equivocation_tracker.clear();
         self.commit_equivocation_tracker.clear();
+
+        // Defense-in-depth: re-derive my_index from the current set on every view
+        // advance. The epoch-boundary branch above only fires for live consensus
+        // transitions; nodes that joined via block sync, snapshot recovery, or any
+        // path that mutates epoch_manager outside of advance_to_view would otherwise
+        // keep their stale `my_index = 0` observer default and fail BLS verification
+        // on every signed message they emit.
+        let _ = self.sync_local_validator_index();
         // Preserve timing from committed view for external reading.
         if self.view_timing.commit_qc_formed.is_some() {
             self.last_committed_timing = Some(self.view_timing.clone());
@@ -1361,6 +1382,92 @@ mod tests {
             has_prepare_qc,
             "leader should form PrepareQC with votes from all 4 validators (including newly added)"
         );
+    }
+
+    /// Regression: observer-mode node (my_index=0 default but local key not in set,
+    /// or local key at a different index) must not broadcast a timeout. Otherwise it
+    /// signs with its own key under sender=0, every receiver fails BLS verification,
+    /// and on_timeout's self-process call returns InvalidSignature, stalling the node.
+    #[test]
+    fn test_observer_does_not_broadcast_timeout() {
+        // Build a 3-validator set. Use a 4th secret key for the local node — it's NOT
+        // in the active set, so the local key is at no valid index. my_index defaults to 0.
+        let sks: Vec<_> = (0..4).map(|i| test_key(0x70 + i as u8)).collect();
+        let infos: Vec<ValidatorInfo> = sks[..3]
+            .iter()
+            .enumerate()
+            .map(|(i, sk)| ValidatorInfo {
+                address: Address::with_last_byte(i as u8),
+                bls_public_key: sk.public_key(),
+                p2p_peer_id: None,
+            })
+            .collect();
+
+        let (output_tx, mut output_rx) = mpsc::channel(64);
+        let mut engine = ConsensusEngine::new(
+            0, // observer default
+            sks[3].clone(), // local key NOT in the set
+            ValidatorSet::new(&infos, 0),
+            60_000,
+            120_000,
+            output_tx,
+        );
+
+        // Sanity: observer is correctly detected.
+        assert!(!engine.is_local_validator_active_for_view(engine.current_view()));
+
+        // Pacemaker fires → on_timeout. Must not panic / not return Err / not broadcast.
+        engine.on_timeout().expect("on_timeout must succeed for observer");
+
+        let mut broadcast_count = 0;
+        while let Ok(out) = output_rx.try_recv() {
+            if let EngineOutput::BroadcastMessage(ConsensusMessage::Timeout(_)) = out {
+                broadcast_count += 1;
+            }
+        }
+        assert_eq!(
+            broadcast_count, 0,
+            "observer must not broadcast Timeout messages"
+        );
+    }
+
+    /// Regression: same observer guard for vote broadcast. A node with my_index pointing
+    /// at a different validator's slot must not vote — otherwise the leader rejects the
+    /// vote on signature mismatch.
+    #[test]
+    fn test_observer_does_not_send_vote() {
+        let sks: Vec<_> = (0..4).map(|i| test_key(0x80 + i as u8)).collect();
+        let infos: Vec<ValidatorInfo> = sks[..3]
+            .iter()
+            .enumerate()
+            .map(|(i, sk)| ValidatorInfo {
+                address: Address::with_last_byte(i as u8),
+                bls_public_key: sk.public_key(),
+                p2p_peer_id: None,
+            })
+            .collect();
+
+        let (output_tx, mut output_rx) = mpsc::channel(64);
+        let mut engine = ConsensusEngine::new(
+            0,
+            sks[3].clone(),
+            ValidatorSet::new(&infos, 0),
+            60_000,
+            120_000,
+            output_tx,
+        );
+
+        engine
+            .send_vote(engine.current_view(), B256::repeat_byte(0xCC))
+            .expect("send_vote must succeed for observer (silent skip)");
+
+        let mut vote_count = 0;
+        while let Ok(out) = output_rx.try_recv() {
+            if let EngineOutput::SendToValidator(_, ConsensusMessage::Vote(_)) = out {
+                vote_count += 1;
+            }
+        }
+        assert_eq!(vote_count, 0, "observer must not send Vote messages");
     }
 
     #[test]

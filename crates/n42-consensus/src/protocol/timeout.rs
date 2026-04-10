@@ -36,6 +36,24 @@ impl ConsensusEngine {
     pub fn on_timeout(&mut self) -> ConsensusResult<()> {
         let view = self.round_state.current_view();
 
+        // Observer guard: if our local key is not a validator for this view
+        // (or my_index is stale and points at someone else's key), do not
+        // broadcast a timeout. Sending one would carry our signature under
+        // a foreign sender index, fail BLS verification on every receiver,
+        // and stall the network.
+        if !self.is_local_validator_active_for_view(view) {
+            tracing::debug!(
+                target: "n42::cl::timeout",
+                view,
+                my_index = self.my_index,
+                "observer (or stale my_index): skipping timeout broadcast"
+            );
+            self.round_state.timeout();
+            self.pacemaker
+                .reset_for_view(view, self.round_state.consecutive_timeouts());
+            return Ok(());
+        }
+
         if self.round_state.phase() == Phase::TimedOut {
             // Already timed out in this view: reset pacemaker and re-broadcast timeout.
             // Re-broadcasting ensures validators who missed the first message (network
