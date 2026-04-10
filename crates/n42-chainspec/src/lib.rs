@@ -28,7 +28,25 @@ pub struct ConsensusConfig {
     /// When > 0, validator set can change at epoch boundaries.
     #[serde(default)]
     pub epoch_length: u64,
+    /// How many past epoch validator sets the consensus engine retains for
+    /// resolving QCs whose `view` falls in a previous epoch (block sync,
+    /// late Decide replay, etc.). Defaults to 32 (~32 minutes at
+    /// epoch_length=30); raise this on networks with longer expected
+    /// partitions. Clamped to `[1, 256]` by `validate()`.
+    #[serde(default = "default_max_historical_epochs")]
+    pub max_historical_epochs: usize,
 }
+
+/// Default for `ConsensusConfig::max_historical_epochs` when omitted from
+/// JSON/TOML chainspecs (kept in sync with
+/// `n42_consensus::DEFAULT_MAX_HISTORICAL_EPOCHS`).
+fn default_max_historical_epochs() -> usize {
+    32
+}
+
+/// Hard upper bound enforced by `ConsensusConfig::validate` (kept in sync with
+/// `n42_consensus::MAX_HISTORICAL_EPOCHS_LIMIT`).
+const MAX_HISTORICAL_EPOCHS_LIMIT: usize = 256;
 
 /// Information about a validator in the initial set.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -86,6 +104,7 @@ impl ConsensusConfig {
             max_timeout_ms: 8000,
             initial_validators: Vec::new(),
             epoch_length: 30,
+            max_historical_epochs: default_max_historical_epochs(),
         }
     }
 
@@ -128,6 +147,7 @@ impl ConsensusConfig {
             max_timeout_ms: 60000,
             initial_validators: validators,
             epoch_length: 30,
+            max_historical_epochs: default_max_historical_epochs(),
         }
     }
 
@@ -187,6 +207,15 @@ impl ConsensusConfig {
         }
         if self.slot_time_ms == 0 {
             return Err("slot_time_ms must be > 0".to_string());
+        }
+        if self.max_historical_epochs == 0 {
+            return Err("max_historical_epochs must be > 0".to_string());
+        }
+        if self.max_historical_epochs > MAX_HISTORICAL_EPOCHS_LIMIT {
+            return Err(format!(
+                "max_historical_epochs ({}) exceeds hard limit ({})",
+                self.max_historical_epochs, MAX_HISTORICAL_EPOCHS_LIMIT
+            ));
         }
         // Check for duplicate validator addresses.
         if !self.initial_validators.is_empty() {
@@ -856,6 +885,39 @@ epoch_length = 0
             config.validate().is_ok(),
             "base == max timeout should be valid"
         );
+    }
+
+    #[test]
+    fn test_validate_max_historical_epochs_bounds() {
+        let mut cfg = ConsensusConfig::dev();
+        cfg.max_historical_epochs = 0;
+        assert!(cfg.validate().unwrap_err().contains("max_historical_epochs"));
+
+        cfg.max_historical_epochs = MAX_HISTORICAL_EPOCHS_LIMIT + 1;
+        assert!(cfg.validate().unwrap_err().contains("exceeds hard limit"));
+
+        cfg.max_historical_epochs = 1;
+        assert!(cfg.validate().is_ok());
+        cfg.max_historical_epochs = MAX_HISTORICAL_EPOCHS_LIMIT;
+        assert!(cfg.validate().is_ok());
+        cfg.max_historical_epochs = 32;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_default_max_historical_epochs_when_omitted_in_json() {
+        // Old chainspec without max_historical_epochs must deserialize via #[serde(default)].
+        let json = r#"{
+            "slot_time_ms": 2000,
+            "validator_set_size": 4,
+            "fault_tolerance": 1,
+            "base_timeout_ms": 4000,
+            "max_timeout_ms": 8000,
+            "initial_validators": [],
+            "epoch_length": 30
+        }"#;
+        let cfg: ConsensusConfig = serde_json::from_str(json).expect("must deserialize");
+        assert_eq!(cfg.max_historical_epochs, default_max_historical_epochs());
     }
 
     #[test]

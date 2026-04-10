@@ -106,6 +106,7 @@ fn build_epoch_manager(
     initial_validator_set: &ValidatorSet,
     initial_validator_infos: &[ValidatorInfo],
     epoch_length: u64,
+    max_historical_epochs: usize,
     recovery_epoch_schedule: Option<&EpochSchedule>,
     recovered_view: Option<u64>,
     snapshot_current_epoch: Option<&(u64, Vec<ValidatorInfo>, u32)>,
@@ -131,7 +132,12 @@ fn build_epoch_manager(
                 validators = snap_validators.len(),
                 "restored current epoch validator set from snapshot"
             );
-            return Ok(EpochManager::from_epoch(vs, epoch_length, *snap_epoch));
+            return Ok(EpochManager::from_epoch_with_history(
+                vs,
+                epoch_length,
+                *snap_epoch,
+                max_historical_epochs,
+            ));
         }
     }
 
@@ -142,18 +148,24 @@ fn build_epoch_manager(
             current_epoch,
             3,
         );
-        EpochManager::from_schedule(epoch_length, &recovery_window)
-            .map_err(|e| eyre::eyre!("failed to reconstruct epoch manager from schedule: {e}"))
+        EpochManager::from_schedule_with_history(
+            epoch_length,
+            &recovery_window,
+            max_historical_epochs,
+        )
+        .map_err(|e| eyre::eyre!("failed to reconstruct epoch manager from schedule: {e}"))
     } else if current_epoch > 0 {
-        Ok(EpochManager::from_epoch(
+        Ok(EpochManager::from_epoch_with_history(
             initial_validator_set.clone(),
             epoch_length,
             current_epoch,
+            max_historical_epochs,
         ))
     } else {
-        Ok(EpochManager::with_epoch_length(
+        Ok(EpochManager::with_epoch_length_and_history(
             initial_validator_set.clone(),
             epoch_length,
+            max_historical_epochs,
         ))
     }
 }
@@ -475,6 +487,7 @@ fn main() {
             &initial_validator_set,
             &initial_validator_infos,
             consensus_config.epoch_length,
+            consensus_config.max_historical_epochs,
             epoch_schedule.as_ref(),
             snapshot.as_ref().map(|snap| snap.current_view),
             snapshot.as_ref().and_then(|snap| snap.current_epoch_validators.as_ref()),
@@ -1014,6 +1027,7 @@ fn main() {
                         &initial_validator_set,
                         &initial_validator_infos,
                         consensus_config.epoch_length,
+                        consensus_config.max_historical_epochs,
                         epoch_schedule.as_ref(),
                         Some(snapshot.current_view),
                         snapshot.current_epoch_validators.as_ref(),
@@ -1067,6 +1081,7 @@ fn main() {
                             &initial_validator_set,
                             &initial_validator_infos,
                             consensus_config.epoch_length,
+                            consensus_config.max_historical_epochs,
                             epoch_schedule.as_ref(),
                             None,
                             None,

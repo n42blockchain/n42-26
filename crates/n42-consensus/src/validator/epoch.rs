@@ -5,7 +5,7 @@ use n42_chainspec::ValidatorInfo;
 use n42_primitives::consensus::ValidatorChange;
 use std::collections::BTreeMap;
 
-/// Maximum number of historical epoch validator sets to retain.
+/// Default upper bound on retained historical epoch validator sets.
 ///
 /// Needed for verifying QCs whose `view` belongs to a past epoch — this happens
 /// during block sync, late Decide/NewView replays, or any code path that resolves
@@ -14,7 +14,23 @@ use std::collections::BTreeMap;
 /// short partitions and rolling restarts. Beyond that the resolver falls back to
 /// `current_set` and logs a warning; callers (e.g. `verify_qc`) will then surface
 /// a verification error rather than silently accept the wrong set.
-const MAX_HISTORICAL_EPOCHS: usize = 32;
+///
+/// The actual bound is configurable per-EpochManager (see `max_historical_epochs`
+/// field) so deployments with longer expected partitions can raise it.
+pub const DEFAULT_MAX_HISTORICAL_EPOCHS: usize = 32;
+
+/// Hard upper bound enforced by `ConsensusConfig::validate` and constructors.
+/// Each historical set is `validators × ~144 bytes`; 256 epochs × 500 validators
+/// ≈ 18 MB which is the most we want to keep around purely for replay support.
+pub const MAX_HISTORICAL_EPOCHS_LIMIT: usize = 256;
+
+/// Clamps a configured `max_historical_epochs` value into `[1, LIMIT]`. A
+/// caller passing 0 likely means "default" but we treat it as "disable history",
+/// so we promote to 1 to keep the resolver from immediately falling back; values
+/// above LIMIT are silently capped to avoid OOM from a misconfigured chainspec.
+fn clamp_max_historical(value: usize) -> usize {
+    value.clamp(1, MAX_HISTORICAL_EPOCHS_LIMIT)
+}
 
 /// Minimum number of validators required for BFT safety (f ≥ 1).
 pub const MIN_VALIDATOR_COUNT: usize = 4;
@@ -45,8 +61,11 @@ pub struct EpochManager {
     next_set: Option<ValidatorSet>,
     /// Raw validator info for the staged set (kept for persistence).
     staged_info: Option<(Vec<ValidatorInfo>, u32)>,
-    /// Historical validator sets keyed by epoch number (most recent MAX_HISTORICAL_EPOCHS).
+    /// Historical validator sets keyed by epoch number.
+    /// Trimmed to at most `max_historical_epochs` entries on every advance.
     historical_sets: BTreeMap<u64, ValidatorSet>,
+    /// Maximum number of past validator sets to keep (configurable per chain).
+    max_historical_epochs: usize,
     /// Validators proposed for addition at the next CommitQC.
     pending_adds: Vec<ValidatorInfo>,
     /// Validator addresses proposed for removal at the next CommitQC.
@@ -63,13 +82,29 @@ impl EpochManager {
             next_set: None,
             staged_info: None,
             historical_sets: BTreeMap::new(),
+            max_historical_epochs: DEFAULT_MAX_HISTORICAL_EPOCHS,
             pending_adds: Vec::new(),
             pending_removes: Vec::new(),
         }
     }
 
-    /// Creates an EpochManager with epoch transitions enabled.
+    /// Creates an EpochManager with epoch transitions enabled, using the
+    /// default historical bound. Tests / dev paths.
     pub fn with_epoch_length(validator_set: ValidatorSet, epoch_length: u64) -> Self {
+        Self::with_epoch_length_and_history(
+            validator_set,
+            epoch_length,
+            DEFAULT_MAX_HISTORICAL_EPOCHS,
+        )
+    }
+
+    /// Like [`Self::with_epoch_length`] but with an explicit historical-set bound.
+    /// `max_historical_epochs` is clamped to `[1, MAX_HISTORICAL_EPOCHS_LIMIT]`.
+    pub fn with_epoch_length_and_history(
+        validator_set: ValidatorSet,
+        epoch_length: u64,
+        max_historical_epochs: usize,
+    ) -> Self {
         Self {
             epoch_length,
             current_epoch: 0,
@@ -77,6 +112,7 @@ impl EpochManager {
             next_set: None,
             staged_info: None,
             historical_sets: BTreeMap::new(),
+            max_historical_epochs: clamp_max_historical(max_historical_epochs),
             pending_adds: Vec::new(),
             pending_removes: Vec::new(),
         }
@@ -85,6 +121,21 @@ impl EpochManager {
     /// Creates an EpochManager starting from a specific epoch.
     /// Used when a node starts from a snapshot at a non-genesis epoch.
     pub fn from_epoch(validator_set: ValidatorSet, epoch_length: u64, starting_epoch: u64) -> Self {
+        Self::from_epoch_with_history(
+            validator_set,
+            epoch_length,
+            starting_epoch,
+            DEFAULT_MAX_HISTORICAL_EPOCHS,
+        )
+    }
+
+    /// Like [`Self::from_epoch`] but with an explicit historical-set bound.
+    pub fn from_epoch_with_history(
+        validator_set: ValidatorSet,
+        epoch_length: u64,
+        starting_epoch: u64,
+        max_historical_epochs: usize,
+    ) -> Self {
         Self {
             epoch_length,
             current_epoch: starting_epoch,
@@ -92,6 +143,7 @@ impl EpochManager {
             next_set: None,
             staged_info: None,
             historical_sets: BTreeMap::new(),
+            max_historical_epochs: clamp_max_historical(max_historical_epochs),
             pending_adds: Vec::new(),
             pending_removes: Vec::new(),
         }
@@ -106,10 +158,20 @@ impl EpochManager {
         epoch_length: u64,
         schedule: &[(u64, Vec<ValidatorInfo>, u32)],
     ) -> ConsensusResult<Self> {
+        Self::from_schedule_with_history(epoch_length, schedule, DEFAULT_MAX_HISTORICAL_EPOCHS)
+    }
+
+    /// Like [`Self::from_schedule`] but with an explicit historical-set bound.
+    pub fn from_schedule_with_history(
+        epoch_length: u64,
+        schedule: &[(u64, Vec<ValidatorInfo>, u32)],
+        max_historical_epochs: usize,
+    ) -> ConsensusResult<Self> {
         if schedule.is_empty() {
             return Err(ConsensusError::EpochScheduleEmpty);
         }
 
+        let max_historical_epochs = clamp_max_historical(max_historical_epochs);
         let mut historical = BTreeMap::new();
 
         // Add all but the last entry to historical
@@ -118,8 +180,8 @@ impl EpochManager {
             historical.insert(*epoch, set);
         }
 
-        // Trim historical to MAX_HISTORICAL_EPOCHS
-        while historical.len() > MAX_HISTORICAL_EPOCHS {
+        // Trim historical to the configured bound
+        while historical.len() > max_historical_epochs {
             if let Some(oldest) = historical.keys().next().copied() {
                 historical.remove(&oldest);
             }
@@ -136,9 +198,15 @@ impl EpochManager {
             next_set: None,
             staged_info: None,
             historical_sets: historical,
+            max_historical_epochs,
             pending_adds: Vec::new(),
             pending_removes: Vec::new(),
         })
+    }
+
+    /// Returns the configured upper bound on retained historical sets.
+    pub fn max_historical_epochs(&self) -> usize {
+        self.max_historical_epochs
     }
 
     /// Returns the epoch length (0 = disabled).
@@ -205,7 +273,7 @@ impl EpochManager {
             return set;
         }
 
-        // Historical set unavailable (epoch too old, beyond MAX_HISTORICAL_EPOCHS).
+        // Historical set unavailable (epoch too old, beyond max_historical_epochs).
         // Log a warning so operators can detect sync/verification issues.
         // Falling back to current_set is a best-effort measure; callers that need
         // strict correctness should treat this as an error.
@@ -214,7 +282,7 @@ impl EpochManager {
             view,
             epoch,
             current_epoch = self.current_epoch,
-            max_historical = MAX_HISTORICAL_EPOCHS,
+            max_historical = self.max_historical_epochs,
             "validator set for epoch not in history (too old); falling back to current set — \
              QC verification for this view may be incorrect"
         );
@@ -299,9 +367,9 @@ impl EpochManager {
         None
     }
 
-    /// Trims historical sets to maintain MAX_HISTORICAL_EPOCHS limit.
+    /// Trims historical sets to maintain the configured max_historical_epochs limit.
     fn trim_historical(&mut self) {
-        while self.historical_sets.len() > MAX_HISTORICAL_EPOCHS {
+        while self.historical_sets.len() > self.max_historical_epochs {
             if let Some(oldest) = self.historical_sets.keys().next().copied() {
                 self.historical_sets.remove(&oldest);
             }
@@ -757,9 +825,44 @@ mod tests {
             em.advance_epoch();
         }
 
-        // Should only keep MAX_HISTORICAL_EPOCHS (3)
-        assert!(em.historical_epoch_count() <= MAX_HISTORICAL_EPOCHS);
+        // Should only keep at most the configured max_historical_epochs entries.
+        assert!(em.historical_epoch_count() <= em.max_historical_epochs());
         assert_eq!(em.current_epoch(), 5);
+    }
+
+    /// Verifies the configurable historical bound: a manager with max=2 must
+    /// drop the oldest entries after enough advances.
+    #[test]
+    fn test_configurable_historical_limit() {
+        let infos = make_validator_infos(4);
+        let vs = ValidatorSet::new(&infos, 1);
+        let mut em = EpochManager::with_epoch_length_and_history(vs, 10, 2);
+        assert_eq!(em.max_historical_epochs(), 2);
+
+        for i in 0..5 {
+            let new_infos = make_validator_infos(4 + i);
+            em.stage_next_epoch(&new_infos, 1).unwrap();
+            em.advance_epoch();
+        }
+
+        // 5 advances → 5 historical entries → trimmed down to 2.
+        assert_eq!(em.historical_epoch_count(), 2);
+        assert_eq!(em.current_epoch(), 5);
+    }
+
+    /// 0 must clamp to 1, oversize must clamp to MAX_HISTORICAL_EPOCHS_LIMIT.
+    #[test]
+    fn test_max_historical_clamping() {
+        let infos = make_validator_infos(4);
+        let vs = ValidatorSet::new(&infos, 1);
+        assert_eq!(
+            EpochManager::with_epoch_length_and_history(vs.clone(), 10, 0).max_historical_epochs(),
+            1
+        );
+        assert_eq!(
+            EpochManager::with_epoch_length_and_history(vs, 10, 10_000).max_historical_epochs(),
+            MAX_HISTORICAL_EPOCHS_LIMIT
+        );
     }
 
     #[test]
