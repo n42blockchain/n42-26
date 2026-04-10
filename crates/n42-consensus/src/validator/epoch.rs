@@ -6,8 +6,15 @@ use n42_primitives::consensus::ValidatorChange;
 use std::collections::BTreeMap;
 
 /// Maximum number of historical epoch validator sets to retain.
-/// Needed for verifying QCs from recent past epochs.
-const MAX_HISTORICAL_EPOCHS: usize = 3;
+///
+/// Needed for verifying QCs whose `view` belongs to a past epoch — this happens
+/// during block sync, late Decide/NewView replays, or any code path that resolves
+/// a QC by looking up the validator set for a historical view. With epoch_length
+/// = 30 this covers ~32 minutes of history (~960 views), which is enough for
+/// short partitions and rolling restarts. Beyond that the resolver falls back to
+/// `current_set` and logs a warning; callers (e.g. `verify_qc`) will then surface
+/// a verification error rather than silently accept the wrong set.
+const MAX_HISTORICAL_EPOCHS: usize = 32;
 
 /// Minimum number of validators required for BFT safety (f ≥ 1).
 pub const MIN_VALIDATOR_COUNT: usize = 4;

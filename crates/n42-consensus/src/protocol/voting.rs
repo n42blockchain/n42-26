@@ -35,15 +35,11 @@ impl ConsensusEngine {
             });
         }
 
-        // Equivocation detection runs on ALL nodes, not just the leader.
-        if let Some((h1, h2)) = check_equivocation(&mut self.equivocation_tracker, vote.voter, vote.block_hash) {
-            tracing::warn!(target: "n42::cl::voting", view, validator = vote.voter,
-                hash1 = %h1, hash2 = %h2, "vote equivocation detected");
-            self.emit(EngineOutput::EquivocationDetected { view, validator: vote.voter, hash1: h1, hash2: h2 })?;
-            return Ok(());
-        }
-
-        // Only the leader collects votes to form a QC.
+        // Votes are addressed to the leader (SendToValidator). Followers that receive
+        // multi-path duplicates (or anything a Byzantine peer relays directly) drop
+        // here, mirroring the R2 design. Aside from saving work, this prevents an
+        // unauthenticated peer from poisoning equivocation_tracker with forged
+        // (voter, hash) pairs and starving the real voter's later vote.
         if !self.is_current_leader() {
             return Ok(());
         }
@@ -67,6 +63,15 @@ impl ConsensusEngine {
                 view,
                 validator_index: vote.voter,
             })?;
+
+        // Equivocation check is gated on a verified signature so that an unauthenticated
+        // peer cannot poison the tracker against a real voter.
+        if let Some((h1, h2)) = check_equivocation(&mut self.equivocation_tracker, vote.voter, vote.block_hash) {
+            tracing::warn!(target: "n42::cl::voting", view, validator = vote.voter,
+                hash1 = %h1, hash2 = %h2, "vote equivocation detected");
+            self.emit(EngineOutput::EquivocationDetected { view, validator: vote.voter, hash1: h1, hash2: h2 })?;
+            return Ok(());
+        }
 
         let collector = match self.vote_collector.as_mut() {
             Some(c) => c,
@@ -168,16 +173,6 @@ impl ConsensusEngine {
             return Ok(());
         }
 
-        // R2 equivocation detection — leader-only by design: CommitVotes are sent
-        // directly to the leader (not broadcast), so only the leader can observe
-        // conflicting votes from the same validator.
-        if let Some((h1, h2)) = check_equivocation(&mut self.commit_equivocation_tracker, cv.voter, cv.block_hash) {
-            tracing::warn!(target: "n42::cl::voting", view, validator = cv.voter,
-                hash1 = %h1, hash2 = %h2, "commit-vote equivocation detected");
-            self.emit(EngineOutput::EquivocationDetected { view, validator: cv.voter, hash1: h1, hash2: h2 })?;
-            return Ok(());
-        }
-
         let expected_hash = match self.commit_collector.as_ref() {
             Some(c) => c.block_hash(),
             None => return Ok(()),
@@ -196,6 +191,15 @@ impl ConsensusEngine {
                 view,
                 validator_index: cv.voter,
             })?;
+
+        // R2 equivocation check — gated on verified signature, leader-only by design
+        // (CommitVotes are sent directly to the leader, not broadcast).
+        if let Some((h1, h2)) = check_equivocation(&mut self.commit_equivocation_tracker, cv.voter, cv.block_hash) {
+            tracing::warn!(target: "n42::cl::voting", view, validator = cv.voter,
+                hash1 = %h1, hash2 = %h2, "commit-vote equivocation detected");
+            self.emit(EngineOutput::EquivocationDetected { view, validator: cv.voter, hash1: h1, hash2: h2 })?;
+            return Ok(());
+        }
 
         let collector = match self.commit_collector.as_mut() {
             Some(c) => c,

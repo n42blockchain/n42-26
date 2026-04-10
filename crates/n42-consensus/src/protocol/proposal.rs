@@ -84,8 +84,20 @@ impl ConsensusEngine {
         ));
         self.round_state.enter_voting();
 
-        // GossipSub does not deliver messages back to the sender, so the leader
-        // must add its own vote directly to the collector.
+        // Leader self-vote: GossipSub does not deliver messages back to the sender,
+        // so the leader must add its own vote directly to the collector. Record the
+        // vote in last_voted_view *before* signing — same crash-safety invariant as
+        // send_vote(): we err on the side of not voting rather than double-voting.
+        if !self.round_state.may_vote_in(view) {
+            tracing::warn!(
+                target: "n42::cl::proposal",
+                view,
+                last_voted = self.round_state.last_voted_view(),
+                "leader already voted in this view; aborting proposal"
+            );
+            return Ok(());
+        }
+        self.round_state.record_vote(view);
         // Reuse the vote_msg computed above (same view + block_hash).
         let leader_vote_sig = self.secret_key.sign(&vote_msg);
         if let Some(ref mut collector) = self.vote_collector {
