@@ -1,8 +1,8 @@
 diff --git a/Cargo.lock b/Cargo.lock
-index d0f0f7e68..5231448cc 100644
+index fbe3c9c1a0b79f8c2485683f1cc169f49469a624..692bfa0274a1a4d16a9c0872f7e61fe58113c269 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
-@@ -8745,6 +8745,7 @@ dependencies = [
+@@ -8497,6 +8497,7 @@ dependencies = [
   "reth-storage-errors",
   "reth-trie-common",
   "revm",
@@ -11,7 +11,7 @@ index d0f0f7e68..5231448cc 100644
  
  [[package]]
 diff --git a/crates/engine/tree/src/tree/payload_validator.rs b/crates/engine/tree/src/tree/payload_validator.rs
-index b4edc7463..7479618d1 100644
+index d0ab75aa090681b98a508e307d758bbe3d635fa8..2ce71658defbf8f126058d9d490a330dc7aeaa19 100644
 --- a/crates/engine/tree/src/tree/payload_validator.rs
 +++ b/crates/engine/tree/src/tree/payload_validator.rs
 @@ -497,12 +497,32 @@ where
@@ -224,10 +224,10 @@ index b4edc7463..7479618d1 100644
              Self::write_trie_debug_recorders(block.header().number(), &trie_debug_recorders);
  
 diff --git a/crates/ethereum/payload/src/lib.rs b/crates/ethereum/payload/src/lib.rs
-index d71d7490b..f315c953e 100644
+index aafd32eaba1ed95ce9c956394bbe71bc4cd613f7..b1d56a6d77d108e784911cba2cc84debbf361756 100644
 --- a/crates/ethereum/payload/src/lib.rs
 +++ b/crates/ethereum/payload/src/lib.rs
-@@ -22,7 +22,7 @@ use reth_consensus_common::validation::MAX_RLP_BLOCK_SIZE;
+@@ -21,7 +21,7 @@ use reth_consensus_common::validation::MAX_RLP_BLOCK_SIZE;
  use reth_errors::{BlockExecutionError, BlockValidationError, ConsensusError};
  use reth_ethereum_primitives::{EthPrimitives, TransactionSigned};
  use reth_evm::{
@@ -236,7 +236,7 @@ index d71d7490b..f315c953e 100644
      ConfigureEvm, Evm, NextBlockEnvAttributes,
  };
  use reth_evm_ethereum::EthEvmConfig;
-@@ -40,7 +40,7 @@ use reth_transaction_pool::{
+@@ -39,7 +39,7 @@ use reth_transaction_pool::{
  };
  use revm::context_interface::Block as _;
  use std::sync::Arc;
@@ -245,7 +245,7 @@ index d71d7490b..f315c953e 100644
  
  mod config;
  pub use config::*;
-@@ -243,7 +243,50 @@ where
+@@ -242,7 +242,50 @@ where
      let withdrawals_rlp_length =
          attributes.withdrawals.as_ref().map(|withdrawals| withdrawals.length()).unwrap_or(0);
  
@@ -297,7 +297,7 @@ index d71d7490b..f315c953e 100644
          // ensure we still have capacity for this transaction
          if cumulative_gas_used + pool_tx.gas_limit() > block_gas_limit {
              // we can't fit this transaction into the block, so we need to mark it as invalid
-@@ -261,24 +304,34 @@ where
+@@ -260,24 +303,34 @@ where
              return Ok(BuildOutcome::Cancelled)
          }
  
@@ -347,7 +347,7 @@ index d71d7490b..f315c953e 100644
  
          // There's only limited amount of blob space available per block, so we need to check if
          // the EIP-4844 can still fit in the block
-@@ -336,6 +389,7 @@ where
+@@ -335,6 +388,7 @@ where
          let miner_fee = tx.effective_tip_per_gas(base_fee);
          let tx_hash = *tx.tx_hash();
  
@@ -355,7 +355,7 @@ index d71d7490b..f315c953e 100644
          let gas_used = match builder.execute_transaction(tx) {
              Ok(gas_used) => gas_used,
              Err(BlockExecutionError::Validation(BlockValidationError::InvalidTx {
-@@ -361,6 +415,8 @@ where
+@@ -360,6 +414,8 @@ where
              Err(err) => return Err(PayloadBuilderError::evm(err)),
          };
  
@@ -364,7 +364,7 @@ index d71d7490b..f315c953e 100644
          // add to the total blob gas used if the transaction successfully executed
          if let Some(blob_count) = tx_blob_count {
              block_blob_count += blob_count;
-@@ -377,6 +433,7 @@ where
+@@ -376,6 +432,7 @@ where
          let miner_fee = miner_fee.expect("fee is always valid; execution succeeded");
          total_fees += U256::from(miner_fee) * U256::from(gas_used);
          cumulative_gas_used += gas_used;
@@ -372,7 +372,7 @@ index d71d7490b..f315c953e 100644
  
          // Add blob tx sidecar to the payload.
          if let Some(sidecar) = blob_tx_sidecar {
-@@ -384,6 +441,26 @@ where
+@@ -383,6 +440,26 @@ where
          }
      }
  
@@ -399,7 +399,7 @@ index d71d7490b..f315c953e 100644
      // check if we have a better block
      if !is_better_payload(best_payload.as_ref(), total_fees) {
          // Release db
-@@ -418,11 +495,37 @@ where
+@@ -417,11 +494,37 @@ where
          builder.finish(state_provider.as_ref(), None)?
      };
  
@@ -439,7 +439,7 @@ index d71d7490b..f315c953e 100644
  
      if is_osaka && sealed_block.rlp_length() > MAX_RLP_BLOCK_SIZE {
 diff --git a/crates/evm/evm/Cargo.toml b/crates/evm/evm/Cargo.toml
-index 4b469c955..b69aaa164 100644
+index 727042d552e9f95c7d6a9e4b2c2cb0cf2a3d144b..5b8d8abcd57cfec8b1eed70d9b7550f50012feb1 100644
 --- a/crates/evm/evm/Cargo.toml
 +++ b/crates/evm/evm/Cargo.toml
 @@ -28,6 +28,7 @@ alloy-eips.workspace = true
@@ -451,7 +451,7 @@ index 4b469c955..b69aaa164 100644
  derive_more.workspace = true
  futures-util.workspace = true
 diff --git a/crates/evm/evm/src/execute.rs b/crates/evm/evm/src/execute.rs
-index 76c9f3808..7644e9574 100644
+index 76c9f3808b34b75febbc672a0db17934abd2dd51..7644e9574d7ea588908133c88d74a6e3334d36fd 100644
 --- a/crates/evm/evm/src/execute.rs
 +++ b/crates/evm/evm/src/execute.rs
 @@ -484,23 +484,58 @@ where
@@ -547,10 +547,10 @@ index 76c9f3808..7644e9574 100644
          Ok(BlockBuilderOutcome { execution_result: result, hashed_state, trie_updates, block })
      }
 diff --git a/crates/evm/evm/src/lib.rs b/crates/evm/evm/src/lib.rs
-index 7b01da49e..a2017d8d0 100644
+index 9902166d8ea049f4c3bd2b6ba439f862f179cc66..e3b5d33f2ffc6db23f17b573a39a6bfb57d431b9 100644
 --- a/crates/evm/evm/src/lib.rs
 +++ b/crates/evm/evm/src/lib.rs
-@@ -52,6 +52,30 @@ pub use engine::{ConfigureEngineEvm, ConvertTx, ExecutableTxIterator, Executable
+@@ -48,6 +48,30 @@ pub use engine::{ConfigureEngineEvm, ConvertTx, ExecutableTxIterator, Executable
  #[cfg(feature = "metrics")]
  pub mod metrics;
  pub mod noop;
@@ -581,8 +581,24 @@ index 7b01da49e..a2017d8d0 100644
  #[cfg(any(test, feature = "test-utils"))]
  /// test helpers for mocking executor
  pub mod test_utils;
+diff --git a/crates/fs-util/src/lib.rs b/crates/fs-util/src/lib.rs
+index d17b7113a76925639db0528ae779316610984b48..d057566216bbbead92c8cd2921b5bbc734881fc5 100644
+--- a/crates/fs-util/src/lib.rs
++++ b/crates/fs-util/src/lib.rs
+@@ -356,7 +356,10 @@ where
+     // Rename file, not move
+     rename(&tmp_path, file_path)?;
+ 
+-    // fsync() directory
++    // fsync() directory — only on Unix. Windows does not allow opening a
++    // directory as a file, and NTFS journals metadata operations independently
++    // so the rename above is already crash-safe without an explicit dir fsync.
++    #[cfg(unix)]
+     if let Some(parent) = file_path.parent() {
+         OpenOptions::new()
+             .read(true)
 diff --git a/crates/rpc/rpc-eth-types/src/utils.rs b/crates/rpc/rpc-eth-types/src/utils.rs
-index 5df161d33..f53429864 100644
+index 5df161d33b59319456a56554c42b03506c789c2e..f53429864c4e983b489a664dd5ee5fc8c41c2d77 100644
 --- a/crates/rpc/rpc-eth-types/src/utils.rs
 +++ b/crates/rpc/rpc-eth-types/src/utils.rs
 @@ -40,8 +40,19 @@ pub fn recover_raw_transaction<T: SignedTransaction>(data: &[u8]) -> EthResult<R
@@ -609,7 +625,7 @@ index 5df161d33..f53429864 100644
  /// Performs a binary search within a given block range to find the desired block number.
 diff --git a/crates/evm/evm/src/payload_cache.rs b/crates/evm/evm/src/payload_cache.rs
 new file mode 100644
-index 000000000..000000001
+index 0000000000000000000000000000000000000000..590fdeb3a63a70b7ad3ae0499b7226745be52597
 --- /dev/null
 +++ b/crates/evm/evm/src/payload_cache.rs
 @@ -0,0 +1,74 @@
@@ -687,19 +703,3 @@ index 000000000..000000001
 +pub fn take_broadcast_execution<T: 'static>(block_hash: &B256) -> Option<T> {
 +    take::<T>(&BROADCAST_CACHE, block_hash)
 +}
-diff --git a/crates/fs-util/src/lib.rs b/crates/fs-util/src/lib.rs
-index d17b7113a..d05756621 100644
---- a/crates/fs-util/src/lib.rs
-+++ b/crates/fs-util/src/lib.rs
-@@ -356,7 +356,10 @@ where
-     // Rename file, not move
-     rename(&tmp_path, file_path)?;
- 
--    // fsync() directory
-+    // fsync() directory — only on Unix. Windows does not allow opening a
-+    // directory as a file, and NTFS journals metadata operations independently
-+    // so the rename above is already crash-safe without an explicit dir fsync.
-+    #[cfg(unix)]
-     if let Some(parent) = file_path.parent() {
-         OpenOptions::new()
-             .read(true)

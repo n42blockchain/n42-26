@@ -1148,6 +1148,7 @@ async fn test_timeout_convergence_from_different_views() {
             n42_primitives::consensus::QuorumCertificate::genesis(),
             n42_primitives::consensus::QuorumCertificate::genesis(),
             0,
+            0,
         );
         engines.push(engine);
         output_rxs.push(rx);
