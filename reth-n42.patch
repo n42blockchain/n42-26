@@ -1,8 +1,8 @@
 diff --git a/Cargo.lock b/Cargo.lock
-index fbe3c9c1a0b79f8c2485683f1cc169f49469a624..692bfa0274a1a4d16a9c0872f7e61fe58113c269 100644
+index c68654a3cfcb47255f270e10c4825081059741ae..8512be084371927e7ca0cba95394729255b5d9c7 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
-@@ -8497,6 +8497,7 @@ dependencies = [
+@@ -8687,6 +8687,7 @@ dependencies = [
   "reth-storage-errors",
   "reth-trie-common",
   "revm",
