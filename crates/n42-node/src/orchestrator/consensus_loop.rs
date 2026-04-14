@@ -125,7 +125,8 @@ impl ConsensusOrchestrator {
     pub(super) async fn handle_engine_output(&mut self, output: EngineOutput) {
         match output {
             EngineOutput::BroadcastMessage(msg) => {
-                if matches!(&msg, ConsensusMessage::Proposal(_)) && self.engine.is_current_leader() {
+                if matches!(&msg, ConsensusMessage::Proposal(_)) && self.engine.is_current_leader()
+                {
                     self.broadcast_via_rotor(msg);
                 } else {
                     // Fire-and-forget: do NOT await — blocking the consensus loop on
@@ -159,6 +160,14 @@ impl ConsensusOrchestrator {
             } => {
                 self.handle_block_committed(view, block_hash, commit_qc, validator_changes)
                     .await;
+            }
+            EngineOutput::CommittedBlockValidatorChangesRecovered {
+                view,
+                block_hash,
+                validator_changes,
+            } => {
+                self.recover_committed_block_validator_changes(view, block_hash, validator_changes);
+                self.refresh_epoch_status();
             }
             EngineOutput::ViewChanged { new_view } => {
                 self.handle_view_changed(new_view).await;
@@ -245,10 +254,7 @@ impl ConsensusOrchestrator {
 
                 // Update network's validator context for Rotor relay
                 self.network
-                    .set_validator_context(
-                        self.engine.my_index(),
-                        validator_count,
-                    )
+                    .set_validator_context(self.engine.my_index(), validator_count)
                     .await;
 
                 // Pre-stage the validator set for the epoch after next, if scheduled.
@@ -367,7 +373,8 @@ impl ConsensusOrchestrator {
             state.notify_block_committed(block_hash, self.committed_block_count);
         }
 
-        self.prev_randao_cache = alloy_primitives::keccak256(commit_qc.aggregate_signature.to_bytes());
+        self.prev_randao_cache =
+            alloy_primitives::keccak256(commit_qc.aggregate_signature.to_bytes());
         self.last_commit_qc = Some(commit_qc.clone());
 
         // Build and persist ConsensusEvidence in MDBX for future verification.
@@ -421,7 +428,10 @@ impl ConsensusOrchestrator {
                 let block_count = self.committed_block_count;
                 tokio::task::spawn_blocking(move || {
                     let start = std::time::Instant::now();
-                    let mut tree = jmt.lock().unwrap_or_else(|e| { tracing::warn!("jmt mutex poisoned, recovering"); e.into_inner() });
+                    let mut tree = jmt.lock().unwrap_or_else(|e| {
+                        tracing::warn!("jmt mutex poisoned, recovering");
+                        e.into_inner()
+                    });
                     match tree.apply_diff(&diff) {
                         Ok((version, root)) => {
                             let elapsed_ms = start.elapsed().as_millis();
@@ -489,7 +499,10 @@ impl ConsensusOrchestrator {
         {
             match super::decompress_payload(data) {
                 Ok(decompressed) => {
-                    let mut mgr = staking_mgr.lock().unwrap_or_else(|e| { tracing::warn!("staking_mgr mutex poisoned, recovering"); e.into_inner() });
+                    let mut mgr = staking_mgr.lock().unwrap_or_else(|e| {
+                        tracing::warn!("staking_mgr mutex poisoned, recovering");
+                        e.into_inner()
+                    });
                     mgr.scan_committed_block(self.committed_block_count, &decompressed);
                 }
                 Err(e) => {
@@ -530,10 +543,7 @@ impl ConsensusOrchestrator {
         };
 
         let fcu_start = std::time::Instant::now();
-        let finalized = match engine_handle
-            .fork_choice_updated(fcu_state, None)
-            .await
-        {
+        let finalized = match engine_handle.fork_choice_updated(fcu_state, None).await {
             Ok(result) => {
                 let elapsed_ms = fcu_start.elapsed().as_millis() as u64;
                 info!(target: "n42::cl::consensus_loop", view, %block_hash, status = ?result.payload_status.status, elapsed_ms, "N42_FCU: finalize fcu");
@@ -573,10 +583,7 @@ impl ConsensusOrchestrator {
                     finalized_block_hash: block_hash,
                 };
                 let retry_start = std::time::Instant::now();
-                match engine_handle
-                    .fork_choice_updated(retry_fcu, None)
-                    .await
-                {
+                match engine_handle.fork_choice_updated(retry_fcu, None).await {
                     Ok(result) => {
                         let retry_ms = retry_start.elapsed().as_millis() as u64;
                         info!(target: "n42::cl::consensus_loop", view, %block_hash, status = ?result.payload_status.status, retry_ms, "N42_FCU_RETRY: retry fcu after eager import");
@@ -763,10 +770,7 @@ impl ConsensusOrchestrator {
                     safe_block_hash: block_hash,
                     finalized_block_hash: block_hash,
                 };
-                if let Err(e) = engine_handle
-                    .fork_choice_updated(fcu, None)
-                    .await
-                {
+                if let Err(e) = engine_handle.fork_choice_updated(fcu, None).await {
                     error!(target: "n42::cl::consensus_loop", %block_hash, error = %e, "bg import: fcu failed");
                 }
                 info!(target: "n42::cl::consensus_loop", %block_hash, "bg import: block imported successfully");

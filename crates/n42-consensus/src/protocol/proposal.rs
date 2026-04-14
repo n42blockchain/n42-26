@@ -10,8 +10,122 @@ use crate::validator::LeaderSelector;
 const MAX_IMPORTED_BLOCKS: usize = 64;
 
 impl ConsensusEngine {
+    /// Recovers validator changes from a late Proposal whose block has already
+    /// been committed by a Decide. GossipSub does not guarantee ordering, so a
+    /// follower can observe Decide first and Proposal second for the same view.
+    /// Without this recovery path, the follower misses the leader's committed
+    /// validator changes and diverges at the next epoch boundary.
+    pub(super) fn recover_late_committed_proposal(
+        &mut self,
+        proposal: &Proposal,
+    ) -> ConsensusResult<bool> {
+        let Some(changes) = proposal.validator_changes.as_ref() else {
+            return Ok(false);
+        };
+
+        let current_view = self.round_state.current_view();
+        if proposal.view >= current_view {
+            return Ok(false);
+        }
+
+        let last_committed = self.round_state.last_committed_qc();
+        if last_committed.view != proposal.view || last_committed.block_hash != proposal.block_hash
+        {
+            return Ok(false);
+        }
+
+        let expected_hash = self.cached_changes_hash(&proposal.block_hash);
+        if expected_hash == B256::ZERO {
+            return Ok(false);
+        }
+
+        let actual_hash = crate::EpochManager::hash_changes(changes);
+        if actual_hash != expected_hash {
+            tracing::warn!(
+                target: "n42::cl::proposal",
+                view = proposal.view,
+                block_hash = %proposal.block_hash,
+                expected_hash = %expected_hash,
+                actual_hash = %actual_hash,
+                "ignoring late committed proposal with mismatched validator_changes hash"
+            );
+            return Ok(false);
+        }
+
+        let proposal_epoch = self.epoch_manager.epoch_for_view(proposal.view);
+        if self.epoch_manager.current_epoch() != proposal_epoch
+            || self.epoch_manager.has_staged_next()
+        {
+            return Ok(false);
+        }
+
+        let view_set = self.validator_set_for_view(proposal.view);
+        let expected_leader = LeaderSelector::leader_for_view(proposal.view, view_set);
+        if proposal.proposer != expected_leader {
+            tracing::warn!(
+                target: "n42::cl::proposal",
+                view = proposal.view,
+                expected = expected_leader,
+                actual = proposal.proposer,
+                "ignoring late committed proposal from unexpected proposer"
+            );
+            return Ok(false);
+        }
+
+        let pk = match view_set.get_public_key(proposal.proposer) {
+            Ok(pk) => pk,
+            Err(error) => {
+                tracing::warn!(
+                    target: "n42::cl::proposal",
+                    view = proposal.view,
+                    proposer = proposal.proposer,
+                    error = %error,
+                    "ignoring late committed proposal with unknown proposer"
+                );
+                return Ok(false);
+            }
+        };
+        let prop_msg = super::quorum::proposal_signing_message(
+            proposal.view,
+            &proposal.block_hash,
+            &proposal.validator_changes,
+        );
+        if pk
+            .verify_prevalidated(&prop_msg, &proposal.signature)
+            .is_err()
+        {
+            tracing::warn!(
+                target: "n42::cl::proposal",
+                view = proposal.view,
+                proposer = proposal.proposer,
+                "ignoring late committed proposal with invalid signature"
+            );
+            return Ok(false);
+        }
+
+        self.epoch_manager.replace_pending_from_proposal(changes);
+        self.epoch_manager.commit_pending_changes()?;
+        self.emit(EngineOutput::CommittedBlockValidatorChangesRecovered {
+            view: proposal.view,
+            block_hash: proposal.block_hash,
+            validator_changes: changes.clone(),
+        })?;
+        tracing::warn!(
+            target: "n42::cl::proposal",
+            view = proposal.view,
+            block_hash = %proposal.block_hash,
+            changes = ?changes,
+            "recovered validator changes from late committed proposal"
+        );
+        Ok(true)
+    }
+
     /// Called when this node (as leader) has a block ready to propose.
-    pub(super) fn on_block_ready(&mut self, block_hash: B256, tx_root_hash: Option<B256>) -> ConsensusResult<()> {
+    pub(super) fn on_block_ready(
+        &mut self,
+        block_hash: B256,
+        tx_root_hash: Option<B256>,
+    ) -> ConsensusResult<()> {
         let view = self.round_state.current_view();
 
         if !self.is_current_leader() {
@@ -40,7 +154,8 @@ impl ConsensusEngine {
         self.pending_changes_hashes.insert(block_hash, changes_hash);
 
         // Signature covers changes_hash to prevent Byzantine relay from swapping changes.
-        let prop_msg = super::quorum::proposal_signing_message(view, &block_hash, &validator_changes);
+        let prop_msg =
+            super::quorum::proposal_signing_message(view, &block_hash, &validator_changes);
         let signature = self.secret_key.sign(&prop_msg);
         let vote_msg = signing_message(view, &block_hash);
 
@@ -51,7 +166,9 @@ impl ConsensusEngine {
         // self.my_index is only updated at the epoch boundary; using it here would send
         // the OLD index, causing an InvalidProposer rejection whenever the new validator's
         // address sorts before this node's, shifting this node's position in the set.
-        let proposer = self.local_validator_index_for_view(view).unwrap_or(self.my_index);
+        let proposer = self
+            .local_validator_index_for_view(view)
+            .unwrap_or(self.my_index);
 
         let proposal = Proposal {
             view,
@@ -231,7 +348,8 @@ impl ConsensusEngine {
         };
         // Cache the proposal's changes_hash so the R2 commit-vote signing
         // path can include it.
-        self.pending_changes_hashes.insert(proposal.block_hash, changes_hash);
+        self.pending_changes_hashes
+            .insert(proposal.block_hash, changes_hash);
 
         // Store pending tx_root_hash for future DA verification if present.
         if let Some(tx_root) = proposal.tx_root_hash {

@@ -35,11 +35,7 @@ impl ConsensusEngine {
             });
         }
         let changes_hash = self.cached_changes_hash(&qc.block_hash);
-        super::quorum::verify_qc_any_domain(
-            qc,
-            self.resolve_qc_validator_set(qc),
-            &changes_hash,
-        )
+        super::quorum::verify_qc_any_domain(qc, self.resolve_qc_validator_set(qc), &changes_hash)
     }
 
     /// Handles a view timeout triggered by the pacemaker.
@@ -89,7 +85,8 @@ impl ConsensusEngine {
             let quorum_size = self.validator_set_for_view(view).quorum_size();
             let next_view = view.saturating_add(1);
             if let Some(ref collector) = self.timeout_collector
-                && collector.has_quorum(quorum_size) && self.is_leader_for_view(next_view)
+                && collector.has_quorum(quorum_size)
+                && self.is_leader_for_view(next_view)
             {
                 self.try_form_tc_and_advance(view, next_view)?;
             }
@@ -231,6 +228,14 @@ impl ConsensusEngine {
             e
         })?;
 
+        let last_committed_view = self.round_state.last_committed_qc().view;
+        if timeout.high_qc.view > last_committed_view.saturating_add(3) {
+            self.emit(EngineOutput::SyncRequired {
+                local_view: last_committed_view,
+                target_view: timeout.high_qc.view,
+            })?;
+        }
+
         tracing::info!(target: "n42::cl::timeout",
             current_view,
             timeout_view = timeout.view,
@@ -272,6 +277,16 @@ impl ConsensusEngine {
                 }
                 Err(e) => return Err(e),
             }
+        }
+
+        if !self.is_local_validator_active_for_view(timeout.view) {
+            tracing::info!(
+                target: "n42::cl::timeout",
+                timeout_view = timeout.view,
+                my_index = self.my_index,
+                "local validator not active for synchronized timeout view; skipping timeout rebroadcast"
+            );
+            return Ok(());
         }
 
         // Broadcast our own timeout so other nodes can converge and form a TC.

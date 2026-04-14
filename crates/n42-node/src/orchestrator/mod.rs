@@ -689,7 +689,10 @@ impl ConsensusOrchestrator {
     }
 
     /// Installs the admin command receiver for RPC-originated validator reconfig requests.
-    pub fn with_admin_rx(mut self, rx: mpsc::Receiver<crate::consensus_state::AdminCommand>) -> Self {
+    pub fn with_admin_rx(
+        mut self,
+        rx: mpsc::Receiver<crate::consensus_state::AdminCommand>,
+    ) -> Self {
         self.admin_rx = Some(rx);
         self
     }
@@ -699,7 +702,6 @@ impl ConsensusOrchestrator {
         self.evidence_store = Some(store);
         self
     }
-
 
     pub fn with_tx_pool_bridge(
         mut self,
@@ -727,10 +729,7 @@ impl ConsensusOrchestrator {
 
         // Set validator context for Rotor relay forwarding in network layer
         self.network
-            .set_validator_context(
-                self.engine.my_index(),
-                self.engine.validator_count(),
-            )
+            .set_validator_context(self.engine.my_index(), self.engine.validator_count())
             .await;
 
         loop {
@@ -1059,12 +1058,16 @@ impl ConsensusOrchestrator {
         use crate::consensus_state::AdminCommand;
         match cmd {
             AdminCommand::AddValidator { info, reply } => {
-                let result = self.engine.propose_add_validator(info)
+                let result = self
+                    .engine
+                    .propose_add_validator(info)
                     .map_err(|e| e.to_string());
                 let _ = reply.send(result);
             }
             AdminCommand::RemoveValidator { address, reply } => {
-                let result = self.engine.propose_remove_validator(address)
+                let result = self
+                    .engine
+                    .propose_remove_validator(address)
                     .map_err(|e| e.to_string());
                 let _ = reply.send(result);
             }
@@ -1254,7 +1257,11 @@ impl ConsensusOrchestrator {
                 // window. Anything else more than FUTURE_VIEW_WINDOW ahead must
                 // consume a token from this peer's bucket or be dropped.
                 let needs_view_jump = !matches!(message.as_ref(), CM::Decide(_) | CM::NewView(_))
-                    && message.view() > self.engine.current_view().saturating_add(FUTURE_VIEW_WINDOW);
+                    && message.view()
+                        > self
+                            .engine
+                            .current_view()
+                            .saturating_add(FUTURE_VIEW_WINDOW);
                 if needs_view_jump && !self.view_jump_throttle.try_consume(source) {
                     counter!("n42_view_jump_throttled_total").increment(1);
                     debug!(
@@ -1384,6 +1391,7 @@ mod tests {
     use n42_chainspec::ValidatorInfo;
     use n42_consensus::{ConsensusEngine, ValidatorSet};
     use n42_network::{NetworkCommand, NetworkHandle};
+    use n42_primitives::consensus::ValidatorChange;
     use n42_primitives::{BlsSecretKey, ConsensusMessage, QuorumCertificate, Vote};
     use std::time::Duration;
 
@@ -1522,6 +1530,39 @@ mod tests {
             orch.head_block_hash,
             B256::repeat_byte(0xDD),
             "head should be updated after commit"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_late_recovered_validator_changes_patch_sync_cache() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let mut orch = ConsensusOrchestrator::new(engine, network, net_event_rx, output_rx);
+
+        let block_hash = B256::repeat_byte(0xA5);
+        orch.store_committed_block(15, block_hash, QuorumCertificate::genesis(), None);
+
+        orch.handle_engine_output(EngineOutput::CommittedBlockValidatorChangesRecovered {
+            view: 15,
+            block_hash,
+            validator_changes: vec![ValidatorChange::Add {
+                address: Address::with_last_byte(0x04),
+                bls_public_key: test_key(0x44).public_key(),
+                p2p_peer_id: None,
+            }],
+        })
+        .await;
+
+        assert_eq!(orch.committed_blocks.len(), 1);
+        assert!(orch.committed_blocks[0].validator_changes.is_some());
+        assert_eq!(
+            orch.committed_blocks[0]
+                .validator_changes
+                .as_ref()
+                .expect("validator changes should be patched")
+                .len(),
+            1
         );
     }
 

@@ -73,7 +73,11 @@ impl ConsensusOrchestrator {
         let em = self.engine.epoch_manager();
         let current_epoch_validators = if em.epochs_enabled() {
             let vs = em.current_validator_set();
-            Some((em.current_epoch(), vs.validator_infos(), vs.fault_tolerance()))
+            Some((
+                em.current_epoch(),
+                vs.validator_infos(),
+                vs.fault_tolerance(),
+            ))
         } else {
             None
         };
@@ -108,7 +112,10 @@ impl ConsensusOrchestrator {
 
         // Also persist staking state
         if let Some(ref staking_mgr) = self.staking_manager {
-            let mgr = staking_mgr.lock().unwrap_or_else(|e| { tracing::warn!("staking_mgr mutex poisoned, recovering"); e.into_inner() });
+            let mgr = staking_mgr.lock().unwrap_or_else(|e| {
+                tracing::warn!("staking_mgr mutex poisoned, recovering");
+                e.into_inner()
+            });
             mgr.save();
         }
     }
@@ -153,6 +160,45 @@ impl ConsensusOrchestrator {
             payload,
             validator_changes,
         });
+    }
+
+    /// Backfills validator changes for an already-cached committed block.
+    ///
+    /// This is used when a follower commits a block from Decide first and only
+    /// later recovers the matching Proposal carrying validator changes. The
+    /// sync ring buffer must be patched so joining nodes can verify the CommitQC
+    /// against the correct `validator_changes_hash`.
+    pub(super) fn recover_committed_block_validator_changes(
+        &mut self,
+        view: u64,
+        block_hash: B256,
+        validator_changes: Vec<n42_primitives::consensus::ValidatorChange>,
+    ) {
+        if validator_changes.is_empty() {
+            return;
+        }
+
+        if let Some(block) = self
+            .committed_blocks
+            .iter_mut()
+            .find(|b| b.view == view && b.block_hash == block_hash)
+        {
+            block.validator_changes = Some(validator_changes);
+            debug!(
+                target: "n42::cl::sync",
+                view,
+                %block_hash,
+                "patched committed block validator_changes in sync cache"
+            );
+            return;
+        }
+
+        warn!(
+            target: "n42::cl::sync",
+            view,
+            %block_hash,
+            "late validator_changes recovery could not find committed block in sync cache"
+        );
     }
 }
 
@@ -315,7 +361,10 @@ impl ConsensusOrchestrator {
             {
                 match super::decompress_payload(&sync_block.payload) {
                     Ok(decompressed) => {
-                        let mut mgr = staking_mgr.lock().unwrap_or_else(|e| { tracing::warn!("staking_mgr mutex poisoned, recovering"); e.into_inner() });
+                        let mut mgr = staking_mgr.lock().unwrap_or_else(|e| {
+                            tracing::warn!("staking_mgr mutex poisoned, recovering");
+                            e.into_inner()
+                        });
                         mgr.scan_committed_block(sync_block.view, &decompressed);
                     }
                     Err(e) => {
@@ -326,9 +375,8 @@ impl ConsensusOrchestrator {
 
             // Update consensus metadata that payload building depends on.
             self.committed_block_count += 1;
-            self.prev_randao_cache = alloy_primitives::keccak256(
-                sync_block.commit_qc.aggregate_signature.to_bytes(),
-            );
+            self.prev_randao_cache =
+                alloy_primitives::keccak256(sync_block.commit_qc.aggregate_signature.to_bytes());
 
             // Write evidence to MDBX (same as normal commit path).
             if let Some(ref evidence_store) = self.evidence_store {
@@ -336,7 +384,8 @@ impl ConsensusOrchestrator {
                     view: sync_block.view,
                     block_hash: sync_block.block_hash.0,
                     aggregate_signature: sync_block.commit_qc.aggregate_signature.to_bytes(),
-                    signer_count: u16::try_from(sync_block.commit_qc.signers.len()).unwrap_or(u16::MAX),
+                    signer_count: u16::try_from(sync_block.commit_qc.signers.len())
+                        .unwrap_or(u16::MAX),
                     packed_signers: sync_block.commit_qc.signers.as_raw_slice().to_vec(),
                     mobile: None,
                 };
@@ -355,7 +404,11 @@ impl ConsensusOrchestrator {
 
             // Apply validator changes from the synced block to the epoch manager.
             if let Some(ref changes) = sync_block.validator_changes {
-                match self.engine.epoch_manager_mut().apply_committed_changes_from_sync(changes) {
+                match self
+                    .engine
+                    .epoch_manager_mut()
+                    .apply_committed_changes_from_sync(changes)
+                {
                     Ok(()) => {
                         // Record the view at which the staging occurred so the epoch
                         // boundary check below can tell live-staged state from sync-staged state.
@@ -377,7 +430,9 @@ impl ConsensusOrchestrator {
             let next_view = sync_block.view.saturating_add(1);
             if self.engine.epoch_manager().is_epoch_boundary(next_view)
                 && self.engine.epoch_manager().has_staged_next()
-                && self.epoch_sync_staged_view.is_some_and(|v| v <= sync_block.view)
+                && self
+                    .epoch_sync_staged_view
+                    .is_some_and(|v| v <= sync_block.view)
                 && self.engine.epoch_manager_mut().advance_epoch()
             {
                 self.epoch_sync_staged_view = None;

@@ -58,6 +58,11 @@ impl ConsensusEngine {
             &decide.validator_changes_hash,
         )?;
 
+        // Cache the committed block's changes hash so a late Proposal for the same
+        // block can still recover validator_changes after this Decide advances the view.
+        self.pending_changes_hashes
+            .insert(decide.block_hash, decide.validator_changes_hash);
+
         const SYNC_GAP_THRESHOLD: u64 = 3;
         if decide.view > current_view + SYNC_GAP_THRESHOLD {
             tracing::warn!(target: "n42::cl::decision",

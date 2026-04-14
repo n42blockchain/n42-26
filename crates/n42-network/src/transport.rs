@@ -53,6 +53,12 @@ pub struct TransportConfig {
     /// GossipSub outbound minimum D_out (default: 2).
     /// Must satisfy: D_out <= D/2 AND D_out < D_low.
     pub mesh_outbound_min: usize,
+    /// Number of top-scoring peers retained during mesh pruning.
+    ///
+    /// libp2p defaults this to 4, but that underflows in tiny meshes when the
+    /// network later grows (for example 3 validators expanding to 4 at runtime).
+    /// Keep it bounded by `mesh_d_high` so heartbeat pruning stays valid.
+    pub retain_scores: usize,
     /// Enable mDNS for automatic LAN peer discovery (dev/test only).
     pub enable_mdns: bool,
     /// Enable Kademlia DHT for WAN peer discovery (production).
@@ -77,6 +83,7 @@ impl TransportConfig {
         let mesh_outbound_min =
             2.min(mesh_d / 2)
                 .min(if mesh_d_low > 0 { mesh_d_low - 1 } else { 0 });
+        let retain_scores = 4.min(mesh_d_high.max(1));
 
         Self {
             heartbeat_interval: Duration::from_secs(1),
@@ -85,6 +92,7 @@ impl TransportConfig {
             mesh_d_low,
             mesh_d_high,
             mesh_outbound_min,
+            retain_scores,
             enable_mdns: false,
             enable_kademlia: false,
             // Scale connection limits with network size so that every validator
@@ -105,6 +113,7 @@ impl Default for TransportConfig {
             mesh_d_low: 6,
             mesh_d_high: 12,
             mesh_outbound_min: 2,
+            retain_scores: 4,
             enable_mdns: false,
             enable_kademlia: false,
             max_established_incoming: 128,
@@ -159,6 +168,7 @@ pub fn build_swarm_with_validator_index(
         .mesh_n_low(config.mesh_d_low)
         .mesh_n_high(config.mesh_d_high)
         .mesh_outbound_min(config.mesh_outbound_min)
+        .retain_scores(config.retain_scores)
         .message_id_fn(message_id_fn)
         .build()
         .map_err(|e| eyre::eyre!("gossipsub config error: {e}"))?;
@@ -376,6 +386,7 @@ mod tests {
         assert_eq!(config.mesh_d_low, 2);
         assert_eq!(config.mesh_d_high, 2);
         assert_eq!(config.mesh_outbound_min, 1);
+        assert_eq!(config.retain_scores, 2);
     }
 
     #[test]
@@ -385,6 +396,7 @@ mod tests {
         assert_eq!(config.mesh_d_low, 6);
         assert_eq!(config.mesh_d_high, 12);
         assert_eq!(config.mesh_outbound_min, 2);
+        assert_eq!(config.retain_scores, 4);
     }
 
     #[test]
@@ -394,6 +406,7 @@ mod tests {
         assert_eq!(config.mesh_d_low, 6);
         assert_eq!(config.mesh_d_high, 12);
         assert_eq!(config.mesh_outbound_min, 2);
+        assert_eq!(config.retain_scores, 4);
     }
 
     #[test]
@@ -403,6 +416,7 @@ mod tests {
         assert_eq!(config.mesh_d_low, 1);
         assert_eq!(config.mesh_d_high, 1);
         assert_eq!(config.mesh_outbound_min, 0);
+        assert_eq!(config.retain_scores, 1);
     }
 
     #[test]
@@ -417,6 +431,10 @@ mod tests {
             assert!(c.mesh_d_low <= c.mesh_d, "D_low > D for n={n}");
             assert!(c.mesh_d <= c.mesh_d_high, "D > D_high for n={n}");
             assert!(c.mesh_outbound_min <= c.mesh_d / 2, "D_out > D/2 for n={n}");
+            assert!(
+                c.retain_scores <= c.mesh_d_high,
+                "retain_scores > D_high for n={n}"
+            );
             assert!(
                 c.mesh_outbound_min < c.mesh_d_low || c.mesh_d_low == 0,
                 "D_out >= D_low for n={n}"
