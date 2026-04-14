@@ -366,7 +366,7 @@ if [[ -z "$NEW_BLS_PUBKEY" ]]; then
     mkdir -p "$tmp_datadir"
 
     # 启动一个快速退出的节点来导出公钥
-    # 我们用 N42_VALIDATOR_COUNT=1 + 新节点的 key，然后查询
+    # 用 N42_VALIDATOR_COUNT=NUM_AFTER 确保 validator set 包含新 validator 的密钥
     tmp_http_port=$((BASE_HTTP + 100))
     tmp_auth_port=$((BASE_AUTH + 100))
     tmp_p2p_port=$((BASE_P2P + 100))
@@ -376,7 +376,7 @@ if [[ -z "$NEW_BLS_PUBKEY" ]]; then
 
     RUST_LOG="error" \
     N42_VALIDATOR_KEY="${BLS_KEYS[$NEW_INDEX]}" \
-    N42_VALIDATOR_COUNT="1" \
+    N42_VALIDATOR_COUNT="$NUM_AFTER" \
     N42_DATA_DIR="$tmp_datadir" \
     N42_CONSENSUS_PORT="$tmp_consensus_port" \
     N42_STARHUB_PORT="$tmp_starhub_port" \
@@ -406,8 +406,8 @@ if [[ -z "$NEW_BLS_PUBKEY" ]]; then
             NEW_BLS_PUBKEY=$(echo "$tmp_vs" | python3 -c "
 import sys, json
 r = json.load(sys.stdin)
-# 单节点模式下只有一个 validator，它的公钥就是我们要的
-pk = r['result']['active'][0]['publicKey']
+# 取新 validator 的公钥（索引 $NEW_INDEX）
+pk = r['result']['active'][$NEW_INDEX]['publicKey']
 print(pk)
 ")
             break

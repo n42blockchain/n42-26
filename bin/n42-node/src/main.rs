@@ -544,12 +544,17 @@ fn main() {
                     // Dev mode with auto-generated validator set — index 0 is correct.
                     0
                 } else {
+                    // Joining validator: BLS key not in initial set.
+                    // Use val_count as provisional index so the libp2p identity
+                    // is unique and auto-connect port math stays correct.
+                    let provisional = startup_validator_set.len();
                     warn!(
                         target: "n42::cli",
-                        "this node's BLS public key not found in the current epoch validator set; \
-                         defaulting to observer mode (index 0, no block rewards)"
+                        provisional_index = provisional,
+                        "BLS key not in initial validator set — joining as provisional index {provisional}; \
+                         will update after epoch sync"
                     );
-                    0
+                    provisional
                 }
             });
 
@@ -557,11 +562,19 @@ fn main() {
             .get_address(my_index)
             .copied()
             .unwrap_or_else(|_| {
-                warn!(
-                    target: "n42::cli",
-                    "no fee recipient address found for validator index {my_index}, \
-                     block rewards will be sent to Address::ZERO"
-                );
+                if resolved_my_index.is_none() {
+                    info!(
+                        target: "n42::cli",
+                        "joining validator (provisional index {my_index}) — \
+                         fee recipient will be resolved after epoch sync"
+                    );
+                } else {
+                    warn!(
+                        target: "n42::cli",
+                        "no fee recipient address found for validator index {my_index}, \
+                         block rewards will be sent to Address::ZERO"
+                    );
+                }
                 Address::ZERO
             });
 
@@ -857,17 +870,24 @@ fn main() {
 
                 connect_trusted_peers(&net_handle);
 
-                // Auto-connect to higher-index validators only (i < j initiates the connection),
-                // avoiding duplicate connections. Port convention: base_port + validator_index.
+                // Normal mode: connect to higher-index only (i < j avoids duplicate connections).
+                // Joining mode (key not in initial set): connect to ALL existing validators
+                // since no existing node will initiate a connection to us.
                 let val_count = startup_validator_set.len() as u32;
                 if !env_bool("N42_NO_AUTO_CONNECT") && val_count > 1 {
                     let base_port = consensus_port.saturating_sub(my_index as u16);
+                    let connect_range = if resolved_my_index.is_none() {
+                        0..val_count
+                    } else {
+                        (my_index + 1)..val_count
+                    };
+                    let mode = if resolved_my_index.is_none() { "all (joining)" } else { "higher-index" };
                     info!(
                         target: "n42::cli",
-                        base_port, val_count, my_index,
-                        "auto-connecting to higher-index validators"
+                        base_port, val_count, my_index, mode,
+                        "auto-connecting to validators"
                     );
-                    for j in (my_index + 1)..val_count {
+                    for j in connect_range {
                         let peer_id = if let Some(peer_id) = expected_validator_peer_ids.get(&j) {
                             *peer_id
                         } else {
