@@ -355,22 +355,8 @@ fi
 NEW_ADDR=$(validator_address "$NEW_INDEX")
 info "新 validator 地址: $NEW_ADDR"
 
-# 用 Python 计算 BLS 公钥（需要 blst 库，如果没有则用备选方案）
-NEW_BLS_PUBKEY=$(python3 << PYEOF 2>/dev/null || echo "")
-try:
-    from blst import P1
-    key_bytes = bytes.fromhex("${BLS_KEYS[$NEW_INDEX]}")
-    sk = P1()
-    # blst doesn't directly give us what we need, fall back
-    raise ImportError("use fallback")
-except ImportError:
-    pass
-
-# Fallback: start a temporary n42-node with the new key, query its validator set
-# This won't work easily. Instead we use a different approach:
-# We can derive the pubkey by starting a single-node with the key and checking its set.
-print("")
-PYEOF
+# BLS 公钥通过临时节点导出（见下方 fallback 逻辑）
+NEW_BLS_PUBKEY=""
 
 # 如果无法直接计算 BLS 公钥，使用备选方案：
 # 启动临时单节点获取公钥

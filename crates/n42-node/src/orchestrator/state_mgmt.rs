@@ -2,7 +2,7 @@ use super::{BlockDataBroadcast, CommittedBlock, ConsensusOrchestrator};
 use crate::persistence::{self, ConsensusSnapshot};
 use alloy_primitives::B256;
 use metrics::counter;
-use n42_consensus::verify_commit_qc;
+use n42_consensus::{validator_changes_hash, verify_commit_qc};
 use n42_network::{BlockSyncResponse, MAX_BLOCKS_PER_SYNC_REQUEST, PeerId, SyncBlock};
 use n42_primitives::QuorumCertificate;
 use std::sync::LazyLock;
@@ -458,7 +458,8 @@ impl ConsensusOrchestrator {
             }
         };
 
-        if let Err(e) = verify_commit_qc(&sync_block.commit_qc, vs) {
+        let ch = validator_changes_hash(&sync_block.validator_changes);
+        if let Err(e) = verify_commit_qc(&sync_block.commit_qc, vs, &ch) {
             warn!(
                 target: "n42::cl::sync",
                 view = sync_block.view,

@@ -458,6 +458,24 @@ pub fn verify_tc(tc: &TimeoutCertificate, validator_set: &ValidatorSet) -> Conse
     )
 }
 
+/// Computes the `changes_hash` for a set of validator changes.
+///
+/// Returns `B256::ZERO` when there are no changes; otherwise returns
+/// `blake3(bincode::serialize(changes))`.  This is the value that must be
+/// passed to [`verify_commit_qc`] and [`commit_signing_message`].
+pub fn validator_changes_hash(
+    validator_changes: &Option<Vec<n42_primitives::consensus::ValidatorChange>>,
+) -> B256 {
+    match validator_changes {
+        Some(changes) if !changes.is_empty() => {
+            let encoded = bincode::serialize(changes)
+                .expect("ValidatorChange serialization cannot fail");
+            B256::from(*blake3::hash(&encoded).as_bytes())
+        }
+        _ => B256::ZERO,
+    }
+}
+
 /// Signing message for Round 1 votes: view (8 bytes LE) || block_hash (32 bytes).
 pub fn signing_message(view: ViewNumber, block_hash: &B256) -> [u8; 40] {
     let mut msg = [0u8; 40];

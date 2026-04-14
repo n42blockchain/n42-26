@@ -5,7 +5,7 @@ use alloy_primitives::B256;
 use alloy_rpc_types_engine::{ForkchoiceState, PayloadStatusEnum};
 use metrics::{counter, gauge};
 use n42_chainspec::ValidatorInfo;
-use n42_consensus::{ValidatorSet, verify_commit_qc};
+use n42_consensus::{ValidatorSet, validator_changes_hash, verify_commit_qc};
 use n42_network::{BlockSyncResponse, NetworkEvent, NetworkHandle, PeerId, SyncBlock};
 use n42_primitives::QuorumCertificate;
 use reth_ethereum_engine_primitives::EthEngineTypes;
@@ -92,7 +92,8 @@ fn verify_sync_block_qc_against_set(
         return true;
     };
 
-    if let Err(e) = verify_commit_qc(&sync_block.commit_qc, vs) {
+    let ch = validator_changes_hash(&sync_block.validator_changes);
+    if let Err(e) = verify_commit_qc(&sync_block.commit_qc, vs, &ch) {
         warn!(
             target: "n42::observer",
             view = sync_block.view,
@@ -720,6 +721,7 @@ mod tests {
         let signature = key.sign(&n42_consensus::protocol::quorum::commit_signing_message(
             view,
             &block_hash,
+            &alloy_primitives::B256::ZERO,
         ));
 
         (
