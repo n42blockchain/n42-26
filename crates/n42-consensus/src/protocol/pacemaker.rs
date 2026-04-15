@@ -122,13 +122,6 @@ impl Pacemaker {
         self.deadline.saturating_duration_since(Instant::now())
     }
 
-    /// Extends the current deadline by the given duration.
-    ///
-    /// Used at startup to allow extra time for GossipSub mesh formation
-    /// before the first proposal.
-    pub fn extend_deadline(&mut self, extra: Duration) {
-        self.deadline += extra;
-    }
 }
 
 #[cfg(test)]

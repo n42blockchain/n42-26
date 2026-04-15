@@ -725,8 +725,6 @@ impl ConsensusOrchestrator {
             "N42 consensus layer initialized"
         );
 
-        self.initialize_startup_schedule().await;
-
         // Set validator context for Rotor relay forwarding in network layer
         self.network
             .set_validator_context(self.engine.my_index(), self.engine.validator_count())
@@ -1008,33 +1006,6 @@ impl ConsensusOrchestrator {
 
         info!(target: "n42::cl::orchestrator", view = self.engine.current_view(), "orchestrator shutting down, persisting final state");
         self.save_shutdown_state();
-    }
-
-    async fn initialize_startup_schedule(&mut self) {
-        if !self.engine.is_current_leader() || self.beacon_engine.is_none() {
-            return;
-        }
-
-        let n = self.engine.validator_count() as u64;
-        let startup_delay_ms: u64 = std::env::var("N42_STARTUP_DELAY_MS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or_else(|| if n <= 1 { 0 } else { 5000 + n * 500 });
-
-        if startup_delay_ms > 0 {
-            let startup_delay = Duration::from_millis(startup_delay_ms);
-            info!(
-                target: "n42::cl::orchestrator",
-                delay_ms = startup_delay_ms,
-                validators = n,
-                "leader for view 1, waiting for GossipSub mesh formation"
-            );
-            self.next_build_at = Some(Instant::now() + startup_delay);
-            self.engine.pacemaker_mut().extend_deadline(startup_delay);
-        } else {
-            info!(target: "n42::cl::orchestrator", "this node is leader for view 1, triggering genesis payload build");
-            self.schedule_payload_build().await;
-        }
     }
 
     /// Records a pipeline timing entry for a block, with bounded map size.
