@@ -730,6 +730,13 @@ impl ConsensusOrchestrator {
             .set_validator_context(self.engine.my_index(), self.engine.validator_count())
             .await;
 
+        // If we are the leader for view 1 on a fresh genesis start, schedule the first
+        // block build immediately. No artificial delay — the pacemaker handles recovery
+        // if the network isn't ready yet.
+        if self.engine.is_current_leader() && self.engine.current_view() == 1 {
+            self.schedule_payload_build().await;
+        }
+
         loop {
             let timeout = self.engine.pacemaker().timeout_sleep();
             tokio::pin!(timeout);
@@ -924,7 +931,7 @@ impl ConsensusOrchestrator {
                     self.next_build_at = None;
 
                     if slot_ts.is_none() {
-                        // Retry or startup delay: verify we're still the leader before building.
+                        // Build retry: verify we're still the leader before building.
                         if !self.engine.is_current_leader() {
                             debug!(target: "n42::cl::orchestrator", "build timer fired but no longer leader, skipping");
                             continue;
@@ -934,13 +941,7 @@ impl ConsensusOrchestrator {
                             debug!(target: "n42::cl::orchestrator", view, "build timer fired but speculative build in progress, skipping");
                             continue;
                         }
-                        // Check if this is a startup delay or a retry.
-                        if view <= 1 {
-                            self.engine.pacemaker_mut().reset_for_view(view, 0);
-                            info!(target: "n42::cl::orchestrator", "startup delay completed, triggering first payload build");
-                        } else {
-                            info!(target: "n42::cl::orchestrator", view, "build retry timer fired, re-attempting payload build");
-                        }
+                        info!(target: "n42::cl::orchestrator", view, "build retry timer fired, re-attempting payload build");
                     } else {
                         info!(target: "n42::cl::orchestrator", slot_timestamp = ?slot_ts, "slot boundary reached, triggering payload build");
                     }
