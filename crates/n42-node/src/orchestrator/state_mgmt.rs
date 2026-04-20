@@ -420,19 +420,36 @@ impl ConsensusOrchestrator {
                 }
             }
 
-            // Advance epoch at the boundary immediately following this block.
+            // Advance epoch when we reach or pass the boundary following the staging view.
             //
             // IMPORTANT: only fire if the staging was recorded from THIS sync pass
             // (epoch_sync_staged_view is set and <= current block's view).  Without
             // this guard, a pre-existing `next_set` from live-consensus staging at a
             // LATER view would trigger a premature advance at an earlier boundary,
             // causing the epoch manager to diverge from the actual network state.
-            let next_view = sync_block.view.saturating_add(1);
-            if self.engine.epoch_manager().is_epoch_boundary(next_view)
-                && self.engine.epoch_manager().has_staged_next()
-                && self
-                    .epoch_sync_staged_view
-                    .is_some_and(|v| v <= sync_block.view)
+            //
+            // NOTE: we cannot use `is_epoch_boundary(sync_block.view + 1)` here
+            // because the epoch boundary view may be a *timeout view* — a view where
+            // the pacemaker timed out and no block was committed.  The live consensus
+            // path fires advance_epoch() via advance_to_view() for every view including
+            // timeout views, but the sync path only sees committed blocks.  If views
+            // 30–31 were both timeouts, no sync block satisfies view+1 == 31, so the
+            // epoch would never advance.  Instead we compute the next boundary view
+            // from the staging view and advance as soon as any committed block at or
+            // past that boundary is processed.
+            if self.engine.epoch_manager().has_staged_next()
+                && {
+                    let epoch_len = self.engine.epoch_manager().epoch_length().max(1);
+                    self.epoch_sync_staged_view.is_some_and(|sv| {
+                        // Boundaries are at views k*epoch_len+1 for k ≥ 1.
+                        // First boundary strictly after staging view sv:
+                        //   k = floor((sv - 1) / epoch_len) + 1
+                        //   boundary = k * epoch_len + 1
+                        let k = sv.saturating_sub(1) / epoch_len + 1;
+                        let next_boundary = k.saturating_mul(epoch_len).saturating_add(1);
+                        sv <= sync_block.view && sync_block.view >= next_boundary
+                    })
+                }
                 && self.engine.epoch_manager_mut().advance_epoch()
             {
                 self.epoch_sync_staged_view = None;

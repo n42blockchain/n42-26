@@ -1289,6 +1289,8 @@ impl ConsensusOrchestrator {
                         "failed to promote authenticated validator peer"
                     );
                 }
+                // Save the message view before process_event consumes it via *message.
+                let msg_view = message.view();
                 debug!(target: "n42::cl::orchestrator", msg_type, view = self.engine.current_view(), "processing consensus message");
                 match self
                     .engine
@@ -1313,17 +1315,23 @@ impl ConsensusOrchestrator {
                                     if reason.contains("bitmap length mismatch")
                             );
                             if is_bitmap_mismatch {
+                                let local_view = self.engine.current_view();
                                 warn!(
                                     target: "n42::cl::orchestrator",
-                                    current_view = self.engine.current_view(),
+                                    current_view = local_view,
+                                    msg_view,
                                     "epoch state divergence detected (bitmap mismatch) — triggering sync"
                                 );
-                                let local_view = self.engine.current_view();
-                                // Sync back one full epoch to ensure we capture the
-                                // validator-change block that we missed.
+                                // Sync from two epochs back up to the message's view so we
+                                // capture the validator-change block that caused the mismatch.
+                                // Using msg_view (not local_view) as the target is critical:
+                                // when local_view=0 and msg_view=45, initiate_sync(0,0) would
+                                // produce an invalid from_view=1 > to_view=0 request that the
+                                // peer rejects silently, leaving the node permanently stuck.
                                 let epoch_len = self.engine.epoch_manager().epoch_length().max(1);
                                 let from = local_view.saturating_sub(epoch_len * 2);
-                                self.initiate_sync(from, local_view);
+                                let target = msg_view.max(local_view);
+                                self.initiate_sync(from, target);
                             }
                         }
                     }
