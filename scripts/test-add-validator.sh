@@ -129,6 +129,29 @@ derive_bls_pubkey() {
     echo "$secret_hex"  # placeholder, will be resolved below
 }
 
+# Fetch block hash at a given decimal height from a node's HTTP RPC port.
+# Returns empty string on any error (node down, block not yet produced, timeout).
+block_hash_at() {
+    local port=$1 height=$2
+    local hex_h
+    hex_h=$(printf '0x%x' "$height")
+    python3 -c "
+import sys, json, urllib.request
+req = urllib.request.Request(
+    'http://127.0.0.1:${port}',
+    data=json.dumps({'jsonrpc':'2.0','method':'eth_getBlockByNumber',
+                     'params':['${hex_h}',False],'id':1}).encode(),
+    headers={'Content-Type':'application/json'}, method='POST')
+try:
+    with urllib.request.urlopen(req, timeout=5) as r:
+        obj = json.load(r)
+    result = obj.get('result') or {}
+    print(result.get('hash',''))
+except Exception:
+    print('')
+" 2>/dev/null || echo ""
+}
+
 # DevP2P key generation (matches testnet.sh)
 generate_p2p_key() {
     local idx=$1
@@ -685,14 +708,43 @@ for i in $(seq 0 $NEW_INDEX); do
     info "  v${i}: 高度 $h_dec"
 done
 
-# 检查高度差不超过 2
-min_h=${FINAL_HEIGHTS[0]}
-max_h=${FINAL_HEIGHTS[0]}
-for h in "${FINAL_HEIGHTS[@]}"; do
-    [[ $h -lt $min_h ]] && min_h=$h
-    [[ $h -gt $max_h ]] && max_h=$h
-done
-height_diff=$((max_h - min_h))
+# 检查高度差 + 区块哈希一致性
+# set +u/-u guards the whole block: bash version differences around
+# nounset + read/array interactions cannot abort the script here.
+set +u
+min_h=0
+max_h=0
+height_diff=0
+hash_ok=true
+ref_hash=""
+if [[ "${#FINAL_HEIGHTS[@]}" -gt 0 ]]; then
+    _stats=$(python3 -c "
+hs=list(map(int,'${FINAL_HEIGHTS[*]}'.split()))
+mn,mx=min(hs),max(hs)
+print(mn,mx,mx-mn)
+" 2>/dev/null) || _stats="0 0 0"
+    read -r min_h max_h height_diff <<< "${_stats:-0 0 0}" || true
+
+    if [[ "${min_h:-0}" -gt 0 ]]; then
+        log "验证区块哈希一致性（高度 $min_h）..."
+        for i in $(seq 0 "$NEW_INDEX"); do
+            port=$((BASE_HTTP + i))
+            bh=$(block_hash_at "$port" "$min_h")
+            if [[ -z "$bh" ]]; then
+                warn "  v${i}: 无法获取高度 $min_h 的区块哈希，跳过"
+                continue
+            fi
+            info "  v${i}: hash=${bh:0:20}..."
+            if [[ -z "$ref_hash" ]]; then
+                ref_hash="$bh"
+            elif [[ "$bh" != "$ref_hash" ]]; then
+                err "  v${i}: 分叉! hash=$bh 与参考 $ref_hash 不符"
+                hash_ok=false
+            fi
+        done
+    fi
+fi
+set -u
 
 # 验证新节点也看到了新的 validator set
 new_vs_resp=$(curl -s --max-time 5 \
@@ -707,10 +759,10 @@ echo "════════════════════════�
 
 PASS=true
 
-if [[ $height_diff -le 3 && $min_h -gt 0 ]]; then
-    echo -e "  ${GREEN}✓${NC} 高度一致性: 最大差距 ${height_diff} 块（${min_h} ~ ${max_h}）"
+if [[ ${height_diff:-0} -le 3 && ${min_h:-0} -gt 0 ]]; then
+    echo -e "  ${GREEN}✓${NC} 高度一致性: 最大差距 ${height_diff:-0} 块（${min_h:-0} ~ ${max_h:-0}）"
 else
-    echo -e "  ${RED}✗${NC} 高度不一致: 差距 ${height_diff} 块（${min_h} ~ ${max_h}）"
+    echo -e "  ${RED}✗${NC} 高度不一致: 差距 ${height_diff:-0} 块（${min_h:-0} ~ ${max_h:-0}）"
     PASS=false
 fi
 
@@ -721,10 +773,19 @@ else
     PASS=false
 fi
 
-if [[ $max_h -gt $activate_block ]]; then
-    echo -e "  ${GREEN}✓${NC} 新 validator set 激活后持续出块: $activate_block → $max_h"
+if [[ ${max_h:-0} -gt $activate_block ]]; then
+    echo -e "  ${GREEN}✓${NC} 新 validator set 激活后持续出块: $activate_block → ${max_h:-0}"
 else
     echo -e "  ${RED}✗${NC} 激活后未见新块"
+    PASS=false
+fi
+
+if [[ "${hash_ok:-true}" == true && -n "${ref_hash:-}" ]]; then
+    echo -e "  ${GREEN}✓${NC} 区块哈希一致性: 高度 ${min_h:-0} 全节点哈希一致（${ref_hash:0:20}...）"
+elif [[ "${hash_ok:-true}" == true && -z "${ref_hash:-}" ]]; then
+    echo -e "  ${YELLOW}~${NC} 区块哈希一致性: 无法验证（节点未响应）"
+else
+    echo -e "  ${RED}✗${NC} 区块哈希不一致: 检测到分叉！"
     PASS=false
 fi
 
