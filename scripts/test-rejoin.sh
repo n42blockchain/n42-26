@@ -135,6 +135,41 @@ wait_for_height() {
     return 1
 }
 
+# get_consensus_view PORT → integer view number, or -1 on error
+get_consensus_view() {
+    local raw; raw=$(rpc "$1" n42_consensusStatus '[]')
+    python3 -c "
+import json, sys
+try:
+    d = json.loads('''$raw''')
+    v = (d.get('result') or {}).get('latestCommittedView')
+    print(int(v) if v is not None else -1)
+except:
+    print(-1)
+" 2>/dev/null || echo -1
+}
+
+# check_view_height_ratio PORT HEIGHT LABEL
+# Warns when view/height > 2.0, errors (returns 1) when view >= height*3
+check_view_height_ratio() {
+    local port=$1 height=$2 label=$3
+    [[ "$height" -le 0 ]] && return 0
+    local view; view=$(get_consensus_view "$port")
+    if [[ "$view" -lt 0 ]]; then
+        info "  $label: view unavailable (RPC may be starting)"
+        return 0
+    fi
+    local ratio_x10; ratio_x10=$(( view * 10 / height ))
+    if [[ "$ratio_x10" -ge 30 ]]; then
+        err "  $label: view/height critical — view=$view height=$height ($(( ratio_x10 / 10 )).$(( ratio_x10 % 10 ))x >= 3.0x, excessive timeouts)"
+        return 1
+    elif [[ "$ratio_x10" -gt 20 ]]; then
+        warn "  $label: view/height elevated — view=$view height=$height ($(( ratio_x10 / 10 )).$(( ratio_x10 % 10 ))x > 2.0x)"
+    else
+        info "  $label: view=$view height=$height ratio=$(( ratio_x10 / 10 )).$(( ratio_x10 % 10 ))x  OK"
+    fi
+}
+
 # ── Key generation ─────────────────────────────────────────────────────
 bls_secret_hex() { printf '%056x%08x' 0 $(($1 + 1)); }
 
@@ -410,6 +445,14 @@ for h in "${FINAL_HEIGHTS[@]}"; do
 done
 height_skew=$(( max_h - min_h ))
 
+# View/height ratio check — catches excessive timeouts even when height advances
+log "Checking view/height ratios..."
+ratio_ok=true
+for i in $(seq 0 $((NUM_VALIDATORS - 1))); do
+    fh="${FINAL_HEIGHTS[$i]}"
+    check_view_height_ratio "$((BASE_HTTP + i))" "$fh" "v$i" || ratio_ok=false
+done
+
 # Block hash at the common minimum height — detects forks
 ref_hash=$(block_hash_at "$RPC" "$min_h")
 info "Reference hash at height $min_h: ${ref_hash:0:20}..."
@@ -471,6 +514,14 @@ if [[ "$hash_ok" == true && -n "$ref_hash" ]]; then
     echo -e "  ${GREEN}✓${NC} No fork: all nodes agree on hash at height $min_h"
 else
     echo -e "  ${RED}✗${NC} Fork detected — nodes disagree on block hash at height $min_h"
+    PASS=false
+fi
+
+# 6. View/height ratio?
+if [[ "$ratio_ok" == true ]]; then
+    echo -e "  ${GREEN}✓${NC} View/height ratio OK (no excessive timeouts)"
+else
+    echo -e "  ${RED}✗${NC} View/height ratio critical (>= 3.0x — too many timeouts)"
     PASS=false
 fi
 
