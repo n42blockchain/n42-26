@@ -96,8 +96,13 @@ alloy-network = { version = "1.8.2", default-features = false }
 alloy-rpc-types-eth = { version = "1.8.2", default-features = false }
 alloy-sol-types = { version = "1.5.6", default-features = false }
 
-# EVM
-alloy-evm = { version = "0.30.0", default-features = false }
+# EVM — aligned with `../reth/Cargo.toml` (local reth tracks upstream v1.11.3
+# with bumped alloy-evm 0.29.2 / revm 36 in its working tree). Stage 2 upgrade
+# to v2.2.0 / alloy-evm 0.34 / revm 38 is blocked by reth v2's Unix-only
+# `std::os::unix::fs::FileExt` use in changeset_offsets (Windows local build
+# fails; CI on ubuntu would pass). See docs/rfc/reth-v2-upgrade.md and the
+# stage2-*.patch files in repo root for the partial migration.
+alloy-evm = { version = "0.29.2", default-features = false }
 revm = { version = "36.0.0", default-features = false, features = ["std", "serde"] }
 
 # Testing

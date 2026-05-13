@@ -38,17 +38,20 @@ where
         }
     }
 
+    // We deliberately keep the `contains_key` + `insert` shape: in the miss
+    // case we must update `self.order` (eviction + push_back) before the
+    // `insert`, and re-borrowing the map via `Entry` would conflict with
+    // mutating `self.order`.
+    #[allow(clippy::map_entry)]
     pub(crate) fn insert(&mut self, key: K, value: V) {
-        if self.map.contains_key(&key) {
-            self.map.insert(key, value);
-            return;
+        if !self.map.contains_key(&key) {
+            if self.map.len() >= self.capacity
+                && let Some(oldest) = self.order.pop_front()
+            {
+                self.map.remove(&oldest);
+            }
+            self.order.push_back(key.clone());
         }
-        if self.map.len() >= self.capacity
-            && let Some(oldest) = self.order.pop_front()
-        {
-            self.map.remove(&oldest);
-        }
-        self.order.push_back(key.clone());
         self.map.insert(key, value);
     }
 

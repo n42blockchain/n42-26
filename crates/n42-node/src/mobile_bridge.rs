@@ -225,15 +225,15 @@ impl MobileVerificationBridge {
                                 connected = self.connected_sessions.len(),
                                 "mobile verifier connected"
                             );
-                            if let Some(ref tx) = self.phone_connected_tx {
-                                if let Err(error) = tx.send(session_id).await {
-                                    warn!(
-                                        target: "n42::mobile",
-                                        session_id,
-                                        error = %error,
-                                        "failed to deliver phone_connected notification"
-                                    );
-                                }
+                            if let Some(ref tx) = self.phone_connected_tx
+                                && let Err(error) = tx.send(session_id).await
+                            {
+                                warn!(
+                                    target: "n42::mobile",
+                                    session_id,
+                                    error = %error,
+                                    "failed to deliver phone_connected notification"
+                                );
                             }
                         }
                         HubEvent::PhoneDisconnected { session_id } => {

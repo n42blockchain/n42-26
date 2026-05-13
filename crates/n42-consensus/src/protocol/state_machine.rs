@@ -664,6 +664,18 @@ impl ConsensusEngine {
 
     /// Processes a consensus event and generates outputs.
     pub fn process_event(&mut self, event: ConsensusEvent) -> ConsensusResult<()> {
+        let kind = match &event {
+            ConsensusEvent::Message(_) => "message",
+            ConsensusEvent::BlockReady(..) => "block_ready",
+            ConsensusEvent::BlockImported(_) => "block_imported",
+        };
+        let _span = tracing::info_span!(
+            target: "n42.cl.consensus.event",
+            "process_event",
+            view = self.round_state.current_view(),
+            kind = kind,
+        )
+        .entered();
         match event {
             ConsensusEvent::Message(msg) => self.process_message(msg),
             ConsensusEvent::BlockReady(block_hash, tx_root_hash) => {

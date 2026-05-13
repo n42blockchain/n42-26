@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
-use tracing::{debug, error, info, warn};
+use tracing::{Instrument, debug, error, info, warn};
 
 /// Whether Compact Block (follower EVM skip) is enabled.
 /// Controlled by `N42_COMPACT_BLOCK` env var: "0" to disable, anything else or absent = enabled.
@@ -579,6 +579,12 @@ impl ConsensusOrchestrator {
             let leader_ready_unix_ms = broadcast.leader_ready_unix_ms;
             let eager_done_tx = self.eager_import_done_tx.clone();
             let block_guard = self.eager_import_block_guard.clone();
+            let eager_span = tracing::info_span!(
+                target: "n42.cl.exec_bridge.eager_import",
+                "follower_eager_import",
+                %hash,
+                view,
+            );
             tokio::spawn(async move {
                 let decompress_start = std::time::Instant::now();
                 let payload_json = match super::decompress_payload(&payload_compressed) {
@@ -688,6 +694,11 @@ impl ConsensusOrchestrator {
                             metrics::counter!("n42_compact_block_cache_hits").increment(1);
                         }
                         metrics::counter!("n42_follower_eager_import_hits_total").increment(1);
+                        metrics::counter!(
+                            "n42_eager_import_outcomes_total",
+                            "role" => "follower", "outcome" => "hit"
+                        )
+                        .increment(1);
                         if eager_done_tx.send((hash, block_ts)).await.is_err() {
                             debug!(target: "n42::cl::exec_bridge", %hash, view, "eager import completion receiver dropped");
                         }
@@ -697,15 +708,25 @@ impl ConsensusOrchestrator {
                         if compact_injected {
                             metrics::counter!("n42_compact_block_cache_misses").increment(1);
                         }
+                        metrics::counter!(
+                            "n42_eager_import_outcomes_total",
+                            "role" => "follower", "outcome" => "stale"
+                        )
+                        .increment(1);
                     }
                     Err(e) => {
                         debug!(target: "n42::cl::exec_bridge", %hash, view, error = %e, compact_injected, "follower eager import: failed");
                         if compact_injected {
                             metrics::counter!("n42_compact_block_cache_misses").increment(1);
                         }
+                        metrics::counter!(
+                            "n42_eager_import_outcomes_total",
+                            "role" => "follower", "outcome" => "error"
+                        )
+                        .increment(1);
                     }
                 }
-            });
+            }.instrument(eager_span));
         }
     }
 
@@ -1012,6 +1033,12 @@ impl ConsensusOrchestrator {
 /// eliminating the ~200ms pipeline stall from the background import path (Case B).
 /// If consensus is faster than import, Case B still works as a fallback.
 #[allow(clippy::too_many_arguments)]
+#[tracing::instrument(
+    target = "n42.cl.exec_bridge.leader_emit",
+    name = "leader_emit",
+    skip_all,
+    fields(view = current_view, hash = tracing::field::Empty, block_number = tracing::field::Empty)
+)]
 async fn handle_built_payload(
     payload: EthBuiltPayload,
     engine_handle: ConsensusEngineHandle<EthEngineTypes>,
@@ -1024,6 +1051,11 @@ async fn handle_built_payload(
     block_guard: Arc<std::sync::atomic::AtomicU64>,
 ) {
     let hash = payload.block().hash();
+    {
+        let span = tracing::Span::current();
+        span.record("hash", tracing::field::display(&hash));
+        span.record("block_number", payload.block().header().number);
+    }
 
     let execution_data =
         <EthEngineTypes as PayloadTypes>::block_to_payload(payload.block().clone());
@@ -1112,6 +1144,11 @@ async fn handle_built_payload(
             let np_elapsed = import_start.elapsed().as_millis() as u64;
             info!(target: "n42::cl::exec_bridge", %hash, np_elapsed, "eager import: new_payload accepted (no FCU)");
             metrics::counter!("n42_eager_import_hits_total").increment(1);
+            metrics::counter!(
+                "n42_eager_import_outcomes_total",
+                "role" => "leader", "outcome" => "hit"
+            )
+            .increment(1);
             if eager_import_done_tx
                 .send((hash, block_timestamp))
                 .await
@@ -1122,13 +1159,24 @@ async fn handle_built_payload(
         }
         Ok(status) => {
             info!(target: "n42::cl::exec_bridge", %hash, status = ?status.status, elapsed_ms = import_start.elapsed().as_millis() as u64, "eager import: new_payload not accepted");
+            metrics::counter!(
+                "n42_eager_import_outcomes_total",
+                "role" => "leader", "outcome" => "stale"
+            )
+            .increment(1);
         }
         Err(e) => {
             info!(target: "n42::cl::exec_bridge", %hash, error = %e, "eager import: new_payload failed");
+            metrics::counter!(
+                "n42_eager_import_outcomes_total",
+                "role" => "leader", "outcome" => "error"
+            )
+            .increment(1);
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn broadcast_block_data(
     network: &NetworkHandle,
     leader_payload_tx: &mpsc::Sender<(B256, Vec<u8>)>,
