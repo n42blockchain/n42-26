@@ -43,7 +43,8 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
             startup_delay_ms: None,
         };
 
-        let node = NodeProcess::start_with_env(&config, vec![("N42_OPEN_VERIFICATION", "1")]).await?;
+        let node =
+            NodeProcess::start_with_env(&config, vec![("N42_OPEN_VERIFICATION", "1")]).await?;
         info!(index = i, http_port = node.http_port, "solo node started");
         nodes.push(node);
         tmp_dirs.push(tmp_dir);

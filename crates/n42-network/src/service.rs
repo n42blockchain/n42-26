@@ -374,10 +374,12 @@ impl NetworkHandle {
 
     /// Updates the network layer's validator context for Rotor relay forwarding.
     pub async fn set_validator_context(&self, my_index: u32, validator_count: u32) {
-        let _ = self.command_tx.try_send(NetworkCommand::SetValidatorContext {
-            my_index,
-            validator_count,
-        });
+        let _ = self
+            .command_tx
+            .try_send(NetworkCommand::SetValidatorContext {
+                my_index,
+                validator_count,
+            });
     }
 
     fn send(&self, cmd: NetworkCommand) -> Result<(), NetworkError> {
@@ -1126,7 +1128,10 @@ impl NetworkService {
                     match decode_consensus_message(&request.message_bytes) {
                         Ok(msg) => {
                             // Check if we should relay this proposal to our assigned targets
-                            if let n42_primitives::consensus::ConsensusMessage::Proposal(ref proposal) = msg {
+                            if let n42_primitives::consensus::ConsensusMessage::Proposal(
+                                ref proposal,
+                            ) = msg
+                            {
                                 self.maybe_relay_proposal(proposal, &request.message_bytes, peer);
                             }
                             self.emit_event(NetworkEvent::ConsensusMessage {
@@ -1178,17 +1183,19 @@ impl NetworkService {
         raw_bytes: &[u8],
         source: libp2p::PeerId,
     ) {
-        let Some(my_index) = self.my_validator_index else { return };
+        let Some(my_index) = self.my_validator_index else {
+            return;
+        };
         if self.validator_count < 2 {
             return;
         }
 
         // Only relay messages that came directly from the leader
         let leader_peer = {
-            let map = self
-                .validator_peer_map
-                .read()
-                .unwrap_or_else(|e| { tracing::warn!("validator_peer_map poisoned, recovering"); e.into_inner() });
+            let map = self.validator_peer_map.read().unwrap_or_else(|e| {
+                tracing::warn!("validator_peer_map poisoned, recovering");
+                e.into_inner()
+            });
             map.get(&proposal.proposer).copied()
         };
         if leader_peer != Some(source) {
@@ -1214,10 +1221,10 @@ impl NetworkService {
 
         // Collect target peer IDs while holding the lock, then release before sending.
         let target_peers: Vec<libp2p::PeerId> = {
-            let map = self
-                .validator_peer_map
-                .read()
-                .unwrap_or_else(|e| { tracing::warn!("validator_peer_map poisoned, recovering"); e.into_inner() });
+            let map = self.validator_peer_map.read().unwrap_or_else(|e| {
+                tracing::warn!("validator_peer_map poisoned, recovering");
+                e.into_inner()
+            });
             targets
                 .iter()
                 .filter(|&&idx| idx != my_index)
@@ -1370,7 +1377,13 @@ impl NetworkService {
                             .swarm
                             .behaviour_mut()
                             .tx_forward
-                            .send_response(channel, TxForwardResponse { accepted: true, remaining_credit: None })
+                            .send_response(
+                                channel,
+                                TxForwardResponse {
+                                    accepted: true,
+                                    remaining_credit: None,
+                                },
+                            )
                             .is_err()
                         {
                             tracing::warn!(%peer, "failed to send tx forward ACK");
@@ -1381,7 +1394,13 @@ impl NetworkService {
                             .swarm
                             .behaviour_mut()
                             .tx_forward
-                            .send_response(channel, TxForwardResponse { accepted: false, remaining_credit: Some(0) })
+                            .send_response(
+                                channel,
+                                TxForwardResponse {
+                                    accepted: false,
+                                    remaining_credit: Some(0),
+                                },
+                            )
                             .is_err()
                         {
                             tracing::warn!(%peer, "failed to send tx forward rejection");

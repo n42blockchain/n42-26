@@ -768,7 +768,7 @@ mod tests {
         assert_eq!(normal.tier(), PhoneTier::Normal);
         assert_eq!(slow.tier(), PhoneTier::Slow);
 
-        let mut targets = vec![
+        let mut targets = [
             (2u64, PhoneTier::Slow),
             (1u64, PhoneTier::Fast),
             (3u64, PhoneTier::Normal),
@@ -788,7 +788,7 @@ mod tests {
         }
         let fast = Arc::new(MobileSession::new(2, [0u8; 48]));
 
-        let sessions = vec![(1u64, slow), (2u64, fast)];
+        let sessions = [(1u64, slow), (2u64, fast)];
         let sent_to: Vec<u64> = sessions
             .iter()
             .filter(|(_, sess)| sess.tier() != PhoneTier::Slow)

@@ -54,7 +54,9 @@ impl ValidatorSet {
         for (index, v) in validators.iter().enumerate() {
             v.bls_public_key
                 .validate()
-                .map_err(|_| ConsensusError::InvalidValidatorPubkey { index: index as u32 })?;
+                .map_err(|_| ConsensusError::InvalidValidatorPubkey {
+                    index: index as u32,
+                })?;
             entries.push(ValidatorEntry {
                 address: v.address,
                 public_key: v.bls_public_key.clone(),
@@ -200,7 +202,7 @@ mod tests {
 
     #[test]
     fn test_get_public_key() {
-        let items: Vec<_> = (0..4u8).map(|i| make_validator_info(i)).collect();
+        let items: Vec<_> = (0..4u8).map(make_validator_info).collect();
         let infos: Vec<_> = items.iter().map(|(_, info)| info.clone()).collect();
         let vs = ValidatorSet::new(&infos, 1);
 
@@ -250,7 +252,7 @@ mod tests {
 
     #[test]
     fn test_all_public_keys() {
-        let items: Vec<_> = (0..3u8).map(|i| make_validator_info(i)).collect();
+        let items: Vec<_> = (0..3u8).map(make_validator_info).collect();
         let infos: Vec<_> = items.iter().map(|(_, info)| info.clone()).collect();
         let vs = ValidatorSet::new(&infos, 0);
 
@@ -263,7 +265,7 @@ mod tests {
 
     #[test]
     fn test_index_of_public_key() {
-        let items: Vec<_> = (0..4u8).map(|i| make_validator_info(i)).collect();
+        let items: Vec<_> = (0..4u8).map(make_validator_info).collect();
         let infos: Vec<_> = items.iter().map(|(_, info)| info.clone()).collect();
         let vs = ValidatorSet::new(&infos, 1);
 
@@ -277,7 +279,7 @@ mod tests {
 
     #[test]
     fn test_public_keys_for_signers() {
-        let items: Vec<_> = (0..4u8).map(|i| make_validator_info(i)).collect();
+        let items: Vec<_> = (0..4u8).map(make_validator_info).collect();
         let infos: Vec<_> = items.iter().map(|(_, info)| info.clone()).collect();
         let vs = ValidatorSet::new(&infos, 1);
 

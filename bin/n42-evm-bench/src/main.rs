@@ -362,7 +362,7 @@ fn bench_parallel_transfers() {
         // Sequential: force sequential path with high threshold.
         // SAFETY: benchmark is single-threaded at this point.
         unsafe {
-            std::env::set_var("N42_PARALLEL_THRESHOLD", &format!("{}", num_txs + 1));
+            std::env::set_var("N42_PARALLEL_THRESHOLD", format!("{}", num_txs + 1));
         }
         let seq_start = Instant::now();
         let seq_result =

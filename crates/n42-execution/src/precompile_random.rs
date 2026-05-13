@@ -5,8 +5,8 @@
 //! - `0x01`: `getRandomInRange(max)` → `keccak256(prevrandao) % max` (32 bytes, 150 gas)
 //! - `0x02`: `getRandomWithSeed(seed)` → `keccak256(prevrandao || seed)` (32 bytes, 100 gas)
 
-use alloy_primitives::{keccak256, Bytes, B256, U256};
-use revm::precompile::{PrecompileError, PrecompileOutput, PrecompileResult};
+use alloy_primitives::{B256, Bytes, U256, keccak256};
+use revm::precompile::{PrecompileHalt, PrecompileOutput, PrecompileResult};
 use std::cell::Cell;
 
 thread_local! {
@@ -29,12 +29,28 @@ fn get_block_randomness() -> B256 {
 
 /// Adapter for revm precompile registration.
 /// Reads prevrandao from thread-local storage set by [`set_block_randomness()`].
-pub fn revm_precompile_fn(input: &[u8], gas_limit: u64) -> PrecompileResult {
+///
+/// The `reservoir` parameter (added in revm 38 / EIP-8037) tracks the remaining
+/// state-gas reservoir for this call; precompiles that do not touch state pass
+/// it through unchanged.
+pub fn revm_precompile_fn(input: &[u8], gas_limit: u64, reservoir: u64) -> PrecompileResult {
     let prevrandao = get_block_randomness();
     match execute_randomness(input, gas_limit, prevrandao) {
-        Ok(result) => Ok(PrecompileOutput::new(result.gas_used, Bytes::from(result.output))),
-        Err(PrecompileCallError::OutOfGas) => Err(PrecompileError::OutOfGas),
-        Err(e) => Err(PrecompileError::other(e.to_string())),
+        Ok(result) => Ok(PrecompileOutput::new(
+            result.gas_used,
+            Bytes::from(result.output),
+            reservoir,
+        )),
+        // revm 38 split fatal vs non-fatal: input-shape / out-of-gas issues
+        // become `PrecompileOutput::halt(...)` (non-fatal) instead of `Err`
+        // (which would abort the entire EVM transaction).
+        Err(PrecompileCallError::OutOfGas) => {
+            Ok(PrecompileOutput::halt(PrecompileHalt::OutOfGas, reservoir))
+        }
+        Err(e) => Ok(PrecompileOutput::halt(
+            PrecompileHalt::other(e.to_string()),
+            reservoir,
+        )),
     }
 }
 
@@ -178,9 +194,7 @@ mod tests {
         assert_eq!(result.output.len(), 32);
         assert_eq!(result.gas_used, GAS_RANDOM_RANGE);
 
-        let value = U256::from_be_bytes(
-            <[u8; 32]>::try_from(result.output.as_slice()).unwrap(),
-        );
+        let value = U256::from_be_bytes(<[u8; 32]>::try_from(result.output.as_slice()).unwrap());
         assert!(value < U256::from(max));
     }
 
@@ -209,7 +223,10 @@ mod tests {
 
         assert_eq!(ra.output.len(), 32);
         assert_eq!(ra.gas_used, GAS_RANDOM);
-        assert_ne!(ra.output, rb.output, "different seeds must produce different output");
+        assert_ne!(
+            ra.output, rb.output,
+            "different seeds must produce different output"
+        );
     }
 
     #[test]

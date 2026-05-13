@@ -47,6 +47,13 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
     Ok(())
 }
 
+fn startup_delay_ms(node_count: usize) -> Option<u64> {
+    // The 21-node profile starts validators sequentially. Give the initial
+    // leader enough time for the full validator set to become RPC-ready and
+    // form a mesh before view 1 begins.
+    (node_count > 10).then_some(35_000)
+}
+
 /// Tests multi-node consensus with comprehensive verification.
 ///
 /// Verifies:
@@ -107,7 +114,7 @@ async fn run_multi_node_test(
             trusted_peers,
             base_timeout_ms: None,
             max_timeout_ms: None,
-            startup_delay_ms: None,
+            startup_delay_ms: startup_delay_ms(node_count),
         };
 
         match NodeProcess::start(&config).await {

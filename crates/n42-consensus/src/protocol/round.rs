@@ -105,7 +105,10 @@ impl RoundState {
     /// Records that this node has voted in `view`. Must be called immediately
     /// after `may_vote_in()` returns `true` and before the vote is broadcast.
     pub fn record_vote(&mut self, view: ViewNumber) {
-        debug_assert!(view > self.last_voted_view, "record_vote called without may_vote_in guard");
+        debug_assert!(
+            view > self.last_voted_view,
+            "record_vote called without may_vote_in guard"
+        );
         self.last_voted_view = view;
     }
 

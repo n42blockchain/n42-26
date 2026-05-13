@@ -252,7 +252,9 @@ pub struct FileVoteLog {
 
 impl std::fmt::Debug for FileVoteLog {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("FileVoteLog").field("path", &self.path).finish()
+        f.debug_struct("FileVoteLog")
+            .field("path", &self.path)
+            .finish()
     }
 }
 
@@ -277,7 +279,10 @@ impl FileVoteLog {
             file.write_all(&0u64.to_le_bytes())?;
             file.sync_all()?;
         }
-        Ok(Self { path, file: Mutex::new(file) })
+        Ok(Self {
+            path,
+            file: Mutex::new(file),
+        })
     }
 }
 
@@ -448,8 +453,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("consensus_state.json");
 
-        let mut json_value: serde_json::Value =
-            serde_json::to_value(&genesis_snapshot(10)).unwrap();
+        let mut json_value: serde_json::Value = serde_json::to_value(genesis_snapshot(10)).unwrap();
         json_value.as_object_mut().unwrap().remove("version");
         std::fs::write(&path, serde_json::to_string_pretty(&json_value).unwrap()).unwrap();
 
@@ -561,10 +565,7 @@ mod tests {
         std::fs::write(&path, serde_json::to_string_pretty(&snapshot).unwrap()).unwrap();
 
         // Match bin/n42-node startup semantics: if snapshot loading fails, log and continue fresh.
-        let startup_snapshot = match load_consensus_state(&path) {
-            Ok(snap) => snap,
-            Err(_) => None,
-        };
+        let startup_snapshot = load_consensus_state(&path).unwrap_or_default();
         assert!(
             startup_snapshot.is_none(),
             "startup path should discard invalid snapshots and continue fresh"
@@ -666,7 +667,10 @@ mod tests {
 
         // v2 migration: no-version snapshots are discarded.
         let loaded = load_consensus_state(&path).unwrap();
-        assert!(loaded.is_none(), "legacy snapshot without version should be discarded");
+        assert!(
+            loaded.is_none(),
+            "legacy snapshot without version should be discarded"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

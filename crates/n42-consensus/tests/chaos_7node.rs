@@ -1,6 +1,14 @@
 //! 7-Node HotStuff-2 Chaos Integration Tests (Cases 5-8)
 //! Tests fault scenarios with precise message routing control.
 
+#![allow(
+    clippy::collapsible_if,
+    clippy::manual_range_contains,
+    clippy::needless_range_loop,
+    clippy::single_match,
+    clippy::unnecessary_cast
+)]
+
 use alloy_primitives::{Address, B256};
 use n42_chainspec::ValidatorInfo;
 use n42_consensus::error::ConsensusError;
@@ -447,7 +455,8 @@ impl ChaosHarness {
         };
 
         // Step 1: Leader proposes
-        let result = self.engines[leader].process_event(ConsensusEvent::BlockReady(block_hash, None));
+        let result =
+            self.engines[leader].process_event(ConsensusEvent::BlockReady(block_hash, None));
         check_result(result, &mut dup_vote_errors);
 
         let leader_outputs = self.drain_outputs(leader);
@@ -1342,8 +1351,7 @@ fn run_round_with_active_set(
     for &i in active {
         if i != leader {
             let _ = harness.engines[i].process_event(ConsensusEvent::Message(proposal.clone()));
-            let _ = harness.engines[i]
-                .process_event(ConsensusEvent::BlockImported(proposal_hash));
+            let _ = harness.engines[i].process_event(ConsensusEvent::BlockImported(proposal_hash));
         }
     }
 
@@ -1353,8 +1361,7 @@ fn run_round_with_active_set(
             for output in harness.drain_outputs(i) {
                 if let EngineOutput::SendToValidator(target, msg) = output {
                     if target == leader as u32 {
-                        let _ = harness.engines[leader]
-                            .process_event(ConsensusEvent::Message(msg));
+                        let _ = harness.engines[leader].process_event(ConsensusEvent::Message(msg));
                     }
                 }
             }
@@ -1381,8 +1388,7 @@ fn run_round_with_active_set(
     // Deliver PrepareQC to active non-leaders.
     for &i in active {
         if i != leader {
-            let _ = harness.engines[i]
-                .process_event(ConsensusEvent::Message(prepare_qc.clone()));
+            let _ = harness.engines[i].process_event(ConsensusEvent::Message(prepare_qc.clone()));
         }
     }
 
@@ -1392,8 +1398,7 @@ fn run_round_with_active_set(
             for output in harness.drain_outputs(i) {
                 if let EngineOutput::SendToValidator(target, msg) = output {
                     if target == leader as u32 {
-                        let _ = harness.engines[leader]
-                            .process_event(ConsensusEvent::Message(msg));
+                        let _ = harness.engines[leader].process_event(ConsensusEvent::Message(msg));
                     }
                 }
             }
@@ -1402,17 +1407,16 @@ fn run_round_with_active_set(
 
     // Check if BlockCommitted produced.
     let leader_outputs = harness.drain_outputs(leader);
-    let committed = leader_outputs.iter().any(|o| {
-        matches!(o, EngineOutput::BlockCommitted { .. })
-    });
+    let committed = leader_outputs
+        .iter()
+        .any(|o| matches!(o, EngineOutput::BlockCommitted { .. }));
 
     // Propagate Decide to active nodes.
     for output in &leader_outputs {
         if let EngineOutput::BroadcastMessage(msg @ ConsensusMessage::Decide(_)) = output {
             for &i in active {
                 if i != leader {
-                    let _ = harness.engines[i]
-                        .process_event(ConsensusEvent::Message(msg.clone()));
+                    let _ = harness.engines[i].process_event(ConsensusEvent::Message(msg.clone()));
                 }
             }
         }
@@ -1427,12 +1431,7 @@ fn run_round_with_active_set(
 fn test_7node_all_active_commits() {
     let mut h = ChaosHarness::new(7);
     let active: Vec<usize> = (0..7).collect();
-    let committed = run_round_with_active_set(
-        &mut h,
-        1,
-        B256::repeat_byte(0x01),
-        &active,
-    );
+    let committed = run_round_with_active_set(&mut h, 1, B256::repeat_byte(0x01), &active);
     assert!(committed, "7/7 active: should commit (quorum=5 of 7)");
     eprintln!("7/7 active: committed ✓");
 }
@@ -1443,12 +1442,7 @@ fn test_7node_6active_commits() {
     let mut h = ChaosHarness::new(7);
     // Drop node 6 (last validator).
     let active: Vec<usize> = (0..6).collect();
-    let committed = run_round_with_active_set(
-        &mut h,
-        1,
-        B256::repeat_byte(0x02),
-        &active,
-    );
+    let committed = run_round_with_active_set(&mut h, 1, B256::repeat_byte(0x02), &active);
     assert!(committed, "6/7 active: should commit (quorum=5 of 7)");
     eprintln!("6/7 active: committed ✓");
 }
@@ -1459,13 +1453,11 @@ fn test_7node_5active_commits_boundary() {
     let mut h = ChaosHarness::new(7);
     // Drop nodes 5 and 6.
     let active: Vec<usize> = (0..5).collect();
-    let committed = run_round_with_active_set(
-        &mut h,
-        1,
-        B256::repeat_byte(0x03),
-        &active,
+    let committed = run_round_with_active_set(&mut h, 1, B256::repeat_byte(0x03), &active);
+    assert!(
+        committed,
+        "5/7 active: should commit at boundary (quorum=5 of 7)"
     );
-    assert!(committed, "5/7 active: should commit at boundary (quorum=5 of 7)");
     eprintln!("5/7 active: committed ✓ (boundary)");
 }
 
@@ -1475,13 +1467,11 @@ fn test_7node_4active_stalls() {
     let mut h = ChaosHarness::new(7);
     // Drop nodes 4, 5, 6.
     let active: Vec<usize> = (0..4).collect();
-    let committed = run_round_with_active_set(
-        &mut h,
-        1,
-        B256::repeat_byte(0x04),
-        &active,
+    let committed = run_round_with_active_set(&mut h, 1, B256::repeat_byte(0x04), &active);
+    assert!(
+        !committed,
+        "4/7 active: should NOT commit (need 5, only 4 active)"
     );
-    assert!(!committed, "4/7 active: should NOT commit (need 5, only 4 active)");
     eprintln!("4/7 active: stalled ✓ (below quorum)");
 }
 
@@ -1490,13 +1480,11 @@ fn test_7node_4active_stalls() {
 fn test_7node_3active_stalls() {
     let mut h = ChaosHarness::new(7);
     let active: Vec<usize> = (0..3).collect();
-    let committed = run_round_with_active_set(
-        &mut h,
-        1,
-        B256::repeat_byte(0x05),
-        &active,
+    let committed = run_round_with_active_set(&mut h, 1, B256::repeat_byte(0x05), &active);
+    assert!(
+        !committed,
+        "3/7 active: should NOT commit (need 5, only 3 active)"
     );
-    assert!(!committed, "3/7 active: should NOT commit (need 5, only 3 active)");
     eprintln!("3/7 active: stalled ✓");
 }
 
@@ -1505,13 +1493,11 @@ fn test_7node_3active_stalls() {
 fn test_7node_1active_stalls() {
     let mut h = ChaosHarness::new(7);
     let active: Vec<usize> = vec![0];
-    let committed = run_round_with_active_set(
-        &mut h,
-        1,
-        B256::repeat_byte(0x06),
-        &active,
+    let committed = run_round_with_active_set(&mut h, 1, B256::repeat_byte(0x06), &active);
+    assert!(
+        !committed,
+        "1/7 active: should NOT commit (need 5, only 1 active)"
     );
-    assert!(!committed, "1/7 active: should NOT commit (need 5, only 1 active)");
     eprintln!("1/7 active: stalled ✓");
 }
 
@@ -1530,8 +1516,7 @@ fn test_7node_progressive_dropout() {
         let should_commit = active_count >= quorum;
 
         assert_eq!(
-            committed,
-            should_commit,
+            committed, should_commit,
             "{}/{} active: expected committed={}, got committed={}",
             active_count, 7, should_commit, committed
         );

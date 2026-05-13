@@ -260,7 +260,10 @@ where
             }
         };
 
-    let gas_used = result.gas_used();
+    // EIP-8037 split gas_used into tx_gas_used (execution) and state_gas_used.
+    // For N42 metrics + receipt totals we want the transaction-level gas, which
+    // matches the pre-EIP semantics of the deprecated `gas_used()`.
+    let gas_used = result.tx_gas_used();
     let success = result.is_success();
     let logs = result.into_logs();
 
@@ -362,7 +365,12 @@ fn build_output(
             logs: output.logs,
         });
 
-        merge_tx_state(&mut state_changes, tx_idx, output.account_writes, output.storage_writes);
+        merge_tx_state(
+            &mut state_changes,
+            tx_idx,
+            output.account_writes,
+            output.storage_writes,
+        );
     }
 
     Ok(ParallelExecutionOutput {
@@ -406,7 +414,12 @@ where
             logs: output.logs,
         });
 
-        merge_tx_state(&mut state_changes, tx_idx, output.account_writes, output.storage_writes);
+        merge_tx_state(
+            &mut state_changes,
+            tx_idx,
+            output.account_writes,
+            output.storage_writes,
+        );
     }
 
     Ok(ParallelExecutionOutput {

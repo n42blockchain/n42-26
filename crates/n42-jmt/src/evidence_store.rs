@@ -52,7 +52,9 @@ impl ConsensusEvidence {
         debug_assert!(
             self.packed_signers.len() >= signer_bytes,
             "packed_signers too short: {} < {} for signer_count {}",
-            self.packed_signers.len(), signer_bytes, self.signer_count,
+            self.packed_signers.len(),
+            signer_bytes,
+            self.signer_count,
         );
         let mobile_size = self.mobile.as_ref().map_or(0, |m| {
             debug_assert!(
@@ -203,7 +205,9 @@ impl EvidenceStore {
                 let root: [u8; 32] = bytes[bytes.len() - 32..].try_into().unwrap();
                 Ok(Some(root))
             }
-            Ok(Some(_)) => Err(eyre::eyre!("evidence block {block_number}: value too short for root")),
+            Ok(Some(_)) => Err(eyre::eyre!(
+                "evidence block {block_number}: value too short for root"
+            )),
             Ok(None) => Ok(None),
             Err(e) => Err(eyre::eyre!("evidence get_root block {block_number}: {e}")),
         }
@@ -220,7 +224,9 @@ impl EvidenceStore {
                     .map_err(|e| eyre::eyre!("evidence decode block {block_number}: {e}"))?;
                 Ok(Some(ev))
             }
-            Ok(Some(_)) => Err(eyre::eyre!("evidence block {block_number}: value too short")),
+            Ok(Some(_)) => Err(eyre::eyre!(
+                "evidence block {block_number}: value too short"
+            )),
             Ok(None) => Ok(None),
             Err(e) => Err(eyre::eyre!("evidence get block {block_number}: {e}")),
         }

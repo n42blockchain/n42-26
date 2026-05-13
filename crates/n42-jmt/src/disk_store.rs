@@ -13,7 +13,7 @@ use jmt::{KeyHash, OwnedValue, Version};
 use lru::LruCache;
 use parking_lot::Mutex;
 use reth_libmdbx::{
-    Database, DatabaseFlags, Environment, Geometry, Transaction, WriteFlags, RO, RW,
+    Database, DatabaseFlags, Environment, Geometry, RO, RW, Transaction, WriteFlags,
 };
 use std::num::NonZeroUsize;
 use std::path::Path;
@@ -239,7 +239,8 @@ impl DiskTreeStore {
             Ok(Some((found_key, found_val))) => {
                 // Exact match: same key_hash and exact version
                 if let Some((fk, fv)) = decode_value_key(&found_key)
-                    && fk.0 == key_hash.0 && fv == max_version
+                    && fk.0 == key_hash.0
+                    && fv == max_version
                 {
                     return Ok(decode_value_entry(&found_val));
                 }
@@ -263,7 +264,8 @@ impl DiskTreeStore {
         match cursor.prev::<Vec<u8>, Vec<u8>>() {
             Ok(Some((prev_key, prev_val))) => {
                 if let Some((pk, pv)) = decode_value_key(&prev_key)
-                    && pk.0 == key_hash.0 && pv <= max_version
+                    && pk.0 == key_hash.0
+                    && pv <= max_version
                 {
                     return Ok(decode_value_entry(&prev_val));
                 }
@@ -282,7 +284,8 @@ impl DiskTreeStore {
         match cursor.last::<Vec<u8>, Vec<u8>>() {
             Ok(Some((last_key, last_val))) => {
                 if let Some((lk, lv)) = decode_value_key(&last_key)
-                    && lk.0 == key_hash.0 && lv <= max_version
+                    && lk.0 == key_hash.0
+                    && lv <= max_version
                 {
                     return Ok(decode_value_entry(&last_val));
                 }
@@ -379,8 +382,7 @@ impl TreeWriter for DiskTreeStore {
             .begin_rw_txn()
             .map_err(|e| anyhow::anyhow!("rw txn: {e}"))?;
         self.write_batch_in_txn(&tx, node_batch)?;
-        tx.commit()
-            .map_err(|e| anyhow::anyhow!("commit: {e}"))?;
+        tx.commit().map_err(|e| anyhow::anyhow!("commit: {e}"))?;
         Ok(())
     }
 }
@@ -741,10 +743,7 @@ mod tests {
 
         let (_, batch) = tree
             .put_value_set(
-                vec![
-                    (k1, Some(b"a".to_vec())),
-                    (k2, Some(b"b".to_vec())),
-                ],
+                vec![(k1, Some(b"a".to_vec())), (k2, Some(b"b".to_vec()))],
                 0,
             )
             .unwrap();

@@ -811,14 +811,20 @@ impl N42ApiServer for N42RpcServer {
             p2p_peer_id: None,
         };
 
-        let admin_tx = self.consensus_state.admin_tx()
-            .ok_or_else(|| ErrorObjectOwned::owned(-32603, "admin channel not available", None::<()>))?;
+        let admin_tx = self.consensus_state.admin_tx().ok_or_else(|| {
+            ErrorObjectOwned::owned(-32603, "admin channel not available", None::<()>)
+        })?;
 
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         admin_tx
-            .send(crate::consensus_state::AdminCommand::AddValidator { info, reply: reply_tx })
+            .send(crate::consensus_state::AdminCommand::AddValidator {
+                info,
+                reply: reply_tx,
+            })
             .await
-            .map_err(|_| ErrorObjectOwned::owned(-32603, "consensus loop unavailable", None::<()>))?;
+            .map_err(|_| {
+                ErrorObjectOwned::owned(-32603, "consensus loop unavailable", None::<()>)
+            })?;
 
         reply_rx.await
             .map_err(|_| ErrorObjectOwned::owned(-32603, "consensus loop dropped reply", None::<()>))?
@@ -832,14 +838,20 @@ impl N42ApiServer for N42RpcServer {
         address: Address,
     ) -> RpcResult<String> {
         self.verify_admin_token(&admin_token)?;
-        let admin_tx = self.consensus_state.admin_tx()
-            .ok_or_else(|| ErrorObjectOwned::owned(-32603, "admin channel not available", None::<()>))?;
+        let admin_tx = self.consensus_state.admin_tx().ok_or_else(|| {
+            ErrorObjectOwned::owned(-32603, "admin channel not available", None::<()>)
+        })?;
 
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         admin_tx
-            .send(crate::consensus_state::AdminCommand::RemoveValidator { address, reply: reply_tx })
+            .send(crate::consensus_state::AdminCommand::RemoveValidator {
+                address,
+                reply: reply_tx,
+            })
             .await
-            .map_err(|_| ErrorObjectOwned::owned(-32603, "consensus loop unavailable", None::<()>))?;
+            .map_err(|_| {
+                ErrorObjectOwned::owned(-32603, "consensus loop unavailable", None::<()>)
+            })?;
 
         reply_rx.await
             .map_err(|_| ErrorObjectOwned::owned(-32603, "consensus loop dropped reply", None::<()>))?

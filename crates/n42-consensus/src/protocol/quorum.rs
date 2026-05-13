@@ -468,8 +468,8 @@ pub fn validator_changes_hash(
 ) -> B256 {
     match validator_changes {
         Some(changes) if !changes.is_empty() => {
-            let encoded = bincode::serialize(changes)
-                .expect("ValidatorChange serialization cannot fail");
+            let encoded =
+                bincode::serialize(changes).expect("ValidatorChange serialization cannot fail");
             B256::from(*blake3::hash(&encoded).as_bytes())
         }
         _ => B256::ZERO,
@@ -500,7 +500,8 @@ pub fn proposal_signing_message(
     msg[8..40].copy_from_slice(block_hash.as_slice());
     let changes_hash = match validator_changes {
         Some(changes) if !changes.is_empty() => {
-            let encoded = bincode::serialize(changes).expect("ValidatorChange serialization cannot fail");
+            let encoded =
+                bincode::serialize(changes).expect("ValidatorChange serialization cannot fail");
             *blake3::hash(&encoded).as_bytes()
         }
         _ => [0u8; 32],
@@ -917,7 +918,8 @@ mod tests {
         }
         let commit_qc = collector.build_qc_with_message(&vs, &msg).unwrap();
 
-        verify_commit_qc(&commit_qc, &vs, &alloy_primitives::B256::ZERO).expect("verify_commit_qc should succeed");
+        verify_commit_qc(&commit_qc, &vs, &alloy_primitives::B256::ZERO)
+            .expect("verify_commit_qc should succeed");
     }
 
     #[test]

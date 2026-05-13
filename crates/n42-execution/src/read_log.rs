@@ -1035,7 +1035,7 @@ mod tests {
         assert!(none.is_none());
 
         // storage() should be logged
-        let _val = logged_db.storage(addr, U256::ZERO.into()).unwrap();
+        let _val = logged_db.storage(addr, U256::ZERO).unwrap();
 
         // block_hash() should be logged
         let _hash = logged_db.block_hash(0).unwrap();

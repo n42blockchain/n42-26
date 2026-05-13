@@ -550,8 +550,7 @@ impl ConsensusOrchestrator {
         let finalized = match engine_handle.fork_choice_updated(fcu_state, None).await {
             Ok(result) => {
                 let elapsed_ms = fcu_start.elapsed().as_millis() as u64;
-                histogram!("n42_fcu_latency_ms", "attempt" => "first")
-                    .record(elapsed_ms as f64);
+                histogram!("n42_fcu_latency_ms", "attempt" => "first").record(elapsed_ms as f64);
                 info!(target: "n42::cl::consensus_loop", view, %block_hash, status = ?result.payload_status.status, elapsed_ms, "N42_FCU: finalize fcu");
                 matches!(
                     result.payload_status.status,

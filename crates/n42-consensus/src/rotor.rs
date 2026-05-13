@@ -54,7 +54,8 @@ pub fn compute_relay_assignment(
             hasher.update((i as u64).to_le_bytes());
             hasher.finalize().into()
         };
-        let j = u64::from_le_bytes(pos_hash[..8].try_into().expect("SHA256 always 32 bytes")) % (i as u64 + 1);
+        let j = u64::from_le_bytes(pos_hash[..8].try_into().expect("SHA256 always 32 bytes"))
+            % (i as u64 + 1);
         candidates.swap(i, j as usize);
     }
 
@@ -92,8 +93,8 @@ pub fn cached_relay_assignment(
     leader: u32,
     relay_count: usize,
 ) -> RelayAssignment {
-    use std::sync::Mutex;
     use std::collections::VecDeque;
+    use std::sync::Mutex;
 
     type CacheEntry = (u64, u32, u32, usize, RelayAssignment);
     static CACHE: Mutex<Option<VecDeque<CacheEntry>>> = Mutex::new(None);
@@ -112,7 +113,13 @@ pub fn cached_relay_assignment(
     if cache.len() >= MAX_CACHE {
         cache.pop_front();
     }
-    cache.push_back((view, validator_count, leader, relay_count, assignment.clone()));
+    cache.push_back((
+        view,
+        validator_count,
+        leader,
+        relay_count,
+        assignment.clone(),
+    ));
     assignment
 }
 

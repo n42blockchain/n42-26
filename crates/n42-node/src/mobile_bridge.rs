@@ -354,7 +354,10 @@ impl MobileVerificationBridge {
                 counter!("n42_mobile_aggregate_attestations_total").increment(1);
 
                 let reward_pubkeys = if let Some(ref store) = self.attestation_store {
-                    let s = store.lock().unwrap_or_else(|e| { tracing::warn!("attestation_store mutex poisoned, recovering"); e.into_inner() });
+                    let s = store.lock().unwrap_or_else(|e| {
+                        tracing::warn!("attestation_store mutex poisoned, recovering");
+                        e.into_inner()
+                    });
                     let mut reward_pubkeys = Vec::new();
                     for (byte_idx, &byte) in attestation.participant_bitfield.iter().enumerate() {
                         for bit in 0..8u32 {
@@ -372,7 +375,10 @@ impl MobileVerificationBridge {
                 };
 
                 if let Some(ref store) = self.attestation_store {
-                    let mut s = store.lock().unwrap_or_else(|e| { tracing::warn!("attestation_store mutex poisoned, recovering"); e.into_inner() });
+                    let mut s = store.lock().unwrap_or_else(|e| {
+                        tracing::warn!("attestation_store mutex poisoned, recovering");
+                        e.into_inner()
+                    });
                     s.record_attestation(&attestation);
                     if let Err(e) = s.save() {
                         warn!(
@@ -493,7 +499,10 @@ impl MobileVerificationBridge {
 
         // Feed valid receipts into the BLS attestation builder.
         if is_valid && let Some(ref store) = self.attestation_store {
-            let store_guard = store.lock().unwrap_or_else(|e| { tracing::warn!("attestation_store mutex poisoned, recovering"); e.into_inner() });
+            let store_guard = store.lock().unwrap_or_else(|e| {
+                tracing::warn!("attestation_store mutex poisoned, recovering");
+                e.into_inner()
+            });
             if let Some(builder) = self.attestation_builders.get_mut(&receipt.block_hash) {
                 builder.add_receipt(receipt, store_guard.registry());
             }

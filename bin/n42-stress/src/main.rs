@@ -1056,7 +1056,6 @@ fn presign_all(
             .iter()
             .enumerate()
             .map(|(acct_idx, account)| {
-                let targets = targets;
                 s.spawn(move || {
                     let count = txs_per_account + if acct_idx < remainder { 1 } else { 0 };
                     if count == 0 {
@@ -1151,6 +1150,8 @@ const FILE_VERSION: u8 = 2;
 
 /// Raw EIP-2718 encoded transaction bytes paired with 20-byte sender address.
 type RawTxWithSender = (Vec<u8>, [u8; 20]);
+type RawTxWithAddress = (Vec<u8>, Address);
+type PerAccountRawTxResults = Vec<(usize, Vec<RawTxWithAddress>)>;
 
 /// Pre-sign transactions and save to binary file (raw RLP, not hex).
 fn presign_and_save(
@@ -1178,12 +1179,11 @@ fn presign_and_save(
     let start = Instant::now();
 
     // Parallel signing — returns raw RLP bytes (not hex) grouped by rpc_idx
-    let per_account_results: Vec<(usize, Vec<(Vec<u8>, Address)>)> = std::thread::scope(|s| {
+    let per_account_results: PerAccountRawTxResults = std::thread::scope(|s| {
         let handles: Vec<_> = accounts
             .iter()
             .enumerate()
             .map(|(acct_idx, account)| {
-                let targets = targets;
                 s.spawn(move || {
                     let count = txs_per_account + if acct_idx < remainder { 1 } else { 0 };
                     if count == 0 {
@@ -2478,6 +2478,7 @@ async fn run_presign_send(
 
 /// Wave mode: submit exactly `wave_cap` txs, wait for new block, repeat.
 /// Keeps pool_pending ≈ cap, preventing pool overload and ensuring fast builds.
+#[allow(clippy::too_many_arguments)]
 async fn run_wave_mode(
     presigned: Vec<Vec<String>>,
     rpc_urls: &[String],
@@ -2574,11 +2575,11 @@ async fn run_wave_mode(
         let wait_start = Instant::now();
         loop {
             tokio::time::sleep(Duration::from_millis(10)).await;
-            if let Ok(bn) = get_block_number(client, &rpc_urls[0]).await {
-                if bn > last_block {
-                    last_block = bn;
-                    break;
-                }
+            if let Ok(bn) = get_block_number(client, &rpc_urls[0]).await
+                && bn > last_block
+            {
+                last_block = bn;
+                break;
             }
             if wait_start.elapsed() > Duration::from_secs(30) {
                 tracing::warn!("wave timeout waiting for new block");
@@ -3321,15 +3322,15 @@ async fn main() -> Result<()> {
                 tracing::warn!("Pool drain timeout (120s)");
                 break;
             }
-            if let Ok((pending, _)) = get_txpool_status(&client, &rpc_urls[0]).await {
-                if pending < 500 {
-                    tracing::info!(
-                        pending,
-                        drain_ms = drain_start.elapsed().as_millis(),
-                        "Pool drained"
-                    );
-                    break;
-                }
+            if let Ok((pending, _)) = get_txpool_status(&client, &rpc_urls[0]).await
+                && pending < 500
+            {
+                tracing::info!(
+                    pending,
+                    drain_ms = drain_start.elapsed().as_millis(),
+                    "Pool drained"
+                );
+                break;
             }
             tokio::time::sleep(Duration::from_secs(2)).await;
         }

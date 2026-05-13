@@ -1,6 +1,12 @@
 //! Performance benchmark for N42 consensus + mobile verification.
 //! Measures wall-clock time for each component to determine minimum block interval.
 
+#![allow(
+    clippy::collapsible_if,
+    clippy::needless_range_loop,
+    clippy::unnecessary_cast
+)]
+
 use alloy_primitives::{Address, B256};
 use n42_chainspec::ValidatorInfo;
 use n42_consensus::protocol::VoteCollector;

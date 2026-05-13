@@ -1,3 +1,12 @@
+#![cfg_attr(
+    test,
+    allow(
+        clippy::collapsible_if,
+        clippy::needless_range_loop,
+        clippy::unnecessary_literal_unwrap
+    )
+)]
+
 mod adapter;
 pub mod error;
 pub mod extra_data;

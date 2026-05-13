@@ -493,7 +493,7 @@ mod tests {
 
     #[test]
     fn packed_bits_roundtrip_bincode() {
-        let mut bv = bitvec![u8, Msb0; 1, 0, 1, 1, 0, 0, 1];
+        let bv = bitvec![u8, Msb0; 1, 0, 1, 1, 0, 0, 1];
         let qc = QuorumCertificate {
             view: 1,
             block_hash: B256::ZERO,
@@ -559,15 +559,15 @@ mod tests {
     fn packed_bits_rejects_length_mismatch() {
         // Craft a (bit_count=100, raw_bytes=[0u8; 5]) — needs 13 bytes, has 5
         let bad: (u16, Vec<u8>) = (100, vec![0u8; 5]);
-        let bad_bytes = bincode::serialize(&bad).unwrap();
+        let _bad_bytes = bincode::serialize(&bad).unwrap();
         // Wrap in a QC-like structure: prepend view(8) + hash(32) + sig (bincode bytes)
         // Easier: just test packed_bits directly via QC deserialization
         // Actually, construct the full bincode manually is complex.
         // Instead test that a short raw_bytes is rejected via serde_json:
-        let json = r#"{"view":1,"block_hash":"0x0000000000000000000000000000000000000000000000000000000000000000","aggregate_signature":"placeholder","signers":[100,[0,0,0,0,0]]}"#;
+        let _json = r#"{"view":1,"block_hash":"0x0000000000000000000000000000000000000000000000000000000000000000","aggregate_signature":"placeholder","signers":[100,[0,0,0,0,0]]}"#;
         // This won't parse cleanly because aggregate_signature isn't valid.
         // Use a simpler approach: serialize a valid QC, tamper with the signers field.
-        let mut bv = bitvec![u8, Msb0; 1, 0, 1];
+        let bv = bitvec![u8, Msb0; 1, 0, 1];
         let qc = QuorumCertificate {
             view: 1,
             block_hash: B256::ZERO,
@@ -578,7 +578,10 @@ mod tests {
         // Tamper signers: set bit_count to 100 but keep 1 byte of data
         json_val["signers"] = serde_json::json!([100, [0xA0]]);
         let result: Result<QuorumCertificate, _> = serde_json::from_value(json_val);
-        assert!(result.is_err(), "should reject bit_count > raw_bytes capacity");
+        assert!(
+            result.is_err(),
+            "should reject bit_count > raw_bytes capacity"
+        );
     }
 
     // ── ValidatorChange tests ──────────────────────────────────────
@@ -600,7 +603,11 @@ mod tests {
         let decoded: Vec<ValidatorChange> = bincode::deserialize(&encoded).unwrap();
         assert_eq!(decoded.len(), 2);
         match &decoded[0] {
-            ValidatorChange::Add { address, p2p_peer_id, .. } => {
+            ValidatorChange::Add {
+                address,
+                p2p_peer_id,
+                ..
+            } => {
                 assert_eq!(*address, Address::repeat_byte(0x01));
                 assert_eq!(p2p_peer_id.as_deref(), Some("12D3KooW..."));
             }
@@ -618,7 +625,6 @@ mod tests {
 
     #[test]
     fn decide_changes_hash_serde_roundtrip() {
-        let sig = dummy_signature();
         let genesis_qc = QuorumCertificate::genesis();
         let decide = Decide {
             view: 42,
@@ -634,7 +640,6 @@ mod tests {
     #[test]
     fn decide_changes_hash_defaults_to_zero() {
         // Simulate old Decide without validator_changes_hash (backward compat)
-        let sig = dummy_signature();
         let genesis_qc = QuorumCertificate::genesis();
         let old_decide = serde_json::json!({
             "view": 42,
