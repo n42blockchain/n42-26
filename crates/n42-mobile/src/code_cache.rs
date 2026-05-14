@@ -100,7 +100,7 @@ impl HotContractTracker {
     /// Returns the top-N hottest contracts by access count.
     pub fn top_contracts(&self, n: usize) -> Vec<(B256, u64)> {
         let mut sorted: Vec<_> = self.access_counts.iter().map(|(k, v)| (*k, *v)).collect();
-        sorted.sort_by(|a, b| b.1.cmp(&a.1));
+        sorted.sort_by_key(|b| std::cmp::Reverse(b.1));
         sorted.truncate(n);
         sorted
     }

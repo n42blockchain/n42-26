@@ -2738,7 +2738,7 @@ fn spawn_reporter(
                 effective_tps = format!("{:.1}", sent as f64 / elapsed.max(1.0)),
                 block,
                 blocks,
-                avg_tx_per_block = if blocks > 0 { sent / blocks } else { 0 },
+                avg_tx_per_block = sent.checked_div(blocks).unwrap_or(0),
                 rpc_lat_ms = format!("{:.1}", stats.avg_rpc_latency_ms()),
                 sign_us = format!("{:.1}", stats.avg_sign_us()),
                 pool_pending = pool.0,
