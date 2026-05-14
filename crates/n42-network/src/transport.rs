@@ -74,12 +74,32 @@ impl TransportConfig {
     /// Standard params (D=8, D_low=6, D_high=12, D_out=2) apply when there are
     /// enough peers. For small networks (< 8 nodes), parameters are scaled down
     /// so the mesh can form without continuous "Mesh low" warnings.
+    ///
+    /// Mesh degree may be overridden at runtime via environment variables for
+    /// Phase 1 (leader direct push) deployments where block data no longer flows
+    /// through GossipSub — operators can collapse the mesh to reduce duplicate
+    /// gossip overhead:
+    ///
+    ///   - `N42_GOSSIP_MESH_D`      (target degree)
+    ///   - `N42_GOSSIP_MESH_D_LOW`  (low watermark)
+    ///   - `N42_GOSSIP_MESH_D_HIGH` (high watermark)
+    ///
+    /// Overrides are clamped to `[0, max_peers]` and validated so `D_out <= D/2`
+    /// and `D_out < D_low` (libp2p invariants); invalid overrides fall back to
+    /// the size-scaled defaults.
     pub fn for_network_size(node_count: usize) -> Self {
         let max_peers = if node_count > 1 { node_count - 1 } else { 1 };
 
-        let mesh_d = 8.min(max_peers);
-        let mesh_d_low = 6.min(max_peers);
-        let mesh_d_high = 12.min(max_peers).max(mesh_d);
+        let default_d = 8.min(max_peers);
+        let default_d_low = 6.min(max_peers);
+        let default_d_high = 12.min(max_peers).max(default_d);
+
+        let mesh_d = env_mesh_override("N42_GOSSIP_MESH_D", max_peers).unwrap_or(default_d);
+        let mesh_d_low =
+            env_mesh_override("N42_GOSSIP_MESH_D_LOW", max_peers).unwrap_or(default_d_low);
+        let mesh_d_high = env_mesh_override("N42_GOSSIP_MESH_D_HIGH", max_peers)
+            .unwrap_or(default_d_high)
+            .max(mesh_d);
         let mesh_outbound_min =
             2.min(mesh_d / 2)
                 .min(if mesh_d_low > 0 { mesh_d_low - 1 } else { 0 });
@@ -102,6 +122,14 @@ impl TransportConfig {
             max_established_total: 192u32.max((max_peers as u32 + 16) * 2),
         }
     }
+}
+
+/// Reads a positive integer mesh parameter from the environment, clamped to
+/// `[0, max_peers]`. Returns `None` if the env var is unset or unparseable.
+fn env_mesh_override(name: &str, max_peers: usize) -> Option<usize> {
+    let raw = std::env::var(name).ok()?;
+    let parsed: usize = raw.parse().ok()?;
+    Some(parsed.min(max_peers))
 }
 
 impl Default for TransportConfig {

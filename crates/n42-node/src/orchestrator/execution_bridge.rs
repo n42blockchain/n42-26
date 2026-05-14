@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
-use tracing::{debug, error, info, warn};
+use tracing::{Instrument, debug, error, info, warn};
 
 /// Whether Compact Block (follower EVM skip) is enabled.
 /// Controlled by `N42_COMPACT_BLOCK` env var: "0" to disable, anything else or absent = enabled.
@@ -54,7 +54,10 @@ fn elapsed_since_unix_ms(start_ms: u64) -> Option<u64> {
 fn observe_compact_inject_attempt(hash: B256, source: &'static str) -> Option<u64> {
     static TRACKER: std::sync::OnceLock<Mutex<CompactInjectTracker>> = std::sync::OnceLock::new();
     let tracker = TRACKER.get_or_init(|| Mutex::new(CompactInjectTracker::default()));
-    let mut tracker = tracker.lock().unwrap_or_else(|e| { tracing::warn!("compact_inject_tracker mutex poisoned, recovering"); e.into_inner() });
+    let mut tracker = tracker.lock().unwrap_or_else(|e| {
+        tracing::warn!("compact_inject_tracker mutex poisoned, recovering");
+        e.into_inner()
+    });
 
     if let Some(seen) = tracker.counts.get_mut(&hash) {
         *seen += 1;
@@ -222,7 +225,10 @@ impl ConsensusOrchestrator {
         // 1. Pre-fetch staked BLS pubkeys (lock StakingManager, then release).
         //    This avoids holding both locks simultaneously and prevents deadlocks.
         let staked_pubkeys = if let Some(ref staking_mgr) = self.staking_manager {
-            let mgr = staking_mgr.lock().unwrap_or_else(|e| { tracing::warn!("staking_mgr mutex poisoned, recovering"); e.into_inner() });
+            let mgr = staking_mgr.lock().unwrap_or_else(|e| {
+                tracing::warn!("staking_mgr mutex poisoned, recovering");
+                e.into_inner()
+            });
             mgr.staked_bls_pubkeys()
         } else {
             std::collections::HashSet::new()
@@ -250,7 +256,10 @@ impl ConsensusOrchestrator {
         // 3. Staking integration: resolve reward addresses and add cooldown returns.
         //    Re-acquire StakingManager lock for address resolution and cooldown checks.
         if let Some(ref staking_mgr) = self.staking_manager {
-            let mut staking = staking_mgr.lock().unwrap_or_else(|e| { tracing::warn!("staking_mgr mutex poisoned, recovering"); e.into_inner() });
+            let mut staking = staking_mgr.lock().unwrap_or_else(|e| {
+                tracing::warn!("staking_mgr mutex poisoned, recovering");
+                e.into_inner()
+            });
 
             // Reward address resolution: BLS-derived keccak → staker's actual EVM address.
             for w in &mut withdrawals {
@@ -283,6 +292,7 @@ impl ConsensusOrchestrator {
             // this value, producing identical state on leader and followers.
             // None is invalid for Cancun — reth rejects attributes without it.
             parent_beacon_block_root: Some(B256::ZERO),
+            slot_number: None,
         }
     }
 
@@ -353,10 +363,7 @@ impl ConsensusOrchestrator {
             let used_ts = try_attrs.timestamp;
 
             match beacon_engine
-                .fork_choice_updated(
-                    fcu_state,
-                    Some(try_attrs),
-                )
+                .fork_choice_updated(fcu_state, Some(try_attrs))
                 .await
             {
                 Ok(result) => {
@@ -579,6 +586,12 @@ impl ConsensusOrchestrator {
             let leader_ready_unix_ms = broadcast.leader_ready_unix_ms;
             let eager_done_tx = self.eager_import_done_tx.clone();
             let block_guard = self.eager_import_block_guard.clone();
+            let eager_span = tracing::info_span!(
+                target: "n42.cl.exec_bridge.eager_import",
+                "follower_eager_import",
+                %hash,
+                view,
+            );
             tokio::spawn(async move {
                 let decompress_start = std::time::Instant::now();
                 let payload_json = match super::decompress_payload(&payload_compressed) {
@@ -688,6 +701,11 @@ impl ConsensusOrchestrator {
                             metrics::counter!("n42_compact_block_cache_hits").increment(1);
                         }
                         metrics::counter!("n42_follower_eager_import_hits_total").increment(1);
+                        metrics::counter!(
+                            "n42_eager_import_outcomes_total",
+                            "role" => "follower", "outcome" => "hit"
+                        )
+                        .increment(1);
                         if eager_done_tx.send((hash, block_ts)).await.is_err() {
                             debug!(target: "n42::cl::exec_bridge", %hash, view, "eager import completion receiver dropped");
                         }
@@ -697,15 +715,25 @@ impl ConsensusOrchestrator {
                         if compact_injected {
                             metrics::counter!("n42_compact_block_cache_misses").increment(1);
                         }
+                        metrics::counter!(
+                            "n42_eager_import_outcomes_total",
+                            "role" => "follower", "outcome" => "stale"
+                        )
+                        .increment(1);
                     }
                     Err(e) => {
                         debug!(target: "n42::cl::exec_bridge", %hash, view, error = %e, compact_injected, "follower eager import: failed");
                         if compact_injected {
                             metrics::counter!("n42_compact_block_cache_misses").increment(1);
                         }
+                        metrics::counter!(
+                            "n42_eager_import_outcomes_total",
+                            "role" => "follower", "outcome" => "error"
+                        )
+                        .increment(1);
                     }
                 }
-            });
+            }.instrument(eager_span));
         }
     }
 
@@ -831,10 +859,7 @@ impl ConsensusOrchestrator {
             safe_block_hash: broadcast.block_hash,
             finalized_block_hash: broadcast.block_hash,
         };
-        if let Err(e) = engine_handle
-            .fork_choice_updated(fcu_state, None)
-            .await
-        {
+        if let Err(e) = engine_handle.fork_choice_updated(fcu_state, None).await {
             error!(
                 target: "n42::cl::exec_bridge",
                 hash = %broadcast.block_hash,
@@ -966,9 +991,7 @@ impl ConsensusOrchestrator {
                         safe_block_hash: retry_hash,
                         finalized_block_hash: retry_hash,
                     };
-                    let _ = engine_handle
-                        .fork_choice_updated(fcu, None)
-                        .await;
+                    let _ = engine_handle.fork_choice_updated(fcu, None).await;
                     self.head_block_hash = retry_hash;
                     if let Err(e) = self
                         .engine
@@ -1012,6 +1035,12 @@ impl ConsensusOrchestrator {
 /// eliminating the ~200ms pipeline stall from the background import path (Case B).
 /// If consensus is faster than import, Case B still works as a fallback.
 #[allow(clippy::too_many_arguments)]
+#[tracing::instrument(
+    target = "n42.cl.exec_bridge.leader_emit",
+    name = "leader_emit",
+    skip_all,
+    fields(view = current_view, hash = tracing::field::Empty, block_number = tracing::field::Empty)
+)]
 async fn handle_built_payload(
     payload: EthBuiltPayload,
     engine_handle: ConsensusEngineHandle<EthEngineTypes>,
@@ -1024,6 +1053,11 @@ async fn handle_built_payload(
     block_guard: Arc<std::sync::atomic::AtomicU64>,
 ) {
     let hash = payload.block().hash();
+    {
+        let span = tracing::Span::current();
+        span.record("hash", tracing::field::display(&hash));
+        span.record("block_number", payload.block().header().number);
+    }
 
     let execution_data =
         <EthEngineTypes as PayloadTypes>::block_to_payload(payload.block().clone());
@@ -1112,6 +1146,11 @@ async fn handle_built_payload(
             let np_elapsed = import_start.elapsed().as_millis() as u64;
             info!(target: "n42::cl::exec_bridge", %hash, np_elapsed, "eager import: new_payload accepted (no FCU)");
             metrics::counter!("n42_eager_import_hits_total").increment(1);
+            metrics::counter!(
+                "n42_eager_import_outcomes_total",
+                "role" => "leader", "outcome" => "hit"
+            )
+            .increment(1);
             if eager_import_done_tx
                 .send((hash, block_timestamp))
                 .await
@@ -1122,13 +1161,24 @@ async fn handle_built_payload(
         }
         Ok(status) => {
             info!(target: "n42::cl::exec_bridge", %hash, status = ?status.status, elapsed_ms = import_start.elapsed().as_millis() as u64, "eager import: new_payload not accepted");
+            metrics::counter!(
+                "n42_eager_import_outcomes_total",
+                "role" => "leader", "outcome" => "stale"
+            )
+            .increment(1);
         }
         Err(e) => {
             info!(target: "n42::cl::exec_bridge", %hash, error = %e, "eager import: new_payload failed");
+            metrics::counter!(
+                "n42_eager_import_outcomes_total",
+                "role" => "leader", "outcome" => "error"
+            )
+            .increment(1);
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn broadcast_block_data(
     network: &NetworkHandle,
     leader_payload_tx: &mpsc::Sender<(B256, Vec<u8>)>,

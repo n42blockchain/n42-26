@@ -67,7 +67,6 @@ impl N42ConsensusBuilder {
         self.validator_set_resolver = Some(validator_set_resolver);
         self
     }
-
 }
 
 impl<Node> ConsensusBuilder<Node> for N42ConsensusBuilder
@@ -116,7 +115,7 @@ mod tests {
     #[test]
     fn test_executor_builder_clone_copy() {
         let builder = N42ExecutorBuilder;
-        let _ = (builder.clone(), builder);
+        let _ = (builder, builder);
     }
 
     #[test]

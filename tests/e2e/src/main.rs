@@ -1,3 +1,9 @@
+#![allow(
+    clippy::collapsible_if,
+    clippy::manual_range_contains,
+    clippy::too_many_arguments
+)]
+
 mod erc20;
 mod genesis;
 mod mobile_sim;

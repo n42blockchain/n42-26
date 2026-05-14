@@ -503,7 +503,7 @@ mod tests {
         let addr = bls_pubkey_to_address(&pk);
 
         // Manually compute expected address: keccak256(pubkey_bytes)[12..]
-        let hash = alloy_primitives::keccak256(&pk);
+        let hash = alloy_primitives::keccak256(pk);
         let expected = Address::from_slice(&hash[12..]);
         assert_eq!(addr, expected);
         assert_ne!(addr, Address::ZERO);

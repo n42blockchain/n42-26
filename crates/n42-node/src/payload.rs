@@ -37,10 +37,8 @@ where
         + 'static,
     Evm: ConfigureEvm<Primitives = PrimitivesTy<Types>, NextBlockEnvCtx = NextBlockEnvAttributes>
         + 'static,
-    Types::Payload: PayloadTypes<
-            BuiltPayload = EthBuiltPayload,
-            PayloadAttributes = EthPayloadAttributes,
-        >,
+    Types::Payload:
+        PayloadTypes<BuiltPayload = EthBuiltPayload, PayloadAttributes = EthPayloadAttributes>,
 {
     type PayloadBuilder = N42InnerPayloadBuilder<Pool, Node::Provider, Evm>;
 

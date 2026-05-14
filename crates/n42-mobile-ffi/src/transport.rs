@@ -42,10 +42,11 @@ pub(crate) async fn connect_quic(
 
     let mut transport = quinn::TransportConfig::default();
     transport.max_idle_timeout(Some(
-        quinn::IdleTimeout::try_from(Duration::from_secs(300))
-            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+        quinn::IdleTimeout::try_from(Duration::from_secs(300)).map_err(
+            |e| -> Box<dyn std::error::Error + Send + Sync> {
                 format!("idle timeout config error: {e}").into()
-            })?,
+            },
+        )?,
     ));
     transport.keep_alive_interval(Some(Duration::from_secs(15)));
 

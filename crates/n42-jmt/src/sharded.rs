@@ -307,11 +307,7 @@ impl ShardedJmt<crate::DiskTreeStore> {
             })
             .collect::<eyre::Result<Vec<_>>>()?;
 
-        let version = shards
-            .iter()
-            .map(|s| s.lock().version())
-            .max()
-            .unwrap_or(0);
+        let version = shards.iter().map(|s| s.lock().version()).max().unwrap_or(0);
         Ok(Self { shards, version })
     }
 
@@ -361,8 +357,7 @@ impl ShardedJmt<crate::DiskTreeStore> {
                     .map_err(|e| eyre::eyre!("{e}"))?;
             }
         }
-        tx.commit()
-            .map_err(|e| eyre::eyre!("atomic commit: {e}"))?;
+        tx.commit().map_err(|e| eyre::eyre!("atomic commit: {e}"))?;
 
         // Phase 5: Advance shard versions after successful commit.
         for (i, (ver, _)) in batches.iter().enumerate() {
@@ -605,7 +600,10 @@ mod tests {
         let mut jmt2 = ShardedJmt::open_disk(dir2.path(), 1000).unwrap();
         let (_, r2) = jmt2.apply_diff(&diff).unwrap();
 
-        assert_eq!(r1, r2, "same diff should produce same root across disk instances");
+        assert_eq!(
+            r1, r2,
+            "same diff should produce same root across disk instances"
+        );
 
         // Also compare with in-memory
         let mut jmt_mem = ShardedJmt::new();

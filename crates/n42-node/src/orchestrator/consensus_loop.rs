@@ -141,6 +141,7 @@ impl ConsensusOrchestrator {
                 // Direct send + broadcast for reliability. Direct send via request-response
                 // can silently fail (QUIC transport issues), so always broadcast as backup.
                 // The consensus engine deduplicates votes by (view, voter).
+                let send_start = std::time::Instant::now();
                 if let Some(peer_id) = self.network.validator_peer(target) {
                     let _ = self.network.send_direct(peer_id, msg.clone());
                 }
@@ -148,6 +149,8 @@ impl ConsensusOrchestrator {
                 if let Err(e) = self.network.broadcast_consensus(msg) {
                     error!(target: "n42::cl::consensus_loop", target_validator = target, error = %e, "broadcast failed");
                 }
+                histogram!("n42_send_to_validator_e2e_ms")
+                    .record(send_start.elapsed().as_millis() as f64);
             }
             EngineOutput::ExecuteBlock(block_hash) => {
                 self.handle_execute_block(block_hash).await;
@@ -436,6 +439,7 @@ impl ConsensusOrchestrator {
                         Ok((version, root)) => {
                             let elapsed_ms = start.elapsed().as_millis();
                             gauge!("n42_jmt_latest_root").set(version as f64);
+                            histogram!("n42_state_root_apply_diff_ms").record(elapsed_ms as f64);
                             info!(
                                 target: "n42::jmt",
                                 version,
@@ -466,30 +470,30 @@ impl ConsensusOrchestrator {
         // ZK proof sidecar: schedule proof generation (async, non-blocking).
         // Uses committed_block_count (monotonically increasing) for interval check,
         // not view (which can skip on timeouts).
-        if let Some(ref scheduler) = self.zk_scheduler {
-            if let Some(data) = self.pending_block_data.get(&block_hash) {
-                let block_count = self.committed_block_count;
-                // Extract decompressed CompactBlockExecution JSON from the raw
-                // BlockDataBroadcast. This is the same decompress path used by
-                // JMT and staking scan.
-                let bundle_json = match Self::extract_bundle_state_json(block_hash, data) {
-                    Some(json) => json,
-                    None => {
-                        warn!(target: "n42::zk", block_count, "ZK input: failed to extract bundle_state_json, using empty (proof will be incomplete)");
-                        Vec::new()
-                    }
-                };
-                let input = n42_zkproof::BlockExecutionInput {
-                    block_hash,
-                    block_number: block_count,
-                    parent_hash: self.head_block_hash,
-                    header_rlp: Vec::new(),
-                    transactions_rlp: Vec::new(),
-                    bundle_state_json: bundle_json,
-                    parent_state_root: B256::ZERO,
-                };
-                scheduler.on_block_committed(block_count, input);
-            }
+        if let Some(ref scheduler) = self.zk_scheduler
+            && let Some(data) = self.pending_block_data.get(&block_hash)
+        {
+            let block_count = self.committed_block_count;
+            // Extract decompressed CompactBlockExecution JSON from the raw
+            // BlockDataBroadcast. This is the same decompress path used by
+            // JMT and staking scan.
+            let bundle_json = match Self::extract_bundle_state_json(block_hash, data) {
+                Some(json) => json,
+                None => {
+                    warn!(target: "n42::zk", block_count, "ZK input: failed to extract bundle_state_json, using empty (proof will be incomplete)");
+                    Vec::new()
+                }
+            };
+            let input = n42_zkproof::BlockExecutionInput {
+                block_hash,
+                block_number: block_count,
+                parent_hash: self.head_block_hash,
+                header_rlp: Vec::new(),
+                transactions_rlp: Vec::new(),
+                bundle_state_json: bundle_json,
+                parent_state_root: B256::ZERO,
+            };
+            scheduler.on_block_committed(block_count, input);
         }
 
         // Scan committed block for staking/unstaking transactions.
@@ -546,6 +550,7 @@ impl ConsensusOrchestrator {
         let finalized = match engine_handle.fork_choice_updated(fcu_state, None).await {
             Ok(result) => {
                 let elapsed_ms = fcu_start.elapsed().as_millis() as u64;
+                histogram!("n42_fcu_latency_ms", "attempt" => "first").record(elapsed_ms as f64);
                 info!(target: "n42::cl::consensus_loop", view, %block_hash, status = ?result.payload_status.status, elapsed_ms, "N42_FCU: finalize fcu");
                 matches!(
                     result.payload_status.status,
@@ -553,6 +558,8 @@ impl ConsensusOrchestrator {
                 )
             }
             Err(e) => {
+                histogram!("n42_fcu_latency_ms", "attempt" => "first_err")
+                    .record(fcu_start.elapsed().as_millis() as f64);
                 warn!(target: "n42::cl::consensus_loop", view, %block_hash, error = %e, "fork_choice_updated failed");
                 false
             }
@@ -586,6 +593,8 @@ impl ConsensusOrchestrator {
                 match engine_handle.fork_choice_updated(retry_fcu, None).await {
                     Ok(result) => {
                         let retry_ms = retry_start.elapsed().as_millis() as u64;
+                        histogram!("n42_fcu_latency_ms", "attempt" => "retry")
+                            .record(retry_ms as f64);
                         info!(target: "n42::cl::consensus_loop", view, %block_hash, status = ?result.payload_status.status, retry_ms, "N42_FCU_RETRY: retry fcu after eager import");
                         matches!(
                             result.payload_status.status,
@@ -593,6 +602,8 @@ impl ConsensusOrchestrator {
                         )
                     }
                     Err(e) => {
+                        histogram!("n42_fcu_latency_ms", "attempt" => "retry_err")
+                            .record(retry_start.elapsed().as_millis() as f64);
                         warn!(target: "n42::cl::consensus_loop", view, %block_hash, error = %e, "retry fcu failed");
                         false
                     }

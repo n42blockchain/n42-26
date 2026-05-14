@@ -1,9 +1,9 @@
 //! N42 custom EVM factory with randomness precompile at address `0x0302`.
 
 use alloy_evm::{
-    eth::EthEvmContext,
+    EvmEnv, EvmFactory,
+    eth::{EthEvm, EthEvmBuilder, EthEvmContext},
     precompiles::PrecompilesMap,
-    EthEvm, EvmFactory,
 };
 use alloy_primitives::address;
 use revm::{
@@ -12,7 +12,6 @@ use revm::{
     inspector::{Inspector, NoOpInspector},
     precompile::{Precompile, PrecompileId, PrecompileSpecId, Precompiles},
     primitives::hardfork::SpecId,
-    Context, MainBuilder, MainContext,
 };
 
 use crate::precompile_random;
@@ -34,7 +33,7 @@ fn n42_precompiles(spec: SpecId) -> &'static Precompiles {
         return precompiles;
     }
 
-    let mut precompiles = Precompiles::new(PrecompileSpecId::from(spec)).clone();
+    let mut precompiles = Precompiles::new(PrecompileSpecId::from_spec_id(spec)).clone();
     precompiles.extend([Precompile::new(
         PrecompileId::custom("n42-randomness"),
         RANDOMNESS_PRECOMPILE_ADDR,
@@ -63,34 +62,35 @@ impl EvmFactory for N42EvmFactory {
     fn create_evm<DB: alloy_evm::Database>(
         &self,
         db: DB,
-        input: alloy_evm::EvmEnv,
+        evm_env: EvmEnv,
     ) -> Self::Evm<DB, NoOpInspector> {
-        let spec = input.cfg_env.spec;
+        let spec = evm_env.cfg_env.spec;
 
         // Inject prevrandao into thread-local for the randomness precompile.
-        if let Some(prevrandao) = input.block_env.prevrandao {
+        if let Some(prevrandao) = evm_env.block_env.prevrandao {
             precompile_random::set_block_randomness(prevrandao);
         }
 
-        let evm = Context::mainnet()
-            .with_db(db)
-            .with_cfg(input.cfg_env)
-            .with_block(input.block_env)
-            .build_mainnet_with_inspector(NoOpInspector {})
-            .with_precompiles(PrecompilesMap::from_static(n42_precompiles(spec)));
-
-        EthEvm::new(evm, false)
+        EthEvmBuilder::new(db, evm_env)
+            .precompiles(PrecompilesMap::from_static(n42_precompiles(spec)))
+            .build()
     }
 
     fn create_evm_with_inspector<DB: alloy_evm::Database, I: Inspector<Self::Context<DB>>>(
         &self,
         db: DB,
-        input: alloy_evm::EvmEnv,
+        evm_env: EvmEnv,
         inspector: I,
     ) -> Self::Evm<DB, I> {
-        EthEvm::new(
-            self.create_evm(db, input).into_inner().with_inspector(inspector),
-            true,
-        )
+        let spec = evm_env.cfg_env.spec;
+
+        if let Some(prevrandao) = evm_env.block_env.prevrandao {
+            precompile_random::set_block_randomness(prevrandao);
+        }
+
+        EthEvmBuilder::new(db, evm_env)
+            .precompiles(PrecompilesMap::from_static(n42_precompiles(spec)))
+            .activate_inspector(inspector)
+            .build()
     }
 }

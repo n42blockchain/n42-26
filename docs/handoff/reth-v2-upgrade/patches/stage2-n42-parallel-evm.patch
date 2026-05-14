@@ -1,0 +1,165 @@
+diff --git a/crates/n42-parallel-evm/src/lib.rs b/crates/n42-parallel-evm/src/lib.rs
+index 8dc0bac..580b7b8 100644
+--- a/crates/n42-parallel-evm/src/lib.rs
++++ b/crates/n42-parallel-evm/src/lib.rs
+@@ -43,6 +43,12 @@ pub struct TxResult {
+ /// Execute transactions in parallel using Block-STM.
+ ///
+ /// Falls back to sequential for small batches (configurable via `N42_PARALLEL_THRESHOLD`).
++#[tracing::instrument(
++    target = "n42.el.parallel_execute",
++    name = "parallel_execute",
++    skip_all,
++    fields(tx_count = txs.len(), parallelism = tracing::field::Empty)
++)]
+ pub fn parallel_execute<DB>(
+     txs: &[TxEnv],
+     base_db: &DB,
+@@ -53,6 +59,7 @@ where
+     DB: DatabaseRef + Send + Sync,
+     DB::Error: fmt::Display + Send,
+ {
++    tracing::Span::current().record("parallelism", rayon::current_num_threads());
+     let num_txs = txs.len();
+     if num_txs == 0 {
+         return Ok(ParallelExecutionOutput {
+@@ -253,7 +260,10 @@ where
+             }
+         };
+ 
+-    let gas_used = result.gas_used();
++    // EIP-8037 split gas_used into tx_gas_used (execution) and state_gas_used.
++    // For N42 metrics + receipt totals we want the transaction-level gas, which
++    // matches the pre-EIP semantics of the deprecated `gas_used()`.
++    let gas_used = result.tx_gas_used();
+     let success = result.is_success();
+     let logs = result.into_logs();
+ 
+diff --git a/crates/n42-parallel-evm/src/mv_memory.rs b/crates/n42-parallel-evm/src/mv_memory.rs
+index 41eb216..a2b3f78 100644
+--- a/crates/n42-parallel-evm/src/mv_memory.rs
++++ b/crates/n42-parallel-evm/src/mv_memory.rs
+@@ -19,6 +19,13 @@ pub enum MvRead<T> {
+     NotFound,
+ }
+ 
++/// Per-tx write key for clear_tx indexing.
++#[derive(Debug, Clone)]
++enum WriteKey {
++    Account(Address),
++    Storage(Address, U256),
++}
++
+ /// Thread-safe multi-version memory backing the Block-STM parallel execution.
+ pub struct MvMemory {
+     /// Account info: address → { tx_idx → account_info }
+@@ -27,6 +34,9 @@ pub struct MvMemory {
+     storage: DashMap<(Address, U256), RwLock<BTreeMap<TxIdx, U256>>>,
+     /// Code cache (immutable per block — no versioning).
+     code: DashMap<B256, Bytecode>,
++    /// Per-tx write index: tx_idx → list of locations that tx wrote.
++    /// Used by `clear_tx` to avoid O(|all_locations|) scans on re-execution.
++    tx_writes: DashMap<TxIdx, Vec<WriteKey>>,
+ }
+ 
+ impl Default for MvMemory {
+@@ -41,6 +51,7 @@ impl MvMemory {
+             accounts: DashMap::new(),
+             storage: DashMap::new(),
+             code: DashMap::new(),
++            tx_writes: DashMap::new(),
+         }
+     }
+ 
+@@ -67,6 +78,10 @@ impl MvMemory {
+             .write()
+             .unwrap_or_else(|e| e.into_inner())
+             .insert(writer_idx, info);
++        self.tx_writes
++            .entry(writer_idx)
++            .or_default()
++            .push(WriteKey::Account(addr));
+     }
+ 
+     /// Read storage slot visible to `reader_idx`.
+@@ -88,6 +103,10 @@ impl MvMemory {
+             .write()
+             .unwrap_or_else(|e| e.into_inner())
+             .insert(writer_idx, value);
++        self.tx_writes
++            .entry(writer_idx)
++            .or_default()
++            .push(WriteKey::Storage(addr, slot));
+     }
+ 
+     /// Cache code by hash (immutable, no versioning).
+@@ -101,18 +120,59 @@ impl MvMemory {
+     }
+ 
+     /// Remove all entries written by `tx_idx` (used before re-execution).
++    ///
++    /// O(|writes_of_tx|) via the per-tx write index; falls back to a full scan if the
++    /// index entry is missing (defense-in-depth for any caller that bypasses
++    /// `write_account` / `write_storage`).
+     pub fn clear_tx(&self, tx_idx: TxIdx) {
+-        for entry in self.accounts.iter() {
+-            entry
+-                .write()
+-                .unwrap_or_else(|e| e.into_inner())
+-                .remove(&tx_idx);
++        let start = std::time::Instant::now();
++        let mut writes_count: usize = 0;
++        let mut used_fallback = false;
++        if let Some((_, writes)) = self.tx_writes.remove(&tx_idx) {
++            writes_count = writes.len();
++            for w in writes {
++                match w {
++                    WriteKey::Account(addr) => {
++                        if let Some(entry) = self.accounts.get(&addr) {
++                            entry
++                                .write()
++                                .unwrap_or_else(|e| e.into_inner())
++                                .remove(&tx_idx);
++                        }
++                    }
++                    WriteKey::Storage(addr, slot) => {
++                        if let Some(entry) = self.storage.get(&(addr, slot)) {
++                            entry
++                                .write()
++                                .unwrap_or_else(|e| e.into_inner())
++                                .remove(&tx_idx);
++                        }
++                    }
++                }
++            }
++        } else {
++            used_fallback = true;
++            for entry in self.accounts.iter() {
++                entry
++                    .write()
++                    .unwrap_or_else(|e| e.into_inner())
++                    .remove(&tx_idx);
++            }
++            for entry in self.storage.iter() {
++                entry
++                    .write()
++                    .unwrap_or_else(|e| e.into_inner())
++                    .remove(&tx_idx);
++            }
+         }
+-        for entry in self.storage.iter() {
+-            entry
+-                .write()
+-                .unwrap_or_else(|e| e.into_inner())
+-                .remove(&tx_idx);
++        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
++        metrics::histogram!(
++            "n42_mv_memory_clear_tx_ms",
++            "path" => if used_fallback { "fallback_scan" } else { "indexed" }
++        )
++        .record(elapsed_ms);
++        if !used_fallback {
++            metrics::histogram!("n42_mv_memory_clear_tx_writes").record(writes_count as f64);
+         }
+     }
+ 

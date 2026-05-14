@@ -116,7 +116,7 @@ Primary code:
 - [`crates/n42-jmt/src/`](crates/n42-jmt/src)
 - [`crates/n42-zkproof/src/`](crates/n42-zkproof/src)
 
-> **⚠️ JMT 未接入生产**：`ShardedJmt` 在 `main.rs` 中从未构造。orchestrator 和 RPC 的 `with_jmt()` builder 已就绪但未调用。`n42_jmtProof`/`n42_jmtVersion` RPC 永远返回 "JMT not enabled"。需要在启动流程中创建实例并接线。
+> **✅ JMT 已接入生产**：`ShardedJmt` 在 `bin/n42-node/src/main.rs:702`（RPC）和 `:1231`（orchestrator）通过 `with_jmt()` builder 注入。详见 `docs/devlog-52-jmt-full-integration.md`。`apply_diff` 在 commit 后通过 spawn_blocking 异步更新，不在共识关键路径。`n42_jmtRoot` / `n42_jmtProof` / `n42_jmtVersion` RPC 已可用。
 
 ### 6. Staking plane
 
@@ -208,14 +208,14 @@ Each module's end-to-end integration status: constructed in `main.rs` → events
 | Crash Recovery | ✅ Wired | always | `main.rs:440` → `ConsensusEngine::with_recovered_state` |
 | ZK ProofScheduler | ✅ Wired | `N42_ZK_PROOF=1` | `main.rs:535` → `consensus_loop:413` → `on_block_committed` |
 | Validator Reconfig RPC | ✅ Wired | always | `main.rs:515` → admin channel → orchestrator select! |
-| **JMT (ShardedJmt)** | **❌ Stub** | **never** | `with_jmt()` builder exists but **never called in main.rs** |
-| **Parallel EVM** | **❌ Dead** | **never** | crate exists but **zero references** in any production code |
+| JMT (ShardedJmt) | ✅ Wired | always | `main.rs:702, 1231` → `with_jmt()` → `consensus_loop.rs` apply_diff (spawn_blocking) |
+| Parallel EVM | ⚙️ Opt-in | `N42_PARALLEL_EVM=1` | `executor.rs:130` `parallel_evm_enabled()` → `execute_block_parallel` (off by default) |
 
 ### Open issues
 
-1. **JMT 未接入**：orchestrator (`mod.rs:329`) 和 RPC (`rpc.rs:234`) 有 `Option<Arc<Mutex<ShardedJmt>>>` 字段和 builder 方法，但 `main.rs` 从未构造 `ShardedJmt` 实例。consensus_loop 中的 `apply_diff` 代码（`consensus_loop.rs:366-408`）是死代码。需要：(a) 在 `main.rs` 中创建 `ShardedJmt`，(b) 调用 `orchestrator.with_jmt(jmt)` 和 `rpc_server.with_jmt(jmt)`。
-2. **Parallel EVM 死代码**：`n42-parallel-evm` 是 workspace member 和 `n42-node` 依赖，但从未 import 或调用。执行层通过 `N42EvmConfig` → reth 标准路径。
-3. **Admin RPC 无鉴权**：`proposeAddValidator`/`proposeRemoveValidator` 端点无权限控制，任何 RPC 客户端可调用。
+1. **Parallel EVM opt-in**：`n42-parallel-evm` 由 `N42_PARALLEL_EVM=1` 门控（`executor.rs:130` `parallel_evm_enabled`），默认走 reth 标准串行路径。Block-STM 在小块（< `N42_PARALLEL_THRESHOLD`，默认 8 tx）时回退顺序执行；devlog-28 评估 EVM 仅占 8s slot 约 5%，启用收益有限，仍是 opt-in。
+2. **Admin RPC 无鉴权**：`proposeAddValidator`/`proposeRemoveValidator` 端点无权限控制，任何 RPC 客户端可调用（除非启用 `N42_ADMIN_TOKEN`）。
+3. **base 编译需 reth 补丁**：reth path 依赖与 workspace 在 `alloy-evm` 版本上不一致（0.29.2 vs 0.30.0），导致 `n42-execution` 在未打 `../n42-26/reth-n42.patch` 时编译失败。
 
 ## Shared state objects
 

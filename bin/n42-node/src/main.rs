@@ -8,6 +8,7 @@ use alloy_primitives::Address;
 use clap::Parser;
 use n42_chainspec::{ConsensusConfig, ValidatorInfo};
 use n42_consensus::{ConsensusEngine, EpochManager, ValidatorSet, ValidatorSetResolver};
+use n42_jmt::ShardedJmt;
 use n42_network::NetworkService;
 use n42_network::{
     ShardedStarHub, ShardedStarHubConfig, TransportConfig, build_swarm_with_validator_index,
@@ -25,7 +26,6 @@ use n42_node::tx_bridge::TxPoolBridge;
 use n42_node::{ConsensusOrchestrator, N42Node, ObserverOrchestrator, SharedConsensusState};
 use n42_node::{configured_validator_peer_ids, expected_validator_peer_ids_with_policy};
 use n42_primitives::BlsSecretKey;
-use n42_jmt::ShardedJmt;
 use n42_zkproof::{MockProver, ProofScheduler, ProofStore};
 use reth_chainspec::ChainSpecProvider;
 use reth_ethereum_cli::Cli;
@@ -123,22 +123,23 @@ fn build_epoch_manager(
     // directly.  This ensures that a dynamic `proposeAddValidator` which crossed an
     // epoch boundary survives a node restart even when `epoch_schedule.json` has not
     // been updated manually.
-    if let Some((snap_epoch, snap_validators, snap_ft)) = snapshot_current_epoch {
-        if *snap_epoch == current_epoch && !snap_validators.is_empty() {
-            let vs = ValidatorSet::try_new(snap_validators, *snap_ft)
-                .map_err(|e| eyre::eyre!("snapshot current_epoch_validators invalid: {e}"))?;
-            tracing::info!(
-                epoch = snap_epoch,
-                validators = snap_validators.len(),
-                "restored current epoch validator set from snapshot"
-            );
-            return Ok(EpochManager::from_epoch_with_history(
-                vs,
-                epoch_length,
-                *snap_epoch,
-                max_historical_epochs,
-            ));
-        }
+    if let Some((snap_epoch, snap_validators, snap_ft)) = snapshot_current_epoch
+        && *snap_epoch == current_epoch
+        && !snap_validators.is_empty()
+    {
+        let vs = ValidatorSet::try_new(snap_validators, *snap_ft)
+            .map_err(|e| eyre::eyre!("snapshot current_epoch_validators invalid: {e}"))?;
+        tracing::info!(
+            epoch = snap_epoch,
+            validators = snap_validators.len(),
+            "restored current epoch validator set from snapshot"
+        );
+        return Ok(EpochManager::from_epoch_with_history(
+            vs,
+            epoch_length,
+            *snap_epoch,
+            max_historical_epochs,
+        ));
     }
 
     if let Some(schedule) = recovery_epoch_schedule {
@@ -313,7 +314,7 @@ fn main() {
             ("N42_SKIP_STATE_ROOT", "state root computation skipped"),
             ("N42_DEFER_STATE_ROOT", "state root computation deferred"),
         ] {
-            if std::env::var(var).map_or(false, |v| v == "1") {
+            if std::env::var(var).is_ok_and(|v| v == "1") {
                 warn!(target: "n42::cli", var, desc, "BENCHMARK MODE: {var}=1 — NOT FOR PRODUCTION");
             }
         }
@@ -601,7 +602,7 @@ fn main() {
         let evidence_store: Option<Arc<n42_jmt::EvidenceStore>> = {
             let evidence_path = data_dir.join("evidence");
             n42_jmt::open_jmt_env(&evidence_path)
-                .and_then(|env| n42_jmt::EvidenceStore::open(env))
+                .and_then(n42_jmt::EvidenceStore::open)
                 .map(|store| {
                     info!(target: "n42::cli", path = %evidence_path.display(), "EvidenceStore initialized");
                     Arc::new(store)

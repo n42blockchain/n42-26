@@ -1,6 +1,6 @@
 use alloy_primitives::{B256, Bytes};
 use reth_revm::witness::ExecutionWitnessRecord;
-use reth_trie_common::HashedPostState;
+use reth_trie_common::{ExecutionWitnessMode, HashedPostState};
 use revm::database::State;
 use std::collections::HashSet;
 use tracing::debug;
@@ -25,7 +25,11 @@ impl ExecutionWitness {
     /// This should be called while the `State<DB>` is still available,
     /// before `take_bundle()` consumes the state changes.
     pub fn from_state<DB>(state: &State<DB>) -> Self {
-        let record = ExecutionWitnessRecord::from_executed_state(state);
+        // `Legacy` preserves the pre-reth-v2 witness shape that the N42 mobile
+        // verifier already consumes (no dedup / sort). Switching to `Canonical`
+        // would break the existing mobile packet format.
+        let record =
+            ExecutionWitnessRecord::from_executed_state(state, ExecutionWitnessMode::Legacy);
         Self {
             hashed_state: record.hashed_state,
             codes: record.codes,
@@ -216,7 +220,7 @@ mod tests {
         let compact = CompactWitness {
             hashed_state: HashedPostState::default(),
             uncached_codes: vec![bytecode(&[0xFF])],
-            cached_code_hashes: vec![keccak256(&[0xAA])],
+            cached_code_hashes: vec![keccak256([0xAA])],
             keys: vec![bytecode(&[4, 5, 6])],
             lowest_block_number: Some(100),
         };

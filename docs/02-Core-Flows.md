@@ -124,12 +124,12 @@ flowchart TD
 ```mermaid
 flowchart LR
     A["Committed block"] --> B["Extract state diff"]
-    B -.->|"dead: jmt is None"| C["Background JMT apply_diff"]
-    C -.-> D["Update root/version in SharedConsensusState"]
-    D -.-> E["RPC jmtRoot / jmtProof"]
+    B --> C["Background JMT apply_diff (spawn_blocking)"]
+    C --> D["Update root/version in SharedConsensusState"]
+    D --> E["RPC jmtRoot / jmtProof"]
 ```
 
-**需要修复**：在 `main.rs` 中添加 `ShardedJmt` 构造（参照 ZK scheduler 的 `N42_ZK_PROOF` 环境变量模式），调用 `orchestrator.with_jmt(jmt)` 和 `rpc_server.with_jmt(jmt)`。
+JMT 在 `bin/n42-node/src/main.rs:702`（RPC）和 `:1231`（orchestrator）通过 `with_jmt()` 注入。`apply_diff` 在 `consensus_loop.rs` 的 `handle_block_committed()` 末段 `spawn_blocking` 异步执行（详见 `devlog-52-jmt-full-integration.md`），不在共识关键路径上；每 100 块自动 `prune(200)` 回收旧版本。State root 时间通过 `n42_state_root_apply_diff_ms` histogram 暴露。
 
 ## 7. ZK sidecar path
 

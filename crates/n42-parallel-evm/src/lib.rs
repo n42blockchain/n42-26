@@ -43,6 +43,12 @@ pub struct TxResult {
 /// Execute transactions in parallel using Block-STM.
 ///
 /// Falls back to sequential for small batches (configurable via `N42_PARALLEL_THRESHOLD`).
+#[tracing::instrument(
+    target = "n42.el.parallel_execute",
+    name = "parallel_execute",
+    skip_all,
+    fields(tx_count = txs.len(), parallelism = tracing::field::Empty)
+)]
 pub fn parallel_execute<DB>(
     txs: &[TxEnv],
     base_db: &DB,
@@ -53,6 +59,7 @@ where
     DB: DatabaseRef + Send + Sync,
     DB::Error: fmt::Display + Send,
 {
+    tracing::Span::current().record("parallelism", rayon::current_num_threads());
     let num_txs = txs.len();
     if num_txs == 0 {
         return Ok(ParallelExecutionOutput {
@@ -253,7 +260,10 @@ where
             }
         };
 
-    let gas_used = result.gas_used();
+    // EIP-8037 split gas_used into tx_gas_used (execution) and state_gas_used.
+    // For N42 metrics + receipt totals we want the transaction-level gas, which
+    // matches the pre-EIP semantics of the deprecated `gas_used()`.
+    let gas_used = result.tx_gas_used();
     let success = result.is_success();
     let logs = result.into_logs();
 
@@ -355,7 +365,12 @@ fn build_output(
             logs: output.logs,
         });
 
-        merge_tx_state(&mut state_changes, tx_idx, output.account_writes, output.storage_writes);
+        merge_tx_state(
+            &mut state_changes,
+            tx_idx,
+            output.account_writes,
+            output.storage_writes,
+        );
     }
 
     Ok(ParallelExecutionOutput {
@@ -399,7 +414,12 @@ where
             logs: output.logs,
         });
 
-        merge_tx_state(&mut state_changes, tx_idx, output.account_writes, output.storage_writes);
+        merge_tx_state(
+            &mut state_changes,
+            tx_idx,
+            output.account_writes,
+            output.storage_writes,
+        );
     }
 
     Ok(ParallelExecutionOutput {

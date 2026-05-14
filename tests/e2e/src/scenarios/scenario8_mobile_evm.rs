@@ -204,7 +204,10 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
                             send_receipt(&quic_conn, &receipt).await?;
                             receipts_sent += 1;
 
-                            info!(block_number, receipts_sent, "signed receipt sent back to node");
+                            info!(
+                                block_number,
+                                receipts_sent, "signed receipt sent back to node"
+                            );
 
                             verified_count += 1;
                             if !packet.transactions.is_empty() {
@@ -276,8 +279,7 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
 
                             info!(
                                 block_number = packet.block_number,
-                                receipts_sent,
-                                "signed receipt sent back to node"
+                                receipts_sent, "signed receipt sent back to node"
                             );
 
                             verified_count += 1;

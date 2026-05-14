@@ -104,7 +104,9 @@ pub enum ConsensusError {
     InsufficientValidators { have: usize, need: usize },
 
     /// New and old validator sets do not have sufficient quorum overlap for safe transition.
-    #[error("insufficient quorum overlap between old and new validator sets: have {have}, need {need}")]
+    #[error(
+        "insufficient quorum overlap between old and new validator sets: have {have}, need {need}"
+    )]
     InsufficientQuorumOverlap { have: usize, need: usize },
 
     /// Validator already exists in the current set or pending additions.
@@ -122,7 +124,9 @@ pub enum ConsensusError {
     /// A validator set transition is already staged for the next epoch.
     /// No further proposals are accepted until the staged transition is activated
     /// at the next epoch boundary.
-    #[error("epoch transition already staged; wait for the current staged set to be activated before proposing further changes")]
+    #[error(
+        "epoch transition already staged; wait for the current staged set to be activated before proposing further changes"
+    )]
     EpochTransitionAlreadyStaged,
 
     /// A proposal contained too many validator changes (DoS protection).
@@ -130,7 +134,9 @@ pub enum ConsensusError {
     TooManyValidatorChanges { count: usize, max: usize },
 
     /// Dynamic validator changes require epochs to be enabled (epoch_length > 0).
-    #[error("epochs are disabled (epoch_length=0); dynamic validator changes require epoch_length > 0 in consensus config")]
+    #[error(
+        "epochs are disabled (epoch_length=0); dynamic validator changes require epoch_length > 0 in consensus config"
+    )]
     EpochsDisabled,
 
     /// A validator's BLS public key failed subgroup / non-infinity validation.

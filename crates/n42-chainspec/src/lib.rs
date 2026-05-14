@@ -891,7 +891,11 @@ epoch_length = 0
     fn test_validate_max_historical_epochs_bounds() {
         let mut cfg = ConsensusConfig::dev();
         cfg.max_historical_epochs = 0;
-        assert!(cfg.validate().unwrap_err().contains("max_historical_epochs"));
+        assert!(
+            cfg.validate()
+                .unwrap_err()
+                .contains("max_historical_epochs")
+        );
 
         cfg.max_historical_epochs = MAX_HISTORICAL_EPOCHS_LIMIT + 1;
         assert!(cfg.validate().unwrap_err().contains("exceeds hard limit"));

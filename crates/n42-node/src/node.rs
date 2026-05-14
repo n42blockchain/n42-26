@@ -53,7 +53,6 @@ impl N42Node {
         self.validator_set_resolver = Some(validator_set_resolver);
         self
     }
-
 }
 
 impl NodeTypes for N42Node {

@@ -1,0 +1,727 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index ca649d5..136d47b 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -286,24 +286,6 @@ dependencies = [
+  "tracing",
+ ]
+ 
+-[[package]]
+-name = "alloy-evm"
+-version = "0.30.0"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "e13146597a586a4166ac31b192883e08c044272d6b8c43de231ee1f43dd9a115"
+-dependencies = [
+- "alloy-consensus",
+- "alloy-eips",
+- "alloy-hardforks",
+- "alloy-primitives",
+- "alloy-sol-types",
+- "auto_impl",
+- "derive_more 2.1.1",
+- "revm",
+- "thiserror 2.0.18",
+- "tracing",
+-]
+-
+ [[package]]
+ name = "alloy-genesis"
+ version = "1.8.2"
+@@ -6433,7 +6415,7 @@ name = "n42-execution"
+ version = "0.5.0"
+ dependencies = [
+  "alloy-eips",
+- "alloy-evm 0.30.0",
++ "alloy-evm",
+  "alloy-primitives",
+  "alloy-rpc-types-engine",
+  "bincode",
+@@ -8890,7 +8872,7 @@ dependencies = [
+  "alloy-chains",
+  "alloy-consensus",
+  "alloy-eips",
+- "alloy-evm 0.29.2",
++ "alloy-evm",
+  "alloy-genesis",
+  "alloy-primitives",
+  "alloy-trie",
+@@ -9385,7 +9367,7 @@ dependencies = [
+  "alloy-consensus",
+  "alloy-eip7928",
+  "alloy-eips",
+- "alloy-evm 0.29.2",
++ "alloy-evm",
+  "alloy-primitives",
+  "alloy-rlp",
+  "alloy-rpc-types-engine",
+@@ -9683,7 +9665,7 @@ version = "1.11.3"
+ dependencies = [
+  "alloy-consensus",
+  "alloy-eips",
+- "alloy-evm 0.29.2",
++ "alloy-evm",
+  "alloy-primitives",
+  "auto_impl",
+  "derive_more 2.1.1",
+@@ -9707,7 +9689,7 @@ version = "1.11.3"
+ dependencies = [
+  "alloy-consensus",
+  "alloy-eips",
+- "alloy-evm 0.29.2",
++ "alloy-evm",
+  "alloy-primitives",
+  "alloy-rpc-types-engine",
+  "reth-chainspec",
+@@ -9741,7 +9723,7 @@ dependencies = [
+ name = "reth-execution-errors"
+ version = "1.11.3"
+ dependencies = [
+- "alloy-evm 0.29.2",
++ "alloy-evm",
+  "alloy-primitives",
+  "alloy-rlp",
+  "nybbles",
+@@ -9755,7 +9737,7 @@ version = "1.11.3"
+ dependencies = [
+  "alloy-consensus",
+  "alloy-eips",
+- "alloy-evm 0.29.2",
++ "alloy-evm",
+  "alloy-primitives",
+  "alloy-rlp",
+  "derive_more 2.1.1",
+@@ -10534,7 +10516,7 @@ dependencies = [
+  "alloy-dyn-abi",
+  "alloy-eip7928",
+  "alloy-eips",
+- "alloy-evm 0.29.2",
++ "alloy-evm",
+  "alloy-genesis",
+  "alloy-network",
+  "alloy-primitives",
+@@ -10680,7 +10662,7 @@ name = "reth-rpc-convert"
+ version = "1.11.3"
+ dependencies = [
+  "alloy-consensus",
+- "alloy-evm 0.29.2",
++ "alloy-evm",
+  "alloy-json-rpc",
+  "alloy-network",
+  "alloy-primitives",
+@@ -10731,7 +10713,7 @@ dependencies = [
+  "alloy-consensus",
+  "alloy-dyn-abi",
+  "alloy-eips",
+- "alloy-evm 0.29.2",
++ "alloy-evm",
+  "alloy-json-rpc",
+  "alloy-network",
+  "alloy-primitives",
+@@ -10773,7 +10755,7 @@ version = "1.11.3"
+ dependencies = [
+  "alloy-consensus",
+  "alloy-eips",
+- "alloy-evm 0.29.2",
++ "alloy-evm",
+  "alloy-network",
+  "alloy-primitives",
+  "alloy-rpc-client",
+@@ -11191,7 +11173,7 @@ name = "reth-trie-parallel"
+ version = "1.11.3"
+ dependencies = [
+  "alloy-eip7928",
+- "alloy-evm 0.29.2",
++ "alloy-evm",
+  "alloy-primitives",
+  "alloy-rlp",
+  "crossbeam-channel",
+diff --git a/Cargo.toml b/Cargo.toml
+index 3afa8cc..71cf455 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -96,8 +96,13 @@ alloy-network = { version = "1.8.2", default-features = false }
+ alloy-rpc-types-eth = { version = "1.8.2", default-features = false }
+ alloy-sol-types = { version = "1.5.6", default-features = false }
+ 
+-# EVM
+-alloy-evm = { version = "0.30.0", default-features = false }
++# EVM — aligned with `../reth/Cargo.toml` (local reth tracks upstream v1.11.3
++# with bumped alloy-evm 0.29.2 / revm 36 in its working tree). Stage 2 upgrade
++# to v2.2.0 / alloy-evm 0.34 / revm 38 is blocked by reth v2's Unix-only
++# `std::os::unix::fs::FileExt` use in changeset_offsets (Windows local build
++# fails; CI on ubuntu would pass). See docs/rfc/reth-v2-upgrade.md and the
++# stage2-*.patch files in repo root for the partial migration.
++alloy-evm = { version = "0.29.2", default-features = false }
+ revm = { version = "36.0.0", default-features = false, features = ["std", "serde"] }
+ 
+ # Testing
+diff --git a/crates/n42-consensus/src/protocol/bounded_fifo.rs b/crates/n42-consensus/src/protocol/bounded_fifo.rs
+index e7d365d..c9158e0 100644
+--- a/crates/n42-consensus/src/protocol/bounded_fifo.rs
++++ b/crates/n42-consensus/src/protocol/bounded_fifo.rs
+@@ -38,17 +38,20 @@ where
+         }
+     }
+ 
++    // We deliberately keep the `contains_key` + `insert` shape: in the miss
++    // case we must update `self.order` (eviction + push_back) before the
++    // `insert`, and re-borrowing the map via `Entry` would conflict with
++    // mutating `self.order`.
++    #[allow(clippy::map_entry)]
+     pub(crate) fn insert(&mut self, key: K, value: V) {
+-        if self.map.contains_key(&key) {
+-            self.map.insert(key, value);
+-            return;
++        if !self.map.contains_key(&key) {
++            if self.map.len() >= self.capacity
++                && let Some(oldest) = self.order.pop_front()
++            {
++                self.map.remove(&oldest);
++            }
++            self.order.push_back(key.clone());
+         }
+-        if self.map.len() >= self.capacity
+-            && let Some(oldest) = self.order.pop_front()
+-        {
+-            self.map.remove(&oldest);
+-        }
+-        self.order.push_back(key.clone());
+         self.map.insert(key, value);
+     }
+ 
+diff --git a/crates/n42-consensus/src/protocol/state_machine.rs b/crates/n42-consensus/src/protocol/state_machine.rs
+index f748bc3..10d011b 100644
+--- a/crates/n42-consensus/src/protocol/state_machine.rs
++++ b/crates/n42-consensus/src/protocol/state_machine.rs
+@@ -664,6 +664,18 @@ impl ConsensusEngine {
+ 
+     /// Processes a consensus event and generates outputs.
+     pub fn process_event(&mut self, event: ConsensusEvent) -> ConsensusResult<()> {
++        let kind = match &event {
++            ConsensusEvent::Message(_) => "message",
++            ConsensusEvent::BlockReady(..) => "block_ready",
++            ConsensusEvent::BlockImported(_) => "block_imported",
++        };
++        let _span = tracing::info_span!(
++            target: "n42.cl.consensus.event",
++            "process_event",
++            view = self.round_state.current_view(),
++            kind = kind,
++        )
++        .entered();
+         match event {
+             ConsensusEvent::Message(msg) => self.process_message(msg),
+             ConsensusEvent::BlockReady(block_hash, tx_root_hash) => {
+diff --git a/crates/n42-network/src/transport.rs b/crates/n42-network/src/transport.rs
+index 35e0b4f..cc017bb 100644
+--- a/crates/n42-network/src/transport.rs
++++ b/crates/n42-network/src/transport.rs
+@@ -74,12 +74,32 @@ impl TransportConfig {
+     /// Standard params (D=8, D_low=6, D_high=12, D_out=2) apply when there are
+     /// enough peers. For small networks (< 8 nodes), parameters are scaled down
+     /// so the mesh can form without continuous "Mesh low" warnings.
++    ///
++    /// Mesh degree may be overridden at runtime via environment variables for
++    /// Phase 1 (leader direct push) deployments where block data no longer flows
++    /// through GossipSub — operators can collapse the mesh to reduce duplicate
++    /// gossip overhead:
++    ///
++    ///   - `N42_GOSSIP_MESH_D`      (target degree)
++    ///   - `N42_GOSSIP_MESH_D_LOW`  (low watermark)
++    ///   - `N42_GOSSIP_MESH_D_HIGH` (high watermark)
++    ///
++    /// Overrides are clamped to `[0, max_peers]` and validated so `D_out <= D/2`
++    /// and `D_out < D_low` (libp2p invariants); invalid overrides fall back to
++    /// the size-scaled defaults.
+     pub fn for_network_size(node_count: usize) -> Self {
+         let max_peers = if node_count > 1 { node_count - 1 } else { 1 };
+ 
+-        let mesh_d = 8.min(max_peers);
+-        let mesh_d_low = 6.min(max_peers);
+-        let mesh_d_high = 12.min(max_peers).max(mesh_d);
++        let default_d = 8.min(max_peers);
++        let default_d_low = 6.min(max_peers);
++        let default_d_high = 12.min(max_peers).max(default_d);
++
++        let mesh_d = env_mesh_override("N42_GOSSIP_MESH_D", max_peers).unwrap_or(default_d);
++        let mesh_d_low =
++            env_mesh_override("N42_GOSSIP_MESH_D_LOW", max_peers).unwrap_or(default_d_low);
++        let mesh_d_high = env_mesh_override("N42_GOSSIP_MESH_D_HIGH", max_peers)
++            .unwrap_or(default_d_high)
++            .max(mesh_d);
+         let mesh_outbound_min =
+             2.min(mesh_d / 2)
+                 .min(if mesh_d_low > 0 { mesh_d_low - 1 } else { 0 });
+@@ -104,6 +124,14 @@ impl TransportConfig {
+     }
+ }
+ 
++/// Reads a positive integer mesh parameter from the environment, clamped to
++/// `[0, max_peers]`. Returns `None` if the env var is unset or unparseable.
++fn env_mesh_override(name: &str, max_peers: usize) -> Option<usize> {
++    let raw = std::env::var(name).ok()?;
++    let parsed: usize = raw.parse().ok()?;
++    Some(parsed.min(max_peers))
++}
++
+ impl Default for TransportConfig {
+     fn default() -> Self {
+         Self {
+diff --git a/crates/n42-node/src/mobile_bridge.rs b/crates/n42-node/src/mobile_bridge.rs
+index 6ad6c4b..eb43af9 100644
+--- a/crates/n42-node/src/mobile_bridge.rs
++++ b/crates/n42-node/src/mobile_bridge.rs
+@@ -225,15 +225,15 @@ impl MobileVerificationBridge {
+                                 connected = self.connected_sessions.len(),
+                                 "mobile verifier connected"
+                             );
+-                            if let Some(ref tx) = self.phone_connected_tx {
+-                                if let Err(error) = tx.send(session_id).await {
+-                                    warn!(
+-                                        target: "n42::mobile",
+-                                        session_id,
+-                                        error = %error,
+-                                        "failed to deliver phone_connected notification"
+-                                    );
+-                                }
++                            if let Some(ref tx) = self.phone_connected_tx
++                                && let Err(error) = tx.send(session_id).await
++                            {
++                                warn!(
++                                    target: "n42::mobile",
++                                    session_id,
++                                    error = %error,
++                                    "failed to deliver phone_connected notification"
++                                );
+                             }
+                         }
+                         HubEvent::PhoneDisconnected { session_id } => {
+diff --git a/crates/n42-node/src/orchestrator/consensus_loop.rs b/crates/n42-node/src/orchestrator/consensus_loop.rs
+index 1337260..7a794df 100644
+--- a/crates/n42-node/src/orchestrator/consensus_loop.rs
++++ b/crates/n42-node/src/orchestrator/consensus_loop.rs
+@@ -141,6 +141,7 @@ impl ConsensusOrchestrator {
+                 // Direct send + broadcast for reliability. Direct send via request-response
+                 // can silently fail (QUIC transport issues), so always broadcast as backup.
+                 // The consensus engine deduplicates votes by (view, voter).
++                let send_start = std::time::Instant::now();
+                 if let Some(peer_id) = self.network.validator_peer(target) {
+                     let _ = self.network.send_direct(peer_id, msg.clone());
+                 }
+@@ -148,6 +149,8 @@ impl ConsensusOrchestrator {
+                 if let Err(e) = self.network.broadcast_consensus(msg) {
+                     error!(target: "n42::cl::consensus_loop", target_validator = target, error = %e, "broadcast failed");
+                 }
++                histogram!("n42_send_to_validator_e2e_ms")
++                    .record(send_start.elapsed().as_millis() as f64);
+             }
+             EngineOutput::ExecuteBlock(block_hash) => {
+                 self.handle_execute_block(block_hash).await;
+@@ -436,6 +439,7 @@ impl ConsensusOrchestrator {
+                         Ok((version, root)) => {
+                             let elapsed_ms = start.elapsed().as_millis();
+                             gauge!("n42_jmt_latest_root").set(version as f64);
++                            histogram!("n42_state_root_apply_diff_ms").record(elapsed_ms as f64);
+                             info!(
+                                 target: "n42::jmt",
+                                 version,
+@@ -466,30 +470,30 @@ impl ConsensusOrchestrator {
+         // ZK proof sidecar: schedule proof generation (async, non-blocking).
+         // Uses committed_block_count (monotonically increasing) for interval check,
+         // not view (which can skip on timeouts).
+-        if let Some(ref scheduler) = self.zk_scheduler {
+-            if let Some(data) = self.pending_block_data.get(&block_hash) {
+-                let block_count = self.committed_block_count;
+-                // Extract decompressed CompactBlockExecution JSON from the raw
+-                // BlockDataBroadcast. This is the same decompress path used by
+-                // JMT and staking scan.
+-                let bundle_json = match Self::extract_bundle_state_json(block_hash, data) {
+-                    Some(json) => json,
+-                    None => {
+-                        warn!(target: "n42::zk", block_count, "ZK input: failed to extract bundle_state_json, using empty (proof will be incomplete)");
+-                        Vec::new()
+-                    }
+-                };
+-                let input = n42_zkproof::BlockExecutionInput {
+-                    block_hash,
+-                    block_number: block_count,
+-                    parent_hash: self.head_block_hash,
+-                    header_rlp: Vec::new(),
+-                    transactions_rlp: Vec::new(),
+-                    bundle_state_json: bundle_json,
+-                    parent_state_root: B256::ZERO,
+-                };
+-                scheduler.on_block_committed(block_count, input);
+-            }
++        if let Some(ref scheduler) = self.zk_scheduler
++            && let Some(data) = self.pending_block_data.get(&block_hash)
++        {
++            let block_count = self.committed_block_count;
++            // Extract decompressed CompactBlockExecution JSON from the raw
++            // BlockDataBroadcast. This is the same decompress path used by
++            // JMT and staking scan.
++            let bundle_json = match Self::extract_bundle_state_json(block_hash, data) {
++                Some(json) => json,
++                None => {
++                    warn!(target: "n42::zk", block_count, "ZK input: failed to extract bundle_state_json, using empty (proof will be incomplete)");
++                    Vec::new()
++                }
++            };
++            let input = n42_zkproof::BlockExecutionInput {
++                block_hash,
++                block_number: block_count,
++                parent_hash: self.head_block_hash,
++                header_rlp: Vec::new(),
++                transactions_rlp: Vec::new(),
++                bundle_state_json: bundle_json,
++                parent_state_root: B256::ZERO,
++            };
++            scheduler.on_block_committed(block_count, input);
+         }
+ 
+         // Scan committed block for staking/unstaking transactions.
+@@ -546,6 +550,8 @@ impl ConsensusOrchestrator {
+         let finalized = match engine_handle.fork_choice_updated(fcu_state, None).await {
+             Ok(result) => {
+                 let elapsed_ms = fcu_start.elapsed().as_millis() as u64;
++                histogram!("n42_fcu_latency_ms", "attempt" => "first")
++                    .record(elapsed_ms as f64);
+                 info!(target: "n42::cl::consensus_loop", view, %block_hash, status = ?result.payload_status.status, elapsed_ms, "N42_FCU: finalize fcu");
+                 matches!(
+                     result.payload_status.status,
+@@ -553,6 +559,8 @@ impl ConsensusOrchestrator {
+                 )
+             }
+             Err(e) => {
++                histogram!("n42_fcu_latency_ms", "attempt" => "first_err")
++                    .record(fcu_start.elapsed().as_millis() as f64);
+                 warn!(target: "n42::cl::consensus_loop", view, %block_hash, error = %e, "fork_choice_updated failed");
+                 false
+             }
+@@ -586,6 +594,8 @@ impl ConsensusOrchestrator {
+                 match engine_handle.fork_choice_updated(retry_fcu, None).await {
+                     Ok(result) => {
+                         let retry_ms = retry_start.elapsed().as_millis() as u64;
++                        histogram!("n42_fcu_latency_ms", "attempt" => "retry")
++                            .record(retry_ms as f64);
+                         info!(target: "n42::cl::consensus_loop", view, %block_hash, status = ?result.payload_status.status, retry_ms, "N42_FCU_RETRY: retry fcu after eager import");
+                         matches!(
+                             result.payload_status.status,
+@@ -593,6 +603,8 @@ impl ConsensusOrchestrator {
+                         )
+                     }
+                     Err(e) => {
++                        histogram!("n42_fcu_latency_ms", "attempt" => "retry_err")
++                            .record(retry_start.elapsed().as_millis() as f64);
+                         warn!(target: "n42::cl::consensus_loop", view, %block_hash, error = %e, "retry fcu failed");
+                         false
+                     }
+diff --git a/crates/n42-node/src/orchestrator/execution_bridge.rs b/crates/n42-node/src/orchestrator/execution_bridge.rs
+index ca93518..039326f 100644
+--- a/crates/n42-node/src/orchestrator/execution_bridge.rs
++++ b/crates/n42-node/src/orchestrator/execution_bridge.rs
+@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
+ use std::time::Duration;
+ use tokio::sync::mpsc;
+ use tokio::time::Instant;
+-use tracing::{debug, error, info, warn};
++use tracing::{Instrument, debug, error, info, warn};
+ 
+ /// Whether Compact Block (follower EVM skip) is enabled.
+ /// Controlled by `N42_COMPACT_BLOCK` env var: "0" to disable, anything else or absent = enabled.
+@@ -579,6 +579,12 @@ impl ConsensusOrchestrator {
+             let leader_ready_unix_ms = broadcast.leader_ready_unix_ms;
+             let eager_done_tx = self.eager_import_done_tx.clone();
+             let block_guard = self.eager_import_block_guard.clone();
++            let eager_span = tracing::info_span!(
++                target: "n42.cl.exec_bridge.eager_import",
++                "follower_eager_import",
++                %hash,
++                view,
++            );
+             tokio::spawn(async move {
+                 let decompress_start = std::time::Instant::now();
+                 let payload_json = match super::decompress_payload(&payload_compressed) {
+@@ -688,6 +694,11 @@ impl ConsensusOrchestrator {
+                             metrics::counter!("n42_compact_block_cache_hits").increment(1);
+                         }
+                         metrics::counter!("n42_follower_eager_import_hits_total").increment(1);
++                        metrics::counter!(
++                            "n42_eager_import_outcomes_total",
++                            "role" => "follower", "outcome" => "hit"
++                        )
++                        .increment(1);
+                         if eager_done_tx.send((hash, block_ts)).await.is_err() {
+                             debug!(target: "n42::cl::exec_bridge", %hash, view, "eager import completion receiver dropped");
+                         }
+@@ -697,15 +708,25 @@ impl ConsensusOrchestrator {
+                         if compact_injected {
+                             metrics::counter!("n42_compact_block_cache_misses").increment(1);
+                         }
++                        metrics::counter!(
++                            "n42_eager_import_outcomes_total",
++                            "role" => "follower", "outcome" => "stale"
++                        )
++                        .increment(1);
+                     }
+                     Err(e) => {
+                         debug!(target: "n42::cl::exec_bridge", %hash, view, error = %e, compact_injected, "follower eager import: failed");
+                         if compact_injected {
+                             metrics::counter!("n42_compact_block_cache_misses").increment(1);
+                         }
++                        metrics::counter!(
++                            "n42_eager_import_outcomes_total",
++                            "role" => "follower", "outcome" => "error"
++                        )
++                        .increment(1);
+                     }
+                 }
+-            });
++            }.instrument(eager_span));
+         }
+     }
+ 
+@@ -1012,6 +1033,12 @@ impl ConsensusOrchestrator {
+ /// eliminating the ~200ms pipeline stall from the background import path (Case B).
+ /// If consensus is faster than import, Case B still works as a fallback.
+ #[allow(clippy::too_many_arguments)]
++#[tracing::instrument(
++    target = "n42.cl.exec_bridge.leader_emit",
++    name = "leader_emit",
++    skip_all,
++    fields(view = current_view, hash = tracing::field::Empty, block_number = tracing::field::Empty)
++)]
+ async fn handle_built_payload(
+     payload: EthBuiltPayload,
+     engine_handle: ConsensusEngineHandle<EthEngineTypes>,
+@@ -1024,6 +1051,11 @@ async fn handle_built_payload(
+     block_guard: Arc<std::sync::atomic::AtomicU64>,
+ ) {
+     let hash = payload.block().hash();
++    {
++        let span = tracing::Span::current();
++        span.record("hash", tracing::field::display(&hash));
++        span.record("block_number", payload.block().header().number);
++    }
+ 
+     let execution_data =
+         <EthEngineTypes as PayloadTypes>::block_to_payload(payload.block().clone());
+@@ -1112,6 +1144,11 @@ async fn handle_built_payload(
+             let np_elapsed = import_start.elapsed().as_millis() as u64;
+             info!(target: "n42::cl::exec_bridge", %hash, np_elapsed, "eager import: new_payload accepted (no FCU)");
+             metrics::counter!("n42_eager_import_hits_total").increment(1);
++            metrics::counter!(
++                "n42_eager_import_outcomes_total",
++                "role" => "leader", "outcome" => "hit"
++            )
++            .increment(1);
+             if eager_import_done_tx
+                 .send((hash, block_timestamp))
+                 .await
+@@ -1122,13 +1159,24 @@ async fn handle_built_payload(
+         }
+         Ok(status) => {
+             info!(target: "n42::cl::exec_bridge", %hash, status = ?status.status, elapsed_ms = import_start.elapsed().as_millis() as u64, "eager import: new_payload not accepted");
++            metrics::counter!(
++                "n42_eager_import_outcomes_total",
++                "role" => "leader", "outcome" => "stale"
++            )
++            .increment(1);
+         }
+         Err(e) => {
+             info!(target: "n42::cl::exec_bridge", %hash, error = %e, "eager import: new_payload failed");
++            metrics::counter!(
++                "n42_eager_import_outcomes_total",
++                "role" => "leader", "outcome" => "error"
++            )
++            .increment(1);
+         }
+     }
+ }
+ 
++#[allow(clippy::too_many_arguments)]
+ async fn broadcast_block_data(
+     network: &NetworkHandle,
+     leader_payload_tx: &mpsc::Sender<(B256, Vec<u8>)>,
+diff --git a/crates/n42-parallel-evm/src/mv_memory.rs b/crates/n42-parallel-evm/src/mv_memory.rs
+index 41eb216..a2b3f78 100644
+--- a/crates/n42-parallel-evm/src/mv_memory.rs
++++ b/crates/n42-parallel-evm/src/mv_memory.rs
+@@ -19,6 +19,13 @@ pub enum MvRead<T> {
+     NotFound,
+ }
+ 
++/// Per-tx write key for clear_tx indexing.
++#[derive(Debug, Clone)]
++enum WriteKey {
++    Account(Address),
++    Storage(Address, U256),
++}
++
+ /// Thread-safe multi-version memory backing the Block-STM parallel execution.
+ pub struct MvMemory {
+     /// Account info: address → { tx_idx → account_info }
+@@ -27,6 +34,9 @@ pub struct MvMemory {
+     storage: DashMap<(Address, U256), RwLock<BTreeMap<TxIdx, U256>>>,
+     /// Code cache (immutable per block — no versioning).
+     code: DashMap<B256, Bytecode>,
++    /// Per-tx write index: tx_idx → list of locations that tx wrote.
++    /// Used by `clear_tx` to avoid O(|all_locations|) scans on re-execution.
++    tx_writes: DashMap<TxIdx, Vec<WriteKey>>,
+ }
+ 
+ impl Default for MvMemory {
+@@ -41,6 +51,7 @@ impl MvMemory {
+             accounts: DashMap::new(),
+             storage: DashMap::new(),
+             code: DashMap::new(),
++            tx_writes: DashMap::new(),
+         }
+     }
+ 
+@@ -67,6 +78,10 @@ impl MvMemory {
+             .write()
+             .unwrap_or_else(|e| e.into_inner())
+             .insert(writer_idx, info);
++        self.tx_writes
++            .entry(writer_idx)
++            .or_default()
++            .push(WriteKey::Account(addr));
+     }
+ 
+     /// Read storage slot visible to `reader_idx`.
+@@ -88,6 +103,10 @@ impl MvMemory {
+             .write()
+             .unwrap_or_else(|e| e.into_inner())
+             .insert(writer_idx, value);
++        self.tx_writes
++            .entry(writer_idx)
++            .or_default()
++            .push(WriteKey::Storage(addr, slot));
+     }
+ 
+     /// Cache code by hash (immutable, no versioning).
+@@ -101,18 +120,59 @@ impl MvMemory {
+     }
+ 
+     /// Remove all entries written by `tx_idx` (used before re-execution).
++    ///
++    /// O(|writes_of_tx|) via the per-tx write index; falls back to a full scan if the
++    /// index entry is missing (defense-in-depth for any caller that bypasses
++    /// `write_account` / `write_storage`).
+     pub fn clear_tx(&self, tx_idx: TxIdx) {
+-        for entry in self.accounts.iter() {
+-            entry
+-                .write()
+-                .unwrap_or_else(|e| e.into_inner())
+-                .remove(&tx_idx);
++        let start = std::time::Instant::now();
++        let mut writes_count: usize = 0;
++        let mut used_fallback = false;
++        if let Some((_, writes)) = self.tx_writes.remove(&tx_idx) {
++            writes_count = writes.len();
++            for w in writes {
++                match w {
++                    WriteKey::Account(addr) => {
++                        if let Some(entry) = self.accounts.get(&addr) {
++                            entry
++                                .write()
++                                .unwrap_or_else(|e| e.into_inner())
++                                .remove(&tx_idx);
++                        }
++                    }
++                    WriteKey::Storage(addr, slot) => {
++                        if let Some(entry) = self.storage.get(&(addr, slot)) {
++                            entry
++                                .write()
++                                .unwrap_or_else(|e| e.into_inner())
++                                .remove(&tx_idx);
++                        }
++                    }
++                }
++            }
++        } else {
++            used_fallback = true;
++            for entry in self.accounts.iter() {
++                entry
++                    .write()
++                    .unwrap_or_else(|e| e.into_inner())
++                    .remove(&tx_idx);
++            }
++            for entry in self.storage.iter() {
++                entry
++                    .write()
++                    .unwrap_or_else(|e| e.into_inner())
++                    .remove(&tx_idx);
++            }
+         }
+-        for entry in self.storage.iter() {
+-            entry
+-                .write()
+-                .unwrap_or_else(|e| e.into_inner())
+-                .remove(&tx_idx);
++        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
++        metrics::histogram!(
++            "n42_mv_memory_clear_tx_ms",
++            "path" => if used_fallback { "fallback_scan" } else { "indexed" }
++        )
++        .record(elapsed_ms);
++        if !used_fallback {
++            metrics::histogram!("n42_mv_memory_clear_tx_writes").record(writes_count as f64);
+         }
+     }
+ 
+diff --git a/docs/01-System-Architecture.md b/docs/01-System-Architecture.md
+index dd44a62..84e7023 100644
+--- a/docs/01-System-Architecture.md
++++ b/docs/01-System-Architecture.md
+@@ -116,7 +116,7 @@ Primary code:
+ - [`crates/n42-jmt/src/`](crates/n42-jmt/src)
+ - [`crates/n42-zkproof/src/`](crates/n42-zkproof/src)
+ 
+-> **⚠️ JMT 未接入生产**：`ShardedJmt` 在 `main.rs` 中从未构造。orchestrator 和 RPC 的 `with_jmt()` builder 已就绪但未调用。`n42_jmtProof`/`n42_jmtVersion` RPC 永远返回 "JMT not enabled"。需要在启动流程中创建实例并接线。
++> **✅ JMT 已接入生产**：`ShardedJmt` 在 `bin/n42-node/src/main.rs:702`（RPC）和 `:1231`（orchestrator）通过 `with_jmt()` builder 注入。详见 `docs/devlog-52-jmt-full-integration.md`。`apply_diff` 在 commit 后通过 spawn_blocking 异步更新，不在共识关键路径。`n42_jmtRoot` / `n42_jmtProof` / `n42_jmtVersion` RPC 已可用。
+ 
+ ### 6. Staking plane
+ 
+@@ -208,14 +208,14 @@ Each module's end-to-end integration status: constructed in `main.rs` → events
+ | Crash Recovery | ✅ Wired | always | `main.rs:440` → `ConsensusEngine::with_recovered_state` |
+ | ZK ProofScheduler | ✅ Wired | `N42_ZK_PROOF=1` | `main.rs:535` → `consensus_loop:413` → `on_block_committed` |
+ | Validator Reconfig RPC | ✅ Wired | always | `main.rs:515` → admin channel → orchestrator select! |
+-| **JMT (ShardedJmt)** | **❌ Stub** | **never** | `with_jmt()` builder exists but **never called in main.rs** |
+-| **Parallel EVM** | **❌ Dead** | **never** | crate exists but **zero references** in any production code |
++| JMT (ShardedJmt) | ✅ Wired | always | `main.rs:702, 1231` → `with_jmt()` → `consensus_loop.rs` apply_diff (spawn_blocking) |
++| Parallel EVM | ⚙️ Opt-in | `N42_PARALLEL_EVM=1` | `executor.rs:130` `parallel_evm_enabled()` → `execute_block_parallel` (off by default) |
+ 
+ ### Open issues
+ 
+-1. **JMT 未接入**：orchestrator (`mod.rs:329`) 和 RPC (`rpc.rs:234`) 有 `Option<Arc<Mutex<ShardedJmt>>>` 字段和 builder 方法，但 `main.rs` 从未构造 `ShardedJmt` 实例。consensus_loop 中的 `apply_diff` 代码（`consensus_loop.rs:366-408`）是死代码。需要：(a) 在 `main.rs` 中创建 `ShardedJmt`，(b) 调用 `orchestrator.with_jmt(jmt)` 和 `rpc_server.with_jmt(jmt)`。
+-2. **Parallel EVM 死代码**：`n42-parallel-evm` 是 workspace member 和 `n42-node` 依赖，但从未 import 或调用。执行层通过 `N42EvmConfig` → reth 标准路径。
+-3. **Admin RPC 无鉴权**：`proposeAddValidator`/`proposeRemoveValidator` 端点无权限控制，任何 RPC 客户端可调用。
++1. **Parallel EVM opt-in**：`n42-parallel-evm` 由 `N42_PARALLEL_EVM=1` 门控（`executor.rs:130` `parallel_evm_enabled`），默认走 reth 标准串行路径。Block-STM 在小块（< `N42_PARALLEL_THRESHOLD`，默认 8 tx）时回退顺序执行；devlog-28 评估 EVM 仅占 8s slot 约 5%，启用收益有限，仍是 opt-in。
++2. **Admin RPC 无鉴权**：`proposeAddValidator`/`proposeRemoveValidator` 端点无权限控制，任何 RPC 客户端可调用（除非启用 `N42_ADMIN_TOKEN`）。
++3. **base 编译需 reth 补丁**：reth path 依赖与 workspace 在 `alloy-evm` 版本上不一致（0.29.2 vs 0.30.0），导致 `n42-execution` 在未打 `../n42-26/reth-n42.patch` 时编译失败。
+ 
+ ## Shared state objects
+ 
+diff --git a/docs/02-Core-Flows.md b/docs/02-Core-Flows.md
+index 7883ea6..e432e1e 100644
+--- a/docs/02-Core-Flows.md
++++ b/docs/02-Core-Flows.md
+@@ -124,12 +124,12 @@ flowchart TD
+ ```mermaid
+ flowchart LR
+     A["Committed block"] --> B["Extract state diff"]
+-    B -.->|"dead: jmt is None"| C["Background JMT apply_diff"]
+-    C -.-> D["Update root/version in SharedConsensusState"]
+-    D -.-> E["RPC jmtRoot / jmtProof"]
++    B --> C["Background JMT apply_diff (spawn_blocking)"]
++    C --> D["Update root/version in SharedConsensusState"]
++    D --> E["RPC jmtRoot / jmtProof"]
+ ```
+ 
+-**需要修复**：在 `main.rs` 中添加 `ShardedJmt` 构造（参照 ZK scheduler 的 `N42_ZK_PROOF` 环境变量模式），调用 `orchestrator.with_jmt(jmt)` 和 `rpc_server.with_jmt(jmt)`。
++JMT 在 `bin/n42-node/src/main.rs:702`（RPC）和 `:1231`（orchestrator）通过 `with_jmt()` 注入。`apply_diff` 在 `consensus_loop.rs` 的 `handle_block_committed()` 末段 `spawn_blocking` 异步执行（详见 `devlog-52-jmt-full-integration.md`），不在共识关键路径上；每 100 块自动 `prune(200)` 回收旧版本。State root 时间通过 `n42_state_root_apply_diff_ms` histogram 暴露。
+ 
+ ## 7. ZK sidecar path
+ 

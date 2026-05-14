@@ -192,7 +192,7 @@ mod tests {
             .filter_map(|(hashed, maybe_account)| {
                 maybe_account
                     .as_ref()
-                    .and_then(|a| address_preimages.get(hashed).map(|addr| (*addr, a.clone())))
+                    .and_then(|a| address_preimages.get(hashed).map(|addr| (*addr, *a)))
             })
             .collect();
 
@@ -307,7 +307,7 @@ mod tests {
                 let result = address_preimages
                     .get(ha)
                     .copied()
-                    .ok_or_else(|| PacketBuildError::MissingAccountPreimage(*ha));
+                    .ok_or(PacketBuildError::MissingAccountPreimage(*ha));
                 assert!(result.is_err());
                 assert!(matches!(
                     result.unwrap_err(),

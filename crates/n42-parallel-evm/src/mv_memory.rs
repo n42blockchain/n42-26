@@ -19,6 +19,13 @@ pub enum MvRead<T> {
     NotFound,
 }
 
+/// Per-tx write key for clear_tx indexing.
+#[derive(Debug, Clone)]
+enum WriteKey {
+    Account(Address),
+    Storage(Address, U256),
+}
+
 /// Thread-safe multi-version memory backing the Block-STM parallel execution.
 pub struct MvMemory {
     /// Account info: address → { tx_idx → account_info }
@@ -27,6 +34,9 @@ pub struct MvMemory {
     storage: DashMap<(Address, U256), RwLock<BTreeMap<TxIdx, U256>>>,
     /// Code cache (immutable per block — no versioning).
     code: DashMap<B256, Bytecode>,
+    /// Per-tx write index: tx_idx → list of locations that tx wrote.
+    /// Used by `clear_tx` to avoid O(|all_locations|) scans on re-execution.
+    tx_writes: DashMap<TxIdx, Vec<WriteKey>>,
 }
 
 impl Default for MvMemory {
@@ -41,6 +51,7 @@ impl MvMemory {
             accounts: DashMap::new(),
             storage: DashMap::new(),
             code: DashMap::new(),
+            tx_writes: DashMap::new(),
         }
     }
 
@@ -67,6 +78,10 @@ impl MvMemory {
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .insert(writer_idx, info);
+        self.tx_writes
+            .entry(writer_idx)
+            .or_default()
+            .push(WriteKey::Account(addr));
     }
 
     /// Read storage slot visible to `reader_idx`.
@@ -88,6 +103,10 @@ impl MvMemory {
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .insert(writer_idx, value);
+        self.tx_writes
+            .entry(writer_idx)
+            .or_default()
+            .push(WriteKey::Storage(addr, slot));
     }
 
     /// Cache code by hash (immutable, no versioning).
@@ -101,18 +120,59 @@ impl MvMemory {
     }
 
     /// Remove all entries written by `tx_idx` (used before re-execution).
+    ///
+    /// O(|writes_of_tx|) via the per-tx write index; falls back to a full scan if the
+    /// index entry is missing (defense-in-depth for any caller that bypasses
+    /// `write_account` / `write_storage`).
     pub fn clear_tx(&self, tx_idx: TxIdx) {
-        for entry in self.accounts.iter() {
-            entry
-                .write()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&tx_idx);
+        let start = std::time::Instant::now();
+        let mut writes_count: usize = 0;
+        let mut used_fallback = false;
+        if let Some((_, writes)) = self.tx_writes.remove(&tx_idx) {
+            writes_count = writes.len();
+            for w in writes {
+                match w {
+                    WriteKey::Account(addr) => {
+                        if let Some(entry) = self.accounts.get(&addr) {
+                            entry
+                                .write()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .remove(&tx_idx);
+                        }
+                    }
+                    WriteKey::Storage(addr, slot) => {
+                        if let Some(entry) = self.storage.get(&(addr, slot)) {
+                            entry
+                                .write()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .remove(&tx_idx);
+                        }
+                    }
+                }
+            }
+        } else {
+            used_fallback = true;
+            for entry in self.accounts.iter() {
+                entry
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&tx_idx);
+            }
+            for entry in self.storage.iter() {
+                entry
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&tx_idx);
+            }
         }
-        for entry in self.storage.iter() {
-            entry
-                .write()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&tx_idx);
+        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+        metrics::histogram!(
+            "n42_mv_memory_clear_tx_ms",
+            "path" => if used_fallback { "fallback_scan" } else { "indexed" }
+        )
+        .record(elapsed_ms);
+        if !used_fallback {
+            metrics::histogram!("n42_mv_memory_clear_tx_writes").record(writes_count as f64);
         }
     }
 

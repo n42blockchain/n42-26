@@ -44,7 +44,9 @@ impl TokenBucket {
     /// Adds tokens accrued since `last_refill` (capped at `burst`), then
     /// consumes one if available. Returns `true` if a token was consumed.
     fn try_consume(&mut self, burst: u32, refill_per_sec: u32, now: Instant) -> bool {
-        let elapsed = now.saturating_duration_since(self.last_refill).as_secs_f64();
+        let elapsed = now
+            .saturating_duration_since(self.last_refill)
+            .as_secs_f64();
         self.tokens = (self.tokens + elapsed * refill_per_sec as f64).min(burst as f64);
         self.last_refill = now;
         if self.tokens >= 1.0 {

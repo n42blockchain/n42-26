@@ -58,18 +58,26 @@ impl ConsensusEngine {
         let view_set = self.validator_set_for_view(view);
         let pk = view_set.get_public_key(vote.voter)?;
         let msg = signing_message(view, &vote.block_hash);
-        pk.verify_prevalidated(&msg, &vote.signature)
-            .map_err(|_| ConsensusError::InvalidSignature {
+        pk.verify_prevalidated(&msg, &vote.signature).map_err(|_| {
+            ConsensusError::InvalidSignature {
                 view,
                 validator_index: vote.voter,
-            })?;
+            }
+        })?;
 
         // Equivocation check is gated on a verified signature so that an unauthenticated
         // peer cannot poison the tracker against a real voter.
-        if let Some((h1, h2)) = check_equivocation(&mut self.equivocation_tracker, vote.voter, vote.block_hash) {
+        if let Some((h1, h2)) =
+            check_equivocation(&mut self.equivocation_tracker, vote.voter, vote.block_hash)
+        {
             tracing::warn!(target: "n42::cl::voting", view, validator = vote.voter,
                 hash1 = %h1, hash2 = %h2, "vote equivocation detected");
-            self.emit(EngineOutput::EquivocationDetected { view, validator: vote.voter, hash1: h1, hash2: h2 })?;
+            self.emit(EngineOutput::EquivocationDetected {
+                view,
+                validator: vote.voter,
+                hash1: h1,
+                hash2: h2,
+            })?;
             return Ok(());
         }
 
@@ -190,18 +198,28 @@ impl ConsensusEngine {
         let pk = view_set.get_public_key(cv.voter)?;
         let changes_hash = self.cached_changes_hash(&cv.block_hash);
         let msg = commit_signing_message(view, &cv.block_hash, &changes_hash);
-        pk.verify_prevalidated(&msg, &cv.signature)
-            .map_err(|_| ConsensusError::InvalidSignature {
+        pk.verify_prevalidated(&msg, &cv.signature).map_err(|_| {
+            ConsensusError::InvalidSignature {
                 view,
                 validator_index: cv.voter,
-            })?;
+            }
+        })?;
 
         // R2 equivocation check — gated on verified signature, leader-only by design
         // (CommitVotes are sent directly to the leader, not broadcast).
-        if let Some((h1, h2)) = check_equivocation(&mut self.commit_equivocation_tracker, cv.voter, cv.block_hash) {
+        if let Some((h1, h2)) = check_equivocation(
+            &mut self.commit_equivocation_tracker,
+            cv.voter,
+            cv.block_hash,
+        ) {
             tracing::warn!(target: "n42::cl::voting", view, validator = cv.voter,
                 hash1 = %h1, hash2 = %h2, "commit-vote equivocation detected");
-            self.emit(EngineOutput::EquivocationDetected { view, validator: cv.voter, hash1: h1, hash2: h2 })?;
+            self.emit(EngineOutput::EquivocationDetected {
+                view,
+                validator: cv.voter,
+                hash1: h1,
+                hash2: h2,
+            })?;
             return Ok(());
         }
 

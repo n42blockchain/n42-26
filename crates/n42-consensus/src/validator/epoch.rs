@@ -927,7 +927,8 @@ mod tests {
         let vs = ValidatorSet::new(&infos, 1);
         let mut em = EpochManager::with_epoch_length(vs, 10);
 
-        em.propose_remove_validator(Address::with_last_byte(0)).unwrap();
+        em.propose_remove_validator(Address::with_last_byte(0))
+            .unwrap();
         assert!(em.has_pending_changes());
         assert_eq!(em.pending_removes.len(), 1);
     }
@@ -938,9 +939,14 @@ mod tests {
         let vs = ValidatorSet::new(&infos, 1);
         let mut em = EpochManager::with_epoch_length(vs, 10);
 
-        let err = em.propose_remove_validator(Address::with_last_byte(0)).unwrap_err();
+        let err = em
+            .propose_remove_validator(Address::with_last_byte(0))
+            .unwrap_err();
         assert!(
-            matches!(err, ConsensusError::InsufficientValidators { have: 3, need: 4 }),
+            matches!(
+                err,
+                ConsensusError::InsufficientValidators { have: 3, need: 4 }
+            ),
             "unexpected error: {err}"
         );
     }
@@ -979,7 +985,8 @@ mod tests {
             p2p_peer_id: None,
         };
         em.propose_add_validator(new_v).unwrap();
-        em.propose_remove_validator(Address::with_last_byte(0)).unwrap();
+        em.propose_remove_validator(Address::with_last_byte(0))
+            .unwrap();
 
         em.commit_pending_changes().unwrap();
 
@@ -991,8 +998,16 @@ mod tests {
         let new_infos = em.current_validator_set().validator_infos();
         assert_eq!(new_infos.len(), 5); // 5 - 1 + 1 = 5
         // 0x00 should be gone, 0x10 should be present
-        assert!(!new_infos.iter().any(|v| v.address == Address::with_last_byte(0)));
-        assert!(new_infos.iter().any(|v| v.address == Address::with_last_byte(0x10)));
+        assert!(
+            !new_infos
+                .iter()
+                .any(|v| v.address == Address::with_last_byte(0))
+        );
+        assert!(
+            new_infos
+                .iter()
+                .any(|v| v.address == Address::with_last_byte(0x10))
+        );
     }
 
     #[test]
@@ -1007,24 +1022,59 @@ mod tests {
         let sk1 = test_key(0x61);
         let sk2 = test_key(0x62);
         let completely_new: Vec<ValidatorInfo> = vec![
-            ValidatorInfo { address: Address::with_last_byte(0),    bls_public_key: infos[0].bls_public_key.clone(), p2p_peer_id: None },
-            ValidatorInfo { address: Address::with_last_byte(0x20), bls_public_key: sk0.public_key(), p2p_peer_id: None },
-            ValidatorInfo { address: Address::with_last_byte(0x21), bls_public_key: sk1.public_key(), p2p_peer_id: None },
-            ValidatorInfo { address: Address::with_last_byte(0x22), bls_public_key: sk2.public_key(), p2p_peer_id: None },
+            ValidatorInfo {
+                address: Address::with_last_byte(0),
+                bls_public_key: infos[0].bls_public_key.clone(),
+                p2p_peer_id: None,
+            },
+            ValidatorInfo {
+                address: Address::with_last_byte(0x20),
+                bls_public_key: sk0.public_key(),
+                p2p_peer_id: None,
+            },
+            ValidatorInfo {
+                address: Address::with_last_byte(0x21),
+                bls_public_key: sk1.public_key(),
+                p2p_peer_id: None,
+            },
+            ValidatorInfo {
+                address: Address::with_last_byte(0x22),
+                bls_public_key: sk2.public_key(),
+                p2p_peer_id: None,
+            },
         ];
         let err = em.validate_transition(&completely_new).unwrap_err();
         assert!(
-            matches!(err, ConsensusError::InsufficientQuorumOverlap { have: 1, need: 3 }),
+            matches!(
+                err,
+                ConsensusError::InsufficientQuorumOverlap { have: 1, need: 3 }
+            ),
             "unexpected error: {err}"
         );
 
         // New set: keep 0x00..0x02 (overlap=3 == 3) — should succeed
         let sk3 = test_key(0x63);
         let valid_new: Vec<ValidatorInfo> = vec![
-            ValidatorInfo { address: Address::with_last_byte(0), bls_public_key: infos[0].bls_public_key.clone(), p2p_peer_id: None },
-            ValidatorInfo { address: Address::with_last_byte(1), bls_public_key: infos[1].bls_public_key.clone(), p2p_peer_id: None },
-            ValidatorInfo { address: Address::with_last_byte(2), bls_public_key: infos[2].bls_public_key.clone(), p2p_peer_id: None },
-            ValidatorInfo { address: Address::with_last_byte(0x30), bls_public_key: sk3.public_key(), p2p_peer_id: None },
+            ValidatorInfo {
+                address: Address::with_last_byte(0),
+                bls_public_key: infos[0].bls_public_key.clone(),
+                p2p_peer_id: None,
+            },
+            ValidatorInfo {
+                address: Address::with_last_byte(1),
+                bls_public_key: infos[1].bls_public_key.clone(),
+                p2p_peer_id: None,
+            },
+            ValidatorInfo {
+                address: Address::with_last_byte(2),
+                bls_public_key: infos[2].bls_public_key.clone(),
+                p2p_peer_id: None,
+            },
+            ValidatorInfo {
+                address: Address::with_last_byte(0x30),
+                bls_public_key: sk3.public_key(),
+                p2p_peer_id: None,
+            },
         ];
         em.validate_transition(&valid_new).unwrap();
     }
@@ -1050,10 +1100,16 @@ mod tests {
         let new_infos = em.current_validator_set().validator_infos();
         // Verify ascending address order
         for w in new_infos.windows(2) {
-            assert!(w[0].address <= w[1].address, "validators not sorted by address");
+            assert!(
+                w[0].address <= w[1].address,
+                "validators not sorted by address"
+            );
         }
         // Last element should be 0xFF
-        assert_eq!(new_infos.last().unwrap().address, Address::with_last_byte(0xFF));
+        assert_eq!(
+            new_infos.last().unwrap().address,
+            Address::with_last_byte(0xFF)
+        );
     }
 
     #[test]
@@ -1097,7 +1153,9 @@ mod tests {
         let mut em = EpochManager::with_epoch_length(vs, 10);
 
         // Address 0xAB is not in the set
-        let err = em.propose_remove_validator(Address::with_last_byte(0xAB)).unwrap_err();
+        let err = em
+            .propose_remove_validator(Address::with_last_byte(0xAB))
+            .unwrap_err();
         assert!(
             matches!(err, ConsensusError::ValidatorNotFound { .. }),
             "unexpected error: {err}"
@@ -1112,10 +1170,13 @@ mod tests {
         let vs = ValidatorSet::new(&infos, 1);
         let mut em = EpochManager::with_epoch_length(vs, 10);
 
-        em.propose_remove_validator(Address::with_last_byte(0)).unwrap();
+        em.propose_remove_validator(Address::with_last_byte(0))
+            .unwrap();
         assert_eq!(em.pending_removes.len(), 1);
 
-        let err = em.propose_remove_validator(Address::with_last_byte(0)).unwrap_err();
+        let err = em
+            .propose_remove_validator(Address::with_last_byte(0))
+            .unwrap_err();
         assert!(
             matches!(err, ConsensusError::ValidatorAlreadyPendingRemoval { .. }),
             "unexpected error: {err}"
@@ -1157,7 +1218,9 @@ mod tests {
         );
 
         // Attempting to propose a remove must also fail
-        let err_rm = em.propose_remove_validator(Address::with_last_byte(0)).unwrap_err();
+        let err_rm = em
+            .propose_remove_validator(Address::with_last_byte(0))
+            .unwrap_err();
         assert!(
             matches!(err_rm, ConsensusError::EpochTransitionAlreadyStaged),
             "unexpected error: {err_rm}"
@@ -1231,7 +1294,8 @@ mod tests {
         let mut em = EpochManager::with_epoch_length(vs, 10);
         assert_eq!(em.current_validator_set().len(), 7);
 
-        em.propose_remove_validator(Address::with_last_byte(6)).unwrap();
+        em.propose_remove_validator(Address::with_last_byte(6))
+            .unwrap();
         em.commit_pending_changes().unwrap();
         em.advance_epoch(); // epoch 1: 6 validators
 
@@ -1239,14 +1303,16 @@ mod tests {
         assert_eq!(em.current_validator_set().fault_tolerance(), 1);
 
         // ── Epoch 1 → 2: 6 → 5 ──
-        em.propose_remove_validator(Address::with_last_byte(5)).unwrap();
+        em.propose_remove_validator(Address::with_last_byte(5))
+            .unwrap();
         em.commit_pending_changes().unwrap();
         em.advance_epoch(); // epoch 2: 5 validators
 
         assert_eq!(em.current_validator_set().len(), 5);
 
         // ── Epoch 2 → 3: 5 → 4 (minimum) ──
-        em.propose_remove_validator(Address::with_last_byte(4)).unwrap();
+        em.propose_remove_validator(Address::with_last_byte(4))
+            .unwrap();
         em.commit_pending_changes().unwrap();
         em.advance_epoch(); // epoch 3: 4 validators
 
@@ -1254,9 +1320,14 @@ mod tests {
         assert_eq!(em.current_validator_set().fault_tolerance(), 1); // f=(4-1)/3=1
 
         // ── Attempt 4 → 3: must be rejected ──
-        let err = em.propose_remove_validator(Address::with_last_byte(3)).unwrap_err();
+        let err = em
+            .propose_remove_validator(Address::with_last_byte(3))
+            .unwrap_err();
         assert!(
-            matches!(err, ConsensusError::InsufficientValidators { have: 3, need: 4 }),
+            matches!(
+                err,
+                ConsensusError::InsufficientValidators { have: 3, need: 4 }
+            ),
             "unexpected error: {err}"
         );
         // Set is still intact at 4 validators
@@ -1392,7 +1463,9 @@ mod tests {
             "expected EpochsDisabled, got: {err}"
         );
 
-        let err = em.propose_remove_validator(Address::with_last_byte(0)).unwrap_err();
+        let err = em
+            .propose_remove_validator(Address::with_last_byte(0))
+            .unwrap_err();
         assert!(
             matches!(err, ConsensusError::EpochsDisabled),
             "expected EpochsDisabled, got: {err}"

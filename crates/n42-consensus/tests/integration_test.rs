@@ -1,12 +1,23 @@
 //! Full integration test suite for the N42 HotStuff-2 consensus engine.
 //! Tests genesis bootstrap, multi-node consensus, mobile verification, fault tolerance, and stability.
 
+#![allow(
+    clippy::collapsible_if,
+    clippy::expect_fun_call,
+    clippy::identity_op,
+    clippy::manual_range_contains,
+    clippy::needless_range_loop,
+    clippy::unnecessary_cast
+)]
+
 use alloy_primitives::{Address, B256};
 use n42_chainspec::ValidatorInfo;
 use n42_consensus::error::ConsensusError;
 use n42_consensus::protocol::Phase;
 use n42_consensus::protocol::quorum::signing_message;
-use n42_consensus::{ConsensusEngine, ConsensusEvent, EpochManager, EngineOutput, LeaderSelector, ValidatorSet};
+use n42_consensus::{
+    ConsensusEngine, ConsensusEvent, EngineOutput, EpochManager, LeaderSelector, ValidatorSet,
+};
 use n42_primitives::BlsSecretKey;
 use n42_primitives::consensus::{ConsensusMessage, Proposal, QuorumCertificate, ViewNumber, Vote};
 use tokio::sync::mpsc;
@@ -1249,7 +1260,8 @@ mod fault_tolerance {
         let leader = harness.leader_for_view(view);
         let block_hash = B256::repeat_byte(0x5A);
 
-        let msg = n42_consensus::protocol::quorum::proposal_signing_message(view, &block_hash, &None);
+        let msg =
+            n42_consensus::protocol::quorum::proposal_signing_message(view, &block_hash, &None);
         let sig = harness.secret_keys[leader].sign(&msg);
 
         let bad_proposal = Proposal {
@@ -1288,7 +1300,8 @@ mod fault_tolerance {
         // Leader for view 1 is validator 1. Send proposal from validator 0.
         let block_hash = B256::repeat_byte(0x1B);
 
-        let msg = n42_consensus::protocol::quorum::proposal_signing_message(view, &block_hash, &None);
+        let msg =
+            n42_consensus::protocol::quorum::proposal_signing_message(view, &block_hash, &None);
         let sig = harness.secret_keys[0].sign(&msg);
 
         let bad_proposal = Proposal {
@@ -3192,8 +3205,8 @@ mod twenty_one_node {
             // Step 2: Non-leaders process proposal
             for i in 0..n {
                 if i != leader {
-                    let _ = self.engines[i]
-                        .process_event(ConsensusEvent::Message(proposal.clone()));
+                    let _ =
+                        self.engines[i].process_event(ConsensusEvent::Message(proposal.clone()));
                 }
             }
 
@@ -3224,14 +3237,12 @@ mod twenty_one_node {
 
             // Step 4: Leader broadcasts PrepareQC
             let leader_outputs = self.drain_outputs(leader);
-            let prepare_qc = leader_outputs
-                .iter()
-                .find_map(|o| match o {
-                    EngineOutput::BroadcastMessage(msg @ ConsensusMessage::PrepareQC(_)) => {
-                        Some(msg.clone())
-                    }
-                    _ => None,
-                });
+            let prepare_qc = leader_outputs.iter().find_map(|o| match o {
+                EngineOutput::BroadcastMessage(msg @ ConsensusMessage::PrepareQC(_)) => {
+                    Some(msg.clone())
+                }
+                _ => None,
+            });
 
             let prepare_qc = match prepare_qc {
                 Some(pqc) => pqc,
@@ -3244,8 +3255,8 @@ mod twenty_one_node {
             // Step 5: Non-leaders process PrepareQC and send CommitVotes
             for i in 0..n {
                 if i != leader {
-                    let _ = self.engines[i]
-                        .process_event(ConsensusEvent::Message(prepare_qc.clone()));
+                    let _ =
+                        self.engines[i].process_event(ConsensusEvent::Message(prepare_qc.clone()));
                 }
             }
 
@@ -3286,8 +3297,7 @@ mod twenty_one_node {
             for msg in &decide_msgs {
                 for i in 0..n {
                     if i != leader {
-                        let _ = self.engines[i]
-                            .process_event(ConsensusEvent::Message(msg.clone()));
+                        let _ = self.engines[i].process_event(ConsensusEvent::Message(msg.clone()));
                     }
                 }
             }
@@ -3299,8 +3309,7 @@ mod twenty_one_node {
             for i in 0..n {
                 if self.engines[i].current_view() < next_view {
                     for msg in &decide_msgs {
-                        let _ = self.engines[i]
-                            .process_event(ConsensusEvent::Message(msg.clone()));
+                        let _ = self.engines[i].process_event(ConsensusEvent::Message(msg.clone()));
                     }
                 }
             }
@@ -3356,7 +3365,10 @@ mod twenty_one_node {
             "should be in epoch 1 after crossing boundary"
         );
         assert_eq!(
-            harness.engines[0].epoch_manager().current_validator_set().len(),
+            harness.engines[0]
+                .epoch_manager()
+                .current_validator_set()
+                .len(),
             5,
             "should have 5 validators in epoch 1"
         );
@@ -3473,6 +3485,10 @@ mod twenty_one_node {
             .index_of_public_key(&sks[3].public_key())
             .unwrap();
         assert_eq!(engine.my_index(), expected);
-        assert_ne!(engine.my_index(), 0, "my_index should no longer be 0 (observer)");
+        assert_ne!(
+            engine.my_index(),
+            0,
+            "my_index should no longer be 0 (observer)"
+        );
     }
 }
