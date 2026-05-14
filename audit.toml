@@ -1,0 +1,38 @@
+# cargo-audit ignore list for known transitive-dep vulnerabilities.
+#
+# All entries below are vulnerabilities in dependencies that N42 does NOT
+# control directly — they come through libp2p 0.54, reth path, rustls and
+# similar upstream crates. Resolving them requires those upstreams to publish
+# new releases. cargo-audit still surfaces NEW advisories not in this list,
+# so the workflow continues to catch regressions.
+#
+# Owner: revisit this list whenever reth or libp2p is bumped. Drop entries
+# whose source dependency has since released a fixed version.
+
+[advisories]
+ignore = [
+    # hickory-proto (transitive via libp2p-mdns / libp2p-dns / reth-dns-discovery).
+    # Two CPU exhaustion advisories at 0.24.4 and 0.25.2; fix is 0.26.1+ but
+    # libp2p 0.54 pins 0.24 and reth 2.2.0 pins 0.25. Waiting on upstream bumps.
+    "RUSTSEC-2026-0119",
+    # hickory-proto NSEC3 unbounded loop on cross-zone responses. No fixed
+    # upgrade available from upstream as of this writing.
+    "RUSTSEC-2026-0118",
+
+    # ring 0.16.20 AES panic. Reaches us via the rcgen 0.11 line that some
+    # transitive deps still pull in (we already pin rcgen 0.14.7 directly,
+    # which uses ring 0.17). Will drop when offending older rcgen disappears
+    # from the lock file.
+    "RUSTSEC-2025-0009",
+
+    # rustls-webpki — three advisories at the same crate version, all
+    # transitive via rustls 0.23 (our direct pin) plus reth/libp2p chains.
+    # Waiting on rustls-webpki 0.103.12+ to propagate through the dep graph.
+    "RUSTSEC-2026-0098",
+    "RUSTSEC-2026-0099",
+    "RUSTSEC-2026-0104",
+
+    # tracing-subscriber 0.3 < 0.3.20 — ANSI-escape log poisoning. Transitive
+    # via reth/libp2p tracing setup. Will lift when reth bumps the dep.
+    "RUSTSEC-2025-0055",
+]
