@@ -143,6 +143,13 @@ impl NodeProcess {
             .arg("--http")
             .arg("--http.port")
             .arg(http_port.to_string())
+            // reth v2 narrows the default --http.api set; scenario 12 expects
+            // debug_traceTransaction / debug_traceBlockByNumber to be reachable
+            // (and other scenarios rely on the standard eth/net/web3/txpool/rpc
+            // namespaces). Enumerate them explicitly so the harness is robust
+            // against future reth default changes.
+            .arg("--http.api")
+            .arg("eth,net,web3,txpool,rpc,debug,trace,admin")
             .arg("--ws")
             .arg("--ws.port")
             .arg(ws_port.to_string())

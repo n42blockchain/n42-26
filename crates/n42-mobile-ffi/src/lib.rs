@@ -547,11 +547,10 @@ pub unsafe extern "C" fn n42_get_stats(
     }
 
     let stats = lock_or_recover(&ctx.stats);
-    let avg_time = if stats.blocks_verified > 0 {
-        stats.total_verify_time_ms / stats.blocks_verified
-    } else {
-        0
-    };
+    let avg_time = stats
+        .total_verify_time_ms
+        .checked_div(stats.blocks_verified)
+        .unwrap_or(0);
     let success_rate = if stats.blocks_verified > 0 {
         (stats.success_count as f64 / stats.blocks_verified as f64 * 100.0) as u64
     } else {

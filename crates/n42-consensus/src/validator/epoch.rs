@@ -232,13 +232,13 @@ impl EpochManager {
     /// Computes which epoch a given view belongs to.
     /// Returns 0 when epochs are disabled.
     pub fn epoch_for_view(&self, view: u64) -> u64 {
-        if self.epoch_length == 0 {
-            0
-        } else {
-            // Views start at 1, so view 1..=epoch_length → epoch 0,
-            // view (epoch_length+1)..=(2*epoch_length) → epoch 1, etc.
-            view.saturating_sub(1) / self.epoch_length
-        }
+        // Views start at 1, so view 1..=epoch_length → epoch 0,
+        // view (epoch_length+1)..=(2*epoch_length) → epoch 1, etc.
+        // `checked_div` returns None when epochs are disabled (epoch_length == 0),
+        // matching the original "epochs disabled → epoch 0" semantics.
+        view.saturating_sub(1)
+            .checked_div(self.epoch_length)
+            .unwrap_or(0)
     }
 
     /// Checks if a given view is the first view of a new epoch.
