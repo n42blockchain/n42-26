@@ -487,8 +487,7 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
     // === V4: ETH transfer receipts (sample check) ===
     // Check a sample of ETH tx receipts for status=1.
     let sample_size = eth_tx_hashes.len().min(50);
-    if sample_size > 0 {
-        let step = eth_tx_hashes.len() / sample_size;
+    if let Some(step) = eth_tx_hashes.len().checked_div(sample_size) {
         let mut ok = 0;
         let mut failed = 0;
         for i in (0..eth_tx_hashes.len())

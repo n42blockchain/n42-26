@@ -451,8 +451,7 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
     {
         let sample_count = 10.min(min_height as usize);
         let mut hash_mismatch = false;
-        if sample_count > 0 {
-            let step = min_height / sample_count as u64;
+        if let Some(step) = min_height.checked_div(sample_count as u64) {
             for s in 0..sample_count {
                 let check_height = 1 + s as u64 * step;
                 let mut hashes = Vec::new();
