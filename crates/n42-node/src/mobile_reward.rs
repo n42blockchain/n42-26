@@ -104,7 +104,7 @@ impl MobileRewardManager {
         // remaining entries (Drain::drop clears the HashMap), causing those
         // validators to lose their rewards without any log message.
         let mut entries: Vec<([u8; 48], u64)> = self.epoch_attestations.drain().collect();
-        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        entries.sort_by_key(|a| a.0);
 
         let remaining_capacity = MAX_REWARD_QUEUE_SIZE - self.reward_queue.len();
         if entries.len() > remaining_capacity {

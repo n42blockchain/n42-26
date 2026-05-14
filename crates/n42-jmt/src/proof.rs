@@ -170,7 +170,7 @@ mod tests {
         let key = account_key(&addr);
 
         let proof = build_proof(&jmt, key).unwrap().expect("proof should exist");
-        assert_eq!(proof.shard_index, (key.0[0] >> 4) as u8);
+        assert_eq!(proof.shard_index, key.0[0] >> 4);
         assert!(proof.value.is_some());
         assert_eq!(proof.shard_roots.len(), 16);
 
