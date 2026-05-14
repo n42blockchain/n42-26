@@ -2701,6 +2701,7 @@ mod twenty_one_node {
 
     /// Stability: verify locked_qc monotonicity over 50 mixed rounds.
     #[test]
+    #[allow(clippy::explicit_counter_loop)] // `view` is an explicit 1-indexed counter, kept separate from the 0-indexed `round` for readability.
     fn test_21v_locked_qc_monotonic() {
         let mut harness = TestHarness::new(21);
 
@@ -2784,6 +2785,7 @@ mod twenty_one_node {
 
     /// All 21 engines should remain view-consistent after 200 mixed rounds.
     #[test]
+    #[allow(clippy::explicit_counter_loop)] // `view` is an explicit 1-indexed counter, kept separate from the 0-indexed `round` for readability.
     fn test_21v_view_consistency_200_rounds() {
         let mut harness = TestHarness::new(21);
 
