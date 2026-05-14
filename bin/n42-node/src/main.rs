@@ -178,10 +178,9 @@ fn build_validator_set_resolver(
     epoch_schedule: Option<EpochSchedule>,
 ) -> ValidatorSetResolver {
     Arc::new(move |view: u64| {
-        let (validators, fault_tolerance) = if epoch_length == 0 {
-            (initial_validator_infos.as_slice(), initial_fault_tolerance)
-        } else {
-            let epoch = view.saturating_sub(1) / epoch_length;
+        // `checked_div` returns None when epoch_length == 0 (epochs disabled).
+        let epoch_opt = view.saturating_sub(1).checked_div(epoch_length);
+        let (validators, fault_tolerance) = if let Some(epoch) = epoch_opt {
             epoch_schedule
                 .as_ref()
                 .map(|schedule| {
@@ -192,6 +191,8 @@ fn build_validator_set_resolver(
                     )
                 })
                 .unwrap_or((initial_validator_infos.as_slice(), initial_fault_tolerance))
+        } else {
+            (initial_validator_infos.as_slice(), initial_fault_tolerance)
         };
 
         ValidatorSet::try_new(validators, fault_tolerance)
