@@ -215,7 +215,6 @@ Each module's end-to-end integration status: constructed in `main.rs` → events
 
 1. **Parallel EVM opt-in**：`n42-parallel-evm` 由 `N42_PARALLEL_EVM=1` 门控（`executor.rs:130` `parallel_evm_enabled`），默认走 reth 标准串行路径。Block-STM 在小块（< `N42_PARALLEL_THRESHOLD`，默认 8 tx）时回退顺序执行；devlog-28 评估 EVM 仅占 8s slot 约 5%，启用收益有限，仍是 opt-in。
 2. **Admin RPC 无鉴权**：`proposeAddValidator`/`proposeRemoveValidator` 端点无权限控制，任何 RPC 客户端可调用（除非启用 `N42_ADMIN_TOKEN`）。
-3. **base 编译需 reth 补丁**：reth path 依赖与 workspace 在 `alloy-evm` 版本上不一致（0.29.2 vs 0.30.0），导致 `n42-execution` 在未打 `../n42-26/reth-n42.patch` 时编译失败。
 
 ## Shared state objects
 

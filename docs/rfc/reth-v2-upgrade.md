@@ -183,46 +183,53 @@ cargo build --release -p n42-node-bin
 - 阅读上游 reth v1.11.x → v2.0 release notes（链接：https://github.com/paradigmxyz/reth/releases）
 - 阅读 alloy-evm 0.30 → 0.34 changelog
 
-## Stage 2 Attempt Notes (2026-05-13)
+## Stage 2 Completion (2026-05-14)
 
-阶段 2 在本会话中已部分尝试，**因 reth v2.x 上游 Windows 兼容性 bug 受阻**，主体改动已 snapshot 到 patch 文件保留：
+阶段 2 已落地。从 reth v1.11.3 (commit `27781443a`) + 705 行 `reth-n42.patch` 升级到
+`n42blockchain/reth @ n42-v2-upgrade` (commit `77e0b8c25`，基于 v2.2.0 + 重新 rebase 的
+N42 hooks + roaring 0.11.4 + fs-util Windows 兼容性 fix)。workspace 升 `alloy-evm 0.34`、
+`revm 38`、`alloy-* 2.0.4`、`reth-primitives-traits 0.3.1`。
 
-### 已完成的改动（保留为 patch，未应用）
+### 落地 commit
 
-- `stage2-workspace-deps.patch` (48 行)：workspace Cargo.toml deps bump（alloy-evm 0.34, revm 38, alloy-consensus/eips/genesis/rpc-types-engine/signer/signer-local/network/rpc-types-eth → 2.0.4, reth-primitives-traits → 0.3.1）
-- `stage2-n42-execution.patch` (155 行)：
-  - `evm_factory.rs` 重写 — 用 `EthEvmBuilder::new(db, evm_env).precompiles(...).build()` 替代 `Context::mainnet()` 模式
-  - `precompile_random.rs` — `PrecompileFn` 加 `reservoir: u64` 第 3 参数（EIP-8037 状态 gas 分离）；revm 38 把 `PrecompileError` 拆为 `PrecompileError`(fatal) + `PrecompileHalt`(non-fatal)，`OutOfGas` / `Other` 走 halt 路径返回 `Ok(PrecompileOutput::halt(...))`
-  - `witness.rs` — `ExecutionWitnessRecord::from_executed_state(state)` 加 `mode: ExecutionWitnessMode` 第 2 参数；N42 选 `ExecutionWitnessMode::Legacy` 维持手机端兼容
-- `stage2-n42-parallel-evm.patch` (165 行)：`result.gas_used()` → `tx_gas_used()`（EIP-8037 deprecation）
-- `stage2-reth-roaring-bump.patch` (13 行)：reth Cargo.toml `roaring = "0.11.3" → "0.11.4"`（v2.2.0 tag 上 `IntegerList` derive `Eq` 但 0.11.3 不 impl，这是 reth 上游已修但未合并到 v2.2.0 tag 的 base bug）
+| repo | branch | commit | 内容 |
+|---|---|---|---|
+| n42-26 | `dev2603` / `main` | `b1d1e06` | feat: upgrade reth to v2.2.0 + alloy-evm 0.34 + revm 38 |
+| n42-26 | `dev2603` / `main` | `d986a8b` | ci: point reth checkout to n42 fork @ n42-v2-upgrade |
+| n42-26 | `dev2603` / `main` | `4cf66d2 → 3396402` | 6 个 Rust 1.95 clippy fix commits |
+| reth | `n42blockchain/reth @ n42-v2-upgrade` | `77e0b8c25` | n42: reth v2.2.0 base + N42 hooks rebased + roaring 0.11.4 |
 
-### 受阻原因 — reth v2 Windows 兼容性
+### N42 hooks 在 v2.2.0 上重新落地的关键 file:line
 
-reth v2.2.0 与上游 main 在 `crates/static-file/types/src/changeset_offsets.rs` 中**无条件** `use std::os::unix::fs::FileExt;`，并把 `ChangesetOffsetReader/Writer` 类型用 `#[cfg(all(feature = "std", unix))]` 守门，导致 `crates/storage/provider/src/providers/static_file/{writer,mod}.rs` 在 Windows 上 `unresolved import` × 11 errors。
+- `crates/evm/evm/src/lib.rs` — `n42_skip_state_root()` / `n42_defer_state_root()` env helpers + `pub mod payload_cache`
+- `crates/evm/evm/src/execute.rs` — `BlockBuilder::finish` 加 `state_root_precomputed: Option<(B256, TrieUpdates)>` v2 参数，N42 skip 路径同步适配
+- `crates/engine/tree/src/tree/payload_validator.rs` — cache hit fast path + n42_skip_root 跳过验证 + state_root_match 守门
+- `crates/ethereum/payload/src/lib.rs` — 双槽 broadcast cache 写入 + `N42_MAX_TXS_PER_BLOCK` + tx packing budget + 3 项 perf 优化
+- `crates/evm/evm/src/payload_cache.rs` (new) — `CACHE` + `BROADCAST_CACHE` 双槽
+- `crates/fs-util/src/lib.rs` — `#[cfg(unix)]` 守护 fsync 目录调用（Windows 兼容性 bonus）
+- `crates/rpc/rpc-eth-types/src/utils.rs` — `N42_SKIP_TX_VERIFY` benchmark mode
 
-这是 reth **上游本身的 Windows compat 缺陷**，与 N42 patch 无关。CI（ubuntu-latest）应该可以 build；本地 Windows 无法。
+### 关键 breaking change 适配（n42-26 端）
 
-### 重启阶段 2 的前置条件（按优先级）
+- `crates/n42-execution/src/evm_factory.rs` — `Context::mainnet().with_db()…build()` 链 → `EthEvmBuilder::new(db, evm_env).precompiles(...).build()`；`PrecompileSpecId::from(spec)` → `from_spec_id(spec)`
+- `crates/n42-execution/src/precompile_random.rs` — `PrecompileFn` 加第 3 参数 `reservoir: u64`（EIP-8037 状态 gas 拆分）；revm 38 `PrecompileError` 拆为 `Error`(fatal) + `Halt`(non-fatal)，`OutOfGas` / `Other` 走 `Ok(PrecompileOutput::halt(...))`
+- `crates/n42-execution/src/witness.rs` — `ExecutionWitnessRecord::from_executed_state(state)` 加 `mode: ExecutionWitnessMode` 第 2 参数；N42 选 `Legacy` 维持手机端 packet 兼容
+- `crates/n42-parallel-evm/src/lib.rs` — `result.gas_used()` → `tx_gas_used()`（EIP-8037 deprecation）
+- 6 个 Rust 1.95 clippy fix 跟随 stable 工具链升级：`unnecessary_sort_by` × 2、`unnecessary_cast` × 1、`manual_checked_ops` × 5、`explicit_counter_loop` × 2
 
-1. **首选**：等 reth 上游为 `changeset_offsets.rs` 加 Windows 实现（用 `std::os::windows::fs::FileExt::seek_read/seek_write` 等价物），或者把 reth-provider 中所有调用点也 `#[cfg(unix)]` 守门
-2. **备选**：在 WSL2 / Docker Linux 环境内做阶段 2 升级 + 验证；CI 已是 ubuntu-latest 可直接跑
-3. **不推荐**：fork reth 自己补 Windows 实现 — 维护成本高
+### 验证
 
-### 重启操作步骤（Linux/WSL2 环境）
+CI run [25837769303](https://github.com/n42blockchain/n42-26/actions/runs/25837769303) 全绿：
 
-```bash
-cd /path/to/n42-26
-git apply stage2-workspace-deps.patch
-git apply stage2-n42-execution.patch
-git apply stage2-n42-parallel-evm.patch
-cd ../reth
-git checkout v2.2.0
-git apply ../n42-26/stage2-reth-roaring-bump.patch
-# rebase 705 行 reth-n42.patch + 8 个本地 modified files 到 v2.2.0（手工）
-# 然后回到 n42-26 跑 cargo check + test
-```
+| Job | 时长 | 状态 |
+|---|---|---|
+| Lint and Unit Tests | 12m50s | ✓ |
+| E2E Correctness - mobile-rpc (5, 8, 12) | 11m0s | ✓ |
+| E2E Correctness - smoke-consensus (1, 3, 4) | 23m8s | ✓ |
 
-### 阶段 1 当前状态
+Codex 在 macOS 上的 pre-merge 验证：`cargo check --all-targets` / `clippy -D warnings` / `cargo test --workspace --lib` (942/942) / E2E 1,3,4 全过。
 
-workspace 与本地 reth (v1.11.3 base + N42 patches) 完全对齐，全核心 crate 编译通过，731/731 + 206 = 937 tests pass。继续基于阶段 1 做迭代是当前可行路径。
+### 已知 follow-up
+
+- 仓库根目录 705 行 `reth-n42.patch` 是 v1.11.3 时代的原始 patch，CI 不再 apply，已删除。
+- reth path 现统一用 `n42blockchain/reth` fork 而非"上游 + apply patch"模式；后续 reth 主线升级时直接在 fork 上 rebase。
