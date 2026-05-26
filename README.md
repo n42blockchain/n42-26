@@ -49,7 +49,7 @@ A high-performance blockchain system combining **HotStuff-2** BFT consensus with
 
 - **HotStuff-2 Consensus**: 2-round optimistic commit with 3-round timeout recovery
 - **BLS12-381 Signatures**: Aggregated signatures for compact quorum certificates
-- **reth Latest Upstream Integration**: Tracks `paradigmxyz/reth` `origin/main` at `27781443a6e6`, with N42-specific payload/cache patches applied on top
+- **reth v2.2.0 Integration**: Tracks `n42blockchain/reth` branch `n42-v2-upgrade`, based on upstream `v2.2.0` with N42-specific payload/cache patches applied on top
 - **Jellyfish Merkle Tree (JMT)**: Blake3 hashing, 16-shard parallel updates, Merkle proofs via RPC
 - **Compact Block Propagation**: Leader caches execution output, followers skip EVM re-execution (cache hit ~3ms)
 - **Optimistic Voting**: Followers vote immediately after proposal validation, before block import
@@ -222,22 +222,21 @@ Both configurations are well within the **8-second slot target**.
 ### Prerequisites
 
 - Rust 1.93+
-- Latest `reth` source checked out at `../reth`
+- N42 `reth` fork checked out at `../reth`
 - Android local builds: JDK 17 recommended for Gradle/Kotlin
 - SP1 toolchain v4.2.1 (optional, for ZK proof guest build): `curl -L https://sp1up.succinct.xyz | bash && sp1up --version v4.2.1`
 
 ### Prepare `reth`
 
 ```bash
-git clone https://github.com/paradigmxyz/reth.git ../reth
-git -C ../reth checkout 27781443a6e6e71c93bbbe05012f0ac9595f9dac
-git -C ../reth apply ../n42-26/reth-n42.patch
+git clone https://github.com/n42blockchain/reth.git ../reth
+git -C ../reth checkout n42-v2-upgrade
 ```
 
 ### Build
 
 ```bash
-# Verify the full workspace against the patched latest reth tree
+# Verify the full workspace against the patched N42 reth fork
 cargo check --all-targets
 
 # Main binaries
@@ -249,12 +248,11 @@ JAVA_HOME=$(/usr/libexec/java_home -v 17) \
   ./mobile/android/gradlew :app:compileDebugKotlin
 ```
 
-### Regenerate The `reth` Patch
+### Update The `reth` Fork
 
 ```bash
-git -C ../reth diff --binary origin/main > reth-n42.patch
-git -C ../reth diff --binary --no-index \
-  /dev/null crates/evm/evm/src/payload_cache.rs >> reth-n42.patch
+git -C ../reth fetch origin
+git -C ../reth checkout n42-v2-upgrade
 ```
 
 ### Run

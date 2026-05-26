@@ -14,8 +14,8 @@ GIT_COMMITTER_NAME="Nyxen" GIT_COMMITTER_EMAIL="40690755+MiraWells@users.noreply
 
 ## 项目上下文
 
-- 自定义区块链：执行端基于 reth latest（本地 path 依赖 `../reth`），共识端采用 HotStuff-2 变体
-- reth 上游 commit：`27781443a6e6`，需先打补丁：`git apply ../n42-26/reth-n42.patch`（在 `../reth` 目录执行）
+- 自定义区块链：执行端基于 reth v2.2.0（本地 path 依赖 `../reth`），共识端采用 HotStuff-2 变体
+- reth fork：`n42blockchain/reth` branch `n42-v2-upgrade`，基于 upstream `v2.2.0` 并包含 N42 payload/cache hooks
 - 分发节点（IDC）负责出块、共识投票、存储状态；手机并行验证，不在共识关键路径上
 - 规模：100-500 IDC 节点，每节点约 10,000 手机；性能目标：8 秒 slot
 - Rust edition 2024，最低 Rust 1.93+
