@@ -17,7 +17,7 @@ use revm::context::{BlockEnv, CfgEnv, Context, TxEnv};
 use revm::context_interface::result::ResultAndState;
 use revm::database_interface::DatabaseRef;
 use revm::handler::MainBuilder;
-use revm::state::{Account, EvmStorageSlot};
+use revm::state::{Account, EvmStorageSlot, TransactionId};
 use scheduler::{Scheduler, Task};
 use std::collections::HashMap;
 use std::fmt;
@@ -323,10 +323,12 @@ fn merge_tx_state(
     account_writes: Vec<(Address, AccountWrite)>,
     storage_writes: Vec<(Address, U256, U256)>,
 ) {
+    // revm 40 tracks the originating transaction via a TransactionId newtype.
+    let tx_id = TransactionId::new(tx_idx).expect("transaction index exceeds u32::MAX");
     for (addr, write) in account_writes {
         let account = state_changes
             .entry(addr)
-            .or_insert_with(|| Account::new_not_existing(tx_idx));
+            .or_insert_with(|| Account::new_not_existing(tx_id));
         match write {
             AccountWrite::Updated(info) => {
                 account.info = info;
@@ -340,10 +342,10 @@ fn merge_tx_state(
     for (addr, slot, value) in storage_writes {
         let account = state_changes
             .entry(addr)
-            .or_insert_with(|| Account::new_not_existing(tx_idx));
+            .or_insert_with(|| Account::new_not_existing(tx_id));
         account
             .storage
-            .insert(slot, EvmStorageSlot::new_changed(U256::ZERO, value, tx_idx));
+            .insert(slot, EvmStorageSlot::new_changed(U256::ZERO, value, tx_id));
     }
 }
 

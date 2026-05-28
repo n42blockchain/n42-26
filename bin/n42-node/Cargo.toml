@@ -31,7 +31,6 @@ alloy-primitives.workspace = true
 
 jsonrpsee.workspace = true
 clap = { version = "4", features = ["derive"] }
-tikv-jemallocator = { version = "0.6", optional = true }
 eyre.workspace = true
 hex.workspace = true
 tokio.workspace = true
@@ -43,7 +42,11 @@ aes-gcm.workspace = true
 scrypt.workspace = true
 rand.workspace = true
 
+# jemalloc is unix-only; on Windows the default feature is a no-op for the allocator.
+[target.'cfg(unix)'.dependencies]
+tikv-jemallocator = { version = "0.6", optional = true }
+
 [features]
 default = ["jemalloc"]
-jemalloc = ["tikv-jemallocator"]
+jemalloc = ["dep:tikv-jemallocator"]
 sp1 = ["n42-zkproof/sp1"]

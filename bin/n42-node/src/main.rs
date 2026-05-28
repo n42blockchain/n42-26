@@ -1,6 +1,8 @@
 mod keystore;
 
-#[cfg(feature = "jemalloc")]
+// jemalloc is unix-only; tikv-jemallocator is a target.'cfg(unix)' dependency,
+// so the `feature = "jemalloc"` cfg is gated on `unix` to keep Windows builds happy.
+#[cfg(all(feature = "jemalloc", unix))]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
