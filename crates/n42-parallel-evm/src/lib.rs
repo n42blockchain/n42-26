@@ -67,6 +67,12 @@ where
             state_changes: HashMap::new(),
         });
     }
+    // Reject impossibly large blocks up front so the hot loop can construct
+    // TransactionId without falling back to a panic. NonMaxU32 forbids u32::MAX
+    // itself, so the largest legal tx_idx is u32::MAX - 1.
+    if num_txs >= u32::MAX as usize {
+        return Err(ParallelEvmError::BlockTooLarge { tx_count: num_txs });
+    }
 
     static THRESHOLD: OnceLock<usize> = OnceLock::new();
     let parallel_threshold: usize = *THRESHOLD.get_or_init(|| {
@@ -323,8 +329,11 @@ fn merge_tx_state(
     account_writes: Vec<(Address, AccountWrite)>,
     storage_writes: Vec<(Address, U256, U256)>,
 ) {
-    // revm 40 tracks the originating transaction via a TransactionId newtype.
-    let tx_id = TransactionId::new(tx_idx).expect("transaction index exceeds u32::MAX");
+    // revm 40 tracks the originating transaction via a TransactionId (NonMaxU32).
+    // The parallel_execute entry rejects blocks with >= u32::MAX txs, so tx_idx
+    // is always a valid NonMaxU32 here.
+    let tx_id = TransactionId::new(tx_idx)
+        .expect("tx_idx < u32::MAX guaranteed by parallel_execute entry check");
     for (addr, write) in account_writes {
         let account = state_changes
             .entry(addr)

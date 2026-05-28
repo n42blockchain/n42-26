@@ -47,4 +47,8 @@ pub enum ParallelEvmError {
     /// Retained for future use if callers want explicit error reporting.
     #[error("execution did not converge after {0} rounds")]
     TooManyRounds(usize),
+    /// revm 40's TransactionId is backed by NonMaxU32, so blocks cannot carry
+    /// more than `u32::MAX - 1` transactions through the parallel engine.
+    #[error("block has too many transactions ({tx_count}); parallel engine supports < u32::MAX")]
+    BlockTooLarge { tx_count: usize },
 }
