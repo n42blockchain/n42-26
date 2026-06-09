@@ -1,0 +1,278 @@
+//! 16-shard parallel SBMT — the binary-tree counterpart of [`crate::ShardedJmt`].
+//!
+//! Each shard is an independent [`Sbmt`] plus a per-shard key→value map (the
+//! QMDB-style "unified KV + Merkle" split): the SBMT holds `key → blake3(value)`
+//! commitments, the KV map holds the raw bytes so accounts can be read back
+//! (e.g. to preserve `code_hash` on a balance-only `Modified`). Updates are
+//! partitioned by the first nibble of the key and applied in parallel via rayon;
+//! the combined root is `blake3(shard_0_root || … || shard_15_root)`, identical
+//! in shape to `ShardedJmt` so the two are directly comparable.
+//!
+//! Phase-2 of the JMT→SBMT switch (devlog-59): brings SBMT to feature/perf parity
+//! with the sharded JMT path for end-to-end `apply_diff` benchmarking. Persistence,
+//! proof packaging, and mobile verification are later phases.
+
+use crate::bmt::{Hash, Sbmt};
+use crate::keys::{account_key, storage_key};
+use crate::sharded::{SHARD_COUNT, combine_shard_roots};
+use crate::tree::{decode_code_hash, encode_account_value};
+
+use alloy_primitives::B256;
+use n42_execution::state_diff::{AccountChangeType, StateDiff};
+use parking_lot::Mutex;
+use rayon::prelude::*;
+use std::collections::HashMap;
+
+#[inline]
+fn shard_index(key: &Hash) -> usize {
+    (key[0] >> 4) as usize
+}
+
+/// 16-shard parallel Sparse Binary Merkle Tree with per-shard value storage.
+pub struct ShardedSbmt {
+    shards: Vec<Mutex<Sbmt>>,
+    /// Per-shard raw key→value store (unified KV layer for read-back).
+    values: Vec<Mutex<HashMap<Hash, Vec<u8>>>>,
+    version: u64,
+}
+
+impl Default for ShardedSbmt {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ShardedSbmt {
+    /// Create an empty 16-shard SBMT.
+    pub fn new() -> Self {
+        Self {
+            shards: (0..SHARD_COUNT).map(|_| Mutex::new(Sbmt::new())).collect(),
+            values: (0..SHARD_COUNT)
+                .map(|_| Mutex::new(HashMap::new()))
+                .collect(),
+            version: 0,
+        }
+    }
+
+    /// Current global version.
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+
+    /// Combined root hash across all 16 shards.
+    pub fn root_hash(&self) -> B256 {
+        let roots: Vec<Hash> = self.shards.iter().map(|s| s.lock().root_hash()).collect();
+        combine_shard_roots(&roots)
+    }
+
+    /// Read a key's raw value at the current version.
+    pub fn get(&self, key: &Hash) -> Option<Vec<u8>> {
+        self.values[shard_index(key)].lock().get(key).cloned()
+    }
+
+    /// Read the existing `code_hash` for an account key (or ZERO if absent).
+    fn existing_code_hash(&self, account_key_bytes: &Hash) -> B256 {
+        self.values[shard_index(account_key_bytes)]
+            .lock()
+            .get(account_key_bytes)
+            .map(|v| decode_code_hash(v))
+            .unwrap_or(B256::ZERO)
+    }
+
+    /// Partition a `StateDiff` into per-shard `(key, Option<value>)` updates.
+    ///
+    /// Mirrors `ShardedJmt::prepare_shard_updates`: for a `Modified` account with
+    /// no `code_change`, the existing `code_hash` is read back and preserved.
+    fn prepare(&self, diff: &StateDiff) -> Vec<Vec<(Hash, Option<Vec<u8>>)>> {
+        let mut shard_updates: Vec<Vec<(Hash, Option<Vec<u8>>)>> =
+            (0..SHARD_COUNT).map(|_| Vec::new()).collect();
+
+        for (address, account_diff) in &diff.accounts {
+            let key = account_key(address).0;
+            let si = shard_index(&key);
+
+            match account_diff.change_type {
+                AccountChangeType::Destroyed => {
+                    shard_updates[si].push((key, None));
+                    for slot in account_diff.storage.keys() {
+                        let skey = storage_key(address, slot).0;
+                        shard_updates[shard_index(&skey)].push((skey, None));
+                    }
+                }
+                AccountChangeType::Created | AccountChangeType::Modified => {
+                    let balance = account_diff
+                        .balance
+                        .as_ref()
+                        .map(|v| v.to)
+                        .unwrap_or_default();
+                    let nonce = account_diff.nonce.as_ref().map(|v| v.to).unwrap_or(0);
+                    let code_hash = match &account_diff.code_change {
+                        Some(change) => change.to.unwrap_or(B256::ZERO),
+                        None => self.existing_code_hash(&key),
+                    };
+                    let value = encode_account_value(&balance, nonce, &code_hash);
+                    shard_updates[si].push((key, Some(value)));
+
+                    for (slot, change) in &account_diff.storage {
+                        let skey = storage_key(address, slot).0;
+                        let ssi = shard_index(&skey);
+                        if change.to.is_zero() {
+                            shard_updates[ssi].push((skey, None));
+                        } else {
+                            shard_updates[ssi]
+                                .push((skey, Some(change.to.to_be_bytes::<32>().to_vec())));
+                        }
+                    }
+                }
+            }
+        }
+
+        shard_updates
+    }
+
+    /// Apply a `StateDiff` across all 16 shards in parallel.
+    ///
+    /// Returns `(new_version, combined_root)`.
+    pub fn apply_diff(&mut self, diff: &StateDiff) -> (u64, B256) {
+        let new_version = self.version + 1;
+        let shard_updates = self.prepare(diff);
+
+        let roots: Vec<Hash> = self
+            .shards
+            .par_iter()
+            .zip(self.values.par_iter())
+            .zip(shard_updates.into_par_iter())
+            .map(|((shard, vals), updates)| {
+                let mut tree = shard.lock();
+                let mut kv = vals.lock();
+                for (key, value) in &updates {
+                    match value {
+                        Some(bytes) => {
+                            tree.insert(*key, bytes);
+                            kv.insert(*key, bytes.clone());
+                        }
+                        None => {
+                            tree.remove(key);
+                            kv.remove(key);
+                        }
+                    }
+                }
+                tree.root_hash()
+            })
+            .collect();
+
+        self.version = new_version;
+        (new_version, combine_shard_roots(&roots))
+    }
+
+    /// Per-shard `(leaf_count, value_count)` for diagnostics.
+    pub fn shard_stats(&self) -> Vec<(usize, usize)> {
+        self.shards
+            .iter()
+            .zip(self.values.iter())
+            .map(|(s, v)| (s.lock().len(), v.lock().len()))
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_primitives::{Address, U256};
+    use n42_execution::state_diff::{AccountDiff, ValueChange};
+    use std::collections::BTreeMap;
+
+    fn created_diff(count: usize) -> StateDiff {
+        let mut accounts = BTreeMap::new();
+        for i in 0..count {
+            let mut b = [0u8; 20];
+            b[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            accounts.insert(
+                Address::from(b),
+                AccountDiff {
+                    change_type: AccountChangeType::Created,
+                    balance: Some(ValueChange::new(U256::ZERO, U256::from(1000 + i as u64))),
+                    nonce: Some(ValueChange::new(0, 1)),
+                    code_change: None,
+                    storage: BTreeMap::new(),
+                },
+            );
+        }
+        StateDiff { accounts }
+    }
+
+    #[test]
+    fn basic_apply() {
+        let mut t = ShardedSbmt::new();
+        let (v, root) = t.apply_diff(&created_diff(100));
+        assert_eq!(v, 1);
+        assert_ne!(root, B256::ZERO);
+        assert_eq!(root, t.root_hash(), "returned root must match recomputed root");
+    }
+
+    #[test]
+    fn deterministic_root() {
+        let diff = created_diff(64);
+        let mut a = ShardedSbmt::new();
+        let mut b = ShardedSbmt::new();
+        let (_, ra) = a.apply_diff(&diff);
+        let (_, rb) = b.apply_diff(&diff);
+        assert_eq!(ra, rb, "same diff → same combined root");
+    }
+
+    #[test]
+    fn distributes_across_shards() {
+        let mut t = ShardedSbmt::new();
+        t.apply_diff(&created_diff(200));
+        let non_empty = t.shard_stats().iter().filter(|(n, _)| *n > 0).count();
+        assert!(non_empty >= 8, "expected ≥8 non-empty shards, got {non_empty}");
+    }
+
+    #[test]
+    fn read_back_value() {
+        let mut t = ShardedSbmt::new();
+        t.apply_diff(&created_diff(10));
+        let mut b = [0u8; 20];
+        b[..8].copy_from_slice(&3u64.to_le_bytes());
+        let key = account_key(&Address::from(b)).0;
+        assert!(t.get(&key).is_some(), "account value must be readable back");
+    }
+
+    #[test]
+    fn preserves_code_hash_on_modify() {
+        let mut t = ShardedSbmt::new();
+        let addr = Address::repeat_byte(0xAB);
+        let code_hash = B256::repeat_byte(0xCC);
+
+        let mut a1 = BTreeMap::new();
+        a1.insert(
+            addr,
+            AccountDiff {
+                change_type: AccountChangeType::Created,
+                balance: Some(ValueChange::new(U256::ZERO, U256::from(100))),
+                nonce: Some(ValueChange::new(0, 0)),
+                code_change: Some(ValueChange::new(None, Some(code_hash))),
+                storage: BTreeMap::new(),
+            },
+        );
+        t.apply_diff(&StateDiff { accounts: a1 });
+
+        // Balance-only modify, code_change = None.
+        let mut a2 = BTreeMap::new();
+        a2.insert(
+            addr,
+            AccountDiff {
+                change_type: AccountChangeType::Modified,
+                balance: Some(ValueChange::new(U256::from(100), U256::from(200))),
+                nonce: None,
+                code_change: None,
+                storage: BTreeMap::new(),
+            },
+        );
+        t.apply_diff(&StateDiff { accounts: a2 });
+
+        let key = account_key(&addr).0;
+        let val = t.get(&key).unwrap();
+        assert_eq!(decode_code_hash(&val), code_hash, "code_hash must survive modify");
+    }
+}

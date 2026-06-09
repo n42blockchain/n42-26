@@ -71,9 +71,55 @@ SBMT 接入 `ShardedJmt` 框架后再测。但引擎层结论清晰。
 第一阶段完成:✅ SBMT 内存核心 ✅ inclusion/exclusion proof ✅ 9 单测 ✅ 对拍 3.4–7.5×。
 
 后续阶段(JMT→BMT 全面切换):
-- **P1**:SBMT 接入 16 分片框架(`ShardedSbmt`,复用 `sharded.rs` 分片/合并逻辑)+ 与 ShardedJmt 端到端对拍。
+- ~~**P1**:SBMT 接入 16 分片框架~~ → **已完成,见下方第二阶段**。
 - **P1**:SBMT 持久化 —— 复用 P0 `PersistentJmt` 路线(全内存 + 后台快照),崩溃恢复补 WAL。
 - **P1**:proof 格式定稿 + **手机端(`n42-mobile` / FFI / Dart SDK)同步 SBMT 验证**。
 - **P2**:共识/出块 state root 计算切到 SBMT(`n42-node` 编排器),走新创世。
 - **P2**:Pleiades 式 **root 计算异步出共识关键路径**(对 8s slot 预算最直接收益)。
 - **P3**:value-hash vs value-bytes 在 proof 中的取舍、节点剪枝、disk store。
+
+---
+
+## 第二阶段:ShardedSbmt(16 分片并行)+ 端到端对拍
+
+`crates/n42-jmt/src/sharded_bmt.rs` — SBMT 的 16 分片版,对标 `ShardedJmt`。
+
+### 设计
+
+- 16 个独立 `Sbmt` + **per-shard KV map**(QMDB 式「统一 KV + Merkle」拆分):SBMT 存
+  `key → blake3(value)` 承诺,KV map 存原始字节供读回(账户 `code_hash` 在余额-only `Modified`
+  时需读回保留)。
+- 分片:key 首 nibble(`key[0] >> 4`),与 `ShardedJmt` 一致;combined root =
+  `blake3(shard_0_root || … || shard_15_root)`,形状与 ShardedJmt 完全相同 → 可直接对拍。
+- `apply_diff(StateDiff)`:复用与 ShardedJmt 相同的账户处理(account/storage key、
+  `encode_account_value`、code_hash 保留),rayon 16 片并行,每片同时更新 SBMT + KV。
+- **5/5 单测**:`deterministic_root`、`distributes_across_shards`、`read_back_value`、
+  `preserves_code_hash_on_modify`、`basic_apply`。
+
+### 端到端对拍(ShardedSbmt vs ShardedJmt,同 `make_diff`,同机,内存)
+
+| accounts | ShardedSBMT(µs) | ShardedJMT(µs) | SBMT 快 |
+|---------:|----------------:|---------------:|--------:|
+| 100 | 138.9 | 203.0 | 1.46× |
+| 1,000 | 218.7 | 361.2 | 1.65× |
+| 10,000 | 215.2 | 367.7 | 1.71× |
+| 50,000 | 215.7 | 359.9 | 1.67× |
+
+**结论与解读**:16 分片端到端 SBMT 比 JMT 快 **1.5–1.7×**,稳定净提升。
+
+注意此处提速(1.5–1.7×)**小于单树对拍的 3.4–7.5×**,原因:
+1. 16 分片把每棵树做小,树引擎差异被摊薄;
+2. `prepare`(StateDiff 处理、分片、code_hash 读)是两边**共有的固定开销**,分片后占比变大;
+3. ShardedSbmt 还多维护一层 per-shard KV map。
+
+**Caveat(可能低估)**:此 bench 的 `make_diff` 用 `Address::with_last_byte(i % 256)`,
+N≥256 时实际只有 **256 个 distinct 账户**(每片 ~16 个)。真实大 block(每片账户更多、树更深)时,
+SBMT 的引擎优势会更接近单树的数字。后续应补一组 **distinct-key 大 diff** 的对拍以反映生产场景。
+
+### 阶段状态
+
+第二阶段完成:✅ ShardedSbmt 16 分片 ✅ 统一 KV+Merkle 读回 ✅ code_hash 保留 ✅ 5 单测
+✅ 端到端对拍 1.5–1.7×。`cargo test -p n42-jmt` 共 **82 passed**,clippy 干净。
+
+后续:distinct-key 大 diff 对拍 → SBMT 持久化(P0 PersistentJmt 路线)→ proof 打包 +
+手机端验证 → 共识 state root 切换(新创世)。

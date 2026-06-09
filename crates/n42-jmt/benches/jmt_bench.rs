@@ -1,7 +1,7 @@
 use alloy_primitives::{Address, U256};
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use n42_execution::state_diff::{AccountChangeType, AccountDiff, StateDiff, ValueChange};
-use n42_jmt::{N42JmtTree, PersistentJmt, Sbmt, ShardedJmt, account_key};
+use n42_jmt::{N42JmtTree, PersistentJmt, Sbmt, ShardedJmt, ShardedSbmt, account_key};
 use std::collections::BTreeMap;
 
 /// Distinct 20-byte address for index `i` (avoids the 256-collision of
@@ -137,6 +137,30 @@ fn bench_apply_diff_persistent(c: &mut Criterion) {
 /// JMT (16-ary, jmt 0.12), both in-memory, both doing batch insert + root. This
 /// is the apples-to-apples "binary vs 16-ary tree engine" comparison driving the
 /// JMT→BMT switch decision.
+/// End-to-end sharded comparison: `ShardedSbmt::apply_diff` vs the existing
+/// `apply_diff` (ShardedJmt) group, same `make_diff`, same machine. Both run the
+/// 16-shard rayon path, so this isolates the tree-engine difference at the level
+/// the consensus state-root actually uses.
+fn bench_apply_diff_sharded_bmt(c: &mut Criterion) {
+    let mut group = c.benchmark_group("apply_diff_sharded_bmt");
+
+    for &account_count in &[100, 1_000, 10_000, 50_000] {
+        let diff = make_diff(account_count, 0);
+        group.bench_with_input(
+            BenchmarkId::new("accounts_only", account_count),
+            &diff,
+            |b, diff| {
+                b.iter(|| {
+                    let mut jmt = ShardedSbmt::new();
+                    black_box(jmt.apply_diff(diff));
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
 fn bench_bmt_vs_jmt(c: &mut Criterion) {
     let mut group = c.benchmark_group("bmt_vs_jmt");
 
@@ -264,6 +288,7 @@ criterion_group!(
     bench_apply_diff,
     bench_apply_diff_disk,
     bench_apply_diff_persistent,
+    bench_apply_diff_sharded_bmt,
     bench_bmt_vs_jmt,
     bench_root_hash,
     bench_proof_generation,
