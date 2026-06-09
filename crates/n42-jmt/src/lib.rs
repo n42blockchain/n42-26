@@ -1,18 +1,22 @@
+pub mod bmt;
 pub mod disk_store;
 pub mod evidence_store;
 pub mod hasher;
 pub mod keys;
 pub mod metrics;
+pub mod persistent;
 pub mod proof;
 pub mod sharded;
 pub mod snapshot;
 pub mod store;
 pub mod tree;
 
+pub use bmt::{BmtProof, Sbmt};
 pub use disk_store::{DiskTreeStore, open_jmt_env};
 pub use evidence_store::{ConsensusEvidence, EvidenceStore, MobileEvidence};
 pub use hasher::Blake3Hasher;
 pub use keys::{account_key, storage_key};
+pub use persistent::PersistentJmt;
 pub use proof::{JmtProof, VerifyError};
 pub use sharded::{ShardedJmt, combine_shard_roots};
 pub use snapshot::{JmtSnapshot, load_snapshot, save_snapshot};

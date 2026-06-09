@@ -86,6 +86,8 @@ Logs are split into separate files by phase for easy maintenance:
 ---
 
 | [devlog-56-consensus-evidence-persistence](docs/devlog-56-consensus-evidence-persistence.md) | Consensus Evidence Persistence, Validator Change Protocol, Prague Upgrade |
+| [devlog-58-jmt-vs-qmdb-gap-p0](docs/devlog-58-jmt-vs-qmdb-gap-p0.md) | JMT vs QMDB/NOMT Gap Analysis + P0: In-Memory Tree + Background Snapshot, Disk 33–48× Slower | Architecture |
+| [devlog-59-jmt-to-bmt-sbmt-phase1](docs/devlog-59-jmt-to-bmt-sbmt-phase1.md) | Decision JMT→Self-built SBMT + Phase-1 In-Memory Core, AlDBaran Eval, 3.4–7.5× Faster than JMT | Architecture |
 
 ---
 
