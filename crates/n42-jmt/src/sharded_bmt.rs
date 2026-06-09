@@ -12,12 +12,10 @@
 //! with the sharded JMT path for end-to-end `apply_diff` benchmarking. Persistence,
 //! proof packaging, and mobile verification are later phases.
 
-use crate::bmt::{BmtProof, Hash, Sbmt, hash_value};
 use crate::keys::{account_key, storage_key};
-use crate::proof::VerifyError;
-use crate::sharded::SHARD_COUNT;
 use crate::snapshot::JmtSnapshot;
 use crate::tree::{decode_code_hash, encode_account_value};
+use n42_bmt_core::{Hash, SHARD_COUNT, Sbmt, ShardedBmtProof, shard_tree_path, shard_tree_root};
 
 use alloy_primitives::B256;
 use n42_execution::state_diff::{AccountChangeType, StateDiff};
@@ -30,58 +28,6 @@ fn shard_index(key: &Hash) -> usize {
     (key[0] >> 4) as usize
 }
 
-// ---------------------------------------------------------------------------
-// Shard-root commitment: a depth-4 binary merkle tree over the 16 shard roots.
-//
-// Replaces the flat `blake3(concat 16 roots)` so a proof only carries the target
-// shard root + its 4 siblings (160 B) instead of all 16 roots (512 B). SBMT runs
-// from a fresh genesis, so changing the combined-root algorithm has no compat cost.
-// ---------------------------------------------------------------------------
-
-#[inline]
-fn hash_pair(a: &Hash, b: &Hash) -> Hash {
-    let mut h = blake3::Hasher::new();
-    h.update(a);
-    h.update(b);
-    *h.finalize().as_bytes()
-}
-
-/// Merkle root over the 16 shard roots (16 → 8 → 4 → 2 → 1, depth 4).
-fn shard_tree_root(leaves: &[Hash]) -> Hash {
-    let mut level: Vec<Hash> = leaves.to_vec();
-    while level.len() > 1 {
-        level = level.chunks(2).map(|c| hash_pair(&c[0], &c[1])).collect();
-    }
-    level[0]
-}
-
-/// Authentication path (siblings, bottom-up) from `index` to the shard-tree root.
-fn shard_tree_path(leaves: &[Hash], index: usize) -> Vec<Hash> {
-    let mut path = Vec::new();
-    let mut level: Vec<Hash> = leaves.to_vec();
-    let mut idx = index;
-    while level.len() > 1 {
-        path.push(level[idx ^ 1]);
-        level = level.chunks(2).map(|c| hash_pair(&c[0], &c[1])).collect();
-        idx >>= 1;
-    }
-    path
-}
-
-/// Recompute the shard-tree root from a leaf shard root + its authentication path.
-fn shard_tree_root_from_path(leaf: Hash, index: usize, path: &[Hash]) -> Hash {
-    let mut cur = leaf;
-    let mut idx = index;
-    for sib in path {
-        cur = if idx & 1 == 0 {
-            hash_pair(&cur, sib)
-        } else {
-            hash_pair(sib, &cur)
-        };
-        idx >>= 1;
-    }
-    cur
-}
 
 /// 16-shard parallel Sparse Binary Merkle Tree with per-shard value storage.
 pub struct ShardedSbmt {
@@ -284,66 +230,6 @@ impl ShardedSbmt {
     }
 }
 
-/// A self-contained proof for a key in a [`ShardedSbmt`].
-///
-/// Carries the target shard root + its depth-4 shard-tree path (instead of all 16
-/// shard roots), the in-shard [`BmtProof`], and the raw value. Verifiable with
-/// only the block header's combined root — no tree access (mobile-callable).
-#[derive(Debug, Clone)]
-pub struct ShardedBmtProof {
-    pub shard_index: u8,
-    /// The target shard's root.
-    pub shard_root: Hash,
-    /// Authentication path from `shard_root` up to the combined root (4 siblings).
-    pub shard_path: Vec<Hash>,
-    pub inner: BmtProof,
-    pub value: Option<Vec<u8>>,
-}
-
-impl ShardedBmtProof {
-    /// Verify against a known combined root hash.
-    pub fn verify(&self, combined_root: &B256) -> Result<(), VerifyError> {
-        if self.shard_index as usize >= SHARD_COUNT {
-            return Err(VerifyError::ShardIndexOutOfRange(self.shard_index));
-        }
-        // Step 1: recompute the combined root from shard_root + shard-tree path.
-        let computed = B256::from(shard_tree_root_from_path(
-            self.shard_root,
-            self.shard_index as usize,
-            &self.shard_path,
-        ));
-        if computed != *combined_root {
-            return Err(VerifyError::CombinedRootMismatch {
-                expected: *combined_root,
-                computed,
-            });
-        }
-        // Step 2: the raw value must hash to the value_hash the in-shard proof commits to.
-        let expected_vh = self.value.as_ref().map(|v| hash_value(v));
-        if self.inner.value_hash != expected_vh {
-            return Err(VerifyError::ShardProofFailed("value hash mismatch".into()));
-        }
-        // Step 3: verify the in-shard binary proof against the shard root.
-        if !self.inner.verify(&self.shard_root, expected_vh) {
-            return Err(VerifyError::ShardProofFailed("in-shard proof failed".into()));
-        }
-        Ok(())
-    }
-
-    /// Estimated serialized size in bytes (same basis as `JmtProof::estimated_size`).
-    pub fn estimated_size(&self) -> usize {
-        1 + 32                               // shard_index + shard_root
-            + 4 + self.shard_path.len() * 32 // shard-tree path (len prefix + siblings)
-            + self.inner.encoded_len()
-            + self.value.as_ref().map_or(0, |v| v.len())
-    }
-
-    /// Bytes of the in-shard merkle authentication path (the part that differs from JMT).
-    pub fn path_bytes(&self) -> usize {
-        self.inner.path_len() * 32
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -485,16 +371,16 @@ mod tests {
         let key = account_key(&addr_of(42)).0;
         let proof = t.prove(key);
         assert!(proof.value.is_some());
-        assert!(proof.verify(&root).is_ok(), "inclusion proof must verify");
+        assert!(proof.verify(&root.0).is_ok(), "inclusion proof must verify");
 
         let absent = account_key(&addr_of(999_999)).0;
         let ep = t.prove(absent);
         assert!(ep.value.is_none());
-        assert!(ep.verify(&root).is_ok(), "exclusion proof must verify");
+        assert!(ep.verify(&root.0).is_ok(), "exclusion proof must verify");
 
         let mut bad = proof.clone();
         bad.shard_root[0] ^= 0xFF;
-        assert!(bad.verify(&root).is_err(), "tampered shard root must fail");
+        assert!(bad.verify(&root.0).is_err(), "tampered shard root must fail");
     }
 
     #[test]
@@ -511,7 +397,7 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        assert!(sp.verify(&sbmt.root_hash()).is_ok());
+        assert!(sp.verify(&sbmt.root_hash().0).is_ok());
         assert!(jp.verify(&jmt.root_hash().unwrap()).is_ok());
 
         eprintln!(

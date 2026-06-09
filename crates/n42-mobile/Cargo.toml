@@ -12,6 +12,9 @@ alloy-primitives.workspace = true
 # Crypto (BLS12-381 signatures)
 n42-primitives = { path = "../n42-primitives" }
 
+# Zero-dependency SBMT proof verification (pure blake3, no reth/mdbx)
+n42-bmt-core.workspace = true
+
 # Caching
 lru.workspace = true
 

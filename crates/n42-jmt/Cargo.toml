@@ -8,6 +8,7 @@ description = "N42 Jellyfish Merkle Tree with Blake3 hashing, 16-shard paralleli
 
 [dependencies]
 n42-execution.workspace = true
+n42-bmt-core.workspace = true
 
 jmt.workspace = true
 blake3.workspace = true

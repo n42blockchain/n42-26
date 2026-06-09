@@ -12,7 +12,7 @@ pub mod snapshot;
 pub mod store;
 pub mod tree;
 
-pub use bmt::{BmtProof, Sbmt};
+pub use bmt::{BmtProof, Sbmt, ShardedBmtProof};
 pub use disk_store::{DiskTreeStore, open_jmt_env};
 pub use evidence_store::{ConsensusEvidence, EvidenceStore, MobileEvidence};
 pub use hasher::Blake3Hasher;
@@ -20,7 +20,7 @@ pub use keys::{account_key, storage_key};
 pub use persistent::{PersistentJmt, PersistentSbmt};
 pub use proof::{JmtProof, VerifyError};
 pub use sharded::{ShardedJmt, combine_shard_roots};
-pub use sharded_bmt::{ShardedBmtProof, ShardedSbmt};
+pub use sharded_bmt::ShardedSbmt;
 pub use snapshot::{JmtSnapshot, load_snapshot, save_snapshot};
 pub use store::{MemTreeStore, TreeStore};
 pub use tree::{N42JmtTree, decode_code_hash, encode_account_value};

@@ -4,6 +4,7 @@ pub mod packet;
 pub mod quic_client;
 pub mod receipt;
 pub(crate) mod serde_helpers;
+pub mod state_proof;
 pub mod verification;
 pub mod verifier;
 pub mod wire;
