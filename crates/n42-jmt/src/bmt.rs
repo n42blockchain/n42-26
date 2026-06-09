@@ -379,6 +379,19 @@ impl BmtProof {
         self.value_hash.is_some()
     }
 
+    /// Number of sibling hashes on the authentication path (= proof depth).
+    pub fn path_len(&self) -> usize {
+        self.siblings.len()
+    }
+
+    /// Estimated serialized size in bytes (key + value_hash + siblings + other_leaf).
+    pub fn encoded_len(&self) -> usize {
+        32                                                          // key
+            + 1 + if self.value_hash.is_some() { 32 } else { 0 }   // value_hash option
+            + 4 + self.siblings.len() * 32                         // siblings (len prefix + data)
+            + 1 + if self.other_leaf.is_some() { 64 } else { 0 }   // other_leaf option
+    }
+
     /// Verify the proof against `root`. For inclusion, the caller passes the
     /// expected `value_hash`; for exclusion pass `None`.
     pub fn verify(&self, root: &Hash, expected_value_hash: Option<Hash>) -> bool {

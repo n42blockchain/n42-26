@@ -20,7 +20,7 @@ pub use keys::{account_key, storage_key};
 pub use persistent::{PersistentJmt, PersistentSbmt};
 pub use proof::{JmtProof, VerifyError};
 pub use sharded::{ShardedJmt, combine_shard_roots};
-pub use sharded_bmt::ShardedSbmt;
+pub use sharded_bmt::{ShardedBmtProof, ShardedSbmt};
 pub use snapshot::{JmtSnapshot, load_snapshot, save_snapshot};
 pub use store::{MemTreeStore, TreeStore};
 pub use tree::{N42JmtTree, decode_code_hash, encode_account_value};

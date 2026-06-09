@@ -12,8 +12,9 @@
 //! with the sharded JMT path for end-to-end `apply_diff` benchmarking. Persistence,
 //! proof packaging, and mobile verification are later phases.
 
-use crate::bmt::{Hash, Sbmt};
+use crate::bmt::{BmtProof, Hash, Sbmt, hash_value};
 use crate::keys::{account_key, storage_key};
+use crate::proof::VerifyError;
 use crate::sharded::{SHARD_COUNT, combine_shard_roots};
 use crate::snapshot::JmtSnapshot;
 use crate::tree::{decode_code_hash, encode_account_value};
@@ -193,6 +194,21 @@ impl ShardedSbmt {
         }
     }
 
+    /// Build a self-contained proof for `key` (16 shard roots + in-shard proof +
+    /// raw value), the SBMT counterpart of [`crate::JmtProof`] for mobile clients.
+    pub fn prove(&self, key: Hash) -> ShardedBmtProof {
+        let si = shard_index(&key);
+        let inner = self.shards[si].lock().prove(key);
+        let value = self.values[si].lock().get(&key).cloned();
+        let shard_roots: Vec<Hash> = self.shards.iter().map(|s| s.lock().root_hash()).collect();
+        ShardedBmtProof {
+            shard_index: si as u8,
+            shard_roots,
+            inner,
+            value,
+        }
+    }
+
     /// Reconstruct a `ShardedSbmt` from a snapshot, verifying the combined root.
     pub fn from_snapshot(snapshot: &JmtSnapshot) -> eyre::Result<Self> {
         let mut t = Self::new();
@@ -214,9 +230,69 @@ impl ShardedSbmt {
     }
 }
 
+/// A self-contained proof for a key in a [`ShardedSbmt`].
+///
+/// Mirrors [`crate::JmtProof`]: the 16 shard roots (to recompute the combined
+/// root), the in-shard [`BmtProof`], and the raw value. Verifiable with only the
+/// block header's combined root — no tree access (mobile-callable).
+#[derive(Debug, Clone)]
+pub struct ShardedBmtProof {
+    pub shard_index: u8,
+    pub shard_roots: Vec<Hash>,
+    pub inner: BmtProof,
+    pub value: Option<Vec<u8>>,
+}
+
+impl ShardedBmtProof {
+    /// Verify against a known combined root hash.
+    pub fn verify(&self, combined_root: &B256) -> Result<(), VerifyError> {
+        if self.shard_index as usize >= SHARD_COUNT {
+            return Err(VerifyError::ShardIndexOutOfRange(self.shard_index));
+        }
+        if self.shard_roots.len() != SHARD_COUNT {
+            return Err(VerifyError::WrongShardRootCount(self.shard_roots.len()));
+        }
+        let computed = combine_shard_roots(&self.shard_roots);
+        if computed != *combined_root {
+            return Err(VerifyError::CombinedRootMismatch {
+                expected: *combined_root,
+                computed,
+            });
+        }
+        // The raw value must hash to the value_hash the in-shard proof commits to.
+        let expected_vh = self.value.as_ref().map(|v| hash_value(v));
+        if self.inner.value_hash != expected_vh {
+            return Err(VerifyError::ShardProofFailed("value hash mismatch".into()));
+        }
+        let shard_root = self.shard_roots[self.shard_index as usize];
+        if !self.inner.verify(&shard_root, expected_vh) {
+            return Err(VerifyError::ShardProofFailed("in-shard proof failed".into()));
+        }
+        Ok(())
+    }
+
+    /// Estimated serialized size in bytes (same basis as `JmtProof::estimated_size`).
+    pub fn estimated_size(&self) -> usize {
+        1 + self.shard_roots.len() * 32
+            + self.inner.encoded_len()
+            + self.value.as_ref().map_or(0, |v| v.len())
+    }
+
+    /// Bytes of the merkle authentication path only (the part that differs from JMT).
+    pub fn path_bytes(&self) -> usize {
+        self.inner.path_len() * 32
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn addr_of(i: usize) -> Address {
+        let mut b = [0u8; 20];
+        b[..8].copy_from_slice(&(i as u64).to_le_bytes());
+        Address::from(b)
+    }
     use alloy_primitives::{Address, U256};
     use n42_execution::state_diff::{AccountDiff, ValueChange};
     use std::collections::BTreeMap;
@@ -338,5 +414,53 @@ mod tests {
         let key = account_key(&addr).0;
         let val = t.get(&key).unwrap();
         assert_eq!(decode_code_hash(&val), code_hash, "code_hash must survive modify");
+    }
+
+    #[test]
+    fn sharded_proof_inclusion_exclusion_tamper() {
+        let mut t = ShardedSbmt::new();
+        t.apply_diff(&created_diff(500));
+        let root = t.root_hash();
+
+        let key = account_key(&addr_of(42)).0;
+        let proof = t.prove(key);
+        assert!(proof.value.is_some());
+        assert!(proof.verify(&root).is_ok(), "inclusion proof must verify");
+
+        let absent = account_key(&addr_of(999_999)).0;
+        let ep = t.prove(absent);
+        assert!(ep.value.is_none());
+        assert!(ep.verify(&root).is_ok(), "exclusion proof must verify");
+
+        let mut bad = proof.clone();
+        bad.shard_roots[0][0] ^= 0xFF;
+        assert!(bad.verify(&root).is_err(), "tampered shard root must fail");
+    }
+
+    #[test]
+    fn proof_size_vs_jmt() {
+        let diff = created_diff(5_000);
+        let mut sbmt = ShardedSbmt::new();
+        sbmt.apply_diff(&diff);
+        let mut jmt = crate::ShardedJmt::new();
+        jmt.apply_diff(&diff).unwrap();
+
+        let key = account_key(&addr_of(42)).0;
+        let sp = sbmt.prove(key);
+        let jp = crate::proof::build_proof(&jmt, jmt::KeyHash(key))
+            .unwrap()
+            .unwrap();
+
+        assert!(sp.verify(&sbmt.root_hash()).is_ok());
+        assert!(jp.verify(&jmt.root_hash().unwrap()).is_ok());
+
+        eprintln!(
+            "[proof-size @5000 distinct accts] SBMT total={}B path={}B depth={} | JMT total={}B path_bytes={}B",
+            sp.estimated_size(),
+            sp.path_bytes(),
+            sp.inner.path_len(),
+            jp.estimated_size(),
+            jp.proof_bytes.len(),
+        );
     }
 }

@@ -168,3 +168,38 @@ proof + 持久化恢复。
 
 后续(SBMT 外部集成,需方向确认):proof 打包 + 大小对比 → 手机端(`n42-mobile`)验证 →
 共识 state root 切换(`n42-node`,新创世)→ Pleiades 式 root 异步出关键路径 → WAL 闭合崩溃恢复。
+
+---
+
+## 第四阶段:proof 打包 + 大小对比
+
+`ShardedBmtProof`(`sharded_bmt.rs`)— SBMT 端到端 proof,对标 `JmtProof`:16 shard roots
+(重算 combined root)+ in-shard `BmtProof` + 原始 value,**自洽验证**(仅需 block header 的
+combined root,无需树访问,手机可调)。verify 校验:shard 数/索引 → combined root → value 与
+value_hash 一致 → in-shard 二叉路径折回 shard root。
+
+### proof 大小对比(5000 个 distinct 账户,同 key)
+
+| | 总大小 | 认证路径(siblings) | 深度 |
+|---|------:|-------------------:|-----:|
+| **SBMT** | 1,135 B | **480 B** | 15 |
+| JMT | 1,326 B | 709 B | — |
+
+- 总大小小 **14%**;**认证路径小 32%**(480 vs 709)—— 这是真正的差异(两者 16 shard roots
+  512B + value 相同)。验证决策依据「二叉 proof 比 16 叉 SparseMerkleProof 更干净」。
+- **剩余优化空间**:两者都含 512B 的 16 shard-roots 冗余。对 shard roots 再建一棵小 merkle,
+  proof 只带 log₂16=4 个兄弟(128B),可再省 384B —— 这是差距分析里的 proof 去冗余点,留作后续。
+
+### 验证
+
+- 新增 **2 测试**:`sharded_proof_inclusion_exclusion_tamper`、`proof_size_vs_jmt`。
+- `cargo test -p n42-jmt`:全绿,clippy `-D warnings` 干净。
+
+### 阶段状态
+
+第四阶段完成:✅ ShardedBmtProof 打包 + 自洽 verify ✅ inclusion/exclusion/篡改测试
+✅ proof 大小实测(认证路径比 JMT 小 32%)。
+
+SBMT 现已具备生产所需全部 crate 内能力:引擎 + 16 分片 + 统一 KV+Merkle + proof(打包+验证+
+更小)+ 持久化恢复。后续为外部集成(需方向确认):手机端 SBMT proof 验证(`n42-mobile`)→
+共识 state root 切换(`n42-node`,新创世)→ proof shard-root 去冗余 → WAL。
