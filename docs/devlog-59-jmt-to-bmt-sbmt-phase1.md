@@ -203,3 +203,37 @@ value_hash 一致 → in-shard 二叉路径折回 shard root。
 SBMT 现已具备生产所需全部 crate 内能力:引擎 + 16 分片 + 统一 KV+Merkle + proof(打包+验证+
 更小)+ 持久化恢复。后续为外部集成(需方向确认):手机端 SBMT proof 验证(`n42-mobile`)→
 共识 state root 切换(`n42-node`,新创世)→ proof shard-root 去冗余 → WAL。
+
+---
+
+## 第五阶段:proof shard-root 去冗余
+
+把 combined root 从「16 shard root 拼接哈希」改成**深度-4 二叉 merkle 树**,proof 只带目标
+shard root + 4 个兄弟(160B),不再带全部 16 roots(512B)。SBMT 走新创世,改 combined-root
+算法无兼容负担。
+
+### 实现(`sharded_bmt.rs`)
+
+- `shard_tree_root` / `shard_tree_path` / `shard_tree_root_from_path`:16→8→4→2→1 的二叉 merkle。
+- `ShardedSbmt::root_hash` 与 `apply_diff` 改用 `shard_tree_root`。
+- `ShardedBmtProof` 字段:`shard_roots: Vec<Hash>`(512B)→ `shard_root: Hash` + `shard_path: Vec<Hash>`(4 个,128B)。
+- verify 第一步改为从 `shard_root + path` 重算 combined root。
+
+### proof 大小(5000 distinct 账户,同 key)
+
+| | 总大小 | 变化 |
+|---|------:|------|
+| SBMT(去冗余前) | 1,135 B | — |
+| **SBMT(去冗余后)** | **787 B** | **−348 B / −31%** |
+| JMT | 1,326 B | — |
+
+去冗余后 **SBMT proof 比 JMT 小 41%**(787 vs 1326)。对手机带宽敏感场景直接收益。
+
+### 验证
+
+- `cargo test -p n42-jmt`:全绿(tamper 测试改打 `shard_root`);clippy `-D warnings` 干净。
+
+### 阶段状态
+
+①proof shard-root 去冗余 ✅ 完成。下一步按既定顺序:②手机端 SBMT 验证(`n42-mobile`)→
+③共识 state root 切换(`n42-node`,新创世)。

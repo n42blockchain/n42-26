@@ -15,7 +15,7 @@
 use crate::bmt::{BmtProof, Hash, Sbmt, hash_value};
 use crate::keys::{account_key, storage_key};
 use crate::proof::VerifyError;
-use crate::sharded::{SHARD_COUNT, combine_shard_roots};
+use crate::sharded::SHARD_COUNT;
 use crate::snapshot::JmtSnapshot;
 use crate::tree::{decode_code_hash, encode_account_value};
 
@@ -28,6 +28,59 @@ use std::collections::HashMap;
 #[inline]
 fn shard_index(key: &Hash) -> usize {
     (key[0] >> 4) as usize
+}
+
+// ---------------------------------------------------------------------------
+// Shard-root commitment: a depth-4 binary merkle tree over the 16 shard roots.
+//
+// Replaces the flat `blake3(concat 16 roots)` so a proof only carries the target
+// shard root + its 4 siblings (160 B) instead of all 16 roots (512 B). SBMT runs
+// from a fresh genesis, so changing the combined-root algorithm has no compat cost.
+// ---------------------------------------------------------------------------
+
+#[inline]
+fn hash_pair(a: &Hash, b: &Hash) -> Hash {
+    let mut h = blake3::Hasher::new();
+    h.update(a);
+    h.update(b);
+    *h.finalize().as_bytes()
+}
+
+/// Merkle root over the 16 shard roots (16 → 8 → 4 → 2 → 1, depth 4).
+fn shard_tree_root(leaves: &[Hash]) -> Hash {
+    let mut level: Vec<Hash> = leaves.to_vec();
+    while level.len() > 1 {
+        level = level.chunks(2).map(|c| hash_pair(&c[0], &c[1])).collect();
+    }
+    level[0]
+}
+
+/// Authentication path (siblings, bottom-up) from `index` to the shard-tree root.
+fn shard_tree_path(leaves: &[Hash], index: usize) -> Vec<Hash> {
+    let mut path = Vec::new();
+    let mut level: Vec<Hash> = leaves.to_vec();
+    let mut idx = index;
+    while level.len() > 1 {
+        path.push(level[idx ^ 1]);
+        level = level.chunks(2).map(|c| hash_pair(&c[0], &c[1])).collect();
+        idx >>= 1;
+    }
+    path
+}
+
+/// Recompute the shard-tree root from a leaf shard root + its authentication path.
+fn shard_tree_root_from_path(leaf: Hash, index: usize, path: &[Hash]) -> Hash {
+    let mut cur = leaf;
+    let mut idx = index;
+    for sib in path {
+        cur = if idx & 1 == 0 {
+            hash_pair(&cur, sib)
+        } else {
+            hash_pair(sib, &cur)
+        };
+        idx >>= 1;
+    }
+    cur
 }
 
 /// 16-shard parallel Sparse Binary Merkle Tree with per-shard value storage.
@@ -61,10 +114,10 @@ impl ShardedSbmt {
         self.version
     }
 
-    /// Combined root hash across all 16 shards.
+    /// Combined root hash: the depth-4 merkle root over the 16 shard roots.
     pub fn root_hash(&self) -> B256 {
         let roots: Vec<Hash> = self.shards.iter().map(|s| s.lock().root_hash()).collect();
-        combine_shard_roots(&roots)
+        B256::from(shard_tree_root(&roots))
     }
 
     /// Read a key's raw value at the current version.
@@ -164,7 +217,7 @@ impl ShardedSbmt {
             .collect();
 
         self.version = new_version;
-        (new_version, combine_shard_roots(&roots))
+        (new_version, B256::from(shard_tree_root(&roots)))
     }
 
     /// Per-shard `(leaf_count, value_count)` for diagnostics.
@@ -200,10 +253,11 @@ impl ShardedSbmt {
         let si = shard_index(&key);
         let inner = self.shards[si].lock().prove(key);
         let value = self.values[si].lock().get(&key).cloned();
-        let shard_roots: Vec<Hash> = self.shards.iter().map(|s| s.lock().root_hash()).collect();
+        let roots: Vec<Hash> = self.shards.iter().map(|s| s.lock().root_hash()).collect();
         ShardedBmtProof {
             shard_index: si as u8,
-            shard_roots,
+            shard_root: roots[si],
+            shard_path: shard_tree_path(&roots, si),
             inner,
             value,
         }
@@ -232,13 +286,16 @@ impl ShardedSbmt {
 
 /// A self-contained proof for a key in a [`ShardedSbmt`].
 ///
-/// Mirrors [`crate::JmtProof`]: the 16 shard roots (to recompute the combined
-/// root), the in-shard [`BmtProof`], and the raw value. Verifiable with only the
-/// block header's combined root — no tree access (mobile-callable).
+/// Carries the target shard root + its depth-4 shard-tree path (instead of all 16
+/// shard roots), the in-shard [`BmtProof`], and the raw value. Verifiable with
+/// only the block header's combined root — no tree access (mobile-callable).
 #[derive(Debug, Clone)]
 pub struct ShardedBmtProof {
     pub shard_index: u8,
-    pub shard_roots: Vec<Hash>,
+    /// The target shard's root.
+    pub shard_root: Hash,
+    /// Authentication path from `shard_root` up to the combined root (4 siblings).
+    pub shard_path: Vec<Hash>,
     pub inner: BmtProof,
     pub value: Option<Vec<u8>>,
 }
@@ -249,23 +306,25 @@ impl ShardedBmtProof {
         if self.shard_index as usize >= SHARD_COUNT {
             return Err(VerifyError::ShardIndexOutOfRange(self.shard_index));
         }
-        if self.shard_roots.len() != SHARD_COUNT {
-            return Err(VerifyError::WrongShardRootCount(self.shard_roots.len()));
-        }
-        let computed = combine_shard_roots(&self.shard_roots);
+        // Step 1: recompute the combined root from shard_root + shard-tree path.
+        let computed = B256::from(shard_tree_root_from_path(
+            self.shard_root,
+            self.shard_index as usize,
+            &self.shard_path,
+        ));
         if computed != *combined_root {
             return Err(VerifyError::CombinedRootMismatch {
                 expected: *combined_root,
                 computed,
             });
         }
-        // The raw value must hash to the value_hash the in-shard proof commits to.
+        // Step 2: the raw value must hash to the value_hash the in-shard proof commits to.
         let expected_vh = self.value.as_ref().map(|v| hash_value(v));
         if self.inner.value_hash != expected_vh {
             return Err(VerifyError::ShardProofFailed("value hash mismatch".into()));
         }
-        let shard_root = self.shard_roots[self.shard_index as usize];
-        if !self.inner.verify(&shard_root, expected_vh) {
+        // Step 3: verify the in-shard binary proof against the shard root.
+        if !self.inner.verify(&self.shard_root, expected_vh) {
             return Err(VerifyError::ShardProofFailed("in-shard proof failed".into()));
         }
         Ok(())
@@ -273,12 +332,13 @@ impl ShardedBmtProof {
 
     /// Estimated serialized size in bytes (same basis as `JmtProof::estimated_size`).
     pub fn estimated_size(&self) -> usize {
-        1 + self.shard_roots.len() * 32
+        1 + 32                               // shard_index + shard_root
+            + 4 + self.shard_path.len() * 32 // shard-tree path (len prefix + siblings)
             + self.inner.encoded_len()
             + self.value.as_ref().map_or(0, |v| v.len())
     }
 
-    /// Bytes of the merkle authentication path only (the part that differs from JMT).
+    /// Bytes of the in-shard merkle authentication path (the part that differs from JMT).
     pub fn path_bytes(&self) -> usize {
         self.inner.path_len() * 32
     }
@@ -433,7 +493,7 @@ mod tests {
         assert!(ep.verify(&root).is_ok(), "exclusion proof must verify");
 
         let mut bad = proof.clone();
-        bad.shard_roots[0][0] ^= 0xFF;
+        bad.shard_root[0] ^= 0xFF;
         assert!(bad.verify(&root).is_err(), "tampered shard root must fail");
     }
 
