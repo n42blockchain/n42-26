@@ -15,6 +15,7 @@
 use crate::bmt::{Hash, Sbmt};
 use crate::keys::{account_key, storage_key};
 use crate::sharded::{SHARD_COUNT, combine_shard_roots};
+use crate::snapshot::JmtSnapshot;
 use crate::tree::{decode_code_hash, encode_account_value};
 
 use alloy_primitives::B256;
@@ -173,6 +174,44 @@ impl ShardedSbmt {
             .map(|(s, v)| (s.lock().len(), v.lock().len()))
             .collect()
     }
+
+    /// Snapshot all live `(key, value)` pairs plus version and combined root.
+    ///
+    /// Reuses the shared [`JmtSnapshot`] format (a plain KV dump), so SBMT and
+    /// JMT snapshots are interchangeable on disk.
+    pub fn snapshot(&self) -> JmtSnapshot {
+        let mut entries = Vec::new();
+        for vals in &self.values {
+            for (key, value) in vals.lock().iter() {
+                entries.push((*key, value.clone()));
+            }
+        }
+        JmtSnapshot {
+            version: self.version,
+            root: self.root_hash().0,
+            entries,
+        }
+    }
+
+    /// Reconstruct a `ShardedSbmt` from a snapshot, verifying the combined root.
+    pub fn from_snapshot(snapshot: &JmtSnapshot) -> eyre::Result<Self> {
+        let mut t = Self::new();
+        for (key, value) in &snapshot.entries {
+            let si = shard_index(key);
+            t.shards[si].lock().insert(*key, value);
+            t.values[si].lock().insert(*key, value.clone());
+        }
+        t.version = snapshot.version;
+
+        let root = t.root_hash();
+        if root.0 != snapshot.root {
+            return Err(eyre::eyre!(
+                "SBMT snapshot root mismatch: expected {}, got {root}",
+                B256::from(snapshot.root),
+            ));
+        }
+        Ok(t)
+    }
 }
 
 #[cfg(test)]
@@ -236,6 +275,31 @@ mod tests {
         b[..8].copy_from_slice(&3u64.to_le_bytes());
         let key = account_key(&Address::from(b)).0;
         assert!(t.get(&key).is_some(), "account value must be readable back");
+    }
+
+    #[test]
+    fn snapshot_roundtrip() {
+        let mut t = ShardedSbmt::new();
+        t.apply_diff(&created_diff(120));
+        let root = t.root_hash();
+        let version = t.version();
+
+        let snap = t.snapshot();
+        assert_eq!(snap.entries.len(), 120);
+        assert_eq!(snap.version, version);
+
+        let restored = ShardedSbmt::from_snapshot(&snap).unwrap();
+        assert_eq!(restored.root_hash(), root, "restored root must match");
+        assert_eq!(restored.version(), version);
+    }
+
+    #[test]
+    fn from_snapshot_rejects_root_mismatch() {
+        let mut t = ShardedSbmt::new();
+        t.apply_diff(&created_diff(8));
+        let mut snap = t.snapshot();
+        snap.root[0] ^= 0xFF;
+        assert!(ShardedSbmt::from_snapshot(&snap).is_err());
     }
 
     #[test]

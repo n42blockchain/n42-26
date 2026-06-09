@@ -18,6 +18,7 @@
 //! production-grade durability.
 
 use crate::sharded::ShardedJmt;
+use crate::sharded_bmt::ShardedSbmt;
 use crate::snapshot::{JmtSnapshot, load_snapshot, save_snapshot};
 use crate::store::MemTreeStore;
 
@@ -145,6 +146,110 @@ impl Drop for PersistentJmt {
     }
 }
 
+/// In-memory [`ShardedSbmt`] with snapshot-based durability — the SBMT analogue
+/// of [`PersistentJmt`]. Same model: `apply_diff` runs at in-memory speed (no
+/// node IO), snapshots flush every `snapshot_interval` versions, optionally on a
+/// background thread. Same P0 limitation: crash-recovery granularity == snapshot
+/// interval (production needs a StateDiff WAL between snapshots).
+pub struct PersistentSbmt {
+    inner: ShardedSbmt,
+    snapshot_path: PathBuf,
+    snapshot_interval: u64,
+    last_snapshot_version: u64,
+    pending_flush: Option<JoinHandle<eyre::Result<()>>>,
+}
+
+impl PersistentSbmt {
+    /// Open a persistent SBMT, restoring from an existing snapshot if present.
+    pub fn open(snapshot_path: impl AsRef<Path>, snapshot_interval: u64) -> eyre::Result<Self> {
+        let snapshot_path = snapshot_path.as_ref().to_path_buf();
+        let (inner, last_snapshot_version) = match load_snapshot(&snapshot_path)? {
+            Some(snap) => {
+                let version = snap.version;
+                (ShardedSbmt::from_snapshot(&snap)?, version)
+            }
+            None => (ShardedSbmt::new(), 0),
+        };
+        Ok(Self {
+            inner,
+            snapshot_path,
+            snapshot_interval: snapshot_interval.max(1),
+            last_snapshot_version,
+            pending_flush: None,
+        })
+    }
+
+    /// Current global version.
+    pub fn version(&self) -> u64 {
+        self.inner.version()
+    }
+
+    /// Combined root hash across all 16 shards.
+    pub fn root_hash(&self) -> B256 {
+        self.inner.root_hash()
+    }
+
+    /// Borrow the underlying in-memory sharded SBMT.
+    pub fn inner(&self) -> &ShardedSbmt {
+        &self.inner
+    }
+
+    /// The version most recently persisted to a snapshot.
+    pub fn last_snapshot_version(&self) -> u64 {
+        self.last_snapshot_version
+    }
+
+    /// Apply a `StateDiff` (zero node IO), triggering a background snapshot once
+    /// `snapshot_interval` versions have elapsed since the last persisted one.
+    pub fn apply_diff(&mut self, diff: &StateDiff) -> eyre::Result<(u64, B256)> {
+        let (version, root) = self.inner.apply_diff(diff);
+        if version.saturating_sub(self.last_snapshot_version) >= self.snapshot_interval {
+            self.flush_background()?;
+        }
+        Ok((version, root))
+    }
+
+    /// Synchronous snapshot flush: blocks until durably written.
+    pub fn flush(&mut self) -> eyre::Result<()> {
+        self.join_pending()?;
+        let snapshot = self.inner.snapshot();
+        self.last_snapshot_version = snapshot.version;
+        save_snapshot(&self.snapshot_path, &snapshot)
+    }
+
+    /// Background snapshot flush: serialization + IO off the apply path.
+    pub fn flush_background(&mut self) -> eyre::Result<()> {
+        self.join_pending()?;
+        let snapshot: JmtSnapshot = self.inner.snapshot();
+        self.last_snapshot_version = snapshot.version;
+        let path = self.snapshot_path.clone();
+        debug!(
+            target: "n42::jmt",
+            version = snapshot.version,
+            entries = snapshot.entries.len(),
+            "spawning background SBMT snapshot flush"
+        );
+        self.pending_flush = Some(std::thread::spawn(move || save_snapshot(&path, &snapshot)));
+        Ok(())
+    }
+
+    /// Wait for any in-flight background flush, propagating its result.
+    pub fn join_pending(&mut self) -> eyre::Result<()> {
+        if let Some(handle) = self.pending_flush.take() {
+            handle
+                .join()
+                .map_err(|_| eyre::eyre!("snapshot flush thread panicked"))??;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for PersistentSbmt {
+    fn drop(&mut self) {
+        let _ = self.join_pending();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -229,6 +334,47 @@ mod tests {
 
         let reopened = PersistentJmt::open(&path, u64::MAX).unwrap();
         assert_eq!(reopened.root_hash().unwrap(), root);
+    }
+
+    #[test]
+    fn sbmt_apply_flush_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sbmt.snapshot");
+
+        let (root, version) = {
+            let mut jmt = PersistentSbmt::open(&path, u64::MAX).unwrap();
+            jmt.apply_diff(&make_diff(100)).unwrap();
+            jmt.apply_diff(&make_diff(40)).unwrap();
+            let r = jmt.root_hash();
+            let v = jmt.version();
+            jmt.flush().unwrap();
+            assert_eq!(jmt.last_snapshot_version(), v);
+            (r, v)
+        };
+
+        let reopened = PersistentSbmt::open(&path, u64::MAX).unwrap();
+        assert_eq!(reopened.version(), version);
+        assert_eq!(reopened.root_hash(), root);
+    }
+
+    #[test]
+    fn sbmt_auto_snapshot_and_background_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sbmt.snapshot");
+
+        let mut jmt = PersistentSbmt::open(&path, 3).unwrap();
+        jmt.apply_diff(&make_diff(10)).unwrap();
+        jmt.apply_diff(&make_diff(10)).unwrap();
+        assert_eq!(jmt.last_snapshot_version(), 0);
+        jmt.apply_diff(&make_diff(10)).unwrap(); // version 3 → background snapshot
+        assert_eq!(jmt.last_snapshot_version(), 3);
+        jmt.join_pending().unwrap();
+        let root = jmt.root_hash();
+        drop(jmt);
+
+        let reopened = PersistentSbmt::open(&path, 3).unwrap();
+        assert_eq!(reopened.version(), 3);
+        assert_eq!(reopened.root_hash(), root);
     }
 
     #[test]

@@ -136,3 +136,35 @@ N≥256 时实际只有 **256 个 distinct 账户**(每片 ~16 个),摊薄了引
 
 后续:distinct-key 大 diff 对拍 → SBMT 持久化(P0 PersistentJmt 路线)→ proof 打包 +
 手机端验证 → 共识 state root 切换(新创世)。
+
+---
+
+## 第三阶段:SBMT 持久化(PersistentSbmt)
+
+让换树方案具备上生产基础:全内存运行 + 快照持久化 + 崩溃恢复。
+
+### 实现
+
+- `ShardedSbmt::snapshot()` / `from_snapshot()`(`sharded_bmt.rs`):**复用通用 `JmtSnapshot`
+  结构**(纯 KV dump),所以 SBMT 与 JMT 快照在磁盘上**格式互换**。from_snapshot 按分片重建
+  并**校验 combined root** 一致。
+- `PersistentSbmt`(`persistent.rs`):`PersistentJmt` 的 SBMT 对应物,同一模型 ——
+  `apply_diff` 内存级(零节点 IO),每 `snapshot_interval` 版本触发**后台线程快照**
+  (序列化+zstd+落盘不阻塞 apply),`open` 启动从快照恢复,`flush`/`flush_background`/
+  `join_pending` 生命周期,`Drop` 时 best-effort join。复用现成 `save_snapshot`/`load_snapshot`。
+- **同一 P0 局限**:崩溃恢复粒度 = 快照间隔,生产需补 StateDiff WAL(后续)。
+
+### 验证
+
+- 新增 **4 个测试**:`snapshot_roundtrip`、`from_snapshot_rejects_root_mismatch`(ShardedSbmt);
+  `sbmt_apply_flush_reopen`、`sbmt_auto_snapshot_and_background_flush`(PersistentSbmt)。
+- `cargo test -p n42-jmt` 共 **86 passed**,clippy `-D warnings` 干净。
+
+### 阶段状态
+
+第三阶段完成:✅ ShardedSbmt 快照/恢复(格式与 JMT 互换)✅ PersistentSbmt 全内存+后台快照
+✅ 4 测试。至此 SBMT 自身已具备:引擎 + 16 分片并行 + 统一 KV+Merkle + inclusion/exclusion
+proof + 持久化恢复。
+
+后续(SBMT 外部集成,需方向确认):proof 打包 + 大小对比 → 手机端(`n42-mobile`)验证 →
+共识 state root 切换(`n42-node`,新创世)→ Pleiades 式 root 异步出关键路径 → WAL 闭合崩溃恢复。
