@@ -112,9 +112,22 @@ SBMT 接入 `ShardedJmt` 框架后再测。但引擎层结论清晰。
 2. `prepare`(StateDiff 处理、分片、code_hash 读)是两边**共有的固定开销**,分片后占比变大;
 3. ShardedSbmt 还多维护一层 per-shard KV map。
 
-**Caveat(可能低估)**:此 bench 的 `make_diff` 用 `Address::with_last_byte(i % 256)`,
-N≥256 时实际只有 **256 个 distinct 账户**(每片 ~16 个)。真实大 block(每片账户更多、树更深)时,
-SBMT 的引擎优势会更接近单树的数字。后续应补一组 **distinct-key 大 diff** 的对拍以反映生产场景。
+**Caveat(已验证为低估)**:上表的 `make_diff` 用 `Address::with_last_byte(i % 256)`,
+N≥256 时实际只有 **256 个 distinct 账户**(每片 ~16 个),摊薄了引擎差异。
+
+### distinct-key 验证(`apply_diff_distinct`,真实大 block)
+
+改用 `make_diff_distinct`(N 个互异地址,每片树更深)重测:
+
+| accounts | ShardedSBMT(µs) | ShardedJMT(µs) | SBMT 快 |
+|---------:|----------------:|---------------:|--------:|
+| 1,000 | 539.8 | 1,012.3 | 1.88× |
+| 10,000 | 4,904.7 | 9,874.3 | 2.01× |
+| 50,000 | 28,598.3 | 62,204.4 | **2.18×** |
+
+证实碰撞版低估:真实 distinct 账户下端到端提速 **1.9–2.2×,且随规模增大**。三档梯度清晰:
+**单树引擎 3.4–7.5× → 16 分片摊薄到 ~2× → 大 block 越明显**。这是换树后共识 state root 计算可
+预期的真实净收益(尚不含 proof 简化 + zkVM 友好的额外价值)。
 
 ### 阶段状态
 

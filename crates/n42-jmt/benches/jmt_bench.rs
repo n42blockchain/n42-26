@@ -141,6 +141,55 @@ fn bench_apply_diff_persistent(c: &mut Criterion) {
 /// `apply_diff` (ShardedJmt) group, same `make_diff`, same machine. Both run the
 /// 16-shard rayon path, so this isolates the tree-engine difference at the level
 /// the consensus state-root actually uses.
+/// Build a diff of `n` **distinct** accounts (no address collision), so each of
+/// the 16 shards holds a deep tree — the realistic large-block case where the
+/// binary-vs-16-ary engine gap is not amortized away by tiny per-shard trees.
+fn make_diff_distinct(n: usize) -> StateDiff {
+    let mut accounts = BTreeMap::new();
+    for i in 0..n {
+        accounts.insert(
+            addr_of(i),
+            AccountDiff {
+                change_type: if i % 10 == 0 {
+                    AccountChangeType::Created
+                } else {
+                    AccountChangeType::Modified
+                },
+                balance: Some(ValueChange::new(U256::from(1000u64), U256::from(1000u64 + i as u64))),
+                nonce: Some(ValueChange::new(i as u64, i as u64 + 1)),
+                code_change: None,
+                storage: BTreeMap::new(),
+            },
+        );
+    }
+    StateDiff { accounts }
+}
+
+/// Distinct-key end-to-end: ShardedSbmt vs ShardedJmt on `n` distinct accounts.
+/// Complements `apply_diff_sharded_bmt` (which collides to 256 accounts) to show
+/// the engine gap when per-shard trees are actually large.
+fn bench_apply_diff_distinct(c: &mut Criterion) {
+    let mut group = c.benchmark_group("apply_diff_distinct");
+
+    for &n in &[1_000, 10_000, 50_000] {
+        let diff = make_diff_distinct(n);
+        group.bench_with_input(BenchmarkId::new("sbmt", n), &diff, |b, d| {
+            b.iter(|| {
+                let mut t = ShardedSbmt::new();
+                black_box(t.apply_diff(d));
+            });
+        });
+        group.bench_with_input(BenchmarkId::new("jmt", n), &diff, |b, d| {
+            b.iter(|| {
+                let mut t = ShardedJmt::new();
+                black_box(t.apply_diff(d).unwrap());
+            });
+        });
+    }
+
+    group.finish();
+}
+
 fn bench_apply_diff_sharded_bmt(c: &mut Criterion) {
     let mut group = c.benchmark_group("apply_diff_sharded_bmt");
 
@@ -289,6 +338,7 @@ criterion_group!(
     bench_apply_diff_disk,
     bench_apply_diff_persistent,
     bench_apply_diff_sharded_bmt,
+    bench_apply_diff_distinct,
     bench_bmt_vs_jmt,
     bench_root_hash,
     bench_proof_generation,
