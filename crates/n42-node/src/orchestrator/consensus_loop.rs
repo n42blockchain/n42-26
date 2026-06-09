@@ -428,38 +428,30 @@ impl ConsensusOrchestrator {
             if let Some(diff) = diff {
                 let jmt = Arc::clone(jmt);
                 let state = self.consensus_state.clone();
-                let block_count = self.committed_block_count;
                 tokio::task::spawn_blocking(move || {
                     let start = std::time::Instant::now();
                     let mut tree = jmt.lock().unwrap_or_else(|e| {
-                        tracing::warn!("jmt mutex poisoned, recovering");
+                        tracing::warn!("sbmt mutex poisoned, recovering");
                         e.into_inner()
                     });
-                    match tree.apply_diff(&diff) {
-                        Ok((version, root)) => {
-                            let elapsed_ms = start.elapsed().as_millis();
-                            gauge!("n42_jmt_latest_root").set(version as f64);
-                            histogram!("n42_state_root_apply_diff_ms").record(elapsed_ms as f64);
-                            info!(
-                                target: "n42::jmt",
-                                version,
-                                %root,
-                                accounts = diff.len(),
-                                storage_changes = diff.total_storage_changes(),
-                                elapsed_ms,
-                                "JMT updated"
-                            );
-                            if let Some(ref state) = state {
-                                state.update_jmt_root(version, root);
-                            }
-                            // Prune old versions every 100 blocks to reclaim memory.
-                            if block_count.is_multiple_of(100) {
-                                tree.prune(200);
-                            }
-                        }
-                        Err(e) => {
-                            warn!(target: "n42::jmt", error = %e, "JMT apply_diff failed");
-                        }
+                    // SBMT apply_diff is infallible and returns (version, root)
+                    // directly. SBMT keeps only the latest state (no version
+                    // history), so there is nothing to prune.
+                    let (version, root) = tree.apply_diff(&diff);
+                    let elapsed_ms = start.elapsed().as_millis();
+                    gauge!("n42_jmt_latest_root").set(version as f64);
+                    histogram!("n42_state_root_apply_diff_ms").record(elapsed_ms as f64);
+                    info!(
+                        target: "n42::jmt",
+                        version,
+                        %root,
+                        accounts = diff.len(),
+                        storage_changes = diff.total_storage_changes(),
+                        elapsed_ms,
+                        "SBMT updated"
+                    );
+                    if let Some(ref state) = state {
+                        state.update_jmt_root(version, root);
                     }
                 });
             } else {

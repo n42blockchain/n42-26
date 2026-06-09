@@ -11,7 +11,7 @@ use jsonrpsee::core::SubscriptionResult;
 use jsonrpsee::proc_macros::rpc;
 use jsonrpsee::types::ErrorObjectOwned;
 use jsonrpsee::{PendingSubscriptionSink, SubscriptionMessage};
-use n42_jmt::ShardedJmt;
+use n42_jmt::ShardedSbmt;
 use n42_primitives::{BlsPublicKey, BlsSignature};
 use n42_zkproof::ProofScheduler;
 use serde::{Deserialize, Serialize};
@@ -258,7 +258,7 @@ pub trait N42Api {
 pub struct N42RpcServer {
     consensus_state: Arc<SharedConsensusState>,
     staking_manager: Option<Arc<Mutex<StakingManager>>>,
-    jmt: Option<Arc<Mutex<ShardedJmt>>>,
+    jmt: Option<Arc<Mutex<ShardedSbmt>>>,
     zk_scheduler: Option<Arc<ProofScheduler>>,
     admin_token: Option<String>,
 }
@@ -279,7 +279,7 @@ impl N42RpcServer {
         self
     }
 
-    pub fn with_jmt(mut self, jmt: Arc<Mutex<ShardedJmt>>) -> Self {
+    pub fn with_jmt(mut self, jmt: Arc<Mutex<ShardedSbmt>>) -> Self {
         self.jmt = Some(jmt);
         self
     }
@@ -638,40 +638,32 @@ impl N42ApiServer for N42RpcServer {
         })?;
 
         let key_hash = match storage_slot {
-            Some(slot) => n42_jmt::storage_key(&address, &slot),
-            None => n42_jmt::account_key(&address),
+            Some(slot) => n42_jmt::storage_key(&address, &slot).0,
+            None => n42_jmt::account_key(&address).0,
         };
 
         let tree = jmt
             .lock()
-            .map_err(|_| ErrorObjectOwned::owned(-32603, "JMT lock poisoned", None::<()>))?;
+            .map_err(|_| ErrorObjectOwned::owned(-32603, "SBMT lock poisoned", None::<()>))?;
 
-        let root = tree.root_hash().map_err(|e| {
-            ErrorObjectOwned::owned(-32603, format!("JMT root error: {e}"), None::<()>)
+        // SBMT root_hash and prove are infallible; prove always returns a proof
+        // (inclusion or exclusion). The full ShardedBmtProof is bincode-encoded
+        // into `proof_hex` for the mobile client to deserialize and verify; the
+        // shard-tree path is exposed via `shard_roots` for inspection.
+        let root = tree.root_hash();
+        let proof = tree.prove(key_hash);
+        let proof_bytes = bincode::serialize(&proof).map_err(|e| {
+            ErrorObjectOwned::owned(-32603, format!("SBMT proof encode error: {e}"), None::<()>)
         })?;
 
-        let proof = n42_jmt::proof::build_proof(&tree, key_hash).map_err(|e| {
-            ErrorObjectOwned::owned(-32603, format!("JMT proof error: {e}"), None::<()>)
-        })?;
-
-        match proof {
-            Some(p) => Ok(JmtProofResponse {
-                shard_index: p.shard_index,
-                key_hash: hex::encode(p.key),
-                value: p.value.as_ref().map(hex::encode),
-                proof_hex: hex::encode(&p.proof_bytes),
-                shard_roots: p.shard_roots.iter().map(hex::encode).collect(),
-                root: format!("{root:?}"),
-            }),
-            None => Ok(JmtProofResponse {
-                shard_index: (key_hash.0[0] >> 4),
-                key_hash: hex::encode(key_hash.0),
-                value: None,
-                proof_hex: String::new(),
-                shard_roots: Vec::new(),
-                root: format!("{root:?}"),
-            }),
-        }
+        Ok(JmtProofResponse {
+            shard_index: proof.shard_index,
+            key_hash: hex::encode(proof.inner.key),
+            value: proof.value.as_ref().map(hex::encode),
+            proof_hex: hex::encode(&proof_bytes),
+            shard_roots: proof.shard_path.iter().map(hex::encode).collect(),
+            root: format!("{root:?}"),
+        })
     }
 
     async fn jmt_version(&self) -> RpcResult<u64> {

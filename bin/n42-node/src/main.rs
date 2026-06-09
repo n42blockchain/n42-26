@@ -10,7 +10,7 @@ use alloy_primitives::Address;
 use clap::Parser;
 use n42_chainspec::{ConsensusConfig, ValidatorInfo};
 use n42_consensus::{ConsensusEngine, EpochManager, ValidatorSet, ValidatorSetResolver};
-use n42_jmt::ShardedJmt;
+use n42_jmt::ShardedSbmt;
 use n42_network::NetworkService;
 use n42_network::{
     ShardedStarHub, ShardedStarHubConfig, TransportConfig, build_swarm_with_validator_index,
@@ -626,9 +626,9 @@ fn main() {
 
         // JMT state tree: enabled by N42_JMT=1. Maintains a Jellyfish Merkle Tree
         // updated on each block commit, serving state proofs via RPC.
-        let jmt: Option<Arc<Mutex<ShardedJmt>>> = if env_bool("N42_JMT") {
-            let jmt = Arc::new(Mutex::new(ShardedJmt::new()));
-            info!(target: "n42::cli", "JMT state tree enabled (16 shards)");
+        let jmt: Option<Arc<Mutex<ShardedSbmt>>> = if env_bool("N42_JMT") {
+            let jmt = Arc::new(Mutex::new(ShardedSbmt::new()));
+            info!(target: "n42::cli", "SBMT state tree enabled (16 shards)");
             Some(jmt)
         } else {
             None

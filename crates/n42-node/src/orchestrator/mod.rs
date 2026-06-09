@@ -12,7 +12,7 @@ use crate::tx_bridge::TxImportBatch;
 use alloy_primitives::{Address, B256};
 use metrics::{counter, gauge, histogram};
 use n42_consensus::{ConsensusEngine, EngineOutput, FUTURE_VIEW_WINDOW, ValidatorSet};
-use n42_jmt::ShardedJmt;
+use n42_jmt::ShardedSbmt;
 use n42_network::{NetworkEvent, NetworkHandle, PeerId};
 use n42_primitives::QuorumCertificate;
 use reth_ethereum_engine_primitives::EthEngineTypes;
@@ -333,9 +333,9 @@ pub struct ConsensusOrchestrator {
     /// ViewChanged/BlockCommitted. Consensus voting naturally paces block production.
     /// Enabled by `N42_FAST_PROPOSE=1`. Default: false (grid-aligned slots).
     fast_propose: bool,
-    /// Jellyfish Merkle Tree for parallel state commitment.
+    /// Sparse Binary Merkle Tree for parallel state commitment.
     /// Updated asynchronously after each committed block.
-    jmt: Option<Arc<Mutex<ShardedJmt>>>,
+    jmt: Option<Arc<Mutex<ShardedSbmt>>>,
     /// ZK proof scheduler: generates ZK proofs asynchronously as a sidecar.
     /// Enabled by `N42_ZK_PROOF=1`. Default: None (disabled, zero overhead).
     zk_scheduler: Option<Arc<n42_zkproof::ProofScheduler>>,
@@ -655,7 +655,7 @@ impl ConsensusOrchestrator {
     ///
     /// When set, the orchestrator consults the schedule at each `EpochTransition`
     /// event and automatically stages the next epoch's validator set.
-    pub fn with_jmt(mut self, jmt: Arc<Mutex<ShardedJmt>>) -> Self {
+    pub fn with_jmt(mut self, jmt: Arc<Mutex<ShardedSbmt>>) -> Self {
         self.jmt = Some(jmt);
         self
     }
