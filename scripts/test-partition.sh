@@ -240,7 +240,7 @@ genesis = {
         "terminalTotalDifficultyPassed": True,
     },
     "nonce": "0x0", "timestamp": "0x0", "extraData": "0x",
-    "gasLimit": "0x77359400", "difficulty": "0x0",
+    "gasLimit": hex(int(os.environ.get("N42_GAS_LIMIT", "2000000000"))), "difficulty": "0x0",
     "mixHash": "0x" + "0" * 64,
     "coinbase": "0x0000000000000000000000000000000000000000",
     "alloc": {
@@ -308,7 +308,7 @@ start_validator() {
         --max-outbound-peers "$((NUM_VALIDATORS + 2))" \
         --max-inbound-peers "$((NUM_VALIDATORS + 2))" \
         --metrics "127.0.0.1:$((BASE_METRICS + idx))" \
-        --builder.gaslimit 2000000000 \
+        --builder.gaslimit "${N42_GAS_LIMIT:-2000000000}" \
         --builder.interval 50ms \
         --rpc.max-connections 100 \
         --disable-tx-gossip \
