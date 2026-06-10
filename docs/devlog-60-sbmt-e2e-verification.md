@@ -125,3 +125,28 @@ N42_SBMT_RPC_URL=http://127.0.0.1:18000 \
 SBMT proof RPC is now verified end to end for both inclusion and exclusion. The proof
 format returned by `n42_jmtProof` is compatible with the mobile verifier, and local
 negative tests confirm proof tampering is rejected.
+
+---
+
+## Maintainer note (reth main 对齐)
+
+本次 E2E 在 macOS 上用的是**旧 reth fork(`n42/n42-v2-upgrade`,reth v2.2.0 base)**,
+为在该 fork 上编译,上文 "Environment Notes" 把 workspace 依赖临时降级了
+(revm 40→38、alloy-evm 0.35→0.34、reth-primitives-traits 0.4→0.3.1 等),并把几处
+reth-main API 改回了旧版。
+
+**本分支 `chore/merge-reth-main-deps-upgrade` 的目标是升级到 reth main**,因此这些
+**依赖降级 + API 回退已在主线撤销**(commit 见下),恢复为 reth main 对齐版本:
+`revm 40.0.3 / alloy-evm 0.35.0 / reth-primitives-traits 0.4.0`,并恢复
+`crates/n42-parallel-evm` 的 `TransactionId`(NonMaxU32,commit d8bce60 的修复)、
+`n42-consensus/adapter.rs` 的 `block_access_list_hash` 参数、`n42-execution/evm_factory.rs`
+的 `DBErrorMarker`、`execution_bridge.rs` 的 `block_to_payload(.., None)`。
+
+**保留的有效成果**(与 reth 版本无关,已在 reth main 下 `cargo check -p n42-node-bin` +
+`cargo test -p n42-jmt` + E2E 测试编译通过):
+- `crates/n42-mobile/tests/sbmt_rpc_e2e.rs`(E2E 验证器)
+- **Genesis alloc seeding**(`ShardedSbmt::seed_genesis_account` + main.rs 启动注入)
+- **Leader block-data drain**(`consensus_loop.rs`,修单节点 jmtRoot 未初始化)
+
+**仍待**:用 **reth main fork** 在 mac 上重跑一次实际 E2E(本次 proof 往返结论逻辑上有效,
+且代码已确认兼容 reth main,但运行验证是在旧 reth 上做的)。
