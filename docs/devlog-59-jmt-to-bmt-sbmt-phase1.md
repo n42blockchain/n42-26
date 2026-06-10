@@ -337,3 +337,37 @@ root 不进 header、不参与 BFT,唯一用途是 **RPC `jmtProof` 给手机钱
 
 FFI 接入 ✅。SBMT 现已端到端可用：节点算 root + 出 proof（RPC）→ 手机 C/JNI/Swift 纯 blake3 验证。
 剩余：PersistentSbmt 的 WAL（崩溃恢复闭合）+ reth-main 下实际 E2E（需 mac/CI）。
+
+---
+
+## 第九阶段:PersistentSbmt WAL（崩溃恢复闭合）
+
+闭合前几阶段反复标注的 P0 局限：崩溃恢复粒度 == 快照间隔。
+
+### 实现（`persistent.rs`）
+
+- **WAL**（`<snapshot>.wal`，append-only）：每条 `[version u64 LE][len u32 LE][bincode(StateDiff)]`。
+- `apply_diff`：内存 apply → **append WAL（per-block durable）** → 到 `snapshot_interval` 触发**同步**
+  `flush`（快照 durable 后才截断 WAL，保证顺序安全）。
+- `open`：load snapshot(V0) → **replay WAL 中 version > V0 的记录** → 打开 WAL append handle。
+  崩溃时写一半的尾记录（截断/损坏）被丢弃。
+- `flush`：snapshot + save **成功后** `truncate_wal`（快照已覆盖到该 version，WAL 可清）。
+- `flush_background` 保留但**不截断 WAL**（快照未 durable），WAL checkpoint 只走同步 `flush`。
+
+### 效果
+
+崩溃恢复 = 快照 + WAL replay → **已提交的块一个都不丢**，即使从未快照。
+
+### 验证
+
+- 新增 2 测试：`sbmt_wal_recovers_unsnapshotted_blocks`（interval=MAX 不快照，纯 WAL 恢复 3 个块）、
+  `sbmt_wal_truncated_after_snapshot`（快照后 WAL 文件长度=0）。
+- `cargo test -p n42-jmt` **81 passed**，clippy `-D warnings` 干净。
+
+### 阶段状态
+
+WAL ✅。**至此 SBMT 新树完整实现闭环**：引擎 → 16 分片 → 统一 KV+Merkle → proof（打包+去冗余，比 JMT
+小 41%）→ 持久化（快照 + WAL 崩溃恢复）→ 零依赖 core → 手机验证（core + FFI C/JNI/Swift）→
+节点切换（ShardedSbmt + genesis seeding + leader drain）→ reth main 端到端 E2E 通过（mac）。
+
+注：生产可选增强 — WAL 用 `fsync`（当前 `flush` 到 OS buffer，进程崩溃安全、OS 崩溃可能丢 buffer）。

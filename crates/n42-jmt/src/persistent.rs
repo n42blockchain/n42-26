@@ -25,6 +25,8 @@ use crate::store::MemTreeStore;
 use alloy_primitives::B256;
 use jmt::Version;
 use n42_execution::state_diff::StateDiff;
+use std::fs::{File, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::thread::JoinHandle;
 use tracing::debug;
@@ -146,33 +148,93 @@ impl Drop for PersistentJmt {
     }
 }
 
-/// In-memory [`ShardedSbmt`] with snapshot-based durability — the SBMT analogue
-/// of [`PersistentJmt`]. Same model: `apply_diff` runs at in-memory speed (no
-/// node IO), snapshots flush every `snapshot_interval` versions, optionally on a
-/// background thread. Same P0 limitation: crash-recovery granularity == snapshot
-/// interval (production needs a StateDiff WAL between snapshots).
+/// In-memory [`ShardedSbmt`] with snapshot + write-ahead-log durability.
+///
+/// Every `apply_diff` appends the `StateDiff` to a WAL (durable per block); a
+/// snapshot every `snapshot_interval` versions checkpoints full state and then
+/// truncates the WAL. Recovery = load snapshot + replay WAL, so **no committed
+/// block is lost on crash** — this closes the earlier "crash-recovery granularity
+/// == snapshot interval" limitation of the snapshot-only design.
 pub struct PersistentSbmt {
     inner: ShardedSbmt,
     snapshot_path: PathBuf,
+    /// WAL path (`<snapshot>.wal`).
+    wal_path: PathBuf,
+    /// Append-only log of per-block `StateDiff`s since the last snapshot.
+    wal: File,
     snapshot_interval: u64,
     last_snapshot_version: u64,
     pending_flush: Option<JoinHandle<eyre::Result<()>>>,
+}
+
+/// Read all `(version, StateDiff)` records from a WAL file (empty if absent).
+///
+/// Record format: `[version: u64 LE][len: u32 LE][bincode(StateDiff): len]`.
+/// A truncated or corrupt trailing record (crash mid-write) is discarded.
+fn read_wal_entries(path: &Path) -> eyre::Result<Vec<(u64, StateDiff)>> {
+    let data = match std::fs::read(path) {
+        Ok(d) => d,
+        Err(_) => return Ok(Vec::new()),
+    };
+    let mut entries = Vec::new();
+    let mut off = 0usize;
+    while off + 12 <= data.len() {
+        let version = u64::from_le_bytes(data[off..off + 8].try_into().unwrap());
+        let len = u32::from_le_bytes(data[off + 8..off + 12].try_into().unwrap()) as usize;
+        let start = off + 12;
+        if start + len > data.len() {
+            break; // truncated trailing record
+        }
+        match bincode::deserialize::<StateDiff>(&data[start..start + len]) {
+            Ok(diff) => entries.push((version, diff)),
+            Err(_) => break, // corrupt trailing record
+        }
+        off = start + len;
+    }
+    Ok(entries)
 }
 
 impl PersistentSbmt {
     /// Open a persistent SBMT, restoring from an existing snapshot if present.
     pub fn open(snapshot_path: impl AsRef<Path>, snapshot_interval: u64) -> eyre::Result<Self> {
         let snapshot_path = snapshot_path.as_ref().to_path_buf();
-        let (inner, last_snapshot_version) = match load_snapshot(&snapshot_path)? {
+        let wal_path = snapshot_path.with_extension("wal");
+        let (mut inner, last_snapshot_version) = match load_snapshot(&snapshot_path)? {
             Some(snap) => {
                 let version = snap.version;
                 (ShardedSbmt::from_snapshot(&snap)?, version)
             }
             None => (ShardedSbmt::new(), 0),
         };
+
+        // Replay WAL records newer than the snapshot to recover committed blocks
+        // that were not yet checkpointed when the process stopped.
+        let mut replayed = 0u64;
+        for (version, diff) in read_wal_entries(&wal_path)? {
+            if version > inner.version() {
+                inner.apply_diff(&diff);
+                replayed += 1;
+            }
+        }
+        if replayed > 0 {
+            tracing::info!(
+                target: "n42::jmt",
+                replayed,
+                version = inner.version(),
+                "replayed SBMT WAL on open"
+            );
+        }
+
+        let wal = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&wal_path)?;
+
         Ok(Self {
             inner,
             snapshot_path,
+            wal_path,
+            wal,
             snapshot_interval: snapshot_interval.max(1),
             last_snapshot_version,
             pending_flush: None,
@@ -203,21 +265,57 @@ impl PersistentSbmt {
     /// `snapshot_interval` versions have elapsed since the last persisted one.
     pub fn apply_diff(&mut self, diff: &StateDiff) -> eyre::Result<(u64, B256)> {
         let (version, root) = self.inner.apply_diff(diff);
+        // WAL append makes this block durable immediately, before any snapshot.
+        self.append_wal(version, diff)?;
         if version.saturating_sub(self.last_snapshot_version) >= self.snapshot_interval {
-            self.flush_background()?;
+            // Synchronous checkpoint so the WAL can be safely truncated afterward.
+            self.flush()?;
         }
         Ok((version, root))
     }
 
-    /// Synchronous snapshot flush: blocks until durably written.
+    /// Append a `(version, diff)` record to the WAL and flush it to the OS.
+    fn append_wal(&mut self, version: u64, diff: &StateDiff) -> eyre::Result<()> {
+        let bytes = bincode::serialize(diff)?;
+        self.wal.write_all(&version.to_le_bytes())?;
+        self.wal.write_all(&(bytes.len() as u32).to_le_bytes())?;
+        self.wal.write_all(&bytes)?;
+        self.wal.flush()?;
+        Ok(())
+    }
+
+    /// Clear the WAL after a durable snapshot, then reopen it for append.
+    fn truncate_wal(&mut self) -> eyre::Result<()> {
+        drop(
+            OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&self.wal_path)?,
+        );
+        self.wal = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.wal_path)?;
+        Ok(())
+    }
+
+    /// Synchronous snapshot flush: blocks until durably written, then truncates
+    /// the WAL (the snapshot now covers everything up to `last_snapshot_version`).
     pub fn flush(&mut self) -> eyre::Result<()> {
         self.join_pending()?;
         let snapshot = self.inner.snapshot();
         self.last_snapshot_version = snapshot.version;
-        save_snapshot(&self.snapshot_path, &snapshot)
+        save_snapshot(&self.snapshot_path, &snapshot)?;
+        self.truncate_wal()
     }
 
     /// Background snapshot flush: serialization + IO off the apply path.
+    ///
+    /// Unlike [`flush`](Self::flush), this does **not** truncate the WAL (the
+    /// snapshot is not yet durable when this returns). WAL checkpointing happens
+    /// via the synchronous `flush` path; use this only when you manage durability
+    /// ordering yourself.
     pub fn flush_background(&mut self) -> eyre::Result<()> {
         self.join_pending()?;
         let snapshot: JmtSnapshot = self.inner.snapshot();
@@ -334,6 +432,52 @@ mod tests {
 
         let reopened = PersistentJmt::open(&path, u64::MAX).unwrap();
         assert_eq!(reopened.root_hash().unwrap(), root);
+    }
+
+    #[test]
+    fn sbmt_wal_recovers_unsnapshotted_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sbmt.snapshot");
+
+        let (root, version) = {
+            // interval = MAX → no snapshot ever fires; durability is purely WAL.
+            let mut jmt = PersistentSbmt::open(&path, u64::MAX).unwrap();
+            jmt.apply_diff(&make_diff(50)).unwrap();
+            jmt.apply_diff(&make_diff(30)).unwrap();
+            jmt.apply_diff(&make_diff(10)).unwrap();
+            assert_eq!(jmt.last_snapshot_version(), 0, "no snapshot should have fired");
+            (jmt.root_hash(), jmt.version())
+            // drop without flush() — simulates a crash with no snapshot taken.
+        };
+
+        // Reopen: the snapshot file is absent, so recovery must come from WAL replay.
+        let reopened = PersistentSbmt::open(&path, u64::MAX).unwrap();
+        assert_eq!(
+            reopened.version(),
+            version,
+            "WAL must recover every committed block"
+        );
+        assert_eq!(reopened.root_hash(), root);
+    }
+
+    #[test]
+    fn sbmt_wal_truncated_after_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sbmt.snapshot");
+        let wal = path.with_extension("wal");
+
+        let mut jmt = PersistentSbmt::open(&path, 2).unwrap(); // snapshot every 2 versions
+        jmt.apply_diff(&make_diff(10)).unwrap();
+        jmt.apply_diff(&make_diff(10)).unwrap(); // version 2 → snapshot + WAL truncate
+        assert_eq!(jmt.last_snapshot_version(), 2);
+        let wal_len = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+        assert_eq!(wal_len, 0, "WAL must be empty after a checkpoint");
+
+        let root = jmt.root_hash();
+        drop(jmt);
+        let reopened = PersistentSbmt::open(&path, 2).unwrap();
+        assert_eq!(reopened.root_hash(), root);
+        assert_eq!(reopened.version(), 2);
     }
 
     #[test]
