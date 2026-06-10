@@ -28,11 +28,35 @@
 
 ## 2. 前置
 
-1. 同步代码:分支 **`chore/merge-reth-main-deps-upgrade`**(`git pull`,确认 HEAD 含 commit
-   `4e0fba0` "switch parallel state tree ... ShardedSbmt" 或更新)。
-2. reth fork 在 `../reth`(相对 n42-26),分支为 n42 的 upgrade 分支(`git -C ../reth log -1`)。
-3. 构建:`cargo build --release -p n42-node-bin`(mac 应可原生编译;Windows 编不过的 jemalloc/
+### ⛔ 步骤 0（必做，否则会破坏分支）：确认 `../reth` 是 **reth main 合并版**
+
+本分支 `chore/merge-reth-main-deps-upgrade` 的依赖 pin 对齐 **reth main**
+（`revm 40.0.3 / alloy-evm 0.35.0 / reth-primitives-traits 0.4.0`）。`../reth` 有一个**旧基线**
+`n42-v2-upgrade`（reth v2.2.0，对应 revm 38 / alloy-evm 0.34 / reth-primitives-traits 0.3.1）。
+**用错基线会导致编译失败，且绝不能为了让旧 reth 编过而降级 `Cargo.toml`** —— 那会推翻本分支的
+deps upgrade（上一轮就因此返工，见 §Maintainer note in devlog-60）。
+
+```bash
+# 1) 确认 reth 在 main 合并版（HEAD 应是 reth main 合并 + N42 hooks，不是 v2.2.0 base）
+git -C ../reth log -1 --oneline
+git -C ../reth branch --show-current
+# 2) 自检：以下版本必须保持原样，不得改动
+grep -E "alloy-evm =|revm =|reth-primitives-traits =" Cargo.toml
+#   预期：alloy-evm 0.35.0 / revm 40.0.3 / reth-primitives-traits 0.4.0
+```
+
+如果 `../reth` 只有旧的 `n42-v2-upgrade`，**先把 reth fork 切到/拉取 reth main 合并版再继续**；
+不要修改 n42-26 的依赖去迁就旧 reth。完成后 `git diff Cargo.toml` 必须为空。
+
+### 其余前置
+
+1. 同步代码:分支 **`chore/merge-reth-main-deps-upgrade`**(`git pull`,HEAD 应含 commit
+   `2e13906` "revert reth v2.2.0 downgrade ... realign to reth main" 或更新)。
+2. 构建:`cargo build --release -p n42-node-bin`(mac 原生编译;Windows 编不过的 jemalloc/
    mdbx 在 mac 上正常)。先确认 `cargo test -p n42-bmt-core -p n42-jmt` 全绿。
+3. **收尾自检**:E2E 跑完提交前,再次 `git diff Cargo.toml`(必须为空)+
+   `git diff -- crates/n42-parallel-evm crates/n42-consensus crates/n42-execution`(不应有
+   revm/alloy API 回退式改动)。
 
 ## 3. 关键技术点(已确认)
 
