@@ -15,20 +15,21 @@ Verify the SBMT production path end to end on macOS:
 
 ## Environment Notes
 
-`../reth` must point at the n42 fork upgrade branch. Using upstream `paradigmxyz/reth`
-`main` produced `alloy-evm` / `revm` trait mismatches. The working setup used:
+`../reth` points at the n42 reth branch that has upstream main merged plus the N42
+execution hooks. A plain `../reth/main` checkout failed the required release build
+because it does not contain `reth_evm::payload_cache` or `n42_defer_state_root`.
+The validated setup used:
 
 ```text
-../reth: n42/n42-v2-upgrade
-HEAD: 77e0b8c25c n42: reth v2.2.0 base + N42 hooks rebased + roaring 0.11.4
+../reth: n42/chore/merge-upstream-main
+HEAD: 04c7f29f9b feat(deps): bump alloy-evm 0.35 -> 0.36, adapt OnStateHook API
 ```
 
-The n42 workspace dependency pins were aligned to this local reth tree:
+The n42 workspace manifest stayed aligned with the reth-main dependency line:
 
-- `reth-primitives-traits = 0.3.1`
-- `alloy-* = 2.0.4/1.5.6 line where required by reth`
-- `alloy-evm = 0.34.0`
-- `revm = 38.0.0`
+- `reth-primitives-traits = 0.4.0` in `Cargo.toml` (resolved as `0.4.2` in `Cargo.lock`);
+- `alloy-evm = 0.36.0`;
+- `revm = 40.0.3`.
 
 ## Fixes Made During Verification
 
@@ -92,9 +93,17 @@ env N42_JMT=1 N42_ENABLE_HTTP_RPC=1 N42_LOW_MEMORY=1 \
 RPC smoke:
 
 ```text
-eth_blockNumber -> 0x1d
-n42_jmtVersion -> 29
-n42_jmtRoot -> { version: 29, root: 0x7389f22cccf772a7641bfe9c4b4520afef2df828d4436fdcbef24dcf156cda6a }
+eth_blockNumber -> 0x1c
+n42_jmtVersion -> 28
+n42_jmtRoot -> { version: 28, root: 0xb48623238c0cc0155172c8ce9692ac3da79dfcdfae463f3cf1269b9db5f1dec4 }
+```
+
+Representative SBMT logs:
+
+```text
+SBMT state tree enabled (16 shards)
+SBMT seeded from genesis alloc version=0 root=0x661cbcc1a53b67794b35a46a348788abc3eaa45d72a511d745e10698852f09dc accounts=5001
+SBMT updated version=28 root=0xb48623238c0cc0155172c8ce9692ac3da79dfcdfae463f3cf1269b9db5f1dec4 accounts=4 storage_changes=0
 ```
 
 Ignored E2E result:
@@ -112,8 +121,6 @@ Passed:
 
 ```bash
 cargo test -p n42-bmt-core -p n42-jmt
-cargo test -p n42-jmt
-cargo check -p n42-node-bin
 cargo build --release -p n42-node-bin
 cargo test -p n42-mobile --test sbmt_rpc_e2e
 N42_SBMT_RPC_URL=http://127.0.0.1:18000 \
@@ -122,31 +129,17 @@ N42_SBMT_RPC_URL=http://127.0.0.1:18000 \
 
 ## Outcome
 
-SBMT proof RPC is now verified end to end for both inclusion and exclusion. The proof
-format returned by `n42_jmtProof` is compatible with the mobile verifier, and local
-negative tests confirm proof tampering is rejected.
+SBMT proof RPC is verified end to end on the reth-main merged fork for both inclusion
+and exclusion. The proof format returned by `n42_jmtProof` is compatible with the
+mobile verifier, and local negative tests confirm proof tampering is rejected.
 
 ---
 
-## Maintainer note (reth main 对齐)
+## Reth Main Alignment Status
 
-本次 E2E 在 macOS 上用的是**旧 reth fork(`n42/n42-v2-upgrade`,reth v2.2.0 base)**,
-为在该 fork 上编译,上文 "Environment Notes" 把 workspace 依赖临时降级了
-(revm 40→38、alloy-evm 0.35→0.34、reth-primitives-traits 0.4→0.3.1 等),并把几处
-reth-main API 改回了旧版。
-
-**本分支 `chore/merge-reth-main-deps-upgrade` 的目标是升级到 reth main**,因此这些
-**依赖降级 + API 回退已在主线撤销**(commit 见下),恢复为 reth main 对齐版本:
-`revm 40.0.3 / alloy-evm 0.35.0 / reth-primitives-traits 0.4.0`,并恢复
-`crates/n42-parallel-evm` 的 `TransactionId`(NonMaxU32,commit d8bce60 的修复)、
-`n42-consensus/adapter.rs` 的 `block_access_list_hash` 参数、`n42-execution/evm_factory.rs`
-的 `DBErrorMarker`、`execution_bridge.rs` 的 `block_to_payload(.., None)`。
-
-**保留的有效成果**(与 reth 版本无关,已在 reth main 下 `cargo check -p n42-node-bin` +
-`cargo test -p n42-jmt` + E2E 测试编译通过):
-- `crates/n42-mobile/tests/sbmt_rpc_e2e.rs`(E2E 验证器)
-- **Genesis alloc seeding**(`ShardedSbmt::seed_genesis_account` + main.rs 启动注入)
-- **Leader block-data drain**(`consensus_loop.rs`,修单节点 jmtRoot 未初始化)
-
-**仍待**:用 **reth main fork** 在 mac 上重跑一次实际 E2E(本次 proof 往返结论逻辑上有效,
-且代码已确认兼容 reth main,但运行验证是在旧 reth 上做的)。
+The earlier old-fork E2E note is superseded by this run. The actual RPC proof
+roundtrip above was executed after switching `../reth` to `chore/merge-upstream-main`.
+`Cargo.toml` kept the reth-main dependency line (`revm 40.0.3`, `alloy-evm 0.36.0`,
+`reth-primitives-traits 0.4.0`), and final diff checks showed no dependency rollback
+or reth-main API rollback in `crates/n42-parallel-evm`, `crates/n42-consensus`, or
+`crates/n42-execution`.
