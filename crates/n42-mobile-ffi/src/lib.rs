@@ -25,6 +25,8 @@ use transport::{connect_quic, is_v2_wire_format, recv_loop};
 
 pub use context::VerifierContext;
 
+use n42_mobile::state_proof::{ShardedBmtProof, verify_state_proof};
+
 // ── Android JNI bridge ──
 #[cfg(target_os = "android")]
 mod android;
@@ -504,6 +506,47 @@ pub unsafe extern "C" fn n42_last_verify_info(
     safe_cint(json.len())
 }
 
+/// Verifies an SBMT state proof (a single account/storage entry) against a
+/// block's combined SBMT state root, using pure blake3 — no block re-execution,
+/// no network. Stateless: does not require a `VerifierContext`.
+///
+/// `proof_data` is `bincode(ShardedBmtProof)` — exactly the bytes returned in the
+/// `n42_jmtProof` RPC response's `proofHex` field (hex-decoded). `state_root`
+/// points to the 32-byte combined SBMT root from `n42_jmtRoot`.
+///
+/// Returns:
+/// - `0`  proof is valid (inclusion or exclusion);
+/// - `1`  proof failed to decode;
+/// - `2`  verification failed (wrong root / tampered / value mismatch);
+/// - `-1` null or zero-length arguments.
+///
+/// # Safety
+/// `proof_data` must point to `proof_len` valid bytes; `state_root` to 32 bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn n42_verify_state_proof(
+    proof_data: *const u8,
+    proof_len: usize,
+    state_root: *const u8,
+) -> c_int {
+    if proof_data.is_null() || proof_len == 0 || state_root.is_null() {
+        return FfiError::InvalidData.into_code();
+    }
+
+    let proof_bytes = unsafe { std::slice::from_raw_parts(proof_data, proof_len) };
+    let proof: ShardedBmtProof = match bincode::deserialize(proof_bytes) {
+        Ok(p) => p,
+        Err(e) => return FfiError::PacketDecode(format!("SBMT proof decode: {e}")).into_code(),
+    };
+
+    let mut root = [0u8; 32];
+    unsafe { std::ptr::copy_nonoverlapping(state_root, root.as_mut_ptr(), 32) };
+
+    match verify_state_proof(&proof, B256::from(root)) {
+        Ok(()) => 0,
+        Err(e) => FfiError::VerifyFailed(format!("SBMT proof: {e}")).into_code(),
+    }
+}
+
 /// Gets the BLS12-381 public key (48 bytes) into `out_buf`.
 ///
 /// Returns 0 on success, -1 on error.
@@ -639,6 +682,48 @@ mod tests {
     use n42_mobile::code_cache::CacheSyncMessage;
     use std::collections::VecDeque;
     use std::sync::atomic::AtomicU64;
+
+    #[test]
+    fn test_verify_state_proof_roundtrip() {
+        use n42_bmt_core::{EMPTY_HASH, Sbmt, ShardedBmtProof, shard_tree_path, shard_tree_root};
+
+        // Build a single-shard SBMT proof from the engine (mirrors what the node's
+        // n42_jmtProof RPC returns, bincode-encoded).
+        let key = [0x05u8; 32];
+        let si = (key[0] >> 4) as usize;
+        let mut shard = Sbmt::new();
+        shard.insert(key, b"acct-value");
+        let mut roots = vec![EMPTY_HASH; 16];
+        roots[si] = shard.root_hash();
+        let combined = shard_tree_root(&roots);
+        let proof = ShardedBmtProof {
+            shard_index: si as u8,
+            shard_root: roots[si],
+            shard_path: shard_tree_path(&roots, si),
+            inner: shard.prove(key),
+            value: Some(b"acct-value".to_vec()),
+        };
+        let bytes = bincode::serialize(&proof).unwrap();
+
+        // Valid proof against the correct root.
+        let r = unsafe { n42_verify_state_proof(bytes.as_ptr(), bytes.len(), combined.as_ptr()) };
+        assert_eq!(r, 0, "valid SBMT proof must verify");
+
+        // Wrong root -> verification failure (code 2).
+        let bad_root = [0xFFu8; 32];
+        let r = unsafe { n42_verify_state_proof(bytes.as_ptr(), bytes.len(), bad_root.as_ptr()) };
+        assert_eq!(r, 2, "wrong root must fail verification");
+
+        // Undecodable proof -> decode error (code 1).
+        let garbage = [0xDEu8, 0xAD, 0xBE, 0xEF];
+        let r =
+            unsafe { n42_verify_state_proof(garbage.as_ptr(), garbage.len(), combined.as_ptr()) };
+        assert_eq!(r, 1, "undecodable proof must return decode error");
+
+        // Null args -> -1.
+        let r = unsafe { n42_verify_state_proof(std::ptr::null(), 0, combined.as_ptr()) };
+        assert_eq!(r, -1);
+    }
 
     #[test]
     fn test_verify_stats_default() {

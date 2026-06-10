@@ -311,3 +311,29 @@ root 不进 header、不参与 BFT,唯一用途是 **RPC `jmtProof` 给手机钱
 共识节点(n42-node)。`ShardedJmt` 保留在 n42-jmt crate 仅作对拍基线。
 
 后续:CI E2E 验证 → FFI/Dart SDK 暴露 verify_state_proof → 旧 JMT 代码清理(确认 SBMT 稳定后)。
+
+---
+
+## 第八阶段:FFI 暴露 SBMT proof 验证（手机真机接入）
+
+补齐手机验证最后一公里：手机 app 能用纯 blake3 验证 SBMT 账户 proof，不重执行、不联网。
+
+### 实现（`n42-mobile-ffi`）
+
+- C FFI `n42_verify_state_proof(proof_data, proof_len, state_root)`：**无状态**（不需要
+  `VerifierContext`），接 `bincode(ShardedBmtProof)`（= `n42_jmtProof` RPC 的 `proofHex` hex-decode）
+  + 32 字节 combined root（= `n42_jmtRoot`）。返回 0 有效 / 1 解码失败 / 2 验证失败 / -1 参数错。
+- **iOS**：`include/n42_mobile.h` 加 C 声明（Swift 直接调）。
+- **Android**：`android.rs` 加 JNI wrapper `nativeVerifyStateProof(proof, stateRoot)`。
+- 验证链路：手机调 `n42_jmtRoot` + `n42_jmtProof(addr)` → hex-decode proofHex → `n42_verify_state_proof`
+  → 0 即账户状态被 block SBMT root 承诺，无需信任节点、无需重执行。
+
+### 验证
+
+- 新增 FFI 往返测试（valid=0 / wrong-root=2 / garbage=1 / null=-1）+ iOS header 断言含新函数。
+- `cargo test -p n42-mobile-ffi` **44 passed**，clippy `-D warnings` 干净。
+
+### 阶段状态
+
+FFI 接入 ✅。SBMT 现已端到端可用：节点算 root + 出 proof（RPC）→ 手机 C/JNI/Swift 纯 blake3 验证。
+剩余：PersistentSbmt 的 WAL（崩溃恢复闭合）+ reth-main 下实际 E2E（需 mac/CI）。

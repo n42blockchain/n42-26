@@ -6755,6 +6755,7 @@ dependencies = [
  "blst",
  "hex",
  "jni 0.21.1",
+ "n42-bmt-core",
  "n42-chainspec",
  "n42-execution",
  "n42-mobile",

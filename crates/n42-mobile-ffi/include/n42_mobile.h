@@ -95,6 +95,22 @@ int n42_poll_packet(VerifierContext* ctx, uint8_t* out_buf, size_t buf_len);
 int n42_verify_and_send(VerifierContext* ctx, const uint8_t* data, size_t len);
 
 /**
+ * Verify an SBMT state proof (a single account/storage entry) against a block's
+ * combined SBMT state root, using pure blake3. Stateless — no context required,
+ * no block re-execution, no network.
+ *
+ * @param proof_data  bincode(ShardedBmtProof) — the hex-decoded `proofHex` from
+ *                    the n42_jmtProof RPC response.
+ * @param proof_len   Length of proof_data.
+ * @param state_root  Pointer to the 32-byte combined SBMT root (from n42_jmtRoot).
+ * @return  N42_OK (0) if valid, or:
+ *          N42_ERR_INVALID_INPUT (-1) if proof_data/state_root is NULL or len is 0,
+ *          N42_VERIFY_DECODE_ERROR (1) if the proof fails to decode,
+ *          N42_VERIFY_EXEC_ERROR (2) if verification fails.
+ */
+int n42_verify_state_proof(const uint8_t* proof_data, size_t proof_len, const uint8_t* state_root);
+
+/**
  * Get information about the last verification as a JSON string.
  *
  * JSON fields: block_number, block_hash, computed_receipts_root,
