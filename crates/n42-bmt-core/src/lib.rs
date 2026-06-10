@@ -146,20 +146,24 @@ fn new_internal(left: Link, right: Link) -> Link {
 }
 
 fn insert(link: &mut Link, key: Hash, value_hash: Hash, depth: usize) -> bool {
-    match link.take() {
+    match link {
         None => {
             *link = Some(Box::new(Node::Leaf { key, value_hash }));
             true
         }
-        Some(node) => match *node {
+        Some(node) => match node.as_mut() {
             Node::Leaf {
                 key: ek,
                 value_hash: ev,
             } => {
-                if ek == key {
-                    *link = Some(Box::new(Node::Leaf { key, value_hash }));
+                if *ek == key {
+                    // Same key: update the value hash in place, no reallocation.
+                    *ev = value_hash;
                     false
                 } else {
+                    // Split: replace this leaf with an internal subtree holding
+                    // both the existing leaf and the new key.
+                    let (ek, ev) = (*ek, *ev);
                     let mut internal = new_internal(None, None);
                     descend_insert(&mut internal, ek, ev, depth);
                     descend_insert(&mut internal, key, value_hash, depth);
@@ -167,18 +171,16 @@ fn insert(link: &mut Link, key: Hash, value_hash: Hash, depth: usize) -> bool {
                     true
                 }
             }
-            Node::Internal {
-                mut left,
-                mut right,
-                ..
-            } => {
-                let added = if bit(&key, depth) {
-                    insert(&mut right, key, value_hash, depth + 1)
+            Node::Internal { left, right, cache } => {
+                // Mutate in place: invalidate this node's cached hash and recurse
+                // into the correct child. Avoids the O(depth) Box reallocation of
+                // rebuilding every internal node on the insert path.
+                cache.set(None);
+                if bit(&key, depth) {
+                    insert(right, key, value_hash, depth + 1)
                 } else {
-                    insert(&mut left, key, value_hash, depth + 1)
-                };
-                *link = new_internal(left, right);
-                added
+                    insert(left, key, value_hash, depth + 1)
+                }
             }
         },
     }
@@ -242,6 +244,43 @@ fn collapse(left: Link, right: Link) -> Link {
     }
 }
 
+/// Live-tree node accounting, for benchmarking footprint against other
+/// content-addressed binary merkle trees (e.g. gov5's Go BMT).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NodeStats {
+    pub internal_nodes: usize,
+    pub leaf_nodes: usize,
+    /// Sum of per-node serialized bytes under a content-addressed store keyed by
+    /// a 32-byte hash: internal = 32 + 64 (key + `left||right`), leaf = 32 + 32
+    /// (key + value_hash). Mirrors gov5's `32 + len(value)` accounting so
+    /// `avg_node_size` is comparable. This counts the *live* tree only — unlike
+    /// an archival copy-on-write store, superseded node versions are not retained.
+    pub serialized_bytes: u64,
+}
+
+impl NodeStats {
+    pub fn total_nodes(&self) -> usize {
+        self.internal_nodes + self.leaf_nodes
+    }
+}
+
+fn collect_node_stats(link: &Link, s: &mut NodeStats) {
+    if let Some(node) = link {
+        match node.as_ref() {
+            Node::Leaf { .. } => {
+                s.leaf_nodes += 1;
+                s.serialized_bytes += 32 + 32;
+            }
+            Node::Internal { left, right, .. } => {
+                s.internal_nodes += 1;
+                s.serialized_bytes += 32 + 64;
+                collect_node_stats(left, s);
+                collect_node_stats(right, s);
+            }
+        }
+    }
+}
+
 /// A Sparse Binary Merkle Tree (path-compressed, blake3, 256-bit keys).
 #[derive(Default)]
 pub struct Sbmt {
@@ -266,6 +305,14 @@ impl Sbmt {
     /// Whether the tree has no leaves.
     pub fn is_empty(&self) -> bool {
         self.len == 0
+    }
+
+    /// Walk the live tree and tally internal/leaf node counts + serialized bytes.
+    /// O(nodes); intended for diagnostics/benchmarks, not the hot path.
+    pub fn node_stats(&self) -> NodeStats {
+        let mut s = NodeStats::default();
+        collect_node_stats(&self.root, &mut s);
+        s
     }
 
     /// Root hash (`EMPTY_HASH` for an empty tree).

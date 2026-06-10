@@ -6368,6 +6368,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "memory-stats"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c73f5c649995a115e1a0220b35e4df0a1294500477f97a91d0660fb5abeb574a"
+dependencies = [
+ "libc",
+ "windows-sys 0.52.0",
+]
+
+[[package]]
 name = "memuse"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6700,6 +6710,7 @@ dependencies = [
  "eyre",
  "jmt",
  "lru 0.16.4",
+ "memory-stats",
  "metrics",
  "n42-bmt-core",
  "n42-execution",
@@ -6708,6 +6719,7 @@ dependencies = [
  "rayon",
  "reth-libmdbx",
  "serde",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.18",
  "tracing",

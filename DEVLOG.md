@@ -90,6 +90,7 @@ Logs are split into separate files by phase for easy maintenance:
 | [devlog-59-jmt-to-bmt-sbmt-phase1](docs/devlog-59-jmt-to-bmt-sbmt-phase1.md) | Decision JMT→Self-built SBMT, Persistent SBMT WAL/fsync, Recovery E2E, EOA code_hash alignment | Architecture |
 | [devlog-60-sbmt-e2e-verification](docs/devlog-60-sbmt-e2e-verification.md) | SBMT RPC Proof + Restart Recovery E2E: Genesis Snapshot, Inclusion/Exclusion Proofs, Mobile Verify | Verification |
 | [devlog-61-sbmt-proof-key-binding](docs/devlog-61-sbmt-proof-key-binding.md) | SBMT 证明 key+shard 绑定安全修复（轻客户端 soundness）+ key 派生/shard_index 单一来源去重 | Security |
+| [devlog-62-sbmt-benchmark-vs-gov5](docs/devlog-62-sbmt-benchmark-vs-gov5.md) | SBMT 规模化 benchmark + in-place insert 优化（1.8×）+ 对标 gov5 BMT/QMDB；识别路径压缩机会 | Benchmark |
 
 ---
 

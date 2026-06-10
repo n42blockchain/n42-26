@@ -210,6 +210,20 @@ impl ShardedSbmt {
             .collect()
     }
 
+    /// Aggregate live-tree node statistics across all 16 shards (for footprint
+    /// benchmarking). The depth-4 shard-tree over the 16 shard roots adds 15
+    /// transient internal nodes that are recomputed on demand and not counted.
+    pub fn node_stats(&self) -> n42_bmt_core::NodeStats {
+        let mut agg = n42_bmt_core::NodeStats::default();
+        for s in &self.shards {
+            let st = s.lock().node_stats();
+            agg.internal_nodes += st.internal_nodes;
+            agg.leaf_nodes += st.leaf_nodes;
+            agg.serialized_bytes += st.serialized_bytes;
+        }
+        agg
+    }
+
     /// Snapshot all live `(key, value)` pairs plus version and combined root.
     ///
     /// Reuses the shared [`JmtSnapshot`] format (a plain KV dump), so SBMT and
