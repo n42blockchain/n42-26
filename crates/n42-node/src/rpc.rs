@@ -648,8 +648,15 @@ impl N42ApiServer for N42RpcServer {
 
         // SBMT root_hash and prove are infallible; prove always returns a proof
         // (inclusion or exclusion). The full ShardedBmtProof is bincode-encoded
-        // into `proof_hex` for the mobile client to deserialize and verify; the
-        // shard-tree path is exposed via `shard_roots` for inspection.
+        // into `proof_hex` for the mobile client to deserialize and verify.
+        //
+        // IMPORTANT for verifiers: the `root` field below is the **SBMT combined
+        // root** (its own depth-4 shard merkle), NOT the block header's
+        // `state_root` (which is reth's MPT root, and is `B256::ZERO` in
+        // deferred-state-root mode). `verify_state_proof` must be given THIS root
+        // (also available via `n42_jmtRoot`). The `shard_roots` field carries the
+        // proof's 4 shard-tree siblings (`shard_path`), not the 16 shard roots it
+        // held under JMT — it is informational only; verification uses `proof_hex`.
         let root = tree.root_hash();
         let proof = tree.prove(key_hash);
         let proof_bytes = bincode::serialize(&proof).map_err(|e| {

@@ -425,10 +425,20 @@ impl ConsensusOrchestrator {
         // block in its engine tree.
         while let Ok((hash, data)) = self.leader_payload_rx.try_recv() {
             if !self.pending_block_data.contains_key(&hash) {
-                if self.pending_block_data.len() >= super::execution_bridge::MAX_PENDING_BLOCK_DATA
-                    && let Some(old_key) = self.pending_block_data.keys().next().copied()
-                {
-                    self.pending_block_data.remove(&old_key);
+                if self.pending_block_data.len() >= super::execution_bridge::MAX_PENDING_BLOCK_DATA {
+                    // `pending_block_data` is a BTreeMap (hash-ordered, not
+                    // insertion-ordered), so `keys().next()` is the smallest hash,
+                    // which could be `block_hash` — the very entry we are about to
+                    // read for the SBMT update below. Never evict the block being
+                    // committed; evict any other entry instead.
+                    if let Some(old_key) = self
+                        .pending_block_data
+                        .keys()
+                        .find(|k| **k != block_hash)
+                        .copied()
+                    {
+                        self.pending_block_data.remove(&old_key);
+                    }
                 }
                 self.pending_block_data.insert(hash, data);
             }

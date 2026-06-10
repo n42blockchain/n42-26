@@ -373,6 +373,13 @@ impl BmtProof {
             (Some(vh), None) => hash_leaf(&self.key, &vh),
             (None, None) => EMPTY_HASH,
             (None, Some((ok, ovh))) => {
+                // The occupying leaf MUST be a different key. Otherwise a present
+                // key K could be passed off as absent by reusing its own leaf
+                // (key=K, value_hash=None, other_leaf=Some((K, V))): the fold would
+                // reach the real root and a forged exclusion proof would verify.
+                if ok == self.key {
+                    return false;
+                }
                 if !shares_prefix(&self.key, &ok, self.siblings.len()) {
                     return false;
                 }
@@ -453,6 +460,8 @@ pub enum BmtVerifyError {
     ShardIndexOutOfRange(u8),
     #[error("combined root mismatch")]
     CombinedRootMismatch,
+    #[error("malformed shard path length {len}, expected {expected}")]
+    MalformedShardPath { len: usize, expected: usize },
     #[error("value does not match committed value hash")]
     ValueHashMismatch,
     #[error("in-shard proof verification failed")]
@@ -478,6 +487,16 @@ impl ShardedBmtProof {
     pub fn verify(&self, combined_root: &Hash) -> Result<(), BmtVerifyError> {
         if self.shard_index as usize >= SHARD_COUNT {
             return Err(BmtVerifyError::ShardIndexOutOfRange(self.shard_index));
+        }
+        // The shard-tree is a fixed depth-log2(SHARD_COUNT) binary merkle, so the
+        // authentication path must have exactly that many siblings. Reject any
+        // other length explicitly (untrusted proof) rather than relying on the
+        // root re-comparison below to catch a malformed fold.
+        if self.shard_path.len() != SHARD_COUNT.trailing_zeros() as usize {
+            return Err(BmtVerifyError::MalformedShardPath {
+                len: self.shard_path.len(),
+                expected: SHARD_COUNT.trailing_zeros() as usize,
+            });
         }
         let computed = shard_tree_root_from_path(
             self.shard_root,
@@ -576,6 +595,31 @@ mod tests {
         let vh = hash_value(&42u64.to_le_bytes());
         assert!(t.prove(key).verify(&root, Some(vh)));
         assert!(t.prove(key_from(99999)).verify(&root, None));
+    }
+
+    #[test]
+    fn forged_exclusion_proof_rejected() {
+        // K is present; reuse its own leaf to forge an absence proof.
+        let mut t = Sbmt::new();
+        for i in 0..50u64 {
+            t.insert(key_from(i), &i.to_le_bytes());
+        }
+        let root = t.root_hash();
+        let key = key_from(7);
+        let vh = hash_value(&7u64.to_le_bytes());
+        let incl = t.prove(key);
+        assert!(incl.verify(&root, Some(vh)), "real inclusion must verify");
+
+        let forged = BmtProof {
+            key,
+            value_hash: None,
+            siblings: incl.siblings.clone(),
+            other_leaf: Some((key, vh)),
+        };
+        assert!(
+            !forged.verify(&root, None),
+            "exclusion proof reusing the key's own leaf must be rejected"
+        );
     }
 
     #[test]

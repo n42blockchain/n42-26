@@ -208,13 +208,24 @@ impl PersistentSbmt {
         };
 
         // Replay WAL records newer than the snapshot to recover committed blocks
-        // that were not yet checkpointed when the process stopped.
+        // that were not yet checkpointed when the process stopped. Records must be
+        // strictly contiguous (each is the next version): `apply_diff` derives the
+        // version internally, so a gap would be silently misapplied at the wrong
+        // version. Fail loud instead of corrupting state.
         let mut replayed = 0u64;
         for (version, diff) in read_wal_entries(&wal_path)? {
-            if version > inner.version() {
-                inner.apply_diff(&diff);
-                replayed += 1;
+            let expected = inner.version() + 1;
+            if version < expected {
+                continue; // already covered by the snapshot
             }
+            if version != expected {
+                return Err(eyre::eyre!(
+                    "SBMT WAL is non-contiguous: expected version {expected}, found {version}; \
+                     refusing to replay to avoid silent state corruption"
+                ));
+            }
+            inner.apply_diff(&diff);
+            replayed += 1;
         }
         if replayed > 0 {
             tracing::info!(
@@ -264,9 +275,13 @@ impl PersistentSbmt {
     /// Apply a `StateDiff` (zero node IO), triggering a background snapshot once
     /// `snapshot_interval` versions have elapsed since the last persisted one.
     pub fn apply_diff(&mut self, diff: &StateDiff) -> eyre::Result<(u64, B256)> {
+        // WAL-ahead: append the record durably BEFORE mutating memory, so a crash
+        // can only lose in-memory state (recoverable by replay) and never leave
+        // memory ahead of the WAL. `apply_diff` will assign exactly this version.
+        let next_version = self.inner.version() + 1;
+        self.append_wal(next_version, diff)?;
         let (version, root) = self.inner.apply_diff(diff);
-        // WAL append makes this block durable immediately, before any snapshot.
-        self.append_wal(version, diff)?;
+        debug_assert_eq!(version, next_version);
         if version.saturating_sub(self.last_snapshot_version) >= self.snapshot_interval {
             // Synchronous checkpoint so the WAL can be safely truncated afterward.
             self.flush()?;
