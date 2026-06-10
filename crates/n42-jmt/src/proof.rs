@@ -110,7 +110,7 @@ pub fn build_proof<S: crate::TreeStore>(
 ) -> eyre::Result<Option<JmtProof>> {
     let start = Instant::now();
 
-    let shard_idx = key_hash.0[0] >> 4;
+    let shard_idx = n42_bmt_core::shard_index_for_key(&key_hash.0) as u8;
 
     // Generate shard-level proof. None if shard is empty.
     let Some(shard_proof) = sharded_jmt.get_proof(key_hash)? else {

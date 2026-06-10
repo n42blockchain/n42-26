@@ -25,7 +25,7 @@ use std::collections::HashMap;
 
 #[inline]
 fn shard_index(key: &Hash) -> usize {
-    (key[0] >> 4) as usize
+    n42_bmt_core::shard_index_for_key(key)
 }
 
 

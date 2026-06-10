@@ -25,7 +25,10 @@ use transport::{connect_quic, is_v2_wire_format, recv_loop};
 
 pub use context::VerifierContext;
 
-use n42_mobile::state_proof::{ShardedBmtProof, verify_state_proof};
+use alloy_primitives::{Address, U256};
+use n42_mobile::state_proof::{
+    ShardedBmtProof, verify_account_proof, verify_state_proof, verify_storage_proof,
+};
 
 // ── Android JNI bridge ──
 #[cfg(target_os = "android")]
@@ -547,6 +550,96 @@ pub unsafe extern "C" fn n42_verify_state_proof(
     }
 }
 
+/// Like [`n42_verify_state_proof`], but **binds the proof to a queried account**.
+///
+/// Derives the canonical account key for the 20-byte `address` and rejects the
+/// proof unless its leaf key and shard match — closing the gap where an
+/// untrusted server answers a query for account A with a valid proof for an
+/// unrelated account B (or a wrong-shard non-membership proof for A). Light
+/// clients verifying against an untrusted RPC should use this, not the unbound
+/// variant.
+///
+/// Returns: `0` valid; `1` decode failed; `2` verification failed (wrong root /
+/// tampered / key or shard mismatch); `-1` null/short arguments.
+///
+/// # Safety
+/// `proof_data` → `proof_len` bytes; `state_root` → 32 bytes; `address` → 20 bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn n42_verify_account_proof(
+    proof_data: *const u8,
+    proof_len: usize,
+    state_root: *const u8,
+    address: *const u8,
+) -> c_int {
+    if proof_data.is_null() || proof_len == 0 || state_root.is_null() || address.is_null() {
+        return FfiError::InvalidData.into_code();
+    }
+
+    let proof_bytes = unsafe { std::slice::from_raw_parts(proof_data, proof_len) };
+    let proof: ShardedBmtProof = match bincode::deserialize(proof_bytes) {
+        Ok(p) => p,
+        Err(e) => return FfiError::PacketDecode(format!("SBMT proof decode: {e}")).into_code(),
+    };
+
+    let mut root = [0u8; 32];
+    unsafe { std::ptr::copy_nonoverlapping(state_root, root.as_mut_ptr(), 32) };
+    let mut addr = [0u8; 20];
+    unsafe { std::ptr::copy_nonoverlapping(address, addr.as_mut_ptr(), 20) };
+
+    match verify_account_proof(&proof, B256::from(root), Address::from(addr)) {
+        Ok(()) => 0,
+        Err(e) => FfiError::VerifyFailed(format!("SBMT account proof: {e}")).into_code(),
+    }
+}
+
+/// Like [`n42_verify_account_proof`], but binds to a `(address, slot)` storage entry.
+///
+/// `slot` is the 32-byte big-endian storage slot key.
+///
+/// # Safety
+/// `proof_data` → `proof_len` bytes; `state_root` → 32 bytes; `address` → 20
+/// bytes; `slot` → 32 bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn n42_verify_storage_proof(
+    proof_data: *const u8,
+    proof_len: usize,
+    state_root: *const u8,
+    address: *const u8,
+    slot: *const u8,
+) -> c_int {
+    if proof_data.is_null()
+        || proof_len == 0
+        || state_root.is_null()
+        || address.is_null()
+        || slot.is_null()
+    {
+        return FfiError::InvalidData.into_code();
+    }
+
+    let proof_bytes = unsafe { std::slice::from_raw_parts(proof_data, proof_len) };
+    let proof: ShardedBmtProof = match bincode::deserialize(proof_bytes) {
+        Ok(p) => p,
+        Err(e) => return FfiError::PacketDecode(format!("SBMT proof decode: {e}")).into_code(),
+    };
+
+    let mut root = [0u8; 32];
+    unsafe { std::ptr::copy_nonoverlapping(state_root, root.as_mut_ptr(), 32) };
+    let mut addr = [0u8; 20];
+    unsafe { std::ptr::copy_nonoverlapping(address, addr.as_mut_ptr(), 20) };
+    let mut slot_be = [0u8; 32];
+    unsafe { std::ptr::copy_nonoverlapping(slot, slot_be.as_mut_ptr(), 32) };
+
+    match verify_storage_proof(
+        &proof,
+        B256::from(root),
+        Address::from(addr),
+        U256::from_be_bytes(slot_be),
+    ) {
+        Ok(()) => 0,
+        Err(e) => FfiError::VerifyFailed(format!("SBMT storage proof: {e}")).into_code(),
+    }
+}
+
 /// Gets the BLS12-381 public key (48 bytes) into `out_buf`.
 ///
 /// Returns 0 on success, -1 on error.
@@ -723,6 +816,59 @@ mod tests {
         // Null args -> -1.
         let r = unsafe { n42_verify_state_proof(std::ptr::null(), 0, combined.as_ptr()) };
         assert_eq!(r, -1);
+    }
+
+    #[test]
+    fn test_verify_account_proof_binds_address() {
+        use n42_bmt_core::{
+            EMPTY_HASH, Sbmt, ShardedBmtProof, account_key, shard_index_for_key, shard_tree_path,
+            shard_tree_root,
+        };
+
+        let addr = Address::repeat_byte(0xAB);
+        let key = account_key(&addr.into_array());
+        let si = shard_index_for_key(&key);
+        let mut shard = Sbmt::new();
+        shard.insert(key, b"acct-value");
+        let mut roots = vec![EMPTY_HASH; 16];
+        roots[si] = shard.root_hash();
+        let combined = shard_tree_root(&roots);
+        let proof = ShardedBmtProof {
+            shard_index: si as u8,
+            shard_root: roots[si],
+            shard_path: shard_tree_path(&roots, si),
+            inner: shard.prove(key),
+            value: Some(b"acct-value".to_vec()),
+        };
+        let bytes = bincode::serialize(&proof).unwrap();
+
+        // Bound to the correct address → valid.
+        let r = unsafe {
+            n42_verify_account_proof(
+                bytes.as_ptr(),
+                bytes.len(),
+                combined.as_ptr(),
+                addr.as_ptr(),
+            )
+        };
+        assert_eq!(r, 0, "proof bound to its real address must verify");
+
+        // Same proof, different queried address → rejected (code 2), even though
+        // the unbound n42_verify_state_proof would accept it.
+        let other = Address::repeat_byte(0xCD);
+        let r = unsafe {
+            n42_verify_account_proof(
+                bytes.as_ptr(),
+                bytes.len(),
+                combined.as_ptr(),
+                other.as_ptr(),
+            )
+        };
+        assert_eq!(r, 2, "proof for a different account must be rejected");
+
+        // Sanity: the unbound API still accepts it (documents why binding matters).
+        let r = unsafe { n42_verify_state_proof(bytes.as_ptr(), bytes.len(), combined.as_ptr()) };
+        assert_eq!(r, 0, "unbound verify accepts any internally-consistent proof");
     }
 
     #[test]

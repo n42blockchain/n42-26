@@ -47,6 +47,53 @@ pub fn hash_value(value: &[u8]) -> Hash {
     *blake3::hash(value).as_bytes()
 }
 
+// ---------------------------------------------------------------------------
+// Canonical key derivation + shard assignment.
+//
+// These MUST stay byte-identical to `n42-jmt`'s `keys::account_key` /
+// `keys::storage_key` and its `>> 4` shard split — `n42-jmt` re-uses them so
+// there is a single source of truth. A key-bound proof check (see
+// [`ShardedBmtProof::verify_for_key`]) is only sound if the verifier derives
+// the key exactly the way the builder did.
+// ---------------------------------------------------------------------------
+
+/// Domain separators preventing cross-type key collisions.
+const ACCOUNT_DOMAIN: &[u8] = b"n42:account:";
+const STORAGE_DOMAIN: &[u8] = b"n42:storage:";
+
+/// Canonical SBMT key for an account leaf: `blake3("n42:account:" || address_20)`.
+#[inline]
+pub fn account_key(address: &[u8; 20]) -> Hash {
+    let mut h = blake3::Hasher::new();
+    h.update(ACCOUNT_DOMAIN);
+    h.update(address);
+    *h.finalize().as_bytes()
+}
+
+/// Canonical SBMT key for a storage-slot leaf:
+/// `blake3("n42:storage:" || address_20 || slot_32_be)`.
+#[inline]
+pub fn storage_key(address: &[u8; 20], slot_be: &[u8; 32]) -> Hash {
+    let mut h = blake3::Hasher::new();
+    h.update(STORAGE_DOMAIN);
+    h.update(address);
+    h.update(slot_be);
+    *h.finalize().as_bytes()
+}
+
+/// Shard a key falls into: the top nibble of byte 0, giving `0..SHARD_COUNT`.
+///
+/// Coupled to `SHARD_COUNT == 16` (a 4-bit split). The `debug_assert`
+/// documents that coupling; if `SHARD_COUNT` ever changes this must too.
+#[inline]
+pub fn shard_index_for_key(key: &Hash) -> usize {
+    debug_assert_eq!(
+        SHARD_COUNT, 16,
+        "shard_index_for_key assumes a 4-bit (16-way) split"
+    );
+    (key[0] >> 4) as usize
+}
+
 /// Bit at `depth` of `key`, MSB-first. `false` = left (0), `true` = right (1).
 #[inline]
 fn bit(key: &Hash, depth: usize) -> bool {
@@ -458,6 +505,10 @@ pub fn shard_tree_root_from_path(leaf: Hash, index: usize, path: &[Hash]) -> Has
 pub enum BmtVerifyError {
     #[error("shard index {0} out of range (max 15)")]
     ShardIndexOutOfRange(u8),
+    #[error("proof leaf key does not match the queried key")]
+    KeyMismatch,
+    #[error("shard index {got} does not match queried key's shard {expected}")]
+    WrongShardForKey { expected: u8, got: u8 },
     #[error("combined root mismatch")]
     CombinedRootMismatch,
     #[error("malformed shard path length {len}, expected {expected}")]
@@ -514,6 +565,38 @@ impl ShardedBmtProof {
             return Err(BmtVerifyError::InShardProofFailed);
         }
         Ok(())
+    }
+
+    /// Verify against a known combined root **and bind the proof to a queried
+    /// key**.
+    ///
+    /// This is what an untrusted-server light client must use. [`verify`] only
+    /// checks the proof is internally consistent with `combined_root`; it does
+    /// NOT check that the proof concerns the key the client actually asked
+    /// about. Without that binding a server can answer a query for key A with a
+    /// valid proof for an unrelated key B, or forge a *non-membership* proof
+    /// for A by presenting it against a shard where A is legitimately absent
+    /// (A's real shard is fixed by `shard_index_for_key`). This method rejects
+    /// both: the leaf key must equal `expected_key`, and `shard_index` must be
+    /// `expected_key`'s shard.
+    ///
+    /// [`verify`]: Self::verify
+    pub fn verify_for_key(
+        &self,
+        combined_root: &Hash,
+        expected_key: &Hash,
+    ) -> Result<(), BmtVerifyError> {
+        if self.inner.key != *expected_key {
+            return Err(BmtVerifyError::KeyMismatch);
+        }
+        let expected_shard = shard_index_for_key(expected_key);
+        if self.shard_index as usize != expected_shard {
+            return Err(BmtVerifyError::WrongShardForKey {
+                expected: expected_shard as u8,
+                got: self.shard_index,
+            });
+        }
+        self.verify(combined_root)
     }
 
     /// Estimated serialized size in bytes.

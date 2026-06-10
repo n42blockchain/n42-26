@@ -76,7 +76,7 @@ impl ShardedJmt<MemTreeStore> {
 
         for (key_bytes, value) in &snapshot.entries {
             let key = KeyHash(*key_bytes);
-            let idx = (key.0[0] >> 4) as usize;
+            let idx = n42_bmt_core::shard_index_for_key(&key.0);
             shard_entries[idx].push((key, Some(value.clone())));
         }
 

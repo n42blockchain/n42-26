@@ -19,7 +19,7 @@ pub const SHARD_COUNT: usize = 16;
 /// Assigns a `KeyHash` to a shard by its first nibble (upper 4 bits of first byte).
 #[inline]
 fn shard_index(key: &KeyHash) -> usize {
-    (key.0[0] >> 4) as usize
+    n42_bmt_core::shard_index_for_key(&key.0)
 }
 
 /// Compute the combined root hash from an array of shard roots.

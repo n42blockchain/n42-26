@@ -5,20 +5,52 @@
 //! runs blake3 over the proof. Built on the zero-dependency [`n42_bmt_core`]
 //! crate, so this pulls no reth/mdbx storage stack into the mobile binary / FFI.
 
-use alloy_primitives::B256;
+use alloy_primitives::{Address, B256, U256};
 
-pub use n42_bmt_core::{BmtVerifyError, ShardedBmtProof};
+pub use n42_bmt_core::{BmtVerifyError, ShardedBmtProof, account_key, shard_index_for_key, storage_key};
 
-/// Verify an SBMT account/storage proof against a block's combined state root.
+/// Verify an SBMT account/storage proof against a block's combined state root,
+/// **without** binding it to a queried key.
 ///
 /// The proof carries the shard root + shard-tree path, the in-shard binary proof,
 /// and the raw value; verification recomputes the combined root and checks the
 /// value commitment. Returns `Ok(())` iff the proof is valid for `state_root`.
+///
+/// ⚠️ This only proves the proof is *internally consistent* — it does NOT prove
+/// the proof answers the key you asked about. An untrusted server could return a
+/// valid proof for an unrelated key. Prefer [`verify_account_proof`] /
+/// [`verify_storage_proof`], which bind the proof to the queried account/slot.
 pub fn verify_state_proof(
     proof: &ShardedBmtProof,
     state_root: B256,
 ) -> Result<(), BmtVerifyError> {
     proof.verify(&state_root.0)
+}
+
+/// Verify an SBMT account proof against `state_root`, bound to `address`.
+///
+/// Derives the canonical account key for `address` and rejects the proof unless
+/// its leaf key and shard match — so a server cannot answer a query for one
+/// account with another account's (or a wrong-shard non-membership) proof.
+pub fn verify_account_proof(
+    proof: &ShardedBmtProof,
+    state_root: B256,
+    address: Address,
+) -> Result<(), BmtVerifyError> {
+    let key = account_key(&address.into_array());
+    proof.verify_for_key(&state_root.0, &key)
+}
+
+/// Verify an SBMT storage-slot proof against `state_root`, bound to
+/// `(address, slot)`.
+pub fn verify_storage_proof(
+    proof: &ShardedBmtProof,
+    state_root: B256,
+    address: Address,
+    slot: U256,
+) -> Result<(), BmtVerifyError> {
+    let key = storage_key(&address.into_array(), &slot.to_be_bytes::<32>());
+    proof.verify_for_key(&state_root.0, &key)
 }
 
 #[cfg(test)]
@@ -65,5 +97,38 @@ mod tests {
         let (mut proof, root) = build_single_shard_proof([0x05; 32], b"account-value");
         proof.value = Some(b"forged-value".to_vec());
         assert!(verify_state_proof(&proof, root).is_err());
+    }
+
+    #[test]
+    fn account_proof_binds_to_address() {
+        let addr = Address::repeat_byte(0xAB);
+        let key = account_key(&addr.into_array());
+        let (proof, root) = build_single_shard_proof(key, b"account-value");
+
+        // Bound verify against the right address passes.
+        assert!(verify_account_proof(&proof, root, addr).is_ok());
+
+        // A proof for `addr` must NOT verify as some other account's answer.
+        let other = Address::repeat_byte(0xCD);
+        assert_eq!(
+            verify_account_proof(&proof, root, other),
+            Err(BmtVerifyError::KeyMismatch),
+        );
+    }
+
+    #[test]
+    fn rejects_wrong_shard_for_key() {
+        // Build a valid proof, then lie about the shard index. Unbound verify
+        // would still need the root to match (it won't here), but the bound
+        // check rejects on shard mismatch before that.
+        let addr = Address::repeat_byte(0xAB);
+        let key = account_key(&addr.into_array());
+        let (mut proof, root) = build_single_shard_proof(key, b"account-value");
+        let real_shard = shard_index_for_key(&key) as u8;
+        proof.shard_index = real_shard ^ 0x01; // any other shard
+        assert!(matches!(
+            verify_account_proof(&proof, root, addr),
+            Err(BmtVerifyError::WrongShardForKey { .. }),
+        ));
     }
 }
