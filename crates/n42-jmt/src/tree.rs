@@ -14,9 +14,19 @@ use tracing::debug;
 /// Format: `[balance_32_be][nonce_8_be][code_hash_32]`
 const ACCOUNT_VALUE_LEN: usize = 72;
 
+/// EVM account code hash for empty bytecode: `keccak256([])`.
+///
+/// This matches reth/revm account semantics. Newly created EOAs usually arrive
+/// in `StateDiff` with `code_change = None`, so the tree-side default must be
+/// empty-code hash rather than zero.
+pub const EMPTY_CODE_HASH: B256 = B256::new([
+    0xc5, 0xd2, 0x46, 0x01, 0x86, 0xf7, 0x23, 0x3c, 0x92, 0x7e, 0x7d, 0xb2, 0xdc, 0xc7, 0x03, 0xc0,
+    0xe5, 0x00, 0xb6, 0x53, 0xca, 0x82, 0x27, 0x3b, 0x7b, 0xfa, 0xd8, 0x04, 0x5d, 0x85, 0xa4, 0x70,
+]);
+
 /// Encodes an account leaf value for JMT storage.
 ///
-/// Format: `[balance_32_be][nonce_8_be][code_hash_32_or_zeros]` = 72 bytes fixed.
+/// Format: `[balance_32_be][nonce_8_be][code_hash_32]` = 72 bytes fixed.
 /// Compact, deterministic, no serde overhead.
 pub fn encode_account_value(
     balance: &alloy_primitives::U256,
@@ -137,13 +147,13 @@ impl<S: TreeStore> N42JmtTree<S> {
                     // Resolve code_hash: use new value if changed, otherwise
                     // read existing code_hash from current leaf to preserve it.
                     let code_hash = match &account_diff.code_change {
-                        Some(change) => change.to.unwrap_or(B256::ZERO),
+                        Some(change) => change.to.unwrap_or(EMPTY_CODE_HASH),
                         None => {
                             // Code unchanged — read existing code_hash from tree.
                             self.get(key)?
                                 .as_deref()
                                 .map(decode_code_hash)
-                                .unwrap_or(B256::ZERO)
+                                .unwrap_or(EMPTY_CODE_HASH)
                         }
                     };
 
@@ -334,6 +344,19 @@ mod tests {
         let key = account_key(&addr);
         let value = tree.get(key).unwrap();
         assert!(value.is_some());
+    }
+
+    #[test]
+    fn created_eoa_defaults_to_empty_code_hash() {
+        let mut tree = N42JmtTree::new();
+        let addr = Address::repeat_byte(0xEE);
+        tree.apply_diff(&simple_created_diff(addr, 1000, 1))
+            .unwrap();
+
+        let key = account_key(&addr);
+        let value = tree.get(key).unwrap().unwrap();
+        assert_eq!(decode_code_hash(&value), EMPTY_CODE_HASH);
+        assert_ne!(decode_code_hash(&value), B256::ZERO);
     }
 
     #[test]

@@ -87,8 +87,8 @@ Logs are split into separate files by phase for easy maintenance:
 
 | [devlog-56-consensus-evidence-persistence](docs/devlog-56-consensus-evidence-persistence.md) | Consensus Evidence Persistence, Validator Change Protocol, Prague Upgrade |
 | [devlog-58-jmt-vs-qmdb-gap-p0](docs/devlog-58-jmt-vs-qmdb-gap-p0.md) | JMT vs QMDB/NOMT Gap Analysis + P0: In-Memory Tree + Background Snapshot, Disk 33–48× Slower | Architecture |
-| [devlog-59-jmt-to-bmt-sbmt-phase1](docs/devlog-59-jmt-to-bmt-sbmt-phase1.md) | Decision JMT→Self-built SBMT + Phase-1 In-Memory Core, AlDBaran Eval, 3.4–7.5× Faster than JMT | Architecture |
-| [devlog-60-sbmt-e2e-verification](docs/devlog-60-sbmt-e2e-verification.md) | SBMT RPC Proof E2E Verification: Genesis Seed, Inclusion/Exclusion Proofs, Mobile Verify | Verification |
+| [devlog-59-jmt-to-bmt-sbmt-phase1](docs/devlog-59-jmt-to-bmt-sbmt-phase1.md) | Decision JMT→Self-built SBMT, Persistent SBMT WAL/fsync, Recovery E2E, EOA code_hash alignment | Architecture |
+| [devlog-60-sbmt-e2e-verification](docs/devlog-60-sbmt-e2e-verification.md) | SBMT RPC Proof + Restart Recovery E2E: Genesis Snapshot, Inclusion/Exclusion Proofs, Mobile Verify | Verification |
 
 ---
 

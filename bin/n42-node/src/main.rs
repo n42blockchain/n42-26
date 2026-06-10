@@ -6,11 +6,11 @@ mod keystore;
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-use alloy_primitives::{Address, B256, U256, keccak256};
+use alloy_primitives::{Address, U256, keccak256};
 use clap::Parser;
 use n42_chainspec::{ConsensusConfig, ValidatorInfo};
 use n42_consensus::{ConsensusEngine, EpochManager, ValidatorSet, ValidatorSetResolver};
-use n42_jmt::PersistentSbmt;
+use n42_jmt::{EMPTY_CODE_HASH, PersistentSbmt};
 use n42_network::NetworkService;
 use n42_network::{
     ShardedStarHub, ShardedStarHubConfig, TransportConfig, build_swarm_with_validator_index,
@@ -778,7 +778,7 @@ fn main() {
                                 .as_ref()
                                 .filter(|code| !code.is_empty())
                                 .map(|code| keccak256(code.as_ref()))
-                                .unwrap_or(B256::ZERO);
+                                .unwrap_or(EMPTY_CODE_HASH);
                             let storage = account
                                 .storage_slots()
                                 .map(|(slot, value)| (U256::from_be_bytes(slot.0), value));
@@ -789,6 +789,14 @@ fn main() {
                                 account.nonce.unwrap_or_default(),
                                 code_hash,
                                 storage,
+                            );
+                        }
+
+                        if let Err(e) = tree.flush() {
+                            warn!(
+                                target: "n42::cli",
+                                error = %e,
+                                "failed to persist genesis SBMT snapshot; crash recovery may need to reseed genesis"
                             );
                         }
 

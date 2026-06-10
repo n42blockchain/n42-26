@@ -2,7 +2,7 @@ use crate::hasher::Blake3Hasher;
 use crate::keys::{account_key, storage_key};
 use crate::metrics;
 use crate::store::{MemTreeStore, TreeStore};
-use crate::tree::{N42JmtTree, decode_code_hash, encode_account_value};
+use crate::tree::{EMPTY_CODE_HASH, N42JmtTree, decode_code_hash, encode_account_value};
 
 use alloy_primitives::B256;
 use jmt::{KeyHash, OwnedValue, Version};
@@ -150,11 +150,11 @@ impl<S: TreeStore> ShardedJmt<S> {
                         .unwrap_or_default();
                     let nonce = account_diff.nonce.as_ref().map(|v| v.to).unwrap_or(0);
                     let code_hash = match &account_diff.code_change {
-                        Some(change) => change.to.unwrap_or(B256::ZERO),
+                        Some(change) => change.to.unwrap_or(EMPTY_CODE_HASH),
                         None => existing_code_hashes
                             .get(address)
                             .copied()
-                            .unwrap_or(B256::ZERO),
+                            .unwrap_or(EMPTY_CODE_HASH),
                     };
                     let value = encode_account_value(&balance, nonce, &code_hash);
                     shard_updates[si].push((key, Some(value)));
@@ -420,6 +420,31 @@ mod tests {
         let (version, root) = jmt.apply_diff(&diff).unwrap();
         assert_eq!(version, 1);
         assert_ne!(root, B256::ZERO);
+    }
+
+    #[test]
+    fn sharded_created_eoa_defaults_to_empty_code_hash() {
+        let mut jmt = ShardedJmt::new();
+        let addr = Address::repeat_byte(0xEE);
+        let diff = StateDiff {
+            accounts: BTreeMap::from([(
+                addr,
+                AccountDiff {
+                    change_type: AccountChangeType::Created,
+                    balance: Some(ValueChange::new(U256::ZERO, U256::from(1000))),
+                    nonce: Some(ValueChange::new(0, 1)),
+                    code_change: None,
+                    storage: BTreeMap::new(),
+                },
+            )]),
+        };
+        jmt.apply_diff(&diff).unwrap();
+
+        let key = account_key(&addr);
+        let si = shard_index(&key);
+        let value = jmt.shards()[si].lock().get(key).unwrap().unwrap();
+        assert_eq!(decode_code_hash(&value), EMPTY_CODE_HASH);
+        assert_ne!(decode_code_hash(&value), B256::ZERO);
     }
 
     #[test]

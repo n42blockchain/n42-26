@@ -15,6 +15,11 @@ use serde_json::{Value, json};
 const DEFAULT_RPC_URL: &str = "http://127.0.0.1:18000";
 const GENESIS_ACCOUNT: &str = "0xe3778939cdCa78b70fc36dE06B0E862333D6D8dc";
 const MISSING_ACCOUNT: &str = "0x0000000000000000000000000000000000000042";
+const ACCOUNT_VALUE_LEN: usize = 72;
+const EMPTY_CODE_HASH: B256 = B256::new([
+    0xc5, 0xd2, 0x46, 0x01, 0x86, 0xf7, 0x23, 0x3c, 0x92, 0x7e, 0x7d, 0xb2, 0xdc, 0xc7, 0x03, 0xc0,
+    0xe5, 0x00, 0xb6, 0x53, 0xca, 0x82, 0x27, 0x3b, 0x7b, 0xfa, 0xd8, 0x04, 0x5d, 0x85, 0xa4, 0x70,
+]);
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -55,6 +60,11 @@ fn sbmt_rpc_proof_roundtrip() -> Result<(), Box<dyn Error>> {
         inclusion.value.is_some(),
         "genesis account proof should be inclusion"
     );
+    assert_eq!(
+        inclusion_code_hash(&inclusion)?,
+        EMPTY_CODE_HASH,
+        "genesis EOA leaf must use reth/revm empty-code hash, not zero"
+    );
     verify_rpc_proof("inclusion", &inclusion)?;
 
     let exclusion = jmt_proof(&rpc_url, MISSING_ACCOUNT)?;
@@ -65,6 +75,18 @@ fn sbmt_rpc_proof_roundtrip() -> Result<(), Box<dyn Error>> {
     verify_rpc_proof("exclusion", &exclusion)?;
 
     Ok(())
+}
+
+fn inclusion_code_hash(response: &JmtProofResponse) -> Result<B256, Box<dyn Error>> {
+    let value_hex = response
+        .value
+        .as_deref()
+        .ok_or("inclusion proof response missing value")?;
+    let value = hex::decode(value_hex.trim_start_matches("0x"))?;
+    if value.len() != ACCOUNT_VALUE_LEN {
+        return Err(format!("unexpected account leaf value length: {}", value.len()).into());
+    }
+    Ok(B256::from_slice(&value[40..72]))
 }
 
 fn wait_for_new_jmt_version(

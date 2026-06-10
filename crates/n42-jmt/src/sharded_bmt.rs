@@ -14,7 +14,7 @@
 
 use crate::keys::{account_key, storage_key};
 use crate::snapshot::JmtSnapshot;
-use crate::tree::{decode_code_hash, encode_account_value};
+use crate::tree::{EMPTY_CODE_HASH, decode_code_hash, encode_account_value};
 use n42_bmt_core::{Hash, SHARD_COUNT, Sbmt, ShardedBmtProof, shard_tree_path, shard_tree_root};
 
 use alloy_primitives::{Address, B256, U256};
@@ -106,13 +106,13 @@ impl ShardedSbmt {
         }
     }
 
-    /// Read the existing `code_hash` for an account key (or ZERO if absent).
+    /// Read the existing `code_hash` for an account key (or empty-code hash if absent).
     fn existing_code_hash(&self, account_key_bytes: &Hash) -> B256 {
         self.values[shard_index(account_key_bytes)]
             .lock()
             .get(account_key_bytes)
             .map(|v| decode_code_hash(v))
-            .unwrap_or(B256::ZERO)
+            .unwrap_or(EMPTY_CODE_HASH)
     }
 
     /// Partition a `StateDiff` into per-shard `(key, Option<value>)` updates.
@@ -143,7 +143,7 @@ impl ShardedSbmt {
                         .unwrap_or_default();
                     let nonce = account_diff.nonce.as_ref().map(|v| v.to).unwrap_or(0);
                     let code_hash = match &account_diff.code_change {
-                        Some(change) => change.to.unwrap_or(B256::ZERO),
+                        Some(change) => change.to.unwrap_or(EMPTY_CODE_HASH),
                         None => self.existing_code_hash(&key),
                     };
                     let value = encode_account_value(&balance, nonce, &code_hash);
@@ -304,6 +304,30 @@ mod tests {
         assert_eq!(v, 1);
         assert_ne!(root, B256::ZERO);
         assert_eq!(root, t.root_hash(), "returned root must match recomputed root");
+    }
+
+    #[test]
+    fn created_eoa_defaults_to_empty_code_hash() {
+        let mut t = ShardedSbmt::new();
+        let addr = Address::repeat_byte(0xEE);
+        let diff = StateDiff {
+            accounts: BTreeMap::from([(
+                addr,
+                AccountDiff {
+                    change_type: AccountChangeType::Created,
+                    balance: Some(ValueChange::new(U256::ZERO, U256::from(1000))),
+                    nonce: Some(ValueChange::new(0, 1)),
+                    code_change: None,
+                    storage: BTreeMap::new(),
+                },
+            )]),
+        };
+        t.apply_diff(&diff);
+
+        let key = account_key(&addr).0;
+        let value = t.get(&key).unwrap();
+        assert_eq!(decode_code_hash(&value), EMPTY_CODE_HASH);
+        assert_ne!(decode_code_hash(&value), B256::ZERO);
     }
 
     #[test]

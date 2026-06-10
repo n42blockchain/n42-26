@@ -430,4 +430,42 @@ WAL 记录与快照现对 **OS/电源崩溃** durable,不只是进程崩溃。`P
 ### 验证
 
 - `cargo test -p n42-jmt` **81 passed**,clippy 干净。
-- **E2E 待 mac(codex)**:跑块 → kill → 重启 → 确认恢复;以及拔电/OS 崩溃场景。
+- mac E2E:单节点 `N42_JMT=1` 跑块 → `SIGKILL` validator → 同 data-dir 重启,确认
+  `JMT snapshot loaded version=0 entries=5001` + `replayed SBMT WAL on open replayed=44 version=44`
+  + `SBMT restored from snapshot/WAL`。重启后 `sbmt_rpc_proof_roundtrip` 通过。
+- 注:拔电/OS 崩溃仍需真实故障注入环境;代码路径已对 WAL `sync_data` 与 snapshot temp/rename 做 fsync。
+
+---
+
+## 第十二阶段:mac 恢复 E2E + EOA code_hash 对齐(审计 #9)
+
+mac 恢复 E2E 发现一个持久化边界 bug:genesis seed 只写内存,不进 WAL;如果在第一次周期性
+snapshot 前崩溃,重启时 `PersistentSbmt::open` 从空树 replay WAL,会漏掉 genesis alloc,导致
+genesis 账户 proof 变 exclusion。本阶段补齐 genesis snapshot baseline,并处理 #9 的 EOA
+`code_hash` 语义。
+
+### 改动
+
+- `tree.rs`:新增 `EMPTY_CODE_HASH = keccak256([])` 常量,作为 EOA/no-code account 的 leaf
+  缺省 `code_hash`。
+- `N42JmtTree` / `ShardedJmt` / `ShardedSbmt`:当 `StateDiff.code_change == None` 且没有现有
+  leaf 可读时,缺省写 `EMPTY_CODE_HASH`,不再写 `B256::ZERO`。`code_change.to == None` 也按
+  empty-code hash 处理。
+- `bin/n42-node`:genesis alloc seed 对空 bytecode 写 `EMPTY_CODE_HASH`;seed 完成后立即
+  `tree.flush()` 写 version-0 snapshot,作为后续 WAL replay 的 genesis 基线。
+- `sbmt_rpc_e2e`:增加 genesis EOA leaf 编码断言,要求 proof response 的账户 value 末尾
+  32 字节等于 `keccak256([])`。
+
+### 验证
+
+- `cargo test -p n42-bmt-core -p n42-jmt`:n42-bmt-core 6 passed,n42-jmt 84 passed。
+- `cargo build --release -p n42-node-bin`:通过。
+- `cargo test -p n42-mobile --test sbmt_rpc_e2e`:默认 ignored 测试编译通过。
+- mac recovery E2E:
+  - fresh start 写 `sbmt.snapshot` version 0,5001 entries;
+  - kill 前观察到 `n42_jmtRoot.version=39`;
+  - `SIGKILL` 后不清理 data-dir 重启;
+  - 恢复日志:`JMT snapshot loaded version=0 entries=5001`,`replayed SBMT WAL on open replayed=44 version=44`,
+    `SBMT restored from snapshot/WAL version=44`;
+  - 重启后 `N42_SBMT_RPC_URL=http://127.0.0.1:18000 cargo test -p n42-mobile --test sbmt_rpc_e2e -- --ignored --nocapture`
+    通过,inclusion proof 708B,exclusion proof 692B。
