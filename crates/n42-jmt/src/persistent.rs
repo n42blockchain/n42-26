@@ -267,6 +267,14 @@ impl PersistentSbmt {
         &self.inner
     }
 
+    /// Mutable access to the underlying tree, for **genesis seeding at version 0
+    /// only**. This bypasses the WAL: genesis state is re-derivable from the
+    /// chain spec and is only seeded when no snapshot exists (version 0), so it
+    /// needs no WAL record. Do not use for block application — use `apply_diff`.
+    pub fn inner_mut(&mut self) -> &mut ShardedSbmt {
+        &mut self.inner
+    }
+
     /// The version most recently persisted to a snapshot.
     pub fn last_snapshot_version(&self) -> u64 {
         self.last_snapshot_version

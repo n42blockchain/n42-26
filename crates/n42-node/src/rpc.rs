@@ -11,7 +11,7 @@ use jsonrpsee::core::SubscriptionResult;
 use jsonrpsee::proc_macros::rpc;
 use jsonrpsee::types::ErrorObjectOwned;
 use jsonrpsee::{PendingSubscriptionSink, SubscriptionMessage};
-use n42_jmt::ShardedSbmt;
+use n42_jmt::PersistentSbmt;
 use n42_primitives::{BlsPublicKey, BlsSignature};
 use n42_zkproof::ProofScheduler;
 use serde::{Deserialize, Serialize};
@@ -258,7 +258,7 @@ pub trait N42Api {
 pub struct N42RpcServer {
     consensus_state: Arc<SharedConsensusState>,
     staking_manager: Option<Arc<Mutex<StakingManager>>>,
-    jmt: Option<Arc<Mutex<ShardedSbmt>>>,
+    jmt: Option<Arc<Mutex<PersistentSbmt>>>,
     zk_scheduler: Option<Arc<ProofScheduler>>,
     admin_token: Option<String>,
 }
@@ -279,7 +279,7 @@ impl N42RpcServer {
         self
     }
 
-    pub fn with_jmt(mut self, jmt: Arc<Mutex<ShardedSbmt>>) -> Self {
+    pub fn with_jmt(mut self, jmt: Arc<Mutex<PersistentSbmt>>) -> Self {
         self.jmt = Some(jmt);
         self
     }
@@ -658,7 +658,7 @@ impl N42ApiServer for N42RpcServer {
         // proof's 4 shard-tree siblings (`shard_path`), not the 16 shard roots it
         // held under JMT — it is informational only; verification uses `proof_hex`.
         let root = tree.root_hash();
-        let proof = tree.prove(key_hash);
+        let proof = tree.inner().prove(key_hash);
         let proof_bytes = bincode::serialize(&proof).map_err(|e| {
             ErrorObjectOwned::owned(-32603, format!("SBMT proof encode error: {e}"), None::<()>)
         })?;

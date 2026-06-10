@@ -459,24 +459,30 @@ impl ConsensusOrchestrator {
                         tracing::warn!("sbmt mutex poisoned, recovering");
                         e.into_inner()
                     });
-                    // SBMT apply_diff is infallible and returns (version, root)
-                    // directly. SBMT keeps only the latest state (no version
-                    // history), so there is nothing to prune.
-                    let (version, root) = tree.apply_diff(&diff);
-                    let elapsed_ms = start.elapsed().as_millis();
-                    gauge!("n42_jmt_latest_root").set(version as f64);
-                    histogram!("n42_state_root_apply_diff_ms").record(elapsed_ms as f64);
-                    info!(
-                        target: "n42::jmt",
-                        version,
-                        %root,
-                        accounts = diff.len(),
-                        storage_changes = diff.total_storage_changes(),
-                        elapsed_ms,
-                        "SBMT updated"
-                    );
-                    if let Some(ref state) = state {
-                        state.update_jmt_root(version, root);
+                    // PersistentSbmt::apply_diff applies in-memory, appends the WAL
+                    // (durable per block) and checkpoints a snapshot every interval.
+                    // It returns a Result because the WAL/snapshot IO can fail.
+                    match tree.apply_diff(&diff) {
+                        Ok((version, root)) => {
+                            let elapsed_ms = start.elapsed().as_millis();
+                            gauge!("n42_jmt_latest_root").set(version as f64);
+                            histogram!("n42_state_root_apply_diff_ms").record(elapsed_ms as f64);
+                            info!(
+                                target: "n42::jmt",
+                                version,
+                                %root,
+                                accounts = diff.len(),
+                                storage_changes = diff.total_storage_changes(),
+                                elapsed_ms,
+                                "SBMT updated"
+                            );
+                            if let Some(ref state) = state {
+                                state.update_jmt_root(version, root);
+                            }
+                        }
+                        Err(e) => {
+                            warn!(target: "n42::jmt", error = %e, "SBMT apply_diff/persist failed");
+                        }
                     }
                 });
             } else {

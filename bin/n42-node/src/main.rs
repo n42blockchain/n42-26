@@ -10,7 +10,7 @@ use alloy_primitives::{Address, B256, U256, keccak256};
 use clap::Parser;
 use n42_chainspec::{ConsensusConfig, ValidatorInfo};
 use n42_consensus::{ConsensusEngine, EpochManager, ValidatorSet, ValidatorSetResolver};
-use n42_jmt::ShardedSbmt;
+use n42_jmt::PersistentSbmt;
 use n42_network::NetworkService;
 use n42_network::{
     ShardedStarHub, ShardedStarHubConfig, TransportConfig, build_swarm_with_validator_index,
@@ -624,12 +624,27 @@ fn main() {
         ));
         info!(target: "n42::cli", "StakingManager initialized");
 
-        // JMT state tree: enabled by N42_JMT=1. Maintains a Jellyfish Merkle Tree
-        // updated on each block commit, serving state proofs via RPC.
-        let jmt: Option<Arc<Mutex<ShardedSbmt>>> = if env_bool("N42_JMT") {
-            let jmt = Arc::new(Mutex::new(ShardedSbmt::new()));
-            info!(target: "n42::cli", "SBMT state tree enabled (16 shards)");
-            Some(jmt)
+        // SBMT state tree: enabled by N42_JMT=1. Persisted via snapshot + WAL
+        // under <data_dir>/sbmt.snapshot so it survives restarts; updated on each
+        // block commit and serves state proofs via RPC.
+        let jmt: Option<Arc<Mutex<PersistentSbmt>>> = if env_bool("N42_JMT") {
+            let snapshot_path = data_dir.join("sbmt.snapshot");
+            let interval = env_parse::<u64>("N42_SBMT_SNAPSHOT_INTERVAL").unwrap_or(1000);
+            match PersistentSbmt::open(&snapshot_path, interval) {
+                Ok(tree) => {
+                    info!(
+                        target: "n42::cli",
+                        version = tree.version(),
+                        interval,
+                        "SBMT state tree enabled (16 shards, snapshot+WAL persistent)"
+                    );
+                    Some(Arc::new(Mutex::new(tree)))
+                }
+                Err(e) => {
+                    warn!(target: "n42::cli", error = %e, "failed to open persistent SBMT; disabling state tree");
+                    None
+                }
+            }
         } else {
             None
         };
@@ -748,43 +763,57 @@ fn main() {
                 };
 
                 if let Some(ref jmt) = jmt {
-                    let chain_spec = full_node.provider.chain_spec();
-                    let alloc_len = chain_spec.genesis.alloc.len();
                     let mut tree = jmt.lock().unwrap_or_else(|e| {
                         warn!(target: "n42::cli", "SBMT mutex poisoned during genesis seed, recovering state");
                         e.into_inner()
                     });
 
-                    for (address, account) in &chain_spec.genesis.alloc {
-                        let code_hash = account
-                            .code
-                            .as_ref()
-                            .filter(|code| !code.is_empty())
-                            .map(|code| keccak256(code.as_ref()))
-                            .unwrap_or(B256::ZERO);
-                        let storage = account
-                            .storage_slots()
-                            .map(|(slot, value)| (U256::from_be_bytes(slot.0), value));
+                    if tree.version() == 0 {
+                        // Fresh start (no snapshot/WAL restored it): seed genesis alloc.
+                        let chain_spec = full_node.provider.chain_spec();
+                        let alloc_len = chain_spec.genesis.alloc.len();
+                        for (address, account) in &chain_spec.genesis.alloc {
+                            let code_hash = account
+                                .code
+                                .as_ref()
+                                .filter(|code| !code.is_empty())
+                                .map(|code| keccak256(code.as_ref()))
+                                .unwrap_or(B256::ZERO);
+                            let storage = account
+                                .storage_slots()
+                                .map(|(slot, value)| (U256::from_be_bytes(slot.0), value));
 
-                        tree.seed_genesis_account(
-                            *address,
-                            account.balance,
-                            account.nonce.unwrap_or_default(),
-                            code_hash,
-                            storage,
+                            tree.inner_mut().seed_genesis_account(
+                                *address,
+                                account.balance,
+                                account.nonce.unwrap_or_default(),
+                                code_hash,
+                                storage,
+                            );
+                        }
+
+                        let version = tree.version();
+                        let root = tree.root_hash();
+                        consensus_state.update_jmt_root(version, root);
+                        info!(
+                            target: "n42::cli",
+                            version,
+                            %root,
+                            accounts = alloc_len,
+                            "SBMT seeded from genesis alloc"
+                        );
+                    } else {
+                        // Restored from snapshot + WAL — publish the recovered root.
+                        let version = tree.version();
+                        let root = tree.root_hash();
+                        consensus_state.update_jmt_root(version, root);
+                        info!(
+                            target: "n42::cli",
+                            version,
+                            %root,
+                            "SBMT restored from snapshot/WAL"
                         );
                     }
-
-                    let version = tree.version();
-                    let root = tree.root_hash();
-                    consensus_state.update_jmt_root(version, root);
-                    info!(
-                        target: "n42::cli",
-                        version,
-                        %root,
-                        accounts = alloc_len,
-                        "SBMT seeded from genesis alloc"
-                    );
                 }
 
                 info!(
