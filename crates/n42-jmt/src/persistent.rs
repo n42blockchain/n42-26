@@ -303,7 +303,10 @@ impl PersistentSbmt {
         self.wal.write_all(&version.to_le_bytes())?;
         self.wal.write_all(&(bytes.len() as u32).to_le_bytes())?;
         self.wal.write_all(&bytes)?;
-        self.wal.flush()?;
+        // fsync so the record is durable against OS/power crash, not just a
+        // process crash. SBMT applies run in a background spawn_blocking task
+        // (off the consensus critical path), so the per-block fsync is affordable.
+        self.wal.sync_data()?;
         Ok(())
     }
 

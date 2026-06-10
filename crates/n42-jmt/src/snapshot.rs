@@ -129,10 +129,24 @@ pub fn save_snapshot(path: &Path, snapshot: &JmtSnapshot) -> eyre::Result<()> {
     let raw = bincode::serialize(snapshot)?;
     let compressed = zstd::bulk::compress(&raw, 3)?;
 
-    // Atomic write: write to temp file then rename.
+    // Atomic + durable write: write temp, fsync it, rename, then fsync the dir
+    // so a power/OS crash cannot leave a renamed-but-empty or lost snapshot.
     let tmp_path = path.with_extension("tmp");
-    std::fs::write(&tmp_path, &compressed)?;
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&tmp_path)?;
+        f.write_all(&compressed)?;
+        f.sync_all()?;
+    }
     std::fs::rename(&tmp_path, path)?;
+    // Directory fsync makes the rename itself durable (unix only; Windows has no
+    // directory-fsync and ReplaceFile-style renames are already crash-safe).
+    #[cfg(unix)]
+    if let Some(parent) = path.parent()
+        && let Ok(dir) = std::fs::File::open(parent)
+    {
+        let _ = dir.sync_all();
+    }
 
     let elapsed_ms = start.elapsed().as_millis();
     info!(

@@ -407,3 +407,27 @@ SBMT 真正具备生产持久性。
 审计 #2 ✅ 修复。SBMT 持久化端到端贯通:引擎→分片→proof→`PersistentSbmt`(快照+WAL)→
 **节点集成(重启恢复)**→手机验证(FFI)。剩余审计项:#5 leader drain finalization(共识,需 mac E2E)、
 #7 fsync(可选)、#10 cleanup 去重(重构)。
+
+---
+
+## 第十一阶段:WAL/快照 fsync(审计 #7,Windows 端)
+
+审计 #7:`append_wal` 只 `flush()` 到 OS buffer、`save_snapshot` 只 atomic rename 不 fsync,文档
+"durable per block / no committed block lost on crash" 对 OS/电源崩溃过强。本阶段补 fsync(Windows
+端代码 + 单测;重启崩溃 E2E 由 mac/codex 负责)。
+
+### 改动
+
+- `persistent.rs append_wal`:去掉对 `File` 无效的 `flush()`,改 `self.wal.sync_data()`(fsync 数据)。
+  每块 fsync;SBMT apply 在 spawn_blocking 后台(非共识关键路径),成本可接受。
+- `snapshot.rs save_snapshot`:`std::fs::write` → `File::create + write_all + sync_all`(fsync temp),
+  rename 后 `#[cfg(unix)]` fsync 父目录使 rename 本身 durable(Windows 无 dir-fsync,rename 已 crash-safe)。
+
+### 效果
+
+WAL 记录与快照现对 **OS/电源崩溃** durable,不只是进程崩溃。`PersistentJmt` 的快照也受益(共享 `save_snapshot`)。
+
+### 验证
+
+- `cargo test -p n42-jmt` **81 passed**,clippy 干净。
+- **E2E 待 mac(codex)**:跑块 → kill → 重启 → 确认恢复;以及拔电/OS 崩溃场景。
