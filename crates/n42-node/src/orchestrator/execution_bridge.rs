@@ -1060,7 +1060,7 @@ async fn handle_built_payload(
     }
 
     let execution_data =
-        <EthEngineTypes as PayloadTypes>::block_to_payload(payload.block().clone(), None);
+        <EthEngineTypes as PayloadTypes>::block_to_payload(payload.block().clone());
 
     let ser_start = std::time::Instant::now();
     let payload_json = match serde_json::to_vec(&execution_data) {

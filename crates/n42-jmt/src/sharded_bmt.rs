@@ -17,7 +17,7 @@ use crate::snapshot::JmtSnapshot;
 use crate::tree::{decode_code_hash, encode_account_value};
 use n42_bmt_core::{Hash, SHARD_COUNT, Sbmt, ShardedBmtProof, shard_tree_path, shard_tree_root};
 
-use alloy_primitives::B256;
+use alloy_primitives::{Address, B256, U256};
 use n42_execution::state_diff::{AccountChangeType, StateDiff};
 use parking_lot::Mutex;
 use rayon::prelude::*;
@@ -69,6 +69,41 @@ impl ShardedSbmt {
     /// Read a key's raw value at the current version.
     pub fn get(&self, key: &Hash) -> Option<Vec<u8>> {
         self.values[shard_index(key)].lock().get(key).cloned()
+    }
+
+    fn insert_raw(&self, key: Hash, value: Vec<u8>) {
+        let si = shard_index(&key);
+        self.shards[si].lock().insert(key, &value);
+        self.values[si].lock().insert(key, value);
+    }
+
+    /// Seed a genesis account without advancing the block-version counter.
+    ///
+    /// `apply_diff` increments `version` once per committed block. Genesis state
+    /// is the starting point for proofs, so it is inserted directly at version 0.
+    pub fn seed_genesis_account<I>(
+        &mut self,
+        address: Address,
+        balance: U256,
+        nonce: u64,
+        code_hash: B256,
+        storage: I,
+    ) where
+        I: IntoIterator<Item = (U256, U256)>,
+    {
+        let account_key = account_key(&address).0;
+        self.insert_raw(
+            account_key,
+            encode_account_value(&balance, nonce, &code_hash),
+        );
+
+        for (slot, value) in storage {
+            if value.is_zero() {
+                continue;
+            }
+            let key = storage_key(&address, &slot).0;
+            self.insert_raw(key, value.to_be_bytes::<32>().to_vec());
+        }
     }
 
     /// Read the existing `code_hash` for an account key (or ZERO if absent).

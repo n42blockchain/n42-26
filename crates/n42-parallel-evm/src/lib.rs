@@ -17,7 +17,7 @@ use revm::context::{BlockEnv, CfgEnv, Context, TxEnv};
 use revm::context_interface::result::ResultAndState;
 use revm::database_interface::DatabaseRef;
 use revm::handler::MainBuilder;
-use revm::state::{Account, EvmStorageSlot, TransactionId};
+use revm::state::{Account, EvmStorageSlot};
 use scheduler::{Scheduler, Task};
 use std::collections::HashMap;
 use std::fmt;
@@ -67,9 +67,9 @@ where
             state_changes: HashMap::new(),
         });
     }
-    // Reject impossibly large blocks up front so the hot loop can construct
-    // TransactionId without falling back to a panic. NonMaxU32 forbids u32::MAX
-    // itself, so the largest legal tx_idx is u32::MAX - 1.
+    // Keep the historical guard from the revm 40 path. The n42 reth fork uses
+    // revm 38 where transaction ids are usize, but this remains a conservative
+    // sanity limit for local block execution.
     if num_txs >= u32::MAX as usize {
         return Err(ParallelEvmError::BlockTooLarge { tx_count: num_txs });
     }
@@ -329,11 +329,7 @@ fn merge_tx_state(
     account_writes: Vec<(Address, AccountWrite)>,
     storage_writes: Vec<(Address, U256, U256)>,
 ) {
-    // revm 40 tracks the originating transaction via a TransactionId (NonMaxU32).
-    // The parallel_execute entry rejects blocks with >= u32::MAX txs, so tx_idx
-    // is always a valid NonMaxU32 here.
-    let tx_id = TransactionId::new(tx_idx)
-        .expect("tx_idx < u32::MAX guaranteed by parallel_execute entry check");
+    let tx_id = tx_idx;
     for (addr, write) in account_writes {
         let account = state_changes
             .entry(addr)

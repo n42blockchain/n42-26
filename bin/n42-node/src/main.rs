@@ -6,7 +6,7 @@ mod keystore;
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-use alloy_primitives::Address;
+use alloy_primitives::{Address, B256, U256, keccak256};
 use clap::Parser;
 use n42_chainspec::{ConsensusConfig, ValidatorInfo};
 use n42_consensus::{ConsensusEngine, EpochManager, ValidatorSet, ValidatorSetResolver};
@@ -746,6 +746,46 @@ fn main() {
                         genesis_hash
                     }
                 };
+
+                if let Some(ref jmt) = jmt {
+                    let chain_spec = full_node.provider.chain_spec();
+                    let alloc_len = chain_spec.genesis.alloc.len();
+                    let mut tree = jmt.lock().unwrap_or_else(|e| {
+                        warn!(target: "n42::cli", "SBMT mutex poisoned during genesis seed, recovering state");
+                        e.into_inner()
+                    });
+
+                    for (address, account) in &chain_spec.genesis.alloc {
+                        let code_hash = account
+                            .code
+                            .as_ref()
+                            .filter(|code| !code.is_empty())
+                            .map(|code| keccak256(code.as_ref()))
+                            .unwrap_or(B256::ZERO);
+                        let storage = account
+                            .storage_slots()
+                            .map(|(slot, value)| (U256::from_be_bytes(slot.0), value));
+
+                        tree.seed_genesis_account(
+                            *address,
+                            account.balance,
+                            account.nonce.unwrap_or_default(),
+                            code_hash,
+                            storage,
+                        );
+                    }
+
+                    let version = tree.version();
+                    let root = tree.root_hash();
+                    consensus_state.update_jmt_root(version, root);
+                    info!(
+                        target: "n42::cli",
+                        version,
+                        %root,
+                        accounts = alloc_len,
+                        "SBMT seeded from genesis alloc"
+                    );
+                }
 
                 info!(
                     target: "n42::cli",

@@ -419,6 +419,21 @@ impl ConsensusOrchestrator {
         self.store_committed_block(view, block_hash, commit_qc.clone(), validator_changes);
         self.head_block_hash = block_hash;
 
+        // Leader eager-imported blocks can finalize via Case A before the select
+        // loop processes `leader_payload_rx`. Drain it here so the SBMT/JMT
+        // updater can see the local block data even when reth already has the
+        // block in its engine tree.
+        while let Ok((hash, data)) = self.leader_payload_rx.try_recv() {
+            if !self.pending_block_data.contains_key(&hash) {
+                if self.pending_block_data.len() >= super::execution_bridge::MAX_PENDING_BLOCK_DATA
+                    && let Some(old_key) = self.pending_block_data.keys().next().copied()
+                {
+                    self.pending_block_data.remove(&old_key);
+                }
+                self.pending_block_data.insert(hash, data);
+            }
+        }
+
         // JMT background update: extract BundleState from pending block data.
         if let Some(ref jmt) = self.jmt {
             let diff = self
