@@ -26,7 +26,7 @@ GIT_COMMITTER_NAME="Nyxen" GIT_COMMITTER_EMAIL="40690755+MiraWells@users.noreply
 | reth 分支 | base | 对应依赖 pin |
 |-----------|------|-------------|
 | `n42-v2-upgrade`（旧） | reth v2.2.0 | revm 38 / alloy-evm 0.34 / reth-primitives-traits 0.3.1 |
-| **reth main 合并版（当前主线）** | upstream main | **revm 40.0.3 / alloy-evm 0.35.0 / reth-primitives-traits 0.4.0** |
+| **reth main 合并版（当前主线）** | upstream main | **revm 40.0.3 / alloy-evm 0.36.0 / reth-primitives-traits 0.4.0** |
 
 **当前 n42-26 主线（含 `chore/merge-reth-main-deps-upgrade`）用 reth main 合并版。** 动手前先
 `git -C ../reth log -1 --oneline` 确认 reth 在 main 合并版；**切勿为了让旧 reth 编过而降级
