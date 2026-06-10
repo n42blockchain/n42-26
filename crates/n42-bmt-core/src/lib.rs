@@ -281,20 +281,45 @@ fn collect_node_stats(link: &Link, s: &mut NodeStats) {
     }
 }
 
-/// A Sparse Binary Merkle Tree (path-compressed, blake3, 256-bit keys).
+/// A Sparse Binary Merkle Tree (blake3, 256-bit keys).
+///
+/// `base_depth` is the bit index the tree starts branching at: keys are assumed
+/// to share their first `base_depth` bits (so those bits carry no information
+/// inside this tree) and the structure skips them. The sharded layer sets
+/// `base_depth = log2(SHARD_COUNT)` because every key in a shard shares the
+/// top-nibble shard selector — this prunes the otherwise-forced single-child
+/// chain for the shard prefix. The leaf still commits the FULL key
+/// (`blake3(0x00 || key || value_hash)`), so the skip changes the commitment
+/// (root) but not its soundness.
 #[derive(Default)]
 pub struct Sbmt {
     root: Link,
     len: usize,
+    base_depth: usize,
 }
 
 impl Sbmt {
-    /// Create an empty tree.
+    /// Create an empty tree branching from bit 0.
     pub fn new() -> Self {
         Self {
             root: None,
             len: 0,
+            base_depth: 0,
         }
+    }
+
+    /// Create an empty tree that skips the first `base_depth` (shared-prefix) bits.
+    pub fn with_base_depth(base_depth: usize) -> Self {
+        Self {
+            root: None,
+            len: 0,
+            base_depth,
+        }
+    }
+
+    /// The bit index this tree starts branching at.
+    pub fn base_depth(&self) -> usize {
+        self.base_depth
     }
 
     /// Number of live leaves.
@@ -322,7 +347,7 @@ impl Sbmt {
 
     /// Insert or update a key with a pre-hashed value.
     pub fn insert_hashed(&mut self, key: Hash, value_hash: Hash) {
-        if insert(&mut self.root, key, value_hash, 0) {
+        if insert(&mut self.root, key, value_hash, self.base_depth) {
             self.len += 1;
         }
     }
@@ -334,7 +359,7 @@ impl Sbmt {
 
     /// Remove a key. Returns true if it existed.
     pub fn remove(&mut self, key: &Hash) -> bool {
-        if remove(&mut self.root, key, 0) {
+        if remove(&mut self.root, key, self.base_depth) {
             self.len -= 1;
             true
         } else {
@@ -357,7 +382,7 @@ impl Sbmt {
     /// Look up a key's value hash.
     pub fn get(&self, key: &Hash) -> Option<Hash> {
         let mut link = &self.root;
-        let mut depth = 0;
+        let mut depth = self.base_depth;
         loop {
             match link {
                 None => return None,
@@ -379,7 +404,7 @@ impl Sbmt {
     pub fn prove(&self, key: Hash) -> BmtProof {
         let mut siblings = Vec::new();
         let mut link = &self.root;
-        let mut depth = 0;
+        let mut depth = self.base_depth;
         loop {
             match link {
                 None => {
@@ -459,7 +484,13 @@ impl BmtProof {
     }
 
     /// Verify the proof against a shard `root`, given the expected value hash.
-    pub fn verify(&self, root: &Hash, expected_value_hash: Option<Hash>) -> bool {
+    ///
+    /// `base_depth` is the bit index the tree branches from (0 for a standalone
+    /// [`Sbmt`]; `log2(SHARD_COUNT)` for an in-shard tree, where the shard
+    /// selector prefix is skipped). The sibling at index `i` authenticates bit
+    /// `base_depth + i`, and an exclusion proof's occupying leaf must share the
+    /// full in-tree path prefix `[base_depth, base_depth + siblings.len())`.
+    pub fn verify(&self, root: &Hash, expected_value_hash: Option<Hash>, base_depth: usize) -> bool {
         if self.value_hash != expected_value_hash {
             return false;
         }
@@ -474,15 +505,16 @@ impl BmtProof {
                 if ok == self.key {
                     return false;
                 }
-                if !shares_prefix(&self.key, &ok, self.siblings.len()) {
+                if !shares_prefix_range(&self.key, &ok, base_depth, self.siblings.len()) {
                     return false;
                 }
                 hash_leaf(&ok, &ovh)
             }
             (Some(_), Some(_)) => return false,
         };
-        for depth in (0..self.siblings.len()).rev() {
-            let sib = self.siblings[depth];
+        for i in (0..self.siblings.len()).rev() {
+            let sib = self.siblings[i];
+            let depth = base_depth + i;
             cur = if bit(&self.key, depth) {
                 hash_internal(&sib, &cur)
             } else {
@@ -493,9 +525,10 @@ impl BmtProof {
     }
 }
 
+/// Whether `a` and `b` agree on bits `[base, base + len)`.
 #[inline]
-fn shares_prefix(a: &Hash, b: &Hash, depth: usize) -> bool {
-    (0..depth).all(|d| bit(a, d) == bit(b, d))
+fn shares_prefix_range(a: &Hash, b: &Hash, base: usize, len: usize) -> bool {
+    (base..base + len).all(|d| bit(a, d) == bit(b, d))
 }
 
 // ---------------------------------------------------------------------------
@@ -608,7 +641,10 @@ impl ShardedBmtProof {
         if self.inner.value_hash != expected_vh {
             return Err(BmtVerifyError::ValueHashMismatch);
         }
-        if !self.inner.verify(&self.shard_root, expected_vh) {
+        // In-shard trees skip the shard-selector prefix (top `log2(SHARD_COUNT)`
+        // bits), so the in-shard proof branches from that base depth.
+        let base_depth = SHARD_COUNT.trailing_zeros() as usize;
+        if !self.inner.verify(&self.shard_root, expected_vh, base_depth) {
             return Err(BmtVerifyError::InShardProofFailed);
         }
         Ok(())
@@ -723,8 +759,8 @@ mod tests {
         let root = t.root_hash();
         let key = key_from(42);
         let vh = hash_value(&42u64.to_le_bytes());
-        assert!(t.prove(key).verify(&root, Some(vh)));
-        assert!(t.prove(key_from(99999)).verify(&root, None));
+        assert!(t.prove(key).verify(&root, Some(vh), 0));
+        assert!(t.prove(key_from(99999)).verify(&root, None, 0));
     }
 
     #[test]
@@ -738,7 +774,7 @@ mod tests {
         let key = key_from(7);
         let vh = hash_value(&7u64.to_le_bytes());
         let incl = t.prove(key);
-        assert!(incl.verify(&root, Some(vh)), "real inclusion must verify");
+        assert!(incl.verify(&root, Some(vh), 0), "real inclusion must verify");
 
         let forged = BmtProof {
             key,
@@ -747,9 +783,41 @@ mod tests {
             other_leaf: Some((key, vh)),
         };
         assert!(
-            !forged.verify(&root, None),
+            !forged.verify(&root, None, 0),
             "exclusion proof reusing the key's own leaf must be rejected"
         );
+    }
+
+    #[test]
+    fn base_depth_prefix_skip_inclusion_and_exclusion() {
+        // All keys share the top nibble (shard 0xA); a base_depth=4 tree skips it.
+        let base = 4usize;
+        let mut t = Sbmt::with_base_depth(base);
+        let mk = |i: u64| {
+            let mut k = key_from(i);
+            k[0] = 0xA0 | (k[0] & 0x0F); // force top nibble = 0xA
+            k
+        };
+        for i in 0..200u64 {
+            t.insert(mk(i), &i.to_le_bytes());
+        }
+        let root = t.root_hash();
+
+        // Inclusion verifies with the correct base_depth, and FAILS with a wrong one.
+        let key = mk(123);
+        let vh = hash_value(&123u64.to_le_bytes());
+        let incl = t.prove(key);
+        assert!(incl.verify(&root, Some(vh), base), "inclusion @base_depth must verify");
+        assert!(
+            !incl.verify(&root, Some(vh), 0),
+            "verifying with the wrong base_depth must fail"
+        );
+
+        // Exclusion of an absent (but same-shard-prefix) key verifies.
+        let absent = mk(999999);
+        let excl = t.prove(absent);
+        assert!(excl.value_hash.is_none());
+        assert!(excl.verify(&root, None, base), "exclusion @base_depth must verify");
     }
 
     #[test]

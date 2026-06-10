@@ -45,9 +45,16 @@ impl Default for ShardedSbmt {
 
 impl ShardedSbmt {
     /// Create an empty 16-shard SBMT.
+    ///
+    /// Every key in shard `s` shares the top-nibble selector (`key[0] >> 4 == s`),
+    /// so the in-shard trees branch from `base_depth = log2(SHARD_COUNT)`, skipping
+    /// the otherwise-forced single-child chain for that shared prefix.
     pub fn new() -> Self {
+        let base_depth = SHARD_COUNT.trailing_zeros() as usize;
         Self {
-            shards: (0..SHARD_COUNT).map(|_| Mutex::new(Sbmt::new())).collect(),
+            shards: (0..SHARD_COUNT)
+                .map(|_| Mutex::new(Sbmt::with_base_depth(base_depth)))
+                .collect(),
             values: (0..SHARD_COUNT)
                 .map(|_| Mutex::new(HashMap::new()))
                 .collect(),

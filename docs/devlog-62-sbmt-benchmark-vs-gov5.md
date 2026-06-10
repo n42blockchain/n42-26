@@ -84,7 +84,41 @@ proof 713.9B / depth 22.31 / gen 66.82 us / verify 2.56 us、archival 350.9M nod
 
 ## 后续计划
 
-- 等用户决策路径压缩。若做：先在 n42-bmt-core 落地压缩节点 + proof 编码，单测对拍
-  root 与 proof，再 codex 验 mobile/FFI；否则保留当前结构（proof 略大但实现简单、
-  生成极快）。
 - QMDB 真实数：gov5 的 `cmd/n42-qmdb-bench` 无 committed 结果，需现跑 Go（mac/codex）。
+
+---
+
+## Phase 2：shard-prefix 路径压缩（已实施）
+
+用户决策做路径压缩。采用**安全的 shard-prefix 压缩**（非全 PATRICIA）：
+
+**设计**：给 `Sbmt` 加 `base_depth`，in-shard 树从 `base_depth = log2(SHARD_COUNT) = 4`
+开始分支，跳过所有 key 共享的 shard 选择 nibble（bits 0-3）。leaf 仍 commit 完整 key
+（`blake3(0x00 || full_key || vh)`），所以**改 root（共识级）但 soundness 不变**——
+每层仍单 bit、无新的 exclusion 复杂度，纯深度偏移。
+
+**实施**：
+- `n42-bmt-core`：`Sbmt::with_base_depth` + insert/get/prove/remove 从 base_depth 起；
+  `BmtProof::verify(root, vh, base_depth)`（sibling i 验 bit `base_depth+i`，exclusion
+  的 `shares_prefix_range` 校验 `[base_depth, base_depth+len)`）；`ShardedBmtProof::verify`
+  对 inner 传 `base_depth=4`。
+- `n42-jmt`：`ShardedSbmt::new`/`from_snapshot` 用 `Sbmt::with_base_depth(4)` 建 16 shard。
+- 新增对抗测试 `base_depth_prefix_skip_inclusion_and_exclusion`（含"错 base_depth 必须
+  验证失败"）。
+
+**实测收益（measure 确认）**：
+
+| 指标 | @1M 压缩前 | @1M 压缩后 | @5M 压缩前 | @5M 压缩后 |
+|------|-----------|-----------|-----------|-----------|
+| proof depth | 25.27 | **21.28** | 27.62 | **23.57** |
+| proof size avg | 988 B | **860 B** | 1063 B | **933 B** |
+| verify | 3.48 us | 2.93 us | 3.79 us | 3.25 us |
+
+depth -4 层、proof -128~130B（-13%）、verify 更快；10000 个采样 proof 全部 `verify_for_key`
+通过；91+ 单测全绿。活节点数不变（1.44·N 是全 PATRICIA 的活，shard-prefix 只省常数）。
+
+**未做**：全 intra-tree PATRICIA（internal 1.44→1.0、再省 ~1 层 + 内存）——需提交 skip
+长度到节点 hash + 重写 exclusion 验证 + 单独安全审计，风险高，作为后续可选项。
+
+**待 codex**：consensus-breaking（root 变），需 fresh-genesis E2E + 对抗性复核（真实 RPC
+proof roundtrip、bound verify 正确/错误 address、错 base_depth 拒绝）。
