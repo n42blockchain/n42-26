@@ -264,6 +264,38 @@ blake3 并行收益。**撤回**，prepare 保持单遍串行。
 
 这些是后续（增分片=共识级；SIMD 批量 hash=中等改动）的方向，非本轮范围。
 
+### 单核 6× 差距的深度拆解（数据驱动）
+
+37× 总差距 = ~6× 核数（96 vs 16，硬件）× ~6× 单核。单核（每核 upd/s）：AlDBaran
+0.50M、我们 0.061M(@5M) / 0.12M(L3 命中)。6× 单核三块，均已用 no-op / 控树大小法实测定位：
+
+1. **缓存局部性 ~2×**（实测：5M 树 830MB 狠 miss L3 = 0.98M upd/s vs 100k 树 16MB 命中
+   L3 = 1.91M）。深因：随机 key 深度遍历大 arena 按索引乱跳，**外加独立 values
+   HashMap(760MB) 再 miss 一次**（双结构双 miss）。
+2. **blake3 ~1.3×**（no-op 法实测 blake3 占 24%：account_key 派生 17% + 节点 hash 7%）。
+3. **结构性 ~3×**（命中缓存后仍 4.2× 落后）：twig append vs 我们"改树+改HashMap"双写、
+   twig buffering、手调紧循环；部分口径无法精确归因。
+
+### 已实测否决的 root-invariant 吞吐杠杆（measure-first）
+
+| 尝试 | 结果 | 原因 |
+|------|------|------|
+| 并行 prepare（rayon） | **更慢**（674k→466k @block200） | 中间 Vec + 派发开销 > blake3 并行收益 |
+| SIMD 仅树节点 | 上限 ~7% | 节点 hash 只占 7% |
+| SoA 拆分 | ~11% RSS，ROI 差 | tagged-ref 复杂度穿透共识核心；values map 没动 |
+| **DFS arena 重排** | **略慢**（1.10M→1.04M @5M，root 字节恒等） | 随机 key 路径左右乱跳，DFS 只利左子；values map miss 没动 |
+
+### 结论：root-invariant 微优化已到边际，大头需 twig
+
+- 缓存 ~2× 不是简单 DFS 重排能拿的（随机访问需 vEB 复杂布局，且 values map 是并列 miss
+  源）；blake3 SIMD 卡 batch API（~15-20% 但脆弱）；结构 ~3× 本质是 twig。
+- **三个大头（缓存 + 结构）都指向 twig 连续子树块结构**。C2 一个 session 内拿到 3.3×
+  （2.26→7.12M）是**在已有 twig 结构上**做 thread-sharding/紧循环/SIMD——我们没有那个
+  结构，复制不了。
+- 9950X 理论天花板 ~8M/s（AlDBaran 单核 0.5M × 16）。要到那量级，最终路径是 twig 模型
+  （consensus-breaking 大重构 + 单独审计），非微优化。当前 root-invariant 已落地的
+  arena(-15% RSS) + 无锁分片是性价比最高的部分。
+
 ### 同硬件 apples-to-apples（9950X 16C/32T）：QMDB 仍快 ~1.7×
 
 跑 bench 的机器恰是 Ryzen 9 9950X（16C/32T）——与另一会话（C2）测 QMDB 的同款 CPU。
