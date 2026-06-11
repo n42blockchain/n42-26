@@ -134,7 +134,25 @@ Rust root **字节等于 gov5 Go QMDB root** `b32e9a4b…689912`（临时 Go 程
 
 测试：7 个全过（空树/单插/读回/多 twig proof/更新删除/确定性/**Go 对拍**），clippy -D warnings 干净。
 
-后续接 §7 的 P2（compaction + 确定性不变量）→ P3（16 分片 + #11 绑定）→ …
+## 8c. P2 完成状态（已落地）
+
+`TwigTree` 加上 append 模型的共识确定性 + compaction：
+- **`apply_batch(ops)`**：块内按 **keyHash 排序**应用（确定性不变量 #1）——append-slot root
+  依赖顺序，所有节点对同一块按 canonical 顺序应用 → 同 root，与输入顺序无关。
+- **`compact(threshold)`**：确定性 compaction——稀疏 twig（live ratio < threshold，排除 active
+  twig）的 live entry 按 keyHash 排序重 append 到新 slot，清空原 twig，回收其 value 堆。
+  **改 root**（重 slot），需所有节点同块边界同阈值（不变量 #2）。
+- 空 twig 快速路径：`live==0` 的 twig 直接取 `null_twig_root`（免 2047 次 null hash 折叠）。
+
+**跨语言一致性（P2）**：`apply_batch`(0..5000) 的 Rust root **字节等于** gov5 Go QMDB 同
+keyHash-排序 Set 的 root `58671c9a…6526fa` —— canonical 排序不变量对蓝本忠实。
+（compaction 是 fresh-genesis 下我们自定义的，不需与 gov5 字节一致，只需我们节点间确定性 +
+正确性，已由测试覆盖。）
+
+测试：11 个全过（P1 7 + apply_batch 顺序无关 / compaction 正确性+确定性 / compaction 改 root /
+**sorted-batch Go 对拍**），clippy -D warnings 干净。
+
+后续接 §7 的 P3（16 分片 + #11 key 绑定 proof）→ P4 SIMD → …
 
 ## 9. 风险
 

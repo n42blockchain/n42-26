@@ -82,6 +82,14 @@ impl Twig {
         }
         self.dirty = false;
     }
+
+    /// Fast path for an all-null (live == 0) twig: set the root directly to the
+    /// precomputed `null_twig_root` instead of folding 2047 null hashes. Same
+    /// result as `recompute()` on all-null leaves.
+    fn mark_empty(&mut self, null_twig_root: Hash) {
+        self.nodes[1] = null_twig_root;
+        self.dirty = false;
+    }
 }
 
 struct Entry {
@@ -92,23 +100,47 @@ struct Entry {
     active: bool,
 }
 
+/// All-null twig commitment: `null_level[TWIG_HEIGHT]` = fold of NULL_HASH up 11
+/// levels. An emptied twig commits to this (matches gov5's `nullTwigRoot`).
+fn null_twig_root() -> Hash {
+    let mut h = NULL_HASH;
+    for _ in 0..TWIG_HEIGHT {
+        h = hash_node(&h, &h);
+    }
+    h
+}
+
 /// Single-shard append-only twig tree. `set` assigns a monotonically increasing
 /// slot; updating a key deactivates its old slot (nulls that leaf) and appends a
 /// new entry. The world root is therefore a function of the append history.
-#[derive(Default)]
 pub struct TwigTree {
     entries: Vec<Entry>, // indexed by slot
     twigs: Vec<Twig>,
     index: HashMap<Hash, u64>, // key -> active slot
     next_slot: u64,
+    null_twig_root: Hash,
     // Upper merkle over twig roots, rebuilt by `root()`; cached for `prove()`.
     upper: Vec<Hash>,
     up_cap: usize,
 }
 
+impl Default for TwigTree {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TwigTree {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            entries: Vec::new(),
+            twigs: Vec::new(),
+            index: HashMap::new(),
+            next_slot: 0,
+            null_twig_root: null_twig_root(),
+            upper: Vec::new(),
+            up_cap: 0,
+        }
     }
 
     /// Number of live (active) keys.
@@ -177,6 +209,69 @@ impl TwigTree {
             .map(|&slot| self.entries[slot as usize].value.as_slice())
     }
 
+    /// Apply a block's `(key, Option<value>)` ops in **canonical (keyHash-sorted)
+    /// order** — the consensus-determinism invariant: the append-slot root depends
+    /// on order, so every node MUST apply the same block in the same order. Sorting
+    /// by key makes the root independent of the input order. Keys within a block
+    /// are expected unique (the `StateDiff`/sharded layer guarantees this).
+    pub fn apply_batch(&mut self, ops: &[(Hash, Option<Vec<u8>>)]) {
+        let mut order: Vec<usize> = (0..ops.len()).collect();
+        order.sort_by_key(|&i| ops[i].0);
+        for i in order {
+            match &ops[i].1 {
+                Some(v) => self.set(ops[i].0, v),
+                None => {
+                    self.delete(&ops[i].0);
+                }
+            }
+        }
+    }
+
+    /// Deterministic compaction: re-append the live entries of every sparse twig
+    /// (live ratio < `threshold`, excluding the active twig) at fresh slots in
+    /// keyHash-sorted order, emptying those twigs. Returns the number of entries
+    /// moved. **Changes the world root** (entries move to new slots) — must run at
+    /// the same block boundary with the same threshold on every node (determinism
+    /// invariant #2). Reclaims the value heap of the emptied slots.
+    pub fn compact(&mut self, threshold: f64) -> usize {
+        let active = (self.next_slot / TWIG_SIZE as u64) as usize;
+        let mut sparse: Vec<usize> = Vec::new();
+        for (id, t) in self.twigs.iter().enumerate() {
+            if id == active || t.live == 0 {
+                continue;
+            }
+            if (t.live as f64) / (TWIG_SIZE as f64) < threshold {
+                sparse.push(id);
+            }
+        }
+        // Collect live entries (deterministic keyHash order).
+        let mut live: Vec<(Hash, Vec<u8>)> = Vec::new();
+        for &id in &sparse {
+            let base = id as u64 * TWIG_SIZE as u64;
+            for local in 0..TWIG_SIZE as u64 {
+                let e = &self.entries[(base + local) as usize];
+                if e.active {
+                    live.push((e.key, e.value.clone()));
+                }
+            }
+        }
+        live.sort_by_key(|p| p.0);
+        let moved = live.len();
+        // Re-append (deactivates old slots, appends to the active twig forward).
+        for (k, v) in live {
+            self.set(k, &v);
+        }
+        // Reclaim the value heap of the now fully-dead sparse twig slots.
+        for &id in &sparse {
+            let base = id as u64 * TWIG_SIZE as u64;
+            for local in 0..TWIG_SIZE as u64 {
+                let slot = (base + local) as usize;
+                self.entries[slot].value = Vec::new();
+            }
+        }
+        moved
+    }
+
     /// Recompute dirty twig roots + rebuild the upper tree, returning the world
     /// root. Must be called before `prove()` (it refreshes the cached upper tree).
     pub fn root(&mut self) -> Hash {
@@ -187,7 +282,11 @@ impl TwigTree {
         }
         for t in &mut self.twigs {
             if t.dirty {
-                t.recompute();
+                if t.live == 0 {
+                    t.mark_empty(self.null_twig_root);
+                } else {
+                    t.recompute();
+                }
             }
         }
         let n = self.twigs.len();
@@ -386,6 +485,99 @@ mod tests {
             *b = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).unwrap();
         }
         h
+    }
+
+    /// Cross-language: `apply_batch` (keyHash-sorted) of 0..5000 must match the
+    /// root gov5's Go QMDB produces when Set in the same keyHash-sorted order —
+    /// validates the canonical-ordering determinism invariant is byte-faithful.
+    #[test]
+    fn cross_check_sorted_batch_vs_gov5_go() {
+        let ops: Vec<(Hash, Option<Vec<u8>>)> =
+            (0..5000u64).map(|i| (key(i), Some(val(i)))).collect();
+        let mut t = TwigTree::new();
+        t.apply_batch(&ops);
+        let expected =
+            hex_to_hash("58671c9adadd83040c3966abdbb8fd06d7d7ea8def0c7f1d317799ea486526fa");
+        assert_eq!(t.root(), expected, "apply_batch root must match gov5 sorted-insert root");
+    }
+
+    #[test]
+    fn apply_batch_is_input_order_independent() {
+        // Same op set, different INPUT order -> same root (canonical sort inside).
+        let ops_fwd: Vec<(Hash, Option<Vec<u8>>)> =
+            (0..1500u64).map(|i| (key(i), Some(val(i)))).collect();
+        let ops_rev: Vec<(Hash, Option<Vec<u8>>)> = ops_fwd.iter().rev().cloned().collect();
+
+        let mut a = TwigTree::new();
+        a.apply_batch(&ops_fwd);
+        let ra = a.root();
+
+        let mut b = TwigTree::new();
+        b.apply_batch(&ops_rev);
+        let rb = b.root();
+
+        assert_eq!(ra, rb, "apply_batch root must not depend on input order");
+        // sanity: a proof verifies
+        let p = a.prove(&key(700)).unwrap();
+        assert!(p.verify(&ra));
+    }
+
+    #[test]
+    fn compaction_correctness_and_determinism() {
+        let build = || {
+            let mut t = TwigTree::new();
+            for i in 0..5000u64 {
+                t.set(key(i), &val(i));
+            }
+            // Make twig 0 (slots 0..2047) and twig 1 (2048..4095) sparse.
+            for i in 0..1900u64 {
+                t.delete(&key(i));
+            }
+            for i in 2048..3900u64 {
+                t.delete(&key(i));
+            }
+            t
+        };
+
+        let mut t = build();
+        let live_before: usize = t.len();
+        let _ = t.root();
+
+        let moved = t.compact(0.5);
+        let root_after = t.root();
+        assert!(moved > 0, "should have moved live entries out of sparse twigs");
+
+        // Live set unchanged; all live keys still readable + provable.
+        assert_eq!(t.len(), live_before, "compaction must not change the live set");
+        for i in [1950u64, 2000, 3950, 3999, 4500, 4999] {
+            assert_eq!(t.get(&key(i)), Some(val(i).as_slice()), "key {i} live after compact");
+            let p = t.prove(&key(i)).unwrap();
+            assert!(p.verify(&root_after), "proof for {i} verifies vs post-compaction root");
+        }
+        // Deleted keys still gone.
+        assert!(t.get(&key(10)).is_none());
+
+        // Determinism: an identically-built tree, compacted the same way, yields
+        // the same post-compaction root.
+        let mut t2 = build();
+        let _ = t2.root();
+        t2.compact(0.5);
+        assert_eq!(root_after, t2.root(), "compaction must be deterministic");
+    }
+
+    #[test]
+    fn compaction_changes_root() {
+        let mut t = TwigTree::new();
+        for i in 0..5000u64 {
+            t.set(key(i), &val(i));
+        }
+        for i in 0..1900u64 {
+            t.delete(&key(i));
+        }
+        let before = t.root();
+        t.compact(0.5);
+        let after = t.root();
+        assert_ne!(before, after, "re-slotting entries must change the root");
     }
 
     #[test]
