@@ -118,6 +118,24 @@ value）；mobile/FFI `verify_for_key`（绑定 inner.key==account_key(addr) 且
 - 吞吐：全 DRAM + SIMD + 无锁分片 → Rust 版目标 ≥ C2 Go 的 7.99M（Rust 无 GC + 紧布局）。
 - proof：twig 11×32 + upper log2 + shard 4×32（比当前 SBMT 580B 略大，但仍 sub-1KB）。
 
+## 8b. P1 完成状态（已落地）
+
+新 crate `n42-twig-core`（zero-dep：blake3+serde+thiserror）实现单分片标量 `TwigTree`：
+- twig（2048 叶 / 4096 节点堆，`nodes[1]`=root，children=2j/2j+1）+ 全量 recompute；
+- upper 树（next_pow2 padding NULL_HASH，二叉折叠）；
+- append-slot 模型（`set` 分配 next_slot++、更新置死旧 slot、追加新 entry）；
+- `set` / `delete` / `get`（统一 KV：value 直接进 leaf hash，无独立 values map）；
+- `root()`（recompute 脏 twig + 重建 upper，缓存供 prove）；
+- `prove()`（twig path 11 + upper path）+ `TwigProof::verify`。
+
+**跨语言一致性验证（P1 关键里程碑）**：5000 inserts（key=blake3(i_le)、value=i_be8）
+Rust root **字节等于 gov5 Go QMDB root** `b32e9a4b…689912`（临时 Go 程序对拍，已删）。
+证明 twig/upper/leaf/internal 哈希 + append 布局对 gov5 蓝本忠实。
+
+测试：7 个全过（空树/单插/读回/多 twig proof/更新删除/确定性/**Go 对拍**），clippy -D warnings 干净。
+
+后续接 §7 的 P2（compaction + 确定性不变量）→ P3（16 分片 + #11 绑定）→ …
+
 ## 9. 风险
 
 - **共识确定性**（§2 三不变量）—— 头号风险，append 模型 root 依赖顺序 + compaction 改 root。

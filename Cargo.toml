@@ -15,6 +15,7 @@ members = [
     "crates/n42-parallel-evm",
     "crates/n42-jmt",
     "crates/n42-bmt-core",
+    "crates/n42-twig-core",
     "crates/n42-zkproof",
     "tests/e2e",
 ]
@@ -42,6 +43,7 @@ n42-node = { path = "crates/n42-node" }
 n42-parallel-evm = { path = "crates/n42-parallel-evm" }
 n42-jmt = { path = "crates/n42-jmt" }
 n42-bmt-core = { path = "crates/n42-bmt-core" }
+n42-twig-core = { path = "crates/n42-twig-core" }
 n42-zkproof = { path = "crates/n42-zkproof" }
 
 # reth dependencies (n42blockchain/reth @ n42-v2-upgrade, local path)

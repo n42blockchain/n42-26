@@ -1,0 +1,18 @@
+[package]
+name = "n42-twig-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Zero reth/mdbx dependencies: pure-blake3 QMDB-style twig engine (all-DRAM
+# AlDBaran variant) + proof verification, so n42-mobile / FFI can verify twig
+# proofs without pulling the storage stack. See docs/devlog-64.
+
+[dependencies]
+blake3.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+rand.workspace = true
