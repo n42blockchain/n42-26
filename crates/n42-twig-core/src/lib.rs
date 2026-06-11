@@ -89,11 +89,31 @@ impl Twig {
 }
 
 struct Entry {
-    /// Kept for P2 compaction (re-append live entries by keyHash). Unused in P1.
-    #[allow(dead_code)]
     key: Hash,
     value: Vec<u8>,
     active: bool,
+}
+
+/// Serializable snapshot of one append-slot entry (slot order is positional).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct EntrySnapshot {
+    pub key: Hash,
+    pub value: Vec<u8>,
+    pub active: bool,
+}
+
+/// Serializable snapshot of one shard: its append-only entry log (slot order).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ShardSnapshot {
+    pub next_slot: u64,
+    pub entries: Vec<EntrySnapshot>,
+}
+
+/// Serializable snapshot of a [`ShardedTwig`] (version + 16 shard logs).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TwigSnapshot {
+    pub version: u64,
+    pub shards: Vec<ShardSnapshot>,
 }
 
 /// `null_level[h]` = root of an all-null subtree of height `h`:
@@ -280,6 +300,47 @@ impl TwigTree {
             }
         }
         moved
+    }
+
+    fn snapshot(&self) -> ShardSnapshot {
+        ShardSnapshot {
+            next_slot: self.next_slot,
+            entries: self
+                .entries
+                .iter()
+                .map(|e| EntrySnapshot {
+                    key: e.key,
+                    value: e.value.clone(),
+                    active: e.active,
+                })
+                .collect(),
+        }
+    }
+
+    /// Rebuild a shard from its append-slot log: replay each entry's leaf at its
+    /// slot (only active entries set a non-null leaf), rebuilding the index.
+    fn restore(snap: &ShardSnapshot) -> Self {
+        let mut t = TwigTree::new();
+        t.next_slot = snap.next_slot;
+        let nl = t.null_level;
+        for (slot, e) in snap.entries.iter().enumerate() {
+            let twig_id = slot / TWIG_SIZE;
+            let local = slot % TWIG_SIZE;
+            while t.twigs.len() <= twig_id {
+                t.twigs.push(Twig::new(&nl));
+            }
+            if e.active {
+                t.twigs[twig_id].set_leaf(local, hash_leaf(&e.key, &e.value));
+                t.twigs[twig_id].live += 1;
+                t.index.insert(e.key, slot as u64);
+            }
+            t.entries.push(Entry {
+                key: e.key,
+                value: e.value.clone(),
+                active: e.active,
+            });
+        }
+        t
     }
 
     /// Recompute dirty twig roots + rebuild the upper tree, returning the world
@@ -490,6 +551,28 @@ impl ShardedTwig {
         (self.version, self.root())
     }
 
+    /// Serialize the full live state. The append-slot history (entries in slot
+    /// order, per shard) fully determines the root, so a snapshot + WAL replay
+    /// reconstructs the exact tree after a crash.
+    pub fn snapshot(&self) -> TwigSnapshot {
+        TwigSnapshot {
+            version: self.version,
+            shards: self.shards.iter().map(|s| s.snapshot()).collect(),
+        }
+    }
+
+    /// Rebuild from a [`TwigSnapshot`] (replays each shard's entries in slot order
+    /// and recomputes roots).
+    pub fn from_snapshot(snap: &TwigSnapshot) -> Self {
+        let shards = snap.shards.iter().map(TwigTree::restore).collect();
+        let mut t = Self {
+            shards,
+            version: snap.version,
+        };
+        let _ = t.root();
+        t
+    }
+
     /// Build a self-contained proof for `key`. Requires a prior `root()`/
     /// `apply_batch` call (uses cached shard roots).
     pub fn prove(&self, key: &Hash) -> Option<ShardedTwigProof> {
@@ -682,6 +765,38 @@ mod tests {
         let expected =
             hex_to_hash("6c20907fdae8d61a9085cb8468e03e47aca130a40ef3628ce90c2c202798a475");
         assert_eq!(root, expected, "ShardedTwig combined root must match gov5 NewSharded(16)");
+    }
+
+    #[test]
+    fn snapshot_roundtrip_preserves_root_and_state() {
+        let mut t = ShardedTwig::new();
+        let ins: Vec<(Hash, Option<Vec<u8>>)> =
+            (0..4000u64).map(|i| (key(i), Some(val(i)))).collect();
+        t.apply_batch(&ins);
+        // updates (dead slots) + deletes
+        let upd: Vec<(Hash, Option<Vec<u8>>)> =
+            (0..500u64).map(|i| (key(i), Some(val(i + 1_000_000)))).collect();
+        t.apply_batch(&upd);
+        let del: Vec<(Hash, Option<Vec<u8>>)> = (1000..1500u64).map(|i| (key(i), None)).collect();
+        let (_v, root_before) = {
+            t.apply_batch(&del);
+            (t.version(), t.root())
+        };
+
+        // Serialize -> bytes -> deserialize -> rebuild (the real persistence path).
+        let snap = t.snapshot();
+        let bytes = bincode::serialize(&snap).unwrap();
+        let snap2: TwigSnapshot = bincode::deserialize(&bytes).unwrap();
+        let mut restored = ShardedTwig::from_snapshot(&snap2);
+        let root_after = restored.root();
+
+        assert_eq!(root_before, root_after, "snapshot roundtrip must preserve the root");
+        assert_eq!(restored.version(), t.version());
+        assert_eq!(restored.get(&key(2000)), Some(val(2000).as_slice()));
+        assert_eq!(restored.get(&key(0)), Some(val(1_000_000).as_slice())); // updated
+        assert_eq!(restored.get(&key(1200)), None); // deleted
+        let p = restored.prove(&key(2000)).unwrap();
+        assert!(p.verify_for_key(&root_after, &key(2000)).is_ok());
     }
 
     #[test]
