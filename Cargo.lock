@@ -6714,6 +6714,7 @@ dependencies = [
  "metrics",
  "n42-bmt-core",
  "n42-execution",
+ "n42-twig-core",
  "parking_lot",
  "rand 0.9.4",
  "rayon",
@@ -6985,6 +6986,17 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber 0.3.23",
+]
+
+[[package]]
+name = "n42-twig-core"
+version = "0.5.0"
+dependencies = [
+ "bincode",
+ "blake3",
+ "rand 0.9.4",
+ "serde",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

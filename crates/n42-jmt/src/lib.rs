@@ -11,6 +11,7 @@ pub mod sharded_bmt;
 pub mod snapshot;
 pub mod store;
 pub mod tree;
+pub mod twig;
 
 pub use bmt::{BmtProof, Sbmt, ShardedBmtProof};
 pub use disk_store::{DiskTreeStore, open_jmt_env};
@@ -24,3 +25,4 @@ pub use sharded_bmt::ShardedSbmt;
 pub use snapshot::{JmtSnapshot, load_snapshot, save_snapshot};
 pub use store::{MemTreeStore, TreeStore};
 pub use tree::{EMPTY_CODE_HASH, N42JmtTree, decode_code_hash, encode_account_value};
+pub use twig::TwigState;

@@ -195,9 +195,29 @@ proof 仍验证通过。14 测试全过，clippy 干净。
 
 文件级 snapshot + WAL（崩溃恢复）放 P6 的 n42-jmt 层（复用 PersistentSbmt 机制）。
 
-后续 P6（n42-jmt StateDiff 接口 + PersistentTwig 文件持久化 + mobile/FFI + 节点接线 +
-fresh genesis + 多节点 E2E）。节点接线 + 多节点 E2E 需 testnet（Windows 跑不了 + node bin 原生
-不编），交接 codex/mac；n42-jmt 桥接 + mobile 验证在 Windows 实现并测。
+## 8g. P6 部分完成（StateDiff 桥接，Windows 已实现并测）
+
+`n42-jmt::TwigState`（`crates/n42-jmt/src/twig.rs`）：把 `ShardedTwig` 包成节点可用的状态树。
+- `apply_diff(StateDiff) -> (version, root)`：复用 `account_key`/`storage_key` 派生 + `code_hash`
+  从统一 KV 读回 + `encode_account_value`，展平成 canonical `(key, Option<value>)` ops 交
+  `ShardedTwig::apply_batch`。
+- `seed_genesis_account`（version 0 直接 set）、`get`、`root`、`prove(key) -> ShardedTwigProof`、
+  `snapshot`/`from_snapshot`。
+- 测试：apply_diff 后 root/get/**#11 绑定 proof**（正确 key 过、错 key 拒）+ snapshot roundtrip。
+  n42-jmt 87 测试、n42-twig-core 14 全过，clippy 干净。
+
+### P6 剩余（交接 codex/mac —— 需 testnet + node bin，Windows 跑不了/不编）
+
+详见 `docs/task-twig-p6-node-integration.md`：
+1. **PersistentTwig**（文件 snapshot + WAL 崩溃恢复）—— 复用 `persistent.rs` 的 PersistentSbmt 机制。
+2. **mobile/FFI**：`n42_verify_twig_account_proof` 等（带 #11 绑定，验证侧用 `n42-twig-core`）。
+3. **节点接线**：`orchestrator` 的 `Arc<Mutex<PersistentTwig>>`、`main.rs` fresh genesis seed、
+   RPC `n42_twigProof`/`n42_twigRoot`。
+4. **E2E**：fresh-genesis 多节点出块 root/height 一致、崩溃恢复、真实 RPC proof + 错 address 拒、
+   内存/吞吐 benchmark（目标 ~100 B/entry、≥ C2 Go 7.99M）。
+
+至此 Rust twig 引擎核心（P1–P5）+ StateDiff 桥接（P6 部分）完成并对 gov5 字节验证；节点级 E2E
+待 codex/mac。现有 SBMT（PR #1）仍为稳定回退基线。
 
 ## 9. 风险
 

@@ -525,6 +525,12 @@ impl ShardedTwig {
         self.shards[shard_index(key)].get(key)
     }
 
+    /// Set one key directly (no version bump) — for genesis seeding before the
+    /// first block. Call [`root`](Self::root) once after seeding.
+    pub fn set(&mut self, key: Hash, value: &[u8]) {
+        self.shards[shard_index(&key)].set(key, value);
+    }
+
     /// Recompute all shard roots + the combined root.
     pub fn root(&mut self) -> Hash {
         let mut roots = [NULL_HASH; SHARD_COUNT];
