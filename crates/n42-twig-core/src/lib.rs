@@ -56,6 +56,7 @@ pub fn hash_node(left: &Hash, right: &Hash) -> Hash {
 struct Twig {
     nodes: Box<[Hash; 2 * TWIG_SIZE]>,
     live: usize,
+    dirty: bool,
 }
 
 impl Twig {
@@ -67,18 +68,38 @@ impl Twig {
             let depth = (u32::BITS - 1 - (j as u32).leading_zeros()) as usize;
             *slot = null_level[TWIG_HEIGHT - depth];
         }
-        Self { nodes, live: 0 }
+        Self {
+            nodes,
+            live: 0,
+            dirty: false,
+        }
     }
 
-    /// Write a leaf and eager-fold its path to the root (11 hashes).
+    /// Write a leaf value WITHOUT folding (deferred — the tree folds dirty twigs
+    /// once per batch in `root()`, picking eager-fold vs full-recompute by density).
     #[inline]
-    fn set_leaf(&mut self, local: usize, h: Hash) {
+    fn write_leaf(&mut self, local: usize, h: Hash) {
+        self.nodes[TWIG_SIZE + local] = h;
+        self.dirty = true;
+    }
+
+    /// Eager-fold a single leaf's path to the root (11 hashes). Cheap for a twig
+    /// with few changed leaves this batch.
+    #[inline]
+    fn fold_path(&mut self, local: usize) {
         let mut j = TWIG_SIZE + local;
-        self.nodes[j] = h;
         while j > 1 {
             let p = j >> 1;
             self.nodes[p] = hash_node(&self.nodes[2 * p], &self.nodes[2 * p + 1]);
             j = p;
+        }
+    }
+
+    /// Full bottom-up recompute of all 2047 internal nodes. Cheaper than per-leaf
+    /// folding once a twig has many changed leaves this batch (the dense/genesis case).
+    fn recompute(&mut self) {
+        for j in (1..TWIG_SIZE).rev() {
+            self.nodes[j] = hash_node(&self.nodes[2 * j], &self.nodes[2 * j + 1]);
         }
     }
 
@@ -139,8 +160,16 @@ pub struct TwigTree {
     entries: Vec<Entry>, // indexed by slot
     value_arena: Vec<u8>, // entry values, append-only (Entry.voff/vlen index here)
     twigs: Vec<Twig>,
-    index: HashMap<Hash, u64>, // key -> active slot
+    // Compact index: 16-byte key prefix -> active slot. Lookups confirm against
+    // the entry's full key, so a (cryptographically negligible, ~N²/2¹²⁹) prefix
+    // collision can never return a wrong value. Halves the key bytes vs storing
+    // the full 32-byte key, and the index never feeds the root (the tree commits
+    // full keys in its leaves), so this is purely a memory/throughput choice.
+    index: HashMap<u128, u64>,
     next_slot: u64,
+    /// Slots whose leaves changed since the last `root()` — drives the per-twig
+    /// eager-fold vs full-recompute choice.
+    touched: Vec<u64>,
     null_level: [Hash; TWIG_HEIGHT + 1],
     // Upper merkle over twig roots, rebuilt by `root()`; cached for `prove()`.
     upper: Vec<Hash>,
@@ -161,6 +190,7 @@ impl TwigTree {
             twigs: Vec::new(),
             index: HashMap::new(),
             next_slot: 0,
+            touched: Vec::new(),
             null_level: null_level(),
             upper: Vec::new(),
             up_cap: 0,
@@ -172,6 +202,21 @@ impl TwigTree {
     fn entry_value(&self, slot: usize) -> &[u8] {
         let e = &self.entries[slot];
         &self.value_arena[e.voff as usize..e.voff as usize + e.vlen as usize]
+    }
+
+    /// 16-byte key prefix used as the compact index key.
+    #[inline]
+    fn prefix(key: &Hash) -> u128 {
+        u128::from_le_bytes(key[..16].try_into().unwrap())
+    }
+
+    /// Active slot for `key`, confirmed against the entry's full key.
+    #[inline]
+    fn lookup(&self, key: &Hash) -> Option<u64> {
+        self.index
+            .get(&Self::prefix(key))
+            .copied()
+            .filter(|&slot| &self.entries[slot as usize].key == key)
     }
 
     /// Number of live (active) keys.
@@ -202,15 +247,16 @@ impl TwigTree {
         self.entries[slot as usize].active = false;
         let twig_id = (slot / TWIG_SIZE as u64) as usize;
         let local = (slot % TWIG_SIZE as u64) as usize;
+        self.touched.push(slot);
         let t = &mut self.twigs[twig_id];
-        t.set_leaf(local, NULL_HASH);
+        t.write_leaf(local, NULL_HASH);
         t.live -= 1;
     }
 
     /// Insert or update `key -> value`. Deactivates the old slot if the key
     /// existed, then appends a fresh entry at `next_slot`.
     pub fn set(&mut self, key: Hash, value: &[u8]) {
-        if let Some(&old) = self.index.get(&key) {
+        if let Some(old) = self.lookup(&key) {
             self.deactivate(old);
         }
         let slot = self.next_slot;
@@ -224,8 +270,9 @@ impl TwigTree {
             }
         }
         let leaf = hash_leaf(&key, value);
+        self.touched.push(slot);
         let t = &mut self.twigs[twig_id];
-        t.set_leaf(local, leaf);
+        t.write_leaf(local, leaf);
         t.live += 1;
         debug_assert_eq!(self.entries.len() as u64, slot);
         let voff = self.value_arena.len() as u64;
@@ -236,12 +283,13 @@ impl TwigTree {
             vlen: value.len() as u32,
             active: true,
         });
-        self.index.insert(key, slot);
+        self.index.insert(Self::prefix(&key), slot);
     }
 
     /// Delete `key`. Returns whether it was present.
     pub fn delete(&mut self, key: &Hash) -> bool {
-        if let Some(slot) = self.index.remove(key) {
+        if let Some(slot) = self.lookup(key) {
+            self.index.remove(&Self::prefix(key));
             self.deactivate(slot);
             true
         } else {
@@ -251,7 +299,7 @@ impl TwigTree {
 
     /// Read the current value for `key`.
     pub fn get(&self, key: &Hash) -> Option<&[u8]> {
-        self.index.get(key).map(|&slot| self.entry_value(slot as usize))
+        self.lookup(key).map(|slot| self.entry_value(slot as usize))
     }
 
     /// Apply a block's `(key, Option<value>)` ops in **canonical (keyHash-sorted)
@@ -348,9 +396,10 @@ impl TwigTree {
             let voff = t.value_arena.len() as u64;
             t.value_arena.extend_from_slice(&e.value);
             if e.active {
-                t.twigs[twig_id].set_leaf(local, hash_leaf(&e.key, &e.value));
+                t.twigs[twig_id].write_leaf(local, hash_leaf(&e.key, &e.value));
                 t.twigs[twig_id].live += 1;
-                t.index.insert(e.key, slot as u64);
+                t.touched.push(slot as u64);
+                t.index.insert(TwigTree::prefix(&e.key), slot as u64);
             }
             t.entries.push(Entry {
                 key: e.key,
@@ -365,13 +414,47 @@ impl TwigTree {
     /// Recompute dirty twig roots + rebuild the upper tree, returning the world
     /// root. Must be called before `prove()` (it refreshes the cached upper tree).
     pub fn root(&mut self) -> Hash {
+        // Fold dirty twigs once per batch: group touched slots by twig, then pick
+        // full-recompute (dense, >= TWIG_SIZE/TWIG_HEIGHT changes) vs eager per-leaf
+        // fold (sparse). Both yield the same twig root — purely a cost choice.
+        if !self.touched.is_empty() {
+            self.touched.sort_unstable();
+            self.touched.dedup();
+            let mut i = 0;
+            while i < self.touched.len() {
+                let twig_id = (self.touched[i] / TWIG_SIZE as u64) as usize;
+                let mut j = i;
+                while j < self.touched.len()
+                    && (self.touched[j] / TWIG_SIZE as u64) as usize == twig_id
+                {
+                    j += 1;
+                }
+                let count = j - i;
+                let twig = &mut self.twigs[twig_id];
+                if twig.dirty {
+                    if count * TWIG_HEIGHT >= TWIG_SIZE {
+                        twig.recompute();
+                    } else {
+                        for k in i..j {
+                            let local = (self.touched[k] % TWIG_SIZE as u64) as usize;
+                            twig.fold_path(local);
+                        }
+                    }
+                    twig.dirty = false;
+                }
+                i = j;
+            }
+            self.touched.clear();
+            // Free a large genesis-sized touched buffer; keep modest capacity for
+            // steady-state block reuse.
+            self.touched.shrink_to(1 << 16);
+        }
+
         if self.twigs.is_empty() {
             self.upper.clear();
             self.up_cap = 0;
             return NULL_HASH;
         }
-        // Twig roots are kept current by eager fold (`set_leaf`); just rebuild the
-        // upper merkle over them.
         let n = self.twigs.len();
         let up_cap = n.next_power_of_two();
         let mut upper = vec![NULL_HASH; 2 * up_cap];
@@ -391,7 +474,7 @@ impl TwigTree {
     /// `None` if the key is absent. Requires a prior `root()` call (uses the cached
     /// upper tree); debug-asserts that twigs are clean.
     pub fn prove(&self, key: &Hash) -> Option<TwigProof> {
-        let &slot = self.index.get(key)?;
+        let slot = self.lookup(key)?;
         debug_assert!(
             self.up_cap >= self.twigs.len(),
             "call root() before prove()"

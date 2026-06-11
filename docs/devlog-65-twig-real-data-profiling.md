@@ -40,6 +40,41 @@ nonce/balance/bytecode_hash），喂 twig 引擎剖析。
 
 实测：RSS 304→280MB（−8%）、build 略快（少 1M 次堆分配）。
 
+## 优化 2：compact index（root 不变，−6% RSS + 更快）
+
+index 由 `HashMap<[u8;32], u64>` 改为 `HashMap<u128, u64>`（16 字节 key 前缀）+ 查找时用
+entry 的完整 key 确认。16 字节前缀碰撞 ≈ N²/2¹²⁹ ≈ 3.7e-21（全 1.58B key，与树自身抗碰撞同级），
+且 index 不进 root（root 由树的完整 key 决定），安全。
+- RSS 280→263MB（−6%），build 1.30→1.21s（u128 key 比 32 字节 hash 快）。
+
+## 优化 3：自适应 fold（root 不变，build 2.5x）
+
+每插入原 eager-fold 11 次 hash；稠密 genesis 填 twig 时 = 2048×11 ≈ 22528 次/twig，浪费。改为
+**deferred + 每块按密度自适应**：apply_batch 只写叶 + 记 touched，`root()` 时每 twig 二选一——
+稠密（≥187 改动）整体重算一次（2047 次，~11x 少），稀疏才逐叶 eager fold。
+- **build 1.21→0.53s（1.89M accts/s，2.5x！单线程 scalar）**，RSS 持平（touched buffer 用后 shrink）。
+- root 完全不变（3 个 gov5 对拍 + 14 测试全过）。
+- 重算的"逐层"循环正是 **SIMD 批量的天然结构**（以后 drop-in AVX 即可）。
+
+## 累计效果（1M 真实主网账户，单线程 scalar）
+
+| | RSS | 吞吐 |
+|---|-----|------|
+| 原始 | 304 MB | 750k accts/s |
+| + value-arena | 280 | 772k |
+| + compact index | 263 | 824k |
+| **+ 自适应 fold** | **264 MB（264 B/acct）** | **1.89M accts/s** |
+| **总计** | **−13%；vs SBMT −30%** | **2.5x**；已超 C2 Go 单树 1.71M |
+
+## SIMD（AVX-512 16-way）现状
+
+CPU 热点仍是 blake3。自适应 fold 已把 hash **数量**降下来（算法级），且重算循环是 SIMD-ready。
+**真·AVX-512 16-way blake3** 是 CPU 侧最后杠杆，但 `blake3` crate 无公开 batch（hash_many）API，
+需 vendored SIMD blake3 或手写 std::arch intrinsics（数百行、共识级、须与单 hash 逐字节对拍）——
+不宜一次性硬写。计划：在 `Twig::recompute` 的逐层循环引入 `hash_node_8/16`（AVX2/AVX-512 +
+标量 fallback + 运行时检测），用 gov5 cross-check 验证 root 字节恒等；参考 C2 的 Go AVX-512 接法。
+预计在 hash-bound 部分再叠加 ~2-4x。
+
 ## 结论与后续
 
 - twig 全-DRAM @1M 真实账户 **280 B/acct**，比 SBMT 省 25%。但距 AlDBaran/QMDB ~100 B/acct
