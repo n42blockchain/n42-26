@@ -47,48 +47,44 @@ pub fn hash_node(left: &Hash, right: &Hash) -> Hash {
 /// One twig: a complete binary heap of `2*TWIG_SIZE` hashes. `nodes[1]` is the
 /// twig root; internal nodes occupy `[1, TWIG_SIZE)`; leaves `[TWIG_SIZE, 2*TWIG_SIZE)`.
 /// `children(j) = (2j, 2j+1)`. Boxed (128 KiB) to keep it off the stack.
+///
+/// The root is kept current via **eager fold**: each leaf write re-folds only its
+/// 11-node path to the root (O(11)), so a block touching few leaves per twig costs
+/// far less than a full 2047-node recompute. A fresh twig's internal nodes are
+/// pre-seeded with the all-null subtree roots (`null_level[height]`) so untouched
+/// subtrees commit correctly without ever being recomputed.
 struct Twig {
     nodes: Box<[Hash; 2 * TWIG_SIZE]>,
     live: usize,
-    dirty: bool,
 }
 
 impl Twig {
-    fn new() -> Self {
-        Self {
-            nodes: Box::new([NULL_HASH; 2 * TWIG_SIZE]),
-            live: 0,
-            dirty: false,
+    fn new(null_level: &[Hash; TWIG_HEIGHT + 1]) -> Self {
+        let mut nodes = Box::new([NULL_HASH; 2 * TWIG_SIZE]);
+        // Internal node `j` roots an all-null subtree of height `TWIG_HEIGHT -
+        // floor(log2(j))`; seed it so untouched subtrees are already correct.
+        for (j, slot) in nodes.iter_mut().enumerate().take(TWIG_SIZE).skip(1) {
+            let depth = (u32::BITS - 1 - (j as u32).leading_zeros()) as usize;
+            *slot = null_level[TWIG_HEIGHT - depth];
         }
+        Self { nodes, live: 0 }
     }
 
+    /// Write a leaf and eager-fold its path to the root (11 hashes).
     #[inline]
     fn set_leaf(&mut self, local: usize, h: Hash) {
-        self.nodes[TWIG_SIZE + local] = h;
-        self.dirty = true;
+        let mut j = TWIG_SIZE + local;
+        self.nodes[j] = h;
+        while j > 1 {
+            let p = j >> 1;
+            self.nodes[p] = hash_node(&self.nodes[2 * p], &self.nodes[2 * p + 1]);
+            j = p;
+        }
     }
 
     #[inline]
     fn root(&self) -> Hash {
         self.nodes[1]
-    }
-
-    /// Bottom-up full recompute of all 2047 internal nodes from the leaves.
-    /// Processing `j` from high to low guarantees children `(2j, 2j+1)` are done
-    /// first (they are larger indices). An all-null twig folds to `null_twig_root`.
-    fn recompute(&mut self) {
-        for j in (1..TWIG_SIZE).rev() {
-            self.nodes[j] = hash_node(&self.nodes[2 * j], &self.nodes[2 * j + 1]);
-        }
-        self.dirty = false;
-    }
-
-    /// Fast path for an all-null (live == 0) twig: set the root directly to the
-    /// precomputed `null_twig_root` instead of folding 2047 null hashes. Same
-    /// result as `recompute()` on all-null leaves.
-    fn mark_empty(&mut self, null_twig_root: Hash) {
-        self.nodes[1] = null_twig_root;
-        self.dirty = false;
     }
 }
 
@@ -100,14 +96,15 @@ struct Entry {
     active: bool,
 }
 
-/// All-null twig commitment: `null_level[TWIG_HEIGHT]` = fold of NULL_HASH up 11
-/// levels. An emptied twig commits to this (matches gov5's `nullTwigRoot`).
-fn null_twig_root() -> Hash {
-    let mut h = NULL_HASH;
-    for _ in 0..TWIG_HEIGHT {
-        h = hash_node(&h, &h);
+/// `null_level[h]` = root of an all-null subtree of height `h`:
+/// `null_level[0] = NULL_HASH`, `null_level[h] = hash_node(prev, prev)`.
+/// `null_level[TWIG_HEIGHT]` is the empty-twig commitment (gov5 `nullTwigRoot`).
+fn null_level() -> [Hash; TWIG_HEIGHT + 1] {
+    let mut nl = [NULL_HASH; TWIG_HEIGHT + 1];
+    for h in 1..=TWIG_HEIGHT {
+        nl[h] = hash_node(&nl[h - 1], &nl[h - 1]);
     }
-    h
+    nl
 }
 
 /// Single-shard append-only twig tree. `set` assigns a monotonically increasing
@@ -118,7 +115,7 @@ pub struct TwigTree {
     twigs: Vec<Twig>,
     index: HashMap<Hash, u64>, // key -> active slot
     next_slot: u64,
-    null_twig_root: Hash,
+    null_level: [Hash; TWIG_HEIGHT + 1],
     // Upper merkle over twig roots, rebuilt by `root()`; cached for `prove()`.
     upper: Vec<Hash>,
     up_cap: usize,
@@ -137,7 +134,7 @@ impl TwigTree {
             twigs: Vec::new(),
             index: HashMap::new(),
             next_slot: 0,
-            null_twig_root: null_twig_root(),
+            null_level: null_level(),
             upper: Vec::new(),
             up_cap: 0,
         }
@@ -186,8 +183,11 @@ impl TwigTree {
         self.next_slot += 1;
         let twig_id = (slot / TWIG_SIZE as u64) as usize;
         let local = (slot % TWIG_SIZE as u64) as usize;
-        while self.twigs.len() <= twig_id {
-            self.twigs.push(Twig::new());
+        if self.twigs.len() <= twig_id {
+            let nl = self.null_level;
+            while self.twigs.len() <= twig_id {
+                self.twigs.push(Twig::new(&nl));
+            }
         }
         let leaf = hash_leaf(&key, value);
         let t = &mut self.twigs[twig_id];
@@ -290,15 +290,8 @@ impl TwigTree {
             self.up_cap = 0;
             return NULL_HASH;
         }
-        for t in &mut self.twigs {
-            if t.dirty {
-                if t.live == 0 {
-                    t.mark_empty(self.null_twig_root);
-                } else {
-                    t.recompute();
-                }
-            }
-        }
+        // Twig roots are kept current by eager fold (`set_leaf`); just rebuild the
+        // upper merkle over them.
         let n = self.twigs.len();
         let up_cap = n.next_power_of_two();
         let mut upper = vec![NULL_HASH; 2 * up_cap];
@@ -320,7 +313,7 @@ impl TwigTree {
     pub fn prove(&self, key: &Hash) -> Option<TwigProof> {
         let &slot = self.index.get(key)?;
         debug_assert!(
-            self.up_cap >= self.twigs.len() && !self.twigs.iter().any(|t| t.dirty),
+            self.up_cap >= self.twigs.len(),
             "call root() before prove()"
         );
         let value = self.entries[slot as usize].value.clone();

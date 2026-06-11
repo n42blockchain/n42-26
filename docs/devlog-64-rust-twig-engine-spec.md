@@ -166,7 +166,24 @@ keyHash-排序 Set 的 root `58671c9a…6526fa` —— canonical 排序不变量
 
 测试：13 个全过（+ 分片 prove/verify + #11 绑定拒绝 + 分片 Go 对拍），clippy 干净。
 
-后续接 §7 的 P4（SIMD 批量 hash）→ P5（持久化）→ P6（n42-jmt StateDiff 接口 + mobile/FFI + 节点接线）。
+## 8e. P4 完成状态（增量 eager fold；真·SIMD 延后）
+
+P4 原计划 AVX-512 16-way。但 blake3 crate 无稳定公开 batch API，手写 AVX-512 blake3
+压缩风险极高（密码学正确性）。先做**算法级提速 + gov5 默认做法：增量 eager fold**——
+- 每次 `set_leaf` 只折叠那条 11 节点路径到根（O(11)），不再全量重算 2047 节点；
+- 一个块对某 twig 触碰 K 个叶 → O(K·11) vs 全量 O(2047)；K<186 即更快（块常态远小于此）；
+- 新 twig 的内部节点用 `null_level[height]` 预种，未触碰子树自然正确（免重算）；
+- 删 dirty/recompute/mark_empty，`root()` 只重建 upper。
+
+**root 完全不变**：3 个 gov5 跨语言对拍（单树/sorted-batch/sharded16）+ 全部内部测试仍过
+（13 个）。clippy 干净。
+
+**真·AVX-512 16-way SIMD 作为后续单独项**：需 blake3 内部 hash_many（不稳定）或 vendored
+SIMD blake3 + 标量对拍验证；问 C2 它的 Go AVX-512 接法当参考。预计在 hash-bound 部分（实测
+blake3 占 ~24%）再加 ~15-20%。
+
+后续接 §7 的 P5（持久化：snapshot + WAL，全 DRAM）→ P6（n42-jmt StateDiff 接口 + mobile/FFI +
+节点接线 + fresh genesis + 多节点 E2E）。
 
 ## 9. 风险
 
