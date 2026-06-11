@@ -263,3 +263,23 @@ blake3 并行收益。**撤回**，prepare 保持单遍串行。
 - **硬件**：AlDBaran 96 核 + NVMe 管线。
 
 这些是后续（增分片=共识级；SIMD 批量 hash=中等改动）的方向，非本轮范围。
+
+### 同硬件 apples-to-apples（9950X 16C/32T）：QMDB 仍快 ~1.7×
+
+跑 bench 的机器恰是 Ryzen 9 9950X（16C/32T）——与另一会话（C2）测 QMDB 的同款 CPU。
+新增 bench 更新阶段（`SBMT_BENCH_UPDATES`，覆写随机既有账户，对齐 C2 的 400K-update workload）：
+
+| | 吞吐（16-shard，9950X，400K 覆写） |
+|---|-----------------------------------|
+| 我们 SBMT | **~1.3M upd/s**（block=25000）；更新 ≈ 插入（root 重算主导，非 alloc） |
+| C2 QMDB | **2.26M upd/s**（16-shard，达成论文 2.28M；64-shard 仅 2.55M，过 16 后边际递减） |
+
+C2 的 scaling（单树 0.30M → 4-shard 1.02M → 16-shard 2.26M(7.5×) → 64-shard 2.55M）说明
+**16 分片正是 16 核机的甜点，过 16 边际递减** → 我们固定 16 分片的选择对商用硬件是对的，
+增分片在常用硬件上无意义。
+
+**结论**：同硬件、同 shard、同 workload，QMDB 仍快 ~1.7×。差距是**每次更新的 hash 效率**：
+QMDB 的 twig 是连续数组 + 确定性缓存布局 + SIMD 一条指令 hash 16 兄弟分支；我们即便 arena
+仍按索引跳转 + 逐节点 blake3。**唯一明确、root 不变的吞吐杠杆 = SIMD 批量 hash 脏路径兄弟节点**
+（AlDBaran 核心手段，中等改动）。商用 16 核机的吞吐天花板约 2.5M（C2 的 64-shard 平台），
+我们 1.3M 距该天花板 ~1.9×；AlDBaran 的 48M 是 96 核的事。

@@ -100,6 +100,44 @@ fn main() {
 
     let rss_after_build = memory_stats::memory_stats().map(|m| m.physical_mem).unwrap_or(0);
 
+    // ── Optional update phase: overwrite random existing accounts (Modified),
+    // the apples-to-apples workload for comparing against QMDB-style update
+    // benchmarks (no tree growth: in-place value-hash update, no split/alloc). ──
+    let updates = env_usize("SBMT_BENCH_UPDATES", 0);
+    let mut upd_per_sec = 0.0;
+    if updates > 0 {
+        let mut rng = rand::rng();
+        let mut upd_us = 0.0f64;
+        let mut done = 0usize;
+        while done < updates {
+            let count = block.min(updates - done);
+            let mut accounts = BTreeMap::new();
+            for _ in 0..count {
+                let i = rng.random_range(0..entries);
+                accounts.insert(
+                    addr_of(i),
+                    AccountDiff {
+                        change_type: AccountChangeType::Modified,
+                        balance: Some(ValueChange::new(U256::ZERO, U256::from(rng.random::<u64>()))),
+                        nonce: Some(ValueChange::new(0, 1)),
+                        code_change: None,
+                        storage: BTreeMap::new(),
+                    },
+                );
+            }
+            let diff = StateDiff { accounts };
+            let t = Instant::now();
+            let _ = tree.apply_diff(&diff);
+            upd_us += t.elapsed().as_secs_f64() * 1e6;
+            done += count;
+        }
+        upd_per_sec = updates as f64 / (upd_us / 1e6).max(f64::MIN_POSITIVE);
+        println!(
+            "updates:      {updates} ops, {upd_per_sec:.0} upd/s (block={block}, overwrite)"
+        );
+    }
+    let _ = upd_per_sec;
+
     // ── Footprint. ──
     let ns = tree.node_stats();
     let total_nodes = ns.total_nodes();
