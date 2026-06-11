@@ -92,7 +92,8 @@ Logs are split into separate files by phase for easy maintenance:
 | [devlog-61-sbmt-proof-key-binding](docs/devlog-61-sbmt-proof-key-binding.md) | SBMT 证明 key+shard 绑定安全修复（轻客户端 soundness）+ key 派生/shard_index 单一来源去重 | Security |
 | [devlog-62-sbmt-benchmark-vs-gov5](docs/devlog-62-sbmt-benchmark-vs-gov5.md) | SBMT 规模化 benchmark + in-place insert 优化（1.8×）+ 对标 gov5 BMT/QMDB；识别路径压缩机会 | Benchmark |
 | [devlog-63-twig-memory-core-design](docs/devlog-63-twig-memory-core-design.md) | 决策：走 AlDBaran 全 DRAM 路线（非 QMDB SSD 路线）；内存即吞吐；Rust 自建 twig 核心 | Design |
-| [devlog-64-rust-twig-engine-spec](docs/devlog-64-rust-twig-engine-spec.md) | Rust 全-DRAM twig engine 实现 spec：gov5 蓝本 + 全 DRAM 适配 + #11 绑定 + 分阶段计划 | Design |
+| [devlog-64-rust-twig-engine-spec](docs/devlog-64-rust-twig-engine-spec.md) | Rust 全-DRAM twig engine 实现 spec + P1–P6 实现（对 gov5 字节验证、#11 绑定、StateDiff 桥接） | Design |
+| [devlog-65-twig-real-data-profiling](docs/devlog-65-twig-real-data-profiling.md) | twig 引擎真实主网账户剖析（reth2k）+ value-arena 优化（−8% RSS，280 B/acct，root 不变） | Profiling |
 
 ---
 
