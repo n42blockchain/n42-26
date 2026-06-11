@@ -154,16 +154,26 @@ in-memory SBMT 同口径。输出：footprint（QMDB entryLog+twigMeta vs JMT al
 
 ## 最终对比结论（含实测 QMDB）
 
-| 维度 | SBMT（实测） | QMDB（实测/结构） |
-|------|-------------|-------------------|
-| 内存 @5M | RSS 2.0 GB（全树驻内存，线性） | **~351 MB**（entryLog+twig，约省 5.8×） |
+| 维度 | SBMT（实测） | QMDB（实测） |
+|------|-------------|-------------|
+| 内存 @5M | RSS 2.0 GB→**1.72 GB**（arena 后；全树驻内存，线性） | **~351 MB**（gov5 qmdb-bench；约省 ~5×） |
 | 活态磁盘 @5M | snapshot 520 MB | ~351 MB（entryLog；compaction 后更小） |
 | 每块 root @5M | 258 µs（apply+root，插入） | 213 µs（覆写） |
-| proof 生成 | **~3 µs**（内存，快 ~20×） | 含冷读，更慢（结构） |
-| proof 大小 | **580 B**（实链，压缩后） | 更大（twig 11×32 + upper，结构估计） |
-| proof depth | 21–24 | 11 + log2(numTwigs) |
+| proof 生成 | ~3.1 µs（vs gov5 Go BMT 快 ~20×） | **~1.0 µs**（扁平堆直读 sibling，零重哈希）→ 比 SBMT 快 ~3× |
+| proof 验证 | 2.9 µs | 2.0–2.9 µs（同级） |
+| proof 大小 | **580 B**（实链，压缩后）/ 860 B（bench 全序列化） | 751 B(@1M) / 815 B(@5M) |
+| proof depth | 21.3 / 23.6 | **21 / 23（几乎一致）** |
 | 并行 root speedup | 16 分片 | 14.8–17.4×（twig） |
 | 实现复杂度 | 低（单引擎） | 高（twig/compaction/冷存） |
+
+> QMDB footprint（351 MB）来自本机跑 gov5 `qmdb-bench`；QMDB proof 行（751/815 B、~1 µs gen、
+> depth 21/23）来自另一会话（C2）对其 QMDB 实现的实测。proof depth 两边独立测出 21/23 ≈ SBMT
+> 21.3/23.6，互为交叉验证。
+>
+> **可借鉴点**：QMDB proof gen ~3× 快，因为 twig 是完整二叉堆、所有节点 hash 预存为扁平数组，
+> prove 时直接读 sibling、零重哈希。我们的 `prove()` 虽走 arena + cache，但每次仍有 Vec 分配 +
+> 逐层 peek + 可能的未缓存 sibling 重算。若 proof gen 成热点，可把 in-shard 树的 sibling hash
+> 预物化为扁平数组（类似 twig）来追平。当前 3 µs 非瓶颈，列为后续可选。
 
 **一句话**：SBMT 在 proof（生成快 20×、更小）和实现简单度上占优；QMDB 在大规模内存
 （省 ~5.8×、有界）上占优。选择取决于状态规模——中小状态 SBMT 全驻内存可接受且 proof 极优；
