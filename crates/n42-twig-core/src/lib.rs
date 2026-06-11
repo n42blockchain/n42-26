@@ -88,9 +88,14 @@ impl Twig {
     }
 }
 
+/// One append-slot entry. The value bytes live in the shard's flat `value_arena`
+/// (`[voff, voff+vlen)`) rather than a per-entry `Vec<u8>` — this removes the
+/// 24-byte Vec header + per-value heap allocation/rounding and keeps values
+/// contiguous (cache-friendly). `voff` is `u64` so a shard's arena can exceed 4 GiB.
 struct Entry {
     key: Hash,
-    value: Vec<u8>,
+    voff: u64,
+    vlen: u32,
     active: bool,
 }
 
@@ -132,6 +137,7 @@ fn null_level() -> [Hash; TWIG_HEIGHT + 1] {
 /// new entry. The world root is therefore a function of the append history.
 pub struct TwigTree {
     entries: Vec<Entry>, // indexed by slot
+    value_arena: Vec<u8>, // entry values, append-only (Entry.voff/vlen index here)
     twigs: Vec<Twig>,
     index: HashMap<Hash, u64>, // key -> active slot
     next_slot: u64,
@@ -151,6 +157,7 @@ impl TwigTree {
     pub fn new() -> Self {
         Self {
             entries: Vec::new(),
+            value_arena: Vec::new(),
             twigs: Vec::new(),
             index: HashMap::new(),
             next_slot: 0,
@@ -158,6 +165,13 @@ impl TwigTree {
             upper: Vec::new(),
             up_cap: 0,
         }
+    }
+
+    /// Value bytes for a slot (slice into the arena).
+    #[inline]
+    fn entry_value(&self, slot: usize) -> &[u8] {
+        let e = &self.entries[slot];
+        &self.value_arena[e.voff as usize..e.voff as usize + e.vlen as usize]
     }
 
     /// Number of live (active) keys.
@@ -214,9 +228,12 @@ impl TwigTree {
         t.set_leaf(local, leaf);
         t.live += 1;
         debug_assert_eq!(self.entries.len() as u64, slot);
+        let voff = self.value_arena.len() as u64;
+        self.value_arena.extend_from_slice(value);
         self.entries.push(Entry {
             key,
-            value: value.to_vec(),
+            voff,
+            vlen: value.len() as u32,
             active: true,
         });
         self.index.insert(key, slot);
@@ -234,9 +251,7 @@ impl TwigTree {
 
     /// Read the current value for `key`.
     pub fn get(&self, key: &Hash) -> Option<&[u8]> {
-        self.index
-            .get(key)
-            .map(|&slot| self.entries[slot as usize].value.as_slice())
+        self.index.get(key).map(|&slot| self.entry_value(slot as usize))
     }
 
     /// Apply a block's `(key, Option<value>)` ops in **canonical (keyHash-sorted)
@@ -277,27 +292,21 @@ impl TwigTree {
         // Collect live entries (deterministic keyHash order).
         let mut live: Vec<(Hash, Vec<u8>)> = Vec::new();
         for &id in &sparse {
-            let base = id as u64 * TWIG_SIZE as u64;
-            for local in 0..TWIG_SIZE as u64 {
-                let e = &self.entries[(base + local) as usize];
-                if e.active {
-                    live.push((e.key, e.value.clone()));
+            let base = id * TWIG_SIZE;
+            for local in 0..TWIG_SIZE {
+                let slot = base + local;
+                if self.entries[slot].active {
+                    live.push((self.entries[slot].key, self.entry_value(slot).to_vec()));
                 }
             }
         }
         live.sort_by_key(|p| p.0);
         let moved = live.len();
         // Re-append (deactivates old slots, appends to the active twig forward).
+        // The old arena bytes become dead; they are reclaimed by a future full
+        // rebuild (snapshot/restore compacts the arena).
         for (k, v) in live {
             self.set(k, &v);
-        }
-        // Reclaim the value heap of the now fully-dead sparse twig slots.
-        for &id in &sparse {
-            let base = id as u64 * TWIG_SIZE as u64;
-            for local in 0..TWIG_SIZE as u64 {
-                let slot = (base + local) as usize;
-                self.entries[slot].value = Vec::new();
-            }
         }
         moved
     }
@@ -305,13 +314,20 @@ impl TwigTree {
     fn snapshot(&self) -> ShardSnapshot {
         ShardSnapshot {
             next_slot: self.next_slot,
-            entries: self
-                .entries
-                .iter()
-                .map(|e| EntrySnapshot {
-                    key: e.key,
-                    value: e.value.clone(),
-                    active: e.active,
+            entries: (0..self.entries.len())
+                .map(|slot| {
+                    let active = self.entries[slot].active;
+                    EntrySnapshot {
+                        key: self.entries[slot].key,
+                        // dead entries don't affect the root; persist them empty
+                        // so restore compacts the value arena.
+                        value: if active {
+                            self.entry_value(slot).to_vec()
+                        } else {
+                            Vec::new()
+                        },
+                        active,
+                    }
                 })
                 .collect(),
         }
@@ -329,6 +345,8 @@ impl TwigTree {
             while t.twigs.len() <= twig_id {
                 t.twigs.push(Twig::new(&nl));
             }
+            let voff = t.value_arena.len() as u64;
+            t.value_arena.extend_from_slice(&e.value);
             if e.active {
                 t.twigs[twig_id].set_leaf(local, hash_leaf(&e.key, &e.value));
                 t.twigs[twig_id].live += 1;
@@ -336,7 +354,8 @@ impl TwigTree {
             }
             t.entries.push(Entry {
                 key: e.key,
-                value: e.value.clone(),
+                voff,
+                vlen: e.value.len() as u32,
                 active: e.active,
             });
         }
@@ -377,7 +396,7 @@ impl TwigTree {
             self.up_cap >= self.twigs.len(),
             "call root() before prove()"
         );
-        let value = self.entries[slot as usize].value.clone();
+        let value = self.entry_value(slot as usize).to_vec();
         let twig_id = (slot / TWIG_SIZE as u64) as usize;
         let local = (slot % TWIG_SIZE as u64) as usize;
 
