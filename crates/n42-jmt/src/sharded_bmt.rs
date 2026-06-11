@@ -19,7 +19,6 @@ use n42_bmt_core::{Hash, SHARD_COUNT, Sbmt, ShardedBmtProof, shard_tree_path, sh
 
 use alloy_primitives::{Address, B256, U256};
 use n42_execution::state_diff::{AccountChangeType, StateDiff};
-use parking_lot::Mutex;
 use rayon::prelude::*;
 use std::collections::HashMap;
 
@@ -28,12 +27,17 @@ fn shard_index(key: &Hash) -> usize {
     n42_bmt_core::shard_index_for_key(key)
 }
 
-
 /// 16-shard parallel Sparse Binary Merkle Tree with per-shard value storage.
+///
+/// Shards are stored *unlocked*: every caller reaches `ShardedSbmt` through the
+/// node's outer `Arc<Mutex<PersistentSbmt>>`, so access is already serialized and
+/// a per-shard lock would only double-lock. `apply_diff` takes `&mut self` and
+/// fans out with `par_iter_mut`, giving each rayon worker exclusive ownership of
+/// one shard — no locks on the critical path.
 pub struct ShardedSbmt {
-    shards: Vec<Mutex<Sbmt>>,
+    shards: Vec<Sbmt>,
     /// Per-shard raw key→value store (unified KV layer for read-back).
-    values: Vec<Mutex<HashMap<Hash, Vec<u8>>>>,
+    values: Vec<HashMap<Hash, Vec<u8>>>,
     version: u64,
 }
 
@@ -53,11 +57,9 @@ impl ShardedSbmt {
         let base_depth = SHARD_COUNT.trailing_zeros() as usize;
         Self {
             shards: (0..SHARD_COUNT)
-                .map(|_| Mutex::new(Sbmt::with_base_depth(base_depth)))
+                .map(|_| Sbmt::with_base_depth(base_depth))
                 .collect(),
-            values: (0..SHARD_COUNT)
-                .map(|_| Mutex::new(HashMap::new()))
-                .collect(),
+            values: (0..SHARD_COUNT).map(|_| HashMap::new()).collect(),
             version: 0,
         }
     }
@@ -69,19 +71,19 @@ impl ShardedSbmt {
 
     /// Combined root hash: the depth-4 merkle root over the 16 shard roots.
     pub fn root_hash(&self) -> B256 {
-        let roots: Vec<Hash> = self.shards.iter().map(|s| s.lock().root_hash()).collect();
+        let roots: Vec<Hash> = self.shards.iter().map(|s| s.root_hash()).collect();
         B256::from(shard_tree_root(&roots))
     }
 
     /// Read a key's raw value at the current version.
     pub fn get(&self, key: &Hash) -> Option<Vec<u8>> {
-        self.values[shard_index(key)].lock().get(key).cloned()
+        self.values[shard_index(key)].get(key).cloned()
     }
 
-    fn insert_raw(&self, key: Hash, value: Vec<u8>) {
+    fn insert_raw(&mut self, key: Hash, value: Vec<u8>) {
         let si = shard_index(&key);
-        self.shards[si].lock().insert(key, &value);
-        self.values[si].lock().insert(key, value);
+        self.shards[si].insert(key, &value);
+        self.values[si].insert(key, value);
     }
 
     /// Seed a genesis account without advancing the block-version counter.
@@ -113,19 +115,15 @@ impl ShardedSbmt {
         }
     }
 
-    /// Read the existing `code_hash` for an account key (or empty-code hash if absent).
-    fn existing_code_hash(&self, account_key_bytes: &Hash) -> B256 {
-        self.values[shard_index(account_key_bytes)]
-            .lock()
-            .get(account_key_bytes)
-            .map(|v| decode_code_hash(v))
-            .unwrap_or(EMPTY_CODE_HASH)
-    }
-
     /// Partition a `StateDiff` into per-shard `(key, Option<value>)` updates.
     ///
     /// Mirrors `ShardedJmt::prepare_shard_updates`: for a `Modified` account with
     /// no `code_change`, the existing `code_hash` is read back and preserved.
+    ///
+    /// Kept single-pass + serial: a rayon fan-out here measured *slower* than the
+    /// per-shard parallelism in `apply_diff` (extra intermediate Vecs + dispatch
+    /// dominate for typical block sizes). The lock-free shard storage lets the
+    /// `code_hash` read-back hit the value map directly, no `Mutex`.
     fn prepare(&self, diff: &StateDiff) -> Vec<Vec<(Hash, Option<Vec<u8>>)>> {
         let mut shard_updates: Vec<Vec<(Hash, Option<Vec<u8>>)>> =
             (0..SHARD_COUNT).map(|_| Vec::new()).collect();
@@ -143,15 +141,14 @@ impl ShardedSbmt {
                     }
                 }
                 AccountChangeType::Created | AccountChangeType::Modified => {
-                    let balance = account_diff
-                        .balance
-                        .as_ref()
-                        .map(|v| v.to)
-                        .unwrap_or_default();
+                    let balance = account_diff.balance.as_ref().map(|v| v.to).unwrap_or_default();
                     let nonce = account_diff.nonce.as_ref().map(|v| v.to).unwrap_or(0);
                     let code_hash = match &account_diff.code_change {
                         Some(change) => change.to.unwrap_or(EMPTY_CODE_HASH),
-                        None => self.existing_code_hash(&key),
+                        None => self.values[si]
+                            .get(&key)
+                            .map(|v| decode_code_hash(v))
+                            .unwrap_or(EMPTY_CODE_HASH),
                     };
                     let value = encode_account_value(&balance, nonce, &code_hash);
                     shard_updates[si].push((key, Some(value)));
@@ -182,12 +179,10 @@ impl ShardedSbmt {
 
         let roots: Vec<Hash> = self
             .shards
-            .par_iter()
-            .zip(self.values.par_iter())
+            .par_iter_mut()
+            .zip(self.values.par_iter_mut())
             .zip(shard_updates.into_par_iter())
-            .map(|((shard, vals), updates)| {
-                let mut tree = shard.lock();
-                let mut kv = vals.lock();
+            .map(|((tree, kv), updates)| {
                 for (key, value) in &updates {
                     match value {
                         Some(bytes) => {
@@ -213,7 +208,7 @@ impl ShardedSbmt {
         self.shards
             .iter()
             .zip(self.values.iter())
-            .map(|(s, v)| (s.lock().len(), v.lock().len()))
+            .map(|(s, v)| (s.len(), v.len()))
             .collect()
     }
 
@@ -223,7 +218,7 @@ impl ShardedSbmt {
     pub fn node_stats(&self) -> n42_bmt_core::NodeStats {
         let mut agg = n42_bmt_core::NodeStats::default();
         for s in &self.shards {
-            let st = s.lock().node_stats();
+            let st = s.node_stats();
             agg.internal_nodes += st.internal_nodes;
             agg.leaf_nodes += st.leaf_nodes;
             agg.serialized_bytes += st.serialized_bytes;
@@ -238,7 +233,7 @@ impl ShardedSbmt {
     pub fn snapshot(&self) -> JmtSnapshot {
         let mut entries = Vec::new();
         for vals in &self.values {
-            for (key, value) in vals.lock().iter() {
+            for (key, value) in vals.iter() {
                 entries.push((*key, value.clone()));
             }
         }
@@ -253,9 +248,9 @@ impl ShardedSbmt {
     /// raw value), the SBMT counterpart of [`crate::JmtProof`] for mobile clients.
     pub fn prove(&self, key: Hash) -> ShardedBmtProof {
         let si = shard_index(&key);
-        let inner = self.shards[si].lock().prove(key);
-        let value = self.values[si].lock().get(&key).cloned();
-        let roots: Vec<Hash> = self.shards.iter().map(|s| s.lock().root_hash()).collect();
+        let inner = self.shards[si].prove(key);
+        let value = self.values[si].get(&key).cloned();
+        let roots: Vec<Hash> = self.shards.iter().map(|s| s.root_hash()).collect();
         ShardedBmtProof {
             shard_index: si as u8,
             shard_root: roots[si],
@@ -270,8 +265,8 @@ impl ShardedSbmt {
         let mut t = Self::new();
         for (key, value) in &snapshot.entries {
             let si = shard_index(key);
-            t.shards[si].lock().insert(*key, value);
-            t.values[si].lock().insert(*key, value.clone());
+            t.shards[si].insert(*key, value);
+            t.values[si].insert(*key, value.clone());
         }
         t.version = snapshot.version;
 
