@@ -157,6 +157,16 @@ impl TwigTree {
         self.next_slot
     }
 
+    /// The world root computed by the most recent [`root`](Self::root) call
+    /// (without recomputing). `NULL_HASH` if empty or never committed.
+    pub fn cached_root(&self) -> Hash {
+        if self.up_cap == 0 {
+            NULL_HASH
+        } else {
+            self.upper[1]
+        }
+    }
+
     fn deactivate(&mut self, slot: u64) {
         self.entries[slot as usize].active = false;
         let twig_id = (slot / TWIG_SIZE as u64) as usize;
@@ -380,6 +390,194 @@ impl TwigProof {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Sharded layer: 16 independent twig trees, combined by a depth-4 merkle over
+// their roots. Keys shard by the top nibble (`key[0] >> 4`), matching gov5's
+// `ShardedTree` (16 shards). Proofs carry the in-shard twig proof + the shard
+// path, and bind to the queried key+shard (audit #11).
+// ---------------------------------------------------------------------------
+
+/// Number of shards.
+pub const SHARD_COUNT: usize = 16;
+const SHARD_BITS: usize = 4; // log2(SHARD_COUNT)
+
+/// Shard a key falls into: the top nibble of byte 0.
+#[inline]
+pub fn shard_index(key: &Hash) -> usize {
+    (key[0] >> (8 - SHARD_BITS)) as usize
+}
+
+/// Depth-4 merkle root over the 16 shard roots (`hash_node` combiner).
+pub fn shard_tree_root(leaves: &[Hash; SHARD_COUNT]) -> Hash {
+    let mut level: Vec<Hash> = leaves.to_vec();
+    while level.len() > 1 {
+        level = level.chunks(2).map(|c| hash_node(&c[0], &c[1])).collect();
+    }
+    level[0]
+}
+
+/// Authentication path (4 siblings, bottom-up) from shard `index` to the root.
+pub fn shard_tree_path(leaves: &[Hash; SHARD_COUNT], index: usize) -> [Hash; SHARD_BITS] {
+    let mut path = [NULL_HASH; SHARD_BITS];
+    let mut level: Vec<Hash> = leaves.to_vec();
+    let mut idx = index;
+    for slot in path.iter_mut() {
+        *slot = level[idx ^ 1];
+        level = level.chunks(2).map(|c| hash_node(&c[0], &c[1])).collect();
+        idx >>= 1;
+    }
+    path
+}
+
+fn fold_shard_path(leaf: Hash, index: usize, path: &[Hash; SHARD_BITS]) -> Hash {
+    let mut cur = leaf;
+    let mut idx = index;
+    for sib in path {
+        cur = if idx & 1 == 0 {
+            hash_node(&cur, sib)
+        } else {
+            hash_node(sib, &cur)
+        };
+        idx >>= 1;
+    }
+    cur
+}
+
+/// 16-shard twig tree. Combined root = depth-4 merkle over the shard roots.
+pub struct ShardedTwig {
+    shards: Vec<TwigTree>,
+    version: u64,
+}
+
+impl Default for ShardedTwig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ShardedTwig {
+    pub fn new() -> Self {
+        Self {
+            shards: (0..SHARD_COUNT).map(|_| TwigTree::new()).collect(),
+            version: 0,
+        }
+    }
+
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+
+    pub fn get(&self, key: &Hash) -> Option<&[u8]> {
+        self.shards[shard_index(key)].get(key)
+    }
+
+    /// Recompute all shard roots + the combined root.
+    pub fn root(&mut self) -> Hash {
+        let mut roots = [NULL_HASH; SHARD_COUNT];
+        for (i, t) in self.shards.iter_mut().enumerate() {
+            roots[i] = t.root();
+        }
+        shard_tree_root(&roots)
+    }
+
+    /// Apply a block's ops: partition by shard, each shard applies in canonical
+    /// keyHash order (consensus determinism). Returns `(version, combined_root)`.
+    pub fn apply_batch(&mut self, ops: &[(Hash, Option<Vec<u8>>)]) -> (u64, Hash) {
+        let mut per_shard: Vec<Vec<(Hash, Option<Vec<u8>>)>> =
+            (0..SHARD_COUNT).map(|_| Vec::new()).collect();
+        for op in ops {
+            per_shard[shard_index(&op.0)].push(op.clone());
+        }
+        for (i, shard_ops) in per_shard.into_iter().enumerate() {
+            if !shard_ops.is_empty() {
+                self.shards[i].apply_batch(&shard_ops);
+            }
+        }
+        self.version += 1;
+        (self.version, self.root())
+    }
+
+    /// Build a self-contained proof for `key`. Requires a prior `root()`/
+    /// `apply_batch` call (uses cached shard roots).
+    pub fn prove(&self, key: &Hash) -> Option<ShardedTwigProof> {
+        let si = shard_index(key);
+        let inner = self.shards[si].prove(key)?;
+        let mut roots = [NULL_HASH; SHARD_COUNT];
+        for (i, t) in self.shards.iter().enumerate() {
+            roots[i] = t.cached_root();
+        }
+        Some(ShardedTwigProof {
+            shard_index: si as u8,
+            shard_root: roots[si],
+            shard_path: shard_tree_path(&roots, si),
+            inner,
+        })
+    }
+}
+
+/// Verification error for [`ShardedTwigProof`].
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum TwigVerifyError {
+    #[error("proof leaf key does not match the queried key")]
+    KeyMismatch,
+    #[error("shard index {got} does not match queried key's shard {expected}")]
+    WrongShardForKey { expected: u8, got: u8 },
+    #[error("shard index {0} out of range (max 15)")]
+    ShardIndexOutOfRange(u8),
+    #[error("proof verification failed")]
+    VerifyFailed,
+}
+
+/// End-to-end proof: the in-shard twig proof + the shard's depth-4 path to the
+/// combined root. Verifiable from only the combined root (mobile/FFI).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ShardedTwigProof {
+    pub shard_index: u8,
+    pub shard_root: Hash,
+    pub shard_path: [Hash; SHARD_BITS],
+    pub inner: TwigProof,
+}
+
+impl ShardedTwigProof {
+    /// Verify against the combined root (internal consistency only). Use
+    /// [`verify_for_key`](Self::verify_for_key) for untrusted servers.
+    pub fn verify(&self, combined_root: &Hash) -> Result<(), TwigVerifyError> {
+        if self.shard_index as usize >= SHARD_COUNT {
+            return Err(TwigVerifyError::ShardIndexOutOfRange(self.shard_index));
+        }
+        if !self.inner.verify(&self.shard_root) {
+            return Err(TwigVerifyError::VerifyFailed);
+        }
+        let computed = fold_shard_path(self.shard_root, self.shard_index as usize, &self.shard_path);
+        if computed != *combined_root {
+            return Err(TwigVerifyError::VerifyFailed);
+        }
+        Ok(())
+    }
+
+    /// Verify **and bind to a queried key** (audit #11): rejects a proof whose
+    /// leaf key differs from `expected_key` or whose shard does not match
+    /// `expected_key`'s shard — so an untrusted server cannot answer a query for
+    /// key A with a valid proof for an unrelated key B.
+    pub fn verify_for_key(
+        &self,
+        combined_root: &Hash,
+        expected_key: &Hash,
+    ) -> Result<(), TwigVerifyError> {
+        if self.inner.key != *expected_key {
+            return Err(TwigVerifyError::KeyMismatch);
+        }
+        let expected_shard = shard_index(expected_key);
+        if self.shard_index as usize != expected_shard {
+            return Err(TwigVerifyError::WrongShardForKey {
+                expected: expected_shard as u8,
+                got: self.shard_index,
+            });
+        }
+        self.verify(combined_root)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -477,6 +675,50 @@ mod tests {
             root, expected,
             "Rust twig root must match gov5 Go QMDB root for identical input"
         );
+    }
+
+    /// Cross-language: 16-shard combined root for 3000 keys must equal gov5's
+    /// `NewSharded(16)` combined root for the same keyHash-sorted input —
+    /// validates shard split (`key[0]>>4`) + depth-4 fold are byte-faithful.
+    #[test]
+    fn cross_check_sharded16_root_vs_gov5_go() {
+        let mut t = ShardedTwig::new();
+        let ops: Vec<(Hash, Option<Vec<u8>>)> =
+            (0..3000u64).map(|i| (key(i), Some(val(i)))).collect();
+        let (_v, root) = t.apply_batch(&ops);
+        let expected =
+            hex_to_hash("6c20907fdae8d61a9085cb8468e03e47aca130a40ef3628ce90c2c202798a475");
+        assert_eq!(root, expected, "ShardedTwig combined root must match gov5 NewSharded(16)");
+    }
+
+    #[test]
+    fn sharded_prove_verify_and_key_binding() {
+        let mut t = ShardedTwig::new();
+        let ops: Vec<(Hash, Option<Vec<u8>>)> =
+            (0..3000u64).map(|i| (key(i), Some(val(i)))).collect();
+        let (_v, root) = t.apply_batch(&ops);
+
+        for i in [0u64, 1, 500, 1500, 2999] {
+            let p = t.prove(&key(i)).unwrap();
+            assert!(p.verify(&root).is_ok());
+            assert!(p.verify_for_key(&root, &key(i)).is_ok());
+            // #11: a proof for key i must not pass as some other key's answer.
+            let other = key(i.wrapping_add(7));
+            assert_eq!(
+                p.verify_for_key(&root, &other),
+                Err(TwigVerifyError::KeyMismatch)
+            );
+        }
+
+        // #11: tampering shard_index (keeping inner.key) is caught as a shard
+        // mismatch before the fold even runs.
+        let mut p = t.prove(&key(42)).unwrap();
+        let real = shard_index(&key(42)) as u8;
+        p.shard_index = (real + 1) % SHARD_COUNT as u8;
+        assert!(matches!(
+            p.verify_for_key(&root, &key(42)),
+            Err(TwigVerifyError::WrongShardForKey { .. })
+        ));
     }
 
     fn hex_to_hash(s: &str) -> Hash {

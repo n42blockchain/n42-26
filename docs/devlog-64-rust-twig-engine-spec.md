@@ -152,7 +152,21 @@ keyHash-排序 Set 的 root `58671c9a…6526fa` —— canonical 排序不变量
 测试：11 个全过（P1 7 + apply_batch 顺序无关 / compaction 正确性+确定性 / compaction 改 root /
 **sorted-batch Go 对拍**），clippy -D warnings 干净。
 
-后续接 §7 的 P3（16 分片 + #11 key 绑定 proof）→ P4 SIMD → …
+## 8d. P3 完成状态（已落地）
+
+`ShardedTwig`（16 分片 × `TwigTree`，按 `key[0]>>4` 切分，深度-4 merkle 合根）：
+- `apply_batch(ops)`：按 shard 分桶，每片 canonical keyHash 排序应用 → `(version, root)`。
+- `prove(key)` → `ShardedTwigProof`（in-shard twig proof + shard_root + 深度-4 shard_path）。
+- `ShardedTwigProof::verify`（自洽）+ **`verify_for_key`（#11 key+shard 绑定）**：拒绝 inner.key
+  ≠ 期望 key（KeyMismatch）或 shard 不符（WrongShardForKey）—— 堵"用别的账户合法 proof 冒充"。
+- `TwigVerifyError`（KeyMismatch / WrongShardForKey / ShardIndexOutOfRange / VerifyFailed）。
+
+**跨语言一致性（P3）**：3000 keys 的 16 分片 combined root **字节等于** gov5 `NewSharded(16)`
+的 root `6c20907f…98a475` —— 分片切分 + 深度-4 fold 对蓝本忠实。
+
+测试：13 个全过（+ 分片 prove/verify + #11 绑定拒绝 + 分片 Go 对拍），clippy 干净。
+
+后续接 §7 的 P4（SIMD 批量 hash）→ P5（持久化）→ P6（n42-jmt StateDiff 接口 + mobile/FFI + 节点接线）。
 
 ## 9. 风险
 
