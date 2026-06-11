@@ -100,148 +100,24 @@ fn bit(key: &Hash, depth: usize) -> bool {
     (key[depth / 8] >> (7 - (depth % 8))) & 1 == 1
 }
 
-type Link = Option<Box<Node>>;
+/// Index into the [`Sbmt`] node arena; `NIL` marks an empty link.
+type NodeIdx = u32;
+const NIL: NodeIdx = u32::MAX;
 
+/// Arena node. Children are `NodeIdx` into the flat `Sbmt::nodes` Vec rather than
+/// `Box` pointers — this removes per-node heap allocation + allocator overhead and
+/// keeps nodes contiguous for cache locality. The tree structure (and therefore
+/// every root/proof hash) is identical to the previous boxed representation.
 enum Node {
     Leaf {
         key: Hash,
         value_hash: Hash,
     },
     Internal {
-        left: Link,
-        right: Link,
+        left: NodeIdx,
+        right: NodeIdx,
         cache: Cell<Option<Hash>>,
     },
-}
-
-#[inline]
-fn link_hash(link: &Link) -> Hash {
-    match link {
-        None => EMPTY_HASH,
-        Some(node) => match node.as_ref() {
-            Node::Leaf { key, value_hash } => hash_leaf(key, value_hash),
-            Node::Internal {
-                left,
-                right,
-                cache,
-            } => {
-                if let Some(h) = cache.get() {
-                    return h;
-                }
-                let h = hash_internal(&link_hash(left), &link_hash(right));
-                cache.set(Some(h));
-                h
-            }
-        },
-    }
-}
-
-#[inline]
-fn new_internal(left: Link, right: Link) -> Link {
-    Some(Box::new(Node::Internal {
-        left,
-        right,
-        cache: Cell::new(None),
-    }))
-}
-
-fn insert(link: &mut Link, key: Hash, value_hash: Hash, depth: usize) -> bool {
-    match link {
-        None => {
-            *link = Some(Box::new(Node::Leaf { key, value_hash }));
-            true
-        }
-        Some(node) => match node.as_mut() {
-            Node::Leaf {
-                key: ek,
-                value_hash: ev,
-            } => {
-                if *ek == key {
-                    // Same key: update the value hash in place, no reallocation.
-                    *ev = value_hash;
-                    false
-                } else {
-                    // Split: replace this leaf with an internal subtree holding
-                    // both the existing leaf and the new key.
-                    let (ek, ev) = (*ek, *ev);
-                    let mut internal = new_internal(None, None);
-                    descend_insert(&mut internal, ek, ev, depth);
-                    descend_insert(&mut internal, key, value_hash, depth);
-                    *link = internal;
-                    true
-                }
-            }
-            Node::Internal { left, right, cache } => {
-                // Mutate in place: invalidate this node's cached hash and recurse
-                // into the correct child. Avoids the O(depth) Box reallocation of
-                // rebuilding every internal node on the insert path.
-                cache.set(None);
-                if bit(&key, depth) {
-                    insert(right, key, value_hash, depth + 1)
-                } else {
-                    insert(left, key, value_hash, depth + 1)
-                }
-            }
-        },
-    }
-}
-
-fn descend_insert(link: &mut Link, key: Hash, value_hash: Hash, depth: usize) {
-    if let Some(node) = link.as_mut()
-        && let Node::Internal { left, right, cache } = node.as_mut()
-    {
-        cache.set(None);
-        if bit(&key, depth) {
-            insert(right, key, value_hash, depth + 1);
-        } else {
-            insert(left, key, value_hash, depth + 1);
-        }
-    }
-}
-
-fn remove(link: &mut Link, key: &Hash, depth: usize) -> bool {
-    match link.take() {
-        None => false,
-        Some(node) => match *node {
-            Node::Leaf {
-                key: ek,
-                value_hash: ev,
-            } => {
-                if ek == *key {
-                    *link = None;
-                    true
-                } else {
-                    *link = Some(Box::new(Node::Leaf {
-                        key: ek,
-                        value_hash: ev,
-                    }));
-                    false
-                }
-            }
-            Node::Internal {
-                mut left,
-                mut right,
-                ..
-            } => {
-                let removed = if bit(key, depth) {
-                    remove(&mut right, key, depth + 1)
-                } else {
-                    remove(&mut left, key, depth + 1)
-                };
-                *link = collapse(left, right);
-                removed
-            }
-        },
-    }
-}
-
-fn collapse(left: Link, right: Link) -> Link {
-    match (left, right) {
-        (None, None) => None,
-        (Some(l), None) if matches!(l.as_ref(), Node::Leaf { .. }) => Some(l),
-        (None, Some(r)) if matches!(r.as_ref(), Node::Leaf { .. }) => Some(r),
-        (left, right) => new_internal(left, right),
-    }
 }
 
 /// Live-tree node accounting, for benchmarking footprint against other
@@ -264,23 +140,6 @@ impl NodeStats {
     }
 }
 
-fn collect_node_stats(link: &Link, s: &mut NodeStats) {
-    if let Some(node) = link {
-        match node.as_ref() {
-            Node::Leaf { .. } => {
-                s.leaf_nodes += 1;
-                s.serialized_bytes += 32 + 32;
-            }
-            Node::Internal { left, right, .. } => {
-                s.internal_nodes += 1;
-                s.serialized_bytes += 32 + 64;
-                collect_node_stats(left, s);
-                collect_node_stats(right, s);
-            }
-        }
-    }
-}
-
 /// A Sparse Binary Merkle Tree (blake3, 256-bit keys).
 ///
 /// `base_depth` is the bit index the tree starts branching at: keys are assumed
@@ -291,18 +150,30 @@ fn collect_node_stats(link: &Link, s: &mut NodeStats) {
 /// chain for the shard prefix. The leaf still commits the FULL key
 /// (`blake3(0x00 || key || value_hash)`), so the skip changes the commitment
 /// (root) but not its soundness.
-#[derive(Default)]
 pub struct Sbmt {
-    root: Link,
+    /// Flat node arena. Children reference slots by `NodeIdx`; `root == NIL` for
+    /// an empty tree. Cache-friendly and free of per-node heap allocation.
+    nodes: Vec<Node>,
+    /// Recycled arena slots (freed by removes/collapses), reused before growing.
+    free: Vec<NodeIdx>,
+    root: NodeIdx,
     len: usize,
     base_depth: usize,
+}
+
+impl Default for Sbmt {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Sbmt {
     /// Create an empty tree branching from bit 0.
     pub fn new() -> Self {
         Self {
-            root: None,
+            nodes: Vec::new(),
+            free: Vec::new(),
+            root: NIL,
             len: 0,
             base_depth: 0,
         }
@@ -311,7 +182,9 @@ impl Sbmt {
     /// Create an empty tree that skips the first `base_depth` (shared-prefix) bits.
     pub fn with_base_depth(base_depth: usize) -> Self {
         Self {
-            root: None,
+            nodes: Vec::new(),
+            free: Vec::new(),
+            root: NIL,
             len: 0,
             base_depth,
         }
@@ -332,23 +205,133 @@ impl Sbmt {
         self.len == 0
     }
 
+    // ── Arena helpers ──
+
+    #[inline]
+    fn alloc(&mut self, node: Node) -> NodeIdx {
+        if let Some(i) = self.free.pop() {
+            self.nodes[i as usize] = node;
+            i
+        } else {
+            let i = self.nodes.len() as NodeIdx;
+            self.nodes.push(node);
+            i
+        }
+    }
+
+    #[inline]
+    fn free_slot(&mut self, idx: NodeIdx) {
+        if idx != NIL {
+            self.free.push(idx);
+        }
+    }
+
+    fn node_hash(&self, idx: NodeIdx) -> Hash {
+        if idx == NIL {
+            return EMPTY_HASH;
+        }
+        match &self.nodes[idx as usize] {
+            Node::Leaf { key, value_hash } => hash_leaf(key, value_hash),
+            Node::Internal { left, right, cache } => {
+                if let Some(h) = cache.get() {
+                    return h;
+                }
+                let (l, r) = (*left, *right);
+                let h = hash_internal(&self.node_hash(l), &self.node_hash(r));
+                cache.set(Some(h));
+                h
+            }
+        }
+    }
+
+    fn collect_stats(&self, idx: NodeIdx, s: &mut NodeStats) {
+        if idx == NIL {
+            return;
+        }
+        match &self.nodes[idx as usize] {
+            Node::Leaf { .. } => {
+                s.leaf_nodes += 1;
+                s.serialized_bytes += 32 + 32;
+            }
+            Node::Internal { left, right, .. } => {
+                s.internal_nodes += 1;
+                s.serialized_bytes += 32 + 64;
+                let (l, r) = (*left, *right);
+                self.collect_stats(l, s);
+                self.collect_stats(r, s);
+            }
+        }
+    }
+
     /// Walk the live tree and tally internal/leaf node counts + serialized bytes.
     /// O(nodes); intended for diagnostics/benchmarks, not the hot path.
     pub fn node_stats(&self) -> NodeStats {
         let mut s = NodeStats::default();
-        collect_node_stats(&self.root, &mut s);
+        self.collect_stats(self.root, &mut s);
         s
     }
 
     /// Root hash (`EMPTY_HASH` for an empty tree).
     pub fn root_hash(&self) -> Hash {
-        link_hash(&self.root)
+        self.node_hash(self.root)
     }
 
     /// Insert or update a key with a pre-hashed value.
     pub fn insert_hashed(&mut self, key: Hash, value_hash: Hash) {
-        if insert(&mut self.root, key, value_hash, self.base_depth) {
+        let (new_root, added) = self.insert_at(self.root, key, value_hash, self.base_depth);
+        self.root = new_root;
+        if added {
             self.len += 1;
+        }
+    }
+
+    fn insert_at(&mut self, slot: NodeIdx, key: Hash, vh: Hash, depth: usize) -> (NodeIdx, bool) {
+        if slot == NIL {
+            return (self.alloc(Node::Leaf { key, value_hash: vh }), true);
+        }
+        // Peek the node kind, copying out the fields we need, so the immutable
+        // borrow is dropped before the `&mut self` recursion/alloc below.
+        let (is_leaf, ek, ev, l, r) = match &self.nodes[slot as usize] {
+            Node::Leaf { key, value_hash } => (true, *key, *value_hash, NIL, NIL),
+            Node::Internal { left, right, .. } => (false, EMPTY_HASH, EMPTY_HASH, *left, *right),
+        };
+        if is_leaf {
+            if ek == key {
+                // Same key: update the value hash in place.
+                self.nodes[slot as usize] = Node::Leaf { key, value_hash: vh };
+                (slot, false)
+            } else {
+                // Split: turn this slot into an internal node, then re-place the
+                // existing leaf and insert the new key (recursive). Mirrors the
+                // boxed `descend_insert` chain.
+                self.nodes[slot as usize] = Node::Internal {
+                    left: NIL,
+                    right: NIL,
+                    cache: Cell::new(None),
+                };
+                self.insert_at(slot, ek, ev, depth);
+                self.insert_at(slot, key, vh, depth);
+                (slot, true)
+            }
+        } else {
+            // Internal: invalidate cache, recurse into the correct child, write
+            // back the (possibly new) child index.
+            if let Node::Internal { cache, .. } = &self.nodes[slot as usize] {
+                cache.set(None);
+            }
+            if bit(&key, depth) {
+                let (nr, added) = self.insert_at(r, key, vh, depth + 1);
+                if let Node::Internal { right, .. } = &mut self.nodes[slot as usize] {
+                    *right = nr;
+                }
+                (slot, added)
+            } else {
+                let (nl, added) = self.insert_at(l, key, vh, depth + 1);
+                if let Node::Internal { left, .. } = &mut self.nodes[slot as usize] {
+                    *left = nl;
+                }
+                (slot, added)
+            }
         }
     }
 
@@ -359,11 +342,73 @@ impl Sbmt {
 
     /// Remove a key. Returns true if it existed.
     pub fn remove(&mut self, key: &Hash) -> bool {
-        if remove(&mut self.root, key, self.base_depth) {
+        let (new_root, removed) = self.remove_at(self.root, key, self.base_depth);
+        self.root = new_root;
+        if removed {
             self.len -= 1;
-            true
+        }
+        removed
+    }
+
+    fn remove_at(&mut self, slot: NodeIdx, key: &Hash, depth: usize) -> (NodeIdx, bool) {
+        if slot == NIL {
+            return (NIL, false);
+        }
+        let (is_leaf, ek, l, r) = match &self.nodes[slot as usize] {
+            Node::Leaf { key, .. } => (true, *key, NIL, NIL),
+            Node::Internal { left, right, .. } => (false, EMPTY_HASH, *left, *right),
+        };
+        if is_leaf {
+            if ek == *key {
+                self.free_slot(slot);
+                (NIL, true)
+            } else {
+                (slot, false)
+            }
         } else {
-            false
+            let removed = if bit(key, depth) {
+                let (nr, rm) = self.remove_at(r, key, depth + 1);
+                if let Node::Internal { right, cache, .. } = &mut self.nodes[slot as usize] {
+                    *right = nr;
+                    cache.set(None);
+                }
+                rm
+            } else {
+                let (nl, rm) = self.remove_at(l, key, depth + 1);
+                if let Node::Internal { left, cache, .. } = &mut self.nodes[slot as usize] {
+                    *left = nl;
+                    cache.set(None);
+                }
+                rm
+            };
+            let (cl, cr) = match &self.nodes[slot as usize] {
+                Node::Internal { left, right, .. } => (*left, *right),
+                _ => (NIL, NIL),
+            };
+            (self.collapse(slot, cl, cr), removed)
+        }
+    }
+
+    /// Collapse an internal `slot` after a child changed: a single leaf child
+    /// replaces the internal; an all-empty internal becomes empty. A single
+    /// *internal* child is kept wrapped (matches the boxed `collapse`).
+    fn collapse(&mut self, slot: NodeIdx, left: NodeIdx, right: NodeIdx) -> NodeIdx {
+        let l_leaf = left != NIL && matches!(self.nodes[left as usize], Node::Leaf { .. });
+        let r_leaf = right != NIL && matches!(self.nodes[right as usize], Node::Leaf { .. });
+        match (left, right) {
+            (NIL, NIL) => {
+                self.free_slot(slot);
+                NIL
+            }
+            (l, NIL) if l_leaf => {
+                self.free_slot(slot);
+                l
+            }
+            (NIL, r) if r_leaf => {
+                self.free_slot(slot);
+                r
+            }
+            _ => slot,
         }
     }
 
@@ -381,21 +426,21 @@ impl Sbmt {
 
     /// Look up a key's value hash.
     pub fn get(&self, key: &Hash) -> Option<Hash> {
-        let mut link = &self.root;
+        let mut idx = self.root;
         let mut depth = self.base_depth;
         loop {
-            match link {
-                None => return None,
-                Some(node) => match node.as_ref() {
-                    Node::Leaf {
-                        key: ek,
-                        value_hash,
-                    } => return if ek == key { Some(*value_hash) } else { None },
-                    Node::Internal { left, right, .. } => {
-                        link = if bit(key, depth) { right } else { left };
-                        depth += 1;
-                    }
-                },
+            if idx == NIL {
+                return None;
+            }
+            match &self.nodes[idx as usize] {
+                Node::Leaf {
+                    key: ek,
+                    value_hash,
+                } => return if ek == key { Some(*value_hash) } else { None },
+                Node::Internal { left, right, .. } => {
+                    idx = if bit(key, depth) { *right } else { *left };
+                    depth += 1;
+                }
             }
         }
     }
@@ -403,51 +448,46 @@ impl Sbmt {
     /// Generate an inclusion/exclusion proof for `key`.
     pub fn prove(&self, key: Hash) -> BmtProof {
         let mut siblings = Vec::new();
-        let mut link = &self.root;
+        let mut idx = self.root;
         let mut depth = self.base_depth;
         loop {
-            match link {
-                None => {
-                    return BmtProof {
+            if idx == NIL {
+                return BmtProof {
+                    key,
+                    value_hash: None,
+                    siblings,
+                    other_leaf: None,
+                };
+            }
+            let (is_leaf, ek, ev, l, r) = match &self.nodes[idx as usize] {
+                Node::Leaf { key, value_hash } => (true, *key, *value_hash, NIL, NIL),
+                Node::Internal { left, right, .. } => (false, EMPTY_HASH, EMPTY_HASH, *left, *right),
+            };
+            if is_leaf {
+                return if ek == key {
+                    BmtProof {
+                        key,
+                        value_hash: Some(ev),
+                        siblings,
+                        other_leaf: None,
+                    }
+                } else {
+                    BmtProof {
                         key,
                         value_hash: None,
                         siblings,
-                        other_leaf: None,
-                    };
-                }
-                Some(node) => match node.as_ref() {
-                    Node::Leaf {
-                        key: ek,
-                        value_hash,
-                    } => {
-                        return if *ek == key {
-                            BmtProof {
-                                key,
-                                value_hash: Some(*value_hash),
-                                siblings,
-                                other_leaf: None,
-                            }
-                        } else {
-                            BmtProof {
-                                key,
-                                value_hash: None,
-                                siblings,
-                                other_leaf: Some((*ek, *value_hash)),
-                            }
-                        };
+                        other_leaf: Some((ek, ev)),
                     }
-                    Node::Internal { left, right, .. } => {
-                        if bit(&key, depth) {
-                            siblings.push(link_hash(left));
-                            link = right;
-                        } else {
-                            siblings.push(link_hash(right));
-                            link = left;
-                        }
-                        depth += 1;
-                    }
-                },
+                };
             }
+            if bit(&key, depth) {
+                siblings.push(self.node_hash(l));
+                idx = r;
+            } else {
+                siblings.push(self.node_hash(r));
+                idx = l;
+            }
+            depth += 1;
         }
     }
 }

@@ -122,3 +122,88 @@ depth -4 层、proof -128~130B（-13%）、verify 更快；10000 个采样 proof
 
 **待 codex**：consensus-breaking（root 变），需 fresh-genesis E2E + 对抗性复核（真实 RPC
 proof roundtrip、bound verify 正确/错误 address、错 base_depth 拒绝）。
+
+---
+
+## Phase 3：QMDB 实测数据（gov5 `cmd/n42-qmdb-bench`，本机现跑）
+
+gov5 的 `n42-qmdb-bench` 自带 synthetic churn workload（seed `keys` 个 key，再跑 `blocks`
+块、每块覆写 `perblock` 个随机 key），**无需 journal**。in-memory（无磁盘 store），与我们
+in-memory SBMT 同口径。输出：footprint（QMDB entryLog+twigMeta vs JMT all-history）、
+每块 root 时间、compaction、并行 vs 顺序 twig 重算 speedup。
+
+实测（Windows，go 1.25）：
+
+| keys | QMDB footprint | （entryLog / twigMeta / twigs） | JMT all-history | QMDB root/block | JMT root/block | 并行 speedup |
+|------|----------------|--------------------------------|-----------------|-----------------|----------------|--------------|
+| 1M（blocks=2000） | **96.3 MB** | 96.1 / 0.2 MB / 684 | 3452 MB（8.98M nodes） | 118 µs | 2.77 ms | 14.8× |
+| 5M（blocks=500） | **350.9 MB** | 350.2 / 0.7 MB / 2491 | 13933 MB（35.3M nodes） | 213 µs | 3.44 ms | 17.4× |
+
+要点：
+- **QMDB 的树结构内存极小**：twigMeta 仅 0.2 MB(@1M) / 0.7 MB(@5M)；footprint 几乎全是
+  entryLog（flat append KV，8+32+32 B/entry）。对比我们 SBMT 把每个内部节点都堆成 Box，
+  @5M RSS 2.0 GB 里绝大部分是 12.2M 个树节点。
+- **内存对比（in-memory，同口径）@5M**：QMDB 资源结构 ~351 MB vs SBMT RSS ~2018 MB →
+  **QMDB 约省 5.8× 内存**。这就是 QMDB 全部复杂度（twig 滑窗 + 冷存 + compaction）换来的东西。
+- compaction 在此 workload 下 0% reclaimed（纯覆写既有 key，twig 始终 dense，不触发稀疏
+  twig 修剪）；要展示 compaction 收益需带删除的 workload。
+- 每块 root：QMDB 118/213 µs vs SBMT 244/258 µs（apply+root）。同量级，QMDB 略快（但 QMDB 是
+  覆写、SBMT 是插入新 key，workload 不同）。
+- 此 bench **不测 proof**（proof 指标在 `bench_state`）；QMDB proof 仍按结构估计：twig path
+  11×32 + upper log2(twigs)×32，比 SBMT 大。
+
+## 最终对比结论（含实测 QMDB）
+
+| 维度 | SBMT（实测） | QMDB（实测/结构） |
+|------|-------------|-------------------|
+| 内存 @5M | RSS 2.0 GB（全树驻内存，线性） | **~351 MB**（entryLog+twig，约省 5.8×） |
+| 活态磁盘 @5M | snapshot 520 MB | ~351 MB（entryLog；compaction 后更小） |
+| 每块 root @5M | 258 µs（apply+root，插入） | 213 µs（覆写） |
+| proof 生成 | **~3 µs**（内存，快 ~20×） | 含冷读，更慢（结构） |
+| proof 大小 | **580 B**（实链，压缩后） | 更大（twig 11×32 + upper，结构估计） |
+| proof depth | 21–24 | 11 + log2(numTwigs) |
+| 并行 root speedup | 16 分片 | 14.8–17.4×（twig） |
+| 实现复杂度 | 低（单引擎） | 高（twig/compaction/冷存） |
+
+**一句话**：SBMT 在 proof（生成快 20×、更小）和实现简单度上占优；QMDB 在大规模内存
+（省 ~5.8×、有界）上占优。选择取决于状态规模——中小状态 SBMT 全驻内存可接受且 proof 极优；
+超大状态（数千万~亿账户）QMDB 的有界内存才是刚需。
+
+---
+
+## Phase 4：内存优化——arena 扁平节点（学习 QMDB/AlDBaran 紧凑布局）
+
+### 论文对标背景
+
+查证：传说中的 **50M update/s 来自 AlDBaran/Pleiades**（Eclipse Labs，arXiv 2508.10493），
+非"SBMT 论文"（SBMT 是本项目自起名）。谱系 **NOMT(~50k/s) → QMDB(2.28M/s, 2.3 B/entry,
+arXiv 2501.05262) → AlDBaran(48M 无历史 / 24M 带历史 / 60M 峰值，96 核 + 1.5TB DRAM)**。
+我们 SBMT ~0.74M/s、**~400 B/entry**——比 QMDB 内存差 ~170×。关键差距：我们把每个内部节点
+堆成 `Box<Node>`（指针追逐 + 分配器开销），而 QMDB 内存只留 twig root + bitmap（2.3 B/entry）。
+
+借鉴的优秀方法：QMDB twig（2048 叶/twig + append-only log）、AlDBaran 的 thread-sharding
+无锁 / twig buffering / SIMD 16-branch hash / 确定性缓存布局。
+
+### 本次落地：arena 扁平节点（安全，root 不变）
+
+`Sbmt` 由 `Option<Box<Node>>` 链表改为**扁平 `Vec<Node>` + u32 索引**（`NodeIdx`，`NIL`
+哨兵），insert/remove/get/prove/hash 全部改索引递归 + free-list 复用。消除每节点堆分配 +
+分配器开销，节点连续利于缓存。**树结构与所有 root/proof 完全不变**（200+ 单测全过）。
+
+实测：
+
+| 规模 | RSS 前 | RSS 后 | 省 | build 前→后 |
+|------|--------|--------|-----|------------|
+| 1M | 405 MB | 375 MB | ~7% | 1.36→1.37s |
+| 5M | 2018 MB | **1721 MB** | **~15%** | 7.11→7.58s（~6%） |
+
+规模越大省越多（小规模 values map+基础开销占比大）。代价是 ~6% build（arena 多一次
+索引 + Vec 倍增 realloc）。proof/depth 不变。
+
+### 仍未做（更大的内存杠杆）
+
+- **SoA 拆分**（leaf arena + internal arena）：Internal 节点 41B vs 统一 enum 的 68B，
+  预计再省 ~10%。中等改动、root 不变。
+- **QMDB twig 模型**：2048 叶/twig + append-only entry log（可落盘）+ 内存只留 twig
+  root+bitmap → 趋近 2.3 B/entry、有界内存。consensus-breaking + 大重构 + 单独审计。这是
+  把内存从"线性"变"有界"的唯一路。
