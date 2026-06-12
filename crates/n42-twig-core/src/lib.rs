@@ -627,36 +627,79 @@ impl ShardedTwig {
         self.shards[shard_index(key)].get(key)
     }
 
+    /// Pre-reserve capacity (split across shards) so a large batch does not
+    /// realloc the entry log / value arena / index mid-apply — avoids allocator
+    /// contention when applying shards in parallel.
+    pub fn reserve(&mut self, entries: usize, arena_bytes: usize) {
+        let per = entries.div_ceil(SHARD_COUNT);
+        let ab = arena_bytes.div_ceil(SHARD_COUNT);
+        for s in &mut self.shards {
+            s.entries.reserve(per);
+            s.value_arena.reserve(ab);
+            s.index.reserve(per);
+            s.touched.reserve(per);
+        }
+    }
+
     /// Set one key directly (no version bump) — for genesis seeding before the
     /// first block. Call [`root`](Self::root) once after seeding.
     pub fn set(&mut self, key: Hash, value: &[u8]) {
         self.shards[shard_index(&key)].set(key, value);
     }
 
-    /// Recompute all shard roots + the combined root.
+    /// Recompute all shard roots + the combined root. Per-shard work is
+    /// independent → parallel across shards when the `rayon` feature is on.
     pub fn root(&mut self) -> Hash {
-        let mut roots = [NULL_HASH; SHARD_COUNT];
-        for (i, t) in self.shards.iter_mut().enumerate() {
-            roots[i] = t.root();
-        }
-        shard_tree_root(&roots)
+        #[cfg(feature = "rayon")]
+        let roots: Vec<Hash> = {
+            use rayon::prelude::*;
+            self.shards.par_iter_mut().map(|t| t.root()).collect()
+        };
+        #[cfg(not(feature = "rayon"))]
+        let roots: Vec<Hash> = self.shards.iter_mut().map(|t| t.root()).collect();
+        let arr: [Hash; SHARD_COUNT] = roots.try_into().unwrap();
+        shard_tree_root(&arr)
     }
 
     /// Apply a block's ops: partition by shard, each shard applies in canonical
-    /// keyHash order (consensus determinism). Returns `(version, combined_root)`.
+    /// keyHash order (consensus determinism) + folds its root — parallel across
+    /// shards under the `rayon` feature, no locks (each worker owns one shard).
+    /// Returns `(version, combined_root)`.
     pub fn apply_batch(&mut self, ops: &[(Hash, Option<Vec<u8>>)]) -> (u64, Hash) {
         let mut per_shard: Vec<Vec<(Hash, Option<Vec<u8>>)>> =
             (0..SHARD_COUNT).map(|_| Vec::new()).collect();
         for op in ops {
             per_shard[shard_index(&op.0)].push(op.clone());
         }
-        for (i, shard_ops) in per_shard.into_iter().enumerate() {
-            if !shard_ops.is_empty() {
-                self.shards[i].apply_batch(&shard_ops);
-            }
-        }
+        #[cfg(feature = "rayon")]
+        let roots: Vec<Hash> = {
+            use rayon::prelude::*;
+            self.shards
+                .par_iter_mut()
+                .zip(per_shard.into_par_iter())
+                .map(|(shard, shard_ops)| {
+                    if !shard_ops.is_empty() {
+                        shard.apply_batch(&shard_ops);
+                    }
+                    shard.root()
+                })
+                .collect()
+        };
+        #[cfg(not(feature = "rayon"))]
+        let roots: Vec<Hash> = self
+            .shards
+            .iter_mut()
+            .zip(per_shard)
+            .map(|(shard, shard_ops)| {
+                if !shard_ops.is_empty() {
+                    shard.apply_batch(&shard_ops);
+                }
+                shard.root()
+            })
+            .collect();
         self.version += 1;
-        (self.version, self.root())
+        let arr: [Hash; SHARD_COUNT] = roots.try_into().unwrap();
+        (self.version, shard_tree_root(&arr))
     }
 
     /// Serialize the full live state. The append-slot history (entries in slot

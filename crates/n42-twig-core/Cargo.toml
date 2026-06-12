@@ -13,6 +13,13 @@ license.workspace = true
 blake3.workspace = true
 serde.workspace = true
 thiserror.workspace = true
+# Optional: cross-shard parallelism for the builder. OFF by default so mobile/FFI
+# stays zero-dep (it only verifies proofs). n42-jmt enables it.
+rayon = { workspace = true, optional = true }
+
+[features]
+default = []
+rayon = ["dep:rayon"]
 
 [dev-dependencies]
 rand.workspace = true

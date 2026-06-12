@@ -77,10 +77,12 @@ fn main() {
     let parse_s = t.elapsed().as_secs_f64();
     let n = ops.len();
 
-    // Sample keys to keep after `ops` is freed (for proof timing).
+    // All keys kept for proof timing + the update phase (32 B/key harness cost,
+    // noted separately from the engine RSS).
+    let all_keys: Vec<Hash> = ops.iter().map(|o| o.0).collect();
     let samples = env_usize("PROFILE_PROOF_SAMPLES", 10_000).min(n);
     let step = (n / samples.max(1)).max(1);
-    let sample_keys: Vec<Hash> = ops.iter().step_by(step).take(samples).map(|o| o.0).collect();
+    let sample_keys: Vec<Hash> = all_keys.iter().step_by(step).take(samples).copied().collect();
 
     #[cfg(unix)]
     let guard = pprof::ProfilerGuardBuilder::default()
@@ -95,6 +97,42 @@ fn main() {
     let build_s = t.elapsed().as_secs_f64();
     drop(ops); // free the harness ops/clones so RSS reflects the engine only
     let rss = memory_stats::memory_stats().map(|m| m.physical_mem).unwrap_or(0);
+
+    // ── Update phase: overwrite random existing accounts in blocks (the
+    // consensus-relevant + C2-comparable workload). apply_batch parallelizes
+    // across the 16 shards (rayon feature). ──
+    let updates = env_usize("PROFILE_UPDATES", 0);
+    if updates > 0 && n > 0 {
+        let block = env_usize("PROFILE_UPD_BLOCK", 25_000);
+        let mut rng = 0x9e3779b97f4a7c15u64;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        tree.reserve(updates, updates * 72); // avoid realloc contention mid-apply
+        let mut done = 0usize;
+        let t = Instant::now();
+        while done < updates {
+            let cnt = block.min(updates - done);
+            let mut ops: Vec<(Hash, Option<Vec<u8>>)> = Vec::with_capacity(cnt);
+            for _ in 0..cnt {
+                let key = all_keys[(next() as usize) % n];
+                let mut value = vec![0u8; 72];
+                value[..8].copy_from_slice(&next().to_le_bytes());
+                ops.push((key, Some(value)));
+            }
+            tree.apply_batch(&ops);
+            done += cnt;
+        }
+        let upd_s = t.elapsed().as_secs_f64();
+        println!(
+            "updates:   {updates} ops in blocks of {block}: {:.2}s ({:.0} upd/s)",
+            upd_s,
+            updates as f64 / upd_s
+        );
+    }
 
     // ── Proof sampling on real keys. ──
     let mut gen_us = 0.0f64;
