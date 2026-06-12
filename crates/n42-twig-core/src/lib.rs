@@ -345,20 +345,23 @@ impl TwigTree {
     /// by key makes the root independent of the input order. Keys within a block
     /// are expected unique (the `StateDiff`/sharded layer guarantees this).
     pub fn apply_batch(&mut self, ops: &[(Hash, Option<Vec<u8>>)]) {
+        let refs: Vec<(Hash, Option<&[u8]>)> = ops.iter().map(|(k, v)| (*k, v.as_deref())).collect();
         let mut order: Vec<usize> = (0..ops.len()).collect();
-        self.apply_batch_indexed(ops, &mut order);
+        self.apply_batch_indexed(&refs, &mut order);
     }
 
-    /// Like [`apply_batch`](Self::apply_batch) but over caller-provided op
-    /// indices (sorted in place) — lets the sharded layer partition a block by
-    /// index instead of cloning every op's value into per-shard Vecs.
-    pub fn apply_batch_indexed(&mut self, ops: &[(Hash, Option<Vec<u8>>)], order: &mut [usize]) {
+    /// Like [`apply_batch`](Self::apply_batch) but over BORROWED values and
+    /// caller-provided op indices (sorted in place). Values are borrowed slices —
+    /// the profiled hot spot was the per-op `Vec<u8>` forced by an owned API
+    /// (RtlFree/AllocateHeap ≈ 15% of update time) — and the index partition lets
+    /// the sharded layer split a block without cloning anything.
+    pub fn apply_batch_indexed(&mut self, ops: &[(Hash, Option<&[u8]>)], order: &mut [usize]) {
         order.sort_by_key(|&i| ops[i].0);
         // Pass 0: SIMD-batch the leaf hashes of every Set op up front (16-way on
         // AVX-512). Safe to precompute: leaf hash depends only on (key, value).
         let jobs: Vec<(&Hash, &[u8])> = order
             .iter()
-            .filter_map(|&i| ops[i].1.as_ref().map(|v| (&ops[i].0, v.as_slice())))
+            .filter_map(|&i| ops[i].1.map(|v| (&ops[i].0, v)))
             .collect();
         let mut leaf_hashes = vec![NULL_HASH; jobs.len()];
         simd::hash_leaves(&jobs, &mut leaf_hashes);
@@ -371,7 +374,7 @@ impl TwigTree {
             if let Some(&j) = order.get(k + PREFETCH_AHEAD) {
                 self.index.prefetch(Self::prefix(&ops[j].0));
             }
-            match &ops[i].1 {
+            match ops[i].1 {
                 Some(v) => {
                     self.set_with_leaf(ops[i].0, v, leaf_hashes[next_leaf]);
                     next_leaf += 1;
@@ -732,6 +735,14 @@ impl ShardedTwig {
     /// shards under the `rayon` feature, no locks (each worker owns one shard).
     /// Returns `(version, combined_root)`.
     pub fn apply_batch(&mut self, ops: &[(Hash, Option<Vec<u8>>)]) -> (u64, Hash) {
+        let refs: Vec<(Hash, Option<&[u8]>)> = ops.iter().map(|(k, v)| (*k, v.as_deref())).collect();
+        self.apply_batch_refs(&refs)
+    }
+
+    /// Borrowed-value variant of [`apply_batch`](Self::apply_batch) — callers that
+    /// stage a block's values in a reusable buffer avoid the per-op `Vec<u8>`
+    /// allocations the owned API forces (the profiled allocator hot spot).
+    pub fn apply_batch_refs(&mut self, ops: &[(Hash, Option<&[u8]>)]) -> (u64, Hash) {
         // Partition by op INDEX — no value clones (a block's values can be MBs).
         let mut per_shard: Vec<Vec<usize>> = (0..SHARD_COUNT).map(|_| Vec::new()).collect();
         for (i, op) in ops.iter().enumerate() {

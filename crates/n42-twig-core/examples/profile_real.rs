@@ -112,18 +112,23 @@ fn main() {
             rng
         };
         tree.reserve(updates, updates * 72); // avoid realloc contention mid-apply
+        // Stage each block's values in one reusable buffer + pass borrowed slices
+        // (the owned API's per-op Vec<u8> was the profiled allocator hot spot).
+        let mut valbuf = vec![0u8; block * 72];
+        let mut keys: Vec<Hash> = Vec::with_capacity(block);
         let mut done = 0usize;
         let t = Instant::now();
         while done < updates {
             let cnt = block.min(updates - done);
-            let mut ops: Vec<(Hash, Option<Vec<u8>>)> = Vec::with_capacity(cnt);
-            for _ in 0..cnt {
-                let key = all_keys[(next() as usize) % n];
-                let mut value = vec![0u8; 72];
-                value[..8].copy_from_slice(&next().to_le_bytes());
-                ops.push((key, Some(value)));
+            keys.clear();
+            for c in 0..cnt {
+                keys.push(all_keys[(next() as usize) % n]);
+                valbuf[c * 72..c * 72 + 8].copy_from_slice(&next().to_le_bytes());
             }
-            tree.apply_batch(&ops);
+            let ops: Vec<(Hash, Option<&[u8]>)> = (0..cnt)
+                .map(|c| (keys[c], Some(&valbuf[c * 72..(c + 1) * 72])))
+                .collect();
+            tree.apply_batch_refs(&ops);
             done += cnt;
         }
         let upd_s = t.elapsed().as_secs_f64();

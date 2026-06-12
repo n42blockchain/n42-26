@@ -73,23 +73,39 @@ impl TwigState {
     }
 
     /// Apply a block's `StateDiff`. Returns `(new_version, combined_root)`.
+    ///
+    /// Values are staged in one per-block arena and passed as borrowed slices
+    /// (`apply_batch_refs`) — the per-op `Vec<u8>` of an owned-value API was a
+    /// profiled allocator hot spot.
     pub fn apply_diff(&mut self, diff: &StateDiff) -> (u64, B256) {
-        let ops = self.prepare(diff);
-        let (version, root) = self.inner.apply_batch(&ops);
+        let (meta, buf) = self.prepare(diff);
+        let ops: Vec<(Hash, Option<&[u8]>)> = meta
+            .iter()
+            .map(|(k, r)| (*k, r.map(|(o, l)| &buf[o..o + l])))
+            .collect();
+        let (version, root) = self.inner.apply_batch_refs(&ops);
         (version, B256::from(root))
     }
 
-    /// Flatten a `StateDiff` into `(key, Option<value>)` ops (mirrors
-    /// [`crate::ShardedSbmt`]'s prepare; `code_hash` read back from the unified KV).
-    fn prepare(&self, diff: &StateDiff) -> Vec<(Hash, Option<Vec<u8>>)> {
-        let mut ops: Vec<(Hash, Option<Vec<u8>>)> = Vec::new();
+    /// Flatten a `StateDiff` into per-op `(key, Option<(offset, len)>)` metadata
+    /// plus one flat value arena (mirrors [`crate::ShardedSbmt`]'s prepare;
+    /// `code_hash` read back from the unified KV).
+    #[allow(clippy::type_complexity)]
+    fn prepare(&self, diff: &StateDiff) -> (Vec<(Hash, Option<(usize, usize)>)>, Vec<u8>) {
+        let mut meta: Vec<(Hash, Option<(usize, usize)>)> = Vec::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let push_val = |buf: &mut Vec<u8>, v: &[u8]| {
+            let off = buf.len();
+            buf.extend_from_slice(v);
+            Some((off, v.len()))
+        };
         for (address, account_diff) in &diff.accounts {
             let key = account_key(address).0;
             match account_diff.change_type {
                 AccountChangeType::Destroyed => {
-                    ops.push((key, None));
+                    meta.push((key, None));
                     for slot in account_diff.storage.keys() {
-                        ops.push((storage_key(address, slot).0, None));
+                        meta.push((storage_key(address, slot).0, None));
                     }
                 }
                 AccountChangeType::Created | AccountChangeType::Modified => {
@@ -99,19 +115,22 @@ impl TwigState {
                         Some(change) => change.to.unwrap_or(EMPTY_CODE_HASH),
                         None => self.inner.get(&key).map(decode_code_hash).unwrap_or(EMPTY_CODE_HASH),
                     };
-                    ops.push((key, Some(encode_account_value(&balance, nonce, &code_hash))));
+                    let v = encode_account_value(&balance, nonce, &code_hash);
+                    let r = push_val(&mut buf, &v);
+                    meta.push((key, r));
                     for (slot, change) in &account_diff.storage {
                         let skey = storage_key(address, slot).0;
                         if change.to.is_zero() {
-                            ops.push((skey, None));
+                            meta.push((skey, None));
                         } else {
-                            ops.push((skey, Some(change.to.to_be_bytes::<32>().to_vec())));
+                            let r = push_val(&mut buf, &change.to.to_be_bytes::<32>());
+                            meta.push((skey, r));
                         }
                     }
                 }
             }
         }
-        ops
+        (meta, buf)
     }
 
     /// Build a key-bindable proof for a derived `key` (requires a prior root call).

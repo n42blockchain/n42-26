@@ -160,6 +160,61 @@ SipHash）；RSS 持平略降（引擎 ~245MB）。root 不变（19 测试含 go
 单线程 1.17M 更新已是诚实口径。剩余杠杆：leaf hash（hash_leaf 2-block）批量 SIMD、
 deactivate 旧 slot 的 twig 叶写预取。
 
+## 采样诊断（samply/ETW，pprof 的 Windows 等价）+ 第三轮优化
+
+WSL 未装（pprof-rs unix-only），改用 **samply 0.13（ETW 采样）**：
+`samply record --save-only --unstable-presymbolicate -o profile.json.gz ./profile_real.exe`，
+3M 更新 workload，解析 Firefox-profiler JSON 取 self-time 热点。另加 `[profile.profiling]`
+（inherits release + debug 符号）供采样。
+
+**诊断发现（决定性）**：`RtlFreeHeap` 7.5% self-time + 对应 alloc ≈ **分配器是第一热点**。
+根因：`ops: &[(Hash, Option<Vec<u8>>)]` API **强制每 op 一个 owned Vec<u8>** —— 3M 更新 =
+300 万次 malloc/free（调用方构造 + apply 后 drop）。
+
+**修复（第三轮，全部 root 不变）**：
+1. **借用 API**：核心改为 `apply_batch_refs(&[(Hash, Option<&[u8]>)])` / `apply_batch_indexed`
+   借用版（owned 版保留为兼容壳）。
+2. **TwigState::prepare 改 arena**：StateDiff 展平为 (key, (off,len)) 元数据 + 单一 value
+   arena，借用切片直通引擎 —— 节点真实路径同样零 per-op 分配。
+3. example harness 同步（块级复用 buffer）。
+
+实测：更新 **1.5M → ~1.8M upd/s（再 +25%）**。复采确认 heap self-time 绝对量大降
+（残余 ~7% 为每块工作 Vec —— jobs/leaf_hashes/per_shard/借用数组，scratch 复用可再压，边际）。
+
+## 最终总账（1M 真实主网账户，单线程，root 全程不变，gov5 字节对拍全程通过）
+
+| 阶段 | build | 400K 更新 |
+|------|-------|-----------|
+| 初版 | 750k accts/s | 533k upd/s |
+| 算法四连（arena/index/fold/buffering） | 1.89M | 687k |
+| + AVX-512/AVX2 node SIMD | 1.96M | 812k |
+| + FlatIndex + prefetch | 2.17M | 1.17M |
+| + 索引分桶（去 clone）+ leaf SIMD | ~4.4M | ~1.5M |
+| **+ 借用 API（去分配）** | **~4.4M** | **~1.8M** |
+| **累计** | **5.9×** | **3.4×** |
+
+vs C2 Go：单树 build 超 2.6×（4.4M vs 1.71M）；Go 16 分片 AVX-512 7.99M 为 16 核并行数，
+我们单线程 1.8M（并行已实测内存绑定无收益，口径不同）。
+
+## 全局优化清单（整体视角，按 ROI 排序）
+
+**引擎内（边际收益递减，可选）**
+- 每块工作 Vec scratch 复用（heap 残余 ~7% → ~2%）
+- deactivate 旧 slot 的 twig 叶行预取（随机写 miss）
+- proof 生成路径（非热，按需）
+
+**引擎外 / 系统级（真实节点路径上的下一批大杠杆）**
+- **key 派生 SIMD**：`account_key = blake3(domain‖addr)` 是 <64B 单块 —— 与 node kernel 同构，
+  可直接 16-way 批量！prepare 阶段每 op 一次派生（曾测占 SBMT 更新 17%），落在 n42-jmt 桥接层。
+- **PersistentTwig WAL**（P6）：块级 fsync 摊销 / 组提交。
+- snapshot 序列化：大状态 bincode 可分 shard 并行 + 增量。
+- upper 树增量折叠：十亿级 twig 才需要（当前 31 twig/shard 全量重建微不足道）。
+- 流水线并行（架构级）：节点上 EVM 执行与上一块树更新重叠 —— 单 workload 内存绑定，
+  但执行/哈希异质负载可并行。
+
+**内存（按需）**
+- FlatIndex 负载因子/容量策略调优；twig 叶驱逐（仅当放弃全 DRAM 路线时，QMDB tier-2）。
+
 ## 结论与后续
 
 - twig 全-DRAM @1M 真实账户 **280 B/acct**，比 SBMT 省 25%。但距 AlDBaran/QMDB ~100 B/acct
