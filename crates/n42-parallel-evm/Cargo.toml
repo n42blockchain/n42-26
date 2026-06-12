@@ -27,3 +27,5 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
+[[example]]
+name = "parallel_profile"

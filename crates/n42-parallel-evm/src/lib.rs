@@ -106,6 +106,22 @@ where
         None => None,
     };
 
+    // Worker count. Block-STM's in-order validation is partly serial, so idle
+    // workers spin/contend on the shared scheduler atoms; past a point adding
+    // threads makes cheap-tx blocks SLOWER (measured: 32 workers ~4x slower than
+    // 4 on plain transfers). Cap to a sane default; raise N42_PARALLEL_WORKERS on
+    // contract-heavy chains where per-tx work amortizes the coordination cost.
+    // See `docs/devlog-67`.
+    let num_workers = {
+        let cores = rayon::current_num_threads();
+        let cap = std::env::var("N42_PARALLEL_WORKERS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&w| w > 0)
+            .unwrap_or_else(|| cores.min(8));
+        cap.min(cores).min(num_txs).max(1)
+    };
+
     let start = std::time::Instant::now();
     let mv = MvMemory::new();
     let scheduler = Scheduler::new(num_txs);
@@ -121,7 +137,6 @@ where
         round += 1;
 
         rayon::scope(|s| {
-            let num_workers = rayon::current_num_threads().min(num_txs);
             for _ in 0..num_workers {
                 s.spawn(|_| {
                     worker_loop(

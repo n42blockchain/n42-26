@@ -83,3 +83,36 @@ deferred 并行的**每个账户余额**(含 coinbase 费总额 `200×21000×7`)
 
 修复 1/2/3/4 全部落地,结果与顺序执行逐账户一致(对拍测试),parallel-evm 4 测试 + clippy 绿。
 全局优化 #3 完成。
+
+## 修复 5:调度竞争 + worker 数(samply 驱动)
+
+deferred coinbase 消除级联后,profile 并行路径(`examples/parallel_profile.rs`,5000 独立转账,
+samply/ETW)发现 **40% 线程空转 + 线程越多越慢**:
+
+| RAYON 线程 | us/tx(优化前) |
+|-----------|---------------|
+| 2 | 4.72 |
+| 4 | 4.99 |
+| 8 | 9.49 |
+| 32 | **21.4(4x 更差)** |
+
+根因是共享调度原子的 cache-line 竞争 + in-order validation 的串行自旋。三个 micro-fix(全部
+降低竞争,所有线程数受益):
+1. **redo 队列免锁快路径**:`redo_len` 原子,空队列(无冲突常态)直接返回,不 lock mutex —
+   原来每次 `try_get_task` 都锁。
+2. **删 `active_workers`**:该字段只 fetch_add/sub 从不被读 —— 纯死竞争(每 task 两次共享 RMW),
+   直接移除。
+3. **`exec_cursor` 改 `fetch_add`**:原 CAS load/compare 循环在 32 线程下重试风暴;wait-free
+   fetch_add 单次原子,溢出 num_txs 的认领忽略即可。
+
+但 8+ 线程仍崩 —— in-order validation 的串行性是 Block-STM 结构性限制(idle worker 自旋等
+val_cursor 推进),需重写(并行 validation / work-stealing)才能根治。
+
+**worker 数旋钮**:cheap-tx 块的协调开销摊不平,加 `N42_PARALLEL_WORKERS`(默认
+`min(cores, 8)`,避开 32 线程灾难;合约重链可调高)。实测默认 8.9 us/tx vs 未限 32 的
+19.7 us/tx(2.2x),WORKERS=4 最优 4.66。**真实块最优 worker 数需 testnet 标定。**
+
+> 诚实结论:trivial 转账块即使最优 worker 数,par(~4.6us/tx)也仅 ≈ seq(~5us)—— 每笔
+> ~1us 工作量摊不平并行协调,这是 Amdahl/内存带宽下限,非 bug。真正受益的是合约重块(每笔
+> 工作量大),而那些块没有 deferred coinbase 会被级联打死 —— 所以 deferred(修复4)是前提,
+> 调度调优(修复5)是边际。后续可做:并行 validation 重写 + 按 gas 估算自适应 worker 数。
