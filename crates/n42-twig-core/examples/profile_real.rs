@@ -93,7 +93,7 @@ fn main() {
     // ── Build (genesis load): one canonical apply_batch over all accounts. ──
     let mut tree = ShardedTwig::new();
     let t = Instant::now();
-    let (_ver, root) = tree.apply_batch(&ops);
+    let (_ver, _build_root) = tree.apply_batch(&ops);
     let build_s = t.elapsed().as_secs_f64();
     drop(ops); // free the harness ops/clones so RSS reflects the engine only
     let rss = memory_stats::memory_stats().map(|m| m.physical_mem).unwrap_or(0);
@@ -134,7 +134,9 @@ fn main() {
         );
     }
 
-    // ── Proof sampling on real keys. ──
+    // ── Proof sampling on real keys (against the CURRENT root — the update
+    // phase above changes it). ──
+    let root = tree.root();
     let mut gen_us = 0.0f64;
     let mut ver_us = 0.0f64;
     let mut sizes = 0usize;

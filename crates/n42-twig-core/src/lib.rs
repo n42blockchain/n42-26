@@ -10,9 +10,10 @@
 //! Ported from gov5 `lib/qmdb` (Go); P1 is scalar + all-in-DRAM (no SSD entry-log,
 //! no eviction tiers, no compaction yet — those are P2+).
 
-use std::collections::HashMap;
-
+mod flat;
 mod simd;
+
+use flat::FlatIndex;
 pub use simd::kernel_name as simd_kernel_name;
 
 /// 32-byte hash / key.
@@ -196,7 +197,7 @@ pub struct TwigTree {
     // collision can never return a wrong value. Halves the key bytes vs storing
     // the full 32-byte key, and the index never feeds the root (the tree commits
     // full keys in its leaves), so this is purely a memory/throughput choice.
-    index: HashMap<u128, u64>,
+    index: FlatIndex,
     next_slot: u64,
     /// Slots whose leaves changed since the last `root()` — drives the per-twig
     /// eager-fold vs full-recompute choice.
@@ -219,7 +220,7 @@ impl TwigTree {
             entries: Vec::new(),
             value_arena: Vec::new(),
             twigs: Vec::new(),
-            index: HashMap::new(),
+            index: FlatIndex::new(),
             next_slot: 0,
             touched: Vec::new(),
             null_level: null_level(),
@@ -245,8 +246,7 @@ impl TwigTree {
     #[inline]
     fn lookup(&self, key: &Hash) -> Option<u64> {
         self.index
-            .get(&Self::prefix(key))
-            .copied()
+            .get(Self::prefix(key))
             .filter(|&slot| &self.entries[slot as usize].key == key)
     }
 
@@ -256,7 +256,7 @@ impl TwigTree {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.index.is_empty()
+        self.index.len() == 0
     }
 
     /// Total slots ever appended (the append-history length).
@@ -320,7 +320,7 @@ impl TwigTree {
     /// Delete `key`. Returns whether it was present.
     pub fn delete(&mut self, key: &Hash) -> bool {
         if let Some(slot) = self.lookup(key) {
-            self.index.remove(&Self::prefix(key));
+            self.index.remove(Self::prefix(key));
             self.deactivate(slot);
             true
         } else {
@@ -341,7 +341,14 @@ impl TwigTree {
     pub fn apply_batch(&mut self, ops: &[(Hash, Option<Vec<u8>>)]) {
         let mut order: Vec<usize> = (0..ops.len()).collect();
         order.sort_by_key(|&i| ops[i].0);
-        for i in order {
+        // Software-prefetch the index bucket a few ops ahead: each op's first
+        // dependent load is its (randomly located) index bucket, so issuing the
+        // line early overlaps the DRAM miss with the current op's hashing.
+        const PREFETCH_AHEAD: usize = 12;
+        for (k, &i) in order.iter().enumerate() {
+            if let Some(&j) = order.get(k + PREFETCH_AHEAD) {
+                self.index.prefetch(Self::prefix(&ops[j].0));
+            }
             match &ops[i].1 {
                 Some(v) => self.set(ops[i].0, v),
                 None => {
