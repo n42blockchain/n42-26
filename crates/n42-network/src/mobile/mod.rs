@@ -1,3 +1,4 @@
+pub(crate) mod receipt_batch;
 pub mod session;
 pub mod sharded_hub;
 pub mod star_hub;
