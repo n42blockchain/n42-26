@@ -12,6 +12,9 @@
 
 use std::collections::HashMap;
 
+mod simd;
+pub use simd::kernel_name as simd_kernel_name;
+
 /// 32-byte hash / key.
 pub type Hash = [u8; 32];
 
@@ -85,9 +88,9 @@ impl Twig {
 
     /// Batch-fold the union of several changed leaves' paths, computing each
     /// internal node **once** (twig buffering): process level by level, dedup the
-    /// parents, hash each. For K changed leaves this is ~union-of-paths hashes vs
-    /// K×11 for per-leaf folding — a big win when many leaves in one twig change
-    /// in a block. `scratch` is a reusable buffer to avoid per-call allocation.
+    /// parents, then hash the whole level with the batched SIMD kernel. For K
+    /// changed leaves this is ~union-of-paths hashes vs K×11 for per-leaf folding.
+    /// `scratch` is a reusable buffer to avoid per-call allocation.
     fn fold_batch(&mut self, locals: &[usize], scratch: &mut Vec<usize>) {
         if locals.is_empty() {
             return;
@@ -99,29 +102,35 @@ impl Twig {
         // Fold up level by level until the root (node 1).
         let mut level = std::mem::take(scratch);
         while level[0] > 1 {
-            // Recompute each distinct parent of this (sorted) level exactly once;
-            // sibling pairs share a parent and are adjacent, so `p != last` dedups.
+            // Distinct parents of this (sorted) level; sibling pairs share a
+            // parent and are adjacent, so `p != last` dedups in place.
             let mut w = 0usize;
             let mut last = usize::MAX;
             for r in 0..level.len() {
                 let p = level[r] >> 1;
                 if p != last {
-                    self.nodes[p] = hash_node(&self.nodes[2 * p], &self.nodes[2 * p + 1]);
                     level[w] = p;
                     w += 1;
                     last = p;
                 }
             }
             level.truncate(w);
+            // One level = disjoint reads (children) / writes (parents) → batchable.
+            simd::hash_parents(&mut self.nodes[..], &level);
         }
         *scratch = level;
     }
 
-    /// Full bottom-up recompute of all 2047 internal nodes. Cheaper than per-leaf
-    /// folding once a twig has many changed leaves this batch (the dense/genesis case).
-    fn recompute(&mut self) {
-        for j in (1..TWIG_SIZE).rev() {
-            self.nodes[j] = hash_node(&self.nodes[2 * j], &self.nodes[2 * j + 1]);
+    /// Full bottom-up recompute of all 2047 internal nodes, whole levels at a
+    /// time so the SIMD kernel gets full batches (level L's parents are the
+    /// contiguous range `[L_start, 2*L_start)` with children one level below).
+    fn recompute(&mut self, scratch: &mut Vec<usize>) {
+        let mut start = TWIG_SIZE / 2;
+        while start >= 1 {
+            scratch.clear();
+            scratch.extend(start..2 * start);
+            simd::hash_parents(&mut self.nodes[..], scratch);
+            start /= 2;
         }
     }
 
@@ -457,7 +466,7 @@ impl TwigTree {
                 let twig = &mut self.twigs[twig_id];
                 if twig.dirty {
                     if count * TWIG_HEIGHT >= TWIG_SIZE {
-                        twig.recompute();
+                        twig.recompute(&mut fold_scratch);
                     } else {
                         fold_locals.clear();
                         for k in i..j {
