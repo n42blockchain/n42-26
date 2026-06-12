@@ -159,13 +159,12 @@ fn main() {
     }
 
     #[cfg(unix)]
-    if let Some(g) = guard {
-        if let Ok(report) = g.report().build() {
-            if let Ok(f) = std::fs::File::create("twig_flamegraph.svg") {
-                let _ = report.flamegraph(f);
-                eprintln!("wrote twig_flamegraph.svg");
-            }
-        }
+    if let Some(g) = guard
+        && let Ok(report) = g.report().build()
+        && let Ok(f) = std::fs::File::create("twig_flamegraph.svg")
+    {
+        let _ = report.flamegraph(f);
+        eprintln!("wrote twig_flamegraph.svg");
     }
 
     println!("\n=== twig engine on REAL mainnet accounts ===");

@@ -21,10 +21,12 @@ use crate::sharded::ShardedJmt;
 use crate::sharded_bmt::ShardedSbmt;
 use crate::snapshot::{JmtSnapshot, load_snapshot, save_snapshot};
 use crate::store::MemTreeStore;
+use crate::twig::TwigState;
 
 use alloy_primitives::B256;
 use jmt::Version;
 use n42_execution::state_diff::StateDiff;
+use n42_twig_core::TwigSnapshot;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -192,6 +194,69 @@ fn read_wal_entries(path: &Path) -> eyre::Result<Vec<(u64, StateDiff)>> {
         off = start + len;
     }
     Ok(entries)
+}
+
+fn twig_snapshot_entry_count(snapshot: &TwigSnapshot) -> usize {
+    snapshot.shards.iter().map(|s| s.entries.len()).sum()
+}
+
+fn save_twig_snapshot(path: &Path, snapshot: &TwigSnapshot) -> eyre::Result<()> {
+    let start = std::time::Instant::now();
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let raw = bincode::serialize(snapshot)?;
+    let compressed = zstd::bulk::compress(&raw, 3)?;
+    let tmp_path = path.with_extension("tmp");
+    {
+        let mut f = File::create(&tmp_path)?;
+        f.write_all(&compressed)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp_path, path)?;
+    #[cfg(unix)]
+    if let Some(parent) = path.parent()
+        && let Ok(dir) = File::open(parent)
+    {
+        let _ = dir.sync_all();
+    }
+
+    let elapsed_ms = start.elapsed().as_millis();
+    tracing::info!(
+        target: "n42::jmt",
+        version = snapshot.version,
+        entries = twig_snapshot_entry_count(snapshot),
+        raw_kb = raw.len() / 1024,
+        compressed_kb = compressed.len() / 1024,
+        elapsed_ms,
+        path = %path.display(),
+        "Twig snapshot saved"
+    );
+    Ok(())
+}
+
+fn load_twig_snapshot(path: &Path) -> eyre::Result<Option<TwigSnapshot>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let start = std::time::Instant::now();
+    let compressed = std::fs::read(path)?;
+    let raw = zstd::stream::decode_all(&compressed[..])?;
+    let snapshot: TwigSnapshot = bincode::deserialize(&raw)?;
+    let elapsed_ms = start.elapsed().as_millis();
+
+    tracing::info!(
+        target: "n42::jmt",
+        version = snapshot.version,
+        entries = twig_snapshot_entry_count(&snapshot),
+        elapsed_ms,
+        path = %path.display(),
+        "Twig snapshot loaded"
+    );
+    Ok(Some(snapshot))
 }
 
 impl PersistentSbmt {
@@ -374,6 +439,183 @@ impl Drop for PersistentSbmt {
     }
 }
 
+/// In-memory [`TwigState`] with snapshot + write-ahead-log durability.
+///
+/// Mirrors [`PersistentSbmt`]'s crash-recovery contract for the twig engine:
+/// every committed block is appended to a durable WAL before in-memory mutation,
+/// periodic snapshots checkpoint the full append-slot history, and recovery
+/// replays only strictly contiguous WAL records newer than the snapshot.
+pub struct PersistentTwig {
+    inner: TwigState,
+    snapshot_path: PathBuf,
+    wal_path: PathBuf,
+    wal: File,
+    snapshot_interval: u64,
+    last_snapshot_version: u64,
+    pending_flush: Option<JoinHandle<eyre::Result<()>>>,
+}
+
+impl PersistentTwig {
+    /// Open a persistent twig state tree, restoring from snapshot + WAL if present.
+    pub fn open(snapshot_path: impl AsRef<Path>, snapshot_interval: u64) -> eyre::Result<Self> {
+        let snapshot_path = snapshot_path.as_ref().to_path_buf();
+        let wal_path = snapshot_path.with_extension("wal");
+        let (mut inner, last_snapshot_version) = match load_twig_snapshot(&snapshot_path)? {
+            Some(snap) => {
+                let version = snap.version;
+                (TwigState::from_snapshot(&snap), version)
+            }
+            None => (TwigState::new(), 0),
+        };
+
+        let mut replayed = 0u64;
+        for (version, diff) in read_wal_entries(&wal_path)? {
+            let expected = inner.version() + 1;
+            if version < expected {
+                continue;
+            }
+            if version != expected {
+                return Err(eyre::eyre!(
+                    "Twig WAL is non-contiguous: expected version {expected}, found {version}; \
+                     refusing to replay to avoid silent state corruption"
+                ));
+            }
+            inner.apply_diff(&diff);
+            replayed += 1;
+        }
+        if replayed > 0 {
+            tracing::info!(
+                target: "n42::jmt",
+                replayed,
+                version = inner.version(),
+                "replayed Twig WAL on open"
+            );
+        }
+
+        let wal = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&wal_path)?;
+
+        Ok(Self {
+            inner,
+            snapshot_path,
+            wal_path,
+            wal,
+            snapshot_interval: snapshot_interval.max(1),
+            last_snapshot_version,
+            pending_flush: None,
+        })
+    }
+
+    /// Current global version.
+    pub fn version(&self) -> u64 {
+        self.inner.version()
+    }
+
+    /// Combined root hash across all twig shards.
+    pub fn root_hash(&mut self) -> B256 {
+        self.inner.root()
+    }
+
+    /// Borrow the underlying in-memory twig state tree.
+    pub fn inner(&self) -> &TwigState {
+        &self.inner
+    }
+
+    /// Mutable access to the underlying tree, for genesis seeding at version 0 only.
+    pub fn inner_mut(&mut self) -> &mut TwigState {
+        &mut self.inner
+    }
+
+    /// The version most recently persisted to a snapshot.
+    pub fn last_snapshot_version(&self) -> u64 {
+        self.last_snapshot_version
+    }
+
+    /// Apply a `StateDiff`, triggering a durable checkpoint on snapshot interval.
+    pub fn apply_diff(&mut self, diff: &StateDiff) -> eyre::Result<(u64, B256)> {
+        let next_version = self.inner.version() + 1;
+        self.append_wal(next_version, diff)?;
+        let (version, root) = self.inner.apply_diff(diff);
+        debug_assert_eq!(version, next_version);
+        if version.saturating_sub(self.last_snapshot_version) >= self.snapshot_interval {
+            self.flush()?;
+        }
+        Ok((version, root))
+    }
+
+    fn append_wal(&mut self, version: u64, diff: &StateDiff) -> eyre::Result<()> {
+        let bytes = bincode::serialize(diff)?;
+        self.wal.write_all(&version.to_le_bytes())?;
+        self.wal.write_all(&(bytes.len() as u32).to_le_bytes())?;
+        self.wal.write_all(&bytes)?;
+        self.wal.sync_data()?;
+        Ok(())
+    }
+
+    fn truncate_wal(&mut self) -> eyre::Result<()> {
+        drop(
+            OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&self.wal_path)?,
+        );
+        self.wal = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.wal_path)?;
+        Ok(())
+    }
+
+    /// Synchronous snapshot flush: durably writes snapshot, then truncates WAL.
+    pub fn flush(&mut self) -> eyre::Result<()> {
+        self.join_pending()?;
+        let snapshot = self.inner.snapshot();
+        self.last_snapshot_version = snapshot.version;
+        save_twig_snapshot(&self.snapshot_path, &snapshot)?;
+        self.truncate_wal()
+    }
+
+    /// Background snapshot flush: serialization + IO off the apply path.
+    ///
+    /// This mirrors [`PersistentSbmt::flush_background`]: it does not truncate the
+    /// WAL because the snapshot is not yet durable when the method returns.
+    pub fn flush_background(&mut self) -> eyre::Result<()> {
+        self.join_pending()?;
+        let snapshot = self.inner.snapshot();
+        self.last_snapshot_version = snapshot.version;
+        let path = self.snapshot_path.clone();
+        debug!(
+            target: "n42::jmt",
+            version = snapshot.version,
+            entries = twig_snapshot_entry_count(&snapshot),
+            "spawning background Twig snapshot flush"
+        );
+        self.pending_flush = Some(std::thread::spawn(move || {
+            save_twig_snapshot(&path, &snapshot)
+        }));
+        Ok(())
+    }
+
+    /// Wait for any in-flight background flush, propagating its result.
+    pub fn join_pending(&mut self) -> eyre::Result<()> {
+        if let Some(handle) = self.pending_flush.take() {
+            handle
+                .join()
+                .map_err(|_| eyre::eyre!("snapshot flush thread panicked"))??;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for PersistentTwig {
+    fn drop(&mut self) {
+        let _ = self.join_pending();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -471,7 +713,11 @@ mod tests {
             jmt.apply_diff(&make_diff(50)).unwrap();
             jmt.apply_diff(&make_diff(30)).unwrap();
             jmt.apply_diff(&make_diff(10)).unwrap();
-            assert_eq!(jmt.last_snapshot_version(), 0, "no snapshot should have fired");
+            assert_eq!(
+                jmt.last_snapshot_version(),
+                0,
+                "no snapshot should have fired"
+            );
             (jmt.root_hash(), jmt.version())
             // drop without flush() — simulates a crash with no snapshot taken.
         };
@@ -544,6 +790,100 @@ mod tests {
 
         let reopened = PersistentSbmt::open(&path, 3).unwrap();
         assert_eq!(reopened.version(), 3);
+        assert_eq!(reopened.root_hash(), root);
+    }
+
+    #[test]
+    fn twig_wal_recovers_unsnapshotted_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("twig.snapshot");
+
+        let (root, version) = {
+            let mut twig = PersistentTwig::open(&path, u64::MAX).unwrap();
+            twig.apply_diff(&make_diff(50)).unwrap();
+            twig.apply_diff(&make_diff(30)).unwrap();
+            twig.apply_diff(&make_diff(10)).unwrap();
+            assert_eq!(
+                twig.last_snapshot_version(),
+                0,
+                "no snapshot should have fired"
+            );
+            (twig.root_hash(), twig.version())
+        };
+
+        let mut reopened = PersistentTwig::open(&path, u64::MAX).unwrap();
+        assert_eq!(
+            reopened.version(),
+            version,
+            "WAL must recover every committed block"
+        );
+        assert_eq!(reopened.root_hash(), root);
+    }
+
+    #[test]
+    fn twig_wal_truncated_after_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("twig.snapshot");
+        let wal = path.with_extension("wal");
+
+        let mut twig = PersistentTwig::open(&path, 2).unwrap();
+        twig.apply_diff(&make_diff(10)).unwrap();
+        twig.apply_diff(&make_diff(10)).unwrap();
+        assert_eq!(twig.last_snapshot_version(), 2);
+        let wal_len = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+        assert_eq!(wal_len, 0, "WAL must be empty after a checkpoint");
+
+        let root = twig.root_hash();
+        drop(twig);
+        let mut reopened = PersistentTwig::open(&path, 2).unwrap();
+        assert_eq!(reopened.version(), 2);
+        assert_eq!(reopened.root_hash(), root);
+    }
+
+    #[test]
+    fn twig_apply_flush_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("twig.snapshot");
+
+        let (root, version) = {
+            let mut twig = PersistentTwig::open(&path, u64::MAX).unwrap();
+            twig.apply_diff(&make_diff(100)).unwrap();
+            twig.apply_diff(&make_diff(40)).unwrap();
+            let root = twig.root_hash();
+            let version = twig.version();
+            twig.flush().unwrap();
+            assert_eq!(twig.last_snapshot_version(), version);
+            (root, version)
+        };
+
+        let mut reopened = PersistentTwig::open(&path, u64::MAX).unwrap();
+        assert_eq!(reopened.version(), version);
+        assert_eq!(reopened.root_hash(), root);
+    }
+
+    #[test]
+    fn twig_genesis_seed_snapshot_baseline_survives_wal_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("twig.snapshot");
+
+        let (root, version) = {
+            let mut twig = PersistentTwig::open(&path, u64::MAX).unwrap();
+            twig.inner_mut().seed_genesis_account(
+                Address::with_last_byte(0x42),
+                U256::from(1_000_000u64),
+                7,
+                B256::ZERO,
+                std::iter::empty::<(U256, U256)>(),
+            );
+            twig.flush().unwrap();
+            assert_eq!(twig.last_snapshot_version(), 0);
+
+            twig.apply_diff(&make_diff(25)).unwrap();
+            (twig.root_hash(), twig.version())
+        };
+
+        let mut reopened = PersistentTwig::open(&path, u64::MAX).unwrap();
+        assert_eq!(reopened.version(), version);
         assert_eq!(reopened.root_hash(), root);
     }
 
