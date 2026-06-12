@@ -168,3 +168,36 @@ debug 旋钮。
 测试:7 个全过(原 4 + contract_beneficiary + beneficiary_as_sender 改全相等 + hot_recipient),
 clippy 干净。审计另核:reth merge 解析(execute.rs cfg-gate、cache-hit、RLP-skip)均正确;BLS 收据批
 奖励经济安全(只对已验证收据发 ReceiptReceived)。
+
+## 重大修复:模块化重构暴露并修复 Block-STM soundness bug
+
+把 749 行单体 `lib.rs` 拆成内聚模块(`coinbase`/`execution`/`output`/`worker` + 精简 `lib.rs`
+orchestration)时,新加的 `hot_recipient` 测试(每 tx 经普通写贷记同一收款人)在重复运行下
+**flaky**(8 次 2 失败)→ 揭穿两个真实并发正确性 bug:
+
+**Bug A — validated_count 竞争**:`abort_and_reschedule` 标记更高 tx REDO 用 `load` 然后
+`store`(非原子),与 `finish_validation` 的 `CAS(EXECUTED→VALIDATED)` 竞争 → 可漏减一个
+VALIDATED → `validated_count` 永久偏高 → `all_done` 提前触发。**修复**:CAS 让
+EXECUTED/VALIDATED→REDO 转换与 prev 观测原子化。
+
+**Bug B(根因)— "并行 out-of-order validation"重写本身不健全**:此前我把串行 `val_cursor`
+换成验证队列,以为 in-order 只是保守。错。**in-order validation 是 load-bearing 的正确性保证**:
+tx_i 只在 0..i-1 都验证后才验,保证通过的验证是对已 settle 的下层前缀。乱序验证下,一个 tx 可
+对中间状态验证通过被标 VALIDATED,之后下层更新它读的值却不再重验 → 依赖链(热账户)结果错
+(实测 hot 余额 14700 vs 正确 15000)。修了 Bug A 后 Bug B 从 flaky 变稳定暴露(原本 count 多计
+意外多跑几轮偶尔纠正)。**修复**:恢复 in-order `val_cursor`(abort 时 rewind 到该 index)。
+
+**额外加固 — 值校验**:`validate_read_set` 由"查 writer 身份"改为"重读当前值比对"
+(`ReadEntry` 存 `ReadValue` 快照而非 `ReadOrigin`)—— 下层 tx 重执行写不同值时,即使 writer
+index 不变也能失效。这是 incarnation 跟踪的轻量替代(防御纵深)。
+
+**性能**:scaling 瓶颈早已查明是分配器(mimalloc/jemalloc),非 in-order validation;恢复 in-order
+对无冲突块几乎无损(验证总过的快速串行扫描),bench 4 workers 1.3 us/tx,deferred coinbase
+级联消除大赢保留。
+
+**结果**:`hot_recipient` 30/30 稳定通过,全套 6 测试 × 30 次全绿,n42-execution 91 + n42-jmt 92
+无回归,clippy 两路干净。**parallel-evm 现在对热账户/依赖链 sound** —— 这对 2257x 的真实
+workload 有效性 + B(接入生产)是必须的正确性基础。
+
+> 教训:之前 devlog 说"hot_recipient 通过证明引擎对热账户 sound"是**错的**(那次侥幸过)。
+> 重复运行 + 模块化重构把它揪了出来。已纠正。

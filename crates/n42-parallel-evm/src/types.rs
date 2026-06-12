@@ -15,20 +15,43 @@ pub enum LocationKey {
     Storage(Address, U256),
 }
 
-/// The origin of a value read during transaction execution.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReadOrigin {
-    /// Read from the base (pre-block) state.
-    Base,
-    /// Read a value written by the given tx.
-    Tx(TxIdx),
+/// The value a tx observed for an account read — the fields that affect
+/// execution. Storing the value (not just the writer) lets validation detect a
+/// lower tx that RE-EXECUTED and wrote a *different* value under the same index:
+/// writer-identity validation would wrongly pass such a stale read (the
+/// non-deterministic hot-account bug; see `docs/devlog-67`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountSnapshot {
+    pub balance: U256,
+    pub nonce: u64,
+    pub code_hash: alloy_primitives::B256,
 }
 
-/// A single entry in a transaction's read set.
+impl AccountSnapshot {
+    /// Snapshot the execution-relevant fields of an account read.
+    pub fn of(info: &Option<AccountInfo>) -> Option<Self> {
+        info.as_ref().map(|i| Self {
+            balance: i.balance,
+            nonce: i.nonce,
+            code_hash: i.code_hash,
+        })
+    }
+}
+
+/// The value observed by a single read, recorded for value-based validation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReadValue {
+    /// Account basic info (None ⇒ account absent).
+    Account(Option<AccountSnapshot>),
+    /// Storage slot value.
+    Storage(U256),
+}
+
+/// A single entry in a transaction's read set: the key and the value observed.
 #[derive(Debug, Clone)]
 pub struct ReadEntry {
     pub key: LocationKey,
-    pub origin: ReadOrigin,
+    pub value: ReadValue,
 }
 
 /// Per-transaction write to account info.

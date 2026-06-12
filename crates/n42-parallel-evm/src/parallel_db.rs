@@ -5,7 +5,7 @@
 //! for later conflict validation.
 
 use crate::mv_memory::{MvMemory, MvRead};
-use crate::types::{LocationKey, ReadEntry, ReadOrigin, TxIdx};
+use crate::types::{AccountSnapshot, LocationKey, ReadEntry, ReadValue, TxIdx};
 use alloy_primitives::{Address, B256, U256};
 use parking_lot::Mutex;
 use revm::database_interface::{DBErrorMarker, Database, DatabaseRef};
@@ -60,8 +60,8 @@ impl<'a, DB> ParallelDb<'a, DB> {
         }
     }
 
-    fn record_read(&self, key: LocationKey, origin: ReadOrigin) {
-        self.read_set.lock().push(ReadEntry { key, origin });
+    fn record_read(&self, key: LocationKey, value: ReadValue) {
+        self.read_set.lock().push(ReadEntry { key, value });
     }
 }
 
@@ -81,20 +81,18 @@ where
                 .basic_ref(address)
                 .map_err(|e| ParallelDbError(e.to_string()));
         }
-        match self.mv.read_account(self.tx_idx, address) {
-            MvRead::Value(src_tx, info) => {
-                self.record_read(LocationKey::Account(address), ReadOrigin::Tx(src_tx));
-                Ok(info)
-            }
-            MvRead::NotFound => {
-                let info = self
-                    .base
-                    .basic_ref(address)
-                    .map_err(|e| ParallelDbError(e.to_string()))?;
-                self.record_read(LocationKey::Account(address), ReadOrigin::Base);
-                Ok(info)
-            }
-        }
+        let info = match self.mv.read_account(self.tx_idx, address) {
+            MvRead::Value(_src_tx, info) => info,
+            MvRead::NotFound => self
+                .base
+                .basic_ref(address)
+                .map_err(|e| ParallelDbError(e.to_string()))?,
+        };
+        self.record_read(
+            LocationKey::Account(address),
+            ReadValue::Account(AccountSnapshot::of(&info)),
+        );
+        Ok(info)
     }
 
     fn code_by_hash(&mut self, code_hash: B256) -> Result<Bytecode, Self::Error> {
@@ -110,20 +108,15 @@ where
     }
 
     fn storage(&mut self, address: Address, index: U256) -> Result<U256, Self::Error> {
-        match self.mv.read_storage(self.tx_idx, address, index) {
-            MvRead::Value(src_tx, value) => {
-                self.record_read(LocationKey::Storage(address, index), ReadOrigin::Tx(src_tx));
-                Ok(value)
-            }
-            MvRead::NotFound => {
-                let value = self
-                    .base
-                    .storage_ref(address, index)
-                    .map_err(|e| ParallelDbError(e.to_string()))?;
-                self.record_read(LocationKey::Storage(address, index), ReadOrigin::Base);
-                Ok(value)
-            }
-        }
+        let value = match self.mv.read_storage(self.tx_idx, address, index) {
+            MvRead::Value(_src_tx, value) => value,
+            MvRead::NotFound => self
+                .base
+                .storage_ref(address, index)
+                .map_err(|e| ParallelDbError(e.to_string()))?,
+        };
+        self.record_read(LocationKey::Storage(address, index), ReadValue::Storage(value));
+        Ok(value)
     }
 
     fn block_hash(&mut self, number: u64) -> Result<B256, Self::Error> {
