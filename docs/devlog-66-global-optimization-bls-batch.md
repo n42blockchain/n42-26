@@ -45,11 +45,26 @@ twig 引擎已榨到位(build 4.4M accts/s / 更新 1.8M upd/s / 节点路径 2.
 注意:与 codex 的 P6(node 区域)避让 —— star_hub 在 n42-network,不冲突,但实施排在
 P6 节点接线落定之后或协调分工。
 
-## EVM 侧(25% 大头)profile
+## EVM 侧(25% 大头)profile 结论
 
-n42-evm-bench(samply/ETW 采样)结论见下节补充。reth 2.3 合并带来 upstream 的
-**BAL 并行执行**(`bal_prewarm_pool`、parallel BAL executor)——EVM 侧的结构性提速来自
-upstream 演进,n42 跟进配置即可。
+n42-evm-bench(samply/ETW,17 万样本)实测:
+- **裸 EVM 解释器极快**:100K tx(90% transfer + 10% ERC-20)= 81ms,**1.23M tx/s 单核**,
+  仅占 4s slot 的 **2%**。理论单核 TPS 1.4-2.4M。
+- 所以"EVM 执行 2000ms(25%)"的大头**不是解释器**,而是真实节点的 **state/provider 层**
+  (SLOAD→trie/mdbx/缓存 miss;bench 用 CacheDB 内存态故无此项)。
+- profile 另见 35.5% 线程等待(NtWaitForAlertByThreadId)= Block-STM 并行段同步空转,
+  parallel-evm 的调度仍有余地。
+- **结构性方向**:reth 2.3 合并带来 upstream 的 BAL 并行执行(`bal_prewarm_pool`、
+  parallel BAL executor)+ prewarm,正是打 state-access 延迟的;n42 跟进配置/启用即可,
+  无需自研。
+
+## 全局优化排序(本轮诊断后)
+
+1. **BLS 收据 batch_verify(24x,~200ms@1 核)** —— 最大可收割,行动项已列。
+2. EVM state 层:跟进 reth 2.3 BAL 并行执行 + prewarm 配置(upstream 路线)。
+3. parallel-evm 同步空转(35% wait)—— Block-STM 调度精调,中等。
+4. twig/状态根:已完成(~6%→~1%)。
+5. 网络/序列化:实测 17-29 Gbps 分发、<2ms,无关紧要。
 
 ## 工具
 
