@@ -126,6 +126,11 @@ mod tests {
         assert!(N42_C_HEADER.contains("n42_poll_packet"));
         assert!(N42_C_HEADER.contains("n42_verify_and_send"));
         assert!(N42_C_HEADER.contains("n42_verify_state_proof"));
+        assert!(N42_C_HEADER.contains("n42_verify_account_proof"));
+        assert!(N42_C_HEADER.contains("n42_verify_storage_proof"));
+        assert!(N42_C_HEADER.contains("n42_verify_twig_state_proof"));
+        assert!(N42_C_HEADER.contains("n42_verify_twig_account_proof"));
+        assert!(N42_C_HEADER.contains("n42_verify_twig_storage_proof"));
         assert!(N42_C_HEADER.contains("n42_last_verify_info"));
         assert!(N42_C_HEADER.contains("n42_get_pubkey"));
         assert!(N42_C_HEADER.contains("n42_get_stats"));

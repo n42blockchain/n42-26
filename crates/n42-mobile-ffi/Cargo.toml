@@ -59,6 +59,7 @@ once_cell = "1.19"
 # Test-only: build SBMT proofs from the engine for the FFI verify roundtrip test.
 [dev-dependencies]
 n42-bmt-core.workspace = true
+n42-twig-core.workspace = true
 
 # Android JNI (only used on Android targets)
 [target.'cfg(target_os = "android")'.dependencies]
