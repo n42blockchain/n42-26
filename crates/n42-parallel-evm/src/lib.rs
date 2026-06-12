@@ -87,24 +87,43 @@ where
 
     // Deferred coinbase (devlog-67): credit the block beneficiary's gas fees as a
     // commutative accumulator instead of a versioned write, so independent txs no
-    // longer cascade-abort on the shared coinbase. Sound while no tx branches on
-    // the beneficiary's mid-block balance; we additionally exclude the case where
-    // the beneficiary is a tx sender (its nonce changes — not commutative). Toggle
-    // with N42_DEFERRED_COINBASE=0.
-    let deferred_bene: Option<Address> = {
-        let enabled = std::env::var("N42_DEFERRED_COINBASE")
-            .map(|v| v != "0")
-            .unwrap_or(true);
-        let bene = block_env.beneficiary;
-        let bene_is_sender = txs.iter().any(|t| t.caller == bene);
-        (enabled && !bene_is_sender).then_some(bene)
+    // longer cascade-abort on the shared coinbase. Sound only while the
+    // beneficiary's balance change is a pure commutative increment:
+    //   - exclude when it is a tx sender (nonce changes — not commutative);
+    //   - exclude when it is a CONTRACT (non-empty code): a tx could CALL it and
+    //     DECREASE its balance with nonce/code unchanged, which the post-hoc
+    //     `new - base` delta would saturate to 0 and corrupt the final balance.
+    // A validator reward address is an EOA, so deferral stays on in practice.
+    // Toggle with N42_DEFERRED_COINBASE=0.
+    let enabled = std::env::var("N42_DEFERRED_COINBASE")
+        .map(|v| v != "0")
+        .unwrap_or(true);
+    let bene = block_env.beneficiary;
+    let bene_base: Option<AccountInfo> = if enabled {
+        base_db
+            .basic_ref(bene)
+            .map_err(|e| ParallelEvmError::Database(e.to_string()))?
+    } else {
+        None
     };
-    let bene_base: Option<AccountInfo> = match deferred_bene {
-        Some(b) => base_db
-            .basic_ref(b)
-            .map_err(|e| ParallelEvmError::Database(e.to_string()))?,
-        None => None,
-    };
+    let bene_is_sender = txs.iter().any(|t| t.caller == bene);
+    // None base (account absent) ⇒ empty code ⇒ EOA.
+    let bene_is_eoa = bene_base.as_ref().is_none_or(|i| i.is_empty_code_hash());
+
+    // When the default deferral is on but the beneficiary is NOT a deferrable EOA
+    // (it is a tx sender, or a contract that a tx could CALL), neither path is
+    // sound in parallel: deferral's commutative delta breaks (nonce change /
+    // balance decrease), and the non-deferred path lets every tx's fee credit turn
+    // the beneficiary into a hot account whose optimistic ordering does not exactly
+    // reproduce sequential crediting. These cases are rare (a validator reward
+    // address is an EOA non-sender), so execute the whole block sequentially for
+    // guaranteed correctness. (`N42_DEFERRED_COINBASE=0` is an explicit debug knob
+    // and keeps the non-deferred parallel path, accepting its limitations.)
+    if enabled && (bene_is_sender || !bene_is_eoa) {
+        return sequential_execute(txs, base_db, &cfg_env, &block_env);
+    }
+    let deferred_bene: Option<Address> = enabled.then_some(bene);
+    let bene_base: Option<AccountInfo> = deferred_bene.and(bene_base);
 
     // Worker count. Block-STM's in-order validation is partly serial, so idle
     // workers spin/contend on the shared scheduler atoms; past a point adding
@@ -622,6 +641,89 @@ mod deferred_coinbase_tests {
     }
 
     #[test]
+    fn hot_recipient_matches_sequential() {
+        // Every tx sends value to the SAME recipient (a hot account written by all
+        // txs via NORMAL tx writes, not the coinbase reward). This probes whether
+        // Block-STM handles a generic hot account correctly (vs the coinbase, which
+        // is special). Beneficiary is a distinct EOA so deferral handles the fees.
+        let bene = addr(0xB0B0_B175);
+        let hot = addr(0x9999_9999);
+        let mut db = CacheDB::<EmptyDB>::default();
+        let mut txs = Vec::new();
+        for i in 0..150u64 {
+            let sender = addr(0x1000 + i);
+            db.insert_account_info(
+                sender,
+                AccountInfo {
+                    balance: U256::from(u128::MAX),
+                    nonce: 0,
+                    ..Default::default()
+                },
+            );
+            txs.push(
+                TxEnv::builder()
+                    .caller(sender)
+                    .kind(TxKind::Call(hot)) // all send to the same recipient
+                    .value(U256::from(100))
+                    .gas_limit(21_000)
+                    .gas_price(7)
+                    .nonce(0)
+                    .build()
+                    .unwrap(),
+            );
+        }
+        let cfg = CfgEnv::default();
+        let block = BlockEnv {
+            beneficiary: bene,
+            ..Default::default()
+        };
+        let seq = sequential_execute(&txs, &db, &cfg, &block).unwrap();
+        unsafe { std::env::set_var("N42_PARALLEL_THRESHOLD", "1") };
+        let par = parallel_execute(&txs, &db, cfg.clone(), block.clone()).unwrap();
+        unsafe { std::env::remove_var("N42_PARALLEL_THRESHOLD") };
+        // The hot recipient accrues 150*100 regardless of order (commutative adds),
+        // but Block-STM must still reproduce it exactly.
+        assert_eq!(
+            par.state_changes.get(&hot).map(|a| a.info.balance),
+            Some(U256::from(150u64 * 100)),
+            "hot recipient balance"
+        );
+        assert_eq!(balances(&seq), balances(&par), "hot-recipient block must match sequential");
+    }
+
+    #[test]
+    fn contract_beneficiary_disables_deferral() {
+        // A contract beneficiary (non-empty code) must NOT be deferred: a tx could
+        // CALL it and reduce its balance with nonce/code unchanged, which the
+        // post-hoc `new - base` delta would saturate to 0. With the guard, deferral
+        // is off and the result equals sequential. Here we just confirm the engine
+        // runs correctly + matches sequential when the beneficiary has code.
+        let bene = addr(0xC0DE_B175);
+        let (mut db, txs) = workload(80);
+        // Give the beneficiary contract code (STOP) + a starting balance.
+        db.insert_account_info(
+            bene,
+            AccountInfo {
+                balance: U256::from(1_000_000u64),
+                nonce: 1,
+                code_hash: alloy_primitives::keccak256([0x00u8]),
+                code: Some(revm::state::Bytecode::new_raw(vec![0x00].into())),
+                ..Default::default()
+            },
+        );
+        let cfg = CfgEnv::default();
+        let block = BlockEnv {
+            beneficiary: bene,
+            ..Default::default()
+        };
+        let seq = sequential_execute(&txs, &db, &cfg, &block).unwrap();
+        unsafe { std::env::set_var("N42_PARALLEL_THRESHOLD", "1") };
+        let par = parallel_execute(&txs, &db, cfg.clone(), block.clone()).unwrap();
+        unsafe { std::env::remove_var("N42_PARALLEL_THRESHOLD") };
+        assert_eq!(balances(&seq), balances(&par), "contract-beneficiary block must match sequential");
+    }
+
+    #[test]
     fn beneficiary_as_sender_disables_deferral() {
         // Beneficiary is also tx 0's sender (nonce-changing ⇒ non-commutative):
         // the `bene_is_sender` guard auto-disables deferral, so the coinbase flows
@@ -640,11 +742,8 @@ mod deferred_coinbase_tests {
         unsafe { std::env::set_var("N42_PARALLEL_THRESHOLD", "1") };
         let par = parallel_execute(&txs, &db, cfg.clone(), block.clone()).unwrap();
         unsafe { std::env::remove_var("N42_PARALLEL_THRESHOLD") };
-        let strip = |out: &ParallelExecutionOutput| {
-            let mut b = balances(out);
-            b.remove(&bene);
-            b
-        };
-        assert_eq!(strip(&seq), strip(&par), "non-beneficiary accounts must match");
+        // Beneficiary-as-sender is non-deferrable ⇒ whole block falls back to
+        // sequential ⇒ every account (incl. the beneficiary) matches exactly.
+        assert_eq!(balances(&seq), balances(&par), "must match sequential exactly");
     }
 }
