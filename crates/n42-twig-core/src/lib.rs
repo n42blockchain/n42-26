@@ -312,6 +312,11 @@ impl TwigTree {
         t.write_leaf(local, leaf);
         t.live += 1;
         debug_assert_eq!(self.entries.len() as u64, slot);
+        debug_assert!(
+            value.len() <= u32::MAX as usize,
+            "value length {} exceeds u32 arena-offset width",
+            value.len()
+        );
         let voff = self.value_arena.len() as u64;
         self.value_arena.extend_from_slice(value);
         self.entries.push(Entry {

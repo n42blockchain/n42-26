@@ -95,6 +95,7 @@ Logs are split into separate files by phase for easy maintenance:
 | [devlog-64-rust-twig-engine-spec](docs/devlog-64-rust-twig-engine-spec.md) | Rust 全-DRAM twig engine 实现 spec + P1–P6 实现（对 gov5 字节验证、#11 绑定、StateDiff 桥接） | Design |
 | [devlog-65-twig-real-data-profiling](docs/devlog-65-twig-real-data-profiling.md) | twig 引擎真实主网账户剖析（reth2k）+ value-arena 优化（−8% RSS，280 B/acct，root 不变） | Profiling |
 | [devlog-68-twig-node-integration](docs/devlog-68-twig-node-integration.md) | Twig P6 持久化、mobile/FFI 验证、节点接线、mac 4-node E2E + WAL 恢复 | Architecture |
+| [devlog-69-concurrency-audit](docs/devlog-69-concurrency-audit.md) | 跨 crate 并发/正确性审计：consensus 状态机+twig 边界判定健全；network set_validator_context 静默丢弃修复 | Audit |
 
 ---
 
