@@ -21,7 +21,7 @@ use revm::state::{Account, EvmStorageSlot, TransactionId};
 use scheduler::{Scheduler, Task};
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use tracing::{debug, info, warn};
 use types::*;
 
@@ -74,13 +74,12 @@ where
         return Err(ParallelEvmError::BlockTooLarge { tx_count: num_txs });
     }
 
-    static THRESHOLD: OnceLock<usize> = OnceLock::new();
-    let parallel_threshold: usize = *THRESHOLD.get_or_init(|| {
-        std::env::var("N42_PARALLEL_THRESHOLD")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(8)
-    });
+    // Read per call (once per block, negligible) so tests/benches can vary it;
+    // a OnceLock here silently froze the first value for the process lifetime.
+    let parallel_threshold: usize = std::env::var("N42_PARALLEL_THRESHOLD")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8);
 
     if num_txs <= parallel_threshold {
         return sequential_execute(txs, base_db, &cfg_env, &block_env);

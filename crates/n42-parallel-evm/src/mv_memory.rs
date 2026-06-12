@@ -121,13 +121,15 @@ impl MvMemory {
 
     /// Remove all entries written by `tx_idx` (used before re-execution).
     ///
-    /// O(|writes_of_tx|) via the per-tx write index; falls back to a full scan if the
-    /// index entry is missing (defense-in-depth for any caller that bypasses
-    /// `write_account` / `write_storage`).
+    /// O(|writes_of_tx|) via the per-tx write index. A missing index entry means
+    /// the tx has never written anything (`write_account`/`write_storage` always
+    /// register the index), so it is a no-op — the previous full-table-scan
+    /// fallback ran on EVERY first execution (no prior writes) and made the
+    /// whole block O(n^2).
     pub fn clear_tx(&self, tx_idx: TxIdx) {
         let start = std::time::Instant::now();
         let mut writes_count: usize = 0;
-        let mut used_fallback = false;
+        let used_fallback = false;
         if let Some((_, writes)) = self.tx_writes.remove(&tx_idx) {
             writes_count = writes.len();
             for w in writes {
@@ -149,20 +151,6 @@ impl MvMemory {
                         }
                     }
                 }
-            }
-        } else {
-            used_fallback = true;
-            for entry in self.accounts.iter() {
-                entry
-                    .write()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .remove(&tx_idx);
-            }
-            for entry in self.storage.iter() {
-                entry
-                    .write()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .remove(&tx_idx);
             }
         }
         let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;

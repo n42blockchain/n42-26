@@ -7,6 +7,8 @@
 //! 4. Repeat until all transactions are validated.
 
 use crate::types::TxIdx;
+use parking_lot::Mutex;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 /// Transaction execution status.
@@ -37,6 +39,12 @@ pub struct Scheduler {
     validated_count: AtomicUsize,
     /// Number of active workers (for termination detection).
     active_workers: AtomicUsize,
+    /// Queue of tx indices marked REDO. The status array remains the source of
+    /// truth: entries are confirmed with a REDO->PENDING CAS on pop, so stale or
+    /// duplicate entries (a tx aborted twice before being picked up) are skipped.
+    /// Replaces the previous O(num_txs) status scan per task — that scan made
+    /// task acquisition O(n) and the whole block O(n^2) (5000 txs measured 188s).
+    redo: Mutex<VecDeque<TxIdx>>,
 }
 
 impl Scheduler {
@@ -50,6 +58,21 @@ impl Scheduler {
             val_cursor: AtomicUsize::new(0),
             validated_count: AtomicUsize::new(0),
             active_workers: AtomicUsize::new(0),
+            redo: Mutex::new(VecDeque::new()),
+        }
+    }
+
+    /// Pop redo entries until one is genuinely still REDO (or the queue is empty).
+    fn pop_redo(&self) -> Option<TxIdx> {
+        loop {
+            let cand = self.redo.lock().pop_front()?;
+            if self.status[cand]
+                .compare_exchange(STATUS_REDO, STATUS_PENDING, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                return Some(cand);
+            }
+            // Stale/duplicate entry — already rescheduled through another path.
         }
     }
 
@@ -67,19 +90,9 @@ impl Scheduler {
     }
 
     fn try_get_task(&self) -> Option<Task> {
-        // Priority 1: Re-execute transactions marked for redo.
-        for i in 0..self.num_txs {
-            if self.status[i]
-                .compare_exchange(
-                    STATUS_REDO,
-                    STATUS_PENDING,
-                    Ordering::SeqCst,
-                    Ordering::SeqCst,
-                )
-                .is_ok()
-            {
-                return Some(Task::Execute(i));
-            }
+        // Priority 1: Re-execute transactions marked for redo (O(1) queue pop).
+        if let Some(i) = self.pop_redo() {
+            return Some(Task::Execute(i));
         }
 
         // Priority 2: Execute new transactions.
@@ -126,18 +139,8 @@ impl Scheduler {
         std::thread::yield_now();
 
         // After yield, try again for redo tasks.
-        for i in 0..self.num_txs {
-            if self.status[i]
-                .compare_exchange(
-                    STATUS_REDO,
-                    STATUS_PENDING,
-                    Ordering::SeqCst,
-                    Ordering::SeqCst,
-                )
-                .is_ok()
-            {
-                return Some(Task::Execute(i));
-            }
+        if let Some(i) = self.pop_redo() {
+            return Some(Task::Execute(i));
         }
 
         // Check validation cursor again.
@@ -192,6 +195,7 @@ impl Scheduler {
         // Use swap to atomically set REDO and capture the previous status,
         // so we can correctly count this tx if it was already VALIDATED.
         let prev_self = self.status[tx_idx].swap(STATUS_REDO, Ordering::SeqCst);
+        self.redo.lock().push_back(tx_idx);
 
         // Reset validation cursor to re-validate from this point.
         loop {
@@ -215,6 +219,7 @@ impl Scheduler {
             let prev = self.status[i].load(Ordering::SeqCst);
             if prev == STATUS_EXECUTED || prev == STATUS_VALIDATED {
                 self.status[i].store(STATUS_REDO, Ordering::SeqCst);
+                self.redo.lock().push_back(i);
                 if prev == STATUS_VALIDATED {
                     invalidated_validated += 1;
                 }
