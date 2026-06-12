@@ -116,3 +116,31 @@ val_cursor 推进),需重写(并行 validation / work-stealing)才能根治。
 > ~1us 工作量摊不平并行协调,这是 Amdahl/内存带宽下限,非 bug。真正受益的是合约重块(每笔
 > 工作量大),而那些块没有 deferred coinbase 会被级联打死 —— 所以 deferred(修复4)是前提,
 > 调度调优(修复5)是边际。后续可做:并行 validation 重写 + 按 gas 估算自适应 worker 数。
+
+## 修复 6:并行 validation + 真相(分配器才是 8+ 线程崩溃主因)
+
+**并行 validation 重写**:把串行 `val_cursor` 换成验证队列 `WorkQueue`(原子 len 守卫,空队列免锁),
+任意 worker 验证任意已执行 tx、乱序并行。**正确性依据**:`abort_and_reschedule` 已把所有更高 tx
+标 REDO → 提前验证的 tx 只要有更低 tx abort 就被重验,故乱序验证 sound(验证是纯读集检查,abort
+级联与顺序无关)。新增队列 skip 测试 + deferred 对拍仍过。
+
+**但并行 validation 没解决 8+ 线程崩溃 → 说明 in-order validation 不是主因。** 继续验证假设:
+给 bench 链 mimalloc 分配器再 sweep,真相大白:
+
+| 线程 | Windows 默认堆 | **mimalloc** |
+|------|---------------|-------------|
+| 1 | 5.44 us/tx | **2.72**(2x) |
+| 4 | 4.37 | **1.11**(best,2.5x scaling over 1) |
+| 8 | 8.22 | 1.38 |
+| 32 | **20.85** | **2.30**(9x 改善,仅比 4 慢 2x) |
+
+**结论修正**:之前"线程越多越慢"主要是 **Windows 默认堆的多线程分配锁**竞争(每 tx 构造 revm
+Context/EVM 做大量小分配,32 线程狂抢 RtlAllocateHeap),**不是算法/调度问题**。
+
+**生产无此问题**:`bin/n42-node` 在 unix 用 **jemalloc**(`feature="jemalloc"`),Linux IDC 节点
+上并行路径正常 scale。换好分配器后,4 线程对 trivial 转账 2.5x、32 线程仅比 4 慢 2x(协调开销在
+~1us/tx 下的 Amdahl 余量,非崩溃)。
+
+**净收益**:① 并行 validation 去掉串行验证瓶颈(结构正确,重块受益);② 三个调度 micro-fix 降竞争;
+③ worker 旋钮主要是 Windows-默认-堆 的保险,jemalloc 生产可调高 N42_PARALLEL_WORKERS;④ bench
+现链 mimalloc,反映生产真实 scaling。所有改动 root/结果不变(deferred 对拍 + 5 测试绿)。

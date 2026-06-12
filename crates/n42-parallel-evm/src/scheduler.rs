@@ -1,10 +1,19 @@
 //! Block-STM scheduler: coordinates parallel execution and validation.
 //!
 //! Based on the Block-STM algorithm from Aptos, simplified for our use case:
-//! 1. Execute all transactions optimistically in parallel.
-//! 2. Validate each transaction's read set (did its reads change?).
-//! 3. Re-execute any transaction that fails validation.
+//! 1. Execute transactions optimistically in parallel.
+//! 2. Validate each executed transaction's read set (did its reads change?).
+//! 3. Re-execute any transaction that fails validation, and — conservatively —
+//!    every higher-indexed transaction (it may have read the aborted tx's writes).
 //! 4. Repeat until all transactions are validated.
+//!
+//! Both execution and validation are **parallel and out-of-order**: workers pull
+//! from a redo queue, a monotonic execute cursor, and a validation queue. Out-of-
+//! order validation is sound because any abort re-marks *every* higher tx REDO, so
+//! a tx validated early is re-validated whenever a lower tx re-executes. The
+//! previous design validated strictly in order through a single `val_cursor`,
+//! which serialized validation and left most workers spinning (the dominant cost
+//! once the coinbase cascade was gone — see `docs/devlog-67`).
 
 use crate::types::TxIdx;
 use parking_lot::Mutex;
@@ -26,6 +35,39 @@ pub enum Task {
     Validate(TxIdx),
 }
 
+/// A work queue of tx indices guarded by an atomic length, so the empty-queue
+/// hot path (the no-conflict common case) never locks the mutex.
+struct WorkQueue {
+    q: Mutex<VecDeque<TxIdx>>,
+    len: AtomicUsize,
+}
+
+impl WorkQueue {
+    fn new() -> Self {
+        Self {
+            q: Mutex::new(VecDeque::new()),
+            len: AtomicUsize::new(0),
+        }
+    }
+
+    fn push(&self, tx_idx: TxIdx) {
+        self.q.lock().push_back(tx_idx);
+        self.len.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Pop one index, or `None` if empty (lock-free when empty).
+    fn pop(&self) -> Option<TxIdx> {
+        if self.len.load(Ordering::Acquire) == 0 {
+            return None;
+        }
+        let v = self.q.lock().pop_front();
+        if v.is_some() {
+            self.len.fetch_sub(1, Ordering::AcqRel);
+        }
+        v
+    }
+}
+
 /// Coordinates execution and validation of transactions across worker threads.
 pub struct Scheduler {
     num_txs: usize,
@@ -33,22 +75,16 @@ pub struct Scheduler {
     status: Vec<AtomicU32>,
     /// Next transaction index to execute (monotonically increasing).
     exec_cursor: AtomicUsize,
-    /// Next transaction index to validate (monotonically increasing).
-    val_cursor: AtomicUsize,
-    /// Number of transactions that have been validated.
+    /// Number of transactions currently in the VALIDATED state.
     validated_count: AtomicUsize,
-    /// Queue of tx indices marked REDO. The status array remains the source of
-    /// truth: entries are confirmed with a REDO->PENDING CAS on pop, so stale or
-    /// duplicate entries (a tx aborted twice before being picked up) are skipped.
-    /// Replaces the previous O(num_txs) status scan per task — that scan made
-    /// task acquisition O(n) and the whole block O(n^2) (5000 txs measured 188s).
-    redo: Mutex<VecDeque<TxIdx>>,
-    /// Length of `redo`, mirrored as an atomic so the no-conflict hot path can
-    /// skip locking the mutex entirely. Without this, every `try_get_task` (one
-    /// per task, on every worker) locked the redo mutex even when no tx ever
-    /// aborts — that lock was the dominant contention point, making the parallel
-    /// path SLOWER with more threads (32 threads measured 4x slower than 2).
-    redo_len: AtomicUsize,
+    /// Tx indices marked REDO. The status array is the source of truth: entries
+    /// are confirmed with a REDO->PENDING CAS on pop, so stale/duplicate entries
+    /// are skipped.
+    redo: WorkQueue,
+    /// Tx indices that finished execution and await validation. Confirmed with a
+    /// status==EXECUTED check on pop (a since-aborted entry is skipped). Lets any
+    /// worker validate any executed tx in parallel.
+    validate: WorkQueue,
 }
 
 impl Scheduler {
@@ -59,127 +95,66 @@ impl Scheduler {
                 .map(|_| AtomicU32::new(STATUS_PENDING))
                 .collect(),
             exec_cursor: AtomicUsize::new(0),
-            val_cursor: AtomicUsize::new(0),
             validated_count: AtomicUsize::new(0),
-            redo: Mutex::new(VecDeque::new()),
-            redo_len: AtomicUsize::new(0),
+            redo: WorkQueue::new(),
+            validate: WorkQueue::new(),
         }
     }
 
-    /// Pop redo entries until one is genuinely still REDO (or the queue is empty).
-    /// Lock-free fast exit when the queue is empty (the no-conflict common case).
+    /// Pop a redo entry that is genuinely still REDO (claims it PENDING).
     fn pop_redo(&self) -> Option<TxIdx> {
-        if self.redo_len.load(Ordering::Acquire) == 0 {
-            return None;
-        }
-        loop {
-            let cand = match self.redo.lock().pop_front() {
-                Some(c) => {
-                    self.redo_len.fetch_sub(1, Ordering::AcqRel);
-                    c
-                }
-                None => return None,
-            };
+        while let Some(cand) = self.redo.pop() {
             if self.status[cand]
                 .compare_exchange(STATUS_REDO, STATUS_PENDING, Ordering::SeqCst, Ordering::SeqCst)
                 .is_ok()
             {
                 return Some(cand);
             }
-            // Stale/duplicate entry — already rescheduled through another path.
+            // Stale/duplicate — already rescheduled through another path.
         }
+        None
     }
 
-    /// Push a REDO entry (keeps `redo_len` in sync with the queue).
-    fn push_redo(&self, tx_idx: TxIdx) {
-        self.redo.lock().push_back(tx_idx);
-        self.redo_len.fetch_add(1, Ordering::AcqRel);
+    /// Pop a validation entry that is still EXECUTED (a since-aborted entry is
+    /// skipped — it will be re-pushed when it re-executes).
+    fn pop_validate(&self) -> Option<TxIdx> {
+        while let Some(cand) = self.validate.pop() {
+            if self.status[cand].load(Ordering::SeqCst) == STATUS_EXECUTED {
+                return Some(cand);
+            }
+        }
+        None
     }
 
-    /// Get the next task for a worker. Returns `None` when all work is done.
+    /// Get the next task for a worker, or `None` if nothing is ready right now.
     pub fn next_task(&self) -> Option<Task> {
-        self.try_get_task()
-    }
-
-    fn try_get_task(&self) -> Option<Task> {
-        // Priority 1: Re-execute transactions marked for redo (O(1) queue pop).
+        // Priority 1: re-execute aborted txs (keeps the cascade converging).
         if let Some(i) = self.pop_redo() {
             return Some(Task::Execute(i));
         }
-
-        // Priority 2: Execute new transactions. Wait-free claim via fetch_add —
-        // a CAS load/compare loop here caused retry storms under 32-thread
-        // contention (the dominant cost on cheap txs). The cursor may overshoot
-        // `num_txs`; we simply ignore claims past the end.
+        // Priority 2: execute a new tx. Wait-free claim via fetch_add (a CAS
+        // loop retry-stormed under contention). The cursor may overshoot num_txs.
         let idx = self.exec_cursor.fetch_add(1, Ordering::SeqCst);
         if idx < self.num_txs {
             return Some(Task::Execute(idx));
         }
-
-        // Priority 3: Validate executed transactions.
-        loop {
-            let idx = self.val_cursor.load(Ordering::SeqCst);
-            if idx >= self.num_txs {
-                break;
-            }
-            // Only validate if the tx has been executed.
-            if self.status[idx].load(Ordering::SeqCst) != STATUS_EXECUTED {
-                break; // Must validate in order — wait for this tx to be executed.
-            }
-            if self
-                .val_cursor
-                .compare_exchange(idx, idx + 1, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok()
-            {
-                return Some(Task::Validate(idx));
-            }
+        // Priority 3: validate an executed tx (parallel, any order).
+        if let Some(i) = self.pop_validate() {
+            return Some(Task::Validate(i));
         }
-
-        // Check if all done.
-        if self.validated_count.load(Ordering::SeqCst) >= self.num_txs {
-            return None;
-        }
-
-        // No task available but not done yet — spin briefly then check again.
-        // This avoids busy-waiting by yielding to the thread pool.
-        std::thread::yield_now();
-
-        // After yield, try again for redo tasks.
-        if let Some(i) = self.pop_redo() {
-            return Some(Task::Execute(i));
-        }
-
-        // Check validation cursor again.
-        let idx = self.val_cursor.load(Ordering::SeqCst);
-        if idx < self.num_txs
-            && self.status[idx].load(Ordering::SeqCst) == STATUS_EXECUTED
-            && self
-                .val_cursor
-                .compare_exchange(idx, idx + 1, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok()
-        {
-            return Some(Task::Validate(idx));
-        }
-
-        if self.validated_count.load(Ordering::SeqCst) >= self.num_txs {
-            return None;
-        }
-
-        // Still not done — return None to let the worker exit this iteration.
-        // The outer loop will call next_task() again.
         None
     }
 
-    /// Mark a transaction as executed.
+    /// Mark a transaction as executed and enqueue it for validation.
     pub fn finish_execution(&self, tx_idx: TxIdx) {
         self.status[tx_idx].store(STATUS_EXECUTED, Ordering::SeqCst);
+        self.validate.push(tx_idx);
     }
 
     /// Mark a transaction as validated.
     pub fn finish_validation(&self, tx_idx: TxIdx) {
         // A lower-index abort may already have invalidated this tx while its
-        // validation task was still in flight. In that case, keep the REDO
-        // marker instead of reviving the stale execution result.
+        // validation task was in flight. Only count it if it is still EXECUTED.
         if self.status[tx_idx]
             .compare_exchange(
                 STATUS_EXECUTED,
@@ -193,44 +168,26 @@ impl Scheduler {
         }
     }
 
-    /// Mark a transaction for re-execution (validation failed).
-    /// Also invalidates all higher-indexed transactions that might have read from this one.
+    /// Mark a transaction for re-execution (validation failed). Also invalidates
+    /// every higher-indexed tx, which might have read this one's stale writes.
     pub fn abort_and_reschedule(&self, tx_idx: TxIdx) {
-        // Use swap to atomically set REDO and capture the previous status,
-        // so we can correctly count this tx if it was already VALIDATED.
+        // Swap to REDO and capture the previous status so we can keep
+        // validated_count exact if it was already VALIDATED.
         let prev_self = self.status[tx_idx].swap(STATUS_REDO, Ordering::SeqCst);
-        self.push_redo(tx_idx);
+        self.redo.push(tx_idx);
 
-        // Reset validation cursor to re-validate from this point.
-        loop {
-            let current = self.val_cursor.load(Ordering::SeqCst);
-            if current <= tx_idx {
-                break;
-            }
-            if self
-                .val_cursor
-                .compare_exchange(current, tx_idx, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok()
-            {
-                break;
-            }
-        }
-
-        // Mark all higher-indexed executed txs as needing redo too,
-        // since they might have read stale data from the aborted tx.
-        let mut invalidated_validated = if prev_self == STATUS_VALIDATED { 1 } else { 0 };
+        let mut invalidated_validated = usize::from(prev_self == STATUS_VALIDATED);
         for i in (tx_idx + 1)..self.num_txs {
             let prev = self.status[i].load(Ordering::SeqCst);
             if prev == STATUS_EXECUTED || prev == STATUS_VALIDATED {
                 self.status[i].store(STATUS_REDO, Ordering::SeqCst);
-                self.push_redo(i);
+                self.redo.push(i);
                 if prev == STATUS_VALIDATED {
                     invalidated_validated += 1;
                 }
             }
         }
         self.decrement_validated_count(invalidated_validated);
-
     }
 
     /// Check if all transactions have been validated.
@@ -242,7 +199,6 @@ impl Scheduler {
         if count == 0 {
             return;
         }
-
         let _ = self
             .validated_count
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
@@ -263,12 +219,10 @@ mod tests {
         scheduler.status[1].store(STATUS_VALIDATED, Ordering::SeqCst);
         scheduler.status[2].store(STATUS_VALIDATED, Ordering::SeqCst);
         scheduler.validated_count.store(3, Ordering::SeqCst);
-        scheduler.val_cursor.store(3, Ordering::SeqCst);
 
         scheduler.abort_and_reschedule(1);
 
         assert_eq!(scheduler.validated_count.load(Ordering::SeqCst), 1);
-        assert_eq!(scheduler.val_cursor.load(Ordering::SeqCst), 1);
         assert_eq!(scheduler.status[1].load(Ordering::SeqCst), STATUS_REDO);
         assert_eq!(scheduler.status[2].load(Ordering::SeqCst), STATUS_REDO);
     }
@@ -281,13 +235,28 @@ mod tests {
         scheduler.status[1].store(STATUS_EXECUTED, Ordering::SeqCst);
         scheduler.status[2].store(STATUS_EXECUTED, Ordering::SeqCst);
         scheduler.validated_count.store(1, Ordering::SeqCst);
-        scheduler.val_cursor.store(3, Ordering::SeqCst);
 
         scheduler.abort_and_reschedule(1);
-
         scheduler.finish_validation(2);
 
         assert_eq!(scheduler.validated_count.load(Ordering::SeqCst), 1);
         assert_eq!(scheduler.status[2].load(Ordering::SeqCst), STATUS_REDO);
+    }
+
+    #[test]
+    fn parallel_validation_queue_skips_aborted_entries() {
+        let s = Scheduler::new(4);
+        // Two txs execute -> both enqueued for validation.
+        s.finish_execution(2);
+        s.finish_execution(3);
+        // tx1 aborts, re-marking 2 and 3 REDO.
+        s.status[1].store(STATUS_EXECUTED, Ordering::SeqCst);
+        s.abort_and_reschedule(1);
+        // The stale validate entries (2,3 now REDO) must be skipped.
+        assert!(s.pop_validate().is_none());
+        // And they are available as redo work instead.
+        let mut redos = vec![s.pop_redo(), s.pop_redo(), s.pop_redo()];
+        redos.sort();
+        assert_eq!(redos, vec![Some(1), Some(2), Some(3)]);
     }
 }

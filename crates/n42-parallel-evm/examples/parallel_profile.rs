@@ -11,6 +11,9 @@
 //!           ./target/profiling/examples/parallel_profile.exe
 //! Env: PP_TXS (default 5000), PP_ITERS (default 40)
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use alloy_primitives::{Address, TxKind, U256};
 use revm::context::{BlockEnv, CfgEnv, TxEnv};
 use revm::database::{CacheDB, EmptyDB};
