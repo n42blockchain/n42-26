@@ -17,7 +17,7 @@ use revm::context::{BlockEnv, CfgEnv, Context, TxEnv};
 use revm::context_interface::result::ResultAndState;
 use revm::database_interface::DatabaseRef;
 use revm::handler::MainBuilder;
-use revm::state::{Account, EvmStorageSlot, TransactionId};
+use revm::state::{Account, AccountInfo, EvmStorageSlot, TransactionId};
 use scheduler::{Scheduler, Task};
 use std::collections::HashMap;
 use std::fmt;
@@ -85,6 +85,27 @@ where
         return sequential_execute(txs, base_db, &cfg_env, &block_env);
     }
 
+    // Deferred coinbase (devlog-67): credit the block beneficiary's gas fees as a
+    // commutative accumulator instead of a versioned write, so independent txs no
+    // longer cascade-abort on the shared coinbase. Sound while no tx branches on
+    // the beneficiary's mid-block balance; we additionally exclude the case where
+    // the beneficiary is a tx sender (its nonce changes — not commutative). Toggle
+    // with N42_DEFERRED_COINBASE=0.
+    let deferred_bene: Option<Address> = {
+        let enabled = std::env::var("N42_DEFERRED_COINBASE")
+            .map(|v| v != "0")
+            .unwrap_or(true);
+        let bene = block_env.beneficiary;
+        let bene_is_sender = txs.iter().any(|t| t.caller == bene);
+        (enabled && !bene_is_sender).then_some(bene)
+    };
+    let bene_base: Option<AccountInfo> = match deferred_bene {
+        Some(b) => base_db
+            .basic_ref(b)
+            .map_err(|e| ParallelEvmError::Database(e.to_string()))?,
+        None => None,
+    };
+
     let start = std::time::Instant::now();
     let mv = MvMemory::new();
     let scheduler = Scheduler::new(num_txs);
@@ -104,7 +125,15 @@ where
             for _ in 0..num_workers {
                 s.spawn(|_| {
                     worker_loop(
-                        &scheduler, txs, base_db, &mv, &cfg_env, &block_env, &outputs,
+                        &scheduler,
+                        txs,
+                        base_db,
+                        &mv,
+                        &cfg_env,
+                        &block_env,
+                        &outputs,
+                        deferred_bene,
+                        bene_base.as_ref(),
                     );
                 });
             }
@@ -127,7 +156,24 @@ where
     metrics::counter!("n42_parallel_evm_blocks_total").increment(1);
     metrics::histogram!("n42_parallel_evm_duration_ms").record(elapsed.as_millis() as f64);
 
-    build_output(outputs)
+    let mut output = build_output(outputs)?;
+    // Materialize the deferred coinbase: final balance = base + Σ per-tx deltas.
+    // Order-independent (addition commutes); applied once here at commit.
+    if let Some(bene) = deferred_bene {
+        let sum = mv.sum_bene_deltas();
+        if !sum.is_zero() {
+            let mut info = bene_base.clone().unwrap_or_default();
+            info.balance = info.balance.saturating_add(sum);
+            let tx_id = TransactionId::new(0).expect("0 is a valid TransactionId");
+            let account = output
+                .state_changes
+                .entry(bene)
+                .or_insert_with(|| Account::new_not_existing(tx_id));
+            account.info = info;
+            account.mark_touch();
+        }
+    }
+    Ok(output)
 }
 
 /// Internal per-tx output (before merging).
@@ -138,9 +184,13 @@ struct TxOutputInternal {
     account_writes: Vec<(Address, AccountWrite)>,
     storage_writes: Vec<(Address, U256, U256)>,
     read_set: Vec<ReadEntry>,
+    /// Commutative balance delta this tx credited to the deferred beneficiary
+    /// (gas fee + value sent to it), if deferral is active. Applied at commit.
+    bene_delta: Option<U256>,
 }
 
 /// Worker loop: repeatedly fetches and executes tasks from the scheduler.
+#[allow(clippy::too_many_arguments)]
 fn worker_loop<DB>(
     scheduler: &Scheduler,
     txs: &[TxEnv],
@@ -149,6 +199,8 @@ fn worker_loop<DB>(
     cfg_env: &CfgEnv,
     block_env: &BlockEnv,
     outputs: &[Mutex<Option<TxOutputInternal>>],
+    deferred_bene: Option<Address>,
+    bene_base: Option<&AccountInfo>,
 ) where
     DB: DatabaseRef + Send + Sync,
     DB::Error: fmt::Display + Send,
@@ -177,8 +229,16 @@ fn worker_loop<DB>(
             Task::Execute(tx_idx) => {
                 mv.clear_tx(tx_idx);
 
-                let output =
-                    execute_single_tx(tx_idx, &txs[tx_idx], base_db, mv, cfg_env, block_env);
+                let output = execute_single_tx(
+                    tx_idx,
+                    &txs[tx_idx],
+                    base_db,
+                    mv,
+                    cfg_env,
+                    block_env,
+                    deferred_bene,
+                    bene_base,
+                );
 
                 if let Some(ref out) = output {
                     for (addr, write) in &out.account_writes {
@@ -186,6 +246,9 @@ fn worker_loop<DB>(
                     }
                     for &(addr, slot, value) in &out.storage_writes {
                         mv.write_storage(tx_idx, addr, slot, value);
+                    }
+                    if let Some(delta) = out.bene_delta {
+                        mv.record_bene_delta(tx_idx, delta);
                     }
                 }
 
@@ -219,6 +282,7 @@ fn unwrap_read_set(read_set: SharedReadSet) -> Vec<ReadEntry> {
 }
 
 /// Execute a single transaction using revm with the parallel database adapter.
+#[allow(clippy::too_many_arguments)]
 fn execute_single_tx<DB>(
     tx_idx: TxIdx,
     tx_env: &TxEnv,
@@ -226,13 +290,15 @@ fn execute_single_tx<DB>(
     mv: &MvMemory,
     cfg_env: &CfgEnv,
     block_env: &BlockEnv,
+    deferred_bene: Option<Address>,
+    bene_base: Option<&AccountInfo>,
 ) -> Option<TxOutputInternal>
 where
     DB: DatabaseRef + Send + Sync,
     DB::Error: fmt::Display + Send,
 {
     let read_set: SharedReadSet = Arc::new(parking_lot::Mutex::new(Vec::new()));
-    let db = ParallelDb::new(tx_idx, base_db, mv, read_set.clone());
+    let db = ParallelDb::new(tx_idx, base_db, mv, read_set.clone(), deferred_bene);
 
     // Build the EVM context and execute.
     let mut ctx: Context<
@@ -261,6 +327,7 @@ where
                     account_writes: vec![],
                     storage_writes: vec![],
                     read_set: rs,
+                    bene_delta: None,
                 });
             }
         };
@@ -275,9 +342,34 @@ where
     // Extract state changes.
     let mut account_writes = Vec::new();
     let mut storage_writes = Vec::new();
+    let mut bene_delta = None;
 
     for (addr, account) in &state {
         if account.is_touched() {
+            // Deferred beneficiary: if it was only balance-credited (nonce + code
+            // unchanged from base — the universal fee/transfer case), record the
+            // commutative delta instead of a versioned account write so it never
+            // conflicts. Any nonce/code change means it was a genuine participant
+            // (e.g. a contract coinbase whose call mutated it) — fall back to a
+            // normal write for correctness. Its storage writes (if any) stay
+            // versioned regardless.
+            if deferred_bene == Some(*addr) {
+                let base = bene_base.cloned().unwrap_or_default();
+                let only_balance =
+                    account.info.nonce == base.nonce && account.info.code_hash == base.code_hash;
+                if only_balance {
+                    bene_delta = Some(account.info.balance.saturating_sub(base.balance));
+                } else {
+                    account_writes.push((*addr, AccountWrite::Updated(account.info.clone())));
+                }
+                for (slot, storage) in &account.storage {
+                    if storage.is_changed() {
+                        storage_writes.push((*addr, *slot, storage.present_value));
+                    }
+                }
+                continue;
+            }
+
             account_writes.push((*addr, AccountWrite::Updated(account.info.clone())));
 
             for (slot, storage) in &account.storage {
@@ -297,6 +389,7 @@ where
         account_writes,
         storage_writes,
         read_set: rs,
+        bene_delta,
     })
 }
 
@@ -405,10 +498,14 @@ where
     let mut state_changes: HashMap<Address, Account> = HashMap::new();
 
     for (tx_idx, tx_env) in txs.iter().enumerate() {
-        let output = execute_single_tx(tx_idx, tx_env, base_db, &mv, cfg_env, block_env)
-            .ok_or_else(|| {
-                ParallelEvmError::Database(format!("execution failed for tx {tx_idx}"))
-            })?;
+        // Sequential path credits the beneficiary normally (deferral is a
+        // parallel-only optimization); pass None so the coinbase write flows
+        // through the standard account-write path in tx order.
+        let output =
+            execute_single_tx(tx_idx, tx_env, base_db, &mv, cfg_env, block_env, None, None)
+                .ok_or_else(|| {
+                    ParallelEvmError::Database(format!("execution failed for tx {tx_idx}"))
+                })?;
 
         // Write to MvMemory so subsequent txs see this tx's state.
         for (addr, write) in &output.account_writes {
@@ -436,4 +533,103 @@ where
         results,
         state_changes,
     })
+}
+
+#[cfg(test)]
+mod deferred_coinbase_tests {
+    use super::*;
+    use alloy_primitives::TxKind;
+    use revm::database::{CacheDB, EmptyDB};
+
+    fn addr(n: u64) -> Address {
+        Address::from_word(U256::from(n).into())
+    }
+
+    /// N independent transfers (unique sender→unique receiver) paying gas to a
+    /// shared beneficiary — the exact pattern that used to cascade.
+    fn workload(n: u64) -> (CacheDB<EmptyDB>, Vec<TxEnv>) {
+        let mut db = CacheDB::<EmptyDB>::default();
+        let mut txs = Vec::new();
+        for i in 0..n {
+            let sender = addr(0x1000 + i);
+            db.insert_account_info(
+                sender,
+                AccountInfo {
+                    balance: U256::from(u128::MAX),
+                    nonce: 0,
+                    ..Default::default()
+                },
+            );
+            txs.push(
+                TxEnv::builder()
+                    .caller(sender)
+                    .kind(TxKind::Call(addr(0x2000 + i)))
+                    .value(U256::from(1))
+                    .gas_limit(21_000)
+                    .gas_price(7) // basefee=0 ⇒ all 7/gas goes to the coinbase
+                    .nonce(0)
+                    .build()
+                    .unwrap(),
+            );
+        }
+        (db, txs)
+    }
+
+    fn balances(out: &ParallelExecutionOutput) -> std::collections::BTreeMap<Address, U256> {
+        out.state_changes
+            .iter()
+            .map(|(a, acc)| (*a, acc.info.balance))
+            .collect()
+    }
+
+    #[test]
+    fn deferred_parallel_matches_sequential_state() {
+        let bene = addr(0xC01D_B175);
+        let (db, txs) = workload(200);
+        let cfg = CfgEnv::default();
+        let block = BlockEnv {
+            beneficiary: bene,
+            ..Default::default()
+        };
+
+        // Ground truth: sequential (normal in-order coinbase credit).
+        let seq = sequential_execute(&txs, &db, &cfg, &block).unwrap();
+
+        // Deferred parallel (threshold=1 forces the parallel path).
+        unsafe { std::env::set_var("N42_PARALLEL_THRESHOLD", "1") };
+        let par = parallel_execute(&txs, &db, cfg.clone(), block.clone()).unwrap();
+        unsafe { std::env::remove_var("N42_PARALLEL_THRESHOLD") };
+
+        // Coinbase actually accrued fees, and matches sequential exactly.
+        let cb = seq.state_changes.get(&bene).map(|a| a.info.balance);
+        assert_eq!(cb, Some(U256::from(200u64 * 21_000 * 7)), "coinbase fee total");
+        assert_eq!(balances(&seq), balances(&par), "every account balance must match");
+    }
+
+    #[test]
+    fn beneficiary_as_sender_disables_deferral() {
+        // Beneficiary is also tx 0's sender (nonce-changing ⇒ non-commutative):
+        // the `bene_is_sender` guard auto-disables deferral, so the coinbase flows
+        // through the normal versioned path. We assert the NON-beneficiary accounts
+        // match sequential (the guard disturbs nothing); the coinbase-that-is-also-
+        // a-sender hot account is the pre-existing Block-STM path, out of scope for
+        // the deferred-coinbase feature.
+        let bene = addr(0x1000); // == sender of tx 0
+        let (db, txs) = workload(50);
+        let cfg = CfgEnv::default();
+        let block = BlockEnv {
+            beneficiary: bene,
+            ..Default::default()
+        };
+        let seq = sequential_execute(&txs, &db, &cfg, &block).unwrap();
+        unsafe { std::env::set_var("N42_PARALLEL_THRESHOLD", "1") };
+        let par = parallel_execute(&txs, &db, cfg.clone(), block.clone()).unwrap();
+        unsafe { std::env::remove_var("N42_PARALLEL_THRESHOLD") };
+        let strip = |out: &ParallelExecutionOutput| {
+            let mut b = balances(out);
+            b.remove(&bene);
+            b
+        };
+        assert_eq!(strip(&seq), strip(&par), "non-beneficiary accounts must match");
+    }
 }

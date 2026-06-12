@@ -36,15 +36,27 @@ pub struct ParallelDb<'a, DB> {
     base: &'a DB,
     mv: &'a MvMemory,
     read_set: SharedReadSet,
+    /// When `Some`, this address is the deferred block beneficiary: its account
+    /// is read "blind" (base value, NOT recorded in the read set), so the fee
+    /// credit creates no read/write dependency and never aborts other txs. The
+    /// balance delta is extracted post-execution. See `docs/devlog-67`.
+    deferred_bene: Option<Address>,
 }
 
 impl<'a, DB> ParallelDb<'a, DB> {
-    pub fn new(tx_idx: TxIdx, base: &'a DB, mv: &'a MvMemory, read_set: SharedReadSet) -> Self {
+    pub fn new(
+        tx_idx: TxIdx,
+        base: &'a DB,
+        mv: &'a MvMemory,
+        read_set: SharedReadSet,
+        deferred_bene: Option<Address>,
+    ) -> Self {
         Self {
             tx_idx,
             base,
             mv,
             read_set,
+            deferred_bene,
         }
     }
 
@@ -60,6 +72,15 @@ where
     type Error = ParallelDbError;
 
     fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
+        // Deferred beneficiary: blind base read, no read-set entry. revm credits
+        // the fee against this base value; the delta is recovered after execution
+        // and accumulated commutatively, so the beneficiary never conflicts.
+        if self.deferred_bene == Some(address) {
+            return self
+                .base
+                .basic_ref(address)
+                .map_err(|e| ParallelDbError(e.to_string()));
+        }
         match self.mv.read_account(self.tx_idx, address) {
             MvRead::Value(src_tx, info) => {
                 self.record_read(LocationKey::Account(address), ReadOrigin::Tx(src_tx));

@@ -47,7 +47,39 @@ commutative` 累加器),从读集里剔除 coinbase 余额。
 在 `MvMemory` 给 beneficiary 余额增量设可交换累加器(每 tx 记 delta,验证不比对 coinbase 余额,
 commit 时求和应用)。预期把转账块从 O(n²) 降到近线性,真正吃满多核。属中等改动,单列一轮。
 
+## 修复 4:deferred coinbase(消除并行级联,2257x)
+
+按"加法可交换"的洞察实现:
+- **盲读**:`ParallelDb` 对 beneficiary 返回 base 值且**不进 read_set** → fee 入账不产生读依赖。
+- **commutative delta**:`execute_single_tx` 抽出 `delta = new_balance - base_balance`,存进
+  `MvMemory.bene_deltas`(不进 versioned accounts),`clear_tx` 重执行时一并清除。
+- **commit 物化**:最终 `beneficiary = base + Σ delta`(加法,顺序无关),在 `build_output` 后
+  一次性写回。
+- **守卫**:beneficiary 若是某 tx 的 sender(nonce 变,不可交换)→ `bene_is_sender` 自动关闭
+  deferral,退回正常 versioned 路径;tx 若改了 beneficiary 的 nonce/code → 该 tx 退回普通写。
+  开关 `N42_DEFERRED_COINBASE=0`。
+- **soundness**:只要无 tx 分支于 coinbase 的块内中间余额(标准转账/ERC-20/DeFi 均不读
+  `block.coinbase` 余额)即与顺序逐字节一致。
+
+**对拍测试**(`deferred_parallel_matches_sequential_state`):200 笔独立转账付费给共享 coinbase,
+deferred 并行的**每个账户余额**(含 coinbase 费总额 `200×21000×7`)**逐一等于顺序执行**。
+第二个测试验证 bene-as-sender 守卫。
+
+实测(evm-bench Block-STM 段):
+
+| txs | deferred OFF | deferred ON | 提速 |
+|-----|-------------|-------------|------|
+| 2000 | 19295 ms | 47 ms | 410x |
+| 5000 | **227642 ms** | **100.9 ms** | **2257x** |
+
+并行从 O(n²) 级联恢复为**近线性**(~50 txs/ms)。
+
+> 注:trivial 转账下 par(100ms)仍 > seq(28ms)—— 这是并行协调的固定开销在"每笔仅 5µs"
+> 工作量下未摊平,**不是级联**(级联已除)。真实区块(合约调用、多 SLOAD)每笔工作量大得多,
+> 并行才赢;而那些块同样共享 coinbase,没有 deferred 就会被级联打死 —— 所以 deferred 是并行
+> 可用的前提。trivial-only 大块可由阈值/自适应调度走顺序,属调优。
+
 ## 状态
 
-修复 1/2/3 已落地,root/结果不变(par_ok=true 收敛正确),parallel-evm 测试 + clippy 绿。
-deferred coinbase 待续。
+修复 1/2/3/4 全部落地,结果与顺序执行逐账户一致(对拍测试),parallel-evm 4 测试 + clippy 绿。
+全局优化 #3 完成。
