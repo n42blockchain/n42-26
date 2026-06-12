@@ -25,11 +25,13 @@ GIT_COMMITTER_NAME="Nyxen" GIT_COMMITTER_EMAIL="40690755+MiraWells@users.noreply
 
 | reth 分支 | base | 对应依赖 pin |
 |-----------|------|-------------|
-| `n42-v2-upgrade`（旧） | reth v2.2.0 | revm 38 / alloy-evm 0.34 / reth-primitives-traits 0.3.1 |
-| **reth main 合并版（当前主线）** | upstream main | **revm 40.0.3 / alloy-evm 0.36.0 / reth-primitives-traits 0.4.0** |
+| `n42-v2-upgrade`（最旧） | reth v2.2.0 | revm 38 / alloy-evm 0.34 / reth-primitives-traits 0.3.1 |
+| `chore/merge-upstream-main`（旧） | upstream main @04c7f29f | revm 40.0.3 / alloy-evm 0.36.0 / reth-primitives-traits 0.4.0 |
+| **`chore/merge-upstream-fc2cc1e`（当前主线）** | upstream 2.3 @fc2cc1e9（merge 449ecfdce） | **revm 40.0.3 / alloy-evm 0.36.0 / reth-primitives-traits 0.4.1** |
 
-**当前 n42-26 主线（含 `chore/merge-reth-main-deps-upgrade`）用 reth main 合并版。** 动手前先
-`git -C ../reth log -1 --oneline` 确认 reth 在 main 合并版；**切勿为了让旧 reth 编过而降级
+**当前 n42-26 主线用 `chore/merge-upstream-fc2cc1e`（reth 2.3 合并版，jit/revmc 默认关闭——
+Windows 无 LLVM 22；Linux 要 JIT 用 `--features jit`）。** 动手前先
+`git -C ../reth log -1 --oneline` 确认 reth 在 449ecfdce（或其后代）；**切勿为了让旧 reth 编过而降级
 `Cargo.toml` 的 revm/alloy/reth-* 版本**——那会推翻 deps upgrade 工作（参见 devlog-60 维护者说明）。
 
 ## 常用命令
