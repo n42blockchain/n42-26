@@ -54,14 +54,18 @@ n42-evm-bench(samply/ETW,17 万样本)实测:
   (SLOAD→trie/mdbx/缓存 miss;bench 用 CacheDB 内存态故无此项)。
 - profile 另见 35.5% 线程等待(NtWaitForAlertByThreadId)= Block-STM 并行段同步空转,
   parallel-evm 的调度仍有余地。
-- **结构性方向**:reth 2.3 合并带来 upstream 的 BAL 并行执行(`bal_prewarm_pool`、
-  parallel BAL executor)+ prewarm,正是打 state-access 延迟的;n42 跟进配置/启用即可,
-  无需自研。
+- **结构性方向(更正)**:reth 2.3 带来 BAL 并行执行(`bal_prewarm_pool`、parallel BAL
+  executor),但 **`decoded_bal` 仅在块带 BAL 时非空,而 BAL=EIP-7928 是 Osaka 特性**。
+  **n42 只激活到 Cancun**(chainspec `.cancun_activated()`)→ BAL 并行执行**永不触发**。
+  启用它=激活 Osaka 硬分叉(整套 ruleset + payload builder 产 BAL + consensus-breaking +
+  全网 fork),**是大工程不是配置**。原"跟进配置即可"判断错误,已更正。详见下节。
 
 ## 全局优化排序(本轮诊断后)
 
 1. **BLS 收据 batch_verify(24x,~200ms@1 核)** —— 最大可收割,行动项已列。
-2. EVM state 层:跟进 reth 2.3 BAL 并行执行 + prewarm 配置(upstream 路线)。
+2. EVM state 层:reth 2.3 BAL 并行执行需 **Osaka 硬分叉**(n42 在 Cancun,永不触发)——
+   非配置,是 consensus-breaking 大工程,需单独立项。替代:把已优化的 n42-parallel-evm
+   (deferred coinbase)接进 reth 执行路径(也是大集成)。
 3. parallel-evm 同步空转(35% wait)—— Block-STM 调度精调,中等。
 4. twig/状态根:已完成(~6%→~1%)。
 5. 网络/序列化:实测 17-29 Gbps 分发、<2ms,无关紧要。
@@ -70,3 +74,23 @@ n42-evm-bench(samply/ETW,17 万样本)实测:
 
 - `crates/n42-primitives/examples/bls_receipt_bench.rs`(三方案对比,BLS_BENCH_N 可调)。
 - samply(ETW)+ `[profile.profiling]`(此前已加)。
+
+## 更正:BAL 并行执行需要 Osaka(非配置开关)
+
+调查(2026-06 本会话):
+- n42 执行走 reth `new_payload` → engine-tree `payload_validator`,BAL 并行执行就在这条路上,
+  且 reth 默认 `disable_bal_parallel_execution=false`(已启用)。
+- 但触发条件是 `env.decoded_bal.is_some()`;`decoded_bal = payload.block_access_list()`,
+  BAL=EIP-7928 是 **Osaka** 特性,payload 不带 BAL 就是 None。
+- **n42-chainspec 只 `.cancun_activated()`**(无 Prague/Osaka)→ 块永不带 BAL → 并行 BAL 死路。
+
+**启用 = 激活 Osaka 硬分叉**:整套 Osaka ruleset + payload builder 强制产 BAL
+(`MissingBlockAccessList`)+ consensus-breaking(fresh genesis / 全网协调 fork)+ 在 Osaka 下
+重验 HotStuff 共识 + 手机验证 + twig 状态树。**这是独立大工程,需立项规划,不在"快速优化"范围。**
+
+替代方向(都需集成工作,非配置):
+- 把 n42-parallel-evm(已 deferred coinbase + 并行 validation,Linux/jemalloc 下 scale)接进
+  reth 的 block executor(自定义 EvmConfig/Executor 委托),替代 reth 顺序 executor。但现状
+  `execute_block_parallel` 是 standalone,且 leader 已有 N42_PAYLOAD_CACHE 跳过重执行,主要
+  受益的是 follower eager import 的重块。
+- n42 真实 EVM 瓶颈缓解其实已大部分到位:leader 执行缓存(N42_PAYLOAD_CACHE,209ms→22ms)。
