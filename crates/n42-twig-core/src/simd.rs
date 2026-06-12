@@ -137,6 +137,29 @@ pub(crate) fn hash_leaves(jobs: &[(&Hash, &[u8])], out: &mut [Hash]) {
     }
 }
 
+/// Batched single-block blake3 over arbitrary ≤64-byte inputs: `out[i] =
+/// blake3(&msgs[i].0[..msgs[i].1 as usize])`. Each job carries its zero-padded
+/// 64-byte block plus the true input length (per-lane `block_len`). This is what
+/// key derivation reduces to: `account_key` is a 32-byte single-block input,
+/// `storage_key` exactly 64 — both batch 16-wide on AVX-512.
+pub fn hash_singleblock_batch(msgs: &[([u8; 64], u32)], out: &mut [Hash]) {
+    debug_assert_eq!(msgs.len(), out.len());
+    debug_assert!(msgs.iter().all(|(_, l)| *l <= 64));
+    match kernel() {
+        #[cfg(target_arch = "x86_64")]
+        Kernel::Avx512 => unsafe { x86::hash_singleblock_avx512(msgs, out) },
+        #[cfg(target_arch = "x86_64")]
+        Kernel::Avx2 => unsafe { x86::hash_singleblock_avx2(msgs, out) },
+        Kernel::Scalar => hash_singleblock_scalar(msgs, out),
+    }
+}
+
+fn hash_singleblock_scalar(msgs: &[([u8; 64], u32)], out: &mut [Hash]) {
+    for (o, (buf, len)) in out.iter_mut().zip(msgs) {
+        *o = *blake3::hash(&buf[..*len as usize]).as_bytes();
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
 mod x86 {
     use super::*;
@@ -311,6 +334,94 @@ mod x86 {
                 i += 16;
             }
             hash_parents_scalar(nodes, &parents[i..]);
+        }
+    }
+
+    #[target_feature(enable = "avx512f")]
+    pub(super) unsafe fn hash_singleblock_avx512(msgs: &[([u8; 64], u32)], out: &mut [Hash]) {
+        unsafe {
+            let iv = [
+                _mm512_set1_epi32(IV[0] as i32),
+                _mm512_set1_epi32(IV[1] as i32),
+                _mm512_set1_epi32(IV[2] as i32),
+                _mm512_set1_epi32(IV[3] as i32),
+                _mm512_set1_epi32(IV[4] as i32),
+                _mm512_set1_epi32(IV[5] as i32),
+                _mm512_set1_epi32(IV[6] as i32),
+                _mm512_set1_epi32(IV[7] as i32),
+            ];
+            let mut msg_t = [0u32; 16 * 16];
+            let mut lens = [0i32; 16];
+            let mut out_t = [0u32; 8 * 16];
+            let mut i = 0usize;
+            while i + 16 <= msgs.len() {
+                for l in 0..16 {
+                    let (buf, len) = &msgs[i + l];
+                    lens[l] = *len as i32;
+                    for w in 0..16 {
+                        msg_t[w * 16 + l] =
+                            u32::from_le_bytes(buf[4 * w..4 * w + 4].try_into().unwrap());
+                    }
+                }
+                let m = load16(&msg_t, 0);
+                let len_v = _mm512_loadu_si512(lens.as_ptr() as *const _);
+                let o = core16(&iv, &m, len_v, FLAG_SINGLE);
+                for (w, ov) in o.iter().enumerate() {
+                    _mm512_storeu_si512(out_t.as_mut_ptr().add(w * 16) as *mut _, *ov);
+                }
+                for l in 0..16 {
+                    let dst = out.as_mut_ptr().add(i + l) as *mut u32;
+                    for w in 0..8 {
+                        dst.add(w).write_unaligned(out_t[w * 16 + l]);
+                    }
+                }
+                i += 16;
+            }
+            hash_singleblock_scalar(&msgs[i..], &mut out[i..]);
+        }
+    }
+
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn hash_singleblock_avx2(msgs: &[([u8; 64], u32)], out: &mut [Hash]) {
+        unsafe {
+            let iv = [
+                _mm256_set1_epi32(IV[0] as i32),
+                _mm256_set1_epi32(IV[1] as i32),
+                _mm256_set1_epi32(IV[2] as i32),
+                _mm256_set1_epi32(IV[3] as i32),
+                _mm256_set1_epi32(IV[4] as i32),
+                _mm256_set1_epi32(IV[5] as i32),
+                _mm256_set1_epi32(IV[6] as i32),
+                _mm256_set1_epi32(IV[7] as i32),
+            ];
+            let mut msg_t = [0u32; 16 * 8];
+            let mut lens = [0i32; 8];
+            let mut out_t = [0u32; 8 * 8];
+            let mut i = 0usize;
+            while i + 8 <= msgs.len() {
+                for l in 0..8 {
+                    let (buf, len) = &msgs[i + l];
+                    lens[l] = *len as i32;
+                    for w in 0..16 {
+                        msg_t[w * 8 + l] =
+                            u32::from_le_bytes(buf[4 * w..4 * w + 4].try_into().unwrap());
+                    }
+                }
+                let m = load8(&msg_t, 0);
+                let len_v = _mm256_loadu_si256(lens.as_ptr() as *const _);
+                let o = core8(&iv, &m, len_v, FLAG_SINGLE);
+                for (w, ov) in o.iter().enumerate() {
+                    _mm256_storeu_si256(out_t.as_mut_ptr().add(w * 8) as *mut _, *ov);
+                }
+                for l in 0..8 {
+                    let dst = out.as_mut_ptr().add(i + l) as *mut u32;
+                    for w in 0..8 {
+                        dst.add(w).write_unaligned(out_t[w * 8 + l]);
+                    }
+                }
+                i += 8;
+            }
+            hash_singleblock_scalar(&msgs[i..], &mut out[i..]);
         }
     }
 
@@ -649,6 +760,45 @@ mod tests {
         hash_parents(&mut got, &parents);
         for (i, &p) in parents.iter().enumerate() {
             assert_eq!(got[p], want[i]);
+        }
+    }
+
+    #[test]
+    fn singleblock_kernels_match_blake3_crate() {
+        let mut rng = rand::rng();
+        // Key-derivation shapes: 32 B (account = domain+addr) and 64 B (storage),
+        // plus odd lengths and batch sizes that exercise tails.
+        for batch in [1usize, 7, 8, 9, 16, 17, 33, 50] {
+            let mut msgs = Vec::new();
+            for i in 0..batch {
+                let mut buf = [0u8; 64];
+                let len = [32u32, 64, 1, 20, 63, 12][i % 6];
+                let mut tmp = vec![0u8; len as usize];
+                rng.fill_bytes(&mut tmp);
+                buf[..len as usize].copy_from_slice(&tmp);
+                msgs.push((buf, len));
+            }
+            let want: Vec<Hash> = msgs
+                .iter()
+                .map(|(b, l)| *blake3::hash(&b[..*l as usize]).as_bytes())
+                .collect();
+            let mut got = vec![[0u8; 32]; batch];
+            hash_singleblock_batch(&msgs, &mut got);
+            assert_eq!(got, want, "dispatcher batch {batch}");
+
+            #[cfg(target_arch = "x86_64")]
+            {
+                if std::arch::is_x86_feature_detected!("avx2") {
+                    let mut got = vec![[0u8; 32]; batch];
+                    unsafe { x86::hash_singleblock_avx2(&msgs, &mut got) };
+                    assert_eq!(got, want, "avx2 batch {batch}");
+                }
+                if std::arch::is_x86_feature_detected!("avx512f") {
+                    let mut got = vec![[0u8; 32]; batch];
+                    unsafe { x86::hash_singleblock_avx512(&msgs, &mut got) };
+                    assert_eq!(got, want, "avx512 batch {batch}");
+                }
+            }
         }
     }
 

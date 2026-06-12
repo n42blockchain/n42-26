@@ -7,7 +7,7 @@
 //! KV when a `Modified` account has no `code_change`), then applies them in
 //! keyHash-sorted order. See `docs/devlog-64` (P6).
 
-use crate::keys::{account_key, storage_key};
+use crate::keys::{KeyJob, account_key, derive_keys_batch, storage_key};
 use crate::tree::{EMPTY_CODE_HASH, decode_code_hash, encode_account_value};
 
 use alloy_primitives::{Address, B256, U256};
@@ -90,22 +90,41 @@ impl TwigState {
     /// Flatten a `StateDiff` into per-op `(key, Option<(offset, len)>)` metadata
     /// plus one flat value arena (mirrors [`crate::ShardedSbmt`]'s prepare;
     /// `code_hash` read back from the unified KV).
+    ///
+    /// Key derivation (one blake3 per op) runs SIMD-batched up front via
+    /// [`derive_keys_batch`]; the second pass consumes the keys in the same
+    /// encounter order (the read-back of `code_hash` needs the derived key, so
+    /// it must run after derivation).
     #[allow(clippy::type_complexity)]
     fn prepare(&self, diff: &StateDiff) -> (Vec<(Hash, Option<(usize, usize)>)>, Vec<u8>) {
-        let mut meta: Vec<(Hash, Option<(usize, usize)>)> = Vec::new();
+        // Pass 1: collect every key-derivation job in encounter order.
+        let mut jobs: Vec<KeyJob> = Vec::new();
+        for (address, account_diff) in &diff.accounts {
+            jobs.push(KeyJob::Account(*address));
+            for slot in account_diff.storage.keys() {
+                jobs.push(KeyJob::Storage(*address, *slot));
+            }
+        }
+        let keys = derive_keys_batch(&jobs);
+
+        // Pass 2: build the op metadata + value arena, consuming keys in order.
+        let mut meta: Vec<(Hash, Option<(usize, usize)>)> = Vec::with_capacity(keys.len());
         let mut buf: Vec<u8> = Vec::new();
         let push_val = |buf: &mut Vec<u8>, v: &[u8]| {
             let off = buf.len();
             buf.extend_from_slice(v);
             Some((off, v.len()))
         };
-        for (address, account_diff) in &diff.accounts {
-            let key = account_key(address).0;
+        let mut ki = 0usize;
+        for account_diff in diff.accounts.values() {
+            let key = keys[ki];
+            ki += 1;
             match account_diff.change_type {
                 AccountChangeType::Destroyed => {
                     meta.push((key, None));
-                    for slot in account_diff.storage.keys() {
-                        meta.push((storage_key(address, slot).0, None));
+                    for _slot in account_diff.storage.keys() {
+                        meta.push((keys[ki], None));
+                        ki += 1;
                     }
                 }
                 AccountChangeType::Created | AccountChangeType::Modified => {
@@ -118,8 +137,9 @@ impl TwigState {
                     let v = encode_account_value(&balance, nonce, &code_hash);
                     let r = push_val(&mut buf, &v);
                     meta.push((key, r));
-                    for (slot, change) in &account_diff.storage {
-                        let skey = storage_key(address, slot).0;
+                    for change in account_diff.storage.values() {
+                        let skey = keys[ki];
+                        ki += 1;
                         if change.to.is_zero() {
                             meta.push((skey, None));
                         } else {

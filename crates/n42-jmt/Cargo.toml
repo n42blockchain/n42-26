@@ -48,3 +48,6 @@ harness = false
 
 [[example]]
 name = "sbmt_state_bench"
+
+[[example]]
+name = "twig_state_bench"

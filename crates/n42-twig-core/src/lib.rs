@@ -14,7 +14,7 @@ mod flat;
 mod simd;
 
 use flat::FlatIndex;
-pub use simd::kernel_name as simd_kernel_name;
+pub use simd::{hash_singleblock_batch, kernel_name as simd_kernel_name};
 
 /// 32-byte hash / key.
 pub type Hash = [u8; 32];

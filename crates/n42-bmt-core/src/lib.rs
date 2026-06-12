@@ -58,8 +58,11 @@ pub fn hash_value(value: &[u8]) -> Hash {
 // ---------------------------------------------------------------------------
 
 /// Domain separators preventing cross-type key collisions.
-const ACCOUNT_DOMAIN: &[u8] = b"n42:account:";
-const STORAGE_DOMAIN: &[u8] = b"n42:storage:";
+/// Domain separator for account keys (public so batched derivation in other
+/// crates can build the exact same blake3 input — single source of truth).
+pub const ACCOUNT_DOMAIN: &[u8] = b"n42:account:";
+/// Domain separator for storage keys (see [`ACCOUNT_DOMAIN`]).
+pub const STORAGE_DOMAIN: &[u8] = b"n42:storage:";
 
 /// Canonical SBMT key for an account leaf: `blake3("n42:account:" || address_20)`.
 #[inline]

@@ -215,6 +215,20 @@ vs C2 Go：单树 build 超 2.6×（4.4M vs 1.71M）；Go 16 分片 AVX-512 7.99
 **内存（按需）**
 - FlatIndex 负载因子/容量策略调优；twig 叶驱逐（仅当放弃全 DRAM 路线时，QMDB tier-2）。
 
+## key 派生 SIMD（系统级清单第一项，已落地）
+
+`account_key = blake3("n42:account:"‖addr)` 输入 32B、`storage_key` 恰 64B —— **都是单块**，
+与 node kernel 同构（core 已支持 per-lane len 向量，可混批）。落地：
+- `n42-twig-core::hash_singleblock_batch`（通用 ≤64B 单块批量，AVX-512 16-way / AVX2 / 标量）；
+- `n42-jmt::keys::derive_keys_batch(&[KeyJob])`（Account/Storage 混批，domain 常量由
+  n42-bmt-core 公开保单一来源）；
+- `TwigState::prepare` 重构两遍：pass-1 收集派生 jobs SIMD 批量，pass-2 按相同顺序消费 key
+  构建 meta（code_hash read-back 依赖派生出的 key，必须在派生后）。
+
+新增 `examples/twig_state_bench.rs`（StateDiff 全节点路径：派生+编码+引擎+root）。
+实测 1M 账户 + 250K storage ops：**2.03M → 2.27M ops/s（+11%）**。对拍：
+`batch_derivation_matches_scalar`（混合 jobs 全批/尾部逐字节一致）+ 全部既有测试（21+88）绿。
+
 ## 结论与后续
 
 - twig 全-DRAM @1M 真实账户 **280 B/acct**，比 SBMT 省 25%。但距 AlDBaran/QMDB ~100 B/acct
