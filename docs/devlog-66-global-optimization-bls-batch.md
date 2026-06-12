@@ -94,3 +94,29 @@ n42-evm-bench(samply/ETW,17 万样本)实测:
   `execute_block_parallel` 是 standalone,且 leader 已有 N42_PAYLOAD_CACHE 跳过重执行,主要
   受益的是 follower eager import 的重块。
 - n42 真实 EVM 瓶颈缓解其实已大部分到位:leader 执行缓存(N42_PAYLOAD_CACHE,209ms→22ms)。
+
+## 落地核验 + witness 路径调查(2026-06,先做2再做1)
+
+### 2. 落地核验:已做的赢焊死在生产树
+全 workspace 集成验证(含 BLS批 + parallel-evm 重写 + reth 2.3 merge + codex twig step1/2):
+**`cargo check --all-targets` 绿、1121 测试全过、clippy 仅 reth-path crates 普通 warning**。
+- BLS 收据批 24x:**已在 star_hub 生产路径**(LANDED)。
+- reth merge / deps / Windows jit / key-deriv SIMD / twig SIMD:已是基线 / 随 twig 落地。
+- twig 引擎:codex P6 step3 节点接线(N42_TWIG=1 + orchestrator + RPC)。
+- **parallel-evm:唯一未落地的赢,落地=B(信封重写大工程)**。手机 `verify_block` 也用 reth
+  `execute_one`(全块顺序),同样 B-blocker —— parallel-evm 处处需全块信封,无法低成本落地。
+
+### 1. witness/mobile-packet 路径:已优化,非热点
+查 `mobile_packet.rs` 生产路径:
+- **独立 async loop**(commit 触发)、**background、off slot 关键路径**。
+- **once-per-block,broadcast-once**(同一 compressed 包广播给所有手机)—— **无 per-phone leader 开销**
+  (之前"10k 手机=10k clone"的担忧不成立)。
+- **V2 differential**(`ReadLogDatabase` 抓 read-log,非全 witness)+ 代码差分缓存
+  (`previously_sent_codes`)—— 包已最小化。
+- 唯一低效:leader 在此 background loop **重执行**每块抓 read-log(共识时已执行过),但 background
+  不阻塞 slot,消除它需注入 read-log 捕获进 reth 共识执行(B 型)。不值。
+
+### 结论
+算法级大赢已榨完并(BLS)落地或(twig)接入中。**剩余候选(parallel-evm 落地、witness 重执行消除)
+全是 B 型(reth executor 信封集成)+ 边际收益**。下一步真正有价值的是 **testnet 真实 slot 测量**
+(现有微基准都 CacheDB 内存态,测不到真实瓶颈)—— 但需 Linux testnet。优化战役基本收官。
