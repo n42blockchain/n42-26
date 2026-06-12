@@ -148,16 +148,13 @@ impl MvMemory {
     /// whole block O(n^2).
     pub fn clear_tx(&self, tx_idx: TxIdx) {
         let start = std::time::Instant::now();
-        let mut writes_count: usize = 0;
-        let used_fallback = false;
         // Drop any deferred beneficiary delta from the prior execution.
         self.bene_deltas.remove(&tx_idx);
-        if let Some((_, writes)) = self.tx_writes.remove(&tx_idx) {
-            writes_count = writes.len();
-            for w in writes {
+        let writes_count = if let Some((_, writes)) = self.tx_writes.remove(&tx_idx) {
+            for w in &writes {
                 match w {
                     WriteKey::Account(addr) => {
-                        if let Some(entry) = self.accounts.get(&addr) {
+                        if let Some(entry) = self.accounts.get(addr) {
                             entry
                                 .write()
                                 .unwrap_or_else(|e| e.into_inner())
@@ -165,7 +162,7 @@ impl MvMemory {
                         }
                     }
                     WriteKey::Storage(addr, slot) => {
-                        if let Some(entry) = self.storage.get(&(addr, slot)) {
+                        if let Some(entry) = self.storage.get(&(*addr, *slot)) {
                             entry
                                 .write()
                                 .unwrap_or_else(|e| e.into_inner())
@@ -174,44 +171,12 @@ impl MvMemory {
                     }
                 }
             }
-        }
+            writes.len()
+        } else {
+            0
+        };
         let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-        metrics::histogram!(
-            "n42_mv_memory_clear_tx_ms",
-            "path" => if used_fallback { "fallback_scan" } else { "indexed" }
-        )
-        .record(elapsed_ms);
-        if !used_fallback {
-            metrics::histogram!("n42_mv_memory_clear_tx_writes").record(writes_count as f64);
-        }
-    }
-
-    /// Check if the latest writer for a key visible to `reader_idx` matches `expected_origin`.
-    /// Used during validation to detect conflicts.
-    pub fn latest_account_writer(&self, reader_idx: TxIdx, addr: &Address) -> Option<TxIdx> {
-        self.accounts.get(addr).and_then(|entry| {
-            entry
-                .read()
-                .unwrap_or_else(|e| e.into_inner())
-                .range(..reader_idx)
-                .next_back()
-                .map(|(&idx, _)| idx)
-        })
-    }
-
-    pub fn latest_storage_writer(
-        &self,
-        reader_idx: TxIdx,
-        addr: &Address,
-        slot: &U256,
-    ) -> Option<TxIdx> {
-        self.storage.get(&(*addr, *slot)).and_then(|entry| {
-            entry
-                .read()
-                .unwrap_or_else(|e| e.into_inner())
-                .range(..reader_idx)
-                .next_back()
-                .map(|(&idx, _)| idx)
-        })
+        metrics::histogram!("n42_mv_memory_clear_tx_ms").record(elapsed_ms);
+        metrics::histogram!("n42_mv_memory_clear_tx_writes").record(writes_count as f64);
     }
 }
