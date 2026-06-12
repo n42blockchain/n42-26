@@ -97,6 +97,26 @@ Go 7.99M 来自连续 twig(L2 驻留)+ AVX-512,不是单纯并行。→ n42-jmt 
 > 注:我们 Rust **scalar build 1.89M/s 已超 C2 Go 单树 1.71M**(无 GC + 自适应 fold)。更新
 > 吞吐 925k 低于 C2 Go 7.99M,差距是 cache 布局 + SIMD + 紧循环(AlDBaran 技术),并行解决不了。
 
+## twig buffering（算法级，root 不变，更新 +29%）
+
+`Twig::fold_batch`：一个块内多次改同一 twig 时，**逐层算父节点、每节点只 hash 一次**（兄弟对去重），
+取代"每叶各自 fold 11 层"（K×11，共享祖先重复算）。`root()` 的稀疏分支用它（稠密仍整体重算）。
+
+为何有效：一个 25000-更新的块,每 shard ~1562 更新散到 ~31 twig = **每 twig ~50 改动**（K≈50），
+原 50×11=550(重复) → buffering ~union-of-paths（~5x 少 hash）。
+
+实测（1M 真实账户,400K 更新）：
+
+| block | 优化前 | twig buffering |
+|-------|--------|----------------|
+| 25000（真实块大小） | 533k/s | **687k/s（+29%）** |
+| 200000（K>187→recompute） | — | 761k/s（buffering 不适用,本就重算） |
+
+root 不变（3 个 gov5 对拍 + 14 测试全过）;genesis build 持平（稠密走 recompute,不变）。
+
+> 真实块大小（K 中等）正是共识场景,所以 +29% 是实打实的更新吞吐提升。更大块 K>187 走 recompute
+> 已最优,buffering 不适用。
+
 ## 结论与后续
 
 - twig 全-DRAM @1M 真实账户 **280 B/acct**，比 SBMT 省 25%。但距 AlDBaran/QMDB ~100 B/acct

@@ -83,16 +83,38 @@ impl Twig {
         self.dirty = true;
     }
 
-    /// Eager-fold a single leaf's path to the root (11 hashes). Cheap for a twig
-    /// with few changed leaves this batch.
-    #[inline]
-    fn fold_path(&mut self, local: usize) {
-        let mut j = TWIG_SIZE + local;
-        while j > 1 {
-            let p = j >> 1;
-            self.nodes[p] = hash_node(&self.nodes[2 * p], &self.nodes[2 * p + 1]);
-            j = p;
+    /// Batch-fold the union of several changed leaves' paths, computing each
+    /// internal node **once** (twig buffering): process level by level, dedup the
+    /// parents, hash each. For K changed leaves this is ~union-of-paths hashes vs
+    /// K×11 for per-leaf folding — a big win when many leaves in one twig change
+    /// in a block. `scratch` is a reusable buffer to avoid per-call allocation.
+    fn fold_batch(&mut self, locals: &[usize], scratch: &mut Vec<usize>) {
+        if locals.is_empty() {
+            return;
         }
+        scratch.clear();
+        scratch.extend(locals.iter().map(|&l| TWIG_SIZE + l));
+        scratch.sort_unstable();
+        scratch.dedup();
+        // Fold up level by level until the root (node 1).
+        let mut level = std::mem::take(scratch);
+        while level[0] > 1 {
+            // Recompute each distinct parent of this (sorted) level exactly once;
+            // sibling pairs share a parent and are adjacent, so `p != last` dedups.
+            let mut w = 0usize;
+            let mut last = usize::MAX;
+            for r in 0..level.len() {
+                let p = level[r] >> 1;
+                if p != last {
+                    self.nodes[p] = hash_node(&self.nodes[2 * p], &self.nodes[2 * p + 1]);
+                    level[w] = p;
+                    w += 1;
+                    last = p;
+                }
+            }
+            level.truncate(w);
+        }
+        *scratch = level;
     }
 
     /// Full bottom-up recompute of all 2047 internal nodes. Cheaper than per-leaf
@@ -420,6 +442,8 @@ impl TwigTree {
         if !self.touched.is_empty() {
             self.touched.sort_unstable();
             self.touched.dedup();
+            let mut fold_locals: Vec<usize> = Vec::new();
+            let mut fold_scratch: Vec<usize> = Vec::new();
             let mut i = 0;
             while i < self.touched.len() {
                 let twig_id = (self.touched[i] / TWIG_SIZE as u64) as usize;
@@ -435,10 +459,11 @@ impl TwigTree {
                     if count * TWIG_HEIGHT >= TWIG_SIZE {
                         twig.recompute();
                     } else {
+                        fold_locals.clear();
                         for k in i..j {
-                            let local = (self.touched[k] % TWIG_SIZE as u64) as usize;
-                            twig.fold_path(local);
+                            fold_locals.push((self.touched[k] % TWIG_SIZE as u64) as usize);
                         }
+                        twig.fold_batch(&fold_locals, &mut fold_scratch);
                     }
                     twig.dirty = false;
                 }
