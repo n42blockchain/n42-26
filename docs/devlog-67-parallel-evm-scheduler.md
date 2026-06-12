@@ -201,3 +201,29 @@ workload 有效性 + B(接入生产)是必须的正确性基础。
 
 > 教训:之前 devlog 说"hot_recipient 通过证明引擎对热账户 sound"是**错的**(那次侥幸过)。
 > 重复运行 + 模块化重构把它揪了出来。已纠正。
+
+## 审计扩展:scheduler 收敛性 + execution_bridge 生产块导入
+
+继 mv_memory 之后审了两块,均 sound,无新 bug:
+
+**scheduler 收敛性/liveness**:
+- 兜底:`while !all_done && round<10 { rayon::scope }` + worker `retries>100` break → 最坏 10 轮
+  后回退顺序执行,**永不永久 stall**;sequential fallback 是 liveness 后盾。
+- REDO 必入队:abort 的每个 EXECUTED/VALIDATED→REDO 转换(CAS)都 push redo;PENDING 高 tx
+  跳过(本就在 exec_cursor / in-flight 执行)→ 无 tx 丢失永不执行。
+- val_cursor 不卡死:tx[v]=REDO 时返 None 自旋,另一 worker pop_redo 重执行→EXECUTED→推进。
+- all_done 不提前:外层在 `rayon::scope` 全 worker join 后才查(无 in-flight task,count 稳定);
+  worker 内见瞬时 count=n 而 break 时,正做 abort 的 worker 未 break → scope 不返回 → 不误判。
+- finish_execution 覆盖并发 REDO 良性:陈旧执行由 in-order + 值校验在验证时抓。
+- 实证:hot_recipient(150-tx 全依赖链,高冲突)×30 收敛正确。
+
+**execution_bridge 生产块导入**:
+- `CompactInjectTracker`(全局 Mutex):FIFO `order` + `counts`,2048 上限驱逐,dedup,mutex 毒恢复 → 有界,无泄漏。
+- `reth_evm::payload_cache`(N42_PAYLOAD_CACHE 核心):**单条目** `Option<CachedPayload>`,store 覆写
+  → 无泄漏;cache miss 仅降级到重执行(状态根仍校验)→ 无正确性风险;单 leader 串行建块 + Mutex → 无竞争;downcast 类型检查。
+- syncing 重试:队列 `MAX_SYNCING_QUEUE_SIZE`(pop_front 溢出)+ 重试 `MAX_SYNCING_RETRIES=3`
+  (超限丢弃)→ 双重有界,无无限重入。
+
+**审计总结(本轮 parallel-evm + 生产路径)**:真实 bug 全在 parallel-evm 且已修(deferred coinbase
+非-EOA saturation、validated_count 竞争、out-of-order validation 不健全→恢复 in-order、值校验);
+mv_memory/scheduler/execution_bridge 经审 sound,清了死代码。生产块导入路径成熟稳健。
