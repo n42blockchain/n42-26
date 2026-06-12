@@ -95,6 +95,28 @@ apply_diff 不会删它们 → 孤儿叶子。但 n42 自创世即 Cancun/EIP-67
 - `cargo test -p n42-twig-core`:21 passed;`cargo test -p n42-execution state_diff`:21 passed
   (含 2 个新回归测试)。
 
+## 5. parallel-evm 边界回归 —— 全态 differential 对拍
+
+审计收尾把 parallel-evm 的 differential 从"只比 balance"升级到**全态字节对拍**。新增
+`differential_tests` 模块(`lib.rs`),用确定性 xorshift64 PRNG(无 `rand` 依赖)生成随机
+混合块,逐块跑 sequential(参照)+ parallel(×4 重复)并断言:
+- **每个账户的 balance / nonce / code_hash / 每个存储槽**(`fingerprint`,BTreeMap 有序),
+- **每笔 tx 的 gas_used / success**(`results_fp`)。
+
+混合负载覆盖 Block-STM 的冲突机制:
+- **counter 合约**(`slot[0]+=1` 字节码)被多 tx CALL → 重读写存储冲突,强制 abort/重执行级联;
+  `differential_storage_conflict_counter_is_exact` 锁定"N 次调用后 slot0==N"。
+- **热收款人**(共享 EOA)→ 余额冲突;**冷收款人** → 无冲突;**延迟 coinbase**(basefee 0)
+  混入。
+- 8 个种子 × 不同 tx/合约数(合约越少存储越热、abort 越多)+ 单 counter 高争用块。
+
+×4 重复是为了抓非确定性竞态(就是当初 `hot_recipient` flaky 那类——in-order validation +
+value-based 读集修复前会偶发)。**release 下连跑 12 轮全绿**(每轮 = 多种子 × parallel×4),
+parallel 与 sequential 全态一致。全套 9 测试通过,clippy 干净。
+
+(真实链上 tx 回放需把 reth-db/provider provider 接进来读 reth2k MDBX——依赖面大且与当前 reth
+pin 敏感,留作更大的后续任务;本轮用真实块"形状"的随机混合负载覆盖正确性边界。)
+
 ## n42-node orchestrator(3-way select)—— 只读审计,无 bug
 
 (codex 并发在 n42-node 上,本块只读不改。)biased `select!` 9 分支按共识优先级排序防饥饿;

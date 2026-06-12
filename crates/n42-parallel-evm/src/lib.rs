@@ -400,3 +400,287 @@ mod deferred_coinbase_tests {
         assert_eq!(balances(&seq), balances(&par), "must match sequential exactly");
     }
 }
+
+/// Differential regression: randomized mixed-workload blocks run through the
+/// parallel engine must produce **byte-for-byte the same post-state** as the
+/// sequential reference — not just balances, but every account's nonce,
+/// code_hash, and storage slot, plus per-tx gas/success. Each block is run
+/// through the parallel path several times to catch nondeterministic races
+/// (the class of bug that made `hot_recipient` flaky before the in-order
+/// validation + value-based read-set fix; see `docs/devlog-67`/`-69`).
+#[cfg(test)]
+mod differential_tests {
+    use super::*;
+    use alloy_primitives::{B256, Bytes, TxKind, U256};
+    use revm::database::{CacheDB, EmptyDB};
+    use revm::state::{AccountInfo, Bytecode};
+    use std::collections::BTreeMap;
+
+    /// Tiny deterministic xorshift64 PRNG — reproducible blocks, no `rand` dep.
+    struct Rng(u64);
+    impl Rng {
+        fn new(seed: u64) -> Self {
+            Self(seed ^ 0x9E37_79B9_7F4A_7C15)
+        }
+        fn next_u64(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            if n == 0 { 0 } else { self.next_u64() % n }
+        }
+    }
+
+    fn addr(n: u64) -> Address {
+        Address::from_word(U256::from(n).into())
+    }
+
+    /// Minimal "counter" contract: `slot[0] += 1` then STOP. Every CALL to it
+    /// SLOADs slot 0, adds 1, SSTOREs — so N calls must serialize and leave the
+    /// slot at N. This is the heavy read-write storage-conflict probe for
+    /// Block-STM (forces abort/re-execute cascades).
+    fn counter_code() -> Bytecode {
+        // 60 00  PUSH1 0   | 54 SLOAD | 60 01 PUSH1 1 | 01 ADD
+        // 60 00  PUSH1 0   | 55 SSTORE | 00 STOP
+        Bytecode::new_raw(Bytes::from_static(&[
+            0x60, 0x00, 0x54, 0x60, 0x01, 0x01, 0x60, 0x00, 0x55, 0x00,
+        ]))
+    }
+
+    /// Full post-state fingerprint of one account: balance, nonce, code_hash,
+    /// and every changed storage slot (present value).
+    #[derive(PartialEq, Eq, Debug)]
+    struct AcctFp {
+        balance: U256,
+        nonce: u64,
+        code_hash: B256,
+        storage: BTreeMap<U256, U256>,
+    }
+
+    /// Canonical, order-independent fingerprint of the whole block output.
+    fn fingerprint(out: &ParallelExecutionOutput) -> BTreeMap<Address, AcctFp> {
+        out.state_changes
+            .iter()
+            .map(|(a, acc)| {
+                let storage = acc
+                    .storage
+                    .iter()
+                    .map(|(k, slot)| (*k, slot.present_value))
+                    .collect();
+                (
+                    *a,
+                    AcctFp {
+                        balance: acc.info.balance,
+                        nonce: acc.info.nonce,
+                        code_hash: acc.info.code_hash,
+                        storage,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn results_fp(out: &ParallelExecutionOutput) -> Vec<(u64, bool)> {
+        out.results.iter().map(|r| (r.gas_used, r.success)).collect()
+    }
+
+    /// Build a randomized mixed block: `n` txs, each from a unique sender (nonce
+    /// 0, well funded), randomly either (a) CALLing one of `k` shared counter
+    /// contracts (storage conflict) or (b) transferring a random value to one of
+    /// a few shared "hot" recipients or a unique cold recipient (balance
+    /// conflict). Beneficiary is a clean EOA, basefee 0 ⇒ all gas accrues to it
+    /// (exercises deferred coinbase under mixed load).
+    fn mixed_block(seed: u64, n: u64, k: u64) -> (CacheDB<EmptyDB>, Vec<TxEnv>, BlockEnv) {
+        let mut rng = Rng::new(seed);
+        let mut db = CacheDB::<EmptyDB>::default();
+
+        // Counter contracts.
+        let code = counter_code();
+        let code_hash = code.hash_slow();
+        for c in 0..k {
+            db.insert_account_info(
+                addr(0xC000_0000 + c),
+                AccountInfo {
+                    balance: U256::ZERO,
+                    nonce: 1,
+                    code_hash,
+                    code: Some(code.clone()),
+                    ..Default::default()
+                },
+            );
+        }
+        // A handful of hot recipient EOAs.
+        let hot_count = 3u64;
+        for h in 0..hot_count {
+            db.insert_account_info(
+                addr(0x8000_0000 + h),
+                AccountInfo {
+                    balance: U256::from(1u64),
+                    nonce: 0,
+                    ..Default::default()
+                },
+            );
+        }
+
+        let mut txs = Vec::with_capacity(n as usize);
+        for i in 0..n {
+            let sender = addr(0x10_0000 + i);
+            db.insert_account_info(
+                sender,
+                AccountInfo {
+                    balance: U256::from(u128::MAX),
+                    nonce: 0,
+                    ..Default::default()
+                },
+            );
+
+            let (target, value, gas) = if rng.below(2) == 0 && k > 0 {
+                // CALL a shared counter contract (storage conflict).
+                (addr(0xC000_0000 + rng.below(k)), U256::ZERO, 100_000)
+            } else if rng.below(3) != 0 {
+                // Transfer to a shared hot recipient (balance conflict).
+                (
+                    addr(0x8000_0000 + rng.below(hot_count)),
+                    U256::from(rng.below(1_000) + 1),
+                    21_000,
+                )
+            } else {
+                // Transfer to a unique cold recipient.
+                (
+                    addr(0x4000_0000 + i),
+                    U256::from(rng.below(1_000) + 1),
+                    21_000,
+                )
+            };
+
+            txs.push(
+                TxEnv::builder()
+                    .caller(sender)
+                    .kind(TxKind::Call(target))
+                    .value(value)
+                    .gas_limit(gas)
+                    .gas_price(7) // basefee 0 ⇒ all 7/gas to the beneficiary
+                    .nonce(0)
+                    .build()
+                    .unwrap(),
+            );
+        }
+
+        let block = BlockEnv {
+            beneficiary: addr(0xBE0E_F1C1),
+            ..Default::default()
+        };
+        (db, txs, block)
+    }
+
+    /// Run one randomized block through sequential (reference) and parallel
+    /// (4 repeats), asserting full post-state + per-tx results match every time.
+    fn assert_block_matches(seed: u64, n: u64, k: u64) {
+        let (db, txs, block) = mixed_block(seed, n, k);
+        let cfg = CfgEnv::default();
+
+        let seq = sequential_execute(&txs, &db, &cfg, &block).unwrap();
+        let seq_fp = fingerprint(&seq);
+        let seq_res = results_fp(&seq);
+
+        unsafe { std::env::set_var("N42_PARALLEL_THRESHOLD", "1") };
+        for run in 0..4 {
+            let par = parallel_execute(&txs, &db, cfg.clone(), block.clone()).unwrap();
+            assert_eq!(
+                fingerprint(&par),
+                seq_fp,
+                "seed={seed} n={n} k={k} run={run}: post-state diverged from sequential"
+            );
+            assert_eq!(
+                results_fp(&par),
+                seq_res,
+                "seed={seed} n={n} k={k} run={run}: per-tx gas/success diverged"
+            );
+        }
+        unsafe { std::env::remove_var("N42_PARALLEL_THRESHOLD") };
+    }
+
+    #[test]
+    fn differential_mixed_workloads_match_sequential() {
+        // Varied conflict densities: many seeds, varying tx counts and contract
+        // counts (fewer contracts ⇒ hotter storage ⇒ more aborts).
+        for seed in 0..8u64 {
+            assert_block_matches(seed, 120, 4);
+        }
+    }
+
+    #[test]
+    fn differential_high_storage_contention() {
+        // A single shared counter ⇒ every contract call serializes on slot 0.
+        // The final counter must equal the number of successful calls, identical
+        // in parallel and sequential.
+        assert_block_matches(0xABCD, 150, 1);
+        assert_block_matches(0x1234, 150, 1);
+    }
+
+    #[test]
+    fn differential_storage_conflict_counter_is_exact() {
+        // Pin down the counter semantics: K=1, all-CALL block (no transfers) must
+        // leave slot 0 == number of txs, matching sequential exactly.
+        let n = 100u64;
+        let mut db = CacheDB::<EmptyDB>::default();
+        let code = counter_code();
+        let code_hash = code.hash_slow();
+        let contract = addr(0xC000_0000);
+        db.insert_account_info(
+            contract,
+            AccountInfo {
+                balance: U256::ZERO,
+                nonce: 1,
+                code_hash,
+                code: Some(code),
+                ..Default::default()
+            },
+        );
+        let mut txs = Vec::new();
+        for i in 0..n {
+            let sender = addr(0x10_0000 + i);
+            db.insert_account_info(
+                sender,
+                AccountInfo {
+                    balance: U256::from(u128::MAX),
+                    nonce: 0,
+                    ..Default::default()
+                },
+            );
+            txs.push(
+                TxEnv::builder()
+                    .caller(sender)
+                    .kind(TxKind::Call(contract))
+                    .value(U256::ZERO)
+                    .gas_limit(100_000)
+                    .gas_price(7)
+                    .nonce(0)
+                    .build()
+                    .unwrap(),
+            );
+        }
+        let cfg = CfgEnv::default();
+        let block = BlockEnv {
+            beneficiary: addr(0xBE0E_F1C1),
+            ..Default::default()
+        };
+        let seq = sequential_execute(&txs, &db, &cfg, &block).unwrap();
+        unsafe { std::env::set_var("N42_PARALLEL_THRESHOLD", "1") };
+        let par = parallel_execute(&txs, &db, cfg.clone(), block.clone()).unwrap();
+        unsafe { std::env::remove_var("N42_PARALLEL_THRESHOLD") };
+
+        let counter = par
+            .state_changes
+            .get(&contract)
+            .and_then(|a| a.storage.get(&U256::ZERO))
+            .map(|s| s.present_value);
+        assert_eq!(counter, Some(U256::from(n)), "counter must equal tx count");
+        assert_eq!(fingerprint(&seq), fingerprint(&par), "full state must match");
+        assert_eq!(results_fp(&seq), results_fp(&par), "per-tx results must match");
+    }
+}
