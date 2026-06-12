@@ -287,6 +287,13 @@ impl TwigTree {
     /// Insert or update `key -> value`. Deactivates the old slot if the key
     /// existed, then appends a fresh entry at `next_slot`.
     pub fn set(&mut self, key: Hash, value: &[u8]) {
+        self.set_with_leaf(key, value, hash_leaf(&key, value));
+    }
+
+    /// [`set`](Self::set) with a precomputed leaf hash — the batch path computes
+    /// leaf hashes SIMD-batched up front and feeds them through here.
+    fn set_with_leaf(&mut self, key: Hash, value: &[u8], leaf: Hash) {
+        debug_assert_eq!(leaf, hash_leaf(&key, value));
         if let Some(old) = self.lookup(&key) {
             self.deactivate(old);
         }
@@ -300,7 +307,6 @@ impl TwigTree {
                 self.twigs.push(Twig::new(&nl));
             }
         }
-        let leaf = hash_leaf(&key, value);
         self.touched.push(slot);
         let t = &mut self.twigs[twig_id];
         t.write_leaf(local, leaf);
@@ -340,17 +346,36 @@ impl TwigTree {
     /// are expected unique (the `StateDiff`/sharded layer guarantees this).
     pub fn apply_batch(&mut self, ops: &[(Hash, Option<Vec<u8>>)]) {
         let mut order: Vec<usize> = (0..ops.len()).collect();
+        self.apply_batch_indexed(ops, &mut order);
+    }
+
+    /// Like [`apply_batch`](Self::apply_batch) but over caller-provided op
+    /// indices (sorted in place) — lets the sharded layer partition a block by
+    /// index instead of cloning every op's value into per-shard Vecs.
+    pub fn apply_batch_indexed(&mut self, ops: &[(Hash, Option<Vec<u8>>)], order: &mut [usize]) {
         order.sort_by_key(|&i| ops[i].0);
+        // Pass 0: SIMD-batch the leaf hashes of every Set op up front (16-way on
+        // AVX-512). Safe to precompute: leaf hash depends only on (key, value).
+        let jobs: Vec<(&Hash, &[u8])> = order
+            .iter()
+            .filter_map(|&i| ops[i].1.as_ref().map(|v| (&ops[i].0, v.as_slice())))
+            .collect();
+        let mut leaf_hashes = vec![NULL_HASH; jobs.len()];
+        simd::hash_leaves(&jobs, &mut leaf_hashes);
         // Software-prefetch the index bucket a few ops ahead: each op's first
         // dependent load is its (randomly located) index bucket, so issuing the
         // line early overlaps the DRAM miss with the current op's hashing.
         const PREFETCH_AHEAD: usize = 12;
+        let mut next_leaf = 0usize;
         for (k, &i) in order.iter().enumerate() {
             if let Some(&j) = order.get(k + PREFETCH_AHEAD) {
                 self.index.prefetch(Self::prefix(&ops[j].0));
             }
             match &ops[i].1 {
-                Some(v) => self.set(ops[i].0, v),
+                Some(v) => {
+                    self.set_with_leaf(ops[i].0, v, leaf_hashes[next_leaf]);
+                    next_leaf += 1;
+                }
                 None => {
                     self.delete(&ops[i].0);
                 }
@@ -707,10 +732,10 @@ impl ShardedTwig {
     /// shards under the `rayon` feature, no locks (each worker owns one shard).
     /// Returns `(version, combined_root)`.
     pub fn apply_batch(&mut self, ops: &[(Hash, Option<Vec<u8>>)]) -> (u64, Hash) {
-        let mut per_shard: Vec<Vec<(Hash, Option<Vec<u8>>)>> =
-            (0..SHARD_COUNT).map(|_| Vec::new()).collect();
-        for op in ops {
-            per_shard[shard_index(&op.0)].push(op.clone());
+        // Partition by op INDEX — no value clones (a block's values can be MBs).
+        let mut per_shard: Vec<Vec<usize>> = (0..SHARD_COUNT).map(|_| Vec::new()).collect();
+        for (i, op) in ops.iter().enumerate() {
+            per_shard[shard_index(&op.0)].push(i);
         }
         #[cfg(feature = "rayon")]
         let roots: Vec<Hash> = {
@@ -718,9 +743,9 @@ impl ShardedTwig {
             self.shards
                 .par_iter_mut()
                 .zip(per_shard.into_par_iter())
-                .map(|(shard, shard_ops)| {
-                    if !shard_ops.is_empty() {
-                        shard.apply_batch(&shard_ops);
+                .map(|(shard, mut idx)| {
+                    if !idx.is_empty() {
+                        shard.apply_batch_indexed(ops, &mut idx);
                     }
                     shard.root()
                 })
@@ -731,9 +756,9 @@ impl ShardedTwig {
             .shards
             .iter_mut()
             .zip(per_shard)
-            .map(|(shard, shard_ops)| {
-                if !shard_ops.is_empty() {
-                    shard.apply_batch(&shard_ops);
+            .map(|(shard, mut idx)| {
+                if !idx.is_empty() {
+                    shard.apply_batch_indexed(ops, &mut idx);
                 }
                 shard.root()
             })

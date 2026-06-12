@@ -1,19 +1,21 @@
-//! Batched internal-node hashing: N-way (16 AVX-512 / 8 AVX2) single-block
-//! blake3 compressions in transposed (SoA) form.
+//! Batched blake3 compressions: N-way (16 AVX-512 / 8 AVX2) in transposed (SoA)
+//! form, for internal-node hashing AND leaf hashing.
 //!
 //! `hash_node(left, right) = blake3(left || right)` is a 64-byte input — exactly
-//! one blake3 block, i.e. ONE compression call with `CV = IV`, `block_len = 64`,
-//! `flags = CHUNK_START | CHUNK_END | ROOT`, output = first 8 state words. That
-//! makes batching trivial: run the compression across SIMD lanes, one independent
-//! (left, right) pair per lane. This mirrors gov5's Go `compressNodes16AVX512` /
-//! `compressNodes8AVX2` kernels.
+//! one blake3 compression with `CV = IV`, `block_len = 64`, `flags = CHUNK_START |
+//! CHUNK_END | ROOT`. `hash_leaf(key, value) = blake3(0x01 || key || value)` is a
+//! 65..=128-byte input for our 32/72-byte values — a TWO-compression chain
+//! (block 1: flags=CHUNK_START, output is the chaining value; block 2:
+//! flags=CHUNK_END|ROOT). Both reduce to the same lane-parallel compression core
+//! parameterized by (cv, message, block_len, flags), mirroring gov5's Go
+//! `compressNodes16AVX512` / `hashLeaves16` kernels.
 //!
-//! Correctness: the kernels are verified byte-for-byte against the `blake3` crate
-//! in unit tests (random inputs), and the end-to-end gov5 cross-check tests pin
-//! the whole pipeline. Runtime feature detection picks AVX-512 → AVX2 → scalar;
-//! `TWIG_NO_SIMD=1` forces scalar (for A/B measurement and non-x86 parity).
+//! Correctness: every kernel is verified byte-for-byte against the `blake3` crate
+//! in unit tests (random inputs incl. length edge cases), and the gov5 end-to-end
+//! cross-checks pin the whole pipeline. Runtime detection picks AVX-512 → AVX2 →
+//! scalar; `TWIG_NO_SIMD=1` forces scalar (A/B measurement, non-x86 parity).
 
-use crate::{Hash, hash_node};
+use crate::{Hash, hash_leaf, hash_node};
 
 /// blake3 IV (also the CV for a single-chunk input).
 #[cfg(target_arch = "x86_64")]
@@ -41,11 +43,12 @@ const MSG_SCHEDULE: [[usize; 16]; 7] = [
     [11, 15, 5, 0, 1, 9, 8, 6, 14, 10, 2, 12, 3, 4, 7, 13],
 ];
 
-/// CHUNK_START | CHUNK_END | ROOT — a complete single-block, single-chunk input.
 #[cfg(target_arch = "x86_64")]
-const FLAGS: u32 = 0x0B;
+const FLAG_CHUNK_START: u32 = 0x01;
 #[cfg(target_arch = "x86_64")]
-const BLOCK_LEN: u32 = 64;
+const FLAG_CHUNK_END_ROOT: u32 = 0x0A; // CHUNK_END | ROOT
+#[cfg(target_arch = "x86_64")]
+const FLAG_SINGLE: u32 = 0x0B; // CHUNK_START | CHUNK_END | ROOT
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kernel {
@@ -116,6 +119,24 @@ fn hash_parents_scalar(nodes: &mut [Hash], parents: &[usize]) {
     }
 }
 
+/// Batched `hash_leaf`: `out[i] = blake3(0x01 || keys[i] || values[i])` for every
+/// job. Jobs whose total input (33 + value_len) exceeds 128 bytes fall back to the
+/// scalar path; our account (72 B) and storage (32 B) values are always ≤ 128.
+pub(crate) fn hash_leaves(jobs: &[(&Hash, &[u8])], out: &mut [Hash]) {
+    debug_assert_eq!(jobs.len(), out.len());
+    match kernel() {
+        #[cfg(target_arch = "x86_64")]
+        Kernel::Avx512 => unsafe { x86::hash_leaves_avx512(jobs, out) },
+        #[cfg(target_arch = "x86_64")]
+        Kernel::Avx2 => unsafe { x86::hash_leaves_avx2(jobs, out) },
+        Kernel::Scalar => {
+            for (o, (k, v)) in out.iter_mut().zip(jobs) {
+                *o = hash_leaf(k, v);
+            }
+        }
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
 mod x86 {
     use super::*;
@@ -154,60 +175,62 @@ mod x86 {
         }
     }
 
-    // ── AVX-512: 16 lanes ──
-
-    #[target_feature(enable = "avx512f")]
-    pub(super) unsafe fn hash_parents_avx512(nodes: &mut [Hash], parents: &[usize]) {
-        let mut i = 0usize;
-        let mut msg_t = [0u32; 16 * 16];
-        let mut out_t = [0u32; 8 * 16];
-        while i + 16 <= parents.len() {
-            unsafe {
-                for l in 0..16 {
-                    fill_lane::<16>(&mut msg_t, nodes, l, parents[i + l]);
-                }
-                compress16(&msg_t, &mut out_t);
-                for l in 0..16 {
-                    store_lane::<16>(&out_t, nodes, l, parents[i + l]);
-                }
-            }
-            i += 16;
+    /// Transpose one lane's 128-byte (2-block) leaf input `0x01 || key || value`
+    /// into the two word-major message buffers.
+    #[inline(always)]
+    fn fill_leaf_lane<const LANES: usize>(
+        m1_t: &mut [u32],
+        m2_t: &mut [u32],
+        lane: usize,
+        key: &Hash,
+        value: &[u8],
+    ) {
+        let mut buf = [0u8; 128];
+        buf[0] = 0x01;
+        buf[1..33].copy_from_slice(key);
+        buf[33..33 + value.len()].copy_from_slice(value);
+        for w in 0..16 {
+            m1_t[w * LANES + lane] = u32::from_le_bytes(buf[4 * w..4 * w + 4].try_into().unwrap());
+            m2_t[w * LANES + lane] =
+                u32::from_le_bytes(buf[64 + 4 * w..64 + 4 * w + 4].try_into().unwrap());
         }
-        hash_parents_scalar(nodes, &parents[i..]);
     }
 
-    /// 16 independent single-block blake3 compressions (CV=IV, len=64,
-    /// flags=CHUNK_START|CHUNK_END|ROOT), transposed: word w of lane l lives at
-    /// `[w * 16 + l]`. Output is the first 8 state words xor the second 8.
+    // ── AVX-512: 16 lanes ──
+
+    /// One lane-parallel blake3 compression: state words live across 16 lanes.
+    /// Returns the 8-word output (`v[i] ^ v[i+8]`), which doubles as the chaining
+    /// value for multi-block inputs.
     #[target_feature(enable = "avx512f")]
-    unsafe fn compress16(msg_t: &[u32; 256], out_t: &mut [u32; 128]) {
-        unsafe {
-            let mut m = [_mm512_setzero_si512(); 16];
-            for (w, mv) in m.iter_mut().enumerate() {
-                *mv = _mm512_loadu_si512(msg_t.as_ptr().add(w * 16) as *const _);
-            }
+    unsafe fn core16(
+        cv: &[__m512i; 8],
+        m: &[__m512i; 16],
+        len: __m512i,
+        flags: u32,
+    ) -> [__m512i; 8] {
+        {
             macro_rules! bc {
                 ($x:expr) => {
                     _mm512_set1_epi32($x as i32)
                 };
             }
             let mut v = [
-                bc!(IV[0]),
-                bc!(IV[1]),
-                bc!(IV[2]),
-                bc!(IV[3]),
-                bc!(IV[4]),
-                bc!(IV[5]),
-                bc!(IV[6]),
-                bc!(IV[7]),
+                cv[0],
+                cv[1],
+                cv[2],
+                cv[3],
+                cv[4],
+                cv[5],
+                cv[6],
+                cv[7],
                 bc!(IV[0]),
                 bc!(IV[1]),
                 bc!(IV[2]),
                 bc!(IV[3]),
                 _mm512_setzero_si512(), // counter_lo
                 _mm512_setzero_si512(), // counter_hi
-                bc!(BLOCK_LEN),
-                bc!(FLAGS),
+                len,
+                bc!(flags),
             ];
             // G mixes lanes-parallel; rotr(n) == rotl(32-n) (VPROLD is AVX-512F).
             macro_rules! G {
@@ -232,67 +255,167 @@ mod x86 {
                 G!(2, 7, 8, 13, m[s[12]], m[s[13]]);
                 G!(3, 4, 9, 14, m[s[14]], m[s[15]]);
             }
-            for i in 0..8 {
-                let o = _mm512_xor_si512(v[i], v[i + 8]);
-                _mm512_storeu_si512(out_t.as_mut_ptr().add(i * 16) as *mut _, o);
+            [
+                _mm512_xor_si512(v[0], v[8]),
+                _mm512_xor_si512(v[1], v[9]),
+                _mm512_xor_si512(v[2], v[10]),
+                _mm512_xor_si512(v[3], v[11]),
+                _mm512_xor_si512(v[4], v[12]),
+                _mm512_xor_si512(v[5], v[13]),
+                _mm512_xor_si512(v[6], v[14]),
+                _mm512_xor_si512(v[7], v[15]),
+            ]
+        }
+    }
+
+    #[target_feature(enable = "avx512f")]
+    unsafe fn load16(msg_t: &[u32], base: usize) -> [__m512i; 16] {
+        unsafe {
+            let mut m = [_mm512_setzero_si512(); 16];
+            for (w, mv) in m.iter_mut().enumerate() {
+                *mv = _mm512_loadu_si512(msg_t.as_ptr().add(base + w * 16) as *const _);
             }
+            m
+        }
+    }
+
+    #[target_feature(enable = "avx512f")]
+    pub(super) unsafe fn hash_parents_avx512(nodes: &mut [Hash], parents: &[usize]) {
+        unsafe {
+            let mut i = 0usize;
+            let mut msg_t = [0u32; 16 * 16];
+            let mut out_t = [0u32; 8 * 16];
+            let iv = [
+                _mm512_set1_epi32(IV[0] as i32),
+                _mm512_set1_epi32(IV[1] as i32),
+                _mm512_set1_epi32(IV[2] as i32),
+                _mm512_set1_epi32(IV[3] as i32),
+                _mm512_set1_epi32(IV[4] as i32),
+                _mm512_set1_epi32(IV[5] as i32),
+                _mm512_set1_epi32(IV[6] as i32),
+                _mm512_set1_epi32(IV[7] as i32),
+            ];
+            let len64 = _mm512_set1_epi32(64);
+            while i + 16 <= parents.len() {
+                for l in 0..16 {
+                    fill_lane::<16>(&mut msg_t, nodes, l, parents[i + l]);
+                }
+                let m = load16(&msg_t, 0);
+                let o = core16(&iv, &m, len64, FLAG_SINGLE);
+                for (w, ov) in o.iter().enumerate() {
+                    _mm512_storeu_si512(out_t.as_mut_ptr().add(w * 16) as *mut _, *ov);
+                }
+                for l in 0..16 {
+                    store_lane::<16>(&out_t, nodes, l, parents[i + l]);
+                }
+                i += 16;
+            }
+            hash_parents_scalar(nodes, &parents[i..]);
+        }
+    }
+
+    #[target_feature(enable = "avx512f")]
+    pub(super) unsafe fn hash_leaves_avx512(jobs: &[(&Hash, &[u8])], out: &mut [Hash]) {
+        unsafe {
+            let iv = [
+                _mm512_set1_epi32(IV[0] as i32),
+                _mm512_set1_epi32(IV[1] as i32),
+                _mm512_set1_epi32(IV[2] as i32),
+                _mm512_set1_epi32(IV[3] as i32),
+                _mm512_set1_epi32(IV[4] as i32),
+                _mm512_set1_epi32(IV[5] as i32),
+                _mm512_set1_epi32(IV[6] as i32),
+                _mm512_set1_epi32(IV[7] as i32),
+            ];
+            let len64 = _mm512_set1_epi32(64);
+            let mut m1_t = [0u32; 16 * 16];
+            let mut m2_t = [0u32; 16 * 16];
+            let mut lens = [0i32; 16];
+            let mut out_t = [0u32; 8 * 16];
+            // Lane assignment for the current batch: indices of 2-block jobs.
+            let mut lanes = [0usize; 16];
+            let mut n = 0usize;
+            let flush = |lanes: &[usize; 16],
+                             n: usize,
+                             m1_t: &mut [u32; 256],
+                             m2_t: &mut [u32; 256],
+                             lens: &mut [i32; 16],
+                             out_t: &mut [u32; 128],
+                             out: &mut [Hash]| {
+                if n == 0 {
+                    return;
+                }
+                // Pad unused lanes by reusing lane 0's input (results discarded).
+                for l in n..16 {
+                    for w in 0..16 {
+                        m1_t[w * 16 + l] = m1_t[w * 16];
+                        m2_t[w * 16 + l] = m2_t[w * 16];
+                    }
+                    lens[l] = lens[0];
+                }
+                let m1 = load16(&m1_t[..], 0);
+                let cv = core16(&iv, &m1, len64, FLAG_CHUNK_START);
+                let m2 = load16(&m2_t[..], 0);
+                let len2 = _mm512_loadu_si512(lens.as_ptr() as *const _);
+                let o = core16(&cv, &m2, len2, FLAG_CHUNK_END_ROOT);
+                for (w, ov) in o.iter().enumerate() {
+                    _mm512_storeu_si512(out_t.as_mut_ptr().add(w * 16) as *mut _, *ov);
+                }
+                for (l, &j) in lanes.iter().take(n).enumerate() {
+                    let dst = out.as_mut_ptr().add(j) as *mut u32;
+                    for w in 0..8 {
+                        dst.add(w).write_unaligned(out_t[w * 16 + l]);
+                    }
+                }
+            };
+            for (j, (k, v)) in jobs.iter().enumerate() {
+                let total = 33 + v.len();
+                if total <= 64 || total > 128 {
+                    out[j] = hash_leaf(k, v); // rare sizes: scalar
+                    continue;
+                }
+                fill_leaf_lane::<16>(&mut m1_t, &mut m2_t, n, k, v);
+                lens[n] = (total - 64) as i32;
+                lanes[n] = j;
+                n += 1;
+                if n == 16 {
+                    flush(&lanes, n, &mut m1_t, &mut m2_t, &mut lens, &mut out_t, out);
+                    n = 0;
+                }
+            }
+            flush(&lanes, n, &mut m1_t, &mut m2_t, &mut lens, &mut out_t, out);
         }
     }
 
     // ── AVX2: 8 lanes ──
 
+    /// 8-lane variant of [`core16`] (AVX2 has no native rotate: shift+or).
     #[target_feature(enable = "avx2")]
-    pub(super) unsafe fn hash_parents_avx2(nodes: &mut [Hash], parents: &[usize]) {
-        let mut i = 0usize;
-        let mut msg_t = [0u32; 16 * 8];
-        let mut out_t = [0u32; 8 * 8];
-        while i + 8 <= parents.len() {
-            unsafe {
-                for l in 0..8 {
-                    fill_lane::<8>(&mut msg_t, nodes, l, parents[i + l]);
-                }
-                compress8(&msg_t, &mut out_t);
-                for l in 0..8 {
-                    store_lane::<8>(&out_t, nodes, l, parents[i + l]);
-                }
-            }
-            i += 8;
-        }
-        hash_parents_scalar(nodes, &parents[i..]);
-    }
-
-    /// 8-lane variant of [`compress16`] (AVX2 has no native rotate: shift+or).
-    #[target_feature(enable = "avx2")]
-    unsafe fn compress8(msg_t: &[u32; 128], out_t: &mut [u32; 64]) {
-        unsafe {
-            let mut m = [_mm256_setzero_si256(); 16];
-            for (w, mv) in m.iter_mut().enumerate() {
-                *mv = _mm256_loadu_si256(msg_t.as_ptr().add(w * 8) as *const _);
-            }
+    unsafe fn core8(cv: &[__m256i; 8], m: &[__m256i; 16], len: __m256i, flags: u32) -> [__m256i; 8] {
+        {
             macro_rules! bc {
                 ($x:expr) => {
                     _mm256_set1_epi32($x as i32)
                 };
             }
             let mut v = [
-                bc!(IV[0]),
-                bc!(IV[1]),
-                bc!(IV[2]),
-                bc!(IV[3]),
-                bc!(IV[4]),
-                bc!(IV[5]),
-                bc!(IV[6]),
-                bc!(IV[7]),
+                cv[0],
+                cv[1],
+                cv[2],
+                cv[3],
+                cv[4],
+                cv[5],
+                cv[6],
+                cv[7],
                 bc!(IV[0]),
                 bc!(IV[1]),
                 bc!(IV[2]),
                 bc!(IV[3]),
                 _mm256_setzero_si256(),
                 _mm256_setzero_si256(),
-                bc!(BLOCK_LEN),
-                bc!(FLAGS),
+                len,
+                bc!(flags),
             ];
-            // rotr by N == (x >> N) | (x << 32-N); shift imms are const generics.
             macro_rules! rotr {
                 ($x:expr, $r:literal, $l:literal) => {
                     _mm256_or_si256(_mm256_srli_epi32::<$r>($x), _mm256_slli_epi32::<$l>($x))
@@ -320,10 +443,133 @@ mod x86 {
                 G!(2, 7, 8, 13, m[s[12]], m[s[13]]);
                 G!(3, 4, 9, 14, m[s[14]], m[s[15]]);
             }
-            for i in 0..8 {
-                let o = _mm256_xor_si256(v[i], v[i + 8]);
-                _mm256_storeu_si256(out_t.as_mut_ptr().add(i * 8) as *mut _, o);
+            [
+                _mm256_xor_si256(v[0], v[8]),
+                _mm256_xor_si256(v[1], v[9]),
+                _mm256_xor_si256(v[2], v[10]),
+                _mm256_xor_si256(v[3], v[11]),
+                _mm256_xor_si256(v[4], v[12]),
+                _mm256_xor_si256(v[5], v[13]),
+                _mm256_xor_si256(v[6], v[14]),
+                _mm256_xor_si256(v[7], v[15]),
+            ]
+        }
+    }
+
+    #[target_feature(enable = "avx2")]
+    unsafe fn load8(msg_t: &[u32], base: usize) -> [__m256i; 16] {
+        unsafe {
+            let mut m = [_mm256_setzero_si256(); 16];
+            for (w, mv) in m.iter_mut().enumerate() {
+                *mv = _mm256_loadu_si256(msg_t.as_ptr().add(base + w * 8) as *const _);
             }
+            m
+        }
+    }
+
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn hash_parents_avx2(nodes: &mut [Hash], parents: &[usize]) {
+        unsafe {
+            let mut i = 0usize;
+            let mut msg_t = [0u32; 16 * 8];
+            let mut out_t = [0u32; 8 * 8];
+            let iv = [
+                _mm256_set1_epi32(IV[0] as i32),
+                _mm256_set1_epi32(IV[1] as i32),
+                _mm256_set1_epi32(IV[2] as i32),
+                _mm256_set1_epi32(IV[3] as i32),
+                _mm256_set1_epi32(IV[4] as i32),
+                _mm256_set1_epi32(IV[5] as i32),
+                _mm256_set1_epi32(IV[6] as i32),
+                _mm256_set1_epi32(IV[7] as i32),
+            ];
+            let len64 = _mm256_set1_epi32(64);
+            while i + 8 <= parents.len() {
+                for l in 0..8 {
+                    fill_lane::<8>(&mut msg_t, nodes, l, parents[i + l]);
+                }
+                let m = load8(&msg_t, 0);
+                let o = core8(&iv, &m, len64, FLAG_SINGLE);
+                for (w, ov) in o.iter().enumerate() {
+                    _mm256_storeu_si256(out_t.as_mut_ptr().add(w * 8) as *mut _, *ov);
+                }
+                for l in 0..8 {
+                    store_lane::<8>(&out_t, nodes, l, parents[i + l]);
+                }
+                i += 8;
+            }
+            hash_parents_scalar(nodes, &parents[i..]);
+        }
+    }
+
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn hash_leaves_avx2(jobs: &[(&Hash, &[u8])], out: &mut [Hash]) {
+        unsafe {
+            let iv = [
+                _mm256_set1_epi32(IV[0] as i32),
+                _mm256_set1_epi32(IV[1] as i32),
+                _mm256_set1_epi32(IV[2] as i32),
+                _mm256_set1_epi32(IV[3] as i32),
+                _mm256_set1_epi32(IV[4] as i32),
+                _mm256_set1_epi32(IV[5] as i32),
+                _mm256_set1_epi32(IV[6] as i32),
+                _mm256_set1_epi32(IV[7] as i32),
+            ];
+            let len64 = _mm256_set1_epi32(64);
+            let mut m1_t = [0u32; 16 * 8];
+            let mut m2_t = [0u32; 16 * 8];
+            let mut lens = [0i32; 8];
+            let mut out_t = [0u32; 8 * 8];
+            let mut lanes = [0usize; 8];
+            let mut n = 0usize;
+            let flush = |lanes: &[usize; 8],
+                             n: usize,
+                             m1_t: &mut [u32; 128],
+                             m2_t: &mut [u32; 128],
+                             lens: &mut [i32; 8],
+                             out_t: &mut [u32; 64],
+                             out: &mut [Hash]| {
+                if n == 0 {
+                    return;
+                }
+                for l in n..8 {
+                    for w in 0..16 {
+                        m1_t[w * 8 + l] = m1_t[w * 8];
+                        m2_t[w * 8 + l] = m2_t[w * 8];
+                    }
+                    lens[l] = lens[0];
+                }
+                let m1 = load8(&m1_t[..], 0);
+                let cv = core8(&iv, &m1, len64, FLAG_CHUNK_START);
+                let m2 = load8(&m2_t[..], 0);
+                let len2 = _mm256_loadu_si256(lens.as_ptr() as *const _);
+                let o = core8(&cv, &m2, len2, FLAG_CHUNK_END_ROOT);
+                for (w, ov) in o.iter().enumerate() {
+                    _mm256_storeu_si256(out_t.as_mut_ptr().add(w * 8) as *mut _, *ov);
+                }
+                for (l, &j) in lanes.iter().take(n).enumerate() {
+                    let dst = out.as_mut_ptr().add(j) as *mut u32;
+                    for w in 0..8 {
+                        dst.add(w).write_unaligned(out_t[w * 8 + l]);
+                    }
+                }
+            };
+            for (j, (k, v)) in jobs.iter().enumerate() {
+                let total = 33 + v.len();
+                if total <= 64 || total > 128 {
+                    out[j] = hash_leaf(k, v);
+                    continue;
+                }
+                fill_leaf_lane::<8>(&mut m1_t, &mut m2_t, n, k, v);
+                lens[n] = (total - 64) as i32;
+                lanes[n] = j;
+                n += 1;
+                if n == 8 {
+                    flush(&lanes, n, &mut m1_t, &mut m2_t, &mut lens, &mut out_t, out);
+                    n = 0;
+                }
+            }
+            flush(&lanes, n, &mut m1_t, &mut m2_t, &mut lens, &mut out_t, out);
         }
     }
 }
@@ -403,6 +649,46 @@ mod tests {
         hash_parents(&mut got, &parents);
         for (i, &p) in parents.iter().enumerate() {
             assert_eq!(got[p], want[i]);
+        }
+    }
+
+    #[test]
+    fn leaf_kernels_match_blake3_crate() {
+        let mut rng = rand::rng();
+        // Mixed value lengths incl. the real account (72) / storage (32) sizes and
+        // boundary cases: ≤31 single-block scalar path, 95 = max 2-block, >95 scalar.
+        let lens = [0usize, 1, 31, 32, 33, 63, 64, 72, 95, 96, 200];
+        for batch in [1usize, 5, 8, 9, 16, 17, 40] {
+            let mut keys = Vec::new();
+            let mut vals = Vec::new();
+            for i in 0..batch {
+                let mut k = [0u8; 32];
+                rng.fill_bytes(&mut k);
+                keys.push(k);
+                let mut v = vec![0u8; lens[i % lens.len()]];
+                rng.fill_bytes(&mut v);
+                vals.push(v);
+            }
+            let jobs: Vec<(&Hash, &[u8])> =
+                keys.iter().zip(vals.iter().map(|v| v.as_slice())).collect();
+            let want: Vec<Hash> = jobs.iter().map(|(k, v)| hash_leaf(k, v)).collect();
+            let mut got = vec![[0u8; 32]; jobs.len()];
+            hash_leaves(&jobs, &mut got);
+            assert_eq!(got, want, "dispatcher leaves batch {batch}");
+
+            #[cfg(target_arch = "x86_64")]
+            {
+                if std::arch::is_x86_feature_detected!("avx2") {
+                    let mut got = vec![[0u8; 32]; jobs.len()];
+                    unsafe { x86::hash_leaves_avx2(&jobs, &mut got) };
+                    assert_eq!(got, want, "avx2 leaves batch {batch}");
+                }
+                if std::arch::is_x86_feature_detected!("avx512f") {
+                    let mut got = vec![[0u8; 32]; jobs.len()];
+                    unsafe { x86::hash_leaves_avx512(&jobs, &mut got) };
+                    assert_eq!(got, want, "avx512 leaves batch {batch}");
+                }
+            }
         }
     }
 }
