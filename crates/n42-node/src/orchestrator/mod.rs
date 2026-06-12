@@ -12,7 +12,7 @@ use crate::tx_bridge::TxImportBatch;
 use alloy_primitives::{Address, B256};
 use metrics::{counter, gauge, histogram};
 use n42_consensus::{ConsensusEngine, EngineOutput, FUTURE_VIEW_WINDOW, ValidatorSet};
-use n42_jmt::PersistentSbmt;
+use n42_jmt::{PersistentSbmt, PersistentTwig};
 use n42_network::{NetworkEvent, NetworkHandle, PeerId};
 use n42_primitives::QuorumCertificate;
 use reth_ethereum_engine_primitives::EthEngineTypes;
@@ -336,6 +336,9 @@ pub struct ConsensusOrchestrator {
     /// Sparse Binary Merkle Tree for parallel state commitment.
     /// Updated asynchronously after each committed block.
     jmt: Option<Arc<Mutex<PersistentSbmt>>>,
+    /// Twig state tree for append-only state commitments.
+    /// Updated asynchronously after each committed block.
+    twig: Option<Arc<Mutex<PersistentTwig>>>,
     /// ZK proof scheduler: generates ZK proofs asynchronously as a sidecar.
     /// Enabled by `N42_ZK_PROOF=1`. Default: None (disabled, zero overhead).
     zk_scheduler: Option<Arc<n42_zkproof::ProofScheduler>>,
@@ -428,6 +431,7 @@ impl ConsensusOrchestrator {
                 .unwrap_or(0)
                 > 0,
             jmt: None,
+            twig: None,
             zk_scheduler: None,
             allow_deterministic_validator_peers: true,
             admin_rx: None,
@@ -605,6 +609,7 @@ impl ConsensusOrchestrator {
             eager_import_block_guard: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             fast_propose,
             jmt: None,
+            twig: None,
             zk_scheduler: None,
             allow_deterministic_validator_peers: true,
             admin_rx: None,
@@ -657,6 +662,11 @@ impl ConsensusOrchestrator {
     /// event and automatically stages the next epoch's validator set.
     pub fn with_jmt(mut self, jmt: Arc<Mutex<PersistentSbmt>>) -> Self {
         self.jmt = Some(jmt);
+        self
+    }
+
+    pub fn with_twig(mut self, twig: Arc<Mutex<PersistentTwig>>) -> Self {
+        self.twig = Some(twig);
         self
     }
 

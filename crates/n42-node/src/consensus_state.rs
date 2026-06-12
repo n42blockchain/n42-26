@@ -174,9 +174,12 @@ pub struct SharedConsensusState {
     /// BLS pubkeys of verifiers that have completed a QUIC handshake with StarHub.
     /// Only keys in this set are accepted by `submit_attestation` (RPC path).
     authorized_verifiers: Mutex<HashSet<[u8; 48]>>,
-    /// Latest JMT (Jellyfish Merkle Tree) root and version.
+    /// Latest SBMT/JMT root and version.
     /// Updated asynchronously after each committed block's state diff is applied.
     pub(crate) jmt_root: ArcSwap<Option<(u64, B256)>>,
+    /// Latest twig root and version.
+    /// Updated asynchronously after each committed block's state diff is applied.
+    pub(crate) twig_root: ArcSwap<Option<(u64, B256)>>,
     /// Latest ZK proof block number and hash (updated by ProofScheduler).
     pub(crate) zk_latest_proof: ArcSwap<Option<(u64, B256)>>,
     /// Admin command channel sender; set once the orchestrator is wired up.
@@ -210,6 +213,7 @@ impl SharedConsensusState {
             equivocation_log: Mutex::new(VecDeque::new()),
             authorized_verifiers: Mutex::new(HashSet::new()),
             jmt_root: ArcSwap::from_pointee(None),
+            twig_root: ArcSwap::from_pointee(None),
             zk_latest_proof: ArcSwap::from_pointee(None),
             admin_tx: Mutex::new(None),
             epoch_status: ArcSwap::from_pointee(EpochStatus::default()),
@@ -359,6 +363,16 @@ impl SharedConsensusState {
     /// Loads the latest JMT root hash and version, if available.
     pub fn load_jmt_root(&self) -> Arc<Option<(u64, B256)>> {
         self.jmt_root.load_full()
+    }
+
+    /// Updates the latest twig root hash and version.
+    pub fn update_twig_root(&self, version: u64, root: B256) {
+        self.twig_root.store(Arc::new(Some((version, root))));
+    }
+
+    /// Loads the latest twig root hash and version, if available.
+    pub fn load_twig_root(&self) -> Arc<Option<(u64, B256)>> {
+        self.twig_root.load_full()
     }
 
     /// Updates the latest ZK proof block number and hash.
