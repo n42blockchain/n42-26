@@ -94,7 +94,7 @@ Logs are split into separate files by phase for easy maintenance:
 | [devlog-63-twig-memory-core-design](docs/devlog-63-twig-memory-core-design.md) | 决策：走 AlDBaran 全 DRAM 路线（非 QMDB SSD 路线）；内存即吞吐；Rust 自建 twig 核心 | Design |
 | [devlog-64-rust-twig-engine-spec](docs/devlog-64-rust-twig-engine-spec.md) | Rust 全-DRAM twig engine 实现 spec + P1–P6 实现（对 gov5 字节验证、#11 绑定、StateDiff 桥接） | Design |
 | [devlog-65-twig-real-data-profiling](docs/devlog-65-twig-real-data-profiling.md) | twig 引擎真实主网账户剖析（reth2k）+ value-arena 优化（−8% RSS，280 B/acct，root 不变） | Profiling |
-| [devlog-68-twig-node-integration](docs/devlog-68-twig-node-integration.md) | Twig P6 持久化、mobile/FFI 验证、节点接线（N42_TWIG + RPC） | Architecture |
+| [devlog-68-twig-node-integration](docs/devlog-68-twig-node-integration.md) | Twig P6 持久化、mobile/FFI 验证、节点接线、mac 4-node E2E + WAL 恢复 | Architecture |
 
 ---
 

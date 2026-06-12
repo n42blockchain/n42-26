@@ -515,6 +515,7 @@ start_validators() {
         ws_port=$((BASE_WS + i))
         auth_port=$((BASE_AUTH + i))
         p2p_port=$((BASE_P2P + i))
+        discovery_v5_port=$((BASE_P2P + 200 + i))
         consensus_port=$((BASE_CONSENSUS + i))
         metrics_port=$((BASE_METRICS + i))
         starhub_port=$((BASE_STARHUB + i))
@@ -535,9 +536,9 @@ start_validators() {
             p2p_key_flag="--p2p-secret-key-hex ${P2P_SECRETS[$i]}"
         fi
 
-        local mdns_flag="true"
+        local mdns_flag="${N42_ENABLE_MDNS:-true}"
         if [[ "$NUM_VALIDATORS" -eq 1 ]]; then
-            mdns_flag="false"
+            mdns_flag="${N42_ENABLE_MDNS:-false}"
         fi
 
         # Low-memory mode: reduce reth caches, pool sizes, and thread counts
@@ -592,6 +593,7 @@ start_validators() {
             --authrpc.port "$auth_port" \
             --port "$p2p_port" \
             --discovery.port "$p2p_port" \
+            --discovery.v5.port "$discovery_v5_port" \
             --log.file.directory "$datadir/logs" \
             --ipcdisable \
             --max-outbound-peers "$NUM_VALIDATORS" \
