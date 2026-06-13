@@ -392,6 +392,42 @@ mod tests {
         assert_eq!(slot1.to, U256::from(100));
     }
 
+    /// Reproduces the production state-tree path: a `BundleState` carrying a
+    /// storage change is serialized to JSON and back (exactly what
+    /// `CompactBlockExecution` does for the compact-block broadcast), then a
+    /// `StateDiff` is extracted on the receiving side. Asserts storage survives
+    /// the round-trip — isolates whether the `storage_changes=0` field observed
+    /// in the real-node profile (devlog-71) is a serde-drop or an upstream
+    /// capture issue.
+    #[test]
+    fn test_bundle_state_serde_roundtrip_preserves_storage() {
+        let addr = Address::with_last_byte(7);
+        let mut account = modified_account(100, 1, 200, 2);
+        account.storage.insert(U256::from(0), storage_slot(0, 99));
+        account.storage.insert(U256::from(7), storage_slot(5, 0));
+
+        let mut bundle = BundleState::default();
+        bundle.state.insert(addr, account);
+
+        // Sanity: pre-roundtrip the diff sees the storage.
+        assert_eq!(StateDiff::from_bundle_state(&bundle).total_storage_changes(), 2);
+
+        // Round-trip through serde_json, as the compact-block broadcast does.
+        let json = serde_json::to_vec(&bundle).expect("BundleState should serialize");
+        let restored: BundleState =
+            serde_json::from_slice(&json).expect("BundleState should deserialize");
+
+        let diff = StateDiff::from_bundle_state(&restored);
+        assert_eq!(
+            diff.total_storage_changes(),
+            2,
+            "storage changes must survive the serde_json round-trip"
+        );
+        let account_diff = diff.accounts.get(&addr).expect("account should be present");
+        assert_eq!(account_diff.storage.get(&U256::from(0)).unwrap().to, U256::from(99));
+        assert_eq!(account_diff.storage.get(&U256::from(7)).unwrap().from, U256::from(5));
+    }
+
     #[test]
     fn test_state_diff_no_actual_change_filtered() {
         // An account where nothing actually changed (balance, nonce, code all same)
