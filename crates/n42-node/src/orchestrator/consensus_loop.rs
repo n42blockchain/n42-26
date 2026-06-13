@@ -423,27 +423,7 @@ impl ConsensusOrchestrator {
         // loop processes `leader_payload_rx`. Drain it here so state-tree
         // updater can see the local block data even when reth already has the
         // block in its engine tree.
-        while let Ok((hash, data)) = self.leader_payload_rx.try_recv() {
-            if !self.pending_block_data.contains_key(&hash) {
-                if self.pending_block_data.len() >= super::execution_bridge::MAX_PENDING_BLOCK_DATA
-                {
-                    // `pending_block_data` is a BTreeMap (hash-ordered, not
-                    // insertion-ordered), so `keys().next()` is the smallest hash,
-                    // which could be `block_hash` — the very entry we are about to
-                    // read for the state-tree update below. Never evict the block
-                    // being committed; evict any other entry instead.
-                    if let Some(old_key) = self
-                        .pending_block_data
-                        .keys()
-                        .find(|k| **k != block_hash)
-                        .copied()
-                    {
-                        self.pending_block_data.remove(&old_key);
-                    }
-                }
-                self.pending_block_data.insert(hash, data);
-            }
-        }
+        self.drain_leader_payload_rx(&[block_hash]);
 
         // State-tree background update: extract BundleState from pending block
         // data once, then feed the enabled sidecar tree(s).
@@ -713,17 +693,7 @@ impl ConsensusOrchestrator {
             // data (sent via leader_payload_tx) hasn't been processed by the select loop
             // yet because block_ready_rx was processed first, triggering the consensus
             // flow before the data was cached. Drain the leader_payload_rx to recover.
-            while let Ok((hash, data)) = self.leader_payload_rx.try_recv() {
-                if !self.pending_block_data.contains_key(&hash) {
-                    if self.pending_block_data.len()
-                        >= super::execution_bridge::MAX_PENDING_BLOCK_DATA
-                        && let Some(old_key) = self.pending_block_data.keys().next().copied()
-                    {
-                        self.pending_block_data.remove(&old_key);
-                    }
-                    self.pending_block_data.insert(hash, data);
-                }
-            }
+            self.drain_leader_payload_rx(&[block_hash]);
             if let Some(data) = self.pending_block_data.remove(&block_hash) {
                 // Recovered! Proceed as Case B.
                 info!(target: "n42::cl::consensus_loop", view, %block_hash, "recovered block data from leader_payload_rx, proceeding as Case B");
@@ -1007,13 +977,12 @@ impl ConsensusOrchestrator {
         // so the block data must be available in pending_block_data for Case B in
         // finalize_committed_block().  GossipSub does not echo to self, so without
         // this cache the leader's own block would fall to Case C (missing data).
-        if !self.pending_block_data.contains_key(&hash) {
-            if self.pending_block_data.len() >= super::execution_bridge::MAX_PENDING_BLOCK_DATA
-                && let Some(old_key) = self.pending_block_data.keys().next().copied()
-            {
-                self.pending_block_data.remove(&old_key);
-            }
-            self.pending_block_data.insert(hash, data.clone());
+        let pending_finalization_hash = self
+            .pending_finalization
+            .as_ref()
+            .map(|pending| pending.block_hash)
+            .unwrap_or(hash);
+        if self.cache_pending_block_data(hash, data.clone(), &[hash, pending_finalization_hash]) {
             debug!(target: "n42::cl::consensus_loop", %hash, "cached leader block data for deferred import");
         }
 

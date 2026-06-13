@@ -558,12 +558,19 @@ impl ConsensusOrchestrator {
             self.last_committed_timestamp = self.last_committed_timestamp.max(broadcast.timestamp);
         }
 
-        if self.pending_block_data.len() >= MAX_PENDING_BLOCK_DATA
-            && let Some(old_key) = self.pending_block_data.keys().next().copied()
-        {
-            self.pending_block_data.remove(&old_key);
+        let pending_finalization_hash = self
+            .pending_finalization
+            .as_ref()
+            .map(|pending| pending.block_hash)
+            .unwrap_or(hash);
+        if !self.cache_pending_block_data(hash, data, &[hash, pending_finalization_hash]) {
+            warn!(
+                target: "n42::cl::exec_bridge",
+                %hash,
+                "failed to cache block data, skipping consensus import notification"
+            );
+            return;
         }
-        self.pending_block_data.insert(hash, data);
 
         // Notify consensus immediately — enables voting without EVM execution.
         debug!(target: "n42::cl::exec_bridge", %hash, "block data cached, notifying consensus (deferred execution)");
