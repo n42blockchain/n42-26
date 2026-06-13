@@ -376,6 +376,8 @@ import json, os, time
 NUM_ACCOUNTS = 5000
 CHAIN_ID = 4242
 INITIAL_BALANCE = "0x4B3B4CA85A86C47A098A224000000"  # 100M N42 per account
+STRESS_CONTRACT_ADDRESS = "0x000000000000000000000000000000000000C042"
+STRESS_CONTRACT_BYTECODE = "0x33600052600060205260406000208054600101905560016020526040600020429055600160005260206000f3"
 
 data_dir = os.environ["DATA_DIR"]
 cache_file = os.environ.get("ACCOUNTS_CACHE", "")
@@ -424,6 +426,8 @@ genesis = {
     "alloc": {
         # Genesis master account: 30 billion N42
         "0xe3778939cdCa78b70fc36dE06B0E862333D6D8dc": {"balance": "0x60EF6B1ABA6F072330000000"},
+        # Predeployed storage burner used by n42-stress --erc20-ratio.
+        STRESS_CONTRACT_ADDRESS: {"balance": "0x0", "code": STRESS_CONTRACT_BYTECODE},
         # Test accounts: 100M N42 each
         **{a["address"]: {"balance": INITIAL_BALANCE} for a in accounts},
     },

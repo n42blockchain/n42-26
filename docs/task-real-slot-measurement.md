@@ -10,6 +10,19 @@ metrics、tracing span、workload)在 mac 上一样能跑。
 仍然成立的纪律:**不要用 CacheDB 微基准或 mac 预检凑 EVM/state-root/BLS/consensus/network 百分比**;
 数字必须来自真实 testnet(≥4 节点 + 手机 sim + 合约重 workload)的实测。
 
+## 状态更新（2026-06-13 · bounded mac pilot 完成）
+
+见 `docs/devlog-71-real-slot-profile.md`。已完成一次真实 4-node macOS testnet pilot:
+
+- 纯转账:192k tx post-drain 全部上链,11 个 tx-bearing blocks,最大 24k tx/block;
+- 合约重:clean contract-only 链 fresh presign,120k tx post-drain 全部上链,14 个 tx-bearing blocks;
+- mobile sim:4 phones;
+- Twig:`N42_TWIG=1`;
+- 采样:`samply attach` 被 macOS `task_for_pid` 权限挡住,改用 `/usr/bin/sample`;release binary 未符号化,所以这次不声称函数级 flamegraph 热点。
+
+仍需后续补齐:用 `--profile profiling` 或 `samply record -- <node ...>` 直接 launch 出符号化
+leader flamegraph,并跑更长 steady-state(4/7 节点,数百块)。
+
 ## 背景与目标
 
 所有现有 EVM/状态/BLS 微基准都在 **CacheDB 内存态**跑,测不到真实节点的
