@@ -1094,9 +1094,28 @@ impl ConsensusOrchestrator {
                 return None;
             }
         };
-        Some(n42_execution::state_diff::StateDiff::from_bundle_state(
-            &compact.bundle_state,
-        ))
+        // Diagnostic for the devlog-71 `storage_changes=0` follow-up: count the
+        // raw storage slots present in the broadcast bundle BEFORE StateDiff
+        // filtering. If this is 0 for a contract-heavy block, the storage is
+        // missing from the leader's captured bundle (reth payload-build capture),
+        // not dropped by StateDiff extraction. See docs/devlog-71.
+        let raw_bundle_storage: usize = compact
+            .bundle_state
+            .state
+            .values()
+            .map(|acc| acc.storage.len())
+            .sum();
+        let diff = n42_execution::state_diff::StateDiff::from_bundle_state(&compact.bundle_state);
+        debug!(
+            target: "n42::cl::consensus_loop",
+            %block_hash,
+            bundle_accounts = compact.bundle_state.state.len(),
+            raw_bundle_storage_slots = raw_bundle_storage,
+            diff_accounts = diff.len(),
+            diff_storage_changes = diff.total_storage_changes(),
+            "STATE_DIFF_DIAG: raw broadcast bundle vs extracted diff"
+        );
+        Some(diff)
     }
 
     /// Extract decompressed CompactBlockExecution JSON bytes from raw BlockDataBroadcast.
