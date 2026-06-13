@@ -96,6 +96,7 @@ Logs are split into separate files by phase for easy maintenance:
 | [devlog-65-twig-real-data-profiling](docs/devlog-65-twig-real-data-profiling.md) | twig 引擎真实主网账户剖析（reth2k）+ value-arena 优化（−8% RSS，280 B/acct，root 不变） | Profiling |
 | [devlog-68-twig-node-integration](docs/devlog-68-twig-node-integration.md) | Twig P6 持久化、mobile/FFI 验证、节点接线、mac 4-node E2E + WAL 恢复 | Architecture |
 | [devlog-69-concurrency-audit](docs/devlog-69-concurrency-audit.md) | 跨 crate 并发/正确性审计：consensus 状态机+twig 边界+orchestrator 判定健全；修复 network set_validator_context 静默丢弃 + execution destroyed-then-recreated 账户误删（EIP-6780 DestroyedChanged） | Audit |
+| [devlog-70-p6-node-e2e-closeout](docs/devlog-70-p6-node-e2e-closeout.md) | P6 节点 E2E 收尾：fresh 4-node Twig root 一致、WAL crash recovery、leader drain finalization；真实 8s slot profiling 仍需 Linux | Verification |
 
 ---
 

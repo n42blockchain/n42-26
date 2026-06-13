@@ -1,5 +1,12 @@
 # 任务:在真实节点量 8s slot 分解(stop optimizing blind)
 
+## 状态更新（2026-06-13）
+
+本任务尚未完成。当前可用执行环境是 macOS/Darwin，不能产出本任务验收要求的
+Linux `perf`/`samply` leader flamegraph，也不能替代真实 Linux testnet 数据。因此不要从
+macOS 预检或 CacheDB 微基准填 EVM/state-root/BLS/consensus/network 百分比；正式交付仍需
+Linux ≥4 节点 testnet + mobile sim + 合约重 workload 采样。
+
 ## 背景与目标
 
 所有现有 EVM/状态/BLS 微基准都在 **CacheDB 内存态**跑,测不到真实节点的
