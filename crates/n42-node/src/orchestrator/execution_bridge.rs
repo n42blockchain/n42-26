@@ -1,6 +1,7 @@
 use super::{
     BlobSidecarBroadcast, BlockDataBroadcast, CompactBlockExecution, ConsensusOrchestrator,
 };
+use crate::el::ExecutionLayer;
 use crate::ingest::note_virtual_block_credit;
 use crate::now_unix_ms;
 use alloy_consensus::Typed2718;
@@ -12,8 +13,7 @@ use n42_consensus::ConsensusEvent;
 use n42_network::NetworkHandle;
 use reth_ethereum_engine_primitives::EthEngineTypes;
 use reth_execution_types::{BlockExecutionOutput, BlockExecutionResult};
-use reth_node_builder::ConsensusEngineHandle;
-use reth_payload_builder::{EthBuiltPayload, PayloadBuilderHandle, PayloadId};
+use reth_payload_builder::{EthBuiltPayload, PayloadId};
 use reth_payload_primitives::{PayloadKind, PayloadTypes};
 use reth_transaction_pool::blobstore::{BlobStore, DiskFileBlobStore};
 use std::collections::{HashMap, VecDeque};
@@ -298,14 +298,10 @@ impl ConsensusOrchestrator {
 
     /// Triggers payload building via fork_choice_updated, then spawns a task to resolve it.
     pub(super) async fn do_trigger_payload_build(&mut self, slot_timestamp: Option<u64>) {
-        if self.beacon_engine.is_none() {
-            debug!(target: "n42::cl::exec_bridge", "no beacon engine configured, skipping payload build");
-            return;
-        }
-        let payload_builder = match &self.payload_builder {
-            Some(pb) => pb.clone(),
+        let el = match &self.el {
+            Some(e) => e.clone(),
             None => {
-                debug!(target: "n42::cl::exec_bridge", "no payload builder configured, skipping payload build");
+                debug!(target: "n42::cl::exec_bridge", "no execution layer configured, skipping payload build");
                 return;
             }
         };
@@ -325,14 +321,7 @@ impl ConsensusOrchestrator {
         self.building_on_parent = Some(parent);
         self.build_triggered_at = Some(Instant::now());
 
-        // Build attrs before borrowing beacon_engine to avoid borrow conflict.
         let attrs = self.build_payload_attributes(slot_timestamp);
-        let Some(beacon_engine) = self.beacon_engine.as_ref() else {
-            debug!(target: "n42::cl::exec_bridge", "beacon engine disappeared before payload build");
-            self.building_on_parent = None;
-            self.build_triggered_at = None;
-            return;
-        };
         let timestamp = attrs.timestamp;
 
         let fcu_state = ForkchoiceState {
@@ -362,8 +351,8 @@ impl ConsensusOrchestrator {
             };
             let used_ts = try_attrs.timestamp;
 
-            match beacon_engine
-                .fork_choice_updated(fcu_state, Some(try_attrs))
+            match el
+                .fork_choice_updated_with_attrs(fcu_state, try_attrs)
                 .await
             {
                 Ok(result) => {
@@ -373,11 +362,7 @@ impl ConsensusOrchestrator {
                         // strictly increasing timestamps even in fast-commit scenarios.
                         self.last_committed_timestamp = self.last_committed_timestamp.max(used_ts);
                         debug!(target: "n42::cl::exec_bridge", ?payload_id, "payload building started, spawning resolve task");
-                        self.spawn_payload_resolve_task(
-                            beacon_engine.clone(),
-                            payload_builder,
-                            payload_id,
-                        );
+                        self.spawn_payload_resolve_task(el.clone(), payload_id);
                     } else {
                         warn!(target: "n42::cl::exec_bridge", "fork_choice_updated did not return payload_id, scheduling retry");
                         // FCU returned SYNCING — reth hasn't caught up yet.
@@ -427,12 +412,7 @@ impl ConsensusOrchestrator {
         self.next_slot_timestamp = None;
     }
 
-    fn spawn_payload_resolve_task(
-        &self,
-        engine_handle: ConsensusEngineHandle<EthEngineTypes>,
-        payload_builder: PayloadBuilderHandle<EthEngineTypes>,
-        payload_id: PayloadId,
-    ) {
+    fn spawn_payload_resolve_task(&self, el: Arc<dyn ExecutionLayer>, payload_id: PayloadId) {
         let block_ready_tx = self.block_ready_tx.clone();
         let network = self.network.clone();
         let leader_payload_tx = self.leader_payload_tx.clone();
@@ -451,7 +431,7 @@ impl ConsensusOrchestrator {
 
             let resolve_result = tokio::time::timeout(
                 PAYLOAD_BUILD_TIMEOUT,
-                payload_builder.resolve_kind(payload_id, PayloadKind::WaitForPending),
+                el.resolve_payload(payload_id, PayloadKind::WaitForPending),
             )
             .await;
 
@@ -467,7 +447,7 @@ impl ConsensusOrchestrator {
                 Some(Ok(payload)) => {
                     handle_built_payload(
                         payload,
-                        engine_handle,
+                        el,
                         network,
                         block_ready_tx,
                         leader_payload_tx,
@@ -584,8 +564,8 @@ impl ConsensusOrchestrator {
         // Follower eager import: start new_payload + fcu in parallel with consensus voting.
         // By the time finalize_committed_block runs after consensus commit, the block is
         // likely already in reth (Case A), eliminating the ~200ms background import stall.
-        if let Some(ref engine_handle) = self.beacon_engine {
-            let eh = engine_handle.clone();
+        if let Some(ref el) = self.el {
+            let eh = el.clone();
             let payload_compressed = broadcast.payload_json;
             let execution_output_compressed = broadcast.execution_output;
             let view = broadcast.view;
@@ -784,8 +764,8 @@ impl ConsensusOrchestrator {
 
     /// Imports a block via new_payload; queues for retry on Syncing status.
     pub(super) async fn import_and_notify(&mut self, broadcast: BlockDataBroadcast) {
-        let engine_handle = match self.beacon_engine {
-            Some(ref h) => h.clone(),
+        let engine_handle = match self.el {
+            Some(ref el) => el.clone(),
             None => return,
         };
 
@@ -844,7 +824,7 @@ impl ConsensusOrchestrator {
     async fn handle_valid_import(
         &mut self,
         broadcast: &BlockDataBroadcast,
-        engine_handle: &ConsensusEngineHandle<EthEngineTypes>,
+        engine_handle: &Arc<dyn ExecutionLayer>,
         status: &alloy_rpc_types_engine::PayloadStatus,
     ) {
         if let Some(ref valid_hash) = status.latest_valid_hash
@@ -866,7 +846,7 @@ impl ConsensusOrchestrator {
             safe_block_hash: broadcast.block_hash,
             finalized_block_hash: broadcast.block_hash,
         };
-        if let Err(e) = engine_handle.fork_choice_updated(fcu_state, None).await {
+        if let Err(e) = engine_handle.fork_choice_updated(fcu_state).await {
             error!(
                 target: "n42::cl::exec_bridge",
                 hash = %broadcast.block_hash,
@@ -951,10 +931,7 @@ impl ConsensusOrchestrator {
         }
     }
 
-    async fn retry_syncing_blocks(
-        &mut self,
-        engine_handle: &ConsensusEngineHandle<EthEngineTypes>,
-    ) {
+    async fn retry_syncing_blocks(&mut self, engine_handle: &Arc<dyn ExecutionLayer>) {
         let queued: Vec<(Vec<u8>, u32)> = self.syncing_blocks.drain(..).collect();
         info!(target: "n42::cl::exec_bridge", count = queued.len(), "retrying previously-syncing blocks");
 
@@ -998,7 +975,7 @@ impl ConsensusOrchestrator {
                         safe_block_hash: retry_hash,
                         finalized_block_hash: retry_hash,
                     };
-                    let _ = engine_handle.fork_choice_updated(fcu, None).await;
+                    let _ = engine_handle.fork_choice_updated(fcu).await;
                     self.head_block_hash = retry_hash;
                     if let Err(e) = self
                         .engine
@@ -1050,7 +1027,7 @@ impl ConsensusOrchestrator {
 )]
 async fn handle_built_payload(
     payload: EthBuiltPayload,
-    engine_handle: ConsensusEngineHandle<EthEngineTypes>,
+    el: Arc<dyn ExecutionLayer>,
     network: NetworkHandle,
     block_ready_tx: mpsc::Sender<B256>,
     leader_payload_tx: mpsc::Sender<(B256, Vec<u8>)>,
@@ -1143,7 +1120,7 @@ async fn handle_built_payload(
     // can accept it instantly. We skip FCU to avoid changing canonical chain —
     // only finalize_committed_block (after consensus commit) should do FCU.
     let import_start = std::time::Instant::now();
-    match engine_handle.new_payload(execution_data).await {
+    match el.new_payload(execution_data).await {
         Ok(status)
             if matches!(
                 status.status,

@@ -1,13 +1,12 @@
 use super::ConsensusOrchestrator;
 use super::state_mgmt::max_consecutive_empty_skips;
+use crate::el::ExecutionLayer;
 use crate::expected_validator_peer_ids_with_policy;
 use alloy_primitives::B256;
 use alloy_rpc_types_engine::{ForkchoiceState, PayloadStatusEnum};
 use metrics::{counter, gauge, histogram};
 use n42_consensus::EngineOutput;
 use n42_primitives::{ConsensusMessage, QuorumCertificate};
-use reth_ethereum_engine_primitives::EthEngineTypes;
-use reth_node_builder::ConsensusEngineHandle;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -573,8 +572,8 @@ impl ConsensusOrchestrator {
         block_hash: B256,
         commit_qc: QuorumCertificate,
     ) {
-        let engine_handle = match &self.beacon_engine {
-            Some(h) => h.clone(),
+        let engine_handle = match &self.el {
+            Some(el) => el.clone(),
             None => {
                 self.pending_block_data.clear();
                 self.pending_executions.clear();
@@ -589,7 +588,7 @@ impl ConsensusOrchestrator {
         };
 
         let fcu_start = std::time::Instant::now();
-        let finalized = match engine_handle.fork_choice_updated(fcu_state, None).await {
+        let finalized = match engine_handle.fork_choice_updated(fcu_state).await {
             Ok(result) => {
                 let elapsed_ms = fcu_start.elapsed().as_millis() as u64;
                 histogram!("n42_fcu_latency_ms", "attempt" => "first").record(elapsed_ms as f64);
@@ -632,7 +631,7 @@ impl ConsensusOrchestrator {
                     finalized_block_hash: block_hash,
                 };
                 let retry_start = std::time::Instant::now();
-                match engine_handle.fork_choice_updated(retry_fcu, None).await {
+                match engine_handle.fork_choice_updated(retry_fcu).await {
                     Ok(result) => {
                         let retry_ms = retry_start.elapsed().as_millis() as u64;
                         histogram!("n42_fcu_latency_ms", "attempt" => "retry")
@@ -736,8 +735,8 @@ impl ConsensusOrchestrator {
     fn spawn_bg_import(&mut self, data: Vec<u8>, block_hash: B256, view: u64) {
         self.bg_import_in_flight = true;
         let done_tx = self.import_done_tx.clone();
-        let eh = match &self.beacon_engine {
-            Some(h) => h.clone(),
+        let eh = match &self.el {
+            Some(el) => el.clone(),
             None => {
                 self.bg_import_in_flight = false;
                 self.bg_import_hashes.remove(&block_hash);
@@ -760,7 +759,7 @@ impl ConsensusOrchestrator {
     /// Runs `new_payload` + `fork_choice_updated` in a background task.
     /// Returns (success, block_timestamp).
     async fn background_import(
-        engine_handle: ConsensusEngineHandle<EthEngineTypes>,
+        engine_handle: Arc<dyn ExecutionLayer>,
         data: &[u8],
         block_hash: B256,
     ) -> (bool, u64) {
@@ -813,7 +812,7 @@ impl ConsensusOrchestrator {
                     safe_block_hash: block_hash,
                     finalized_block_hash: block_hash,
                 };
-                if let Err(e) = engine_handle.fork_choice_updated(fcu, None).await {
+                if let Err(e) = engine_handle.fork_choice_updated(fcu).await {
                     error!(target: "n42::cl::consensus_loop", %block_hash, error = %e, "bg import: fcu failed");
                 }
                 info!(target: "n42::cl::consensus_loop", %block_hash, "bg import: block imported successfully");
