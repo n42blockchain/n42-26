@@ -91,6 +91,48 @@ Twig update timing, tx-bearing windows:
 as an instrumentation or StateDiff follow-up item before drawing storage-specific
 conclusions from this run.
 
+### Follow-up: contract gas limit was the root cause
+
+The `storage_changes=0` observation above was rechecked on 2026-06-14 after
+`ef11287` (`fix(stress): raise CONTRACT_CALL_GAS 65k->100k so storage burner doesn't
+OOG`). Root cause was the stress harness, not node StateDiff/Twig extraction:
+the old contract call limit was 65,000 gas, below the storage-burner contract's
+fresh-slot write cost, so every contract call reverted out-of-gas and rolled back
+storage. The original 12k-tx contract-heavy blocks used exactly 780M gas
+(`65,000 gas/tx`), which matches the old limit and explains the empty storage diffs.
+
+Minimal confirmation run:
+
+- tip: `ef11287`
+- build: `cargo build --release --bin n42-node --bin n42-stress --bin n42-mobile-sim`
+- testnet: 4 validators, `N42_TWIG=1`,
+  `RUST_LOG=n42::cl::consensus_loop=debug`
+- stress: `n42-stress --erc20-ratio 100`, 8,000 contract-heavy tx, 0 errors
+- post-drain chain: 4 tx-bearing blocks, 2,000 tx/block, 8,000 tx total
+- gas: each tx-bearing block used `102,970,000` gas, or `51,485 gas/tx`, below the
+  new 100k limit and not pinned to the limit
+
+Representative tx-bearing `STATE_DIFF_DIAG`:
+
+```text
+block_hash=0xed7e510fd06ebe282af51b7a689f5e197b9a0eb0b5ea4f604f93176d3a574397
+bundle_accounts=1252 raw_bundle_storage_slots=2500
+diff_accounts=1252 diff_storage_changes=2500
+```
+
+All four validators logged the same non-zero storage counts for the tx-bearing blocks.
+Twig also applied the same storage delta, for example:
+
+```text
+Twig updated version=10 root=0x71895f638874019a3de278d8d9d8680b4810e79c0e79a14c326804d595a9ef67 accounts=1252 storage_changes=2500
+```
+
+Conclusion: the previous `storage_changes=0` result was an all-OOG stress workload.
+With `CONTRACT_CALL_GAS=100_000`, contract storage commits, raw broadcast bundle
+storage slots are non-zero, extracted StateDiff storage changes are non-zero, and Twig
+receives the expected storage changes. No node StateDiff/Twig bug is indicated by this
+follow-up.
+
 Mobile verification is background relative to leader proposal:
 
 | Workload | Mobile verify p50/p95/max | By block size |
@@ -127,5 +169,4 @@ Next measurement work:
 - rerun under `--profile profiling` or launch the process through `samply record --` to
   get symbolicated leader self-time;
 - run a longer 4-node and 7-node steady-state pass;
-- teach `n42-stress` to wait for post-drain finality before printing `BLOCK_ANALYSIS`;
-- audit why the contract-heavy run reports `storage_changes=0` in Twig updates.
+- teach `n42-stress` to wait for post-drain finality before printing `BLOCK_ANALYSIS`.
