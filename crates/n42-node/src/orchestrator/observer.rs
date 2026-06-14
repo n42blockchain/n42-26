@@ -1,4 +1,5 @@
 use super::{BlobSidecarBroadcast, BlockDataBroadcast, CommittedBlock};
+use crate::el::{ExecutionLayer, RethExecutionLayer};
 use crate::epoch_schedule::EpochSchedule;
 use alloy_eips::eip7594::BlobTransactionSidecarVariant;
 use alloy_primitives::B256;
@@ -12,6 +13,7 @@ use reth_ethereum_engine_primitives::EthEngineTypes;
 use reth_node_builder::ConsensusEngineHandle;
 use reth_transaction_pool::blobstore::{BlobStore, DiskFileBlobStore};
 use std::collections::{HashSet, VecDeque};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
@@ -137,8 +139,8 @@ pub struct ObserverOrchestrator {
     net_event_rx: mpsc::Receiver<NetworkEvent>,
     connected_peers: HashSet<PeerId>,
 
-    // reth Engine API
-    beacon_engine: ConsensusEngineHandle<EthEngineTypes>,
+    // Execution layer (import-only adapter; observers never build payloads).
+    el: Arc<dyn ExecutionLayer>,
     head_block_hash: B256,
 
     // CL state
@@ -177,7 +179,7 @@ impl ObserverOrchestrator {
             network,
             net_event_rx,
             connected_peers: HashSet::new(),
-            beacon_engine,
+            el: Arc::new(RethExecutionLayer::engine_only(beacon_engine)),
             head_block_hash,
             local_view: 0,
             highest_seen_view: 0,
@@ -354,7 +356,7 @@ impl ObserverOrchestrator {
             );
         }
 
-        match self.beacon_engine.new_payload(execution_data).await {
+        match self.el.new_payload(execution_data).await {
             Ok(status) => {
                 if matches!(
                     status.status,
@@ -375,11 +377,7 @@ impl ObserverOrchestrator {
                         safe_block_hash: hash,
                         finalized_block_hash: hash,
                     };
-                    if let Err(e) = self
-                        .beacon_engine
-                        .fork_choice_updated(fcu_state, None)
-                        .await
-                    {
+                    if let Err(e) = self.el.fork_choice_updated(fcu_state).await {
                         error!(target: "n42::observer", %hash, error = %e, "fork_choice_updated failed");
                     } else {
                         self.head_block_hash = hash;

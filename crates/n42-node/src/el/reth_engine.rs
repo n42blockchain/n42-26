@@ -11,21 +11,32 @@ use reth_node_builder::ConsensusEngineHandle;
 use reth_payload_builder::{EthBuiltPayload, PayloadBuilderHandle};
 use reth_payload_primitives::PayloadKind;
 
-/// Wraps reth's `ConsensusEngineHandle` + `PayloadBuilderHandle`. Both handles are
-/// cheaply cloneable (channel senders), so the adapter is cheap to share via `Arc`.
+/// Wraps reth's `ConsensusEngineHandle` + (optional) `PayloadBuilderHandle`. Both
+/// handles are cheaply cloneable (channel senders), so the adapter is cheap to
+/// share via `Arc`. The payload builder is optional because non-producing roles
+/// (the observer) only need `new_payload`/`fork_choice_updated`, never builds.
 pub struct RethExecutionLayer {
     engine: ConsensusEngineHandle<EthEngineTypes>,
-    payload_builder: PayloadBuilderHandle<EthEngineTypes>,
+    payload_builder: Option<PayloadBuilderHandle<EthEngineTypes>>,
 }
 
 impl RethExecutionLayer {
+    /// Full adapter (leader/follower): can build payloads.
     pub fn new(
         engine: ConsensusEngineHandle<EthEngineTypes>,
         payload_builder: PayloadBuilderHandle<EthEngineTypes>,
     ) -> Self {
         Self {
             engine,
-            payload_builder,
+            payload_builder: Some(payload_builder),
+        }
+    }
+
+    /// Import-only adapter (observer): `resolve_payload` is never called.
+    pub fn engine_only(engine: ConsensusEngineHandle<EthEngineTypes>) -> Self {
+        Self {
+            engine,
+            payload_builder: None,
         }
     }
 }
@@ -70,6 +81,7 @@ impl ExecutionLayer for RethExecutionLayer {
     ) -> Option<Result<EthBuiltPayload, ElError>> {
         // execution_bridge::spawn_payload_resolve_task (resolve_kind WaitForPending).
         self.payload_builder
+            .as_ref()?
             .resolve_kind(id, kind)
             .await
             .map(|r| r.map_err(|e| ElError(e.to_string())))
