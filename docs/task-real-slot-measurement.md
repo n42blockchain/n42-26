@@ -23,6 +23,21 @@ metrics、tracing span、workload)在 mac 上一样能跑。
 仍需后续补齐:用 `--profile profiling` 或 `samply record -- <node ...>` 直接 launch 出符号化
 leader flamegraph,并跑更长 steady-state(4/7 节点,数百块)。
 
+## 状态更新（2026-06-14 · gas 修复后合约 profile 已补）
+
+见 `docs/devlog-71-real-slot-profile.md`。`ef11287` 把 stress 合约调用 gas 从 65k 提到
+100k 后，已补跑一次真实 4-node contract-heavy profile:
+
+- 120k contract-heavy tx,0 errors,post-drain 全部上链;
+- 14 个 tx-bearing blocks,最大 12k tx/block,最大 358.82M gas/block;
+- gas/tx 不再钉死 limit;StateDiff/Twig storage 非零且四节点一致;
+- tx-bearing leader commit p50/p95 为 233/318ms;Twig elapsed p50/p95/max 为 15/37/47ms。
+
+符号化 leader flamegraph 仍未完成:`samply record -- ./scripts/testnet.sh` 被 macOS 签名
+`/bin/bash`/root-task 限制挡住;直接 launch `target/profiling/n42-node` 能产出符号化 samply
+artifact,但本 shell 环境下未能稳定编排其余 peers 跑出有效 4-node tx-bearing profile。下一步应从
+授权本机终端用 samply/xctrace launch leader,并让 peers 由外部 supervisor/tmux/launchd 管住。
+
 ## 背景与目标
 
 所有现有 EVM/状态/BLS 微基准都在 **CacheDB 内存态**跑,测不到真实节点的

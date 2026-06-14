@@ -329,7 +329,20 @@ setup_python_venv() {
 build_binaries() {
     local build_flag="--release"
     local build_dir="release"
-    if [[ "$DEBUG_BUILD" == true ]]; then
+    if [[ -n "${N42_BUILD_PROFILE:-}" ]]; then
+        build_dir="$N42_BUILD_PROFILE"
+        case "$N42_BUILD_PROFILE" in
+            release)
+                build_flag="--release"
+                ;;
+            debug)
+                build_flag=""
+                ;;
+            *)
+                build_flag="--profile $N42_BUILD_PROFILE"
+                ;;
+        esac
+    elif [[ "$DEBUG_BUILD" == true ]]; then
         build_flag=""
         build_dir="debug"
     fi
