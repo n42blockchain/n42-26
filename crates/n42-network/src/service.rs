@@ -373,13 +373,30 @@ impl NetworkHandle {
     }
 
     /// Updates the network layer's validator context for Rotor relay forwarding.
+    ///
+    /// Best-effort (returns `()`), but uses backpressure rather than a bare
+    /// `try_send`: this is called once per epoch transition, so dropping it on a
+    /// momentarily-full command channel would leave the relay layer forwarding
+    /// against a stale `my_index`/`validator_count` with no trace. Backpressure +
+    /// a warning give delivery a real chance and surface the rare failure.
     pub async fn set_validator_context(&self, my_index: u32, validator_count: u32) {
-        let _ = self
-            .command_tx
-            .try_send(NetworkCommand::SetValidatorContext {
+        if let Err(error) = Self::send_with_backpressure(
+            &self.command_tx,
+            NetworkCommand::SetValidatorContext {
                 my_index,
                 validator_count,
-            });
+            },
+        )
+        .await
+        {
+            tracing::warn!(
+                %error,
+                my_index,
+                validator_count,
+                "failed to update network validator context for Rotor relay"
+            );
+            metrics::counter!("n42_network_set_validator_context_drops_total").increment(1);
+        }
     }
 
     fn send(&self, cmd: NetworkCommand) -> Result<(), NetworkError> {

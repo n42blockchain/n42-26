@@ -12,6 +12,11 @@ alloy-primitives.workspace = true
 # Crypto (BLS12-381 signatures)
 n42-primitives = { path = "../n42-primitives" }
 
+# Zero-dependency SBMT proof verification (pure blake3, no reth/mdbx)
+n42-bmt-core.workspace = true
+# Zero-dependency twig proof verification (pure blake3, no reth/mdbx)
+n42-twig-core.workspace = true
+
 # Caching
 lru.workspace = true
 
@@ -53,3 +58,6 @@ tokio.workspace = true
 
 # Compression (StarHub sends zstd-compressed packets)
 zstd.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

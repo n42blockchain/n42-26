@@ -128,6 +128,33 @@ pub extern "system" fn Java_com_n42_verifier_N42Verifier_nativeVerifyAndSend(
     unsafe { crate::n42_verify_and_send(ptr as *mut VerifierContext, bytes.as_ptr(), bytes.len()) }
 }
 
+/// `N42Verifier.nativeVerifyStateProof(proof: ByteArray, stateRoot: ByteArray): Int`
+///
+/// Stateless SBMT state-proof verification (no context). `proof` is
+/// `bincode(ShardedBmtProof)`, `stateRoot` is the 32-byte combined SBMT root.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_n42_verifier_N42Verifier_nativeVerifyStateProof(
+    env: JNIEnv,
+    _class: JClass,
+    proof: JByteArray,
+    state_root: JByteArray,
+) -> jint {
+    let proof_bytes = match env.convert_byte_array(&proof) {
+        Ok(b) => b,
+        Err(_) => return -1,
+    };
+    let root_bytes = match env.convert_byte_array(&state_root) {
+        Ok(b) => b,
+        Err(_) => return -1,
+    };
+    if root_bytes.len() != 32 {
+        return -1;
+    }
+    unsafe {
+        crate::n42_verify_state_proof(proof_bytes.as_ptr(), proof_bytes.len(), root_bytes.as_ptr())
+    }
+}
+
 /// `N42Verifier.nativeLastVerifyInfo(ptr: Long): String?`
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_n42_verifier_N42Verifier_nativeLastVerifyInfo(

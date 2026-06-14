@@ -261,6 +261,10 @@ impl StarHub {
 
         let sessions = self.sessions.clone();
         let event_tx = self.event_tx.clone();
+        // Global micro-batch BLS verifier for receipts (devlog-66): sessions
+        // enqueue identity-checked receipts; it batch-verifies and emits
+        // HubEvent::ReceiptReceived.
+        let receipt_batch_tx = super::receipt_batch::spawn(self.event_tx.clone());
         let max_conns = self.config.max_connections;
         let session_senders = self.session_senders.clone();
         let shared_id_gen = self.shared_session_id_gen.clone();
@@ -284,14 +288,15 @@ impl StarHub {
                 let (session_tx, session_rx) = mpsc::channel::<Bytes>(32);
                 let sessions = sessions.clone();
                 let event_tx = event_tx.clone();
+                let receipt_batch_tx = receipt_batch_tx.clone();
                 let senders = session_senders.clone();
 
                 tokio::spawn(async move {
                     match incoming.await {
                         Ok(connection) => {
                             handle_phone_connection(
-                                sid, connection, sessions, event_tx, session_tx, session_rx,
-                                senders, max_conns,
+                                sid, connection, sessions, event_tx, receipt_batch_tx,
+                                session_tx, session_rx, senders, max_conns,
                             )
                             .await;
                         }
@@ -394,6 +399,7 @@ async fn handle_phone_connection(
     connection: quinn::Connection,
     sessions: Arc<RwLock<HashMap<u64, Arc<MobileSession>>>>,
     event_tx: mpsc::Sender<HubEvent>,
+    receipt_batch_tx: mpsc::Sender<Box<n42_mobile::receipt::VerificationReceipt>>,
     session_tx: mpsc::Sender<Bytes>,
     mut session_rx: mpsc::Receiver<Bytes>,
     session_senders: SessionSenders,
@@ -524,26 +530,14 @@ async fn handle_phone_connection(
                                             metrics::counter!("n42_mobile_receipt_pubkey_mismatch").increment(1);
                                             continue;
                                         }
-                                        // Verify BLS signature off the async runtime to
-                                        // avoid blocking the event loop (~1.5ms per verify).
-                                        // Move receipt into blocking task, return it on success.
+                                        // BLS verification is micro-batched (devlog-66): enqueue the
+                                        // identity-checked receipt to the global batch verifier, which
+                                        // runs coefficient-randomized batch_verify (24x fewer pairings)
+                                        // and emits HubEvent::ReceiptReceived for valid ones. Session
+                                        // bookkeeping below is optimistic; an invalid signature is
+                                        // dropped + counted by the batcher exactly as the old inline
+                                        // path did (it also only warned and continued).
                                         let receipt_box = Box::new(receipt);
-                                        let verified = tokio::task::spawn_blocking(move || {
-                                            if receipt_box.verify_signature().is_ok() {
-                                                Some(receipt_box)
-                                            } else {
-                                                None
-                                            }
-                                        })
-                                        .await
-                                        .ok()
-                                        .flatten();
-
-                                        let Some(receipt_box) = verified else {
-                                            tracing::warn!(session_id, "receipt BLS signature invalid, dropping");
-                                            metrics::counter!("n42_mobile_receipt_sig_invalid").increment(1);
-                                            continue;
-                                        };
 
                                         last_receipt_at = Some(now);
                                         rate_violations = 0; // reset consecutive violation count on success
@@ -556,8 +550,8 @@ async fn handle_phone_connection(
                                         if receipt_box.timestamp_ms > 0 && now_ms > receipt_box.timestamp_ms {
                                             session.record_rtt(now_ms - receipt_box.timestamp_ms);
                                         }
-                                        if let Err(e) = event_tx
-                                            .send(HubEvent::ReceiptReceived(receipt_box))
+                                        if let Err(e) = receipt_batch_tx
+                                            .send(receipt_box)
                                             .await
                                         {
                                             metrics::counter!("n42_hub_event_drops_total").increment(1);

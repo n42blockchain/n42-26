@@ -345,7 +345,10 @@ pub const STRESS_CONTRACT_ADDRESS: Address = address!("0000000000000000000000000
 ///   1. `counters[caller]++` (SLOAD + SSTORE)
 ///   2. `values[caller] = timestamp` (SSTORE)
 ///
-/// Gas cost: ~45k (similar to ERC-20 transfer).
+/// Gas cost: ~67.5k for a fresh caller — 21k intrinsic + 2×22.1k cold
+/// `SSTORE_SET` + cold `SLOAD` + `KECCAK`. Callers MUST give a gas limit above
+/// this (n42-stress uses 100k); a limit near the old ~45k estimate runs the call
+/// out of gas, reverting both writes.
 pub static STRESS_CONTRACT_BYTECODE: Bytes = bytes!(
     "33600052600060205260406000208054600101905560016020526040600020429055600160005260206000f3"
 );

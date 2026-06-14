@@ -11,7 +11,7 @@ use jsonrpsee::core::SubscriptionResult;
 use jsonrpsee::proc_macros::rpc;
 use jsonrpsee::types::ErrorObjectOwned;
 use jsonrpsee::{PendingSubscriptionSink, SubscriptionMessage};
-use n42_jmt::ShardedJmt;
+use n42_jmt::{PersistentSbmt, PersistentTwig};
 use n42_primitives::{BlsPublicKey, BlsSignature};
 use n42_zkproof::ProofScheduler;
 use serde::{Deserialize, Serialize};
@@ -113,10 +113,28 @@ pub struct JmtRootResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct TwigRootResponse {
+    pub version: u64,
+    pub root: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct JmtProofResponse {
     pub shard_index: u8,
     pub key_hash: String,
     pub value: Option<String>,
+    pub proof_hex: String,
+    pub shard_roots: Vec<String>,
+    pub root: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TwigProofResponse {
+    pub shard_index: u8,
+    pub key_hash: String,
+    pub value: String,
     pub proof_hex: String,
     pub shard_roots: Vec<String>,
     pub root: String,
@@ -211,6 +229,18 @@ pub trait N42Api {
         storage_slot: Option<U256>,
     ) -> RpcResult<JmtProofResponse>;
 
+    /// Returns the latest twig root hash and version.
+    #[method(name = "twigRoot")]
+    async fn twig_root(&self) -> RpcResult<TwigRootResponse>;
+
+    /// Generates a twig proof for an account, or a storage slot if `storage_slot` is provided.
+    #[method(name = "twigProof")]
+    async fn twig_proof(
+        &self,
+        address: Address,
+        storage_slot: Option<U256>,
+    ) -> RpcResult<TwigProofResponse>;
+
     /// Returns the current JMT version (block count since genesis).
     #[method(name = "jmtVersion")]
     async fn jmt_version(&self) -> RpcResult<u64>;
@@ -258,7 +288,8 @@ pub trait N42Api {
 pub struct N42RpcServer {
     consensus_state: Arc<SharedConsensusState>,
     staking_manager: Option<Arc<Mutex<StakingManager>>>,
-    jmt: Option<Arc<Mutex<ShardedJmt>>>,
+    jmt: Option<Arc<Mutex<PersistentSbmt>>>,
+    twig: Option<Arc<Mutex<PersistentTwig>>>,
     zk_scheduler: Option<Arc<ProofScheduler>>,
     admin_token: Option<String>,
 }
@@ -269,6 +300,7 @@ impl N42RpcServer {
             consensus_state,
             staking_manager: None,
             jmt: None,
+            twig: None,
             zk_scheduler: None,
             admin_token: None,
         }
@@ -279,8 +311,13 @@ impl N42RpcServer {
         self
     }
 
-    pub fn with_jmt(mut self, jmt: Arc<Mutex<ShardedJmt>>) -> Self {
+    pub fn with_jmt(mut self, jmt: Arc<Mutex<PersistentSbmt>>) -> Self {
         self.jmt = Some(jmt);
+        self
+    }
+
+    pub fn with_twig(mut self, twig: Arc<Mutex<PersistentTwig>>) -> Self {
+        self.twig = Some(twig);
         self
     }
 
@@ -638,40 +675,39 @@ impl N42ApiServer for N42RpcServer {
         })?;
 
         let key_hash = match storage_slot {
-            Some(slot) => n42_jmt::storage_key(&address, &slot),
-            None => n42_jmt::account_key(&address),
+            Some(slot) => n42_jmt::storage_key(&address, &slot).0,
+            None => n42_jmt::account_key(&address).0,
         };
 
         let tree = jmt
             .lock()
-            .map_err(|_| ErrorObjectOwned::owned(-32603, "JMT lock poisoned", None::<()>))?;
+            .map_err(|_| ErrorObjectOwned::owned(-32603, "SBMT lock poisoned", None::<()>))?;
 
-        let root = tree.root_hash().map_err(|e| {
-            ErrorObjectOwned::owned(-32603, format!("JMT root error: {e}"), None::<()>)
+        // SBMT root_hash and prove are infallible; prove always returns a proof
+        // (inclusion or exclusion). The full ShardedBmtProof is bincode-encoded
+        // into `proof_hex` for the mobile client to deserialize and verify.
+        //
+        // IMPORTANT for verifiers: the `root` field below is the **SBMT combined
+        // root** (its own depth-4 shard merkle), NOT the block header's
+        // `state_root` (which is reth's MPT root, and is `B256::ZERO` in
+        // deferred-state-root mode). `verify_state_proof` must be given THIS root
+        // (also available via `n42_jmtRoot`). The `shard_roots` field carries the
+        // proof's 4 shard-tree siblings (`shard_path`), not the 16 shard roots it
+        // held under JMT — it is informational only; verification uses `proof_hex`.
+        let root = tree.root_hash();
+        let proof = tree.inner().prove(key_hash);
+        let proof_bytes = bincode::serialize(&proof).map_err(|e| {
+            ErrorObjectOwned::owned(-32603, format!("SBMT proof encode error: {e}"), None::<()>)
         })?;
 
-        let proof = n42_jmt::proof::build_proof(&tree, key_hash).map_err(|e| {
-            ErrorObjectOwned::owned(-32603, format!("JMT proof error: {e}"), None::<()>)
-        })?;
-
-        match proof {
-            Some(p) => Ok(JmtProofResponse {
-                shard_index: p.shard_index,
-                key_hash: hex::encode(p.key),
-                value: p.value.as_ref().map(hex::encode),
-                proof_hex: hex::encode(&p.proof_bytes),
-                shard_roots: p.shard_roots.iter().map(hex::encode).collect(),
-                root: format!("{root:?}"),
-            }),
-            None => Ok(JmtProofResponse {
-                shard_index: (key_hash.0[0] >> 4),
-                key_hash: hex::encode(key_hash.0),
-                value: None,
-                proof_hex: String::new(),
-                shard_roots: Vec::new(),
-                root: format!("{root:?}"),
-            }),
-        }
+        Ok(JmtProofResponse {
+            shard_index: proof.shard_index,
+            key_hash: hex::encode(proof.inner.key),
+            value: proof.value.as_ref().map(hex::encode),
+            proof_hex: hex::encode(&proof_bytes),
+            shard_roots: proof.shard_path.iter().map(hex::encode).collect(),
+            root: format!("{root:?}"),
+        })
     }
 
     async fn jmt_version(&self) -> RpcResult<u64> {
@@ -682,6 +718,64 @@ impl N42ApiServer for N42RpcServer {
             .lock()
             .map_err(|_| ErrorObjectOwned::owned(-32603, "JMT lock poisoned", None::<()>))?;
         Ok(tree.version())
+    }
+
+    async fn twig_root(&self) -> RpcResult<TwigRootResponse> {
+        let twig_root = self.consensus_state.load_twig_root();
+        match twig_root.as_ref() {
+            Some((version, root)) => Ok(TwigRootResponse {
+                version: *version,
+                root: format!("{root:?}"),
+            }),
+            None => Err(ErrorObjectOwned::owned(
+                -32001,
+                "Twig not initialized or no blocks committed yet",
+                None::<()>,
+            )),
+        }
+    }
+
+    async fn twig_proof(
+        &self,
+        address: Address,
+        storage_slot: Option<U256>,
+    ) -> RpcResult<TwigProofResponse> {
+        let twig = self.twig.as_ref().ok_or_else(|| {
+            ErrorObjectOwned::owned(-32001, "Twig not enabled on this node", None::<()>)
+        })?;
+
+        let key_hash = match storage_slot {
+            Some(slot) => n42_jmt::storage_key(&address, &slot).0,
+            None => n42_jmt::account_key(&address).0,
+        };
+
+        let mut tree = twig
+            .lock()
+            .map_err(|_| ErrorObjectOwned::owned(-32603, "Twig lock poisoned", None::<()>))?;
+
+        // Twig proofs are inclusion proofs for live leaves. The full
+        // ShardedTwigProof is bincode-encoded into `proof_hex` for mobile/FFI.
+        // `root` is the combined twig root, not the block header's MPT root.
+        let root = tree.root_hash();
+        let proof = tree.inner().prove(key_hash).ok_or_else(|| {
+            ErrorObjectOwned::owned(
+                -32001,
+                "Twig proof unavailable for key (key not present)",
+                None::<()>,
+            )
+        })?;
+        let proof_bytes = bincode::serialize(&proof).map_err(|e| {
+            ErrorObjectOwned::owned(-32603, format!("Twig proof encode error: {e}"), None::<()>)
+        })?;
+
+        Ok(TwigProofResponse {
+            shard_index: proof.shard_index,
+            key_hash: hex::encode(proof.inner.key),
+            value: hex::encode(&proof.inner.value),
+            proof_hex: hex::encode(&proof_bytes),
+            shard_roots: proof.shard_path.iter().map(hex::encode).collect(),
+            root: format!("{root:?}"),
+        })
     }
 
     async fn zk_proof(&self, block_number: u64) -> RpcResult<ZkProofResponse> {
@@ -983,6 +1077,58 @@ mod tests {
         let health = rpc.health().await.unwrap();
         assert_eq!(health.status, "syncing");
         assert_eq!(health.validator_count, 3);
+    }
+
+    #[tokio::test]
+    async fn test_twig_root_and_proof_roundtrip() {
+        let vs = ValidatorSet::new(&[], 0);
+        let state = Arc::new(SharedConsensusState::new(vs));
+        let dir = tempfile::tempdir().unwrap();
+        let twig = Arc::new(Mutex::new(
+            PersistentTwig::open(dir.path().join("twig.snapshot"), 1000).unwrap(),
+        ));
+
+        let address = Address::repeat_byte(0xAB);
+        let slot = U256::from(7);
+        let root = {
+            let mut tree = twig.lock().unwrap();
+            tree.inner_mut().seed_genesis_account(
+                address,
+                U256::from(123u64),
+                2,
+                n42_jmt::EMPTY_CODE_HASH,
+                [(slot, U256::from(9u64))],
+            );
+            tree.flush().unwrap();
+            let root = tree.root_hash();
+            state.update_twig_root(tree.version(), root);
+            root
+        };
+
+        let rpc = N42RpcServer::new(state).with_twig(Arc::clone(&twig));
+        let root_resp = rpc.twig_root().await.unwrap();
+        assert_eq!(root_resp.version, 0);
+        assert_eq!(root_resp.root, format!("{root:?}"));
+
+        let proof_resp = rpc.twig_proof(address, None).await.unwrap();
+        assert_eq!(proof_resp.root, root_resp.root);
+        let proof_bytes = hex::decode(&proof_resp.proof_hex).unwrap();
+        let expected_key = n42_jmt::account_key(&address).0;
+        let expected_proof = {
+            let tree = twig.lock().unwrap();
+            tree.inner().prove(expected_key).unwrap()
+        };
+        expected_proof
+            .verify_for_key(&root.0, &expected_key)
+            .unwrap();
+        assert_eq!(proof_bytes, bincode::serialize(&expected_proof).unwrap());
+
+        let storage_resp = rpc.twig_proof(address, Some(slot)).await.unwrap();
+        assert_eq!(storage_resp.root, root_resp.root);
+
+        let missing = rpc.twig_proof(Address::repeat_byte(0xCD), None).await;
+        assert!(missing.is_err());
+        assert_eq!(missing.unwrap_err().code(), -32001);
     }
 
     #[tokio::test]

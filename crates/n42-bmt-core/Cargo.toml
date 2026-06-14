@@ -1,0 +1,14 @@
+[package]
+name = "n42-bmt-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Zero reth/mdbx dependencies: pure-blake3 SBMT engine + proof verification, so
+# n42-mobile / FFI can verify SBMT proofs without pulling the storage stack.
+
+[dependencies]
+blake3.workspace = true
+serde.workspace = true
+thiserror.workspace = true

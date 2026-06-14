@@ -70,7 +70,7 @@ pub trait DirectPoolIngest: Send + Sync + 'static {
 impl<V, S> DirectPoolIngest for Pool<V, CoinbaseTipOrdering<EthPooledTransaction>, S>
 where
     V: TransactionValidator<Transaction = EthPooledTransaction> + 'static,
-    S: BlobStore + 'static,
+    S: BlobStore + Clone + 'static,
 {
     fn add_prevalidated(
         &self,

@@ -115,12 +115,14 @@ where
         block: &RecoveredBlock<N::Block>,
         result: &BlockExecutionResult<N::Receipt>,
         receipt_root_bloom: Option<reth_consensus::ReceiptRootBloom>,
+        block_access_list_hash: Option<alloy_primitives::B256>,
     ) -> Result<(), ConsensusError> {
         <EthBeaconConsensus<C> as FullConsensus<N>>::validate_block_post_execution(
             &self.inner,
             block,
             result,
             receipt_root_bloom,
+            block_access_list_hash,
         )
     }
 }

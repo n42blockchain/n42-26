@@ -95,6 +95,104 @@ int n42_poll_packet(VerifierContext* ctx, uint8_t* out_buf, size_t buf_len);
 int n42_verify_and_send(VerifierContext* ctx, const uint8_t* data, size_t len);
 
 /**
+ * Verify an SBMT state proof (a single account/storage entry) against a block's
+ * combined SBMT state root, using pure blake3. Stateless — no context required,
+ * no block re-execution, no network.
+ *
+ * @param proof_data  bincode(ShardedBmtProof) — the hex-decoded `proofHex` from
+ *                    the n42_jmtProof RPC response.
+ * @param proof_len   Length of proof_data.
+ * @param state_root  Pointer to the 32-byte combined SBMT root (from n42_jmtRoot).
+ * @return  N42_OK (0) if valid, or:
+ *          N42_ERR_INVALID_INPUT (-1) if proof_data/state_root is NULL or len is 0,
+ *          N42_VERIFY_DECODE_ERROR (1) if the proof fails to decode,
+ *          N42_VERIFY_EXEC_ERROR (2) if verification fails.
+ */
+int n42_verify_state_proof(const uint8_t* proof_data, size_t proof_len, const uint8_t* state_root);
+
+/**
+ * Verify an SBMT account proof and bind it to the queried account address.
+ *
+ * @param proof_data  bincode(ShardedBmtProof).
+ * @param proof_len   Length of proof_data.
+ * @param state_root  Pointer to the 32-byte combined SBMT root.
+ * @param address     Pointer to the 20-byte account address.
+ * @return  N42_OK (0) if valid, or -1/1/2 as documented for n42_verify_state_proof.
+ */
+int n42_verify_account_proof(
+    const uint8_t* proof_data,
+    size_t proof_len,
+    const uint8_t* state_root,
+    const uint8_t* address
+);
+
+/**
+ * Verify an SBMT storage proof and bind it to the queried account + slot.
+ *
+ * @param proof_data  bincode(ShardedBmtProof).
+ * @param proof_len   Length of proof_data.
+ * @param state_root  Pointer to the 32-byte combined SBMT root.
+ * @param address     Pointer to the 20-byte account address.
+ * @param slot        Pointer to the 32-byte big-endian storage slot.
+ * @return  N42_OK (0) if valid, or -1/1/2 as documented for n42_verify_state_proof.
+ */
+int n42_verify_storage_proof(
+    const uint8_t* proof_data,
+    size_t proof_len,
+    const uint8_t* state_root,
+    const uint8_t* address,
+    const uint8_t* slot
+);
+
+/**
+ * Verify a twig state proof against a block's combined twig state root.
+ *
+ * @param proof_data  bincode(ShardedTwigProof) from n42_twigProof.
+ * @param proof_len   Length of proof_data.
+ * @param state_root  Pointer to the 32-byte combined twig root from n42_twigRoot.
+ * @return  N42_OK (0) if valid, or -1/1/2 as documented for n42_verify_state_proof.
+ */
+int n42_verify_twig_state_proof(
+    const uint8_t* proof_data,
+    size_t proof_len,
+    const uint8_t* state_root
+);
+
+/**
+ * Verify a twig account proof and bind it to the queried account address.
+ *
+ * @param proof_data  bincode(ShardedTwigProof).
+ * @param proof_len   Length of proof_data.
+ * @param state_root  Pointer to the 32-byte combined twig root.
+ * @param address     Pointer to the 20-byte account address.
+ * @return  N42_OK (0) if valid, or -1/1/2 as documented for n42_verify_state_proof.
+ */
+int n42_verify_twig_account_proof(
+    const uint8_t* proof_data,
+    size_t proof_len,
+    const uint8_t* state_root,
+    const uint8_t* address
+);
+
+/**
+ * Verify a twig storage proof and bind it to the queried account + slot.
+ *
+ * @param proof_data  bincode(ShardedTwigProof).
+ * @param proof_len   Length of proof_data.
+ * @param state_root  Pointer to the 32-byte combined twig root.
+ * @param address     Pointer to the 20-byte account address.
+ * @param slot        Pointer to the 32-byte big-endian storage slot.
+ * @return  N42_OK (0) if valid, or -1/1/2 as documented for n42_verify_state_proof.
+ */
+int n42_verify_twig_storage_proof(
+    const uint8_t* proof_data,
+    size_t proof_len,
+    const uint8_t* state_root,
+    const uint8_t* address,
+    const uint8_t* slot
+);
+
+/**
  * Get information about the last verification as a JSON string.
  *
  * JSON fields: block_number, block_hash, computed_receipts_root,

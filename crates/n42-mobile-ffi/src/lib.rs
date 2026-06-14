@@ -25,6 +25,13 @@ use transport::{connect_quic, is_v2_wire_format, recv_loop};
 
 pub use context::VerifierContext;
 
+use alloy_primitives::{Address, U256};
+use n42_mobile::state_proof::{
+    ShardedBmtProof, ShardedTwigProof, verify_account_proof, verify_state_proof,
+    verify_storage_proof, verify_twig_account_proof, verify_twig_state_proof,
+    verify_twig_storage_proof,
+};
+
 // ── Android JNI bridge ──
 #[cfg(target_os = "android")]
 mod android;
@@ -504,6 +511,250 @@ pub unsafe extern "C" fn n42_last_verify_info(
     safe_cint(json.len())
 }
 
+/// Verifies an SBMT state proof (a single account/storage entry) against a
+/// block's combined SBMT state root, using pure blake3 — no block re-execution,
+/// no network. Stateless: does not require a `VerifierContext`.
+///
+/// `proof_data` is `bincode(ShardedBmtProof)` — exactly the bytes returned in the
+/// `n42_jmtProof` RPC response's `proofHex` field (hex-decoded). `state_root`
+/// points to the 32-byte combined SBMT root from `n42_jmtRoot`.
+///
+/// Returns:
+/// - `0`  proof is valid (inclusion or exclusion);
+/// - `1`  proof failed to decode;
+/// - `2`  verification failed (wrong root / tampered / value mismatch);
+/// - `-1` null or zero-length arguments.
+///
+/// # Safety
+/// `proof_data` must point to `proof_len` valid bytes; `state_root` to 32 bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn n42_verify_state_proof(
+    proof_data: *const u8,
+    proof_len: usize,
+    state_root: *const u8,
+) -> c_int {
+    if proof_data.is_null() || proof_len == 0 || state_root.is_null() {
+        return FfiError::InvalidData.into_code();
+    }
+
+    let proof_bytes = unsafe { std::slice::from_raw_parts(proof_data, proof_len) };
+    let proof: ShardedBmtProof = match bincode::deserialize(proof_bytes) {
+        Ok(p) => p,
+        Err(e) => return FfiError::PacketDecode(format!("SBMT proof decode: {e}")).into_code(),
+    };
+
+    let mut root = [0u8; 32];
+    unsafe { std::ptr::copy_nonoverlapping(state_root, root.as_mut_ptr(), 32) };
+
+    match verify_state_proof(&proof, B256::from(root)) {
+        Ok(()) => 0,
+        Err(e) => FfiError::VerifyFailed(format!("SBMT proof: {e}")).into_code(),
+    }
+}
+
+/// Like [`n42_verify_state_proof`], but **binds the proof to a queried account**.
+///
+/// Derives the canonical account key for the 20-byte `address` and rejects the
+/// proof unless its leaf key and shard match — closing the gap where an
+/// untrusted server answers a query for account A with a valid proof for an
+/// unrelated account B (or a wrong-shard non-membership proof for A). Light
+/// clients verifying against an untrusted RPC should use this, not the unbound
+/// variant.
+///
+/// Returns: `0` valid; `1` decode failed; `2` verification failed (wrong root /
+/// tampered / key or shard mismatch); `-1` null/short arguments.
+///
+/// # Safety
+/// `proof_data` → `proof_len` bytes; `state_root` → 32 bytes; `address` → 20 bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn n42_verify_account_proof(
+    proof_data: *const u8,
+    proof_len: usize,
+    state_root: *const u8,
+    address: *const u8,
+) -> c_int {
+    if proof_data.is_null() || proof_len == 0 || state_root.is_null() || address.is_null() {
+        return FfiError::InvalidData.into_code();
+    }
+
+    let proof_bytes = unsafe { std::slice::from_raw_parts(proof_data, proof_len) };
+    let proof: ShardedBmtProof = match bincode::deserialize(proof_bytes) {
+        Ok(p) => p,
+        Err(e) => return FfiError::PacketDecode(format!("SBMT proof decode: {e}")).into_code(),
+    };
+
+    let mut root = [0u8; 32];
+    unsafe { std::ptr::copy_nonoverlapping(state_root, root.as_mut_ptr(), 32) };
+    let mut addr = [0u8; 20];
+    unsafe { std::ptr::copy_nonoverlapping(address, addr.as_mut_ptr(), 20) };
+
+    match verify_account_proof(&proof, B256::from(root), Address::from(addr)) {
+        Ok(()) => 0,
+        Err(e) => FfiError::VerifyFailed(format!("SBMT account proof: {e}")).into_code(),
+    }
+}
+
+/// Like [`n42_verify_account_proof`], but binds to a `(address, slot)` storage entry.
+///
+/// `slot` is the 32-byte big-endian storage slot key.
+///
+/// # Safety
+/// `proof_data` → `proof_len` bytes; `state_root` → 32 bytes; `address` → 20
+/// bytes; `slot` → 32 bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn n42_verify_storage_proof(
+    proof_data: *const u8,
+    proof_len: usize,
+    state_root: *const u8,
+    address: *const u8,
+    slot: *const u8,
+) -> c_int {
+    if proof_data.is_null()
+        || proof_len == 0
+        || state_root.is_null()
+        || address.is_null()
+        || slot.is_null()
+    {
+        return FfiError::InvalidData.into_code();
+    }
+
+    let proof_bytes = unsafe { std::slice::from_raw_parts(proof_data, proof_len) };
+    let proof: ShardedBmtProof = match bincode::deserialize(proof_bytes) {
+        Ok(p) => p,
+        Err(e) => return FfiError::PacketDecode(format!("SBMT proof decode: {e}")).into_code(),
+    };
+
+    let mut root = [0u8; 32];
+    unsafe { std::ptr::copy_nonoverlapping(state_root, root.as_mut_ptr(), 32) };
+    let mut addr = [0u8; 20];
+    unsafe { std::ptr::copy_nonoverlapping(address, addr.as_mut_ptr(), 20) };
+    let mut slot_be = [0u8; 32];
+    unsafe { std::ptr::copy_nonoverlapping(slot, slot_be.as_mut_ptr(), 32) };
+
+    match verify_storage_proof(
+        &proof,
+        B256::from(root),
+        Address::from(addr),
+        U256::from_be_bytes(slot_be),
+    ) {
+        Ok(()) => 0,
+        Err(e) => FfiError::VerifyFailed(format!("SBMT storage proof: {e}")).into_code(),
+    }
+}
+
+/// Verifies a twig state proof against a block's combined twig state root.
+///
+/// `proof_data` is `bincode(ShardedTwigProof)` — exactly the bytes returned in
+/// the `n42_twigProof` RPC response's `proofHex` field (hex-decoded).
+///
+/// Returns: `0` valid; `1` decode failed; `2` verification failed; `-1`
+/// null/short arguments.
+///
+/// # Safety
+/// `proof_data` → `proof_len` bytes; `state_root` → 32 bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn n42_verify_twig_state_proof(
+    proof_data: *const u8,
+    proof_len: usize,
+    state_root: *const u8,
+) -> c_int {
+    if proof_data.is_null() || proof_len == 0 || state_root.is_null() {
+        return FfiError::InvalidData.into_code();
+    }
+
+    let proof_bytes = unsafe { std::slice::from_raw_parts(proof_data, proof_len) };
+    let proof: ShardedTwigProof = match bincode::deserialize(proof_bytes) {
+        Ok(p) => p,
+        Err(e) => return FfiError::PacketDecode(format!("Twig proof decode: {e}")).into_code(),
+    };
+
+    let mut root = [0u8; 32];
+    unsafe { std::ptr::copy_nonoverlapping(state_root, root.as_mut_ptr(), 32) };
+
+    match verify_twig_state_proof(&proof, B256::from(root)) {
+        Ok(()) => 0,
+        Err(e) => FfiError::VerifyFailed(format!("Twig proof: {e}")).into_code(),
+    }
+}
+
+/// Like [`n42_verify_twig_state_proof`], but binds the proof to a queried account.
+///
+/// # Safety
+/// `proof_data` → `proof_len` bytes; `state_root` → 32 bytes; `address` → 20 bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn n42_verify_twig_account_proof(
+    proof_data: *const u8,
+    proof_len: usize,
+    state_root: *const u8,
+    address: *const u8,
+) -> c_int {
+    if proof_data.is_null() || proof_len == 0 || state_root.is_null() || address.is_null() {
+        return FfiError::InvalidData.into_code();
+    }
+
+    let proof_bytes = unsafe { std::slice::from_raw_parts(proof_data, proof_len) };
+    let proof: ShardedTwigProof = match bincode::deserialize(proof_bytes) {
+        Ok(p) => p,
+        Err(e) => return FfiError::PacketDecode(format!("Twig proof decode: {e}")).into_code(),
+    };
+
+    let mut root = [0u8; 32];
+    unsafe { std::ptr::copy_nonoverlapping(state_root, root.as_mut_ptr(), 32) };
+    let mut addr = [0u8; 20];
+    unsafe { std::ptr::copy_nonoverlapping(address, addr.as_mut_ptr(), 20) };
+
+    match verify_twig_account_proof(&proof, B256::from(root), Address::from(addr)) {
+        Ok(()) => 0,
+        Err(e) => FfiError::VerifyFailed(format!("Twig account proof: {e}")).into_code(),
+    }
+}
+
+/// Like [`n42_verify_twig_account_proof`], but binds to a `(address, slot)` storage entry.
+///
+/// # Safety
+/// `proof_data` → `proof_len` bytes; `state_root` → 32 bytes; `address` → 20
+/// bytes; `slot` → 32 bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn n42_verify_twig_storage_proof(
+    proof_data: *const u8,
+    proof_len: usize,
+    state_root: *const u8,
+    address: *const u8,
+    slot: *const u8,
+) -> c_int {
+    if proof_data.is_null()
+        || proof_len == 0
+        || state_root.is_null()
+        || address.is_null()
+        || slot.is_null()
+    {
+        return FfiError::InvalidData.into_code();
+    }
+
+    let proof_bytes = unsafe { std::slice::from_raw_parts(proof_data, proof_len) };
+    let proof: ShardedTwigProof = match bincode::deserialize(proof_bytes) {
+        Ok(p) => p,
+        Err(e) => return FfiError::PacketDecode(format!("Twig proof decode: {e}")).into_code(),
+    };
+
+    let mut root = [0u8; 32];
+    unsafe { std::ptr::copy_nonoverlapping(state_root, root.as_mut_ptr(), 32) };
+    let mut addr = [0u8; 20];
+    unsafe { std::ptr::copy_nonoverlapping(address, addr.as_mut_ptr(), 20) };
+    let mut slot_be = [0u8; 32];
+    unsafe { std::ptr::copy_nonoverlapping(slot, slot_be.as_mut_ptr(), 32) };
+
+    match verify_twig_storage_proof(
+        &proof,
+        B256::from(root),
+        Address::from(addr),
+        U256::from_be_bytes(slot_be),
+    ) {
+        Ok(()) => 0,
+        Err(e) => FfiError::VerifyFailed(format!("Twig storage proof: {e}")).into_code(),
+    }
+}
+
 /// Gets the BLS12-381 public key (48 bytes) into `out_buf`.
 ///
 /// Returns 0 on success, -1 on error.
@@ -639,6 +890,206 @@ mod tests {
     use n42_mobile::code_cache::CacheSyncMessage;
     use std::collections::VecDeque;
     use std::sync::atomic::AtomicU64;
+
+    #[test]
+    fn test_verify_state_proof_roundtrip() {
+        use n42_bmt_core::{EMPTY_HASH, Sbmt, ShardedBmtProof, shard_tree_path, shard_tree_root};
+
+        // Build a single-shard SBMT proof from the engine (mirrors what the node's
+        // n42_jmtProof RPC returns, bincode-encoded).
+        let key = [0x05u8; 32];
+        let si = (key[0] >> 4) as usize;
+        let mut shard = Sbmt::new();
+        shard.insert(key, b"acct-value");
+        let mut roots = vec![EMPTY_HASH; 16];
+        roots[si] = shard.root_hash();
+        let combined = shard_tree_root(&roots);
+        let proof = ShardedBmtProof {
+            shard_index: si as u8,
+            shard_root: roots[si],
+            shard_path: shard_tree_path(&roots, si),
+            inner: shard.prove(key),
+            value: Some(b"acct-value".to_vec()),
+        };
+        let bytes = bincode::serialize(&proof).unwrap();
+
+        // Valid proof against the correct root.
+        let r = unsafe { n42_verify_state_proof(bytes.as_ptr(), bytes.len(), combined.as_ptr()) };
+        assert_eq!(r, 0, "valid SBMT proof must verify");
+
+        // Wrong root -> verification failure (code 2).
+        let bad_root = [0xFFu8; 32];
+        let r = unsafe { n42_verify_state_proof(bytes.as_ptr(), bytes.len(), bad_root.as_ptr()) };
+        assert_eq!(r, 2, "wrong root must fail verification");
+
+        // Undecodable proof -> decode error (code 1).
+        let garbage = [0xDEu8, 0xAD, 0xBE, 0xEF];
+        let r =
+            unsafe { n42_verify_state_proof(garbage.as_ptr(), garbage.len(), combined.as_ptr()) };
+        assert_eq!(r, 1, "undecodable proof must return decode error");
+
+        // Null args -> -1.
+        let r = unsafe { n42_verify_state_proof(std::ptr::null(), 0, combined.as_ptr()) };
+        assert_eq!(r, -1);
+    }
+
+    #[test]
+    fn test_verify_account_proof_binds_address() {
+        use n42_bmt_core::{
+            EMPTY_HASH, Sbmt, ShardedBmtProof, account_key, shard_index_for_key, shard_tree_path,
+            shard_tree_root,
+        };
+
+        let addr = Address::repeat_byte(0xAB);
+        let key = account_key(&addr.into_array());
+        let si = shard_index_for_key(&key);
+        let mut shard = Sbmt::new();
+        shard.insert(key, b"acct-value");
+        let mut roots = vec![EMPTY_HASH; 16];
+        roots[si] = shard.root_hash();
+        let combined = shard_tree_root(&roots);
+        let proof = ShardedBmtProof {
+            shard_index: si as u8,
+            shard_root: roots[si],
+            shard_path: shard_tree_path(&roots, si),
+            inner: shard.prove(key),
+            value: Some(b"acct-value".to_vec()),
+        };
+        let bytes = bincode::serialize(&proof).unwrap();
+
+        // Bound to the correct address → valid.
+        let r = unsafe {
+            n42_verify_account_proof(
+                bytes.as_ptr(),
+                bytes.len(),
+                combined.as_ptr(),
+                addr.as_ptr(),
+            )
+        };
+        assert_eq!(r, 0, "proof bound to its real address must verify");
+
+        // Same proof, different queried address → rejected (code 2), even though
+        // the unbound n42_verify_state_proof would accept it.
+        let other = Address::repeat_byte(0xCD);
+        let r = unsafe {
+            n42_verify_account_proof(
+                bytes.as_ptr(),
+                bytes.len(),
+                combined.as_ptr(),
+                other.as_ptr(),
+            )
+        };
+        assert_eq!(r, 2, "proof for a different account must be rejected");
+
+        // Sanity: the unbound API still accepts it (documents why binding matters).
+        let r = unsafe { n42_verify_state_proof(bytes.as_ptr(), bytes.len(), combined.as_ptr()) };
+        assert_eq!(
+            r, 0,
+            "unbound verify accepts any internally-consistent proof"
+        );
+    }
+
+    #[test]
+    fn test_verify_twig_account_proof_binds_address() {
+        use n42_bmt_core::{account_key, shard_index_for_key};
+        use n42_twig_core::ShardedTwig;
+
+        let addr = Address::repeat_byte(0xAB);
+        let key = account_key(&addr.into_array());
+        let mut tree = ShardedTwig::new();
+        tree.set(key, b"twig-acct-value");
+        let root = tree.root();
+        let proof = tree.prove(&key).unwrap();
+        let bytes = bincode::serialize(&proof).unwrap();
+
+        let r = unsafe {
+            n42_verify_twig_account_proof(bytes.as_ptr(), bytes.len(), root.as_ptr(), addr.as_ptr())
+        };
+        assert_eq!(r, 0, "twig proof bound to its real address must verify");
+
+        let other = Address::repeat_byte(0xCD);
+        let r = unsafe {
+            n42_verify_twig_account_proof(
+                bytes.as_ptr(),
+                bytes.len(),
+                root.as_ptr(),
+                other.as_ptr(),
+            )
+        };
+        assert_eq!(r, 2, "twig proof for a different account must be rejected");
+
+        let r = unsafe { n42_verify_twig_state_proof(bytes.as_ptr(), bytes.len(), root.as_ptr()) };
+        assert_eq!(
+            r, 0,
+            "unbound twig verify accepts internally-consistent proof"
+        );
+
+        let mut wrong_shard = proof.clone();
+        wrong_shard.shard_index = (shard_index_for_key(&key) as u8) ^ 0x01;
+        let wrong_shard_bytes = bincode::serialize(&wrong_shard).unwrap();
+        let r = unsafe {
+            n42_verify_twig_account_proof(
+                wrong_shard_bytes.as_ptr(),
+                wrong_shard_bytes.len(),
+                root.as_ptr(),
+                addr.as_ptr(),
+            )
+        };
+        assert_eq!(r, 2, "wrong-shard twig proof must be rejected");
+
+        let garbage = [0xDEu8, 0xAD, 0xBE, 0xEF];
+        let r =
+            unsafe { n42_verify_twig_state_proof(garbage.as_ptr(), garbage.len(), root.as_ptr()) };
+        assert_eq!(r, 1, "undecodable twig proof must return decode error");
+
+        let r = unsafe { n42_verify_twig_state_proof(std::ptr::null(), 0, root.as_ptr()) };
+        assert_eq!(r, -1);
+    }
+
+    #[test]
+    fn test_verify_twig_storage_proof_binds_slot() {
+        use n42_bmt_core::storage_key;
+        use n42_twig_core::ShardedTwig;
+
+        let addr = Address::repeat_byte(0xEF);
+        let slot = U256::from(42);
+        let slot_be = slot.to_be_bytes::<32>();
+        let key = storage_key(&addr.into_array(), &slot_be);
+        let mut tree = ShardedTwig::new();
+        tree.set(key, b"twig-storage-value");
+        let root = tree.root();
+        let proof = tree.prove(&key).unwrap();
+        let bytes = bincode::serialize(&proof).unwrap();
+
+        let r = unsafe {
+            n42_verify_twig_storage_proof(
+                bytes.as_ptr(),
+                bytes.len(),
+                root.as_ptr(),
+                addr.as_ptr(),
+                slot_be.as_ptr(),
+            )
+        };
+        assert_eq!(
+            r, 0,
+            "twig storage proof bound to its real slot must verify"
+        );
+
+        let wrong_slot = U256::from(43).to_be_bytes::<32>();
+        let r = unsafe {
+            n42_verify_twig_storage_proof(
+                bytes.as_ptr(),
+                bytes.len(),
+                root.as_ptr(),
+                addr.as_ptr(),
+                wrong_slot.as_ptr(),
+            )
+        };
+        assert_eq!(
+            r, 2,
+            "twig storage proof for a different slot must be rejected"
+        );
+    }
 
     #[test]
     fn test_verify_stats_default() {

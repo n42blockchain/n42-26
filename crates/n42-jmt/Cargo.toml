@@ -8,6 +8,12 @@ description = "N42 Jellyfish Merkle Tree with Blake3 hashing, 16-shard paralleli
 
 [dependencies]
 n42-execution.workspace = true
+n42-bmt-core.workspace = true
+# rayon feature intentionally NOT enabled: cross-shard parallelism measured
+# no benefit (slight regression) on the twig engine — the update path is
+# memory-latency-bound on random access, not CPU-bound (see devlog-65). Scalar
+# is as-fast-or-faster here; the feature stays available for other workloads.
+n42-twig-core.workspace = true
 
 jmt.workspace = true
 blake3.workspace = true
@@ -33,7 +39,15 @@ reth-libmdbx.workspace = true
 rand.workspace = true
 criterion = "0.5"
 tempfile.workspace = true
+memory-stats = "1"
+serde_json = "1"
 
 [[bench]]
 name = "jmt_bench"
 harness = false
+
+[[example]]
+name = "sbmt_state_bench"
+
+[[example]]
+name = "twig_state_bench"

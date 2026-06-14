@@ -419,51 +419,93 @@ impl ConsensusOrchestrator {
         self.store_committed_block(view, block_hash, commit_qc.clone(), validator_changes);
         self.head_block_hash = block_hash;
 
-        // JMT background update: extract BundleState from pending block data.
-        if let Some(ref jmt) = self.jmt {
+        // Leader eager-imported blocks can finalize via Case A before the select
+        // loop processes `leader_payload_rx`. Drain it here so state-tree
+        // updater can see the local block data even when reth already has the
+        // block in its engine tree.
+        self.drain_leader_payload_rx(&[block_hash]);
+
+        // State-tree background update: extract BundleState from pending block
+        // data once, then feed the enabled sidecar tree(s).
+        if self.jmt.is_some() || self.twig.is_some() {
             let diff = self
                 .pending_block_data
                 .get(&block_hash)
-                .and_then(|data| Self::extract_state_diff_for_jmt(block_hash, data));
+                .and_then(|data| Self::extract_state_diff_for_state_tree(block_hash, data));
             if let Some(diff) = diff {
-                let jmt = Arc::clone(jmt);
-                let state = self.consensus_state.clone();
-                let block_count = self.committed_block_count;
-                tokio::task::spawn_blocking(move || {
-                    let start = std::time::Instant::now();
-                    let mut tree = jmt.lock().unwrap_or_else(|e| {
-                        tracing::warn!("jmt mutex poisoned, recovering");
-                        e.into_inner()
+                if let Some(ref jmt) = self.jmt {
+                    let diff = diff.clone();
+                    let jmt = Arc::clone(jmt);
+                    let state = self.consensus_state.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let start = std::time::Instant::now();
+                        let mut tree = jmt.lock().unwrap_or_else(|e| {
+                            tracing::warn!("sbmt mutex poisoned, recovering");
+                            e.into_inner()
+                        });
+                        // PersistentSbmt::apply_diff applies in-memory, appends the WAL
+                        // (durable per block) and checkpoints a snapshot every interval.
+                        // It returns a Result because the WAL/snapshot IO can fail.
+                        match tree.apply_diff(&diff) {
+                            Ok((version, root)) => {
+                                let elapsed_ms = start.elapsed().as_millis();
+                                gauge!("n42_jmt_latest_root").set(version as f64);
+                                histogram!("n42_state_root_apply_diff_ms")
+                                    .record(elapsed_ms as f64);
+                                info!(
+                                    target: "n42::jmt",
+                                    version,
+                                    %root,
+                                    accounts = diff.len(),
+                                    storage_changes = diff.total_storage_changes(),
+                                    elapsed_ms,
+                                    "SBMT updated"
+                                );
+                                if let Some(ref state) = state {
+                                    state.update_jmt_root(version, root);
+                                }
+                            }
+                            Err(e) => {
+                                warn!(target: "n42::jmt", error = %e, "SBMT apply_diff/persist failed");
+                            }
+                        }
                     });
-                    match tree.apply_diff(&diff) {
-                        Ok((version, root)) => {
-                            let elapsed_ms = start.elapsed().as_millis();
-                            gauge!("n42_jmt_latest_root").set(version as f64);
-                            histogram!("n42_state_root_apply_diff_ms").record(elapsed_ms as f64);
-                            info!(
-                                target: "n42::jmt",
-                                version,
-                                %root,
-                                accounts = diff.len(),
-                                storage_changes = diff.total_storage_changes(),
-                                elapsed_ms,
-                                "JMT updated"
-                            );
-                            if let Some(ref state) = state {
-                                state.update_jmt_root(version, root);
+                }
+                if let Some(ref twig) = self.twig {
+                    let twig = Arc::clone(twig);
+                    let state = self.consensus_state.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let start = std::time::Instant::now();
+                        let mut tree = twig.lock().unwrap_or_else(|e| {
+                            tracing::warn!("twig mutex poisoned, recovering");
+                            e.into_inner()
+                        });
+                        match tree.apply_diff(&diff) {
+                            Ok((version, root)) => {
+                                let elapsed_ms = start.elapsed().as_millis();
+                                gauge!("n42_twig_latest_root").set(version as f64);
+                                histogram!("n42_twig_apply_diff_ms").record(elapsed_ms as f64);
+                                info!(
+                                    target: "n42::twig",
+                                    version,
+                                    %root,
+                                    accounts = diff.len(),
+                                    storage_changes = diff.total_storage_changes(),
+                                    elapsed_ms,
+                                    "Twig updated"
+                                );
+                                if let Some(ref state) = state {
+                                    state.update_twig_root(version, root);
+                                }
                             }
-                            // Prune old versions every 100 blocks to reclaim memory.
-                            if block_count.is_multiple_of(100) {
-                                tree.prune(200);
+                            Err(e) => {
+                                warn!(target: "n42::twig", error = %e, "Twig apply_diff/persist failed");
                             }
                         }
-                        Err(e) => {
-                            warn!(target: "n42::jmt", error = %e, "JMT apply_diff failed");
-                        }
-                    }
-                });
+                    });
+                }
             } else {
-                debug!(target: "n42::jmt", %block_hash, "no block data available for JMT update (will catch up)");
+                debug!(target: "n42::jmt", %block_hash, "no block data available for state-tree update (will catch up)");
             }
         }
 
@@ -651,17 +693,7 @@ impl ConsensusOrchestrator {
             // data (sent via leader_payload_tx) hasn't been processed by the select loop
             // yet because block_ready_rx was processed first, triggering the consensus
             // flow before the data was cached. Drain the leader_payload_rx to recover.
-            while let Ok((hash, data)) = self.leader_payload_rx.try_recv() {
-                if !self.pending_block_data.contains_key(&hash) {
-                    if self.pending_block_data.len()
-                        >= super::execution_bridge::MAX_PENDING_BLOCK_DATA
-                        && let Some(old_key) = self.pending_block_data.keys().next().copied()
-                    {
-                        self.pending_block_data.remove(&old_key);
-                    }
-                    self.pending_block_data.insert(hash, data);
-                }
-            }
+            self.drain_leader_payload_rx(&[block_hash]);
             if let Some(data) = self.pending_block_data.remove(&block_hash) {
                 // Recovered! Proceed as Case B.
                 info!(target: "n42::cl::consensus_loop", view, %block_hash, "recovered block data from leader_payload_rx, proceeding as Case B");
@@ -945,13 +977,12 @@ impl ConsensusOrchestrator {
         // so the block data must be available in pending_block_data for Case B in
         // finalize_committed_block().  GossipSub does not echo to self, so without
         // this cache the leader's own block would fall to Case C (missing data).
-        if !self.pending_block_data.contains_key(&hash) {
-            if self.pending_block_data.len() >= super::execution_bridge::MAX_PENDING_BLOCK_DATA
-                && let Some(old_key) = self.pending_block_data.keys().next().copied()
-            {
-                self.pending_block_data.remove(&old_key);
-            }
-            self.pending_block_data.insert(hash, data.clone());
+        let pending_finalization_hash = self
+            .pending_finalization
+            .as_ref()
+            .map(|pending| pending.block_hash)
+            .unwrap_or(hash);
+        if self.cache_pending_block_data(hash, data.clone(), &[hash, pending_finalization_hash]) {
             debug!(target: "n42::cl::consensus_loop", %hash, "cached leader block data for deferred import");
         }
 
@@ -1021,20 +1052,20 @@ impl ConsensusOrchestrator {
         }
     }
 
-    /// Try to extract a `StateDiff` from serialized `BlockDataBroadcast` for JMT update.
+    /// Try to extract a `StateDiff` from serialized `BlockDataBroadcast` for a state-tree update.
     /// Returns `None` if the data is missing, malformed, or has no compact block execution.
-    fn extract_state_diff_for_jmt(
+    fn extract_state_diff_for_state_tree(
         block_hash: B256,
         data: &[u8],
     ) -> Option<n42_execution::state_diff::StateDiff> {
-        let broadcast = Self::decode_block_data_broadcast(block_hash, data, "jmt_state_diff")?;
+        let broadcast = Self::decode_block_data_broadcast(block_hash, data, "state_tree_diff")?;
         let exec_bytes = match broadcast.execution_output.as_ref() {
             Some(exec_bytes) => exec_bytes,
             None => {
                 debug!(
                     target: "n42::cl::consensus_loop",
                     %block_hash,
-                    "block data broadcast missing execution output for JMT update"
+                    "block data broadcast missing execution output for state-tree update"
                 );
                 return None;
             }
@@ -1046,7 +1077,7 @@ impl ConsensusOrchestrator {
                     target: "n42::cl::consensus_loop",
                     %block_hash,
                     error = %error,
-                    "failed to decompress execution output for JMT update"
+                    "failed to decompress execution output for state-tree update"
                 );
                 return None;
             }
@@ -1058,14 +1089,33 @@ impl ConsensusOrchestrator {
                     target: "n42::cl::consensus_loop",
                     %block_hash,
                     error = %error,
-                    "failed to decode compact execution JSON for JMT update"
+                    "failed to decode compact execution JSON for state-tree update"
                 );
                 return None;
             }
         };
-        Some(n42_execution::state_diff::StateDiff::from_bundle_state(
-            &compact.bundle_state,
-        ))
+        // Diagnostic for the devlog-71 `storage_changes=0` follow-up: count the
+        // raw storage slots present in the broadcast bundle BEFORE StateDiff
+        // filtering. If this is 0 for a contract-heavy block, the storage is
+        // missing from the leader's captured bundle (reth payload-build capture),
+        // not dropped by StateDiff extraction. See docs/devlog-71.
+        let raw_bundle_storage: usize = compact
+            .bundle_state
+            .state
+            .values()
+            .map(|acc| acc.storage.len())
+            .sum();
+        let diff = n42_execution::state_diff::StateDiff::from_bundle_state(&compact.bundle_state);
+        debug!(
+            target: "n42::cl::consensus_loop",
+            %block_hash,
+            bundle_accounts = compact.bundle_state.state.len(),
+            raw_bundle_storage_slots = raw_bundle_storage,
+            diff_accounts = diff.len(),
+            diff_storage_changes = diff.total_storage_changes(),
+            "STATE_DIFF_DIAG: raw broadcast bundle vs extracted diff"
+        );
+        Some(diff)
     }
 
     /// Extract decompressed CompactBlockExecution JSON bytes from raw BlockDataBroadcast.

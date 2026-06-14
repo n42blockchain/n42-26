@@ -28,7 +28,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: n42blockchain/reth
-          ref: n42-v2-upgrade
+          ref: chore/merge-upstream-fc2cc1e
           path: workspace/reth
 
       - name: Build client image

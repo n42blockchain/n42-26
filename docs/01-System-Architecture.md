@@ -116,7 +116,7 @@ Primary code:
 - [`crates/n42-jmt/src/`](crates/n42-jmt/src)
 - [`crates/n42-zkproof/src/`](crates/n42-zkproof/src)
 
-> **✅ JMT 已接入生产**：`ShardedJmt` 在 `bin/n42-node/src/main.rs:702`（RPC）和 `:1231`（orchestrator）通过 `with_jmt()` builder 注入。详见 `docs/devlog-52-jmt-full-integration.md`。`apply_diff` 在 commit 后通过 spawn_blocking 异步更新，不在共识关键路径。`n42_jmtRoot` / `n42_jmtProof` / `n42_jmtVersion` RPC 已可用。
+> **✅ 状态树已接入生产（SBMT）**：自 devlog-59 起，并行状态树从 `ShardedJmt` 切换为 `ShardedSbmt`（自研二叉 SBMT，`N42_JMT=1` 启用），在 `bin/n42-node/src/main.rs`（RPC + orchestrator）通过 `with_jmt()` builder 注入。`apply_diff` 在 commit 后通过 spawn_blocking 异步更新，不在共识关键路径（state root 由 reth MPT 算并入 header，SBMT 仅服务手机 proof）。`n42_jmtProof` 现返回 bincode 编码的 `ShardedBmtProof`，手机用 `n42-bmt-core::verify`（纯 blake3）验证。`n42_jmtRoot` / `n42_jmtProof` / `n42_jmtVersion` RPC 可用。
 
 ### 6. Staking plane
 

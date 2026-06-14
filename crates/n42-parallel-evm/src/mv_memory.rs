@@ -37,6 +37,13 @@ pub struct MvMemory {
     /// Per-tx write index: tx_idx → list of locations that tx wrote.
     /// Used by `clear_tx` to avoid O(|all_locations|) scans on re-execution.
     tx_writes: DashMap<TxIdx, Vec<WriteKey>>,
+    /// Deferred-coinbase accumulator: tx_idx → balance delta this tx credited to
+    /// the block beneficiary (gas fee + any value sent to it). Kept OUT of the
+    /// versioned `accounts` map so they never create read/write conflicts
+    /// (balance increments commute), eliminating the Block-STM coinbase cascade.
+    /// Summed in `sum_bene_deltas` at commit; `clear_tx` drops a tx's entry on
+    /// re-execution. See `docs/devlog-67`.
+    bene_deltas: DashMap<TxIdx, U256>,
 }
 
 impl Default for MvMemory {
@@ -52,7 +59,20 @@ impl MvMemory {
             storage: DashMap::new(),
             code: DashMap::new(),
             tx_writes: DashMap::new(),
+            bene_deltas: DashMap::new(),
         }
+    }
+
+    /// Record this tx's commutative balance delta to the block beneficiary.
+    pub fn record_bene_delta(&self, tx_idx: TxIdx, delta: U256) {
+        self.bene_deltas.insert(tx_idx, delta);
+    }
+
+    /// Sum every recorded beneficiary delta (commit-time materialization).
+    pub fn sum_bene_deltas(&self) -> U256 {
+        self.bene_deltas
+            .iter()
+            .fold(U256::ZERO, |acc, e| acc.saturating_add(*e.value()))
     }
 
     /// Read account info visible to `reader_idx` (latest version from a tx < reader_idx).
@@ -121,19 +141,20 @@ impl MvMemory {
 
     /// Remove all entries written by `tx_idx` (used before re-execution).
     ///
-    /// O(|writes_of_tx|) via the per-tx write index; falls back to a full scan if the
-    /// index entry is missing (defense-in-depth for any caller that bypasses
-    /// `write_account` / `write_storage`).
+    /// O(|writes_of_tx|) via the per-tx write index. A missing index entry means
+    /// the tx has never written anything (`write_account`/`write_storage` always
+    /// register the index), so it is a no-op — the previous full-table-scan
+    /// fallback ran on EVERY first execution (no prior writes) and made the
+    /// whole block O(n^2).
     pub fn clear_tx(&self, tx_idx: TxIdx) {
         let start = std::time::Instant::now();
-        let mut writes_count: usize = 0;
-        let mut used_fallback = false;
-        if let Some((_, writes)) = self.tx_writes.remove(&tx_idx) {
-            writes_count = writes.len();
-            for w in writes {
+        // Drop any deferred beneficiary delta from the prior execution.
+        self.bene_deltas.remove(&tx_idx);
+        let writes_count = if let Some((_, writes)) = self.tx_writes.remove(&tx_idx) {
+            for w in &writes {
                 match w {
                     WriteKey::Account(addr) => {
-                        if let Some(entry) = self.accounts.get(&addr) {
+                        if let Some(entry) = self.accounts.get(addr) {
                             entry
                                 .write()
                                 .unwrap_or_else(|e| e.into_inner())
@@ -141,7 +162,7 @@ impl MvMemory {
                         }
                     }
                     WriteKey::Storage(addr, slot) => {
-                        if let Some(entry) = self.storage.get(&(addr, slot)) {
+                        if let Some(entry) = self.storage.get(&(*addr, *slot)) {
                             entry
                                 .write()
                                 .unwrap_or_else(|e| e.into_inner())
@@ -150,58 +171,12 @@ impl MvMemory {
                     }
                 }
             }
+            writes.len()
         } else {
-            used_fallback = true;
-            for entry in self.accounts.iter() {
-                entry
-                    .write()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .remove(&tx_idx);
-            }
-            for entry in self.storage.iter() {
-                entry
-                    .write()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .remove(&tx_idx);
-            }
-        }
+            0
+        };
         let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-        metrics::histogram!(
-            "n42_mv_memory_clear_tx_ms",
-            "path" => if used_fallback { "fallback_scan" } else { "indexed" }
-        )
-        .record(elapsed_ms);
-        if !used_fallback {
-            metrics::histogram!("n42_mv_memory_clear_tx_writes").record(writes_count as f64);
-        }
-    }
-
-    /// Check if the latest writer for a key visible to `reader_idx` matches `expected_origin`.
-    /// Used during validation to detect conflicts.
-    pub fn latest_account_writer(&self, reader_idx: TxIdx, addr: &Address) -> Option<TxIdx> {
-        self.accounts.get(addr).and_then(|entry| {
-            entry
-                .read()
-                .unwrap_or_else(|e| e.into_inner())
-                .range(..reader_idx)
-                .next_back()
-                .map(|(&idx, _)| idx)
-        })
-    }
-
-    pub fn latest_storage_writer(
-        &self,
-        reader_idx: TxIdx,
-        addr: &Address,
-        slot: &U256,
-    ) -> Option<TxIdx> {
-        self.storage.get(&(*addr, *slot)).and_then(|entry| {
-            entry
-                .read()
-                .unwrap_or_else(|e| e.into_inner())
-                .range(..reader_idx)
-                .next_back()
-                .map(|(&idx, _)| idx)
-        })
+        metrics::histogram!("n42_mv_memory_clear_tx_ms").record(elapsed_ms);
+        metrics::histogram!("n42_mv_memory_clear_tx_writes").record(writes_count as f64);
     }
 }

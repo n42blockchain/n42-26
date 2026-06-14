@@ -12,7 +12,7 @@ use crate::tx_bridge::TxImportBatch;
 use alloy_primitives::{Address, B256};
 use metrics::{counter, gauge, histogram};
 use n42_consensus::{ConsensusEngine, EngineOutput, FUTURE_VIEW_WINDOW, ValidatorSet};
-use n42_jmt::ShardedJmt;
+use n42_jmt::{PersistentSbmt, PersistentTwig};
 use n42_network::{NetworkEvent, NetworkHandle, PeerId};
 use n42_primitives::QuorumCertificate;
 use reth_ethereum_engine_primitives::EthEngineTypes;
@@ -333,9 +333,12 @@ pub struct ConsensusOrchestrator {
     /// ViewChanged/BlockCommitted. Consensus voting naturally paces block production.
     /// Enabled by `N42_FAST_PROPOSE=1`. Default: false (grid-aligned slots).
     fast_propose: bool,
-    /// Jellyfish Merkle Tree for parallel state commitment.
+    /// Sparse Binary Merkle Tree for parallel state commitment.
     /// Updated asynchronously after each committed block.
-    jmt: Option<Arc<Mutex<ShardedJmt>>>,
+    jmt: Option<Arc<Mutex<PersistentSbmt>>>,
+    /// Twig state tree for append-only state commitments.
+    /// Updated asynchronously after each committed block.
+    twig: Option<Arc<Mutex<PersistentTwig>>>,
     /// ZK proof scheduler: generates ZK proofs asynchronously as a sidecar.
     /// Enabled by `N42_ZK_PROOF=1`. Default: None (disabled, zero overhead).
     zk_scheduler: Option<Arc<n42_zkproof::ProofScheduler>>,
@@ -353,6 +356,46 @@ pub struct ConsensusOrchestrator {
 }
 
 impl ConsensusOrchestrator {
+    fn cache_pending_block_data(
+        &mut self,
+        hash: B256,
+        data: Vec<u8>,
+        protected_hashes: &[B256],
+    ) -> bool {
+        if self.pending_block_data.contains_key(&hash) {
+            return false;
+        }
+
+        if self.pending_block_data.len() >= execution_bridge::MAX_PENDING_BLOCK_DATA {
+            let evict_key = self
+                .pending_block_data
+                .keys()
+                .find(|candidate| !protected_hashes.contains(*candidate))
+                .copied();
+
+            let Some(evict_key) = evict_key else {
+                counter!("n42_pending_block_data_full_protected_drop_total").increment(1);
+                warn!(
+                    target: "n42::cl::orchestrator",
+                    %hash,
+                    protected = protected_hashes.len(),
+                    "pending block data cache full with no evictable entry, dropping block data"
+                );
+                return false;
+            };
+            self.pending_block_data.remove(&evict_key);
+        }
+
+        self.pending_block_data.insert(hash, data);
+        true
+    }
+
+    fn drain_leader_payload_rx(&mut self, protected_hashes: &[B256]) {
+        while let Ok((hash, data)) = self.leader_payload_rx.try_recv() {
+            self.cache_pending_block_data(hash, data, protected_hashes);
+        }
+    }
+
     pub fn new(
         engine: ConsensusEngine,
         network: NetworkHandle,
@@ -428,6 +471,7 @@ impl ConsensusOrchestrator {
                 .unwrap_or(0)
                 > 0,
             jmt: None,
+            twig: None,
             zk_scheduler: None,
             allow_deterministic_validator_peers: true,
             admin_rx: None,
@@ -605,6 +649,7 @@ impl ConsensusOrchestrator {
             eager_import_block_guard: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             fast_propose,
             jmt: None,
+            twig: None,
             zk_scheduler: None,
             allow_deterministic_validator_peers: true,
             admin_rx: None,
@@ -655,8 +700,13 @@ impl ConsensusOrchestrator {
     ///
     /// When set, the orchestrator consults the schedule at each `EpochTransition`
     /// event and automatically stages the next epoch's validator set.
-    pub fn with_jmt(mut self, jmt: Arc<Mutex<ShardedJmt>>) -> Self {
+    pub fn with_jmt(mut self, jmt: Arc<Mutex<PersistentSbmt>>) -> Self {
         self.jmt = Some(jmt);
+        self
+    }
+
+    pub fn with_twig(mut self, twig: Arc<Mutex<PersistentTwig>>) -> Self {
+        self.twig = Some(twig);
         self
     }
 
@@ -1710,6 +1760,68 @@ mod tests {
         let mut orch = ConsensusOrchestrator::new(engine, network, net_event_rx, output_rx);
         orch.consensus_state = state;
         orch
+    }
+
+    #[test]
+    fn test_cache_pending_block_data_preserves_protected_hash_when_full() {
+        let mut orch = make_test_orchestrator_with_state(None);
+        let protected_hash = B256::repeat_byte(0x00);
+        for byte in 0..super::execution_bridge::MAX_PENDING_BLOCK_DATA {
+            let hash = B256::repeat_byte(byte as u8);
+            orch.pending_block_data.insert(hash, vec![byte as u8]);
+        }
+
+        let incoming_hash = B256::repeat_byte(0xff);
+        assert!(orch.cache_pending_block_data(incoming_hash, vec![0xff], &[protected_hash]));
+
+        assert_eq!(
+            orch.pending_block_data.len(),
+            super::execution_bridge::MAX_PENDING_BLOCK_DATA
+        );
+        assert!(orch.pending_block_data.contains_key(&protected_hash));
+        assert!(orch.pending_block_data.contains_key(&incoming_hash));
+        assert!(
+            !orch
+                .pending_block_data
+                .contains_key(&B256::repeat_byte(0x01))
+        );
+    }
+
+    #[test]
+    fn test_leader_payload_drain_preserves_finalizing_hash_when_full() {
+        let mut orch = make_test_orchestrator_with_state(None);
+        for byte in 1..=super::execution_bridge::MAX_PENDING_BLOCK_DATA {
+            let hash = B256::repeat_byte(byte as u8);
+            orch.pending_block_data.insert(hash, vec![byte as u8]);
+        }
+
+        let finalizing_hash = B256::repeat_byte(0x00);
+        let later_hash = B256::repeat_byte(0xff);
+        orch.leader_payload_tx
+            .try_send((finalizing_hash, b"target".to_vec()))
+            .expect("leader payload channel should accept target");
+        orch.leader_payload_tx
+            .try_send((later_hash, b"later".to_vec()))
+            .expect("leader payload channel should accept later payload");
+
+        orch.drain_leader_payload_rx(&[finalizing_hash]);
+
+        assert_eq!(
+            orch.pending_block_data
+                .get(&finalizing_hash)
+                .map(Vec::as_slice),
+            Some(&b"target"[..])
+        );
+        assert_eq!(
+            orch.pending_block_data.len(),
+            super::execution_bridge::MAX_PENDING_BLOCK_DATA
+        );
+        assert!(orch.pending_block_data.contains_key(&later_hash));
+        assert!(
+            !orch
+                .pending_block_data
+                .contains_key(&B256::repeat_byte(0x01))
+        );
     }
 
     #[tokio::test]

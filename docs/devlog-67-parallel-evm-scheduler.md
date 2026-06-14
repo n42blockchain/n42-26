@@ -1,0 +1,229 @@
+# devlog-67 — parallel-evm:消除两处 O(n²) + 定位 coinbase 级联
+
+## 起因(devlog-66 #3)
+
+samply 显示 parallel-evm 并行段 35% 线程等待。n42-evm-bench 的 Block-STM 段实测暴露真问题:
+
+| txs | seq(修复前) | par(修复前) |
+|-----|------------|------------|
+| 5000 | **195243 ms** | 187909 ms |
+
+5000 笔**互不冲突**转账,顺序执行竟要 195 秒 —— 明显 O(n²)。
+
+## 修复 1:`MvMemory::clear_tx` 全表扫描(顺序路径 7500x)
+
+`clear_tx(tx_idx)` 在重执行前清掉该 tx 的旧写。原实现:索引命中走 O(writes),**索引缺失时
+回退全表扫描**(扫所有 account/storage entry 调 `remove(&tx_idx)`)。但"索引缺失"恰恰是
+**每笔 tx 首次执行**的常态(还没写过任何东西)—— 于是每笔首执行都全表扫一遍 = O(n²)。
+
+修复:索引缺失 = 该 tx 没写过 = no-op(`write_account`/`write_storage` 总会登记索引,回退
+分支是死代码且有害)。**seq 5000: 195243 ms → 26 ms。**
+
+## 修复 2:`Scheduler::try_get_task` 的 O(n) 状态扫描
+
+每次取任务都 `for i in 0..num_txs` 线性扫 REDO 标记 → 任务获取 O(n)、全块 O(n²)。
+改为 **REDO 队列**(`Mutex<VecDeque>`):`abort_and_reschedule` push 被作废的 tx,取任务时
+O(1) pop + `REDO→PENDING` CAS 确认(status 数组仍是真值源,跳过陈旧/重复条目)。
+
+## 修复 3:`N42_PARALLEL_THRESHOLD` 被 `OnceLock` 冻结
+
+阈值用 `OnceLock` 缓存,进程内第一次读后永久固定 —— bench/测试改环境变量无效。改为每块读一次
+(每块一次 env 读,纳秒级)。
+
+## 仍然慢的真相:coinbase 写冲突级联(并行路径)
+
+修复后 seq 5000 = 26 ms,但 **par 5000 仍 ~198 s**。根因不是调度,而是 Block-STM 的经典死穴:
+
+> bench 的"无冲突"转账**全部写同一个 beneficiary(coinbase)账户** —— 每笔 tx 付 gas 费给
+> 同一 coinbase,于是 tx_i 读到 tx_{i-1} 写的 coinbase 余额 → 全局串行依赖 → 每笔验证失败 →
+> `abort_and_reschedule` 把所有更高 index 标 REDO → O(n²) 重执行。
+
+这是**真实问题**(真实区块每笔都付 coinbase,gas_price>0),不是 bench 假象。Aptos Block-STM
+的标准解法:coinbase 余额增量是**可交换累加**,不当普通读写,在 commit 时聚合(`lazy/
+commutative` 累加器),从读集里剔除 coinbase 余额。
+
+### 下一步(#3 续):deferred coinbase
+
+在 `MvMemory` 给 beneficiary 余额增量设可交换累加器(每 tx 记 delta,验证不比对 coinbase 余额,
+commit 时求和应用)。预期把转账块从 O(n²) 降到近线性,真正吃满多核。属中等改动,单列一轮。
+
+## 修复 4:deferred coinbase(消除并行级联,2257x)
+
+按"加法可交换"的洞察实现:
+- **盲读**:`ParallelDb` 对 beneficiary 返回 base 值且**不进 read_set** → fee 入账不产生读依赖。
+- **commutative delta**:`execute_single_tx` 抽出 `delta = new_balance - base_balance`,存进
+  `MvMemory.bene_deltas`(不进 versioned accounts),`clear_tx` 重执行时一并清除。
+- **commit 物化**:最终 `beneficiary = base + Σ delta`(加法,顺序无关),在 `build_output` 后
+  一次性写回。
+- **守卫**:beneficiary 若是某 tx 的 sender(nonce 变,不可交换)→ `bene_is_sender` 自动关闭
+  deferral,退回正常 versioned 路径;tx 若改了 beneficiary 的 nonce/code → 该 tx 退回普通写。
+  开关 `N42_DEFERRED_COINBASE=0`。
+- **soundness**:只要无 tx 分支于 coinbase 的块内中间余额(标准转账/ERC-20/DeFi 均不读
+  `block.coinbase` 余额)即与顺序逐字节一致。
+
+**对拍测试**(`deferred_parallel_matches_sequential_state`):200 笔独立转账付费给共享 coinbase,
+deferred 并行的**每个账户余额**(含 coinbase 费总额 `200×21000×7`)**逐一等于顺序执行**。
+第二个测试验证 bene-as-sender 守卫。
+
+实测(evm-bench Block-STM 段):
+
+| txs | deferred OFF | deferred ON | 提速 |
+|-----|-------------|-------------|------|
+| 2000 | 19295 ms | 47 ms | 410x |
+| 5000 | **227642 ms** | **100.9 ms** | **2257x** |
+
+并行从 O(n²) 级联恢复为**近线性**(~50 txs/ms)。
+
+> 注:trivial 转账下 par(100ms)仍 > seq(28ms)—— 这是并行协调的固定开销在"每笔仅 5µs"
+> 工作量下未摊平,**不是级联**(级联已除)。真实区块(合约调用、多 SLOAD)每笔工作量大得多,
+> 并行才赢;而那些块同样共享 coinbase,没有 deferred 就会被级联打死 —— 所以 deferred 是并行
+> 可用的前提。trivial-only 大块可由阈值/自适应调度走顺序,属调优。
+
+## 状态
+
+修复 1/2/3/4 全部落地,结果与顺序执行逐账户一致(对拍测试),parallel-evm 4 测试 + clippy 绿。
+全局优化 #3 完成。
+
+## 修复 5:调度竞争 + worker 数(samply 驱动)
+
+deferred coinbase 消除级联后,profile 并行路径(`examples/parallel_profile.rs`,5000 独立转账,
+samply/ETW)发现 **40% 线程空转 + 线程越多越慢**:
+
+| RAYON 线程 | us/tx(优化前) |
+|-----------|---------------|
+| 2 | 4.72 |
+| 4 | 4.99 |
+| 8 | 9.49 |
+| 32 | **21.4(4x 更差)** |
+
+根因是共享调度原子的 cache-line 竞争 + in-order validation 的串行自旋。三个 micro-fix(全部
+降低竞争,所有线程数受益):
+1. **redo 队列免锁快路径**:`redo_len` 原子,空队列(无冲突常态)直接返回,不 lock mutex —
+   原来每次 `try_get_task` 都锁。
+2. **删 `active_workers`**:该字段只 fetch_add/sub 从不被读 —— 纯死竞争(每 task 两次共享 RMW),
+   直接移除。
+3. **`exec_cursor` 改 `fetch_add`**:原 CAS load/compare 循环在 32 线程下重试风暴;wait-free
+   fetch_add 单次原子,溢出 num_txs 的认领忽略即可。
+
+但 8+ 线程仍崩 —— in-order validation 的串行性是 Block-STM 结构性限制(idle worker 自旋等
+val_cursor 推进),需重写(并行 validation / work-stealing)才能根治。
+
+**worker 数旋钮**:cheap-tx 块的协调开销摊不平,加 `N42_PARALLEL_WORKERS`(默认
+`min(cores, 8)`,避开 32 线程灾难;合约重链可调高)。实测默认 8.9 us/tx vs 未限 32 的
+19.7 us/tx(2.2x),WORKERS=4 最优 4.66。**真实块最优 worker 数需 testnet 标定。**
+
+> 诚实结论:trivial 转账块即使最优 worker 数,par(~4.6us/tx)也仅 ≈ seq(~5us)—— 每笔
+> ~1us 工作量摊不平并行协调,这是 Amdahl/内存带宽下限,非 bug。真正受益的是合约重块(每笔
+> 工作量大),而那些块没有 deferred coinbase 会被级联打死 —— 所以 deferred(修复4)是前提,
+> 调度调优(修复5)是边际。后续可做:并行 validation 重写 + 按 gas 估算自适应 worker 数。
+
+## 修复 6:并行 validation + 真相(分配器才是 8+ 线程崩溃主因)
+
+**并行 validation 重写**:把串行 `val_cursor` 换成验证队列 `WorkQueue`(原子 len 守卫,空队列免锁),
+任意 worker 验证任意已执行 tx、乱序并行。**正确性依据**:`abort_and_reschedule` 已把所有更高 tx
+标 REDO → 提前验证的 tx 只要有更低 tx abort 就被重验,故乱序验证 sound(验证是纯读集检查,abort
+级联与顺序无关)。新增队列 skip 测试 + deferred 对拍仍过。
+
+**但并行 validation 没解决 8+ 线程崩溃 → 说明 in-order validation 不是主因。** 继续验证假设:
+给 bench 链 mimalloc 分配器再 sweep,真相大白:
+
+| 线程 | Windows 默认堆 | **mimalloc** |
+|------|---------------|-------------|
+| 1 | 5.44 us/tx | **2.72**(2x) |
+| 4 | 4.37 | **1.11**(best,2.5x scaling over 1) |
+| 8 | 8.22 | 1.38 |
+| 32 | **20.85** | **2.30**(9x 改善,仅比 4 慢 2x) |
+
+**结论修正**:之前"线程越多越慢"主要是 **Windows 默认堆的多线程分配锁**竞争(每 tx 构造 revm
+Context/EVM 做大量小分配,32 线程狂抢 RtlAllocateHeap),**不是算法/调度问题**。
+
+**生产无此问题**:`bin/n42-node` 在 unix 用 **jemalloc**(`feature="jemalloc"`),Linux IDC 节点
+上并行路径正常 scale。换好分配器后,4 线程对 trivial 转账 2.5x、32 线程仅比 4 慢 2x(协调开销在
+~1us/tx 下的 Amdahl 余量,非崩溃)。
+
+**净收益**:① 并行 validation 去掉串行验证瓶颈(结构正确,重块受益);② 三个调度 micro-fix 降竞争;
+③ worker 旋钮主要是 Windows-默认-堆 的保险,jemalloc 生产可调高 N42_PARALLEL_WORKERS;④ bench
+现链 mimalloc,反映生产真实 scaling。所有改动 root/结果不变(deferred 对拍 + 5 测试绿)。
+
+## 审计修复:deferred coinbase 的非-EOA beneficiary 正确性
+
+深度审计主执行路径(reth 2.3 merge 解析 + BLS 收据批 + parallel-evm)发现一个 deferred coinbase
+的真实 correctness bug:
+
+**Bug**:deferral 守卫原为 `only_balance = nonce 不变 && code 不变`。若 beneficiary 是**合约**、
+被某 tx CALL 导致 balance **减少**(nonce/code 不变),`delta = new.saturating_sub(base)` 会
+**饱和到 0**,丢失减少 → 最终 coinbase 余额错误。验证者奖励是 EOA 永不触发,但属潜在共识隐患。
+
+**深层**:进一步发现非-deferred 路径对**热 coinbase**(每 tx 经 revm reward 机制贷记)本就不精确
+匹配 sequential(`beneficiary_as_sender` 测试此前靠 strip 掉 bene 才过)。
+
+**修复**:不可 defer 的 beneficiary(是 tx sender 或合约 = 非 EOA)→ **整块回退顺序执行**,保证
+正确(罕见;EOA non-sender 走 defer 快路)。`N42_DEFERRED_COINBASE=0` 仍保留非-deferred 并行作
+debug 旋钮。
+
+**判定范围**:新增 `hot_recipient_matches_sequential` 测试 —— 每 tx 经**普通 tx 写**贷记同一收款人
+(通用热账户),parallel == sequential **通过**。证明:① coinbase 不匹配是 **revm reward 机制特有**,
+非通用 Block-STM bug;② 引擎对通用热账户 sound(2257x 对真实 workload 成立 + 利好 B 集成)。
+
+测试:7 个全过(原 4 + contract_beneficiary + beneficiary_as_sender 改全相等 + hot_recipient),
+clippy 干净。审计另核:reth merge 解析(execute.rs cfg-gate、cache-hit、RLP-skip)均正确;BLS 收据批
+奖励经济安全(只对已验证收据发 ReceiptReceived)。
+
+## 重大修复:模块化重构暴露并修复 Block-STM soundness bug
+
+把 749 行单体 `lib.rs` 拆成内聚模块(`coinbase`/`execution`/`output`/`worker` + 精简 `lib.rs`
+orchestration)时,新加的 `hot_recipient` 测试(每 tx 经普通写贷记同一收款人)在重复运行下
+**flaky**(8 次 2 失败)→ 揭穿两个真实并发正确性 bug:
+
+**Bug A — validated_count 竞争**:`abort_and_reschedule` 标记更高 tx REDO 用 `load` 然后
+`store`(非原子),与 `finish_validation` 的 `CAS(EXECUTED→VALIDATED)` 竞争 → 可漏减一个
+VALIDATED → `validated_count` 永久偏高 → `all_done` 提前触发。**修复**:CAS 让
+EXECUTED/VALIDATED→REDO 转换与 prev 观测原子化。
+
+**Bug B(根因)— "并行 out-of-order validation"重写本身不健全**:此前我把串行 `val_cursor`
+换成验证队列,以为 in-order 只是保守。错。**in-order validation 是 load-bearing 的正确性保证**:
+tx_i 只在 0..i-1 都验证后才验,保证通过的验证是对已 settle 的下层前缀。乱序验证下,一个 tx 可
+对中间状态验证通过被标 VALIDATED,之后下层更新它读的值却不再重验 → 依赖链(热账户)结果错
+(实测 hot 余额 14700 vs 正确 15000)。修了 Bug A 后 Bug B 从 flaky 变稳定暴露(原本 count 多计
+意外多跑几轮偶尔纠正)。**修复**:恢复 in-order `val_cursor`(abort 时 rewind 到该 index)。
+
+**额外加固 — 值校验**:`validate_read_set` 由"查 writer 身份"改为"重读当前值比对"
+(`ReadEntry` 存 `ReadValue` 快照而非 `ReadOrigin`)—— 下层 tx 重执行写不同值时,即使 writer
+index 不变也能失效。这是 incarnation 跟踪的轻量替代(防御纵深)。
+
+**性能**:scaling 瓶颈早已查明是分配器(mimalloc/jemalloc),非 in-order validation;恢复 in-order
+对无冲突块几乎无损(验证总过的快速串行扫描),bench 4 workers 1.3 us/tx,deferred coinbase
+级联消除大赢保留。
+
+**结果**:`hot_recipient` 30/30 稳定通过,全套 6 测试 × 30 次全绿,n42-execution 91 + n42-jmt 92
+无回归,clippy 两路干净。**parallel-evm 现在对热账户/依赖链 sound** —— 这对 2257x 的真实
+workload 有效性 + B(接入生产)是必须的正确性基础。
+
+> 教训:之前 devlog 说"hot_recipient 通过证明引擎对热账户 sound"是**错的**(那次侥幸过)。
+> 重复运行 + 模块化重构把它揪了出来。已纠正。
+
+## 审计扩展:scheduler 收敛性 + execution_bridge 生产块导入
+
+继 mv_memory 之后审了两块,均 sound,无新 bug:
+
+**scheduler 收敛性/liveness**:
+- 兜底:`while !all_done && round<10 { rayon::scope }` + worker `retries>100` break → 最坏 10 轮
+  后回退顺序执行,**永不永久 stall**;sequential fallback 是 liveness 后盾。
+- REDO 必入队:abort 的每个 EXECUTED/VALIDATED→REDO 转换(CAS)都 push redo;PENDING 高 tx
+  跳过(本就在 exec_cursor / in-flight 执行)→ 无 tx 丢失永不执行。
+- val_cursor 不卡死:tx[v]=REDO 时返 None 自旋,另一 worker pop_redo 重执行→EXECUTED→推进。
+- all_done 不提前:外层在 `rayon::scope` 全 worker join 后才查(无 in-flight task,count 稳定);
+  worker 内见瞬时 count=n 而 break 时,正做 abort 的 worker 未 break → scope 不返回 → 不误判。
+- finish_execution 覆盖并发 REDO 良性:陈旧执行由 in-order + 值校验在验证时抓。
+- 实证:hot_recipient(150-tx 全依赖链,高冲突)×30 收敛正确。
+
+**execution_bridge 生产块导入**:
+- `CompactInjectTracker`(全局 Mutex):FIFO `order` + `counts`,2048 上限驱逐,dedup,mutex 毒恢复 → 有界,无泄漏。
+- `reth_evm::payload_cache`(N42_PAYLOAD_CACHE 核心):**单条目** `Option<CachedPayload>`,store 覆写
+  → 无泄漏;cache miss 仅降级到重执行(状态根仍校验)→ 无正确性风险;单 leader 串行建块 + Mutex → 无竞争;downcast 类型检查。
+- syncing 重试:队列 `MAX_SYNCING_QUEUE_SIZE`(pop_front 溢出)+ 重试 `MAX_SYNCING_RETRIES=3`
+  (超限丢弃)→ 双重有界,无无限重入。
+
+**审计总结(本轮 parallel-evm + 生产路径)**:真实 bug 全在 parallel-evm 且已修(deferred coinbase
+非-EOA saturation、validated_count 竞争、out-of-order validation 不健全→恢复 in-order、值校验);
+mv_memory/scheduler/execution_bridge 经审 sound,清了死代码。生产块导入路径成熟稳健。

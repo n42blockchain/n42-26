@@ -105,20 +105,25 @@ impl StateDiff {
             let original_info = bundle_account.original_info.as_ref();
             let current_info = bundle_account.info.as_ref();
 
-            debug_assert!(
-                !(was_destroyed && current_info.is_some()),
-                "account {address:?} marked destroyed but still has current info"
-            );
-
-            let change_type = match (
-                was_destroyed,
-                original_info.is_some(),
-                current_info.is_some(),
-            ) {
-                (true, _, _) => AccountChangeType::Destroyed,
-                (false, false, true) => AccountChangeType::Created,
-                _ => AccountChangeType::Modified,
+            // `was_destroyed()` is true for revm's `DestroyedChanged` status — an
+            // account SELFDESTRUCTed and then RE-CREATED within the same block
+            // (reachable under EIP-6780: create+selfdestruct in one tx, then touch
+            // the same address later in the block). In that case `current_info` is
+            // `Some` and the account EXISTS at block end. Classifying it as
+            // `Destroyed` would push `key→None` in apply_diff and drop the live
+            // account from the state tree (wrong root / wrong mobile proofs), so
+            // the post-state presence (`current_info`) — not `was_destroyed` —
+            // decides existence. `Destroyed` is reserved for accounts absent at
+            // block end.
+            let change_type = match (original_info.is_some(), current_info.is_some()) {
+                (_, false) => AccountChangeType::Destroyed,
+                (false, true) => AccountChangeType::Created,
+                (true, true) => AccountChangeType::Modified,
             };
+            debug_assert!(
+                change_type != AccountChangeType::Destroyed || current_info.is_none(),
+                "account {address:?} classified Destroyed but still present at block end"
+            );
 
             // Extract balance change
             let balance = match (original_info, current_info) {
@@ -387,6 +392,42 @@ mod tests {
         assert_eq!(slot1.to, U256::from(100));
     }
 
+    /// Reproduces the production state-tree path: a `BundleState` carrying a
+    /// storage change is serialized to JSON and back (exactly what
+    /// `CompactBlockExecution` does for the compact-block broadcast), then a
+    /// `StateDiff` is extracted on the receiving side. Asserts storage survives
+    /// the round-trip — isolates whether the `storage_changes=0` field observed
+    /// in the real-node profile (devlog-71) is a serde-drop or an upstream
+    /// capture issue.
+    #[test]
+    fn test_bundle_state_serde_roundtrip_preserves_storage() {
+        let addr = Address::with_last_byte(7);
+        let mut account = modified_account(100, 1, 200, 2);
+        account.storage.insert(U256::from(0), storage_slot(0, 99));
+        account.storage.insert(U256::from(7), storage_slot(5, 0));
+
+        let mut bundle = BundleState::default();
+        bundle.state.insert(addr, account);
+
+        // Sanity: pre-roundtrip the diff sees the storage.
+        assert_eq!(StateDiff::from_bundle_state(&bundle).total_storage_changes(), 2);
+
+        // Round-trip through serde_json, as the compact-block broadcast does.
+        let json = serde_json::to_vec(&bundle).expect("BundleState should serialize");
+        let restored: BundleState =
+            serde_json::from_slice(&json).expect("BundleState should deserialize");
+
+        let diff = StateDiff::from_bundle_state(&restored);
+        assert_eq!(
+            diff.total_storage_changes(),
+            2,
+            "storage changes must survive the serde_json round-trip"
+        );
+        let account_diff = diff.accounts.get(&addr).expect("account should be present");
+        assert_eq!(account_diff.storage.get(&U256::from(0)).unwrap().to, U256::from(99));
+        assert_eq!(account_diff.storage.get(&U256::from(7)).unwrap().from, U256::from(5));
+    }
+
     #[test]
     fn test_state_diff_no_actual_change_filtered() {
         // An account where nothing actually changed (balance, nonce, code all same)
@@ -629,5 +670,69 @@ mod tests {
         let slot = account_diff.storage.get(&U256::from(5)).unwrap();
         assert_eq!(slot.from, U256::from(100));
         assert_eq!(slot.to, U256::ZERO);
+    }
+
+    /// Helper: an account SELFDESTRUCTed and then RE-CREATED within the same
+    /// block — revm's `DestroyedChanged` status. `was_destroyed()` is true yet
+    /// `info` is `Some` (the account exists at block end).
+    fn destroyed_then_recreated(
+        orig_balance: u64,
+        orig_nonce: u64,
+        new_balance: u64,
+        new_nonce: u64,
+    ) -> BundleAccount {
+        BundleAccount {
+            info: Some(make_account_info(new_balance, new_nonce)),
+            original_info: Some(make_account_info(orig_balance, orig_nonce)),
+            storage: StorageWithOriginalValues::default(),
+            status: AccountStatus::DestroyedChanged,
+        }
+    }
+
+    /// Regression: a destroyed-then-recreated account (revm `DestroyedChanged`,
+    /// reachable under EIP-6780) must NOT be classified `Destroyed` — it exists
+    /// at block end, and labeling it `Destroyed` would drop the live account
+    /// from the state tree (apply_diff pushes `key→None`). It must be `Modified`
+    /// (existed before the block) carrying the recreated info.
+    #[test]
+    fn test_state_diff_destroyed_then_recreated_is_not_dropped() {
+        let addr = Address::with_last_byte(9);
+        let mut bundle = BundleState::default();
+        bundle
+            .state
+            .insert(addr, destroyed_then_recreated(2000, 5, 700, 1));
+
+        let diff = StateDiff::from_bundle_state(&bundle);
+        let account_diff = diff.accounts.get(&addr).expect("addr should be in diff");
+
+        assert_eq!(
+            account_diff.change_type,
+            AccountChangeType::Modified,
+            "destroyed-then-recreated must stay live, not Destroyed"
+        );
+        // Carries the recreated (post-block) balance/nonce.
+        assert_eq!(account_diff.balance.as_ref().unwrap().to, U256::from(700));
+        assert_eq!(account_diff.nonce.as_ref().unwrap().to, 1);
+    }
+
+    /// A freshly-created account that SELFDESTRUCTs in the same block ends absent
+    /// (revm `Destroyed` with `original_info == None`): net-absent ⇒ `Destroyed`.
+    #[test]
+    fn test_state_diff_created_then_destroyed_is_absent() {
+        let addr = Address::with_last_byte(10);
+        let mut bundle = BundleState::default();
+        bundle.state.insert(
+            addr,
+            BundleAccount {
+                info: None,
+                original_info: None,
+                storage: StorageWithOriginalValues::default(),
+                status: AccountStatus::Destroyed,
+            },
+        );
+
+        let diff = StateDiff::from_bundle_state(&bundle);
+        let account_diff = diff.accounts.get(&addr).expect("addr should be in diff");
+        assert_eq!(account_diff.change_type, AccountChangeType::Destroyed);
     }
 }

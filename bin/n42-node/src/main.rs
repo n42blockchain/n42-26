@@ -1,14 +1,16 @@
 mod keystore;
 
-#[cfg(feature = "jemalloc")]
+// jemalloc is unix-only; tikv-jemallocator is a target.'cfg(unix)' dependency,
+// so the `feature = "jemalloc"` cfg is gated on `unix` to keep Windows builds happy.
+#[cfg(all(feature = "jemalloc", unix))]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-use alloy_primitives::Address;
+use alloy_primitives::{Address, U256, keccak256};
 use clap::Parser;
 use n42_chainspec::{ConsensusConfig, ValidatorInfo};
 use n42_consensus::{ConsensusEngine, EpochManager, ValidatorSet, ValidatorSetResolver};
-use n42_jmt::ShardedJmt;
+use n42_jmt::{EMPTY_CODE_HASH, PersistentSbmt, PersistentTwig};
 use n42_network::NetworkService;
 use n42_network::{
     ShardedStarHub, ShardedStarHubConfig, TransportConfig, build_swarm_with_validator_index,
@@ -622,12 +624,56 @@ fn main() {
         ));
         info!(target: "n42::cli", "StakingManager initialized");
 
-        // JMT state tree: enabled by N42_JMT=1. Maintains a Jellyfish Merkle Tree
-        // updated on each block commit, serving state proofs via RPC.
-        let jmt: Option<Arc<Mutex<ShardedJmt>>> = if env_bool("N42_JMT") {
-            let jmt = Arc::new(Mutex::new(ShardedJmt::new()));
-            info!(target: "n42::cli", "JMT state tree enabled (16 shards)");
-            Some(jmt)
+        // SBMT state tree: enabled by N42_JMT=1. Persisted via snapshot + WAL
+        // under <data_dir>/sbmt.snapshot so it survives restarts; updated on each
+        // block commit and serves state proofs via RPC.
+        let jmt: Option<Arc<Mutex<PersistentSbmt>>> = if env_bool("N42_JMT") {
+            let snapshot_path = data_dir.join("sbmt.snapshot");
+            let interval = env_parse::<u64>("N42_SBMT_SNAPSHOT_INTERVAL").unwrap_or(1000);
+            match PersistentSbmt::open(&snapshot_path, interval) {
+                Ok(tree) => {
+                    info!(
+                        target: "n42::cli",
+                        version = tree.version(),
+                        interval,
+                        "SBMT state tree enabled (16 shards, snapshot+WAL persistent)"
+                    );
+                    Some(Arc::new(Mutex::new(tree)))
+                }
+                Err(e) => {
+                    warn!(target: "n42::cli", error = %e, "failed to open persistent SBMT; disabling state tree");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        // Twig state tree: enabled by N42_TWIG=1. This is a separate,
+        // consensus-breaking state commitment sidecar; start it with a fresh
+        // data dir / clean genesis when switching from another state tree.
+        let twig: Option<Arc<Mutex<PersistentTwig>>> = if env_bool("N42_TWIG") {
+            let snapshot_path = data_dir.join("twig.snapshot");
+            let interval = env_parse::<u64>("N42_TWIG_SNAPSHOT_INTERVAL").unwrap_or(1000);
+            match PersistentTwig::open(&snapshot_path, interval) {
+                Ok(tree) => {
+                    warn!(
+                        target: "n42::cli",
+                        "N42_TWIG=1 enabled; use a fresh data dir/clean genesis for consensus-compatible runs"
+                    );
+                    info!(
+                        target: "n42::cli",
+                        version = tree.version(),
+                        interval,
+                        "Twig state tree enabled (16 shards, snapshot+WAL persistent)"
+                    );
+                    Some(Arc::new(Mutex::new(tree)))
+                }
+                Err(e) => {
+                    warn!(target: "n42::cli", error = %e, "failed to open persistent Twig; disabling state tree");
+                    None
+                }
+            }
         } else {
             None
         };
@@ -691,6 +737,7 @@ fn main() {
         let rpc_staking_manager = staking_manager.clone();
         let rpc_zk_scheduler = zk_scheduler.clone();
         let rpc_jmt = jmt.clone();
+        let rpc_twig = twig.clone();
         let rpc_admin_token = std::env::var("N42_ADMIN_TOKEN").ok();
         let handle = builder
             .node(n42_node)
@@ -702,6 +749,9 @@ fn main() {
                 }
                 if let Some(ref jmt) = rpc_jmt {
                     rpc_server = rpc_server.with_jmt(Arc::clone(jmt));
+                }
+                if let Some(ref twig) = rpc_twig {
+                    rpc_server = rpc_server.with_twig(Arc::clone(twig));
                 }
                 if let Some(token) = rpc_admin_token {
                     rpc_server = rpc_server.with_admin_token(token);
@@ -744,6 +794,128 @@ fn main() {
                         genesis_hash
                     }
                 };
+
+                if let Some(ref jmt) = jmt {
+                    let mut tree = jmt.lock().unwrap_or_else(|e| {
+                        warn!(target: "n42::cli", "SBMT mutex poisoned during genesis seed, recovering state");
+                        e.into_inner()
+                    });
+
+                    if tree.version() == 0 {
+                        // Fresh start (no snapshot/WAL restored it): seed genesis alloc.
+                        let chain_spec = full_node.provider.chain_spec();
+                        let alloc_len = chain_spec.genesis.alloc.len();
+                        for (address, account) in &chain_spec.genesis.alloc {
+                            let code_hash = account
+                                .code
+                                .as_ref()
+                                .filter(|code| !code.is_empty())
+                                .map(|code| keccak256(code.as_ref()))
+                                .unwrap_or(EMPTY_CODE_HASH);
+                            let storage = account
+                                .storage_slots()
+                                .map(|(slot, value)| (U256::from_be_bytes(slot.0), value));
+
+                            tree.inner_mut().seed_genesis_account(
+                                *address,
+                                account.balance,
+                                account.nonce.unwrap_or_default(),
+                                code_hash,
+                                storage,
+                            );
+                        }
+
+                        if let Err(e) = tree.flush() {
+                            warn!(
+                                target: "n42::cli",
+                                error = %e,
+                                "failed to persist genesis SBMT snapshot; crash recovery may need to reseed genesis"
+                            );
+                        }
+
+                        let version = tree.version();
+                        let root = tree.root_hash();
+                        consensus_state.update_jmt_root(version, root);
+                        info!(
+                            target: "n42::cli",
+                            version,
+                            %root,
+                            accounts = alloc_len,
+                            "SBMT seeded from genesis alloc"
+                        );
+                    } else {
+                        // Restored from snapshot + WAL — publish the recovered root.
+                        let version = tree.version();
+                        let root = tree.root_hash();
+                        consensus_state.update_jmt_root(version, root);
+                        info!(
+                            target: "n42::cli",
+                            version,
+                            %root,
+                            "SBMT restored from snapshot/WAL"
+                        );
+                    }
+                }
+
+                if let Some(ref twig) = twig {
+                    let mut tree = twig.lock().unwrap_or_else(|e| {
+                        warn!(target: "n42::cli", "Twig mutex poisoned during genesis seed, recovering state");
+                        e.into_inner()
+                    });
+
+                    if tree.version() == 0 {
+                        let chain_spec = full_node.provider.chain_spec();
+                        let alloc_len = chain_spec.genesis.alloc.len();
+                        for (address, account) in &chain_spec.genesis.alloc {
+                            let code_hash = account
+                                .code
+                                .as_ref()
+                                .filter(|code| !code.is_empty())
+                                .map(|code| keccak256(code.as_ref()))
+                                .unwrap_or(EMPTY_CODE_HASH);
+                            let storage = account
+                                .storage_slots()
+                                .map(|(slot, value)| (U256::from_be_bytes(slot.0), value));
+
+                            tree.inner_mut().seed_genesis_account(
+                                *address,
+                                account.balance,
+                                account.nonce.unwrap_or_default(),
+                                code_hash,
+                                storage,
+                            );
+                        }
+
+                        if let Err(e) = tree.flush() {
+                            warn!(
+                                target: "n42::cli",
+                                error = %e,
+                                "failed to persist genesis Twig snapshot; crash recovery may need to reseed genesis"
+                            );
+                        }
+
+                        let version = tree.version();
+                        let root = tree.root_hash();
+                        consensus_state.update_twig_root(version, root);
+                        info!(
+                            target: "n42::cli",
+                            version,
+                            %root,
+                            accounts = alloc_len,
+                            "Twig seeded from genesis alloc"
+                        );
+                    } else {
+                        let version = tree.version();
+                        let root = tree.root_hash();
+                        consensus_state.update_twig_root(version, root);
+                        info!(
+                            target: "n42::cli",
+                            version,
+                            %root,
+                            "Twig restored from snapshot/WAL"
+                        );
+                    }
+                }
 
                 info!(
                     target: "n42::cli",
@@ -1231,6 +1403,9 @@ fn main() {
                     .with_allow_deterministic_validator_peers(allow_deterministic_validator_peers);
                 if let Some(ref jmt) = jmt {
                     orchestrator = orchestrator.with_jmt(Arc::clone(jmt));
+                }
+                if let Some(ref twig) = twig {
+                    orchestrator = orchestrator.with_twig(Arc::clone(twig));
                 }
                 if let Some(scheduler) = zk_scheduler {
                     orchestrator = orchestrator.with_zk_scheduler(scheduler);

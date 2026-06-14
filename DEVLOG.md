@@ -86,6 +86,18 @@ Logs are split into separate files by phase for easy maintenance:
 ---
 
 | [devlog-56-consensus-evidence-persistence](docs/devlog-56-consensus-evidence-persistence.md) | Consensus Evidence Persistence, Validator Change Protocol, Prague Upgrade |
+| [devlog-58-jmt-vs-qmdb-gap-p0](docs/devlog-58-jmt-vs-qmdb-gap-p0.md) | JMT vs QMDB/NOMT Gap Analysis + P0: In-Memory Tree + Background Snapshot, Disk 33–48× Slower | Architecture |
+| [devlog-59-jmt-to-bmt-sbmt-phase1](docs/devlog-59-jmt-to-bmt-sbmt-phase1.md) | Decision JMT→Self-built SBMT, Persistent SBMT WAL/fsync, Recovery E2E, EOA code_hash alignment | Architecture |
+| [devlog-60-sbmt-e2e-verification](docs/devlog-60-sbmt-e2e-verification.md) | SBMT RPC Proof + Restart Recovery E2E: Genesis Snapshot, Inclusion/Exclusion Proofs, Mobile Verify | Verification |
+| [devlog-61-sbmt-proof-key-binding](docs/devlog-61-sbmt-proof-key-binding.md) | SBMT 证明 key+shard 绑定安全修复（轻客户端 soundness）+ key 派生/shard_index 单一来源去重 | Security |
+| [devlog-62-sbmt-benchmark-vs-gov5](docs/devlog-62-sbmt-benchmark-vs-gov5.md) | SBMT 规模化 benchmark + in-place insert 优化（1.8×）+ 对标 gov5 BMT/QMDB；识别路径压缩机会 | Benchmark |
+| [devlog-63-twig-memory-core-design](docs/devlog-63-twig-memory-core-design.md) | 决策：走 AlDBaran 全 DRAM 路线（非 QMDB SSD 路线）；内存即吞吐；Rust 自建 twig 核心 | Design |
+| [devlog-64-rust-twig-engine-spec](docs/devlog-64-rust-twig-engine-spec.md) | Rust 全-DRAM twig engine 实现 spec + P1–P6 实现（对 gov5 字节验证、#11 绑定、StateDiff 桥接） | Design |
+| [devlog-65-twig-real-data-profiling](docs/devlog-65-twig-real-data-profiling.md) | twig 引擎真实主网账户剖析（reth2k）+ value-arena 优化（−8% RSS，280 B/acct，root 不变） | Profiling |
+| [devlog-68-twig-node-integration](docs/devlog-68-twig-node-integration.md) | Twig P6 持久化、mobile/FFI 验证、节点接线、mac 4-node E2E + WAL 恢复 | Architecture |
+| [devlog-69-concurrency-audit](docs/devlog-69-concurrency-audit.md) | 跨 crate 并发/正确性审计：consensus 状态机+twig 边界+orchestrator 判定健全；修复 network set_validator_context 静默丢弃 + execution destroyed-then-recreated 账户误删（EIP-6780 DestroyedChanged） | Audit |
+| [devlog-70-p6-node-e2e-closeout](docs/devlog-70-p6-node-e2e-closeout.md) | P6 节点 E2E 收尾：fresh 4-node Twig root 一致、WAL crash recovery、leader drain finalization；真实 8s slot profiling 另见 devlog-71 | Verification |
+| [devlog-71-real-slot-profile](docs/devlog-71-real-slot-profile.md) | macOS 真实 4-node slot profiling pilot：transfer/contract-heavy + mobile sim + Twig，记录 critical-path 和采样限制 | Profiling |
 
 ---
 
