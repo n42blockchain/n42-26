@@ -5,6 +5,7 @@ mod state_mgmt;
 mod view_jump_throttle;
 
 use crate::consensus_state::SharedConsensusState;
+use crate::el::{ExecutionLayer, RethExecutionLayer};
 use crate::epoch_schedule::EpochSchedule;
 use crate::mobile_reward::MobileRewardManager;
 use crate::staking::StakingManager;
@@ -234,8 +235,10 @@ pub struct ConsensusOrchestrator {
     /// Lower-priority: data events (BlockData, TX, Sync, Peers)
     net_event_rx: mpsc::Receiver<NetworkEvent>,
     output_rx: mpsc::Receiver<EngineOutput>,
-    beacon_engine: Option<ConsensusEngineHandle<EthEngineTypes>>,
-    payload_builder: Option<PayloadBuilderHandle<EthEngineTypes>>,
+    /// The execution-layer seam (Caplin-style `ExecutionEngine`). `None` for
+    /// tests / EL-less observer paths. One in-process adapter
+    /// (`RethExecutionLayer`) wraps the reth engine + payload-builder handles.
+    el: Option<Arc<dyn ExecutionLayer>>,
     consensus_state: Option<Arc<SharedConsensusState>>,
     head_block_hash: B256,
     last_commit_qc: Option<QuorumCertificate>,
@@ -414,8 +417,7 @@ impl ConsensusOrchestrator {
             consensus_event_rx: None,
             net_event_rx,
             output_rx,
-            beacon_engine: None,
-            payload_builder: None,
+            el: None,
             consensus_state: None,
             head_block_hash: B256::ZERO,
             last_commit_qc: None,
@@ -596,8 +598,7 @@ impl ConsensusOrchestrator {
             consensus_event_rx: Some(consensus_event_rx),
             net_event_rx,
             output_rx,
-            beacon_engine: Some(beacon_engine),
-            payload_builder: Some(payload_builder),
+            el: Some(Arc::new(RethExecutionLayer::new(beacon_engine, payload_builder))),
             consensus_state: Some(consensus_state),
             head_block_hash,
             last_commit_qc: None,
@@ -1061,7 +1062,7 @@ impl ConsensusOrchestrator {
     }
 
     async fn initialize_startup_schedule(&mut self) {
-        if !self.engine.is_current_leader() || self.beacon_engine.is_none() {
+        if !self.engine.is_current_leader() || self.el.is_none() {
             return;
         }
 
