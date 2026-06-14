@@ -148,7 +148,13 @@ struct Cli {
 
 const CHAIN_ID: u64 = 4242;
 const TRANSFER_GAS: u64 = 21_000;
-const CONTRACT_CALL_GAS: u64 = 65_000;
+// The stress storage-burner does 2 cold SSTOREs to fresh slots (per-caller
+// counter + timestamp): 21k intrinsic + 2×22.1k SSTORE_SET + cold SLOAD + KECCAK
+// ≈ 67.5k. The old 65k limit was BELOW this, so every contract call ran out of
+// gas and reverted — the writes were rolled back, "contract-heavy" runs actually
+// measured all-OOG reverts (gas_used pinned to the limit, storage_changes=0).
+// 100k gives headroom so the calls succeed and actually exercise storage.
+const CONTRACT_CALL_GAS: u64 = 100_000;
 const MAX_FEE_PER_GAS: u128 = 2_000_000_000;
 const MAX_PRIORITY_FEE: u128 = 1_000_000_000;
 const TRANSFER_VALUE: u128 = 1_000_000_000_000;
