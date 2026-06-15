@@ -215,6 +215,8 @@ struct PendingFinalization {
     commit_qc: QuorumCertificate,
 }
 
+type FinalizeDone = (u64, B256, QuorumCertificate, bool);
+
 pub(crate) struct CommittedBlock {
     pub(crate) view: u64,
     pub(crate) block_hash: B256,
@@ -277,6 +279,10 @@ pub struct ConsensusOrchestrator {
     /// Tuple: (block_hash, view, success).
     import_done_rx: mpsc::Receiver<(B256, u64, bool, u64)>,
     import_done_tx: mpsc::Sender<(B256, u64, bool, u64)>,
+    /// Receives finalize-FCU completion from the optional async finalize path.
+    /// Tuple: (view, block_hash, commit_qc, finalized).
+    finalize_done_rx: mpsc::Receiver<FinalizeDone>,
+    finalize_done_tx: mpsc::Sender<FinalizeDone>,
     blob_store: Option<DiskFileBlobStore>,
     /// True while a background import task is running.
     bg_import_in_flight: bool,
@@ -336,6 +342,9 @@ pub struct ConsensusOrchestrator {
     /// ViewChanged/BlockCommitted. Consensus voting naturally paces block production.
     /// Enabled by `N42_FAST_PROPOSE=1`. Default: false (grid-aligned slots).
     fast_propose: bool,
+    /// Moves finalize forkchoiceUpdated off the consensus select-loop hot path.
+    /// Enabled by `N42_ASYNC_FINALIZE_FCU=1`. Default: false.
+    async_finalize_fcu: bool,
     /// Sparse Binary Merkle Tree for parallel state commitment.
     /// Updated asynchronously after each committed block.
     jmt: Option<Arc<Mutex<PersistentSbmt>>>,
@@ -359,6 +368,14 @@ pub struct ConsensusOrchestrator {
 }
 
 impl ConsensusOrchestrator {
+    fn async_finalize_fcu_enabled() -> bool {
+        std::env::var("N42_ASYNC_FINALIZE_FCU")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0)
+            > 0
+    }
+
     fn cache_pending_block_data(
         &mut self,
         hash: B256,
@@ -409,6 +426,7 @@ impl ConsensusOrchestrator {
         let (block_ready_tx, block_ready_rx) = mpsc::channel(256);
         let (leader_payload_tx, leader_payload_rx) = mpsc::channel(64);
         let (import_done_tx, import_done_rx) = mpsc::channel(256);
+        let (finalize_done_tx, finalize_done_rx) = mpsc::channel(256);
         let (eager_import_done_tx, eager_import_done_rx) = mpsc::channel(256);
         let (build_complete_tx, build_complete_rx) = mpsc::channel(256);
         Self {
@@ -447,6 +465,8 @@ impl ConsensusOrchestrator {
             leader_payload_tx,
             import_done_rx,
             import_done_tx,
+            finalize_done_rx,
+            finalize_done_tx,
             blob_store: None,
             bg_import_in_flight: false,
             bg_import_hashes: HashSet::new(),
@@ -472,6 +492,7 @@ impl ConsensusOrchestrator {
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(0)
                 > 0,
+            async_finalize_fcu: Self::async_finalize_fcu_enabled(),
             jmt: None,
             twig: None,
             zk_scheduler: None,
@@ -573,6 +594,7 @@ impl ConsensusOrchestrator {
         let (block_ready_tx, block_ready_rx) = mpsc::channel(256);
         let (leader_payload_tx, leader_payload_rx) = mpsc::channel(64);
         let (import_done_tx, import_done_rx) = mpsc::channel(256);
+        let (finalize_done_tx, finalize_done_rx) = mpsc::channel(256);
         let (eager_import_done_tx, eager_import_done_rx) = mpsc::channel(256);
         let (build_complete_tx, build_complete_rx) = mpsc::channel(256);
 
@@ -587,9 +609,10 @@ impl ConsensusOrchestrator {
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(0)
             > 0;
+        let async_finalize_fcu = Self::async_finalize_fcu_enabled();
 
         if slot_time_ms > 0 {
-            info!(target: "n42::cl::orchestrator", slot_time_ms, fast_propose, "slot timing configured");
+            info!(target: "n42::cl::orchestrator", slot_time_ms, fast_propose, async_finalize_fcu, "slot timing configured");
         }
 
         Self {
@@ -598,7 +621,10 @@ impl ConsensusOrchestrator {
             consensus_event_rx: Some(consensus_event_rx),
             net_event_rx,
             output_rx,
-            el: Some(Arc::new(RethExecutionLayer::new(beacon_engine, payload_builder))),
+            el: Some(Arc::new(RethExecutionLayer::new(
+                beacon_engine,
+                payload_builder,
+            ))),
             consensus_state: Some(consensus_state),
             head_block_hash,
             last_commit_qc: None,
@@ -628,6 +654,8 @@ impl ConsensusOrchestrator {
             leader_payload_tx,
             import_done_rx,
             import_done_tx,
+            finalize_done_rx,
+            finalize_done_tx,
             blob_store: None,
             bg_import_in_flight: false,
             bg_import_hashes: HashSet::new(),
@@ -649,6 +677,7 @@ impl ConsensusOrchestrator {
             pipeline_timings: HashMap::new(),
             eager_import_block_guard: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             fast_propose,
+            async_finalize_fcu,
             jmt: None,
             twig: None,
             zk_scheduler: None,
@@ -846,7 +875,21 @@ impl ConsensusOrchestrator {
                     }
                 }
 
-                // === Priority 3: Consensus network events (high-priority, dedicated channel) ===
+                // === Priority 3: Async finalize-FCU completion ===
+                finalize_done = async {
+                    if self.finalize_done_rx.is_closed() && self.finalize_done_rx.is_empty() {
+                        std::future::pending::<Option<FinalizeDone>>().await
+                    } else {
+                        self.finalize_done_rx.recv().await
+                    }
+                } => {
+                    if let Some((view, block_hash, commit_qc, finalized)) = finalize_done {
+                        self.handle_finalize_done(view, block_hash, commit_qc, finalized).await;
+                        self.save_consensus_state();
+                    }
+                }
+
+                // === Priority 4: Consensus network events (high-priority, dedicated channel) ===
                 // Consensus messages (votes, proposals, QCs) are routed to a separate channel
                 // so they are never queued behind high-volume TX/BlockData events.
                 event = async {
@@ -865,7 +908,7 @@ impl ConsensusOrchestrator {
                     }
                 }
 
-                // === Priority 4: Block build completion ===
+                // === Priority 5: Block build completion ===
                 block_hash = async {
                     if self.block_ready_rx.is_closed() && self.block_ready_rx.is_empty() {
                         std::future::pending::<Option<B256>>().await
@@ -899,7 +942,7 @@ impl ConsensusOrchestrator {
                     }
                 }
 
-                // === Priority 5: Data network events (TX forward, block data, sync, peers) ===
+                // === Priority 6: Data network events (TX forward, block data, sync, peers) ===
                 // Lower priority than consensus — under high TPS these fire thousands of
                 // times per second but should never delay vote/proposal processing.
                 event = self.net_event_rx.recv() => {
@@ -912,7 +955,7 @@ impl ConsensusOrchestrator {
                     }
                 }
 
-                // === Priority 6: Import and build lifecycle ===
+                // === Priority 7: Import and build lifecycle ===
                 import_result = async {
                     if self.import_done_rx.is_closed() && self.import_done_rx.is_empty() {
                         std::future::pending::<Option<(B256, u64, bool, u64)>>().await
@@ -971,7 +1014,7 @@ impl ConsensusOrchestrator {
                     }
                 }
 
-                // === Priority 7: Slot timing ===
+                // === Priority 8: Slot timing ===
                 _ = &mut build_timer => {
                     let slot_ts = self.next_slot_timestamp.take();
                     self.next_build_at = None;
@@ -1001,7 +1044,7 @@ impl ConsensusOrchestrator {
                     self.do_trigger_payload_build(slot_ts).await;
                 }
 
-                // === Priority 8: TX forwarding (lowest priority) ===
+                // === Priority 9: TX forwarding (lowest priority) ===
                 // Under high load, TX events fire thousands of times per second.
                 // Deferring them ensures consensus votes are never delayed by TX buffering.
                 tx_data = async {
@@ -1034,7 +1077,7 @@ impl ConsensusOrchestrator {
                     self.flush_tx_forward_buffer().await;
                 }
 
-                // === Priority 9: Admin commands (validator reconfig from RPC) ===
+                // === Priority 10: Admin commands (validator reconfig from RPC) ===
                 msg = async {
                     match self.admin_rx.as_mut() {
                         Some(rx) => rx.recv().await,
