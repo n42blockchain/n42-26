@@ -587,6 +587,42 @@ impl ConsensusOrchestrator {
             finalized_block_hash: block_hash,
         };
 
+        if self.async_finalize_fcu {
+            let done_tx = self.finalize_done_tx.clone();
+            tokio::spawn(async move {
+                let fcu_start = std::time::Instant::now();
+                let finalized = match engine_handle.fork_choice_updated(fcu_state).await {
+                    Ok(result) => {
+                        let elapsed_ms = fcu_start.elapsed().as_millis() as u64;
+                        histogram!("n42_fcu_latency_ms", "attempt" => "first")
+                            .record(elapsed_ms as f64);
+                        info!(target: "n42::cl::consensus_loop", view, %block_hash, status = ?result.payload_status.status, elapsed_ms, "N42_FCU: async finalize fcu");
+                        matches!(
+                            result.payload_status.status,
+                            PayloadStatusEnum::Valid | PayloadStatusEnum::Accepted
+                        )
+                    }
+                    Err(e) => {
+                        histogram!("n42_fcu_latency_ms", "attempt" => "first_err")
+                            .record(fcu_start.elapsed().as_millis() as f64);
+                        warn!(target: "n42::cl::consensus_loop", view, %block_hash, error = %e, "async fork_choice_updated failed");
+                        false
+                    }
+                };
+
+                if done_tx
+                    .send((view, block_hash, commit_qc, finalized))
+                    .await
+                    .is_err()
+                {
+                    debug!(target: "n42::cl::consensus_loop", view, %block_hash, "async finalize completion receiver dropped");
+                }
+            });
+            counter!("n42_async_finalize_fcu_spawned_total").increment(1);
+            debug!(target: "n42::cl::consensus_loop", view, %block_hash, "spawned async finalize fcu");
+            return;
+        }
+
         let fcu_start = std::time::Instant::now();
         let finalized = match engine_handle.fork_choice_updated(fcu_state).await {
             Ok(result) => {
@@ -656,6 +692,17 @@ impl ConsensusOrchestrator {
             true
         };
 
+        self.handle_finalize_done(view, block_hash, commit_qc, finalized)
+            .await;
+    }
+
+    pub(super) async fn handle_finalize_done(
+        &mut self,
+        view: u64,
+        block_hash: B256,
+        commit_qc: QuorumCertificate,
+        finalized: bool,
+    ) {
         if finalized {
             // Case A: Block already in reth (leader built + new_payload already done,
             // OR block was previously imported by a follower, OR rescued by eager import).
