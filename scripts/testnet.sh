@@ -622,6 +622,7 @@ start_validators() {
             --rpc.max-response-size 50 \
             --disable-tx-gossip \
             ${low_mem_flags} \
+            ${N42_EXTRA_NODE_FLAGS:-} \
             ${p2p_key_flag} \
             ${TRUSTED_PEERS_FLAG} \
             > "$log_file" 2>&1 &
