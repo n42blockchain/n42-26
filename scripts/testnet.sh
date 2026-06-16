@@ -558,6 +558,14 @@ start_validators() {
             mdns_flag="${N42_ENABLE_MDNS:-false}"
         fi
 
+        local -a node_launcher=("$BINARY")
+        local profile_output="${N42_PROFILE_OUTPUT:-$DATA_DIR/samply-validator-${i}.json}"
+        if [[ "${N42_PROFILE_VALIDATOR_INDEX:-}" == "$i" ]]; then
+            mkdir -p "$(dirname "$profile_output")"
+            log "  v${i}: profiling with samply -> $profile_output"
+            node_launcher=(samply record --save-only -o "$profile_output" -- "$BINARY")
+        fi
+
         # Low-memory mode: reduce reth caches, pool sizes, and thread counts
         # for dense local testnets. Activated when N42_LOW_MEMORY=1.
         local low_mem_flags=""
@@ -596,7 +604,7 @@ start_validators() {
         N42_LOW_MEMORY="${N42_LOW_MEMORY:-0}" \
         N42_ADMIN_TOKEN="${N42_ADMIN_TOKEN:-}" \
         N42_INJECT_PORT="${N42_INJECT_PORT:+$((${N42_INJECT_PORT} + i))}" \
-        "$BINARY" node \
+        "${node_launcher[@]}" node \
             --chain "$GENESIS_FILE" \
             --datadir "$datadir" \
             --http \

@@ -1,0 +1,1173 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="520" viewBox="0 0 1600 520" font-family="Menlo, Consolas, monospace" font-size="12">
+<style>rect{stroke:#fff;stroke-width:.6} text{fill:#111;pointer-events:none} .title{font:600 16px -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif}.sub{font:12px -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;fill:#555}</style>
+<text class="title" x="10" y="22">Leader payload build CPU flamegraph</text>
+<text class="sub" x="10" y="42">validator-0, 7-node 2G/48k contract-heavy, samply CPU-delta total 1820.3 ms. Width is sampled CPU in focused payload-build stacks.</text>
+<g><title>leader payload build
+1820.34 ms</title><rect x="10" y="58" width="1580" height="17" fill="#4f6bed" rx="2"/><text x="14" y="71">leader payload build (1820.3 ms)</text></g>
+<g><title>reth_ethereum_payload_builder::default_payload
+1820.34 ms (100.0%)</title><rect x="10.00" y="76" width="1580.00" height="17" fill="#64a9c6" rx="2"/></g>
+<text x="14.00" y="89" clip-path="inset(0)">reth_ethereum_payload_builder::default_payload</text>
+<g><title>&lt;reth_evm..execute..BasicBlockBuilder&lt;F,Executor,Builder,N&gt; as reth_evm..execute..BlockBuilder&gt;::finish
+613.40 ms (33.7%)</title><rect x="10.00" y="94" width="532.41" height="17" fill="#64a9c6" rx="2"/></g>
+<text x="14.00" y="107" clip-path="inset(0)">&lt;reth_evm..execute..BasicBlockBuilder&lt;F,Executor,Builder,N&gt; as reth_evm..exec...</text>
+<g><title>reth_evm::execute::_::&lt;impl reth_evm..execute..BlockAssembler&lt;F&gt; for $RF$T&gt;::assemble_block
+490.33 ms (26.9%)</title><rect x="10.00" y="112" width="425.60" height="17" fill="#64a9c6" rx="2"/></g>
+<text x="14.00" y="125" clip-path="inset(0)">reth_evm::execute::_::&lt;impl reth_evm..execute..BlockAssembler&lt;F&gt; for $RF$T&gt;::...</text>
+<g><title>alloy_trie::root::ordered_trie_root_with_encoder
+475.97 ms (26.1%)</title><rect x="10.00" y="130" width="413.13" height="17" fill="#e6a23c" rx="2"/></g>
+<text x="14.00" y="143" clip-path="inset(0)">alloy_trie::root::ordered_trie_root_with_encoder</text>
+<g><title>HashBuilder::add_leaf
+418.49 ms (23.0%)</title><rect x="10.00" y="148" width="363.23" height="17" fill="#e6a23c" rx="2"/></g>
+<text x="14.00" y="161" clip-path="inset(0)">HashBuilder::add_leaf</text>
+<g><title>HashBuilder::update
+401.24 ms (22.0%)</title><rect x="10.00" y="166" width="348.27" height="17" fill="#e6a23c" rx="2"/></g>
+<text x="14.00" y="179" clip-path="inset(0)">HashBuilder::update</text>
+<g><title>alloy_primitives::utils::keccak256_impl
+350.46 ms (19.3%)</title><rect x="10.00" y="184" width="304.19" height="17" fill="#e6a23c" rx="2"/></g>
+<text x="14.00" y="197" clip-path="inset(0)">alloy_primitives::utils::keccak256_impl</text>
+<g><title>keccak::backends::aarch64_sha3::p1600_armv8_sha3
+177.38 ms (9.7%)</title><rect x="10.00" y="202" width="153.96" height="17" fill="#e6a23c" rx="2"/></g>
+<text x="14.00" y="215" clip-path="inset(0)">keccak::backends::aarch64_sha3::p1600_armv8_sha3</text>
+<g><title>keccak::Keccak::with_backend::aarch64_sha3_inner
+162.52 ms (8.9%)</title><rect x="163.96" y="202" width="141.06" height="17" fill="#e6a23c" rx="2"/></g>
+<text x="167.96" y="215" clip-path="inset(0)">keccak::Keccak::with_backend::aarch64_sha3_inner</text>
+<g><title>keccak::backends::aarch64_sha3::p1600_armv8_sha3
+155.60 ms (8.5%)</title><rect x="163.96" y="220" width="135.06" height="17" fill="#e6a23c" rx="2"/></g>
+<text x="167.96" y="233" clip-path="inset(0)">keccak::backends::aarch64_sha3::p1600_armv8_sha3</text>
+<g><title>libsystem_platform.dylib:0x3414
+2.41 ms (0.1%)</title><rect x="305.02" y="202" width="2.09" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>libsystem_platform.dylib:0x352c
+1.95 ms (0.1%)</title><rect x="307.11" y="202" width="1.69" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>&lt;alloy_trie..nodes..leaf..LeafNodeRef as alloy_rlp..encode..Encodable&gt;::encode
+13.51 ms (0.7%)</title><rect x="314.19" y="184" width="11.73" height="17" fill="#e6a23c" rx="2"/></g>
+<g><title>libsystem_platform.dylib:0x3520
+1.68 ms (0.1%)</title><rect x="314.19" y="202" width="1.46" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>libsystem_platform.dylib:0x3524
+1.47 ms (0.1%)</title><rect x="315.65" y="202" width="1.27" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>libsystem_platform.dylib:0x3440
+1.39 ms (0.1%)</title><rect x="316.92" y="202" width="1.20" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>DYLD-STUB$$memcpy
+0.68 ms (0.0%)</title><rect x="318.12" y="202" width="0.59" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>libsystem_platform.dylib:0x3514
+0.64 ms (0.0%)</title><rect x="318.72" y="202" width="0.55" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>&lt;alloy_trie..nodes..branch..BranchNodeRef as alloy_rlp..encode..Encodable&gt;::encode
+10.64 ms (0.6%)</title><rect x="325.92" y="184" width="9.23" height="17" fill="#e6a23c" rx="2"/></g>
+<g><title>libsystem_platform.dylib:0x3360
+3.17 ms (0.2%)</title><rect x="325.92" y="202" width="2.75" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>libsystem_platform.dylib:0x350c
+1.82 ms (0.1%)</title><rect x="328.67" y="202" width="1.58" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>HashBuilder::resize_masks
+0.86 ms (0.0%)</title><rect x="335.15" y="184" width="0.75" height="17" fill="#e6a23c" rx="2"/></g>
+<g><title>HashBuilder::log_key_value
+4.40 ms (0.2%)</title><rect x="358.27" y="166" width="3.82" height="17" fill="#e6a23c" rx="2"/></g>
+<g><title>libsystem_platform.dylib:0x3414
+1.75 ms (0.1%)</title><rect x="362.09" y="166" width="1.52" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>libsystem_platform.dylib:0x3384
+1.58 ms (0.1%)</title><rect x="363.61" y="166" width="1.37" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>libsystem_platform.dylib:0x336c
+1.23 ms (0.1%)</title><rect x="364.98" y="166" width="1.07" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>&lt;alloy_consensus..transaction..envelope..EthereumTxEnvelope&lt;Eip4844&gt; as alloy_eips..eip2718..Encodable2718&gt;::encode_2718
+43.34 ms (2.4%)</title><rect x="373.23" y="148" width="37.62" height="17" fill="#d76d6d" rx="2"/></g>
+<text x="377.23" y="161" clip-path="inset(0)">&lt;alloy_consensus..transaction..envelope..EthereumTxEnvelope&lt;Eip4844&gt; as alloy...</text>
+<g><title>&lt;alloy_consensus..transaction..eip1559..TxEip1559 as alloy_consensus..transaction..rlp..RlpEcdsaEncodableTx&gt;::rlp_encoded_fields_length
+18.62 ms (1.0%)</title><rect x="373.23" y="166" width="16.16" height="17" fill="#d76d6d" rx="2"/></g>
+<g><title>&lt;alloy_consensus..transaction..eip1559..TxEip1559 as alloy_consensus..transaction..rlp..RlpEcdsaEncodableTx&gt;::rlp_encode_fields
+17.06 ms (0.9%)</title><rect x="389.39" y="166" width="14.81" height="17" fill="#d76d6d" rx="2"/></g>
+<g><title>&lt;alloc..vec..Vec&lt;u8&gt; as bytes..buf..buf_mut..BufMut&gt;::put_slice
+8.63 ms (0.5%)</title><rect x="389.39" y="184" width="7.49" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>libsystem_platform.dylib:0x3524
+2.18 ms (0.1%)</title><rect x="389.39" y="202" width="1.89" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>libsystem_platform.dylib:0x351c
+1.45 ms (0.1%)</title><rect x="391.28" y="202" width="1.26" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>libsystem_platform.dylib:0x352c
+1.01 ms (0.1%)</title><rect x="392.54" y="202" width="0.87" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>ruint::support::alloy_rlp::&lt;impl alloy_rlp..encode..Encodable for ruint..Uint&lt;_,_&gt;&gt;::encode
+3.33 ms (0.2%)</title><rect x="404.20" y="166" width="2.89" height="17" fill="#d76d6d" rx="2"/></g>
+<g><title>&lt;deduplicated_symbol&gt;
+1.19 ms (0.1%)</title><rect x="407.09" y="166" width="1.03" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>&lt;alloc..vec..Vec&lt;u8&gt; as bytes..buf..buf_mut..BufMut&gt;::put_slice
+1.04 ms (0.1%)</title><rect x="408.12" y="166" width="0.90" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>libsystem_platform.dylib:0x352c
+0.87 ms (0.0%)</title><rect x="408.12" y="184" width="0.75" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>&lt;alloy_consensus..receipt..receipt2..EthereumReceipt&lt;T&gt; as alloy_consensus..receipt..Eip2718EncodableReceipt&gt;::eip2718_encode_with_bloom
+10.62 ms (0.6%)</title><rect x="410.85" y="148" width="9.22" height="17" fill="#d76d6d" rx="2"/></g>
+<g><title>&lt;alloc..vec..Vec&lt;u8&gt; as bytes..buf..buf_mut..BufMut&gt;::put_slice
+7.62 ms (0.4%)</title><rect x="410.85" y="166" width="6.61" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>libsystem_platform.dylib:0x3360
+3.69 ms (0.2%)</title><rect x="410.85" y="184" width="3.21" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>libsystem_platform.dylib:0x336c
+1.15 ms (0.1%)</title><rect x="414.06" y="184" width="1.00" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>libsystem_platform.dylib:0x352c
+1.05 ms (0.1%)</title><rect x="415.06" y="184" width="0.91" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>libsystem_platform.dylib:0x3514
+0.92 ms (0.1%)</title><rect x="415.97" y="184" width="0.80" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>&lt;deduplicated_symbol&gt;
+1.80 ms (0.1%)</title><rect x="417.47" y="166" width="1.56" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>0x00000001015f864c
+2.29 ms (0.1%)</title><rect x="423.13" y="130" width="1.99" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>0x00000001015f8688
+2.24 ms (0.1%)</title><rect x="425.12" y="130" width="1.95" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>0x00000001015f86c8
+1.90 ms (0.1%)</title><rect x="427.06" y="130" width="1.65" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>_rjem_sdallocx
+1.68 ms (0.1%)</title><rect x="428.72" y="130" width="1.46" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>_rjem_je_sdallocx_default
+1.68 ms (0.1%)</title><rect x="428.72" y="148" width="1.46" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>_rjem_je_large_dalloc
+1.68 ms (0.1%)</title><rect x="428.72" y="166" width="1.46" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>pac_dalloc_impl
+1.68 ms (0.1%)</title><rect x="428.72" y="184" width="1.46" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>_rjem_je_extent_dalloc_wrapper
+1.68 ms (0.1%)</title><rect x="428.72" y="202" width="1.46" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>_rjem_je_extent_dalloc_mmap
+1.68 ms (0.1%)</title><rect x="428.72" y="220" width="1.46" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>_rjem_je_pages_unmap
+1.68 ms (0.1%)</title><rect x="428.72" y="238" width="1.46" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>libsystem_kernel.dylib:0x4728
+1.68 ms (0.1%)</title><rect x="428.72" y="256" width="1.46" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>0x00000001015f8698
+1.51 ms (0.1%)</title><rect x="430.18" y="130" width="1.31" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>0x00000001015f866c
+1.13 ms (0.1%)</title><rect x="431.49" y="130" width="0.98" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>0x00000001015f86a0
+0.94 ms (0.1%)</title><rect x="432.47" y="130" width="0.82" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>0x00000001015f8694
+0.92 ms (0.1%)</title><rect x="433.28" y="130" width="0.80" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>0x00000001015f8690
+0.90 ms (0.0%)</title><rect x="434.09" y="130" width="0.78" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>0x00000001015f86fc
+0.84 ms (0.0%)</title><rect x="434.87" y="130" width="0.73" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>&lt;reth_chain_state..memory_overlay..MemoryOverlayStateProvider&lt;N&gt; as reth_storage_api..trie..StateRootProvider&gt;::state_root_with_updates
+92.50 ms (5.1%)</title><rect x="435.60" y="112" width="80.29" height="17" fill="#e6a23c" rx="2"/></g>
+<text x="439.60" y="125" clip-path="inset(0)">&lt;reth_chain_state..memory_overlay..MemoryOverlayStateProvider&lt;N&gt; as reth_stor...</text>
+<g><title>0x0000000100b03b4b
+88.13 ms (4.8%)</title><rect x="435.60" y="130" width="76.49" height="17" fill="#64a9c6" rx="2"/></g>
+<text x="439.60" y="143" clip-path="inset(0)">0x0000000100b03b4b</text>
+<g><title>0x0000000100b1d933
+87.11 ms (4.8%)</title><rect x="435.60" y="148" width="75.60" height="17" fill="#64a9c6" rx="2"/></g>
+<text x="439.60" y="161" clip-path="inset(0)">0x0000000100b1d933</text>
+<g><title>&lt;reth_trie..trie..StateRoot&lt;reth_trie_db..trie_cursor..DatabaseTrieCursorFactory&lt;$RF$TX,A&gt;,reth_trie_db..hashed_cursor..DatabaseHashedCur...
+87.11 ms (4.8%)</title><rect x="435.60" y="166" width="75.60" height="17" fill="#e6a23c" rx="2"/></g>
+<text x="439.60" y="179" clip-path="inset(0)">&lt;reth_trie..trie..StateRoot&lt;reth_trie_db..trie_cursor..DatabaseTrieCursorFact...</text>
+<g><title>reth_trie::trie::StateRoot&lt;T,H&gt;::calculate
+86.58 ms (4.8%)</title><rect x="435.60" y="184" width="75.15" height="17" fill="#e6a23c" rx="2"/></g>
+<text x="439.60" y="197" clip-path="inset(0)">reth_trie::trie::StateRoot&lt;T,H&gt;::calculate</text>
+<g><title>reth_trie::trie::StorageRoot&lt;T,H&gt;::calculate
+53.15 ms (2.9%)</title><rect x="435.60" y="202" width="46.14" height="17" fill="#e6a23c" rx="2"/></g>
+<text x="439.60" y="215" clip-path="inset(0)">reth_trie::trie::StorageRoot&lt;T,H&gt;::calculate</text>
+<g><title>HashBuilder::add_leaf
+28.01 ms (1.5%)</title><rect x="435.60" y="220" width="24.31" height="17" fill="#e6a23c" rx="2"/></g>
+<g><title>HashBuilder::update
+25.36 ms (1.4%)</title><rect x="435.60" y="238" width="22.01" height="17" fill="#e6a23c" rx="2"/></g>
+<g><title>&lt;alloy_trie..nodes..branch..BranchNodeRef as alloy_rlp..encode..Encodable&gt;::encode
+12.79 ms (0.7%)</title><rect x="435.60" y="256" width="11.10" height="17" fill="#e6a23c" rx="2"/></g>
+<g><title>alloy_primitives::utils::keccak256_impl
+10.62 ms (0.6%)</title><rect x="446.69" y="256" width="9.22" height="17" fill="#e6a23c" rx="2"/></g>
+<g><title>keccak::Keccak::with_backend::aarch64_sha3_inner
+9.77 ms (0.5%)</title><rect x="446.69" y="274" width="8.48" height="17" fill="#e6a23c" rx="2"/></g>
+<g><title>keccak::backends::aarch64_sha3::p1600_armv8_sha3
+8.42 ms (0.5%)</title><rect x="446.69" y="292" width="7.31" height="17" fill="#e6a23c" rx="2"/></g>
+<g><title>libsystem_platform.dylib:0x3360
+0.85 ms (0.0%)</title><rect x="455.18" y="274" width="0.74" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>&lt;alloy_trie..nodes..leaf..LeafNodeRef as alloy_rlp..encode..Encodable&gt;::encode
+1.03 ms (0.1%)</title><rect x="455.92" y="256" width="0.89" height="17" fill="#e6a23c" rx="2"/></g>
+<g><title>HashBuilder::log_key_value
+1.66 ms (0.1%)</title><rect x="457.61" y="238" width="1.44" height="17" fill="#e6a23c" rx="2"/></g>
+<g><title>libsystem_platform.dylib:0x352c
+0.99 ms (0.1%)</title><rect x="459.05" y="238" width="0.86" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>&lt;reth_trie..hashed_cursor..post_state..HashedPostStateCursor$LT,C$V&gt; as reth_trie..hashed_cursor..HashedCursor&gt;::next
+8.22 ms (0.5%)</title><rect x="459.91" y="220" width="7.13" height="17" fill="#e6a23c" rx="2"/></g>
+<g><title>&lt;reth_trie_db..hashed_cursor..DatabaseHashedStorageCursor&lt;C&gt; as reth_trie..hashed_cursor..HashedCursor&gt;::next
+7.49 ms (0.4%)</title><rect x="459.91" y="238" width="6.50" height="17" fill="#e6a23c" rx="2"/></g>
+<g><title>0x0000000100ac5a68
+1.27 ms (0.1%)</title><rect x="459.91" y="256" width="1.10" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>0x0000000100ac5a9f
+1.25 ms (0.1%)</title><rect x="461.01" y="256" width="1.09" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>libsystem_platform.dylib:0x351c
+1.25 ms (0.1%)</title><rect x="461.01" y="274" width="1.09" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>0x0000000100faf91f
+0.96 ms (0.1%)</title><rect x="462.10" y="256" width="0.84" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>reth_libmdbx::transaction::TransactionPtr::lock
+0.96 ms (0.1%)</title><rect x="462.10" y="274" width="0.84" height="17" fill="#7e6bdc" rx="2"/></g>
+<g><title>0x0000000100faf98b
+0.80 ms (0.0%)</title><rect x="462.93" y="256" width="0.69" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>mdbx_cursor_get
+0.80 ms (0.0%)</title><rect x="462.93" y="274" width="0.69" height="17" fill="#7e6bdc" rx="2"/></g>
+<g><title>cursor_ops
+0.80 ms (0.0%)</title><rect x="462.93" y="292" width="0.69" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>outer_next
+0.80 ms (0.0%)</title><rect x="462.93" y="310" width="0.69" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>inner_next
+0.80 ms (0.0%)</title><rect x="462.93" y="328" width="0.69" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>0x0000000100ac5aa0
+0.71 ms (0.0%)</title><rect x="463.62" y="256" width="0.62" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>reth_trie::hashed_cursor::post_state::HashedPostStateCursor$LT,C$V&gt;::choose_next_entry
+0.72 ms (0.0%)</title><rect x="466.41" y="238" width="0.63" height="17" fill="#e6a23c" rx="2"/></g>
+<g><title>HashBuilder::add_branch
+4.02 ms (0.2%)</title><rect x="467.04" y="220" width="3.49" height="17" fill="#e6a23c" rx="2"/></g>
+<g><title>HashBuilder::update
+4.02 ms (0.2%)</title><rect x="467.04" y="238" width="3.49" height="17" fill="#e6a23c" rx="2"/></g>
+<g><title>&lt;alloy_trie..nodes..leaf..LeafNodeRef as alloy_rlp..encode..Encodable&gt;::encode
+1.52 ms (0.1%)</title><rect x="467.04" y="256" width="1.32" height="17" fill="#e6a23c" rx="2"/></g>
+<g><title>&lt;alloy_trie..nodes..branch..BranchNodeRef as alloy_rlp..encode..Encodable&gt;::encode
+1.02 ms (0.1%)</title><rect x="468.36" y="256" width="0.89" height="17" fill="#e6a23c" rx="2"/></g>
+<g><title>libsystem_platform.dylib:0x352c
+1.02 ms (0.1%)</title><rect x="468.36" y="274" width="0.89" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>alloy_primitives::utils::keccak256_impl
+0.93 ms (0.1%)</title><rect x="469.24" y="256" width="0.80" height="17" fill="#e6a23c" rx="2"/></g>
+<g><title>keccak::backends::aarch64_sha3::p1600_armv8_sha3
+0.93 ms (0.1%)</title><rect x="469.24" y="274" width="0.80" height="17" fill="#e6a23c" rx="2"/></g>
+<g><title>reth_trie::walker::TrieWalker$LT,C$K&gt;::consume_node
+2.78 ms (0.2%)</title><rect x="470.53" y="220" width="2.41" height="17" fill="#e6a23c" rx="2"/></g>
+<g><title>reth_trie::walker::TrieWalker$LT,C$K&gt;::node
+1.85 ms (0.1%)</title><rect x="470.53" y="238" width="1.61" height="17" fill="#e6a23c" rx="2"/></g>
+<g><title>&lt;reth_trie..trie_cursor..in_memory..InMemoryTrieCursor&lt;C&gt; as reth_trie..trie_cursor..TrieCursor&gt;::seek
+1.85 ms (0.1%)</title><rect x="470.53" y="256" width="1.61" height="17" fill="#e6a23c" rx="2"/></g>
+<g><title>reth_trie::forward_cursor::ForwardInMemoryCursor&lt;K,V&gt;::seek
+1.85 ms (0.1%)</title><rect x="470.53" y="274" width="1.61" height="17" fill="#e6a23c" rx="2"/></g>
+<g><title>core::slice::&lt;impl $u5b$T$u5d$&gt;::partition_point
+1.85 ms (0.1%)</title><rect x="470.53" y="292" width="1.61" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>reth_trie::node_iter::TrieNodeIter$LT,C$H,K&gt;::seek_hashed_entry
+2.48 ms (0.1%)</title><rect x="472.94" y="220" width="2.15" height="17" fill="#e6a23c" rx="2"/></g>
+<g><title>&lt;reth_trie..hashed_cursor..post_state..HashedPostStateCursor$LT,C$V&gt; as reth_trie..hashed_cursor..HashedCursor&gt;::seek
+1.79 ms (0.1%)</title><rect x="472.94" y="238" width="1.55" height="17" fill="#e6a23c" rx="2"/></g>
+<g><title>reth_trie::forward_cursor::ForwardInMemoryCursor&lt;K,V&gt;::seek
+0.95 ms (0.1%)</title><rect x="472.94" y="256" width="0.82" height="17" fill="#e6a23c" rx="2"/></g>
+<g><title>&lt;reth_db..implementation..mdbx..cursor..Cursor&lt;K,T&gt; as reth_db_api..cursor..DbDupCursorRO&lt;T&gt;&gt;::seek_by_key_subkey
+0.84 ms (0.0%)</title><rect x="473.76" y="256" width="0.73" height="17" fill="#7e6bdc" rx="2"/></g>
+<g><title>0x0000000100fafb47
+0.84 ms (0.0%)</title><rect x="473.76" y="274" width="0.73" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>mdbx_cursor_get
+0.84 ms (0.0%)</title><rect x="473.76" y="292" width="0.73" height="17" fill="#7e6bdc" rx="2"/></g>
+<g><title>cursor_ops
+0.84 ms (0.0%)</title><rect x="473.76" y="310" width="0.73" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>cursor_seek
+0.84 ms (0.0%)</title><rect x="473.76" y="328" width="0.73" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>cursor_seek
+0.84 ms (0.0%)</title><rect x="473.76" y="346" width="0.73" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>node_search
+0.84 ms (0.0%)</title><rect x="473.76" y="364" width="0.73" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>cmp_lexical
+0.84 ms (0.0%)</title><rect x="473.76" y="382" width="0.73" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>&lt;reth_db..implementation..mdbx..cursor..Cursor&lt;K,T&gt; as reth_db_api..cursor..DbCursorRO&lt;T&gt;&gt;::seek_exact
+2.08 ms (0.1%)</title><rect x="475.09" y="220" width="1.81" height="17" fill="#7e6bdc" rx="2"/></g>
+<g><title>0x0000000100faf98b
+1.93 ms (0.1%)</title><rect x="475.09" y="238" width="1.68" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>mdbx_cursor_get
+1.93 ms (0.1%)</title><rect x="475.09" y="256" width="1.68" height="17" fill="#7e6bdc" rx="2"/></g>
+<g><title>cursor_ops
+1.93 ms (0.1%)</title><rect x="475.09" y="274" width="1.68" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>cursor_seek
+1.93 ms (0.1%)</title><rect x="475.09" y="292" width="1.68" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>node_search
+1.93 ms (0.1%)</title><rect x="475.09" y="310" width="1.68" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>reth_db::implementation::mdbx::tx::Tx&lt;K&gt;::new_cursor
+1.24 ms (0.1%)</title><rect x="476.89" y="220" width="1.08" height="17" fill="#7e6bdc" rx="2"/></g>
+<g><title>reth_libmdbx::transaction::Transaction&lt;K&gt;::cursor_with_dbi
+1.02 ms (0.1%)</title><rect x="476.89" y="238" width="0.89" height="17" fill="#7e6bdc" rx="2"/></g>
+<g><title>reth_trie::metrics::WalkerMetrics::new
+1.19 ms (0.1%)</title><rect x="477.97" y="220" width="1.03" height="17" fill="#e6a23c" rx="2"/></g>
+<g><title>std::thread::local::LocalKey&lt;T&gt;::with
+1.19 ms (0.1%)</title><rect x="477.97" y="238" width="1.03" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>reth_trie::metrics::WalkerMetrics::_new_with_labels::_{{closure}}
+1.19 ms (0.1%)</title><rect x="477.97" y="256" width="1.03" height="17" fill="#e6a23c" rx="2"/></g>
+<g><title>&lt;metrics_util..layers..prefix..Prefix&lt;R&gt; as metrics..recorder..Recorder&gt;::register_counter
+1.19 ms (0.1%)</title><rect x="477.97" y="274" width="1.03" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>&lt;metrics_exporter_prometheus..recorder..PrometheusRecorder as metrics..recorder..Recorder&gt;::register_counter
+1.19 ms (0.1%)</title><rect x="477.97" y="292" width="1.03" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>metrics_util::registry::Registry&lt;K,S&gt;::get_or_create_counter
+1.19 ms (0.1%)</title><rect x="477.97" y="310" width="1.03" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>&lt;metrics..key..Key as core..cmp..PartialEq&gt;::eq
+1.19 ms (0.1%)</title><rect x="477.97" y="328" width="1.03" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>libsystem_platform.dylib:0xf48
+1.19 ms (0.1%)</title><rect x="477.97" y="346" width="1.03" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>libsystem_platform.dylib:0x3524
+0.97 ms (0.1%)</title><rect x="479.00" y="220" width="0.84" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>reth_trie::trie::StateRootContext::process_storage_root_result
+9.60 ms (0.5%)</title><rect x="481.73" y="202" width="8.33" height="17" fill="#e6a23c" rx="2"/></g>
+<g><title>HashBuilder::add_leaf
+8.24 ms (0.5%)</title><rect x="481.73" y="220" width="7.15" height="17" fill="#e6a23c" rx="2"/></g>
+<g><title>HashBuilder::update
+6.86 ms (0.4%)</title><rect x="481.73" y="238" width="5.95" height="17" fill="#e6a23c" rx="2"/></g>
+<g><title>alloy_primitives::utils::keccak256_impl
+4.98 ms (0.3%)</title><rect x="481.73" y="256" width="4.32" height="17" fill="#e6a23c" rx="2"/></g>
+<g><title>keccak::Keccak::with_backend::aarch64_sha3_inner
+4.86 ms (0.3%)</title><rect x="481.73" y="274" width="4.22" height="17" fill="#e6a23c" rx="2"/></g>
+<g><title>keccak::backends::aarch64_sha3::p1600_armv8_sha3
+4.86 ms (0.3%)</title><rect x="481.73" y="292" width="4.22" height="17" fill="#e6a23c" rx="2"/></g>
+<g><title>&lt;alloc..vec..Vec&lt;T&gt; as alloc..vec..spec_from_iter_nested..SpecFromIterNested&lt;T,I&gt;&gt;::from_iter
+1.00 ms (0.1%)</title><rect x="486.05" y="256" width="0.87" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>reth_trie_common::updates::TrieUpdates::insert_storage_updates
+1.36 ms (0.1%)</title><rect x="488.88" y="220" width="1.18" height="17" fill="#e6a23c" rx="2"/></g>
+<g><title>hashbrown::map::HashMap&lt;K,V,S,A&gt;::insert
+1.36 ms (0.1%)</title><rect x="488.88" y="238" width="1.18" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>reth_trie::node_iter::TrieNodeIter$LT,C$H,K&gt;::seek_hashed_entry
+4.85 ms (0.3%)</title><rect x="490.06" y="202" width="4.21" height="17" fill="#e6a23c" rx="2"/></g>
+<g><title>&lt;reth_trie..hashed_cursor..post_state..HashedPostStateCursor$LT,C$V&gt; as reth_trie..hashed_cursor..HashedCursor&gt;::seek
+4.85 ms (0.3%)</title><rect x="490.06" y="220" width="4.21" height="17" fill="#e6a23c" rx="2"/></g>
+<g><title>reth_trie::hashed_cursor::post_state::HashedPostStateCursor$LT,C$V&gt;::cursor_seek
+3.69 ms (0.2%)</title><rect x="490.06" y="238" width="3.20" height="17" fill="#e6a23c" rx="2"/></g>
+<g><title>&lt;reth_db..implementation..mdbx..cursor..Cursor&lt;K,T&gt; as reth_db_api..cursor..DbCursorRO&lt;T&gt;&gt;::seek
+3.69 ms (0.2%)</title><rect x="490.06" y="256" width="3.20" height="17" fill="#7e6bdc" rx="2"/></g>
+<g><title>0x0000000100faf98b
+3.54 ms (0.2%)</title><rect x="490.06" y="274" width="3.07" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>mdbx_cursor_get
+3.54 ms (0.2%)</title><rect x="490.06" y="292" width="3.07" height="17" fill="#7e6bdc" rx="2"/></g>
+<g><title>cursor_ops
+3.54 ms (0.2%)</title><rect x="490.06" y="310" width="3.07" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>cursor_seek
+3.54 ms (0.2%)</title><rect x="490.06" y="328" width="3.07" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>node_search
+3.44 ms (0.2%)</title><rect x="490.06" y="346" width="2.98" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>reth_trie::forward_cursor::ForwardInMemoryCursor&lt;K,V&gt;::seek
+1.16 ms (0.1%)</title><rect x="493.26" y="238" width="1.00" height="17" fill="#e6a23c" rx="2"/></g>
+<g><title>&lt;reth_trie..hashed_cursor..post_state..HashedPostStateCursor$LT,C$V&gt; as reth_trie..hashed_cursor..HashedCursor&gt;::next
+4.44 ms (0.2%)</title><rect x="494.27" y="202" width="3.85" height="17" fill="#e6a23c" rx="2"/></g>
+<g><title>&lt;reth_db..implementation..mdbx..cursor..Cursor&lt;K,T&gt; as reth_db_api..cursor..DbCursorRO&lt;T&gt;&gt;::next
+1.92 ms (0.1%)</title><rect x="494.27" y="220" width="1.67" height="17" fill="#7e6bdc" rx="2"/></g>
+<g><title>reth_db::implementation::mdbx::utils::decoder
+1.92 ms (0.1%)</title><rect x="494.27" y="238" width="1.67" height="17" fill="#7e6bdc" rx="2"/></g>
+<g><title>&lt;reth_primitives_traits..account..Account as reth_codecs..Compact&gt;::from_compact
+1.92 ms (0.1%)</title><rect x="494.27" y="256" width="1.67" height="17" fill="#d76d6d" rx="2"/></g>
+<g><title>reth_trie::forward_cursor::ForwardInMemoryCursor&lt;K,V&gt;::first_after
+1.33 ms (0.1%)</title><rect x="495.93" y="220" width="1.15" height="17" fill="#e6a23c" rx="2"/></g>
+<g><title>reth_trie::hashed_cursor::post_state::HashedPostStateCursor$LT,C$V&gt;::choose_next_entry
+1.19 ms (0.1%)</title><rect x="497.08" y="220" width="1.04" height="17" fill="#e6a23c" rx="2"/></g>
+<g><title>HashBuilder::add_branch
+4.06 ms (0.2%)</title><rect x="498.12" y="202" width="3.52" height="17" fill="#e6a23c" rx="2"/></g>
+<g><title>HashBuilder::update
+4.06 ms (0.2%)</title><rect x="498.12" y="220" width="3.52" height="17" fill="#e6a23c" rx="2"/></g>
+<g><title>alloy_primitives::utils::keccak256_impl
+3.86 ms (0.2%)</title><rect x="498.12" y="238" width="3.35" height="17" fill="#e6a23c" rx="2"/></g>
+<g><title>keccak::Keccak::with_backend::aarch64_sha3_inner
+3.86 ms (0.2%)</title><rect x="498.12" y="256" width="3.35" height="17" fill="#e6a23c" rx="2"/></g>
+<g><title>keccak::backends::aarch64_sha3::p1600_armv8_sha3
+3.86 ms (0.2%)</title><rect x="498.12" y="274" width="3.35" height="17" fill="#e6a23c" rx="2"/></g>
+<g><title>&lt;metrics_util..registry..recency..Generational&lt;T&gt; as metrics..handles..CounterFn&gt;::increment
+1.26 ms (0.1%)</title><rect x="501.64" y="202" width="1.10" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>0x0000000100b1d91f
+1.02 ms (0.1%)</title><rect x="511.20" y="148" width="0.89" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>reth_trie_common::input::TrieInputSorted::from_unsorted
+1.02 ms (0.1%)</title><rect x="511.20" y="166" width="0.89" height="17" fill="#e6a23c" rx="2"/></g>
+<g><title>reth_trie_common::hashed_state::HashedPostState::into_sorted
+1.02 ms (0.1%)</title><rect x="511.20" y="184" width="0.89" height="17" fill="#e6a23c" rx="2"/></g>
+<g><title>&lt;core..iter..adapters..map..Map&lt;I,F&gt; as core..iter..traits..iterator..Iterator&gt;::fold
+1.02 ms (0.1%)</title><rect x="511.20" y="202" width="0.89" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>reth_trie_common::hashed_state::HashedStorage::into_sorted
+1.02 ms (0.1%)</title><rect x="511.20" y="220" width="0.89" height="17" fill="#e6a23c" rx="2"/></g>
+<g><title>core::slice::sort::unstable::quicksort::quicksort
+1.02 ms (0.1%)</title><rect x="511.20" y="238" width="0.89" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>core::slice::sort::unstable::quicksort::quicksort
+0.84 ms (0.0%)</title><rect x="511.20" y="256" width="0.73" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>core::slice::sort::unstable::quicksort::quicksort
+0.84 ms (0.0%)</title><rect x="511.20" y="274" width="0.73" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>core::slice::sort::unstable::quicksort::quicksort
+0.84 ms (0.0%)</title><rect x="511.20" y="292" width="0.73" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>0x00000001029a3a2c
+0.84 ms (0.0%)</title><rect x="511.20" y="310" width="0.73" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>std::sync::once_lock::OnceLock&lt;T&gt;::initialize
+3.17 ms (0.2%)</title><rect x="512.09" y="130" width="2.75" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>_RNvMNtNtNtNtCsaLOjE9VYtxK_3std3sys4sync4once5queueNtB2_4Once4call
+3.17 ms (0.2%)</title><rect x="512.09" y="148" width="2.75" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>std::sync::once::Once::call_once_force::_{{closure}}
+3.17 ms (0.2%)</title><rect x="512.09" y="166" width="2.75" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>reth_trie_common::updates::TrieUpdates::extend_from_sorted
+3.17 ms (0.2%)</title><rect x="512.09" y="184" width="2.75" height="17" fill="#e6a23c" rx="2"/></g>
+<g><title>hashbrown::raw::RawTable&lt;T,A&gt;::reserve_rehash
+1.63 ms (0.1%)</title><rect x="512.09" y="202" width="1.42" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>reth_trie_common::updates::StorageTrieUpdates::extend_from_sorted
+0.92 ms (0.1%)</title><rect x="513.50" y="202" width="0.80" height="17" fill="#e6a23c" rx="2"/></g>
+<g><title>hashbrown::raw::RawTable&lt;T,A&gt;::clear
+0.92 ms (0.1%)</title><rect x="513.50" y="220" width="0.80" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>core::hash::BuildHasher::hash_one
+0.62 ms (0.0%)</title><rect x="514.30" y="202" width="0.54" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>reth_trie_common::input::TrieInput::prepend_self
+1.05 ms (0.1%)</title><rect x="514.84" y="130" width="0.91" height="17" fill="#e6a23c" rx="2"/></g>
+<g><title>reth_trie_common::hashed_state::HashedPostState::extend_inner
+1.05 ms (0.1%)</title><rect x="514.84" y="148" width="0.91" height="17" fill="#e6a23c" rx="2"/></g>
+<g><title>hashbrown::raw::RawIterRange&lt;T&gt;::fold_impl
+1.05 ms (0.1%)</title><rect x="514.84" y="166" width="0.91" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>0x00000001015dd23f
+10.18 ms (0.6%)</title><rect x="515.88" y="112" width="8.84" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>libsystem_platform.dylib:0x3414
+8.00 ms (0.4%)</title><rect x="515.88" y="130" width="6.95" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>libsystem_platform.dylib:0x3434
+1.12 ms (0.1%)</title><rect x="522.83" y="130" width="0.97" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>libsystem_platform.dylib:0x341c
+0.62 ms (0.0%)</title><rect x="523.80" y="130" width="0.54" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>0x0000000100b03b27
+8.16 ms (0.4%)</title><rect x="524.72" y="112" width="7.08" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>0x0000000100b1d31b
+8.16 ms (0.4%)</title><rect x="524.72" y="130" width="7.08" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>&lt;reth_trie..trie..StateRoot&lt;reth_trie_db..trie_cursor..DatabaseTrieCursorFactory&lt;$RF$TX,A&gt;,reth_trie_db..hashed_cursor..DatabaseHashedCur...
+8.16 ms (0.4%)</title><rect x="524.72" y="148" width="7.08" height="17" fill="#e6a23c" rx="2"/></g>
+<g><title>reth_trie::trie::StateRoot&lt;T,H&gt;::calculate
+8.16 ms (0.4%)</title><rect x="524.72" y="166" width="7.08" height="17" fill="#e6a23c" rx="2"/></g>
+<g><title>reth_trie::trie::StorageRoot&lt;T,H&gt;::calculate
+5.89 ms (0.3%)</title><rect x="524.72" y="184" width="5.11" height="17" fill="#e6a23c" rx="2"/></g>
+<g><title>&lt;reth_trie..hashed_cursor..post_state..HashedPostStateCursor$LT,C$V&gt; as reth_trie..hashed_cursor..HashedCursor&gt;::next
+1.96 ms (0.1%)</title><rect x="524.72" y="202" width="1.70" height="17" fill="#e6a23c" rx="2"/></g>
+<g><title>&lt;reth_trie_db..hashed_cursor..DatabaseHashedStorageCursor&lt;C&gt; as reth_trie..hashed_cursor..HashedCursor&gt;::next
+1.96 ms (0.1%)</title><rect x="524.72" y="220" width="1.70" height="17" fill="#e6a23c" rx="2"/></g>
+<g><title>0x0000000100faf96c
+1.05 ms (0.1%)</title><rect x="524.72" y="238" width="0.91" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>0x0000000100faf91f
+0.92 ms (0.1%)</title><rect x="525.63" y="238" width="0.79" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>reth_libmdbx::transaction::TransactionPtr::lock
+0.92 ms (0.1%)</title><rect x="525.63" y="256" width="0.79" height="17" fill="#7e6bdc" rx="2"/></g>
+<g><title>HashBuilder::add_leaf
+1.01 ms (0.1%)</title><rect x="526.42" y="202" width="0.88" height="17" fill="#e6a23c" rx="2"/></g>
+<g><title>HashBuilder::update
+1.01 ms (0.1%)</title><rect x="526.42" y="220" width="0.88" height="17" fill="#e6a23c" rx="2"/></g>
+<g><title>alloy_primitives::utils::keccak256_impl
+1.01 ms (0.1%)</title><rect x="526.42" y="238" width="0.88" height="17" fill="#e6a23c" rx="2"/></g>
+<g><title>keccak::Keccak::with_backend::aarch64_sha3_inner
+1.01 ms (0.1%)</title><rect x="526.42" y="256" width="0.88" height="17" fill="#e6a23c" rx="2"/></g>
+<g><title>keccak::backends::aarch64_sha3::p1600_armv8_sha3
+1.01 ms (0.1%)</title><rect x="526.42" y="274" width="0.88" height="17" fill="#e6a23c" rx="2"/></g>
+<g><title>_RNvNvNtCs8dnTdrJsiec_5alloc3fmt6format12format_inner
+0.95 ms (0.1%)</title><rect x="527.30" y="202" width="0.82" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>_RNvNtCs6sq8b9ugfBC_4core3fmt5write
+0.95 ms (0.1%)</title><rect x="527.30" y="220" width="0.82" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>&lt;alloy_primitives..bits..fixed..FixedBytes&lt;_&gt; as core..fmt..Debug&gt;::fmt
+0.95 ms (0.1%)</title><rect x="527.30" y="238" width="0.82" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>_RNvXsZ_NtCs8dnTdrJsiec_5alloc6stringNtB5_6StringNtNtCs6sq8b9ugfBC_4core3fmt5Write9write_str
+0.95 ms (0.1%)</title><rect x="527.30" y="256" width="0.82" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>&lt;reth_trie..hashed_cursor..post_state..HashedPostStateCursor$LT,C$V&gt; as reth_trie..hashed_cursor..HashedCursor&gt;::next
+0.95 ms (0.1%)</title><rect x="529.83" y="184" width="0.83" height="17" fill="#e6a23c" rx="2"/></g>
+<g><title>0x00000001015dd22b
+3.88 ms (0.2%)</title><rect x="531.80" y="112" width="3.37" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>libsystem_platform.dylib:0x3414
+1.98 ms (0.1%)</title><rect x="531.80" y="130" width="1.72" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>libsystem_platform.dylib:0x341c
+1.36 ms (0.1%)</title><rect x="533.52" y="130" width="1.18" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>&lt;reth_chain_state..memory_overlay..MemoryOverlayStateProvider&lt;N&gt; as reth_storage_api..state..HashedPostStateProvider&gt;::hashed_post_state
+3.81 ms (0.2%)</title><rect x="535.17" y="112" width="3.30" height="17" fill="#7e6bdc" rx="2"/></g>
+<g><title>&lt;reth_provider..providers..state..latest..LatestStateProvider&lt;Provider&gt; as reth_storage_api..state..HashedPostStateProvider&gt;::hashed_post...
+3.81 ms (0.2%)</title><rect x="535.17" y="130" width="3.30" height="17" fill="#7e6bdc" rx="2"/></g>
+<g><title>&lt;reth_trie_common..hashed_state..HashedPostState as core..iter..traits..collect..FromIterator&lt;$LP$alloy_primitives..bits..fixed..FixedByt...
+3.81 ms (0.2%)</title><rect x="535.17" y="148" width="3.30" height="17" fill="#e6a23c" rx="2"/></g>
+<g><title>&lt;hashbrown..map..Iter&lt;K,V&gt; as core..iter..traits..iterator..Iterator&gt;::fold
+3.38 ms (0.2%)</title><rect x="535.17" y="166" width="2.93" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>alloy_primitives::utils::keccak256_impl
+3.20 ms (0.2%)</title><rect x="535.17" y="184" width="2.78" height="17" fill="#e6a23c" rx="2"/></g>
+<g><title>keccak::Keccak::with_backend::aarch64_sha3_inner
+2.60 ms (0.1%)</title><rect x="535.17" y="202" width="2.25" height="17" fill="#e6a23c" rx="2"/></g>
+<g><title>keccak::backends::aarch64_sha3::p1600_armv8_sha3
+1.81 ms (0.1%)</title><rect x="535.17" y="220" width="1.57" height="17" fill="#e6a23c" rx="2"/></g>
+<g><title>_rjem_sdallocx
+2.93 ms (0.2%)</title><rect x="538.47" y="112" width="2.54" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>_rjem_je_sdallocx_default
+2.93 ms (0.2%)</title><rect x="538.47" y="130" width="2.54" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>_rjem_je_large_dalloc
+2.93 ms (0.2%)</title><rect x="538.47" y="148" width="2.54" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>pac_dalloc_impl
+2.93 ms (0.2%)</title><rect x="538.47" y="166" width="2.54" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>_rjem_je_extent_dalloc_wrapper
+2.93 ms (0.2%)</title><rect x="538.47" y="184" width="2.54" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>_rjem_je_extent_dalloc_mmap
+2.93 ms (0.2%)</title><rect x="538.47" y="202" width="2.54" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>_rjem_je_pages_unmap
+2.93 ms (0.2%)</title><rect x="538.47" y="220" width="2.54" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>libsystem_kernel.dylib:0x4728
+2.93 ms (0.2%)</title><rect x="538.47" y="238" width="2.54" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>revm_database::states::bundle_state::BundleState::apply_transitions_and_create_reverts
+1.61 ms (0.1%)</title><rect x="541.01" y="112" width="1.40" height="17" fill="#58a65c" rx="2"/></g>
+<g><title>revm_database::states::transition_account::TransitionAccount::create_revert
+1.22 ms (0.1%)</title><rect x="541.01" y="130" width="1.06" height="17" fill="#58a65c" rx="2"/></g>
+<g><title>revm_database::states::bundle_account::BundleAccount::update_and_create_revert
+1.22 ms (0.1%)</title><rect x="541.01" y="148" width="1.06" height="17" fill="#58a65c" rx="2"/></g>
+<g><title>hashbrown::raw::RawIterRange&lt;T&gt;::fold_impl
+1.22 ms (0.1%)</title><rect x="541.01" y="166" width="1.06" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>0x0000000101e32dff
+604.44 ms (33.2%)</title><rect x="542.41" y="94" width="524.64" height="17" fill="#64a9c6" rx="2"/></g>
+<text x="546.41" y="107" clip-path="inset(0)">0x0000000101e32dff</text>
+<g><title>&lt;alloy_evm..eth..block..EthBlockExecutor&lt;E,Spec,R&gt; as alloy_evm..block..BlockExecutor&gt;::execute_transaction_without_commit
+604.44 ms (33.2%)</title><rect x="542.41" y="112" width="524.64" height="17" fill="#64a9c6" rx="2"/></g>
+<text x="546.41" y="125" clip-path="inset(0)">&lt;alloy_evm..eth..block..EthBlockExecutor&lt;E,Spec,R&gt; as alloy_evm..block..Block...</text>
+<g><title>alloy_evm::evm::Evm::transact
+596.46 ms (32.8%)</title><rect x="542.41" y="130" width="517.71" height="17" fill="#58a65c" rx="2"/></g>
+<text x="546.41" y="143" clip-path="inset(0)">alloy_evm::evm::Evm::transact</text>
+<g><title>revm_handler::handler::Handler::execution
+480.01 ms (26.4%)</title><rect x="542.41" y="148" width="416.63" height="17" fill="#58a65c" rx="2"/></g>
+<text x="546.41" y="161" clip-path="inset(0)">revm_handler::handler::Handler::execution</text>
+<g><title>&lt;deduplicated_symbol&gt;
+177.79 ms (9.8%)</title><rect x="542.41" y="166" width="154.32" height="17" fill="#64a9c6" rx="2"/></g>
+<text x="546.41" y="179" clip-path="inset(0)">&lt;deduplicated_symbol&gt;</text>
+<g><title>alloy_primitives::utils::keccak256_impl
+176.64 ms (9.7%)</title><rect x="542.41" y="184" width="153.32" height="17" fill="#e6a23c" rx="2"/></g>
+<text x="546.41" y="197" clip-path="inset(0)">alloy_primitives::utils::keccak256_impl</text>
+<g><title>keccak::Keccak::with_backend::aarch64_sha3_inner
+97.16 ms (5.3%)</title><rect x="542.41" y="202" width="84.33" height="17" fill="#e6a23c" rx="2"/></g>
+<text x="546.41" y="215" clip-path="inset(0)">keccak::Keccak::with_backend::aarch64_sha3_inner</text>
+<g><title>keccak::backends::aarch64_sha3::p1600_armv8_sha3
+95.66 ms (5.3%)</title><rect x="542.41" y="220" width="83.03" height="17" fill="#e6a23c" rx="2"/></g>
+<text x="546.41" y="233" clip-path="inset(0)">keccak::backends::aarch64_sha3::p1600_armv8_sha3</text>
+<g><title>libsystem_platform.dylib:0x3414
+1.98 ms (0.1%)</title><rect x="626.74" y="202" width="1.72" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>libsystem_platform.dylib:0x33f0
+1.35 ms (0.1%)</title><rect x="628.46" y="202" width="1.17" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>revm_interpreter::instructions::host::sstore
+112.48 ms (6.2%)</title><rect x="696.73" y="166" width="97.63" height="17" fill="#58a65c" rx="2"/></g>
+<text x="700.73" y="179" clip-path="inset(0)">revm_interpreter::instructions::host::sstore</text>
+<g><title>JournaledAccount::sload_concrete_error
+81.82 ms (4.5%)</title><rect x="696.73" y="184" width="71.02" height="17" fill="#58a65c" rx="2"/></g>
+<text x="700.73" y="197" clip-path="inset(0)">JournaledAccount::sload_concrete_error</text>
+<g><title>revm_database_interface::_::&lt;impl revm_database_interface..Database for $RF$mut T&gt;::storage
+9.25 ms (0.5%)</title><rect x="696.73" y="202" width="8.03" height="17" fill="#58a65c" rx="2"/></g>
+<g><title>revm_database::states::state::State&lt;DB&gt;::storage
+9.25 ms (0.5%)</title><rect x="696.73" y="220" width="8.03" height="17" fill="#58a65c" rx="2"/></g>
+<g><title>&lt;reth_revm..cached..CachedReadsDbMut&lt;DB&gt; as revm_database_interface..Database&gt;::storage
+7.38 ms (0.4%)</title><rect x="696.73" y="238" width="6.41" height="17" fill="#58a65c" rx="2"/></g>
+<g><title>&lt;reth_chain_state..memory_overlay..MemoryOverlayStateProvider&lt;N&gt; as reth_storage_api..state..StateProvider&gt;::storage
+6.70 ms (0.4%)</title><rect x="696.73" y="256" width="5.82" height="17" fill="#7e6bdc" rx="2"/></g>
+<g><title>0x0000000100b0379f
+6.70 ms (0.4%)</title><rect x="696.73" y="274" width="5.82" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>0x0000000100b03c07
+2.32 ms (0.1%)</title><rect x="696.73" y="292" width="2.01" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>alloy_primitives::utils::keccak256_impl
+2.32 ms (0.1%)</title><rect x="696.73" y="310" width="2.01" height="17" fill="#e6a23c" rx="2"/></g>
+<g><title>keccak::Keccak::with_backend::aarch64_sha3_inner
+2.32 ms (0.1%)</title><rect x="696.73" y="328" width="2.01" height="17" fill="#e6a23c" rx="2"/></g>
+<g><title>keccak::backends::aarch64_sha3::p1600_armv8_sha3
+1.44 ms (0.1%)</title><rect x="696.73" y="346" width="1.25" height="17" fill="#e6a23c" rx="2"/></g>
+<g><title>0x0000000100b03c9f
+2.21 ms (0.1%)</title><rect x="698.75" y="292" width="1.92" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>&lt;reth_db..implementation..mdbx..cursor..Cursor&lt;K,T&gt; as reth_db_api..cursor..DbDupCursorRO&lt;T&gt;&gt;::seek_by_key_subkey
+2.21 ms (0.1%)</title><rect x="698.75" y="310" width="1.92" height="17" fill="#7e6bdc" rx="2"/></g>
+<g><title>0x0000000100fafb47
+2.21 ms (0.1%)</title><rect x="698.75" y="328" width="1.92" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>mdbx_cursor_get
+2.21 ms (0.1%)</title><rect x="698.75" y="346" width="1.92" height="17" fill="#7e6bdc" rx="2"/></g>
+<g><title>cursor_ops
+2.21 ms (0.1%)</title><rect x="698.75" y="364" width="1.92" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>cursor_seek
+2.21 ms (0.1%)</title><rect x="698.75" y="382" width="1.92" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>cursor_seek
+2.21 ms (0.1%)</title><rect x="698.75" y="400" width="1.92" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>node_search
+1.26 ms (0.1%)</title><rect x="698.75" y="418" width="1.09" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>tree_search_finalize
+0.95 ms (0.1%)</title><rect x="699.84" y="418" width="0.82" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>node_search
+0.95 ms (0.1%)</title><rect x="699.84" y="436" width="0.82" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>cmp_lexical
+0.95 ms (0.1%)</title><rect x="699.84" y="454" width="0.82" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>libsystem_platform.dylib:0xf10
+0.95 ms (0.1%)</title><rect x="699.84" y="472" width="0.82" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>0x0000000100b03c1f
+1.33 ms (0.1%)</title><rect x="700.66" y="292" width="1.16" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>alloy_primitives::utils::keccak256_impl
+1.33 ms (0.1%)</title><rect x="700.66" y="310" width="1.16" height="17" fill="#e6a23c" rx="2"/></g>
+<g><title>keccak::Keccak::with_backend::aarch64_sha3_inner
+1.33 ms (0.1%)</title><rect x="700.66" y="328" width="1.16" height="17" fill="#e6a23c" rx="2"/></g>
+<g><title>keccak::backends::aarch64_sha3::p1600_armv8_sha3
+1.33 ms (0.1%)</title><rect x="700.66" y="346" width="1.16" height="17" fill="#e6a23c" rx="2"/></g>
+<g><title>0x0000000100b03c2b
+0.84 ms (0.0%)</title><rect x="701.82" y="292" width="0.73" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>reth_db::implementation::mdbx::tx::Tx&lt;K&gt;::new_cursor
+0.84 ms (0.0%)</title><rect x="701.82" y="310" width="0.73" height="17" fill="#7e6bdc" rx="2"/></g>
+<g><title>reth_libmdbx::transaction::Transaction&lt;K&gt;::cursor_with_dbi
+0.84 ms (0.0%)</title><rect x="701.82" y="328" width="0.73" height="17" fill="#7e6bdc" rx="2"/></g>
+<g><title>mdbx_cursor_open
+0.84 ms (0.0%)</title><rect x="701.82" y="346" width="0.73" height="17" fill="#7e6bdc" rx="2"/></g>
+<g><title>revm_database::states::state::State&lt;DB&gt;::load_cache_account_with
+1.28 ms (0.1%)</title><rect x="703.14" y="238" width="1.11" height="17" fill="#58a65c" rx="2"/></g>
+<g><title>hashbrown::rustc_entry::&lt;impl hashbrown..map..HashMap&lt;K,V,S,A&gt;&gt;::rustc_entry
+1.28 ms (0.1%)</title><rect x="703.14" y="256" width="1.11" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>revm_handler::handler::Handler::first_frame_input
+38.19 ms (2.1%)</title><rect x="794.36" y="166" width="33.15" height="17" fill="#58a65c" rx="2"/></g>
+<g><title>JournalInner::load_account_optional
+33.44 ms (1.8%)</title><rect x="794.36" y="184" width="29.02" height="17" fill="#58a65c" rx="2"/></g>
+<g><title>JournalInner::load_account_mut_optional
+28.69 ms (1.6%)</title><rect x="794.36" y="202" width="24.90" height="17" fill="#58a65c" rx="2"/></g>
+<g><title>&lt;revm_state..Account as core..convert..From&lt;revm_state..account_info..AccountInfo&gt;&gt;::from
+16.31 ms (0.9%)</title><rect x="794.36" y="220" width="14.16" height="17" fill="#58a65c" rx="2"/></g>
+<g><title>_rjem_malloc
+0.99 ms (0.1%)</title><rect x="794.36" y="238" width="0.86" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>hashbrown::rustc_entry::&lt;impl hashbrown..map..HashMap&lt;K,V,S,A&gt;&gt;::rustc_entry
+3.33 ms (0.2%)</title><rect x="808.52" y="220" width="2.89" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>revm_database_interface::_::&lt;impl revm_database_interface..Database for $RF$mut T&gt;::basic
+3.20 ms (0.2%)</title><rect x="811.41" y="220" width="2.78" height="17" fill="#58a65c" rx="2"/></g>
+<g><title>revm_database::states::state::State&lt;DB&gt;::load_cache_account_with
+2.31 ms (0.1%)</title><rect x="811.41" y="238" width="2.01" height="17" fill="#58a65c" rx="2"/></g>
+<g><title>hashbrown::rustc_entry::&lt;impl hashbrown..map..HashMap&lt;K,V,S,A&gt;&gt;::rustc_entry
+1.05 ms (0.1%)</title><rect x="811.41" y="256" width="0.91" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>libdyld.dylib:0x1d38c
+2.06 ms (0.1%)</title><rect x="814.19" y="220" width="1.79" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>revm_interpreter::instructions::host::sload
+27.56 ms (1.5%)</title><rect x="827.51" y="166" width="23.92" height="17" fill="#58a65c" rx="2"/></g>
+<g><title>JournaledAccount::sload_concrete_error
+25.28 ms (1.4%)</title><rect x="827.51" y="184" width="21.94" height="17" fill="#58a65c" rx="2"/></g>
+<g><title>revm_database_interface::_::&lt;impl revm_database_interface..Database for $RF$mut T&gt;::storage
+18.52 ms (1.0%)</title><rect x="827.51" y="202" width="16.08" height="17" fill="#58a65c" rx="2"/></g>
+<g><title>revm_database::states::state::State&lt;DB&gt;::storage
+18.52 ms (1.0%)</title><rect x="827.51" y="220" width="16.08" height="17" fill="#58a65c" rx="2"/></g>
+<g><title>revm_database::states::state::State&lt;DB&gt;::load_cache_account_with
+8.60 ms (0.5%)</title><rect x="827.51" y="238" width="7.46" height="17" fill="#58a65c" rx="2"/></g>
+<g><title>&lt;reth_revm..cached..CachedReadsDbMut&lt;DB&gt; as revm_database_interface..Database&gt;::storage
+7.12 ms (0.4%)</title><rect x="834.97" y="238" width="6.18" height="17" fill="#58a65c" rx="2"/></g>
+<g><title>&lt;reth_chain_state..memory_overlay..MemoryOverlayStateProvider&lt;N&gt; as reth_storage_api..state..StateProvider&gt;::storage
+5.75 ms (0.3%)</title><rect x="834.97" y="256" width="4.99" height="17" fill="#7e6bdc" rx="2"/></g>
+<g><title>0x0000000100b0379f
+5.75 ms (0.3%)</title><rect x="834.97" y="274" width="4.99" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>0x0000000100b03c9f
+1.99 ms (0.1%)</title><rect x="834.97" y="292" width="1.73" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>&lt;reth_db..implementation..mdbx..cursor..Cursor&lt;K,T&gt; as reth_db_api..cursor..DbDupCursorRO&lt;T&gt;&gt;::seek_by_key_subkey
+1.99 ms (0.1%)</title><rect x="834.97" y="310" width="1.73" height="17" fill="#7e6bdc" rx="2"/></g>
+<g><title>0x0000000100fafb47
+1.99 ms (0.1%)</title><rect x="834.97" y="328" width="1.73" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>mdbx_cursor_get
+1.99 ms (0.1%)</title><rect x="834.97" y="346" width="1.73" height="17" fill="#7e6bdc" rx="2"/></g>
+<g><title>cursor_ops
+1.99 ms (0.1%)</title><rect x="834.97" y="364" width="1.73" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>cursor_seek
+1.99 ms (0.1%)</title><rect x="834.97" y="382" width="1.73" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>cursor_seek
+1.99 ms (0.1%)</title><rect x="834.97" y="400" width="1.73" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>node_search
+1.99 ms (0.1%)</title><rect x="834.97" y="418" width="1.73" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>0x0000000100b03c07
+1.77 ms (0.1%)</title><rect x="836.70" y="292" width="1.54" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>alloy_primitives::utils::keccak256_impl
+1.77 ms (0.1%)</title><rect x="836.70" y="310" width="1.54" height="17" fill="#e6a23c" rx="2"/></g>
+<g><title>keccak::Keccak::with_backend::aarch64_sha3_inner
+1.77 ms (0.1%)</title><rect x="836.70" y="328" width="1.54" height="17" fill="#e6a23c" rx="2"/></g>
+<g><title>keccak::backends::aarch64_sha3::p1600_armv8_sha3
+1.77 ms (0.1%)</title><rect x="836.70" y="346" width="1.54" height="17" fill="#e6a23c" rx="2"/></g>
+<g><title>0x0000000100b03c1f
+1.57 ms (0.1%)</title><rect x="838.24" y="292" width="1.36" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>alloy_primitives::utils::keccak256_impl
+1.57 ms (0.1%)</title><rect x="838.24" y="310" width="1.36" height="17" fill="#e6a23c" rx="2"/></g>
+<g><title>keccak::Keccak::with_backend::aarch64_sha3_inner
+1.57 ms (0.1%)</title><rect x="838.24" y="328" width="1.36" height="17" fill="#e6a23c" rx="2"/></g>
+<g><title>keccak::backends::aarch64_sha3::p1600_armv8_sha3
+1.57 ms (0.1%)</title><rect x="838.24" y="346" width="1.36" height="17" fill="#e6a23c" rx="2"/></g>
+<g><title>hashbrown::rustc_entry::&lt;impl hashbrown..map..HashMap&lt;K,V,S,A&gt;&gt;::rustc_entry
+1.36 ms (0.1%)</title><rect x="839.96" y="256" width="1.18" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>hashbrown::rustc_entry::&lt;impl hashbrown..map..HashMap&lt;K,V,S,A&gt;&gt;::rustc_entry
+2.81 ms (0.2%)</title><rect x="841.15" y="238" width="2.44" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>hashbrown::rustc_entry::&lt;impl hashbrown..map..HashMap&lt;K,V,S,A&gt;&gt;::rustc_entry
+2.79 ms (0.2%)</title><rect x="843.59" y="202" width="2.42" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>hashbrown::raw::RawTable&lt;T,A&gt;::reserve_rehash
+1.42 ms (0.1%)</title><rect x="843.59" y="220" width="1.23" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>_rjem_malloc
+1.42 ms (0.1%)</title><rect x="843.59" y="238" width="1.23" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>&lt;revm_context..evm..Evm&lt;CTX,INSP,I,P,revm_handler..frame..EthFrame&gt; as revm_handler..evm..EvmTr&gt;::frame_init
+18.38 ms (1.0%)</title><rect x="851.43" y="166" width="15.95" height="17" fill="#58a65c" rx="2"/></g>
+<g><title>revm_handler::frame::EthFrame::init_with_context
+16.39 ms (0.9%)</title><rect x="851.43" y="184" width="14.23" height="17" fill="#58a65c" rx="2"/></g>
+<g><title>JournalInner::transfer_loaded
+6.13 ms (0.3%)</title><rect x="851.43" y="202" width="5.32" height="17" fill="#58a65c" rx="2"/></g>
+<g><title>core::ptr::drop_in_place&lt;alloc..boxed..Box&lt;revm_interpreter..interpreter_action..call_inputs..CallInputs&gt;&gt;
+1.34 ms (0.1%)</title><rect x="856.75" y="202" width="1.16" height="17" fill="#58a65c" rx="2"/></g>
+<g><title>&lt;alloy_evm..precompiles..PrecompilesMap as revm_handler..precompile_provider..PrecompileProvider&lt;revm_context..context..Context&lt;BlockEnv,...
+1.13 ms (0.1%)</title><rect x="857.91" y="202" width="0.98" height="17" fill="#58a65c" rx="2"/></g>
+<g><title>alloy_evm::precompiles::PrecompilesMap::get
+1.13 ms (0.1%)</title><rect x="857.91" y="220" width="0.98" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>0x0000000101ec8d2c
+10.43 ms (0.6%)</title><rect x="867.38" y="166" width="9.05" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>0x0000000101ec9e14
+8.25 ms (0.5%)</title><rect x="876.43" y="166" width="7.16" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>0x0000000101ec9e53
+6.57 ms (0.4%)</title><rect x="883.60" y="166" width="5.70" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>revm_interpreter::interpreter::shared_memory::resize_memory_cold
+6.57 ms (0.4%)</title><rect x="883.60" y="184" width="5.70" height="17" fill="#58a65c" rx="2"/></g>
+<g><title>libsystem_platform.dylib:0x3158
+2.25 ms (0.1%)</title><rect x="883.60" y="202" width="1.95" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>libsystem_platform.dylib:0x3144
+1.00 ms (0.1%)</title><rect x="885.55" y="202" width="0.87" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>0x000000010141830c
+6.07 ms (0.3%)</title><rect x="889.30" y="166" width="5.27" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>revm_interpreter::instructions::control::return_inner
+3.46 ms (0.2%)</title><rect x="894.57" y="166" width="3.00" height="17" fill="#58a65c" rx="2"/></g>
+<g><title>libsystem_platform.dylib:0x350c
+1.77 ms (0.1%)</title><rect x="894.57" y="184" width="1.53" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>0x0000000101ec9d78
+2.48 ms (0.1%)</title><rect x="897.57" y="166" width="2.16" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>0x00000001014182d8
+2.20 ms (0.1%)</title><rect x="899.73" y="166" width="1.91" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>0x0000000101ec9dac
+2.08 ms (0.1%)</title><rect x="901.64" y="166" width="1.81" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>0x0000000101418df4
+1.08 ms (0.1%)</title><rect x="903.45" y="166" width="0.94" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>0x00000001014182e0
+0.98 ms (0.1%)</title><rect x="904.38" y="166" width="0.85" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>0x0000000101ec9e24
+0.93 ms (0.1%)</title><rect x="905.24" y="166" width="0.80" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>0x0000000101417c14
+0.90 ms (0.0%)</title><rect x="906.04" y="166" width="0.78" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>0x000000010153091c
+0.88 ms (0.0%)</title><rect x="906.82" y="166" width="0.76" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>0x0000000101418310
+0.75 ms (0.0%)</title><rect x="907.58" y="166" width="0.65" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>revm_handler::handler::Handler::pre_execution
+56.59 ms (3.1%)</title><rect x="959.04" y="148" width="49.12" height="17" fill="#58a65c" rx="2"/></g>
+<text x="963.04" y="161" clip-path="inset(0)">revm_handler::handler::Handler::pre_execution</text>
+<g><title>revm_context_interface::journaled_state::JournalTr::load_account_with_code_mut
+53.43 ms (2.9%)</title><rect x="959.04" y="166" width="46.38" height="17" fill="#58a65c" rx="2"/></g>
+<text x="963.04" y="179" clip-path="inset(0)">revm_context_interface::journaled_state::JournalTr::load_account_with_code_mut</text>
+<g><title>JournalInner::load_account_mut_optional
+52.95 ms (2.9%)</title><rect x="959.04" y="184" width="45.96" height="17" fill="#58a65c" rx="2"/></g>
+<text x="963.04" y="197" clip-path="inset(0)">JournalInner::load_account_mut_optional</text>
+<g><title>revm_database_interface::_::&lt;impl revm_database_interface..Database for $RF$mut T&gt;::basic
+30.99 ms (1.7%)</title><rect x="959.04" y="202" width="26.90" height="17" fill="#58a65c" rx="2"/></g>
+<g><title>revm_database::states::state::State&lt;DB&gt;::load_cache_account_with
+1.27 ms (0.1%)</title><rect x="959.04" y="220" width="1.10" height="17" fill="#58a65c" rx="2"/></g>
+<g><title>&lt;reth_revm..cached..CachedReadsDbMut&lt;DB&gt; as revm_database_interface..Database&gt;::basic
+1.27 ms (0.1%)</title><rect x="959.04" y="238" width="1.10" height="17" fill="#58a65c" rx="2"/></g>
+<g><title>hashbrown::rustc_entry::&lt;impl hashbrown..map..HashMap&lt;K,V,S,A&gt;&gt;::rustc_entry
+11.90 ms (0.7%)</title><rect x="985.94" y="202" width="10.33" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>hashbrown::raw::RawTable&lt;T,A&gt;::reserve_rehash
+11.73 ms (0.6%)</title><rect x="985.94" y="220" width="10.18" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>hashbrown::raw::RawTableInner::fallible_with_capacity
+10.81 ms (0.6%)</title><rect x="985.94" y="238" width="9.39" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>_rjem_malloc
+0.98 ms (0.1%)</title><rect x="985.94" y="256" width="0.85" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>&lt;revm_state..Account as core..convert..From&lt;revm_state..account_info..AccountInfo&gt;&gt;::from
+1.92 ms (0.1%)</title><rect x="996.27" y="202" width="1.67" height="17" fill="#58a65c" rx="2"/></g>
+<g><title>_rjem_malloc
+1.09 ms (0.1%)</title><rect x="996.27" y="220" width="0.95" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>libdyld.dylib:0x1d38c
+0.95 ms (0.1%)</title><rect x="997.94" y="202" width="0.82" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>revm_handler::pre_execution::calculate_caller_fee
+2.65 ms (0.1%)</title><rect x="1005.42" y="166" width="2.30" height="17" fill="#58a65c" rx="2"/></g>
+<g><title>revm_context_interface::transaction::Transaction::effective_balance_spending
+1.76 ms (0.1%)</title><rect x="1005.42" y="184" width="1.53" height="17" fill="#58a65c" rx="2"/></g>
+<g><title>revm_context_interface::transaction::_::&lt;impl revm_context_interface..transaction..Transaction for $RF$T&gt;::ensure_enough_balance
+0.89 ms (0.0%)</title><rect x="1006.95" y="184" width="0.78" height="17" fill="#58a65c" rx="2"/></g>
+<g><title>revm_handler::handler::Handler::post_execution
+33.47 ms (1.8%)</title><rect x="1008.16" y="148" width="29.05" height="17" fill="#58a65c" rx="2"/></g>
+<g><title>JournalInner::load_account_mut_optional
+25.10 ms (1.4%)</title><rect x="1008.16" y="166" width="21.79" height="17" fill="#58a65c" rx="2"/></g>
+<g><title>&lt;revm_state..Account as core..convert..From&lt;revm_state..account_info..AccountInfo&gt;&gt;::from
+7.57 ms (0.4%)</title><rect x="1008.16" y="184" width="6.57" height="17" fill="#58a65c" rx="2"/></g>
+<g><title>_rjem_malloc
+3.17 ms (0.2%)</title><rect x="1008.16" y="202" width="2.76" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>DYLD-STUB$$pthread_getspecific
+0.99 ms (0.1%)</title><rect x="1008.16" y="220" width="0.86" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>hashbrown::rustc_entry::&lt;impl hashbrown..map..HashMap&lt;K,V,S,A&gt;&gt;::rustc_entry
+3.26 ms (0.2%)</title><rect x="1014.73" y="184" width="2.83" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>revm_database_interface::_::&lt;impl revm_database_interface..Database for $RF$mut T&gt;::basic
+0.64 ms (0.0%)</title><rect x="1017.56" y="184" width="0.55" height="17" fill="#58a65c" rx="2"/></g>
+<g><title>&lt;revm_context_interface..journaled_state..account..JournaledAccount&lt;DB,ENTRY&gt; as revm_context_interface..journaled_state..account..Journa...
+4.42 ms (0.2%)</title><rect x="1029.95" y="166" width="3.84" height="17" fill="#58a65c" rx="2"/></g>
+<g><title>revm_handler::handler::Handler::validate
+10.84 ms (0.6%)</title><rect x="1037.22" y="148" width="9.41" height="17" fill="#58a65c" rx="2"/></g>
+<g><title>revm_context_interface::cfg::gas_params::GasParams::initial_tx_gas
+9.94 ms (0.5%)</title><rect x="1037.22" y="166" width="8.63" height="17" fill="#58a65c" rx="2"/></g>
+<g><title>revm_handler::handler::Handler::execution_result
+6.61 ms (0.4%)</title><rect x="1046.63" y="148" width="5.74" height="17" fill="#58a65c" rx="2"/></g>
+<g><title>JournalInner::commit_tx
+2.82 ms (0.2%)</title><rect x="1046.63" y="166" width="2.44" height="17" fill="#58a65c" rx="2"/></g>
+<g><title>hashbrown::raw::RawTable&lt;T,A&gt;::clear
+1.05 ms (0.1%)</title><rect x="1046.63" y="184" width="0.91" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>0x00000001017ef0cf
+1.36 ms (0.1%)</title><rect x="1049.07" y="166" width="1.18" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>bytes::bytes::shallow_clone_vec
+1.36 ms (0.1%)</title><rect x="1049.07" y="184" width="1.18" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>bytes::bytes::promotable_even_clone
+1.18 ms (0.1%)</title><rect x="1050.25" y="166" width="1.02" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>JournalInner::finalize
+1.54 ms (0.1%)</title><rect x="1052.37" y="148" width="1.33" height="17" fill="#58a65c" rx="2"/></g>
+<g><title>libsystem_platform.dylib:0x3414
+3.88 ms (0.2%)</title><rect x="1060.12" y="130" width="3.36" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>0x0000000101e32f8f
+281.69 ms (15.5%)</title><rect x="1067.05" y="94" width="244.50" height="17" fill="#64a9c6" rx="2"/></g>
+<text x="1071.05" y="107" clip-path="inset(0)">0x0000000101e32f8f</text>
+<g><title>&lt;alloy_evm..eth..block..EthBlockExecutor&lt;E,Spec,R&gt; as alloy_evm..block..BlockExecutor&gt;::commit_transaction
+281.69 ms (15.5%)</title><rect x="1067.05" y="112" width="244.50" height="17" fill="#64a9c6" rx="2"/></g>
+<text x="1071.05" y="125" clip-path="inset(0)">&lt;alloy_evm..eth..block..EthBlockExecutor&lt;E,Spec,R&gt; as alloy_evm..block..Block...</text>
+<g><title>&lt;revm_database..states..state..State&lt;DB&gt; as revm_database_interface..DatabaseCommit&gt;::commit
+273.80 ms (15.0%)</title><rect x="1067.05" y="130" width="237.65" height="17" fill="#58a65c" rx="2"/></g>
+<text x="1071.05" y="143" clip-path="inset(0)">&lt;revm_database..states..state..State&lt;DB&gt; as revm_database_interface..Database...</text>
+<g><title>0x0000000101d3739f
+139.54 ms (7.7%)</title><rect x="1067.05" y="148" width="121.11" height="17" fill="#64a9c6" rx="2"/></g>
+<text x="1071.05" y="161" clip-path="inset(0)">0x0000000101d3739f</text>
+<g><title>revm_database::states::cache::CacheState::apply_account_state
+139.54 ms (7.7%)</title><rect x="1067.05" y="166" width="121.11" height="17" fill="#58a65c" rx="2"/></g>
+<text x="1071.05" y="179" clip-path="inset(0)">revm_database::states::cache::CacheState::apply_account_state</text>
+<g><title>_rjem_sdallocx
+51.54 ms (2.8%)</title><rect x="1067.05" y="184" width="44.74" height="17" fill="#9aa0a6" rx="2"/></g>
+<text x="1071.05" y="197" clip-path="inset(0)">_rjem_sdallocx</text>
+<g><title>_rjem_sdallocx.cold.1
+3.30 ms (0.2%)</title><rect x="1067.05" y="202" width="2.86" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>revm_database::states::cache_account::CacheAccount::change
+44.41 ms (2.4%)</title><rect x="1111.78" y="184" width="38.54" height="17" fill="#58a65c" rx="2"/></g>
+<text x="1115.78" y="197" clip-path="inset(0)">revm_database::states::cache_account::CacheAccount::change</text>
+<g><title>0x0000000102a4fb44
+6.41 ms (0.4%)</title><rect x="1111.78" y="202" width="5.57" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>0x0000000102a4fb6c
+6.14 ms (0.3%)</title><rect x="1117.35" y="202" width="5.33" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>0x0000000102a4fb3f
+4.34 ms (0.2%)</title><rect x="1122.68" y="202" width="3.76" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>hashbrown::map::HashMap&lt;K,V,S,A&gt;::insert
+4.34 ms (0.2%)</title><rect x="1122.68" y="220" width="3.76" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>0x0000000102a4fb78
+1.02 ms (0.1%)</title><rect x="1126.45" y="202" width="0.89" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>0x0000000102a4fae4
+0.94 ms (0.1%)</title><rect x="1127.33" y="202" width="0.82" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>&lt;core..iter..adapters..map..Map&lt;I,F&gt; as core..iter..traits..iterator..Iterator&gt;::fold
+11.63 ms (0.6%)</title><rect x="1150.33" y="184" width="10.09" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>hashbrown::map::HashMap&lt;K,V,S,A&gt;::insert
+4.54 ms (0.2%)</title><rect x="1150.33" y="202" width="3.94" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>hashbrown::raw::RawTable&lt;T,A&gt;::reserve_rehash
+2.58 ms (0.1%)</title><rect x="1150.33" y="220" width="2.24" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>_rjem_je_malloc_default
+1.31 ms (0.1%)</title><rect x="1150.33" y="238" width="1.14" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>_rjem_je_tcache_alloc_small_hard
+1.31 ms (0.1%)</title><rect x="1150.33" y="256" width="1.14" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>_rjem_je_arena_cache_bin_fill_small
+1.31 ms (0.1%)</title><rect x="1150.33" y="274" width="1.14" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>libsystem_platform.dylib:0x3158
+1.25 ms (0.1%)</title><rect x="1151.46" y="238" width="1.08" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>_rjem_sdallocx
+1.44 ms (0.1%)</title><rect x="1154.27" y="202" width="1.25" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>_rjem_sdallocx.cold.1
+1.44 ms (0.1%)</title><rect x="1154.27" y="220" width="1.25" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>OUTLINED_FUNCTION_4
+1.44 ms (0.1%)</title><rect x="1154.27" y="238" width="1.25" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>hashbrown::rustc_entry::&lt;impl hashbrown..map..HashMap&lt;K,V,S,A&gt;&gt;::rustc_entry
+6.24 ms (0.3%)</title><rect x="1160.42" y="184" width="5.42" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>0x0000000101d37603
+112.92 ms (6.2%)</title><rect x="1188.16" y="148" width="98.01" height="17" fill="#64a9c6" rx="2"/></g>
+<text x="1192.16" y="161" clip-path="inset(0)">0x0000000101d37603</text>
+<g><title>revm_database::states::transition_account::TransitionAccount::update
+112.92 ms (6.2%)</title><rect x="1188.16" y="166" width="98.01" height="17" fill="#58a65c" rx="2"/></g>
+<text x="1192.16" y="179" clip-path="inset(0)">revm_database::states::transition_account::TransitionAccount::update</text>
+<g><title>hashbrown::rustc_entry::&lt;impl hashbrown..map..HashMap&lt;K,V,S,A&gt;&gt;::rustc_entry
+5.39 ms (0.3%)</title><rect x="1188.16" y="184" width="4.68" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>0x0000000101d37453
+7.98 ms (0.4%)</title><rect x="1286.18" y="148" width="6.92" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>hashbrown::rustc_entry::&lt;impl hashbrown..map..HashMap&lt;K,V,S,A&gt;&gt;::rustc_entry
+7.98 ms (0.4%)</title><rect x="1286.18" y="166" width="6.92" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>0x0000000101d37260
+1.51 ms (0.1%)</title><rect x="1293.10" y="148" width="1.31" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>0x0000000101d372b4
+1.22 ms (0.1%)</title><rect x="1294.41" y="148" width="1.06" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>0x0000000101d37298
+1.12 ms (0.1%)</title><rect x="1295.47" y="148" width="0.97" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>0x0000000101d376db
+1.03 ms (0.1%)</title><rect x="1296.44" y="148" width="0.89" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>_rjem_sdallocx
+1.03 ms (0.1%)</title><rect x="1296.44" y="166" width="0.89" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>_rjem_sdallocx.cold.1
+1.03 ms (0.1%)</title><rect x="1296.44" y="184" width="0.89" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>0x0000000101d37388
+1.02 ms (0.1%)</title><rect x="1297.34" y="148" width="0.89" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>0x0000000101d375b4
+1.02 ms (0.1%)</title><rect x="1298.22" y="148" width="0.88" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>0x0000000101d37424
+1.02 ms (0.1%)</title><rect x="1299.11" y="148" width="0.88" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>0x0000000101d373cc
+0.94 ms (0.1%)</title><rect x="1299.99" y="148" width="0.82" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>0x0000000101d37440
+0.93 ms (0.1%)</title><rect x="1300.81" y="148" width="0.81" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>0x0000000101d37358
+0.91 ms (0.0%)</title><rect x="1301.62" y="148" width="0.79" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>0x0000000101d37608
+0.76 ms (0.0%)</title><rect x="1302.40" y="148" width="0.66" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>0x0000000101d37368
+0.61 ms (0.0%)</title><rect x="1303.06" y="148" width="0.53" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>_rjem_sdallocx
+2.57 ms (0.1%)</title><rect x="1304.70" y="130" width="2.23" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>_rjem_sdallocx.cold.1
+2.57 ms (0.1%)</title><rect x="1304.70" y="148" width="2.23" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>bytes::bytes::shared_drop
+2.24 ms (0.1%)</title><rect x="1306.93" y="130" width="1.95" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>_rjem_sdallocx
+2.24 ms (0.1%)</title><rect x="1306.93" y="148" width="1.95" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>_rjem_sdallocx.cold.1
+2.24 ms (0.1%)</title><rect x="1306.93" y="166" width="1.95" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>alloc::raw_vec::RawVec&lt;T,A&gt;::grow_one
+0.65 ms (0.0%)</title><rect x="1308.87" y="130" width="0.56" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>alloc::raw_vec::RawVecInner&lt;A&gt;::finish_grow
+0.65 ms (0.0%)</title><rect x="1308.87" y="148" width="0.56" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>do_rallocx
+0.65 ms (0.0%)</title><rect x="1308.87" y="166" width="0.56" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>_rjem_je_large_ralloc
+0.65 ms (0.0%)</title><rect x="1308.87" y="184" width="0.56" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>_rjem_je_large_ralloc_no_move
+0.65 ms (0.0%)</title><rect x="1308.87" y="202" width="0.56" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>large_ralloc_no_move_expand
+0.65 ms (0.0%)</title><rect x="1308.87" y="220" width="0.56" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>_rjem_je_pa_expand
+0.65 ms (0.0%)</title><rect x="1308.87" y="238" width="0.56" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>pac_expand_impl
+0.65 ms (0.0%)</title><rect x="1308.87" y="256" width="0.56" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>_rjem_je_ecache_alloc_grow
+0.65 ms (0.0%)</title><rect x="1308.87" y="274" width="0.56" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>_rjem_je_extent_alloc_wrapper
+0.65 ms (0.0%)</title><rect x="1308.87" y="292" width="0.56" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>_rjem_je_extent_alloc_mmap
+0.65 ms (0.0%)</title><rect x="1308.87" y="310" width="0.56" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>_rjem_je_pages_map
+0.65 ms (0.0%)</title><rect x="1308.87" y="328" width="0.56" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>os_pages_map
+0.65 ms (0.0%)</title><rect x="1308.87" y="346" width="0.56" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>libsystem_kernel.dylib:0x196c
+0.65 ms (0.0%)</title><rect x="1308.87" y="364" width="0.56" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>&lt;reth_transaction_pool..pool..best..BestTransactions&lt;T&gt; as core..iter..traits..iterator..Iterator&gt;::next
+169.37 ms (9.3%)</title><rect x="1311.55" y="94" width="147.01" height="17" fill="#64a9c6" rx="2"/></g>
+<text x="1315.55" y="107" clip-path="inset(0)">&lt;reth_transaction_pool..pool..best..BestTransactions&lt;T&gt; as core..iter..traits...</text>
+<g><title>imbl::ord::map::GenericOrdMap&lt;K,V,P&gt;::remove_with_key
+63.17 ms (3.5%)</title><rect x="1311.55" y="112" width="54.83" height="17" fill="#9aa0a6" rx="2"/></g>
+<text x="1315.55" y="125" clip-path="inset(0)">imbl::ord::map::GenericOrdMap&lt;K,V,P&gt;::remove_with_key</text>
+<g><title>imbl::nodes::btree::Branch&lt;K,V,P&gt;::remove
+63.17 ms (3.5%)</title><rect x="1311.55" y="130" width="54.83" height="17" fill="#9aa0a6" rx="2"/></g>
+<text x="1315.55" y="143" clip-path="inset(0)">imbl::nodes::btree::Branch&lt;K,V,P&gt;::remove</text>
+<g><title>imbl::nodes::btree::Branch&lt;K,V,P&gt;::remove
+61.34 ms (3.4%)</title><rect x="1311.55" y="148" width="53.24" height="17" fill="#9aa0a6" rx="2"/></g>
+<text x="1315.55" y="161" clip-path="inset(0)">imbl::nodes::btree::Branch&lt;K,V,P&gt;::remove</text>
+<g><title>imbl::nodes::btree::Branch&lt;K,V,P&gt;::remove
+54.55 ms (3.0%)</title><rect x="1311.55" y="166" width="47.34" height="17" fill="#9aa0a6" rx="2"/></g>
+<text x="1315.55" y="179" clip-path="inset(0)">imbl::nodes::btree::Branch&lt;K,V,P&gt;::remove</text>
+<g><title>imbl::nodes::btree::Branch&lt;K,V,P&gt;::remove
+29.88 ms (1.6%)</title><rect x="1311.55" y="184" width="25.94" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>imbl::nodes::btree::Branch&lt;K,V,P&gt;::merge_leaves
+9.61 ms (0.5%)</title><rect x="1311.55" y="202" width="8.34" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>alloc::sync::Arc&lt;T,A&gt;::make_mut
+4.18 ms (0.2%)</title><rect x="1311.55" y="220" width="3.63" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>libsystem_platform.dylib:0x3414
+3.85 ms (0.2%)</title><rect x="1311.55" y="238" width="3.34" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>alloc::sync::Arc&lt;T,A&gt;::drop_slow
+2.65 ms (0.1%)</title><rect x="1315.18" y="220" width="2.30" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>imbl_sized_chunks::sized_chunk::Chunk&lt;A,_&gt;::insert_from
+1.89 ms (0.1%)</title><rect x="1317.48" y="220" width="1.64" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>libsystem_platform.dylib:0x3414
+0.95 ms (0.1%)</title><rect x="1317.48" y="238" width="0.83" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>&lt;imbl_sized_chunks..sized_chunk..Chunk&lt;A,_&gt; as core..iter..traits..collect..Extend&lt;A&gt;&gt;::extend
+0.88 ms (0.0%)</title><rect x="1319.12" y="220" width="0.76" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>alloc::sync::Arc&lt;T,A&gt;::make_mut
+3.21 ms (0.2%)</title><rect x="1319.88" y="202" width="2.78" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>libsystem_platform.dylib:0x3414
+1.18 ms (0.1%)</title><rect x="1319.88" y="220" width="1.02" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>imbl::nodes::btree::Branch&lt;K,V,P&gt;::merge_branches
+5.00 ms (0.3%)</title><rect x="1337.48" y="184" width="4.34" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>libsystem_platform.dylib:0x34dc
+2.46 ms (0.1%)</title><rect x="1337.48" y="202" width="2.13" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>&lt;imbl_sized_chunks..sized_chunk..Chunk&lt;A,_&gt; as core..iter..traits..collect..Extend&lt;A&gt;&gt;::extend
+1.02 ms (0.1%)</title><rect x="1339.62" y="202" width="0.88" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>0x0000000101b8de5c
+0.91 ms (0.0%)</title><rect x="1340.50" y="202" width="0.79" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>alloc::sync::Arc&lt;T,A&gt;::make_mut
+4.92 ms (0.3%)</title><rect x="1341.82" y="184" width="4.27" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>libsystem_platform.dylib:0x3414
+2.35 ms (0.1%)</title><rect x="1341.82" y="202" width="2.04" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>imbl::nodes::btree::Branch&lt;K,V,P&gt;::merge_leaves
+2.31 ms (0.1%)</title><rect x="1346.09" y="184" width="2.01" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>imbl_sized_chunks::sized_chunk::Chunk&lt;A,_&gt;::insert_from
+1.56 ms (0.1%)</title><rect x="1346.09" y="202" width="1.35" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>&lt;imbl_sized_chunks..sized_chunk..Chunk&lt;A,_&gt; as core..iter..traits..collect..Extend&lt;A&gt;&gt;::extend
+0.76 ms (0.0%)</title><rect x="1347.44" y="202" width="0.66" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>imbl::nodes::btree::Branch&lt;K,V,P&gt;::branch_rebalance_children
+0.85 ms (0.0%)</title><rect x="1348.10" y="184" width="0.74" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>imbl::nodes::btree::Branch&lt;K,V,P&gt;::merge_leaves
+0.93 ms (0.1%)</title><rect x="1358.89" y="166" width="0.81" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>imbl_sized_chunks::sized_chunk::Chunk&lt;A,_&gt;::insert_from
+0.93 ms (0.1%)</title><rect x="1358.89" y="184" width="0.81" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>imbl::nodes::btree::Branch&lt;K,V,P&gt;::branch_rebalance_children
+0.84 ms (0.0%)</title><rect x="1364.78" y="148" width="0.73" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>imbl::ord::map::GenericOrdMap&lt;K,V,P&gt;::get
+56.58 ms (3.1%)</title><rect x="1366.38" y="112" width="49.11" height="17" fill="#9aa0a6" rx="2"/></g>
+<text x="1370.38" y="125" clip-path="inset(0)">imbl::ord::map::GenericOrdMap&lt;K,V,P&gt;::get</text>
+<g><title>alloc::collections::btree::map::BTreeMap&lt;K,V,A&gt;::insert
+43.29 ms (2.4%)</title><rect x="1415.48" y="112" width="37.58" height="17" fill="#9aa0a6" rx="2"/></g>
+<text x="1419.48" y="125" clip-path="inset(0)">alloc::collections::btree::map::BTreeMap&lt;K,V,A&gt;::insert</text>
+<g><title>_rjem_malloc
+1.08 ms (0.1%)</title><rect x="1415.48" y="130" width="0.94" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>alloc::collections::btree::map::BTreeMap&lt;K,V,A&gt;::pop_last
+3.34 ms (0.2%)</title><rect x="1453.06" y="112" width="2.90" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>alloc::collections::btree::remove::&lt;impl alloc..collections..btree..node..Handle&lt;alloc..collections..btree..node..NodeRef&lt;alloc..collecti...
+1.17 ms (0.1%)</title><rect x="1453.06" y="130" width="1.02" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>_RNvMNtNtNtNtCsaLOjE9VYtxK_3std3sys3pal4unix4timeNtB2_8Timespec3now
+59.36 ms (3.3%)</title><rect x="1458.55" y="94" width="51.52" height="17" fill="#64a9c6" rx="2"/></g>
+<text x="1462.55" y="107" clip-path="inset(0)">_RNvMNtNtNtNtCsaLOjE9VYtxK_3std3sys3pal4unix4timeNtB2_8Timespec3now</text>
+<g><title>libsystem_c.dylib:0xed5f
+57.31 ms (3.1%)</title><rect x="1458.55" y="112" width="49.74" height="17" fill="#64a9c6" rx="2"/></g>
+<text x="1462.55" y="125" clip-path="inset(0)">libsystem_c.dylib:0xed5f</text>
+<g><title>libsystem_c.dylib:0x115b
+55.65 ms (3.1%)</title><rect x="1458.55" y="130" width="48.30" height="17" fill="#64a9c6" rx="2"/></g>
+<text x="1462.55" y="143" clip-path="inset(0)">libsystem_c.dylib:0x115b</text>
+<g><title>libsystem_kernel.dylib:0x110c
+46.95 ms (2.6%)</title><rect x="1458.55" y="148" width="40.75" height="17" fill="#9aa0a6" rx="2"/></g>
+<text x="1462.55" y="161" clip-path="inset(0)">libsystem_kernel.dylib:0x110c</text>
+<g><title>libsystem_kernel.dylib:0x1110
+8.70 ms (0.5%)</title><rect x="1499.30" y="148" width="7.55" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>libsystem_c.dylib:0x1120
+1.09 ms (0.1%)</title><rect x="1506.85" y="130" width="0.95" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>libsystem_c.dylib:0xed44
+0.94 ms (0.1%)</title><rect x="1508.30" y="112" width="0.82" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>0x0000000101e32db7
+12.88 ms (0.7%)</title><rect x="1510.07" y="94" width="11.18" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>&lt;revm_context..tx..TxEnv as alloy_evm..tx..FromRecoveredTx&lt;alloy_consensus..transaction..eip1559..TxEip1559&gt;&gt;::from_recovered_tx
+12.88 ms (0.7%)</title><rect x="1510.07" y="112" width="11.18" height="17" fill="#58a65c" rx="2"/></g>
+<g><title>revm_context::tx::TxEnvBuilder::build
+7.08 ms (0.4%)</title><rect x="1510.07" y="130" width="6.14" height="17" fill="#58a65c" rx="2"/></g>
+<g><title>libsystem_platform.dylib:0x3414
+1.88 ms (0.1%)</title><rect x="1510.07" y="148" width="1.64" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>libsystem_platform.dylib:0x33f0
+0.88 ms (0.0%)</title><rect x="1511.71" y="148" width="0.77" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>libsystem_platform.dylib:0x3408
+0.85 ms (0.0%)</title><rect x="1512.48" y="148" width="0.73" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>0x0000000101e32eec
+11.94 ms (0.7%)</title><rect x="1521.25" y="94" width="10.36" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>&lt;reth_execution_types..execute..BlockExecutionOutput&lt;T&gt; as core..clone..Clone&gt;::clone
+9.29 ms (0.5%)</title><rect x="1531.61" y="94" width="8.06" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>&lt;alloc..vec..Vec&lt;T,A&gt; as core..clone..Clone&gt;::clone
+6.56 ms (0.4%)</title><rect x="1531.61" y="112" width="5.69" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>&lt;T as alloc..slice..&lt;impl $u5b$T$u5d$&gt;..to_vec_in..ConvertVec&gt;::to_vec
+4.92 ms (0.3%)</title><rect x="1531.61" y="130" width="4.27" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>&lt;hashbrown..map..HashMap&lt;K,V,S,A&gt; as core..clone..Clone&gt;::clone
+2.73 ms (0.2%)</title><rect x="1537.31" y="112" width="2.37" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>&lt;reth_transaction_pool..traits..EthPooledTransaction as reth_transaction_pool..traits..PoolTransaction&gt;::clone_into_consensus
+8.55 ms (0.5%)</title><rect x="1539.68" y="94" width="7.42" height="17" fill="#6f8fb5" rx="2"/></g>
+<g><title>libsystem_platform.dylib:0x33f0
+1.31 ms (0.1%)</title><rect x="1539.68" y="112" width="1.14" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>&lt;alloc..vec..Vec&lt;T,A&gt; as core..clone..Clone&gt;::clone
+1.11 ms (0.1%)</title><rect x="1540.82" y="112" width="0.96" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>libsystem_platform.dylib:0x336c
+0.97 ms (0.1%)</title><rect x="1541.78" y="112" width="0.84" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>libsystem_platform.dylib:0x342c
+0.81 ms (0.0%)</title><rect x="1542.62" y="112" width="0.70" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>_RNvMNtCsaLOjE9VYtxK_3std4timeNtB2_7Instant7elapsed
+7.91 ms (0.4%)</title><rect x="1547.10" y="94" width="6.87" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>_RNvMNtNtNtNtCsaLOjE9VYtxK_3std3sys3pal4unix4timeNtB2_8Timespec3now
+5.93 ms (0.3%)</title><rect x="1547.10" y="112" width="5.15" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>libsystem_c.dylib:0xed5f
+5.93 ms (0.3%)</title><rect x="1547.10" y="130" width="5.15" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>libsystem_c.dylib:0x115b
+3.67 ms (0.2%)</title><rect x="1547.10" y="148" width="3.18" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>libsystem_kernel.dylib:0x110c
+2.85 ms (0.2%)</title><rect x="1547.10" y="166" width="2.47" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>libsystem_c.dylib:0x10cb
+2.26 ms (0.1%)</title><rect x="1550.28" y="148" width="1.97" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>libsystem_kernel.dylib:0x101c
+2.26 ms (0.1%)</title><rect x="1550.28" y="166" width="1.97" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>_RNvMNtNtNtNtCsaLOjE9VYtxK_3std3sys3pal4unix4timeNtB2_8Timespec12sub_timespec
+1.98 ms (0.1%)</title><rect x="1552.24" y="112" width="1.72" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>0x0000000101e32fd7
+7.68 ms (0.4%)</title><rect x="1553.96" y="94" width="6.66" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>libsystem_platform.dylib:0x3414
+2.61 ms (0.1%)</title><rect x="1553.96" y="112" width="2.26" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>libsystem_platform.dylib:0x341c
+2.06 ms (0.1%)</title><rect x="1556.22" y="112" width="1.78" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>libsystem_platform.dylib:0x3408
+1.58 ms (0.1%)</title><rect x="1558.01" y="112" width="1.37" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>libsystem_platform.dylib:0x343c
+0.88 ms (0.0%)</title><rect x="1559.38" y="112" width="0.76" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>0x0000000101e32fbf
+4.76 ms (0.3%)</title><rect x="1560.62" y="94" width="4.13" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>alloc::raw_vec::RawVec&lt;T,A&gt;::grow_one
+4.76 ms (0.3%)</title><rect x="1560.62" y="112" width="4.13" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>alloc::raw_vec::RawVecInner&lt;A&gt;::finish_grow
+4.76 ms (0.3%)</title><rect x="1560.62" y="130" width="4.13" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>do_rallocx
+4.76 ms (0.3%)</title><rect x="1560.62" y="148" width="4.13" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>_rjem_je_large_ralloc
+4.76 ms (0.3%)</title><rect x="1560.62" y="166" width="4.13" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>libsystem_platform.dylib:0x33b8
+4.47 ms (0.2%)</title><rect x="1560.62" y="184" width="3.88" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>0x0000000101e32ddb
+3.69 ms (0.2%)</title><rect x="1564.76" y="94" width="3.20" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>libsystem_platform.dylib:0x3414
+2.16 ms (0.1%)</title><rect x="1564.76" y="112" width="1.88" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>libsystem_platform.dylib:0x3378
+1.21 ms (0.1%)</title><rect x="1566.63" y="112" width="1.05" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>&lt;tracing_subscriber..layer..layered..Layered&lt;L,S&gt; as tracing_core..subscriber..Subscriber&gt;::event
+2.19 ms (0.1%)</title><rect x="1567.96" y="94" width="1.91" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>&lt;tracing_subscriber..filter..layer_filters..Filtered&lt;L,F,S&gt; as tracing_subscriber..layer..Layer&lt;S&gt;&gt;::on_event
+2.19 ms (0.1%)</title><rect x="1567.96" y="112" width="1.91" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>std::thread::local::LocalKey&lt;T&gt;::with
+2.19 ms (0.1%)</title><rect x="1567.96" y="130" width="1.91" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>_RNvXsh_NtNtCsaLOjE9VYtxK_3std2io5stdioNtB5_10StdoutLockNtB7_5Write9write_all
+2.19 ms (0.1%)</title><rect x="1567.96" y="148" width="1.91" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>_RNvXs_NtNtCsaLOjE9VYtxK_3std2io5stdioNtB4_9StdoutRawNtB6_5Write9write_all
+2.19 ms (0.1%)</title><rect x="1567.96" y="166" width="1.91" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>libsystem_kernel.dylib:0x4834
+2.19 ms (0.1%)</title><rect x="1567.96" y="184" width="1.91" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>reth_ethereum_payload_builder::default_payload::_{{closure}}
+1.91 ms (0.1%)</title><rect x="1569.86" y="94" width="1.66" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>&lt;tracing_subscriber..layer..layered..Layered&lt;L,S&gt; as tracing_core..subscriber..Subscriber&gt;::event
+1.91 ms (0.1%)</title><rect x="1569.86" y="112" width="1.66" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>&lt;tracing_subscriber..filter..layer_filters..Filtered&lt;L,F,S&gt; as tracing_subscriber..layer..Layer&lt;S&gt;&gt;::on_event
+1.91 ms (0.1%)</title><rect x="1569.86" y="130" width="1.66" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>std::thread::local::LocalKey&lt;T&gt;::with
+1.91 ms (0.1%)</title><rect x="1569.86" y="148" width="1.66" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>_RNvXsh_NtNtCsaLOjE9VYtxK_3std2io5stdioNtB5_10StdoutLockNtB7_5Write9write_all
+1.52 ms (0.1%)</title><rect x="1569.86" y="166" width="1.32" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>_RNvXs_NtNtCsaLOjE9VYtxK_3std2io5stdioNtB4_9StdoutRawNtB6_5Write9write_all
+1.52 ms (0.1%)</title><rect x="1569.86" y="184" width="1.32" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>libsystem_kernel.dylib:0x4834
+1.52 ms (0.1%)</title><rect x="1569.86" y="202" width="1.32" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>libsystem_platform.dylib:0x3414
+1.83 ms (0.1%)</title><rect x="1571.52" y="94" width="1.59" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>0x0000000101805a88
+1.79 ms (0.1%)</title><rect x="1573.11" y="94" width="1.56" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>0x0000000101e32fd8
+1.71 ms (0.1%)</title><rect x="1574.67" y="94" width="1.48" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>_RNvMNtNtNtNtCsaLOjE9VYtxK_3std3sys3pal4unix4timeNtB2_8Timespec12sub_timespec
+1.70 ms (0.1%)</title><rect x="1576.15" y="94" width="1.48" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>core::ptr::drop_in_place&lt;reth_chain_state..memory_overlay..MemoryOverlayStateProvider&gt;
+1.46 ms (0.1%)</title><rect x="1577.63" y="94" width="1.26" height="17" fill="#7e6bdc" rx="2"/></g>
+<g><title>core::ptr::drop_in_place&lt;reth_chain_state..in_memory..ExecutedBlock&gt;
+1.46 ms (0.1%)</title><rect x="1577.63" y="112" width="1.26" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>alloc::sync::Arc&lt;T,A&gt;::drop_slow
+1.46 ms (0.1%)</title><rect x="1577.63" y="130" width="1.26" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>core::ptr::drop_in_place&lt;alloy_consensus..block..BlockBody&lt;alloy_consensus..transaction..envelope..EthereumTxEnvelope&lt;alloy_consensus..tr...
+1.46 ms (0.1%)</title><rect x="1577.63" y="148" width="1.26" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>_rjem_sdallocx
+1.46 ms (0.1%)</title><rect x="1577.63" y="166" width="1.26" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>_rjem_je_sdallocx_default
+1.46 ms (0.1%)</title><rect x="1577.63" y="184" width="1.26" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>_rjem_je_large_dalloc
+1.46 ms (0.1%)</title><rect x="1577.63" y="202" width="1.26" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>pac_dalloc_impl
+1.46 ms (0.1%)</title><rect x="1577.63" y="220" width="1.26" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>_rjem_je_extent_dalloc_wrapper
+1.46 ms (0.1%)</title><rect x="1577.63" y="238" width="1.26" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>_rjem_je_extent_dalloc_mmap
+1.46 ms (0.1%)</title><rect x="1577.63" y="256" width="1.26" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>_rjem_je_pages_unmap
+1.46 ms (0.1%)</title><rect x="1577.63" y="274" width="1.26" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>libsystem_kernel.dylib:0x4728
+1.46 ms (0.1%)</title><rect x="1577.63" y="292" width="1.26" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>0x0000000101e32dcb
+1.34 ms (0.1%)</title><rect x="1578.89" y="94" width="1.17" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>libsystem_platform.dylib:0x3414
+0.76 ms (0.0%)</title><rect x="1578.89" y="112" width="0.66" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>libsystem_platform.dylib:0x33f0
+0.58 ms (0.0%)</title><rect x="1579.55" y="112" width="0.51" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>core::ptr::drop_in_place&lt;reth_transaction_pool..pool..best..BestTransactions&lt;reth_transaction_pool..ordering..CoinbaseTipOrdering&lt;reth_tr...
+1.17 ms (0.1%)</title><rect x="1580.06" y="94" width="1.02" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>alloc::sync::Arc&lt;T,A&gt;::drop_slow
+1.17 ms (0.1%)</title><rect x="1580.06" y="112" width="1.02" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>alloc::sync::Arc&lt;T,A&gt;::drop_slow
+1.17 ms (0.1%)</title><rect x="1580.06" y="130" width="1.02" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>alloc::sync::Arc&lt;T,A&gt;::drop_slow
+1.17 ms (0.1%)</title><rect x="1580.06" y="148" width="1.02" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>_rjem_sdallocx
+1.17 ms (0.1%)</title><rect x="1580.06" y="166" width="1.02" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>_rjem_sdallocx.cold.1
+1.17 ms (0.1%)</title><rect x="1580.06" y="184" width="1.02" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>OUTLINED_FUNCTION_7
+1.17 ms (0.1%)</title><rect x="1580.06" y="202" width="1.02" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>0x0000000101e32f14
+1.00 ms (0.1%)</title><rect x="1581.07" y="94" width="0.87" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>0x0000000101e32deb
+1.00 ms (0.1%)</title><rect x="1581.94" y="94" width="0.87" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>libsystem_platform.dylib:0x3414
+1.00 ms (0.1%)</title><rect x="1581.94" y="112" width="0.87" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>libsystem_platform.dylib:0x3418
+0.96 ms (0.1%)</title><rect x="1582.81" y="94" width="0.84" height="17" fill="#9aa0a6" rx="2"/></g>
+<g><title>0x0000000101e32dec
+0.95 ms (0.1%)</title><rect x="1583.65" y="94" width="0.82" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>0x0000000101e32ddc
+0.90 ms (0.0%)</title><rect x="1584.47" y="94" width="0.78" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>0x0000000101e32ed8
+0.89 ms (0.0%)</title><rect x="1585.25" y="94" width="0.77" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>0x0000000101e32fa7
+0.78 ms (0.0%)</title><rect x="1586.02" y="94" width="0.68" height="17" fill="#64a9c6" rx="2"/></g>
+<g><title>libsystem_platform.dylib:0x3414
+0.78 ms (0.0%)</title><rect x="1586.02" y="112" width="0.68" height="17" fill="#9aa0a6" rx="2"/></g>
+</svg>
