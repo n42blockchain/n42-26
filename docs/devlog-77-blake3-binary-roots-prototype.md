@@ -100,3 +100,72 @@ hash 都能走 BLAKE3 原型路径；state-root 计时从 p50/p95 `3/5ms` 压到
 下一步如果要验收这条优化，先修 measurement：必须让单 leader block 真正吃到 90k tx（或复用
 devlog-76 那套 TCP 122K 注入方式），再重跑 off/on。只有在 90k block 下看到
 `assemble_block_ms + state_root_ms + total_finish_ms` 从数百毫秒级降下来，才值得讨论默认开。
+
+## 5. 90k 单入口重跑
+
+按要求修正 measurement：不用 7 个 ingest endpoint 分摊 `wave=90000`，而是用单 RPC / 单 TCP
+ingest endpoint，把 90k tx 放进同一个 validator 的本地池。
+
+共同配置：
+
+- `cargo build --release --bin n42-node --bin n42-stress --bin n42-mobile-sim`
+- `N42_TWIG=1`, `N42_DISABLE_TX_FORWARD=1`
+- `N42_MAX_TXS_PER_BLOCK=95000`, `N42_GAS_LIMIT=2000000000`
+- `./scripts/testnet.sh --nodes 7 --clean --no-explorer --no-tx-gen --no-monitor --block-interval 2000`
+- workload：单 RPC pre-sign `450000` simple transfers，单 endpoint `--ingest 127.0.0.1:19900`,
+  `--wave 90000`, `--erc20-ratio 0`
+
+这次确实打到了 90k 大块：
+
+| run | flag | tx-bearing leader blocks | max tx/block | total tx in leader pack logs |
+| --- | --- | ---: | ---: | ---: |
+| single-entry off | off | 5 | 90,000 | 450,000 |
+| single-entry on | on | 5 | 95,000 | 450,000 |
+
+Stress / chain summary：
+
+| run | stress summary caveat | elapsed | wall TPS | sustained TPS | chain tx blocks |
+| --- | --- | ---: | ---: | ---: | --- |
+| off | complete at stress exit | 74.4s | 6,052 | 6,590 | five `90000` blocks |
+| on | stress summary was early; waited for pool drain and re-read RPC/logs | 137.4s at stress exit | 3,276 | 3,337 | `90000, 95000, 95000, 95000, 75000` |
+
+Leader `N42_PAYLOAD_PACK`:
+
+| metric | off p50 | off p95 | off max | on p50 | on p95 | on max |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `tx_count` | 90,000 | 90,000 | 90,000 | 95,000 | 95,000 | 95,000 |
+| `evm_exec_ms` | 98 | 108 | 108 | 89 | 111 | 111 |
+| `packing_ms` | 147 | 160 | 160 | 136 | 164 | 164 |
+| `pool_overhead_ms` | 48 | 51 | 51 | 47 | 53 | 53 |
+
+Leader `N42_FINISH_BREAKDOWN`:
+
+| metric | off p50 | off p95 | off max | on p50 | on p95 | on max |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `state_root_ms` | 3 | 3 | 3 | 0 | 0 | 0 |
+| `assemble_block_ms` | 91 | 94 | 94 | 109 | 110 | 110 |
+| `total_finish_ms` | 99 | 101 | 101 | 114 | 114 | 114 |
+
+Two important caveats:
+
+- The corrected off baseline no longer has the previous false low-load problem: it is real
+  90k/block. But it still does **not** reproduce a hundreds-of-ms finish/root bottleneck on
+  this current code and macOS setup. Baseline `total_finish_ms` is only p95 `101ms`, with
+  `state_root_ms` p95 `3ms`.
+- The single-entry flag-on run is useful for leader finish timing, but not a clean 7-node
+  propagation/TPS acceptance run: validators 0-4 advanced and drained, while validators 5/6
+  lagged at height 26 during the run. A follow-up attempt to broadcast the same wave to all
+  7 local pools kept all nodes at the same height but produced no tx-bearing blocks
+  (`ingest accepted=0`, soft-gated), so it was discarded.
+
+Conclusion for the 90k rerun:
+
+- Measurement fix worked: the run now proves the leader can build real 90k transfer blocks.
+- The BLAKE3 prototype removes the tiny measured state-root cost (`3ms -> 0ms`) but does not
+  reduce total finish time; in this sample total finish is slightly higher (`101ms -> 114ms`
+  p95), dominated by block assembly / tx+receipt root work.
+- There is no demonstrated TPS gain worth default-enabling from this prototype. The original
+  devlog-76 `~920ms` simple-transfer post-processing number is not reproduced here; before
+  doing more format work, the next step should be narrower timing inside `assemble_block`
+  (tx root vs receipt root vs header/block construction) or a symbolized profile of the
+  current 90k transfer finish path.
