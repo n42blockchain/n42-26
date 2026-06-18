@@ -191,12 +191,12 @@ impl NodeProcess {
             cmd.env(key, value);
         }
 
-        let stdout_log = std::fs::File::create(&stdout_log_path)
-            .unwrap_or_else(|_| std::fs::File::create("/dev/null").unwrap());
-        let stderr_log = std::fs::File::create(&stderr_log_path)
-            .unwrap_or_else(|_| std::fs::File::create("/dev/null").unwrap());
-        cmd.stdout(Stdio::from(stdout_log))
-            .stderr(Stdio::from(stderr_log));
+        // On failure to open a log file, discard the stream (cross-platform —
+        // `Stdio::null` is `/dev/null` on unix and `NUL` on Windows).
+        let stdout_log = std::fs::File::create(&stdout_log_path).ok();
+        let stderr_log = std::fs::File::create(&stderr_log_path).ok();
+        cmd.stdout(stdout_log.map(Stdio::from).unwrap_or_else(Stdio::null))
+            .stderr(stderr_log.map(Stdio::from).unwrap_or_else(Stdio::null));
 
         info!(
             binary = %config.binary_path.display(),
@@ -284,11 +284,10 @@ impl NodeProcess {
     }
 
     fn log_paths(validator_index: usize, http_port: u16) -> (PathBuf, PathBuf) {
-        let stem = format!("/tmp/n42-node-v{validator_index}-p{http_port}");
-        (
-            PathBuf::from(format!("{stem}.log")),
-            PathBuf::from(format!("{stem}.err.log")),
-        )
+        // Cross-platform temp dir (`/tmp` on unix, `%TEMP%` on Windows).
+        let dir = std::env::temp_dir();
+        let base = format!("n42-node-v{validator_index}-p{http_port}");
+        (dir.join(format!("{base}.log")), dir.join(format!("{base}.err.log")))
     }
 
     /// Reads the last 20 lines of the node's stderr log file for diagnostics.

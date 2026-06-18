@@ -1,0 +1,8 @@
+# Windows MSVC: raise the executable's main-thread stack from the 1 MiB default
+# to 32 MiB. reth's type-level node builder constructs very deep generic types
+# whose startup recursion overflows the default Windows main-thread stack
+# (`STATUS_STACK_OVERFLOW` / 0xc00000fd), even though the same code runs fine on
+# Linux/macOS where the default main-thread stack is 8 MiB. Target-scoped, so it
+# only affects native Windows builds — Linux/macOS CI is untouched.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "link-args=/STACK:33554432"]
