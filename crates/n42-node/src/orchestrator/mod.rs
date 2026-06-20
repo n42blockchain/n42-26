@@ -4,7 +4,7 @@ pub mod observer;
 mod state_mgmt;
 mod view_jump_throttle;
 
-use crate::consensus_state::SharedConsensusState;
+use crate::consensus_state::{PoolDepthSnapshot, SharedConsensusState};
 use crate::el::{ExecutionLayer, RethExecutionLayer};
 use crate::epoch_schedule::EpochSchedule;
 use crate::mobile_reward::MobileRewardManager;
@@ -586,6 +586,13 @@ impl ConsensusOrchestrator {
                 counter!("n42_tx_import_drops_total").increment(1);
             }
         }
+    }
+
+    pub(super) fn pool_depth_snapshot(&self) -> PoolDepthSnapshot {
+        self.consensus_state
+            .as_ref()
+            .map(|state| state.load_pool_depth())
+            .unwrap_or_default()
     }
 
     #[allow(clippy::too_many_arguments)]

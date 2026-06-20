@@ -34,8 +34,10 @@ use reth_ethereum_cli::Cli;
 use reth_ethereum_cli::chainspec::EthereumChainSpecParser;
 use reth_node_core::args::{DefaultEngineValues, DefaultRpcServerArgs};
 use reth_storage_api::{BlockHashReader, BlockNumReader};
+use reth_transaction_pool::TransactionPool;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, Once};
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
@@ -1357,6 +1359,26 @@ fn main() {
                     })
                     .map_err(|e| eyre::eyre!("failed to spawn tx-bridge thread: {e}"))?;
                 info!(target: "n42::cli", "TxPoolBridge started on dedicated runtime");
+
+                // Sample txpool depth into SharedConsensusState so commit/build_start
+                // cadence logs can show whether the leader was actually fed.
+                let pool_for_depth = full_node.pool.clone();
+                let pool_depth_state = consensus_state.clone();
+                let pool_depth_poll_ms = env_parse::<u64>("N42_POOL_DEPTH_POLL_MS")
+                    .unwrap_or(100)
+                    .max(10);
+                task_executor.spawn_critical_task(
+                    "n42-pool-depth-sampler",
+                    Box::pin(async move {
+                        let mut interval =
+                            tokio::time::interval(Duration::from_millis(pool_depth_poll_ms));
+                        loop {
+                            let size = pool_for_depth.pool_size();
+                            pool_depth_state.update_pool_depth(size.pending, size.queued);
+                            interval.tick().await;
+                        }
+                    }),
+                );
 
                 // Binary TCP ingest server for high-speed local TX submission.
                 // Enable with N42_INGEST_PORT=19900. Legacy fallback: N42_INJECT_PORT.

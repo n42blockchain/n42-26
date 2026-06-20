@@ -95,6 +95,8 @@ where
         // Log pool depth before building — key diagnostic for TPS bottleneck analysis.
         let pool_pending = self.pool.pool_size().pending;
         let pool_queued = self.pool.pool_size().queued;
+        self.consensus_state
+            .update_pool_depth(pool_pending, pool_queued);
         metrics::gauge!("n42_pool_pending_at_build").set(pool_pending as f64);
         metrics::gauge!("n42_pool_queued_at_build").set(pool_queued as f64);
 
