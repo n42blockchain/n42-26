@@ -318,8 +318,30 @@ impl ConsensusOrchestrator {
             debug!(target: "n42::cl::exec_bridge", %parent, "build already in progress on this parent, skipping");
             return;
         }
+        let build_start = Instant::now();
+        let should_record_commit_to_build = self.last_commit_hash == Some(parent)
+            && self.commit_to_build_recorded_parent != Some(parent);
+        if should_record_commit_to_build {
+            if let Some(last_commit) = self.last_commit_instant {
+                let commit_to_build_start_ms =
+                    build_start.duration_since(last_commit).as_millis() as u64;
+                metrics::histogram!("n42_commit_to_build_start_ms")
+                    .record(commit_to_build_start_ms as f64);
+                self.commit_to_build_recorded_parent = Some(parent);
+                info!(
+                    target: "n42::cl::exec_bridge",
+                    view = self.engine.current_view(),
+                    %parent,
+                    last_commit_view = self.last_commit_view.unwrap_or_default(),
+                    last_commit_hash = ?self.last_commit_hash,
+                    commit_to_build_start_ms,
+                    async_finalize_fcu = self.async_finalize_fcu,
+                    "N42_CADENCE: commit->build_start"
+                );
+            }
+        }
         self.building_on_parent = Some(parent);
-        self.build_triggered_at = Some(Instant::now());
+        self.build_triggered_at = Some(build_start);
 
         let attrs = self.build_payload_attributes(slot_timestamp);
         let timestamp = attrs.timestamp;
@@ -362,7 +384,7 @@ impl ConsensusOrchestrator {
                         // strictly increasing timestamps even in fast-commit scenarios.
                         self.last_committed_timestamp = self.last_committed_timestamp.max(used_ts);
                         debug!(target: "n42::cl::exec_bridge", ?payload_id, "payload building started, spawning resolve task");
-                        self.spawn_payload_resolve_task(el.clone(), payload_id);
+                        self.spawn_payload_resolve_task(el.clone(), payload_id, build_start);
                     } else {
                         warn!(target: "n42::cl::exec_bridge", "fork_choice_updated did not return payload_id, scheduling retry");
                         // FCU returned SYNCING — reth hasn't caught up yet.
@@ -412,7 +434,12 @@ impl ConsensusOrchestrator {
         self.next_slot_timestamp = None;
     }
 
-    fn spawn_payload_resolve_task(&self, el: Arc<dyn ExecutionLayer>, payload_id: PayloadId) {
+    fn spawn_payload_resolve_task(
+        &self,
+        el: Arc<dyn ExecutionLayer>,
+        payload_id: PayloadId,
+        build_start: Instant,
+    ) {
         let block_ready_tx = self.block_ready_tx.clone();
         let network = self.network.clone();
         let leader_payload_tx = self.leader_payload_tx.clone();
@@ -455,6 +482,7 @@ impl ConsensusOrchestrator {
                         blob_store,
                         eager_import_done_tx,
                         block_guard,
+                        build_start,
                     )
                     .await;
                 }
@@ -571,6 +599,7 @@ impl ConsensusOrchestrator {
             let view = broadcast.view;
             let block_ts = broadcast.timestamp;
             let leader_ready_unix_ms = broadcast.leader_ready_unix_ms;
+            let block_data_received = std::time::Instant::now();
             let eager_done_tx = self.eager_import_done_tx.clone();
             let block_guard = self.eager_import_block_guard.clone();
             let eager_span = tracing::info_span!(
@@ -651,8 +680,11 @@ impl ConsensusOrchestrator {
                         ) =>
                     {
                         let np_elapsed = import_start.elapsed().as_millis() as u64;
+                        let follower_import_ms = block_data_received.elapsed().as_millis() as u64;
                         let ready_to_accept_ms = elapsed_since_unix_ms(leader_ready_unix_ms);
                         note_virtual_block_credit(tx_count, "follower_payload_accepted");
+                        metrics::histogram!("n42_follower_import_ms")
+                            .record(follower_import_ms as f64);
                         if let Some(elapsed) = ready_to_accept_ms {
                             metrics::histogram!("n42_follower_ready_to_accept_ms")
                                 .record(elapsed as f64);
@@ -669,6 +701,7 @@ impl ConsensusOrchestrator {
                             ready_to_compact_inject_ms =
                                 ready_to_compact_inject_ms.unwrap_or_default(),
                             ready_to_accept_ms = ready_to_accept_ms.unwrap_or_default(),
+                            follower_import_ms,
                             "follower eager import: new_payload accepted (no FCU)"
                         );
                         info!(
@@ -681,8 +714,22 @@ impl ConsensusOrchestrator {
                                 ready_to_compact_inject_ms.unwrap_or_default(),
                             ready_to_accept_ms = ready_to_accept_ms.unwrap_or_default(),
                             np_elapsed,
+                            follower_import_ms,
                             compact_injected,
                             "N42_FOLLOWER_PATH: ready->decode->inject->accept"
+                        );
+                        info!(
+                            target: "n42::cl::exec_bridge",
+                            %hash,
+                            view,
+                            compressed_kb = payload_compressed.len() / 1024,
+                            tx_count,
+                            decompress_ms,
+                            deser_ms,
+                            np_elapsed,
+                            follower_import_ms,
+                            compact_injected,
+                            "N42_FOLLOWER_IMPORT: block_data->accepted"
                         );
                         if compact_injected {
                             metrics::counter!("n42_compact_block_cache_hits").increment(1);
@@ -1035,6 +1082,7 @@ async fn handle_built_payload(
     blob_store: Option<DiskFileBlobStore>,
     eager_import_done_tx: mpsc::Sender<(B256, u64)>,
     block_guard: Arc<std::sync::atomic::AtomicU64>,
+    build_start: Instant,
 ) {
     let hash = payload.block().hash();
     {
@@ -1094,6 +1142,7 @@ async fn handle_built_payload(
         block_timestamp,
         execution_output_bytes,
         leader_ready_unix_ms,
+        build_start,
     )
     .await;
     broadcast_blob_sidecars(&network, &payload, hash, current_view, blob_store);
@@ -1172,6 +1221,7 @@ async fn broadcast_block_data(
     timestamp: u64,
     execution_output: Option<Vec<u8>>,
     leader_ready_unix_ms: u64,
+    build_start: Instant,
 ) {
     if payload_json.is_empty() {
         return;
@@ -1207,6 +1257,22 @@ async fn broadcast_block_data(
             return;
         }
     };
+
+    let build_start_to_broadcast_ms = build_start.elapsed().as_millis() as u64;
+    metrics::histogram!("n42_build_start_to_broadcast_ms")
+        .record(build_start_to_broadcast_ms as f64);
+    info!(
+        target: "n42::cl::exec_bridge",
+        %hash,
+        current_view,
+        encoded_kb = encoded.len() / 1024,
+        raw_kb = raw_len / 1024,
+        compressed_kb = compressed_len / 1024,
+        exec_kb,
+        compress_ms,
+        build_start_to_broadcast_ms,
+        "N42_CADENCE: build_start->broadcast"
+    );
 
     // Leader direct push: send to all known validator peers via QUIC unicast.
     // This bypasses GossipSub mesh flooding for large payloads.

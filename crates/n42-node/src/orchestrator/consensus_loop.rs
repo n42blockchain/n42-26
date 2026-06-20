@@ -327,6 +327,25 @@ impl ConsensusOrchestrator {
         commit_qc: QuorumCertificate,
         validator_changes: Option<Vec<n42_primitives::consensus::ValidatorChange>>,
     ) {
+        let commit_now = Instant::now();
+        if let Some(prev_commit) = self.last_commit_instant {
+            let inter_block_commit_ms = commit_now.duration_since(prev_commit).as_millis() as u64;
+            histogram!("n42_inter_block_commit_ms").record(inter_block_commit_ms as f64);
+            info!(
+                target: "n42::cl::consensus_loop",
+                view,
+                %block_hash,
+                prev_view = self.last_commit_view.unwrap_or_default(),
+                prev_hash = ?self.last_commit_hash,
+                inter_block_commit_ms,
+                async_finalize_fcu = self.async_finalize_fcu,
+                "N42_CADENCE: inter-block commit interval"
+            );
+        }
+        self.last_commit_instant = Some(commit_now);
+        self.last_commit_view = Some(view);
+        self.last_commit_hash = Some(block_hash);
+
         self.committed_block_count += 1;
         counter!("n42_blocks_committed_total").increment(1);
         gauge!("n42_consensus_view").set(view as f64);
@@ -342,7 +361,7 @@ impl ConsensusOrchestrator {
 
         // Pipeline: record commit time and emit summary.
         let pipeline_summary = if let Some(mut timing) = self.pipeline_timings.remove(&block_hash) {
-            timing.committed = Some(Instant::now());
+            timing.committed = Some(commit_now);
             timing.emit_metrics();
             Some(timing.summary())
         } else {

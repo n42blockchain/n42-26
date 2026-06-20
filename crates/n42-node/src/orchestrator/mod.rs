@@ -334,6 +334,12 @@ pub struct ConsensusOrchestrator {
     /// through the orchestrator. Logged and emitted as metrics at commit time.
     /// Bounded to 32 entries; older entries are evicted.
     pipeline_timings: HashMap<B256, PipelineTiming>,
+    /// Last local consensus commit wall-clock. Used for inter-block cadence metrics.
+    last_commit_instant: Option<Instant>,
+    last_commit_view: Option<u64>,
+    last_commit_hash: Option<B256>,
+    /// Last committed parent for which commit->build_start has already been recorded.
+    commit_to_build_recorded_parent: Option<B256>,
     /// Guards follower eager import: tracks the last block number sent to reth
     /// via new_payload. Prevents multiple eager imports for the same block number
     /// with different hashes, which triggers reth pipeline sync and chain stalls.
@@ -486,6 +492,10 @@ impl ConsensusOrchestrator {
             epoch_schedule: None,
             tx_forward_buffer: Vec::new(),
             pipeline_timings: HashMap::new(),
+            last_commit_instant: None,
+            last_commit_view: None,
+            last_commit_hash: None,
+            commit_to_build_recorded_parent: None,
             eager_import_block_guard: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             fast_propose: std::env::var("N42_FAST_PROPOSE")
                 .ok()
@@ -675,6 +685,10 @@ impl ConsensusOrchestrator {
             epoch_schedule: None,
             tx_forward_buffer: Vec::new(),
             pipeline_timings: HashMap::new(),
+            last_commit_instant: None,
+            last_commit_view: None,
+            last_commit_hash: None,
+            commit_to_build_recorded_parent: None,
             eager_import_block_guard: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             fast_propose,
             async_finalize_fcu,
