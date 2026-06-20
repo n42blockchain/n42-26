@@ -194,6 +194,12 @@ Rewards are injected as `Withdrawal` entries in `PayloadAttributes` — no trans
 | Cache Hit Fast Path | **90,949** | 90K | Peak single-block TPS |
 | 2s Slot + All Optimizations | **13,858** | 48K | Production-like timing |
 
+Latest cadence follow-up: [devlog-82](docs/devlog-82-continuous-cadence.md)
+uses continuous per-node ingest with repeated 90K blocks. It reached 67.7K
+active-block TPS and 90K max block TPS, but wall sustained TPS over 90.3s was
+13.5K because remaining gaps are view-timeout/cadence stalls plus a leader
+build/broadcast path near the 2s slot budget.
+
 ### Key Optimizations
 
 | Optimization | Impact |
