@@ -328,6 +328,7 @@ impl ConsensusOrchestrator {
         validator_changes: Option<Vec<n42_primitives::consensus::ValidatorChange>>,
     ) {
         let commit_now = Instant::now();
+        let pool_depth = self.pool_depth_snapshot();
         if let Some(prev_commit) = self.last_commit_instant {
             let inter_block_commit_ms = commit_now.duration_since(prev_commit).as_millis() as u64;
             histogram!("n42_inter_block_commit_ms").record(inter_block_commit_ms as f64);
@@ -338,6 +339,8 @@ impl ConsensusOrchestrator {
                 prev_view = self.last_commit_view.unwrap_or_default(),
                 prev_hash = ?self.last_commit_hash,
                 inter_block_commit_ms,
+                pool_pending = pool_depth.pending,
+                pool_queued = pool_depth.queued,
                 async_finalize_fcu = self.async_finalize_fcu,
                 "N42_CADENCE: inter-block commit interval"
             );
@@ -349,6 +352,17 @@ impl ConsensusOrchestrator {
         self.committed_block_count += 1;
         counter!("n42_blocks_committed_total").increment(1);
         gauge!("n42_consensus_view").set(view as f64);
+        gauge!("n42_pool_pending_at_commit").set(pool_depth.pending as f64);
+        gauge!("n42_pool_queued_at_commit").set(pool_depth.queued as f64);
+        info!(
+            target: "n42::cl::consensus_loop",
+            view,
+            %block_hash,
+            pool_pending = pool_depth.pending,
+            pool_queued = pool_depth.queued,
+            async_finalize_fcu = self.async_finalize_fcu,
+            "N42_POOL_AT_COMMIT"
+        );
         let elapsed = self.view_started_at.take().map(|t| t.elapsed());
         let elapsed_ms = elapsed.map(|d| d.as_millis() as u64);
         if let Some(ms) = elapsed_ms {
