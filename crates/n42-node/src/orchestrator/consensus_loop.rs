@@ -921,6 +921,7 @@ impl ConsensusOrchestrator {
 
     async fn handle_view_changed(&mut self, new_view: u64) {
         counter!("n42_view_changes_total").increment(1);
+        self.record_timeout_diag_view_changed(new_view);
         self.view_started_at = Some(tokio::time::Instant::now());
         // Note: building_on_parent is NOT cleared here. It's keyed on parent hash,
         // not view number. If a build is in-flight for the current parent, it should
