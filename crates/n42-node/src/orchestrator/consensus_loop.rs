@@ -34,7 +34,8 @@ impl ConsensusOrchestrator {
 
     /// Schedules the next payload build, skipping if recent blocks are empty.
     pub(super) async fn schedule_payload_build(&mut self) {
-        if self.recent_blocks_empty()
+        if !crate::batch_transfer::fastlane_enabled()
+            && self.recent_blocks_empty()
             && self.consecutive_empty_skips < max_consecutive_empty_skips()
         {
             self.consecutive_empty_skips += 1;
@@ -84,7 +85,11 @@ impl ConsensusOrchestrator {
                 if self.fast_propose {
                     info!(target: "n42::cl::consensus_loop", "fast propose: triggering immediate payload build");
                 }
-                self.do_trigger_payload_build(None).await;
+                if crate::batch_transfer::fastlane_enabled() {
+                    self.do_trigger_batch_transfer_build().await;
+                } else {
+                    self.do_trigger_payload_build(None).await;
+                }
             }
         } else {
             let (slot_ts, delay) = self.next_slot_boundary();
@@ -329,16 +334,18 @@ impl ConsensusOrchestrator {
     ) {
         let commit_now = Instant::now();
         let pool_depth = self.pool_depth_snapshot();
+        let mut inter_block_commit_ms = None;
         if let Some(prev_commit) = self.last_commit_instant {
-            let inter_block_commit_ms = commit_now.duration_since(prev_commit).as_millis() as u64;
-            histogram!("n42_inter_block_commit_ms").record(inter_block_commit_ms as f64);
+            let elapsed_ms = commit_now.duration_since(prev_commit).as_millis() as u64;
+            inter_block_commit_ms = Some(elapsed_ms);
+            histogram!("n42_inter_block_commit_ms").record(elapsed_ms as f64);
             info!(
                 target: "n42::cl::consensus_loop",
                 view,
                 %block_hash,
                 prev_view = self.last_commit_view.unwrap_or_default(),
                 prev_hash = ?self.last_commit_hash,
-                inter_block_commit_ms,
+                inter_block_commit_ms = elapsed_ms,
                 pool_pending = pool_depth.pending,
                 pool_queued = pool_depth.queued,
                 async_finalize_fcu = self.async_finalize_fcu,
@@ -456,6 +463,57 @@ impl ConsensusOrchestrator {
         // updater can see the local block data even when reth already has the
         // block in its engine tree.
         self.drain_leader_payload_rx(&[block_hash]);
+
+        let batch_transfer_commit = self
+            .pending_block_data
+            .get(&block_hash)
+            .and_then(|data| {
+                Self::decode_block_data_broadcast(block_hash, data, "batch_transfer_commit")
+            })
+            .and_then(|broadcast| {
+                broadcast.batch_transfer.as_ref().map(|bytes| {
+                    (
+                        broadcast.batch_transfer_count,
+                        bytes.len(),
+                        broadcast.leader_ready_unix_ms,
+                    )
+                })
+            });
+
+        if let Some((transfers, encoded_bytes, leader_ready_unix_ms)) = batch_transfer_commit {
+            let commit_interval_ms = inter_block_commit_ms.unwrap_or_default();
+            let transfer_tps = if commit_interval_ms > 0 {
+                transfers as f64 * 1000.0 / commit_interval_ms as f64
+            } else {
+                0.0
+            };
+            if commit_interval_ms > 0 {
+                histogram!("n42_batch_transfer_commit_interval_ms")
+                    .record(commit_interval_ms as f64);
+                histogram!("n42_batch_transfer_tps").record(transfer_tps);
+            }
+            counter!("n42_batch_transfer_transfers_committed_total").increment(transfers);
+            info!(
+                target: "n42::batch_transfer",
+                view,
+                %block_hash,
+                transfers,
+                encoded_kb = encoded_bytes / 1024,
+                bytes_per_transfer = format_args!("{:.3}", encoded_bytes as f64 / transfers.max(1) as f64),
+                commit_interval_ms,
+                transfer_tps = format_args!("{:.0}", transfer_tps),
+                leader_ready_unix_ms,
+                "N42_BATCH_TRANSFER_COMMIT"
+            );
+            self.pending_block_data.clear();
+            self.pending_executions.clear();
+            self.pending_finalization = None;
+            self.save_consensus_state();
+            if self.engine.is_current_leader() {
+                self.schedule_payload_build().await;
+            }
+            return;
+        }
 
         // State-tree background update: extract BundleState from pending block
         // data once, then feed the enabled sidecar tree(s).

@@ -44,6 +44,8 @@ alloy-eips.workspace = true
 alloy-primitives.workspace = true
 alloy-rlp.workspace = true
 alloy-rpc-types-engine.workspace = true
+alloy-signer.workspace = true
+alloy-signer-local.workspace = true
 
 reth-ethereum-payload-builder.workspace = true
 reth-basic-payload-builder.workspace = true

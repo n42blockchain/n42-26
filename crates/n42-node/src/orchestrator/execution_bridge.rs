@@ -1,6 +1,7 @@
 use super::{
     BlobSidecarBroadcast, BlockDataBroadcast, CompactBlockExecution, ConsensusOrchestrator,
 };
+use crate::batch_transfer;
 use crate::el::ExecutionLayer;
 use crate::ingest::note_virtual_block_credit;
 use crate::now_unix_ms;
@@ -30,6 +31,15 @@ pub(super) fn compact_block_enabled() -> bool {
     *ENABLED.get_or_init(|| {
         std::env::var("N42_COMPACT_BLOCK")
             .map(|v| v != "0")
+            .unwrap_or(true)
+    })
+}
+
+fn batch_transfer_gossip_fallback_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("N42_BATCH_TRANSFER_GOSSIP_FALLBACK")
+            .map(|value| value != "0")
             .unwrap_or(true)
     })
 }
@@ -431,6 +441,105 @@ impl ConsensusOrchestrator {
         }
     }
 
+    pub(super) async fn do_trigger_batch_transfer_build(&mut self) {
+        let parent = self.head_block_hash;
+        if let Some(building_parent) = self.building_on_parent
+            && building_parent == parent
+        {
+            debug!(target: "n42::cl::exec_bridge", %parent, "batch-transfer build already in progress on this parent, skipping");
+            return;
+        }
+
+        let build_start = Instant::now();
+        let pool_depth = self.pool_depth_snapshot();
+        metrics::gauge!("n42_pool_pending_at_build_start").set(pool_depth.pending as f64);
+        metrics::gauge!("n42_pool_queued_at_build_start").set(pool_depth.queued as f64);
+        info!(
+            target: "n42::cl::exec_bridge",
+            view = self.engine.current_view(),
+            %parent,
+            pool_pending = pool_depth.pending,
+            pool_queued = pool_depth.queued,
+            "N42_POOL_AT_BUILD_START"
+        );
+        let should_record_commit_to_build = self.last_commit_hash == Some(parent)
+            && self.commit_to_build_recorded_parent != Some(parent);
+        if should_record_commit_to_build && let Some(last_commit) = self.last_commit_instant {
+            let commit_to_build_start_ms =
+                build_start.duration_since(last_commit).as_millis() as u64;
+            metrics::histogram!("n42_commit_to_build_start_ms")
+                .record(commit_to_build_start_ms as f64);
+            self.commit_to_build_recorded_parent = Some(parent);
+            info!(
+                target: "n42::cl::exec_bridge",
+                view = self.engine.current_view(),
+                %parent,
+                last_commit_view = self.last_commit_view.unwrap_or_default(),
+                commit_to_build_start_ms,
+                pool_pending = pool_depth.pending,
+                pool_queued = pool_depth.queued,
+                "N42_CADENCE: commit->build_start"
+            );
+        }
+
+        self.building_on_parent = Some(parent);
+        self.build_triggered_at = Some(build_start);
+
+        let block_number = self.committed_block_count.saturating_add(1);
+        let (hash, batch_bytes, stats) = match batch_transfer::build_block(block_number) {
+            Ok(result) => result,
+            Err(error) => {
+                error!(target: "n42::batch_transfer", error = %error, "failed to build batch-transfer block");
+                self.building_on_parent = None;
+                self.build_triggered_at = None;
+                self.schedule_build_retry();
+                return;
+            }
+        };
+
+        metrics::histogram!("n42_batch_transfer_build_ms").record(stats.build_ms as f64);
+        metrics::histogram!("n42_batch_transfer_encoded_bytes").record(stats.encoded_bytes as f64);
+        info!(
+            target: "n42::batch_transfer",
+            %hash,
+            view = self.engine.current_view(),
+            block_number = stats.block_number,
+            senders = stats.senders,
+            transfers_per_sender = stats.transfers_per_sender,
+            transfers = stats.transfers,
+            encoded_kb = stats.encoded_bytes / 1024,
+            bytes_per_transfer = format_args!("{:.3}", stats.bytes_per_transfer),
+            build_ms = stats.build_ms,
+            block_hash_ms = stats.block_hash_ms,
+            "N42_BATCH_TRANSFER_BUILD"
+        );
+
+        let leader_ready_unix_ms = now_unix_ms();
+        let broadcast = BlockDataBroadcast {
+            block_hash: hash,
+            view: self.engine.current_view(),
+            payload_json: Vec::new(),
+            timestamp: leader_ready_unix_ms / 1000,
+            execution_output: None,
+            leader_ready_unix_ms,
+            batch_transfer: Some(batch_bytes),
+            batch_transfer_count: stats.transfers,
+        };
+        broadcast_batch_transfer_data(
+            &self.network,
+            &self.leader_payload_tx,
+            broadcast,
+            build_start,
+        )
+        .await;
+
+        if self.block_ready_tx.send(hash).await.is_err() {
+            debug!(target: "n42::cl::exec_bridge", %hash, "block_ready receiver dropped");
+            self.building_on_parent = None;
+            self.build_triggered_at = None;
+        }
+    }
+
     /// Schedules a delayed build retry when FCU returns SYNCING or no payload_id.
     ///
     /// Uses the existing `next_build_at` / build_timer mechanism in the main select! loop.
@@ -580,6 +689,48 @@ impl ConsensusOrchestrator {
             self.last_committed_timestamp = self.last_committed_timestamp.max(broadcast.timestamp);
         }
 
+        let is_batch_transfer = broadcast.batch_transfer.is_some();
+        if let Some(batch_bytes) = broadcast.batch_transfer.as_ref() {
+            let verify_start = std::time::Instant::now();
+            match batch_transfer::verify_apply_block(batch_bytes, hash) {
+                Ok(stats) => {
+                    let wall_ms = verify_start.elapsed().as_millis() as u64;
+                    metrics::histogram!("n42_batch_transfer_verify_apply_ms")
+                        .record(stats.total_verify_apply_ms as f64);
+                    metrics::histogram!("n42_batch_transfer_receive_to_ready_ms")
+                        .record(wall_ms as f64);
+                    info!(
+                        target: "n42::batch_transfer",
+                        %hash,
+                        view = broadcast.view,
+                        block_number = stats.block_number,
+                        senders = stats.senders,
+                        transfers = stats.transfers,
+                        encoded_kb = stats.encoded_bytes / 1024,
+                        bytes_per_transfer = format_args!("{:.3}", stats.bytes_per_transfer),
+                        block_hash_ms = stats.block_hash_ms,
+                        decode_ms = stats.decode_ms,
+                        record_hash_ms = stats.record_hash_ms,
+                        recover_ms = stats.recover_ms,
+                        apply_ms = stats.apply_ms,
+                        total_verify_apply_ms = stats.total_verify_apply_ms,
+                        wall_ms,
+                        "N42_BATCH_TRANSFER_VERIFY"
+                    );
+                }
+                Err(error) => {
+                    warn!(
+                        target: "n42::batch_transfer",
+                        %hash,
+                        view = broadcast.view,
+                        error = %error,
+                        "invalid batch-transfer block"
+                    );
+                    return;
+                }
+            }
+        }
+
         let pending_finalization_hash = self
             .pending_finalization
             .as_ref()
@@ -601,6 +752,10 @@ impl ConsensusOrchestrator {
             .process_event(ConsensusEvent::BlockImported(hash))
         {
             error!(target: "n42::cl::exec_bridge", error = %e, "error processing BlockImported for deferred execution");
+        }
+
+        if is_batch_transfer {
+            return;
         }
 
         // Follower eager import: start new_payload + fcu in parallel with consensus voting.
@@ -1263,6 +1418,8 @@ async fn broadcast_block_data(
         timestamp,
         execution_output,
         leader_ready_unix_ms,
+        batch_transfer: None,
+        batch_transfer_count: 0,
     };
     let encoded = match bincode::serialize(&broadcast) {
         Ok(enc) => enc,
@@ -1341,6 +1498,105 @@ async fn broadcast_block_data(
 
     if leader_payload_tx.send((hash, encoded)).await.is_err() {
         debug!(target: "n42::cl::exec_bridge", %hash, "leader payload feedback receiver dropped");
+    }
+}
+
+async fn broadcast_batch_transfer_data(
+    network: &NetworkHandle,
+    leader_payload_tx: &mpsc::Sender<(B256, Vec<u8>)>,
+    broadcast: BlockDataBroadcast,
+    build_start: Instant,
+) {
+    let hash = broadcast.block_hash;
+    let current_view = broadcast.view;
+    let transfers = broadcast.batch_transfer_count;
+    let raw_kb = broadcast
+        .batch_transfer
+        .as_ref()
+        .map_or(0, |bytes| bytes.len() / 1024);
+    let encoded = match bincode::serialize(&broadcast) {
+        Ok(enc) => enc,
+        Err(error) => {
+            error!(target: "n42::batch_transfer", error = %error, "failed to serialize batch-transfer broadcast");
+            return;
+        }
+    };
+
+    let build_start_to_broadcast_ms = build_start.elapsed().as_millis() as u64;
+    metrics::histogram!("n42_build_start_to_broadcast_ms")
+        .record(build_start_to_broadcast_ms as f64);
+    info!(
+        target: "n42::batch_transfer",
+        %hash,
+        current_view,
+        transfers,
+        raw_kb,
+        encoded_kb = encoded.len() / 1024,
+        build_start_to_broadcast_ms,
+        "N42_BATCH_TRANSFER_BROADCAST_READY"
+    );
+
+    let validator_peers = network.all_validator_peers();
+    let direct_count = validator_peers.len();
+    let send_start = std::time::Instant::now();
+    for (idx, peer_id) in &validator_peers {
+        if let Err(error) = network
+            .send_block_direct_reliable(*peer_id, encoded.clone())
+            .await
+        {
+            warn!(
+                target: "n42::batch_transfer",
+                validator_index = idx,
+                %peer_id,
+                error = %error,
+                "failed to send batch-transfer block to validator peer"
+            );
+        }
+    }
+    let send_ms = send_start.elapsed().as_millis() as u64;
+    info!(
+        target: "n42::batch_transfer",
+        %hash,
+        encoded_kb = encoded.len() / 1024,
+        direct_count,
+        send_ms,
+        "N42_BATCH_TRANSFER_DIRECT_PUSH"
+    );
+
+    let gossip_enabled = batch_transfer_gossip_fallback_enabled();
+    let gossip_start = std::time::Instant::now();
+    if gossip_enabled {
+        if let Err(error) = network.announce_block_reliable(encoded.clone()).await {
+            warn!(target: "n42::batch_transfer", error = %error, "failed to broadcast batch-transfer block via gossipsub");
+        }
+    } else {
+        info!(
+            target: "n42::batch_transfer",
+            %hash,
+            encoded_kb = encoded.len() / 1024,
+            direct_peers = direct_count,
+            "N42_BATCH_TRANSFER_GOSSIP_SKIPPED"
+        );
+    }
+    let gossip_ms = if gossip_enabled {
+        gossip_start.elapsed().as_millis() as u64
+    } else {
+        0
+    };
+    info!(
+        target: "n42::batch_transfer",
+        %hash,
+        encoded_kb = encoded.len() / 1024,
+        direct_peers = direct_count,
+        send_ms,
+        gossip_ms,
+        gossip_enabled,
+        total_broadcast_ms = send_ms + gossip_ms,
+        "N42_BATCH_TRANSFER_BROADCAST"
+    );
+
+    if leader_payload_tx.send((hash, encoded)).await.is_err() {
+        debug!(target: "n42::batch_transfer", %hash, "leader batch-transfer feedback receiver dropped");
     }
 }
 

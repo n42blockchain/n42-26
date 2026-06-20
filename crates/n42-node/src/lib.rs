@@ -1,4 +1,5 @@
 pub mod attestation_store;
+pub(crate) mod batch_transfer;
 mod components;
 pub mod consensus_state;
 pub mod el;

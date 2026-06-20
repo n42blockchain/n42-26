@@ -658,6 +658,11 @@ start_validators() {
 # ---------------------------------------------------------------------------
 
 wait_for_blocks() {
+    if [[ "${N42_SKIP_WAIT_FOR_BLOCKS:-0}" == "1" ]]; then
+        log "Skipping eth_blockNumber wait (N42_SKIP_WAIT_FOR_BLOCKS=1)."
+        return
+    fi
+
     log "Waiting for block production (up to ${MAX_BLOCK_WAIT}s)..."
     local waited=0
     while [[ $waited -lt $MAX_BLOCK_WAIT ]]; do

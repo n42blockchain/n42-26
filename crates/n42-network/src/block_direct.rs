@@ -12,6 +12,18 @@ pub const BLOCK_DIRECT_PROTOCOL: &str = "/n42/block-direct/1";
 /// Maximum block direct message size (16 MB — sufficient for large execution payloads).
 const MAX_BLOCK_DIRECT_SIZE: usize = 16 * 1024 * 1024;
 
+fn max_block_direct_size() -> usize {
+    static MAX_SIZE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MAX_SIZE.get_or_init(|| {
+        std::env::var("N42_BLOCK_DIRECT_MAX_MB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|mb| *mb > 0)
+            .map(|mb| mb.saturating_mul(1024 * 1024))
+            .unwrap_or(MAX_BLOCK_DIRECT_SIZE)
+    })
+}
+
 /// Request: carries serialized block data from leader to follower.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BlockDirectRequest {
@@ -45,7 +57,7 @@ impl request_response::Codec for BlockDirectCodec {
         'life2: 'async_trait,
         Self: 'async_trait,
     {
-        Box::pin(codec::read_length_prefixed(io, MAX_BLOCK_DIRECT_SIZE))
+        Box::pin(codec::read_length_prefixed(io, max_block_direct_size()))
     }
 
     fn read_response<'life0, 'life1, 'life2, 'async_trait, T>(
@@ -60,7 +72,7 @@ impl request_response::Codec for BlockDirectCodec {
         'life2: 'async_trait,
         Self: 'async_trait,
     {
-        Box::pin(codec::read_length_prefixed(io, MAX_BLOCK_DIRECT_SIZE))
+        Box::pin(codec::read_length_prefixed(io, max_block_direct_size()))
     }
 
     fn write_request<'life0, 'life1, 'life2, 'async_trait, T>(
@@ -76,7 +88,9 @@ impl request_response::Codec for BlockDirectCodec {
         'life2: 'async_trait,
         Self: 'async_trait,
     {
-        Box::pin(async move { codec::write_length_prefixed(io, &req, MAX_BLOCK_DIRECT_SIZE).await })
+        Box::pin(
+            async move { codec::write_length_prefixed(io, &req, max_block_direct_size()).await },
+        )
     }
 
     fn write_response<'life0, 'life1, 'life2, 'async_trait, T>(
@@ -92,6 +106,8 @@ impl request_response::Codec for BlockDirectCodec {
         'life2: 'async_trait,
         Self: 'async_trait,
     {
-        Box::pin(async move { codec::write_length_prefixed(io, &res, MAX_BLOCK_DIRECT_SIZE).await })
+        Box::pin(
+            async move { codec::write_length_prefixed(io, &res, max_block_direct_size()).await },
+        )
     }
 }

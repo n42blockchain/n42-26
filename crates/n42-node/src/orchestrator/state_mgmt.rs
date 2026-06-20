@@ -351,6 +351,8 @@ impl ConsensusOrchestrator {
                 timestamp: 0,
                 execution_output: None,
                 leader_ready_unix_ms: 0,
+                batch_transfer: None,
+                batch_transfer_count: 0,
             };
 
             self.import_and_notify(broadcast).await;

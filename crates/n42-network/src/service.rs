@@ -42,6 +42,15 @@ fn command_send_timeout() -> Duration {
     })
 }
 
+fn block_direct_accept_expected_peers() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("N42_BLOCK_DIRECT_ACCEPT_EXPECTED")
+            .map(|value| value != "0")
+            .unwrap_or(false)
+    })
+}
+
 #[derive(Default)]
 struct RecentBlockAnnouncementDedup {
     order: VecDeque<B256>,
@@ -1273,6 +1282,26 @@ impl NetworkService {
         }
     }
 
+    fn block_direct_validator_index(&self, peer: &PeerId) -> Option<(u32, &'static str)> {
+        if let Some(&validator_idx) = self.authenticated_peer_validator_map.get(peer) {
+            return Some((validator_idx, "authenticated"));
+        }
+
+        if !block_direct_accept_expected_peers() {
+            return None;
+        }
+
+        if let Some(&validator_idx) = self.peer_validator_map.get(peer) {
+            return Some((validator_idx, "expected-known"));
+        }
+
+        self.expected_validator_peer_ids
+            .iter()
+            .find_map(|(validator_idx, expected_peer)| {
+                (expected_peer == peer).then_some((*validator_idx, "expected-config"))
+            })
+    }
+
     fn handle_block_direct_event(
         &mut self,
         event: libp2p::request_response::Event<BlockDirectRequest, BlockDirectResponse>,
@@ -1286,14 +1315,20 @@ impl NetworkService {
                     let bytes = request.data.len();
                     // Accept direct push only from peers that have already proved
                     // control of a current validator key via a signed consensus message.
-                    if let Some(&validator_idx) = self.authenticated_peer_validator_map.get(&peer) {
-                        tracing::debug!(%peer, validator_index = validator_idx, bytes, "received block via direct push from validator");
+                    // Benchmark/testnet runs can opt into accepting deterministic expected
+                    // validator PeerIds to remove the startup authentication race from large
+                    // sidecar throughput measurements.
+                    if let Some((validator_idx, auth_source)) =
+                        self.block_direct_validator_index(&peer)
+                    {
+                        tracing::debug!(%peer, validator_index = validator_idx, auth_source, bytes, "received block via direct push from validator");
                         let is_duplicate =
                             self.observe_block_announcement(&request.data, "block_direct");
                         if is_duplicate {
                             tracing::info!(
                                 %peer,
                                 validator_index = validator_idx,
+                                auth_source,
                                 dedup_source = "block_direct",
                                 bytes,
                                 "N42_DUP_BLOCK_ANNOUNCEMENT_RAW: dropped duplicate block announcement"

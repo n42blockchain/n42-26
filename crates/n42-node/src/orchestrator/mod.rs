@@ -79,6 +79,12 @@ pub(crate) struct BlockDataBroadcast {
     /// for broadcast. Used only for cross-task timing diagnostics.
     #[serde(default)]
     pub(crate) leader_ready_unix_ms: u64,
+    /// Benchmark-only batch-transfer sidecar. Enabled only with
+    /// `N42_BATCH_TRANSFER_FASTLANE=1`; normal execution payloads leave this empty.
+    #[serde(default)]
+    pub(crate) batch_transfer: Option<Vec<u8>>,
+    #[serde(default)]
+    pub(crate) batch_transfer_count: u64,
 }
 
 /// Serializable proxy for `(BlockExecutionOutput<Receipt>, Vec<Address>)`.
@@ -1062,7 +1068,11 @@ impl ConsensusOrchestrator {
                         info!(target: "n42::cl::orchestrator", slot_timestamp = ?slot_ts, "slot boundary reached, triggering payload build");
                     }
 
-                    self.do_trigger_payload_build(slot_ts).await;
+                    if crate::batch_transfer::fastlane_enabled() {
+                        self.do_trigger_batch_transfer_build().await;
+                    } else {
+                        self.do_trigger_payload_build(slot_ts).await;
+                    }
                 }
 
                 // === Priority 9: TX forwarding (lowest priority) ===

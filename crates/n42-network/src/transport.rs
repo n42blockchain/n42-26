@@ -185,13 +185,19 @@ pub fn build_swarm_with_validator_index(
     config: TransportConfig,
     validator_index: Option<u32>,
 ) -> eyre::Result<Swarm<N42Behaviour>> {
+    let block_gossip_max_bytes = std::env::var("N42_GOSSIP_BLOCK_MAX_MB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|mb| *mb > 0)
+        .map(|mb| mb.saturating_mul(1024 * 1024))
+        .unwrap_or(8 * 1024 * 1024);
     let gossipsub_config = gossipsub::ConfigBuilder::default()
         .heartbeat_interval(config.heartbeat_interval)
         // Permissive: messages forwarded automatically after delivery.
         // Application-level validation is in handle_gossipsub_message.
         .validation_mode(gossipsub::ValidationMode::Permissive)
-        // 8MB max: high-throughput blocks can reach several MB.
-        .max_transmit_size(8 * 1024 * 1024)
+        // 8MB default; benchmarks can raise via N42_GOSSIP_BLOCK_MAX_MB.
+        .max_transmit_size(block_gossip_max_bytes)
         .mesh_n(config.mesh_d)
         .mesh_n_low(config.mesh_d_low)
         .mesh_n_high(config.mesh_d_high)

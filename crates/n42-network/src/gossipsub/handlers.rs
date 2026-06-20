@@ -60,6 +60,18 @@ pub fn message_id_fn(message: &Message) -> MessageId {
     MessageId::from(keccak256(&data).as_slice().to_vec())
 }
 
+fn max_block_gossip_size() -> usize {
+    static MAX_SIZE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MAX_SIZE.get_or_init(|| {
+        std::env::var("N42_GOSSIP_BLOCK_MAX_MB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|mb| *mb > 0)
+            .map(|mb| mb.saturating_mul(1024 * 1024))
+            .unwrap_or(8 * 1024 * 1024)
+    })
+}
+
 /// Validates a gossipsub message before forwarding.
 ///
 /// Performs lightweight structural checks:
@@ -84,7 +96,7 @@ pub fn validate_message(
     // Block data can reach several MB; consensus messages are small (~130-500 bytes).
     // Mempool transactions capped at 128KB; blob sidecars at 1MB.
     let max_size = if topic == block_topic_hash {
-        8 * 1024 * 1024 // 8MB for high-throughput block data
+        max_block_gossip_size()
     } else if topic == blob_sidecar_topic_hash {
         1024 * 1024 // 1MB for blob sidecars
     } else if topic == mempool_topic_hash {

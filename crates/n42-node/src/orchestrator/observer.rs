@@ -549,6 +549,8 @@ impl ObserverOrchestrator {
                 timestamp: 0,
                 execution_output: None,
                 leader_ready_unix_ms: 0,
+                batch_transfer: None,
+                batch_transfer_count: 0,
             };
 
             // Import directly — no serialize/deserialize round-trip
