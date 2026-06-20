@@ -319,6 +319,18 @@ impl ConsensusOrchestrator {
             return;
         }
         let build_start = Instant::now();
+        let pool_depth = self.pool_depth_snapshot();
+        metrics::gauge!("n42_pool_pending_at_build_start").set(pool_depth.pending as f64);
+        metrics::gauge!("n42_pool_queued_at_build_start").set(pool_depth.queued as f64);
+        info!(
+            target: "n42::cl::exec_bridge",
+            view = self.engine.current_view(),
+            %parent,
+            pool_pending = pool_depth.pending,
+            pool_queued = pool_depth.queued,
+            async_finalize_fcu = self.async_finalize_fcu,
+            "N42_POOL_AT_BUILD_START"
+        );
         let should_record_commit_to_build = self.last_commit_hash == Some(parent)
             && self.commit_to_build_recorded_parent != Some(parent);
         if should_record_commit_to_build {
@@ -335,6 +347,8 @@ impl ConsensusOrchestrator {
                     last_commit_view = self.last_commit_view.unwrap_or_default(),
                     last_commit_hash = ?self.last_commit_hash,
                     commit_to_build_start_ms,
+                    pool_pending = pool_depth.pending,
+                    pool_queued = pool_depth.queued,
                     async_finalize_fcu = self.async_finalize_fcu,
                     "N42_CADENCE: commit->build_start"
                 );

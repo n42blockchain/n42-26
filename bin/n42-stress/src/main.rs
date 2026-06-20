@@ -15,11 +15,12 @@
 
 use alloy_consensus::{SignableTransaction, TxEip1559};
 use alloy_eips::eip2718::Encodable2718;
-use alloy_primitives::{Address, Bytes, TxKind, U256};
+use alloy_primitives::{Address, B256, Bytes, Signature, TxKind, U256};
 use alloy_signer::SignerSync;
 use alloy_signer_local::PrivateKeySigner;
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use eyre::Result;
+use std::hint::black_box;
 use std::io::{BufReader, BufWriter, Read as IoRead, Write as IoWrite};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -107,6 +108,12 @@ struct Cli {
     #[arg(long, default_value = "0")]
     wave: u64,
 
+    /// Synchronized TCP ingest mode for --wave tests.
+    /// auto preserves the old behavior. per-node-continuous keeps feeding each
+    /// ingest endpoint for the full duration and does not wait for pool drain.
+    #[arg(long, value_enum, default_value = "auto")]
+    sync_ingest_mode: SyncIngestMode,
+
     /// Binary TCP ingest endpoints (comma-separated host:port).
     /// Uses a local high-throughput submission path instead of JSON-RPC.
     /// Usage: --ingest 127.0.0.1:19900,127.0.0.1:19901,... --presign-load txdata.bin
@@ -144,6 +151,34 @@ struct Cli {
         default_value = "http://127.0.0.1:18545,http://127.0.0.1:18546,http://127.0.0.1:18547,http://127.0.0.1:18548,http://127.0.0.1:18549,http://127.0.0.1:18550,http://127.0.0.1:18551"
     )]
     rpc: String,
+
+    /// Offline benchmark for a compressed one-signature-per-sender batch transfer lane.
+    #[arg(long)]
+    batch_transfer_bench: bool,
+
+    /// Number of sender batches in --batch-transfer-bench.
+    #[arg(long, default_value = "512")]
+    batch_transfer_senders: usize,
+
+    /// Transfers per sender batch in --batch-transfer-bench.
+    #[arg(long, default_value = "10000")]
+    batch_transfer_per_sender: usize,
+
+    /// Number of timed decode/apply iterations in --batch-transfer-bench.
+    #[arg(long, default_value = "3")]
+    batch_transfer_iters: usize,
+
+    /// Number of per-tx ecrecover samples used for baseline estimation.
+    #[arg(long, default_value = "100000")]
+    batch_transfer_recover_samples: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum SyncIngestMode {
+    Auto,
+    PerNodeDrain,
+    PerNodeContinuous,
+    GlobalWave,
 }
 
 const CHAIN_ID: u64 = 4242;
@@ -257,6 +292,271 @@ fn create_accounts(count: usize, num_rpcs: usize) -> Vec<Arc<TestAccount>> {
             })
         })
         .collect()
+}
+
+const BATCH_TRANSFER_RECORD_BYTES: usize = 12;
+const BATCH_TRANSFER_HEADER_BYTES: usize = 8 + 4 + 65;
+const BATCH_TRANSFER_DOMAIN: &[u8] = b"N42_BATCH_TRANSFER_V0";
+
+fn batch_transfer_prehash(
+    chain_id: u64,
+    block_number: u64,
+    start_nonce: u64,
+    count: u32,
+    records: &[u8],
+) -> B256 {
+    let records_hash = blake3::hash(records);
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(BATCH_TRANSFER_DOMAIN);
+    hasher.update(&chain_id.to_le_bytes());
+    hasher.update(&block_number.to_le_bytes());
+    hasher.update(&start_nonce.to_le_bytes());
+    hasher.update(&count.to_le_bytes());
+    hasher.update(records_hash.as_bytes());
+    B256::from_slice(hasher.finalize().as_bytes())
+}
+
+fn push_batch_transfer_records(buf: &mut Vec<u8>, sender_idx: usize, transfers: usize) {
+    for i in 0..transfers {
+        let recipient_index = ((sender_idx * transfers + i) as u32).wrapping_mul(2_654_435_761);
+        let amount = TRANSFER_VALUE as u64;
+        buf.extend_from_slice(&recipient_index.to_le_bytes());
+        buf.extend_from_slice(&amount.to_le_bytes());
+    }
+}
+
+fn sample_signed_transfer_size(account: &TestAccount, targets: &[Address], samples: usize) -> f64 {
+    let mut total = 0usize;
+    for i in 0..samples.max(1) {
+        let tx = TxEip1559 {
+            chain_id: CHAIN_ID,
+            nonce: i as u64,
+            gas_limit: TRANSFER_GAS,
+            max_fee_per_gas: MAX_FEE_PER_GAS,
+            max_priority_fee_per_gas: MAX_PRIORITY_FEE,
+            to: TxKind::Call(targets[i % targets.len()]),
+            value: U256::from(TRANSFER_VALUE),
+            input: Bytes::new(),
+            access_list: Default::default(),
+        };
+        let sig_hash = tx.signature_hash();
+        let sig = account.signer.sign_hash_sync(&sig_hash).expect("sign");
+        let signed = tx.into_signed(sig);
+        let mut encoded = Vec::with_capacity(128);
+        signed.encode_2718(&mut encoded);
+        total += encoded.len();
+    }
+    total as f64 / samples.max(1) as f64
+}
+
+fn keccak_hash_bytes(bytes: &[u8]) -> [u8; 32] {
+    let mut hasher = Keccak::v256();
+    hasher.update(bytes);
+    let mut out = [0u8; 32];
+    hasher.finalize(&mut out);
+    out
+}
+
+fn run_batch_transfer_bench(
+    senders: usize,
+    transfers_per_sender: usize,
+    iters: usize,
+    recover_samples: usize,
+) -> Result<()> {
+    let senders = senders.max(1);
+    let transfers_per_sender = transfers_per_sender.max(1);
+    let iters = iters.max(1);
+    let total_transfers = senders.saturating_mul(transfers_per_sender);
+    let accounts = create_accounts(senders.max(1024), 1);
+    let targets: Vec<Address> = accounts.iter().map(|a| a.address).collect();
+    let baseline_samples = 1024.min(total_transfers).max(1);
+    let avg_rlp_transfer_bytes =
+        sample_signed_transfer_size(&accounts[0], &targets, baseline_samples);
+
+    tracing::info!(
+        senders,
+        transfers_per_sender,
+        total_transfers,
+        record_bytes = BATCH_TRANSFER_RECORD_BYTES,
+        batch_header_bytes = BATCH_TRANSFER_HEADER_BYTES,
+        "BATCH_TRANSFER_BENCH: start"
+    );
+
+    let build_start = Instant::now();
+    let mut encoded = Vec::with_capacity(
+        4 + senders
+            * (BATCH_TRANSFER_HEADER_BYTES + transfers_per_sender * BATCH_TRANSFER_RECORD_BYTES),
+    );
+    encoded.extend_from_slice(&(senders as u32).to_le_bytes());
+    let mut signed_batches: Vec<(B256, Signature, Address)> = Vec::with_capacity(senders);
+
+    for sender_idx in 0..senders {
+        let start_nonce = sender_idx as u64 * transfers_per_sender as u64;
+        let count = transfers_per_sender as u32;
+        let records_start = encoded.len() + BATCH_TRANSFER_HEADER_BYTES;
+        let header_pos = encoded.len();
+        encoded.extend_from_slice(&start_nonce.to_le_bytes());
+        encoded.extend_from_slice(&count.to_le_bytes());
+        encoded.resize(encoded.len() + 65, 0);
+        push_batch_transfer_records(&mut encoded, sender_idx, transfers_per_sender);
+        let records = &encoded
+            [records_start..records_start + transfers_per_sender * BATCH_TRANSFER_RECORD_BYTES];
+        let prehash = batch_transfer_prehash(CHAIN_ID, 0, start_nonce, count, records);
+        let sig = accounts[sender_idx]
+            .signer
+            .sign_hash_sync(&prehash)
+            .expect("batch sign");
+        encoded[header_pos + 12..header_pos + 77].copy_from_slice(&sig.as_bytes());
+        signed_batches.push((prehash, sig, accounts[sender_idx].address));
+    }
+    let build_ms = build_start.elapsed().as_millis() as u64;
+
+    let encoded_bytes = encoded.len();
+    let bytes_per_transfer = encoded_bytes as f64 / total_transfers as f64;
+    let baseline_bytes = avg_rlp_transfer_bytes * total_transfers as f64;
+    let compression = baseline_bytes / encoded_bytes as f64;
+
+    let hash_start = Instant::now();
+    let blake3_root = blake3::hash(&encoded);
+    let blake3_ms = hash_start.elapsed().as_secs_f64() * 1000.0;
+    let hash_start = Instant::now();
+    let keccak_root = keccak_hash_bytes(&encoded);
+    let keccak_ms = hash_start.elapsed().as_secs_f64() * 1000.0;
+    black_box((blake3_root, keccak_root));
+
+    let recover_count = recover_samples.max(1).min(total_transfers);
+    let recover_start = Instant::now();
+    let mut recovered_checksum = 0u64;
+    for i in 0..recover_count {
+        let (prehash, sig, expected) = &signed_batches[i % signed_batches.len()];
+        let recovered = sig.recover_address_from_prehash(prehash)?;
+        if recovered != *expected {
+            eyre::bail!("signature recovery mismatch");
+        }
+        recovered_checksum ^= u64::from_le_bytes(recovered.as_slice()[..8].try_into().unwrap());
+    }
+    black_box(recovered_checksum);
+    let recover_ms = recover_start.elapsed().as_secs_f64() * 1000.0;
+    let recover_per_sec = recover_count as f64 / (recover_ms / 1000.0).max(f64::MIN_POSITIVE);
+    let per_tx_recover_est_ms = total_transfers as f64 / recover_per_sec * 1000.0;
+    let batch_recover_est_ms = senders as f64 / recover_per_sec * 1000.0;
+
+    let mut decode_times = Vec::with_capacity(iters);
+    let mut apply_times = Vec::with_capacity(iters);
+    let mut verify_times = Vec::with_capacity(iters);
+    let mut hash_times = Vec::with_capacity(iters);
+    let recipient_count = total_transfers.min(2_000_000).max(1);
+
+    for _ in 0..iters {
+        let mut sender_balances = vec![u128::MAX / 4; senders];
+        let mut recipient_balances = vec![0u128; recipient_count];
+        let mut sender_nonces = vec![0u64; senders];
+        let mut offset = 0usize;
+
+        let decode_start = Instant::now();
+        let batch_count =
+            u32::from_le_bytes(encoded[offset..offset + 4].try_into().unwrap()) as usize;
+        offset += 4;
+        decode_times.push(decode_start.elapsed().as_secs_f64() * 1000.0);
+
+        let mut apply_ms = 0.0;
+        let mut verify_ms = 0.0;
+        let mut record_hash_ms = 0.0;
+        let mut checksum = 0u128;
+        for sender_idx in 0..batch_count {
+            let start_nonce = u64::from_le_bytes(encoded[offset..offset + 8].try_into().unwrap());
+            let count =
+                u32::from_le_bytes(encoded[offset + 8..offset + 12].try_into().unwrap()) as usize;
+            let sig = Signature::from_raw(&encoded[offset + 12..offset + 77])?;
+            offset += BATCH_TRANSFER_HEADER_BYTES;
+            let records_start = offset;
+            let records_end = records_start + count * BATCH_TRANSFER_RECORD_BYTES;
+            let records = &encoded[records_start..records_end];
+
+            let hash_start = Instant::now();
+            let prehash = batch_transfer_prehash(CHAIN_ID, 0, start_nonce, count as u32, records);
+            record_hash_ms += hash_start.elapsed().as_secs_f64() * 1000.0;
+
+            let verify_start = Instant::now();
+            let recovered = sig.recover_address_from_prehash(&prehash)?;
+            if recovered != accounts[sender_idx].address {
+                eyre::bail!("decoded signature recovery mismatch");
+            }
+            verify_ms += verify_start.elapsed().as_secs_f64() * 1000.0;
+
+            let apply_start = Instant::now();
+            sender_nonces[sender_idx] = start_nonce;
+            for rec in records.chunks_exact(BATCH_TRANSFER_RECORD_BYTES) {
+                let recipient_index = u32::from_le_bytes(rec[..4].try_into().unwrap()) as usize;
+                let amount = u64::from_le_bytes(rec[4..12].try_into().unwrap()) as u128;
+                let recipient = recipient_index % recipient_count;
+                sender_balances[sender_idx] = sender_balances[sender_idx].wrapping_sub(amount);
+                recipient_balances[recipient] = recipient_balances[recipient].wrapping_add(amount);
+                sender_nonces[sender_idx] += 1;
+                checksum ^= recipient_balances[recipient];
+            }
+            apply_ms += apply_start.elapsed().as_secs_f64() * 1000.0;
+            offset = records_end;
+        }
+        black_box((checksum, sender_balances, recipient_balances, sender_nonces));
+        apply_times.push(apply_ms);
+        verify_times.push(verify_ms);
+        hash_times.push(record_hash_ms);
+    }
+
+    fn avg(v: &[f64]) -> f64 {
+        v.iter().sum::<f64>() / v.len().max(1) as f64
+    }
+    let decode_ms = avg(&decode_times);
+    let apply_ms = avg(&apply_times);
+    let verify_ms = avg(&verify_times);
+    let record_hash_ms = avg(&hash_times);
+    let total_fast_lane_ms = apply_ms + verify_ms + record_hash_ms + decode_ms;
+    let fast_lane_tps =
+        total_transfers as f64 / (total_fast_lane_ms / 1000.0).max(f64::MIN_POSITIVE);
+    let wire_tps_at_1gbps = 125_000_000.0 / bytes_per_transfer;
+    let wire_tps_at_10gbps = 1_250_000_000.0 / bytes_per_transfer;
+
+    tracing::info!(
+        total_transfers,
+        encoded_bytes,
+        encoded_mb = format!("{:.2}", encoded_bytes as f64 / 1_000_000.0),
+        bytes_per_transfer = format!("{:.3}", bytes_per_transfer),
+        avg_rlp_transfer_bytes = format!("{:.1}", avg_rlp_transfer_bytes),
+        compression_vs_signed_rlp = format!("{:.1}x", compression),
+        build_ms,
+        "BATCH_TRANSFER_BENCH: size"
+    );
+    tracing::info!(
+        blake3_ms = format!("{:.3}", blake3_ms),
+        keccak_ms = format!("{:.3}", keccak_ms),
+        blake3_gbps = format!("{:.2}", encoded_bytes as f64 / (blake3_ms / 1000.0) / 1e9),
+        keccak_gbps = format!("{:.2}", encoded_bytes as f64 / (keccak_ms / 1000.0) / 1e9),
+        "BATCH_TRANSFER_BENCH: block_hash"
+    );
+    tracing::info!(
+        recover_samples = recover_count,
+        recover_ms = format!("{:.3}", recover_ms),
+        recover_per_sec = format!("{:.0}", recover_per_sec),
+        per_tx_recover_est_ms = format!("{:.1}", per_tx_recover_est_ms),
+        batch_recover_est_ms = format!("{:.3}", batch_recover_est_ms),
+        ecrecover_reduction = format!("{:.0}x", total_transfers as f64 / senders as f64),
+        "BATCH_TRANSFER_BENCH: ecrecover"
+    );
+    tracing::info!(
+        iters,
+        decode_ms = format!("{:.3}", decode_ms),
+        record_hash_ms = format!("{:.3}", record_hash_ms),
+        batch_verify_ms = format!("{:.3}", verify_ms),
+        apply_ms = format!("{:.3}", apply_ms),
+        total_fast_lane_ms = format!("{:.3}", total_fast_lane_ms),
+        fast_lane_tps = format!("{:.0}", fast_lane_tps),
+        wire_tps_at_1gbps = format!("{:.0}", wire_tps_at_1gbps),
+        wire_tps_at_10gbps = format!("{:.0}", wire_tps_at_10gbps),
+        "BATCH_TRANSFER_BENCH: throughput"
+    );
+
+    Ok(())
 }
 
 /// Partition accounts by RPC index. Returns Vec[rpc_idx] = Vec<account>.
@@ -2911,6 +3211,15 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+    if cli.batch_transfer_bench {
+        return run_batch_transfer_bench(
+            cli.batch_transfer_senders,
+            cli.batch_transfer_per_sender,
+            cli.batch_transfer_iters,
+            cli.batch_transfer_recover_samples,
+        );
+    }
+
     let rpc_urls: Vec<String> = cli.rpc.split(',').map(|s| s.trim().to_string()).collect();
 
     tracing::info!("=== N42 TPS Stress Test v10 (Burst Mode + Optimized Submission) ===");
@@ -2994,6 +3303,54 @@ async fn main() -> Result<()> {
         }
 
         if cli.wave > 0 {
+            let sync_continuous_env = std::env::var("N42_SYNC_INGEST_CONTINUOUS")
+                .map(|v| {
+                    v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes")
+                })
+                .unwrap_or(false);
+            if cli.sync_ingest_mode == SyncIngestMode::PerNodeContinuous || sync_continuous_env {
+                let disable_forward = std::env::var("N42_DISABLE_TX_FORWARD")
+                    .map(|v| v == "1")
+                    .unwrap_or(false);
+                if !disable_forward {
+                    tracing::warn!(
+                        "per-node-continuous mode is intended for N42_DISABLE_TX_FORWARD=1"
+                    );
+                }
+                tracing::info!(
+                    wave = cli.wave,
+                    duration_secs = cli.duration,
+                    "=== CONTINUOUS TCP INGEST MODE (no wave drain) ==="
+                );
+
+                let stats = Arc::new(Stats::new());
+                stats.start_block.store(start_block, Ordering::Relaxed);
+                run_ingest_mode(
+                    &endpoints,
+                    presigned,
+                    cli.batch_size,
+                    cli.target_tps,
+                    IngestPacerConfig {
+                        soft_resume: cli.ingest_soft_resume,
+                        soft_target: cli.ingest_soft_target,
+                        hard_target: cli.ingest_hard_target,
+                        hard_cap: cli.ingest_hard_cap,
+                        target_spread: cli.ingest_target_spread,
+                        pool_poll_ms: cli.ingest_pool_poll_ms,
+                    },
+                    &stats,
+                    &rpc_urls,
+                    &client,
+                    start_block,
+                    cli.duration,
+                )
+                .await;
+
+                let final_block = get_block_number(&client, &rpc_urls[0]).await?;
+                analyze_blocks(&client, &rpc_urls[0], start_block, final_block).await;
+                return Ok(());
+            }
+
             // Synchronized TCP ingest: wave_cap txs per wave, wait for pool drain
             tracing::info!("=== SYNC TCP INGEST MODE (wave={}) ===", cli.wave);
 

@@ -16,6 +16,7 @@ alloy-consensus = { workspace = true, features = ["k256"] }
 alloy-eips.workspace = true
 alloy-signer.workspace = true
 alloy-signer-local.workspace = true
+blake3.workspace = true
 
 tokio.workspace = true
 eyre.workspace = true

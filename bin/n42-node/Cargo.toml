@@ -25,6 +25,7 @@ reth-node-builder.workspace = true
 reth-node-core.workspace = true
 reth-rpc-server-types.workspace = true
 reth-storage-api.workspace = true
+reth-transaction-pool.workspace = true
 reth-tasks.workspace = true
 
 alloy-primitives.workspace = true

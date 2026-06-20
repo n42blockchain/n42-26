@@ -5,6 +5,7 @@ use n42_consensus::ValidatorSet;
 use n42_primitives::QuorumCertificate;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{broadcast, oneshot};
 use tracing::{info, warn};
@@ -146,6 +147,13 @@ pub struct EpochStatus {
     pub next_epoch_validator_count: usize,
 }
 
+/// Latest transaction pool depth sampled for cadence diagnostics.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PoolDepthSnapshot {
+    pub pending: usize,
+    pub queued: usize,
+}
+
 /// Admin command sent from RPC to the consensus orchestrator.
 pub enum AdminCommand {
     AddValidator {
@@ -187,6 +195,9 @@ pub struct SharedConsensusState {
     /// Epoch status snapshot updated by the consensus engine after each relevant event.
     /// Provides pending/staged info for the `n42_validatorSet` RPC.
     epoch_status: ArcSwap<EpochStatus>,
+    /// Latest txpool depth sampled by the node task and payload builder.
+    pool_pending: AtomicUsize,
+    pool_queued: AtomicUsize,
 }
 
 impl SharedConsensusState {
@@ -217,6 +228,8 @@ impl SharedConsensusState {
             zk_latest_proof: ArcSwap::from_pointee(None),
             admin_tx: Mutex::new(None),
             epoch_status: ArcSwap::from_pointee(EpochStatus::default()),
+            pool_pending: AtomicUsize::new(0),
+            pool_queued: AtomicUsize::new(0),
         }
     }
 
@@ -414,6 +427,20 @@ impl SharedConsensusState {
     /// Loads the current epoch status snapshot.
     pub fn load_epoch_status(&self) -> Arc<EpochStatus> {
         self.epoch_status.load_full()
+    }
+
+    /// Updates the txpool depth snapshot used by cadence diagnostics.
+    pub fn update_pool_depth(&self, pending: usize, queued: usize) {
+        self.pool_pending.store(pending, Ordering::Relaxed);
+        self.pool_queued.store(queued, Ordering::Relaxed);
+    }
+
+    /// Loads the most recently sampled txpool depth.
+    pub fn load_pool_depth(&self) -> PoolDepthSnapshot {
+        PoolDepthSnapshot {
+            pending: self.pool_pending.load(Ordering::Relaxed),
+            queued: self.pool_queued.load(Ordering::Relaxed),
+        }
     }
 
     /// Registers the block for attestation tracking and notifies RPC subscribers.
