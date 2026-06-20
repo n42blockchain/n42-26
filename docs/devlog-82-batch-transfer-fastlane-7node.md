@@ -116,6 +116,20 @@ Yes, this special-case batch transfer lane can exceed the historical Mac records
 - best practical 256 x 10k range: ~0.45-0.70M TPS, with >1M single-interval peak;
 - largest 512 x 10k block: 1.245M TPS peak, but not stable in the current harness.
 
+Update: `devlog-83` fixed the benchmark network artifacts called out below
+(`rejected block direct push from unauthenticated peer` and duplicate full
+GossipSub fallback). The cleaned 7-node results are:
+
+| Run | TPS avg | TPS p50 | TPS p95 | TPS max |
+| --- | ---: | ---: | ---: | ---: |
+| Optimized 256 x 10k | 3.27M | 2.83M | 6.92M | 11.28M |
+| Optimized release 512 x 10k | 3.24M | 3.04M | 6.42M | 13.33M |
+
+See `docs/devlog-83-batch-transfer-profile-optimize.md` and
+`docs/performance-records.md`. The same benchmark-only caveat still applies:
+this path skips reth/EVM execution, state root, receipts, persistence, and
+production replay semantics.
+
 The bottleneck is no longer ECDSA verification or transfer encoding. With one ECDSA recovery per sender, verification/apply remains sub-second for 30 MB blocks and around 0.8-2.1s for 60 MB blocks. The visible instability comes from consensus/network cadence around very large sidecars:
 
 - pacemaker timeouts under 30-60 MB blocks;

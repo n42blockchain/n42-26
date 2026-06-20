@@ -6,6 +6,20 @@
 > 数据来源：`devlog-49`（LAN cap sweep）、`devlog-50`/`90K-cap-timing-analysis`（90K）、
 > `devlog-73`（7 节点共识 A/B）、`devlog-74`（EVM/state profile）、`devlog-75`（leader 火焰图）。
 
+## 2026-06-20 追加：batch-transfer fast-lane 上限实验
+
+`devlog-81` → `devlog-83` 跟进了一个**特殊 benchmark-only** transfer fast lane：每个 sender 在块内只带一个 ECDSA 签名，单笔 transfer 记录压到
+`recipient_index u32 + amount u64 = 12 bytes`。这条路径绕过 reth/EVM、state root、receipt、MDBX persistence 和生产 replay 语义，只用于测"压缩转账格式 + 7 节点共识/网络壳"的上限。
+
+最新清理后记录（commit `8e1a077`，详见 `docs/devlog-83-batch-transfer-profile-optimize.md` 和 `docs/performance-records.md`）：
+
+| path | block shape | TPS avg | p50 | p95 | max | 备注 |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| Batch transfer fast-lane | 256 x 10k = 2.56M transfers | 3.27M | 2.83M | 6.92M | 11.28M | clean practical benchmark setting |
+| Batch transfer fast-lane | 512 x 10k = 5.12M transfers | 3.24M | 3.04M | 6.42M | 13.33M | peak exploration, 60MB sidecar |
+
+这证明"特定批量转账协议"的上限可以进入百万 TPS 级，但**不应和下文普通 Ethereum tx TPS 直接等价**。下文关于 90K 普通转账、合约重 12K、EVM/网络/finish-root 瓶颈的判断仍然适用于正常交易路径。
+
 ## 1. 历史对账：~90K 不是被 EVM 撑起来的，12K 也不是回退
 
 | 记录 | TPS | workload | slot | 平台 | tx/block | 注入 | **真正的限制** |

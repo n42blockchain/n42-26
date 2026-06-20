@@ -219,3 +219,29 @@ Bottom line:
   and propagation probes. If that run becomes admission-limited, BLS-tx becomes
   the obvious next prototype. If it remains cadence/import-limited, BLS-tx will
   not move on-chain TPS enough by itself.
+
+## 2026-06-20 follow-up: narrow batch-transfer fast lane
+
+The follow-up did not start a full BLS-tx or replicated-mempool migration.
+Instead it prototyped the narrowest measurable idea: a benchmark-only transfer
+sidecar with 12-byte transfer records and one ECDSA signature per sender batch.
+
+Follow-up records:
+
+- `docs/devlog-81-batch-transfer-fastlane-bench.md`
+- `docs/devlog-82-batch-transfer-fastlane-7node.md`
+- `docs/devlog-83-batch-transfer-profile-optimize.md`
+- `docs/performance-records.md`
+- commit `8e1a077`
+
+Clean 7-node benchmark results:
+
+| Run | Transfers / block | TPS avg | TPS p50 | TPS p95 | TPS max |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Optimized 256 x 10k | 2.56M | 3.27M | 2.83M | 6.92M | 11.28M |
+| Optimized release 512 x 10k | 5.12M | 3.24M | 3.04M | 6.42M | 13.33M |
+
+This validates the upper-bound potential of the specialized compressed transfer
+lane, while preserving the original caution: these are not production-chain TPS
+numbers because the benchmark path skips reth/EVM execution, state root,
+receipts, MDBX persistence, and production replay semantics.

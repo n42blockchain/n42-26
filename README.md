@@ -89,7 +89,7 @@ n42-26/
 │   ├── n42-mobile/                # Mobile verification protocol (no reth deps)
 │   ├── n42-mobile-ffi/            # C/JNI FFI bindings for Android & iOS
 │   └── n42-node/                  # Node type assembly + ConsensusOrchestrator
-├── docs/                          # Development logs (devlog-01 through devlog-53)
+├── docs/                          # Development logs and performance records (devlog-01 through devlog-83)
 ├── scripts/                       # Testnet launch scripts
 └── DEVLOG.md                      # Development log index
 ```
@@ -193,6 +193,15 @@ Rewards are injected as `Withdrawal` entries in `PayloadAttributes` — no trans
 | Sync Wave + Fast Propose | **25,797** | 48K | Inject→drain→inject cycle |
 | Cache Hit Fast Path | **90,949** | 90K | Peak single-block TPS |
 | 2s Slot + All Optimizations | **13,858** | 48K | Production-like timing |
+
+Benchmark-only upper-bound:
+
+| Mode | TPS | Block Shape | Notes |
+|------|----:|------------:|-------|
+| Batch Transfer Fast-Lane | **3.27M avg / 11.28M max** | 256 x 10k = 2.56M transfers | 12.008 B/transfer, direct-only sidecar, skips reth/EVM/state root/receipts/persistence |
+| Batch Transfer Fast-Lane | **3.24M avg / 13.33M max** | 512 x 10k = 5.12M transfers | 60 MB sidecar stress; peak exploration, not production TPS |
+
+See [docs/performance-records.md](docs/performance-records.md) and [docs/devlog-83-batch-transfer-profile-optimize.md](docs/devlog-83-batch-transfer-profile-optimize.md) for the caveats and profiling breakdown.
 
 ### Key Optimizations
 

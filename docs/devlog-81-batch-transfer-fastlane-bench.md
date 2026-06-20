@@ -145,6 +145,28 @@ Next prototype should be feature-gated and fresh-genesis only:
   and replay domain,
 - run 7-node bandwidth/state-root tests with 5M-25M transfer blocks.
 
+## 7-Node Follow-Up
+
+Follow-up work landed in:
+
+- `docs/devlog-82-batch-transfer-fastlane-7node.md`
+- `docs/devlog-83-batch-transfer-profile-optimize.md`
+- `docs/performance-records.md`
+- commit `8e1a077`
+
+The feature-gated 7-node benchmark sidecar confirmed the million-TPS regime for
+this narrow workload after removing direct-push auth races and duplicate full
+GossipSub fallback:
+
+| Run | Transfers / block | Encoded size | TPS avg | TPS p50 | TPS p95 | TPS max |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Optimized 256 x 10k | 2,560,000 | 30,019 KiB | 3.27M | 2.83M | 6.92M | 11.28M |
+| Optimized release 512 x 10k | 5,120,000 | 60,038 KiB | 3.24M | 3.04M | 6.42M | 13.33M |
+
+The caveat remains important: this is still an upper-bound benchmark, not
+production chain TPS. It skips reth/EVM execution, state root, receipts,
+persistence, and production replay semantics.
+
 Claude bridge note: I attempted to send this direction to the bridge, but the
 bridge was unreachable (`Cannot reach Codex Bridge at http://192.168.0.120:8788`).
 This devlog is the durable handoff until the bridge comes back.
