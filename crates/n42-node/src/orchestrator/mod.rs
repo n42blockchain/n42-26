@@ -54,6 +54,17 @@ pub(crate) fn decompress_payload(data: &[u8]) -> std::io::Result<Vec<u8>> {
     }
 }
 
+fn elapsed_since_unix_ms(start_ms: u64) -> Option<u64> {
+    if start_ms == 0 {
+        return None;
+    }
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_millis() as u64;
+    Some(now_ms.saturating_sub(start_ms))
+}
+
 /// Block data broadcast via /n42/blocks/1 GossipSub topic.
 ///
 /// NOTE: Serialized with bincode. Adding new fields requires all nodes to upgrade
@@ -128,6 +139,18 @@ pub(crate) struct PipelineTiming {
     pub(crate) import_complete: Option<Instant>,
     /// Consensus committed (Decide received or CommitQC formed).
     pub(crate) committed: Option<Instant>,
+}
+
+#[derive(Debug, Default)]
+struct TimeoutViewDiag {
+    build_start: Option<Instant>,
+    build_pool_pending: usize,
+    build_pool_queued: usize,
+    block_data_received_count: u32,
+    first_block_data_received: Option<Instant>,
+    timeout_at: Option<Instant>,
+    timeout_pool_pending: usize,
+    timeout_pool_queued: usize,
 }
 
 impl PipelineTiming {
@@ -338,6 +361,8 @@ pub struct ConsensusOrchestrator {
     last_commit_instant: Option<Instant>,
     last_commit_view: Option<u64>,
     last_commit_hash: Option<B256>,
+    /// Observation-only high-TPS timeout diagnostics keyed by consensus view.
+    timeout_view_diags: BTreeMap<u64, TimeoutViewDiag>,
     /// Last committed parent for which commit->build_start has already been recorded.
     commit_to_build_recorded_parent: Option<B256>,
     /// Guards follower eager import: tracks the last block number sent to reth
@@ -422,6 +447,207 @@ impl ConsensusOrchestrator {
         }
     }
 
+    fn diag_leader_index_for_view(&self, view: u64) -> u32 {
+        if view == self.engine.current_view() {
+            return self.engine.current_leader_index();
+        }
+        let validator_count = self.engine.validator_count().max(1) as u64;
+        (view % validator_count) as u32
+    }
+
+    fn timeout_diag_entry(&mut self, view: u64) -> &mut TimeoutViewDiag {
+        const MAX_TIMEOUT_DIAG_VIEWS: usize = 256;
+        while self.timeout_view_diags.len() >= MAX_TIMEOUT_DIAG_VIEWS {
+            let Some(oldest) = self.timeout_view_diags.keys().next().copied() else {
+                break;
+            };
+            self.timeout_view_diags.remove(&oldest);
+        }
+        self.timeout_view_diags.entry(view).or_default()
+    }
+
+    fn record_timeout_diag_build_start(
+        &mut self,
+        view: u64,
+        parent: B256,
+        pool_pending: usize,
+        pool_queued: usize,
+        build_start: Instant,
+    ) {
+        let leader_idx = self.diag_leader_index_for_view(view);
+        let my_index = self.engine.my_index();
+        let prev_view = view.saturating_sub(1);
+        let prev_timeout_to_build_start_ms = self
+            .timeout_view_diags
+            .get(&prev_view)
+            .and_then(|diag| diag.timeout_at)
+            .map(|timeout_at| {
+                build_start
+                    .saturating_duration_since(timeout_at)
+                    .as_millis() as u64
+            });
+        let prev_view_had_timeout = prev_timeout_to_build_start_ms.is_some();
+
+        let diag = self.timeout_diag_entry(view);
+        diag.build_start = Some(build_start);
+        diag.build_pool_pending = pool_pending;
+        diag.build_pool_queued = pool_queued;
+
+        info!(
+            target: "n42::cl::timeout_diag",
+            view,
+            leader_idx,
+            my_index,
+            %parent,
+            pool_pending,
+            pool_queued,
+            prev_view,
+            prev_view_had_timeout,
+            prev_timeout_to_build_start_ms = prev_timeout_to_build_start_ms.unwrap_or(0),
+            "N42_TIMEOUT_VIEW: leader_build_start"
+        );
+    }
+
+    fn record_timeout_diag_block_data_received(
+        &mut self,
+        view: u64,
+        hash: B256,
+        bytes: usize,
+        leader_ready_unix_ms: u64,
+        duplicate: bool,
+    ) {
+        let now = Instant::now();
+        let current_view = self.engine.current_view();
+        let leader_idx = self.diag_leader_index_for_view(view);
+        let my_index = self.engine.my_index();
+        let since_leader_ready_ms = elapsed_since_unix_ms(leader_ready_unix_ms).unwrap_or(0);
+
+        let diag = self.timeout_diag_entry(view);
+        diag.block_data_received_count = diag.block_data_received_count.saturating_add(1);
+        if diag.first_block_data_received.is_none() {
+            diag.first_block_data_received = Some(now);
+        }
+        let received_after_timeout_ms = diag
+            .timeout_at
+            .map(|timeout_at| now.saturating_duration_since(timeout_at).as_millis() as u64);
+        let timeout_seen = received_after_timeout_ms.is_some();
+
+        info!(
+            target: "n42::cl::timeout_diag",
+            view,
+            current_view,
+            leader_idx,
+            my_index,
+            %hash,
+            bytes,
+            duplicate,
+            block_data_received_count = diag.block_data_received_count,
+            has_leader_ready_ts = leader_ready_unix_ms > 0,
+            since_leader_ready_ms,
+            timeout_seen,
+            received_after_timeout_ms = received_after_timeout_ms.unwrap_or(0),
+            "N42_TIMEOUT_VIEW: block_data_received"
+        );
+    }
+
+    fn record_timeout_diag_timeout_triggered(&mut self, view: u64) {
+        let now = Instant::now();
+        let pool_depth = self.pool_depth_snapshot();
+        let leader_idx = self.engine.current_leader_index();
+        let my_index = self.engine.my_index();
+        let elapsed_since_last_commit_ms = self
+            .last_commit_instant
+            .map(|last_commit| now.saturating_duration_since(last_commit).as_millis() as u64);
+        let view_elapsed_ms = self
+            .view_started_at
+            .map(|started| started.elapsed().as_millis() as u64);
+
+        let building_on_parent = self.building_on_parent;
+        let next_build_scheduled = self.next_build_at.is_some();
+        let speculative_build_hash = self.speculative_build_hash;
+        let bg_import_in_flight = self.bg_import_in_flight;
+        let bg_import_queue_len = self.bg_import_queue.len();
+        let pending_block_data_len = self.pending_block_data.len();
+        let pending_executions_len = self.pending_executions.len();
+        let phase = format!("{:?}", self.engine.current_phase());
+        let is_leader = self.engine.is_current_leader();
+        let last_commit_view = self.last_commit_view.unwrap_or_default();
+        let last_commit_hash = self.last_commit_hash;
+
+        let diag = self.timeout_diag_entry(view);
+        let build_started = diag.build_start.is_some();
+        let build_start_age_ms = diag
+            .build_start
+            .map(|build_start| now.saturating_duration_since(build_start).as_millis() as u64);
+        let block_data_received_count = diag.block_data_received_count;
+        let block_data_before_timeout = diag.first_block_data_received.is_some();
+        diag.timeout_at.get_or_insert(now);
+        diag.timeout_pool_pending = pool_depth.pending;
+        diag.timeout_pool_queued = pool_depth.queued;
+
+        info!(
+            target: "n42::cl::timeout_diag",
+            view,
+            leader_idx,
+            my_index,
+            is_leader,
+            phase = %phase,
+            pool_pending = pool_depth.pending,
+            pool_queued = pool_depth.queued,
+            last_commit_view,
+            last_commit_hash = ?last_commit_hash,
+            elapsed_since_last_commit_ms = elapsed_since_last_commit_ms.unwrap_or(0),
+            has_last_commit = elapsed_since_last_commit_ms.is_some(),
+            view_elapsed_ms = view_elapsed_ms.unwrap_or(0),
+            has_view_start = view_elapsed_ms.is_some(),
+            build_started,
+            build_start_age_ms = build_start_age_ms.unwrap_or(0),
+            block_data_received_count,
+            block_data_before_timeout,
+            pending_block_data_len,
+            pending_executions_len,
+            building_on_parent = ?building_on_parent,
+            next_build_scheduled,
+            speculative_build_hash = ?speculative_build_hash,
+            bg_import_in_flight,
+            bg_import_queue_len,
+            "N42_TIMEOUT_VIEW: timeout_triggered"
+        );
+    }
+
+    fn record_timeout_diag_view_changed(&mut self, new_view: u64) {
+        let now = Instant::now();
+        let timed_out_view = new_view.saturating_sub(1);
+        let Some(diag) = self.timeout_view_diags.get(&timed_out_view) else {
+            return;
+        };
+        let Some(timeout_at) = diag.timeout_at else {
+            return;
+        };
+        let pool_depth = self.pool_depth_snapshot();
+        let timeout_to_view_change_ms =
+            now.saturating_duration_since(timeout_at).as_millis() as u64;
+        let prev_leader_idx = self.diag_leader_index_for_view(timed_out_view);
+        let next_leader_idx = self.diag_leader_index_for_view(new_view);
+
+        info!(
+            target: "n42::cl::timeout_diag",
+            timed_out_view,
+            new_view,
+            prev_leader_idx,
+            next_leader_idx,
+            my_index = self.engine.my_index(),
+            timeout_to_view_change_ms,
+            timeout_pool_pending = diag.timeout_pool_pending,
+            timeout_pool_queued = diag.timeout_pool_queued,
+            pool_pending = pool_depth.pending,
+            pool_queued = pool_depth.queued,
+            build_started = diag.build_start.is_some(),
+            block_data_received_count = diag.block_data_received_count,
+            "N42_TIMEOUT_VIEW: view_change_after_timeout"
+        );
+    }
+
     pub fn new(
         engine: ConsensusEngine,
         network: NetworkHandle,
@@ -495,6 +721,7 @@ impl ConsensusOrchestrator {
             last_commit_instant: None,
             last_commit_view: None,
             last_commit_hash: None,
+            timeout_view_diags: BTreeMap::new(),
             commit_to_build_recorded_parent: None,
             eager_import_block_guard: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             fast_propose: std::env::var("N42_FAST_PROPOSE")
@@ -695,6 +922,7 @@ impl ConsensusOrchestrator {
             last_commit_instant: None,
             last_commit_view: None,
             last_commit_hash: None,
+            timeout_view_diags: BTreeMap::new(),
             commit_to_build_recorded_parent: None,
             eager_import_block_guard: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             fast_propose,
@@ -868,6 +1096,7 @@ impl ConsensusOrchestrator {
                 _ = &mut timeout => {
                     let view = self.engine.current_view();
                     counter!("n42_view_timeouts_total").increment(1);
+                    self.record_timeout_diag_timeout_triggered(view);
                     warn!(target: "n42::cl::orchestrator", view, "pacemaker timeout, initiating view change");
                     if let Err(e) = self.engine.on_timeout() {
                         error!(target: "n42::cl::orchestrator", view, error = %e, "error handling timeout");

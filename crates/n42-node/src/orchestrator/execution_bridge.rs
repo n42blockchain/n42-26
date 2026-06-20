@@ -320,11 +320,19 @@ impl ConsensusOrchestrator {
         }
         let build_start = Instant::now();
         let pool_depth = self.pool_depth_snapshot();
+        let view = self.engine.current_view();
+        self.record_timeout_diag_build_start(
+            view,
+            parent,
+            pool_depth.pending,
+            pool_depth.queued,
+            build_start,
+        );
         metrics::gauge!("n42_pool_pending_at_build_start").set(pool_depth.pending as f64);
         metrics::gauge!("n42_pool_queued_at_build_start").set(pool_depth.queued as f64);
         info!(
             target: "n42::cl::exec_bridge",
-            view = self.engine.current_view(),
+            view,
             %parent,
             pool_pending = pool_depth.pending,
             pool_queued = pool_depth.queued,
@@ -342,7 +350,7 @@ impl ConsensusOrchestrator {
                 self.commit_to_build_recorded_parent = Some(parent);
                 info!(
                     target: "n42::cl::exec_bridge",
-                    view = self.engine.current_view(),
+                    view,
                     %parent,
                     last_commit_view = self.last_commit_view.unwrap_or_default(),
                     last_commit_hash = ?self.last_commit_hash,
@@ -550,9 +558,17 @@ impl ConsensusOrchestrator {
 
         let hash = broadcast.block_hash;
         let duplicate_bytes = data.len();
+        let duplicate = self.pending_block_data.contains_key(&hash);
+        self.record_timeout_diag_block_data_received(
+            broadcast.view,
+            hash,
+            duplicate_bytes,
+            broadcast.leader_ready_unix_ms,
+            duplicate,
+        );
 
         // Dedup: skip if we already have this block (direct push + GossipSub overlap).
-        if self.pending_block_data.contains_key(&hash) {
+        if duplicate {
             metrics::counter!("n42_block_data_dup_hash_drop_total").increment(1);
             metrics::counter!("n42_block_data_dup_hash_drop_bytes_total")
                 .increment(duplicate_bytes as u64);
@@ -1146,6 +1162,15 @@ async fn handle_built_payload(
         has_compact_block = execution_output_bytes.is_some(),
         "N42_LEADER_READY: payload ready for broadcast"
     );
+    info!(
+        target: "n42::cl::timeout_diag",
+        view = current_view,
+        %hash,
+        tx_count,
+        leader_ready_unix_ms,
+        has_compact_block = execution_output_bytes.is_some(),
+        "N42_TIMEOUT_VIEW: leader_ready"
+    );
     // 1. Broadcast block data + blob sidecars to followers
     broadcast_block_data(
         &network,
@@ -1337,6 +1362,18 @@ async fn broadcast_block_data(
         gossip_ms,
         total_broadcast_ms = send_ms + gossip_ms,
         "N42_BROADCAST: direct push + gossipsub complete"
+    );
+    info!(
+        target: "n42::cl::timeout_diag",
+        view = current_view,
+        %hash,
+        encoded_kb = encoded.len() / 1024,
+        direct_peers = direct_count,
+        send_ms,
+        gossip_ms,
+        total_broadcast_ms = send_ms + gossip_ms,
+        build_start_to_broadcast_ms,
+        "N42_TIMEOUT_VIEW: leader_broadcast_complete"
     );
 
     if leader_payload_tx.send((hash, encoded)).await.is_err() {
