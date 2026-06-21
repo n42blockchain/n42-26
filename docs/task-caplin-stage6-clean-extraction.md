@@ -4,11 +4,19 @@ Branch: `feat/caplin-cl-stage3-6`. Stages 3-5 done (sink ports, network port, re
 `ConsensusOrchestrator`→`ConsensusService` + alias), all committed + unit-test green
 (213 unit + 6 integ). Reth baseline `../reth` @ 449ecfdce.
 
-User decision: **完全纯净抽取** — the new `n42-consensus-service` crate must have **zero
-reth dependency** (no reth-node-builder, no reth_evm/reth_payload_*/reth_transaction_pool/
-reth_execution_types/reth_ethereum_primitives). All reth concrete types stay in `n42-node`
-behind ports/adapters. Real-machine E2E deferred (datc occupies the box) — correctness
-rests on behavior-identical refactor + compile + unit tests.
+User decision (refined after discovering the revm/StateDiff coupling): **pragmatic
+boundary**. The new `n42-consensus-service` crate must NOT depend on the hard red-line:
+`reth-node-builder`, `reth_evm`, `reth_payload_builder`, `reth_payload_primitives`,
+`reth_transaction_pool`, `reth_execution_types`, or any node-assembly type. It **MAY**
+depend on `revm`, `reth_ethereum_primitives::Receipt`, and `n42-execution` (`StateDiff`) —
+these are genuine execution-domain type deps (the orchestrator really processes execution
+state for the state-tree / ZK / compact-block paths). So `CompactBlockExecution`,
+`CommittedBlock.receipts`, `StateDiff`, and the state-tree/ZK extraction helpers STAY.
+Real-machine E2E deferred (datc occupies the box) — correctness rests on behavior-identical
+refactor + compile + unit tests.
+
+**Revised acceptance for "orchestrator hard-reth-free" (end of 6a-3):**
+`git grep -nE 'reth_evm|reth_node_builder|reth_payload_builder|reth_payload_primitives|reth_transaction_pool|reth_execution_types' crates/n42-node/src/orchestrator/{mod,consensus_loop,execution_bridge,state_mgmt,view_jump_throttle}.rs` = EMPTY. `revm` + `reth_ethereum_primitives` allowed.
 
 ## The full reth coupling surface in `crates/n42-node/src/orchestrator/` (target = ZERO)
 
