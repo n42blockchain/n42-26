@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use alloy_primitives::B256;
 use alloy_rpc_types_engine::{
-    Claims, ExecutionData, ExecutionPayload, ExecutionPayloadEnvelopeV4, ForkchoiceState,
+    ExecutionData, ExecutionPayload, ExecutionPayloadEnvelopeV4, ForkchoiceState,
     ForkchoiceUpdated, JwtSecret, PayloadAttributes, PayloadId, PayloadStatus,
 };
 use n42_consensus_service::el::{BuiltBlock, ElError, ExecutionLayer, ResolveKind};
@@ -158,15 +158,34 @@ fn jsonrpc_request(id: u64, method: &str, params: Value) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })
 }
 
-/// Mints an `Authorization: Bearer <jwt>` value with a fresh `iat` claim. Free
-/// function (no `reqwest::Client`) so unit tests can exercise the JWT without
-/// constructing a client — building `reqwest::Client` races the process-global
-/// rustls `CryptoProvider` install across parallel tests.
+/// Mints an `Authorization: Bearer <HS256-JWT>` with a fresh `iat` claim,
+/// directly via HMAC-SHA256 over the 32-byte secret. Done by hand (not
+/// `JwtSecret::encode`) because that pulls `jsonwebtoken`, whose `rust_crypto`
+/// vs `aws_lc_rs` provider features unify to BOTH once the reth/node crates are
+/// in the same build graph, making HS256 encode panic ("could not determine the
+/// process-level CryptoProvider"). Pure HMAC has no such ambiguity. The Engine
+/// API only requires the `iat` claim (within ±60s).
 fn bearer_header(jwt: &JwtSecret) -> Result<String, ElError> {
-    let token = jwt
-        .encode(&Claims::with_current_timestamp())
-        .map_err(|e| ElError(format!("jwt encode: {e}")))?;
-    Ok(format!("Bearer {token}"))
+    use base64::Engine as _;
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+
+    let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    // Static HS256 header.
+    let header_b64 = b64.encode(br#"{"alg":"HS256","typ":"JWT"}"#);
+    let iat = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| ElError(format!("clock before epoch: {e}")))?
+        .as_secs();
+    let claims_b64 = b64.encode(format!(r#"{{"iat":{iat}}}"#));
+    let signing_input = format!("{header_b64}.{claims_b64}");
+
+    let mut mac = Hmac::<Sha256>::new_from_slice(jwt.as_bytes())
+        .map_err(|e| ElError(format!("jwt hmac key: {e}")))?;
+    mac.update(signing_input.as_bytes());
+    let sig_b64 = b64.encode(mac.finalize().into_bytes());
+
+    Ok(format!("Bearer {signing_input}.{sig_b64}"))
 }
 
 /// Extracts the `result` field of a JSON-RPC response, surfacing `error` as

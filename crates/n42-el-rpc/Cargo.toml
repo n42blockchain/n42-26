@@ -11,9 +11,12 @@ n42-consensus-service = { workspace = true }
 alloy-primitives = { workspace = true }
 alloy-rpc-types-engine = { workspace = true, features = ["serde", "jwt"] }
 
-# alloy's JwtSecret pulls jsonwebtoken but enables no crypto backend; select the
-# pure-Rust HMAC provider (portable, no native aws-lc build) so HS256 encode works.
-jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto"] }
+# HS256 JWT is minted directly with hmac+sha2 (not via alloy's
+# `JwtSecret::encode`/jsonwebtoken, whose `rust_crypto`/`aws_lc_rs` provider
+# features unify to BOTH in the node build graph and panic at encode time).
+hmac = "0.12"
+sha2 = { workspace = true }
+base64 = "0.22"
 reqwest = { version = "0.12", features = ["json"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
