@@ -1,6 +1,4 @@
-use super::{
-    BlobSidecarBroadcast, BlockDataBroadcast, CompactBlockExecution, ConsensusOrchestrator,
-};
+use super::{BlobSidecarBroadcast, BlockDataBroadcast, CompactBlockExecution, ConsensusService};
 use crate::el::ExecutionLayer;
 use crate::ingest::note_virtual_block_credit;
 use crate::net_port::ConsensusNetwork;
@@ -196,7 +194,7 @@ pub(super) const MAX_PENDING_BLOCK_DATA: usize = 16;
 /// Maximum number of blocks in the syncing retry queue.
 const MAX_SYNCING_QUEUE_SIZE: usize = 8;
 
-impl ConsensusOrchestrator {
+impl ConsensusService {
     /// Builds `PayloadAttributes` with timestamp correction and reward withdrawal injection.
     fn build_payload_attributes(&mut self, slot_timestamp: Option<u64>) -> PayloadAttributes {
         let mut timestamp = slot_timestamp.unwrap_or_else(|| {

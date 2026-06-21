@@ -257,7 +257,7 @@ pub(crate) struct CommittedBlock {
 ///
 /// Runs as a background task via `tokio::select!` over network events, engine outputs,
 /// pacemaker timeouts, and BlockReady signals.
-pub struct ConsensusOrchestrator {
+pub struct ConsensusService {
     engine: ConsensusEngine,
     /// Network port (Caplin sentinel-client seam). One in-process adapter today
     /// (`NetworkHandle`); the trait object lets the orchestrator move into a
@@ -417,7 +417,7 @@ pub struct ConsensusOrchestrator {
     view_jump_throttle: view_jump_throttle::ViewJumpThrottle,
 }
 
-impl ConsensusOrchestrator {
+impl ConsensusService {
     fn async_finalize_fcu_enabled() -> bool {
         std::env::var("N42_ASYNC_FINALIZE_FCU")
             .ok()
@@ -1820,7 +1820,7 @@ mod tests {
         let (engine, output_rx) = make_test_engine();
         let (network, _cmd_rx, _prx) = make_test_network();
         let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
-        let _ = ConsensusOrchestrator::new(engine, network, net_event_rx, output_rx);
+        let _ = ConsensusService::new(engine, network, net_event_rx, output_rx);
     }
 
     #[test]
@@ -1838,7 +1838,7 @@ mod tests {
         let (engine, output_rx) = make_test_engine();
         let (network, _cmd_rx, mut cmd_rx) = make_test_network();
         let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
-        let mut orch = ConsensusOrchestrator::new(engine, network, net_event_rx, output_rx);
+        let mut orch = ConsensusService::new(engine, network, net_event_rx, output_rx);
 
         let sk = test_key(0x12);
         let sig = sk.sign(b"test");
@@ -1864,7 +1864,7 @@ mod tests {
         let (engine, output_rx) = make_test_engine();
         let (network, _cmd_rx, mut cmd_rx) = make_test_network();
         let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
-        let mut orch = ConsensusOrchestrator::new(engine, network, net_event_rx, output_rx);
+        let mut orch = ConsensusService::new(engine, network, net_event_rx, output_rx);
 
         let sk = test_key(0x13);
         let sig = sk.sign(b"test");
@@ -1893,7 +1893,7 @@ mod tests {
         let (engine, output_rx) = make_test_engine();
         let (network, _cmd_rx, _prx) = make_test_network();
         let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
-        let mut orch = ConsensusOrchestrator::new(engine, network, net_event_rx, output_rx);
+        let mut orch = ConsensusService::new(engine, network, net_event_rx, output_rx);
         orch.handle_engine_output(EngineOutput::ExecuteBlock(B256::repeat_byte(0xCC)))
             .await;
     }
@@ -1903,7 +1903,7 @@ mod tests {
         let (engine, output_rx) = make_test_engine();
         let (network, _cmd_rx, _prx) = make_test_network();
         let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
-        let mut orch = ConsensusOrchestrator::new(engine, network, net_event_rx, output_rx);
+        let mut orch = ConsensusService::new(engine, network, net_event_rx, output_rx);
 
         let commit_qc = QuorumCertificate::genesis();
         orch.handle_engine_output(EngineOutput::BlockCommitted {
@@ -1926,7 +1926,7 @@ mod tests {
         let (engine, output_rx) = make_test_engine();
         let (network, _cmd_rx, _prx) = make_test_network();
         let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
-        let mut orch = ConsensusOrchestrator::new(engine, network, net_event_rx, output_rx);
+        let mut orch = ConsensusService::new(engine, network, net_event_rx, output_rx);
 
         let block_hash = B256::repeat_byte(0xA5);
         orch.store_committed_block(15, block_hash, QuorumCertificate::genesis(), None);
@@ -1959,7 +1959,7 @@ mod tests {
         let (engine, output_rx) = make_test_engine();
         let (network, _cmd_rx, _prx) = make_test_network();
         let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
-        let mut orch = ConsensusOrchestrator::new(engine, network, net_event_rx, output_rx);
+        let mut orch = ConsensusService::new(engine, network, net_event_rx, output_rx);
         orch.handle_engine_output(EngineOutput::ViewChanged { new_view: 5 })
             .await;
     }
@@ -1969,7 +1969,7 @@ mod tests {
         let (engine, output_rx) = make_test_engine();
         let (network, mut cmd_rx, _prx) = make_test_network();
         let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
-        let mut orch = ConsensusOrchestrator::new(engine, network, net_event_rx, output_rx);
+        let mut orch = ConsensusService::new(engine, network, net_event_rx, output_rx);
 
         let peer0 = Keypair::generate_ed25519().public().to_peer_id();
         let peer1 = Keypair::generate_ed25519().public().to_peer_id();
@@ -2011,7 +2011,7 @@ mod tests {
         let (engine, output_rx) = make_test_engine();
         let (network, mut cmd_rx, _prx) = make_test_network();
         let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
-        let mut orch = ConsensusOrchestrator::new(engine, network, net_event_rx, output_rx)
+        let mut orch = ConsensusService::new(engine, network, net_event_rx, output_rx)
             .with_allow_deterministic_validator_peers(false);
 
         let next_validators = vec![
@@ -2051,7 +2051,7 @@ mod tests {
         let (engine, output_rx) = make_test_engine();
         let (network, _cmd_rx, _prx) = make_test_network();
         let (net_event_tx, net_event_rx) = mpsc::channel::<NetworkEvent>(8192);
-        let orch = ConsensusOrchestrator::new(engine, network, net_event_rx, output_rx);
+        let orch = ConsensusService::new(engine, network, net_event_rx, output_rx);
         drop(net_event_tx);
 
         let result = tokio::time::timeout(Duration::from_secs(5), orch.run()).await;
@@ -2066,7 +2066,7 @@ mod tests {
         let (engine, output_rx) = make_test_engine();
         let (network, _cmd_rx, _prx) = make_test_network();
         let (net_event_tx, net_event_rx) = mpsc::channel::<NetworkEvent>(8192);
-        let orch = ConsensusOrchestrator::new(engine, network, net_event_rx, output_rx);
+        let orch = ConsensusService::new(engine, network, net_event_rx, output_rx);
 
         let peer_id = libp2p::PeerId::random();
         net_event_tx
@@ -2083,11 +2083,11 @@ mod tests {
 
     fn make_test_orchestrator_with_state(
         state: Option<Arc<SharedConsensusState>>,
-    ) -> ConsensusOrchestrator {
+    ) -> ConsensusService {
         let (engine, output_rx) = make_test_engine();
         let (network, _cmd_rx, _prx) = make_test_network();
         let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
-        let mut orch = ConsensusOrchestrator::new(engine, network, net_event_rx, output_rx);
+        let mut orch = ConsensusService::new(engine, network, net_event_rx, output_rx);
         orch.consensus_state = state;
         orch
     }
@@ -2198,7 +2198,7 @@ mod tests {
         let (engine, output_rx) = make_test_engine();
         let (network, _cmd_rx, _prx) = make_test_network();
         let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
-        let mut orch = ConsensusOrchestrator::new(engine, network, net_event_rx, output_rx);
+        let mut orch = ConsensusService::new(engine, network, net_event_rx, output_rx);
 
         let txs: Vec<Vec<u8>> = (0..5000)
             .map(|i| vec![(i & 0xff) as u8, ((i >> 8) & 0xff) as u8])
@@ -2216,7 +2216,7 @@ mod tests {
         let (engine, output_rx) = make_test_engine();
         let (network, _cmd_rx, _prx) = make_test_network();
         let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
-        let mut orch = ConsensusOrchestrator::new(engine, network, net_event_rx, output_rx);
+        let mut orch = ConsensusService::new(engine, network, net_event_rx, output_rx);
 
         orch.connected_peers.insert(libp2p::PeerId::random());
         orch.sync_in_flight = true;
@@ -2257,7 +2257,7 @@ mod tests {
         let (engine, output_rx) = make_test_engine();
         let (network, _cmd_rx, _prx) = make_test_network();
         let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
-        let orch = ConsensusOrchestrator::new(engine, network, net_event_rx, output_rx);
+        let orch = ConsensusService::new(engine, network, net_event_rx, output_rx);
 
         // Before recovery: prev_randao_cache is ZERO
         assert_eq!(orch.prev_randao_cache, B256::ZERO);

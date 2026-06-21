@@ -1,4 +1,4 @@
-use super::{BlockDataBroadcast, CommittedBlock, ConsensusOrchestrator};
+use super::{BlockDataBroadcast, CommittedBlock, ConsensusService};
 use crate::persistence::{self, ConsensusSnapshot};
 use alloy_primitives::B256;
 use metrics::counter;
@@ -59,7 +59,7 @@ pub(super) fn max_consecutive_empty_skips() -> u32 {
 
 // ── State persistence ──
 
-impl ConsensusOrchestrator {
+impl ConsensusService {
     /// Collects the staged epoch transition info from the epoch manager for persistence.
     fn collect_scheduled_epoch(&self) -> Option<(u64, Vec<n42_chainspec::ValidatorInfo>, u32)> {
         self.engine
@@ -200,7 +200,7 @@ impl ConsensusOrchestrator {
 
 // ── State sync ──
 
-impl ConsensusOrchestrator {
+impl ConsensusService {
     /// Initiates a state sync request to a connected peer.
     /// Uses deterministic peer rotation by view number to avoid always hitting the same peer.
     pub(super) fn initiate_sync(&mut self, local_view: u64, target_view: u64) {

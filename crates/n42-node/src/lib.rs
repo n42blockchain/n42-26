@@ -23,7 +23,11 @@ pub mod validator_peers;
 pub use components::{N42ConsensusBuilder, N42ExecutorBuilder};
 pub use consensus_state::SharedConsensusState;
 pub use node::N42Node;
-pub use orchestrator::ConsensusOrchestrator;
+pub use orchestrator::ConsensusService;
+/// Backwards-compatible alias retained one release while the Caplin EL-seam
+/// refactor renames `ConsensusOrchestrator` → [`ConsensusService`] (stage 5).
+/// External callers (`bin/n42-node`, RPC) keep compiling unchanged.
+pub use orchestrator::ConsensusService as ConsensusOrchestrator;
 pub use orchestrator::observer::ObserverOrchestrator;
 pub use payload::N42PayloadBuilder;
 pub use pool::N42PoolBuilder;

@@ -1,4 +1,4 @@
-use super::ConsensusOrchestrator;
+use super::ConsensusService;
 use super::state_mgmt::max_consecutive_empty_skips;
 use crate::el::ExecutionLayer;
 use crate::expected_validator_peer_ids_with_policy;
@@ -19,7 +19,7 @@ const EMPTY_BLOCK_CHECK_WINDOW: usize = 3;
 /// Payload size below which a block is considered "empty" (no meaningful transactions).
 const EMPTY_BLOCK_SIZE_THRESHOLD: usize = 512;
 
-impl ConsensusOrchestrator {
+impl ConsensusService {
     pub(super) fn recent_blocks_empty(&self) -> bool {
         let check_count = EMPTY_BLOCK_CHECK_WINDOW.min(self.committed_blocks.len());
         if check_count == 0 {
