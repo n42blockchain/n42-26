@@ -8,6 +8,10 @@ use crate::consensus_state::{PoolDepthSnapshot, SharedConsensusState};
 use crate::el::{ExecutionLayer, RethExecutionLayer};
 use crate::epoch_schedule::EpochSchedule;
 use crate::mobile_reward::MobileRewardManager;
+use crate::sinks::{
+    ManagerStakingSink, NodeWithdrawalSource, SbmtStateSink, SchedulerZkSink, StakingSink,
+    StateSink, TwigStateSink, WithdrawalSource, ZkSink,
+};
 use crate::staking::StakingManager;
 use crate::tx_bridge::TxImportBatch;
 use alloy_primitives::{Address, B256};
@@ -336,8 +340,19 @@ pub struct ConsensusOrchestrator {
     /// when a resolve task takes longer than the pacemaker timeout.
     build_complete_tx: mpsc::Sender<()>,
     build_complete_rx: mpsc::Receiver<()>,
+    /// Raw mobile-reward manager, kept only as builder scaffolding: it feeds the
+    /// [`WithdrawalSource`] port (`withdrawal_source`) but the orchestrator's
+    /// runtime logic never touches it directly. Stage 5/6 relocates construction.
     mobile_reward_manager: Option<Arc<Mutex<MobileRewardManager>>>,
+    /// Raw staking manager, kept only as builder scaffolding: it feeds both the
+    /// [`StakingSink`] (`staking_sink`) and the [`WithdrawalSource`] ports. The
+    /// orchestrator's runtime logic never touches it directly.
     staking_manager: Option<Arc<Mutex<StakingManager>>>,
+    /// Staking scan/persist behind the [`StakingSink`] port.
+    staking_sink: Option<Arc<dyn StakingSink>>,
+    /// Reward + matured-stake withdrawal computation behind the
+    /// [`WithdrawalSource`] port (build-path query).
+    withdrawal_source: Option<Arc<dyn WithdrawalSource>>,
     committed_block_count: u64,
     /// Tracks the timestamp of the last built/committed block to prevent
     /// "invalid timestamp" errors from the Engine API.  The Engine API requires
@@ -376,15 +391,15 @@ pub struct ConsensusOrchestrator {
     /// Moves finalize forkchoiceUpdated off the consensus select-loop hot path.
     /// Enabled by `N42_ASYNC_FINALIZE_FCU=1`. Default: false.
     async_finalize_fcu: bool,
-    /// Sparse Binary Merkle Tree for parallel state commitment.
-    /// Updated asynchronously after each committed block.
-    jmt: Option<Arc<Mutex<PersistentSbmt>>>,
-    /// Twig state tree for append-only state commitments.
-    /// Updated asynchronously after each committed block.
-    twig: Option<Arc<Mutex<PersistentTwig>>>,
-    /// ZK proof scheduler: generates ZK proofs asynchronously as a sidecar.
-    /// Enabled by `N42_ZK_PROOF=1`. Default: None (disabled, zero overhead).
-    zk_scheduler: Option<Arc<n42_zkproof::ProofScheduler>>,
+    /// Sparse Binary Merkle Tree for parallel state commitment, behind the
+    /// [`StateSink`] port. Updated asynchronously after each committed block.
+    jmt: Option<Arc<dyn StateSink>>,
+    /// Twig state tree for append-only state commitments, behind the
+    /// [`StateSink`] port. Updated asynchronously after each committed block.
+    twig: Option<Arc<dyn StateSink>>,
+    /// ZK proof scheduler behind the [`ZkSink`] port: generates ZK proofs
+    /// asynchronously as a sidecar. Enabled by `N42_ZK_PROOF=1`.
+    zk_scheduler: Option<Arc<dyn ZkSink>>,
     /// Whether deterministic validator PeerIds may be derived when no explicit
     /// `p2p_peer_id` bindings are configured.
     allow_deterministic_validator_peers: bool,
@@ -712,6 +727,8 @@ impl ConsensusOrchestrator {
             build_complete_rx,
             mobile_reward_manager: None,
             staking_manager: None,
+            staking_sink: None,
+            withdrawal_source: None,
             committed_block_count: 0,
             last_committed_timestamp: 0,
             view_started_at: None,
@@ -913,6 +930,8 @@ impl ConsensusOrchestrator {
             build_complete_rx,
             mobile_reward_manager: None,
             staking_manager: None,
+            staking_sink: None,
+            withdrawal_source: None,
             committed_block_count: 0,
             last_committed_timestamp: 0,
             view_started_at: None,
@@ -959,12 +978,25 @@ impl ConsensusOrchestrator {
 
     pub fn with_mobile_reward_manager(mut self, mgr: Arc<Mutex<MobileRewardManager>>) -> Self {
         self.mobile_reward_manager = Some(mgr);
+        self.rebuild_withdrawal_source();
         self
     }
 
     pub fn with_staking_manager(mut self, mgr: Arc<Mutex<StakingManager>>) -> Self {
+        self.staking_sink = Some(Arc::new(ManagerStakingSink(Arc::clone(&mgr))));
         self.staking_manager = Some(mgr);
+        self.rebuild_withdrawal_source();
         self
+    }
+
+    /// (Re)builds the [`WithdrawalSource`] port from whichever of the mobile
+    /// reward / staking managers have been wired so far. Called by the two
+    /// manager builders; both arrive via separate `with_*` calls.
+    fn rebuild_withdrawal_source(&mut self) {
+        self.withdrawal_source = Some(Arc::new(NodeWithdrawalSource {
+            reward: self.mobile_reward_manager.clone(),
+            staking: self.staking_manager.clone(),
+        }));
     }
 
     /// Restores the committed block count from a persisted snapshot.
@@ -980,12 +1012,12 @@ impl ConsensusOrchestrator {
     /// When set, the orchestrator consults the schedule at each `EpochTransition`
     /// event and automatically stages the next epoch's validator set.
     pub fn with_jmt(mut self, jmt: Arc<Mutex<PersistentSbmt>>) -> Self {
-        self.jmt = Some(jmt);
+        self.jmt = Some(Arc::new(SbmtStateSink(jmt)));
         self
     }
 
     pub fn with_twig(mut self, twig: Arc<Mutex<PersistentTwig>>) -> Self {
-        self.twig = Some(twig);
+        self.twig = Some(Arc::new(TwigStateSink(twig)));
         self
     }
 
@@ -995,7 +1027,7 @@ impl ConsensusOrchestrator {
     /// committed block (at the configured interval). Proofs are generated
     /// in `spawn_blocking` and never block the consensus path.
     pub fn with_zk_scheduler(mut self, scheduler: Arc<n42_zkproof::ProofScheduler>) -> Self {
-        self.zk_scheduler = Some(scheduler);
+        self.zk_scheduler = Some(Arc::new(SchedulerZkSink(scheduler)));
         self
     }
 

@@ -111,12 +111,8 @@ impl ConsensusOrchestrator {
         }
 
         // Also persist staking state
-        if let Some(ref staking_mgr) = self.staking_manager {
-            let mgr = staking_mgr.lock().unwrap_or_else(|e| {
-                tracing::warn!("staking_mgr mutex poisoned, recovering");
-                e.into_inner()
-            });
-            mgr.save();
+        if let Some(ref staking_sink) = self.staking_sink {
+            staking_sink.save();
         }
     }
 
@@ -356,16 +352,12 @@ impl ConsensusOrchestrator {
             self.import_and_notify(broadcast).await;
 
             // Fix #3: Scan sync-imported blocks for staking transactions.
-            if let Some(ref staking_mgr) = self.staking_manager
+            if let Some(ref staking_sink) = self.staking_sink
                 && !sync_block.payload.is_empty()
             {
                 match super::decompress_payload(&sync_block.payload) {
                     Ok(decompressed) => {
-                        let mut mgr = staking_mgr.lock().unwrap_or_else(|e| {
-                            tracing::warn!("staking_mgr mutex poisoned, recovering");
-                            e.into_inner()
-                        });
-                        mgr.scan_committed_block(sync_block.view, &decompressed);
+                        staking_sink.scan_committed_block(sync_block.view, &decompressed);
                     }
                     Err(e) => {
                         warn!(target: "n42::cl::sync", view = sync_block.view, error = %e, "failed to decompress sync payload for staking scan");

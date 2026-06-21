@@ -471,14 +471,11 @@ impl ConsensusOrchestrator {
                     let state = self.consensus_state.clone();
                     tokio::task::spawn_blocking(move || {
                         let start = std::time::Instant::now();
-                        let mut tree = jmt.lock().unwrap_or_else(|e| {
-                            tracing::warn!("sbmt mutex poisoned, recovering");
-                            e.into_inner()
-                        });
-                        // PersistentSbmt::apply_diff applies in-memory, appends the WAL
-                        // (durable per block) and checkpoints a snapshot every interval.
-                        // It returns a Result because the WAL/snapshot IO can fail.
-                        match tree.apply_diff(&diff) {
+                        // StateSink::apply_diff locks the SBMT internally, applies
+                        // in-memory, appends the WAL (durable per block) and checkpoints
+                        // a snapshot every interval. It returns a Result because the
+                        // WAL/snapshot IO can fail.
+                        match jmt.apply_diff(&diff) {
                             Ok((version, root)) => {
                                 let elapsed_ms = start.elapsed().as_millis();
                                 gauge!("n42_jmt_latest_root").set(version as f64);
@@ -508,11 +505,8 @@ impl ConsensusOrchestrator {
                     let state = self.consensus_state.clone();
                     tokio::task::spawn_blocking(move || {
                         let start = std::time::Instant::now();
-                        let mut tree = twig.lock().unwrap_or_else(|e| {
-                            tracing::warn!("twig mutex poisoned, recovering");
-                            e.into_inner()
-                        });
-                        match tree.apply_diff(&diff) {
+                        // StateSink::apply_diff locks the Twig tree internally.
+                        match twig.apply_diff(&diff) {
                             Ok((version, root)) => {
                                 let elapsed_ms = start.elapsed().as_millis();
                                 gauge!("n42_twig_latest_root").set(version as f64);
@@ -571,17 +565,13 @@ impl ConsensusOrchestrator {
         }
 
         // Scan committed block for staking/unstaking transactions.
-        if let Some(ref staking_mgr) = self.staking_manager
+        if let Some(ref staking_sink) = self.staking_sink
             && let Some(data) = self.committed_blocks.back().map(|b| b.payload.as_slice())
             && !data.is_empty()
         {
             match super::decompress_payload(data) {
                 Ok(decompressed) => {
-                    let mut mgr = staking_mgr.lock().unwrap_or_else(|e| {
-                        tracing::warn!("staking_mgr mutex poisoned, recovering");
-                        e.into_inner()
-                    });
-                    mgr.scan_committed_block(self.committed_block_count, &decompressed);
+                    staking_sink.scan_committed_block(self.committed_block_count, &decompressed);
                 }
                 Err(e) => {
                     warn!(target: "n42::cl::consensus_loop", error = %e, "failed to decompress payload for staking scan");

@@ -222,65 +222,14 @@ impl ConsensusOrchestrator {
             timestamp = bumped;
         }
 
-        // 1. Pre-fetch staked BLS pubkeys (lock StakingManager, then release).
-        //    This avoids holding both locks simultaneously and prevents deadlocks.
-        let staked_pubkeys = if let Some(ref staking_mgr) = self.staking_manager {
-            let mgr = staking_mgr.lock().unwrap_or_else(|e| {
-                tracing::warn!("staking_mgr mutex poisoned, recovering");
-                e.into_inner()
-            });
-            mgr.staked_bls_pubkeys()
-        } else {
-            std::collections::HashSet::new()
-        };
-
-        // 2. Compute mobile rewards (lock MobileRewardManager).
-        let mut withdrawals = vec![];
-        if let Some(ref reward_mgr) = self.mobile_reward_manager {
-            let mut mgr = reward_mgr.lock().unwrap_or_else(|e| {
-                error!(target: "n42::cl::exec_bridge", "mobile_reward_manager mutex poisoned: {e}");
-                e.into_inner()
-            });
-            let next_block_number = self.committed_block_count + 1;
-            mgr.check_epoch_boundary(next_block_number, &staked_pubkeys);
-            withdrawals = mgr.take_pending_rewards(next_block_number);
-            if !withdrawals.is_empty() {
-                info!(
-                    target: "n42::cl::exec_bridge",
-                    count = withdrawals.len(),
-                    "injecting mobile rewards as withdrawals"
-                );
-            }
-        }
-
-        // 3. Staking integration: resolve reward addresses and add cooldown returns.
-        //    Re-acquire StakingManager lock for address resolution and cooldown checks.
-        if let Some(ref staking_mgr) = self.staking_manager {
-            let mut staking = staking_mgr.lock().unwrap_or_else(|e| {
-                tracing::warn!("staking_mgr mutex poisoned, recovering");
-                e.into_inner()
-            });
-
-            // Reward address resolution: BLS-derived keccak → staker's actual EVM address.
-            for w in &mut withdrawals {
-                if let Some(addr) = staking.staker_address_by_reward(w.address) {
-                    w.address = addr;
-                }
-            }
-
-            // Cooldown expiration checks + return withdrawals.
-            let next_block_number = self.committed_block_count + 1;
-            staking.check_cooldowns(next_block_number);
-            let returns = staking.take_pending_returns(next_block_number, 8);
-            if !returns.is_empty() {
-                info!(
-                    target: "n42::cl::exec_bridge",
-                    count = returns.len(),
-                    "injecting staking returns as withdrawals"
-                );
-                withdrawals.extend(returns);
-            }
-        }
+        // Mobile rewards (epoch boundary) + matured stake returns, with reward
+        // addresses resolved to staker EVM addresses, computed behind the
+        // WithdrawalSource port. Empty when neither manager is wired.
+        let withdrawals = self
+            .withdrawal_source
+            .as_ref()
+            .map(|src| src.withdrawals_for_block(self.committed_block_count + 1))
+            .unwrap_or_default();
 
         PayloadAttributes {
             timestamp,
@@ -341,26 +290,24 @@ impl ConsensusOrchestrator {
         );
         let should_record_commit_to_build = self.last_commit_hash == Some(parent)
             && self.commit_to_build_recorded_parent != Some(parent);
-        if should_record_commit_to_build {
-            if let Some(last_commit) = self.last_commit_instant {
-                let commit_to_build_start_ms =
-                    build_start.duration_since(last_commit).as_millis() as u64;
-                metrics::histogram!("n42_commit_to_build_start_ms")
-                    .record(commit_to_build_start_ms as f64);
-                self.commit_to_build_recorded_parent = Some(parent);
-                info!(
-                    target: "n42::cl::exec_bridge",
-                    view,
-                    %parent,
-                    last_commit_view = self.last_commit_view.unwrap_or_default(),
-                    last_commit_hash = ?self.last_commit_hash,
-                    commit_to_build_start_ms,
-                    pool_pending = pool_depth.pending,
-                    pool_queued = pool_depth.queued,
-                    async_finalize_fcu = self.async_finalize_fcu,
-                    "N42_CADENCE: commit->build_start"
-                );
-            }
+        if should_record_commit_to_build && let Some(last_commit) = self.last_commit_instant {
+            let commit_to_build_start_ms =
+                build_start.duration_since(last_commit).as_millis() as u64;
+            metrics::histogram!("n42_commit_to_build_start_ms")
+                .record(commit_to_build_start_ms as f64);
+            self.commit_to_build_recorded_parent = Some(parent);
+            info!(
+                target: "n42::cl::exec_bridge",
+                view,
+                %parent,
+                last_commit_view = self.last_commit_view.unwrap_or_default(),
+                last_commit_hash = ?self.last_commit_hash,
+                commit_to_build_start_ms,
+                pool_pending = pool_depth.pending,
+                pool_queued = pool_depth.queued,
+                async_finalize_fcu = self.async_finalize_fcu,
+                "N42_CADENCE: commit->build_start"
+            );
         }
         self.building_on_parent = Some(parent);
         self.build_triggered_at = Some(build_start);
