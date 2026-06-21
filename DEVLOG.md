@@ -99,6 +99,21 @@ Logs are split into separate files by phase for easy maintenance:
 | [devlog-70-p6-node-e2e-closeout](docs/devlog-70-p6-node-e2e-closeout.md) | P6 节点 E2E 收尾：fresh 4-node Twig root 一致、WAL crash recovery、leader drain finalization；真实 8s slot profiling 另见 devlog-71 | Verification |
 | [devlog-71-real-slot-profile](docs/devlog-71-real-slot-profile.md) | macOS 真实 4-node slot profiling pilot：transfer/contract-heavy + mobile sim + Twig，记录 critical-path 和采样限制 | Profiling |
 
+### 高 TPS 调查（devlog-80→87，已收尾）
+
+合成压力工况（7 节点、2s 出块、90k tx/块、skip-verify、deferred state-root）下定位高 TPS 墙钟尾的真因。**结论**：墙钟尾不是 EVM、不是卡死的 `building_on_parent` guard，而是 90k 压力下 reth(EL) 落后共识 **2-6 块**（head_lag p50=4/p95=6），leader 在 EL 还没追上的 head 上构建 → FCU 返回 `Syncing/no-payload` → 不广播 → 10s 超时级联。**leader 单边 backpressure 已被 A/B 数据否决**（验证者独立超时，治标更差）；真正的修复需网络可见的 view-extension 或抬高 EL 吞吐天花板。合成数 64-90k 块 TPS / 9k 持续已远超 8s-slot 生产目标，调查归档收手。
+
+| 文件 | 内容 | 类型 |
+|------|------|------|
+| [devlog-80-interblock-cadence](docs/devlog-80-interblock-cadence.md) | inter-block cadence 探针：30s 尾是 harness pool-drain 假象，leader build 1.9-2.6s | Profiling |
+| [devlog-81-batch-transfer-fastlane-bench](docs/devlog-81-batch-transfer-fastlane-bench.md) | pool-depth 诊断 + batch-transfer 快车道（CPU-only：批量 ecrecover 1e4-5e4× 降，48-64M transfers/s，带宽受限）| Benchmark |
+| [devlog-82-continuous-cadence](docs/devlog-82-continuous-cadence.md) | per-node-continuous 重测：30s 假象消失（inter-block p95 31.7s→12.4s），暴露满池超时 | Profiling |
+| [devlog-83-timeout-view](docs/devlog-83-timeout-view.md) | 满池超时=leader 侧不广播视图（81.8%）；smoking gun：reth worker 线程 tracing span panic | Diagnosis |
+| [devlog-84-fix-payload-span-panic](docs/devlog-84-fix-payload-span-panic.md) | span panic 修复（n42 `Span::none()` + reth `parent: &parent_span`，0 panic）；但非 TPS 收益 | Bug Fix |
+| [devlog-85-fcu-nopayload-noleaderbuild](docs/devlog-85-fcu-nopayload-noleaderbuild.md) | 真因二分：A=FCU 返回 Syncing/no-payload；B=leader 在 bg import 在途换届被迫 defer；均=EL/import 跟不上节奏 | Diagnosis |
+| [devlog-86-el-headlag](docs/devlog-86-el-headlag.md) | EL head-lag 钩子量化：Syncing/no-payload 时 head_lag 稳定 2-6 块（真·多块滞后，非 1 块竞态）| Diagnosis |
+| [devlog-87-el-backpressure-scheduler](docs/devlog-87-el-backpressure-scheduler.md) | EL-backpressure 调度器（flag 门控）A/B：no-gain，leader 单边延迟治标更差，默认 OFF，不并入 | Benchmark |
+
 ---
 
 New entries: append to the corresponding category file, or create a new numbered file (e.g., `devlog-57-xxx.md`) in `docs/`.
