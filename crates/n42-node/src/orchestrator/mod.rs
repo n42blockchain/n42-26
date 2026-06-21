@@ -5,7 +5,7 @@ mod state_mgmt;
 mod view_jump_throttle;
 
 use crate::consensus_state::{PoolDepthSnapshot, SharedConsensusState};
-use crate::el::{ExecutionLayer, RethExecutionLayer};
+use crate::el::ExecutionLayer;
 use crate::epoch_schedule::EpochSchedule;
 use crate::mobile_reward::MobileRewardManager;
 use crate::net_port::ConsensusNetwork;
@@ -21,9 +21,6 @@ use n42_consensus::{ConsensusEngine, EngineOutput, FUTURE_VIEW_WINDOW, Validator
 use n42_jmt::{PersistentSbmt, PersistentTwig};
 use n42_network::{NetworkEvent, NetworkHandle, PeerId};
 use n42_primitives::QuorumCertificate;
-use reth_ethereum_engine_primitives::EthEngineTypes;
-use reth_node_builder::ConsensusEngineHandle;
-use reth_payload_builder::PayloadBuilderHandle;
 use reth_transaction_pool::blobstore::DiskFileBlobStore;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
@@ -844,14 +841,13 @@ impl ConsensusService {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn with_engine_api(
+    pub fn with_execution_layer(
         engine: ConsensusEngine,
         network: NetworkHandle,
         consensus_event_rx: mpsc::Receiver<NetworkEvent>,
         net_event_rx: mpsc::Receiver<NetworkEvent>,
         output_rx: mpsc::Receiver<EngineOutput>,
-        beacon_engine: ConsensusEngineHandle<EthEngineTypes>,
-        payload_builder: PayloadBuilderHandle<EthEngineTypes>,
+        el: Arc<dyn ExecutionLayer>,
         consensus_state: Arc<SharedConsensusState>,
         head_block_hash: B256,
         fee_recipient: Address,
@@ -886,10 +882,7 @@ impl ConsensusService {
             consensus_event_rx: Some(consensus_event_rx),
             net_event_rx,
             output_rx,
-            el: Some(Arc::new(RethExecutionLayer::new(
-                beacon_engine,
-                payload_builder,
-            ))),
+            el: Some(el),
             consensus_state: Some(consensus_state),
             head_block_hash,
             last_commit_qc: None,

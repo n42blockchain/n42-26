@@ -1,18 +1,14 @@
 use super::{BlobSidecarBroadcast, BlockDataBroadcast, CompactBlockExecution, ConsensusService};
-use crate::el::ExecutionLayer;
+use crate::el::{BuiltBlock, ExecutionLayer, ResolveKind};
 use crate::ingest::note_virtual_block_credit;
 use crate::net_port::ConsensusNetwork;
 use crate::now_unix_ms;
-use alloy_consensus::Typed2718;
 use alloy_eips::eip7594::BlobTransactionSidecarVariant;
 use alloy_primitives::{Address, B256};
 use alloy_rlp::Encodable;
-use alloy_rpc_types_engine::{ForkchoiceState, PayloadAttributes, PayloadStatusEnum};
+use alloy_rpc_types_engine::{ForkchoiceState, PayloadAttributes, PayloadId, PayloadStatusEnum};
 use n42_consensus::ConsensusEvent;
-use reth_ethereum_engine_primitives::EthEngineTypes;
 use reth_execution_types::{BlockExecutionOutput, BlockExecutionResult};
-use reth_payload_builder::{EthBuiltPayload, PayloadId};
-use reth_payload_primitives::{PayloadKind, PayloadTypes};
 use reth_transaction_pool::blobstore::{BlobStore, DiskFileBlobStore};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -425,7 +421,7 @@ impl ConsensusService {
 
             let resolve_result = tokio::time::timeout(
                 PAYLOAD_BUILD_TIMEOUT,
-                el.resolve_payload(payload_id, PayloadKind::WaitForPending),
+                el.resolve_payload(payload_id, ResolveKind::WaitForPending),
             )
             .await;
 
@@ -438,9 +434,9 @@ impl ConsensusService {
             };
 
             match payload_opt {
-                Some(Ok(payload)) => {
+                Some(Ok(built)) => {
                     handle_built_payload(
-                        payload,
+                        built,
                         el,
                         network,
                         block_ready_tx,
@@ -1048,7 +1044,7 @@ impl ConsensusService {
     fields(view = current_view, hash = tracing::field::Empty, block_number = tracing::field::Empty)
 )]
 async fn handle_built_payload(
-    payload: EthBuiltPayload,
+    built: BuiltBlock,
     el: Arc<dyn ExecutionLayer>,
     network: Arc<dyn ConsensusNetwork>,
     block_ready_tx: mpsc::Sender<B256>,
@@ -1059,15 +1055,19 @@ async fn handle_built_payload(
     block_guard: Arc<std::sync::atomic::AtomicU64>,
     build_start: Instant,
 ) {
-    let hash = payload.block().hash();
+    let BuiltBlock {
+        hash,
+        number: block_number,
+        timestamp: block_timestamp,
+        tx_count,
+        execution_data,
+        blob_tx_hashes,
+    } = built;
     {
         let span = tracing::Span::current();
         span.record("hash", tracing::field::display(&hash));
-        span.record("block_number", payload.block().header().number);
+        span.record("block_number", block_number);
     }
-
-    let execution_data =
-        <EthEngineTypes as PayloadTypes>::block_to_payload(payload.block().clone(), None);
 
     let ser_start = std::time::Instant::now();
     let payload_json = match serde_json::to_vec(&execution_data) {
@@ -1079,8 +1079,6 @@ async fn handle_built_payload(
     };
     let ser_ms = ser_start.elapsed().as_millis() as u64;
 
-    let block_timestamp = payload.block().header().timestamp;
-    let tx_count = payload.block().body().transactions().count();
     info!(
         target: "n42::cl::exec_bridge",
         %hash,
@@ -1129,7 +1127,13 @@ async fn handle_built_payload(
         build_start,
     )
     .await;
-    broadcast_blob_sidecars(network.as_ref(), &payload, hash, current_view, blob_store);
+    broadcast_blob_sidecars(
+        network.as_ref(),
+        blob_tx_hashes,
+        hash,
+        current_view,
+        blob_store,
+    );
 
     // 2. Trigger consensus voting immediately (non-blocking channel send)
     if block_ready_tx.send(hash).await.is_err() {
@@ -1142,7 +1146,6 @@ async fn handle_built_payload(
     //
     //    Guard: prevent importing the same block number with different hashes,
     //    which triggers reth pipeline sync and chain stalls.
-    let block_number = payload.block().header().number;
     let prev = block_guard.fetch_max(block_number, std::sync::atomic::Ordering::SeqCst);
     if prev >= block_number {
         debug!(target: "n42::cl::exec_bridge", %hash, block_number, prev, "leader eager import: skipping duplicate block number");
@@ -1328,7 +1331,7 @@ async fn broadcast_block_data(
 
 fn broadcast_blob_sidecars(
     network: &dyn ConsensusNetwork,
-    payload: &EthBuiltPayload,
+    blob_tx_hashes: Vec<B256>,
     hash: B256,
     current_view: u64,
     blob_store: Option<DiskFileBlobStore>,
@@ -1337,14 +1340,6 @@ fn broadcast_blob_sidecars(
         Some(bs) => bs,
         None => return,
     };
-
-    let blob_tx_hashes: Vec<B256> = payload
-        .block()
-        .body()
-        .transactions()
-        .filter(|tx| tx.is_eip4844())
-        .map(|tx| *tx.tx_hash())
-        .collect();
 
     if blob_tx_hashes.is_empty() {
         return;

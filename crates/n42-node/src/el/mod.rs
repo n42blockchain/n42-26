@@ -9,11 +9,10 @@
 mod reth_engine;
 pub use reth_engine::RethExecutionLayer;
 
+use alloy_primitives::B256;
 use alloy_rpc_types_engine::{
     ExecutionData, ForkchoiceState, ForkchoiceUpdated, PayloadAttributes, PayloadId, PayloadStatus,
 };
-use reth_payload_builder::EthBuiltPayload;
-use reth_payload_primitives::PayloadKind;
 
 /// Error at the EL boundary. Erases reth's concrete engine error enums
 /// (`BeaconOnNewPayloadError` / `BeaconForkChoiceUpdateError` / `PayloadBuilderError`)
@@ -21,6 +20,37 @@ use reth_payload_primitives::PayloadKind;
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
 pub struct ElError(pub String);
+
+/// Node-neutral result of a completed payload build. Carries only alloy/std
+/// types so the [`ExecutionLayer`] trait stays free of reth concretes (the
+/// in-process adapter converts reth's `EthBuiltPayload` into this). The
+/// orchestrator broadcasts + eager-imports from these fields.
+#[derive(Debug, Clone)]
+pub struct BuiltBlock {
+    /// Block hash of the built block.
+    pub hash: B256,
+    /// Block number.
+    pub number: u64,
+    /// Block timestamp (seconds).
+    pub timestamp: u64,
+    /// Number of transactions in the block.
+    pub tx_count: usize,
+    /// Engine-API execution payload (alloy wire type) for re-import via
+    /// `new_payload` and serialization to followers.
+    pub execution_data: ExecutionData,
+    /// Transaction hashes of the EIP-4844 (blob) transactions in this block,
+    /// used to gather + broadcast their sidecars.
+    pub blob_tx_hashes: Vec<B256>,
+}
+
+/// How to resolve a started build — node-neutral replacement for reth's
+/// `PayloadKind` (the adapter maps it). Only the wait-for-pending mode is used
+/// today (block until the builder finishes packing).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolveKind {
+    /// Wait for the pending build to finish before resolving.
+    WaitForPending,
+}
 
 /// The execution-layer seam the consensus orchestrator calls instead of holding
 /// reth's `ConsensusEngineHandle` / `PayloadBuilderHandle` directly.
@@ -49,14 +79,12 @@ pub trait ExecutionLayer: Send + Sync + 'static {
     ) -> Result<ForkchoiceUpdated, ElError>;
 
     /// Resolve a started build to its payload (blocks until the pending build
-    /// completes). `None` ⇒ no such job.
-    ///
-    /// NOTE: still returns reth's `EthBuiltPayload`, keeping the existing
-    /// `handle_built_payload` conversion unchanged. A node-neutral `BuiltBlock`
-    /// result is a follow-up for when this trait is promoted into its own crate.
+    /// completes). `None` ⇒ no such job. Returns a node-neutral [`BuiltBlock`]
+    /// so this trait carries no reth types — the in-process adapter converts
+    /// reth's `EthBuiltPayload`.
     async fn resolve_payload(
         &self,
         id: PayloadId,
-        kind: PayloadKind,
-    ) -> Option<Result<EthBuiltPayload, ElError>>;
+        kind: ResolveKind,
+    ) -> Option<Result<BuiltBlock, ElError>>;
 }

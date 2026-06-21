@@ -1390,14 +1390,19 @@ fn main() {
                     );
                 }
 
-                let mut orchestrator = ConsensusOrchestrator::with_engine_api(
+                let el: std::sync::Arc<dyn n42_node::el::ExecutionLayer> = std::sync::Arc::new(
+                    n42_node::el::RethExecutionLayer::new(
+                        beacon_engine_handle,
+                        payload_builder_handle,
+                    ),
+                );
+                let mut orchestrator = ConsensusOrchestrator::with_execution_layer(
                     consensus_engine,
                     net_handle,
                     consensus_event_rx,
                     net_event_rx,
                     output_rx,
-                    beacon_engine_handle,
-                    payload_builder_handle,
+                    el,
                     consensus_state,
                     head_block_hash,
                     fee_recipient,
