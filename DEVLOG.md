@@ -114,6 +114,12 @@ Logs are split into separate files by phase for easy maintenance:
 | [devlog-86-el-headlag](docs/devlog-86-el-headlag.md) | EL head-lag 钩子量化：Syncing/no-payload 时 head_lag 稳定 2-6 块（真·多块滞后，非 1 块竞态）| Diagnosis |
 | [devlog-87-el-backpressure-scheduler](docs/devlog-87-el-backpressure-scheduler.md) | EL-backpressure 调度器（flag 门控）A/B：no-gain，leader 单边延迟治标更差，默认 OFF，不并入 | Benchmark |
 
+### Caplin EL-seam 重构（stage 3-6）
+
+| 文件 | 内容 | 类型 |
+|------|------|------|
+| [devlog-88-caplin-cl-seam-stage3-6](docs/devlog-88-caplin-cl-seam-stage3-6.md) | 把共识层重构成 Caplin 式 ports-and-adapters：sink/network/EL/blob/exec-cache 全走 port trait，抽出 `n42-consensus-service` crate（硬-reth-free，允许 revm/Receipt）；行为字节级等同，212 单测+6 集成绿；E2E 待 datc 让机 | Architecture |
+
 ---
 
 New entries: append to the corresponding category file, or create a new numbered file (e.g., `devlog-57-xxx.md`) in `docs/`.
