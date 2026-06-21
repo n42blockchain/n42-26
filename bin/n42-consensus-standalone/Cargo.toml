@@ -1,0 +1,25 @@
+[package]
+name = "n42-consensus-standalone"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "n42-consensus-standalone"
+path = "src/main.rs"
+
+[dependencies]
+n42-el-rpc = { workspace = true }
+n42-consensus-service = { workspace = true }
+n42-consensus = { workspace = true }
+n42-chainspec = { workspace = true }
+n42-primitives = { workspace = true }
+n42-network = { workspace = true }
+
+alloy-primitives = { workspace = true }
+alloy-rpc-types-engine = { workspace = true, features = ["serde", "jwt"] }
+
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "bin/n42-node",
+    "bin/n42-consensus-standalone",
     "bin/n42-mobile-sim",
     "bin/n42-stress",
     "bin/n42-evm-bench",
@@ -8,6 +9,7 @@ members = [
     "crates/n42-chainspec",
     "crates/n42-consensus",
     "crates/n42-consensus-service",
+    "crates/n42-el-rpc",
     "crates/n42-execution",
     "crates/n42-mobile",
     "crates/n42-mobile-ffi",
@@ -37,6 +39,7 @@ n42-primitives = { path = "crates/n42-primitives" }
 n42-chainspec = { path = "crates/n42-chainspec" }
 n42-consensus = { path = "crates/n42-consensus" }
 n42-consensus-service = { path = "crates/n42-consensus-service" }
+n42-el-rpc = { path = "crates/n42-el-rpc" }
 n42-execution = { path = "crates/n42-execution" }
 n42-mobile = { path = "crates/n42-mobile" }
 n42-mobile-ffi = { path = "crates/n42-mobile-ffi" }
