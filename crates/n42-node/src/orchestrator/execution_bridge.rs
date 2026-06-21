@@ -1,15 +1,13 @@
 use super::{BlobSidecarBroadcast, BlockDataBroadcast, ConsensusService};
+use crate::blob_port::BlobStorePort;
 use crate::el::{BuiltBlock, ExecutionLayer, ResolveKind};
 use crate::exec_cache::ExecutionOutputCache;
 use crate::ingest::note_virtual_block_credit;
 use crate::net_port::ConsensusNetwork;
 use crate::now_unix_ms;
-use alloy_eips::eip7594::BlobTransactionSidecarVariant;
 use alloy_primitives::B256;
-use alloy_rlp::Encodable;
 use alloy_rpc_types_engine::{ForkchoiceState, PayloadAttributes, PayloadId, PayloadStatusEnum};
 use n42_consensus::ConsensusEvent;
-use reth_transaction_pool::blobstore::{BlobStore, DiskFileBlobStore};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -634,18 +632,9 @@ impl ConsensusService {
 
         let sidecar_count = broadcast.sidecars.len();
         for (tx_hash, sidecar_rlp) in broadcast.sidecars {
-            match <BlobTransactionSidecarVariant as alloy_rlp::Decodable>::decode(
-                &mut &sidecar_rlp[..],
-            ) {
-                Ok(sidecar) => {
-                    if let Err(e) = blob_store.insert(tx_hash, sidecar) {
-                        debug!(target: "n42::cl::exec_bridge", %tx_hash, error = %e, "failed to insert blob sidecar");
-                    }
-                }
-                Err(e) => {
-                    warn!(target: "n42::cl::exec_bridge", %tx_hash, error = %e, "failed to decode blob sidecar RLP");
-                }
-            }
+            // RLP decode + insert (and per-sidecar decode/insert failure logging)
+            // happen inside the BlobStorePort adapter, byte-identical to before.
+            blob_store.insert_rlp(tx_hash, &sidecar_rlp);
         }
 
         debug!(
@@ -928,7 +917,7 @@ async fn handle_built_payload(
     block_ready_tx: mpsc::Sender<B256>,
     leader_payload_tx: mpsc::Sender<(B256, Vec<u8>)>,
     current_view: u64,
-    blob_store: Option<DiskFileBlobStore>,
+    blob_store: Option<Arc<dyn BlobStorePort>>,
     exec_output_cache: Option<Arc<dyn ExecutionOutputCache>>,
     eager_import_done_tx: mpsc::Sender<(B256, u64)>,
     block_guard: Arc<std::sync::atomic::AtomicU64>,
@@ -1215,7 +1204,7 @@ fn broadcast_blob_sidecars(
     blob_tx_hashes: Vec<B256>,
     hash: B256,
     current_view: u64,
-    blob_store: Option<DiskFileBlobStore>,
+    blob_store: Option<Arc<dyn BlobStorePort>>,
 ) {
     let blob_store = match blob_store {
         Some(bs) => bs,
@@ -1226,17 +1215,8 @@ fn broadcast_blob_sidecars(
         return;
     }
 
-    match blob_store.get_all(blob_tx_hashes) {
-        Ok(sidecars) if !sidecars.is_empty() => {
-            let encoded_sidecars: Vec<(B256, Vec<u8>)> = sidecars
-                .into_iter()
-                .map(|(tx_hash, sidecar)| {
-                    let mut buf = Vec::new();
-                    sidecar.encode(&mut buf);
-                    (tx_hash, buf)
-                })
-                .collect();
-
+    match blob_store.get_all_encoded(blob_tx_hashes) {
+        Ok(encoded_sidecars) if !encoded_sidecars.is_empty() => {
             let sidecar_count = encoded_sidecars.len();
             let broadcast = BlobSidecarBroadcast {
                 block_hash: hash,

@@ -734,7 +734,7 @@ impl ConsensusService {
 
             // Deferred state root mode: log that state root verification is pending.
             // Future: spawn async state root computation here using reth's provider.
-            if reth_evm::n42_defer_state_root() {
+            if self.defer_state_root {
                 debug!(target: "n42::cl::consensus_loop", view, %block_hash,
                     "N42_DEFER_STATE_ROOT: block finalized with deferred state root (B256::ZERO)");
             }

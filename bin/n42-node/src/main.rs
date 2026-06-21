@@ -1411,7 +1411,10 @@ fn main() {
                 .with_mobile_packet_tx(mobile_packet_tx)
                 .with_state_persistence(state_file)
                 .with_validator_set(startup_validator_set)
-                .with_blob_store(full_node.pool.blob_store().clone())
+                .with_blob_store(std::sync::Arc::new(n42_node::blob_port::DiskBlobStorePort(
+                    full_node.pool.blob_store().clone(),
+                )))
+                .with_defer_state_root(n42_node::defer_state_root_enabled())
                 .with_exec_output_cache(std::sync::Arc::new(
                     n42_node::exec_cache::RethExecutionOutputCache,
                 ))

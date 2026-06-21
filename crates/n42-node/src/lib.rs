@@ -1,4 +1,5 @@
 pub mod attestation_store;
+pub mod blob_port;
 mod components;
 pub mod consensus_state;
 pub mod el;
@@ -45,4 +46,11 @@ pub(crate) fn now_unix_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+/// Whether deferred state-root mode is enabled (env `N42_DEFER_STATE_ROOT`).
+/// Re-exported so the node binary can read it once at startup and pass it to the
+/// `ConsensusService` without depending on `reth_evm` directly.
+pub fn defer_state_root_enabled() -> bool {
+    reth_evm::n42_defer_state_root()
 }

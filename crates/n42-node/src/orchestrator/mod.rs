@@ -4,6 +4,7 @@ pub mod observer;
 mod state_mgmt;
 mod view_jump_throttle;
 
+use crate::blob_port::BlobStorePort;
 use crate::consensus_state::{PoolDepthSnapshot, SharedConsensusState};
 use crate::el::ExecutionLayer;
 use crate::epoch_schedule::EpochSchedule;
@@ -15,14 +16,12 @@ use crate::sinks::{
     StateSink, TwigStateSink, WithdrawalSource, ZkSink,
 };
 use crate::staking::StakingManager;
-use crate::tx_bridge::TxImportBatch;
 use alloy_primitives::{Address, B256};
 use metrics::{counter, gauge, histogram};
 use n42_consensus::{ConsensusEngine, EngineOutput, FUTURE_VIEW_WINDOW, ValidatorSet};
 use n42_jmt::{PersistentSbmt, PersistentTwig};
 use n42_network::{NetworkEvent, NetworkHandle, PeerId};
 use n42_primitives::QuorumCertificate;
-use reth_transaction_pool::blobstore::DiskFileBlobStore;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -30,6 +29,12 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tracing::{debug, error, info, warn};
+
+/// Batched network transaction import payload sent to the tx-pool bridge. Defined
+/// locally (identical to `tx_bridge::TxImportBatch`) so the consensus service does
+/// not depend on the reth-coupled `tx_bridge` module — both are `Vec<Vec<u8>>`, so
+/// the channel ends stay compatible.
+pub type TxImportBatch = Vec<Vec<u8>>;
 
 /// zstd magic bytes: all zstd frames start with 0x28B52FFD.
 const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
@@ -312,7 +317,7 @@ pub struct ConsensusService {
     /// Tuple: (view, block_hash, commit_qc, finalized).
     finalize_done_rx: mpsc::Receiver<FinalizeDone>,
     finalize_done_tx: mpsc::Sender<FinalizeDone>,
-    blob_store: Option<DiskFileBlobStore>,
+    blob_store: Option<Arc<dyn BlobStorePort>>,
     /// Compact-block execution-output cache behind the [`ExecutionOutputCache`]
     /// port. `None` ⇒ compact-block inject/take are no-ops (tests / EL-less).
     exec_output_cache: Option<Arc<dyn ExecutionOutputCache>>,
@@ -396,6 +401,10 @@ pub struct ConsensusService {
     /// Moves finalize forkchoiceUpdated off the consensus select-loop hot path.
     /// Enabled by `N42_ASYNC_FINALIZE_FCU=1`. Default: false.
     async_finalize_fcu: bool,
+    /// Deferred state-root mode (env `N42_DEFER_STATE_ROOT`, read once by the node
+    /// at construction). When set, finalized blocks log a deferred-state-root note.
+    /// Cached as a `bool` so the orchestrator no longer calls the reth EVM helper.
+    defer_state_root: bool,
     /// Sparse Binary Merkle Tree for parallel state commitment, behind the
     /// [`StateSink`] port. Updated asynchronously after each committed block.
     jmt: Option<Arc<dyn StateSink>>,
@@ -753,6 +762,7 @@ impl ConsensusService {
                 .unwrap_or(0)
                 > 0,
             async_finalize_fcu: Self::async_finalize_fcu_enabled(),
+            defer_state_root: false,
             jmt: None,
             twig: None,
             zk_scheduler: None,
@@ -949,6 +959,7 @@ impl ConsensusService {
             eager_import_block_guard: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             fast_propose,
             async_finalize_fcu,
+            defer_state_root: false,
             jmt: None,
             twig: None,
             zk_scheduler: None,
@@ -964,8 +975,15 @@ impl ConsensusService {
         self
     }
 
-    pub fn with_blob_store(mut self, blob_store: DiskFileBlobStore) -> Self {
+    pub fn with_blob_store(mut self, blob_store: Arc<dyn BlobStorePort>) -> Self {
         self.blob_store = Some(blob_store);
+        self
+    }
+
+    /// Caches the deferred-state-root mode (read from `N42_DEFER_STATE_ROOT` by the
+    /// node) so the orchestrator does not call the reth EVM helper directly.
+    pub fn with_defer_state_root(mut self, defer: bool) -> Self {
+        self.defer_state_root = defer;
         self
     }
 
