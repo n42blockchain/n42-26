@@ -8,6 +8,7 @@ use crate::consensus_state::{PoolDepthSnapshot, SharedConsensusState};
 use crate::el::{ExecutionLayer, RethExecutionLayer};
 use crate::epoch_schedule::EpochSchedule;
 use crate::mobile_reward::MobileRewardManager;
+use crate::net_port::ConsensusNetwork;
 use crate::sinks::{
     ManagerStakingSink, NodeWithdrawalSource, SbmtStateSink, SchedulerZkSink, StakingSink,
     StateSink, TwigStateSink, WithdrawalSource, ZkSink,
@@ -258,7 +259,10 @@ pub(crate) struct CommittedBlock {
 /// pacemaker timeouts, and BlockReady signals.
 pub struct ConsensusOrchestrator {
     engine: ConsensusEngine,
-    network: NetworkHandle,
+    /// Network port (Caplin sentinel-client seam). One in-process adapter today
+    /// (`NetworkHandle`); the trait object lets the orchestrator move into a
+    /// service crate without depending on `n42-network` / libp2p internals.
+    network: Arc<dyn ConsensusNetwork>,
     /// High-priority: consensus messages only (Vote, Proposal, PrepareQC, etc.)
     consensus_event_rx: Option<mpsc::Receiver<NetworkEvent>>,
     /// Lower-priority: data events (BlockData, TX, Sync, Peers)
@@ -678,7 +682,7 @@ impl ConsensusOrchestrator {
         let (build_complete_tx, build_complete_rx) = mpsc::channel(256);
         Self {
             engine,
-            network,
+            network: Arc::new(network),
             consensus_event_rx: None,
             net_event_rx,
             output_rx,
@@ -878,7 +882,7 @@ impl ConsensusOrchestrator {
 
         Self {
             engine,
-            network,
+            network: Arc::new(network),
             consensus_event_rx: Some(consensus_event_rx),
             net_event_rx,
             output_rx,

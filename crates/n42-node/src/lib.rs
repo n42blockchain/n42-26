@@ -7,6 +7,7 @@ pub mod ingest;
 pub mod mobile_bridge;
 pub mod mobile_packet;
 pub mod mobile_reward;
+pub mod net_port;
 mod node;
 pub mod orchestrator;
 pub mod packet_builder;

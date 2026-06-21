@@ -3,6 +3,7 @@ use super::{
 };
 use crate::el::ExecutionLayer;
 use crate::ingest::note_virtual_block_credit;
+use crate::net_port::ConsensusNetwork;
 use crate::now_unix_ms;
 use alloy_consensus::Typed2718;
 use alloy_eips::eip7594::BlobTransactionSidecarVariant;
@@ -10,7 +11,6 @@ use alloy_primitives::{Address, B256};
 use alloy_rlp::Encodable;
 use alloy_rpc_types_engine::{ForkchoiceState, PayloadAttributes, PayloadStatusEnum};
 use n42_consensus::ConsensusEvent;
-use n42_network::NetworkHandle;
 use reth_ethereum_engine_primitives::EthEngineTypes;
 use reth_execution_types::{BlockExecutionOutput, BlockExecutionResult};
 use reth_payload_builder::{EthBuiltPayload, PayloadId};
@@ -1052,7 +1052,7 @@ impl ConsensusOrchestrator {
 async fn handle_built_payload(
     payload: EthBuiltPayload,
     el: Arc<dyn ExecutionLayer>,
-    network: NetworkHandle,
+    network: Arc<dyn ConsensusNetwork>,
     block_ready_tx: mpsc::Sender<B256>,
     leader_payload_tx: mpsc::Sender<(B256, Vec<u8>)>,
     current_view: u64,
@@ -1120,7 +1120,7 @@ async fn handle_built_payload(
     );
     // 1. Broadcast block data + blob sidecars to followers
     broadcast_block_data(
-        &network,
+        network.as_ref(),
         &leader_payload_tx,
         hash,
         current_view,
@@ -1131,7 +1131,7 @@ async fn handle_built_payload(
         build_start,
     )
     .await;
-    broadcast_blob_sidecars(&network, &payload, hash, current_view, blob_store);
+    broadcast_blob_sidecars(network.as_ref(), &payload, hash, current_view, blob_store);
 
     // 2. Trigger consensus voting immediately (non-blocking channel send)
     if block_ready_tx.send(hash).await.is_err() {
@@ -1199,7 +1199,7 @@ async fn handle_built_payload(
 
 #[allow(clippy::too_many_arguments)]
 async fn broadcast_block_data(
-    network: &NetworkHandle,
+    network: &dyn ConsensusNetwork,
     leader_payload_tx: &mpsc::Sender<(B256, Vec<u8>)>,
     hash: B256,
     current_view: u64,
@@ -1329,7 +1329,7 @@ async fn broadcast_block_data(
 }
 
 fn broadcast_blob_sidecars(
-    network: &NetworkHandle,
+    network: &dyn ConsensusNetwork,
     payload: &EthBuiltPayload,
     hash: B256,
     current_view: u64,
