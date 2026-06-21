@@ -284,6 +284,62 @@ Expected reference values:
 
 The encoded size should be near `30019 KiB`.
 
+## Optional EVM CPU Control
+
+Run `bin/n42-evm-bench` when the test report needs a normal simple-transfer EVM
+CPU reference next to the batch-transfer fast-lane result:
+
+```bash
+cargo run --release --bin n42-evm-bench 2>&1 | tee /tmp/n42-evm-bench.log
+```
+
+This command requires the same paired `../reth` checkout as the workspace. It
+does not use the 7-node testnet and does not measure chain throughput.
+
+Expected reference shape on the tested Mac:
+
+| Check | Reference value |
+| --- | ---: |
+| Default ETH-transfer iterations | 100,000 |
+| Default ETH-transfer total time | 80.65 ms |
+| Default ETH-transfer single-core TPS | 1,239,979 |
+| Validated many-sender CPU-only ceiling | 1,143,021 TPS median |
+| Validated hot-sender CPU-only ceiling | 2,147,149 TPS median |
+
+The validated control asserted every transaction succeeded and consumed exactly
+`21000` gas. It exists to anchor interpretation: simple-transfer EVM CPU alone
+is around 1.1M TPS for many accounts on the tested machine, while the
+batch-transfer fast-lane record skips EVM/reth execution entirely.
+
+## Optional PEVM Replay Control
+
+If a tester also has the local sibling PEVM harness at `../pevm`, use it as a
+separate Ethereum-history replay control. This is not part of the
+batch-transfer fast-lane test, but it is useful when comparing the fast-lane
+upper bound against real EVM execution research.
+
+```bash
+cd ../pevm
+cargo build --release
+
+./target/release/pevm evm \
+  --begin 9000000 \
+  --end 9100000 \
+  --step 3 \
+  --use-log on \
+  --log-dir test_bench_logs \
+  --mmap-log \
+  --datadir /path/to/reth-mainnet-datadir 2>&1 | tee pevm-replay.log
+
+rg "Execution|Ggas_per_s|TPS" pevm-replay.log
+```
+
+The local `../pevm` docs describe a Reth-backed replay engine with state-read
+logging and mmap replay. The checked-in planning data includes 100k-block local
+state-log samples and a zstd estimate of roughly `130 GiB` / `64 h` to generate
+logs for blocks `1..20,000,000`; quote replay TPS or Ggas/s only from captured
+`Execution ... TPS=... Ggas_per_s=...` output.
+
 ## What To Submit
 
 Attach or archive:

@@ -49,6 +49,24 @@ Useful for:
 
 Benchmark/support utility for execution-focused investigations.
 
+Use it when you need a CPU-only EVM control measurement instead of a full-chain
+TPS run:
+
+```bash
+cargo run --release --bin n42-evm-bench
+```
+
+The default ETH transfer benchmark executes simple `21000` gas transfers through
+`revm + CacheDB` and excludes signatures, RLP, txpool admission, network,
+consensus, roots, receipts, and persistence. On the latest documented Mac run,
+the default 100k ETH-transfer case measured `80.65ms`, or about `1.24M TPS`.
+An additional validated control that asserted success and `21000` gas per
+transaction measured about `1.14M TPS` for many independent senders and about
+`2.15M TPS` for a hot-sender upper-bound shape.
+
+Use `docs/performance-records.md` for the stable interpretation and external
+PEVM comparison data.
+
 ## End-to-end tests
 
 `tests/e2e` provides scenario-oriented coverage rather than just unit coverage.
