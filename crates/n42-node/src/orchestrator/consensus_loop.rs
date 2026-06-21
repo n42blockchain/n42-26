@@ -1,6 +1,7 @@
 use super::ConsensusService;
 use super::state_mgmt::max_consecutive_empty_skips;
 use crate::el::ExecutionLayer;
+use crate::exec_cache::ExecutionOutputCache;
 use crate::expected_validator_peer_ids_with_policy;
 use alloy_primitives::B256;
 use alloy_rpc_types_engine::{ForkchoiceState, PayloadStatusEnum};
@@ -813,9 +814,11 @@ impl ConsensusService {
                 return;
             }
         };
+        let exec_cache = self.exec_output_cache.clone();
         info!(target: "n42::cl::consensus_loop", view, %block_hash, "spawning background import");
         tokio::spawn(async move {
-            let (success, block_ts) = Self::background_import(eh, &data, block_hash).await;
+            let (success, block_ts) =
+                Self::background_import(eh, exec_cache, &data, block_hash).await;
             if done_tx
                 .send((block_hash, view, success, block_ts))
                 .await
@@ -830,6 +833,7 @@ impl ConsensusService {
     /// Returns (success, block_timestamp).
     async fn background_import(
         engine_handle: Arc<dyn ExecutionLayer>,
+        exec_cache: Option<Arc<dyn ExecutionOutputCache>>,
         data: &[u8],
         block_hash: B256,
     ) -> (bool, u64) {
@@ -862,12 +866,9 @@ impl ConsensusService {
         // Compact Block: load execution output into payload cache before `new_payload`.
         if let Some(ref exec_compressed) = broadcast.execution_output
             && super::execution_bridge::compact_block_enabled()
+            && let Some(ref cache) = exec_cache
         {
-            super::execution_bridge::inject_compact_block(
-                &block_hash,
-                exec_compressed,
-                "consensus_loop",
-            );
+            cache.inject(block_hash, exec_compressed, "consensus_loop");
         }
 
         match engine_handle.new_payload(execution_data).await {

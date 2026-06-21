@@ -7,6 +7,7 @@ mod view_jump_throttle;
 use crate::consensus_state::{PoolDepthSnapshot, SharedConsensusState};
 use crate::el::ExecutionLayer;
 use crate::epoch_schedule::EpochSchedule;
+use crate::exec_cache::ExecutionOutputCache;
 use crate::mobile_reward::MobileRewardManager;
 use crate::net_port::ConsensusNetwork;
 use crate::sinks::{
@@ -312,6 +313,9 @@ pub struct ConsensusService {
     finalize_done_rx: mpsc::Receiver<FinalizeDone>,
     finalize_done_tx: mpsc::Sender<FinalizeDone>,
     blob_store: Option<DiskFileBlobStore>,
+    /// Compact-block execution-output cache behind the [`ExecutionOutputCache`]
+    /// port. `None` ⇒ compact-block inject/take are no-ops (tests / EL-less).
+    exec_output_cache: Option<Arc<dyn ExecutionOutputCache>>,
     /// True while a background import task is running.
     bg_import_in_flight: bool,
     /// Hashes already queued or in-flight for background import.
@@ -716,6 +720,7 @@ impl ConsensusService {
             finalize_done_rx,
             finalize_done_tx,
             blob_store: None,
+            exec_output_cache: None,
             bg_import_in_flight: false,
             bg_import_hashes: HashSet::new(),
             bg_import_queue: VecDeque::new(),
@@ -915,6 +920,7 @@ impl ConsensusService {
             finalize_done_rx,
             finalize_done_tx,
             blob_store: None,
+            exec_output_cache: None,
             bg_import_in_flight: false,
             bg_import_hashes: HashSet::new(),
             bg_import_queue: VecDeque::new(),
@@ -951,6 +957,11 @@ impl ConsensusService {
             evidence_store: None,
             view_jump_throttle: view_jump_throttle::ViewJumpThrottle::default(),
         }
+    }
+
+    pub fn with_exec_output_cache(mut self, cache: Arc<dyn ExecutionOutputCache>) -> Self {
+        self.exec_output_cache = Some(cache);
+        self
     }
 
     pub fn with_blob_store(mut self, blob_store: DiskFileBlobStore) -> Self {

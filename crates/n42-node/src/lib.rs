@@ -3,6 +3,7 @@ mod components;
 pub mod consensus_state;
 pub mod el;
 pub mod epoch_schedule;
+pub mod exec_cache;
 pub mod ingest;
 pub mod mobile_bridge;
 pub mod mobile_packet;

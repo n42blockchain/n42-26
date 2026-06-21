@@ -1412,6 +1412,9 @@ fn main() {
                 .with_state_persistence(state_file)
                 .with_validator_set(startup_validator_set)
                 .with_blob_store(full_node.pool.blob_store().clone())
+                .with_exec_output_cache(std::sync::Arc::new(
+                    n42_node::exec_cache::RethExecutionOutputCache,
+                ))
                 .with_mobile_reward_manager(reward_manager)
                 .with_staking_manager(staking_manager.clone())
                 .with_committed_block_count(restored_block_count);

@@ -1,17 +1,16 @@
-use super::{BlobSidecarBroadcast, BlockDataBroadcast, CompactBlockExecution, ConsensusService};
+use super::{BlobSidecarBroadcast, BlockDataBroadcast, ConsensusService};
 use crate::el::{BuiltBlock, ExecutionLayer, ResolveKind};
+use crate::exec_cache::ExecutionOutputCache;
 use crate::ingest::note_virtual_block_credit;
 use crate::net_port::ConsensusNetwork;
 use crate::now_unix_ms;
 use alloy_eips::eip7594::BlobTransactionSidecarVariant;
-use alloy_primitives::{Address, B256};
+use alloy_primitives::B256;
 use alloy_rlp::Encodable;
 use alloy_rpc_types_engine::{ForkchoiceState, PayloadAttributes, PayloadId, PayloadStatusEnum};
 use n42_consensus::ConsensusEvent;
-use reth_execution_types::{BlockExecutionOutput, BlockExecutionResult};
 use reth_transaction_pool::blobstore::{BlobStore, DiskFileBlobStore};
-use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
@@ -28,143 +27,13 @@ pub(super) fn compact_block_enabled() -> bool {
     })
 }
 
-type CachedPayloadData = (
-    BlockExecutionOutput<reth_ethereum_primitives::Receipt>,
-    Vec<Address>,
-);
-
-#[derive(Default)]
-struct CompactInjectTracker {
-    order: VecDeque<B256>,
-    counts: HashMap<B256, u64>,
-}
-
-const COMPACT_INJECT_TRACKER_LIMIT: usize = 2048;
+// `inject_compact_block` moved to `crate::exec_cache` (stage 6a-2). Re-exported
+// here so `ObserverOrchestrator` (which is not on the `ExecutionOutputCache`
+// port) keeps calling `super::execution_bridge::inject_compact_block` unchanged.
+pub(super) use crate::exec_cache::inject_compact_block;
 
 fn elapsed_since_unix_ms(start_ms: u64) -> Option<u64> {
     (start_ms > 0).then(|| now_unix_ms().saturating_sub(start_ms))
-}
-
-fn observe_compact_inject_attempt(hash: B256, source: &'static str) -> Option<u64> {
-    static TRACKER: std::sync::OnceLock<Mutex<CompactInjectTracker>> = std::sync::OnceLock::new();
-    let tracker = TRACKER.get_or_init(|| Mutex::new(CompactInjectTracker::default()));
-    let mut tracker = tracker.lock().unwrap_or_else(|e| {
-        tracing::warn!("compact_inject_tracker mutex poisoned, recovering");
-        e.into_inner()
-    });
-
-    if let Some(seen) = tracker.counts.get_mut(&hash) {
-        *seen += 1;
-        let duplicate_attempt = *seen;
-        metrics::counter!("n42_compact_inject_duplicate_total").increment(1);
-        info!(
-            target: "n42::cl::exec_bridge",
-            %hash,
-            source,
-            duplicate_attempt,
-            "N42_COMPACT_INJECT_DUP: repeated compact inject attempt"
-        );
-        return Some(duplicate_attempt);
-    }
-
-    tracker.counts.insert(hash, 1);
-    tracker.order.push_back(hash);
-    if tracker.order.len() > COMPACT_INJECT_TRACKER_LIMIT
-        && let Some(evicted) = tracker.order.pop_front()
-    {
-        tracker.counts.remove(&evicted);
-    }
-    None
-}
-
-/// Take execution output from broadcast cache and serialize it for followers.
-fn take_and_serialize_execution_output(hash: &B256) -> Option<Vec<u8>> {
-    let (output, senders) =
-        reth_evm::payload_cache::take_broadcast_execution::<CachedPayloadData>(hash)?;
-
-    let ser_start = std::time::Instant::now();
-    let compact = CompactBlockExecution {
-        bundle_state: output.state,
-        receipts: output.result.receipts,
-        requests: output.result.requests,
-        gas_used: output.result.gas_used,
-        blob_gas_used: output.result.blob_gas_used,
-        senders,
-    };
-    // Use serde_json (not bincode) because Receipt/BundleState serde impls use
-    // custom formats (e.g., alloy_serde::quantity for hex u64) incompatible with bincode.
-    match serde_json::to_vec(&compact) {
-        Ok(serialized) => {
-            let compressed = super::compress_payload(&serialized);
-            let ser_ms = ser_start.elapsed().as_millis() as u64;
-            info!(
-                target: "n42::cl::exec_bridge",
-                %hash,
-                raw_kb = serialized.len() / 1024,
-                compressed_kb = compressed.len() / 1024,
-                ser_ms,
-                "N42_COMPACT_BLOCK: execution output serialized for broadcast"
-            );
-            metrics::counter!("n42_compact_block_serialized").increment(1);
-            metrics::histogram!("n42_compact_block_size_bytes").record(compressed.len() as f64);
-            Some(compressed)
-        }
-        Err(e) => {
-            warn!(target: "n42::cl::exec_bridge", %hash, error = %e, "compact block: failed to serialize execution output");
-            None
-        }
-    }
-}
-
-/// Deserialize compact block execution output and load it into the payload cache.
-pub(super) fn inject_compact_block(hash: &B256, compressed: &[u8], source: &'static str) -> bool {
-    let duplicate_attempt = observe_compact_inject_attempt(*hash, source);
-    let inject_start = std::time::Instant::now();
-
-    let decompress_start = std::time::Instant::now();
-    let decompressed = match super::decompress_payload(compressed) {
-        Ok(d) => d,
-        Err(e) => {
-            warn!(target: "n42::cl::exec_bridge", %hash, error = %e, "compact block: failed to decompress");
-            return false;
-        }
-    };
-    let decompress_ms = decompress_start.elapsed().as_millis() as u64;
-
-    let deser_start = std::time::Instant::now();
-    let compact: CompactBlockExecution = match serde_json::from_slice(&decompressed) {
-        Ok(c) => c,
-        Err(e) => {
-            warn!(target: "n42::cl::exec_bridge", %hash, error = %e, "compact block: failed to deserialize");
-            return false;
-        }
-    };
-    let deser_ms = deser_start.elapsed().as_millis() as u64;
-
-    let store_start = std::time::Instant::now();
-    let output = BlockExecutionOutput {
-        state: compact.bundle_state,
-        result: BlockExecutionResult {
-            receipts: compact.receipts,
-            requests: compact.requests,
-            gas_used: compact.gas_used,
-            blob_gas_used: compact.blob_gas_used,
-        },
-    };
-    reth_evm::payload_cache::store_payload_execution(*hash, (output, compact.senders));
-    let store_ms = store_start.elapsed().as_millis() as u64;
-
-    let total_ms = inject_start.elapsed().as_millis() as u64;
-    info!(target: "n42::cl::exec_bridge", %hash,
-        source,
-        duplicate_attempt = duplicate_attempt.unwrap_or_default(),
-        compressed_kb = compressed.len() / 1024,
-        decompressed_kb = decompressed.len() / 1024,
-        decompress_ms, deser_ms, store_ms, total_ms,
-        "N42_COMPACT_INJECT: execution output injected into payload cache");
-    metrics::counter!("n42_compact_block_cache_injected").increment(1);
-    metrics::histogram!("n42_compact_inject_ms").record(total_ms as f64);
-    true
 }
 
 /// Delay before resolving the built payload, allowing the builder to pack transactions.
@@ -411,6 +280,7 @@ impl ConsensusService {
         let eager_import_done_tx = self.eager_import_done_tx.clone();
         let build_complete_tx = self.build_complete_tx.clone();
         let block_guard = self.eager_import_block_guard.clone();
+        let exec_output_cache = self.exec_output_cache.clone();
 
         let handle = tokio::spawn(async move {
             // Allow builder time to pack transactions from the pool.
@@ -443,6 +313,7 @@ impl ConsensusService {
                         leader_payload_tx,
                         current_view,
                         blob_store,
+                        exec_output_cache,
                         eager_import_done_tx,
                         block_guard,
                         build_start,
@@ -573,6 +444,7 @@ impl ConsensusService {
             let block_data_received = std::time::Instant::now();
             let eager_done_tx = self.eager_import_done_tx.clone();
             let block_guard = self.eager_import_block_guard.clone();
+            let exec_cache = self.exec_output_cache.clone();
             let eager_span = tracing::info_span!(
                 target: "n42.cl.exec_bridge.eager_import",
                 "follower_eager_import",
@@ -626,7 +498,11 @@ impl ConsensusService {
                 // This lets reth skip EVM re-execution (cache hit path), reducing import from
                 // ~209ms to ~22ms. Safety: state root is still verified by reth's new_payload.
                 let compact_injected = execution_output_compressed.as_ref().is_some_and(|exec| {
-                    compact_block_enabled() && inject_compact_block(&hash, exec, "block_data_eager")
+                    compact_block_enabled()
+                        && exec_cache
+                            .as_ref()
+                            .map(|c| c.inject(hash, exec, "block_data_eager"))
+                            .unwrap_or(false)
                 });
                 let ready_to_compact_inject_ms = execution_output_compressed
                     .as_ref()
@@ -810,8 +686,9 @@ impl ConsensusService {
         // Compact Block: load execution output into payload cache before `new_payload`.
         if let Some(ref exec_compressed) = broadcast.execution_output
             && compact_block_enabled()
+            && let Some(ref cache) = self.exec_output_cache
         {
-            inject_compact_block(&broadcast.block_hash, exec_compressed, "import_and_notify");
+            cache.inject(broadcast.block_hash, exec_compressed, "import_and_notify");
         }
 
         match engine_handle.new_payload(execution_data).await {
@@ -976,8 +853,9 @@ impl ConsensusService {
             // Compact Block: load on retry path too.
             if let Some(ref exec_compressed) = retry_broadcast.execution_output
                 && compact_block_enabled()
+                && let Some(ref cache) = self.exec_output_cache
             {
-                inject_compact_block(&retry_hash, exec_compressed, "retry_syncing");
+                cache.inject(retry_hash, exec_compressed, "retry_syncing");
             }
 
             match engine_handle.new_payload(retry_exec).await {
@@ -1051,6 +929,7 @@ async fn handle_built_payload(
     leader_payload_tx: mpsc::Sender<(B256, Vec<u8>)>,
     current_view: u64,
     blob_store: Option<DiskFileBlobStore>,
+    exec_output_cache: Option<Arc<dyn ExecutionOutputCache>>,
     eager_import_done_tx: mpsc::Sender<(B256, u64)>,
     block_guard: Arc<std::sync::atomic::AtomicU64>,
     build_start: Instant,
@@ -1091,7 +970,9 @@ async fn handle_built_payload(
 
     // Compact Block: serialize execution output for followers to skip EVM re-execution.
     let execution_output_bytes = if compact_block_enabled() {
-        take_and_serialize_execution_output(&hash)
+        exec_output_cache
+            .as_ref()
+            .and_then(|c| c.take_serialized(hash))
     } else {
         None
     };
