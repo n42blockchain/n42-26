@@ -119,6 +119,7 @@ Logs are split into separate files by phase for easy maintenance:
 | 文件 | 内容 | 类型 |
 |------|------|------|
 | [devlog-88-caplin-cl-seam-stage3-6](docs/devlog-88-caplin-cl-seam-stage3-6.md) | 把共识层重构成 Caplin 式 ports-and-adapters：sink/network/EL/blob/exec-cache 全走 port trait，抽出 `n42-consensus-service` crate（硬-reth-free，允许 revm/Receipt）；行为字节级等同，212 单测+6 集成绿；E2E 待 datc 让机 | Architecture |
+| [devlog-89-caplin-cl-seam-stage7-9](docs/devlog-89-caplin-cl-seam-stage7-9.md) | stage 7 observer 折叠到 ports 并入 crate；stage 8 async finalize-FCU 本已实现（flag-gated），A/B 留真机；stage 9 `EngineApiRpcExecutionLayer`（Engine-API JSON-RPC 客户端实现 ExecutionLayer）+ standalone 共识二进制（双模），含 JWT provider-feature 统一冲突的 hmac 修复 | Architecture |
 
 ---
 
