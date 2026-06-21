@@ -25,8 +25,14 @@ fn addr(n: u64) -> Address {
 }
 
 fn main() {
-    let n: u64 = std::env::var("PP_TXS").ok().and_then(|v| v.parse().ok()).unwrap_or(5000);
-    let iters: usize = std::env::var("PP_ITERS").ok().and_then(|v| v.parse().ok()).unwrap_or(40);
+    let n: u64 = std::env::var("PP_TXS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5000);
+    let iters: usize = std::env::var("PP_ITERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(40);
 
     // Independent transfers paying gas to a shared coinbase (deferred-coinbase
     // makes them non-conflicting — pure per-tx overhead, no aborts).
@@ -67,7 +73,8 @@ fn main() {
     let t = Instant::now();
     let mut acc = 0usize;
     for _ in 0..iters {
-        let out = n42_parallel_evm::parallel_execute(&txs, &db, cfg.clone(), block.clone()).unwrap();
+        let out =
+            n42_parallel_evm::parallel_execute(&txs, &db, cfg.clone(), block.clone()).unwrap();
         acc = acc.wrapping_add(out.results.len());
     }
     let secs = t.elapsed().as_secs_f64();

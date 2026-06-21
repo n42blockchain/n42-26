@@ -128,11 +128,19 @@ impl TwigState {
                     }
                 }
                 AccountChangeType::Created | AccountChangeType::Modified => {
-                    let balance = account_diff.balance.as_ref().map(|v| v.to).unwrap_or_default();
+                    let balance = account_diff
+                        .balance
+                        .as_ref()
+                        .map(|v| v.to)
+                        .unwrap_or_default();
                     let nonce = account_diff.nonce.as_ref().map(|v| v.to).unwrap_or(0);
                     let code_hash = match &account_diff.code_change {
                         Some(change) => change.to.unwrap_or(EMPTY_CODE_HASH),
-                        None => self.inner.get(&key).map(decode_code_hash).unwrap_or(EMPTY_CODE_HASH),
+                        None => self
+                            .inner
+                            .get(&key)
+                            .map(decode_code_hash)
+                            .unwrap_or(EMPTY_CODE_HASH),
                     };
                     let v = encode_account_value(&balance, nonce, &code_hash);
                     let r = push_val(&mut buf, &v);

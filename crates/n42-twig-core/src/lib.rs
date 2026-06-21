@@ -189,7 +189,7 @@ fn null_level() -> [Hash; TWIG_HEIGHT + 1] {
 /// slot; updating a key deactivates its old slot (nulls that leaf) and appends a
 /// new entry. The world root is therefore a function of the append history.
 pub struct TwigTree {
-    entries: Vec<Entry>, // indexed by slot
+    entries: Vec<Entry>,  // indexed by slot
     value_arena: Vec<u8>, // entry values, append-only (Entry.voff/vlen index here)
     twigs: Vec<Twig>,
     // Compact index: 16-byte key prefix -> active slot. Lookups confirm against
@@ -350,7 +350,8 @@ impl TwigTree {
     /// by key makes the root independent of the input order. Keys within a block
     /// are expected unique (the `StateDiff`/sharded layer guarantees this).
     pub fn apply_batch(&mut self, ops: &[(Hash, Option<Vec<u8>>)]) {
-        let refs: Vec<(Hash, Option<&[u8]>)> = ops.iter().map(|(k, v)| (*k, v.as_deref())).collect();
+        let refs: Vec<(Hash, Option<&[u8]>)> =
+            ops.iter().map(|(k, v)| (*k, v.as_deref())).collect();
         let mut order: Vec<usize> = (0..ops.len()).collect();
         self.apply_batch_indexed(&refs, &mut order);
     }
@@ -740,7 +741,8 @@ impl ShardedTwig {
     /// shards under the `rayon` feature, no locks (each worker owns one shard).
     /// Returns `(version, combined_root)`.
     pub fn apply_batch(&mut self, ops: &[(Hash, Option<Vec<u8>>)]) -> (u64, Hash) {
-        let refs: Vec<(Hash, Option<&[u8]>)> = ops.iter().map(|(k, v)| (*k, v.as_deref())).collect();
+        let refs: Vec<(Hash, Option<&[u8]>)> =
+            ops.iter().map(|(k, v)| (*k, v.as_deref())).collect();
         self.apply_batch_refs(&refs)
     }
 
@@ -857,7 +859,8 @@ impl ShardedTwigProof {
         if !self.inner.verify(&self.shard_root) {
             return Err(TwigVerifyError::VerifyFailed);
         }
-        let computed = fold_shard_path(self.shard_root, self.shard_index as usize, &self.shard_path);
+        let computed =
+            fold_shard_path(self.shard_root, self.shard_index as usize, &self.shard_path);
         if computed != *combined_root {
             return Err(TwigVerifyError::VerifyFailed);
         }
@@ -997,7 +1000,10 @@ mod tests {
         let (_v, root) = t.apply_batch(&ops);
         let expected =
             hex_to_hash("6c20907fdae8d61a9085cb8468e03e47aca130a40ef3628ce90c2c202798a475");
-        assert_eq!(root, expected, "ShardedTwig combined root must match gov5 NewSharded(16)");
+        assert_eq!(
+            root, expected,
+            "ShardedTwig combined root must match gov5 NewSharded(16)"
+        );
     }
 
     #[test]
@@ -1007,8 +1013,9 @@ mod tests {
             (0..4000u64).map(|i| (key(i), Some(val(i)))).collect();
         t.apply_batch(&ins);
         // updates (dead slots) + deletes
-        let upd: Vec<(Hash, Option<Vec<u8>>)> =
-            (0..500u64).map(|i| (key(i), Some(val(i + 1_000_000)))).collect();
+        let upd: Vec<(Hash, Option<Vec<u8>>)> = (0..500u64)
+            .map(|i| (key(i), Some(val(i + 1_000_000))))
+            .collect();
         t.apply_batch(&upd);
         let del: Vec<(Hash, Option<Vec<u8>>)> = (1000..1500u64).map(|i| (key(i), None)).collect();
         let (_v, root_before) = {
@@ -1023,7 +1030,10 @@ mod tests {
         let mut restored = ShardedTwig::from_snapshot(&snap2);
         let root_after = restored.root();
 
-        assert_eq!(root_before, root_after, "snapshot roundtrip must preserve the root");
+        assert_eq!(
+            root_before, root_after,
+            "snapshot roundtrip must preserve the root"
+        );
         assert_eq!(restored.version(), t.version());
         assert_eq!(restored.get(&key(2000)), Some(val(2000).as_slice()));
         assert_eq!(restored.get(&key(0)), Some(val(1_000_000).as_slice())); // updated
@@ -1081,7 +1091,11 @@ mod tests {
         t.apply_batch(&ops);
         let expected =
             hex_to_hash("58671c9adadd83040c3966abdbb8fd06d7d7ea8def0c7f1d317799ea486526fa");
-        assert_eq!(t.root(), expected, "apply_batch root must match gov5 sorted-insert root");
+        assert_eq!(
+            t.root(),
+            expected,
+            "apply_batch root must match gov5 sorted-insert root"
+        );
     }
 
     #[test]
@@ -1128,14 +1142,28 @@ mod tests {
 
         let moved = t.compact(0.5);
         let root_after = t.root();
-        assert!(moved > 0, "should have moved live entries out of sparse twigs");
+        assert!(
+            moved > 0,
+            "should have moved live entries out of sparse twigs"
+        );
 
         // Live set unchanged; all live keys still readable + provable.
-        assert_eq!(t.len(), live_before, "compaction must not change the live set");
+        assert_eq!(
+            t.len(),
+            live_before,
+            "compaction must not change the live set"
+        );
         for i in [1950u64, 2000, 3950, 3999, 4500, 4999] {
-            assert_eq!(t.get(&key(i)), Some(val(i).as_slice()), "key {i} live after compact");
+            assert_eq!(
+                t.get(&key(i)),
+                Some(val(i).as_slice()),
+                "key {i} live after compact"
+            );
             let p = t.prove(&key(i)).unwrap();
-            assert!(p.verify(&root_after), "proof for {i} verifies vs post-compaction root");
+            assert!(
+                p.verify(&root_after),
+                "proof for {i} verifies vs post-compaction root"
+            );
         }
         // Deleted keys still gone.
         assert!(t.get(&key(10)).is_none());

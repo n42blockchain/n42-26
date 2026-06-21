@@ -295,8 +295,16 @@ mod deferred_coinbase_tests {
 
         // Coinbase actually accrued fees, and matches sequential exactly.
         let cb = seq.state_changes.get(&bene).map(|a| a.info.balance);
-        assert_eq!(cb, Some(U256::from(200u64 * 21_000 * 7)), "coinbase fee total");
-        assert_eq!(balances(&seq), balances(&par), "every account balance must match");
+        assert_eq!(
+            cb,
+            Some(U256::from(200u64 * 21_000 * 7)),
+            "coinbase fee total"
+        );
+        assert_eq!(
+            balances(&seq),
+            balances(&par),
+            "every account balance must match"
+        );
     }
 
     #[test]
@@ -347,7 +355,11 @@ mod deferred_coinbase_tests {
             Some(U256::from(150u64 * 100)),
             "hot recipient balance"
         );
-        assert_eq!(balances(&seq), balances(&par), "hot-recipient block must match sequential");
+        assert_eq!(
+            balances(&seq),
+            balances(&par),
+            "hot-recipient block must match sequential"
+        );
     }
 
     #[test]
@@ -378,7 +390,11 @@ mod deferred_coinbase_tests {
         unsafe { std::env::set_var("N42_PARALLEL_THRESHOLD", "1") };
         let par = parallel_execute(&txs, &db, cfg.clone(), block.clone()).unwrap();
         unsafe { std::env::remove_var("N42_PARALLEL_THRESHOLD") };
-        assert_eq!(balances(&seq), balances(&par), "contract-beneficiary block must match sequential");
+        assert_eq!(
+            balances(&seq),
+            balances(&par),
+            "contract-beneficiary block must match sequential"
+        );
     }
 
     #[test]
@@ -397,7 +413,11 @@ mod deferred_coinbase_tests {
         unsafe { std::env::set_var("N42_PARALLEL_THRESHOLD", "1") };
         let par = parallel_execute(&txs, &db, cfg.clone(), block.clone()).unwrap();
         unsafe { std::env::remove_var("N42_PARALLEL_THRESHOLD") };
-        assert_eq!(balances(&seq), balances(&par), "must match sequential exactly");
+        assert_eq!(
+            balances(&seq),
+            balances(&par),
+            "must match sequential exactly"
+        );
     }
 }
 
@@ -485,7 +505,10 @@ mod differential_tests {
     }
 
     fn results_fp(out: &ParallelExecutionOutput) -> Vec<(u64, bool)> {
-        out.results.iter().map(|r| (r.gas_used, r.success)).collect()
+        out.results
+            .iter()
+            .map(|r| (r.gas_used, r.success))
+            .collect()
     }
 
     /// Build a randomized mixed block: `n` txs, each from a unique sender (nonce
@@ -680,7 +703,15 @@ mod differential_tests {
             .and_then(|a| a.storage.get(&U256::ZERO))
             .map(|s| s.present_value);
         assert_eq!(counter, Some(U256::from(n)), "counter must equal tx count");
-        assert_eq!(fingerprint(&seq), fingerprint(&par), "full state must match");
-        assert_eq!(results_fp(&seq), results_fp(&par), "per-tx results must match");
+        assert_eq!(
+            fingerprint(&seq),
+            fingerprint(&par),
+            "full state must match"
+        );
+        assert_eq!(
+            results_fp(&seq),
+            results_fp(&par),
+            "per-tx results must match"
+        );
     }
 }

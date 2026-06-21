@@ -103,7 +103,12 @@ impl Scheduler {
     fn pop_redo(&self) -> Option<TxIdx> {
         while let Some(cand) = self.redo.pop() {
             if self.status[cand]
-                .compare_exchange(STATUS_REDO, STATUS_PENDING, Ordering::SeqCst, Ordering::SeqCst)
+                .compare_exchange(
+                    STATUS_REDO,
+                    STATUS_PENDING,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                )
                 .is_ok()
             {
                 return Some(cand);
@@ -177,12 +182,10 @@ impl Scheduler {
         // Rewind val_cursor so validation resumes from the aborted tx.
         let mut cur = self.val_cursor.load(Ordering::SeqCst);
         while cur > tx_idx {
-            match self.val_cursor.compare_exchange(
-                cur,
-                tx_idx,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            ) {
+            match self
+                .val_cursor
+                .compare_exchange(cur, tx_idx, Ordering::SeqCst, Ordering::SeqCst)
+            {
                 Ok(_) => break,
                 Err(actual) => cur = actual,
             }

@@ -14,7 +14,10 @@ use std::io::Read;
 use std::time::Instant;
 
 fn env_usize(k: &str, d: usize) -> usize {
-    std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+    std::env::var(k)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(d)
 }
 
 fn hex32(s: &str) -> Hash {
@@ -82,7 +85,12 @@ fn main() {
     let all_keys: Vec<Hash> = ops.iter().map(|o| o.0).collect();
     let samples = env_usize("PROFILE_PROOF_SAMPLES", 10_000).min(n);
     let step = (n / samples.max(1)).max(1);
-    let sample_keys: Vec<Hash> = all_keys.iter().step_by(step).take(samples).copied().collect();
+    let sample_keys: Vec<Hash> = all_keys
+        .iter()
+        .step_by(step)
+        .take(samples)
+        .copied()
+        .collect();
 
     #[cfg(unix)]
     let guard = pprof::ProfilerGuardBuilder::default()
@@ -96,7 +104,9 @@ fn main() {
     let (_ver, _build_root) = tree.apply_batch(&ops);
     let build_s = t.elapsed().as_secs_f64();
     drop(ops); // free the harness ops/clones so RSS reflects the engine only
-    let rss = memory_stats::memory_stats().map(|m| m.physical_mem).unwrap_or(0);
+    let rss = memory_stats::memory_stats()
+        .map(|m| m.physical_mem)
+        .unwrap_or(0);
 
     // ── Update phase: overwrite random existing accounts in blocks (the
     // consensus-relevant + C2-comparable workload). apply_batch parallelizes
@@ -176,7 +186,11 @@ fn main() {
         n as f64 / build_s,
         build_s * 1e6 / n as f64
     );
-    println!("RSS:       {:.0} MB  ({:.1} B/acct)", rss as f64 / 1e6, rss as f64 / n as f64);
+    println!(
+        "RSS:       {:.0} MB  ({:.1} B/acct)",
+        rss as f64 / 1e6,
+        rss as f64 / n as f64
+    );
     println!("root:      0x{}", hex::encode_hash(&root));
     println!(
         "proof:     avg {:.0} B, gen {:.2} us, verify {:.2} us  ({counted} samples)",
