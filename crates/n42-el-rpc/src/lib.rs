@@ -66,11 +66,7 @@ impl EngineApiRpcExecutionLayer {
 
     /// Builds the `Authorization: Bearer <jwt>` value with a fresh `iat` claim.
     fn auth_header(&self) -> Result<String, ElError> {
-        let token = self
-            .jwt
-            .encode(&Claims::with_current_timestamp())
-            .map_err(|e| ElError(format!("jwt encode: {e}")))?;
-        Ok(format!("Bearer {token}"))
+        bearer_header(&self.jwt)
     }
 
     async fn call(&self, method: &str, params: Value) -> Result<Value, ElError> {
@@ -160,6 +156,17 @@ impl ExecutionLayer for EngineApiRpcExecutionLayer {
 /// Builds a JSON-RPC 2.0 request envelope.
 fn jsonrpc_request(id: u64, method: &str, params: Value) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })
+}
+
+/// Mints an `Authorization: Bearer <jwt>` value with a fresh `iat` claim. Free
+/// function (no `reqwest::Client`) so unit tests can exercise the JWT without
+/// constructing a client — building `reqwest::Client` races the process-global
+/// rustls `CryptoProvider` install across parallel tests.
+fn bearer_header(jwt: &JwtSecret) -> Result<String, ElError> {
+    let token = jwt
+        .encode(&Claims::with_current_timestamp())
+        .map_err(|e| ElError(format!("jwt encode: {e}")))?;
+    Ok(format!("Bearer {token}"))
 }
 
 /// Extracts the `result` field of a JSON-RPC response, surfacing `error` as
@@ -310,16 +317,17 @@ mod tests {
 
     #[test]
     fn jwt_header_is_fresh_hs256_bearer() {
+        // Use the free `bearer_header` (no `reqwest::Client`) to avoid racing the
+        // process-global rustls CryptoProvider install across parallel tests.
         let secret = JwtSecret::random();
-        let el = EngineApiRpcExecutionLayer::new("http://127.0.0.1:8551", secret);
-        let header = el.auth_header().expect("header");
+        let header = bearer_header(&secret).expect("header");
         let token = header.strip_prefix("Bearer ").expect("bearer prefix");
         // HS256 JWT = three non-empty base64url segments.
         let segs: Vec<&str> = token.split('.').collect();
         assert_eq!(segs.len(), 3, "well-formed JWT");
         assert!(segs.iter().all(|s| !s.is_empty()), "no empty JWT segment");
         // A second call issues a distinct token (fresh per-request auth header).
-        let header2 = el.auth_header().expect("header2");
+        let header2 = bearer_header(&secret).expect("header2");
         assert!(header2.starts_with("Bearer "));
     }
 }
