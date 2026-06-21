@@ -9,7 +9,6 @@ pub mod mobile_packet;
 pub mod mobile_reward;
 pub use n42_consensus_service::net_port;
 mod node;
-pub mod observer;
 pub mod packet_builder;
 pub mod payload;
 pub mod pool;
@@ -32,8 +31,8 @@ pub use components::{N42ConsensusBuilder, N42ExecutorBuilder};
 /// Backwards-compatible alias retained one release while the Caplin EL-seam
 /// refactor renames `ConsensusOrchestrator` → [`ConsensusService`] (stage 5).
 pub use n42_consensus_service::ConsensusService as ConsensusOrchestrator;
+pub use n42_consensus_service::observer::ObserverOrchestrator;
 pub use node::N42Node;
-pub use observer::ObserverOrchestrator;
 pub use payload::N42PayloadBuilder;
 pub use pool::N42PoolBuilder;
 

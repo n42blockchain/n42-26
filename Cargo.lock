@@ -6737,6 +6737,7 @@ dependencies = [
  "arc-swap",
  "async-trait",
  "bincode",
+ "bitvec",
  "blake3",
  "bytes",
  "eyre",

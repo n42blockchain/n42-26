@@ -41,5 +41,6 @@ tracing.workspace = true
 metrics.workspace = true
 
 [dev-dependencies]
+bitvec.workspace = true
 libp2p.workspace = true
 tempfile.workspace = true

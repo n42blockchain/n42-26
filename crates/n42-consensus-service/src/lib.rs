@@ -15,11 +15,13 @@ pub mod epoch_schedule;
 pub mod exec_cache;
 pub mod ingest;
 pub mod net_port;
+pub mod observer;
 pub mod orchestrator;
 pub mod persistence;
 pub mod sinks;
 pub mod validator_peers;
 
+pub use observer::ObserverOrchestrator;
 pub use orchestrator::ConsensusService;
 pub use validator_peers::expected_validator_peer_ids_with_policy;
 

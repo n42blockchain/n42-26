@@ -969,14 +969,26 @@ fn main() {
 
                     connect_trusted_peers(&net_handle);
 
+                    // Register node-side hooks the consensus-service driver calls
+                    // back into (ingest virtual-block-credit arming).
+                    n42_node::register_consensus_service_hooks();
+                    let observer_el: std::sync::Arc<dyn n42_node::el::ExecutionLayer> =
+                        std::sync::Arc::new(n42_node::el::RethExecutionLayer::engine_only(
+                            beacon_engine_handle,
+                        ));
                     let mut observer = ObserverOrchestrator::new(
                         net_handle,
                         net_event_rx,
-                        beacon_engine_handle,
+                        observer_el,
                         head_block_hash,
                     )
                     .with_validator_set(initial_validator_set.clone())
-                    .with_blob_store(full_node.pool.blob_store().clone());
+                    .with_blob_store(std::sync::Arc::new(n42_node::blob_port::DiskBlobStorePort(
+                        full_node.pool.blob_store().clone(),
+                    )))
+                    .with_exec_output_cache(std::sync::Arc::new(
+                        n42_node::exec_cache::RethExecutionOutputCache,
+                    ));
                     if let Some(schedule) = epoch_schedule.clone() {
                         observer =
                             observer.with_epoch_schedule(consensus_config.epoch_length, schedule);
