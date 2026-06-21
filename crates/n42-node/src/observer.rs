@@ -1,4 +1,3 @@
-use super::{BlobSidecarBroadcast, BlockDataBroadcast, CommittedBlock};
 use crate::el::{ExecutionLayer, RethExecutionLayer};
 use crate::epoch_schedule::EpochSchedule;
 use alloy_eips::eip7594::BlobTransactionSidecarVariant;
@@ -7,6 +6,9 @@ use alloy_rpc_types_engine::{ForkchoiceState, PayloadStatusEnum};
 use metrics::{counter, gauge};
 use n42_chainspec::ValidatorInfo;
 use n42_consensus::{ValidatorSet, validator_changes_hash, verify_commit_qc};
+use n42_consensus_service::orchestrator::{
+    BlobSidecarBroadcast, BlockDataBroadcast, CommittedBlock,
+};
 use n42_network::{BlockSyncResponse, NetworkEvent, NetworkHandle, PeerId, SyncBlock};
 use n42_primitives::QuorumCertificate;
 use reth_ethereum_engine_primitives::EthEngineTypes;
@@ -330,7 +332,9 @@ impl ObserverOrchestrator {
             self.highest_sync_target_view = view;
         }
 
-        let payload_json = match super::decompress_payload(&broadcast.payload_json) {
+        let payload_json = match n42_consensus_service::orchestrator::decompress_payload(
+            &broadcast.payload_json,
+        ) {
             Ok(d) => d,
             Err(e) => {
                 warn!(target: "n42::observer", %hash, error = %e, "failed to decompress payload");
@@ -347,13 +351,9 @@ impl ObserverOrchestrator {
 
         // Compact Block: load execution output to skip EVM re-execution.
         if let Some(ref exec_compressed) = broadcast.execution_output
-            && super::execution_bridge::compact_block_enabled()
+            && n42_consensus_service::orchestrator::compact_block_enabled()
         {
-            super::execution_bridge::inject_compact_block(
-                &hash,
-                exec_compressed,
-                "observer_import",
-            );
+            crate::exec_cache::inject_compact_block(&hash, exec_compressed, "observer_import");
         }
 
         match self.el.new_payload(execution_data).await {

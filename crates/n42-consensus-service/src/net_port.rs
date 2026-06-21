@@ -1,22 +1,15 @@
 //! Consensus network port — a trait boundary over the libp2p `NetworkHandle`
-//! that the consensus orchestrator drives, decoupling consensus from the
-//! concrete network handle (a Caplin-style sentinel-client seam; stage 4 of the
-//! EL-seam refactor). `NetworkHandle` is itself a cheap channel facade, so the
-//! port is thin: it exposes exactly the methods the `ConsensusOrchestrator`
-//! (and its spawned payload-broadcast task) call, no more. See
-//! `docs/task-caplin-cl-module.md`.
+//! that the consensus orchestrator drives. The in-process adapter
+//! (`impl ConsensusNetwork for NetworkHandle`) lives node-side; this crate holds
+//! only the trait. Caplin EL-seam refactor (stage 4 / 6c).
 
 use n42_network::{BlockSyncRequest, BlockSyncResponse, NetworkError, NetworkHandle, PeerId};
 use n42_primitives::ConsensusMessage;
 use std::collections::HashMap;
 
 /// The network operations the consensus orchestrator needs. One in-process
-/// adapter today (`NetworkHandle`); the port lets the orchestrator move into a
-/// service crate without depending on libp2p / `n42-network` internals.
-///
-/// `async_trait` is used only for `announce_block_reliable` (the sole awaited
-/// call on the consensus path, in the payload-broadcast task); the remaining
-/// methods stay synchronous.
+/// adapter today (`NetworkHandle`, node-side). `async_trait` is used for the
+/// awaited backpressure variants; the rest stay synchronous.
 #[async_trait::async_trait]
 pub trait ConsensusNetwork: Send + Sync {
     /// Broadcast a consensus message via GossipSub (priority channel).
@@ -74,6 +67,9 @@ pub trait ConsensusNetwork: Send + Sync {
     async fn set_validator_context(&self, my_index: u32, validator_count: u32);
 }
 
+/// In-process adapter: libp2p `NetworkHandle` is a cheap channel facade and
+/// reth-free, so it lives with the trait. Each method forwards 1:1 to the
+/// inherent `NetworkHandle` method.
 #[async_trait::async_trait]
 impl ConsensusNetwork for NetworkHandle {
     fn broadcast_consensus(&self, msg: ConsensusMessage) -> Result<(), NetworkError> {
@@ -141,41 +137,5 @@ impl ConsensusNetwork for NetworkHandle {
 
     async fn set_validator_context(&self, my_index: u32, validator_count: u32) {
         NetworkHandle::set_validator_context(self, my_index, validator_count).await
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use n42_network::NetworkCommand;
-    use n42_primitives::{BlsSecretKey, Vote};
-    use tokio::sync::mpsc;
-
-    #[tokio::test]
-    async fn broadcast_consensus_through_port_emits_command() {
-        let (cmd_tx, _cmd_rx) = mpsc::channel(8);
-        let (ptx, mut priority_rx) = mpsc::channel(8);
-        let handle = NetworkHandle::new(cmd_tx, ptx);
-
-        let sk = BlsSecretKey::key_gen(&[0x21; 32]).expect("deterministic key");
-        let vote = Vote {
-            view: 1,
-            block_hash: alloy_primitives::B256::repeat_byte(0xCC),
-            voter: 0,
-            signature: sk.sign(b"port-test"),
-        };
-
-        // Drive the call through the trait object, not the inherent method.
-        let net: &dyn ConsensusNetwork = &handle;
-        net.broadcast_consensus(ConsensusMessage::Vote(vote))
-            .expect("broadcast_consensus via port should succeed");
-
-        let cmd = priority_rx
-            .try_recv()
-            .expect("priority channel should carry the broadcast");
-        assert!(
-            matches!(cmd, NetworkCommand::BroadcastConsensus(_)),
-            "should be a BroadcastConsensus command"
-        );
     }
 }

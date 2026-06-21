@@ -1,9 +1,6 @@
-//! Blob-store port — a byte-oriented trait over reth's `DiskFileBlobStore` so the
-//! consensus orchestrator (and the future `n42-consensus-service` crate) handle
-//! only RLP bytes, never reth blob types. The `BlobTransactionSidecarVariant`
-//! RLP coding + `DiskFileBlobStore` live in the node-side adapter here. Part of
-//! the Caplin EL-seam refactor (stage 6a-3); see
-//! `docs/task-caplin-stage6-clean-extraction.md`.
+//! Node-side blob-store adapter. The `BlobStorePort` trait lives in
+//! `n42-consensus-service`; this module provides the in-process adapter
+//! [`DiskBlobStorePort`] over reth's `DiskFileBlobStore` (Caplin stage 6a-3 / 6).
 
 use alloy_eips::eip7594::BlobTransactionSidecarVariant;
 use alloy_primitives::B256;
@@ -11,18 +8,7 @@ use alloy_rlp::{Decodable, Encodable};
 use reth_transaction_pool::blobstore::{BlobStore, DiskFileBlobStore};
 use tracing::{debug, warn};
 
-/// Stores / retrieves EIP-4844 blob sidecars as RLP bytes. Callers exchange
-/// `(tx_hash, sidecar_rlp)` only; the reth blob type + RLP coding stay in the
-/// adapter.
-pub trait BlobStorePort: Send + Sync {
-    /// Decode an RLP-encoded sidecar and insert it under `tx_hash`. Logging on
-    /// decode / insert failure is identical to the previous inline path.
-    fn insert_rlp(&self, tx_hash: B256, sidecar_rlp: &[u8]);
-
-    /// Fetch the sidecars for `tx_hashes`, RLP-encoding each into `(tx_hash, rlp)`.
-    /// `Err` on a store error (caller logs it with the block hash).
-    fn get_all_encoded(&self, tx_hashes: Vec<B256>) -> Result<Vec<(B256, Vec<u8>)>, String>;
-}
+pub use n42_consensus_service::blob_port::BlobStorePort;
 
 /// In-process adapter over reth's `DiskFileBlobStore`.
 pub struct DiskBlobStorePort(pub DiskFileBlobStore);

@@ -16,7 +16,7 @@ use tracing::{Instrument, debug, error, info, warn};
 
 /// Whether Compact Block (follower EVM skip) is enabled.
 /// Controlled by `N42_COMPACT_BLOCK` env var: "0" to disable, anything else or absent = enabled.
-pub(super) fn compact_block_enabled() -> bool {
+pub fn compact_block_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
         std::env::var("N42_COMPACT_BLOCK")
@@ -24,11 +24,6 @@ pub(super) fn compact_block_enabled() -> bool {
             .unwrap_or(true)
     })
 }
-
-// `inject_compact_block` moved to `crate::exec_cache` (stage 6a-2). Re-exported
-// here so `ObserverOrchestrator` (which is not on the `ExecutionOutputCache`
-// port) keeps calling `super::execution_bridge::inject_compact_block` unchanged.
-pub(super) use crate::exec_cache::inject_compact_block;
 
 fn elapsed_since_unix_ms(start_ms: u64) -> Option<u64> {
     (start_ms > 0).then(|| now_unix_ms().saturating_sub(start_ms))

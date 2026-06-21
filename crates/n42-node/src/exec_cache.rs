@@ -1,34 +1,18 @@
-//! Compact-block execution-output cache port — the trait boundary over reth's
-//! `reth_evm::payload_cache` that the consensus orchestrator drives. The leader
-//! serializes its EVM execution output so followers can skip re-execution; the
-//! follower injects it into the payload cache before `new_payload`. All reth
-//! coupling (`BlockExecutionOutput`, `reth_evm::payload_cache`, `Receipt`) lives
-//! in the node-side adapter here, so the orchestrator and the future
-//! `n42-consensus-service` crate exchange only bytes. Part of the Caplin EL-seam
-//! refactor (stage 6a-2). The `ExecutionOutputCache` trait moves to the service
-//! crate in stage 6c; the adapter + free fns stay node-side.
+//! Node-side compact-block execution-output cache adapter. The
+//! `ExecutionOutputCache` trait lives in `n42-consensus-service`; this module
+//! provides the in-process adapter [`RethExecutionOutputCache`] + the free
+//! functions over reth's global `reth_evm::payload_cache` (Caplin stage 6a-2 / 6).
 
-use crate::orchestrator::{CompactBlockExecution, compress_payload, decompress_payload};
 use alloy_primitives::{Address, B256};
+use n42_consensus_service::orchestrator::{
+    CompactBlockExecution, compress_payload, decompress_payload,
+};
 use reth_execution_types::{BlockExecutionOutput, BlockExecutionResult};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 use tracing::{info, warn};
 
-/// Port the orchestrator calls instead of reth's `payload_cache` directly. One
-/// in-process adapter today ([`RethExecutionOutputCache`]); both sides exchange
-/// the compressed wire blob only.
-pub trait ExecutionOutputCache: Send + Sync {
-    /// Take + serialize + compress the cached compact-block execution output for
-    /// `hash`. `None` when nothing is cached. The bytes are the wire blob the
-    /// leader puts in `BlockDataBroadcast.execution_output`.
-    fn take_serialized(&self, hash: B256) -> Option<Vec<u8>>;
-
-    /// Inject a received compact-block wire blob into the payload cache so the
-    /// next `new_payload` hits the cache and skips EVM re-execution. Returns
-    /// whether the inject succeeded.
-    fn inject(&self, hash: B256, compressed: &[u8], source: &'static str) -> bool;
-}
+pub use n42_consensus_service::exec_cache::ExecutionOutputCache;
 
 /// In-process adapter over reth's global `reth_evm::payload_cache`.
 pub struct RethExecutionOutputCache;
@@ -102,8 +86,6 @@ pub(crate) fn take_and_serialize_execution_output(hash: &B256) -> Option<Vec<u8>
         blob_gas_used: output.result.blob_gas_used,
         senders,
     };
-    // Use serde_json (not bincode) because Receipt/BundleState serde impls use
-    // custom formats (e.g., alloy_serde::quantity for hex u64) incompatible with bincode.
     match serde_json::to_vec(&compact) {
         Ok(serialized) => {
             let compressed = compress_payload(&serialized);

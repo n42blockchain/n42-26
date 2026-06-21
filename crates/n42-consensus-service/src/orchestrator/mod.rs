@@ -1,6 +1,6 @@
 mod consensus_loop;
 mod execution_bridge;
-pub mod observer;
+pub use execution_bridge::compact_block_enabled;
 mod state_mgmt;
 mod view_jump_throttle;
 
@@ -9,22 +9,16 @@ use crate::consensus_state::{PoolDepthSnapshot, SharedConsensusState};
 use crate::el::ExecutionLayer;
 use crate::epoch_schedule::EpochSchedule;
 use crate::exec_cache::ExecutionOutputCache;
-use crate::mobile_reward::MobileRewardManager;
 use crate::net_port::ConsensusNetwork;
-use crate::sinks::{
-    ManagerStakingSink, NodeWithdrawalSource, SbmtStateSink, SchedulerZkSink, StakingSink,
-    StateSink, TwigStateSink, WithdrawalSource, ZkSink,
-};
-use crate::staking::StakingManager;
+use crate::sinks::{StakingSink, StateSink, WithdrawalSource, ZkSink};
 use alloy_primitives::{Address, B256};
 use metrics::{counter, gauge, histogram};
 use n42_consensus::{ConsensusEngine, EngineOutput, FUTURE_VIEW_WINDOW, ValidatorSet};
-use n42_jmt::{PersistentSbmt, PersistentTwig};
-use n42_network::{NetworkEvent, NetworkHandle, PeerId};
+use n42_network::{NetworkEvent, PeerId};
 use n42_primitives::QuorumCertificate;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
@@ -44,7 +38,7 @@ const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
 const TX_FORWARD_BATCH_TARGET: usize = 512;
 
 /// Compress payload JSON with zstd (level 3 — good speed/ratio tradeoff).
-pub(crate) fn compress_payload(json: &[u8]) -> Vec<u8> {
+pub fn compress_payload(json: &[u8]) -> Vec<u8> {
     zstd::bulk::compress(json, 3).unwrap_or_else(|e| {
         tracing::warn!(target: "n42::cl", len = json.len(), error = %e, "zstd compression failed, sending uncompressed");
         json.to_vec()
@@ -53,7 +47,7 @@ pub(crate) fn compress_payload(json: &[u8]) -> Vec<u8> {
 
 /// Decompress payload if zstd-compressed; pass through raw JSON unchanged.
 /// Backward-compatible: old nodes send uncompressed JSON, new nodes send zstd.
-pub(crate) fn decompress_payload(data: &[u8]) -> std::io::Result<Vec<u8>> {
+pub fn decompress_payload(data: &[u8]) -> std::io::Result<Vec<u8>> {
     if data.len() >= 4 && data[..4] == ZSTD_MAGIC {
         zstd::bulk::decompress(data, 64 * 1024 * 1024) // 64 MB max
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
@@ -79,45 +73,45 @@ fn elapsed_since_unix_ms(start_ms: u64) -> Option<u64> {
 /// simultaneously — bincode does not support missing trailing fields on deserialization.
 /// New→old is fine (bincode ignores trailing bytes), but old→new will fail.
 #[derive(serde::Serialize, serde::Deserialize)]
-pub(crate) struct BlockDataBroadcast {
-    pub(crate) block_hash: B256,
-    pub(crate) view: u64,
+pub struct BlockDataBroadcast {
+    pub block_hash: B256,
+    pub view: u64,
     /// Execution payload — zstd-compressed JSON (or raw JSON from older peers).
     /// Use `decompress_payload()` before `serde_json::from_slice()`.
-    pub(crate) payload_json: Vec<u8>,
+    pub payload_json: Vec<u8>,
     /// Block timestamp (seconds since epoch). Stored directly to avoid JSON re-parsing.
     /// Defaults to 0 for backwards compatibility with older serialized broadcasts.
     #[serde(default)]
-    pub(crate) timestamp: u64,
+    pub timestamp: u64,
     /// Compact Block: zstd-compressed bincode of `CompactBlockExecution`.
     /// When present, followers load this into `payload_cache` to skip EVM re-execution.
     /// None for backwards compatibility with older peers.
     #[serde(default)]
-    pub(crate) execution_output: Option<Vec<u8>>,
+    pub execution_output: Option<Vec<u8>>,
     /// Leader wall-clock timestamp in unix milliseconds when payload became ready
     /// for broadcast. Used only for cross-task timing diagnostics.
     #[serde(default)]
-    pub(crate) leader_ready_unix_ms: u64,
+    pub leader_ready_unix_ms: u64,
 }
 
 /// Serializable proxy for `(BlockExecutionOutput<Receipt>, Vec<Address>)`.
 /// `BlockExecutionResult` from alloy-evm doesn't derive serde, so we flatten it.
 #[derive(serde::Serialize, serde::Deserialize)]
-pub(crate) struct CompactBlockExecution {
-    pub(crate) bundle_state: revm::database::states::BundleState,
-    pub(crate) receipts: Vec<reth_ethereum_primitives::Receipt>,
-    pub(crate) requests: alloy_eips::eip7685::Requests,
-    pub(crate) gas_used: u64,
-    pub(crate) blob_gas_used: u64,
-    pub(crate) senders: Vec<Address>,
+pub struct CompactBlockExecution {
+    pub bundle_state: revm::database::states::BundleState,
+    pub receipts: Vec<reth_ethereum_primitives::Receipt>,
+    pub requests: alloy_eips::eip7685::Requests,
+    pub gas_used: u64,
+    pub blob_gas_used: u64,
+    pub senders: Vec<Address>,
 }
 
 /// Blob sidecar broadcast via /n42/blobs/1 GossipSub topic.
 #[derive(serde::Serialize, serde::Deserialize)]
-pub(crate) struct BlobSidecarBroadcast {
-    pub(crate) block_hash: B256,
-    pub(crate) view: u64,
-    pub(crate) sidecars: Vec<(B256, Vec<u8>)>,
+pub struct BlobSidecarBroadcast {
+    pub block_hash: B256,
+    pub view: u64,
+    pub sidecars: Vec<(B256, Vec<u8>)>,
 }
 
 /// Per-block pipeline timing tracker.
@@ -248,12 +242,12 @@ struct PendingFinalization {
 
 type FinalizeDone = (u64, B256, QuorumCertificate, bool);
 
-pub(crate) struct CommittedBlock {
-    pub(crate) view: u64,
-    pub(crate) block_hash: B256,
-    pub(crate) commit_qc: QuorumCertificate,
-    pub(crate) payload: Vec<u8>,
-    pub(crate) validator_changes: Option<Vec<n42_primitives::consensus::ValidatorChange>>,
+pub struct CommittedBlock {
+    pub view: u64,
+    pub block_hash: B256,
+    pub commit_qc: QuorumCertificate,
+    pub payload: Vec<u8>,
+    pub validator_changes: Option<Vec<n42_primitives::consensus::ValidatorChange>>,
 }
 
 /// Bridges the consensus engine with the P2P network layer and reth Engine API.
@@ -350,14 +344,6 @@ pub struct ConsensusService {
     /// when a resolve task takes longer than the pacemaker timeout.
     build_complete_tx: mpsc::Sender<()>,
     build_complete_rx: mpsc::Receiver<()>,
-    /// Raw mobile-reward manager, kept only as builder scaffolding: it feeds the
-    /// [`WithdrawalSource`] port (`withdrawal_source`) but the orchestrator's
-    /// runtime logic never touches it directly. Stage 5/6 relocates construction.
-    mobile_reward_manager: Option<Arc<Mutex<MobileRewardManager>>>,
-    /// Raw staking manager, kept only as builder scaffolding: it feeds both the
-    /// [`StakingSink`] (`staking_sink`) and the [`WithdrawalSource`] ports. The
-    /// orchestrator's runtime logic never touches it directly.
-    staking_manager: Option<Arc<Mutex<StakingManager>>>,
     /// Staking scan/persist behind the [`StakingSink`] port.
     staking_sink: Option<Arc<dyn StakingSink>>,
     /// Reward + matured-stake withdrawal computation behind the
@@ -679,7 +665,7 @@ impl ConsensusService {
 
     pub fn new(
         engine: ConsensusEngine,
-        network: NetworkHandle,
+        network: Arc<dyn ConsensusNetwork>,
         net_event_rx: mpsc::Receiver<NetworkEvent>,
         output_rx: mpsc::Receiver<EngineOutput>,
     ) -> Self {
@@ -692,7 +678,7 @@ impl ConsensusService {
         let (build_complete_tx, build_complete_rx) = mpsc::channel(256);
         Self {
             engine,
-            network: Arc::new(network),
+            network,
             consensus_event_rx: None,
             net_event_rx,
             output_rx,
@@ -740,8 +726,6 @@ impl ConsensusService {
             build_triggered_at: None,
             build_complete_tx,
             build_complete_rx,
-            mobile_reward_manager: None,
-            staking_manager: None,
             staking_sink: None,
             withdrawal_source: None,
             committed_block_count: 0,
@@ -858,7 +842,7 @@ impl ConsensusService {
     #[allow(clippy::too_many_arguments)]
     pub fn with_execution_layer(
         engine: ConsensusEngine,
-        network: NetworkHandle,
+        network: Arc<dyn ConsensusNetwork>,
         consensus_event_rx: mpsc::Receiver<NetworkEvent>,
         net_event_rx: mpsc::Receiver<NetworkEvent>,
         output_rx: mpsc::Receiver<EngineOutput>,
@@ -893,7 +877,7 @@ impl ConsensusService {
 
         Self {
             engine,
-            network: Arc::new(network),
+            network,
             consensus_event_rx: Some(consensus_event_rx),
             net_event_rx,
             output_rx,
@@ -941,8 +925,6 @@ impl ConsensusService {
             build_triggered_at: None,
             build_complete_tx,
             build_complete_rx,
-            mobile_reward_manager: None,
-            staking_manager: None,
             staking_sink: None,
             withdrawal_source: None,
             committed_block_count: 0,
@@ -1002,27 +984,19 @@ impl ConsensusService {
         self
     }
 
-    pub fn with_mobile_reward_manager(mut self, mgr: Arc<Mutex<MobileRewardManager>>) -> Self {
-        self.mobile_reward_manager = Some(mgr);
-        self.rebuild_withdrawal_source();
+    /// Attaches the reward+staking withdrawal source (build-path query). The
+    /// node builds the concrete adapter (`NodeWithdrawalSource`) and passes the
+    /// trait object so this crate stays free of the reward/staking concretes.
+    pub fn with_withdrawal_source(mut self, source: Arc<dyn WithdrawalSource>) -> Self {
+        self.withdrawal_source = Some(source);
         self
     }
 
-    pub fn with_staking_manager(mut self, mgr: Arc<Mutex<StakingManager>>) -> Self {
-        self.staking_sink = Some(Arc::new(ManagerStakingSink(Arc::clone(&mgr))));
-        self.staking_manager = Some(mgr);
-        self.rebuild_withdrawal_source();
+    /// Attaches the staking scan/persist sink. The node builds the concrete
+    /// adapter (`ManagerStakingSink`) and passes the trait object.
+    pub fn with_staking_sink(mut self, sink: Arc<dyn StakingSink>) -> Self {
+        self.staking_sink = Some(sink);
         self
-    }
-
-    /// (Re)builds the [`WithdrawalSource`] port from whichever of the mobile
-    /// reward / staking managers have been wired so far. Called by the two
-    /// manager builders; both arrive via separate `with_*` calls.
-    fn rebuild_withdrawal_source(&mut self) {
-        self.withdrawal_source = Some(Arc::new(NodeWithdrawalSource {
-            reward: self.mobile_reward_manager.clone(),
-            staking: self.staking_manager.clone(),
-        }));
     }
 
     /// Restores the committed block count from a persisted snapshot.
@@ -1037,13 +1011,13 @@ impl ConsensusService {
     ///
     /// When set, the orchestrator consults the schedule at each `EpochTransition`
     /// event and automatically stages the next epoch's validator set.
-    pub fn with_jmt(mut self, jmt: Arc<Mutex<PersistentSbmt>>) -> Self {
-        self.jmt = Some(Arc::new(SbmtStateSink(jmt)));
+    pub fn with_jmt(mut self, jmt: Arc<dyn StateSink>) -> Self {
+        self.jmt = Some(jmt);
         self
     }
 
-    pub fn with_twig(mut self, twig: Arc<Mutex<PersistentTwig>>) -> Self {
-        self.twig = Some(Arc::new(TwigStateSink(twig)));
+    pub fn with_twig(mut self, twig: Arc<dyn StateSink>) -> Self {
+        self.twig = Some(twig);
         self
     }
 
@@ -1052,8 +1026,8 @@ impl ConsensusService {
     /// When set, the orchestrator triggers ZK proof generation after each
     /// committed block (at the configured interval). Proofs are generated
     /// in `spawn_blocking` and never block the consensus path.
-    pub fn with_zk_scheduler(mut self, scheduler: Arc<n42_zkproof::ProofScheduler>) -> Self {
-        self.zk_scheduler = Some(Arc::new(SchedulerZkSink(scheduler)));
+    pub fn with_zk_scheduler(mut self, sink: Arc<dyn ZkSink>) -> Self {
+        self.zk_scheduler = Some(sink);
         self
     }
 
@@ -1842,7 +1816,7 @@ mod tests {
         let (engine, output_rx) = make_test_engine();
         let (network, _cmd_rx, _prx) = make_test_network();
         let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
-        let _ = ConsensusService::new(engine, network, net_event_rx, output_rx);
+        let _ = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
     }
 
     #[test]
@@ -1860,7 +1834,7 @@ mod tests {
         let (engine, output_rx) = make_test_engine();
         let (network, _cmd_rx, mut cmd_rx) = make_test_network();
         let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
-        let mut orch = ConsensusService::new(engine, network, net_event_rx, output_rx);
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
 
         let sk = test_key(0x12);
         let sig = sk.sign(b"test");
@@ -1886,7 +1860,7 @@ mod tests {
         let (engine, output_rx) = make_test_engine();
         let (network, _cmd_rx, mut cmd_rx) = make_test_network();
         let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
-        let mut orch = ConsensusService::new(engine, network, net_event_rx, output_rx);
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
 
         let sk = test_key(0x13);
         let sig = sk.sign(b"test");
@@ -1915,7 +1889,7 @@ mod tests {
         let (engine, output_rx) = make_test_engine();
         let (network, _cmd_rx, _prx) = make_test_network();
         let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
-        let mut orch = ConsensusService::new(engine, network, net_event_rx, output_rx);
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
         orch.handle_engine_output(EngineOutput::ExecuteBlock(B256::repeat_byte(0xCC)))
             .await;
     }
@@ -1925,7 +1899,7 @@ mod tests {
         let (engine, output_rx) = make_test_engine();
         let (network, _cmd_rx, _prx) = make_test_network();
         let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
-        let mut orch = ConsensusService::new(engine, network, net_event_rx, output_rx);
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
 
         let commit_qc = QuorumCertificate::genesis();
         orch.handle_engine_output(EngineOutput::BlockCommitted {
@@ -1948,7 +1922,7 @@ mod tests {
         let (engine, output_rx) = make_test_engine();
         let (network, _cmd_rx, _prx) = make_test_network();
         let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
-        let mut orch = ConsensusService::new(engine, network, net_event_rx, output_rx);
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
 
         let block_hash = B256::repeat_byte(0xA5);
         orch.store_committed_block(15, block_hash, QuorumCertificate::genesis(), None);
@@ -1981,7 +1955,7 @@ mod tests {
         let (engine, output_rx) = make_test_engine();
         let (network, _cmd_rx, _prx) = make_test_network();
         let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
-        let mut orch = ConsensusService::new(engine, network, net_event_rx, output_rx);
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
         orch.handle_engine_output(EngineOutput::ViewChanged { new_view: 5 })
             .await;
     }
@@ -1991,7 +1965,7 @@ mod tests {
         let (engine, output_rx) = make_test_engine();
         let (network, mut cmd_rx, _prx) = make_test_network();
         let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
-        let mut orch = ConsensusService::new(engine, network, net_event_rx, output_rx);
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
 
         let peer0 = Keypair::generate_ed25519().public().to_peer_id();
         let peer1 = Keypair::generate_ed25519().public().to_peer_id();
@@ -2033,7 +2007,7 @@ mod tests {
         let (engine, output_rx) = make_test_engine();
         let (network, mut cmd_rx, _prx) = make_test_network();
         let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
-        let mut orch = ConsensusService::new(engine, network, net_event_rx, output_rx)
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx)
             .with_allow_deterministic_validator_peers(false);
 
         let next_validators = vec![
@@ -2073,7 +2047,7 @@ mod tests {
         let (engine, output_rx) = make_test_engine();
         let (network, _cmd_rx, _prx) = make_test_network();
         let (net_event_tx, net_event_rx) = mpsc::channel::<NetworkEvent>(8192);
-        let orch = ConsensusService::new(engine, network, net_event_rx, output_rx);
+        let orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
         drop(net_event_tx);
 
         let result = tokio::time::timeout(Duration::from_secs(5), orch.run()).await;
@@ -2088,7 +2062,7 @@ mod tests {
         let (engine, output_rx) = make_test_engine();
         let (network, _cmd_rx, _prx) = make_test_network();
         let (net_event_tx, net_event_rx) = mpsc::channel::<NetworkEvent>(8192);
-        let orch = ConsensusService::new(engine, network, net_event_rx, output_rx);
+        let orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
 
         let peer_id = libp2p::PeerId::random();
         net_event_tx
@@ -2109,7 +2083,7 @@ mod tests {
         let (engine, output_rx) = make_test_engine();
         let (network, _cmd_rx, _prx) = make_test_network();
         let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
-        let mut orch = ConsensusService::new(engine, network, net_event_rx, output_rx);
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
         orch.consensus_state = state;
         orch
     }
@@ -2220,7 +2194,7 @@ mod tests {
         let (engine, output_rx) = make_test_engine();
         let (network, _cmd_rx, _prx) = make_test_network();
         let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
-        let mut orch = ConsensusService::new(engine, network, net_event_rx, output_rx);
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
 
         let txs: Vec<Vec<u8>> = (0..5000)
             .map(|i| vec![(i & 0xff) as u8, ((i >> 8) & 0xff) as u8])
@@ -2238,7 +2212,7 @@ mod tests {
         let (engine, output_rx) = make_test_engine();
         let (network, _cmd_rx, _prx) = make_test_network();
         let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
-        let mut orch = ConsensusService::new(engine, network, net_event_rx, output_rx);
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
 
         orch.connected_peers.insert(libp2p::PeerId::random());
         orch.sync_in_flight = true;
@@ -2279,7 +2253,7 @@ mod tests {
         let (engine, output_rx) = make_test_engine();
         let (network, _cmd_rx, _prx) = make_test_network();
         let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
-        let orch = ConsensusService::new(engine, network, net_event_rx, output_rx);
+        let orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
 
         // Before recovery: prev_randao_cache is ZERO
         assert_eq!(orch.prev_randao_cache, B256::ZERO);

@@ -6726,6 +6726,42 @@ dependencies = [
 ]
 
 [[package]]
+name = "n42-consensus-service"
+version = "0.5.0"
+dependencies = [
+ "alloy-consensus",
+ "alloy-eips",
+ "alloy-primitives",
+ "alloy-rlp",
+ "alloy-rpc-types-engine",
+ "arc-swap",
+ "async-trait",
+ "bincode",
+ "blake3",
+ "bytes",
+ "eyre",
+ "hex",
+ "libp2p",
+ "metrics",
+ "n42-chainspec",
+ "n42-consensus",
+ "n42-execution",
+ "n42-jmt",
+ "n42-network",
+ "n42-primitives",
+ "n42-zkproof",
+ "reth-ethereum-primitives",
+ "revm",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "zstd",
+]
+
+[[package]]
 name = "n42-evm-bench"
 version = "0.5.0"
 dependencies = [
@@ -6926,6 +6962,7 @@ dependencies = [
  "metrics",
  "n42-chainspec",
  "n42-consensus",
+ "n42-consensus-service",
  "n42-execution",
  "n42-jmt",
  "n42-mobile",

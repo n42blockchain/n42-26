@@ -1,42 +1,49 @@
 pub mod attestation_store;
 pub mod blob_port;
 mod components;
-pub mod consensus_state;
 pub mod el;
-pub mod epoch_schedule;
 pub mod exec_cache;
 pub mod ingest;
 pub mod mobile_bridge;
 pub mod mobile_packet;
 pub mod mobile_reward;
-pub mod net_port;
+pub use n42_consensus_service::net_port;
 mod node;
-pub mod orchestrator;
+pub mod observer;
 pub mod packet_builder;
 pub mod payload;
-pub mod persistence;
 pub mod pool;
 pub mod rpc;
 pub mod sinks;
 pub mod staking;
 pub mod tx_bridge;
-pub mod validator_peers;
 
-pub use components::{N42ConsensusBuilder, N42ExecutorBuilder};
-pub use consensus_state::SharedConsensusState;
-pub use node::N42Node;
-pub use orchestrator::ConsensusService;
-/// Backwards-compatible alias retained one release while the Caplin EL-seam
-/// refactor renames `ConsensusOrchestrator` → [`ConsensusService`] (stage 5).
-/// External callers (`bin/n42-node`, RPC) keep compiling unchanged.
-pub use orchestrator::ConsensusService as ConsensusOrchestrator;
-pub use orchestrator::observer::ObserverOrchestrator;
-pub use payload::N42PayloadBuilder;
-pub use pool::N42PoolBuilder;
-pub use validator_peers::{
-    configured_validator_peer_ids, expected_validator_peer_ids,
+// The consensus driver + its port traits + reth-free supporting types now live
+// in the `n42-consensus-service` crate (Caplin stage 6). Re-export the names the
+// node + binary still reference so callers compile unchanged.
+pub use n42_consensus_service::consensus_state::{self, SharedConsensusState};
+pub use n42_consensus_service::validator_peers::{
+    self, configured_validator_peer_ids, expected_validator_peer_ids,
     expected_validator_peer_ids_with_policy,
 };
+pub use n42_consensus_service::{ConsensusService, epoch_schedule, orchestrator, persistence};
+
+pub use components::{N42ConsensusBuilder, N42ExecutorBuilder};
+/// Backwards-compatible alias retained one release while the Caplin EL-seam
+/// refactor renames `ConsensusOrchestrator` → [`ConsensusService`] (stage 5).
+pub use n42_consensus_service::ConsensusService as ConsensusOrchestrator;
+pub use node::N42Node;
+pub use observer::ObserverOrchestrator;
+pub use payload::N42PayloadBuilder;
+pub use pool::N42PoolBuilder;
+
+/// Wires node-side hooks the `n42-consensus-service` driver calls back into. Must
+/// be invoked once at node startup. Currently registers the ingest virtual-block-
+/// credit arming fn (whose shared state + consume side live in this crate's ingest
+/// server) so the driver can arm credits without depending on the node ingest code.
+pub fn register_consensus_service_hooks() {
+    n42_consensus_service::ingest::set_block_credit_hook(ingest::note_virtual_block_credit);
+}
 
 /// Returns the current wall-clock time in milliseconds since the Unix epoch.
 ///

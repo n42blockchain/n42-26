@@ -1,0 +1,45 @@
+[package]
+name = "n42-consensus-service"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+n42-primitives.workspace = true
+n42-chainspec.workspace = true
+n42-consensus.workspace = true
+n42-execution.workspace = true
+n42-network.workspace = true
+n42-jmt.workspace = true
+n42-zkproof.workspace = true
+
+# Execution-domain type deps (pragmatic boundary: NO reth-node-builder / reth-evm /
+# reth-payload-* / reth-transaction-pool / reth-execution-types).
+revm.workspace = true
+reth-ethereum-primitives.workspace = true
+
+alloy-consensus.workspace = true
+alloy-eips.workspace = true
+alloy-primitives.workspace = true
+alloy-rlp.workspace = true
+alloy-rpc-types-engine = { workspace = true, features = ["serde"] }
+blake3.workspace = true
+
+arc-swap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+bincode.workspace = true
+hex.workspace = true
+bytes.workspace = true
+zstd.workspace = true
+eyre.workspace = true
+thiserror.workspace = true
+async-trait = "0.1"
+tokio.workspace = true
+tracing.workspace = true
+metrics.workspace = true
+
+[dev-dependencies]
+libp2p.workspace = true
+tempfile.workspace = true

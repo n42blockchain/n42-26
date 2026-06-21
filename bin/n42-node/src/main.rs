@@ -1390,6 +1390,10 @@ fn main() {
                     );
                 }
 
+                // Register node-side hooks the consensus-service driver calls back
+                // into (ingest virtual-block-credit arming).
+                n42_node::register_consensus_service_hooks();
+
                 let el: std::sync::Arc<dyn n42_node::el::ExecutionLayer> = std::sync::Arc::new(
                     n42_node::el::RethExecutionLayer::new(
                         beacon_engine_handle,
@@ -1398,7 +1402,7 @@ fn main() {
                 );
                 let mut orchestrator = ConsensusOrchestrator::with_execution_layer(
                     consensus_engine,
-                    net_handle,
+                    std::sync::Arc::new(net_handle),
                     consensus_event_rx,
                     net_event_rx,
                     output_rx,
@@ -1418,8 +1422,15 @@ fn main() {
                 .with_exec_output_cache(std::sync::Arc::new(
                     n42_node::exec_cache::RethExecutionOutputCache,
                 ))
-                .with_mobile_reward_manager(reward_manager)
-                .with_staking_manager(staking_manager.clone())
+                .with_staking_sink(std::sync::Arc::new(
+                    n42_node::sinks::ManagerStakingSink(staking_manager.clone()),
+                ))
+                .with_withdrawal_source(std::sync::Arc::new(
+                    n42_node::sinks::NodeWithdrawalSource {
+                        reward: Some(reward_manager),
+                        staking: Some(staking_manager.clone()),
+                    },
+                ))
                 .with_committed_block_count(restored_block_count);
 
                 // Restore prev_randao derivation from snapshot's last committed QC.
@@ -1435,13 +1446,19 @@ fn main() {
                 orchestrator = orchestrator
                     .with_allow_deterministic_validator_peers(allow_deterministic_validator_peers);
                 if let Some(ref jmt) = jmt {
-                    orchestrator = orchestrator.with_jmt(Arc::clone(jmt));
+                    orchestrator = orchestrator.with_jmt(std::sync::Arc::new(
+                        n42_node::sinks::SbmtStateSink(Arc::clone(jmt)),
+                    ));
                 }
                 if let Some(ref twig) = twig {
-                    orchestrator = orchestrator.with_twig(Arc::clone(twig));
+                    orchestrator = orchestrator.with_twig(std::sync::Arc::new(
+                        n42_node::sinks::TwigStateSink(Arc::clone(twig)),
+                    ));
                 }
                 if let Some(scheduler) = zk_scheduler {
-                    orchestrator = orchestrator.with_zk_scheduler(scheduler);
+                    orchestrator = orchestrator.with_zk_scheduler(std::sync::Arc::new(
+                        n42_node::sinks::SchedulerZkSink(scheduler),
+                    ));
                 }
                 if let Some(rx) = admin_rx.lock().unwrap_or_else(|e| e.into_inner()).take() {
                     orchestrator = orchestrator.with_admin_rx(rx);
