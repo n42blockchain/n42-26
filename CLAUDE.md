@@ -21,12 +21,14 @@ GIT_COMMITTER_NAME="Nyxen" GIT_COMMITTER_EMAIL="40690755+MiraWells@users.noreply
 
 ### ⚠️ reth fork 基线（务必对齐，否则会触发依赖降级）
 
-**当前唯一正确基线：`../reth` @ `chore/merge-upstream-fc2cc1e`（reth 2.3 合并版，merge
-`449ecfdce`）**，对应 workspace pin **revm 40.0.3 / alloy-evm 0.36.0 /
-reth-primitives-traits 0.4.1**。动手前先 `git -C ../reth log -1 --oneline` 确认 reth 在
-`449ecfdce`（或其后代）。jit/revmc 默认关闭（Windows 无 LLVM 22；Linux 要 JIT 用
-`--features jit`）。**CI 已对齐**：所有 workflow checkout reth 的 `chore/merge-upstream-fc2cc1e`
-（见 `.github/workflows/*.yml`）。
+**当前唯一正确基线：`../reth` @ `chore/merge-upstream-paradigmxyz-latest`（reth 2.3，merge
+paradigmxyz/main 63 提交，merge commit `0655e7a9a`）**，对应 workspace pin
+**revm 41.0.0 / alloy-evm 0.37.0 / reth-primitives-traits 0.5.0**。动手前先
+`git -C ../reth log -1 --oneline` 确认 reth 在 `0655e7a9a`（或其后代）。jit/revmc 默认关闭
+（Windows 无 LLVM 22；Linux 要 JIT 用 `--features jit`）。**CI 已对齐**：所有 workflow
+checkout reth 的 `chore/merge-upstream-paradigmxyz-latest`（见 `.github/workflows/*.yml`）。
+适配要点：alloy-rpc-types-engine 2.0→2.1 给 `PayloadAttributes` 加了 `target_gas_limit`
+（n42 设 `None`）；revm 40→41 / alloy-evm 0.36→0.37 对 n42-26 无 API 破坏。
 
 **🔴 红线：切勿为了让旧 reth 编过而降级 `Cargo.toml` 的 revm/alloy/reth-* 版本。** 那会推翻
 deps upgrade 工作（参见 devlog-60 维护者说明），也正是历史上 CI 误用旧 ref（`n42-v2-upgrade`）
@@ -38,6 +40,7 @@ deps upgrade 工作（参见 devlog-60 维护者说明），也正是历史上 C
 |-----------|------|-------------|
 | `n42-v2-upgrade`（最旧） | reth v2.2.0 | revm 38 / alloy-evm 0.34 / reth-primitives-traits 0.3.1 |
 | `chore/merge-upstream-main` | upstream main @04c7f29f | revm 40.0.3 / alloy-evm 0.36.0 / reth-primitives-traits 0.4.0 |
+| `chore/merge-upstream-fc2cc1e` | reth 2.3 @449ecfdce | revm 40.0.3 / alloy-evm 0.36.0 / reth-primitives-traits 0.4.1 |
 
 ## 常用命令
 
