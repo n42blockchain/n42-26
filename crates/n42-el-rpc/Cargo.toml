@@ -1,0 +1,29 @@
+[package]
+name = "n42-el-rpc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+n42-consensus-service = { workspace = true }
+
+alloy-primitives = { workspace = true }
+alloy-rpc-types-engine = { workspace = true, features = ["serde", "jwt"] }
+
+# HS256 JWT is minted directly with hmac+sha2 (not via alloy's
+# `JwtSecret::encode`/jsonwebtoken, whose `rust_crypto`/`aws_lc_rs` provider
+# features unify to BOTH in the node build graph and panic at encode time).
+hmac = "0.12"
+sha2 = { workspace = true }
+base64 = "0.22"
+reqwest = { version = "0.12", features = ["json"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = "0.1"
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

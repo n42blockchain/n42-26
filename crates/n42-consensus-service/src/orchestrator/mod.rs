@@ -1,32 +1,34 @@
 mod consensus_loop;
 mod execution_bridge;
-pub mod observer;
+pub use execution_bridge::compact_block_enabled;
 mod state_mgmt;
 mod view_jump_throttle;
 
+use crate::blob_port::BlobStorePort;
 use crate::consensus_state::{PoolDepthSnapshot, SharedConsensusState};
-use crate::el::{ExecutionLayer, RethExecutionLayer};
+use crate::el::ExecutionLayer;
 use crate::epoch_schedule::EpochSchedule;
-use crate::mobile_reward::MobileRewardManager;
-use crate::staking::StakingManager;
-use crate::tx_bridge::TxImportBatch;
+use crate::exec_cache::ExecutionOutputCache;
+use crate::net_port::ConsensusNetwork;
+use crate::sinks::{StakingSink, StateSink, WithdrawalSource, ZkSink};
 use alloy_primitives::{Address, B256};
 use metrics::{counter, gauge, histogram};
 use n42_consensus::{ConsensusEngine, EngineOutput, FUTURE_VIEW_WINDOW, ValidatorSet};
-use n42_jmt::{PersistentSbmt, PersistentTwig};
-use n42_network::{NetworkEvent, NetworkHandle, PeerId};
+use n42_network::{NetworkEvent, PeerId};
 use n42_primitives::QuorumCertificate;
-use reth_ethereum_engine_primitives::EthEngineTypes;
-use reth_node_builder::ConsensusEngineHandle;
-use reth_payload_builder::PayloadBuilderHandle;
-use reth_transaction_pool::blobstore::DiskFileBlobStore;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tracing::{debug, error, info, warn};
+
+/// Batched network transaction import payload sent to the tx-pool bridge. Defined
+/// locally (identical to `tx_bridge::TxImportBatch`) so the consensus service does
+/// not depend on the reth-coupled `tx_bridge` module — both are `Vec<Vec<u8>>`, so
+/// the channel ends stay compatible.
+pub type TxImportBatch = Vec<Vec<u8>>;
 
 /// zstd magic bytes: all zstd frames start with 0x28B52FFD.
 const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
@@ -36,7 +38,7 @@ const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
 const TX_FORWARD_BATCH_TARGET: usize = 512;
 
 /// Compress payload JSON with zstd (level 3 — good speed/ratio tradeoff).
-pub(crate) fn compress_payload(json: &[u8]) -> Vec<u8> {
+pub fn compress_payload(json: &[u8]) -> Vec<u8> {
     zstd::bulk::compress(json, 3).unwrap_or_else(|e| {
         tracing::warn!(target: "n42::cl", len = json.len(), error = %e, "zstd compression failed, sending uncompressed");
         json.to_vec()
@@ -45,7 +47,7 @@ pub(crate) fn compress_payload(json: &[u8]) -> Vec<u8> {
 
 /// Decompress payload if zstd-compressed; pass through raw JSON unchanged.
 /// Backward-compatible: old nodes send uncompressed JSON, new nodes send zstd.
-pub(crate) fn decompress_payload(data: &[u8]) -> std::io::Result<Vec<u8>> {
+pub fn decompress_payload(data: &[u8]) -> std::io::Result<Vec<u8>> {
     if data.len() >= 4 && data[..4] == ZSTD_MAGIC {
         zstd::bulk::decompress(data, 64 * 1024 * 1024) // 64 MB max
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
@@ -71,45 +73,45 @@ fn elapsed_since_unix_ms(start_ms: u64) -> Option<u64> {
 /// simultaneously — bincode does not support missing trailing fields on deserialization.
 /// New→old is fine (bincode ignores trailing bytes), but old→new will fail.
 #[derive(serde::Serialize, serde::Deserialize)]
-pub(crate) struct BlockDataBroadcast {
-    pub(crate) block_hash: B256,
-    pub(crate) view: u64,
+pub struct BlockDataBroadcast {
+    pub block_hash: B256,
+    pub view: u64,
     /// Execution payload — zstd-compressed JSON (or raw JSON from older peers).
     /// Use `decompress_payload()` before `serde_json::from_slice()`.
-    pub(crate) payload_json: Vec<u8>,
+    pub payload_json: Vec<u8>,
     /// Block timestamp (seconds since epoch). Stored directly to avoid JSON re-parsing.
     /// Defaults to 0 for backwards compatibility with older serialized broadcasts.
     #[serde(default)]
-    pub(crate) timestamp: u64,
+    pub timestamp: u64,
     /// Compact Block: zstd-compressed bincode of `CompactBlockExecution`.
     /// When present, followers load this into `payload_cache` to skip EVM re-execution.
     /// None for backwards compatibility with older peers.
     #[serde(default)]
-    pub(crate) execution_output: Option<Vec<u8>>,
+    pub execution_output: Option<Vec<u8>>,
     /// Leader wall-clock timestamp in unix milliseconds when payload became ready
     /// for broadcast. Used only for cross-task timing diagnostics.
     #[serde(default)]
-    pub(crate) leader_ready_unix_ms: u64,
+    pub leader_ready_unix_ms: u64,
 }
 
 /// Serializable proxy for `(BlockExecutionOutput<Receipt>, Vec<Address>)`.
 /// `BlockExecutionResult` from alloy-evm doesn't derive serde, so we flatten it.
 #[derive(serde::Serialize, serde::Deserialize)]
-pub(crate) struct CompactBlockExecution {
-    pub(crate) bundle_state: revm::database::states::BundleState,
-    pub(crate) receipts: Vec<reth_ethereum_primitives::Receipt>,
-    pub(crate) requests: alloy_eips::eip7685::Requests,
-    pub(crate) gas_used: u64,
-    pub(crate) blob_gas_used: u64,
-    pub(crate) senders: Vec<Address>,
+pub struct CompactBlockExecution {
+    pub bundle_state: revm::database::states::BundleState,
+    pub receipts: Vec<reth_ethereum_primitives::Receipt>,
+    pub requests: alloy_eips::eip7685::Requests,
+    pub gas_used: u64,
+    pub blob_gas_used: u64,
+    pub senders: Vec<Address>,
 }
 
 /// Blob sidecar broadcast via /n42/blobs/1 GossipSub topic.
 #[derive(serde::Serialize, serde::Deserialize)]
-pub(crate) struct BlobSidecarBroadcast {
-    pub(crate) block_hash: B256,
-    pub(crate) view: u64,
-    pub(crate) sidecars: Vec<(B256, Vec<u8>)>,
+pub struct BlobSidecarBroadcast {
+    pub block_hash: B256,
+    pub view: u64,
+    pub sidecars: Vec<(B256, Vec<u8>)>,
 }
 
 /// Per-block pipeline timing tracker.
@@ -240,21 +242,24 @@ struct PendingFinalization {
 
 type FinalizeDone = (u64, B256, QuorumCertificate, bool);
 
-pub(crate) struct CommittedBlock {
-    pub(crate) view: u64,
-    pub(crate) block_hash: B256,
-    pub(crate) commit_qc: QuorumCertificate,
-    pub(crate) payload: Vec<u8>,
-    pub(crate) validator_changes: Option<Vec<n42_primitives::consensus::ValidatorChange>>,
+pub struct CommittedBlock {
+    pub view: u64,
+    pub block_hash: B256,
+    pub commit_qc: QuorumCertificate,
+    pub payload: Vec<u8>,
+    pub validator_changes: Option<Vec<n42_primitives::consensus::ValidatorChange>>,
 }
 
 /// Bridges the consensus engine with the P2P network layer and reth Engine API.
 ///
 /// Runs as a background task via `tokio::select!` over network events, engine outputs,
 /// pacemaker timeouts, and BlockReady signals.
-pub struct ConsensusOrchestrator {
+pub struct ConsensusService {
     engine: ConsensusEngine,
-    network: NetworkHandle,
+    /// Network port (Caplin sentinel-client seam). One in-process adapter today
+    /// (`NetworkHandle`); the trait object lets the orchestrator move into a
+    /// service crate without depending on `n42-network` / libp2p internals.
+    network: Arc<dyn ConsensusNetwork>,
     /// High-priority: consensus messages only (Vote, Proposal, PrepareQC, etc.)
     consensus_event_rx: Option<mpsc::Receiver<NetworkEvent>>,
     /// Lower-priority: data events (BlockData, TX, Sync, Peers)
@@ -306,7 +311,10 @@ pub struct ConsensusOrchestrator {
     /// Tuple: (view, block_hash, commit_qc, finalized).
     finalize_done_rx: mpsc::Receiver<FinalizeDone>,
     finalize_done_tx: mpsc::Sender<FinalizeDone>,
-    blob_store: Option<DiskFileBlobStore>,
+    blob_store: Option<Arc<dyn BlobStorePort>>,
+    /// Compact-block execution-output cache behind the [`ExecutionOutputCache`]
+    /// port. `None` ⇒ compact-block inject/take are no-ops (tests / EL-less).
+    exec_output_cache: Option<Arc<dyn ExecutionOutputCache>>,
     /// True while a background import task is running.
     bg_import_in_flight: bool,
     /// Hashes already queued or in-flight for background import.
@@ -336,8 +344,11 @@ pub struct ConsensusOrchestrator {
     /// when a resolve task takes longer than the pacemaker timeout.
     build_complete_tx: mpsc::Sender<()>,
     build_complete_rx: mpsc::Receiver<()>,
-    mobile_reward_manager: Option<Arc<Mutex<MobileRewardManager>>>,
-    staking_manager: Option<Arc<Mutex<StakingManager>>>,
+    /// Staking scan/persist behind the [`StakingSink`] port.
+    staking_sink: Option<Arc<dyn StakingSink>>,
+    /// Reward + matured-stake withdrawal computation behind the
+    /// [`WithdrawalSource`] port (build-path query).
+    withdrawal_source: Option<Arc<dyn WithdrawalSource>>,
     committed_block_count: u64,
     /// Tracks the timestamp of the last built/committed block to prevent
     /// "invalid timestamp" errors from the Engine API.  The Engine API requires
@@ -376,15 +387,19 @@ pub struct ConsensusOrchestrator {
     /// Moves finalize forkchoiceUpdated off the consensus select-loop hot path.
     /// Enabled by `N42_ASYNC_FINALIZE_FCU=1`. Default: false.
     async_finalize_fcu: bool,
-    /// Sparse Binary Merkle Tree for parallel state commitment.
-    /// Updated asynchronously after each committed block.
-    jmt: Option<Arc<Mutex<PersistentSbmt>>>,
-    /// Twig state tree for append-only state commitments.
-    /// Updated asynchronously after each committed block.
-    twig: Option<Arc<Mutex<PersistentTwig>>>,
-    /// ZK proof scheduler: generates ZK proofs asynchronously as a sidecar.
-    /// Enabled by `N42_ZK_PROOF=1`. Default: None (disabled, zero overhead).
-    zk_scheduler: Option<Arc<n42_zkproof::ProofScheduler>>,
+    /// Deferred state-root mode (env `N42_DEFER_STATE_ROOT`, read once by the node
+    /// at construction). When set, finalized blocks log a deferred-state-root note.
+    /// Cached as a `bool` so the orchestrator no longer calls the reth EVM helper.
+    defer_state_root: bool,
+    /// Sparse Binary Merkle Tree for parallel state commitment, behind the
+    /// [`StateSink`] port. Updated asynchronously after each committed block.
+    jmt: Option<Arc<dyn StateSink>>,
+    /// Twig state tree for append-only state commitments, behind the
+    /// [`StateSink`] port. Updated asynchronously after each committed block.
+    twig: Option<Arc<dyn StateSink>>,
+    /// ZK proof scheduler behind the [`ZkSink`] port: generates ZK proofs
+    /// asynchronously as a sidecar. Enabled by `N42_ZK_PROOF=1`.
+    zk_scheduler: Option<Arc<dyn ZkSink>>,
     /// Whether deterministic validator PeerIds may be derived when no explicit
     /// `p2p_peer_id` bindings are configured.
     allow_deterministic_validator_peers: bool,
@@ -398,7 +413,7 @@ pub struct ConsensusOrchestrator {
     view_jump_throttle: view_jump_throttle::ViewJumpThrottle,
 }
 
-impl ConsensusOrchestrator {
+impl ConsensusService {
     fn async_finalize_fcu_enabled() -> bool {
         std::env::var("N42_ASYNC_FINALIZE_FCU")
             .ok()
@@ -650,7 +665,7 @@ impl ConsensusOrchestrator {
 
     pub fn new(
         engine: ConsensusEngine,
-        network: NetworkHandle,
+        network: Arc<dyn ConsensusNetwork>,
         net_event_rx: mpsc::Receiver<NetworkEvent>,
         output_rx: mpsc::Receiver<EngineOutput>,
     ) -> Self {
@@ -700,6 +715,7 @@ impl ConsensusOrchestrator {
             finalize_done_rx,
             finalize_done_tx,
             blob_store: None,
+            exec_output_cache: None,
             bg_import_in_flight: false,
             bg_import_hashes: HashSet::new(),
             bg_import_queue: VecDeque::new(),
@@ -710,8 +726,8 @@ impl ConsensusOrchestrator {
             build_triggered_at: None,
             build_complete_tx,
             build_complete_rx,
-            mobile_reward_manager: None,
-            staking_manager: None,
+            staking_sink: None,
+            withdrawal_source: None,
             committed_block_count: 0,
             last_committed_timestamp: 0,
             view_started_at: None,
@@ -730,6 +746,7 @@ impl ConsensusOrchestrator {
                 .unwrap_or(0)
                 > 0,
             async_finalize_fcu: Self::async_finalize_fcu_enabled(),
+            defer_state_root: false,
             jmt: None,
             twig: None,
             zk_scheduler: None,
@@ -823,14 +840,13 @@ impl ConsensusOrchestrator {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn with_engine_api(
+    pub fn with_execution_layer(
         engine: ConsensusEngine,
-        network: NetworkHandle,
+        network: Arc<dyn ConsensusNetwork>,
         consensus_event_rx: mpsc::Receiver<NetworkEvent>,
         net_event_rx: mpsc::Receiver<NetworkEvent>,
         output_rx: mpsc::Receiver<EngineOutput>,
-        beacon_engine: ConsensusEngineHandle<EthEngineTypes>,
-        payload_builder: PayloadBuilderHandle<EthEngineTypes>,
+        el: Arc<dyn ExecutionLayer>,
         consensus_state: Arc<SharedConsensusState>,
         head_block_hash: B256,
         fee_recipient: Address,
@@ -865,10 +881,7 @@ impl ConsensusOrchestrator {
             consensus_event_rx: Some(consensus_event_rx),
             net_event_rx,
             output_rx,
-            el: Some(Arc::new(RethExecutionLayer::new(
-                beacon_engine,
-                payload_builder,
-            ))),
+            el: Some(el),
             consensus_state: Some(consensus_state),
             head_block_hash,
             last_commit_qc: None,
@@ -901,6 +914,7 @@ impl ConsensusOrchestrator {
             finalize_done_rx,
             finalize_done_tx,
             blob_store: None,
+            exec_output_cache: None,
             bg_import_in_flight: false,
             bg_import_hashes: HashSet::new(),
             bg_import_queue: VecDeque::new(),
@@ -911,8 +925,8 @@ impl ConsensusOrchestrator {
             build_triggered_at: None,
             build_complete_tx,
             build_complete_rx,
-            mobile_reward_manager: None,
-            staking_manager: None,
+            staking_sink: None,
+            withdrawal_source: None,
             committed_block_count: 0,
             last_committed_timestamp: 0,
             view_started_at: None,
@@ -927,6 +941,7 @@ impl ConsensusOrchestrator {
             eager_import_block_guard: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             fast_propose,
             async_finalize_fcu,
+            defer_state_root: false,
             jmt: None,
             twig: None,
             zk_scheduler: None,
@@ -937,8 +952,20 @@ impl ConsensusOrchestrator {
         }
     }
 
-    pub fn with_blob_store(mut self, blob_store: DiskFileBlobStore) -> Self {
+    pub fn with_exec_output_cache(mut self, cache: Arc<dyn ExecutionOutputCache>) -> Self {
+        self.exec_output_cache = Some(cache);
+        self
+    }
+
+    pub fn with_blob_store(mut self, blob_store: Arc<dyn BlobStorePort>) -> Self {
         self.blob_store = Some(blob_store);
+        self
+    }
+
+    /// Caches the deferred-state-root mode (read from `N42_DEFER_STATE_ROOT` by the
+    /// node) so the orchestrator does not call the reth EVM helper directly.
+    pub fn with_defer_state_root(mut self, defer: bool) -> Self {
+        self.defer_state_root = defer;
         self
     }
 
@@ -957,13 +984,18 @@ impl ConsensusOrchestrator {
         self
     }
 
-    pub fn with_mobile_reward_manager(mut self, mgr: Arc<Mutex<MobileRewardManager>>) -> Self {
-        self.mobile_reward_manager = Some(mgr);
+    /// Attaches the reward+staking withdrawal source (build-path query). The
+    /// node builds the concrete adapter (`NodeWithdrawalSource`) and passes the
+    /// trait object so this crate stays free of the reward/staking concretes.
+    pub fn with_withdrawal_source(mut self, source: Arc<dyn WithdrawalSource>) -> Self {
+        self.withdrawal_source = Some(source);
         self
     }
 
-    pub fn with_staking_manager(mut self, mgr: Arc<Mutex<StakingManager>>) -> Self {
-        self.staking_manager = Some(mgr);
+    /// Attaches the staking scan/persist sink. The node builds the concrete
+    /// adapter (`ManagerStakingSink`) and passes the trait object.
+    pub fn with_staking_sink(mut self, sink: Arc<dyn StakingSink>) -> Self {
+        self.staking_sink = Some(sink);
         self
     }
 
@@ -979,12 +1011,12 @@ impl ConsensusOrchestrator {
     ///
     /// When set, the orchestrator consults the schedule at each `EpochTransition`
     /// event and automatically stages the next epoch's validator set.
-    pub fn with_jmt(mut self, jmt: Arc<Mutex<PersistentSbmt>>) -> Self {
+    pub fn with_jmt(mut self, jmt: Arc<dyn StateSink>) -> Self {
         self.jmt = Some(jmt);
         self
     }
 
-    pub fn with_twig(mut self, twig: Arc<Mutex<PersistentTwig>>) -> Self {
+    pub fn with_twig(mut self, twig: Arc<dyn StateSink>) -> Self {
         self.twig = Some(twig);
         self
     }
@@ -994,8 +1026,8 @@ impl ConsensusOrchestrator {
     /// When set, the orchestrator triggers ZK proof generation after each
     /// committed block (at the configured interval). Proofs are generated
     /// in `spawn_blocking` and never block the consensus path.
-    pub fn with_zk_scheduler(mut self, scheduler: Arc<n42_zkproof::ProofScheduler>) -> Self {
-        self.zk_scheduler = Some(scheduler);
+    pub fn with_zk_scheduler(mut self, sink: Arc<dyn ZkSink>) -> Self {
+        self.zk_scheduler = Some(sink);
         self
     }
 
@@ -1784,7 +1816,7 @@ mod tests {
         let (engine, output_rx) = make_test_engine();
         let (network, _cmd_rx, _prx) = make_test_network();
         let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
-        let _ = ConsensusOrchestrator::new(engine, network, net_event_rx, output_rx);
+        let _ = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
     }
 
     #[test]
@@ -1802,7 +1834,7 @@ mod tests {
         let (engine, output_rx) = make_test_engine();
         let (network, _cmd_rx, mut cmd_rx) = make_test_network();
         let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
-        let mut orch = ConsensusOrchestrator::new(engine, network, net_event_rx, output_rx);
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
 
         let sk = test_key(0x12);
         let sig = sk.sign(b"test");
@@ -1828,7 +1860,7 @@ mod tests {
         let (engine, output_rx) = make_test_engine();
         let (network, _cmd_rx, mut cmd_rx) = make_test_network();
         let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
-        let mut orch = ConsensusOrchestrator::new(engine, network, net_event_rx, output_rx);
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
 
         let sk = test_key(0x13);
         let sig = sk.sign(b"test");
@@ -1857,7 +1889,7 @@ mod tests {
         let (engine, output_rx) = make_test_engine();
         let (network, _cmd_rx, _prx) = make_test_network();
         let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
-        let mut orch = ConsensusOrchestrator::new(engine, network, net_event_rx, output_rx);
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
         orch.handle_engine_output(EngineOutput::ExecuteBlock(B256::repeat_byte(0xCC)))
             .await;
     }
@@ -1867,7 +1899,7 @@ mod tests {
         let (engine, output_rx) = make_test_engine();
         let (network, _cmd_rx, _prx) = make_test_network();
         let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
-        let mut orch = ConsensusOrchestrator::new(engine, network, net_event_rx, output_rx);
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
 
         let commit_qc = QuorumCertificate::genesis();
         orch.handle_engine_output(EngineOutput::BlockCommitted {
@@ -1890,7 +1922,7 @@ mod tests {
         let (engine, output_rx) = make_test_engine();
         let (network, _cmd_rx, _prx) = make_test_network();
         let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
-        let mut orch = ConsensusOrchestrator::new(engine, network, net_event_rx, output_rx);
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
 
         let block_hash = B256::repeat_byte(0xA5);
         orch.store_committed_block(15, block_hash, QuorumCertificate::genesis(), None);
@@ -1923,7 +1955,7 @@ mod tests {
         let (engine, output_rx) = make_test_engine();
         let (network, _cmd_rx, _prx) = make_test_network();
         let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
-        let mut orch = ConsensusOrchestrator::new(engine, network, net_event_rx, output_rx);
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
         orch.handle_engine_output(EngineOutput::ViewChanged { new_view: 5 })
             .await;
     }
@@ -1933,7 +1965,7 @@ mod tests {
         let (engine, output_rx) = make_test_engine();
         let (network, mut cmd_rx, _prx) = make_test_network();
         let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
-        let mut orch = ConsensusOrchestrator::new(engine, network, net_event_rx, output_rx);
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
 
         let peer0 = Keypair::generate_ed25519().public().to_peer_id();
         let peer1 = Keypair::generate_ed25519().public().to_peer_id();
@@ -1975,7 +2007,7 @@ mod tests {
         let (engine, output_rx) = make_test_engine();
         let (network, mut cmd_rx, _prx) = make_test_network();
         let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
-        let mut orch = ConsensusOrchestrator::new(engine, network, net_event_rx, output_rx)
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx)
             .with_allow_deterministic_validator_peers(false);
 
         let next_validators = vec![
@@ -2015,7 +2047,7 @@ mod tests {
         let (engine, output_rx) = make_test_engine();
         let (network, _cmd_rx, _prx) = make_test_network();
         let (net_event_tx, net_event_rx) = mpsc::channel::<NetworkEvent>(8192);
-        let orch = ConsensusOrchestrator::new(engine, network, net_event_rx, output_rx);
+        let orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
         drop(net_event_tx);
 
         let result = tokio::time::timeout(Duration::from_secs(5), orch.run()).await;
@@ -2030,7 +2062,7 @@ mod tests {
         let (engine, output_rx) = make_test_engine();
         let (network, _cmd_rx, _prx) = make_test_network();
         let (net_event_tx, net_event_rx) = mpsc::channel::<NetworkEvent>(8192);
-        let orch = ConsensusOrchestrator::new(engine, network, net_event_rx, output_rx);
+        let orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
 
         let peer_id = libp2p::PeerId::random();
         net_event_tx
@@ -2047,11 +2079,11 @@ mod tests {
 
     fn make_test_orchestrator_with_state(
         state: Option<Arc<SharedConsensusState>>,
-    ) -> ConsensusOrchestrator {
+    ) -> ConsensusService {
         let (engine, output_rx) = make_test_engine();
         let (network, _cmd_rx, _prx) = make_test_network();
         let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
-        let mut orch = ConsensusOrchestrator::new(engine, network, net_event_rx, output_rx);
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
         orch.consensus_state = state;
         orch
     }
@@ -2162,7 +2194,7 @@ mod tests {
         let (engine, output_rx) = make_test_engine();
         let (network, _cmd_rx, _prx) = make_test_network();
         let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
-        let mut orch = ConsensusOrchestrator::new(engine, network, net_event_rx, output_rx);
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
 
         let txs: Vec<Vec<u8>> = (0..5000)
             .map(|i| vec![(i & 0xff) as u8, ((i >> 8) & 0xff) as u8])
@@ -2180,7 +2212,7 @@ mod tests {
         let (engine, output_rx) = make_test_engine();
         let (network, _cmd_rx, _prx) = make_test_network();
         let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
-        let mut orch = ConsensusOrchestrator::new(engine, network, net_event_rx, output_rx);
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
 
         orch.connected_peers.insert(libp2p::PeerId::random());
         orch.sync_in_flight = true;
@@ -2221,7 +2253,7 @@ mod tests {
         let (engine, output_rx) = make_test_engine();
         let (network, _cmd_rx, _prx) = make_test_network();
         let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
-        let orch = ConsensusOrchestrator::new(engine, network, net_event_rx, output_rx);
+        let orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
 
         // Before recovery: prev_randao_cache is ZERO
         assert_eq!(orch.prev_randao_cache, B256::ZERO);

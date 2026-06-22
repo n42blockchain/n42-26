@@ -1,6 +1,7 @@
-use super::ConsensusOrchestrator;
+use super::ConsensusService;
 use super::state_mgmt::max_consecutive_empty_skips;
 use crate::el::ExecutionLayer;
+use crate::exec_cache::ExecutionOutputCache;
 use crate::expected_validator_peer_ids_with_policy;
 use alloy_primitives::B256;
 use alloy_rpc_types_engine::{ForkchoiceState, PayloadStatusEnum};
@@ -19,7 +20,7 @@ const EMPTY_BLOCK_CHECK_WINDOW: usize = 3;
 /// Payload size below which a block is considered "empty" (no meaningful transactions).
 const EMPTY_BLOCK_SIZE_THRESHOLD: usize = 512;
 
-impl ConsensusOrchestrator {
+impl ConsensusService {
     pub(super) fn recent_blocks_empty(&self) -> bool {
         let check_count = EMPTY_BLOCK_CHECK_WINDOW.min(self.committed_blocks.len());
         if check_count == 0 {
@@ -471,14 +472,11 @@ impl ConsensusOrchestrator {
                     let state = self.consensus_state.clone();
                     tokio::task::spawn_blocking(move || {
                         let start = std::time::Instant::now();
-                        let mut tree = jmt.lock().unwrap_or_else(|e| {
-                            tracing::warn!("sbmt mutex poisoned, recovering");
-                            e.into_inner()
-                        });
-                        // PersistentSbmt::apply_diff applies in-memory, appends the WAL
-                        // (durable per block) and checkpoints a snapshot every interval.
-                        // It returns a Result because the WAL/snapshot IO can fail.
-                        match tree.apply_diff(&diff) {
+                        // StateSink::apply_diff locks the SBMT internally, applies
+                        // in-memory, appends the WAL (durable per block) and checkpoints
+                        // a snapshot every interval. It returns a Result because the
+                        // WAL/snapshot IO can fail.
+                        match jmt.apply_diff(&diff) {
                             Ok((version, root)) => {
                                 let elapsed_ms = start.elapsed().as_millis();
                                 gauge!("n42_jmt_latest_root").set(version as f64);
@@ -508,11 +506,8 @@ impl ConsensusOrchestrator {
                     let state = self.consensus_state.clone();
                     tokio::task::spawn_blocking(move || {
                         let start = std::time::Instant::now();
-                        let mut tree = twig.lock().unwrap_or_else(|e| {
-                            tracing::warn!("twig mutex poisoned, recovering");
-                            e.into_inner()
-                        });
-                        match tree.apply_diff(&diff) {
+                        // StateSink::apply_diff locks the Twig tree internally.
+                        match twig.apply_diff(&diff) {
                             Ok((version, root)) => {
                                 let elapsed_ms = start.elapsed().as_millis();
                                 gauge!("n42_twig_latest_root").set(version as f64);
@@ -571,17 +566,13 @@ impl ConsensusOrchestrator {
         }
 
         // Scan committed block for staking/unstaking transactions.
-        if let Some(ref staking_mgr) = self.staking_manager
+        if let Some(ref staking_sink) = self.staking_sink
             && let Some(data) = self.committed_blocks.back().map(|b| b.payload.as_slice())
             && !data.is_empty()
         {
             match super::decompress_payload(data) {
                 Ok(decompressed) => {
-                    let mut mgr = staking_mgr.lock().unwrap_or_else(|e| {
-                        tracing::warn!("staking_mgr mutex poisoned, recovering");
-                        e.into_inner()
-                    });
-                    mgr.scan_committed_block(self.committed_block_count, &decompressed);
+                    staking_sink.scan_committed_block(self.committed_block_count, &decompressed);
                 }
                 Err(e) => {
                     warn!(target: "n42::cl::consensus_loop", error = %e, "failed to decompress payload for staking scan");
@@ -743,7 +734,7 @@ impl ConsensusOrchestrator {
 
             // Deferred state root mode: log that state root verification is pending.
             // Future: spawn async state root computation here using reth's provider.
-            if reth_evm::n42_defer_state_root() {
+            if self.defer_state_root {
                 debug!(target: "n42::cl::consensus_loop", view, %block_hash,
                     "N42_DEFER_STATE_ROOT: block finalized with deferred state root (B256::ZERO)");
             }
@@ -823,9 +814,11 @@ impl ConsensusOrchestrator {
                 return;
             }
         };
+        let exec_cache = self.exec_output_cache.clone();
         info!(target: "n42::cl::consensus_loop", view, %block_hash, "spawning background import");
         tokio::spawn(async move {
-            let (success, block_ts) = Self::background_import(eh, &data, block_hash).await;
+            let (success, block_ts) =
+                Self::background_import(eh, exec_cache, &data, block_hash).await;
             if done_tx
                 .send((block_hash, view, success, block_ts))
                 .await
@@ -840,6 +833,7 @@ impl ConsensusOrchestrator {
     /// Returns (success, block_timestamp).
     async fn background_import(
         engine_handle: Arc<dyn ExecutionLayer>,
+        exec_cache: Option<Arc<dyn ExecutionOutputCache>>,
         data: &[u8],
         block_hash: B256,
     ) -> (bool, u64) {
@@ -872,12 +866,9 @@ impl ConsensusOrchestrator {
         // Compact Block: load execution output into payload cache before `new_payload`.
         if let Some(ref exec_compressed) = broadcast.execution_output
             && super::execution_bridge::compact_block_enabled()
+            && let Some(ref cache) = exec_cache
         {
-            super::execution_bridge::inject_compact_block(
-                &block_hash,
-                exec_compressed,
-                "consensus_loop",
-            );
+            cache.inject(block_hash, exec_compressed, "consensus_loop");
         }
 
         match engine_handle.new_payload(execution_data).await {

@@ -1,7 +1,8 @@
-use super::{BlobSidecarBroadcast, BlockDataBroadcast, CommittedBlock};
-use crate::el::{ExecutionLayer, RethExecutionLayer};
+use crate::blob_port::BlobStorePort;
+use crate::el::ExecutionLayer;
 use crate::epoch_schedule::EpochSchedule;
-use alloy_eips::eip7594::BlobTransactionSidecarVariant;
+use crate::exec_cache::ExecutionOutputCache;
+use crate::orchestrator::{BlobSidecarBroadcast, BlockDataBroadcast, CommittedBlock};
 use alloy_primitives::B256;
 use alloy_rpc_types_engine::{ForkchoiceState, PayloadStatusEnum};
 use metrics::{counter, gauge};
@@ -9,9 +10,6 @@ use n42_chainspec::ValidatorInfo;
 use n42_consensus::{ValidatorSet, validator_changes_hash, verify_commit_qc};
 use n42_network::{BlockSyncResponse, NetworkEvent, NetworkHandle, PeerId, SyncBlock};
 use n42_primitives::QuorumCertificate;
-use reth_ethereum_engine_primitives::EthEngineTypes;
-use reth_node_builder::ConsensusEngineHandle;
-use reth_transaction_pool::blobstore::{BlobStore, DiskFileBlobStore};
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
@@ -160,8 +158,11 @@ pub struct ObserverOrchestrator {
     sync_attempt_counter: u64,
     committed_blocks: VecDeque<CommittedBlock>,
 
-    // Blob
-    blob_store: Option<DiskFileBlobStore>,
+    // Blob (byte-oriented port; reth blob types live in the node-side adapter)
+    blob_store: Option<Arc<dyn BlobStorePort>>,
+
+    // Compact-block execution-output cache port (None ⇒ no inject)
+    exec_output_cache: Option<Arc<dyn ExecutionOutputCache>>,
 
     // Progress
     blocks_imported: u64,
@@ -172,14 +173,14 @@ impl ObserverOrchestrator {
     pub fn new(
         network: NetworkHandle,
         net_event_rx: mpsc::Receiver<NetworkEvent>,
-        beacon_engine: ConsensusEngineHandle<EthEngineTypes>,
+        el: Arc<dyn ExecutionLayer>,
         head_block_hash: B256,
     ) -> Self {
         Self {
             network,
             net_event_rx,
             connected_peers: HashSet::new(),
-            el: Arc::new(RethExecutionLayer::engine_only(beacon_engine)),
+            el,
             head_block_hash,
             local_view: 0,
             highest_seen_view: 0,
@@ -195,6 +196,7 @@ impl ObserverOrchestrator {
             sync_attempt_counter: 0,
             committed_blocks: VecDeque::new(),
             blob_store: None,
+            exec_output_cache: None,
             blocks_imported: 0,
             sync_start_time: Instant::now(),
         }
@@ -213,8 +215,13 @@ impl ObserverOrchestrator {
         self
     }
 
-    pub fn with_blob_store(mut self, blob_store: DiskFileBlobStore) -> Self {
+    pub fn with_blob_store(mut self, blob_store: Arc<dyn BlobStorePort>) -> Self {
         self.blob_store = Some(blob_store);
+        self
+    }
+
+    pub fn with_exec_output_cache(mut self, cache: Arc<dyn ExecutionOutputCache>) -> Self {
+        self.exec_output_cache = Some(cache);
         self
     }
 
@@ -330,7 +337,7 @@ impl ObserverOrchestrator {
             self.highest_sync_target_view = view;
         }
 
-        let payload_json = match super::decompress_payload(&broadcast.payload_json) {
+        let payload_json = match crate::orchestrator::decompress_payload(&broadcast.payload_json) {
             Ok(d) => d,
             Err(e) => {
                 warn!(target: "n42::observer", %hash, error = %e, "failed to decompress payload");
@@ -347,13 +354,10 @@ impl ObserverOrchestrator {
 
         // Compact Block: load execution output to skip EVM re-execution.
         if let Some(ref exec_compressed) = broadcast.execution_output
-            && super::execution_bridge::compact_block_enabled()
+            && crate::orchestrator::compact_block_enabled()
+            && let Some(ref cache) = self.exec_output_cache
         {
-            super::execution_bridge::inject_compact_block(
-                &hash,
-                exec_compressed,
-                "observer_import",
-            );
+            cache.inject(hash, exec_compressed, "observer_import");
         }
 
         match self.el.new_payload(execution_data).await {
@@ -436,18 +440,7 @@ impl ObserverOrchestrator {
         };
 
         for (tx_hash, sidecar_rlp) in broadcast.sidecars {
-            match <BlobTransactionSidecarVariant as alloy_rlp::Decodable>::decode(
-                &mut &sidecar_rlp[..],
-            ) {
-                Ok(sidecar) => {
-                    if let Err(e) = blob_store.insert(tx_hash, sidecar) {
-                        debug!(target: "n42::observer", %tx_hash, error = %e, "failed to insert blob sidecar");
-                    }
-                }
-                Err(e) => {
-                    warn!(target: "n42::observer", %tx_hash, error = %e, "failed to decode blob sidecar RLP");
-                }
-            }
+            blob_store.insert_rlp(tx_hash, &sidecar_rlp);
         }
     }
 

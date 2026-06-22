@@ -969,14 +969,26 @@ fn main() {
 
                     connect_trusted_peers(&net_handle);
 
+                    // Register node-side hooks the consensus-service driver calls
+                    // back into (ingest virtual-block-credit arming).
+                    n42_node::register_consensus_service_hooks();
+                    let observer_el: std::sync::Arc<dyn n42_node::el::ExecutionLayer> =
+                        std::sync::Arc::new(n42_node::el::RethExecutionLayer::engine_only(
+                            beacon_engine_handle,
+                        ));
                     let mut observer = ObserverOrchestrator::new(
                         net_handle,
                         net_event_rx,
-                        beacon_engine_handle,
+                        observer_el,
                         head_block_hash,
                     )
                     .with_validator_set(initial_validator_set.clone())
-                    .with_blob_store(full_node.pool.blob_store().clone());
+                    .with_blob_store(std::sync::Arc::new(n42_node::blob_port::DiskBlobStorePort(
+                        full_node.pool.blob_store().clone(),
+                    )))
+                    .with_exec_output_cache(std::sync::Arc::new(
+                        n42_node::exec_cache::RethExecutionOutputCache,
+                    ));
                     if let Some(schedule) = epoch_schedule.clone() {
                         observer =
                             observer.with_epoch_schedule(consensus_config.epoch_length, schedule);
@@ -1390,14 +1402,23 @@ fn main() {
                     );
                 }
 
-                let mut orchestrator = ConsensusOrchestrator::with_engine_api(
+                // Register node-side hooks the consensus-service driver calls back
+                // into (ingest virtual-block-credit arming).
+                n42_node::register_consensus_service_hooks();
+
+                let el: std::sync::Arc<dyn n42_node::el::ExecutionLayer> = std::sync::Arc::new(
+                    n42_node::el::RethExecutionLayer::new(
+                        beacon_engine_handle,
+                        payload_builder_handle,
+                    ),
+                );
+                let mut orchestrator = ConsensusOrchestrator::with_execution_layer(
                     consensus_engine,
-                    net_handle,
+                    std::sync::Arc::new(net_handle),
                     consensus_event_rx,
                     net_event_rx,
                     output_rx,
-                    beacon_engine_handle,
-                    payload_builder_handle,
+                    el,
                     consensus_state,
                     head_block_hash,
                     fee_recipient,
@@ -1406,9 +1427,22 @@ fn main() {
                 .with_mobile_packet_tx(mobile_packet_tx)
                 .with_state_persistence(state_file)
                 .with_validator_set(startup_validator_set)
-                .with_blob_store(full_node.pool.blob_store().clone())
-                .with_mobile_reward_manager(reward_manager)
-                .with_staking_manager(staking_manager.clone())
+                .with_blob_store(std::sync::Arc::new(n42_node::blob_port::DiskBlobStorePort(
+                    full_node.pool.blob_store().clone(),
+                )))
+                .with_defer_state_root(n42_node::defer_state_root_enabled())
+                .with_exec_output_cache(std::sync::Arc::new(
+                    n42_node::exec_cache::RethExecutionOutputCache,
+                ))
+                .with_staking_sink(std::sync::Arc::new(
+                    n42_node::sinks::ManagerStakingSink(staking_manager.clone()),
+                ))
+                .with_withdrawal_source(std::sync::Arc::new(
+                    n42_node::sinks::NodeWithdrawalSource {
+                        reward: Some(reward_manager),
+                        staking: Some(staking_manager.clone()),
+                    },
+                ))
                 .with_committed_block_count(restored_block_count);
 
                 // Restore prev_randao derivation from snapshot's last committed QC.
@@ -1424,13 +1458,19 @@ fn main() {
                 orchestrator = orchestrator
                     .with_allow_deterministic_validator_peers(allow_deterministic_validator_peers);
                 if let Some(ref jmt) = jmt {
-                    orchestrator = orchestrator.with_jmt(Arc::clone(jmt));
+                    orchestrator = orchestrator.with_jmt(std::sync::Arc::new(
+                        n42_node::sinks::SbmtStateSink(Arc::clone(jmt)),
+                    ));
                 }
                 if let Some(ref twig) = twig {
-                    orchestrator = orchestrator.with_twig(Arc::clone(twig));
+                    orchestrator = orchestrator.with_twig(std::sync::Arc::new(
+                        n42_node::sinks::TwigStateSink(Arc::clone(twig)),
+                    ));
                 }
                 if let Some(scheduler) = zk_scheduler {
-                    orchestrator = orchestrator.with_zk_scheduler(scheduler);
+                    orchestrator = orchestrator.with_zk_scheduler(std::sync::Arc::new(
+                        n42_node::sinks::SchedulerZkSink(scheduler),
+                    ));
                 }
                 if let Some(rx) = admin_rx.lock().unwrap_or_else(|e| e.into_inner()).take() {
                     orchestrator = orchestrator.with_admin_rx(rx);

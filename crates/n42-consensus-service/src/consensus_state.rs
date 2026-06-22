@@ -174,9 +174,9 @@ pub enum AdminCommand {
 pub struct SharedConsensusState {
     /// Latest committed QC; `None` before any block is committed.
     pub(crate) latest_committed_qc: ArcSwap<Option<QuorumCertificate>>,
-    pub(crate) validator_set: Arc<ArcSwapOption<ValidatorSet>>,
-    pub(crate) attestation_state: Mutex<AttestationState>,
-    pub(crate) block_committed_tx: broadcast::Sender<VerificationTask>,
+    pub validator_set: Arc<ArcSwapOption<ValidatorSet>>,
+    pub attestation_state: Mutex<AttestationState>,
+    pub block_committed_tx: broadcast::Sender<VerificationTask>,
     attestation_history: Mutex<VecDeque<AttestationRecord>>,
     equivocation_log: Mutex<VecDeque<EquivocationEvidence>>,
     /// BLS pubkeys of verifiers that have completed a QUIC handshake with StarHub.
