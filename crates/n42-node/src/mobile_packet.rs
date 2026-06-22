@@ -18,6 +18,8 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
+use crate::mobile_bridge::DispatchedBlockRoot;
+
 /// Errors that can occur during mobile packet generation.
 #[derive(Debug, thiserror::Error)]
 pub enum MobilePacketError {
@@ -111,6 +113,7 @@ pub async fn mobile_packet_loop<P>(
     chain_spec: Arc<ChainSpec>,
     hub_handle: ShardedStarHubHandle,
     mut phone_connected_rx: mpsc::Receiver<u64>,
+    dispatched_block_tx: Option<mpsc::Sender<DispatchedBlockRoot>>,
 ) where
     P: BlockReader<Block = <EthPrimitives as NodePrimitives>::Block>
         + StateProviderFactory
@@ -144,6 +147,7 @@ pub async fn mobile_packet_loop<P>(
                         &hub_handle,
                         block_hash,
                         &mut previously_sent_codes,
+                        dispatched_block_tx.as_ref(),
                     )
                     .await
                     {
@@ -223,6 +227,7 @@ async fn generate_and_broadcast_v2<P>(
     hub_handle: &ShardedStarHubHandle,
     block_hash: B256,
     previously_sent_codes: &mut CodeCache,
+    dispatched_block_tx: Option<&mpsc::Sender<DispatchedBlockRoot>>,
 ) -> Result<usize, MobilePacketError>
 where
     P: BlockReader<Block = <EthPrimitives as NodePrimitives>::Block>
@@ -230,7 +235,7 @@ where
         + BlockHashReader
         + 'static,
 {
-    let (compressed, packet_size, all_codes) = {
+    let (compressed, packet_size, all_codes, block_number, receipts_root) = {
         let recovered_block = provider
             .recovered_block(
                 BlockHashOrNumber::Hash(block_hash),
@@ -286,6 +291,7 @@ where
 
         let header = recovered_block.header();
         let block_number = header.number();
+        let receipts_root = header.receipts_root();
         let mut header_buf = Vec::new();
         header.encode(&mut header_buf);
         let transactions = recovered_block.body().encoded_2718_transactions();
@@ -331,8 +337,54 @@ where
             "stream packet compressed"
         );
 
-        (bytes::Bytes::from(compressed), packet_size, all_codes)
+        (
+            bytes::Bytes::from(compressed),
+            packet_size,
+            all_codes,
+            block_number,
+            receipts_root,
+        )
     };
+
+    if let Some(tx) = dispatched_block_tx {
+        let notification = DispatchedBlockRoot {
+            block_hash,
+            block_number,
+            receipts_root,
+        };
+        match tx.try_send(notification) {
+            Ok(()) => {
+                debug!(
+                    block_number,
+                    %block_hash,
+                    %receipts_root,
+                    "registered mobile packet root before broadcast"
+                );
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Full(notification)) => {
+                warn!(
+                    block_number,
+                    %block_hash,
+                    "mobile packet root channel full, waiting before broadcast"
+                );
+                if let Err(error) = tx.send(notification).await {
+                    warn!(
+                        block_number,
+                        %block_hash,
+                        error = %error,
+                        "failed to register mobile packet root before broadcast"
+                    );
+                }
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                warn!(
+                    block_number,
+                    %block_hash,
+                    "mobile packet root channel closed before broadcast"
+                );
+            }
+        }
+    }
 
     hub_handle
         .broadcast_packet(compressed)

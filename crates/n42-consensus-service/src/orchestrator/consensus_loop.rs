@@ -406,7 +406,6 @@ impl ConsensusService {
 
         if let Some(ref state) = self.consensus_state {
             state.update_committed_qc(commit_qc.clone());
-            state.notify_block_committed(block_hash, self.committed_block_count);
         }
 
         self.prev_randao_cache =
@@ -457,6 +456,10 @@ impl ConsensusService {
         // updater can see the local block data even when reth already has the
         // block in its engine tree.
         self.drain_leader_payload_rx(&[block_hash]);
+
+        if let Some(ref state) = self.consensus_state {
+            state.notify_block_committed(block_hash, self.committed_block_count);
+        }
 
         // State-tree background update: extract BundleState from pending block
         // data once, then feed the enabled sidecar tree(s).
@@ -567,10 +570,14 @@ impl ConsensusService {
 
         // Scan committed block for staking/unstaking transactions.
         if let Some(ref staking_sink) = self.staking_sink
-            && let Some(data) = self.committed_blocks.back().map(|b| b.payload.as_slice())
+            && let Some(data) = self.pending_block_data.get(&block_hash)
             && !data.is_empty()
         {
-            match super::decompress_payload(data) {
+            match bincode::deserialize::<super::BlockDataBroadcast>(data)
+                .map_err(|e| e.to_string())
+                .and_then(|broadcast| {
+                    super::decompress_payload(&broadcast.payload_json).map_err(|e| e.to_string())
+                }) {
                 Ok(decompressed) => {
                     staking_sink.scan_committed_block(self.committed_block_count, &decompressed);
                 }

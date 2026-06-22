@@ -19,6 +19,17 @@ pub struct AttestationEvent {
     pub valid_count: u32,
 }
 
+/// Node-local notification from the mobile packet generator.
+///
+/// The expected receipts root comes from the imported block header used to build
+/// the packet sent to phones, not from consensus or block-data gossip.
+#[derive(Debug, Clone)]
+pub struct DispatchedBlockRoot {
+    pub block_hash: B256,
+    pub block_number: u64,
+    pub receipts_root: B256,
+}
+
 #[derive(Debug, Clone)]
 struct FinalizedAttestation {
     event: AttestationEvent,
@@ -49,6 +60,9 @@ pub struct MobileVerificationBridge {
     /// Subscription to committed-block notifications for registering blocks that
     /// are eligible to receive mobile receipts.
     verification_task_rx: Option<broadcast::Receiver<VerificationTask>>,
+    /// Node-local root notifications from the packet generator, populated from
+    /// imported block headers after mobile stream packets are built.
+    dispatched_block_rx: Option<mpsc::Receiver<DispatchedBlockRoot>>,
     /// Per-block invalid receipt counts for divergence detection (FIFO-bounded).
     invalid_receipt_counts: HashMap<B256, u32>,
     invalid_receipt_order: VecDeque<B256>,
@@ -85,6 +99,7 @@ impl MobileVerificationBridge {
             consensus_state: None,
             staking_manager: None,
             verification_task_rx: None,
+            dispatched_block_rx: None,
             invalid_receipt_counts: HashMap::new(),
             invalid_receipt_order: VecDeque::new(),
             block_first_receipt_at: HashMap::new(),
@@ -130,6 +145,12 @@ impl MobileVerificationBridge {
     pub fn with_consensus_state(mut self, state: Arc<SharedConsensusState>) -> Self {
         self.verification_task_rx = Some(state.block_committed_tx.subscribe());
         self.consensus_state = Some(state);
+        self
+    }
+
+    /// Attaches node-local block-root notifications from the packet generator.
+    pub fn with_dispatched_block_rx(mut self, rx: mpsc::Receiver<DispatchedBlockRoot>) -> Self {
+        self.dispatched_block_rx = Some(rx);
         self
     }
 
@@ -289,7 +310,11 @@ impl MobileVerificationBridge {
                 } => {
                     match task {
                         Ok(task) => {
-                            self.register_dispatched_block(task.block_hash, task.block_number, None);
+                            self.register_dispatched_block(
+                                task.block_hash,
+                                task.block_number,
+                                None,
+                            );
                             debug!(
                                 target: "n42::mobile",
                                 block_hash = %task.block_hash,
@@ -306,6 +331,32 @@ impl MobileVerificationBridge {
                         }
                         Err(broadcast::error::RecvError::Closed) => {
                             self.verification_task_rx = None;
+                        }
+                    }
+                }
+                dispatched = async {
+                    match self.dispatched_block_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    match dispatched {
+                        Some(dispatched) => {
+                            self.register_dispatched_block(
+                                dispatched.block_hash,
+                                dispatched.block_number,
+                                Some(dispatched.receipts_root),
+                            );
+                            debug!(
+                                target: "n42::mobile",
+                                block_hash = %dispatched.block_hash,
+                                block_number = dispatched.block_number,
+                                receipts_root = %dispatched.receipts_root,
+                                "registered mobile packet block root from imported header"
+                            );
+                        }
+                        None => {
+                            self.dispatched_block_rx = None;
                         }
                     }
                 }

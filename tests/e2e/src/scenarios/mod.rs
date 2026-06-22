@@ -2,6 +2,7 @@ pub mod scenario10_chaos;
 pub mod scenario11_quic_10k;
 pub mod scenario12_blockscout_rpc;
 pub mod scenario13_rewards;
+pub mod scenario14_reward_blob;
 pub mod scenario1_single_node;
 pub mod scenario2_rpc_load;
 pub mod scenario3_erc20;

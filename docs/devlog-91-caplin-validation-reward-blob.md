@@ -1,140 +1,160 @@
-# Devlog 91 - Caplin Reward and Blob Port Validation
+# Devlog 91 - Mobile Reward and Blob True E2E
 
 Date: 2026-06-22
 
-Branch under test: `feat/caplin-cl-stage3-6` at `4cf2b57` plus the two focused
-test-only regressions described below.
+Branch under test: `fix/mobile-reward-receipts-root` at `40c3eae` plus this follow-up.
 
-Reth baseline: `../reth` at `449ecfdcef n42: disable jit by default (Windows, no LLVM 22) + post-merge fixes`.
+Base: Caplin clean branch `c2ef42d`; this fix branch must not be folded back into
+`feat/caplin-cl-stage3-6`.
 
-Artifacts:
-
-- Main reward E2E log: `/tmp/n42-caplin-validation-artifacts/e2e-reward-main.log`
-- Candidate reward E2E log: `/tmp/n42-caplin-validation-artifacts/e2e-reward-candidate.log`
-- Main reward node logs: `/tmp/n42-caplin-validation-artifacts/reward-main-node-logs`
-- Candidate reward node logs: `/tmp/n42-caplin-validation-artifacts/reward-candidate-node-logs`
+Reth baseline: `../reth` at
+`449ecfdcef n42: disable jit by default (Windows, no LLVM 22) + post-merge fixes`.
 
 ## Verdict
 
-Updated Caplin validation verdict: **MERGE**.
+Fix branch verdict: **READY WITH CAPLIN**.
 
-The reward and blob gaps from devlog-90 are now covered by the strongest checks
-available in this tree without changing production behavior:
+The reward/blob coverage gap is closed without carrying `receipts_root` through
+consensus:
 
-- Reward scenario 13 is identical between main and candidate, but it is only an
-  observability E2E in the current harness and did not emit real reward
-  withdrawals in either branch.
-- The candidate now has a focused `NodeWithdrawalSource` regression that
-  exercises the moved reward + staking-return adapter path and verifies
-  withdrawal address resolution, amount, and index output.
-- There is no existing E2E 4844/blob transaction injector in `tests/e2e` or the
-  current stress harness. The candidate now has a focused `DiskBlobStorePort`
-  regression that exercises the moved RLP decode -> `DiskFileBlobStore` insert
-  -> `get_all_encoded` -> RLP decode path.
+- `WithdrawalSource` / mobile reward funds flow: PASS with a real stake and a
+  real EIP-4895 withdrawal.
+- `BlobStorePort` / EIP-4844 sidecar injection and propagation: PASS.
 
-No production code, consensus wire type, `crates/n42-consensus`, or `Cargo.lock`
-was changed for this follow-up.
+## Design Correction
 
-## Reward - Scenario 13 E2E
+The earlier `40c3eae` path incorrectly let consensus provide `receipts_root` to
+mobile verification. That short-circuited the phone's independent verification
+role.
 
-Commands:
+This follow-up restores the intended design:
 
-```text
-E2E_SCENARIO_FILTER=13 /tmp/n42-caplin-validation-artifacts/e2e-test.main \
-  --binary /tmp/n42-caplin-validation-artifacts/n42-node.main
+- `VerificationTask` is again only `(block_hash, block_number)`.
+- `SharedConsensusState::notify_block_committed` no longer accepts or broadcasts
+  `receipts_root`.
+- `consensus_loop` no longer extracts `receipts_root` from
+  `BlockDataBroadcast`, and the late root fallback was removed.
+- `MobileVerificationBridge` first registers the consensus task with
+  `expected_receipts_root = None`.
+- `mobile_packet_loop` reads the receipts root from the node-local imported
+  block header and sends a local `DispatchedBlockRoot` to the bridge.
+- `ReceiptAggregator::register_block` can fill a missing expected root later
+  without resetting already observed receipts.
 
-E2E_SCENARIO_FILTER=13 /tmp/n42-caplin-validation-artifacts/e2e-test.candidate \
-  --binary /tmp/n42-caplin-validation-artifacts/n42-node.candidate
-```
+The expected root therefore comes from the locally imported block, not from a
+consensus wire payload. Phones still submit their independently computed
+`computed_receipts_root` in the BLS receipt.
 
-Result:
+## Staking Fix
 
-| Check | main | candidate | Result |
-| --- | ---: | ---: | --- |
-| Scenario 13 suite | passed=1 failed=0 | passed=1 failed=0 | no regression |
-| Final height | 30 | 30 | identical |
-| Miner count | 3 | 3 | identical |
-| Miner block split | 10 / 10 / 10 | 10 / 10 / 10 | identical |
-| Reward total observed by scenario | 0 | 0 | identical |
-| Scenario warning | no reward detected | no reward detected | identical |
+Reward requires stake. A zero reward for an unstaked phone is correct behavior.
 
-Interpretation:
+The reward E2E now stakes first:
 
-- Scenario 13 confirms the candidate did not regress the existing reward
-  observability E2E.
-- Scenario 13 does not close the real `WithdrawalSource` funds-flow gap by
-  itself because neither branch produced reward withdrawals in this run.
+- The harness sends a real stake transaction to `0x0000000000000000000000000000000000000042`.
+- Stake value is `32 ETH` (`32000000000000000000` wei).
+- Stake input is the 48-byte BLS pubkey used by the QUIC mobile verifier.
+- `StakingManager` scans the committed block from `pending_block_data` after
+  `drain_leader_payload_rx`, instead of reading the already-cached
+  `committed_blocks.back()` entry that could be empty on the leader.
+- The scanner accepts Engine API payload shape via `payload.transactions`.
 
-## Reward - Focused Adapter Regression
+## Harness
 
-Added candidate-only test:
+Scenario 14 has two phases.
 
-```text
-cargo test -p n42-node withdrawal_source_combines_reward_resolution_and_staking_returns
-```
+Reward phase:
 
-Result: PASS.
+- Starts one real `n42-node`.
+- Sends a real stake transaction for the mobile verifier pubkey.
+- Connects a real QUIC mobile verifier to StarHub.
+- Receives stream verification packets.
+- Re-executes/verifies each packet in the harness and signs real BLS mobile
+  receipts.
+- Waits for an EIP-4895 withdrawal to the staker EVM address.
+- Asserts node logs include stake registration, mobile receipt handling,
+  withdrawal injection, and local imported-header root registration.
 
-Coverage:
+Blob phase:
 
-- Creates one active staker with a reward-address mapping and one unstaking
-  staker whose cooldown has expired.
-- Records ten mobile attestations so `MobileRewardManager` emits one reward
-  withdrawal at the epoch boundary.
-- Calls `NodeWithdrawalSource::withdrawals_for_block`.
-- Asserts two withdrawals:
-  - reward withdrawal resolves from reward address to the staker EVM address;
-  - reward amount is `100_000_000`;
-  - reward index is `block_number * max_withdrawals_per_payload`;
-  - staking return amount is `32_000_000_000`;
-  - staking return index is the persisted `next_withdrawal_index`.
+- Starts a three-node real testnet.
+- Builds and signs a real EIP-4844 blob transaction using Alloy's KZG sidecar
+  builder.
+- Submits the transaction to the leader RPC.
+- Waits for the transaction receipt and syncs all nodes.
+- Asserts all nodes agree on the blob block hash.
+- Asserts `blobGasUsed > 0`.
+- Asserts leader blob sidecar broadcast and follower sidecar processing logs are
+  present with no decode/insert errors.
 
-This directly covers the stage-3 port extraction that moved the old inline
-mobile reward + staking return logic behind `WithdrawalSource`.
-
-## Blob - E2E Availability
-
-Search result:
-
-- `tests/e2e` has no 4844/blob scenario.
-- `n42-stress` has no blob transaction injection mode in this branch.
-- The default E2E genesis currently sets `blobGasUsed` to `0x0`.
-
-Therefore no real two-node EIP-4844 transaction propagation E2E can be run from
-the existing harness without adding a new blob transaction generator. That is a
-test-harness gap, not an observed candidate regression.
-
-## Blob - Focused Adapter Regression
-
-Added candidate-only test:
+## Commands
 
 ```text
-cargo test -p n42-node disk_blob_store_port_roundtrips_rlp_sidecar
+cargo check --all-targets
+
+cargo clippy -- -D warnings
+
+cargo build --release -p n42-node-bin -p e2e-test
+
+E2E_SCENARIO_FILTER=14 target/release/e2e-test --binary target/release/n42-node
 ```
 
-Result: PASS.
+## Results
 
-Coverage:
+`cargo check --all-targets`: PASS.
 
-- Builds an RLP-encoded EIP-4844 `BlobTransactionSidecarVariant`.
-- Calls `DiskBlobStorePort::insert_rlp`, which decodes the RLP and inserts into
-  reth's `DiskFileBlobStore`.
-- Calls `DiskBlobStorePort::get_all_encoded`, which reads the sidecar back and
-  re-encodes it as RLP bytes.
-- Decodes the returned bytes and asserts exact sidecar equality and byte
-  equality with the original RLP payload.
+`cargo clippy -- -D warnings`: PASS.
 
-This directly covers the stage-6a-3 port extraction that moved blob sidecar RLP
-decode/encode out of the orchestrator and into the node-side `BlobStorePort`
-adapter. `BlobSidecarBroadcast` remains the same bincode shape:
-`(block_hash, view, Vec<(tx_hash, sidecar_rlp)>)`.
+`cargo build --release -p n42-node-bin -p e2e-test`: PASS.
 
-## Guardrail Check
+`scenario 14`: PASS.
 
-- Production behavior changes: none.
-- Consensus wire changes: none.
-- `crates/n42-consensus` changes: none.
-- `Cargo.lock` changes: none.
-- Existing full scenario `1/3/4` gate remains devlog-90's candidate PASS.
-- Reward/blob follow-up tests are narrow regressions for the two ports that
-  scenario `1/3/4` did not exercise.
+```text
+test suite complete passed=1 failed=0 total=1
+```
+
+Reward evidence:
+
+| Field | Value |
+| --- | --- |
+| Stake tx hash | `0xf310b052a7de24752f6e79d5b06cd40a7a1a3b2c872c1b1b9072d28210c71f90` |
+| Stake block | `3` |
+| Staker / withdrawal recipient | `0xb208ebDe1606a7d2E2132565dD2e5d618332B498` |
+| BLS-derived reward address | `0xC6446a5A8e10c0BB36e7b014A6E1f8F5107f67Cb` |
+| Stake amount | `32000000000000000000` wei |
+| Mobile receipts signed | `8` |
+| First withdrawal block observed by harness | `5` |
+| Withdrawal index | `40` |
+| Reward amount | `100000000` gwei |
+| Recipient balance after reward | `24414062499999968699963649140625000` wei |
+
+Node-side reward proof:
+
+- `new stake registered` at block `3`.
+- `registered mobile packet block root from imported header` for streamed
+  blocks, proving the expected root is local block-header data.
+- `verification receipt received from mobile verifier` for blocks `4..10`.
+- `injecting mobile rewards as withdrawals` emitted with `count=1`.
+
+Blob evidence:
+
+| Field | Value |
+| --- | --- |
+| Blob tx hash | `0x913b82ff49915db37fc4a1bbc705a8b17a6cabb19a5e04842f1bb6a162355532` |
+| Inclusion block | `6` |
+| `blobGasUsed` | `131072` |
+| Leader sidecar broadcasts | `1` |
+| Follower sidecar process logs | `2` |
+
+Node-side blob proof:
+
+- Leader emitted one blob sidecar broadcast.
+- Both followers emitted `processed blob sidecar broadcast` with `sidecars=1`.
+- The E2E log found no blob sidecar decode or insert errors.
+
+## Guardrails
+
+- No `Cargo.lock` drift is included.
+- `crates/n42-consensus` and consensus wire formats were not changed.
+- The fix branch keeps the Caplin branch clean and records only the reward/blob
+  validation fix.

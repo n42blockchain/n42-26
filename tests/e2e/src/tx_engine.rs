@@ -1,6 +1,8 @@
-use alloy_consensus::{SignableTransaction, TxEip1559};
+use alloy_consensus::{SidecarBuilder, SignableTransaction, SimpleCoder, TxEip1559};
 use alloy_eips::eip2718::Encodable2718;
+use alloy_network::{Ethereum, EthereumWallet, NetworkTransactionBuilder, TransactionBuilder4844};
 use alloy_primitives::{Address, B256, Bytes, TxKind, U256};
+use alloy_rpc_types_eth::{TransactionInput, TransactionRequest};
 use alloy_signer::SignerSync;
 use alloy_signer_local::PrivateKeySigner;
 use tracing::{debug, info};
@@ -156,6 +158,54 @@ impl TxEngine {
         signed.encode_2718(&mut encoded);
 
         Ok((*signed.hash(), encoded))
+    }
+
+    pub async fn build_blob_tx(
+        &mut self,
+        from_index: usize,
+        to: Address,
+        value: U256,
+        max_fee_per_gas: u128,
+        max_priority_fee_per_gas: u128,
+        max_fee_per_blob_gas: u128,
+    ) -> eyre::Result<(B256, Vec<u8>)> {
+        let wallet = &mut self.wallets[from_index];
+        let nonce = wallet.nonce;
+        wallet.nonce += 1;
+
+        let mut sidecar_builder = SidecarBuilder::<SimpleCoder>::new();
+        sidecar_builder.ingest(b"n42 e2e blob sidecar");
+        let sidecar = sidecar_builder.build()?;
+
+        let mut tx = TransactionRequest {
+            chain_id: Some(self.chain_id),
+            nonce: Some(nonce),
+            gas: Some(210_000),
+            max_fee_per_gas: Some(max_fee_per_gas),
+            max_priority_fee_per_gas: Some(max_priority_fee_per_gas),
+            max_fee_per_blob_gas: Some(max_fee_per_blob_gas),
+            to: Some(TxKind::Call(to)),
+            value: Some(value),
+            input: TransactionInput {
+                input: None,
+                data: None,
+            },
+            ..Default::default()
+        };
+        tx.set_blob_sidecar(alloy_eips::eip7594::BlobTransactionSidecarVariant::Eip4844(
+            sidecar,
+        ));
+
+        let signer = EthereumWallet::from(wallet.signer.clone());
+        let signed =
+            <TransactionRequest as NetworkTransactionBuilder<Ethereum>>::build(tx, &signer)
+                .await
+                .map_err(|e| eyre::eyre!("failed to sign blob tx: {e}"))?;
+        let tx_hash = *signed.hash();
+        let mut encoded = Vec::new();
+        signed.encode_2718(&mut encoded);
+
+        Ok((tx_hash, encoded))
     }
 
     /// Sends a batch of transfer transactions at a given rate.

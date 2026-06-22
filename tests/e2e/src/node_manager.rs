@@ -307,6 +307,10 @@ impl NodeProcess {
         &self.stdout_log_path
     }
 
+    pub fn stderr_log_path(&self) -> &std::path::Path {
+        &self.stderr_log_path
+    }
+
     /// Stops the node but returns the data directory for reuse in restart tests.
     pub fn stop_keep_data(mut self) -> eyre::Result<TempDir> {
         info!(

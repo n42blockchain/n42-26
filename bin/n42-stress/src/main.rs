@@ -390,7 +390,7 @@ fn run_batch_transfer_bench(
     encoded.extend_from_slice(&(senders as u32).to_le_bytes());
     let mut signed_batches: Vec<(B256, Signature, Address)> = Vec::with_capacity(senders);
 
-    for sender_idx in 0..senders {
+    for (sender_idx, account) in accounts.iter().take(senders).enumerate() {
         let start_nonce = sender_idx as u64 * transfers_per_sender as u64;
         let count = transfers_per_sender as u32;
         let records_start = encoded.len() + BATCH_TRANSFER_HEADER_BYTES;
@@ -402,12 +402,9 @@ fn run_batch_transfer_bench(
         let records = &encoded
             [records_start..records_start + transfers_per_sender * BATCH_TRANSFER_RECORD_BYTES];
         let prehash = batch_transfer_prehash(CHAIN_ID, 0, start_nonce, count, records);
-        let sig = accounts[sender_idx]
-            .signer
-            .sign_hash_sync(&prehash)
-            .expect("batch sign");
+        let sig = account.signer.sign_hash_sync(&prehash).expect("batch sign");
         encoded[header_pos + 12..header_pos + 77].copy_from_slice(&sig.as_bytes());
-        signed_batches.push((prehash, sig, accounts[sender_idx].address));
+        signed_batches.push((prehash, sig, account.address));
     }
     let build_ms = build_start.elapsed().as_millis() as u64;
 
@@ -445,7 +442,7 @@ fn run_batch_transfer_bench(
     let mut apply_times = Vec::with_capacity(iters);
     let mut verify_times = Vec::with_capacity(iters);
     let mut hash_times = Vec::with_capacity(iters);
-    let recipient_count = total_transfers.min(2_000_000).max(1);
+    let recipient_count = total_transfers.clamp(1, 2_000_000);
 
     for _ in 0..iters {
         let mut sender_balances = vec![u128::MAX / 4; senders];

@@ -1182,6 +1182,7 @@ fn main() {
                 let (attest_tx, mut attest_rx) = mpsc::channel(256);
                 let (phone_connected_tx, phone_connected_rx) = mpsc::channel(128);
                 let (reward_attest_tx, mut reward_attest_rx) = mpsc::channel(1024);
+                let (dispatched_block_tx, dispatched_block_rx) = mpsc::channel(128);
 
                 let attestation_store_path = data_dir.join("attestation_store.json");
                 let attestation_store = Arc::new(Mutex::new(
@@ -1195,7 +1196,8 @@ fn main() {
                     .with_consensus_state(consensus_state.clone())
                     .with_reward_tx(reward_attest_tx)
                     .with_staking_manager(staking_manager.clone())
-                    .with_attestation_store(attestation_store.clone());
+                    .with_attestation_store(attestation_store.clone())
+                    .with_dispatched_block_rx(dispatched_block_rx);
 
                 task_executor.spawn_critical_task("n42-mobile-bridge", Box::pin(mobile_bridge.run()));
 
@@ -1243,6 +1245,7 @@ fn main() {
                         full_node.provider.chain_spec(),
                         star_hub_handle.clone(),
                         phone_connected_rx,
+                        Some(dispatched_block_tx),
                     )),
                 );
                 info!(target: "n42::cli", "Mobile packet generation loop started");
