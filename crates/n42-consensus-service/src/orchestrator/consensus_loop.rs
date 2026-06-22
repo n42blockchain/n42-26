@@ -458,12 +458,7 @@ impl ConsensusService {
         self.drain_leader_payload_rx(&[block_hash]);
 
         if let Some(ref state) = self.consensus_state {
-            let receipts_root = self
-                .pending_block_data
-                .get(&block_hash)
-                .and_then(|data| Self::extract_mobile_task_fields(block_hash, data))
-                .map(|(_, receipts_root)| receipts_root);
-            state.notify_block_committed(block_hash, self.committed_block_count, receipts_root);
+            state.notify_block_committed(block_hash, self.committed_block_count);
         }
 
         // State-tree background update: extract BundleState from pending block
@@ -575,10 +570,14 @@ impl ConsensusService {
 
         // Scan committed block for staking/unstaking transactions.
         if let Some(ref staking_sink) = self.staking_sink
-            && let Some(data) = self.committed_blocks.back().map(|b| b.payload.as_slice())
+            && let Some(data) = self.pending_block_data.get(&block_hash)
             && !data.is_empty()
         {
-            match super::decompress_payload(data) {
+            match bincode::deserialize::<super::BlockDataBroadcast>(data)
+                .map_err(|e| e.to_string())
+                .and_then(|broadcast| {
+                    super::decompress_payload(&broadcast.payload_json).map_err(|e| e.to_string())
+                }) {
                 Ok(decompressed) => {
                     staking_sink.scan_committed_block(self.committed_block_count, &decompressed);
                 }
@@ -1096,26 +1095,6 @@ impl ConsensusService {
             debug!(target: "n42::cl::consensus_loop", %hash, "populated committed block payload from leader build task");
         }
 
-        if let Some(ref state) = self.consensus_state
-            && self
-                .committed_blocks
-                .iter()
-                .rev()
-                .any(|block| block.block_hash == hash)
-            && let Some(ref broadcast) = decoded_broadcast
-            && let Some((block_number, receipts_root)) =
-                Self::extract_mobile_task_fields_from_payload(hash, &broadcast.payload_json)
-        {
-            state.notify_block_committed(hash, block_number, Some(receipts_root));
-            debug!(
-                target: "n42::cl::consensus_loop",
-                %hash,
-                block_number,
-                %receipts_root,
-                "sent late mobile verification task with receipts root"
-            );
-        }
-
         // If a deferred finalization is pending for this hash, complete it now.
         // This handles the race where commit arrives before leader_payload_rx.
         let should_finalize = self
@@ -1149,44 +1128,6 @@ impl ConsensusService {
                 None
             }
         }
-    }
-
-    fn extract_mobile_task_fields(block_hash: B256, data: &[u8]) -> Option<(u64, B256)> {
-        let broadcast = Self::decode_block_data_broadcast(block_hash, data, "mobile_task_fields")?;
-        Self::extract_mobile_task_fields_from_payload(block_hash, &broadcast.payload_json)
-    }
-
-    fn extract_mobile_task_fields_from_payload(
-        block_hash: B256,
-        payload: &[u8],
-    ) -> Option<(u64, B256)> {
-        let payload_json = match super::decompress_payload(payload) {
-            Ok(payload_json) => payload_json,
-            Err(error) => {
-                warn!(
-                    target: "n42::cl::consensus_loop",
-                    %block_hash,
-                    error = %error,
-                    "failed to decompress payload for mobile task fields"
-                );
-                return None;
-            }
-        };
-        let execution_data: alloy_rpc_types_engine::ExecutionData =
-            match serde_json::from_slice(&payload_json) {
-                Ok(execution_data) => execution_data,
-                Err(error) => {
-                    warn!(
-                        target: "n42::cl::consensus_loop",
-                        %block_hash,
-                        error = %error,
-                        "failed to decode payload for mobile task fields"
-                    );
-                    return None;
-                }
-            };
-        let payload = execution_data.payload.as_v1();
-        Some((payload.block_number, payload.receipts_root))
     }
 
     /// Try to extract a `StateDiff` from serialized `BlockDataBroadcast` for a state-tree update.

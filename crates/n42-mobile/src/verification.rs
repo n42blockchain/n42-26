@@ -127,7 +127,10 @@ impl ReceiptAggregator {
         block_number: u64,
         expected_receipts_root: Option<B256>,
     ) {
-        if self.blocks.contains_key(&block_hash) {
+        if let Some(status) = self.blocks.get_mut(&block_hash) {
+            if status.expected_receipts_root.is_none() && expected_receipts_root.is_some() {
+                status.expected_receipts_root = expected_receipts_root;
+            }
             return;
         }
         if self.blocks.len() >= self.max_tracked_blocks
@@ -395,6 +398,25 @@ mod tests {
         assert_eq!(
             status.valid_count, 2,
             "register_block must not overwrite existing receipt counts"
+        );
+    }
+
+    #[test]
+    fn test_register_block_can_fill_missing_expected_root() {
+        let mut agg = ReceiptAggregator::new(2, 100);
+        let bh = hash(21);
+        agg.register_block(bh, 2001, None);
+        assert_eq!(
+            agg.get_status(&bh).unwrap().expected_receipts_root,
+            None,
+            "initial consensus notification does not carry receipts_root"
+        );
+
+        agg.register_block(bh, 2001, Some(EXPECTED_RR));
+        assert_eq!(
+            agg.get_status(&bh).unwrap().expected_receipts_root,
+            Some(EXPECTED_RR),
+            "packet generator should be able to fill the imported-header root"
         );
     }
 

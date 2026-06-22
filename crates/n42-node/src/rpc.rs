@@ -1222,7 +1222,7 @@ mod tests {
         let vs = ValidatorSet::new(&[], 0);
         let state = Arc::new(SharedConsensusState::new(vs));
         let block_hash = B256::repeat_byte(0xDD);
-        state.notify_block_committed(block_hash, 10, None);
+        state.notify_block_committed(block_hash, 10);
 
         let sk = test_bls_key(0x23);
         // Authorize the verifier to simulate a completed QUIC handshake.
@@ -1251,7 +1251,7 @@ mod tests {
         let vs = ValidatorSet::new(&[], 0);
         let state = Arc::new(SharedConsensusState::new(vs));
         let block_hash = B256::repeat_byte(0xDE);
-        state.notify_block_committed(block_hash, 11, None);
+        state.notify_block_committed(block_hash, 11);
         // Deliberately NOT calling state.authorize_verifier(...).
 
         let rpc = N42RpcServer::new(state);

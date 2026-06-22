@@ -210,23 +210,65 @@ impl StakingManager {
             }
         };
 
-        let transactions = match parsed.get("transactions").and_then(|t| t.as_array()) {
+        let transactions = match Self::payload_transactions(&parsed) {
             Some(txs) => txs,
-            None => return,
+            None => {
+                debug!(
+                    target: "n42::staking",
+                    block = block_number,
+                    "staking scan skipped: payload has no transaction array"
+                );
+                return;
+            }
         };
+
+        debug!(
+            target: "n42::staking",
+            block = block_number,
+            tx_count = transactions.len(),
+            "staking scan inspecting committed block"
+        );
 
         for tx_hex in transactions {
             let tx_str = match tx_hex.as_str() {
                 Some(s) => s.strip_prefix("0x").unwrap_or(s),
-                None => continue,
+                None => {
+                    debug!(
+                        target: "n42::staking",
+                        block = block_number,
+                        "staking scan skipped non-raw transaction entry"
+                    );
+                    continue;
+                }
             };
             let tx_bytes = match hex::decode(tx_str) {
                 Ok(b) => b,
-                Err(_) => continue,
+                Err(e) => {
+                    debug!(
+                        target: "n42::staking",
+                        block = block_number,
+                        error = %e,
+                        "staking scan skipped invalid transaction hex"
+                    );
+                    continue;
+                }
             };
 
             self.process_transaction(block_number, &tx_bytes);
         }
+    }
+
+    fn payload_transactions(parsed: &serde_json::Value) -> Option<&[serde_json::Value]> {
+        [
+            parsed.get("transactions"),
+            parsed.get("payload").and_then(|p| p.get("transactions")),
+            parsed
+                .get("executionPayload")
+                .and_then(|p| p.get("transactions")),
+        ]
+        .into_iter()
+        .flatten()
+        .find_map(|value| value.as_array().map(Vec::as_slice))
     }
 
     fn process_transaction(&mut self, block_number: u64, tx_bytes: &[u8]) {
@@ -1008,6 +1050,19 @@ mod tests {
 
         mgr.scan_committed_block(100, empty_payload);
         assert_eq!(mgr.last_scanned_block(), 100);
+    }
+
+    #[test]
+    fn test_payload_transactions_supports_engine_payload_shape() {
+        let parsed = serde_json::json!({
+            "payload": {
+                "transactions": ["0x1234"]
+            }
+        });
+
+        let txs = StakingManager::payload_transactions(&parsed).unwrap();
+        assert_eq!(txs.len(), 1);
+        assert_eq!(txs[0].as_str(), Some("0x1234"));
     }
 
     // ── Registration tests ──

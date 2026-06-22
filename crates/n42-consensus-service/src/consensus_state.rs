@@ -17,12 +17,6 @@ pub struct VerificationTask {
     pub block_hash: B256,
     /// Monotonic committed block number used by mobile verification and rewards.
     pub block_number: u64,
-    /// Expected receipts root for BLS aggregate mobile attestations.
-    ///
-    /// Older producers may omit this, in which case mobile receipts remain
-    /// counted for threshold status but cannot produce reward participants.
-    #[serde(default)]
-    pub receipts_root: Option<B256>,
 }
 
 /// Per-block mobile attestation tracking.
@@ -450,12 +444,7 @@ impl SharedConsensusState {
     }
 
     /// Registers the block for attestation tracking and notifies RPC subscribers.
-    pub fn notify_block_committed(
-        &self,
-        block_hash: B256,
-        block_number: u64,
-        receipts_root: Option<B256>,
-    ) {
+    pub fn notify_block_committed(&self, block_hash: B256, block_number: u64) {
         let mut att_state = self.attestation_state.lock().unwrap_or_else(|e| {
             tracing::error!("attestation_state mutex poisoned: {e}");
             e.into_inner()
@@ -465,7 +454,6 @@ impl SharedConsensusState {
         let task = VerificationTask {
             block_hash,
             block_number,
-            receipts_root,
         };
         if self.block_committed_tx.receiver_count() > 0 {
             match self.block_committed_tx.send(task) {
@@ -473,7 +461,6 @@ impl SharedConsensusState {
                     info!(
                         %block_hash,
                         block_number,
-                        has_receipts_root = receipts_root.is_some(),
                         receivers = n,
                         "verification task broadcast to mobile subscribers"
                     );
@@ -580,13 +567,11 @@ mod tests {
         let mut rx = state.block_committed_tx.subscribe();
 
         let hash = B256::repeat_byte(0xDD);
-        let receipts_root = B256::repeat_byte(0xEE);
-        state.notify_block_committed(hash, 42, Some(receipts_root));
+        state.notify_block_committed(hash, 42);
 
         let task = rx.try_recv().unwrap();
         assert_eq!(task.block_hash, hash);
         assert_eq!(task.block_number, 42);
-        assert_eq!(task.receipts_root, Some(receipts_root));
 
         let att = state.attestation_state.lock().unwrap();
         assert_eq!(att.get_attestation_count(&hash), Some(0));

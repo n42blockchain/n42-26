@@ -31,7 +31,11 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
     let reward = run_reward_in_block(&binary_path).await?;
     info!(
         block = reward.block_number,
-        recipient = %reward.recipient,
+        staker = %reward.staker_address,
+        reward_address = %reward.reward_address,
+        stake_tx = %reward.stake_tx_hash,
+        stake_block = reward.stake_block_number,
+        withdrawal_index = reward.withdrawal_index,
         amount_gwei = reward.amount_gwei,
         balance = %reward.balance,
         receipts_sent = reward.receipts_sent,
@@ -54,7 +58,11 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
 
 struct RewardEvidence {
     block_number: u64,
-    recipient: Address,
+    staker_address: Address,
+    reward_address: Address,
+    stake_tx_hash: B256,
+    stake_block_number: u64,
+    withdrawal_index: u64,
     amount_gwei: u64,
     balance: U256,
     receipts_sent: u32,
@@ -93,15 +101,13 @@ async fn run_reward_in_block(binary_path: &Path) -> eyre::Result<RewardEvidence>
         vec![
             (
                 "RUST_LOG",
-                "info,n42::mobile=debug,n42::reward=debug,n42::cl::exec_bridge=debug",
+                "info,n42::mobile=debug,n42::reward=debug,n42::staking=debug,n42::cl::exec_bridge=debug",
             ),
-            ("N42_OPEN_VERIFICATION", "1"),
             ("N42_MIN_ATTESTATION_THRESHOLD", "1"),
             ("N42_REWARD_EPOCH_BLOCKS", "1"),
             ("N42_DAILY_BASE_REWARD_GWEI", "100000000"),
             ("N42_REWARD_CURVE_K", "4.0"),
             ("N42_MAX_REWARDS_PER_BLOCK", "8"),
-            ("N42_UNSTAKED_REWARD_RATIO", "1.0"),
         ],
     )
     .await?;
@@ -114,9 +120,45 @@ async fn run_reward_in_block(binary_path: &Path) -> eyre::Result<RewardEvidence>
     let pubkey_bytes = mobile_pubkey.to_bytes();
     let reward_address = n42_mobile::bls_pubkey_to_address(&pubkey_bytes);
 
+    let mut tx_engine = TxEngine::new(&accounts, TEST_CHAIN_ID);
+    tx_engine.sync_nonces(&rpc).await?;
+    let staker_address = tx_engine.address(0);
+    let gas_price = rpc.gas_price().await.unwrap_or(20_000_000_000);
+    let max_fee = gas_price.saturating_mul(4).max(20_000_000_000);
+    let priority_fee = (gas_price / 10).max(1_000_000_000);
+    let (stake_tx_hash, stake_raw_tx) = tx_engine.build_contract_call(
+        0,
+        staking_address(),
+        pubkey_bytes.to_vec(),
+        min_stake_wei(),
+        max_fee,
+        priority_fee,
+        120_000,
+    )?;
+    let submitted_stake = rpc.send_raw_transaction(&stake_raw_tx).await?;
+    if submitted_stake != stake_tx_hash {
+        return Err(eyre::eyre!(
+            "stake tx hash mismatch: built={stake_tx_hash:?} submitted={submitted_stake:?}"
+        ));
+    }
+    let stake_receipt = rpc
+        .wait_for_receipt(stake_tx_hash, Duration::from_secs(45))
+        .await?;
+    if stake_receipt.status != 1 {
+        return Err(eyre::eyre!(
+            "stake tx failed: hash={stake_tx_hash:?} block={} status={}",
+            stake_receipt.block_number,
+            stake_receipt.status
+        ));
+    }
+    wait_for_node_log_contains(&node, "new stake registered", Duration::from_secs(20)).await?;
+
     info!(
         starhub_port = node.starhub_port,
+        staker_address = %staker_address,
         reward_address = %reward_address,
+        stake_tx_hash = %stake_tx_hash,
+        stake_block_number = stake_receipt.block_number,
         pubkey = hex::encode(pubkey_bytes),
         "scenario14/reward: connecting real QUIC verifier"
     );
@@ -126,9 +168,16 @@ async fn run_reward_in_block(binary_path: &Path) -> eyre::Result<RewardEvidence>
         sign_mobile_receipts(&quic_conn, &mobile_key, 8, Duration::from_secs(75)).await?;
     quic_conn.close(0u32.into(), b"scenario14 reward complete");
 
-    let evidence =
-        wait_for_reward_withdrawal(&rpc, reward_address, receipts_sent, Duration::from_secs(45))
-            .await?;
+    let evidence = wait_for_reward_withdrawal(
+        &rpc,
+        staker_address,
+        reward_address,
+        stake_tx_hash,
+        stake_receipt.block_number,
+        receipts_sent,
+        Duration::from_secs(45),
+    )
+    .await?;
 
     let log = node_logs(&node);
     if !log.contains("verification receipt received from mobile verifier") {
@@ -139,6 +188,11 @@ async fn run_reward_in_block(binary_path: &Path) -> eyre::Result<RewardEvidence>
     if !log.contains("injecting mobile rewards as withdrawals") {
         return Err(eyre::eyre!(
             "reward proof missing WithdrawalSource injection log"
+        ));
+    }
+    if !log.contains("registered mobile packet block root from imported header") {
+        return Err(eyre::eyre!(
+            "reward proof missing imported-header receipts_root registration log"
         ));
     }
 
@@ -443,6 +497,9 @@ fn signed_receipt(
 async fn wait_for_reward_withdrawal(
     rpc: &RpcClient,
     expected_address: Address,
+    reward_address: Address,
+    stake_tx_hash: B256,
+    stake_block_number: u64,
     receipts_sent: u32,
     timeout: Duration,
 ) -> eyre::Result<RewardEvidence> {
@@ -465,6 +522,10 @@ async fn wait_for_reward_withdrawal(
                         .get("amount")
                         .and_then(parse_hex_value)
                         .unwrap_or_default();
+                    let withdrawal_index = withdrawal
+                        .get("index")
+                        .and_then(parse_hex_value)
+                        .unwrap_or_default();
                     if amount_gwei == 0 {
                         return Err(eyre::eyre!(
                             "reward withdrawal for {expected_address:?} had zero amount"
@@ -478,7 +539,11 @@ async fn wait_for_reward_withdrawal(
                     }
                     return Ok(RewardEvidence {
                         block_number: next_scan,
-                        recipient: expected_address,
+                        staker_address: expected_address,
+                        reward_address,
+                        stake_tx_hash,
+                        stake_block_number,
+                        withdrawal_index,
                         amount_gwei,
                         balance,
                         receipts_sent,
@@ -497,6 +562,14 @@ async fn wait_for_reward_withdrawal(
     }
 }
 
+fn staking_address() -> Address {
+    Address::with_last_byte(0x42)
+}
+
+fn min_stake_wei() -> U256 {
+    U256::from(32u64) * U256::from(1_000_000_000_000_000_000u128)
+}
+
 async fn wait_for_height(rpc: &RpcClient, target: u64, timeout: Duration) -> eyre::Result<()> {
     let start = tokio::time::Instant::now();
     loop {
@@ -509,6 +582,25 @@ async fn wait_for_height(rpc: &RpcClient, target: u64, timeout: Duration) -> eyr
             return Err(eyre::eyre!("timeout waiting for block height {target}"));
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+async fn wait_for_node_log_contains(
+    node: &NodeProcess,
+    needle: &str,
+    timeout: Duration,
+) -> eyre::Result<()> {
+    let start = tokio::time::Instant::now();
+    loop {
+        if node_logs(node).contains(needle) {
+            return Ok(());
+        }
+        if start.elapsed() > timeout {
+            return Err(eyre::eyre!(
+                "timeout waiting for node log containing {needle:?}"
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
     }
 }
 
