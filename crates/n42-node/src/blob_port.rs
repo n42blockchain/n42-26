@@ -39,3 +39,29 @@ impl BlobStorePort for DiskBlobStorePort {
             .collect())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_eips::{eip4844::BlobTransactionSidecar, eip7594::BlobTransactionSidecarVariant};
+
+    #[test]
+    fn disk_blob_store_port_roundtrips_rlp_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DiskFileBlobStore::open(dir.path(), Default::default()).unwrap();
+        let port = DiskBlobStorePort(store);
+        let tx_hash = B256::from([0x42u8; 32]);
+        let sidecar = BlobTransactionSidecarVariant::Eip4844(BlobTransactionSidecar::default());
+        let mut encoded = Vec::new();
+        sidecar.encode(&mut encoded);
+
+        port.insert_rlp(tx_hash, &encoded);
+
+        let retrieved = port.get_all_encoded(vec![tx_hash]).unwrap();
+        assert_eq!(retrieved.len(), 1);
+        assert_eq!(retrieved[0].0, tx_hash);
+        let decoded = BlobTransactionSidecarVariant::decode(&mut &retrieved[0].1[..]).unwrap();
+        assert_eq!(decoded, sidecar);
+        assert_eq!(retrieved[0].1, encoded);
+    }
+}

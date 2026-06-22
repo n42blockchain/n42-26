@@ -165,4 +165,72 @@ mod tests {
         };
         assert!(src.withdrawals_for_block(100).is_empty());
     }
+
+    #[test]
+    fn withdrawal_source_combines_reward_resolution_and_staking_returns() {
+        let staked_bls = [0x11u8; 48];
+        let unstaking_bls = [0x22u8; 48];
+        let staked_addr = alloy_primitives::Address::with_last_byte(0x11);
+        let unstaking_addr = alloy_primitives::Address::with_last_byte(0x22);
+        let stake_wei = "32000000000000000000";
+        let staking_json = format!(
+            r#"{{
+              "stakes": [
+                {{
+                  "staker": "{staked_addr}",
+                  "bls_pubkey": "{}",
+                  "amount": "{stake_wei}",
+                  "staked_at_block": 1,
+                  "status": "Active"
+                }},
+                {{
+                  "staker": "{unstaking_addr}",
+                  "bls_pubkey": "{}",
+                  "amount": "{stake_wei}",
+                  "staked_at_block": 1,
+                  "status": {{ "Unstaking": {{ "initiated_block": 1 }} }}
+                }}
+              ],
+              "registrations": [],
+              "pending_returns": [],
+              "last_scanned_block": 1,
+              "next_withdrawal_index": 1000000
+            }}"#,
+            hex::encode(staked_bls),
+            hex::encode(unstaking_bls)
+        );
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), staking_json).unwrap();
+        let staking = Arc::new(Mutex::new(StakingManager::load_or_new(tmp.path())));
+
+        let reward = Arc::new(Mutex::new(MobileRewardManager::new(
+            10,
+            100_000_000,
+            4.0,
+            32,
+            0.1,
+        )));
+        for _ in 0..10 {
+            reward.lock().unwrap().record_attestation(&staked_bls);
+        }
+
+        let src = NodeWithdrawalSource {
+            reward: Some(reward),
+            staking: Some(staking),
+        };
+
+        let withdrawals = src.withdrawals_for_block(1 + crate::staking::UNSTAKE_COOLDOWN_BLOCKS);
+
+        assert_eq!(withdrawals.len(), 2);
+        assert_eq!(withdrawals[0].address, staked_addr);
+        assert_eq!(withdrawals[0].amount, 100_000_000);
+        assert_eq!(
+            withdrawals[0].index,
+            (1 + crate::staking::UNSTAKE_COOLDOWN_BLOCKS) * 32
+        );
+        assert_eq!(withdrawals[1].address, unstaking_addr);
+        assert_eq!(withdrawals[1].amount, 32_000_000_000);
+        assert_eq!(withdrawals[1].index, 1_000_000);
+    }
 }
