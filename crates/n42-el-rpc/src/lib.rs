@@ -328,6 +328,7 @@ mod tests {
             withdrawals: Some(vec![]),
             parent_beacon_block_root: Some(B256::repeat_byte(0xEE)),
             slot_number: None,
+            target_gas_limit: None,
         };
         let params = fcu_v3_params(&state, Some(&attrs)).expect("params");
         assert!(params[1].is_object(), "attrs ⇒ object second param");

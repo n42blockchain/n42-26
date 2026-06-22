@@ -25,7 +25,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: n42blockchain/reth
-          ref: chore/merge-upstream-fc2cc1e
+          ref: chore/merge-upstream-paradigmxyz-latest
           path: reth
 
       - uses: dtolnay/rust-toolchain@stable
