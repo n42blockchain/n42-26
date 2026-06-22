@@ -289,11 +289,16 @@ impl MobileVerificationBridge {
                 } => {
                     match task {
                         Ok(task) => {
-                            self.register_dispatched_block(task.block_hash, task.block_number, None);
+                            self.register_dispatched_block(
+                                task.block_hash,
+                                task.block_number,
+                                task.receipts_root,
+                            );
                             debug!(
                                 target: "n42::mobile",
                                 block_hash = %task.block_hash,
                                 block_number = task.block_number,
+                                has_receipts_root = task.receipts_root.is_some(),
                                 "registered dispatched block for mobile receipt tracking"
                             );
                         }
@@ -1362,7 +1367,7 @@ mod tests {
         let mut bridge =
             MobileVerificationBridge::new(hub_rx, 1, 100).with_consensus_state(state.clone());
 
-        state.notify_block_committed(B256::with_last_byte(0xC1), 77);
+        state.notify_block_committed(B256::with_last_byte(0xC1), 77, None);
 
         let run_once = tokio::time::timeout(std::time::Duration::from_millis(50), async {
             tokio::select! {
