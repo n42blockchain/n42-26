@@ -98,6 +98,9 @@ impl ConsensusService {
             // None is invalid for Cancun — reth rejects attributes without it.
             parent_beacon_block_root: Some(B256::ZERO),
             slot_number: None,
+            // alloy 2.1: optional EL gas-limit hint. None = use the node's
+            // configured gas limit (prior behavior before the field existed).
+            target_gas_limit: None,
         }
     }
 
