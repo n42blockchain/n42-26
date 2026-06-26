@@ -2,7 +2,9 @@
 //!
 //! Records state reads (`basic`, `storage`, `block_hash`) into an ordered log.
 //! Replaying these in the same order on mobile via `StreamReplayDB` reconstructs
-//! the exact same EVM execution without needing address/slot keys.
+//! the exact same EVM execution from a **keyless state value stream**.
+//! Only the operation sequence is transmitted; addresses and slot keys are implicit
+//! by deterministic call position.
 //!
 //! Works because: same block + txs → deterministic `Database::basic()`,
 //! `Database::storage()`, `Database::block_hash()` call order.

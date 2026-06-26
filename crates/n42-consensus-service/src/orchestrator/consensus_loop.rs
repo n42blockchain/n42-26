@@ -423,7 +423,9 @@ impl ConsensusService {
                 aggregate_signature: commit_qc.aggregate_signature.to_bytes(),
                 signer_count: u16::try_from(commit_qc.signers.len()).unwrap_or(u16::MAX),
                 packed_signers: commit_qc.signers.as_raw_slice().to_vec(),
-                mobile: None, // TODO: wire AttestationStore for mobile evidence
+                // Filled later by the node-side mobile evidence write-back task;
+                // committee finality never waits for phone attestations.
+                mobile: None,
             };
             let encoded = evidence.encode();
             let root_bytes = *blake3::hash(&encoded).as_bytes();

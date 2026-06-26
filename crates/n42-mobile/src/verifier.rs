@@ -197,7 +197,7 @@ impl DBErrorMarker for StreamDbError {}
 
 /// Sequential replay database for mobile verification — zero-allocation cursor on raw bytes.
 ///
-/// Parses read log entries directly from pre-encoded bytes on each `Database` call,
+/// Parses keyless read-log entries directly from pre-encoded bytes on each `Database` call,
 /// advancing a byte cursor. No intermediate `Vec<ReadLogEntry>` is ever allocated.
 ///
 /// This is safe because same block + same txs → same revm `Database` call sequence

@@ -5,6 +5,7 @@ pub mod el;
 pub mod exec_cache;
 pub mod ingest;
 pub mod mobile_bridge;
+pub mod mobile_evidence;
 pub mod mobile_packet;
 pub mod mobile_reward;
 pub use n42_consensus_service::net_port;

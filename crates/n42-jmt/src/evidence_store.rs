@@ -342,6 +342,32 @@ mod tests {
     }
 
     #[test]
+    fn mobile_update_roundtrips_and_changes_root() {
+        let mut ev = sample_evidence(7, false);
+        let no_mobile_root = ev.evidence_root();
+
+        ev.mobile = Some(MobileEvidence {
+            receipts_root: [0x12; 32],
+            aggregate_signature: [0x34; 96],
+            participant_count: 21,
+            packed_participants: vec![0xFF, 0xFF, 0x1F],
+            created_at_ms: 1_700_000_000_000,
+        });
+
+        let encoded = ev.encode();
+        let decoded = ConsensusEvidence::decode(&encoded).unwrap();
+        assert_eq!(decoded.encode(), encoded);
+        assert_ne!(decoded.evidence_root(), no_mobile_root);
+
+        let mobile = decoded.mobile.unwrap();
+        assert_eq!(mobile.receipts_root, [0x12; 32]);
+        assert_eq!(mobile.aggregate_signature, [0x34; 96]);
+        assert_eq!(mobile.participant_count, 21);
+        assert_eq!(mobile.packed_participants, vec![0xFF, 0xFF, 0x1F]);
+        assert_eq!(mobile.created_at_ms, 1_700_000_000_000);
+    }
+
+    #[test]
     fn encode_size_7_validators() {
         let ev = sample_evidence(7, false);
         assert_eq!(ev.encode().len(), 140);
