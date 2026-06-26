@@ -628,10 +628,16 @@ fn main() {
         ));
         info!(target: "n42::cli", "StakingManager initialized");
 
-        // SBMT state tree: enabled by N42_JMT=1. Persisted via snapshot + WAL
-        // under <data_dir>/sbmt.snapshot so it survives restarts; updated on each
-        // block commit and serves state proofs via RPC.
-        let jmt: Option<Arc<Mutex<PersistentSbmt>>> = if env_bool("N42_JMT") {
+        // QMDB/twig state tree: default backend for production and test runs.
+        // `N42_TWIG` is the primary selector; if unset, we keep QMDB enabled by
+        // default unless `N42_JMT=1` explicitly requests the reserve path.
+        let twig_enabled = match std::env::var("N42_TWIG") {
+            Ok(v) => v == "1" || v.eq_ignore_ascii_case("true"),
+            Err(_) => !env_bool("N42_JMT"),
+        };
+        let jmt_enabled = env_bool("N42_JMT") && !twig_enabled;
+
+        let jmt: Option<Arc<Mutex<PersistentSbmt>>> = if jmt_enabled {
             let snapshot_path = data_dir.join("sbmt.snapshot");
             let interval = env_parse::<u64>("N42_SBMT_SNAPSHOT_INTERVAL").unwrap_or(1000);
             match PersistentSbmt::open(&snapshot_path, interval) {
@@ -653,28 +659,28 @@ fn main() {
             None
         };
 
-        // Twig state tree: enabled by N42_TWIG=1. This is a separate,
-        // consensus-breaking state commitment sidecar; start it with a fresh
-        // data dir / clean genesis when switching from another state tree.
-        let twig: Option<Arc<Mutex<PersistentTwig>>> = if env_bool("N42_TWIG") {
+        // Twig/QMDB state tree: the default live state commitment sidecar.
+        // It remains consensus-breaking in the sense that it does not gate
+        // HotStuff finality, but it is the default proof backend now.
+        let twig: Option<Arc<Mutex<PersistentTwig>>> = if twig_enabled {
             let snapshot_path = data_dir.join("twig.snapshot");
             let interval = env_parse::<u64>("N42_TWIG_SNAPSHOT_INTERVAL").unwrap_or(1000);
             match PersistentTwig::open(&snapshot_path, interval) {
                 Ok(tree) => {
                     warn!(
                         target: "n42::cli",
-                        "N42_TWIG=1 enabled; use a fresh data dir/clean genesis for consensus-compatible runs"
+                        "twig backend enabled; use a fresh data dir/clean genesis when switching from another state tree"
                     );
                     info!(
                         target: "n42::cli",
                         version = tree.version(),
                         interval,
-                        "Twig state tree enabled (16 shards, snapshot+WAL persistent)"
+                        "Twig/QMDB state tree enabled (16 shards, snapshot+WAL persistent)"
                     );
                     Some(Arc::new(Mutex::new(tree)))
                 }
                 Err(e) => {
-                    warn!(target: "n42::cli", error = %e, "failed to open persistent Twig; disabling state tree");
+                    warn!(target: "n42::cli", error = %e, "failed to open persistent twig backend; disabling state tree");
                     None
                 }
             }
