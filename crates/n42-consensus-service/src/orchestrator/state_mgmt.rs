@@ -379,6 +379,8 @@ impl ConsensusService {
                     signer_count: u16::try_from(sync_block.commit_qc.signers.len())
                         .unwrap_or(u16::MAX),
                     packed_signers: sync_block.commit_qc.signers.as_raw_slice().to_vec(),
+                    // Filled later by the node-side mobile evidence write-back task;
+                    // sync recovery must not gate committee evidence on phones.
                     mobile: None,
                 };
                 let encoded = evidence.encode();

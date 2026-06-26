@@ -37,6 +37,20 @@ const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
 /// use a larger batch target to reduce cross-task and cross-peer overhead.
 const TX_FORWARD_BATCH_TARGET: usize = 512;
 
+/// Minimum gossip warm-up before leader proposal attempts.
+const DEFAULT_LEADER_PROPOSE_WARMUP_MS: u64 = 500;
+
+/// Re-check interval while waiting for validator quorum.
+const LEADER_QUORUM_RETRY_MS: u64 = 500;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LeaderBuildWaitMode {
+    /// The pending leader build should be executed directly once quorum is reached.
+    Direct,
+    /// The pending leader build should resume through `schedule_payload_build` once quorum is reached.
+    Scheduled,
+}
+
 /// Compress payload JSON with zstd (level 3 — good speed/ratio tradeoff).
 pub fn compress_payload(json: &[u8]) -> Vec<u8> {
     zstd::bulk::compress(json, 3).unwrap_or_else(|e| {
@@ -291,6 +305,13 @@ pub struct ConsensusService {
     tx_broadcast_rx: Option<mpsc::Receiver<Vec<u8>>>,
     committed_blocks: VecDeque<CommittedBlock>,
     connected_peers: HashSet<PeerId>,
+    /// Pending leader-proposal quorum gate for a specific view.
+    ///
+    /// `LeaderBuildWaitMode::Direct` means the gate will call
+    /// `do_trigger_payload_build` directly once quorum is reached.
+    /// `LeaderBuildWaitMode::Scheduled` means the gate re-enters
+    /// `schedule_payload_build` once quorum is reached.
+    leader_build_waiting_view: Option<(u64, LeaderBuildWaitMode)>,
     sync_in_flight: bool,
     sync_started_at: Option<Instant>,
     state_file: Option<PathBuf>,
@@ -454,6 +475,87 @@ impl ConsensusService {
 
         self.pending_block_data.insert(hash, data);
         true
+    }
+
+    fn leader_propose_warmup_delay() -> Duration {
+        std::env::var("N42_STARTUP_DELAY_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|v| *v > 0)
+            .map(Duration::from_millis)
+            .unwrap_or_else(|| Duration::from_millis(DEFAULT_LEADER_PROPOSE_WARMUP_MS))
+    }
+
+    fn leader_quorum_recheck_delay() -> Duration {
+        Duration::from_millis(LEADER_QUORUM_RETRY_MS)
+    }
+
+    fn connected_validator_peer_count(&self) -> usize {
+        let connected_peers: HashSet<_> = self.connected_peers.iter().copied().collect();
+        self.network
+            .all_validator_peers()
+            .into_iter()
+            .map(|(_, peer_id)| peer_id)
+            .filter(|peer_id| connected_peers.contains(peer_id))
+            .count()
+    }
+
+    fn quorum_peers_needed(&self) -> usize {
+        self.engine.quorum_size().saturating_sub(1)
+    }
+
+    fn has_quorum_peers(&self) -> bool {
+        self.connected_validator_peer_count() >= self.quorum_peers_needed()
+    }
+
+    fn pending_leader_build_mode_for_current_view(&self) -> Option<LeaderBuildWaitMode> {
+        let current_view = self.engine.current_view();
+        self.leader_build_waiting_view
+            .and_then(|(view, mode)| (view == current_view).then_some(mode))
+    }
+
+    fn begin_leader_build_wait(&mut self, mode: LeaderBuildWaitMode, slot_timestamp: Option<u64>) {
+        self.leader_build_waiting_view = Some((self.engine.current_view(), mode));
+        self.next_slot_timestamp = slot_timestamp;
+    }
+
+    fn clear_leader_build_wait(&mut self) {
+        self.leader_build_waiting_view = None;
+    }
+
+    fn schedule_leader_build_recheck(&mut self, delay: Duration) {
+        self.next_build_at = Some(Instant::now() + delay);
+    }
+
+    async fn evaluate_leader_build_wait(&mut self, slot_timestamp: Option<u64>) {
+        let Some(mode) = self.pending_leader_build_mode_for_current_view() else {
+            return;
+        };
+
+        if !self.engine.is_current_leader() {
+            self.clear_leader_build_wait();
+            return;
+        }
+
+        if let Some(slot_timestamp) = slot_timestamp {
+            self.next_slot_timestamp = Some(slot_timestamp);
+        }
+
+        if !self.has_quorum_peers() {
+            self.schedule_leader_build_recheck(Self::leader_quorum_recheck_delay());
+            return;
+        }
+
+        self.clear_leader_build_wait();
+        match mode {
+            LeaderBuildWaitMode::Direct => {
+                let slot_timestamp = self.next_slot_timestamp.take();
+                self.do_trigger_payload_build(slot_timestamp).await;
+            }
+            LeaderBuildWaitMode::Scheduled => {
+                self.schedule_payload_build().await;
+            }
+        }
     }
 
     fn drain_leader_payload_rx(&mut self, protected_hashes: &[B256]) {
@@ -702,6 +804,7 @@ impl ConsensusService {
             tx_broadcast_rx: None,
             committed_blocks: VecDeque::new(),
             connected_peers: HashSet::new(),
+            leader_build_waiting_view: None,
             sync_in_flight: false,
             sync_started_at: None,
             state_file: None,
@@ -901,6 +1004,7 @@ impl ConsensusService {
             tx_broadcast_rx: None,
             committed_blocks: VecDeque::new(),
             connected_peers: HashSet::new(),
+            leader_build_waiting_view: None,
             sync_in_flight: false,
             sync_started_at: None,
             state_file: None,
@@ -1312,18 +1416,29 @@ impl ConsensusService {
                             debug!(target: "n42::cl::orchestrator", view, "build timer fired but speculative build in progress, skipping");
                             continue;
                         }
-                        // Check if this is a startup delay or a retry.
+                        // Check if this is a startup recheck or a regular re-check:
+                        // on initial view, we still gate strictly on quorum peers before
+                        // attempting first proposal.
                         if view <= 1 {
                             self.engine.pacemaker_mut().reset_for_view(view, 0);
-                            info!(target: "n42::cl::orchestrator", "startup delay completed, triggering first payload build");
+                        }
+                        if view <= 1 {
+                            info!(
+                                target: "n42::cl::orchestrator",
+                                "leader build timer reached; checking validator peer quorum"
+                            );
                         } else {
-                            info!(target: "n42::cl::orchestrator", view, "build retry timer fired, re-attempting payload build");
+                            info!(
+                                target: "n42::cl::orchestrator",
+                                view,
+                                "leader build timer reached; re-checking validator peer quorum"
+                            );
                         }
                     } else {
                         info!(target: "n42::cl::orchestrator", slot_timestamp = ?slot_ts, "slot boundary reached, triggering payload build");
                     }
 
-                    self.do_trigger_payload_build(slot_ts).await;
+                    self.evaluate_leader_build_wait(slot_ts).await;
                 }
 
                 // === Priority 9: TX forwarding (lowest priority) ===
@@ -1391,26 +1506,32 @@ impl ConsensusService {
             return;
         }
 
-        let n = self.engine.validator_count() as u64;
-        let startup_delay_ms: u64 = std::env::var("N42_STARTUP_DELAY_MS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or_else(|| if n <= 1 { 0 } else { 5000 + n * 500 });
-
-        if startup_delay_ms > 0 {
-            let startup_delay = Duration::from_millis(startup_delay_ms);
+        let warmup_delay = Self::leader_propose_warmup_delay();
+        let warmup_delay = if self.quorum_peers_needed() == 0 {
+            Duration::ZERO
+        } else {
+            warmup_delay
+        };
+        self.begin_leader_build_wait(LeaderBuildWaitMode::Direct, None);
+        if warmup_delay.is_zero() {
             info!(
                 target: "n42::cl::orchestrator",
-                delay_ms = startup_delay_ms,
-                validators = n,
-                "leader for view 1, waiting for GossipSub mesh formation"
+                validators = self.engine.validator_count(),
+                "leader for view 1, attempting immediate proposal after quorum check"
             );
-            self.next_build_at = Some(Instant::now() + startup_delay);
-            self.engine.pacemaker_mut().extend_deadline(startup_delay);
-        } else {
-            info!(target: "n42::cl::orchestrator", "this node is leader for view 1, triggering genesis payload build");
-            self.schedule_payload_build().await;
+            self.evaluate_leader_build_wait(None).await;
+            return;
         }
+
+        info!(
+            target: "n42::cl::orchestrator",
+            delay_ms = warmup_delay.as_millis() as u64,
+            validators = self.engine.validator_count(),
+            needed_quorum_peers = self.quorum_peers_needed(),
+            "leader for view 1, waiting for validator quorum (warmup floor)"
+        );
+        self.schedule_leader_build_recheck(warmup_delay);
+        self.engine.pacemaker_mut().extend_deadline(warmup_delay);
     }
 
     /// Records a pipeline timing entry for a block, with bounded map size.
@@ -1717,12 +1838,21 @@ impl ConsensusService {
                 info!(target: "n42::cl::orchestrator", %peer_id, "consensus peer connected");
                 self.connected_peers.insert(peer_id);
                 gauge!("n42_connected_peers").set(self.connected_peers.len() as f64);
+
+                if self.pending_leader_build_mode_for_current_view().is_some() {
+                    let slot_timestamp = self.next_slot_timestamp;
+                    self.evaluate_leader_build_wait(slot_timestamp).await;
+                }
             }
             NetworkEvent::PeerDisconnected(peer_id) => {
                 warn!(target: "n42::cl::orchestrator", %peer_id, "consensus peer disconnected");
                 self.connected_peers.remove(&peer_id);
                 self.view_jump_throttle.forget(&peer_id);
                 gauge!("n42_connected_peers").set(self.connected_peers.len() as f64);
+
+                if self.pending_leader_build_mode_for_current_view().is_some() {
+                    self.schedule_leader_build_recheck(Self::leader_quorum_recheck_delay());
+                }
             }
             NetworkEvent::BlockAnnouncement { source, data } => {
                 tracing::debug!(target: "n42::cl::orchestrator", %source, bytes = data.len(), "received block data broadcast");
@@ -1777,10 +1907,159 @@ mod tests {
     use n42_network::{NetworkCommand, NetworkHandle};
     use n42_primitives::consensus::ValidatorChange;
     use n42_primitives::{BlsSecretKey, ConsensusMessage, QuorumCertificate, Vote};
+    use std::collections::HashMap;
+    use std::sync::{Arc, RwLock};
     use std::time::Duration;
+
+    #[derive(Clone, Default)]
+    struct MockConsensusNetwork {
+        peers: Arc<RwLock<HashMap<u32, n42_network::PeerId>>>,
+    }
+
+    impl MockConsensusNetwork {
+        fn with_peers(peers: Vec<(u32, n42_network::PeerId)>) -> Self {
+            let peer_map = peers.into_iter().collect::<HashMap<_, _>>();
+            Self {
+                peers: Arc::new(RwLock::new(peer_map)),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ConsensusNetwork for MockConsensusNetwork {
+        fn broadcast_consensus(
+            &self,
+            _msg: n42_primitives::ConsensusMessage,
+        ) -> Result<(), n42_network::NetworkError> {
+            Ok(())
+        }
+
+        fn validator_peer(&self, index: u32) -> Option<n42_network::PeerId> {
+            self.peers
+                .read()
+                .expect("mock peers lock")
+                .get(&index)
+                .copied()
+        }
+
+        fn send_direct(
+            &self,
+            _peer: n42_network::PeerId,
+            _msg: n42_primitives::ConsensusMessage,
+        ) -> Result<(), n42_network::NetworkError> {
+            Ok(())
+        }
+
+        fn all_validator_peers(&self) -> Vec<(u32, n42_network::PeerId)> {
+            self.peers
+                .read()
+                .expect("mock peers lock")
+                .iter()
+                .map(|(index, peer_id)| (*index, *peer_id))
+                .collect()
+        }
+
+        fn forward_tx_batch(
+            &self,
+            _peer: n42_network::PeerId,
+            _txs: Vec<Vec<u8>>,
+        ) -> Result<(), n42_network::NetworkError> {
+            Ok(())
+        }
+
+        fn request_sync(
+            &self,
+            _peer: n42_network::PeerId,
+            _request: n42_network::BlockSyncRequest,
+        ) -> Result<(), n42_network::NetworkError> {
+            Ok(())
+        }
+
+        fn broadcast_blob_sidecar(&self, _data: Vec<u8>) -> Result<(), n42_network::NetworkError> {
+            Ok(())
+        }
+
+        async fn announce_block_reliable(
+            &self,
+            _data: Vec<u8>,
+        ) -> Result<(), n42_network::NetworkError> {
+            Ok(())
+        }
+
+        async fn send_block_direct_reliable(
+            &self,
+            _peer: n42_network::PeerId,
+            _data: Vec<u8>,
+        ) -> Result<(), n42_network::NetworkError> {
+            Ok(())
+        }
+
+        async fn send_sync_response_reliable(
+            &self,
+            _request_id: u64,
+            _response: n42_network::BlockSyncResponse,
+        ) -> Result<(), n42_network::NetworkError> {
+            Ok(())
+        }
+
+        async fn authenticate_validator_peer_reliable(
+            &self,
+            _peer_id: n42_network::PeerId,
+            _validator_index: u32,
+        ) -> Result<(), n42_network::NetworkError> {
+            Ok(())
+        }
+
+        async fn replace_expected_validator_peers_reliable(
+            &self,
+            peers: HashMap<u32, n42_network::PeerId>,
+        ) -> Result<(), n42_network::NetworkError> {
+            *self.peers.write().expect("mock peers lock") = peers;
+            Ok(())
+        }
+
+        async fn set_validator_context(&self, _my_index: u32, _validator_count: u32) {}
+    }
 
     fn test_key(seed: u8) -> BlsSecretKey {
         BlsSecretKey::key_gen(&[seed; 32]).expect("deterministic test key should be valid")
+    }
+
+    fn make_test_engine_with_validator_count(
+        count: u8,
+        my_index: u8,
+    ) -> (ConsensusEngine, mpsc::Receiver<EngineOutput>) {
+        let fault_tolerance = u32::from(count.saturating_sub(1)) / 3;
+        make_test_engine_with_fault_tolerance(count, my_index, fault_tolerance)
+    }
+
+    fn make_test_engine_with_fault_tolerance(
+        count: u8,
+        my_index: u8,
+        fault_tolerance: u32,
+    ) -> (ConsensusEngine, mpsc::Receiver<EngineOutput>) {
+        assert!(my_index < count);
+        let keys: Vec<_> = (0..count).map(test_key).collect();
+        let validators = keys
+            .iter()
+            .enumerate()
+            .map(|(idx, key)| ValidatorInfo {
+                address: Address::with_last_byte(idx as u8),
+                bls_public_key: key.public_key(),
+                p2p_peer_id: None,
+            })
+            .collect::<Vec<_>>();
+        let (output_tx, output_rx) = mpsc::channel(1024);
+
+        let engine = ConsensusEngine::new(
+            my_index as u32,
+            keys[my_index as usize].clone(),
+            ValidatorSet::new(&validators, fault_tolerance),
+            60000,
+            120000,
+            output_tx,
+        );
+        (engine, output_rx)
     }
 
     fn make_test_engine() -> (ConsensusEngine, mpsc::Receiver<EngineOutput>) {
@@ -2264,5 +2543,107 @@ mod tests {
         let orch = orch.with_recovered_commit_qc(qc);
         assert_eq!(orch.prev_randao_cache, expected);
         assert!(orch.last_commit_qc.is_some());
+    }
+
+    #[test]
+    fn test_connected_validator_peer_count() {
+        let (engine, output_rx) = make_test_engine_with_validator_count(2, 0);
+        let mock_peers = vec![
+            (0u32, Keypair::generate_ed25519().public().to_peer_id()),
+            (1u32, Keypair::generate_ed25519().public().to_peer_id()),
+        ];
+        let network = Arc::new(MockConsensusNetwork::with_peers(mock_peers.clone()));
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let mut orch = ConsensusService::new(engine, network, net_event_rx, output_rx);
+
+        let non_validator = Keypair::generate_ed25519().public().to_peer_id();
+        orch.connected_peers.insert(non_validator);
+        orch.connected_peers.insert(mock_peers[0].1);
+        orch.connected_peers.insert(mock_peers[1].1);
+
+        assert_eq!(orch.connected_validator_peer_count(), 2);
+    }
+
+    #[test]
+    fn test_has_quorum_peers() {
+        let (engine, output_rx) = make_test_engine_with_validator_count(7, 1);
+        let mock_peers = (0..7)
+            .map(|idx| {
+                (
+                    idx as u32,
+                    Keypair::generate_ed25519().public().to_peer_id(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let network = Arc::new(MockConsensusNetwork::with_peers(mock_peers.clone()));
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let mut orch = ConsensusService::new(engine, network, net_event_rx, output_rx);
+
+        orch.connected_peers.insert(mock_peers[0].1);
+        orch.connected_peers.insert(mock_peers[1].1);
+        orch.connected_peers.insert(mock_peers[2].1);
+
+        assert!(!orch.has_quorum_peers());
+        orch.connected_peers.insert(mock_peers[4].1);
+        assert!(orch.has_quorum_peers());
+    }
+
+    #[test]
+    fn test_quorum_peers_needed_uses_engine_quorum() {
+        let (engine, output_rx) = make_test_engine_with_fault_tolerance(7, 1, 1);
+        let mock_peers = (0..7)
+            .map(|idx| {
+                (
+                    idx as u32,
+                    Keypair::generate_ed25519().public().to_peer_id(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let network = Arc::new(MockConsensusNetwork::with_peers(mock_peers.clone()));
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let mut orch = ConsensusService::new(engine, network, net_event_rx, output_rx);
+
+        assert_eq!(orch.quorum_peers_needed(), 2);
+        orch.connected_peers.insert(mock_peers[0].1);
+        assert!(!orch.has_quorum_peers());
+        orch.connected_peers.insert(mock_peers[2].1);
+        assert!(orch.has_quorum_peers());
+    }
+
+    #[test]
+    fn test_quorum_peers_needed_single_validator() {
+        let (engine, output_rx) = make_test_engine_with_validator_count(1, 0);
+        let network = Arc::new(MockConsensusNetwork::default());
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let orch = ConsensusService::new(engine, network, net_event_rx, output_rx);
+        assert_eq!(orch.quorum_peers_needed(), 0);
+        assert!(orch.has_quorum_peers());
+    }
+
+    #[tokio::test]
+    async fn test_startup_leader_gate_waits_for_validator_quorum() {
+        let (engine, output_rx) = make_test_engine_with_validator_count(7, 1);
+        let mock_peers = (0..7)
+            .map(|idx| {
+                (
+                    idx as u32,
+                    Keypair::generate_ed25519().public().to_peer_id(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let network = Arc::new(MockConsensusNetwork::with_peers(mock_peers.clone()));
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let mut orch = ConsensusService::new(engine, network, net_event_rx, output_rx);
+
+        orch.begin_leader_build_wait(LeaderBuildWaitMode::Direct, None);
+
+        for idx in 0..3 {
+            orch.handle_network_event(NetworkEvent::PeerConnected(mock_peers[idx as usize].1))
+                .await;
+            assert!(orch.leader_build_waiting_view.is_some());
+        }
+        orch.handle_network_event(NetworkEvent::PeerConnected(mock_peers[3].1))
+            .await;
+        assert!(orch.leader_build_waiting_view.is_none());
     }
 }

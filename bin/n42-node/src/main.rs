@@ -17,8 +17,10 @@ use n42_network::{
     deterministic_validator_keypair,
 };
 use n42_node::attestation_store::AttestationStore;
+use n42_node::consensus_state::configured_min_mobile_verifiers;
 use n42_node::epoch_schedule::EpochSchedule;
 use n42_node::mobile_bridge::MobileVerificationBridge;
+use n42_node::mobile_evidence::spawn_mobile_evidence_writeback;
 use n42_node::mobile_packet::mobile_packet_loop;
 use n42_node::mobile_reward::MobileRewardManager;
 use n42_node::persistence;
@@ -39,7 +41,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, Once};
 use std::time::Duration;
 use tokio::sync::mpsc;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 fn env_bool(name: &str) -> bool {
     std::env::var(name)
@@ -626,10 +628,16 @@ fn main() {
         ));
         info!(target: "n42::cli", "StakingManager initialized");
 
-        // SBMT state tree: enabled by N42_JMT=1. Persisted via snapshot + WAL
-        // under <data_dir>/sbmt.snapshot so it survives restarts; updated on each
-        // block commit and serves state proofs via RPC.
-        let jmt: Option<Arc<Mutex<PersistentSbmt>>> = if env_bool("N42_JMT") {
+        // QMDB/twig state tree: default backend for production and test runs.
+        // `N42_TWIG` is the primary selector; if unset, we keep QMDB enabled by
+        // default unless `N42_JMT=1` explicitly requests the reserve path.
+        let twig_enabled = match std::env::var("N42_TWIG") {
+            Ok(v) => v == "1" || v.eq_ignore_ascii_case("true"),
+            Err(_) => !env_bool("N42_JMT"),
+        };
+        let jmt_enabled = env_bool("N42_JMT") && !twig_enabled;
+
+        let jmt: Option<Arc<Mutex<PersistentSbmt>>> = if jmt_enabled {
             let snapshot_path = data_dir.join("sbmt.snapshot");
             let interval = env_parse::<u64>("N42_SBMT_SNAPSHOT_INTERVAL").unwrap_or(1000);
             match PersistentSbmt::open(&snapshot_path, interval) {
@@ -651,28 +659,28 @@ fn main() {
             None
         };
 
-        // Twig state tree: enabled by N42_TWIG=1. This is a separate,
-        // consensus-breaking state commitment sidecar; start it with a fresh
-        // data dir / clean genesis when switching from another state tree.
-        let twig: Option<Arc<Mutex<PersistentTwig>>> = if env_bool("N42_TWIG") {
+        // Twig/QMDB state tree: the default live state commitment sidecar.
+        // It remains consensus-breaking in the sense that it does not gate
+        // HotStuff finality, but it is the default proof backend now.
+        let twig: Option<Arc<Mutex<PersistentTwig>>> = if twig_enabled {
             let snapshot_path = data_dir.join("twig.snapshot");
             let interval = env_parse::<u64>("N42_TWIG_SNAPSHOT_INTERVAL").unwrap_or(1000);
             match PersistentTwig::open(&snapshot_path, interval) {
                 Ok(tree) => {
                     warn!(
                         target: "n42::cli",
-                        "N42_TWIG=1 enabled; use a fresh data dir/clean genesis for consensus-compatible runs"
+                        "twig backend enabled; use a fresh data dir/clean genesis when switching from another state tree"
                     );
                     info!(
                         target: "n42::cli",
                         version = tree.version(),
                         interval,
-                        "Twig state tree enabled (16 shards, snapshot+WAL persistent)"
+                        "Twig/QMDB state tree enabled (16 shards, snapshot+WAL persistent)"
                     );
                     Some(Arc::new(Mutex::new(tree)))
                 }
                 Err(e) => {
-                    warn!(target: "n42::cli", error = %e, "failed to open persistent Twig; disabling state tree");
+                    warn!(target: "n42::cli", error = %e, "failed to open persistent twig backend; disabling state tree");
                     None
                 }
             }
@@ -1180,6 +1188,7 @@ fn main() {
                 );
 
                 let (attest_tx, mut attest_rx) = mpsc::channel(256);
+                let (attest_progress_tx, mut attest_progress_rx) = mpsc::channel(256);
                 let (phone_connected_tx, phone_connected_rx) = mpsc::channel(128);
                 let (reward_attest_tx, mut reward_attest_rx) = mpsc::channel(1024);
                 let (dispatched_block_tx, dispatched_block_rx) = mpsc::channel(128);
@@ -1190,8 +1199,13 @@ fn main() {
                         .map_err(|e| eyre::eyre!("failed to initialize attestation store: {e}"))?,
                 ));
 
-                let mobile_bridge = MobileVerificationBridge::new(hub_event_rx, 10, 1000)
+                let mobile_bridge = MobileVerificationBridge::new(
+                    hub_event_rx,
+                    configured_min_mobile_verifiers(),
+                    1000,
+                )
                     .with_attestation_tx(attest_tx)
+                    .with_attestation_progress_tx(attest_progress_tx)
                     .with_phone_connected_tx(phone_connected_tx)
                     .with_consensus_state(consensus_state.clone())
                     .with_reward_tx(reward_attest_tx)
@@ -1216,6 +1230,7 @@ fn main() {
                 );
 
                 let attestation_state = consensus_state.clone();
+                let evidence_store_for_mobile = evidence_store.clone();
                 task_executor.spawn_critical_task(
                     "n42-attestation-logger",
                     Box::pin(async move {
@@ -1231,6 +1246,30 @@ fn main() {
                                 event.block_hash,
                                 event.block_number,
                                 event.valid_count,
+                            );
+                            if let Some(ref evidence_store) = evidence_store_for_mobile {
+                                spawn_mobile_evidence_writeback(
+                                    Arc::clone(evidence_store),
+                                    event,
+                                );
+                            }
+                        }
+                    }),
+                );
+
+                task_executor.spawn_critical_task(
+                    "n42-attestation-progress",
+                    Box::pin(async move {
+                        while let Some(event) = attest_progress_rx.recv().await {
+                            debug!(
+                                target: "n42::mobile",
+                                block_number = event.block_number,
+                                %event.block_hash,
+                                valid_count = event.valid_count,
+                                threshold = event.threshold,
+                                reached = event.valid_count >= event.threshold,
+                                receipts_root = %alloy_primitives::B256::from(event.receipts_root),
+                                "mobile attestation progress"
                             );
                         }
                     }),

@@ -1,5 +1,5 @@
 use super::ConsensusService;
-use super::state_mgmt::max_consecutive_empty_skips;
+use super::{LeaderBuildWaitMode, state_mgmt::max_consecutive_empty_skips};
 use crate::el::ExecutionLayer;
 use crate::exec_cache::ExecutionOutputCache;
 use crate::expected_validator_peer_ids_with_policy;
@@ -423,7 +423,9 @@ impl ConsensusService {
                 aggregate_signature: commit_qc.aggregate_signature.to_bytes(),
                 signer_count: u16::try_from(commit_qc.signers.len()).unwrap_or(u16::MAX),
                 packed_signers: commit_qc.signers.as_raw_slice().to_vec(),
-                mobile: None, // TODO: wire AttestationStore for mobile evidence
+                // Filled later by the node-side mobile evidence write-back task;
+                // committee finality never waits for phone attestations.
+                mobile: None,
             };
             let encoded = evidence.encode();
             let root_bytes = *blake3::hash(&encoded).as_bytes();
@@ -756,7 +758,8 @@ impl ConsensusService {
                     // Don't clear yet — let handle_view_changed see it too.
                 } else {
                     debug!(target: "n42::cl::consensus_loop", next_view = self.engine.current_view(), "leader: scheduling next build (Case A)");
-                    self.schedule_payload_build().await;
+                    self.begin_leader_build_wait(LeaderBuildWaitMode::Scheduled, None);
+                    self.evaluate_leader_build_wait(None).await;
                 }
             }
         } else if let Some(data) = self.pending_block_data.remove(&block_hash) {
@@ -979,7 +982,8 @@ impl ConsensusService {
                 debug!(target: "n42::cl::consensus_loop", new_view, "speculative build already in progress, skipping view-change build");
             } else {
                 debug!(target: "n42::cl::consensus_loop", new_view, "became leader after view change, scheduling payload build");
-                self.schedule_payload_build().await;
+                self.begin_leader_build_wait(LeaderBuildWaitMode::Scheduled, None);
+                self.evaluate_leader_build_wait(None).await;
             }
         } else {
             // Not leader for this view — clear any stale speculative build.
@@ -1026,7 +1030,8 @@ impl ConsensusService {
             self.spawn_bg_import(data, next_hash, next_view);
         } else if self.engine.is_current_leader() {
             debug!(target: "n42::cl::consensus_loop", next_view = self.engine.current_view(), "leader: scheduling build after all bg imports done");
-            self.schedule_payload_build().await;
+            self.begin_leader_build_wait(LeaderBuildWaitMode::Scheduled, None);
+            self.evaluate_leader_build_wait(None).await;
         }
     }
 

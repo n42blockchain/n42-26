@@ -123,12 +123,17 @@ const MAX_ATTESTATION_HISTORY: usize = 1000;
 const MAX_EQUIVOCATION_LOG: usize = 500;
 /// Maximum number of recent blocks tracked for attestation.
 const MAX_TRACKED_ATTESTATION_BLOCKS: usize = 100;
+/// Production floor for mobile verifier aggregate completeness.
+///
+/// `N42_MIN_ATTESTATION_THRESHOLD` may override this for local/dev testnets,
+/// but production defaults to the Go replay/reseal floor of 21 verifiers.
+pub const MIN_MOBILE_VERIFIERS: u32 = 21;
 
-fn default_attestation_threshold() -> u32 {
+pub fn configured_min_mobile_verifiers() -> u32 {
     std::env::var("N42_MIN_ATTESTATION_THRESHOLD")
         .ok()
         .and_then(|s| s.parse::<u32>().ok())
-        .unwrap_or(10)
+        .unwrap_or(MIN_MOBILE_VERIFIERS)
 }
 
 fn unix_now_secs() -> u64 {
@@ -202,9 +207,9 @@ pub struct SharedConsensusState {
 
 impl SharedConsensusState {
     /// Creates a new shared state. Threshold is read from `N42_MIN_ATTESTATION_THRESHOLD`
-    /// (default 10); a value of 0 is clamped to 1.
+    /// (default 21); a value of 0 is clamped to 1.
     pub fn new(validator_set: ValidatorSet) -> Self {
-        let threshold = default_attestation_threshold();
+        let threshold = configured_min_mobile_verifiers();
         let threshold = if threshold == 0 {
             warn!("N42_MIN_ATTESTATION_THRESHOLD=0 is invalid, clamping to 1");
             1

@@ -95,7 +95,9 @@ pub struct StreamPacket {
     pub block_hash: B256,
     pub header_rlp: Bytes,
     pub transactions: Vec<Bytes>,
-    /// Pre-encoded read log bytes (output of `encode_read_log`).
+    /// Pre-encoded read log bytes (output of `encode_read_log`), represented as a strict
+    /// state **value stream**. There are no keys in this payload; replay is by fixed
+    /// EVM `Database` call order only.
     pub read_log_data: Vec<u8>,
     /// Contract bytecodes not in the phone's cache: (code_hash, bytecode).
     pub bytecodes: Vec<(B256, Bytes)>,

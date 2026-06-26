@@ -463,6 +463,10 @@ impl ConsensusEngine {
         self.validator_set().len()
     }
 
+    pub fn quorum_size(&self) -> usize {
+        self.validator_set().quorum_size()
+    }
+
     /// Returns the validator index if the message carries a valid single-validator
     /// BLS signature under the validator set for that message's view.
     ///

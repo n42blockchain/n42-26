@@ -1,6 +1,8 @@
 use alloy_primitives::B256;
 use metrics::{counter, gauge};
-use n42_mobile::{AttestationBuilder, ReceiptAggregator, VerificationReceipt};
+use n42_mobile::{
+    AggregatedAttestation, AttestationBuilder, ReceiptAggregator, VerificationReceipt,
+};
 use n42_network::mobile::HubEvent;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -8,7 +10,9 @@ use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, info, warn};
 
 use crate::attestation_store::AttestationStore;
-use crate::consensus_state::{SharedConsensusState, VerificationTask};
+use crate::consensus_state::{
+    SharedConsensusState, VerificationTask, configured_min_mobile_verifiers,
+};
 use crate::staking::StakingManager;
 
 /// Notification sent when a block reaches the mobile attestation threshold.
@@ -16,7 +20,27 @@ use crate::staking::StakingManager;
 pub struct AttestationEvent {
     pub block_hash: B256,
     pub block_number: u64,
+    pub receipts_root: [u8; 32],
+    pub aggregate_signature: [u8; 96],
+    pub participant_count: u16,
+    /// Little-endian bitfield over the [`AttestationStore`] verifier registry
+    /// registration order. Bit `i` corresponds to registry index `i`.
+    pub packed_participants: Vec<u8>,
+    pub created_at_ms: u64,
     pub valid_count: u32,
+}
+
+/// Continuous verification progress notification emitted as receipts arrive.
+#[derive(Debug, Clone)]
+pub struct AttestationProgressEvent {
+    pub block_hash: B256,
+    pub block_number: u64,
+    /// Number of unique valid receipts counted so far for this block.
+    pub valid_count: u32,
+    /// Current threshold at the time this progress event was emitted.
+    pub threshold: u32,
+    /// Expected receipts root for this block, if known.
+    pub receipts_root: [u8; 32],
 }
 
 /// Node-local notification from the mobile packet generator.
@@ -37,10 +61,7 @@ struct FinalizedAttestation {
 }
 
 fn min_attestation_threshold() -> u32 {
-    std::env::var("N42_MIN_ATTESTATION_THRESHOLD")
-        .ok()
-        .and_then(|s| s.parse::<u32>().ok())
-        .unwrap_or(10)
+    configured_min_mobile_verifiers()
 }
 
 /// Bridges StarHub mobile verification events with the ReceiptAggregator.
@@ -48,6 +69,7 @@ pub struct MobileVerificationBridge {
     hub_event_rx: mpsc::Receiver<HubEvent>,
     receipt_aggregator: ReceiptAggregator,
     attestation_tx: Option<mpsc::Sender<AttestationEvent>>,
+    attestation_progress_tx: Option<mpsc::Sender<AttestationProgressEvent>>,
     phone_connected_tx: Option<mpsc::Sender<u64>>,
     reward_tx: Option<mpsc::Sender<[u8; 48]>>,
     /// Maps session_id → verifier BLS pubkey for deauthorization on disconnect.
@@ -107,11 +129,20 @@ impl MobileVerificationBridge {
             max_tracked: max_tracked_blocks,
             attestation_builders: HashMap::new(),
             attestation_store: None,
+            attestation_progress_tx: None,
         }
     }
 
     pub fn with_attestation_tx(mut self, tx: mpsc::Sender<AttestationEvent>) -> Self {
         self.attestation_tx = Some(tx);
+        self
+    }
+
+    pub fn with_attestation_progress_tx(
+        mut self,
+        tx: mpsc::Sender<AttestationProgressEvent>,
+    ) -> Self {
+        self.attestation_progress_tx = Some(tx);
         self
     }
 
@@ -381,28 +412,68 @@ impl MobileVerificationBridge {
         &mut self,
         block_hash: B256,
         block_number: u64,
-        valid_count: u32,
-    ) -> Vec<[u8; 48]> {
+        required_count: u32,
+    ) -> Option<(AttestationEvent, Vec<[u8; 48]>)> {
         let Some(builder) = self.attestation_builders.remove(&block_hash) else {
-            return Vec::new();
+            warn!(
+                target: "n42::mobile",
+                block_number,
+                %block_hash,
+                "mobile threshold reached but no aggregate builder was retained"
+            );
+            return None;
         };
 
         let sig_count = builder.count();
         if sig_count == 0 {
-            return Vec::new();
+            warn!(
+                target: "n42::mobile",
+                block_number,
+                %block_hash,
+                "mobile threshold reached but aggregate builder has no signatures"
+            );
+            return None;
         }
 
         match builder.build() {
             Ok(attestation) => {
+                if attestation.participant_count < required_count {
+                    warn!(
+                        target: "n42::mobile",
+                        block_number,
+                        %block_hash,
+                        participant_count = attestation.participant_count,
+                        required_count,
+                        "mobile aggregate below required threshold; not emitting evidence event"
+                    );
+                    return None;
+                }
+
+                let participant_count = match u16::try_from(attestation.participant_count) {
+                    Ok(count) => count,
+                    Err(_) => {
+                        warn!(
+                            target: "n42::mobile",
+                            block_number,
+                            %block_hash,
+                            participant_count = attestation.participant_count,
+                            "mobile aggregate participant count exceeds evidence codec limit"
+                        );
+                        return None;
+                    }
+                };
+
                 info!(
                     target: "n42::mobile",
                     block_number,
                     %block_hash,
                     participant_count = attestation.participant_count,
-                    valid_count,
+                    required_count,
                     "BLS aggregate attestation built"
                 );
                 counter!("n42_mobile_aggregate_attestations_total").increment(1);
+
+                let event = Self::attestation_event_from_aggregate(&attestation, participant_count);
 
                 let reward_pubkeys = if let Some(ref store) = self.attestation_store {
                     let s = store.lock().unwrap_or_else(|e| {
@@ -448,7 +519,7 @@ impl MobileVerificationBridge {
                     "reward pubkeys prepared for finalized attestation"
                 );
 
-                return reward_pubkeys;
+                return Some((event, reward_pubkeys));
             }
             Err(e) => {
                 warn!(
@@ -462,7 +533,23 @@ impl MobileVerificationBridge {
             }
         }
 
-        Vec::new()
+        None
+    }
+
+    fn attestation_event_from_aggregate(
+        attestation: &AggregatedAttestation,
+        participant_count: u16,
+    ) -> AttestationEvent {
+        AttestationEvent {
+            block_hash: attestation.block_hash,
+            block_number: attestation.block_number,
+            receipts_root: attestation.receipts_root.0,
+            aggregate_signature: attestation.aggregate_signature.to_bytes(),
+            participant_count,
+            packed_participants: attestation.participant_bitfield.clone(),
+            created_at_ms: attestation.created_at_ms,
+            valid_count: u32::from(participant_count),
+        }
     }
 
     fn process_receipt_inner(
@@ -562,11 +649,21 @@ impl MobileVerificationBridge {
         match self.receipt_aggregator.process_receipt(receipt) {
             Some(true) => {
                 // New unique receipt for a dispatched block; threshold just crossed.
-                let valid_count = self
+                let (valid_count, required_count) = self
                     .receipt_aggregator
                     .get_status(&receipt.block_hash)
-                    .map(|s| s.valid_count)
-                    .unwrap_or(0);
+                    .map(|s| (s.valid_count, s.threshold))
+                    .unwrap_or((0, 0));
+
+                if let Some(status) = self.receipt_aggregator.get_status(&receipt.block_hash) {
+                    self.try_emit_attestation_progress_event(AttestationProgressEvent {
+                        block_hash: status.block_hash,
+                        block_number: status.block_number,
+                        valid_count: status.valid_count,
+                        threshold: status.threshold,
+                        receipts_root: status.expected_receipts_root.unwrap_or_default().0,
+                    });
+                }
 
                 if let Some(first_at) = self.block_first_receipt_at.get(&receipt.block_hash) {
                     let latency_ms = first_at.elapsed().as_millis() as u64;
@@ -581,11 +678,21 @@ impl MobileVerificationBridge {
                 }
 
                 // Build BLS aggregate signature and persist.
-                let reward_pubkeys = self.finalize_attestation(
+                let Some((event, reward_pubkeys)) = self.finalize_attestation(
                     receipt.block_hash,
                     receipt.block_number,
-                    valid_count,
-                );
+                    required_count,
+                ) else {
+                    warn!(
+                        target: "n42::mobile",
+                        block_number = receipt.block_number,
+                        %receipt.block_hash,
+                        valid_count,
+                        required_count,
+                        "mobile threshold reached but aggregate evidence is unavailable"
+                    );
+                    return None;
+                };
 
                 info!(
                     target: "n42::mobile",
@@ -596,16 +703,21 @@ impl MobileVerificationBridge {
                 );
 
                 return Some(FinalizedAttestation {
-                    event: AttestationEvent {
-                        block_hash: receipt.block_hash,
-                        block_number: receipt.block_number,
-                        valid_count,
-                    },
+                    event,
                     reward_pubkeys,
                 });
             }
             Some(false) => {
                 // New unique receipt for a dispatched block; threshold not yet reached.
+                if let Some(status) = self.receipt_aggregator.get_status(&receipt.block_hash) {
+                    self.try_emit_attestation_progress_event(AttestationProgressEvent {
+                        block_hash: status.block_hash,
+                        block_number: status.block_number,
+                        valid_count: status.valid_count,
+                        threshold: status.threshold,
+                        receipts_root: status.expected_receipts_root.unwrap_or_default().0,
+                    });
+                }
                 debug!(
                     target: "n42::mobile",
                     block_number = receipt.block_number,
@@ -623,6 +735,34 @@ impl MobileVerificationBridge {
         }
 
         None
+    }
+
+    fn try_emit_attestation_progress_event(&self, event: AttestationProgressEvent) {
+        let Some(ref tx) = self.attestation_progress_tx else {
+            return;
+        };
+
+        let block_hash = event.block_hash;
+        let block_number = event.block_number;
+        match tx.try_send(event) {
+            Ok(()) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                warn!(
+                    target: "n42::mobile",
+                    block_number,
+                    %block_hash,
+                    "failed to deliver attestation progress event: channel closed"
+                );
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                warn!(
+                    target: "n42::mobile",
+                    block_number,
+                    %block_hash,
+                    "attestation progress event dropped (channel full)"
+                );
+            }
+        }
     }
 
     fn try_emit_reward_pubkeys(
@@ -832,8 +972,9 @@ mod tests {
     use super::*;
     use alloy_primitives::B256;
     use n42_consensus::ValidatorSet;
+    use n42_mobile::AggregatedAttestation;
     use n42_mobile::receipt::sign_receipt;
-    use n42_primitives::BlsSecretKey;
+    use n42_primitives::{BlsSecretKey, BlsSignature};
 
     /// The expected receipts root used in test receipts.
     const TEST_RR: B256 = B256::new([0xAA; 32]);
@@ -845,6 +986,16 @@ mod tests {
     fn make_receipt(block_hash: B256, block_number: u64, signer_seed: u8) -> VerificationReceipt {
         let key = test_key(signer_seed);
         sign_receipt(block_hash, block_number, TEST_RR, 1_000_000, &key)
+    }
+
+    fn make_keys(n: usize) -> Vec<BlsSecretKey> {
+        (0..n)
+            .map(|i| {
+                let mut seed = [0u8; 32];
+                seed[0..8].copy_from_slice(&(i as u64).to_le_bytes());
+                BlsSecretKey::key_gen(&seed).unwrap()
+            })
+            .collect()
     }
 
     fn make_consensus_state() -> Arc<SharedConsensusState> {
@@ -883,13 +1034,27 @@ mod tests {
 
     #[test]
     fn test_bridge_attestation_notification() {
+        use crate::attestation_store::AttestationStore;
+
         let (tx, rx) = make_hub_channel();
         let (attest_tx, mut attest_rx) = mpsc::channel(256);
-        let mut bridge = MobileVerificationBridge::new(rx, 1, 100).with_attestation_tx(attest_tx);
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(
+            AttestationStore::new(store_dir.path().join("attestation_store.json")).unwrap(),
+        ));
+        let key = test_key(0x13);
+        {
+            let mut s = store.lock().unwrap();
+            s.registry_mut().register(key.public_key().to_bytes());
+        }
+        let mut bridge = MobileVerificationBridge::new(rx, 1, 100)
+            .with_attestation_tx(attest_tx)
+            .with_attestation_store(store);
 
         let block_hash = B256::with_last_byte(0x03);
         bridge.register_dispatched_block(block_hash, 10, Some(TEST_RR));
-        bridge.process_receipt(&make_receipt(block_hash, 10, 0x13));
+        let receipt = sign_receipt(block_hash, 10, TEST_RR, 1_000_000, &key);
+        bridge.process_receipt(&receipt);
 
         let event = attest_rx
             .try_recv()
@@ -897,8 +1062,130 @@ mod tests {
         assert_eq!(event.block_hash, block_hash);
         assert_eq!(event.block_number, 10);
         assert_eq!(event.valid_count, 1);
+        assert_eq!(event.participant_count, 1);
+        assert_eq!(event.receipts_root, TEST_RR.0);
+        assert_eq!(event.packed_participants, vec![0b0000_0001]);
+        assert!(event.aggregate_signature.iter().any(|&byte| byte != 0));
 
         drop(tx);
+    }
+
+    #[test]
+    fn test_bridge_attestation_progress_stream() {
+        use crate::attestation_store::AttestationStore;
+
+        let (_hub_tx, hub_rx) = make_hub_channel();
+        let (attest_tx, mut attest_rx) = mpsc::channel(256);
+        let (progress_tx, mut progress_rx) = mpsc::channel(256);
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(
+            AttestationStore::new(store_dir.path().join("attestation_store.json")).unwrap(),
+        ));
+        let key0 = BlsSecretKey::key_gen(&[0x51; 32]).unwrap();
+        let key1 = BlsSecretKey::key_gen(&[0x52; 32]).unwrap();
+        {
+            let mut s = store.lock().unwrap();
+            s.registry_mut().register(key0.public_key().to_bytes());
+            s.registry_mut().register(key1.public_key().to_bytes());
+        }
+
+        let mut bridge = MobileVerificationBridge::new(hub_rx, 2, 100)
+            .with_attestation_tx(attest_tx)
+            .with_attestation_progress_tx(progress_tx)
+            .with_attestation_store(store);
+
+        let block_hash = B256::with_last_byte(0x22);
+        let block_number = 22;
+        bridge.register_dispatched_block(block_hash, block_number, Some(TEST_RR));
+
+        bridge.process_receipt(&make_receipt(block_hash, block_number, 0x51));
+        let progress = progress_rx
+            .try_recv()
+            .expect("attestation progress should be emitted before threshold");
+        assert_eq!(progress.block_hash, block_hash);
+        assert_eq!(progress.block_number, block_number);
+        assert_eq!(progress.valid_count, 1);
+        assert_eq!(progress.threshold, 2);
+        assert_eq!(progress.receipts_root, TEST_RR.0);
+        assert!(attest_rx.try_recv().is_err());
+
+        bridge.process_receipt(&make_receipt(block_hash, block_number, 0x52));
+        let final_progress = progress_rx
+            .try_recv()
+            .expect("attestation progress should be emitted at threshold");
+        assert_eq!(final_progress.valid_count, 2);
+        assert_eq!(final_progress.threshold, 2);
+
+        assert!(
+            attest_rx.try_recv().is_ok(),
+            "threshold event should still be emitted"
+        );
+
+        let _ = std::fs::remove_file(store_dir.path().join("attestation_store.json"));
+    }
+
+    #[test]
+    fn test_bridge_attestation_event_carries_21_participant_evidence() {
+        use crate::attestation_store::AttestationStore;
+
+        let (_hub_tx, hub_rx) = make_hub_channel();
+        let (attest_tx, mut attest_rx) = mpsc::channel(256);
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(
+            AttestationStore::new(store_dir.path().join("attestation_store.json")).unwrap(),
+        ));
+        let keys = make_keys(21);
+        {
+            let mut s = store.lock().unwrap();
+            for key in &keys {
+                s.registry_mut().register(key.public_key().to_bytes());
+            }
+        }
+
+        let mut bridge = MobileVerificationBridge::new(hub_rx, 21, 100)
+            .with_attestation_tx(attest_tx)
+            .with_attestation_store(store.clone());
+        let block_hash = B256::with_last_byte(0x21);
+        let block_number = 21;
+        bridge.register_dispatched_block(block_hash, block_number, Some(TEST_RR));
+
+        for key in &keys {
+            let receipt = sign_receipt(block_hash, block_number, TEST_RR, 1_000_000, key);
+            bridge.process_receipt(&receipt);
+        }
+
+        let event = attest_rx
+            .try_recv()
+            .expect("attestation event should be sent at 21 participants");
+        assert_eq!(event.block_hash, block_hash);
+        assert_eq!(event.block_number, block_number);
+        assert_eq!(event.receipts_root, TEST_RR.0);
+        assert_eq!(event.participant_count, 21);
+        assert_eq!(event.valid_count, 21);
+        assert_eq!(
+            event
+                .packed_participants
+                .iter()
+                .map(|byte| byte.count_ones())
+                .sum::<u32>(),
+            21
+        );
+        assert!(event.aggregate_signature.iter().any(|&byte| byte != 0));
+
+        let aggregate_signature = BlsSignature::from_bytes(&event.aggregate_signature).unwrap();
+        let aggregate = AggregatedAttestation {
+            block_hash: event.block_hash,
+            block_number: event.block_number,
+            receipts_root: B256::from(event.receipts_root),
+            aggregate_signature,
+            participant_bitfield: event.packed_participants,
+            participant_count: u32::from(event.participant_count),
+            created_at_ms: event.created_at_ms,
+        };
+        let s = store.lock().unwrap();
+        aggregate
+            .verify(s.registry())
+            .expect("event aggregate signature should verify");
     }
 
     #[test]
