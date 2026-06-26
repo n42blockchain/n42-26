@@ -527,6 +527,14 @@ impl ConsensusService {
         self.next_build_at = Some(Instant::now() + delay);
     }
 
+    fn arm_leader_build_timer_as_direct_wait(&mut self, slot_timestamp: Option<u64>) {
+        if self.pending_leader_build_mode_for_current_view().is_none() {
+            self.begin_leader_build_wait(LeaderBuildWaitMode::Direct, slot_timestamp);
+        } else if let Some(slot_timestamp) = slot_timestamp {
+            self.next_slot_timestamp = Some(slot_timestamp);
+        }
+    }
+
     async fn evaluate_leader_build_wait(&mut self, slot_timestamp: Option<u64>) {
         let Some(mode) = self.pending_leader_build_mode_for_current_view() else {
             return;
@@ -541,10 +549,34 @@ impl ConsensusService {
             self.next_slot_timestamp = Some(slot_timestamp);
         }
 
-        if !self.has_quorum_peers() {
+        let connected_validator_peers = self.connected_validator_peer_count();
+        let needed_quorum_peers = self.quorum_peers_needed();
+        let has_quorum_peers = self.has_quorum_peers();
+        debug_assert_eq!(
+            has_quorum_peers,
+            connected_validator_peers >= needed_quorum_peers
+        );
+        if !has_quorum_peers {
+            debug!(
+                target: "n42::cl::orchestrator",
+                view = self.engine.current_view(),
+                ?mode,
+                connected_validator_peers,
+                needed_quorum_peers,
+                "leader build waiting for validator peer quorum"
+            );
             self.schedule_leader_build_recheck(Self::leader_quorum_recheck_delay());
             return;
         }
+
+        info!(
+            target: "n42::cl::orchestrator",
+            view = self.engine.current_view(),
+            ?mode,
+            connected_validator_peers,
+            needed_quorum_peers,
+            "validator peer quorum reached for leader build"
+        );
 
         self.clear_leader_build_wait();
         match mode {
@@ -1416,6 +1448,7 @@ impl ConsensusService {
                             debug!(target: "n42::cl::orchestrator", view, "build timer fired but speculative build in progress, skipping");
                             continue;
                         }
+                        self.arm_leader_build_timer_as_direct_wait(None);
                         // Check if this is a startup recheck or a regular re-check:
                         // on initial view, we still gate strictly on quorum peers before
                         // attempting first proposal.
@@ -1436,6 +1469,7 @@ impl ConsensusService {
                         }
                     } else {
                         info!(target: "n42::cl::orchestrator", slot_timestamp = ?slot_ts, "slot boundary reached, triggering payload build");
+                        self.arm_leader_build_timer_as_direct_wait(slot_ts);
                     }
 
                     self.evaluate_leader_build_wait(slot_ts).await;
@@ -2645,5 +2679,39 @@ mod tests {
         orch.handle_network_event(NetworkEvent::PeerConnected(mock_peers[3].1))
             .await;
         assert!(orch.leader_build_waiting_view.is_none());
+    }
+
+    #[test]
+    fn test_leader_build_timer_rearms_direct_wait_after_scheduled_gate_clears() {
+        let (engine, output_rx) = make_test_engine_with_validator_count(7, 1);
+        let network = Arc::new(MockConsensusNetwork::default());
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let mut orch = ConsensusService::new(engine, network, net_event_rx, output_rx);
+
+        assert!(orch.leader_build_waiting_view.is_none());
+
+        orch.arm_leader_build_timer_as_direct_wait(Some(12345));
+
+        assert_eq!(
+            orch.leader_build_waiting_view,
+            Some((orch.engine.current_view(), LeaderBuildWaitMode::Direct))
+        );
+        assert_eq!(orch.next_slot_timestamp, Some(12345));
+    }
+
+    #[test]
+    fn test_leader_build_timer_preserves_existing_wait_mode() {
+        let (engine, output_rx) = make_test_engine_with_validator_count(7, 1);
+        let network = Arc::new(MockConsensusNetwork::default());
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let mut orch = ConsensusService::new(engine, network, net_event_rx, output_rx);
+
+        orch.begin_leader_build_wait(LeaderBuildWaitMode::Scheduled, None);
+        orch.arm_leader_build_timer_as_direct_wait(None);
+
+        assert_eq!(
+            orch.leader_build_waiting_view,
+            Some((orch.engine.current_view(), LeaderBuildWaitMode::Scheduled))
+        );
     }
 }

@@ -364,6 +364,8 @@ leader = int(sys.argv[3])
 label = sys.argv[4]
 needed = 0 if count <= 1 else (2 * ((count - 1) // 3) + 1) - 1
 leader_log = root / f"validator-{leader}.log"
+ansi_re = re.compile(r"\x1b\[[0-9;]*m")
+quorum_re = re.compile(r"connected_validator_peers\s*=\s*(\d+).*needed_quorum_peers\s*=\s*(\d+)")
 
 events = []
 connected = 0
@@ -372,10 +374,12 @@ first_commit = None
 first_timeout = None
 first_newview = None
 waiting = []
+reached = []
 
 patterns = {
     "connected": "consensus peer connected",
-    "waiting": "waiting for validator quorum",
+    "waiting": "leader build waiting for validator peer quorum",
+    "reached": "validator peer quorum reached for leader build",
     "timer": "leader build timer reached",
     "build": "triggering payload build",
     "commit": "block committed!",
@@ -385,23 +389,30 @@ patterns = {
 
 if leader_log.exists():
     for line_no, line in enumerate(leader_log.read_text(errors="replace").splitlines(), 1):
-        if patterns["connected"] in line:
+        clean = ansi_re.sub("", line)
+        quorum_match = quorum_re.search(clean)
+        exact_connected = int(quorum_match.group(1)) if quorum_match else connected
+        exact_needed = int(quorum_match.group(2)) if quorum_match else needed
+        if patterns["connected"] in clean:
             connected += 1
-            events.append({"line": line_no, "kind": "peer_connected", "connected": connected, "text": line[-260:]})
-        if patterns["waiting"] in line:
+            events.append({"line": line_no, "kind": "peer_connected", "connected": connected, "text": clean[-260:]})
+        if patterns["waiting"] in clean:
             waiting.append(line_no)
-            events.append({"line": line_no, "kind": "waiting", "connected": connected, "needed": needed, "text": line[-260:]})
-        if patterns["timer"] in line:
-            events.append({"line": line_no, "kind": "gate_recheck", "connected": connected, "needed": needed, "text": line[-260:]})
-        if patterns["build"] in line and first_build is None:
-            first_build = {"line": line_no, "connected": connected, "needed": needed, "text": line[-260:]}
+            events.append({"line": line_no, "kind": "waiting", "connected": exact_connected, "needed": exact_needed, "text": clean[-260:]})
+        if patterns["reached"] in clean:
+            reached.append({"line": line_no, "connected": exact_connected, "needed": exact_needed, "text": clean[-260:]})
+            events.append({"line": line_no, "kind": "quorum_reached", "connected": exact_connected, "needed": exact_needed, "text": clean[-260:]})
+        if patterns["timer"] in clean:
+            events.append({"line": line_no, "kind": "gate_recheck", "connected": exact_connected, "needed": exact_needed, "text": clean[-260:]})
+        if patterns["build"] in clean and first_build is None:
+            first_build = {"line": line_no, "connected": exact_connected, "needed": exact_needed, "text": clean[-260:]}
             events.append({"line": line_no, "kind": "first_build", **first_build})
-        if patterns["commit"] in line and first_commit is None:
-            first_commit = {"line": line_no, "connected": connected, "needed": needed, "text": line[-260:]}
-        if patterns["timeout"] in line and first_timeout is None:
-            first_timeout = {"line": line_no, "connected": connected, "needed": needed, "text": line[-260:]}
-        if patterns["newview"] in line and first_newview is None:
-            first_newview = {"line": line_no, "connected": connected, "needed": needed, "text": line[-260:]}
+        if patterns["commit"] in clean and first_commit is None:
+            first_commit = {"line": line_no, "connected": exact_connected, "needed": exact_needed, "text": clean[-260:]}
+        if patterns["timeout"] in clean and first_timeout is None:
+            first_timeout = {"line": line_no, "connected": exact_connected, "needed": exact_needed, "text": clean[-260:]}
+        if patterns["newview"] in clean and first_newview is None:
+            first_newview = {"line": line_no, "connected": exact_connected, "needed": exact_needed, "text": clean[-260:]}
 
 summary = {
     "label": label,
@@ -410,6 +421,7 @@ summary = {
     "needed_validator_peers": needed,
     "leader_log": str(leader_log),
     "waiting_lines": waiting,
+    "quorum_reached": reached,
     "first_build": first_build,
     "first_commit": first_commit,
     "first_timeout_broadcast_on_leader": first_timeout,
@@ -425,6 +437,7 @@ md = [
     f"- view-1 leader: validator-{leader}",
     f"- needed connected validator peers: {needed}",
     f"- waiting log lines: {waiting}",
+    f"- quorum reached events: {reached[:5]}",
     f"- first build: {first_build}",
     f"- first leader commit: {first_commit}",
     f"- first timeout broadcast on leader: {first_timeout}",
@@ -560,6 +573,9 @@ run_partition() {
     printf '{"height_before_partition":%s,"height_during_partition":%s,"height_after_restore":%s}\n' \
         "$before" "$during" "$restored" > "$dir/result.json"
     dump_evidence "$dir" 1 "$dir/evidence-block-1.json"
+    if [[ "$restored" =~ ^[0-9]+$ ]] && (( restored > 0 )); then
+        dump_evidence "$dir" "$restored" "$dir/evidence-block-restored.json"
+    fi
     analyze_scenario "$dir" 7 1 "$name"
     log "Scenario $name complete: before=$before during=$during restored=$restored"
     cleanup_all
