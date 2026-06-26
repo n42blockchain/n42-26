@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "N42 Jellyfish Merkle Tree with Blake3 hashing, 16-shard parallelism, and Prometheus metrics"
+description = "N42 state-tree compatibility crate with QMDB/twig backend, JMT reserve code, and Prometheus metrics"
 
 [dependencies]
 n42-execution.workspace = true

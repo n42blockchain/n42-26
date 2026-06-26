@@ -50,7 +50,7 @@ A high-performance blockchain system combining **HotStuff-2** BFT consensus with
 - **HotStuff-2 Consensus**: 2-round optimistic commit with 3-round timeout recovery
 - **BLS12-381 Signatures**: Aggregated signatures for compact quorum certificates
 - **reth v2.2.0 Integration**: Tracks `n42blockchain/reth` branch `n42-v2-upgrade`, based on upstream `v2.2.0` with N42-specific payload/cache patches applied on top
-- **Jellyfish Merkle Tree (JMT)**: Blake3 hashing, 16-shard parallel updates, Merkle proofs via RPC
+- **QMDB-style twig tree**: Blake3 hashing, 16-shard parallel updates, Merkle proofs via RPC
 - **Compact Block Propagation**: Leader caches execution output, followers skip EVM re-execution (cache hit ~3ms)
 - **Optimistic Voting**: Followers vote immediately after proposal validation, before block import
 - **TX Forward to Leader**: O(n) message complexity replacing O(n²) gossip for transactions
@@ -82,7 +82,8 @@ n42-26/
 │   ├── n42-consensus/             # HotStuff-2 state machine + reth adapter
 │   ├── n42-execution/             # EVM config wrapper, witness & state diff
 │   ├── n42-parallel-evm/          # Optimistic parallel EVM execution
-│   ├── n42-jmt/                   # Jellyfish Merkle Tree (Blake3, 16-shard parallel)
+│   ├── n42-jmt/                   # Legacy compatibility crate (JMT reserve + twig persistence)
+│   ├── n42-twig-core/             # QMDB-style twig engine (Blake3, all-DRAM)
 │   ├── n42-zkproof/               # ZK sidecar proof system (SP1 + MockProver)
 │   ├── n42-zkproof-guest/         # SP1 zkVM guest program (RISC-V ELF)
 │   ├── n42-network/               # libp2p GossipSub + QUIC StarHub
@@ -319,7 +320,7 @@ cargo test --workspace
 cargo test -p n42-consensus
 cargo test -p n42-primitives
 cargo test -p n42-mobile
-cargo test -p n42-jmt
+cargo test -p n42-twig-core
 cargo test -p n42-zkproof
 cargo test -p n42-node
 ```
@@ -361,7 +362,8 @@ bin/n42-node                    bin/n42-stress           bin/n42-mobile-sim
       │                   └── n42-chainspec ──── n42-primitives
       ├── n42-execution ──┬── reth-evm, reth-revm
       │                   └── n42-chainspec
-      ├── n42-jmt ────────── jmt, blake3, rayon (16-shard parallel)
+      ├── n42-jmt ────────── legacy reserve / persistence wrappers
+      ├── n42-twig-core ──── twig, blake3 (QMDB-style binary tree)
       ├── n42-zkproof ──── alloy-primitives, serde, tokio, sp1-sdk (optional)
       │     └── n42-zkproof-guest (SP1 RISC-V, built separately)
       ├── n42-network ────┬── n42-primitives
@@ -378,7 +380,7 @@ n42-mobile-ffi (Android/iOS SDK)
 
 Key design: **n42-mobile** has zero reth dependencies — only `alloy-primitives`, `ed25519-dalek`, `lru`, `serde`.
 **n42-mobile-ffi** compiles as `staticlib` + `cdylib`, exposing a C ABI and JNI bridge for Android.
-**n42-jmt** provides Jellyfish Merkle Tree with Blake3 hashing and 16-shard parallelism for state proofs.
+**n42-twig-core** provides the QMDB-style twig tree with Blake3 hashing and 16-shard parallelism for state proofs.
 **n42-zkproof** provides backend-agnostic ZK proof generation (`trait ZkProver`) with `MockProver` for testing and `Sp1Prover` for real SP1 zkVM proofs.
 **n42-zkproof-guest** is the SP1 RISC-V guest program, built separately with `cargo prove build` (excluded from workspace).
 

@@ -37,9 +37,9 @@ struct JmtProofResponse {
 }
 
 #[test]
-#[ignore = "requires a running local n42 node with N42_JMT=1 and HTTP RPC enabled"]
-fn sbmt_rpc_proof_roundtrip() -> Result<(), Box<dyn Error>> {
-    let rpc_url = std::env::var("N42_SBMT_RPC_URL").unwrap_or_else(|_| DEFAULT_RPC_URL.to_string());
+#[ignore = "requires a running local n42 node with N42_TWIG=1 and HTTP RPC enabled"]
+fn twig_rpc_proof_roundtrip() -> Result<(), Box<dyn Error>> {
+    let rpc_url = std::env::var("N42_TWIG_RPC_URL").unwrap_or_else(|_| DEFAULT_RPC_URL.to_string());
 
     let first_version = jmt_version(&rpc_url)?;
     let first_root = jmt_root(&rpc_url)?;
@@ -52,7 +52,7 @@ fn sbmt_rpc_proof_roundtrip() -> Result<(), Box<dyn Error>> {
     let later_root = wait_for_new_jmt_version(&rpc_url, first_root.version)?;
     assert!(
         later_root.version > first_root.version,
-        "SBMT version should advance as local blocks commit"
+        "Twig version should advance as local blocks commit"
     );
 
     let inclusion = jmt_proof(&rpc_url, GENESIS_ACCOUNT)?;

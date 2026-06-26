@@ -164,7 +164,8 @@ impl NodeProcess {
             .env("N42_VALIDATOR_COUNT", config.validator_count.to_string())
             .env("N42_CONSENSUS_PORT", consensus_port.to_string())
             .env("N42_STARHUB_PORT", starhub_port.to_string())
-            .env("N42_DATA_DIR", data_dir.path());
+            .env("N42_DATA_DIR", data_dir.path())
+            .env("N42_TWIG", "1");
 
         if config.block_interval_ms > 0 {
             cmd.env(

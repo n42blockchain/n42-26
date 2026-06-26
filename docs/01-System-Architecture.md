@@ -8,7 +8,7 @@ N42 is a high-performance blockchain node that combines:
 - reth-backed EVM execution
 - a libp2p-based validator network
 - a QUIC-based mobile verifier side channel
-- JMT state commitment and proof serving
+- Twig/QMDB state commitment and proof serving
 - optional asynchronous ZK proof generation
 
 The system is intentionally split into an on-critical-path validator plane and an off-critical-path verification plane.
@@ -26,7 +26,7 @@ flowchart LR
     BOOT --> HUB["ShardedStarHub"]
     BOOT --> MBR["MobileVerificationBridge"]
     BOOT --> RPC["JSON-RPC server"]
-    BOOT -.->|"❌ NOT WIRED"| JMT["ShardedJmt"]
+    BOOT -.->|"default backend"| TWIG["PersistentTwig"]
     BOOT -->|"N42_ZK_PROOF=1"| ZK["ProofScheduler"]
     BOOT --> REWARD["MobileRewardManager"]
     BOOT --> STAKE["StakingManager"]
@@ -35,7 +35,7 @@ flowchart LR
     ORCH --> CONS
     ORCH --> NET
     ORCH --> RETH
-    ORCH -.->|"never initialized"| JMT
+    ORCH -.->|"default backend"| TWIG
     ORCH --> ZK
     ORCH --> MBR
     ORCH --> STAKE
@@ -116,7 +116,7 @@ Primary code:
 - [`crates/n42-jmt/src/`](crates/n42-jmt/src)
 - [`crates/n42-zkproof/src/`](crates/n42-zkproof/src)
 
-> **✅ 状态树已接入生产（SBMT）**：自 devlog-59 起，并行状态树从 `ShardedJmt` 切换为 `ShardedSbmt`（自研二叉 SBMT，`N42_JMT=1` 启用），在 `bin/n42-node/src/main.rs`（RPC + orchestrator）通过 `with_jmt()` builder 注入。`apply_diff` 在 commit 后通过 spawn_blocking 异步更新，不在共识关键路径（state root 由 reth MPT 算并入 header，SBMT 仅服务手机 proof）。`n42_jmtProof` 现返回 bincode 编码的 `ShardedBmtProof`，手机用 `n42-bmt-core::verify`（纯 blake3）验证。`n42_jmtRoot` / `n42_jmtProof` / `n42_jmtVersion` RPC 可用。
+> **✅ 状态树默认切到 Twig/QMDB**：默认并行状态树现为 `PersistentTwig`（QMDB-style bin tree），在 `bin/n42-node/src/main.rs`（RPC + orchestrator）通过 `with_twig()` builder 注入；`N42_JMT=1` 仅保留为兼容备用路径。`apply_diff` 在 commit 后通过 spawn_blocking 异步更新，不在共识关键路径（state root 由 reth MPT 算并入 header，twig 仅服务手机 proof）。`n42_jmtProof` 仍返回 bincode 编码的 `ShardedBmtProof`，手机用 `n42-bmt-core::verify`（纯 blake3）验证。`n42_jmtRoot` / `n42_jmtProof` / `n42_jmtVersion` RPC 仍可用。
 
 ### 6. Staking plane
 
@@ -145,7 +145,7 @@ flowchart TD
         F["MobileVerificationBridge"]
         G["RPC server"]
         H["reth engine API"]
-        I["JMT ❌ stub"]
+        I["Twig reserve / compatibility"]
         J["ZK scheduler"]
         K["Reward manager"]
         L["StakingManager"]
@@ -208,7 +208,7 @@ Each module's end-to-end integration status: constructed in `main.rs` → events
 | Crash Recovery | ✅ Wired | always | `main.rs:440` → `ConsensusEngine::with_recovered_state` |
 | ZK ProofScheduler | ✅ Wired | `N42_ZK_PROOF=1` | `main.rs:535` → `consensus_loop:413` → `on_block_committed` |
 | Validator Reconfig RPC | ✅ Wired | always | `main.rs:515` → admin channel → orchestrator select! |
-| JMT (ShardedJmt) | ✅ Wired | always | `main.rs:702, 1231` → `with_jmt()` → `consensus_loop.rs` apply_diff (spawn_blocking) |
+| Twig/QMDB (PersistentTwig) | ✅ Wired | default (`N42_JMT=1` keeps reserve path) | `main.rs:764, 1508` → `with_twig()` → `consensus_loop.rs` apply_diff (spawn_blocking) |
 | Parallel EVM | ⚙️ Opt-in | `N42_PARALLEL_EVM=1` | `executor.rs:130` `parallel_evm_enabled()` → `execute_block_parallel` (off by default) |
 
 ### Open issues

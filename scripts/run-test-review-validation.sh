@@ -24,7 +24,7 @@ export CARGO_INCREMENTAL=0
 
 COMMON_CRATES=(
   "n42-chainspec"
-  "n42-jmt"
+  "n42-twig-core"
   "n42-mobile-ffi"
 )
 
@@ -71,7 +71,7 @@ run_coverage() {
 
     local -a objects=()
     local stem
-    for stem in n42_chainspec n42_jmt n42_mobile_ffi n42_zkproof_guest e2e_test; do
+    for stem in n42_chainspec n42_twig_core n42_mobile_ffi n42_zkproof_guest e2e_test; do
         while IFS= read -r file; do
             objects+=("$file")
         done < <(find "$CARGO_TARGET_DIR/debug/deps" -maxdepth 1 -type f -perm -111 -name "${stem}-*" 2>/dev/null | sort)
