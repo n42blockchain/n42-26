@@ -8,7 +8,7 @@ use std::{
 };
 
 use alloy_primitives::B256;
-use n42_mobile::state_proof::{ShardedBmtProof, verify_state_proof};
+use n42_mobile::state_proof::{ShardedTwigProof, verify_twig_state_proof};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -23,15 +23,15 @@ const EMPTY_CODE_HASH: B256 = B256::new([
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct JmtRootResponse {
+struct TwigRootResponse {
     version: u64,
     root: String,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct JmtProofResponse {
-    value: Option<String>,
+struct TwigProofResponse {
+    value: String,
     proof_hex: String,
     root: String,
 }
@@ -41,25 +41,16 @@ struct JmtProofResponse {
 fn twig_rpc_proof_roundtrip() -> Result<(), Box<dyn Error>> {
     let rpc_url = std::env::var("N42_TWIG_RPC_URL").unwrap_or_else(|_| DEFAULT_RPC_URL.to_string());
 
-    let first_version = jmt_version(&rpc_url)?;
-    let first_root = jmt_root(&rpc_url)?;
+    let first_root = twig_root(&rpc_url)?;
     let _first_root_hash = B256::from_str(&first_root.root)?;
-    assert!(
-        first_root.version >= first_version,
-        "n42_jmtRoot.version should not lag n42_jmtVersion"
-    );
 
-    let later_root = wait_for_new_jmt_version(&rpc_url, first_root.version)?;
+    let later_root = wait_for_new_twig_version(&rpc_url, first_root.version)?;
     assert!(
         later_root.version > first_root.version,
         "Twig version should advance as local blocks commit"
     );
 
-    let inclusion = jmt_proof(&rpc_url, GENESIS_ACCOUNT)?;
-    assert!(
-        inclusion.value.is_some(),
-        "genesis account proof should be inclusion"
-    );
+    let inclusion = twig_proof(&rpc_url, GENESIS_ACCOUNT)?;
     assert_eq!(
         inclusion_code_hash(&inclusion)?,
         EMPTY_CODE_HASH,
@@ -67,21 +58,16 @@ fn twig_rpc_proof_roundtrip() -> Result<(), Box<dyn Error>> {
     );
     verify_rpc_proof("inclusion", &inclusion)?;
 
-    let exclusion = jmt_proof(&rpc_url, MISSING_ACCOUNT)?;
     assert!(
-        exclusion.value.is_none(),
-        "missing account proof should be exclusion"
+        twig_proof(&rpc_url, MISSING_ACCOUNT).is_err(),
+        "missing account should not have a live Twig inclusion proof"
     );
-    verify_rpc_proof("exclusion", &exclusion)?;
 
     Ok(())
 }
 
-fn inclusion_code_hash(response: &JmtProofResponse) -> Result<B256, Box<dyn Error>> {
-    let value_hex = response
-        .value
-        .as_deref()
-        .ok_or("inclusion proof response missing value")?;
+fn inclusion_code_hash(response: &TwigProofResponse) -> Result<B256, Box<dyn Error>> {
+    let value_hex = response.value.as_str();
     let value = hex::decode(value_hex.trim_start_matches("0x"))?;
     if value.len() != ACCOUNT_VALUE_LEN {
         return Err(format!("unexpected account leaf value length: {}", value.len()).into());
@@ -89,42 +75,43 @@ fn inclusion_code_hash(response: &JmtProofResponse) -> Result<B256, Box<dyn Erro
     Ok(B256::from_slice(&value[40..72]))
 }
 
-fn wait_for_new_jmt_version(
+fn wait_for_new_twig_version(
     rpc_url: &str,
     previous_version: u64,
-) -> Result<JmtRootResponse, Box<dyn Error>> {
-    let mut last = jmt_root(rpc_url)?;
+) -> Result<TwigRootResponse, Box<dyn Error>> {
+    let mut last = twig_root(rpc_url)?;
     for _ in 0..10 {
         if last.version > previous_version {
             return Ok(last);
         }
         thread::sleep(Duration::from_secs(2));
-        last = jmt_root(rpc_url)?;
+        last = twig_root(rpc_url)?;
     }
     Ok(last)
 }
 
-fn verify_rpc_proof(label: &str, response: &JmtProofResponse) -> Result<(), Box<dyn Error>> {
+fn verify_rpc_proof(label: &str, response: &TwigProofResponse) -> Result<(), Box<dyn Error>> {
     let root = B256::from_str(&response.root)?;
     let proof_bytes = hex::decode(response.proof_hex.trim_start_matches("0x"))?;
-    let proof: ShardedBmtProof = bincode::deserialize(&proof_bytes)?;
+    let proof: ShardedTwigProof = bincode::deserialize(&proof_bytes)?;
 
-    verify_state_proof(&proof, root)?;
+    verify_twig_state_proof(&proof, root)?;
 
     let mut bad_shard_root = proof.clone();
     bad_shard_root.shard_root[0] ^= 0xFF;
     assert!(
-        verify_state_proof(&bad_shard_root, root).is_err(),
+        verify_twig_state_proof(&bad_shard_root, root).is_err(),
         "{label} proof with tampered shard_root must fail"
     );
 
     let mut bad_value = proof.clone();
-    match bad_value.value.as_mut() {
-        Some(value) if !value.is_empty() => value[0] ^= 0xFF,
-        _ => bad_value.value = Some(vec![0x42]),
+    if let Some(byte) = bad_value.inner.value.first_mut() {
+        *byte ^= 0xFF;
+    } else {
+        bad_value.inner.value = vec![0x42];
     }
     assert!(
-        verify_state_proof(&bad_value, root).is_err(),
+        verify_twig_state_proof(&bad_value, root).is_err(),
         "{label} proof with tampered value must fail"
     );
 
@@ -135,7 +122,7 @@ fn verify_rpc_proof(label: &str, response: &JmtProofResponse) -> Result<(), Box<
         let mut bad_path = proof.clone();
         bad_path.shard_path[0] = first_path_hash;
         assert!(
-            verify_state_proof(&bad_path, root).is_err(),
+            verify_twig_state_proof(&bad_path, root).is_err(),
             "{label} proof with tampered shard_path must fail"
         );
     }
@@ -149,20 +136,13 @@ fn verify_rpc_proof(label: &str, response: &JmtProofResponse) -> Result<(), Box<
     Ok(())
 }
 
-fn jmt_version(rpc_url: &str) -> Result<u64, Box<dyn Error>> {
-    let result = rpc_call(rpc_url, "n42_jmtVersion", json!([]))?;
-    result
-        .as_u64()
-        .ok_or_else(|| format!("invalid n42_jmtVersion result: {result:?}").into())
-}
-
-fn jmt_root(rpc_url: &str) -> Result<JmtRootResponse, Box<dyn Error>> {
-    let result = rpc_call(rpc_url, "n42_jmtRoot", json!([]))?;
+fn twig_root(rpc_url: &str) -> Result<TwigRootResponse, Box<dyn Error>> {
+    let result = rpc_call(rpc_url, "n42_twigRoot", json!([]))?;
     Ok(serde_json::from_value(result)?)
 }
 
-fn jmt_proof(rpc_url: &str, address: &str) -> Result<JmtProofResponse, Box<dyn Error>> {
-    let result = rpc_call(rpc_url, "n42_jmtProof", json!([address, null]))?;
+fn twig_proof(rpc_url: &str, address: &str) -> Result<TwigProofResponse, Box<dyn Error>> {
+    let result = rpc_call(rpc_url, "n42_twigProof", json!([address, null]))?;
     Ok(serde_json::from_value(result)?)
 }
 

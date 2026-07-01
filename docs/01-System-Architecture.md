@@ -66,7 +66,7 @@ Purpose:
 - build payloads through reth integration
 - import committed blocks
 - optionally generate execution witness and compact execution output
-- derive state diffs for JMT and mobile verification
+- derive state diffs for the Twig/QMDB state-proof sidecar and mobile verification
 
 Primary code:
 
@@ -107,7 +107,7 @@ Primary code:
 
 Purpose:
 
-- maintain JMT root and proofs
+- maintain Twig/QMDB root and proofs, with JMT/SBMT retained as a reserve path
 - generate and store asynchronous ZK proofs
 - expose proof queries via RPC
 
@@ -116,7 +116,7 @@ Primary code:
 - [`crates/n42-jmt/src/`](crates/n42-jmt/src)
 - [`crates/n42-zkproof/src/`](crates/n42-zkproof/src)
 
-> **✅ 状态树默认切到 Twig/QMDB**：默认并行状态树现为 `PersistentTwig`（QMDB-style bin tree），在 `bin/n42-node/src/main.rs`（RPC + orchestrator）通过 `with_twig()` builder 注入；`N42_JMT=1` 仅保留为兼容备用路径。`apply_diff` 在 commit 后通过 spawn_blocking 异步更新，不在共识关键路径（state root 由 reth MPT 算并入 header，twig 仅服务手机 proof）。`n42_jmtProof` 仍返回 bincode 编码的 `ShardedBmtProof`，手机用 `n42-bmt-core::verify`（纯 blake3）验证。`n42_jmtRoot` / `n42_jmtProof` / `n42_jmtVersion` RPC 仍可用。
+> **✅ 状态树默认切到 Twig/QMDB**：默认并行状态树现为 `PersistentTwig`（QMDB-style bin tree），在 `bin/n42-node/src/main.rs`（RPC + orchestrator）通过 `with_twig()` builder 注入；`N42_JMT=1` 仅保留为兼容备用路径。`apply_diff` 在 commit 后通过 spawn_blocking 异步更新，不在共识关键路径（state root 由 reth MPT 算并入 header，twig 仅服务手机 proof）。默认路径使用 `n42_twigRoot` / `n42_twigProof` RPC，proof 为 bincode 编码的 `ShardedTwigProof`，手机用 `n42-mobile::state_proof::verify_twig_*` 验证。`n42_jmtRoot` / `n42_jmtProof` / `n42_jmtVersion` RPC 仅随 `N42_JMT=1` reserve path 启用。
 
 ### 6. Staking plane
 
@@ -187,7 +187,7 @@ flowchart TD
 - mobile packet dispatch
 - mobile receipt aggregation
 - mobile rewards
-- JMT background updates
+- Twig/QMDB background updates
 - ZK proof generation
 - many observability and persistence tasks
 
@@ -226,7 +226,7 @@ Acts as the main cross-subsystem read/write bridge:
 - attestation state
 - authorized mobile verifiers
 - equivocation log
-- JMT root metadata (⚠️ never populated — JMT not wired)
+- Twig/QMDB root metadata (JMT/SBMT metadata is populated only on the reserve path)
 - ZK latest-proof metadata
 - committed-block broadcast channel
 - admin command channel (validator reconfig)
@@ -263,6 +263,6 @@ Persistent recovery payload for:
 - some state is shared by side effects across async tasks, which increases coupling risk
 - security-sensitive mobile authorization spans `star_hub`, `mobile_bridge`, `consensus_state`, and `rpc`
 - release readiness depends heavily on cross-module invariants rather than a single enforcement layer
-- JMT crate is fully implemented but not wired into production — the "proof and state proof plane" is half-dark
+- state-proof naming is still partly historical (`n42-jmt` crate and `n42_jmt*` reserve RPCs), even though the default production path is Twig/QMDB
 - `n42-parallel-evm` crate is orphaned dead code
 - admin RPC endpoints (`proposeAddValidator`/`proposeRemoveValidator`) lack authentication
