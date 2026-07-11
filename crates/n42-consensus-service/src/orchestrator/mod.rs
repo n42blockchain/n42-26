@@ -284,7 +284,16 @@ pub struct ConsensusService {
     /// (`RethExecutionLayer`) wraps the reth engine + payload-builder handles.
     el: Option<Arc<dyn ExecutionLayer>>,
     consensus_state: Option<Arc<SharedConsensusState>>,
+    /// Most recent locally execution-validated committed head. This is deliberately
+    /// distinct from `committed_block_count`: HotStuff agreement may advance before
+    /// reth has accepted the corresponding payload.
     head_block_hash: B256,
+    /// Highest committed/sync view whose block reth confirmed as `Valid`/`Accepted`.
+    /// Guards async finalize/import completions from regressing the executed head.
+    execution_validated_head_view: u64,
+    /// Bounded record of speculative eager imports that reth already accepted.
+    /// A matching commit may promote the block without waiting for a second EL result.
+    eager_execution_validated: VecDeque<B256>,
     last_commit_qc: Option<QuorumCertificate>,
     /// Cached `keccak256(commit_qc.aggregate_signature)` — avoids re-hashing on every payload build.
     prev_randao_cache: B256,
@@ -819,6 +828,8 @@ impl ConsensusService {
             el: None,
             consensus_state: None,
             head_block_hash: B256::ZERO,
+            execution_validated_head_view: 0,
+            eager_execution_validated: VecDeque::new(),
             last_commit_qc: None,
             prev_randao_cache: B256::ZERO,
             block_ready_tx,
@@ -1019,6 +1030,8 @@ impl ConsensusService {
             el: Some(el),
             consensus_state: Some(consensus_state),
             head_block_hash,
+            execution_validated_head_view: 0,
+            eager_execution_validated: VecDeque::new(),
             last_commit_qc: None,
             prev_randao_cache: B256::ZERO,
             block_ready_tx,
@@ -1934,15 +1947,21 @@ impl ConsensusService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_primitives::{Address, B256};
+    use alloy_primitives::{Address, B256, Bloom, Bytes, U256};
+    use alloy_rpc_types_engine::{
+        ExecutionData, ExecutionPayload, ExecutionPayloadSidecar, ExecutionPayloadV1,
+        ForkchoiceState, ForkchoiceUpdated, PayloadAttributes, PayloadId, PayloadStatus,
+        PayloadStatusEnum,
+    };
     use libp2p::identity::Keypair;
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
     use n42_chainspec::ValidatorInfo;
     use n42_consensus::{ConsensusEngine, ValidatorSet};
     use n42_network::{NetworkCommand, NetworkHandle};
     use n42_primitives::consensus::ValidatorChange;
     use n42_primitives::{BlsSecretKey, ConsensusMessage, QuorumCertificate, Vote};
     use std::collections::HashMap;
-    use std::sync::{Arc, RwLock};
+    use std::sync::{Arc, Mutex, RwLock};
     use std::time::Duration;
 
     #[derive(Clone, Default)]
@@ -1957,6 +1976,103 @@ mod tests {
                 peers: Arc::new(RwLock::new(peer_map)),
             }
         }
+    }
+
+    #[derive(Clone)]
+    struct MockExecutionLayer {
+        new_payload_status: PayloadStatusEnum,
+        fcu_status: PayloadStatusEnum,
+        build_parents: Arc<Mutex<Vec<B256>>>,
+    }
+
+    impl MockExecutionLayer {
+        fn new(new_payload_status: PayloadStatusEnum, fcu_status: PayloadStatusEnum) -> Self {
+            Self {
+                new_payload_status,
+                fcu_status,
+                build_parents: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn build_parents(&self) -> Vec<B256> {
+            self.build_parents
+                .lock()
+                .expect("mock execution-layer lock")
+                .clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ExecutionLayer for MockExecutionLayer {
+        async fn new_payload(
+            &self,
+            _payload: ExecutionData,
+        ) -> Result<PayloadStatus, crate::el::ElError> {
+            Ok(PayloadStatus::from_status(self.new_payload_status.clone()))
+        }
+
+        async fn fork_choice_updated(
+            &self,
+            _state: ForkchoiceState,
+        ) -> Result<ForkchoiceUpdated, crate::el::ElError> {
+            Ok(ForkchoiceUpdated::from_status(self.fcu_status.clone()))
+        }
+
+        async fn fork_choice_updated_with_attrs(
+            &self,
+            state: ForkchoiceState,
+            _attrs: PayloadAttributes,
+        ) -> Result<ForkchoiceUpdated, crate::el::ElError> {
+            self.build_parents
+                .lock()
+                .expect("mock execution-layer lock")
+                .push(state.head_block_hash);
+            Ok(ForkchoiceUpdated::from_status(PayloadStatusEnum::Valid))
+        }
+
+        async fn resolve_payload(
+            &self,
+            _id: PayloadId,
+            _kind: crate::el::ResolveKind,
+        ) -> Option<Result<crate::el::BuiltBlock, crate::el::ElError>> {
+            None
+        }
+    }
+
+    fn test_execution_data(parent_hash: B256, block_hash: B256) -> ExecutionData {
+        ExecutionData::new(
+            ExecutionPayload::V1(ExecutionPayloadV1 {
+                parent_hash,
+                fee_recipient: Address::ZERO,
+                state_root: B256::ZERO,
+                receipts_root: B256::ZERO,
+                logs_bloom: Bloom::ZERO,
+                prev_randao: B256::ZERO,
+                block_number: 1,
+                gas_limit: 30_000_000,
+                gas_used: 0,
+                timestamp: 1,
+                extra_data: Bytes::new(),
+                base_fee_per_gas: U256::from(1),
+                block_hash,
+                transactions: Vec::new(),
+            }),
+            ExecutionPayloadSidecar::none(),
+        )
+    }
+
+    fn test_block_data(parent_hash: B256, block_hash: B256, view: u64) -> Vec<u8> {
+        let payload_json = serde_json::to_vec(&test_execution_data(parent_hash, block_hash))
+            .expect("serialize test execution data");
+        bincode::serialize(&BlockDataBroadcast {
+            block_hash,
+            view,
+            payload_json,
+            timestamp: 1,
+            execution_output: None,
+            leader_ready_unix_ms: 0,
+        })
+        .expect("serialize test block broadcast")
     }
 
     #[async_trait::async_trait]
@@ -2208,7 +2324,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_handle_engine_output_block_committed() {
+    async fn test_commit_without_execution_confirmation_does_not_advance_head() {
         let (engine, output_rx) = make_test_engine();
         let (network, _cmd_rx, _prx) = make_test_network();
         let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
@@ -2225,9 +2341,184 @@ mod tests {
 
         assert_eq!(
             orch.head_block_hash,
-            B256::repeat_byte(0xDD),
-            "head should be updated after commit"
+            B256::ZERO,
+            "agreement alone must not advance the execution head"
         );
+        assert_eq!(orch.committed_block_count, 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn committed_invalid_payload_preserves_validated_head_and_build_parent() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _recorder_guard = metrics::set_default_local_recorder(&recorder);
+
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let previous_head = B256::repeat_byte(0x11);
+        let bad_hash = B256::repeat_byte(0xDD);
+        let view = 1;
+        let mock_el = Arc::new(MockExecutionLayer::new(
+            PayloadStatusEnum::Invalid {
+                validation_error: "stale nonce".to_string(),
+            },
+            PayloadStatusEnum::Syncing,
+        ));
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
+        orch.el = Some(mock_el.clone());
+        orch.head_block_hash = previous_head;
+        orch.async_finalize_fcu = false;
+        orch.pending_block_data
+            .insert(bad_hash, test_block_data(previous_head, bad_hash, view));
+
+        orch.handle_engine_output(EngineOutput::BlockCommitted {
+            view,
+            block_hash: bad_hash,
+            commit_qc: QuorumCertificate::genesis(),
+            validator_changes: None,
+        })
+        .await;
+
+        assert_eq!(orch.committed_block_count, 1, "QC agreement still advances");
+        assert_eq!(orch.head_block_hash, previous_head);
+
+        let (hash, imported_view, success, block_ts) =
+            tokio::time::timeout(Duration::from_secs(2), orch.import_done_rx.recv())
+                .await
+                .expect("background import should finish")
+                .expect("background import channel should remain open");
+        assert_eq!((hash, imported_view), (bad_hash, view));
+        assert!(!success, "mock new_payload Invalid must reject the block");
+        orch.handle_import_done(hash, imported_view, success, block_ts)
+            .await;
+
+        assert_eq!(
+            orch.head_block_hash, previous_head,
+            "committed invalid block must not pin the local execution head"
+        );
+        let metric_value =
+            snapshotter
+                .snapshot()
+                .into_vec()
+                .into_iter()
+                .find_map(|(key, _, _, value)| {
+                    (key.key().name() == "n42_committed_block_unexecutable_total").then_some(value)
+                });
+        assert_eq!(metric_value, Some(DebugValue::Counter(1)));
+
+        orch.do_trigger_payload_build(None).await;
+        assert_eq!(mock_el.build_parents(), vec![previous_head]);
+        assert!(
+            !mock_el.build_parents().contains(&bad_hash),
+            "no payload build may use the unexecutable committed hash as parent"
+        );
+    }
+
+    #[tokio::test]
+    async fn committed_valid_fcu_advances_execution_head() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let previous_head = B256::repeat_byte(0x22);
+        let valid_hash = B256::repeat_byte(0xEE);
+        let mock_el = Arc::new(MockExecutionLayer::new(
+            PayloadStatusEnum::Valid,
+            PayloadStatusEnum::Valid,
+        ));
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
+        orch.el = Some(mock_el);
+        orch.head_block_hash = previous_head;
+        orch.async_finalize_fcu = false;
+
+        orch.handle_engine_output(EngineOutput::BlockCommitted {
+            view: 1,
+            block_hash: valid_hash,
+            commit_qc: QuorumCertificate::genesis(),
+            validator_changes: None,
+        })
+        .await;
+
+        assert_eq!(orch.committed_block_count, 1);
+        assert_eq!(orch.head_block_hash, valid_hash);
+        assert_eq!(orch.execution_validated_head_view, 1);
+    }
+
+    #[tokio::test]
+    async fn eager_valid_before_commit_advances_head_only_after_commit() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let previous_head = B256::repeat_byte(0x33);
+        let eager_hash = B256::repeat_byte(0xEF);
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
+        orch.head_block_hash = previous_head;
+
+        orch.handle_eager_import_done(eager_hash, 1).await;
+        assert_eq!(
+            orch.head_block_hash, previous_head,
+            "speculative eager validity must not move head before commit"
+        );
+
+        orch.handle_engine_output(EngineOutput::BlockCommitted {
+            view: 1,
+            block_hash: eager_hash,
+            commit_qc: QuorumCertificate::genesis(),
+            validator_changes: None,
+        })
+        .await;
+
+        assert_eq!(orch.head_block_hash, eager_hash);
+        assert_eq!(orch.execution_validated_head_view, 1);
+        assert!(orch.eager_execution_validated.is_empty());
+    }
+
+    #[tokio::test]
+    async fn queued_eager_validity_drained_during_finalize_advances_head() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let previous_head = B256::repeat_byte(0x34);
+        let eager_hash = B256::repeat_byte(0xF0);
+        let mock_el = Arc::new(MockExecutionLayer::new(
+            PayloadStatusEnum::Valid,
+            PayloadStatusEnum::Syncing,
+        ));
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
+        orch.el = Some(mock_el);
+        orch.head_block_hash = previous_head;
+        orch.async_finalize_fcu = false;
+        orch.eager_import_done_tx
+            .send((eager_hash, 1))
+            .await
+            .expect("queue eager completion");
+
+        orch.handle_engine_output(EngineOutput::BlockCommitted {
+            view: 1,
+            block_hash: eager_hash,
+            commit_qc: QuorumCertificate::genesis(),
+            validator_changes: None,
+        })
+        .await;
+
+        assert_eq!(orch.head_block_hash, eager_hash);
+        assert_eq!(orch.execution_validated_head_view, 1);
+        assert!(orch.eager_execution_validated.is_empty());
+    }
+
+    #[test]
+    fn stale_execution_completion_cannot_regress_head() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
+        let newer_hash = B256::repeat_byte(0x44);
+
+        orch.advance_execution_validated_head(2, newer_hash, "test newer completion");
+        orch.advance_execution_validated_head(1, B256::repeat_byte(0x45), "test stale completion");
+
+        assert_eq!(orch.head_block_hash, newer_hash);
+        assert_eq!(orch.execution_validated_head_view, 2);
     }
 
     #[tokio::test]

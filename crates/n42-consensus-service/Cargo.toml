@@ -43,4 +43,5 @@ metrics.workspace = true
 [dev-dependencies]
 bitvec.workspace = true
 libp2p.workspace = true
+metrics-util = { version = "0.20", default-features = false, features = ["debugging"] }
 tempfile.workspace = true

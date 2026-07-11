@@ -451,7 +451,14 @@ impl ConsensusService {
         self.refresh_epoch_status();
 
         self.store_committed_block(view, block_hash, commit_qc.clone(), validator_changes);
-        self.head_block_hash = block_hash;
+        if let Some(index) = self
+            .eager_execution_validated
+            .iter()
+            .position(|hash| *hash == block_hash)
+        {
+            self.eager_execution_validated.remove(index);
+            self.advance_execution_validated_head(view, block_hash, "eager import before commit");
+        }
 
         // Leader eager-imported blocks can finalize via Case A before the select
         // loop processes `leader_payload_rx`. Drain it here so state-tree
@@ -681,6 +688,7 @@ impl ConsensusService {
         let finalized = if !finalized {
             let mut found_match = false;
             while let Ok((hash, ts)) = self.eager_import_done_rx.try_recv() {
+                self.record_eager_execution_validated(hash);
                 if ts > 0 {
                     self.last_committed_timestamp = self.last_committed_timestamp.max(ts);
                 }
@@ -692,6 +700,18 @@ impl ConsensusService {
                 }
             }
             if found_match {
+                if let Some(index) = self
+                    .eager_execution_validated
+                    .iter()
+                    .position(|hash| *hash == block_hash)
+                {
+                    self.eager_execution_validated.remove(index);
+                }
+                self.advance_execution_validated_head(
+                    view,
+                    block_hash,
+                    "eager import during finalize",
+                );
                 info!(target: "n42::cl::consensus_loop", view, %block_hash, "eager import completed during FCU, retrying");
                 counter!("n42_eager_import_rescued_total").increment(1);
                 let retry_fcu = ForkchoiceState {
@@ -740,6 +760,7 @@ impl ConsensusService {
             // Case A: Block already in reth (leader built + new_payload already done,
             // OR block was previously imported by a follower, OR rescued by eager import).
             debug!(target: "n42::cl::consensus_loop", view, %block_hash, "block finalized in reth");
+            self.advance_execution_validated_head(view, block_hash, "finalize fcu");
 
             // Deferred state root mode: log that state root verification is pending.
             // Future: spawn async state root computation here using reth's provider.
@@ -991,6 +1012,64 @@ impl ConsensusService {
         }
     }
 
+    fn record_eager_execution_validated(&mut self, hash: B256) {
+        const MAX_EAGER_VALIDATED_BLOCKS: usize = 32;
+        if self.eager_execution_validated.contains(&hash) {
+            return;
+        }
+        if self.eager_execution_validated.len() >= MAX_EAGER_VALIDATED_BLOCKS {
+            self.eager_execution_validated.pop_front();
+        }
+        self.eager_execution_validated.push_back(hash);
+    }
+
+    /// Advances the local payload-building head only after reth has confirmed the
+    /// block executable. Completions can arrive out of order when async FCU is
+    /// enabled, so an older confirmation must never regress the head.
+    pub(super) fn advance_execution_validated_head(
+        &mut self,
+        view: u64,
+        hash: B256,
+        source: &'static str,
+    ) {
+        if view < self.execution_validated_head_view {
+            debug!(
+                target: "n42::cl::consensus_loop",
+                view,
+                %hash,
+                source,
+                current_validated_view = self.execution_validated_head_view,
+                current_head = %self.head_block_hash,
+                "ignoring stale execution-validity completion"
+            );
+            return;
+        }
+        if view == self.execution_validated_head_view
+            && self.execution_validated_head_view != 0
+            && self.head_block_hash != hash
+        {
+            error!(
+                target: "n42::cl::consensus_loop",
+                view,
+                %hash,
+                source,
+                current_head = %self.head_block_hash,
+                "conflicting execution-validity result at the same committed view; refusing head change"
+            );
+            return;
+        }
+
+        self.head_block_hash = hash;
+        self.execution_validated_head_view = view;
+        debug!(
+            target: "n42::cl::consensus_loop",
+            view,
+            %hash,
+            source,
+            "advanced execution-validated head"
+        );
+    }
+
     /// Called when a background import task completes.
     pub(super) async fn handle_import_done(
         &mut self,
@@ -1007,14 +1086,30 @@ impl ConsensusService {
                 timing.import_complete = Some(Instant::now());
             }
             info!(target: "n42::cl::consensus_loop", %hash, view, "background import completed, updating head");
-            self.head_block_hash = hash;
+            self.advance_execution_validated_head(view, hash, "background import");
             if block_timestamp > 0 {
                 self.last_committed_timestamp = self.last_committed_timestamp.max(block_timestamp);
             }
             self.enqueue_mobile_packet(hash, view, "background import completed")
                 .await;
         } else {
-            warn!(target: "n42::cl::consensus_loop", %hash, view, "background import FAILED, requesting sync");
+            let committed = self
+                .committed_blocks
+                .iter()
+                .any(|block| block.view == view && block.block_hash == hash);
+            if committed {
+                error!(
+                    target: "n42::cl::consensus_loop",
+                    %hash,
+                    view,
+                    execution_validated_head_view = self.execution_validated_head_view,
+                    execution_validated_head = %self.head_block_hash,
+                    "COMMITTED block is unexecutable; preserving last execution-validated head and requesting sync"
+                );
+                counter!("n42_committed_block_unexecutable_total").increment(1);
+            } else {
+                warn!(target: "n42::cl::consensus_loop", %hash, view, "speculative background import failed, requesting sync");
+            }
             counter!("n42_bg_import_failures_total").increment(1);
             // Clear the queue — parent failed so children would fail too.
             for (_, queued_hash, _) in self.bg_import_queue.drain(..) {
@@ -1052,6 +1147,38 @@ impl ConsensusService {
             timing.import_complete = Some(Instant::now());
         }
         debug!(target: "n42::cl::consensus_loop", %hash, "eager import done: block in engine tree (awaiting consensus commit)");
+
+        self.record_eager_execution_validated(hash);
+
+        // If commit/finalize raced ahead of eager new_payload, re-drive the
+        // committed FCU now that reth has explicitly accepted the payload. This
+        // closes the late-eager Case C gap without making speculative imports
+        // canonical.
+        let committed = self
+            .committed_blocks
+            .iter()
+            .rev()
+            .find(|block| block.block_hash == hash)
+            .map(|block| (block.view, block.commit_qc.clone()));
+        if let Some((view, commit_qc)) = committed {
+            let needs_finalize = self.head_block_hash != hash
+                || self
+                    .pending_finalization
+                    .as_ref()
+                    .is_some_and(|pending| pending.block_hash == hash);
+            self.advance_execution_validated_head(view, hash, "eager import after commit");
+            if let Some(index) = self
+                .eager_execution_validated
+                .iter()
+                .position(|validated_hash| *validated_hash == hash)
+            {
+                self.eager_execution_validated.remove(index);
+            }
+            if needs_finalize {
+                info!(target: "n42::cl::consensus_loop", view, %hash, "late eager import accepted for committed block; retrying finalization");
+                self.finalize_committed_block(view, hash, commit_qc).await;
+            }
+        }
     }
 
     pub(super) async fn handle_leader_payload_feedback(&mut self, hash: B256, data: Vec<u8>) {
