@@ -737,7 +737,7 @@ impl ConsensusService {
             );
         }
 
-        self.head_block_hash = broadcast.block_hash;
+        self.advance_execution_validated_head(broadcast.view, broadcast.block_hash, "sync import");
         self.complete_deferred_finalization(broadcast).await;
 
         if let Err(e) = self
@@ -859,7 +859,11 @@ impl ConsensusService {
                         finalized_block_hash: retry_hash,
                     };
                     let _ = engine_handle.fork_choice_updated(fcu).await;
-                    self.head_block_hash = retry_hash;
+                    self.advance_execution_validated_head(
+                        retry_broadcast.view,
+                        retry_hash,
+                        "sync import retry",
+                    );
                     if let Err(e) = self
                         .engine
                         .process_event(ConsensusEvent::BlockImported(retry_hash))
