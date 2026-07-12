@@ -655,7 +655,6 @@ impl ObserverOrchestrator {
             block_hash,
             commit_qc,
             payload: payload.to_vec(),
-            raw_broadcast: Vec::new(), // observer replays; no local re-drive needed
             validator_changes: None,
         });
     }

@@ -1,9 +1,4 @@
-use super::ConsensusService;
-
-/// Cap on staged (committed-but-unconfirmed) sidecar state-tree diffs; a
-/// backlog this deep means confirmations stopped landing and the staged diffs
-/// belong to blocks that may never confirm - drop and let catch-up re-derive.
-const MAX_PENDING_SIDECAR_DIFFS: usize = 8;
+use super::{ConsensusService, ImportOutcome};
 use super::{LeaderBuildWaitMode, state_mgmt::max_consecutive_empty_skips};
 use crate::el::ExecutionLayer;
 use crate::exec_cache::ExecutionOutputCache;
@@ -489,25 +484,12 @@ impl ConsensusService {
                 .get(&block_hash)
                 .and_then(|data| Self::extract_state_diff_for_state_tree(block_hash, data));
             if let Some(diff) = diff {
-                if self.pending_sidecar_diffs.len() >= MAX_PENDING_SIDECAR_DIFFS {
-                    // Confirmations are not landing; staged diffs for blocks that
-                    // never confirm are dead weight. Drop the backlog - the
-                    // sidecar catch-up path re-derives missed blocks.
-                    counter!("n42_sidecar_diff_backlog_dropped_total")
-                        .increment(self.pending_sidecar_diffs.len() as u64);
-                    warn!(
-                        target: "n42::jmt",
-                        dropped = self.pending_sidecar_diffs.len(),
-                        "sidecar diff backlog overflow; dropping staged diffs (catch-up will re-derive)"
-                    );
-                    self.pending_sidecar_diffs.clear();
-                }
-                self.pending_sidecar_diffs.insert(block_hash, diff);
+                self.pending_sidecar_diffs.insert(view, (block_hash, diff));
                 // The commit may confirm execution in the same breath (eager
                 // import validated before the CommitQC): the head already
                 // advanced above, so flush the staged diff immediately.
-                if self.head_block_hash == block_hash {
-                    self.apply_sidecar_state_diff(block_hash);
+                if view <= self.execution_validated_head_view {
+                    self.enqueue_confirmed_sidecar_state_diffs(self.execution_validated_head_view);
                 }
             } else {
                 debug!(target: "n42::jmt", %block_hash, "no block data available for state-tree update (will catch up)");
@@ -814,10 +796,10 @@ impl ConsensusService {
         let exec_cache = self.exec_output_cache.clone();
         info!(target: "n42::cl::consensus_loop", view, %block_hash, "spawning background import");
         tokio::spawn(async move {
-            let (success, block_ts) =
+            let (outcome, block_ts) =
                 Self::background_import(eh, exec_cache, &data, block_hash).await;
             if done_tx
-                .send((block_hash, view, success, block_ts))
+                .send((block_hash, view, outcome, block_ts))
                 .await
                 .is_err()
             {
@@ -827,18 +809,18 @@ impl ConsensusService {
     }
 
     /// Runs `new_payload` + `fork_choice_updated` in a background task.
-    /// Returns (success, block_timestamp).
+    /// Returns (execution outcome, block_timestamp).
     async fn background_import(
         engine_handle: Arc<dyn ExecutionLayer>,
         exec_cache: Option<Arc<dyn ExecutionOutputCache>>,
         data: &[u8],
         block_hash: B256,
-    ) -> (bool, u64) {
+    ) -> (ImportOutcome, u64) {
         let broadcast: super::BlockDataBroadcast = match bincode::deserialize(data) {
             Ok(b) => b,
             Err(e) => {
                 warn!(target: "n42::cl::consensus_loop", %block_hash, error = %e, "bg import: failed to deserialize block data");
-                return (false, 0);
+                return (ImportOutcome::Invalid, 0);
             }
         };
 
@@ -849,14 +831,14 @@ impl ConsensusService {
             Ok(d) => d,
             Err(e) => {
                 warn!(target: "n42::cl::consensus_loop", %block_hash, error = %e, "bg import: failed to decompress payload");
-                return (false, 0);
+                return (ImportOutcome::Invalid, 0);
             }
         };
         let execution_data = match serde_json::from_slice(&payload_json) {
             Ok(d) => d,
             Err(e) => {
                 warn!(target: "n42::cl::consensus_loop", %block_hash, error = %e, "bg import: failed to parse execution payload");
-                return (false, 0);
+                return (ImportOutcome::Invalid, 0);
             }
         };
 
@@ -884,21 +866,30 @@ impl ConsensusService {
                     error!(target: "n42::cl::consensus_loop", %block_hash, error = %e, "bg import: fcu failed");
                 }
                 info!(target: "n42::cl::consensus_loop", %block_hash, "bg import: block imported successfully");
-                (true, block_timestamp)
+                (ImportOutcome::Valid, block_timestamp)
+            }
+            Ok(status) if matches!(status.status, PayloadStatusEnum::Syncing) => {
+                info!(target: "n42::cl::consensus_loop", %block_hash, "bg import: parent lineage not available yet");
+                (ImportOutcome::Syncing, 0)
             }
             Ok(status) => {
                 warn!(target: "n42::cl::consensus_loop", %block_hash, status = ?status.status, "bg import: new_payload rejected");
-                (false, 0)
+                (ImportOutcome::Invalid, 0)
             }
             Err(e) => {
                 error!(target: "n42::cl::consensus_loop", %block_hash, error = %e, "bg import: new_payload failed");
-                (false, 0)
+                (ImportOutcome::Invalid, 0)
             }
         }
     }
 
     /// Records a deferred finalization when block data has not yet been imported.
-    pub(super) fn defer_finalization(&mut self, view: u64, block_hash: B256, commit_qc: QuorumCertificate) {
+    pub(super) fn defer_finalization(
+        &mut self,
+        view: u64,
+        block_hash: B256,
+        commit_qc: QuorumCertificate,
+    ) {
         self.pending_finalization = Some(super::PendingFinalization {
             view,
             block_hash,
@@ -954,9 +945,30 @@ impl ConsensusService {
                     .committed_blocks
                     .iter()
                     .rev()
-                    .find(|b| b.block_hash == stale_hash && !b.raw_broadcast.is_empty())
-                    .map(|b| b.raw_broadcast.clone());
-                if let Some(raw) = local {
+                    .find(|b| b.block_hash == stale_hash && !b.payload.is_empty())
+                    .map(|b| super::BlockDataBroadcast {
+                        block_hash: b.block_hash,
+                        view: b.view,
+                        payload_json: b.payload.clone(),
+                        timestamp: 0,
+                        execution_output: None,
+                        leader_ready_unix_ms: 0,
+                    });
+                if let Some(broadcast) = local {
+                    let raw = match bincode::serialize(&broadcast) {
+                        Ok(raw) => raw,
+                        Err(error) => {
+                            error!(
+                                target: "n42::cl::consensus_loop",
+                                stale_view,
+                                hash = %stale_hash,
+                                %error,
+                                "failed to rebuild retained committed broadcast; requesting sync"
+                            );
+                            self.initiate_sync(stale_view, new_view);
+                            return;
+                        }
+                    };
                     counter!("n42_pending_finalization_local_redrive_total").increment(1);
                     info!(
                         target: "n42::cl::consensus_loop",
@@ -1054,7 +1066,7 @@ impl ConsensusService {
         // Execution is now confirmed for this block: flush its staged sidecar
         // state-tree diff (no-op when nothing is staged - e.g. catch-up blocks
         // whose broadcast never reached us; the sidecar catch-up path owns those).
-        self.apply_sidecar_state_diff(hash);
+        self.enqueue_confirmed_sidecar_state_diffs(view);
         debug!(
             target: "n42::cl::consensus_loop",
             view,
@@ -1069,12 +1081,12 @@ impl ConsensusService {
         &mut self,
         hash: B256,
         view: u64,
-        success: bool,
+        outcome: ImportOutcome,
         block_timestamp: u64,
     ) {
         self.bg_import_in_flight = false;
         self.bg_import_hashes.remove(&hash);
-        if success {
+        if outcome == ImportOutcome::Valid {
             // Pipeline: background import complete — record timing.
             if let Some(timing) = self.pipeline_timings.get_mut(&hash) {
                 timing.import_complete = Some(Instant::now());
@@ -1091,7 +1103,7 @@ impl ConsensusService {
                 .committed_blocks
                 .iter()
                 .any(|block| block.view == view && block.block_hash == hash);
-            if committed {
+            if committed && outcome == ImportOutcome::Invalid {
                 error!(
                     target: "n42::cl::consensus_loop",
                     %hash,
@@ -1101,6 +1113,21 @@ impl ConsensusService {
                     "COMMITTED block is unexecutable; preserving last execution-validated head and requesting sync"
                 );
                 counter!("n42_committed_block_unexecutable_total").increment(1);
+                if self
+                    .pending_sidecar_diffs
+                    .get(&view)
+                    .is_some_and(|(staged_hash, _)| *staged_hash == hash)
+                {
+                    self.pending_sidecar_diffs.remove(&view);
+                }
+            } else if committed {
+                warn!(
+                    target: "n42::cl::consensus_loop",
+                    %hash,
+                    view,
+                    execution_validated_head_view = self.execution_validated_head_view,
+                    "committed block is waiting for an execution ancestor; requesting catch-up sync"
+                );
             } else {
                 warn!(target: "n42::cl::consensus_loop", %hash, view, "speculative background import failed, requesting sync");
             }
@@ -1109,7 +1136,16 @@ impl ConsensusService {
             for (_, queued_hash, _) in self.bg_import_queue.drain(..) {
                 self.bg_import_hashes.remove(&queued_hash);
             }
-            self.initiate_sync(view, self.engine.current_view());
+            let sync_from = if committed {
+                self.execution_validated_head_view
+            } else {
+                view
+            };
+            if committed && outcome == ImportOutcome::Syncing {
+                self.initiate_execution_catchup_sync(sync_from, self.engine.current_view());
+            } else {
+                self.initiate_sync(sync_from, self.engine.current_view());
+            }
             return;
         }
 
@@ -1256,82 +1292,136 @@ impl ConsensusService {
         }
     }
 
-    /// Try to extract a `StateDiff` from serialized `BlockDataBroadcast` for a state-tree update.
-    /// Returns `None` if the data is missing, malformed, or has no compact block execution.
-    /// Applies a staged sidecar diff for a block whose execution reth has
-    /// CONFIRMED (the only caller path is advance_execution_validated_head and
-    /// the same-breath flush in handle_block_committed). Runs the JMT/Twig
-    /// updates on blocking threads exactly like the old commit-time path did.
-    pub(super) fn apply_sidecar_state_diff(&mut self, block_hash: B256) {
-        let Some(diff) = self.pending_sidecar_diffs.remove(&block_hash) else {
+    /// Moves every staged diff through `confirmed_view` into a single FIFO
+    /// background worker. Reth can confirm later blocks before earlier async
+    /// completions are observed; draining by committed view preserves the
+    /// state-tree lineage and prevents separately spawned tasks from racing.
+    pub(super) fn enqueue_confirmed_sidecar_state_diffs(&mut self, confirmed_view: u64) {
+        let confirmed_views: Vec<u64> = self
+            .pending_sidecar_diffs
+            .range(..=confirmed_view)
+            .map(|(view, _)| *view)
+            .collect();
+        if confirmed_views.is_empty() {
             return;
-        };
-        if let Some(ref jmt) = self.jmt {
-            let diff = diff.clone();
-            let jmt = Arc::clone(jmt);
-            let state = self.consensus_state.clone();
-            tokio::task::spawn_blocking(move || {
-                let start = std::time::Instant::now();
-                // StateSink::apply_diff locks the SBMT internally, applies
-                // in-memory, appends the WAL (durable per block) and checkpoints
-                // a snapshot every interval. It returns a Result because the
-                // WAL/snapshot IO can fail.
-                match jmt.apply_diff(&diff) {
-                    Ok((version, root)) => {
-                        let elapsed_ms = start.elapsed().as_millis();
-                        gauge!("n42_jmt_latest_root").set(version as f64);
-                        histogram!("n42_state_root_apply_diff_ms").record(elapsed_ms as f64);
-                        info!(
-                            target: "n42::jmt",
-                            version,
-                            %root,
-                            accounts = diff.len(),
-                            storage_changes = diff.total_storage_changes(),
-                            elapsed_ms,
-                            "SBMT updated"
-                        );
-                        if let Some(ref state) = state {
-                            state.update_jmt_root(version, root);
+        }
+
+        {
+            let mut queue = self
+                .sidecar_apply_queue
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            for view in confirmed_views {
+                if let Some((hash, diff)) = self.pending_sidecar_diffs.remove(&view) {
+                    queue.push_back((view, hash, diff));
+                }
+            }
+        }
+
+        if self
+            .sidecar_apply_worker_running
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return;
+        }
+
+        let queue = Arc::clone(&self.sidecar_apply_queue);
+        let running = Arc::clone(&self.sidecar_apply_worker_running);
+        let jmt = self.jmt.clone();
+        let twig = self.twig.clone();
+        let state = self.consensus_state.clone();
+        tokio::task::spawn_blocking(move || {
+            loop {
+                let work = queue
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .pop_front();
+                let Some((view, block_hash, diff)) = work else {
+                    running.store(false, std::sync::atomic::Ordering::Release);
+                    let has_more = !queue
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .is_empty();
+                    if !has_more
+                        || running
+                            .compare_exchange(
+                                false,
+                                true,
+                                std::sync::atomic::Ordering::AcqRel,
+                                std::sync::atomic::Ordering::Acquire,
+                            )
+                            .is_err()
+                    {
+                        break;
+                    }
+                    continue;
+                };
+
+                if let Some(ref jmt) = jmt {
+                    let start = std::time::Instant::now();
+                    // StateSink::apply_diff locks the SBMT internally, applies
+                    // in-memory, appends the WAL (durable per block) and checkpoints
+                    // a snapshot every interval. It returns a Result because the
+                    // WAL/snapshot IO can fail.
+                    match jmt.apply_diff(&diff) {
+                        Ok((version, root)) => {
+                            let elapsed_ms = start.elapsed().as_millis();
+                            gauge!("n42_jmt_latest_root").set(version as f64);
+                            histogram!("n42_state_root_apply_diff_ms").record(elapsed_ms as f64);
+                            info!(
+                                target: "n42::jmt",
+                                view,
+                                %block_hash,
+                                version,
+                                %root,
+                                accounts = diff.len(),
+                                storage_changes = diff.total_storage_changes(),
+                                elapsed_ms,
+                                "SBMT updated"
+                            );
+                            if let Some(ref state) = state {
+                                state.update_jmt_root(version, root);
+                            }
+                        }
+                        Err(e) => {
+                            warn!(target: "n42::jmt", error = %e, "SBMT apply_diff/persist failed");
                         }
                     }
-                    Err(e) => {
-                        warn!(target: "n42::jmt", error = %e, "SBMT apply_diff/persist failed");
-                    }
                 }
-            });
-        }
-        if let Some(ref twig) = self.twig {
-            let twig = Arc::clone(twig);
-            let state = self.consensus_state.clone();
-            tokio::task::spawn_blocking(move || {
-                let start = std::time::Instant::now();
-                // StateSink::apply_diff locks the Twig tree internally.
-                match twig.apply_diff(&diff) {
-                    Ok((version, root)) => {
-                        let elapsed_ms = start.elapsed().as_millis();
-                        gauge!("n42_twig_latest_root").set(version as f64);
-                        histogram!("n42_twig_apply_diff_ms").record(elapsed_ms as f64);
-                        info!(
-                            target: "n42::twig",
-                            version,
-                            %root,
-                            accounts = diff.len(),
-                            storage_changes = diff.total_storage_changes(),
-                            elapsed_ms,
-                            "Twig updated"
-                        );
-                        if let Some(ref state) = state {
-                            state.update_twig_root(version, root);
+                if let Some(ref twig) = twig {
+                    let start = std::time::Instant::now();
+                    // StateSink::apply_diff locks the Twig tree internally.
+                    match twig.apply_diff(&diff) {
+                        Ok((version, root)) => {
+                            let elapsed_ms = start.elapsed().as_millis();
+                            gauge!("n42_twig_latest_root").set(version as f64);
+                            histogram!("n42_twig_apply_diff_ms").record(elapsed_ms as f64);
+                            info!(
+                                target: "n42::twig",
+                                view,
+                                %block_hash,
+                                version,
+                                %root,
+                                accounts = diff.len(),
+                                storage_changes = diff.total_storage_changes(),
+                                elapsed_ms,
+                                "Twig updated"
+                            );
+                            if let Some(ref state) = state {
+                                state.update_twig_root(version, root);
+                            }
+                        }
+                        Err(e) => {
+                            warn!(target: "n42::twig", error = %e, "Twig apply_diff/persist failed");
                         }
                     }
-                    Err(e) => {
-                        warn!(target: "n42::twig", error = %e, "Twig apply_diff/persist failed");
-                    }
                 }
-            });
-        }
+            }
+        });
     }
 
+    /// Try to extract a `StateDiff` from serialized `BlockDataBroadcast` for a state-tree update.
+    /// Returns `None` if the data is missing, malformed, or has no compact block execution.
     fn extract_state_diff_for_state_tree(
         block_hash: B256,
         data: &[u8],

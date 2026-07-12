@@ -306,8 +306,8 @@ async fn test_concurrent_rapid_blocks() {
 
     wait_until(
         tokio::time::Duration::from_secs(3),
-        || callback_count.load(Ordering::SeqCst) >= 50,
-        "concurrent proof generation",
+        || scheduler.in_progress_count() == 0,
+        "concurrent proof generation drain",
     )
     .await;
 
