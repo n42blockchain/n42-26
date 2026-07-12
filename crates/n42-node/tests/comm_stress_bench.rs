@@ -508,7 +508,7 @@ fn bench_rwlock_contention() -> Vec<BenchResult> {
                     for _ in 0..iters {
                         let guard = map.read().await;
                         let count = guard.len();
-                        for (_, session) in guard.iter() {
+                        for session in guard.values() {
                             session.record_send_success();
                         }
                         std::hint::black_box(count);
