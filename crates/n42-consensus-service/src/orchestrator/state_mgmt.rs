@@ -201,6 +201,60 @@ impl ConsensusService {
 // ── State sync ──
 
 impl ConsensusService {
+    /// Requests an execution lineage from every connected peer.
+    ///
+    /// This is narrower than ordinary consensus catch-up: a committed payload
+    /// returned `Syncing`, so the local reth tree is known to be missing an
+    /// ancestor. A single peer may have an incomplete retained payload ring or
+    /// an unready request-response stream; fan-out avoids a full sync timeout
+    /// while every response remains QC-verified and idempotent.
+    pub(super) fn initiate_execution_catchup_sync(&mut self, local_view: u64, target_view: u64) {
+        if self.sync_in_flight {
+            debug!(
+                target: "n42::cl::sync",
+                local_view,
+                target_view,
+                "execution catch-up sync already in flight"
+            );
+            return;
+        }
+
+        let peers: Vec<_> = self.connected_peers.iter().copied().collect();
+        if peers.is_empty() {
+            warn!(target: "n42::cl::sync", "no connected peers for execution catch-up sync");
+            return;
+        }
+
+        let capped_to_view = target_view.min(local_view + MAX_BLOCKS_PER_SYNC_REQUEST);
+        let request = n42_network::BlockSyncRequest {
+            from_view: local_view + 1,
+            to_view: capped_to_view,
+            local_committed_view: local_view,
+        };
+        let mut sent = 0usize;
+        for peer in peers {
+            match self.network.request_sync(peer, request.clone()) {
+                Ok(()) => sent += 1,
+                Err(error) => {
+                    warn!(target: "n42::cl::sync", %peer, %error, "failed to send execution catch-up request");
+                }
+            }
+        }
+        if sent == 0 {
+            return;
+        }
+
+        info!(
+            target: "n42::cl::sync",
+            local_view,
+            target_view = capped_to_view,
+            peers = sent,
+            "initiating execution catch-up sync"
+        );
+        self.sync_in_flight = true;
+        self.sync_started_at = Some(Instant::now());
+    }
+
     /// Initiates a state sync request to a connected peer.
     /// Uses deterministic peer rotation by view number to avoid always hitting the same peer.
     pub(super) fn initiate_sync(&mut self, local_view: u64, target_view: u64) {
@@ -229,7 +283,8 @@ impl ConsensusService {
             warn!(target: "n42::cl::sync", "no connected peers for sync");
             return;
         }
-        let peer = peers[(local_view as usize) % peers.len()];
+        let peer = peers[self.sync_peer_cursor % peers.len()];
+        self.sync_peer_cursor = self.sync_peer_cursor.wrapping_add(1);
 
         info!(target: "n42::cl::sync", %peer, local_view, target_view, "initiating state sync");
 
@@ -340,6 +395,31 @@ impl ConsensusService {
                 continue;
             }
 
+            if self.committed_blocks.iter().any(|block| {
+                block.view == sync_block.view && block.block_hash != sync_block.block_hash
+            }) {
+                error!(
+                    target: "n42::cl::sync",
+                    view = sync_block.view,
+                    hash = %sync_block.block_hash,
+                    "refusing conflicting QC-verified block at an already committed view"
+                );
+                continue;
+            }
+
+            let already_committed = self.committed_blocks.iter().any(|block| {
+                block.view == sync_block.view && block.block_hash == sync_block.block_hash
+            });
+
+            // A second fan-out response can arrive after an earlier peer has
+            // already rebuilt this lineage. Never issue FCU for those old blocks
+            // again: that would regress reth even though the local validated-head
+            // guard correctly refuses to regress its own bookkeeping.
+            if already_committed && sync_block.view <= self.execution_validated_head_view {
+                imported += 1;
+                continue;
+            }
+
             let broadcast = BlockDataBroadcast {
                 block_hash: sync_block.block_hash,
                 view: sync_block.view,
@@ -350,6 +430,22 @@ impl ConsensusService {
             };
 
             self.import_and_notify(broadcast).await;
+
+            // Execution catch-up can deliberately request ancestors older than
+            // the local consensus commit point. Re-import those blocks so reth
+            // can reconstruct the lineage, but never double-count metadata for
+            // a block whose CommitQC this node already processed live.
+            if already_committed {
+                if let Some(ref changes) = sync_block.validator_changes {
+                    self.recover_committed_block_validator_changes(
+                        sync_block.view,
+                        sync_block.block_hash,
+                        changes.clone(),
+                    );
+                }
+                imported += 1;
+                continue;
+            }
 
             // Fix #3: Scan sync-imported blocks for staking transactions.
             if let Some(ref staking_sink) = self.staking_sink
@@ -467,9 +563,6 @@ impl ConsensusService {
                 }
             }
 
-            if self.committed_blocks.len() >= max_committed_blocks() {
-                self.committed_blocks.pop_front();
-            }
             self.committed_blocks.push_back(CommittedBlock {
                 view: sync_block.view,
                 block_hash: sync_block.block_hash,
@@ -477,6 +570,12 @@ impl ConsensusService {
                 payload: sync_block.payload.clone(),
                 validator_changes: sync_block.validator_changes.clone(),
             });
+            self.committed_blocks
+                .make_contiguous()
+                .sort_by_key(|block| block.view);
+            while self.committed_blocks.len() > max_committed_blocks() {
+                self.committed_blocks.pop_front();
+            }
 
             imported += 1;
         }
@@ -485,6 +584,28 @@ impl ConsensusService {
         self.save_consensus_state();
 
         info!(target: "n42::cl::sync", imported, peer_committed_view = response.peer_committed_view, "state sync blocks imported");
+
+        // A node can become leader for the next view while a committed child is
+        // still waiting for a missing execution ancestor. handle_view_changed
+        // correctly defers building while that import is unresolved; once sync
+        // reconstructs the lineage, re-enter the normal quorum-gated,
+        // slot-aligned build path instead of waiting for a pacemaker timeout.
+        if imported > 0
+            && self.engine.is_current_leader()
+            && !self.bg_import_in_flight
+            && self.bg_import_queue.is_empty()
+            && self.building_on_parent.is_none()
+            && self.next_build_at.is_none()
+        {
+            info!(
+                target: "n42::cl::sync",
+                view = self.engine.current_view(),
+                execution_validated_head_view = self.execution_validated_head_view,
+                "execution catch-up completed for current leader; resuming gated build schedule"
+            );
+            self.begin_leader_build_wait(super::LeaderBuildWaitMode::Scheduled, None);
+            self.evaluate_leader_build_wait(None).await;
+        }
 
         let local_view = self.engine.current_view();
         if response.peer_committed_view > local_view + 3 {

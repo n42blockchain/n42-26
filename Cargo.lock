@@ -7048,6 +7048,7 @@ dependencies = [
  "hex",
  "jsonrpsee",
  "libp2p",
+ "metrics",
  "n42-chainspec",
  "n42-consensus",
  "n42-jmt",

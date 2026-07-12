@@ -326,6 +326,25 @@ fn main() {
             }
         }
 
+        // Hard guard (RFC production-safe-deferred-state-root, Phase A): the
+        // state-root bypass flags refuse to start outside an explicitly
+        // allowed benchmark chain. A warn-only gate let "temporary" bench
+        // flags reach long-lived deployments with verification silently off.
+        let env_is_1 = |var: &str| std::env::var(var).is_ok_and(|v| v == "1");
+        let skip_root = env_is_1("N42_SKIP_STATE_ROOT");
+        let defer_root = env_is_1("N42_DEFER_STATE_ROOT");
+        if let Err(msg) = n42_node::validate_state_root_bypass_flags(
+            skip_root,
+            defer_root,
+            env_is_1("N42_ALLOW_BENCH_MODE"),
+            builder.config().chain.chain.id(),
+        ) {
+            eprintln!("ERROR: {msg}");
+            std::process::exit(1);
+        }
+        metrics::gauge!("n42_deferred_state_root_enabled")
+            .set(if skip_root || defer_root { 1.0 } else { 0.0 });
+
         // Priority: N42_CONSENSUS_CONFIG file > N42_VALIDATOR_COUNT dev mode.
         let consensus_config_path = std::env::var("N42_CONSENSUS_CONFIG").ok();
         let consensus_config_from_file = consensus_config_path.is_some();

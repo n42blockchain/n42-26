@@ -83,7 +83,10 @@ jobs:
         working-directory: n42-26
         run: cargo build --release -p n42-node-bin -p e2e-test
         env:
-          RUSTFLAGS: "-C target-cpu=native"
+          # Correctness artifacts are cached across heterogeneous hosted runners;
+          # `target-cpu=native` can restore instructions unsupported by the next
+          # runner and make the test binary exit with SIGILL before a scenario runs.
+          RUSTFLAGS: ""
 
       - name: Run E2E shard
         working-directory: n42-26
