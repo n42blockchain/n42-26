@@ -1,4 +1,9 @@
 use super::ConsensusService;
+
+/// Cap on staged (committed-but-unconfirmed) sidecar state-tree diffs; a
+/// backlog this deep means confirmations stopped landing and the staged diffs
+/// belong to blocks that may never confirm - drop and let catch-up re-derive.
+const MAX_PENDING_SIDECAR_DIFFS: usize = 8;
 use super::{LeaderBuildWaitMode, state_mgmt::max_consecutive_empty_skips};
 use crate::el::ExecutionLayer;
 use crate::exec_cache::ExecutionOutputCache;
@@ -470,78 +475,39 @@ impl ConsensusService {
             state.notify_block_committed(block_hash, self.committed_block_count);
         }
 
-        // State-tree background update: extract BundleState from pending block
-        // data once, then feed the enabled sidecar tree(s).
+        // State-tree sidecars: STAGE the diff now (the broadcast data is at hand),
+        // apply it only once reth confirms the block executable. Applying at
+        // commit time advanced the JMT/Twig trees on blocks reth could later
+        // reject - the same three-state divergence class the Go stack hit live
+        // (sidecar state walking away from the authoritative state). The apply
+        // now hangs off advance_execution_validated_head, the single point every
+        // confirmation path (eager import, finalize FCU, bg import, sync) funnels
+        // through.
         if self.jmt.is_some() || self.twig.is_some() {
             let diff = self
                 .pending_block_data
                 .get(&block_hash)
                 .and_then(|data| Self::extract_state_diff_for_state_tree(block_hash, data));
             if let Some(diff) = diff {
-                if let Some(ref jmt) = self.jmt {
-                    let diff = diff.clone();
-                    let jmt = Arc::clone(jmt);
-                    let state = self.consensus_state.clone();
-                    tokio::task::spawn_blocking(move || {
-                        let start = std::time::Instant::now();
-                        // StateSink::apply_diff locks the SBMT internally, applies
-                        // in-memory, appends the WAL (durable per block) and checkpoints
-                        // a snapshot every interval. It returns a Result because the
-                        // WAL/snapshot IO can fail.
-                        match jmt.apply_diff(&diff) {
-                            Ok((version, root)) => {
-                                let elapsed_ms = start.elapsed().as_millis();
-                                gauge!("n42_jmt_latest_root").set(version as f64);
-                                histogram!("n42_state_root_apply_diff_ms")
-                                    .record(elapsed_ms as f64);
-                                info!(
-                                    target: "n42::jmt",
-                                    version,
-                                    %root,
-                                    accounts = diff.len(),
-                                    storage_changes = diff.total_storage_changes(),
-                                    elapsed_ms,
-                                    "SBMT updated"
-                                );
-                                if let Some(ref state) = state {
-                                    state.update_jmt_root(version, root);
-                                }
-                            }
-                            Err(e) => {
-                                warn!(target: "n42::jmt", error = %e, "SBMT apply_diff/persist failed");
-                            }
-                        }
-                    });
+                if self.pending_sidecar_diffs.len() >= MAX_PENDING_SIDECAR_DIFFS {
+                    // Confirmations are not landing; staged diffs for blocks that
+                    // never confirm are dead weight. Drop the backlog - the
+                    // sidecar catch-up path re-derives missed blocks.
+                    counter!("n42_sidecar_diff_backlog_dropped_total")
+                        .increment(self.pending_sidecar_diffs.len() as u64);
+                    warn!(
+                        target: "n42::jmt",
+                        dropped = self.pending_sidecar_diffs.len(),
+                        "sidecar diff backlog overflow; dropping staged diffs (catch-up will re-derive)"
+                    );
+                    self.pending_sidecar_diffs.clear();
                 }
-                if let Some(ref twig) = self.twig {
-                    let twig = Arc::clone(twig);
-                    let state = self.consensus_state.clone();
-                    tokio::task::spawn_blocking(move || {
-                        let start = std::time::Instant::now();
-                        // StateSink::apply_diff locks the Twig tree internally.
-                        match twig.apply_diff(&diff) {
-                            Ok((version, root)) => {
-                                let elapsed_ms = start.elapsed().as_millis();
-                                gauge!("n42_twig_latest_root").set(version as f64);
-                                histogram!("n42_twig_apply_diff_ms").record(elapsed_ms as f64);
-                                info!(
-                                    target: "n42::twig",
-                                    version,
-                                    %root,
-                                    accounts = diff.len(),
-                                    storage_changes = diff.total_storage_changes(),
-                                    elapsed_ms,
-                                    "Twig updated"
-                                );
-                                if let Some(ref state) = state {
-                                    state.update_twig_root(version, root);
-                                }
-                            }
-                            Err(e) => {
-                                warn!(target: "n42::twig", error = %e, "Twig apply_diff/persist failed");
-                            }
-                        }
-                    });
+                self.pending_sidecar_diffs.insert(block_hash, diff);
+                // The commit may confirm execution in the same breath (eager
+                // import validated before the CommitQC): the head already
+                // advanced above, so flush the staged diff immediately.
+                if self.head_block_hash == block_hash {
+                    self.apply_sidecar_state_diff(block_hash);
                 }
             } else {
                 debug!(target: "n42::jmt", %block_hash, "no block data available for state-tree update (will catch up)");
@@ -606,7 +572,7 @@ impl ConsensusService {
         // Case A (block already in reth) schedules the build immediately.
     }
 
-    async fn finalize_committed_block(
+    pub(super) async fn finalize_committed_block(
         &mut self,
         view: u64,
         block_hash: B256,
@@ -932,7 +898,7 @@ impl ConsensusService {
     }
 
     /// Records a deferred finalization when block data has not yet been imported.
-    fn defer_finalization(&mut self, view: u64, block_hash: B256, commit_qc: QuorumCertificate) {
+    pub(super) fn defer_finalization(&mut self, view: u64, block_hash: B256, commit_qc: QuorumCertificate) {
         self.pending_finalization = Some(super::PendingFinalization {
             view,
             block_hash,
@@ -941,7 +907,7 @@ impl ConsensusService {
         self.pending_executions.insert(block_hash);
     }
 
-    async fn handle_view_changed(&mut self, new_view: u64) {
+    pub(super) async fn handle_view_changed(&mut self, new_view: u64) {
         counter!("n42_view_changes_total").increment(1);
         self.record_timeout_diag_view_changed(new_view);
         self.view_started_at = Some(tokio::time::Instant::now());
@@ -975,11 +941,35 @@ impl ConsensusService {
                 );
                 counter!("n42_pending_finalization_stale_total").increment(1);
                 let stale_view = pf.view;
+                let stale_hash = pf.block_hash;
                 self.pending_finalization = None;
                 self.pending_block_data.clear();
                 self.pending_executions.clear();
-                // Trigger sync to recover the missing block
-                self.initiate_sync(stale_view, new_view);
+                // A COMMITTED block whose broadcast we still hold must be
+                // re-driven locally - dropping straight to sync gambled that a
+                // peer retained the only copy of data this node already had
+                // (the committed_blocks ring keeps the raw broadcast exactly
+                // for this). Only a truly data-less stall goes to sync.
+                let local = self
+                    .committed_blocks
+                    .iter()
+                    .rev()
+                    .find(|b| b.block_hash == stale_hash && !b.raw_broadcast.is_empty())
+                    .map(|b| b.raw_broadcast.clone());
+                if let Some(raw) = local {
+                    counter!("n42_pending_finalization_local_redrive_total").increment(1);
+                    info!(
+                        target: "n42::cl::consensus_loop",
+                        stale_view,
+                        new_view,
+                        hash = %stale_hash,
+                        "stale pending_finalization re-driven from the retained committed broadcast"
+                    );
+                    self.enqueue_bg_import(raw, stale_hash, stale_view);
+                } else {
+                    // Trigger sync to recover the missing block
+                    self.initiate_sync(stale_view, new_view);
+                }
             }
         }
         // NOTE: We intentionally do NOT clear pending_block_data here.
@@ -1061,6 +1051,10 @@ impl ConsensusService {
 
         self.head_block_hash = hash;
         self.execution_validated_head_view = view;
+        // Execution is now confirmed for this block: flush its staged sidecar
+        // state-tree diff (no-op when nothing is staged - e.g. catch-up blocks
+        // whose broadcast never reached us; the sidecar catch-up path owns those).
+        self.apply_sidecar_state_diff(hash);
         debug!(
             target: "n42::cl::consensus_loop",
             view,
@@ -1264,6 +1258,80 @@ impl ConsensusService {
 
     /// Try to extract a `StateDiff` from serialized `BlockDataBroadcast` for a state-tree update.
     /// Returns `None` if the data is missing, malformed, or has no compact block execution.
+    /// Applies a staged sidecar diff for a block whose execution reth has
+    /// CONFIRMED (the only caller path is advance_execution_validated_head and
+    /// the same-breath flush in handle_block_committed). Runs the JMT/Twig
+    /// updates on blocking threads exactly like the old commit-time path did.
+    pub(super) fn apply_sidecar_state_diff(&mut self, block_hash: B256) {
+        let Some(diff) = self.pending_sidecar_diffs.remove(&block_hash) else {
+            return;
+        };
+        if let Some(ref jmt) = self.jmt {
+            let diff = diff.clone();
+            let jmt = Arc::clone(jmt);
+            let state = self.consensus_state.clone();
+            tokio::task::spawn_blocking(move || {
+                let start = std::time::Instant::now();
+                // StateSink::apply_diff locks the SBMT internally, applies
+                // in-memory, appends the WAL (durable per block) and checkpoints
+                // a snapshot every interval. It returns a Result because the
+                // WAL/snapshot IO can fail.
+                match jmt.apply_diff(&diff) {
+                    Ok((version, root)) => {
+                        let elapsed_ms = start.elapsed().as_millis();
+                        gauge!("n42_jmt_latest_root").set(version as f64);
+                        histogram!("n42_state_root_apply_diff_ms").record(elapsed_ms as f64);
+                        info!(
+                            target: "n42::jmt",
+                            version,
+                            %root,
+                            accounts = diff.len(),
+                            storage_changes = diff.total_storage_changes(),
+                            elapsed_ms,
+                            "SBMT updated"
+                        );
+                        if let Some(ref state) = state {
+                            state.update_jmt_root(version, root);
+                        }
+                    }
+                    Err(e) => {
+                        warn!(target: "n42::jmt", error = %e, "SBMT apply_diff/persist failed");
+                    }
+                }
+            });
+        }
+        if let Some(ref twig) = self.twig {
+            let twig = Arc::clone(twig);
+            let state = self.consensus_state.clone();
+            tokio::task::spawn_blocking(move || {
+                let start = std::time::Instant::now();
+                // StateSink::apply_diff locks the Twig tree internally.
+                match twig.apply_diff(&diff) {
+                    Ok((version, root)) => {
+                        let elapsed_ms = start.elapsed().as_millis();
+                        gauge!("n42_twig_latest_root").set(version as f64);
+                        histogram!("n42_twig_apply_diff_ms").record(elapsed_ms as f64);
+                        info!(
+                            target: "n42::twig",
+                            version,
+                            %root,
+                            accounts = diff.len(),
+                            storage_changes = diff.total_storage_changes(),
+                            elapsed_ms,
+                            "Twig updated"
+                        );
+                        if let Some(ref state) = state {
+                            state.update_twig_root(version, root);
+                        }
+                    }
+                    Err(e) => {
+                        warn!(target: "n42::twig", error = %e, "Twig apply_diff/persist failed");
+                    }
+                }
+            });
+        }
+    }
+
     fn extract_state_diff_for_state_tree(
         block_hash: B256,
         data: &[u8],

@@ -139,6 +139,11 @@ impl ConsensusService {
         commit_qc: QuorumCertificate,
         validator_changes: Option<Vec<n42_primitives::consensus::ValidatorChange>>,
     ) {
+        let raw_broadcast = self
+            .pending_block_data
+            .get(&block_hash)
+            .cloned()
+            .unwrap_or_default();
         let payload = self
             .pending_block_data
             .get(&block_hash)
@@ -153,6 +158,7 @@ impl ConsensusService {
             view,
             block_hash,
             commit_qc,
+            raw_broadcast,
             payload,
             validator_changes,
         });
@@ -475,6 +481,7 @@ impl ConsensusService {
                 block_hash: sync_block.block_hash,
                 commit_qc: sync_block.commit_qc.clone(),
                 payload: sync_block.payload.clone(),
+                raw_broadcast: Vec::new(), // synced blocks are already imported; nothing to re-drive
                 validator_changes: sync_block.validator_changes.clone(),
             });
 

@@ -261,6 +261,10 @@ pub struct CommittedBlock {
     pub block_hash: B256,
     pub commit_qc: QuorumCertificate,
     pub payload: Vec<u8>,
+    /// The raw BlockDataBroadcast bytes as received - retained so a stale
+    /// pending finalization can be re-driven LOCALLY instead of gambling on a
+    /// peer holding the only copy (see handle_view_changed).
+    pub raw_broadcast: Vec<u8>,
     pub validator_changes: Option<Vec<n42_primitives::consensus::ValidatorChange>>,
 }
 
@@ -294,6 +298,10 @@ pub struct ConsensusService {
     /// Bounded record of speculative eager imports that reth already accepted.
     /// A matching commit may promote the block without waiting for a second EL result.
     eager_execution_validated: VecDeque<B256>,
+    /// State-tree sidecar diffs staged at commit time, applied only once
+    /// execution is CONFIRMED (advance_execution_validated_head) - never on a
+    /// block reth could still reject.
+    pending_sidecar_diffs: HashMap<B256, n42_execution::state_diff::StateDiff>,
     last_commit_qc: Option<QuorumCertificate>,
     /// Cached `keccak256(commit_qc.aggregate_signature)` — avoids re-hashing on every payload build.
     prev_randao_cache: B256,
@@ -830,6 +838,7 @@ impl ConsensusService {
             head_block_hash: B256::ZERO,
             execution_validated_head_view: 0,
             eager_execution_validated: VecDeque::new(),
+            pending_sidecar_diffs: HashMap::new(),
             last_commit_qc: None,
             prev_randao_cache: B256::ZERO,
             block_ready_tx,
@@ -1032,6 +1041,7 @@ impl ConsensusService {
             head_block_hash,
             execution_validated_head_view: 0,
             eager_execution_validated: VecDeque::new(),
+            pending_sidecar_diffs: HashMap::new(),
             last_commit_qc: None,
             prev_randao_cache: B256::ZERO,
             block_ready_tx,
@@ -1983,6 +1993,11 @@ mod tests {
         new_payload_status: PayloadStatusEnum,
         fcu_status: PayloadStatusEnum,
         build_parents: Arc<Mutex<Vec<B256>>>,
+        /// Every attribute-less forkchoiceUpdated head - the canonical-writer
+        /// audit trail (import paths must NEVER appear here).
+        fcu_heads: Arc<Mutex<Vec<B256>>>,
+        /// Every new_payload block hash.
+        new_payload_hashes: Arc<Mutex<Vec<B256>>>,
     }
 
     impl MockExecutionLayer {
@@ -1991,7 +2006,20 @@ mod tests {
                 new_payload_status,
                 fcu_status,
                 build_parents: Arc::new(Mutex::new(Vec::new())),
+                fcu_heads: Arc::new(Mutex::new(Vec::new())),
+                new_payload_hashes: Arc::new(Mutex::new(Vec::new())),
             }
+        }
+
+        fn fcu_heads(&self) -> Vec<B256> {
+            self.fcu_heads.lock().expect("mock execution-layer lock").clone()
+        }
+
+        fn new_payload_hashes(&self) -> Vec<B256> {
+            self.new_payload_hashes
+                .lock()
+                .expect("mock execution-layer lock")
+                .clone()
         }
 
         fn build_parents(&self) -> Vec<B256> {
@@ -2006,15 +2034,23 @@ mod tests {
     impl ExecutionLayer for MockExecutionLayer {
         async fn new_payload(
             &self,
-            _payload: ExecutionData,
+            payload: ExecutionData,
         ) -> Result<PayloadStatus, crate::el::ElError> {
+            self.new_payload_hashes
+                .lock()
+                .expect("mock execution-layer lock")
+                .push(payload.payload.block_hash());
             Ok(PayloadStatus::from_status(self.new_payload_status.clone()))
         }
 
         async fn fork_choice_updated(
             &self,
-            _state: ForkchoiceState,
+            state: ForkchoiceState,
         ) -> Result<ForkchoiceUpdated, crate::el::ElError> {
+            self.fcu_heads
+                .lock()
+                .expect("mock execution-layer lock")
+                .push(state.head_block_hash);
             Ok(ForkchoiceUpdated::from_status(self.fcu_status.clone()))
         }
 
@@ -3004,5 +3040,235 @@ mod tests {
             orch.leader_build_waiting_view,
             Some((orch.engine.current_view(), LeaderBuildWaitMode::Scheduled))
         );
+    }
+
+    /// Counting StateSink: records every applied diff (Task 2 spy).
+    struct SpyStateSink {
+        applies: Arc<Mutex<Vec<usize>>>, // account counts per apply
+    }
+
+    impl SpyStateSink {
+        fn new() -> (Arc<Self>, Arc<Mutex<Vec<usize>>>) {
+            let applies = Arc::new(Mutex::new(Vec::new()));
+            (
+                Arc::new(Self {
+                    applies: Arc::clone(&applies),
+                }),
+                applies,
+            )
+        }
+    }
+
+    impl crate::sinks::StateSink for SpyStateSink {
+        fn apply_diff(
+            &self,
+            diff: &n42_execution::state_diff::StateDiff,
+        ) -> Result<(u64, B256), String> {
+            self.applies
+                .lock()
+                .expect("spy sink lock")
+                .push(diff.len());
+            Ok((1, B256::repeat_byte(0xAB)))
+        }
+    }
+
+    async fn drain_spawned_tasks() {
+        // apply_sidecar_state_diff runs the sink on spawn_blocking; yield until
+        // the pool has run it.
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    /// Task 2: a committed block whose execution reth REJECTS must never reach
+    /// the sidecar state trees; the staged diff stays parked (and is dropped by
+    /// the backlog cap eventually), and the sink records zero applies.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sidecar_diff_withheld_when_execution_rejected() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let previous_head = B256::repeat_byte(0x11);
+        let bad_hash = B256::repeat_byte(0xDD);
+        let mock_el = Arc::new(MockExecutionLayer::new(
+            PayloadStatusEnum::Invalid {
+                validation_error: "stale nonce".to_string(),
+            },
+            PayloadStatusEnum::Syncing,
+        ));
+        let (sink, applies) = SpyStateSink::new();
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
+        orch.el = Some(mock_el);
+        orch.jmt = Some(sink);
+        orch.head_block_hash = previous_head;
+        orch.async_finalize_fcu = false;
+        orch.pending_block_data
+            .insert(bad_hash, test_block_data(previous_head, bad_hash, 1));
+        // The broadcast fixture carries no execution output, so stage the diff
+        // directly - the staging/flush timing is what this test pins down.
+        orch.pending_sidecar_diffs
+            .insert(bad_hash, n42_execution::state_diff::StateDiff::default());
+
+        orch.handle_engine_output(EngineOutput::BlockCommitted {
+            view: 1,
+            block_hash: bad_hash,
+            commit_qc: QuorumCertificate::genesis(),
+            validator_changes: None,
+        })
+        .await;
+        let (hash, view, success, ts) =
+            tokio::time::timeout(Duration::from_secs(2), orch.import_done_rx.recv())
+                .await
+                .expect("bg import finishes")
+                .expect("channel open");
+        assert!(!success);
+        orch.handle_import_done(hash, view, success, ts).await;
+        drain_spawned_tasks().await;
+
+        assert!(
+            applies.lock().unwrap().is_empty(),
+            "sidecar sink must not see a diff for an execution-rejected block"
+        );
+        assert!(
+            orch.pending_sidecar_diffs.contains_key(&bad_hash),
+            "the staged diff stays parked, never applied"
+        );
+    }
+
+    /// Task 2 happy path: once execution IS confirmed (head advances to the
+    /// block), the staged diff is applied exactly once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sidecar_diff_applied_once_after_confirmation() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let good_hash = B256::repeat_byte(0x22);
+        let (sink, applies) = SpyStateSink::new();
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
+        orch.jmt = Some(sink);
+        orch.pending_sidecar_diffs
+            .insert(good_hash, n42_execution::state_diff::StateDiff::default());
+
+        orch.advance_execution_validated_head(1, good_hash, "test confirmation");
+        drain_spawned_tasks().await;
+        assert_eq!(
+            applies.lock().unwrap().len(),
+            1,
+            "confirmed block applies its staged diff exactly once"
+        );
+        assert!(orch.pending_sidecar_diffs.is_empty());
+
+        // A second confirmation of the same hash is a no-op (diff consumed).
+        orch.advance_execution_validated_head(1, good_hash, "duplicate confirmation");
+        drain_spawned_tasks().await;
+        assert_eq!(applies.lock().unwrap().len(), 1);
+    }
+
+    /// Task 3: a stale pending finalization whose block the committed ring
+    /// still holds re-drives the import LOCALLY - no sync round-trip for data
+    /// this node already has.
+    #[tokio::test]
+    async fn stale_pending_finalization_redrives_from_committed_broadcast() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let head = B256::repeat_byte(0x31);
+        let committed_hash = B256::repeat_byte(0x44);
+        let raw = test_block_data(head, committed_hash, 3);
+        let mock_el = Arc::new(MockExecutionLayer::new(
+            PayloadStatusEnum::Valid,
+            PayloadStatusEnum::Valid,
+        ));
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
+        orch.el = Some(mock_el.clone());
+        orch.pending_block_data.insert(committed_hash, raw);
+        orch.store_committed_block(3, committed_hash, QuorumCertificate::genesis(), None);
+        orch.defer_finalization(3, committed_hash, QuorumCertificate::genesis());
+        orch.pending_block_data.clear(); // the eviction that used to force a sync
+
+        orch.handle_view_changed(6).await; // 3 views past the pending one
+
+        assert!(
+            orch.pending_finalization.is_none(),
+            "stale pending finalization is consumed"
+        );
+        assert!(
+            !orch.sync_in_flight,
+            "locally retained broadcast must not fall back to sync"
+        );
+        let (hash, view, success, _ts) =
+            tokio::time::timeout(Duration::from_secs(2), orch.import_done_rx.recv())
+                .await
+                .expect("local re-drive import completes")
+                .expect("channel open");
+        assert_eq!((hash, view), (committed_hash, 3));
+        assert!(success, "the retained broadcast re-imports successfully");
+        assert_eq!(
+            mock_el.new_payload_hashes(),
+            vec![committed_hash],
+            "the re-drive imports the retained broadcast through new_payload"
+        );
+        // The block IS committed - the re-driven import legitimately finishes
+        // with the commit-authorized fork-choice update (Case B semantics).
+        assert_eq!(mock_el.fcu_heads(), vec![committed_hash]);
+    }
+
+    /// Task 3 fallback: with no retained broadcast the stale finalization
+    /// still goes to sync (the pre-existing behavior).
+    #[tokio::test]
+    async fn stale_pending_finalization_without_payload_falls_back_to_sync() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let committed_hash = B256::repeat_byte(0x55);
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
+        orch.connected_peers
+            .insert(n42_network::PeerId::random());
+        orch.defer_finalization(3, committed_hash, QuorumCertificate::genesis());
+
+        orch.handle_view_changed(6).await;
+
+        assert!(orch.pending_finalization.is_none());
+        assert!(orch.sync_in_flight, "no local data -> sync is the only recovery");
+        assert!(!orch.bg_import_hashes.contains(&committed_hash));
+    }
+
+    /// Task 5: import paths must NEVER move reth fork choice - the
+    /// single-canonical-writer invariant. Passive block data import and the
+    /// commit-driven finalize are driven back to back; only the finalize may
+    /// produce an attribute-less FCU.
+    #[tokio::test]
+    async fn import_paths_never_issue_fcu() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let head = B256::repeat_byte(0x61);
+        let block_hash = B256::repeat_byte(0x62);
+        let mock_el = Arc::new(MockExecutionLayer::new(
+            PayloadStatusEnum::Valid,
+            PayloadStatusEnum::Valid,
+        ));
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
+        orch.el = Some(mock_el.clone());
+        orch.head_block_hash = head;
+        orch.async_finalize_fcu = false;
+
+        // Passive path: block data arrives from the network.
+        orch.handle_block_data(test_block_data(head, block_hash, 1))
+            .await;
+        assert!(
+            mock_el.fcu_heads().is_empty(),
+            "passive block-data import must not call forkchoiceUpdated"
+        );
+
+        // Commit-driven finalize is the ONLY canonical writer.
+        orch.finalize_committed_block(1, block_hash, QuorumCertificate::genesis())
+            .await;
+        assert!(
+            !mock_el.fcu_heads().is_empty(),
+            "finalize is expected to move the fork choice"
+        );
+        assert_eq!(mock_el.fcu_heads(), vec![block_hash]);
     }
 }
