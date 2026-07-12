@@ -8,7 +8,7 @@ N42 is a high-performance blockchain node that combines:
 - reth-backed EVM execution
 - a libp2p-based validator network
 - a QUIC-based mobile verifier side channel
-- JMT state commitment and proof serving
+- a default QMDB-style binary twig state-proof backend
 - optional asynchronous ZK proof generation
 
 The system is intentionally split into an on-critical-path validator plane and an off-critical-path verification plane.
@@ -26,7 +26,7 @@ flowchart LR
     BOOT --> HUB["ShardedStarHub"]
     BOOT --> MBR["MobileVerificationBridge"]
     BOOT --> RPC["JSON-RPC server"]
-    BOOT -.->|"❌ NOT WIRED"| JMT["ShardedJmt"]
+    BOOT -->|"default: N42_TWIG"| TREE["QMDB-style ShardedTwig"]
     BOOT -->|"N42_ZK_PROOF=1"| ZK["ProofScheduler"]
     BOOT --> REWARD["MobileRewardManager"]
     BOOT --> STAKE["StakingManager"]
@@ -35,7 +35,7 @@ flowchart LR
     ORCH --> CONS
     ORCH --> NET
     ORCH --> RETH
-    ORCH -.->|"never initialized"| JMT
+    ORCH -->|"execution-validated StateDiff"| TREE
     ORCH --> ZK
     ORCH --> MBR
     ORCH --> STAKE
@@ -66,7 +66,7 @@ Purpose:
 - build payloads through reth integration
 - import committed blocks
 - optionally generate execution witness and compact execution output
-- derive state diffs for JMT and mobile verification
+- derive state diffs for QMDB/LtHash and mobile verification
 
 Primary code:
 
@@ -107,16 +107,23 @@ Primary code:
 
 Purpose:
 
-- maintain JMT root and proofs
+- maintain the QMDB-style binary twig root and proofs
 - generate and store asynchronous ZK proofs
 - expose proof queries via RPC
 
 Primary code:
 
-- [`crates/n42-jmt/src/`](crates/n42-jmt/src)
-- [`crates/n42-zkproof/src/`](crates/n42-zkproof/src)
+- [`crates/n42-twig-core/src/`](../crates/n42-twig-core/src)
+- [`crates/n42-jmt/src/twig.rs`](../crates/n42-jmt/src/twig.rs)
+- [`crates/n42-zkproof/src/`](../crates/n42-zkproof/src)
 
-> **✅ 状态树已接入生产（SBMT）**：自 devlog-59 起，并行状态树从 `ShardedJmt` 切换为 `ShardedSbmt`（自研二叉 SBMT，`N42_JMT=1` 启用），在 `bin/n42-node/src/main.rs`（RPC + orchestrator）通过 `with_jmt()` builder 注入。`apply_diff` 在 commit 后通过 spawn_blocking 异步更新，不在共识关键路径（state root 由 reth MPT 算并入 header，SBMT 仅服务手机 proof）。`n42_jmtProof` 现返回 bincode 编码的 `ShardedBmtProof`，手机用 `n42-bmt-core::verify`（纯 blake3）验证。`n42_jmtRoot` / `n42_jmtProof` / `n42_jmtVersion` RPC 可用。
+> **当前状态树选择**：`N42_TWIG` 未设置时默认启用 QMDB 风格的 16-shard
+> binary twig；`N42_JMT=1` 是显式选择的 reserve SBMT 路径。PR #22 之后，tree
+> diff 仅在 execution acceptance 后按 committed view 顺序应用。目标 follower
+> commitment 规则是 QMDB root + LtHash summary；Rust 的 LtHash 与 proposal/header
+> wiring 尚未完成，详见
+> [`follower-validation-modes.md`](follower-validation-modes.md)，不得把该目标能力写成
+> 已经上线。
 
 ### 6. Staking plane
 
@@ -145,7 +152,7 @@ flowchart TD
         F["MobileVerificationBridge"]
         G["RPC server"]
         H["reth engine API"]
-        I["JMT ❌ stub"]
+        I["QMDB-style ShardedTwig"]
         J["ZK scheduler"]
         K["Reward manager"]
         L["StakingManager"]
@@ -161,7 +168,7 @@ flowchart TD
     C --> B
     C --> D
     C --> H
-    C -.-> I
+    C --> I
     C --> J
     C --> L
     E --> F
@@ -187,13 +194,13 @@ flowchart TD
 - mobile packet dispatch
 - mobile receipt aggregation
 - mobile rewards
-- JMT background updates
+- QMDB binary twig background updates
 - ZK proof generation
 - many observability and persistence tasks
 
 This split matters operationally: a failure in mobile verification should not prevent consensus progress unless the implementation incorrectly couples the two.
 
-## Production wiring audit (2026-03-26)
+## Production wiring audit (2026-07-12)
 
 Each module's end-to-end integration status: constructed in `main.rs` → events connected → RPC exposed.
 
@@ -208,7 +215,8 @@ Each module's end-to-end integration status: constructed in `main.rs` → events
 | Crash Recovery | ✅ Wired | always | `main.rs:440` → `ConsensusEngine::with_recovered_state` |
 | ZK ProofScheduler | ✅ Wired | `N42_ZK_PROOF=1` | `main.rs:535` → `consensus_loop:413` → `on_block_committed` |
 | Validator Reconfig RPC | ✅ Wired | always | `main.rs:515` → admin channel → orchestrator select! |
-| JMT (ShardedJmt) | ✅ Wired | always | `main.rs:702, 1231` → `with_jmt()` → `consensus_loop.rs` apply_diff (spawn_blocking) |
+| QMDB binary twig (`ShardedTwig`) | ✅ Wired | default (`N42_TWIG` unset/on) | `main.rs` → `with_twig()` → execution-validated, ordered `apply_diff` worker |
+| Reserve SBMT | ⚙️ Opt-in | `N42_JMT=1` | `main.rs` → `with_jmt()`; disabled when twig is selected |
 | Parallel EVM | ⚙️ Opt-in | `N42_PARALLEL_EVM=1` | `executor.rs:130` `parallel_evm_enabled()` → `execute_block_parallel` (off by default) |
 
 ### Open issues
@@ -226,7 +234,8 @@ Acts as the main cross-subsystem read/write bridge:
 - attestation state
 - authorized mobile verifiers
 - equivocation log
-- JMT root metadata (⚠️ never populated — JMT not wired)
+- QMDB twig root/version metadata
+- reserve SBMT root/version metadata when selected
 - ZK latest-proof metadata
 - committed-block broadcast channel
 - admin command channel (validator reconfig)
@@ -263,6 +272,6 @@ Persistent recovery payload for:
 - some state is shared by side effects across async tasks, which increases coupling risk
 - security-sensitive mobile authorization spans `star_hub`, `mobile_bridge`, `consensus_state`, and `rpc`
 - release readiness depends heavily on cross-module invariants rather than a single enforcement layer
-- JMT crate is fully implemented but not wired into production — the "proof and state proof plane" is half-dark
-- `n42-parallel-evm` crate is orphaned dead code
+- QMDB/LtHash proposal commitments and the explicit full-replay mode are not yet wired; see `follower-validation-modes.md`
+- `n42-parallel-evm` remains opt-in pending broader differential evidence
 - admin RPC endpoints (`proposeAddValidator`/`proposeRemoveValidator`) lack authentication

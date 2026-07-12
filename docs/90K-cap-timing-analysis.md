@@ -6,6 +6,14 @@
 **注入**: 5,000,000 预签名交易, TCP全速注入, batch_size=500, 88.5秒完成
 **结果**: 每块稳定90,000笔交易, 0错误, 链稳定运行
 
+> **有效性口径补充（2026-07-12）**：这是历史吞吐/传播实验，不是“六个 follower
+> 均独立执行 90K 交易并验证状态根”的证据。该次运行明确设置了
+> `N42_DEFER_STATE_ROOT=1` 和 `N42_SKIP_TX_VERIFY=1`，followers 主要走 compact
+> execution-output / payload-cache hit 快路径。目标生产架构使用 QMDB 风格二叉 twig
+> 状态树，并以 LtHash 快速摘要验证 compact transition；六 follower 独立完整 EVM
+> 重放、重算 QMDB root 并对拍 commitment 是可选审计模式。完整模式定义与当前实现
+> 缺口见 [`follower-validation-modes.md`](follower-validation-modes.md)。
+
 ---
 
 ## 一、整体性能概览
@@ -196,7 +204,7 @@ V6: ║──────────────────F──────
 |------|------|
 | Payload Cache命中率 | 100% |
 | Cache命中时EVM耗时 | 0ms (跳过重复执行) |
-| State Root耗时 | 0ms (DEFER模式) |
+| State Root耗时 | 0ms (本次历史测试使用 DEFER；不代表生产默认) |
 | Follower Import耗时 | ~0ms (cache hit) |
 | Follower Commit耗时 | 30-70ms |
 

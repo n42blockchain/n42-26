@@ -50,8 +50,10 @@ A high-performance blockchain system combining **HotStuff-2** BFT consensus with
 - **HotStuff-2 Consensus**: 2-round optimistic commit with 3-round timeout recovery
 - **BLS12-381 Signatures**: Aggregated signatures for compact quorum certificates
 - **reth v2.2.0 Integration**: Tracks `n42blockchain/reth` branch `n42-v2-upgrade`, based on upstream `v2.2.0` with N42-specific payload/cache patches applied on top
-- **Jellyfish Merkle Tree (JMT)**: Blake3 hashing, 16-shard parallel updates, Merkle proofs via RPC
-- **Compact Block Propagation**: Leader caches execution output, followers skip EVM re-execution (cache hit ~3ms)
+- **Reserve SBMT Path**: `N42_JMT=1` explicitly selects the legacy-compatible 16-shard sparse binary backend and RPC surface
+- **Compact Block Propagation**: Leader caches execution output; the default follower path skips duplicate EVM execution (cache hit ~3ms)
+- **QMDB Binary Twig Backend**: The QMDB-style 16-shard binary twig tree is the default N42 state-proof backend (`N42_TWIG` defaults on)
+- **Follower Validation Modes**: Target production default is cache-hit + QMDB/LtHash commitment verification; six-follower independent full replay is the optional audit mode (see [`docs/follower-validation-modes.md`](docs/follower-validation-modes.md))
 - **Optimistic Voting**: Followers vote immediately after proposal validation, before block import
 - **TX Forward to Leader**: O(n) message complexity replacing O(n²) gossip for transactions
 - **Binary TCP Injection**: High-throughput transaction injection for stress testing (122K tx/s)
