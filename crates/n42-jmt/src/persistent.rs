@@ -172,6 +172,8 @@ pub struct PersistentSbmt {
     /// diverged from healthy nodes (F1a/F1b). Carries the failing version +
     /// cause for diagnostics.
     poisoned: Option<String>,
+    /// Whether any state was restored from a snapshot or WAL on open (F6).
+    restored_from_disk: bool,
 }
 
 /// Read all `(version, StateDiff)` records from a WAL file (empty if absent).
@@ -282,13 +284,14 @@ impl PersistentSbmt {
     pub fn open(snapshot_path: impl AsRef<Path>, snapshot_interval: u64) -> eyre::Result<Self> {
         let snapshot_path = snapshot_path.as_ref().to_path_buf();
         let wal_path = snapshot_path.with_extension("wal");
-        let (mut inner, last_snapshot_version) = match load_snapshot(&snapshot_path)? {
-            Some(snap) => {
-                let version = snap.version;
-                (ShardedSbmt::from_snapshot(&snap)?, version)
-            }
-            None => (ShardedSbmt::new(), 0),
-        };
+        let (mut inner, last_snapshot_version, snapshot_present) =
+            match load_snapshot(&snapshot_path)? {
+                Some(snap) => {
+                    let version = snap.version;
+                    (ShardedSbmt::from_snapshot(&snap)?, version, true)
+                }
+                None => (ShardedSbmt::new(), 0, false),
+            };
 
         // Replay WAL records newer than the snapshot to recover committed blocks
         // that were not yet checkpointed when the process stopped. Records must be
@@ -333,6 +336,7 @@ impl PersistentSbmt {
             last_snapshot_version,
             pending_flush: None,
             poisoned: None,
+            restored_from_disk: snapshot_present || replayed > 0,
         })
     }
 
@@ -349,6 +353,13 @@ impl PersistentSbmt {
     /// The reason this sink was poisoned, if any.
     pub fn poison_reason(&self) -> Option<&str> {
         self.poisoned.as_deref()
+    }
+
+    /// Whether any state was restored from a snapshot or WAL on open (F6).
+    /// SBMT is root-neutral to a re-seed (map semantics), but the guard keeps
+    /// the two sinks symmetric and avoids a redundant reseed on every restart.
+    pub fn restored_from_disk(&self) -> bool {
+        self.restored_from_disk
     }
 
     /// Combined root hash across all 16 shards.
@@ -548,6 +559,10 @@ pub struct PersistentTwig {
     /// diverged from healthy nodes (F1a/F1b). Carries the failing version +
     /// cause for diagnostics.
     poisoned: Option<String>,
+    /// Whether any state was restored from a snapshot or WAL on open (F6). The
+    /// caller uses this to skip idempotency-breaking genesis reseeding even when
+    /// the restored version is still 0 (genesis seeding does not bump version).
+    restored_from_disk: bool,
 }
 
 impl PersistentTwig {
@@ -555,13 +570,14 @@ impl PersistentTwig {
     pub fn open(snapshot_path: impl AsRef<Path>, snapshot_interval: u64) -> eyre::Result<Self> {
         let snapshot_path = snapshot_path.as_ref().to_path_buf();
         let wal_path = snapshot_path.with_extension("wal");
-        let (mut inner, last_snapshot_version) = match load_twig_snapshot(&snapshot_path)? {
-            Some(snap) => {
-                let version = snap.version;
-                (TwigState::from_snapshot(&snap), version)
-            }
-            None => (TwigState::new(), 0),
-        };
+        let (mut inner, last_snapshot_version, snapshot_present) =
+            match load_twig_snapshot(&snapshot_path)? {
+                Some(snap) => {
+                    let version = snap.version;
+                    (TwigState::from_snapshot(&snap), version, true)
+                }
+                None => (TwigState::new(), 0, false),
+            };
 
         let mut replayed = 0u64;
         for (version, diff) in read_wal_entries(&wal_path)? {
@@ -601,6 +617,7 @@ impl PersistentTwig {
             last_snapshot_version,
             pending_flush: None,
             poisoned: None,
+            restored_from_disk: snapshot_present || replayed > 0,
         })
     }
 
@@ -617,6 +634,14 @@ impl PersistentTwig {
     /// The reason this sink was poisoned, if any.
     pub fn poison_reason(&self) -> Option<&str> {
         self.poisoned.as_deref()
+    }
+
+    /// Whether any state was restored from a snapshot or WAL on open. When true,
+    /// the caller must NOT reseed genesis even at version 0 (F6): re-`set`ting an
+    /// existing key in the append-slot model deactivates the old slot and
+    /// appends a new one, producing a different root than an un-restarted node.
+    pub fn restored_from_disk(&self) -> bool {
+        self.restored_from_disk
     }
 
     /// Combined root hash across all twig shards.
@@ -1157,6 +1182,66 @@ mod tests {
         assert_eq!(sbmt.version(), version_before);
         let err2 = sbmt.apply_diff(&make_diff(5)).unwrap_err();
         assert!(err2.to_string().contains("poisoned"));
+    }
+
+    /// F6: after a restart-before-first-block, a restored twig must NOT reseed
+    /// genesis. The guard keeps the append-ordered root identical; the same test
+    /// shows that reseeding a restored tree WOULD change the root (the bug).
+    #[test]
+    fn twig_genesis_reseed_guard_keeps_root_stable_across_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("twig.snapshot");
+
+        let seed = |twig: &mut PersistentTwig| {
+            twig.inner_mut().seed_genesis_account(
+                Address::with_last_byte(0x42),
+                U256::from(1_000_000u64),
+                7,
+                B256::ZERO,
+                std::iter::empty::<(U256, U256)>(),
+            );
+        };
+
+        // First boot: fresh start, seed genesis, flush a version-0 snapshot.
+        let root_after_seed = {
+            let mut twig = PersistentTwig::open(&path, u64::MAX).unwrap();
+            assert!(!twig.restored_from_disk(), "a fresh start is not restored");
+            assert!(twig.version() == 0 && !twig.restored_from_disk());
+            seed(&mut twig);
+            twig.flush().unwrap();
+            assert_eq!(twig.version(), 0, "genesis seeding does not bump the version");
+            twig.root_hash()
+        };
+
+        // Restart before the first block: the version-0 snapshot is restored.
+        {
+            let mut twig = PersistentTwig::open(&path, u64::MAX).unwrap();
+            assert!(
+                twig.restored_from_disk(),
+                "a persisted snapshot marks the tree restored"
+            );
+            assert!(
+                !(twig.version() == 0 && !twig.restored_from_disk()),
+                "the reseed guard must be false for a restored tree"
+            );
+            assert_eq!(
+                twig.root_hash(),
+                root_after_seed,
+                "the root must be identical after a guarded restart"
+            );
+        }
+
+        // Sanity / bug demonstration: reseeding a restored append-slot tree DOES
+        // change the root — exactly what the guard prevents.
+        {
+            let mut twig = PersistentTwig::open(&path, u64::MAX).unwrap();
+            seed(&mut twig);
+            assert_ne!(
+                twig.root_hash(),
+                root_after_seed,
+                "reseeding a restored append-slot tree changes the root (the F6 bug)"
+            );
+        }
     }
 
     #[test]
