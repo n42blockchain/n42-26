@@ -2080,7 +2080,7 @@ mod tests {
     #[derive(Clone)]
     struct MockExecutionLayer {
         new_payload_status: PayloadStatusEnum,
-        fcu_status: PayloadStatusEnum,
+        fcu_statuses: Arc<Mutex<VecDeque<PayloadStatusEnum>>>,
         build_parents: Arc<Mutex<Vec<B256>>>,
         /// Every attribute-less forkchoiceUpdated head - the canonical-writer
         /// audit trail (import paths must NEVER appear here).
@@ -2093,7 +2093,25 @@ mod tests {
         fn new(new_payload_status: PayloadStatusEnum, fcu_status: PayloadStatusEnum) -> Self {
             Self {
                 new_payload_status,
-                fcu_status,
+                fcu_statuses: Arc::new(Mutex::new(VecDeque::from([fcu_status]))),
+                build_parents: Arc::new(Mutex::new(Vec::new())),
+                fcu_heads: Arc::new(Mutex::new(Vec::new())),
+                new_payload_hashes: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn with_fcu_statuses(
+            new_payload_status: PayloadStatusEnum,
+            fcu_statuses: impl IntoIterator<Item = PayloadStatusEnum>,
+        ) -> Self {
+            let fcu_statuses = fcu_statuses.into_iter().collect::<VecDeque<_>>();
+            assert!(
+                !fcu_statuses.is_empty(),
+                "at least one FCU status is required"
+            );
+            Self {
+                new_payload_status,
+                fcu_statuses: Arc::new(Mutex::new(fcu_statuses)),
                 build_parents: Arc::new(Mutex::new(Vec::new())),
                 fcu_heads: Arc::new(Mutex::new(Vec::new())),
                 new_payload_hashes: Arc::new(Mutex::new(Vec::new())),
@@ -2143,7 +2161,16 @@ mod tests {
                 .lock()
                 .expect("mock execution-layer lock")
                 .push(state.head_block_hash);
-            Ok(ForkchoiceUpdated::from_status(self.fcu_status.clone()))
+            let mut statuses = self.fcu_statuses.lock().expect("mock execution-layer lock");
+            let status = if statuses.len() > 1 {
+                statuses.pop_front().expect("non-empty FCU status queue")
+            } else {
+                statuses
+                    .front()
+                    .expect("non-empty FCU status queue")
+                    .clone()
+            };
+            Ok(ForkchoiceUpdated::from_status(status))
         }
 
         async fn fork_choice_updated_with_attrs(
@@ -2664,9 +2691,9 @@ mod tests {
         let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
         let previous_head = B256::repeat_byte(0x34);
         let eager_hash = B256::repeat_byte(0xF0);
-        let mock_el = Arc::new(MockExecutionLayer::new(
+        let mock_el = Arc::new(MockExecutionLayer::with_fcu_statuses(
             PayloadStatusEnum::Valid,
-            PayloadStatusEnum::Syncing,
+            [PayloadStatusEnum::Syncing, PayloadStatusEnum::Valid],
         ));
         let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
         orch.el = Some(mock_el);
@@ -3872,9 +3899,9 @@ mod tests {
         let committed_hash = B256::repeat_byte(0xF0);
         // FCU returns Syncing first, forcing the finalize path to drain the
         // eager completion channel — the rescue route for an evicted entry.
-        let mock_el = Arc::new(MockExecutionLayer::new(
+        let mock_el = Arc::new(MockExecutionLayer::with_fcu_statuses(
             PayloadStatusEnum::Valid,
-            PayloadStatusEnum::Syncing,
+            [PayloadStatusEnum::Syncing, PayloadStatusEnum::Valid],
         ));
         let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
         orch.el = Some(mock_el);
