@@ -208,12 +208,17 @@ impl RpcClient {
         Ok(u64::from_str_radix(hex.trim_start_matches("0x"), 16)?)
     }
 
-    /// Returns the current nonce for an address.
+    /// Returns the next usable nonce for an address, including transactions
+    /// already accepted into the local pool.
+    ///
+    /// E2E senders resynchronize after high-volume phases while the pool may
+    /// still contain unmined transactions. Querying `latest` there reuses the
+    /// first pending nonce and produces a replacement-underpriced failure.
     pub async fn get_nonce(&self, address: Address) -> eyre::Result<u64> {
         let hex: String = self
             .call(
                 "eth_getTransactionCount",
-                json!([format!("{address:?}"), "latest"]),
+                json!([format!("{address:?}"), "pending"]),
             )
             .await?;
         Ok(u64::from_str_radix(hex.trim_start_matches("0x"), 16)?)
