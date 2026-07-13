@@ -1384,7 +1384,12 @@ impl ConsensusService {
                             }
                         }
                         Err(e) => {
-                            warn!(target: "n42::jmt", error = %e, "SBMT apply_diff/persist failed");
+                            // A failed apply poisons the sink (F1b): it now
+                            // refuses every later diff, so update_jmt_root is
+                            // never called again and the node stops publishing a
+                            // root that has silently diverged. Surface it loudly.
+                            error!(target: "n42::jmt", view, %block_hash, error = %e, "SBMT apply_diff/persist failed; sink poisoned, no further roots published");
+                            counter!("n42_jmt_sink_poisoned").increment(1);
                         }
                     }
                 }
@@ -1412,7 +1417,12 @@ impl ConsensusService {
                             }
                         }
                         Err(e) => {
-                            warn!(target: "n42::twig", error = %e, "Twig apply_diff/persist failed");
+                            // A failed apply poisons the sink (F1b): it now
+                            // refuses every later diff, so update_twig_root is
+                            // never called again and the node stops publishing a
+                            // root that has silently diverged. Surface it loudly.
+                            error!(target: "n42::twig", view, %block_hash, error = %e, "Twig apply_diff/persist failed; sink poisoned, no further roots published");
+                            counter!("n42_twig_sink_poisoned").increment(1);
                         }
                     }
                 }

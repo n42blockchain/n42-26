@@ -167,12 +167,25 @@ pub struct PersistentSbmt {
     snapshot_interval: u64,
     last_snapshot_version: u64,
     pending_flush: Option<JoinHandle<eyre::Result<()>>>,
+    /// Set once a WAL append or apply fails: the sink is poisoned and refuses
+    /// every further apply, so it can never silently produce a root that has
+    /// diverged from healthy nodes (F1a/F1b). Carries the failing version +
+    /// cause for diagnostics.
+    poisoned: Option<String>,
 }
 
 /// Read all `(version, StateDiff)` records from a WAL file (empty if absent).
 ///
 /// Record format: `[version: u64 LE][len: u32 LE][bincode(StateDiff): len]`.
-/// A truncated or corrupt trailing record (crash mid-write) is discarded.
+///
+/// A *truncated trailing* record (a crash mid-append whose declared length runs
+/// past EOF) is tolerated — every complete record before it is durable. But a
+/// record whose bytes are fully present yet fail to decode is *interior*
+/// corruption: it is an error, not a truncation, because silently `break`ing
+/// there would discard every later, fully durable record (F1a). The append path
+/// rolls back a partial write so this pathological "partial followed by valid"
+/// layout should never be produced in the first place; failing loud here is the
+/// backstop for on-disk corruption the append path could not have prevented.
 fn read_wal_entries(path: &Path) -> eyre::Result<Vec<(u64, StateDiff)>> {
     let data = match std::fs::read(path) {
         Ok(d) => d,
@@ -185,11 +198,16 @@ fn read_wal_entries(path: &Path) -> eyre::Result<Vec<(u64, StateDiff)>> {
         let len = u32::from_le_bytes(data[off + 8..off + 12].try_into().unwrap()) as usize;
         let start = off + 12;
         if start + len > data.len() {
-            break; // truncated trailing record
+            break; // truncated trailing record — tolerate
         }
         match bincode::deserialize::<StateDiff>(&data[start..start + len]) {
             Ok(diff) => entries.push((version, diff)),
-            Err(_) => break, // corrupt trailing record
+            Err(e) => {
+                return Err(eyre::eyre!(
+                    "WAL record at offset {off} (version {version}, len {len}) is fully present but \
+                     does not decode: {e}; refusing to silently drop later durable records"
+                ));
+            }
         }
         off = start + len;
     }
@@ -314,12 +332,23 @@ impl PersistentSbmt {
             snapshot_interval: snapshot_interval.max(1),
             last_snapshot_version,
             pending_flush: None,
+            poisoned: None,
         })
     }
 
     /// Current global version.
     pub fn version(&self) -> u64 {
         self.inner.version()
+    }
+
+    /// Whether the sink has been poisoned by a WAL/apply failure.
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned.is_some()
+    }
+
+    /// The reason this sink was poisoned, if any.
+    pub fn poison_reason(&self) -> Option<&str> {
+        self.poisoned.as_deref()
     }
 
     /// Combined root hash across all 16 shards.
@@ -348,11 +377,24 @@ impl PersistentSbmt {
     /// Apply a `StateDiff` (zero node IO), triggering a background snapshot once
     /// `snapshot_interval` versions have elapsed since the last persisted one.
     pub fn apply_diff(&mut self, diff: &StateDiff) -> eyre::Result<(u64, B256)> {
+        // Once poisoned, refuse without touching the WAL or memory. A sink that
+        // silently kept producing wrong roots is worse than one that stops.
+        if let Some(reason) = &self.poisoned {
+            return Err(eyre::eyre!("SBMT sink is poisoned, refusing apply: {reason}"));
+        }
         // WAL-ahead: append the record durably BEFORE mutating memory, so a crash
         // can only lose in-memory state (recoverable by replay) and never leave
         // memory ahead of the WAL. `apply_diff` will assign exactly this version.
         let next_version = self.inner.version() + 1;
-        self.append_wal(next_version, diff)?;
+        if let Err(e) = self.append_wal(next_version, diff) {
+            // The WAL append is the only fallible step before memory mutation.
+            // If it fails, this block's diff is not durable; poison rather than
+            // continue, so block N+1 can never be applied as version N and drift
+            // the version→block mapping (F1b).
+            let reason = format!("WAL append failed at version {next_version}: {e}");
+            self.poisoned = Some(reason.clone());
+            return Err(eyre::eyre!(reason));
+        }
         let (version, root) = self.inner.apply_diff(diff);
         debug_assert_eq!(version, next_version);
         if version.saturating_sub(self.last_snapshot_version) >= self.snapshot_interval {
@@ -362,17 +404,43 @@ impl PersistentSbmt {
         Ok((version, root))
     }
 
-    /// Append a `(version, diff)` record to the WAL and flush it to the OS.
+    /// Append a `(version, diff)` record to the WAL and flush it to the OS,
+    /// rolling the file back to the previous record boundary on any write/sync
+    /// error so a partial record can never be followed by a later append (F1a).
     fn append_wal(&mut self, version: u64, diff: &StateDiff) -> eyre::Result<()> {
         let bytes = bincode::serialize(diff)?;
-        self.wal.write_all(&version.to_le_bytes())?;
-        self.wal.write_all(&(bytes.len() as u32).to_le_bytes())?;
-        self.wal.write_all(&bytes)?;
-        // fsync so the record is durable against OS/power crash, not just a
-        // process crash. SBMT applies run in a background spawn_blocking task
-        // (off the consensus critical path), so the per-block fsync is affordable.
-        self.wal.sync_data()?;
-        Ok(())
+        // Durable length before this record; the rollback target.
+        let prev_len = self.wal.metadata()?.len();
+        match Self::write_wal_record(&mut self.wal, version, &bytes) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // Truncate the partial record and re-sync. If the rollback
+                // itself fails the file may still hold a partial record, so the
+                // caller must poison the sink (no further appends).
+                match self.wal.set_len(prev_len).and_then(|()| self.wal.sync_data()) {
+                    Ok(()) => Err(eyre::eyre!(
+                        "WAL append failed at version {version}, rolled back to {prev_len} bytes: {e}"
+                    )),
+                    Err(re) => Err(eyre::eyre!(
+                        "WAL append failed at version {version} and rollback failed ({re}); \
+                         a partial record may remain: {e}"
+                    )),
+                }
+            }
+        }
+    }
+
+    /// Write one `[version][len][bincode(diff)]` record and fsync it. A free
+    /// function so `append_wal` can hold the rollback borrow of `self.wal`.
+    ///
+    /// fsync makes the record durable against OS/power crash, not just a process
+    /// crash. SBMT applies run in a background task (off the consensus critical
+    /// path), so the per-block fsync is affordable.
+    fn write_wal_record(wal: &mut File, version: u64, bytes: &[u8]) -> std::io::Result<()> {
+        wal.write_all(&version.to_le_bytes())?;
+        wal.write_all(&(bytes.len() as u32).to_le_bytes())?;
+        wal.write_all(bytes)?;
+        wal.sync_data()
     }
 
     /// Clear the WAL after a durable snapshot, then reopen it for append.
@@ -431,6 +499,16 @@ impl PersistentSbmt {
         }
         Ok(())
     }
+
+    /// Test-only: swap the WAL handle for a read-only one so the next append
+    /// deterministically fails, exercising the F1a rollback + F1b poison path.
+    #[cfg(test)]
+    pub(crate) fn break_wal_handle_for_test(&mut self) {
+        self.wal = OpenOptions::new()
+            .read(true)
+            .open(&self.wal_path)
+            .expect("reopen WAL read-only");
+    }
 }
 
 impl Drop for PersistentSbmt {
@@ -453,6 +531,11 @@ pub struct PersistentTwig {
     snapshot_interval: u64,
     last_snapshot_version: u64,
     pending_flush: Option<JoinHandle<eyre::Result<()>>>,
+    /// Set once a WAL append or apply fails: the sink is poisoned and refuses
+    /// every further apply, so it can never silently produce a root that has
+    /// diverged from healthy nodes (F1a/F1b). Carries the failing version +
+    /// cause for diagnostics.
+    poisoned: Option<String>,
 }
 
 impl PersistentTwig {
@@ -505,12 +588,23 @@ impl PersistentTwig {
             snapshot_interval: snapshot_interval.max(1),
             last_snapshot_version,
             pending_flush: None,
+            poisoned: None,
         })
     }
 
     /// Current global version.
     pub fn version(&self) -> u64 {
         self.inner.version()
+    }
+
+    /// Whether the sink has been poisoned by a WAL/apply failure.
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned.is_some()
+    }
+
+    /// The reason this sink was poisoned, if any.
+    pub fn poison_reason(&self) -> Option<&str> {
+        self.poisoned.as_deref()
     }
 
     /// Combined root hash across all twig shards.
@@ -535,8 +629,21 @@ impl PersistentTwig {
 
     /// Apply a `StateDiff`, triggering a durable checkpoint on snapshot interval.
     pub fn apply_diff(&mut self, diff: &StateDiff) -> eyre::Result<(u64, B256)> {
+        // Once poisoned, refuse without touching the WAL or memory. The twig
+        // root is a function of append history, so a silent continue after a
+        // failed step diverges the root from every healthy node permanently.
+        if let Some(reason) = &self.poisoned {
+            return Err(eyre::eyre!("Twig sink is poisoned, refusing apply: {reason}"));
+        }
         let next_version = self.inner.version() + 1;
-        self.append_wal(next_version, diff)?;
+        if let Err(e) = self.append_wal(next_version, diff) {
+            // WAL append is the only fallible step before memory mutation; on
+            // failure poison rather than continue, so block N+1 can never be
+            // applied as version N and drift the version→block mapping (F1b).
+            let reason = format!("WAL append failed at version {next_version}: {e}");
+            self.poisoned = Some(reason.clone());
+            return Err(eyre::eyre!(reason));
+        }
         let (version, root) = self.inner.apply_diff(diff);
         debug_assert_eq!(version, next_version);
         if version.saturating_sub(self.last_snapshot_version) >= self.snapshot_interval {
@@ -545,13 +652,33 @@ impl PersistentTwig {
         Ok((version, root))
     }
 
+    /// Append a `(version, diff)` record to the WAL, rolling the file back to the
+    /// previous record boundary on any write/sync error so a partial record can
+    /// never be followed by a later append (F1a).
     fn append_wal(&mut self, version: u64, diff: &StateDiff) -> eyre::Result<()> {
         let bytes = bincode::serialize(diff)?;
-        self.wal.write_all(&version.to_le_bytes())?;
-        self.wal.write_all(&(bytes.len() as u32).to_le_bytes())?;
-        self.wal.write_all(&bytes)?;
-        self.wal.sync_data()?;
-        Ok(())
+        let prev_len = self.wal.metadata()?.len();
+        match Self::write_wal_record(&mut self.wal, version, &bytes) {
+            Ok(()) => Ok(()),
+            Err(e) => match self.wal.set_len(prev_len).and_then(|()| self.wal.sync_data()) {
+                Ok(()) => Err(eyre::eyre!(
+                    "WAL append failed at version {version}, rolled back to {prev_len} bytes: {e}"
+                )),
+                Err(re) => Err(eyre::eyre!(
+                    "WAL append failed at version {version} and rollback failed ({re}); \
+                     a partial record may remain: {e}"
+                )),
+            },
+        }
+    }
+
+    /// Write one `[version][len][bincode(diff)]` record and fsync it. A free
+    /// function so `append_wal` can hold the rollback borrow of `self.wal`.
+    fn write_wal_record(wal: &mut File, version: u64, bytes: &[u8]) -> std::io::Result<()> {
+        wal.write_all(&version.to_le_bytes())?;
+        wal.write_all(&(bytes.len() as u32).to_le_bytes())?;
+        wal.write_all(bytes)?;
+        wal.sync_data()
     }
 
     fn truncate_wal(&mut self) -> eyre::Result<()> {
@@ -607,6 +734,16 @@ impl PersistentTwig {
                 .map_err(|_| eyre::eyre!("snapshot flush thread panicked"))??;
         }
         Ok(())
+    }
+
+    /// Test-only: swap the WAL handle for a read-only one so the next append
+    /// deterministically fails, exercising the F1a rollback + F1b poison path.
+    #[cfg(test)]
+    pub(crate) fn break_wal_handle_for_test(&mut self) {
+        self.wal = OpenOptions::new()
+            .read(true)
+            .open(&self.wal_path)
+            .expect("reopen WAL read-only");
     }
 }
 
@@ -885,6 +1022,117 @@ mod tests {
         let mut reopened = PersistentTwig::open(&path, u64::MAX).unwrap();
         assert_eq!(reopened.version(), version);
         assert_eq!(reopened.root_hash(), root);
+    }
+
+    /// Build a raw WAL byte stream from `(version, StateDiff)` records for the
+    /// corruption tests (mirrors `append_wal`'s on-disk format).
+    fn encode_wal_records(records: &[(u64, StateDiff)]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for (version, diff) in records {
+            let body = bincode::serialize(diff).unwrap();
+            bytes.extend_from_slice(&version.to_le_bytes());
+            bytes.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(&body);
+        }
+        bytes
+    }
+
+    /// F1a: a truncated trailing record (crash mid-append) is tolerated — every
+    /// complete record before it still replays.
+    #[test]
+    fn wal_truncated_trailing_record_is_tolerated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("twig.snapshot");
+        let wal_path = path.with_extension("wal");
+
+        let mut bytes = encode_wal_records(&[(1, make_diff(3)), (2, make_diff(4))]);
+        // Truncated trailing record: header claims len=100 but only 10 body bytes.
+        bytes.extend_from_slice(&3u64.to_le_bytes());
+        bytes.extend_from_slice(&100u32.to_le_bytes());
+        bytes.extend_from_slice(&[0u8; 10]);
+        std::fs::write(&wal_path, &bytes).unwrap();
+
+        let reopened = PersistentTwig::open(&path, u64::MAX).unwrap();
+        assert_eq!(
+            reopened.version(),
+            2,
+            "both complete records must replay; the truncated tail is dropped"
+        );
+    }
+
+    /// F1a: a record whose bytes are fully present but do not decode is interior
+    /// corruption — `open` must fail loud rather than silently drop later records.
+    #[test]
+    fn wal_interior_corruption_fails_loud() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("twig.snapshot");
+        let wal_path = path.with_extension("wal");
+
+        let mut bytes = encode_wal_records(&[(1, make_diff(3))]);
+        // A fully-present but undecodable record (huge bincode map length → EOF).
+        let garbage = vec![0xFFu8; 32];
+        bytes.extend_from_slice(&2u64.to_le_bytes());
+        bytes.extend_from_slice(&(garbage.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&garbage);
+        std::fs::write(&wal_path, &bytes).unwrap();
+
+        let err = match PersistentTwig::open(&path, u64::MAX) {
+            Ok(_) => panic!("interior WAL corruption must fail open, not succeed"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("does not decode"),
+            "interior WAL corruption must fail loud, got: {err}"
+        );
+    }
+
+    /// F1b: a WAL append failure poisons the sink; memory does not advance and
+    /// every later apply fails fast without touching the WAL or the tree.
+    #[test]
+    fn twig_apply_failure_poisons_sink_and_fails_fast() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("twig.snapshot");
+        let mut twig = PersistentTwig::open(&path, u64::MAX).unwrap();
+        twig.apply_diff(&make_diff(5)).unwrap();
+        let version_before = twig.version();
+        assert!(!twig.is_poisoned());
+
+        twig.break_wal_handle_for_test();
+        let err = twig.apply_diff(&make_diff(5)).unwrap_err();
+        assert!(
+            err.to_string().contains("WAL append failed"),
+            "the first failure should be a WAL append error: {err}"
+        );
+        assert!(twig.is_poisoned(), "a WAL failure must poison the sink");
+        assert_eq!(
+            twig.version(),
+            version_before,
+            "memory must not advance past a non-durable block"
+        );
+
+        let err2 = twig.apply_diff(&make_diff(5)).unwrap_err();
+        assert!(
+            err2.to_string().contains("poisoned"),
+            "further applies must fail fast: {err2}"
+        );
+        assert_eq!(twig.version(), version_before);
+    }
+
+    /// F1b mirror on the SBMT sink.
+    #[test]
+    fn sbmt_apply_failure_poisons_sink_and_fails_fast() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sbmt.snapshot");
+        let mut sbmt = PersistentSbmt::open(&path, u64::MAX).unwrap();
+        sbmt.apply_diff(&make_diff(5)).unwrap();
+        let version_before = sbmt.version();
+
+        sbmt.break_wal_handle_for_test();
+        let _ = sbmt.apply_diff(&make_diff(5)).unwrap_err();
+        assert!(sbmt.is_poisoned(), "a WAL failure must poison the SBMT sink");
+        assert_eq!(sbmt.version(), version_before);
+        let err2 = sbmt.apply_diff(&make_diff(5)).unwrap_err();
+        assert!(err2.to_string().contains("poisoned"));
     }
 
     #[test]
