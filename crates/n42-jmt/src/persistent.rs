@@ -257,6 +257,33 @@ fn read_wal_entries(path: &Path) -> eyre::Result<Vec<(u64, StateDiff)>> {
     Ok(entries)
 }
 
+/// Durably truncate a WAL while its append-only handle remains open, then
+/// replace that handle with a fresh append handle.
+///
+/// Truncating through `wal.set_len(0)` is not portable to Windows: an
+/// append-only handle has `FILE_APPEND_DATA`, while `SetEndOfFile` requires
+/// `FILE_WRITE_DATA`. Rust's default Windows share mode allows a separate
+/// write handle to truncate the same file without first invalidating `wal`.
+fn truncate_wal_for_checkpoint(wal: &mut File, wal_path: &Path) -> std::io::Result<()> {
+    let truncating = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(wal_path)?;
+    // A checkpoint is not complete until both the replacement snapshot and
+    // the WAL length change are durable. Closing alone only flushes userspace
+    // state; it does not provide the fsync guarantee promised by `flush()`.
+    truncating.sync_data()?;
+    drop(truncating);
+
+    let append = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(wal_path)?;
+    *wal = append;
+    Ok(())
+}
+
 fn twig_snapshot_entry_count(snapshot: &TwigSnapshot) -> usize {
     snapshot.shards.iter().map(|s| s.entries.len()).sum()
 }
@@ -523,9 +550,8 @@ impl PersistentSbmt {
 
     /// Clear the WAL after a durable snapshot, then reopen it for append.
     fn truncate_wal(&mut self) -> eyre::Result<()> {
-        self.wal.set_len(0)?;
-        self.wal.sync_data()?;
-        Ok(())
+        let wal_path = self.snapshot_path.with_extension("wal");
+        truncate_wal_for_checkpoint(&mut self.wal, &wal_path).map_err(Into::into)
     }
 
     /// Synchronous snapshot flush: blocks until durably written, then truncates
@@ -818,9 +844,8 @@ impl PersistentTwig {
     }
 
     fn truncate_wal(&mut self) -> eyre::Result<()> {
-        self.wal.set_len(0)?;
-        self.wal.sync_data()?;
-        Ok(())
+        let wal_path = self.snapshot_path.with_extension("wal");
+        truncate_wal_for_checkpoint(&mut self.wal, &wal_path).map_err(Into::into)
     }
 
     /// Synchronous snapshot flush: durably writes snapshot, then truncates WAL.
@@ -1032,11 +1057,26 @@ mod tests {
         let wal_len = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
         assert_eq!(wal_len, 0, "WAL must be empty after a checkpoint");
 
+        // The replacement append handle must remain usable, and a subsequent
+        // checkpoint must be able to repeat the portable truncate sequence.
+        jmt.apply_diff(&make_diff(11)).unwrap(); // version 3 → WAL append
+        assert!(
+            std::fs::metadata(&wal).unwrap().len() > 0,
+            "the reopened WAL handle must accept the next record"
+        );
+        jmt.apply_diff(&make_diff(12)).unwrap(); // version 4 → checkpoint again
+        assert_eq!(jmt.last_snapshot_version(), 4);
+        assert_eq!(
+            std::fs::metadata(&wal).unwrap().len(),
+            0,
+            "a repeated checkpoint must truncate the WAL again"
+        );
+
         let root = jmt.root_hash();
         drop(jmt);
         let reopened = PersistentSbmt::open(&path, 2).unwrap();
         assert_eq!(reopened.root_hash(), root);
-        assert_eq!(reopened.version(), 2);
+        assert_eq!(reopened.version(), 4);
     }
 
     #[test]
@@ -1120,10 +1160,24 @@ mod tests {
         let wal_len = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
         assert_eq!(wal_len, 0, "WAL must be empty after a checkpoint");
 
+        // Mirror the SBMT regression on the production-default QMDB/Twig sink.
+        twig.apply_diff(&make_diff(11)).unwrap(); // version 3 → WAL append
+        assert!(
+            std::fs::metadata(&wal).unwrap().len() > 0,
+            "the reopened WAL handle must accept the next record"
+        );
+        twig.apply_diff(&make_diff(12)).unwrap(); // version 4 → checkpoint again
+        assert_eq!(twig.last_snapshot_version(), 4);
+        assert_eq!(
+            std::fs::metadata(&wal).unwrap().len(),
+            0,
+            "a repeated checkpoint must truncate the WAL again"
+        );
+
         let root = twig.root_hash();
         drop(twig);
         let mut reopened = PersistentTwig::open(&path, 2).unwrap();
-        assert_eq!(reopened.version(), 2);
+        assert_eq!(reopened.version(), 4);
         assert_eq!(reopened.root_hash(), root);
     }
 
