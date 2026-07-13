@@ -124,7 +124,8 @@ impl ShardedSbmt {
     /// per-shard parallelism in `apply_diff` (extra intermediate Vecs + dispatch
     /// dominate for typical block sizes). The lock-free shard storage lets the
     /// `code_hash` read-back hit the value map directly, no `Mutex`.
-    fn prepare(&self, diff: &StateDiff) -> Vec<Vec<(Hash, Option<Vec<u8>>)>> {
+    #[allow(clippy::type_complexity)]
+    fn prepare(&self, diff: &StateDiff) -> eyre::Result<Vec<Vec<(Hash, Option<Vec<u8>>)>>> {
         let mut shard_updates: Vec<Vec<(Hash, Option<Vec<u8>>)>> =
             (0..SHARD_COUNT).map(|_| Vec::new()).collect();
 
@@ -145,10 +146,27 @@ impl ShardedSbmt {
                     let nonce = account_diff.nonce.as_ref().map(|v| v.to).unwrap_or(0);
                     let code_hash = match &account_diff.code_change {
                         Some(change) => change.to.unwrap_or(EMPTY_CODE_HASH),
-                        None => self.values[si]
-                            .get(&key)
-                            .map(|v| decode_code_hash(v))
-                            .unwrap_or(EMPTY_CODE_HASH),
+                        None => match self.values[si].get(&key).map(|v| decode_code_hash(v)) {
+                            Some(h) => h,
+                            // A Created account legitimately has no prior leaf.
+                            None if matches!(
+                                account_diff.change_type,
+                                AccountChangeType::Created
+                            ) =>
+                            {
+                                EMPTY_CODE_HASH
+                            }
+                            // A Modified account with no code_change MUST have an
+                            // existing leaf; a miss means the tree lost it (F5).
+                            // Defaulting to EMPTY_CODE_HASH would commit a wrong
+                            // leaf and diverge the root — fail loud instead.
+                            None => {
+                                return Err(eyre::eyre!(
+                                    "SBMT read-miss: Modified account {address} has no code_change \
+                                     and no existing leaf; refusing to commit EMPTY_CODE_HASH"
+                                ));
+                            }
+                        },
                     };
                     let value = encode_account_value(&balance, nonce, &code_hash);
                     shard_updates[si].push((key, Some(value)));
@@ -167,15 +185,15 @@ impl ShardedSbmt {
             }
         }
 
-        shard_updates
+        Ok(shard_updates)
     }
 
     /// Apply a `StateDiff` across all 16 shards in parallel.
     ///
     /// Returns `(new_version, combined_root)`.
-    pub fn apply_diff(&mut self, diff: &StateDiff) -> (u64, B256) {
+    pub fn apply_diff(&mut self, diff: &StateDiff) -> eyre::Result<(u64, B256)> {
         let new_version = self.version + 1;
-        let shard_updates = self.prepare(diff);
+        let shard_updates = self.prepare(diff)?;
 
         let roots: Vec<Hash> = self
             .shards
@@ -200,7 +218,7 @@ impl ShardedSbmt {
             .collect();
 
         self.version = new_version;
-        (new_version, B256::from(shard_tree_root(&roots)))
+        Ok((new_version, B256::from(shard_tree_root(&roots))))
     }
 
     /// Per-shard `(leaf_count, value_count)` for diagnostics.
@@ -316,7 +334,7 @@ mod tests {
     #[test]
     fn basic_apply() {
         let mut t = ShardedSbmt::new();
-        let (v, root) = t.apply_diff(&created_diff(100));
+        let (v, root) = t.apply_diff(&created_diff(100)).unwrap();
         assert_eq!(v, 1);
         assert_ne!(root, B256::ZERO);
         assert_eq!(root, t.root_hash(), "returned root must match recomputed root");
@@ -338,7 +356,7 @@ mod tests {
                 },
             )]),
         };
-        t.apply_diff(&diff);
+        t.apply_diff(&diff).unwrap();
 
         let key = account_key(&addr).0;
         let value = t.get(&key).unwrap();
@@ -351,15 +369,15 @@ mod tests {
         let diff = created_diff(64);
         let mut a = ShardedSbmt::new();
         let mut b = ShardedSbmt::new();
-        let (_, ra) = a.apply_diff(&diff);
-        let (_, rb) = b.apply_diff(&diff);
+        let (_, ra) = a.apply_diff(&diff).unwrap();
+        let (_, rb) = b.apply_diff(&diff).unwrap();
         assert_eq!(ra, rb, "same diff → same combined root");
     }
 
     #[test]
     fn distributes_across_shards() {
         let mut t = ShardedSbmt::new();
-        t.apply_diff(&created_diff(200));
+        t.apply_diff(&created_diff(200)).unwrap();
         let non_empty = t.shard_stats().iter().filter(|(n, _)| *n > 0).count();
         assert!(non_empty >= 8, "expected ≥8 non-empty shards, got {non_empty}");
     }
@@ -367,7 +385,7 @@ mod tests {
     #[test]
     fn read_back_value() {
         let mut t = ShardedSbmt::new();
-        t.apply_diff(&created_diff(10));
+        t.apply_diff(&created_diff(10)).unwrap();
         let mut b = [0u8; 20];
         b[..8].copy_from_slice(&3u64.to_le_bytes());
         let key = account_key(&Address::from(b)).0;
@@ -377,7 +395,7 @@ mod tests {
     #[test]
     fn snapshot_roundtrip() {
         let mut t = ShardedSbmt::new();
-        t.apply_diff(&created_diff(120));
+        t.apply_diff(&created_diff(120)).unwrap();
         let root = t.root_hash();
         let version = t.version();
 
@@ -393,7 +411,7 @@ mod tests {
     #[test]
     fn from_snapshot_rejects_root_mismatch() {
         let mut t = ShardedSbmt::new();
-        t.apply_diff(&created_diff(8));
+        t.apply_diff(&created_diff(8)).unwrap();
         let mut snap = t.snapshot();
         snap.root[0] ^= 0xFF;
         assert!(ShardedSbmt::from_snapshot(&snap).is_err());
@@ -416,7 +434,7 @@ mod tests {
                 storage: BTreeMap::new(),
             },
         );
-        t.apply_diff(&StateDiff { accounts: a1 });
+        t.apply_diff(&StateDiff { accounts: a1 }).unwrap();
 
         // Balance-only modify, code_change = None.
         let mut a2 = BTreeMap::new();
@@ -430,7 +448,7 @@ mod tests {
                 storage: BTreeMap::new(),
             },
         );
-        t.apply_diff(&StateDiff { accounts: a2 });
+        t.apply_diff(&StateDiff { accounts: a2 }).unwrap();
 
         let key = account_key(&addr).0;
         let val = t.get(&key).unwrap();
@@ -440,7 +458,7 @@ mod tests {
     #[test]
     fn sharded_proof_inclusion_exclusion_tamper() {
         let mut t = ShardedSbmt::new();
-        t.apply_diff(&created_diff(500));
+        t.apply_diff(&created_diff(500)).unwrap();
         let root = t.root_hash();
 
         let key = account_key(&addr_of(42)).0;
@@ -462,7 +480,7 @@ mod tests {
     fn proof_size_vs_jmt() {
         let diff = created_diff(5_000);
         let mut sbmt = ShardedSbmt::new();
-        sbmt.apply_diff(&diff);
+        sbmt.apply_diff(&diff).unwrap();
         let mut jmt = crate::ShardedJmt::new();
         jmt.apply_diff(&diff).unwrap();
 

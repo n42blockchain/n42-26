@@ -176,7 +176,7 @@ fn bench_apply_diff_distinct(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("sbmt", n), &diff, |b, d| {
             b.iter(|| {
                 let mut t = ShardedSbmt::new();
-                black_box(t.apply_diff(d));
+                black_box(t.apply_diff(d).unwrap());
             });
         });
         group.bench_with_input(BenchmarkId::new("jmt", n), &diff, |b, d| {
@@ -201,7 +201,7 @@ fn bench_apply_diff_sharded_bmt(c: &mut Criterion) {
             |b, diff| {
                 b.iter(|| {
                     let mut jmt = ShardedSbmt::new();
-                    black_box(jmt.apply_diff(diff));
+                    black_box(jmt.apply_diff(diff).unwrap());
                 });
             },
         );

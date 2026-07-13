@@ -148,13 +148,27 @@ impl<S: TreeStore> N42JmtTree<S> {
                     // read existing code_hash from current leaf to preserve it.
                     let code_hash = match &account_diff.code_change {
                         Some(change) => change.to.unwrap_or(EMPTY_CODE_HASH),
-                        None => {
-                            // Code unchanged — read existing code_hash from tree.
-                            self.get(key)?
-                                .as_deref()
-                                .map(decode_code_hash)
-                                .unwrap_or(EMPTY_CODE_HASH)
-                        }
+                        None => match self.get(key)?.as_deref().map(decode_code_hash) {
+                            Some(h) => h,
+                            // A Created account legitimately has no prior leaf.
+                            None if matches!(
+                                account_diff.change_type,
+                                AccountChangeType::Created
+                            ) =>
+                            {
+                                EMPTY_CODE_HASH
+                            }
+                            // A Modified account with no code_change MUST have an
+                            // existing leaf; a miss means the tree lost it (F5).
+                            // Defaulting to EMPTY_CODE_HASH would commit a wrong
+                            // leaf and diverge the root — fail loud instead.
+                            None => {
+                                return Err(eyre::eyre!(
+                                    "JMT read-miss: Modified account {address} has no code_change \
+                                     and no existing leaf; refusing to commit EMPTY_CODE_HASH"
+                                ));
+                            }
+                        },
                     };
 
                     let value = encode_account_value(&balance, nonce, &code_hash);

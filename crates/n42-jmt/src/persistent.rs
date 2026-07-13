@@ -307,7 +307,7 @@ impl PersistentSbmt {
                      refusing to replay to avoid silent state corruption"
                 ));
             }
-            inner.apply_diff(&diff);
+            inner.apply_diff(&diff)?;
             replayed += 1;
         }
         if replayed > 0 {
@@ -395,7 +395,19 @@ impl PersistentSbmt {
             self.poisoned = Some(reason.clone());
             return Err(eyre::eyre!(reason));
         }
-        let (version, root) = self.inner.apply_diff(diff);
+        let (version, root) = match self.inner.apply_diff(diff) {
+            Ok(vr) => vr,
+            Err(e) => {
+                // A read-miss (F5) or other apply error must poison the sink,
+                // not silently continue with a diverged root. The WAL record is
+                // already durable (a valid block diff); a clean replay from a
+                // good snapshot may still apply it, so this halts only the
+                // current session rather than corrupting persisted state.
+                let reason = format!("state-tree apply failed at version {next_version}: {e}");
+                self.poisoned = Some(reason.clone());
+                return Err(eyre::eyre!(reason));
+            }
+        };
         debug_assert_eq!(version, next_version);
         if version.saturating_sub(self.last_snapshot_version) >= self.snapshot_interval {
             // Synchronous checkpoint so the WAL can be safely truncated afterward.
@@ -563,7 +575,7 @@ impl PersistentTwig {
                      refusing to replay to avoid silent state corruption"
                 ));
             }
-            inner.apply_diff(&diff);
+            inner.apply_diff(&diff)?;
             replayed += 1;
         }
         if replayed > 0 {
@@ -644,7 +656,19 @@ impl PersistentTwig {
             self.poisoned = Some(reason.clone());
             return Err(eyre::eyre!(reason));
         }
-        let (version, root) = self.inner.apply_diff(diff);
+        let (version, root) = match self.inner.apply_diff(diff) {
+            Ok(vr) => vr,
+            Err(e) => {
+                // A read-miss (F5) or other apply error must poison the sink,
+                // not silently continue with a diverged root. The WAL record is
+                // already durable (a valid block diff); a clean replay from a
+                // good snapshot may still apply it, so this halts only the
+                // current session rather than corrupting persisted state.
+                let reason = format!("state-tree apply failed at version {next_version}: {e}");
+                self.poisoned = Some(reason.clone());
+                return Err(eyre::eyre!(reason));
+            }
+        };
         debug_assert_eq!(version, next_version);
         if version.saturating_sub(self.last_snapshot_version) >= self.snapshot_interval {
             self.flush()?;
