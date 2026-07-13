@@ -84,7 +84,10 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
     let mut nodes: Vec<Option<NodeProcess>> = Vec::with_capacity(NODE_COUNT);
     for (i, config) in configs.iter().enumerate() {
         info!(node = i, "starting node");
-        match NodeProcess::start(config).await {
+        // The synthetic verifier keys are intentionally not staked. Enable the
+        // node's explicit dev/test registration policy so the QUIC handshake,
+        // rather than an RPC bypass, authorizes them.
+        match NodeProcess::start_with_env(config, vec![("N42_OPEN_VERIFICATION", "1")]).await {
             Ok(node) => nodes.push(Some(node)),
             Err(e) => {
                 error!(node = i, error = %e, "failed to start node");
@@ -315,7 +318,12 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
 
     // T+0s: Restart node-4 → 5/7 = quorum → resume
     info!("restarting node-4 (5/7 = quorum)");
-    let node4 = NodeProcess::start_with_datadir(&configs[4], data_dir_4).await?;
+    let node4 = NodeProcess::start_with_datadir_and_env(
+        &configs[4],
+        data_dir_4,
+        vec![("N42_OPEN_VERIFICATION", "1")],
+    )
+    .await?;
     let node4_rpc = RpcClient::new(format!("http://127.0.0.1:{}", 8545 + PORT_OFFSET_BASE + 40));
     let target_height = get_height_safe(&node0_rpc).await;
     if let Err(e) = wait_for_sync(&node4_rpc, target_height, Duration::from_secs(30)).await {
@@ -337,7 +345,12 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
 
     // T+15s: Restart node-5 → 6/7
     info!("restarting node-5 (6/7)");
-    let node5 = NodeProcess::start_with_datadir(&configs[5], data_dir_5).await?;
+    let node5 = NodeProcess::start_with_datadir_and_env(
+        &configs[5],
+        data_dir_5,
+        vec![("N42_OPEN_VERIFICATION", "1")],
+    )
+    .await?;
     let node5_rpc = RpcClient::new(format!("http://127.0.0.1:{}", 8545 + PORT_OFFSET_BASE + 50));
     let target_height = get_height_safe(&node0_rpc).await;
     if let Err(e) = wait_for_sync(&node5_rpc, target_height, Duration::from_secs(30)).await {
@@ -350,7 +363,12 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
 
     // T+30s: Restart node-6 → 7/7
     info!("restarting node-6 (7/7)");
-    let node6 = NodeProcess::start_with_datadir(&configs[6], data_dir_6).await?;
+    let node6 = NodeProcess::start_with_datadir_and_env(
+        &configs[6],
+        data_dir_6,
+        vec![("N42_OPEN_VERIFICATION", "1")],
+    )
+    .await?;
     let node6_rpc = RpcClient::new(format!("http://127.0.0.1:{}", 8545 + PORT_OFFSET_BASE + 60));
     let target_height = get_height_safe(&node0_rpc).await;
     if let Err(e) = wait_for_sync(&node6_rpc, target_height, Duration::from_secs(45)).await {

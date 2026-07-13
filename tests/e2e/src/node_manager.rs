@@ -115,6 +115,17 @@ impl NodeProcess {
         Self::start_inner(config, data_dir, &[]).await
     }
 
+    /// Starts an N42 node with extra environment variables while reusing an
+    /// existing data directory. Restart scenarios must use this when the
+    /// original process relied on non-default runtime policy.
+    pub async fn start_with_datadir_and_env(
+        config: &NodeConfig,
+        data_dir: TempDir,
+        extra_env: Vec<(&str, &str)>,
+    ) -> eyre::Result<Self> {
+        Self::start_inner(config, data_dir, &extra_env).await
+    }
+
     async fn start_inner(
         config: &NodeConfig,
         data_dir: TempDir,

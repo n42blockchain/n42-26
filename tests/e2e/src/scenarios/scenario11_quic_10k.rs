@@ -43,7 +43,11 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
     let genesis_path = genesis::write_genesis_file(tmp_dir.path(), &accounts);
 
     let node_config = NodeConfig::single_node(binary_path, genesis_path, 4000);
-    let node = NodeProcess::start(&node_config).await?;
+    // The generated load-test keys are not staked. Use the explicit open
+    // verification policy so this measures authorized StarHub sessions rather
+    // than transport connections that the mobile bridge immediately rejects.
+    let node =
+        NodeProcess::start_with_env(&node_config, vec![("N42_OPEN_VERIFICATION", "1")]).await?;
 
     let starhub_port = node.starhub_port;
 

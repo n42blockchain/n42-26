@@ -48,7 +48,10 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
         startup_delay_ms: None,
     };
 
-    let node = NodeProcess::start(&config).await?;
+    // This scenario uses an ephemeral verifier instead of exercising the
+    // staking flow. Keep authorization real (the QUIC handshake is still
+    // required) while opting into the node's explicit dev/test open policy.
+    let node = NodeProcess::start_with_env(&config, vec![("N42_OPEN_VERIFICATION", "1")]).await?;
     info!(
         http_port = node.http_port,
         starhub_port = node.starhub_port,
