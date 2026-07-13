@@ -523,8 +523,24 @@ impl PersistentSbmt {
 
     /// Clear the WAL after a durable snapshot, then reopen it for append.
     fn truncate_wal(&mut self) -> eyre::Result<()> {
-        self.wal.set_len(0)?;
-        self.wal.sync_data()?;
+        // Truncate through a fresh write handle, then reopen for append.
+        // `set_len(0)` on the existing append-only handle is NOT portable:
+        // Windows' SetEndOfFile needs FILE_WRITE_DATA, which an O_APPEND handle
+        // does not carry, so it fails with ERROR_ACCESS_DENIED (os error 5).
+        // The separate truncating handle works because Rust opens files with a
+        // full share mode. `wal_path` is derived the same way `open` does.
+        let wal_path = self.snapshot_path.with_extension("wal");
+        drop(
+            OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&wal_path)?,
+        );
+        self.wal = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&wal_path)?;
         Ok(())
     }
 
@@ -818,8 +834,24 @@ impl PersistentTwig {
     }
 
     fn truncate_wal(&mut self) -> eyre::Result<()> {
-        self.wal.set_len(0)?;
-        self.wal.sync_data()?;
+        // Truncate through a fresh write handle, then reopen for append.
+        // `set_len(0)` on the existing append-only handle is NOT portable:
+        // Windows' SetEndOfFile needs FILE_WRITE_DATA, which an O_APPEND handle
+        // does not carry, so it fails with ERROR_ACCESS_DENIED (os error 5).
+        // The separate truncating handle works because Rust opens files with a
+        // full share mode. `wal_path` is derived the same way `open` does.
+        let wal_path = self.snapshot_path.with_extension("wal");
+        drop(
+            OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&wal_path)?,
+        );
+        self.wal = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&wal_path)?;
         Ok(())
     }
 
