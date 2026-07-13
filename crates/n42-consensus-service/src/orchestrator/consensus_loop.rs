@@ -1331,6 +1331,11 @@ impl ConsensusService {
         let twig = self.twig.clone();
         let state = self.consensus_state.clone();
         tokio::task::spawn_blocking(move || {
+            // F7: the append-ordered twig root demands diffs apply in committed
+            // order. The queue is view-ordered by construction; this tracks the
+            // last applied view so a reordering bug is caught, not silently
+            // baked into a diverged root.
+            let mut last_applied_view: u64 = 0;
             loop {
                 let work = queue
                     .lock()
@@ -1356,6 +1361,22 @@ impl ConsensusService {
                     }
                     continue;
                 };
+
+                // F7 defense-in-depth: refuse an out-of-order apply. Applying a
+                // lower view after a higher one would diverge the append-ordered
+                // twig root permanently, so skip and surface it loudly.
+                if view < last_applied_view {
+                    error!(
+                        target: "n42::twig",
+                        view,
+                        last_applied_view,
+                        %block_hash,
+                        "sidecar apply queue out of order; skipping to preserve root determinism"
+                    );
+                    counter!("n42_sidecar_apply_out_of_order").increment(1);
+                    continue;
+                }
+                last_applied_view = view;
 
                 if let Some(ref jmt) = jmt {
                     let start = std::time::Instant::now();

@@ -3355,6 +3355,63 @@ mod tests {
         assert!(orch.sidecar_apply_queue.lock().unwrap().is_empty());
     }
 
+    /// F7 defense-in-depth: if an out-of-order entry ever reaches the apply
+    /// queue, the single FIFO worker skips it rather than applying a lower view
+    /// after a higher one (which would diverge the append-ordered root).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sidecar_worker_skips_out_of_order_apply() {
+        use n42_execution::state_diff::{AccountChangeType, AccountDiff, StateDiff};
+
+        fn diff_with_accounts(count: u8) -> StateDiff {
+            let mut diff = StateDiff::default();
+            for index in 0..count {
+                diff.accounts.insert(
+                    Address::with_last_byte(index + 1),
+                    AccountDiff {
+                        change_type: AccountChangeType::Modified,
+                        balance: None,
+                        nonce: None,
+                        code_change: None,
+                        storage: BTreeMap::new(),
+                    },
+                );
+            }
+            diff
+        }
+
+        // NB: the worker runs on spawn_blocking (a separate thread), so a
+        // thread-local metrics recorder would not see its counter — the
+        // observable `applies` order below is the assertion that matters.
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let (sink, applies) = SpyStateSink::new();
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
+        orch.jmt = Some(sink);
+        let hash = B256::repeat_byte(0x25);
+
+        // Inject an out-of-order pair (view 2 before view 1) directly into the
+        // queue, simulating a hypothetical reordering bug.
+        {
+            let mut q = orch.sidecar_apply_queue.lock().unwrap();
+            q.push_back((2, hash, diff_with_accounts(2)));
+            q.push_back((1, hash, diff_with_accounts(1)));
+        }
+        // A normal confirmation at view 3 drains pending → queue = [2, 1, 3] and
+        // starts the worker.
+        orch.pending_sidecar_diffs
+            .insert(3, (hash, diff_with_accounts(3)));
+        orch.advance_execution_validated_head(3, hash, "confirm view 3");
+        drain_spawned_tasks().await;
+
+        // View 1 (arriving after view 2) is skipped; views 2 and 3 apply.
+        assert_eq!(
+            *applies.lock().unwrap(),
+            vec![2, 3],
+            "the out-of-order lower view must be skipped, not applied"
+        );
+    }
+
     /// Task 3: a stale pending finalization whose block the committed ring
     /// still holds re-drives the import LOCALLY - no sync round-trip for data
     /// this node already has.
