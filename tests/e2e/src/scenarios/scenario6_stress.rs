@@ -43,7 +43,10 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
     test_empty_blocks(&node.rpc).await?;
 
     // --- Sub-test 2: Full pool stress ---
-    test_full_pool(&mut tx_engine, &node.rpc, max_fee, priority_fee).await?;
+    // Keep the boundary-test transactions ahead of the deliberately saturated
+    // pool: stress transactions use reserved senders and a lower tip.
+    let stress_priority_fee = (priority_fee / 10).max(1);
+    test_full_pool(&mut tx_engine, &node.rpc, max_fee, stress_priority_fee).await?;
 
     // Resync nonces after pool stress.
     tx_engine.sync_nonces(&node.rpc).await?;
@@ -133,15 +136,24 @@ async fn test_full_pool(
     max_fee: u128,
     priority_fee: u128,
 ) -> eyre::Result<()> {
-    info!("sub-test 2: full pool stress (50,000 transactions)");
-
-    let batch_size = 50_000u64;
+    let batch_size = std::env::var("E2E_SCENARIO6_BATCH_SIZE")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(50_000);
+    info!(batch_size, "sub-test 2: full pool stress");
+    // Accounts 0, 2, 5, and 9 are used as senders by the later boundary
+    // checks. If the stress phase queues thousands of nonces on those same
+    // accounts, the boundary transactions cannot execute until the whole
+    // backlog drains and the test times out for reasons unrelated to the
+    // boundary being checked.
+    let stress_senders = [1usize, 3, 4, 6, 7, 8];
     let mut sent = 0u64;
     let mut errors = 0u64;
 
     for i in 0..batch_size {
-        let from_idx = (i as usize) % tx_engine.wallet_count();
-        let to_idx = ((i as usize) + 1) % tx_engine.wallet_count();
+        let sender_pos = (i as usize) % stress_senders.len();
+        let from_idx = stress_senders[sender_pos];
+        let to_idx = stress_senders[(sender_pos + 1) % stress_senders.len()];
         let to_addr = tx_engine.address(to_idx);
 
         let amount = U256::from(1_000_000_000_000_000u64); // 0.001 N42
@@ -164,7 +176,9 @@ async fn test_full_pool(
         errors, "PASS: full pool test complete (some rejections expected)"
     );
 
-    // Wait for the pool to drain.
+    // Let several blocks process the stress backlog. The later checks use
+    // reserved sender accounts and a higher tip, so they do not require all
+    // 50,000 transactions to drain first.
     tokio::time::sleep(Duration::from_secs(30)).await;
 
     Ok(())
