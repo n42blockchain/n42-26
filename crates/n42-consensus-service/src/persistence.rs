@@ -83,6 +83,52 @@ pub struct ConsensusSnapshot {
     pub execution_validated_head_hash: B256,
 }
 
+/// Selects a restart-safe view for reth's canonical head.
+///
+/// A view and hash must describe the same block. Restoring a stale view next
+/// to reth's newer canonical hash re-opens the backward-FCU window this state
+/// is meant to close. Prefer the exact v4 pair, then independently persisted
+/// consensus evidence, and finally the last committed QC when both its hash
+/// and block count identify reth's tip. If none of those prove the mapping,
+/// fail closed instead of guessing a lower view.
+pub fn recover_execution_validated_head_view(
+    snapshot: &ConsensusSnapshot,
+    canonical_head_hash: B256,
+    canonical_head_number: u64,
+    evidence_head: Option<(u64, B256)>,
+) -> Result<(u64, &'static str), String> {
+    if canonical_head_number == 0 {
+        return Ok((0, "genesis"));
+    }
+
+    if snapshot.execution_validated_head_hash != B256::ZERO
+        && snapshot.execution_validated_head_hash == canonical_head_hash
+    {
+        return Ok((snapshot.execution_validated_head_view, "snapshot-exact"));
+    }
+
+    if let Some((view, hash)) = evidence_head
+        && hash == canonical_head_hash
+    {
+        return Ok((view, "evidence-exact"));
+    }
+
+    if snapshot.committed_block_count == canonical_head_number
+        && snapshot.last_committed_qc.block_hash == canonical_head_hash
+    {
+        return Ok((snapshot.last_committed_qc.view, "commit-qc-exact"));
+    }
+
+    Err(format!(
+        "cannot map canonical head {canonical_head_hash} at block {canonical_head_number} to a consensus view (snapshot validated view={}, hash={}, committed count={}, last committed view={}, hash={})",
+        snapshot.execution_validated_head_view,
+        snapshot.execution_validated_head_hash,
+        snapshot.committed_block_count,
+        snapshot.last_committed_qc.view,
+        snapshot.last_committed_qc.block_hash,
+    ))
+}
+
 /// Serde helper: serialize/deserialize `Vec<[u8; 48]>` as hex strings for human-readable JSON.
 mod authorized_verifiers_hex {
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -713,9 +759,63 @@ mod tests {
         let loaded = load_consensus_state(&path).unwrap().unwrap();
         assert_eq!(loaded.version, SNAPSHOT_VERSION);
         assert_eq!(loaded.execution_validated_head_view, 4242);
-        assert_eq!(loaded.execution_validated_head_hash, B256::repeat_byte(0x7E));
+        assert_eq!(
+            loaded.execution_validated_head_hash,
+            B256::repeat_byte(0x7E)
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restart_head_view_requires_an_exact_hash_mapping() {
+        let canonical = B256::repeat_byte(0xA1);
+        let stale = B256::repeat_byte(0xB2);
+        let mut snapshot = genesis_snapshot(105);
+        snapshot.committed_block_count = 100;
+        snapshot.last_committed_qc.view = 105;
+        snapshot.last_committed_qc.block_hash = canonical;
+        snapshot.execution_validated_head_view = 104;
+        snapshot.execution_validated_head_hash = stale;
+
+        let recovered = recover_execution_validated_head_view(&snapshot, canonical, 100, None)
+            .expect("the matching committed QC proves the canonical view");
+        assert_eq!(recovered, (105, "commit-qc-exact"));
+
+        snapshot.last_committed_qc.block_hash = B256::repeat_byte(0xC3);
+        let error = recover_execution_validated_head_view(&snapshot, canonical, 100, None)
+            .expect_err("a mismatched hash/view pair must fail closed");
+        assert!(error.contains("cannot map canonical head"));
+    }
+
+    #[test]
+    fn restart_head_view_can_use_matching_evidence() {
+        let canonical = B256::repeat_byte(0xA1);
+        let mut snapshot = genesis_snapshot(105);
+        snapshot.committed_block_count = 100;
+        snapshot.execution_validated_head_view = 90;
+        snapshot.execution_validated_head_hash = B256::repeat_byte(0xB2);
+
+        assert_eq!(
+            recover_execution_validated_head_view(
+                &snapshot,
+                canonical,
+                101,
+                Some((107, canonical)),
+            )
+            .unwrap(),
+            (107, "evidence-exact")
+        );
+        assert!(
+            recover_execution_validated_head_view(
+                &snapshot,
+                canonical,
+                101,
+                Some((107, B256::repeat_byte(0xD4))),
+            )
+            .is_err(),
+            "evidence for another hash must not seed the guard"
+        );
     }
 
     #[test]

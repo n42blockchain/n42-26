@@ -803,18 +803,18 @@ fn main() {
                     .flatten()
                     .unwrap_or_default();
 
+                let best_block_number = full_node.provider.best_block_number().unwrap_or(0);
                 let head_block_hash = {
-                    let best_num = full_node.provider.best_block_number().unwrap_or(0);
-                    if best_num > 0 {
+                    if best_block_number > 0 {
                         let hash = full_node
                             .provider
-                            .block_hash(best_num)
+                            .block_hash(best_block_number)
                             .ok()
                             .flatten()
                             .unwrap_or(genesis_hash);
                         info!(
                             target: "n42::cli",
-                            best_block = best_num,
+                            best_block = best_block_number,
                             %hash,
                             "using canonical chain head as head_block_hash"
                         );
@@ -823,6 +823,12 @@ fn main() {
                         genesis_hash
                     }
                 };
+
+                if best_block_number > 0 && snapshot.is_none() {
+                    return Err(eyre::eyre!(
+                        "refusing to start consensus on reth block {best_block_number} without a valid consensus snapshot"
+                    ));
+                }
 
                 if let Some(ref jmt) = jmt {
                     let mut tree = jmt.lock().unwrap_or_else(|e| {
@@ -1512,36 +1518,51 @@ fn main() {
                     orchestrator = orchestrator
                         .with_recovered_commit_qc(snap.last_committed_qc.clone());
 
-                    // T1: restore the execution-validity guard clock. When the
-                    // snapshot's validated head matches reth's canonical tip this
-                    // is an exact restore; otherwise reth advanced past (or lags)
-                    // the snapshot, so floor the view one below the committed view
-                    // — low enough that the pending block's own confirmation still
-                    // passes the strict-monotonic guard, never claiming a view
-                    // reth may not actually hold.
-                    let seeded_view = if snap.execution_validated_head_hash
-                        != alloy_primitives::B256::ZERO
-                        && snap.execution_validated_head_hash == head_block_hash
-                    {
-                        snap.execution_validated_head_view
-                    } else {
-                        snap.last_committed_qc
-                            .view
-                            .min(snap.execution_validated_head_view)
-                            .saturating_sub(1)
-                    };
+                    // T1: restore a view that is cryptographically/structurally
+                    // tied to reth's canonical hash. Never pair a guessed lower
+                    // view with a newer canonical hash: doing so would re-open
+                    // the backward-FCU window during the first sync response.
+                    let evidence_head = evidence_store.as_ref().and_then(|store| {
+                        match store.get(best_block_number) {
+                            Ok(Some(evidence)) => Some((
+                                evidence.view,
+                                alloy_primitives::B256::from(evidence.block_hash),
+                            )),
+                            Ok(None) => None,
+                            Err(error) => {
+                                warn!(
+                                    target: "n42::cli",
+                                    best_block = best_block_number,
+                                    %error,
+                                    "failed to read canonical-head consensus evidence"
+                                );
+                                None
+                            }
+                        }
+                    });
+                    let (seeded_view, recovery_source) =
+                        persistence::recover_execution_validated_head_view(
+                            snap,
+                            head_block_hash,
+                            best_block_number,
+                            evidence_head,
+                        )
+                        .map_err(|error| {
+                            eyre::eyre!(
+                                "refusing to start consensus with an unproven execution-head view: {error}"
+                            )
+                        })?;
                     info!(
                         target: "n42::cli",
                         seeded_view,
+                        recovery_source,
                         snapshot_validated_view = snap.execution_validated_head_view,
                         snapshot_validated_hash = %snap.execution_validated_head_hash,
                         %head_block_hash,
                         "restored execution-validated head guard from snapshot"
                     );
-                    orchestrator = orchestrator.with_recovered_execution_validated_head(
-                        seeded_view,
-                        snap.execution_validated_head_hash,
-                    );
+                    orchestrator =
+                        orchestrator.with_recovered_execution_validated_head(seeded_view);
                 }
 
                 if let Some(schedule) = epoch_schedule {

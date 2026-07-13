@@ -296,7 +296,7 @@ pub struct ConsensusService {
     /// distinct from `committed_block_count`: HotStuff agreement may advance before
     /// reth has accepted the corresponding payload.
     head_block_hash: B256,
-    /// Highest committed/sync view whose block reth confirmed as `Valid`/`Accepted`.
+    /// Highest committed/sync view whose block reth confirmed as `Valid`.
     /// Guards async finalize/import completions from regressing the executed head.
     execution_validated_head_view: u64,
     /// Bounded record of speculative eager imports that reth already accepted.
@@ -342,10 +342,14 @@ pub struct ConsensusService {
     sync_started_at: Option<Instant>,
     /// `[from_view, to_view]` of the most recent in-flight sync / catch-up
     /// request. Sync responses are validated against this range so a peer
-    /// cannot inject blocks we never asked for (T2a). Overwritten on each new
-    /// request; deliberately NOT cleared on response so a late fan-out
-    /// duplicate response is still range-checked.
+    /// cannot inject blocks we never asked for (T2a). Cleared together with
+    /// `sync_requested_peers` when that request group completes.
     sync_request_range: Option<(u64, u64)>,
+    /// Peers to which the active sync range was actually sent. Responses from
+    /// any other peer are unsolicited and must not clear or mutate active sync
+    /// state. Catch-up fan-out keeps every successful recipient here until one
+    /// returns useful data or all recipients finish.
+    sync_requested_peers: HashSet<PeerId>,
     /// Round-robin cursor for recovery requests. The execution-validated view
     /// can remain pinned while consensus advances, so keying peer choice only
     /// on that view would retry the same possibly incomplete peer forever.
@@ -913,6 +917,7 @@ impl ConsensusService {
             sync_in_flight: false,
             sync_started_at: None,
             sync_request_range: None,
+            sync_requested_peers: HashSet::new(),
             sync_peer_cursor: 0,
             state_file: None,
             validator_set_for_sync: None,
@@ -1120,6 +1125,7 @@ impl ConsensusService {
             sync_in_flight: false,
             sync_started_at: None,
             sync_request_range: None,
+            sync_requested_peers: HashSet::new(),
             sync_peer_cursor: 0,
             state_file: None,
             validator_set_for_sync: None,
@@ -1273,15 +1279,11 @@ impl ConsensusService {
     /// consensus view stream and reth's canonical head are persistent. Left at
     /// 0 across restart it disables the stale/same-view refusals for the first
     /// confirmation and pins the post-restart catch-up floor at 0 (re-audit
-    /// F1/F2). Seeding it from the persisted `(view, hash)` keeps a persistent
-    /// reference clock. `head` is applied only when it agrees with the head the
-    /// node already adopted from reth's canonical tip, so a stale snapshot can
-    /// never move the head backward.
-    pub fn with_recovered_execution_validated_head(mut self, view: u64, hash: B256) -> Self {
+    /// F1/F2). Startup proves the view belongs to the canonical hash before it
+    /// calls this builder; `head_block_hash` itself already came directly from
+    /// reth and is never replaced from the snapshot.
+    pub fn with_recovered_execution_validated_head(mut self, view: u64) -> Self {
         self.execution_validated_head_view = view;
-        if hash != B256::ZERO && hash == self.head_block_hash {
-            self.head_block_hash = hash;
-        }
         self
     }
 
@@ -1483,6 +1485,10 @@ impl ConsensusService {
                 } => {
                     if let Some((hash, view, outcome, block_ts)) = import_result {
                         self.handle_import_done(hash, view, outcome, block_ts).await;
+                        // Background import completion can advance the
+                        // execution-validity guard after the commit-time
+                        // snapshot was written. Persist the exact new pair now.
+                        self.save_consensus_state();
                     }
                 }
 
@@ -1499,6 +1505,9 @@ impl ConsensusService {
                             timing.import_complete = Some(Instant::now());
                         }
                         self.handle_eager_import_done(hash, block_ts).await;
+                        // A late eager completion may close a committed Case C
+                        // and advance the guard outside handle_block_committed.
+                        self.save_consensus_state();
                     }
                 }
 
@@ -2018,8 +2027,11 @@ impl ConsensusService {
             }
             NetworkEvent::SyncRequestFailed { peer, error } => {
                 warn!(target: "n42::cl::orchestrator", %peer, %error, "sync request failed");
-                self.sync_in_flight = false;
-                self.sync_started_at = None;
+                if self.sync_requested_peers.remove(&peer) && self.sync_requested_peers.is_empty() {
+                    self.sync_in_flight = false;
+                    self.sync_started_at = None;
+                    self.sync_request_range = None;
+                }
             }
             NetworkEvent::BlobSidecarReceived { source: _, data } => {
                 self.handle_blob_sidecar(data);
@@ -3576,13 +3588,14 @@ mod tests {
             orch.head_block_hash, head,
             "the execution-validated head must not regress"
         );
-        let skipped = snapshotter
-            .snapshot()
-            .into_vec()
-            .into_iter()
-            .find_map(|(key, _, _, value)| {
-                (key.key().name() == "n42_import_fcu_skipped_backward_total").then_some(value)
-            });
+        let skipped =
+            snapshotter
+                .snapshot()
+                .into_vec()
+                .into_iter()
+                .find_map(|(key, _, _, value)| {
+                    (key.key().name() == "n42_import_fcu_skipped_backward_total").then_some(value)
+                });
         assert_eq!(skipped, Some(DebugValue::Counter(1)));
     }
 
@@ -3600,6 +3613,7 @@ mod tests {
         let peer = n42_network::PeerId::random();
         let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
         orch.sync_request_range = Some((10, 20));
+        orch.sync_requested_peers.insert(peer);
         let before = orch.committed_block_count;
 
         let response = n42_network::BlockSyncResponse {
@@ -3618,14 +3632,42 @@ mod tests {
             orch.committed_block_count, before,
             "an out-of-range block must not be counted"
         );
-        let dropped = snapshotter
-            .snapshot()
-            .into_vec()
-            .into_iter()
-            .find_map(|(key, _, _, value)| {
-                (key.key().name() == "n42_sync_blocks_out_of_range_total").then_some(value)
-            });
+        let dropped =
+            snapshotter
+                .snapshot()
+                .into_vec()
+                .into_iter()
+                .find_map(|(key, _, _, value)| {
+                    (key.key().name() == "n42_sync_blocks_out_of_range_total").then_some(value)
+                });
         assert_eq!(dropped, Some(DebugValue::Counter(1)));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unsolicited_sync_response_cannot_cancel_active_request() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let expected_peer = n42_network::PeerId::random();
+        let unexpected_peer = n42_network::PeerId::random();
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
+        orch.sync_in_flight = true;
+        orch.sync_started_at = Some(Instant::now());
+        orch.sync_request_range = Some((10, 20));
+        orch.sync_requested_peers.insert(expected_peer);
+
+        orch.handle_sync_response(
+            unexpected_peer,
+            n42_network::BlockSyncResponse {
+                blocks: Vec::new(),
+                peer_committed_view: 20,
+            },
+        )
+        .await;
+
+        assert!(orch.sync_in_flight, "the real request must remain active");
+        assert_eq!(orch.sync_request_range, Some((10, 20)));
+        assert!(orch.sync_requested_peers.contains(&expected_peer));
     }
 
     /// T3 (F2): after a restart the execution-validated view is 0 while the
@@ -3692,10 +3734,8 @@ mod tests {
         orch.el = Some(el);
         orch.head_block_hash = head;
         orch.execution_validated_head_view = 0;
-        orch.pending_sidecar_diffs.insert(
-            3,
-            (block, n42_execution::state_diff::StateDiff::default()),
-        );
+        orch.pending_sidecar_diffs
+            .insert(3, (block, n42_execution::state_diff::StateDiff::default()));
 
         let broadcast = BlockDataBroadcast {
             block_hash: block,
@@ -3726,12 +3766,47 @@ mod tests {
         );
     }
 
-    /// T1: the restore builder seeds the guard view unconditionally but only
-    /// adopts the persisted head hash when it agrees with the head already
-    /// derived from reth's canonical tip, so a stale snapshot can never move
-    /// the head backward.
+    /// A `Valid` new-payload response is insufficient when the following FCU
+    /// says `Accepted`: reth has executed the payload but has not accepted it as
+    /// the requested canonical/finalized head.
+    #[tokio::test(flavor = "current_thread")]
+    async fn accepted_fcu_does_not_advance_execution_head() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let head = B256::repeat_byte(0x11);
+        let block = B256::repeat_byte(0x22);
+        let mock = Arc::new(MockExecutionLayer::new(
+            PayloadStatusEnum::Valid,
+            PayloadStatusEnum::Accepted,
+        ));
+        let el: Arc<dyn ExecutionLayer> = mock.clone();
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
+        orch.el = Some(el);
+        orch.head_block_hash = head;
+        orch.execution_validated_head_view = 1;
+
+        orch.import_and_notify(BlockDataBroadcast {
+            block_hash: block,
+            view: 2,
+            payload_json: serde_json::to_vec(&test_execution_data(head, block)).unwrap(),
+            timestamp: 0,
+            execution_output: None,
+            leader_ready_unix_ms: 0,
+        })
+        .await;
+
+        assert_eq!(orch.head_block_hash, head);
+        assert_eq!(orch.execution_validated_head_view, 1);
+        assert_eq!(mock.fcu_heads(), vec![block]);
+        assert_eq!(orch.syncing_blocks.len(), 1, "the FCU is retried later");
+    }
+
+    /// T1: startup validates the persisted view/hash mapping before calling the
+    /// builder. The builder restores only the proven view and never replaces
+    /// the canonical head already derived from reth.
     #[test]
-    fn with_recovered_execution_validated_head_only_adopts_matching_hash() {
+    fn with_recovered_execution_validated_head_preserves_reth_hash() {
         let head = B256::repeat_byte(0x60);
 
         let (engine, output_rx) = make_test_engine();
@@ -3739,22 +3814,9 @@ mod tests {
         let (_t, net_event_rx) = mpsc::channel(8192);
         let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
         orch.head_block_hash = head;
-        let orch = orch.with_recovered_execution_validated_head(42, head);
+        let orch = orch.with_recovered_execution_validated_head(42);
         assert_eq!(orch.execution_validated_head_view, 42);
         assert_eq!(orch.head_block_hash, head);
-
-        let (engine2, output_rx2) = make_test_engine();
-        let (network2, _c2, _p2) = make_test_network();
-        let (_t2, net_event_rx2) = mpsc::channel(8192);
-        let mut orch2 =
-            ConsensusService::new(engine2, Arc::new(network2), net_event_rx2, output_rx2);
-        orch2.head_block_hash = head;
-        let orch2 = orch2.with_recovered_execution_validated_head(42, B256::repeat_byte(0x99));
-        assert_eq!(orch2.execution_validated_head_view, 42, "view still restored");
-        assert_eq!(
-            orch2.head_block_hash, head,
-            "a mismatched snapshot hash must not move the reth-derived head"
-        );
     }
 
     /// T5 (F4): the bounded eager-validation set can evict a true confirmation
@@ -3813,13 +3875,14 @@ mod tests {
             "the evicted-but-imported block is rescued and the head advances"
         );
         assert_eq!(orch.execution_validated_head_view, 1);
-        let rescued = snapshotter
-            .snapshot()
-            .into_vec()
-            .into_iter()
-            .find_map(|(key, _, _, value)| {
-                (key.key().name() == "n42_eager_import_rescued_total").then_some(value)
-            });
+        let rescued =
+            snapshotter
+                .snapshot()
+                .into_vec()
+                .into_iter()
+                .find_map(|(key, _, _, value)| {
+                    (key.key().name() == "n42_eager_import_rescued_total").then_some(value)
+                });
         assert_eq!(rescued, Some(DebugValue::Counter(1)));
     }
 }

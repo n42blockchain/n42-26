@@ -243,9 +243,13 @@ impl ConsensusService {
             local_committed_view: local_view,
         };
         let mut sent = 0usize;
+        let mut requested_peers = std::collections::HashSet::new();
         for peer in peers {
             match self.network.request_sync(peer, request.clone()) {
-                Ok(()) => sent += 1,
+                Ok(()) => {
+                    sent += 1;
+                    requested_peers.insert(peer);
+                }
                 Err(error) => {
                     warn!(target: "n42::cl::sync", %peer, %error, "failed to send execution catch-up request");
                 }
@@ -265,6 +269,7 @@ impl ConsensusService {
         self.sync_in_flight = true;
         self.sync_started_at = Some(Instant::now());
         self.sync_request_range = Some((request.from_view, capped_to_view));
+        self.sync_requested_peers = requested_peers;
     }
 
     /// Initiates a state sync request to a connected peer.
@@ -284,6 +289,8 @@ impl ConsensusService {
                 );
                 self.sync_in_flight = false;
                 self.sync_started_at = None;
+                self.sync_request_range = None;
+                self.sync_requested_peers.clear();
             } else {
                 debug!(target: "n42::cl::sync", local_view, target_view, "sync already in flight, skipping");
                 return;
@@ -318,6 +325,8 @@ impl ConsensusService {
         self.sync_in_flight = true;
         self.sync_started_at = Some(Instant::now());
         self.sync_request_range = Some(request_range);
+        self.sync_requested_peers.clear();
+        self.sync_requested_peers.insert(peer);
     }
 
     /// Handles an incoming sync request from a peer.
@@ -382,8 +391,26 @@ impl ConsensusService {
     /// Handles a sync response containing blocks from a peer.
     /// Verifies QC validity, imports each block into reth, and requests more if still behind.
     pub(super) async fn handle_sync_response(&mut self, peer: PeerId, response: BlockSyncResponse) {
-        self.sync_in_flight = false;
-        self.sync_started_at = None;
+        let Some((requested_from, requested_to)) = self.sync_request_range else {
+            warn!(
+                target: "n42::cl::sync",
+                %peer,
+                "dropping unsolicited sync response with no active request"
+            );
+            counter!("n42_sync_responses_unsolicited_total").increment(1);
+            return;
+        };
+        if !self.sync_requested_peers.remove(&peer) {
+            warn!(
+                target: "n42::cl::sync",
+                %peer,
+                requested_from,
+                requested_to,
+                "dropping sync response from a peer outside the active request group"
+            );
+            counter!("n42_sync_responses_unsolicited_total").increment(1);
+            return;
+        }
 
         info!(
             target: "n42::cl::sync",
@@ -395,10 +422,12 @@ impl ConsensusService {
 
         if response.blocks.is_empty() {
             debug!(target: "n42::cl::sync", "sync response contains no blocks");
+            self.finish_sync_response_group(false);
             return;
         }
 
         let mut imported = 0u64;
+        let mut highest_qc_verified_view = 0u64;
         for sync_block in &response.blocks {
             if sync_block.payload.is_empty() {
                 debug!(target: "n42::cl::sync", view = sync_block.view, "skipping sync block with empty payload");
@@ -409,14 +438,12 @@ impl ConsensusService {
             // requested. A malicious peer — or a stale fan-out response for a
             // since-superseded request — must not be able to inject blocks
             // outside `[from_view, to_view]`.
-            if let Some((from_view, to_view)) = self.sync_request_range
-                && (sync_block.view < from_view || sync_block.view > to_view)
-            {
+            if sync_block.view < requested_from || sync_block.view > requested_to {
                 warn!(
                     target: "n42::cl::sync",
                     view = sync_block.view,
-                    from_view,
-                    to_view,
+                    from_view = requested_from,
+                    to_view = requested_to,
                     "dropping sync block outside the requested range"
                 );
                 counter!("n42_sync_blocks_out_of_range_total").increment(1);
@@ -426,6 +453,7 @@ impl ConsensusService {
             if !self.verify_sync_block_qc(sync_block) {
                 continue;
             }
+            highest_qc_verified_view = highest_qc_verified_view.max(sync_block.view);
 
             if self.committed_blocks.iter().any(|block| {
                 block.view == sync_block.view && block.block_hash != sync_block.block_hash
@@ -443,6 +471,21 @@ impl ConsensusService {
                 block.view == sync_block.view && block.block_hash == sync_block.block_hash
             });
 
+            if sync_block.view == self.execution_validated_head_view
+                && self.execution_validated_head_view != 0
+                && sync_block.block_hash != self.head_block_hash
+            {
+                error!(
+                    target: "n42::cl::sync",
+                    view = sync_block.view,
+                    hash = %sync_block.block_hash,
+                    execution_validated_head = %self.head_block_hash,
+                    "refusing conflicting sync block at the execution-validated view"
+                );
+                counter!("n42_sync_blocks_conflict_validated_head_total").increment(1);
+                continue;
+            }
+
             // (T2b) Hoisted execution-validated-head guard. Never re-import or
             // re-FCU a block at or below the head reth has already executed —
             // whether or not it still sits in the committed ring (which is
@@ -452,9 +495,7 @@ impl ConsensusService {
             // has to happen here, ahead of the import. A second fan-out response
             // for a lineage an earlier peer already rebuilt lands here too.
             if sync_block.view <= self.execution_validated_head_view {
-                if already_committed
-                    && let Some(ref changes) = sync_block.validator_changes
-                {
+                if already_committed && let Some(ref changes) = sync_block.validator_changes {
                     self.recover_committed_block_validator_changes(
                         sync_block.view,
                         sync_block.block_hash,
@@ -630,6 +671,27 @@ impl ConsensusService {
             imported += 1;
         }
 
+        // A useful response completes the fan-out group; later duplicates are
+        // rejected as unsolicited. If this peer supplied nothing useful, keep
+        // waiting for the other peers in the active catch-up fan-out.
+        self.finish_sync_response_group(imported > 0);
+
+        let execution_target_view = highest_qc_verified_view
+            .max(self.last_commit_qc.as_ref().map(|qc| qc.view).unwrap_or(0));
+        let execution_caught_up = self.execution_validated_head_view >= execution_target_view;
+        if !execution_caught_up && !self.sync_in_flight {
+            warn!(
+                target: "n42::cl::sync",
+                execution_validated_head_view = self.execution_validated_head_view,
+                execution_target_view,
+                "sync response did not close the execution gap; requesting the remaining lineage"
+            );
+            self.initiate_execution_catchup_sync(
+                self.execution_validated_head_view,
+                execution_target_view,
+            );
+        }
+
         // Save snapshot after sync batch to persist updated committed_block_count.
         self.save_consensus_state();
 
@@ -641,6 +703,9 @@ impl ConsensusService {
         // reconstructs the lineage, re-enter the normal quorum-gated,
         // slot-aligned build path instead of waiting for a pacemaker timeout.
         if imported > 0
+            && execution_caught_up
+            && self.syncing_blocks.is_empty()
+            && self.pending_finalization.is_none()
             && self.engine.is_current_leader()
             && !self.bg_import_in_flight
             && self.bg_import_queue.is_empty()
@@ -666,6 +731,17 @@ impl ConsensusService {
                 "still behind after sync, requesting more blocks"
             );
             self.initiate_sync(local_view, response.peer_committed_view);
+        }
+    }
+
+    fn finish_sync_response_group(&mut self, useful_response: bool) {
+        if useful_response {
+            self.sync_requested_peers.clear();
+        }
+        if useful_response || self.sync_requested_peers.is_empty() {
+            self.sync_in_flight = false;
+            self.sync_started_at = None;
+            self.sync_request_range = None;
         }
     }
 

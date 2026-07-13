@@ -750,13 +750,42 @@ impl ConsensusService {
             safe_block_hash: broadcast.block_hash,
             finalized_block_hash: broadcast.block_hash,
         };
-        if let Err(e) = engine_handle.fork_choice_updated(fcu_state).await {
-            error!(
-                target: "n42::cl::exec_bridge",
-                hash = %broadcast.block_hash,
-                error = %e,
-                "fork_choice_updated failed for imported block"
-            );
+        match engine_handle.fork_choice_updated(fcu_state).await {
+            Ok(result) if matches!(result.payload_status.status, PayloadStatusEnum::Valid) => {}
+            Ok(result)
+                if matches!(
+                    result.payload_status.status,
+                    PayloadStatusEnum::Syncing | PayloadStatusEnum::Accepted
+                ) =>
+            {
+                warn!(
+                    target: "n42::cl::exec_bridge",
+                    hash = %broadcast.block_hash,
+                    status = ?result.payload_status.status,
+                    "fork_choice_updated has not executed the imported block; queuing retry"
+                );
+                self.queue_syncing_block(broadcast);
+                return;
+            }
+            Ok(result) => {
+                error!(
+                    target: "n42::cl::exec_bridge",
+                    hash = %broadcast.block_hash,
+                    status = ?result.payload_status.status,
+                    "fork_choice_updated rejected imported block"
+                );
+                return;
+            }
+            Err(e) => {
+                error!(
+                    target: "n42::cl::exec_bridge",
+                    hash = %broadcast.block_hash,
+                    error = %e,
+                    "fork_choice_updated failed for imported block; queuing retry"
+                );
+                self.queue_syncing_block(broadcast);
+                return;
+            }
         }
 
         self.advance_execution_validated_head(broadcast.view, broadcast.block_hash, "sync import");
@@ -886,17 +915,48 @@ impl ConsensusService {
                         safe_block_hash: retry_hash,
                         finalized_block_hash: retry_hash,
                     };
-                    let _ = engine_handle.fork_choice_updated(fcu).await;
-                    self.advance_execution_validated_head(
-                        retry_broadcast.view,
-                        retry_hash,
-                        "sync import retry",
-                    );
-                    if let Err(e) = self
-                        .engine
-                        .process_event(ConsensusEvent::BlockImported(retry_hash))
-                    {
-                        error!(target: "n42::cl::exec_bridge", error = %e, "error processing BlockImported for retry");
+                    match engine_handle.fork_choice_updated(fcu).await {
+                        Ok(result)
+                            if matches!(result.payload_status.status, PayloadStatusEnum::Valid) =>
+                        {
+                            self.advance_execution_validated_head(
+                                retry_broadcast.view,
+                                retry_hash,
+                                "sync import retry",
+                            );
+                            if let Err(e) = self
+                                .engine
+                                .process_event(ConsensusEvent::BlockImported(retry_hash))
+                            {
+                                error!(target: "n42::cl::exec_bridge", error = %e, "error processing BlockImported for retry");
+                            }
+                        }
+                        Ok(result)
+                            if matches!(
+                                result.payload_status.status,
+                                PayloadStatusEnum::Syncing | PayloadStatusEnum::Accepted
+                            ) =>
+                        {
+                            let next_retry = retry_count + 1;
+                            if next_retry >= MAX_SYNCING_RETRIES {
+                                warn!(target: "n42::cl::exec_bridge", %retry_hash, retries = next_retry, status = ?result.payload_status.status, "retry FCU exceeded max retries, dropping");
+                            } else {
+                                debug!(target: "n42::cl::exec_bridge", %retry_hash, retry = next_retry, status = ?result.payload_status.status, "retry FCU still not executable, re-queuing");
+                                self.syncing_blocks.push_back((data, next_retry));
+                            }
+                        }
+                        Ok(result) => {
+                            warn!(target: "n42::cl::exec_bridge", %retry_hash, status = ?result.payload_status.status, "retry FCU rejected block");
+                        }
+                        Err(error) => {
+                            let next_retry = retry_count + 1;
+                            if next_retry >= MAX_SYNCING_RETRIES {
+                                warn!(target: "n42::cl::exec_bridge", %retry_hash, retries = next_retry, %error, "retry FCU failed and exceeded max retries, dropping");
+                            } else {
+                                warn!(target: "n42::cl::exec_bridge", %retry_hash, retry = next_retry, %error, "retry FCU failed, re-queuing");
+                                self.syncing_blocks.push_back((data, next_retry));
+                            }
+                        }
                     }
                 }
                 Ok(rs)

@@ -854,11 +854,34 @@ impl ConsensusService {
                     safe_block_hash: block_hash,
                     finalized_block_hash: block_hash,
                 };
-                if let Err(e) = engine_handle.fork_choice_updated(fcu).await {
-                    error!(target: "n42::cl::consensus_loop", %block_hash, error = %e, "bg import: fcu failed");
+                match engine_handle.fork_choice_updated(fcu).await {
+                    Ok(result)
+                        if matches!(result.payload_status.status, PayloadStatusEnum::Valid) =>
+                    {
+                        info!(target: "n42::cl::consensus_loop", %block_hash, "bg import: block imported successfully");
+                        (ImportOutcome::Valid, block_timestamp)
+                    }
+                    Ok(result)
+                        if matches!(
+                            result.payload_status.status,
+                            PayloadStatusEnum::Syncing | PayloadStatusEnum::Accepted
+                        ) =>
+                    {
+                        warn!(target: "n42::cl::consensus_loop", %block_hash, status = ?result.payload_status.status, "bg import: fcu did not execute the committed block; requesting catch-up");
+                        (ImportOutcome::Syncing, 0)
+                    }
+                    Ok(result) => {
+                        error!(target: "n42::cl::consensus_loop", %block_hash, status = ?result.payload_status.status, "bg import: fcu rejected the committed block");
+                        (ImportOutcome::Invalid, 0)
+                    }
+                    Err(e) => {
+                        // Transport/internal FCU errors do not prove payload
+                        // invalidity. Preserve the staged sidecar diff and retry
+                        // through the execution catch-up path.
+                        error!(target: "n42::cl::consensus_loop", %block_hash, error = %e, "bg import: fcu failed; treating as retryable");
+                        (ImportOutcome::Syncing, 0)
+                    }
                 }
-                info!(target: "n42::cl::consensus_loop", %block_hash, "bg import: block imported successfully");
-                (ImportOutcome::Valid, block_timestamp)
             }
             Ok(status)
                 if matches!(
@@ -877,8 +900,10 @@ impl ConsensusService {
                 (ImportOutcome::Invalid, 0)
             }
             Err(e) => {
-                error!(target: "n42::cl::consensus_loop", %block_hash, error = %e, "bg import: new_payload failed");
-                (ImportOutcome::Invalid, 0)
+                // An Engine API transport/internal error is not an `Invalid`
+                // verdict. Keep the committed diff staged and retry ancestors.
+                error!(target: "n42::cl::consensus_loop", %block_hash, error = %e, "bg import: new_payload failed; treating as retryable");
+                (ImportOutcome::Syncing, 0)
             }
         }
     }

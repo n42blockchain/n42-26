@@ -362,10 +362,7 @@ impl ObserverOrchestrator {
 
         match self.el.new_payload(execution_data).await {
             Ok(status) => {
-                if matches!(
-                    status.status,
-                    PayloadStatusEnum::Valid | PayloadStatusEnum::Accepted
-                ) {
+                if matches!(status.status, PayloadStatusEnum::Valid) {
                     if !has_commit_proof {
                         debug!(
                             target: "n42::observer",
@@ -381,9 +378,21 @@ impl ObserverOrchestrator {
                         safe_block_hash: hash,
                         finalized_block_hash: hash,
                     };
-                    if let Err(e) = self.el.fork_choice_updated(fcu_state).await {
-                        error!(target: "n42::observer", %hash, error = %e, "fork_choice_updated failed");
-                    } else {
+                    let fcu_valid = match self.el.fork_choice_updated(fcu_state).await {
+                        Ok(result) => {
+                            let valid =
+                                matches!(result.payload_status.status, PayloadStatusEnum::Valid);
+                            if !valid {
+                                warn!(target: "n42::observer", %hash, status = ?result.payload_status.status, "fork_choice_updated did not validate observer head; waiting for retry");
+                            }
+                            valid
+                        }
+                        Err(e) => {
+                            error!(target: "n42::observer", %hash, error = %e, "fork_choice_updated failed");
+                            false
+                        }
+                    };
+                    if fcu_valid {
                         self.head_block_hash = hash;
                         self.local_view = view;
                         self.blocks_imported += 1;
@@ -413,8 +422,11 @@ impl ObserverOrchestrator {
                             "skipping observer sync cache for block without commit_qc"
                         );
                     }
-                } else if matches!(status.status, PayloadStatusEnum::Syncing) {
-                    debug!(target: "n42::observer", %hash, view, "new_payload returned Syncing (reth pipeline catching up)");
+                } else if matches!(
+                    status.status,
+                    PayloadStatusEnum::Syncing | PayloadStatusEnum::Accepted
+                ) {
+                    debug!(target: "n42::observer", %hash, view, status = ?status.status, "new_payload has not executed observer block yet");
                 } else {
                     warn!(target: "n42::observer", %hash, view, status = ?status.status, "new_payload rejected block");
                 }
