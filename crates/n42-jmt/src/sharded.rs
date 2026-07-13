@@ -2,7 +2,9 @@ use crate::hasher::Blake3Hasher;
 use crate::keys::{account_key, storage_key};
 use crate::metrics;
 use crate::store::{MemTreeStore, TreeStore};
-use crate::tree::{EMPTY_CODE_HASH, N42JmtTree, decode_code_hash, encode_account_value};
+#[cfg(test)]
+use crate::tree::decode_code_hash;
+use crate::tree::{EMPTY_CODE_HASH, N42JmtTree, decode_code_hash_checked, encode_account_value};
 
 use alloy_primitives::B256;
 use jmt::{KeyHash, OwnedValue, Version};
@@ -116,9 +118,17 @@ impl<S: TreeStore> ShardedJmt<S> {
                 let key = account_key(address);
                 let si = shard_index(&key);
                 let tree = self.shards[si].lock();
-                if let Some(val) = tree.get(key)? {
-                    existing_code_hashes.insert(*address, decode_code_hash(&val));
-                }
+                let val = tree.get(key)?.ok_or_else(|| {
+                    eyre::eyre!(
+                        "sharded JMT read-miss: Modified account {address} at key {key:?} has no code_change and no existing leaf"
+                    )
+                })?;
+                let code_hash = decode_code_hash_checked(&val).map_err(|error| {
+                    eyre::eyre!(
+                        "sharded JMT account leaf for Modified account {address} at key {key:?} is corrupt: {error}"
+                    )
+                })?;
+                existing_code_hashes.insert(*address, code_hash);
             }
         }
 
@@ -151,10 +161,14 @@ impl<S: TreeStore> ShardedJmt<S> {
                     let nonce = account_diff.nonce.as_ref().map(|v| v.to).unwrap_or(0);
                     let code_hash = match &account_diff.code_change {
                         Some(change) => change.to.unwrap_or(EMPTY_CODE_HASH),
-                        None => existing_code_hashes
-                            .get(address)
-                            .copied()
-                            .unwrap_or(EMPTY_CODE_HASH),
+                        None if matches!(account_diff.change_type, AccountChangeType::Created) => {
+                            EMPTY_CODE_HASH
+                        }
+                        None => *existing_code_hashes.get(address).ok_or_else(|| {
+                            eyre::eyre!(
+                                "sharded JMT read-miss: Modified account {address} has no preserved code_hash"
+                            )
+                        })?,
                     };
                     let value = encode_account_value(&balance, nonce, &code_hash);
                     shard_updates[si].push((key, Some(value)));
@@ -563,6 +577,27 @@ mod tests {
             code_hash,
             "code_hash must be preserved in sharded mode"
         );
+    }
+
+    #[test]
+    fn sharded_modified_account_read_miss_fails_before_version_advance() {
+        let mut jmt = ShardedJmt::new();
+        let addr = Address::repeat_byte(0xBC);
+        let mut accounts = BTreeMap::new();
+        accounts.insert(
+            addr,
+            AccountDiff {
+                change_type: AccountChangeType::Modified,
+                balance: Some(ValueChange::new(U256::ZERO, U256::from(1))),
+                nonce: None,
+                code_change: None,
+                storage: BTreeMap::new(),
+            },
+        );
+
+        let error = jmt.apply_diff(&StateDiff { accounts }).unwrap_err();
+        assert!(error.to_string().contains("read-miss"));
+        assert_eq!(jmt.version(), 0);
     }
 
     #[test]

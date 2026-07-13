@@ -306,11 +306,19 @@ pub struct ConsensusService {
     /// execution is CONFIRMED (advance_execution_validated_head) - never on a
     /// block reth could still reject.
     pending_sidecar_diffs: BTreeMap<u64, (B256, n42_execution::state_diff::StateDiff)>,
+    /// Committed views whose compact execution output was unavailable or
+    /// malformed when the block committed. A gap is an ordering barrier:
+    /// later diffs remain staged until late BlockData recovers the missing one.
+    missing_sidecar_diffs: BTreeMap<u64, B256>,
     /// Confirmed sidecar diffs waiting for the single FIFO background worker.
     /// A shared queue is required because separate spawn_blocking calls can
     /// acquire the StateSink lock out of commit order.
     sidecar_apply_queue: Arc<std::sync::Mutex<VecDeque<SidecarDiffWork>>>,
     sidecar_apply_worker_running: Arc<std::sync::atomic::AtomicBool>,
+    /// Highest view accepted by the sidecar worker, retained across worker
+    /// lifetimes so a later queue cannot replay or regress an already-applied
+    /// append-ordered diff.
+    last_sidecar_applied_view: Arc<std::sync::atomic::AtomicU64>,
     last_commit_qc: Option<QuorumCertificate>,
     /// Cached `keccak256(commit_qc.aggregate_signature)` — avoids re-hashing on every payload build.
     prev_randao_cache: B256,
@@ -479,6 +487,10 @@ impl ConsensusService {
         data: Vec<u8>,
         protected_hashes: &[B256],
     ) -> bool {
+        // A Decide-before-BlockData race may have left the sidecar paused at
+        // this committed view. Recover the owned StateDiff directly from the
+        // late bytes even if the bounded raw-data cache cannot retain them.
+        self.try_recover_missing_sidecar_diff(hash, &data);
         if self.pending_block_data.contains_key(&hash) {
             return false;
         }
@@ -505,6 +517,35 @@ impl ConsensusService {
 
         self.pending_block_data.insert(hash, data);
         true
+    }
+
+    fn try_recover_missing_sidecar_diff(&mut self, hash: B256, data: &[u8]) {
+        if self.jmt.is_none() && self.twig.is_none() {
+            return;
+        }
+        let Some(view) = self
+            .missing_sidecar_diffs
+            .iter()
+            .find_map(|(view, missing_hash)| (*missing_hash == hash).then_some(*view))
+        else {
+            return;
+        };
+        let Some(diff) = Self::extract_state_diff_for_state_tree(hash, data) else {
+            return;
+        };
+
+        self.missing_sidecar_diffs.remove(&view);
+        self.pending_sidecar_diffs.insert(view, (hash, diff));
+        counter!("n42_sidecar_diff_gap_recovered_total").increment(1);
+        info!(
+            target: "n42::twig",
+            view,
+            %hash,
+            "recovered missing committed sidecar diff from late block data"
+        );
+        if view <= self.execution_validated_head_view {
+            self.enqueue_confirmed_sidecar_state_diffs(self.execution_validated_head_view);
+        }
     }
 
     fn leader_propose_warmup_delay() -> Duration {
@@ -884,8 +925,10 @@ impl ConsensusService {
             execution_validated_head_view: 0,
             eager_execution_validated: VecDeque::new(),
             pending_sidecar_diffs: BTreeMap::new(),
+            missing_sidecar_diffs: BTreeMap::new(),
             sidecar_apply_queue: Arc::new(std::sync::Mutex::new(VecDeque::new())),
             sidecar_apply_worker_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            last_sidecar_applied_view: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_commit_qc: None,
             prev_randao_cache: B256::ZERO,
             block_ready_tx,
@@ -1090,8 +1133,10 @@ impl ConsensusService {
             execution_validated_head_view: 0,
             eager_execution_validated: VecDeque::new(),
             pending_sidecar_diffs: BTreeMap::new(),
+            missing_sidecar_diffs: BTreeMap::new(),
             sidecar_apply_queue: Arc::new(std::sync::Mutex::new(VecDeque::new())),
             sidecar_apply_worker_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            last_sidecar_applied_view: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_commit_qc: None,
             prev_randao_cache: B256::ZERO,
             block_ready_tx,
@@ -2160,6 +2205,35 @@ mod tests {
             payload_json,
             timestamp: 1,
             execution_output: None,
+            leader_ready_unix_ms: 0,
+        })
+        .expect("serialize test block broadcast")
+    }
+
+    fn test_block_data_with_empty_execution(
+        parent_hash: B256,
+        block_hash: B256,
+        view: u64,
+    ) -> Vec<u8> {
+        let payload_json = serde_json::to_vec(&test_execution_data(parent_hash, block_hash))
+            .expect("serialize test execution data");
+        let compact = CompactBlockExecution {
+            bundle_state: Default::default(),
+            receipts: Vec::new(),
+            requests: Default::default(),
+            gas_used: 0,
+            blob_gas_used: 0,
+            senders: Vec::new(),
+        };
+        let execution_json = serde_json::to_vec(&compact).expect("serialize compact execution");
+        let execution_output =
+            zstd::bulk::compress(&execution_json, 3).expect("compress compact execution");
+        bincode::serialize(&BlockDataBroadcast {
+            block_hash,
+            view,
+            payload_json,
+            timestamp: 1,
+            execution_output: Some(execution_output),
             leader_ready_unix_ms: 0,
         })
         .expect("serialize test block broadcast")
@@ -3311,6 +3385,60 @@ mod tests {
         assert_eq!(applies.lock().unwrap().len(), 1);
     }
 
+    /// F8: a missing committed diff is an ordering barrier. A later confirmed
+    /// diff waits, then both apply in order once late BlockData repairs the gap.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sidecar_missing_diff_pauses_and_late_block_data_recovers_in_order() {
+        use n42_execution::state_diff::{AccountChangeType, AccountDiff, StateDiff};
+
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let (sink, applies) = SpyStateSink::new();
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
+        orch.jmt = Some(sink);
+
+        let parent = B256::repeat_byte(0x30);
+        let missing_hash = B256::repeat_byte(0x31);
+        let later_hash = B256::repeat_byte(0x32);
+        orch.missing_sidecar_diffs.insert(1, missing_hash);
+        let mut later_diff = StateDiff::default();
+        for index in 0..2u8 {
+            later_diff.accounts.insert(
+                Address::with_last_byte(index + 1),
+                AccountDiff {
+                    change_type: AccountChangeType::Created,
+                    balance: None,
+                    nonce: None,
+                    code_change: None,
+                    storage: BTreeMap::new(),
+                },
+            );
+        }
+        orch.pending_sidecar_diffs
+            .insert(2, (later_hash, later_diff));
+
+        orch.advance_execution_validated_head(2, later_hash, "confirm across missing diff");
+        drain_spawned_tasks().await;
+        assert!(
+            applies.lock().unwrap().is_empty(),
+            "view 2 must not apply across the missing view 1 diff"
+        );
+        assert!(orch.pending_sidecar_diffs.contains_key(&2));
+
+        let late_data = test_block_data_with_empty_execution(parent, missing_hash, 1);
+        orch.cache_pending_block_data(missing_hash, late_data, &[missing_hash]);
+        drain_spawned_tasks().await;
+
+        assert_eq!(
+            *applies.lock().unwrap(),
+            vec![0, 2],
+            "recovered view 1 must apply before the already-confirmed view 2"
+        );
+        assert!(orch.missing_sidecar_diffs.is_empty());
+        assert!(orch.pending_sidecar_diffs.is_empty());
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn sidecar_diffs_apply_in_committed_view_order() {
         use n42_execution::state_diff::{AccountChangeType, AccountDiff, StateDiff};
@@ -3359,7 +3487,7 @@ mod tests {
     /// queue, the single FIFO worker skips it rather than applying a lower view
     /// after a higher one (which would diverge the append-ordered root).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn sidecar_worker_skips_out_of_order_apply() {
+    async fn sidecar_worker_skips_out_of_order_apply_across_worker_restarts() {
         use n42_execution::state_diff::{AccountChangeType, AccountDiff, StateDiff};
 
         fn diff_with_accounts(count: u8) -> StateDiff {
@@ -3390,21 +3518,26 @@ mod tests {
         orch.jmt = Some(sink);
         let hash = B256::repeat_byte(0x25);
 
-        // Inject an out-of-order pair (view 2 before view 1) directly into the
-        // queue, simulating a hypothetical reordering bug.
-        {
-            let mut q = orch.sidecar_apply_queue.lock().unwrap();
-            q.push_back((2, hash, diff_with_accounts(2)));
-            q.push_back((1, hash, diff_with_accounts(1)));
-        }
-        // A normal confirmation at view 3 drains pending → queue = [2, 1, 3] and
-        // starts the worker.
+        // First worker lifetime: normally apply view 2, then let the queue drain
+        // and the worker exit.
+        orch.pending_sidecar_diffs
+            .insert(2, (hash, diff_with_accounts(2)));
+        orch.advance_execution_validated_head(2, hash, "confirm view 2");
+        drain_spawned_tasks().await;
+        assert_eq!(*applies.lock().unwrap(), vec![2]);
+
+        // Second worker lifetime: inject stale view 1 before normally-confirmed
+        // view 3. A worker-local last-view variable would reset to zero here and
+        // incorrectly apply [1, 3]; the shared high-water mark must skip 1.
+        orch.sidecar_apply_queue
+            .lock()
+            .unwrap()
+            .push_back((1, hash, diff_with_accounts(1)));
         orch.pending_sidecar_diffs
             .insert(3, (hash, diff_with_accounts(3)));
         orch.advance_execution_validated_head(3, hash, "confirm view 3");
         drain_spawned_tasks().await;
 
-        // View 1 (arriving after view 2) is skipped; views 2 and 3 apply.
         assert_eq!(
             *applies.lock().unwrap(),
             vec![2, 3],

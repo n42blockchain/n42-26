@@ -24,5 +24,7 @@ pub use sharded::{ShardedJmt, combine_shard_roots};
 pub use sharded_bmt::ShardedSbmt;
 pub use snapshot::{JmtSnapshot, load_snapshot, save_snapshot};
 pub use store::{MemTreeStore, TreeStore};
-pub use tree::{EMPTY_CODE_HASH, N42JmtTree, decode_code_hash, encode_account_value};
+pub use tree::{
+    EMPTY_CODE_HASH, N42JmtTree, decode_code_hash, decode_code_hash_checked, encode_account_value,
+};
 pub use twig::TwigState;

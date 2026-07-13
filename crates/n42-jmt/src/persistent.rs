@@ -160,8 +160,6 @@ impl Drop for PersistentJmt {
 pub struct PersistentSbmt {
     inner: ShardedSbmt,
     snapshot_path: PathBuf,
-    /// WAL path (`<snapshot>.wal`).
-    wal_path: PathBuf,
     /// Append-only log of per-block `StateDiff`s since the last snapshot.
     wal: File,
     snapshot_interval: u64,
@@ -191,7 +189,13 @@ pub struct PersistentSbmt {
 fn read_wal_entries(path: &Path) -> eyre::Result<Vec<(u64, StateDiff)>> {
     let data = match std::fs::read(path) {
         Ok(d) => d,
-        Err(_) => return Ok(Vec::new()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(eyre::eyre!(
+                "failed to read WAL {}: {error}",
+                path.display()
+            ));
+        }
     };
     let mut entries = Vec::new();
     let mut off = 0usize;
@@ -199,10 +203,15 @@ fn read_wal_entries(path: &Path) -> eyre::Result<Vec<(u64, StateDiff)>> {
         let version = u64::from_le_bytes(data[off..off + 8].try_into().unwrap());
         let len = u32::from_le_bytes(data[off + 8..off + 12].try_into().unwrap()) as usize;
         let start = off + 12;
-        if start + len > data.len() {
+        let Some(end) = start.checked_add(len) else {
+            return Err(eyre::eyre!(
+                "WAL record length overflows address space at offset {off}: {len}"
+            ));
+        };
+        if end > data.len() {
             break; // truncated trailing record — tolerate
         }
-        match bincode::deserialize::<StateDiff>(&data[start..start + len]) {
+        match bincode::deserialize::<StateDiff>(&data[start..end]) {
             Ok(diff) => entries.push((version, diff)),
             Err(e) => {
                 return Err(eyre::eyre!(
@@ -211,7 +220,39 @@ fn read_wal_entries(path: &Path) -> eyre::Result<Vec<(u64, StateDiff)>> {
                 ));
             }
         }
-        off = start + len;
+        off = end;
+    }
+
+    // Recovery must remove a truncated header/body before reopening the file
+    // in append mode. Merely ignoring it leaves the write cursor after the
+    // corrupt bytes, so the next valid record is appended behind the fragment
+    // and becomes unreachable on the following restart (F1a).
+    if off < data.len() {
+        let wal = OpenOptions::new().write(true).open(path).map_err(|error| {
+            eyre::eyre!(
+                "failed to open WAL {} for truncated-tail repair: {error}",
+                path.display()
+            )
+        })?;
+        wal.set_len(off as u64).map_err(|error| {
+            eyre::eyre!(
+                "failed to truncate WAL {} to valid offset {off}: {error}",
+                path.display()
+            )
+        })?;
+        wal.sync_data().map_err(|error| {
+            eyre::eyre!(
+                "failed to sync repaired WAL {} at offset {off}: {error}",
+                path.display()
+            )
+        })?;
+        tracing::warn!(
+            target: "n42::jmt",
+            path = %path.display(),
+            valid_bytes = off,
+            removed_bytes = data.len() - off,
+            "repaired truncated WAL tail before reopening for append"
+        );
     }
     Ok(entries)
 }
@@ -330,7 +371,6 @@ impl PersistentSbmt {
         Ok(Self {
             inner,
             snapshot_path,
-            wal_path,
             wal,
             snapshot_interval: snapshot_interval.max(1),
             last_snapshot_version,
@@ -391,8 +431,13 @@ impl PersistentSbmt {
         // Once poisoned, refuse without touching the WAL or memory. A sink that
         // silently kept producing wrong roots is worse than one that stops.
         if let Some(reason) = &self.poisoned {
-            return Err(eyre::eyre!("SBMT sink is poisoned, refusing apply: {reason}"));
+            return Err(eyre::eyre!(
+                "SBMT sink is poisoned, refusing apply: {reason}"
+            ));
         }
+        // Surface a failed explicitly-requested background checkpoint before
+        // accepting another block.
+        self.join_pending()?;
         // WAL-ahead: append the record durably BEFORE mutating memory, so a crash
         // can only lose in-memory state (recoverable by replay) and never leave
         // memory ahead of the WAL. `apply_diff` will assign exactly this version.
@@ -440,7 +485,11 @@ impl PersistentSbmt {
                 // Truncate the partial record and re-sync. If the rollback
                 // itself fails the file may still hold a partial record, so the
                 // caller must poison the sink (no further appends).
-                match self.wal.set_len(prev_len).and_then(|()| self.wal.sync_data()) {
+                match self
+                    .wal
+                    .set_len(prev_len)
+                    .and_then(|()| self.wal.sync_data())
+                {
                     Ok(()) => Err(eyre::eyre!(
                         "WAL append failed at version {version}, rolled back to {prev_len} bytes: {e}"
                     )),
@@ -460,36 +509,45 @@ impl PersistentSbmt {
     /// crash. SBMT applies run in a background task (off the consensus critical
     /// path), so the per-block fsync is affordable.
     fn write_wal_record(wal: &mut File, version: u64, bytes: &[u8]) -> std::io::Result<()> {
+        let len = u32::try_from(bytes.len()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("WAL record is too large: {} bytes", bytes.len()),
+            )
+        })?;
         wal.write_all(&version.to_le_bytes())?;
-        wal.write_all(&(bytes.len() as u32).to_le_bytes())?;
+        wal.write_all(&len.to_le_bytes())?;
         wal.write_all(bytes)?;
         wal.sync_data()
     }
 
     /// Clear the WAL after a durable snapshot, then reopen it for append.
     fn truncate_wal(&mut self) -> eyre::Result<()> {
-        drop(
-            OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(&self.wal_path)?,
-        );
-        self.wal = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.wal_path)?;
+        self.wal.set_len(0)?;
+        self.wal.sync_data()?;
         Ok(())
     }
 
     /// Synchronous snapshot flush: blocks until durably written, then truncates
     /// the WAL (the snapshot now covers everything up to `last_snapshot_version`).
     pub fn flush(&mut self) -> eyre::Result<()> {
+        if let Some(reason) = &self.poisoned {
+            return Err(eyre::eyre!(
+                "SBMT sink is poisoned, refusing checkpoint/WAL truncation: {reason}"
+            ));
+        }
         self.join_pending()?;
         let snapshot = self.inner.snapshot();
-        self.last_snapshot_version = snapshot.version;
-        save_snapshot(&self.snapshot_path, &snapshot)?;
-        self.truncate_wal()
+        let version = snapshot.version;
+        if let Err(error) =
+            save_snapshot(&self.snapshot_path, &snapshot).and_then(|()| self.truncate_wal())
+        {
+            let reason = format!("SBMT checkpoint failed at version {version}: {error}");
+            self.poisoned = Some(reason.clone());
+            return Err(eyre::eyre!(reason));
+        }
+        self.last_snapshot_version = version;
+        Ok(())
     }
 
     /// Background snapshot flush: serialization + IO off the apply path.
@@ -499,6 +557,11 @@ impl PersistentSbmt {
     /// via the synchronous `flush` path; use this only when you manage durability
     /// ordering yourself.
     pub fn flush_background(&mut self) -> eyre::Result<()> {
+        if let Some(reason) = &self.poisoned {
+            return Err(eyre::eyre!(
+                "SBMT sink is poisoned, refusing background checkpoint: {reason}"
+            ));
+        }
         self.join_pending()?;
         let snapshot: JmtSnapshot = self.inner.snapshot();
         self.last_snapshot_version = snapshot.version;
@@ -515,10 +578,15 @@ impl PersistentSbmt {
 
     /// Wait for any in-flight background flush, propagating its result.
     pub fn join_pending(&mut self) -> eyre::Result<()> {
-        if let Some(handle) = self.pending_flush.take() {
-            handle
+        if let Some(handle) = self.pending_flush.take()
+            && let Err(error) = handle
                 .join()
-                .map_err(|_| eyre::eyre!("snapshot flush thread panicked"))??;
+                .map_err(|_| eyre::eyre!("snapshot flush thread panicked"))
+                .and_then(|result| result)
+        {
+            let reason = format!("SBMT background checkpoint failed: {error}");
+            self.poisoned = Some(reason.clone());
+            return Err(eyre::eyre!(reason));
         }
         Ok(())
     }
@@ -527,9 +595,10 @@ impl PersistentSbmt {
     /// deterministically fails, exercising the F1a rollback + F1b poison path.
     #[cfg(test)]
     pub(crate) fn break_wal_handle_for_test(&mut self) {
+        let wal_path = self.snapshot_path.with_extension("wal");
         self.wal = OpenOptions::new()
             .read(true)
-            .open(&self.wal_path)
+            .open(wal_path)
             .expect("reopen WAL read-only");
     }
 }
@@ -549,7 +618,6 @@ impl Drop for PersistentSbmt {
 pub struct PersistentTwig {
     inner: TwigState,
     snapshot_path: PathBuf,
-    wal_path: PathBuf,
     wal: File,
     snapshot_interval: u64,
     last_snapshot_version: u64,
@@ -574,7 +642,7 @@ impl PersistentTwig {
             match load_twig_snapshot(&snapshot_path)? {
                 Some(snap) => {
                     let version = snap.version;
-                    (TwigState::from_snapshot(&snap), version, true)
+                    (TwigState::try_from_snapshot(&snap)?, version, true)
                 }
                 None => (TwigState::new(), 0, false),
             };
@@ -618,7 +686,6 @@ impl PersistentTwig {
         Ok(Self {
             inner,
             snapshot_path,
-            wal_path,
             wal,
             snapshot_interval: snapshot_interval.max(1),
             last_snapshot_version,
@@ -677,8 +744,11 @@ impl PersistentTwig {
         // root is a function of append history, so a silent continue after a
         // failed step diverges the root from every healthy node permanently.
         if let Some(reason) = &self.poisoned {
-            return Err(eyre::eyre!("Twig sink is poisoned, refusing apply: {reason}"));
+            return Err(eyre::eyre!(
+                "Twig sink is poisoned, refusing apply: {reason}"
+            ));
         }
+        self.join_pending()?;
         let next_version = self.inner.version() + 1;
         if let Err(e) = self.append_wal(next_version, diff) {
             // WAL append is the only fallible step before memory mutation; on
@@ -716,7 +786,11 @@ impl PersistentTwig {
         let prev_len = self.wal.metadata()?.len();
         match Self::write_wal_record(&mut self.wal, version, &bytes) {
             Ok(()) => Ok(()),
-            Err(e) => match self.wal.set_len(prev_len).and_then(|()| self.wal.sync_data()) {
+            Err(e) => match self
+                .wal
+                .set_len(prev_len)
+                .and_then(|()| self.wal.sync_data())
+            {
                 Ok(()) => Err(eyre::eyre!(
                     "WAL append failed at version {version}, rolled back to {prev_len} bytes: {e}"
                 )),
@@ -731,34 +805,43 @@ impl PersistentTwig {
     /// Write one `[version][len][bincode(diff)]` record and fsync it. A free
     /// function so `append_wal` can hold the rollback borrow of `self.wal`.
     fn write_wal_record(wal: &mut File, version: u64, bytes: &[u8]) -> std::io::Result<()> {
+        let len = u32::try_from(bytes.len()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("WAL record is too large: {} bytes", bytes.len()),
+            )
+        })?;
         wal.write_all(&version.to_le_bytes())?;
-        wal.write_all(&(bytes.len() as u32).to_le_bytes())?;
+        wal.write_all(&len.to_le_bytes())?;
         wal.write_all(bytes)?;
         wal.sync_data()
     }
 
     fn truncate_wal(&mut self) -> eyre::Result<()> {
-        drop(
-            OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(&self.wal_path)?,
-        );
-        self.wal = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.wal_path)?;
+        self.wal.set_len(0)?;
+        self.wal.sync_data()?;
         Ok(())
     }
 
     /// Synchronous snapshot flush: durably writes snapshot, then truncates WAL.
     pub fn flush(&mut self) -> eyre::Result<()> {
+        if let Some(reason) = &self.poisoned {
+            return Err(eyre::eyre!(
+                "Twig sink is poisoned, refusing checkpoint/WAL truncation: {reason}"
+            ));
+        }
         self.join_pending()?;
         let snapshot = self.inner.snapshot();
-        self.last_snapshot_version = snapshot.version;
-        save_twig_snapshot(&self.snapshot_path, &snapshot)?;
-        self.truncate_wal()
+        let version = snapshot.version;
+        if let Err(error) =
+            save_twig_snapshot(&self.snapshot_path, &snapshot).and_then(|()| self.truncate_wal())
+        {
+            let reason = format!("Twig checkpoint failed at version {version}: {error}");
+            self.poisoned = Some(reason.clone());
+            return Err(eyre::eyre!(reason));
+        }
+        self.last_snapshot_version = version;
+        Ok(())
     }
 
     /// Background snapshot flush: serialization + IO off the apply path.
@@ -766,6 +849,11 @@ impl PersistentTwig {
     /// This mirrors [`PersistentSbmt::flush_background`]: it does not truncate the
     /// WAL because the snapshot is not yet durable when the method returns.
     pub fn flush_background(&mut self) -> eyre::Result<()> {
+        if let Some(reason) = &self.poisoned {
+            return Err(eyre::eyre!(
+                "Twig sink is poisoned, refusing background checkpoint: {reason}"
+            ));
+        }
         self.join_pending()?;
         let snapshot = self.inner.snapshot();
         self.last_snapshot_version = snapshot.version;
@@ -784,10 +872,15 @@ impl PersistentTwig {
 
     /// Wait for any in-flight background flush, propagating its result.
     pub fn join_pending(&mut self) -> eyre::Result<()> {
-        if let Some(handle) = self.pending_flush.take() {
-            handle
+        if let Some(handle) = self.pending_flush.take()
+            && let Err(error) = handle
                 .join()
-                .map_err(|_| eyre::eyre!("snapshot flush thread panicked"))??;
+                .map_err(|_| eyre::eyre!("snapshot flush thread panicked"))
+                .and_then(|result| result)
+        {
+            let reason = format!("Twig background checkpoint failed: {error}");
+            self.poisoned = Some(reason.clone());
+            return Err(eyre::eyre!(reason));
         }
         Ok(())
     }
@@ -796,9 +889,10 @@ impl PersistentTwig {
     /// deterministically fails, exercising the F1a rollback + F1b poison path.
     #[cfg(test)]
     pub(crate) fn break_wal_handle_for_test(&mut self) {
+        let wal_path = self.snapshot_path.with_extension("wal");
         self.wal = OpenOptions::new()
             .read(true)
-            .open(&self.wal_path)
+            .open(wal_path)
             .expect("reopen WAL read-only");
     }
 }
@@ -1108,11 +1202,24 @@ mod tests {
         bytes.extend_from_slice(&[0u8; 10]);
         std::fs::write(&wal_path, &bytes).unwrap();
 
-        let reopened = PersistentTwig::open(&path, u64::MAX).unwrap();
+        let mut reopened = PersistentTwig::open(&path, u64::MAX).unwrap();
         assert_eq!(
             reopened.version(),
             2,
             "both complete records must replay; the truncated tail is dropped"
+        );
+        assert!(
+            std::fs::metadata(&wal_path).unwrap().len() < bytes.len() as u64,
+            "open must physically truncate the ignored tail before append"
+        );
+        reopened.apply_diff(&make_diff(5)).unwrap();
+        drop(reopened);
+
+        let reopened_again = PersistentTwig::open(&path, u64::MAX).unwrap();
+        assert_eq!(
+            reopened_again.version(),
+            3,
+            "a valid record appended after crash repair must survive the next restart"
         );
     }
 
@@ -1172,6 +1279,10 @@ mod tests {
             "further applies must fail fast: {err2}"
         );
         assert_eq!(twig.version(), version_before);
+        assert!(
+            twig.flush().unwrap_err().to_string().contains("poisoned"),
+            "a poisoned sink must not checkpoint or mutate its WAL"
+        );
     }
 
     /// F1b mirror on the SBMT sink.
@@ -1185,10 +1296,46 @@ mod tests {
 
         sbmt.break_wal_handle_for_test();
         let _ = sbmt.apply_diff(&make_diff(5)).unwrap_err();
-        assert!(sbmt.is_poisoned(), "a WAL failure must poison the SBMT sink");
+        assert!(
+            sbmt.is_poisoned(),
+            "a WAL failure must poison the SBMT sink"
+        );
         assert_eq!(sbmt.version(), version_before);
         let err2 = sbmt.apply_diff(&make_diff(5)).unwrap_err();
         assert!(err2.to_string().contains("poisoned"));
+        assert!(sbmt.flush().unwrap_err().to_string().contains("poisoned"));
+    }
+
+    #[test]
+    fn twig_checkpoint_failure_poisons_but_wal_recovers_the_applied_diff() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("twig.snapshot");
+        let tmp_path = path.with_extension("tmp");
+        let mut twig = PersistentTwig::open(&path, 1).unwrap();
+
+        // Block the atomic snapshot temp file with a directory. The WAL append
+        // and in-memory mutation succeed, then checkpoint creation fails.
+        std::fs::create_dir(&tmp_path).unwrap();
+        let error = twig.apply_diff(&make_diff(5)).unwrap_err();
+        assert!(error.to_string().contains("checkpoint failed"));
+        assert!(twig.is_poisoned());
+        assert_eq!(twig.version(), 1, "the durable WAL-backed apply occurred");
+        assert_eq!(twig.last_snapshot_version(), 0);
+        assert!(
+            twig.apply_diff(&make_diff(1))
+                .unwrap_err()
+                .to_string()
+                .contains("poisoned")
+        );
+        drop(twig);
+
+        std::fs::remove_dir(&tmp_path).unwrap();
+        let reopened = PersistentTwig::open(&path, u64::MAX).unwrap();
+        assert_eq!(
+            reopened.version(),
+            1,
+            "restart must replay the durable diff whose checkpoint failed"
+        );
     }
 
     /// F6: after a restart-before-first-block, a restored twig must NOT reseed
@@ -1216,7 +1363,11 @@ mod tests {
             assert!(twig.version() == 0 && !twig.restored_from_disk());
             seed(&mut twig);
             twig.flush().unwrap();
-            assert_eq!(twig.version(), 0, "genesis seeding does not bump the version");
+            assert_eq!(
+                twig.version(),
+                0,
+                "genesis seeding does not bump the version"
+            );
             twig.root_hash()
         };
 
@@ -1228,7 +1379,7 @@ mod tests {
                 "a persisted snapshot marks the tree restored"
             );
             assert!(
-                !(twig.version() == 0 && !twig.restored_from_disk()),
+                twig.version() != 0 || twig.restored_from_disk(),
                 "the reseed guard must be false for a restored tree"
             );
             assert_eq!(

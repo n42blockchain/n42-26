@@ -484,6 +484,7 @@ impl ConsensusService {
                 .get(&block_hash)
                 .and_then(|data| Self::extract_state_diff_for_state_tree(block_hash, data));
             if let Some(diff) = diff {
+                self.missing_sidecar_diffs.remove(&view);
                 self.pending_sidecar_diffs.insert(view, (block_hash, diff));
                 // The commit may confirm execution in the same breath (eager
                 // import validated before the CommitQC): the head already
@@ -492,7 +493,14 @@ impl ConsensusService {
                     self.enqueue_confirmed_sidecar_state_diffs(self.execution_validated_head_view);
                 }
             } else {
-                debug!(target: "n42::jmt", %block_hash, "no block data available for state-tree update (will catch up)");
+                self.missing_sidecar_diffs.insert(view, block_hash);
+                error!(
+                    target: "n42::twig",
+                    view,
+                    %block_hash,
+                    "committed sidecar diff unavailable; pausing QMDB/SBMT updates at this view until block data recovery"
+                );
+                counter!("n42_sidecar_diff_gap_total").increment(1);
             }
         }
 
@@ -1297,9 +1305,18 @@ impl ConsensusService {
     /// completions are observed; draining by committed view preserves the
     /// state-tree lineage and prevents separately spawned tasks from racing.
     pub(super) fn enqueue_confirmed_sidecar_state_diffs(&mut self, confirmed_view: u64) {
+        // Never apply across a missing committed diff. Views can skip on
+        // HotStuff timeouts, so the barrier is the first explicitly recorded
+        // missing view rather than `last + 1` arithmetic.
+        let blocked_view = self
+            .missing_sidecar_diffs
+            .range(..=confirmed_view)
+            .next()
+            .map(|(view, _)| *view);
         let confirmed_views: Vec<u64> = self
             .pending_sidecar_diffs
             .range(..=confirmed_view)
+            .take_while(|(view, _)| blocked_view.is_none_or(|blocked| **view < blocked))
             .map(|(view, _)| *view)
             .collect();
         if confirmed_views.is_empty() {
@@ -1327,6 +1344,7 @@ impl ConsensusService {
 
         let queue = Arc::clone(&self.sidecar_apply_queue);
         let running = Arc::clone(&self.sidecar_apply_worker_running);
+        let last_applied = Arc::clone(&self.last_sidecar_applied_view);
         let jmt = self.jmt.clone();
         let twig = self.twig.clone();
         let state = self.consensus_state.clone();
@@ -1335,7 +1353,6 @@ impl ConsensusService {
             // order. The queue is view-ordered by construction; this tracks the
             // last applied view so a reordering bug is caught, not silently
             // baked into a diverged root.
-            let mut last_applied_view: u64 = 0;
             loop {
                 let work = queue
                     .lock()
@@ -1365,18 +1382,19 @@ impl ConsensusService {
                 // F7 defense-in-depth: refuse an out-of-order apply. Applying a
                 // lower view after a higher one would diverge the append-ordered
                 // twig root permanently, so skip and surface it loudly.
-                if view < last_applied_view {
+                let last_applied_view = last_applied.load(std::sync::atomic::Ordering::Acquire);
+                if view <= last_applied_view {
                     error!(
                         target: "n42::twig",
                         view,
                         last_applied_view,
                         %block_hash,
-                        "sidecar apply queue out of order; skipping to preserve root determinism"
+                        "sidecar apply queue duplicate/out of order; skipping to preserve root determinism"
                     );
                     counter!("n42_sidecar_apply_out_of_order").increment(1);
                     continue;
                 }
-                last_applied_view = view;
+                last_applied.store(view, std::sync::atomic::Ordering::Release);
 
                 if let Some(ref jmt) = jmt {
                     let start = std::time::Instant::now();
@@ -1453,7 +1471,7 @@ impl ConsensusService {
 
     /// Try to extract a `StateDiff` from serialized `BlockDataBroadcast` for a state-tree update.
     /// Returns `None` if the data is missing, malformed, or has no compact block execution.
-    fn extract_state_diff_for_state_tree(
+    pub(super) fn extract_state_diff_for_state_tree(
         block_hash: B256,
         data: &[u8],
     ) -> Option<n42_execution::state_diff::StateDiff> {

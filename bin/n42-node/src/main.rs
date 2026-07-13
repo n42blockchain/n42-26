@@ -860,13 +860,11 @@ fn main() {
                             );
                         }
 
-                        if let Err(e) = tree.flush() {
-                            warn!(
-                                target: "n42::cli",
-                                error = %e,
-                                "failed to persist genesis SBMT snapshot; crash recovery may need to reseed genesis"
-                            );
-                        }
+                        tree.flush().map_err(|error| {
+                            eyre::eyre!(
+                                "failed to persist genesis SBMT snapshot; refusing to start: {error}"
+                            )
+                        })?;
 
                         let version = tree.version();
                         let root = tree.root_hash();
@@ -927,13 +925,11 @@ fn main() {
                             );
                         }
 
-                        if let Err(e) = tree.flush() {
-                            warn!(
-                                target: "n42::cli",
-                                error = %e,
-                                "failed to persist genesis Twig snapshot; crash recovery may need to reseed genesis"
-                            );
-                        }
+                        tree.flush().map_err(|error| {
+                            eyre::eyre!(
+                                "failed to persist genesis Twig snapshot; refusing to start: {error}"
+                            )
+                        })?;
 
                         let version = tree.version();
                         let root = tree.root_hash();

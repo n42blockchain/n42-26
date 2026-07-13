@@ -14,7 +14,9 @@
 
 use crate::keys::{account_key, storage_key};
 use crate::snapshot::JmtSnapshot;
-use crate::tree::{EMPTY_CODE_HASH, decode_code_hash, encode_account_value};
+#[cfg(test)]
+use crate::tree::decode_code_hash;
+use crate::tree::{EMPTY_CODE_HASH, decode_code_hash_checked, encode_account_value};
 use n42_bmt_core::{Hash, SHARD_COUNT, Sbmt, ShardedBmtProof, shard_tree_path, shard_tree_root};
 
 use alloy_primitives::{Address, B256, U256};
@@ -142,12 +144,22 @@ impl ShardedSbmt {
                     }
                 }
                 AccountChangeType::Created | AccountChangeType::Modified => {
-                    let balance = account_diff.balance.as_ref().map(|v| v.to).unwrap_or_default();
+                    let balance = account_diff
+                        .balance
+                        .as_ref()
+                        .map(|v| v.to)
+                        .unwrap_or_default();
                     let nonce = account_diff.nonce.as_ref().map(|v| v.to).unwrap_or(0);
                     let code_hash = match &account_diff.code_change {
                         Some(change) => change.to.unwrap_or(EMPTY_CODE_HASH),
-                        None => match self.values[si].get(&key).map(|v| decode_code_hash(v)) {
-                            Some(h) => h,
+                        None => match self.values[si].get(&key) {
+                            Some(value) => {
+                                decode_code_hash_checked(value).map_err(|error| {
+                                    eyre::eyre!(
+                                        "SBMT account leaf for Modified account {address} at key {key:?} is corrupt: {error}"
+                                    )
+                                })?
+                            }
                             // A Created account legitimately has no prior leaf.
                             None if matches!(
                                 account_diff.change_type,
@@ -162,7 +174,7 @@ impl ShardedSbmt {
                             // leaf and diverge the root — fail loud instead.
                             None => {
                                 return Err(eyre::eyre!(
-                                    "SBMT read-miss: Modified account {address} has no code_change \
+                                    "SBMT read-miss: Modified account {address} at key {key:?} has no code_change \
                                      and no existing leaf; refusing to commit EMPTY_CODE_HASH"
                                 ));
                             }
@@ -337,7 +349,11 @@ mod tests {
         let (v, root) = t.apply_diff(&created_diff(100)).unwrap();
         assert_eq!(v, 1);
         assert_ne!(root, B256::ZERO);
-        assert_eq!(root, t.root_hash(), "returned root must match recomputed root");
+        assert_eq!(
+            root,
+            t.root_hash(),
+            "returned root must match recomputed root"
+        );
     }
 
     #[test]
@@ -379,7 +395,10 @@ mod tests {
         let mut t = ShardedSbmt::new();
         t.apply_diff(&created_diff(200)).unwrap();
         let non_empty = t.shard_stats().iter().filter(|(n, _)| *n > 0).count();
-        assert!(non_empty >= 8, "expected ≥8 non-empty shards, got {non_empty}");
+        assert!(
+            non_empty >= 8,
+            "expected ≥8 non-empty shards, got {non_empty}"
+        );
     }
 
     #[test]
@@ -452,7 +471,11 @@ mod tests {
 
         let key = account_key(&addr).0;
         let val = t.get(&key).unwrap();
-        assert_eq!(decode_code_hash(&val), code_hash, "code_hash must survive modify");
+        assert_eq!(
+            decode_code_hash(&val),
+            code_hash,
+            "code_hash must survive modify"
+        );
     }
 
     #[test]
@@ -473,7 +496,10 @@ mod tests {
 
         let mut bad = proof.clone();
         bad.shard_root[0] ^= 0xFF;
-        assert!(bad.verify(&root.0).is_err(), "tampered shard root must fail");
+        assert!(
+            bad.verify(&root.0).is_err(),
+            "tampered shard root must fail"
+        );
     }
 
     #[test]

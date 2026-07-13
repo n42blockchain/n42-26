@@ -8,7 +8,9 @@
 //! keyHash-sorted order. See `docs/devlog-64` (P6).
 
 use crate::keys::{KeyJob, account_key, derive_keys_batch, storage_key};
-use crate::tree::{EMPTY_CODE_HASH, decode_code_hash, encode_account_value};
+#[cfg(test)]
+use crate::tree::decode_code_hash;
+use crate::tree::{EMPTY_CODE_HASH, decode_code_hash_checked, encode_account_value};
 
 use alloy_primitives::{Address, B256, U256};
 use n42_execution::state_diff::{AccountChangeType, StateDiff};
@@ -131,12 +133,20 @@ impl TwigState {
                     }
                 }
                 AccountChangeType::Created | AccountChangeType::Modified => {
-                    let balance = account_diff.balance.as_ref().map(|v| v.to).unwrap_or_default();
+                    let balance = account_diff
+                        .balance
+                        .as_ref()
+                        .map(|v| v.to)
+                        .unwrap_or_default();
                     let nonce = account_diff.nonce.as_ref().map(|v| v.to).unwrap_or(0);
                     let code_hash = match &account_diff.code_change {
                         Some(change) => change.to.unwrap_or(EMPTY_CODE_HASH),
-                        None => match self.inner.get(&key).map(decode_code_hash) {
-                            Some(h) => h,
+                        None => match self.inner.get(&key) {
+                            Some(value) => decode_code_hash_checked(value).map_err(|error| {
+                                eyre::eyre!(
+                                    "twig account leaf for Modified account {address} at key {key:?} is corrupt: {error}"
+                                )
+                            })?,
                             // A Created account legitimately has no prior leaf.
                             None if matches!(
                                 account_diff.change_type,
@@ -152,7 +162,7 @@ impl TwigState {
                             // root — fail loud instead.
                             None => {
                                 return Err(eyre::eyre!(
-                                    "twig read-miss: Modified account {address} has no code_change \
+                                    "twig read-miss: Modified account {address} at key {key:?} has no code_change \
                                      and no existing leaf; refusing to commit EMPTY_CODE_HASH"
                                 ));
                             }
@@ -191,10 +201,18 @@ impl TwigState {
         self.inner.snapshot()
     }
 
+    /// Restore and validate a snapshot loaded from persistent or otherwise
+    /// untrusted bytes.
+    pub fn try_from_snapshot(snap: &TwigSnapshot) -> eyre::Result<Self> {
+        Ok(Self {
+            inner: ShardedTwig::try_from_snapshot(snap)
+                .map_err(|error| eyre::eyre!("invalid Twig snapshot: {error}"))?,
+        })
+    }
+
+    /// Restore a trusted in-process snapshot.
     pub fn from_snapshot(snap: &TwigSnapshot) -> Self {
-        Self {
-            inner: ShardedTwig::from_snapshot(snap),
-        }
+        Self::try_from_snapshot(snap).expect("invalid Twig snapshot")
     }
 }
 
@@ -294,6 +312,21 @@ mod tests {
             err.to_string().contains("read-miss"),
             "a Modified read-miss must fail loud, got: {err}"
         );
+    }
+
+    #[test]
+    fn modified_account_corrupt_leaf_fails_loud() {
+        let mut t = TwigState::new();
+        let addr = Address::with_last_byte(0x12);
+        let key = account_key(&addr).0;
+        t.inner.set(key, &[0xAA, 0xBB]);
+        let (addr, diff) = modified_no_code(addr);
+        let mut accounts = BTreeMap::new();
+        accounts.insert(addr, diff);
+
+        let err = t.apply_diff(&StateDiff { accounts }).unwrap_err();
+        assert!(err.to_string().contains("corrupt"));
+        assert_eq!(t.version(), 0, "validation must precede tree mutation");
     }
 
     /// F5 companion: a `Created` account with no code_change legitimately
