@@ -653,11 +653,6 @@ impl ConsensusService {
                 {
                     self.eager_execution_validated.remove(index);
                 }
-                self.advance_execution_validated_head(
-                    view,
-                    block_hash,
-                    "eager import during finalize",
-                );
                 info!(target: "n42::cl::consensus_loop", view, %block_hash, "eager import completed during FCU, retrying");
                 counter!("n42_eager_import_rescued_total").increment(1);
                 let retry_fcu = ForkchoiceState {

@@ -3802,6 +3802,42 @@ mod tests {
         assert_eq!(orch.syncing_blocks.len(), 1, "the FCU is retried later");
     }
 
+    /// T4 rescue edge: eager `new_payload=Valid` arriving during a failed FCU
+    /// only justifies retrying FCU. If that retry is still `Accepted`, the
+    /// committed/build head must remain at the last canonical Valid block.
+    #[tokio::test(flavor = "current_thread")]
+    async fn accepted_retry_fcu_after_eager_valid_does_not_advance_head() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let head = B256::repeat_byte(0x11);
+        let block = B256::repeat_byte(0x22);
+        let mock = Arc::new(MockExecutionLayer::new(
+            PayloadStatusEnum::Valid,
+            PayloadStatusEnum::Accepted,
+        ));
+        let el: Arc<dyn ExecutionLayer> = mock.clone();
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
+        orch.el = Some(el);
+        orch.head_block_hash = head;
+        orch.execution_validated_head_view = 1;
+        orch.eager_import_done_tx
+            .send((block, 0))
+            .await
+            .expect("eager completion channel remains open");
+
+        orch.finalize_committed_block(2, block, QuorumCertificate::genesis())
+            .await;
+
+        assert_eq!(orch.head_block_hash, head);
+        assert_eq!(orch.execution_validated_head_view, 1);
+        assert_eq!(
+            mock.fcu_heads(),
+            vec![block, block],
+            "the eager completion triggers exactly one FCU retry"
+        );
+    }
+
     /// T1: startup validates the persisted view/hash mapping before calling the
     /// builder. The builder restores only the proven view and never replaces
     /// the canonical head already derived from reth.
