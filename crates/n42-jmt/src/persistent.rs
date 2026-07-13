@@ -603,6 +603,13 @@ impl PersistentTwig {
             );
         }
 
+        // F3: the restored tree's live counters must agree; a mismatch means a
+        // lost/duplicated leaf in the snapshot or WAL replay. Fail loud rather
+        // than serve a silently diverged root.
+        if let Err(e) = inner.check_consistency() {
+            return Err(eyre::eyre!("twig consistency check failed on open: {e}"));
+        }
+
         let wal = OpenOptions::new()
             .create(true)
             .append(true)

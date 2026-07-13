@@ -259,9 +259,36 @@ impl TwigTree {
         self.index.len() == 0
     }
 
+    /// Cross-check the three independent live counters (F3): the flat index
+    /// length, the sum of per-twig live counts, and the number of active
+    /// entries in the slot log must all agree. A mismatch means a lost or
+    /// duplicated leaf — e.g. a 16-byte index-prefix collision that overwrote a
+    /// still-live entry's mapping — which would silently diverge the root.
+    /// O(twigs + entries), cheap enough to run on every restore.
+    pub fn check_consistency(&self) -> Result<(), String> {
+        let index_live = self.index.len();
+        let twig_live: usize = self.twigs.iter().map(|t| t.live).sum();
+        let active_entries = self.entries.iter().filter(|e| e.active).count();
+        if index_live != twig_live || index_live != active_entries {
+            return Err(format!(
+                "twig live-counter mismatch: index.len()={index_live}, \
+                 Σtwig.live={twig_live}, active_entries={active_entries}"
+            ));
+        }
+        Ok(())
+    }
+
     /// Total slots ever appended (the append-history length).
     pub fn next_slot(&self) -> u64 {
         self.next_slot
+    }
+
+    /// Test-only: flip an entry's `active` flag without updating the index or
+    /// the twig's live count, synthesizing exactly the lost-leaf inconsistency
+    /// that [`check_consistency`](Self::check_consistency) must detect (F3).
+    #[cfg(test)]
+    pub fn corrupt_entry_active_for_test(&mut self, slot: usize) {
+        self.entries[slot].active = !self.entries[slot].active;
     }
 
     /// The world root computed by the most recent [`root`](Self::root) call
@@ -389,6 +416,11 @@ impl TwigTree {
                 }
             }
         }
+        // F3: in debug builds, assert the live counters stayed in agreement.
+        debug_assert!(
+            self.check_consistency().is_ok(),
+            "twig live-counter mismatch after apply_batch_indexed"
+        );
     }
 
     /// Deterministic compaction: re-append the live entries of every sparse twig
@@ -699,6 +731,16 @@ impl ShardedTwig {
 
     pub fn get(&self, key: &Hash) -> Option<&[u8]> {
         self.shards[shard_index(key)].get(key)
+    }
+
+    /// Run [`TwigTree::check_consistency`] on every shard (F3).
+    pub fn check_consistency(&self) -> Result<(), String> {
+        for (i, shard) in self.shards.iter().enumerate() {
+            shard
+                .check_consistency()
+                .map_err(|e| format!("shard {i}: {e}"))?;
+        }
+        Ok(())
     }
 
     /// Pre-reserve capacity (split across shards) so a large batch does not
@@ -1176,5 +1218,36 @@ mod tests {
             t.root()
         };
         assert_eq!(build(), build());
+    }
+
+    /// F3: a clean tree passes the live-counter cross-check; corrupting one
+    /// entry's active flag (without updating the index / twig.live) is detected.
+    #[test]
+    fn check_consistency_passes_clean_and_detects_corruption() {
+        let mut t = TwigTree::new();
+        for i in 0..5000u64 {
+            t.set(key(i), &val(i));
+        }
+        assert!(
+            t.check_consistency().is_ok(),
+            "a clean 5k-op tree must be consistent"
+        );
+
+        t.corrupt_entry_active_for_test(0);
+        let err = t.check_consistency().unwrap_err();
+        assert!(
+            err.contains("mismatch"),
+            "an inconsistent live count must be detected, got: {err}"
+        );
+    }
+
+    /// F3 at the sharded layer: a clean sharded tree passes.
+    #[test]
+    fn sharded_check_consistency_passes_clean() {
+        let mut t = ShardedTwig::new();
+        let ops: Vec<(Hash, Option<Vec<u8>>)> =
+            (0..2000u64).map(|i| (key(i), Some(val(i)))).collect();
+        t.apply_batch(&ops);
+        assert!(t.check_consistency().is_ok());
     }
 }

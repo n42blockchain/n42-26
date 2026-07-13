@@ -182,6 +182,11 @@ impl TwigState {
         self.inner.prove(&key)
     }
 
+    /// Cross-check live-counter consistency across all shards (F3).
+    pub fn check_consistency(&self) -> eyre::Result<()> {
+        self.inner.check_consistency().map_err(|e| eyre::eyre!(e))
+    }
+
     pub fn snapshot(&self) -> TwigSnapshot {
         self.inner.snapshot()
     }
