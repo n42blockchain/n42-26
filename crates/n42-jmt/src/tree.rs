@@ -40,21 +40,28 @@ pub fn encode_account_value(
     buf
 }
 
-/// Decode the code_hash field from a 72-byte account leaf value.
-/// Returns `B256::ZERO` if the value is too short, and logs a warning so
-/// data corruption does not go unnoticed.
-pub fn decode_code_hash(value: &[u8]) -> B256 {
+/// Decode the code_hash field from a 72-byte account leaf value, failing loud
+/// when the leaf is truncated or otherwise not an account value.
+pub fn decode_code_hash_checked(value: &[u8]) -> eyre::Result<B256> {
     if value.len() >= ACCOUNT_VALUE_LEN {
-        B256::from_slice(&value[40..72])
+        Ok(B256::from_slice(&value[40..72]))
     } else {
-        tracing::warn!(
-            target: "n42::jmt",
-            actual_len = value.len(),
-            expected_len = ACCOUNT_VALUE_LEN,
-            "decode_code_hash: account leaf value too short, returning ZERO (possible data corruption)"
-        );
-        B256::ZERO
+        Err(eyre::eyre!(
+            "account leaf value is truncated: expected at least {ACCOUNT_VALUE_LEN} bytes, got {}",
+            value.len()
+        ))
     }
+}
+
+/// Legacy infallible decoder for diagnostics/tests that already hold a known
+/// account leaf. Consensus state-application paths must use
+/// [`decode_code_hash_checked`] and propagate corruption instead of substituting
+/// a hash that would change the committed root.
+pub fn decode_code_hash(value: &[u8]) -> B256 {
+    decode_code_hash_checked(value).unwrap_or_else(|error| {
+        tracing::warn!(target: "n42::jmt", %error, "decode_code_hash failed, returning ZERO");
+        B256::ZERO
+    })
 }
 
 /// Helper to convert anyhow::Error to eyre::Report.
@@ -148,13 +155,31 @@ impl<S: TreeStore> N42JmtTree<S> {
                     // read existing code_hash from current leaf to preserve it.
                     let code_hash = match &account_diff.code_change {
                         Some(change) => change.to.unwrap_or(EMPTY_CODE_HASH),
-                        None => {
-                            // Code unchanged — read existing code_hash from tree.
-                            self.get(key)?
-                                .as_deref()
-                                .map(decode_code_hash)
-                                .unwrap_or(EMPTY_CODE_HASH)
-                        }
+                        None => match self.get(key)?.as_deref() {
+                            Some(value) => decode_code_hash_checked(value).map_err(|error| {
+                                eyre::eyre!(
+                                    "JMT account leaf for Modified account {address} at key {key:?} is corrupt: {error}"
+                                )
+                            })?,
+                            // A Created account legitimately has no prior leaf.
+                            None if matches!(
+                                account_diff.change_type,
+                                AccountChangeType::Created
+                            ) =>
+                            {
+                                EMPTY_CODE_HASH
+                            }
+                            // A Modified account with no code_change MUST have an
+                            // existing leaf; a miss means the tree lost it (F5).
+                            // Defaulting to EMPTY_CODE_HASH would commit a wrong
+                            // leaf and diverge the root — fail loud instead.
+                            None => {
+                                return Err(eyre::eyre!(
+                                    "JMT read-miss: Modified account {address} at key {key:?} has no code_change \
+                                     and no existing leaf; refusing to commit EMPTY_CODE_HASH"
+                                ));
+                            }
+                        },
                     };
 
                     let value = encode_account_value(&balance, nonce, &code_hash);

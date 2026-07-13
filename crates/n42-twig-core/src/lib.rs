@@ -189,7 +189,7 @@ fn null_level() -> [Hash; TWIG_HEIGHT + 1] {
 /// slot; updating a key deactivates its old slot (nulls that leaf) and appends a
 /// new entry. The world root is therefore a function of the append history.
 pub struct TwigTree {
-    entries: Vec<Entry>, // indexed by slot
+    entries: Vec<Entry>,  // indexed by slot
     value_arena: Vec<u8>, // entry values, append-only (Entry.voff/vlen index here)
     twigs: Vec<Twig>,
     // Compact index: 16-byte key prefix -> active slot. Lookups confirm against
@@ -259,9 +259,36 @@ impl TwigTree {
         self.index.len() == 0
     }
 
+    /// Cross-check the three independent live counters (F3): the flat index
+    /// length, the sum of per-twig live counts, and the number of active
+    /// entries in the slot log must all agree. A mismatch means a lost or
+    /// duplicated leaf — e.g. a 16-byte index-prefix collision that overwrote a
+    /// still-live entry's mapping — which would silently diverge the root.
+    /// O(twigs + entries), cheap enough to run on every restore.
+    pub fn check_consistency(&self) -> Result<(), String> {
+        let index_live = self.index.len();
+        let twig_live: usize = self.twigs.iter().map(|t| t.live).sum();
+        let active_entries = self.entries.iter().filter(|e| e.active).count();
+        if index_live != twig_live || index_live != active_entries {
+            return Err(format!(
+                "twig live-counter mismatch: index.len()={index_live}, \
+                 Σtwig.live={twig_live}, active_entries={active_entries}"
+            ));
+        }
+        Ok(())
+    }
+
     /// Total slots ever appended (the append-history length).
     pub fn next_slot(&self) -> u64 {
         self.next_slot
+    }
+
+    /// Test-only: flip an entry's `active` flag without updating the index or
+    /// the twig's live count, synthesizing exactly the lost-leaf inconsistency
+    /// that [`check_consistency`](Self::check_consistency) must detect (F3).
+    #[cfg(test)]
+    pub fn corrupt_entry_active_for_test(&mut self, slot: usize) {
+        self.entries[slot].active = !self.entries[slot].active;
     }
 
     /// The world root computed by the most recent [`root`](Self::root) call
@@ -350,7 +377,8 @@ impl TwigTree {
     /// by key makes the root independent of the input order. Keys within a block
     /// are expected unique (the `StateDiff`/sharded layer guarantees this).
     pub fn apply_batch(&mut self, ops: &[(Hash, Option<Vec<u8>>)]) {
-        let refs: Vec<(Hash, Option<&[u8]>)> = ops.iter().map(|(k, v)| (*k, v.as_deref())).collect();
+        let refs: Vec<(Hash, Option<&[u8]>)> =
+            ops.iter().map(|(k, v)| (*k, v.as_deref())).collect();
         let mut order: Vec<usize> = (0..ops.len()).collect();
         self.apply_batch_indexed(&refs, &mut order);
     }
@@ -389,6 +417,11 @@ impl TwigTree {
                 }
             }
         }
+        // F3: in debug builds, assert the live counters stayed in agreement.
+        debug_assert!(
+            self.check_consistency().is_ok(),
+            "twig live-counter mismatch after apply_batch_indexed"
+        );
     }
 
     /// Deterministic compaction: re-append the live entries of every sparse twig
@@ -454,11 +487,24 @@ impl TwigTree {
 
     /// Rebuild a shard from its append-slot log: replay each entry's leaf at its
     /// slot (only active entries set a non-null leaf), rebuilding the index.
-    fn restore(snap: &ShardSnapshot) -> Self {
+    fn restore(snap: &ShardSnapshot) -> Result<Self, String> {
+        if snap.next_slot != snap.entries.len() as u64 {
+            return Err(format!(
+                "snapshot next_slot {} does not match entry count {}",
+                snap.next_slot,
+                snap.entries.len()
+            ));
+        }
         let mut t = TwigTree::new();
         t.next_slot = snap.next_slot;
         let nl = t.null_level;
         for (slot, e) in snap.entries.iter().enumerate() {
+            if e.value.len() > u32::MAX as usize {
+                return Err(format!(
+                    "snapshot entry {slot} value is too large: {} bytes",
+                    e.value.len()
+                ));
+            }
             let twig_id = slot / TWIG_SIZE;
             let local = slot % TWIG_SIZE;
             while t.twigs.len() <= twig_id {
@@ -479,7 +525,8 @@ impl TwigTree {
                 active: e.active,
             });
         }
-        t
+        t.check_consistency()?;
+        Ok(t)
     }
 
     /// Recompute dirty twig roots + rebuild the upper tree, returning the world
@@ -701,6 +748,16 @@ impl ShardedTwig {
         self.shards[shard_index(key)].get(key)
     }
 
+    /// Run [`TwigTree::check_consistency`] on every shard (F3).
+    pub fn check_consistency(&self) -> Result<(), String> {
+        for (i, shard) in self.shards.iter().enumerate() {
+            shard
+                .check_consistency()
+                .map_err(|e| format!("shard {i}: {e}"))?;
+        }
+        Ok(())
+    }
+
     /// Pre-reserve capacity (split across shards) so a large batch does not
     /// realloc the entry log / value arena / index mid-apply — avoids allocator
     /// contention when applying shards in parallel.
@@ -740,7 +797,8 @@ impl ShardedTwig {
     /// shards under the `rayon` feature, no locks (each worker owns one shard).
     /// Returns `(version, combined_root)`.
     pub fn apply_batch(&mut self, ops: &[(Hash, Option<Vec<u8>>)]) -> (u64, Hash) {
-        let refs: Vec<(Hash, Option<&[u8]>)> = ops.iter().map(|(k, v)| (*k, v.as_deref())).collect();
+        let refs: Vec<(Hash, Option<&[u8]>)> =
+            ops.iter().map(|(k, v)| (*k, v.as_deref())).collect();
         self.apply_batch_refs(&refs)
     }
 
@@ -794,16 +852,48 @@ impl ShardedTwig {
         }
     }
 
-    /// Rebuild from a [`TwigSnapshot`] (replays each shard's entries in slot order
-    /// and recomputes roots).
-    pub fn from_snapshot(snap: &TwigSnapshot) -> Self {
-        let shards = snap.shards.iter().map(TwigTree::restore).collect();
+    /// Rebuild and validate a [`TwigSnapshot`] (replays each shard's entries in
+    /// slot order and recomputes roots).
+    pub fn try_from_snapshot(snap: &TwigSnapshot) -> Result<Self, String> {
+        if snap.shards.len() != SHARD_COUNT {
+            return Err(format!(
+                "snapshot shard count mismatch: expected {SHARD_COUNT}, got {}",
+                snap.shards.len()
+            ));
+        }
+        for (expected_shard, shard) in snap.shards.iter().enumerate() {
+            for (slot, entry) in shard.entries.iter().enumerate() {
+                let actual_shard = shard_index(&entry.key);
+                if actual_shard != expected_shard {
+                    return Err(format!(
+                        "shard {expected_shard} entry {slot} belongs to shard {actual_shard}"
+                    ));
+                }
+            }
+        }
+        let shards = snap
+            .shards
+            .iter()
+            .enumerate()
+            .map(|(index, shard)| {
+                TwigTree::restore(shard).map_err(|error| format!("shard {index}: {error}"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let mut t = Self {
             shards,
             version: snap.version,
         };
         let _ = t.root();
-        t
+        t.check_consistency()?;
+        Ok(t)
+    }
+
+    /// Rebuild from a trusted in-process snapshot.
+    ///
+    /// Persistent/untrusted snapshot loading must use [`try_from_snapshot`]
+    /// and propagate validation failures.
+    pub fn from_snapshot(snap: &TwigSnapshot) -> Self {
+        Self::try_from_snapshot(snap).expect("invalid TwigSnapshot")
     }
 
     /// Build a self-contained proof for `key`. Requires a prior `root()`/
@@ -857,7 +947,8 @@ impl ShardedTwigProof {
         if !self.inner.verify(&self.shard_root) {
             return Err(TwigVerifyError::VerifyFailed);
         }
-        let computed = fold_shard_path(self.shard_root, self.shard_index as usize, &self.shard_path);
+        let computed =
+            fold_shard_path(self.shard_root, self.shard_index as usize, &self.shard_path);
         if computed != *combined_root {
             return Err(TwigVerifyError::VerifyFailed);
         }
@@ -997,7 +1088,10 @@ mod tests {
         let (_v, root) = t.apply_batch(&ops);
         let expected =
             hex_to_hash("6c20907fdae8d61a9085cb8468e03e47aca130a40ef3628ce90c2c202798a475");
-        assert_eq!(root, expected, "ShardedTwig combined root must match gov5 NewSharded(16)");
+        assert_eq!(
+            root, expected,
+            "ShardedTwig combined root must match gov5 NewSharded(16)"
+        );
     }
 
     #[test]
@@ -1007,8 +1101,9 @@ mod tests {
             (0..4000u64).map(|i| (key(i), Some(val(i)))).collect();
         t.apply_batch(&ins);
         // updates (dead slots) + deletes
-        let upd: Vec<(Hash, Option<Vec<u8>>)> =
-            (0..500u64).map(|i| (key(i), Some(val(i + 1_000_000)))).collect();
+        let upd: Vec<(Hash, Option<Vec<u8>>)> = (0..500u64)
+            .map(|i| (key(i), Some(val(i + 1_000_000))))
+            .collect();
         t.apply_batch(&upd);
         let del: Vec<(Hash, Option<Vec<u8>>)> = (1000..1500u64).map(|i| (key(i), None)).collect();
         let (_v, root_before) = {
@@ -1023,13 +1118,64 @@ mod tests {
         let mut restored = ShardedTwig::from_snapshot(&snap2);
         let root_after = restored.root();
 
-        assert_eq!(root_before, root_after, "snapshot roundtrip must preserve the root");
+        assert_eq!(
+            root_before, root_after,
+            "snapshot roundtrip must preserve the root"
+        );
         assert_eq!(restored.version(), t.version());
         assert_eq!(restored.get(&key(2000)), Some(val(2000).as_slice()));
         assert_eq!(restored.get(&key(0)), Some(val(1_000_000).as_slice())); // updated
         assert_eq!(restored.get(&key(1200)), None); // deleted
         let p = restored.prove(&key(2000)).unwrap();
         assert!(p.verify_for_key(&root_after, &key(2000)).is_ok());
+    }
+
+    #[test]
+    fn snapshot_restore_rejects_wrong_shard_count() {
+        let mut snap = ShardedTwig::new().snapshot();
+        snap.shards.pop();
+
+        let error = match ShardedTwig::try_from_snapshot(&snap) {
+            Ok(_) => panic!("wrong shard count must be rejected"),
+            Err(error) => error,
+        };
+        assert!(
+            error.contains("snapshot shard count mismatch"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn snapshot_restore_rejects_inconsistent_next_slot() {
+        let mut snap = ShardedTwig::new().snapshot();
+        snap.shards[0].next_slot = 1;
+
+        let error = match ShardedTwig::try_from_snapshot(&snap) {
+            Ok(_) => panic!("inconsistent next_slot must be rejected"),
+            Err(error) => error,
+        };
+        assert!(
+            error.contains("next_slot 1 does not match entry count 0"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn snapshot_restore_rejects_entry_in_wrong_shard() {
+        let mut tree = ShardedTwig::new();
+        tree.set(key(7), b"value");
+        let mut snap = tree.snapshot();
+        let original_shard = shard_index(&key(7));
+        snap.shards[original_shard].entries[0].key[0] = ((original_shard + 1) as u8) << 4;
+
+        let error = match ShardedTwig::try_from_snapshot(&snap) {
+            Ok(_) => panic!("entry in the wrong shard must be rejected"),
+            Err(error) => error,
+        };
+        assert!(
+            error.contains("belongs to shard"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
@@ -1081,7 +1227,11 @@ mod tests {
         t.apply_batch(&ops);
         let expected =
             hex_to_hash("58671c9adadd83040c3966abdbb8fd06d7d7ea8def0c7f1d317799ea486526fa");
-        assert_eq!(t.root(), expected, "apply_batch root must match gov5 sorted-insert root");
+        assert_eq!(
+            t.root(),
+            expected,
+            "apply_batch root must match gov5 sorted-insert root"
+        );
     }
 
     #[test]
@@ -1128,14 +1278,28 @@ mod tests {
 
         let moved = t.compact(0.5);
         let root_after = t.root();
-        assert!(moved > 0, "should have moved live entries out of sparse twigs");
+        assert!(
+            moved > 0,
+            "should have moved live entries out of sparse twigs"
+        );
 
         // Live set unchanged; all live keys still readable + provable.
-        assert_eq!(t.len(), live_before, "compaction must not change the live set");
+        assert_eq!(
+            t.len(),
+            live_before,
+            "compaction must not change the live set"
+        );
         for i in [1950u64, 2000, 3950, 3999, 4500, 4999] {
-            assert_eq!(t.get(&key(i)), Some(val(i).as_slice()), "key {i} live after compact");
+            assert_eq!(
+                t.get(&key(i)),
+                Some(val(i).as_slice()),
+                "key {i} live after compact"
+            );
             let p = t.prove(&key(i)).unwrap();
-            assert!(p.verify(&root_after), "proof for {i} verifies vs post-compaction root");
+            assert!(
+                p.verify(&root_after),
+                "proof for {i} verifies vs post-compaction root"
+            );
         }
         // Deleted keys still gone.
         assert!(t.get(&key(10)).is_none());
@@ -1176,5 +1340,36 @@ mod tests {
             t.root()
         };
         assert_eq!(build(), build());
+    }
+
+    /// F3: a clean tree passes the live-counter cross-check; corrupting one
+    /// entry's active flag (without updating the index / twig.live) is detected.
+    #[test]
+    fn check_consistency_passes_clean_and_detects_corruption() {
+        let mut t = TwigTree::new();
+        for i in 0..5000u64 {
+            t.set(key(i), &val(i));
+        }
+        assert!(
+            t.check_consistency().is_ok(),
+            "a clean 5k-op tree must be consistent"
+        );
+
+        t.corrupt_entry_active_for_test(0);
+        let err = t.check_consistency().unwrap_err();
+        assert!(
+            err.contains("mismatch"),
+            "an inconsistent live count must be detected, got: {err}"
+        );
+    }
+
+    /// F3 at the sharded layer: a clean sharded tree passes.
+    #[test]
+    fn sharded_check_consistency_passes_clean() {
+        let mut t = ShardedTwig::new();
+        let ops: Vec<(Hash, Option<Vec<u8>>)> =
+            (0..2000u64).map(|i| (key(i), Some(val(i)))).collect();
+        t.apply_batch(&ops);
+        assert!(t.check_consistency().is_ok());
     }
 }

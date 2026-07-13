@@ -836,7 +836,13 @@ fn main() {
                         e.into_inner()
                     });
 
-                    if tree.version() == 0 {
+                    // F6: seed genesis only on a truly fresh start.
+                    // `restored_from_disk` guards the append-slot idempotency
+                    // trap — genesis seeding does not bump the version, so a
+                    // restart before the first block commits would otherwise
+                    // reseed on top of restored state and diverge the
+                    // (append-ordered) root from every un-restarted node.
+                    if tree.version() == 0 && !tree.restored_from_disk() {
                         // Fresh start (no snapshot/WAL restored it): seed genesis alloc.
                         let chain_spec = full_node.provider.chain_spec();
                         let alloc_len = chain_spec.genesis.alloc.len();
@@ -860,13 +866,11 @@ fn main() {
                             );
                         }
 
-                        if let Err(e) = tree.flush() {
-                            warn!(
-                                target: "n42::cli",
-                                error = %e,
-                                "failed to persist genesis SBMT snapshot; crash recovery may need to reseed genesis"
-                            );
-                        }
+                        tree.flush().map_err(|error| {
+                            eyre::eyre!(
+                                "failed to persist genesis SBMT snapshot; refusing to start: {error}"
+                            )
+                        })?;
 
                         let version = tree.version();
                         let root = tree.root_hash();
@@ -898,7 +902,13 @@ fn main() {
                         e.into_inner()
                     });
 
-                    if tree.version() == 0 {
+                    // F6: seed genesis only on a truly fresh start.
+                    // `restored_from_disk` guards the append-slot idempotency
+                    // trap — genesis seeding does not bump the version, so a
+                    // restart before the first block commits would otherwise
+                    // reseed on top of restored state and diverge the
+                    // (append-ordered) root from every un-restarted node.
+                    if tree.version() == 0 && !tree.restored_from_disk() {
                         let chain_spec = full_node.provider.chain_spec();
                         let alloc_len = chain_spec.genesis.alloc.len();
                         for (address, account) in &chain_spec.genesis.alloc {
@@ -921,13 +931,11 @@ fn main() {
                             );
                         }
 
-                        if let Err(e) = tree.flush() {
-                            warn!(
-                                target: "n42::cli",
-                                error = %e,
-                                "failed to persist genesis Twig snapshot; crash recovery may need to reseed genesis"
-                            );
-                        }
+                        tree.flush().map_err(|error| {
+                            eyre::eyre!(
+                                "failed to persist genesis Twig snapshot; refusing to start: {error}"
+                            )
+                        })?;
 
                         let version = tree.version();
                         let root = tree.root_hash();

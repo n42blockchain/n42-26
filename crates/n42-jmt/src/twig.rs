@@ -8,7 +8,9 @@
 //! keyHash-sorted order. See `docs/devlog-64` (P6).
 
 use crate::keys::{KeyJob, account_key, derive_keys_batch, storage_key};
-use crate::tree::{EMPTY_CODE_HASH, decode_code_hash, encode_account_value};
+#[cfg(test)]
+use crate::tree::decode_code_hash;
+use crate::tree::{EMPTY_CODE_HASH, decode_code_hash_checked, encode_account_value};
 
 use alloy_primitives::{Address, B256, U256};
 use n42_execution::state_diff::{AccountChangeType, StateDiff};
@@ -77,14 +79,14 @@ impl TwigState {
     /// Values are staged in one per-block arena and passed as borrowed slices
     /// (`apply_batch_refs`) — the per-op `Vec<u8>` of an owned-value API was a
     /// profiled allocator hot spot.
-    pub fn apply_diff(&mut self, diff: &StateDiff) -> (u64, B256) {
-        let (meta, buf) = self.prepare(diff);
+    pub fn apply_diff(&mut self, diff: &StateDiff) -> eyre::Result<(u64, B256)> {
+        let (meta, buf) = self.prepare(diff)?;
         let ops: Vec<(Hash, Option<&[u8]>)> = meta
             .iter()
             .map(|(k, r)| (*k, r.map(|(o, l)| &buf[o..o + l])))
             .collect();
         let (version, root) = self.inner.apply_batch_refs(&ops);
-        (version, B256::from(root))
+        Ok((version, B256::from(root)))
     }
 
     /// Flatten a `StateDiff` into per-op `(key, Option<(offset, len)>)` metadata
@@ -96,7 +98,10 @@ impl TwigState {
     /// encounter order (the read-back of `code_hash` needs the derived key, so
     /// it must run after derivation).
     #[allow(clippy::type_complexity)]
-    fn prepare(&self, diff: &StateDiff) -> (Vec<(Hash, Option<(usize, usize)>)>, Vec<u8>) {
+    fn prepare(
+        &self,
+        diff: &StateDiff,
+    ) -> eyre::Result<(Vec<(Hash, Option<(usize, usize)>)>, Vec<u8>)> {
         // Pass 1: collect every key-derivation job in encounter order.
         let mut jobs: Vec<KeyJob> = Vec::new();
         for (address, account_diff) in &diff.accounts {
@@ -116,7 +121,7 @@ impl TwigState {
             Some((off, v.len()))
         };
         let mut ki = 0usize;
-        for account_diff in diff.accounts.values() {
+        for (address, account_diff) in &diff.accounts {
             let key = keys[ki];
             ki += 1;
             match account_diff.change_type {
@@ -128,11 +133,40 @@ impl TwigState {
                     }
                 }
                 AccountChangeType::Created | AccountChangeType::Modified => {
-                    let balance = account_diff.balance.as_ref().map(|v| v.to).unwrap_or_default();
+                    let balance = account_diff
+                        .balance
+                        .as_ref()
+                        .map(|v| v.to)
+                        .unwrap_or_default();
                     let nonce = account_diff.nonce.as_ref().map(|v| v.to).unwrap_or(0);
                     let code_hash = match &account_diff.code_change {
                         Some(change) => change.to.unwrap_or(EMPTY_CODE_HASH),
-                        None => self.inner.get(&key).map(decode_code_hash).unwrap_or(EMPTY_CODE_HASH),
+                        None => match self.inner.get(&key) {
+                            Some(value) => decode_code_hash_checked(value).map_err(|error| {
+                                eyre::eyre!(
+                                    "twig account leaf for Modified account {address} at key {key:?} is corrupt: {error}"
+                                )
+                            })?,
+                            // A Created account legitimately has no prior leaf.
+                            None if matches!(
+                                account_diff.change_type,
+                                AccountChangeType::Created
+                            ) =>
+                            {
+                                EMPTY_CODE_HASH
+                            }
+                            // A Modified account with no code_change MUST have an
+                            // existing leaf; a miss means the tree lost it (F5).
+                            // Defaulting to EMPTY_CODE_HASH would commit a wrong
+                            // leaf and permanently diverge the append-ordered twig
+                            // root — fail loud instead.
+                            None => {
+                                return Err(eyre::eyre!(
+                                    "twig read-miss: Modified account {address} at key {key:?} has no code_change \
+                                     and no existing leaf; refusing to commit EMPTY_CODE_HASH"
+                                ));
+                            }
+                        },
                     };
                     let v = encode_account_value(&balance, nonce, &code_hash);
                     let r = push_val(&mut buf, &v);
@@ -150,7 +184,7 @@ impl TwigState {
                 }
             }
         }
-        (meta, buf)
+        Ok((meta, buf))
     }
 
     /// Build a key-bindable proof for a derived `key` (requires a prior root call).
@@ -158,14 +192,27 @@ impl TwigState {
         self.inner.prove(&key)
     }
 
+    /// Cross-check live-counter consistency across all shards (F3).
+    pub fn check_consistency(&self) -> eyre::Result<()> {
+        self.inner.check_consistency().map_err(|e| eyre::eyre!(e))
+    }
+
     pub fn snapshot(&self) -> TwigSnapshot {
         self.inner.snapshot()
     }
 
+    /// Restore and validate a snapshot loaded from persistent or otherwise
+    /// untrusted bytes.
+    pub fn try_from_snapshot(snap: &TwigSnapshot) -> eyre::Result<Self> {
+        Ok(Self {
+            inner: ShardedTwig::try_from_snapshot(snap)
+                .map_err(|error| eyre::eyre!("invalid Twig snapshot: {error}"))?,
+        })
+    }
+
+    /// Restore a trusted in-process snapshot.
     pub fn from_snapshot(snap: &TwigSnapshot) -> Self {
-        Self {
-            inner: ShardedTwig::from_snapshot(snap),
-        }
+        Self::try_from_snapshot(snap).expect("invalid Twig snapshot")
     }
 }
 
@@ -201,7 +248,7 @@ mod tests {
             let _ = a;
         }
         let diff = StateDiff { accounts };
-        let (v, root) = t.apply_diff(&diff);
+        let (v, root) = t.apply_diff(&diff).unwrap();
         assert_eq!(v, 1);
         assert_ne!(root, B256::ZERO);
 
@@ -230,11 +277,69 @@ mod tests {
             b[..8].copy_from_slice(&i.to_le_bytes());
             accounts.insert(Address::from(b), created(Address::ZERO, 1000 + i).1);
         }
-        t.apply_diff(&StateDiff { accounts });
+        t.apply_diff(&StateDiff { accounts }).unwrap();
         let root = t.root();
         let snap = t.snapshot();
         let mut restored = TwigState::from_snapshot(&snap);
         assert_eq!(restored.root(), root);
         assert_eq!(restored.version(), t.version());
+    }
+
+    fn modified_no_code(addr: Address) -> (Address, AccountDiff) {
+        (
+            addr,
+            AccountDiff {
+                change_type: AccountChangeType::Modified,
+                balance: Some(ValueChange::new(U256::ZERO, U256::from(5))),
+                nonce: Some(ValueChange::new(0, 1)),
+                code_change: None,
+                storage: BTreeMap::new(),
+            },
+        )
+    }
+
+    /// F5: a `Modified` account with no code_change whose leaf is absent must
+    /// fail loud, not silently commit an `EMPTY_CODE_HASH` leaf that diverges
+    /// the append-ordered root.
+    #[test]
+    fn modified_account_read_miss_fails_loud() {
+        let mut t = TwigState::new();
+        let (addr, diff) = modified_no_code(Address::with_last_byte(0x11));
+        let mut accounts = BTreeMap::new();
+        accounts.insert(addr, diff);
+        let err = t.apply_diff(&StateDiff { accounts }).unwrap_err();
+        assert!(
+            err.to_string().contains("read-miss"),
+            "a Modified read-miss must fail loud, got: {err}"
+        );
+    }
+
+    #[test]
+    fn modified_account_corrupt_leaf_fails_loud() {
+        let mut t = TwigState::new();
+        let addr = Address::with_last_byte(0x12);
+        let key = account_key(&addr).0;
+        t.inner.set(key, &[0xAA, 0xBB]);
+        let (addr, diff) = modified_no_code(addr);
+        let mut accounts = BTreeMap::new();
+        accounts.insert(addr, diff);
+
+        let err = t.apply_diff(&StateDiff { accounts }).unwrap_err();
+        assert!(err.to_string().contains("corrupt"));
+        assert_eq!(t.version(), 0, "validation must precede tree mutation");
+    }
+
+    /// F5 companion: a `Created` account with no code_change legitimately
+    /// defaults to `EMPTY_CODE_HASH` and still applies.
+    #[test]
+    fn created_account_with_no_code_defaults_empty() {
+        let mut t = TwigState::new();
+        let addr = Address::with_last_byte(0x22);
+        let mut accounts = BTreeMap::new();
+        accounts.insert(addr, created(addr, 5).1);
+        let (v, _root) = t.apply_diff(&StateDiff { accounts }).unwrap();
+        assert_eq!(v, 1);
+        let key = account_key(&addr).0;
+        assert_eq!(decode_code_hash(t.get(&key).unwrap()), EMPTY_CODE_HASH);
     }
 }

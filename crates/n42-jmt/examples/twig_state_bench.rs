@@ -73,7 +73,7 @@ fn main() {
     let start = Instant::now();
     let mut root = Default::default();
     for d in &diffs {
-        let (_v, r) = t.apply_diff(d);
+        let (_v, r) = t.apply_diff(d).unwrap();
         root = r;
     }
     let secs = start.elapsed().as_secs_f64();
