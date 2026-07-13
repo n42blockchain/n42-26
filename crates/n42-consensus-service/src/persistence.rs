@@ -1,3 +1,4 @@
+use alloy_primitives::B256;
 use n42_chainspec::ValidatorInfo;
 use n42_consensus::error::{ConsensusError, ConsensusResult};
 use n42_consensus::vote_log::map_io_err;
@@ -20,7 +21,14 @@ use std::sync::Mutex;
 /// - `current_epoch_validators`: the active validator set for the current epoch,
 ///   so dynamic `proposeAddValidator` changes survive restart without requiring a
 ///   static `epoch_schedule.json` update
-const SNAPSHOT_VERSION: u32 = 3;
+///
+/// v4 adds `execution_validated_head_{view,hash}` so the execution-validity
+/// guard survives a restart. Without them the guard resets to view 0 while
+/// reth's canonical head and the consensus view stream stay persistent — a
+/// sync-imported old block could then regress `head_block_hash` and the
+/// post-restart catch-up floor would be 0 (see the PR #21 restart-boundary
+/// re-audit, findings F1/F2).
+const SNAPSHOT_VERSION: u32 = 4;
 
 fn default_version() -> u32 {
     SNAPSHOT_VERSION
@@ -61,6 +69,64 @@ pub struct ConsensusSnapshot {
     /// treated as epoch 0 with the genesis validator set).
     #[serde(default)]
     pub current_epoch_validators: Option<(u64, Vec<ValidatorInfo>, u32)>,
+    /// Highest committed view whose block reth confirmed executable at snapshot
+    /// time. Restored into `execution_validated_head_view` so the
+    /// stale/same-view guards and the catch-up floor keep a persistent
+    /// reference clock across restart. `0` for pre-v4 snapshots (missing field).
+    #[serde(default)]
+    pub execution_validated_head_view: u64,
+    /// Block hash paired with `execution_validated_head_view` — the
+    /// execution-validated head reth held at snapshot time. Restored into
+    /// `head_block_hash` when it matches reth's canonical head on boot.
+    /// `B256::ZERO` for pre-v4 snapshots.
+    #[serde(default)]
+    pub execution_validated_head_hash: B256,
+}
+
+/// Selects a restart-safe view for reth's canonical head.
+///
+/// A view and hash must describe the same block. Restoring a stale view next
+/// to reth's newer canonical hash re-opens the backward-FCU window this state
+/// is meant to close. Prefer the exact v4 pair, then independently persisted
+/// consensus evidence, and finally the last committed QC when both its hash
+/// and block count identify reth's tip. If none of those prove the mapping,
+/// fail closed instead of guessing a lower view.
+pub fn recover_execution_validated_head_view(
+    snapshot: &ConsensusSnapshot,
+    canonical_head_hash: B256,
+    canonical_head_number: u64,
+    evidence_head: Option<(u64, B256)>,
+) -> Result<(u64, &'static str), String> {
+    if canonical_head_number == 0 {
+        return Ok((0, "genesis"));
+    }
+
+    if snapshot.execution_validated_head_hash != B256::ZERO
+        && snapshot.execution_validated_head_hash == canonical_head_hash
+    {
+        return Ok((snapshot.execution_validated_head_view, "snapshot-exact"));
+    }
+
+    if let Some((view, hash)) = evidence_head
+        && hash == canonical_head_hash
+    {
+        return Ok((view, "evidence-exact"));
+    }
+
+    if snapshot.committed_block_count == canonical_head_number
+        && snapshot.last_committed_qc.block_hash == canonical_head_hash
+    {
+        return Ok((snapshot.last_committed_qc.view, "commit-qc-exact"));
+    }
+
+    Err(format!(
+        "cannot map canonical head {canonical_head_hash} at block {canonical_head_number} to a consensus view (snapshot validated view={}, hash={}, committed count={}, last committed view={}, hash={})",
+        snapshot.execution_validated_head_view,
+        snapshot.execution_validated_head_hash,
+        snapshot.committed_block_count,
+        snapshot.last_committed_qc.view,
+        snapshot.last_committed_qc.block_hash,
+    ))
 }
 
 /// Serde helper: serialize/deserialize `Vec<[u8; 48]>` as hex strings for human-readable JSON.
@@ -369,6 +435,8 @@ mod tests {
             committed_block_count: 0,
             last_voted_view: 0,
             current_epoch_validators: None,
+            execution_validated_head_view: 0,
+            execution_validated_head_hash: B256::ZERO,
         }
     }
 
@@ -670,6 +738,112 @@ mod tests {
         assert!(
             loaded.is_none(),
             "legacy snapshot without version should be discarded"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_snapshot_v4_execution_validated_head_round_trip() {
+        let dir = std::env::temp_dir().join("n42-test-v4-validated-head");
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("consensus_state.json");
+
+        let snapshot = ConsensusSnapshot {
+            execution_validated_head_view: 4242,
+            execution_validated_head_hash: B256::repeat_byte(0x7E),
+            ..genesis_snapshot(5000)
+        };
+        save_consensus_state(&path, &snapshot).unwrap();
+
+        let loaded = load_consensus_state(&path).unwrap().unwrap();
+        assert_eq!(loaded.version, SNAPSHOT_VERSION);
+        assert_eq!(loaded.execution_validated_head_view, 4242);
+        assert_eq!(
+            loaded.execution_validated_head_hash,
+            B256::repeat_byte(0x7E)
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restart_head_view_requires_an_exact_hash_mapping() {
+        let canonical = B256::repeat_byte(0xA1);
+        let stale = B256::repeat_byte(0xB2);
+        let mut snapshot = genesis_snapshot(105);
+        snapshot.committed_block_count = 100;
+        snapshot.last_committed_qc.view = 105;
+        snapshot.last_committed_qc.block_hash = canonical;
+        snapshot.execution_validated_head_view = 104;
+        snapshot.execution_validated_head_hash = stale;
+
+        let recovered = recover_execution_validated_head_view(&snapshot, canonical, 100, None)
+            .expect("the matching committed QC proves the canonical view");
+        assert_eq!(recovered, (105, "commit-qc-exact"));
+
+        snapshot.last_committed_qc.block_hash = B256::repeat_byte(0xC3);
+        let error = recover_execution_validated_head_view(&snapshot, canonical, 100, None)
+            .expect_err("a mismatched hash/view pair must fail closed");
+        assert!(error.contains("cannot map canonical head"));
+    }
+
+    #[test]
+    fn restart_head_view_can_use_matching_evidence() {
+        let canonical = B256::repeat_byte(0xA1);
+        let mut snapshot = genesis_snapshot(105);
+        snapshot.committed_block_count = 100;
+        snapshot.execution_validated_head_view = 90;
+        snapshot.execution_validated_head_hash = B256::repeat_byte(0xB2);
+
+        assert_eq!(
+            recover_execution_validated_head_view(
+                &snapshot,
+                canonical,
+                101,
+                Some((107, canonical)),
+            )
+            .unwrap(),
+            (107, "evidence-exact")
+        );
+        assert!(
+            recover_execution_validated_head_view(
+                &snapshot,
+                canonical,
+                101,
+                Some((107, B256::repeat_byte(0xD4))),
+            )
+            .is_err(),
+            "evidence for another hash must not seed the guard"
+        );
+    }
+
+    #[test]
+    fn test_load_v3_snapshot_defaults_execution_validated_head() {
+        let dir = std::env::temp_dir().join("n42-test-v3-to-v4-upgrade");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("consensus_state.json");
+
+        // A v3 snapshot: valid, versioned 3, missing the v4 fields.
+        let snapshot = genesis_snapshot(77);
+        let mut json_value: serde_json::Value = serde_json::to_value(&snapshot).unwrap();
+        let obj = json_value.as_object_mut().unwrap();
+        obj.insert("version".into(), serde_json::json!(3));
+        obj.remove("execution_validated_head_view");
+        obj.remove("execution_validated_head_hash");
+        std::fs::write(&path, serde_json::to_string_pretty(&json_value).unwrap()).unwrap();
+
+        let loaded = load_consensus_state(&path).unwrap().unwrap();
+        assert_eq!(loaded.version, 3, "a v3 snapshot loads unchanged");
+        assert_eq!(
+            loaded.execution_validated_head_view, 0,
+            "missing v4 view field defaults to 0"
+        );
+        assert_eq!(
+            loaded.execution_validated_head_hash,
+            B256::ZERO,
+            "missing v4 hash field defaults to zero"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

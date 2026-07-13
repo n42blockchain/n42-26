@@ -516,12 +516,10 @@ impl ConsensusService {
                 // ultimately commits, and premature FCU causes reorgs that stall the chain.
                 let import_start = std::time::Instant::now();
                 match eh.new_payload(execution_data).await {
-                    Ok(status)
-                        if matches!(
-                            status.status,
-                            PayloadStatusEnum::Valid | PayloadStatusEnum::Accepted
-                        ) =>
-                    {
+                    // Only `Valid` marks the block eager-validated. `Accepted`
+                    // (stored, not executed) must fall through to the stale arm
+                    // so a later commit never promotes an unexecuted block (F3).
+                    Ok(status) if matches!(status.status, PayloadStatusEnum::Valid) => {
                         let np_elapsed = import_start.elapsed().as_millis() as u64;
                         let follower_import_ms = block_data_received.elapsed().as_millis() as u64;
                         let ready_to_accept_ms = elapsed_since_unix_ms(leader_ready_unix_ms);
@@ -680,13 +678,21 @@ impl ConsensusService {
 
         match engine_handle.new_payload(execution_data).await {
             Ok(status) => {
-                if matches!(
-                    status.status,
-                    PayloadStatusEnum::Valid | PayloadStatusEnum::Accepted
-                ) {
+                if matches!(status.status, PayloadStatusEnum::Valid) {
                     self.handle_valid_import(&broadcast, &engine_handle, &status)
                         .await;
-                } else if matches!(status.status, PayloadStatusEnum::Syncing) {
+                } else if matches!(
+                    status.status,
+                    PayloadStatusEnum::Syncing | PayloadStatusEnum::Accepted
+                ) {
+                    // Engine API: `Accepted` means the payload was stored for a
+                    // side chain WITHOUT being executed. Advancing the validated
+                    // head here would flush the staged sidecar diff for an
+                    // unexecuted block (re-audit F3). Treat it like `Syncing`:
+                    // queue for retry until reth executes it and returns `Valid`.
+                    if matches!(status.status, PayloadStatusEnum::Accepted) {
+                        metrics::counter!("n42_new_payload_accepted_total").increment(1);
+                    }
                     self.queue_syncing_block(&broadcast);
                 } else {
                     warn!(
@@ -723,18 +729,63 @@ impl ConsensusService {
 
         debug!(target: "n42::cl::exec_bridge", hash = %broadcast.block_hash, "block imported from leader");
 
+        // Never let an import move reth's canonical head backward. The sync path
+        // hoists this same guard ahead of the import (T2b), but a block queued
+        // while Syncing can also be retried through here after the validated head
+        // has since advanced past it — suppress the FCU before it reaches reth.
+        if self.import_would_regress_head(broadcast.view, broadcast.block_hash) {
+            debug!(
+                target: "n42::cl::exec_bridge",
+                hash = %broadcast.block_hash,
+                view = broadcast.view,
+                execution_validated_head_view = self.execution_validated_head_view,
+                "skipping fork-choice update for a block at or below the execution-validated head"
+            );
+            metrics::counter!("n42_import_fcu_skipped_backward_total").increment(1);
+            return;
+        }
+
         let fcu_state = ForkchoiceState {
             head_block_hash: broadcast.block_hash,
             safe_block_hash: broadcast.block_hash,
             finalized_block_hash: broadcast.block_hash,
         };
-        if let Err(e) = engine_handle.fork_choice_updated(fcu_state).await {
-            error!(
-                target: "n42::cl::exec_bridge",
-                hash = %broadcast.block_hash,
-                error = %e,
-                "fork_choice_updated failed for imported block"
-            );
+        match engine_handle.fork_choice_updated(fcu_state).await {
+            Ok(result) if matches!(result.payload_status.status, PayloadStatusEnum::Valid) => {}
+            Ok(result)
+                if matches!(
+                    result.payload_status.status,
+                    PayloadStatusEnum::Syncing | PayloadStatusEnum::Accepted
+                ) =>
+            {
+                warn!(
+                    target: "n42::cl::exec_bridge",
+                    hash = %broadcast.block_hash,
+                    status = ?result.payload_status.status,
+                    "fork_choice_updated has not executed the imported block; queuing retry"
+                );
+                self.queue_syncing_block(broadcast);
+                return;
+            }
+            Ok(result) => {
+                error!(
+                    target: "n42::cl::exec_bridge",
+                    hash = %broadcast.block_hash,
+                    status = ?result.payload_status.status,
+                    "fork_choice_updated rejected imported block"
+                );
+                return;
+            }
+            Err(e) => {
+                error!(
+                    target: "n42::cl::exec_bridge",
+                    hash = %broadcast.block_hash,
+                    error = %e,
+                    "fork_choice_updated failed for imported block; queuing retry"
+                );
+                self.queue_syncing_block(broadcast);
+                return;
+            }
         }
 
         self.advance_execution_validated_head(broadcast.view, broadcast.block_hash, "sync import");
@@ -846,37 +897,81 @@ impl ConsensusService {
             }
 
             match engine_handle.new_payload(retry_exec).await {
-                Ok(rs)
-                    if matches!(
-                        rs.status,
-                        PayloadStatusEnum::Valid | PayloadStatusEnum::Accepted
-                    ) =>
-                {
+                Ok(rs) if matches!(rs.status, PayloadStatusEnum::Valid) => {
+                    if self.import_would_regress_head(retry_broadcast.view, retry_hash) {
+                        debug!(
+                            target: "n42::cl::exec_bridge",
+                            %retry_hash,
+                            view = retry_broadcast.view,
+                            execution_validated_head_view = self.execution_validated_head_view,
+                            "skipping retry fork-choice update for a block at or below the execution-validated head"
+                        );
+                        metrics::counter!("n42_import_fcu_skipped_backward_total").increment(1);
+                        continue;
+                    }
                     info!(target: "n42::cl::exec_bridge", %retry_hash, "syncing block retry succeeded");
                     let fcu = ForkchoiceState {
                         head_block_hash: retry_hash,
                         safe_block_hash: retry_hash,
                         finalized_block_hash: retry_hash,
                     };
-                    let _ = engine_handle.fork_choice_updated(fcu).await;
-                    self.advance_execution_validated_head(
-                        retry_broadcast.view,
-                        retry_hash,
-                        "sync import retry",
-                    );
-                    if let Err(e) = self
-                        .engine
-                        .process_event(ConsensusEvent::BlockImported(retry_hash))
-                    {
-                        error!(target: "n42::cl::exec_bridge", error = %e, "error processing BlockImported for retry");
+                    match engine_handle.fork_choice_updated(fcu).await {
+                        Ok(result)
+                            if matches!(result.payload_status.status, PayloadStatusEnum::Valid) =>
+                        {
+                            self.advance_execution_validated_head(
+                                retry_broadcast.view,
+                                retry_hash,
+                                "sync import retry",
+                            );
+                            if let Err(e) = self
+                                .engine
+                                .process_event(ConsensusEvent::BlockImported(retry_hash))
+                            {
+                                error!(target: "n42::cl::exec_bridge", error = %e, "error processing BlockImported for retry");
+                            }
+                        }
+                        Ok(result)
+                            if matches!(
+                                result.payload_status.status,
+                                PayloadStatusEnum::Syncing | PayloadStatusEnum::Accepted
+                            ) =>
+                        {
+                            let next_retry = retry_count + 1;
+                            if next_retry >= MAX_SYNCING_RETRIES {
+                                warn!(target: "n42::cl::exec_bridge", %retry_hash, retries = next_retry, status = ?result.payload_status.status, "retry FCU exceeded max retries, dropping");
+                            } else {
+                                debug!(target: "n42::cl::exec_bridge", %retry_hash, retry = next_retry, status = ?result.payload_status.status, "retry FCU still not executable, re-queuing");
+                                self.syncing_blocks.push_back((data, next_retry));
+                            }
+                        }
+                        Ok(result) => {
+                            warn!(target: "n42::cl::exec_bridge", %retry_hash, status = ?result.payload_status.status, "retry FCU rejected block");
+                        }
+                        Err(error) => {
+                            let next_retry = retry_count + 1;
+                            if next_retry >= MAX_SYNCING_RETRIES {
+                                warn!(target: "n42::cl::exec_bridge", %retry_hash, retries = next_retry, %error, "retry FCU failed and exceeded max retries, dropping");
+                            } else {
+                                warn!(target: "n42::cl::exec_bridge", %retry_hash, retry = next_retry, %error, "retry FCU failed, re-queuing");
+                                self.syncing_blocks.push_back((data, next_retry));
+                            }
+                        }
                     }
                 }
-                Ok(rs) if matches!(rs.status, PayloadStatusEnum::Syncing) => {
+                Ok(rs)
+                    if matches!(
+                        rs.status,
+                        PayloadStatusEnum::Syncing | PayloadStatusEnum::Accepted
+                    ) =>
+                {
+                    // `Accepted` (stored, not executed) is retried exactly like
+                    // `Syncing`: never treated as a validated head (F3).
                     let next_retry = retry_count + 1;
                     if next_retry >= MAX_SYNCING_RETRIES {
-                        warn!(target: "n42::cl::exec_bridge", %retry_hash, retries = next_retry, "syncing block exceeded max retries, dropping");
+                        warn!(target: "n42::cl::exec_bridge", %retry_hash, retries = next_retry, status = ?rs.status, "syncing/accepted block exceeded max retries, dropping");
                     } else {
-                        debug!(target: "n42::cl::exec_bridge", %retry_hash, retry = next_retry, "retry still Syncing, re-queuing");
+                        debug!(target: "n42::cl::exec_bridge", %retry_hash, retry = next_retry, status = ?rs.status, "retry still not executable, re-queuing");
                         self.syncing_blocks.push_back((data, next_retry));
                     }
                 }
@@ -1029,12 +1124,10 @@ async fn handle_built_payload(
     // only finalize_committed_block (after consensus commit) should do FCU.
     let import_start = std::time::Instant::now();
     match el.new_payload(execution_data).await {
-        Ok(status)
-            if matches!(
-                status.status,
-                PayloadStatusEnum::Valid | PayloadStatusEnum::Accepted
-            ) =>
-        {
+        // Only `Valid` marks the block eager-validated. `Accepted` (stored, not
+        // executed) falls through to the stale arm so a later commit never
+        // promotes an unexecuted block (F3).
+        Ok(status) if matches!(status.status, PayloadStatusEnum::Valid) => {
             let np_elapsed = import_start.elapsed().as_millis() as u64;
             info!(target: "n42::cl::exec_bridge", %hash, np_elapsed, "eager import: new_payload accepted (no FCU)");
             metrics::counter!("n42_eager_import_hits_total").increment(1);
