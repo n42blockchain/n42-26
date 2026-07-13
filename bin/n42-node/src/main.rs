@@ -1511,6 +1511,37 @@ fn main() {
                 if let Some(ref snap) = snapshot {
                     orchestrator = orchestrator
                         .with_recovered_commit_qc(snap.last_committed_qc.clone());
+
+                    // T1: restore the execution-validity guard clock. When the
+                    // snapshot's validated head matches reth's canonical tip this
+                    // is an exact restore; otherwise reth advanced past (or lags)
+                    // the snapshot, so floor the view one below the committed view
+                    // — low enough that the pending block's own confirmation still
+                    // passes the strict-monotonic guard, never claiming a view
+                    // reth may not actually hold.
+                    let seeded_view = if snap.execution_validated_head_hash
+                        != alloy_primitives::B256::ZERO
+                        && snap.execution_validated_head_hash == head_block_hash
+                    {
+                        snap.execution_validated_head_view
+                    } else {
+                        snap.last_committed_qc
+                            .view
+                            .min(snap.execution_validated_head_view)
+                            .saturating_sub(1)
+                    };
+                    info!(
+                        target: "n42::cli",
+                        seeded_view,
+                        snapshot_validated_view = snap.execution_validated_head_view,
+                        snapshot_validated_hash = %snap.execution_validated_head_hash,
+                        %head_block_hash,
+                        "restored execution-validated head guard from snapshot"
+                    );
+                    orchestrator = orchestrator.with_recovered_execution_validated_head(
+                        seeded_view,
+                        snap.execution_validated_head_hash,
+                    );
                 }
 
                 if let Some(schedule) = epoch_schedule {

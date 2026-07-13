@@ -340,6 +340,12 @@ pub struct ConsensusService {
     leader_build_waiting_view: Option<(u64, LeaderBuildWaitMode)>,
     sync_in_flight: bool,
     sync_started_at: Option<Instant>,
+    /// `[from_view, to_view]` of the most recent in-flight sync / catch-up
+    /// request. Sync responses are validated against this range so a peer
+    /// cannot inject blocks we never asked for (T2a). Overwritten on each new
+    /// request; deliberately NOT cleared on response so a late fan-out
+    /// duplicate response is still range-checked.
+    sync_request_range: Option<(u64, u64)>,
     /// Round-robin cursor for recovery requests. The execution-validated view
     /// can remain pinned while consensus advances, so keying peer choice only
     /// on that view would retry the same possibly incomplete peer forever.
@@ -906,6 +912,7 @@ impl ConsensusService {
             leader_build_waiting_view: None,
             sync_in_flight: false,
             sync_started_at: None,
+            sync_request_range: None,
             sync_peer_cursor: 0,
             state_file: None,
             validator_set_for_sync: None,
@@ -1112,6 +1119,7 @@ impl ConsensusService {
             leader_build_waiting_view: None,
             sync_in_flight: false,
             sync_started_at: None,
+            sync_request_range: None,
             sync_peer_cursor: 0,
             state_file: None,
             validator_set_for_sync: None,
@@ -1256,6 +1264,24 @@ impl ConsensusService {
     pub fn with_recovered_commit_qc(mut self, qc: QuorumCertificate) -> Self {
         self.prev_randao_cache = alloy_primitives::keccak256(qc.aggregate_signature.to_bytes());
         self.last_commit_qc = Some(qc);
+        self
+    }
+
+    /// Restores the execution-validity guard clock from a v4 snapshot (T1).
+    ///
+    /// The guard (`execution_validated_head_view`) is process-local while the
+    /// consensus view stream and reth's canonical head are persistent. Left at
+    /// 0 across restart it disables the stale/same-view refusals for the first
+    /// confirmation and pins the post-restart catch-up floor at 0 (re-audit
+    /// F1/F2). Seeding it from the persisted `(view, hash)` keeps a persistent
+    /// reference clock. `head` is applied only when it agrees with the head the
+    /// node already adopted from reth's canonical tip, so a stale snapshot can
+    /// never move the head backward.
+    pub fn with_recovered_execution_validated_head(mut self, view: u64, hash: B256) -> Self {
+        self.execution_validated_head_view = view;
+        if hash != B256::ZERO && hash == self.head_block_hash {
+            self.head_block_hash = hash;
+        }
         self
     }
 
@@ -3466,5 +3492,334 @@ mod tests {
             "finalize is expected to move the fork choice"
         );
         assert_eq!(mock_el.fcu_heads(), vec![block_hash]);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Restart-boundary hardening (PR #21 re-audit T1-T4)
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// T2 unit: the FCU-suppression predicate refuses only backward or
+    /// sideways moves; a strictly-newer view, an idempotent re-import of the
+    /// same head, and the view-0 restart/genesis seed are all admissible.
+    #[test]
+    fn import_would_regress_head_is_backward_or_sideways_only() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
+        let head = B256::repeat_byte(0x22);
+        orch.execution_validated_head_view = 5;
+        orch.head_block_hash = head;
+
+        assert!(
+            orch.import_would_regress_head(4, B256::repeat_byte(0x33)),
+            "strictly older view regresses"
+        );
+        assert!(
+            orch.import_would_regress_head(5, B256::repeat_byte(0x33)),
+            "same view, different hash is a sideways regress"
+        );
+        assert!(
+            !orch.import_would_regress_head(5, head),
+            "same view, same head is idempotent, not a regress"
+        );
+        assert!(
+            !orch.import_would_regress_head(6, B256::repeat_byte(0x33)),
+            "strictly newer view is forward"
+        );
+
+        // View 0 is the restart/genesis seed: the same-view conflict is exempt
+        // so the very first advance can seed the head.
+        orch.execution_validated_head_view = 0;
+        assert!(!orch.import_would_regress_head(0, B256::repeat_byte(0x77)));
+    }
+
+    /// T2b core (F1): a stale block reth would accept as `Valid`, imported at a
+    /// view at or below the execution-validated head, must NOT move reth fork
+    /// choice backward. The guard fires ahead of the FCU side effect.
+    #[tokio::test(flavor = "current_thread")]
+    async fn sync_import_below_validated_head_issues_no_backward_fcu() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _recorder_guard = metrics::set_default_local_recorder(&recorder);
+
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let head = B256::repeat_byte(0x50);
+        let old_hash = B256::repeat_byte(0x40);
+        let mock = Arc::new(MockExecutionLayer::new(
+            PayloadStatusEnum::Valid,
+            PayloadStatusEnum::Valid,
+        ));
+        let el: Arc<dyn ExecutionLayer> = mock.clone();
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
+        orch.el = Some(el);
+        orch.head_block_hash = head;
+        orch.execution_validated_head_view = 10;
+
+        let broadcast = BlockDataBroadcast {
+            block_hash: old_hash,
+            view: 5,
+            payload_json: serde_json::to_vec(&test_execution_data(head, old_hash)).unwrap(),
+            timestamp: 0,
+            execution_output: None,
+            leader_ready_unix_ms: 0,
+        };
+        orch.import_and_notify(broadcast).await;
+
+        assert!(
+            mock.fcu_heads().is_empty(),
+            "an import below the validated head must not fork-choice-update reth backward"
+        );
+        assert_eq!(
+            orch.head_block_hash, head,
+            "the execution-validated head must not regress"
+        );
+        let skipped = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .find_map(|(key, _, _, value)| {
+                (key.key().name() == "n42_import_fcu_skipped_backward_total").then_some(value)
+            });
+        assert_eq!(skipped, Some(DebugValue::Counter(1)));
+    }
+
+    /// T2a: a sync response block outside the requested `[from_view, to_view]`
+    /// range is dropped before QC verification and never counted.
+    #[tokio::test(flavor = "current_thread")]
+    async fn sync_response_drops_blocks_outside_requested_range() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _recorder_guard = metrics::set_default_local_recorder(&recorder);
+
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let peer = n42_network::PeerId::random();
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
+        orch.sync_request_range = Some((10, 20));
+        let before = orch.committed_block_count;
+
+        let response = n42_network::BlockSyncResponse {
+            blocks: vec![n42_network::SyncBlock {
+                view: 5, // below the requested [10, 20]
+                block_hash: B256::repeat_byte(0x33),
+                commit_qc: QuorumCertificate::genesis(),
+                payload: vec![1, 2, 3], // non-empty so it is not skipped as empty
+                validator_changes: None,
+            }],
+            peer_committed_view: 5,
+        };
+        orch.handle_sync_response(peer, response).await;
+
+        assert_eq!(
+            orch.committed_block_count, before,
+            "an out-of-range block must not be counted"
+        );
+        let dropped = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .find_map(|(key, _, _, value)| {
+                (key.key().name() == "n42_sync_blocks_out_of_range_total").then_some(value)
+            });
+        assert_eq!(dropped, Some(DebugValue::Counter(1)));
+    }
+
+    /// T3 (F2): after a restart the execution-validated view is 0 while the
+    /// chain is far ahead. A committed block awaiting an execution ancestor
+    /// must derive its catch-up floor from the recovered committed QC view, not
+    /// view 1 (which would flood peers whose sync ring cannot reach that far).
+    #[tokio::test(flavor = "current_thread")]
+    async fn post_restart_catchup_floor_uses_recovered_committed_view() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, mut cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let peer = n42_network::PeerId::random();
+        let waiting = B256::repeat_byte(0x22);
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
+        orch.connected_peers.insert(peer);
+        orch.head_block_hash = B256::repeat_byte(0x11);
+        orch.execution_validated_head_view = 0; // reset by the restart
+
+        let mut recovered = QuorumCertificate::genesis();
+        recovered.view = 100;
+        orch.last_commit_qc = Some(recovered);
+        orch.committed_blocks.push_back(CommittedBlock {
+            view: 105,
+            block_hash: waiting,
+            commit_qc: QuorumCertificate::genesis(),
+            payload: Vec::new(),
+            validator_changes: None,
+        });
+
+        orch.handle_import_done(waiting, 105, ImportOutcome::Syncing, 0)
+            .await;
+
+        let command = tokio::time::timeout(Duration::from_secs(1), cmd_rx.recv())
+            .await
+            .expect("a catch-up sync command should be sent")
+            .expect("network command channel should remain open");
+        match command {
+            NetworkCommand::RequestSync { request, .. } => {
+                assert_eq!(
+                    request.from_view, 101,
+                    "floor derives from the recovered committed view (100), not 1"
+                );
+            }
+            other => panic!("unexpected network command: {other:?}"),
+        }
+    }
+
+    /// T4 (F3): `Accepted` from `new_payload` means the payload was stored for a
+    /// side chain WITHOUT execution. It must not advance the head nor flush the
+    /// staged sidecar diff; the block is queued for retry.
+    #[tokio::test(flavor = "current_thread")]
+    async fn accepted_new_payload_is_not_execution_validity() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let head = B256::repeat_byte(0x11);
+        let block = B256::repeat_byte(0x22);
+        let mock = Arc::new(MockExecutionLayer::new(
+            PayloadStatusEnum::Accepted,
+            PayloadStatusEnum::Accepted,
+        ));
+        let el: Arc<dyn ExecutionLayer> = mock.clone();
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
+        orch.el = Some(el);
+        orch.head_block_hash = head;
+        orch.execution_validated_head_view = 0;
+        orch.pending_sidecar_diffs.insert(
+            3,
+            (block, n42_execution::state_diff::StateDiff::default()),
+        );
+
+        let broadcast = BlockDataBroadcast {
+            block_hash: block,
+            view: 3,
+            payload_json: serde_json::to_vec(&test_execution_data(head, block)).unwrap(),
+            timestamp: 0,
+            execution_output: None,
+            leader_ready_unix_ms: 0,
+        };
+        orch.import_and_notify(broadcast).await;
+
+        assert_eq!(
+            orch.head_block_hash, head,
+            "Accepted (stored, not executed) must not advance the head"
+        );
+        assert_eq!(orch.execution_validated_head_view, 0);
+        assert!(
+            mock.fcu_heads().is_empty(),
+            "Accepted must not fork-choice-update reth"
+        );
+        assert!(
+            orch.pending_sidecar_diffs.contains_key(&3),
+            "the staged sidecar diff must not be flushed for an unexecuted block"
+        );
+        assert!(
+            !orch.syncing_blocks.is_empty(),
+            "Accepted is queued for retry, exactly like Syncing"
+        );
+    }
+
+    /// T1: the restore builder seeds the guard view unconditionally but only
+    /// adopts the persisted head hash when it agrees with the head already
+    /// derived from reth's canonical tip, so a stale snapshot can never move
+    /// the head backward.
+    #[test]
+    fn with_recovered_execution_validated_head_only_adopts_matching_hash() {
+        let head = B256::repeat_byte(0x60);
+
+        let (engine, output_rx) = make_test_engine();
+        let (network, _c, _p) = make_test_network();
+        let (_t, net_event_rx) = mpsc::channel(8192);
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
+        orch.head_block_hash = head;
+        let orch = orch.with_recovered_execution_validated_head(42, head);
+        assert_eq!(orch.execution_validated_head_view, 42);
+        assert_eq!(orch.head_block_hash, head);
+
+        let (engine2, output_rx2) = make_test_engine();
+        let (network2, _c2, _p2) = make_test_network();
+        let (_t2, net_event_rx2) = mpsc::channel(8192);
+        let mut orch2 =
+            ConsensusService::new(engine2, Arc::new(network2), net_event_rx2, output_rx2);
+        orch2.head_block_hash = head;
+        let orch2 = orch2.with_recovered_execution_validated_head(42, B256::repeat_byte(0x99));
+        assert_eq!(orch2.execution_validated_head_view, 42, "view still restored");
+        assert_eq!(
+            orch2.head_block_hash, head,
+            "a mismatched snapshot hash must not move the reth-derived head"
+        );
+    }
+
+    /// T5 (F4): the bounded eager-validation set can evict a true confirmation
+    /// under speculative churn, but the finalize path drains the eager
+    /// completion channel and rescues it — the head still advances. This proves
+    /// the recoverability the re-audit relies on to rate the eviction bounded.
+    #[tokio::test(flavor = "current_thread")]
+    async fn eager_validation_evicted_by_churn_is_rescued_at_finalize() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _recorder_guard = metrics::set_default_local_recorder(&recorder);
+
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let previous_head = B256::repeat_byte(0x34);
+        let committed_hash = B256::repeat_byte(0xF0);
+        // FCU returns Syncing first, forcing the finalize path to drain the
+        // eager completion channel — the rescue route for an evicted entry.
+        let mock_el = Arc::new(MockExecutionLayer::new(
+            PayloadStatusEnum::Valid,
+            PayloadStatusEnum::Syncing,
+        ));
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
+        orch.el = Some(mock_el);
+        orch.head_block_hash = previous_head;
+        orch.async_finalize_fcu = false;
+
+        // Saturate the bounded eager set (cap 32) with unrelated churn so the
+        // committed block's own eager entry is NOT present — the eviction case.
+        for i in 0..32u8 {
+            orch.eager_execution_validated
+                .push_back(B256::repeat_byte(0x80 + i));
+        }
+        assert!(
+            !orch.eager_execution_validated.contains(&committed_hash),
+            "the committed block's eager entry has been evicted by churn"
+        );
+
+        // Its eager import still completed and is waiting on the channel.
+        orch.eager_import_done_tx
+            .send((committed_hash, 1))
+            .await
+            .expect("queue eager completion");
+
+        orch.handle_engine_output(EngineOutput::BlockCommitted {
+            view: 1,
+            block_hash: committed_hash,
+            commit_qc: QuorumCertificate::genesis(),
+            validator_changes: None,
+        })
+        .await;
+
+        assert_eq!(
+            orch.head_block_hash, committed_hash,
+            "the evicted-but-imported block is rescued and the head advances"
+        );
+        assert_eq!(orch.execution_validated_head_view, 1);
+        let rescued = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .find_map(|(key, _, _, value)| {
+                (key.key().name() == "n42_eager_import_rescued_total").then_some(value)
+            });
+        assert_eq!(rescued, Some(DebugValue::Counter(1)));
     }
 }

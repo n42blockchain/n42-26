@@ -585,10 +585,9 @@ impl ConsensusService {
                         histogram!("n42_fcu_latency_ms", "attempt" => "first")
                             .record(elapsed_ms as f64);
                         info!(target: "n42::cl::consensus_loop", view, %block_hash, status = ?result.payload_status.status, elapsed_ms, "N42_FCU: async finalize fcu");
-                        matches!(
-                            result.payload_status.status,
-                            PayloadStatusEnum::Valid | PayloadStatusEnum::Accepted
-                        )
+                        // Only `Valid` is a real finalize. `Accepted` (stored,
+                        // not executed) must not advance the validated head (F3).
+                        matches!(result.payload_status.status, PayloadStatusEnum::Valid)
                     }
                     Err(e) => {
                         histogram!("n42_fcu_latency_ms", "attempt" => "first_err")
@@ -617,10 +616,9 @@ impl ConsensusService {
                 let elapsed_ms = fcu_start.elapsed().as_millis() as u64;
                 histogram!("n42_fcu_latency_ms", "attempt" => "first").record(elapsed_ms as f64);
                 info!(target: "n42::cl::consensus_loop", view, %block_hash, status = ?result.payload_status.status, elapsed_ms, "N42_FCU: finalize fcu");
-                matches!(
-                    result.payload_status.status,
-                    PayloadStatusEnum::Valid | PayloadStatusEnum::Accepted
-                )
+                // Only `Valid` is a real finalize. `Accepted` (stored, not
+                // executed) must not advance the validated head (F3).
+                matches!(result.payload_status.status, PayloadStatusEnum::Valid)
             }
             Err(e) => {
                 histogram!("n42_fcu_latency_ms", "attempt" => "first_err")
@@ -674,10 +672,9 @@ impl ConsensusService {
                         histogram!("n42_fcu_latency_ms", "attempt" => "retry")
                             .record(retry_ms as f64);
                         info!(target: "n42::cl::consensus_loop", view, %block_hash, status = ?result.payload_status.status, retry_ms, "N42_FCU_RETRY: retry fcu after eager import");
-                        matches!(
-                            result.payload_status.status,
-                            PayloadStatusEnum::Valid | PayloadStatusEnum::Accepted
-                        )
+                        // Only `Valid` is a real finalize. `Accepted` (stored,
+                        // not executed) must not advance the validated head (F3).
+                        matches!(result.payload_status.status, PayloadStatusEnum::Valid)
                     }
                     Err(e) => {
                         histogram!("n42_fcu_latency_ms", "attempt" => "retry_err")
@@ -851,12 +848,7 @@ impl ConsensusService {
         }
 
         match engine_handle.new_payload(execution_data).await {
-            Ok(status)
-                if matches!(
-                    status.status,
-                    PayloadStatusEnum::Valid | PayloadStatusEnum::Accepted
-                ) =>
-            {
+            Ok(status) if matches!(status.status, PayloadStatusEnum::Valid) => {
                 let fcu = ForkchoiceState {
                     head_block_hash: block_hash,
                     safe_block_hash: block_hash,
@@ -868,8 +860,16 @@ impl ConsensusService {
                 info!(target: "n42::cl::consensus_loop", %block_hash, "bg import: block imported successfully");
                 (ImportOutcome::Valid, block_timestamp)
             }
-            Ok(status) if matches!(status.status, PayloadStatusEnum::Syncing) => {
-                info!(target: "n42::cl::consensus_loop", %block_hash, "bg import: parent lineage not available yet");
+            Ok(status)
+                if matches!(
+                    status.status,
+                    PayloadStatusEnum::Syncing | PayloadStatusEnum::Accepted
+                ) =>
+            {
+                // `Accepted` = stored as a side chain, not executed (Engine
+                // API). Bucket it with `Syncing` so handle_import_done drives a
+                // catch-up rather than promoting an unexecuted block (F3).
+                info!(target: "n42::cl::consensus_loop", %block_hash, status = ?status.status, "bg import: block not yet executable, retrying via catch-up");
                 (ImportOutcome::Syncing, 0)
             }
             Ok(status) => {
@@ -1025,6 +1025,34 @@ impl ConsensusService {
         self.eager_execution_validated.push_back(hash);
     }
 
+    /// True when importing `(view, hash)` would move reth's canonical head
+    /// backward or sideways relative to the execution-validated head — the same
+    /// refusal `advance_execution_validated_head` applies, but checkable
+    /// *before* the fork-choice-update side effect so the backward FCU never
+    /// reaches reth in the first place (F1: the FCU used to fire ahead of the
+    /// guard, letting a stale sync import regress reth's canonical head).
+    pub(super) fn import_would_regress_head(&self, view: u64, hash: B256) -> bool {
+        view < self.execution_validated_head_view
+            || (view == self.execution_validated_head_view
+                && self.execution_validated_head_view != 0
+                && self.head_block_hash != hash)
+    }
+
+    /// Floor view for a post-restart execution catch-up request (T3). The
+    /// execution-validated head is the natural floor, but right after a restart
+    /// from a pre-v4 snapshot — or before the first confirmation — it can still
+    /// be 0 while the chain is far ahead. Requesting from view 1 then floods
+    /// peers whose sync ring cannot reach that far back, so the committed
+    /// blocks never execute and the head wedges (re-audit F2). Fall back to the
+    /// restored committed QC view so the request targets the actual gap.
+    pub(super) fn execution_catchup_floor(&self) -> u64 {
+        if self.execution_validated_head_view > 0 {
+            self.execution_validated_head_view
+        } else {
+            self.last_commit_qc.as_ref().map(|qc| qc.view).unwrap_or(0)
+        }
+    }
+
     /// Advances the local payload-building head only after reth has confirmed the
     /// block executable. Completions can arrive out of order when async FCU is
     /// enabled, so an older confirmation must never regress the head.
@@ -1137,7 +1165,7 @@ impl ConsensusService {
                 self.bg_import_hashes.remove(&queued_hash);
             }
             let sync_from = if committed {
-                self.execution_validated_head_view
+                self.execution_catchup_floor()
             } else {
                 view
             };
