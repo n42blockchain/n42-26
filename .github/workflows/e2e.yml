@@ -13,17 +13,17 @@ jobs:
     timeout-minutes: 30
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           path: n42-26
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           repository: n42blockchain/reth
-          ref: chore/merge-upstream-paradigmxyz-latest
+          ref: chore/reth-upstream-20260714
           path: reth
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.97.0
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -61,17 +61,17 @@ jobs:
             filter: "5,8,12"
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           path: n42-26
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           repository: n42blockchain/reth
-          ref: chore/merge-upstream-paradigmxyz-latest
+          ref: chore/reth-upstream-20260714
           path: reth
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.97.0
 
       - uses: Swatinem/rust-cache@v2
         with:

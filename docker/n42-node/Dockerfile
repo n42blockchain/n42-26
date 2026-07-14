@@ -4,7 +4,7 @@
 # Usage: docker build -t n42-node -f docker/n42-node/Dockerfile ../../..
 
 # ── Build stage ──
-FROM rust:1.93-bookworm AS builder
+FROM rust:1.97.0-bookworm AS builder
 
 WORKDIR /build
 

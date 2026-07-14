@@ -49,7 +49,7 @@ A high-performance blockchain system combining **HotStuff-2** BFT consensus with
 
 - **HotStuff-2 Consensus**: 2-round optimistic commit with 3-round timeout recovery
 - **BLS12-381 Signatures**: Aggregated signatures for compact quorum certificates
-- **reth v2.2.0 Integration**: Tracks `n42blockchain/reth` branch `n42-v2-upgrade`, based on upstream `v2.2.0` with N42-specific payload/cache patches applied on top
+- **reth v2.3 Integration**: Tracks `n42blockchain/reth` branch `chore/reth-upstream-20260714`, including upstream through `b9ac0af744` plus N42-specific payload-cache/QMDB patches
 - **Reserve SBMT Path**: `N42_JMT=1` explicitly selects the legacy-compatible 16-shard sparse binary backend and RPC surface
 - **Compact Block Propagation**: Leader caches execution output; the default follower path skips duplicate EVM execution (cache hit ~3ms)
 - **QMDB Binary Twig Backend**: The QMDB-style 16-shard binary twig tree is the default N42 state-proof backend (`N42_TWIG` defaults on)
@@ -229,7 +229,7 @@ Both configurations are well within the **8-second slot target**.
 
 ### Prerequisites
 
-- Rust 1.93+
+- Rust 1.95+ (development and CI are pinned to Rust 1.97.0)
 - N42 `reth` fork checked out at `../reth`
 - Android local builds: JDK 17 recommended for Gradle/Kotlin
 - SP1 toolchain v4.2.1 (optional, for ZK proof guest build): `curl -L https://sp1up.succinct.xyz | bash && sp1up --version v4.2.1`
@@ -238,7 +238,7 @@ Both configurations are well within the **8-second slot target**.
 
 ```bash
 git clone https://github.com/n42blockchain/reth.git ../reth
-git -C ../reth checkout n42-v2-upgrade
+git -C ../reth checkout chore/reth-upstream-20260714
 ```
 
 ### Build
@@ -260,7 +260,7 @@ JAVA_HOME=$(/usr/libexec/java_home -v 17) \
 
 ```bash
 git -C ../reth fetch origin
-git -C ../reth checkout n42-v2-upgrade
+git -C ../reth checkout chore/reth-upstream-20260714
 ```
 
 ### Run

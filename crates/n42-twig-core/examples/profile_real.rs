@@ -6,15 +6,20 @@
 //!
 //! Run:
 //!   PROFILE_ACCOUNTS=D:/reth2k-accounts-1m.json cargo run --release --example profile_real
-//! On Linux/WSL it also writes `twig_flamegraph.svg` (pprof). On Windows it prints
+//! On Linux/WSL it also writes `twig_profile.pb` (pprof). On Windows it prints
 //! the phase breakdown + per-op time + RSS (pprof's sampler is unix-only).
 
 use n42_twig_core::{Hash, ShardedTwig};
+#[cfg(unix)]
+use pprof::protos::Message as _;
 use std::io::Read;
 use std::time::Instant;
 
 fn env_usize(k: &str, d: usize) -> usize {
-    std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+    std::env::var(k)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(d)
 }
 
 fn hex32(s: &str) -> Hash {
@@ -82,7 +87,12 @@ fn main() {
     let all_keys: Vec<Hash> = ops.iter().map(|o| o.0).collect();
     let samples = env_usize("PROFILE_PROOF_SAMPLES", 10_000).min(n);
     let step = (n / samples.max(1)).max(1);
-    let sample_keys: Vec<Hash> = all_keys.iter().step_by(step).take(samples).copied().collect();
+    let sample_keys: Vec<Hash> = all_keys
+        .iter()
+        .step_by(step)
+        .take(samples)
+        .copied()
+        .collect();
 
     #[cfg(unix)]
     let guard = pprof::ProfilerGuardBuilder::default()
@@ -96,7 +106,9 @@ fn main() {
     let (_ver, _build_root) = tree.apply_batch(&ops);
     let build_s = t.elapsed().as_secs_f64();
     drop(ops); // free the harness ops/clones so RSS reflects the engine only
-    let rss = memory_stats::memory_stats().map(|m| m.physical_mem).unwrap_or(0);
+    let rss = memory_stats::memory_stats()
+        .map(|m| m.physical_mem)
+        .unwrap_or(0);
 
     // ── Update phase: overwrite random existing accounts in blocks (the
     // consensus-relevant + C2-comparable workload). apply_batch parallelizes
@@ -161,10 +173,10 @@ fn main() {
     #[cfg(unix)]
     if let Some(g) = guard
         && let Ok(report) = g.report().build()
-        && let Ok(f) = std::fs::File::create("twig_flamegraph.svg")
+        && let Ok(profile) = report.pprof()
+        && std::fs::write("twig_profile.pb", profile.encode_to_vec()).is_ok()
     {
-        let _ = report.flamegraph(f);
-        eprintln!("wrote twig_flamegraph.svg");
+        eprintln!("wrote twig_profile.pb (open with `go tool pprof`)");
     }
 
     println!("\n=== twig engine on REAL mainnet accounts ===");
@@ -176,7 +188,11 @@ fn main() {
         n as f64 / build_s,
         build_s * 1e6 / n as f64
     );
-    println!("RSS:       {:.0} MB  ({:.1} B/acct)", rss as f64 / 1e6, rss as f64 / n as f64);
+    println!(
+        "RSS:       {:.0} MB  ({:.1} B/acct)",
+        rss as f64 / 1e6,
+        rss as f64 / n as f64
+    );
     println!("root:      0x{}", hex::encode_hash(&root));
     println!(
         "proof:     avg {:.0} B, gen {:.2} us, verify {:.2} us  ({counted} samples)",
@@ -185,7 +201,7 @@ fn main() {
         ver_us / counted.max(1) as f64,
     );
     #[cfg(not(unix))]
-    println!("(pprof flamegraph: run on Linux/WSL — sampler is unix-only)");
+    println!("(pprof profile: run on Linux/WSL — sampler is unix-only)");
 }
 
 mod hex {

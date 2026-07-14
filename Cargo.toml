@@ -30,7 +30,7 @@ resolver = "2"
 [workspace.package]
 version = "0.5.0"
 edition = "2024"
-rust-version = "1.93"
+rust-version = "1.95"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
@@ -51,7 +51,7 @@ n42-bmt-core = { path = "crates/n42-bmt-core" }
 n42-twig-core = { path = "crates/n42-twig-core" }
 n42-zkproof = { path = "crates/n42-zkproof" }
 
-# reth dependencies (n42blockchain/reth @ n42-v2-upgrade, local path)
+# reth dependencies (n42blockchain/reth @ chore/reth-upstream-20260714, local path)
 reth-chainspec = { path = "../reth/crates/chainspec" }
 reth-consensus = { path = "../reth/crates/consensus/consensus" }
 reth-db = { path = "../reth/crates/storage/db" }
@@ -67,7 +67,7 @@ reth-node-builder = { path = "../reth/crates/node/builder" }
 reth-node-ethereum = { path = "../reth/crates/ethereum/node" }
 reth-node-types = { path = "../reth/crates/node/types" }
 reth-payload-builder = { path = "../reth/crates/payload/builder" }
-reth-primitives-traits = { version = "0.5.0", default-features = false }
+reth-primitives-traits = { version = "0.5.2", default-features = false }
 reth-provider = { path = "../reth/crates/storage/provider" }
 reth-revm = { path = "../reth/crates/revm" }
 reth-tasks = { path = "../reth/crates/tasks" }
@@ -91,22 +91,22 @@ reth-rpc-server-types = { path = "../reth/crates/rpc/rpc-server-types" }
 reth-node-core = { path = "../reth/crates/node/core" }
 
 # Alloy (aligned with n42blockchain/reth merged with upstream main)
-alloy-consensus = { version = "2.0.5", default-features = false, features = ["serde"] }
-alloy-eips = { version = "2.0.5", default-features = false, features = ["serde"] }
+alloy-consensus = { version = "2.1.1", default-features = false, features = ["serde"] }
+alloy-eips = { version = "2.1.1", default-features = false, features = ["serde"] }
 alloy-primitives = { version = "1.6.0", default-features = false, features = ["serde"] }
-alloy-rlp = { version = "0.3.13", default-features = false }
-alloy-genesis = { version = "2.0.5", default-features = false }
-alloy-rpc-types-engine = { version = "2.0.5", default-features = false }
+alloy-rlp = { version = "0.3.16", default-features = false }
+alloy-genesis = { version = "2.1.1", default-features = false }
+alloy-rpc-types-engine = { version = "2.1.1", default-features = false }
 
 # Alloy signing & network
-alloy-signer = { version = "2.0.5", default-features = false }
-alloy-signer-local = { version = "2.0.5", default-features = false }
-alloy-network = { version = "2.0.5", default-features = false }
-alloy-rpc-types-eth = { version = "2.0.5", default-features = false }
+alloy-signer = { version = "2.1.1", default-features = false }
+alloy-signer-local = { version = "2.1.1", default-features = false }
+alloy-network = { version = "2.1.1", default-features = false }
+alloy-rpc-types-eth = { version = "2.1.1", default-features = false }
 alloy-sol-types = { version = "1.6.0", default-features = false }
 
 # EVM — aligned with `../reth/Cargo.toml` (upstream main).
-alloy-evm = { version = "0.37.0", default-features = false }
+alloy-evm = { version = "0.37.1", default-features = false }
 revm = { version = "41.0.0", default-features = false, features = ["std", "serde"] }
 
 # Testing
@@ -141,7 +141,7 @@ tracing = "0.1"
 metrics = "0.24"
 
 # Networking
-libp2p = { version = "0.54", features = ["gossipsub", "tokio", "quic", "identify", "macros", "request-response", "mdns", "kad"] }
+libp2p = { version = "0.56", features = ["gossipsub", "tokio", "quic", "identify", "macros", "request-response", "mdns", "kad"] }
 quinn = "0.11"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rcgen = "0.14.7"
