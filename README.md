@@ -229,7 +229,7 @@ Both configurations are well within the **8-second slot target**.
 
 ### Prerequisites
 
-- Rust 1.95+ (development and CI are pinned to Rust 1.97.0)
+- Rust 1.97+ (development and CI are pinned to Rust 1.97.0)
 - N42 `reth` fork checked out at `../reth`
 - Android local builds: JDK 17 recommended for Gradle/Kotlin
 - SP1 toolchain v4.2.1 (optional, for ZK proof guest build): `curl -L https://sp1up.succinct.xyz | bash && sp1up --version v4.2.1`
