@@ -20,15 +20,15 @@ jobs:
 
     steps:
       - name: Checkout n42-26
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           path: workspace/n42-26
 
       - name: Checkout reth
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: n42blockchain/reth
-          ref: chore/merge-upstream-paradigmxyz-latest
+          ref: chore/reth-upstream-20260714
           path: workspace/reth
 
       - name: Build client image
@@ -37,7 +37,7 @@ jobs:
           docker save reth -o /tmp/reth_image.tar
 
       - name: Upload client image
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: reth_image
           path: /tmp/reth_image.tar
@@ -49,19 +49,19 @@ jobs:
 
     steps:
       - name: Checkout n42-26
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           path: workspace/n42-26
 
       - name: Checkout ethereum/hive
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: ethereum/hive
           ref: master
           path: workspace/hivetests
 
       - name: Setup Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version: "^1.21"
 
@@ -72,7 +72,7 @@ jobs:
           OUT_DIR: /tmp/hive_assets
 
       - name: Upload hive assets
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: hive_assets
           path: /tmp/hive_assets
@@ -82,7 +82,6 @@ jobs:
     needs:
       - build-client-image
       - prepare-hive-assets
-    if: contains(format(',{0},', github.event.inputs.shards || 'paris+shanghai,cancun,prague,osaka,rlp'), format(',{0},', matrix.shard.name))
     runs-on: ubuntu-latest
     timeout-minutes: 110
     strategy:
@@ -104,41 +103,50 @@ jobs:
           - name: rlp
             tests: "unchanged"
             minutes: "19"
+    env:
+      SHARD_SELECTED: ${{ contains(format(',{0},', github.event.inputs.shards || 'paris+shanghai,cancun,prague,osaka,rlp'), format(',{0},', matrix.shard.name)) }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+        if: env.SHARD_SELECTED == 'true'
 
       - name: Download hive assets
-        uses: actions/download-artifact@v4
+        if: env.SHARD_SELECTED == 'true'
+        uses: actions/download-artifact@v8
         with:
           name: hive_assets
           path: /tmp/hive_assets
 
       - name: Download client image
-        uses: actions/download-artifact@v4
+        if: env.SHARD_SELECTED == 'true'
+        uses: actions/download-artifact@v8
         with:
           name: reth_image
           path: /tmp/reth_image
 
       - name: Load Docker images
+        if: env.SHARD_SELECTED == 'true'
         run: .github/scripts/hive/load_execution_spec_images.sh
         env:
           ASSET_DIR: /tmp/hive_assets
           RETH_IMAGE_TAR: /tmp/reth_image/reth_image.tar
 
       - name: Install hive binary
+        if: env.SHARD_SELECTED == 'true'
         run: |
           install -m 0755 /tmp/hive_assets/hive /usr/local/bin/hive
           hive --help >/dev/null
 
       - name: Checkout ethereum/hive
-        uses: actions/checkout@v4
+        if: env.SHARD_SELECTED == 'true'
+        uses: actions/checkout@v7
         with:
           repository: ethereum/hive
           ref: master
           path: hivetests
 
       - name: Run shard
+        if: env.SHARD_SELECTED == 'true'
         run: scripts/run-execution-spec-shards.sh
         env:
           HIVE_TESTS_DIR: ${{ github.workspace }}/hivetests
@@ -147,8 +155,8 @@ jobs:
           LOG_DIR: ${{ github.workspace }}/.artifacts/execution-spec/${{ matrix.shard.name }}
 
       - name: Upload shard logs
-        if: always()
-        uses: actions/upload-artifact@v4
+        if: always() && env.SHARD_SELECTED == 'true'
+        uses: actions/upload-artifact@v7
         with:
           name: execution-spec-${{ matrix.shard.name }}-logs
           path: ${{ github.workspace }}/.artifacts/execution-spec/${{ matrix.shard.name }}

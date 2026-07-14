@@ -17,16 +17,16 @@ GIT_COMMITTER_NAME="Nyxen" GIT_COMMITTER_EMAIL="40690755+MiraWells@users.noreply
 - 自定义区块链：执行端基于 reth（本地 path 依赖 `../reth`），共识端采用 HotStuff-2 变体
 - 分发节点（IDC）负责出块、共识投票、存储状态；手机并行验证，不在共识关键路径上
 - 规模：100-500 IDC 节点，每节点约 10,000 手机；性能目标：8 秒 slot
-- Rust edition 2024，最低 Rust 1.93+
+- Rust edition 2024，最低 Rust 1.95；开发与 CI 由 `rust-toolchain.toml` 固定为 Rust 1.97.0
 
 ### ⚠️ reth fork 基线（务必对齐，否则会触发依赖降级）
 
-**当前唯一正确基线：`../reth` @ `chore/merge-upstream-paradigmxyz-latest`（reth 2.3，merge
-paradigmxyz/main 63 提交，merge commit `0655e7a9a`）**，对应 workspace pin
-**revm 41.0.0 / alloy-evm 0.37.0 / reth-primitives-traits 0.5.0**。动手前先
-`git -C ../reth log -1 --oneline` 确认 reth 在 `0655e7a9a`（或其后代）。jit/revmc 默认关闭
+**当前唯一正确基线：`../reth` @ `chore/reth-upstream-20260714`（reth 2.3，包含
+paradigmxyz/main `b9ac0af744`，merge commit `0d2405a25e`）**，对应 workspace pin
+**revm 41.0.0 / alloy-evm 0.37.1 / reth-primitives-traits 0.5.2 / Alloy 2.1.1**。动手前先
+`git -C ../reth log -1 --oneline` 确认 reth 在 `0d2405a25e`（或其后代）。jit/revmc 默认关闭
 （Windows 无 LLVM 22；Linux 要 JIT 用 `--features jit`）。**CI 已对齐**：所有 workflow
-checkout reth 的 `chore/merge-upstream-paradigmxyz-latest`（见 `.github/workflows/*.yml`）。
+checkout reth 的 `chore/reth-upstream-20260714`（见 `.github/workflows/*.yml`）。
 适配要点：alloy-rpc-types-engine 2.0→2.1 给 `PayloadAttributes` 加了 `target_gas_limit`
 （n42 设 `None`）；revm 40→41 / alloy-evm 0.36→0.37 对 n42-26 无 API 破坏。
 
@@ -41,6 +41,7 @@ deps upgrade 工作（参见 devlog-60 维护者说明），也正是历史上 C
 | `n42-v2-upgrade`（最旧） | reth v2.2.0 | revm 38 / alloy-evm 0.34 / reth-primitives-traits 0.3.1 |
 | `chore/merge-upstream-main` | upstream main @04c7f29f | revm 40.0.3 / alloy-evm 0.36.0 / reth-primitives-traits 0.4.0 |
 | `chore/merge-upstream-fc2cc1e` | reth 2.3 @449ecfdce | revm 40.0.3 / alloy-evm 0.36.0 / reth-primitives-traits 0.4.1 |
+| `chore/merge-upstream-paradigmxyz-latest` | reth 2.3 @0655e7a9a | revm 41.0.0 / alloy-evm 0.37.0 / reth-primitives-traits 0.5.0 |
 
 ## 常用命令
 

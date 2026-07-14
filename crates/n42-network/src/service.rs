@@ -1563,8 +1563,8 @@ impl NetworkService {
     fn gossipsub_publish(&mut self, topic: gossipsub::IdentTopic, data: Vec<u8>, label: &str) {
         match self.swarm.behaviour_mut().gossipsub.publish(topic, data) {
             Ok(_) => {}
-            Err(gossipsub::PublishError::InsufficientPeers) => {
-                tracing::debug!("failed to publish {label}: InsufficientPeers");
+            Err(gossipsub::PublishError::NoPeersSubscribedToTopic) => {
+                tracing::debug!("failed to publish {label}: no peers subscribed to topic");
             }
             Err(e) => {
                 tracing::warn!(error = %e, "failed to publish {label}");

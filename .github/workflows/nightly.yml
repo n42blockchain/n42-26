@@ -18,17 +18,17 @@ jobs:
     timeout-minutes: 90
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           path: n42-26
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           repository: n42blockchain/reth
-          ref: chore/merge-upstream-paradigmxyz-latest
+          ref: chore/reth-upstream-20260714
           path: reth
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.97.0
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -39,18 +39,14 @@ jobs:
       - name: Security audit
         working-directory: n42-26
         # Ignore list — see audit.toml in the repo root for rationale per
-        # advisory. All entries are transitive deps N42 doesn't control
-        # directly (libp2p 0.54 / reth 2.2.0 / rustls / tracing-subscriber).
+        # advisory. Remaining entries are transitive deps N42 doesn't control
+        # directly (libp2p mDNS / an inactive revm optional dependency edge).
         # Drop a flag once the corresponding upstream releases the fix.
         run: |
           cargo install cargo-audit --locked --quiet
           cargo audit \
             --ignore RUSTSEC-2026-0119 \
             --ignore RUSTSEC-2026-0118 \
-            --ignore RUSTSEC-2025-0009 \
-            --ignore RUSTSEC-2026-0098 \
-            --ignore RUSTSEC-2026-0099 \
-            --ignore RUSTSEC-2026-0104 \
             --ignore RUSTSEC-2025-0055
 
       - name: Build n42-node and e2e harness

@@ -77,7 +77,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source ~/.cargo/env
 
 # 验证
-rustc --version   # 应 >= 1.93
+rustc --version   # 应 >= 1.95；仓库默认固定为 1.97.0
 docker --version  # 验证 Docker 集成
 ```
 

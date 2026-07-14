@@ -235,7 +235,7 @@ vs C2 Go：单树 build 超 2.6×（4.4M vs 1.71M）；Go 16 分片 AVX-512 7.99
   仍有差距 —— 根因是 all-DRAM 把 entry 数据 + 全 twig 节点驻内存（QMDB 驱逐 twig 叶 + entry 下盘）。
   这是 all-DRAM 路线的内禀成本（用户已选 all-DRAM 换吞吐/简单）。
 - **CPU 热点 = blake3**（每插入 12 次：1 leaf + 11 fold）。SIMD 批量（AVX-512 16-way）是 CPU 侧
-  下一杠杆（需 blake3 内部/vendored，参考 C2）。pprof flamegraph 在 Linux/WSL 跑 `profile_real`
+  下一杠杆（需 blake3 内部/vendored，参考 C2）。pprof profile 在 Linux/WSL 跑 `profile_real`
   可直接看到 blake3 占比。
 - 后续可选内存杠杆：compact index（QMDB 式只存 key 高位 + slot，省 ~7%）。
 
@@ -246,5 +246,5 @@ vs C2 Go：单树 build 超 2.6×（4.4M vs 1.71M）；Go 16 分片 AVX-512 7.99
 reth.exe db --datadir D:\reth2k list HashedAccounts --len 1000000 --json > D:\reth2k-accounts-1m.json
 # 剖析
 PROFILE_ACCOUNTS=D:/reth2k-accounts-1m.json cargo run --release --example profile_real -p n42-twig-core
-# Linux/WSL 额外产出 twig_flamegraph.svg
+# Linux/WSL 额外产出 twig_profile.pb（用 `go tool pprof twig_profile.pb` 查看）
 ```

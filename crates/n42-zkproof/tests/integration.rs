@@ -283,40 +283,31 @@ async fn test_concurrent_rapid_blocks() {
     let scheduler =
         Arc::new(ProofScheduler::new(prover, 10, Arc::clone(&store)).with_callback(callback));
 
-    // Spawn 5 tasks, each committing 50 blocks (only multiples of 10 trigger proofs).
-    // This yields 25 unique proof-eligible blocks spread across tasks.
-    let mut handles = vec![];
-    for t in 0..5u64 {
-        let s = scheduler.clone();
-        handles.push(tokio::spawn(async move {
-            for i in 1..=50u64 {
+    // Submit 50 waves of 5 concurrent callers. Draining between waves keeps
+    // the test deterministic while still exercising concurrent scheduler access:
+    // no submission is allowed to depend on host scheduling beating the 8-permit limit.
+    for i in 1..=50u64 {
+        let mut handles = vec![];
+        for t in 0..5u64 {
+            let s = scheduler.clone();
+            handles.push(tokio::spawn(async move {
                 let block = t * 1000 + i * 10; // 10, 20, ..., 500 per task
                 s.on_block_committed(block, make_input(block));
-                // Small yield to let tasks interleave.
-                if i % 10 == 0 {
-                    tokio::task::yield_now().await;
-                }
-            }
-        }));
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        wait_until(
+            tokio::time::Duration::from_secs(3),
+            || scheduler.in_progress_count() == 0,
+            "concurrent proof generation wave drain",
+        )
+        .await;
     }
 
-    for h in handles {
-        h.await.unwrap();
-    }
-
-    wait_until(
-        tokio::time::Duration::from_secs(3),
-        || scheduler.in_progress_count() == 0,
-        "concurrent proof generation drain",
-    )
-    .await;
-
-    // Some blocks may be skipped due to concurrency limit, but most should succeed.
     let generated = callback_count.load(Ordering::SeqCst);
-    assert!(
-        generated >= 50,
-        "expected at least 50 proofs, got {generated}"
-    );
+    assert_eq!(generated, 250);
     assert_eq!(store.len() as u64, generated);
 }
 
