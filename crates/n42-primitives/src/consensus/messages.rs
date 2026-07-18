@@ -245,7 +245,9 @@ pub struct Decide {
 //     wire-format breaking change requiring a coordinated upgrade.
 // v4: QC/TC quorum changed from 2f+1 to n-f. The wire payload is unchanged,
 //     but mixed v3/v4 validators can disagree on certificate validity whenever
-//     n != 3f+1, so deployment still requires a coordinated upgrade.
+//     n != 3f+1. Leader payload construction also became LockedQC-authoritative.
+//     Mixed deployments cannot guarantee either rule, so deployment requires a
+//     coordinated upgrade.
 pub const CONSENSUS_PROTOCOL_VERSION: u16 = 4;
 
 /// Versioned wrapper for consensus messages on the wire.

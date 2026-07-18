@@ -130,5 +130,6 @@ Logs are split into separate files by phase for easy maintenance:
 ---
 
 | [devlog-96-view-proof-gates](docs/devlog-96-view-proof-gates.md) | Gov5 S2: QC successor-only jumps, quorum-only timeout progression, stale-timer guard, restart CommitQC catch-up | Security |
+| [devlog-97-locked-qc-build-parent](docs/devlog-97-locked-qc-build-parent.md) | gov5 S3 audit: LockedQC-authoritative leader builds, async view/parent binding, fail-closed reth defer | Security |
 
 New entries: append to the corresponding category file, or create a new numbered file (e.g., `devlog-57-xxx.md`) in `docs/`.

@@ -114,21 +114,31 @@ impl ConsensusService {
             }
         };
 
+        let Some(build_context) = self.required_payload_build_context() else {
+            error!(target: "n42::cl::exec_bridge", view = self.engine.current_view(),
+                locked_view = self.engine.locked_qc().view,
+                "refusing payload build: non-genesis LockedQC has a zero block hash");
+            metrics::counter!("n42_locked_qc_parent_unavailable_total").increment(1);
+            self.schedule_build_retry();
+            return;
+        };
+
         // Guard: prevent duplicate builds on the same parent hash.
         // Without this, eager import + speculative build can race with the finalize path,
         // spawning multiple resolve tasks that produce different blocks at the same height
         // (same parent, different timestamps). This floods reth with conflicting new_payload
         // calls, triggering pipeline sync and permanent chain stalls.
-        let parent = self.head_block_hash;
-        if let Some(building_parent) = self.building_on_parent
-            && building_parent == parent
+        let parent = build_context.parent_hash;
+        if let Some(building) = self.building_on_parent
+            && building.parent_hash == parent
         {
-            debug!(target: "n42::cl::exec_bridge", %parent, "build already in progress on this parent, skipping");
+            debug!(target: "n42::cl::exec_bridge", %parent, build_view = building.view,
+                current_view = build_context.view, "build already in progress on this parent, skipping");
             return;
         }
         let build_start = Instant::now();
         let pool_depth = self.pool_depth_snapshot();
-        let view = self.engine.current_view();
+        let view = build_context.view;
         self.record_timeout_diag_build_start(
             view,
             parent,
@@ -168,19 +178,36 @@ impl ConsensusService {
                 "N42_CADENCE: commit->build_start"
             );
         }
-        self.building_on_parent = Some(parent);
+        self.building_on_parent = Some(build_context);
         self.build_triggered_at = Some(build_start);
 
         let attrs = self.build_payload_attributes(slot_timestamp);
         let timestamp = attrs.timestamp;
 
+        let same_execution_branch = parent == self.head_block_hash;
         let fcu_state = ForkchoiceState {
-            head_block_hash: self.head_block_hash,
-            safe_block_hash: self.head_block_hash,
-            finalized_block_hash: self.head_block_hash,
+            // Build on the branch certified by LockedQC. When the local head
+            // differs, it may be a sibling rather than an ancestor; advertising
+            // it as safe/finalized would make the FCU internally inconsistent.
+            // Zero means "no new safe/finalized assertion". If reth has not
+            // imported the LockedQC block, it returns Syncing/no payload and the
+            // existing retry path defers instead of falling back to another fork.
+            head_block_hash: parent,
+            safe_block_hash: if same_execution_branch {
+                self.head_block_hash
+            } else {
+                B256::ZERO
+            },
+            finalized_block_hash: if same_execution_branch {
+                self.head_block_hash
+            } else {
+                B256::ZERO
+            },
         };
 
-        debug!(target: "n42::cl::exec_bridge", head = %self.head_block_hash, timestamp, "triggering payload build via fork_choice_updated");
+        debug!(target: "n42::cl::exec_bridge", %parent,
+            execution_head = %self.head_block_hash, locked_view = self.engine.locked_qc().view,
+            timestamp, "triggering payload build on LockedQC branch via fork_choice_updated");
 
         // Try FCU; on "invalid payload attributes" (timestamp race), retry once with
         // a conservatively bumped timestamp.  This handles the edge case where
@@ -212,7 +239,12 @@ impl ConsensusService {
                         // strictly increasing timestamps even in fast-commit scenarios.
                         self.last_committed_timestamp = self.last_committed_timestamp.max(used_ts);
                         debug!(target: "n42::cl::exec_bridge", ?payload_id, "payload building started, spawning resolve task");
-                        self.spawn_payload_resolve_task(el.clone(), payload_id, build_start);
+                        self.spawn_payload_resolve_task(
+                            el.clone(),
+                            payload_id,
+                            build_start,
+                            build_context,
+                        );
                     } else {
                         warn!(target: "n42::cl::exec_bridge", "fork_choice_updated did not return payload_id, scheduling retry");
                         // FCU returned SYNCING — reth hasn't caught up yet.
@@ -262,19 +294,39 @@ impl ConsensusService {
         self.next_slot_timestamp = None;
     }
 
+    /// Returns the only parent an honest leader may build on in the current
+    /// view. Genesis has no signed parent certificate, so it uses reth's
+    /// execution-confirmed head. Every later view is anchored to LockedQC.
+    pub(super) fn required_payload_build_context(&self) -> Option<super::PayloadBuildContext> {
+        let locked_qc = self.engine.locked_qc();
+        let parent_hash = if locked_qc.view == 0 {
+            self.head_block_hash
+        } else if locked_qc.block_hash == B256::ZERO {
+            return None;
+        } else {
+            locked_qc.block_hash
+        };
+        Some(super::PayloadBuildContext {
+            view: self.engine.current_view(),
+            parent_hash,
+        })
+    }
+
     fn spawn_payload_resolve_task(
         &self,
         el: Arc<dyn ExecutionLayer>,
         payload_id: PayloadId,
         build_start: Instant,
+        build_context: super::PayloadBuildContext,
     ) {
         let block_ready_tx = self.block_ready_tx.clone();
         let network = self.network.clone();
         let leader_payload_tx = self.leader_payload_tx.clone();
-        let current_view = self.engine.current_view();
+        let current_view = build_context.view;
         let blob_store = self.blob_store.clone();
         let eager_import_done_tx = self.eager_import_done_tx.clone();
         let build_complete_tx = self.build_complete_tx.clone();
+        let completed_context = build_context;
         let block_guard = self.eager_import_block_guard.clone();
         let exec_output_cache = self.exec_output_cache.clone();
 
@@ -313,6 +365,7 @@ impl ConsensusService {
                         eager_import_done_tx,
                         block_guard,
                         build_start,
+                        build_context,
                     )
                     .await;
                 }
@@ -338,7 +391,7 @@ impl ConsensusService {
                 );
             }
             // Signal completion regardless of success/failure/panic.
-            if build_complete_tx.send(()).await.is_err() {
+            if build_complete_tx.send(completed_context).await.is_err() {
                 debug!(target: "n42::cl::exec_bridge", "build completion receiver dropped");
             }
         });
@@ -1011,7 +1064,7 @@ async fn handle_built_payload(
     built: BuiltBlock,
     el: Arc<dyn ExecutionLayer>,
     network: Arc<dyn ConsensusNetwork>,
-    block_ready_tx: mpsc::Sender<B256>,
+    block_ready_tx: mpsc::Sender<super::PayloadBuildReady>,
     leader_payload_tx: mpsc::Sender<(B256, Vec<u8>)>,
     current_view: u64,
     blob_store: Option<Arc<dyn BlobStorePort>>,
@@ -1019,6 +1072,7 @@ async fn handle_built_payload(
     eager_import_done_tx: mpsc::Sender<(B256, u64)>,
     block_guard: Arc<std::sync::atomic::AtomicU64>,
     build_start: Instant,
+    build_context: super::PayloadBuildContext,
 ) {
     let BuiltBlock {
         hash,
@@ -1028,6 +1082,14 @@ async fn handle_built_payload(
         execution_data,
         blob_tx_hashes,
     } = built;
+    let actual_parent = execution_data.parent_hash();
+    if actual_parent != build_context.parent_hash {
+        error!(target: "n42::cl::exec_bridge", %hash, %actual_parent,
+            required_parent = %build_context.parent_hash, view = build_context.view,
+            "payload builder returned a block outside the requested LockedQC branch");
+        metrics::counter!("n42_payload_parent_mismatch_total").increment(1);
+        return;
+    }
     {
         let span = tracing::Span::current();
         span.record("hash", tracing::field::display(&hash));
@@ -1103,7 +1165,14 @@ async fn handle_built_payload(
     );
 
     // 2. Trigger consensus voting immediately (non-blocking channel send)
-    if block_ready_tx.send(hash).await.is_err() {
+    if block_ready_tx
+        .send(super::PayloadBuildReady {
+            context: build_context,
+            block_hash: hash,
+        })
+        .await
+        .is_err()
+    {
         debug!(target: "n42::cl::exec_bridge", %hash, "block_ready receiver dropped");
     }
 

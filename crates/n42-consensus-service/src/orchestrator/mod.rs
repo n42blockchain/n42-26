@@ -108,6 +108,20 @@ pub struct BlockDataBroadcast {
     pub leader_ready_unix_ms: u64,
 }
 
+/// Consensus context captured when a leader starts an asynchronous payload build.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct PayloadBuildContext {
+    view: u64,
+    parent_hash: B256,
+}
+
+/// A resolved payload together with the context it was built under.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct PayloadBuildReady {
+    context: PayloadBuildContext,
+    block_hash: B256,
+}
+
 /// Serializable proxy for `(BlockExecutionOutput<Receipt>, Vec<Address>)`.
 /// `BlockExecutionResult` from alloy-evm doesn't derive serde, so we flatten it.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -322,8 +336,8 @@ pub struct ConsensusService {
     last_commit_qc: Option<QuorumCertificate>,
     /// Cached `keccak256(commit_qc.aggregate_signature)` — avoids re-hashing on every payload build.
     prev_randao_cache: B256,
-    block_ready_tx: mpsc::Sender<B256>,
-    block_ready_rx: mpsc::Receiver<B256>,
+    block_ready_tx: mpsc::Sender<PayloadBuildReady>,
+    block_ready_rx: mpsc::Receiver<PayloadBuildReady>,
     fee_recipient: Address,
     slot_time: Duration,
     next_build_at: Option<Instant>,
@@ -400,19 +414,19 @@ pub struct ConsensusService {
     /// Set when build is triggered by eager import (before consensus commit).
     /// Cleared on ViewChanged or when finalize confirms the block.
     speculative_build_hash: Option<B256>,
-    /// Parent hash for which a payload build task is currently running.
+    /// View and parent hash for which a payload build task is currently running.
     /// Prevents duplicate builds based on the same parent, which produce different
     /// blocks at the same height and overwhelm reth with conflicting `new_payload` calls
     /// — triggering pipeline sync and chain stalls.
-    building_on_parent: Option<B256>,
+    building_on_parent: Option<PayloadBuildContext>,
     /// When the current payload build was triggered. Used to measure actual build duration
     /// in PipelineTiming (created → build_complete). Reset when build finishes or is cancelled.
     build_triggered_at: Option<Instant>,
     /// Notifies the orchestrator when a payload resolve task finishes (success or failure).
     /// Used to clear `building_on_parent` so new builds are not permanently blocked
     /// when a resolve task takes longer than the pacemaker timeout.
-    build_complete_tx: mpsc::Sender<()>,
-    build_complete_rx: mpsc::Receiver<()>,
+    build_complete_tx: mpsc::Sender<PayloadBuildContext>,
+    build_complete_rx: mpsc::Receiver<PayloadBuildContext>,
     /// Staking scan/persist behind the [`StakingSink`] port.
     staking_sink: Option<Arc<dyn StakingSink>>,
     /// Reward + matured-stake withdrawal computation behind the
@@ -672,6 +686,79 @@ impl ConsensusService {
                 self.schedule_payload_build().await;
             }
         }
+    }
+
+    /// Accepts a resolved payload only under the LockedQC parent/view captured
+    /// when its build began. A view change must never wrap an old child of B in
+    /// a new Proposal justified by LockedQC(A).
+    fn handle_payload_build_ready(&mut self, ready: PayloadBuildReady) -> bool {
+        let current_context = self.required_payload_build_context();
+        let owns_guard = self.building_on_parent == Some(ready.context);
+        if owns_guard {
+            self.building_on_parent = None;
+        }
+
+        if current_context != Some(ready.context) {
+            warn!(
+                target: "n42::cl::orchestrator",
+                built_view = ready.context.view,
+                built_parent = %ready.context.parent_hash,
+                current_view = self.engine.current_view(),
+                required_parent = ?current_context.map(|context| context.parent_hash),
+                block_hash = %ready.block_hash,
+                "discarding payload resolved for stale view or non-LockedQC parent"
+            );
+            counter!("n42_stale_payload_builds_total").increment(1);
+            if owns_guard {
+                self.build_triggered_at = None;
+            }
+            if self.building_on_parent.is_none() {
+                self.schedule_build_retry();
+            }
+            return false;
+        }
+
+        let now = Instant::now();
+        let timing = PipelineTiming {
+            created: self.build_triggered_at.take().unwrap_or(now),
+            is_leader: true,
+            build_complete: Some(now),
+            import_complete: None,
+            committed: None,
+        };
+        self.record_pipeline_timing(ready.block_hash, timing);
+
+        info!(target: "n42::cl::orchestrator", hash = %ready.block_hash,
+            view = ready.context.view, parent = %ready.context.parent_hash,
+            "payload built on LockedQC parent, feeding BlockReady to consensus");
+        if let Err(error) = self
+            .engine
+            .process_event(n42_consensus::ConsensusEvent::BlockReady(
+                ready.block_hash,
+                None,
+            ))
+        {
+            error!(target: "n42::cl::orchestrator", %error, "error processing BlockReady event");
+            return false;
+        }
+        true
+    }
+
+    /// Clears only the guard owned by the task that completed. An older
+    /// resolve task may finish after a new-view build has already started.
+    fn handle_payload_build_complete(&mut self, completed: PayloadBuildContext) -> bool {
+        if self.building_on_parent != Some(completed) {
+            debug!(target: "n42::cl::orchestrator", ?completed,
+                active = ?self.building_on_parent,
+                "ignoring stale payload-build completion");
+            return false;
+        }
+
+        debug!(target: "n42::cl::orchestrator", ?completed,
+            "build task completed, clearing its building_on_parent guard");
+        self.building_on_parent = None;
+        self.build_triggered_at = None;
+        true
     }
 
     fn drain_leader_payload_rx(&mut self, protected_hashes: &[B256]) {
@@ -1476,36 +1563,15 @@ impl ConsensusService {
                 }
 
                 // === Priority 5: Block build completion ===
-                block_hash = async {
+                payload_ready = async {
                     if self.block_ready_rx.is_closed() && self.block_ready_rx.is_empty() {
-                        std::future::pending::<Option<B256>>().await
+                        std::future::pending::<Option<PayloadBuildReady>>().await
                     } else {
                         self.block_ready_rx.recv().await
                     }
                 } => {
-                    if let Some(hash) = block_hash {
-                        // Build succeeded — clear the parent guard immediately so future
-                        // builds for the same parent (after view change) are not blocked.
-                        self.building_on_parent = None;
-
-                        // Pipeline: leader build complete — use build_triggered_at as the
-                        // starting point so build duration is accurately measured.
-                        let now = Instant::now();
-                        let timing = PipelineTiming {
-                            created: self.build_triggered_at.take().unwrap_or(now),
-                            is_leader: true,
-                            build_complete: Some(now),
-                            import_complete: None,
-                            committed: None,
-                        };
-                        self.record_pipeline_timing(hash, timing);
-
-                        info!(target: "n42::cl::orchestrator", %hash, view = self.engine.current_view(), "payload built, feeding BlockReady to consensus");
-                        if let Err(e) = self.engine.process_event(
-                            n42_consensus::ConsensusEvent::BlockReady(hash, None)
-                        ) {
-                            error!(target: "n42::cl::orchestrator", error = %e, "error processing BlockReady event");
-                        }
+                    if let Some(ready) = payload_ready {
+                        self.handle_payload_build_ready(ready);
                     }
                 }
 
@@ -1570,21 +1636,17 @@ impl ConsensusService {
                     }
                 }
 
-                _ = async {
+                completed_build = async {
                     if self.build_complete_rx.is_closed() && self.build_complete_rx.is_empty() {
-                        std::future::pending::<Option<()>>().await
+                        std::future::pending::<Option<PayloadBuildContext>>().await
                     } else {
                         self.build_complete_rx.recv().await
                     }
                 } => {
                     // Payload resolve task finished (success or failure).
-                    // Clear the parent guard so future builds are not permanently blocked.
-                    // On success, block_ready_rx already cleared it; this handles failure paths
-                    // (build error, timeout, panic) where no BlockReady signal is sent.
-                    if self.building_on_parent.is_some() {
-                        debug!(target: "n42::cl::orchestrator", "build task completed, clearing building_on_parent guard");
-                        self.building_on_parent = None;
-                        self.build_triggered_at = None;
+                    // A stale task must never clear a newer view's build guard.
+                    if let Some(completed) = completed_build {
+                        self.handle_payload_build_complete(completed);
                     }
                 }
 
@@ -2102,7 +2164,7 @@ mod tests {
     use libp2p::identity::Keypair;
     use metrics_util::debugging::{DebugValue, DebuggingRecorder};
     use n42_chainspec::ValidatorInfo;
-    use n42_consensus::{ConsensusEngine, ValidatorSet};
+    use n42_consensus::{ConsensusEngine, EpochManager, ValidatorSet};
     use n42_network::{NetworkCommand, NetworkHandle};
     use n42_primitives::consensus::ValidatorChange;
     use n42_primitives::{BlsSecretKey, ConsensusMessage, QuorumCertificate, Vote};
@@ -2129,6 +2191,7 @@ mod tests {
         new_payload_status: PayloadStatusEnum,
         fcu_statuses: Arc<Mutex<VecDeque<PayloadStatusEnum>>>,
         build_parents: Arc<Mutex<Vec<B256>>>,
+        build_forkchoices: Arc<Mutex<Vec<(B256, B256, B256)>>>,
         /// Every attribute-less forkchoiceUpdated head - the canonical-writer
         /// audit trail (import paths must NEVER appear here).
         fcu_heads: Arc<Mutex<Vec<B256>>>,
@@ -2142,6 +2205,7 @@ mod tests {
                 new_payload_status,
                 fcu_statuses: Arc::new(Mutex::new(VecDeque::from([fcu_status]))),
                 build_parents: Arc::new(Mutex::new(Vec::new())),
+                build_forkchoices: Arc::new(Mutex::new(Vec::new())),
                 fcu_heads: Arc::new(Mutex::new(Vec::new())),
                 new_payload_hashes: Arc::new(Mutex::new(Vec::new())),
             }
@@ -2160,6 +2224,7 @@ mod tests {
                 new_payload_status,
                 fcu_statuses: Arc::new(Mutex::new(fcu_statuses)),
                 build_parents: Arc::new(Mutex::new(Vec::new())),
+                build_forkchoices: Arc::new(Mutex::new(Vec::new())),
                 fcu_heads: Arc::new(Mutex::new(Vec::new())),
                 new_payload_hashes: Arc::new(Mutex::new(Vec::new())),
             }
@@ -2181,6 +2246,13 @@ mod tests {
 
         fn build_parents(&self) -> Vec<B256> {
             self.build_parents
+                .lock()
+                .expect("mock execution-layer lock")
+                .clone()
+        }
+
+        fn build_forkchoices(&self) -> Vec<(B256, B256, B256)> {
+            self.build_forkchoices
                 .lock()
                 .expect("mock execution-layer lock")
                 .clone()
@@ -2225,6 +2297,14 @@ mod tests {
             state: ForkchoiceState,
             _attrs: PayloadAttributes,
         ) -> Result<ForkchoiceUpdated, crate::el::ElError> {
+            self.build_forkchoices
+                .lock()
+                .expect("mock execution-layer lock")
+                .push((
+                    state.head_block_hash,
+                    state.safe_block_hash,
+                    state.finalized_block_hash,
+                ));
             self.build_parents
                 .lock()
                 .expect("mock execution-layer lock")
@@ -2460,6 +2540,36 @@ mod tests {
         (engine, output_rx)
     }
 
+    fn make_test_engine_locked_on(
+        locked_hash: B256,
+    ) -> (ConsensusEngine, mpsc::Receiver<EngineOutput>) {
+        let sk = test_key(0x21);
+        let validator_info = ValidatorInfo {
+            address: Address::with_last_byte(1),
+            bls_public_key: sk.public_key(),
+            p2p_peer_id: None,
+        };
+        let validator_set = ValidatorSet::new(&[validator_info], 0);
+        let (output_tx, output_rx) = mpsc::channel(1024);
+        let mut locked_qc = QuorumCertificate::genesis();
+        locked_qc.view = 1;
+        locked_qc.block_hash = locked_hash;
+        let engine = ConsensusEngine::with_recovered_state(
+            0,
+            sk,
+            EpochManager::new(validator_set),
+            60_000,
+            120_000,
+            output_tx,
+            2,
+            locked_qc,
+            QuorumCertificate::genesis(),
+            0,
+            0,
+        );
+        (engine, output_rx)
+    }
+
     /// Returns (handle, normal_cmd_rx, priority_cmd_rx).
     fn make_test_network() -> (
         NetworkHandle,
@@ -2648,6 +2758,111 @@ mod tests {
             !mock_el.build_parents().contains(&bad_hash),
             "no payload build may use the unexecutable committed hash as parent"
         );
+    }
+
+    /// S3 acceptance: when consensus is locked on A but reth's last validated
+    /// head is the same-height sibling B, the leader must request a payload on
+    /// A. A sibling B must not be advertised as A's safe/finalized ancestor.
+    #[tokio::test]
+    async fn leader_build_uses_locked_qc_parent_over_local_execution_sibling() {
+        let locked_parent = B256::repeat_byte(0xA1);
+        let execution_sibling = B256::repeat_byte(0xB2);
+        let (engine, output_rx) = make_test_engine_locked_on(locked_parent);
+        let (network, _cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let mock_el = Arc::new(MockExecutionLayer::new(
+            PayloadStatusEnum::Valid,
+            PayloadStatusEnum::Valid,
+        ));
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
+        orch.el = Some(mock_el.clone());
+        orch.head_block_hash = execution_sibling;
+
+        orch.do_trigger_payload_build(None).await;
+
+        assert_eq!(mock_el.build_parents(), vec![locked_parent]);
+        assert_eq!(
+            mock_el.build_forkchoices(),
+            vec![(locked_parent, B256::ZERO, B256::ZERO)],
+            "LockedQC must drive FCU head without claiming sibling B as its safe/finalized ancestor"
+        );
+    }
+
+    #[test]
+    fn payload_ready_is_bound_to_captured_locked_qc_context() {
+        let locked_parent = B256::repeat_byte(0xA1);
+        let wrong_parent = B256::repeat_byte(0xB2);
+        let child = B256::repeat_byte(0xC3);
+        let (engine, output_rx) = make_test_engine_locked_on(locked_parent);
+        let (network, _cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
+        let stale_context = PayloadBuildContext {
+            view: 2,
+            parent_hash: wrong_parent,
+        };
+        orch.building_on_parent = Some(stale_context);
+        orch.build_triggered_at = Some(Instant::now());
+
+        assert!(
+            !orch.handle_payload_build_ready(PayloadBuildReady {
+                context: stale_context,
+                block_hash: child,
+            }),
+            "a payload from a sibling parent must not enter consensus"
+        );
+        assert!(
+            orch.output_rx.try_recv().is_err(),
+            "no proposal may be emitted"
+        );
+        assert!(
+            orch.next_build_at.is_some(),
+            "the leader must retry on LockedQC"
+        );
+
+        let locked_context = PayloadBuildContext {
+            view: 2,
+            parent_hash: locked_parent,
+        };
+        orch.building_on_parent = Some(locked_context);
+        orch.build_triggered_at = Some(Instant::now());
+        assert!(orch.handle_payload_build_ready(PayloadBuildReady {
+            context: locked_context,
+            block_hash: child,
+        }));
+
+        let proposal = match orch.output_rx.try_recv().expect("proposal output") {
+            EngineOutput::BroadcastMessage(ConsensusMessage::Proposal(proposal)) => proposal,
+            output => panic!("expected Proposal, got {output:?}"),
+        };
+        assert_eq!(proposal.view, locked_context.view);
+        assert_eq!(proposal.block_hash, child);
+        assert_eq!(proposal.justify_qc.block_hash, locked_parent);
+    }
+
+    #[test]
+    fn stale_build_completion_cannot_clear_new_view_guard() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
+        let old_context = PayloadBuildContext {
+            view: 7,
+            parent_hash: B256::repeat_byte(0x71),
+        };
+        let new_context = PayloadBuildContext {
+            view: 8,
+            parent_hash: B256::repeat_byte(0x82),
+        };
+        orch.building_on_parent = Some(new_context);
+        orch.build_triggered_at = Some(Instant::now());
+
+        assert!(!orch.handle_payload_build_complete(old_context));
+        assert_eq!(orch.building_on_parent, Some(new_context));
+        assert!(orch.build_triggered_at.is_some());
+        assert!(orch.handle_payload_build_complete(new_context));
+        assert!(orch.building_on_parent.is_none());
+        assert!(orch.build_triggered_at.is_none());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3098,11 +3313,18 @@ mod tests {
         let block_ready_tx = orch.block_ready_tx.clone();
 
         let test_hash = B256::repeat_byte(0xFF);
-        block_ready_tx.send(test_hash).await.unwrap();
+        let ready = PayloadBuildReady {
+            context: PayloadBuildContext {
+                view: 7,
+                parent_hash: B256::repeat_byte(0xEE),
+            },
+            block_hash: test_hash,
+        };
+        block_ready_tx.send(ready).await.unwrap();
 
         let received = orch.block_ready_rx.try_recv();
-        assert!(received.is_ok(), "should receive BlockReady hash");
-        assert_eq!(received.unwrap(), test_hash);
+        assert!(received.is_ok(), "should receive BlockReady context");
+        assert_eq!(received.unwrap(), ready);
     }
 
     #[test]
