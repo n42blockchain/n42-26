@@ -696,15 +696,14 @@ impl ConsensusEngine {
         let current_view = self.round_state.current_view();
 
         // Buffer messages for future views (within window) instead of rejecting them.
-        // Decide and NewView are always exempt — they handle their own view logic.
-        // Timeout messages within FUTURE_VIEW_WINDOW are also exempt — process_timeout
-        // handles view synchronization for these.
+        // Decide and NewView are always exempt — they carry quorum proofs and handle
+        // their own view logic. A Timeout is deliberately NOT exempt: one validator's
+        // signed timeout is not a quorum proof and therefore may only be buffered.
         if let Some(view) = msg_view {
             let is_exempt = matches!(
                 msg,
                 ConsensusMessage::Decide(_) | ConsensusMessage::NewView(_)
-            ) || (matches!(msg, ConsensusMessage::Timeout(_))
-                && view <= current_view + FUTURE_VIEW_WINDOW);
+            );
 
             if view > current_view && !is_exempt {
                 if view <= current_view + FUTURE_VIEW_WINDOW {
@@ -806,9 +805,9 @@ impl ConsensusEngine {
 
     /// Attempts a QC-based view jump when a far-future message arrives.
     ///
-    /// Extracts and verifies the QC from the message. If valid, jumps to
-    /// `max(qc.view + 1, msg_view)`. This breaks the deadlock where a recovering
-    /// node's view is too old to participate in consensus.
+    /// Extracts and verifies the QC from the message. If valid, jumps to exactly
+    /// `qc.view + 1`. `msg_view` is not quorum-authenticated and is used only by
+    /// the caller to decide whether the enclosing message can be buffered.
     ///
     /// Safety: A valid QC proves ≥quorum validators reached that view, so
     /// jumping does not violate HotStuff-2 safety. locked_qc only advances.
@@ -841,14 +840,7 @@ impl ConsensusEngine {
             }
             ConsensusMessage::Proposal(_)
             | ConsensusMessage::Timeout(_)
-            | ConsensusMessage::NewView(_) => {
-                let changes_hash = self.cached_changes_hash(&qc.block_hash);
-                super::quorum::verify_qc_any_domain(
-                    qc,
-                    self.validator_set_for_view(qc.view),
-                    &changes_hash,
-                )
-            }
+            | ConsensusMessage::NewView(_) => self.verify_qc_any_domain_or_known(qc),
             ConsensusMessage::Vote(_) | ConsensusMessage::CommitVote(_) => return Ok(false),
         };
         if verify_result.is_err() {
@@ -861,13 +853,11 @@ impl ConsensusEngine {
             return Ok(false);
         }
 
-        // Jump target: prefer msg_view (authenticated via BLS signature for Timeout/Proposal/
-        // NewView messages) but cap the gap between msg_view and qc.view to limit the blast
-        // radius of a single Byzantine validator sending a far-future view with an old QC.
-        // A gap > MAX_VIEW_JUMP_GAP is implausible in normal operation and indicates either
-        // a Byzantine validator or a severely partitioned node; in both cases we clamp.
-        const MAX_VIEW_JUMP_GAP: u64 = 10_000;
-        let target_view = msg_view.min(qc.view.saturating_add(MAX_VIEW_JUMP_GAP));
+        // A QC proves that a quorum reached qc.view, so its successor is the highest
+        // view justified by this message. The outer msg_view may have only one signer;
+        // allowing it to influence the target lets one Byzantine validator drag peers
+        // through arbitrary views by attaching a valid historical QC.
+        let target_view = qc.view.saturating_add(1);
         if target_view <= current_view {
             return Ok(false);
         }
@@ -1085,6 +1075,27 @@ impl ConsensusEngine {
             .unwrap_or_default()
     }
 
+    /// Verifies a QC that may use either the prepare or commit signing domain.
+    ///
+    /// An exact QC already held as the local lock/commit is trusted: it was
+    /// verified before entering safety-critical state and is restored as such
+    /// from the crash-safe snapshot. This matters for a CommitQC over a validator
+    /// change, whose signing domain includes a non-zero changes hash that the
+    /// bounded runtime cache intentionally does not persist. Requiring that
+    /// ephemeral cache after restart would make every follower reject the first
+    /// proposal extending its own persisted CommitQC.
+    pub(super) fn verify_qc_any_domain_or_known(
+        &self,
+        qc: &QuorumCertificate,
+    ) -> ConsensusResult<()> {
+        if qc == self.round_state.locked_qc() || qc == self.round_state.last_committed_qc() {
+            return Ok(());
+        }
+
+        let changes_hash = self.cached_changes_hash(&qc.block_hash);
+        super::quorum::verify_qc_any_domain(qc, self.resolve_qc_validator_set(qc), &changes_hash)
+    }
+
     pub(super) fn emit(&self, output: EngineOutput) -> ConsensusResult<()> {
         const MAX_OUTPUT_SEND_RETRIES: u32 = 3;
 
@@ -1293,6 +1304,63 @@ mod tests {
             collector.add_vote(i, sks[i as usize].sign(&msg)).unwrap();
         }
         collector.build_qc(vs).unwrap()
+    }
+
+    #[test]
+    fn test_recovered_commit_qc_with_changes_can_justify_first_proposal() {
+        let (fresh, sks, vs, _fresh_rx) = make_engine(4, 0);
+        let committed_hash = B256::repeat_byte(0xC8);
+        let changes_hash = B256::repeat_byte(0xA8);
+        let commit_qc = build_test_commit_qc_with_changes(
+            1,
+            committed_hash,
+            &sks,
+            &vs,
+            &[0, 1, 2],
+            &changes_hash,
+        );
+
+        let (output_tx, _output_rx) = mpsc::channel(64);
+        let mut recovered = ConsensusEngine::with_recovered_state(
+            0,
+            sks[0].clone(),
+            fresh.epoch_manager,
+            60_000,
+            120_000,
+            output_tx,
+            2,
+            commit_qc.clone(),
+            commit_qc.clone(),
+            0,
+            1,
+        );
+        assert_eq!(
+            recovered.cached_changes_hash(&committed_hash),
+            B256::ZERO,
+            "the bounded changes-hash cache is intentionally empty after restart"
+        );
+
+        let view = recovered.current_view();
+        let proposer = recovered.leader_index_for_view(view);
+        let block_hash = B256::repeat_byte(0xC9);
+        let signing_message =
+            crate::protocol::quorum::proposal_signing_message(view, &block_hash, &None);
+        let proposal = Proposal {
+            view,
+            block_hash,
+            justify_qc: commit_qc,
+            proposer,
+            signature: sks[proposer as usize].sign(&signing_message),
+            prepare_qc: None,
+            tx_root_hash: None,
+            validator_changes: None,
+        };
+
+        recovered
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(
+                proposal,
+            )))
+            .expect("the first post-restart proposal must extend the persisted CommitQC");
     }
 
     #[test]
@@ -3064,7 +3132,56 @@ mod tests {
     }
 
     #[test]
-    fn test_far_future_timeout_triggers_view_jump() {
+    fn test_message_view_cannot_jump_past_qc_successor() {
+        let (mut engine, sks, vs, mut rx) = make_engine(4, 0);
+        assert_eq!(engine.current_view(), 1);
+
+        let qc_view = 99u64;
+        let forged_message_view = qc_view + 1_000;
+        let block_hash = B256::repeat_byte(0xF6);
+        let justify_qc =
+            build_test_prepare_qc(qc_view, B256::repeat_byte(0xF7), &sks, &vs, &[0, 1, 2]);
+        let msg = crate::protocol::quorum::proposal_signing_message(
+            forged_message_view,
+            &block_hash,
+            &None,
+        );
+        let proposal = n42_primitives::consensus::Proposal {
+            view: forged_message_view,
+            block_hash,
+            justify_qc,
+            proposer: 0,
+            signature: sks[0].sign(&msg),
+            prepare_qc: None,
+            tx_root_hash: None,
+            validator_changes: None,
+        };
+
+        engine
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(
+                proposal,
+            )))
+            .expect("valid QC should justify only its successor view");
+
+        assert_eq!(engine.current_view(), qc_view + 1);
+        assert!(engine.future_msg_buffer.is_empty());
+        let outputs: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(outputs.iter().any(|o| matches!(
+            o,
+            EngineOutput::SyncRequired {
+                local_view: 1,
+                target_view: 100
+            }
+        )));
+        assert!(
+            outputs
+                .iter()
+                .any(|o| matches!(o, EngineOutput::ViewChanged { new_view: 100 }))
+        );
+    }
+
+    #[test]
+    fn test_far_future_timeout_jumps_only_to_prepare_qc_successor() {
         use crate::protocol::quorum::timeout_signing_message;
         use n42_primitives::consensus::TimeoutMessage;
 
@@ -3086,12 +3203,14 @@ mod tests {
             .process_event(ConsensusEvent::Message(ConsensusMessage::Timeout(timeout)))
             .expect("far-future timeout with valid QC should trigger view jump");
 
-        assert_eq!(engine.current_view(), 200);
+        assert_eq!(engine.current_view(), 191);
+        assert_eq!(engine.future_msg_buffer.len(), 1);
+        assert_eq!(engine.future_msg_buffer[0].0, far_view);
         while rx.try_recv().is_ok() {}
     }
 
     #[test]
-    fn test_far_future_timeout_with_commit_qc_triggers_view_jump() {
+    fn test_far_future_timeout_jumps_only_to_commit_qc_successor() {
         use crate::protocol::quorum::timeout_signing_message;
         use n42_primitives::consensus::TimeoutMessage;
 
@@ -3113,7 +3232,9 @@ mod tests {
             .process_event(ConsensusEvent::Message(ConsensusMessage::Timeout(timeout)))
             .expect("far-future timeout with commit QC should trigger view jump");
 
-        assert_eq!(engine.current_view(), 200);
+        assert_eq!(engine.current_view(), 191);
+        assert_eq!(engine.future_msg_buffer.len(), 1);
+        assert_eq!(engine.future_msg_buffer[0].0, far_view);
         while rx.try_recv().is_ok() {}
     }
 
@@ -3328,7 +3449,7 @@ mod tests {
             .expect("should trigger view jump via timeout");
 
         while rx.try_recv().is_ok() {}
-        assert_eq!(engine.current_view(), 200);
+        assert_eq!(engine.current_view(), 31);
         assert_eq!(
             engine.locked_qc().view,
             50,
@@ -3444,7 +3565,7 @@ mod tests {
     }
 
     #[test]
-    fn test_process_timeout_at_window_boundary() {
+    fn test_single_timeout_at_window_boundary_is_buffered() {
         use crate::protocol::quorum::timeout_signing_message;
         use n42_primitives::consensus::TimeoutMessage;
 
@@ -3462,9 +3583,11 @@ mod tests {
 
         engine
             .process_event(ConsensusEvent::Message(ConsensusMessage::Timeout(timeout)))
-            .expect("timeout at window boundary should be accepted");
+            .expect("timeout at window boundary should be buffered");
 
-        assert_eq!(engine.current_view(), boundary_view);
+        assert_eq!(engine.current_view(), 1);
+        assert_eq!(engine.future_msg_buffer.len(), 1);
+        assert_eq!(engine.future_msg_buffer[0].0, boundary_view);
         let outputs: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
         assert!(
             !outputs
@@ -3475,7 +3598,7 @@ mod tests {
     }
 
     #[test]
-    fn test_observer_future_timeout_triggers_sync_without_invalid_rebroadcast() {
+    fn test_observer_buffers_single_future_timeout_without_rebroadcast() {
         use crate::protocol::quorum::timeout_signing_message;
         use n42_primitives::consensus::TimeoutMessage;
 
@@ -3505,18 +3628,18 @@ mod tests {
 
         engine
             .process_event(ConsensusEvent::Message(ConsensusMessage::Timeout(timeout)))
-            .expect("observer should accept future timeout for sync");
+            .expect("observer should buffer a future timeout");
 
-        assert_eq!(engine.current_view(), timeout_view);
+        assert_eq!(engine.current_view(), 1);
+        assert_eq!(engine.future_msg_buffer.len(), 1);
+        assert_eq!(engine.future_msg_buffer[0].0, timeout_view);
 
         let outputs: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
-        assert!(outputs.iter().any(|o| matches!(
-            o,
-            EngineOutput::SyncRequired {
-                local_view: 0,
-                target_view: 29
-            }
-        )));
+        assert!(
+            !outputs
+                .iter()
+                .any(|o| matches!(o, EngineOutput::SyncRequired { .. }))
+        );
         assert!(
             !outputs.iter().any(|o| matches!(
                 o,
@@ -3592,6 +3715,49 @@ mod tests {
             EngineOutput::BroadcastMessage(ConsensusMessage::NewView(_))
         )));
         assert_eq!(engine.current_view(), 2);
+    }
+
+    #[test]
+    fn test_duplicate_timeout_from_one_signer_cannot_form_tc() {
+        use crate::protocol::quorum::timeout_signing_message;
+        use n42_primitives::consensus::TimeoutMessage;
+
+        // Node 2 is the next leader and would form a TC if the duplicate were
+        // incorrectly counted as the third distinct timeout.
+        let (mut engine, sks, _, mut rx) = make_engine(4, 2);
+        engine.on_timeout().expect("own timeout");
+        while rx.try_recv().is_ok() {}
+
+        let msg = timeout_signing_message(1);
+        for _ in 0..2 {
+            let duplicate = TimeoutMessage {
+                view: 1,
+                high_qc: QuorumCertificate::genesis(),
+                sender: 0,
+                signature: sks[0].sign(&msg),
+            };
+            engine
+                .process_event(ConsensusEvent::Message(ConsensusMessage::Timeout(
+                    duplicate,
+                )))
+                .expect("duplicate delivery should be ignored");
+        }
+
+        let outputs: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(!outputs.iter().any(|o| matches!(
+            o,
+            EngineOutput::BroadcastMessage(ConsensusMessage::NewView(_))
+        )));
+        assert_eq!(engine.current_view(), 1);
+        assert_eq!(
+            engine
+                .timeout_collector
+                .as_ref()
+                .expect("collector should exist")
+                .timeout_count(),
+            2,
+            "only the local signer and one external signer may be counted"
+        );
     }
 
     #[test]

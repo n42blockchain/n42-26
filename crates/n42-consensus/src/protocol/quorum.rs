@@ -228,6 +228,17 @@ impl TimeoutCollector {
     /// Timeout messages with invalid signatures are skipped (defense-in-depth).
     /// The TC fails only if fewer than `quorum_size` valid timeouts remain.
     pub fn build_tc(&self, validator_set: &ValidatorSet) -> ConsensusResult<TimeoutCertificate> {
+        if validator_set.len() != self.set_size {
+            return Err(ConsensusError::InvalidTC {
+                view: self.view,
+                reason: format!(
+                    "validator_set size mismatch: collector set_size={}, validator_set.len()={}",
+                    self.set_size,
+                    validator_set.len()
+                ),
+            });
+        }
+
         let quorum_size = validator_set.quorum_size();
         if self.timeouts.len() < quorum_size {
             return Err(ConsensusError::InsufficientVotes {
@@ -1016,6 +1027,58 @@ mod tests {
             }
             other => panic!("expected DuplicateVote, got: {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_verify_tc_checks_quorum_bitmap_and_aggregate_signature() {
+        let (sks, vs) = test_validator_set(4);
+        let view = 14u64;
+        let mut collector = TimeoutCollector::new(view, vs.len());
+        let msg = timeout_signing_message(view);
+        for i in 0..3u32 {
+            collector
+                .add_timeout(i, sks[i as usize].sign(&msg), QuorumCertificate::genesis())
+                .unwrap();
+        }
+
+        let mut tc = collector.build_tc(&vs).expect("quorum TC should form");
+        verify_tc(&tc, &vs).expect("valid TC aggregate should verify");
+
+        let wrong_msg = timeout_signing_message(view + 1);
+        let wrong_sigs: Vec<_> = (0..3u32)
+            .map(|i| sks[i as usize].sign(&wrong_msg))
+            .collect();
+        let wrong_refs: Vec<_> = wrong_sigs.iter().collect();
+        tc.aggregate_signature = AggregateSignature::aggregate(&wrong_refs).unwrap();
+        assert!(
+            verify_tc(&tc, &vs).is_err(),
+            "a signer bitmap cannot authenticate an aggregate over another view"
+        );
+
+        tc.signers.set(2, false);
+        assert!(
+            verify_tc(&tc, &vs).is_err(),
+            "a TC bitmap below quorum must be rejected before pairing verification"
+        );
+    }
+
+    #[test]
+    fn test_build_tc_rejects_validator_set_size_mismatch() {
+        let (sks, vs) = test_validator_set(4);
+        let (_, smaller_vs) = test_validator_set(3);
+        let view = 15u64;
+        let msg = timeout_signing_message(view);
+        let mut collector = TimeoutCollector::new(view, vs.len());
+        for i in 0..3u32 {
+            collector
+                .add_timeout(i, sks[i as usize].sign(&msg), QuorumCertificate::genesis())
+                .unwrap();
+        }
+
+        assert!(matches!(
+            collector.build_tc(&smaller_vs),
+            Err(ConsensusError::InvalidTC { .. })
+        ));
     }
 
     #[test]

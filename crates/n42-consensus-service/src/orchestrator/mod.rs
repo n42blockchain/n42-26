@@ -1377,6 +1377,11 @@ impl ConsensusService {
             .await;
 
         loop {
+            // Bind this Sleep to the view/deadline from which it was created. The
+            // event loop recreates and drops the timer after every selected branch;
+            // the checks in the timeout branch are defense-in-depth against a stale
+            // timer if that structure changes in the future.
+            let timeout_view = self.engine.current_view();
             let timeout = self.engine.pacemaker().timeout_sleep();
             tokio::pin!(timeout);
 
@@ -1410,6 +1415,11 @@ impl ConsensusService {
                 // === Priority 1: Safety-critical ===
                 _ = &mut timeout => {
                     let view = self.engine.current_view();
+                    if view != timeout_view || !self.engine.pacemaker().is_timed_out() {
+                        debug!(target: "n42::cl::orchestrator", timeout_view, current_view = view,
+                            "ignoring stale pacemaker timer");
+                        continue;
+                    }
                     counter!("n42_view_timeouts_total").increment(1);
                     self.record_timeout_diag_timeout_triggered(view);
                     warn!(target: "n42::cl::orchestrator", view, "pacemaker timeout, initiating view change");
