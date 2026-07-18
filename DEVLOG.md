@@ -123,4 +123,6 @@ Logs are split into separate files by phase for easy maintenance:
 
 ---
 
+| [devlog-97-locked-qc-build-parent](docs/devlog-97-locked-qc-build-parent.md) | gov5 S3 audit: LockedQC-authoritative leader builds, async view/parent binding, fail-closed reth defer | Security |
+
 New entries: append to the corresponding category file, or create a new numbered file (e.g., `devlog-57-xxx.md`) in `docs/`.

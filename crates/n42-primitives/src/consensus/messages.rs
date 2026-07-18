@@ -242,7 +242,7 @@ pub struct Decide {
 //     the proposal's `validator_changes_hash`. Old nodes signing under the v2
 //     46-byte format will fail BLS verification on new nodes — this is a
 //     wire-format breaking change requiring a coordinated upgrade.
-pub const CONSENSUS_PROTOCOL_VERSION: u16 = 3;
+pub const CONSENSUS_PROTOCOL_VERSION: u16 = 4;
 
 /// Versioned wrapper for consensus messages on the wire.
 ///
