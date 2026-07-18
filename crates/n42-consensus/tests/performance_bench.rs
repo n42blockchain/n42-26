@@ -646,7 +646,7 @@ fn bench_comparative_summary() {
     );
     println!(
         "  {:35} | {:>12} | {:>12}",
-        "Quorum size (2f+1)",
+        "Quorum size (n-f)",
         harness_a.validator_set.quorum_size(),
         harness_b.validator_set.quorum_size()
     );

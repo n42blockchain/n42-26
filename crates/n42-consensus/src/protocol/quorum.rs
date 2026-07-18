@@ -10,7 +10,7 @@ use crate::error::{ConsensusError, ConsensusResult};
 use crate::validator::ValidatorSet;
 
 /// Collects votes for a specific view and produces a QuorumCertificate
-/// once 2f+1 votes are received.
+/// once n-f votes from the active validator set are received.
 #[derive(Debug)]
 pub struct VoteCollector {
     view: ViewNumber,
@@ -598,6 +598,30 @@ mod tests {
 
         assert_eq!(collector.vote_count(), 3);
         assert!(collector.has_quorum(vs.quorum_size()));
+    }
+
+    #[test]
+    fn test_five_validator_three_votes_cannot_form_qc() {
+        let (sks, vs) = test_validator_set(5);
+        let view = 2u64;
+        let block_hash = B256::repeat_byte(0xB5);
+        let mut collector = VoteCollector::new(view, block_hash, vs.len());
+        let msg = signing_message(view, &block_hash);
+
+        for i in 0..3u32 {
+            collector.add_vote(i, sks[i as usize].sign(&msg)).unwrap();
+        }
+
+        assert_eq!(vs.quorum_size(), 4);
+        assert!(!collector.has_quorum(vs.quorum_size()));
+        assert!(matches!(
+            collector.build_qc(&vs),
+            Err(ConsensusError::InsufficientVotes {
+                have: 3,
+                need: 4,
+                ..
+            })
+        ));
     }
 
     #[test]

@@ -206,7 +206,7 @@ pub(super) struct PendingProposal {
 ///
 /// ### Timeout recovery (Round 3):
 /// 1. Timer expires → validator broadcasts `Timeout{view, high_qc}`
-/// 2. New leader collects 2f+1 timeouts → forms TC
+/// 2. New leader collects n-f timeouts → forms TC
 /// 3. New leader broadcasts `NewView{view+1, TC}` → back to Propose
 pub struct ConsensusEngine {
     pub(super) my_index: u32,
@@ -2733,7 +2733,7 @@ mod tests {
                 block_hash_1,
                 &sks,
                 &vs_epoch_0,
-                &[0],
+                &[0, 1, 2],
                 &changes_hash,
             ),
             validator_changes_hash: changes_hash,
@@ -2772,7 +2772,7 @@ mod tests {
         let decide_2 = Decide {
             view: 2,
             block_hash: block_hash_2,
-            commit_qc: build_test_commit_qc(2, block_hash_2, &sks, &vs_epoch_0, &[0]),
+            commit_qc: build_test_commit_qc(2, block_hash_2, &sks, &vs_epoch_0, &[0, 1, 2]),
             validator_changes_hash: B256::ZERO,
         };
         engine

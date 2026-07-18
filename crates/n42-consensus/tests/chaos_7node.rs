@@ -1297,7 +1297,7 @@ async fn test_timeout_convergence_from_different_views() {
 
 // ── Node dropout tests ───────────────��──────────────────────────────────────
 //
-// HotStuff-2 with n=7, f=2, quorum=2f+1=5.
+// HotStuff-2 with n=7, f=2, quorum=n-f=5.
 //
 // Active nodes → can reach quorum?
 //   7 → yes (5 of 7)
@@ -1512,7 +1512,7 @@ fn test_7node_progressive_dropout() {
         let block_hash = B256::repeat_byte(active_count as u8);
         let committed = run_round_with_active_set(&mut h, 1, block_hash, &active);
 
-        let quorum = 5usize; // 2f+1 = 2*2+1 = 5
+        let quorum = 5usize; // n-f = 7-2 = 5
         let should_commit = active_count >= quorum;
 
         assert_eq!(

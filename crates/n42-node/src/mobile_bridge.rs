@@ -399,6 +399,9 @@ impl MobileVerificationBridge {
 
     fn update_dynamic_threshold(&mut self) {
         let connected = self.connected_sessions.len() as u32;
+        // This is a non-consensus mobile-attestation sampling threshold. It does
+        // not authorize QC/TC formation and intentionally remains separate from
+        // the validator-set n-f consensus quorum.
         let threshold = (connected * 2 / 3).max(min_attestation_threshold());
         self.receipt_aggregator.set_default_threshold(threshold);
         debug!(target: "n42::mobile", connected, threshold, "attestation threshold updated");

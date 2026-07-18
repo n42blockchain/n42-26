@@ -1446,15 +1446,17 @@ mod boundary_conditions {
 
     #[test]
     fn test_quorum_size_formula() {
-        // Verify quorum_size = 2f+1 for various n values
+        // Verify quorum_size = n-f for arbitrary valid validator-set sizes.
         let test_cases: Vec<(usize, u32, usize)> = vec![
             // (n, expected_f, expected_quorum)
             (1, 0, 1),
             (4, 1, 3),
+            (5, 1, 4),
             (7, 2, 5),
             (10, 3, 7),
+            (21, 6, 15),
             (100, 33, 67),
-            (500, 166, 333),
+            (500, 166, 334),
         ];
 
         for (n, expected_f, expected_quorum) in test_cases {
@@ -1553,9 +1555,9 @@ mod stress_performance {
     fn test_large_set_500_validators() {
         let mut harness = TestHarness::new(500);
 
-        // f=166, quorum=333
+        // f=166, quorum=n-f=334
         assert_eq!(harness.validator_set.fault_tolerance(), 166);
-        assert_eq!(harness.validator_set.quorum_size(), 333);
+        assert_eq!(harness.validator_set.quorum_size(), 334);
 
         let block_hash = B256::repeat_byte(0x55);
         harness.run_consensus_round(1, block_hash);
@@ -1767,7 +1769,7 @@ mod byzantine_signature {
     use n42_primitives::consensus::CommitVote;
 
     /// Run consensus round where f Byzantine validators send votes with invalid signatures.
-    /// Consensus should still succeed because 2f+1 honest validators form quorum.
+    /// Consensus should still succeed because n-f honest validators form quorum.
     ///
     /// Topology: 7 validators, f=2, quorum=5.
     /// Byzantine validators (5, 6) send votes with wrong signatures.
@@ -2255,7 +2257,7 @@ mod attestation_e2e {
 
 // ══════════════════════════════════════════════════════════════════════════════
 // Module: 21-Node HotStuff-2 Consensus Tests
-// n=21, f=6, quorum=13
+// n=21, f=6, quorum=n-f=15
 // ══════════════════════════════════════════════════════════════════════════════
 
 mod twenty_one_node {
@@ -2274,8 +2276,8 @@ mod twenty_one_node {
         );
         assert_eq!(
             harness.validator_set.quorum_size(),
-            13,
-            "quorum should be 13 for n=21"
+            15,
+            "quorum should be 15 for n=21"
         );
 
         // All engines start at view 1, WaitingForProposal
@@ -2382,25 +2384,23 @@ mod twenty_one_node {
         }
     }
 
-    /// Fault tolerance: exactly quorum (13 of 21) participate, 8 crash.
-    /// With f=6, losing 8 > f nodes should still work because quorum=13
-    /// and we have exactly 13 participants.
+    /// Fault tolerance: exactly quorum (15 of 21) participate, f=6 crash.
     #[test]
-    fn test_21v_exact_quorum_13_of_21() {
+    fn test_21v_exact_quorum_15_of_21() {
         let mut harness = TestHarness::new(21);
 
-        // Participating validators: first 13 (indices 0-12)
+        // Participating validators: first 15 (indices 0-14)
         // For view 1, leader = 1 % 21 = 1, which is in the participating set.
-        let participating: Vec<usize> = (0..13).collect();
+        let participating: Vec<usize> = (0..15).collect();
 
         let block_hash = B256::repeat_byte(0xEE);
         let committed = harness.run_consensus_round_partial(1, block_hash, &participating);
 
-        assert!(committed, "exactly quorum (13/21) should achieve consensus");
+        assert!(committed, "exactly quorum (15/21) should achieve consensus");
         assert_eq!(harness.committed_blocks.len(), 1);
     }
 
-    /// Fault tolerance: f=6 crash, 15 nodes remain (still > quorum=13).
+    /// Fault tolerance: f=6 crash, exactly n-f=15 nodes remain.
     #[test]
     fn test_21v_f_crash_6_nodes_down() {
         let mut harness = TestHarness::new(21);
@@ -2418,10 +2418,9 @@ mod twenty_one_node {
         assert_eq!(harness.committed_blocks.len(), 1);
     }
 
-    /// Fault tolerance: f+1=7 crash, only 14 remain.
-    /// 14 >= quorum=13, so should still commit.
+    /// Safety boundary: f+1=7 crash, only 14 remain, so consensus must stall.
     #[test]
-    fn test_21v_f_plus_1_crash_14_remain() {
+    fn test_21v_f_plus_1_crash_14_remain_stalls() {
         let mut harness = TestHarness::new(21);
 
         // 7 crashed nodes: indices 14-20
@@ -2431,13 +2430,12 @@ mod twenty_one_node {
         let committed = harness.run_consensus_round_partial(1, block_hash, &participating);
 
         assert!(
-            committed,
-            "14/21 nodes (7 crashed) should still achieve consensus (14 >= quorum=13)"
+            !committed,
+            "14/21 nodes (7 crashed) must not achieve n-f quorum=15"
         );
     }
 
-    /// Fault tolerance: 9 crash, only 12 remain.
-    /// 12 < quorum=13, so consensus MUST stall.
+    /// Fault tolerance: 9 crash, only 12 remain, well below n-f=15.
     #[test]
     fn test_21v_below_quorum_12_of_21_stalls() {
         let mut harness = TestHarness::new(21);
@@ -2451,13 +2449,13 @@ mod twenty_one_node {
 
         assert!(
             !committed,
-            "12/21 nodes (below quorum=13) must NOT achieve consensus"
+            "12/21 nodes (below quorum=15) must NOT achieve consensus"
         );
         assert_eq!(harness.committed_blocks.len(), 0);
     }
 
-    /// Byzantine: f=6 nodes send votes with invalid signatures,
-    /// but 14 honest nodes form quorum (14 >= 13).
+    /// Byzantine: f=6 nodes send votes with invalid signatures, while all
+    /// n-f=15 honest nodes (including the leader's self-vote) form quorum.
     #[test]
     fn test_21v_byzantine_6_invalid_votes() {
         let mut harness = TestHarness::new(21);
@@ -2540,7 +2538,7 @@ mod twenty_one_node {
             }
         }
 
-        // Step 4: Leader should have PrepareQC from 14 honest votes (>= quorum=13)
+        // Step 4: 14 external honest votes plus the leader self-vote reach quorum=15.
         let leader_outputs = harness.drain_outputs(leader);
         let prepare_qc = leader_outputs.iter().find_map(|o| match o {
             EngineOutput::BroadcastMessage(msg @ ConsensusMessage::PrepareQC(_)) => {
@@ -2551,7 +2549,7 @@ mod twenty_one_node {
 
         assert!(
             prepare_qc.is_some(),
-            "14 honest votes should form PrepareQC (quorum=13)"
+            "15 honest votes including the leader should form PrepareQC (quorum=15)"
         );
 
         // Continue: Route PrepareQC → CommitVotes → verify commitment
@@ -2733,7 +2731,7 @@ mod twenty_one_node {
     }
 
     /// Fault tolerance: multiple rounds with exactly quorum participants,
-    /// different subsets each round (rotating which 8 are "down").
+    /// different subsets each round (rotating which f=6 are "down").
     #[test]
     fn test_21v_rotating_failures_10_rounds() {
         let mut harness = TestHarness::new(21);
@@ -2741,24 +2739,22 @@ mod twenty_one_node {
         for round in 0..10u64 {
             let view = round + 1;
 
-            // Rotate which 8 nodes are "down" each round.
+            // Rotate which 6 nodes are "down" each round.
             // Ensure the leader for this view is always in the participating set.
             let leader = harness.leader_for_view(view);
 
             let participating: Vec<usize> = (0..21)
                 .filter(|&i| {
-                    // Drop 8 nodes based on round number
+                    // Drop 6 nodes based on round number
                     let dropped_start = ((round as usize) * 3) % 21;
-                    let is_dropped = (0..8).any(|d| (dropped_start + d) % 21 == i);
+                    let is_dropped = (0..6).any(|d| (dropped_start + d) % 21 == i);
                     !is_dropped || i == leader // leader always participates
                 })
                 .collect();
 
-            // Ensure at least quorum (13) participants
-            if participating.len() < 13 {
-                // If leader inclusion pushed us to exactly 13, that's fine
-                // Otherwise we need more — but with 21-8=13, plus leader always included,
-                // we should have exactly 13 or 14.
+            // With 21-6=15, leader inclusion leaves either 15 or 16 participants.
+            if participating.len() < 15 {
+                unreachable!("rotating failure set must retain n-f validators");
             }
 
             let mut block_bytes = [0u8; 32];
@@ -2769,7 +2765,7 @@ mod twenty_one_node {
 
             assert!(
                 committed,
-                "round {} (view {}) with {}/21 nodes should commit (quorum=13), participating={:?}",
+                "round {} (view {}) with {}/21 nodes should commit (quorum=15), participating={:?}",
                 round,
                 view,
                 participating.len(),
@@ -2827,7 +2823,7 @@ mod twenty_one_node {
     }
 
     /// Byzantine: f=6 nodes send votes for WRONG block hash.
-    /// 14 honest nodes should still reach consensus on the correct block.
+    /// The 15 honest nodes should still reach consensus on the correct block.
     #[test]
     fn test_21v_byzantine_6_wrong_block_votes() {
         let mut harness = TestHarness::new(21);
@@ -2902,7 +2898,7 @@ mod twenty_one_node {
             }
         }
 
-        // 14 honest votes for correct_hash → should form PrepareQC
+        // 14 external honest votes plus the leader self-vote form quorum=15.
         let leader_outputs = harness.drain_outputs(leader);
         let has_prepare_qc = leader_outputs.iter().any(|o| {
             matches!(
@@ -2913,41 +2909,41 @@ mod twenty_one_node {
 
         assert!(
             has_prepare_qc,
-            "14 honest votes for correct block should form PrepareQC despite 6 wrong-block votes"
+            "15 honest votes including the leader should form PrepareQC despite 6 wrong-block votes"
         );
     }
 
-    /// Boundary: exactly 12 honest + leader = 13 (borderline quorum) should commit.
+    /// Boundary: exactly 14 external/participating peers + leader = 15 should commit.
     #[test]
     fn test_21v_borderline_quorum() {
         let mut harness = TestHarness::new(21);
 
         // View 1: leader = 1
-        // Participating: leader (1) + validators 2-13 = 13 total = exact quorum
-        let participating: Vec<usize> = (1..14).collect();
+        // Participating: leader (1) + validators 2-15 = 15 total = exact quorum
+        let participating: Vec<usize> = (1..16).collect();
 
         let block_hash = B256::repeat_byte(0xBD);
         let committed = harness.run_consensus_round_partial(1, block_hash, &participating);
 
         assert!(
             committed,
-            "borderline quorum of exactly 13/21 (including leader) should commit"
+            "borderline quorum of exactly 15/21 (including leader) should commit"
         );
     }
 
-    /// Boundary: 12 voters + leader = 13 for quorum, but one fewer = 12, should NOT commit.
+    /// Boundary: one below n-f quorum (14 total) must not commit.
     #[test]
     fn test_21v_one_below_quorum() {
         let mut harness = TestHarness::new(21);
 
         // View 1: leader = 1
-        // Participating: leader (1) + validators 2-12 = 12 total (one below quorum=13)
-        let participating: Vec<usize> = (1..13).collect();
+        // Participating: leader (1) + validators 2-14 = 14 total (one below quorum=15)
+        let participating: Vec<usize> = (1..15).collect();
 
         let block_hash = B256::repeat_byte(0xB1);
         let committed = harness.run_consensus_round_partial(1, block_hash, &participating);
 
-        assert!(!committed, "12/21 (one below quorum=13) should NOT commit");
+        assert!(!committed, "14/21 (one below quorum=15) should NOT commit");
     }
 
     /// Stability: 200 consecutive blocks with 21 nodes.
