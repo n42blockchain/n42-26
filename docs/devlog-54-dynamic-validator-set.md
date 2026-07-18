@@ -4,6 +4,12 @@
 > 分支：dev2603
 > 类别：Feature / Consensus Safety
 
+> 2026-07-18 safety update: the original `2f+1` quorum/overlap rule below has
+> been superseded by the active-set `n-f` rule in
+> [devlog-95](devlog-95-quorum-n-minus-f.md). The text below is retained as the
+> historical implementation record; current code and deployments must use
+> `n-f`.
+
 ---
 
 ## 背景

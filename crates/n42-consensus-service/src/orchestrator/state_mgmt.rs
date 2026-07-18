@@ -211,15 +211,6 @@ impl ConsensusService {
     /// an unready request-response stream; fan-out avoids a full sync timeout
     /// while every response remains QC-verified and idempotent.
     pub(super) fn initiate_execution_catchup_sync(&mut self, local_view: u64, target_view: u64) {
-        // (T3) Defense in depth: a caller that still passes a 0 floor right
-        // after a restart would request from view 1 and flood peers whose sync
-        // ring cannot reach that far back. Raise it to the restored committed
-        // view so the request targets the real gap.
-        let local_view = if local_view == 0 {
-            self.execution_catchup_floor()
-        } else {
-            local_view
-        };
         if self.sync_in_flight {
             debug!(
                 target: "n42::cl::sync",

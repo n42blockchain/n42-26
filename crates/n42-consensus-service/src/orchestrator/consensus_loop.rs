@@ -1066,19 +1066,16 @@ impl ConsensusService {
                 && self.head_block_hash != hash)
     }
 
-    /// Floor view for a post-restart execution catch-up request (T3). The
-    /// execution-validated head is the natural floor, but right after a restart
-    /// from a pre-v4 snapshot — or before the first confirmation — it can still
-    /// be 0 while the chain is far ahead. Requesting from view 1 then floods
-    /// peers whose sync ring cannot reach that far back, so the committed
-    /// blocks never execute and the head wedges (re-audit F2). Fall back to the
-    /// restored committed QC view so the request targets the actual gap.
+    /// Floor view for an execution-lineage catch-up request.
+    ///
+    /// Only the execution-validated view is a sound floor. In particular, a
+    /// joining validator can learn and commit a descendant before it has the
+    /// ancestor payloads; using `last_commit_qc.view` in that case skips the
+    /// exact lineage it needs. Restart recovery seeds this field from a
+    /// view/hash pair proven against reth's canonical head, so recovered nodes
+    /// still start from their durable execution floor.
     pub(super) fn execution_catchup_floor(&self) -> u64 {
-        if self.execution_validated_head_view > 0 {
-            self.execution_validated_head_view
-        } else {
-            self.last_commit_qc.as_ref().map(|qc| qc.view).unwrap_or(0)
-        }
+        self.execution_validated_head_view
     }
 
     /// Advances the local payload-building head only after reth has confirmed the

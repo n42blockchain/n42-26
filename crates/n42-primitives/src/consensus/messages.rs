@@ -42,14 +42,14 @@ pub type ViewNumber = u64;
 pub type ValidatorIndex = u32;
 
 /// A quorum certificate: aggregated BLS signature + signer bitmap.
-/// Proves that 2f+1 validators signed a particular message.
+/// Proves that n-f validators from the active set signed a particular message.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct QuorumCertificate {
     /// The view this QC was formed in.
     pub view: ViewNumber,
     /// Block hash that was voted on.
     pub block_hash: B256,
-    /// Aggregated BLS signature from 2f+1 validators.
+    /// Aggregated BLS signature from n-f validators.
     pub aggregate_signature: BlsSignature,
     /// Bitmap indicating which validators signed (1 bit per validator).
     #[serde(with = "packed_bits")]
@@ -81,7 +81,7 @@ impl QuorumCertificate {
     }
 }
 
-/// A timeout certificate: proves that 2f+1 validators timed out in a given view.
+/// A timeout certificate: proves that n-f validators timed out in a given view.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TimeoutCertificate {
     /// The view that timed out.
@@ -223,7 +223,7 @@ pub struct Decide {
     pub view: ViewNumber,
     /// Block hash that was committed.
     pub block_hash: B256,
-    /// The CommitQC that proves 2f+1 validators committed.
+    /// The CommitQC that proves n-f validators committed.
     pub commit_qc: QuorumCertificate,
     /// Blake3 hash of the serialized `validator_changes` from the Proposal.
     /// Non-zero when the committed Proposal carried validator changes.
@@ -237,12 +237,16 @@ pub struct Decide {
 }
 
 /// Current consensus protocol wire format version.
-/// Increment when making breaking changes to message formats.
+/// Increment for wire-format or consensus-rule changes that make mixed-version
+/// validator operation unsafe.
 // v3 (HotStuff-2 audit Plan #2): R2 commit-vote signing message now includes
 //     the proposal's `validator_changes_hash`. Old nodes signing under the v2
 //     46-byte format will fail BLS verification on new nodes — this is a
 //     wire-format breaking change requiring a coordinated upgrade.
-pub const CONSENSUS_PROTOCOL_VERSION: u16 = 3;
+// v4: QC/TC quorum changed from 2f+1 to n-f. The wire payload is unchanged,
+//     but mixed v3/v4 validators can disagree on certificate validity whenever
+//     n != 3f+1, so deployment still requires a coordinated upgrade.
+pub const CONSENSUS_PROTOCOL_VERSION: u16 = 4;
 
 /// Versioned wrapper for consensus messages on the wire.
 ///

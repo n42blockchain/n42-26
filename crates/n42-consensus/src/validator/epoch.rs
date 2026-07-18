@@ -642,7 +642,7 @@ impl EpochManager {
 
     /// Validates that a proposed new validator set satisfies safety invariants:
     /// - At least MIN_VALIDATOR_COUNT validators.
-    /// - The intersection of current and new address sets is ≥ current quorum_size (2f+1),
+    /// - The intersection of current and new address sets is ≥ current quorum_size (n-f),
     ///   ensuring the Jolteon §4.3 quorum-overlap liveness property.
     ///
     /// Accepts the pre-built `new_validators` slice to avoid a redundant
@@ -669,7 +669,7 @@ impl EpochManager {
                 overlap += 1;
             }
         }
-        let required = self.current_set.quorum_size(); // 2f+1
+        let required = self.current_set.quorum_size(); // n-f of the active set
         if overlap < required {
             return Err(ConsensusError::InsufficientQuorumOverlap {
                 have: overlap,
@@ -795,6 +795,35 @@ mod tests {
 
         // Historical epoch (0) should use old set
         assert_eq!(em.validator_set_for_view(5).len(), 4);
+    }
+
+    #[test]
+    fn test_historical_qc_uses_historical_n_minus_f_quorum() {
+        use crate::protocol::quorum::{VoteCollector, signing_message, verify_qc};
+
+        let old_infos = make_validator_infos(5);
+        let new_infos = old_infos[..4].to_vec();
+        let old_set = ValidatorSet::new(&old_infos, 1);
+        let mut em = EpochManager::with_epoch_length(old_set, 10);
+        em.stage_next_epoch(&new_infos, 1).unwrap();
+        assert!(em.advance_epoch());
+
+        let historical_set = em.validator_set_for_view(5);
+        assert_eq!(historical_set.len(), 5);
+        assert_eq!(historical_set.quorum_size(), 4);
+        assert_eq!(em.validator_set_for_view(11).quorum_size(), 3);
+
+        let block_hash = alloy_primitives::B256::repeat_byte(0xE5);
+        let msg = signing_message(5, &block_hash);
+        let mut collector = VoteCollector::new(5, block_hash, historical_set.len());
+        for i in 0..4u32 {
+            collector
+                .add_vote(i, test_key(0x50 + i as u8).sign(&msg))
+                .unwrap();
+        }
+
+        let qc = collector.build_qc(historical_set).unwrap();
+        verify_qc(&qc, em.validator_set_for_view(qc.view)).unwrap();
     }
 
     #[test]
@@ -1012,19 +1041,29 @@ mod tests {
 
     #[test]
     fn test_validate_transition_quorum_overlap() {
-        // 4 validators (f=1, quorum=3). New set must overlap ≥ 3 with current.
-        let infos = make_validator_infos(4); // addresses 0x00..0x03
+        // 5 validators (f=1, quorum=n-f=4). This specifically guards against
+        // the old 2f+1 threshold, which would have accepted only 3 overlaps.
+        let infos = make_validator_infos(5); // addresses 0x00..0x04
         let vs = ValidatorSet::new(&infos, 1);
         let em = EpochManager::with_epoch_length(vs, 10);
 
-        // New set: keep only 0x00 (overlap=1 < 3) — should fail
+        // New set: keep 0x00..0x02 (overlap=3 < 4) — should fail.
         let sk0 = test_key(0x60);
         let sk1 = test_key(0x61);
-        let sk2 = test_key(0x62);
         let completely_new: Vec<ValidatorInfo> = vec![
             ValidatorInfo {
                 address: Address::with_last_byte(0),
                 bls_public_key: infos[0].bls_public_key.clone(),
+                p2p_peer_id: None,
+            },
+            ValidatorInfo {
+                address: Address::with_last_byte(1),
+                bls_public_key: infos[1].bls_public_key.clone(),
+                p2p_peer_id: None,
+            },
+            ValidatorInfo {
+                address: Address::with_last_byte(2),
+                bls_public_key: infos[2].bls_public_key.clone(),
                 p2p_peer_id: None,
             },
             ValidatorInfo {
@@ -1037,22 +1076,17 @@ mod tests {
                 bls_public_key: sk1.public_key(),
                 p2p_peer_id: None,
             },
-            ValidatorInfo {
-                address: Address::with_last_byte(0x22),
-                bls_public_key: sk2.public_key(),
-                p2p_peer_id: None,
-            },
         ];
         let err = em.validate_transition(&completely_new).unwrap_err();
         assert!(
             matches!(
                 err,
-                ConsensusError::InsufficientQuorumOverlap { have: 1, need: 3 }
+                ConsensusError::InsufficientQuorumOverlap { have: 3, need: 4 }
             ),
             "unexpected error: {err}"
         );
 
-        // New set: keep 0x00..0x02 (overlap=3 == 3) — should succeed
+        // New set: keep 0x00..0x03 (overlap=4 == 4) — should succeed.
         let sk3 = test_key(0x63);
         let valid_new: Vec<ValidatorInfo> = vec![
             ValidatorInfo {
@@ -1068,6 +1102,11 @@ mod tests {
             ValidatorInfo {
                 address: Address::with_last_byte(2),
                 bls_public_key: infos[2].bls_public_key.clone(),
+                p2p_peer_id: None,
+            },
+            ValidatorInfo {
+                address: Address::with_last_byte(3),
+                bls_public_key: infos[3].bls_public_key.clone(),
                 p2p_peer_id: None,
             },
             ValidatorInfo {
@@ -1287,8 +1326,8 @@ mod tests {
         let vs = ValidatorSet::new(&infos, 2); // f=2, quorum=5
 
         // Each reduction is a separate epoch to ensure quorum overlap is satisfied.
-        // overlap required = current quorum_size = 2f+1
-        // After 7→6: f=1, quorum=4; after 6→5: f=1, quorum=4; after 5→4: f=1, quorum=3.
+        // overlap required = current quorum_size = n-f
+        // After 7→6: f=1, quorum=5; after 6→5: f=1, quorum=4; after 5→4: f=1, quorum=3.
 
         // ── Epoch 0: 7 validators → remove one → stage 6 ──
         let mut em = EpochManager::with_epoch_length(vs, 10);

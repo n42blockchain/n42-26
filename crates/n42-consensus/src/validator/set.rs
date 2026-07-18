@@ -86,10 +86,14 @@ impl ValidatorSet {
         self.validators.is_empty()
     }
 
-    /// Returns the quorum size: 2f + 1.
-    /// Uses u64 arithmetic internally to prevent overflow when f is large.
+    /// Returns the authoritative consensus quorum size: `n - f`.
+    ///
+    /// Unlike `2f + 1`, this remains safe when a dynamic validator set has a
+    /// valid size greater than `3f + 1`.
     pub fn quorum_size(&self) -> usize {
-        (2u64 * self.fault_tolerance as u64 + 1) as usize
+        self.validators
+            .len()
+            .saturating_sub(self.fault_tolerance as usize)
     }
 
     /// Returns the fault tolerance f.
@@ -198,6 +202,18 @@ mod tests {
         assert_eq!(vs.fault_tolerance(), 1);
         assert_eq!(vs.quorum_size(), 3);
         assert!(!vs.is_empty());
+    }
+
+    #[test]
+    fn test_quorum_size_uses_active_validator_count() {
+        let test_cases = [(4, 3), (5, 4), (7, 5), (10, 7), (21, 15)];
+
+        for (n, expected_quorum) in test_cases {
+            let infos: Vec<_> = (0..n).map(|i| make_validator_info(i as u8).1).collect();
+            let f = ValidatorSet::max_fault_tolerance_for_len(n);
+            let vs = ValidatorSet::new(&infos, f);
+            assert_eq!(vs.quorum_size(), expected_quorum, "n-f quorum for n={n}");
+        }
     }
 
     #[test]

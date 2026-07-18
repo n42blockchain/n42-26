@@ -161,9 +161,12 @@ impl ConsensusConfig {
         bytes
     }
 
-    /// Returns the quorum size (2f+1).
+    /// Returns the consensus quorum size (`n - f`) for the configured validator set.
+    ///
+    /// `n - f` is equal to `2f + 1` only when `n = 3f + 1`. Dynamic validator
+    /// sets may have any valid size, so deriving quorum from `f` alone is unsafe.
     pub fn quorum_size(&self) -> u32 {
-        2 * self.fault_tolerance + 1
+        self.validator_set_size.saturating_sub(self.fault_tolerance)
     }
 
     /// Validates that the configuration is internally consistent.
@@ -253,7 +256,7 @@ impl ConsensusConfig {
     /// Recommended `(slot_time_ms, base_timeout_ms, max_timeout_ms)` for a given network topology.
     ///
     /// Based on HotStuff-2 two-round protocol and real-world RTT measurements:
-    /// - Quorum = 2f+1, only needs the (2f+1)-th fastest validator to respond
+    /// - Quorum = n-f, only needs the (n-f)-th fastest validator to respond
     /// - Total consensus ≈ 2.5 × quorum_RTT (2 rounds + Decide broadcast)
     ///
     /// ```text
@@ -510,27 +513,17 @@ mod tests {
 
     #[test]
     fn test_consensus_config_quorum_size() {
-        // With fault_tolerance = 1, quorum_size = 2*1+1 = 3.
-        let mut config = ConsensusConfig::dev();
-        config.fault_tolerance = 1;
-        assert_eq!(
-            config.quorum_size(),
-            3,
-            "quorum size should be 2f+1 = 3 when f=1"
-        );
+        let test_cases = [(4, 1, 3), (5, 1, 4), (7, 2, 5), (10, 3, 7), (21, 6, 15)];
 
-        // With fault_tolerance = 0, quorum_size = 1.
-        let config0 = ConsensusConfig::dev();
-        assert_eq!(config0.quorum_size(), 1, "quorum size should be 1 when f=0");
-
-        // With fault_tolerance = 3, quorum_size = 7.
-        let mut config3 = ConsensusConfig::dev();
-        config3.fault_tolerance = 3;
-        assert_eq!(
-            config3.quorum_size(),
-            7,
-            "quorum size should be 2f+1 = 7 when f=3"
-        );
+        for (n, expected_f, expected_quorum) in test_cases {
+            let config = ConsensusConfig::dev_multi(n);
+            assert_eq!(config.fault_tolerance, expected_f, "f for n={n}");
+            assert_eq!(
+                config.quorum_size(),
+                expected_quorum,
+                "n-f quorum for n={n}"
+            );
+        }
     }
 
     #[test]
@@ -611,7 +604,7 @@ mod tests {
     fn test_consensus_config_dev_multi_4() {
         let config = ConsensusConfig::dev_multi(4);
         assert_eq!(config.fault_tolerance, 1); // (4-1)/3 = 1
-        assert_eq!(config.quorum_size(), 3); // 2*1+1 = 3
+        assert_eq!(config.quorum_size(), 3); // n-f = 4-1 = 3
         assert!(config.validate().is_ok());
     }
 
@@ -961,14 +954,14 @@ epoch_length = 0
 
     #[test]
     fn test_dev_multi_7_and_10_validators() {
-        // n=7: f=(7-1)/3=2, quorum=2*2+1=5, need 3*2+1=7 ≤ 7 → valid
+        // n=7: f=(7-1)/3=2, quorum=n-f=5, need 3*2+1=7 ≤ 7 → valid
         let c7 = ConsensusConfig::dev_multi(7);
         assert_eq!(c7.fault_tolerance, 2);
         assert_eq!(c7.quorum_size(), 5);
         assert_eq!(c7.initial_validators.len(), 7);
         assert!(c7.validate().is_ok(), "7-validator config should be valid");
 
-        // n=10: f=(10-1)/3=3, quorum=2*3+1=7, need 3*3+1=10 ≤ 10 → valid
+        // n=10: f=(10-1)/3=3, quorum=n-f=7, need 3*3+1=10 ≤ 10 → valid
         let c10 = ConsensusConfig::dev_multi(10);
         assert_eq!(c10.fault_tolerance, 3);
         assert_eq!(c10.quorum_size(), 7);

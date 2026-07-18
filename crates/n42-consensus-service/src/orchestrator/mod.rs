@@ -582,18 +582,10 @@ impl ConsensusService {
     }
 
     fn quorum_peers_needed(&self) -> usize {
-        let validator_count = self.engine.validator_count();
-        let quorum_size = self.engine.quorum_size();
-        if validator_count > 1 && quorum_size == 1 {
-            // Multi-validator f=0 configurations promise no fault tolerance:
-            // every validator is required. Letting the initial leader build
-            // with zero peers makes sequential startup produce a block that
-            // later validators cannot have received, forcing an avoidable
-            // execution-lineage catch-up and a full pacemaker timeout.
-            validator_count.saturating_sub(1) as usize
-        } else {
-            quorum_size.saturating_sub(1)
-        }
+        // The leader contributes its own vote, so it needs n-f-1 connected
+        // validator peers before building. This also makes f=0 multi-validator
+        // sets wait for every other validator.
+        self.engine.quorum_size().saturating_sub(1)
     }
 
     fn has_quorum_peers(&self) -> bool {
@@ -3238,10 +3230,12 @@ mod tests {
         let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
         let mut orch = ConsensusService::new(engine, network, net_event_rx, output_rx);
 
-        assert_eq!(orch.quorum_peers_needed(), 2);
-        orch.connected_peers.insert(mock_peers[0].1);
+        assert_eq!(orch.quorum_peers_needed(), 5);
+        for (_, peer_id) in mock_peers.iter().take(4) {
+            orch.connected_peers.insert(*peer_id);
+        }
         assert!(!orch.has_quorum_peers());
-        orch.connected_peers.insert(mock_peers[2].1);
+        orch.connected_peers.insert(mock_peers[4].1);
         assert!(orch.has_quorum_peers());
     }
 
@@ -3887,12 +3881,10 @@ mod tests {
         assert!(orch.sync_requested_peers.contains(&expected_peer));
     }
 
-    /// T3 (F2): after a restart the execution-validated view is 0 while the
-    /// chain is far ahead. A committed block awaiting an execution ancestor
-    /// must derive its catch-up floor from the recovered committed QC view, not
-    /// view 1 (which would flood peers whose sync ring cannot reach that far).
+    /// T3 (F2): restart recovery seeds the execution floor from a view/hash pair
+    /// proven against reth's canonical head. Catch-up must preserve that floor.
     #[tokio::test(flavor = "current_thread")]
-    async fn post_restart_catchup_floor_uses_recovered_committed_view() {
+    async fn post_restart_catchup_floor_uses_recovered_execution_view() {
         let (engine, output_rx) = make_test_engine();
         let (network, mut cmd_rx, _prx) = make_test_network();
         let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
@@ -3901,7 +3893,7 @@ mod tests {
         let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
         orch.connected_peers.insert(peer);
         orch.head_block_hash = B256::repeat_byte(0x11);
-        orch.execution_validated_head_view = 0; // reset by the restart
+        orch = orch.with_recovered_execution_validated_head(100);
 
         let mut recovered = QuorumCertificate::genesis();
         recovered.view = 100;
@@ -3926,6 +3918,51 @@ mod tests {
                 assert_eq!(
                     request.from_view, 101,
                     "floor derives from the recovered committed view (100), not 1"
+                );
+            }
+            other => panic!("unexpected network command: {other:?}"),
+        }
+    }
+
+    /// A joining validator may receive a Decide for a descendant before it has
+    /// any ancestor payloads. Its newly learned commit view is not an execution
+    /// floor: catch-up must start after genesis so the missing lineage is not
+    /// skipped.
+    #[tokio::test(flavor = "current_thread")]
+    async fn fresh_joiner_catchup_does_not_use_learned_commit_view_as_floor() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, mut cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let peer = n42_network::PeerId::random();
+        let waiting = B256::repeat_byte(0x32);
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
+        orch.connected_peers.insert(peer);
+        orch.head_block_hash = B256::repeat_byte(0x31);
+        orch.execution_validated_head_view = 0;
+
+        let mut learned = QuorumCertificate::genesis();
+        learned.view = 3;
+        orch.last_commit_qc = Some(learned);
+        orch.committed_blocks.push_back(CommittedBlock {
+            view: 3,
+            block_hash: waiting,
+            commit_qc: QuorumCertificate::genesis(),
+            payload: Vec::new(),
+            validator_changes: None,
+        });
+
+        orch.handle_import_done(waiting, 3, ImportOutcome::Syncing, 0)
+            .await;
+
+        let command = tokio::time::timeout(Duration::from_secs(1), cmd_rx.recv())
+            .await
+            .expect("a catch-up sync command should be sent")
+            .expect("network command channel should remain open");
+        match command {
+            NetworkCommand::RequestSync { request, .. } => {
+                assert_eq!(
+                    request.from_view, 1,
+                    "a fresh joiner must request ancestors after its execution floor"
                 );
             }
             other => panic!("unexpected network command: {other:?}"),
