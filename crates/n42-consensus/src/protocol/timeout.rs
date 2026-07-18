@@ -2,7 +2,7 @@ use n42_primitives::consensus::{ConsensusMessage, NewView, TimeoutMessage};
 
 use super::quorum::{TimeoutCollector, newview_signing_message, timeout_signing_message};
 use super::round::Phase;
-use super::state_machine::{ConsensusEngine, EngineOutput, FUTURE_VIEW_WINDOW};
+use super::state_machine::{ConsensusEngine, EngineOutput};
 use crate::error::{ConsensusError, ConsensusResult};
 use crate::validator::LeaderSelector;
 
@@ -34,8 +34,7 @@ impl ConsensusEngine {
                 reason: "genesis QC rejected: local locked_qc has already advanced".to_string(),
             });
         }
-        let changes_hash = self.cached_changes_hash(&qc.block_hash);
-        super::quorum::verify_qc_any_domain(qc, self.resolve_qc_validator_set(qc), &changes_hash)
+        self.verify_qc_any_domain_or_known(qc)
     }
 
     /// Handles a view timeout triggered by the pacemaker.
@@ -130,7 +129,10 @@ impl ConsensusEngine {
         self.process_timeout(timeout_msg)
     }
 
-    /// Processes a timeout message (current or future view).
+    /// Processes a timeout message for the current view.
+    ///
+    /// Future timeouts are buffered by `process_message`; a single validator's
+    /// timeout is never sufficient evidence to advance the local view.
     pub(super) fn process_timeout(&mut self, timeout: TimeoutMessage) -> ConsensusResult<()> {
         let view = self.round_state.current_view();
 
@@ -139,7 +141,13 @@ impl ConsensusEngine {
         }
 
         if timeout.view > view {
-            return self.handle_future_view_timeout(view, timeout);
+            tracing::debug!(target: "n42::cl::timeout",
+                current_view = view,
+                timeout_view = timeout.view,
+                sender = timeout.sender,
+                "ignoring directly-dispatched future timeout without a quorum TC"
+            );
+            return Ok(());
         }
 
         // Current-view timeout processing.
@@ -196,113 +204,6 @@ impl ConsensusEngine {
         }
 
         Ok(())
-    }
-
-    /// Handles a timeout from a future view: verifies, advances, and re-broadcasts.
-    fn handle_future_view_timeout(
-        &mut self,
-        current_view: u64,
-        timeout: TimeoutMessage,
-    ) -> ConsensusResult<()> {
-        if timeout.view > current_view + FUTURE_VIEW_WINDOW {
-            return Ok(());
-        }
-
-        // Verify BLS signature BEFORE advancing to prevent unauthenticated view jumps.
-        let timeout_set = self.validator_set_for_view(timeout.view);
-        let n_validators = timeout_set.len();
-        let pk = timeout_set.get_public_key(timeout.sender)?;
-        let msg = timeout_signing_message(timeout.view);
-        pk.verify_prevalidated(&msg, &timeout.signature)
-            .map_err(|_| ConsensusError::InvalidSignature {
-                view: timeout.view,
-                validator_index: timeout.sender,
-            })?;
-
-        // Verify the embedded high_qc to prevent Byzantine validators from injecting
-        // forged QCs via future-view timeouts.
-        self.verify_embedded_qc(&timeout.high_qc).map_err(|e| {
-            tracing::warn!(target: "n42::cl::timeout", current_view, timeout_view = timeout.view, sender = timeout.sender,
-                qc_view = timeout.high_qc.view,
-                "rejecting future timeout with invalid high_qc: {e}");
-            e
-        })?;
-
-        let last_committed_view = self.round_state.last_committed_qc().view;
-        if timeout.high_qc.view > last_committed_view.saturating_add(3) {
-            self.emit(EngineOutput::SyncRequired {
-                local_view: last_committed_view,
-                target_view: timeout.high_qc.view,
-            })?;
-        }
-
-        tracing::info!(target: "n42::cl::timeout",
-            current_view,
-            timeout_view = timeout.view,
-            sender = timeout.sender,
-            "advancing to higher timeout view for synchronization"
-        );
-
-        self.advance_to_view(timeout.view)?;
-        self.round_state.timeout();
-
-        // Second reset: advance_to_view resets with consecutive_timeouts=0, but timeout()
-        // just incremented the counter. This applies the correct exponential backoff.
-        self.pacemaker
-            .reset_for_view(timeout.view, self.round_state.consecutive_timeouts());
-
-        // Conditional creation: advance_to_view may have replayed buffered messages that
-        // already created and populated a timeout_collector. Overwriting would lose those.
-        if self
-            .timeout_collector
-            .as_ref()
-            .is_none_or(|tc| tc.view() != timeout.view)
-        {
-            self.timeout_collector = Some(TimeoutCollector::new(timeout.view, n_validators));
-        }
-
-        if let Some(ref mut collector) = self.timeout_collector {
-            match collector.add_verified_timeout(
-                timeout.sender,
-                timeout.signature.clone(),
-                timeout.high_qc.clone(),
-            ) {
-                Ok(()) => {}
-                Err(ConsensusError::DuplicateVote { .. }) => {
-                    tracing::debug!(target: "n42::cl::timeout",
-                        view = timeout.view,
-                        sender = timeout.sender,
-                        "ignoring duplicate timeout (GossipSub multi-path)"
-                    );
-                }
-                Err(e) => return Err(e),
-            }
-        }
-
-        if !self.is_local_validator_active_for_view(timeout.view) {
-            tracing::info!(
-                target: "n42::cl::timeout",
-                timeout_view = timeout.view,
-                my_index = self.my_index,
-                "local validator not active for synchronized timeout view; skipping timeout rebroadcast"
-            );
-            return Ok(());
-        }
-
-        // Broadcast our own timeout so other nodes can converge and form a TC.
-        let own_msg = timeout_signing_message(timeout.view);
-        let own_sig = self.secret_key.sign(&own_msg);
-        let own_timeout = TimeoutMessage {
-            view: timeout.view,
-            high_qc: self.round_state.locked_qc().clone(),
-            sender: self.my_index,
-            signature: own_sig,
-        };
-        self.emit(EngineOutput::BroadcastMessage(ConsensusMessage::Timeout(
-            own_timeout.clone(),
-        )))?;
-
-        self.process_timeout(own_timeout)
     }
 
     /// Processes a NewView message from the new leader.

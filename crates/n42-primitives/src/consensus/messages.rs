@@ -43,7 +43,7 @@ pub type ValidatorIndex = u32;
 
 /// A quorum certificate: aggregated BLS signature + signer bitmap.
 /// Proves that n-f validators from the active set signed a particular message.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QuorumCertificate {
     /// The view this QC was formed in.
     pub view: ViewNumber,
