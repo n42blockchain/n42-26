@@ -35,6 +35,10 @@ pub struct RoundState {
     /// Persisted to disk so that after a crash the node will not vote twice
     /// in the same view (fundamental BFT safety invariant).
     last_voted_view: ViewNumber,
+    /// The last view in which this node cast a Round-2 commit vote.
+    /// Persisted independently from R1 because a validator may crash between
+    /// the two phases and must not sign a conflicting CommitVote after restart.
+    last_commit_voted_view: ViewNumber,
 }
 
 impl RoundState {
@@ -47,6 +51,7 @@ impl RoundState {
             last_committed_qc: genesis_qc,
             consecutive_timeouts: 0,
             last_voted_view: 0,
+            last_commit_voted_view: 0,
         }
     }
 
@@ -60,6 +65,7 @@ impl RoundState {
         last_committed_qc: QuorumCertificate,
         consecutive_timeouts: u32,
         last_voted_view: ViewNumber,
+        last_commit_voted_view: ViewNumber,
     ) -> Self {
         Self {
             current_view: view,
@@ -68,6 +74,7 @@ impl RoundState {
             last_committed_qc,
             consecutive_timeouts,
             last_voted_view,
+            last_commit_voted_view,
         }
     }
 
@@ -95,6 +102,10 @@ impl RoundState {
         self.last_voted_view
     }
 
+    pub fn last_commit_voted_view(&self) -> ViewNumber {
+        self.last_commit_voted_view
+    }
+
     /// Returns `true` if this node has NOT yet voted in the given view.
     /// After returning `true`, the caller MUST call `record_vote(view)` before
     /// actually broadcasting the vote, to prevent double-voting after a crash.
@@ -110,6 +121,20 @@ impl RoundState {
             "record_vote called without may_vote_in guard"
         );
         self.last_voted_view = view;
+    }
+
+    /// Returns `true` if this node has not cast an R2 commit vote in `view`.
+    pub fn may_commit_vote_in(&self, view: ViewNumber) -> bool {
+        view > self.last_commit_voted_view
+    }
+
+    /// Records an R2 commit vote before its signature is produced.
+    pub fn record_commit_vote(&mut self, view: ViewNumber) {
+        debug_assert!(
+            view > self.last_commit_voted_view,
+            "record_commit_vote called without may_commit_vote_in guard"
+        );
+        self.last_commit_voted_view = view;
     }
 
     pub fn enter_voting(&mut self) {

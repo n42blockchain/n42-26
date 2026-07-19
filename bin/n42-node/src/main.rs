@@ -499,44 +499,32 @@ fn main() {
         let snapshot = match persistence::load_consensus_state(&state_file) {
             Ok(snap) => snap,
             Err(e) => {
-                warn!(
-                    target: "n42::cli",
-                    path = %state_file.display(),
-                    error = %e,
-                    "failed to load consensus snapshot, starting fresh"
-                );
-                None
+                return Err(eyre::eyre!(
+                    "failed to load consensus snapshot {}: {e}",
+                    state_file.display()
+                ));
             }
         };
 
-        // Open the durable vote log. fsync'd before every R1 vote so a crash
+        // Open the durable vote log. fsync'd before every R1/R2 vote so a crash
         // after signing cannot drop the recorded view (HotStuff-2 paper
         // safety invariant — see crates/n42-consensus/src/vote_log.rs).
         let vote_log_path = data_dir.join("vote_log.bin");
-        let vote_log: std::sync::Arc<dyn n42_consensus::VoteLogWriter> =
-            match persistence::FileVoteLog::open(vote_log_path.clone()) {
-                Ok(log) => std::sync::Arc::new(log),
-                Err(e) => {
-                    warn!(
-                        target: "n42::cli",
-                        path = %vote_log_path.display(),
-                        error = %e,
-                        "failed to open vote log, falling back to NoopVoteLog (R1 votes will not be \
-                         crash-durable; do not run in production)"
-                    );
-                    std::sync::Arc::new(n42_consensus::NoopVoteLog)
-                }
-            };
-        let last_voted_view_from_disk = persistence::load_last_voted_view(&vote_log_path)
-            .unwrap_or_else(|e| {
-                warn!(
-                    target: "n42::cli",
-                    path = %vote_log_path.display(),
-                    error = %e,
-                    "failed to read last_voted_view from vote log, defaulting to 0"
-                );
-                0
-            });
+        let vote_log: std::sync::Arc<dyn n42_consensus::VoteLogWriter> = std::sync::Arc::new(
+            persistence::FileVoteLog::open(vote_log_path.clone()).map_err(|e| {
+                eyre::eyre!(
+                    "failed to open crash-safe vote log {}: {e}",
+                    vote_log_path.display()
+                )
+            })?,
+        );
+        let (last_voted_view_from_disk, last_commit_voted_view_from_disk) =
+            persistence::load_last_vote_views(&vote_log_path).map_err(|e| {
+                eyre::eyre!(
+                    "failed to read crash-safe vote log {}: {e}",
+                    vote_log_path.display()
+                )
+            })?;
 
         let initial_validator_infos = initial_validator_set.validator_infos();
         let startup_epoch_manager = build_epoch_manager(
@@ -1375,6 +1363,9 @@ fn main() {
                     // may be ahead if the snapshot was written before the latest
                     // vote, while the snapshot may be ahead on a fresh datadir.
                     let lvv = snapshot.last_voted_view.max(last_voted_view_from_disk);
+                    let lcvv = snapshot
+                        .last_commit_voted_view
+                        .max(last_commit_voted_view_from_disk);
                     ConsensusEngine::with_recovered_state_and_vote_log(
                         my_index,
                         secret_key,
@@ -1387,9 +1378,17 @@ fn main() {
                         snapshot.last_committed_qc,
                         snapshot.consecutive_timeouts,
                         lvv,
+                        lcvv,
                         vote_log.clone(),
                     )
                 } else {
+                    if last_voted_view_from_disk != 0 || last_commit_voted_view_from_disk != 0 {
+                        return Err(eyre::eyre!(
+                            "vote log records R1 view {} / R2 view {} but no consensus snapshot exists; refusing unsafe fresh start",
+                            last_voted_view_from_disk,
+                            last_commit_voted_view_from_disk
+                        ));
+                    }
                     info!(target: "n42::cli", "no consensus snapshot found, starting fresh");
                     ConsensusEngine::with_epoch_manager_and_vote_log(
                         my_index,
