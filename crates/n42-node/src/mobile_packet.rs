@@ -14,7 +14,10 @@ use reth_primitives_traits::{BlockBody, NodePrimitives};
 use reth_provider::BlockHashReader;
 use reth_storage_api::{BlockReader, StateProviderFactory, TransactionVariant};
 use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
@@ -112,6 +115,7 @@ pub async fn mobile_packet_loop<P>(
     provider: P,
     chain_spec: Arc<ChainSpec>,
     hub_handle: ShardedStarHubHandle,
+    sidecar_healthy: Arc<AtomicBool>,
     mut phone_connected_rx: mpsc::Receiver<u64>,
     dispatched_block_tx: Option<mpsc::Sender<DispatchedBlockRoot>>,
 ) where
@@ -132,6 +136,15 @@ pub async fn mobile_packet_loop<P>(
         tokio::select! {
             commit = rx.recv() => {
                 let Some((block_hash, _view)) = commit else { break };
+                if !sidecar_healthy.load(Ordering::Acquire) {
+                    metrics::counter!("n42_mobile_packet_suppressed_unhealthy_sidecar_total")
+                        .increment(1);
+                    warn!(
+                        %block_hash,
+                        "mobile packet suppressed while Twig sidecar is unhealthy"
+                    );
+                    continue;
+                }
                 debug!(%block_hash, "generating mobile stream packet");
 
                 let mut last_err = None;
@@ -178,6 +191,12 @@ pub async fn mobile_packet_loop<P>(
             }
 
             Some(session_id) = phone_connected_rx.recv() => {
+                if !sidecar_healthy.load(Ordering::Acquire) {
+                    metrics::counter!("n42_mobile_cache_sync_suppressed_unhealthy_sidecar_total")
+                        .increment(1);
+                    warn!(session_id, "mobile cache sync suppressed while Twig sidecar is unhealthy");
+                    continue;
+                }
                 if previously_sent_codes.is_empty() {
                     continue;
                 }
