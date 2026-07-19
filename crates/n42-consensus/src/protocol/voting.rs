@@ -26,6 +26,16 @@ pub(super) fn check_equivocation(
 impl ConsensusEngine {
     /// Processes a Round 1 (Prepare) vote from a validator.
     pub(super) fn process_vote(&mut self, vote: Vote) -> ConsensusResult<()> {
+        self.process_vote_inner(vote, false)
+    }
+
+    /// Processes a vote whose exact message was authenticated by the engine's
+    /// randomized batch verifier.
+    pub(super) fn process_verified_vote(&mut self, vote: Vote) -> ConsensusResult<()> {
+        self.process_vote_inner(vote, true)
+    }
+
+    fn process_vote_inner(&mut self, vote: Vote, signature_verified: bool) -> ConsensusResult<()> {
         let view = self.round_state.current_view();
 
         if vote.view != view {
@@ -44,15 +54,17 @@ impl ConsensusEngine {
             return Ok(());
         }
 
-        let view_set = self.validator_set_for_view(view);
-        let pk = view_set.get_public_key(vote.voter)?;
-        let msg = signing_message(view, &vote.block_hash);
-        pk.verify_prevalidated(&msg, &vote.signature).map_err(|_| {
-            ConsensusError::InvalidSignature {
-                view,
-                validator_index: vote.voter,
-            }
-        })?;
+        if !signature_verified {
+            let view_set = self.validator_set_for_view(view);
+            let pk = view_set.get_public_key(vote.voter)?;
+            let msg = signing_message(view, &vote.block_hash);
+            pk.verify_prevalidated(&msg, &vote.signature).map_err(|_| {
+                ConsensusError::InvalidSignature {
+                    view,
+                    validator_index: vote.voter,
+                }
+            })?;
+        }
 
         // Equivocation check is gated on a verified signature so that an unauthenticated
         // peer cannot poison the tracker against a real voter.
@@ -182,6 +194,20 @@ impl ConsensusEngine {
 
     /// Processes a Round 2 (Commit) vote from a validator.
     pub(super) fn process_commit_vote(&mut self, cv: CommitVote) -> ConsensusResult<()> {
+        self.process_commit_vote_inner(cv, false)
+    }
+
+    /// Processes a commit vote whose exact message was authenticated by the
+    /// engine's randomized batch verifier.
+    pub(super) fn process_verified_commit_vote(&mut self, cv: CommitVote) -> ConsensusResult<()> {
+        self.process_commit_vote_inner(cv, true)
+    }
+
+    fn process_commit_vote_inner(
+        &mut self,
+        cv: CommitVote,
+        signature_verified: bool,
+    ) -> ConsensusResult<()> {
         let view = self.round_state.current_view();
 
         if cv.view != view {
@@ -195,16 +221,18 @@ impl ConsensusEngine {
             return Ok(());
         }
 
-        let view_set = self.validator_set_for_view(view);
-        let pk = view_set.get_public_key(cv.voter)?;
-        let changes_hash = self.cached_changes_hash(&cv.block_hash);
-        let msg = commit_signing_message(view, &cv.block_hash, &changes_hash);
-        pk.verify_prevalidated(&msg, &cv.signature).map_err(|_| {
-            ConsensusError::InvalidSignature {
-                view,
-                validator_index: cv.voter,
-            }
-        })?;
+        if !signature_verified {
+            let view_set = self.validator_set_for_view(view);
+            let pk = view_set.get_public_key(cv.voter)?;
+            let changes_hash = self.cached_changes_hash(&cv.block_hash);
+            let msg = commit_signing_message(view, &cv.block_hash, &changes_hash);
+            pk.verify_prevalidated(&msg, &cv.signature).map_err(|_| {
+                ConsensusError::InvalidSignature {
+                    view,
+                    validator_index: cv.voter,
+                }
+            })?;
+        }
 
         // R2 equivocation check — gated on verified signature, leader-only by design
         // (CommitVotes are sent directly to the leader, not broadcast).

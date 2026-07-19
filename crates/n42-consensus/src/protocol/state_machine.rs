@@ -136,6 +136,25 @@ pub enum ConsensusEvent {
     BlockImported(B256),
 }
 
+/// A vote message whose single-validator BLS signature was verified by the
+/// engine's randomized batch verifier.
+///
+/// Fields are private so callers cannot detach the authentication result from
+/// the exact message that was verified. The orchestrator may inspect the signer
+/// for peer promotion, then must hand the token back to
+/// [`ConsensusEngine::process_authenticated_message`].
+#[derive(Debug)]
+pub struct AuthenticatedConsensusMessage {
+    message: ConsensusMessage,
+    signer: u32,
+}
+
+impl AuthenticatedConsensusMessage {
+    pub fn signer(&self) -> u32 {
+        self.signer
+    }
+}
+
 /// Actions the consensus engine requests from the outer node.
 #[derive(Debug)]
 pub enum EngineOutput {
@@ -577,6 +596,97 @@ impl ConsensusEngine {
         }
     }
 
+    /// Batch-authenticates Round 1 and Round 2 vote messages.
+    ///
+    /// The returned vector is position-aligned with `messages`. A `None` entry
+    /// means the message was not a Vote/CommitVote, names an unknown validator,
+    /// or has an invalid signature. Verification uses randomized coefficients
+    /// and falls back to individual checks only to identify invalid entries.
+    pub fn authenticate_vote_batch(
+        &self,
+        messages: Vec<ConsensusMessage>,
+    ) -> Vec<Option<AuthenticatedConsensusMessage>> {
+        let mut candidates = Vec::with_capacity(messages.len());
+        for (position, message) in messages.iter().enumerate() {
+            match message {
+                ConsensusMessage::Vote(vote) => {
+                    let Ok(public_key) = self
+                        .validator_set_for_view(vote.view)
+                        .get_public_key(vote.voter)
+                    else {
+                        continue;
+                    };
+                    candidates.push((
+                        position,
+                        vote.voter,
+                        signing_message(vote.view, &vote.block_hash).to_vec(),
+                        &vote.signature,
+                        public_key,
+                    ));
+                }
+                ConsensusMessage::CommitVote(commit_vote) => {
+                    let Ok(public_key) = self
+                        .validator_set_for_view(commit_vote.view)
+                        .get_public_key(commit_vote.voter)
+                    else {
+                        continue;
+                    };
+                    let changes_hash = self.cached_changes_hash(&commit_vote.block_hash);
+                    candidates.push((
+                        position,
+                        commit_vote.voter,
+                        commit_signing_message(
+                            commit_vote.view,
+                            &commit_vote.block_hash,
+                            &changes_hash,
+                        )
+                        .to_vec(),
+                        &commit_vote.signature,
+                        public_key,
+                    ));
+                }
+                _ => {}
+            }
+        }
+
+        let signing_messages = candidates
+            .iter()
+            .map(|(_, _, message, _, _)| message.as_slice())
+            .collect::<Vec<_>>();
+        let signatures = candidates
+            .iter()
+            .map(|(_, _, _, signature, _)| *signature)
+            .collect::<Vec<_>>();
+        let public_keys = candidates
+            .iter()
+            .map(|(_, _, _, _, public_key)| *public_key)
+            .collect::<Vec<_>>();
+        let bad = n42_primitives::bls::batch_verify_with_fallback(
+            &signing_messages,
+            &signatures,
+            &public_keys,
+        )
+        .err()
+        .unwrap_or_default()
+        .into_iter()
+        .collect::<HashSet<_>>();
+
+        let mut verified_signers = vec![None; messages.len()];
+        for (candidate_position, (message_position, signer, ..)) in candidates.iter().enumerate() {
+            if !bad.contains(&candidate_position) {
+                verified_signers[*message_position] = Some(*signer);
+            }
+        }
+
+        messages
+            .into_iter()
+            .zip(verified_signers)
+            .map(|(message, signer)| {
+                signer.map(|signer| AuthenticatedConsensusMessage { message, signer })
+            })
+            .collect()
+    }
+
     pub fn epoch_manager(&self) -> &EpochManager {
         &self.epoch_manager
     }
@@ -706,9 +816,26 @@ impl ConsensusEngine {
         }
     }
 
+    /// Processes an exact Vote/CommitVote message authenticated by
+    /// [`Self::authenticate_vote_batch`] without repeating its pairing.
+    pub fn process_authenticated_message(
+        &mut self,
+        authenticated: AuthenticatedConsensusMessage,
+    ) -> ConsensusResult<()> {
+        self.process_message_inner(authenticated.message, Some(authenticated.signer))
+    }
+
     // ── Message dispatch ──
 
     fn process_message(&mut self, msg: ConsensusMessage) -> ConsensusResult<()> {
+        self.process_message_inner(msg, None)
+    }
+
+    fn process_message_inner(
+        &mut self,
+        msg: ConsensusMessage,
+        authenticated_signer: Option<u32>,
+    ) -> ConsensusResult<()> {
         let msg_view = Self::message_view(&msg);
         let current_view = self.round_state.current_view();
 
@@ -750,7 +877,7 @@ impl ConsensusEngine {
                 if self.try_qc_view_jump(&msg, view)? {
                     let new_current = self.round_state.current_view();
                     if view == new_current {
-                        return self.dispatch_message(msg);
+                        return self.dispatch_message(msg, authenticated_signer);
                     } else if view > new_current
                         && view <= new_current + FUTURE_VIEW_WINDOW
                         && self.future_msg_buffer.len() < MAX_FUTURE_MESSAGES
@@ -782,13 +909,23 @@ impl ConsensusEngine {
             return Ok(());
         }
 
-        self.dispatch_message(msg)
+        self.dispatch_message(msg, authenticated_signer)
     }
 
-    fn dispatch_message(&mut self, msg: ConsensusMessage) -> ConsensusResult<()> {
+    fn dispatch_message(
+        &mut self,
+        msg: ConsensusMessage,
+        authenticated_signer: Option<u32>,
+    ) -> ConsensusResult<()> {
         match msg {
             ConsensusMessage::Proposal(p) => self.process_proposal(p),
+            ConsensusMessage::Vote(v) if authenticated_signer == Some(v.voter) => {
+                self.process_verified_vote(v)
+            }
             ConsensusMessage::Vote(v) => self.process_vote(v),
+            ConsensusMessage::CommitVote(cv) if authenticated_signer == Some(cv.voter) => {
+                self.process_verified_commit_vote(cv)
+            }
             ConsensusMessage::CommitVote(cv) => self.process_commit_vote(cv),
             ConsensusMessage::PrepareQC(pqc) => self.process_prepare_qc(pqc),
             ConsensusMessage::Timeout(t) => self.process_timeout(t),
@@ -1014,7 +1151,7 @@ impl ConsensusEngine {
         }
 
         for msg in to_replay {
-            if let Err(e) = self.dispatch_message(msg) {
+            if let Err(e) = self.dispatch_message(msg, None) {
                 tracing::debug!(target: "n42::cl::engine", view = new_view, error = %e, "buffered message replay failed");
             }
         }
@@ -2736,6 +2873,85 @@ mod tests {
         assert_eq!(
             engine.authenticated_signer(&ConsensusMessage::Vote(vote)),
             None
+        );
+    }
+
+    #[test]
+    fn test_vote_batch_authentication_locates_invalid_signature() {
+        let (engine, sks, _, _) = make_engine(4, 0);
+        let view = 1;
+        let block_hash = B256::repeat_byte(0xC3);
+        let signing_message = signing_message(view, &block_hash);
+        let messages = vec![
+            ConsensusMessage::Vote(Vote {
+                view,
+                block_hash,
+                voter: 0,
+                signature: sks[0].sign(&signing_message),
+            }),
+            ConsensusMessage::Vote(Vote {
+                view,
+                block_hash,
+                voter: 1,
+                signature: sks[2].sign(&signing_message),
+            }),
+            ConsensusMessage::Vote(Vote {
+                view,
+                block_hash,
+                voter: 2,
+                signature: sks[2].sign(&signing_message),
+            }),
+        ];
+
+        let authenticated = engine.authenticate_vote_batch(messages);
+        assert_eq!(
+            authenticated[0].as_ref().map(|message| message.signer()),
+            Some(0)
+        );
+        assert!(
+            authenticated[1].is_none(),
+            "wrong-key signature must be isolated"
+        );
+        assert_eq!(
+            authenticated[2].as_ref().map(|message| message.signer()),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn test_authenticated_vote_batch_forms_qc_without_second_verification() {
+        let (mut engine, sks, _, mut rx) = make_engine(4, 1);
+        let view = 1;
+        let block_hash = B256::repeat_byte(0xC4);
+        engine
+            .process_event(ConsensusEvent::BlockReady(block_hash, None))
+            .expect("leader should initialize its vote collector");
+        while rx.try_recv().is_ok() {}
+
+        let signing_message = signing_message(view, &block_hash);
+        let messages = [0u32, 2]
+            .into_iter()
+            .map(|voter| {
+                ConsensusMessage::Vote(Vote {
+                    view,
+                    block_hash,
+                    voter,
+                    signature: sks[voter as usize].sign(&signing_message),
+                })
+            })
+            .collect();
+        let authenticated = engine.authenticate_vote_batch(messages);
+        for message in authenticated.into_iter().flatten() {
+            engine
+                .process_authenticated_message(message)
+                .expect("batch-authenticated vote should process");
+        }
+
+        assert!(
+            std::iter::from_fn(|| rx.try_recv().ok()).any(|output| matches!(
+                output,
+                EngineOutput::BroadcastMessage(ConsensusMessage::PrepareQC(_))
+            ))
         );
     }
 

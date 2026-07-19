@@ -1,7 +1,7 @@
 use alloy_primitives::B256;
 use bitvec::prelude::*;
 use n42_primitives::{
-    bls::{AggregateSignature, BlsPublicKey, BlsSignature},
+    bls::{AggregateSignature, BlsPublicKey, BlsSignature, batch_verify_with_fallback},
     consensus::{QuorumCertificate, TimeoutCertificate, ViewNumber},
 };
 use std::collections::{HashMap, HashSet};
@@ -116,6 +116,7 @@ impl VoteCollector {
 
         let mut valid_sigs: Vec<&BlsSignature> = Vec::with_capacity(self.votes.len());
         let mut signers = bitvec![u8, Msb0; 0; self.set_size as usize];
+        let mut unverified = Vec::with_capacity(self.votes.len());
 
         for (&idx, sig) in &self.votes {
             if idx >= self.set_size {
@@ -136,12 +137,35 @@ impl VoteCollector {
                     continue;
                 }
             };
-            if pk.verify_prevalidated(message, sig).is_err() {
-                tracing::warn!(target: "n42::cl::quorum", view = self.view, idx, "skipping invalid signature in QC build");
-                continue;
+            unverified.push((idx, sig, pk));
+        }
+
+        // Verify the untrusted tail in one randomized multi-pairing. The
+        // primitive falls back to individual verification only when the batch
+        // fails, preserving the old ability to exclude exactly the bad votes.
+        // Random coefficients are generated inside n42-primitives, so a
+        // malicious signer cannot construct cancelling invalid signatures.
+        if !unverified.is_empty() {
+            let messages = vec![message; unverified.len()];
+            let signatures = unverified
+                .iter()
+                .map(|(_, sig, _)| *sig)
+                .collect::<Vec<_>>();
+            let public_keys = unverified.iter().map(|(_, _, pk)| *pk).collect::<Vec<_>>();
+            let bad = batch_verify_with_fallback(&messages, &signatures, &public_keys)
+                .err()
+                .unwrap_or_default()
+                .into_iter()
+                .collect::<HashSet<_>>();
+
+            for (position, (idx, sig, _)) in unverified.into_iter().enumerate() {
+                if bad.contains(&position) {
+                    tracing::warn!(target: "n42::cl::quorum", view = self.view, idx, "skipping invalid signature in QC build");
+                    continue;
+                }
+                valid_sigs.push(sig);
+                signers.set(idx as usize, true);
             }
-            valid_sigs.push(sig);
-            signers.set(idx as usize, true);
         }
 
         if valid_sigs.len() < quorum_size {
@@ -252,6 +276,7 @@ impl TimeoutCollector {
         let mut highest_qc: Option<&QuorumCertificate> = None;
         let mut valid_sigs: Vec<&BlsSignature> = Vec::with_capacity(self.timeouts.len());
         let mut signers = bitvec![u8, Msb0; 0; self.set_size as usize];
+        let mut unverified = Vec::with_capacity(self.timeouts.len());
 
         for (&idx, (sig, high_qc)) in &self.timeouts {
             if idx >= self.set_size {
@@ -275,14 +300,35 @@ impl TimeoutCollector {
                     continue;
                 }
             };
-            if pk.verify_prevalidated(&message, sig).is_err() {
-                tracing::warn!(target: "n42::cl::quorum", view = self.view, idx, "skipping invalid timeout signature in TC build");
-                continue;
-            }
-            valid_sigs.push(sig);
-            signers.set(idx as usize, true);
-            if highest_qc.as_ref().is_none_or(|hq| high_qc.view > hq.view) {
-                highest_qc = Some(high_qc);
+            unverified.push((idx, sig, pk, high_qc));
+        }
+
+        if !unverified.is_empty() {
+            let messages = vec![message.as_slice(); unverified.len()];
+            let signatures = unverified
+                .iter()
+                .map(|(_, sig, _, _)| *sig)
+                .collect::<Vec<_>>();
+            let public_keys = unverified
+                .iter()
+                .map(|(_, _, pk, _)| *pk)
+                .collect::<Vec<_>>();
+            let bad = batch_verify_with_fallback(&messages, &signatures, &public_keys)
+                .err()
+                .unwrap_or_default()
+                .into_iter()
+                .collect::<HashSet<_>>();
+
+            for (position, (idx, sig, _, high_qc)) in unverified.into_iter().enumerate() {
+                if bad.contains(&position) {
+                    tracing::warn!(target: "n42::cl::quorum", view = self.view, idx, "skipping invalid timeout signature in TC build");
+                    continue;
+                }
+                valid_sigs.push(sig);
+                signers.set(idx as usize, true);
+                if highest_qc.as_ref().is_none_or(|hq| high_qc.view > hq.view) {
+                    highest_qc = Some(high_qc);
+                }
             }
         }
 
