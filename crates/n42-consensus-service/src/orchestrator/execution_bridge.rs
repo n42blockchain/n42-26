@@ -277,6 +277,7 @@ impl ConsensusService {
         let build_complete_tx = self.build_complete_tx.clone();
         let block_guard = self.eager_import_block_guard.clone();
         let exec_output_cache = self.exec_output_cache.clone();
+        let bad_blocks = self.bad_blocks.clone();
 
         let handle = tokio::spawn(async move {
             // Allow builder time to pack transactions from the pool.
@@ -310,6 +311,7 @@ impl ConsensusService {
                         current_view,
                         blob_store,
                         exec_output_cache,
+                        bad_blocks,
                         eager_import_done_tx,
                         block_guard,
                         build_start,
@@ -365,6 +367,9 @@ impl ConsensusService {
         };
 
         let hash = broadcast.block_hash;
+        if self.bad_blocks.should_skip(hash, "block_data") {
+            return;
+        }
         let duplicate_bytes = data.len();
         let duplicate = self.pending_block_data.contains_key(&hash);
         self.record_timeout_diag_block_data_received(
@@ -441,6 +446,7 @@ impl ConsensusService {
             let eager_done_tx = self.eager_import_done_tx.clone();
             let block_guard = self.eager_import_block_guard.clone();
             let exec_cache = self.exec_output_cache.clone();
+            let bad_blocks = self.bad_blocks.clone();
             let eager_span = tracing::info_span!(
                 target: "n42.cl.exec_bridge.eager_import",
                 "follower_eager_import",
@@ -461,6 +467,16 @@ impl ConsensusService {
                         Ok(data) => data,
                         Err(_) => return,
                     };
+                if execution_data.block_hash() != hash {
+                    warn!(
+                        target: "n42::cl::exec_bridge",
+                        %hash,
+                        payload_hash = %execution_data.block_hash(),
+                        "block-data envelope hash does not match execution payload; dropping"
+                    );
+                    metrics::counter!("n42_block_data_payload_hash_mismatch_total").increment(1);
+                    return;
+                }
                 let deser_ms = deser_start.elapsed().as_millis() as u64;
                 let ready_to_decode_ms = elapsed_since_unix_ms(leader_ready_unix_ms);
                 if let Some(elapsed) = ready_to_decode_ms {
@@ -484,6 +500,9 @@ impl ConsensusService {
                 // reth pipeline sync and causes chain stalls.
                 let block_number = execution_data.block_number();
                 let tx_count = execution_data.transaction_count();
+                if bad_blocks.should_skip(hash, "block_data_eager") {
+                    return;
+                }
                 let prev = block_guard.fetch_max(block_number, std::sync::atomic::Ordering::SeqCst);
                 if prev >= block_number {
                     info!(target: "n42::cl::exec_bridge", %hash, view, block_number, prev, "follower eager import: skipping duplicate block number");
@@ -586,6 +605,11 @@ impl ConsensusService {
                         }
                     }
                     Ok(status) => {
+                        bad_blocks.insert_if_invalid(
+                            hash,
+                            &status.status,
+                            "block_data_eager",
+                        );
                         debug!(target: "n42::cl::exec_bridge", %hash, view, status = ?status.status, compact_injected, "follower eager import: not accepted");
                         if compact_injected {
                             metrics::counter!("n42_compact_block_cache_misses").increment(1);
@@ -642,10 +666,16 @@ impl ConsensusService {
     }
 
     /// Imports a block via new_payload; queues for retry on Syncing status.
-    pub(super) async fn import_and_notify(&mut self, broadcast: BlockDataBroadcast) {
+    pub(super) async fn import_and_notify(&mut self, broadcast: BlockDataBroadcast) -> bool {
+        if self
+            .bad_blocks
+            .should_skip(broadcast.block_hash, "sync_import")
+        {
+            return false;
+        }
         let engine_handle = match self.el {
             Some(ref el) => el.clone(),
-            None => return,
+            None => return false,
         };
 
         // Update timestamp from the direct field.
@@ -657,16 +687,34 @@ impl ConsensusService {
             Ok(d) => d,
             Err(e) => {
                 warn!(target: "n42::cl::exec_bridge", hash = %broadcast.block_hash, "failed to decompress payload: {e}");
-                return;
+                return false;
             }
         };
-        let execution_data = match serde_json::from_slice(&payload_json) {
+        let execution_data: alloy_rpc_types_engine::ExecutionData = match serde_json::from_slice(
+            &payload_json,
+        ) {
             Ok(data) => data,
             Err(e) => {
                 warn!(target: "n42::cl::exec_bridge", hash = %broadcast.block_hash, "failed to deserialize execution payload: {e}");
-                return;
+                return false;
             }
         };
+        if execution_data.block_hash() != broadcast.block_hash {
+            warn!(
+                target: "n42::cl::exec_bridge",
+                hash = %broadcast.block_hash,
+                payload_hash = %execution_data.block_hash(),
+                "sync envelope hash does not match execution payload; dropping"
+            );
+            metrics::counter!("n42_block_data_payload_hash_mismatch_total").increment(1);
+            return false;
+        }
+        if self
+            .bad_blocks
+            .should_skip(broadcast.block_hash, "sync_import_pre_submit")
+        {
+            return false;
+        }
 
         // Compact Block: load execution output into payload cache before `new_payload`.
         if let Some(ref exec_compressed) = broadcast.execution_output
@@ -681,6 +729,7 @@ impl ConsensusService {
                 if matches!(status.status, PayloadStatusEnum::Valid) {
                     self.handle_valid_import(&broadcast, &engine_handle, &status)
                         .await;
+                    true
                 } else if matches!(
                     status.status,
                     PayloadStatusEnum::Syncing | PayloadStatusEnum::Accepted
@@ -694,17 +743,25 @@ impl ConsensusService {
                         metrics::counter!("n42_new_payload_accepted_total").increment(1);
                     }
                     self.queue_syncing_block(&broadcast);
+                    true
                 } else {
+                    self.bad_blocks.insert_if_invalid(
+                        broadcast.block_hash,
+                        &status.status,
+                        "sync_import",
+                    );
                     warn!(
                         target: "n42::cl::exec_bridge",
                         hash = %broadcast.block_hash,
                         status = ?status.status,
                         "new_payload rejected block"
                     );
+                    false
                 }
             }
             Err(e) => {
                 error!(target: "n42::cl::exec_bridge", hash = %broadcast.block_hash, error = %e, "new_payload failed");
+                false
             }
         }
     }
@@ -845,6 +902,12 @@ impl ConsensusService {
     }
 
     fn queue_syncing_block(&mut self, broadcast: &BlockDataBroadcast) {
+        if self
+            .bad_blocks
+            .should_skip(broadcast.block_hash, "syncing_queue")
+        {
+            return;
+        }
         info!(target: "n42::cl::exec_bridge", hash = %broadcast.block_hash, "new_payload returned Syncing, queuing for retry");
         match bincode::serialize(broadcast) {
             Ok(data) => {
@@ -876,17 +939,38 @@ impl ConsensusService {
                 Err(_) => continue,
             };
             let retry_hash = retry_broadcast.block_hash;
+            if self.bad_blocks.should_skip(retry_hash, "syncing_retry") {
+                continue;
+            }
             let retry_payload = match super::decompress_payload(&retry_broadcast.payload_json) {
                 Ok(d) => d,
                 Err(_) => continue,
             };
-            let retry_exec = match serde_json::from_slice(&retry_payload) {
+            let retry_exec: alloy_rpc_types_engine::ExecutionData = match serde_json::from_slice(
+                &retry_payload,
+            ) {
                 Ok(d) => d,
                 Err(e) => {
                     warn!(target: "n42::cl::exec_bridge", %retry_hash, error = %e, "failed to deserialize retry payload");
                     continue;
                 }
             };
+            if retry_exec.block_hash() != retry_hash {
+                warn!(
+                    target: "n42::cl::exec_bridge",
+                    %retry_hash,
+                    payload_hash = %retry_exec.block_hash(),
+                    "retry envelope hash does not match execution payload; dropping"
+                );
+                metrics::counter!("n42_block_data_payload_hash_mismatch_total").increment(1);
+                continue;
+            }
+            if self
+                .bad_blocks
+                .should_skip(retry_hash, "syncing_retry_pre_submit")
+            {
+                continue;
+            }
 
             // Compact Block: load on retry path too.
             if let Some(ref exec_compressed) = retry_broadcast.execution_output
@@ -976,6 +1060,8 @@ impl ConsensusService {
                     }
                 }
                 Ok(rs) => {
+                    self.bad_blocks
+                        .insert_if_invalid(retry_hash, &rs.status, "syncing_retry");
                     warn!(target: "n42::cl::exec_bridge", %retry_hash, status = ?rs.status, "retry rejected");
                 }
                 Err(e) => {
@@ -1016,6 +1102,7 @@ async fn handle_built_payload(
     current_view: u64,
     blob_store: Option<Arc<dyn BlobStorePort>>,
     exec_output_cache: Option<Arc<dyn ExecutionOutputCache>>,
+    bad_blocks: super::bad_block_cache::BadBlockCache,
     eager_import_done_tx: mpsc::Sender<(B256, u64)>,
     block_guard: Arc<std::sync::atomic::AtomicU64>,
     build_start: Instant,
@@ -1028,6 +1115,19 @@ async fn handle_built_payload(
         execution_data,
         blob_tx_hashes,
     } = built;
+    if execution_data.block_hash() != hash {
+        error!(
+            target: "n42::cl::exec_bridge",
+            %hash,
+            payload_hash = %execution_data.block_hash(),
+            "built payload hash mismatch; refusing to broadcast"
+        );
+        metrics::counter!("n42_built_payload_hash_mismatch_total").increment(1);
+        return;
+    }
+    if bad_blocks.should_skip(hash, "leader_built_payload") {
+        return;
+    }
     {
         let span = tracing::Span::current();
         span.record("hash", tracing::field::display(&hash));
@@ -1113,6 +1213,9 @@ async fn handle_built_payload(
     //
     //    Guard: prevent importing the same block number with different hashes,
     //    which triggers reth pipeline sync and chain stalls.
+    if bad_blocks.should_skip(hash, "leader_eager_import_pre_submit") {
+        return;
+    }
     let prev = block_guard.fetch_max(block_number, std::sync::atomic::Ordering::SeqCst);
     if prev >= block_number {
         debug!(target: "n42::cl::exec_bridge", %hash, block_number, prev, "leader eager import: skipping duplicate block number");
@@ -1145,6 +1248,7 @@ async fn handle_built_payload(
             }
         }
         Ok(status) => {
+            bad_blocks.insert_if_invalid(hash, &status.status, "leader_eager_import");
             info!(target: "n42::cl::exec_bridge", %hash, status = ?status.status, elapsed_ms = import_start.elapsed().as_millis() as u64, "eager import: new_payload not accepted");
             metrics::counter!(
                 "n42_eager_import_outcomes_total",

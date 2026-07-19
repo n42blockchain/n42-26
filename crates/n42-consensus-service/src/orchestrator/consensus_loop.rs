@@ -760,6 +760,24 @@ impl ConsensusService {
     /// Enqueues a block for background import. If no import is in flight, spawns immediately.
     /// Otherwise queues for sequential processing (parent must be imported before child).
     fn enqueue_bg_import(&mut self, data: Vec<u8>, block_hash: B256, view: u64) {
+        if self
+            .bad_blocks
+            .should_skip(block_hash, "committed_import_enqueue")
+        {
+            if self
+                .import_done_tx
+                .try_send((block_hash, view, ImportOutcome::Invalid, 0))
+                .is_err()
+            {
+                error!(
+                    target: "n42::cl::consensus_loop",
+                    view,
+                    %block_hash,
+                    "failed to report cached-invalid committed block"
+                );
+            }
+            return;
+        }
         if !self.bg_import_hashes.insert(block_hash) {
             counter!("n42_bg_import_duplicate_enqueue_total").increment(1);
             info!(
@@ -794,10 +812,11 @@ impl ConsensusService {
             }
         };
         let exec_cache = self.exec_output_cache.clone();
+        let bad_blocks = self.bad_blocks.clone();
         info!(target: "n42::cl::consensus_loop", view, %block_hash, "spawning background import");
         tokio::spawn(async move {
             let (outcome, block_ts) =
-                Self::background_import(eh, exec_cache, &data, block_hash).await;
+                Self::background_import(eh, exec_cache, bad_blocks, &data, block_hash).await;
             if done_tx
                 .send((block_hash, view, outcome, block_ts))
                 .await
@@ -813,9 +832,13 @@ impl ConsensusService {
     async fn background_import(
         engine_handle: Arc<dyn ExecutionLayer>,
         exec_cache: Option<Arc<dyn ExecutionOutputCache>>,
+        bad_blocks: super::bad_block_cache::BadBlockCache,
         data: &[u8],
         block_hash: B256,
     ) -> (ImportOutcome, u64) {
+        if bad_blocks.should_skip(block_hash, "committed_import") {
+            return (ImportOutcome::Invalid, 0);
+        }
         let broadcast: super::BlockDataBroadcast = match bincode::deserialize(data) {
             Ok(b) => b,
             Err(e) => {
@@ -834,13 +857,29 @@ impl ConsensusService {
                 return (ImportOutcome::Invalid, 0);
             }
         };
-        let execution_data = match serde_json::from_slice(&payload_json) {
+        let execution_data: alloy_rpc_types_engine::ExecutionData = match serde_json::from_slice(
+            &payload_json,
+        ) {
             Ok(d) => d,
             Err(e) => {
                 warn!(target: "n42::cl::consensus_loop", %block_hash, error = %e, "bg import: failed to parse execution payload");
                 return (ImportOutcome::Invalid, 0);
             }
         };
+        if broadcast.block_hash != block_hash || execution_data.block_hash() != block_hash {
+            warn!(
+                target: "n42::cl::consensus_loop",
+                %block_hash,
+                envelope_hash = %broadcast.block_hash,
+                payload_hash = %execution_data.block_hash(),
+                "bg import: block hash mismatch; refusing untrusted envelope"
+            );
+            counter!("n42_block_data_payload_hash_mismatch_total").increment(1);
+            return (ImportOutcome::Invalid, 0);
+        }
+        if bad_blocks.should_skip(block_hash, "committed_import_pre_submit") {
+            return (ImportOutcome::Invalid, 0);
+        }
 
         // Compact Block: load execution output into payload cache before `new_payload`.
         if let Some(ref exec_compressed) = broadcast.execution_output
@@ -899,6 +938,7 @@ impl ConsensusService {
                 (ImportOutcome::Syncing, 0)
             }
             Ok(status) => {
+                bad_blocks.insert_if_invalid(block_hash, &status.status, "committed_import");
                 warn!(target: "n42::cl::consensus_loop", %block_hash, status = ?status.status, "bg import: new_payload rejected");
                 (ImportOutcome::Invalid, 0)
             }
