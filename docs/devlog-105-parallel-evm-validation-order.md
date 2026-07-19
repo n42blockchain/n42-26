@@ -42,7 +42,8 @@ EXECUTED/VALIDATED 交易原子改为 REDO 并回退 cursor。
 - `hot_recipient_matches_sequential`：30/30 连续通过（修复前第 2 次即失败）；
 - `cargo test -p n42-parallel-evm`：全包 10/10 轮通过，每轮 10/10 tests；
 - 新增 scheduler 竞态单测：通过；
-- `cargo clippy -p n42-parallel-evm --all-targets -- -D warnings`：通过。
+- `cargo clippy -p n42-parallel-evm --all-targets -- -D warnings`：通过；
+- 与 P1-4 组合后 `cargo check --workspace --all-targets`、
+  `cargo clippy --workspace --all-targets -- -D warnings`、`cargo test --workspace`：全绿。
 
-workspace check/clippy/test 在前置提交与 P1-4 组合后再执行。该修复使用独立提交/分支，避免把
-执行有效性修复藏进网络 diff。
+该修复使用独立提交/分支，避免把执行有效性修复藏进网络 diff。
