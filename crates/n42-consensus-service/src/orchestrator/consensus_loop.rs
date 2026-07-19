@@ -129,6 +129,33 @@ impl ConsensusService {
                 {
                     self.broadcast_via_rotor(msg);
                 } else {
+                    // Timeout votes are byte-identical when re-broadcast in the same view.
+                    // GossipSub therefore rejects the repeat as a duplicate and a validator
+                    // that reconnects after the first publication can never contribute to the
+                    // TC. Send timeout/NewView control messages directly to every currently
+                    // known validator as well as through GossipSub. This is intentionally
+                    // limited to view-change traffic: timeouts are rare, and the direct path
+                    // makes late-join recovery independent of GossipSub's message-id cache.
+                    if matches!(
+                        &msg,
+                        ConsensusMessage::Timeout(_) | ConsensusMessage::NewView(_)
+                    ) {
+                        let my_index = self.engine.my_index();
+                        for (validator_index, peer_id) in self.network.all_validator_peers() {
+                            if validator_index == my_index {
+                                continue;
+                            }
+                            if let Err(error) = self.network.send_direct(peer_id, msg.clone()) {
+                                warn!(
+                                    target: "n42::cl::consensus_loop",
+                                    validator_index,
+                                    %peer_id,
+                                    %error,
+                                    "failed to send view-change control message directly"
+                                );
+                            }
+                        }
+                    }
                     // Fire-and-forget: do NOT await — blocking the consensus loop on
                     // network I/O causes event starvation under 48K+ load, leading to
                     // delayed block imports and invalid-ancestor cascades.

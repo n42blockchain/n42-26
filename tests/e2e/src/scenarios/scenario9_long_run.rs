@@ -169,6 +169,7 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
     let mut node2_recovered = false;
     let mut node2_data_dir: Option<tempfile::TempDir> = None;
     let mut blocks_at_crash: u64 = 0;
+    let mut blocks_at_recovery: u64 = 0;
     let mut node2_height_at_crash: u64 = 0;
     let mut sync_time_ms: u64 = 0;
 
@@ -234,6 +235,7 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
 
                         // Wait for node-2 to sync.
                         let target_height = get_height_safe(node0_rpc).await;
+                        blocks_at_recovery = target_height;
                         match wait_for_sync(&node.rpc, target_height, Duration::from_secs(120))
                             .await
                         {
@@ -410,7 +412,7 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
 
     // === V2: Minimum block count ===
     // Theoretical: duration_secs / (block_interval_ms / 1000)
-    // Allow 20% for fast intervals (consensus round-trip dominates at <1s slots)
+    // Require 20% for fast intervals (consensus round-trip dominates at <1s slots)
     // or 50% for normal intervals.
     let theoretical_blocks = cfg.duration_secs * 1000 / cfg.block_interval_ms;
     let tolerance = if cfg.block_interval_ms < 2000 {
@@ -426,7 +428,7 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
             actual_blocks,
             min_expected,
             theoretical = theoretical_blocks,
-            "V2 PASS: block count >= 60% of theoretical"
+            "V2 PASS: block count meets configured theoretical floor"
         );
         pass_count += 1;
     } else {
@@ -568,38 +570,39 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
         fail_count += 1;
     }
 
-    // === V6: System survived node-2 crash ===
-    // Verify that the system continued operating during and after node-2's downtime.
-    // With 3 nodes and quorum=1, 2 remaining nodes should keep producing blocks.
-    // However, at fast intervals (500ms), the timeout overhead during the crashed
-    // node's leader turns significantly reduces throughput, so we just verify
-    // the system didn't halt completely and eventually recovered.
-    if node2_crashed {
-        // Check 1: blocks were produced between crash and test end
+    // === V6: Consensus resumed after node-2 recovery ===
+    // With the n-f quorum, all three votes are required in a 3-validator network,
+    // so halting while node-2 is offline is expected. Once it reconnects, repeated
+    // timeout votes must reach the next leader, form a TC, and resume block production.
+    if node2_crashed && node2_recovered {
         let final_height = actual_max_height;
         let blocks_after_crash = final_height.saturating_sub(blocks_at_crash);
-        // Check 2: node-2 recovered and synced (already checked in V7, but validate here too)
+        let blocks_after_recovery = final_height.saturating_sub(blocks_at_recovery);
         let node2_alive = nodes[2].is_some();
         info!(
             final_height,
-            blocks_at_crash, blocks_after_crash, node2_alive, "V6 debug: system resilience check"
+            blocks_at_crash,
+            blocks_at_recovery,
+            blocks_after_crash,
+            blocks_after_recovery,
+            node2_alive,
+            "V6 debug: recovery progress check"
         );
-        // The system survived if: node-2 was properly killed and restarted,
-        // and the overall block count is reasonable (we already checked this in V2).
-        // Even if blocks_after_crash == 0 (all blocks produced before crash),
-        // the crash/recovery itself working is the key validation.
-        if node2_alive {
+        if node2_alive && blocks_after_recovery > 0 {
             info!(
-                blocks_after_crash,
-                "V6 PASS: system survived node-2 crash and recovery"
+                blocks_after_recovery,
+                "V6 PASS: consensus resumed after node-2 recovery"
             );
             pass_count += 1;
         } else {
-            error!("V6 FAIL: node-2 did not recover after crash");
+            error!(
+                blocks_after_recovery,
+                "V6 FAIL: no block committed after node-2 recovery"
+            );
             fail_count += 1;
         }
     } else {
-        warn!("V6 SKIP: node-2 was not crashed (duration too short?)");
+        warn!("V6 SKIP: crash/recovery cycle did not complete (duration too short?)");
         fail_count += 1;
     }
 

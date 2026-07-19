@@ -1206,7 +1206,9 @@ mod tests {
     use super::*;
     use alloy_primitives::Address;
     use n42_chainspec::ValidatorInfo;
-    use n42_primitives::consensus::{CommitVote, Decide, Proposal, ValidatorChange, Vote};
+    use n42_primitives::consensus::{
+        CommitVote, Decide, Proposal, TimeoutMessage, ValidatorChange, Vote,
+    };
 
     fn test_key(seed: u8) -> n42_primitives::BlsSecretKey {
         n42_primitives::BlsSecretKey::key_gen(&[seed; 32])
@@ -3562,6 +3564,47 @@ mod tests {
             .count();
         // Repeat timeout re-broadcasts to help late/slow validators collect our vote.
         assert_eq!(broadcast_count_2, 1);
+    }
+
+    #[test]
+    fn test_verified_repeat_timeout_is_relayed_to_next_leader() {
+        // View 1's next leader is validator 2 in a four-validator set. Validator 0
+        // has already timed out and receives validator 1's vote; even a duplicate
+        // must be sent directly to validator 2 so a reconnect cannot strand the TC.
+        let (mut engine, sks, _, mut rx) = make_engine(4, 0);
+        engine.on_timeout().expect("local timeout");
+        while rx.try_recv().is_ok() {}
+
+        let timeout = TimeoutMessage {
+            view: 1,
+            high_qc: QuorumCertificate::genesis(),
+            sender: 1,
+            signature: sks[1].sign(&timeout_signing_message(1)),
+        };
+
+        for expected_attempt in 1..=2 {
+            engine
+                .process_event(ConsensusEvent::Message(ConsensusMessage::Timeout(
+                    timeout.clone(),
+                )))
+                .expect("verified timeout should be accepted or deduplicated");
+
+            let relays = std::iter::from_fn(|| rx.try_recv().ok())
+                .filter(|output| {
+                    matches!(
+                        output,
+                        EngineOutput::SendToValidator(
+                            2,
+                            ConsensusMessage::Timeout(relayed)
+                        ) if relayed.sender == 1 && relayed.view == 1
+                    )
+                })
+                .count();
+            assert_eq!(
+                relays, 1,
+                "relay attempt {expected_attempt} must target the next leader"
+            );
+        }
     }
 
     #[test]
