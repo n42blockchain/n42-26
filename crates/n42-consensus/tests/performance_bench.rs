@@ -718,9 +718,9 @@ fn bench_comparative_summary() {
     let hash = B256::repeat_byte(0xAA);
     let msg = signing_message(view, &hash);
 
-    for &(label, n_val, quorum) in &[
-        ("Config A (500 nodes)", 500usize, 333usize),
-        ("Config B (100 nodes)", 100usize, 67usize),
+    for &(label, n_val) in &[
+        ("Config A (500 nodes)", 500usize),
+        ("Config B (100 nodes)", 100usize),
     ] {
         let keys: Vec<BlsSecretKey> = (0..n_val as u32).map(test_bls_key).collect();
         let infos: Vec<ValidatorInfo> = keys
@@ -734,6 +734,7 @@ fn bench_comparative_summary() {
             .collect();
         let f = (n_val as u32 - 1) / 3;
         let vs = ValidatorSet::new(&infos, f);
+        let quorum = vs.quorum_size();
 
         // Pre-sign votes (distributed in real system)
         let sigs: Vec<_> = (0..quorum).map(|i| keys[i].sign(&msg)).collect();
@@ -776,10 +777,7 @@ fn bench_comparative_summary() {
     println!("  Leader only needs to verify + aggregate (sequential).");
 
     // For the revised estimate, measure just leader work
-    for &(label, n_val, quorum) in &[
-        ("Config A", 500usize, 333usize),
-        ("Config B", 100usize, 67usize),
-    ] {
+    for &(label, n_val) in &[("Config A", 500usize), ("Config B", 100usize)] {
         let keys: Vec<BlsSecretKey> = (0..n_val as u32).map(test_bls_key).collect();
         let infos: Vec<ValidatorInfo> = keys
             .iter()
@@ -792,6 +790,7 @@ fn bench_comparative_summary() {
             .collect();
         let f = (n_val as u32 - 1) / 3;
         let vs = ValidatorSet::new(&infos, f);
+        let quorum = vs.quorum_size();
         let sigs: Vec<_> = (0..quorum).map(|i| keys[i].sign(&msg)).collect();
 
         let runs = 5;
