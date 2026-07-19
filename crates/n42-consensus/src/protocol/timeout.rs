@@ -172,6 +172,22 @@ impl ConsensusEngine {
         let quorum_size = view_set.quorum_size();
         let next_view = view.saturating_add(1);
 
+        // Only the next-view leader can form and sign NewView, so make every
+        // non-leader receiver a relay for verified timeout votes. This matters
+        // after a leader reconnects: the original sender's direct stream may
+        // still be negotiating, while another validator already has a healthy
+        // stream to it. Relay before duplicate detection so repeat timeouts can
+        // repair exactly that late-join gap. SendToValidator retains GossipSub
+        // as a fallback, while the direct leg is not suppressed by GossipSub's
+        // byte-identical message-id cache.
+        let next_leader = LeaderSelector::leader_for_view(next_view, view_set);
+        if timeout.sender != self.my_index && next_leader != self.my_index {
+            self.emit(EngineOutput::SendToValidator(
+                next_leader,
+                ConsensusMessage::Timeout(timeout.clone()),
+            ))?;
+        }
+
         let collector = self
             .timeout_collector
             .get_or_insert_with(|| TimeoutCollector::new(view, n_validators));

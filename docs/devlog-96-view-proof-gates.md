@@ -58,6 +58,36 @@ the crash-safe state, so the first post-restart proposal can extend it without
 depending on an ephemeral cache. All other incoming certificates still undergo
 normal aggregate verification.
 
+## Reconnect liveness follow-up
+
+The ordered S1-S5 validation exposed a second restart edge that the original
+Scenario 9 assertion did not detect. With the S1 `n-f` threshold, a
+three-validator network correctly needs all three timeout votes. It therefore
+halts while one validator is offline. After that validator restarted, however,
+all processes were healthy but the chain remained at height 57.
+
+The next-view leader had missed one timeout while it was disconnected. Honest
+validators periodically rebroadcast the same signed timeout, but those bytes
+are identical within a view, so GossipSub's message-id cache rejected the
+repeat as a duplicate. The leader consequently remained one vote short of a TC
+and could not leave the timed-out engine phase.
+
+The recovery path now has two layers:
+
+1. Locally generated Timeout and NewView broadcasts are also sent directly to
+   every known validator peer. GossipSub remains the normal fanout path.
+2. After fully verifying a received Timeout, a non-leader relays it to the
+   next-view leader. This happens before collector duplicate rejection so a
+   repeated timeout can repair a late-join gap through another healthy direct
+   stream. Unverified messages are never relayed.
+
+Scenario 9 V6 previously counted a live restarted process as success even when
+zero blocks were committed after recovery. It now records the height at
+recovery and requires at least one later committed block. This stricter check
+first reproduced the halt as a real 6/7 failure, then passed after the relay
+fix: node 2 restarted at height 57, all three validators reached height 107,
+50 blocks committed after recovery, and all seven checks passed.
+
 N42 also does not inherit gov5's 60-second base-timeout setting: the chainspec
 defaults are 4 seconds for single-validator dev and 20 seconds for deterministic
 multi-validator dev; testnet scripts commonly use 10 seconds. No timing change
@@ -88,6 +118,13 @@ required by this task.
 - `cargo clippy --all-targets -- -D warnings`: passed
 - `cargo test --workspace`: passed
 - `cargo test -p n42-consensus --test chaos_7node`: 12 passed
+- Reconnect regressions:
+  - `test_on_timeout_repeat_rebroadcasts`
+  - `test_verified_repeat_timeout_is_relayed_to_next_leader`
+  - `test_timeout_rebroadcast_directly_reaches_reconnected_validators`
+- Strict Scenario 9 (`60s`, crash at `15s`, `10s` downtime, `500ms` block
+  interval): 7/7 passed; recovery height 57, final height 107 on all nodes,
+  50 post-recovery blocks, 387 transactions, and 10 sampled hashes consistent
 
 The first workspace run exposed one stale chaos-test assumption rather than a
 code failure: `test_timeout_convergence_from_different_views` expected repeated

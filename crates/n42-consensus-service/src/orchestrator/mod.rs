@@ -2172,7 +2172,7 @@ mod tests {
     use n42_consensus::{ConsensusEngine, EpochManager, ValidatorSet};
     use n42_network::{NetworkCommand, NetworkHandle};
     use n42_primitives::consensus::ValidatorChange;
-    use n42_primitives::{BlsSecretKey, ConsensusMessage, QuorumCertificate, Vote};
+    use n42_primitives::{BlsSecretKey, ConsensusMessage, QuorumCertificate, TimeoutMessage, Vote};
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex, RwLock};
     use std::time::Duration;
@@ -2180,6 +2180,8 @@ mod tests {
     #[derive(Clone, Default)]
     struct MockConsensusNetwork {
         peers: Arc<RwLock<HashMap<u32, n42_network::PeerId>>>,
+        broadcasts: Arc<Mutex<Vec<n42_primitives::ConsensusMessage>>>,
+        direct_messages: Arc<Mutex<Vec<(n42_network::PeerId, n42_primitives::ConsensusMessage)>>>,
     }
 
     impl MockConsensusNetwork {
@@ -2187,7 +2189,22 @@ mod tests {
             let peer_map = peers.into_iter().collect::<HashMap<_, _>>();
             Self {
                 peers: Arc::new(RwLock::new(peer_map)),
+                ..Self::default()
             }
+        }
+
+        fn broadcasts(&self) -> Vec<n42_primitives::ConsensusMessage> {
+            self.broadcasts
+                .lock()
+                .expect("mock broadcasts lock")
+                .clone()
+        }
+
+        fn direct_messages(&self) -> Vec<(n42_network::PeerId, n42_primitives::ConsensusMessage)> {
+            self.direct_messages
+                .lock()
+                .expect("mock direct messages lock")
+                .clone()
         }
     }
 
@@ -2395,8 +2412,12 @@ mod tests {
     impl ConsensusNetwork for MockConsensusNetwork {
         fn broadcast_consensus(
             &self,
-            _msg: n42_primitives::ConsensusMessage,
+            msg: n42_primitives::ConsensusMessage,
         ) -> Result<(), n42_network::NetworkError> {
+            self.broadcasts
+                .lock()
+                .expect("mock broadcasts lock")
+                .push(msg);
             Ok(())
         }
 
@@ -2410,9 +2431,13 @@ mod tests {
 
         fn send_direct(
             &self,
-            _peer: n42_network::PeerId,
-            _msg: n42_primitives::ConsensusMessage,
+            peer: n42_network::PeerId,
+            msg: n42_primitives::ConsensusMessage,
         ) -> Result<(), n42_network::NetworkError> {
+            self.direct_messages
+                .lock()
+                .expect("mock direct messages lock")
+                .push((peer, msg));
             Ok(())
         }
 
@@ -2627,6 +2652,53 @@ mod tests {
         assert!(
             matches!(cmd, NetworkCommand::BroadcastConsensus(_)),
             "should be a BroadcastConsensus command"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_timeout_rebroadcast_directly_reaches_reconnected_validators() {
+        let (engine, output_rx) = make_test_engine_with_validator_count(3, 0);
+        let peers = (0..3u32)
+            .map(|idx| {
+                let keypair = Keypair::generate_ed25519();
+                (idx, keypair.public().to_peer_id())
+            })
+            .collect::<Vec<_>>();
+        let network = Arc::new(MockConsensusNetwork::with_peers(peers.clone()));
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let mut orch = ConsensusService::new(engine, network.clone(), net_event_rx, output_rx);
+
+        let view = 1;
+        let timeout = TimeoutMessage {
+            view,
+            high_qc: QuorumCertificate::genesis(),
+            sender: 0,
+            signature: test_key(0).sign(&n42_consensus::protocol::quorum::timeout_signing_message(
+                view,
+            )),
+        };
+
+        orch.handle_engine_output(EngineOutput::BroadcastMessage(ConsensusMessage::Timeout(
+            timeout,
+        )))
+        .await;
+
+        let direct = network.direct_messages();
+        assert_eq!(
+            direct.len(),
+            2,
+            "timeout must use direct delivery to every peer except self"
+        );
+        assert!(
+            direct
+                .iter()
+                .all(|(_, msg)| matches!(msg, ConsensusMessage::Timeout(_)))
+        );
+        assert!(direct.iter().all(|(peer, _)| *peer != peers[0].1));
+        assert_eq!(
+            network.broadcasts().len(),
+            1,
+            "GossipSub remains the fanout fallback"
         );
     }
 
