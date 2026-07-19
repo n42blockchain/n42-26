@@ -3791,7 +3791,8 @@ mod tests {
 
         orch.connected_peers.insert(libp2p::PeerId::random());
         orch.sync_in_flight = true;
-        orch.sync_started_at = Some(Instant::now() - Duration::from_secs(60));
+        orch.sync_started_at =
+            Some(Instant::now() - state_mgmt::sync_request_timeout() - Duration::from_secs(1));
 
         orch.initiate_sync(1, 10);
 
@@ -3800,6 +3801,37 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(2),
             "sync_started_at should be recent after timeout reset"
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_state_sync_yields_to_execution_catchup_fanout() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
+        let peers = [libp2p::PeerId::random(), libp2p::PeerId::random()];
+        orch.connected_peers.extend(peers);
+
+        orch.sync_in_flight = true;
+        orch.sync_started_at =
+            Some(Instant::now() - state_mgmt::sync_request_timeout() - Duration::from_secs(1));
+        orch.sync_request_range = Some((88, 89));
+        orch.sync_requested_peers.insert(peers[0]);
+
+        orch.initiate_execution_catchup_sync(86, 116);
+
+        assert!(orch.sync_in_flight, "catch-up request should be in flight");
+        assert_eq!(orch.sync_request_range, Some((87, 116)));
+        assert_eq!(
+            orch.sync_requested_peers,
+            peers.into_iter().collect(),
+            "execution catch-up must replace the stale request and fan out"
+        );
+        let started = orch.sync_started_at.expect("sync_started_at should be set");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "sync_started_at should belong to the replacement request"
         );
     }
 

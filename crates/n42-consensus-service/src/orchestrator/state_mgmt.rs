@@ -204,6 +204,39 @@ impl ConsensusService {
 // ── State sync ──
 
 impl ConsensusService {
+    /// Clears an expired sync request group so another recovery strategy can
+    /// take ownership. Both ordinary state sync and execution catch-up must
+    /// pass through this gate: otherwise a lost single-peer response can leave
+    /// `sync_in_flight` set forever and suppress every later fan-out request.
+    fn expire_stale_sync_request(&mut self) -> bool {
+        if !self.sync_in_flight {
+            return false;
+        }
+
+        let elapsed = self.sync_started_at.map(|started| started.elapsed());
+        let timed_out = elapsed
+            .map(|elapsed| elapsed > sync_request_timeout())
+            // An in-flight request without a start time violates the local
+            // state invariant. Treat it as stale instead of wedging recovery.
+            .unwrap_or(true);
+        if !timed_out {
+            return false;
+        }
+
+        warn!(
+            target: "n42::cl::sync",
+            elapsed_secs = elapsed.map_or(0, |elapsed| elapsed.as_secs()),
+            requested_peers = self.sync_requested_peers.len(),
+            "sync request timed out, resetting"
+        );
+        counter!("n42_sync_requests_timed_out_total").increment(1);
+        self.sync_in_flight = false;
+        self.sync_started_at = None;
+        self.sync_request_range = None;
+        self.sync_requested_peers.clear();
+        true
+    }
+
     /// Requests an execution lineage from every connected peer.
     ///
     /// This is narrower than ordinary consensus catch-up: a committed payload
@@ -212,6 +245,7 @@ impl ConsensusService {
     /// an unready request-response stream; fan-out avoids a full sync timeout
     /// while every response remains QC-verified and idempotent.
     pub(super) fn initiate_execution_catchup_sync(&mut self, local_view: u64, target_view: u64) {
+        self.expire_stale_sync_request();
         if self.sync_in_flight {
             debug!(
                 target: "n42::cl::sync",
@@ -267,26 +301,10 @@ impl ConsensusService {
     /// Initiates a state sync request to a connected peer.
     /// Uses deterministic peer rotation by view number to avoid always hitting the same peer.
     pub(super) fn initiate_sync(&mut self, local_view: u64, target_view: u64) {
+        self.expire_stale_sync_request();
         if self.sync_in_flight {
-            let timed_out = self
-                .sync_started_at
-                .map(|t| t.elapsed() > sync_request_timeout())
-                .unwrap_or(false);
-
-            if timed_out {
-                warn!(
-                    target: "n42::cl::sync",
-                    elapsed_secs = self.sync_started_at.map_or(0, |t| t.elapsed().as_secs()),
-                    "sync request timed out, resetting"
-                );
-                self.sync_in_flight = false;
-                self.sync_started_at = None;
-                self.sync_request_range = None;
-                self.sync_requested_peers.clear();
-            } else {
-                debug!(target: "n42::cl::sync", local_view, target_view, "sync already in flight, skipping");
-                return;
-            }
+            debug!(target: "n42::cl::sync", local_view, target_view, "sync already in flight, skipping");
+            return;
         }
 
         let peers: Vec<_> = self.connected_peers.iter().copied().collect();
