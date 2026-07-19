@@ -25,6 +25,23 @@ impl ExecutionOutputCache for RethExecutionOutputCache {
     fn inject(&self, hash: B256, compressed: &[u8], source: &'static str) -> bool {
         inject_compact_block(&hash, compressed, source)
     }
+
+    fn evict(&self, hash: B256) {
+        let removed =
+            reth_evm::payload_cache::take_payload_execution::<CachedPayloadData>(&hash).is_some();
+        metrics::counter!(
+            "n42_compact_block_cache_evictions_total",
+            "removed" => if removed { "true" } else { "false" }
+        )
+        .increment(1);
+        if removed {
+            warn!(
+                target: "n42::cl::exec_bridge",
+                %hash,
+                "evicted rejected compact execution output"
+            );
+        }
+    }
 }
 
 type CachedPayloadData = (

@@ -20,4 +20,10 @@ pub trait ExecutionOutputCache: Send + Sync {
     /// next `new_payload` hits the cache and skips EVM re-execution. Returns
     /// whether the inject succeeded.
     fn inject(&self, hash: B256, compressed: &[u8], source: &'static str) -> bool;
+
+    /// Remove a previously injected execution output. Every caller that
+    /// injects untrusted bytes must evict them when `new_payload` does not
+    /// return `Valid`; otherwise a rejected bundle can poison later arrivals
+    /// for the same declared block hash.
+    fn evict(&self, hash: B256);
 }

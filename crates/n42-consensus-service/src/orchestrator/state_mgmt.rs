@@ -3,7 +3,10 @@ use crate::persistence::{self, ConsensusSnapshot};
 use alloy_primitives::B256;
 use metrics::counter;
 use n42_consensus::{validator_changes_hash, verify_commit_qc};
-use n42_network::{BlockSyncResponse, MAX_BLOCKS_PER_SYNC_REQUEST, PeerId, SyncBlock, SyncPayload};
+use n42_network::{
+    BlockSyncResponse, MAX_BLOCKS_PER_SYNC_REQUEST, MAX_SYNC_MESSAGE_SIZE, PeerId, SyncBlock,
+    SyncPayload,
+};
 use n42_primitives::QuorumCertificate;
 use std::sync::LazyLock;
 use std::time::Duration;
@@ -38,6 +41,22 @@ static CFG_MAX_EMPTY_SKIPS: LazyLock<u32> = LazyLock::new(|| {
 });
 
 const MAX_SYNC_BLOCKS: usize = 128;
+
+fn sync_response_fits_frame(response: &BlockSyncResponse) -> bool {
+    bincode::serialized_size(response)
+        .ok()
+        .is_some_and(|size| size <= MAX_SYNC_MESSAGE_SIZE as u64)
+}
+
+fn try_append_lineage_within_frame(response: &mut BlockSyncResponse, payload: SyncPayload) -> bool {
+    response.execution_lineage.push(payload);
+    if sync_response_fits_frame(response) {
+        true
+    } else {
+        response.execution_lineage.pop();
+        false
+    }
+}
 
 /// Maximum committed blocks retained in the ring buffer for sync serving.
 /// At 8-second slots, 10,000 blocks ≈ ~22 hours of history.
@@ -391,7 +410,7 @@ impl ConsensusService {
             .filter(|b| b.view >= request.from_view && b.view <= request.to_view)
             .take(MAX_SYNC_BLOCKS)
             .collect();
-        let blocks: Vec<SyncBlock> = retained
+        let mut blocks: Vec<SyncBlock> = retained
             .iter()
             .map(|b| SyncBlock {
                 view: b.view,
@@ -401,24 +420,61 @@ impl ConsensusService {
                 validator_changes: b.validator_changes.clone(),
             })
             .collect();
-        let mut lineage_hashes = std::collections::HashSet::new();
-        let execution_lineage = retained
+        let peer_committed_view = self.committed_blocks.back().map(|b| b.view).unwrap_or(0);
+        let mut response = BlockSyncResponse {
+            blocks: std::mem::take(&mut blocks),
+            peer_committed_view,
+            execution_lineage: Vec::new(),
+        };
+        let initial_blocks = response.blocks.len();
+        while !sync_response_fits_frame(&response) && !response.blocks.is_empty() {
+            response.blocks.pop();
+        }
+        if response.blocks.len() != initial_blocks {
+            warn!(
+                target: "n42::cl::sync",
+                retained_blocks = initial_blocks,
+                blocks_sent = response.blocks.len(),
+                max_frame_bytes = MAX_SYNC_MESSAGE_SIZE,
+                "truncated sync blocks to the negotiated frame budget"
+            );
+            counter!("n42_sync_response_frame_truncations_total", "section" => "blocks")
+                .increment(1);
+        }
+
+        let selected_hashes: std::collections::HashSet<_> = response
+            .blocks
             .iter()
+            .map(|block| block.block_hash)
+            .collect();
+        let mut lineage_hashes = std::collections::HashSet::new();
+        let lineage_candidates = retained
+            .iter()
+            .filter(|block| selected_hashes.contains(&block.block_hash))
             .flat_map(|block| block.execution_lineage.iter())
             .filter(|payload| lineage_hashes.insert(payload.block_hash))
             .take(MAX_SYNC_BLOCKS)
-            .cloned()
-            .collect();
+            .cloned();
+        let mut lineage_truncated = false;
+        for payload in lineage_candidates {
+            if !try_append_lineage_within_frame(&mut response, payload) {
+                lineage_truncated = true;
+                break;
+            }
+        }
+        if lineage_truncated {
+            warn!(
+                target: "n42::cl::sync",
+                blocks_sent = response.blocks.len(),
+                lineage_sent = response.execution_lineage.len(),
+                max_frame_bytes = MAX_SYNC_MESSAGE_SIZE,
+                "truncated execution lineage to the negotiated frame budget"
+            );
+            counter!("n42_sync_response_frame_truncations_total", "section" => "lineage")
+                .increment(1);
+        }
 
-        let peer_committed_view = self.committed_blocks.back().map(|b| b.view).unwrap_or(0);
-
-        debug!(target: "n42::cl::sync", %peer, blocks_sent = blocks.len(), peer_committed_view, "sending sync response");
-
-        let response = BlockSyncResponse {
-            blocks,
-            peer_committed_view,
-            execution_lineage,
-        };
+        debug!(target: "n42::cl::sync", %peer, blocks_sent = response.blocks.len(), lineage_sent = response.execution_lineage.len(), peer_committed_view, "sending sync response");
 
         if let Err(e) = self
             .network
@@ -1135,5 +1191,34 @@ impl ConsensusService {
         }
 
         true
+    }
+}
+
+#[cfg(test)]
+mod frame_budget_tests {
+    use super::*;
+
+    #[test]
+    fn execution_lineage_is_truncated_before_the_16mb_frame_limit() {
+        let mut response = BlockSyncResponse {
+            blocks: Vec::new(),
+            peer_committed_view: 2,
+            execution_lineage: Vec::new(),
+        };
+        let first = SyncPayload {
+            view: 1,
+            block_hash: B256::repeat_byte(1),
+            block_data: vec![1; 9 * 1024 * 1024],
+        };
+        let second = SyncPayload {
+            view: 2,
+            block_hash: B256::repeat_byte(2),
+            block_data: vec![2; 9 * 1024 * 1024],
+        };
+
+        assert!(try_append_lineage_within_frame(&mut response, first));
+        assert!(!try_append_lineage_within_frame(&mut response, second));
+        assert_eq!(response.execution_lineage.len(), 1);
+        assert!(sync_response_fits_frame(&response));
     }
 }

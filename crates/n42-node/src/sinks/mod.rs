@@ -17,6 +17,11 @@ use std::sync::{
 
 pub use n42_consensus_service::sinks::{StakingSink, StateSink, WithdrawalSource, ZkSink};
 
+/// Bound database reads per sampled account. A hot contract can touch tens of
+/// thousands of slots inside one probe interval; sampling remains useful
+/// without letting that fan out into an unbounded exact-state query.
+const MAX_TWIG_PROBE_SLOTS_PER_ACCOUNT: usize = 256;
+
 /// Adapter over the persistent SBMT tree.
 pub struct SbmtStateSink(pub Arc<Mutex<PersistentSbmt>>);
 
@@ -224,7 +229,13 @@ impl TwigStateSink {
             bytes[..32].copy_from_slice(block_hash.as_slice());
             bytes[32..].copy_from_slice(address.as_slice());
             let rank = *blake3::hash(&bytes).as_bytes();
-            let storage_slots = account.storage.keys().copied().collect::<Vec<_>>();
+            let mut storage_slots = account.storage.keys().copied().collect::<Vec<_>>();
+            if storage_slots.len() > MAX_TWIG_PROBE_SLOTS_PER_ACCOUNT {
+                let dropped = storage_slots.len() - MAX_TWIG_PROBE_SLOTS_PER_ACCOUNT;
+                storage_slots.truncate(MAX_TWIG_PROBE_SLOTS_PER_ACCOUNT);
+                metrics::counter!("n42_twig_probe_storage_slots_dropped_total")
+                    .increment(dropped as u64);
+            }
 
             if let Some((existing_rank, target)) = candidates
                 .iter_mut()
@@ -234,6 +245,14 @@ impl TwigStateSink {
                 target.storage_slots.extend(storage_slots);
                 target.storage_slots.sort_unstable();
                 target.storage_slots.dedup();
+                if target.storage_slots.len() > MAX_TWIG_PROBE_SLOTS_PER_ACCOUNT {
+                    let dropped = target.storage_slots.len() - MAX_TWIG_PROBE_SLOTS_PER_ACCOUNT;
+                    target
+                        .storage_slots
+                        .truncate(MAX_TWIG_PROBE_SLOTS_PER_ACCOUNT);
+                    metrics::counter!("n42_twig_probe_storage_slots_dropped_total")
+                        .increment(dropped as u64);
+                }
                 continue;
             }
 
@@ -643,6 +662,59 @@ mod tests {
         .unwrap();
         assert_eq!(reader.reads.load(Ordering::Relaxed), 2);
         assert!(!healthy.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn twig_probe_caps_storage_slots_per_sampled_account() {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = Arc::new(Mutex::new(
+            PersistentTwig::open(dir.path().join("twig.snapshot"), u64::MAX).unwrap(),
+        ));
+        let address = Address::with_last_byte(0x52);
+        let reader = Arc::new(FixedProbeReader {
+            expected: Mutex::new(TwigProbeAccount {
+                account: None,
+                storage: Vec::new(),
+            }),
+            reads: AtomicUsize::new(0),
+        });
+        let sink = TwigStateSink::with_probe_reader(
+            tree,
+            reader,
+            Arc::new(AtomicBool::new(true)),
+            TwigProbeConfig {
+                interval: 32,
+                accounts_per_sample: 1,
+            },
+        );
+        let storage = (0..(MAX_TWIG_PROBE_SLOTS_PER_ACCOUNT + 44))
+            .map(|slot| {
+                (
+                    U256::from(slot),
+                    ValueChange::new(U256::ZERO, U256::from(slot + 1)),
+                )
+            })
+            .collect();
+        let diff = StateDiff {
+            accounts: BTreeMap::from([(
+                address,
+                AccountDiff {
+                    change_type: AccountChangeType::Modified,
+                    balance: None,
+                    nonce: None,
+                    code_change: None,
+                    storage,
+                },
+            )]),
+        };
+
+        sink.record_probe_candidates(B256::repeat_byte(0x53), &diff);
+        let targets = sink.pending_probe_targets();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(
+            targets[0].storage_slots.len(),
+            MAX_TWIG_PROBE_SLOTS_PER_ACCOUNT
+        );
     }
 
     #[test]

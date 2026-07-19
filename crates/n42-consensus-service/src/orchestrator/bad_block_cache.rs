@@ -94,6 +94,25 @@ impl BadBlockCache {
         let PayloadStatusEnum::Invalid { validation_error } = status else {
             return false;
         };
+        // `block hash mismatch` rejects an attacker-controlled declaration,
+        // not the block identified by `hash`: reth recomputed a different hash
+        // from the supplied contents. Caching the declared key would let one
+        // Byzantine peer blacklist a future honest block with that hash.
+        if is_declared_block_hash_mismatch(validation_error) {
+            counter!(
+                "n42_bad_block_cache_untrusted_hash_rejects_total",
+                "source" => source
+            )
+            .increment(1);
+            warn!(
+                target: "n42::bad_block_cache",
+                %hash,
+                source,
+                validation_error,
+                "not caching rejection for a sender-declared block hash mismatch"
+            );
+            return false;
+        }
         self.insert_invalid_payload(hash, validation_error, source);
         true
     }
@@ -165,6 +184,13 @@ fn truncate_reason(reason: &str) -> String {
     reason[..end].to_owned()
 }
 
+fn is_declared_block_hash_mismatch(validation_error: &str) -> bool {
+    validation_error
+        .trim_start()
+        .to_ascii_lowercase()
+        .starts_with("block hash mismatch:")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -209,5 +235,35 @@ mod tests {
             inner.reasons.get(&hash),
             Some(&BadBlockReason::InvalidPayload("replacement".to_owned()))
         );
+    }
+
+    #[test]
+    fn declared_hash_mismatch_never_blacklists_the_declared_hash() {
+        let cache = BadBlockCache::with_capacity(2);
+        let honest_hash = B256::repeat_byte(5);
+        let status = PayloadStatusEnum::Invalid {
+            validation_error: format!(
+                "block hash mismatch: want {}, got {}",
+                B256::repeat_byte(6),
+                honest_hash
+            ),
+        };
+
+        assert!(!cache.insert_if_invalid(honest_hash, &status, "test"));
+        assert!(!cache.should_skip(honest_hash, "test"));
+        assert_eq!(cache.len(), 0);
+    }
+
+    #[test]
+    fn deterministic_execution_rejection_remains_cacheable() {
+        let cache = BadBlockCache::with_capacity(2);
+        let bad_hash = B256::repeat_byte(7);
+        let status = PayloadStatusEnum::Invalid {
+            validation_error: "state root mismatch".to_owned(),
+        };
+
+        assert!(cache.insert_if_invalid(bad_hash, &status, "test"));
+        assert!(cache.should_skip(bad_hash, "test"));
+        assert_eq!(cache.len(), 1);
     }
 }

@@ -380,12 +380,14 @@ impl ObserverOrchestrator {
         }
 
         // Compact Block: load execution output to skip EVM re-execution.
-        if let Some(ref exec_compressed) = broadcast.execution_output
+        let compact_injected = if let Some(ref exec_compressed) = broadcast.execution_output
             && crate::orchestrator::compact_block_enabled()
             && let Some(ref cache) = self.exec_output_cache
         {
-            cache.inject(hash, exec_compressed, "observer_import");
-        }
+            cache.inject(hash, exec_compressed, "observer_import")
+        } else {
+            false
+        };
 
         match self.el.new_payload(execution_data).await {
             Ok(status) => {
@@ -454,9 +456,15 @@ impl ObserverOrchestrator {
                     status.status,
                     PayloadStatusEnum::Syncing | PayloadStatusEnum::Accepted
                 ) {
+                    if compact_injected && let Some(ref cache) = self.exec_output_cache {
+                        cache.evict(hash);
+                    }
                     debug!(target: "n42::observer", %hash, view, status = ?status.status, "new_payload has not executed observer block yet");
                     true
                 } else {
+                    if compact_injected && let Some(ref cache) = self.exec_output_cache {
+                        cache.evict(hash);
+                    }
                     self.bad_blocks
                         .insert_if_invalid(hash, &status.status, "observer_import");
                     warn!(target: "n42::observer", %hash, view, status = ?status.status, "new_payload rejected block");
@@ -464,6 +472,9 @@ impl ObserverOrchestrator {
                 }
             }
             Err(e) => {
+                if compact_injected && let Some(ref cache) = self.exec_output_cache {
+                    cache.evict(hash);
+                }
                 error!(target: "n42::observer", %hash, error = %e, "new_payload call failed");
                 false
             }

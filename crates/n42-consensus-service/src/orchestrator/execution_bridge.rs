@@ -658,6 +658,9 @@ impl ConsensusService {
                         }
                     }
                     Ok(status) => {
+                        if compact_injected && let Some(ref cache) = exec_cache {
+                            cache.evict(hash);
+                        }
                         bad_blocks.insert_if_invalid(
                             hash,
                             &status.status,
@@ -674,6 +677,9 @@ impl ConsensusService {
                         .increment(1);
                     }
                     Err(e) => {
+                        if compact_injected && let Some(ref cache) = exec_cache {
+                            cache.evict(hash);
+                        }
                         debug!(target: "n42::cl::exec_bridge", %hash, view, error = %e, compact_injected, "follower eager import: failed");
                         if compact_injected {
                             metrics::counter!("n42_compact_block_cache_misses").increment(1);
@@ -770,12 +776,14 @@ impl ConsensusService {
         }
 
         // Compact Block: load execution output into payload cache before `new_payload`.
-        if let Some(ref exec_compressed) = broadcast.execution_output
+        let compact_injected = if let Some(ref exec_compressed) = broadcast.execution_output
             && compact_block_enabled()
             && let Some(ref cache) = self.exec_output_cache
         {
-            cache.inject(broadcast.block_hash, exec_compressed, "import_and_notify");
-        }
+            cache.inject(broadcast.block_hash, exec_compressed, "import_and_notify")
+        } else {
+            false
+        };
 
         match engine_handle.new_payload(execution_data).await {
             Ok(status) => {
@@ -787,6 +795,9 @@ impl ConsensusService {
                     status.status,
                     PayloadStatusEnum::Syncing | PayloadStatusEnum::Accepted
                 ) {
+                    if compact_injected && let Some(ref cache) = self.exec_output_cache {
+                        cache.evict(broadcast.block_hash);
+                    }
                     // Engine API: `Accepted` means the payload was stored for a
                     // side chain WITHOUT being executed. Advancing the validated
                     // head here would flush the staged sidecar diff for an
@@ -798,6 +809,10 @@ impl ConsensusService {
                     self.queue_syncing_block(&broadcast);
                     true
                 } else {
+                    if compact_injected && let Some(ref cache) = self.exec_output_cache {
+                        cache.evict(broadcast.block_hash);
+                    }
+                    self.discard_unvalidated_sidecar_diff(broadcast.view, broadcast.block_hash);
                     self.bad_blocks.insert_if_invalid(
                         broadcast.block_hash,
                         &status.status,
@@ -813,6 +828,10 @@ impl ConsensusService {
                 }
             }
             Err(e) => {
+                if compact_injected && let Some(ref cache) = self.exec_output_cache {
+                    cache.evict(broadcast.block_hash);
+                }
+                self.discard_unvalidated_sidecar_diff(broadcast.view, broadcast.block_hash);
                 error!(target: "n42::cl::exec_bridge", hash = %broadcast.block_hash, error = %e, "new_payload failed");
                 false
             }
@@ -1026,12 +1045,15 @@ impl ConsensusService {
             }
 
             // Compact Block: load on retry path too.
-            if let Some(ref exec_compressed) = retry_broadcast.execution_output
+            let compact_injected = if let Some(ref exec_compressed) =
+                retry_broadcast.execution_output
                 && compact_block_enabled()
                 && let Some(ref cache) = self.exec_output_cache
             {
-                cache.inject(retry_hash, exec_compressed, "retry_syncing");
-            }
+                cache.inject(retry_hash, exec_compressed, "retry_syncing")
+            } else {
+                false
+            };
 
             match engine_handle.new_payload(retry_exec).await {
                 Ok(rs) if matches!(rs.status, PayloadStatusEnum::Valid) => {
@@ -1102,6 +1124,9 @@ impl ConsensusService {
                         PayloadStatusEnum::Syncing | PayloadStatusEnum::Accepted
                     ) =>
                 {
+                    if compact_injected && let Some(ref cache) = self.exec_output_cache {
+                        cache.evict(retry_hash);
+                    }
                     // `Accepted` (stored, not executed) is retried exactly like
                     // `Syncing`: never treated as a validated head (F3).
                     let next_retry = retry_count + 1;
@@ -1113,11 +1138,19 @@ impl ConsensusService {
                     }
                 }
                 Ok(rs) => {
+                    if compact_injected && let Some(ref cache) = self.exec_output_cache {
+                        cache.evict(retry_hash);
+                    }
+                    self.discard_unvalidated_sidecar_diff(retry_broadcast.view, retry_hash);
                     self.bad_blocks
                         .insert_if_invalid(retry_hash, &rs.status, "syncing_retry");
                     warn!(target: "n42::cl::exec_bridge", %retry_hash, status = ?rs.status, "retry rejected");
                 }
                 Err(e) => {
+                    if compact_injected && let Some(ref cache) = self.exec_output_cache {
+                        cache.evict(retry_hash);
+                    }
+                    self.discard_unvalidated_sidecar_diff(retry_broadcast.view, retry_hash);
                     warn!(target: "n42::cl::exec_bridge", %retry_hash, error = %e, "retry new_payload failed");
                 }
             }
@@ -1317,6 +1350,9 @@ async fn handle_built_payload(
             }
         }
         Ok(status) => {
+            if let Some(ref cache) = exec_output_cache {
+                cache.evict(hash);
+            }
             bad_blocks.insert_if_invalid(hash, &status.status, "leader_eager_import");
             info!(target: "n42::cl::exec_bridge", %hash, status = ?status.status, elapsed_ms = import_start.elapsed().as_millis() as u64, "eager import: new_payload not accepted");
             metrics::counter!(
@@ -1326,6 +1362,9 @@ async fn handle_built_payload(
             .increment(1);
         }
         Err(e) => {
+            if let Some(ref cache) = exec_output_cache {
+                cache.evict(hash);
+            }
             info!(target: "n42::cl::exec_bridge", %hash, error = %e, "eager import: new_payload failed");
             metrics::counter!(
                 "n42_eager_import_outcomes_total",

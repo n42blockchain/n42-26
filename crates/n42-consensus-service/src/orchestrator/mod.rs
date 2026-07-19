@@ -352,6 +352,10 @@ pub struct ConsensusService {
     /// execution is CONFIRMED (advance_execution_validated_head) - never on a
     /// block reth could still reject.
     pending_sidecar_diffs: BTreeMap<u64, (B256, n42_execution::state_diff::StateDiff)>,
+    /// Exact block hash reth confirmed for each staged sidecar view. A diff is
+    /// never flushed merely because a later view advanced; its staged hash
+    /// must match this execution-valid canonical binding first.
+    execution_validated_sidecar_hashes: BTreeMap<u64, B256>,
     /// Committed views whose compact execution output was unavailable or
     /// malformed when the block committed. A gap is an ordering barrier:
     /// later diffs remain staged until late BlockData recovers the missing one.
@@ -740,6 +744,28 @@ impl ConsensusService {
         );
         if view <= self.execution_validated_head_view {
             self.enqueue_confirmed_sidecar_state_diffs(self.execution_validated_head_view);
+        }
+    }
+
+    /// Drop a staged diff whose corresponding payload failed execution
+    /// validation. Keeping peer-supplied bytes after a non-`Valid` result could
+    /// let a later honest payload with the same declared hash flush the forged
+    /// diff into QMDB/Twig.
+    fn discard_unvalidated_sidecar_diff(&mut self, view: u64, hash: B256) {
+        let matches = self
+            .pending_sidecar_diffs
+            .get(&view)
+            .is_some_and(|(staged_hash, _)| *staged_hash == hash);
+        let removed = matches && self.pending_sidecar_diffs.remove(&view).is_some();
+        if removed {
+            self.missing_sidecar_diffs.insert(view, hash);
+            counter!("n42_sidecar_unvalidated_diffs_discarded_total").increment(1);
+            warn!(
+                target: "n42::twig",
+                view,
+                %hash,
+                "discarded sidecar diff after payload failed execution validation"
+            );
         }
     }
 
@@ -1198,6 +1224,7 @@ impl ConsensusService {
             execution_validated_head_view: 0,
             eager_execution_validated: VecDeque::new(),
             pending_sidecar_diffs: BTreeMap::new(),
+            execution_validated_sidecar_hashes: BTreeMap::new(),
             missing_sidecar_diffs: BTreeMap::new(),
             sidecar_apply_queue: Arc::new(std::sync::Mutex::new(VecDeque::new())),
             sidecar_apply_worker_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1411,6 +1438,7 @@ impl ConsensusService {
             execution_validated_head_view: 0,
             eager_execution_validated: VecDeque::new(),
             pending_sidecar_diffs: BTreeMap::new(),
+            execution_validated_sidecar_hashes: BTreeMap::new(),
             missing_sidecar_diffs: BTreeMap::new(),
             sidecar_apply_queue: Arc::new(std::sync::Mutex::new(VecDeque::new())),
             sidecar_apply_worker_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -2501,7 +2529,7 @@ mod tests {
     use n42_network::{NetworkCommand, NetworkHandle};
     use n42_primitives::consensus::ValidatorChange;
     use n42_primitives::{BlsSecretKey, ConsensusMessage, QuorumCertificate, TimeoutMessage, Vote};
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::sync::{Arc, Mutex, RwLock};
     use std::time::Duration;
 
@@ -2538,7 +2566,7 @@ mod tests {
 
     #[derive(Clone)]
     struct MockExecutionLayer {
-        new_payload_status: PayloadStatusEnum,
+        new_payload_statuses: Arc<Mutex<VecDeque<PayloadStatusEnum>>>,
         fcu_statuses: Arc<Mutex<VecDeque<PayloadStatusEnum>>>,
         build_parents: Arc<Mutex<Vec<B256>>>,
         build_forkchoices: Arc<Mutex<Vec<(B256, B256, B256)>>>,
@@ -2552,7 +2580,7 @@ mod tests {
     impl MockExecutionLayer {
         fn new(new_payload_status: PayloadStatusEnum, fcu_status: PayloadStatusEnum) -> Self {
             Self {
-                new_payload_status,
+                new_payload_statuses: Arc::new(Mutex::new(VecDeque::from([new_payload_status]))),
                 fcu_statuses: Arc::new(Mutex::new(VecDeque::from([fcu_status]))),
                 build_parents: Arc::new(Mutex::new(Vec::new())),
                 build_forkchoices: Arc::new(Mutex::new(Vec::new())),
@@ -2571,8 +2599,27 @@ mod tests {
                 "at least one FCU status is required"
             );
             Self {
-                new_payload_status,
+                new_payload_statuses: Arc::new(Mutex::new(VecDeque::from([new_payload_status]))),
                 fcu_statuses: Arc::new(Mutex::new(fcu_statuses)),
+                build_parents: Arc::new(Mutex::new(Vec::new())),
+                build_forkchoices: Arc::new(Mutex::new(Vec::new())),
+                fcu_heads: Arc::new(Mutex::new(Vec::new())),
+                new_payload_hashes: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn with_new_payload_statuses(
+            new_payload_statuses: impl IntoIterator<Item = PayloadStatusEnum>,
+            fcu_status: PayloadStatusEnum,
+        ) -> Self {
+            let new_payload_statuses = new_payload_statuses.into_iter().collect::<VecDeque<_>>();
+            assert!(
+                !new_payload_statuses.is_empty(),
+                "at least one new-payload status is required"
+            );
+            Self {
+                new_payload_statuses: Arc::new(Mutex::new(new_payload_statuses)),
+                fcu_statuses: Arc::new(Mutex::new(VecDeque::from([fcu_status]))),
                 build_parents: Arc::new(Mutex::new(Vec::new())),
                 build_forkchoices: Arc::new(Mutex::new(Vec::new())),
                 fcu_heads: Arc::new(Mutex::new(Vec::new())),
@@ -2619,7 +2666,16 @@ mod tests {
                 .lock()
                 .expect("mock execution-layer lock")
                 .push(payload.payload.block_hash());
-            Ok(PayloadStatus::from_status(self.new_payload_status.clone()))
+            let mut statuses = self
+                .new_payload_statuses
+                .lock()
+                .expect("mock execution-layer lock");
+            let status = if statuses.len() > 1 {
+                statuses.pop_front().expect("non-empty status queue")
+            } else {
+                statuses.front().expect("non-empty status queue").clone()
+            };
+            Ok(PayloadStatus::from_status(status))
         }
 
         async fn fork_choice_updated(
@@ -2668,6 +2724,40 @@ mod tests {
             _kind: crate::el::ResolveKind,
         ) -> Option<Result<crate::el::BuiltBlock, crate::el::ElError>> {
             None
+        }
+    }
+
+    #[derive(Default)]
+    struct MockExecutionOutputCache {
+        active: Mutex<HashSet<B256>>,
+        injected: Mutex<Vec<B256>>,
+        evicted: Mutex<Vec<B256>>,
+    }
+
+    impl MockExecutionOutputCache {
+        fn contains(&self, hash: B256) -> bool {
+            self.active.lock().expect("mock cache lock").contains(&hash)
+        }
+
+        fn evicted(&self) -> Vec<B256> {
+            self.evicted.lock().expect("mock cache lock").clone()
+        }
+    }
+
+    impl crate::exec_cache::ExecutionOutputCache for MockExecutionOutputCache {
+        fn take_serialized(&self, _hash: B256) -> Option<Vec<u8>> {
+            None
+        }
+
+        fn inject(&self, hash: B256, _compressed: &[u8], _source: &'static str) -> bool {
+            self.active.lock().expect("mock cache lock").insert(hash);
+            self.injected.lock().expect("mock cache lock").push(hash);
+            true
+        }
+
+        fn evict(&self, hash: B256) {
+            self.active.lock().expect("mock cache lock").remove(&hash);
+            self.evicted.lock().expect("mock cache lock").push(hash);
         }
     }
 
@@ -4384,6 +4474,7 @@ mod tests {
         orch.pending_sidecar_diffs
             .insert(2, (later_hash, later_diff));
 
+        orch.advance_execution_validated_head(1, missing_hash, "confirm missing diff hash");
         orch.advance_execution_validated_head(2, later_hash, "confirm across missing diff");
         drain_spawned_tasks().await;
         assert!(
@@ -4439,14 +4530,40 @@ mod tests {
         orch.pending_sidecar_diffs
             .insert(2, (second_hash, diff_with_accounts(2)));
 
-        // A later confirmation proves its ancestors executable too. The worker
-        // must still apply their diffs in committed-view order.
+        // The later completion arrives first, but cannot authorize the staged
+        // earlier hash by itself. Once the exact earlier completion arrives,
+        // the worker applies both diffs in view order without regressing head.
         orch.advance_execution_validated_head(2, second_hash, "later confirmation first");
+        assert!(applies.lock().unwrap().is_empty());
+        orch.advance_execution_validated_head(1, first_hash, "earlier confirmation observed late");
         drain_spawned_tasks().await;
 
         assert_eq!(*applies.lock().unwrap(), vec![1, 2]);
         assert!(orch.pending_sidecar_diffs.is_empty());
         assert!(orch.sidecar_apply_queue.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sidecar_flush_rejects_diff_for_noncanonical_hash_at_view() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let (sink, applies) = SpyStateSink::new();
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
+        orch.jmt = Some(sink);
+        let forged_hash = B256::repeat_byte(0x81);
+        let canonical_hash = B256::repeat_byte(0x82);
+        orch.pending_sidecar_diffs.insert(
+            1,
+            (forged_hash, n42_execution::state_diff::StateDiff::default()),
+        );
+
+        orch.advance_execution_validated_head(1, canonical_hash, "canonical import");
+        drain_spawned_tasks().await;
+
+        assert!(applies.lock().unwrap().is_empty());
+        assert!(!orch.pending_sidecar_diffs.contains_key(&1));
+        assert_eq!(orch.missing_sidecar_diffs.get(&1), Some(&canonical_hash));
     }
 
     /// F7 defense-in-depth: if an out-of-order entry ever reaches the apply
@@ -5160,6 +5277,71 @@ mod tests {
             vec![bad_hash],
             "the cached second arrival must not reach new_payload"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn declared_hash_poison_is_evicted_and_honest_block_can_follow() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let parent = B256::repeat_byte(0x71);
+        let honest_hash = B256::repeat_byte(0x72);
+        let mock = Arc::new(MockExecutionLayer::with_new_payload_statuses(
+            [
+                PayloadStatusEnum::Invalid {
+                    validation_error: format!(
+                        "block hash mismatch: want {}, got {}",
+                        B256::repeat_byte(0x73),
+                        honest_hash
+                    ),
+                },
+                PayloadStatusEnum::Valid,
+            ],
+            PayloadStatusEnum::Valid,
+        ));
+        let cache = Arc::new(MockExecutionOutputCache::default());
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx)
+            .with_exec_output_cache(cache.clone());
+        orch.el = Some(mock.clone());
+        orch.head_block_hash = parent;
+
+        let forged = BlockDataBroadcast {
+            block_hash: honest_hash,
+            view: 1,
+            // The envelope and payload both declare the honest hash so the
+            // pre-submit field check passes, while the payload contents differ
+            // from the honest arrival below. Reth is what recomputes the hash.
+            payload_json: serde_json::to_vec(&test_execution_data_at_number(
+                parent,
+                honest_hash,
+                999,
+            ))
+            .unwrap(),
+            timestamp: 1,
+            // The mock cache deliberately accepts arbitrary bytes: this models
+            // a peer-supplied bundle keyed by the honest block's declared hash.
+            execution_output: Some(vec![0xFA, 0xCE]),
+            leader_ready_unix_ms: 0,
+        };
+        assert!(!orch.import_and_notify(forged).await);
+        assert_eq!(cache.evicted(), vec![honest_hash]);
+        assert!(!cache.contains(honest_hash));
+        assert!(
+            !orch.bad_blocks.should_skip(honest_hash, "test"),
+            "a recomputed-hash mismatch must not blacklist the declared honest hash"
+        );
+
+        let honest = BlockDataBroadcast {
+            block_hash: honest_hash,
+            view: 1,
+            payload_json: serde_json::to_vec(&test_execution_data(parent, honest_hash)).unwrap(),
+            timestamp: 1,
+            execution_output: None,
+            leader_ready_unix_ms: 0,
+        };
+        assert!(orch.import_and_notify(honest).await);
+        assert_eq!(orch.head_block_hash, honest_hash);
+        assert_eq!(mock.new_payload_hashes(), vec![honest_hash, honest_hash]);
     }
 
     #[tokio::test(flavor = "current_thread")]

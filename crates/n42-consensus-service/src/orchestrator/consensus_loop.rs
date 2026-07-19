@@ -1005,12 +1005,14 @@ impl ConsensusService {
         }
 
         // Compact Block: load execution output into payload cache before `new_payload`.
-        if let Some(ref exec_compressed) = broadcast.execution_output
+        let compact_injected = if let Some(ref exec_compressed) = broadcast.execution_output
             && super::execution_bridge::compact_block_enabled()
             && let Some(ref cache) = exec_cache
         {
-            cache.inject(block_hash, exec_compressed, "consensus_loop");
-        }
+            cache.inject(block_hash, exec_compressed, "consensus_loop")
+        } else {
+            false
+        };
 
         match engine_handle.new_payload(execution_data).await {
             Ok(status) if matches!(status.status, PayloadStatusEnum::Valid) => {
@@ -1054,6 +1056,9 @@ impl ConsensusService {
                     PayloadStatusEnum::Syncing | PayloadStatusEnum::Accepted
                 ) =>
             {
+                if compact_injected && let Some(ref cache) = exec_cache {
+                    cache.evict(block_hash);
+                }
                 // `Accepted` = stored as a side chain, not executed (Engine
                 // API). Bucket it with `Syncing` so handle_import_done drives a
                 // catch-up rather than promoting an unexecuted block (F3).
@@ -1061,11 +1066,17 @@ impl ConsensusService {
                 (ImportOutcome::Syncing, 0)
             }
             Ok(status) => {
+                if compact_injected && let Some(ref cache) = exec_cache {
+                    cache.evict(block_hash);
+                }
                 bad_blocks.insert_if_invalid(block_hash, &status.status, "committed_import");
                 warn!(target: "n42::cl::consensus_loop", %block_hash, status = ?status.status, "bg import: new_payload rejected");
                 (ImportOutcome::Invalid, 0)
             }
             Err(e) => {
+                if compact_injected && let Some(ref cache) = exec_cache {
+                    cache.evict(block_hash);
+                }
                 // An Engine API transport/internal error is not an `Invalid`
                 // verdict. Keep the committed diff staged and retry ancestors.
                 error!(target: "n42::cl::consensus_loop", %block_hash, error = %e, "bg import: new_payload failed; treating as retryable");
@@ -1251,7 +1262,25 @@ impl ConsensusService {
         hash: B256,
         source: &'static str,
     ) {
+        if self.jmt.is_some() || self.twig.is_some() {
+            if let Some(existing) = self.execution_validated_sidecar_hashes.get(&view)
+                && *existing != hash
+            {
+                error!(
+                    target: "n42::twig",
+                    view,
+                    %hash,
+                    %existing,
+                    source,
+                    "conflicting execution-valid hashes for one sidecar view; refusing binding"
+                );
+                counter!("n42_sidecar_canonical_hash_conflicts_total").increment(1);
+                return;
+            }
+            self.execution_validated_sidecar_hashes.insert(view, hash);
+        }
         if view < self.execution_validated_head_view {
+            self.enqueue_confirmed_sidecar_state_diffs(self.execution_validated_head_view);
             debug!(
                 target: "n42::cl::consensus_loop",
                 view,
@@ -1330,13 +1359,7 @@ impl ConsensusService {
                     "COMMITTED block is unexecutable; preserving last execution-validated head and requesting sync"
                 );
                 counter!("n42_committed_block_unexecutable_total").increment(1);
-                if self
-                    .pending_sidecar_diffs
-                    .get(&view)
-                    .is_some_and(|(staged_hash, _)| *staged_hash == hash)
-                {
-                    self.pending_sidecar_diffs.remove(&view);
-                }
+                self.discard_unvalidated_sidecar_diff(view, hash);
             } else if committed {
                 warn!(
                     target: "n42::cl::consensus_loop",
@@ -1514,6 +1537,23 @@ impl ConsensusService {
     /// completions are observed; draining by committed view preserves the
     /// state-tree lineage and prevents separately spawned tasks from racing.
     pub(super) fn enqueue_confirmed_sidecar_state_diffs(&mut self, confirmed_view: u64) {
+        let last_applied_view = self
+            .last_sidecar_applied_view
+            .load(std::sync::atomic::Ordering::Acquire);
+        let stale_bindings: Vec<_> = self
+            .execution_validated_sidecar_hashes
+            .keys()
+            .filter(|view| {
+                **view <= last_applied_view
+                    && !self.pending_sidecar_diffs.contains_key(view)
+                    && !self.missing_sidecar_diffs.contains_key(view)
+            })
+            .copied()
+            .collect();
+        for view in stale_bindings {
+            self.execution_validated_sidecar_hashes.remove(&view);
+        }
+
         // Never apply across a missing committed diff. Views can skip on
         // HotStuff timeouts, so the barrier is the first explicitly recorded
         // missing view rather than `last + 1` arithmetic.
@@ -1522,12 +1562,37 @@ impl ConsensusService {
             .range(..=confirmed_view)
             .next()
             .map(|(view, _)| *view);
-        let confirmed_views: Vec<u64> = self
-            .pending_sidecar_diffs
-            .range(..=confirmed_view)
-            .take_while(|(view, _)| blocked_view.is_none_or(|blocked| **view < blocked))
-            .map(|(view, _)| *view)
-            .collect();
+        let mut confirmed_views = Vec::new();
+        let mut canonical_mismatch = None;
+        for (view, (staged_hash, _)) in self.pending_sidecar_diffs.range(..=confirmed_view) {
+            if blocked_view.is_some_and(|blocked| *view >= blocked) {
+                break;
+            }
+            let Some(canonical_hash) = self.execution_validated_sidecar_hashes.get(view) else {
+                // A later execution completion does not by itself authorize an
+                // arbitrary staged diff at an earlier view. Wait for the exact
+                // per-view `Valid` result.
+                break;
+            };
+            if canonical_hash != staged_hash {
+                canonical_mismatch = Some((*view, *staged_hash, *canonical_hash));
+                break;
+            }
+            confirmed_views.push(*view);
+        }
+
+        if let Some((view, staged_hash, canonical_hash)) = canonical_mismatch {
+            self.pending_sidecar_diffs.remove(&view);
+            self.missing_sidecar_diffs.insert(view, canonical_hash);
+            counter!("n42_sidecar_canonical_hash_mismatch_total").increment(1);
+            error!(
+                target: "n42::twig",
+                view,
+                %staged_hash,
+                %canonical_hash,
+                "discarded sidecar diff that is not bound to the execution-valid canonical hash"
+            );
+        }
         if confirmed_views.is_empty() {
             return;
         }
@@ -1541,6 +1606,7 @@ impl ConsensusService {
                 if let Some((hash, diff)) = self.pending_sidecar_diffs.remove(&view) {
                     queue.push_back((view, hash, diff));
                 }
+                self.execution_validated_sidecar_hashes.remove(&view);
             }
         }
 

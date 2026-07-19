@@ -19,7 +19,8 @@ pub use mobile::{
 };
 pub use service::{NetworkCommand, NetworkEvent, NetworkHandle, NetworkService};
 pub use state_sync::{
-    BlockSyncRequest, BlockSyncResponse, MAX_BLOCKS_PER_SYNC_REQUEST, SyncBlock, SyncPayload,
+    BlockSyncRequest, BlockSyncResponse, MAX_BLOCKS_PER_SYNC_REQUEST, MAX_SYNC_MESSAGE_SIZE,
+    SyncBlock, SyncPayload,
 };
 pub use transport::{
     N42Behaviour, TransportConfig, build_swarm, build_swarm_with_validator_index,
