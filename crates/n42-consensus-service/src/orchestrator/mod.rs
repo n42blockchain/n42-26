@@ -44,6 +44,20 @@ const DEFAULT_LEADER_PROPOSE_WARMUP_MS: u64 = 500;
 /// Re-check interval while waiting for validator quorum.
 const LEADER_QUORUM_RETRY_MS: u64 = 500;
 
+/// Default interval for re-sending the current view's locally signed R1/R2
+/// vote when the collector may have missed the first delivery.
+const DEFAULT_VOTE_RESEND_MS: u64 = 2_000;
+
+/// A locally signed vote awaiting evidence that the view progressed. Re-sending
+/// the exact bytes is safe because collectors deduplicate by `(view, voter)`.
+#[derive(Clone)]
+struct PendingVoteResend {
+    view: u64,
+    target: u32,
+    message: n42_primitives::ConsensusMessage,
+    next_at: Instant,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LeaderBuildWaitMode {
     /// The pending leader build should be executed directly once quorum is reached.
@@ -450,6 +464,9 @@ pub struct ConsensusService {
     epoch_schedule: Option<EpochSchedule>,
     /// Buffer for batching tx forwards to the current leader.
     tx_forward_buffer: Vec<Vec<u8>>,
+    /// Last R1/R2 vote sent in the current view. If direct delivery was lost and
+    /// the view has not advanced, retry it periodically to the collector.
+    pending_vote_resend: Option<PendingVoteResend>,
     /// Per-block pipeline timing tracker. Populated incrementally as events flow
     /// through the orchestrator. Logged and emitted as metrics at commit time.
     /// Bounded to 32 entries; older entries are evicted.
@@ -500,6 +517,59 @@ pub struct ConsensusService {
 }
 
 impl ConsensusService {
+    fn vote_resend_delay() -> Duration {
+        Duration::from_millis(
+            std::env::var("N42_VOTE_RESEND_MS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(DEFAULT_VOTE_RESEND_MS)
+                .max(100),
+        )
+    }
+
+    fn resend_pending_vote(&mut self) {
+        let Some(pending) = self.pending_vote_resend.clone() else {
+            return;
+        };
+
+        let current_view = self.engine.current_view();
+        if pending.view != current_view {
+            self.pending_vote_resend = None;
+            return;
+        }
+
+        let mut delivered_directly = false;
+        if let Some(peer_id) = self.network.validator_peer(pending.target) {
+            match self.network.send_direct(peer_id, pending.message.clone()) {
+                Ok(()) => delivered_directly = true,
+                Err(error) => warn!(
+                    target: "n42::cl::orchestrator",
+                    view = pending.view,
+                    target = pending.target,
+                    %error,
+                    "direct vote resend failed; falling back to gossip"
+                ),
+            }
+        }
+
+        if !delivered_directly && let Err(error) = self.network.broadcast_consensus(pending.message)
+        {
+            warn!(
+                target: "n42::cl::orchestrator",
+                view = pending.view,
+                target = pending.target,
+                %error,
+                "fallback gossip vote resend failed"
+            );
+        }
+
+        counter!("n42_consensus_vote_resends_total", "delivery" => if delivered_directly { "direct" } else { "gossip" })
+            .increment(1);
+        if let Some(next) = self.pending_vote_resend.as_mut() {
+            next.next_at = Instant::now() + Self::vote_resend_delay();
+        }
+    }
+
     fn async_finalize_fcu_enabled() -> bool {
         std::env::var("N42_ASYNC_FINALIZE_FCU")
             .ok()
@@ -1074,6 +1144,7 @@ impl ConsensusService {
             view_started_at: None,
             epoch_schedule: None,
             tx_forward_buffer: Vec::new(),
+            pending_vote_resend: None,
             pipeline_timings: HashMap::new(),
             last_commit_instant: None,
             last_commit_view: None,
@@ -1285,6 +1356,7 @@ impl ConsensusService {
             view_started_at: None,
             epoch_schedule: None,
             tx_forward_buffer: Vec::new(),
+            pending_vote_resend: None,
             pipeline_timings: HashMap::new(),
             last_commit_instant: None,
             last_commit_view: None,
@@ -1489,6 +1561,18 @@ impl ConsensusService {
             };
             tokio::pin!(tx_flush_timer);
 
+            let vote_resend_deadline = self
+                .pending_vote_resend
+                .as_ref()
+                .map(|pending| pending.next_at);
+            let vote_resend_timer = async {
+                match vote_resend_deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::pin!(vote_resend_timer);
+
             // Biased select: consensus-critical channels are checked FIRST.
             // Without biased, tokio randomly permutes branch order on each poll,
             // causing consensus votes to compete with high-frequency TX events.
@@ -1532,6 +1616,12 @@ impl ConsensusService {
                             break;
                         }
                     }
+                }
+
+                // Keep the current view's locally signed R1/R2 vote alive when
+                // a collector's direct or gossip receive path was transiently lost.
+                _ = &mut vote_resend_timer => {
+                    self.resend_pending_vote();
                 }
 
                 // === Priority 3: Async finalize-FCU completion ===
@@ -2729,6 +2819,50 @@ mod tests {
             matches!(cmd, NetworkCommand::BroadcastConsensus(_)),
             "SendToValidator should fallback to BroadcastConsensus"
         );
+    }
+
+    #[tokio::test]
+    async fn test_current_view_vote_is_resent_directly_until_view_changes() {
+        let (engine, output_rx) = make_test_engine_with_validator_count(3, 0);
+        let collector = n42_network::PeerId::random();
+        let network = MockConsensusNetwork::with_peers(vec![(1, collector)]);
+        let network_probe = network.clone();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
+
+        let vote = Vote {
+            view: 1,
+            block_hash: B256::repeat_byte(0xBC),
+            voter: 0,
+            signature: test_key(0).sign(b"vote-resend"),
+        };
+        orch.handle_engine_output(EngineOutput::SendToValidator(
+            1,
+            ConsensusMessage::Vote(vote),
+        ))
+        .await;
+
+        assert_eq!(network_probe.direct_messages().len(), 1);
+        assert_eq!(network_probe.broadcasts().len(), 1);
+        orch.resend_pending_vote();
+        assert_eq!(
+            network_probe.direct_messages().len(),
+            2,
+            "the collector should receive the exact signed vote again"
+        );
+        assert_eq!(
+            network_probe.broadcasts().len(),
+            1,
+            "successful direct resend should not add gossip traffic"
+        );
+
+        orch.pending_vote_resend
+            .as_mut()
+            .expect("vote should remain pending")
+            .view = 0;
+        orch.resend_pending_vote();
+        assert!(orch.pending_vote_resend.is_none());
+        assert_eq!(network_probe.direct_messages().len(), 2);
     }
 
     #[tokio::test]

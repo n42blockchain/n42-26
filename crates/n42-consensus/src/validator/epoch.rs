@@ -289,6 +289,27 @@ impl EpochManager {
         &self.current_set
     }
 
+    /// Returns the validator set for `view` only when it is known exactly.
+    ///
+    /// Unlike [`Self::validator_set_for_view`], this never falls back to the
+    /// current set. Safety-critical recovery paths use it before aggregating
+    /// signatures for a future view: accepting a quorum under a guessed set at
+    /// an unstaged epoch boundary could manufacture an invalid certificate.
+    pub fn known_validator_set_for_view(&self, view: u64) -> Option<&ValidatorSet> {
+        if self.epoch_length == 0 {
+            return Some(&self.current_set);
+        }
+
+        let epoch = self.epoch_for_view(view);
+        if epoch == self.current_epoch {
+            return Some(&self.current_set);
+        }
+        if epoch == self.current_epoch + 1 {
+            return self.next_set.as_ref();
+        }
+        self.historical_sets.get(&epoch)
+    }
+
     /// Stages a new validator set for the next epoch.
     /// The set will be activated when `advance_epoch()` is called.
     pub fn stage_next_epoch(

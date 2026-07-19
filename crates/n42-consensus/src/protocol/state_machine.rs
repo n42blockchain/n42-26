@@ -221,6 +221,10 @@ pub struct ConsensusEngine {
     pub(super) vote_collector: Option<VoteCollector>,
     pub(super) commit_collector: Option<VoteCollector>,
     pub(super) timeout_collector: Option<TimeoutCollector>,
+    /// Verified timeout votes for future views, keyed by their exact view.
+    /// These may produce a TC only when the validator set for that view is
+    /// known without epoch fallback and this node is the next-view leader.
+    pub(super) future_timeout_collectors: HashMap<ViewNumber, TimeoutCollector>,
     /// QC formed from Round 1 votes (used to broadcast PrepareQC).
     pub(super) prepare_qc: Option<QuorumCertificate>,
     /// Saved PrepareQC piggybacked into the next Proposal (chained mode).
@@ -324,6 +328,7 @@ impl ConsensusEngine {
             vote_collector: None,
             commit_collector: None,
             timeout_collector: None,
+            future_timeout_collectors: HashMap::new(),
             prepare_qc: None,
             previous_prepare_qc: None,
             output_tx,
@@ -428,6 +433,7 @@ impl ConsensusEngine {
             vote_collector: None,
             commit_collector: None,
             timeout_collector: None,
+            future_timeout_collectors: HashMap::new(),
             prepare_qc: None,
             previous_prepare_qc: None,
             output_tx,
@@ -724,6 +730,11 @@ impl ConsensusEngine {
 
             if view > current_view && !is_exempt {
                 if view <= current_view + FUTURE_VIEW_WINDOW {
+                    if let ConsensusMessage::Timeout(ref timeout) = msg
+                        && self.collect_future_timeout(timeout.clone())?
+                    {
+                        return Ok(());
+                    }
                     if self.future_msg_buffer.len() >= MAX_FUTURE_MESSAGES {
                         // Evict the oldest (lowest view) entry.
                         if let Some(min_idx) = self
@@ -976,6 +987,9 @@ impl ConsensusEngine {
         self.vote_collector = None;
         self.commit_collector = None;
         self.timeout_collector = None;
+        self.future_timeout_collectors.retain(|view, _| {
+            *view > new_view && *view <= new_view.saturating_add(FUTURE_VIEW_WINDOW)
+        });
         self.prepare_qc = None;
         self.pending_proposal = None;
         self.imported_blocks.clear();
@@ -4067,6 +4081,93 @@ mod tests {
             .expect("timeout beyond window should be silently dropped");
 
         assert_eq!(engine.current_view(), 1);
+    }
+
+    #[test]
+    fn future_timeout_quorum_advances_only_with_a_valid_tc() {
+        use crate::protocol::quorum::timeout_signing_message;
+
+        // For four validators, view 6's leader is validator 2. Start it far
+        // behind at view 1 and deliver three distinct timeouts for view 5.
+        let (mut engine, sks, _, mut rx) = make_engine(4, 2);
+        let timeout_view = 5;
+        let msg = timeout_signing_message(timeout_view);
+
+        for sender in [0u32, 1] {
+            engine
+                .process_event(ConsensusEvent::Message(ConsensusMessage::Timeout(
+                    TimeoutMessage {
+                        view: timeout_view,
+                        high_qc: QuorumCertificate::genesis(),
+                        sender,
+                        signature: sks[sender as usize].sign(&msg),
+                    },
+                )))
+                .expect("valid future timeout should be collected");
+            assert_eq!(
+                engine.current_view(),
+                1,
+                "fewer than quorum future timeouts must never advance the view"
+            );
+        }
+
+        engine
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Timeout(
+                TimeoutMessage {
+                    view: timeout_view,
+                    high_qc: QuorumCertificate::genesis(),
+                    sender: 2,
+                    signature: sks[2].sign(&msg),
+                },
+            )))
+            .expect("a verified future timeout quorum should form a TC");
+
+        assert_eq!(engine.current_view(), 6);
+        let outputs: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let new_view = outputs.iter().find_map(|output| match output {
+            EngineOutput::BroadcastMessage(ConsensusMessage::NewView(new_view)) => Some(new_view),
+            _ => None,
+        });
+        let new_view = new_view.expect("the next-view leader must broadcast the TC proof");
+        assert_eq!(new_view.view, 6);
+        assert_eq!(new_view.timeout_cert.view, timeout_view);
+        crate::protocol::quorum::verify_tc(&new_view.timeout_cert, engine.validator_set())
+            .expect("future recovery must produce a cryptographically valid TC");
+    }
+
+    #[test]
+    fn future_timeout_quorum_rejects_unknown_epoch_set_fallback() {
+        use crate::protocol::quorum::timeout_signing_message;
+
+        // Epoch 1 begins at view 3, but no next set has been staged. The legacy
+        // resolver would fall back to epoch 0's set; the recovery path must not.
+        let (mut engine, sks, vs, mut rx) = make_engine(4, 0);
+        engine.epoch_manager = EpochManager::with_epoch_length(vs, 2);
+        let timeout_view = 3;
+        let msg = timeout_signing_message(timeout_view);
+
+        for sender in [0u32, 1, 2] {
+            engine
+                .process_event(ConsensusEvent::Message(ConsensusMessage::Timeout(
+                    TimeoutMessage {
+                        view: timeout_view,
+                        high_qc: QuorumCertificate::genesis(),
+                        sender,
+                        signature: sks[sender as usize].sign(&msg),
+                    },
+                )))
+                .expect("unknown-epoch timeout should be buffered without aggregation");
+        }
+
+        assert_eq!(engine.current_view(), 1);
+        assert!(engine.future_timeout_collectors.is_empty());
+        assert_eq!(engine.future_msg_buffer.len(), 3);
+        assert!(
+            !std::iter::from_fn(|| rx.try_recv().ok()).any(|output| matches!(
+                output,
+                EngineOutput::BroadcastMessage(ConsensusMessage::NewView(_))
+            ))
+        );
     }
 
     #[test]

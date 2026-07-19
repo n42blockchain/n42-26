@@ -1,4 +1,4 @@
-use n42_primitives::consensus::{ConsensusMessage, NewView, TimeoutMessage};
+use n42_primitives::consensus::{ConsensusMessage, NewView, TimeoutCertificate, TimeoutMessage};
 
 use super::quorum::{TimeoutCollector, newview_signing_message, timeout_signing_message};
 use super::round::Phase;
@@ -7,6 +7,97 @@ use crate::error::{ConsensusError, ConsensusResult};
 use crate::validator::LeaderSelector;
 
 impl ConsensusEngine {
+    /// Verifies and collects a timeout vote for a bounded future view.
+    ///
+    /// A lone future timeout never changes the local view. Only the exact
+    /// next-view leader may aggregate a quorum of distinct, verified timeout
+    /// signatures into a TC and advance. Validator-set lookup is strict so an
+    /// unstaged future epoch can never be verified using the current set as a
+    /// fallback.
+    pub(super) fn collect_future_timeout(
+        &mut self,
+        timeout: TimeoutMessage,
+    ) -> ConsensusResult<bool> {
+        let current_view = self.round_state.current_view();
+        if timeout.view <= current_view
+            || timeout.view > current_view.saturating_add(super::state_machine::FUTURE_VIEW_WINDOW)
+        {
+            return Ok(false);
+        }
+
+        let Some(view_set) = self
+            .epoch_manager
+            .known_validator_set_for_view(timeout.view)
+            .cloned()
+        else {
+            tracing::debug!(target: "n42::cl::timeout",
+                current_view,
+                timeout_view = timeout.view,
+                "buffering future timeout without aggregating: validator set is not known exactly"
+            );
+            return Ok(false);
+        };
+        let next_view = timeout.view.saturating_add(1);
+        let Some(next_view_set) = self
+            .epoch_manager
+            .known_validator_set_for_view(next_view)
+            .cloned()
+        else {
+            tracing::debug!(target: "n42::cl::timeout",
+                current_view,
+                timeout_view = timeout.view,
+                next_view,
+                "buffering future timeout without aggregating: next-view validator set is not known exactly"
+            );
+            return Ok(false);
+        };
+
+        let pk = view_set.get_public_key(timeout.sender)?;
+        let msg = timeout_signing_message(timeout.view);
+        pk.verify_prevalidated(&msg, &timeout.signature)
+            .map_err(|_| ConsensusError::InvalidSignature {
+                view: timeout.view,
+                validator_index: timeout.sender,
+            })?;
+        self.verify_embedded_qc(&timeout.high_qc)?;
+
+        let next_leader = LeaderSelector::leader_for_view(next_view, &next_view_set);
+        let local_timeout_index = view_set.index_of_public_key(&self.local_public_key);
+        let local_next_index = next_view_set.index_of_public_key(&self.local_public_key);
+        if local_timeout_index != Some(timeout.sender) && local_next_index != Some(next_leader) {
+            self.emit(EngineOutput::SendToValidator(
+                next_leader,
+                ConsensusMessage::Timeout(timeout.clone()),
+            ))?;
+        }
+
+        let collector = self
+            .future_timeout_collectors
+            .entry(timeout.view)
+            .or_insert_with(|| TimeoutCollector::new(timeout.view, view_set.len()));
+        match collector.add_verified_timeout(timeout.sender, timeout.signature, timeout.high_qc) {
+            Ok(()) => {}
+            Err(ConsensusError::DuplicateVote { .. }) => return Ok(false),
+            Err(error) => return Err(error),
+        }
+
+        let quorum_size = view_set.quorum_size();
+        if local_next_index != Some(next_leader) || !collector.has_quorum(quorum_size) {
+            return Ok(false);
+        }
+
+        let tc = collector.build_tc(&view_set)?;
+        self.future_timeout_collectors.remove(&timeout.view);
+        tracing::info!(target: "n42::cl::timeout",
+            local_view = current_view,
+            timeout_view = timeout.view,
+            next_view,
+            "future timeout quorum formed a TC; recovering split-view validators"
+        );
+        self.advance_with_tc(tc, next_view)?;
+        Ok(true)
+    }
+
     /// Verifies a QC embedded in a timeout or NewView message.
     /// Genesis QC (view 0) is exempt only when our own locked_qc is also genesis —
     /// i.e., the chain has just started and no real QC exists yet.
@@ -297,8 +388,12 @@ impl ConsensusEngine {
             }
         };
 
+        self.advance_with_tc(tc, next_view)
+    }
+
+    fn advance_with_tc(&mut self, tc: TimeoutCertificate, next_view: u64) -> ConsensusResult<()> {
         tracing::info!(target: "n42::cl::timeout",
-            view = current_view,
+            view = tc.view,
             "TC formed, I am the new leader for view {}", next_view
         );
 
