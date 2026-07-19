@@ -129,6 +129,7 @@ Logs are split into separate files by phase for easy maintenance:
 | [devlog-96-view-proof-gates](docs/devlog-96-view-proof-gates.md) | Gov5 S2: QC successor-only jumps, quorum-only timeout progression, stale-timer guard, restart CommitQC catch-up | Security |
 | [devlog-97-locked-qc-build-parent](docs/devlog-97-locked-qc-build-parent.md) | gov5 S3 audit: LockedQC-authoritative leader builds, async view/parent binding, fail-closed reth defer | Security |
 | [devlog-98-equivocation-crash-guards](docs/devlog-98-equivocation-crash-guards.md) | gov5 2026H1 S4：验签后且与到达顺序无关的 Proposal/R1/R2 equivocation 检测；R1/R2 双投票崩溃持久化与 fail-closed 恢复 | Security |
+| [devlog-99-bad-block-cache](docs/devlog-99-bad-block-cache.md) | gov5 2026H1 S5：512-entry LRU 确定性坏块缓存，覆盖 direct/gossip/sync/catch-up/observer；暂态失败不投毒；补 envelope/payload hash 绑定 | Liveness |
 
 ---
 

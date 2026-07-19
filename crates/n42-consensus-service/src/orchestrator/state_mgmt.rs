@@ -498,6 +498,14 @@ impl ConsensusService {
                 continue;
             }
 
+            if self
+                .bad_blocks
+                .should_skip(sync_block.block_hash, "sync_response")
+            {
+                counter!("n42_sync_bad_blocks_filtered_total").increment(1);
+                continue;
+            }
+
             let broadcast = BlockDataBroadcast {
                 block_hash: sync_block.block_hash,
                 view: sync_block.view,
@@ -507,7 +515,10 @@ impl ConsensusService {
                 leader_ready_unix_ms: 0,
             };
 
-            self.import_and_notify(broadcast).await;
+            if !self.import_and_notify(broadcast).await {
+                counter!("n42_sync_blocks_import_rejected_total").increment(1);
+                continue;
+            }
 
             // (T2c) Never double-count consensus metadata. A block is
             // already-counted when it is in the ring, or — after a crash between

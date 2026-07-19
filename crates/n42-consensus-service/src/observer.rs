@@ -2,6 +2,7 @@ use crate::blob_port::BlobStorePort;
 use crate::el::ExecutionLayer;
 use crate::epoch_schedule::EpochSchedule;
 use crate::exec_cache::ExecutionOutputCache;
+use crate::orchestrator::bad_block_cache::BadBlockCache;
 use crate::orchestrator::{BlobSidecarBroadcast, BlockDataBroadcast, CommittedBlock};
 use alloy_primitives::B256;
 use alloy_rpc_types_engine::{ForkchoiceState, PayloadStatusEnum};
@@ -164,6 +165,9 @@ pub struct ObserverOrchestrator {
     // Compact-block execution-output cache port (None ⇒ no inject)
     exec_output_cache: Option<Arc<dyn ExecutionOutputCache>>,
 
+    // Deterministic Engine API payload rejections shared by gossip and sync paths.
+    bad_blocks: BadBlockCache,
+
     // Progress
     blocks_imported: u64,
     sync_start_time: Instant,
@@ -197,6 +201,7 @@ impl ObserverOrchestrator {
             committed_blocks: VecDeque::new(),
             blob_store: None,
             exec_output_cache: None,
+            bad_blocks: BadBlockCache::default(),
             blocks_imported: 0,
             sync_start_time: Instant::now(),
         }
@@ -312,7 +317,7 @@ impl ObserverOrchestrator {
                 return;
             }
         };
-        self.import_block_data(broadcast, None).await;
+        let _ = self.import_block_data(broadcast, None).await;
     }
 
     /// Core import logic: parses the execution payload and submits it to the Engine API.
@@ -325,10 +330,14 @@ impl ObserverOrchestrator {
         &mut self,
         broadcast: BlockDataBroadcast,
         commit_qc: Option<QuorumCertificate>,
-    ) {
+    ) -> bool {
         let hash = broadcast.block_hash;
         let view = broadcast.view;
         let has_commit_proof = commit_qc.is_some();
+
+        if self.bad_blocks.should_skip(hash, "observer_import") {
+            return false;
+        }
 
         if view > self.highest_seen_view {
             self.highest_seen_view = view;
@@ -341,16 +350,34 @@ impl ObserverOrchestrator {
             Ok(d) => d,
             Err(e) => {
                 warn!(target: "n42::observer", %hash, error = %e, "failed to decompress payload");
-                return;
+                return false;
             }
         };
-        let execution_data = match serde_json::from_slice(&payload_json) {
+        let execution_data: alloy_rpc_types_engine::ExecutionData = match serde_json::from_slice(
+            &payload_json,
+        ) {
             Ok(d) => d,
             Err(e) => {
                 warn!(target: "n42::observer", %hash, error = %e, "failed to parse execution payload JSON");
-                return;
+                return false;
             }
         };
+        if execution_data.block_hash() != hash {
+            warn!(
+                target: "n42::observer",
+                %hash,
+                payload_hash = %execution_data.block_hash(),
+                "observer envelope hash does not match execution payload; dropping"
+            );
+            counter!("n42_block_data_payload_hash_mismatch_total").increment(1);
+            return false;
+        }
+        if self
+            .bad_blocks
+            .should_skip(hash, "observer_import_pre_submit")
+        {
+            return false;
+        }
 
         // Compact Block: load execution output to skip EVM re-execution.
         if let Some(ref exec_compressed) = broadcast.execution_output
@@ -370,7 +397,7 @@ impl ObserverOrchestrator {
                             %hash,
                             "validated gossip block without commit_qc; waiting for sync proof before following head"
                         );
-                        return;
+                        return true;
                     }
 
                     let fcu_state = ForkchoiceState {
@@ -422,17 +449,23 @@ impl ObserverOrchestrator {
                             "skipping observer sync cache for block without commit_qc"
                         );
                     }
+                    true
                 } else if matches!(
                     status.status,
                     PayloadStatusEnum::Syncing | PayloadStatusEnum::Accepted
                 ) {
                     debug!(target: "n42::observer", %hash, view, status = ?status.status, "new_payload has not executed observer block yet");
+                    true
                 } else {
+                    self.bad_blocks
+                        .insert_if_invalid(hash, &status.status, "observer_import");
                     warn!(target: "n42::observer", %hash, view, status = ?status.status, "new_payload rejected block");
+                    false
                 }
             }
             Err(e) => {
                 error!(target: "n42::observer", %hash, error = %e, "new_payload call failed");
+                false
             }
         }
     }
@@ -546,6 +579,14 @@ impl ObserverOrchestrator {
                 continue;
             }
 
+            if self
+                .bad_blocks
+                .should_skip(sync_block.block_hash, "observer_sync_response")
+            {
+                counter!("n42_sync_bad_blocks_filtered_total").increment(1);
+                continue;
+            }
+
             let commit_qc = sync_block.commit_qc.clone();
             let broadcast = BlockDataBroadcast {
                 block_hash: sync_block.block_hash,
@@ -557,8 +598,9 @@ impl ObserverOrchestrator {
             };
 
             // Import directly — no serialize/deserialize round-trip
-            self.import_block_data(broadcast, Some(commit_qc)).await;
-            imported += 1;
+            if self.import_block_data(broadcast, Some(commit_qc)).await {
+                imported += 1;
+            }
         }
 
         info!(target: "n42::observer", imported, "sync blocks processed");

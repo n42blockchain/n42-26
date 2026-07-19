@@ -1,3 +1,4 @@
+pub(crate) mod bad_block_cache;
 mod consensus_loop;
 mod execution_bridge;
 pub use execution_bridge::compact_block_enabled;
@@ -349,6 +350,8 @@ pub struct ConsensusService {
     /// Blocks that returned `Syncing` from new_payload, queued for retry.
     /// Each entry is `(serialized_data, retry_count)` — dropped after 3 retries.
     syncing_blocks: VecDeque<(Vec<u8>, u32)>,
+    /// Deterministic `new_payload(INVALID)` verdicts, bounded by an LRU policy.
+    bad_blocks: bad_block_cache::BadBlockCache,
     tx_import_tx: Option<mpsc::Sender<TxImportBatch>>,
     tx_broadcast_rx: Option<mpsc::Receiver<Vec<u8>>>,
     committed_blocks: VecDeque<CommittedBlock>,
@@ -1031,6 +1034,7 @@ impl ConsensusService {
             pending_executions: HashSet::new(),
             pending_finalization: None,
             syncing_blocks: VecDeque::new(),
+            bad_blocks: bad_block_cache::BadBlockCache::default(),
             tx_import_tx: None,
             tx_broadcast_rx: None,
             committed_blocks: VecDeque::new(),
@@ -1241,6 +1245,7 @@ impl ConsensusService {
             pending_executions: HashSet::new(),
             pending_finalization: None,
             syncing_blocks: VecDeque::new(),
+            bad_blocks: bad_block_cache::BadBlockCache::default(),
             tx_import_tx: None,
             tx_broadcast_rx: None,
             committed_blocks: VecDeque::new(),
@@ -4021,7 +4026,7 @@ mod tests {
             execution_output: None,
             leader_ready_unix_ms: 0,
         };
-        orch.import_and_notify(broadcast).await;
+        let _ = orch.import_and_notify(broadcast).await;
 
         assert!(
             mock.fcu_heads().is_empty(),
@@ -4231,7 +4236,7 @@ mod tests {
             execution_output: None,
             leader_ready_unix_ms: 0,
         };
-        orch.import_and_notify(broadcast).await;
+        let _ = orch.import_and_notify(broadcast).await;
 
         assert_eq!(
             orch.head_block_hash, head,
@@ -4272,20 +4277,140 @@ mod tests {
         orch.head_block_hash = head;
         orch.execution_validated_head_view = 1;
 
-        orch.import_and_notify(BlockDataBroadcast {
-            block_hash: block,
-            view: 2,
-            payload_json: serde_json::to_vec(&test_execution_data(head, block)).unwrap(),
-            timestamp: 0,
-            execution_output: None,
-            leader_ready_unix_ms: 0,
-        })
-        .await;
+        let _ = orch
+            .import_and_notify(BlockDataBroadcast {
+                block_hash: block,
+                view: 2,
+                payload_json: serde_json::to_vec(&test_execution_data(head, block)).unwrap(),
+                timestamp: 0,
+                execution_output: None,
+                leader_ready_unix_ms: 0,
+            })
+            .await;
 
         assert_eq!(orch.head_block_hash, head);
         assert_eq!(orch.execution_validated_head_view, 1);
         assert_eq!(mock.fcu_heads(), vec![block]);
         assert_eq!(orch.syncing_blocks.len(), 1, "the FCU is retried later");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn invalid_payload_is_cached_and_second_sync_arrival_skips_engine() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let parent = B256::repeat_byte(0x31);
+        let bad_hash = B256::repeat_byte(0x32);
+        let mock = Arc::new(MockExecutionLayer::new(
+            PayloadStatusEnum::Invalid {
+                validation_error: "state root mismatch".to_owned(),
+            },
+            PayloadStatusEnum::Valid,
+        ));
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
+        orch.el = Some(mock.clone());
+
+        for expected_submission in [false, false] {
+            let broadcast = bincode::deserialize(&test_block_data(parent, bad_hash, 1))
+                .expect("test broadcast decodes");
+            assert_eq!(orch.import_and_notify(broadcast).await, expected_submission);
+        }
+
+        assert_eq!(
+            mock.new_payload_hashes(),
+            vec![bad_hash],
+            "the cached second arrival must not reach new_payload"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn direct_block_arrival_is_filtered_by_bad_block_cache() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let parent = B256::repeat_byte(0x35);
+        let bad_hash = B256::repeat_byte(0x36);
+        let mock = Arc::new(MockExecutionLayer::new(
+            PayloadStatusEnum::Valid,
+            PayloadStatusEnum::Valid,
+        ));
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
+        orch.el = Some(mock.clone());
+        orch.bad_blocks
+            .insert_invalid_payload(bad_hash, "known invalid", "test_setup");
+
+        orch.handle_block_data(test_block_data(parent, bad_hash, 1))
+            .await;
+
+        assert!(mock.new_payload_hashes().is_empty());
+        assert!(
+            !orch.pending_block_data.contains_key(&bad_hash),
+            "known bad direct/gossip data must be dropped before consensus notification"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn syncing_payload_is_never_added_to_bad_block_cache() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let parent = B256::repeat_byte(0x41);
+        let block_hash = B256::repeat_byte(0x42);
+        let mock = Arc::new(MockExecutionLayer::new(
+            PayloadStatusEnum::Syncing,
+            PayloadStatusEnum::Valid,
+        ));
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
+        orch.el = Some(mock.clone());
+
+        for _ in 0..2 {
+            let broadcast = bincode::deserialize(&test_block_data(parent, block_hash, 1))
+                .expect("test broadcast decodes");
+            assert!(orch.import_and_notify(broadcast).await);
+        }
+
+        assert_eq!(mock.new_payload_hashes(), vec![block_hash, block_hash]);
+        assert!(
+            !orch.bad_blocks.should_skip(block_hash, "test"),
+            "Syncing is retryable and must not poison the cache"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn mismatched_sync_envelope_cannot_poison_declared_hash() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let parent = B256::repeat_byte(0x51);
+        let declared_hash = B256::repeat_byte(0x52);
+        let payload_hash = B256::repeat_byte(0x53);
+        let mock = Arc::new(MockExecutionLayer::new(
+            PayloadStatusEnum::Invalid {
+                validation_error: "invalid".to_owned(),
+            },
+            PayloadStatusEnum::Valid,
+        ));
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
+        orch.el = Some(mock.clone());
+
+        let submitted = orch
+            .import_and_notify(BlockDataBroadcast {
+                block_hash: declared_hash,
+                view: 1,
+                payload_json: serde_json::to_vec(&test_execution_data(parent, payload_hash))
+                    .unwrap(),
+                timestamp: 0,
+                execution_output: None,
+                leader_ready_unix_ms: 0,
+            })
+            .await;
+
+        assert!(!submitted);
+        assert!(mock.new_payload_hashes().is_empty());
+        assert!(
+            !orch.bad_blocks.should_skip(declared_hash, "test"),
+            "untrusted envelope mismatches must be dropped, not cached"
+        );
     }
 
     /// T4 rescue edge: eager `new_payload=Valid` arriving during a failed FCU
