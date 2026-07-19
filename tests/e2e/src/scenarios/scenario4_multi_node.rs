@@ -22,6 +22,10 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
         // Keep correctness CI on smaller, more decisive topologies.
         // Larger meshes remain available in the default manual/full profile.
         &[(1, 100, 0), (3, 100, 100), (5, 120, 200)]
+    } else if profile.eq_ignore_ascii_case("seven") {
+        // Targeted real-binary regression lane for the first topology that
+        // needs an explicit validator-set rendezvous before view 1.
+        &[(7, 100, 150)]
     } else {
         &[
             (1, 100, 0),
@@ -48,10 +52,14 @@ pub async fn run(binary_path: PathBuf) -> eyre::Result<()> {
 }
 
 fn startup_delay_ms(node_count: usize) -> Option<u64> {
-    // The 21-node profile starts validators sequentially. Give the initial
-    // leader enough time for the full validator set to become RPC-ready and
-    // form a mesh before view 1 begins.
-    (node_count > 10).then_some(35_000)
+    // Validators are spawned sequentially. Larger topologies need an explicit
+    // rendezvous so the initial leader cannot start view 1 while later
+    // validators are still establishing their execution ancestry and mesh.
+    match node_count {
+        0..=6 => None,
+        7..=10 => Some(15_000),
+        _ => Some(35_000),
+    }
 }
 
 /// Tests multi-node consensus with comprehensive verification.
@@ -372,4 +380,19 @@ async fn run_multi_node_test(
         let _ = node.stop();
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::startup_delay_ms;
+
+    #[test]
+    fn larger_validator_sets_wait_for_rendezvous() {
+        assert_eq!(startup_delay_ms(1), None);
+        assert_eq!(startup_delay_ms(6), None);
+        assert_eq!(startup_delay_ms(7), Some(15_000));
+        assert_eq!(startup_delay_ms(10), Some(15_000));
+        assert_eq!(startup_delay_ms(11), Some(35_000));
+        assert_eq!(startup_delay_ms(21), Some(35_000));
+    }
 }

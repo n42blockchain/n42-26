@@ -13,6 +13,7 @@ This harness runs the real `n42-node` binary. Not every scenario is a merge-gate
 
 These are the scenarios selected by `.github/workflows/e2e.yml` and `.github/workflows/nightly.yml`.
 For `scenario4`, CI sets `E2E_SCENARIO4_PROFILE=correctness`; the default manual profile remains broader.
+Use `E2E_SCENARIO4_PROFILE=seven` to rerun the real-binary 7-validator rendezvous and consensus regression lane in isolation.
 
 ## Manual Integrated E2E
 
@@ -41,4 +42,5 @@ Use these for throughput studies, timing diagrams, and bottleneck analysis such 
 cargo build --release -p n42-node-bin -p e2e-test
 target/release/e2e-test --binary target/release/n42-node --scenario 5
 E2E_SCENARIO_FILTER=1,3,4 target/release/e2e-test --binary target/release/n42-node
+E2E_SCENARIO_FILTER=4 E2E_SCENARIO4_PROFILE=seven target/release/e2e-test --binary target/release/n42-node
 ```

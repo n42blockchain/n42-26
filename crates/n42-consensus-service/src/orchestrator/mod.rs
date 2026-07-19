@@ -346,6 +346,11 @@ pub struct ConsensusService {
     /// `LeaderBuildWaitMode::Scheduled` means the gate re-enters
     /// `schedule_payload_build` once quorum is reached.
     leader_build_waiting_view: Option<(u64, LeaderBuildWaitMode)>,
+    /// Earliest instant at which the startup leader may propose for the
+    /// associated view. Peer-connect events can satisfy the quorum gate before
+    /// the configured warmup floor, so the floor must be tracked separately
+    /// from the recheck timer.
+    leader_build_not_before: Option<(u64, Instant)>,
     sync_in_flight: bool,
     sync_started_at: Option<Instant>,
     /// `[from_view, to_view]` of the most recent in-flight sync / catch-up
@@ -613,6 +618,7 @@ impl ConsensusService {
 
     fn clear_leader_build_wait(&mut self) {
         self.leader_build_waiting_view = None;
+        self.leader_build_not_before = None;
     }
 
     fn schedule_leader_build_recheck(&mut self, delay: Duration) {
@@ -635,6 +641,24 @@ impl ConsensusService {
         if !self.engine.is_current_leader() {
             self.clear_leader_build_wait();
             return;
+        }
+
+        let current_view = self.engine.current_view();
+        if let Some((floor_view, not_before)) = self.leader_build_not_before {
+            if floor_view != current_view {
+                self.leader_build_not_before = None;
+            } else if let Some(remaining) = not_before.checked_duration_since(Instant::now()) {
+                debug!(
+                    target: "n42::cl::orchestrator",
+                    view = current_view,
+                    remaining_ms = remaining.as_millis() as u64,
+                    "leader build waiting for warmup floor"
+                );
+                self.schedule_leader_build_recheck(remaining);
+                return;
+            } else {
+                self.leader_build_not_before = None;
+            }
         }
 
         if let Some(slot_timestamp) = slot_timestamp {
@@ -957,6 +981,7 @@ impl ConsensusService {
             committed_blocks: VecDeque::new(),
             connected_peers: HashSet::new(),
             leader_build_waiting_view: None,
+            leader_build_not_before: None,
             sync_in_flight: false,
             sync_started_at: None,
             sync_request_range: None,
@@ -1167,6 +1192,7 @@ impl ConsensusService {
             committed_blocks: VecDeque::new(),
             connected_peers: HashSet::new(),
             leader_build_waiting_view: None,
+            leader_build_not_before: None,
             sync_in_flight: false,
             sync_started_at: None,
             sync_request_range: None,
@@ -1718,6 +1744,8 @@ impl ConsensusService {
             needed_quorum_peers = self.quorum_peers_needed(),
             "leader for view 1, waiting for validator quorum (warmup floor)"
         );
+        self.leader_build_not_before =
+            Some((self.engine.current_view(), Instant::now() + warmup_delay));
         self.schedule_leader_build_recheck(warmup_delay);
         self.engine.pacemaker_mut().extend_deadline(warmup_delay);
     }
@@ -3290,6 +3318,44 @@ mod tests {
         orch.handle_network_event(NetworkEvent::PeerConnected(mock_peers[3].1))
             .await;
         assert!(orch.leader_build_waiting_view.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_startup_leader_gate_honors_warmup_floor_after_quorum() {
+        let (engine, output_rx) = make_test_engine_with_validator_count(7, 1);
+        let mock_peers = (0..7)
+            .map(|idx| {
+                (
+                    idx as u32,
+                    Keypair::generate_ed25519().public().to_peer_id(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let network = Arc::new(MockConsensusNetwork::with_peers(mock_peers.clone()));
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let mut orch = ConsensusService::new(engine, network, net_event_rx, output_rx);
+        let view = orch.engine.current_view();
+
+        orch.begin_leader_build_wait(LeaderBuildWaitMode::Direct, None);
+        orch.leader_build_not_before = Some((view, Instant::now() + Duration::from_secs(60)));
+
+        for (_, peer_id) in mock_peers.iter().take(4) {
+            orch.handle_network_event(NetworkEvent::PeerConnected(*peer_id))
+                .await;
+        }
+
+        assert_eq!(
+            orch.leader_build_waiting_view,
+            Some((view, LeaderBuildWaitMode::Direct))
+        );
+        assert!(orch.leader_build_not_before.is_some());
+        assert!(orch.next_build_at.is_some());
+
+        orch.leader_build_not_before = Some((view, Instant::now()));
+        orch.evaluate_leader_build_wait(None).await;
+
+        assert!(orch.leader_build_waiting_view.is_none());
+        assert!(orch.leader_build_not_before.is_none());
     }
 
     #[test]
