@@ -50,6 +50,20 @@ pub struct BlockSyncResponse {
     pub blocks: Vec<SyncBlock>,
     /// Peer's latest committed view.
     pub peer_committed_view: u64,
+    /// Full block-data broadcasts for the execution lineage covered by the
+    /// committed blocks above. This includes prepared ancestors which became
+    /// canonical only when a descendant obtained a CommitQC. Keeping the raw
+    /// broadcast preserves the cached execution output and sidecar StateDiff.
+    pub execution_lineage: Vec<SyncPayload>,
+}
+
+/// A raw execution payload in a CommitQC-proven lineage.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SyncPayload {
+    pub view: u64,
+    pub block_hash: B256,
+    /// Bincode-encoded consensus `BlockDataBroadcast`.
+    pub block_data: Vec<u8>,
 }
 
 /// A single committed block for sync purposes.
@@ -69,7 +83,10 @@ pub struct SyncBlock {
 // ── libp2p request-response codec ──
 
 /// Protocol identifier for block sync.
-pub const SYNC_PROTOCOL: &str = "/n42/sync/1";
+// `BlockSyncResponse` v2 carries the raw execution lineage required to recover
+// prepared ancestors. Bincode is not self-describing, so mixed v1/v2 peers
+// must negotiate different protocol IDs instead of mis-decoding the wire body.
+pub const SYNC_PROTOCOL: &str = "/n42/sync/2";
 
 /// Maximum sync message size (16 MB — supports batches of blocks).
 const MAX_SYNC_MSG_SIZE: usize = 16 * 1024 * 1024;
@@ -186,6 +203,11 @@ mod tests {
         BlockSyncResponse {
             blocks: vec![sample_sync_block()],
             peer_committed_view: 25,
+            execution_lineage: vec![SyncPayload {
+                view: 15,
+                block_hash: B256::repeat_byte(0xAA),
+                block_data: vec![5, 6, 7],
+            }],
         }
     }
 
@@ -209,6 +231,7 @@ mod tests {
         assert_eq!(decoded.blocks[0].block_hash, B256::repeat_byte(0xAA));
         assert_eq!(decoded.blocks[0].payload, vec![1, 2, 3, 4]);
         assert_eq!(decoded.peer_committed_view, 25);
+        assert_eq!(decoded.execution_lineage[0].block_data, vec![5, 6, 7]);
     }
 
     #[test]
@@ -216,6 +239,7 @@ mod tests {
         let resp = BlockSyncResponse {
             blocks: vec![],
             peer_committed_view: 100,
+            execution_lineage: Vec::new(),
         };
         let bytes = bincode::serialize(&resp).unwrap();
         let decoded: BlockSyncResponse = bincode::deserialize(&bytes).unwrap();

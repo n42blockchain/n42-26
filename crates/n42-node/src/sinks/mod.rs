@@ -442,12 +442,19 @@ impl ZkSink for SchedulerZkSink {
 pub struct ManagerStakingSink(pub Arc<Mutex<StakingManager>>);
 
 impl StakingSink for ManagerStakingSink {
-    fn scan_committed_block(&self, view: u64, payload: &[u8]) {
+    fn scan_committed_block(&self, block_number: u64, payload: &[u8]) {
         let mut mgr = self.0.lock().unwrap_or_else(|e| {
             tracing::warn!("staking_mgr mutex poisoned, recovering");
             e.into_inner()
         });
-        mgr.scan_committed_block(view, payload);
+        mgr.scan_committed_block(block_number, payload);
+    }
+
+    fn last_scanned_block(&self) -> u64 {
+        self.0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .last_scanned_block()
     }
 
     fn save(&self) {

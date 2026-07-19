@@ -522,6 +522,7 @@ impl ObserverOrchestrator {
         let response = BlockSyncResponse {
             blocks,
             peer_committed_view,
+            execution_lineage: Vec::new(),
         };
 
         if let Err(e) = self
@@ -710,6 +711,7 @@ impl ObserverOrchestrator {
             commit_qc,
             payload: payload.to_vec(),
             validator_changes: None,
+            execution_lineage: Vec::new(),
         });
     }
 

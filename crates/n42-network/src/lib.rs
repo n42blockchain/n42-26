@@ -18,7 +18,9 @@ pub use mobile::{
     ShardedStarHubHandle, StarHub, StarHubConfig, StarHubHandle,
 };
 pub use service::{NetworkCommand, NetworkEvent, NetworkHandle, NetworkService};
-pub use state_sync::{BlockSyncRequest, BlockSyncResponse, MAX_BLOCKS_PER_SYNC_REQUEST, SyncBlock};
+pub use state_sync::{
+    BlockSyncRequest, BlockSyncResponse, MAX_BLOCKS_PER_SYNC_REQUEST, SyncBlock, SyncPayload,
+};
 pub use transport::{
     N42Behaviour, TransportConfig, build_swarm, build_swarm_with_validator_index,
     deterministic_validator_keypair, deterministic_validator_peer_id,

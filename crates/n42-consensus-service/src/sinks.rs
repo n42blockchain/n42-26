@@ -29,7 +29,8 @@ pub trait ZkSink: Send + Sync {
 /// staking state. Distinct from [`WithdrawalSource`] (the build-path query);
 /// both may wrap the same `StakingManager`.
 pub trait StakingSink: Send + Sync {
-    fn scan_committed_block(&self, view: u64, payload: &[u8]);
+    fn scan_committed_block(&self, block_number: u64, payload: &[u8]);
+    fn last_scanned_block(&self) -> u64;
     fn save(&self);
 }
 

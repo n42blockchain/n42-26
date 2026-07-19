@@ -3,7 +3,7 @@ use crate::persistence::{self, ConsensusSnapshot};
 use alloy_primitives::B256;
 use metrics::counter;
 use n42_consensus::{validator_changes_hash, verify_commit_qc};
-use n42_network::{BlockSyncResponse, MAX_BLOCKS_PER_SYNC_REQUEST, PeerId, SyncBlock};
+use n42_network::{BlockSyncResponse, MAX_BLOCKS_PER_SYNC_REQUEST, PeerId, SyncBlock, SyncPayload};
 use n42_primitives::QuorumCertificate;
 use std::sync::LazyLock;
 use std::time::Duration;
@@ -36,6 +36,8 @@ static CFG_MAX_EMPTY_SKIPS: LazyLock<u32> = LazyLock::new(|| {
         .and_then(|s| s.parse().ok())
         .unwrap_or(3)
 });
+
+const MAX_SYNC_BLOCKS: usize = 128;
 
 /// Maximum committed blocks retained in the ring buffer for sync serving.
 /// At 8-second slots, 10,000 blocks ≈ ~22 hours of history.
@@ -142,6 +144,24 @@ impl ConsensusService {
         commit_qc: QuorumCertificate,
         validator_changes: Option<Vec<n42_primitives::consensus::ValidatorChange>>,
     ) {
+        let execution_lineage: Vec<_> = self
+            .recent_execution_lineage(block_hash)
+            .into_iter()
+            .map(|entry| SyncPayload {
+                view: entry.view,
+                block_hash: entry.block_hash,
+                block_data: entry.block_data,
+            })
+            .collect();
+        // Ordinary blocks remain recoverable through `SyncBlock`; duplicating
+        // every cached execution output in the 10k-entry commit ring would be
+        // unbounded at high TPS. Raw retention is reserved for the indispensable
+        // case: a prepared ancestor without its own CommitQC.
+        let execution_lineage = if execution_lineage.len() > 1 {
+            execution_lineage
+        } else {
+            Vec::new()
+        };
         let payload = self
             .pending_block_data
             .get(&block_hash)
@@ -158,6 +178,7 @@ impl ConsensusService {
             commit_qc,
             payload,
             validator_changes,
+            execution_lineage,
         });
     }
 
@@ -364,13 +385,14 @@ impl ConsensusService {
             "handling sync request"
         );
 
-        const MAX_SYNC_BLOCKS: usize = 128;
-
-        let blocks: Vec<SyncBlock> = self
+        let retained: Vec<&CommittedBlock> = self
             .committed_blocks
             .iter()
             .filter(|b| b.view >= request.from_view && b.view <= request.to_view)
             .take(MAX_SYNC_BLOCKS)
+            .collect();
+        let blocks: Vec<SyncBlock> = retained
+            .iter()
             .map(|b| SyncBlock {
                 view: b.view,
                 block_hash: b.block_hash,
@@ -378,6 +400,14 @@ impl ConsensusService {
                 payload: b.payload.clone(),
                 validator_changes: b.validator_changes.clone(),
             })
+            .collect();
+        let mut lineage_hashes = std::collections::HashSet::new();
+        let execution_lineage = retained
+            .iter()
+            .flat_map(|block| block.execution_lineage.iter())
+            .filter(|payload| lineage_hashes.insert(payload.block_hash))
+            .take(MAX_SYNC_BLOCKS)
+            .cloned()
             .collect();
 
         let peer_committed_view = self.committed_blocks.back().map(|b| b.view).unwrap_or(0);
@@ -387,6 +417,7 @@ impl ConsensusService {
         let response = BlockSyncResponse {
             blocks,
             peer_committed_view,
+            execution_lineage,
         };
 
         if let Err(e) = self
@@ -396,6 +427,151 @@ impl ConsensusService {
         {
             error!(target: "n42::cl::sync", error = %e, "failed to send sync response");
         }
+    }
+
+    /// Validates raw execution payloads against the CommitQC-bearing blocks in
+    /// the response and returns the unique, parent-linked lineage in block
+    /// number order. No payload is imported unless the chain reaches the
+    /// caller's exact execution-validated hash.
+    fn validated_sync_execution_lineage(
+        &self,
+        response: &BlockSyncResponse,
+        requested_from: u64,
+        requested_to: u64,
+    ) -> Vec<(SyncPayload, BlockDataBroadcast, B256, u64)> {
+        let committed_hashes: std::collections::HashSet<B256> = response
+            .blocks
+            .iter()
+            .filter(|block| {
+                block.view >= requested_from
+                    && block.view <= requested_to
+                    && self.verify_sync_block_qc(block)
+            })
+            .map(|block| block.block_hash)
+            .collect();
+        if committed_hashes.is_empty() || response.execution_lineage.is_empty() {
+            return Vec::new();
+        }
+
+        let mut decoded: std::collections::HashMap<
+            B256,
+            (SyncPayload, BlockDataBroadcast, B256, u64),
+        > = std::collections::HashMap::new();
+        for payload in &response.execution_lineage {
+            if payload.view < requested_from || payload.view > requested_to {
+                continue;
+            }
+            let Ok(broadcast) = bincode::deserialize::<BlockDataBroadcast>(&payload.block_data)
+            else {
+                continue;
+            };
+            if broadcast.view != payload.view || broadcast.block_hash != payload.block_hash {
+                continue;
+            }
+            let Some((parent_hash, block_number)) =
+                Self::execution_parent_and_number(&payload.block_data)
+            else {
+                continue;
+            };
+            let decoded_payload = (payload.clone(), broadcast, parent_hash, block_number);
+            if let Some(existing) = decoded.get(&payload.block_hash) {
+                if existing.0.block_data != payload.block_data || existing.0.view != payload.view {
+                    error!(
+                        target: "n42::cl::sync",
+                        hash = %payload.block_hash,
+                        "sync response contains conflicting raw payloads for one block hash"
+                    );
+                    return Vec::new();
+                }
+                continue;
+            }
+            decoded.insert(payload.block_hash, decoded_payload);
+        }
+
+        let mut required = std::collections::HashSet::new();
+        for committed_hash in &committed_hashes {
+            let mut current = *committed_hash;
+            let mut path = Vec::new();
+            let mut seen = std::collections::HashSet::new();
+            let mut child_number = None;
+            while current != self.head_block_hash && path.len() < MAX_SYNC_BLOCKS {
+                if !seen.insert(current) {
+                    path.clear();
+                    break;
+                }
+                let Some((_, _, parent_hash, block_number)) = decoded.get(&current) else {
+                    path.clear();
+                    break;
+                };
+                if child_number.is_some_and(|child| block_number.saturating_add(1) != child) {
+                    path.clear();
+                    break;
+                }
+                child_number = Some(*block_number);
+                path.push(current);
+                current = *parent_hash;
+            }
+            if current == self.head_block_hash {
+                required.extend(path);
+            } else {
+                warn!(
+                    target: "n42::cl::sync",
+                    %committed_hash,
+                    execution_head = %self.head_block_hash,
+                    "sync response execution lineage does not reach the validated head"
+                );
+                counter!("n42_sync_execution_lineage_incomplete_total").increment(1);
+            }
+        }
+
+        let mut lineage: Vec<_> = required
+            .into_iter()
+            .filter_map(|hash| decoded.remove(&hash))
+            .collect();
+        lineage.sort_by_key(|(_, _, _, block_number)| *block_number);
+        if lineage
+            .windows(2)
+            .any(|pair| pair[0].3 == pair[1].3 && pair[0].0.block_hash != pair[1].0.block_hash)
+        {
+            error!(target: "n42::cl::sync", "sync response contains conflicting execution blocks at one height");
+            return Vec::new();
+        }
+        lineage
+    }
+
+    /// Selects the exact raw path `(floor, target]` from a previously validated
+    /// response lineage. Returning an empty path for a non-floor target means
+    /// the caller must not trust a cached execution output for that target.
+    fn sync_execution_path(
+        lineage: &[(SyncPayload, BlockDataBroadcast, B256, u64)],
+        floor: B256,
+        target: B256,
+    ) -> Vec<&(SyncPayload, BlockDataBroadcast, B256, u64)> {
+        if target == floor {
+            return Vec::new();
+        }
+        let by_hash: std::collections::HashMap<_, _> = lineage
+            .iter()
+            .map(|entry| (entry.0.block_hash, entry))
+            .collect();
+        let mut current = target;
+        let mut reversed = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        while current != floor && reversed.len() < MAX_SYNC_BLOCKS {
+            if !seen.insert(current) {
+                return Vec::new();
+            }
+            let Some(entry) = by_hash.get(&current).copied() else {
+                return Vec::new();
+            };
+            reversed.push(entry);
+            current = entry.2;
+        }
+        if current != floor {
+            return Vec::new();
+        }
+        reversed.reverse();
+        reversed
     }
 
     /// Handles a sync response containing blocks from a peer.
@@ -436,10 +612,50 @@ impl ConsensusService {
             return;
         }
 
+        let validated_lineage =
+            self.validated_sync_execution_lineage(&response, requested_from, requested_to);
+        // Capture the durable metadata floor before any import advances the
+        // execution head. This is the crash-recovery double-count guard; using
+        // the post-import head would incorrectly classify every fresh block as
+        // already accounted for.
+        let restored_committed_floor = self
+            .execution_validated_head_view
+            .max(self.last_commit_qc.as_ref().map(|qc| qc.view).unwrap_or(0));
+
+        // Stage every raw StateDiff before advancing reth. The prerequisite
+        // imports below may immediately return Valid and drain the sidecar
+        // queue, so staging after import would permanently skip an ancestor.
+        if self.jmt.is_some() || self.twig.is_some() {
+            for (payload, _, _, _) in &validated_lineage {
+                if let Some(diff) =
+                    Self::extract_state_diff_for_state_tree(payload.block_hash, &payload.block_data)
+                {
+                    self.missing_sidecar_diffs.remove(&payload.view);
+                    self.pending_sidecar_diffs
+                        .insert(payload.view, (payload.block_hash, diff));
+                } else {
+                    self.missing_sidecar_diffs
+                        .insert(payload.view, payload.block_hash);
+                    counter!("n42_sidecar_diff_gap_total").increment(1);
+                }
+            }
+        }
+
+        let raw_lineage_by_hash: std::collections::HashMap<_, _> = validated_lineage
+            .iter()
+            .map(|(payload, broadcast, _, block_number)| {
+                (payload.block_hash, (broadcast.clone(), *block_number))
+            })
+            .collect();
+
         let mut imported = 0u64;
         let mut highest_qc_verified_view = 0u64;
-        for sync_block in &response.blocks {
-            if sync_block.payload.is_empty() {
+        let mut sync_blocks: Vec<_> = response.blocks.iter().collect();
+        sync_blocks.sort_by_key(|block| block.view);
+        'sync_blocks: for sync_block in sync_blocks {
+            if sync_block.payload.is_empty()
+                && !raw_lineage_by_hash.contains_key(&sync_block.block_hash)
+            {
                 debug!(target: "n42::cl::sync", view = sync_block.view, "skipping sync block with empty payload");
                 continue;
             }
@@ -524,18 +740,105 @@ impl ConsensusService {
                 continue;
             }
 
-            let broadcast = BlockDataBroadcast {
-                block_hash: sync_block.block_hash,
-                view: sync_block.view,
-                payload_json: sync_block.payload.clone(),
-                timestamp: 0,
-                execution_output: None,
-                leader_ready_unix_ms: 0,
-            };
+            // Rebuild only the prepared ancestors immediately preceding this
+            // CommitQC block. Processing per committed block preserves order
+            // when another prepared ancestor appears between two CommitQCs in
+            // the same response.
+            let lineage_floor_hash = self.head_block_hash;
+            let block_lineage = Self::sync_execution_path(
+                &validated_lineage,
+                lineage_floor_hash,
+                sync_block.block_hash,
+            );
+            for entry in block_lineage
+                .iter()
+                .take(block_lineage.len().saturating_sub(1))
+            {
+                let broadcast = &entry.1;
+                let parent_hash = entry.2;
+                if parent_hash != self.head_block_hash {
+                    warn!(
+                        target: "n42::cl::sync",
+                        view = broadcast.view,
+                        hash = %broadcast.block_hash,
+                        expected_parent = %self.head_block_hash,
+                        actual_parent = %parent_hash,
+                        "prepared sync ancestor is not next in the validated lineage"
+                    );
+                    continue 'sync_blocks;
+                }
+                if !self.import_and_notify(broadcast.clone()).await
+                    || self.head_block_hash != broadcast.block_hash
+                {
+                    warn!(
+                        target: "n42::cl::sync",
+                        view = broadcast.view,
+                        hash = %broadcast.block_hash,
+                        "prepared sync ancestor has not reached execution-valid state"
+                    );
+                    continue 'sync_blocks;
+                }
+                counter!("n42_sync_prepared_ancestors_imported_total").increment(1);
+            }
+
+            let validated_raw_child = block_lineage
+                .last()
+                .filter(|entry| entry.0.block_hash == sync_block.block_hash);
+            let broadcast = validated_raw_child
+                .map(|entry| entry.1.clone())
+                .unwrap_or_else(|| BlockDataBroadcast {
+                    block_hash: sync_block.block_hash,
+                    view: sync_block.view,
+                    payload_json: sync_block.payload.clone(),
+                    timestamp: 0,
+                    execution_output: None,
+                    leader_ready_unix_ms: 0,
+                });
 
             if !self.import_and_notify(broadcast).await {
                 counter!("n42_sync_blocks_import_rejected_total").increment(1);
                 continue;
+            }
+
+            let retained_execution_lineage: Vec<_> =
+                block_lineage.iter().map(|entry| entry.0.clone()).collect();
+            let execution_block_number = validated_raw_child.map(|entry| entry.3).or_else(|| {
+                Self::execution_parent_and_number_from_payload(&sync_block.payload)
+                    .map(|(_, block_number)| block_number)
+            });
+
+            // Scan every newly recovered execution block in actual block-number
+            // order, including prepared ancestors. A live commit with a missing
+            // ancestor deliberately deferred this work, so the persisted
+            // last-scanned floor makes the replay idempotent.
+            if let Some(ref staking_sink) = self.staking_sink {
+                if block_lineage.is_empty() {
+                    if let Some(block_number) = execution_block_number
+                        && block_number > staking_sink.last_scanned_block()
+                        && let Ok(decompressed) = super::decompress_payload(&sync_block.payload)
+                    {
+                        staking_sink.scan_committed_block(block_number, &decompressed);
+                    }
+                } else {
+                    for entry in &block_lineage {
+                        let broadcast = &entry.1;
+                        let block_number = entry.3;
+                        if block_number <= staking_sink.last_scanned_block() {
+                            continue;
+                        }
+                        match super::decompress_payload(&broadcast.payload_json) {
+                            Ok(decompressed) => {
+                                staking_sink.scan_committed_block(block_number, &decompressed)
+                            }
+                            Err(error) => warn!(
+                                target: "n42::cl::sync",
+                                block_number,
+                                %error,
+                                "failed to decompress raw sync payload for staking scan"
+                            ),
+                        }
+                    }
+                }
             }
 
             // (T2c) Never double-count consensus metadata. A block is
@@ -544,10 +847,23 @@ impl ConsensusService {
             // sits at or below the restored committed floor while reth's
             // executed head is still behind. Import it (above) so reth rebuilds
             // the lineage, then skip the metadata bookkeeping.
-            let committed_floor = self
-                .execution_validated_head_view
-                .max(self.last_commit_qc.as_ref().map(|qc| qc.view).unwrap_or(0));
-            if already_committed || sync_block.view <= committed_floor {
+            if already_committed || sync_block.view <= restored_committed_floor {
+                if let Some(block_number) = execution_block_number {
+                    self.committed_block_count = self.committed_block_count.max(block_number);
+                }
+                if let Some(block) = self.committed_blocks.iter_mut().find(|block| {
+                    block.view == sync_block.view && block.block_hash == sync_block.block_hash
+                }) {
+                    if !retained_execution_lineage.is_empty() {
+                        block.execution_lineage = retained_execution_lineage;
+                    }
+                    if block.payload.is_empty()
+                        && let Some((broadcast, _)) =
+                            raw_lineage_by_hash.get(&sync_block.block_hash)
+                    {
+                        block.payload = broadcast.payload_json.clone();
+                    }
+                }
                 if let Some(ref changes) = sync_block.validator_changes {
                     self.recover_committed_block_validator_changes(
                         sync_block.view,
@@ -559,22 +875,12 @@ impl ConsensusService {
                 continue;
             }
 
-            // Fix #3: Scan sync-imported blocks for staking transactions.
-            if let Some(ref staking_sink) = self.staking_sink
-                && !sync_block.payload.is_empty()
-            {
-                match super::decompress_payload(&sync_block.payload) {
-                    Ok(decompressed) => {
-                        staking_sink.scan_committed_block(sync_block.view, &decompressed);
-                    }
-                    Err(e) => {
-                        warn!(target: "n42::cl::sync", view = sync_block.view, error = %e, "failed to decompress sync payload for staking scan");
-                    }
-                }
-            }
-
             // Update consensus metadata that payload building depends on.
-            self.committed_block_count += 1;
+            if let Some(block_number) = execution_block_number {
+                self.committed_block_count = self.committed_block_count.max(block_number);
+            } else {
+                self.committed_block_count += 1;
+            }
             self.prev_randao_cache =
                 alloy_primitives::keccak256(sync_block.commit_qc.aggregate_signature.to_bytes());
 
@@ -679,8 +985,11 @@ impl ConsensusService {
                 view: sync_block.view,
                 block_hash: sync_block.block_hash,
                 commit_qc: sync_block.commit_qc.clone(),
-                payload: sync_block.payload.clone(),
+                payload: validated_raw_child
+                    .map(|entry| entry.1.payload_json.clone())
+                    .unwrap_or_else(|| sync_block.payload.clone()),
                 validator_changes: sync_block.validator_changes.clone(),
+                execution_lineage: retained_execution_lineage,
             });
             self.committed_blocks
                 .make_contiguous()

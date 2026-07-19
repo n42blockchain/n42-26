@@ -17,7 +17,7 @@ use metrics::{counter, gauge, histogram};
 use n42_consensus::{
     AuthenticatedConsensusMessage, ConsensusEngine, EngineOutput, FUTURE_VIEW_WINDOW, ValidatorSet,
 };
-use n42_network::{NetworkEvent, PeerId};
+use n42_network::{NetworkEvent, PeerId, SyncPayload};
 use n42_primitives::QuorumCertificate;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
@@ -107,7 +107,7 @@ fn elapsed_since_unix_ms(start_ms: u64) -> Option<u64> {
 /// NOTE: Serialized with bincode. Adding new fields requires all nodes to upgrade
 /// simultaneously — bincode does not support missing trailing fields on deserialization.
 /// New→old is fine (bincode ignores trailing bytes), but old→new will fail.
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct BlockDataBroadcast {
     pub block_hash: B256,
     pub view: u64,
@@ -305,6 +305,17 @@ pub struct CommittedBlock {
     pub commit_qc: QuorumCertificate,
     pub payload: Vec<u8>,
     pub validator_changes: Option<Vec<n42_primitives::consensus::ValidatorChange>>,
+    /// Full execution lineage from the previously execution-validated head to
+    /// this committed block. It may include a prepared ancestor that never
+    /// obtained its own CommitQC before a timeout/restart.
+    pub execution_lineage: Vec<SyncPayload>,
+}
+
+#[derive(Clone)]
+struct RecentBlockData {
+    view: u64,
+    block_hash: B256,
+    block_data: Vec<u8>,
 }
 
 /// Bridges the consensus engine with the P2P network layer and reth Engine API.
@@ -365,6 +376,10 @@ pub struct ConsensusService {
     next_slot_timestamp: Option<u64>,
     consecutive_empty_skips: u32,
     pending_block_data: BTreeMap<B256, Vec<u8>>,
+    /// Raw proposal payloads retained across ordinary pending-cache clears so
+    /// CommitQC descendants can prove and serve any prepared execution
+    /// ancestors needed by a restarting reth tree.
+    recent_block_data: VecDeque<RecentBlockData>,
     pending_executions: HashSet<B256>,
     pending_finalization: Option<PendingFinalization>,
     /// Blocks that returned `Syncing` from new_payload, queued for retry.
@@ -594,6 +609,7 @@ impl ConsensusService {
         // this committed view. Recover the owned StateDiff directly from the
         // late bytes even if the bounded raw-data cache cannot retain them.
         self.try_recover_missing_sidecar_diff(hash, &data);
+        self.remember_recent_block_data(hash, &data);
         if self.pending_block_data.contains_key(&hash) {
             return false;
         }
@@ -620,6 +636,82 @@ impl ConsensusService {
 
         self.pending_block_data.insert(hash, data);
         true
+    }
+
+    fn remember_recent_block_data(&mut self, hash: B256, data: &[u8]) {
+        if self
+            .recent_block_data
+            .iter()
+            .any(|entry| entry.block_hash == hash)
+        {
+            return;
+        }
+        let Ok(broadcast) = bincode::deserialize::<BlockDataBroadcast>(data) else {
+            return;
+        };
+        if broadcast.block_hash != hash {
+            return;
+        }
+        if self.recent_block_data.len() >= execution_bridge::MAX_PENDING_BLOCK_DATA {
+            self.recent_block_data.pop_front();
+        }
+        self.recent_block_data.push_back(RecentBlockData {
+            view: broadcast.view,
+            block_hash: hash,
+            block_data: data.to_vec(),
+        });
+    }
+
+    fn execution_parent_and_number(data: &[u8]) -> Option<(B256, u64)> {
+        let broadcast = bincode::deserialize::<BlockDataBroadcast>(data).ok()?;
+        let payload = decompress_payload(&broadcast.payload_json).ok()?;
+        let execution: alloy_rpc_types_engine::ExecutionData =
+            serde_json::from_slice(&payload).ok()?;
+        (execution.block_hash() == broadcast.block_hash)
+            .then(|| (execution.parent_hash(), execution.block_number()))
+    }
+
+    fn execution_parent_and_number_from_payload(payload_json: &[u8]) -> Option<(B256, u64)> {
+        let payload = decompress_payload(payload_json).ok()?;
+        let execution: alloy_rpc_types_engine::ExecutionData =
+            serde_json::from_slice(&payload).ok()?;
+        Some((execution.parent_hash(), execution.block_number()))
+    }
+
+    /// Returns the raw execution chain from the current validated head through
+    /// `block_hash`. An empty result means the bounded proposal cache cannot
+    /// prove a complete parent-linked lineage and callers must stay conservative.
+    fn recent_execution_lineage(&self, block_hash: B256) -> Vec<RecentBlockData> {
+        let mut current = block_hash;
+        let mut reversed = Vec::new();
+        let mut seen = HashSet::new();
+
+        while current != self.head_block_hash
+            && reversed.len() < execution_bridge::MAX_PENDING_BLOCK_DATA
+        {
+            if !seen.insert(current) {
+                return Vec::new();
+            }
+            let Some(entry) = self
+                .recent_block_data
+                .iter()
+                .find(|entry| entry.block_hash == current)
+                .cloned()
+            else {
+                return Vec::new();
+            };
+            let Some((parent, _)) = Self::execution_parent_and_number(&entry.block_data) else {
+                return Vec::new();
+            };
+            reversed.push(entry);
+            current = parent;
+        }
+
+        if current != self.head_block_hash {
+            return Vec::new();
+        }
+        reversed.reverse();
+        reversed
     }
 
     fn try_recover_missing_sidecar_diff(&mut self, hash: B256, data: &[u8]) {
@@ -844,6 +936,15 @@ impl ConsensusService {
         while let Ok((hash, data)) = self.leader_payload_rx.try_recv() {
             let decoded = bincode::deserialize::<BlockDataBroadcast>(&data).ok();
             self.cache_pending_block_data(hash, data, protected_hashes);
+            let execution_lineage = self
+                .recent_execution_lineage(hash)
+                .into_iter()
+                .map(|entry| SyncPayload {
+                    view: entry.view,
+                    block_hash: entry.block_hash,
+                    block_data: entry.block_data,
+                })
+                .collect::<Vec<_>>();
             if let Some(broadcast) = decoded {
                 if broadcast.timestamp > 0 {
                     self.last_committed_timestamp =
@@ -854,14 +955,18 @@ impl ConsensusService {
                     .iter_mut()
                     .rev()
                     .find(|block| block.block_hash == hash)
-                    && block.payload.is_empty()
                 {
-                    block.payload = broadcast.payload_json;
-                    debug!(
-                        target: "n42::cl::consensus_loop",
-                        %hash,
-                        "backfilled committed payload while draining leader feedback"
-                    );
+                    if block.payload.is_empty() {
+                        block.payload = broadcast.payload_json;
+                        debug!(
+                            target: "n42::cl::consensus_loop",
+                            %hash,
+                            "backfilled committed payload while draining leader feedback"
+                        );
+                    }
+                    if block.execution_lineage.is_empty() && execution_lineage.len() > 1 {
+                        block.execution_lineage = execution_lineage;
+                    }
                 }
             }
         }
@@ -1107,6 +1212,7 @@ impl ConsensusService {
             next_slot_timestamp: None,
             consecutive_empty_skips: 0,
             pending_block_data: BTreeMap::new(),
+            recent_block_data: VecDeque::new(),
             pending_executions: HashSet::new(),
             pending_finalization: None,
             syncing_blocks: VecDeque::new(),
@@ -1319,6 +1425,7 @@ impl ConsensusService {
             next_slot_timestamp: None,
             consecutive_empty_skips: 0,
             pending_block_data: BTreeMap::new(),
+            recent_block_data: VecDeque::new(),
             pending_executions: HashSet::new(),
             pending_finalization: None,
             syncing_blocks: VecDeque::new(),
@@ -2564,7 +2671,11 @@ mod tests {
         }
     }
 
-    fn test_execution_data(parent_hash: B256, block_hash: B256) -> ExecutionData {
+    fn test_execution_data_at_number(
+        parent_hash: B256,
+        block_hash: B256,
+        block_number: u64,
+    ) -> ExecutionData {
         ExecutionData::new(
             ExecutionPayload::V1(ExecutionPayloadV1 {
                 parent_hash,
@@ -2573,7 +2684,7 @@ mod tests {
                 receipts_root: B256::ZERO,
                 logs_bloom: Bloom::ZERO,
                 prev_randao: B256::ZERO,
-                block_number: 1,
+                block_number,
                 gas_limit: 30_000_000,
                 gas_used: 0,
                 timestamp: 1,
@@ -2584,6 +2695,10 @@ mod tests {
             }),
             ExecutionPayloadSidecar::none(),
         )
+    }
+
+    fn test_execution_data(parent_hash: B256, block_hash: B256) -> ExecutionData {
+        test_execution_data_at_number(parent_hash, block_hash, 1)
     }
 
     fn test_block_data(parent_hash: B256, block_hash: B256, view: u64) -> Vec<u8> {
@@ -2600,13 +2715,66 @@ mod tests {
         .expect("serialize test block broadcast")
     }
 
+    fn test_block_data_at_number(
+        parent_hash: B256,
+        block_hash: B256,
+        view: u64,
+        block_number: u64,
+    ) -> Vec<u8> {
+        let payload_json = serde_json::to_vec(&test_execution_data_at_number(
+            parent_hash,
+            block_hash,
+            block_number,
+        ))
+        .expect("serialize test execution data");
+        bincode::serialize(&BlockDataBroadcast {
+            block_hash,
+            view,
+            payload_json,
+            timestamp: 1,
+            execution_output: None,
+            leader_ready_unix_ms: 0,
+        })
+        .expect("serialize test block broadcast")
+    }
+
+    fn test_commit_qc(view: u64, block_hash: B256) -> QuorumCertificate {
+        let key = test_key(0x11);
+        let message =
+            n42_consensus::protocol::quorum::commit_signing_message(view, &block_hash, &B256::ZERO);
+        let signature = key.sign(&message);
+        let aggregate_signature = n42_primitives::bls::AggregateSignature::aggregate(&[&signature])
+            .expect("single test signature aggregates");
+        let mut signers = QuorumCertificate::genesis().signers;
+        signers.push(true);
+        QuorumCertificate {
+            view,
+            block_hash,
+            aggregate_signature,
+            signers,
+        }
+    }
+
     fn test_block_data_with_empty_execution(
         parent_hash: B256,
         block_hash: B256,
         view: u64,
     ) -> Vec<u8> {
-        let payload_json = serde_json::to_vec(&test_execution_data(parent_hash, block_hash))
-            .expect("serialize test execution data");
+        test_block_data_with_empty_execution_at_number(parent_hash, block_hash, view, 1)
+    }
+
+    fn test_block_data_with_empty_execution_at_number(
+        parent_hash: B256,
+        block_hash: B256,
+        view: u64,
+        block_number: u64,
+    ) -> Vec<u8> {
+        let payload_json = serde_json::to_vec(&test_execution_data_at_number(
+            parent_hash,
+            block_hash,
+            block_number,
+        ))
+        .expect("serialize test execution data");
         let compact = CompactBlockExecution {
             bundle_state: Default::default(),
             receipts: Vec::new(),
@@ -3266,6 +3434,7 @@ mod tests {
             commit_qc: QuorumCertificate::genesis(),
             payload: Vec::new(),
             validator_changes: None,
+            execution_lineage: Vec::new(),
         });
         orch.pending_sidecar_diffs.insert(
             1,
@@ -3708,6 +3877,7 @@ mod tests {
             commit_qc: QuorumCertificate::genesis(),
             payload: Vec::new(),
             validator_changes: None,
+            execution_lineage: Vec::new(),
         });
         orch.leader_payload_tx
             .try_send((block_hash, data))
@@ -3716,6 +3886,41 @@ mod tests {
         orch.drain_leader_payload_rx(&[block_hash]);
 
         assert_eq!(orch.committed_blocks[0].payload, expected_payload);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn committed_child_uses_execution_number_when_ancestor_payload_is_missing() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let durable_head = B256::repeat_byte(0x53);
+        let missing_parent = B256::repeat_byte(0x54);
+        let committed_hash = B256::repeat_byte(0x55);
+        let data = test_block_data_at_number(missing_parent, committed_hash, 145, 145);
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
+        orch.head_block_hash = durable_head;
+        orch.committed_block_count = 143;
+        assert!(orch.cache_pending_block_data(committed_hash, data, &[committed_hash]));
+
+        orch.handle_block_committed(
+            145,
+            committed_hash,
+            test_commit_qc(145, committed_hash),
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            orch.committed_block_count, 145,
+            "the child payload reveals the real execution height even before its parent is recovered"
+        );
+        assert_eq!(orch.head_block_hash, durable_head);
+        assert_eq!(orch.committed_blocks.len(), 1);
+        assert_eq!(
+            orch.committed_blocks[0].execution_lineage.len(),
+            0,
+            "an incomplete raw ancestry is not retained as a trusted recovery lineage"
+        );
     }
 
     #[tokio::test]
@@ -4538,6 +4743,7 @@ mod tests {
                 validator_changes: None,
             }],
             peer_committed_view: 5,
+            execution_lineage: Vec::new(),
         };
         orch.handle_sync_response(peer, response).await;
 
@@ -4554,6 +4760,171 @@ mod tests {
                     (key.key().name() == "n42_sync_blocks_out_of_range_total").then_some(value)
                 });
         assert_eq!(dropped, Some(DebugValue::Counter(1)));
+    }
+
+    /// A CommitQC child can finalize a prepared execution ancestor that has no
+    /// CommitQC of its own. Restart recovery must import both raw payloads in
+    /// parent order, preserve their compact outputs for later peers, advance
+    /// the real execution block number, and apply both Twig/QMDB sidecars.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sync_recovers_prepared_ancestor_execution_lineage() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let peer = n42_network::PeerId::random();
+        let durable_head = B256::repeat_byte(0x43);
+        let prepared_hash = B256::repeat_byte(0x44);
+        let committed_hash = B256::repeat_byte(0x45);
+        let prepared_data =
+            test_block_data_with_empty_execution_at_number(durable_head, prepared_hash, 2, 144);
+        let committed_data =
+            test_block_data_with_empty_execution_at_number(prepared_hash, committed_hash, 3, 145);
+        let committed_broadcast: BlockDataBroadcast =
+            bincode::deserialize(&committed_data).expect("test broadcast decodes");
+        let mock = Arc::new(MockExecutionLayer::with_fcu_statuses(
+            PayloadStatusEnum::Valid,
+            [PayloadStatusEnum::Valid, PayloadStatusEnum::Valid],
+        ));
+        let el: Arc<dyn ExecutionLayer> = mock.clone();
+        let (twig, applies) = SpyStateSink::new();
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx)
+            .with_twig(twig);
+        orch.el = Some(el);
+        orch.head_block_hash = durable_head;
+        orch.execution_validated_head_view = 1;
+        orch.committed_block_count = 143;
+        orch.sync_in_flight = true;
+        orch.sync_started_at = Some(Instant::now());
+        orch.sync_request_range = Some((2, 3));
+        orch.sync_requested_peers.insert(peer);
+
+        orch.handle_sync_response(
+            peer,
+            n42_network::BlockSyncResponse {
+                blocks: vec![n42_network::SyncBlock {
+                    view: 3,
+                    block_hash: committed_hash,
+                    commit_qc: test_commit_qc(3, committed_hash),
+                    payload: committed_broadcast.payload_json.clone(),
+                    validator_changes: None,
+                }],
+                peer_committed_view: 3,
+                execution_lineage: vec![
+                    n42_network::SyncPayload {
+                        view: 2,
+                        block_hash: prepared_hash,
+                        block_data: prepared_data,
+                    },
+                    n42_network::SyncPayload {
+                        view: 3,
+                        block_hash: committed_hash,
+                        block_data: committed_data,
+                    },
+                ],
+            },
+        )
+        .await;
+        drain_spawned_tasks().await;
+
+        assert_eq!(
+            mock.new_payload_hashes(),
+            vec![prepared_hash, committed_hash],
+            "reth receives the prepared ancestor before its CommitQC child"
+        );
+        assert_eq!(mock.fcu_heads(), vec![prepared_hash, committed_hash]);
+        assert_eq!(orch.head_block_hash, committed_hash);
+        assert_eq!(orch.execution_validated_head_view, 3);
+        assert_eq!(
+            orch.committed_block_count, 145,
+            "metadata follows the execution payload number, not CommitQC count"
+        );
+        let retained = orch
+            .committed_blocks
+            .back()
+            .expect("synced committed block retained");
+        assert_eq!(retained.execution_lineage.len(), 2);
+        assert_eq!(retained.execution_lineage[0].block_hash, prepared_hash);
+        assert_eq!(retained.execution_lineage[1].block_hash, committed_hash);
+        assert_eq!(
+            applies.lock().expect("spy sink lock").len(),
+            2,
+            "both execution StateDiffs reach the binary-tree sidecar"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sync_does_not_trust_raw_lineage_that_misses_exact_head() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let peer = n42_network::PeerId::random();
+        let exact_head = B256::repeat_byte(0x63);
+        let foreign_parent = B256::repeat_byte(0x99);
+        let prepared_hash = B256::repeat_byte(0x64);
+        let committed_hash = B256::repeat_byte(0x65);
+        let prepared_data = test_block_data_at_number(foreign_parent, prepared_hash, 2, 144);
+        let committed_data = test_block_data_at_number(prepared_hash, committed_hash, 3, 145);
+        let committed_broadcast: BlockDataBroadcast =
+            bincode::deserialize(&committed_data).expect("test broadcast decodes");
+        let mock = Arc::new(MockExecutionLayer::new(
+            PayloadStatusEnum::Syncing,
+            PayloadStatusEnum::Valid,
+        ));
+        let el: Arc<dyn ExecutionLayer> = mock.clone();
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
+        orch.el = Some(el);
+        orch.head_block_hash = exact_head;
+        orch.execution_validated_head_view = 1;
+        orch.committed_block_count = 143;
+        orch.sync_in_flight = true;
+        orch.sync_started_at = Some(Instant::now());
+        orch.sync_request_range = Some((2, 3));
+        orch.sync_requested_peers.insert(peer);
+
+        orch.handle_sync_response(
+            peer,
+            n42_network::BlockSyncResponse {
+                blocks: vec![n42_network::SyncBlock {
+                    view: 3,
+                    block_hash: committed_hash,
+                    commit_qc: test_commit_qc(3, committed_hash),
+                    payload: committed_broadcast.payload_json,
+                    validator_changes: None,
+                }],
+                peer_committed_view: 3,
+                execution_lineage: vec![
+                    n42_network::SyncPayload {
+                        view: 2,
+                        block_hash: prepared_hash,
+                        block_data: prepared_data,
+                    },
+                    n42_network::SyncPayload {
+                        view: 3,
+                        block_hash: committed_hash,
+                        block_data: committed_data,
+                    },
+                ],
+            },
+        )
+        .await;
+
+        assert_eq!(
+            mock.new_payload_hashes(),
+            vec![committed_hash],
+            "the foreign prepared payload and its cached output are never submitted"
+        );
+        assert!(mock.fcu_heads().is_empty());
+        assert_eq!(orch.head_block_hash, exact_head);
+        assert_eq!(orch.execution_validated_head_view, 1);
+        assert_eq!(orch.syncing_blocks.len(), 1);
+        assert!(
+            orch.committed_blocks
+                .back()
+                .expect("QC metadata remains recoverable")
+                .execution_lineage
+                .is_empty(),
+            "an unproven raw lineage must not enter the sync-serving ring"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -4574,6 +4945,7 @@ mod tests {
             n42_network::BlockSyncResponse {
                 blocks: Vec::new(),
                 peer_committed_view: 20,
+                execution_lineage: Vec::new(),
             },
         )
         .await;
@@ -4606,6 +4978,7 @@ mod tests {
             commit_qc: QuorumCertificate::genesis(),
             payload: Vec::new(),
             validator_changes: None,
+            execution_lineage: Vec::new(),
         });
 
         orch.handle_import_done(waiting, 105, ImportOutcome::Syncing, 0)
@@ -4651,6 +5024,7 @@ mod tests {
             commit_qc: QuorumCertificate::genesis(),
             payload: Vec::new(),
             validator_changes: None,
+            execution_lineage: Vec::new(),
         });
 
         orch.handle_import_done(waiting, 3, ImportOutcome::Syncing, 0)

@@ -359,7 +359,7 @@ impl ConsensusService {
         }
     }
 
-    async fn handle_block_committed(
+    pub(super) async fn handle_block_committed(
         &mut self,
         view: u64,
         block_hash: B256,
@@ -368,6 +368,16 @@ impl ConsensusService {
     ) {
         let commit_now = Instant::now();
         let pool_depth = self.pool_depth_snapshot();
+        // The leader receives its own raw payload through a local feedback
+        // channel rather than the network announcement path. Drain anything
+        // already available before deriving the execution lineage.
+        self.drain_leader_payload_rx(&[block_hash]);
+        // A prepared block can survive a timeout as LockedQC and become an
+        // execution ancestor of the next block that obtains a CommitQC. Reth
+        // then advances by more than one block for a single consensus commit.
+        // Recover that complete raw lineage before any pending caches are
+        // cleared so block numbering and QMDB/Twig sidecars do not skip it.
+        let execution_lineage = self.recent_execution_lineage(block_hash);
         if let Some(prev_commit) = self.last_commit_instant {
             let inter_block_commit_ms = commit_now.duration_since(prev_commit).as_millis() as u64;
             histogram!("n42_inter_block_commit_ms").record(inter_block_commit_ms as f64);
@@ -388,8 +398,44 @@ impl ConsensusService {
         self.last_commit_view = Some(view);
         self.last_commit_hash = Some(block_hash);
 
-        self.committed_block_count += 1;
+        let previous_block_count = self.committed_block_count;
+        let committed_execution_number = execution_lineage
+            .last()
+            .and_then(|entry| Self::execution_parent_and_number(&entry.block_data))
+            .map(|(_, block_number)| block_number)
+            .or_else(|| {
+                self.pending_block_data
+                    .get(&block_hash)
+                    .and_then(|data| Self::execution_parent_and_number(data))
+                    .map(|(_, block_number)| block_number)
+            });
+        match committed_execution_number {
+            Some(block_number) => {
+                self.committed_block_count = self.committed_block_count.max(block_number);
+            }
+            None => self.committed_block_count += 1,
+        }
+        let execution_blocks_committed = self
+            .committed_block_count
+            .saturating_sub(previous_block_count)
+            .max(1);
+        // This counter describes consensus CommitQC events, not the number of
+        // execution blocks finalized transitively by one event.
         counter!("n42_blocks_committed_total").increment(1);
+        counter!("n42_execution_blocks_finalized_total").increment(execution_blocks_committed);
+        if execution_blocks_committed > 1 {
+            info!(
+                target: "n42::cl::consensus_loop",
+                view,
+                %block_hash,
+                execution_blocks_committed,
+                previous_block_count,
+                committed_block_count = self.committed_block_count,
+                "CommitQC finalized a prepared execution ancestor lineage"
+            );
+            counter!("n42_implicit_ancestor_commits_total")
+                .increment(execution_blocks_committed - 1);
+        }
         gauge!("n42_consensus_view").set(view as f64);
         gauge!("n42_pool_pending_at_commit").set(pool_depth.pending as f64);
         gauge!("n42_pool_queued_at_commit").set(pool_depth.queued as f64);
@@ -453,7 +499,9 @@ impl ConsensusService {
         // Build and persist ConsensusEvidence in MDBX for future verification.
         // Note: evidence root is NOT placed in the block header (parent_beacon_block_root
         // is always B256::ZERO for Cancun compatibility).
-        // committed_block_count was incremented above; it equals the new block's number.
+        // committed_block_count was aligned to the execution payload above; it
+        // equals the new block's number even when a prepared ancestor was
+        // finalized transitively by this CommitQC.
         if let Some(ref evidence_store) = self.evidence_store {
             let evidence = n42_jmt::ConsensusEvidence {
                 view: commit_qc.view,
@@ -517,28 +565,39 @@ impl ConsensusService {
         // confirmation path (eager import, finalize FCU, bg import, sync) funnels
         // through.
         if self.jmt.is_some() || self.twig.is_some() {
-            let diff = self
-                .pending_block_data
-                .get(&block_hash)
-                .and_then(|data| Self::extract_state_diff_for_state_tree(block_hash, data));
-            if let Some(diff) = diff {
-                self.missing_sidecar_diffs.remove(&view);
-                self.pending_sidecar_diffs.insert(view, (block_hash, diff));
-                // The commit may confirm execution in the same breath (eager
-                // import validated before the CommitQC): the head already
-                // advanced above, so flush the staged diff immediately.
-                if view <= self.execution_validated_head_view {
-                    self.enqueue_confirmed_sidecar_state_diffs(self.execution_validated_head_view);
-                }
+            let lineage_data: Vec<(u64, B256, Vec<u8>)> = if execution_lineage.is_empty() {
+                self.pending_block_data
+                    .get(&block_hash)
+                    .map(|data| vec![(view, block_hash, data.clone())])
+                    .unwrap_or_default()
             } else {
-                self.missing_sidecar_diffs.insert(view, block_hash);
-                error!(
-                    target: "n42::twig",
-                    view,
-                    %block_hash,
-                    "committed sidecar diff unavailable; pausing QMDB/SBMT updates at this view until block data recovery"
-                );
-                counter!("n42_sidecar_diff_gap_total").increment(1);
+                execution_lineage
+                    .iter()
+                    .map(|entry| (entry.view, entry.block_hash, entry.block_data.clone()))
+                    .collect()
+            };
+            for (lineage_view, lineage_hash, data) in lineage_data {
+                if let Some(diff) = Self::extract_state_diff_for_state_tree(lineage_hash, &data) {
+                    self.missing_sidecar_diffs.remove(&lineage_view);
+                    self.pending_sidecar_diffs
+                        .insert(lineage_view, (lineage_hash, diff));
+                } else {
+                    self.missing_sidecar_diffs
+                        .insert(lineage_view, lineage_hash);
+                    error!(
+                        target: "n42::twig",
+                        view = lineage_view,
+                        %lineage_hash,
+                        "committed sidecar diff unavailable; pausing QMDB/SBMT updates at this view until block data recovery"
+                    );
+                    counter!("n42_sidecar_diff_gap_total").increment(1);
+                }
+            }
+            // The commit may confirm execution in the same breath (eager
+            // import validated before the CommitQC): the head already advanced
+            // above, so flush every staged lineage diff immediately.
+            if view <= self.execution_validated_head_view {
+                self.enqueue_confirmed_sidecar_state_diffs(self.execution_validated_head_view);
             }
         }
 
@@ -572,20 +631,46 @@ impl ConsensusService {
         }
 
         // Scan committed block for staking/unstaking transactions.
-        if let Some(ref staking_sink) = self.staking_sink
-            && let Some(data) = self.pending_block_data.get(&block_hash)
-            && !data.is_empty()
-        {
-            match bincode::deserialize::<super::BlockDataBroadcast>(data)
-                .map_err(|e| e.to_string())
-                .and_then(|broadcast| {
-                    super::decompress_payload(&broadcast.payload_json).map_err(|e| e.to_string())
-                }) {
-                Ok(decompressed) => {
-                    staking_sink.scan_committed_block(self.committed_block_count, &decompressed);
+        if let Some(ref staking_sink) = self.staking_sink {
+            let lineage_data: Vec<&[u8]> = if execution_lineage.is_empty() {
+                // If reth already advanced to the child, or the raw child links
+                // directly to the current head, this is an ordinary one-block
+                // lineage. Otherwise an ancestor is missing: defer all scans so
+                // catch-up can replay them in execution-number order.
+                self.pending_block_data
+                    .get(&block_hash)
+                    .filter(|data| {
+                        self.head_block_hash == block_hash
+                            || Self::execution_parent_and_number(data)
+                                .is_some_and(|(parent, _)| parent == self.head_block_hash)
+                    })
+                    .map(|data| vec![data.as_slice()])
+                    .unwrap_or_default()
+            } else {
+                execution_lineage
+                    .iter()
+                    .map(|entry| entry.block_data.as_slice())
+                    .collect()
+            };
+            for data in lineage_data {
+                let block_number = Self::execution_parent_and_number(data)
+                    .map(|(_, block_number)| block_number)
+                    .unwrap_or(self.committed_block_count);
+                if block_number <= staking_sink.last_scanned_block() {
+                    continue;
                 }
-                Err(e) => {
-                    warn!(target: "n42::cl::consensus_loop", error = %e, "failed to decompress payload for staking scan");
+                match bincode::deserialize::<super::BlockDataBroadcast>(data)
+                    .map_err(|e| e.to_string())
+                    .and_then(|broadcast| {
+                        super::decompress_payload(&broadcast.payload_json)
+                            .map_err(|e| e.to_string())
+                    }) {
+                    Ok(decompressed) => {
+                        staking_sink.scan_committed_block(block_number, &decompressed);
+                    }
+                    Err(e) => {
+                        warn!(target: "n42::cl::consensus_loop", block_number, error = %e, "failed to decompress payload for staking scan");
+                    }
                 }
             }
         }
