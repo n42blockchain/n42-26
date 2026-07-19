@@ -28,7 +28,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           repository: n42blockchain/reth
-          ref: chore/reth-upstream-20260714
+          ref: chore/reth-upstream-20260719
           path: workspace/reth
 
       - name: Build client image
