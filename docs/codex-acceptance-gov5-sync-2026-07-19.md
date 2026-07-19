@@ -151,6 +151,58 @@ Scenario 9 修复方向正确。**唯一硬伤就是上面的 CRITICAL**——"C
 3. MEDIUM：sidecar staging 绑定 canonical hash；devlog-96 版本号改 4；collect_future_timeout 拆分或 devlog 逐条声明。
 4. 合并纪律不变：用 `fix/gov5-sync-p1-rework-20260719`（已含 P0 全栈），**勿再合独立 S1-S5 草稿分支**。
 
+---
+
+# 第四轮验收（2026-07-19，返工后）：✅ 全部通过，可合并
+
+Codex 读到留言后用 2 个提交（`b2af731` fix + `f5aa472` docs，在 `fix/gov5-sync-p1-rework-20260719` 上）
+把 CRITICAL 连同全部 MEDIUM/LOW 一次收清。**逐项亲自核实（不外包核心结论）如下：**
+
+## 🔴→✅ CRITICAL：S5 缓存投毒 —— 两处修复均正确且完整
+
+**Fix ①（坏块缓存不接受 hash-mismatch）**：`bad_block_cache.rs` 的 `insert_if_invalid` 新增
+`is_declared_block_hash_mismatch()`，对 `"block hash mismatch:"` 前缀（trim+小写）的 Invalid 不写缓存。
+**承重的字符串判据经端到端核实无误**：
+- alloy-rpc-types-engine **2.2.0**（在用版本）`PayloadError::BlockHash` 的 Display =
+  `"block hash mismatch: want {execution}, got {consensus}"`（`error.rs:60`）；
+- reth `on_new_payload_error`（`engine/tree/src/tree/mod.rs:3165`）`PayloadStatusEnum::from(error)`
+  把该 Display 透传为 `Invalid.validation_error`，且对 block-hash-mismatch 置 `latest_valid_hash = None`；
+- Codex 前缀精确命中。红线保持：state-root-mismatch 等确定性失败仍正常入缓存（有 `deterministic_execution_rejection_remains_cacheable` 测试）。
+
+**Fix ②（注入的 execution_output 失败回收）**：`ExecutionOutputCache` trait 新增 `evict(hash)`，
+node 侧 `RethExecutionOutputCache` 实现为 `take_payload_execution` 移除 reth cache 条目。
+**16 个 evict 调用点覆盖全部 inject-then-非-Valid 路径**：import_and_notify 的 Invalid/Syncing/Err、
+eager 导入、syncing retry、leader eager、committed 后台导入、observer——逐点核对无遗漏。
+
+新增投毒测试 `declared_hash_mismatch_never_blacklists_the_declared_hash` 断言"声明 hash=H 内容不符 →
+H 不进坏块缓存、len==0"，实跑通过；既有 `syncing_payload_is_never_added` / `direct_block_arrival_is_filtered` 全绿。
+
+## 🟠→✅ MEDIUM
+
+- **sidecar StateDiff 绑定 canonical hash**：新增 `execution_validated_sidecar_hashes: view→hash`，
+  同 view 出现不同 execution-valid hash 时**拒绝绑定**（`conflicting execution-valid hashes; refusing binding` + metric），flush 按此绑定冲刷。
+- **devlog-96 版本表述**：改为 "consensus wire protocol is version 4 / handshake rejects mixed v3/v4"。
+- **collect_future_timeout 共识断代声明**：devlog-104 已逐条点名声明为共识行为+兼容性断代（禁新旧混跑），并修正悬空哈希引用 `5ba718d`→`71bf98e`。
+
+## 🟡→✅ LOW
+
+- lineage 响应按 `MAX_SYNC_MESSAGE_SIZE`（16MB）帧预算截断（`sync_response_fits_frame` + metric）；
+- Twig 探针 `MAX_TWIG_PROBE_SLOTS_PER_ACCOUNT = 256` 上限 + dropped metric；
+- bitfield v2 "datadir 单向迁移、不可原地降级旧版"警示补入 devlog-106；
+- devlog-110 收尾文档准确复述攻击链与修复。
+
+## 构建与测试
+
+check/clippy 零警告；44 测试套件全绿；唯一失败仍是 `test_emit_retries_non_block_committed_output_when_channel_is_full`——已三轮确认是 main 上就有的**存量并行 flake**（单跑绿、串行复跑绿），非本批引入，建议单独立 issue，不阻断。
+
+## 最终判定：**整批可合并**
+
+`fix/gov5-sync-p1-rework-20260719`（含 P0 全栈 + P1 重做 + 6 新提交 + S5 硬化）全部验收项通过。
+合并前置与纪律：
+1. 本地/CI 的 `../reth` 切到 `chore/reth-upstream-20260719`（配套 `chore/deps-toolchain-20260719` 已单独验收通过）；
+2. 用 `fix/gov5-sync-p1-rework-20260719`，**勿合并独立 S1-S5 草稿分支**（过时）；合并后建议删除草稿分支与历史遗留分支。
+3. 合并后把存量 flake `test_emit_retries_...` 单独立 issue。
+
 ## 验收环境记录
 
 - worktree：`D:\N42\n42-26-verify`（分支 `verify/gov5-sync-acceptance`，八爪合并 + DEVLOG 并集），返工后可在此复验。
