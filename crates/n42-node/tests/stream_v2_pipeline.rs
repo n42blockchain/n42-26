@@ -8,12 +8,16 @@
 
 use alloy_consensus::{Header, TxLegacy};
 use alloy_primitives::{Address, B256, Bytes, TxKind, U256, keccak256};
-use n42_execution::read_log::{ReadLogDatabase, encode_read_log};
+use n42_execution::{
+    read_log::{ReadLogDatabase, ReadLogEntry, encode_read_log},
+    state_diff::{AccountChangeType, StateDiff},
+};
 use n42_mobile::verifier::StreamReplayDB;
 use reth_chainspec::{ChainSpecBuilder, EthereumHardfork, ForkCondition, MAINNET};
 use reth_ethereum_primitives::{Block, BlockBody, Receipt, Transaction};
 use reth_evm::execute::{BasicBlockExecutor, Executor};
 use reth_evm_ethereum::EthEvmConfig;
+use reth_execution_types::BlockExecutionOutput;
 use reth_primitives_traits::{RecoveredBlock, crypto::secp256k1::public_key_to_address};
 use reth_testing_utils::generators::sign_tx_with_key_pair;
 use revm::{bytecode::Bytecode, database::CacheDB, state::AccountInfo};
@@ -99,6 +103,16 @@ fn test_chain_spec() -> Arc<reth_chainspec::ChainSpec> {
     )
 }
 
+/// Chain spec with Cancun active from genesis for EIP-6780 tests.
+fn cancun_test_chain_spec() -> Arc<reth_chainspec::ChainSpec> {
+    Arc::new(
+        ChainSpecBuilder::from(&*MAINNET)
+            .shanghai_activated()
+            .cancun_activated()
+            .build(),
+    )
+}
+
 /// Build the ABI-encoded calldata for `transfer(address to, uint256 amount)`.
 fn encode_transfer_call(to: Address, amount: U256) -> Bytes {
     let mut data = Vec::with_capacity(68);
@@ -132,15 +146,35 @@ fn run_pipeline_test(
     transactions: Vec<reth_ethereum_primitives::TransactionSigned>,
     senders: Vec<Address>,
 ) {
-    let chain_spec = test_chain_spec();
+    run_pipeline_test_with_assertions(
+        base_db,
+        header,
+        transactions,
+        senders,
+        test_chain_spec(),
+        |_, _, _| {},
+    );
+}
 
+/// Same IDC/read-log/mobile replay pipeline as [`run_pipeline_test`], with a
+/// caller-supplied fork schedule and assertions over both real EVM outputs.
+fn run_pipeline_test_with_assertions<F>(
+    base_db: CacheDB<revm::database::EmptyDB>,
+    header: Header,
+    transactions: Vec<reth_ethereum_primitives::TransactionSigned>,
+    senders: Vec<Address>,
+    chain_spec: Arc<reth_chainspec::ChainSpec>,
+    assertions: F,
+) where
+    F: FnOnce(&BlockExecutionOutput<Receipt>, &BlockExecutionOutput<Receipt>, &[ReadLogEntry]),
+{
     // ── IDC side: execute with ReadLogDatabase ──
     let logged_db = ReadLogDatabase::new(base_db.clone());
     let log_handle = logged_db.log_handle();
     let codes_handle = logged_db.codes_handle();
 
     let evm_config = EthEvmConfig::new(chain_spec.clone());
-    let mut idc_executor = BasicBlockExecutor::new(evm_config.clone(), logged_db);
+    let idc_executor = BasicBlockExecutor::new(evm_config.clone(), logged_db);
 
     let block = RecoveredBlock::new_unhashed(
         Block {
@@ -155,7 +189,7 @@ fn run_pipeline_test(
     );
 
     let idc_result = idc_executor
-        .execute_one(&block)
+        .execute(&block)
         .expect("IDC execution should succeed");
 
     // Extract read log and captured codes
@@ -185,10 +219,10 @@ fn run_pipeline_test(
         .collect();
 
     let replay_db = StreamReplayDB::new_without_cache(read_log_data, bytecodes_map);
-    let mut phone_executor = BasicBlockExecutor::new(evm_config, replay_db);
+    let phone_executor = BasicBlockExecutor::new(evm_config, replay_db);
 
     let phone_result = phone_executor
-        .execute_one(&block)
+        .execute(&block)
         .expect("Phone replay execution should succeed");
 
     // ── Compare receipts ──
@@ -229,6 +263,8 @@ fn run_pipeline_test(
         "Receipts root mismatch: IDC={}, Phone={}",
         idc_root, phone_root
     );
+
+    assertions(&idc_result, &phone_result, &read_log);
 
     eprintln!("  Receipts root:    {} ✓", idc_root);
 }
@@ -461,6 +497,365 @@ fn test_v2_pipeline_mixed_block() {
     };
 
     run_pipeline_test(db, header, vec![tx1, tx2], vec![sender_a, sender_b]);
+}
+
+// ─── SELFDESTRUCT adversarial witness cases (P1-6) ─────────────────────────
+
+const SELFDESTRUCT_BENEFICIARY: Address = Address::new([0x77; 20]);
+const CREATE2_SALT: B256 = B256::with_last_byte(0x42);
+
+/// Runtime with two paths: empty calldata writes two slots; non-empty calldata
+/// SELFDESTRUCTs. The destroy path performs no SLOAD, so both slots are truly
+/// unread by the block that destroys a pre-existing instance.
+fn write_or_selfdestruct_runtime() -> Bytes {
+    Bytes::from(
+        hex::decode(concat!(
+            "3615601c57",                                 // CALLDATASIZE; ISZERO; jump to write path
+            "737777777777777777777777777777777777777777", // beneficiary
+            "ff00",                                       // SELFDESTRUCT; STOP
+            "5b",                                         // write-path JUMPDEST
+            "602a600155",                                 // SSTORE(1, 0x2a)
+            "6099600255",                                 // SSTORE(2, 0x99)
+            "00"                                          // STOP
+        ))
+        .unwrap(),
+    )
+}
+
+fn init_code_for_runtime(runtime: &Bytes) -> Bytes {
+    let len = u8::try_from(runtime.len()).expect("test runtime fits PUSH1");
+    let mut init = Vec::with_capacity(12 + runtime.len());
+    init.extend_from_slice(&[
+        0x60, len, // PUSH1 runtime_len
+        0x60, 0x0c, // PUSH1 runtime_offset
+        0x60, 0x00, // PUSH1 mem_offset
+        0x39, // CODECOPY
+        0x60, len, // PUSH1 runtime_len
+        0x60, 0x00, // PUSH1 mem_offset
+        0xf3, // RETURN
+    ]);
+    init.extend_from_slice(runtime);
+    Bytes::from(init)
+}
+
+/// Minimal CREATE2 factory: calldata is child init code; fixed salt 0x42.
+fn create2_factory_runtime() -> Bytes {
+    Bytes::from(
+        hex::decode(concat!(
+            "366000600037", // CALLDATACOPY(0, 0, calldatasize)
+            "7f0000000000000000000000000000000000000000000000000000000000000042",
+            "3660006000f500" // CREATE2(0, 0, calldatasize, salt); STOP
+        ))
+        .unwrap(),
+    )
+}
+
+fn create2_address(factory: Address, salt: B256, init_code: &Bytes) -> Address {
+    let init_hash = keccak256(init_code);
+    let mut preimage = [0u8; 85];
+    preimage[0] = 0xff;
+    preimage[1..21].copy_from_slice(factory.as_slice());
+    preimage[21..53].copy_from_slice(salt.as_slice());
+    preimage[53..].copy_from_slice(init_hash.as_slice());
+    let hash = keccak256(preimage);
+    Address::from_slice(&hash.as_slice()[12..])
+}
+
+fn selfdestruct_in_constructor_init_code() -> Bytes {
+    let mut init = vec![0x60, 0x42, 0x60, 0x07, 0x55]; // SSTORE(7, 0x42)
+    init.push(0x73); // PUSH20 beneficiary
+    init.extend_from_slice(SELFDESTRUCT_BENEFICIARY.as_slice());
+    init.push(0xff);
+    Bytes::from(init)
+}
+
+fn funded_test_db(sender: Address) -> CacheDB<revm::database::EmptyDB> {
+    let mut db = CacheDB::new(Default::default());
+    db.insert_account_info(
+        sender,
+        AccountInfo {
+            nonce: 0,
+            balance: U256::from(1_000_000_000_000_000_000u64),
+            ..Default::default()
+        },
+    );
+    db
+}
+
+fn insert_contract(db: &mut CacheDB<revm::database::EmptyDB>, address: Address, code: Bytes) {
+    db.insert_account_info(
+        address,
+        AccountInfo {
+            nonce: 1,
+            code_hash: keccak256(&code),
+            code: Some(Bytecode::new_raw(code)),
+            ..Default::default()
+        },
+    );
+}
+
+fn signed_legacy_call(
+    key_pair: Keypair,
+    chain_id: u64,
+    nonce: u64,
+    to: TxKind,
+    input: Bytes,
+) -> reth_ethereum_primitives::TransactionSigned {
+    sign_tx_with_key_pair(
+        key_pair,
+        Transaction::Legacy(TxLegacy {
+            chain_id: Some(chain_id),
+            nonce,
+            gas_price: 7,
+            gas_limit: 600_000,
+            to,
+            value: U256::ZERO,
+            input,
+        }),
+    )
+}
+
+fn selfdestruct_header() -> Header {
+    Header {
+        number: 1,
+        timestamp: 1_700_000_000,
+        gas_limit: 30_000_000,
+        beneficiary: Address::with_last_byte(0xFF),
+        base_fee_per_gas: Some(7),
+        ..Header::default()
+    }
+}
+
+fn cancun_selfdestruct_header() -> Header {
+    Header {
+        parent_beacon_block_root: Some(B256::ZERO),
+        blob_gas_used: Some(0),
+        excess_blob_gas: Some(0),
+        ..selfdestruct_header()
+    }
+}
+
+/// Pre-Cancun permits create → write → destroy → same-address CREATE2 again in
+/// one block. Cancun keeps the child after an inter-transaction SELFDESTRUCT,
+/// so the second CREATE2 collides. Both IDC and phone must take the same branch.
+#[test]
+fn test_v2_selfdestruct_create_recreate_same_block_eip6780_boundary() {
+    let (key_pair, sender) = test_sender(0x31);
+    let factory = Address::new([0xAA; 20]);
+    let runtime = write_or_selfdestruct_runtime();
+    let child_init = init_code_for_runtime(&runtime);
+    let child = create2_address(factory, CREATE2_SALT, &child_init);
+    let chain_id = test_chain_spec().chain.id();
+
+    let mut db = funded_test_db(sender);
+    insert_contract(&mut db, factory, create2_factory_runtime());
+    let txs = vec![
+        signed_legacy_call(
+            key_pair,
+            chain_id,
+            0,
+            TxKind::Call(factory),
+            child_init.clone(),
+        ),
+        signed_legacy_call(key_pair, chain_id, 1, TxKind::Call(child), Bytes::new()),
+        signed_legacy_call(
+            key_pair,
+            chain_id,
+            2,
+            TxKind::Call(child),
+            Bytes::from(vec![1]),
+        ),
+        signed_legacy_call(key_pair, chain_id, 3, TxKind::Call(factory), child_init),
+    ];
+    let senders = vec![sender; txs.len()];
+
+    run_pipeline_test_with_assertions(
+        db.clone(),
+        selfdestruct_header(),
+        txs.clone(),
+        senders.clone(),
+        test_chain_spec(),
+        |idc, phone, _| {
+            assert!(idc.receipts.iter().all(|receipt| receipt.success));
+            for output in [idc, phone] {
+                let child_state = output
+                    .account_state(&child)
+                    .expect("recreated child must be present in the block bundle");
+                assert!(child_state.info.is_some(), "recreated child must be live");
+                assert_eq!(
+                    output.storage(&child, U256::from(1)).unwrap_or_default(),
+                    U256::ZERO
+                );
+                assert_eq!(
+                    output.storage(&child, U256::from(2)).unwrap_or_default(),
+                    U256::ZERO
+                );
+                let diff = StateDiff::from_bundle_state(&output.state);
+                assert_ne!(
+                    diff.accounts.get(&child).unwrap().change_type,
+                    AccountChangeType::Destroyed
+                );
+            }
+        },
+    );
+
+    run_pipeline_test_with_assertions(
+        db,
+        cancun_selfdestruct_header(),
+        txs,
+        senders,
+        cancun_test_chain_spec(),
+        |idc, phone, _| {
+            for output in [idc, phone] {
+                let child_state = output
+                    .account_state(&child)
+                    .expect("child must be in bundle");
+                assert!(
+                    !child_state.was_destroyed(),
+                    "Cancun inter-tx SELFDESTRUCT must retain the child"
+                );
+                assert_eq!(
+                    output.storage(&child, U256::from(1)),
+                    Some(U256::from(0x2a))
+                );
+                assert_eq!(
+                    output.storage(&child, U256::from(2)),
+                    Some(U256::from(0x99))
+                );
+            }
+        },
+    );
+}
+
+/// A pre-Cancun destroy must not require reading every old storage slot. The
+/// keyless phone never materializes the unread slots, and both executions end
+/// with the account destroyed and the same receipts root.
+#[test]
+fn test_v2_selfdestruct_unread_slots_leave_no_mobile_ghost_state() {
+    let (key_pair, sender) = test_sender(0x32);
+    let contract = Address::new([0xCC; 20]);
+    let runtime = write_or_selfdestruct_runtime();
+    let mut db = funded_test_db(sender);
+    insert_contract(&mut db, contract, runtime);
+    db.insert_account_storage(contract, U256::from(1), U256::from(0x2a))
+        .unwrap();
+    db.insert_account_storage(contract, U256::from(2), U256::from(0x99))
+        .unwrap();
+
+    let spec = test_chain_spec();
+    let tx = signed_legacy_call(
+        key_pair,
+        spec.chain.id(),
+        0,
+        TxKind::Call(contract),
+        Bytes::from(vec![1]),
+    );
+    run_pipeline_test_with_assertions(
+        db,
+        selfdestruct_header(),
+        vec![tx],
+        vec![sender],
+        spec,
+        |idc, phone, read_log| {
+            assert!(
+                !read_log
+                    .iter()
+                    .any(|entry| matches!(entry, ReadLogEntry::Storage(_))),
+                "SELFDESTRUCT path must not accidentally read the pre-existing slots"
+            );
+            for output in [idc, phone] {
+                let account = output
+                    .account_state(&contract)
+                    .expect("destroyed contract must be represented in output state");
+                assert!(account.was_destroyed());
+                assert!(account.info.is_none());
+                assert_eq!(
+                    output.storage(&contract, U256::from(1)).unwrap_or_default(),
+                    U256::ZERO
+                );
+                assert_eq!(
+                    output.storage(&contract, U256::from(2)).unwrap_or_default(),
+                    U256::ZERO
+                );
+                assert_eq!(
+                    StateDiff::from_bundle_state(&output.state)
+                        .accounts
+                        .get(&contract)
+                        .unwrap()
+                        .change_type,
+                    AccountChangeType::Destroyed
+                );
+            }
+        },
+    );
+}
+
+/// Cancun preserves an old contract, but still deletes a contract that invokes
+/// SELFDESTRUCT in its own creation transaction. Pre-Cancun deletes the old
+/// contract. Each branch is replayed from the same ordered read log on mobile.
+#[test]
+fn test_v2_selfdestruct_cancun_same_tx_delete_vs_pre_cancun() {
+    let (key_pair, sender) = test_sender(0x33);
+    let existing = Address::new([0xDD; 20]);
+    let runtime = write_or_selfdestruct_runtime();
+    let mut base = funded_test_db(sender);
+    insert_contract(&mut base, existing, runtime);
+    base.insert_account_storage(existing, U256::from(1), U256::from(0x2a))
+        .unwrap();
+
+    for (spec, must_destroy) in [(test_chain_spec(), true), (cancun_test_chain_spec(), false)] {
+        let tx = signed_legacy_call(
+            key_pair,
+            spec.chain.id(),
+            0,
+            TxKind::Call(existing),
+            Bytes::from(vec![1]),
+        );
+        run_pipeline_test_with_assertions(
+            base.clone(),
+            if must_destroy {
+                selfdestruct_header()
+            } else {
+                cancun_selfdestruct_header()
+            },
+            vec![tx],
+            vec![sender],
+            spec,
+            |idc, phone, _| {
+                for output in [idc, phone] {
+                    let destroyed = output
+                        .account_state(&existing)
+                        .is_some_and(|account| account.was_destroyed());
+                    assert_eq!(destroyed, must_destroy);
+                }
+            },
+        );
+    }
+
+    let spec = cancun_test_chain_spec();
+    let created = sender.create(0);
+    let tx = signed_legacy_call(
+        key_pair,
+        spec.chain.id(),
+        0,
+        TxKind::Create,
+        selfdestruct_in_constructor_init_code(),
+    );
+    run_pipeline_test_with_assertions(
+        funded_test_db(sender),
+        cancun_selfdestruct_header(),
+        vec![tx],
+        vec![sender],
+        spec,
+        |idc, phone, _| {
+            for output in [idc, phone] {
+                assert!(
+                    output.account_state(&created).is_none(),
+                    "Cancun same-tx created-and-destroyed account must leave no state"
+                );
+            }
+        },
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
