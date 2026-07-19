@@ -131,14 +131,24 @@ fn write_mobile_evidence_once(
     evidence_store: Arc<EvidenceStore>,
     event: AttestationEvent,
 ) -> MobileEvidenceWriteOutcome {
-    if event.valid_count != u32::from(event.participant_count) {
+    let set_bits: u32 = event
+        .packed_participants
+        .iter()
+        .map(|byte| byte.count_ones())
+        .sum();
+    if event.valid_count != u32::from(event.participant_count)
+        || set_bits != u32::from(event.participant_count)
+        || event.packed_participants.last() == Some(&0)
+    {
         warn!(
             target: "n42::cl::evidence",
             block_number = event.block_number,
             %event.block_hash,
             valid_count = event.valid_count,
             participant_count = event.participant_count,
-            "mobile evidence event count mismatch; dropping"
+            set_bits,
+            bitfield_bytes = event.packed_participants.len(),
+            "mobile evidence event has a non-canonical participant bitfield; dropping"
         );
         return MobileEvidenceWriteOutcome::InvalidEvent;
     }
@@ -262,6 +272,61 @@ mod tests {
 
         let outcome = write_mobile_evidence_with_retry(store, event, config).await;
         assert_eq!(outcome, MobileEvidenceWriteOutcome::AlreadyPresent);
+    }
+
+    #[tokio::test]
+    async fn writeback_preserves_sparse_high_registry_index() {
+        let (_dir, store) = open_store();
+        let block_number = 43;
+        let block_hash = B256::from([0x12; 32]);
+        store
+            .put(block_number, &sample_consensus_evidence(block_hash))
+            .unwrap();
+
+        let mut event = sample_event(block_hash, block_number);
+        event.participant_count = 1;
+        event.valid_count = 1;
+        event.packed_participants = vec![0u8; 1_250];
+        event.packed_participants[9_999 / 8] |= 1 << (9_999 % 8);
+
+        let outcome = write_mobile_evidence_with_retry(
+            Arc::clone(&store),
+            event.clone(),
+            MobileEvidenceWriteConfig {
+                max_attempts: 1,
+                retry_delay: Duration::from_millis(1),
+            },
+        )
+        .await;
+        assert_eq!(outcome, MobileEvidenceWriteOutcome::Written);
+
+        let mobile = store.get(block_number).unwrap().unwrap().mobile.unwrap();
+        assert_eq!(mobile.packed_participants, event.packed_participants);
+        assert_ne!(mobile.packed_participants[9_999 / 8], 0);
+    }
+
+    #[tokio::test]
+    async fn writeback_rejects_participant_count_bitfield_mismatch() {
+        let (_dir, store) = open_store();
+        let block_number = 44;
+        let block_hash = B256::from([0x13; 32]);
+        store
+            .put(block_number, &sample_consensus_evidence(block_hash))
+            .unwrap();
+
+        let mut event = sample_event(block_hash, block_number);
+        event.packed_participants[2] = 0x0F; // 20 set bits, count still claims 21.
+        let outcome = write_mobile_evidence_with_retry(
+            Arc::clone(&store),
+            event,
+            MobileEvidenceWriteConfig {
+                max_attempts: 1,
+                retry_delay: Duration::from_millis(1),
+            },
+        )
+        .await;
+        assert_eq!(outcome, MobileEvidenceWriteOutcome::InvalidEvent);
+        assert!(store.get(block_number).unwrap().unwrap().mobile.is_none());
     }
 
     #[tokio::test]

@@ -9,10 +9,20 @@
 //!
 //! ```text
 //! [8B view LE][32B block_hash][96B agg_sig][2B signer_count LE][⌈n/8⌉B packed_signers]
-//! [1B has_mobile]
-//! [if has_mobile:
-//!   [32B receipts_root][96B mob_sig][2B mob_count LE][⌈m/8⌉B mob_bits][8B created_at_ms LE]
+//! [1B mobile_encoding]
+//! [if mobile_encoding == 0x01 (legacy v1):
+//!   [32B receipts_root][96B mob_sig][2B mob_count LE][⌈mob_count/8⌉B mob_bits]
+//!   [8B created_at_ms LE]
 //! ]
+//! [if mobile_encoding == 0x02 (v2):
+//!   [32B receipts_root][96B mob_sig][2B mob_count LE][4B mob_bits_len LE]
+//!   [mob_bits_len B mob_bits][8B created_at_ms LE]
+//! ]
+//!
+//! Mobile v2 stores the bitfield length explicitly because `mob_count` is the
+//! number of set bits, while bit positions are verifier-registry indices. A
+//! sparse cohort containing only registry index 9,999 therefore needs 1,250
+//! bytes, not `ceil(1/8)`. The decoder retains v1 support for historical rows.
 //! ```
 
 use reth_libmdbx::{Database, DatabaseFlags, Environment, WriteFlags};
@@ -44,6 +54,12 @@ pub struct MobileEvidence {
 
 /// Minimum encoded size: 8 + 32 + 96 + 2 + 0 + 1 = 139 bytes (0 signers, no mobile).
 const MIN_EVIDENCE_SIZE: usize = 8 + 32 + 96 + 2 + 1;
+const MOBILE_NONE: u8 = 0x00;
+const MOBILE_V1: u8 = 0x01;
+const MOBILE_V2: u8 = 0x02;
+/// Defensive bound for corrupted evidence rows. This still supports bitfields
+/// over 134 million verifier indices, far above the current 10K-per-IDC limit.
+const MAX_MOBILE_BITFIELD_BYTES: usize = 16 * 1024 * 1024;
 
 impl ConsensusEvidence {
     /// Encodes into the compact binary format described in the module docs.
@@ -56,14 +72,10 @@ impl ConsensusEvidence {
             signer_bytes,
             self.signer_count,
         );
-        let mobile_size = self.mobile.as_ref().map_or(0, |m| {
-            debug_assert!(
-                m.packed_participants.len() >= packed_byte_len(m.participant_count),
-                "packed_participants too short for participant_count {}",
-                m.participant_count,
-            );
-            32 + 96 + 2 + packed_byte_len(m.participant_count) + 8
-        });
+        let mobile_size = self
+            .mobile
+            .as_ref()
+            .map_or(0, |m| 32 + 96 + 2 + 4 + m.packed_participants.len() + 8);
         let mut buf = Vec::with_capacity(MIN_EVIDENCE_SIZE + signer_bytes + mobile_size);
 
         buf.extend_from_slice(&self.view.to_le_bytes());
@@ -73,14 +85,16 @@ impl ConsensusEvidence {
         buf.extend_from_slice(&self.packed_signers[..signer_bytes]);
 
         match &self.mobile {
-            None => buf.push(0x00),
+            None => buf.push(MOBILE_NONE),
             Some(m) => {
-                buf.push(0x01);
+                let mob_bytes = u32::try_from(m.packed_participants.len())
+                    .expect("mobile participant bitfield exceeds the v2 u32 wire limit");
+                buf.push(MOBILE_V2);
                 buf.extend_from_slice(&m.receipts_root);
                 buf.extend_from_slice(&m.aggregate_signature);
                 buf.extend_from_slice(&m.participant_count.to_le_bytes());
-                let mob_bytes = packed_byte_len(m.participant_count);
-                buf.extend_from_slice(&m.packed_participants[..mob_bytes]);
+                buf.extend_from_slice(&mob_bytes.to_le_bytes());
+                buf.extend_from_slice(&m.packed_participants);
                 buf.extend_from_slice(&m.created_at_ms.to_le_bytes());
             }
         }
@@ -100,28 +114,44 @@ impl ConsensusEvidence {
         let packed_signers = bytes[pos..pos + signer_bytes].to_vec();
         pos += signer_bytes;
 
-        let has_mobile = bytes[pos];
+        let mobile_encoding = bytes[pos];
         pos += 1;
 
-        let mobile = if has_mobile != 0 {
-            let receipts_root = read_array::<32>(bytes, &mut pos)?;
-            let mob_sig = read_array::<96>(bytes, &mut pos)?;
-            let mob_count = read_u16_le(bytes, &mut pos)?;
-            let mob_bytes = packed_byte_len(mob_count);
-            check_remaining(bytes, pos, mob_bytes + 8)?;
-            let packed_participants = bytes[pos..pos + mob_bytes].to_vec();
-            pos += mob_bytes;
-            let created_at_ms = read_u64_le(bytes, &mut pos)?;
-            Some(MobileEvidence {
-                receipts_root,
-                aggregate_signature: mob_sig,
-                participant_count: mob_count,
-                packed_participants,
-                created_at_ms,
-            })
-        } else {
-            None
+        let mobile = match mobile_encoding {
+            MOBILE_NONE => None,
+            MOBILE_V1 | MOBILE_V2 => {
+                let receipts_root = read_array::<32>(bytes, &mut pos)?;
+                let mob_sig = read_array::<96>(bytes, &mut pos)?;
+                let mob_count = read_u16_le(bytes, &mut pos)?;
+                let mob_bytes = if mobile_encoding == MOBILE_V1 {
+                    packed_byte_len(mob_count)
+                } else {
+                    read_u32_le(bytes, &mut pos)? as usize
+                };
+                if mob_bytes > MAX_MOBILE_BITFIELD_BYTES {
+                    return Err(EvidenceDecodeError::MobileBitfieldTooLarge {
+                        have: mob_bytes,
+                        max: MAX_MOBILE_BITFIELD_BYTES,
+                    });
+                }
+                check_remaining(bytes, pos, mob_bytes + 8)?;
+                let packed_participants = bytes[pos..pos + mob_bytes].to_vec();
+                pos += mob_bytes;
+                let created_at_ms = read_u64_le(bytes, &mut pos)?;
+                Some(MobileEvidence {
+                    receipts_root,
+                    aggregate_signature: mob_sig,
+                    participant_count: mob_count,
+                    packed_participants,
+                    created_at_ms,
+                })
+            }
+            tag => return Err(EvidenceDecodeError::UnknownMobileEncoding(tag)),
         };
+
+        if pos != bytes.len() {
+            return Err(EvidenceDecodeError::TrailingBytes(bytes.len() - pos));
+        }
 
         Ok(Self {
             view,
@@ -246,6 +276,12 @@ impl EvidenceStore {
 pub enum EvidenceDecodeError {
     #[error("evidence bytes too short: have {have}, need at least {need}")]
     TooShort { have: usize, need: usize },
+    #[error("unknown mobile evidence encoding 0x{0:02x}")]
+    UnknownMobileEncoding(u8),
+    #[error("mobile participant bitfield is too large: {have} bytes, maximum {max}")]
+    MobileBitfieldTooLarge { have: usize, max: usize },
+    #[error("evidence has {0} trailing bytes")]
+    TrailingBytes(usize),
 }
 
 fn packed_byte_len(bit_count: u16) -> usize {
@@ -263,6 +299,13 @@ fn read_u16_le(buf: &[u8], pos: &mut usize) -> Result<u16, EvidenceDecodeError> 
     check_remaining(buf, *pos, 2)?;
     let v = u16::from_le_bytes(buf[*pos..*pos + 2].try_into().unwrap());
     *pos += 2;
+    Ok(v)
+}
+
+fn read_u32_le(buf: &[u8], pos: &mut usize) -> Result<u32, EvidenceDecodeError> {
+    check_remaining(buf, *pos, 4)?;
+    let v = u32::from_le_bytes(buf[*pos..*pos + 4].try_into().unwrap());
+    *pos += 4;
     Ok(v)
 }
 
@@ -305,7 +348,11 @@ mod tests {
                     receipts_root: [0xCC; 32],
                     aggregate_signature: [0xDD; 96],
                     participant_count: 100,
-                    packed_participants: vec![0xEE; 13], // ceil(100/8) = 13
+                    packed_participants: {
+                        let mut bits = vec![0xFF; 13];
+                        bits[12] = 0x0F; // 12 * 8 + 4 = 100 set bits
+                        bits
+                    },
                     created_at_ms: 1700000000000,
                 })
             } else {
@@ -330,8 +377,8 @@ mod tests {
     fn encode_decode_roundtrip_with_mobile() {
         let ev = sample_evidence(500, true);
         let encoded = ev.encode();
-        // 8 + 32 + 96 + 2 + 63 + 1 + 32 + 96 + 2 + 13 + 8 = 353
-        assert_eq!(encoded.len(), 353);
+        // 8 + 32 + 96 + 2 + 63 + 1 + 32 + 96 + 2 + 4 + 13 + 8 = 357
+        assert_eq!(encoded.len(), 357);
         let decoded = ConsensusEvidence::decode(&encoded).unwrap();
         assert_eq!(decoded.signer_count, 500);
         assert_eq!(decoded.packed_signers.len(), 63);
@@ -365,6 +412,56 @@ mod tests {
         assert_eq!(mobile.participant_count, 21);
         assert_eq!(mobile.packed_participants, vec![0xFF, 0xFF, 0x1F]);
         assert_eq!(mobile.created_at_ms, 1_700_000_000_000);
+    }
+
+    #[test]
+    fn sparse_mobile_index_roundtrips_without_truncation() {
+        let mut ev = sample_evidence(7, false);
+        let mut sparse_bits = vec![0u8; 1_250];
+        sparse_bits[9_999 / 8] |= 1 << (9_999 % 8);
+        ev.mobile = Some(MobileEvidence {
+            receipts_root: [0x12; 32],
+            aggregate_signature: [0x34; 96],
+            participant_count: 1,
+            packed_participants: sparse_bits.clone(),
+            created_at_ms: 1_700_000_000_000,
+        });
+
+        let encoded = ev.encode();
+        assert_eq!(encoded[8 + 32 + 96 + 2 + 1], MOBILE_V2);
+        let decoded = ConsensusEvidence::decode(&encoded).unwrap();
+        let mobile = decoded.mobile.unwrap();
+        assert_eq!(mobile.participant_count, 1);
+        assert_eq!(mobile.packed_participants, sparse_bits);
+        assert_ne!(mobile.packed_participants[9_999 / 8], 0);
+    }
+
+    #[test]
+    fn legacy_mobile_v1_remains_readable() {
+        let mut encoded = sample_evidence(7, false).encode();
+        assert_eq!(encoded.pop(), Some(MOBILE_NONE));
+        encoded.push(MOBILE_V1);
+        encoded.extend_from_slice(&[0x12; 32]);
+        encoded.extend_from_slice(&[0x34; 96]);
+        encoded.extend_from_slice(&21u16.to_le_bytes());
+        encoded.extend_from_slice(&[0xFF, 0xFF, 0x1F]);
+        encoded.extend_from_slice(&1_700_000_000_000u64.to_le_bytes());
+
+        let decoded = ConsensusEvidence::decode(&encoded).unwrap();
+        let mobile = decoded.mobile.unwrap();
+        assert_eq!(mobile.participant_count, 21);
+        assert_eq!(mobile.packed_participants, vec![0xFF, 0xFF, 0x1F]);
+        assert_eq!(mobile.created_at_ms, 1_700_000_000_000);
+    }
+
+    #[test]
+    fn unknown_mobile_encoding_is_rejected() {
+        let mut encoded = sample_evidence(7, false).encode();
+        *encoded.last_mut().unwrap() = 0x7F;
+        assert!(matches!(
+            ConsensusEvidence::decode(&encoded),
+            Err(EvidenceDecodeError::UnknownMobileEncoding(0x7F))
+        ));
     }
 
     #[test]
