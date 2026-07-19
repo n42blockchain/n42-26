@@ -169,6 +169,17 @@ impl ConsensusService {
                 // can silently fail (QUIC transport issues), so always broadcast as backup.
                 // The consensus engine deduplicates votes by (view, voter).
                 let send_start = std::time::Instant::now();
+                if matches!(
+                    msg,
+                    ConsensusMessage::Vote(_) | ConsensusMessage::CommitVote(_)
+                ) {
+                    self.pending_vote_resend = Some(super::PendingVoteResend {
+                        view: msg.view(),
+                        target,
+                        message: msg.clone(),
+                        next_at: tokio::time::Instant::now() + Self::vote_resend_delay(),
+                    });
+                }
                 if let Some(peer_id) = self.network.validator_peer(target) {
                     let _ = self.network.send_direct(peer_id, msg.clone());
                 }
@@ -997,6 +1008,7 @@ impl ConsensusService {
         counter!("n42_view_changes_total").increment(1);
         self.record_timeout_diag_view_changed(new_view);
         self.view_started_at = Some(tokio::time::Instant::now());
+        self.pending_vote_resend = None;
         // Note: building_on_parent is NOT cleared here. It's keyed on parent hash,
         // not view number. If a build is in-flight for the current parent, it should
         // still be guarded even after a view change. The guard naturally expires when

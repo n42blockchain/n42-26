@@ -6,7 +6,7 @@ use libp2p::{Multiaddr, PeerId, Swarm};
 use n42_primitives::ConsensusMessage;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::time::interval;
 
@@ -29,6 +29,36 @@ const MAX_PENDING_RELIABLE_EVENTS: usize = 2048;
 const MAX_PENDING_DATA_EVENTS: usize = 8192;
 const RECENT_BLOCK_ANNOUNCEMENT_IDS_LIMIT: usize = 4096;
 const DEFAULT_COMMAND_SEND_TIMEOUT_MS: u64 = 50;
+const SYNC_RATE_WINDOW: Duration = Duration::from_secs(1);
+const MAX_SYNC_REQUESTS_UNTRUSTED: u32 = 4;
+const MAX_SYNC_REQUESTS_VALIDATOR: u32 = 32;
+
+#[derive(Clone, Copy)]
+struct SyncRequestWindow {
+    started_at: Instant,
+    accepted: u32,
+}
+
+impl SyncRequestWindow {
+    fn new(now: Instant) -> Self {
+        Self {
+            started_at: now,
+            accepted: 0,
+        }
+    }
+
+    fn allow(&mut self, now: Instant, limit: u32) -> bool {
+        if now.duration_since(self.started_at) >= SYNC_RATE_WINDOW {
+            self.started_at = now;
+            self.accepted = 0;
+        }
+        if self.accepted >= limit {
+            return false;
+        }
+        self.accepted += 1;
+        true
+    }
+}
 
 fn command_send_timeout() -> Duration {
     static TIMEOUT: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
@@ -493,6 +523,10 @@ pub struct NetworkService {
     /// Maps internal request ID → libp2p ResponseChannel for sending sync replies.
     pending_sync_channels:
         HashMap<u64, libp2p::request_response::ResponseChannel<BlockSyncResponse>>,
+    /// Fixed-window protection for inbound catch-up work. Validators receive a
+    /// higher allowance, while unauthenticated peers cannot monopolize the
+    /// bounded response-channel table or node-side database reads.
+    sync_request_windows: HashMap<PeerId, SyncRequestWindow>,
     next_sync_id: u64,
     /// Configured validator index -> expected PeerId bindings.
     expected_validator_peer_ids: HashMap<u32, PeerId>,
@@ -659,6 +693,7 @@ impl NetworkService {
             blob_sidecar_topic_hash,
             verification_receipts_topic_hash,
             pending_sync_channels: HashMap::new(),
+            sync_request_windows: HashMap::new(),
             next_sync_id: 0,
             expected_validator_peer_ids,
             validator_peer_map,
@@ -834,6 +869,7 @@ impl NetworkService {
                 tracing::info!(%peer_id, "peer disconnected");
                 metrics::gauge!("n42_active_peer_connections").decrement(1.0);
                 self.reconnection.on_disconnected(&peer_id);
+                self.sync_request_windows.remove(&peer_id);
                 self.clear_validator_mapping_for_peer(&peer_id);
                 self.clear_authenticated_validator_peer(&peer_id);
                 self.emit_event(NetworkEvent::PeerDisconnected(peer_id));
@@ -882,6 +918,36 @@ impl NetworkService {
     }
 
     fn authenticate_validator_peer(&mut self, peer_id: PeerId, validator_index: u32) {
+        // Consensus messages may arrive through GossipSub or Rotor relays, so
+        // the transport source is not necessarily the signed message's author.
+        // Never let a relay overwrite validator routing: promotion is valid only
+        // when the source PeerId matches the configured/deterministic binding.
+        match expected_peer_id_for_validator(
+            &self.expected_validator_peer_ids,
+            validator_index,
+            self.allow_deterministic_peer_ids,
+        ) {
+            Ok(expected_peer_id) if expected_peer_id == peer_id => {}
+            Ok(expected_peer_id) => {
+                tracing::debug!(
+                    %peer_id,
+                    %expected_peer_id,
+                    validator_index,
+                    "ignoring relayed consensus signer for validator peer authentication"
+                );
+                return;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %peer_id,
+                    validator_index,
+                    %error,
+                    "refusing validator authentication without a trusted peer binding"
+                );
+                return;
+            }
+        }
+
         if !self.swarm.is_connected(&peer_id) {
             tracing::debug!(
                 %peer_id,
@@ -890,6 +956,11 @@ impl NetworkService {
             );
             return;
         }
+
+        // A successfully authenticated validator is safety-critical and must
+        // keep the indefinite reconnect policy even if it was first discovered
+        // through mDNS/Identify as an ordinary peer.
+        self.reconnection.register_peer(peer_id, Vec::new(), true);
 
         if let Some(previous_peer) = self
             .authenticated_validator_peer_map
@@ -968,6 +1039,8 @@ impl NetworkService {
                         validator_index = idx,
                         "mapped peer to validator from identify metadata"
                     );
+                    self.reconnection
+                        .register_peer(peer_id, info.listen_addrs.clone(), true);
                     // Update reverse map: remove any old peer that claimed this index
                     self.peer_validator_map.retain(|_, v| *v != idx);
                     self.peer_validator_map.insert(peer_id, idx);
@@ -1086,6 +1159,22 @@ impl NetworkService {
                 libp2p::request_response::Message::Request {
                     request, channel, ..
                 } => {
+                    if !self.allow_inbound_sync_request(peer) {
+                        let validator = self.reconnection.is_trusted(&peer)
+                            || self.authenticated_peer_validator_map.contains_key(&peer);
+                        metrics::counter!(
+                            "n42_state_sync_requests_throttled_total",
+                            "peer_class" => if validator { "validator" } else { "untrusted" }
+                        )
+                        .increment(1);
+                        tracing::warn!(
+                            %peer,
+                            validator,
+                            "dropping rate-limited inbound state-sync request"
+                        );
+                        drop(channel);
+                        return;
+                    }
                     metrics::counter!("n42_state_sync_requests").increment(1);
                     let id = self.next_sync_id;
                     self.next_sync_id = self.next_sync_id.wrapping_add(1);
@@ -1130,6 +1219,20 @@ impl NetworkService {
                 tracing::debug!(%peer, "sync response sent");
             }
         }
+    }
+
+    fn allow_inbound_sync_request(&mut self, peer: PeerId) -> bool {
+        let validator = self.reconnection.is_trusted(&peer)
+            || self.authenticated_peer_validator_map.contains_key(&peer);
+        let limit = if validator {
+            MAX_SYNC_REQUESTS_VALIDATOR
+        } else {
+            MAX_SYNC_REQUESTS_UNTRUSTED
+        };
+        self.sync_request_windows
+            .entry(peer)
+            .or_insert_with(|| SyncRequestWindow::new(Instant::now()))
+            .allow(Instant::now(), limit)
     }
 
     fn handle_consensus_direct_event(
@@ -1816,6 +1919,32 @@ mod tests {
         handle.validator_peer_map.write().unwrap().insert(0, peer);
         assert_eq!(handle.validator_peer(0), Some(peer));
         assert!(handle.validator_peer(1).is_none());
+    }
+
+    #[test]
+    fn sync_request_window_enforces_limit_and_resets() {
+        let started_at = Instant::now();
+        let mut window = SyncRequestWindow::new(started_at);
+
+        for _ in 0..MAX_SYNC_REQUESTS_UNTRUSTED {
+            assert!(window.allow(started_at, MAX_SYNC_REQUESTS_UNTRUSTED));
+        }
+        assert!(!window.allow(started_at, MAX_SYNC_REQUESTS_UNTRUSTED));
+        assert!(window.allow(started_at + SYNC_RATE_WINDOW, MAX_SYNC_REQUESTS_UNTRUSTED));
+    }
+
+    #[test]
+    fn validator_sync_window_has_explicit_higher_allowance() {
+        let now = Instant::now();
+        let mut validator = SyncRequestWindow::new(now);
+        let mut untrusted = SyncRequestWindow::new(now);
+
+        for _ in 0..MAX_SYNC_REQUESTS_UNTRUSTED {
+            assert!(validator.allow(now, MAX_SYNC_REQUESTS_VALIDATOR));
+            assert!(untrusted.allow(now, MAX_SYNC_REQUESTS_UNTRUSTED));
+        }
+        assert!(validator.allow(now, MAX_SYNC_REQUESTS_VALIDATOR));
+        assert!(!untrusted.allow(now, MAX_SYNC_REQUESTS_UNTRUSTED));
     }
 
     #[test]
