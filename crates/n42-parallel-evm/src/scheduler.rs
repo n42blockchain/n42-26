@@ -135,6 +135,15 @@ impl Scheduler {
                 // Either not executed yet, or already validated/redone — wait.
                 return None;
             }
+            // `val_cursor` advances when a validation task is claimed, not when
+            // it finishes. Without this predecessor gate, another worker can
+            // claim tx v+1 while tx v is still validating. The higher tx may
+            // then validate against an unsettled hot-account value and escape
+            // revalidation under an unlucky abort race. Completion, not merely
+            // claim order, is the load-bearing Block-STM invariant.
+            if v > 0 && self.status[v - 1].load(Ordering::SeqCst) != STATUS_VALIDATED {
+                return None;
+            }
             if self
                 .val_cursor
                 .compare_exchange(v, v + 1, Ordering::SeqCst, Ordering::SeqCst)
@@ -268,5 +277,22 @@ mod tests {
 
         assert_eq!(scheduler.validated_count.load(Ordering::SeqCst), 1);
         assert_eq!(scheduler.status[2].load(Ordering::SeqCst), STATUS_REDO);
+    }
+
+    #[test]
+    fn validation_waits_for_predecessor_completion_not_just_claim() {
+        let scheduler = Scheduler::new(2);
+        scheduler.exec_cursor.store(2, Ordering::SeqCst);
+        scheduler.status[0].store(STATUS_EXECUTED, Ordering::SeqCst);
+        scheduler.status[1].store(STATUS_EXECUTED, Ordering::SeqCst);
+
+        assert!(matches!(scheduler.next_task(), Some(Task::Validate(0))));
+        assert!(
+            scheduler.next_task().is_none(),
+            "tx 1 must not validate while tx 0's validation is still in flight"
+        );
+
+        scheduler.finish_validation(0);
+        assert!(matches!(scheduler.next_task(), Some(Task::Validate(1))));
     }
 }

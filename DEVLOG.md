@@ -134,6 +134,7 @@ Logs are split into separate files by phase for easy maintenance:
 | [devlog-101-consensus-bls-batch](docs/devlog-101-consensus-bls-batch.md) | gov5 2026H1 P1-1：R1/R2 已排队票随机系数批量验签，坏签名精确回退；500 节点 QC 351.0ms→137.3ms（2.56x） | Performance |
 | [devlog-102-twig-staged-flush-audit](docs/devlog-102-twig-staged-flush-audit.md) | gov5 2026H1 P1-2：审计 QMDB bin tree/Twig staged diff、WAL fsync、内存 adopt 与快照顺序；增加 WAL 写失败后 root/version 不前进且重启回到最后 durable 状态的故障注入验收 | Reliability |
 | [devlog-103-state-root-hard-floor](docs/devlog-103-state-root-hard-floor.md) | gov5 2026H1 P1-3：生产链 state-root bypass 启动硬门；按确定性低频采样比对同一块的 reth PlainState 与 QMDB bin tree/Twig 叶值，发散后锁存 unhealthy/rebuild-required 并停发手机包 | Safety |
+| [devlog-105-parallel-evm-validation-order](docs/devlog-105-parallel-evm-validation-order.md) | workspace 门禁复现并修复 Block-STM validation 领取顺序早于完成顺序的竞态；强制低位前缀完成后才验证高位交易 | Safety |
 
 ---
 
