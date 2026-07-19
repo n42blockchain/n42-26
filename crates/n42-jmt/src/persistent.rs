@@ -1312,6 +1312,7 @@ mod tests {
         let mut twig = PersistentTwig::open(&path, u64::MAX).unwrap();
         twig.apply_diff(&make_diff(5)).unwrap();
         let version_before = twig.version();
+        let root_before = twig.root_hash();
         assert!(!twig.is_poisoned());
 
         twig.break_wal_handle_for_test();
@@ -1336,6 +1337,19 @@ mod tests {
         assert!(
             twig.flush().unwrap_err().to_string().contains("poisoned"),
             "a poisoned sink must not checkpoint or mutate its WAL"
+        );
+        drop(twig);
+
+        let mut reopened = PersistentTwig::open(&path, u64::MAX).unwrap();
+        assert_eq!(
+            reopened.version(),
+            version_before,
+            "restart must recover exactly the last durable version"
+        );
+        assert_eq!(
+            reopened.root_hash(),
+            root_before,
+            "failed staged diff must not appear in the recovered root"
         );
     }
 

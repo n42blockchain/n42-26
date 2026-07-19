@@ -131,6 +131,7 @@ Logs are split into separate files by phase for easy maintenance:
 | [devlog-98-equivocation-crash-guards](docs/devlog-98-equivocation-crash-guards.md) | gov5 2026H1 S4：验签后且与到达顺序无关的 Proposal/R1/R2 equivocation 检测；R1/R2 双投票崩溃持久化与 fail-closed 恢复 | Security |
 | [devlog-99-bad-block-cache](docs/devlog-99-bad-block-cache.md) | gov5 2026H1 S5：512-entry LRU 确定性坏块缓存，覆盖 direct/gossip/sync/catch-up/observer；暂态失败不投毒；补 envelope/payload hash 绑定 | Liveness |
 | [devlog-100-gov5-sync-p0-validation](docs/devlog-100-gov5-sync-p0-validation.md) | gov5 2026H1 P0 顺序聚合验收：S1-S5 全量测试与 6 场景 E2E；修复三节点重连后 TC 缺票死锁及 Scenario 9 假绿 | Verification |
+| [devlog-102-twig-staged-flush-audit](docs/devlog-102-twig-staged-flush-audit.md) | gov5 2026H1 P1-2：审计 QMDB bin tree/Twig staged diff、WAL fsync、内存 adopt 与快照顺序；增加 WAL 写失败后 root/version 不前进且重启回到最后 durable 状态的故障注入验收 | Reliability |
 
 ---
 
