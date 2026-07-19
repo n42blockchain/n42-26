@@ -36,6 +36,11 @@ evidence. The change affects only node-local bypass evidence; mobile evidence
 does not enter HotStuff voting and the evidence root is not placed in the block
 header (`parent_beacon_block_root` remains zero).
 
+The datadir migration is one-way for rows rewritten as v2: an older binary does
+not understand tag `0x02` and must not be pointed at the same MDBX datadir after
+the upgrade. Rollback requires a backup made before v2 writes (or a fresh
+resync), not an in-place binary downgrade.
+
 ## Validation
 
 - `cargo test -p n42-jmt evidence_store --lib`: 11 passed, including v1 read,

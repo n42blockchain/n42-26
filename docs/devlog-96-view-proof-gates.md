@@ -95,12 +95,11 @@ was made in this security-focused task.
 
 ## Compatibility
 
-No message field, serialization, or signing domain changed, so the consensus
-wire protocol remains version 3. Mixed old/new nodes can still exchange and
-verify QC/TC messages. A rolling deployment is format-compatible, but the old
-nodes retain the single-timeout/msg-view liveness attack until upgraded;
-operators should upgrade all validators promptly. A coordinated stop is not
-required by this task.
+This task did not add another message field, serialization form, or signing
+domain, but the integrated consensus wire protocol is version 4
+(`CONSENSUS_PROTOCOL_VERSION = 4`). The handshake rejects mixed v3/v4 peers, so
+operators must coordinate a validator-set upgrade rather than treating this as
+a format-compatible rolling deployment.
 
 ## Verification
 

@@ -56,6 +56,11 @@ index，恢复后投票直发到错误节点，链停在高度 84。加 source b
 最终 Scenario 10 中，node-6 从本地 view 66 收到 view 89 的 quorum Timeout，形成 TC89，广播
 NewView90；全网随后恢复。
 
+`collect_future_timeout` 是明确的共识行为与兼容性断代，不只是网络重连优化：节点现在会缓存
+future-view Timeout，逐票验证 sender、BLS 签名和 high-QC，按该 view 的严格 validator set 去重并
+要求 N−f；只有目标 next-view leader 才能聚合 TC、签 NewView 并推进。旧节点不会执行这条恢复
+路径。它与 consensus protocol v4 一起要求验证者协调升级，禁止把新旧版本当作可滚动混跑。
+
 ### Catch-up 节流
 
 - 入站 state-sync 按 PeerId 使用 1 秒固定窗口：未认证 peer 4 requests/s，trusted/authenticated
@@ -72,7 +77,7 @@ NewView90；全网随后恢复。
   Timeout 未达 quorum 不推进、真实 TC 推进、未知 future epoch 不允许 current-set fallback。
 - `cargo check --workspace --all-targets`、
   `cargo clippy --workspace --all-targets -- -D warnings`、`cargo test --workspace`：通过；workspace
-  首轮捕获的 parallel-EVM 真竞态已由独立前置提交 `5ba718d` 修复后重新全绿。
+  首轮捕获的 parallel-EVM 真竞态已由独立前置提交 `71bf98e` 修复后重新全绿。
 - E2E Scenario 9（120s、node-2 停 20s）：7/7 checks；最终三节点高度均为 206，恢复后新增
   78 blocks，10 个采样区块 hash 一致，783 笔 ETH/ERC20 交易通过且 ERC20 总量守恒。
 - E2E Scenario 10：10/10 checks；4/7 时高度 85 不增长，恢复后 7 节点最终高度均为 120，

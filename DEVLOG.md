@@ -135,11 +135,13 @@ Logs are split into separate files by phase for easy maintenance:
 | [devlog-102-twig-staged-flush-audit](docs/devlog-102-twig-staged-flush-audit.md) | gov5 2026H1 P1-2：审计 QMDB bin tree/Twig staged diff、WAL fsync、内存 adopt 与快照顺序；增加 WAL 写失败后 root/version 不前进且重启回到最后 durable 状态的故障注入验收 | Reliability |
 | [devlog-103-state-root-hard-floor](docs/devlog-103-state-root-hard-floor.md) | gov5 2026H1 P1-3：生产链 state-root bypass 启动硬门；按确定性低频采样比对同一块的 reth PlainState 与 QMDB bin tree/Twig 叶值，发散后锁存 unhealthy/rebuild-required 并停发手机包 | Safety |
 | [devlog-104-network-liveness](docs/devlog-104-network-liveness.md) | gov5 2026H1 P1-4：验证者身份绑定与指数重连、当前 view 投票幂等重发、future-timeout quorum TC 恢复及 catch-up 入站节流；Scenario 9/10 实弹 | Liveness |
+| [mobileverify-gov5-comparison](docs/mobileverify-gov5-comparison.md) | gov5 mobileverify 对照：dense/delta 位图、跨 IDC 聚合、注册表承诺与 QMDB/Twig 复用边界 | Architecture |
 | [devlog-105-parallel-evm-validation-order](docs/devlog-105-parallel-evm-validation-order.md) | workspace 门禁复现并修复 Block-STM validation 领取顺序早于完成顺序的竞态；强制低位前缀完成后才验证高位交易 | Safety |
 | [devlog-106-mobile-evidence-bitfield-v2](docs/devlog-106-mobile-evidence-bitfield-v2.md) | P1-5 对照审计附带修复：MDBX evidence v2 显式保存稀疏手机参与位图长度，兼容读取 v1，并拒绝非规范/越界数据 | Bug Fix |
 | [devlog-107-selfdestruct-mobile-replay](docs/devlog-107-selfdestruct-mobile-replay.md) | gov5 2026H1 P1-6：真实 EVM 覆盖 create/destroy/recreate、未读 slot 与 Cancun EIP-6780 分叉语义，IDC/read-log/手机重放 receipts root 一致 | Verification |
 | [devlog-108-parallel-selfdestruct-shadow](docs/devlog-108-parallel-selfdestruct-shadow.md) | P1-6/跨客户端审计附带修复：Block-STM 显式传播 Destroyed/Recreated 整地址 storage wipe，修复 MVCC、输出合并与 deferred coinbase 回退 | Safety |
 | [devlog-109-gov5-p1-rework-closeout](docs/devlog-109-gov5-p1-rework-closeout.md) | gov5 2026H1 P1-1～P1-6 返工收尾：批量 BLS、Twig WAL/state floor、网络恢复、mobile/SELFDESTRUCT；补 CommitQC 预提交执行谱系 sync/2，Scenario 9/10 实弹全绿 | Verification |
+| [devlog-110-s5-cache-poison-hardening](docs/devlog-110-s5-cache-poison-hardening.md) | S5 CRITICAL 返工：拒绝 sender-declared hash mismatch 投毒坏块缓存，非 Valid 回收 compact output，并绑定 sidecar canonical hash 与 sync/2 帧预算 | Security |
 
 ---
 
