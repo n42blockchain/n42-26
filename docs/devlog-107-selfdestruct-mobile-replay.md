@@ -11,8 +11,8 @@ retained a state tree: pre-Cancun SELFDESTRUCT can delete storage slots that the
 destroying block never reads, so the replayer otherwise cannot enumerate them.
 
 n42-26 mobile V2 has a different boundary. `StreamReplayDB` is a per-block,
-keyless value stream and computes a receipts root; it does not retain QMDB/Twig
-or MPT state between blocks. An unread old slot is never materialized on the
+keyless value stream and computes a receipts root; it does not retain a
+persistent QMDB/Twig state tree between blocks. An unread old slot is never materialized on the
 phone, so it cannot survive there as a ghost leaf. The production chain is
 Cancun-active, where EIP-6780 also preserves storage for an existing contract.
 

@@ -10,9 +10,10 @@ The node now has two independent state-integrity floors:
 2. the default QMDB binary-tree/Twig sidecar is sampled against reth's exact
    post-state and mobile output is fail-closed on a real value mismatch.
 
-The two roots are deliberately **not compared**. reth commits an Ethereum MPT;
-Twig uses a sharded append-ordered binary-tree commitment, so equal values have
-different roots by construction.
+The two root domains are deliberately **not compared**. The default N42 state
+tree is the QMDB/Twig sharded append-ordered binary tree, not MPT. The
+reth-backed execution adapter and Twig probe therefore compare exact account
+and storage values for the same block rather than assuming byte-equal roots.
 
 ## Startup hard gate
 

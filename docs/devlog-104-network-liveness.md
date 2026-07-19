@@ -77,3 +77,30 @@ NewView90；全网随后恢复。
   78 blocks，10 个采样区块 hash 一致，783 笔 ETH/ERC20 交易通过且 ERC20 总量守恒。
 - E2E Scenario 10：10/10 checks；4/7 时高度 85 不增长，恢复后 7 节点最终高度均为 120，
   新增 35 blocks，区块 hash 一致，7 个 leader 均出现，595 个手机验证回执 accepted、0 reject。
+
+## 2026-07-19 返工：epoch、超时请求与执行谱系
+
+对 Scenario 10 连续实弹时又发现并修复三条恢复链：
+
+1. epoch 是 view 区间，不只是“validator set 变更次数”。没有成员变化的边界现在也推进 epoch
+   并保存历史集合；启动挂载 schedule 时预先 staged 第一轮配置，live 与 restart 不再对同一 view
+   计算出不同 epoch。
+2. 普通 state sync 丢失响应后，旧 `sync_in_flight` 会长期挡住 execution catch-up。两条入口现统一
+   淘汰超时请求组，再允许多 peer fan-out。
+3. 一块在 R1 后因节点掉线而只留下 LockedQC，下一块可沿它构建并取得 CommitQC。重启节点的 reth
+   只持久化到更早的 committed head；只同步 CommitQC 子块会永久缺父块。sync/2 现在由 CommitQC
+   证明完整 raw execution lineage，逐父链导入预提交祖先，再导入子块；cached execution output 与
+   StateDiff 一并保留。执行高度按 payload block number 校准，QMDB/Twig 二叉树逐块应用全部 diff，
+   质押扫描也改用真实 execution block number。普通块不在 10K ring 中重复保存大 execution output，
+   raw retention 只用于“无独立 CommitQC 的预提交祖先”这一必要情况。
+
+新增 mock reth 验收明确观察到 `prepared #144 -> committed #145` 的导入顺序、执行高度
+`143 -> 145`、两份 QMDB/Twig StateDiff 均应用；不完整/不连到本地 exact head 的 raw lineage
+不获信任。协议使用新的 `/n42/sync/2` ID，避免 bincode v1/v2 混解。
+
+返工后 release 实弹：
+
+- Scenario 9（3 节点、120 秒、node-2 停 20 秒）：7/7；最终高度 228/228/228，恢复节点补齐
+  78 块，10 个 hash 样本一致，780 笔 ETH/ERC20 交易与总量守恒。
+- Scenario 10（7 节点）：10/10；7/7 高度 66、6/7 高度 83、5/7 高度 85、4/7 严格停在 85；
+  全恢复后高度 138/138/138/138/138/138/138，hash 一致，7 个 leader，595 accepted、0 reject。

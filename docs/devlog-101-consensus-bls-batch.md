@@ -79,3 +79,34 @@ gain is smaller.
   handling and below-quorum rejection.
 - `cargo check --all-targets`, strict clippy, workspace tests, and chaos E2E are
   run as the task closeout gate.
+
+## 2026-07-19 rework audit
+
+The first implementation authenticated a `CommitVote` batch against whatever
+`validator_changes_hash` happened to be cached before the drained events were
+dispatched. An earlier Proposal in that same drain can establish or change the
+canonical domain. A signer-only authentication token could therefore suppress
+the required individual recheck under a stale domain.
+
+The token now records the exact authenticated vote kind and, for R2, the exact
+validator-changes hash. The state machine skips individual verification only
+while that domain is still canonical. A batch miss for R2 falls back to the
+ordinary check after preceding events have populated the proposal cache. The
+primitive also randomizes every coefficient (including index zero) and treats
+an unmatched input tail as a total batch failure.
+
+The authoritative task-book benchmark was rerun serially in release mode. All
+five ignored tests passed in 910.53 seconds. Representative current values:
+
+| Workload | Result |
+|---|---:|
+| Mobile sign / verify | 401.4 / 755.6 us |
+| 250K mobile receipts | 288,794 ms |
+| QC n=100, quorum=67 | 28.26 ms |
+| QC n=500, quorum=334 | 141.54 ms |
+| 500×500 per-node mobile work | 574 ms |
+| 100×2500 per-node mobile work | 2,883 ms |
+
+The task-book's “same-message hash-to-G2 reuse” is not exposed by the current
+safe Rust `blst` API. It remains a measured follow-up, not an unsafe local FFI
+shortcut. The randomized batch path already clears the required 2x threshold.

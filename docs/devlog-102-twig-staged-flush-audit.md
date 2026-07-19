@@ -10,7 +10,9 @@ This audit covers the QMDB binary-tree/Twig sidecar's two mutation boundaries:
 - `PersistentTwig` WAL, in-memory tree and snapshot ordering in
   `n42-jmt/src/persistent.rs`.
 
-The Twig root is its own binary-tree commitment. It is not the reth MPT root.
+The Twig root is the default QMDB-style binary-tree commitment. It is not
+byte-equal to the legacy execution-root adapter, and the target N42 tree must
+not be described as MPT.
 
 ## Result
 
