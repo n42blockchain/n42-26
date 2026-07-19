@@ -146,12 +146,37 @@ pub enum ConsensusEvent {
 #[derive(Debug)]
 pub struct AuthenticatedConsensusMessage {
     message: ConsensusMessage,
-    signer: u32,
+    proof: AuthenticatedVoteProof,
 }
 
 impl AuthenticatedConsensusMessage {
     pub fn signer(&self) -> u32 {
-        self.signer
+        self.proof.signer()
+    }
+}
+
+/// Exact signature domain authenticated by the batch verifier.
+///
+/// A CommitVote is bound to the validator-changes hash observed during batch
+/// verification. Processing may mutate the proposal cache before the token is
+/// consumed, so the engine must only skip individual verification while that
+/// domain is still canonical.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthenticatedVoteProof {
+    Vote {
+        signer: u32,
+    },
+    CommitVote {
+        signer: u32,
+        validator_changes_hash: B256,
+    },
+}
+
+impl AuthenticatedVoteProof {
+    fn signer(self) -> u32 {
+        match self {
+            Self::Vote { signer } | Self::CommitVote { signer, .. } => signer,
+        }
     }
 }
 
@@ -624,7 +649,7 @@ impl ConsensusEngine {
                     };
                     candidates.push((
                         position,
-                        vote.voter,
+                        AuthenticatedVoteProof::Vote { signer: vote.voter },
                         signing_message(vote.view, &vote.block_hash).to_vec(),
                         &vote.signature,
                         public_key,
@@ -640,7 +665,10 @@ impl ConsensusEngine {
                     let changes_hash = self.cached_changes_hash(&commit_vote.block_hash);
                     candidates.push((
                         position,
-                        commit_vote.voter,
+                        AuthenticatedVoteProof::CommitVote {
+                            signer: commit_vote.voter,
+                            validator_changes_hash: changes_hash,
+                        },
                         commit_signing_message(
                             commit_vote.view,
                             &commit_vote.block_hash,
@@ -677,18 +705,18 @@ impl ConsensusEngine {
         .into_iter()
         .collect::<HashSet<_>>();
 
-        let mut verified_signers = vec![None; messages.len()];
-        for (candidate_position, (message_position, signer, ..)) in candidates.iter().enumerate() {
+        let mut verified_proofs = vec![None; messages.len()];
+        for (candidate_position, (message_position, proof, ..)) in candidates.iter().enumerate() {
             if !bad.contains(&candidate_position) {
-                verified_signers[*message_position] = Some(*signer);
+                verified_proofs[*message_position] = Some(*proof);
             }
         }
 
         messages
             .into_iter()
-            .zip(verified_signers)
-            .map(|(message, signer)| {
-                signer.map(|signer| AuthenticatedConsensusMessage { message, signer })
+            .zip(verified_proofs)
+            .map(|(message, proof)| {
+                proof.map(|proof| AuthenticatedConsensusMessage { message, proof })
             })
             .collect()
     }
@@ -828,7 +856,7 @@ impl ConsensusEngine {
         &mut self,
         authenticated: AuthenticatedConsensusMessage,
     ) -> ConsensusResult<()> {
-        self.process_message_inner(authenticated.message, Some(authenticated.signer))
+        self.process_message_inner(authenticated.message, Some(authenticated.proof))
     }
 
     // ── Message dispatch ──
@@ -840,7 +868,7 @@ impl ConsensusEngine {
     fn process_message_inner(
         &mut self,
         msg: ConsensusMessage,
-        authenticated_signer: Option<u32>,
+        authenticated_proof: Option<AuthenticatedVoteProof>,
     ) -> ConsensusResult<()> {
         let msg_view = Self::message_view(&msg);
         let current_view = self.round_state.current_view();
@@ -888,7 +916,7 @@ impl ConsensusEngine {
                 if self.try_qc_view_jump(&msg, view)? {
                     let new_current = self.round_state.current_view();
                     if view == new_current {
-                        return self.dispatch_message(msg, authenticated_signer);
+                        return self.dispatch_message(msg, authenticated_proof);
                     } else if view > new_current
                         && view <= new_current + FUTURE_VIEW_WINDOW
                         && self.future_msg_buffer.len() < MAX_FUTURE_MESSAGES
@@ -920,24 +948,38 @@ impl ConsensusEngine {
             return Ok(());
         }
 
-        self.dispatch_message(msg, authenticated_signer)
+        self.dispatch_message(msg, authenticated_proof)
     }
 
     fn dispatch_message(
         &mut self,
         msg: ConsensusMessage,
-        authenticated_signer: Option<u32>,
+        authenticated_proof: Option<AuthenticatedVoteProof>,
     ) -> ConsensusResult<()> {
         match msg {
             ConsensusMessage::Proposal(p) => self.process_proposal(p),
-            ConsensusMessage::Vote(v) if authenticated_signer == Some(v.voter) => {
+            ConsensusMessage::Vote(v)
+                if authenticated_proof
+                    == Some(AuthenticatedVoteProof::Vote { signer: v.voter }) =>
+            {
                 self.process_verified_vote(v)
             }
             ConsensusMessage::Vote(v) => self.process_vote(v),
-            ConsensusMessage::CommitVote(cv) if authenticated_signer == Some(cv.voter) => {
-                self.process_verified_commit_vote(cv)
+            ConsensusMessage::CommitVote(cv) => {
+                let domain_is_current = matches!(
+                    authenticated_proof,
+                    Some(AuthenticatedVoteProof::CommitVote {
+                        signer,
+                        validator_changes_hash,
+                    }) if signer == cv.voter
+                        && validator_changes_hash == self.cached_changes_hash(&cv.block_hash)
+                );
+                if domain_is_current {
+                    self.process_verified_commit_vote(cv)
+                } else {
+                    self.process_commit_vote(cv)
+                }
             }
-            ConsensusMessage::CommitVote(cv) => self.process_commit_vote(cv),
             ConsensusMessage::PrepareQC(pqc) => self.process_prepare_qc(pqc),
             ConsensusMessage::Timeout(t) => self.process_timeout(t),
             ConsensusMessage::NewView(nv) => self.process_new_view(nv),
@@ -2967,6 +3009,70 @@ mod tests {
                 EngineOutput::BroadcastMessage(ConsensusMessage::PrepareQC(_))
             ))
         );
+    }
+
+    #[test]
+    fn test_authenticated_commit_vote_rechecks_changed_signature_domain() {
+        let (mut engine, sks, _, _) = make_engine(4, 1);
+        let view = 1;
+        let block_hash = B256::repeat_byte(0xC5);
+
+        // Batch authentication runs before the orchestrator processes earlier
+        // messages in the same drain. Without a cached proposal this token is
+        // authenticated in the canonical no-validator-changes domain.
+        let stale_message = commit_signing_message(view, &block_hash, &B256::ZERO);
+        let mut authenticated =
+            engine.authenticate_vote_batch(vec![ConsensusMessage::CommitVote(CommitVote {
+                view,
+                block_hash,
+                voter: 0,
+                signature: sks[0].sign(&stale_message),
+            })]);
+        let authenticated = authenticated
+            .pop()
+            .flatten()
+            .expect("the stale-domain signature is valid at batch time");
+
+        // Simulate an earlier Proposal in the same drain establishing the
+        // actual validator-changes hash before this CommitVote is dispatched.
+        engine
+            .pending_changes_hashes
+            .insert(block_hash, B256::repeat_byte(0x5A));
+
+        assert!(matches!(
+            engine.process_authenticated_message(authenticated),
+            Err(crate::error::ConsensusError::InvalidSignature {
+                view: 1,
+                validator_index: 0,
+            })
+        ));
+    }
+
+    #[test]
+    fn test_batch_rejected_commit_vote_can_pass_after_domain_is_established() {
+        let (mut engine, sks, _, _) = make_engine(4, 1);
+        let view = 1;
+        let block_hash = B256::repeat_byte(0xC6);
+        let changes_hash = B256::repeat_byte(0x6A);
+        let message = ConsensusMessage::CommitVote(CommitVote {
+            view,
+            block_hash,
+            voter: 0,
+            signature: sks[0].sign(&commit_signing_message(view, &block_hash, &changes_hash)),
+        });
+
+        let mut authenticated = engine.authenticate_vote_batch(vec![message.clone()]);
+        assert!(
+            authenticated.pop().flatten().is_none(),
+            "the non-zero-domain vote cannot authenticate before its Proposal"
+        );
+
+        engine
+            .pending_changes_hashes
+            .insert(block_hash, changes_hash);
+        engine
+            .process_event(ConsensusEvent::Message(message))
+            .expect("canonical fallback should accept the now-established signature domain");
     }
 
     #[test]

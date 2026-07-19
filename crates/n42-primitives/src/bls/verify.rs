@@ -44,9 +44,7 @@ pub fn batch_verify(
     }
 
     let mut rands: Vec<blst_scalar> = Vec::with_capacity(messages.len());
-    rands.push(scalar_from_u64(1));
-
-    for _ in 1..messages.len() {
+    for _ in 0..messages.len() {
         let mut rand_bytes = [0u8; 8];
         getrandom::fill(&mut rand_bytes).map_err(|_| BlsError::RandomGenerationFailed)?;
         let mut val = u64::from_le_bytes(rand_bytes);
@@ -81,10 +79,10 @@ pub fn batch_verify_with_fallback(
     public_keys: &[&BlsPublicKey],
 ) -> Result<(), Vec<usize>> {
     if messages.len() != signatures.len() || signatures.len() != public_keys.len() {
-        // Input length mismatch is a programming error; return all valid indices as bad
-        // to ensure the caller treats it as a total failure without out-of-bounds risk.
-        let min_len = messages.len().min(signatures.len()).min(public_keys.len());
-        return Err((0..min_len).collect());
+        // Input length mismatch is a programming error. Mark every message
+        // position bad so callers that use this index set as a filter cannot
+        // accidentally accept an unmatched tail.
+        return Err((0..messages.len()).collect());
     }
 
     if messages.len() > MAX_BATCH_SIZE {
@@ -267,5 +265,18 @@ mod tests {
         assert!(bad_indices.contains(&1), "should identify index 1 as bad");
         assert!(bad_indices.contains(&3), "should identify index 3 as bad");
         assert_eq!(bad_indices.len(), 2, "should find exactly 2 bad signatures");
+    }
+
+    #[test]
+    fn test_batch_verify_with_fallback_rejects_unmatched_tail() {
+        let sk = test_key(0x75);
+        let pk = sk.public_key();
+        let sig = sk.sign(b"first");
+        let messages: Vec<&[u8]> = vec![b"first".as_ref(), b"unmatched".as_ref()];
+
+        assert_eq!(
+            batch_verify_with_fallback(&messages, &[&sig], &[&pk]),
+            Err(vec![0, 1])
+        );
     }
 }

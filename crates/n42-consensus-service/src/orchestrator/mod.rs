@@ -2192,6 +2192,17 @@ impl ConsensusService {
 
                 let authenticated = match preauthenticated {
                     Some(Some(authenticated)) => Some(authenticated),
+                    // CommitVote's signature domain includes proposal-derived
+                    // validator_changes_hash. Batch verification happens before
+                    // earlier events in this drain are dispatched, so a failed
+                    // precheck can become valid after an earlier Proposal fills
+                    // the cache. Re-run the canonical individual check in that
+                    // case; Vote has no mutable domain and can be dropped here.
+                    Some(None) if matches!(message.as_ref(), CM::CommitVote(_)) => {
+                        counter!("n42_consensus_commit_vote_batch_domain_fallback_total")
+                            .increment(1);
+                        None
+                    }
                     Some(None) => {
                         counter!("n42_consensus_vote_batch_invalid_total").increment(1);
                         debug!(
