@@ -58,6 +58,10 @@ pub struct ReadEntry {
 #[derive(Debug, Clone)]
 pub enum AccountWrite {
     Updated(AccountInfo),
+    /// A newly created account whose address may have existed before an
+    /// earlier SELFDESTRUCT. Its entire prior storage domain is zero before
+    /// the transaction's explicit slot writes are applied.
+    Recreated(AccountInfo),
     Destroyed,
 }
 

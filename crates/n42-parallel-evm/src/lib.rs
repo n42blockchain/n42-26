@@ -159,6 +159,23 @@ where
         return sequential_execute(txs, base_db, &cfg_env, &block_env);
     }
 
+    // The deferred-beneficiary optimization uses blind base-state reads. If a
+    // transaction dynamically creates, mutates, or destroys that address, prior
+    // fee deltas no longer commute with the transition. Preserve correctness by
+    // re-running the whole block through the canonical sequential path.
+    if coinbase.is_some()
+        && outputs.iter().any(|output| {
+            output
+                .lock()
+                .as_ref()
+                .is_some_and(|out| out.deferred_bene_invalidated)
+        })
+    {
+        warn!(target: "n42::parallel_evm", "deferred beneficiary changed dynamically; falling back to sequential");
+        metrics::counter!("n42_parallel_evm_coinbase_fallback_total").increment(1);
+        return sequential_execute(txs, base_db, &cfg_env, &block_env);
+    }
+
     let elapsed = start.elapsed();
     info!(
         target: "n42::parallel_evm",
@@ -230,8 +247,9 @@ where
 #[cfg(test)]
 mod deferred_coinbase_tests {
     use super::*;
-    use alloy_primitives::{TxKind, U256};
+    use alloy_primitives::{Bytes, TxKind, U256};
     use revm::database::{CacheDB, EmptyDB};
+    use revm::primitives::hardfork::SpecId;
     use revm::state::AccountInfo;
 
     fn addr(n: u64) -> Address {
@@ -295,8 +313,16 @@ mod deferred_coinbase_tests {
 
         // Coinbase actually accrued fees, and matches sequential exactly.
         let cb = seq.state_changes.get(&bene).map(|a| a.info.balance);
-        assert_eq!(cb, Some(U256::from(200u64 * 21_000 * 7)), "coinbase fee total");
-        assert_eq!(balances(&seq), balances(&par), "every account balance must match");
+        assert_eq!(
+            cb,
+            Some(U256::from(200u64 * 21_000 * 7)),
+            "coinbase fee total"
+        );
+        assert_eq!(
+            balances(&seq),
+            balances(&par),
+            "every account balance must match"
+        );
     }
 
     #[test]
@@ -347,7 +373,11 @@ mod deferred_coinbase_tests {
             Some(U256::from(150u64 * 100)),
             "hot recipient balance"
         );
-        assert_eq!(balances(&seq), balances(&par), "hot-recipient block must match sequential");
+        assert_eq!(
+            balances(&seq),
+            balances(&par),
+            "hot-recipient block must match sequential"
+        );
     }
 
     #[test]
@@ -378,7 +408,11 @@ mod deferred_coinbase_tests {
         unsafe { std::env::set_var("N42_PARALLEL_THRESHOLD", "1") };
         let par = parallel_execute(&txs, &db, cfg.clone(), block.clone()).unwrap();
         unsafe { std::env::remove_var("N42_PARALLEL_THRESHOLD") };
-        assert_eq!(balances(&seq), balances(&par), "contract-beneficiary block must match sequential");
+        assert_eq!(
+            balances(&seq),
+            balances(&par),
+            "contract-beneficiary block must match sequential"
+        );
     }
 
     #[test]
@@ -397,7 +431,163 @@ mod deferred_coinbase_tests {
         unsafe { std::env::set_var("N42_PARALLEL_THRESHOLD", "1") };
         let par = parallel_execute(&txs, &db, cfg.clone(), block.clone()).unwrap();
         unsafe { std::env::remove_var("N42_PARALLEL_THRESHOLD") };
-        assert_eq!(balances(&seq), balances(&par), "must match sequential exactly");
+        assert_eq!(
+            balances(&seq),
+            balances(&par),
+            "must match sequential exactly"
+        );
+    }
+
+    #[test]
+    fn constructor_selfdestruct_of_deferred_beneficiary_falls_back() {
+        let sender = addr(0x5151);
+        let beneficiary = sender.create(0);
+        let mut db = CacheDB::<EmptyDB>::default();
+        db.insert_account_info(
+            sender,
+            AccountInfo {
+                balance: U256::from(u128::MAX),
+                nonce: 0,
+                ..Default::default()
+            },
+        );
+
+        // Constructor writes one slot and immediately SELFDESTRUCTs. This is a
+        // real deletion under Cancun's same-transaction creation exception.
+        let mut init = vec![0x60, 0x42, 0x60, 0x00, 0x55, 0x73];
+        init.extend_from_slice(addr(0xDEAD).as_slice());
+        init.push(0xff);
+        let tx = TxEnv::builder()
+            .caller(sender)
+            .kind(TxKind::Create)
+            .data(Bytes::from(init))
+            .gas_limit(500_000)
+            .gas_price(7)
+            .nonce(0)
+            .build()
+            .unwrap();
+        let txs = vec![tx];
+        let cfg = CfgEnv::new_with_spec(SpecId::CANCUN);
+        let block = BlockEnv {
+            beneficiary,
+            ..Default::default()
+        };
+
+        let deferred = match DeferredCoinbase::plan(&txs, &db, &block).unwrap() {
+            CoinbasePlan::Defer(deferred) => deferred,
+            _ => panic!("absent beneficiary should initially be deferrable"),
+        };
+        let probe = execute_single_tx(
+            0,
+            &txs[0],
+            &db,
+            &MvMemory::new(),
+            &cfg,
+            &block,
+            Some(&deferred),
+        )
+        .unwrap();
+        assert!(probe.deferred_bene_invalidated);
+        assert!(probe.account_writes.iter().any(|(address, write)| {
+            *address == beneficiary && matches!(write, AccountWrite::Destroyed)
+        }));
+        assert!(
+            probe
+                .storage_writes
+                .iter()
+                .all(|(address, _, _)| *address != beneficiary)
+        );
+
+        let sequential = sequential_execute(&txs, &db, &cfg, &block).unwrap();
+        unsafe { std::env::set_var("N42_PARALLEL_THRESHOLD", "0") };
+        let parallel = parallel_execute(&txs, &db, cfg, block).unwrap();
+        unsafe { std::env::remove_var("N42_PARALLEL_THRESHOLD") };
+
+        assert!(sequential.state_changes[&beneficiary].is_selfdestructed());
+        assert!(parallel.state_changes[&beneficiary].is_selfdestructed());
+        assert_eq!(
+            sequential.state_changes[&beneficiary].storage,
+            parallel.state_changes[&beneficiary].storage
+        );
+    }
+
+    #[test]
+    fn selfdestruct_classification_respects_eip6780() {
+        let sender = addr(0x6161);
+        let contract = addr(0xC0DE);
+        let recipient = addr(0xDEAD);
+        let beneficiary = addr(0xBEEF);
+        let mut runtime = vec![0x73];
+        runtime.extend_from_slice(recipient.as_slice());
+        runtime.push(0xff);
+        let bytecode = revm::state::Bytecode::new_raw(Bytes::from(runtime));
+
+        let mut db = CacheDB::<EmptyDB>::default();
+        db.insert_account_info(
+            sender,
+            AccountInfo {
+                balance: U256::from(u128::MAX),
+                nonce: 0,
+                ..Default::default()
+            },
+        );
+        db.insert_account_info(
+            contract,
+            AccountInfo {
+                balance: U256::from(42),
+                nonce: 1,
+                code_hash: bytecode.hash_slow(),
+                code: Some(bytecode),
+                ..Default::default()
+            },
+        );
+        let tx = TxEnv::builder()
+            .caller(sender)
+            .kind(TxKind::Call(contract))
+            .gas_limit(100_000)
+            .gas_price(0)
+            .nonce(0)
+            .build()
+            .unwrap();
+        let block = BlockEnv {
+            beneficiary,
+            ..Default::default()
+        };
+
+        let shanghai = execute_single_tx(
+            0,
+            &tx,
+            &db,
+            &MvMemory::new(),
+            &CfgEnv::new_with_spec(SpecId::SHANGHAI),
+            &block,
+            None,
+        )
+        .unwrap();
+        assert!(shanghai.account_writes.iter().any(
+            |(address, write)| *address == contract && matches!(write, AccountWrite::Destroyed)
+        ));
+
+        let cancun = execute_single_tx(
+            0,
+            &tx,
+            &db,
+            &MvMemory::new(),
+            &CfgEnv::new_with_spec(SpecId::CANCUN),
+            &block,
+            None,
+        )
+        .unwrap();
+        assert!(
+            cancun
+                .account_writes
+                .iter()
+                .any(|(address, write)| *address == contract
+                    && matches!(write, AccountWrite::Updated(_)))
+        );
+        assert!(!cancun.account_writes.iter().any(
+            |(address, write)| *address == contract && matches!(write, AccountWrite::Destroyed)
+        ));
     }
 }
 
@@ -485,7 +675,10 @@ mod differential_tests {
     }
 
     fn results_fp(out: &ParallelExecutionOutput) -> Vec<(u64, bool)> {
-        out.results.iter().map(|r| (r.gas_used, r.success)).collect()
+        out.results
+            .iter()
+            .map(|r| (r.gas_used, r.success))
+            .collect()
     }
 
     /// Build a randomized mixed block: `n` txs, each from a unique sender (nonce
@@ -680,7 +873,15 @@ mod differential_tests {
             .and_then(|a| a.storage.get(&U256::ZERO))
             .map(|s| s.present_value);
         assert_eq!(counter, Some(U256::from(n)), "counter must equal tx count");
-        assert_eq!(fingerprint(&seq), fingerprint(&par), "full state must match");
-        assert_eq!(results_fp(&seq), results_fp(&par), "per-tx results must match");
+        assert_eq!(
+            fingerprint(&seq),
+            fingerprint(&par),
+            "full state must match"
+        );
+        assert_eq!(
+            results_fp(&seq),
+            results_fp(&par),
+            "per-tx results must match"
+        );
     }
 }

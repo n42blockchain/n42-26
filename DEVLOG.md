@@ -138,6 +138,7 @@ Logs are split into separate files by phase for easy maintenance:
 | [devlog-105-parallel-evm-validation-order](docs/devlog-105-parallel-evm-validation-order.md) | workspace 门禁复现并修复 Block-STM validation 领取顺序早于完成顺序的竞态；强制低位前缀完成后才验证高位交易 | Safety |
 | [devlog-106-mobile-evidence-bitfield-v2](docs/devlog-106-mobile-evidence-bitfield-v2.md) | P1-5 对照审计附带修复：MDBX evidence v2 显式保存稀疏手机参与位图长度，兼容读取 v1，并拒绝非规范/越界数据 | Bug Fix |
 | [devlog-107-selfdestruct-mobile-replay](docs/devlog-107-selfdestruct-mobile-replay.md) | gov5 2026H1 P1-6：真实 EVM 覆盖 create/destroy/recreate、未读 slot 与 Cancun EIP-6780 分叉语义，IDC/read-log/手机重放 receipts root 一致 | Verification |
+| [devlog-108-parallel-selfdestruct-shadow](docs/devlog-108-parallel-selfdestruct-shadow.md) | P1-6/跨客户端审计附带修复：Block-STM 显式传播 Destroyed/Recreated 整地址 storage wipe，修复 MVCC、输出合并与 deferred coinbase 回退 | Safety |
 
 ---
 

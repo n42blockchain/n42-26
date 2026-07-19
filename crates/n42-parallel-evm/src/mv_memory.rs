@@ -24,6 +24,7 @@ pub enum MvRead<T> {
 enum WriteKey {
     Account(Address),
     Storage(Address, U256),
+    StorageWipe(Address),
 }
 
 /// Thread-safe multi-version memory backing the Block-STM parallel execution.
@@ -32,6 +33,10 @@ pub struct MvMemory {
     accounts: DashMap<Address, RwLock<BTreeMap<TxIdx, Option<AccountInfo>>>>,
     /// Storage slots: (address, slot) → { tx_idx → value }
     storage: DashMap<(Address, U256), RwLock<BTreeMap<TxIdx, U256>>>,
+    /// Whole-account storage wipes caused by SELFDESTRUCT. Slot reads compare
+    /// the latest wipe with the latest per-slot write so untouched historical
+    /// slots become zero while writes after a recreation remain visible.
+    storage_wipes: DashMap<Address, RwLock<BTreeMap<TxIdx, ()>>>,
     /// Code cache (immutable per block — no versioning).
     code: DashMap<B256, Bytecode>,
     /// Per-tx write index: tx_idx → list of locations that tx wrote.
@@ -57,6 +62,7 @@ impl MvMemory {
         Self {
             accounts: DashMap::new(),
             storage: DashMap::new(),
+            storage_wipes: DashMap::new(),
             code: DashMap::new(),
             tx_writes: DashMap::new(),
             bene_deltas: DashMap::new(),
@@ -89,7 +95,7 @@ impl MvMemory {
     /// Write account info from `writer_idx`.
     pub fn write_account(&self, writer_idx: TxIdx, addr: Address, write: &AccountWrite) {
         let info = match write {
-            AccountWrite::Updated(info) => Some(info.clone()),
+            AccountWrite::Updated(info) | AccountWrite::Recreated(info) => Some(info.clone()),
             AccountWrite::Destroyed => None,
         };
         self.accounts
@@ -102,17 +108,42 @@ impl MvMemory {
             .entry(writer_idx)
             .or_default()
             .push(WriteKey::Account(addr));
+        if matches!(write, AccountWrite::Destroyed | AccountWrite::Recreated(_)) {
+            self.storage_wipes
+                .entry(addr)
+                .or_insert_with(|| RwLock::new(BTreeMap::new()))
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(writer_idx, ());
+            self.tx_writes
+                .entry(writer_idx)
+                .or_default()
+                .push(WriteKey::StorageWipe(addr));
+        }
     }
 
     /// Read storage slot visible to `reader_idx`.
     pub fn read_storage(&self, reader_idx: TxIdx, addr: Address, slot: U256) -> MvRead<U256> {
-        if let Some(entry) = self.storage.get(&(addr, slot)) {
+        let latest_slot = self.storage.get(&(addr, slot)).and_then(|entry| {
             let versions = entry.read().unwrap_or_else(|e| e.into_inner());
-            if let Some((&src_tx, &val)) = versions.range(..reader_idx).next_back() {
-                return MvRead::Value(src_tx, val);
+            versions
+                .range(..reader_idx)
+                .next_back()
+                .map(|(&tx, &value)| (tx, value))
+        });
+        let latest_wipe = self.storage_wipes.get(&addr).and_then(|entry| {
+            let versions = entry.read().unwrap_or_else(|e| e.into_inner());
+            versions.range(..reader_idx).next_back().map(|(&tx, _)| tx)
+        });
+
+        match (latest_slot, latest_wipe) {
+            (Some((slot_tx, _value)), Some(wipe_tx)) if wipe_tx > slot_tx => {
+                MvRead::Value(wipe_tx, U256::ZERO)
             }
+            (Some((slot_tx, value)), _) => MvRead::Value(slot_tx, value),
+            (None, Some(wipe_tx)) => MvRead::Value(wipe_tx, U256::ZERO),
+            (None, None) => MvRead::NotFound,
         }
-        MvRead::NotFound
     }
 
     /// Write storage slot from `writer_idx`.
@@ -169,6 +200,14 @@ impl MvMemory {
                                 .remove(&tx_idx);
                         }
                     }
+                    WriteKey::StorageWipe(addr) => {
+                        if let Some(entry) = self.storage_wipes.get(addr) {
+                            entry
+                                .write()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .remove(&tx_idx);
+                        }
+                    }
                 }
             }
             writes.len()
@@ -178,5 +217,79 @@ impl MvMemory {
         let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
         metrics::histogram!("n42_mv_memory_clear_tx_ms").record(elapsed_ms);
         metrics::histogram!("n42_mv_memory_clear_tx_writes").record(writes_count as f64);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn addr(n: u64) -> Address {
+        Address::from_word(U256::from(n).into())
+    }
+
+    #[test]
+    fn selfdestruct_wipe_shadows_older_slots_but_not_recreated_writes() {
+        let mv = MvMemory::new();
+        let account = addr(1);
+        let old_slot = U256::from(7);
+        let new_slot = U256::from(8);
+
+        mv.write_storage(0, account, old_slot, U256::from(11));
+        mv.write_account(1, account, &AccountWrite::Destroyed);
+
+        assert!(matches!(
+            mv.read_storage(2, account, old_slot),
+            MvRead::Value(1, value) if value.is_zero()
+        ));
+        assert!(matches!(
+            mv.read_storage(2, account, new_slot),
+            MvRead::Value(1, value) if value.is_zero()
+        ));
+
+        mv.write_account(
+            2,
+            account,
+            &AccountWrite::Recreated(AccountInfo::default()),
+        );
+        mv.write_storage(2, account, new_slot, U256::from(22));
+
+        assert!(matches!(
+            mv.read_storage(3, account, old_slot),
+            MvRead::Value(2, value) if value.is_zero()
+        ));
+        assert!(matches!(
+            mv.read_storage(3, account, new_slot),
+            MvRead::Value(2, value) if value == U256::from(22)
+        ));
+
+        mv.clear_tx(1);
+        assert!(matches!(
+            mv.read_storage(3, account, old_slot),
+            MvRead::Value(2, value) if value.is_zero()
+        ));
+        mv.clear_tx(2);
+        assert!(matches!(
+            mv.read_storage(3, account, old_slot),
+            MvRead::Value(0, value) if value == U256::from(11)
+        ));
+    }
+
+    #[test]
+    fn recreated_account_hides_unmaterialized_base_storage() {
+        let mv = MvMemory::new();
+        let account = addr(2);
+        let unread_base_slot = U256::from(99);
+
+        mv.write_account(
+            4,
+            account,
+            &AccountWrite::Recreated(AccountInfo::default()),
+        );
+
+        assert!(matches!(
+            mv.read_storage(5, account, unread_base_slot),
+            MvRead::Value(4, value) if value.is_zero()
+        ));
     }
 }
