@@ -14,7 +14,9 @@ use crate::net_port::ConsensusNetwork;
 use crate::sinks::{StakingSink, StateSink, WithdrawalSource, ZkSink};
 use alloy_primitives::{Address, B256};
 use metrics::{counter, gauge, histogram};
-use n42_consensus::{ConsensusEngine, EngineOutput, FUTURE_VIEW_WINDOW, ValidatorSet};
+use n42_consensus::{
+    AuthenticatedConsensusMessage, ConsensusEngine, EngineOutput, FUTURE_VIEW_WINDOW, ValidatorSet,
+};
 use n42_network::{NetworkEvent, PeerId};
 use n42_primitives::QuorumCertificate;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -37,6 +39,10 @@ const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
 /// TX forwarding batches are latency-bounded by a 50ms flush timer, so we can
 /// use a larger batch target to reduce cross-task and cross-peer overhead.
 const TX_FORWARD_BATCH_TARGET: usize = 512;
+
+/// Maximum number of already-queued R1/R2 votes verified in one randomized
+/// BLS multi-pairing. Draining is non-blocking, so this adds no timer latency.
+const CONSENSUS_VOTE_BATCH_MAX: usize = 256;
 
 /// Minimum gossip warm-up before leader proposal attempts.
 const DEFAULT_LEADER_PROPOSE_WARMUP_MS: u64 = 500;
@@ -1558,7 +1564,19 @@ impl ConsensusService {
                     }
                 } => {
                     match event {
-                        Some(ev) => self.handle_network_event(ev).await,
+                        Some(ev) => {
+                            let mut events = Vec::with_capacity(CONSENSUS_VOTE_BATCH_MAX);
+                            events.push(ev);
+                            if let Some(rx) = self.consensus_event_rx.as_mut() {
+                                while events.len() < CONSENSUS_VOTE_BATCH_MAX {
+                                    match rx.try_recv() {
+                                        Ok(event) => events.push(event),
+                                        Err(_) => break,
+                                    }
+                                }
+                            }
+                            self.handle_consensus_event_batch(events).await;
+                        }
                         None => {
                             // Consensus channel closed is not fatal — may be observer mode.
                             self.consensus_event_rx = None;
@@ -1990,7 +2008,60 @@ impl ConsensusService {
         }
     }
 
+    async fn handle_consensus_event_batch(&mut self, events: Vec<NetworkEvent>) {
+        let current_view = self.engine.current_view();
+        let mut positions = Vec::new();
+        let mut messages = Vec::new();
+        for (position, event) in events.iter().enumerate() {
+            let NetworkEvent::ConsensusMessage { message, .. } = event else {
+                continue;
+            };
+            let eligible = matches!(
+                message.as_ref(),
+                n42_primitives::ConsensusMessage::Vote(vote) if vote.view == current_view
+            ) || matches!(
+                message.as_ref(),
+                n42_primitives::ConsensusMessage::CommitVote(vote) if vote.view == current_view
+            );
+            if eligible {
+                positions.push(position);
+                messages.push(message.as_ref().clone());
+            }
+        }
+
+        if messages.len() < 2 {
+            for event in events {
+                self.handle_network_event(event).await;
+            }
+            return;
+        }
+
+        let verify_started = std::time::Instant::now();
+        let authenticated = self.engine.authenticate_vote_batch(messages);
+        histogram!("n42_consensus_vote_batch_size").record(authenticated.len() as f64);
+        histogram!("n42_consensus_vote_batch_verify_ms")
+            .record(verify_started.elapsed().as_secs_f64() * 1000.0);
+
+        let mut hints: Vec<Option<Option<AuthenticatedConsensusMessage>>> =
+            (0..events.len()).map(|_| None).collect();
+        for (position, authenticated) in positions.into_iter().zip(authenticated) {
+            hints[position] = Some(authenticated);
+        }
+
+        for (event, hint) in events.into_iter().zip(hints) {
+            self.handle_network_event_with_auth(event, hint).await;
+        }
+    }
+
     async fn handle_network_event(&mut self, event: NetworkEvent) {
+        self.handle_network_event_with_auth(event, None).await;
+    }
+
+    async fn handle_network_event_with_auth(
+        &mut self,
+        event: NetworkEvent,
+        preauthenticated: Option<Option<AuthenticatedConsensusMessage>>,
+    ) {
         match event {
             NetworkEvent::ConsensusMessage { source, message } => {
                 counter!("n42_consensus_messages_received").increment(1);
@@ -2029,7 +2100,25 @@ impl ConsensusService {
                     return;
                 }
 
-                if let Some(validator_index) = self.engine.authenticated_signer(message.as_ref())
+                let authenticated = match preauthenticated {
+                    Some(Some(authenticated)) => Some(authenticated),
+                    Some(None) => {
+                        counter!("n42_consensus_vote_batch_invalid_total").increment(1);
+                        debug!(
+                            target: "n42::cl::orchestrator",
+                            %source,
+                            msg_type,
+                            "dropping vote rejected by batch signature verification"
+                        );
+                        return;
+                    }
+                    None => None,
+                };
+                let validator_index = authenticated
+                    .as_ref()
+                    .map(AuthenticatedConsensusMessage::signer)
+                    .or_else(|| self.engine.authenticated_signer(message.as_ref()));
+                if let Some(validator_index) = validator_index
                     && let Err(error) = self
                         .network
                         .authenticate_validator_peer_reliable(source, validator_index)
@@ -2046,10 +2135,13 @@ impl ConsensusService {
                 // Save the message view before process_event consumes it via *message.
                 let msg_view = message.view();
                 debug!(target: "n42::cl::orchestrator", msg_type, view = self.engine.current_view(), "processing consensus message");
-                match self
-                    .engine
-                    .process_event(n42_consensus::ConsensusEvent::Message(*message))
-                {
+                let result = match authenticated {
+                    Some(authenticated) => self.engine.process_authenticated_message(authenticated),
+                    None => self
+                        .engine
+                        .process_event(n42_consensus::ConsensusEvent::Message(*message)),
+                };
+                match result {
                     Ok(()) => {}
                     Err(e) => {
                         if matches!(e, n42_consensus::N42ConsensusError::SafetyViolation { .. }) {
@@ -2699,6 +2791,48 @@ mod tests {
             network.broadcasts().len(),
             1,
             "GossipSub remains the fanout fallback"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_consensus_event_batch_forms_qc_and_drops_bad_vote() {
+        let (mut engine, output_rx) = make_test_engine_with_validator_count(4, 1);
+        let block_hash = B256::repeat_byte(0xB7);
+        engine
+            .process_event(n42_consensus::ConsensusEvent::BlockReady(block_hash, None))
+            .expect("leader should initialize the vote collector");
+
+        let peers = (0..4u32)
+            .map(|idx| {
+                let keypair = Keypair::generate_ed25519();
+                (idx, keypair.public().to_peer_id())
+            })
+            .collect::<Vec<_>>();
+        let network = Arc::new(MockConsensusNetwork::with_peers(peers.clone()));
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let mut orch = ConsensusService::new(engine, network, net_event_rx, output_rx);
+        let signing_message = n42_consensus::protocol::quorum::signing_message(1, &block_hash);
+
+        let events = [(0u32, 0u8), (2, 2), (3, 0)]
+            .into_iter()
+            .map(|(voter, signing_key)| NetworkEvent::ConsensusMessage {
+                source: peers[voter as usize].1,
+                message: Box::new(ConsensusMessage::Vote(Vote {
+                    view: 1,
+                    block_hash,
+                    voter,
+                    signature: test_key(signing_key).sign(&signing_message),
+                })),
+            })
+            .collect();
+
+        orch.handle_consensus_event_batch(events).await;
+
+        assert!(
+            std::iter::from_fn(|| orch.output_rx.try_recv().ok()).any(|output| matches!(
+                output,
+                EngineOutput::BroadcastMessage(ConsensusMessage::PrepareQC(_))
+            ))
         );
     }
 
