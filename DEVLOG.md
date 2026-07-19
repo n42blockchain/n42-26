@@ -136,6 +136,7 @@ Logs are split into separate files by phase for easy maintenance:
 | [devlog-103-state-root-hard-floor](docs/devlog-103-state-root-hard-floor.md) | gov5 2026H1 P1-3：生产链 state-root bypass 启动硬门；按确定性低频采样比对同一块的 reth PlainState 与 QMDB bin tree/Twig 叶值，发散后锁存 unhealthy/rebuild-required 并停发手机包 | Safety |
 | [devlog-104-network-liveness](docs/devlog-104-network-liveness.md) | gov5 2026H1 P1-4：验证者身份绑定与指数重连、当前 view 投票幂等重发、future-timeout quorum TC 恢复及 catch-up 入站节流；Scenario 9/10 实弹 | Liveness |
 | [devlog-105-parallel-evm-validation-order](docs/devlog-105-parallel-evm-validation-order.md) | workspace 门禁复现并修复 Block-STM validation 领取顺序早于完成顺序的竞态；强制低位前缀完成后才验证高位交易 | Safety |
+| [devlog-106-mobile-evidence-bitfield-v2](docs/devlog-106-mobile-evidence-bitfield-v2.md) | P1-5 对照审计附带修复：MDBX evidence v2 显式保存稀疏手机参与位图长度，兼容读取 v1，并拒绝非规范/越界数据 | Bug Fix |
 
 ---
 
