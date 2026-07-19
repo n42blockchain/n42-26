@@ -72,6 +72,7 @@ where
                     storage_writes: vec![],
                     read_set: rs,
                     bene_delta: None,
+                    deferred_bene_invalidated: false,
                 });
             }
         };
@@ -87,6 +88,7 @@ where
     let mut account_writes = Vec::new();
     let mut storage_writes = Vec::new();
     let mut bene_delta = None;
+    let mut deferred_bene_invalidated = false;
 
     for (addr, account) in &state {
         if !account.is_touched() {
@@ -98,15 +100,35 @@ where
         // nonce/code changed — defensive fallback to a normal write. Storage writes
         // stay versioned regardless.
         if let Some(cb) = coinbase.filter(|c| c.address() == *addr) {
+            if account.is_selfdestructed() {
+                // Blind-reading the deferred beneficiary is only sound while
+                // every tx contributes a commutative balance increment. A
+                // CREATE/SELFDESTRUCT transition wipes earlier credits and can
+                // be followed by recreation, so force whole-block sequential
+                // fallback instead of trying to repair the accumulator.
+                deferred_bene_invalidated = true;
+                account_writes.push((*addr, AccountWrite::Destroyed));
+                continue;
+            }
             match cb.extract_delta(account) {
                 Some(delta) => bene_delta = Some(delta),
-                None => account_writes.push((*addr, AccountWrite::Updated(account.info.clone()))),
+                None => {
+                    deferred_bene_invalidated = true;
+                    account_writes.push((*addr, AccountWrite::Updated(account.info.clone())));
+                }
             }
             for (slot, storage) in &account.storage {
                 if storage.is_changed() {
                     storage_writes.push((*addr, *slot, storage.present_value));
                 }
             }
+            continue;
+        }
+
+        if account.is_selfdestructed() {
+            account_writes.push((*addr, AccountWrite::Destroyed));
+            // SELFDESTRUCT wipes the whole storage domain. Per-slot writes from
+            // the destroyed account must not be published after the wipe.
             continue;
         }
 
@@ -126,6 +148,7 @@ where
         storage_writes,
         read_set: unwrap_read_set(read_set),
         bene_delta,
+        deferred_bene_invalidated,
     })
 }
 
