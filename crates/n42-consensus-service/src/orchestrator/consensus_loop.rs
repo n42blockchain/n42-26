@@ -195,7 +195,7 @@ impl ConsensusService {
                     validator,
                     %hash1,
                     %hash2,
-                    "EQUIVOCATION: validator voted for two different blocks in same view"
+                    "EQUIVOCATION: validator signed two conflicting consensus values in same view"
                 );
                 if let Some(ref state) = self.consensus_state {
                     state.record_equivocation(view, validator, hash1, hash2);

@@ -82,7 +82,7 @@ impl ConsensusService {
             None
         };
         ConsensusSnapshot {
-            version: 4,
+            version: 5,
             current_view: self.engine.current_view(),
             locked_qc: self.engine.locked_qc().clone(),
             last_committed_qc: self.engine.last_committed_qc().clone(),
@@ -91,6 +91,7 @@ impl ConsensusService {
             authorized_verifiers: Vec::new(),
             committed_block_count: self.committed_block_count,
             last_voted_view: self.engine.last_voted_view(),
+            last_commit_voted_view: self.engine.last_commit_voted_view(),
             current_epoch_validators,
             execution_validated_head_view: self.execution_validated_head_view,
             execution_validated_head_hash: self.head_block_hash,

@@ -8,7 +8,7 @@ use crate::error::{ConsensusError, ConsensusResult};
 
 /// Checks an equivocation tracker for a validator voting for two different blocks.
 /// Returns `Some((hash1, hash2))` if equivocation detected, `None` otherwise.
-fn check_equivocation(
+pub(super) fn check_equivocation(
     tracker: &mut HashMap<u32, B256>,
     voter: u32,
     block_hash: B256,
@@ -44,17 +44,6 @@ impl ConsensusEngine {
             return Ok(());
         }
 
-        // Check block hash before verification (read-only borrow of collector).
-        let expected_hash = match self.vote_collector.as_ref() {
-            Some(c) => c.block_hash(),
-            None => return Ok(()),
-        };
-
-        if vote.block_hash != expected_hash {
-            tracing::debug!(target: "n42::cl::voting", view, voter = vote.voter, "ignoring vote for different block");
-            return Ok(());
-        }
-
         let view_set = self.validator_set_for_view(view);
         let pk = view_set.get_public_key(vote.voter)?;
         let msg = signing_message(view, &vote.block_hash);
@@ -78,6 +67,20 @@ impl ConsensusEngine {
                 hash1: h1,
                 hash2: h2,
             })?;
+            return Ok(());
+        }
+
+        // Compare with the collector only after signature verification and
+        // equivocation tracking. Otherwise a Byzantine validator's vote for a
+        // sibling hash is discarded before it can become evidence, making
+        // detection depend on which vote arrived first.
+        let expected_hash = match self.vote_collector.as_ref() {
+            Some(c) => c.block_hash(),
+            None => return Ok(()),
+        };
+        if vote.block_hash != expected_hash {
+            tracing::debug!(target: "n42::cl::voting", view, voter = vote.voter,
+                "ignoring verified vote for non-proposed block after equivocation tracking");
             return Ok(());
         }
 
@@ -159,6 +162,14 @@ impl ConsensusEngine {
         // Leader self-vote for CommitVote (Round 2). Bind to the same
         // changes_hash on_block_ready cached so this self-vote signs the
         // same domain as every follower's commit vote.
+        if !self.round_state.may_commit_vote_in(view) {
+            tracing::warn!(target: "n42::cl::voting", view,
+                last_commit_voted = self.round_state.last_commit_voted_view(),
+                "leader already cast a commit vote in this view; suppressing R2 self-vote");
+            return Ok(());
+        }
+        self.round_state.record_commit_vote(view);
+        self.vote_log.record_commit_vote(view)?;
         let changes_hash = self.cached_changes_hash(&block_hash);
         let commit_msg = commit_signing_message(view, &block_hash, &changes_hash);
         let commit_sig = self.secret_key.sign(&commit_msg);
@@ -181,16 +192,6 @@ impl ConsensusEngine {
         }
 
         if !self.is_current_leader() {
-            return Ok(());
-        }
-
-        let expected_hash = match self.commit_collector.as_ref() {
-            Some(c) => c.block_hash(),
-            None => return Ok(()),
-        };
-
-        if cv.block_hash != expected_hash {
-            tracing::debug!(target: "n42::cl::voting", view, voter = cv.voter, "ignoring commit vote for different block");
             return Ok(());
         }
 
@@ -220,6 +221,16 @@ impl ConsensusEngine {
                 hash1: h1,
                 hash2: h2,
             })?;
+            return Ok(());
+        }
+
+        let expected_hash = match self.commit_collector.as_ref() {
+            Some(c) => c.block_hash(),
+            None => return Ok(()),
+        };
+        if cv.block_hash != expected_hash {
+            tracing::debug!(target: "n42::cl::voting", view, voter = cv.voter,
+                "ignoring verified commit vote for non-proposed block after equivocation tracking");
             return Ok(());
         }
 

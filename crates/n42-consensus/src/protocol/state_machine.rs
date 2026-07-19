@@ -168,7 +168,8 @@ pub enum EngineOutput {
         local_view: ViewNumber,
         target_view: ViewNumber,
     },
-    /// Equivocation detected: a validator voted for two different blocks in the same view.
+    /// Equivocation detected after authenticating two conflicting signed
+    /// consensus values from the same validator in one view.
     EquivocationDetected {
         view: ViewNumber,
         validator: u32,
@@ -234,6 +235,10 @@ pub struct ConsensusEngine {
     pub(super) equivocation_tracker: HashMap<u32, B256>,
     /// Tracks R2 (CommitVote) per validator per view for equivocation detection.
     pub(super) commit_equivocation_tracker: HashMap<u32, B256>,
+    /// Tracks `(signed_message_commitment, block_hash)` per proposer in the
+    /// current view. The commitment includes validator changes, so reusing a
+    /// block hash with a different reconfiguration payload is still detected.
+    pub(super) proposal_equivocation_tracker: HashMap<u32, (B256, B256)>,
     /// Buffer for messages arriving for future views (within FUTURE_VIEW_WINDOW).
     pub(super) future_msg_buffer: Vec<(ViewNumber, ConsensusMessage)>,
     /// Per-view timing for commit latency diagnosis.
@@ -326,6 +331,7 @@ impl ConsensusEngine {
             imported_blocks: HashSet::new(),
             equivocation_tracker: HashMap::new(),
             commit_equivocation_tracker: HashMap::new(),
+            proposal_equivocation_tracker: HashMap::new(),
             future_msg_buffer: Vec::new(),
             view_timing: ViewTiming::new(),
             last_committed_timing: None,
@@ -366,6 +372,10 @@ impl ConsensusEngine {
             last_committed_qc,
             consecutive_timeouts,
             last_voted_view,
+            // Legacy callers do not supply an R2 view. Conservatively treating
+            // the last R1 view as already commit-voted can suppress one vote
+            // after upgrade but cannot create a double signature.
+            last_voted_view,
             Arc::new(NoopVoteLog),
         )
     }
@@ -384,6 +394,7 @@ impl ConsensusEngine {
         last_committed_qc: QuorumCertificate,
         consecutive_timeouts: u32,
         last_voted_view: ViewNumber,
+        last_commit_voted_view: ViewNumber,
         vote_log: Arc<dyn VoteLogWriter>,
     ) -> Self {
         /// Maximum consecutive timeouts preserved from a snapshot to prevent
@@ -411,6 +422,7 @@ impl ConsensusEngine {
                 last_committed_qc,
                 safe_consecutive_timeouts,
                 last_voted_view,
+                last_commit_voted_view,
             ),
             pacemaker: Pacemaker::new(base_timeout_ms, max_timeout_ms),
             vote_collector: None,
@@ -423,6 +435,7 @@ impl ConsensusEngine {
             imported_blocks: HashSet::new(),
             equivocation_tracker: HashMap::new(),
             commit_equivocation_tracker: HashMap::new(),
+            proposal_equivocation_tracker: HashMap::new(),
             future_msg_buffer: Vec::new(),
             view_timing: ViewTiming::new(),
             last_committed_timing: None,
@@ -662,6 +675,10 @@ impl ConsensusEngine {
 
     pub fn last_voted_view(&self) -> u64 {
         self.round_state.last_voted_view()
+    }
+
+    pub fn last_commit_voted_view(&self) -> u64 {
+        self.round_state.last_commit_voted_view()
     }
 
     // ── Event processing ──
@@ -964,6 +981,7 @@ impl ConsensusEngine {
         self.imported_blocks.clear();
         self.equivocation_tracker.clear();
         self.commit_equivocation_tracker.clear();
+        self.proposal_equivocation_tracker.clear();
 
         // Defense-in-depth: re-derive my_index from the current set on every view
         // advance. The epoch-boundary branch above only fires for live consensus
@@ -1304,6 +1322,25 @@ mod tests {
             collector.add_vote(i, sks[i as usize].sign(&msg)).unwrap();
         }
         collector.build_qc(vs).unwrap()
+    }
+
+    fn signed_test_proposal(
+        view: ViewNumber,
+        block_hash: B256,
+        proposer: u32,
+        signer: &n42_primitives::BlsSecretKey,
+    ) -> Proposal {
+        let msg = crate::protocol::quorum::proposal_signing_message(view, &block_hash, &None);
+        Proposal {
+            view,
+            block_hash,
+            justify_qc: QuorumCertificate::genesis(),
+            proposer,
+            signature: signer.sign(&msg),
+            prepare_qc: None,
+            tx_root_hash: None,
+            validator_changes: None,
+        }
     }
 
     #[test]
@@ -2010,6 +2047,170 @@ mod tests {
     }
 
     #[test]
+    fn test_signed_double_proposal_emits_evidence_in_both_arrival_orders() {
+        let hash_a = B256::repeat_byte(0xA1);
+        let hash_b = B256::repeat_byte(0xB2);
+
+        for (first_hash, second_hash) in [(hash_a, hash_b), (hash_b, hash_a)] {
+            let (mut engine, sks, _, mut rx) = make_engine(4, 0);
+
+            engine
+                .process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(
+                    signed_test_proposal(1, first_hash, 1, &sks[1]),
+                )))
+                .expect("first signed proposal should be accepted");
+
+            let mut first_outputs = Vec::new();
+            while let Ok(output) = rx.try_recv() {
+                first_outputs.push(output);
+            }
+            assert_eq!(
+                first_outputs
+                    .iter()
+                    .filter(|output| matches!(
+                        output,
+                        EngineOutput::SendToValidator(_, ConsensusMessage::Vote(_))
+                    ))
+                    .count(),
+                1,
+                "the first valid proposal must produce exactly one R1 vote"
+            );
+            assert!(
+                !first_outputs
+                    .iter()
+                    .any(|output| matches!(output, EngineOutput::EquivocationDetected { .. }))
+            );
+
+            engine
+                .process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(
+                    signed_test_proposal(1, second_hash, 1, &sks[1]),
+                )))
+                .expect("second signed proposal should be recorded as equivocation");
+
+            let mut second_outputs = Vec::new();
+            while let Ok(output) = rx.try_recv() {
+                second_outputs.push(output);
+            }
+            assert!(second_outputs.iter().any(|output| matches!(
+                output,
+                EngineOutput::EquivocationDetected {
+                    view: 1,
+                    validator: 1,
+                    hash1,
+                    hash2,
+                } if *hash1 == first_hash && *hash2 == second_hash
+            )));
+            assert!(
+                !second_outputs.iter().any(|output| matches!(
+                    output,
+                    EngineOutput::SendToValidator(_, ConsensusMessage::Vote(_))
+                        | EngineOutput::ExecuteBlock(_)
+                )),
+                "an equivocating second proposal must not trigger execution or another vote"
+            );
+        }
+    }
+
+    #[test]
+    fn test_same_block_different_validator_changes_is_proposal_equivocation() {
+        let (mut engine, sks, _, mut rx) = make_engine(4, 0);
+        let block_hash = B256::repeat_byte(0xA5);
+        let first_changes = Some(vec![ValidatorChange::Remove {
+            address: Address::with_last_byte(2),
+        }]);
+        let second_changes = Some(vec![ValidatorChange::Remove {
+            address: Address::with_last_byte(3),
+        }]);
+        let make_proposal = |changes: Option<Vec<ValidatorChange>>| {
+            let message =
+                crate::protocol::quorum::proposal_signing_message(1, &block_hash, &changes);
+            Proposal {
+                view: 1,
+                block_hash,
+                justify_qc: QuorumCertificate::genesis(),
+                proposer: 1,
+                signature: sks[1].sign(&message),
+                prepare_qc: None,
+                tx_root_hash: None,
+                validator_changes: changes,
+            }
+        };
+
+        engine
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(
+                make_proposal(first_changes),
+            )))
+            .expect("first signed proposal should be accepted");
+        while rx.try_recv().is_ok() {}
+
+        engine
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(
+                make_proposal(second_changes),
+            )))
+            .expect("different signed changes for the same block are equivocation");
+
+        let mut outputs = Vec::new();
+        while let Ok(output) = rx.try_recv() {
+            outputs.push(output);
+        }
+        assert!(outputs.iter().any(|output| matches!(
+            output,
+            EngineOutput::EquivocationDetected {
+                view: 1,
+                validator: 1,
+                hash1,
+                hash2,
+            } if hash1 != hash2
+        )));
+        assert!(!outputs.iter().any(|output| matches!(
+            output,
+            EngineOutput::SendToValidator(_, ConsensusMessage::Vote(_))
+                | EngineOutput::ExecuteBlock(_)
+        )));
+    }
+
+    #[test]
+    fn test_forged_proposal_is_rejected_without_poisoning_equivocation_tracker() {
+        let (mut engine, sks, _, mut rx) = make_engine(4, 0);
+        let forged_hash = B256::repeat_byte(0xF0);
+        let valid_hash = B256::repeat_byte(0xA1);
+
+        let forged = signed_test_proposal(1, forged_hash, 1, &sks[2]);
+        assert!(matches!(
+            engine.process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(forged))),
+            Err(crate::error::ConsensusError::InvalidSignature {
+                view: 1,
+                validator_index: 1,
+            })
+        ));
+        assert!(
+            rx.try_recv().is_err(),
+            "a forged proposal must emit nothing"
+        );
+
+        engine
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(
+                signed_test_proposal(1, valid_hash, 1, &sks[1]),
+            )))
+            .expect("a valid proposal after a forgery should still be accepted");
+
+        let mut outputs = Vec::new();
+        while let Ok(output) = rx.try_recv() {
+            outputs.push(output);
+        }
+        assert!(outputs.iter().any(|output| matches!(
+            output,
+            EngineOutput::SendToValidator(_, ConsensusMessage::Vote(vote))
+                if vote.block_hash == valid_hash
+        )));
+        assert!(
+            !outputs
+                .iter()
+                .any(|output| matches!(output, EngineOutput::EquivocationDetected { .. }))
+        );
+    }
+
+    #[test]
     fn test_engine_block_imported_before_proposal() {
         let (mut engine, sks, _, mut rx) = make_engine(4, 0);
         let block_hash = B256::repeat_byte(0xEE);
@@ -2286,9 +2487,14 @@ mod tests {
         };
         engine
             .process_event(ConsensusEvent::Message(ConsensusMessage::PrepareQC(
-                prepare_qc,
+                prepare_qc.clone(),
             )))
             .expect("PrepareQC should succeed");
+        engine
+            .process_event(ConsensusEvent::Message(ConsensusMessage::PrepareQC(
+                prepare_qc,
+            )))
+            .expect("duplicate PrepareQC should be safely suppressed");
 
         assert_eq!(engine.current_phase(), Phase::PreCommit);
 
@@ -2296,16 +2502,58 @@ mod tests {
         while let Ok(o) = rx.try_recv() {
             outputs.push(o);
         }
-        let has_commit_vote = outputs.iter().any(|o| {
-            matches!(
-                o,
-                EngineOutput::SendToValidator(1, ConsensusMessage::CommitVote(cv))
-                if cv.view == view && cv.block_hash == block_hash
-            )
-        });
+        let commit_vote_count = outputs
+            .iter()
+            .filter(|o| {
+                matches!(
+                    o,
+                    EngineOutput::SendToValidator(1, ConsensusMessage::CommitVote(cv))
+                    if cv.view == view && cv.block_hash == block_hash
+                )
+            })
+            .count();
+        assert_eq!(
+            commit_vote_count, 1,
+            "validator must send at most one CommitVote in a view"
+        );
+    }
+
+    #[test]
+    fn test_recovered_r2_vote_guard_suppresses_same_view_commit_vote() {
+        let (_fresh_engine, sks, vs, _fresh_rx) = make_engine(4, 0);
+        let (output_tx, mut output_rx) = mpsc::channel(32);
+        let mut engine = ConsensusEngine::with_recovered_state_and_vote_log(
+            0,
+            sks[0].clone(),
+            EpochManager::new(vs.clone()),
+            60_000,
+            120_000,
+            output_tx,
+            1,
+            QuorumCertificate::genesis(),
+            QuorumCertificate::genesis(),
+            0,
+            0,
+            1,
+            Arc::new(NoopVoteLog),
+        );
+        let block_hash = B256::repeat_byte(0xC7);
+        let prepare_qc = n42_primitives::consensus::PrepareQC {
+            view: 1,
+            block_hash,
+            qc: build_test_prepare_qc(1, block_hash, &sks, &vs, &[0, 1, 2]),
+        };
+
+        engine
+            .process_event(ConsensusEvent::Message(ConsensusMessage::PrepareQC(
+                prepare_qc,
+            )))
+            .expect("valid PrepareQC should still update the recovered lock");
+
+        assert_eq!(engine.last_commit_voted_view(), 1);
         assert!(
-            has_commit_vote,
-            "validator should send CommitVote to leader"
+            output_rx.try_recv().is_err(),
+            "restart must not emit a second CommitVote for the recovered view"
         );
     }
 
@@ -2516,6 +2764,111 @@ mod tests {
             .expect("vote for wrong block should be silently ignored");
 
         assert_eq!(engine.current_phase(), Phase::Voting);
+    }
+
+    #[test]
+    fn test_r1_equivocation_evidence_is_arrival_order_independent() {
+        use crate::protocol::quorum::signing_message;
+
+        let expected_hash = B256::repeat_byte(0xA1);
+        let sibling_hash = B256::repeat_byte(0xB2);
+        let view = 1u64;
+
+        for (first_hash, second_hash) in
+            [(expected_hash, sibling_hash), (sibling_hash, expected_hash)]
+        {
+            let (mut engine, sks, _, mut rx) = make_engine(4, 1);
+            engine
+                .process_event(ConsensusEvent::BlockReady(expected_hash, None))
+                .expect("leader should initialize the vote collector");
+            while rx.try_recv().is_ok() {}
+
+            for hash in [first_hash, second_hash] {
+                let vote = Vote {
+                    view,
+                    block_hash: hash,
+                    voter: 0,
+                    signature: sks[0].sign(&signing_message(view, &hash)),
+                };
+                engine
+                    .process_event(ConsensusEvent::Message(ConsensusMessage::Vote(vote)))
+                    .expect("both authenticated votes should be processed");
+            }
+
+            let mut outputs = Vec::new();
+            while let Ok(output) = rx.try_recv() {
+                outputs.push(output);
+            }
+            assert!(outputs.iter().any(|output| matches!(
+                output,
+                EngineOutput::EquivocationDetected {
+                    view: 1,
+                    validator: 0,
+                    hash1,
+                    hash2,
+                } if *hash1 == first_hash && *hash2 == second_hash
+            )));
+        }
+    }
+
+    #[test]
+    fn test_r2_equivocation_evidence_is_arrival_order_independent() {
+        use crate::protocol::quorum::{commit_signing_message, signing_message};
+
+        let expected_hash = B256::repeat_byte(0xC1);
+        let sibling_hash = B256::repeat_byte(0xD2);
+        let view = 1u64;
+
+        for (first_hash, second_hash) in
+            [(expected_hash, sibling_hash), (sibling_hash, expected_hash)]
+        {
+            let (mut engine, sks, _, mut rx) = make_engine(4, 1);
+            engine
+                .process_event(ConsensusEvent::BlockReady(expected_hash, None))
+                .expect("leader should initialize both collectors");
+            while rx.try_recv().is_ok() {}
+
+            for voter in [0u32, 2] {
+                let vote = Vote {
+                    view,
+                    block_hash: expected_hash,
+                    voter,
+                    signature: sks[voter as usize].sign(&signing_message(view, &expected_hash)),
+                };
+                engine
+                    .process_event(ConsensusEvent::Message(ConsensusMessage::Vote(vote)))
+                    .expect("R1 vote should form PrepareQC");
+            }
+            while rx.try_recv().is_ok() {}
+
+            for hash in [first_hash, second_hash] {
+                let commit_vote = CommitVote {
+                    view,
+                    block_hash: hash,
+                    voter: 0,
+                    signature: sks[0].sign(&commit_signing_message(view, &hash, &B256::ZERO)),
+                };
+                engine
+                    .process_event(ConsensusEvent::Message(ConsensusMessage::CommitVote(
+                        commit_vote,
+                    )))
+                    .expect("both authenticated commit votes should be processed");
+            }
+
+            let mut outputs = Vec::new();
+            while let Ok(output) = rx.try_recv() {
+                outputs.push(output);
+            }
+            assert!(outputs.iter().any(|output| matches!(
+                output,
+                EngineOutput::EquivocationDetected {
+                    view: 1,
+                    validator: 0,
+                    hash1,
+                    hash2,
+                } if *hash1 == first_hash && *hash2 == second_hash
+            )));
+        }
     }
 
     #[test]

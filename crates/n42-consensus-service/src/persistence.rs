@@ -28,7 +28,10 @@ use std::sync::Mutex;
 /// sync-imported old block could then regress `head_block_hash` and the
 /// post-restart catch-up floor would be 0 (see the PR #21 restart-boundary
 /// re-audit, findings F1/F2).
-const SNAPSHOT_VERSION: u32 = 4;
+///
+/// v5 adds `last_commit_voted_view`. Together with the expanded 16-byte vote
+/// log, it extends the crash-safe same-view voting guard from R1 to R2.
+const SNAPSHOT_VERSION: u32 = 5;
 
 fn default_version() -> u32 {
     SNAPSHOT_VERSION
@@ -59,6 +62,10 @@ pub struct ConsensusSnapshot {
     /// Persisted to prevent double-voting after crash recovery (BFT safety).
     #[serde(default)]
     pub last_voted_view: u64,
+    /// Last view in which this node cast an R2 CommitVote. Persisted
+    /// independently from R1 so crash recovery cannot double-sign either phase.
+    #[serde(default)]
+    pub last_commit_voted_view: u64,
     /// Active validator set for the current epoch at the time of the snapshot.
     ///
     /// Stored as `(epoch_number, validators, fault_tolerance)`.  On restart this
@@ -168,6 +175,18 @@ impl ConsensusSnapshot {
                 self.last_committed_qc.view, self.locked_qc.view
             ));
         }
+        if self.last_voted_view > self.current_view {
+            return Err(format!(
+                "last_voted_view ({}) > current_view ({})",
+                self.last_voted_view, self.current_view
+            ));
+        }
+        if self.last_commit_voted_view > self.current_view {
+            return Err(format!(
+                "last_commit_voted_view ({}) > current_view ({})",
+                self.last_commit_voted_view, self.current_view
+            ));
+        }
         if let Some((target_epoch, validators, fault_tolerance)) = &self.scheduled_epoch_transition
         {
             if *target_epoch == 0 {
@@ -246,21 +265,35 @@ pub fn load_consensus_state(path: &Path) -> io::Result<Option<ConsensusSnapshot>
             // v2 changed BitVec serde from per-bool to packed_bits.
             // Old snapshots cannot be deserialized into the new format,
             // so we probe the version field first before full deserialization.
-            if let Ok(probe) = serde_json::from_str::<serde_json::Value>(&json) {
-                let ver = probe.get("version").and_then(|v| v.as_u64()).unwrap_or(1);
-                if ver < 2 {
-                    tracing::warn!(
-                        snapshot_version = ver,
-                        "consensus snapshot v{ver} predates packed_bits format (v2); \
-                         discarding old snapshot and starting fresh"
-                    );
-                    let _ = std::fs::remove_file(path);
-                    return Ok(None);
-                }
-            }
-
-            let snapshot: ConsensusSnapshot = serde_json::from_str(&json)
+            let probe: serde_json::Value = serde_json::from_str(&json)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            let probed_version = probe.get("version").and_then(|v| v.as_u64()).unwrap_or(1);
+            if probed_version < 2 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "consensus snapshot v{probed_version} predates packed_bits format v2; refusing unsafe fresh start"
+                    ),
+                ));
+            }
+            let has_r2_vote_view = probe.get("last_commit_voted_view").is_some();
+
+            let mut snapshot: ConsensusSnapshot = serde_json::from_str(&json)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+            if snapshot.version < 5 {
+                // Pre-v5 snapshots did not distinguish R1 from R2. Assuming
+                // the R1 view was also R2-voted can cost liveness for one view,
+                // but guessing zero could let a restarted validator double-sign.
+                snapshot.last_commit_voted_view = snapshot
+                    .last_commit_voted_view
+                    .max(snapshot.last_voted_view);
+            } else if !has_r2_vote_view {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "consensus snapshot v5+ is missing last_commit_voted_view",
+                ));
+            }
 
             if snapshot.version > SNAPSHOT_VERSION {
                 tracing::warn!(
@@ -287,30 +320,48 @@ pub fn load_consensus_state(path: &Path) -> io::Result<Option<ConsensusSnapshot>
 
 // ── Vote log: durable last-voted-view storage ───────────────────────────────
 //
-// Single-record file (8 bytes LE) holding the highest view this node has cast
-// an R1 vote in. Overwritten in place + fsync'd on every vote so a crash after
-// signing cannot lose the record. Used by `ConsensusEngine` to gate vote
-// emission via the `VoteLogWriter` trait.
+// Fixed-size file containing two u64 LE records: highest R1 vote view at
+// offset 0 and highest R2 CommitVote view at offset 8. Each field is
+// overwritten in place + fsync'd before its signature is produced.
 
-/// Reads the persisted last-voted-view, or `Ok(0)` if the file does not exist
-/// or is shorter than 8 bytes (treat as never voted). Returns `Err` only on
-/// genuine I/O failures (permissions, disk).
-pub fn load_last_voted_view(path: &Path) -> io::Result<u64> {
+const VOTE_LOG_FIELD_BYTES: u64 = 8;
+const VOTE_LOG_BYTES: u64 = 16;
+
+/// Reads the persisted `(last_r1_view, last_r2_view)`. A missing file means no
+/// votes. The legacy 8-byte R1-only format conservatively treats the same view
+/// as already R2-voted; this may suppress one vote after upgrade but cannot
+/// enable a double signature.
+pub fn load_last_vote_views(path: &Path) -> io::Result<(u64, u64)> {
     match std::fs::File::open(path) {
         Ok(mut f) => {
-            let mut buf = [0u8; 8];
-            match f.read_exact(&mut buf) {
-                Ok(()) => Ok(u64::from_le_bytes(buf)),
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(0),
-                Err(e) => Err(e),
+            let len = f.metadata()?.len();
+            if len != VOTE_LOG_FIELD_BYTES && len != VOTE_LOG_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid vote log length {len}; expected 8 or 16 bytes"),
+                ));
             }
+            let mut prepare = [0u8; 8];
+            f.read_exact(&mut prepare)?;
+            let prepare_view = u64::from_le_bytes(prepare);
+            if len == VOTE_LOG_FIELD_BYTES {
+                return Ok((prepare_view, prepare_view));
+            }
+            let mut commit = [0u8; 8];
+            f.read_exact(&mut commit)?;
+            Ok((prepare_view, u64::from_le_bytes(commit)))
         }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(0),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok((0, 0)),
         Err(e) => Err(e),
     }
 }
 
-/// Persistent file-backed vote log. Always 8 bytes; overwritten in place.
+/// Backwards-compatible R1-only accessor used by existing diagnostics/tests.
+pub fn load_last_voted_view(path: &Path) -> io::Result<u64> {
+    load_last_vote_views(path).map(|(prepare_view, _)| prepare_view)
+}
+
+/// Persistent file-backed vote log. Always 16 bytes; fields are overwritten in place.
 pub struct FileVoteLog {
     path: PathBuf,
     file: Mutex<File>,
@@ -325,10 +376,10 @@ impl std::fmt::Debug for FileVoteLog {
 }
 
 impl FileVoteLog {
-    /// Opens (creating if needed) the vote-log file at `path`. Initializes
-    /// the file to 8 zero bytes if it was missing or shorter, so subsequent
-    /// reads always succeed. Performs one fsync at open time so the empty
-    /// state is durable.
+    /// Opens (creating if needed) the vote-log file at `path`. Initializes a
+    /// new file to 16 zero bytes and conservatively migrates the legacy 8-byte
+    /// R1-only format. Performs one fsync so initialization/migration is
+    /// durable before consensus starts.
     pub fn open(path: PathBuf) -> io::Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -339,32 +390,53 @@ impl FileVoteLog {
             .create(true)
             .truncate(false)
             .open(&path)?;
-        let len = file.metadata()?.len();
-        if len < 8 {
-            file.seek(SeekFrom::Start(0))?;
-            file.write_all(&0u64.to_le_bytes())?;
-            file.sync_all()?;
+        match file.metadata()?.len() {
+            0 => {
+                file.write_all(&[0u8; VOTE_LOG_BYTES as usize])?;
+                file.sync_all()?;
+            }
+            VOTE_LOG_FIELD_BYTES => {
+                let mut prepare = [0u8; 8];
+                file.seek(SeekFrom::Start(0))?;
+                file.read_exact(&mut prepare)?;
+                // Conservative migration: assume the last R1 view may also
+                // have reached R2 before the old process crashed.
+                file.seek(SeekFrom::Start(VOTE_LOG_FIELD_BYTES))?;
+                file.write_all(&prepare)?;
+                file.sync_all()?;
+            }
+            VOTE_LOG_BYTES => {}
+            len => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid vote log length {len}; expected 0, 8, or 16 bytes"),
+                ));
+            }
         }
         Ok(Self {
             path,
             file: Mutex::new(file),
         })
     }
-}
 
-impl VoteLogWriter for FileVoteLog {
-    fn record_vote(&self, view: u64) -> ConsensusResult<()> {
+    fn record_at(&self, offset: u64, view: u64) -> ConsensusResult<()> {
         let mut guard = self
             .file
             .lock()
             .map_err(|e| ConsensusError::VoteLogFsync(format!("vote log mutex poisoned: {e}")))?;
-        guard.seek(SeekFrom::Start(0)).map_err(map_io_err)?;
+        guard.seek(SeekFrom::Start(offset)).map_err(map_io_err)?;
         guard.write_all(&view.to_le_bytes()).map_err(map_io_err)?;
-        // sync_data avoids the metadata fsync (file size is fixed at 8 bytes
-        // and never changes after open), trading ~1 IO op for the same
-        // crash-safety guarantee on the actual content bytes.
-        guard.sync_data().map_err(map_io_err)?;
-        Ok(())
+        guard.sync_data().map_err(map_io_err)
+    }
+}
+
+impl VoteLogWriter for FileVoteLog {
+    fn record_vote(&self, view: u64) -> ConsensusResult<()> {
+        self.record_at(0, view)
+    }
+
+    fn record_commit_vote(&self, view: u64) -> ConsensusResult<()> {
+        self.record_at(VOTE_LOG_FIELD_BYTES, view)
     }
 }
 
@@ -377,9 +449,10 @@ mod tests {
     fn vote_log_open_initializes_empty() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("vote_log.bin");
-        assert_eq!(load_last_voted_view(&path).unwrap(), 0);
+        assert_eq!(load_last_vote_views(&path).unwrap(), (0, 0));
         let _ = FileVoteLog::open(path.clone()).unwrap();
-        assert_eq!(load_last_voted_view(&path).unwrap(), 0);
+        assert_eq!(load_last_vote_views(&path).unwrap(), (0, 0));
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), VOTE_LOG_BYTES);
     }
 
     #[test]
@@ -388,9 +461,10 @@ mod tests {
         let path = dir.path().join("vote_log.bin");
         let log = FileVoteLog::open(path.clone()).unwrap();
         log.record_vote(42).unwrap();
+        log.record_commit_vote(41).unwrap();
         // Drop the writer to release the file handle, then load.
         drop(log);
-        assert_eq!(load_last_voted_view(&path).unwrap(), 42);
+        assert_eq!(load_last_vote_views(&path).unwrap(), (42, 41));
     }
 
     #[test]
@@ -400,11 +474,15 @@ mod tests {
         let log = FileVoteLog::open(path.clone()).unwrap();
         for v in [1u64, 5, 100, u64::MAX] {
             log.record_vote(v).unwrap();
-            // File stays exactly 8 bytes — overwrite, not append.
-            assert_eq!(std::fs::metadata(&path).unwrap().len(), 8);
+            log.record_commit_vote(v.saturating_sub(1)).unwrap();
+            // File stays exactly 16 bytes — overwrite, not append.
+            assert_eq!(std::fs::metadata(&path).unwrap().len(), VOTE_LOG_BYTES);
         }
         drop(log);
-        assert_eq!(load_last_voted_view(&path).unwrap(), u64::MAX);
+        assert_eq!(
+            load_last_vote_views(&path).unwrap(),
+            (u64::MAX, u64::MAX - 1)
+        );
     }
 
     #[test]
@@ -414,13 +492,42 @@ mod tests {
         {
             let log = FileVoteLog::open(path.clone()).unwrap();
             log.record_vote(7).unwrap();
+            log.record_commit_vote(6).unwrap();
         }
         // Reopen and verify the previous record persists.
-        assert_eq!(load_last_voted_view(&path).unwrap(), 7);
+        assert_eq!(load_last_vote_views(&path).unwrap(), (7, 6));
         let log = FileVoteLog::open(path.clone()).unwrap();
         log.record_vote(8).unwrap();
+        log.record_commit_vote(9).unwrap();
         drop(log);
-        assert_eq!(load_last_voted_view(&path).unwrap(), 8);
+        assert_eq!(load_last_vote_views(&path).unwrap(), (8, 9));
+    }
+
+    #[test]
+    fn vote_log_migrates_legacy_r1_record_conservatively() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vote_log.bin");
+        std::fs::write(&path, 17u64.to_le_bytes()).unwrap();
+
+        assert_eq!(
+            load_last_vote_views(&path).unwrap(),
+            (17, 17),
+            "legacy reads must conservatively treat R2 as already voted"
+        );
+        let _ = FileVoteLog::open(path.clone()).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), VOTE_LOG_BYTES);
+        assert_eq!(load_last_vote_views(&path).unwrap(), (17, 17));
+    }
+
+    #[test]
+    fn vote_log_rejects_corrupt_lengths() {
+        let dir = tempfile::tempdir().unwrap();
+        for len in [1usize, 7, 9, 15, 17] {
+            let path = dir.path().join(format!("vote_log_{len}.bin"));
+            std::fs::write(&path, vec![0u8; len]).unwrap();
+            assert!(load_last_vote_views(&path).is_err());
+            assert!(FileVoteLog::open(path).is_err());
+        }
     }
 
     fn genesis_snapshot(current_view: u64) -> ConsensusSnapshot {
@@ -434,6 +541,7 @@ mod tests {
             authorized_verifiers: Vec::new(),
             committed_block_count: 0,
             last_voted_view: 0,
+            last_commit_voted_view: 0,
             current_epoch_validators: None,
             execution_validated_head_view: 0,
             execution_validated_head_hash: B256::ZERO,
@@ -464,19 +572,21 @@ mod tests {
     }
 
     #[test]
-    fn test_last_voted_view_persisted() {
+    fn test_both_last_voted_views_persisted() {
         let dir = std::env::temp_dir().join("n42-test-last-voted");
         let _ = std::fs::remove_dir_all(&dir);
         let path = dir.join("consensus_state.json");
 
         let snapshot = ConsensusSnapshot {
             last_voted_view: 99,
+            last_commit_voted_view: 98,
             ..genesis_snapshot(100)
         };
         save_consensus_state(&path, &snapshot).unwrap();
 
         let loaded = load_consensus_state(&path).unwrap().unwrap();
         assert_eq!(loaded.last_voted_view, 99);
+        assert_eq!(loaded.last_commit_voted_view, 98);
         assert_eq!(loaded.current_view, 100);
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -515,7 +625,7 @@ mod tests {
     }
 
     #[test]
-    fn test_load_legacy_snapshot_without_version_is_discarded() {
+    fn test_load_legacy_snapshot_without_version_fails_closed() {
         let dir = std::env::temp_dir().join("n42-test-legacy-version");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -525,10 +635,13 @@ mod tests {
         json_value.as_object_mut().unwrap().remove("version");
         std::fs::write(&path, serde_json::to_string_pretty(&json_value).unwrap()).unwrap();
 
-        // v2 migration: snapshots without version field are treated as v1 and discarded.
-        let loaded = load_consensus_state(&path).unwrap();
-        assert!(loaded.is_none(), "legacy v1 snapshot should be discarded");
-        assert!(!path.exists(), "discarded snapshot file should be deleted");
+        // A no-version snapshot is v1. Its safety state cannot be decoded by
+        // the packed-bit format, so startup must require operator migration.
+        assert!(load_consensus_state(&path).is_err());
+        assert!(
+            path.exists(),
+            "failed recovery must preserve the operator's data"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -536,6 +649,26 @@ mod tests {
     #[test]
     fn test_validate_valid_snapshot() {
         assert!(genesis_snapshot(10).validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_rejects_vote_views_ahead_of_current_view() {
+        assert!(
+            ConsensusSnapshot {
+                last_voted_view: 11,
+                ..genesis_snapshot(10)
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            ConsensusSnapshot {
+                last_commit_voted_view: 11,
+                ..genesis_snapshot(10)
+            }
+            .validate()
+            .is_err()
+        );
     }
 
     #[test]
@@ -617,7 +750,7 @@ mod tests {
     }
 
     #[test]
-    fn test_invalid_snapshot_can_be_discarded_by_startup_path() {
+    fn test_invalid_snapshot_must_fail_startup_closed() {
         let dir = std::env::temp_dir().join("n42-test-invalid-snapshot-startup-fallback");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -632,12 +765,10 @@ mod tests {
         };
         std::fs::write(&path, serde_json::to_string_pretty(&snapshot).unwrap()).unwrap();
 
-        // Match bin/n42-node startup semantics: if snapshot loading fails, log and continue fresh.
-        let startup_snapshot = load_consensus_state(&path).unwrap_or_default();
-        assert!(
-            startup_snapshot.is_none(),
-            "startup path should discard invalid snapshots and continue fresh"
-        );
+        // The node propagates this error and refuses to restart without its
+        // safety state; falling back to a fresh engine could double-sign.
+        let startup_snapshot = load_consensus_state(&path);
+        assert!(startup_snapshot.is_err());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -717,7 +848,7 @@ mod tests {
     }
 
     #[test]
-    fn test_load_legacy_snapshot_without_epoch_transition_is_discarded() {
+    fn test_load_legacy_snapshot_without_epoch_transition_fails_closed() {
         let dir = std::env::temp_dir().join("n42-test-legacy-no-epoch");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -733,12 +864,8 @@ mod tests {
         obj.remove("scheduled_epoch_transition");
         std::fs::write(&path, serde_json::to_string_pretty(&json_value).unwrap()).unwrap();
 
-        // v2 migration: no-version snapshots are discarded.
-        let loaded = load_consensus_state(&path).unwrap();
-        assert!(
-            loaded.is_none(),
-            "legacy snapshot without version should be discarded"
-        );
+        assert!(load_consensus_state(&path).is_err());
+        assert!(path.exists());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -845,6 +972,50 @@ mod tests {
             B256::ZERO,
             "missing v4 hash field defaults to zero"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_load_v4_snapshot_conservatively_recovers_r2_vote_view() {
+        let dir = std::env::temp_dir().join("n42-test-v4-to-v5-upgrade");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("consensus_state.json");
+
+        let snapshot = ConsensusSnapshot {
+            last_voted_view: 76,
+            ..genesis_snapshot(77)
+        };
+        let mut json_value = serde_json::to_value(&snapshot).unwrap();
+        let obj = json_value.as_object_mut().unwrap();
+        obj.insert("version".into(), serde_json::json!(4));
+        obj.remove("last_commit_voted_view");
+        std::fs::write(&path, serde_json::to_string_pretty(&json_value).unwrap()).unwrap();
+
+        let loaded = load_consensus_state(&path).unwrap().unwrap();
+        assert_eq!(loaded.version, 4);
+        assert_eq!(loaded.last_voted_view, 76);
+        assert_eq!(loaded.last_commit_voted_view, 76);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_load_v5_snapshot_missing_r2_vote_view_fails_closed() {
+        let dir = std::env::temp_dir().join("n42-test-v5-missing-r2-view");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("consensus_state.json");
+
+        let mut json_value = serde_json::to_value(genesis_snapshot(77)).unwrap();
+        json_value
+            .as_object_mut()
+            .unwrap()
+            .remove("last_commit_voted_view");
+        std::fs::write(&path, serde_json::to_string_pretty(&json_value).unwrap()).unwrap();
+
+        assert!(load_consensus_state(&path).is_err());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

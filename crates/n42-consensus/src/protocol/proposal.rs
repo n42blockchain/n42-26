@@ -22,6 +22,12 @@ impl ConsensusEngine {
         let Some(changes) = proposal.validator_changes.as_ref() else {
             return Ok(false);
         };
+        if changes.is_empty() {
+            // `None` and `Some([])` have the same signed changes hash. Treat
+            // both as no reconfiguration so unsigned representation details
+            // cannot change consensus state.
+            return Ok(false);
+        }
 
         let current_view = self.round_state.current_view();
         if proposal.view >= current_view {
@@ -274,6 +280,38 @@ impl ConsensusEngine {
                 validator_index: proposal.proposer,
             })?;
 
+        // Track the exact signed message rather than only block_hash: validator
+        // changes are part of the signature domain and two different change
+        // sets for the same block are also equivocation. Record only after BLS
+        // verification so a forged first message cannot poison the tracker.
+        let proposal_commitment = B256::from(*blake3::hash(&prop_msg).as_bytes());
+        if let Some(&(previous_commitment, previous_block_hash)) =
+            self.proposal_equivocation_tracker.get(&proposal.proposer)
+            && previous_commitment != proposal_commitment
+        {
+            // Preserve the existing block-hash evidence shape for ordinary
+            // double proposals. If only the signed changes differ, emit the
+            // two distinct signed-message commitments instead.
+            let (hash1, hash2) = if previous_block_hash != proposal.block_hash {
+                (previous_block_hash, proposal.block_hash)
+            } else {
+                (previous_commitment, proposal_commitment)
+            };
+            tracing::warn!(target: "n42::cl::proposal", view,
+                proposer = proposal.proposer, %hash1, %hash2,
+                "proposal equivocation detected");
+            self.emit(EngineOutput::EquivocationDetected {
+                view,
+                validator: proposal.proposer,
+                hash1,
+                hash2,
+            })?;
+            return Ok(());
+        }
+        self.proposal_equivocation_tracker
+            .entry(proposal.proposer)
+            .or_insert((proposal_commitment, proposal.block_hash));
+
         // Verify the justify_qc's aggregate BLS signature to prevent a Byzantine leader
         // from injecting a forged QC that manipulates honest nodes' locked_qc.
         // Genesis QC (view 0) is exempt — it has no real aggregate signatures.
@@ -328,7 +366,9 @@ impl ConsensusEngine {
         // included in a Proposal yet (the node wasn't leader). They will
         // be included when this node next becomes leader.
         const MAX_CHANGES_PER_PROPOSAL: usize = 4;
-        let changes_hash = if let Some(ref changes) = proposal.validator_changes {
+        let changes_hash = if let Some(ref changes) = proposal.validator_changes
+            && !changes.is_empty()
+        {
             if changes.len() > MAX_CHANGES_PER_PROPOSAL {
                 return Err(ConsensusError::TooManyValidatorChanges {
                     count: changes.len(),
@@ -416,6 +456,16 @@ impl ConsensusEngine {
         }
 
         tracing::debug!(target: "n42::cl::proposal", view, block_hash = %pqc.block_hash, "received valid PrepareQC, sending commit vote");
+
+        if !self.round_state.may_commit_vote_in(view) {
+            tracing::warn!(target: "n42::cl::proposal", view,
+                last_commit_voted = self.round_state.last_commit_voted_view(),
+                "suppressed duplicate commit vote (already commit-voted in this view)");
+            return Ok(());
+        }
+        // Persist before signing for the same crash-safety reason as R1.
+        self.round_state.record_commit_vote(view);
+        self.vote_log.record_commit_vote(view)?;
 
         // Bind this R2 commit-vote signature to the same changes_hash the
         // leader's proposal carried.

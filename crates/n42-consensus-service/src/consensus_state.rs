@@ -108,7 +108,11 @@ pub struct AttestationRecord {
     pub timestamp: u64,
 }
 
-/// Evidence of equivocation (double-voting) by a validator.
+/// Locally authenticated evidence of equivocation by a validator.
+///
+/// For R1/R2 votes, `hash1`/`hash2` are block hashes. For a same-block
+/// double-proposal that changes another signed field, they are commitments to
+/// the two distinct proposal signing messages.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EquivocationEvidence {
