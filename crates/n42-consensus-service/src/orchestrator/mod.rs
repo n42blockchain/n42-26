@@ -3783,6 +3783,7 @@ mod tests {
     impl crate::sinks::StateSink for SpyStateSink {
         fn apply_diff(
             &self,
+            _block_hash: B256,
             diff: &n42_execution::state_diff::StateDiff,
         ) -> Result<(u64, B256), String> {
             self.applies.lock().expect("spy sink lock").push(diff.len());

@@ -1514,7 +1514,7 @@ impl ConsensusService {
                     // in-memory, appends the WAL (durable per block) and checkpoints
                     // a snapshot every interval. It returns a Result because the
                     // WAL/snapshot IO can fail.
-                    match jmt.apply_diff(&diff) {
+                    match jmt.apply_diff(block_hash, &diff) {
                         Ok((version, root)) => {
                             let elapsed_ms = start.elapsed().as_millis();
                             gauge!("n42_jmt_latest_root").set(version as f64);
@@ -1547,7 +1547,7 @@ impl ConsensusService {
                 if let Some(ref twig) = twig {
                     let start = std::time::Instant::now();
                     // StateSink::apply_diff locks the Twig tree internally.
-                    match twig.apply_diff(&diff) {
+                    match twig.apply_diff(block_hash, &diff) {
                         Ok((version, root)) => {
                             let elapsed_ms = start.elapsed().as_millis();
                             gauge!("n42_twig_latest_root").set(version as f64);

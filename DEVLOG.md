@@ -133,6 +133,7 @@ Logs are split into separate files by phase for easy maintenance:
 | [devlog-100-gov5-sync-p0-validation](docs/devlog-100-gov5-sync-p0-validation.md) | gov5 2026H1 P0 顺序聚合验收：S1-S5 全量测试与 6 场景 E2E；修复三节点重连后 TC 缺票死锁及 Scenario 9 假绿 | Verification |
 | [devlog-101-consensus-bls-batch](docs/devlog-101-consensus-bls-batch.md) | gov5 2026H1 P1-1：R1/R2 已排队票随机系数批量验签，坏签名精确回退；500 节点 QC 351.0ms→137.3ms（2.56x） | Performance |
 | [devlog-102-twig-staged-flush-audit](docs/devlog-102-twig-staged-flush-audit.md) | gov5 2026H1 P1-2：审计 QMDB bin tree/Twig staged diff、WAL fsync、内存 adopt 与快照顺序；增加 WAL 写失败后 root/version 不前进且重启回到最后 durable 状态的故障注入验收 | Reliability |
+| [devlog-103-state-root-hard-floor](docs/devlog-103-state-root-hard-floor.md) | gov5 2026H1 P1-3：生产链 state-root bypass 启动硬门；按确定性低频采样比对同一块的 reth PlainState 与 QMDB bin tree/Twig 叶值，发散后锁存 unhealthy/rebuild-required 并停发手机包 | Safety |
 
 ---
 

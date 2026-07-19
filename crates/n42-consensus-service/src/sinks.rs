@@ -14,7 +14,9 @@ use n42_execution::state_diff::StateDiff;
 /// orchestrator keeps its existing metrics / logs / shared-state callbacks.
 pub trait StateSink: Send + Sync {
     /// Apply a state diff, returning `(version, root)`. Locks internally.
-    fn apply_diff(&self, diff: &StateDiff) -> Result<(u64, B256), String>;
+    /// `block_hash` binds optional sidecar consistency probes to the exact reth
+    /// post-state that produced `diff`.
+    fn apply_diff(&self, block_hash: B256, diff: &StateDiff) -> Result<(u64, B256), String>;
 }
 
 /// The ZK proof sidecar: schedules asynchronous proof generation for a

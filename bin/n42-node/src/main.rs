@@ -38,7 +38,7 @@ use reth_node_core::args::{DefaultEngineValues, DefaultRpcServerArgs};
 use reth_storage_api::{BlockHashReader, BlockNumReader};
 use reth_transaction_pool::TransactionPool;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, Once};
+use std::sync::{Arc, Mutex, Once, atomic::AtomicBool};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -342,6 +342,15 @@ fn main() {
             eprintln!("ERROR: {msg}");
             std::process::exit(1);
         }
+        if skip_root || defer_root {
+            warn!(
+                target: "n42::cli",
+                chain_id = builder.config().chain.chain.id(),
+                skip_root,
+                defer_root,
+                "!!! UNSAFE BENCHMARK MODE ACTIVE: STATE-ROOT CONSENSUS CHECKS ARE BYPASSED !!!"
+            );
+        }
         metrics::gauge!("n42_deferred_state_root_enabled")
             .set(if skip_root || defer_root { 1.0 } else { 0.0 });
 
@@ -643,6 +652,8 @@ fn main() {
             Err(_) => !env_bool("N42_JMT"),
         };
         let jmt_enabled = env_bool("N42_JMT") && !twig_enabled;
+        let twig_sidecar_healthy = Arc::new(AtomicBool::new(true));
+        metrics::gauge!("n42_twig_sidecar_healthy").set(1.0);
 
         let jmt: Option<Arc<Mutex<PersistentSbmt>>> = if jmt_enabled {
             let snapshot_path = data_dir.join("sbmt.snapshot");
@@ -1304,6 +1315,7 @@ fn main() {
                         full_node.provider.clone(),
                         full_node.provider.chain_spec(),
                         star_hub_handle.clone(),
+                        Arc::clone(&twig_sidecar_healthy),
                         phone_connected_rx,
                         Some(dispatched_block_tx),
                     )),
@@ -1583,8 +1595,20 @@ fn main() {
                     ));
                 }
                 if let Some(ref twig) = twig {
+                    let probe_config = n42_node::sinks::TwigProbeConfig::from_env();
+                    info!(
+                        target: "n42::cli",
+                        interval = probe_config.interval,
+                        accounts = probe_config.accounts_per_sample,
+                        "Twig/reth exact-block consistency sampling enabled"
+                    );
                     orchestrator = orchestrator.with_twig(std::sync::Arc::new(
-                        n42_node::sinks::TwigStateSink(Arc::clone(twig)),
+                        n42_node::sinks::TwigStateSink::with_reth_probe(
+                            Arc::clone(twig),
+                            full_node.provider.clone(),
+                            Arc::clone(&twig_sidecar_healthy),
+                            probe_config,
+                        ),
                     ));
                 }
                 if let Some(scheduler) = zk_scheduler {
