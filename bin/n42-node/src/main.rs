@@ -125,25 +125,33 @@ fn build_epoch_manager(
         .map(|view| view.saturating_sub(1) / epoch_length)
         .unwrap_or(0);
 
-    // If the snapshot recorded the live validator set for the current epoch, use it
-    // directly.  This ensures that a dynamic `proposeAddValidator` which crossed an
-    // epoch boundary survives a node restart even when `epoch_schedule.json` has not
-    // been updated manually.
+    // If the snapshot recorded the live validator set, use it directly. This
+    // ensures that a dynamic `proposeAddValidator` survives restart even when
+    // `epoch_schedule.json` has not been updated. Older snapshots may have kept
+    // `snap_epoch` at 0 across unchanged boundaries while `current_view` already
+    // belongs to a later mathematical epoch; migrate the epoch number but never
+    // discard the snapshot's authoritative active membership.
     if let Some((snap_epoch, snap_validators, snap_ft)) = snapshot_current_epoch
-        && *snap_epoch == current_epoch
         && !snap_validators.is_empty()
     {
         let vs = ValidatorSet::try_new(snap_validators, *snap_ft)
             .map_err(|e| eyre::eyre!("snapshot current_epoch_validators invalid: {e}"))?;
+        if *snap_epoch != current_epoch {
+            tracing::warn!(
+                snapshot_epoch = snap_epoch,
+                recovered_view_epoch = current_epoch,
+                "migrating legacy snapshot epoch number while preserving its validator set"
+            );
+        }
         tracing::info!(
-            epoch = snap_epoch,
+            epoch = current_epoch,
             validators = snap_validators.len(),
             "restored current epoch validator set from snapshot"
         );
         return Ok(EpochManager::from_epoch_with_history(
             vs,
             epoch_length,
-            *snap_epoch,
+            current_epoch,
             max_historical_epochs,
         ));
     }
@@ -1348,7 +1356,16 @@ fn main() {
                         snapshot.scheduled_epoch_transition
                     {
                         let expected_epoch = epoch_manager.current_epoch() + 1;
-                        if target_epoch != expected_epoch {
+                        let legacy_snapshot_epoch = snapshot
+                            .current_epoch_validators
+                            .as_ref()
+                            .map(|(epoch, _, _)| *epoch);
+                        let legacy_retarget = target_epoch != expected_epoch
+                            && legacy_snapshot_epoch.is_some_and(|epoch| {
+                                target_epoch == epoch + 1
+                                    && epoch < epoch_manager.current_epoch()
+                            });
+                        if target_epoch != expected_epoch && !legacy_retarget {
                             warn!(
                                 target: "n42::cli",
                                 target_epoch,
@@ -1363,9 +1380,17 @@ fn main() {
                                 "discarding invalid staged epoch transition from snapshot"
                             );
                         } else {
+                            if legacy_retarget {
+                                warn!(
+                                    target: "n42::cli",
+                                    snapshot_target_epoch = target_epoch,
+                                    migrated_target_epoch = expected_epoch,
+                                    "retargeted legacy staged epoch transition to the next view-range epoch"
+                                );
+                            }
                             info!(
                                 target: "n42::cli",
-                                target_epoch,
+                                target_epoch = expected_epoch,
                                 new_validators = validators.len(),
                                 "restored staged epoch transition from snapshot"
                             );

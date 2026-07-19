@@ -890,6 +890,25 @@ impl ConsensusEngine {
                     {
                         return Ok(());
                     }
+                    // A future message inside the buffering window may still
+                    // carry a quorum-authenticated QC. Use that proof to catch
+                    // up to exactly qc.view+1 before buffering. This preserves
+                    // the S2 rule (the single sender's msg_view never controls
+                    // the jump) and lets a lagging next leader reach the timeout
+                    // view, request missing blocks, and form the recovery TC.
+                    if self.try_qc_view_jump(&msg, view)? {
+                        let new_current = self.round_state.current_view();
+                        if view == new_current {
+                            return self.dispatch_message(msg, authenticated_proof);
+                        }
+                        if view > new_current
+                            && view <= new_current + FUTURE_VIEW_WINDOW
+                            && self.future_msg_buffer.len() < MAX_FUTURE_MESSAGES
+                        {
+                            self.future_msg_buffer.push((view, msg));
+                        }
+                        return Ok(());
+                    }
                     if self.future_msg_buffer.len() >= MAX_FUTURE_MESSAGES {
                         // Evict the oldest (lowest view) entry.
                         if let Some(min_idx) = self
@@ -1107,21 +1126,36 @@ impl ConsensusEngine {
         // Save current PrepareQC for piggybacking into the next Proposal (chained mode).
         self.previous_prepare_qc = self.prepare_qc.take();
 
-        // Pre-validate local key presence BEFORE advancing epoch (irreversible).
-        if self.epoch_manager.epochs_enabled()
-            && self.epoch_manager.is_epoch_boundary(new_view)
-            && self.epoch_manager.has_staged_next()
+        // Epoch numbers follow fixed view ranges even when validator membership
+        // is unchanged. Advance every crossed boundary so live execution,
+        // snapshot recovery, and strict future-TC verification agree. A staged
+        // set is activated at the first boundary; otherwise the current set is
+        // carried forward. A QC/Decide jump can cross more than one boundary,
+        // hence the loop rather than a single `is_epoch_boundary(new_view)` test.
+        let target_epoch = self.epoch_manager.epoch_for_view(new_view);
+        while self.epoch_manager.epochs_enabled()
+            && self.epoch_manager.current_epoch() < target_epoch
         {
             let local_in_next = self
                 .epoch_manager
                 .peek_next_set()
-                .and_then(|set| set.index_of_public_key(&self.local_public_key));
-
-            let advanced = self.epoch_manager.advance_epoch();
-            debug_assert!(
-                advanced,
-                "advance_epoch must succeed when has_staged_next is true"
-            );
+                .unwrap_or_else(|| self.epoch_manager.current_validator_set())
+                .index_of_public_key(&self.local_public_key);
+            let membership_changed = if self.epoch_manager.has_staged_next() {
+                let advanced = self.epoch_manager.advance_epoch();
+                debug_assert!(
+                    advanced,
+                    "advance_epoch must succeed when has_staged_next is true"
+                );
+                true
+            } else {
+                let advanced = self.epoch_manager.carry_epoch_forward();
+                debug_assert!(
+                    advanced,
+                    "carry_epoch_forward must succeed without a staged set"
+                );
+                false
+            };
 
             let new_epoch = self.epoch_manager.current_epoch();
             let validator_count = self.validator_set().len();
@@ -1151,6 +1185,7 @@ impl ConsensusEngine {
                 target: "n42::cl::engine",
                 new_epoch,
                 validator_count,
+                membership_changed,
                 view = new_view,
                 "epoch transition at view boundary"
             );
@@ -1643,6 +1678,30 @@ mod tests {
                 validator_count: 4,
             })
         ));
+    }
+
+    #[test]
+    fn test_epoch_boundaries_advance_without_membership_changes() {
+        let (mut engine, _, vs, mut output_rx) = make_engine(4, 0);
+        engine.epoch_manager = EpochManager::with_epoch_length(vs, 10);
+
+        engine
+            .advance_to_view(25)
+            .expect("multi-boundary view advance should succeed");
+
+        assert_eq!(engine.current_view(), 25);
+        assert_eq!(engine.epoch_manager.current_epoch(), 2);
+        assert_eq!(engine.epoch_manager.historical_epoch_count(), 2);
+        assert!(
+            engine
+                .epoch_manager
+                .known_validator_set_for_view(25)
+                .is_some()
+        );
+        let transitions = std::iter::from_fn(|| output_rx.try_recv().ok())
+            .filter(|output| matches!(output, EngineOutput::EpochTransition { .. }))
+            .count();
+        assert_eq!(transitions, 2);
     }
 
     /// Tests that `sync_local_validator_index` correctly updates `my_index`
@@ -4362,16 +4421,18 @@ mod tests {
             .process_event(ConsensusEvent::Message(ConsensusMessage::Timeout(timeout)))
             .expect("observer should buffer a future timeout");
 
-        assert_eq!(engine.current_view(), 1);
+        assert_eq!(engine.current_view(), 30);
         assert_eq!(engine.future_msg_buffer.len(), 1);
         assert_eq!(engine.future_msg_buffer[0].0, timeout_view);
 
         let outputs: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
-        assert!(
-            !outputs
-                .iter()
-                .any(|o| matches!(o, EngineOutput::SyncRequired { .. }))
-        );
+        assert!(outputs.iter().any(|o| matches!(
+            o,
+            EngineOutput::SyncRequired {
+                local_view: 1,
+                target_view: 30,
+            }
+        )));
         assert!(
             !outputs.iter().any(|o| matches!(
                 o,
@@ -4379,6 +4440,58 @@ mod tests {
             )),
             "observer must not rebroadcast timeout with a stale/provisional index"
         );
+    }
+
+    #[test]
+    fn future_timeout_high_qc_recovers_lagging_cross_epoch_leader() {
+        use crate::protocol::quorum::timeout_signing_message;
+
+        let (fresh, sks, vs, _) = make_engine(4, 3);
+        let (output_tx, mut output_rx) = mpsc::channel(64);
+        let mut engine = ConsensusEngine::with_recovered_state(
+            3,
+            sks[3].clone(),
+            EpochManager::from_epoch(vs.clone(), 30, 1),
+            60_000,
+            120_000,
+            output_tx,
+            59,
+            fresh.locked_qc().clone(),
+            fresh.last_committed_qc().clone(),
+            0,
+            0,
+        );
+        let timeout_view = 82;
+        let high_qc = build_test_prepare_qc(81, B256::repeat_byte(0x82), &sks, &vs, &[0, 1, 2]);
+        let timeout = TimeoutMessage {
+            view: timeout_view,
+            high_qc,
+            sender: 0,
+            signature: sks[0].sign(&timeout_signing_message(timeout_view)),
+        };
+
+        engine
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Timeout(timeout)))
+            .expect("the quorum-authenticated high QC should recover the lagging leader");
+
+        assert_eq!(engine.current_view(), timeout_view);
+        assert_eq!(engine.epoch_manager.current_epoch(), 2);
+        assert_eq!(
+            engine
+                .timeout_collector
+                .as_ref()
+                .expect("the current-view timeout should be collected")
+                .timeout_count(),
+            1
+        );
+        let outputs: Vec<_> = std::iter::from_fn(|| output_rx.try_recv().ok()).collect();
+        assert!(outputs.iter().any(|output| matches!(
+            output,
+            EngineOutput::SyncRequired {
+                local_view: 59,
+                target_view: 82,
+            }
+        )));
     }
 
     #[test]

@@ -1463,6 +1463,34 @@ impl ConsensusService {
     }
 
     pub fn with_epoch_schedule(mut self, schedule: EpochSchedule) -> Self {
+        // The transition handler stages epoch N+1 after entering N, but a
+        // freshly started/recovered service has not emitted such an event yet.
+        // Pre-stage an exact next-epoch schedule entry here so the first
+        // configured rotation is not skipped.
+        let next_epoch = self.engine.epoch_manager().current_epoch() + 1;
+        if !self.engine.epoch_manager().has_staged_next()
+            && let Some((validators, fault_tolerance)) = schedule.get_for_epoch(next_epoch)
+        {
+            match self
+                .engine
+                .epoch_manager_mut()
+                .stage_next_epoch(validators, fault_tolerance)
+            {
+                Ok(()) => info!(
+                    target: "n42::cl::orchestrator",
+                    next_epoch,
+                    validator_count = validators.len(),
+                    fault_tolerance,
+                    "pre-staged next epoch validator set from schedule"
+                ),
+                Err(error) => warn!(
+                    target: "n42::cl::orchestrator",
+                    next_epoch,
+                    %error,
+                    "failed to pre-stage next epoch validator set from schedule"
+                ),
+            }
+        }
         self.epoch_schedule = Some(schedule);
         self
     }
@@ -3420,6 +3448,59 @@ mod tests {
         let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
         orch.handle_engine_output(EngineOutput::ViewChanged { new_view: 5 })
             .await;
+    }
+
+    #[test]
+    fn attaching_epoch_schedule_pre_stages_first_rotation() {
+        let current_key = test_key(0x31);
+        let current = ValidatorInfo {
+            address: Address::with_last_byte(0x31),
+            bls_public_key: current_key.public_key(),
+            p2p_peer_id: None,
+        };
+        let next_validators = vec![
+            current.clone(),
+            ValidatorInfo {
+                address: Address::with_last_byte(0x32),
+                bls_public_key: test_key(0x32).public_key(),
+                p2p_peer_id: None,
+            },
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let schedule_path = dir.path().join("epoch_schedule.json");
+        let json = serde_json::json!([{
+            "start_epoch": 1,
+            "validators": next_validators,
+            "fault_tolerance": 0,
+        }]);
+        std::fs::write(&schedule_path, serde_json::to_vec(&json).unwrap()).unwrap();
+        let schedule = EpochSchedule::load(&schedule_path)
+            .unwrap()
+            .expect("schedule should load");
+
+        let (output_tx, output_rx) = mpsc::channel(64);
+        let engine = ConsensusEngine::with_epoch_manager(
+            0,
+            current_key,
+            EpochManager::with_epoch_length(ValidatorSet::new(&[current], 0), 30),
+            60_000,
+            120_000,
+            output_tx,
+        );
+        let (network, _cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx)
+            .with_epoch_schedule(schedule);
+
+        assert!(orch.engine.epoch_manager().has_staged_next());
+        assert_eq!(
+            orch.engine
+                .epoch_manager()
+                .peek_next_set()
+                .expect("epoch 1 should be staged")
+                .len(),
+            2
+        );
     }
 
     #[tokio::test]

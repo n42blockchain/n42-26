@@ -49,6 +49,9 @@ pub const MIN_VALIDATOR_COUNT: usize = 4;
 /// - `commit_pending_changes` is called at CommitQC time; it validates safety
 ///   constraints and calls `stage_next_epoch` to schedule activation.
 /// - `advance_epoch` activates the staged set at the next epoch boundary.
+/// - `carry_epoch_forward` advances an empty boundary while retaining the
+///   active set. Epoch numbers still follow view ranges even when membership
+///   does not change.
 #[derive(Debug, Clone)]
 pub struct EpochManager {
     /// Number of views per epoch (0 = epochs disabled).
@@ -352,6 +355,36 @@ impl EpochManager {
             "epoch advanced to new validator set"
         );
 
+        true
+    }
+
+    /// Advances one epoch boundary without changing validator membership.
+    ///
+    /// Epochs are view ranges, not merely validator-set version numbers. A
+    /// boundary with no staged reconfiguration must therefore still advance
+    /// `current_epoch`; otherwise live nodes stay at epoch 0 forever while a
+    /// restarted node reconstructs epoch N from its view. That disagreement is
+    /// normally hidden by the legacy validator-set fallback, but prevents the
+    /// strict future-timeout recovery path from forming a TC.
+    ///
+    /// Returns false when a staged set exists: callers must activate that set
+    /// with [`Self::advance_epoch`] instead of silently carrying the old set.
+    pub fn carry_epoch_forward(&mut self) -> bool {
+        if self.next_set.is_some() || self.epoch_length == 0 {
+            return false;
+        }
+
+        self.historical_sets
+            .insert(self.current_epoch, self.current_set.clone());
+        self.trim_historical();
+        self.current_epoch += 1;
+
+        tracing::info!(
+            target: "n42::cl::epoch",
+            epoch = self.current_epoch,
+            validators = self.current_set.len(),
+            "epoch advanced with unchanged validator set"
+        );
         true
     }
 
@@ -799,6 +832,41 @@ mod tests {
         // No staged set → advance fails
         assert!(!em.advance_epoch());
         assert_eq!(em.current_epoch(), 0);
+    }
+
+    #[test]
+    fn test_carry_epoch_forward_retains_set_and_records_history() {
+        let infos = make_validator_infos(4);
+        let vs = ValidatorSet::new(&infos, 1);
+        let mut em = EpochManager::with_epoch_length(vs, 10);
+
+        assert!(em.carry_epoch_forward());
+        assert_eq!(em.current_epoch(), 1);
+        assert_eq!(em.current_validator_set().len(), infos.len() as u32);
+        for (index, info) in infos.iter().enumerate() {
+            assert_eq!(
+                em.current_validator_set()
+                    .get_public_key(index as u32)
+                    .unwrap(),
+                &info.bls_public_key
+            );
+        }
+        assert_eq!(em.historical_epoch_count(), 1);
+        assert_eq!(em.known_validator_set_for_view(5).unwrap().len(), 4);
+        assert_eq!(em.known_validator_set_for_view(15).unwrap().len(), 4);
+    }
+
+    #[test]
+    fn test_carry_epoch_forward_refuses_to_skip_staged_change() {
+        let infos = make_validator_infos(4);
+        let next_infos = make_validator_infos(5);
+        let vs = ValidatorSet::new(&infos, 1);
+        let mut em = EpochManager::with_epoch_length(vs, 10);
+        em.stage_next_epoch(&next_infos, 1).unwrap();
+
+        assert!(!em.carry_epoch_forward());
+        assert_eq!(em.current_epoch(), 0);
+        assert!(em.has_staged_next());
     }
 
     #[test]
