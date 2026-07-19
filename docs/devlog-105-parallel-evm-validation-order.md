@@ -1,6 +1,6 @@
 # Devlog 105: Block-STM validation 完成顺序修复
 
-日期：2026-07-18  
+日期：2026-07-18
 来源：P1-4 提交前 `cargo test --workspace` 门禁
 
 ## 现象
