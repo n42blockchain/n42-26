@@ -12,8 +12,8 @@ verdict 写入缓存，导致诚实区块 hash 被 `should_skip` 丢弃，阻断
 
 ## 修复
 
-- follower eager import、`import_and_notify` 与 syncing retry 均记录本次是否实际注入 compact
-  output。
+- follower eager import、`import_and_notify`、syncing retry 与 committed/observer background
+  import 均记录本次是否实际注入 compact output。
 - 若注入后 `new_payload` 非 `Valid`，先 evict 注入项，但**不**调用 `insert_if_invalid`；该 hash
   保持可重试。
 - 未注入的路径保持原 S5 行为：reth 对确定性 state-root/EVM 无效块的 verdict 仍会进入坏块缓存。
@@ -32,8 +32,8 @@ verdict 写入缓存，导致诚实区块 hash 被 `should_skip` 丢弃，阻断
 
 新增测试覆盖：诚实 payload + 伪造 compact output → 模拟 reth state-root mismatch → 注入缓存被
 evict、声明 hash 不进入坏块缓存；随后同一 hash 的无 compact-output 诚实广播可 `Valid` 导入并推进
-head。既有 non-inject state-root-invalid 测试继续验证第二次到达由 S5 跳过、不会重复提交给
-`new_payload`。
+head。另有 committed/observer Case-B 回归覆盖相同的注入拒绝语义。既有 non-inject
+state-root-invalid 测试继续验证第二次到达由 S5 跳过、不会重复提交给 `new_payload`。
 
 ## 后续
 

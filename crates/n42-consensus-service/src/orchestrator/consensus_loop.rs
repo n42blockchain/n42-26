@@ -1069,7 +1069,13 @@ impl ConsensusService {
                 if compact_injected && let Some(ref cache) = exec_cache {
                     cache.evict(block_hash);
                 }
-                bad_blocks.insert_if_invalid(block_hash, &status.status, "committed_import");
+                // The committed background path consumes the same unauthenticated
+                // compact bytes as eager/sync imports. A rejection after injection
+                // describes those bytes, not necessarily the committed block, so
+                // evict above and keep the hash retryable (HIGH-1).
+                if !compact_injected {
+                    bad_blocks.insert_if_invalid(block_hash, &status.status, "committed_import");
+                }
                 warn!(target: "n42::cl::consensus_loop", %block_hash, status = ?status.status, "bg import: new_payload rejected");
                 (ImportOutcome::Invalid, 0)
             }

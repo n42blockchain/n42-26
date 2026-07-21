@@ -5468,6 +5468,58 @@ mod tests {
         assert_eq!(mock.new_payload_hashes(), vec![honest_hash, honest_hash]);
     }
 
+    /// HIGH-1 observer/committed path: Case-B background import must apply the
+    /// same no-blacklist rule when it injected peer-provided compact bytes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn committed_compact_rejection_does_not_blacklist_block_hash() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let parent = B256::repeat_byte(0x76);
+        let honest_hash = B256::repeat_byte(0x77);
+        let mock = Arc::new(MockExecutionLayer::new(
+            PayloadStatusEnum::Invalid {
+                validation_error: "state root mismatch from compact output".to_owned(),
+            },
+            PayloadStatusEnum::Syncing,
+        ));
+        let cache = Arc::new(MockExecutionOutputCache::default());
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx)
+            .with_exec_output_cache(cache.clone());
+        orch.el = Some(mock.clone());
+        orch.head_block_hash = parent;
+        orch.async_finalize_fcu = false;
+        orch.pending_block_data.insert(
+            honest_hash,
+            test_block_data_with_empty_execution(parent, honest_hash, 1),
+        );
+
+        orch.handle_engine_output(EngineOutput::BlockCommitted {
+            view: 1,
+            block_hash: honest_hash,
+            commit_qc: QuorumCertificate::genesis(),
+            validator_changes: None,
+        })
+        .await;
+        let (hash, view, outcome, _) =
+            tokio::time::timeout(Duration::from_secs(2), orch.import_done_rx.recv())
+                .await
+                .expect("background import finishes")
+                .expect("channel open");
+
+        assert_eq!(
+            (hash, view, outcome),
+            (honest_hash, 1, ImportOutcome::Invalid)
+        );
+        assert_eq!(cache.evicted(), vec![honest_hash]);
+        assert!(!cache.contains(honest_hash));
+        assert!(
+            !orch.bad_blocks.should_skip(honest_hash, "test"),
+            "committed compact rejection must not blacklist the block hash"
+        );
+        assert_eq!(mock.new_payload_hashes(), vec![honest_hash]);
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn direct_block_arrival_is_filtered_by_bad_block_cache() {
         let (engine, output_rx) = make_test_engine();
