@@ -285,6 +285,10 @@ impl ObserverOrchestrator {
                 debug!(target: "n42::observer", %source, bytes = data.len(), "received block announcement");
                 self.handle_block_announcement(data).await;
             }
+            NetworkEvent::Gov5H2Message { source, message } => {
+                let kind = message.kind().as_str();
+                debug!(target: "n42::observer", %source, kind, "validated legacy gov5 H2 message");
+            }
             NetworkEvent::BlobSidecarReceived { source: _, data } => {
                 self.handle_blob_sidecar(data);
             }

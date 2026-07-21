@@ -34,6 +34,7 @@ thiserror.workspace = true
 
 # Hashing
 sha2.workspace = true
+snap.workspace = true
 
 # Encoding
 hex.workspace = true
@@ -47,3 +48,6 @@ bytes.workspace = true
 # Logging & metrics
 tracing.workspace = true
 metrics.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

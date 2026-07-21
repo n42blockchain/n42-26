@@ -1,6 +1,6 @@
 # N42 原生链跨语言节点互通路线（QMDB + HotStuff-2）
 
-> 状态：QMDB Phase 0/1 已完成并通过现有 full replay；H2 Phase 0 进行中。本文定义 gov5（Go）与 n42-26（Rust）成为同一条 N42 原生链中独立客户端的边界、迁移顺序和验收条件。replay-v2 的 QMDB 历史和 HotStuff-2（H2）共识是第一优先级；eth-el archive+ 互通在此路线稳定后再单独推进。
+> 状态：QMDB Phase 0/1 已完成并通过现有 full replay；H2 legacy wire Phase 0 与只读 observer 已完成，H2-v4 共同签名域仍待实现。本文定义 gov5（Go）与 n42-26（Rust）成为同一条 N42 原生链中独立客户端的边界、迁移顺序和验收条件。replay-v2 的 QMDB 历史和 HotStuff-2（H2）共识是第一优先级；eth-el archive+ 互通在此路线稳定后再单独推进。
 
 ## 目标
 
@@ -70,6 +70,9 @@ gov5 和 n42-26 应像 geth 与 reth 一样，能以不同实现加入同一条 
 - 升级 Go 与 Rust 到同一 H2 v4 schema：统一 validator-change binding、`HighTC`、`Decide` 字段、bitmap bit order、BLS domain/preimage。不能选择性“兼容”46B 与 78B commit 签名。
 - Rust 先验证 Go 消息、Go 先验证 Rust 消息；双向 codec + signature vectors 通过后才允许 observer 消费 live H2 gossip。
 
+Legacy observer 已先完成：Rust observer 根据本地 genesis fork digest 订阅 gov5 的旧
+`hotstuff_consensus/ssz_snappy` topic，严格验证 Go 产生的 Snappy 帧与七类消息，但不把消息交给投票引擎。该路径用于 live 线协议取证，不等同于 H2-v4 validator 互通。
+
 ### Phase 3 — replay-v2 等价性与 catch-up
 
 - 将 replay 输入固定为 QMDB bootstrap export + finalized native block bundle/diff，而不是直接读取另一客户端的 MDBX 表。
@@ -92,4 +95,4 @@ gov5 和 n42-26 应像 geth 与 reth 一样，能以不同实现加入同一条 
 
 ## 下一项实现
 
-QMDB 已完成 deterministic vectors、portable exporter、Rust importer，以及既有 87,786,434-slot full replay 的同 root 验收。下一项是补齐 H2 全部 7 类消息的双端 vectors，定义统一 v4 commit 签名域并接只读 observer；网络接入仍须等待 codec、BLS domain、QC/TC bitmap 与错误输入 vectors 全部通过。
+QMDB 已完成 deterministic vectors、portable exporter、Rust importer，以及既有 87,786,434-slot full replay 的同 root 验收。H2 全部 7 类 legacy 消息、签名 preimage、QC/TC bitmap、Go Snappy frame 与 Rust 只读 observer 也已通过双端 vectors。下一项是设计并实现双方共同的 H2-v4 commit 签名域和 versioned topic，再做 1,000-block finalized bundle replay；在此之前仍禁止混合 validator 投票。

@@ -194,7 +194,7 @@ pub fn verify_portable_stream<R: Read>(
             }
         }
     }
-    if next_slot > 0 && next_slot as usize % TWIG_SIZE != 0 {
+    if next_slot > 0 && !(next_slot as usize).is_multiple_of(TWIG_SIZE) {
         let twig = current_twig
             .as_mut()
             .expect("a partial final twig is present");
@@ -748,6 +748,10 @@ impl QmdbCompatTree {
 
     pub fn len(&self) -> usize {
         self.index.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.index.is_empty()
     }
 
     pub fn get(&self, key: &Hash) -> Option<&[u8]> {
