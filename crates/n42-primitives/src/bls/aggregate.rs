@@ -1,5 +1,5 @@
-use super::DST;
 use super::keys::{BlsError, BlsPublicKey, BlsSignature};
+use super::{DST, H2_V4_DST};
 use blst::BLST_ERROR;
 use blst::min_pk::AggregateSignature as BlstAggSig;
 
@@ -32,6 +32,24 @@ impl AggregateSignature {
             .inner()
             .fast_aggregate_verify(true, message, DST, &pks);
 
+        if result != BLST_ERROR::BLST_SUCCESS {
+            return Err(BlsError::VerificationFailed(result));
+        }
+        Ok(())
+    }
+
+    /// Verifies a gov5-compatible H2-v4 aggregate signature. This explicit
+    /// entry point prevents the POP ciphersuite from leaking into native Rust
+    /// consensus signatures, which remain on [`super::DST`].
+    pub fn verify_h2_v4_aggregate(
+        message: &[u8],
+        signature: &BlsSignature,
+        public_keys: &[&BlsPublicKey],
+    ) -> Result<(), BlsError> {
+        let pks: Vec<&blst::min_pk::PublicKey> = public_keys.iter().map(|pk| pk.inner()).collect();
+        let result = signature
+            .inner()
+            .fast_aggregate_verify(true, message, H2_V4_DST, &pks);
         if result != BLST_ERROR::BLST_SUCCESS {
             return Err(BlsError::VerificationFailed(result));
         }
@@ -104,5 +122,24 @@ mod tests {
         let agg_sig = AggregateSignature::aggregate(&[&sig]).expect("aggregation should succeed");
         AggregateSignature::verify_aggregate(message, &agg_sig, &[&pk])
             .expect("single-sig verification should succeed");
+    }
+
+    #[test]
+    fn h2_v4_pop_domain_is_explicit_and_separate() {
+        let sk1 = test_key(0x41);
+        let sk2 = test_key(0x42);
+        let message = b"h2-v4-domain";
+        let sig1 = sk1.sign_h2_v4(message);
+        let sig2 = sk2.sign_h2_v4(message);
+        let aggregate = AggregateSignature::aggregate(&[&sig1, &sig2]).unwrap();
+        let pk1 = sk1.public_key();
+        let pk2 = sk2.public_key();
+        let public_keys = [&pk1, &pk2];
+
+        AggregateSignature::verify_h2_v4_aggregate(message, &aggregate, &public_keys).unwrap();
+        assert!(
+            AggregateSignature::verify_aggregate(message, &aggregate, &public_keys).is_err(),
+            "native NUL and H2-v4 POP ciphersuites must remain separated"
+        );
     }
 }

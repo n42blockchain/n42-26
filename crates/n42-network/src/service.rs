@@ -17,9 +17,11 @@ use crate::gossipsub::handlers::{
     decode_consensus_message, encode_consensus_message, validate_message,
 };
 use crate::gossipsub::topics::{
-    blob_sidecar_topic, block_announce_topic, consensus_topic, mempool_topic,
-    verification_receipts_topic,
+    blob_sidecar_topic, block_announce_topic, consensus_topic, gov5_h2_topic, h2_v4_topic,
+    mempool_topic, verification_receipts_topic,
 };
+use crate::h2_wire::{H2Message, decode_gov5_gossip_message};
+use crate::h2_v4::{H2V4ChainIdentity, H2V4Envelope, decode_gossip as decode_h2_v4_gossip};
 use crate::reconnection::ReconnectionManager;
 use crate::state_sync::{BlockSyncRequest, BlockSyncResponse};
 use crate::transport::{N42Behaviour, N42BehaviourEvent, deterministic_validator_peer_id};
@@ -155,6 +157,16 @@ pub enum NetworkEvent {
     ConsensusMessage {
         source: PeerId,
         message: Box<ConsensusMessage>,
+    },
+    /// Strictly decoded legacy gov5 H2 message. Observer-only: it is never
+    /// passed to the Rust voting engine while signature domains differ.
+    Gov5H2Message {
+        source: PeerId,
+        message: Box<H2Message>,
+    },
+    H2V4Message {
+        source: PeerId,
+        envelope: Box<H2V4Envelope>,
     },
     BlockAnnouncement {
         source: PeerId,
@@ -516,6 +528,9 @@ pub struct NetworkService {
     /// Reliable data-plane events that could not be delivered immediately.
     pending_data_events: VecDeque<NetworkEvent>,
     consensus_topic_hash: gossipsub::TopicHash,
+    gov5_h2_topic_hash: Option<gossipsub::TopicHash>,
+    h2_v4_topic_hash: Option<gossipsub::TopicHash>,
+    h2_v4_identity: Option<H2V4ChainIdentity>,
     block_announce_topic_hash: gossipsub::TopicHash,
     mempool_topic_hash: gossipsub::TopicHash,
     blob_sidecar_topic_hash: gossipsub::TopicHash,
@@ -611,13 +626,64 @@ impl NetworkService {
         ),
         NetworkError,
     > {
-        Self::new_with_expected_validator_peer_ids(swarm, HashMap::new(), true)
+        Self::new_with_options(swarm, HashMap::new(), true, None, None)
+    }
+
+    /// Creates a non-voting service which also subscribes to the gov5 H2 topic
+    /// derived from this chain's genesis hash.
+    pub fn new_gov5_h2_observer(
+        swarm: Swarm<N42Behaviour>,
+        chain_id: u64,
+        genesis_hash: B256,
+    ) -> Result<
+        (
+            Self,
+            NetworkHandle,
+            mpsc::Receiver<NetworkEvent>,
+            mpsc::Receiver<NetworkEvent>,
+        ),
+        NetworkError,
+    > {
+        Self::new_with_options(
+            swarm,
+            HashMap::new(),
+            true,
+            Some(gov5_h2_topic(genesis_hash)),
+            Some(H2V4ChainIdentity {
+                chain_id,
+                genesis_hash,
+            }),
+        )
     }
 
     pub fn new_with_expected_validator_peer_ids(
+        swarm: Swarm<N42Behaviour>,
+        expected_validator_peer_ids: HashMap<u32, PeerId>,
+        allow_deterministic_peer_ids: bool,
+    ) -> Result<
+        (
+            Self,
+            NetworkHandle,
+            mpsc::Receiver<NetworkEvent>,
+            mpsc::Receiver<NetworkEvent>,
+        ),
+        NetworkError,
+    > {
+        Self::new_with_options(
+            swarm,
+            expected_validator_peer_ids,
+            allow_deterministic_peer_ids,
+            None,
+            None,
+        )
+    }
+
+    fn new_with_options(
         mut swarm: Swarm<N42Behaviour>,
         expected_validator_peer_ids: HashMap<u32, PeerId>,
         allow_deterministic_peer_ids: bool,
+        gov5_h2_observer_topic: Option<gossipsub::IdentTopic>,
+        h2_v4_identity: Option<H2V4ChainIdentity>,
     ) -> Result<
         (
             Self,
@@ -658,6 +724,23 @@ impl NetworkService {
                 .subscribe(topic)
                 .map_err(|e| NetworkError::Subscribe(e.to_string()))?;
         }
+        if let Some(topic) = gov5_h2_observer_topic.as_ref() {
+            swarm
+                .behaviour_mut()
+                .gossipsub
+                .subscribe(topic)
+                .map_err(|e| NetworkError::Subscribe(e.to_string()))?;
+            tracing::info!(topic = %topic.hash(), "subscribed to legacy gov5 H2 observer topic");
+        }
+        let h2_v4_observer_topic = h2_v4_identity.map(|_| h2_v4_topic());
+        if let Some(topic) = h2_v4_observer_topic.as_ref() {
+            swarm
+                .behaviour_mut()
+                .gossipsub
+                .subscribe(topic)
+                .map_err(|e| NetworkError::Subscribe(e.to_string()))?;
+            tracing::info!(topic = %topic.hash(), "subscribed to H2-v4 observer topic");
+        }
 
         let [
             consensus,
@@ -671,6 +754,8 @@ impl NetworkService {
         let verification_receipts_topic_hash = verification.hash();
         let mempool_topic_hash = mempool.hash();
         let blob_sidecar_topic_hash = blob_sidecar.hash();
+        let gov5_h2_topic_hash = gov5_h2_observer_topic.map(|topic| topic.hash());
+        let h2_v4_topic_hash = h2_v4_observer_topic.map(|topic| topic.hash());
 
         let validator_peer_map = Arc::new(RwLock::new(HashMap::new()));
         let handle = NetworkHandle {
@@ -688,6 +773,9 @@ impl NetworkService {
             pending_reliable_events: VecDeque::new(),
             pending_data_events: VecDeque::new(),
             consensus_topic_hash,
+            gov5_h2_topic_hash,
+            h2_v4_topic_hash,
+            h2_v4_identity,
             block_announce_topic_hash,
             mempool_topic_hash,
             blob_sidecar_topic_hash,
@@ -1097,6 +1185,54 @@ impl NetworkService {
 
         let topic = &message.topic;
         let event = match () {
+            _ if self
+                .h2_v4_topic_hash
+                .as_ref()
+                .is_some_and(|hash| topic == hash) =>
+            {
+                let Some(identity) = self.h2_v4_identity else {
+                    return;
+                };
+                match decode_h2_v4_gossip(&message.data, identity) {
+                    Ok(envelope) => {
+                        let kind = envelope.message.kind().as_str();
+                        metrics::counter!("n42_h2_v4_messages_observed_total", "kind" => kind)
+                            .increment(1);
+                        NetworkEvent::H2V4Message {
+                            source,
+                            envelope: Box::new(envelope),
+                        }
+                    }
+                    Err(error) => {
+                        metrics::counter!("n42_h2_v4_messages_rejected_total").increment(1);
+                        tracing::warn!(target: "n42::interop::h2v4", %source, %error, "rejected invalid H2-v4 message");
+                        return;
+                    }
+                }
+            }
+            _ if self
+                .gov5_h2_topic_hash
+                .as_ref()
+                .is_some_and(|hash| topic == hash) =>
+            {
+                match decode_gov5_gossip_message(&message.data) {
+                    Ok(msg) => {
+                        let kind = msg.kind().as_str();
+                        metrics::counter!("n42_gov5_h2_messages_observed_total", "kind" => kind)
+                            .increment(1);
+                        tracing::debug!(target: "n42::interop::h2", %source, kind, "observed gov5 H2 message");
+                        NetworkEvent::Gov5H2Message {
+                            source,
+                            message: Box::new(msg),
+                        }
+                    }
+                    Err(error) => {
+                        metrics::counter!("n42_gov5_h2_messages_rejected_total").increment(1);
+                        tracing::warn!(target: "n42::interop::h2", %source, %error, "rejected invalid gov5 H2 message");
+                        return;
+                    }
+                }
+            }
             _ if *topic == self.consensus_topic_hash => {
                 match decode_consensus_message(&message.data) {
                     Ok(msg) => {
@@ -1619,7 +1755,9 @@ impl NetworkService {
         );
         let reliable_data = matches!(
             &event,
-            NetworkEvent::VerificationReceipt { .. }
+            NetworkEvent::Gov5H2Message { .. }
+                | NetworkEvent::H2V4Message { .. }
+                | NetworkEvent::VerificationReceipt { .. }
                 | NetworkEvent::BlobSidecarReceived { .. }
                 | NetworkEvent::PeerConnected(_)
                 | NetworkEvent::PeerDisconnected(_)

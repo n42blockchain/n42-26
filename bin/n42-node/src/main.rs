@@ -993,7 +993,11 @@ fn main() {
                         .map_err(|e| eyre::eyre!("failed to build observer libp2p swarm: {e}"))?;
 
                     let (mut net_service, net_handle, _consensus_event_rx, net_event_rx) =
-                        NetworkService::new(swarm)
+                        NetworkService::new_gov5_h2_observer(
+                            swarm,
+                            full_node.provider.chain_spec().chain().id(),
+                            genesis_hash,
+                        )
                             .map_err(|e| eyre::eyre!("failed to create observer network service: {e}"))?;
 
                     let consensus_port: u16 = env_parse("N42_CONSENSUS_PORT").unwrap_or(9400);

@@ -6903,7 +6903,9 @@ dependencies = [
  "rcgen 0.14.8",
  "rustls",
  "serde",
+ "serde_json",
  "sha2",
+ "snap",
  "thiserror 2.0.19",
  "tokio",
  "tracing",
@@ -7078,6 +7080,7 @@ version = "0.5.0"
 dependencies = [
  "bincode",
  "blake3",
+ "hex",
  "memory-stats",
  "pprof",
  "rand 0.9.5",

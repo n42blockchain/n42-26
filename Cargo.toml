@@ -157,6 +157,7 @@ hex = "0.4"
 
 # Hashing
 sha2 = "0.10"
+snap = "1.1"
 blake3 = "1"
 
 # JMT

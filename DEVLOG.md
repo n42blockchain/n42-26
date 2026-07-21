@@ -142,6 +142,12 @@ Logs are split into separate files by phase for easy maintenance:
 | [devlog-108-parallel-selfdestruct-shadow](docs/devlog-108-parallel-selfdestruct-shadow.md) | P1-6/跨客户端审计附带修复：Block-STM 显式传播 Destroyed/Recreated 整地址 storage wipe，修复 MVCC、输出合并与 deferred coinbase 回退 | Safety |
 | [devlog-109-gov5-p1-rework-closeout](docs/devlog-109-gov5-p1-rework-closeout.md) | gov5 2026H1 P1-1～P1-6 返工收尾：批量 BLS、Twig WAL/state floor、网络恢复、mobile/SELFDESTRUCT；补 CommitQC 预提交执行谱系 sync/2，Scenario 9/10 实弹全绿 | Verification |
 | [devlog-110-s5-cache-poison-hardening](docs/devlog-110-s5-cache-poison-hardening.md) | S5 CRITICAL 返工：拒绝 sender-declared hash mismatch 投毒坏块缓存，非 Valid 回收 compact output，并绑定 sidecar canonical hash 与 sync/2 帧预算 | Security |
+| [devlog-112-qmdb-cross-client-bootstrap](docs/devlog-112-qmdb-cross-client-bootstrap.md) | gov5 replay-v2 QMDB portable bootstrap：跨语言 vectors、流式全历史导出/验证、87.8M slots full replay root 对拍 | Interop |
+| [devlog-113-gov5-h2-observer](docs/devlog-113-gov5-h2-observer.md) | gov5 H2 七类 wire/signing/Snappy vectors 与 Rust genesis-fork observer 订阅；签名域统一前保持只读 | Interop |
+| [devlog-114-h2-v4-signing-domains](docs/devlog-114-h2-v4-signing-domains.md) | H2-v4 跨语言签名域：绑定版本、阶段、chain id、genesis、view、block 与 validator changes，消除 46/78B 分歧和跨链重放 | Interop |
+| [devlog-115-h2-v4-envelope-observer](docs/devlog-115-h2-v4-envelope-observer.md) | H2-v4 chain-bound envelope、Go Snappy vector 与 Rust `/n42/h2/4/ssz_snappy` 只读 observer | Interop |
+| [devlog-116-h2-v4-finality-verifier](docs/devlog-116-h2-v4-finality-verifier.md) | gov5→Rust 固定 BLS CommitQC 对拍、POP/NUL ciphersuite 隔离、只读 observer finality 证明门禁 | Interop |
+| [devlog-117-h2-v4-production-profile](docs/devlog-117-h2-v4-production-profile.md) | gov5 H2-v4 静态验证者生产 profile、全路径签名域、Decide 双发与 Rust 只读最终性同步目标；默认关闭并保护旧 7 节点/QMDB/archive+ 数据 | Interop |
 
 ### 上游借鉴与跟踪
 
