@@ -11,6 +11,7 @@
 //! no eviction tiers, no compaction yet — those are P2+).
 
 mod flat;
+pub mod qmdb_compat;
 mod simd;
 
 use flat::FlatIndex;
