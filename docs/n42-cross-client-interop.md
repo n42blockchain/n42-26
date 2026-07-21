@@ -1,6 +1,6 @@
 # N42 原生链跨语言节点互通路线（QMDB + HotStuff-2）
 
-> 状态：进行中。本文定义 gov5（Go）与 n42-26（Rust）成为同一条 N42 原生链中独立客户端的边界、迁移顺序和验收条件。replay-v2 的 QMDB 历史和 HotStuff-2（H2）共识是第一优先级；eth-el archive+ 互通在此路线稳定后再单独推进。
+> 状态：QMDB Phase 0/1 已完成并通过现有 full replay；H2 Phase 0 进行中。本文定义 gov5（Go）与 n42-26（Rust）成为同一条 N42 原生链中独立客户端的边界、迁移顺序和验收条件。replay-v2 的 QMDB 历史和 HotStuff-2（H2）共识是第一优先级；eth-el archive+ 互通在此路线稳定后再单独推进。
 
 ## 目标
 
@@ -92,4 +92,4 @@ gov5 和 n42-26 应像 geth 与 reth 一样，能以不同实现加入同一条 
 
 ## 下一项实现
 
-先在 Go 导出 deterministic QMDB/H2 golden vectors，并在 Rust 增加独立的 split-QMDB compatibility crate（不接现有生产 sidecar）。网络接入必须等 vectors 双端通过后再做，以避免在生产 gossip 路径中猜测 Go 的 SSZ、QMDB 或 H2 签名细节。
+QMDB 已完成 deterministic vectors、portable exporter、Rust importer，以及既有 87,786,434-slot full replay 的同 root 验收。下一项是补齐 H2 全部 7 类消息的双端 vectors，定义统一 v4 commit 签名域并接只读 observer；网络接入仍须等待 codec、BLS domain、QC/TC bitmap 与错误输入 vectors 全部通过。

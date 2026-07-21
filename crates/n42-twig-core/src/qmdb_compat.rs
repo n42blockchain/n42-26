@@ -6,7 +6,7 @@
 //! and nulls inactive leaves, so it must not be used to import replay-v2 QMDB
 //! state. This small, isolated core is the compatibility baseline.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, io::Read};
 
 use crate::{Hash, NULL_HASH, TWIG_HEIGHT, TWIG_SIZE, hash_leaf, hash_node, null_level};
 
@@ -14,6 +14,11 @@ const BITS_PREFIX: u8 = 0x03;
 const BITS_BYTES: usize = TWIG_SIZE / 8;
 const PROOF_CODEC_VERSION: u8 = 0x02;
 const MAX_UPPER_PATH: usize = 64;
+const PORTABLE_SNAPSHOT_MAGIC: &[u8; 8] = b"N42QMDB\x01";
+const PORTABLE_SNAPSHOT_DIGEST_SIZE: usize = 32;
+const PORTABLE_SNAPSHOT_HEADER_SIZE: usize = 8 + 8 + 32 + 8 + 32 + 32 + 8 + 8;
+const PORTABLE_SNAPSHOT_ENTRY_SIZE: usize = 8 + 1 + 32 + 4;
+const MAX_PORTABLE_VALUE_SIZE: usize = 16 << 20;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct QmdbEntrySnapshot {
@@ -55,6 +60,439 @@ pub enum QmdbSnapshotError {
     DuplicateActiveKey(Hash),
     #[error("QMDB slot log is not contiguous: expected slot {expected}, got {got}")]
     NonContiguousSlotLog { expected: u64, got: u64 },
+}
+
+/// Cross-client QMDB bootstrap metadata plus its complete positional slot log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QmdbPortableSnapshot {
+    pub chain_id: u64,
+    pub genesis_hash: Hash,
+    pub block_number: u64,
+    pub block_hash: Hash,
+    pub root: Hash,
+    pub slots: QmdbSlotSnapshot,
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum QmdbPortableError {
+    #[error("QMDB portable snapshot I/O failed: {0}")]
+    Io(String),
+    #[error("QMDB portable snapshot is truncated")]
+    Truncated,
+    #[error("unsupported QMDB portable snapshot version")]
+    UnsupportedVersion,
+    #[error("QMDB portable snapshot content hash mismatch")]
+    ContentHashMismatch,
+    #[error("QMDB portable snapshot has {entries} entries but next slot is {next_slot}")]
+    NonPositional { entries: u64, next_slot: u64 },
+    #[error("QMDB portable slot log is not contiguous: expected {expected}, got {got}")]
+    NonContiguousSlotLog { expected: u64, got: u64 },
+    #[error("QMDB portable slot {slot} has invalid active flag {flag}")]
+    InvalidActiveFlag { slot: u64, flag: u8 },
+    #[error("QMDB portable slot {slot} value is too large: {size}")]
+    ValueTooLarge { slot: u64, size: usize },
+    #[error("QMDB portable snapshot has {0} trailing bytes")]
+    TrailingBytes(usize),
+    #[error("QMDB portable snapshot chain id {got} does not equal expected {expected}")]
+    WrongChainId { expected: u64, got: u64 },
+    #[error("QMDB portable snapshot genesis hash does not match the expected chain")]
+    WrongGenesisHash,
+    #[error("QMDB portable snapshot root does not match its positional slot log")]
+    RootMismatch,
+}
+
+/// Result of a bounded-memory streaming verification. Only one 2048-leaf twig
+/// and the compact upper-root list are retained, regardless of replay length.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QmdbPortableVerification {
+    pub chain_id: u64,
+    pub genesis_hash: Hash,
+    pub block_number: u64,
+    pub block_hash: Hash,
+    pub root: Hash,
+    pub next_slot: u64,
+    pub live_count: u64,
+}
+
+/// Verify a portable snapshot from a stream without materializing its values or
+/// full append log. This is the full-replay observer path: peak tree memory is
+/// one twig plus one 32-byte root per historical twig.
+pub fn verify_portable_stream<R: Read>(
+    reader: R,
+    expected_chain_id: u64,
+    expected_genesis_hash: &Hash,
+) -> Result<QmdbPortableVerification, QmdbPortableError> {
+    let mut reader = PortableHashingReader::new(reader);
+    if reader.array::<8>()? != *PORTABLE_SNAPSHOT_MAGIC {
+        return Err(QmdbPortableError::UnsupportedVersion);
+    }
+    let chain_id = u64::from_le_bytes(reader.array()?);
+    if chain_id != expected_chain_id {
+        return Err(QmdbPortableError::WrongChainId {
+            expected: expected_chain_id,
+            got: chain_id,
+        });
+    }
+    let genesis_hash = reader.array()?;
+    if genesis_hash != *expected_genesis_hash {
+        return Err(QmdbPortableError::WrongGenesisHash);
+    }
+    let block_number = u64::from_le_bytes(reader.array()?);
+    let block_hash = reader.array()?;
+    let claimed_root = reader.array()?;
+    let next_slot = u64::from_le_bytes(reader.array()?);
+    let entry_count = u64::from_le_bytes(reader.array()?);
+    if entry_count != next_slot {
+        return Err(QmdbPortableError::NonPositional {
+            entries: entry_count,
+            next_slot,
+        });
+    }
+
+    let nulls = null_level();
+    let mut current_twig = (next_slot > 0).then(|| Twig::new(&nulls));
+    let twig_capacity = usize::try_from(next_slot.div_ceil(TWIG_SIZE as u64))
+        .map_err(|_| QmdbPortableError::Truncated)?;
+    let mut twig_roots = Vec::with_capacity(twig_capacity);
+    let mut live_count = 0_u64;
+    let mut value = Vec::new();
+    for expected in 0..entry_count {
+        let slot = u64::from_le_bytes(reader.array()?);
+        if slot != expected {
+            return Err(QmdbPortableError::NonContiguousSlotLog {
+                expected,
+                got: slot,
+            });
+        }
+        let flag = reader.array::<1>()?[0];
+        if flag > 1 {
+            return Err(QmdbPortableError::InvalidActiveFlag { slot, flag });
+        }
+        let key = reader.array()?;
+        let value_len = u32::from_le_bytes(reader.array()?) as usize;
+        if value_len > MAX_PORTABLE_VALUE_SIZE {
+            return Err(QmdbPortableError::ValueTooLarge {
+                slot,
+                size: value_len,
+            });
+        }
+        reader.fill_vec(&mut value, value_len)?;
+        let local = slot as usize % TWIG_SIZE;
+        let twig = current_twig
+            .as_mut()
+            .expect("a non-empty stream always has a current twig");
+        twig.set_leaf_unchecked(local, hash_leaf(&key, &value));
+        if flag == 1 {
+            twig.bits[local / 8] |= 1 << (local % 8);
+            live_count += 1;
+        }
+        if local + 1 == TWIG_SIZE {
+            twig.recompute();
+            twig_roots.push(twig.root);
+            if expected + 1 < entry_count {
+                current_twig = Some(Twig::new(&nulls));
+            }
+        }
+    }
+    if next_slot > 0 && next_slot as usize % TWIG_SIZE != 0 {
+        let twig = current_twig
+            .as_mut()
+            .expect("a partial final twig is present");
+        twig.recompute();
+        twig_roots.push(twig.root);
+    }
+    reader.finish()?;
+
+    let root = fold_portable_twig_roots(&twig_roots);
+    if root != claimed_root {
+        return Err(QmdbPortableError::RootMismatch);
+    }
+    Ok(QmdbPortableVerification {
+        chain_id,
+        genesis_hash,
+        block_number,
+        block_hash,
+        root,
+        next_slot,
+        live_count,
+    })
+}
+
+fn fold_portable_twig_roots(twig_roots: &[Hash]) -> Hash {
+    if twig_roots.is_empty() {
+        return NULL_HASH;
+    }
+    let capacity = twig_roots.len().next_power_of_two();
+    let mut upper = vec![NULL_HASH; capacity * 2];
+    upper[capacity..capacity + twig_roots.len()].copy_from_slice(twig_roots);
+    for index in (1..capacity).rev() {
+        upper[index] = hash_node(&upper[index * 2], &upper[index * 2 + 1]);
+    }
+    upper[1]
+}
+
+struct PortableHashingReader<R> {
+    inner: R,
+    hasher: blake3::Hasher,
+}
+
+impl<R: Read> PortableHashingReader<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            hasher: blake3::Hasher::new(),
+        }
+    }
+
+    fn array<const N: usize>(&mut self) -> Result<[u8; N], QmdbPortableError> {
+        let mut out = [0_u8; N];
+        self.inner.read_exact(&mut out).map_err(portable_io_error)?;
+        self.hasher.update(&out);
+        Ok(out)
+    }
+
+    fn fill_vec(&mut self, out: &mut Vec<u8>, len: usize) -> Result<(), QmdbPortableError> {
+        out.resize(len, 0);
+        self.inner.read_exact(out).map_err(portable_io_error)?;
+        self.hasher.update(out);
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<(), QmdbPortableError> {
+        let mut claimed_digest = [0_u8; PORTABLE_SNAPSHOT_DIGEST_SIZE];
+        self.inner
+            .read_exact(&mut claimed_digest)
+            .map_err(portable_io_error)?;
+        if self.hasher.finalize().as_bytes() != &claimed_digest {
+            return Err(QmdbPortableError::ContentHashMismatch);
+        }
+        let mut trailing = [0_u8; 1];
+        match self.inner.read(&mut trailing) {
+            Ok(0) => Ok(()),
+            Ok(size) => Err(QmdbPortableError::TrailingBytes(size)),
+            Err(error) => Err(portable_io_error(error)),
+        }
+    }
+}
+
+fn portable_io_error(error: std::io::Error) -> QmdbPortableError {
+    if error.kind() == std::io::ErrorKind::UnexpectedEof {
+        QmdbPortableError::Truncated
+    } else {
+        QmdbPortableError::Io(error.to_string())
+    }
+}
+
+impl QmdbPortableSnapshot {
+    /// Encode the portable v1 layout shared with gov5. The final Blake3 digest
+    /// authenticates every preceding byte, including chain/checkpoint identity.
+    pub fn encode(&self) -> Result<Vec<u8>, QmdbPortableError> {
+        self.validate_positions()?;
+        let mut capacity = PORTABLE_SNAPSHOT_HEADER_SIZE + PORTABLE_SNAPSHOT_DIGEST_SIZE;
+        for entry in &self.slots.entries {
+            if entry.value.len() > MAX_PORTABLE_VALUE_SIZE {
+                return Err(QmdbPortableError::ValueTooLarge {
+                    slot: entry.slot,
+                    size: entry.value.len(),
+                });
+            }
+            capacity += PORTABLE_SNAPSHOT_ENTRY_SIZE + entry.value.len();
+        }
+        let mut out = Vec::with_capacity(capacity);
+        out.extend_from_slice(PORTABLE_SNAPSHOT_MAGIC);
+        out.extend_from_slice(&self.chain_id.to_le_bytes());
+        out.extend_from_slice(&self.genesis_hash);
+        out.extend_from_slice(&self.block_number.to_le_bytes());
+        out.extend_from_slice(&self.block_hash);
+        out.extend_from_slice(&self.root);
+        out.extend_from_slice(&self.slots.next_slot.to_le_bytes());
+        out.extend_from_slice(&(self.slots.entries.len() as u64).to_le_bytes());
+        for entry in &self.slots.entries {
+            out.extend_from_slice(&entry.slot.to_le_bytes());
+            out.push(u8::from(entry.active));
+            out.extend_from_slice(&entry.key);
+            out.extend_from_slice(&(entry.value.len() as u32).to_le_bytes());
+            out.extend_from_slice(&entry.value);
+        }
+        let digest = blake3::hash(&out);
+        out.extend_from_slice(digest.as_bytes());
+        Ok(out)
+    }
+
+    /// Decode and authenticate a portable v1 snapshot. Root and chain identity
+    /// are checked separately by [`Self::verify_and_build`].
+    pub fn decode(encoded: &[u8]) -> Result<Self, QmdbPortableError> {
+        if encoded.len() < PORTABLE_SNAPSHOT_HEADER_SIZE + PORTABLE_SNAPSHOT_DIGEST_SIZE {
+            return Err(QmdbPortableError::Truncated);
+        }
+        let payload_len = encoded.len() - PORTABLE_SNAPSHOT_DIGEST_SIZE;
+        let (payload, claimed_digest) = encoded.split_at(payload_len);
+        if blake3::hash(payload).as_bytes() != claimed_digest {
+            return Err(QmdbPortableError::ContentHashMismatch);
+        }
+        let mut reader = PortableReader::new(payload);
+        if reader.take(PORTABLE_SNAPSHOT_MAGIC.len())? != PORTABLE_SNAPSHOT_MAGIC {
+            return Err(QmdbPortableError::UnsupportedVersion);
+        }
+        let chain_id = reader.u64()?;
+        let genesis_hash = reader.hash()?;
+        let block_number = reader.u64()?;
+        let block_hash = reader.hash()?;
+        let root = reader.hash()?;
+        let next_slot = reader.u64()?;
+        let entry_count = reader.u64()?;
+        if entry_count != next_slot {
+            return Err(QmdbPortableError::NonPositional {
+                entries: entry_count,
+                next_slot,
+            });
+        }
+        if entry_count > (reader.remaining() / PORTABLE_SNAPSHOT_ENTRY_SIZE) as u64 {
+            return Err(QmdbPortableError::Truncated);
+        }
+        let entry_capacity =
+            usize::try_from(entry_count).map_err(|_| QmdbPortableError::Truncated)?;
+        let mut entries = Vec::with_capacity(entry_capacity);
+        for expected in 0..entry_count {
+            let slot = reader.u64()?;
+            if slot != expected {
+                return Err(QmdbPortableError::NonContiguousSlotLog {
+                    expected,
+                    got: slot,
+                });
+            }
+            let flag = reader.byte()?;
+            if flag > 1 {
+                return Err(QmdbPortableError::InvalidActiveFlag { slot, flag });
+            }
+            let key = reader.hash()?;
+            let value_len = reader.u32()? as usize;
+            if value_len > MAX_PORTABLE_VALUE_SIZE {
+                return Err(QmdbPortableError::ValueTooLarge {
+                    slot,
+                    size: value_len,
+                });
+            }
+            let value = reader.take(value_len)?.to_vec();
+            entries.push(QmdbSlotEntry {
+                slot,
+                key,
+                value,
+                active: flag == 1,
+            });
+        }
+        if reader.remaining() != 0 {
+            return Err(QmdbPortableError::TrailingBytes(reader.remaining()));
+        }
+        Ok(Self {
+            chain_id,
+            genesis_hash,
+            block_number,
+            block_hash,
+            root,
+            slots: QmdbSlotSnapshot { next_slot, entries },
+        })
+    }
+
+    /// Enforce chain identity and rebuild the split commitment from every slot.
+    pub fn verify_and_build(
+        &self,
+        expected_chain_id: u64,
+        expected_genesis_hash: &Hash,
+    ) -> Result<QmdbCompatTree, QmdbPortableError> {
+        if self.chain_id != expected_chain_id {
+            return Err(QmdbPortableError::WrongChainId {
+                expected: expected_chain_id,
+                got: self.chain_id,
+            });
+        }
+        if self.genesis_hash != *expected_genesis_hash {
+            return Err(QmdbPortableError::WrongGenesisHash);
+        }
+        let tree =
+            QmdbCompatTree::from_slot_snapshot(&self.slots).map_err(|error| match error {
+                QmdbSnapshotError::NonPositional { entries, next_slot } => {
+                    QmdbPortableError::NonPositional {
+                        entries: entries as u64,
+                        next_slot,
+                    }
+                }
+                QmdbSnapshotError::NonContiguousSlotLog { expected, got } => {
+                    QmdbPortableError::NonContiguousSlotLog { expected, got }
+                }
+                QmdbSnapshotError::DuplicateActiveKey(_) => QmdbPortableError::RootMismatch,
+            })?;
+        if tree.root() != self.root {
+            return Err(QmdbPortableError::RootMismatch);
+        }
+        Ok(tree)
+    }
+
+    fn validate_positions(&self) -> Result<(), QmdbPortableError> {
+        if self.slots.next_slot != self.slots.entries.len() as u64 {
+            return Err(QmdbPortableError::NonPositional {
+                entries: self.slots.entries.len() as u64,
+                next_slot: self.slots.next_slot,
+            });
+        }
+        for (expected, entry) in self.slots.entries.iter().enumerate() {
+            if entry.slot != expected as u64 {
+                return Err(QmdbPortableError::NonContiguousSlotLog {
+                    expected: expected as u64,
+                    got: entry.slot,
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+struct PortableReader<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> PortableReader<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self { data, pos: 0 }
+    }
+
+    fn remaining(&self) -> usize {
+        self.data.len() - self.pos
+    }
+
+    fn take(&mut self, len: usize) -> Result<&'a [u8], QmdbPortableError> {
+        let end = self
+            .pos
+            .checked_add(len)
+            .filter(|end| *end <= self.data.len())
+            .ok_or(QmdbPortableError::Truncated)?;
+        let out = &self.data[self.pos..end];
+        self.pos = end;
+        Ok(out)
+    }
+
+    fn byte(&mut self) -> Result<u8, QmdbPortableError> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn u32(&mut self) -> Result<u32, QmdbPortableError> {
+        let mut bytes = [0_u8; 4];
+        bytes.copy_from_slice(self.take(4)?);
+        Ok(u32::from_le_bytes(bytes))
+    }
+
+    fn u64(&mut self) -> Result<u64, QmdbPortableError> {
+        let mut bytes = [0_u8; 8];
+        bytes.copy_from_slice(self.take(8)?);
+        Ok(u64::from_le_bytes(bytes))
+    }
+
+    fn hash(&mut self) -> Result<Hash, QmdbPortableError> {
+        let mut hash = [0_u8; 32];
+        hash.copy_from_slice(self.take(32)?);
+        Ok(hash)
+    }
 }
 
 /// A gov5 QMDB v2 membership proof.  Its byte encoding is deliberately kept
@@ -458,8 +896,187 @@ impl QmdbCompatTree {
 mod tests {
     use super::*;
 
+    #[derive(serde::Deserialize)]
+    struct CrossClientVector {
+        version: String,
+        workload: CrossClientWorkload,
+        checkpoints: CrossClientCheckpoints,
+        proof: CrossClientProof,
+        portable: CrossClientPortable,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct CrossClientWorkload {
+        insert_count: u64,
+        updates: Vec<[u64; 2]>,
+        deletes: Vec<u64>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct CrossClientCheckpoints {
+        insert_root: String,
+        update_root: String,
+        delete_root: String,
+        next_slot: u64,
+        live_count: usize,
+        snapshot_entries: usize,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct CrossClientProof {
+        key: u64,
+        hex: String,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct CrossClientPortable {
+        hex: String,
+    }
+
     fn key(byte: u8) -> Hash {
         [byte; 32]
+    }
+
+    fn interop_key(value: u64) -> Hash {
+        let mut key = [0_u8; 32];
+        key[..8].copy_from_slice(&value.to_le_bytes());
+        key
+    }
+
+    fn interop_value(value: u64) -> Vec<u8> {
+        value.to_le_bytes().to_vec()
+    }
+
+    #[test]
+    fn matches_gov5_cross_client_v1_vectors() {
+        let vector: CrossClientVector =
+            serde_json::from_str(include_str!("../testdata/cross_client_v1.json")).unwrap();
+        assert_eq!(vector.version, "n42-qmdb-interop-v1");
+
+        let mut tree = QmdbCompatTree::new();
+        for value in 0..vector.workload.insert_count {
+            tree.set(interop_key(value), interop_value(value));
+        }
+        assert_eq!(hex::encode(tree.root()), vector.checkpoints.insert_root);
+
+        for [key, value] in vector.workload.updates {
+            tree.set(interop_key(key), interop_value(value));
+        }
+        assert_eq!(hex::encode(tree.root()), vector.checkpoints.update_root);
+
+        for key in vector.workload.deletes {
+            assert!(tree.delete(&interop_key(key)));
+        }
+        let final_root = tree.root();
+        assert_eq!(hex::encode(final_root), vector.checkpoints.delete_root);
+        assert_eq!(tree.next_slot(), vector.checkpoints.next_slot);
+        assert_eq!(tree.len(), vector.checkpoints.live_count);
+
+        let snapshot = tree.snapshot();
+        assert_eq!(snapshot.entries.len(), vector.checkpoints.snapshot_entries);
+        let slots = QmdbSlotSnapshot {
+            next_slot: snapshot.next_slot,
+            entries: snapshot
+                .entries
+                .iter()
+                .enumerate()
+                .map(|(slot, entry)| QmdbSlotEntry {
+                    slot: slot as u64,
+                    key: entry.key,
+                    value: entry.value.clone(),
+                    active: entry.active,
+                })
+                .collect(),
+        };
+        assert_eq!(
+            QmdbCompatTree::from_slot_snapshot(&slots).unwrap().root(),
+            final_root
+        );
+
+        let proof_bytes = hex::decode(vector.proof.hex).unwrap();
+        let proof = QmdbProof::decode(&proof_bytes).unwrap();
+        assert_eq!(proof.key, interop_key(vector.proof.key));
+        assert!(proof.verify(&final_root));
+
+        let portable_bytes = hex::decode(vector.portable.hex).unwrap();
+        let portable = QmdbPortableSnapshot::decode(&portable_bytes).unwrap();
+        assert_eq!(portable.chain_id, 1143);
+        assert_eq!(portable.genesis_hash, interop_key(0x11));
+        assert_eq!(portable.block_number, 42);
+        assert_eq!(portable.block_hash, interop_key(0x22));
+        assert_eq!(portable.slots.next_slot, 3);
+        assert_eq!(
+            portable
+                .verify_and_build(1143, &interop_key(0x11))
+                .unwrap()
+                .root(),
+            portable.root
+        );
+    }
+
+    #[test]
+    fn portable_snapshot_roundtrip_checks_identity_root_and_digest() {
+        let mut tree = QmdbCompatTree::new();
+        for value in 0..2050 {
+            tree.set(interop_key(value), interop_value(value));
+        }
+        tree.set(interop_key(7), interop_value(1_000_007));
+        assert!(tree.delete(&interop_key(9)));
+        let snapshot = tree.snapshot();
+        let genesis_hash = interop_key(0x11);
+        let portable = QmdbPortableSnapshot {
+            chain_id: 1143,
+            genesis_hash,
+            block_number: 42,
+            block_hash: interop_key(0x22),
+            root: tree.root(),
+            slots: QmdbSlotSnapshot {
+                next_slot: snapshot.next_slot,
+                entries: snapshot
+                    .entries
+                    .iter()
+                    .enumerate()
+                    .map(|(slot, entry)| QmdbSlotEntry {
+                        slot: slot as u64,
+                        key: entry.key,
+                        value: entry.value.clone(),
+                        active: entry.active,
+                    })
+                    .collect(),
+            },
+        };
+        let encoded = portable.encode().unwrap();
+        let decoded = QmdbPortableSnapshot::decode(&encoded).unwrap();
+        assert_eq!(decoded, portable);
+        assert_eq!(
+            decoded
+                .verify_and_build(1143, &genesis_hash)
+                .unwrap()
+                .root(),
+            portable.root
+        );
+        assert!(matches!(
+            decoded.verify_and_build(1, &genesis_hash),
+            Err(QmdbPortableError::WrongChainId {
+                expected: 1,
+                got: 1143
+            })
+        ));
+
+        let mut wrong_root = decoded.clone();
+        wrong_root.root[0] ^= 0x80;
+        let wrong_root = QmdbPortableSnapshot::decode(&wrong_root.encode().unwrap()).unwrap();
+        assert!(matches!(
+            wrong_root.verify_and_build(1143, &genesis_hash),
+            Err(QmdbPortableError::RootMismatch)
+        ));
+
+        let mut tampered = encoded;
+        tampered[PORTABLE_SNAPSHOT_HEADER_SIZE] ^= 0x80;
+        assert!(matches!(
+            QmdbPortableSnapshot::decode(&tampered),
+            Err(QmdbPortableError::ContentHashMismatch)
+        ));
     }
 
     #[test]
