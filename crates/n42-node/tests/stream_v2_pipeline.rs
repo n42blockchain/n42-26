@@ -1268,3 +1268,175 @@ fn test_v2_full_packet_mixed_block() {
 
     run_full_v2_packet_test(db, header, vec![tx1, tx2], vec![sender_a, sender_b]);
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Adversarial tests: a tampered/corrupted read log MUST be detected by the phone.
+//
+// Mirrors the geth `debug_executionWitness` corruption lesson — a stateless
+// verifier that silently accepts corrupted witness data is worse than useless.
+//
+// Verification boundary (what receipts_root replay actually guarantees):
+//   - The read log is replayed in STRICT order, so any structural corruption
+//     (missing / inserted / reordered entry) desyncs the replay → error or a
+//     different receipts_root. These tests prove that.
+//   - Tampering an input that CHANGES execution (e.g. a contract code_hash that
+//     no longer resolves to bytecode) is caught.
+//   - A pure state-value change that does NOT alter execution (e.g. an unrelated
+//     account's balance) is intentionally NOT caught here — that correctness is
+//     anchored by the state_root, not the receipts_root replay path.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+use n42_execution::read_log::ReadLogEntry;
+
+/// Honestly executes an ERC-20 transfer on the IDC side, applies `tamper` to the
+/// captured read log, then replays on the phone side and asserts the tampering is
+/// detected (replay error, or a receipts_root different from the honest one).
+fn run_adversarial_erc20<F: FnOnce(&mut Vec<ReadLogEntry>)>(tamper: F) {
+    let (key_pair, sender) = test_sender(0x31);
+    let receiver = Address::with_last_byte(0x42);
+    let contract = Address::with_last_byte(0xC0);
+    let coinbase = Address::with_last_byte(0xFF);
+
+    let erc20_code = minimal_erc20_bytecode();
+    let code_hash = keccak256(&erc20_code);
+
+    let mut db = CacheDB::new(revm::database::EmptyDB::default());
+    db.insert_account_info(
+        sender,
+        AccountInfo {
+            nonce: 0,
+            balance: U256::from(10u64) * U256::from(10u64).pow(U256::from(18)),
+            ..Default::default()
+        },
+    );
+    db.insert_account_info(
+        contract,
+        AccountInfo {
+            nonce: 1,
+            balance: U256::ZERO,
+            code_hash,
+            code: Some(Bytecode::new_raw(erc20_code)),
+            account_id: None,
+        },
+    );
+    let sender_balance_slot = mapping_slot(sender, 0);
+    db.insert_account_storage(contract, sender_balance_slot, U256::from(1_000_000u64))
+        .expect("insert storage");
+
+    let chain_spec = test_chain_spec();
+    let evm_config = EthEvmConfig::new(chain_spec.clone());
+
+    let tx = sign_tx_with_key_pair(
+        key_pair,
+        Transaction::Legacy(TxLegacy {
+            chain_id: Some(chain_spec.chain.id()),
+            nonce: 0,
+            gas_price: 7,
+            gas_limit: 200_000,
+            to: TxKind::Call(contract),
+            value: U256::ZERO,
+            input: encode_transfer_call(receiver, U256::from(500_000u64)),
+        }),
+    );
+
+    let header = Header {
+        number: 1,
+        timestamp: 1_700_000_000,
+        gas_limit: 30_000_000,
+        beneficiary: coinbase,
+        base_fee_per_gas: Some(7),
+        ..Header::default()
+    };
+
+    let block = RecoveredBlock::new_unhashed(
+        Block {
+            header: header.clone(),
+            body: BlockBody {
+                transactions: vec![tx],
+                ommers: vec![],
+                withdrawals: None,
+            },
+        },
+        vec![sender],
+    );
+
+    // ── IDC side: honest execution capturing the read log ──
+    let logged_db = ReadLogDatabase::new(db);
+    let log_handle = logged_db.log_handle();
+    let codes_handle = logged_db.codes_handle();
+    let mut idc_executor = BasicBlockExecutor::new(evm_config.clone(), logged_db);
+    let idc_result = idc_executor
+        .execute_one(&block)
+        .expect("IDC execution should succeed");
+    let honest_root = Receipt::calculate_receipt_root_no_memo(&idc_result.receipts);
+
+    let mut read_log = match Arc::try_unwrap(log_handle) {
+        Ok(mutex) => mutex.into_inner().unwrap(),
+        Err(arc) => arc.lock().unwrap().clone(),
+    };
+    let captured_codes = match Arc::try_unwrap(codes_handle) {
+        Ok(mutex) => mutex.into_inner().unwrap(),
+        Err(arc) => arc.lock().unwrap().clone(),
+    };
+
+    // ── Tamper as if the witness was corrupted/forged in transit ──
+    tamper(&mut read_log);
+
+    // ── Phone side: replay with the tampered read log ──
+    let bytecodes_map: HashMap<B256, Bytecode> = captured_codes
+        .into_iter()
+        .map(|(h, c)| (h, Bytecode::new_raw(c)))
+        .collect();
+    let replay_db = StreamReplayDB::new_without_cache(encode_read_log(&read_log), bytecodes_map);
+    let mut phone_executor = BasicBlockExecutor::new(evm_config, replay_db);
+
+    match phone_executor.execute_one(&block) {
+        Ok(phone_result) => {
+            let tampered_root = Receipt::calculate_receipt_root_no_memo(&phone_result.receipts);
+            assert_ne!(
+                tampered_root, honest_root,
+                "tampered read log must NOT reproduce the honest receipts_root"
+            );
+        }
+        // Replay desynced and the phone rejected the block — detection succeeded.
+        Err(_) => {}
+    }
+}
+
+#[test]
+fn test_adversarial_truncated_read_log_detected() {
+    eprintln!("\n=== Adversarial: truncated read log ===");
+    run_adversarial_erc20(|log| {
+        // Drop the last state read — the phone runs out of replay data mid-execution.
+        log.pop().expect("read log should be non-empty");
+    });
+}
+
+#[test]
+fn test_adversarial_injected_read_log_entry_detected() {
+    eprintln!("\n=== Adversarial: injected read-log entry ===");
+    run_adversarial_erc20(|log| {
+        // Splice an extra read at the front. Every subsequent reply is now served
+        // the wrong (shifted) value, desyncing the strictly-ordered replay so the
+        // phone either errors out or computes a different receipts_root.
+        log.insert(0, ReadLogEntry::AccountNotFound);
+    });
+}
+
+#[test]
+fn test_adversarial_corrupted_code_hash_detected() {
+    eprintln!("\n=== Adversarial: corrupted contract code_hash ===");
+    run_adversarial_erc20(|log| {
+        // Repoint the first contract's code_hash at bytecode the phone doesn't
+        // have. Execution requires that code, so `code_by_hash` fails the replay.
+        for entry in log.iter_mut() {
+            if let ReadLogEntry::Account { code_hash, .. } = entry
+                && *code_hash != alloy_primitives::KECCAK256_EMPTY
+            {
+                *code_hash = B256::from([0xAB; 32]);
+                return;
+            }
+        }
+        panic!("expected at least one contract account read to tamper");
+    });
+}

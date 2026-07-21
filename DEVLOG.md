@@ -143,6 +143,12 @@ Logs are split into separate files by phase for easy maintenance:
 | [devlog-109-gov5-p1-rework-closeout](docs/devlog-109-gov5-p1-rework-closeout.md) | gov5 2026H1 P1-1～P1-6 返工收尾：批量 BLS、Twig WAL/state floor、网络恢复、mobile/SELFDESTRUCT；补 CommitQC 预提交执行谱系 sync/2，Scenario 9/10 实弹全绿 | Verification |
 | [devlog-110-s5-cache-poison-hardening](docs/devlog-110-s5-cache-poison-hardening.md) | S5 CRITICAL 返工：拒绝 sender-declared hash mismatch 投毒坏块缓存，非 Valid 回收 compact output，并绑定 sidecar canonical hash 与 sync/2 帧预算 | Security |
 
+### 上游借鉴与跟踪
+
+| 文件 | 内容 | 类型 |
+|------|------|------|
+| [devlog-93-eth-client-survey-stage1](docs/devlog-93-eth-client-survey-stage1.md) | 调研 reth/erigon/geth 近三月更新（reth 2.0→2.3 已随 fork 获得、EIP-7928 BAL、Storage V2、Ress 无状态）；借鉴清单+效果/工作量评估；阶段一执行：geth 3 CVE + OP witness 不兼容均不适用、witness 对抗回归测试 3 个（截断/插入/code_hash 篡改，9 测试全绿）、Storage V2 经 reth CLI 透传新节点已默认 | Survey |
+
 ---
 
 New entries: append to the corresponding category file, or create a new numbered file (e.g., `devlog-57-xxx.md`) in `docs/`.
