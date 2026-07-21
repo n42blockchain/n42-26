@@ -73,6 +73,9 @@ gov5 和 n42-26 应像 geth 与 reth 一样，能以不同实现加入同一条 
 Legacy observer 已先完成：Rust observer 根据本地 genesis fork digest 订阅 gov5 的旧
 `hotstuff_consensus/ssz_snappy` topic，严格验证 Go 产生的 Snappy 帧与七类消息，但不把消息交给投票引擎。该路径用于 live 线协议取证，不等同于 H2-v4 validator 互通。
 
+H2-v4 签名域现已由共享 vectors 固定为
+`N42H2V4 || phase || chain_id || genesis_hash || view`，并按消息阶段追加 block hash 与 validator-change hash。旧引擎尚未切换；必须等 v4 envelope/topic 与双向验证完成后通过显式链配置启用。
+
 ### Phase 3 — replay-v2 等价性与 catch-up
 
 - 将 replay 输入固定为 QMDB bootstrap export + finalized native block bundle/diff，而不是直接读取另一客户端的 MDBX 表。

@@ -5,6 +5,7 @@ pub mod dissemination;
 pub mod error;
 pub mod gossipsub;
 pub mod h2_wire;
+pub mod h2_v4;
 pub mod mobile;
 pub mod reconnection;
 pub mod service;
