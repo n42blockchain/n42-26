@@ -5782,6 +5782,64 @@ mod tests {
         assert_eq!(mock.new_payload_hashes(), vec![honest_hash, honest_hash]);
     }
 
+    /// HIGH-1: the payload itself can honestly declare `H` while an
+    /// unauthenticated peer substitutes only the compact execution output. In
+    /// production reth then reports a state-root mismatch. That verdict is
+    /// about the injected bytes, not block `H`, so the cache must be evicted
+    /// without blacklisting `H`; a later honest compact-free arrival must run.
+    #[tokio::test(flavor = "current_thread")]
+    async fn forged_compact_output_does_not_blacklist_honest_hash() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let parent = B256::repeat_byte(0x74);
+        let honest_hash = B256::repeat_byte(0x75);
+        let mock = Arc::new(MockExecutionLayer::with_new_payload_statuses(
+            [
+                PayloadStatusEnum::Invalid {
+                    validation_error: "state root mismatch from compact output".to_owned(),
+                },
+                PayloadStatusEnum::Valid,
+            ],
+            PayloadStatusEnum::Valid,
+        ));
+        let cache = Arc::new(MockExecutionOutputCache::default());
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx)
+            .with_exec_output_cache(cache.clone());
+        orch.el = Some(mock.clone());
+        orch.head_block_hash = parent;
+
+        let forged_compact = BlockDataBroadcast {
+            block_hash: honest_hash,
+            view: 1,
+            // This payload is the honest block and passes the envelope hash
+            // check. Only its independently carried compact bytes are forged.
+            payload_json: serde_json::to_vec(&test_execution_data(parent, honest_hash)).unwrap(),
+            timestamp: 1,
+            execution_output: Some(vec![0xBA, 0xD0, 0x00, 0x01]),
+            leader_ready_unix_ms: 0,
+        };
+        assert!(!orch.import_and_notify(forged_compact).await);
+        assert_eq!(cache.evicted(), vec![honest_hash]);
+        assert!(!cache.contains(honest_hash));
+        assert!(
+            !orch.bad_blocks.should_skip(honest_hash, "test"),
+            "state-root failure after compact injection must not blacklist H"
+        );
+
+        let honest = BlockDataBroadcast {
+            block_hash: honest_hash,
+            view: 1,
+            payload_json: serde_json::to_vec(&test_execution_data(parent, honest_hash)).unwrap(),
+            timestamp: 1,
+            execution_output: None,
+            leader_ready_unix_ms: 0,
+        };
+        assert!(orch.import_and_notify(honest).await);
+        assert_eq!(orch.head_block_hash, honest_hash);
+        assert_eq!(mock.new_payload_hashes(), vec![honest_hash, honest_hash]);
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn direct_block_arrival_is_filtered_by_bad_block_cache() {
         let (engine, output_rx) = make_test_engine();
