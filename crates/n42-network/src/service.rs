@@ -17,10 +17,11 @@ use crate::gossipsub::handlers::{
     decode_consensus_message, encode_consensus_message, validate_message,
 };
 use crate::gossipsub::topics::{
-    blob_sidecar_topic, block_announce_topic, consensus_topic, gov5_h2_topic, mempool_topic,
-    verification_receipts_topic,
+    blob_sidecar_topic, block_announce_topic, consensus_topic, gov5_h2_topic, h2_v4_topic,
+    mempool_topic, verification_receipts_topic,
 };
 use crate::h2_wire::{H2Message, decode_gov5_gossip_message};
+use crate::h2_v4::{H2V4ChainIdentity, H2V4Envelope, decode_gossip as decode_h2_v4_gossip};
 use crate::reconnection::ReconnectionManager;
 use crate::state_sync::{BlockSyncRequest, BlockSyncResponse};
 use crate::transport::{N42Behaviour, N42BehaviourEvent, deterministic_validator_peer_id};
@@ -162,6 +163,10 @@ pub enum NetworkEvent {
     Gov5H2Message {
         source: PeerId,
         message: Box<H2Message>,
+    },
+    H2V4Message {
+        source: PeerId,
+        envelope: Box<H2V4Envelope>,
     },
     BlockAnnouncement {
         source: PeerId,
@@ -524,6 +529,8 @@ pub struct NetworkService {
     pending_data_events: VecDeque<NetworkEvent>,
     consensus_topic_hash: gossipsub::TopicHash,
     gov5_h2_topic_hash: Option<gossipsub::TopicHash>,
+    h2_v4_topic_hash: Option<gossipsub::TopicHash>,
+    h2_v4_identity: Option<H2V4ChainIdentity>,
     block_announce_topic_hash: gossipsub::TopicHash,
     mempool_topic_hash: gossipsub::TopicHash,
     blob_sidecar_topic_hash: gossipsub::TopicHash,
@@ -619,13 +626,14 @@ impl NetworkService {
         ),
         NetworkError,
     > {
-        Self::new_with_options(swarm, HashMap::new(), true, None)
+        Self::new_with_options(swarm, HashMap::new(), true, None, None)
     }
 
     /// Creates a non-voting service which also subscribes to the gov5 H2 topic
     /// derived from this chain's genesis hash.
     pub fn new_gov5_h2_observer(
         swarm: Swarm<N42Behaviour>,
+        chain_id: u64,
         genesis_hash: B256,
     ) -> Result<
         (
@@ -641,6 +649,10 @@ impl NetworkService {
             HashMap::new(),
             true,
             Some(gov5_h2_topic(genesis_hash)),
+            Some(H2V4ChainIdentity {
+                chain_id,
+                genesis_hash,
+            }),
         )
     }
 
@@ -662,6 +674,7 @@ impl NetworkService {
             expected_validator_peer_ids,
             allow_deterministic_peer_ids,
             None,
+            None,
         )
     }
 
@@ -670,6 +683,7 @@ impl NetworkService {
         expected_validator_peer_ids: HashMap<u32, PeerId>,
         allow_deterministic_peer_ids: bool,
         gov5_h2_observer_topic: Option<gossipsub::IdentTopic>,
+        h2_v4_identity: Option<H2V4ChainIdentity>,
     ) -> Result<
         (
             Self,
@@ -718,6 +732,15 @@ impl NetworkService {
                 .map_err(|e| NetworkError::Subscribe(e.to_string()))?;
             tracing::info!(topic = %topic.hash(), "subscribed to legacy gov5 H2 observer topic");
         }
+        let h2_v4_observer_topic = h2_v4_identity.map(|_| h2_v4_topic());
+        if let Some(topic) = h2_v4_observer_topic.as_ref() {
+            swarm
+                .behaviour_mut()
+                .gossipsub
+                .subscribe(topic)
+                .map_err(|e| NetworkError::Subscribe(e.to_string()))?;
+            tracing::info!(topic = %topic.hash(), "subscribed to H2-v4 observer topic");
+        }
 
         let [
             consensus,
@@ -732,6 +755,7 @@ impl NetworkService {
         let mempool_topic_hash = mempool.hash();
         let blob_sidecar_topic_hash = blob_sidecar.hash();
         let gov5_h2_topic_hash = gov5_h2_observer_topic.map(|topic| topic.hash());
+        let h2_v4_topic_hash = h2_v4_observer_topic.map(|topic| topic.hash());
 
         let validator_peer_map = Arc::new(RwLock::new(HashMap::new()));
         let handle = NetworkHandle {
@@ -750,6 +774,8 @@ impl NetworkService {
             pending_data_events: VecDeque::new(),
             consensus_topic_hash,
             gov5_h2_topic_hash,
+            h2_v4_topic_hash,
+            h2_v4_identity,
             block_announce_topic_hash,
             mempool_topic_hash,
             blob_sidecar_topic_hash,
@@ -1159,6 +1185,31 @@ impl NetworkService {
 
         let topic = &message.topic;
         let event = match () {
+            _ if self
+                .h2_v4_topic_hash
+                .as_ref()
+                .is_some_and(|hash| topic == hash) =>
+            {
+                let Some(identity) = self.h2_v4_identity else {
+                    return;
+                };
+                match decode_h2_v4_gossip(&message.data, identity) {
+                    Ok(envelope) => {
+                        let kind = envelope.message.kind().as_str();
+                        metrics::counter!("n42_h2_v4_messages_observed_total", "kind" => kind)
+                            .increment(1);
+                        NetworkEvent::H2V4Message {
+                            source,
+                            envelope: Box::new(envelope),
+                        }
+                    }
+                    Err(error) => {
+                        metrics::counter!("n42_h2_v4_messages_rejected_total").increment(1);
+                        tracing::warn!(target: "n42::interop::h2v4", %source, %error, "rejected invalid H2-v4 message");
+                        return;
+                    }
+                }
+            }
             _ if self
                 .gov5_h2_topic_hash
                 .as_ref()
@@ -1705,6 +1756,7 @@ impl NetworkService {
         let reliable_data = matches!(
             &event,
             NetworkEvent::Gov5H2Message { .. }
+                | NetworkEvent::H2V4Message { .. }
                 | NetworkEvent::VerificationReceipt { .. }
                 | NetworkEvent::BlobSidecarReceived { .. }
                 | NetworkEvent::PeerConnected(_)

@@ -289,6 +289,10 @@ impl ObserverOrchestrator {
                 let kind = message.kind().as_str();
                 debug!(target: "n42::observer", %source, kind, "validated legacy gov5 H2 message");
             }
+            NetworkEvent::H2V4Message { source, envelope } => {
+                let kind = envelope.message.kind().as_str();
+                debug!(target: "n42::observer", %source, kind, changes_hash = %envelope.changes_hash, "validated H2-v4 message");
+            }
             NetworkEvent::BlobSidecarReceived { source: _, data } => {
                 self.handle_blob_sidecar(data);
             }

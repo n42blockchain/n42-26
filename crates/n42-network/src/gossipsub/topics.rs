@@ -20,6 +20,10 @@ pub fn gov5_h2_topic(genesis_hash: B256) -> IdentTopic {
     IdentTopic::new(format!("/n42/{fork_digest}/hotstuff_consensus/ssz_snappy"))
 }
 
+pub fn h2_v4_topic() -> IdentTopic {
+    IdentTopic::new("/n42/h2/4/ssz_snappy")
+}
+
 /// GossipSub topic for block announcements (header-first dissemination).
 ///
 /// Block headers are announced first; full bodies are fetched on-demand
@@ -76,6 +80,10 @@ mod tests {
         assert_eq!(
             gov5_h2_topic(B256::repeat_byte(0xab)).hash(),
             IdentTopic::new("/n42/abababab/hotstuff_consensus/ssz_snappy").hash()
+        );
+        assert_eq!(
+            h2_v4_topic().hash(),
+            IdentTopic::new("/n42/h2/4/ssz_snappy").hash()
         );
 
         // All five topics must be distinct.
