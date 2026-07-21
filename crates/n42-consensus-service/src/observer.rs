@@ -2,6 +2,7 @@ use crate::blob_port::BlobStorePort;
 use crate::el::ExecutionLayer;
 use crate::epoch_schedule::EpochSchedule;
 use crate::exec_cache::ExecutionOutputCache;
+use crate::h2_finality::verify_h2_v4_decide;
 use crate::orchestrator::bad_block_cache::BadBlockCache;
 use crate::orchestrator::{BlobSidecarBroadcast, BlockDataBroadcast, CommittedBlock};
 use alloy_primitives::B256;
@@ -292,6 +293,45 @@ impl ObserverOrchestrator {
             NetworkEvent::H2V4Message { source, envelope } => {
                 let kind = envelope.message.kind().as_str();
                 debug!(target: "n42::observer", %source, kind, changes_hash = %envelope.changes_hash, "validated H2-v4 message");
+                if let n42_network::h2_wire::H2Message::Decide(decide) = &envelope.message {
+                    let view_set = resolve_validator_set_for_view(
+                        decide.view,
+                        self.validator_set.as_ref(),
+                        self.initial_validators.as_deref(),
+                        self.initial_fault_tolerance,
+                        self.epoch_length,
+                        self.epoch_schedule.as_ref(),
+                    );
+                    match view_set.as_ref() {
+                        Some(view_set) => match verify_h2_v4_decide(&envelope, view_set) {
+                            Ok(proof) => {
+                                self.highest_seen_view = self.highest_seen_view.max(proof.view);
+                                self.highest_sync_target_view =
+                                    self.highest_sync_target_view.max(proof.view);
+                                info!(
+                                    target: "n42::observer",
+                                    %source,
+                                    view = proof.view,
+                                    block_hash = %proof.block_hash,
+                                    "verified gov5 H2-v4 finality proof"
+                                );
+                            }
+                            Err(error) => warn!(
+                                target: "n42::observer",
+                                %source,
+                                view = decide.view,
+                                %error,
+                                "rejected gov5 H2-v4 finality proof"
+                            ),
+                        },
+                        None => debug!(
+                            target: "n42::observer",
+                            %source,
+                            view = decide.view,
+                            "cannot verify H2-v4 finality proof without validator set"
+                        ),
+                    }
+                }
             }
             NetworkEvent::BlobSidecarReceived { source: _, data } => {
                 self.handle_blob_sidecar(data);

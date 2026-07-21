@@ -13,6 +13,7 @@ pub mod consensus_state;
 pub mod el;
 pub mod epoch_schedule;
 pub mod exec_cache;
+pub mod h2_finality;
 pub mod ingest;
 pub mod net_port;
 pub mod observer;

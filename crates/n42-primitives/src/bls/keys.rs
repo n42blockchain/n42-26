@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zeroize::Zeroize;
 
-use super::DST;
+use super::{DST, H2_V4_DST};
 
 #[derive(Debug, Error)]
 pub enum BlsError {
@@ -59,6 +59,11 @@ impl BlsSecretKey {
 
     pub fn sign(&self, message: &[u8]) -> BlsSignature {
         BlsSignature(self.0.sign(message, DST, &[]))
+    }
+
+    /// Signs an H2-v4 cross-client message using the ciphersuite deployed by gov5.
+    pub fn sign_h2_v4(&self, message: &[u8]) -> BlsSignature {
+        BlsSignature(self.0.sign(message, H2_V4_DST, &[]))
     }
 
     pub fn sign_hash(&self, hash: &B256) -> BlsSignature {
