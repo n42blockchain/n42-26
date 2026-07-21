@@ -18,6 +18,7 @@ fn run() -> Result<(), String> {
     let mut genesis_hash = None;
     let mut expected_block = None;
     let mut expected_block_hash = None;
+    let mut expected_root = None;
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
         let value = args
@@ -42,6 +43,9 @@ fn run() -> Result<(), String> {
             }
             "--expect-block-hash" => {
                 expected_block_hash = Some(parse_hash("--expect-block-hash", &value)?);
+            }
+            "--expect-root" => {
+                expected_root = Some(parse_hash("--expect-root", &value)?);
             }
             _ => return Err(format!("unknown argument {arg}")),
         }
@@ -69,6 +73,19 @@ fn run() -> Result<(), String> {
     {
         return Err("checkpoint block hash does not equal expected hash".to_owned());
     }
+    // Cross-client equality gate: without this the tool only proves the snapshot
+    // is self-consistent for the target chain, not that its root equals gov5's
+    // canonical replay root. `--expect-root <gov5-root>` makes the cross-check a
+    // machine-checkable assertion (CI-friendly) instead of an eyeball comparison.
+    if let Some(expected) = expected_root
+        && verified.root != expected
+    {
+        return Err(format!(
+            "QMDB root {} does not equal expected gov5 root {}",
+            hex::encode(verified.root),
+            hex::encode(expected)
+        ));
+    }
     println!(
         "verified chain_id={} block={} block_hash={} root={} slots={} live={} bytes={}",
         verified.chain_id,
@@ -91,5 +108,5 @@ fn parse_hash(name: &str, value: &str) -> Result<Hash, String> {
 }
 
 fn usage() -> String {
-    "usage: qmdb_portable_verify --input <file> --chain-id <id> --genesis <32-byte-hex> [--expect-block <n>] [--expect-block-hash <hex>]".to_owned()
+    "usage: qmdb_portable_verify --input <file> --chain-id <id> --genesis <32-byte-hex> [--expect-block <n>] [--expect-block-hash <hex>] [--expect-root <32-byte-hex>]".to_owned()
 }

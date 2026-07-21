@@ -151,9 +151,11 @@ pub fn verify_portable_stream<R: Read>(
 
     let nulls = null_level();
     let mut current_twig = (next_slot > 0).then(|| Twig::new(&nulls));
-    let twig_capacity = usize::try_from(next_slot.div_ceil(TWIG_SIZE as u64))
-        .map_err(|_| QmdbPortableError::Truncated)?;
-    let mut twig_roots = Vec::with_capacity(twig_capacity);
+    // Grow `twig_roots` on demand: `next_slot` is attacker-controlled header data
+    // (the `entry_count == next_slot` guard above is also attacker-controlled), so
+    // reserving `next_slot / TWIG_SIZE` up front would let a 1-byte lie force a
+    // multi-GB reservation before a single entry is validated. `push` amortizes.
+    let mut twig_roots: Vec<Hash> = Vec::new();
     let mut live_count = 0_u64;
     let mut value = Vec::new();
     for expected in 0..entry_count {
@@ -1081,6 +1083,105 @@ mod tests {
             QmdbPortableSnapshot::decode(&tampered),
             Err(QmdbPortableError::ContentHashMismatch)
         ));
+    }
+
+    /// Builds a positional portable snapshot from `n` sequential inserts so the
+    /// streaming verifier can be exercised against the same pinned root as the
+    /// in-memory path.
+    fn build_sequential_portable(chain_id: u64, genesis: Hash, n: u64) -> QmdbPortableSnapshot {
+        let mut tree = QmdbCompatTree::new();
+        for value in 0..n {
+            tree.set(interop_key(value), interop_value(value));
+        }
+        let snapshot = tree.snapshot();
+        QmdbPortableSnapshot {
+            chain_id,
+            genesis_hash: genesis,
+            block_number: 7,
+            block_hash: interop_key(0x99),
+            root: tree.root(),
+            slots: QmdbSlotSnapshot {
+                next_slot: snapshot.next_slot,
+                entries: snapshot
+                    .entries
+                    .iter()
+                    .enumerate()
+                    .map(|(slot, entry)| QmdbSlotEntry {
+                        slot: slot as u64,
+                        key: entry.key,
+                        value: entry.value.clone(),
+                        active: entry.active,
+                    })
+                    .collect(),
+            },
+        }
+    }
+
+    // HIGH-2 regression: the streaming full-replay verifier (`verify_portable_stream`,
+    // the path that actually runs the 87.8M-slot replay) was previously exercised
+    // only by the example binary. Pin it to the same root as the in-memory path.
+    #[test]
+    fn verify_portable_stream_matches_in_memory_root() {
+        let genesis = interop_key(0x11);
+        let portable = build_sequential_portable(1143, genesis, 2050);
+        let in_memory_root = portable
+            .verify_and_build(1143, &genesis)
+            .unwrap()
+            .root();
+        let encoded = portable.encode().unwrap();
+
+        let streamed = verify_portable_stream(encoded.as_slice(), 1143, &genesis).unwrap();
+        assert_eq!(streamed.root, portable.root, "streaming root must match snapshot claim");
+        assert_eq!(streamed.root, in_memory_root, "streaming path must agree with in-memory path");
+        assert_eq!(streamed.next_slot, 2050);
+        assert_eq!(streamed.live_count, 2050);
+
+        // Wrong chain identity is rejected before any root work.
+        assert!(matches!(
+            verify_portable_stream(encoded.as_slice(), 1, &genesis),
+            Err(QmdbPortableError::WrongChainId { expected: 1, got: 1143 })
+        ));
+    }
+
+    // MEDIUM-3 regression: a non-power-of-two twig count exercises the padding
+    // fold (`next_power_of_two`) that all prior fixtures (exactly 2 twigs) skipped.
+    // 5000 entries = 3 twigs (2048 + 2048 + 904). Streaming and in-memory folds
+    // must agree, so an accidental divergence in either fold is caught.
+    #[test]
+    fn verify_portable_stream_non_power_of_two_twig_count() {
+        let genesis = interop_key(0x11);
+        let portable = build_sequential_portable(1143, genesis, 5000);
+        let in_memory_root = portable
+            .verify_and_build(1143, &genesis)
+            .unwrap()
+            .root();
+        let encoded = portable.encode().unwrap();
+
+        let streamed = verify_portable_stream(encoded.as_slice(), 1143, &genesis).unwrap();
+        assert_eq!(streamed.root, in_memory_root, "3-twig fold must agree across paths");
+        assert_eq!(streamed.next_slot, 5000);
+    }
+
+    // HIGH-1 regression: an oversized `next_slot` header field must not drive a
+    // pre-authentication multi-GB allocation. With the `Vec::new()` fix the
+    // verifier reads on demand and fails fast on the truncated body instead of
+    // reserving `next_slot / TWIG_SIZE` hashes up front.
+    #[test]
+    fn oversized_next_slot_header_does_not_preallocate() {
+        let huge: u64 = 1 << 40; // ~5.4e8 twigs => ~17GB if reserved up front
+        let mut header = Vec::new();
+        header.extend_from_slice(PORTABLE_SNAPSHOT_MAGIC);
+        header.extend_from_slice(&1143u64.to_le_bytes()); // chain_id
+        header.extend_from_slice(&interop_key(0x11)); // genesis
+        header.extend_from_slice(&7u64.to_le_bytes()); // block_number
+        header.extend_from_slice(&interop_key(0x99)); // block_hash
+        header.extend_from_slice(&[0u8; 32]); // claimed_root
+        header.extend_from_slice(&huge.to_le_bytes()); // next_slot
+        header.extend_from_slice(&huge.to_le_bytes()); // entry_count == next_slot
+        // No entries / no valid digest: the stream must error on the first missing
+        // entry read, never having reserved for `huge` twigs.
+        let result = verify_portable_stream(header.as_slice(), 1143, &interop_key(0x11));
+        assert!(result.is_err(), "truncated oversized stream must fail, not OOM");
     }
 
     #[test]
