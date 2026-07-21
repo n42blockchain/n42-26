@@ -1286,8 +1286,6 @@ fn test_v2_full_packet_mixed_block() {
 //     anchored by the state_root, not the receipts_root replay path.
 // ═══════════════════════════════════════════════════════════════════════════════
 
-use n42_execution::read_log::ReadLogEntry;
-
 /// Honestly executes an ERC-20 transfer on the IDC side, applies `tamper` to the
 /// captured read log, then replays on the phone side and asserts the tampering is
 /// detected (replay error, or a receipts_root different from the honest one).
@@ -1390,16 +1388,14 @@ fn run_adversarial_erc20<F: FnOnce(&mut Vec<ReadLogEntry>)>(tamper: F) {
     let replay_db = StreamReplayDB::new_without_cache(encode_read_log(&read_log), bytecodes_map);
     let mut phone_executor = BasicBlockExecutor::new(evm_config, replay_db);
 
-    match phone_executor.execute_one(&block) {
-        Ok(phone_result) => {
-            let tampered_root = Receipt::calculate_receipt_root_no_memo(&phone_result.receipts);
-            assert_ne!(
-                tampered_root, honest_root,
-                "tampered read log must NOT reproduce the honest receipts_root"
-            );
-        }
-        // Replay desynced and the phone rejected the block — detection succeeded.
-        Err(_) => {}
+    // On the `Err` path the replay desynced and the phone rejected the block —
+    // detection succeeded, nothing to assert.
+    if let Ok(phone_result) = phone_executor.execute_one(&block) {
+        let tampered_root = Receipt::calculate_receipt_root_no_memo(&phone_result.receipts);
+        assert_ne!(
+            tampered_root, honest_root,
+            "tampered read log must NOT reproduce the honest receipts_root"
+        );
     }
 }
 
