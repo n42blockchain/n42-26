@@ -230,7 +230,7 @@ Both configurations are well within the **8-second slot target**.
 ### Prerequisites
 
 - Rust 1.97+ (development and CI are pinned to Rust 1.97.1)
-- N42 `reth` fork checked out at `../reth`
+- N42 `reth` 2.4.1 fork checked out at `../reth` (`c533db8bad6f`)
 - Android local builds: JDK 17 recommended for Gradle/Kotlin
 - SP1 toolchain v4.2.1 (optional, for ZK proof guest build): `curl -L https://sp1up.succinct.xyz | bash && sp1up --version v4.2.1`
 
@@ -239,6 +239,7 @@ Both configurations are well within the **8-second slot target**.
 ```bash
 git clone https://github.com/n42blockchain/reth.git ../reth
 git -C ../reth checkout chore/reth-upstream-20260719
+test "$(git -C ../reth rev-parse HEAD)" = "c533db8bad6f300be93ec047ecffc717b08957f8"
 ```
 
 ### Build
@@ -261,6 +262,7 @@ JAVA_HOME=$(/usr/libexec/java_home -v 17) \
 ```bash
 git -C ../reth fetch origin
 git -C ../reth checkout chore/reth-upstream-20260719
+git -C ../reth pull --ff-only
 ```
 
 ### Run

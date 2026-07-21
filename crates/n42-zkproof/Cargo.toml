@@ -23,6 +23,7 @@ thiserror.workspace = true
 # SP1 (optional, behind "sp1" feature flag)
 # default-features = false avoids pulling in the "network" feature which
 # depends on alloy 0.14.x and conflicts with the workspace's alloy 1.x.
+# SP1 v4 is the deployed proof format; upgrade prover and guest as one circuit migration.
 sp1-sdk = { version = "4.0", optional = true, default-features = false }
 
 [dev-dependencies]

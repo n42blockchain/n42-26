@@ -167,7 +167,7 @@ fn jsonrpc_request(id: u64, method: &str, params: Value) -> Value {
 /// API only requires the `iat` claim (within ±60s).
 fn bearer_header(jwt: &JwtSecret) -> Result<String, ElError> {
     use base64::Engine as _;
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     use sha2::Sha256;
 
     let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;

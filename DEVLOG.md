@@ -142,6 +142,7 @@ Logs are split into separate files by phase for easy maintenance:
 | [devlog-108-parallel-selfdestruct-shadow](docs/devlog-108-parallel-selfdestruct-shadow.md) | P1-6/跨客户端审计附带修复：Block-STM 显式传播 Destroyed/Recreated 整地址 storage wipe，修复 MVCC、输出合并与 deferred coinbase 回退 | Safety |
 | [devlog-109-gov5-p1-rework-closeout](docs/devlog-109-gov5-p1-rework-closeout.md) | gov5 2026H1 P1-1～P1-6 返工收尾：批量 BLS、Twig WAL/state floor、网络恢复、mobile/SELFDESTRUCT；补 CommitQC 预提交执行谱系 sync/2，Scenario 9/10 实弹全绿 | Verification |
 | [devlog-110-s5-cache-poison-hardening](docs/devlog-110-s5-cache-poison-hardening.md) | S5 CRITICAL 返工：拒绝 sender-declared hash mismatch 投毒坏块缓存，非 Valid 回收 compact output，并绑定 sidecar canonical hash 与 sync/2 帧预算 | Security |
+| [devlog-112-dependency-refresh-reth-2.4.1](docs/devlog-112-dependency-refresh-reth-2.4.1.md) | 2026-07-21 稳定依赖刷新：固定 N42 Reth 2.4.1 配对提交，升级可独立迁移的 Cargo 依赖，并保留 replay/共识/SP1 格式钉住项 | Maintenance |
 
 ### 上游借鉴与跟踪
 

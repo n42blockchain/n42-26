@@ -26,7 +26,7 @@
 use alloy_primitives::{Address, U256};
 use n42_execution::state_diff::{AccountChangeType, AccountDiff, StateDiff, ValueChange};
 use n42_jmt::{ShardedSbmt, account_key};
-use rand::Rng;
+use rand::RngExt;
 use std::collections::BTreeMap;
 use std::time::Instant;
 

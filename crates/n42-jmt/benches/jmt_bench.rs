@@ -1,8 +1,9 @@
 use alloy_primitives::{Address, U256};
-use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use n42_execution::state_diff::{AccountChangeType, AccountDiff, StateDiff, ValueChange};
 use n42_jmt::{N42JmtTree, PersistentJmt, Sbmt, ShardedJmt, ShardedSbmt, account_key};
 use std::collections::BTreeMap;
+use std::hint::black_box;
 
 /// Distinct 20-byte address for index `i` (avoids the 256-collision of
 /// `Address::with_last_byte`).

@@ -7,6 +7,8 @@ description = "N42 ZK proof guest program for SP1 zkVM"
 [dependencies]
 sp1-zkvm = "4.0"
 serde = { version = "1.0", default-features = false, features = ["derive"] }
+# Deployed SP1 guest input format; migrate with a new circuit version.
 bincode = "1.3"
 alloy-primitives = { version = "1.5", default-features = false, features = ["serde"] }
+# Pinned to the SP1 v4 guest dependency graph.
 sha2 = { version = "0.10", default-features = false }

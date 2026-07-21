@@ -173,7 +173,7 @@ impl FlatIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::Rng;
+    use rand::RngExt;
     use std::collections::HashMap;
 
     #[test]
