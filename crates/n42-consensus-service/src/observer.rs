@@ -2,7 +2,7 @@ use crate::blob_port::BlobStorePort;
 use crate::el::ExecutionLayer;
 use crate::epoch_schedule::EpochSchedule;
 use crate::exec_cache::ExecutionOutputCache;
-use crate::h2_finality::verify_h2_v4_decide;
+use crate::h2_finality::{verify_h2_v4_decide, verify_h2_v4_shadow_message};
 use crate::orchestrator::bad_block_cache::BadBlockCache;
 use crate::orchestrator::{BlobSidecarBroadcast, BlockDataBroadcast, CommittedBlock};
 use crate::replay_import::build_gov5_execution_data;
@@ -42,6 +42,33 @@ const MAX_SYNC_BATCH: u64 = 128;
 const MAX_GOV5_LIVE_PENDING: usize = 512;
 
 const GOV5_FETCH_RETRY_INTERVAL: Duration = Duration::from_secs(2);
+
+const H2_V4_SHADOW_KINDS: usize = 7;
+
+fn h2_v4_kind_index(kind: &str) -> usize {
+    match kind {
+        "proposal" => 0,
+        "vote" => 1,
+        "commit_vote" => 2,
+        "prepare_qc" => 3,
+        "timeout" => 4,
+        "new_view" => 5,
+        "decide" => 6,
+        _ => unreachable!("H2-v4 message kind is exhaustive"),
+    }
+}
+
+fn h2_v4_message_view(message: &n42_network::h2_wire::H2Message) -> u64 {
+    use n42_network::h2_wire::H2Message;
+    match message {
+        H2Message::Proposal(value) => value.view,
+        H2Message::Vote(value) | H2Message::CommitVote(value) => value.view,
+        H2Message::PrepareQc(value) => value.view,
+        H2Message::Timeout(value) => value.view,
+        H2Message::NewView(value) => value.view,
+        H2Message::Decide(value) => value.view,
+    }
+}
 
 #[derive(Clone)]
 struct PendingGov5LiveBlock {
@@ -193,6 +220,8 @@ pub struct ObserverOrchestrator {
     gov5_finality: HashMap<B256, u64>,
     gov5_finality_order: VecDeque<B256>,
     gov5_fetch_requested_at: HashMap<B256, Instant>,
+    h2_v4_shadow_verified: [u64; H2_V4_SHADOW_KINDS],
+    h2_v4_shadow_rejected: [u64; H2_V4_SHADOW_KINDS],
 
     // Progress
     blocks_imported: u64,
@@ -233,6 +262,8 @@ impl ObserverOrchestrator {
             gov5_finality: HashMap::new(),
             gov5_finality_order: VecDeque::new(),
             gov5_fetch_requested_at: HashMap::new(),
+            h2_v4_shadow_verified: [0; H2_V4_SHADOW_KINDS],
+            h2_v4_shadow_rejected: [0; H2_V4_SHADOW_KINDS],
             blocks_imported: 0,
             sync_start_time: Instant::now(),
         }
@@ -341,61 +372,83 @@ impl ObserverOrchestrator {
             }
             NetworkEvent::H2V4Message { source, envelope } => {
                 let kind = envelope.message.kind().as_str();
-                debug!(target: "n42::observer", %source, kind, changes_hash = %envelope.changes_hash, "validated H2-v4 message");
-                if let n42_network::h2_wire::H2Message::Decide(decide) = &envelope.message {
-                    let view_set = resolve_validator_set_for_view(
-                        decide.view,
-                        self.validator_set.as_ref(),
-                        self.initial_validators.as_deref(),
-                        self.initial_fault_tolerance,
-                        self.epoch_length,
-                        self.epoch_schedule.as_ref(),
-                    );
-                    match view_set.as_ref() {
-                        Some(view_set) => match verify_h2_v4_decide(&envelope, view_set) {
-                            Ok(proof) => {
-                                self.highest_seen_view = self.highest_seen_view.max(proof.view);
-                                self.highest_sync_target_view =
-                                    self.highest_sync_target_view.max(proof.view);
-                                if proof.view <= self.local_view {
-                                    debug!(
+                let view = h2_v4_message_view(&envelope.message);
+                let view_set = resolve_validator_set_for_view(
+                    view,
+                    self.validator_set.as_ref(),
+                    self.initial_validators.as_deref(),
+                    self.initial_fault_tolerance,
+                    self.epoch_length,
+                    self.epoch_schedule.as_ref(),
+                );
+                match view_set.as_ref() {
+                    Some(view_set) => match verify_h2_v4_shadow_message(&envelope, view_set) {
+                        Ok(proof) => {
+                            counter!("n42_h2_v4_shadow_verified_total", "kind" => kind)
+                                .increment(1);
+                            let kind_index = h2_v4_kind_index(kind);
+                            self.h2_v4_shadow_verified[kind_index] += 1;
+                            if self.h2_v4_shadow_verified[kind_index] == 1 {
+                                info!(target: "n42::observer", %source, kind, view = proof.view, "verified first H2-v4 shadow message of kind");
+                            }
+                            debug!(target: "n42::observer", %source, kind, view = proof.view, changes_hash = %envelope.changes_hash, "verified H2-v4 shadow message");
+                            if let n42_network::h2_wire::H2Message::Decide(decide) =
+                                &envelope.message
+                            {
+                                match verify_h2_v4_decide(&envelope, view_set) {
+                                    Ok(proof) => {
+                                        self.highest_seen_view =
+                                            self.highest_seen_view.max(proof.view);
+                                        self.highest_sync_target_view =
+                                            self.highest_sync_target_view.max(proof.view);
+                                        if proof.view <= self.local_view {
+                                            debug!(
+                                                target: "n42::observer",
+                                                %source,
+                                                view = proof.view,
+                                                local_view = self.local_view,
+                                                block_hash = %proof.block_hash,
+                                                "ignored already-observed gov5 H2-v4 finality proof"
+                                            );
+                                            return;
+                                        }
+                                        info!(
+                                            target: "n42::observer",
+                                            %source,
+                                            view = proof.view,
+                                            block_hash = %proof.block_hash,
+                                            "verified gov5 H2-v4 finality proof"
+                                        );
+                                        self.record_gov5_finality(proof.block_hash, proof.view);
+                                        if !self.gov5_live_blocks.contains_key(&proof.block_hash) {
+                                            self.request_gov5_block(source, proof.block_hash);
+                                        }
+                                        self.drive_gov5_live_import().await;
+                                    }
+                                    Err(error) => warn!(
                                         target: "n42::observer",
                                         %source,
-                                        view = proof.view,
-                                        local_view = self.local_view,
-                                        block_hash = %proof.block_hash,
-                                        "ignored already-observed gov5 H2-v4 finality proof"
-                                    );
-                                    return;
+                                        view = decide.view,
+                                        %error,
+                                        "rejected gov5 H2-v4 finality proof"
+                                    ),
                                 }
-                                info!(
-                                    target: "n42::observer",
-                                    %source,
-                                    view = proof.view,
-                                    block_hash = %proof.block_hash,
-                                    "verified gov5 H2-v4 finality proof"
-                                );
-                                self.record_gov5_finality(proof.block_hash, proof.view);
-                                if !self.gov5_live_blocks.contains_key(&proof.block_hash) {
-                                    self.request_gov5_block(source, proof.block_hash);
-                                }
-                                self.drive_gov5_live_import().await;
                             }
-                            Err(error) => warn!(
-                                target: "n42::observer",
-                                %source,
-                                view = decide.view,
-                                %error,
-                                "rejected gov5 H2-v4 finality proof"
-                            ),
-                        },
-                        None => debug!(
-                            target: "n42::observer",
-                            %source,
-                            view = decide.view,
-                            "cannot verify H2-v4 finality proof without validator set"
-                        ),
-                    }
+                        }
+                        Err(error) => {
+                            counter!("n42_h2_v4_shadow_rejected_total", "kind" => kind)
+                                .increment(1);
+                            self.h2_v4_shadow_rejected[h2_v4_kind_index(kind)] += 1;
+                            warn!(target: "n42::observer", %source, kind, view, %error, "rejected H2-v4 shadow message");
+                        }
+                    },
+                    None => debug!(
+                        target: "n42::observer",
+                        %source,
+                        kind,
+                        view,
+                        "cannot verify H2-v4 shadow message without validator set"
+                    ),
                 }
             }
             NetworkEvent::BlobSidecarReceived { source: _, data } => {
@@ -1121,6 +1174,8 @@ impl ObserverOrchestrator {
             blocks_per_sec = format!("{:.1}", blocks_per_sec),
             uptime_secs,
             stage,
+            h2_shadow_verified = ?self.h2_v4_shadow_verified,
+            h2_shadow_rejected = ?self.h2_v4_shadow_rejected,
             "status"
         );
     }

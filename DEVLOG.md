@@ -159,6 +159,7 @@ Logs are split into separate files by phase for easy maintenance:
 | [devlog-126-branch-safe-qmdb-state-root](docs/devlog-126-branch-safe-qmdb-state-root.md) | Reth 2.4.1 官方 StateRootStrategy 接入 branch-safe QMDB candidate store；认证 base、精确父分支重放和 observer-only 启动门禁 | Interop |
 | [devlog-127-gov5-replay-v2-execution-import](docs/devlog-127-gov5-replay-v2-execution-import.md) | Gov5 block 0 执行基线、Paris/TTD=0、归一化父链与 dirty/no-op QMDB 语义对齐；Rust 真执行 replay-v2 block 1–49/247 tx，head hash/root 完全一致 | Interop |
 | [devlog-128-gov5-finalized-live-following](docs/devlog-128-gov5-finalized-live-following.md) | Rust observer 从 replay-v2 block 49 接续 Gov5 七节点：原生 block push/hash fetch、严格 RLP/commitment 校验、H2-v4 Decide 门控，真机追至 block 60/view 13 | Interop |
+| [devlog-129-h2-v4-full-shadow-verification](docs/devlog-129-h2-v4-full-shadow-verification.md) | Rust observer 对 H2-v4 七类消息做 leader/member/bitmap/quorum/QC/TC/BLS 全量只读验签；临时七节点正常流量与真实 Timeout 通过，并定位远距离加入的 status-session catch-up 门槛 | Interop |
 
 ### 上游借鉴与跟踪
 
