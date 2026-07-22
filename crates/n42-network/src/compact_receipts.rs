@@ -1,6 +1,6 @@
 use alloy_consensus::{EthereumReceipt, TxType};
-use alloy_primitives::{Address, B256, Bytes, Log, keccak256};
-use alloy_rlp::{Encodable, Header};
+use alloy_primitives::{Address, B256, Bytes, Log};
+pub use n42_consensus::gov5_native_receipts_root;
 
 pub const MAX_RECEIPTS_PER_BLOCK: usize = 250_000;
 const MAX_LOGS_PER_BLOCK: usize = 1_000_000;
@@ -86,28 +86,6 @@ pub fn decode_compact_receipts(bytes: &[u8]) -> Result<Vec<EthereumReceipt>, Com
         });
     }
     Ok(receipts)
-}
-
-/// Reproduces gov5 native `hash.DeriveSha(block.Receipts)` exactly. This is
-/// intentionally not the Ethereum receipt trie: replay-v2 hashes the
-/// concatenation of RLP `[status, cumulativeGasUsed, logs]` receipts, and the
-/// empty list is `keccak256("")`.
-pub fn gov5_native_receipts_root(receipts: &[EthereumReceipt]) -> B256 {
-    let mut encoded = Vec::new();
-    for receipt in receipts {
-        let status = u64::from(receipt.success);
-        let payload_length =
-            status.length() + receipt.cumulative_gas_used.length() + receipt.logs.length();
-        Header {
-            list: true,
-            payload_length,
-        }
-        .encode(&mut encoded);
-        status.encode(&mut encoded);
-        receipt.cumulative_gas_used.encode(&mut encoded);
-        receipt.logs.encode(&mut encoded);
-    }
-    keccak256(encoded)
 }
 
 struct Cursor<'a> {

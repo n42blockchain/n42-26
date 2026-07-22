@@ -6701,6 +6701,7 @@ version = "0.5.0"
 dependencies = [
  "alloy-consensus",
  "alloy-primitives",
+ "alloy-rlp",
  "arc-swap",
  "bincode",
  "bitvec",
@@ -7010,6 +7011,7 @@ dependencies = [
  "n42-network",
  "n42-parallel-evm",
  "n42-primitives",
+ "n42-twig-core",
  "n42-zkproof",
  "reth-basic-payload-builder",
  "reth-chain-state",

@@ -15,7 +15,7 @@
 ## 实现
 
 - 增加显式 `Gov5H2` header profile，覆盖真实历史中的三项非标准哈希语义：空 ommers
-  承诺为全零、difficulty 固定为 1，以及超过 Ethereum 32-byte 限制的 `N42H` H2
+  承诺为全零、当前 difficulty 0（兼容既有 replay-v2 历史的 1），以及超过 Ethereum 32-byte 限制的 `N42H` H2
   extra-data。
 - `N42H` 只接受 `magic + little-endian view` 的最小结构，最大 4096 bytes；错误 magic、
   过短、超长、非零 ommers 或非 1 difficulty 均 fail closed。QC/commit seal 的密码学验证

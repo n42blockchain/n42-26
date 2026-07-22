@@ -13,7 +13,7 @@ const MAX_ENVELOPE_PAYLOAD: usize = 8 * 1024;
 const MAX_SIGNATURE: usize = 256;
 const MAX_BITMAP: usize = 1024;
 const MAX_QC: usize = 2 * 1024;
-const MAX_TC: usize = 4 * 1024;
+const MAX_HIGH_TC: usize = 4 * 1024;
 const MAX_VALIDATORS: usize = 4096;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -340,7 +340,7 @@ fn decode_vote_payload(data: &[u8]) -> Result<H2Vote, H2WireError> {
     let high_tc = if offset == data.len() {
         None
     } else {
-        decode_optional_tc(read_bytes_at(data, &mut offset, MAX_TC)?)?
+        decode_optional_tc(read_bytes_at(data, &mut offset, MAX_HIGH_TC)?)?
     };
     finish(data, offset)?;
     Ok(H2Vote {
@@ -353,13 +353,17 @@ fn decode_vote_payload(data: &[u8]) -> Result<H2Vote, H2WireError> {
 }
 
 fn encode_vote_payload(value: &H2Vote) -> Result<Vec<u8>, H2WireError> {
-    let high_tc = value.high_tc.as_ref().map(encode_tc).transpose()?;
+    let high_tc = value.high_tc.as_ref().map(encode_high_tc).transpose()?;
     let mut out = Vec::new();
     out.extend_from_slice(&value.view.to_le_bytes());
     put_limited_bytes(&mut out, value.block_hash.as_slice(), 32)?;
     out.extend_from_slice(&value.voter.to_le_bytes());
     put_signature(&mut out, &value.signature)?;
-    put_limited_bytes(&mut out, high_tc.as_deref().unwrap_or_default(), MAX_TC)?;
+    put_limited_bytes(
+        &mut out,
+        high_tc.as_deref().unwrap_or_default(),
+        MAX_HIGH_TC,
+    )?;
     Ok(out)
 }
 
@@ -392,7 +396,7 @@ fn decode_timeout(data: &[u8]) -> Result<H2Timeout, H2WireError> {
     let high_tc = if offset == data.len() {
         None
     } else {
-        decode_optional_tc(read_bytes_at(data, &mut offset, MAX_TC)?)?
+        decode_optional_tc(read_bytes_at(data, &mut offset, MAX_HIGH_TC)?)?
     };
     finish(data, offset)?;
     Ok(H2Timeout {
@@ -406,13 +410,17 @@ fn decode_timeout(data: &[u8]) -> Result<H2Timeout, H2WireError> {
 
 fn encode_timeout(value: &H2Timeout) -> Result<Vec<u8>, H2WireError> {
     let high_qc = encode_qc(&value.high_qc)?;
-    let high_tc = value.high_tc.as_ref().map(encode_tc).transpose()?;
+    let high_tc = value.high_tc.as_ref().map(encode_high_tc).transpose()?;
     let mut out = Vec::new();
     out.extend_from_slice(&value.view.to_le_bytes());
     put_limited_bytes(&mut out, &high_qc, MAX_QC)?;
     out.extend_from_slice(&value.sender.to_le_bytes());
     put_signature(&mut out, &value.signature)?;
-    put_limited_bytes(&mut out, high_tc.as_deref().unwrap_or_default(), MAX_TC)?;
+    put_limited_bytes(
+        &mut out,
+        high_tc.as_deref().unwrap_or_default(),
+        MAX_HIGH_TC,
+    )?;
     Ok(out)
 }
 
@@ -420,7 +428,7 @@ fn decode_new_view(data: &[u8]) -> Result<H2NewView, H2WireError> {
     let mut offset = 0;
     let value = H2NewView {
         view: read_u64(data, &mut offset)?,
-        timeout_certificate: decode_tc(read_bytes_at(data, &mut offset, MAX_TC)?)?,
+        timeout_certificate: decode_tc(read_bytes_at(data, &mut offset, MAX_HIGH_TC)?)?,
         leader: read_u32(data, &mut offset)?,
         signature: read_signature(data, &mut offset)?,
     };
@@ -429,10 +437,10 @@ fn decode_new_view(data: &[u8]) -> Result<H2NewView, H2WireError> {
 }
 
 fn encode_new_view(value: &H2NewView) -> Result<Vec<u8>, H2WireError> {
-    let tc = encode_tc(&value.timeout_certificate)?;
+    let tc = encode_high_tc(&value.timeout_certificate)?;
     let mut out = Vec::new();
     out.extend_from_slice(&value.view.to_le_bytes());
-    put_limited_bytes(&mut out, &tc, MAX_TC)?;
+    put_limited_bytes(&mut out, &tc, MAX_HIGH_TC)?;
     out.extend_from_slice(&value.leader.to_le_bytes());
     put_signature(&mut out, &value.signature)?;
     Ok(out)
@@ -517,6 +525,20 @@ fn encode_tc(value: &H2TimeoutCertificate) -> Result<Vec<u8>, H2WireError> {
     put_limited_bytes(&mut out, &value.signers_bitmap, MAX_BITMAP)?;
     put_limited_bytes(&mut out, &high_qc, MAX_QC)?;
     Ok(out)
+}
+
+/// Encode a HighTC only when its complete nested representation fits the same schema bound used
+/// by decoding. Keeping this check at the object boundary prevents public encoders from emitting
+/// a message that compliant peers (and our own decoder) must reject.
+fn encode_high_tc(value: &H2TimeoutCertificate) -> Result<Vec<u8>, H2WireError> {
+    let encoded = encode_tc(value)?;
+    if encoded.len() > MAX_HIGH_TC {
+        return Err(H2WireError::FieldTooLarge {
+            actual: encoded.len(),
+            max: MAX_HIGH_TC,
+        });
+    }
+    Ok(encoded)
 }
 
 fn validate_bitmap(bitmap: &[u8]) -> Result<(), H2WireError> {
@@ -753,6 +775,27 @@ mod tests {
     }
 
     #[test]
+    fn vote_encoder_rejects_oversized_high_tc_before_emitting_wire_bytes() {
+        let fixture = fixture();
+        let gossip = hex::decode(fixture.vote_gossip_hex).expect("fixture hex");
+        let mut vote = match decode_gov5_gossip_message(&gossip).unwrap() {
+            H2Message::Vote(vote) => vote,
+            _ => unreachable!("fixture is a vote"),
+        };
+        vote.high_tc
+            .as_mut()
+            .expect("fixture carries HighTC")
+            .aggregate_signature = vec![0; MAX_SIGNATURE + 1];
+        assert_eq!(
+            encode_vote(&vote),
+            Err(H2WireError::FieldTooLarge {
+                actual: MAX_SIGNATURE + 1,
+                max: MAX_SIGNATURE,
+            })
+        );
+    }
+
+    #[test]
     fn rejects_non_canonical_or_oversized_messages() {
         assert_eq!(decode_envelope(&[]), Err(H2WireError::Truncated));
         assert_eq!(
@@ -779,10 +822,10 @@ mod tests {
         );
         let mut encoded_field = Vec::new();
         assert_eq!(
-            put_limited_bytes(&mut encoded_field, &vec![0; MAX_TC + 1], MAX_TC),
+            put_limited_bytes(&mut encoded_field, &vec![0; MAX_HIGH_TC + 1], MAX_HIGH_TC,),
             Err(H2WireError::FieldTooLarge {
-                actual: MAX_TC + 1,
-                max: MAX_TC,
+                actual: MAX_HIGH_TC + 1,
+                max: MAX_HIGH_TC,
             })
         );
     }

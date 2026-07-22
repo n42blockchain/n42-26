@@ -204,7 +204,7 @@ mod tests {
         validate_v1_payload_inputs(7, &header, N42HeaderProfile::Gov5H2).unwrap();
 
         let wrong_difficulty = Header {
-            difficulty: alloy_primitives::U256::ZERO,
+            difficulty: alloy_primitives::U256::from(2),
             ..header
         };
         assert!(matches!(

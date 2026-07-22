@@ -66,18 +66,28 @@ where
 
         let mut block = standard.into_block();
         block.header.ommers_hash = B256::ZERO;
-        block.header.difficulty = U256::from(1);
         block.header.extra_data = original_extra;
-        validate_gov5_h2_header(&block.header).map_err(NewPayloadError::other)?;
-        let sealed = block.seal_slow();
-        if sealed.hash() != expected_hash {
-            return Err(PayloadError::BlockHash {
-                execution: sealed.hash(),
-                consensus: expected_hash,
-            }
-            .into());
+        // Current gov5 uses difficulty 0. Preserved replay-v2 ranges were produced while H2 used
+        // difficulty 1. Engine payloads omit the field, so reconstruct both permitted values and
+        // let the hash-authenticated block identity select exactly one without operator guessing.
+        let mut current = block.clone();
+        current.header.difficulty = U256::ZERO;
+        validate_gov5_h2_header(&current.header).map_err(NewPayloadError::other)?;
+        let current = current.seal_slow();
+        if current.hash() == expected_hash {
+            return Ok(current);
         }
-        Ok(sealed)
+        block.header.difficulty = U256::from(1);
+        validate_gov5_h2_header(&block.header).map_err(NewPayloadError::other)?;
+        let legacy = block.seal_slow();
+        if legacy.hash() == expected_hash {
+            return Ok(legacy);
+        }
+        Err(PayloadError::BlockHash {
+            execution: current.hash(),
+            consensus: expected_hash,
+        }
+        .into())
     }
 }
 
@@ -150,12 +160,12 @@ mod tests {
     use reth_chainspec::ChainSpec;
     use reth_ethereum_engine_primitives::EthEngineTypes;
 
-    fn zero_ommers_payload() -> ExecutionData {
+    fn zero_ommers_payload_with_difficulty(difficulty: U256) -> ExecutionData {
         let extra_data = [b"N42H".as_slice(), &[0_u8; 8], &[0_u8; 96]].concat();
         let block = ConsensusBlock {
             header: Header {
                 ommers_hash: B256::ZERO,
-                difficulty: U256::from(1),
+                difficulty,
                 base_fee_per_gas: Some(0),
                 extra_data: extra_data.into(),
                 ..Default::default()
@@ -163,6 +173,10 @@ mod tests {
             body: BlockBody::<TransactionSigned>::default(),
         };
         ExecutionData::from_block_unchecked(block.header.hash_slow(), &block)
+    }
+
+    fn zero_ommers_payload() -> ExecutionData {
+        zero_ommers_payload_with_difficulty(U256::ZERO)
     }
 
     #[test]
@@ -179,6 +193,20 @@ mod tests {
 
         assert_eq!(sealed.hash(), expected);
         assert_eq!(sealed.header().ommers_hash, B256::ZERO);
+        assert_eq!(sealed.header().difficulty, U256::ZERO);
+    }
+
+    #[test]
+    fn gov5_profile_preserves_legacy_difficulty_one_history() {
+        let validator =
+            N42EngineValidator::new(Arc::new(ChainSpec::default()), N42HeaderProfile::Gov5H2);
+        let payload = zero_ommers_payload_with_difficulty(U256::from(1));
+        let sealed = <N42EngineValidator<ChainSpec> as PayloadValidator<EthEngineTypes>>::convert_payload_to_block(
+            &validator,
+            payload,
+        )
+        .unwrap();
+        assert_eq!(sealed.header().difficulty, U256::from(1));
     }
 
     #[test]
