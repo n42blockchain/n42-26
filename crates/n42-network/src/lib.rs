@@ -23,7 +23,8 @@ pub use compact_receipts::{
 pub use error::NetworkError;
 pub use finalized_range::{
     FinalizedRangeError, FinalizedRangeVerification, MAX_FINALIZED_RANGE_BLOCKS,
-    verify_finalized_range_stream,
+    MAX_MATERIALIZED_FINALIZED_RANGE_BYTES, VerifiedFinalizedRange, VerifiedFinalizedRangeEntry,
+    decode_finalized_range_stream, verify_finalized_range_stream,
 };
 pub use mobile::{
     MSG_TYPE_CACHE_SYNC, MSG_TYPE_CACHE_SYNC_ZSTD, ShardedStarHub, ShardedStarHubConfig,

@@ -116,3 +116,9 @@ checkpoint 完全一致。compact receipts 已按 gov5 native codec 解码，并
 绑定、逐块重算 native receipt root；runtime-02 的 49 块/247 tx 已通过。当前仍是只读
 import boundary；安全的两阶段执行导入和网络 request/response 完成前不会推进本地
 Reth head，也不会开放 validator 投票。
+
+两阶段导入的第一阶段现已实现：`decode_finalized_range_stream` 只有在整帧摘要、完整扩展
+header、block lineage、Ethereum transaction trie root、compact receipts 与 native receipt
+root 全部通过后，才返回带 256 MiB 总物化上限的 typed entries。任何 execution/archive
+副作用必须只消费该返回值；QMDB execution commitment 尚未接入 Reth 前仍禁止提交 Engine
+API 或借助 state-root bypass 推进 head。
