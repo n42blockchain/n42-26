@@ -6,15 +6,15 @@ mod keystore;
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-use alloy_primitives::{Address, U256, keccak256};
+use alloy_primitives::{Address, B256, U256, keccak256};
 use clap::Parser;
 use n42_chainspec::{ConsensusConfig, ValidatorInfo};
 use n42_consensus::{ConsensusEngine, EpochManager, ValidatorSet, ValidatorSetResolver};
 use n42_jmt::{EMPTY_CODE_HASH, PersistentSbmt, PersistentTwig};
 use n42_network::NetworkService;
 use n42_network::{
-    ShardedStarHub, ShardedStarHubConfig, TransportConfig, build_swarm_with_validator_index,
-    deterministic_validator_keypair,
+    ShardedStarHub, ShardedStarHubConfig, TransportConfig, build_interop_observer_swarm,
+    build_swarm_with_validator_index, deterministic_validator_keypair,
 };
 use n42_node::attestation_store::AttestationStore;
 use n42_node::consensus_state::configured_min_mobile_verifiers;
@@ -51,6 +51,19 @@ fn env_bool(name: &str) -> bool {
 
 fn env_parse<T: std::str::FromStr>(name: &str) -> Option<T> {
     std::env::var(name).ok().and_then(|s| s.parse().ok())
+}
+
+fn resolve_observer_genesis_hash(
+    local_genesis_hash: B256,
+    configured_hash: Option<&str>,
+) -> eyre::Result<B256> {
+    let Some(configured_hash) = configured_hash else {
+        return Ok(local_genesis_hash);
+    };
+
+    configured_hash.parse::<B256>().map_err(|error| {
+        eyre::eyre!("N42_INTEROP_GENESIS_HASH must be a 32-byte 0x-prefixed hash: {error}")
+    })
 }
 
 fn override_timeout_from_env(name: &str, target: &mut u64) {
@@ -473,9 +486,10 @@ fn main() {
         let data_dir: PathBuf = std::env::var("N42_DATA_DIR")
             .unwrap_or_else(|_| "./n42-data".to_string())
             .into();
+        let observer_mode = env_bool("N42_OBSERVER_MODE");
         let allow_deterministic_validator_peers =
             !consensus_config_from_file || env_bool("N42_ALLOW_DETERMINISTIC_P2P");
-        if consensus_config_from_file && allow_deterministic_validator_peers {
+        if !observer_mode && consensus_config_from_file && allow_deterministic_validator_peers {
             warn!(
                 target: "n42::cli",
                 "N42_ALLOW_DETERMINISTIC_P2P=1 enables weak, publicly derivable validator PeerIds; this is not suitable for production"
@@ -484,7 +498,7 @@ fn main() {
         let epoch_schedule_path = data_dir.join("epoch_schedule.json");
         let epoch_schedule = match EpochSchedule::load(&epoch_schedule_path) {
             Ok(Some(schedule)) => {
-                if let Err(error) =
+                if !observer_mode && let Err(error) =
                     schedule.validate_peer_binding_policy(allow_deterministic_validator_peers)
                 {
                     eprintln!(
@@ -557,11 +571,18 @@ fn main() {
         let startup_validator_infos = startup_validator_set.validator_infos();
         let configured_validator_peer_ids =
             configured_validator_peer_ids(&startup_validator_infos)?;
-        let expected_validator_peer_ids = expected_validator_peer_ids_with_policy(
-            &startup_validator_infos,
-            allow_deterministic_validator_peers,
-        )?;
-        if startup_validator_set.len() > 1 && configured_validator_peer_ids.is_empty() {
+        let expected_validator_peer_ids = if observer_mode {
+            Default::default()
+        } else {
+            expected_validator_peer_ids_with_policy(
+                &startup_validator_infos,
+                allow_deterministic_validator_peers,
+            )?
+        };
+        if !observer_mode
+            && startup_validator_set.len() > 1
+            && configured_validator_peer_ids.is_empty()
+        {
             warn!(
                 target: "n42::cli",
                 validator_count = startup_validator_set.len(),
@@ -977,8 +998,28 @@ fn main() {
                 );
 
                 // ── Observer mode ──────────────────────────────────────
-                if env_bool("N42_OBSERVER_MODE") {
+                if observer_mode {
                     info!(target: "n42::cli", "Starting in OBSERVER mode (no consensus participation)");
+
+                    // gov5's QMDB-backed genesis state root can differ from the
+                    // local Reth/MPT block-0 root even when both clients load
+                    // the same custom-chain JSON. Keep the EL genesis local,
+                    // but allow the read-only observer's authenticated H2
+                    // domain and fork-digest topic to use gov5's chain identity.
+                    let configured_interop_genesis_hash =
+                        std::env::var("N42_INTEROP_GENESIS_HASH").ok();
+                    let interop_genesis_hash = resolve_observer_genesis_hash(
+                        genesis_hash,
+                        configured_interop_genesis_hash.as_deref(),
+                    )?;
+                    if interop_genesis_hash != genesis_hash {
+                        info!(
+                            target: "n42::cli",
+                            local_execution_genesis_hash = %genesis_hash,
+                            gov5_interop_genesis_hash = %interop_genesis_hash,
+                            "using explicit gov5 chain identity for observer topics and H2 domains"
+                        );
+                    }
 
                     let keypair = libp2p::identity::Keypair::generate_ed25519();
                     let local_peer_id = keypair.public().to_peer_id();
@@ -989,14 +1030,14 @@ fn main() {
                     transport_config.enable_mdns = env_bool("N42_ENABLE_MDNS");
                     transport_config.enable_kademlia = env_bool("N42_ENABLE_DHT");
 
-                    let swarm = build_swarm_with_validator_index(keypair, transport_config, None)
+                    let swarm = build_interop_observer_swarm(keypair, transport_config)
                         .map_err(|e| eyre::eyre!("failed to build observer libp2p swarm: {e}"))?;
 
                     let (mut net_service, net_handle, _consensus_event_rx, net_event_rx) =
                         NetworkService::new_gov5_h2_observer(
                             swarm,
                             full_node.provider.chain_spec().chain().id(),
-                            genesis_hash,
+                            interop_genesis_hash,
                         )
                             .map_err(|e| eyre::eyre!("failed to create observer network service: {e}"))?;
 
@@ -1669,5 +1710,33 @@ fn main() {
     }) {
         eprintln!("Error: {err:?}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod observer_identity_tests {
+    use super::*;
+
+    #[test]
+    fn observer_genesis_hash_defaults_to_local_execution_genesis() {
+        let local = B256::repeat_byte(0x11);
+        assert_eq!(resolve_observer_genesis_hash(local, None).unwrap(), local);
+    }
+
+    #[test]
+    fn observer_genesis_hash_accepts_explicit_gov5_identity() {
+        let configured = B256::repeat_byte(0x22);
+        let encoded = format!("{configured:#x}");
+
+        assert_eq!(
+            resolve_observer_genesis_hash(B256::ZERO, Some(&encoded)).unwrap(),
+            configured
+        );
+    }
+
+    #[test]
+    fn observer_genesis_hash_rejects_malformed_identity() {
+        let error = resolve_observer_genesis_hash(B256::ZERO, Some("0x1234")).unwrap_err();
+        assert!(error.to_string().contains("N42_INTEROP_GENESIS_HASH"));
     }
 }

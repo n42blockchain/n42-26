@@ -25,8 +25,9 @@ pub use state_sync::{
     SyncBlock, SyncPayload,
 };
 pub use transport::{
-    N42Behaviour, TransportConfig, build_swarm, build_swarm_with_validator_index,
-    deterministic_validator_keypair, deterministic_validator_peer_id,
+    N42Behaviour, TransportConfig, build_interop_observer_swarm, build_swarm,
+    build_swarm_with_validator_index, deterministic_validator_keypair,
+    deterministic_validator_peer_id,
 };
 
 // Re-export libp2p types used by consumers.

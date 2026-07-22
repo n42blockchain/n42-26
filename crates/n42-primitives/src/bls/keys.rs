@@ -177,7 +177,24 @@ impl Serialize for BlsPublicKey {
 
 impl<'de> Deserialize<'de> for BlsPublicKey {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let bytes: Vec<u8> = Deserialize::deserialize(deserializer)?;
+        let bytes = if deserializer.is_human_readable() {
+            #[derive(Deserialize)]
+            #[serde(untagged)]
+            enum PublicKeyBytes {
+                Bytes(Vec<u8>),
+                Hex(String),
+            }
+
+            match PublicKeyBytes::deserialize(deserializer)? {
+                PublicKeyBytes::Bytes(bytes) => bytes,
+                PublicKeyBytes::Hex(value) => {
+                    let encoded = value.strip_prefix("0x").unwrap_or(&value);
+                    hex::decode(encoded).map_err(serde::de::Error::custom)?
+                }
+            }
+        } else {
+            Vec::<u8>::deserialize(deserializer)?
+        };
         if bytes.len() != 48 {
             return Err(serde::de::Error::custom(
                 "expected 48 bytes for BLS public key",
@@ -186,6 +203,33 @@ impl<'de> Deserialize<'de> for BlsPublicKey {
         let mut arr = [0u8; 48];
         arr.copy_from_slice(&bytes);
         Self::from_bytes(&arr).map_err(serde::de::Error::custom)
+    }
+}
+
+#[cfg(test)]
+mod public_key_serde_tests {
+    use super::*;
+
+    #[test]
+    fn deserializes_gov5_hex_public_key() {
+        let secret = BlsSecretKey::from_bytes(&[7; 32]).unwrap();
+        let expected = secret.public_key();
+        let json = format!("\"0x{}\"", hex::encode(expected.to_bytes()));
+
+        let decoded: BlsPublicKey = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn preserves_byte_array_deserialization() {
+        let secret = BlsSecretKey::from_bytes(&[9; 32]).unwrap();
+        let expected = secret.public_key();
+        let json = serde_json::to_string(&expected.to_bytes().to_vec()).unwrap();
+
+        let decoded: BlsPublicKey = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(decoded, expected);
     }
 }
 

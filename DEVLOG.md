@@ -148,6 +148,7 @@ Logs are split into separate files by phase for easy maintenance:
 | [devlog-115-h2-v4-envelope-observer](docs/devlog-115-h2-v4-envelope-observer.md) | H2-v4 chain-bound envelope、Go Snappy vector 与 Rust `/n42/h2/4/ssz_snappy` 只读 observer | Interop |
 | [devlog-116-h2-v4-finality-verifier](docs/devlog-116-h2-v4-finality-verifier.md) | gov5→Rust 固定 BLS CommitQC 对拍、POP/NUL ciphersuite 隔离、只读 observer finality 证明门禁 | Interop |
 | [devlog-117-h2-v4-production-profile](docs/devlog-117-h2-v4-production-profile.md) | gov5 H2-v4 静态验证者生产 profile、全路径签名域、Decide 双发与 Rust 只读最终性同步目标；默认关闭并保护旧 7 节点/QMDB/archive+ 数据 | Interop |
+| [devlog-118-gov5-live-interop-observer](docs/devlog-118-gov5-live-interop-observer.md) | gov5 7 节点与 Rust observer 真机 TCP/Noise/Yamux 握手、H2-v4 Decide 接收及 BLS CommitQC 验证 | Interop |
 
 ### 上游借鉴与跟踪
 

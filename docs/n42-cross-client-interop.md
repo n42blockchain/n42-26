@@ -1,6 +1,6 @@
 # N42 原生链跨语言节点互通路线（QMDB + HotStuff-2）
 
-> 状态：QMDB Phase 0/1 已完成并通过现有 full replay；H2 legacy wire Phase 0 与只读 observer 已完成，H2-v4 共同签名域仍待实现。本文定义 gov5（Go）与 n42-26（Rust）成为同一条 N42 原生链中独立客户端的边界、迁移顺序和验收条件。replay-v2 的 QMDB 历史和 HotStuff-2（H2）共识是第一优先级；eth-el archive+ 互通在此路线稳定后再单独推进。
+> 状态：QMDB Phase 0/1 已完成并通过现有 full replay；H2-v4 wire、共同签名域、静态验证者生产 profile 与 gov5→Rust 真机 finality observer 已完成。本文定义 gov5（Go）与 n42-26（Rust）成为同一条 N42 原生链中独立客户端的边界、迁移顺序和验收条件。replay-v2 的 QMDB 历史和 HotStuff-2（H2）共识是第一优先级；eth-el archive+ 互通在此路线稳定后再单独推进。
 
 ## 目标
 
@@ -77,7 +77,7 @@ H2-v4 签名域现已由共享 vectors 固定为
 `N42H2V4 || phase || chain_id || genesis_hash || view`，并按消息阶段追加 block hash 与 validator-change hash。旧引擎尚未切换；必须等 v4 envelope/topic 与双向验证完成后通过显式链配置启用。
 
 H2-v4 envelope 与 Go 生成的 Snappy frame 也已互认；Rust observer 会同时订阅
-`/n42/h2/4/ssz_snappy` 并按本地 chain id/genesis 严格过滤。当前仍只产生观察事件，不转换为 Rust 原生投票事件。
+`/n42/h2/4/ssz_snappy` 并按显式 chain id/genesis 严格过滤。2026-07-21 的独立七节点真机运行中，Rust 经 TCP/Noise/Yamux 接入 gov5，在 view 476 成功验证真实 Decide 的 BLS CommitQC。当前仍只产生观察事件，不转换为 Rust 原生投票事件；详见 devlog-118。
 
 ### Phase 3 — replay-v2 等价性与 catch-up
 
@@ -101,4 +101,4 @@ H2-v4 envelope 与 Go 生成的 Snappy frame 也已互认；Rust observer 会同
 
 ## 下一项实现
 
-QMDB 已完成 deterministic vectors、portable exporter、Rust importer，以及既有 87,786,434-slot full replay 的同 root 验收。H2 全部 7 类 legacy 消息、签名 preimage、QC/TC bitmap、Go Snappy frame 与 Rust 只读 observer 也已通过双端 vectors。下一项是设计并实现双方共同的 H2-v4 commit 签名域和 versioned topic，再做 1,000-block finalized bundle replay；在此之前仍禁止混合 validator 投票。
+QMDB 已完成 deterministic vectors、portable exporter、Rust importer，以及既有 87,786,434-slot full replay 的同 root 验收。H2 全部 7 类 legacy 消息、H2-v4 签名域/envelope、QC/TC bitmap、Go Snappy frame、生产 profile 与 Rust 真机只读 finality observer 均已通过。下一项是实现 finalized-range/replay-v2 transport 并完成 1,000-block finalized bundle + QMDB checkpoint replay；在此之前仍禁止混合 validator 投票。

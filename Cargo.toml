@@ -141,7 +141,7 @@ tracing = "0.1"
 metrics = "0.24"
 
 # Networking
-libp2p = { version = "0.56", features = ["gossipsub", "tokio", "quic", "identify", "macros", "request-response", "mdns", "kad"] }
+libp2p = { version = "0.56", features = ["gossipsub", "tokio", "quic", "tcp", "noise", "yamux", "identify", "macros", "request-response", "mdns", "kad"] }
 quinn = "0.11"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rcgen = "0.14.7"
