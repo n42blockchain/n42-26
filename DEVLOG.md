@@ -162,6 +162,7 @@ Logs are split into separate files by phase for easy maintenance:
 | [devlog-129-h2-v4-full-shadow-verification](docs/devlog-129-h2-v4-full-shadow-verification.md) | Rust observer 对 H2-v4 七类消息做 leader/member/bitmap/quorum/QC/TC/BLS 全量只读验签；临时七节点正常流量与真实 Timeout 通过，并定位远距离加入的 status-session catch-up 门槛 | Interop |
 | [devlog-130-gov5-status-session](docs/devlog-130-gov5-status-session.md) | Rust observer 实现 Gov5 Status SSZ+Snappy framed 双向握手，跨语言夹具与真机会话越过 10 秒断连门限；隔离出 >512 块远距 checkpoint/range 接续门槛 | Interop |
 | [devlog-131-gov5-finalized-far-catchup](docs/devlog-131-gov5-finalized-far-catchup.md) | Rust observer 从 replay-v2 block 49 完成 2,883 块单次认证追赶并与七节点在 block 3,194/hash/state root 一致；512 body 硬上限下支持远距谱系发现、正序执行与稳态跟随 | Interop |
+| [devlog-132-view-bound-validator-authority](docs/devlog-132-view-bound-validator-authority.md) | QC/CommitQC 与 sync 按 certificate view 精确绑定授权验证者集；移除 bitmap 长度猜集合，旧委员会签未来 view 在共识与同步路径均 fail closed | Security |
 
 ### 上游借鉴与跟踪
 

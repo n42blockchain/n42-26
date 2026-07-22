@@ -15,7 +15,7 @@ use super::quorum::{
     signing_message, timeout_signing_message,
 };
 use super::round::{Phase, RoundState};
-use crate::error::ConsensusResult;
+use crate::error::{ConsensusError, ConsensusResult};
 use crate::validator::{EpochManager, LeaderSelector, ValidatorSet};
 use crate::vote_log::{NoopVoteLog, VoteLogWriter};
 
@@ -1259,46 +1259,32 @@ impl ConsensusEngine {
         self.epoch_manager.validator_set_for_view(view)
     }
 
-    /// Resolves the correct validator set for QC verification.
+    /// Resolves the validator set authorized for a QC's exact view.
     ///
-    /// `validator_set_for_view` uses a mathematical epoch formula that diverges
-    /// from the actual epoch state in the "epoch-drift zone": after a validator-set
-    /// transition the formula may map old views to the wrong epoch number, causing
-    /// it to fall back to the current (larger) set.  For example, after advancing
-    /// from epoch 0 (3 validators) to epoch 1 (4 validators) at view 151, the first
-    /// proposal carries a justify_qc from view 150.  `epoch_for_view(150)` = 4,
-    /// which is neither the current epoch (1) nor in history (only epoch 0 stored),
-    /// so `validator_set_for_view` falls back to the current 4-validator set.
-    /// Verifying a 3-bit bitmap against a 4-validator set then fails.
-    ///
-    /// This method detects the mismatch via bitmap-size comparison and falls back
-    /// to `find_validator_set_by_len`, which searches current / next / historical
-    /// sets by validator count.  BLS verification in the caller confirms correctness.
+    /// A valid BLS signature proves only that the selected keys signed the message;
+    /// it does not prove that those keys were authorized for the claimed view. Never
+    /// substitute another known set merely because its length matches the bitmap.
     pub(super) fn resolve_qc_validator_set(
         &self,
         qc: &n42_primitives::consensus::QuorumCertificate,
-    ) -> &ValidatorSet {
-        let primary = self.validator_set_for_view(qc.view);
-        if primary.len() as usize == qc.signers.len() {
-            return primary;
+    ) -> ConsensusResult<&ValidatorSet> {
+        let Some(authorized) = self.epoch_manager.known_validator_set_for_view(qc.view) else {
+            return Err(ConsensusError::InvalidQC {
+                view: qc.view,
+                reason: "validator set unavailable for certificate view".into(),
+            });
+        };
+        if authorized.len() as usize != qc.signers.len() {
+            return Err(ConsensusError::InvalidQC {
+                view: qc.view,
+                reason: format!(
+                    "signer bitmap length {} does not match authorized validator set length {}",
+                    qc.signers.len(),
+                    authorized.len()
+                ),
+            });
         }
-        // Bitmap size doesn't match the primary set — epoch drift has occurred.
-        // Search all known sets by size; BLS in the caller will confirm the match.
-        if let Some(vs) = self
-            .epoch_manager
-            .find_validator_set_by_len(qc.signers.len())
-        {
-            tracing::debug!(
-                target: "n42::cl::engine",
-                qc_view = qc.view,
-                primary_len = primary.len(),
-                bitmap_len = qc.signers.len(),
-                "epoch-drift fallback: using historical validator set for QC verification"
-            );
-            return vs;
-        }
-        // No set matched the bitmap size; return primary and let BLS fail clearly.
-        primary
+        Ok(authorized)
     }
 
     pub(super) fn leader_index_for_view(&self, view: ViewNumber) -> u32 {
@@ -1339,7 +1325,7 @@ impl ConsensusEngine {
         }
 
         let changes_hash = self.cached_changes_hash(&qc.block_hash);
-        super::quorum::verify_qc_any_domain(qc, self.resolve_qc_validator_set(qc), &changes_hash)
+        super::quorum::verify_qc_any_domain(qc, self.resolve_qc_validator_set(qc)?, &changes_hash)
     }
 
     pub(super) fn emit(&self, output: EngineOutput) -> ConsensusResult<()> {
@@ -1702,6 +1688,42 @@ mod tests {
             .filter(|output| matches!(output, EngineOutput::EpochTransition { .. }))
             .count();
         assert_eq!(transitions, 2);
+    }
+
+    #[test]
+    fn test_qc_resolver_rejects_old_committee_for_future_view() {
+        let (mut engine, old_keys, old_set, _output_rx) = make_engine(4, 0);
+        engine.epoch_manager = EpochManager::with_epoch_length(old_set.clone(), 10);
+
+        let mut next_infos = vec![ValidatorInfo {
+            address: Address::with_last_byte(0),
+            bls_public_key: old_keys[0].public_key(),
+            p2p_peer_id: None,
+        }];
+        next_infos.extend((0..4).map(|i| {
+            let key = test_key(0x90 + i);
+            ValidatorInfo {
+                address: Address::with_last_byte(0x90 + i),
+                bls_public_key: key.public_key(),
+                p2p_peer_id: None,
+            }
+        }));
+        engine
+            .epoch_manager
+            .stage_next_epoch(&next_infos, 1)
+            .unwrap();
+        engine.advance_to_view(11).unwrap();
+
+        // The removed epoch-0 committee can produce a cryptographically valid
+        // certificate over arbitrary future-view bytes. It is not authorized at
+        // view 11, and its four-bit bitmap must not select it over the active
+        // five-validator committee.
+        let forged =
+            build_test_commit_qc(11, B256::repeat_byte(0xA7), &old_keys, &old_set, &[0, 1, 2]);
+        assert!(matches!(
+            engine.resolve_qc_validator_set(&forged),
+            Err(ConsensusError::InvalidQC { .. })
+        ));
     }
 
     /// Tests that `sync_local_validator_index` correctly updates `my_index`
@@ -4448,10 +4470,18 @@ mod tests {
 
         let (fresh, sks, vs, _) = make_engine(4, 3);
         let (output_tx, mut output_rx) = mpsc::channel(64);
+        let mut epoch_manager = EpochManager::from_epoch(vs.clone(), 30, 1);
+        // Cross-epoch recovery is safe only when the target view's authority is
+        // known exactly. A static schedule may explicitly stage the unchanged
+        // committee; absence of a staged set must fail closed because the lagging
+        // node cannot know whether remote governance rotated membership.
+        epoch_manager
+            .stage_next_epoch(&vs.validator_infos(), vs.fault_tolerance())
+            .unwrap();
         let mut engine = ConsensusEngine::with_recovered_state(
             3,
             sks[3].clone(),
-            EpochManager::from_epoch(vs.clone(), 30, 1),
+            epoch_manager,
             60_000,
             120_000,
             output_tx,

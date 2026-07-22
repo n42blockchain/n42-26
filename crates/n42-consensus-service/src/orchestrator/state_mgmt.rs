@@ -1133,17 +1133,13 @@ impl ConsensusService {
 
     /// Verifies commit QC validity for a sync block.
     /// Returns false and logs a warning if verification fails.
-    fn verify_sync_block_qc(&self, sync_block: &SyncBlock) -> bool {
-        // Identify the validator set by matching the QC's bitmap length rather than
-        // computing epoch_for_view().  epoch_for_view() assumes epoch advances fire
-        // exactly at every boundary, but in practice staging can be delayed past a
-        // boundary (e.g., validator added at view 47 → epoch advances at view 61, not
-        // view 31).  Matching by size is correct because each epoch has a distinct
-        // validator count in the normal add/remove workflow; BLS verification then
-        // confirms we picked the right set.
+    pub(super) fn verify_sync_block_qc(&self, sync_block: &SyncBlock) -> bool {
+        // Resolve authority from the certificate view. Bitmap width is only a
+        // structural check: a different epoch can have the same width, and even a
+        // differently-sized old set can validly sign bytes for an unauthorized view.
         let bitmap_len = sync_block.commit_qc.signers.len();
         let em = self.engine.epoch_manager();
-        let vs = match em.find_validator_set_by_len(bitmap_len) {
+        let vs = match em.known_validator_set_for_view(sync_block.commit_qc.view) {
             Some(vs) => vs,
             None => {
                 warn!(
@@ -1151,11 +1147,21 @@ impl ConsensusService {
                     view = sync_block.view,
                     bitmap_len,
                     current_epoch = em.current_epoch(),
-                    "no validator set with matching bitmap length; rejecting sync block"
+                    "validator set unavailable for commit_qc view; rejecting sync block"
                 );
                 return false;
             }
         };
+        if vs.len() as usize != bitmap_len {
+            warn!(
+                target: "n42::cl::sync",
+                view = sync_block.view,
+                bitmap_len,
+                authorized_len = vs.len(),
+                "commit_qc bitmap does not match view-authorized validator set"
+            );
+            return false;
+        }
 
         let ch = validator_changes_hash(&sync_block.validator_changes);
         if let Err(e) = verify_commit_qc(&sync_block.commit_qc, vs, &ch) {

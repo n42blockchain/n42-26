@@ -340,10 +340,10 @@ impl ConsensusEngine {
 
         // Chained mode: process piggybacked PrepareQC if present.
         if let Some(ref piggybacked_qc) = proposal.prepare_qc {
-            match super::quorum::verify_qc(
-                piggybacked_qc,
-                self.resolve_qc_validator_set(piggybacked_qc),
-            ) {
+            let verification = self
+                .resolve_qc_validator_set(piggybacked_qc)
+                .and_then(|set| super::quorum::verify_qc(piggybacked_qc, set));
+            match verification {
                 Ok(()) => {
                     tracing::debug!(target: "n42::cl::proposal",
                         view,
@@ -441,7 +441,8 @@ impl ConsensusEngine {
             });
         }
 
-        super::quorum::verify_qc(&pqc.qc, self.resolve_qc_validator_set(&pqc.qc))?;
+        let qc_set = self.resolve_qc_validator_set(&pqc.qc)?;
+        super::quorum::verify_qc(&pqc.qc, qc_set)?;
         self.round_state.update_locked_qc(&pqc.qc);
         self.round_state.enter_pre_commit();
 

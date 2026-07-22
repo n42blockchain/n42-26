@@ -4945,6 +4945,68 @@ mod tests {
         assert_eq!(dropped, Some(DebugValue::Counter(1)));
     }
 
+    #[test]
+    fn sync_qc_rejects_old_committee_signing_future_view() {
+        let (mut engine, output_rx) = make_test_engine_with_validator_count(4, 0);
+        let old_keys: Vec<_> = (0..4).map(test_key).collect();
+        let old_set = engine.epoch_manager().current_validator_set().clone();
+        *engine.epoch_manager_mut() = EpochManager::with_epoch_length(old_set.clone(), 10);
+
+        let next_infos = (0..5)
+            .map(|i| {
+                let key = test_key(0x80 + i);
+                ValidatorInfo {
+                    address: Address::with_last_byte(0x80 + i),
+                    bls_public_key: key.public_key(),
+                    p2p_peer_id: None,
+                }
+            })
+            .collect::<Vec<_>>();
+        engine
+            .epoch_manager_mut()
+            .stage_next_epoch(&next_infos, 1)
+            .unwrap();
+        assert!(engine.epoch_manager_mut().advance_epoch());
+
+        let block_hash = B256::repeat_byte(0xA9);
+        let message =
+            n42_consensus::protocol::quorum::commit_signing_message(11, &block_hash, &B256::ZERO);
+        let signatures = old_keys[..3]
+            .iter()
+            .map(|key| key.sign(&message))
+            .collect::<Vec<_>>();
+        let signature_refs = signatures.iter().collect::<Vec<_>>();
+        let aggregate_signature =
+            n42_primitives::bls::AggregateSignature::aggregate(&signature_refs).unwrap();
+        let mut signers = QuorumCertificate::genesis().signers;
+        signers.resize(4, false);
+        for index in 0..3 {
+            signers.set(index, true);
+        }
+        let commit_qc = QuorumCertificate {
+            view: 11,
+            block_hash,
+            aggregate_signature,
+            signers,
+        };
+
+        let (network, _cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let service = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
+        let block = n42_network::SyncBlock {
+            view: 11,
+            block_hash,
+            commit_qc,
+            payload: vec![1],
+            validator_changes: None,
+        };
+
+        assert!(
+            !service.verify_sync_block_qc(&block),
+            "a cryptographically valid old committee is not authorized at the future view"
+        );
+    }
+
     /// A CommitQC child can finalize a prepared execution ancestor that has no
     /// CommitQC of its own. Restart recovery must import both raw payloads in
     /// parent order, preserve their compact outputs for later peers, advance

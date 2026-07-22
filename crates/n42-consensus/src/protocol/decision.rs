@@ -17,13 +17,7 @@ impl ConsensusEngine {
             return Ok(());
         }
 
-        // Use resolve_qc_validator_set instead of validator_set_for_view to handle
-        // the epoch-drift zone: after staging a new validator set but before the epoch
-        // boundary fires, validator_set_for_view returns the staged next_set (wrong size)
-        // for views that fall in the "mathematical next epoch" range.  The resolver falls
-        // back to find_validator_set_by_len when there is a bitmap-size mismatch, which
-        // correctly identifies the 3-validator set for a 3-bit QC even while next_set is staged.
-        let commit_set = self.resolve_qc_validator_set(&decide.commit_qc);
+        let commit_set = self.resolve_qc_validator_set(&decide.commit_qc)?;
         let quorum_size = commit_set.quorum_size();
         if decide.commit_qc.signer_count() < quorum_size {
             return Err(ConsensusError::InsufficientVotes {
