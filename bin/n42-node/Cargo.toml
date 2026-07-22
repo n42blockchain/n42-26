@@ -15,6 +15,7 @@ metrics.workspace = true
 n42-node.workspace = true
 n42-chainspec.workspace = true
 n42-consensus.workspace = true
+n42-consensus-service.workspace = true
 n42-jmt.workspace = true
 n42-network.workspace = true
 n42-primitives.workspace = true
@@ -29,8 +30,12 @@ reth-rpc-server-types.workspace = true
 reth-storage-api.workspace = true
 reth-transaction-pool.workspace = true
 reth-tasks.workspace = true
+reth-primitives-traits.workspace = true
 
+alloy-consensus.workspace = true
+alloy-genesis.workspace = true
 alloy-primitives.workspace = true
+alloy-rpc-types-engine.workspace = true
 
 jsonrpsee.workspace = true
 clap = { version = "4", features = ["derive"] }

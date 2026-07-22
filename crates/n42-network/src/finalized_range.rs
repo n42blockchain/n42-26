@@ -248,7 +248,13 @@ fn parse_finalized_range_stream<R: Read>(
         transaction_count = transaction_count
             .checked_add(receipts.len() as u64)
             .ok_or(FinalizedRangeError::Bounds)?;
-        if gov5_native_receipts_root(&receipts) != receipts_root {
+        let computed_receipts_root = gov5_native_receipts_root(&receipts);
+        // Gov5 constructs block zero with Ethereum's empty trie root, then switches to its
+        // native Keccak(concatenated receipt RLPs) commitment from block one onward.
+        let legacy_genesis_empty_receipts = number == 0
+            && receipts.is_empty()
+            && receipts_root == calculate_transaction_root::<TxEnvelope>(&[]);
+        if computed_receipts_root != receipts_root && !legacy_genesis_empty_receipts {
             return Err(FinalizedRangeError::ReceiptRootMismatch(number));
         }
         if materialize {
@@ -437,19 +443,23 @@ mod tests {
         calculate_transaction_root::<TxEnvelope>(&[])
     }
 
-    fn header_fixture() -> Vec<u8> {
+    fn header_fixture_with(number: u64, receipts_root: B256) -> Vec<u8> {
         let header = ConsensusHeader {
             parent_hash: B256::repeat_byte(0x06),
             ommers_hash: B256::repeat_byte(0x22),
             state_root: B256::repeat_byte(0x33),
             transactions_root: empty_transaction_root(),
-            receipts_root: empty_receipt_root(),
-            number: 7,
+            receipts_root,
+            number,
             ..Default::default()
         };
         let mut encoded = Vec::new();
         header.encode(&mut encoded);
         encoded
+    }
+
+    fn header_fixture() -> Vec<u8> {
+        header_fixture_with(7, empty_receipt_root())
     }
 
     fn fixture_with_transactions(transaction_data: Vec<Bytes>) -> Vec<u8> {
@@ -488,6 +498,54 @@ mod tests {
 
     fn fixture() -> Vec<u8> {
         fixture_with_transactions(Vec::new())
+    }
+
+    fn genesis_fixture(receipts_root: B256) -> Vec<u8> {
+        let header = header_fixture_with(0, receipts_root);
+        let mut block = Vec::new();
+        RlpHeader {
+            list: true,
+            payload_length: header.len() + Vec::<Bytes>::new().length(),
+        }
+        .encode(&mut block);
+        block.extend_from_slice(&header);
+        Vec::<Bytes>::new().encode(&mut block);
+        let block_hash = keccak256(&header);
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(MAGIC);
+        bytes.extend_from_slice(&1143_u64.to_le_bytes());
+        bytes.extend_from_slice(block_hash.as_slice());
+        bytes.extend_from_slice(&0_u64.to_le_bytes());
+        bytes.extend_from_slice(&0_u64.to_le_bytes());
+        bytes.extend_from_slice(&1_u64.to_le_bytes());
+        bytes.extend_from_slice(&0_u64.to_le_bytes());
+        bytes.extend_from_slice(block_hash.as_slice());
+        bytes.extend_from_slice(B256::repeat_byte(0x06).as_slice());
+        bytes.extend_from_slice(B256::repeat_byte(0x33).as_slice());
+        bytes.extend_from_slice(receipts_root.as_slice());
+        bytes.extend_from_slice(empty_transaction_root().as_slice());
+        for blob in [&header[..], &block[..], &[][..]] {
+            bytes.extend_from_slice(&(blob.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(blob);
+        }
+        let digest = blake3::hash(&bytes);
+        bytes.extend_from_slice(digest.as_bytes());
+        bytes
+    }
+
+    #[test]
+    fn accepts_only_block_zero_ethereum_empty_receipt_root() {
+        let ethereum_empty = empty_transaction_root();
+        let genesis = genesis_fixture(ethereum_empty);
+        let genesis_hash = keccak256(header_fixture_with(0, ethereum_empty));
+        assert!(decode_finalized_range_stream(Cursor::new(genesis), 1143, genesis_hash).is_ok());
+
+        let wrong = genesis_fixture(B256::repeat_byte(0x44));
+        let wrong_hash = keccak256(header_fixture_with(0, B256::repeat_byte(0x44)));
+        assert!(matches!(
+            decode_finalized_range_stream(Cursor::new(wrong), 1143, wrong_hash),
+            Err(FinalizedRangeError::ReceiptRootMismatch(0))
+        ));
     }
 
     #[test]

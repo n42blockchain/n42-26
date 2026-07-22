@@ -1,6 +1,9 @@
-use alloy_primitives::{B256, Bytes, U256};
+use alloy_primitives::{B256, Bytes, U256, keccak256};
 use alloy_rpc_types_engine::{ExecutionData, PayloadAttributes, PayloadError};
-use n42_consensus::{N42HeaderProfile, validate_gov5_h2_header, validate_gov5_header_extra};
+use n42_consensus::{
+    N42HeaderProfile, validate_gov5_h2_header, validate_gov5_header_extra,
+    validate_gov5_replay_v2_header,
+};
 use reth_chainspec::{EthereumHardforks, Hardforks};
 use reth_engine_primitives::{EngineApiValidator, EngineTypes, PayloadValidator};
 use reth_ethereum_primitives::{Block as EthBlock, EthPrimitives, TransactionSigned};
@@ -50,12 +53,30 @@ where
 
         let expected_hash = payload.block_hash();
         let original_extra = payload.payload.as_v1().extra_data.clone();
-        validate_gov5_header_extra(&original_extra).map_err(NewPayloadError::other)?;
+        let replay_v2_shape = original_extra.as_ref() == [0_u8; 32];
+        if !replay_v2_shape {
+            validate_gov5_header_extra(&original_extra).map_err(NewPayloadError::other)?;
+        }
         let mut standard_payload = payload;
         standard_payload.payload.set_extra_data(Bytes::new());
-        let standard_block = standard_payload
+        let mut standard_block = standard_payload
             .clone()
             .try_into_block::<TransactionSigned>()?;
+        if replay_v2_shape {
+            standard_block.header.extra_data = original_extra;
+            standard_block.header.withdrawals_root = Some(keccak256([]));
+            validate_gov5_replay_v2_header(&standard_block.header)
+                .map_err(NewPayloadError::other)?;
+            let replay = standard_block.seal_slow();
+            if replay.hash() == expected_hash {
+                return Ok(replay);
+            }
+            return Err(PayloadError::BlockHash {
+                execution: replay.hash(),
+                consensus: expected_hash,
+            }
+            .into());
+        }
         standard_payload
             .payload
             .set_block_hash(standard_block.header.hash_slow());
@@ -63,7 +84,6 @@ where
             &self.inner,
             standard_payload,
         )?;
-
         let mut block = standard.into_block();
         block.header.ommers_hash = B256::ZERO;
         block.header.extra_data = original_extra;

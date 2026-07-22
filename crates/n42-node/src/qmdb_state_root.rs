@@ -264,11 +264,23 @@ impl StateRootJob<EthPrimitives> for Gov5QmdbStateRootJob {
         output: Arc<BlockExecutionOutput<Receipt>>,
         _hashed_state: &LazyHashedPostState,
     ) -> ProviderResult<StateRootJobOutcome> {
+        let operations = gov5_qmdb_operations_from_output(&output);
+        if std::env::var_os("N42_QMDB_TRACE_OPERATIONS").is_some() {
+            for operation in &operations {
+                tracing::info!(
+                    target: "n42::qmdb",
+                    block = block.number,
+                    key = %B256::from(operation.key),
+                    value = operation.value.as_ref().map(hex::encode).as_deref().unwrap_or("<delete>"),
+                    "QMDB execution mutation"
+                );
+            }
+        }
         let root = match self.store.compute_and_commit(
             block.parent_hash,
             block.hash(),
             block.state_root,
-            gov5_qmdb_operations_from_output(&output),
+            operations,
         ) {
             Ok(root) => root,
             // Return the independently computed root so Reth classifies the payload as

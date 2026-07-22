@@ -6,17 +6,21 @@ mod keystore;
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+use alloy_consensus::Header;
+use alloy_genesis::Genesis;
 use alloy_primitives::{Address, B256, U256, keccak256};
+use alloy_rpc_types_engine::{ForkchoiceState, PayloadStatusEnum};
 use clap::Parser;
 use n42_chainspec::{ConsensusConfig, ValidatorInfo};
 use n42_consensus::{
     ConsensusEngine, EpochManager, N42HeaderProfile, ValidatorSet, ValidatorSetResolver,
 };
+use n42_consensus_service::{ReplayExecutionPlan, build_replay_execution_plan_with_profile};
 use n42_jmt::{EMPTY_CODE_HASH, PersistentSbmt, PersistentTwig};
 use n42_network::NetworkService;
 use n42_network::{
     FinalizedRangeVerification, ShardedStarHub, ShardedStarHubConfig, TransportConfig,
-    build_interop_observer_swarm, build_swarm_with_validator_index,
+    build_interop_observer_swarm, build_swarm_with_validator_index, decode_finalized_range_stream,
     deterministic_validator_keypair, verify_finalized_range_stream,
 };
 use n42_node::attestation_store::AttestationStore;
@@ -27,6 +31,7 @@ use n42_node::mobile_evidence::spawn_mobile_evidence_writeback;
 use n42_node::mobile_packet::mobile_packet_loop;
 use n42_node::mobile_reward::MobileRewardManager;
 use n42_node::persistence;
+use n42_node::qmdb_state::{gov5_qmdb_genesis_tree, gov5_replay_execution_genesis};
 use n42_node::qmdb_state_root::Gov5QmdbStateRootStore;
 use n42_node::rpc::{N42ApiServer, N42RpcServer};
 use n42_node::staking::StakingManager;
@@ -38,10 +43,13 @@ use n42_twig_core::qmdb_compat::{
     QmdbPortableSnapshot, QmdbPortableVerification, verify_portable_stream,
 };
 use n42_zkproof::{MockProver, ProofScheduler, ProofStore};
-use reth_chainspec::ChainSpecProvider;
+use reth_chainspec::{
+    ChainSpec, ChainSpecProvider, EthereumHardfork, EthereumHardforks, ForkCondition,
+};
 use reth_ethereum_cli::Cli;
 use reth_ethereum_cli::chainspec::EthereumChainSpecParser;
 use reth_node_core::args::{DefaultEngineValues, DefaultRpcServerArgs};
+use reth_primitives_traits::SealedHeader;
 use reth_storage_api::{BlockHashReader, BlockNumReader};
 use reth_transaction_pool::TransactionPool;
 use std::fs::File;
@@ -60,6 +68,24 @@ fn env_bool(name: &str) -> bool {
 
 fn env_parse<T: std::str::FromStr>(name: &str) -> Option<T> {
     std::env::var(name).ok().and_then(|s| s.parse().ok())
+}
+
+/// Gov5 H2 blocks are proof-of-stake-style execution blocks and never receive an Ethereum PoW
+/// block reward. The source genesis predates the standard Paris fields, so make that execution
+/// rule explicit without changing the authenticated Gov5 genesis header.
+fn activate_gov5_pos_execution(chain: &mut ChainSpec) {
+    chain.hardforks.insert(
+        EthereumHardfork::Paris,
+        ForkCondition::TTD {
+            activation_block_number: 0,
+            fork_block: Some(0),
+            total_difficulty: U256::ZERO,
+        },
+    );
+    chain.paris_block_and_final_difficulty = Some((0, U256::ZERO));
+    chain.genesis.config.terminal_total_difficulty = Some(U256::ZERO);
+    chain.genesis.config.merge_netsplit_block = Some(0);
+    debug_assert!(chain.is_paris_active_at_block(0));
 }
 
 fn resolve_observer_genesis_hash(
@@ -137,10 +163,20 @@ const HARD_QMDB_EXECUTION_MAX_SLOTS: u64 = 4_000_000;
 const DEFAULT_QMDB_EXECUTION_MAX_BYTES: u64 = 512 * 1024 * 1024;
 const HARD_QMDB_EXECUTION_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
-/// Materialize a bounded portable checkpoint for the Engine Tree strategy. Full-archive snapshots
-/// remain on the streaming verifier path; this function refuses them before allocating.
+struct QmdbExecutionBootstrap {
+    store: Arc<Gov5QmdbStateRootStore>,
+    checkpoint: QmdbPortableVerification,
+    base_block_number: u64,
+    base_block_hash: B256,
+    base_root: B256,
+    genesis_header: Header,
+    execution_genesis: Genesis,
+}
+
+/// Materialize a bounded portable checkpoint only after streaming authentication. Full-archive
+/// snapshots remain on the streaming verifier path; this function refuses them before allocating.
 #[allow(clippy::too_many_arguments)]
-fn load_qmdb_execution_store(
+fn load_qmdb_execution_checkpoint(
     path: &Path,
     chain_id: u64,
     genesis_hash: B256,
@@ -149,7 +185,7 @@ fn load_qmdb_execution_store(
     expected_root: B256,
     max_slots: u64,
     max_bytes: u64,
-) -> eyre::Result<(Arc<Gov5QmdbStateRootStore>, QmdbPortableVerification)> {
+) -> eyre::Result<(QmdbPortableSnapshot, QmdbPortableVerification)> {
     if max_slots > HARD_QMDB_EXECUTION_MAX_SLOTS {
         return Err(eyre::eyre!(
             "N42_QMDB_EXECUTION_MAX_SLOTS exceeds hard limit {HARD_QMDB_EXECUTION_MAX_SLOTS}"
@@ -188,12 +224,115 @@ fn load_qmdb_execution_store(
     let portable = QmdbPortableSnapshot::decode(&encoded)
         .map_err(|error| eyre::eyre!("failed to decode QMDB checkpoint: {error}"))?;
     let expected_genesis: [u8; 32] = genesis_hash.into();
-    let tree = portable
+    portable
         .verify_and_build(chain_id, &expected_genesis)
         .map_err(|error| eyre::eyre!("failed to materialize QMDB checkpoint: {error}"))?;
-    let store = Gov5QmdbStateRootStore::new(expected_block_hash, expected_root, tree.snapshot())
-        .map_err(|error| eyre::eyre!("failed to initialize QMDB state-root store: {error}"))?;
-    Ok((Arc::new(store), verified))
+    Ok((portable, verified))
+}
+
+/// Establish block zero as the execution base by binding four independently checked views of it:
+/// the configured alloc, Gov5's authenticated genesis header, the portable history prefix, and the
+/// checkpoint's full QMDB commitment.
+#[allow(clippy::too_many_arguments)]
+fn load_gov5_genesis_execution_bootstrap(
+    checkpoint_path: &Path,
+    genesis_range_path: &Path,
+    genesis: &Genesis,
+    chain_id: u64,
+    genesis_hash: B256,
+    expected_block: u64,
+    expected_block_hash: B256,
+    expected_root: B256,
+    max_slots: u64,
+    max_bytes: u64,
+) -> eyre::Result<QmdbExecutionBootstrap> {
+    let (portable, checkpoint) = load_qmdb_execution_checkpoint(
+        checkpoint_path,
+        chain_id,
+        genesis_hash,
+        expected_block,
+        expected_block_hash,
+        expected_root,
+        max_slots,
+        max_bytes,
+    )?;
+    let range_file = File::open(genesis_range_path).map_err(|error| {
+        eyre::eyre!(
+            "failed to open Gov5 genesis range {}: {error}",
+            genesis_range_path.display()
+        )
+    })?;
+    let range = decode_finalized_range_stream(BufReader::new(range_file), chain_id, genesis_hash)
+        .map_err(|error| eyre::eyre!("failed to verify Gov5 genesis range: {error}"))?;
+    let genesis_entry = range
+        .entries()
+        .first()
+        .filter(|entry| entry.number() == 0 && entry.block_hash() == genesis_hash)
+        .ok_or_else(|| {
+            eyre::eyre!("Gov5 genesis range must start with the configured block zero")
+        })?;
+    if genesis_entry.parent_hash() != B256::ZERO
+        || !genesis_entry.transactions().is_empty()
+        || !genesis_entry.receipts().is_empty()
+    {
+        return Err(eyre::eyre!(
+            "Gov5 block zero must have zero parent and empty body/receipts"
+        ));
+    }
+
+    let header_genesis_tree = gov5_qmdb_genesis_tree(genesis)
+        .map_err(|error| eyre::eyre!("failed to build Gov5 QMDB genesis state: {error}"))?;
+    let header_genesis_root = B256::from(header_genesis_tree.root());
+    if header_genesis_root != genesis_entry.state_root() {
+        return Err(eyre::eyre!(
+            "configured genesis alloc produces QMDB root {header_genesis_root}, but authenticated Gov5 block zero commits {}",
+            genesis_entry.state_root()
+        ));
+    }
+    let execution_genesis = gov5_replay_execution_genesis(genesis);
+    let genesis_tree = gov5_qmdb_genesis_tree(&execution_genesis).map_err(|error| {
+        eyre::eyre!("failed to build Gov5 replay-v2 execution genesis state: {error}")
+    })?;
+    let base_root = B256::from(genesis_tree.root());
+    let base_snapshot = genesis_tree.snapshot();
+    if portable.slots.entries.len() < base_snapshot.entries.len() {
+        return Err(eyre::eyre!(
+            "QMDB checkpoint has fewer entries than the authenticated genesis alloc"
+        ));
+    }
+    for (slot, (checkpoint_entry, base_entry)) in portable
+        .slots
+        .entries
+        .iter()
+        .zip(&base_snapshot.entries)
+        .enumerate()
+    {
+        if checkpoint_entry.slot != slot as u64
+            || checkpoint_entry.key != base_entry.key
+            || checkpoint_entry.value != base_entry.value
+        {
+            return Err(eyre::eyre!(
+                "QMDB checkpoint genesis prefix mismatch at slot {slot}: checkpoint key={} value_hash={} value_len={}, genesis key={} value_hash={} value_len={}",
+                B256::from(checkpoint_entry.key),
+                keccak256(&checkpoint_entry.value),
+                checkpoint_entry.value.len(),
+                B256::from(base_entry.key),
+                keccak256(&base_entry.value),
+                base_entry.value.len(),
+            ));
+        }
+    }
+    let store = Gov5QmdbStateRootStore::new(genesis_hash, base_root, base_snapshot)
+        .map_err(|error| eyre::eyre!("failed to initialize QMDB genesis store: {error}"))?;
+    Ok(QmdbExecutionBootstrap {
+        store: Arc::new(store),
+        checkpoint,
+        base_block_number: 0,
+        base_block_hash: genesis_hash,
+        base_root,
+        genesis_header: genesis_entry.header().clone(),
+        execution_genesis,
+    })
 }
 
 fn required_observer_env<T>(name: &str) -> eyre::Result<T>
@@ -221,6 +360,75 @@ fn ensure_finalized_range_matches_qmdb(
         ));
     }
     Ok(())
+}
+
+async fn import_authenticated_replay_plan(
+    execution: &dyn n42_node::el::ExecutionLayer,
+    plan: &ReplayExecutionPlan,
+) -> eyre::Result<B256> {
+    let verification = plan.verification();
+    let mut imported_head = verification.first_parent_hash;
+    for payload in plan.payloads() {
+        let block_number = payload.block_number();
+        let block_hash = payload.block_hash();
+        if payload.parent_hash() != imported_head {
+            return Err(eyre::eyre!(
+                "authenticated replay plan broke parent linkage at block {block_number}"
+            ));
+        }
+        let status = execution
+            .new_payload(payload.clone())
+            .await
+            .map_err(|error| {
+                eyre::eyre!(
+                    "new_payload failed for replay block {block_number}/{block_hash}: {error}"
+                )
+            })?;
+        if !matches!(status.status, PayloadStatusEnum::Valid)
+            || status.latest_valid_hash != Some(block_hash)
+        {
+            return Err(eyre::eyre!(
+                "replay block {block_number}/{block_hash} was not deterministically Valid: status={:?} latest_valid_hash={:?}",
+                status.status,
+                status.latest_valid_hash
+            ));
+        }
+        let forkchoice = execution
+            .fork_choice_updated(ForkchoiceState {
+                head_block_hash: block_hash,
+                safe_block_hash: block_hash,
+                finalized_block_hash: block_hash,
+            })
+            .await
+            .map_err(|error| {
+                eyre::eyre!(
+                    "fork_choice_updated failed for replay block {block_number}/{block_hash}: {error}"
+                )
+            })?;
+        if !matches!(forkchoice.payload_status.status, PayloadStatusEnum::Valid)
+            || forkchoice.payload_status.latest_valid_hash != Some(block_hash)
+        {
+            return Err(eyre::eyre!(
+                "replay forkchoice did not finalize block {block_number}/{block_hash}: status={:?} latest_valid_hash={:?}",
+                forkchoice.payload_status.status,
+                forkchoice.payload_status.latest_valid_hash
+            ));
+        }
+        imported_head = block_hash;
+        info!(
+            target: "n42::cli",
+            block = block_number,
+            %block_hash,
+            "imported authenticated gov5 replay-v2 block"
+        );
+    }
+    if imported_head != verification.last_block_hash {
+        return Err(eyre::eyre!(
+            "replay import ended at {imported_head}, expected {}",
+            verification.last_block_hash
+        ));
+    }
+    Ok(imported_head)
 }
 
 fn override_timeout_from_env(name: &str, target: &mut u64) {
@@ -490,7 +698,7 @@ fn main() {
         );
     }
 
-    if let Err(err) = Cli::<EthereumChainSpecParser>::parse().run(async move |builder, _| {
+    if let Err(err) = Cli::<EthereumChainSpecParser>::parse().run(async move |mut builder, _| {
         info!(target: "n42::cli", "Launching N42 node");
 
         // Warn about benchmark/debug env vars that weaken security.
@@ -658,6 +866,11 @@ fn main() {
             let path = std::env::var("N42_QMDB_BOOTSTRAP").map_err(|_| {
                 eyre::eyre!("N42_QMDB_BOOTSTRAP is required with N42_GOV5_QMDB_EXECUTION")
             })?;
+            let genesis_range = std::env::var("N42_GOV5_GENESIS_BOOTSTRAP").map_err(|_| {
+                eyre::eyre!(
+                    "N42_GOV5_GENESIS_BOOTSTRAP is required with N42_GOV5_QMDB_EXECUTION"
+                )
+            })?;
             let expected_block = required_observer_env::<u64>("N42_QMDB_BOOTSTRAP_BLOCK")?;
             let expected_block_hash =
                 required_observer_env::<B256>("N42_QMDB_BOOTSTRAP_BLOCK_HASH")?;
@@ -670,8 +883,10 @@ fn main() {
                 .unwrap_or(DEFAULT_QMDB_EXECUTION_MAX_SLOTS);
             let max_bytes = env_parse("N42_QMDB_EXECUTION_MAX_BYTES")
                 .unwrap_or(DEFAULT_QMDB_EXECUTION_MAX_BYTES);
-            let loaded = load_qmdb_execution_store(
+            let loaded = load_gov5_genesis_execution_bootstrap(
                 Path::new(&path),
+                Path::new(&genesis_range),
+                &builder.config().chain.genesis,
                 builder.config().chain.chain.id(),
                 interop_genesis,
                 expected_block,
@@ -680,14 +895,23 @@ fn main() {
                 max_slots,
                 max_bytes,
             )?;
+            let chain = Arc::make_mut(&mut builder.config_mut().chain);
+            chain.genesis = loaded.execution_genesis.clone();
+            chain.genesis_header =
+                SealedHeader::new(loaded.genesis_header.clone(), loaded.base_block_hash);
+            activate_gov5_pos_execution(chain);
             info!(
                 target: "n42::cli",
                 path,
-                base_block = expected_block,
-                base_hash = %expected_block_hash,
-                base_root = %expected_root,
-                slots = loaded.1.next_slot,
-                "prepared bounded Gov5 QMDB Engine Tree state-root strategy"
+                genesis_range,
+                base_block = loaded.base_block_number,
+                base_hash = %loaded.base_block_hash,
+                base_root = %loaded.base_root,
+                checkpoint_block = loaded.checkpoint.block_number,
+                checkpoint_hash = %B256::from(loaded.checkpoint.block_hash),
+                checkpoint_root = %B256::from(loaded.checkpoint.root),
+                slots = loaded.checkpoint.next_slot,
+                "prepared Gov5 block-zero QMDB Engine Tree execution base"
             );
             Some(loaded)
         } else {
@@ -872,10 +1096,16 @@ fn main() {
         let mut n42_node = N42Node::new(consensus_state.clone())
             .with_validator_set_resolver(validator_set_resolver)
             .with_header_profile(header_profile);
-        if let Some((store, _)) = &qmdb_execution {
-            n42_node = n42_node.with_gov5_qmdb_state_root_store(store.clone());
+        if let Some(bootstrap) = &qmdb_execution {
+            n42_node = n42_node.with_gov5_qmdb_state_root_store(bootstrap.store.clone());
         }
-        let qmdb_execution_checkpoint = qmdb_execution.map(|(_, checkpoint)| checkpoint);
+        let qmdb_execution_base = qmdb_execution.as_ref().map(|bootstrap| {
+            (
+                bootstrap.base_block_number,
+                bootstrap.base_block_hash,
+                bootstrap.base_root,
+            )
+        });
 
         // Create staking manager early so it can be shared with RPC.
         let staking_state_file = data_dir.join("staking_state.json");
@@ -1063,14 +1293,15 @@ fn main() {
                     }
                 };
 
-                if let Some(ref checkpoint) = qmdb_execution_checkpoint
-                    && (best_block_number != checkpoint.block_number ||
-                        head_block_hash != B256::from(checkpoint.block_hash))
+                if let Some((base_block_number, base_block_hash, base_root)) = qmdb_execution_base
+                    && (best_block_number != base_block_number ||
+                        head_block_hash != base_block_hash)
                 {
                     return Err(eyre::eyre!(
-                        "QMDB execution base is block {} ({}) but local Reth head is block {} ({}); hydrate the matching ancestor PlainState/head before enabling N42_GOV5_QMDB_EXECUTION",
-                        checkpoint.block_number,
-                        B256::from(checkpoint.block_hash),
+                        "QMDB execution base is block {} ({}, root {}) but local Reth head is block {} ({}); hydrate the matching ancestor PlainState/head before enabling N42_GOV5_QMDB_EXECUTION",
+                        base_block_number,
+                        base_block_hash,
+                        base_root,
                         best_block_number,
                         head_block_hash,
                     ));
@@ -1275,6 +1506,7 @@ fn main() {
                         qmdb_checkpoint = Some(checkpoint);
                     }
 
+                    let mut replay_plan = None;
                     if let Ok(path) = std::env::var("N42_FINALIZED_RANGE_BOOTSTRAP") {
                         let checkpoint = qmdb_checkpoint.as_ref().ok_or_else(|| {
                             eyre::eyre!(
@@ -1284,25 +1516,75 @@ fn main() {
                         let file = File::open(&path).map_err(|error| {
                             eyre::eyre!("failed to open finalized range {path}: {error}")
                         })?;
-                        let range = verify_finalized_range_stream(
-                            BufReader::new(file),
-                            full_node.provider.chain_spec().chain().id(),
-                            interop_genesis_hash,
-                        )?;
-                        ensure_finalized_range_matches_qmdb(&range, checkpoint)?;
-                        info!(
-                            target: "n42::cli",
-                            path,
-                            from = range.from_block,
-                            to = range.to_block,
-                            blocks = range.block_count,
-                            transactions = range.transaction_count,
-                            head = %range.last_block_hash,
-                            state_root = %range.last_state_root,
-                            receipts_root = %range.last_receipts_root,
-                            "verified gov5 finalized range against QMDB bootstrap"
-                        );
+                        if env_bool("N42_GOV5_REPLAY_IMPORT") {
+                            if qmdb_execution_base.is_none() {
+                                return Err(eyre::eyre!(
+                                    "N42_GOV5_REPLAY_IMPORT requires N42_GOV5_QMDB_EXECUTION=1"
+                                ));
+                            }
+                            let range = decode_finalized_range_stream(
+                                BufReader::new(file),
+                                full_node.provider.chain_spec().chain().id(),
+                                interop_genesis_hash,
+                            )?;
+                            ensure_finalized_range_matches_qmdb(
+                                range.verification(),
+                                checkpoint,
+                            )?;
+                            let plan = build_replay_execution_plan_with_profile(
+                                &range,
+                                N42HeaderProfile::Gov5H2,
+                            )?;
+                            let verified = plan.verification();
+                            info!(
+                                target: "n42::cli",
+                                path,
+                                from = verified.from_block,
+                                to = verified.to_block,
+                                blocks = verified.block_count,
+                                transactions = verified.transaction_count,
+                                head = %verified.last_block_hash,
+                                state_root = %verified.last_state_root,
+                                receipts_root = %verified.last_receipts_root,
+                                "prepared authenticated gov5 replay-v2 execution plan"
+                            );
+                            replay_plan = Some(plan);
+                        } else {
+                            let range = verify_finalized_range_stream(
+                                BufReader::new(file),
+                                full_node.provider.chain_spec().chain().id(),
+                                interop_genesis_hash,
+                            )?;
+                            ensure_finalized_range_matches_qmdb(&range, checkpoint)?;
+                            info!(
+                                target: "n42::cli",
+                                path,
+                                from = range.from_block,
+                                to = range.to_block,
+                                blocks = range.block_count,
+                                transactions = range.transaction_count,
+                                head = %range.last_block_hash,
+                                state_root = %range.last_state_root,
+                                receipts_root = %range.last_receipts_root,
+                                "verified gov5 finalized range against QMDB bootstrap"
+                            );
+                        }
                     }
+
+                    if env_bool("N42_GOV5_REPLAY_IMPORT") && replay_plan.is_none() {
+                        return Err(eyre::eyre!(
+                            "N42_FINALIZED_RANGE_BOOTSTRAP is required with N42_GOV5_REPLAY_IMPORT"
+                        ));
+                    }
+
+                    let observer_el: std::sync::Arc<dyn n42_node::el::ExecutionLayer> =
+                        std::sync::Arc::new(n42_node::el::RethExecutionLayer::engine_only(
+                            beacon_engine_handle,
+                        ));
+                    let observer_head = replay_plan
+                        .as_ref()
+                        .map(|plan| plan.verification().last_block_hash)
+                        .unwrap_or(head_block_hash);
 
                     let keypair = libp2p::identity::Keypair::generate_ed25519();
                     let local_peer_id = keypair.public().to_peer_id();
@@ -1348,15 +1630,11 @@ fn main() {
                     // Register node-side hooks the consensus-service driver calls
                     // back into (ingest virtual-block-credit arming).
                     n42_node::register_consensus_service_hooks();
-                    let observer_el: std::sync::Arc<dyn n42_node::el::ExecutionLayer> =
-                        std::sync::Arc::new(n42_node::el::RethExecutionLayer::engine_only(
-                            beacon_engine_handle,
-                        ));
                     let mut observer = ObserverOrchestrator::new(
                         net_handle,
                         net_event_rx,
-                        observer_el,
-                        head_block_hash,
+                        Arc::clone(&observer_el),
+                        observer_head,
                     )
                     .with_validator_set(initial_validator_set.clone())
                     .with_blob_store(std::sync::Arc::new(n42_node::blob_port::DiskBlobStorePort(
@@ -1370,12 +1648,24 @@ fn main() {
                             observer.with_epoch_schedule(consensus_config.epoch_length, schedule);
                     }
 
-                    task_executor.spawn_critical_task(
-                        "n42-observer-orchestrator",
-                        Box::pin(observer.run()),
-                    );
+                    task_executor.spawn_critical_task("n42-observer-orchestrator", Box::pin(async move {
+                        if let Some(plan) = replay_plan {
+                            match import_authenticated_replay_plan(observer_el.as_ref(), &plan).await {
+                                Ok(imported) => info!(
+                                    target: "n42::cli",
+                                    %imported,
+                                    blocks = plan.verification().block_count,
+                                    "authenticated gov5 replay-v2 import completed"
+                                ),
+                                Err(error) => {
+                                    panic!("authenticated gov5 replay-v2 import failed closed: {error}");
+                                }
+                            }
+                        }
+                        observer.run().await;
+                    }));
 
-                    info!(target: "n42::cli", "Observer node started — EL sync via reth eth P2P, CL data via GossipSub");
+                    info!(target: "n42::cli", "Observer node started — authenticated replay bootstrap precedes CL processing");
                     return Ok(());
                 }
 
@@ -2051,6 +2341,23 @@ mod observer_identity_tests {
     }
 
     #[test]
+    fn gov5_execution_activates_pos_at_genesis() {
+        let mut chain = ChainSpec::default();
+        activate_gov5_pos_execution(&mut chain);
+
+        assert!(chain.is_paris_active_at_block(0));
+        assert_eq!(
+            chain.paris_block_and_final_difficulty,
+            Some((0, U256::ZERO))
+        );
+        assert_eq!(
+            chain.genesis.config.terminal_total_difficulty,
+            Some(U256::ZERO)
+        );
+        assert_eq!(chain.genesis.config.merge_netsplit_block, Some(0));
+    }
+
+    #[test]
     fn observer_qmdb_bootstrap_accepts_exact_checkpoint_identity() {
         let fixture = qmdb_portable_fixture();
         let genesis_hash = "0x1100000000000000000000000000000000000000000000000000000000000000"
@@ -2079,7 +2386,7 @@ mod observer_identity_tests {
     }
 
     #[test]
-    fn bounded_qmdb_execution_store_materializes_authenticated_checkpoint() {
+    fn bounded_qmdb_execution_checkpoint_materializes_after_authentication() {
         let fixture = qmdb_portable_fixture();
         let genesis_hash = "0x1100000000000000000000000000000000000000000000000000000000000000"
             .parse()
@@ -2090,7 +2397,7 @@ mod observer_identity_tests {
         let root = "0xbd6c73b724bc0a38c7efa81c2088bfc805d12faa6d12f188b714ebd1e717c646"
             .parse()
             .unwrap();
-        let (store, checkpoint) = load_qmdb_execution_store(
+        let (portable, checkpoint) = load_qmdb_execution_checkpoint(
             fixture.path(),
             1143,
             genesis_hash,
@@ -2101,11 +2408,11 @@ mod observer_identity_tests {
             1024 * 1024,
         )
         .unwrap();
-        assert_eq!(store.base_block_hash(), block_hash);
-        assert_eq!(store.base_root(), root);
+        assert_eq!(B256::from(portable.block_hash), block_hash);
+        assert_eq!(B256::from(portable.root), root);
         assert_eq!(checkpoint.next_slot, 3);
 
-        let error = load_qmdb_execution_store(
+        let error = load_qmdb_execution_checkpoint(
             fixture.path(),
             1143,
             genesis_hash,

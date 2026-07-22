@@ -1,5 +1,7 @@
-use alloy_consensus::{EMPTY_OMMER_ROOT_HASH, Header, TxReceipt, proofs::calculate_receipt_root};
-use alloy_primitives::{B256, Bloom, Bytes, U256};
+use alloy_consensus::{
+    EMPTY_OMMER_ROOT_HASH, EMPTY_ROOT_HASH, Header, TxReceipt, proofs::calculate_receipt_root,
+};
+use alloy_primitives::{B256, Bloom, Bytes, U256, keccak256};
 use arc_swap::ArcSwapOption;
 use reth_chainspec::{ChainSpec, EthChainSpec, EthereumHardforks};
 use reth_consensus::{Consensus, ConsensusError, FullConsensus, HeaderValidator};
@@ -43,6 +45,8 @@ pub enum N42HeaderProfileError {
     Gov5OmmersHash(B256),
     #[error("gov5 H2 header requires current difficulty 0 or legacy replay difficulty 1, got {0}")]
     Gov5Difficulty(U256),
+    #[error("gov5 replay-v2 header violates its fixed historical shape: {0}")]
+    Gov5ReplayV2Shape(&'static str),
 }
 
 /// Validates the bounded, hash-authenticated outer shape of gov5 H2 header extra-data.
@@ -70,6 +74,68 @@ pub fn validate_gov5_h2_header(header: &Header) -> Result<(), N42HeaderProfileEr
         return Err(N42HeaderProfileError::Gov5Difficulty(header.difficulty));
     }
     validate_gov5_header_extra(&header.extra_data)
+}
+
+/// Validates the fixed post-merge header shape emitted by gov5 replay-v2. Consensus evidence is
+/// stored beside these historical blocks rather than in `extra_data`; every optional field below
+/// is therefore pinned before the block hash is accepted.
+pub fn validate_gov5_replay_v2_header(header: &Header) -> Result<(), N42HeaderProfileError> {
+    let invalid = |reason| Err(N42HeaderProfileError::Gov5ReplayV2Shape(reason));
+    if header.ommers_hash != EMPTY_OMMER_ROOT_HASH {
+        return invalid("ommers hash is not the canonical empty-list hash");
+    }
+    if header.difficulty != U256::ZERO {
+        return invalid("difficulty is not zero");
+    }
+    if header.extra_data.as_ref() != [0_u8; 32] {
+        return invalid("extra data is not exactly 32 zero bytes");
+    }
+    if header.withdrawals_root != Some(keccak256([])) {
+        return invalid("empty reward-list root is not keccak(empty)");
+    }
+    if header.blob_gas_used != Some(0) || header.excess_blob_gas != Some(0) {
+        return invalid("blob gas fields are not both zero");
+    }
+    if header.parent_beacon_block_root.is_none() {
+        return invalid("parent consensus-evidence root is absent");
+    }
+    if header.requests_hash != Some(EMPTY_ROOT_HASH) {
+        return invalid("execution requests root is not the canonical empty root");
+    }
+    if header.block_access_list_hash.is_some() {
+        return invalid("block access list is unsupported in replay-v2 v1 history");
+    }
+    Ok(())
+}
+
+/// Accepts exactly one of the two gov5 history/live shapes. The authenticated block hash selects
+/// the concrete shape; this does not synthesize omitted fields or accept arbitrary hybrids.
+pub fn validate_gov5_interop_header(header: &Header) -> Result<(), N42HeaderProfileError> {
+    if header.extra_data.starts_with(GOV5_HEADER_EXTRA_MAGIC) {
+        validate_gov5_h2_header(header)
+    } else {
+        validate_gov5_replay_v2_header(header)
+    }
+}
+
+fn normalized_gov5_header(header: &Header) -> Result<Header, N42HeaderProfileError> {
+    validate_gov5_interop_header(header)?;
+    let mut normalized = header.clone();
+    if validate_gov5_replay_v2_header(header).is_ok() {
+        // replay-v2 encodes consensus-evidence/reward commitments in Ethereum fork fields while
+        // executing the custom chain's pre-Shanghai rules. Remove only those fixed fields for the
+        // inner Ethereum rule checker; the original sealed header remains hash-authenticated.
+        normalized.withdrawals_root = None;
+        normalized.blob_gas_used = None;
+        normalized.excess_blob_gas = None;
+        normalized.parent_beacon_block_root = None;
+        normalized.requests_hash = None;
+    } else {
+        normalized.ommers_hash = EMPTY_OMMER_ROOT_HASH;
+        normalized.difficulty = U256::ZERO;
+        normalized.extra_data = Bytes::new();
+    }
+    Ok(normalized)
 }
 
 /// Resolves the validator set that should verify a QC for a given view.
@@ -246,12 +312,15 @@ where
         header: &SealedHeader<Header>,
     ) -> Result<(), ConsensusError> {
         if self.header_profile == N42HeaderProfile::Gov5H2 {
-            validate_gov5_h2_header(header.header()).map_err(ConsensusError::other)?;
-            let mut normalized = header.header().clone();
-            normalized.ommers_hash = EMPTY_OMMER_ROOT_HASH;
+            let normalized =
+                normalized_gov5_header(header.header()).map_err(ConsensusError::other)?;
+            let mut normalized_body = body.clone();
+            if validate_gov5_replay_v2_header(header.header()).is_ok() {
+                normalized_body.withdrawals = None;
+            }
             return <EthBeaconConsensus<C> as Consensus<EthBlock>>::validate_body_against_header(
                 &self.inner,
-                body,
+                &normalized_body,
                 &SealedHeader::seal_slow(normalized),
             );
         }
@@ -267,11 +336,12 @@ where
         block: &SealedBlock<EthBlock>,
     ) -> Result<(), ConsensusError> {
         if self.header_profile == N42HeaderProfile::Gov5H2 {
-            validate_gov5_h2_header(block.header()).map_err(ConsensusError::other)?;
             let mut normalized = block.clone().into_block();
-            normalized.header.ommers_hash = EMPTY_OMMER_ROOT_HASH;
-            normalized.header.difficulty = U256::ZERO;
-            normalized.header.extra_data = Bytes::new();
+            normalized.header =
+                normalized_gov5_header(block.header()).map_err(ConsensusError::other)?;
+            if validate_gov5_replay_v2_header(block.header()).is_ok() {
+                normalized.body.withdrawals = None;
+            }
             return self
                 .inner
                 .validate_block_pre_execution(&normalized.seal_slow());
@@ -286,11 +356,8 @@ where
 {
     fn validate_header(&self, header: &SealedHeader<Header>) -> Result<(), ConsensusError> {
         if self.header_profile == N42HeaderProfile::Gov5H2 {
-            validate_gov5_h2_header(header.header()).map_err(ConsensusError::other)?;
-            let mut normalized = header.header().clone();
-            normalized.ommers_hash = EMPTY_OMMER_ROOT_HASH;
-            normalized.difficulty = U256::ZERO;
-            normalized.extra_data = Bytes::new();
+            let normalized =
+                normalized_gov5_header(header.header()).map_err(ConsensusError::other)?;
             return self
                 .inner
                 .validate_header(&SealedHeader::seal_slow(normalized));
@@ -303,6 +370,38 @@ where
         header: &SealedHeader<Header>,
         parent: &SealedHeader<Header>,
     ) -> Result<(), ConsensusError> {
+        if self.header_profile == N42HeaderProfile::Gov5H2 {
+            if parent.hash() != header.parent_hash {
+                return Err(ConsensusError::ParentHashMismatch(
+                    reth_primitives_traits::GotExpected {
+                        got: header.parent_hash,
+                        expected: parent.hash(),
+                    }
+                    .into(),
+                ));
+            }
+            if parent.number.checked_add(1) != Some(header.number) {
+                return Err(ConsensusError::ParentBlockNumberMismatch {
+                    parent_block_number: parent.number,
+                    block_number: header.number,
+                });
+            }
+            let mut header =
+                normalized_gov5_header(header.header()).map_err(ConsensusError::other)?;
+            let parent = if parent.number == 0 {
+                parent.header().clone()
+            } else {
+                normalized_gov5_header(parent.header()).map_err(ConsensusError::other)?
+            };
+            // The inner Ethereum validator must compare like-for-like normalized headers. The
+            // authenticated outer parent link was checked above; rewriting only this temporary
+            // copy avoids comparing the Gov5 hash to its Ethereum-normalized hash.
+            header.parent_hash = parent.hash_slow();
+            return self.inner.validate_header_against_parent(
+                &SealedHeader::seal_slow(header),
+                &SealedHeader::seal_slow(parent),
+            );
+        }
         self.inner.validate_header_against_parent(header, parent)
     }
 }
@@ -435,6 +534,42 @@ mod tests {
                 MAX_GOV5_HEADER_EXTRA_BYTES + 1
             ))
         );
+    }
+
+    #[test]
+    fn gov5_replay_parent_validation_preserves_authenticated_outer_link() {
+        let gov5 = N42Consensus::new(Arc::new(ChainSpec::default()))
+            .with_header_profile(N42HeaderProfile::Gov5H2);
+        let replay_header = |number, parent_hash, timestamp| Header {
+            parent_hash,
+            ommers_hash: EMPTY_OMMER_ROOT_HASH,
+            difficulty: U256::ZERO,
+            number,
+            gas_limit: 30_000_000,
+            timestamp,
+            extra_data: Bytes::from(vec![0_u8; 32]),
+            base_fee_per_gas: Some(0),
+            withdrawals_root: Some(keccak256([])),
+            blob_gas_used: Some(0),
+            excess_blob_gas: Some(0),
+            parent_beacon_block_root: Some(B256::ZERO),
+            requests_hash: Some(EMPTY_ROOT_HASH),
+            ..Default::default()
+        };
+        let parent = SealedHeader::seal_slow(replay_header(1, B256::repeat_byte(0x11), 4));
+        let child = SealedHeader::seal_slow(replay_header(2, parent.hash(), 8));
+
+        gov5.validate_header_against_parent(&child, &parent)
+            .unwrap();
+
+        let forged = SealedHeader::seal_slow(Header {
+            parent_hash: B256::repeat_byte(0x42),
+            ..child.header().clone()
+        });
+        assert!(matches!(
+            gov5.validate_header_against_parent(&forged, &parent),
+            Err(ConsensusError::ParentHashMismatch(_))
+        ));
     }
 
     #[test]

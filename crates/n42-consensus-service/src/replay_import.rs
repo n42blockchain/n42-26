@@ -1,6 +1,10 @@
 use alloy_consensus::{Block, BlockBody, EMPTY_OMMER_ROOT_HASH, Header, TxEnvelope};
+use alloy_primitives::keccak256;
 use alloy_rpc_types_engine::ExecutionData;
-use n42_consensus::{N42HeaderProfile, validate_gov5_h2_header, validate_gov5_header_extra};
+use n42_consensus::{
+    N42HeaderProfile, validate_gov5_h2_header, validate_gov5_header_extra,
+    validate_gov5_interop_header, validate_gov5_replay_v2_header,
+};
 use n42_network::{FinalizedRangeVerification, VerifiedFinalizedRange};
 
 /// Side-effect-free Engine API input built exclusively from an authenticated
@@ -81,7 +85,9 @@ pub fn build_replay_execution_plan_with_profile(
         let payload = ExecutionData::from_block_unchecked(entry.block_hash(), &block);
         let original_extra = payload.payload.as_v1().extra_data.clone();
         let mut reconstruction_payload = payload.clone();
-        if header_profile == N42HeaderProfile::Gov5H2 {
+        let replay_v2_header = header_profile == N42HeaderProfile::Gov5H2
+            && validate_gov5_replay_v2_header(entry.header()).is_ok();
+        if header_profile == N42HeaderProfile::Gov5H2 && !replay_v2_header {
             validate_gov5_header_extra(&original_extra).map_err(|error| {
                 ReplayImportPlanError::PayloadReconstruction(entry.number(), error.to_string())
             })?;
@@ -94,10 +100,23 @@ pub fn build_replay_execution_plan_with_profile(
             .map_err(|error| {
                 ReplayImportPlanError::PayloadReconstruction(entry.number(), error.to_string())
             })?;
-        if header_profile == N42HeaderProfile::Gov5H2 {
+        if replay_v2_header {
+            reconstructed.header.withdrawals_root = Some(keccak256([]));
+            validate_gov5_replay_v2_header(&reconstructed.header).map_err(|error| {
+                ReplayImportPlanError::PayloadReconstruction(entry.number(), error.to_string())
+            })?;
+        } else if header_profile == N42HeaderProfile::Gov5H2 {
             reconstructed.header.ommers_hash = alloy_primitives::B256::ZERO;
-            reconstructed.header.difficulty = alloy_primitives::U256::from(1);
             reconstructed.header.extra_data = original_extra;
+            for difficulty in [
+                alloy_primitives::U256::ZERO,
+                alloy_primitives::U256::from(1),
+            ] {
+                reconstructed.header.difficulty = difficulty;
+                if reconstructed.header.hash_slow() == entry.block_hash() {
+                    break;
+                }
+            }
             validate_gov5_h2_header(&reconstructed.header).map_err(|error| {
                 ReplayImportPlanError::PayloadReconstruction(entry.number(), error.to_string())
             })?;
@@ -127,9 +146,14 @@ fn validate_v1_payload_inputs(
     header: &Header,
     header_profile: N42HeaderProfile,
 ) -> Result<(), ReplayImportPlanError> {
-    let expected_ommers_hash = match header_profile {
-        N42HeaderProfile::Ethereum => EMPTY_OMMER_ROOT_HASH,
-        N42HeaderProfile::Gov5H2 => alloy_primitives::B256::ZERO,
+    let expected_ommers_hash = if header_profile == N42HeaderProfile::Gov5H2
+        && validate_gov5_replay_v2_header(header).is_ok()
+    {
+        EMPTY_OMMER_ROOT_HASH
+    } else if header_profile == N42HeaderProfile::Gov5H2 {
+        alloy_primitives::B256::ZERO
+    } else {
+        EMPTY_OMMER_ROOT_HASH
     };
     if header.ommers_hash != expected_ommers_hash {
         return Err(ReplayImportPlanError::UnsupportedOmmersHash(
@@ -137,17 +161,19 @@ fn validate_v1_payload_inputs(
             header.ommers_hash,
         ));
     }
-    if header.withdrawals_root.is_some() {
+    let replay_v2_header = header_profile == N42HeaderProfile::Gov5H2
+        && validate_gov5_replay_v2_header(header).is_ok();
+    if !replay_v2_header && header.withdrawals_root.is_some() {
         return Err(ReplayImportPlanError::MissingWithdrawals(number));
     }
-    if header.requests_hash.is_some() {
+    if !replay_v2_header && header.requests_hash.is_some() {
         return Err(ReplayImportPlanError::MissingRequests(number));
     }
     if header.block_access_list_hash.is_some() {
         return Err(ReplayImportPlanError::MissingBlockAccessList(number));
     }
     if header_profile == N42HeaderProfile::Gov5H2 {
-        validate_gov5_h2_header(header)
+        validate_gov5_interop_header(header)
             .map_err(|error| ReplayImportPlanError::HeaderProfile(number, error.to_string()))?;
     }
     Ok(())

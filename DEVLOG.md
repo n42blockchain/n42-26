@@ -157,6 +157,7 @@ Logs are split into separate files by phase for easy maintenance:
 | [devlog-124-gov5-h2-engine-header-profile](docs/devlog-124-gov5-h2-engine-header-profile.md) | observer-only Gov5 H2 Engine header profile：无损重建 zero-ommers、difficulty=1、bounded N42H extra；两份真实 range 共 177 块/247 tx 计划通过 | Interop |
 | [devlog-125-gov5-native-execution-commitments](docs/devlog-125-gov5-native-execution-commitments.md) | Gov5 原生 receipt commitment 的执行后硬校验，以及 reth BundleState 到 replay-v2 QMDB 排序 mutation 的逐字节转换边界 | Interop |
 | [devlog-126-branch-safe-qmdb-state-root](docs/devlog-126-branch-safe-qmdb-state-root.md) | Reth 2.4.1 官方 StateRootStrategy 接入 branch-safe QMDB candidate store；认证 base、精确父分支重放和 observer-only 启动门禁 | Interop |
+| [devlog-127-gov5-replay-v2-execution-import](docs/devlog-127-gov5-replay-v2-execution-import.md) | Gov5 block 0 执行基线、Paris/TTD=0、归一化父链与 dirty/no-op QMDB 语义对齐；Rust 真执行 replay-v2 block 1–49/247 tx，head hash/root 完全一致 | Interop |
 
 ### 上游借鉴与跟踪
 

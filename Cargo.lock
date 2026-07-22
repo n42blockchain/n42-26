@@ -6988,6 +6988,7 @@ version = "0.5.0"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
+ "alloy-genesis",
  "alloy-primitives",
  "alloy-rlp",
  "alloy-rpc-types-engine",
@@ -7061,7 +7062,10 @@ name = "n42-node-bin"
 version = "0.5.0"
 dependencies = [
  "aes-gcm",
+ "alloy-consensus",
+ "alloy-genesis",
  "alloy-primitives",
+ "alloy-rpc-types-engine",
  "clap",
  "eyre",
  "hex",
@@ -7070,6 +7074,7 @@ dependencies = [
  "metrics",
  "n42-chainspec",
  "n42-consensus",
+ "n42-consensus-service",
  "n42-jmt",
  "n42-network",
  "n42-node",
@@ -7081,6 +7086,7 @@ dependencies = [
  "reth-ethereum-cli",
  "reth-node-builder",
  "reth-node-core",
+ "reth-primitives-traits",
  "reth-rpc-server-types",
  "reth-storage-api",
  "reth-tasks",

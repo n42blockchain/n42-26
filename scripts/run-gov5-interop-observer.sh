@@ -33,10 +33,28 @@ if [[ -n "${N42_QMDB_BOOTSTRAP:-}" ]]; then
     fi
 fi
 
+if [[ "${N42_GOV5_QMDB_EXECUTION:-0}" == "1" ]]; then
+    : "${N42_QMDB_BOOTSTRAP:?set N42_QMDB_BOOTSTRAP with N42_GOV5_QMDB_EXECUTION}"
+    : "${N42_GOV5_GENESIS_BOOTSTRAP:?set N42_GOV5_GENESIS_BOOTSTRAP with N42_GOV5_QMDB_EXECUTION}"
+    if [[ ! -f "$N42_GOV5_GENESIS_BOOTSTRAP" ]]; then
+        echo "gov5 genesis bootstrap does not exist: $N42_GOV5_GENESIS_BOOTSTRAP" >&2
+        exit 1
+    fi
+fi
+
 if [[ -n "${N42_FINALIZED_RANGE_BOOTSTRAP:-}" ]]; then
     : "${N42_QMDB_BOOTSTRAP:?set N42_QMDB_BOOTSTRAP with N42_FINALIZED_RANGE_BOOTSTRAP}"
     if [[ ! -f "$N42_FINALIZED_RANGE_BOOTSTRAP" ]]; then
         echo "finalized range bootstrap does not exist: $N42_FINALIZED_RANGE_BOOTSTRAP" >&2
+        exit 1
+    fi
+fi
+
+if [[ "${N42_GOV5_REPLAY_IMPORT:-0}" == "1" ]]; then
+    : "${N42_GOV5_QMDB_EXECUTION:?set N42_GOV5_QMDB_EXECUTION=1 with N42_GOV5_REPLAY_IMPORT}"
+    : "${N42_FINALIZED_RANGE_BOOTSTRAP:?set N42_FINALIZED_RANGE_BOOTSTRAP with N42_GOV5_REPLAY_IMPORT}"
+    if [[ "$N42_GOV5_QMDB_EXECUTION" != "1" ]]; then
+        echo "N42_GOV5_QMDB_EXECUTION must be 1 with N42_GOV5_REPLAY_IMPORT" >&2
         exit 1
     fi
 fi
