@@ -12,7 +12,8 @@ use crate::gossipsub::topics::{
     blob_sidecar_topic, block_announce_topic, consensus_topic, mempool_topic,
 };
 use crate::gov5_rpc::{
-    GOV5_BLOCK_BY_HASH_PROTOCOL, GOV5_BLOCK_PUSH_PROTOCOL, Gov5BlockByHashCodec, Gov5BlockPushCodec,
+    GOV5_BLOCK_BY_HASH_PROTOCOL, GOV5_BLOCK_PUSH_PROTOCOL, GOV5_STATUS_PROTOCOL,
+    Gov5BlockByHashCodec, Gov5BlockPushCodec, Gov5StatusCodec,
 };
 use crate::state_sync::StateSyncCodec;
 use crate::tx_forward::TxForwardCodec;
@@ -35,6 +36,8 @@ pub struct N42Behaviour {
     pub gov5_block_push: libp2p::request_response::Behaviour<Gov5BlockPushCodec>,
     /// Gov5 fetch-on-miss block retrieval, enabled outbound for observer catch-up.
     pub gov5_block_by_hash: libp2p::request_response::Behaviour<Gov5BlockByHashCodec>,
+    /// Gov5 chain-status handshake, enabled only on the TCP interop observer.
+    pub gov5_status: libp2p::request_response::Behaviour<Gov5StatusCodec>,
     /// Transaction forwarding from non-leader validators to current leader.
     pub tx_forward: libp2p::request_response::Behaviour<TxForwardCodec>,
     /// Disabled in production; enabled in dev/test via `enable_mdns`.
@@ -305,6 +308,20 @@ fn build_swarm_with_transports(
                 .with_request_timeout(Duration::from_secs(10)),
         );
 
+        let gov5_status_protocols = enable_gov5_tcp
+            .then(|| {
+                (
+                    libp2p::StreamProtocol::new(GOV5_STATUS_PROTOCOL),
+                    libp2p::request_response::ProtocolSupport::Full,
+                )
+            })
+            .into_iter();
+        let gov5_status = libp2p::request_response::Behaviour::new(
+            gov5_status_protocols,
+            libp2p::request_response::Config::default()
+                .with_request_timeout(Duration::from_secs(10)),
+        );
+
         let tx_forward = libp2p::request_response::Behaviour::new(
             [(
                 libp2p::StreamProtocol::new(crate::tx_forward::TX_FORWARD_PROTOCOL),
@@ -361,6 +378,7 @@ fn build_swarm_with_transports(
             block_direct,
             gov5_block_push,
             gov5_block_by_hash,
+            gov5_status,
             tx_forward,
             mdns,
             kademlia,

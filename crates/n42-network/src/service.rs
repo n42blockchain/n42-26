@@ -22,6 +22,7 @@ use crate::gossipsub::topics::{
 };
 use crate::gov5_rpc::{
     Gov5BlockByHashRequest, Gov5BlockByHashResponse, Gov5BlockPushRequest, Gov5BlockPushResponse,
+    Gov5Status,
 };
 use crate::h2_v4::{H2V4ChainIdentity, H2V4Envelope, decode_gossip as decode_h2_v4_gossip};
 use crate::h2_wire::{H2Message, decode_gov5_gossip_message};
@@ -566,6 +567,8 @@ pub struct NetworkService {
     gov5_block_topic_hash: Option<gossipsub::TopicHash>,
     h2_v4_topic_hash: Option<gossipsub::TopicHash>,
     h2_v4_identity: Option<H2V4ChainIdentity>,
+    gov5_status: Option<Gov5Status>,
+    pending_gov5_status_peers: HashSet<PeerId>,
     block_announce_topic_hash: gossipsub::TopicHash,
     mempool_topic_hash: gossipsub::TopicHash,
     blob_sidecar_topic_hash: gossipsub::TopicHash,
@@ -780,6 +783,10 @@ impl NetworkService {
             tracing::info!(topic = %topic.hash(), "subscribed to gov5 block observer topic");
         }
         let h2_v4_observer_topic = h2_v4_identity.map(|_| h2_v4_topic());
+        let gov5_status = h2_v4_identity.map(|identity| Gov5Status {
+            genesis_hash: identity.genesis_hash,
+            current_height: 0,
+        });
         if let Some(topic) = h2_v4_observer_topic.as_ref() {
             swarm
                 .behaviour_mut()
@@ -825,6 +832,8 @@ impl NetworkService {
             gov5_block_topic_hash,
             h2_v4_topic_hash,
             h2_v4_identity,
+            gov5_status,
+            pending_gov5_status_peers: HashSet::new(),
             block_announce_topic_hash,
             mempool_topic_hash,
             blob_sidecar_topic_hash,
@@ -879,6 +888,22 @@ impl NetworkService {
         }
 
         loop {
+            // Gov5 gives an inbound peer ten seconds to initiate Status. Flush
+            // this immediately after ConnectionEstablished, ahead of catch-up
+            // queues that can remain continuously non-empty.
+            if let Some(status) = self.gov5_status {
+                for peer_id in std::mem::take(&mut self.pending_gov5_status_peers) {
+                    if self.swarm.is_connected(&peer_id) {
+                        let request_id = self
+                            .swarm
+                            .behaviour_mut()
+                            .gov5_status
+                            .send_request(&peer_id, status);
+                        tracing::info!(%peer_id, %request_id, "queued gov5 Status handshake");
+                    }
+                }
+            }
+
             while let Some(event) = self.pending_reliable_events.pop_front() {
                 let tx = self.consensus_event_tx.clone();
                 if tx.send(event).await.is_err() {
@@ -988,6 +1013,9 @@ impl NetworkService {
             SwarmEvent::Behaviour(N42BehaviourEvent::Gov5BlockByHash(event)) => {
                 self.handle_gov5_block_by_hash_event(event);
             }
+            SwarmEvent::Behaviour(N42BehaviourEvent::Gov5Status(event)) => {
+                self.handle_gov5_status_event(event);
+            }
             SwarmEvent::Behaviour(N42BehaviourEvent::TxForward(event)) => {
                 self.handle_tx_forward_event(event);
             }
@@ -1007,12 +1035,16 @@ impl NetworkService {
                 tracing::info!(%peer_id, "peer connected");
                 metrics::gauge!("n42_active_peer_connections").increment(1.0);
                 self.reconnection.on_connected(&peer_id);
+                if self.gov5_status.is_some() {
+                    self.pending_gov5_status_peers.insert(peer_id);
+                }
                 self.emit_event(NetworkEvent::PeerConnected(peer_id));
             }
             SwarmEvent::ConnectionClosed { peer_id, .. } => {
                 tracing::info!(%peer_id, "peer disconnected");
                 metrics::gauge!("n42_active_peer_connections").decrement(1.0);
                 self.reconnection.on_disconnected(&peer_id);
+                self.pending_gov5_status_peers.remove(&peer_id);
                 self.sync_request_windows.remove(&peer_id);
                 self.clear_validator_mapping_for_peer(&peer_id);
                 self.clear_authenticated_validator_peer(&peer_id);
@@ -1767,6 +1799,56 @@ impl NetworkService {
                 message: libp2p::request_response::Message::Request { .. },
                 ..
             } => {}
+        }
+    }
+
+    fn handle_gov5_status_event(
+        &mut self,
+        event: libp2p::request_response::Event<Gov5Status, Gov5Status>,
+    ) {
+        let Some(local_status) = self.gov5_status else {
+            return;
+        };
+        match event {
+            libp2p::request_response::Event::Message {
+                peer,
+                message:
+                    libp2p::request_response::Message::Request {
+                        request, channel, ..
+                    },
+                ..
+            } => {
+                if request.genesis_hash != local_status.genesis_hash {
+                    tracing::warn!(%peer, remote_genesis = %request.genesis_hash, local_genesis = %local_status.genesis_hash, "gov5 status genesis mismatch");
+                }
+                let _ = self
+                    .swarm
+                    .behaviour_mut()
+                    .gov5_status
+                    .send_response(channel, local_status);
+            }
+            libp2p::request_response::Event::Message {
+                peer,
+                message: libp2p::request_response::Message::Response { response, .. },
+                ..
+            } => {
+                if response.genesis_hash == local_status.genesis_hash {
+                    metrics::counter!("n42_gov5_status_succeeded_total").increment(1);
+                    tracing::debug!(%peer, height = response.current_height, "validated gov5 status response");
+                } else {
+                    metrics::counter!("n42_gov5_status_failed_total").increment(1);
+                    tracing::warn!(%peer, remote_genesis = %response.genesis_hash, local_genesis = %local_status.genesis_hash, "rejected gov5 status response for another genesis");
+                }
+            }
+            libp2p::request_response::Event::OutboundFailure { peer, error, .. } => {
+                metrics::counter!("n42_gov5_status_failed_total").increment(1);
+                tracing::info!(%peer, %error, "gov5 status outbound exchange failed");
+            }
+            libp2p::request_response::Event::InboundFailure { peer, error, .. } => {
+                metrics::counter!("n42_gov5_status_failed_total").increment(1);
+                tracing::info!(%peer, %error, "gov5 status inbound exchange failed");
+            }
+            libp2p::request_response::Event::ResponseSent { .. } => {}
         }
     }
 
