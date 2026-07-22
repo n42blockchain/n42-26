@@ -5,14 +5,17 @@ use crate::exec_cache::ExecutionOutputCache;
 use crate::h2_finality::verify_h2_v4_decide;
 use crate::orchestrator::bad_block_cache::BadBlockCache;
 use crate::orchestrator::{BlobSidecarBroadcast, BlockDataBroadcast, CommittedBlock};
+use crate::replay_import::build_gov5_execution_data;
 use alloy_primitives::B256;
-use alloy_rpc_types_engine::{ForkchoiceState, PayloadStatusEnum};
+use alloy_rpc_types_engine::{ExecutionData, ForkchoiceState, PayloadStatusEnum};
 use metrics::{counter, gauge};
 use n42_chainspec::ValidatorInfo;
 use n42_consensus::{ValidatorSet, validator_changes_hash, verify_commit_qc};
-use n42_network::{BlockSyncResponse, NetworkEvent, NetworkHandle, PeerId, SyncBlock};
+use n42_network::{
+    BlockSyncResponse, NetworkEvent, NetworkHandle, PeerId, SyncBlock, decode_gov5_block_rlp,
+};
 use n42_primitives::QuorumCertificate;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -33,6 +36,20 @@ const SYNC_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Maximum number of blocks to request per sync batch (matches network layer limit).
 const MAX_SYNC_BATCH: u64 = 128;
+
+/// Bounds unauthenticated live block bodies and authenticated Decide records
+/// retained while their counterpart is in flight.
+const MAX_GOV5_LIVE_PENDING: usize = 512;
+
+const GOV5_FETCH_RETRY_INTERVAL: Duration = Duration::from_secs(2);
+
+#[derive(Clone)]
+struct PendingGov5LiveBlock {
+    execution_data: ExecutionData,
+    parent_hash: B256,
+    number: u64,
+    executed: bool,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SyncTargetSource {
@@ -169,6 +186,14 @@ pub struct ObserverOrchestrator {
     // Deterministic Engine API payload rejections shared by gossip and sync paths.
     bad_blocks: BadBlockCache,
 
+    // Gov5 live interop. Bodies are pre-executed, but only an independently
+    // verified H2-v4 Decide may promote one to canonical/safe/finalized head.
+    gov5_live_blocks: HashMap<B256, PendingGov5LiveBlock>,
+    gov5_live_order: VecDeque<B256>,
+    gov5_finality: HashMap<B256, u64>,
+    gov5_finality_order: VecDeque<B256>,
+    gov5_fetch_requested_at: HashMap<B256, Instant>,
+
     // Progress
     blocks_imported: u64,
     sync_start_time: Instant,
@@ -203,6 +228,11 @@ impl ObserverOrchestrator {
             blob_store: None,
             exec_output_cache: None,
             bad_blocks: BadBlockCache::default(),
+            gov5_live_blocks: HashMap::new(),
+            gov5_live_order: VecDeque::new(),
+            gov5_finality: HashMap::new(),
+            gov5_finality_order: VecDeque::new(),
+            gov5_fetch_requested_at: HashMap::new(),
             blocks_imported: 0,
             sync_start_time: Instant::now(),
         }
@@ -290,6 +320,25 @@ impl ObserverOrchestrator {
                 let kind = message.kind().as_str();
                 debug!(target: "n42::observer", %source, kind, "validated legacy gov5 H2 message");
             }
+            NetworkEvent::Gov5Block { source, rlp } => {
+                self.handle_gov5_block(source, rlp, None).await;
+            }
+            NetworkEvent::Gov5BlockFetched {
+                source,
+                requested_hash,
+                rlp,
+            } => {
+                self.handle_gov5_block(source, rlp, Some(requested_hash))
+                    .await;
+            }
+            NetworkEvent::Gov5BlockFetchFailed {
+                source,
+                block_hash,
+                error,
+            } => {
+                warn!(target: "n42::observer", %source, %block_hash, %error, "gov5 block fetch failed");
+                self.retry_gov5_block_fetch(source, block_hash);
+            }
             NetworkEvent::H2V4Message { source, envelope } => {
                 let kind = envelope.message.kind().as_str();
                 debug!(target: "n42::observer", %source, kind, changes_hash = %envelope.changes_hash, "validated H2-v4 message");
@@ -308,6 +357,17 @@ impl ObserverOrchestrator {
                                 self.highest_seen_view = self.highest_seen_view.max(proof.view);
                                 self.highest_sync_target_view =
                                     self.highest_sync_target_view.max(proof.view);
+                                if proof.view <= self.local_view {
+                                    debug!(
+                                        target: "n42::observer",
+                                        %source,
+                                        view = proof.view,
+                                        local_view = self.local_view,
+                                        block_hash = %proof.block_hash,
+                                        "ignored already-observed gov5 H2-v4 finality proof"
+                                    );
+                                    return;
+                                }
                                 info!(
                                     target: "n42::observer",
                                     %source,
@@ -315,6 +375,11 @@ impl ObserverOrchestrator {
                                     block_hash = %proof.block_hash,
                                     "verified gov5 H2-v4 finality proof"
                                 );
+                                self.record_gov5_finality(proof.block_hash, proof.view);
+                                if !self.gov5_live_blocks.contains_key(&proof.block_hash) {
+                                    self.request_gov5_block(source, proof.block_hash);
+                                }
+                                self.drive_gov5_live_import().await;
                             }
                             Err(error) => warn!(
                                 target: "n42::observer",
@@ -353,6 +418,262 @@ impl ObserverOrchestrator {
             }
             // Observer ignores consensus messages, transactions, and verification receipts.
             _ => {}
+        }
+    }
+
+    async fn handle_gov5_block(
+        &mut self,
+        source: PeerId,
+        rlp: Vec<u8>,
+        requested_hash: Option<B256>,
+    ) {
+        if let Some(requested_hash) = requested_hash {
+            self.gov5_fetch_requested_at.remove(&requested_hash);
+        }
+        let block = match decode_gov5_block_rlp(&rlp) {
+            Ok(block) => block,
+            Err(error) => {
+                counter!("n42_gov5_live_blocks_rejected_total", "stage" => "decode").increment(1);
+                warn!(target: "n42::observer", %source, %error, "rejected invalid gov5 live block");
+                if let Some(requested_hash) = requested_hash {
+                    self.retry_gov5_block_fetch(source, requested_hash);
+                }
+                return;
+            }
+        };
+        let hash = block.block_hash;
+        if let Some(requested_hash) = requested_hash
+            && requested_hash != hash
+        {
+            counter!("n42_gov5_live_blocks_rejected_total", "stage" => "fetch_hash").increment(1);
+            warn!(target: "n42::observer", %source, %requested_hash, received_hash = %hash, "gov5 peer returned a different block than requested");
+            self.retry_gov5_block_fetch(source, requested_hash);
+            return;
+        }
+        if hash == self.head_block_hash || self.bad_blocks.should_skip(hash, "gov5_live_gossip") {
+            return;
+        }
+        let execution_data = match build_gov5_execution_data(
+            hash,
+            &block.header,
+            &block.transactions,
+        ) {
+            Ok(payload) => payload,
+            Err(error) => {
+                counter!("n42_gov5_live_blocks_rejected_total", "stage" => "payload").increment(1);
+                warn!(target: "n42::observer", %source, %hash, number = block.header.number, %error, "rejected non-reconstructible gov5 live block");
+                if let Some(requested_hash) = requested_hash {
+                    self.retry_gov5_block_fetch(source, requested_hash);
+                }
+                return;
+            }
+        };
+
+        if !self.gov5_live_blocks.contains_key(&hash) {
+            self.gov5_live_order.push_back(hash);
+            self.gov5_live_blocks.insert(
+                hash,
+                PendingGov5LiveBlock {
+                    execution_data,
+                    parent_hash: block.header.parent_hash,
+                    number: block.header.number,
+                    executed: false,
+                },
+            );
+            self.trim_gov5_live_cache();
+            debug!(target: "n42::observer", %source, %hash, number = block.header.number, "accepted authenticated-shape gov5 live block body");
+        }
+        let parent_hash = block.header.parent_hash;
+        if parent_hash != self.head_block_hash && !self.gov5_live_blocks.contains_key(&parent_hash)
+        {
+            self.request_gov5_block(source, parent_hash);
+        }
+        self.drive_gov5_live_import().await;
+    }
+
+    fn request_gov5_block(&mut self, peer: PeerId, block_hash: B256) {
+        if block_hash == self.head_block_hash || self.gov5_live_blocks.contains_key(&block_hash) {
+            return;
+        }
+        if self.gov5_fetch_requested_at.len() >= MAX_GOV5_LIVE_PENDING
+            && !self.gov5_fetch_requested_at.contains_key(&block_hash)
+        {
+            warn!(target: "n42::observer", %peer, %block_hash, "gov5 block fetch window is full");
+            return;
+        }
+        let now = Instant::now();
+        if self
+            .gov5_fetch_requested_at
+            .get(&block_hash)
+            .is_some_and(|requested| now.duration_since(*requested) < GOV5_FETCH_RETRY_INTERVAL)
+        {
+            return;
+        }
+        match self.network.request_gov5_block_by_hash(peer, block_hash) {
+            Ok(()) => {
+                self.gov5_fetch_requested_at.insert(block_hash, now);
+                debug!(target: "n42::observer", %peer, %block_hash, "requesting missing gov5 block by hash");
+            }
+            Err(error) => {
+                warn!(target: "n42::observer", %peer, %block_hash, %error, "could not queue gov5 block fetch");
+            }
+        }
+    }
+
+    fn retry_gov5_block_fetch(&mut self, failed_peer: PeerId, block_hash: B256) {
+        self.gov5_fetch_requested_at.remove(&block_hash);
+        if let Some(peer) = self
+            .connected_peers
+            .iter()
+            .copied()
+            .find(|peer| *peer != failed_peer)
+        {
+            self.request_gov5_block(peer, block_hash);
+        }
+    }
+
+    fn record_gov5_finality(&mut self, hash: B256, view: u64) {
+        if self.gov5_finality.insert(hash, view).is_none() {
+            self.gov5_finality_order.push_back(hash);
+        }
+        while self.gov5_finality_order.len() > MAX_GOV5_LIVE_PENDING {
+            if let Some(evicted) = self.gov5_finality_order.pop_front() {
+                self.gov5_finality.remove(&evicted);
+            }
+        }
+    }
+
+    fn trim_gov5_live_cache(&mut self) {
+        while self.gov5_live_order.len() > MAX_GOV5_LIVE_PENDING {
+            if let Some(evicted) = self.gov5_live_order.pop_front() {
+                self.gov5_live_blocks.remove(&evicted);
+            }
+        }
+    }
+
+    fn gov5_finalized_path_to_head(&self, finalized_hash: B256) -> Option<Vec<(u64, B256)>> {
+        let mut path = Vec::new();
+        let mut cursor = finalized_hash;
+        let mut child_number = None;
+        loop {
+            let block = self.gov5_live_blocks.get(&cursor)?;
+            if !block.executed {
+                return None;
+            }
+            if child_number.is_some_and(|child| block.number.checked_add(1) != Some(child)) {
+                return None;
+            }
+            path.push((block.number, cursor));
+            if block.parent_hash == self.head_block_hash {
+                path.reverse();
+                return Some(path);
+            }
+            if path.len() >= MAX_GOV5_LIVE_PENDING {
+                return None;
+            }
+            child_number = Some(block.number);
+            cursor = block.parent_hash;
+        }
+    }
+
+    /// Drives the two independent halves of live following to a fixed point:
+    /// bodies may execute before finality, but FCU promotion requires both a
+    /// Valid EL result and a verified H2-v4 Decide for the same hash.
+    async fn drive_gov5_live_import(&mut self) {
+        let mut candidates: Vec<_> = self
+            .gov5_live_blocks
+            .iter()
+            .filter_map(|(hash, block)| (!block.executed).then_some((block.number, *hash)))
+            .collect();
+        candidates.sort_unstable();
+        let mut rejected = Vec::new();
+        for (_, hash) in candidates {
+            if self.bad_blocks.should_skip(hash, "gov5_live_pre_submit") {
+                rejected.push(hash);
+                continue;
+            }
+            let Some(payload) = self
+                .gov5_live_blocks
+                .get(&hash)
+                .map(|block| block.execution_data.clone())
+            else {
+                continue;
+            };
+            match self.el.new_payload(payload).await {
+                Ok(status) if matches!(status.status, PayloadStatusEnum::Valid) => {
+                    if let Some(block) = self.gov5_live_blocks.get_mut(&hash) {
+                        block.executed = true;
+                    }
+                    counter!("n42_gov5_live_blocks_executed_total").increment(1);
+                }
+                Ok(status)
+                    if matches!(
+                        status.status,
+                        PayloadStatusEnum::Syncing | PayloadStatusEnum::Accepted
+                    ) =>
+                {
+                    debug!(target: "n42::observer", %hash, status = ?status.status, "gov5 live block awaits parent execution");
+                }
+                Ok(status) => {
+                    self.bad_blocks
+                        .insert_if_invalid(hash, &status.status, "gov5_live_import");
+                    warn!(target: "n42::observer", %hash, status = ?status.status, "new_payload rejected gov5 live block");
+                    rejected.push(hash);
+                }
+                Err(error) => {
+                    error!(target: "n42::observer", %hash, %error, "new_payload failed for gov5 live block");
+                }
+            }
+        }
+        for hash in rejected {
+            self.gov5_live_blocks.remove(&hash);
+            self.gov5_live_order.retain(|queued| *queued != hash);
+            self.gov5_finality.remove(&hash);
+            self.gov5_finality_order.retain(|queued| *queued != hash);
+        }
+
+        loop {
+            let next = self
+                .gov5_finality
+                .iter()
+                .filter_map(|(hash, view)| {
+                    self.gov5_finalized_path_to_head(*hash)
+                        .map(|path| (*view, *hash, path))
+                })
+                .min_by_key(|(view, _, _)| *view);
+            let Some((view, hash, path)) = next else {
+                break;
+            };
+            let first_number = path.first().map(|(number, _)| *number).unwrap_or_default();
+            let number = path.last().map(|(number, _)| *number).unwrap_or_default();
+            let state = ForkchoiceState {
+                head_block_hash: hash,
+                safe_block_hash: hash,
+                finalized_block_hash: hash,
+            };
+            let promoted = match self.el.fork_choice_updated(state).await {
+                Ok(result) => matches!(result.payload_status.status, PayloadStatusEnum::Valid),
+                Err(error) => {
+                    error!(target: "n42::observer", %hash, %error, "fork_choice_updated failed for finalized gov5 live block");
+                    false
+                }
+            };
+            if !promoted {
+                warn!(target: "n42::observer", %hash, view, "EL did not promote finalized gov5 live block");
+                break;
+            }
+
+            self.head_block_hash = hash;
+            self.local_view = view;
+            self.highest_seen_view = self.highest_seen_view.max(view);
+            self.highest_sync_target_view = self.highest_sync_target_view.max(view);
+            self.blocks_imported += path.len() as u64;
+            counter!("n42_observer_blocks_imported").increment(path.len() as u64);
+            counter!("n42_gov5_live_blocks_finalized_total").increment(1);
+            gauge!("n42_observer_view").set(view as f64);
+            info!(target: "n42::observer", %hash, first_number, number, imported = path.len(), view, "finalized gov5 live lineage imported");
+            self.gov5_finality.remove(&hash);
+            self.gov5_finality_order.retain(|queued| *queued != hash);
         }
     }
 

@@ -73,72 +73,96 @@ pub fn build_replay_execution_plan_with_profile(
 
     let mut payloads = Vec::with_capacity(range.entries().len());
     for entry in range.entries() {
-        validate_v1_payload_inputs(entry.number(), entry.header(), header_profile)?;
-        let block = Block {
-            header: entry.header().clone(),
-            body: BlockBody {
-                transactions: entry.transactions().to_vec(),
-                ommers: Vec::new(),
-                withdrawals: None,
-            },
-        };
-        let payload = ExecutionData::from_block_unchecked(entry.block_hash(), &block);
-        let original_extra = payload.payload.as_v1().extra_data.clone();
-        let mut reconstruction_payload = payload.clone();
-        let replay_v2_header = header_profile == N42HeaderProfile::Gov5H2
-            && validate_gov5_replay_v2_header(entry.header()).is_ok();
-        if header_profile == N42HeaderProfile::Gov5H2 && !replay_v2_header {
-            validate_gov5_header_extra(&original_extra).map_err(|error| {
-                ReplayImportPlanError::PayloadReconstruction(entry.number(), error.to_string())
-            })?;
-            reconstruction_payload
-                .payload
-                .set_extra_data(alloy_primitives::Bytes::new());
-        }
-        let mut reconstructed = reconstruction_payload
-            .try_into_block::<TxEnvelope>()
-            .map_err(|error| {
-                ReplayImportPlanError::PayloadReconstruction(entry.number(), error.to_string())
-            })?;
-        if replay_v2_header {
-            reconstructed.header.withdrawals_root = Some(keccak256([]));
-            validate_gov5_replay_v2_header(&reconstructed.header).map_err(|error| {
-                ReplayImportPlanError::PayloadReconstruction(entry.number(), error.to_string())
-            })?;
-        } else if header_profile == N42HeaderProfile::Gov5H2 {
-            reconstructed.header.ommers_hash = alloy_primitives::B256::ZERO;
-            reconstructed.header.extra_data = original_extra;
-            for difficulty in [
-                alloy_primitives::U256::ZERO,
-                alloy_primitives::U256::from(1),
-            ] {
-                reconstructed.header.difficulty = difficulty;
-                if reconstructed.header.hash_slow() == entry.block_hash() {
-                    break;
-                }
-            }
-            validate_gov5_h2_header(&reconstructed.header).map_err(|error| {
-                ReplayImportPlanError::PayloadReconstruction(entry.number(), error.to_string())
-            })?;
-        }
-        if payload.block_hash() != entry.block_hash()
-            || payload.parent_hash() != entry.parent_hash()
-            || payload.block_number() != entry.number()
-            || reconstructed.header.hash_slow() != entry.block_hash()
-        {
-            return Err(ReplayImportPlanError::PayloadIdentity {
-                number: entry.number(),
-                expected: entry.block_hash(),
-                reconstructed: reconstructed.header.hash_slow(),
-            });
-        }
-        payloads.push(payload);
+        payloads.push(build_execution_data(
+            entry.block_hash(),
+            entry.header(),
+            entry.transactions(),
+            header_profile,
+        )?);
     }
 
     Ok(ReplayExecutionPlan {
         verification: verification.clone(),
         payloads,
     })
+}
+
+/// Converts a structurally verified Gov5 gossip block into an Engine payload
+/// while proving that Engine's lossy header representation reconstructs to the
+/// exact H2-authenticated outer block hash.
+pub fn build_gov5_execution_data(
+    block_hash: alloy_primitives::B256,
+    header: &Header,
+    transactions: &[TxEnvelope],
+) -> Result<ExecutionData, ReplayImportPlanError> {
+    build_execution_data(block_hash, header, transactions, N42HeaderProfile::Gov5H2)
+}
+
+fn build_execution_data(
+    block_hash: alloy_primitives::B256,
+    header: &Header,
+    transactions: &[TxEnvelope],
+    header_profile: N42HeaderProfile,
+) -> Result<ExecutionData, ReplayImportPlanError> {
+    let number = header.number;
+    validate_v1_payload_inputs(number, header, header_profile)?;
+    let block = Block {
+        header: header.clone(),
+        body: BlockBody {
+            transactions: transactions.to_vec(),
+            ommers: Vec::new(),
+            withdrawals: None,
+        },
+    };
+    let payload = ExecutionData::from_block_unchecked(block_hash, &block);
+    let original_extra = payload.payload.as_v1().extra_data.clone();
+    let mut reconstruction_payload = payload.clone();
+    let replay_v2_header = header_profile == N42HeaderProfile::Gov5H2
+        && validate_gov5_replay_v2_header(header).is_ok();
+    if header_profile == N42HeaderProfile::Gov5H2 && !replay_v2_header {
+        validate_gov5_header_extra(&original_extra).map_err(|error| {
+            ReplayImportPlanError::PayloadReconstruction(number, error.to_string())
+        })?;
+        reconstruction_payload
+            .payload
+            .set_extra_data(alloy_primitives::Bytes::new());
+    }
+    let mut reconstructed = reconstruction_payload
+        .try_into_block::<TxEnvelope>()
+        .map_err(|error| ReplayImportPlanError::PayloadReconstruction(number, error.to_string()))?;
+    if replay_v2_header {
+        reconstructed.header.withdrawals_root = Some(keccak256([]));
+        validate_gov5_replay_v2_header(&reconstructed.header).map_err(|error| {
+            ReplayImportPlanError::PayloadReconstruction(number, error.to_string())
+        })?;
+    } else if header_profile == N42HeaderProfile::Gov5H2 {
+        reconstructed.header.ommers_hash = alloy_primitives::B256::ZERO;
+        reconstructed.header.extra_data = original_extra;
+        for difficulty in [
+            alloy_primitives::U256::ZERO,
+            alloy_primitives::U256::from(1),
+        ] {
+            reconstructed.header.difficulty = difficulty;
+            if reconstructed.header.hash_slow() == block_hash {
+                break;
+            }
+        }
+        validate_gov5_h2_header(&reconstructed.header).map_err(|error| {
+            ReplayImportPlanError::PayloadReconstruction(number, error.to_string())
+        })?;
+    }
+    if payload.block_hash() != block_hash
+        || payload.parent_hash() != header.parent_hash
+        || payload.block_number() != number
+        || reconstructed.header.hash_slow() != block_hash
+    {
+        return Err(ReplayImportPlanError::PayloadIdentity {
+            number,
+            expected: block_hash,
+            reconstructed: reconstructed.header.hash_slow(),
+        });
+    }
+    Ok(payload)
 }
 
 fn validate_v1_payload_inputs(

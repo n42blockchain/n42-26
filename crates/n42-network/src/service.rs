@@ -17,11 +17,14 @@ use crate::gossipsub::handlers::{
     decode_consensus_message, encode_consensus_message, validate_message,
 };
 use crate::gossipsub::topics::{
-    blob_sidecar_topic, block_announce_topic, consensus_topic, gov5_h2_topic, h2_v4_topic,
-    mempool_topic, verification_receipts_topic,
+    blob_sidecar_topic, block_announce_topic, consensus_topic, gov5_block_topic, gov5_h2_topic,
+    h2_v4_topic, mempool_topic, verification_receipts_topic,
 };
-use crate::h2_wire::{H2Message, decode_gov5_gossip_message};
+use crate::gov5_rpc::{
+    Gov5BlockByHashRequest, Gov5BlockByHashResponse, Gov5BlockPushRequest, Gov5BlockPushResponse,
+};
 use crate::h2_v4::{H2V4ChainIdentity, H2V4Envelope, decode_gossip as decode_h2_v4_gossip};
+use crate::h2_wire::{H2Message, decode_gov5_gossip_message};
 use crate::reconnection::ReconnectionManager;
 use crate::state_sync::{BlockSyncRequest, BlockSyncResponse};
 use crate::transport::{N42Behaviour, N42BehaviourEvent, deterministic_validator_peer_id};
@@ -124,6 +127,11 @@ pub enum NetworkCommand {
         peer: PeerId,
         request: BlockSyncRequest,
     },
+    /// Fetch one Gov5 block body from an already-connected peer.
+    RequestGov5BlockByHash {
+        peer: PeerId,
+        block_hash: B256,
+    },
     SendSyncResponse {
         request_id: u64,
         response: BlockSyncResponse,
@@ -163,6 +171,24 @@ pub enum NetworkEvent {
     Gov5H2Message {
         source: PeerId,
         message: Box<H2Message>,
+    },
+    /// Snappy-decoded Gov5 ETH-style RLP block. It remains untrusted until the
+    /// observer validates its header/body commitments and matches its hash to
+    /// an authenticated H2-v4 Decide.
+    Gov5Block {
+        source: PeerId,
+        rlp: Vec<u8>,
+    },
+    /// Gov5 block returned by the hash-bound fetch-on-miss protocol.
+    Gov5BlockFetched {
+        source: PeerId,
+        requested_hash: B256,
+        rlp: Vec<u8>,
+    },
+    Gov5BlockFetchFailed {
+        source: PeerId,
+        block_hash: B256,
+        error: String,
     },
     H2V4Message {
         source: PeerId,
@@ -510,6 +536,14 @@ impl NetworkHandle {
         )
         .await
     }
+
+    pub fn request_gov5_block_by_hash(
+        &self,
+        peer: PeerId,
+        block_hash: B256,
+    ) -> Result<(), NetworkError> {
+        self.send_priority(NetworkCommand::RequestGov5BlockByHash { peer, block_hash })
+    }
 }
 
 /// The network service drives the libp2p swarm and bridges messages between
@@ -529,6 +563,7 @@ pub struct NetworkService {
     pending_data_events: VecDeque<NetworkEvent>,
     consensus_topic_hash: gossipsub::TopicHash,
     gov5_h2_topic_hash: Option<gossipsub::TopicHash>,
+    gov5_block_topic_hash: Option<gossipsub::TopicHash>,
     h2_v4_topic_hash: Option<gossipsub::TopicHash>,
     h2_v4_identity: Option<H2V4ChainIdentity>,
     block_announce_topic_hash: gossipsub::TopicHash,
@@ -538,6 +573,7 @@ pub struct NetworkService {
     /// Maps internal request ID → libp2p ResponseChannel for sending sync replies.
     pending_sync_channels:
         HashMap<u64, libp2p::request_response::ResponseChannel<BlockSyncResponse>>,
+    pending_gov5_block_requests: HashMap<libp2p::request_response::OutboundRequestId, B256>,
     /// Fixed-window protection for inbound catch-up work. Validators receive a
     /// higher allowance, while unauthenticated peers cannot monopolize the
     /// bounded response-channel table or node-side database reads.
@@ -626,7 +662,7 @@ impl NetworkService {
         ),
         NetworkError,
     > {
-        Self::new_with_options(swarm, HashMap::new(), true, None, None)
+        Self::new_with_options(swarm, HashMap::new(), true, None, None, None)
     }
 
     /// Creates a non-voting service which also subscribes to the gov5 H2 topic
@@ -649,6 +685,7 @@ impl NetworkService {
             HashMap::new(),
             true,
             Some(gov5_h2_topic(genesis_hash)),
+            Some(gov5_block_topic(genesis_hash)),
             Some(H2V4ChainIdentity {
                 chain_id,
                 genesis_hash,
@@ -675,6 +712,7 @@ impl NetworkService {
             allow_deterministic_peer_ids,
             None,
             None,
+            None,
         )
     }
 
@@ -683,6 +721,7 @@ impl NetworkService {
         expected_validator_peer_ids: HashMap<u32, PeerId>,
         allow_deterministic_peer_ids: bool,
         gov5_h2_observer_topic: Option<gossipsub::IdentTopic>,
+        gov5_block_observer_topic: Option<gossipsub::IdentTopic>,
         h2_v4_identity: Option<H2V4ChainIdentity>,
     ) -> Result<
         (
@@ -732,6 +771,14 @@ impl NetworkService {
                 .map_err(|e| NetworkError::Subscribe(e.to_string()))?;
             tracing::info!(topic = %topic.hash(), "subscribed to legacy gov5 H2 observer topic");
         }
+        if let Some(topic) = gov5_block_observer_topic.as_ref() {
+            swarm
+                .behaviour_mut()
+                .gossipsub
+                .subscribe(topic)
+                .map_err(|e| NetworkError::Subscribe(e.to_string()))?;
+            tracing::info!(topic = %topic.hash(), "subscribed to gov5 block observer topic");
+        }
         let h2_v4_observer_topic = h2_v4_identity.map(|_| h2_v4_topic());
         if let Some(topic) = h2_v4_observer_topic.as_ref() {
             swarm
@@ -755,6 +802,7 @@ impl NetworkService {
         let mempool_topic_hash = mempool.hash();
         let blob_sidecar_topic_hash = blob_sidecar.hash();
         let gov5_h2_topic_hash = gov5_h2_observer_topic.map(|topic| topic.hash());
+        let gov5_block_topic_hash = gov5_block_observer_topic.map(|topic| topic.hash());
         let h2_v4_topic_hash = h2_v4_observer_topic.map(|topic| topic.hash());
 
         let validator_peer_map = Arc::new(RwLock::new(HashMap::new()));
@@ -774,6 +822,7 @@ impl NetworkService {
             pending_data_events: VecDeque::new(),
             consensus_topic_hash,
             gov5_h2_topic_hash,
+            gov5_block_topic_hash,
             h2_v4_topic_hash,
             h2_v4_identity,
             block_announce_topic_hash,
@@ -781,6 +830,7 @@ impl NetworkService {
             blob_sidecar_topic_hash,
             verification_receipts_topic_hash,
             pending_sync_channels: HashMap::new(),
+            pending_gov5_block_requests: HashMap::new(),
             sync_request_windows: HashMap::new(),
             next_sync_id: 0,
             expected_validator_peer_ids,
@@ -931,6 +981,12 @@ impl NetworkService {
             }
             SwarmEvent::Behaviour(N42BehaviourEvent::BlockDirect(event)) => {
                 self.handle_block_direct_event(event);
+            }
+            SwarmEvent::Behaviour(N42BehaviourEvent::Gov5BlockPush(event)) => {
+                self.handle_gov5_block_push_event(event);
+            }
+            SwarmEvent::Behaviour(N42BehaviourEvent::Gov5BlockByHash(event)) => {
+                self.handle_gov5_block_by_hash_event(event);
             }
             SwarmEvent::Behaviour(N42BehaviourEvent::TxForward(event)) => {
                 self.handle_tx_forward_event(event);
@@ -1176,6 +1232,7 @@ impl NetworkService {
             &self.block_announce_topic_hash,
             &self.mempool_topic_hash,
             &self.blob_sidecar_topic_hash,
+            self.gov5_block_topic_hash.as_ref(),
         );
 
         if !matches!(acceptance, gossipsub::MessageAcceptance::Accept) {
@@ -1185,6 +1242,46 @@ impl NetworkService {
 
         let topic = &message.topic;
         let event = match () {
+            _ if self
+                .gov5_block_topic_hash
+                .as_ref()
+                .is_some_and(|hash| topic == hash) =>
+            {
+                const MAX_GOV5_BLOCK_BYTES: usize = 1 << 20;
+                let decoded_len = match snap::raw::decompress_len(&message.data) {
+                    Ok(len) if len <= MAX_GOV5_BLOCK_BYTES => len,
+                    Ok(len) => {
+                        metrics::counter!("n42_gov5_blocks_rejected_total", "reason" => "oversized")
+                            .increment(1);
+                        tracing::warn!(target: "n42::interop::block", %source, decoded_len = len, "rejected oversized gov5 block gossip");
+                        return;
+                    }
+                    Err(error) => {
+                        metrics::counter!("n42_gov5_blocks_rejected_total", "reason" => "snappy")
+                            .increment(1);
+                        tracing::warn!(target: "n42::interop::block", %source, %error, "rejected invalid gov5 block snappy frame");
+                        return;
+                    }
+                };
+                match snap::raw::Decoder::new().decompress_vec(&message.data) {
+                    Ok(rlp) if rlp.len() == decoded_len => {
+                        metrics::counter!("n42_gov5_blocks_observed_total").increment(1);
+                        NetworkEvent::Gov5Block { source, rlp }
+                    }
+                    Ok(_) => {
+                        metrics::counter!("n42_gov5_blocks_rejected_total", "reason" => "length")
+                            .increment(1);
+                        tracing::warn!(target: "n42::interop::block", %source, "rejected inconsistent gov5 block snappy frame");
+                        return;
+                    }
+                    Err(error) => {
+                        metrics::counter!("n42_gov5_blocks_rejected_total", "reason" => "snappy")
+                            .increment(1);
+                        tracing::warn!(target: "n42::interop::block", %source, %error, "rejected invalid gov5 block snappy frame");
+                        return;
+                    }
+                }
+            }
             _ if self
                 .h2_v4_topic_hash
                 .as_ref()
@@ -1595,6 +1692,84 @@ impl NetworkService {
         }
     }
 
+    fn handle_gov5_block_push_event(
+        &mut self,
+        event: libp2p::request_response::Event<Gov5BlockPushRequest, Gov5BlockPushResponse>,
+    ) {
+        if let libp2p::request_response::Event::Message {
+            peer,
+            message:
+                libp2p::request_response::Message::Request {
+                    request, channel, ..
+                },
+            ..
+        } = event
+        {
+            metrics::counter!("n42_gov5_block_push_received_total").increment(1);
+            self.emit_event(NetworkEvent::Gov5Block {
+                source: peer,
+                rlp: request.rlp,
+            });
+            let _ = self
+                .swarm
+                .behaviour_mut()
+                .gov5_block_push
+                .send_response(channel, Gov5BlockPushResponse);
+        }
+    }
+
+    fn handle_gov5_block_by_hash_event(
+        &mut self,
+        event: libp2p::request_response::Event<Gov5BlockByHashRequest, Gov5BlockByHashResponse>,
+    ) {
+        match event {
+            libp2p::request_response::Event::Message {
+                peer,
+                message:
+                    libp2p::request_response::Message::Response {
+                        request_id,
+                        response,
+                    },
+                ..
+            } => {
+                let Some(requested_hash) = self.pending_gov5_block_requests.remove(&request_id)
+                else {
+                    tracing::warn!(%peer, "received gov5 block response for unknown request");
+                    return;
+                };
+                metrics::counter!("n42_gov5_block_fetch_succeeded_total").increment(1);
+                self.emit_event(NetworkEvent::Gov5BlockFetched {
+                    source: peer,
+                    requested_hash,
+                    rlp: response.rlp,
+                });
+            }
+            libp2p::request_response::Event::OutboundFailure {
+                peer,
+                request_id,
+                error,
+                ..
+            } => {
+                if let Some(block_hash) = self.pending_gov5_block_requests.remove(&request_id) {
+                    metrics::counter!("n42_gov5_block_fetch_failed_total").increment(1);
+                    self.emit_event(NetworkEvent::Gov5BlockFetchFailed {
+                        source: peer,
+                        block_hash,
+                        error: error.to_string(),
+                    });
+                }
+            }
+            libp2p::request_response::Event::InboundFailure { peer, error, .. } => {
+                tracing::debug!(%peer, %error, "gov5 block-by-hash inbound failure");
+            }
+            libp2p::request_response::Event::ResponseSent { .. }
+            | libp2p::request_response::Event::Message {
+                message: libp2p::request_response::Message::Request { .. },
+                ..
+            } => {}
+        }
+    }
+
     fn observe_block_announcement(&mut self, data: &[u8], source: &'static str) -> bool {
         let duplicate = self.recent_block_announcements.observe(data);
         if duplicate {
@@ -1756,6 +1931,9 @@ impl NetworkService {
         let reliable_data = matches!(
             &event,
             NetworkEvent::Gov5H2Message { .. }
+                | NetworkEvent::Gov5Block { .. }
+                | NetworkEvent::Gov5BlockFetched { .. }
+                | NetworkEvent::Gov5BlockFetchFailed { .. }
                 | NetworkEvent::H2V4Message { .. }
                 | NetworkEvent::VerificationReceipt { .. }
                 | NetworkEvent::BlobSidecarReceived { .. }
@@ -1846,6 +2024,15 @@ impl NetworkService {
                         self.publish_consensus(&message, "direct fallback");
                     }
                 }
+            }
+            NetworkCommand::RequestGov5BlockByHash { peer, block_hash } => {
+                let request_id = self
+                    .swarm
+                    .behaviour_mut()
+                    .gov5_block_by_hash
+                    .send_request(&peer, Gov5BlockByHashRequest { block_hash });
+                self.pending_gov5_block_requests
+                    .insert(request_id, block_hash);
             }
             NetworkCommand::AnnounceBlock(data) => {
                 self.gossipsub_publish(block_announce_topic(), data, "block announcement");

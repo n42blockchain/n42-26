@@ -75,6 +75,7 @@ pub fn validate_message(
     block_topic_hash: &TopicHash,
     mempool_topic_hash: &TopicHash,
     blob_sidecar_topic_hash: &TopicHash,
+    gov5_block_topic_hash: Option<&TopicHash>,
 ) -> gossipsub::MessageAcceptance {
     if data.is_empty() {
         return gossipsub::MessageAcceptance::Reject;
@@ -83,15 +84,16 @@ pub fn validate_message(
     // Per-topic size limits.
     // Block data can reach several MB; consensus messages are small (~130-500 bytes).
     // Mempool transactions capped at 128KB; blob sidecars at 1MB.
-    let max_size = if topic == block_topic_hash {
-        8 * 1024 * 1024 // 8MB for high-throughput block data
-    } else if topic == blob_sidecar_topic_hash {
-        1024 * 1024 // 1MB for blob sidecars
-    } else if topic == mempool_topic_hash {
-        128 * 1024 // 128KB for individual transactions
-    } else {
-        1024 * 1024 // 1MB for consensus and other topics
-    };
+    let max_size =
+        if topic == block_topic_hash || gov5_block_topic_hash.is_some_and(|hash| topic == hash) {
+            8 * 1024 * 1024 // 8MB for high-throughput block data
+        } else if topic == blob_sidecar_topic_hash {
+            1024 * 1024 // 1MB for blob sidecars
+        } else if topic == mempool_topic_hash {
+            128 * 1024 // 128KB for individual transactions
+        } else {
+            1024 * 1024 // 1MB for consensus and other topics
+        };
 
     if data.len() > max_size {
         return gossipsub::MessageAcceptance::Reject;
@@ -171,6 +173,7 @@ mod tests {
             &block_hash,
             &mem_hash(),
             &blob_hash(),
+            None,
         );
         assert!(matches!(result, gossipsub::MessageAcceptance::Accept));
     }
@@ -187,6 +190,7 @@ mod tests {
             &block_hash,
             &mem_hash(),
             &blob_hash(),
+            None,
         );
         assert!(matches!(result, gossipsub::MessageAcceptance::Reject));
     }
@@ -204,6 +208,7 @@ mod tests {
             &block_hash,
             &mem_hash(),
             &blob_hash(),
+            None,
         );
         assert!(matches!(result, gossipsub::MessageAcceptance::Reject));
     }
@@ -221,6 +226,7 @@ mod tests {
             &block_hash,
             &mem_hash(),
             &blob_hash(),
+            None,
         );
         assert!(matches!(result, gossipsub::MessageAcceptance::Accept));
     }
@@ -238,6 +244,7 @@ mod tests {
             &block_hash,
             &mem_hash(),
             &blob_hash(),
+            None,
         );
         assert!(matches!(result, gossipsub::MessageAcceptance::Reject));
     }
@@ -255,6 +262,7 @@ mod tests {
             &block_hash,
             &mem_hash(),
             &blob_hash(),
+            None,
         );
         assert!(matches!(result, gossipsub::MessageAcceptance::Reject));
     }
@@ -272,6 +280,7 @@ mod tests {
             &block_hash,
             &mem_hash(),
             &blob_hash(),
+            None,
         );
         assert!(matches!(result, gossipsub::MessageAcceptance::Accept));
     }
@@ -289,6 +298,7 @@ mod tests {
             &block_hash,
             &mem_hash(),
             &blob_hash(),
+            None,
         );
         assert!(matches!(result, gossipsub::MessageAcceptance::Reject));
     }
@@ -307,6 +317,7 @@ mod tests {
             &block_hash,
             &mp_hash,
             &blob_hash(),
+            None,
         );
         assert!(matches!(result, gossipsub::MessageAcceptance::Accept));
 
@@ -318,6 +329,7 @@ mod tests {
             &block_hash,
             &mp_hash,
             &blob_hash(),
+            None,
         );
         assert!(matches!(result, gossipsub::MessageAcceptance::Reject));
     }

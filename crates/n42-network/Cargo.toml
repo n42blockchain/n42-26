@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+async-trait = "0.1"
 # Internal
 n42-primitives.workspace = true
 n42-consensus.workspace = true

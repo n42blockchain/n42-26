@@ -6958,6 +6958,7 @@ dependencies = [
  "alloy-eips",
  "alloy-primitives",
  "alloy-rlp",
+ "async-trait",
  "bincode",
  "blake3",
  "bytes",

@@ -158,6 +158,7 @@ Logs are split into separate files by phase for easy maintenance:
 | [devlog-125-gov5-native-execution-commitments](docs/devlog-125-gov5-native-execution-commitments.md) | Gov5 原生 receipt commitment 的执行后硬校验，以及 reth BundleState 到 replay-v2 QMDB 排序 mutation 的逐字节转换边界 | Interop |
 | [devlog-126-branch-safe-qmdb-state-root](docs/devlog-126-branch-safe-qmdb-state-root.md) | Reth 2.4.1 官方 StateRootStrategy 接入 branch-safe QMDB candidate store；认证 base、精确父分支重放和 observer-only 启动门禁 | Interop |
 | [devlog-127-gov5-replay-v2-execution-import](docs/devlog-127-gov5-replay-v2-execution-import.md) | Gov5 block 0 执行基线、Paris/TTD=0、归一化父链与 dirty/no-op QMDB 语义对齐；Rust 真执行 replay-v2 block 1–49/247 tx，head hash/root 完全一致 | Interop |
+| [devlog-128-gov5-finalized-live-following](docs/devlog-128-gov5-finalized-live-following.md) | Rust observer 从 replay-v2 block 49 接续 Gov5 七节点：原生 block push/hash fetch、严格 RLP/commitment 校验、H2-v4 Decide 门控，真机追至 block 60/view 13 | Interop |
 
 ### 上游借鉴与跟踪
 
