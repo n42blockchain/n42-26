@@ -24,6 +24,7 @@ bincode.workspace = true
 # Primitives
 alloy-primitives.workspace = true
 alloy-rlp.workspace = true
+alloy-consensus.workspace = true
 
 # Async
 tokio.workspace = true

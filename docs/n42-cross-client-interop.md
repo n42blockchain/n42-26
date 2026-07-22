@@ -112,5 +112,7 @@ QMDB replay 锚，不会把 gov5 的 QMDB root 冒充成本地 Reth/MPT executio
 可同时设置 `N42_FINALIZED_RANGE_BOOTSTRAP`。该 bounded v1 bundle 最多包含 128 个
 连续 canonical blocks，Rust 会验证 header Keccak、block 内嵌 header、parent lineage、
 chain/genesis 与整帧 Blake3，并要求 range head 的 block hash/state root 与 QMDB
-checkpoint 完全一致。当前仍是只读 import boundary；receipt compact 解码、执行导入和
-网络 request/response 完成前不会推进本地 Reth head，也不会开放 validator 投票。
+checkpoint 完全一致。compact receipts 已按 gov5 native codec 解码，并与 block 交易数
+绑定、逐块重算 native receipt root；runtime-02 的 49 块/247 tx 已通过。当前仍是只读
+import boundary；安全的两阶段执行导入和网络 request/response 完成前不会推进本地
+Reth head，也不会开放 validator 投票。

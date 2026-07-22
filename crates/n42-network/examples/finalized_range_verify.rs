@@ -21,11 +21,12 @@ fn main() -> eyre::Result<()> {
     let verified =
         verify_finalized_range_stream(BufReader::new(File::open(&path)?), chain_id, genesis)?;
     println!(
-        "verified chain={} blocks={}-{} count={} parent={:#x} head={:#x} state_root={:#x} receipts_root={:#x}",
+        "verified chain={} blocks={}-{} count={} txs={} parent={:#x} head={:#x} state_root={:#x} receipts_root={:#x}",
         verified.chain_id,
         verified.from_block,
         verified.to_block,
         verified.block_count,
+        verified.transaction_count,
         verified.first_parent_hash,
         verified.last_block_hash,
         verified.last_state_root,

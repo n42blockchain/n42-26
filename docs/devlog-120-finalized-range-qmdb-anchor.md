@@ -36,7 +36,7 @@ Rust observer 投票。
 - range：block `771-898`，128 块，首父块为 block 770
 - checkpoint/head：`663a60f7aa9259c1d2e57cd780750bdae5ff14025936afcd958b92bf54f080aa`
 - QMDB/header state root：`76ae4240ad9c782c46911141ace395d9afb75d6f4fb0425287315e12cfeb4a4c`
-- receipts root：Ethereum empty root
+- receipts root：gov5 native empty root `c5d246...a470`
 
 observer 真机启动先记录 QMDB portable 验证，再记录 finalized range 与 checkpoint 对齐，
 随后以 observer mode 订阅 legacy gov5 与 H2-v4 topics。Reth RPC 返回 chain ID 1143，日志

@@ -1,5 +1,6 @@
 pub mod block_direct;
 pub mod codec;
+pub mod compact_receipts;
 pub mod consensus_direct;
 pub mod dissemination;
 pub mod error;
@@ -15,6 +16,10 @@ pub mod transport;
 pub mod tx_forward;
 
 pub use consensus_direct::{ConsensusDirectCodec, ConsensusDirectRequest, ConsensusDirectResponse};
+pub use compact_receipts::{
+    CompactReceiptError, MAX_RECEIPTS_PER_BLOCK, decode_compact_receipts,
+    gov5_native_receipts_root,
+};
 pub use error::NetworkError;
 pub use finalized_range::{
     FinalizedRangeError, FinalizedRangeVerification, MAX_FINALIZED_RANGE_BLOCKS,

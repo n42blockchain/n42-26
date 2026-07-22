@@ -1,3 +1,4 @@
+use crate::{decode_compact_receipts, gov5_native_receipts_root};
 use alloy_primitives::{B256, keccak256};
 use alloy_rlp::Header as RlpHeader;
 use std::io::Read;
@@ -13,6 +14,7 @@ pub struct FinalizedRangeVerification {
     pub from_block: u64,
     pub to_block: u64,
     pub block_count: u64,
+    pub transaction_count: u64,
     pub first_parent_hash: B256,
     pub last_block_hash: B256,
     pub last_state_root: B256,
@@ -41,6 +43,12 @@ pub enum FinalizedRangeError {
     HeaderFieldsMismatch(u64),
     #[error("finalized block {0} does not embed the declared header")]
     BlockHeaderMismatch(u64),
+    #[error("finalized block {0} transaction and receipt counts differ")]
+    ReceiptCountMismatch(u64),
+    #[error("finalized block {0} compact receipts are invalid: {1}")]
+    InvalidReceipts(u64, String),
+    #[error("finalized block {0} receipt root mismatch")]
+    ReceiptRootMismatch(u64),
     #[error("finalized range content hash mismatch")]
     ContentHashMismatch,
     #[error("finalized range has trailing bytes")]
@@ -75,6 +83,7 @@ pub fn verify_finalized_range_stream<R: Read>(
     let mut previous_hash = None;
     let mut first_parent_hash = B256::ZERO;
     let mut last = (B256::ZERO, B256::ZERO, B256::ZERO);
+    let mut transaction_count = 0u64;
     for index in 0..block_count {
         let number = u64::from_le_bytes(reader.array()?);
         if number != from_block + index {
@@ -108,7 +117,18 @@ pub fn verify_finalized_range_stream<R: Read>(
         if embedded_header(&block).is_none_or(|raw| raw != header) {
             return Err(FinalizedRangeError::BlockHeaderMismatch(number));
         }
-        reader.discard_blob(number)?;
+        let receipts_bytes = reader.optional_blob(number)?;
+        let receipts = decode_compact_receipts(&receipts_bytes)
+            .map_err(|error| FinalizedRangeError::InvalidReceipts(number, error.to_string()))?;
+        if block_transaction_count(&block) != Some(receipts.len()) {
+            return Err(FinalizedRangeError::ReceiptCountMismatch(number));
+        }
+        transaction_count = transaction_count
+            .checked_add(receipts.len() as u64)
+            .ok_or(FinalizedRangeError::Bounds)?;
+        if gov5_native_receipts_root(&receipts) != receipts_root {
+            return Err(FinalizedRangeError::ReceiptRootMismatch(number));
+        }
         previous_hash = Some(block_hash);
         last = (block_hash, state_root, receipts_root);
     }
@@ -119,6 +139,7 @@ pub fn verify_finalized_range_stream<R: Read>(
         from_block,
         to_block,
         block_count,
+        transaction_count,
         first_parent_hash,
         last_block_hash: last.0,
         last_state_root: last.1,
@@ -197,6 +218,38 @@ fn embedded_header(block: &[u8]) -> Option<&[u8]> {
     payload.get(..total_len)
 }
 
+fn block_transaction_count(block: &[u8]) -> Option<usize> {
+    let mut payload = block;
+    let outer = RlpHeader::decode(&mut payload).ok()?;
+    if !outer.list || outer.payload_length != payload.len() {
+        return None;
+    }
+    rlp_item(&mut payload)?;
+    let mut transactions = payload;
+    let transactions_header = RlpHeader::decode(&mut transactions).ok()?;
+    if !transactions_header.list || transactions_header.payload_length > transactions.len() {
+        return None;
+    }
+    let mut transactions = transactions.get(..transactions_header.payload_length)?;
+    let mut count = 0usize;
+    while !transactions.is_empty() {
+        rlp_item(&mut transactions)?;
+        count = count.checked_add(1)?;
+    }
+    Some(count)
+}
+
+fn rlp_item<'a>(cursor: &mut &'a [u8]) -> Option<&'a [u8]> {
+    let original = *cursor;
+    let mut payload = original;
+    let header = RlpHeader::decode(&mut payload).ok()?;
+    let prefix_len = original.len().checked_sub(payload.len())?;
+    let total_len = prefix_len.checked_add(header.payload_length)?;
+    let item = original.get(..total_len)?;
+    *cursor = original.get(total_len..)?;
+    Some(item)
+}
+
 struct HashingReader<R> {
     inner: R,
     hasher: blake3::Hasher,
@@ -228,22 +281,15 @@ impl<R: Read> HashingReader<R> {
         Ok(bytes)
     }
 
-    fn discard_blob(&mut self, number: u64) -> Result<(), FinalizedRangeError> {
+    fn optional_blob(&mut self, number: u64) -> Result<Vec<u8>, FinalizedRangeError> {
         let size = u32::from_le_bytes(self.array()?) as usize;
         if size > MAX_BLOB_SIZE {
             return Err(FinalizedRangeError::InvalidBlob(number));
         }
-        let mut remaining = size;
-        let mut buffer = [0; 8192];
-        while remaining > 0 {
-            let take = remaining.min(buffer.len());
-            self.inner
-                .read_exact(&mut buffer[..take])
-                .map_err(io_error)?;
-            self.hasher.update(&buffer[..take]);
-            remaining -= take;
-        }
-        Ok(())
+        let mut bytes = vec![0; size];
+        self.inner.read_exact(&mut bytes).map_err(io_error)?;
+        self.hasher.update(&bytes);
+        Ok(bytes)
     }
 
     fn finish(mut self) -> Result<(), FinalizedRangeError> {
@@ -269,6 +315,10 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
+    fn empty_receipt_root() -> B256 {
+        gov5_native_receipts_root(&[])
+    }
+
     fn header_fixture() -> Vec<u8> {
         let mut payload = Vec::new();
         for value in [B256::repeat_byte(0x06), B256::repeat_byte(0x22)] {
@@ -280,7 +330,7 @@ mod tests {
         for value in [
             B256::repeat_byte(0x33),
             B256::repeat_byte(0x55),
-            B256::repeat_byte(0x44),
+            empty_receipt_root(),
         ] {
             payload.push(0xa0);
             payload.extend_from_slice(value.as_slice());
@@ -297,8 +347,14 @@ mod tests {
 
     fn fixture() -> Vec<u8> {
         let header = header_fixture();
-        let mut block = vec![0xf9, (header.len() >> 8) as u8, header.len() as u8];
+        let block_payload_len = header.len() + 1;
+        let mut block = vec![
+            0xf9,
+            (block_payload_len >> 8) as u8,
+            block_payload_len as u8,
+        ];
         block.extend_from_slice(&header);
+        block.push(0xc0);
         let block_hash = keccak256(&header);
         let mut bytes = Vec::new();
         bytes.extend_from_slice(MAGIC);
@@ -311,7 +367,7 @@ mod tests {
         bytes.extend_from_slice(block_hash.as_slice());
         bytes.extend_from_slice(B256::repeat_byte(0x06).as_slice());
         bytes.extend_from_slice(B256::repeat_byte(0x33).as_slice());
-        bytes.extend_from_slice(B256::repeat_byte(0x44).as_slice());
+        bytes.extend_from_slice(empty_receipt_root().as_slice());
         bytes.extend_from_slice(B256::repeat_byte(0x55).as_slice());
         for blob in [&header[..], &block[..], &[][..]] {
             bytes.extend_from_slice(&(blob.len() as u32).to_le_bytes());
@@ -329,6 +385,7 @@ mod tests {
                 .unwrap();
         assert_eq!(verified.from_block, 7);
         assert_eq!(verified.to_block, 7);
+        assert_eq!(verified.transaction_count, 0);
         assert_eq!(verified.last_block_hash, keccak256(header_fixture()));
     }
 
@@ -353,6 +410,21 @@ mod tests {
         assert!(matches!(
             verify_finalized_range_stream(Cursor::new(bytes), 1143, B256::repeat_byte(0x11)),
             Err(FinalizedRangeError::HeaderFieldsMismatch(7))
+        ));
+    }
+
+    #[test]
+    fn rejects_receipts_without_matching_block_transactions() {
+        let mut bytes = fixture();
+        bytes.truncate(bytes.len() - 32);
+        let receipt_length = bytes.len() - 4;
+        bytes[receipt_length..].copy_from_slice(&4u32.to_le_bytes());
+        bytes.extend_from_slice(&[0x14, 0x52, 0x08, 0x00]);
+        let digest = blake3::hash(&bytes);
+        bytes.extend_from_slice(digest.as_bytes());
+        assert!(matches!(
+            verify_finalized_range_stream(Cursor::new(bytes), 1143, B256::repeat_byte(0x11)),
+            Err(FinalizedRangeError::ReceiptCountMismatch(7))
         ));
     }
 }
