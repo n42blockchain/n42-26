@@ -23,6 +23,16 @@ if [[ ! -f "$N42_GOV5_GENESIS" ]]; then
     exit 1
 fi
 
+if [[ -n "${N42_QMDB_BOOTSTRAP:-}" ]]; then
+    : "${N42_QMDB_BOOTSTRAP_BLOCK:?set N42_QMDB_BOOTSTRAP_BLOCK with N42_QMDB_BOOTSTRAP}"
+    : "${N42_QMDB_BOOTSTRAP_BLOCK_HASH:?set N42_QMDB_BOOTSTRAP_BLOCK_HASH with N42_QMDB_BOOTSTRAP}"
+    : "${N42_QMDB_BOOTSTRAP_ROOT:?set N42_QMDB_BOOTSTRAP_ROOT with N42_QMDB_BOOTSTRAP}"
+    if [[ ! -f "$N42_QMDB_BOOTSTRAP" ]]; then
+        echo "QMDB bootstrap does not exist: $N42_QMDB_BOOTSTRAP" >&2
+        exit 1
+    fi
+fi
+
 if [[ ! -f "$N42_CONSENSUS_CONFIG" ]]; then
     echo "consensus config does not exist: $N42_CONSENSUS_CONFIG" >&2
     exit 1

@@ -30,6 +30,7 @@ use n42_node::tx_bridge::TxPoolBridge;
 use n42_node::{ConsensusOrchestrator, N42Node, ObserverOrchestrator, SharedConsensusState};
 use n42_node::{configured_validator_peer_ids, expected_validator_peer_ids_with_policy};
 use n42_primitives::BlsSecretKey;
+use n42_twig_core::qmdb_compat::{QmdbPortableVerification, verify_portable_stream};
 use n42_zkproof::{MockProver, ProofScheduler, ProofStore};
 use reth_chainspec::ChainSpecProvider;
 use reth_ethereum_cli::Cli;
@@ -37,7 +38,9 @@ use reth_ethereum_cli::chainspec::EthereumChainSpecParser;
 use reth_node_core::args::{DefaultEngineValues, DefaultRpcServerArgs};
 use reth_storage_api::{BlockHashReader, BlockNumReader};
 use reth_transaction_pool::TransactionPool;
-use std::path::PathBuf;
+use std::fs::File;
+use std::io::BufReader;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Once, atomic::AtomicBool};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -64,6 +67,54 @@ fn resolve_observer_genesis_hash(
     configured_hash.parse::<B256>().map_err(|error| {
         eyre::eyre!("N42_INTEROP_GENESIS_HASH must be a 32-byte 0x-prefixed hash: {error}")
     })
+}
+
+fn verify_observer_qmdb_bootstrap(
+    path: &Path,
+    chain_id: u64,
+    genesis_hash: B256,
+    expected_block: u64,
+    expected_block_hash: B256,
+    expected_root: B256,
+) -> eyre::Result<QmdbPortableVerification> {
+    let file = File::open(path).map_err(|error| {
+        eyre::eyre!(
+            "failed to open N42_QMDB_BOOTSTRAP {}: {error}",
+            path.display()
+        )
+    })?;
+    let expected_genesis: [u8; 32] = genesis_hash.into();
+    let verified = verify_portable_stream(BufReader::new(file), chain_id, &expected_genesis)
+        .map_err(|error| eyre::eyre!("invalid QMDB bootstrap {}: {error}", path.display()))?;
+    if verified.block_number != expected_block {
+        return Err(eyre::eyre!(
+            "QMDB bootstrap block {} does not equal N42_QMDB_BOOTSTRAP_BLOCK {expected_block}",
+            verified.block_number
+        ));
+    }
+    if verified.block_hash.as_slice() != expected_block_hash.as_slice() {
+        return Err(eyre::eyre!(
+            "QMDB bootstrap block hash does not equal N42_QMDB_BOOTSTRAP_BLOCK_HASH"
+        ));
+    }
+    if verified.root.as_slice() != expected_root.as_slice() {
+        return Err(eyre::eyre!(
+            "QMDB bootstrap root does not equal N42_QMDB_BOOTSTRAP_ROOT"
+        ));
+    }
+    Ok(verified)
+}
+
+fn required_observer_env<T>(name: &str) -> eyre::Result<T>
+where
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
+{
+    let value = std::env::var(name)
+        .map_err(|_| eyre::eyre!("{name} is required when N42_QMDB_BOOTSTRAP is set"))?;
+    value
+        .parse::<T>()
+        .map_err(|error| eyre::eyre!("invalid {name}: {error}"))
 }
 
 fn override_timeout_from_env(name: &str, target: &mut u64) {
@@ -1021,6 +1072,34 @@ fn main() {
                         );
                     }
 
+                    if let Ok(path) = std::env::var("N42_QMDB_BOOTSTRAP") {
+                        let expected_block =
+                            required_observer_env::<u64>("N42_QMDB_BOOTSTRAP_BLOCK")?;
+                        let expected_block_hash = required_observer_env::<B256>(
+                            "N42_QMDB_BOOTSTRAP_BLOCK_HASH",
+                        )?;
+                        let expected_root =
+                            required_observer_env::<B256>("N42_QMDB_BOOTSTRAP_ROOT")?;
+                        let checkpoint = verify_observer_qmdb_bootstrap(
+                            Path::new(&path),
+                            full_node.provider.chain_spec().chain().id(),
+                            interop_genesis_hash,
+                            expected_block,
+                            expected_block_hash,
+                            expected_root,
+                        )?;
+                        info!(
+                            target: "n42::cli",
+                            path,
+                            block = checkpoint.block_number,
+                            block_hash = %B256::from(checkpoint.block_hash),
+                            root = %B256::from(checkpoint.root),
+                            slots = checkpoint.next_slot,
+                            live = checkpoint.live_count,
+                            "verified gov5 replay-v2 QMDB observer bootstrap"
+                        );
+                    }
+
                     let keypair = libp2p::identity::Keypair::generate_ed25519();
                     let local_peer_id = keypair.public().to_peer_id();
                     info!(target: "n42::cli", %local_peer_id, "Observer P2P identity (random)");
@@ -1716,6 +1795,19 @@ fn main() {
 #[cfg(test)]
 mod observer_identity_tests {
     use super::*;
+    use std::io::Write;
+
+    fn qmdb_portable_fixture() -> tempfile::NamedTempFile {
+        let vector: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../crates/n42-twig-core/testdata/cross_client_v1.json"
+        ))
+        .unwrap();
+        let encoded = vector["portable"]["hex"].as_str().unwrap();
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(&hex::decode(encoded).unwrap()).unwrap();
+        file.flush().unwrap();
+        file
+    }
 
     #[test]
     fn observer_genesis_hash_defaults_to_local_execution_genesis() {
@@ -1738,5 +1830,56 @@ mod observer_identity_tests {
     fn observer_genesis_hash_rejects_malformed_identity() {
         let error = resolve_observer_genesis_hash(B256::ZERO, Some("0x1234")).unwrap_err();
         assert!(error.to_string().contains("N42_INTEROP_GENESIS_HASH"));
+    }
+
+    #[test]
+    fn observer_qmdb_bootstrap_accepts_exact_checkpoint_identity() {
+        let fixture = qmdb_portable_fixture();
+        let genesis_hash = "0x1100000000000000000000000000000000000000000000000000000000000000"
+            .parse()
+            .unwrap();
+        let block_hash = "0x2200000000000000000000000000000000000000000000000000000000000000"
+            .parse()
+            .unwrap();
+        let root = "0xbd6c73b724bc0a38c7efa81c2088bfc805d12faa6d12f188b714ebd1e717c646"
+            .parse()
+            .unwrap();
+
+        let checkpoint = verify_observer_qmdb_bootstrap(
+            fixture.path(),
+            1143,
+            genesis_hash,
+            42,
+            block_hash,
+            root,
+        )
+        .unwrap();
+
+        assert_eq!(checkpoint.block_number, 42);
+        assert_eq!(checkpoint.next_slot, 3);
+        assert_eq!(checkpoint.live_count, 1);
+    }
+
+    #[test]
+    fn observer_qmdb_bootstrap_rejects_mismatched_checkpoint_metadata() {
+        let fixture = qmdb_portable_fixture();
+        let genesis_hash = "0x1100000000000000000000000000000000000000000000000000000000000000"
+            .parse()
+            .unwrap();
+        let block_hash = "0x2200000000000000000000000000000000000000000000000000000000000000"
+            .parse()
+            .unwrap();
+
+        let error = verify_observer_qmdb_bootstrap(
+            fixture.path(),
+            1143,
+            genesis_hash,
+            42,
+            block_hash,
+            B256::repeat_byte(0xff),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("N42_QMDB_BOOTSTRAP_ROOT"));
     }
 }

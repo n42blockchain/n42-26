@@ -149,6 +149,7 @@ Logs are split into separate files by phase for easy maintenance:
 | [devlog-116-h2-v4-finality-verifier](docs/devlog-116-h2-v4-finality-verifier.md) | gov5→Rust 固定 BLS CommitQC 对拍、POP/NUL ciphersuite 隔离、只读 observer finality 证明门禁 | Interop |
 | [devlog-117-h2-v4-production-profile](docs/devlog-117-h2-v4-production-profile.md) | gov5 H2-v4 静态验证者生产 profile、全路径签名域、Decide 双发与 Rust 只读最终性同步目标；默认关闭并保护旧 7 节点/QMDB/archive+ 数据 | Interop |
 | [devlog-118-gov5-live-interop-observer](docs/devlog-118-gov5-live-interop-observer.md) | gov5 7 节点与 Rust observer 真机 TCP/Noise/Yamux 握手、H2-v4 Decide 接收及 BLS CommitQC 验证 | Interop |
+| [devlog-119-custom-qmdb-observer-bootstrap](docs/devlog-119-custom-qmdb-observer-bootstrap.md) | gov5 自定义链 replay-v2 block 49 QMDB checkpoint 接入 Rust observer 启动门禁，437 slots/34 live 同 root | Interop |
 
 ### 上游借鉴与跟踪
 

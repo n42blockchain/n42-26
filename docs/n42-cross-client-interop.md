@@ -102,3 +102,9 @@ H2-v4 envelope 与 Go 生成的 Snappy frame 也已互认；Rust observer 会同
 ## 下一项实现
 
 QMDB 已完成 deterministic vectors、portable exporter、Rust importer，以及既有 87,786,434-slot full replay 的同 root 验收。H2 全部 7 类 legacy 消息、H2-v4 签名域/envelope、QC/TC bitmap、Go Snappy frame、生产 profile 与 Rust 真机只读 finality observer 均已通过。下一项是实现 finalized-range/replay-v2 transport 并完成 1,000-block finalized bundle + QMDB checkpoint replay；在此之前仍禁止混合 validator 投票。
+
+Rust observer 现可在启动网络前通过 `N42_QMDB_BOOTSTRAP` 读取并流式验证
+portable checkpoint。必须同时提供 `N42_QMDB_BOOTSTRAP_BLOCK`、
+`N42_QMDB_BOOTSTRAP_BLOCK_HASH` 与 `N42_QMDB_BOOTSTRAP_ROOT`；节点将它们连同
+chain ID 和 gov5 genesis identity 全部核对，任一不符即 fail closed。该路径只建立
+QMDB replay 锚，不会把 gov5 的 QMDB root 冒充成本地 Reth/MPT execution root。
