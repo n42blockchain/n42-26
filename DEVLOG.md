@@ -150,6 +150,7 @@ Logs are split into separate files by phase for easy maintenance:
 | [devlog-117-h2-v4-production-profile](docs/devlog-117-h2-v4-production-profile.md) | gov5 H2-v4 静态验证者生产 profile、全路径签名域、Decide 双发与 Rust 只读最终性同步目标；默认关闭并保护旧 7 节点/QMDB/archive+ 数据 | Interop |
 | [devlog-118-gov5-live-interop-observer](docs/devlog-118-gov5-live-interop-observer.md) | gov5 7 节点与 Rust observer 真机 TCP/Noise/Yamux 握手、H2-v4 Decide 接收及 BLS CommitQC 验证 | Interop |
 | [devlog-119-custom-qmdb-observer-bootstrap](docs/devlog-119-custom-qmdb-observer-bootstrap.md) | gov5 自定义链 replay-v2 block 49 QMDB checkpoint 接入 Rust observer 启动门禁，437 slots/34 live 同 root | Interop |
+| [devlog-120-finalized-range-qmdb-anchor](docs/devlog-120-finalized-range-qmdb-anchor.md) | gov5 canonical finalized range 与 QMDB checkpoint 同链锚定；现有七节点 block 771-898 真机只读 observer 启动验收，并修复 replay-v2 block 1 零父哈希 | Interop |
 
 ### 上游借鉴与跟踪
 

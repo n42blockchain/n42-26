@@ -23,6 +23,7 @@ bincode.workspace = true
 
 # Primitives
 alloy-primitives.workspace = true
+alloy-rlp.workspace = true
 
 # Async
 tokio.workspace = true
@@ -34,6 +35,7 @@ thiserror.workspace = true
 
 # Hashing
 sha2.workspace = true
+blake3.workspace = true
 snap.workspace = true
 
 # Encoding

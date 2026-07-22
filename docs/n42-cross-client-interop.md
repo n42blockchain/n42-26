@@ -108,3 +108,9 @@ portable checkpoint。必须同时提供 `N42_QMDB_BOOTSTRAP_BLOCK`、
 `N42_QMDB_BOOTSTRAP_BLOCK_HASH` 与 `N42_QMDB_BOOTSTRAP_ROOT`；节点将它们连同
 chain ID 和 gov5 genesis identity 全部核对，任一不符即 fail closed。该路径只建立
 QMDB replay 锚，不会把 gov5 的 QMDB root 冒充成本地 Reth/MPT execution root。
+
+可同时设置 `N42_FINALIZED_RANGE_BOOTSTRAP`。该 bounded v1 bundle 最多包含 128 个
+连续 canonical blocks，Rust 会验证 header Keccak、block 内嵌 header、parent lineage、
+chain/genesis 与整帧 Blake3，并要求 range head 的 block hash/state root 与 QMDB
+checkpoint 完全一致。当前仍是只读 import boundary；receipt compact 解码、执行导入和
+网络 request/response 完成前不会推进本地 Reth head，也不会开放 validator 投票。

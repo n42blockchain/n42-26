@@ -33,6 +33,14 @@ if [[ -n "${N42_QMDB_BOOTSTRAP:-}" ]]; then
     fi
 fi
 
+if [[ -n "${N42_FINALIZED_RANGE_BOOTSTRAP:-}" ]]; then
+    : "${N42_QMDB_BOOTSTRAP:?set N42_QMDB_BOOTSTRAP with N42_FINALIZED_RANGE_BOOTSTRAP}"
+    if [[ ! -f "$N42_FINALIZED_RANGE_BOOTSTRAP" ]]; then
+        echo "finalized range bootstrap does not exist: $N42_FINALIZED_RANGE_BOOTSTRAP" >&2
+        exit 1
+    fi
+fi
+
 if [[ ! -f "$N42_CONSENSUS_CONFIG" ]]; then
     echo "consensus config does not exist: $N42_CONSENSUS_CONFIG" >&2
     exit 1

@@ -13,8 +13,9 @@ use n42_consensus::{ConsensusEngine, EpochManager, ValidatorSet, ValidatorSetRes
 use n42_jmt::{EMPTY_CODE_HASH, PersistentSbmt, PersistentTwig};
 use n42_network::NetworkService;
 use n42_network::{
-    ShardedStarHub, ShardedStarHubConfig, TransportConfig, build_interop_observer_swarm,
-    build_swarm_with_validator_index, deterministic_validator_keypair,
+    FinalizedRangeVerification, ShardedStarHub, ShardedStarHubConfig, TransportConfig,
+    build_interop_observer_swarm, build_swarm_with_validator_index,
+    deterministic_validator_keypair, verify_finalized_range_stream,
 };
 use n42_node::attestation_store::AttestationStore;
 use n42_node::consensus_state::configured_min_mobile_verifiers;
@@ -115,6 +116,21 @@ where
     value
         .parse::<T>()
         .map_err(|error| eyre::eyre!("invalid {name}: {error}"))
+}
+
+fn ensure_finalized_range_matches_qmdb(
+    range: &FinalizedRangeVerification,
+    checkpoint: &QmdbPortableVerification,
+) -> eyre::Result<()> {
+    if range.to_block != checkpoint.block_number
+        || range.last_block_hash != B256::from(checkpoint.block_hash)
+        || range.last_state_root != B256::from(checkpoint.root)
+    {
+        return Err(eyre::eyre!(
+            "finalized range head does not match QMDB bootstrap checkpoint"
+        ));
+    }
+    Ok(())
 }
 
 fn override_timeout_from_env(name: &str, target: &mut u64) {
@@ -1072,6 +1088,7 @@ fn main() {
                         );
                     }
 
+                    let mut qmdb_checkpoint = None;
                     if let Ok(path) = std::env::var("N42_QMDB_BOOTSTRAP") {
                         let expected_block =
                             required_observer_env::<u64>("N42_QMDB_BOOTSTRAP_BLOCK")?;
@@ -1097,6 +1114,35 @@ fn main() {
                             slots = checkpoint.next_slot,
                             live = checkpoint.live_count,
                             "verified gov5 replay-v2 QMDB observer bootstrap"
+                        );
+                        qmdb_checkpoint = Some(checkpoint);
+                    }
+
+                    if let Ok(path) = std::env::var("N42_FINALIZED_RANGE_BOOTSTRAP") {
+                        let checkpoint = qmdb_checkpoint.as_ref().ok_or_else(|| {
+                            eyre::eyre!(
+                                "N42_QMDB_BOOTSTRAP is required with N42_FINALIZED_RANGE_BOOTSTRAP"
+                            )
+                        })?;
+                        let file = File::open(&path).map_err(|error| {
+                            eyre::eyre!("failed to open finalized range {path}: {error}")
+                        })?;
+                        let range = verify_finalized_range_stream(
+                            BufReader::new(file),
+                            full_node.provider.chain_spec().chain().id(),
+                            interop_genesis_hash,
+                        )?;
+                        ensure_finalized_range_matches_qmdb(&range, checkpoint)?;
+                        info!(
+                            target: "n42::cli",
+                            path,
+                            from = range.from_block,
+                            to = range.to_block,
+                            blocks = range.block_count,
+                            head = %range.last_block_hash,
+                            state_root = %range.last_state_root,
+                            receipts_root = %range.last_receipts_root,
+                            "verified gov5 finalized range against QMDB bootstrap"
                         );
                     }
 
@@ -1881,5 +1927,36 @@ mod observer_identity_tests {
         .unwrap_err();
 
         assert!(error.to_string().contains("N42_QMDB_BOOTSTRAP_ROOT"));
+    }
+
+    #[test]
+    fn finalized_range_must_end_at_qmdb_checkpoint() {
+        let hash = B256::repeat_byte(0x22);
+        let root = B256::repeat_byte(0x33);
+        let range = FinalizedRangeVerification {
+            chain_id: 1143,
+            genesis_hash: B256::repeat_byte(0x11),
+            from_block: 7,
+            to_block: 9,
+            block_count: 3,
+            first_parent_hash: B256::repeat_byte(0x06),
+            last_block_hash: hash,
+            last_state_root: root,
+            last_receipts_root: B256::repeat_byte(0x44),
+        };
+        let checkpoint = QmdbPortableVerification {
+            chain_id: 1143,
+            genesis_hash: [0x11; 32],
+            block_number: 9,
+            block_hash: hash.into(),
+            root: root.into(),
+            next_slot: 10,
+            live_count: 8,
+        };
+        ensure_finalized_range_matches_qmdb(&range, &checkpoint).unwrap();
+
+        let mut wrong = range;
+        wrong.last_state_root = B256::ZERO;
+        assert!(ensure_finalized_range_matches_qmdb(&wrong, &checkpoint).is_err());
     }
 }

@@ -3,6 +3,7 @@ pub mod codec;
 pub mod consensus_direct;
 pub mod dissemination;
 pub mod error;
+pub mod finalized_range;
 pub mod gossipsub;
 pub mod h2_wire;
 pub mod h2_v4;
@@ -15,6 +16,10 @@ pub mod tx_forward;
 
 pub use consensus_direct::{ConsensusDirectCodec, ConsensusDirectRequest, ConsensusDirectResponse};
 pub use error::NetworkError;
+pub use finalized_range::{
+    FinalizedRangeError, FinalizedRangeVerification, MAX_FINALIZED_RANGE_BLOCKS,
+    verify_finalized_range_stream,
+};
 pub use mobile::{
     MSG_TYPE_CACHE_SYNC, MSG_TYPE_CACHE_SYNC_ZSTD, ShardedStarHub, ShardedStarHubConfig,
     ShardedStarHubHandle, StarHub, StarHubConfig, StarHubHandle,
