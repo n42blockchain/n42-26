@@ -75,6 +75,7 @@ reth-transaction-pool = { path = "../reth/crates/transaction-pool" }
 reth-tracing = { path = "../reth/crates/tracing" }
 reth-storage-errors = { path = "../reth/crates/storage/errors" }
 reth-trie-common = { path = "../reth/crates/trie/common", features = ["serde"] }
+reth-trie = { path = "../reth/crates/trie/trie" }
 reth-trie-sparse = { path = "../reth/crates/trie/sparse" }
 reth-network-api = { path = "../reth/crates/net/network-api" }
 reth-ethereum-cli = { path = "../reth/crates/ethereum/cli" }
@@ -83,6 +84,7 @@ reth-basic-payload-builder = { path = "../reth/crates/payload/basic" }
 reth-payload-builder-primitives = { path = "../reth/crates/payload/builder-primitives" }
 reth-payload-primitives = { path = "../reth/crates/payload/primitives" }
 reth-engine-primitives = { path = "../reth/crates/engine/primitives" }
+reth-engine-tree = { path = "../reth/crates/engine/tree" }
 reth-chain-state = { path = "../reth/crates/chain-state" }
 reth-libmdbx = { path = "../reth/crates/storage/libmdbx-rs" }
 reth-storage-api = { path = "../reth/crates/storage/storage-api" }

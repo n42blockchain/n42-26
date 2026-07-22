@@ -52,9 +52,11 @@ reth-basic-payload-builder.workspace = true
 reth-payload-builder-primitives.workspace = true
 reth-payload-primitives.workspace = true
 reth-engine-primitives.workspace = true
+reth-engine-tree.workspace = true
 reth-chain-state.workspace = true
 reth-storage-api.workspace = true
 reth-trie-common.workspace = true
+reth-trie.workspace = true
 reth-rpc-builder.workspace = true
 
 arc-swap.workspace = true

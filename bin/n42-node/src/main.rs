@@ -27,13 +27,16 @@ use n42_node::mobile_evidence::spawn_mobile_evidence_writeback;
 use n42_node::mobile_packet::mobile_packet_loop;
 use n42_node::mobile_reward::MobileRewardManager;
 use n42_node::persistence;
+use n42_node::qmdb_state_root::Gov5QmdbStateRootStore;
 use n42_node::rpc::{N42ApiServer, N42RpcServer};
 use n42_node::staking::StakingManager;
 use n42_node::tx_bridge::TxPoolBridge;
 use n42_node::{ConsensusOrchestrator, N42Node, ObserverOrchestrator, SharedConsensusState};
 use n42_node::{configured_validator_peer_ids, expected_validator_peer_ids_with_policy};
 use n42_primitives::BlsSecretKey;
-use n42_twig_core::qmdb_compat::{QmdbPortableVerification, verify_portable_stream};
+use n42_twig_core::qmdb_compat::{
+    QmdbPortableSnapshot, QmdbPortableVerification, verify_portable_stream,
+};
 use n42_zkproof::{MockProver, ProofScheduler, ProofStore};
 use reth_chainspec::ChainSpecProvider;
 use reth_ethereum_cli::Cli;
@@ -127,6 +130,70 @@ fn verify_observer_qmdb_bootstrap(
         ));
     }
     Ok(verified)
+}
+
+const DEFAULT_QMDB_EXECUTION_MAX_SLOTS: u64 = 1_000_000;
+const HARD_QMDB_EXECUTION_MAX_SLOTS: u64 = 4_000_000;
+const DEFAULT_QMDB_EXECUTION_MAX_BYTES: u64 = 512 * 1024 * 1024;
+const HARD_QMDB_EXECUTION_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Materialize a bounded portable checkpoint for the Engine Tree strategy. Full-archive snapshots
+/// remain on the streaming verifier path; this function refuses them before allocating.
+#[allow(clippy::too_many_arguments)]
+fn load_qmdb_execution_store(
+    path: &Path,
+    chain_id: u64,
+    genesis_hash: B256,
+    expected_block: u64,
+    expected_block_hash: B256,
+    expected_root: B256,
+    max_slots: u64,
+    max_bytes: u64,
+) -> eyre::Result<(Arc<Gov5QmdbStateRootStore>, QmdbPortableVerification)> {
+    if max_slots > HARD_QMDB_EXECUTION_MAX_SLOTS {
+        return Err(eyre::eyre!(
+            "N42_QMDB_EXECUTION_MAX_SLOTS exceeds hard limit {HARD_QMDB_EXECUTION_MAX_SLOTS}"
+        ));
+    }
+    if max_bytes > HARD_QMDB_EXECUTION_MAX_BYTES {
+        return Err(eyre::eyre!(
+            "N42_QMDB_EXECUTION_MAX_BYTES exceeds hard limit {HARD_QMDB_EXECUTION_MAX_BYTES}"
+        ));
+    }
+    let verified = verify_observer_qmdb_bootstrap(
+        path,
+        chain_id,
+        genesis_hash,
+        expected_block,
+        expected_block_hash,
+        expected_root,
+    )?;
+    if verified.next_slot > max_slots {
+        return Err(eyre::eyre!(
+            "QMDB execution checkpoint has {} slots; configured materialization limit is {max_slots}",
+            verified.next_slot
+        ));
+    }
+    let file_size = std::fs::metadata(path)
+        .map_err(|error| eyre::eyre!("failed to stat QMDB checkpoint {}: {error}", path.display()))?
+        .len();
+    if file_size > max_bytes {
+        return Err(eyre::eyre!(
+            "QMDB execution checkpoint is {file_size} bytes; configured limit is {max_bytes}"
+        ));
+    }
+    let encoded = std::fs::read(path).map_err(|error| {
+        eyre::eyre!("failed to read QMDB checkpoint {}: {error}", path.display())
+    })?;
+    let portable = QmdbPortableSnapshot::decode(&encoded)
+        .map_err(|error| eyre::eyre!("failed to decode QMDB checkpoint: {error}"))?;
+    let expected_genesis: [u8; 32] = genesis_hash.into();
+    let tree = portable
+        .verify_and_build(chain_id, &expected_genesis)
+        .map_err(|error| eyre::eyre!("failed to materialize QMDB checkpoint: {error}"))?;
+    let store = Gov5QmdbStateRootStore::new(expected_block_hash, expected_root, tree.snapshot())
+        .map_err(|error| eyre::eyre!("failed to initialize QMDB state-root store: {error}"))?;
+    Ok((Arc::new(store), verified))
 }
 
 fn required_observer_env<T>(name: &str) -> eyre::Result<T>
@@ -582,6 +649,50 @@ fn main() {
             env_bool("N42_GOV5_HEADER_PROFILE"),
             std::env::var("N42_INTEROP_GENESIS_HASH").ok().as_deref(),
         )?;
+        let qmdb_execution = if env_bool("N42_GOV5_QMDB_EXECUTION") {
+            if !observer_mode || header_profile != N42HeaderProfile::Gov5H2 {
+                return Err(eyre::eyre!(
+                    "N42_GOV5_QMDB_EXECUTION requires observer mode and N42_GOV5_HEADER_PROFILE=1"
+                ));
+            }
+            let path = std::env::var("N42_QMDB_BOOTSTRAP").map_err(|_| {
+                eyre::eyre!("N42_QMDB_BOOTSTRAP is required with N42_GOV5_QMDB_EXECUTION")
+            })?;
+            let expected_block = required_observer_env::<u64>("N42_QMDB_BOOTSTRAP_BLOCK")?;
+            let expected_block_hash =
+                required_observer_env::<B256>("N42_QMDB_BOOTSTRAP_BLOCK_HASH")?;
+            let expected_root = required_observer_env::<B256>("N42_QMDB_BOOTSTRAP_ROOT")?;
+            let interop_genesis = resolve_observer_genesis_hash(
+                B256::ZERO,
+                std::env::var("N42_INTEROP_GENESIS_HASH").ok().as_deref(),
+            )?;
+            let max_slots = env_parse("N42_QMDB_EXECUTION_MAX_SLOTS")
+                .unwrap_or(DEFAULT_QMDB_EXECUTION_MAX_SLOTS);
+            let max_bytes = env_parse("N42_QMDB_EXECUTION_MAX_BYTES")
+                .unwrap_or(DEFAULT_QMDB_EXECUTION_MAX_BYTES);
+            let loaded = load_qmdb_execution_store(
+                Path::new(&path),
+                builder.config().chain.chain.id(),
+                interop_genesis,
+                expected_block,
+                expected_block_hash,
+                expected_root,
+                max_slots,
+                max_bytes,
+            )?;
+            info!(
+                target: "n42::cli",
+                path,
+                base_block = expected_block,
+                base_hash = %expected_block_hash,
+                base_root = %expected_root,
+                slots = loaded.1.next_slot,
+                "prepared bounded Gov5 QMDB Engine Tree state-root strategy"
+            );
+            Some(loaded)
+        } else {
+            None
+        };
         let allow_deterministic_validator_peers =
             !consensus_config_from_file || env_bool("N42_ALLOW_DETERMINISTIC_P2P");
         if !observer_mode && consensus_config_from_file && allow_deterministic_validator_peers {
@@ -758,9 +869,13 @@ fn main() {
                 .ok()
         };
 
-        let n42_node = N42Node::new(consensus_state.clone())
+        let mut n42_node = N42Node::new(consensus_state.clone())
             .with_validator_set_resolver(validator_set_resolver)
             .with_header_profile(header_profile);
+        if let Some((store, _)) = &qmdb_execution {
+            n42_node = n42_node.with_gov5_qmdb_state_root_store(store.clone());
+        }
+        let qmdb_execution_checkpoint = qmdb_execution.map(|(_, checkpoint)| checkpoint);
 
         // Create staking manager early so it can be shared with RPC.
         let staking_state_file = data_dir.join("staking_state.json");
@@ -947,6 +1062,19 @@ fn main() {
                         genesis_hash
                     }
                 };
+
+                if let Some(ref checkpoint) = qmdb_execution_checkpoint
+                    && (best_block_number != checkpoint.block_number ||
+                        head_block_hash != B256::from(checkpoint.block_hash))
+                {
+                    return Err(eyre::eyre!(
+                        "QMDB execution base is block {} ({}) but local Reth head is block {} ({}); hydrate the matching ancestor PlainState/head before enabling N42_GOV5_QMDB_EXECUTION",
+                        checkpoint.block_number,
+                        B256::from(checkpoint.block_hash),
+                        best_block_number,
+                        head_block_hash,
+                    ));
+                }
 
                 if best_block_number > 0 && snapshot.is_none() {
                     return Err(eyre::eyre!(
@@ -1948,6 +2076,47 @@ mod observer_identity_tests {
         assert_eq!(checkpoint.block_number, 42);
         assert_eq!(checkpoint.next_slot, 3);
         assert_eq!(checkpoint.live_count, 1);
+    }
+
+    #[test]
+    fn bounded_qmdb_execution_store_materializes_authenticated_checkpoint() {
+        let fixture = qmdb_portable_fixture();
+        let genesis_hash = "0x1100000000000000000000000000000000000000000000000000000000000000"
+            .parse()
+            .unwrap();
+        let block_hash = "0x2200000000000000000000000000000000000000000000000000000000000000"
+            .parse()
+            .unwrap();
+        let root = "0xbd6c73b724bc0a38c7efa81c2088bfc805d12faa6d12f188b714ebd1e717c646"
+            .parse()
+            .unwrap();
+        let (store, checkpoint) = load_qmdb_execution_store(
+            fixture.path(),
+            1143,
+            genesis_hash,
+            42,
+            block_hash,
+            root,
+            3,
+            1024 * 1024,
+        )
+        .unwrap();
+        assert_eq!(store.base_block_hash(), block_hash);
+        assert_eq!(store.base_root(), root);
+        assert_eq!(checkpoint.next_slot, 3);
+
+        let error = load_qmdb_execution_store(
+            fixture.path(),
+            1143,
+            genesis_hash,
+            42,
+            block_hash,
+            root,
+            2,
+            1024 * 1024,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("materialization limit"));
     }
 
     #[test]

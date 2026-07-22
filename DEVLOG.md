@@ -156,6 +156,7 @@ Logs are split into separate files by phase for easy maintenance:
 | [devlog-123-replay-engine-plan-preflight](docs/devlog-123-replay-engine-plan-preflight.md) | 已认证 entries 到 Engine payload 的无副作用预检；真实 gov5 header 的零 ommers hash 与标准 Reth 不兼容时 fail closed | Interop |
 | [devlog-124-gov5-h2-engine-header-profile](docs/devlog-124-gov5-h2-engine-header-profile.md) | observer-only Gov5 H2 Engine header profile：无损重建 zero-ommers、difficulty=1、bounded N42H extra；两份真实 range 共 177 块/247 tx 计划通过 | Interop |
 | [devlog-125-gov5-native-execution-commitments](docs/devlog-125-gov5-native-execution-commitments.md) | Gov5 原生 receipt commitment 的执行后硬校验，以及 reth BundleState 到 replay-v2 QMDB 排序 mutation 的逐字节转换边界 | Interop |
+| [devlog-126-branch-safe-qmdb-state-root](docs/devlog-126-branch-safe-qmdb-state-root.md) | Reth 2.4.1 官方 StateRootStrategy 接入 branch-safe QMDB candidate store；认证 base、精确父分支重放和 observer-only 启动门禁 | Interop |
 
 ### 上游借鉴与跟踪
 

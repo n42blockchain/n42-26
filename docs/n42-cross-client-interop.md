@@ -129,4 +129,13 @@ replay-v2 历史的 `difficulty=1`）和有界
 `N42H` extra-data；默认 Ethereum profile 不变。runtime-01 的 128 块与 runtime-02 的 49
 块/247 tx 均已保持原 block hash 生成 payload 计划。当前仍不能声称 execution follower：
 Reth 的 MPT state root/receipt trie 与 gov5 replay-v2 的 QMDB/native receipt commitment 不同，
-后续必须接入确定性 QMDB 执行验证，且不得改写既有七节点历史。
+且不得改写既有七节点历史。
+
+确定性 QMDB state-root 验证现已接入 Reth 2.4.1 官方 `StateRootStrategy`。显式设置
+`N42_GOV5_QMDB_EXECUTION=1` 时，节点会从认证 portable base 按候选块的精确父分支重放 EVM
+mutation，只有 computed root 等于 header root 才登记该候选；兄弟分支不共享可变 canonical
+tree。该模式仍被锁在 observer，并对物化 slots/bytes 设置硬上限。它还要求本地 Reth head 的
+number/hash 与 QMDB base 精确一致：当前 block-49 checkpoint 不能直接配 fresh Reth genesis，
+必须先完成 Gov5 genesis 或 checkpoint 对应的 PlainState/canonical ancestor hydration。因此此时
+仍不能接入现有七节点作为 execution follower，更不能参与投票；下一验收是一次性 datadir 上的
+runtime-02 block 1–49 连续执行与逐块 QMDB/receipt/header 对拍。

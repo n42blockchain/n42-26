@@ -15,6 +15,7 @@ pub mod packet_builder;
 pub mod payload;
 pub mod pool;
 pub mod qmdb_state;
+pub mod qmdb_state_root;
 pub mod rpc;
 pub mod sinks;
 pub mod staking;

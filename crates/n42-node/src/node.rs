@@ -3,6 +3,7 @@ use crate::consensus_state::SharedConsensusState;
 use crate::engine_validator::N42EngineValidatorBuilder;
 use crate::payload::N42PayloadBuilder;
 use crate::pool::N42PoolBuilder;
+use crate::qmdb_state_root::{Gov5QmdbStateRootStore, N42EngineTreeValidatorBuilder};
 use n42_consensus::{N42HeaderProfile, ValidatorSetResolver};
 use reth_chainspec::ChainSpec;
 use reth_ethereum_engine_primitives::EthEngineTypes;
@@ -11,7 +12,7 @@ use reth_node_builder::{
     Node, NodeAdapter,
     components::{BasicPayloadServiceBuilder, ComponentsBuilder},
     node::{FullNodeTypes, NodeTypes},
-    rpc::{BasicEngineApiBuilder, BasicEngineValidatorBuilder, Identity, RpcAddOns},
+    rpc::{BasicEngineApiBuilder, Identity, RpcAddOns},
 };
 use reth_node_ethereum::node::{EthereumAddOns, EthereumEthApiBuilder, EthereumNetworkBuilder};
 use reth_provider::EthStorage;
@@ -26,6 +27,7 @@ pub struct N42Node {
     pub consensus_state: Arc<SharedConsensusState>,
     pub validator_set_resolver: Option<ValidatorSetResolver>,
     pub header_profile: N42HeaderProfile,
+    pub qmdb_state_root_store: Option<Arc<Gov5QmdbStateRootStore>>,
 }
 
 impl std::fmt::Debug for N42Node {
@@ -36,6 +38,10 @@ impl std::fmt::Debug for N42Node {
                 &self.validator_set_resolver.is_some(),
             )
             .field("header_profile", &self.header_profile)
+            .field(
+                "has_qmdb_state_root_store",
+                &self.qmdb_state_root_store.is_some(),
+            )
             .finish()
     }
 }
@@ -46,6 +52,7 @@ impl N42Node {
             consensus_state,
             validator_set_resolver: None,
             header_profile: N42HeaderProfile::Ethereum,
+            qmdb_state_root_store: None,
         }
     }
 
@@ -59,6 +66,13 @@ impl N42Node {
 
     pub const fn with_header_profile(mut self, header_profile: N42HeaderProfile) -> Self {
         self.header_profile = header_profile;
+        self
+    }
+
+    /// Install an authenticated, bounded QMDB execution base. Startup wiring must keep this
+    /// observer-only until continuous cross-client execution gates pass.
+    pub fn with_gov5_qmdb_state_root_store(mut self, store: Arc<Gov5QmdbStateRootStore>) -> Self {
+        self.qmdb_state_root_store = Some(store);
         self
     }
 }
@@ -88,7 +102,7 @@ where
         EthereumEthApiBuilder,
         N42EngineValidatorBuilder,
         BasicEngineApiBuilder<N42EngineValidatorBuilder>,
-        BasicEngineValidatorBuilder<N42EngineValidatorBuilder>,
+        N42EngineTreeValidatorBuilder,
     >;
 
     fn components_builder(&self) -> Self::ComponentsBuilder {
@@ -116,7 +130,7 @@ where
             EthereumEthApiBuilder::default(),
             validator,
             BasicEngineApiBuilder::default(),
-            BasicEngineValidatorBuilder::new(validator),
+            N42EngineTreeValidatorBuilder::new(validator, self.qmdb_state_root_store.clone()),
             Default::default(),
             Identity::new(),
         ))
