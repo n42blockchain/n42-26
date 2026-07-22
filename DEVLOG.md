@@ -161,6 +161,7 @@ Logs are split into separate files by phase for easy maintenance:
 | [devlog-128-gov5-finalized-live-following](docs/devlog-128-gov5-finalized-live-following.md) | Rust observer 从 replay-v2 block 49 接续 Gov5 七节点：原生 block push/hash fetch、严格 RLP/commitment 校验、H2-v4 Decide 门控，真机追至 block 60/view 13 | Interop |
 | [devlog-129-h2-v4-full-shadow-verification](docs/devlog-129-h2-v4-full-shadow-verification.md) | Rust observer 对 H2-v4 七类消息做 leader/member/bitmap/quorum/QC/TC/BLS 全量只读验签；临时七节点正常流量与真实 Timeout 通过，并定位远距离加入的 status-session catch-up 门槛 | Interop |
 | [devlog-130-gov5-status-session](docs/devlog-130-gov5-status-session.md) | Rust observer 实现 Gov5 Status SSZ+Snappy framed 双向握手，跨语言夹具与真机会话越过 10 秒断连门限；隔离出 >512 块远距 checkpoint/range 接续门槛 | Interop |
+| [devlog-131-gov5-finalized-far-catchup](docs/devlog-131-gov5-finalized-far-catchup.md) | Rust observer 从 replay-v2 block 49 完成 2,883 块单次认证追赶并与七节点在 block 3,194/hash/state root 一致；512 body 硬上限下支持远距谱系发现、正序执行与稳态跟随 | Interop |
 
 ### 上游借鉴与跟踪
 
