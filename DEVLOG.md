@@ -153,6 +153,7 @@ Logs are split into separate files by phase for easy maintenance:
 | [devlog-120-finalized-range-qmdb-anchor](docs/devlog-120-finalized-range-qmdb-anchor.md) | gov5 canonical finalized range 与 QMDB checkpoint 同链锚定；现有七节点 block 771-898 真机只读 observer 启动验收，并修复 replay-v2 block 1 零父哈希 | Interop |
 | [devlog-121-gov5-compact-receipt-verification](docs/devlog-121-gov5-compact-receipt-verification.md) | Rust 解码 gov5 compact receipts、绑定 block 交易数并逐块重算 native receipt root；runtime-02 的 49 块/247 tx 跨语言通过 | Interop |
 | [devlog-122-authenticated-finalized-range-materialization](docs/devlog-122-authenticated-finalized-range-materialization.md) | finalized-range 整帧认证后才物化 header/transactions/receipts，增加 256 MiB 总上限并逐块重算 Ethereum tx trie root | Interop |
+| [devlog-123-replay-engine-plan-preflight](docs/devlog-123-replay-engine-plan-preflight.md) | 已认证 entries 到 Engine payload 的无副作用预检；真实 gov5 header 的零 ommers hash 与标准 Reth 不兼容时 fail closed | Interop |
 
 ### 上游借鉴与跟踪
 

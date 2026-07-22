@@ -122,3 +122,10 @@ header、block lineage、Ethereum transaction trie root、compact receipts 与 n
 root 全部通过后，才返回带 256 MiB 总物化上限的 typed entries。任何 execution/archive
 副作用必须只消费该返回值；QMDB execution commitment 尚未接入 Reth 前仍禁止提交 Engine
 API 或借助 state-root bypass 推进 head。
+
+已认证 entries 现可进入无副作用的 Engine import-plan 预检。真实 runtime-01/runtime-02 在
+第一个 block 均被标准 Reth profile 明确拒绝：gov5 header 使用全零 `ommers_hash`，而
+Ethereum payload 重建使用 `1dcc4d...9347`；两者会导向不同 block hash。再加上 QMDB/MPT
+state commitment 差异，当前只能作为验证型 observer/archive input，不能声称 execution
+follower。后续 N42 Engine profile 必须同时解决 zero-ommers header 重建和 QMDB state root，
+且不得改写既有七节点历史。

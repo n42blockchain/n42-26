@@ -19,11 +19,15 @@ pub mod net_port;
 pub mod observer;
 pub mod orchestrator;
 pub mod persistence;
+pub mod replay_import;
 pub mod sinks;
 pub mod validator_peers;
 
 pub use observer::ObserverOrchestrator;
 pub use orchestrator::ConsensusService;
+pub use replay_import::{
+    ReplayExecutionPlan, ReplayImportPlanError, build_replay_execution_plan,
+};
 pub use validator_peers::expected_validator_peer_ids_with_policy;
 
 /// Returns the current wall-clock time in milliseconds since the Unix epoch.

@@ -28,17 +28,17 @@ pub struct FinalizedRangeVerification {
 /// passed its trailing digest and all per-block checks.
 #[derive(Debug, Clone)]
 pub struct VerifiedFinalizedRangeEntry {
-    pub number: u64,
-    pub block_hash: B256,
-    pub parent_hash: B256,
-    pub state_root: B256,
-    pub receipts_root: B256,
-    pub transactions_root: B256,
-    pub header: ConsensusHeader,
-    pub header_rlp: Vec<u8>,
-    pub block_rlp: Vec<u8>,
-    pub transactions: Vec<TxEnvelope>,
-    pub receipts: Vec<alloy_consensus::EthereumReceipt>,
+    number: u64,
+    block_hash: B256,
+    parent_hash: B256,
+    state_root: B256,
+    receipts_root: B256,
+    transactions_root: B256,
+    header: ConsensusHeader,
+    header_rlp: Vec<u8>,
+    block_rlp: Vec<u8>,
+    transactions: Vec<TxEnvelope>,
+    receipts: Vec<alloy_consensus::EthereumReceipt>,
 }
 
 /// Authenticated replay input. Construction is intentionally restricted to
@@ -46,8 +46,64 @@ pub struct VerifiedFinalizedRangeEntry {
 /// the whole-frame Blake3 digest succeeds.
 #[derive(Debug, Clone)]
 pub struct VerifiedFinalizedRange {
-    pub verification: FinalizedRangeVerification,
-    pub entries: Vec<VerifiedFinalizedRangeEntry>,
+    verification: FinalizedRangeVerification,
+    entries: Vec<VerifiedFinalizedRangeEntry>,
+}
+
+impl VerifiedFinalizedRange {
+    pub const fn verification(&self) -> &FinalizedRangeVerification {
+        &self.verification
+    }
+
+    pub fn entries(&self) -> &[VerifiedFinalizedRangeEntry] {
+        &self.entries
+    }
+}
+
+impl VerifiedFinalizedRangeEntry {
+    pub const fn number(&self) -> u64 {
+        self.number
+    }
+
+    pub const fn block_hash(&self) -> B256 {
+        self.block_hash
+    }
+
+    pub const fn parent_hash(&self) -> B256 {
+        self.parent_hash
+    }
+
+    pub const fn state_root(&self) -> B256 {
+        self.state_root
+    }
+
+    pub const fn receipts_root(&self) -> B256 {
+        self.receipts_root
+    }
+
+    pub const fn transactions_root(&self) -> B256 {
+        self.transactions_root
+    }
+
+    pub const fn header(&self) -> &ConsensusHeader {
+        &self.header
+    }
+
+    pub fn header_rlp(&self) -> &[u8] {
+        &self.header_rlp
+    }
+
+    pub fn block_rlp(&self) -> &[u8] {
+        &self.block_rlp
+    }
+
+    pub fn transactions(&self) -> &[TxEnvelope] {
+        &self.transactions
+    }
+
+    pub fn receipts(&self) -> &[alloy_consensus::EthereumReceipt] {
+        &self.receipts
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
