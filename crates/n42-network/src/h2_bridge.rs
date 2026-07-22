@@ -35,7 +35,7 @@ pub enum H2BridgeError {
 fn native_bitmap_to_h2(signers: &BitVec<u8, Msb0>) -> Result<Vec<u8>, H2BridgeError> {
     let count = u16::try_from(signers.len()).map_err(|_| H2BridgeError::InvalidBitmap)?;
     if count == 0 {
-        return Ok(vec![0, 0]);
+        return Ok(Vec::new());
     }
     let mut encoded = Vec::with_capacity(2 + signers.len().div_ceil(8));
     encoded.extend_from_slice(&count.to_le_bytes());
@@ -49,7 +49,7 @@ fn native_bitmap_to_h2(signers: &BitVec<u8, Msb0>) -> Result<Vec<u8>, H2BridgeEr
 }
 
 fn h2_bitmap_to_native(encoded: &[u8]) -> Result<BitVec<u8, Msb0>, H2BridgeError> {
-    if encoded == [0, 0] {
+    if encoded.is_empty() {
         return Ok(BitVec::new());
     }
     let [lo, hi, rest @ ..] = encoded else {
@@ -71,12 +71,15 @@ fn h2_bitmap_to_native(encoded: &[u8]) -> Result<BitVec<u8, Msb0>, H2BridgeError
 }
 
 fn qc_to_h2(qc: &QuorumCertificate) -> Result<H2QuorumCertificate, H2BridgeError> {
-    if qc.view == 0 && qc.block_hash == B256::ZERO && qc.signers.is_empty() {
+    // Rust carries a deterministic dummy signature for its in-memory genesis
+    // sentinel and may pad the bitmap to the active validator count. Gov5's
+    // canonical SSZ representation is instead empty signature + empty bitmap.
+    if qc.view == 0 && qc.block_hash == B256::ZERO && qc.signers.not_any() {
         return Ok(H2QuorumCertificate {
             view: 0,
             block_hash: B256::ZERO,
             aggregate_signature: Vec::new(),
-            signers_bitmap: vec![0, 0],
+            signers_bitmap: Vec::new(),
         });
     }
     Ok(H2QuorumCertificate {
@@ -91,7 +94,7 @@ fn qc_from_h2(qc: H2QuorumCertificate) -> Result<QuorumCertificate, H2BridgeErro
     if qc.view == 0
         && qc.block_hash == B256::ZERO
         && qc.aggregate_signature.is_empty()
-        && qc.signers_bitmap == [0, 0]
+        && qc.signers_bitmap.is_empty()
     {
         return Ok(QuorumCertificate::genesis());
     }
@@ -369,6 +372,39 @@ mod tests {
                 bincode::serialize(&message).unwrap()
             );
         }
+    }
+
+    #[test]
+    fn genesis_qc_uses_gov5_empty_wire_representation() {
+        let identity = H2V4ChainIdentity {
+            chain_id: 42,
+            genesis_hash: B256::repeat_byte(0x11),
+        };
+        let mut genesis = QuorumCertificate::genesis();
+        // The engine can normalize certificate bitmaps to the committee size.
+        // This remains the genesis sentinel because no signer bit is set.
+        genesis.signers = bitvec::bitvec![u8, Msb0; 0; 7];
+        let message = ConsensusMessage::Timeout(TimeoutMessage {
+            view: 1,
+            high_qc: genesis,
+            sender: 0,
+            signature: key().sign_h2_v4(b"timeout"),
+        });
+
+        let envelope = consensus_to_h2_v4(identity, &message).unwrap();
+        let H2Message::Timeout(timeout) = &envelope.message else {
+            panic!("expected timeout");
+        };
+        assert!(timeout.high_qc.aggregate_signature.is_empty());
+        assert!(timeout.high_qc.signers_bitmap.is_empty());
+
+        let recovered = consensus_from_h2_v4(envelope).unwrap();
+        let ConsensusMessage::Timeout(timeout) = recovered else {
+            panic!("expected timeout");
+        };
+        assert_eq!(timeout.high_qc.view, 0);
+        assert_eq!(timeout.high_qc.block_hash, B256::ZERO);
+        assert!(timeout.high_qc.signers.is_empty());
     }
 
     #[test]
