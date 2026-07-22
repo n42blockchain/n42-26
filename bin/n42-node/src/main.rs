@@ -9,7 +9,9 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 use alloy_primitives::{Address, B256, U256, keccak256};
 use clap::Parser;
 use n42_chainspec::{ConsensusConfig, ValidatorInfo};
-use n42_consensus::{ConsensusEngine, EpochManager, ValidatorSet, ValidatorSetResolver};
+use n42_consensus::{
+    ConsensusEngine, EpochManager, N42HeaderProfile, ValidatorSet, ValidatorSetResolver,
+};
 use n42_jmt::{EMPTY_CODE_HASH, PersistentSbmt, PersistentTwig};
 use n42_network::NetworkService;
 use n42_network::{
@@ -68,6 +70,27 @@ fn resolve_observer_genesis_hash(
     configured_hash.parse::<B256>().map_err(|error| {
         eyre::eyre!("N42_INTEROP_GENESIS_HASH must be a 32-byte 0x-prefixed hash: {error}")
     })
+}
+
+fn resolve_header_profile(
+    observer_mode: bool,
+    gov5_profile_requested: bool,
+    interop_genesis_hash: Option<&str>,
+) -> eyre::Result<N42HeaderProfile> {
+    if !gov5_profile_requested {
+        return Ok(N42HeaderProfile::Ethereum);
+    }
+    if !observer_mode {
+        return Err(eyre::eyre!(
+            "N42_GOV5_HEADER_PROFILE is restricted to observer mode until QMDB execution validation is complete"
+        ));
+    }
+    if interop_genesis_hash.is_none() {
+        return Err(eyre::eyre!(
+            "N42_INTEROP_GENESIS_HASH is required with N42_GOV5_HEADER_PROFILE"
+        ));
+    }
+    Ok(N42HeaderProfile::Gov5H2)
 }
 
 fn verify_observer_qmdb_bootstrap(
@@ -554,6 +577,11 @@ fn main() {
             .unwrap_or_else(|_| "./n42-data".to_string())
             .into();
         let observer_mode = env_bool("N42_OBSERVER_MODE");
+        let header_profile = resolve_header_profile(
+            observer_mode,
+            env_bool("N42_GOV5_HEADER_PROFILE"),
+            std::env::var("N42_INTEROP_GENESIS_HASH").ok().as_deref(),
+        )?;
         let allow_deterministic_validator_peers =
             !consensus_config_from_file || env_bool("N42_ALLOW_DETERMINISTIC_P2P");
         if !observer_mode && consensus_config_from_file && allow_deterministic_validator_peers {
@@ -731,7 +759,8 @@ fn main() {
         };
 
         let n42_node = N42Node::new(consensus_state.clone())
-            .with_validator_set_resolver(validator_set_resolver);
+            .with_validator_set_resolver(validator_set_resolver)
+            .with_header_profile(header_profile);
 
         // Create staking manager early so it can be shared with RPC.
         let staking_state_file = data_dir.join("staking_state.json");
@@ -1877,6 +1906,20 @@ mod observer_identity_tests {
     fn observer_genesis_hash_rejects_malformed_identity() {
         let error = resolve_observer_genesis_hash(B256::ZERO, Some("0x1234")).unwrap_err();
         assert!(error.to_string().contains("N42_INTEROP_GENESIS_HASH"));
+    }
+
+    #[test]
+    fn gov5_header_profile_is_identity_bound_and_observer_only() {
+        assert_eq!(
+            resolve_header_profile(false, false, None).unwrap(),
+            N42HeaderProfile::Ethereum
+        );
+        assert!(resolve_header_profile(false, true, Some("0x01")).is_err());
+        assert!(resolve_header_profile(true, true, None).is_err());
+        assert_eq!(
+            resolve_header_profile(true, true, Some("0x01")).unwrap(),
+            N42HeaderProfile::Gov5H2
+        );
     }
 
     #[test]

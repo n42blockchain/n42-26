@@ -15,7 +15,11 @@ pub mod rotor;
 pub mod validator;
 pub mod vote_log;
 
-pub use adapter::{N42Consensus, ValidatorSetResolver};
+pub use adapter::{
+    GOV5_HEADER_EXTRA_MAGIC, MAX_GOV5_HEADER_EXTRA_BYTES, MIN_GOV5_HEADER_EXTRA_BYTES,
+    N42Consensus, N42HeaderProfile, N42HeaderProfileError, ValidatorSetResolver,
+    validate_gov5_h2_header, validate_gov5_header_extra,
+};
 pub use error::ConsensusError as N42ConsensusError;
 pub use protocol::quorum::{validator_changes_hash, verify_commit_qc, verify_qc, verify_tc};
 pub use protocol::state_machine::{AuthenticatedConsensusMessage, FUTURE_VIEW_WINDOW};

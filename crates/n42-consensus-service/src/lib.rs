@@ -27,6 +27,7 @@ pub use observer::ObserverOrchestrator;
 pub use orchestrator::ConsensusService;
 pub use replay_import::{
     ReplayExecutionPlan, ReplayImportPlanError, build_replay_execution_plan,
+    build_replay_execution_plan_with_profile,
 };
 pub use validator_peers::expected_validator_peer_ids_with_policy;
 

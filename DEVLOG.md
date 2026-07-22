@@ -154,6 +154,7 @@ Logs are split into separate files by phase for easy maintenance:
 | [devlog-121-gov5-compact-receipt-verification](docs/devlog-121-gov5-compact-receipt-verification.md) | Rust 解码 gov5 compact receipts、绑定 block 交易数并逐块重算 native receipt root；runtime-02 的 49 块/247 tx 跨语言通过 | Interop |
 | [devlog-122-authenticated-finalized-range-materialization](docs/devlog-122-authenticated-finalized-range-materialization.md) | finalized-range 整帧认证后才物化 header/transactions/receipts，增加 256 MiB 总上限并逐块重算 Ethereum tx trie root | Interop |
 | [devlog-123-replay-engine-plan-preflight](docs/devlog-123-replay-engine-plan-preflight.md) | 已认证 entries 到 Engine payload 的无副作用预检；真实 gov5 header 的零 ommers hash 与标准 Reth 不兼容时 fail closed | Interop |
+| [devlog-124-gov5-h2-engine-header-profile](docs/devlog-124-gov5-h2-engine-header-profile.md) | observer-only Gov5 H2 Engine header profile：无损重建 zero-ommers、difficulty=1、bounded N42H extra；两份真实 range 共 177 块/247 tx 计划通过 | Interop |
 
 ### 上游借鉴与跟踪
 

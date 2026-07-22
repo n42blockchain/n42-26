@@ -18,6 +18,7 @@ reth-ethereum-primitives.workspace = true
 reth-execution-types.workspace = true
 reth-primitives-traits.workspace = true
 
+alloy-consensus.workspace = true
 alloy-primitives.workspace = true
 bincode.workspace = true
 bitvec.workspace = true

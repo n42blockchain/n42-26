@@ -57,6 +57,7 @@ mkdir -p "$interop_runtime_root/consensus" "$interop_runtime_root/reth"
 
 exec env \
     N42_OBSERVER_MODE=1 \
+    N42_GOV5_HEADER_PROFILE=1 \
     N42_CONSENSUS_CONFIG="$N42_CONSENSUS_CONFIG" \
     N42_INTEROP_GENESIS_HASH="$N42_INTEROP_GENESIS_HASH" \
     N42_TRUSTED_PEERS="$N42_TRUSTED_PEERS" \

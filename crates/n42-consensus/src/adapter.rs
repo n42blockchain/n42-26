@@ -1,15 +1,75 @@
+use alloy_consensus::{EMPTY_OMMER_ROOT_HASH, Header};
+use alloy_primitives::{B256, Bytes, U256};
 use arc_swap::ArcSwapOption;
 use reth_chainspec::{ChainSpec, EthChainSpec, EthereumHardforks};
 use reth_consensus::{Consensus, ConsensusError, FullConsensus, HeaderValidator};
 use reth_ethereum_consensus::EthBeaconConsensus;
+use reth_ethereum_primitives::{Block as EthBlock, EthPrimitives};
 use reth_execution_types::BlockExecutionResult;
-use reth_primitives_traits::{
-    Block, BlockHeader, NodePrimitives, RecoveredBlock, SealedBlock, SealedHeader,
-};
+use reth_primitives_traits::{Block, RecoveredBlock, SealedBlock, SealedHeader};
 use std::fmt::Debug;
 use std::sync::Arc;
 
 use crate::validator::ValidatorSet;
+
+/// Header semantics used when reconstructing and validating N42 blocks.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum N42HeaderProfile {
+    /// Standard Ethereum post-merge empty-ommers commitment.
+    #[default]
+    Ethereum,
+    /// gov5 H2 custom-chain header encoding used by the preserved replay-v2 history.
+    Gov5H2,
+}
+
+/// Fixed prefix written by gov5's H2 header-extra encoder.
+pub const GOV5_HEADER_EXTRA_MAGIC: &[u8; 4] = b"N42H";
+/// Magic plus the little-endian H2 view number.
+pub const MIN_GOV5_HEADER_EXTRA_BYTES: usize = 12;
+/// Defensive allocation/wire bound shared with the H2 high-TC envelope limit.
+pub const MAX_GOV5_HEADER_EXTRA_BYTES: usize = 4096;
+
+/// Structural errors in gov5's chain-specific header-extra field.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum N42HeaderProfileError {
+    #[error("gov5 header extra is too short: got {0} bytes, need at least 12")]
+    Gov5ExtraTooShort(usize),
+    #[error("gov5 header extra exceeds 4096 bytes: got {0}")]
+    Gov5ExtraTooLong(usize),
+    #[error("gov5 header extra is missing the N42H magic prefix")]
+    Gov5ExtraInvalidMagic,
+    #[error("gov5 H2 header requires a zero ommers hash, got {0}")]
+    Gov5OmmersHash(B256),
+    #[error("gov5 H2 header requires difficulty 1, got {0}")]
+    Gov5Difficulty(U256),
+}
+
+/// Validates the bounded, hash-authenticated outer shape of gov5 H2 header extra-data.
+/// QC and seal authentication remain the responsibility of the H2 finality layer.
+pub fn validate_gov5_header_extra(extra_data: &[u8]) -> Result<(), N42HeaderProfileError> {
+    if extra_data.len() < MIN_GOV5_HEADER_EXTRA_BYTES {
+        return Err(N42HeaderProfileError::Gov5ExtraTooShort(extra_data.len()));
+    }
+    if extra_data.len() > MAX_GOV5_HEADER_EXTRA_BYTES {
+        return Err(N42HeaderProfileError::Gov5ExtraTooLong(extra_data.len()));
+    }
+    if !extra_data.starts_with(GOV5_HEADER_EXTRA_MAGIC) {
+        return Err(N42HeaderProfileError::Gov5ExtraInvalidMagic);
+    }
+    Ok(())
+}
+
+/// Validates fields that gov5 commits to the H2 block hash but standard Engine payloads omit or
+/// constrain differently.
+pub fn validate_gov5_h2_header(header: &Header) -> Result<(), N42HeaderProfileError> {
+    if header.ommers_hash != B256::ZERO {
+        return Err(N42HeaderProfileError::Gov5OmmersHash(header.ommers_hash));
+    }
+    if header.difficulty != U256::from(1) {
+        return Err(N42HeaderProfileError::Gov5Difficulty(header.difficulty));
+    }
+    validate_gov5_header_extra(&header.extra_data)
+}
 
 /// Resolves the validator set that should verify a QC for a given view.
 pub type ValidatorSetResolver = Arc<dyn Fn(u64) -> Option<Arc<ValidatorSet>> + Send + Sync>;
@@ -33,6 +93,8 @@ pub struct N42Consensus<C = ChainSpec> {
     validator_set: Arc<ArcSwapOption<ValidatorSet>>,
     /// Optional epoch-aware validator-set resolver for QC verification.
     validator_set_resolver: Option<ValidatorSetResolver>,
+    /// Chain-specific header encoding. Defaults to standard Ethereum semantics.
+    header_profile: N42HeaderProfile,
 }
 
 impl<C> std::fmt::Debug for N42Consensus<C> {
@@ -43,6 +105,7 @@ impl<C> std::fmt::Debug for N42Consensus<C> {
                 "has_validator_set_resolver",
                 &self.validator_set_resolver.is_some(),
             )
+            .field("header_profile", &self.header_profile)
             .finish()
     }
 }
@@ -58,6 +121,7 @@ where
             inner: EthBeaconConsensus::new(chain_spec),
             validator_set: Arc::new(ArcSwapOption::empty()),
             validator_set_resolver: None,
+            header_profile: N42HeaderProfile::Ethereum,
         }
     }
 
@@ -88,7 +152,14 @@ where
             inner: EthBeaconConsensus::new(chain_spec),
             validator_set,
             validator_set_resolver,
+            header_profile: N42HeaderProfile::Ethereum,
         }
+    }
+
+    /// Selects non-standard header semantics for an explicitly identified N42 chain.
+    pub const fn with_header_profile(mut self, header_profile: N42HeaderProfile) -> Self {
+        self.header_profile = header_profile;
+        self
     }
 
     /// Sets or updates the validator set.
@@ -105,19 +176,20 @@ where
     }
 }
 
-impl<C, N> FullConsensus<N> for N42Consensus<C>
+impl<C> FullConsensus<EthPrimitives> for N42Consensus<C>
 where
-    C: EthChainSpec<Header = N::BlockHeader> + EthereumHardforks + Debug + Send + Sync,
-    N: NodePrimitives,
+    C: EthChainSpec<Header = Header> + EthereumHardforks + Debug + Send + Sync,
 {
     fn validate_block_post_execution(
         &self,
-        block: &RecoveredBlock<N::Block>,
-        result: &BlockExecutionResult<N::Receipt>,
+        block: &RecoveredBlock<EthBlock>,
+        result: &BlockExecutionResult<
+            <EthPrimitives as reth_primitives_traits::NodePrimitives>::Receipt,
+        >,
         receipt_root_bloom: Option<reth_consensus::ReceiptRootBloom>,
-        block_access_list_hash: Option<alloy_primitives::B256>,
+        block_access_list_hash: Option<B256>,
     ) -> Result<(), ConsensusError> {
-        <EthBeaconConsensus<C> as FullConsensus<N>>::validate_block_post_execution(
+        <EthBeaconConsensus<C> as FullConsensus<EthPrimitives>>::validate_block_post_execution(
             &self.inner,
             block,
             result,
@@ -127,41 +199,72 @@ where
     }
 }
 
-impl<B, C> Consensus<B> for N42Consensus<C>
+impl<C> Consensus<EthBlock> for N42Consensus<C>
 where
-    B: Block,
-    C: EthChainSpec<Header = B::Header> + EthereumHardforks + Debug + Send + Sync,
+    C: EthChainSpec<Header = Header> + EthereumHardforks + Debug + Send + Sync,
 {
     fn validate_body_against_header(
         &self,
-        body: &B::Body,
-        header: &SealedHeader<B::Header>,
+        body: &<EthBlock as reth_primitives_traits::Block>::Body,
+        header: &SealedHeader<Header>,
     ) -> Result<(), ConsensusError> {
-        <EthBeaconConsensus<C> as Consensus<B>>::validate_body_against_header(
+        if self.header_profile == N42HeaderProfile::Gov5H2 {
+            validate_gov5_h2_header(header.header()).map_err(ConsensusError::other)?;
+            let mut normalized = header.header().clone();
+            normalized.ommers_hash = EMPTY_OMMER_ROOT_HASH;
+            return <EthBeaconConsensus<C> as Consensus<EthBlock>>::validate_body_against_header(
+                &self.inner,
+                body,
+                &SealedHeader::seal_slow(normalized),
+            );
+        }
+        <EthBeaconConsensus<C> as Consensus<EthBlock>>::validate_body_against_header(
             &self.inner,
             body,
             header,
         )
     }
 
-    fn validate_block_pre_execution(&self, block: &SealedBlock<B>) -> Result<(), ConsensusError> {
+    fn validate_block_pre_execution(
+        &self,
+        block: &SealedBlock<EthBlock>,
+    ) -> Result<(), ConsensusError> {
+        if self.header_profile == N42HeaderProfile::Gov5H2 {
+            validate_gov5_h2_header(block.header()).map_err(ConsensusError::other)?;
+            let mut normalized = block.clone().into_block();
+            normalized.header.ommers_hash = EMPTY_OMMER_ROOT_HASH;
+            normalized.header.difficulty = U256::ZERO;
+            normalized.header.extra_data = Bytes::new();
+            return self
+                .inner
+                .validate_block_pre_execution(&normalized.seal_slow());
+        }
         self.inner.validate_block_pre_execution(block)
     }
 }
 
-impl<H, C> HeaderValidator<H> for N42Consensus<C>
+impl<C> HeaderValidator<Header> for N42Consensus<C>
 where
-    H: BlockHeader,
-    C: EthChainSpec<Header = H> + EthereumHardforks + Debug + Send + Sync,
+    C: EthChainSpec<Header = Header> + EthereumHardforks + Debug + Send + Sync,
 {
-    fn validate_header(&self, header: &SealedHeader<H>) -> Result<(), ConsensusError> {
+    fn validate_header(&self, header: &SealedHeader<Header>) -> Result<(), ConsensusError> {
+        if self.header_profile == N42HeaderProfile::Gov5H2 {
+            validate_gov5_h2_header(header.header()).map_err(ConsensusError::other)?;
+            let mut normalized = header.header().clone();
+            normalized.ommers_hash = EMPTY_OMMER_ROOT_HASH;
+            normalized.difficulty = U256::ZERO;
+            normalized.extra_data = Bytes::new();
+            return self
+                .inner
+                .validate_header(&SealedHeader::seal_slow(normalized));
+        }
         self.inner.validate_header(header)
     }
 
     fn validate_header_against_parent(
         &self,
-        header: &SealedHeader<H>,
-        parent: &SealedHeader<H>,
+        header: &SealedHeader<Header>,
+        parent: &SealedHeader<Header>,
     ) -> Result<(), ConsensusError> {
         self.inner.validate_header_against_parent(header, parent)
     }
@@ -170,6 +273,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_consensus::BlockBody;
     use alloy_primitives::{Address, B256};
     use bitvec::prelude::*;
     use n42_chainspec::ValidatorInfo;
@@ -207,6 +311,77 @@ mod tests {
         let chain_spec = n42_chainspec::n42_dev_chainspec();
         let consensus = N42Consensus::new(chain_spec);
         assert!(consensus.validator_set.load_full().is_none());
+    }
+
+    #[test]
+    fn gov5_header_profile_accepts_only_zero_empty_ommers_semantics() {
+        let chain_spec = n42_chainspec::n42_dev_chainspec();
+        let standard = N42Consensus::new(chain_spec.clone());
+        let gov5 = N42Consensus::new(chain_spec).with_header_profile(N42HeaderProfile::Gov5H2);
+        let body = BlockBody::<reth_ethereum_primitives::TransactionSigned>::default();
+        let valid_extra = [b"N42H".as_slice(), &[0_u8; 8]].concat();
+        let header = SealedHeader::seal_slow(Header {
+            ommers_hash: B256::ZERO,
+            difficulty: U256::from(1),
+            extra_data: valid_extra.clone().into(),
+            ..Default::default()
+        });
+
+        assert!(
+            standard
+                .validate_body_against_header(&body, &header)
+                .is_err()
+        );
+        gov5.validate_body_against_header(&body, &header).unwrap();
+
+        let bad_tx_root = SealedHeader::seal_slow(Header {
+            ommers_hash: B256::ZERO,
+            difficulty: U256::from(1),
+            extra_data: valid_extra.into(),
+            transactions_root: B256::ZERO,
+            ..Default::default()
+        });
+        assert!(
+            gov5.validate_body_against_header(&body, &bad_tx_root)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn gov5_header_profile_bounds_and_identifies_h2_extra_data() {
+        let chain_spec = reth_chainspec::MAINNET.clone();
+        let standard = N42Consensus::new(chain_spec.clone());
+        let gov5 = N42Consensus::new(chain_spec).with_header_profile(N42HeaderProfile::Gov5H2);
+        let valid_extra = [b"N42H".as_slice(), &[0_u8; 8], &[0_u8; 96]].concat();
+        let header = SealedHeader::seal_slow(Header {
+            ommers_hash: B256::ZERO,
+            difficulty: U256::from(1),
+            extra_data: valid_extra.clone().into(),
+            base_fee_per_gas: Some(0),
+            ..Default::default()
+        });
+
+        assert!(standard.validate_header(&header).is_err());
+        gov5.validate_header(&header).unwrap();
+
+        let malformed = SealedHeader::seal_slow(Header {
+            ommers_hash: B256::ZERO,
+            difficulty: U256::from(1),
+            extra_data: [b"BAD!".as_slice(), &[0_u8; 8]].concat().into(),
+            base_fee_per_gas: Some(0),
+            ..Default::default()
+        });
+        assert!(gov5.validate_header(&malformed).is_err());
+        assert_eq!(
+            validate_gov5_header_extra(&[0_u8; 11]),
+            Err(N42HeaderProfileError::Gov5ExtraTooShort(11))
+        );
+        assert_eq!(
+            validate_gov5_header_extra(&vec![0_u8; MAX_GOV5_HEADER_EXTRA_BYTES + 1]),
+            Err(N42HeaderProfileError::Gov5ExtraTooLong(
+                MAX_GOV5_HEADER_EXTRA_BYTES + 1
+            ))
+        );
     }
 
     #[test]
