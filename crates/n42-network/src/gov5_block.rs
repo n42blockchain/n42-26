@@ -1,9 +1,10 @@
 //! Strict decoder for Gov5's ETH-style RLP sealed-block gossip payload.
 
 use alloy_consensus::{Header, TxEnvelope, proofs::calculate_transaction_root};
-use alloy_eips::Decodable2718;
-use alloy_primitives::{B256, keccak256};
-use alloy_rlp::{Decodable, Header as RlpHeader};
+use alloy_eips::{Decodable2718, Encodable2718};
+use alloy_primitives::{B256, Bytes, U256, keccak256};
+use alloy_rlp::{Decodable, Encodable, Header as RlpHeader};
+use alloy_rpc_types_engine::ExecutionData;
 use n42_consensus::validate_gov5_interop_header;
 
 #[derive(Clone, Debug)]
@@ -21,6 +22,133 @@ pub enum Gov5BlockError {
     HeaderProfile(String),
     #[error("gov5 block transaction root mismatch")]
     TransactionRootMismatch,
+    #[error("execution payload cannot reconstruct a gov5 block: {0}")]
+    PayloadReconstruction(String),
+    #[error("execution payload block hash does not match its reconstructed header")]
+    PayloadHashMismatch,
+}
+
+const GOV5_H2_SEAL_BYTES: usize = 96;
+
+/// Converts a standard locally built Engine payload into the live gov5 H2
+/// header shape. The execution body and roots are unchanged; only fields that
+/// Engine payloads cannot express (`ommers_hash`, `difficulty`) plus the H2
+/// header-extra reservation are rewritten before the new block hash is formed.
+///
+/// The first interoperable producer profile intentionally omits the optional
+/// header QC and reserves a zero seal. Gov5 authenticates the same block hash
+/// through the chain-bound H2 Proposal/CommitQC, and its header decoder accepts
+/// this current `magic || view || seal` layout.
+pub fn normalize_execution_payload_for_gov5_h2(
+    execution: &ExecutionData,
+    view: u64,
+) -> Result<ExecutionData, Gov5BlockError> {
+    if reconstruct_gov5_block(execution).is_ok() {
+        return Ok(execution.clone());
+    }
+
+    let mut block = execution
+        .clone()
+        .try_into_block::<TxEnvelope>()
+        .map_err(|error| Gov5BlockError::PayloadReconstruction(error.to_string()))?;
+    if block.header.hash_slow() != execution.block_hash() {
+        return Err(Gov5BlockError::PayloadHashMismatch);
+    }
+    if calculate_transaction_root(&block.body.transactions) != block.header.transactions_root {
+        return Err(Gov5BlockError::TransactionRootMismatch);
+    }
+
+    block.header.ommers_hash = B256::ZERO;
+    block.header.difficulty = U256::ZERO;
+    let mut extra = Vec::with_capacity(12 + GOV5_H2_SEAL_BYTES);
+    extra.extend_from_slice(b"N42H");
+    extra.extend_from_slice(&view.to_le_bytes());
+    extra.resize(12 + GOV5_H2_SEAL_BYTES, 0);
+    block.header.extra_data = extra.into();
+    validate_gov5_interop_header(&block.header)
+        .map_err(|error| Gov5BlockError::HeaderProfile(error.to_string()))?;
+
+    let block_hash = block.header.hash_slow();
+    Ok(ExecutionData::from_block_unchecked(block_hash, &block))
+}
+
+/// Encodes a locally built execution payload as gov5's canonical block gossip
+/// form. Auxiliary verifier/reward lists are empty because execution validity
+/// and H2-v4 consensus authentication are carried independently.
+pub fn encode_gov5_block_rlp(execution: &ExecutionData) -> Result<Vec<u8>, Gov5BlockError> {
+    let block = reconstruct_gov5_block(execution)?;
+    validate_gov5_interop_header(&block.header)
+        .map_err(|error| Gov5BlockError::HeaderProfile(error.to_string()))?;
+    if block.header.hash_slow() != execution.block_hash() {
+        return Err(Gov5BlockError::PayloadHashMismatch);
+    }
+    if calculate_transaction_root(&block.body.transactions) != block.header.transactions_root {
+        return Err(Gov5BlockError::TransactionRootMismatch);
+    }
+
+    let mut header_rlp = Vec::new();
+    block.header.encode(&mut header_rlp);
+    let transaction_bytes = block
+        .body
+        .transactions
+        .iter()
+        .map(|transaction| Bytes::from(transaction.encoded_2718()))
+        .collect::<Vec<_>>();
+    let verifiers = Vec::<Bytes>::new();
+    let rewards = Vec::<Bytes>::new();
+    let payload_length =
+        header_rlp.len() + transaction_bytes.length() + verifiers.length() + rewards.length();
+    let mut encoded = Vec::new();
+    RlpHeader {
+        list: true,
+        payload_length,
+    }
+    .encode(&mut encoded);
+    encoded.extend_from_slice(&header_rlp);
+    transaction_bytes.encode(&mut encoded);
+    verifiers.encode(&mut encoded);
+    rewards.encode(&mut encoded);
+    Ok(encoded)
+}
+
+/// Engine payloads do not carry `ommers_hash` or `difficulty`. Reth therefore
+/// reconstructs Ethereum's empty-list ommers commitment, while live gov5 H2
+/// headers deliberately commit to a zero ommers hash. Rebuild both permitted
+/// gov5 H2 difficulty variants and let the authenticated payload hash select
+/// the exact header; no operator-controlled guessing is involved.
+fn reconstruct_gov5_block(
+    execution: &ExecutionData,
+) -> Result<alloy_consensus::Block<TxEnvelope>, Gov5BlockError> {
+    let expected_hash = execution.block_hash();
+    if let Ok(direct) = execution.clone().try_into_block::<TxEnvelope>()
+        && validate_gov5_interop_header(&direct.header).is_ok()
+        && direct.header.hash_slow() == expected_hash
+    {
+        return Ok(direct);
+    }
+
+    let extra_data = execution.payload.as_v1().extra_data.clone();
+    let mut standard_execution = execution.clone();
+    standard_execution.payload.set_extra_data(Bytes::new());
+    let mut block = standard_execution
+        .try_into_block::<TxEnvelope>()
+        .map_err(|error| Gov5BlockError::PayloadReconstruction(error.to_string()))?;
+    block.header.ommers_hash = B256::ZERO;
+    block.header.extra_data = extra_data;
+
+    block.header.difficulty = U256::ZERO;
+    if validate_gov5_interop_header(&block.header).is_ok()
+        && block.header.hash_slow() == expected_hash
+    {
+        return Ok(block);
+    }
+    block.header.difficulty = U256::from(1);
+    if validate_gov5_interop_header(&block.header).is_ok()
+        && block.header.hash_slow() == expected_hash
+    {
+        return Ok(block);
+    }
+    Err(Gov5BlockError::PayloadHashMismatch)
 }
 
 /// Decodes the uncompressed Gov5 block wire form:
@@ -124,7 +252,7 @@ fn take_rlp_list_item<'a>(cursor: &mut &'a [u8]) -> Option<&'a [u8]> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_consensus::proofs::calculate_transaction_root;
+    use alloy_consensus::{Block, BlockBody, proofs::calculate_transaction_root};
     use alloy_primitives::{Bytes, U256};
     use alloy_rlp::Encodable;
 
@@ -133,6 +261,7 @@ mod tests {
             ommers_hash: B256::ZERO,
             transactions_root,
             difficulty: U256::ZERO,
+            base_fee_per_gas: Some(0),
             extra_data: Bytes::from_static(b"N42H\x07\0\0\0\0\0\0\0"),
             ..Default::default()
         };
@@ -182,5 +311,56 @@ mod tests {
             decode_gov5_block_rlp(&encoded).unwrap_err(),
             Gov5BlockError::InvalidRlp
         );
+    }
+
+    #[test]
+    fn locally_built_execution_payload_round_trips_through_gov5_block_wire() {
+        let original = decode_gov5_block_rlp(&block_fixture(calculate_transaction_root::<
+            TxEnvelope,
+        >(&[])))
+        .unwrap();
+        let block: Block<TxEnvelope> = Block {
+            header: original.header,
+            body: BlockBody {
+                transactions: original.transactions,
+                ommers: Vec::new(),
+                withdrawals: None,
+            },
+        };
+        let execution = ExecutionData::from_block_unchecked(original.block_hash, &block);
+
+        let encoded = encode_gov5_block_rlp(&execution).unwrap();
+        let recovered = decode_gov5_block_rlp(&encoded).unwrap();
+        assert_eq!(recovered.block_hash, original.block_hash);
+        assert_eq!(recovered.header, block.header);
+        assert!(recovered.transactions.is_empty());
+    }
+
+    #[test]
+    fn normalizes_standard_engine_payload_for_gov5_h2_leader() {
+        let block: Block<TxEnvelope> = Block {
+            header: Header {
+                transactions_root: calculate_transaction_root::<TxEnvelope>(&[]),
+                base_fee_per_gas: Some(0),
+                ..Default::default()
+            },
+            body: BlockBody::default(),
+        };
+        let standard_hash = block.header.hash_slow();
+        let standard = ExecutionData::from_block_unchecked(standard_hash, &block);
+
+        let normalized = normalize_execution_payload_for_gov5_h2(&standard, 19).unwrap();
+        assert_ne!(normalized.block_hash(), standard_hash);
+        let encoded = encode_gov5_block_rlp(&normalized).unwrap();
+        let recovered = decode_gov5_block_rlp(&encoded).unwrap();
+        assert_eq!(recovered.block_hash, normalized.block_hash());
+        assert_eq!(recovered.header.ommers_hash, B256::ZERO);
+        assert_eq!(recovered.header.difficulty, U256::ZERO);
+        assert_eq!(&recovered.header.extra_data[..4], b"N42H");
+        assert_eq!(
+            u64::from_le_bytes(recovered.header.extra_data[4..12].try_into().unwrap()),
+            19
+        );
+        assert_eq!(recovered.header.extra_data.len(), 108);
     }
 }

@@ -46,10 +46,11 @@ impl ConsensusEngine {
         // The `validator_changes_hash` is part of the signed message (Plan #2 in
         // the HotStuff-2 audit), so a Byzantine leader cannot substitute a
         // different changes_hash after collecting commit votes.
-        super::quorum::verify_commit_qc(
+        super::quorum::verify_commit_qc_with_profile(
             &decide.commit_qc,
             commit_set,
             &decide.validator_changes_hash,
+            self.signing_profile,
         )?;
 
         // Cache the committed block's changes hash so a late Proposal for the same

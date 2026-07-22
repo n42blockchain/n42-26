@@ -125,7 +125,12 @@ impl ConsensusService {
     pub(super) async fn handle_engine_output(&mut self, output: EngineOutput) {
         match output {
             EngineOutput::BroadcastMessage(msg) => {
-                if matches!(&msg, ConsensusMessage::Proposal(_)) && self.engine.is_current_leader()
+                if self.h2_v4_identity.is_some() {
+                    if let Err(e) = self.broadcast_engine_consensus(msg) {
+                        error!(target: "n42::interop::h2v4", error = %e, "failed to broadcast H2-v4 consensus message");
+                    }
+                } else if matches!(&msg, ConsensusMessage::Proposal(_))
+                    && self.engine.is_current_leader()
                 {
                     self.broadcast_via_rotor(msg);
                 } else {
@@ -180,11 +185,13 @@ impl ConsensusService {
                         next_at: tokio::time::Instant::now() + Self::vote_resend_delay(),
                     });
                 }
-                if let Some(peer_id) = self.network.validator_peer(target) {
+                if self.h2_v4_identity.is_none()
+                    && let Some(peer_id) = self.network.validator_peer(target)
+                {
                     let _ = self.network.send_direct(peer_id, msg.clone());
                 }
                 // Fire-and-forget broadcast (non-blocking).
-                if let Err(e) = self.network.broadcast_consensus(msg) {
+                if let Err(e) = self.broadcast_engine_consensus(msg) {
                     error!(target: "n42::cl::consensus_loop", target_validator = target, error = %e, "broadcast failed");
                 }
                 histogram!("n42_send_to_validator_e2e_ms")

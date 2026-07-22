@@ -21,12 +21,14 @@ rcgen.workspace = true
 # Serialization
 serde.workspace = true
 bincode.workspace = true
+bitvec.workspace = true
 
 # Primitives
 alloy-primitives.workspace = true
 alloy-rlp.workspace = true
 alloy-consensus.workspace = true
 alloy-eips.workspace = true
+alloy-rpc-types-engine.workspace = true
 
 # Async
 tokio.workspace = true

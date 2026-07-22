@@ -8,6 +8,7 @@ pub mod finalized_range;
 pub mod gossipsub;
 pub mod gov5_block;
 pub mod gov5_rpc;
+pub mod h2_bridge;
 pub mod h2_v4;
 pub mod h2_wire;
 pub mod mobile;
@@ -27,7 +28,11 @@ pub use finalized_range::{
     MAX_MATERIALIZED_FINALIZED_RANGE_BYTES, VerifiedFinalizedRange, VerifiedFinalizedRangeEntry,
     decode_finalized_range_stream, verify_finalized_range_stream,
 };
-pub use gov5_block::{Gov5BlockError, Gov5GossipBlock, decode_gov5_block_rlp};
+pub use gov5_block::{
+    Gov5BlockError, Gov5GossipBlock, decode_gov5_block_rlp, encode_gov5_block_rlp,
+    normalize_execution_payload_for_gov5_h2,
+};
+pub use h2_bridge::{H2BridgeError, consensus_from_h2_v4, consensus_to_h2_v4};
 pub use mobile::{
     MSG_TYPE_CACHE_SYNC, MSG_TYPE_CACHE_SYNC_ZSTD, ShardedStarHub, ShardedStarHubConfig,
     ShardedStarHubHandle, StarHub, StarHubConfig, StarHubHandle,
@@ -38,8 +43,8 @@ pub use state_sync::{
     SyncBlock, SyncPayload,
 };
 pub use transport::{
-    N42Behaviour, TransportConfig, build_interop_observer_swarm, build_swarm,
-    build_swarm_with_validator_index, deterministic_validator_keypair,
+    N42Behaviour, TransportConfig, build_interop_observer_swarm, build_interop_participant_swarm,
+    build_swarm, build_swarm_with_validator_index, deterministic_validator_keypair,
     deterministic_validator_peer_id,
 };
 

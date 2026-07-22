@@ -330,6 +330,7 @@ impl ConsensusService {
         let block_guard = self.eager_import_block_guard.clone();
         let exec_output_cache = self.exec_output_cache.clone();
         let bad_blocks = self.bad_blocks.clone();
+        let h2_v4_participant = self.h2_v4_identity.is_some();
 
         let handle = tokio::spawn(async move {
             // Allow builder time to pack transactions from the pool.
@@ -361,6 +362,7 @@ impl ConsensusService {
                         block_ready_tx,
                         leader_payload_tx,
                         current_view,
+                        h2_v4_participant,
                         blob_store,
                         exec_output_cache,
                         bad_blocks,
@@ -1186,6 +1188,7 @@ async fn handle_built_payload(
     block_ready_tx: mpsc::Sender<super::PayloadBuildReady>,
     leader_payload_tx: mpsc::Sender<(B256, Vec<u8>)>,
     current_view: u64,
+    h2_v4_participant: bool,
     blob_store: Option<Arc<dyn BlobStorePort>>,
     exec_output_cache: Option<Arc<dyn ExecutionOutputCache>>,
     bad_blocks: super::bad_block_cache::BadBlockCache,
@@ -1195,13 +1198,26 @@ async fn handle_built_payload(
     build_context: super::PayloadBuildContext,
 ) {
     let BuiltBlock {
-        hash,
+        mut hash,
         number: block_number,
         timestamp: block_timestamp,
         tx_count,
-        execution_data,
+        mut execution_data,
         blob_tx_hashes,
     } = built;
+    if h2_v4_participant {
+        execution_data = match n42_network::normalize_execution_payload_for_gov5_h2(
+            &execution_data,
+            current_view,
+        ) {
+            Ok(normalized) => normalized,
+            Err(error) => {
+                error!(target: "n42::interop::h2v4", original_hash = %hash, %error, "refusing to propose a payload that cannot be normalized to the gov5 H2 header profile");
+                return;
+            }
+        };
+        hash = execution_data.block_hash();
+    }
     let actual_parent = execution_data.parent_hash();
     if actual_parent != build_context.parent_hash {
         error!(target: "n42::cl::exec_bridge", %hash, %actual_parent,
@@ -1276,6 +1292,19 @@ async fn handle_built_payload(
         has_compact_block = execution_output_bytes.is_some(),
         "N42_TIMEOUT_VIEW: leader_ready"
     );
+    if h2_v4_participant {
+        let gov5_rlp = match n42_network::encode_gov5_block_rlp(&execution_data) {
+            Ok(encoded) => encoded,
+            Err(error) => {
+                error!(target: "n42::interop::h2v4", %hash, %error, "refusing to propose a payload that cannot be encoded for gov5 peers");
+                return;
+            }
+        };
+        if let Err(error) = network.broadcast_gov5_block_reliable(gov5_rlp).await {
+            error!(target: "n42::interop::h2v4", %hash, %error, "refusing to propose after gov5 block broadcast failed");
+            return;
+        }
+    }
     // 1. Broadcast block data + blob sidecars to followers
     broadcast_block_data(
         network.as_ref(),

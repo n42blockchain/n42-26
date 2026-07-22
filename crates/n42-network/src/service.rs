@@ -24,7 +24,10 @@ use crate::gov5_rpc::{
     Gov5BlockByHashRequest, Gov5BlockByHashResponse, Gov5BlockPushRequest, Gov5BlockPushResponse,
     Gov5Status,
 };
-use crate::h2_v4::{H2V4ChainIdentity, H2V4Envelope, decode_gossip as decode_h2_v4_gossip};
+use crate::h2_v4::{
+    H2V4ChainIdentity, H2V4Envelope, decode_gossip as decode_h2_v4_gossip,
+    encode_gossip as encode_h2_v4_gossip,
+};
 use crate::h2_wire::{H2Message, decode_gov5_gossip_message};
 use crate::reconnection::ReconnectionManager;
 use crate::state_sync::{BlockSyncRequest, BlockSyncResponse};
@@ -106,6 +109,8 @@ impl RecentBlockAnnouncementDedup {
 #[derive(Debug)]
 pub enum NetworkCommand {
     BroadcastConsensus(ConsensusMessage),
+    BroadcastH2V4(H2V4Envelope),
+    BroadcastGov5Block(Vec<u8>),
     SendDirect {
         peer: PeerId,
         message: ConsensusMessage,
@@ -282,6 +287,14 @@ impl NetworkHandle {
 
     pub fn broadcast_consensus(&self, msg: ConsensusMessage) -> Result<(), NetworkError> {
         self.send_priority(NetworkCommand::BroadcastConsensus(msg))
+    }
+
+    pub fn broadcast_h2_v4(&self, envelope: H2V4Envelope) -> Result<(), NetworkError> {
+        self.send_priority(NetworkCommand::BroadcastH2V4(envelope))
+    }
+
+    pub fn broadcast_gov5_block(&self, rlp: Vec<u8>) -> Result<(), NetworkError> {
+        self.send_priority(NetworkCommand::BroadcastGov5Block(rlp))
     }
 
     pub fn announce_block(&self, data: Vec<u8>) -> Result<(), NetworkError> {
@@ -510,6 +523,19 @@ impl NetworkHandle {
             .await
     }
 
+    pub async fn broadcast_h2_v4_reliable(
+        &self,
+        envelope: H2V4Envelope,
+    ) -> Result<(), NetworkError> {
+        Self::send_with_backpressure(&self.priority_tx, NetworkCommand::BroadcastH2V4(envelope))
+            .await
+    }
+
+    pub async fn broadcast_gov5_block_reliable(&self, rlp: Vec<u8>) -> Result<(), NetworkError> {
+        Self::send_with_backpressure(&self.priority_tx, NetworkCommand::BroadcastGov5Block(rlp))
+            .await
+    }
+
     pub async fn send_direct_reliable(
         &self,
         peer: PeerId,
@@ -567,6 +593,7 @@ pub struct NetworkService {
     gov5_block_topic_hash: Option<gossipsub::TopicHash>,
     h2_v4_topic_hash: Option<gossipsub::TopicHash>,
     h2_v4_identity: Option<H2V4ChainIdentity>,
+    h2_v4_participant: bool,
     gov5_status: Option<Gov5Status>,
     pending_gov5_status_peers: HashSet<PeerId>,
     block_announce_topic_hash: gossipsub::TopicHash,
@@ -665,7 +692,7 @@ impl NetworkService {
         ),
         NetworkError,
     > {
-        Self::new_with_options(swarm, HashMap::new(), true, None, None, None)
+        Self::new_with_options(swarm, HashMap::new(), true, None, None, None, false)
     }
 
     /// Creates a non-voting service which also subscribes to the gov5 H2 topic
@@ -693,6 +720,40 @@ impl NetworkService {
                 chain_id,
                 genesis_hash,
             }),
+            false,
+        )
+    }
+
+    /// Creates a voting H2-v4 network endpoint. Unlike observer mode, inbound
+    /// H2-v4 frames use the high-priority consensus channel and outbound H2-v4
+    /// publication is enabled. The caller must still enable the matching
+    /// consensus signing profile before processing messages.
+    pub fn new_gov5_h2_participant(
+        swarm: Swarm<N42Behaviour>,
+        expected_validator_peer_ids: HashMap<u32, PeerId>,
+        allow_deterministic_peer_ids: bool,
+        chain_id: u64,
+        genesis_hash: B256,
+    ) -> Result<
+        (
+            Self,
+            NetworkHandle,
+            mpsc::Receiver<NetworkEvent>,
+            mpsc::Receiver<NetworkEvent>,
+        ),
+        NetworkError,
+    > {
+        Self::new_with_options(
+            swarm,
+            expected_validator_peer_ids,
+            allow_deterministic_peer_ids,
+            Some(gov5_h2_topic(genesis_hash)),
+            Some(gov5_block_topic(genesis_hash)),
+            Some(H2V4ChainIdentity {
+                chain_id,
+                genesis_hash,
+            }),
+            true,
         )
     }
 
@@ -716,6 +777,7 @@ impl NetworkService {
             None,
             None,
             None,
+            false,
         )
     }
 
@@ -726,6 +788,7 @@ impl NetworkService {
         gov5_h2_observer_topic: Option<gossipsub::IdentTopic>,
         gov5_block_observer_topic: Option<gossipsub::IdentTopic>,
         h2_v4_identity: Option<H2V4ChainIdentity>,
+        h2_v4_participant: bool,
     ) -> Result<
         (
             Self,
@@ -832,6 +895,7 @@ impl NetworkService {
             gov5_block_topic_hash,
             h2_v4_topic_hash,
             h2_v4_identity,
+            h2_v4_participant,
             gov5_status,
             pending_gov5_status_peers: HashSet::new(),
             block_announce_topic_hash,
@@ -2009,7 +2073,8 @@ impl NetworkService {
         let reliable_consensus = matches!(
             &event,
             NetworkEvent::ConsensusMessage { .. } | NetworkEvent::BlockAnnouncement { .. }
-        );
+        ) || self.h2_v4_participant
+            && matches!(&event, NetworkEvent::H2V4Message { .. });
         let reliable_data = matches!(
             &event,
             NetworkEvent::Gov5H2Message { .. }
@@ -2086,6 +2151,40 @@ impl NetworkService {
             NetworkCommand::BroadcastConsensus(msg) => {
                 metrics::counter!("n42_broadcast_messages_sent").increment(1);
                 self.publish_consensus(&msg, "consensus message");
+            }
+            NetworkCommand::BroadcastH2V4(envelope) => {
+                if !self.h2_v4_participant {
+                    tracing::warn!(target: "n42::interop::h2v4", "refusing H2-v4 publish outside participant mode");
+                    return;
+                }
+                match encode_h2_v4_gossip(&envelope) {
+                    Ok(data) => {
+                        metrics::counter!("n42_h2_v4_messages_sent_total", "kind" => envelope.message.kind().as_str()).increment(1);
+                        self.gossipsub_publish(h2_v4_topic(), data, "H2-v4 consensus message");
+                    }
+                    Err(error) => {
+                        tracing::warn!(target: "n42::interop::h2v4", %error, "failed to encode H2-v4 message")
+                    }
+                }
+            }
+            NetworkCommand::BroadcastGov5Block(rlp) => {
+                let Some(identity) = self.h2_v4_identity.filter(|_| self.h2_v4_participant) else {
+                    tracing::warn!(target: "n42::interop::h2v4", "refusing gov5 block publish outside participant mode");
+                    return;
+                };
+                match snap::raw::Encoder::new().compress_vec(&rlp) {
+                    Ok(data) => {
+                        metrics::counter!("n42_h2_v4_blocks_sent_total").increment(1);
+                        self.gossipsub_publish(
+                            gov5_block_topic(identity.genesis_hash),
+                            data,
+                            "gov5 block",
+                        );
+                    }
+                    Err(error) => {
+                        tracing::warn!(target: "n42::interop::h2v4", %error, "failed to compress gov5 block")
+                    }
+                }
             }
             NetworkCommand::SendDirect { peer, message } => {
                 metrics::counter!("n42_direct_messages_sent").increment(1);

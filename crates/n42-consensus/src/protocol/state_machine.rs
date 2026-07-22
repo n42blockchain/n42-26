@@ -1,7 +1,7 @@
 use alloy_primitives::B256;
 use n42_primitives::{
     BlsSecretKey,
-    consensus::{ConsensusMessage, QuorumCertificate, ViewNumber},
+    consensus::{ConsensusMessage, H2V4ChainIdentity, QuorumCertificate, ViewNumber},
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -10,10 +10,9 @@ use tokio::sync::mpsc;
 
 use super::bounded_fifo::BoundedFifoMap;
 use super::pacemaker::Pacemaker;
-use super::quorum::{
-    TimeoutCollector, VoteCollector, commit_signing_message, newview_signing_message,
-    signing_message, timeout_signing_message,
-};
+use super::quorum::{ConsensusSigningProfile, TimeoutCollector, VoteCollector};
+#[cfg(test)]
+use super::quorum::{commit_signing_message, signing_message, timeout_signing_message};
 use super::round::{Phase, RoundState};
 use crate::error::{ConsensusError, ConsensusResult};
 use crate::validator::{EpochManager, LeaderSelector, ValidatorSet};
@@ -260,6 +259,9 @@ pub struct ConsensusEngine {
     /// multiplications in `local_validator_index_for_view` (called on every message).
     pub(super) local_public_key: n42_primitives::BlsPublicKey,
     pub(super) epoch_manager: EpochManager,
+    /// Explicitly selected signing domain. Native is the safe default; H2-v4
+    /// is enabled only for gov5 participant mode.
+    pub(super) signing_profile: ConsensusSigningProfile,
     pub(super) round_state: RoundState,
     pub(super) pacemaker: Pacemaker,
     pub(super) vote_collector: Option<VoteCollector>,
@@ -367,6 +369,7 @@ impl ConsensusEngine {
             secret_key,
             local_public_key,
             epoch_manager,
+            signing_profile: ConsensusSigningProfile::Native,
             round_state: RoundState::new(),
             pacemaker: Pacemaker::new(base_timeout_ms, max_timeout_ms),
             vote_collector: None,
@@ -465,6 +468,7 @@ impl ConsensusEngine {
             secret_key,
             local_public_key,
             epoch_manager,
+            signing_profile: ConsensusSigningProfile::Native,
             round_state: RoundState::from_snapshot(
                 recovered_view,
                 locked_qc,
@@ -496,6 +500,17 @@ impl ConsensusEngine {
     }
 
     // ── Public accessors ──
+
+    /// Enables gov5-compatible, chain-bound H2-v4 signatures. This does not
+    /// change wire routing by itself, so observer and native nodes remain
+    /// unaffected unless the participant bridge is also explicitly enabled.
+    pub fn enable_h2_v4_signing(&mut self, identity: H2V4ChainIdentity) {
+        self.signing_profile = ConsensusSigningProfile::H2V4(identity);
+    }
+
+    pub fn signing_profile(&self) -> ConsensusSigningProfile {
+        self.signing_profile
+    }
 
     pub fn current_view(&self) -> ViewNumber {
         self.round_state.current_view()
@@ -543,14 +558,14 @@ impl ConsensusEngine {
                     .validator_set_for_view(proposal.view)
                     .get_public_key(proposal.proposer)
                     .ok()?;
-                let sig_msg = crate::protocol::quorum::proposal_signing_message(
+                let sig_msg = self.signing_profile.proposal_message(
                     proposal.view,
-                    &proposal.block_hash,
+                    proposal.block_hash,
                     &proposal.validator_changes,
                 );
-                if pk
-                    .verify_prevalidated(&sig_msg, &proposal.signature)
-                    .is_err()
+                if !self
+                    .signing_profile
+                    .verify_single(pk, &sig_msg, &proposal.signature)
                 {
                     tracing::debug!(target: "n42::consensus", view = proposal.view, proposer = proposal.proposer, "proposal signature verification failed");
                     return None;
@@ -562,8 +577,13 @@ impl ConsensusEngine {
                     .validator_set_for_view(vote.view)
                     .get_public_key(vote.voter)
                     .ok()?;
-                let sig_msg = signing_message(vote.view, &vote.block_hash);
-                if pk.verify_prevalidated(&sig_msg, &vote.signature).is_err() {
+                let sig_msg = self
+                    .signing_profile
+                    .vote_message(vote.view, vote.block_hash);
+                if !self
+                    .signing_profile
+                    .verify_single(pk, &sig_msg, &vote.signature)
+                {
                     tracing::debug!(target: "n42::consensus", view = vote.view, voter = vote.voter, "vote signature verification failed");
                     return None;
                 }
@@ -579,14 +599,14 @@ impl ConsensusEngine {
                 // not be cached yet. The canonical verification re-runs in
                 // process_commit_vote with the same fallback semantics.
                 let changes_hash = self.cached_changes_hash(&commit_vote.block_hash);
-                let sig_msg = commit_signing_message(
+                let sig_msg = self.signing_profile.commit_message(
                     commit_vote.view,
-                    &commit_vote.block_hash,
-                    &changes_hash,
+                    commit_vote.block_hash,
+                    changes_hash,
                 );
-                if pk
-                    .verify_prevalidated(&sig_msg, &commit_vote.signature)
-                    .is_err()
+                if !self
+                    .signing_profile
+                    .verify_single(pk, &sig_msg, &commit_vote.signature)
                 {
                     tracing::debug!(target: "n42::consensus", view = commit_vote.view, voter = commit_vote.voter, "commit_vote signature verification failed");
                     return None;
@@ -598,10 +618,10 @@ impl ConsensusEngine {
                     .validator_set_for_view(timeout.view)
                     .get_public_key(timeout.sender)
                     .ok()?;
-                let sig_msg = timeout_signing_message(timeout.view);
-                if pk
-                    .verify_prevalidated(&sig_msg, &timeout.signature)
-                    .is_err()
+                let sig_msg = self.signing_profile.timeout_message(timeout.view);
+                if !self
+                    .signing_profile
+                    .verify_single(pk, &sig_msg, &timeout.signature)
                 {
                     tracing::debug!(target: "n42::consensus", view = timeout.view, sender = timeout.sender, "timeout signature verification failed");
                     return None;
@@ -613,10 +633,10 @@ impl ConsensusEngine {
                     .validator_set_for_view(new_view.view)
                     .get_public_key(new_view.leader)
                     .ok()?;
-                let sig_msg = newview_signing_message(new_view.view);
-                if pk
-                    .verify_prevalidated(&sig_msg, &new_view.signature)
-                    .is_err()
+                let sig_msg = self.signing_profile.new_view_message(new_view.view);
+                if !self
+                    .signing_profile
+                    .verify_single(pk, &sig_msg, &new_view.signature)
                 {
                     tracing::debug!(target: "n42::consensus", view = new_view.view, leader = new_view.leader, "new_view signature verification failed");
                     return None;
@@ -650,7 +670,8 @@ impl ConsensusEngine {
                     candidates.push((
                         position,
                         AuthenticatedVoteProof::Vote { signer: vote.voter },
-                        signing_message(vote.view, &vote.block_hash).to_vec(),
+                        self.signing_profile
+                            .vote_message(vote.view, vote.block_hash),
                         &vote.signature,
                         public_key,
                     ));
@@ -669,12 +690,11 @@ impl ConsensusEngine {
                             signer: commit_vote.voter,
                             validator_changes_hash: changes_hash,
                         },
-                        commit_signing_message(
+                        self.signing_profile.commit_message(
                             commit_vote.view,
-                            &commit_vote.block_hash,
-                            &changes_hash,
-                        )
-                        .to_vec(),
+                            commit_vote.block_hash,
+                            changes_hash,
+                        ),
                         &commit_vote.signature,
                         public_key,
                     ));
@@ -695,15 +715,27 @@ impl ConsensusEngine {
             .iter()
             .map(|(_, _, _, _, public_key)| *public_key)
             .collect::<Vec<_>>();
-        let bad = n42_primitives::bls::batch_verify_with_fallback(
-            &signing_messages,
-            &signatures,
-            &public_keys,
-        )
-        .err()
-        .unwrap_or_default()
-        .into_iter()
-        .collect::<HashSet<_>>();
+        let bad = match self.signing_profile {
+            ConsensusSigningProfile::Native => n42_primitives::bls::batch_verify_with_fallback(
+                &signing_messages,
+                &signatures,
+                &public_keys,
+            )
+            .err()
+            .unwrap_or_default()
+            .into_iter()
+            .collect::<HashSet<_>>(),
+            ConsensusSigningProfile::H2V4(_) => candidates
+                .iter()
+                .enumerate()
+                .filter_map(|(position, (_, _, message, signature, public_key))| {
+                    (!self
+                        .signing_profile
+                        .verify_single(public_key, message, signature))
+                    .then_some(position)
+                })
+                .collect(),
+        };
 
         let mut verified_proofs = vec![None; messages.len()];
         for (candidate_position, (message_position, proof, ..)) in candidates.iter().enumerate() {
@@ -1056,14 +1088,17 @@ impl ConsensusEngine {
         // we fall back to ZERO since the proposal is not yet cached on this
         // far-behind node (acceptable: the next regular proposal will retry).
         let verify_result = match msg {
-            ConsensusMessage::Decide(decide) => super::quorum::verify_commit_qc(
+            ConsensusMessage::Decide(decide) => super::quorum::verify_commit_qc_with_profile(
                 qc,
                 self.validator_set_for_view(qc.view),
                 &decide.validator_changes_hash,
+                self.signing_profile,
             ),
-            ConsensusMessage::PrepareQC(_) => {
-                super::quorum::verify_qc(qc, self.validator_set_for_view(qc.view))
-            }
+            ConsensusMessage::PrepareQC(_) => super::quorum::verify_qc_with_profile(
+                qc,
+                self.validator_set_for_view(qc.view),
+                self.signing_profile,
+            ),
             ConsensusMessage::Proposal(_)
             | ConsensusMessage::Timeout(_)
             | ConsensusMessage::NewView(_) => self.verify_qc_any_domain_or_known(qc),
@@ -1325,7 +1360,12 @@ impl ConsensusEngine {
         }
 
         let changes_hash = self.cached_changes_hash(&qc.block_hash);
-        super::quorum::verify_qc_any_domain(qc, self.resolve_qc_validator_set(qc)?, &changes_hash)
+        super::quorum::verify_qc_any_domain_with_profile(
+            qc,
+            self.resolve_qc_validator_set(qc)?,
+            &changes_hash,
+            self.signing_profile,
+        )
     }
 
     pub(super) fn emit(&self, output: EngineOutput) -> ConsensusResult<()> {

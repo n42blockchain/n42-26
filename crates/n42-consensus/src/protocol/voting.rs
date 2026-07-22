@@ -2,7 +2,6 @@ use alloy_primitives::B256;
 use n42_primitives::consensus::{CommitVote, ConsensusMessage, PrepareQC, Vote};
 use std::collections::HashMap;
 
-use super::quorum::{commit_signing_message, signing_message};
 use super::state_machine::{ConsensusEngine, EngineOutput};
 use crate::error::{ConsensusError, ConsensusResult};
 
@@ -57,13 +56,16 @@ impl ConsensusEngine {
         if !signature_verified {
             let view_set = self.validator_set_for_view(view);
             let pk = view_set.get_public_key(vote.voter)?;
-            let msg = signing_message(view, &vote.block_hash);
-            pk.verify_prevalidated(&msg, &vote.signature).map_err(|_| {
-                ConsensusError::InvalidSignature {
+            let msg = self.signing_profile.vote_message(view, vote.block_hash);
+            if !self
+                .signing_profile
+                .verify_single(pk, &msg, &vote.signature)
+            {
+                return Err(ConsensusError::InvalidSignature {
                     view,
                     validator_index: vote.voter,
-                }
-            })?;
+                });
+            }
         }
 
         // Equivocation check is gated on a verified signature so that an unauthenticated
@@ -151,7 +153,14 @@ impl ConsensusEngine {
                 return Ok(());
             }
         };
-        let qc = collector.build_qc(view_set)?;
+        let vote_message = self
+            .signing_profile
+            .vote_message(view, collector.block_hash());
+        let qc = collector.build_qc_with_profile_message(
+            view_set,
+            &vote_message,
+            self.signing_profile,
+        )?;
 
         tracing::debug!(target: "n42::cl::voting", view, signers = qc.signer_count(), "QC formed, entering pre-commit");
 
@@ -183,8 +192,10 @@ impl ConsensusEngine {
         self.round_state.record_commit_vote(view);
         self.vote_log.record_commit_vote(view)?;
         let changes_hash = self.cached_changes_hash(&block_hash);
-        let commit_msg = commit_signing_message(view, &block_hash, &changes_hash);
-        let commit_sig = self.secret_key.sign(&commit_msg);
+        let commit_msg = self
+            .signing_profile
+            .commit_message(view, block_hash, changes_hash);
+        let commit_sig = self.signing_profile.sign(&self.secret_key, &commit_msg);
         if let Some(ref mut collector) = self.commit_collector {
             collector.add_verified_vote(self.my_index, commit_sig)?;
         }
@@ -225,13 +236,15 @@ impl ConsensusEngine {
             let view_set = self.validator_set_for_view(view);
             let pk = view_set.get_public_key(cv.voter)?;
             let changes_hash = self.cached_changes_hash(&cv.block_hash);
-            let msg = commit_signing_message(view, &cv.block_hash, &changes_hash);
-            pk.verify_prevalidated(&msg, &cv.signature).map_err(|_| {
-                ConsensusError::InvalidSignature {
+            let msg = self
+                .signing_profile
+                .commit_message(view, cv.block_hash, changes_hash);
+            if !self.signing_profile.verify_single(pk, &msg, &cv.signature) {
+                return Err(ConsensusError::InvalidSignature {
                     view,
                     validator_index: cv.voter,
-                }
-            })?;
+                });
+            }
         }
 
         // R2 equivocation check — gated on verified signature, leader-only by design
@@ -315,8 +328,11 @@ impl ConsensusEngine {
         };
         let block_hash = collector.block_hash();
         let changes_hash = self.cached_changes_hash(&block_hash);
-        let commit_msg = commit_signing_message(view, &block_hash, &changes_hash);
-        let commit_qc = collector.build_qc_with_message(view_set, &commit_msg)?;
+        let commit_msg = self
+            .signing_profile
+            .commit_message(view, block_hash, changes_hash);
+        let commit_qc =
+            collector.build_qc_with_profile_message(view_set, &commit_msg, self.signing_profile)?;
 
         self.view_timing.commit_qc_formed = Some(std::time::Instant::now());
         self.view_timing.commit_vote_count = collector.vote_count() as u32;

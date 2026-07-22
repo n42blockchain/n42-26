@@ -143,6 +143,22 @@ impl BlsPublicKey {
         Ok(())
     }
 
+    /// Verifies a gov5-compatible H2-v4 signature without re-validating a
+    /// public key that already passed the validator-set trust boundary.
+    pub fn verify_h2_v4_prevalidated(
+        &self,
+        message: &[u8],
+        signature: &BlsSignature,
+    ) -> Result<(), BlsError> {
+        let result = signature
+            .0
+            .verify(true, message, H2_V4_DST, &[], &self.0, false);
+        if result != BLST_ERROR::BLST_SUCCESS {
+            return Err(BlsError::VerificationFailed(result));
+        }
+        Ok(())
+    }
+
     pub(crate) fn inner(&self) -> &PublicKey {
         &self.0
     }
@@ -462,5 +478,16 @@ mod tests {
             result.is_err(),
             "deserialize with 48 bytes should fail for signature"
         );
+    }
+
+    #[test]
+    fn h2_v4_single_signature_domain_is_explicit_and_separate() {
+        let sk = test_key(0x5A);
+        let pk = sk.public_key();
+        let message = b"chain-bound-h2-v4";
+        let signature = sk.sign_h2_v4(message);
+
+        pk.verify_h2_v4_prevalidated(message, &signature).unwrap();
+        assert!(pk.verify_prevalidated(message, &signature).is_err());
     }
 }

@@ -20,7 +20,8 @@ use n42_jmt::{EMPTY_CODE_HASH, PersistentSbmt, PersistentTwig};
 use n42_network::NetworkService;
 use n42_network::{
     FinalizedRangeVerification, ShardedStarHub, ShardedStarHubConfig, TransportConfig,
-    build_interop_observer_swarm, build_swarm_with_validator_index, decode_finalized_range_stream,
+    build_interop_observer_swarm, build_interop_participant_swarm,
+    build_swarm_with_validator_index, decode_finalized_range_stream,
     deterministic_validator_keypair, verify_finalized_range_stream,
 };
 use n42_node::attestation_store::AttestationStore;
@@ -102,16 +103,16 @@ fn resolve_observer_genesis_hash(
 }
 
 fn resolve_header_profile(
-    observer_mode: bool,
+    gov5_interop_mode: bool,
     gov5_profile_requested: bool,
     interop_genesis_hash: Option<&str>,
 ) -> eyre::Result<N42HeaderProfile> {
     if !gov5_profile_requested {
         return Ok(N42HeaderProfile::Ethereum);
     }
-    if !observer_mode {
+    if !gov5_interop_mode {
         return Err(eyre::eyre!(
-            "N42_GOV5_HEADER_PROFILE is restricted to observer mode until QMDB execution validation is complete"
+            "N42_GOV5_HEADER_PROFILE requires observer or H2-v4 participant mode"
         ));
     }
     if interop_genesis_hash.is_none() {
@@ -852,15 +853,23 @@ fn main() {
             .unwrap_or_else(|_| "./n42-data".to_string())
             .into();
         let observer_mode = env_bool("N42_OBSERVER_MODE");
+        let h2_v4_participant = env_bool("N42_GOV5_H2_PARTICIPANT");
+        if observer_mode && h2_v4_participant {
+            return Err(eyre::eyre!(
+                "N42_OBSERVER_MODE and N42_GOV5_H2_PARTICIPANT are mutually exclusive"
+            ));
+        }
         let header_profile = resolve_header_profile(
-            observer_mode,
+            observer_mode || h2_v4_participant,
             env_bool("N42_GOV5_HEADER_PROFILE"),
             std::env::var("N42_INTEROP_GENESIS_HASH").ok().as_deref(),
         )?;
         let qmdb_execution = if env_bool("N42_GOV5_QMDB_EXECUTION") {
-            if !observer_mode || header_profile != N42HeaderProfile::Gov5H2 {
+            if !(observer_mode || h2_v4_participant)
+                || header_profile != N42HeaderProfile::Gov5H2
+            {
                 return Err(eyre::eyre!(
-                    "N42_GOV5_QMDB_EXECUTION requires observer mode and N42_GOV5_HEADER_PROFILE=1"
+                    "N42_GOV5_QMDB_EXECUTION requires observer or H2-v4 participant mode and N42_GOV5_HEADER_PROFILE=1"
                 ));
             }
             let path = std::env::var("N42_QMDB_BOOTSTRAP").map_err(|_| {
@@ -917,6 +926,18 @@ fn main() {
         } else {
             None
         };
+        if h2_v4_participant {
+            if qmdb_execution.is_none() {
+                return Err(eyre::eyre!(
+                    "N42_GOV5_H2_PARTICIPANT requires N42_GOV5_QMDB_EXECUTION=1"
+                ));
+            }
+            if consensus_config.epoch_length != 0 {
+                return Err(eyre::eyre!(
+                    "H2-v4 participant mode requires the current gov5 static validator profile (epoch_length=0)"
+                ));
+            }
+        }
         let allow_deterministic_validator_peers =
             !consensus_config_from_file || env_bool("N42_ALLOW_DETERMINISTIC_P2P");
         if !observer_mode && consensus_config_from_file && allow_deterministic_validator_peers {
@@ -955,6 +976,11 @@ fn main() {
                 None
             }
         };
+        if h2_v4_participant && epoch_schedule.is_some() {
+            return Err(eyre::eyre!(
+                "H2-v4 participant mode does not permit an epoch schedule while gov5 uses changes_hash=0"
+            ));
+        }
 
         let state_file = data_dir.join("consensus_state.json");
         let snapshot = match persistence::load_consensus_state(&state_file) {
@@ -1022,6 +1048,11 @@ fn main() {
 
         let my_pubkey = secret_key.public_key();
         let resolved_my_index = startup_validator_set.index_of_public_key(&my_pubkey);
+        if h2_v4_participant && resolved_my_index.is_none() {
+            return Err(eyre::eyre!(
+                "N42_GOV5_H2_PARTICIPANT requires N42_VALIDATOR_KEY to match an existing gov5 validator"
+            ));
+        }
         let my_index = resolved_my_index.unwrap_or_else(|| {
                 if consensus_config.initial_validators.is_empty() {
                     // Dev mode with auto-generated validator set — index 0 is correct.
@@ -1691,16 +1722,33 @@ fn main() {
                     info!(target: "n42::cli", "Kademlia DHT peer discovery enabled");
                 }
 
-                let swarm =
+                let interop_genesis_hash = resolve_observer_genesis_hash(
+                    genesis_hash,
+                    std::env::var("N42_INTEROP_GENESIS_HASH").ok().as_deref(),
+                )?;
+                let swarm = if h2_v4_participant {
+                    build_interop_participant_swarm(keypair, transport_config, my_index)
+                } else {
                     build_swarm_with_validator_index(keypair, transport_config, Some(my_index))
-                        .map_err(|e| eyre::eyre!("failed to build consensus libp2p swarm: {e}"))?;
+                }
+                .map_err(|e| eyre::eyre!("failed to build consensus libp2p swarm: {e}"))?;
 
                 let (mut net_service, net_handle, consensus_event_rx, net_event_rx) =
-                    NetworkService::new_with_expected_validator_peer_ids(
-                        swarm,
-                        expected_validator_peer_ids.clone(),
-                        allow_deterministic_validator_peers,
-                    )
+                    if h2_v4_participant {
+                        NetworkService::new_gov5_h2_participant(
+                            swarm,
+                            expected_validator_peer_ids.clone(),
+                            allow_deterministic_validator_peers,
+                            full_node.provider.chain_spec().chain().id(),
+                            interop_genesis_hash,
+                        )
+                    } else {
+                        NetworkService::new_with_expected_validator_peer_ids(
+                            swarm,
+                            expected_validator_peer_ids.clone(),
+                            allow_deterministic_validator_peers,
+                        )
+                    }
                         .map_err(|e| eyre::eyre!("failed to create consensus network service: {e}"))?;
 
                 let consensus_port: u16 = env_parse("N42_CONSENSUS_PORT").unwrap_or(9400);
@@ -2173,6 +2221,15 @@ fn main() {
                     },
                 ))
                 .with_committed_block_count(restored_block_count);
+
+                if h2_v4_participant {
+                    let identity = n42_network::h2_v4::H2V4ChainIdentity {
+                        chain_id: full_node.provider.chain_spec().chain().id(),
+                        genesis_hash: interop_genesis_hash,
+                    };
+                    orchestrator = orchestrator.with_h2_v4_participant(identity);
+                    info!(target: "n42::cli", chain_id = identity.chain_id, genesis_hash = %identity.genesis_hash, validator_index = my_index, "H2-v4 participant bridge enabled");
+                }
 
                 // Restore prev_randao derivation from snapshot's last committed QC.
                 // Without this, first payload after crash recovery uses B256::ZERO.

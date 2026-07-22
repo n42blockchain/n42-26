@@ -17,8 +17,8 @@ use metrics::{counter, gauge, histogram};
 use n42_consensus::{
     AuthenticatedConsensusMessage, ConsensusEngine, EngineOutput, FUTURE_VIEW_WINDOW, ValidatorSet,
 };
-use n42_network::{NetworkEvent, PeerId, SyncPayload};
-use n42_primitives::QuorumCertificate;
+use n42_network::{NetworkError, NetworkEvent, PeerId, SyncPayload};
+use n42_primitives::{ConsensusMessage, QuorumCertificate};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -324,6 +324,14 @@ struct RecentBlockData {
 /// pacemaker timeouts, and BlockReady signals.
 pub struct ConsensusService {
     engine: ConsensusEngine,
+    /// Enables bidirectional H2-v4 consensus conversion. `None` preserves the
+    /// native network and observer behavior exactly.
+    h2_v4_identity: Option<n42_network::h2_v4::H2V4ChainIdentity>,
+    /// H2-authenticated block hash -> consensus view. Gov5 block gossip is not
+    /// executed until one of these bindings exists.
+    h2_v4_block_views: BTreeMap<B256, u64>,
+    /// Structurally valid gov5 bodies that arrived before their H2 binding.
+    h2_v4_unbound_blocks: BTreeMap<B256, (PeerId, Vec<u8>)>,
     /// Network port (Caplin sentinel-client seam). One in-process adapter today
     /// (`NetworkHandle`); the trait object lets the orchestrator move into a
     /// service crate without depending on `n42-network` / libp2p internals.
@@ -547,6 +555,105 @@ pub struct ConsensusService {
 }
 
 impl ConsensusService {
+    fn remember_h2_v4_block_view(&mut self, block_hash: B256, view: u64) {
+        const MAX_H2_V4_BLOCK_BINDINGS: usize = 2048;
+        self.h2_v4_block_views.insert(block_hash, view);
+        while self.h2_v4_block_views.len() > MAX_H2_V4_BLOCK_BINDINGS {
+            self.h2_v4_block_views.pop_first();
+        }
+    }
+
+    async fn handle_h2_v4_gov5_block(
+        &mut self,
+        source: PeerId,
+        rlp: Vec<u8>,
+        requested_hash: Option<B256>,
+    ) {
+        const MAX_H2_V4_UNBOUND_BLOCKS: usize = 512;
+        let block = match n42_network::decode_gov5_block_rlp(&rlp) {
+            Ok(block) => block,
+            Err(error) => {
+                counter!("n42_h2_v4_blocks_rejected_total", "reason" => "decode").increment(1);
+                warn!(target: "n42::interop::h2v4", %source, %error, "rejected invalid gov5 block body");
+                return;
+            }
+        };
+        if requested_hash.is_some_and(|expected| expected != block.block_hash) {
+            counter!("n42_h2_v4_blocks_rejected_total", "reason" => "requested_hash").increment(1);
+            warn!(target: "n42::interop::h2v4", %source, expected = ?requested_hash, received = %block.block_hash, "gov5 block response hash mismatch");
+            return;
+        }
+        let Some(view) = self.h2_v4_block_views.get(&block.block_hash).copied() else {
+            self.h2_v4_unbound_blocks
+                .insert(block.block_hash, (source, rlp));
+            while self.h2_v4_unbound_blocks.len() > MAX_H2_V4_UNBOUND_BLOCKS {
+                self.h2_v4_unbound_blocks.pop_first();
+            }
+            debug!(target: "n42::interop::h2v4", %source, hash = %block.block_hash, number = block.header.number, "holding gov5 block until H2-v4 authenticates its hash");
+            return;
+        };
+        let execution_data = match crate::replay_import::build_gov5_execution_data(
+            block.block_hash,
+            &block.header,
+            &block.transactions,
+        ) {
+            Ok(data) => data,
+            Err(error) => {
+                counter!("n42_h2_v4_blocks_rejected_total", "reason" => "execution_payload")
+                    .increment(1);
+                warn!(target: "n42::interop::h2v4", %source, hash = %block.block_hash, %error, "could not reconstruct gov5 execution payload");
+                return;
+            }
+        };
+        let payload_json = match serde_json::to_vec(&execution_data) {
+            Ok(payload) => compress_payload(&payload),
+            Err(error) => {
+                warn!(target: "n42::interop::h2v4", %source, hash = %block.block_hash, %error, "could not serialize gov5 execution payload");
+                return;
+            }
+        };
+        let broadcast = BlockDataBroadcast {
+            block_hash: block.block_hash,
+            view,
+            payload_json,
+            timestamp: block.header.timestamp,
+            execution_output: None,
+            leader_ready_unix_ms: 0,
+        };
+        match bincode::serialize(&broadcast) {
+            Ok(data) => self.handle_block_data(data).await,
+            Err(error) => {
+                warn!(target: "n42::interop::h2v4", %source, hash = %block.block_hash, %error, "could not encode internal block data")
+            }
+        }
+    }
+
+    async fn drain_h2_v4_bound_blocks(&mut self) {
+        let ready = self
+            .h2_v4_unbound_blocks
+            .keys()
+            .filter(|hash| self.h2_v4_block_views.contains_key(*hash))
+            .copied()
+            .collect::<Vec<_>>();
+        for hash in ready {
+            if let Some((source, rlp)) = self.h2_v4_unbound_blocks.remove(&hash) {
+                self.handle_h2_v4_gov5_block(source, rlp, Some(hash)).await;
+            }
+        }
+    }
+
+    fn broadcast_engine_consensus(&self, message: ConsensusMessage) -> Result<(), NetworkError> {
+        if let Some(identity) = self.h2_v4_identity {
+            let envelope =
+                n42_network::consensus_to_h2_v4(identity, &message).map_err(|error| {
+                    NetworkError::Codec(format!("H2-v4 consensus conversion failed: {error}"))
+                })?;
+            self.network.broadcast_h2_v4(envelope)
+        } else {
+            self.network.broadcast_consensus(message)
+        }
+    }
+
     fn vote_resend_delay() -> Duration {
         Duration::from_millis(
             std::env::var("N42_VOTE_RESEND_MS")
@@ -569,7 +676,9 @@ impl ConsensusService {
         }
 
         let mut delivered_directly = false;
-        if let Some(peer_id) = self.network.validator_peer(pending.target) {
+        if self.h2_v4_identity.is_none()
+            && let Some(peer_id) = self.network.validator_peer(pending.target)
+        {
             match self.network.send_direct(peer_id, pending.message.clone()) {
                 Ok(()) => delivered_directly = true,
                 Err(error) => warn!(
@@ -582,7 +691,7 @@ impl ConsensusService {
             }
         }
 
-        if !delivered_directly && let Err(error) = self.network.broadcast_consensus(pending.message)
+        if !delivered_directly && let Err(error) = self.broadcast_engine_consensus(pending.message)
         {
             warn!(
                 target: "n42::cl::orchestrator",
@@ -1238,6 +1347,9 @@ impl ConsensusService {
         let (build_complete_tx, build_complete_rx) = mpsc::channel(256);
         Self {
             engine,
+            h2_v4_identity: None,
+            h2_v4_block_views: BTreeMap::new(),
+            h2_v4_unbound_blocks: BTreeMap::new(),
             network,
             consensus_event_rx: None,
             net_event_rx,
@@ -1453,6 +1565,9 @@ impl ConsensusService {
 
         Self {
             engine,
+            h2_v4_identity: None,
+            h2_v4_block_views: BTreeMap::new(),
+            h2_v4_unbound_blocks: BTreeMap::new(),
             network,
             consensus_event_rx: Some(consensus_event_rx),
             net_event_rx,
@@ -1546,6 +1661,17 @@ impl ConsensusService {
 
     pub fn with_exec_output_cache(mut self, cache: Arc<dyn ExecutionOutputCache>) -> Self {
         self.exec_output_cache = Some(cache);
+        self
+    }
+
+    /// Enables the complete H2-v4 participant profile: chain-bound POP BLS
+    /// signatures in the engine plus bidirectional network conversion.
+    pub fn with_h2_v4_participant(
+        mut self,
+        identity: n42_network::h2_v4::H2V4ChainIdentity,
+    ) -> Self {
+        self.engine.enable_h2_v4_signing(identity);
+        self.h2_v4_identity = Some(identity);
         self
     }
 
@@ -2163,6 +2289,12 @@ impl ConsensusService {
     /// Broadcasts a consensus message using Rotor relay: send directly to relay nodes,
     /// then always broadcast via GossipSub as safety net.
     fn broadcast_via_rotor(&mut self, msg: n42_primitives::ConsensusMessage) {
+        if self.h2_v4_identity.is_some() {
+            if let Err(error) = self.broadcast_engine_consensus(msg) {
+                error!(target: "n42::interop::h2v4", %error, "H2-v4 proposal broadcast failed");
+            }
+            return;
+        }
         use n42_consensus::rotor::cached_relay_assignment;
 
         let view = self.engine.current_view();
@@ -2290,6 +2422,40 @@ impl ConsensusService {
     }
 
     async fn handle_consensus_event_batch(&mut self, events: Vec<NetworkEvent>) {
+        let events = events
+            .into_iter()
+            .filter_map(|event| match event {
+                NetworkEvent::H2V4Message { source, envelope } => {
+                    let Some(identity) = self.h2_v4_identity else {
+                        return Some(NetworkEvent::H2V4Message { source, envelope });
+                    };
+                    if envelope.identity != identity {
+                        counter!("n42_h2_v4_participant_rejected_total", "reason" => "identity")
+                            .increment(1);
+                        return None;
+                    }
+                    match n42_network::consensus_from_h2_v4(*envelope) {
+                        Ok(message) => {
+                            counter!("n42_h2_v4_participant_received_total").increment(1);
+                            Some(NetworkEvent::ConsensusMessage {
+                                source,
+                                message: Box::new(message),
+                            })
+                        }
+                        Err(error) => {
+                            counter!("n42_h2_v4_participant_rejected_total", "reason" => "conversion")
+                                .increment(1);
+                            warn!(target: "n42::interop::h2v4", %source, %error, "rejected H2-v4 participant message");
+                            None
+                        }
+                    }
+                }
+                other => Some(other),
+            })
+            .collect::<Vec<_>>();
+        if events.is_empty() {
+            return;
+        }
         let current_view = self.engine.current_view();
         let mut positions = Vec::new();
         let mut messages = Vec::new();
@@ -2314,6 +2480,7 @@ impl ConsensusService {
             for event in events {
                 self.handle_network_event(event).await;
             }
+            self.drain_h2_v4_bound_blocks().await;
             return;
         }
 
@@ -2332,6 +2499,7 @@ impl ConsensusService {
         for (event, hint) in events.into_iter().zip(hints) {
             self.handle_network_event_with_auth(event, hint).await;
         }
+        self.drain_h2_v4_bound_blocks().await;
     }
 
     async fn handle_network_event(&mut self, event: NetworkEvent) {
@@ -2426,6 +2594,17 @@ impl ConsensusService {
                 }
                 // Save the message view before process_event consumes it via *message.
                 let msg_view = message.view();
+                // A body hash becomes eligible for execution only after the H2
+                // state machine has authenticated and accepted the corresponding
+                // Proposal/Decide. Merely decoding a chain-bound envelope is not
+                // authentication: any connected peer can publish one.
+                let h2_block_binding = self.h2_v4_identity.and_then(|_| match message.as_ref() {
+                    CM::Proposal(value) if validator_index == Some(value.proposer) => {
+                        Some((value.block_hash, value.view))
+                    }
+                    CM::Decide(value) => Some((value.block_hash, value.view)),
+                    _ => None,
+                });
                 debug!(target: "n42::cl::orchestrator", msg_type, view = self.engine.current_view(), "processing consensus message");
                 let result = match authenticated {
                     Some(authenticated) => self.engine.process_authenticated_message(authenticated),
@@ -2434,7 +2613,18 @@ impl ConsensusService {
                         .process_event(n42_consensus::ConsensusEvent::Message(*message)),
                 };
                 match result {
-                    Ok(()) => {}
+                    Ok(()) => {
+                        if let Some((block_hash, view)) = h2_block_binding {
+                            self.remember_h2_v4_block_view(block_hash, view);
+                            if !self.pending_block_data.contains_key(&block_hash)
+                                && !self.h2_v4_unbound_blocks.contains_key(&block_hash)
+                                && let Err(error) =
+                                    self.network.request_gov5_block_by_hash(source, block_hash)
+                            {
+                                debug!(target: "n42::interop::h2v4", %source, %block_hash, %error, "could not request H2-authenticated gov5 block");
+                            }
+                        }
+                    }
                     Err(e) => {
                         if matches!(e, n42_consensus::N42ConsensusError::SafetyViolation { .. }) {
                             debug!(target: "n42::cl::orchestrator", error = %e, "benign safety check (QC ordering race)");
@@ -2499,6 +2689,24 @@ impl ConsensusService {
                 tracing::debug!(target: "n42::cl::orchestrator", %source, bytes = data.len(), "received block data broadcast");
                 self.handle_block_data(data).await;
             }
+            NetworkEvent::Gov5Block { source, rlp } if self.h2_v4_identity.is_some() => {
+                self.handle_h2_v4_gov5_block(source, rlp, None).await;
+            }
+            NetworkEvent::Gov5BlockFetched {
+                source,
+                requested_hash,
+                rlp,
+            } if self.h2_v4_identity.is_some() => {
+                self.handle_h2_v4_gov5_block(source, rlp, Some(requested_hash))
+                    .await;
+            }
+            NetworkEvent::Gov5BlockFetchFailed {
+                source,
+                block_hash,
+                error,
+            } if self.h2_v4_identity.is_some() => {
+                warn!(target: "n42::interop::h2v4", %source, %block_hash, %error, "H2-authenticated gov5 block fetch failed");
+            }
             NetworkEvent::TransactionReceived { source: _, data } => {
                 self.enqueue_tx_import(data, "p2p transaction received")
                     .await;
@@ -2556,7 +2764,9 @@ mod tests {
     use n42_consensus::{ConsensusEngine, EpochManager, ValidatorSet};
     use n42_network::{NetworkCommand, NetworkHandle};
     use n42_primitives::consensus::ValidatorChange;
-    use n42_primitives::{BlsSecretKey, ConsensusMessage, QuorumCertificate, TimeoutMessage, Vote};
+    use n42_primitives::{
+        BlsSecretKey, ConsensusMessage, Proposal, QuorumCertificate, TimeoutMessage, Vote,
+    };
     use std::collections::{HashMap, HashSet};
     use std::sync::{Arc, Mutex, RwLock};
     use std::time::Duration;
@@ -2565,6 +2775,7 @@ mod tests {
     struct MockConsensusNetwork {
         peers: Arc<RwLock<HashMap<u32, n42_network::PeerId>>>,
         broadcasts: Arc<Mutex<Vec<n42_primitives::ConsensusMessage>>>,
+        h2_v4_broadcasts: Arc<Mutex<Vec<n42_network::h2_v4::H2V4Envelope>>>,
         direct_messages: Arc<Mutex<Vec<(n42_network::PeerId, n42_primitives::ConsensusMessage)>>>,
     }
 
@@ -2588,6 +2799,13 @@ mod tests {
             self.direct_messages
                 .lock()
                 .expect("mock direct messages lock")
+                .clone()
+        }
+
+        fn h2_v4_broadcasts(&self) -> Vec<n42_network::h2_v4::H2V4Envelope> {
+            self.h2_v4_broadcasts
+                .lock()
+                .expect("mock H2-v4 broadcasts lock")
                 .clone()
         }
     }
@@ -2928,6 +3146,17 @@ mod tests {
             Ok(())
         }
 
+        fn broadcast_h2_v4(
+            &self,
+            envelope: n42_network::h2_v4::H2V4Envelope,
+        ) -> Result<(), n42_network::NetworkError> {
+            self.h2_v4_broadcasts
+                .lock()
+                .expect("mock H2-v4 broadcasts lock")
+                .push(envelope);
+            Ok(())
+        }
+
         fn validator_peer(&self, index: u32) -> Option<n42_network::PeerId> {
             self.peers
                 .read()
@@ -2973,6 +3202,14 @@ mod tests {
             Ok(())
         }
 
+        fn request_gov5_block_by_hash(
+            &self,
+            _peer: n42_network::PeerId,
+            _block_hash: B256,
+        ) -> Result<(), n42_network::NetworkError> {
+            Ok(())
+        }
+
         fn broadcast_blob_sidecar(&self, _data: Vec<u8>) -> Result<(), n42_network::NetworkError> {
             Ok(())
         }
@@ -2980,6 +3217,13 @@ mod tests {
         async fn announce_block_reliable(
             &self,
             _data: Vec<u8>,
+        ) -> Result<(), n42_network::NetworkError> {
+            Ok(())
+        }
+
+        async fn broadcast_gov5_block_reliable(
+            &self,
+            _rlp: Vec<u8>,
         ) -> Result<(), n42_network::NetworkError> {
             Ok(())
         }
@@ -3160,6 +3404,72 @@ mod tests {
             matches!(cmd, NetworkCommand::BroadcastConsensus(_)),
             "should be a BroadcastConsensus command"
         );
+    }
+
+    #[tokio::test]
+    async fn h2_v4_participant_routes_engine_output_only_to_h2_topic() {
+        let (engine, output_rx) = make_test_engine();
+        let network = Arc::new(MockConsensusNetwork::default());
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let identity = n42_network::h2_v4::H2V4ChainIdentity {
+            chain_id: 42,
+            genesis_hash: B256::repeat_byte(0x42),
+        };
+        let mut orch = ConsensusService::new(engine, network.clone(), net_event_rx, output_rx)
+            .with_h2_v4_participant(identity);
+        let vote = Vote {
+            view: 1,
+            block_hash: B256::repeat_byte(0xAA),
+            voter: 0,
+            signature: test_key(0x11).sign_h2_v4(b"test"),
+        };
+
+        orch.handle_engine_output(EngineOutput::BroadcastMessage(ConsensusMessage::Vote(vote)))
+            .await;
+
+        assert!(network.broadcasts().is_empty());
+        let envelopes = network.h2_v4_broadcasts();
+        assert_eq!(envelopes.len(), 1);
+        assert_eq!(envelopes[0].identity, identity);
+        assert_eq!(envelopes[0].changes_hash, B256::ZERO);
+        assert!(matches!(
+            envelopes[0].message,
+            n42_network::h2_wire::H2Message::Vote(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn h2_v4_rejects_body_binding_before_proposal_authentication() {
+        let (engine, output_rx) = make_test_engine();
+        let network = Arc::new(MockConsensusNetwork::default());
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let identity = n42_network::h2_v4::H2V4ChainIdentity {
+            chain_id: 42,
+            genesis_hash: B256::repeat_byte(0x42),
+        };
+        let mut orch = ConsensusService::new(engine, network, net_event_rx, output_rx)
+            .with_h2_v4_participant(identity);
+        let block_hash = B256::repeat_byte(0xA5);
+        let proposal = ConsensusMessage::Proposal(Proposal {
+            view: 1,
+            block_hash,
+            justify_qc: QuorumCertificate::genesis(),
+            proposer: 0,
+            signature: test_key(0x77).sign_h2_v4(b"forged proposal"),
+            prepare_qc: None,
+            tx_root_hash: Some(B256::ZERO),
+            validator_changes: None,
+        });
+        let envelope = n42_network::consensus_to_h2_v4(identity, &proposal).unwrap();
+        let source = Keypair::generate_ed25519().public().to_peer_id();
+
+        orch.handle_consensus_event_batch(vec![NetworkEvent::H2V4Message {
+            source,
+            envelope: Box::new(envelope),
+        }])
+        .await;
+
+        assert!(!orch.h2_v4_block_views.contains_key(&block_hash));
     }
 
     #[tokio::test]

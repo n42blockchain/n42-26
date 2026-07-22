@@ -181,6 +181,16 @@ pub fn build_interop_observer_swarm(
     build_swarm_with_transports(keypair, config, None, true)
 }
 
+/// Builds a voting interop swarm with gov5 TCP/Noise/Yamux transport and an
+/// explicit validator identity. Selection remains an opt-in node policy.
+pub fn build_interop_participant_swarm(
+    keypair: Keypair,
+    config: TransportConfig,
+    validator_index: u32,
+) -> eyre::Result<Swarm<N42Behaviour>> {
+    build_swarm_with_transports(keypair, config, Some(validator_index), true)
+}
+
 /// Derives the deterministic libp2p keypair currently used for validator P2P identities.
 pub fn deterministic_validator_keypair(index: u32) -> eyre::Result<Keypair> {
     let seed = alloy_primitives::keccak256(format!("n42-p2p-key-{index}").as_bytes());
