@@ -3,7 +3,7 @@ use n42_primitives::{
     BlsSecretKey,
     consensus::{ConsensusMessage, H2V4ChainIdentity, QuorumCertificate, ViewNumber},
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
@@ -226,12 +226,12 @@ pub enum EngineOutput {
     },
 }
 
-/// Pending proposal state (retained for timeout cleanup; with optimistic voting,
-/// R1 votes are sent immediately and this struct is rarely populated).
+/// Pending proposal state. Gov5-compatible H2 participants retain this until
+/// the execution layer confirms the matching block is valid.
 #[derive(Debug, Clone)]
 pub(super) struct PendingProposal {
-    pub(super) _view: ViewNumber,
-    pub(super) _block_hash: B256,
+    pub(super) view: ViewNumber,
+    pub(super) block_hash: B256,
 }
 
 /// The HotStuff-2 consensus engine.
@@ -280,6 +280,9 @@ pub struct ConsensusEngine {
     pub(super) pending_proposal: Option<PendingProposal>,
     /// Block hashes imported before their matching proposal arrived.
     pub(super) imported_blocks: HashSet<B256>,
+    /// Insertion order for bounded imported-block eviction. H2 import evidence
+    /// survives view changes because a new leader can repropose the same block.
+    pub(super) imported_block_fifo: VecDeque<B256>,
     /// Tracks which block hash each validator voted for (equivocation detection).
     /// Tracks R1 (Vote) per validator per view for equivocation detection.
     pub(super) equivocation_tracker: HashMap<u32, B256>,
@@ -381,6 +384,7 @@ impl ConsensusEngine {
             output_tx,
             pending_proposal: None,
             imported_blocks: HashSet::new(),
+            imported_block_fifo: VecDeque::new(),
             equivocation_tracker: HashMap::new(),
             commit_equivocation_tracker: HashMap::new(),
             proposal_equivocation_tracker: HashMap::new(),
@@ -487,6 +491,7 @@ impl ConsensusEngine {
             output_tx,
             pending_proposal: None,
             imported_blocks: HashSet::new(),
+            imported_block_fifo: VecDeque::new(),
             equivocation_tracker: HashMap::new(),
             commit_equivocation_tracker: HashMap::new(),
             proposal_equivocation_tracker: HashMap::new(),
@@ -1241,7 +1246,14 @@ impl ConsensusEngine {
         });
         self.prepare_qc = None;
         self.pending_proposal = None;
-        self.imported_blocks.clear();
+        // Gov5 keeps successful import evidence across view changes: a new
+        // leader commonly reproposes the same uncommitted block, and reth will
+        // not emit a second import completion for it. Native optimistic voting
+        // does not need this cache beyond the view.
+        if !matches!(self.signing_profile, ConsensusSigningProfile::H2V4(_)) {
+            self.imported_blocks.clear();
+            self.imported_block_fifo.clear();
+        }
         self.equivocation_tracker.clear();
         self.commit_equivocation_tracker.clear();
         self.proposal_equivocation_tracker.clear();
@@ -1597,6 +1609,36 @@ mod tests {
             tx_root_hash: None,
             validator_changes: None,
         }
+    }
+
+    fn signed_h2_test_proposal(
+        engine: &ConsensusEngine,
+        view: ViewNumber,
+        block_hash: B256,
+        proposer: u32,
+        signer: &n42_primitives::BlsSecretKey,
+    ) -> Proposal {
+        let validator_changes = None;
+        let message = engine
+            .signing_profile
+            .proposal_message(view, block_hash, &validator_changes);
+        Proposal {
+            view,
+            block_hash,
+            justify_qc: QuorumCertificate::genesis(),
+            proposer,
+            signature: engine.signing_profile.sign(signer, &message),
+            prepare_qc: None,
+            tx_root_hash: None,
+            validator_changes,
+        }
+    }
+
+    fn enable_test_h2(engine: &mut ConsensusEngine) {
+        engine.enable_h2_v4_signing(H2V4ChainIdentity {
+            chain_id: 1143,
+            genesis_hash: B256::repeat_byte(0x42),
+        });
     }
 
     #[test]
@@ -2565,6 +2607,79 @@ mod tests {
             o,
             EngineOutput::SendToValidator(_, ConsensusMessage::Vote(_))
         )));
+    }
+
+    #[test]
+    fn test_h2_vote_waits_for_execution_import() {
+        let (mut engine, sks, _, mut rx) = make_engine(4, 0);
+        enable_test_h2(&mut engine);
+        let block_hash = B256::repeat_byte(0xE1);
+        let proposal = signed_h2_test_proposal(&engine, 1, block_hash, 1, &sks[1]);
+
+        engine
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(
+                proposal,
+            )))
+            .expect("H2 proposal should be accepted");
+
+        let before_import: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(before_import.iter().any(
+            |output| matches!(output, EngineOutput::ExecuteBlock(hash) if *hash == block_hash)
+        ));
+        assert!(!before_import.iter().any(|output| matches!(
+            output,
+            EngineOutput::SendToValidator(_, ConsensusMessage::Vote(_))
+        )));
+
+        engine
+            .process_event(ConsensusEvent::BlockImported(block_hash))
+            .expect("execution-valid import should release the H2 vote");
+        let after_import: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(after_import.iter().any(|output| matches!(
+            output,
+            EngineOutput::SendToValidator(_, ConsensusMessage::Vote(vote))
+                if vote.block_hash == block_hash && vote.view == 1
+        )));
+    }
+
+    #[test]
+    fn test_h2_import_before_proposal_votes_immediately() {
+        let (mut engine, sks, _, mut rx) = make_engine(4, 0);
+        enable_test_h2(&mut engine);
+        let block_hash = B256::repeat_byte(0xE2);
+        engine
+            .process_event(ConsensusEvent::BlockImported(block_hash))
+            .expect("early execution-valid import should be cached");
+        let proposal = signed_h2_test_proposal(&engine, 1, block_hash, 1, &sks[1]);
+
+        engine
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(
+                proposal,
+            )))
+            .expect("H2 proposal should use prior import evidence");
+
+        assert!(
+            std::iter::from_fn(|| rx.try_recv().ok()).any(|output| matches!(
+                output,
+                EngineOutput::SendToValidator(_, ConsensusMessage::Vote(vote))
+                    if vote.block_hash == block_hash && vote.view == 1
+            ))
+        );
+    }
+
+    #[test]
+    fn test_h2_import_evidence_survives_view_change() {
+        let (mut engine, _, _, mut rx) = make_engine(4, 0);
+        enable_test_h2(&mut engine);
+        let block_hash = B256::repeat_byte(0xE3);
+        engine
+            .process_event(ConsensusEvent::BlockImported(block_hash))
+            .expect("import should be cached");
+        engine.advance_to_view(2).expect("view should advance");
+        while rx.try_recv().is_ok() {}
+
+        assert!(engine.imported_blocks.contains(&block_hash));
+        assert_eq!(engine.imported_block_fifo.front(), Some(&block_hash));
     }
 
     #[test]
@@ -3854,7 +3969,8 @@ mod tests {
             .process_event(ConsensusEvent::BlockImported(B256::repeat_byte(0xFF)))
             .expect("BlockImported at capacity should succeed");
         assert_eq!(engine.imported_blocks.len(), 64);
-        assert!(!engine.imported_blocks.contains(&B256::repeat_byte(0xFF)));
+        assert!(engine.imported_blocks.contains(&B256::repeat_byte(0xFF)));
+        assert!(!engine.imported_blocks.contains(&B256::repeat_byte(0)));
     }
 
     #[test]

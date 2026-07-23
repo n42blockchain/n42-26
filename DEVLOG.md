@@ -165,6 +165,7 @@ Logs are split into separate files by phase for easy maintenance:
 | [devlog-131-gov5-finalized-far-catchup](docs/devlog-131-gov5-finalized-far-catchup.md) | Rust observer 从 replay-v2 block 49 完成 2,883 块单次认证追赶并与七节点在 block 3,194/hash/state root 一致；512 body 硬上限下支持远距谱系发现、正序执行与稳态跟随 | Interop |
 | [devlog-132-view-bound-validator-authority](docs/devlog-132-view-bound-validator-authority.md) | QC/CommitQC 与 sync 按 certificate view 精确绑定授权验证者集；移除 bitmap 长度猜集合，旧委员会签未来 view 在共识与同步路径均 fail closed | Security |
 | [devlog-133-h2-v4-mixed-participant](docs/devlog-133-h2-v4-mixed-participant.md) | H2-v4 双向混合客户端参与者：gov5 入站订阅、Rust POP 共识/QC/TC、认证后区块执行及 gov5 leader header/RLP 生产；默认关闭并隔离现有七节点 | Interop |
+| [devlog-134-gov5-live-voter-and-catchup-watermark](docs/devlog-134-gov5-live-voter-and-catchup-watermark.md) | Rust 参与者在 Gov5 真机委员会完成执行门控投票；修复乱序 catch-up 子块用 Syncing 结果提前毒化 eager-import 水位 | Interop |
 
 ### 上游借鉴与跟踪
 

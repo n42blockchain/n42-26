@@ -659,6 +659,15 @@ fn expected_peer_id_for_validator(
     }
 }
 
+fn validator_index_for_expected_peer(
+    expected_validator_peer_ids: &HashMap<u32, PeerId>,
+    peer_id: PeerId,
+) -> Option<u32> {
+    expected_validator_peer_ids
+        .iter()
+        .find_map(|(&index, &expected)| (expected == peer_id).then_some(index))
+}
+
 fn push_bounded_backlog<T>(queue: &mut VecDeque<T>, max_len: usize, item: T, label: &'static str) {
     if queue.len() >= max_len {
         metrics::counter!("n42_network_event_drops_total").increment(1);
@@ -1099,6 +1108,13 @@ impl NetworkService {
                 tracing::info!(%peer_id, "peer connected");
                 metrics::gauge!("n42_active_peer_connections").increment(1.0);
                 self.reconnection.on_connected(&peer_id);
+                if let Some(validator_index) = self.route_expected_validator_peer(peer_id) {
+                    tracing::info!(
+                        %peer_id,
+                        validator_index,
+                        "routed connected peer using expected validator binding"
+                    );
+                }
                 if self.gov5_status.is_some() {
                     self.pending_gov5_status_peers.insert(peer_id);
                 }
@@ -1155,6 +1171,29 @@ impl NetworkService {
                 self.authenticated_validator_peer_map.remove(&idx);
             }
         }
+    }
+
+    /// Routes a live peer whose Noise-authenticated PeerId exactly matches the
+    /// configured binding for a validator. This does not mark the peer as BLS
+    /// authenticated; that stronger authorization remains gated on a verified
+    /// single-validator consensus message.
+    fn route_expected_validator_peer(&mut self, peer_id: PeerId) -> Option<u32> {
+        let validator_index =
+            validator_index_for_expected_peer(&self.expected_validator_peer_ids, peer_id)?;
+
+        self.reconnection.register_peer(peer_id, Vec::new(), true);
+        self.peer_validator_map
+            .retain(|_, idx| *idx != validator_index);
+        self.peer_validator_map.insert(peer_id, validator_index);
+        let mut map = self.validator_peer_map.write().unwrap_or_else(|e| {
+            tracing::error!(
+                "validator_peer_map lock poisoned on expected peer route: {}",
+                e
+            );
+            e.into_inner()
+        });
+        map.insert(validator_index, peer_id);
+        Some(validator_index)
     }
 
     fn authenticate_validator_peer(&mut self, peer_id: PeerId, validator_index: u32) {
@@ -1253,11 +1292,28 @@ impl NetworkService {
             e.into_inner()
         });
         map.retain(|idx, peer_id| self.expected_validator_peer_ids.get(idx) == Some(peer_id));
+        drop(map);
+
+        let connected_expected: Vec<_> = self
+            .expected_validator_peer_ids
+            .values()
+            .copied()
+            .filter(|peer_id| self.swarm.is_connected(peer_id))
+            .collect();
+        for peer_id in connected_expected {
+            self.route_expected_validator_peer(peer_id);
+        }
+
+        let routed = self
+            .validator_peer_map
+            .read()
+            .map(|map| map.len())
+            .unwrap_or_default();
 
         tracing::info!(
             validator_count = self.expected_validator_peer_ids.len(),
             authenticated = self.authenticated_validator_peer_map.len(),
-            routed = map.len(),
+            routed,
             "replaced expected validator peer bindings"
         );
     }
@@ -2601,6 +2657,22 @@ mod tests {
         assert_eq!(
             expected_peer_id_for_validator(&expected, 7, false).unwrap(),
             peer_id
+        );
+    }
+
+    #[test]
+    fn test_validator_index_for_expected_peer_requires_exact_noise_identity() {
+        let expected_peer = PeerId::random();
+        let mut expected = HashMap::new();
+        expected.insert(7, expected_peer);
+
+        assert_eq!(
+            validator_index_for_expected_peer(&expected, expected_peer),
+            Some(7)
+        );
+        assert_eq!(
+            validator_index_for_expected_peer(&expected, PeerId::random()),
+            None
         );
     }
 

@@ -517,9 +517,9 @@ pub struct ConsensusService {
     timeout_view_diags: BTreeMap<u64, TimeoutViewDiag>,
     /// Last committed parent for which commit->build_start has already been recorded.
     commit_to_build_recorded_parent: Option<B256>,
-    /// Guards follower eager import: tracks the last block number sent to reth
-    /// via new_payload. Prevents multiple eager imports for the same block number
-    /// with different hashes, which triggers reth pipeline sync and chain stalls.
+    /// Highest block number for which eager import received a deterministic
+    /// `new_payload(Valid)` verdict. Non-Valid attempts never advance it, so an
+    /// out-of-order child cannot suppress the missing parents needed for catch-up.
     eager_import_block_guard: Arc<std::sync::atomic::AtomicU64>,
     /// Fast propose mode: skip slot boundary alignment, build immediately after
     /// ViewChanged/BlockCommitted. Consensus voting naturally paces block production.

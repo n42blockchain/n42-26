@@ -198,7 +198,13 @@ impl ConsensusEngine {
 
         // Clear pending block data: similar to Tendermint's "prevote nil".
         self.pending_proposal = None;
-        self.imported_blocks.clear();
+        if !matches!(
+            self.signing_profile,
+            super::quorum::ConsensusSigningProfile::H2V4(_)
+        ) {
+            self.imported_blocks.clear();
+            self.imported_block_fifo.clear();
+        }
 
         // Preserve any timeouts already collected from validators who timed out before us.
         // Unconditional replacement would discard those votes, potentially preventing

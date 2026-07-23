@@ -172,6 +172,26 @@ struct QmdbExecutionBootstrap {
     base_root: B256,
     genesis_header: Header,
     execution_genesis: Genesis,
+    execution_profile: &'static str,
+}
+
+fn portable_has_genesis_prefix(
+    portable: &QmdbPortableSnapshot,
+    snapshot: &n42_twig_core::qmdb_compat::QmdbSnapshot,
+) -> bool {
+    portable.slots.entries.len() >= snapshot.entries.len()
+        && portable
+            .slots
+            .entries
+            .iter()
+            .zip(&snapshot.entries)
+            .enumerate()
+            .all(|(slot, (checkpoint_entry, base_entry))| {
+                checkpoint_entry.slot == slot as u64
+                    && checkpoint_entry.key == base_entry.key
+                    && checkpoint_entry.value == base_entry.value
+                    && checkpoint_entry.active == base_entry.active
+            })
 }
 
 /// Materialize a bounded portable checkpoint only after streaming authentication. Full-archive
@@ -246,6 +266,7 @@ fn load_gov5_genesis_execution_bootstrap(
     expected_root: B256,
     max_slots: u64,
     max_bytes: u64,
+    start_at_checkpoint: bool,
 ) -> eyre::Result<QmdbExecutionBootstrap> {
     let (portable, checkpoint) = load_qmdb_execution_checkpoint(
         checkpoint_path,
@@ -290,49 +311,56 @@ fn load_gov5_genesis_execution_bootstrap(
             genesis_entry.state_root()
         ));
     }
-    let execution_genesis = gov5_replay_execution_genesis(genesis);
-    let genesis_tree = gov5_qmdb_genesis_tree(&execution_genesis).map_err(|error| {
-        eyre::eyre!("failed to build Gov5 replay-v2 execution genesis state: {error}")
-    })?;
+    let replay_execution_genesis = gov5_replay_execution_genesis(genesis);
+    let replay_genesis_tree =
+        gov5_qmdb_genesis_tree(&replay_execution_genesis).map_err(|error| {
+            eyre::eyre!("failed to build Gov5 replay-v2 execution genesis state: {error}")
+        })?;
+    let native_snapshot = header_genesis_tree.snapshot();
+    let replay_snapshot = replay_genesis_tree.snapshot();
+    // replay-v2 appends its execution overlay after sealing block zero, so both profiles share
+    // the native prefix. Test the longer replay prefix first; otherwise a replay checkpoint would
+    // be misclassified as native. The portable log is authenticated and positional, making this
+    // profile selection deterministic rather than a caller-controlled bypass.
+    let (execution_genesis, genesis_tree, execution_profile) = if portable_has_genesis_prefix(
+        &portable,
+        &replay_snapshot,
+    ) {
+        (replay_execution_genesis, replay_genesis_tree, "replay-v2")
+    } else if portable_has_genesis_prefix(&portable, &native_snapshot) {
+        (genesis.clone(), header_genesis_tree, "native")
+    } else {
+        return Err(eyre::eyre!(
+            "QMDB checkpoint matches neither the native nor replay-v2 authenticated genesis prefix"
+        ));
+    };
     let base_root = B256::from(genesis_tree.root());
     let base_snapshot = genesis_tree.snapshot();
-    if portable.slots.entries.len() < base_snapshot.entries.len() {
-        return Err(eyre::eyre!(
-            "QMDB checkpoint has fewer entries than the authenticated genesis alloc"
-        ));
-    }
-    for (slot, (checkpoint_entry, base_entry)) in portable
-        .slots
-        .entries
-        .iter()
-        .zip(&base_snapshot.entries)
-        .enumerate()
-    {
-        if checkpoint_entry.slot != slot as u64
-            || checkpoint_entry.key != base_entry.key
-            || checkpoint_entry.value != base_entry.value
-        {
-            return Err(eyre::eyre!(
-                "QMDB checkpoint genesis prefix mismatch at slot {slot}: checkpoint key={} value_hash={} value_len={}, genesis key={} value_hash={} value_len={}",
-                B256::from(checkpoint_entry.key),
-                keccak256(&checkpoint_entry.value),
-                checkpoint_entry.value.len(),
-                B256::from(base_entry.key),
-                keccak256(&base_entry.value),
-                base_entry.value.len(),
-            ));
-        }
-    }
-    let store = Gov5QmdbStateRootStore::new(genesis_hash, base_root, base_snapshot)
+    let (store_base_number, store_base_hash, store_base_root, store_base_snapshot) =
+        if start_at_checkpoint {
+            let checkpoint_tree = portable
+                .verify_and_build(chain_id, &genesis_hash.into())
+                .map_err(|error| eyre::eyre!("failed to rebuild QMDB checkpoint base: {error}"))?;
+            (
+                checkpoint.block_number,
+                B256::from(checkpoint.block_hash),
+                B256::from(checkpoint.root),
+                checkpoint_tree.snapshot(),
+            )
+        } else {
+            (0, genesis_hash, base_root, base_snapshot)
+        };
+    let store = Gov5QmdbStateRootStore::new(store_base_hash, store_base_root, store_base_snapshot)
         .map_err(|error| eyre::eyre!("failed to initialize QMDB genesis store: {error}"))?;
     Ok(QmdbExecutionBootstrap {
         store: Arc::new(store),
         checkpoint,
-        base_block_number: 0,
-        base_block_hash: genesis_hash,
-        base_root,
+        base_block_number: store_base_number,
+        base_block_hash: store_base_hash,
+        base_root: store_base_root,
         genesis_header: genesis_entry.header().clone(),
         execution_genesis,
+        execution_profile,
     })
 }
 
@@ -864,6 +892,17 @@ fn main() {
             env_bool("N42_GOV5_HEADER_PROFILE"),
             std::env::var("N42_INTEROP_GENESIS_HASH").ok().as_deref(),
         )?;
+        let qmdb_start_at_checkpoint = env_bool("N42_GOV5_QMDB_START_AT_CHECKPOINT");
+        if qmdb_start_at_checkpoint && !h2_v4_participant {
+            return Err(eyre::eyre!(
+                "N42_GOV5_QMDB_START_AT_CHECKPOINT is restricted to H2-v4 participant mode"
+            ));
+        }
+        if qmdb_start_at_checkpoint && env_bool("N42_GOV5_REPLAY_IMPORT") {
+            return Err(eyre::eyre!(
+                "checkpoint-start participant mode cannot replay the same finalized bootstrap"
+            ));
+        }
         let qmdb_execution = if env_bool("N42_GOV5_QMDB_EXECUTION") {
             if !(observer_mode || h2_v4_participant)
                 || header_profile != N42HeaderProfile::Gov5H2
@@ -903,11 +942,12 @@ fn main() {
                 expected_root,
                 max_slots,
                 max_bytes,
+                qmdb_start_at_checkpoint,
             )?;
             let chain = Arc::make_mut(&mut builder.config_mut().chain);
             chain.genesis = loaded.execution_genesis.clone();
             chain.genesis_header =
-                SealedHeader::new(loaded.genesis_header.clone(), loaded.base_block_hash);
+                SealedHeader::new(loaded.genesis_header.clone(), interop_genesis);
             activate_gov5_pos_execution(chain);
             info!(
                 target: "n42::cli",
@@ -916,6 +956,7 @@ fn main() {
                 base_block = loaded.base_block_number,
                 base_hash = %loaded.base_block_hash,
                 base_root = %loaded.base_root,
+                execution_profile = loaded.execution_profile,
                 checkpoint_block = loaded.checkpoint.block_number,
                 checkpoint_hash = %B256::from(loaded.checkpoint.block_hash),
                 checkpoint_root = %B256::from(loaded.checkpoint.root),
@@ -2346,6 +2387,7 @@ fn main() {
 #[cfg(test)]
 mod observer_identity_tests {
     use super::*;
+    use n42_twig_core::qmdb_compat::{QmdbEntrySnapshot, QmdbSlotEntry, QmdbSlotSnapshot};
     use std::io::Write;
 
     fn qmdb_portable_fixture() -> tempfile::NamedTempFile {
@@ -2358,6 +2400,70 @@ mod observer_identity_tests {
         file.write_all(&hex::decode(encoded).unwrap()).unwrap();
         file.flush().unwrap();
         file
+    }
+
+    fn portable_with_entries(entries: &[QmdbEntrySnapshot]) -> QmdbPortableSnapshot {
+        QmdbPortableSnapshot {
+            chain_id: 1143,
+            genesis_hash: [0x11; 32],
+            block_number: 1,
+            block_hash: [0x22; 32],
+            root: [0x33; 32],
+            slots: QmdbSlotSnapshot {
+                next_slot: entries.len() as u64,
+                entries: entries
+                    .iter()
+                    .enumerate()
+                    .map(|(slot, entry)| QmdbSlotEntry {
+                        slot: slot as u64,
+                        key: entry.key,
+                        value: entry.value.clone(),
+                        active: entry.active,
+                    })
+                    .collect(),
+            },
+        }
+    }
+
+    #[test]
+    fn authenticated_prefix_distinguishes_native_and_replay_execution_genesis() {
+        let native = n42_twig_core::qmdb_compat::QmdbSnapshot {
+            next_slot: 1,
+            entries: vec![QmdbEntrySnapshot {
+                key: [0x41; 32],
+                value: vec![0x01],
+                active: true,
+            }],
+        };
+        let replay = n42_twig_core::qmdb_compat::QmdbSnapshot {
+            next_slot: 2,
+            entries: vec![
+                native.entries[0].clone(),
+                QmdbEntrySnapshot {
+                    key: [0x42; 32],
+                    value: vec![0x02],
+                    active: true,
+                },
+            ],
+        };
+
+        let native_portable = portable_with_entries(&native.entries);
+        assert!(portable_has_genesis_prefix(&native_portable, &native));
+        assert!(!portable_has_genesis_prefix(&native_portable, &replay));
+
+        let replay_portable = portable_with_entries(&replay.entries);
+        assert!(portable_has_genesis_prefix(&replay_portable, &native));
+        assert!(portable_has_genesis_prefix(&replay_portable, &replay));
+
+        let mut forged = replay_portable;
+        forged.slots.entries[0].value[0] ^= 1;
+        assert!(!portable_has_genesis_prefix(&forged, &native));
+        assert!(!portable_has_genesis_prefix(&forged, &replay));
+
+        let mut forged_active_bit = portable_with_entries(&replay.entries);
+        forged_active_bit.slots.entries[0].active = false;
+        assert!(!portable_has_genesis_prefix(&forged_active_bit, &native));
+        assert!(!portable_has_genesis_prefix(&forged_active_bit, &replay));
     }
 
     #[test]

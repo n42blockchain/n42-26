@@ -352,14 +352,17 @@ impl ConsensusService {
         );
 
         if has_data {
-            // Block data already cached — notify consensus immediately for fast voting.
-            // Actual EVM execution deferred to finalize_committed_block() (Case B).
-            info!(target: "n42::cl::consensus_loop", %block_hash, "block data available, sending BlockImported to consensus");
-            if let Err(e) = self
-                .engine
-                .process_event(n42_consensus::ConsensusEvent::BlockImported(block_hash))
-            {
-                error!(target: "n42::cl::consensus_loop", %block_hash, error = %e, "error processing BlockImported");
+            if self.h2_v4_identity.is_none() {
+                // Native mode preserves its established optimistic/deferred
+                // execution behavior. H2 participant mode waits for the eager
+                // new_payload result before emitting BlockImported.
+                info!(target: "n42::cl::consensus_loop", %block_hash, "block data available, sending BlockImported to consensus");
+                if let Err(e) = self
+                    .engine
+                    .process_event(n42_consensus::ConsensusEvent::BlockImported(block_hash))
+                {
+                    error!(target: "n42::cl::consensus_loop", %block_hash, error = %e, "error processing BlockImported");
+                }
             }
         } else {
             self.pending_executions.insert(block_hash);
@@ -1426,6 +1429,17 @@ impl ConsensusService {
         debug!(target: "n42::cl::consensus_loop", %hash, "eager import done: block in engine tree (awaiting consensus commit)");
 
         self.record_eager_execution_validated(hash);
+
+        // Gov5-compatible votes are execution attestations. Only a successful
+        // reth new_payload result reaches this callback, so this is the first
+        // safe point to release an H2 participant's deferred vote.
+        if self.h2_v4_identity.is_some()
+            && let Err(error) = self
+                .engine
+                .process_event(n42_consensus::ConsensusEvent::BlockImported(hash))
+        {
+            error!(target: "n42::interop::h2v4", %hash, %error, "failed to release execution-gated H2 vote");
+        }
 
         // If commit/finalize raced ahead of eager new_payload, re-drive the
         // committed FCU now that reth has explicitly accepted the payload. This

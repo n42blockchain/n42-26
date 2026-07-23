@@ -52,6 +52,18 @@ pub(super) const MAX_PENDING_BLOCK_DATA: usize = 16;
 /// Maximum number of blocks in the syncing retry queue.
 const MAX_SYNCING_QUEUE_SIZE: usize = 8;
 
+fn eager_import_already_validated(
+    guard: &std::sync::atomic::AtomicU64,
+    block_number: u64,
+) -> Option<u64> {
+    let validated = guard.load(std::sync::atomic::Ordering::Acquire);
+    (validated >= block_number).then_some(validated)
+}
+
+fn mark_eager_import_valid(guard: &std::sync::atomic::AtomicU64, block_number: u64) -> u64 {
+    guard.fetch_max(block_number, std::sync::atomic::Ordering::AcqRel)
+}
+
 impl ConsensusService {
     /// Builds `PayloadAttributes` with timestamp correction and reward withdrawal injection.
     fn build_payload_attributes(&mut self, slot_timestamp: Option<u64>) -> PayloadAttributes {
@@ -478,13 +490,17 @@ impl ConsensusService {
             return;
         }
 
-        // Notify consensus immediately — enables voting without EVM execution.
-        debug!(target: "n42::cl::exec_bridge", %hash, "block data cached, notifying consensus (deferred execution)");
-        if let Err(e) = self
-            .engine
-            .process_event(ConsensusEvent::BlockImported(hash))
-        {
-            error!(target: "n42::cl::exec_bridge", error = %e, "error processing BlockImported for deferred execution");
+        // Native mode preserves optimistic voting on cached data. Gov5 H2
+        // participant mode releases its vote only from eager_import_done after
+        // reth returns Valid for this exact payload.
+        if self.h2_v4_identity.is_none() {
+            debug!(target: "n42::cl::exec_bridge", %hash, "block data cached, notifying consensus (deferred execution)");
+            if let Err(e) = self
+                .engine
+                .process_event(ConsensusEvent::BlockImported(hash))
+            {
+                error!(target: "n42::cl::exec_bridge", error = %e, "error processing BlockImported for deferred execution");
+            }
         }
 
         // Follower eager import: start new_payload + fcu in parallel with consensus voting.
@@ -550,17 +566,20 @@ impl ConsensusService {
                     has_compact_block = execution_output_compressed.is_some(),
                     "N42_DECOMPRESS: follower payload decoded"
                 );
-                // Guard against duplicate imports for the same block number with different hashes.
-                // Sending new_payload for the same block number but different hash triggers
-                // reth pipeline sync and causes chain stalls.
+                // Only a block previously accepted as Valid may suppress another
+                // submission at this height. Advancing this watermark before
+                // `new_payload` returns lets an out-of-order child that returns
+                // Syncing poison the whole catch-up batch by suppressing its
+                // missing parents.
                 let block_number = execution_data.block_number();
                 let tx_count = execution_data.transaction_count();
                 if bad_blocks.should_skip(hash, "block_data_eager") {
                     return;
                 }
-                let prev = block_guard.fetch_max(block_number, std::sync::atomic::Ordering::SeqCst);
-                if prev >= block_number {
-                    info!(target: "n42::cl::exec_bridge", %hash, view, block_number, prev, "follower eager import: skipping duplicate block number");
+                if let Some(validated) =
+                    eager_import_already_validated(block_guard.as_ref(), block_number)
+                {
+                    info!(target: "n42::cl::exec_bridge", %hash, view, block_number, validated, "follower eager import: skipping already validated block number");
                     return;
                 }
 
@@ -594,6 +613,7 @@ impl ConsensusService {
                     // (stored, not executed) must fall through to the stale arm
                     // so a later commit never promotes an unexecuted block (F3).
                     Ok(status) if matches!(status.status, PayloadStatusEnum::Valid) => {
+                        mark_eager_import_valid(block_guard.as_ref(), block_number);
                         let np_elapsed = import_start.elapsed().as_millis() as u64;
                         let follower_import_ms = block_data_received.elapsed().as_millis() as u64;
                         let ready_to_accept_ms = elapsed_since_unix_ms(leader_ready_unix_ms);
@@ -1358,14 +1378,13 @@ async fn handle_built_payload(
     //    This is the key pipelining optimization — by the time finalize_committed_block
     //    runs after consensus commit, the block is likely already in reth (Case A).
     //
-    //    Guard: prevent importing the same block number with different hashes,
-    //    which triggers reth pipeline sync and chain stalls.
+    //    Guard: suppress only heights already accepted as Valid. A Syncing or
+    //    Accepted child must not prevent a late parent from reaching reth.
     if bad_blocks.should_skip(hash, "leader_eager_import_pre_submit") {
         return;
     }
-    let prev = block_guard.fetch_max(block_number, std::sync::atomic::Ordering::SeqCst);
-    if prev >= block_number {
-        debug!(target: "n42::cl::exec_bridge", %hash, block_number, prev, "leader eager import: skipping duplicate block number");
+    if let Some(validated) = eager_import_already_validated(block_guard.as_ref(), block_number) {
+        debug!(target: "n42::cl::exec_bridge", %hash, block_number, validated, "leader eager import: skipping already validated block number");
         return;
     }
     // Leader eager import: only run new_payload (no FCU).
@@ -1378,6 +1397,7 @@ async fn handle_built_payload(
         // executed) falls through to the stale arm so a later commit never
         // promotes an unexecuted block (F3).
         Ok(status) if matches!(status.status, PayloadStatusEnum::Valid) => {
+            mark_eager_import_valid(block_guard.as_ref(), block_number);
             let np_elapsed = import_start.elapsed().as_millis() as u64;
             info!(target: "n42::cl::exec_bridge", %hash, np_elapsed, "eager import: new_payload accepted (no FCU)");
             metrics::counter!("n42_eager_import_hits_total").increment(1);
@@ -1597,5 +1617,32 @@ fn broadcast_blob_sidecars(
         Err(e) => {
             warn!(target: "n42::cl::exec_bridge", %hash, error = %e, "failed to get blob sidecars from store");
         }
+    }
+}
+
+#[cfg(test)]
+mod eager_import_guard_tests {
+    use super::{eager_import_already_validated, mark_eager_import_valid};
+    use std::sync::atomic::AtomicU64;
+
+    #[test]
+    fn out_of_order_syncing_child_does_not_suppress_missing_parents() {
+        let guard = AtomicU64::new(95);
+
+        // Block 101 reaches new_payload first and returns Syncing. The caller
+        // deliberately does not mark that outcome, leaving all missing parents
+        // eligible for submission.
+        assert_eq!(eager_import_already_validated(&guard, 101), None);
+        assert_eq!(eager_import_already_validated(&guard, 98), None);
+        assert_eq!(eager_import_already_validated(&guard, 99), None);
+        assert_eq!(eager_import_already_validated(&guard, 100), None);
+
+        mark_eager_import_valid(&guard, 98);
+        assert_eq!(eager_import_already_validated(&guard, 98), Some(98));
+        assert_eq!(eager_import_already_validated(&guard, 99), None);
+
+        mark_eager_import_valid(&guard, 100);
+        assert_eq!(eager_import_already_validated(&guard, 99), Some(100));
+        assert_eq!(eager_import_already_validated(&guard, 101), None);
     }
 }

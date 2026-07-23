@@ -422,6 +422,26 @@ impl ConsensusEngine {
         // Trigger eager import in background (needed for finalization).
         self.emit(EngineOutput::ExecuteBlock(proposal.block_hash))?;
 
+        // Gov5's H2 profile is import-gated: an R1 vote attests that this node
+        // has executed and validated the proposed payload, not merely seen its
+        // hash. Keep the native profile's established optimistic path intact.
+        if matches!(
+            self.signing_profile,
+            super::quorum::ConsensusSigningProfile::H2V4(_)
+        ) {
+            self.pending_proposal = Some(super::state_machine::PendingProposal {
+                view,
+                block_hash: proposal.block_hash,
+            });
+            if self.imported_blocks.contains(&proposal.block_hash) {
+                tracing::info!(target: "n42::interop::h2v4", view, block_hash = %proposal.block_hash, "import-gated vote: block already execution-validated");
+                self.send_vote(view, proposal.block_hash)?;
+            } else {
+                tracing::info!(target: "n42::interop::h2v4", view, block_hash = %proposal.block_hash, "import-gated vote: waiting for execution validation");
+            }
+            return Ok(());
+        }
+
         // Optimistic Voting: vote immediately after Proposal validation.
         //
         // R1 vote signs (view, block_hash) — it does NOT commit to block validity.
@@ -567,20 +587,29 @@ impl ConsensusEngine {
 
     /// Handles the BlockImported event from the orchestrator.
     ///
-    /// With Optimistic Voting, R1 votes are sent immediately upon Proposal validation
-    /// (no waiting for BlockData). This handler only tracks imported blocks for
-    /// diagnostics and eager import coordination.
+    /// Native optimistic voting uses this as execution diagnostics. Gov5 H2
+    /// participant mode also releases the matching deferred R1 vote here.
     pub(super) fn on_block_imported(&mut self, block_hash: B256) -> ConsensusResult<()> {
-        if self.imported_blocks.len() < MAX_IMPORTED_BLOCKS {
-            self.imported_blocks.insert(block_hash);
-        } else {
-            tracing::warn!(
-                target: "n42::cl::proposal",
-                view = self.round_state.current_view(),
-                limit = MAX_IMPORTED_BLOCKS,
-                %block_hash,
-                "imported_blocks at capacity, discarding entry (diagnostic tracking only)"
-            );
+        if self.imported_blocks.insert(block_hash) {
+            if self.imported_block_fifo.len() >= MAX_IMPORTED_BLOCKS
+                && let Some(oldest) = self.imported_block_fifo.pop_front()
+            {
+                self.imported_blocks.remove(&oldest);
+            }
+            self.imported_block_fifo.push_back(block_hash);
+        }
+
+        if matches!(
+            self.signing_profile,
+            super::quorum::ConsensusSigningProfile::H2V4(_)
+        ) && let Some(pending) = self.pending_proposal.as_ref()
+            && pending.view == self.round_state.current_view()
+            && pending.block_hash == block_hash
+            && self.round_state.may_vote_in(pending.view)
+        {
+            let view = pending.view;
+            tracing::info!(target: "n42::interop::h2v4", view, %block_hash, "import-gated vote: execution validated, sending vote");
+            self.send_vote(view, block_hash)?;
         }
         Ok(())
     }
