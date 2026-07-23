@@ -111,6 +111,17 @@ fn qc_from_h2(qc: H2QuorumCertificate) -> Result<QuorumCertificate, H2BridgeErro
     })
 }
 
+/// Converts a decoded Gov5 quorum certificate into the native representation.
+///
+/// This is intentionally strict about aggregate-signature and signer-bitmap
+/// encoding because it is also used at the participant bootstrap trust
+/// boundary.
+pub fn quorum_certificate_from_h2(
+    qc: H2QuorumCertificate,
+) -> Result<QuorumCertificate, H2BridgeError> {
+    qc_from_h2(qc)
+}
+
 fn tc_to_h2(tc: &TimeoutCertificate) -> Result<H2TimeoutCertificate, H2BridgeError> {
     Ok(H2TimeoutCertificate {
         view: tc.view,

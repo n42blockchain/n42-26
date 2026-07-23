@@ -247,11 +247,7 @@ mod tests {
             MvRead::Value(1, value) if value.is_zero()
         ));
 
-        mv.write_account(
-            2,
-            account,
-            &AccountWrite::Recreated(AccountInfo::default()),
-        );
+        mv.write_account(2, account, &AccountWrite::Recreated(AccountInfo::default()));
         mv.write_storage(2, account, new_slot, U256::from(22));
 
         assert!(matches!(
@@ -281,11 +277,7 @@ mod tests {
         let account = addr(2);
         let unread_base_slot = U256::from(99);
 
-        mv.write_account(
-            4,
-            account,
-            &AccountWrite::Recreated(AccountInfo::default()),
-        );
+        mv.write_account(4, account, &AccountWrite::Recreated(AccountInfo::default()));
 
         assert!(matches!(
             mv.read_storage(5, account, unread_base_slot),

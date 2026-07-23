@@ -482,6 +482,15 @@ fn decode_qc(data: &[u8]) -> Result<H2QuorumCertificate, H2WireError> {
     })
 }
 
+/// Decodes the canonical Gov5 SSZ representation of a quorum certificate.
+///
+/// Gov5 persists `lockedQC` and `lastCommittedQC` using this exact wire
+/// representation. Exposing the bounded decoder lets the authenticated
+/// bootstrap tool consume that durable state without duplicating SSZ parsing.
+pub fn decode_h2_qc(data: &[u8]) -> Result<H2QuorumCertificate, H2WireError> {
+    decode_qc(data)
+}
+
 fn encode_qc(value: &H2QuorumCertificate) -> Result<Vec<u8>, H2WireError> {
     validate_bitmap(&value.signers_bitmap)?;
     let mut out = Vec::new();

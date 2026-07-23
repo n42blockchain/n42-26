@@ -410,7 +410,10 @@ mod tests {
         bundle.state.insert(addr, account);
 
         // Sanity: pre-roundtrip the diff sees the storage.
-        assert_eq!(StateDiff::from_bundle_state(&bundle).total_storage_changes(), 2);
+        assert_eq!(
+            StateDiff::from_bundle_state(&bundle).total_storage_changes(),
+            2
+        );
 
         // Round-trip through serde_json, as the compact-block broadcast does.
         let json = serde_json::to_vec(&bundle).expect("BundleState should serialize");
@@ -424,8 +427,14 @@ mod tests {
             "storage changes must survive the serde_json round-trip"
         );
         let account_diff = diff.accounts.get(&addr).expect("account should be present");
-        assert_eq!(account_diff.storage.get(&U256::from(0)).unwrap().to, U256::from(99));
-        assert_eq!(account_diff.storage.get(&U256::from(7)).unwrap().from, U256::from(5));
+        assert_eq!(
+            account_diff.storage.get(&U256::from(0)).unwrap().to,
+            U256::from(99)
+        );
+        assert_eq!(
+            account_diff.storage.get(&U256::from(7)).unwrap().from,
+            U256::from(5)
+        );
     }
 
     #[test]

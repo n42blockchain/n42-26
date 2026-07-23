@@ -13,7 +13,10 @@ use std::collections::BTreeMap;
 use std::time::Instant;
 
 fn env_usize(k: &str, d: usize) -> usize {
-    std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+    std::env::var(k)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(d)
 }
 
 fn addr_of(i: usize) -> Address {
@@ -37,7 +40,10 @@ fn block_diff(start: usize, count: usize, with_storage: bool) -> StateDiff {
             addr_of(i),
             AccountDiff {
                 change_type: AccountChangeType::Created,
-                balance: Some(ValueChange::new(U256::ZERO, U256::from(1_000u64 + i as u64))),
+                balance: Some(ValueChange::new(
+                    U256::ZERO,
+                    U256::from(1_000u64 + i as u64),
+                )),
                 nonce: Some(ValueChange::new(0, 1)),
                 code_change: None,
                 storage,
@@ -79,7 +85,10 @@ fn main() {
     let secs = start.elapsed().as_secs_f64();
 
     println!("=== TwigState (StateDiff node path) ===");
-    println!("accounts:  {n} (+{} storage ops) in blocks of {block}", total_ops - n);
+    println!(
+        "accounts:  {n} (+{} storage ops) in blocks of {block}",
+        total_ops - n
+    );
     println!(
         "apply:     {secs:.2}s  ({:.0} ops/s incl key derivation + encode + root)",
         total_ops as f64 / secs

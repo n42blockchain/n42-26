@@ -115,7 +115,10 @@ where
                 .storage_ref(address, index)
                 .map_err(|e| ParallelDbError(e.to_string()))?,
         };
-        self.record_read(LocationKey::Storage(address, index), ReadValue::Storage(value));
+        self.record_read(
+            LocationKey::Storage(address, index),
+            ReadValue::Storage(value),
+        );
         Ok(value)
     }
 

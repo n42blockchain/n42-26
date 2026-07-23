@@ -1,4 +1,5 @@
 use crate::consensus_state::{AttestationRecord, EquivocationEvidence, SharedConsensusState};
+use crate::qmdb_state_root::Gov5QmdbStateRootStore;
 use crate::staking::{
     MIN_STAKE_WEI, STAKING_ADDRESS, StakeStatus, StakingManager, UNSTAKE_COOLDOWN_BLOCKS,
 };
@@ -168,6 +169,35 @@ pub struct ZkStatusResponse {
     pub in_progress: usize,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QmdbArchiveStateResponse {
+    pub block_hash: String,
+    pub root: String,
+    pub next_slot: u64,
+    pub live_entries: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QmdbArchiveInfoResponse {
+    pub archive_floor: u64,
+    pub archive_floor_hash: String,
+    pub archive_floor_root: String,
+    pub retained_blocks: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QmdbArchiveProofResponse {
+    pub block_hash: String,
+    pub root: String,
+    pub key: String,
+    pub value: String,
+    pub slot: u64,
+    pub proof_hex: String,
+}
+
 /// N42-specific RPC API.
 #[rpc(server, namespace = "n42")]
 pub trait N42Api {
@@ -245,6 +275,22 @@ pub trait N42Api {
     #[method(name = "jmtVersion")]
     async fn jmt_version(&self) -> RpcResult<u64>;
 
+    /// Returns the immutable replay-v2 QMDB archive floor and retained range size.
+    #[method(name = "qmdbArchiveInfo")]
+    async fn qmdb_archive_info(&self) -> RpcResult<QmdbArchiveInfoResponse>;
+
+    /// Returns an immutable replay-v2 QMDB snapshot summary at an exact retained block.
+    #[method(name = "qmdbArchiveState")]
+    async fn qmdb_archive_state(&self, block_hash: B256) -> RpcResult<QmdbArchiveStateResponse>;
+
+    /// Returns a gov5-compatible replay-v2 QMDB membership proof at an exact retained block.
+    #[method(name = "qmdbArchiveProof")]
+    async fn qmdb_archive_proof(
+        &self,
+        block_hash: B256,
+        key: B256,
+    ) -> RpcResult<QmdbArchiveProofResponse>;
+
     /// Returns the ZK proof for a given block number.
     #[method(name = "zkProof")]
     async fn zk_proof(&self, block_number: u64) -> RpcResult<ZkProofResponse>;
@@ -291,6 +337,7 @@ pub struct N42RpcServer {
     jmt: Option<Arc<Mutex<PersistentSbmt>>>,
     twig: Option<Arc<Mutex<PersistentTwig>>>,
     zk_scheduler: Option<Arc<ProofScheduler>>,
+    qmdb_archive: Option<(u64, Arc<Gov5QmdbStateRootStore>)>,
     admin_token: Option<String>,
 }
 
@@ -302,6 +349,7 @@ impl N42RpcServer {
             jmt: None,
             twig: None,
             zk_scheduler: None,
+            qmdb_archive: None,
             admin_token: None,
         }
     }
@@ -323,6 +371,15 @@ impl N42RpcServer {
 
     pub fn with_zk_scheduler(mut self, scheduler: Arc<ProofScheduler>) -> Self {
         self.zk_scheduler = Some(scheduler);
+        self
+    }
+
+    pub fn with_qmdb_archive(
+        mut self,
+        archive_floor: u64,
+        store: Arc<Gov5QmdbStateRootStore>,
+    ) -> Self {
+        self.qmdb_archive = Some((archive_floor, store));
         self
     }
 
@@ -718,6 +775,126 @@ impl N42ApiServer for N42RpcServer {
             .lock()
             .map_err(|_| ErrorObjectOwned::owned(-32603, "JMT lock poisoned", None::<()>))?;
         Ok(tree.version())
+    }
+
+    async fn qmdb_archive_info(&self) -> RpcResult<QmdbArchiveInfoResponse> {
+        let (archive_floor, store) = self.qmdb_archive.as_ref().ok_or_else(|| {
+            ErrorObjectOwned::owned(
+                -32001,
+                "replay-v2 QMDB archive is not enabled on this node",
+                None::<()>,
+            )
+        })?;
+        let retained_blocks = store.retained_block_count().map_err(|error| {
+            ErrorObjectOwned::owned(
+                -32603,
+                format!("QMDB archive inventory failed: {error}"),
+                None::<()>,
+            )
+        })?;
+        Ok(QmdbArchiveInfoResponse {
+            archive_floor: *archive_floor,
+            archive_floor_hash: format!("{}", store.base_block_hash()),
+            archive_floor_root: format!("{}", store.base_root()),
+            retained_blocks,
+        })
+    }
+
+    async fn qmdb_archive_state(&self, block_hash: B256) -> RpcResult<QmdbArchiveStateResponse> {
+        let (_, store) = self.qmdb_archive.as_ref().ok_or_else(|| {
+            ErrorObjectOwned::owned(
+                -32001,
+                "replay-v2 QMDB archive is not enabled on this node",
+                None::<()>,
+            )
+        })?;
+        let snapshot = store
+            .snapshot_for(block_hash)
+            .map_err(|error| {
+                ErrorObjectOwned::owned(
+                    -32603,
+                    format!("QMDB archive reconstruction failed: {error}"),
+                    None::<()>,
+                )
+            })?
+            .ok_or_else(|| {
+                ErrorObjectOwned::owned(
+                    -32001,
+                    format!("QMDB archive block is below the floor or not retained: {block_hash}"),
+                    None::<()>,
+                )
+            })?;
+        let root = store
+            .root_for(block_hash)
+            .map_err(|error| {
+                ErrorObjectOwned::owned(
+                    -32603,
+                    format!("QMDB archive root lookup failed: {error}"),
+                    None::<()>,
+                )
+            })?
+            .expect("a reconstructed retained block has a root");
+        Ok(QmdbArchiveStateResponse {
+            block_hash: format!("{block_hash}"),
+            root: format!("{root}"),
+            next_slot: snapshot.next_slot,
+            live_entries: snapshot.entries.iter().filter(|entry| entry.active).count(),
+        })
+    }
+
+    async fn qmdb_archive_proof(
+        &self,
+        block_hash: B256,
+        key: B256,
+    ) -> RpcResult<QmdbArchiveProofResponse> {
+        let (_, store) = self.qmdb_archive.as_ref().ok_or_else(|| {
+            ErrorObjectOwned::owned(
+                -32001,
+                "replay-v2 QMDB archive is not enabled on this node",
+                None::<()>,
+            )
+        })?;
+        let proof = store
+            .proof_for(block_hash, key.0)
+            .map_err(|error| {
+                ErrorObjectOwned::owned(
+                    -32603,
+                    format!("QMDB archive proof reconstruction failed: {error}"),
+                    None::<()>,
+                )
+            })?
+            .ok_or_else(|| {
+                ErrorObjectOwned::owned(
+                    -32001,
+                    "QMDB archive block is unavailable or key is absent",
+                    None::<()>,
+                )
+            })?;
+        let root = store
+            .root_for(block_hash)
+            .map_err(|error| {
+                ErrorObjectOwned::owned(
+                    -32603,
+                    format!("QMDB archive root lookup failed: {error}"),
+                    None::<()>,
+                )
+            })?
+            .expect("a proven retained block has a root");
+        let proof_hex = hex::encode(proof.encode().map_err(|error| {
+            ErrorObjectOwned::owned(
+                -32603,
+                format!("QMDB archive proof encoding failed: {error}"),
+                None::<()>,
+            )
+        })?);
+        Ok(QmdbArchiveProofResponse {
+            block_hash: format!("{block_hash}"),
+            root: format!("{root}"),
+            key: format!("{key}"),
+            value: hex::encode(&proof.value),
+            slot: proof.slot,
+            proof_hex,
+        })
     }
 
     async fn twig_root(&self) -> RpcResult<TwigRootResponse> {

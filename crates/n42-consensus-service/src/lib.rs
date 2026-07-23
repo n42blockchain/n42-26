@@ -9,6 +9,7 @@
 //! execution-domain type deps. See `docs/task-caplin-stage6-clean-extraction.md`.
 
 pub mod blob_port;
+pub mod bootstrap;
 pub mod consensus_state;
 pub mod el;
 pub mod epoch_schedule;
@@ -30,6 +31,16 @@ pub use replay_import::{
     build_replay_execution_plan_with_profile,
 };
 pub use validator_peers::expected_validator_peer_ids_with_policy;
+
+/// Deterministic process-crash hook used only by the disposable production
+/// qualification matrix. It is inert unless an operator explicitly sets the
+/// exact point in `N42_QUALIFICATION_ABORT_AT`.
+pub(crate) fn qualification_abort_at(point: &str) {
+    if std::env::var("N42_QUALIFICATION_ABORT_AT").ok().as_deref() == Some(point) {
+        eprintln!("N42_QUALIFICATION_ABORT_AT={point}: aborting after durable boundary");
+        std::process::abort();
+    }
+}
 
 /// Returns the current wall-clock time in milliseconds since the Unix epoch.
 /// Shared utility used by the orchestrator.

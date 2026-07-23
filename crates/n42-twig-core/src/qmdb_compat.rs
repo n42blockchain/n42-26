@@ -76,7 +76,7 @@ pub fn encode_gov5_account_value(nonce: u64, balance: &[u8; 32], code_hash: &Has
 }
 
 /// One deterministic QMDB mutation. `None` deactivates the current live slot for `key`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct QmdbOperation {
     pub key: Hash,
     pub value: Option<Vec<u8>>,
@@ -595,6 +595,41 @@ pub enum QmdbProofCodecError {
 }
 
 impl QmdbProof {
+    /// Encode the exact v2 proof layout consumed by gov5 and [`Self::decode`].
+    pub fn encode(&self) -> Result<Vec<u8>, QmdbProofCodecError> {
+        if self.upper_path.len() > MAX_UPPER_PATH {
+            return Err(QmdbProofCodecError::UpperPathTooLong(self.upper_path.len()));
+        }
+        let value_len = u32::try_from(self.value.len())
+            .map_err(|_| QmdbProofCodecError::ValueLengthOverflow)?;
+        let mut out = Vec::with_capacity(
+            1 + 32
+                + 8
+                + 1
+                + TWIG_HEIGHT * 32
+                + BITS_BYTES
+                + 1
+                + self.upper_path.len() * 32
+                + 4
+                + self.value.len(),
+        );
+        out.push(PROOF_CODEC_VERSION);
+        out.extend_from_slice(&self.key);
+        out.extend_from_slice(&self.slot.to_le_bytes());
+        out.push(TWIG_HEIGHT as u8);
+        for sibling in &self.twig_path {
+            out.extend_from_slice(sibling);
+        }
+        out.extend_from_slice(&self.active_bits);
+        out.push(self.upper_path.len() as u8);
+        for sibling in &self.upper_path {
+            out.extend_from_slice(sibling);
+        }
+        out.extend_from_slice(&value_len.to_le_bytes());
+        out.extend_from_slice(&self.value);
+        Ok(out)
+    }
+
     /// Decode the exact v2 proof layout emitted by gov5 `qmdb.Proof.Marshal`.
     /// The transport envelope (SSZ/snappy/RPC) is intentionally outside this
     /// low-level verifier.
@@ -835,6 +870,45 @@ impl QmdbCompatTree {
         self.index
             .get(key)
             .map(|slot| self.entries[*slot as usize].value.as_slice())
+    }
+
+    /// Generate a gov5-compatible membership proof for an active key.
+    pub fn prove(&self, key: &Hash) -> Option<QmdbProof> {
+        let slot = *self.index.get(key)?;
+        let twig_id = slot as usize / TWIG_SIZE;
+        let local = slot as usize % TWIG_SIZE;
+        let twig = &self.twigs[twig_id];
+
+        let mut twig_path = [NULL_HASH; TWIG_HEIGHT];
+        let mut node = TWIG_SIZE + local;
+        for sibling in &mut twig_path {
+            *sibling = twig.nodes[node ^ 1];
+            node >>= 1;
+        }
+
+        let cap = self.twigs.len().next_power_of_two();
+        let mut upper = vec![NULL_HASH; cap * 2];
+        for (index, twig) in self.twigs.iter().enumerate() {
+            upper[cap + index] = twig.root;
+        }
+        for index in (1..cap).rev() {
+            upper[index] = hash_node(&upper[index * 2], &upper[index * 2 + 1]);
+        }
+        let mut upper_path = Vec::with_capacity(cap.trailing_zeros() as usize);
+        let mut upper_node = cap + twig_id;
+        while upper_node > 1 {
+            upper_path.push(upper[upper_node ^ 1]);
+            upper_node >>= 1;
+        }
+
+        Some(QmdbProof {
+            key: *key,
+            value: self.entries[slot as usize].value.clone(),
+            slot,
+            twig_path,
+            active_bits: twig.bits,
+            upper_path,
+        })
     }
 
     /// Append a new frozen leaf, deactivating an earlier live slot for `key`.
@@ -1496,5 +1570,24 @@ mod tests {
             QmdbProof::decode(&encoded),
             Err(QmdbProofCodecError::TrailingBytes(1))
         ));
+    }
+
+    #[test]
+    fn generated_proof_roundtrips_exact_codec_and_root() {
+        let mut tree = QmdbCompatTree::new();
+        let indexed_key = |index: u64| {
+            let mut out = [0_u8; 32];
+            out[..8].copy_from_slice(&index.to_le_bytes());
+            out
+        };
+        for index in 0..(TWIG_SIZE + 3) {
+            tree.set(indexed_key(index as u64), index.to_le_bytes().to_vec());
+        }
+        let query = indexed_key((TWIG_SIZE + 1) as u64);
+        let proof = tree.prove(&query).expect("active key has proof");
+        assert!(proof.verify_for_key(&tree.root(), &query));
+        let encoded = proof.encode().unwrap();
+        assert_eq!(QmdbProof::decode(&encoded).unwrap(), proof);
+        assert!(tree.prove(&indexed_key(u64::MAX)).is_none());
     }
 }

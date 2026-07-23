@@ -25,6 +25,10 @@ pub fn compact_block_enabled() -> bool {
     })
 }
 
+fn should_broadcast_execution_output(h2_v4_participant: bool) -> bool {
+    compact_block_enabled() && !h2_v4_participant
+}
+
 fn elapsed_since_unix_ms(start_ms: u64) -> Option<u64> {
     (start_ms > 0).then(|| now_unix_ms().saturating_sub(start_ms))
 }
@@ -148,6 +152,27 @@ impl ConsensusService {
                 current_view = build_context.view, "build already in progress on this parent, skipping");
             return;
         }
+        if self.engine.last_voted_view() >= build_context.view {
+            debug!(
+                target: "n42::cl::exec_bridge",
+                view = build_context.view,
+                last_voted_view = self.engine.last_voted_view(),
+                %parent,
+                "leader already released a proposal/vote for this view; suppressing duplicate build"
+            );
+            self.next_build_at = None;
+            self.next_slot_timestamp = None;
+            self.clear_leader_build_wait();
+            return;
+        }
+
+        // This build supersedes any retry timer left behind by an earlier FCU
+        // Syncing result. Catch-up completion can invoke this method before that
+        // timer fires; leaving it armed would build a second child after the first
+        // proposal has already been released.
+        self.next_build_at = None;
+        self.next_slot_timestamp = None;
+        self.clear_leader_build_wait();
         let build_start = Instant::now();
         let pool_depth = self.pool_depth_snapshot();
         let view = build_context.view;
@@ -952,6 +977,7 @@ impl ConsensusService {
         }
 
         self.advance_execution_validated_head(broadcast.view, broadcast.block_hash, "sync import");
+        crate::qualification_abort_at("execution_validated");
         self.complete_deferred_finalization(broadcast).await;
 
         if let Err(e) = self
@@ -1241,10 +1267,30 @@ async fn handle_built_payload(
         mut execution_data,
         blob_tx_hashes,
     } = built;
+    let original_hash = hash;
     if h2_v4_participant {
+        let original_parent = execution_data.parent_hash();
+        let (gov5_state_root, gov5_receipts_root, _execution_output) = match exec_output_cache
+            .as_ref()
+            .and_then(|cache| cache.take_gov5_normalization(original_hash, original_parent))
+        {
+            Some(cached) => cached,
+            None => {
+                error!(
+                    target: "n42::interop::h2v4",
+                    %original_hash,
+                    block_number,
+                    tx_count,
+                    "refusing to normalize Gov5 payload without its executed QMDB state and receipts"
+                );
+                return;
+            }
+        };
         execution_data = match n42_network::normalize_execution_payload_for_gov5_h2(
             &execution_data,
             current_view,
+            gov5_state_root,
+            gov5_receipts_root,
         ) {
             Ok(normalized) => normalized,
             Err(error) => {
@@ -1253,6 +1299,16 @@ async fn handle_built_payload(
             }
         };
         hash = execution_data.block_hash();
+        // Header normalization necessarily changes the block hash, so the
+        // builder's execution result remains keyed by a hash that can never be
+        // submitted or broadcast. Drop it before validating the normalized
+        // payload to avoid an unbounded stale-cache tail on every Rust-led
+        // Gov5 view.
+        if hash != original_hash
+            && let Some(ref cache) = exec_output_cache
+        {
+            cache.evict(original_hash);
+        }
     }
     let actual_parent = execution_data.parent_hash();
     if actual_parent != build_context.parent_hash {
@@ -1274,6 +1330,55 @@ async fn handle_built_payload(
     }
     if bad_blocks.should_skip(hash, "leader_built_payload") {
         return;
+    }
+    if h2_v4_participant {
+        let import_start = std::time::Instant::now();
+        match el.new_payload(execution_data.clone()).await {
+            Ok(status) if matches!(status.status, PayloadStatusEnum::Valid) => {
+                mark_eager_import_valid(block_guard.as_ref(), block_number);
+                info!(
+                    target: "n42::interop::h2v4",
+                    %hash,
+                    block_number,
+                    elapsed_ms = import_start.elapsed().as_millis() as u64,
+                    "validated normalized Gov5 leader payload before proposal release"
+                );
+                if eager_import_done_tx
+                    .send((hash, block_timestamp))
+                    .await
+                    .is_err()
+                {
+                    debug!(target: "n42::cl::exec_bridge", %hash, "leader eager import completion receiver dropped");
+                }
+            }
+            Ok(status) => {
+                if let Some(ref cache) = exec_output_cache {
+                    cache.evict(hash);
+                }
+                bad_blocks.insert_if_invalid(hash, &status.status, "gov5_leader_pre_proposal");
+                error!(
+                    target: "n42::interop::h2v4",
+                    %hash,
+                    block_number,
+                    status = ?status.status,
+                    "refusing to release Gov5 leader proposal before new_payload(Valid)"
+                );
+                return;
+            }
+            Err(error) => {
+                if let Some(ref cache) = exec_output_cache {
+                    cache.evict(hash);
+                }
+                error!(
+                    target: "n42::interop::h2v4",
+                    %hash,
+                    block_number,
+                    %error,
+                    "refusing to release Gov5 leader proposal after new_payload failure"
+                );
+                return;
+            }
+        }
     }
     {
         let span = tracing::Span::current();
@@ -1302,7 +1407,7 @@ async fn handle_built_payload(
     );
 
     // Compact Block: serialize execution output for followers to skip EVM re-execution.
-    let execution_output_bytes = if compact_block_enabled() {
+    let execution_output_bytes = if should_broadcast_execution_output(h2_v4_participant) {
         exec_output_cache
             .as_ref()
             .and_then(|c| c.take_serialized(hash))
@@ -1622,7 +1727,9 @@ fn broadcast_blob_sidecars(
 
 #[cfg(test)]
 mod eager_import_guard_tests {
-    use super::{eager_import_already_validated, mark_eager_import_valid};
+    use super::{
+        eager_import_already_validated, mark_eager_import_valid, should_broadcast_execution_output,
+    };
     use std::sync::atomic::AtomicU64;
 
     #[test]
@@ -1644,5 +1751,13 @@ mod eager_import_guard_tests {
         mark_eager_import_valid(&guard, 100);
         assert_eq!(eager_import_already_validated(&guard, 99), Some(100));
         assert_eq!(eager_import_already_validated(&guard, 101), None);
+    }
+
+    #[test]
+    fn normalized_gov5_payload_never_broadcasts_builder_compact_output() {
+        // Header normalization changes the block hash and selects the QMDB
+        // state-root profile. A builder-side Ethereum execution result is not
+        // valid compact data for that normalized payload.
+        assert!(!should_broadcast_execution_output(true));
     }
 }

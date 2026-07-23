@@ -155,8 +155,7 @@ mod tests {
     #[test]
     fn batch_keeps_valid_drops_invalid() {
         let keys: Vec<BlsSecretKey> = (0..5).map(|_| BlsSecretKey::random().unwrap()).collect();
-        let mut batch: Vec<Box<VerificationReceipt>> =
-            keys.iter().map(|k| receipt(k, 7)).collect();
+        let mut batch: Vec<Box<VerificationReceipt>> = keys.iter().map(|k| receipt(k, 7)).collect();
         // Corrupt one receipt's message binding (signature no longer matches).
         batch[2].block_number = 8;
         let verified = verify_batch(batch);

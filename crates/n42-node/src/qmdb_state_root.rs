@@ -8,7 +8,7 @@
 use alloy_primitives::B256;
 use alloy_rpc_types_engine::ExecutionData;
 use n42_twig_core::qmdb_compat::{
-    QmdbCompatTree, QmdbOperation, QmdbOperationError, QmdbSnapshot, QmdbSnapshotError,
+    QmdbCompatTree, QmdbOperation, QmdbOperationError, QmdbProof, QmdbSnapshot, QmdbSnapshotError,
 };
 use reth_chain_state::StateTrieOverlayManager;
 use reth_engine_tree::tree::state_root_strategy::{
@@ -23,8 +23,11 @@ use reth_node_builder::rpc::{BasicEngineValidatorBuilder, ChangesetCache, Engine
 use reth_primitives_traits::RecoveredBlock;
 use reth_provider::{BlockExecutionOutput, ProviderError, ProviderResult};
 use reth_trie::updates::TrieUpdates;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
+    io::Write,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
 
@@ -37,15 +40,24 @@ use crate::{
 /// Maximum ancestry replay accepted by the bounded interoperability strategy.
 pub const DEFAULT_QMDB_REPLAY_DEPTH: usize = 4096;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct StoredQmdbBlock {
     parent_hash: B256,
     root: B256,
     operations: Vec<QmdbOperation>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 struct QmdbBranchState {
+    blocks: HashMap<B256, StoredQmdbBlock>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistedQmdbBranchState {
+    version: u32,
+    base_block_hash: B256,
+    base_root: B256,
+    base_snapshot: QmdbSnapshot,
     blocks: HashMap<B256, StoredQmdbBlock>,
 }
 
@@ -56,6 +68,7 @@ pub struct Gov5QmdbStateRootStore {
     base_root: B256,
     base_snapshot: QmdbSnapshot,
     max_replay_depth: usize,
+    persistence_path: Option<PathBuf>,
     state: Mutex<QmdbBranchState>,
 }
 
@@ -85,6 +98,10 @@ pub enum Gov5QmdbStateRootError {
     InvalidOperations(#[from] QmdbOperationError),
     #[error("QMDB state-root store lock is poisoned")]
     LockPoisoned,
+    #[error("QMDB branch-state persistence failed: {0}")]
+    Persistence(String),
+    #[error("persisted QMDB branch state does not match the authenticated base")]
+    PersistedBaseMismatch,
 }
 
 impl Gov5QmdbStateRootStore {
@@ -120,10 +137,58 @@ impl Gov5QmdbStateRootStore {
             base_root,
             base_snapshot,
             max_replay_depth,
+            persistence_path: None,
             state: Mutex::new(QmdbBranchState {
                 blocks: HashMap::new(),
             }),
         })
+    }
+
+    /// Opens a crash-safe branch store. Existing state must be bound to the
+    /// exact authenticated base and every retained block root is replayed
+    /// before the store is accepted.
+    pub fn persistent(
+        base_block_hash: B256,
+        base_root: B256,
+        base_snapshot: QmdbSnapshot,
+        max_replay_depth: usize,
+        path: PathBuf,
+    ) -> Result<Self, Gov5QmdbStateRootError> {
+        let mut store = Self::with_max_replay_depth(
+            base_block_hash,
+            base_root,
+            base_snapshot,
+            max_replay_depth,
+        )?;
+        store.persistence_path = Some(path.clone());
+        match std::fs::read(&path) {
+            Ok(bytes) => {
+                let persisted: PersistedQmdbBranchState = bincode::deserialize(&bytes)
+                    .map_err(|error| Gov5QmdbStateRootError::Persistence(error.to_string()))?;
+                if persisted.version != 1
+                    || persisted.base_block_hash != store.base_block_hash
+                    || persisted.base_root != store.base_root
+                    || persisted.base_snapshot != store.base_snapshot
+                {
+                    return Err(Gov5QmdbStateRootError::PersistedBaseMismatch);
+                }
+                validate_persisted_blocks(
+                    store.base_block_hash,
+                    store.base_root,
+                    &store.base_snapshot,
+                    store.max_replay_depth,
+                    &persisted.blocks,
+                )?;
+                store.state = Mutex::new(QmdbBranchState {
+                    blocks: persisted.blocks,
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(Gov5QmdbStateRootError::Persistence(error.to_string()));
+            }
+        }
+        Ok(store)
     }
 
     pub const fn base_block_hash(&self) -> B256 {
@@ -134,8 +199,29 @@ impl Gov5QmdbStateRootStore {
         self.base_root
     }
 
+    pub fn retained_block_count(&self) -> Result<usize, Gov5QmdbStateRootError> {
+        Ok(self
+            .state
+            .lock()
+            .map_err(|_| Gov5QmdbStateRootError::LockPoisoned)?
+            .blocks
+            .len())
+    }
+
     /// Compute a candidate from its exact parent branch and publish its delta only after its root
     /// equals the hash-authenticated header commitment. A mismatch leaves the store unchanged.
+    pub fn compute_candidate(
+        &self,
+        parent_hash: B256,
+        operations: &[QmdbOperation],
+    ) -> Result<B256, Gov5QmdbStateRootError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| Gov5QmdbStateRootError::LockPoisoned)?;
+        self.compute_candidate_locked(&state, parent_hash, operations)
+    }
+
     pub fn compute_and_commit(
         &self,
         parent_hash: B256,
@@ -162,8 +248,49 @@ impl Gov5QmdbStateRootStore {
             };
         }
 
+        let root = self.compute_candidate_locked(&state, parent_hash, &operations)?;
+        if root != expected_root {
+            return Err(Gov5QmdbStateRootError::RootMismatch {
+                block_hash,
+                got: root,
+                expected: expected_root,
+            });
+        }
+        state.blocks.insert(
+            block_hash,
+            StoredQmdbBlock {
+                parent_hash,
+                root,
+                operations,
+            },
+        );
+        if let Err(error) = self.persist_locked(&state) {
+            state.blocks.remove(&block_hash);
+            return Err(error);
+        }
+        qualification_abort_at("qmdb_committed");
+        Ok(root)
+    }
+
+    fn compute_candidate_locked(
+        &self,
+        state: &QmdbBranchState,
+        parent_hash: B256,
+        operations: &[QmdbOperation],
+    ) -> Result<B256, Gov5QmdbStateRootError> {
+        let mut tree = self.reconstruct_tree_locked(state, parent_hash)?;
+        Ok(B256::from(
+            tree.apply_sorted_ops(operations.iter().cloned())?,
+        ))
+    }
+
+    fn reconstruct_tree_locked(
+        &self,
+        state: &QmdbBranchState,
+        block_hash: B256,
+    ) -> Result<QmdbCompatTree, Gov5QmdbStateRootError> {
         let mut lineage = Vec::new();
-        let mut cursor = parent_hash;
+        let mut cursor = block_hash;
         while cursor != self.base_block_hash {
             if lineage.len() >= self.max_replay_depth {
                 return Err(Gov5QmdbStateRootError::ReplayDepthExceeded(
@@ -189,23 +316,7 @@ impl Gov5QmdbStateRootStore {
                 });
             }
         }
-        let root = B256::from(tree.apply_sorted_ops(operations.iter().cloned())?);
-        if root != expected_root {
-            return Err(Gov5QmdbStateRootError::RootMismatch {
-                block_hash,
-                got: root,
-                expected: expected_root,
-            });
-        }
-        state.blocks.insert(
-            block_hash,
-            StoredQmdbBlock {
-                parent_hash,
-                root,
-                operations,
-            },
-        );
-        Ok(root)
+        Ok(tree)
     }
 
     pub fn contains(&self, block_hash: B256) -> Result<bool, Gov5QmdbStateRootError> {
@@ -216,6 +327,195 @@ impl Gov5QmdbStateRootStore {
             .blocks
             .contains_key(&block_hash))
     }
+
+    pub fn root_for(&self, block_hash: B256) -> Result<Option<B256>, Gov5QmdbStateRootError> {
+        if block_hash == self.base_block_hash {
+            return Ok(Some(self.base_root));
+        }
+        Ok(self
+            .state
+            .lock()
+            .map_err(|_| Gov5QmdbStateRootError::LockPoisoned)?
+            .blocks
+            .get(&block_hash)
+            .map(|block| block.root))
+    }
+
+    /// Reconstruct an immutable historical snapshot for an exact retained
+    /// block. Unknown hashes return `None`; corrupt retained ancestry fails
+    /// closed instead of serving an unauthenticated state.
+    pub fn snapshot_for(
+        &self,
+        block_hash: B256,
+    ) -> Result<Option<QmdbSnapshot>, Gov5QmdbStateRootError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| Gov5QmdbStateRootError::LockPoisoned)?;
+        if block_hash != self.base_block_hash && !state.blocks.contains_key(&block_hash) {
+            return Ok(None);
+        }
+        Ok(Some(
+            self.reconstruct_tree_locked(&state, block_hash)?.snapshot(),
+        ))
+    }
+
+    /// Generate a gov5-compatible QMDB membership proof at an exact retained
+    /// historical block. `None` covers an unknown block or an absent key.
+    pub fn proof_for(
+        &self,
+        block_hash: B256,
+        key: [u8; 32],
+    ) -> Result<Option<QmdbProof>, Gov5QmdbStateRootError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| Gov5QmdbStateRootError::LockPoisoned)?;
+        if block_hash != self.base_block_hash && !state.blocks.contains_key(&block_hash) {
+            return Ok(None);
+        }
+        Ok(self
+            .reconstruct_tree_locked(&state, block_hash)?
+            .prove(&key))
+    }
+
+    /// Returns the number of parent edges from the authenticated base to an
+    /// exact retained block. This lets restart recovery bind a QMDB-proven
+    /// side branch to its execution block number without trusting a stale
+    /// canonical hash index.
+    pub fn distance_from_base(
+        &self,
+        block_hash: B256,
+    ) -> Result<Option<usize>, Gov5QmdbStateRootError> {
+        if block_hash == self.base_block_hash {
+            return Ok(Some(0));
+        }
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| Gov5QmdbStateRootError::LockPoisoned)?;
+        let mut distance = 0usize;
+        let mut cursor = block_hash;
+        while cursor != self.base_block_hash {
+            if distance >= self.max_replay_depth {
+                return Err(Gov5QmdbStateRootError::ReplayDepthExceeded(
+                    self.max_replay_depth,
+                ));
+            }
+            let Some(block) = state.blocks.get(&cursor) else {
+                return Ok(None);
+            };
+            distance += 1;
+            cursor = block.parent_hash;
+        }
+        Ok(Some(distance))
+    }
+
+    pub fn parent_for(&self, block_hash: B256) -> Result<Option<B256>, Gov5QmdbStateRootError> {
+        if block_hash == self.base_block_hash {
+            return Ok(None);
+        }
+        Ok(self
+            .state
+            .lock()
+            .map_err(|_| Gov5QmdbStateRootError::LockPoisoned)?
+            .blocks
+            .get(&block_hash)
+            .map(|block| block.parent_hash))
+    }
+
+    fn persist_locked(&self, state: &QmdbBranchState) -> Result<(), Gov5QmdbStateRootError> {
+        let Some(path) = &self.persistence_path else {
+            return Ok(());
+        };
+        let persisted = PersistedQmdbBranchState {
+            version: 1,
+            base_block_hash: self.base_block_hash,
+            base_root: self.base_root,
+            base_snapshot: self.base_snapshot.clone(),
+            blocks: state.blocks.clone(),
+        };
+        let bytes = bincode::serialize(&persisted)
+            .map_err(|error| Gov5QmdbStateRootError::Persistence(error.to_string()))?;
+        atomic_write(path, &bytes)
+    }
+}
+
+fn qualification_abort_at(point: &str) {
+    if std::env::var("N42_QUALIFICATION_ABORT_AT").ok().as_deref() == Some(point) {
+        eprintln!("N42_QUALIFICATION_ABORT_AT={point}: aborting after durable boundary");
+        std::process::abort();
+    }
+}
+
+fn validate_persisted_blocks(
+    base_block_hash: B256,
+    base_root: B256,
+    base_snapshot: &QmdbSnapshot,
+    max_replay_depth: usize,
+    blocks: &HashMap<B256, StoredQmdbBlock>,
+) -> Result<(), Gov5QmdbStateRootError> {
+    let mut validated = HashMap::from([(base_block_hash, base_root)]);
+    let mut pending: Vec<_> = blocks.keys().copied().collect();
+    for _ in 0..=blocks.len() {
+        let before = pending.len();
+        pending.retain(|hash| {
+            let block = &blocks[hash];
+            let Some(_) = validated.get(&block.parent_hash) else {
+                return true;
+            };
+            let mut lineage = Vec::new();
+            let mut cursor = *hash;
+            while cursor != base_block_hash {
+                if lineage.len() >= max_replay_depth {
+                    return true;
+                }
+                let Some(stored) = blocks.get(&cursor) else {
+                    return true;
+                };
+                lineage.push((cursor, stored));
+                cursor = stored.parent_hash;
+            }
+            let Ok(mut tree) = QmdbCompatTree::from_snapshot(base_snapshot) else {
+                return true;
+            };
+            for (lineage_hash, stored) in lineage.into_iter().rev() {
+                let Ok(root) = tree.apply_sorted_ops(stored.operations.iter().cloned()) else {
+                    return true;
+                };
+                if B256::from(root) != stored.root {
+                    return true;
+                }
+                validated.insert(lineage_hash, stored.root);
+            }
+            false
+        });
+        if pending.is_empty() {
+            return Ok(());
+        }
+        if pending.len() == before {
+            break;
+        }
+    }
+    Err(Gov5QmdbStateRootError::Persistence(format!(
+        "{} retained QMDB blocks have missing ancestry, excessive depth, or divergent roots",
+        pending.len()
+    )))
+}
+
+fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), Gov5QmdbStateRootError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| Gov5QmdbStateRootError::Persistence(error.to_string()))?;
+    }
+    let tmp = path.with_extension("tmp");
+    let mut file = std::fs::File::create(&tmp)
+        .map_err(|error| Gov5QmdbStateRootError::Persistence(error.to_string()))?;
+    file.write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|error| Gov5QmdbStateRootError::Persistence(error.to_string()))?;
+    std::fs::rename(&tmp, path)
+        .map_err(|error| Gov5QmdbStateRootError::Persistence(error.to_string()))
 }
 
 /// Reth 2.4.1 Engine Tree strategy that replaces only state-root computation. Execution itself,
@@ -395,6 +695,14 @@ mod tests {
         let (store, snapshot) = store();
         let block = B256::repeat_byte(0x20);
         let operations = vec![operation(2, 2)];
+        let expected = expected_root(&snapshot, std::slice::from_ref(&operations));
+        assert_eq!(
+            store
+                .compute_candidate(store.base_block_hash(), &operations)
+                .unwrap(),
+            expected
+        );
+        assert!(!store.contains(block).unwrap());
         assert!(matches!(
             store.compute_and_commit(
                 store.base_block_hash(),
@@ -406,7 +714,6 @@ mod tests {
         ));
         assert!(!store.contains(block).unwrap());
 
-        let expected = expected_root(&snapshot, std::slice::from_ref(&operations));
         assert_eq!(
             store
                 .compute_and_commit(store.base_block_hash(), block, expected, operations)
@@ -441,7 +748,55 @@ mod tests {
                 .unwrap(),
             child_root
         );
+        assert_eq!(
+            store.distance_from_base(store.base_block_hash()).unwrap(),
+            Some(0)
+        );
+        assert_eq!(store.distance_from_base(left).unwrap(), Some(1));
+        assert_eq!(store.distance_from_base(child).unwrap(), Some(2));
+        assert_eq!(store.parent_for(child).unwrap(), Some(left));
+        assert_eq!(store.parent_for(store.base_block_hash()).unwrap(), None);
+        assert_eq!(
+            store.distance_from_base(B256::repeat_byte(0xFE)).unwrap(),
+            None
+        );
         assert_ne!(left_root, right_root);
+    }
+
+    #[test]
+    fn historical_snapshot_and_proof_are_bound_to_exact_block() {
+        let (store, snapshot) = store();
+        let first = B256::repeat_byte(0x61);
+        let second = B256::repeat_byte(0x62);
+        let first_ops = vec![operation(2, 2)];
+        let second_ops = vec![operation(2, 3), operation(3, 3)];
+        let first_root = expected_root(&snapshot, std::slice::from_ref(&first_ops));
+        let second_root = expected_root(&snapshot, &[first_ops.clone(), second_ops.clone()]);
+        store
+            .compute_and_commit(store.base_block_hash(), first, first_root, first_ops)
+            .unwrap();
+        store
+            .compute_and_commit(first, second, second_root, second_ops)
+            .unwrap();
+
+        let first_snapshot = store.snapshot_for(first).unwrap().unwrap();
+        let first_tree = QmdbCompatTree::from_snapshot(&first_snapshot).unwrap();
+        assert_eq!(B256::from(first_tree.root()), first_root);
+        assert_eq!(first_tree.get(&[2; 32]), Some([2].as_slice()));
+
+        let first_proof = store.proof_for(first, [2; 32]).unwrap().unwrap();
+        assert!(first_proof.verify_for_key(first_root.as_ref(), &[2; 32]));
+        assert_eq!(first_proof.value, vec![2]);
+        let second_proof = store.proof_for(second, [2; 32]).unwrap().unwrap();
+        assert!(second_proof.verify_for_key(second_root.as_ref(), &[2; 32]));
+        assert_eq!(second_proof.value, vec![3]);
+        assert!(store.proof_for(first, [3; 32]).unwrap().is_none());
+        assert!(
+            store
+                .snapshot_for(B256::repeat_byte(0xff))
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -491,5 +846,47 @@ mod tests {
             ),
             Err(Gov5QmdbStateRootError::ReplayDepthExceeded(1))
         ));
+    }
+
+    #[test]
+    fn persistent_store_replays_and_rejects_wrong_base() {
+        let (store, snapshot) = store();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("branches.bin");
+        let persistent = Gov5QmdbStateRootStore::persistent(
+            store.base_block_hash(),
+            store.base_root(),
+            snapshot.clone(),
+            8,
+            path.clone(),
+        )
+        .unwrap();
+        let block = B256::repeat_byte(0x51);
+        let operations = vec![operation(7, 7)];
+        let root = expected_root(&snapshot, std::slice::from_ref(&operations));
+        persistent
+            .compute_and_commit(persistent.base_block_hash(), block, root, operations)
+            .unwrap();
+
+        let reopened = Gov5QmdbStateRootStore::persistent(
+            store.base_block_hash(),
+            store.base_root(),
+            snapshot.clone(),
+            8,
+            path.clone(),
+        )
+        .unwrap();
+        assert_eq!(reopened.root_for(block).unwrap(), Some(root));
+        assert_eq!(
+            Gov5QmdbStateRootStore::persistent(
+                B256::repeat_byte(0xff),
+                store.base_root(),
+                snapshot,
+                8,
+                path,
+            )
+            .unwrap_err(),
+            Gov5QmdbStateRootError::PersistedBaseMismatch
+        );
     }
 }

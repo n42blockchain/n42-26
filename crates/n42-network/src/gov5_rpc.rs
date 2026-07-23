@@ -14,12 +14,94 @@ pub const GOV5_BLOCK_BY_HASH_PROTOCOL: &str = "/rpc/block_by_hash/1/ssz_snappy";
 /// Gov5's periodic chain-status handshake.
 pub const GOV5_STATUS_PROTOCOL: &str = "/rpc/status/1/ssz_snappy";
 
+/// Gov5's one-way Rotor/leader-direct HotStuff stream.
+pub const GOV5_HOTSTUFF_DIRECT_PROTOCOL: &str = "/rpc/hotstuff_direct/1";
+
 const MAX_GOV5_BLOCK_SIZE: usize = 1 << 20;
 const MAX_SNAPPY_FRAME_SIZE: usize = MAX_GOV5_BLOCK_SIZE + (MAX_GOV5_BLOCK_SIZE / 6) + 1024;
+const MAX_GOV5_HOTSTUFF_SIZE: usize = 16 * 1024;
+
+#[derive(Clone, Debug)]
+pub struct Gov5HotstuffDirectRequest {
+    /// Exact raw-Snappy canonical Gov5 consensus gossip payload.
+    pub data: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Gov5HotstuffDirectResponse;
+
+#[derive(Clone, Debug, Default)]
+pub struct Gov5HotstuffDirectCodec;
+
+#[async_trait::async_trait]
+impl request_response::Codec for Gov5HotstuffDirectCodec {
+    type Protocol = StreamProtocol;
+    type Request = Gov5HotstuffDirectRequest;
+    type Response = Gov5HotstuffDirectResponse;
+
+    async fn read_request<T>(&mut self, _: &StreamProtocol, io: &mut T) -> io::Result<Self::Request>
+    where
+        T: AsyncRead + Unpin + Send,
+    {
+        Ok(Gov5HotstuffDirectRequest {
+            data: read_bounded(io, MAX_GOV5_HOTSTUFF_SIZE).await?,
+        })
+    }
+
+    async fn read_response<T>(
+        &mut self,
+        _: &StreamProtocol,
+        io: &mut T,
+    ) -> io::Result<Self::Response>
+    where
+        T: AsyncRead + Unpin + Send,
+    {
+        let response = read_bounded(io, 0).await?;
+        if !response.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Gov5 HotStuff direct response is not empty",
+            ));
+        }
+        Ok(Gov5HotstuffDirectResponse)
+    }
+
+    async fn write_request<T>(
+        &mut self,
+        _: &StreamProtocol,
+        io: &mut T,
+        request: Self::Request,
+    ) -> io::Result<()>
+    where
+        T: AsyncWrite + Unpin + Send,
+    {
+        if request.data.len() > MAX_GOV5_HOTSTUFF_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Gov5 HotStuff direct request exceeds size limit",
+            ));
+        }
+        io.write_all(&request.data).await?;
+        io.close().await
+    }
+
+    async fn write_response<T>(
+        &mut self,
+        _: &StreamProtocol,
+        io: &mut T,
+        _: Self::Response,
+    ) -> io::Result<()>
+    where
+        T: AsyncWrite + Unpin + Send,
+    {
+        io.close().await
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct Gov5BlockPushRequest {
     pub rlp: Vec<u8>,
+    pub fork_digest: [u8; 4],
 }
 
 #[derive(Clone, Debug, Default)]
@@ -318,6 +400,26 @@ fn decode_chunked_block(encoded: &[u8]) -> io::Result<Vec<u8>> {
     Ok(decoded)
 }
 
+fn encode_chunked_block(rlp: &[u8], fork_digest: [u8; 4]) -> io::Result<Vec<u8>> {
+    if rlp.len() > MAX_GOV5_BLOCK_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "gov5 RPC block exceeds encoded size limit",
+        ));
+    }
+
+    let mut frame = FrameEncoder::new(Vec::new());
+    frame.write_all(rlp)?;
+    let compressed = frame.into_inner().map_err(io::Error::other)?;
+
+    let mut encoded = Vec::with_capacity(5 + 10 + compressed.len());
+    encoded.push(0);
+    encoded.extend_from_slice(&fork_digest);
+    encode_uvarint(rlp.len(), &mut encoded);
+    encoded.extend_from_slice(&compressed);
+    Ok(encoded)
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Gov5BlockPushCodec;
 
@@ -336,8 +438,18 @@ impl request_response::Codec for Gov5BlockPushCodec {
         T: AsyncRead + Unpin + Send,
     {
         let encoded = read_bounded(io, MAX_SNAPPY_FRAME_SIZE).await?;
+        let fork_digest = encoded
+            .get(1..5)
+            .and_then(|bytes| bytes.try_into().ok())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "gov5 block push is missing fork digest",
+                )
+            })?;
         Ok(Gov5BlockPushRequest {
             rlp: decode_chunked_block(&encoded)?,
+            fork_digest,
         })
     }
 
@@ -355,13 +467,16 @@ impl request_response::Codec for Gov5BlockPushCodec {
     async fn write_request<T>(
         &mut self,
         _protocol: &Self::Protocol,
-        _io: &mut T,
-        _request: Self::Request,
+        io: &mut T,
+        request: Self::Request,
     ) -> io::Result<()>
     where
         T: AsyncWrite + Unpin + Send,
     {
-        Ok(())
+        // Gov5 treats block-push as a one-way stream carrying its normal
+        // chunked-block response shape.
+        io.write_all(&encode_chunked_block(&request.rlp, request.fork_digest)?)
+            .await
     }
 
     async fn write_response<T>(
@@ -430,13 +545,24 @@ impl request_response::Codec for Gov5BlockByHashCodec {
     async fn write_response<T>(
         &mut self,
         _protocol: &Self::Protocol,
-        _io: &mut T,
-        _response: Self::Response,
+        io: &mut T,
+        response: Self::Response,
     ) -> io::Result<()>
     where
         T: AsyncWrite + Unpin + Send,
     {
-        Ok(())
+        if response.rlp.is_empty() {
+            // Gov5's first response byte is its RPC status. A non-zero status
+            // makes a cache miss fail closed instead of looking like a valid
+            // zero-length block.
+            io.write_all(&[1]).await
+        } else {
+            // Rust readers validate the block hash after decoding, so a zero
+            // digest is sufficient for the Rust-to-Rust recovery path. Gov5
+            // does not currently request blocks from Rust over this protocol.
+            io.write_all(&encode_chunked_block(&response.rlp, [0; 4])?)
+                .await
+        }
     }
 }
 
@@ -507,6 +633,7 @@ impl request_response::Codec for Gov5StatusCodec {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use libp2p::request_response::Codec;
     use std::{pin::Pin, task::Poll};
 
     struct NoEof {
@@ -601,6 +728,63 @@ mod tests {
             decode_chunked_block(&chunk(b"block-rlp")).unwrap(),
             b"block-rlp"
         );
+    }
+
+    #[test]
+    fn gov5_chunked_block_encoding_roundtrips() {
+        let encoded = encode_chunked_block(b"block-rlp", [1, 2, 3, 4]).unwrap();
+        assert_eq!(&encoded[..5], &[0, 1, 2, 3, 4]);
+        assert_eq!(decode_chunked_block(&encoded).unwrap(), b"block-rlp");
+    }
+
+    #[test]
+    fn block_by_hash_response_roundtrips_and_cache_miss_fails_closed() {
+        let protocol = StreamProtocol::new(GOV5_BLOCK_BY_HASH_PROTOCOL);
+        let mut writer = futures::io::Cursor::new(Vec::new());
+        futures::executor::block_on(Gov5BlockByHashCodec.write_response(
+            &protocol,
+            &mut writer,
+            Gov5BlockByHashResponse {
+                rlp: b"block-rlp".to_vec(),
+            },
+        ))
+        .unwrap();
+        assert_eq!(
+            decode_chunked_block(&writer.into_inner()).unwrap(),
+            b"block-rlp"
+        );
+
+        let mut miss = futures::io::Cursor::new(Vec::new());
+        futures::executor::block_on(Gov5BlockByHashCodec.write_response(
+            &protocol,
+            &mut miss,
+            Gov5BlockByHashResponse { rlp: Vec::new() },
+        ))
+        .unwrap();
+        assert!(decode_chunked_block(&miss.into_inner()).is_err());
+    }
+
+    #[test]
+    fn hotstuff_direct_codec_preserves_exact_one_way_payload() {
+        let protocol = StreamProtocol::new(GOV5_HOTSTUFF_DIRECT_PROTOCOL);
+        let payload = vec![0xff, 0x06, 0, 0, 0, 0x42, 0x24];
+        let mut writer = futures::io::Cursor::new(Vec::new());
+        futures::executor::block_on(Gov5HotstuffDirectCodec.write_request(
+            &protocol,
+            &mut writer,
+            Gov5HotstuffDirectRequest {
+                data: payload.clone(),
+            },
+        ))
+        .unwrap();
+        assert_eq!(writer.into_inner(), payload);
+
+        let mut reader = futures::io::Cursor::new(payload.clone());
+        let decoded = futures::executor::block_on(
+            Gov5HotstuffDirectCodec.read_request(&protocol, &mut reader),
+        )
+        .unwrap();
+        assert_eq!(decoded.data, payload);
     }
 
     #[test]

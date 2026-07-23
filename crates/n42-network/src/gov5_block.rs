@@ -30,10 +30,30 @@ pub enum Gov5BlockError {
 
 const GOV5_H2_SEAL_BYTES: usize = 96;
 
+/// Returns the consensus view committed into a validated Gov5 H2 header.
+///
+/// Live Gov5 views are not block numbers: timeout views create gaps. Callers
+/// walking an authenticated parent chain must therefore read this value from
+/// each header instead of deriving `parent_view = child_view - 1`.
+pub fn gov5_header_view(header: &Header) -> Result<u64, Gov5BlockError> {
+    let encoded = header.extra_data.as_ref();
+    if encoded.len() < 12 || &encoded[..4] != b"N42H" {
+        return Err(Gov5BlockError::HeaderProfile(
+            "missing canonical N42H view prefix".to_owned(),
+        ));
+    }
+    Ok(u64::from_le_bytes(
+        encoded[4..12]
+            .try_into()
+            .expect("length checked before fixed-width conversion"),
+    ))
+}
+
 /// Converts a standard locally built Engine payload into the live gov5 H2
-/// header shape. The execution body and roots are unchanged; only fields that
-/// Engine payloads cannot express (`ommers_hash`, `difficulty`) plus the H2
-/// header-extra reservation are rewritten before the new block hash is formed.
+/// header shape. Transaction content and execution roots are unchanged; fields
+/// Engine payloads cannot express (`ommers_hash`, `difficulty`), the H2
+/// header-extra reservation, and pre-Shanghai withdrawals markers are
+/// normalized before the new block hash is formed.
 ///
 /// The first interoperable producer profile intentionally omits the optional
 /// header QC and reserves a zero seal. Gov5 authenticates the same block hash
@@ -42,8 +62,21 @@ const GOV5_H2_SEAL_BYTES: usize = 96;
 pub fn normalize_execution_payload_for_gov5_h2(
     execution: &ExecutionData,
     view: u64,
+    state_root: B256,
+    receipts_root: B256,
 ) -> Result<ExecutionData, Gov5BlockError> {
-    if reconstruct_gov5_block(execution).is_ok() {
+    if reconstruct_gov5_block(execution).is_ok_and(|block| {
+        block.header.state_root == state_root
+            && block.header.receipts_root == receipts_root
+            && block.header.withdrawals_root.is_none()
+            && block.header.blob_gas_used.is_none()
+            && block.header.excess_blob_gas.is_none()
+            && block.header.parent_beacon_block_root.is_none()
+            && block.header.requests_hash.is_none()
+            && block.header.block_access_list_hash.is_none()
+            && block.header.slot_number.is_none()
+            && block.body.withdrawals.is_none()
+    }) {
         return Ok(execution.clone());
     }
 
@@ -51,15 +84,36 @@ pub fn normalize_execution_payload_for_gov5_h2(
         .clone()
         .try_into_block::<TxEnvelope>()
         .map_err(|error| Gov5BlockError::PayloadReconstruction(error.to_string()))?;
-    if block.header.hash_slow() != execution.block_hash() {
-        return Err(Gov5BlockError::PayloadHashMismatch);
-    }
     if calculate_transaction_root(&block.body.transactions) != block.header.transactions_root {
         return Err(Gov5BlockError::TransactionRootMismatch);
     }
 
     block.header.ommers_hash = B256::ZERO;
     block.header.difficulty = U256::ZERO;
+    // The deployed Gov5 chain is pre-Shanghai. Reth's builder may represent
+    // "no withdrawals" as an empty V2/V3 list and attach later-fork sidecar
+    // markers; retaining any of them makes Engine API reject the otherwise
+    // valid payload as post-Shanghai.
+    block.header.withdrawals_root = None;
+    block.header.blob_gas_used = None;
+    block.header.excess_blob_gas = None;
+    block.header.parent_beacon_block_root = None;
+    block.header.requests_hash = None;
+    block.header.block_access_list_hash = None;
+    block.header.slot_number = None;
+    block.body.withdrawals = None;
+    // Bind the H2 header to the execution output's Gov5-native
+    // `hash.DeriveSha` receipt commitment. The standard Ethereum builder uses
+    // a Merkle-Patricia receipt trie (whose empty root is 56e81f...), while
+    // Gov5 commits to keccak of concatenated receipt encodings (c5d246... for
+    // an empty set). The caller derives this value from the builder's cached
+    // execution output, so non-empty blocks remain fully supported.
+    block.header.receipts_root = receipts_root;
+    // Reth's stock payload builder commits the Ethereum Merkle-Patricia state
+    // trie. Gov5 replay-v2 commits the same executed state transition through
+    // QMDB. The caller derives this root from the authenticated parent QMDB
+    // branch and the builder's exact execution output.
+    block.header.state_root = state_root;
     let mut extra = Vec::with_capacity(12 + GOV5_H2_SEAL_BYTES);
     extra.extend_from_slice(b"N42H");
     extra.extend_from_slice(&view.to_le_bytes());
@@ -255,6 +309,7 @@ mod tests {
     use alloy_consensus::{Block, BlockBody, proofs::calculate_transaction_root};
     use alloy_primitives::{Bytes, U256};
     use alloy_rlp::Encodable;
+    use n42_consensus::gov5_native_receipts_root;
 
     fn block_fixture(transactions_root: B256) -> Vec<u8> {
         let header = Header {
@@ -349,18 +404,101 @@ mod tests {
         let standard_hash = block.header.hash_slow();
         let standard = ExecutionData::from_block_unchecked(standard_hash, &block);
 
-        let normalized = normalize_execution_payload_for_gov5_h2(&standard, 19).unwrap();
+        let native_state_root = B256::repeat_byte(0x19);
+        let normalized = normalize_execution_payload_for_gov5_h2(
+            &standard,
+            19,
+            native_state_root,
+            gov5_native_receipts_root(&[]),
+        )
+        .unwrap();
         assert_ne!(normalized.block_hash(), standard_hash);
         let encoded = encode_gov5_block_rlp(&normalized).unwrap();
         let recovered = decode_gov5_block_rlp(&encoded).unwrap();
         assert_eq!(recovered.block_hash, normalized.block_hash());
         assert_eq!(recovered.header.ommers_hash, B256::ZERO);
         assert_eq!(recovered.header.difficulty, U256::ZERO);
+        assert_eq!(recovered.header.state_root, native_state_root);
         assert_eq!(&recovered.header.extra_data[..4], b"N42H");
-        assert_eq!(
-            u64::from_le_bytes(recovered.header.extra_data[4..12].try_into().unwrap()),
-            19
-        );
+        assert_eq!(gov5_header_view(&recovered.header).unwrap(), 19);
         assert_eq!(recovered.header.extra_data.len(), 108);
+    }
+
+    #[test]
+    fn normalizes_local_zero_ommers_payload_hidden_by_engine_shape() {
+        let block: Block<TxEnvelope> = Block {
+            header: Header {
+                ommers_hash: B256::ZERO,
+                transactions_root: calculate_transaction_root::<TxEnvelope>(&[]),
+                base_fee_per_gas: Some(0),
+                ..Default::default()
+            },
+            body: BlockBody::default(),
+        };
+        let local_hash = block.header.hash_slow();
+        let local = ExecutionData::from_block_unchecked(local_hash, &block);
+
+        let normalized = normalize_execution_payload_for_gov5_h2(
+            &local,
+            23,
+            B256::repeat_byte(0x23),
+            gov5_native_receipts_root(&[]),
+        )
+        .unwrap();
+        let recovered =
+            decode_gov5_block_rlp(&encode_gov5_block_rlp(&normalized).unwrap()).unwrap();
+        assert_eq!(recovered.header.ommers_hash, B256::ZERO);
+        assert_eq!(gov5_header_view(&recovered.header).unwrap(), 23);
+    }
+
+    #[test]
+    fn normalization_strips_empty_withdrawals_for_pre_shanghai_gov5() {
+        let block: Block<TxEnvelope> = Block {
+            header: Header {
+                transactions_root: calculate_transaction_root::<TxEnvelope>(&[]),
+                withdrawals_root: Some(B256::repeat_byte(0x42)),
+                blob_gas_used: Some(0),
+                excess_blob_gas: Some(0),
+                parent_beacon_block_root: Some(B256::ZERO),
+                base_fee_per_gas: Some(0),
+                ..Default::default()
+            },
+            body: BlockBody {
+                withdrawals: Some(Default::default()),
+                ..Default::default()
+            },
+        };
+        let standard_hash = block.header.hash_slow();
+        let standard = ExecutionData::from_block_unchecked(standard_hash, &block);
+
+        let native_receipts_root = gov5_native_receipts_root(&[]);
+        let native_state_root = B256::repeat_byte(0x29);
+        let normalized = normalize_execution_payload_for_gov5_h2(
+            &standard,
+            29,
+            native_state_root,
+            native_receipts_root,
+        )
+        .unwrap();
+        let recovered =
+            decode_gov5_block_rlp(&encode_gov5_block_rlp(&normalized).unwrap()).unwrap();
+        assert!(recovered.header.withdrawals_root.is_none());
+        assert!(recovered.header.parent_beacon_block_root.is_none());
+        assert_eq!(recovered.header.state_root, native_state_root);
+        assert_eq!(recovered.header.receipts_root, native_receipts_root);
+        assert!(normalized.withdrawals().is_none());
+        assert!(normalized.parent_beacon_block_root().is_none());
+    }
+
+    #[test]
+    fn rejects_header_without_canonical_h2_view_prefix() {
+        let header = Header {
+            extra_data: Bytes::from_static(b"not-an-h2-header"),
+            ..Default::default()
+        };
+        assert!(matches!(
+            gov5_header_view(&header),
+            Err(Gov5BlockError::HeaderProfile(_))
+        ));
     }
 }

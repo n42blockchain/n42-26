@@ -13,17 +13,14 @@ impl LeaderSelector {
     /// Returns the leader's validator index for the given view.
     ///
     /// # Panics
-    /// Debug-asserts that the validator set is non-empty. In release builds,
-    /// returns 0 for empty sets (callers should ensure non-empty sets via
-    /// `ValidatorSet::new` validation).
+    /// Panics if the validator set is empty. Returning a synthetic validator
+    /// index would let a malformed release configuration appear to have a
+    /// leader and fail open.
     pub fn leader_for_view(view: ViewNumber, validator_set: &ValidatorSet) -> u32 {
-        debug_assert!(
+        assert!(
             !validator_set.is_empty(),
             "leader_for_view called with empty validator set"
         );
-        if validator_set.is_empty() {
-            return 0;
-        }
         (view % validator_set.len() as u64) as u32
     }
 

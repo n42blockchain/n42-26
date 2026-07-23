@@ -1411,6 +1411,31 @@ mod tests {
     }
 
     #[test]
+    fn h2_v4_profile_forms_and_verifies_commit_qc_only_in_pop_domain() {
+        let (sks, vs) = test_validator_set(4);
+        let profile = ConsensusSigningProfile::H2V4(H2V4ChainIdentity {
+            chain_id: 42,
+            genesis_hash: B256::repeat_byte(0xA5),
+        });
+        let view = 18;
+        let block_hash = B256::repeat_byte(0xB5);
+        let changes_hash = B256::ZERO;
+        let message = profile.commit_message(view, block_hash, changes_hash);
+        let mut collector = VoteCollector::new(view, block_hash, vs.len());
+        for index in 0..3 {
+            collector
+                .add_vote(index, profile.sign(&sks[index as usize], &message))
+                .unwrap();
+        }
+
+        let qc = collector
+            .build_qc_with_profile_message(&vs, &message, profile)
+            .unwrap();
+        verify_commit_qc_with_profile(&qc, &vs, &changes_hash, profile).unwrap();
+        assert!(verify_commit_qc(&qc, &vs, &changes_hash).is_err());
+    }
+
+    #[test]
     fn h2_v4_profile_forms_and_verifies_timeout_certificate() {
         let (sks, vs) = test_validator_set(4);
         let profile = ConsensusSigningProfile::H2V4(H2V4ChainIdentity {

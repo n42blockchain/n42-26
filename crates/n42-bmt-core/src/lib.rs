@@ -290,7 +290,13 @@ impl Sbmt {
 
     fn insert_at(&mut self, slot: NodeIdx, key: Hash, vh: Hash, depth: usize) -> (NodeIdx, bool) {
         if slot == NIL {
-            return (self.alloc(Node::Leaf { key, value_hash: vh }), true);
+            return (
+                self.alloc(Node::Leaf {
+                    key,
+                    value_hash: vh,
+                }),
+                true,
+            );
         }
         // Peek the node kind, copying out the fields we need, so the immutable
         // borrow is dropped before the `&mut self` recursion/alloc below.
@@ -301,7 +307,10 @@ impl Sbmt {
         if is_leaf {
             if ek == key {
                 // Same key: update the value hash in place.
-                self.nodes[slot as usize] = Node::Leaf { key, value_hash: vh };
+                self.nodes[slot as usize] = Node::Leaf {
+                    key,
+                    value_hash: vh,
+                };
                 (slot, false)
             } else {
                 // Split: turn this slot into an internal node, then re-place the
@@ -464,7 +473,9 @@ impl Sbmt {
             }
             let (is_leaf, ek, ev, l, r) = match &self.nodes[idx as usize] {
                 Node::Leaf { key, value_hash } => (true, *key, *value_hash, NIL, NIL),
-                Node::Internal { left, right, .. } => (false, EMPTY_HASH, EMPTY_HASH, *left, *right),
+                Node::Internal { left, right, .. } => {
+                    (false, EMPTY_HASH, EMPTY_HASH, *left, *right)
+                }
             };
             if is_leaf {
                 return if ek == key {
@@ -533,7 +544,12 @@ impl BmtProof {
     /// selector prefix is skipped). The sibling at index `i` authenticates bit
     /// `base_depth + i`, and an exclusion proof's occupying leaf must share the
     /// full in-tree path prefix `[base_depth, base_depth + siblings.len())`.
-    pub fn verify(&self, root: &Hash, expected_value_hash: Option<Hash>, base_depth: usize) -> bool {
+    pub fn verify(
+        &self,
+        root: &Hash,
+        expected_value_hash: Option<Hash>,
+        base_depth: usize,
+    ) -> bool {
         if self.value_hash != expected_value_hash {
             return false;
         }
@@ -672,11 +688,8 @@ impl ShardedBmtProof {
                 expected: SHARD_COUNT.trailing_zeros() as usize,
             });
         }
-        let computed = shard_tree_root_from_path(
-            self.shard_root,
-            self.shard_index as usize,
-            &self.shard_path,
-        );
+        let computed =
+            shard_tree_root_from_path(self.shard_root, self.shard_index as usize, &self.shard_path);
         if computed != *combined_root {
             return Err(BmtVerifyError::CombinedRootMismatch);
         }
@@ -817,7 +830,10 @@ mod tests {
         let key = key_from(7);
         let vh = hash_value(&7u64.to_le_bytes());
         let incl = t.prove(key);
-        assert!(incl.verify(&root, Some(vh), 0), "real inclusion must verify");
+        assert!(
+            incl.verify(&root, Some(vh), 0),
+            "real inclusion must verify"
+        );
 
         let forged = BmtProof {
             key,
@@ -850,7 +866,10 @@ mod tests {
         let key = mk(123);
         let vh = hash_value(&123u64.to_le_bytes());
         let incl = t.prove(key);
-        assert!(incl.verify(&root, Some(vh), base), "inclusion @base_depth must verify");
+        assert!(
+            incl.verify(&root, Some(vh), base),
+            "inclusion @base_depth must verify"
+        );
         assert!(
             !incl.verify(&root, Some(vh), 0),
             "verifying with the wrong base_depth must fail"
@@ -860,7 +879,10 @@ mod tests {
         let absent = mk(999999);
         let excl = t.prove(absent);
         assert!(excl.value_hash.is_none());
-        assert!(excl.verify(&root, None, base), "exclusion @base_depth must verify");
+        assert!(
+            excl.verify(&root, None, base),
+            "exclusion @base_depth must verify"
+        );
     }
 
     #[test]

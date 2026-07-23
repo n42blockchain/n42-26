@@ -126,9 +126,7 @@ mod state_root_flag_tests {
     #[test]
     fn bypass_with_allow_only_inside_bench_range() {
         assert!(validate_state_root_bypass_flags(false, true, true, BENCH_CHAIN_ID_MIN).is_ok());
-        assert!(
-            validate_state_root_bypass_flags(true, true, true, BENCH_CHAIN_ID_MAX - 1).is_ok()
-        );
+        assert!(validate_state_root_bypass_flags(true, true, true, BENCH_CHAIN_ID_MAX - 1).is_ok());
         assert!(validate_state_root_bypass_flags(false, true, true, BENCH_CHAIN_ID_MAX).is_err());
         assert!(validate_state_root_bypass_flags(true, false, true, 1).is_err());
         assert!(validate_state_root_bypass_flags(true, false, true, 94).is_err());

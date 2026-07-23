@@ -6749,6 +6749,7 @@ dependencies = [
  "n42-jmt",
  "n42-network",
  "n42-primitives",
+ "n42-twig-core",
  "n42-zkproof",
  "reth-ethereum-primitives",
  "revm",

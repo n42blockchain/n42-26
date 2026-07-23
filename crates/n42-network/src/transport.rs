@@ -12,8 +12,9 @@ use crate::gossipsub::topics::{
     blob_sidecar_topic, block_announce_topic, consensus_topic, mempool_topic,
 };
 use crate::gov5_rpc::{
-    GOV5_BLOCK_BY_HASH_PROTOCOL, GOV5_BLOCK_PUSH_PROTOCOL, GOV5_STATUS_PROTOCOL,
-    Gov5BlockByHashCodec, Gov5BlockPushCodec, Gov5StatusCodec,
+    GOV5_BLOCK_BY_HASH_PROTOCOL, GOV5_BLOCK_PUSH_PROTOCOL, GOV5_HOTSTUFF_DIRECT_PROTOCOL,
+    GOV5_STATUS_PROTOCOL, Gov5BlockByHashCodec, Gov5BlockPushCodec, Gov5HotstuffDirectCodec,
+    Gov5StatusCodec,
 };
 use crate::state_sync::StateSyncCodec;
 use crate::tx_forward::TxForwardCodec;
@@ -38,6 +39,8 @@ pub struct N42Behaviour {
     pub gov5_block_by_hash: libp2p::request_response::Behaviour<Gov5BlockByHashCodec>,
     /// Gov5 chain-status handshake, enabled only on the TCP interop observer.
     pub gov5_status: libp2p::request_response::Behaviour<Gov5StatusCodec>,
+    /// Gov5 raw one-way Rotor/direct consensus stream.
+    pub gov5_hotstuff_direct: libp2p::request_response::Behaviour<Gov5HotstuffDirectCodec>,
     /// Transaction forwarding from non-leader validators to current leader.
     pub tx_forward: libp2p::request_response::Behaviour<TxForwardCodec>,
     /// Disabled in production; enabled in dev/test via `enable_mdns`.
@@ -254,8 +257,15 @@ fn build_swarm_with_transports(
             ..Default::default()
         };
 
+        // Gov5 runs GossipSub in StrictNoSign mode. Consensus payloads already
+        // carry validator BLS authentication, so an additional libp2p message
+        // signature is both redundant and actively incompatible: Gov5 rejects
+        // signed GossipSub envelopes and eventually prunes the Rust peer from
+        // the mesh, leaving only intermittent IHAVE/IWANT recovery. Keep the
+        // transport envelope anonymous; application-level consensus validation
+        // remains mandatory in the service/engine.
         let mut gossipsub = gossipsub::Behaviour::new(
-            gossipsub::MessageAuthenticity::Signed(key.clone()),
+            gossipsub::MessageAuthenticity::Anonymous,
             gossipsub_config.clone(),
         )
         .map_err(|e| eyre::eyre!("gossipsub behaviour error: {e}"))?;
@@ -303,7 +313,7 @@ fn build_swarm_with_transports(
         let gov5_block_push = libp2p::request_response::Behaviour::new(
             [(
                 libp2p::StreamProtocol::new(GOV5_BLOCK_PUSH_PROTOCOL),
-                libp2p::request_response::ProtocolSupport::Inbound,
+                libp2p::request_response::ProtocolSupport::Full,
             )],
             libp2p::request_response::Config::default()
                 .with_request_timeout(Duration::from_secs(10)),
@@ -312,7 +322,11 @@ fn build_swarm_with_transports(
         let gov5_block_by_hash = libp2p::request_response::Behaviour::new(
             [(
                 libp2p::StreamProtocol::new(GOV5_BLOCK_BY_HASH_PROTOCOL),
-                libp2p::request_response::ProtocolSupport::Outbound,
+                // A Rust validator can be the only peer that retained a block
+                // received from Gov5. Advertise the fetch protocol in both
+                // directions so another recovering Rust validator can use it
+                // as a bounded, authenticated data source.
+                libp2p::request_response::ProtocolSupport::Full,
             )],
             libp2p::request_response::Config::default()
                 .with_request_timeout(Duration::from_secs(10)),
@@ -328,6 +342,15 @@ fn build_swarm_with_transports(
             .into_iter();
         let gov5_status = libp2p::request_response::Behaviour::new(
             gov5_status_protocols,
+            libp2p::request_response::Config::default()
+                .with_request_timeout(Duration::from_secs(10)),
+        );
+
+        let gov5_hotstuff_direct = libp2p::request_response::Behaviour::new(
+            [(
+                libp2p::StreamProtocol::new(GOV5_HOTSTUFF_DIRECT_PROTOCOL),
+                libp2p::request_response::ProtocolSupport::Full,
+            )],
             libp2p::request_response::Config::default()
                 .with_request_timeout(Duration::from_secs(10)),
         );
@@ -389,6 +412,7 @@ fn build_swarm_with_transports(
             gov5_block_push,
             gov5_block_by_hash,
             gov5_status,
+            gov5_hotstuff_direct,
             tx_forward,
             mdns,
             kademlia,

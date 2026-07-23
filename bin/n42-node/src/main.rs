@@ -15,14 +15,16 @@ use n42_chainspec::{ConsensusConfig, ValidatorInfo};
 use n42_consensus::{
     ConsensusEngine, EpochManager, N42HeaderProfile, ValidatorSet, ValidatorSetResolver,
 };
-use n42_consensus_service::{ReplayExecutionPlan, build_replay_execution_plan_with_profile};
+use n42_consensus_service::{
+    ReplayExecutionPlan, bootstrap::Gov5BootstrapBundle, build_replay_execution_plan_with_profile,
+};
 use n42_jmt::{EMPTY_CODE_HASH, PersistentSbmt, PersistentTwig};
 use n42_network::NetworkService;
 use n42_network::{
     FinalizedRangeVerification, ShardedStarHub, ShardedStarHubConfig, TransportConfig,
     build_interop_observer_swarm, build_interop_participant_swarm,
     build_swarm_with_validator_index, decode_finalized_range_stream,
-    deterministic_validator_keypair, verify_finalized_range_stream,
+    deterministic_validator_keypair, gov5_header_view, verify_finalized_range_stream,
 };
 use n42_node::attestation_store::AttestationStore;
 use n42_node::consensus_state::configured_min_mobile_verifiers;
@@ -51,7 +53,7 @@ use reth_ethereum_cli::Cli;
 use reth_ethereum_cli::chainspec::EthereumChainSpecParser;
 use reth_node_core::args::{DefaultEngineValues, DefaultRpcServerArgs};
 use reth_primitives_traits::SealedHeader;
-use reth_storage_api::{BlockHashReader, BlockNumReader};
+use reth_storage_api::{BlockHashReader, BlockNumReader, HeaderProvider};
 use reth_transaction_pool::TransactionPool;
 use std::fs::File;
 use std::io::BufReader;
@@ -65,6 +67,16 @@ fn env_bool(name: &str) -> bool {
     std::env::var(name)
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
+}
+
+fn restart_entry_view(
+    snapshot_view: u64,
+    _last_voted_view: u64,
+    _last_commit_voted_view: u64,
+) -> u64 {
+    // Vote-log views are signature watermarks, not certificates proving a
+    // view transition. Only the snapshot carries the recovered QC/TC state.
+    snapshot_view
 }
 
 fn env_parse<T: std::str::FromStr>(name: &str) -> Option<T> {
@@ -121,6 +133,14 @@ fn resolve_header_profile(
         ));
     }
     Ok(N42HeaderProfile::Gov5H2)
+}
+
+const fn bootstrap_bundle_mode_allowed(
+    observer_mode: bool,
+    h2_v4_participant: bool,
+    header_profile: N42HeaderProfile,
+) -> bool {
+    (observer_mode || h2_v4_participant) && matches!(header_profile, N42HeaderProfile::Gov5H2)
 }
 
 fn verify_observer_qmdb_bootstrap(
@@ -267,6 +287,8 @@ fn load_gov5_genesis_execution_bootstrap(
     max_slots: u64,
     max_bytes: u64,
     start_at_checkpoint: bool,
+    branch_state_path: &Path,
+    max_replay_depth: usize,
 ) -> eyre::Result<QmdbExecutionBootstrap> {
     let (portable, checkpoint) = load_qmdb_execution_checkpoint(
         checkpoint_path,
@@ -350,8 +372,14 @@ fn load_gov5_genesis_execution_bootstrap(
         } else {
             (0, genesis_hash, base_root, base_snapshot)
         };
-    let store = Gov5QmdbStateRootStore::new(store_base_hash, store_base_root, store_base_snapshot)
-        .map_err(|error| eyre::eyre!("failed to initialize QMDB genesis store: {error}"))?;
+    let store = Gov5QmdbStateRootStore::persistent(
+        store_base_hash,
+        store_base_root,
+        store_base_snapshot,
+        max_replay_depth,
+        branch_state_path.to_path_buf(),
+    )
+    .map_err(|error| eyre::eyre!("failed to initialize QMDB genesis store: {error}"))?;
     Ok(QmdbExecutionBootstrap {
         store: Arc::new(store),
         checkpoint,
@@ -633,29 +661,78 @@ fn derive_ed25519_keypair(index: u32) -> eyre::Result<libp2p::identity::Keypair>
     deterministic_validator_keypair(index)
 }
 
-fn load_explicit_p2p_keypair() -> eyre::Result<Option<libp2p::identity::Keypair>> {
-    let Ok(hex_key) = std::env::var("N42_P2P_KEY") else {
+fn read_secret_hex(variable: &str, configured: &str) -> eyre::Result<String> {
+    if let Some(path) = configured.strip_prefix('@') {
+        if path.is_empty() {
+            return Err(eyre::eyre!(
+                "{variable} @file reference must contain a path"
+            ));
+        }
+        let metadata = std::fs::metadata(path)
+            .map_err(|error| eyre::eyre!("cannot inspect {variable} key file {path}: {error}"))?;
+        if !metadata.is_file() {
+            return Err(eyre::eyre!("{variable} key path is not a file: {path}"));
+        }
+        let value = std::fs::read_to_string(path)
+            .map_err(|error| eyre::eyre!("cannot read {variable} key file {path}: {error}"))?;
+        let value = value.trim();
+        if value.is_empty() {
+            return Err(eyre::eyre!("{variable} key file is empty: {path}"));
+        }
+        return Ok(value.to_owned());
+    }
+    Ok(configured.to_owned())
+}
+
+fn load_explicit_p2p_keypair(
+    expected_peer_id: Option<libp2p::PeerId>,
+) -> eyre::Result<Option<libp2p::identity::Keypair>> {
+    let Ok(configured_key) = std::env::var("N42_P2P_KEY") else {
         return Ok(None);
     };
+    let hex_key = read_secret_hex("N42_P2P_KEY", &configured_key)?;
 
     let bytes = hex::decode(&hex_key)
         .map_err(|error| eyre::eyre!("N42_P2P_KEY must be valid hex: {error}"))?;
-    let mut key_bytes: [u8; 32] = bytes.try_into().map_err(|value: Vec<u8>| {
+    let key_bytes: [u8; 32] = bytes.try_into().map_err(|value: Vec<u8>| {
         eyre::eyre!("N42_P2P_KEY must be exactly 32 bytes, got {}", value.len())
     })?;
-    let secret = libp2p::identity::ed25519::SecretKey::try_from_bytes(&mut key_bytes)
-        .map_err(|error| eyre::eyre!("N42_P2P_KEY is not a valid ed25519 secret key: {error}"))?;
 
-    Ok(Some(libp2p::identity::Keypair::from(
-        libp2p::identity::ed25519::Keypair::from(secret),
-    )))
+    let mut ed25519_bytes = key_bytes;
+    let ed25519 =
+        libp2p::identity::ed25519::SecretKey::try_from_bytes(&mut ed25519_bytes).map(|secret| {
+            libp2p::identity::Keypair::from(libp2p::identity::ed25519::Keypair::from(secret))
+        });
+    if let Ok(keypair) = ed25519
+        && expected_peer_id.is_none_or(|expected| keypair.public().to_peer_id() == expected)
+    {
+        return Ok(Some(keypair));
+    }
+
+    // Gov5 validator identities use the historical secp256k1 libp2p key
+    // format (16U... PeerIds). Supporting the same 32-byte secret is required
+    // for an in-place client replacement without changing the authenticated
+    // validator-to-PeerId binding.
+    let mut secp256k1_bytes = key_bytes;
+    if let Ok(secret) = libp2p::identity::secp256k1::SecretKey::try_from_bytes(&mut secp256k1_bytes)
+    {
+        let keypair =
+            libp2p::identity::Keypair::from(libp2p::identity::secp256k1::Keypair::from(secret));
+        if expected_peer_id.is_none_or(|expected| keypair.public().to_peer_id() == expected) {
+            return Ok(Some(keypair));
+        }
+    }
+
+    Err(eyre::eyre!(
+        "N42_P2P_KEY does not derive the configured validator PeerId as ed25519 or secp256k1"
+    ))
 }
 
 fn resolve_validator_p2p_keypair(
     validator_index: u32,
     expected_peer_id: Option<libp2p::PeerId>,
 ) -> eyre::Result<libp2p::identity::Keypair> {
-    let keypair = if let Some(keypair) = load_explicit_p2p_keypair()? {
+    let keypair = if let Some(keypair) = load_explicit_p2p_keypair(expected_peer_id)? {
         keypair
     } else if expected_peer_id.is_some() {
         return Err(eyre::eyre!(
@@ -838,8 +915,15 @@ fn main() {
                 eprintln!("ERROR: Invalid BLS secret key in keystore: {e}");
                 std::process::exit(1);
             })
-        } else if let Ok(hex_key) = std::env::var("N42_VALIDATOR_KEY") {
-            warn!(target: "n42::cli", "using plaintext N42_VALIDATOR_KEY — use N42_KEYSTORE_PATH for production");
+        } else if let Ok(configured_key) = std::env::var("N42_VALIDATOR_KEY") {
+            let hex_key = read_secret_hex("N42_VALIDATOR_KEY", &configured_key)
+                .unwrap_or_else(|e| {
+                    eprintln!("ERROR: Failed to load N42_VALIDATOR_KEY: {e}");
+                    std::process::exit(1);
+                });
+            if !configured_key.starts_with('@') {
+                warn!(target: "n42::cli", "using plaintext N42_VALIDATOR_KEY — use N42_KEYSTORE_PATH or an @file reference for production");
+            }
             let bytes = hex::decode(&hex_key).unwrap_or_else(|e| {
                 eprintln!("ERROR: N42_VALIDATOR_KEY must be valid hex: {e}");
                 std::process::exit(1);
@@ -892,7 +976,56 @@ fn main() {
             env_bool("N42_GOV5_HEADER_PROFILE"),
             std::env::var("N42_INTEROP_GENESIS_HASH").ok().as_deref(),
         )?;
+        let interop_genesis = resolve_observer_genesis_hash(
+            B256::ZERO,
+            std::env::var("N42_INTEROP_GENESIS_HASH").ok().as_deref(),
+        )?;
+        let bootstrap_bundle = if let Ok(path) = std::env::var("N42_GOV5_BOOTSTRAP_BUNDLE") {
+            if !bootstrap_bundle_mode_allowed(observer_mode, h2_v4_participant, header_profile) {
+                return Err(eyre::eyre!(
+                    "N42_GOV5_BOOTSTRAP_BUNDLE requires observer or H2-v4 participant mode and the Gov5 header profile"
+                ));
+            }
+            let bundle = Gov5BootstrapBundle::from_path(Path::new(&path))
+                .map_err(|error| eyre::eyre!("failed to load Gov5 bootstrap bundle {path}: {error}"))?;
+            let identity = n42_primitives::consensus::H2V4ChainIdentity {
+                chain_id: builder.config().chain.chain.id(),
+                genesis_hash: interop_genesis,
+            };
+            let snapshot = bundle
+                .verify(
+                    identity,
+                    &consensus_config.initial_validators,
+                    consensus_config.fault_tolerance,
+                )
+                .map_err(|error| {
+                    eyre::eyre!("Gov5 bootstrap bundle {path} failed authentication: {error}")
+                })?;
+            let materialized = bundle
+                .materialize(&data_dir, snapshot)
+                .map_err(|error| {
+                    eyre::eyre!("failed to materialize Gov5 bootstrap bundle {path}: {error}")
+                })?;
+            info!(
+                target: "n42::cli",
+                path,
+                sequence = bundle.payload.sequence,
+                digest = %bundle.content_digest,
+                checkpoint_block = bundle.payload.checkpoint_block,
+                checkpoint_hash = %bundle.payload.checkpoint_block_hash,
+                checkpoint_root = %bundle.payload.checkpoint_qmdb_root,
+                "authenticated Gov5 participant bootstrap bundle materialized"
+            );
+            Some((bundle, materialized))
+        } else {
+            None
+        };
         let qmdb_start_at_checkpoint = env_bool("N42_GOV5_QMDB_START_AT_CHECKPOINT");
+        if bootstrap_bundle.is_some() && qmdb_start_at_checkpoint {
+            return Err(eyre::eyre!(
+                "bootstrap bundle cold start replays its authenticated finalized range; do not set N42_GOV5_QMDB_START_AT_CHECKPOINT"
+            ));
+        }
         if qmdb_start_at_checkpoint && !h2_v4_participant {
             return Err(eyre::eyre!(
                 "N42_GOV5_QMDB_START_AT_CHECKPOINT is restricted to H2-v4 participant mode"
@@ -903,7 +1036,14 @@ fn main() {
                 "checkpoint-start participant mode cannot replay the same finalized bootstrap"
             ));
         }
-        let qmdb_execution = if env_bool("N42_GOV5_QMDB_EXECUTION") {
+        let qmdb_execution = if env_bool("N42_GOV5_QMDB_EXECUTION")
+            || bootstrap_bundle.is_some()
+        {
+            if builder.config().prune_config().is_some() {
+                return Err(eyre::eyre!(
+                    "replay-v2 QMDB archive+ mode rejects all CLI pruning options; historical blocks, bodies, receipts, transaction lookup, and state below the published archive floor must remain immutable"
+                ));
+            }
             if !(observer_mode || h2_v4_participant)
                 || header_profile != N42HeaderProfile::Gov5H2
             {
@@ -911,26 +1051,42 @@ fn main() {
                     "N42_GOV5_QMDB_EXECUTION requires observer or H2-v4 participant mode and N42_GOV5_HEADER_PROFILE=1"
                 ));
             }
-            let path = std::env::var("N42_QMDB_BOOTSTRAP").map_err(|_| {
-                eyre::eyre!("N42_QMDB_BOOTSTRAP is required with N42_GOV5_QMDB_EXECUTION")
-            })?;
-            let genesis_range = std::env::var("N42_GOV5_GENESIS_BOOTSTRAP").map_err(|_| {
-                eyre::eyre!(
-                    "N42_GOV5_GENESIS_BOOTSTRAP is required with N42_GOV5_QMDB_EXECUTION"
+            let (
+                path,
+                genesis_range,
+                expected_block,
+                expected_block_hash,
+                expected_root,
+            ) = if let Some((bundle, materialized)) = &bootstrap_bundle {
+                (
+                    materialized.qmdb_checkpoint_path.display().to_string(),
+                    materialized.genesis_range_path.display().to_string(),
+                    bundle.payload.checkpoint_block,
+                    bundle.payload.checkpoint_block_hash,
+                    bundle.payload.checkpoint_qmdb_root,
                 )
-            })?;
-            let expected_block = required_observer_env::<u64>("N42_QMDB_BOOTSTRAP_BLOCK")?;
-            let expected_block_hash =
-                required_observer_env::<B256>("N42_QMDB_BOOTSTRAP_BLOCK_HASH")?;
-            let expected_root = required_observer_env::<B256>("N42_QMDB_BOOTSTRAP_ROOT")?;
-            let interop_genesis = resolve_observer_genesis_hash(
-                B256::ZERO,
-                std::env::var("N42_INTEROP_GENESIS_HASH").ok().as_deref(),
-            )?;
+            } else {
+                (
+                    std::env::var("N42_QMDB_BOOTSTRAP").map_err(|_| {
+                        eyre::eyre!(
+                            "N42_QMDB_BOOTSTRAP is required with N42_GOV5_QMDB_EXECUTION"
+                        )
+                    })?,
+                    std::env::var("N42_GOV5_GENESIS_BOOTSTRAP").map_err(|_| {
+                        eyre::eyre!(
+                            "N42_GOV5_GENESIS_BOOTSTRAP is required with N42_GOV5_QMDB_EXECUTION"
+                        )
+                    })?,
+                    required_observer_env::<u64>("N42_QMDB_BOOTSTRAP_BLOCK")?,
+                    required_observer_env::<B256>("N42_QMDB_BOOTSTRAP_BLOCK_HASH")?,
+                    required_observer_env::<B256>("N42_QMDB_BOOTSTRAP_ROOT")?,
+                )
+            };
             let max_slots = env_parse("N42_QMDB_EXECUTION_MAX_SLOTS")
                 .unwrap_or(DEFAULT_QMDB_EXECUTION_MAX_SLOTS);
             let max_bytes = env_parse("N42_QMDB_EXECUTION_MAX_BYTES")
                 .unwrap_or(DEFAULT_QMDB_EXECUTION_MAX_BYTES);
+            let max_replay_depth = env_parse("N42_QMDB_REPLAY_DEPTH").unwrap_or(65_536usize);
             let loaded = load_gov5_genesis_execution_bootstrap(
                 Path::new(&path),
                 Path::new(&genesis_range),
@@ -943,6 +1099,8 @@ fn main() {
                 max_slots,
                 max_bytes,
                 qmdb_start_at_checkpoint,
+                &data_dir.join("gov5_qmdb_branches.bin"),
+                max_replay_depth,
             )?;
             let chain = Arc::make_mut(&mut builder.config_mut().chain);
             chain.genesis = loaded.execution_genesis.clone();
@@ -961,23 +1119,17 @@ fn main() {
                 checkpoint_hash = %B256::from(loaded.checkpoint.block_hash),
                 checkpoint_root = %B256::from(loaded.checkpoint.root),
                 slots = loaded.checkpoint.next_slot,
+                archive_floor = loaded.base_block_number,
                 "prepared Gov5 block-zero QMDB Engine Tree execution base"
             );
             Some(loaded)
         } else {
             None
         };
-        if h2_v4_participant {
-            if qmdb_execution.is_none() {
-                return Err(eyre::eyre!(
-                    "N42_GOV5_H2_PARTICIPANT requires N42_GOV5_QMDB_EXECUTION=1"
-                ));
-            }
-            if consensus_config.epoch_length != 0 {
-                return Err(eyre::eyre!(
-                    "H2-v4 participant mode requires the current gov5 static validator profile (epoch_length=0)"
-                ));
-            }
+        if h2_v4_participant && qmdb_execution.is_none() {
+            return Err(eyre::eyre!(
+                "N42_GOV5_H2_PARTICIPANT requires N42_GOV5_QMDB_EXECUTION=1"
+            ));
         }
         let allow_deterministic_validator_peers =
             !consensus_config_from_file || env_bool("N42_ALLOW_DETERMINISTIC_P2P");
@@ -1017,10 +1169,13 @@ fn main() {
                 None
             }
         };
-        if h2_v4_participant && epoch_schedule.is_some() {
-            return Err(eyre::eyre!(
-                "H2-v4 participant mode does not permit an epoch schedule while gov5 uses changes_hash=0"
-            ));
+        if h2_v4_participant && consensus_config.epoch_length > 0 {
+            info!(
+                target: "n42::cli",
+                epoch_length = consensus_config.epoch_length,
+                scheduled = epoch_schedule.is_some(),
+                "H2-v4 static-schedule epoch profile enabled; committee changes activate at view boundaries with changes_hash=0"
+            );
         }
 
         let state_file = data_dir.join("consensus_state.json");
@@ -1178,6 +1333,15 @@ fn main() {
                 bootstrap.base_root,
             )
         });
+        let qmdb_execution_store = qmdb_execution
+            .as_ref()
+            .map(|bootstrap| Arc::clone(&bootstrap.store));
+        let qmdb_archive = qmdb_execution.as_ref().map(|bootstrap| {
+            (
+                bootstrap.base_block_number,
+                Arc::clone(&bootstrap.store),
+            )
+        });
 
         // Create staking manager early so it can be shared with RPC.
         let staking_state_file = data_dir.join("staking_state.json");
@@ -1189,11 +1353,25 @@ fn main() {
         // QMDB/twig state tree: default backend for production and test runs.
         // `N42_TWIG` is the primary selector; if unset, we keep QMDB enabled by
         // default unless `N42_JMT=1` explicitly requests the reserve path.
-        let twig_enabled = match std::env::var("N42_TWIG") {
-            Ok(v) => v == "1" || v.eq_ignore_ascii_case("true"),
-            Err(_) => !env_bool("N42_JMT"),
-        };
-        let jmt_enabled = env_bool("N42_JMT") && !twig_enabled;
+        // Gov5 participant mode already commits every replay-v2 transition to
+        // the authenticated QMDB execution/archive store. The generic compact
+        // output sidecars cannot reconstruct Gov5 blocks (their H2 wire body
+        // deliberately carries no Rust compact diff), so enabling a second
+        // Twig/JMT tree would create a permanent false gap at every commit.
+        let authoritative_qmdb_execution = qmdb_execution.is_some();
+        let twig_enabled = !authoritative_qmdb_execution
+            && match std::env::var("N42_TWIG") {
+                Ok(v) => v == "1" || v.eq_ignore_ascii_case("true"),
+                Err(_) => !env_bool("N42_JMT"),
+            };
+        let jmt_enabled =
+            !authoritative_qmdb_execution && env_bool("N42_JMT") && !twig_enabled;
+        if authoritative_qmdb_execution {
+            info!(
+                target: "n42::cli",
+                "generic Twig/JMT compact-output sidecar disabled; authenticated Gov5 QMDB execution store is authoritative"
+            );
+        }
         let twig_sidecar_healthy = Arc::new(AtomicBool::new(true));
         metrics::gauge!("n42_twig_sidecar_healthy").set(1.0);
 
@@ -1308,6 +1486,7 @@ fn main() {
         let rpc_zk_scheduler = zk_scheduler.clone();
         let rpc_jmt = jmt.clone();
         let rpc_twig = twig.clone();
+        let rpc_qmdb_archive = qmdb_archive;
         let rpc_admin_token = std::env::var("N42_ADMIN_TOKEN").ok();
         let handle = builder
             .node(n42_node)
@@ -1322,6 +1501,9 @@ fn main() {
                 }
                 if let Some(ref twig) = rpc_twig {
                     rpc_server = rpc_server.with_twig(Arc::clone(twig));
+                }
+                if let Some((archive_floor, store)) = rpc_qmdb_archive {
+                    rpc_server = rpc_server.with_qmdb_archive(archive_floor, store);
                 }
                 if let Some(token) = rpc_admin_token {
                     rpc_server = rpc_server.with_admin_token(token);
@@ -1369,20 +1551,152 @@ fn main() {
                     && (best_block_number != base_block_number ||
                         head_block_hash != base_block_hash)
                 {
-                    return Err(eyre::eyre!(
-                        "QMDB execution base is block {} ({}, root {}) but local Reth head is block {} ({}); hydrate the matching ancestor PlainState/head before enabling N42_GOV5_QMDB_EXECUTION",
-                        base_block_number,
-                        base_block_hash,
-                        base_root,
-                        best_block_number,
-                        head_block_hash,
-                    ));
+                    let persisted_root = qmdb_execution_store
+                        .as_ref()
+                        .map(|store| store.root_for(head_block_hash))
+                        .transpose()?
+                        .flatten();
+                    if persisted_root.is_none() {
+                        return Err(eyre::eyre!(
+                            "QMDB execution base is block {} ({}, root {}) but local Reth head is block {} ({}) and has no authenticated persisted QMDB lineage",
+                            base_block_number,
+                            base_block_hash,
+                            base_root,
+                            best_block_number,
+                            head_block_hash,
+                        ));
+                    }
+                    info!(
+                        target: "n42::cli",
+                        best_block = best_block_number,
+                        %head_block_hash,
+                        qmdb_root = %persisted_root.unwrap_or_default(),
+                        "restored authenticated QMDB lineage for canonical Reth head"
+                    );
                 }
 
                 if best_block_number > 0 && snapshot.is_none() {
                     return Err(eyre::eyre!(
                         "refusing to start consensus on reth block {best_block_number} without a valid consensus snapshot"
                     ));
+                }
+
+                // A bundle-backed observer or participant begins with an empty Reth database.
+                // Authenticate and prepare its complete execution range before
+                // any consensus event can release a vote.
+                let mut bootstrap_replay_plan = if h2_v4_participant || observer_mode {
+                    if let Some((bundle, materialized)) = &bootstrap_bundle {
+                        if best_block_number == 0 {
+                            let file = File::open(&materialized.finalized_range_path).map_err(
+                                |error| {
+                                    eyre::eyre!(
+                                        "failed to open materialized bootstrap range {}: {error}",
+                                        materialized.finalized_range_path.display()
+                                    )
+                                },
+                            )?;
+                            let range = decode_finalized_range_stream(
+                                BufReader::new(file),
+                                full_node.provider.chain_spec().chain().id(),
+                                bundle.payload.genesis_hash,
+                            )?;
+                            let verified = range.verification();
+                            if verified.from_block != 1
+                                || verified.to_block != bundle.payload.checkpoint_block
+                                || verified.last_block_hash
+                                    != bundle.payload.checkpoint_block_hash
+                                || verified.last_state_root != bundle.payload.checkpoint_qmdb_root
+                            {
+                                return Err(eyre::eyre!(
+                                    "bootstrap finalized range does not match its certified checkpoint"
+                                ));
+                            }
+                            let plan = build_replay_execution_plan_with_profile(
+                                &range,
+                                N42HeaderProfile::Gov5H2,
+                            )?;
+                            info!(
+                                target: "n42::cli",
+                                from = verified.from_block,
+                                to = verified.to_block,
+                                blocks = verified.block_count,
+                                head = %verified.last_block_hash,
+                                state_root = %verified.last_state_root,
+                                "prepared authenticated bundle cold-start replay"
+                            );
+                            Some(plan)
+                        } else {
+                            info!(
+                                target: "n42::cli",
+                                best_block = best_block_number,
+                                %head_block_hash,
+                                "bundle assets retained; continuing from persisted execution state"
+                            );
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                let mut consensus_head_number = bootstrap_replay_plan
+                    .as_ref()
+                    .map(|plan| plan.verification().to_block)
+                    .unwrap_or(best_block_number);
+                let mut consensus_head_hash = bootstrap_replay_plan
+                    .as_ref()
+                    .map(|plan| plan.verification().last_block_hash)
+                    .unwrap_or(head_block_hash);
+
+                // A crash after accepting an uncommitted side proposal can
+                // leave Reth's persisted canonical marker on that proposal
+                // while the consensus snapshot already records a different,
+                // execution-validated branch. Prefer the snapshot only when
+                // its exact hash is independently retained in the
+                // authenticated QMDB lineage, and derive its block number
+                // from parent edges rather than guessing from its view.
+                if bootstrap_replay_plan.is_none()
+                    && h2_v4_participant
+                    && let (Some(snap), Some(store), Some((base_number, _, _))) = (
+                        snapshot.as_ref(),
+                        qmdb_execution_store.as_ref(),
+                        qmdb_execution_base,
+                    )
+                    && snap.execution_validated_head_hash != B256::ZERO
+                    && snap.execution_validated_head_hash != consensus_head_hash
+                {
+                    let mut candidate = snap.execution_validated_head_hash;
+                    while let Some(distance) = store.distance_from_base(candidate)? {
+                        let candidate_number = base_number
+                            .checked_add(distance as u64)
+                            .ok_or_else(|| eyre::eyre!("QMDB recovery block number overflow"))?;
+                        let is_persisted_canonical = full_node
+                            .provider
+                            .block_hash(candidate_number)?
+                            .is_some_and(|hash| hash == candidate);
+                        if is_persisted_canonical {
+                            warn!(
+                                target: "n42::cli",
+                                persisted_canonical_number = consensus_head_number,
+                                persisted_canonical_hash = %consensus_head_hash,
+                                snapshot_number = base_number + store
+                                    .distance_from_base(snap.execution_validated_head_hash)?
+                                    .unwrap_or_default() as u64,
+                                snapshot_hash = %snap.execution_validated_head_hash,
+                                recovered_number = candidate_number,
+                                recovered_hash = %candidate,
+                                "persisted canonical marker differs from the QMDB-proven execution snapshot; starting catch-up from their highest retained common ancestor"
+                            );
+                            consensus_head_number = candidate_number;
+                            consensus_head_hash = candidate;
+                            break;
+                        }
+                        let Some(parent) = store.parent_for(candidate)? else {
+                            break;
+                        };
+                        candidate = parent;
+                    }
                 }
 
                 if let Some(ref jmt) = jmt {
@@ -1578,7 +1892,7 @@ fn main() {
                         qmdb_checkpoint = Some(checkpoint);
                     }
 
-                    let mut replay_plan = None;
+                    let mut replay_plan = bootstrap_replay_plan.take();
                     if let Ok(path) = std::env::var("N42_FINALIZED_RANGE_BOOTSTRAP") {
                         let checkpoint = qmdb_checkpoint.as_ref().ok_or_else(|| {
                             eyre::eyre!(
@@ -1658,9 +1972,19 @@ fn main() {
                         .map(|plan| plan.verification().last_block_hash)
                         .unwrap_or(head_block_hash);
 
-                    let keypair = libp2p::identity::Keypair::generate_ed25519();
+                    let (keypair, identity_source) =
+                        if let Some(keypair) = load_explicit_p2p_keypair(None)? {
+                            (keypair, "configured")
+                        } else {
+                            (libp2p::identity::Keypair::generate_ed25519(), "random")
+                        };
                     let local_peer_id = keypair.public().to_peer_id();
-                    info!(target: "n42::cli", %local_peer_id, "Observer P2P identity (random)");
+                    info!(
+                        target: "n42::cli",
+                        %local_peer_id,
+                        identity_source,
+                        "Observer P2P identity"
+                    );
 
                     let mut transport_config =
                         TransportConfig::for_network_size(startup_validator_set.len() as usize);
@@ -1713,7 +2037,9 @@ fn main() {
                         full_node.pool.blob_store().clone(),
                     )))
                     .with_exec_output_cache(std::sync::Arc::new(
-                        n42_node::exec_cache::RethExecutionOutputCache,
+                        n42_node::exec_cache::RethExecutionOutputCache::new(
+                            qmdb_execution_store.clone(),
+                        ),
                     ));
                     if let Some(schedule) = epoch_schedule.clone() {
                         observer =
@@ -2110,6 +2436,22 @@ fn main() {
                     let lcvv = snapshot
                         .last_commit_voted_view
                         .max(last_commit_voted_view_from_disk);
+                    // The fsync'd vote log is the crash-safety authority and
+                    // can be newer than the replace-in-place JSON snapshot.
+                    // Keep those values only as signature floors. Entering a
+                    // newer view requires the QC/TC that proves the transition;
+                    // a vote-log watermark alone cannot authorize a restarted
+                    // leader to propose there.
+                    let recovered_view = restart_entry_view(snapshot.current_view, lvv, lcvv);
+                    if lvv > recovered_view || lcvv > recovered_view {
+                        warn!(
+                            target: "n42::cli",
+                            snapshot_view = snapshot.current_view,
+                            last_voted_view = lvv,
+                            last_commit_voted_view = lcvv,
+                            "durable vote log is ahead of the snapshot; retaining vote floors while waiting for a QC/TC view transition"
+                        );
+                    }
                     ConsensusEngine::with_recovered_state_and_vote_log(
                         my_index,
                         secret_key,
@@ -2117,7 +2459,7 @@ fn main() {
                         consensus_config.base_timeout_ms,
                         consensus_config.max_timeout_ms,
                         output_tx,
-                        snapshot.current_view,
+                        recovered_view,
                         snapshot.locked_qc,
                         snapshot.last_committed_qc,
                         snapshot.consecutive_timeouts,
@@ -2230,6 +2572,7 @@ fn main() {
                         payload_builder_handle,
                     ),
                 );
+                let participant_replay_el = Arc::clone(&el);
                 let mut orchestrator = ConsensusOrchestrator::with_execution_layer(
                     consensus_engine,
                     std::sync::Arc::new(net_handle),
@@ -2238,19 +2581,22 @@ fn main() {
                     output_rx,
                     el,
                     consensus_state,
-                    head_block_hash,
+                    consensus_head_hash,
+                    consensus_head_number,
                     fee_recipient,
                 )
                 .with_tx_pool_bridge(tx_import_tx, tx_broadcast_rx)
                 .with_mobile_packet_tx(mobile_packet_tx)
-                .with_state_persistence(state_file)
+                .with_state_persistence(state_file.clone())
                 .with_validator_set(startup_validator_set)
                 .with_blob_store(std::sync::Arc::new(n42_node::blob_port::DiskBlobStorePort(
                     full_node.pool.blob_store().clone(),
                 )))
                 .with_defer_state_root(n42_node::defer_state_root_enabled())
                 .with_exec_output_cache(std::sync::Arc::new(
-                    n42_node::exec_cache::RethExecutionOutputCache,
+                    n42_node::exec_cache::RethExecutionOutputCache::new(
+                        qmdb_execution_store.clone(),
+                    ),
                 ))
                 .with_staking_sink(std::sync::Arc::new(
                     n42_node::sinks::ManagerStakingSink(staking_manager.clone()),
@@ -2283,7 +2629,7 @@ fn main() {
                     // view with a newer canonical hash: doing so would re-open
                     // the backward-FCU window during the first sync response.
                     let evidence_head = evidence_store.as_ref().and_then(|store| {
-                        match store.get(best_block_number) {
+                        match store.get(consensus_head_number) {
                             Ok(Some(evidence)) => Some((
                                 evidence.view,
                                 alloy_primitives::B256::from(evidence.block_hash),
@@ -2292,7 +2638,7 @@ fn main() {
                             Err(error) => {
                                 warn!(
                                     target: "n42::cli",
-                                    best_block = best_block_number,
+                                    best_block = consensus_head_number,
                                     %error,
                                     "failed to read canonical-head consensus evidence"
                                 );
@@ -2300,12 +2646,51 @@ fn main() {
                             }
                         }
                     });
+                    let durable_lineage_head =
+                        persistence::recover_execution_lineage_proof(
+                            &state_file,
+                            consensus_head_hash,
+                        )
+                        .map_err(|error| {
+                            eyre::eyre!(
+                                "failed to verify durable execution lineage {}: {error}",
+                                state_file.display()
+                            )
+                        })?;
+                    // Reth can durably accept/canonicalize a Valid payload a
+                    // few instructions before the separate execution-lineage
+                    // fsync. On restart, close that unavoidable cross-database
+                    // crash window with the canonical Gov5 header itself. This
+                    // fallback is allowed only in H2 participant mode after
+                    // the QMDB lineage check above proved that the exact Reth
+                    // head/root descends from the authenticated checkpoint.
+                    let canonical_header_head = if h2_v4_participant {
+                        full_node
+                            .provider
+                            .header(consensus_head_hash)
+                            .map_err(|error| {
+                                eyre::eyre!(
+                                    "failed to read canonical Gov5 head {}: {error}",
+                                    consensus_head_hash
+                                )
+                            })?
+                            .and_then(|header| {
+                                n42_consensus::validate_gov5_interop_header(&header)
+                                    .ok()
+                                    .and_then(|()| gov5_header_view(&header).ok())
+                                    .map(|view| (view, consensus_head_hash))
+                            })
+                    } else {
+                        None
+                    };
                     let (seeded_view, recovery_source) =
                         persistence::recover_execution_validated_head_view(
                             snap,
-                            head_block_hash,
-                            best_block_number,
-                            evidence_head,
+                            consensus_head_hash,
+                            consensus_head_number,
+                            evidence_head
+                                .or(durable_lineage_head)
+                                .or(canonical_header_head),
                         )
                         .map_err(|error| {
                             eyre::eyre!(
@@ -2318,7 +2703,7 @@ fn main() {
                         recovery_source,
                         snapshot_validated_view = snap.execution_validated_head_view,
                         snapshot_validated_hash = %snap.execution_validated_head_hash,
-                        %head_block_hash,
+                        head_block_hash = %consensus_head_hash,
                         "restored execution-validated head guard from snapshot"
                     );
                     orchestrator =
@@ -2368,7 +2753,29 @@ fn main() {
 
                 task_executor.spawn_critical_task(
                     "n42-consensus-orchestrator",
-                    Box::pin(orchestrator.run()),
+                    Box::pin(async move {
+                        if let Some(plan) = bootstrap_replay_plan {
+                            match import_authenticated_replay_plan(
+                                participant_replay_el.as_ref(),
+                                &plan,
+                            )
+                            .await
+                            {
+                                Ok(imported) => info!(
+                                    target: "n42::cli",
+                                    %imported,
+                                    blocks = plan.verification().block_count,
+                                    "authenticated bundle cold-start replay completed"
+                                ),
+                                Err(error) => {
+                                    panic!(
+                                        "authenticated bundle cold-start replay failed closed: {error}"
+                                    );
+                                }
+                            }
+                        }
+                        orchestrator.run().await;
+                    }),
                 );
 
                 info!(target: "n42::cli", "N42 consensus subsystem started");
@@ -2389,6 +2796,25 @@ mod observer_identity_tests {
     use super::*;
     use n42_twig_core::qmdb_compat::{QmdbEntrySnapshot, QmdbSlotEntry, QmdbSlotSnapshot};
     use std::io::Write;
+
+    #[test]
+    fn secret_hex_supports_file_reference_without_putting_secret_in_environment() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(file, "001122aabb").unwrap();
+        let reference = format!("@{}", file.path().display());
+
+        assert_eq!(
+            read_secret_hex("N42_TEST_KEY", &reference).unwrap(),
+            "001122aabb"
+        );
+        assert_eq!(read_secret_hex("N42_TEST_KEY", "ffeedd").unwrap(), "ffeedd");
+        assert!(read_secret_hex("N42_TEST_KEY", "@").is_err());
+    }
+
+    #[test]
+    fn vote_log_watermarks_do_not_manufacture_a_restart_view_transition() {
+        assert_eq!(restart_entry_view(1000, 1001, 1002), 1000);
+    }
 
     fn qmdb_portable_fixture() -> tempfile::NamedTempFile {
         let vector: serde_json::Value = serde_json::from_str(include_str!(
@@ -2501,6 +2927,30 @@ mod observer_identity_tests {
             resolve_header_profile(true, true, Some("0x01")).unwrap(),
             N42HeaderProfile::Gov5H2
         );
+    }
+
+    #[test]
+    fn authenticated_bootstrap_bundle_is_allowed_for_observers_and_participants() {
+        assert!(bootstrap_bundle_mode_allowed(
+            true,
+            false,
+            N42HeaderProfile::Gov5H2
+        ));
+        assert!(bootstrap_bundle_mode_allowed(
+            false,
+            true,
+            N42HeaderProfile::Gov5H2
+        ));
+        assert!(!bootstrap_bundle_mode_allowed(
+            false,
+            false,
+            N42HeaderProfile::Gov5H2
+        ));
+        assert!(!bootstrap_bundle_mode_allowed(
+            true,
+            false,
+            N42HeaderProfile::Ethereum
+        ));
     }
 
     #[test]

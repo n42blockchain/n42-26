@@ -6,7 +6,9 @@ use alloy_rlp::{Decodable, Header as RlpHeader};
 use std::io::Read;
 
 const MAGIC: &[u8; 8] = b"N42FRNG\x01";
-pub const MAX_FINALIZED_RANGE_BLOCKS: u64 = 128;
+/// Allows a bootstrap artifact to span a complete 1,000-view epoch. Live sync
+/// requests retain their independent, smaller batch bounds.
+pub const MAX_FINALIZED_RANGE_BLOCKS: u64 = 1024;
 const MAX_BLOB_SIZE: usize = 16 << 20;
 pub const MAX_MATERIALIZED_FINALIZED_RANGE_BYTES: usize = 256 << 20;
 

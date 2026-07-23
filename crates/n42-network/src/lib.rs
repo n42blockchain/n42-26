@@ -30,9 +30,11 @@ pub use finalized_range::{
 };
 pub use gov5_block::{
     Gov5BlockError, Gov5GossipBlock, decode_gov5_block_rlp, encode_gov5_block_rlp,
-    normalize_execution_payload_for_gov5_h2,
+    gov5_header_view, normalize_execution_payload_for_gov5_h2,
 };
-pub use h2_bridge::{H2BridgeError, consensus_from_h2_v4, consensus_to_h2_v4};
+pub use h2_bridge::{
+    H2BridgeError, consensus_from_h2_v4, consensus_to_h2_v4, quorum_certificate_from_h2,
+};
 pub use mobile::{
     MSG_TYPE_CACHE_SYNC, MSG_TYPE_CACHE_SYNC_ZSTD, ShardedStarHub, ShardedStarHubConfig,
     ShardedStarHubHandle, StarHub, StarHubConfig, StarHubHandle,

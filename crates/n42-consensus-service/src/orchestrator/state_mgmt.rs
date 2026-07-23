@@ -2,7 +2,7 @@ use super::{BlockDataBroadcast, CommittedBlock, ConsensusService};
 use crate::persistence::{self, ConsensusSnapshot};
 use alloy_primitives::B256;
 use metrics::counter;
-use n42_consensus::{validator_changes_hash, verify_commit_qc};
+use n42_consensus::{validator_changes_hash, verify_commit_qc_with_profile};
 use n42_network::{
     BlockSyncResponse, MAX_BLOCKS_PER_SYNC_REQUEST, MAX_SYNC_MESSAGE_SIZE, PeerId, SyncBlock,
     SyncPayload,
@@ -1164,7 +1164,12 @@ impl ConsensusService {
         }
 
         let ch = validator_changes_hash(&sync_block.validator_changes);
-        if let Err(e) = verify_commit_qc(&sync_block.commit_qc, vs, &ch) {
+        if let Err(e) = verify_commit_qc_with_profile(
+            &sync_block.commit_qc,
+            vs,
+            &ch,
+            self.engine.signing_profile(),
+        ) {
             warn!(
                 target: "n42::cl::sync",
                 view = sync_block.view,

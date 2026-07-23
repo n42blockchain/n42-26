@@ -688,6 +688,7 @@ impl ConsensusService {
         self.finalize_committed_block(view, block_hash, commit_qc)
             .await;
         self.save_consensus_state();
+        crate::qualification_abort_at("commit_qc_persisted");
 
         // Note: if finalize_committed_block spawned a background import (Case B),
         // we do NOT schedule the next payload build here. It will be triggered by
@@ -1123,10 +1124,8 @@ impl ConsensusService {
         // Reset eager import block guard on view change: the previous view's proposal
         // was not committed, so the new leader may propose a different block at the
         // same height. The guard must allow reimporting the same block number.
-        self.eager_import_block_guard.store(
-            self.committed_block_count,
-            std::sync::atomic::Ordering::SeqCst,
-        );
+        self.eager_import_block_guard
+            .store(0, std::sync::atomic::Ordering::SeqCst);
 
         info!(target: "n42::cl::consensus_loop", new_view, "view changed");
 
@@ -1319,6 +1318,26 @@ impl ConsensusService {
 
         self.head_block_hash = hash;
         self.execution_validated_head_view = view;
+        if let Some(block_number) = self.h2_v4_block_numbers.remove(&hash) {
+            self.head_block_number = self.head_block_number.max(block_number);
+            self.prune_executed_h2_v4_catchup_history();
+        }
+        if let Some(path) = self.state_file.as_deref()
+            && let Err(error) = crate::persistence::append_execution_lineage_proof(path, view, hash)
+        {
+            error!(
+                target: "n42::cl::sync",
+                view,
+                %hash,
+                %error,
+                "failed to persist execution-valid lineage proof"
+            );
+        }
+        // A canonical FCU can complete after the BlockCommitted snapshot was
+        // written. Persist the exact (view, hash) proof at the point execution
+        // validity advances so a crash/restart never observes a newer Reth head
+        // paired with a stale execution guard.
+        self.save_consensus_state();
         // Execution is now confirmed for this block: flush its staged sidecar
         // state-tree diff (no-op when nothing is staged - e.g. catch-up blocks
         // whose broadcast never reached us; the sidecar catch-up path owns those).

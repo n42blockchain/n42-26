@@ -10,6 +10,14 @@ description = "N42 blockchain node binary"
 name = "n42-node"
 path = "src/main.rs"
 
+[[bin]]
+name = "n42-bootstrap"
+path = "src/bootstrap_main.rs"
+
+[[bin]]
+name = "n42-qmdb-proof-verify"
+path = "src/qmdb_proof_verify_main.rs"
+
 [dependencies]
 metrics.workspace = true
 n42-node.workspace = true

@@ -155,7 +155,10 @@ fn make_diff_distinct(n: usize) -> StateDiff {
                 } else {
                     AccountChangeType::Modified
                 },
-                balance: Some(ValueChange::new(U256::from(1000u64), U256::from(1000u64 + i as u64))),
+                balance: Some(ValueChange::new(
+                    U256::from(1000u64),
+                    U256::from(1000u64 + i as u64),
+                )),
                 nonce: Some(ValueChange::new(i as u64, i as u64 + 1)),
                 code_change: None,
                 storage: BTreeMap::new(),
