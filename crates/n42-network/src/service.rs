@@ -44,9 +44,46 @@ const SYNC_RATE_WINDOW: Duration = Duration::from_secs(1);
 const MAX_SYNC_REQUESTS_UNTRUSTED: u32 = 4;
 const MAX_SYNC_REQUESTS_VALIDATOR: u32 = 32;
 const MAX_PENDING_GOV5_BLOCK_REQUESTS: usize = 256;
+const MAX_GOV5_BLOCK_FETCH_FANOUT: usize = 8;
 const MAX_RECENT_GOV5_BLOCK_REQUESTS: usize = 4096;
 const GOV5_BLOCK_REQUEST_COOLDOWN: Duration = Duration::from_millis(750);
 const MAX_SERVED_GOV5_BLOCKS: usize = 1024;
+
+fn gov5_block_fetch_fanout(
+    preferred: PeerId,
+    last_peer: Option<PeerId>,
+    advertised_connected: &[PeerId],
+    connected: &[PeerId],
+) -> Vec<PeerId> {
+    let mut peers = Vec::with_capacity(MAX_GOV5_BLOCK_FETCH_FANOUT);
+    let mut push = |peer: PeerId| {
+        if peers.len() < MAX_GOV5_BLOCK_FETCH_FANOUT && !peers.contains(&peer) {
+            peers.push(peer);
+        }
+    };
+
+    // Preserve the authenticated message source as the first choice, then
+    // cover every connected implementation in one bounded round. Keeping the
+    // previous failed peer until last prevents a pair of lagging Rust nodes
+    // from selecting only each other while Gov5 peers already have the body.
+    if connected.contains(&preferred) && Some(preferred) != last_peer {
+        push(preferred);
+    }
+    for peer in advertised_connected
+        .iter()
+        .chain(connected)
+        .copied()
+        .filter(|peer| Some(*peer) != last_peer)
+    {
+        push(peer);
+    }
+    if let Some(last_peer) = last_peer
+        && connected.contains(&last_peer)
+    {
+        push(last_peer);
+    }
+    peers
+}
 
 #[derive(Clone, Copy)]
 struct SyncRequestWindow {
@@ -2097,10 +2134,9 @@ impl NetworkService {
             } => {
                 let Some(requested_hash) = self.pending_gov5_block_requests.remove(&request_id)
                 else {
-                    tracing::warn!(%peer, "received gov5 block response for unknown request");
+                    tracing::debug!(%peer, "received redundant gov5 block response after another fan-out peer succeeded");
                     return;
                 };
-                self.pending_gov5_block_hashes.remove(&requested_hash);
                 match self.retain_gov5_served_block(&response.rlp) {
                     Ok(actual_hash) if actual_hash == requested_hash => {}
                     Ok(actual_hash) => {
@@ -2108,26 +2144,43 @@ impl NetworkService {
                         let error = format!(
                             "gov5 block fetch hash mismatch: requested {requested_hash}, got {actual_hash}"
                         );
-                        self.recent_gov5_block_requests.remove(&requested_hash);
                         metrics::counter!("n42_gov5_block_fetch_failed_total").increment(1);
-                        self.emit_event(NetworkEvent::Gov5BlockFetchFailed {
-                            source: peer,
-                            block_hash: requested_hash,
-                            error,
-                        });
+                        if !self
+                            .pending_gov5_block_requests
+                            .values()
+                            .any(|hash| *hash == requested_hash)
+                        {
+                            self.pending_gov5_block_hashes.remove(&requested_hash);
+                            self.recent_gov5_block_requests.remove(&requested_hash);
+                            self.emit_event(NetworkEvent::Gov5BlockFetchFailed {
+                                source: peer,
+                                block_hash: requested_hash,
+                                error,
+                            });
+                        }
                         return;
                     }
                     Err(error) => {
-                        self.recent_gov5_block_requests.remove(&requested_hash);
                         metrics::counter!("n42_gov5_block_fetch_failed_total").increment(1);
-                        self.emit_event(NetworkEvent::Gov5BlockFetchFailed {
-                            source: peer,
-                            block_hash: requested_hash,
-                            error: format!("invalid gov5 block fetch response: {error}"),
-                        });
+                        if !self
+                            .pending_gov5_block_requests
+                            .values()
+                            .any(|hash| *hash == requested_hash)
+                        {
+                            self.pending_gov5_block_hashes.remove(&requested_hash);
+                            self.recent_gov5_block_requests.remove(&requested_hash);
+                            self.emit_event(NetworkEvent::Gov5BlockFetchFailed {
+                                source: peer,
+                                block_hash: requested_hash,
+                                error: format!("all fan-out peers failed; final response: {error}"),
+                            });
+                        }
                         return;
                     }
                 }
+                self.pending_gov5_block_hashes.remove(&requested_hash);
+                self.pending_gov5_block_requests
+                    .retain(|_, hash| *hash != requested_hash);
                 metrics::counter!("n42_gov5_block_fetch_succeeded_total").increment(1);
                 self.emit_event(NetworkEvent::Gov5BlockFetched {
                     source: peer,
@@ -2142,8 +2195,6 @@ impl NetworkService {
                 ..
             } => {
                 if let Some(block_hash) = self.pending_gov5_block_requests.remove(&request_id) {
-                    self.pending_gov5_block_hashes.remove(&block_hash);
-                    self.recent_gov5_block_requests.remove(&block_hash);
                     let error_text = error.to_string();
                     if error_text.contains("supports none")
                         || error_text.contains("UnsupportedProtocols")
@@ -2151,11 +2202,19 @@ impl NetworkService {
                         self.gov5_block_by_hash_peers.remove(&peer);
                     }
                     metrics::counter!("n42_gov5_block_fetch_failed_total").increment(1);
-                    self.emit_event(NetworkEvent::Gov5BlockFetchFailed {
-                        source: peer,
-                        block_hash,
-                        error: error_text,
-                    });
+                    if !self
+                        .pending_gov5_block_requests
+                        .values()
+                        .any(|hash| *hash == block_hash)
+                    {
+                        self.pending_gov5_block_hashes.remove(&block_hash);
+                        self.recent_gov5_block_requests.remove(&block_hash);
+                        self.emit_event(NetworkEvent::Gov5BlockFetchFailed {
+                            source: peer,
+                            block_hash,
+                            error: format!("all fan-out peers failed; final failure: {error_text}"),
+                        });
+                    }
                 }
             }
             libp2p::request_response::Event::InboundFailure { peer, error, .. } => {
@@ -2644,28 +2703,19 @@ impl NetworkService {
                 // Falling back across all connected peers also avoids a
                 // Rust↔Rust missing-parent loop when only Rust peers happened
                 // to advertise the capability.
-                let selected_peer = if self.swarm.is_connected(&peer) && Some(peer) != last_peer {
-                    Some(peer)
-                } else {
-                    self.gov5_block_by_hash_peers
-                        .iter()
-                        .copied()
-                        .find(|candidate| Some(*candidate) != last_peer)
-                        .or_else(|| {
-                            self.gov5_block_by_hash_peers
-                                .contains(&peer)
-                                .then_some(peer)
-                        })
-                        .or_else(|| {
-                            self.swarm
-                                .connected_peers()
-                                .copied()
-                                .find(|candidate| Some(*candidate) != last_peer)
-                        })
-                        .or_else(|| self.swarm.is_connected(&peer).then_some(peer))
-                        .or_else(|| self.gov5_block_by_hash_peers.iter().copied().next())
-                };
-                let Some(selected_peer) = selected_peer else {
+                let connected: Vec<_> = self.swarm.connected_peers().copied().collect();
+                let advertised_connected: Vec<_> = self
+                    .gov5_block_by_hash_peers
+                    .iter()
+                    .copied()
+                    .filter(|candidate| connected.contains(candidate))
+                    .collect();
+                let mut selected_peers =
+                    gov5_block_fetch_fanout(peer, last_peer, &advertised_connected, &connected);
+                let available =
+                    MAX_PENDING_GOV5_BLOCK_REQUESTS - self.pending_gov5_block_requests.len();
+                selected_peers.truncate(available);
+                if selected_peers.is_empty() {
                     metrics::counter!(
                         "n42_gov5_block_fetch_suppressed_total",
                         "reason" => "unsupported_peer"
@@ -2677,17 +2727,21 @@ impl NetworkService {
                         "no connected peer advertises gov5 block-by-hash"
                     );
                     return;
-                };
-                let request_id = self
-                    .swarm
-                    .behaviour_mut()
-                    .gov5_block_by_hash
-                    .send_request(&selected_peer, Gov5BlockByHashRequest { block_hash });
-                self.pending_gov5_block_requests
-                    .insert(request_id, block_hash);
+                }
+                for selected_peer in &selected_peers {
+                    let request_id = self
+                        .swarm
+                        .behaviour_mut()
+                        .gov5_block_by_hash
+                        .send_request(selected_peer, Gov5BlockByHashRequest { block_hash });
+                    self.pending_gov5_block_requests
+                        .insert(request_id, block_hash);
+                }
                 self.pending_gov5_block_hashes.insert(block_hash);
                 self.recent_gov5_block_requests
-                    .insert(block_hash, (now, selected_peer));
+                    .insert(block_hash, (now, selected_peers[0]));
+                metrics::counter!("n42_gov5_block_fetch_fanout_total")
+                    .increment(selected_peers.len() as u64);
             }
             NetworkCommand::AnnounceBlock(data) => {
                 self.gossipsub_publish(block_announce_topic(), data, "block announcement");
@@ -3058,6 +3112,32 @@ mod tests {
         assert!(dedup.observe(b"block-a"));
         assert!(!dedup.observe(b"block-b"));
         assert!(dedup.observe(b"block-b"));
+    }
+
+    #[test]
+    fn gov5_block_fetch_fanout_covers_connected_peers_and_defers_last_failure() {
+        let preferred = PeerId::random();
+        let advertised = PeerId::random();
+        let rust_peer = PeerId::random();
+        let connected = vec![preferred, advertised, rust_peer];
+
+        let peers = gov5_block_fetch_fanout(preferred, Some(rust_peer), &[advertised], &connected);
+
+        assert_eq!(peers[0], preferred);
+        assert!(peers.contains(&advertised));
+        assert_eq!(peers.last(), Some(&rust_peer));
+        assert_eq!(peers.len(), connected.len());
+    }
+
+    #[test]
+    fn gov5_block_fetch_fanout_ignores_unconnected_preferred_peer() {
+        let preferred = PeerId::random();
+        let connected = vec![PeerId::random(), PeerId::random()];
+
+        let peers = gov5_block_fetch_fanout(preferred, None, &[], &connected);
+
+        assert!(!peers.contains(&preferred));
+        assert_eq!(peers.len(), connected.len());
     }
 
     #[test]
