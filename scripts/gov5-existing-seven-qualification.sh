@@ -483,8 +483,9 @@ monitor_observer() {
           at:$at,event:"p6_observer_soak_sample",ok:$ok,
           minHeight:$minHeight,maxHeight:$maxHeight,lag:($maxHeight-$minHeight),
           commonBlockHash:$blockHash,stateRoot:$stateRoot,receiptsRoot:$receiptsRoot,
-          observerStatus:$observerStatus,observerReadOnly:($observerStatus.hasCommittedQc == false)
-          ,observerArchive:$observerArchive
+          observerStatus:$observerStatus,
+          observerReadOnly:($observerStatus.hasCommittedQc == false),
+          observerArchive:$observerArchive
         }' >>"$evidence_file"
     else
       jq -nc --arg at "$(date -u +%FT%TZ)" \
@@ -584,38 +585,40 @@ monitor_participant() {
         last_scanned="$min_height"
       fi
       local block_number
-      for block_number in $(seq $((last_scanned + 1)) "$min_height"); do
-        local response miner block_hash
-        response="$(curl -fsS --max-time 5 \
-          -H 'content-type: application/json' \
-          --data "$(jq -nc --arg height "$(printf '0x%x' "$block_number")" \
-            '{jsonrpc:"2.0",id:1,method:"eth_getBlockByNumber",params:[$height,false]}')" \
-          http://127.0.0.1:30516)"
-        miner="$(printf '%s' "$response" | jq -er '.result.miner | ascii_downcase')"
-        block_hash="$(printf '%s' "$response" | jq -er '.result.hash')"
-        local validator_index=-1
-        local index
-        for index in 0 1 2 3 4 5 6; do
-          if test "$miner" = "${gov_addresses[$index]}"; then
-            validator_index="$index"
-            leader_counts[$index]=$((leader_counts[$index] + 1))
+      if test "$last_scanned" -lt "$min_height"; then
+        for block_number in $(seq $((last_scanned + 1)) "$min_height"); do
+          local response miner block_hash
+          response="$(curl -fsS --max-time 5 \
+            -H 'content-type: application/json' \
+            --data "$(jq -nc --arg height "$(printf '0x%x' "$block_number")" \
+              '{jsonrpc:"2.0",id:1,method:"eth_getBlockByNumber",params:[$height,false]}')" \
+            http://127.0.0.1:30516)"
+          miner="$(printf '%s' "$response" | jq -er '.result.miner | ascii_downcase')"
+          block_hash="$(printf '%s' "$response" | jq -er '.result.hash')"
+          local validator_index=-1
+          local index
+          for index in 0 1 2 3 4 5 6; do
+            if test "$miner" = "${gov_addresses[$index]}"; then
+              validator_index="$index"
+              leader_counts[$index]=$((leader_counts[$index] + 1))
+              break
+            fi
+          done
+          if test "$validator_index" -lt 0; then
+            ok=false
             break
           fi
+          if test "$validator_index" -eq 6; then
+            jq -nc \
+              --arg at "$(date -u +%FT%TZ)" \
+              --argjson height "$block_number" \
+              --arg hash "$block_hash" \
+              --arg miner "$miner" \
+              '{at:$at,event:"p6_rust_leader_block",height:$height,hash:$hash,miner:$miner}' \
+              >>"$leader_evidence"
+          fi
         done
-        if test "$validator_index" -lt 0; then
-          ok=false
-          break
-        fi
-        if test "$validator_index" -eq 6; then
-          jq -nc \
-            --arg at "$(date -u +%FT%TZ)" \
-            --argjson height "$block_number" \
-            --arg hash "$block_hash" \
-            --arg miner "$miner" \
-            '{at:$at,event:"p6_rust_leader_block",height:$height,hash:$hash,miner:$miner}' \
-            >>"$leader_evidence"
-        fi
-      done
+      fi
       last_scanned="$min_height"
     fi
 

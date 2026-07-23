@@ -341,6 +341,12 @@ pub struct ConsensusService {
     /// It is released to Engine API only in ascending block order.
     h2_v4_catchup_blocks: BTreeMap<u64, (PeerId, Vec<u8>)>,
     h2_v4_catchup_active: bool,
+    /// Peers that failed to serve an authenticated block hash during the
+    /// current bounded retry round. A mixed Rust/Gov set may gossip a child
+    /// from a Rust validator whose execution head is also behind; retrying
+    /// that same peer forever prevents either Rust node from reaching a Gov
+    /// peer that already has the missing parent.
+    h2_v4_fetch_failed_peers: BTreeMap<B256, (Instant, HashSet<PeerId>)>,
     /// Network port (Caplin sentinel-client seam). One in-process adapter today
     /// (`NetworkHandle`); the trait object lets the orchestrator move into a
     /// service crate without depending on `n42-network` / libp2p internals.
@@ -1704,6 +1710,7 @@ impl ConsensusService {
             h2_v4_unbound_blocks: BTreeMap::new(),
             h2_v4_catchup_blocks: BTreeMap::new(),
             h2_v4_catchup_active: false,
+            h2_v4_fetch_failed_peers: BTreeMap::new(),
             network,
             consensus_event_rx: None,
             net_event_rx,
@@ -1927,6 +1934,7 @@ impl ConsensusService {
             h2_v4_unbound_blocks: BTreeMap::new(),
             h2_v4_catchup_blocks: BTreeMap::new(),
             h2_v4_catchup_active: false,
+            h2_v4_fetch_failed_peers: BTreeMap::new(),
             network,
             consensus_event_rx: Some(consensus_event_rx),
             net_event_rx,
@@ -3161,6 +3169,7 @@ impl ConsensusService {
                 requested_hash,
                 rlp,
             } if self.h2_v4_identity.is_some() => {
+                self.h2_v4_fetch_failed_peers.remove(&requested_hash);
                 self.handle_h2_v4_gov5_block(source, rlp, Some(requested_hash))
                     .await;
             }
@@ -3170,6 +3179,59 @@ impl ConsensusService {
                 error,
             } if self.h2_v4_identity.is_some() => {
                 warn!(target: "n42::interop::h2v4", %source, %block_hash, %error, "H2-authenticated gov5 block fetch failed");
+                const FETCH_RETRY_ROUND: Duration = Duration::from_secs(5);
+                let now = Instant::now();
+                let attempted = {
+                    let entry = self
+                        .h2_v4_fetch_failed_peers
+                        .entry(block_hash)
+                        .or_insert_with(|| (now, HashSet::new()));
+                    if now.duration_since(entry.0) >= FETCH_RETRY_ROUND {
+                        entry.0 = now;
+                        entry.1.clear();
+                    }
+                    entry.1.insert(source);
+                    entry.1.clone()
+                };
+                while self.h2_v4_fetch_failed_peers.len() > 2048 {
+                    self.h2_v4_fetch_failed_peers.pop_first();
+                }
+                let retry_peer = self
+                    .connected_peers
+                    .iter()
+                    .copied()
+                    .find(|peer| !attempted.contains(peer));
+                if let Some(retry_peer) = retry_peer {
+                    if let Err(retry_error) = self
+                        .network
+                        .request_gov5_block_by_hash(retry_peer, block_hash)
+                    {
+                        debug!(
+                            target: "n42::interop::h2v4",
+                            %retry_peer,
+                            %block_hash,
+                            %retry_error,
+                            "could not queue alternate authenticated Gov5 block fetch"
+                        );
+                    } else {
+                        counter!("n42_h2_v4_block_fetch_retries_total").increment(1);
+                        debug!(
+                            target: "n42::interop::h2v4",
+                            failed_peer = %source,
+                            %retry_peer,
+                            %block_hash,
+                            attempted = attempted.len(),
+                            "retrying authenticated Gov5 block fetch with another peer"
+                        );
+                    }
+                } else {
+                    warn!(
+                        target: "n42::interop::h2v4",
+                        %block_hash,
+                        attempted = attempted.len(),
+                        "authenticated Gov5 block fetch exhausted connected peers for this retry round"
+                    );
+                }
             }
             NetworkEvent::TransactionReceived { source: _, data } => {
                 self.enqueue_tx_import(data, "p2p transaction received")

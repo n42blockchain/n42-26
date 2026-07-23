@@ -725,6 +725,208 @@ archive_rpc_parity() {
   done
 }
 
+transaction_burst() {
+  local artifact="${1:-$runtime/artifacts/p4-signed-transaction-burst.json}"
+  local evidence_file="${2:-$runtime/evidence/p4-transaction-burst.jsonl}"
+  local sender contract
+  local ports=(28501 28502 28503 28504 28505 29545 29546)
+  require_file "$artifact"
+  jq -e '
+    (.chainId == 1143) and
+    (.expectedContract | test("^0x[0-9a-f]{40}$")) and
+    (.transactions | length >= 17) and
+    ([.transactions[].nonce] == [range(0; .transactions | length)]) and
+    (all(.transactions[];
+      (.raw | startswith("0x")) and
+      (.hash | test("^0x[0-9a-f]{64}$")) and
+      (.intendedIngress == "gov" or .intendedIngress == "rust")))
+  ' "$artifact" >/dev/null
+  sender="$(jq -er '.sender' "$artifact")"
+  contract="$(jq -er '.expectedContract' "$artifact")"
+  mkdir -p "$(dirname "$evidence_file")"
+
+  local port nonce_response
+  for port in "${ports[@]}"; do
+    nonce_response="$(rpc_request "http://127.0.0.1:$port" \
+      eth_getTransactionCount "$(jq -nc --arg sender "$sender" '[$sender,"latest"]')")"
+    if test "$(printf '%s' "$nonce_response" | jq -er '.result')" != "0x0"; then
+      echo "transaction burst requires sender nonce 0 at port $port" >&2
+      return 1
+    fi
+  done
+
+  local count index kind nonce ingress raw expected_hash ingress_port
+  local response returned_hash receipt block_number first_block="" last_block=""
+  count="$(jq -er '.transactions | length' "$artifact")"
+  for index in $(seq 0 $((count - 1))); do
+    kind="$(jq -er --argjson index "$index" '.transactions[$index].kind' "$artifact")"
+    nonce="$(jq -er --argjson index "$index" '.transactions[$index].nonce' "$artifact")"
+    ingress="$(jq -er --argjson index "$index" '.transactions[$index].intendedIngress' "$artifact")"
+    raw="$(jq -er --argjson index "$index" '.transactions[$index].raw' "$artifact")"
+    expected_hash="$(jq -er --argjson index "$index" '.transactions[$index].hash' "$artifact")"
+    if test "$ingress" = gov; then
+      ingress_port=28501
+    else
+      ingress_port=29545
+    fi
+    response="$(rpc_request "http://127.0.0.1:$ingress_port" \
+      eth_sendRawTransaction "$(jq -nc --arg raw "$raw" '[$raw]')")"
+    returned_hash="$(printf '%s' "$response" | jq -er 'select(.error == null) | .result')"
+    if test "$returned_hash" != "$expected_hash"; then
+      echo "transaction hash mismatch at nonce $nonce" >&2
+      return 1
+    fi
+
+    receipt=""
+    for _ in $(seq 1 300); do
+      response="$(rpc_request "http://127.0.0.1:$ingress_port" \
+        eth_getTransactionReceipt "$(jq -nc --arg hash "$expected_hash" '[$hash]')")"
+      if test "$(printf '%s' "$response" | jq -r '.result != null')" = true; then
+        receipt="$(printf '%s' "$response" | jq -ec '.result')"
+        break
+      fi
+      sleep 1
+    done
+    if test -z "$receipt"; then
+      echo "transaction was not finalized within 300 seconds: $expected_hash" >&2
+      return 1
+    fi
+    if test "$(printf '%s' "$receipt" | jq -er '.status')" != "0x1"; then
+      echo "transaction execution failed: $expected_hash" >&2
+      return 1
+    fi
+    block_number="$(printf '%s' "$receipt" | jq -er '.blockNumber')"
+    if test -z "$first_block"; then
+      first_block="$block_number"
+    fi
+    last_block="$block_number"
+    jq -nc \
+      --arg at "$(date -u +%FT%TZ)" \
+      --arg kind "$kind" \
+      --argjson nonce "$nonce" \
+      --arg ingress "$ingress" \
+      --argjson ingress_port "$ingress_port" \
+      --arg transaction_hash "$expected_hash" \
+      --arg block_number "$block_number" \
+      '{
+        at:$at,event:"p4_transaction_finalized",kind:$kind,nonce:$nonce,
+        ingress:$ingress,ingressPort:$ingress_port,
+        transactionHash:$transaction_hash,blockNumber:$block_number,status:"0x1"
+      }' >>"$evidence_file"
+  done
+
+  local method params reference candidate
+  local exact_checks=0
+  for method in \
+    eth_getBlockByNumber:false \
+    eth_getBlockByNumber:true \
+    eth_getBlockReceipts \
+    eth_getLogs; do
+    case "$method" in
+      eth_getBlockByNumber:false)
+        params="$(jq -nc --arg block "$last_block" '[$block,false]')" ;;
+      eth_getBlockByNumber:true)
+        params="$(jq -nc --arg block "$last_block" '[$block,true]')" ;;
+      eth_getBlockReceipts)
+        params="$(jq -nc --arg block "$last_block" '[$block]')" ;;
+      eth_getLogs)
+        params="$(jq -nc --arg first "$first_block" --arg last "$last_block" \
+          '[{fromBlock:$first,toBlock:$last}]')" ;;
+    esac
+    reference=""
+    for port in "${ports[@]}"; do
+      candidate="$(rpc_request "http://127.0.0.1:$port" "${method%%:*}" "$params" |
+        jq -ecS 'select(.error == null) | .result')"
+      if test -z "$reference"; then
+        reference="$candidate"
+      elif test "$candidate" != "$reference"; then
+        echo "transaction burst RPC mismatch: $method at port $port" >&2
+        return 1
+      fi
+      exact_checks=$((exact_checks + 1))
+    done
+  done
+
+  local hash
+  while IFS= read -r hash; do
+    for method in eth_getTransactionByHash eth_getTransactionReceipt; do
+      params="$(jq -nc --arg hash "$hash" '[$hash]')"
+      reference=""
+      for port in "${ports[@]}"; do
+        candidate="$(rpc_request "http://127.0.0.1:$port" "$method" "$params" |
+          jq -ecS 'select(.error == null) | .result')"
+        if test -z "$reference"; then
+          reference="$candidate"
+        elif test "$candidate" != "$reference"; then
+          echo "transaction burst RPC mismatch: $method $hash at port $port" >&2
+          return 1
+        fi
+        exact_checks=$((exact_checks + 1))
+      done
+    done
+  done < <(jq -r '.transactions[].hash' "$artifact")
+
+  local state_method
+  for state_method in \
+    "eth_getTransactionCount:$sender" \
+    "eth_getBalance:$sender" \
+    "eth_getBalance:0x000000000000000000000000000000000000dead" \
+    "eth_getCode:$contract"; do
+    params="$(jq -nc --arg address "${state_method#*:}" --arg block "$last_block" \
+      '[$address,$block]')"
+    reference=""
+    for port in "${ports[@]}"; do
+      candidate="$(rpc_request "http://127.0.0.1:$port" "${state_method%%:*}" "$params" |
+        jq -ecS 'select(.error == null) | .result')"
+      if test -z "$reference"; then
+        reference="$candidate"
+      elif test "$candidate" != "$reference"; then
+        echo "transaction burst state mismatch: $state_method at port $port" >&2
+        return 1
+      fi
+      exact_checks=$((exact_checks + 1))
+    done
+  done
+  params="$(jq -nc --arg contract "$contract" --arg block "$last_block" \
+    '[$contract,"0x0",$block]')"
+  reference=""
+  for port in "${ports[@]}"; do
+    candidate="$(rpc_request "http://127.0.0.1:$port" eth_getStorageAt "$params" |
+      jq -ecS 'select(.error == null) | .result')"
+    if test -z "$reference"; then
+      reference="$candidate"
+    elif test "$candidate" != "$reference"; then
+      echo "transaction burst storage mismatch at port $port" >&2
+      return 1
+    fi
+    exact_checks=$((exact_checks + 1))
+  done
+  if test "$reference" != \
+    "0x0000000000000000000000000000000000000000000000000000000000000001"; then
+    echo "transaction burst contract storage did not contain one" >&2
+    return 1
+  fi
+
+  jq -nc \
+    --arg at "$(date -u +%FT%TZ)" \
+    --arg artifact "$artifact" \
+    --arg artifact_sha256 "$(sha256sum "$artifact" | awk '{print $1}')" \
+    --arg sender "$sender" \
+    --arg contract "$contract" \
+    --arg first_block "$first_block" \
+    --arg last_block "$last_block" \
+    --argjson transactions "$count" \
+    --argjson exact_checks "$exact_checks" \
+    '{
+      at:$at,event:"p4_transaction_burst_pass",artifact:$artifact,
+      artifactSha256:$artifact_sha256,sender:$sender,contract:$contract,
+      firstBlock:$first_block,lastBlock:$last_block,transactions:$transactions,
+      govIngress:true,rustIngress:true,allSevenEndpointsExact:true,
+      receiptAndLogParity:true,stateAndStorageParity:true,
+      exactRpcComparisons:$exact_checks
+    }' >>"$evidence_file"
+}
+
 case "${1:-}" in
   start-gov) start_gov ;;
   start-gov-node) start_gov_node "${2:-}" ;;
@@ -753,8 +955,9 @@ case "${1:-}" in
   archive-import) archive_import "${2:-}" "${3:-}" ;;
   archive-corruption-drill) archive_corruption_drill "${2:-}" "${3:-}" "${4:-}" "${5:-}" ;;
   archive-rpc-parity) archive_rpc_parity "${2:-}" "${3:-}" "${4:-}" ;;
+  transaction-burst) transaction_burst "${2:-}" "${3:-}" ;;
   *)
-    echo "usage: $0 {start-gov|start-gov-node N|start-rust|start-rust2|start|stop|restart-gov-node N|restart-rust|restart-rust2|status|monitor-heads <seconds> [interval] [evidence-file]|record-clock <label> [evidence-file]|record-head <label> <port> [evidence-file]|era-checksums <directory>|archive-export <node> <snapshot>|archive-verify <snapshot>|archive-import <snapshot> <fresh-destination>|archive-corruption-drill <snapshot> <corrupt-copy> <recovered-copy> [evidence-file]|archive-rpc-parity <gov-endpoint> <rust-endpoint> [evidence-file]}" >&2
+    echo "usage: $0 {start-gov|start-gov-node N|start-rust|start-rust2|start|stop|restart-gov-node N|restart-rust|restart-rust2|status|monitor-heads <seconds> [interval] [evidence-file]|record-clock <label> [evidence-file]|record-head <label> <port> [evidence-file]|era-checksums <directory>|archive-export <node> <snapshot>|archive-verify <snapshot>|archive-import <snapshot> <fresh-destination>|archive-corruption-drill <snapshot> <corrupt-copy> <recovered-copy> [evidence-file]|archive-rpc-parity <gov-endpoint> <rust-endpoint> [evidence-file]|transaction-burst [ARTIFACT] [EVIDENCE]}" >&2
     exit 2
     ;;
 esac

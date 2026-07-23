@@ -2108,6 +2108,7 @@ impl NetworkService {
                         let error = format!(
                             "gov5 block fetch hash mismatch: requested {requested_hash}, got {actual_hash}"
                         );
+                        self.recent_gov5_block_requests.remove(&requested_hash);
                         metrics::counter!("n42_gov5_block_fetch_failed_total").increment(1);
                         self.emit_event(NetworkEvent::Gov5BlockFetchFailed {
                             source: peer,
@@ -2117,6 +2118,7 @@ impl NetworkService {
                         return;
                     }
                     Err(error) => {
+                        self.recent_gov5_block_requests.remove(&requested_hash);
                         metrics::counter!("n42_gov5_block_fetch_failed_total").increment(1);
                         self.emit_event(NetworkEvent::Gov5BlockFetchFailed {
                             source: peer,
@@ -2141,6 +2143,7 @@ impl NetworkService {
             } => {
                 if let Some(block_hash) = self.pending_gov5_block_requests.remove(&request_id) {
                     self.pending_gov5_block_hashes.remove(&block_hash);
+                    self.recent_gov5_block_requests.remove(&block_hash);
                     let error_text = error.to_string();
                     if error_text.contains("supports none")
                         || error_text.contains("UnsupportedProtocols")
@@ -2633,21 +2636,35 @@ impl NetworkService {
                 }
 
                 let last_peer = previous.map(|(_, last_peer)| last_peer);
-                let selected_peer =
-                    if self.gov5_block_by_hash_peers.contains(&peer) && Some(peer) != last_peer {
-                        Some(peer)
-                    } else {
-                        self.gov5_block_by_hash_peers
-                            .iter()
-                            .copied()
-                            .find(|candidate| Some(*candidate) != last_peer)
-                            .or_else(|| {
-                                self.gov5_block_by_hash_peers
-                                    .contains(&peer)
-                                    .then_some(peer)
-                            })
-                            .or_else(|| self.gov5_block_by_hash_peers.iter().copied().next())
-                    };
+                // Gov5 registers the compatible stream handler after its
+                // identify service starts, so older peers do not always
+                // advertise the protocol in their first identify snapshot.
+                // A trusted, connected preferred peer is still safe to try:
+                // multistream-select will reject it cleanly if unsupported.
+                // Falling back across all connected peers also avoids a
+                // Rust↔Rust missing-parent loop when only Rust peers happened
+                // to advertise the capability.
+                let selected_peer = if self.swarm.is_connected(&peer) && Some(peer) != last_peer {
+                    Some(peer)
+                } else {
+                    self.gov5_block_by_hash_peers
+                        .iter()
+                        .copied()
+                        .find(|candidate| Some(*candidate) != last_peer)
+                        .or_else(|| {
+                            self.gov5_block_by_hash_peers
+                                .contains(&peer)
+                                .then_some(peer)
+                        })
+                        .or_else(|| {
+                            self.swarm
+                                .connected_peers()
+                                .copied()
+                                .find(|candidate| Some(*candidate) != last_peer)
+                        })
+                        .or_else(|| self.swarm.is_connected(&peer).then_some(peer))
+                        .or_else(|| self.gov5_block_by_hash_peers.iter().copied().next())
+                };
                 let Some(selected_peer) = selected_peer else {
                     metrics::counter!(
                         "n42_gov5_block_fetch_suppressed_total",
