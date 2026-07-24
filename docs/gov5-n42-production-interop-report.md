@@ -24,23 +24,28 @@ Pushed implementation commits:
 - n42-26: `ab1bb95` (`test(interop): fail P6 on equivocation evidence`)
 - n42-26: `21ea922` (`fix: bound hybrid sync recovery deadlines`)
 - n42-26: `e1c4f99` (`fix: prioritize interop execution bodies`)
+- n42-26: `517b13d` (`fix(interop): preserve ordered gov5 execution catchup`)
 - N42-gov5: `b027f3040` (`feat(interop): harden Gov5 mixed-client operation`)
 - N42-gov5: `34021c3f7` (`test: make hive genesis fixture self-contained`)
 - N42-gov5: `a70f7cf68` (`test: share hive fixture across packages`)
 
-The current Rust qualification binary was built at `e1c4f99`. The preceding
+The current Rust qualification binary was built at `517b13d`. The preceding
 `21ea922` commit bounds both consensus state-sync requests and
 orchestrator-owned Gov5 body fetches, rotates retry peers, and makes
 unsupported state-sync attempts fail explicitly instead of remaining
 pending. `e1c4f99` additionally routes Gov5 block gossip and hash-fetch
 lifecycle events through the reliable consensus lane in H2 participant mode,
 preventing an always-readable consensus queue from starving already-arrived
-execution bodies. `ab1bb95` changes only the P6 shell monitor. The Gov5
-qualification binary was built at `b027f3040`; the two later Gov5 commits only
-make an existing test fixture self-contained in clean checkouts:
+execution bodies. `517b13d` releases authenticated cached bodies in execution
+height order, retains the direct successor until the durable execution head
+advances, and drains newly bound bodies before later consensus events in the
+same batch can commit descendants. `ab1bb95` changes only the P6 shell
+monitor. The Gov5 qualification binary was built at `b027f3040`; the two later
+Gov5 commits only make an existing test fixture self-contained in clean
+checkouts:
 
 - Rust `n42-node`:
-  `af712fff7ca978ab2737ecea343db12b976f21363f536f99c4c8b218d835b5aa`
+  `a66eaa8b10139677704f38e81fd2efb6b8516905769947cc69c69a3e70f7d72c`
 - Gov5 `n42`:
   `fa02d37c1e7b480a1c3196d318cd7bc79fb2d4247e5977331b79151873a82ae7`
 - Gov5 `n42-qmdb-export`:
@@ -59,21 +64,21 @@ acceptance.
 The P6 observer began with immutable Rust hash
 `73cd5bc9cf59715a0126a2e7cb6697b1ef5de30a28933c53eadfd092c341b10c`.
 Observer qualification remains read-only and keeps that startup binary
-unchanged for the entire window. Rust hash `af712fff...` and Gov5 hash
+unchanged for the entire window. Rust hash `a66eaa8b...` and Gov5 hash
 `fa02d37c...` are staged separately for the maintenance-window participant
 phase.
 
-The n42 implementation baseline is `e1c4f99`, and the Gov5 branch baseline is
+The n42 implementation baseline is `517b13d`, and the Gov5 branch baseline is
 `a70f7cf`; see `source-remote-ref-audit.jsonl`. Live remote audits require the
 n42 branch to contain that implementation and match the local checkpoint or
 final-report commit exactly. This in-progress qualification ledger is
 committed as a checkpoint. Its final PASS update remains pending until all
 runtime gates finish.
 
-`runtime-executable-identity-audit.jsonl` independently resolves both live
-Rust processes through their executable mappings. Both map to the same staged
-release with SHA-256 `af712fff...`; the separately staged P6 participant and
-Gov5 artifacts also retain their expected hashes.
+`p4-lag5-source-fix-executable-identity-audit.jsonl` independently resolves
+both current live Rust processes through their executable mappings. Both map
+to the same staged release with SHA-256 `a66eaa8b...`; the separately staged
+P6 participant and Gov5 artifacts also retain their expected hashes.
 
 ## Qualification runtimes
 
@@ -139,11 +144,11 @@ Final source gates:
 - `go test -race ./...`: PASS
 
 Those entries are the completed P0 baseline gates. For the later `e1c4f99`
-network-lane correction, the directly affected `n42-network` and
-`n42-consensus-service` suites pass 340 tests in total and both packages pass
-Clippy with warnings denied. The authoritative full clean-worktree rerun at
-`e1c4f99` remains deliberately gated after P6 and must pass before
-`FINAL_GATES.PASS`; it is not inferred from the earlier P0 run.
+network-lane and `517b13d` ordered catch-up corrections, the directly affected
+`n42-network` and `n42-consensus-service` suites pass 342 tests in total and
+both packages pass Clippy with warnings denied. The authoritative full
+clean-worktree rerun at `517b13d` remains deliberately gated after P6 and must
+pass before `FINAL_GATES.PASS`; it is not inferred from the earlier P0 run.
 
 The final P0 exit criterion was also rerun from three detached, clean
 worktrees pinned to n42-26 `4ed4fe8c898885de47415b0e737104efbb698c94`,
@@ -309,18 +314,49 @@ Rust2 then caught up from 15885 to 15915. No database was edited, copied,
 recreated, or reformatted.
 
 All failed discovery windows and their exact diagnoses remain preserved; none
-counts toward acceptance. The corrected release then passed a new recovery
+counts toward acceptance. The `e1c4f99` release then passed a new recovery
 regression with 61 samples spanning 652 seconds, zero failures, a maximum lag
 of one, and 111 blocks of progression. Every sample matched across five Gov5
 and two Rust endpoints. Both Rust logs prove persisted QMDB/snapshot recovery,
 reverse-ancestry release in execution order, and arrival at a durable
 execution head.
 
-The only eligible formal successor began from zero at
-`2026-07-24T09:43:41Z`. Each sample compares five Gov5 and two Rust RPCs at the
-minimum common height, checks block hash, QMDB state root, receipts root, lag
-at most four, and every newly finalized block's empty transaction list. The
-new baseline binds source commit `e1c4f99`, release SHA-256 `af712fff...`,
+The formal successor that began at `2026-07-24T09:43:41Z` also failed closed
+at `2026-07-24T12:56:25Z`. Both Rust consensus engines had accepted the
+CommitQC for block 18012, but both execution heads remained at 18007, so the
+measured lag reached five against the unchanged maximum of four. The signed
+transaction burst remained unreleased, and that entire window is archived and
+excluded.
+
+The retained network evidence shows that the Gov5 bodies arrived before the
+failure. Several bodies could remain in the hash-keyed unbound cache until a
+later consensus event authenticated them, after which the cache drained in
+hash order rather than execution-height order. The ordinary asynchronous path
+also failed to retain the direct successor while it was still awaiting Engine
+API completion. A later child could therefore activate catch-up without the
+exact first parent needed to reconnect to the durable execution head. A
+restart recovered from the unchanged persisted data, excluding a missing or
+corrupted database.
+
+Commit `517b13d` sorts every authenticated cached-body release by execution
+height, retains the direct successor until durable execution advances, and
+immediately drains newly authenticated bindings before processing later
+consensus events from the same batch. The consensus-service suite passes 180
+tests, the network suite passes 162 tests, and both packages pass Clippy with
+warnings denied. The production node binary was rebuilt in an isolated target
+directory to avoid stale executable reuse and differs byte-for-byte from the
+prior release. Both Rust validators were restarted sequentially from their
+original persisted datadirs and independently resolved to SHA-256
+`a66eaa8b...`; no database was edited or recreated.
+
+The new eligible formal successor began from zero at
+`2026-07-24T14:05:20Z`, after the corrected release passed an independent
+653-second recovery regression with 64 samples, zero failures, a maximum lag
+of one, and 111 blocks of progression. Each formal sample compares five Gov5
+and two Rust RPCs at the minimum common height, checks block hash, QMDB state
+root, receipts root, lag at most four, and every newly finalized block's empty
+transaction list. The new baseline binds source commit `517b13d`, release
+SHA-256 `a66eaa8b...`,
 recovered heads, exact warning counters, and deadline counters. Evidence is
 appended to `p4-zero-tx-24h-soak-priority-lane-final.jsonl`; it is accepted
 only when the first-to-last sample interval reaches at least 86,400 seconds
@@ -359,6 +395,11 @@ Additional evidence:
 - `p4-signed-transaction-burst-preflight.jsonl`
 - `p4-formal-live-progression-audit.jsonl`
 - `p4-formal-independent-historical-rpc-audit.jsonl`
+- `p4-formal-20260724T094341Z-lag5-failed.jsonl`
+- `p4-ordered-catchup-fix-recovery-summary.jsonl`
+- `p4-lag5-source-fix-build-provenance.jsonl`
+- `p4-lag5-source-fix-executable-identity-audit.jsonl`
+- `p4-lag5-control-chain-rearm-audit.jsonl`
 
 ## P5 — minimal full archive+ parity
 
