@@ -123,7 +123,7 @@ or removed.
 | P1 follower and catch-up | PASS | authenticated reverse/concurrent ancestry logs, 1,000+ following blocks, persisted restart recovery |
 | P2 automatic bootstrap and recovery | PASS | chain-bound bundle, blank-datadir materialization, replay receipt, cold restart |
 | P3 bidirectional leader handoff | PASS | `p3-5gov-2rust-28views-pass.jsonl`; 44 consecutive exact blocks covering more than two rotations |
-| P4 fault and lifecycle matrix | IN PROGRESS | all injected fault cases pass; the latest zero-transaction window failed closed after an execution catch-up stall, and its full 24-hour replacement plus following burst remain required |
+| P4 fault and lifecycle matrix | IN PROGRESS | all injected fault cases pass; the failed execution-stall window is preserved, its FIFO binding fix recovered from persisted databases, and a new full 24-hour replacement is running from zero before the still-withheld burst |
 | P5 minimal full archive+ parity | PASS | 209 RPC comparisons, 22 offline proof checks, export/import and corruption recovery |
 | P6 existing seven-node rollout | IN PROGRESS | observer cold bootstrap and exact epoch crossing pass; the actual 24-hour read-only observer window passes, continuity guard remains active, and participant activation waits for P4 |
 
@@ -451,9 +451,20 @@ suffix during the first recovery attempt. All seven endpoints now serve block
 transaction list. The independent recovery monitor recorded 64 samples over
 655 seconds, zero failures, maximum lag zero, 112 blocks of progress, exact
 seven-endpoint roots, and unchanged warning/deadline counters. No database
-was edited, recreated, reformatted, or removed. The next eligible formal
-window is a new full 86,400-second window from zero and does not inherit the
-prior three-hour milestone.
+was edited, recreated, reformatted, or removed.
+
+The next eligible formal window began from zero at `2026-07-24T22:06:27Z`.
+Its monitor is scheduled for 86,640 seconds and acceptance still requires at
+least 86,400 seconds between its first and last samples, at least 1,400
+samples, no sample gap above 120 seconds, maximum lag four, exact
+seven-endpoint roots, contiguous zero-transaction history, and unchanged
+warning and deadline counters. Its independent ten-minute audit records 11
+samples across 608 seconds, zero failures, maximum lag zero, a maximum
+61-second gap, and 104 blocks of progress. A separate fifteen-minute audit
+also resolves both Rust processes to the exact pinned release and checks all
+seven RPC endpoints. These early milestones prove live progression only;
+neither counts toward the full-window gate or inherits the prior failed
+window's three-hour milestone.
 
 A fail-closed finalizer is armed against the formal monitor. It cannot release
 the burst unless every sample, historical empty-block interval, lag bound, and
@@ -505,6 +516,11 @@ Additional evidence:
 - `p4-binding-fifo-fix-executable-identity-audit.jsonl`
 - `p4-binding-fifo-fix-missing-block-exact-audit.jsonl`
 - `p4-binding-fifo-fix-recovery-summary.jsonl`
+- `p4-binding-fifo-formal-soak-baseline.jsonl`
+- `p4-binding-fifo-formal-10m-milestone-audit.jsonl`
+- `p4-binding-fifo-formal-independent-15m-audit.jsonl`
+- `p4-binding-fifo-fix-control-chain-rearm-audit.jsonl`
+- `overall-goal-alignment-binding-fifo-audit.jsonl`
 
 ## P5 — minimal full archive+ parity
 
@@ -583,7 +599,7 @@ comparisons until the P4 gate releases participant activation, so the
 observer-to-maintenance interval does not become an unmeasured gap. The
 threshold and handoff are independently recorded in
 `p6-observer-24h-independent-threshold-audit.jsonl`. After the P4 window was
-restarted for the priority-lane correction, both extension schedules remained
+restarted for the FIFO binding correction, both extension schedules remained
 lengthened to 86,400 seconds. A second overlapping guard begins at
 `2026-07-25T05:30:00Z`, before the new P4 threshold, and the fail-closed P6
 finalizer stops both guards immediately before activation. Activation also
@@ -620,6 +636,8 @@ Evidence:
 - `p6-pre-marker-failure-rollback-regression.jsonl`
 - `p6-restart-sample-boundary-regression.jsonl`
 - `p6-finalizer-guard.jsonl`
+- `p4-binding-fifo-p6-observer-overlap-schedule-audit.jsonl`
+- `p6-binding-fifo-release-preactivation-audit.jsonl`
 
 The participant monitor also polls `n42_equivocations` every five seconds and
 requires zero authenticated evidence in every formal sample. A separate
