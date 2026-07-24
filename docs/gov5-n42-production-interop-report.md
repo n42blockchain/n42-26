@@ -118,7 +118,7 @@ or removed.
 | P1 follower and catch-up | PASS | authenticated reverse/concurrent ancestry logs, 1,000+ following blocks, persisted restart recovery |
 | P2 automatic bootstrap and recovery | PASS | chain-bound bundle, blank-datadir materialization, replay receipt, cold restart |
 | P3 bidirectional leader handoff | PASS | `p3-5gov-2rust-28views-pass.jsonl`; 44 consecutive exact blocks covering more than two rotations |
-| P4 fault and lifecycle matrix | IN PROGRESS | all injected fault cases pass; actual 24-hour zero-transaction window and following burst are running |
+| P4 fault and lifecycle matrix | IN PROGRESS | all injected fault cases pass; the latest zero-transaction window failed closed after an execution catch-up stall, and its full 24-hour replacement plus following burst remain required |
 | P5 minimal full archive+ parity | PASS | 209 RPC comparisons, 22 offline proof checks, export/import and corruption recovery |
 | P6 existing seven-node rollout | IN PROGRESS | observer cold bootstrap and exact epoch crossing pass; the actual 24-hour read-only observer window passes, continuity guard remains active, and participant activation waits for P4 |
 
@@ -385,15 +385,41 @@ failures, maximum lag one, 111 blocks of progression, exact seven-endpoint
 roots, and an empty transaction list for every newly finalized block.
 
 The entirely fresh formal successor began at `2026-07-24T18:11:44Z`. Each
-sample compares five Gov5 and two Rust RPCs at the minimum common height,
-checks block hash, QMDB state root, receipts root, lag at most four, and every
-newly finalized block's empty transaction list. The baseline binds source
+sample compared five Gov5 and two Rust RPCs at the minimum common height,
+checked block hash, QMDB state root, receipts root, lag at most four, and every
+newly finalized block's empty transaction list. The baseline bound source
 commit `242502c`, release SHA-256 `126ddec6...`, recovered heads, and exact
-warning/deadline counters after the restart transient had stopped. Evidence is
-appended to `p4-zero-tx-24h-soak-priority-lane-final.jsonl`; it is accepted
-only when the first-to-last sample interval reaches at least 86,400 seconds
-with no failed sample and no post-baseline counter growth. The already-signed
-17-transaction burst follows only after that full replacement window passes.
+warning/deadline counters after the restart transient had stopped.
+
+That window also failed closed at `2026-07-24T21:14:08Z`. Its 180 formal
+samples covered 10,888 seconds, advanced the common height from 20,788 to
+22,637, and had maximum lag two through the last sample. The three-hour
+milestone was written before the failure, but the later failure disqualifies
+the entire window and the milestone does not count toward a replacement
+window. Rust2's duplicate-publication counter changed from the pinned baseline
+of nine to eleven, so the independent guard terminated the monitor; the
+finalizer withheld the transaction burst and the supervisor recorded the
+qualification failure.
+
+At capture time all five Gov5 RPCs had advanced beyond block 22,644 while both
+Rust execution RPCs remained at 22,637. Block 22,638, hash
+`0x054530908490257ae5d3402223480cd355d647f484b31432df20eeed74fe44c9`,
+was the first canonical block absent from both Rust RPCs. The retained logs
+show repeated authenticated body-fetch deadline retries, Engine API
+`fork_choice_updated` calls returning no payload ID for later Rust leader
+slots, timeout rebroadcasts, and duplicate publication results. This is a
+production liveness failure, not merely a warning-counter presentation issue;
+the duplicate counter gate remains unchanged. The precise catch-up/fetch
+lifecycle defect must be corrected, verified against the persisted databases,
+and followed by a new full 86,400-second window from zero.
+
+The failed sample stream, baseline, three fail-closed sentinels, pre-failure
+three-hour milestone, complete Rust logs, incident audit, and verified
+SHA-256 manifest are preserved under
+`p4-timeout-rebroadcast-execution-stall-failure-20260724T211408Z-*`. The
+incident audit SHA-256 is
+`7395506d4de02566c8fcadc8a4faf6ded349b62ffc88fb94eace6da7cbf93ce9`.
+No database was deleted, rewritten, recreated, or reformatted.
 
 A fail-closed finalizer is armed against the formal monitor. It cannot release
 the burst unless every sample, historical empty-block interval, lag bound, and
@@ -437,6 +463,9 @@ Additional evidence:
 - `p4-release-trigger-fix-executable-identity-audit.jsonl`
 - `p4-release-trigger-fix-recovery-summary.jsonl`
 - `p4-release-trigger-fix-control-chain-rearm-audit.jsonl`
+- `p4-timeout-rebroadcast-execution-stall-failure-20260724T211408Z-formal-window.jsonl`
+- `p4-timeout-rebroadcast-execution-stall-failure-20260724T211408Z-incident-audit.jsonl`
+- `p4-timeout-rebroadcast-execution-stall-failure-20260724T211408Z-manifest.sha256`
 
 ## P5 — minimal full archive+ parity
 
