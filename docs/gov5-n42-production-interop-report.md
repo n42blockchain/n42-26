@@ -25,11 +25,12 @@ Pushed implementation commits:
 - n42-26: `21ea922` (`fix: bound hybrid sync recovery deadlines`)
 - n42-26: `e1c4f99` (`fix: prioritize interop execution bodies`)
 - n42-26: `517b13d` (`fix(interop): preserve ordered gov5 execution catchup`)
+- n42-26: `242502c` (`fix(interop): rearm staged Gov5 catchup`)
 - N42-gov5: `b027f3040` (`feat(interop): harden Gov5 mixed-client operation`)
 - N42-gov5: `34021c3f7` (`test: make hive genesis fixture self-contained`)
 - N42-gov5: `a70f7cf68` (`test: share hive fixture across packages`)
 
-The current Rust qualification binary was built at `517b13d`. The preceding
+The current Rust qualification binary was built at `242502c`. The preceding
 `21ea922` commit bounds both consensus state-sync requests and
 orchestrator-owned Gov5 body fetches, rotates retry peers, and makes
 unsupported state-sync attempts fail explicitly instead of remaining
@@ -39,13 +40,16 @@ preventing an always-readable consensus queue from starving already-arrived
 execution bodies. `517b13d` releases authenticated cached bodies in execution
 height order, retains the direct successor until the durable execution head
 advances, and drains newly bound bodies before later consensus events in the
-same batch can commit descendants. `ab1bb95` changes only the P6 shell
-monitor. The Gov5 qualification binary was built at `b027f3040`; the two later
-Gov5 commits only make an existing test fixture self-contained in clean
-checkouts:
+same batch can commit descendants. `242502c` additionally rechecks that staged
+suffix after asynchronous Engine API completion advances the durable parent,
+so release no longer depends on a later network message, and re-arms stale
+hash-fetch de-duplication after the transport deadline. `ab1bb95` changes only
+the P6 shell monitor. The Gov5 qualification binary was built at `b027f3040`;
+the two later Gov5 commits only make an existing test fixture self-contained
+in clean checkouts:
 
 - Rust `n42-node`:
-  `a66eaa8b10139677704f38e81fd2efb6b8516905769947cc69c69a3e70f7d72c`
+  `126ddec63f212b349cb317d550146ce06a69f930ba5fafd451b1d828e7775587`
 - Gov5 `n42`:
   `fa02d37c1e7b480a1c3196d318cd7bc79fb2d4247e5977331b79151873a82ae7`
 - Gov5 `n42-qmdb-export`:
@@ -64,20 +68,20 @@ acceptance.
 The P6 observer began with immutable Rust hash
 `73cd5bc9cf59715a0126a2e7cb6697b1ef5de30a28933c53eadfd092c341b10c`.
 Observer qualification remains read-only and keeps that startup binary
-unchanged for the entire window. Rust hash `a66eaa8b...` and Gov5 hash
+unchanged for the entire window. Rust hash `126ddec6...` and Gov5 hash
 `fa02d37c...` are staged separately for the maintenance-window participant
 phase.
 
-The n42 implementation baseline is `517b13d`, and the Gov5 branch baseline is
+The n42 implementation baseline is `242502c`, and the Gov5 branch baseline is
 `a70f7cf`; see `source-remote-ref-audit.jsonl`. Live remote audits require the
 n42 branch to contain that implementation and match the local checkpoint or
 final-report commit exactly. This in-progress qualification ledger is
 committed as a checkpoint. Its final PASS update remains pending until all
 runtime gates finish.
 
-`p4-lag5-source-fix-executable-identity-audit.jsonl` independently resolves
+`p4-release-trigger-fix-executable-identity-audit.jsonl` independently resolves
 both current live Rust processes through their executable mappings. Both map
-to the same staged release with SHA-256 `a66eaa8b...`; the separately staged
+to the same staged release with SHA-256 `126ddec6...`; the separately staged
 P6 participant and Gov5 artifacts also retain their expected hashes.
 
 ## Qualification runtimes
@@ -144,11 +148,12 @@ Final source gates:
 - `go test -race ./...`: PASS
 
 Those entries are the completed P0 baseline gates. For the later `e1c4f99`
-network-lane and `517b13d` ordered catch-up corrections, the directly affected
-`n42-network` and `n42-consensus-service` suites pass 342 tests in total and
-both packages pass Clippy with warnings denied. The authoritative full
-clean-worktree rerun at `517b13d` remains deliberately gated after P6 and must
-pass before `FINAL_GATES.PASS`; it is not inferred from the earlier P0 run.
+network-lane, `517b13d` ordered catch-up, and `242502c` release-trigger
+corrections, the new targeted network and consensus regressions pass 3 and 5
+tests respectively, and both packages pass all-target Clippy with warnings
+denied. The authoritative full clean-worktree rerun at `242502c` remains
+deliberately gated after P6 and must pass before `FINAL_GATES.PASS`; it is not
+inferred from the earlier P0 run.
 
 The final P0 exit criterion was also rerun from three detached, clean
 worktrees pinned to n42-26 `4ed4fe8c898885de47415b0e737104efbb698c94`,
@@ -349,15 +354,42 @@ prior release. Both Rust validators were restarted sequentially from their
 original persisted datadirs and independently resolved to SHA-256
 `a66eaa8b...`; no database was edited or recreated.
 
-The new eligible formal successor began from zero at
-`2026-07-24T14:05:20Z`, after the corrected release passed an independent
-653-second recovery regression with 64 samples, zero failures, a maximum lag
-of one, and 111 blocks of progression. Each formal sample compares five Gov5
-and two Rust RPCs at the minimum common height, checks block hash, QMDB state
-root, receipts root, lag at most four, and every newly finalized block's empty
-transaction list. The new baseline binds source commit `517b13d`, release
-SHA-256 `a66eaa8b...`,
-recovered heads, exact warning counters, and deadline counters. Evidence is
+The eligible formal successor that began at `2026-07-24T14:05:20Z` failed
+closed at `2026-07-24T17:15:34Z`. Its last sample was still inside the lag
+bound at three, but Rust2's duplicate-publication counter changed from two to
+four, so the independent guard terminated the monitor and the finalizer
+withheld the signed transaction burst. Both Rust execution heads then remained
+at block 20541 while all five Gov5 nodes served block 20542 and continued to
+20555. The complete 188-sample failed stream, guard/finalizer/supervisor
+sentinels, and both logs are retained under the
+`p4-ordered-catchup-release-trigger-failure-20260724T171534Z-*` prefix and are
+excluded from acceptance.
+
+The logs show block 20542 arriving while its parent 20541 was still completing
+asynchronous `new_payload`/FCU. The direct successor was correctly staged, but
+the staged-suffix release was only retried by later body/consensus handling;
+the durable parent advance itself did not trigger another check. Stale
+network-level hash de-duplication could also suppress a later orchestrator
+retry if every terminal request event was lost. Commit `242502c` rechecks the
+staged suffix after every drained execution lifecycle event and re-arms
+hash-fetch state after the transport deadline without weakening hash, QC, or
+identity validation.
+
+The production binary was rebuilt in an isolated target directory and pinned
+at SHA-256 `126ddec6...`. Both Rust validators reused their original persisted
+datadirs. On restart, each released a 64-block authenticated suffix beginning
+at the previously missing block 20542, then smaller five- and one-block
+suffixes, reached a durable execution head, and rejoined live consensus. The
+independent recovery regression recorded 64 samples across 658 seconds, zero
+failures, maximum lag one, 111 blocks of progression, exact seven-endpoint
+roots, and an empty transaction list for every newly finalized block.
+
+The entirely fresh formal successor began at `2026-07-24T18:11:44Z`. Each
+sample compares five Gov5 and two Rust RPCs at the minimum common height,
+checks block hash, QMDB state root, receipts root, lag at most four, and every
+newly finalized block's empty transaction list. The baseline binds source
+commit `242502c`, release SHA-256 `126ddec6...`, recovered heads, and exact
+warning/deadline counters after the restart transient had stopped. Evidence is
 appended to `p4-zero-tx-24h-soak-priority-lane-final.jsonl`; it is accepted
 only when the first-to-last sample interval reaches at least 86,400 seconds
 with no failed sample and no post-baseline counter growth. The already-signed
@@ -400,6 +432,11 @@ Additional evidence:
 - `p4-lag5-source-fix-build-provenance.jsonl`
 - `p4-lag5-source-fix-executable-identity-audit.jsonl`
 - `p4-lag5-control-chain-rearm-audit.jsonl`
+- `p4-ordered-catchup-release-trigger-failure-20260724T171534Z-formal-window.jsonl`
+- `p4-release-trigger-fix-build-provenance.jsonl`
+- `p4-release-trigger-fix-executable-identity-audit.jsonl`
+- `p4-release-trigger-fix-recovery-summary.jsonl`
+- `p4-release-trigger-fix-control-chain-rearm-audit.jsonl`
 
 ## P5 — minimal full archive+ parity
 
