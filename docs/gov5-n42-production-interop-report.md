@@ -26,11 +26,12 @@ Pushed implementation commits:
 - n42-26: `e1c4f99` (`fix: prioritize interop execution bodies`)
 - n42-26: `517b13d` (`fix(interop): preserve ordered gov5 execution catchup`)
 - n42-26: `242502c` (`fix(interop): rearm staged Gov5 catchup`)
+- n42-26: `24210f0` (`fix(interop): preserve live H2 bindings at capacity`)
 - N42-gov5: `b027f3040` (`feat(interop): harden Gov5 mixed-client operation`)
 - N42-gov5: `34021c3f7` (`test: make hive genesis fixture self-contained`)
 - N42-gov5: `a70f7cf68` (`test: share hive fixture across packages`)
 
-The current Rust qualification binary was built at `242502c`. The preceding
+The current Rust qualification binary was built at `24210f0`. The preceding
 `21ea922` commit bounds both consensus state-sync requests and
 orchestrator-owned Gov5 body fetches, rotates retry peers, and makes
 unsupported state-sync attempts fail explicitly instead of remaining
@@ -43,13 +44,17 @@ advances, and drains newly bound bodies before later consensus events in the
 same batch can commit descendants. `242502c` additionally rechecks that staged
 suffix after asynchronous Engine API completion advances the durable parent,
 so release no longer depends on a later network message, and re-arms stale
-hash-fetch de-duplication after the transport deadline. `ab1bb95` changes only
+hash-fetch de-duplication after the transport deadline. `24210f0` replaces
+hash-order eviction in the bounded authenticated H2 block-view cache with
+explicit FIFO insertion order. This preserves a newly authenticated live
+binding even when its hash is numerically smaller than all older keys.
+`ab1bb95` changes only
 the P6 shell monitor. The Gov5 qualification binary was built at `b027f3040`;
 the two later Gov5 commits only make an existing test fixture self-contained
 in clean checkouts:
 
 - Rust `n42-node`:
-  `126ddec63f212b349cb317d550146ce06a69f930ba5fafd451b1d828e7775587`
+  `7fcec8e3ad22fab37d265c5509fb461684f248e57e9f5ded02e79ea3c947ce31`
 - Gov5 `n42`:
   `fa02d37c1e7b480a1c3196d318cd7bc79fb2d4247e5977331b79151873a82ae7`
 - Gov5 `n42-qmdb-export`:
@@ -68,20 +73,20 @@ acceptance.
 The P6 observer began with immutable Rust hash
 `73cd5bc9cf59715a0126a2e7cb6697b1ef5de30a28933c53eadfd092c341b10c`.
 Observer qualification remains read-only and keeps that startup binary
-unchanged for the entire window. Rust hash `126ddec6...` and Gov5 hash
+unchanged for the entire window. Rust hash `7fcec8e3...` and Gov5 hash
 `fa02d37c...` are staged separately for the maintenance-window participant
 phase.
 
-The n42 implementation baseline is `242502c`, and the Gov5 branch baseline is
+The n42 implementation baseline is `24210f0`, and the Gov5 branch baseline is
 `a70f7cf`; see `source-remote-ref-audit.jsonl`. Live remote audits require the
 n42 branch to contain that implementation and match the local checkpoint or
 final-report commit exactly. This in-progress qualification ledger is
 committed as a checkpoint. Its final PASS update remains pending until all
 runtime gates finish.
 
-`p4-release-trigger-fix-executable-identity-audit.jsonl` independently resolves
+`p4-binding-fifo-fix-executable-identity-audit.jsonl` independently resolves
 both current live Rust processes through their executable mappings. Both map
-to the same staged release with SHA-256 `126ddec6...`; the separately staged
+to the same staged release with SHA-256 `7fcec8e3...`; the separately staged
 P6 participant and Gov5 artifacts also retain their expected hashes.
 
 ## Qualification runtimes
@@ -421,6 +426,35 @@ incident audit SHA-256 is
 `7395506d4de02566c8fcadc8a4faf6ded349b62ffc88fb94eace6da7cbf93ce9`.
 No database was deleted, rewritten, recreated, or reformatted.
 
+The first missing body had reached both Rust network services before its
+proposal was authenticated. The authenticated block-view cache was already
+at its 2,048-entry bound. It used `BTreeMap::pop_first()` as if that operation
+removed the oldest binding; it actually removed the numerically smallest
+hash. The new live `0x05...` binding therefore evicted itself, leaving the
+body in the unbound cache after its fetch tracker had cleared. Descendants
+could activate catch-up but could not reconnect to the durable execution
+head.
+
+Commit `24210f0` adds explicit FIFO insertion order and evicts the true oldest
+binding. The deterministic regression fills all 2,048 entries with higher
+hashes, inserts a low `0x05` live hash, and proves that the new hash remains
+while the oldest entry is removed. The consensus-service suite passes all 182
+tests; its all-target Clippy gate passes with warnings denied and its package
+format check is clean. The release was rebuilt from a locked isolated target
+and pinned at SHA-256 `7fcec8e3...`.
+
+Both Rust validators restarted under a controlled guardian using their
+original persisted datadirs. Rust1 released a 63-block reverse-delivered
+suffix beginning with block 22,638; Rust2 had already persisted most of that
+suffix during the first recovery attempt. All seven endpoints now serve block
+22,638 with the exact original hash, state root, receipts root, and empty
+transaction list. The independent recovery monitor recorded 64 samples over
+655 seconds, zero failures, maximum lag zero, 112 blocks of progress, exact
+seven-endpoint roots, and unchanged warning/deadline counters. No database
+was edited, recreated, reformatted, or removed. The next eligible formal
+window is a new full 86,400-second window from zero and does not inherit the
+prior three-hour milestone.
+
 A fail-closed finalizer is armed against the formal monitor. It cannot release
 the burst unless every sample, historical empty-block interval, lag bound, and
 all warning and deadline counters pass. An independent 30-second guard also
@@ -466,6 +500,11 @@ Additional evidence:
 - `p4-timeout-rebroadcast-execution-stall-failure-20260724T211408Z-formal-window.jsonl`
 - `p4-timeout-rebroadcast-execution-stall-failure-20260724T211408Z-incident-audit.jsonl`
 - `p4-timeout-rebroadcast-execution-stall-failure-20260724T211408Z-manifest.sha256`
+- `p4-binding-fifo-root-cause-and-fix.jsonl`
+- `p4-binding-fifo-fix-build-provenance.jsonl`
+- `p4-binding-fifo-fix-executable-identity-audit.jsonl`
+- `p4-binding-fifo-fix-missing-block-exact-audit.jsonl`
+- `p4-binding-fifo-fix-recovery-summary.jsonl`
 
 ## P5 — minimal full archive+ parity
 
