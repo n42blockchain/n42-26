@@ -2790,6 +2790,10 @@ impl NetworkService {
                         to_view = request.to_view,
                         "not sending N42 state-sync request to peer without advertised support"
                     );
+                    self.emit_event(NetworkEvent::SyncRequestFailed {
+                        peer,
+                        error: "peer does not advertise N42 state-sync".to_string(),
+                    });
                     return;
                 }
                 tracing::debug!(

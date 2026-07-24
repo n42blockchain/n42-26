@@ -255,7 +255,7 @@ impl ConsensusService {
 
         let elapsed = self.sync_started_at.map(|started| started.elapsed());
         let timed_out = elapsed
-            .map(|elapsed| elapsed > sync_request_timeout())
+            .map(|elapsed| elapsed >= sync_request_timeout())
             // An in-flight request without a start time violates the local
             // state invariant. Treat it as stale instead of wedging recovery.
             .unwrap_or(true);
@@ -275,6 +275,22 @@ impl ConsensusService {
         self.sync_request_range = None;
         self.sync_requested_peers.clear();
         true
+    }
+
+    /// Expires and immediately re-drives the exact outstanding range.
+    ///
+    /// The event-loop timer calls this independently of consensus progress.
+    /// Without that timer, a lost request can remain in flight forever when
+    /// the stalled node receives no later event that happens to initiate sync.
+    pub(super) fn retry_expired_sync_request(&mut self) {
+        let retry_range = self.sync_request_range;
+        if !self.expire_stale_sync_request() {
+            return;
+        }
+        let Some((from_view, to_view)) = retry_range else {
+            return;
+        };
+        self.initiate_sync(from_view.saturating_sub(1), to_view);
     }
 
     /// Requests an execution lineage from every connected peer.
@@ -338,8 +354,12 @@ impl ConsensusService {
         self.sync_requested_peers = requested_peers;
     }
 
-    /// Initiates a state sync request to a connected peer.
-    /// Uses deterministic peer rotation by view number to avoid always hitting the same peer.
+    /// Initiates a state sync request across the connected peer set.
+    ///
+    /// Hybrid Gov5/N42 networks include peers that do not implement N42's
+    /// state-sync protocol. Fan-out lets a capable Rust peer answer while the
+    /// network layer explicitly rejects unsupported recipients. Responses
+    /// remain range-bound, QC-verified, and idempotent.
     pub(super) fn initiate_sync(&mut self, local_view: u64, target_view: u64) {
         self.expire_stale_sync_request();
         if self.sync_in_flight {
@@ -352,11 +372,6 @@ impl ConsensusService {
             warn!(target: "n42::cl::sync", "no connected peers for sync");
             return;
         }
-        let peer = peers[self.sync_peer_cursor % peers.len()];
-        self.sync_peer_cursor = self.sync_peer_cursor.wrapping_add(1);
-
-        info!(target: "n42::cl::sync", %peer, local_view, target_view, "initiating state sync");
-
         // Cap to_view so the request doesn't exceed MAX_BLOCKS_PER_SYNC_REQUEST.
         // The peer will reject oversized ranges; capping here avoids a wasted round-trip.
         let capped_to_view = target_view.min(local_view + MAX_BLOCKS_PER_SYNC_REQUEST);
@@ -366,17 +381,32 @@ impl ConsensusService {
             local_committed_view: local_view,
         };
 
-        let request_range = (request.from_view, request.to_view);
-        if let Err(e) = self.network.request_sync(peer, request) {
-            error!(target: "n42::cl::sync", error = %e, "failed to send sync request");
+        let mut requested_peers = std::collections::HashSet::new();
+        for peer in peers {
+            match self.network.request_sync(peer, request.clone()) {
+                Ok(()) => {
+                    requested_peers.insert(peer);
+                }
+                Err(error) => {
+                    warn!(target: "n42::cl::sync", %peer, %error, "failed to queue state sync request");
+                }
+            }
+        }
+        if requested_peers.is_empty() {
             return;
         }
 
+        info!(
+            target: "n42::cl::sync",
+            local_view,
+            target_view = capped_to_view,
+            peers = requested_peers.len(),
+            "initiating state sync fan-out"
+        );
         self.sync_in_flight = true;
         self.sync_started_at = Some(Instant::now());
-        self.sync_request_range = Some(request_range);
-        self.sync_requested_peers.clear();
-        self.sync_requested_peers.insert(peer);
+        self.sync_request_range = Some((request.from_view, request.to_view));
+        self.sync_requested_peers = requested_peers;
     }
 
     /// Handles an incoming sync request from a peer.

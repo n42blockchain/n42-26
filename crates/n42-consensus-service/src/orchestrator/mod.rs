@@ -40,6 +40,7 @@ const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
 /// TX forwarding batches are latency-bounded by a 50ms flush timer, so we can
 /// use a larger batch target to reduce cross-task and cross-peer overhead.
 const TX_FORWARD_BATCH_TARGET: usize = 512;
+const H2_V4_FETCH_RETRY_TIMEOUT: Duration = Duration::from_secs(12);
 
 /// Maximum number of already-queued R1/R2 votes verified in one randomized
 /// BLS multi-pairing. Draining is non-blocking, so this adds no timer latency.
@@ -347,6 +348,12 @@ pub struct ConsensusService {
     /// that same peer forever prevents either Rust node from reaching a Gov
     /// peer that already has the missing parent.
     h2_v4_fetch_failed_peers: BTreeMap<B256, (Instant, HashSet<PeerId>)>,
+    /// Accepted Gov5 block-by-hash commands awaiting a body. The network layer
+    /// has its own bounded request table, but capacity/cooldown suppression is
+    /// intentionally non-blocking; this orchestrator-owned deadline guarantees
+    /// that a consensus-authenticated body is retried even if no failure event
+    /// can be emitted for a command that was suppressed before transmission.
+    h2_v4_fetch_requested_at: HashMap<B256, (Instant, PeerId)>,
     /// Network port (Caplin sentinel-client seam). One in-process adapter today
     /// (`NetworkHandle`); the trait object lets the orchestrator move into a
     /// service crate without depending on `n42-network` / libp2p internals.
@@ -446,10 +453,6 @@ pub struct ConsensusService {
     /// state. Catch-up fan-out keeps every successful recipient here until one
     /// returns useful data or all recipients finish.
     sync_requested_peers: HashSet<PeerId>,
-    /// Round-robin cursor for recovery requests. The execution-validated view
-    /// can remain pinned while consensus advances, so keying peer choice only
-    /// on that view would retry the same possibly incomplete peer forever.
-    sync_peer_cursor: usize,
     state_file: Option<PathBuf>,
     validator_set_for_sync: Option<ValidatorSet>,
     /// View at which a validator_changes block was applied during sync.
@@ -574,6 +577,83 @@ pub struct ConsensusService {
 }
 
 impl ConsensusService {
+    fn request_h2_v4_gov5_block(&mut self, peer: PeerId, block_hash: B256) {
+        if block_hash == B256::ZERO
+            || block_hash == self.head_block_hash
+            || self.pending_block_data.contains_key(&block_hash)
+            || self.h2_v4_unbound_blocks.contains_key(&block_hash)
+            || self.h2_v4_fetch_requested_at.contains_key(&block_hash)
+        {
+            return;
+        }
+        match self.network.request_gov5_block_by_hash(peer, block_hash) {
+            Ok(()) => {
+                self.h2_v4_fetch_requested_at
+                    .insert(block_hash, (Instant::now(), peer));
+                while self.h2_v4_fetch_requested_at.len() > 2048 {
+                    let Some(oldest) = self
+                        .h2_v4_fetch_requested_at
+                        .iter()
+                        .min_by_key(|(_, (requested_at, _))| *requested_at)
+                        .map(|(hash, _)| *hash)
+                    else {
+                        break;
+                    };
+                    self.h2_v4_fetch_requested_at.remove(&oldest);
+                }
+                debug!(target: "n42::interop::h2v4", %peer, %block_hash, "tracking authenticated Gov5 block fetch");
+            }
+            Err(error) => {
+                warn!(target: "n42::interop::h2v4", %peer, %block_hash, %error, "could not queue authenticated Gov5 block fetch");
+            }
+        }
+    }
+
+    fn retry_expired_h2_v4_fetches(&mut self) {
+        let now = Instant::now();
+        let expired = self
+            .h2_v4_fetch_requested_at
+            .iter()
+            .filter_map(|(hash, (requested_at, peer))| {
+                (now.duration_since(*requested_at) >= H2_V4_FETCH_RETRY_TIMEOUT)
+                    .then_some((*hash, *peer))
+            })
+            .collect::<Vec<_>>();
+        for (block_hash, previous_peer) in expired {
+            self.h2_v4_fetch_requested_at.remove(&block_hash);
+            if block_hash == self.head_block_hash
+                || self.pending_block_data.contains_key(&block_hash)
+                || self.h2_v4_unbound_blocks.contains_key(&block_hash)
+            {
+                continue;
+            }
+            let retry_peer = self
+                .connected_peers
+                .iter()
+                .copied()
+                .find(|peer| *peer != previous_peer)
+                .or_else(|| {
+                    self.connected_peers
+                        .contains(&previous_peer)
+                        .then_some(previous_peer)
+                });
+            if let Some(retry_peer) = retry_peer {
+                counter!("n42_h2_v4_block_fetch_deadline_retries_total").increment(1);
+                warn!(
+                    target: "n42::interop::h2v4",
+                    %block_hash,
+                    %previous_peer,
+                    %retry_peer,
+                    "authenticated Gov5 block fetch deadline expired; retrying"
+                );
+                self.request_h2_v4_gov5_block(retry_peer, block_hash);
+            } else {
+                self.h2_v4_fetch_requested_at
+                    .insert(block_hash, (now, previous_peer));
+            }
+        }
+    }
+
     fn remember_h2_v4_block_view(&mut self, block_hash: B256, view: u64) {
         const MAX_H2_V4_BLOCK_BINDINGS: usize = 2048;
         self.h2_v4_block_views.insert(block_hash, view);
@@ -612,6 +692,7 @@ impl ConsensusService {
             warn!(target: "n42::interop::h2v4", %source, expected = ?requested_hash, received = %block.block_hash, "gov5 block response hash mismatch");
             return;
         }
+        self.h2_v4_fetch_requested_at.remove(&block.block_hash);
         let Some(bound_view) = self.h2_v4_block_views.get(&block.block_hash).copied() else {
             self.h2_v4_unbound_blocks
                 .insert(block.block_hash, (source, rlp));
@@ -699,19 +780,7 @@ impl ConsensusService {
             {
                 self.remember_h2_v4_block_view(block.header.parent_hash, 0);
             }
-            if let Err(error) = self
-                .network
-                .request_gov5_block_by_hash(source, block.header.parent_hash)
-            {
-                warn!(
-                    target: "n42::interop::h2v4",
-                    %source,
-                    child = %block.block_hash,
-                    parent = %block.header.parent_hash,
-                    %error,
-                    "could not request authenticated missing Gov5 parent"
-                );
-            }
+            self.request_h2_v4_gov5_block(source, block.header.parent_hash);
             return;
         }
         if self.h2_v4_catchup_active {
@@ -1711,6 +1780,7 @@ impl ConsensusService {
             h2_v4_catchup_blocks: BTreeMap::new(),
             h2_v4_catchup_active: false,
             h2_v4_fetch_failed_peers: BTreeMap::new(),
+            h2_v4_fetch_requested_at: HashMap::new(),
             network,
             consensus_event_rx: None,
             net_event_rx,
@@ -1752,7 +1822,6 @@ impl ConsensusService {
             sync_started_at: None,
             sync_request_range: None,
             sync_requested_peers: HashSet::new(),
-            sync_peer_cursor: 0,
             state_file: None,
             validator_set_for_sync: None,
             epoch_sync_staged_view: None,
@@ -1935,6 +2004,7 @@ impl ConsensusService {
             h2_v4_catchup_blocks: BTreeMap::new(),
             h2_v4_catchup_active: false,
             h2_v4_fetch_failed_peers: BTreeMap::new(),
+            h2_v4_fetch_requested_at: HashMap::new(),
             network,
             consensus_event_rx: Some(consensus_event_rx),
             net_event_rx,
@@ -1976,7 +2046,6 @@ impl ConsensusService {
             sync_started_at: None,
             sync_request_range: None,
             sync_requested_peers: HashSet::new(),
-            sync_peer_cursor: 0,
             state_file: None,
             validator_set_for_sync: None,
             epoch_sync_staged_view: None,
@@ -2262,6 +2331,30 @@ impl ConsensusService {
             };
             tokio::pin!(vote_resend_timer);
 
+            let sync_request_deadline = self
+                .sync_started_at
+                .map(|started| started + state_mgmt::sync_request_timeout());
+            let sync_request_timer = async {
+                match sync_request_deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::pin!(sync_request_timer);
+
+            let h2_v4_fetch_deadline = self
+                .h2_v4_fetch_requested_at
+                .values()
+                .map(|(requested_at, _)| *requested_at + H2_V4_FETCH_RETRY_TIMEOUT)
+                .min();
+            let h2_v4_fetch_timer = async {
+                match h2_v4_fetch_deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::pin!(h2_v4_fetch_timer);
+
             // Biased select: consensus-critical channels are checked FIRST.
             // Without biased, tokio randomly permutes branch order on each poll,
             // causing consensus votes to compete with high-frequency TX events.
@@ -2311,6 +2404,17 @@ impl ConsensusService {
                 // a collector's direct or gossip receive path was transiently lost.
                 _ = &mut vote_resend_timer => {
                     self.resend_pending_vote();
+                }
+
+                // Recovery deadlines are independent of new consensus/network
+                // traffic. A quiet stall must still clear and re-drive all
+                // request state at its configured deadline.
+                _ = &mut sync_request_timer => {
+                    self.retry_expired_sync_request();
+                }
+
+                _ = &mut h2_v4_fetch_timer => {
+                    self.retry_expired_h2_v4_fetches();
                 }
 
                 // === Priority 3: Async finalize-FCU completion ===
@@ -3055,10 +3159,8 @@ impl ConsensusService {
                             self.remember_h2_v4_block_view(block_hash, view);
                             if !self.pending_block_data.contains_key(&block_hash)
                                 && !self.h2_v4_unbound_blocks.contains_key(&block_hash)
-                                && let Err(error) =
-                                    self.network.request_gov5_block_by_hash(source, block_hash)
                             {
-                                debug!(target: "n42::interop::h2v4", %source, %block_hash, %error, "could not request H2-authenticated gov5 block");
+                                self.request_h2_v4_gov5_block(source, block_hash);
                             }
                         }
                     }
@@ -3126,19 +3228,7 @@ impl ConsensusService {
                             continue;
                         }
                         self.remember_h2_v4_block_view(qc.block_hash, qc.view);
-                        if let Err(error) = self
-                            .network
-                            .request_gov5_block_by_hash(peer_id, qc.block_hash)
-                        {
-                            debug!(
-                                target: "n42::interop::h2v4",
-                                %peer_id,
-                                block_hash = %qc.block_hash,
-                                view = qc.view,
-                                %error,
-                                "could not request persisted H2 certificate anchor"
-                            );
-                        }
+                        self.request_h2_v4_gov5_block(peer_id, qc.block_hash);
                     }
                 }
 
@@ -3169,6 +3259,7 @@ impl ConsensusService {
                 requested_hash,
                 rlp,
             } if self.h2_v4_identity.is_some() => {
+                self.h2_v4_fetch_requested_at.remove(&requested_hash);
                 self.h2_v4_fetch_failed_peers.remove(&requested_hash);
                 self.handle_h2_v4_gov5_block(source, rlp, Some(requested_hash))
                     .await;
@@ -3178,6 +3269,7 @@ impl ConsensusService {
                 block_hash,
                 error,
             } if self.h2_v4_identity.is_some() => {
+                self.h2_v4_fetch_requested_at.remove(&block_hash);
                 warn!(target: "n42::interop::h2v4", %source, %block_hash, %error, "H2-authenticated gov5 block fetch failed");
                 const FETCH_RETRY_ROUND: Duration = Duration::from_secs(5);
                 let now = Instant::now();
@@ -3202,28 +3294,16 @@ impl ConsensusService {
                     .copied()
                     .find(|peer| !attempted.contains(peer));
                 if let Some(retry_peer) = retry_peer {
-                    if let Err(retry_error) = self
-                        .network
-                        .request_gov5_block_by_hash(retry_peer, block_hash)
-                    {
-                        debug!(
-                            target: "n42::interop::h2v4",
-                            %retry_peer,
-                            %block_hash,
-                            %retry_error,
-                            "could not queue alternate authenticated Gov5 block fetch"
-                        );
-                    } else {
-                        counter!("n42_h2_v4_block_fetch_retries_total").increment(1);
-                        debug!(
-                            target: "n42::interop::h2v4",
-                            failed_peer = %source,
-                            %retry_peer,
-                            %block_hash,
-                            attempted = attempted.len(),
-                            "retrying authenticated Gov5 block fetch with another peer"
-                        );
-                    }
+                    counter!("n42_h2_v4_block_fetch_retries_total").increment(1);
+                    debug!(
+                        target: "n42::interop::h2v4",
+                        failed_peer = %source,
+                        %retry_peer,
+                        %block_hash,
+                        attempted = attempted.len(),
+                        "retrying authenticated Gov5 block fetch with another peer"
+                    );
+                    self.request_h2_v4_gov5_block(retry_peer, block_hash);
                 } else {
                     warn!(
                         target: "n42::interop::h2v4",
@@ -4960,6 +5040,74 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(2),
             "sync_started_at should be recent after timeout reset"
+        );
+    }
+
+    #[tokio::test]
+    async fn independent_sync_deadline_refans_out_the_original_range() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
+        let peers = [libp2p::PeerId::random(), libp2p::PeerId::random()];
+        orch.connected_peers.extend(peers);
+        orch.sync_in_flight = true;
+        orch.sync_started_at =
+            Some(Instant::now() - state_mgmt::sync_request_timeout() - Duration::from_secs(1));
+        orch.sync_request_range = Some((41, 47));
+        orch.sync_requested_peers.insert(peers[0]);
+
+        orch.retry_expired_sync_request();
+
+        assert!(orch.sync_in_flight);
+        assert_eq!(orch.sync_request_range, Some((41, 47)));
+        assert_eq!(orch.sync_requested_peers, peers.into_iter().collect());
+        assert!(
+            orch.sync_started_at
+                .expect("replacement request has a deadline")
+                .elapsed()
+                < Duration::from_secs(2)
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_h2_block_fetch_rotates_without_a_network_failure_event() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, mut prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
+        let peers = [libp2p::PeerId::random(), libp2p::PeerId::random()];
+        let block_hash = B256::repeat_byte(0xa7);
+        orch.connected_peers.extend(peers);
+
+        orch.request_h2_v4_gov5_block(peers[0], block_hash);
+        let first = prx.try_recv().expect("initial fetch command");
+        assert!(matches!(
+            first,
+            NetworkCommand::RequestGov5BlockByHash { peer, block_hash: hash }
+                if peer == peers[0] && hash == block_hash
+        ));
+        orch.h2_v4_fetch_requested_at.insert(
+            block_hash,
+            (
+                Instant::now() - H2_V4_FETCH_RETRY_TIMEOUT - Duration::from_secs(1),
+                peers[0],
+            ),
+        );
+
+        orch.retry_expired_h2_v4_fetches();
+
+        let retry = prx.try_recv().expect("deadline retry command");
+        assert!(matches!(
+            retry,
+            NetworkCommand::RequestGov5BlockByHash { peer, block_hash: hash }
+                if peer == peers[1] && hash == block_hash
+        ));
+        assert_eq!(
+            orch.h2_v4_fetch_requested_at
+                .get(&block_hash)
+                .map(|(_, peer)| *peer),
+            Some(peers[1])
         );
     }
 
