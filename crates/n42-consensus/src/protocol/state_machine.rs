@@ -4493,10 +4493,11 @@ mod tests {
     }
 
     #[test]
-    fn test_verified_repeat_timeout_is_relayed_to_next_leader() {
+    fn test_verified_repeat_timeout_is_relayed_to_next_leader_once() {
         // View 1's next leader is validator 2 in a four-validator set. Validator 0
-        // has already timed out and receives validator 1's vote; even a duplicate
-        // must be sent directly to validator 2 so a reconnect cannot strand the TC.
+        // has already timed out and receives validator 1's vote. The first verified
+        // copy is relayed, while redundant H2-v4 transport copies must not be fanned
+        // out again or they form a positive feedback loop.
         let (mut engine, sks, _, mut rx) = make_engine(4, 0);
         engine.on_timeout().expect("local timeout");
         while rx.try_recv().is_ok() {}
@@ -4508,7 +4509,7 @@ mod tests {
             signature: sks[1].sign(&timeout_signing_message(1)),
         };
 
-        for expected_attempt in 1..=2 {
+        for expected_relays in [1, 0] {
             engine
                 .process_event(ConsensusEvent::Message(ConsensusMessage::Timeout(
                     timeout.clone(),
@@ -4527,8 +4528,8 @@ mod tests {
                 })
                 .count();
             assert_eq!(
-                relays, 1,
-                "relay attempt {expected_attempt} must target the next leader"
+                relays, expected_relays,
+                "only the first verified timeout copy may be relayed"
             );
         }
     }

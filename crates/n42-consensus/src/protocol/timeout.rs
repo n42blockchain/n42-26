@@ -276,49 +276,59 @@ impl ConsensusEngine {
         let n_validators = view_set.len();
         let quorum_size = view_set.quorum_size();
         let next_view = view.saturating_add(1);
-
-        // Only the next-view leader can form and sign NewView, so make every
-        // non-leader receiver a relay for verified timeout votes. This matters
-        // after a leader reconnects: the original sender's direct stream may
-        // still be negotiating, while another validator already has a healthy
-        // stream to it. Relay before duplicate detection so repeat timeouts can
-        // repair exactly that late-join gap. SendToValidator retains GossipSub
-        // as a fallback, while the direct leg is not suppressed by GossipSub's
-        // byte-identical message-id cache.
         let next_leader = LeaderSelector::leader_for_view(next_view, view_set);
-        if timeout.sender != self.my_index && next_leader != self.my_index {
+        let relay_timeout = (timeout.sender != self.my_index && next_leader != self.my_index)
+            .then(|| timeout.clone());
+
+        let (has_quorum, timeout_count) = {
+            let collector = self
+                .timeout_collector
+                .get_or_insert_with(|| TimeoutCollector::new(view, n_validators));
+
+            match collector.add_verified_timeout(timeout.sender, timeout.signature, timeout.high_qc)
+            {
+                Ok(()) => {}
+                Err(ConsensusError::DuplicateVote { .. }) => {
+                    tracing::debug!(target: "n42::cl::timeout",
+                        view,
+                        sender = timeout.sender,
+                        "ignoring duplicate timeout (GossipSub multi-path)"
+                    );
+                    return Ok(());
+                }
+                Err(e) => return Err(e),
+            }
+
+            (collector.has_quorum(quorum_size), collector.timeout_count())
+        };
+
+        // Only the next-view leader can form and sign NewView, so make a
+        // non-leader receiver relay each newly observed timeout vote once.
+        //
+        // This must happen after collector deduplication. H2-v4 carries the same
+        // timeout over two GossipSub topics plus validator direct streams, and
+        // SendToValidator uses those same redundant transports. Relaying every
+        // duplicate therefore creates a positive feedback loop: each copy is
+        // fanned out again, eventually exhausting request-response stream
+        // capacity and preventing missing-block recovery. The timeout originator
+        // already periodically re-broadcasts while the view remains timed out,
+        // so a reconnecting next leader still receives a fresh copy without
+        // duplicate-triggered relay amplification.
+        if let Some(timeout) = relay_timeout {
             self.emit(EngineOutput::SendToValidator(
                 next_leader,
-                ConsensusMessage::Timeout(timeout.clone()),
+                ConsensusMessage::Timeout(timeout),
             ))?;
-        }
-
-        let collector = self
-            .timeout_collector
-            .get_or_insert_with(|| TimeoutCollector::new(view, n_validators));
-
-        match collector.add_verified_timeout(timeout.sender, timeout.signature, timeout.high_qc) {
-            Ok(()) => {}
-            Err(ConsensusError::DuplicateVote { .. }) => {
-                tracing::debug!(target: "n42::cl::timeout",
-                    view,
-                    sender = timeout.sender,
-                    "ignoring duplicate timeout (GossipSub multi-path)"
-                );
-                return Ok(());
-            }
-            Err(e) => return Err(e),
         }
 
         tracing::debug!(target: "n42::cl::timeout",
             view,
             sender = timeout.sender,
-            count = collector.timeout_count(),
+            count = timeout_count,
             "received timeout"
         );
 
-        let should_form_tc =
-            collector.has_quorum(quorum_size) && self.is_leader_for_view(next_view);
+        let should_form_tc = has_quorum && self.is_leader_for_view(next_view);
 
         if should_form_tc {
             self.try_form_tc_and_advance(view, next_view)?;
