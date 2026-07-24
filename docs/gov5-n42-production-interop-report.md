@@ -116,7 +116,7 @@ or removed.
 | P3 bidirectional leader handoff | PASS | `p3-5gov-2rust-28views-pass.jsonl`; 44 consecutive exact blocks covering more than two rotations |
 | P4 fault and lifecycle matrix | IN PROGRESS | all injected fault cases pass; actual 24-hour zero-transaction window and following burst are running |
 | P5 minimal full archive+ parity | PASS | 209 RPC comparisons, 22 offline proof checks, export/import and corruption recovery |
-| P6 existing seven-node rollout | IN PROGRESS | observer cold bootstrap, exact epoch crossing and actual 24-hour observer window are running |
+| P6 existing seven-node rollout | IN PROGRESS | observer cold bootstrap and exact epoch crossing pass; the actual 24-hour read-only observer window passes, continuity guard remains active, and participant activation waits for P4 |
 
 ## P0 — safety and participation baseline
 
@@ -460,19 +460,26 @@ endpoints returned the exact same block hash, QMDB state root, and receipts
 root. The observer reports `hasCommittedQc=false`; its 16-byte vote log is
 hashed at the start and will be compared again at the end.
 
-The actual observer window began at `2026-07-23T14:39:47Z`.
-`p6-observer-24h-soak.jsonl` continuously compares:
+The actual observer window began at `2026-07-23T14:39:47Z` and closed after
+1,433 samples at `2026-07-24T14:44:24Z`, spanning 86,677 seconds. It has zero
+failed samples or read-only violations, maximum lag 1, maximum sample gap 63
+seconds, and advances from block 933 to 22,602. Its closed SHA-256 is
+`f5a9d3261156160f6f0f33805620b3ff5f798d590755cd44507eff49b80a192d`.
+`p6-observer-24h-soak.jsonl` compares:
 
 - all seven Gov5 heads and the observer;
 - common block hash, state root, and receipts root;
 - head lag, archive floor, and retained block count;
 - read-only consensus status.
 
-A post-threshold read-only guard continues the same comparisons until the P4
-gate releases participant activation, so the observer-to-maintenance interval
-does not become an unmeasured gap. After the P4 window was restarted for the
-priority-lane correction, both extension schedules remained lengthened to
-86,400 seconds. A second overlapping guard begins at
+A post-threshold read-only guard took over at `2026-07-24T14:45:00Z`, 36
+seconds after the formal window's last sample, and continues the same
+comparisons until the P4 gate releases participant activation, so the
+observer-to-maintenance interval does not become an unmeasured gap. The
+threshold and handoff are independently recorded in
+`p6-observer-24h-independent-threshold-audit.jsonl`. After the P4 window was
+restarted for the priority-lane correction, both extension schedules remained
+lengthened to 86,400 seconds. A second overlapping guard begins at
 `2026-07-25T05:30:00Z`, before the new P4 threshold, and the fail-closed P6
 finalizer stops both guards immediately before activation. Activation also
 requires both handoff gaps to be at most 120 seconds and the last observer
@@ -498,6 +505,7 @@ vote remains blocked until the matching block is execution-valid.
 Evidence:
 
 - `p6-observer-post-24h-guard.jsonl`
+- `p6-observer-24h-independent-threshold-audit.jsonl`
 - `p6-continuous-observer-guard-update.jsonl`
 - `long-window-transition-schedule-audit.jsonl`
 - `p6-observer-independent-archive-rpc-audit.jsonl`
