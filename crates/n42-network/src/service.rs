@@ -286,6 +286,21 @@ pub enum NetworkEvent {
     },
 }
 
+fn event_uses_consensus_lane(event: &NetworkEvent, h2_v4_participant: bool) -> bool {
+    matches!(
+        event,
+        NetworkEvent::ConsensusMessage { .. } | NetworkEvent::BlockAnnouncement { .. }
+    ) || h2_v4_participant
+        && matches!(
+            event,
+            NetworkEvent::Gov5H2Message { .. }
+                | NetworkEvent::H2V4Message { .. }
+                | NetworkEvent::Gov5Block { .. }
+                | NetworkEvent::Gov5BlockFetched { .. }
+                | NetworkEvent::Gov5BlockFetchFailed { .. }
+        )
+}
+
 /// Handle for sending commands to the running `NetworkService`.
 ///
 /// Cheaply cloneable. The main interface for the node layer to interact with
@@ -2428,14 +2443,13 @@ impl NetworkService {
     /// BlockData is critical for follower import pipeline — deprioritizing it
     /// delays block import → delays voting → delays commit.
     fn emit_event(&mut self, event: NetworkEvent) {
-        let reliable_consensus = matches!(
-            &event,
-            NetworkEvent::ConsensusMessage { .. } | NetworkEvent::BlockAnnouncement { .. }
-        ) || self.h2_v4_participant
-            && matches!(
-                &event,
-                NetworkEvent::Gov5H2Message { .. } | NetworkEvent::H2V4Message { .. }
-            );
+        // H2 participant block bodies are part of the execution-gated
+        // consensus path. Routing gossip/fetch responses through the lower
+        // data lane lets a continuously readable consensus lane starve them:
+        // the node can authenticate and commit several hashes while reth
+        // remains unable to execute any of their bodies. Preserve observer
+        // isolation by promoting these events only in participant mode.
+        let reliable_consensus = event_uses_consensus_lane(&event, self.h2_v4_participant);
         let reliable_data = matches!(
             &event,
             NetworkEvent::Gov5H2Message { .. }
@@ -3142,6 +3156,39 @@ mod tests {
 
         assert!(!peers.contains(&preferred));
         assert_eq!(peers.len(), connected.len());
+    }
+
+    #[test]
+    fn h2_participant_block_lifecycle_uses_consensus_lane() {
+        let source = PeerId::random();
+        let block_hash = B256::repeat_byte(0x42);
+        let events = [
+            NetworkEvent::Gov5Block {
+                source,
+                rlp: vec![0xc0],
+            },
+            NetworkEvent::Gov5BlockFetched {
+                source,
+                requested_hash: block_hash,
+                rlp: vec![0xc0],
+            },
+            NetworkEvent::Gov5BlockFetchFailed {
+                source,
+                block_hash,
+                error: "deadline".to_owned(),
+            },
+        ];
+
+        for event in &events {
+            assert!(
+                event_uses_consensus_lane(event, true),
+                "participant execution event must not be starved in the data lane: {event:?}"
+            );
+            assert!(
+                !event_uses_consensus_lane(event, false),
+                "observer block handling must remain isolated from the consensus lane: {event:?}"
+            );
+        }
     }
 
     #[test]
