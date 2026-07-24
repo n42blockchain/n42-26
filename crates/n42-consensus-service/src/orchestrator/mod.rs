@@ -332,6 +332,11 @@ pub struct ConsensusService {
     /// H2-authenticated block hash -> consensus view. Gov5 block gossip is not
     /// executed until one of these bindings exists.
     h2_v4_block_views: BTreeMap<B256, u64>,
+    /// Insertion order for the bounded binding map above. `BTreeMap::pop_first`
+    /// is hash order, not age order: once the map reached capacity, a live
+    /// low-valued block hash could otherwise evict itself immediately and
+    /// strand its already-received body in the unbound cache forever.
+    h2_v4_block_view_order: VecDeque<B256>,
     /// Header-derived execution height for authenticated/interoperable blocks.
     /// This lets asynchronous `Valid` completions advance the exact height
     /// floor without confusing a newer consensus count for executed state.
@@ -656,9 +661,15 @@ impl ConsensusService {
 
     fn remember_h2_v4_block_view(&mut self, block_hash: B256, view: u64) {
         const MAX_H2_V4_BLOCK_BINDINGS: usize = 2048;
+        if !self.h2_v4_block_views.contains_key(&block_hash) {
+            self.h2_v4_block_view_order.push_back(block_hash);
+        }
         self.h2_v4_block_views.insert(block_hash, view);
         while self.h2_v4_block_views.len() > MAX_H2_V4_BLOCK_BINDINGS {
-            self.h2_v4_block_views.pop_first();
+            let Some(oldest) = self.h2_v4_block_view_order.pop_front() else {
+                break;
+            };
+            self.h2_v4_block_views.remove(&oldest);
         }
     }
 
@@ -1816,6 +1827,7 @@ impl ConsensusService {
             engine,
             h2_v4_identity: None,
             h2_v4_block_views: BTreeMap::new(),
+            h2_v4_block_view_order: VecDeque::new(),
             h2_v4_block_numbers: BTreeMap::new(),
             h2_v4_unbound_blocks: BTreeMap::new(),
             h2_v4_catchup_blocks: BTreeMap::new(),
@@ -2040,6 +2052,7 @@ impl ConsensusService {
             engine,
             h2_v4_identity: None,
             h2_v4_block_views: BTreeMap::new(),
+            h2_v4_block_view_order: VecDeque::new(),
             h2_v4_block_numbers: BTreeMap::new(),
             h2_v4_unbound_blocks: BTreeMap::new(),
             h2_v4_catchup_blocks: BTreeMap::new(),
@@ -5273,6 +5286,48 @@ mod tests {
             orch.ready_h2_v4_bound_blocks_in_height_order(),
             expected,
             "a hash-keyed body cache must still release canonical ancestry by height"
+        );
+    }
+
+    #[test]
+    fn full_h2_binding_cache_evicts_oldest_not_new_low_hash() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
+        let mut oldest = B256::ZERO;
+
+        for index in 0..2048_u64 {
+            let mut bytes = [0xf0; 32];
+            bytes[24..].copy_from_slice(&index.to_be_bytes());
+            let hash = B256::from(bytes);
+            if index == 0 {
+                oldest = hash;
+            }
+            orch.remember_h2_v4_block_view(hash, index + 1);
+        }
+
+        let live_low_hash = B256::repeat_byte(0x05);
+        orch.remember_h2_v4_block_view(live_low_hash, 4096);
+
+        assert_eq!(orch.h2_v4_block_views.len(), 2048);
+        assert!(
+            orch.h2_v4_block_views.contains_key(&live_low_hash),
+            "a newly authenticated low-valued hash must not evict itself"
+        );
+        assert!(
+            !orch.h2_v4_block_views.contains_key(&oldest),
+            "capacity eviction must remove the oldest binding"
+        );
+        let mut second_bytes = [0xf0; 32];
+        second_bytes[24..].copy_from_slice(&1_u64.to_be_bytes());
+        assert_eq!(
+            orch.h2_v4_block_view_order.front().copied(),
+            Some(B256::from(second_bytes))
+        );
+        assert_eq!(
+            orch.h2_v4_block_view_order.back().copied(),
+            Some(live_low_hash)
         );
     }
 
