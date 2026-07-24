@@ -569,13 +569,20 @@ monitor_participant() {
     fi
 
     local participant_status='null'
+    local participant_equivocations='null'
     if test "$ok" = true; then
       participant_status="$(curl -fsS --max-time 5 \
         -H 'content-type: application/json' \
         --data '{"jsonrpc":"2.0","id":1,"method":"n42_consensusStatus","params":[]}' \
         http://127.0.0.1:30516 | jq '.result')"
+      participant_equivocations="$(curl -fsS --max-time 5 \
+        -H 'content-type: application/json' \
+        --data '{"jsonrpc":"2.0","id":1,"method":"n42_equivocations","params":[]}' \
+        http://127.0.0.1:30516 | jq '.result')"
       if test "$(printf '%s' "$participant_status" | jq -r '.hasCommittedQc')" != true ||
-        test "$(printf '%s' "$participant_status" | jq -r '.validatorCount')" -ne 7; then
+        test "$(printf '%s' "$participant_status" | jq -r '.validatorCount')" -ne 7 ||
+        test "$(printf '%s' "$participant_equivocations" | jq -r '.total')" -ne 0 ||
+        test "$(printf '%s' "$participant_equivocations" | jq -r '.evidence | length')" -ne 0; then
         ok=false
       fi
     fi
@@ -645,12 +652,15 @@ monitor_participant() {
       --arg stateRoot "$expected_root" \
       --arg receiptsRoot "$expected_receipts_root" \
       --argjson participantStatus "$participant_status" \
+      --argjson participantEquivocations "$participant_equivocations" \
       --argjson leaderCounts "$counts_json" \
       '{
         at:$at,event:"p6_participant_soak_sample",ok:$ok,
         minHeight:$minHeight,maxHeight:$maxHeight,lag:($maxHeight-$minHeight),
         commonBlockHash:$blockHash,stateRoot:$stateRoot,receiptsRoot:$receiptsRoot,
-        participantStatus:$participantStatus,leaderCounts:$leaderCounts
+        participantStatus:$participantStatus,
+        participantEquivocations:$participantEquivocations,
+        leaderCounts:$leaderCounts
       }' >>"$evidence_file"
     rm -rf "$sample_dir"
     if test "$ok" != true; then
