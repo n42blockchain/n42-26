@@ -672,6 +672,51 @@ impl ConsensusService {
         }
     }
 
+    fn stage_h2_v4_catchup_block(
+        &mut self,
+        source: PeerId,
+        rlp: Vec<u8>,
+        height: u64,
+        activate: bool,
+    ) -> bool {
+        const MAX_H2_V4_CATCHUP_BLOCKS: usize = 2048;
+        self.prune_executed_h2_v4_catchup_history();
+        if self.h2_v4_catchup_blocks.len() >= MAX_H2_V4_CATCHUP_BLOCKS
+            && !self.h2_v4_catchup_blocks.contains_key(&height)
+        {
+            error!(
+                target: "n42::interop::h2v4",
+                limit = MAX_H2_V4_CATCHUP_BLOCKS,
+                height,
+                "authenticated Gov5 catch-up exceeds the bounded buffer"
+            );
+            return false;
+        }
+        self.h2_v4_catchup_blocks.insert(height, (source, rlp));
+        if activate {
+            self.h2_v4_catchup_active = true;
+        }
+        true
+    }
+
+    fn ready_h2_v4_bound_blocks_in_height_order(&self) -> Vec<B256> {
+        let mut ready = self
+            .h2_v4_unbound_blocks
+            .iter()
+            .filter(|(hash, _)| self.h2_v4_block_views.contains_key(*hash))
+            .map(|(hash, (_, rlp))| {
+                let height = n42_network::decode_gov5_block_rlp(rlp)
+                    .map(|block| block.header.number)
+                    // Keep malformed entries visible to the canonical handler,
+                    // which records the rejection. They sort behind valid bodies.
+                    .unwrap_or(u64::MAX);
+                (height, *hash)
+            })
+            .collect::<Vec<_>>();
+        ready.sort_unstable();
+        ready.into_iter().map(|(_, hash)| hash).collect()
+    }
+
     async fn handle_h2_v4_gov5_block(
         &mut self,
         source: PeerId,
@@ -749,26 +794,25 @@ impl ConsensusService {
         // execution until the complete bounded segment can be released in
         // ascending order. This still exercises reverse network delivery while
         // ensuring every parent reaches Engine API before its child.
-        const MAX_H2_V4_CATCHUP_BLOCKS: usize = 2048;
         // A known hash binding is not proof that the parent reached execution:
         // several future Proposal/QC messages can arrive together and populate
         // the binding map while Reth is still behind. The only safe live
         // boundary is the durable execution head itself.
         let missing_parent =
             block.header.number > 0 && block.header.parent_hash != self.head_block_hash;
-        if self.h2_v4_catchup_active || missing_parent {
-            self.prune_executed_h2_v4_catchup_history();
-            if self.h2_v4_catchup_blocks.len() >= MAX_H2_V4_CATCHUP_BLOCKS {
-                error!(
-                    target: "n42::interop::h2v4",
-                    limit = MAX_H2_V4_CATCHUP_BLOCKS,
-                    "authenticated Gov5 catch-up exceeds the bounded buffer"
-                );
-                return;
-            }
-            self.h2_v4_catchup_active = true;
-            self.h2_v4_catchup_blocks
-                .insert(block.header.number, (source, rlp));
+        // Retain even the direct successor until execution advances. If several
+        // authenticated bodies are released from a backlogged consensus batch,
+        // the successor may be handled asynchronously just before its child
+        // reveals the gap. Without this one-block staging floor, catch-up then
+        // lacks the exact first parent and cannot reconnect to the durable head.
+        let activate_catchup = self.h2_v4_catchup_active || missing_parent;
+        if !self.stage_h2_v4_catchup_block(
+            source,
+            rlp.clone(),
+            block.header.number,
+            activate_catchup,
+        ) {
+            return;
         }
         if missing_parent {
             // The child header authenticates the exact parent hash, but timeout
@@ -1035,12 +1079,11 @@ impl ConsensusService {
     }
 
     async fn drain_h2_v4_bound_blocks(&mut self) {
-        let ready = self
-            .h2_v4_unbound_blocks
-            .keys()
-            .filter(|hash| self.h2_v4_block_views.contains_key(*hash))
-            .copied()
-            .collect::<Vec<_>>();
+        // The cache is keyed by hash for authentication lookup, but execution
+        // ancestry is ordered by height. A temporarily backlogged batch can
+        // contain several bodies; hash-order release makes children race their
+        // parents and can strand reth in Syncing even though every body arrived.
+        let ready = self.ready_h2_v4_bound_blocks_in_height_order();
         for hash in ready {
             if let Some((source, rlp)) = self.h2_v4_unbound_blocks.remove(&hash) {
                 self.handle_h2_v4_gov5_block(source, rlp, Some(hash)).await;
@@ -3163,6 +3206,10 @@ impl ConsensusService {
                                 self.request_h2_v4_gov5_block(source, block_hash);
                             }
                         }
+                        // Release a body as soon as its authenticating message is
+                        // accepted, before later Proposal/QC/Decide events in the
+                        // same drained batch can commit descendants ahead of it.
+                        self.drain_h2_v4_bound_blocks().await;
                     }
                     Err(e) => {
                         if matches!(e, n42_consensus::N42ConsensusError::SafetyViolation { .. }) {
@@ -3358,6 +3405,9 @@ impl ConsensusService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_consensus::{
+        Block, BlockBody, Header, TxEnvelope, proofs::calculate_transaction_root,
+    };
     use alloy_primitives::{Address, B256, Bloom, Bytes, U256};
     use alloy_rpc_types_engine::{
         ExecutionData, ExecutionPayload, ExecutionPayloadSidecar, ExecutionPayloadV1,
@@ -3376,6 +3426,29 @@ mod tests {
     use std::collections::{HashMap, HashSet};
     use std::sync::{Arc, Mutex, RwLock};
     use std::time::Duration;
+
+    fn test_gov5_block_rlp(parent_hash: B256, number: u64, view: u64) -> (B256, Vec<u8>) {
+        let mut extra_data = Vec::with_capacity(12);
+        extra_data.extend_from_slice(b"N42H");
+        extra_data.extend_from_slice(&view.to_le_bytes());
+        let block = Block::<TxEnvelope> {
+            header: Header {
+                parent_hash,
+                ommers_hash: B256::ZERO,
+                transactions_root: calculate_transaction_root::<TxEnvelope>(&[]),
+                number,
+                base_fee_per_gas: Some(0),
+                extra_data: extra_data.into(),
+                ..Default::default()
+            },
+            body: BlockBody::default(),
+        };
+        let block_hash = block.header.hash_slow();
+        let execution = ExecutionData::from_block_unchecked(block_hash, &block);
+        let rlp =
+            n42_network::encode_gov5_block_rlp(&execution).expect("test Gov5 block must encode");
+        (block_hash, rlp)
+    }
 
     #[derive(Clone, Default)]
     struct MockConsensusNetwork {
@@ -5171,6 +5244,64 @@ mod tests {
         orch.prune_executed_h2_v4_catchup_history();
         assert!(orch.h2_v4_catchup_blocks.is_empty());
         assert!(!orch.h2_v4_catchup_active);
+    }
+
+    #[test]
+    fn bound_h2_bodies_are_released_in_execution_height_order() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
+        let source = n42_network::PeerId::random();
+        let mut parent = B256::repeat_byte(0x70);
+        let mut expected = Vec::new();
+
+        for (height, view) in [(101, 201), (102, 202), (103, 203)] {
+            let (hash, rlp) = test_gov5_block_rlp(parent, height, view);
+            orch.h2_v4_unbound_blocks.insert(hash, (source, rlp));
+            orch.h2_v4_block_views.insert(hash, view);
+            expected.push(hash);
+            parent = hash;
+        }
+
+        assert_eq!(
+            orch.ready_h2_v4_bound_blocks_in_height_order(),
+            expected,
+            "a hash-keyed body cache must still release canonical ancestry by height"
+        );
+    }
+
+    #[test]
+    fn direct_h2_successor_is_staged_before_a_later_child_activates_catchup() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
+        let source = n42_network::PeerId::random();
+        orch.head_block_number = 100;
+
+        assert!(orch.stage_h2_v4_catchup_block(source, vec![0x01], 101, false));
+        assert!(!orch.h2_v4_catchup_active);
+        assert!(orch.stage_h2_v4_catchup_block(source, vec![0x02], 102, true));
+        assert!(orch.h2_v4_catchup_active);
+        assert_eq!(
+            orch.h2_v4_catchup_blocks
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![101, 102],
+            "the first missing parent must remain available when its child reveals the gap"
+        );
+
+        orch.head_block_number = 101;
+        orch.prune_executed_h2_v4_catchup_history();
+        assert_eq!(
+            orch.h2_v4_catchup_blocks
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![102]
+        );
     }
 
     #[test]
