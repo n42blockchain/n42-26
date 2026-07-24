@@ -47,7 +47,26 @@ const MAX_PENDING_GOV5_BLOCK_REQUESTS: usize = 256;
 const MAX_GOV5_BLOCK_FETCH_FANOUT: usize = 8;
 const MAX_RECENT_GOV5_BLOCK_REQUESTS: usize = 4096;
 const GOV5_BLOCK_REQUEST_COOLDOWN: Duration = Duration::from_millis(750);
+// The underlying request-response behaviour times out after ten seconds.
+// Keep one second of scheduling headroom, then let the next orchestrator retry
+// clear any hash-level state whose terminal swarm event was lost or delayed.
+const GOV5_BLOCK_REQUEST_STALE_AFTER: Duration = Duration::from_secs(11);
 const MAX_SERVED_GOV5_BLOCKS: usize = 1024;
+
+fn stale_gov5_block_fetches(
+    pending_hashes: &HashSet<B256>,
+    recent_requests: &HashMap<B256, (Instant, PeerId)>,
+    now: Instant,
+) -> Vec<B256> {
+    recent_requests
+        .iter()
+        .filter_map(|(hash, (attempted, _))| {
+            (pending_hashes.contains(hash)
+                && now.saturating_duration_since(*attempted) >= GOV5_BLOCK_REQUEST_STALE_AFTER)
+                .then_some(*hash)
+        })
+        .collect()
+}
 
 fn gov5_block_fetch_fanout(
     preferred: PeerId,
@@ -2679,6 +2698,33 @@ impl NetworkService {
                 }
             }
             NetworkCommand::RequestGov5BlockByHash { peer, block_hash } => {
+                let now = Instant::now();
+                // Hash de-duplication must not outlive the transport request
+                // that created it. In live catch-up a fan-out round could lose
+                // every terminal swarm event, leaving the orchestrator's
+                // twelve-second retry permanently suppressed even though all
+                // Gov5 peers already served the body. Reap every overdue hash
+                // before applying pending/capacity checks; late responses are
+                // safely treated as redundant by the response handler.
+                let stale = stale_gov5_block_fetches(
+                    &self.pending_gov5_block_hashes,
+                    &self.recent_gov5_block_requests,
+                    now,
+                );
+                for stale_hash in stale {
+                    let requests_before = self.pending_gov5_block_requests.len();
+                    self.pending_gov5_block_requests
+                        .retain(|_, hash| *hash != stale_hash);
+                    self.pending_gov5_block_hashes.remove(&stale_hash);
+                    self.recent_gov5_block_requests.remove(&stale_hash);
+                    let reaped = requests_before - self.pending_gov5_block_requests.len();
+                    metrics::counter!("n42_gov5_block_fetch_stale_rearmed_total").increment(1);
+                    tracing::warn!(
+                        %stale_hash,
+                        reaped,
+                        "re-armed stale Gov5 block fetch after transport deadline"
+                    );
+                }
                 if self.pending_gov5_block_hashes.contains(&block_hash)
                     || self.pending_gov5_block_requests.len() >= MAX_PENDING_GOV5_BLOCK_REQUESTS
                 {
@@ -2690,7 +2736,6 @@ impl NetworkService {
                     return;
                 }
 
-                let now = Instant::now();
                 if self.recent_gov5_block_requests.len() >= MAX_RECENT_GOV5_BLOCK_REQUESTS {
                     self.recent_gov5_block_requests.retain(|_, (attempted, _)| {
                         now.duration_since(*attempted) < Duration::from_secs(60)
@@ -3156,6 +3201,31 @@ mod tests {
 
         assert!(!peers.contains(&preferred));
         assert_eq!(peers.len(), connected.len());
+    }
+
+    #[test]
+    fn stale_gov5_block_fetch_is_rearmed_after_transport_deadline() {
+        let now = Instant::now();
+        let stale_hash = B256::repeat_byte(0x41);
+        let live_hash = B256::repeat_byte(0x42);
+        let peer = PeerId::random();
+        let pending = HashSet::from([stale_hash, live_hash]);
+        let recent = HashMap::from([
+            (stale_hash, (now - GOV5_BLOCK_REQUEST_STALE_AFTER, peer)),
+            (
+                live_hash,
+                (
+                    now - GOV5_BLOCK_REQUEST_STALE_AFTER + Duration::from_millis(1),
+                    peer,
+                ),
+            ),
+        ]);
+
+        assert_eq!(
+            stale_gov5_block_fetches(&pending, &recent, now),
+            vec![stale_hash],
+            "only a hash at or beyond the transport deadline may bypass pending de-duplication"
+        );
     }
 
     #[test]

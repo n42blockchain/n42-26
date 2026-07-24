@@ -717,6 +717,92 @@ impl ConsensusService {
         ready.into_iter().map(|(_, hash)| hash).collect()
     }
 
+    fn ready_h2_v4_catchup_heights(&self) -> Option<Vec<u64>> {
+        if !self.h2_v4_catchup_active {
+            return None;
+        }
+        // The unbound-message cache can release old, already-executed blocks
+        // after a QC jump authenticates their hashes. Starting at the newest
+        // authenticated block, select only the exact parent-hash chain that
+        // terminates at the durable execution head.
+        let (&last_height, (_, newest_rlp)) = self.h2_v4_catchup_blocks.last_key_value()?;
+        let newest = n42_network::decode_gov5_block_rlp(newest_rlp).ok()?;
+        let mut expected_hash = newest.block_hash;
+        let mut height = last_height;
+        let mut selected_heights = Vec::new();
+        loop {
+            let (_, candidate_rlp) = self.h2_v4_catchup_blocks.get(&height)?;
+            let candidate = n42_network::decode_gov5_block_rlp(candidate_rlp).ok()?;
+            if candidate.block_hash != expected_hash {
+                return None;
+            }
+            selected_heights.push(height);
+            if candidate.header.parent_hash == self.head_block_hash {
+                selected_heights.reverse();
+                return Some(selected_heights);
+            }
+            if height == 0 {
+                return None;
+            }
+            expected_hash = candidate.header.parent_hash;
+            height -= 1;
+        }
+    }
+
+    async fn release_ready_h2_v4_catchup_blocks(&mut self) -> bool {
+        let Some(selected_heights) = self.ready_h2_v4_catchup_heights() else {
+            return false;
+        };
+        let mut catchup = Vec::with_capacity(selected_heights.len());
+        for height in selected_heights {
+            let Some(entry) = self.h2_v4_catchup_blocks.remove(&height) else {
+                error!(target: "n42::interop::h2v4", height, "selected Gov5 catch-up block disappeared");
+                return false;
+            };
+            catchup.push(entry);
+        }
+        // Everything left is an unrelated historical release or a stale
+        // branch at/below the selected suffix. Retaining it would poison the
+        // next catch-up activation.
+        self.h2_v4_catchup_blocks.clear();
+        self.h2_v4_catchup_active = false;
+        info!(
+            target: "n42::interop::h2v4",
+            blocks = catchup.len(),
+            "releasing reverse-delivered authenticated Gov5 ancestry in execution order"
+        );
+        for (catchup_source, catchup_rlp) in catchup {
+            let catchup_block = match n42_network::decode_gov5_block_rlp(&catchup_rlp) {
+                Ok(block) => block,
+                Err(error) => {
+                    error!(target: "n42::interop::h2v4", %error, "buffered Gov5 block failed repeat decoding");
+                    return false;
+                }
+            };
+            let Some(catchup_view) = self
+                .h2_v4_block_views
+                .get(&catchup_block.block_hash)
+                .copied()
+            else {
+                error!(target: "n42::interop::h2v4", hash = %catchup_block.block_hash, "buffered Gov5 block lost its authenticated binding");
+                return false;
+            };
+            if !self
+                .import_h2_v4_catchup_block(catchup_source, catchup_block, catchup_view)
+                .await
+            {
+                return false;
+            }
+        }
+        info!(
+            target: "n42::interop::h2v4",
+            execution_validated_view = self.execution_validated_head_view,
+            execution_validated_head = %self.head_block_hash,
+            "authenticated Gov5 ancestry reached a durable execution head"
+        );
+        true
+    }
+
     async fn handle_h2_v4_gov5_block(
         &mut self,
         source: PeerId,
@@ -828,105 +914,17 @@ impl ConsensusService {
             return;
         }
         if self.h2_v4_catchup_active {
-            // The unbound-message cache can release old, already-executed
-            // blocks after a QC jump authenticates their hashes. Those entries
-            // are irrelevant to the missing suffix and must not make us demand
-            // a globally contiguous range from block 1. Starting at the newest
-            // authenticated block, select only the exact parent-hash chain
-            // that terminates at the durable execution head.
-            let Some((&last_height, (_, newest_rlp))) = self.h2_v4_catchup_blocks.last_key_value()
-            else {
-                return;
-            };
-            let Ok(newest) = n42_network::decode_gov5_block_rlp(newest_rlp) else {
-                error!(target: "n42::interop::h2v4", "newest buffered Gov5 block failed repeat decoding");
-                return;
-            };
-            let mut expected_hash = newest.block_hash;
-            let mut height = last_height;
-            let mut selected_heights = Vec::new();
-            let reaches_durable_head = loop {
-                let Some((_, candidate_rlp)) = self.h2_v4_catchup_blocks.get(&height) else {
-                    break false;
-                };
-                let Ok(candidate) = n42_network::decode_gov5_block_rlp(candidate_rlp) else {
-                    error!(target: "n42::interop::h2v4", height, "buffered Gov5 block failed repeat decoding");
-                    return;
-                };
-                if candidate.block_hash != expected_hash {
-                    break false;
-                }
-                selected_heights.push(height);
-                if candidate.header.parent_hash == self.head_block_hash {
-                    break true;
-                }
-                if height == 0 {
-                    break false;
-                }
-                expected_hash = candidate.header.parent_hash;
-                height -= 1;
-            };
-            if !reaches_durable_head {
+            if !self.release_ready_h2_v4_catchup_blocks().await {
                 warn!(
                     target: "n42::interop::h2v4",
                     buffered = self.h2_v4_catchup_blocks.len(),
-                    last_height,
                     execution_head = %self.head_block_hash,
                     "waiting for authenticated Gov5 suffix to reach the durable execution head"
                 );
-                return;
             }
-            selected_heights.reverse();
-            let mut catchup = Vec::with_capacity(selected_heights.len());
-            for height in selected_heights {
-                let Some(entry) = self.h2_v4_catchup_blocks.remove(&height) else {
-                    error!(target: "n42::interop::h2v4", height, "selected Gov5 catch-up block disappeared");
-                    return;
-                };
-                catchup.push(entry);
-            }
-            // Everything left is an unrelated historical release or a stale
-            // branch at/below the selected suffix. Retaining it would poison
-            // the next catch-up activation.
-            self.h2_v4_catchup_blocks.clear();
-            self.h2_v4_catchup_active = false;
-            info!(
-                target: "n42::interop::h2v4",
-                blocks = catchup.len(),
-                "releasing reverse-delivered authenticated Gov5 ancestry in execution order"
-            );
-            for (catchup_source, catchup_rlp) in catchup {
-                let catchup_block = match n42_network::decode_gov5_block_rlp(&catchup_rlp) {
-                    Ok(block) => block,
-                    Err(error) => {
-                        error!(target: "n42::interop::h2v4", %error, "buffered Gov5 block failed repeat decoding");
-                        return;
-                    }
-                };
-                let Some(catchup_view) = self
-                    .h2_v4_block_views
-                    .get(&catchup_block.block_hash)
-                    .copied()
-                else {
-                    error!(target: "n42::interop::h2v4", hash = %catchup_block.block_hash, "buffered Gov5 block lost its authenticated binding");
-                    return;
-                };
-                if !self
-                    .import_h2_v4_catchup_block(catchup_source, catchup_block, catchup_view)
-                    .await
-                {
-                    return;
-                }
-            }
-            info!(
-                target: "n42::interop::h2v4",
-                execution_validated_view = self.execution_validated_head_view,
-                execution_validated_head = %self.head_block_hash,
-                "authenticated Gov5 ancestry reached a durable execution head"
-            );
-            return;
+        } else {
+            self.process_h2_v4_gov5_block(source, block, view).await;
         }
-        self.process_h2_v4_gov5_block(source, block, view).await;
     }
 
     /// Imports a transitively authenticated catch-up segment synchronously.
@@ -2690,6 +2688,13 @@ impl ConsensusService {
             while let Ok(engine_output) = self.output_rx.try_recv() {
                 self.handle_engine_output(engine_output).await;
             }
+            // A child body can arrive while its direct parent is still inside
+            // an asynchronous new_payload/FCU. That child is correctly staged,
+            // but no later network event is guaranteed after the parent moves
+            // the durable execution head. Re-check after every selected
+            // lifecycle event so an execution completion itself releases the
+            // now-contiguous authenticated suffix.
+            self.release_ready_h2_v4_catchup_blocks().await;
         }
 
         info!(target: "n42::cl::orchestrator", view = self.engine.current_view(), "orchestrator shutting down, persisting final state");
@@ -5301,6 +5306,40 @@ mod tests {
                 .copied()
                 .collect::<Vec<_>>(),
             vec![102]
+        );
+    }
+
+    #[test]
+    fn staged_h2_successor_becomes_releasable_when_async_parent_advances_head() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
+        let source = n42_network::PeerId::random();
+        let old_head = B256::repeat_byte(0x60);
+        let (parent_hash, _parent_rlp) = test_gov5_block_rlp(old_head, 101, 201);
+        let (successor_hash, successor_rlp) = test_gov5_block_rlp(parent_hash, 102, 202);
+        orch.head_block_hash = old_head;
+        orch.head_block_number = 100;
+        orch.remember_h2_v4_block_view(successor_hash, 202);
+
+        assert!(orch.stage_h2_v4_catchup_block(source, successor_rlp, 102, true));
+        assert_eq!(
+            orch.ready_h2_v4_catchup_heights(),
+            None,
+            "the successor must wait while its parent is still executing"
+        );
+
+        // This models the asynchronous parent new_payload/FCU completion that
+        // previously left the already-buffered successor stranded forever.
+        orch.head_block_hash = parent_hash;
+        orch.head_block_number = 101;
+        orch.prune_executed_h2_v4_catchup_history();
+
+        assert_eq!(
+            orch.ready_h2_v4_catchup_heights(),
+            Some(vec![102]),
+            "moving the durable head to the parent must release the staged successor"
         );
     }
 
