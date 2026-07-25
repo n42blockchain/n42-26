@@ -10,7 +10,7 @@ use crate::codec;
 pub const BLOCK_DIRECT_PROTOCOL: &str = "/n42/block-direct/1";
 
 /// Maximum block direct message size (16 MB — sufficient for large execution payloads).
-const MAX_BLOCK_DIRECT_SIZE: usize = 16 * 1024 * 1024;
+pub const MAX_BLOCK_DIRECT_SIZE: usize = 16 * 1024 * 1024;
 
 /// Request: carries serialized block data from leader to follower.
 #[derive(Clone, Debug, Serialize, Deserialize)]
