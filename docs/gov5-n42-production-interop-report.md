@@ -462,9 +462,26 @@ warning and deadline counters. Its independent ten-minute audit records 11
 samples across 608 seconds, zero failures, maximum lag zero, a maximum
 61-second gap, and 104 blocks of progress. A separate fifteen-minute audit
 also resolves both Rust processes to the exact pinned release and checks all
-seven RPC endpoints. These early milestones prove live progression only;
-neither counts toward the full-window gate or inherits the prior failed
-window's three-hour milestone.
+seven RPC endpoints.
+
+The same replacement window subsequently crossed independently captured
+three- and four-hour milestones without interruption. The immutable
+three-hour snapshot contains 179 samples across 10,828 seconds, zero
+failures, maximum lag one, maximum sample gap 62 seconds, and 1,843 blocks of
+progress. Its SHA-256 is
+`bfeee2164b1d54a55f4cbceafa72bbac7d3138ca96cafae402daf7585bbb2008`.
+The immutable four-hour snapshot contains 238 samples across 14,420 seconds,
+zero failures, maximum lag one, maximum sample gap 62 seconds, and 2,456
+blocks of progress. Its SHA-256 is
+`7f9a77aae644f977433405c9946fca36fa05ce6a7e5618bb5f6e84896d674f0f`.
+Both audits verify contiguous empty-block coverage, unchanged warning and
+deadline counters, two Rust nodes with the same committed view and hash,
+seven validators, committed QCs, and zero authenticated equivocations. The
+concurrent P6 observer remained read-only with zero failures or write
+violations. All intermediate audits are explicitly
+`PASS_MILESTONE_ONLY`: they prove live progression only, do not count toward
+the full-window gate, and do not inherit the prior failed window's
+three-hour milestone.
 
 A fail-closed finalizer is armed against the formal monitor. It cannot release
 the burst unless every sample, historical empty-block interval, lag bound, and
@@ -519,6 +536,10 @@ Additional evidence:
 - `p4-binding-fifo-formal-soak-baseline.jsonl`
 - `p4-binding-fifo-formal-10m-milestone-audit.jsonl`
 - `p4-binding-fifo-formal-independent-15m-audit.jsonl`
+- `p4-binding-fifo-formal-3h-snapshot.jsonl`
+- `p4-binding-fifo-formal-3h-independent-milestone-audit.jsonl`
+- `p4-binding-fifo-formal-4h-snapshot.jsonl`
+- `p4-binding-fifo-formal-4h-independent-milestone-audit.jsonl`
 - `p4-binding-fifo-fix-control-chain-rearm-audit.jsonl`
 - `overall-goal-alignment-binding-fifo-audit.jsonl`
 
