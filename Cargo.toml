@@ -150,6 +150,7 @@ rcgen = "0.14.7"
 
 # RPC
 jsonrpsee = { version = "0.26", features = ["server", "macros"] }
+tower = "0.5"
 
 # Concurrency
 arc-swap = "1.7"

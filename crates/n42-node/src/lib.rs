@@ -17,6 +17,7 @@ pub mod pool;
 pub mod qmdb_state;
 pub mod qmdb_state_root;
 pub mod rpc;
+mod rpc_compat;
 pub mod sinks;
 pub mod staking;
 pub mod tx_bridge;

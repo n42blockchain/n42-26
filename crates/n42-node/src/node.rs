@@ -4,6 +4,7 @@ use crate::engine_validator::N42EngineValidatorBuilder;
 use crate::payload::N42PayloadBuilder;
 use crate::pool::N42PoolBuilder;
 use crate::qmdb_state_root::{Gov5QmdbStateRootStore, N42EngineTreeValidatorBuilder};
+use crate::rpc_compat::Gov5RpcCompatLayer;
 use n42_consensus::{N42HeaderProfile, ValidatorSetResolver};
 use reth_chainspec::ChainSpec;
 use reth_ethereum_engine_primitives::EthEngineTypes;
@@ -103,6 +104,7 @@ where
         N42EngineValidatorBuilder,
         BasicEngineApiBuilder<N42EngineValidatorBuilder>,
         N42EngineTreeValidatorBuilder,
+        Gov5RpcCompatLayer,
     >;
 
     fn components_builder(&self) -> Self::ComponentsBuilder {
@@ -126,12 +128,14 @@ where
 
     fn add_ons(&self) -> Self::AddOns {
         let validator = N42EngineValidatorBuilder::new(self.header_profile);
+        let rpc_middleware =
+            Gov5RpcCompatLayer::new(self.header_profile == N42HeaderProfile::Gov5H2);
         EthereumAddOns::new(RpcAddOns::new(
             EthereumEthApiBuilder::default(),
             validator,
             BasicEngineApiBuilder::default(),
             N42EngineTreeValidatorBuilder::new(validator, self.qmdb_state_root_store.clone()),
-            Default::default(),
+            rpc_middleware,
             Identity::new(),
         ))
     }

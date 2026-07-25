@@ -735,7 +735,10 @@ transaction_burst() {
     (.chainId == 1143) and
     (.expectedContract | test("^0x[0-9a-f]{40}$")) and
     (.transactions | length >= 17) and
-    ([.transactions[].nonce] == [range(0; .transactions | length)]) and
+    (.transactions[0].nonce | type == "number") and
+    ([.transactions[].nonce] ==
+      [range(.transactions[0].nonce;
+        .transactions[0].nonce + (.transactions | length))]) and
     (all(.transactions[];
       (.raw | startswith("0x")) and
       (.hash | test("^0x[0-9a-f]{64}$")) and
@@ -745,12 +748,14 @@ transaction_burst() {
   contract="$(jq -er '.expectedContract' "$artifact")"
   mkdir -p "$(dirname "$evidence_file")"
 
-  local port nonce_response
+  local port nonce_response first_nonce expected_nonce
+  first_nonce="$(jq -er '.transactions[0].nonce' "$artifact")"
+  printf -v expected_nonce '0x%x' "$first_nonce"
   for port in "${ports[@]}"; do
     nonce_response="$(rpc_request "http://127.0.0.1:$port" \
       eth_getTransactionCount "$(jq -nc --arg sender "$sender" '[$sender,"latest"]')")"
-    if test "$(printf '%s' "$nonce_response" | jq -er '.result')" != "0x0"; then
-      echo "transaction burst requires sender nonce 0 at port $port" >&2
+    if test "$(printf '%s' "$nonce_response" | jq -er '.result')" != "$expected_nonce"; then
+      echo "transaction burst requires sender nonce $expected_nonce at port $port" >&2
       return 1
     fi
   done
