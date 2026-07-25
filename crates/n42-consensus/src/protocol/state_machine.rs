@@ -720,27 +720,13 @@ impl ConsensusEngine {
             .iter()
             .map(|(_, _, _, _, public_key)| *public_key)
             .collect::<Vec<_>>();
-        let bad = match self.signing_profile {
-            ConsensusSigningProfile::Native => n42_primitives::bls::batch_verify_with_fallback(
-                &signing_messages,
-                &signatures,
-                &public_keys,
-            )
+        let bad = self
+            .signing_profile
+            .batch_verify_with_fallback(&signing_messages, &signatures, &public_keys)
             .err()
             .unwrap_or_default()
             .into_iter()
-            .collect::<HashSet<_>>(),
-            ConsensusSigningProfile::H2V4(_) => candidates
-                .iter()
-                .enumerate()
-                .filter_map(|(position, (_, _, message, signature, public_key))| {
-                    (!self
-                        .signing_profile
-                        .verify_single(public_key, message, signature))
-                    .then_some(position)
-                })
-                .collect(),
-        };
+            .collect::<HashSet<_>>();
 
         let mut verified_proofs = vec![None; messages.len()];
         for (candidate_position, (message_position, proof, ..)) in candidates.iter().enumerate() {
@@ -3204,6 +3190,43 @@ mod tests {
             authenticated[1].is_none(),
             "wrong-key signature must be isolated"
         );
+        assert_eq!(
+            authenticated[2].as_ref().map(|message| message.signer()),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn test_h2_v4_vote_batch_authentication_locates_invalid_signature() {
+        let (mut engine, sks, _, _) = make_engine(4, 0);
+        let identity = H2V4ChainIdentity {
+            chain_id: 42,
+            genesis_hash: B256::repeat_byte(0xC5),
+        };
+        engine.enable_h2_v4_signing(identity);
+        let profile = ConsensusSigningProfile::H2V4(identity);
+        let view = 1;
+        let block_hash = B256::repeat_byte(0xC6);
+        let message = profile.vote_message(view, block_hash);
+        let messages = [0u32, 1, 2]
+            .into_iter()
+            .map(|voter| {
+                let signer = if voter == 1 { 2 } else { voter };
+                ConsensusMessage::Vote(Vote {
+                    view,
+                    block_hash,
+                    voter,
+                    signature: profile.sign(&sks[signer as usize], &message),
+                })
+            })
+            .collect();
+
+        let authenticated = engine.authenticate_vote_batch(messages);
+        assert_eq!(
+            authenticated[0].as_ref().map(|message| message.signer()),
+            Some(0)
+        );
+        assert!(authenticated[1].is_none());
         assert_eq!(
             authenticated[2].as_ref().map(|message| message.signer()),
             Some(2)

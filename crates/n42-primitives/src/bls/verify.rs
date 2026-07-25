@@ -1,5 +1,5 @@
-use super::DST;
 use super::keys::{BlsError, BlsPublicKey, BlsSignature};
+use super::{DST, H2_V4_DST};
 use blst::BLST_ERROR;
 use blst::blst_scalar;
 use blst::min_pk::Signature;
@@ -23,6 +23,30 @@ pub fn batch_verify(
     signatures: &[&BlsSignature],
     public_keys: &[&BlsPublicKey],
 ) -> Result<(), BlsError> {
+    batch_verify_with_domain(messages, signatures, public_keys, DST, false)
+}
+
+/// Batch-verifies H2-v4 signatures using gov5's proof-of-possession
+/// ciphersuite.
+///
+/// Public keys must already have crossed the validator-set validation
+/// boundary. This matches the consensus hot path and avoids repeating a
+/// subgroup check for each fallback verification.
+fn batch_verify_h2_v4(
+    messages: &[&[u8]],
+    signatures: &[&BlsSignature],
+    public_keys: &[&BlsPublicKey],
+) -> Result<(), BlsError> {
+    batch_verify_with_domain(messages, signatures, public_keys, H2_V4_DST, true)
+}
+
+fn batch_verify_with_domain(
+    messages: &[&[u8]],
+    signatures: &[&BlsSignature],
+    public_keys: &[&BlsPublicKey],
+    dst: &[u8],
+    h2_v4: bool,
+) -> Result<(), BlsError> {
     if messages.len() != signatures.len() || signatures.len() != public_keys.len() {
         return Err(BlsError::VerificationFailed(BLST_ERROR::BLST_BAD_ENCODING));
     }
@@ -40,7 +64,11 @@ pub fn batch_verify(
 
     // Single signature: use direct verification (no overhead from random scalars).
     if messages.len() == 1 {
-        return public_keys[0].verify(messages[0], signatures[0]);
+        return if h2_v4 {
+            public_keys[0].verify_h2_v4_prevalidated(messages[0], signatures[0])
+        } else {
+            public_keys[0].verify(messages[0], signatures[0])
+        };
     }
 
     let mut rands: Vec<blst_scalar> = Vec::with_capacity(messages.len());
@@ -58,7 +86,7 @@ pub fn batch_verify(
     let pks: Vec<&blst::min_pk::PublicKey> = public_keys.iter().map(|pk| pk.inner()).collect();
 
     let result = Signature::verify_multiple_aggregate_signatures(
-        messages, DST, &pks, false, &sigs, true, &rands, 64,
+        messages, dst, &pks, false, &sigs, true, &rands, 64,
     );
 
     if result != BLST_ERROR::BLST_SUCCESS {
@@ -102,6 +130,49 @@ pub fn batch_verify_with_fallback(
     let mut bad_indices = Vec::new();
     for i in 0..messages.len() {
         if public_keys[i].verify(messages[i], signatures[i]).is_err() {
+            bad_indices.push(i);
+        }
+    }
+
+    if bad_indices.is_empty() {
+        Ok(())
+    } else {
+        Err(bad_indices)
+    }
+}
+
+/// H2-v4 equivalent of [`batch_verify_with_fallback`].
+///
+/// The randomized multi-pairing keeps invalid signatures from cancelling one
+/// another. Only a failed batch falls back to individual H2-v4 verification so
+/// callers can exclude the exact bad positions.
+pub fn batch_verify_h2_v4_prevalidated_with_fallback(
+    messages: &[&[u8]],
+    signatures: &[&BlsSignature],
+    public_keys: &[&BlsPublicKey],
+) -> Result<(), Vec<usize>> {
+    if messages.len() != signatures.len() || signatures.len() != public_keys.len() {
+        return Err((0..messages.len()).collect());
+    }
+
+    if messages.len() > MAX_BATCH_SIZE {
+        return Err((0..messages.len()).collect());
+    }
+
+    if messages.is_empty() {
+        return Ok(());
+    }
+
+    if batch_verify_h2_v4(messages, signatures, public_keys).is_ok() {
+        return Ok(());
+    }
+
+    let mut bad_indices = Vec::new();
+    for i in 0..messages.len() {
+        if public_keys[i]
+            .verify_h2_v4_prevalidated(messages[i], signatures[i])
+            .is_err()
+        {
             bad_indices.push(i);
         }
     }
@@ -276,6 +347,55 @@ mod tests {
 
         assert_eq!(
             batch_verify_with_fallback(&messages, &[&sig], &[&pk]),
+            Err(vec![0, 1])
+        );
+    }
+
+    #[test]
+    fn test_h2_v4_batch_verify_with_fallback_all_valid() {
+        let msg = b"h2-v4 consensus vote";
+        let sks: Vec<_> = (0..5).map(|i| test_key(0x80 + i as u8)).collect();
+        let pks: Vec<_> = sks.iter().map(BlsSecretKey::public_key).collect();
+        let sigs: Vec<_> = sks.iter().map(|sk| sk.sign_h2_v4(msg)).collect();
+        let messages = vec![msg.as_ref(); sks.len()];
+        let sig_refs = sigs.iter().collect::<Vec<_>>();
+        let pk_refs = pks.iter().collect::<Vec<_>>();
+
+        batch_verify_h2_v4_prevalidated_with_fallback(&messages, &sig_refs, &pk_refs)
+            .expect("all H2-v4 signatures should verify as one batch");
+        assert!(
+            batch_verify_with_fallback(&messages, &sig_refs, &pk_refs).is_err(),
+            "H2-v4 signatures must remain invalid in the native domain"
+        );
+    }
+
+    #[test]
+    fn test_h2_v4_batch_verify_with_fallback_identifies_bad() {
+        let msg = b"h2-v4 consensus vote";
+        let sks: Vec<_> = (0..5).map(|i| test_key(0x90 + i as u8)).collect();
+        let pks: Vec<_> = sks.iter().map(BlsSecretKey::public_key).collect();
+        let mut sigs: Vec<_> = sks.iter().map(|sk| sk.sign_h2_v4(msg)).collect();
+        sigs[1] = sks[1].sign_h2_v4(b"wrong");
+        sigs[3] = sks[3].sign(b"h2-v4 consensus vote");
+        let messages = vec![msg.as_ref(); sks.len()];
+        let sig_refs = sigs.iter().collect::<Vec<_>>();
+        let pk_refs = pks.iter().collect::<Vec<_>>();
+
+        assert_eq!(
+            batch_verify_h2_v4_prevalidated_with_fallback(&messages, &sig_refs, &pk_refs),
+            Err(vec![1, 3])
+        );
+    }
+
+    #[test]
+    fn test_h2_v4_batch_verify_with_fallback_rejects_unmatched_tail() {
+        let sk = test_key(0xA0);
+        let pk = sk.public_key();
+        let sig = sk.sign_h2_v4(b"first");
+        let messages: Vec<&[u8]> = vec![b"first".as_ref(), b"unmatched".as_ref()];
+
+        assert_eq!(
+            batch_verify_h2_v4_prevalidated_with_fallback(&messages, &[&sig], &[&pk]),
             Err(vec![0, 1])
         );
     }

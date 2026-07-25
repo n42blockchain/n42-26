@@ -167,6 +167,7 @@ Logs are split into separate files by phase for easy maintenance:
 | [devlog-133-h2-v4-mixed-participant](docs/devlog-133-h2-v4-mixed-participant.md) | H2-v4 双向混合客户端参与者：gov5 入站订阅、Rust POP 共识/QC/TC、认证后区块执行及 gov5 leader header/RLP 生产；默认关闭并隔离现有七节点 | Interop |
 | [devlog-134-gov5-live-voter-and-catchup-watermark](docs/devlog-134-gov5-live-voter-and-catchup-watermark.md) | Rust 参与者在 Gov5 真机委员会完成执行门控投票；修复乱序 catch-up 子块用 Syncing 结果提前毒化 eager-import 水位 | Interop |
 | [devlog-135-interop-branch-deep-audit](docs/devlog-135-interop-branch-deep-audit.md) | 合入 main 前的互操作分支深度审计：gov5 block 响应 Snappy 解压未受声明长度约束（HIGH-1）、H2 执行门控投票的 import 证据被挤出致该 view 永久不投票（HIGH-2），均已修 | Security |
+| [devlog-136-h2-v4-batch-verification](docs/devlog-136-h2-v4-batch-verification.md) | H2-v4 R1/R2、QC 与 TC 未认证尾部改用 POP 域随机系数 multi-pairing，失败时精确回退定位坏签名，保持 Native/H2 域隔离 | Performance |
 
 ### 上游借鉴与跟踪
 

@@ -2,7 +2,10 @@ use alloy_primitives::B256;
 use bitvec::prelude::*;
 use n42_primitives::{
     BlsSecretKey,
-    bls::{AggregateSignature, BlsPublicKey, BlsSignature, batch_verify_with_fallback},
+    bls::{
+        AggregateSignature, BlsPublicKey, BlsSignature,
+        batch_verify_h2_v4_prevalidated_with_fallback, batch_verify_with_fallback,
+    },
     consensus::{
         H2V4ChainIdentity, QuorumCertificate, TimeoutCertificate, ViewNumber,
         h2_v4_commit_signing_message, h2_v4_new_view_signing_message,
@@ -91,6 +94,20 @@ impl ConsensusSigningProfile {
             Self::H2V4(_) => public_key.verify_h2_v4_prevalidated(message, signature),
         }
         .is_ok()
+    }
+
+    pub(super) fn batch_verify_with_fallback(
+        self,
+        messages: &[&[u8]],
+        signatures: &[&BlsSignature],
+        public_keys: &[&BlsPublicKey],
+    ) -> Result<(), Vec<usize>> {
+        match self {
+            Self::Native => batch_verify_with_fallback(messages, signatures, public_keys),
+            Self::H2V4(_) => {
+                batch_verify_h2_v4_prevalidated_with_fallback(messages, signatures, public_keys)
+            }
+        }
     }
 
     fn verify_aggregate(
@@ -261,22 +278,12 @@ impl VoteCollector {
                 .map(|(_, sig, _)| *sig)
                 .collect::<Vec<_>>();
             let public_keys = unverified.iter().map(|(_, _, pk)| *pk).collect::<Vec<_>>();
-            let bad = match signing_profile {
-                ConsensusSigningProfile::Native => {
-                    batch_verify_with_fallback(&messages, &signatures, &public_keys)
-                        .err()
-                        .unwrap_or_default()
-                        .into_iter()
-                        .collect::<HashSet<_>>()
-                }
-                ConsensusSigningProfile::H2V4(_) => unverified
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(position, (_, sig, pk))| {
-                        (!signing_profile.verify_single(pk, message, sig)).then_some(position)
-                    })
-                    .collect(),
-            };
+            let bad = signing_profile
+                .batch_verify_with_fallback(&messages, &signatures, &public_keys)
+                .err()
+                .unwrap_or_default()
+                .into_iter()
+                .collect::<HashSet<_>>();
 
             for (position, (idx, sig, _)) in unverified.into_iter().enumerate() {
                 if bad.contains(&position) {
@@ -441,22 +448,12 @@ impl TimeoutCollector {
                 .iter()
                 .map(|(_, _, pk, _)| *pk)
                 .collect::<Vec<_>>();
-            let bad = match signing_profile {
-                ConsensusSigningProfile::Native => {
-                    batch_verify_with_fallback(&messages, &signatures, &public_keys)
-                        .err()
-                        .unwrap_or_default()
-                        .into_iter()
-                        .collect::<HashSet<_>>()
-                }
-                ConsensusSigningProfile::H2V4(_) => unverified
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(position, (_, sig, pk, _))| {
-                        (!signing_profile.verify_single(pk, &message, sig)).then_some(position)
-                    })
-                    .collect(),
-            };
+            let bad = signing_profile
+                .batch_verify_with_fallback(&messages, &signatures, &public_keys)
+                .err()
+                .unwrap_or_default()
+                .into_iter()
+                .collect::<HashSet<_>>();
 
             for (position, (idx, sig, _, high_qc)) in unverified.into_iter().enumerate() {
                 if bad.contains(&position) {
@@ -1408,6 +1405,34 @@ mod tests {
             .unwrap();
         verify_qc_with_profile(&qc, &vs, profile).unwrap();
         assert!(verify_qc(&qc, &vs).is_err());
+    }
+
+    #[test]
+    fn h2_v4_batch_qc_build_isolates_an_invalid_signature() {
+        let (sks, vs) = test_validator_set(4);
+        let profile = ConsensusSigningProfile::H2V4(H2V4ChainIdentity {
+            chain_id: 42,
+            genesis_hash: B256::repeat_byte(0xA6),
+        });
+        let view = 20;
+        let block_hash = B256::repeat_byte(0xB6);
+        let message = profile.vote_message(view, block_hash);
+        let mut collector = VoteCollector::new(view, block_hash, vs.len());
+        for index in 0..3 {
+            collector
+                .add_vote(index, profile.sign(&sks[index as usize], &message))
+                .unwrap();
+        }
+        collector
+            .add_vote(3, profile.sign(&sks[3], b"wrong H2-v4 vote"))
+            .unwrap();
+
+        let qc = collector
+            .build_qc_with_profile_message(&vs, &message, profile)
+            .expect("the three valid H2-v4 signatures still form quorum");
+        assert_eq!(qc.signer_count(), 3);
+        assert!(!qc.signers[3]);
+        verify_qc_with_profile(&qc, &vs, profile).unwrap();
     }
 
     #[test]
