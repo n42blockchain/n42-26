@@ -579,17 +579,31 @@ impl TwigTree {
         }
         let n = self.twigs.len();
         let up_cap = n.next_power_of_two();
-        let mut upper = vec![NULL_HASH; 2 * up_cap];
-        for (i, t) in self.twigs.iter().enumerate() {
-            upper[up_cap + i] = t.root();
+        // Reuse the previous buffer instead of allocating a fresh one and dropping
+        // the old. `clear` + `resize` re-fills with NULL_HASH — which the padding
+        // leaves past `up_cap + n` rely on — while keeping the capacity, so in the
+        // steady state (twig count stable between blocks) this stops allocating
+        // entirely. Note this only removes the allocation: the fold below is still
+        // O(total twigs) per call and dominates once the forest is large.
+        self.upper.clear();
+        self.upper.resize(2 * up_cap, NULL_HASH);
+        for i in 0..n {
+            self.upper[up_cap + i] = self.twigs[i].root();
         }
+        let upper = &mut self.upper;
         for j in (1..up_cap).rev() {
             upper[j] = hash_node(&upper[2 * j], &upper[2 * j + 1]);
         }
         let world = upper[1];
-        self.upper = upper;
         self.up_cap = up_cap;
         world
+    }
+
+    /// Number of twigs in this shard. Grows with total historical writes (the
+    /// tree is append-only), not with the live key count, and drives the cost of
+    /// the upper-tree rebuild in [`Self::root`].
+    pub fn twig_count(&self) -> usize {
+        self.twigs.len()
     }
 
     /// Build an inclusion proof for a live `key` (twig path + upper path). Returns
@@ -743,6 +757,17 @@ impl ShardedTwig {
 
     pub fn version(&self) -> u64 {
         self.version
+    }
+
+    /// Total twigs across all shards.
+    ///
+    /// Worth exporting as a metric: the per-block upper-tree rebuild in
+    /// [`TwigTree::root`] costs O(twigs) regardless of how much the block
+    /// changed, and each twig also holds a 128 KiB node array resident. Without
+    /// this number there is no way to tell whether that fixed cost is currently
+    /// negligible or dominant.
+    pub fn twig_count(&self) -> usize {
+        self.shards.iter().map(|s| s.twig_count()).sum()
     }
 
     pub fn get(&self, key: &Hash) -> Option<&[u8]> {

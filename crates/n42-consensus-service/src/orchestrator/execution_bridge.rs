@@ -1592,6 +1592,38 @@ async fn broadcast_block_data(
         }
     };
 
+    // This is the first and only point where the true on-wire size of a block is
+    // known: after zstd, after bincode, and including `execution_output`, none of
+    // which the payload builder can see. The builder budgets by transaction count
+    // and gas, and neither is denominated in bytes, so nothing upstream prevents
+    // a block from landing above the propagation ceiling.
+    //
+    // Both send paths below fail *quietly* when that happens — GossipSub logs a
+    // warning and drops the publish, receivers `Reject` it. Validators then have
+    // nothing to vote on, the view cannot reach quorum, and a restart rebuilds
+    // the identical block from the identical mempool. So the chain stops with
+    // only a warning to show for it. Record the overrun loudly and as a metric:
+    // it is the difference between an afternoon of confused log-reading and one
+    // glance at a dashboard.
+    metrics::gauge!("n42_block_broadcast_bytes").set(encoded.len() as f64);
+    if encoded.len() > n42_network::MAX_BROADCAST_PAYLOAD_BYTES {
+        metrics::counter!("n42_block_broadcast_oversized_total").increment(1);
+        error!(
+            target: "n42::cl::exec_bridge",
+            %hash,
+            current_view,
+            encoded_bytes = encoded.len(),
+            budget_bytes = n42_network::MAX_BROADCAST_PAYLOAD_BYTES,
+            gossip_limit_bytes = n42_network::MAX_GOSSIP_MESSAGE_SIZE,
+            raw_kb = raw_len / 1024,
+            compressed_kb = compressed_len / 1024,
+            exec_kb,
+            "block exceeds the propagation budget and will very likely not reach \
+             validators; the view cannot reach quorum and a restart will rebuild the \
+             same block — lower N42_MAX_TXS_PER_BLOCK or the block gas limit"
+        );
+    }
+
     let build_start_to_broadcast_ms = build_start.elapsed().as_millis() as u64;
     metrics::histogram!("n42_build_start_to_broadcast_ms")
         .record(build_start_to_broadcast_ms as f64);

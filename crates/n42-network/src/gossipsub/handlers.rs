@@ -86,7 +86,13 @@ pub fn validate_message(
     // Mempool transactions capped at 128KB; blob sidecars at 1MB.
     let max_size =
         if topic == block_topic_hash || gov5_block_topic_hash.is_some_and(|hash| topic == hash) {
-            8 * 1024 * 1024 // 8MB for high-throughput block data
+            // Same constant the publisher and max_transmit_size use. This is the
+            // receiver's Reject threshold, so a second hardcoded copy drifting below
+            // the send side would let a leader publish a block every follower then
+            // refuses — no quorum, and only a warning to show for it. The gov5
+            // block topic carries the same block data over the same transport, so
+            // it fits through the same ceiling.
+            crate::transport::MAX_GOSSIP_MESSAGE_SIZE
         } else if topic == blob_sidecar_topic_hash {
             1024 * 1024 // 1MB for blob sidecars
         } else if topic == mempool_topic_hash {

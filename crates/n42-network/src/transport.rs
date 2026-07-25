@@ -19,6 +19,15 @@ use crate::gov5_rpc::{
 use crate::state_sync::StateSyncCodec;
 use crate::tx_forward::TxForwardCodec;
 
+/// Largest message GossipSub will publish or accept.
+///
+/// This is the tightest ceiling any block on this chain has to fit through:
+/// block data goes out over `block_direct` (16 MiB) *and* unconditionally over
+/// GossipSub as a reliability fallback, so 8 MiB is the effective limit. It is
+/// public so block producers can derive their budget from it instead of
+/// hard-coding a second copy that silently drifts out of sync with this one.
+pub const MAX_GOSSIP_MESSAGE_SIZE: usize = 8 * 1024 * 1024;
+
 /// The composite network behaviour for N42 nodes.
 ///
 /// Combines GossipSub (pub/sub consensus), Identify (peer metadata),
@@ -236,7 +245,7 @@ fn build_swarm_with_transports(
         // Application-level validation is in handle_gossipsub_message.
         .validation_mode(gossipsub::ValidationMode::Permissive)
         // 8MB max: high-throughput blocks can reach several MB.
-        .max_transmit_size(8 * 1024 * 1024)
+        .max_transmit_size(MAX_GOSSIP_MESSAGE_SIZE)
         .mesh_n(config.mesh_d)
         .mesh_n_low(config.mesh_d_low)
         .mesh_n_high(config.mesh_d_high)

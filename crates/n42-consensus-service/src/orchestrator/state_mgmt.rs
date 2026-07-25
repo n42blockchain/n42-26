@@ -460,7 +460,26 @@ impl ConsensusService {
         while !sync_response_fits_frame(&response) && !response.blocks.is_empty() {
             response.blocks.pop();
         }
-        if response.blocks.len() != initial_blocks {
+        if initial_blocks > 0 && response.blocks.is_empty() {
+            // Dropping every block means the oldest one alone is larger than a
+            // frame. There is no fragmentation layer beneath this, so no retry
+            // and no restart will get that block across: the peer asks for the
+            // same range forever and never advances past it. Distinguish it from
+            // ordinary truncation, which is benign and self-correcting.
+            error!(
+                target: "n42::cl::sync",
+                retained_blocks = initial_blocks,
+                max_frame_bytes = MAX_SYNC_MESSAGE_SIZE,
+                "a single block does not fit in a sync frame; the requesting peer \
+                 cannot advance past it and will stay stuck at this height"
+            );
+            counter!("n42_sync_response_block_exceeds_frame_total").increment(1);
+            // Still count it as a truncation. Dropping every block is the worst
+            // case of one, and anything already alerting on the truncation
+            // counter would otherwise go quiet exactly when it matters most.
+            counter!("n42_sync_response_frame_truncations_total", "section" => "blocks")
+                .increment(1);
+        } else if response.blocks.len() != initial_blocks {
             warn!(
                 target: "n42::cl::sync",
                 retained_blocks = initial_blocks,

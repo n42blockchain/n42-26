@@ -38,6 +38,11 @@ impl TwigState {
         self.inner.version()
     }
 
+    /// Total twigs across all shards — see [`ShardedTwig::twig_count`].
+    pub fn twig_count(&self) -> usize {
+        self.inner.twig_count()
+    }
+
     /// Combined state root.
     pub fn root(&mut self) -> B256 {
         B256::from(self.inner.root())

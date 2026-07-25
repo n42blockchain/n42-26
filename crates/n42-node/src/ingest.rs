@@ -39,6 +39,15 @@ use tokio::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
 const CREDIT_WAIT_SENTINEL: u32 = u32::MAX;
+/// Upper bound on the `num_txs` field of a batch header.
+///
+/// The header is a peer-supplied `u32`, and the batch used to be buffered with
+/// `Vec::with_capacity(num_txs)` before a single transaction had been read — so
+/// a 4-byte frame claiming `u32::MAX - 1` transactions asked the allocator for
+/// hundreds of gigabytes and killed the node. The real client batches 500 at a
+/// time, so this ceiling is far above any legitimate sender and only exists to
+/// keep a malformed or hostile header from turning into an allocation.
+const MAX_INGEST_BATCH_TXS: usize = 65_536;
 const DEFAULT_INGEST_HIGH_WATER: usize = 90_000;
 const DEFAULT_INGEST_TARGET_PENDING: usize = 82_000;
 const DEFAULT_INGEST_VIRTUAL_BLOCK_CREDIT_MS: u64 = 0;
@@ -296,6 +305,17 @@ fn reserve_credit_probe_allowance(base_high_water: usize, pending: usize) -> (us
 /// Reads port from `N42_INGEST_PORT` env var (default: 19900).
 /// Legacy fallback: `N42_INJECT_PORT`.
 /// Each node in testnet gets port = base + node_index.
+///
+/// # Exposure
+///
+/// This listener takes the sender address from the wire and hands the
+/// transaction to the pool through [`DirectPoolIngest::add_prevalidated`] — no
+/// ECDSA recovery, no pool admission checks. That is the whole point of the
+/// port (it exists so a local load generator is not the bottleneck), but it
+/// also means anyone who can reach it can submit a transaction spending from
+/// **any** account. It therefore binds loopback by default. Set
+/// `N42_INGEST_BIND` to an explicit address to widen that, and only on a
+/// network you control.
 pub async fn run_ingest_server<P>(pool: P)
 where
     P: DirectPoolIngest + Clone,
@@ -306,10 +326,23 @@ where
         .and_then(|v| v.parse().ok())
         .unwrap_or(19900);
 
-    let listener = match TcpListener::bind(("0.0.0.0", port)).await {
+    // Loopback by default: binding 0.0.0.0 published an unauthenticated,
+    // signature-free "spend from any account" endpoint on every interface of
+    // every node that had the ingest port enabled.
+    let bind_host = std::env::var("N42_INGEST_BIND").unwrap_or_else(|_| "127.0.0.1".to_string());
+    if bind_host != "127.0.0.1" && bind_host != "::1" && bind_host != "localhost" {
+        warn!(
+            target: "n42::ingest",
+            bind = %bind_host,
+            "ingest server bound off-loopback: it accepts a wire-supplied sender with no \
+             signature check, so anyone who can reach this address can spend from any account"
+        );
+    }
+
+    let listener = match TcpListener::bind((bind_host.as_str(), port)).await {
         Ok(l) => l,
         Err(e) => {
-            warn!(target: "n42::ingest", port, error = %e, "failed to bind ingest server");
+            warn!(target: "n42::ingest", bind = %bind_host, port, error = %e, "failed to bind ingest server");
             return;
         }
     };
@@ -616,6 +649,15 @@ where
             continue;
         }
         let num_txs = header_value as usize;
+        if num_txs > MAX_INGEST_BATCH_TXS {
+            warn!(
+                target: "n42::ingest",
+                num_txs,
+                max = MAX_INGEST_BATCH_TXS,
+                "batch header claims more transactions than allowed; dropping connection"
+            );
+            break;
+        }
 
         stats.received.fetch_add(num_txs as u64, Ordering::Relaxed);
 
@@ -776,4 +818,63 @@ where
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pool stub: the oversized-header test never reaches a pool call, so the
+    /// methods only have to exist.
+    #[derive(Clone)]
+    struct NoopPool;
+
+    impl DirectPoolIngest for NoopPool {
+        fn add_prevalidated(
+            &self,
+            txs: Vec<EthPooledTransaction>,
+        ) -> Vec<PoolResult<AddedTransactionOutcome>> {
+            assert!(txs.is_empty(), "test never submits transactions");
+            Vec::new()
+        }
+
+        fn pending_count(&self) -> usize {
+            0
+        }
+    }
+
+    /// A batch header is a peer-supplied `u32`. It used to be handed straight to
+    /// `Vec::with_capacity`, so a 4-byte frame claiming ~4.29e9 transactions
+    /// asked the allocator for hundreds of gigabytes before a single byte of
+    /// transaction data had been read. The header must be rejected on its face.
+    #[tokio::test]
+    async fn oversized_batch_header_is_rejected_before_allocating() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stats = Arc::new(IngestStats::new());
+        let server_stats = stats.clone();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            handle_client(stream, NoopPool, &server_stats).await
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        // One below the credit-probe sentinel, so it is parsed as a tx count.
+        client
+            .write_all(&(CREDIT_WAIT_SENTINEL - 1).to_le_bytes())
+            .await
+            .unwrap();
+        client.flush().await.unwrap();
+
+        // The server must drop the connection rather than try to buffer the batch.
+        let result = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("handler hung on an oversized header")
+            .expect("handler task panicked");
+        assert!(result.is_ok(), "handler should close cleanly: {result:?}");
+
+        // Rejected before the counter is bumped, so nothing was accounted as received.
+        assert_eq!(stats.received.load(Ordering::Relaxed), 0);
+    }
 }
