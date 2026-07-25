@@ -171,6 +171,17 @@ feat/gov5-n42-live-interop (39 commits)
 **不改任何 wire 格式、签名域或跨语言向量**，与 P4/P6 窗口无关，可随 T2 一并纳入，
 也可单独合入。
 
+#### ⚠️ 请纳入 `e89425b` 而不是 `36e7532`
+
+真机侧记录选定了 `36e7532`。那个 commit **漏了第三个调用点**
+`TimeoutCollector::build_tc_with_profile`——TC 构建有一段与 QC 结构相同、元组多一个
+字段的逐签名回退，本机 grep 时漏过，而真机侧的并行实现
+（`feat/gov5-h2v4-batch-verify`）覆盖了它。已在 `e89425b` 补齐，并补一条 TC 专属
+回归：四票含一张错 view 签名，TC 仍从其余三票成立且坏 signer 的 bit 保持为 0。
+
+`perf/h2-v4-batch-verify` 当前 tip = **`e89425b`**，三个调用点齐全，
+`clippy --all-targets -D warnings` 零告警、`cargo test --workspace` 46 套件零失败。
+
 ---
 
 ### T8 — 生产替换扩面（真机 / 前置 T4、T5、T6）
