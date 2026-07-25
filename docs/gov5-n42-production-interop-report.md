@@ -27,9 +27,14 @@ Pushed implementation commits:
 - n42-26: `517b13d` (`fix(interop): preserve ordered gov5 execution catchup`)
 - n42-26: `242502c` (`fix(interop): rearm staged Gov5 catchup`)
 - n42-26: `24210f0` (`fix(interop): preserve live H2 bindings at capacity`)
+- n42-26: `2a25359` (merge the two 2026-07-25 interoperability audit fixes)
+- n42-26: `8134235` (`perf(consensus): batch-verify H2-v4 signatures`)
+- n42-26: `04ab69e` (`perf(consensus): batch-verify H2-v4 timeout certificates too`)
+- n42-26: `afafd37` (`fix(interop): normalize gov5 RPC transaction metadata`)
 - N42-gov5: `b027f3040` (`feat(interop): harden Gov5 mixed-client operation`)
 - N42-gov5: `34021c3f7` (`test: make hive genesis fixture self-contained`)
 - N42-gov5: `a70f7cf68` (`test: share hive fixture across packages`)
+- N42-gov5: `a35aa6293` (`fix(ethel): join state-root stream producers`)
 
 The current Rust qualification binary was built at `24210f0`. The preceding
 `21ea922` commit bounds both consensus state-sync requests and
@@ -77,8 +82,12 @@ unchanged for the entire window. Rust hash `7fcec8e3...` and Gov5 hash
 `fa02d37c...` are staged separately for the maintenance-window participant
 phase.
 
-The n42 implementation baseline is `24210f0`, and the Gov5 branch baseline is
-`a70f7cf`; see `source-remote-ref-audit.jsonl`. Live remote audits require the
+The selected T2 source baseline is `afafd37`, and the Gov5 branch baseline is
+`a35aa6293`; see the T2 gate evidence and `source-remote-ref-audit.jsonl`.
+The former contains both audit fixes, all three H2-v4 batch-verification call
+sites, and the Gov5-profile-only RPC normalization required by the failed P4
+burst. The latter fixes the data race found by the mandatory full Go race
+gate. Live remote audits require the
 n42 branch to contain that implementation and match the local checkpoint or
 final-report commit exactly. This in-progress qualification ledger is
 committed as a checkpoint. Its final PASS update remains pending until all
@@ -90,9 +99,12 @@ verified integration branch `integration/gov5-interop-main` is pushed at
 the audit fixes, and the four cross-port hardening commits. `main` remains at
 `3bbad4b` until the current P4 window ends and the audit-fix build baseline is
 selected, so the measured runtime and delivery baseline cannot be confused.
-The latest audit-plan tip is `d39fbfc`; the selected H2-v4 batch-verification
-commit is `36e7532` and will be applied with T2 rather than using the
-superseded local duplicate implementation.
+The latest audit-plan tip is `3332d2a`; the authoritative H2-v4
+batch-verification tip is `e89425b`. Its exact three-call-site content is
+present on the live branch as `8134235` plus `04ab69e`; a tree comparison of
+the affected consensus and devlog paths is exact. T2 full gates are running
+against `afafd37`. A new pinned release hash is not declared until every Rust
+and Go gate passes and the isolated release build finishes.
 
 `p4-binding-fifo-fix-executable-identity-audit.jsonl` independently resolves
 both current live Rust processes through their executable mappings. Both map
@@ -687,6 +699,16 @@ read through an `@file` reference and independently derived the exact configured
 `16Uiu2HAmGHiKh3pqQZ32tb3iM6TMJqqCYXKhH7aXh5aUCYU6d3wc`; the unique BLS
 key and both secret files retain mode 0600. No secret material was emitted.
 
+Because the RPC-compatibility correction makes P4 restart from zero, another
+read-only observer stream was overlapped before the preceding extension could
+expire. The durable stream began at `2026-07-25T23:16:06Z`; its independent
+guard requires a live pinned monitor PID, evidence age at most 150 seconds,
+lag at most four, `observerReadOnly=true`, and
+`hasCommittedQc=false`. A first non-durable background launch exited after
+one healthy sample; that control-plane launch failure and its correction are
+preserved, while the original observer stream remained healthy throughout.
+No participant activation or consensus-state write occurred.
+
 The observer intentionally does not rewrite voting consensus state: its
 snapshot remains at view 900 while its Reth/QMDB head continues following the
 network. The participant handoff was therefore audited explicitly at live
@@ -716,6 +738,9 @@ Evidence:
 - `p6-binding-fifo-release-preactivation-audit.jsonl`
 - `p6-pending-proposal-r1-assertion-install-audit.jsonl`
 - `p6-active-rollback-rehearsal-preparation-audit.jsonl`
+- `p6-observer-t2-rpc-rerun-v2-until-activation.jsonl`
+- `p6-t2-rpc-rerun-v3-overlap-guard-health.jsonl`
+- `p6-observer-overlap-guard-handoff-t2-rpc-rerun-correction.jsonl`
 
 The participant monitor also polls `n42_equivocations` every five seconds and
 requires zero authenticated evidence in every formal sample. A separate
