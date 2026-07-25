@@ -2,7 +2,10 @@ use alloy_primitives::B256;
 use bitvec::prelude::*;
 use n42_primitives::{
     BlsSecretKey,
-    bls::{AggregateSignature, BlsPublicKey, BlsSignature, batch_verify_with_fallback},
+    bls::{
+        AggregateSignature, BlsPublicKey, BlsSignature, batch_verify_h2_v4_with_fallback,
+        batch_verify_with_fallback,
+    },
     consensus::{
         H2V4ChainIdentity, QuorumCertificate, TimeoutCertificate, ViewNumber,
         h2_v4_commit_signing_message, h2_v4_new_view_signing_message,
@@ -91,6 +94,23 @@ impl ConsensusSigningProfile {
             Self::H2V4(_) => public_key.verify_h2_v4_prevalidated(message, signature),
         }
         .is_ok()
+    }
+
+    /// Batch-verifies distinct (message, signature, key) tuples, returning the
+    /// positions that failed. Both ciphersuites use the multi-pairing path with
+    /// random scalars; only the domain and the localizing fallback differ.
+    pub fn batch_verify(
+        self,
+        messages: &[&[u8]],
+        signatures: &[&BlsSignature],
+        public_keys: &[&BlsPublicKey],
+    ) -> Result<(), Vec<usize>> {
+        match self {
+            Self::Native => batch_verify_with_fallback(messages, signatures, public_keys),
+            Self::H2V4(_) => {
+                batch_verify_h2_v4_with_fallback(messages, signatures, public_keys)
+            }
+        }
     }
 
     fn verify_aggregate(
@@ -261,22 +281,12 @@ impl VoteCollector {
                 .map(|(_, sig, _)| *sig)
                 .collect::<Vec<_>>();
             let public_keys = unverified.iter().map(|(_, _, pk)| *pk).collect::<Vec<_>>();
-            let bad = match signing_profile {
-                ConsensusSigningProfile::Native => {
-                    batch_verify_with_fallback(&messages, &signatures, &public_keys)
-                        .err()
-                        .unwrap_or_default()
-                        .into_iter()
-                        .collect::<HashSet<_>>()
-                }
-                ConsensusSigningProfile::H2V4(_) => unverified
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(position, (_, sig, pk))| {
-                        (!signing_profile.verify_single(pk, message, sig)).then_some(position)
-                    })
-                    .collect(),
-            };
+            let bad = signing_profile
+                .batch_verify(&messages, &signatures, &public_keys)
+                .err()
+                .unwrap_or_default()
+                .into_iter()
+                .collect::<HashSet<_>>();
 
             for (position, (idx, sig, _)) in unverified.into_iter().enumerate() {
                 if bad.contains(&position) {

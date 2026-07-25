@@ -1,5 +1,5 @@
-use super::DST;
 use super::keys::{BlsError, BlsPublicKey, BlsSignature};
+use super::{DST, H2_V4_DST};
 use blst::BLST_ERROR;
 use blst::blst_scalar;
 use blst::min_pk::Signature;
@@ -15,6 +15,34 @@ fn scalar_from_u64(val: u64) -> blst_scalar {
 
 const MAX_BATCH_SIZE: usize = 10_000;
 
+/// One ciphersuite's domain tag plus the matching single-signature check.
+///
+/// The two travel together on purpose: batch verification and the fallback that
+/// localizes a bad signature must agree on the domain, or a batch failure would
+/// be "confirmed" by a fallback that verifies against a different message
+/// encoding and reports every signature as valid.
+#[derive(Clone, Copy)]
+struct Ciphersuite {
+    dst: &'static [u8],
+    verify_one: fn(&BlsPublicKey, &[u8], &BlsSignature) -> Result<(), BlsError>,
+}
+
+/// Native N42 consensus (NUL). The single-signature path revalidates the public
+/// key, which the batch path does not — the batch protects itself with random
+/// scalars instead.
+const NATIVE: Ciphersuite = Ciphersuite {
+    dst: DST,
+    verify_one: BlsPublicKey::verify,
+};
+
+/// Gov5-compatible H2-v4 (POP). Keys reach this path only through the validator
+/// set, which validates them at `ValidatorSet::try_new`, so the single-signature
+/// check stays on the prevalidated variant used by the rest of the H2-v4 paths.
+const H2_V4: Ciphersuite = Ciphersuite {
+    dst: H2_V4_DST,
+    verify_one: BlsPublicKey::verify_h2_v4_prevalidated,
+};
+
 /// Batch-verify multiple (message, signature, public_key) tuples.
 /// Uses blst's multi-pairing with random 64-bit scalars for rogue-key attack protection.
 /// Significantly faster than individual verification (~50% savings with many signatures).
@@ -22,6 +50,24 @@ pub fn batch_verify(
     messages: &[&[u8]],
     signatures: &[&BlsSignature],
     public_keys: &[&BlsPublicKey],
+) -> Result<(), BlsError> {
+    batch_verify_with_suite(messages, signatures, public_keys, NATIVE)
+}
+
+/// [`batch_verify`] for gov5-compatible H2-v4 signatures.
+pub fn batch_verify_h2_v4(
+    messages: &[&[u8]],
+    signatures: &[&BlsSignature],
+    public_keys: &[&BlsPublicKey],
+) -> Result<(), BlsError> {
+    batch_verify_with_suite(messages, signatures, public_keys, H2_V4)
+}
+
+fn batch_verify_with_suite(
+    messages: &[&[u8]],
+    signatures: &[&BlsSignature],
+    public_keys: &[&BlsPublicKey],
+    suite: Ciphersuite,
 ) -> Result<(), BlsError> {
     if messages.len() != signatures.len() || signatures.len() != public_keys.len() {
         return Err(BlsError::VerificationFailed(BLST_ERROR::BLST_BAD_ENCODING));
@@ -40,7 +86,7 @@ pub fn batch_verify(
 
     // Single signature: use direct verification (no overhead from random scalars).
     if messages.len() == 1 {
-        return public_keys[0].verify(messages[0], signatures[0]);
+        return (suite.verify_one)(public_keys[0], messages[0], signatures[0]);
     }
 
     let mut rands: Vec<blst_scalar> = Vec::with_capacity(messages.len());
@@ -58,7 +104,7 @@ pub fn batch_verify(
     let pks: Vec<&blst::min_pk::PublicKey> = public_keys.iter().map(|pk| pk.inner()).collect();
 
     let result = Signature::verify_multiple_aggregate_signatures(
-        messages, DST, &pks, false, &sigs, true, &rands, 64,
+        messages, suite.dst, &pks, false, &sigs, true, &rands, 64,
     );
 
     if result != BLST_ERROR::BLST_SUCCESS {
@@ -78,6 +124,24 @@ pub fn batch_verify_with_fallback(
     signatures: &[&BlsSignature],
     public_keys: &[&BlsPublicKey],
 ) -> Result<(), Vec<usize>> {
+    batch_verify_with_fallback_suite(messages, signatures, public_keys, NATIVE)
+}
+
+/// [`batch_verify_with_fallback`] for gov5-compatible H2-v4 signatures.
+pub fn batch_verify_h2_v4_with_fallback(
+    messages: &[&[u8]],
+    signatures: &[&BlsSignature],
+    public_keys: &[&BlsPublicKey],
+) -> Result<(), Vec<usize>> {
+    batch_verify_with_fallback_suite(messages, signatures, public_keys, H2_V4)
+}
+
+fn batch_verify_with_fallback_suite(
+    messages: &[&[u8]],
+    signatures: &[&BlsSignature],
+    public_keys: &[&BlsPublicKey],
+    suite: Ciphersuite,
+) -> Result<(), Vec<usize>> {
     if messages.len() != signatures.len() || signatures.len() != public_keys.len() {
         // Input length mismatch is a programming error. Mark every message
         // position bad so callers that use this index set as a filter cannot
@@ -94,14 +158,14 @@ pub fn batch_verify_with_fallback(
     }
 
     // Try batch verification first.
-    if batch_verify(messages, signatures, public_keys).is_ok() {
+    if batch_verify_with_suite(messages, signatures, public_keys, suite).is_ok() {
         return Ok(());
     }
 
     // Batch failed: fall back to individual verification to find bad signatures.
     let mut bad_indices = Vec::new();
     for i in 0..messages.len() {
-        if public_keys[i].verify(messages[i], signatures[i]).is_err() {
+        if (suite.verify_one)(public_keys[i], messages[i], signatures[i]).is_err() {
             bad_indices.push(i);
         }
     }
@@ -277,6 +341,97 @@ mod tests {
         assert_eq!(
             batch_verify_with_fallback(&messages, &[&sig], &[&pk]),
             Err(vec![0, 1])
+        );
+    }
+
+    #[test]
+    fn h2_v4_batch_accepts_h2_v4_signatures() {
+        let msg = b"h2-v4 chain-bound vote";
+        let sks: Vec<_> = (0..5).map(|i| test_key(0x80 + i as u8)).collect();
+        let pks: Vec<_> = sks.iter().map(|sk| sk.public_key()).collect();
+        let sigs: Vec<_> = sks.iter().map(|sk| sk.sign_h2_v4(msg)).collect();
+
+        let messages: Vec<&[u8]> = vec![msg.as_ref(); 5];
+        let sig_refs: Vec<_> = sigs.iter().collect();
+        let pk_refs: Vec<_> = pks.iter().collect();
+
+        batch_verify_h2_v4(&messages, &sig_refs, &pk_refs).expect("H2-v4 batch should verify");
+        batch_verify_h2_v4_with_fallback(&messages, &sig_refs, &pk_refs)
+            .expect("H2-v4 fallback path should agree");
+    }
+
+    /// The whole point of separate entry points: a batch verified under the
+    /// wrong domain must fail, and the fallback must localize every position
+    /// rather than silently "confirming" the batch by checking a different
+    /// message encoding.
+    #[test]
+    fn the_two_ciphersuites_reject_each_other_in_batch() {
+        let msg = b"cross-domain replay";
+        let sks: Vec<_> = (0..3).map(|i| test_key(0x90 + i as u8)).collect();
+        let pks: Vec<_> = sks.iter().map(|sk| sk.public_key()).collect();
+        let pk_refs: Vec<_> = pks.iter().collect();
+        let messages: Vec<&[u8]> = vec![msg.as_ref(); 3];
+
+        let native: Vec<_> = sks.iter().map(|sk| sk.sign(msg)).collect();
+        let native_refs: Vec<_> = native.iter().collect();
+        assert_eq!(
+            batch_verify_h2_v4_with_fallback(&messages, &native_refs, &pk_refs),
+            Err(vec![0, 1, 2]),
+            "native signatures must not pass the H2-v4 batch"
+        );
+
+        let h2: Vec<_> = sks.iter().map(|sk| sk.sign_h2_v4(msg)).collect();
+        let h2_refs: Vec<_> = h2.iter().collect();
+        assert_eq!(
+            batch_verify_with_fallback(&messages, &h2_refs, &pk_refs),
+            Err(vec![0, 1, 2]),
+            "H2-v4 signatures must not pass the native batch"
+        );
+    }
+
+    /// A single-element batch takes a different code path than the
+    /// multi-pairing one, so it needs its own domain check.
+    #[test]
+    fn h2_v4_single_element_batch_uses_the_h2_v4_domain() {
+        let sk = test_key(0x9F);
+        let pk = sk.public_key();
+        let msg = b"single";
+
+        let h2 = sk.sign_h2_v4(msg);
+        batch_verify_h2_v4(&[msg.as_ref()], &[&h2], &[&pk]).expect("H2-v4 single must verify");
+        assert!(
+            batch_verify(&[msg.as_ref()], &[&h2], &[&pk]).is_err(),
+            "native single must reject an H2-v4 signature"
+        );
+
+        let native = sk.sign(msg);
+        batch_verify(&[msg.as_ref()], &[&native], &[&pk]).expect("native single must verify");
+        assert!(
+            batch_verify_h2_v4(&[msg.as_ref()], &[&native], &[&pk]).is_err(),
+            "H2-v4 single must reject a native signature"
+        );
+    }
+
+    /// Bad-signature localization must survive the domain switch: only the
+    /// corrupted positions come back, not the whole batch.
+    #[test]
+    fn h2_v4_fallback_identifies_exactly_the_bad_positions() {
+        let msg = b"h2-v4 quorum";
+        let sks: Vec<_> = (0..5).map(|i| test_key(0xA0 + i as u8)).collect();
+        let pks: Vec<_> = sks.iter().map(|sk| sk.public_key()).collect();
+
+        let mut sigs: Vec<_> = sks.iter().map(|sk| sk.sign_h2_v4(msg)).collect();
+        sigs[1] = sks[1].sign_h2_v4(b"wrong");
+        // A native signature over the right message is just as invalid here.
+        sigs[3] = sks[3].sign(msg);
+
+        let messages: Vec<&[u8]> = vec![msg.as_ref(); 5];
+        let sig_refs: Vec<_> = sigs.iter().collect();
+        let pk_refs: Vec<_> = pks.iter().collect();
+
+        assert_eq!(
+            batch_verify_h2_v4_with_fallback(&messages, &sig_refs, &pk_refs),
+            Err(vec![1, 3])
         );
     }
 }
