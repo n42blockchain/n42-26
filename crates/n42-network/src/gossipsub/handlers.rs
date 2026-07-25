@@ -84,7 +84,11 @@ pub fn validate_message(
     // Block data can reach several MB; consensus messages are small (~130-500 bytes).
     // Mempool transactions capped at 128KB; blob sidecars at 1MB.
     let max_size = if topic == block_topic_hash {
-        8 * 1024 * 1024 // 8MB for high-throughput block data
+        // Same constant the publisher and max_transmit_size use. This is the
+        // receiver's Reject threshold, so a second hardcoded copy drifting below
+        // the send side would let a leader publish a block every follower then
+        // refuses — no quorum, and only a warning to show for it.
+        crate::transport::MAX_GOSSIP_MESSAGE_SIZE
     } else if topic == blob_sidecar_topic_hash {
         1024 * 1024 // 1MB for blob sidecars
     } else if topic == mempool_topic_hash {

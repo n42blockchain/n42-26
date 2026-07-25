@@ -444,6 +444,11 @@ impl ConsensusService {
                  cannot advance past it and will stay stuck at this height"
             );
             counter!("n42_sync_response_block_exceeds_frame_total").increment(1);
+            // Still count it as a truncation. Dropping every block is the worst
+            // case of one, and anything already alerting on the truncation
+            // counter would otherwise go quiet exactly when it matters most.
+            counter!("n42_sync_response_frame_truncations_total", "section" => "blocks")
+                .increment(1);
         } else if response.blocks.len() != initial_blocks {
             warn!(
                 target: "n42::cl::sync",

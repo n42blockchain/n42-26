@@ -39,20 +39,32 @@ pub use transport::{
 /// and the request-response length prefix, none of which are counted in the
 /// payload the producer sees.
 ///
-/// Exceeding this is not a recoverable error anywhere in the stack: GossipSub
-/// drops the publish with a warning and receivers `Reject` it, so an oversized
-/// block simply never reaches the validators. They cannot vote on what they
-/// never received, the view never reaches quorum, and because the same mempool
-/// deterministically rebuilds the same oversized block, a restart does not
-/// clear it. Block producers must treat this as a hard budget.
+/// On the paths that have no fallback, exceeding the ceiling itself is not
+/// recoverable: GossipSub drops the publish with a warning and receivers
+/// `Reject` it, so the block never reaches the validators. They cannot vote on
+/// what they never received, the view never reaches quorum, and because the same
+/// mempool deterministically rebuilds the same oversized block, a restart does
+/// not clear it.
+///
+/// This constant sits *below* that ceiling and marks the point where a block is
+/// close enough to it to be worth reporting — it is a warning line, not the
+/// failure point. The margin is deliberately small because measured traffic
+/// already runs near the ceiling: `docs/devlog-78` records direct-push encoded
+/// sizes of 6,987 KiB p50 and 7,374 KiB p95 against the 8,192 KiB ceiling, on
+/// pure transfers, which is the load zstd compresses best. Anything crossing
+/// this line is inside the last few percent of the budget.
+///
+/// The reserve covers what the producer never sees in its own payload: the
+/// GossipSub envelope (topic, signature, peer id) and the request-response
+/// length prefix. It has not been measured — 256 KiB is an estimate, and if the
+/// real envelope is larger this line sits closer to the ceiling than intended.
 pub const MAX_BROADCAST_PAYLOAD_BYTES: usize = {
     let ceiling = if MAX_GOSSIP_MESSAGE_SIZE < MAX_BLOCK_DIRECT_SIZE {
         MAX_GOSSIP_MESSAGE_SIZE
     } else {
         MAX_BLOCK_DIRECT_SIZE
     };
-    // 90% of the ceiling, less a fixed allowance for wire framing.
-    ceiling / 10 * 9 - 64 * 1024
+    ceiling - 256 * 1024
 };
 
 // Re-export libp2p types used by consumers.
