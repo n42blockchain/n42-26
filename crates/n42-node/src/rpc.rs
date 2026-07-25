@@ -331,9 +331,24 @@ impl N42RpcServer {
         self
     }
 
+    /// Compares two secrets without short-circuiting on the first differing
+    /// byte, so the time taken does not leak how long a common prefix is.
+    fn secret_eq(expected: &str, provided: &str) -> bool {
+        let (a, b) = (expected.as_bytes(), provided.as_bytes());
+        // The length itself is not secret, but bail out in constant time for
+        // the compared bytes rather than returning early mid-scan.
+        let mut diff = (a.len() ^ b.len()) as u8;
+        for i in 0..a.len().max(b.len()) {
+            let x = a.get(i).copied().unwrap_or(0);
+            let y = b.get(i).copied().unwrap_or(0);
+            diff |= x ^ y;
+        }
+        diff == 0 && a.len() == b.len()
+    }
+
     fn verify_admin_token(&self, provided: &str) -> RpcResult<()> {
         match &self.admin_token {
-            Some(expected) if expected == provided => Ok(()),
+            Some(expected) if Self::secret_eq(expected, provided) => Ok(()),
             Some(_) => Err(ErrorObjectOwned::owned(
                 -32001,
                 "invalid admin token",
