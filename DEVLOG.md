@@ -166,6 +166,7 @@ Logs are split into separate files by phase for easy maintenance:
 | [devlog-132-view-bound-validator-authority](docs/devlog-132-view-bound-validator-authority.md) | QC/CommitQC 与 sync 按 certificate view 精确绑定授权验证者集；移除 bitmap 长度猜集合，旧委员会签未来 view 在共识与同步路径均 fail closed | Security |
 | [devlog-133-h2-v4-mixed-participant](docs/devlog-133-h2-v4-mixed-participant.md) | H2-v4 双向混合客户端参与者：gov5 入站订阅、Rust POP 共识/QC/TC、认证后区块执行及 gov5 leader header/RLP 生产；默认关闭并隔离现有七节点 | Interop |
 | [devlog-134-gov5-live-voter-and-catchup-watermark](docs/devlog-134-gov5-live-voter-and-catchup-watermark.md) | Rust 参与者在 Gov5 真机委员会完成执行门控投票；修复乱序 catch-up 子块用 Syncing 结果提前毒化 eager-import 水位 | Interop |
+| [devlog-135-interop-branch-deep-audit](docs/devlog-135-interop-branch-deep-audit.md) | 合入 main 前的互操作分支深度审计：gov5 block 响应 Snappy 解压未受声明长度约束（HIGH-1）、H2 执行门控投票的 import 证据被挤出致该 view 永久不投票（HIGH-2），均已修 | Security |
 
 ### 上游借鉴与跟踪
 

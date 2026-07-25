@@ -387,7 +387,14 @@ fn decode_chunked_block(encoded: &[u8]) -> io::Result<Vec<u8>> {
         .get(5 + prefix_len..)
         .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "missing gov5 Snappy frame"))?;
     let mut decoded = Vec::with_capacity(declared_len);
-    FrameDecoder::new(frame).read_to_end(&mut decoded)?;
+    // Cap the decompressed stream at the declaration, as the Status paths do.
+    // The wire frame is bounded, but Snappy expansion is not: a ~1 MiB frame of
+    // minimal chunks expands to several GiB, and reading it to the end would
+    // exhaust memory before the length check below ever runs. Reading one byte
+    // past the declaration is enough to still detect an over-long payload.
+    FrameDecoder::new(frame)
+        .take((declared_len + 1) as u64)
+        .read_to_end(&mut decoded)?;
     if decoded.len() != declared_len {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -792,5 +799,31 @@ mod tests {
         let mut encoded = chunk(b"block-rlp");
         encoded[5] += 1;
         assert!(decode_chunked_block(&encoded).is_err());
+    }
+
+    /// A peer controls both the declared length and the Snappy frame, and the
+    /// two need not agree. Repetitive input compresses about 21x here, so
+    /// decoding to the end of the frame — rather than to the declaration — lets
+    /// one wire-legal response allocate roughly twenty times the 1 MiB block
+    /// cap, and every concurrent request multiplies that. Stop at the
+    /// declaration instead.
+    #[test]
+    fn rejects_snappy_expansion_beyond_the_declared_length() {
+        const DECODED_BYTES: usize = 16 * 1024 * 1024;
+        let mut frame = FrameEncoder::new(Vec::new());
+        frame.write_all(&vec![0u8; DECODED_BYTES]).unwrap();
+        let compressed = frame.into_inner().unwrap();
+        assert!(
+            compressed.len() < MAX_GOV5_BLOCK_SIZE,
+            "the bomb must fit inside a wire-legal frame to be a real attack: {} bytes",
+            compressed.len()
+        );
+
+        let mut encoded = vec![0, 1, 2, 3, 4];
+        encode_uvarint(9, &mut encoded);
+        encoded.extend_from_slice(&compressed);
+
+        let error = decode_chunked_block(&encoded).expect_err("expansion must be rejected");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 }

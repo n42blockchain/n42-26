@@ -3973,6 +3973,46 @@ mod tests {
         assert!(!engine.imported_blocks.contains(&B256::repeat_byte(0)));
     }
 
+    /// A deferred H2 vote waits on one specific hash, and catching up imports
+    /// enough blocks to evict it. The awaited entry must survive: the
+    /// orchestrator never re-emits `BlockImported` for a hash reth already
+    /// executed, so evicting it would strand the vote for the whole view.
+    #[test]
+    fn imported_block_eviction_keeps_the_hash_a_deferred_vote_waits_on() {
+        let (mut engine, _sks, _, _rx) = make_engine(4, 0);
+        let awaited = B256::repeat_byte(0x01);
+
+        engine
+            .process_event(ConsensusEvent::BlockImported(awaited))
+            .expect("BlockImported should succeed");
+        engine.pending_proposal = Some(PendingProposal {
+            view: engine.current_view(),
+            block_hash: awaited,
+        });
+
+        for index in 0..128u64 {
+            let mut bytes = [0x7f; 32];
+            bytes[24..].copy_from_slice(&index.to_be_bytes());
+            engine
+                .process_event(ConsensusEvent::BlockImported(B256::from(bytes)))
+                .expect("BlockImported should succeed");
+        }
+
+        assert!(
+            engine.imported_blocks.contains(&awaited),
+            "the awaited hash must not be evicted while a vote is deferred on it"
+        );
+        assert!(
+            engine.imported_blocks.len() <= 65,
+            "keeping the live hash must not unbound the cache: {}",
+            engine.imported_blocks.len()
+        );
+        assert_eq!(
+            engine.imported_blocks.len(),
+            engine.imported_block_fifo.len()
+        );
+    }
+
     #[test]
     fn test_far_future_proposal_triggers_view_jump() {
         let (mut engine, sks, vs, mut rx) = make_engine(4, 0);
