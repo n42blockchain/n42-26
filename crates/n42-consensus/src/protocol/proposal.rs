@@ -591,10 +591,8 @@ impl ConsensusEngine {
     /// participant mode also releases the matching deferred R1 vote here.
     pub(super) fn on_block_imported(&mut self, block_hash: B256) -> ConsensusResult<()> {
         if self.imported_blocks.insert(block_hash) {
-            if self.imported_block_fifo.len() >= MAX_IMPORTED_BLOCKS
-                && let Some(oldest) = self.imported_block_fifo.pop_front()
-            {
-                self.imported_blocks.remove(&oldest);
+            if self.imported_block_fifo.len() >= MAX_IMPORTED_BLOCKS {
+                self.evict_oldest_imported_block();
             }
             self.imported_block_fifo.push_back(block_hash);
         }
@@ -612,5 +610,31 @@ impl ConsensusEngine {
             self.send_vote(view, block_hash)?;
         }
         Ok(())
+    }
+
+    /// Drops the oldest import evidence, skipping the hash a deferred H2 vote is
+    /// still waiting on.
+    ///
+    /// The block whose import releases the pending vote is not necessarily the
+    /// most recent one imported: catching up delivers a burst of blocks, and 64
+    /// of them are enough to push the awaited hash out. Losing that entry is
+    /// terminal for the view rather than merely wasteful — the orchestrator
+    /// deduplicates both block data and eager imports, so no second
+    /// `BlockImported` ever arrives for a hash reth already executed, and the
+    /// vote is never released. Rotating the live hash to the back keeps the
+    /// cache bounded (by at most one extra entry) without stranding it.
+    fn evict_oldest_imported_block(&mut self) {
+        let live = self.pending_proposal.as_ref().map(|pending| pending.block_hash);
+        for _ in 0..self.imported_block_fifo.len() {
+            let Some(oldest) = self.imported_block_fifo.pop_front() else {
+                return;
+            };
+            if Some(oldest) == live {
+                self.imported_block_fifo.push_back(oldest);
+                continue;
+            }
+            self.imported_blocks.remove(&oldest);
+            return;
+        }
     }
 }
