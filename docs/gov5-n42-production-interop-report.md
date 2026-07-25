@@ -84,6 +84,16 @@ final-report commit exactly. This in-progress qualification ledger is
 committed as a checkpoint. Its final PASS update remains pending until all
 runtime gates finish.
 
+The live checkpoint branch is `feat/gov5-n42-live-interop`. The separately
+verified integration branch `integration/gov5-interop-main` is pushed at
+`d579eb4` and contains the 39-commit interoperability line, current `main`,
+the audit fixes, and the four cross-port hardening commits. `main` remains at
+`3bbad4b` until the current P4 window ends and the audit-fix build baseline is
+selected, so the measured runtime and delivery baseline cannot be confused.
+The latest audit-plan tip is `d39fbfc`; the selected H2-v4 batch-verification
+commit is `36e7532` and will be applied with T2 rather than using the
+superseded local duplicate implementation.
+
 `p4-binding-fifo-fix-executable-identity-audit.jsonl` independently resolves
 both current live Rust processes through their executable mappings. Both map
 to the same staged release with SHA-256 `7fcec8e3...`; the separately staged
@@ -465,7 +475,8 @@ also resolves both Rust processes to the exact pinned release and checks all
 seven RPC endpoints.
 
 The same replacement window subsequently crossed independently captured
-three- and four-hour milestones without interruption. The immutable
+three-, four-, six-, and twelve-hour-plus milestones without interruption.
+The immutable
 three-hour snapshot contains 179 samples across 10,828 seconds, zero
 failures, maximum lag one, maximum sample gap 62 seconds, and 1,843 blocks of
 progress. Its SHA-256 is
@@ -474,7 +485,15 @@ The immutable four-hour snapshot contains 238 samples across 14,420 seconds,
 zero failures, maximum lag one, maximum sample gap 62 seconds, and 2,456
 blocks of progress. Its SHA-256 is
 `7f9a77aae644f977433405c9946fca36fa05ce6a7e5618bb5f6e84896d674f0f`.
-Both audits verify contiguous empty-block coverage, unchanged warning and
+The six-hour snapshot contains 357 samples across 21,662 seconds, zero
+failures, maximum lag one, maximum sample gap 62 seconds, and 3,688 blocks of
+progress. Its SHA-256 is
+`271839e869fea37177cf9952b1a60c7efa3a794a6e3fc4ce9cdc5965825d1d41`.
+The twelve-hour-plus snapshot contains 798 samples across 48,620 seconds,
+zero failures, maximum lag one, maximum sample gap 67 seconds, and 8,266
+blocks of progress. Its SHA-256 is
+`87e90e191c3ad03de013d01dd424c2c21877f7bead028c9620d30990ab2a8f46`.
+All four audits verify contiguous empty-block coverage, unchanged warning and
 deadline counters, two Rust nodes with the same committed view and hash,
 seven validators, committed QCs, and zero authenticated equivocations. The
 concurrent P6 observer remained read-only with zero failures or write
@@ -540,6 +559,10 @@ Additional evidence:
 - `p4-binding-fifo-formal-3h-independent-milestone-audit.jsonl`
 - `p4-binding-fifo-formal-4h-snapshot.jsonl`
 - `p4-binding-fifo-formal-4h-independent-milestone-audit.jsonl`
+- `p4-binding-fifo-formal-6h-snapshot.jsonl`
+- `p4-binding-fifo-formal-6h-independent-milestone-audit.jsonl`
+- `p4-binding-fifo-formal-12h-plus-snapshot.jsonl`
+- `p4-binding-fifo-formal-12h-plus-independent-milestone-audit.jsonl`
 - `p4-binding-fifo-fix-control-chain-rearm-audit.jsonl`
 - `overall-goal-alignment-binding-fifo-audit.jsonl`
 
@@ -659,6 +682,8 @@ Evidence:
 - `p6-finalizer-guard.jsonl`
 - `p4-binding-fifo-p6-observer-overlap-schedule-audit.jsonl`
 - `p6-binding-fifo-release-preactivation-audit.jsonl`
+- `p6-pending-proposal-r1-assertion-install-audit.jsonl`
+- `p6-active-rollback-rehearsal-preparation-audit.jsonl`
 
 The participant monitor also polls `n42_equivocations` every five seconds and
 requires zero authenticated evidence in every formal sample. A separate
@@ -683,6 +708,13 @@ and removes the planned-restart/RPC-sampling race.
 The rollback trap also restores Gov5 validator 6 when that process is already
 stopped even if failure occurs before the replacement marker is created,
 closing the maintenance-snapshot pre-marker recovery gap.
+The safety scan now also correlates the execution-validation
+`pending_proposal` marker, the R1 send marker, and later view changes. If a
+participant holds a pending proposal but never sends R1 before a later view
+begins, the five-second guard fails closed and invokes the same immediate
+rollback path. A healthy synthetic trace passes and a silent trace is rejected
+at its exact view; the participant and final-state summaries require zero such
+silent views.
 The same guard remains mandatory during the final post-rollback mixed
 reactivation window. The participant stream additionally rejects consecutive
 sample gaps above 180 seconds; rollback and final mixed-health streams reject
@@ -710,8 +742,12 @@ After the full observer window, the runbook will:
 4. restart the remaining Gov5 peers with the Rust QUIC address;
 5. verify two full leader rotations, restart/rejoin Rust, and continue the
    exact-root monitor for an actual 24 hours;
-6. use `rollback-replacement` to stop Rust and reopen the untouched Gov5
-   validator directory if any fail-closed invariant triggers.
+6. actively rehearse `rollback-replacement` on this isolated qualification
+   copy: stop Rust, reopen the untouched Gov5 validator directory, prove seven
+   exact-root convergence for ten minutes, verify all three snapshot
+   manifests, archive the redacted command timeline, and only then reactivate
+   the single Rust participant. Any earlier fail-closed invariant invokes the
+   same rollback immediately.
 
 ## Monitoring and preservation controls
 
@@ -725,11 +761,14 @@ assertion for the remaining P4/P6 windows. Host-capacity evidence records
 954 GiB available storage, low file-descriptor counts, sub-2 ms local RPC
 latency, and the assertion process identity.
 
-The live phase ledger was reconciled against the plan without changing any
-acceptance threshold. `overall-goal-alignment-audit.jsonl` records P0, P1, P2,
-P3, and P5 as complete; P4 and the read-only part of P6 as running; and keeps
-P6 participant activation, rollback, final gates, report commit, and push in
-their required order.
+The live phase ledger was reconciled against the completion plan without
+changing any acceptance threshold.
+`overall-goal-alignment-binding-fifo-audit.jsonl` binds the plan content hash,
+live branch, integration branch, audit-fix tip, and selected H2-v4 batch
+commit. It records P0, P1, P2, P3, and P5 as complete; P4 and the read-only
+part of P6 as running; and keeps T2 rebuild, P6 participant activation,
+active rollback rehearsal, final gates, main integration, report commit, and
+push in their required order.
 
 After all runtime gates pass, the final requirement audit hashes every file
 under the runtime-11 and runtime-12 evidence directories into
