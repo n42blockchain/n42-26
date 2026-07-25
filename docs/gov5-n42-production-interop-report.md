@@ -133,7 +133,7 @@ or removed.
 | P1 follower and catch-up | PASS | authenticated reverse/concurrent ancestry logs, 1,000+ following blocks, persisted restart recovery |
 | P2 automatic bootstrap and recovery | PASS | chain-bound bundle, blank-datadir materialization, replay receipt, cold restart |
 | P3 bidirectional leader handoff | PASS | `p3-5gov-2rust-28views-pass.jsonl`; 44 consecutive exact blocks covering more than two rotations |
-| P4 fault and lifecycle matrix | IN PROGRESS | all injected fault cases pass; the failed execution-stall window is preserved, its FIFO binding fix recovered from persisted databases, and a new full 24-hour replacement is running from zero before the still-withheld burst |
+| P4 fault and lifecycle matrix | FAIL | the 24-hour zero-transaction guard passed, and all 17 signed transactions finalized, but the burst parity gate found Rust-only `blockTimestamp` in a mined full-transaction response; the failed evidence is sealed and T2 plus a Gov5 RPC-shape fix must be rebuilt before a from-zero rerun |
 | P5 minimal full archive+ parity | PASS | 209 RPC comparisons, 22 offline proof checks, export/import and corruption recovery |
 | P6 existing seven-node rollout | IN PROGRESS | observer cold bootstrap and exact epoch crossing pass; the actual 24-hour read-only observer window passes, continuity guard remains active, and participant activation waits for P4 |
 
@@ -507,6 +507,27 @@ violations. All intermediate audits are explicitly
 the full-window gate, and do not inherit the prior failed window's
 three-hour milestone.
 
+The formal monitor then ended naturally with 1,420 samples across 86,601
+seconds, zero failures, maximum lag one, maximum sample gap 67 seconds, and
+unchanged warning/deadline counters. Its independent guard passed. All 17
+signed transactions subsequently finalized successfully through alternating
+Gov5 and Rust ingress, but the burst parity gate failed closed before the
+post-burst liveness monitor: `eth_getBlockByNumber("0x9322", true)` differed
+between implementations. All five Gov5 responses were byte-exact with one
+another, both Rust responses were byte-exact with one another, and the only
+JSON difference was Rust's extra
+`result.transactions[0].blockTimestamp = "0x6a65360d"` field. The block hash,
+state root, receipts root, transactions root, transaction body, and signature
+fields were exact. All seven canonical heads and roots remained exact after
+the failure, with zero authenticated equivocations.
+
+This is an RPC response-shape interoperability failure, not the HIGH-2 silent
+vote/execution-stall symptom. P4 is therefore FAIL, the final PASS marker was
+not written, and the whole window remains preserved but ineligible. T2 may
+now proceed: it must include the audit fixes, remove this Gov5-incompatible
+field from the Gov5 H2 profile without weakening the exact parity gate,
+rebuild the pinned binary, and restart P4 from zero.
+
 A fail-closed finalizer is armed against the formal monitor. It cannot release
 the burst unless every sample, historical empty-block interval, lag bound, and
 all warning and deadline counters pass. An independent 30-second guard also
@@ -570,6 +591,10 @@ Additional evidence:
 - `p4-binding-fifo-formal-12h-plus-independent-milestone-audit.jsonl`
 - `p4-binding-fifo-formal-18h-snapshot.jsonl`
 - `p4-binding-fifo-formal-18h-independent-milestone-audit.jsonl`
+- `p4-burst-full-transaction-rpc-parity-failure-audit.jsonl`
+- `p4-burst-full-transaction-rpc-parity-failure-manifest.sha256`
+- `p4-burst-full-block-gov5-reference.json`
+- `p4-burst-full-block-rust-reference.json`
 - `p4-binding-fifo-fix-control-chain-rearm-audit.jsonl`
 - `overall-goal-alignment-binding-fifo-audit.jsonl`
 
