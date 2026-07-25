@@ -39,8 +39,23 @@ fallback 在 B 域逐个"验证通过"，函数会返回"没有坏签名"，调�
 - 导出 `batch_verify_h2_v4` 与 `batch_verify_h2_v4_with_fallback`。
 
 `crates/n42-consensus/src/protocol/quorum.rs`
-- `ConsensusSigningProfile::batch_verify` 按 profile 分派，两个调用点（QC 构建、
-  状态机入站批量验签）的 `match` 分支消失，各减少一段逐签名回退代码。
+- `ConsensusSigningProfile::batch_verify` 按 profile 分派，三个调用点的 `match`
+  分支消失，各减少一段逐签名回退代码：QC 构建（`VoteCollector`）、TC 构建
+  （`TimeoutCollector`）、状态机入站 R1/R2 批量认证。
+
+## 与真机侧并行实现的合并
+
+真机侧同一天独立完成了同一项工作（`feat/gov5-h2v4-batch-verify`，
+`batch_verify_h2_v4_prevalidated_with_fallback`），两版功能等价。合并取舍：
+
+- **取本版的 `Ciphersuite` 绑定**：真机版把域与 H2-v4 标志作为两个独立参数
+  （`batch_verify_with_domain(..., dst, h2_v4: bool)`），存在 `(DST, true)` 这类
+  自相矛盾的组合；绑成一个值后不可表达。真机版的 fallback 另起一个函数，重复了
+  长度检查、批量上限、空批次与回退循环约 25 行，本版共用同一实现。
+- **取真机版发现的第三个调用点**：本版最初只改了 QC 构建与状态机入站两处，
+  漏掉了 `TimeoutCollector::build_tc_with_profile`——TC 构建有一段结构相同、
+  元组多一个字段的逐签名回退代码，grep 时被漏过。已补齐，并补一条 TC 专属回归
+  （四票含一张错 view 签名，TC 仍成立且坏 signer 的 bit 保持为 0）。
 
 ## 实测
 
@@ -73,6 +88,10 @@ devlog-135 当时写的"7 节点无实际影响"偏保守：7 节点也省下约
   （跳过随机系数直接单验），需要独立确认域。
 - `h2_v4_fallback_identifies_exactly_the_bad_positions`：坏签名定位精度不因换域而
   退化，混入一个"消息正确但域错误"的签名同样被抓出。
+
+`protocol::quorum` 新增 `h2_v4_timeout_certificate_drops_only_the_bad_signature`：
+TC 构建走的是与 QC 相同的批量路径，因此需要同样的保证——坏签名被精确剔除而不是
+让整批失败，且其 signer bit 保持为 0。
 
 `cargo clippy --all-targets -- -D warnings` 零告警；`cargo test --workspace`
 46 套件零失败。
