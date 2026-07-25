@@ -661,11 +661,17 @@ impl ConsensusService {
                         if compact_injected && let Some(ref cache) = exec_cache {
                             cache.evict(hash);
                         }
-                        bad_blocks.insert_if_invalid(
-                            hash,
-                            &status.status,
-                            "block_data_eager",
-                        );
+                        // The compact output was supplied by an unauthenticated
+                        // peer. A non-Valid verdict can therefore describe that
+                        // injected bundle, not the block identified by `hash`.
+                        // Evict it above and leave the block retryable.
+                        if !compact_injected {
+                            bad_blocks.insert_if_invalid(
+                                hash,
+                                &status.status,
+                                "block_data_eager",
+                            );
+                        }
                         debug!(target: "n42::cl::exec_bridge", %hash, view, status = ?status.status, compact_injected, "follower eager import: not accepted");
                         if compact_injected {
                             metrics::counter!("n42_compact_block_cache_misses").increment(1);
@@ -730,6 +736,7 @@ impl ConsensusService {
             .bad_blocks
             .should_skip(broadcast.block_hash, "sync_import")
         {
+            self.discard_unvalidated_sidecar_diff(broadcast.view, broadcast.block_hash);
             return false;
         }
         let engine_handle = match self.el {
@@ -813,11 +820,16 @@ impl ConsensusService {
                         cache.evict(broadcast.block_hash);
                     }
                     self.discard_unvalidated_sidecar_diff(broadcast.view, broadcast.block_hash);
-                    self.bad_blocks.insert_if_invalid(
-                        broadcast.block_hash,
-                        &status.status,
-                        "sync_import",
-                    );
+                    // A compact output injected immediately before this call is
+                    // peer-controlled. Its rejection must not blacklist the
+                    // otherwise honest declared block hash (HIGH-1).
+                    if !compact_injected {
+                        self.bad_blocks.insert_if_invalid(
+                            broadcast.block_hash,
+                            &status.status,
+                            "sync_import",
+                        );
+                    }
                     warn!(
                         target: "n42::cl::exec_bridge",
                         hash = %broadcast.block_hash,
@@ -1142,8 +1154,12 @@ impl ConsensusService {
                         cache.evict(retry_hash);
                     }
                     self.discard_unvalidated_sidecar_diff(retry_broadcast.view, retry_hash);
-                    self.bad_blocks
-                        .insert_if_invalid(retry_hash, &rs.status, "syncing_retry");
+                    // Retry uses the same peer-provided compact output as the
+                    // first import. Never derive a bad-block verdict from it.
+                    if !compact_injected {
+                        self.bad_blocks
+                            .insert_if_invalid(retry_hash, &rs.status, "syncing_retry");
+                    }
                     warn!(target: "n42::cl::exec_bridge", %retry_hash, status = ?rs.status, "retry rejected");
                 }
                 Err(e) => {
