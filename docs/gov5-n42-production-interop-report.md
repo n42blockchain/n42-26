@@ -475,7 +475,8 @@ also resolves both Rust processes to the exact pinned release and checks all
 seven RPC endpoints.
 
 The same replacement window subsequently crossed independently captured
-three-, four-, six-, and twelve-hour-plus milestones without interruption.
+three-, four-, six-, twelve-hour-plus, and eighteen-hour milestones without
+interruption.
 The immutable
 three-hour snapshot contains 179 samples across 10,828 seconds, zero
 failures, maximum lag one, maximum sample gap 62 seconds, and 1,843 blocks of
@@ -493,7 +494,11 @@ The twelve-hour-plus snapshot contains 798 samples across 48,620 seconds,
 zero failures, maximum lag one, maximum sample gap 67 seconds, and 8,266
 blocks of progress. Its SHA-256 is
 `87e90e191c3ad03de013d01dd424c2c21877f7bead028c9620d30990ab2a8f46`.
-All four audits verify contiguous empty-block coverage, unchanged warning and
+The eighteen-hour snapshot contains 1,063 samples across 64,819 seconds,
+zero failures, maximum lag one, maximum sample gap 67 seconds, and 11,011
+blocks of progress. Its SHA-256 is
+`57492d217f589439fa0575f674a6c8771a0fc5baa49e322696dca1797e2ff6ae`.
+All five audits verify contiguous empty-block coverage, unchanged warning and
 deadline counters, two Rust nodes with the same committed view and hash,
 seven validators, committed QCs, and zero authenticated equivocations. The
 concurrent P6 observer remained read-only with zero failures or write
@@ -563,6 +568,8 @@ Additional evidence:
 - `p4-binding-fifo-formal-6h-independent-milestone-audit.jsonl`
 - `p4-binding-fifo-formal-12h-plus-snapshot.jsonl`
 - `p4-binding-fifo-formal-12h-plus-independent-milestone-audit.jsonl`
+- `p4-binding-fifo-formal-18h-snapshot.jsonl`
+- `p4-binding-fifo-formal-18h-independent-milestone-audit.jsonl`
 - `p4-binding-fifo-fix-control-chain-rearm-audit.jsonl`
 - `overall-goal-alignment-binding-fifo-audit.jsonl`
 
