@@ -749,6 +749,11 @@ impl PersistentTwig {
         self.inner.root()
     }
 
+    /// Total twigs across all shards — see [`n42_twig_core::ShardedTwig::twig_count`].
+    pub fn twig_count(&self) -> usize {
+        self.inner.twig_count()
+    }
+
     /// Borrow the underlying in-memory twig state tree.
     pub fn inner(&self) -> &TwigState {
         &self.inner
