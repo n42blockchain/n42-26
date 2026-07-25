@@ -32,9 +32,8 @@
 4. 本轮审计新增两项修复在 `fix/gov5-interop-audit-20260725`（已推送，两个提交）：
    HIGH-1 gov5 block 响应 Snappy 解压未受声明长度约束；**HIGH-2 H2 执行门控投票的
    import 证据被挤出致该 view 永久不投票**。后者与 P4 记录的 execution-stall 症状一致。
-5. `hardening/gov5-cross-port`（4 commits）与 interop 分支在
-   `n42-network/src/lib.rs`、`gossipsub/handlers.rs` 有 2 处冲突，双方都动了 gossip
-   上限常量（同值不同来源）。两边都要进 main。
+5. `hardening/gov5-cross-port`（4 commits）与 interop 分支的 gossip 上限常量冲突
+   **已在 `integration/gov5-interop-main` 解完并验证**（详见 T6）。
 
 ## 红线（任何任务都不得突破）
 
@@ -125,19 +124,32 @@ validator 目录 → 七节点恢复一致 → 全程时间线与命令归档。
 
 ---
 
-### T6 — 分支整合与合入 main（本机代码侧 / 与 T1–T5 并行）
+### T6 — 分支整合 ✅ 已完成（本机代码侧）
 
-**归属**：本机（Windows）侧负责，不占用真机。
+集成分支 **`integration/gov5-interop-main`** 已推送，构成为四路合并：
 
-**步骤**
-1. 建集成分支，解 `hardening/gov5-cross-port` 与 interop 分支在
-   `n42-network/src/lib.rs`、`gossipsub/handlers.rs` 的 2 处 gossip 上限常量冲突
-   （同值不同来源，取单一定义并保留 receiver Reject 阈值与 publisher 上限的统一）。
-2. 全量门禁通过后合入 `main`。
-3. **时机**：合 main 不影响真机（真机跑 pinned 二进制与 feat 分支），可先做；
-   但若真机在 T2 之后还要从 feat 分支重建，则以 feat 分支为准，合 main 只做快进。
+```
+feat/gov5-n42-live-interop (39 commits)
+  + fix/gov5-interop-audit-20260725 (本轮两项修复)
+  + origin/main (HIGH-1 committed 后台路径 + v0.5.1 收尾)
+  + hardening/gov5-cross-port (4 commits)
+```
 
-**验收**：main 包含全部 39 + 4 + 2 个提交，`cargo test --workspace` 与 clippy 全绿。
+三处实质冲突的解法：
+
+1. `n42-network/src/lib.rs` 两处导出列表冲突 → 取并集。
+2. `gossipsub/handlers.rs` 的接收端 Reject 阈值 → 采用 hardening 侧的
+   `transport::MAX_GOSSIP_MESSAGE_SIZE` 单一来源（原因见该提交：第二份硬编码副本
+   一旦低于发送端，leader 发出的块会被所有 follower 拒收，只留一条警告，view 永远
+   不到 quorum），并让 interop 侧新增的 gov5 block topic 共用同一常量——同一条
+   transport、同样的块数据，本就是同一个 8 MiB。
+3. `orchestrator/mod.rs` 与 `docs/devlog-111` → 取 main 的完整版本（含 committed/
+   observer 后台路径的同一 no-blacklist 规则及其回归）。
+
+已验证：`cargo check --all-targets`、`cargo clippy --all-targets -- -D warnings`
+（n42-26 侧零告警）、`cargo test --workspace` 46 套件零失败。
+
+**尚未合入 `main`**——等 T2 决定修复纳入时机后再快进，避免 main 与真机构建基线分叉。
 
 ---
 
@@ -167,7 +179,7 @@ T1 (P4 窗口判定)
            └─> T4 (P6 24h 替换窗口) ──┐
                                       ├─> T8 (扩面)
 T5 (回滚演练)  ────────────────────────┤
-T6 (合入 main) ────────────────────────┘
+T6 (分支整合) ✅ 已完成 ───────────────┘
 T7 (批量验签，非阻塞)
 ```
 
