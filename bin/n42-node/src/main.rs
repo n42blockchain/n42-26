@@ -795,7 +795,19 @@ fn main() {
 
     // Parallel state-root computation currently falls back repeatedly on this workload,
     // so make the synchronous path the default unless the operator overrides it explicitly.
-    let engine_defaults = DefaultEngineValues::default().with_state_root_fallback(true);
+    //
+    // Keep the in-memory block buffer at zero as well. reth 2.4.1 raised its
+    // default from 0 to 5, which holds five blocks in memory awaiting
+    // persistence; N42 derives its state root from the `HashedPostState`
+    // overlay, and the overlay it has to walk grows with that buffer. Measured
+    // on the 400-second single-node lane at a 4-second slot: 101 blocks at 0
+    // (mean interval 3.97s, max 5s) against 69 blocks at 5 (mean 5.87s, max
+    // 24s, degrading progressively past block ~27) — a 32% throughput loss
+    // that an 8-second slot merely hides. Operators can still raise it with
+    // `--engine.memory-block-buffer-target`.
+    let engine_defaults = DefaultEngineValues::default()
+        .with_state_root_fallback(true)
+        .with_memory_block_buffer_target(0);
     if let Err(error) = engine_defaults.try_init() {
         warn!(
             target: "n42::cli",

@@ -171,6 +171,15 @@ impl NodeProcess {
             .arg("--ipcdisable")
             .arg("--disable-discovery");
 
+        // reth 2.4.1 changed `memory_block_buffer_target` from 0 to 5, keeping
+        // that many blocks in memory awaiting persistence. N42 computes its
+        // state root over the `HashedPostState` overlay, whose depth follows
+        // that buffer, so the new default is not neutral here. Exposed so a
+        // run can pin it and compare against the default.
+        if let Ok(target) = std::env::var("E2E_ENGINE_MEMORY_BLOCK_BUFFER_TARGET") {
+            cmd.arg("--engine.memory-block-buffer-target").arg(target);
+        }
+
         cmd.env("N42_VALIDATOR_KEY", &key_hex)
             .env("N42_VALIDATOR_COUNT", config.validator_count.to_string())
             .env("N42_CONSENSUS_PORT", consensus_port.to_string())
