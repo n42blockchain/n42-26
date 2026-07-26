@@ -112,7 +112,10 @@ the affected consensus and devlog paths is exact. T2 full gates passed against
 `f49422f`: Go full race, Rust format/check/Clippy/workspace tests, the isolated
 release build, staged-binary signature and SHA checks, 360 exact seven-endpoint
 historical RPC comparisons, committed-QC/equivocation checks, and a ten-minute
-dual-new-binary liveness window all passed.
+dual-new-binary liveness window all passed. The immutable T2 handoff is
+`runtime-12-existing-seven-qualification/evidence/T2.PASS`; it binds the
+selected source and binary plus the exact P6 finalizer and final clean-gate
+controller hashes.
 
 `t2-f49422f-both-rust-consensus-health-v2.jsonl` independently resolves both
 current live Rust processes through their executable mappings. Both map to the
@@ -153,7 +156,7 @@ or removed.
 | P1 follower and catch-up | PASS | authenticated reverse/concurrent ancestry logs, 1,000+ following blocks, persisted restart recovery |
 | P2 automatic bootstrap and recovery | PASS | chain-bound bundle, blank-datadir materialization, replay receipt, cold restart |
 | P3 bidirectional leader handoff | PASS | `p3-5gov-2rust-28views-pass.jsonl`; 44 consecutive exact blocks covering more than two rotations |
-| P4 fault and lifecycle matrix | FAIL | the prior 24-hour zero-transaction guard passed and all 17 signed transactions finalized, but its burst parity gate found incompatible Rust response metadata; T2 is now rebuilt and rolled out at `f49422f` / `c0ce2778...`, and a fresh P4 window must start from zero |
+| P4 fault and lifecycle matrix | IN PROGRESS | the prior completed window and failed burst parity are preserved and excluded; after T2 selected `f49422f` / `c0ce2778...`, the fresh formal window started from zero at `2026-07-26T03:56:35Z` with seven exact endpoints, zero transactions, and lag zero |
 | P5 minimal full archive+ parity | PASS | 209 RPC comparisons, 22 offline proof checks, export/import and corruption recovery |
 | P6 existing seven-node rollout | IN PROGRESS | observer cold bootstrap and exact epoch crossing pass; the actual 24-hour read-only observer window passes, continuity guard remains active, and participant activation waits for P4 |
 
@@ -561,7 +564,12 @@ the second Rust node. The final dual-new-binary monitor recorded 57 samples
 across 591 seconds, zero failures, maximum lag one, and 99 blocks of progress.
 Both Rust nodes reported the same committed view/hash, seven validators,
 committed QCs, and zero authenticated equivocations. The replacement P4
-window may therefore start from zero without changing any existing database.
+window therefore started from zero at `2026-07-26T03:56:35Z` without changing
+any existing database. Its first sample was healthy at common height 41,024:
+all seven endpoints returned the same block hash, state root, and receipts
+root, lag was zero, and the finalized interval contained no transactions.
+The authoritative stream is `p4-f49422f-zero-tx-24h.jsonl`; its immutable
+baseline is `p4-f49422f-formal-soak-baseline.jsonl`.
 
 A fail-closed finalizer is armed against the formal monitor. It cannot release
 the burst unless every sample, historical empty-block interval, lag bound, and
@@ -576,8 +584,11 @@ ten minutes of continued seven-endpoint exact-root liveness. The finalizer
 pins the signed 17-transaction artifact's exact SHA-256 and 0600 mode both
 when it starts and immediately before broadcast, so the independently audited
 raw signatures cannot be replaced after preflight. Script hashes and process
-identities are recorded in
-`p4-priority-lane-finalizer-guard.jsonl`.
+identities are bound in the fresh baseline. The new formal guard SHA-256 is
+`eef209a050162320e5a776e0307199b8ed4e0ff9a2080f060b91b8f56a9e037d`;
+the P4 finalizer SHA-256 is
+`352181219661b1968bd7cc9f1c3a84b51f5516df021cba80837e9e74d7a929e3`.
+Neither the previous P4 evidence nor its failure sentinels are reused.
 
 Additional evidence:
 
@@ -730,7 +741,13 @@ lag at most four, `observerReadOnly=true`, and
 `hasCommittedQc=false`. A first non-durable background launch exited after
 one healthy sample; that control-plane launch failure and its correction are
 preserved, while the original observer stream remained healthy throughout.
-No participant activation or consensus-state write occurred.
+No participant activation or consensus-state write occurred. The fresh P6
+finalizer also proves continuity from the completed formal observer stream
+through the post-threshold extension, the final overlap, and this durable T2
+overlap, with every internal and handoff gap bounded at 120 seconds. It stops
+all observer guards immediately before activation and is itself bound by
+`T2.PASS` at SHA-256
+`8f0091b1f78936387b2e6acd43e085eb721069ad6f1dbd6454bb28d63b1dbb83`.
 
 The observer intentionally does not rewrite voting consensus state: its
 snapshot remains at view 900 while its Reth/QMDB head continues following the
@@ -846,7 +863,12 @@ changing any acceptance threshold.
 `overall-goal-alignment-binding-fifo-audit.jsonl` binds the plan content hash,
 live branch, integration branch, audit-fix tip, and selected H2-v4 batch
 commit. It records P0, P1, P2, P3, P5, and the T2 rebuild as complete; P4 and
-the read-only part of P6 as running; and keeps P6 participant activation,
+the read-only part of P6 as running. The eligible P4 stream now starts at
+`2026-07-26T03:56:35Z`, while the prior completed-but-ineligible window
+remains immutable. This post-T2 alignment is independently recorded in
+`overall-goal-alignment-f49422f-p4-restart-audit.jsonl`; it reports no
+deviation and does not claim completion. The required order remains P4 pass, P6 participant
+activation and 24-hour replacement,
 active rollback rehearsal, final gates, main integration, report commit, and
 push in their required order.
 
