@@ -156,9 +156,9 @@ or removed.
 | P1 follower and catch-up | PASS | authenticated reverse/concurrent ancestry logs, 1,000+ following blocks, persisted restart recovery |
 | P2 automatic bootstrap and recovery | PASS | chain-bound bundle, blank-datadir materialization, replay receipt, cold restart |
 | P3 bidirectional leader handoff | PASS | `p3-5gov-2rust-28views-pass.jsonl`; 44 consecutive exact blocks covering more than two rotations |
-| P4 fault and lifecycle matrix | IN PROGRESS | the prior completed window and failed burst parity are preserved and excluded; after T2 selected `f49422f` / `c0ce2778...`, the fresh formal window started from zero at `2026-07-26T03:56:35Z` with seven exact endpoints, zero transactions, and lag zero |
+| P4 fault and lifecycle matrix | IN PROGRESS | the prior completed window and failed burst parity are preserved and excluded; the `f49422f` rerun accumulated 736 healthy samples over 45,186 seconds before its control process exited, so that stream is also preserved and excluded; a T9-bound binary must restart P4 from zero |
 | P5 minimal full archive+ parity | PASS | 209 RPC comparisons, 22 offline proof checks, export/import and corruption recovery |
-| P6 existing seven-node rollout | IN PROGRESS | observer cold bootstrap and exact epoch crossing pass; the actual 24-hour read-only observer window passes, continuity guard remains active, and participant activation waits for P4 |
+| P6 existing seven-node rollout | IN PROGRESS | observer cold bootstrap, exact epoch crossing, and the independent 24-hour read-only window pass; the post-window continuity controller exited and the stopped observer now fails closed while validating one retained QMDB branch, so no participant has been activated and the original seven Gov5 validators remain exact |
 
 ## P0 — safety and participation baseline
 
@@ -571,6 +571,18 @@ root, lag was zero, and the finalized interval contained no transactions.
 The authoritative stream is `p4-f49422f-zero-tx-24h.jsonl`; its immutable
 baseline is `p4-f49422f-formal-soak-baseline.jsonl`.
 
+That controller exited after its last sample at `2026-07-26T16:29:41Z`.
+The preserved stream contains 736 samples over 45,186 seconds, zero failed
+samples, maximum lag one, maximum sample gap 81 seconds, and 7,551 blocks of
+progress. All seven node processes remained live and exact; a later health
+snapshot found common height 52,364 with identical block hash, state root,
+and receipts root. The unmeasured gap invalidates the timing stream even
+though no chain invariant failed. No burst was released and no `P4.PASS` was
+written. `p4-f49422f-control-plane-interruption-20260726T162941Z.jsonl`
+classifies and excludes it. Because T9 must now select a new source and
+binary anyway, P4 will restart from zero on that exact baseline rather than
+spend another formal window on the superseded `f49422f` binary.
+
 One response-layer issue discovered after this start is deliberately deferred
 until the formal window closes. `Gov5RpcCompatService::call` limits rewriting
 to `eth_*`, while `batch` currently enables recursive rewriting for every
@@ -587,6 +599,17 @@ recorded in `t9-rpc-batch-method-scope-discovery.jsonl`. T9 must close before
 final delivery; it does not inherit or erase any eligible P4 time. Participant
 activation is fail-closed behind `T9.PASS`, which will bind the post-fix source,
 binary, and replacement finalizer hashes.
+
+T9 is implemented by `6180ec5` plus the explicit disabled-path style follow-up
+`1b8d52b`. Batch request IDs are associated with their methods before the
+inner service is called; only successful responses whose IDs map uniquely to
+`eth_*` requests are normalized. `n42_*`, `debug_*`, and `trace_*` responses
+remain shape-compatible with their single-call paths, while an ID reused
+across eligible and ineligible method families is conservatively left
+unchanged. Seven focused regressions, including mixed families and ambiguous
+duplicate IDs, pass. The commits are pushed, but `T9.PASS` remains absent
+until the full workspace gates, isolated release build, and pinned binary
+hash finish.
 
 A fail-closed finalizer is armed against the formal monitor. It cannot release
 the burst unless every sample, historical empty-block interval, lag bound, and
@@ -767,7 +790,29 @@ all observer guards immediately before activation and is itself bound by
 `8f0091b1f78936387b2e6acd43e085eb721069ad6f1dbd6454bb28d63b1dbb83`.
 The final-overlap monitor ended naturally at `2026-07-26T05:30:00Z` after
 overlapping the durable stream; the durable stream and its independent guard
-remain live. After T9 was registered, the waiting old-binary P6 finalizer was
+were later found stopped, with their final eligible sample at
+`2026-07-26T14:27:17Z`. The stream had 901 samples over 54,671 seconds; its
+single failed sample records the dead monitor PID. At discovery the observer
+execution head remained at 65,537 while the seven Gov5 nodes had advanced to
+72,554. This is a control/observer continuity failure, not a committee
+failure, and it invalidates the handoff to participant activation.
+`p6-t2-observer-lag-and-monitor-exit-20260726T142717Z.jsonl` preserves the
+failure.
+
+Two restart attempts used the unchanged observer binary and the existing
+database. Neither opened RPC or voted. The second attempt
+failed closed while replay-validating `gov5_qmdb_branches.bin`: one retained
+block has missing ancestry, excessive depth, or a divergent root. The branch
+file and 16-byte vote log remained unchanged at SHA-256 `e00b23ab...` and
+`374708ff...`; no repair, rebuild, format, compaction, prune, or deletion was
+performed. The exact binary, logs, hashes, and a post-failure exact seven-Gov5
+health snapshot are in
+`p6-observer-restart-qmdb-fail-closed-20260726T223713Z.jsonl`. The failed
+observer database is quarantined from participant preparation until its
+retained branch can be authenticated against the execution archive and a
+fail-closed recovery is qualified.
+
+After T9 was registered, the waiting old-binary P6 finalizer was
 stopped before `P4.PASS` and before any participant state existed. A release
 barrier now requires both `P4.PASS` and a hash-bound `T9.PASS` before executing
 the post-fix P6 finalizer. This control-only rearm did not restart P4, any node,
@@ -887,16 +932,17 @@ The live phase ledger was reconciled against the completion plan without
 changing any acceptance threshold.
 `overall-goal-alignment-binding-fifo-audit.jsonl` binds the plan content hash,
 live branch, integration branch, audit-fix tip, and selected H2-v4 batch
-commit. It records P0, P1, P2, P3, P5, and the T2 rebuild as complete; P4 and
-the read-only part of P6 as running. The eligible P4 stream now starts at
-`2026-07-26T03:56:35Z`, while the prior completed-but-ineligible window
-remains immutable. This post-T2 alignment is independently recorded in
+commit. It records P0, P1, P2, P3, P5, and the T2 rebuild as complete. The
+`f49422f` P4 stream started at `2026-07-26T03:56:35Z` and is now also
+ineligible because its controller exited before the threshold; both prior
+windows remain immutable. This post-T2 alignment is independently recorded in
 `overall-goal-alignment-f49422f-p4-restart-audit.jsonl`; it reports no
 deviation and does not claim completion. T9 was subsequently added as a
-post-P4 response-scope gate: it cannot change the running formal baseline and
-must pass before final delivery. The required order remains P4 pass, close T9
-without crediting the new binary with the completed P4 time, P6 participant
-activation and 24-hour replacement,
+response-scope gate and is now the selected baseline for the next P4 window.
+No elapsed time from either excluded P4 stream will be credited to the new
+binary. The required order remains close T9, restart and pass P4 from zero,
+qualify the P6 observer recovery and continuity handoff, activate the single
+participant for its 24-hour replacement window,
 active rollback rehearsal, final gates, main integration, report commit, and
 push in their required order.
 

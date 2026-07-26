@@ -35,6 +35,17 @@
 5. `hardening/gov5-cross-port`（4 commits）与 interop 分支的 gossip 上限常量冲突
    **已在 `integration/gov5-interop-main` 解完并验证**（详见 T6）。
 
+### 2026-07-26 运行态更正
+
+- T2 已选定并部署 `f49422f` / `c0ce2778...`；T7 的 QC 与 TC 三个调用点也已纳入。
+- `f49422f` 的 P4 控制进程在 45,186 秒后退出。此前 736 个样本全部健康，但未达到
+  86,400 秒且留下不可接受的采样空洞，因此整段保留并排除，P4 仍须从零重跑。
+- T9 的 RPC batch 方法域修复已推送为 `6180ec5` + `1b8d52b`；定向回归通过，
+  `T9.PASS` 仍等待全门禁、隔离 release 构建与 pinned SHA-256。
+- P6 participant 从未激活。observer 连续守卫退出后，原 observer 停在 65,537；
+  使用原二进制、原数据库重启时对一条 retained QMDB branch 校验失败并 fail-closed。
+  原七个 Gov5 节点继续精确一致。不得清库或跳过校验，须先完成 T10。
+
 ## 红线（任何任务都不得突破）
 
 - 不初始化、不重建、不格式化、不压缩、不清理、不删除任何既有七节点数据库。
@@ -191,14 +202,36 @@ T4 的 24 小时窗口与回滚就绪，不并行替换多个。
 
 ---
 
+### T9 — RPC batch 方法域收口（本机 + 真机 / 前置新 P4）
+
+`Gov5H2` 下逐条按请求 method 和 response ID 关联，只允许 `eth_*` 成功响应进入
+递归归一化；`n42_*`、`debug_*`、`trace_*`、通知、错误与 ambiguous duplicate ID
+保持原样。完成全工作区门禁和隔离 release 构建后写 `T9.PASS`，其 source/binary
+SHA-256 是下一轮 P4 和 P6 的唯一基线。
+
+---
+
+### T10 — P6 observer retained-branch 恢复（真机 / 前置 T9、T3）
+
+保留失败 observer 原库与全部日志，不原地修复。先在 manifest 校验的副本上把
+`gov5_qmdb_branches.bin` 的唯一失败 block 定位到具体 hash、parent、root 和失败类别，
+并与 Reth canonical archive 及认证 QMDB checkpoint 对拍。只有能证明待排除项是
+非 canonical、且恢复算法自身 fail-closed 并有 corruption 回归时，才允许生成新的
+observer/participant 候选副本。候选必须用 T9 pinned binary 冷启动、追平七 Gov5、
+保持 `hasCommittedQc=false` 与 vote log 不变，再开启新的 durable continuity stream。
+任何无法证明的分支一律拒绝恢复，不得删除文件后“重新同步”。
+
+---
+
 ## 依赖图
 
 ```
-T1 (P4 窗口判定)
- └─> T2 (纳入修复 + 重建)
+T9 (RPC batch 收口 + pinned build)
+ └─> T1/T2 (新基线 P4 从零重跑)
       └─> T3 (P4 gate 关闭)
-           └─> T4 (P6 24h 替换窗口) ──┐
-                                      ├─> T8 (扩面)
+           └─> T10 (observer 恢复与连续交接)
+                └─> T4 (P6 24h 替换窗口) ──┐
+                                           ├─> T8 (扩面)
 T5 (回滚演练)  ────────────────────────┤
 T6 (分支整合) ✅ 已完成 ───────────────┘
 T7 (批量验签) ✅ 已完成
