@@ -235,7 +235,20 @@ impl NodeProcess {
         };
 
         // Wait for the node to become ready.
-        node.wait_for_rpc_ready(Duration::from_secs(60)).await?;
+        //
+        // Opening the database is the slow part, and it scales with how many
+        // nodes are coming up at once: reth heals static files and verifies
+        // storage consistency on every start, which is IO-bound. On Windows
+        // with five concurrent nodes that alone measured 27 seconds, pushing
+        // total startup just past a 60-second budget even though the node was
+        // healthy and about to serve. Allow an override so a slow filesystem
+        // does not read as a functional failure.
+        let ready_timeout = std::env::var("E2E_NODE_READY_TIMEOUT_SECS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(60);
+        node.wait_for_rpc_ready(Duration::from_secs(ready_timeout))
+            .await?;
 
         Ok(node)
     }
