@@ -70,10 +70,11 @@ where
     }
 
     fn batch<'a>(&self, req: Batch<'a>) -> impl Future<Output = Self::BatchResponse> + Send + 'a {
-        let rewrite_ids = self
-            .enabled
-            .then(|| batch_eth_rewrite_ids(&req))
-            .unwrap_or_default();
+        let rewrite_ids = if self.enabled {
+            batch_eth_rewrite_ids(&req)
+        } else {
+            HashSet::new()
+        };
         let inner = self.inner.clone();
         async move {
             let response = inner.batch(req).await;
