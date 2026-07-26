@@ -31,12 +31,14 @@ Pushed implementation commits:
 - n42-26: `8134235` (`perf(consensus): batch-verify H2-v4 signatures`)
 - n42-26: `04ab69e` (`perf(consensus): batch-verify H2-v4 timeout certificates too`)
 - n42-26: `afafd37` (`fix(interop): normalize gov5 RPC transaction metadata`)
+- n42-26: `851c1b7` (`fix(interop): normalize empty gov5 receipt logs`)
+- n42-26: `f49422f` (`fix(interop): normalize gov5 log response shapes`)
 - N42-gov5: `b027f3040` (`feat(interop): harden Gov5 mixed-client operation`)
 - N42-gov5: `34021c3f7` (`test: make hive genesis fixture self-contained`)
 - N42-gov5: `a70f7cf68` (`test: share hive fixture across packages`)
 - N42-gov5: `a35aa6293` (`fix(ethel): join state-root stream producers`)
 
-The current Rust qualification binary was built at `24210f0`. The preceding
+The original P4 qualification binary was built at `24210f0`. The preceding
 `21ea922` commit bounds both consensus state-sync requests and
 orchestrator-owned Gov5 body fetches, rotates retry peers, and makes
 unsupported state-sync attempts fail explicitly instead of remaining
@@ -58,8 +60,10 @@ the P6 shell monitor. The Gov5 qualification binary was built at `b027f3040`;
 the two later Gov5 commits only make an existing test fixture self-contained
 in clean checkouts:
 
-- Rust `n42-node`:
+- Rust original P4 `n42-node`:
   `7fcec8e3ad22fab37d265c5509fb461684f248e57e9f5ded02e79ea3c947ce31`
+- Rust selected T2 `n42-node`, built from `f49422f`:
+  `c0ce2778b1deaa329416d56ced26b2c40463b6133a0a172281c3d077191e1e4d`
 - Gov5 `n42`:
   `fa02d37c1e7b480a1c3196d318cd7bc79fb2d4247e5977331b79151873a82ae7`
 - Gov5 `n42-qmdb-export`:
@@ -78,38 +82,42 @@ acceptance.
 The P6 observer began with immutable Rust hash
 `73cd5bc9cf59715a0126a2e7cb6697b1ef5de30a28933c53eadfd092c341b10c`.
 Observer qualification remains read-only and keeps that startup binary
-unchanged for the entire window. Rust hash `7fcec8e3...` and Gov5 hash
-`fa02d37c...` are staged separately for the maintenance-window participant
-phase.
+unchanged for the entire observer window. Selected Rust hash `c0ce2778...`
+and Gov5 hash `fa02d37c...` are staged separately for the maintenance-window
+participant phase.
 
-The selected T2 source baseline is `afafd37`, and the Gov5 branch baseline is
+The selected T2 source baseline is `f49422f`, and the Gov5 branch baseline is
 `a35aa6293`; see the T2 gate evidence and `source-remote-ref-audit.jsonl`.
 The former contains both audit fixes, all three H2-v4 batch-verification call
 sites, and the Gov5-profile-only RPC normalization required by the failed P4
-burst. The latter fixes the data race found by the mandatory full Go race
-gate. Live remote audits require the
-n42 branch to contain that implementation and match the local checkpoint or
-final-report commit exactly. This in-progress qualification ledger is
-committed as a checkpoint. Its final PASS update remains pending until all
-runtime gates finish.
+burst. The response layer distinguishes receipt-embedded logs from top-level
+`eth_getLogs` results, preserving Gov5's established `null`, empty-data, and
+numeric-index shapes without changing Ethereum-profile output. The latter
+fixes the data race found by the mandatory full Go race gate. Live remote
+audits require the n42 branch to contain that implementation and match the
+local checkpoint or final-report commit exactly. This in-progress
+qualification ledger is committed as a checkpoint. Its final PASS update
+remains pending until all runtime gates finish.
 
 The live checkpoint branch is `feat/gov5-n42-live-interop`. The separately
 verified integration branch `integration/gov5-interop-main` is pushed at
 `d579eb4` and contains the 39-commit interoperability line, current `main`,
 the audit fixes, and the four cross-port hardening commits. `main` remains at
-`3bbad4b` until the current P4 window ends and the audit-fix build baseline is
-selected, so the measured runtime and delivery baseline cannot be confused.
+`3bbad4b` until the replacement P4 window ends, so the measured runtime and
+delivery baseline cannot be confused.
 The latest audit-plan tip is `3332d2a`; the authoritative H2-v4
 batch-verification tip is `e89425b`. Its exact three-call-site content is
 present on the live branch as `8134235` plus `04ab69e`; a tree comparison of
-the affected consensus and devlog paths is exact. T2 full gates are running
-against `afafd37`. A new pinned release hash is not declared until every Rust
-and Go gate passes and the isolated release build finishes.
+the affected consensus and devlog paths is exact. T2 full gates passed against
+`f49422f`: Go full race, Rust format/check/Clippy/workspace tests, the isolated
+release build, staged-binary signature and SHA checks, 360 exact seven-endpoint
+historical RPC comparisons, committed-QC/equivocation checks, and a ten-minute
+dual-new-binary liveness window all passed.
 
-`p4-binding-fifo-fix-executable-identity-audit.jsonl` independently resolves
-both current live Rust processes through their executable mappings. Both map
-to the same staged release with SHA-256 `7fcec8e3...`; the separately staged
-P6 participant and Gov5 artifacts also retain their expected hashes.
+`t2-f49422f-both-rust-consensus-health-v2.jsonl` independently resolves both
+current live Rust processes through their executable mappings. Both map to the
+same staged release with SHA-256 `c0ce2778...`; the separately staged P6
+participant and Gov5 artifacts also retain their expected hashes.
 
 ## Qualification runtimes
 
@@ -145,7 +153,7 @@ or removed.
 | P1 follower and catch-up | PASS | authenticated reverse/concurrent ancestry logs, 1,000+ following blocks, persisted restart recovery |
 | P2 automatic bootstrap and recovery | PASS | chain-bound bundle, blank-datadir materialization, replay receipt, cold restart |
 | P3 bidirectional leader handoff | PASS | `p3-5gov-2rust-28views-pass.jsonl`; 44 consecutive exact blocks covering more than two rotations |
-| P4 fault and lifecycle matrix | FAIL | the 24-hour zero-transaction guard passed, and all 17 signed transactions finalized, but the burst parity gate found Rust-only `blockTimestamp` in a mined full-transaction response; the failed evidence is sealed and T2 plus a Gov5 RPC-shape fix must be rebuilt before a from-zero rerun |
+| P4 fault and lifecycle matrix | FAIL | the prior 24-hour zero-transaction guard passed and all 17 signed transactions finalized, but its burst parity gate found incompatible Rust response metadata; T2 is now rebuilt and rolled out at `f49422f` / `c0ce2778...`, and a fresh P4 window must start from zero |
 | P5 minimal full archive+ parity | PASS | 209 RPC comparisons, 22 offline proof checks, export/import and corruption recovery |
 | P6 existing seven-node rollout | IN PROGRESS | observer cold bootstrap and exact epoch crossing pass; the actual 24-hour read-only observer window passes, continuity guard remains active, and participant activation waits for P4 |
 
@@ -540,6 +548,21 @@ now proceed: it must include the audit fixes, remove this Gov5-incompatible
 field from the Gov5 H2 profile without weakening the exact parity gate,
 rebuild the pinned binary, and restart P4 from zero.
 
+T2 then failed closed twice during one-node historical preflight before
+selection. The first candidate removed `blockTimestamp` but exposed Gov5's
+empty receipt `logs:null` shape; the second candidate fixed that field but
+exposed the distinct receipt-log `topics:null` and top-level `eth_getLogs`
+data/index shapes. Each candidate was immediately rolled back before the
+second Rust node was replaced. The final `f49422f` candidate was built in a
+new empty target directory and pinned at SHA-256 `c0ce2778...`. It passed 300
+exact comparisons in the one-new/one-old topology, 29 liveness samples across
+291 seconds with zero failures, then 360 exact comparisons after replacing
+the second Rust node. The final dual-new-binary monitor recorded 57 samples
+across 591 seconds, zero failures, maximum lag one, and 99 blocks of progress.
+Both Rust nodes reported the same committed view/hash, seven validators,
+committed QCs, and zero authenticated equivocations. The replacement P4
+window may therefore start from zero without changing any existing database.
+
 A fail-closed finalizer is armed against the formal monitor. It cannot release
 the burst unless every sample, historical empty-block interval, lag bound, and
 all warning and deadline counters pass. An independent 30-second guard also
@@ -822,8 +845,8 @@ The live phase ledger was reconciled against the completion plan without
 changing any acceptance threshold.
 `overall-goal-alignment-binding-fifo-audit.jsonl` binds the plan content hash,
 live branch, integration branch, audit-fix tip, and selected H2-v4 batch
-commit. It records P0, P1, P2, P3, and P5 as complete; P4 and the read-only
-part of P6 as running; and keeps T2 rebuild, P6 participant activation,
+commit. It records P0, P1, P2, P3, P5, and the T2 rebuild as complete; P4 and
+the read-only part of P6 as running; and keeps P6 participant activation,
 active rollback rehearsal, final gates, main integration, report commit, and
 push in their required order.
 
