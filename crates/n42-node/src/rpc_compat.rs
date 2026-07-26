@@ -14,9 +14,10 @@ use tower::Layer;
 /// Keeps gov5 H2's established JSON-RPC response shape while sharing reth's Ethereum RPC server.
 ///
 /// Reth annotates mined transaction and log objects with the non-standard `blockTimestamp`
-/// convenience field. The preserved gov5 API does not. Removing only that metadata field at the
-/// response boundary keeps cross-client responses structurally identical without changing block,
-/// transaction, receipt, or state commitments.
+/// convenience field, while gov5 does not. Reth also serializes an empty receipt log list as `[]`,
+/// while gov5's established receipt shape uses `null`. Normalizing those response-only differences
+/// keeps cross-client responses structurally identical without changing block, transaction,
+/// receipt, or state commitments.
 #[derive(Clone, Copy, Debug)]
 pub struct Gov5RpcCompatLayer {
     enabled: bool,
@@ -80,18 +81,25 @@ where
     }
 }
 
-fn remove_block_timestamp(value: &mut Value) -> bool {
+fn normalize_gov5_metadata(value: &mut Value) -> bool {
     match value {
         Value::Object(fields) => {
-            let mut removed = fields.remove("blockTimestamp").is_some();
-            removed |= fields
+            let mut changed = fields.remove("blockTimestamp").is_some();
+            if fields
+                .get("logs")
+                .is_some_and(|logs| matches!(logs, Value::Array(entries) if entries.is_empty()))
+            {
+                fields.insert("logs".to_owned(), Value::Null);
+                changed = true;
+            }
+            changed |= fields
                 .values_mut()
-                .fold(false, |found, value| remove_block_timestamp(value) | found);
-            removed
+                .fold(false, |found, value| normalize_gov5_metadata(value) | found);
+            changed
         }
         Value::Array(values) => values
             .iter_mut()
-            .fold(false, |found, value| remove_block_timestamp(value) | found),
+            .fold(false, |found, value| normalize_gov5_metadata(value) | found),
         _ => false,
     }
 }
@@ -117,7 +125,7 @@ fn normalize_method_response(response: MethodResponse) -> MethodResponse {
         return response;
     };
     let mut result = result.into_owned();
-    if !remove_block_timestamp(&mut result) {
+    if !normalize_gov5_metadata(&mut result) {
         return response;
     }
 
@@ -132,14 +140,14 @@ fn normalize_batch_response(response: MethodResponse) -> MethodResponse {
         return response;
     };
     let mut normalized = Vec::with_capacity(parsed.len());
-    let mut removed = false;
+    let mut changed = false;
 
     for item in parsed {
         let id = item.id.into_owned();
         let item = match item.payload {
             ResponsePayload::Success(result) => {
                 let mut result = result.into_owned();
-                removed |= remove_block_timestamp(&mut result);
+                changed |= normalize_gov5_metadata(&mut result);
                 MethodResponse::response(id, MethodResponsePayload::success(result), usize::MAX)
             }
             ResponsePayload::Error(error) => MethodResponse::error(id, error.into_owned()),
@@ -147,7 +155,7 @@ fn normalize_batch_response(response: MethodResponse) -> MethodResponse {
         normalized.push(item);
     }
 
-    if !removed {
+    if !changed {
         return response;
     }
 
@@ -195,8 +203,26 @@ mod tests {
     }
 
     #[test]
+    fn normalizes_empty_receipt_logs_without_changing_top_level_log_results() {
+        let receipt = success(json!({
+            "transactionHash": "0x01",
+            "logs": []
+        }));
+        let normalized = normalize_response(receipt, true);
+        let value: Value = serde_json::from_str(normalized.as_ref()).unwrap();
+        assert_eq!(
+            value["result"],
+            json!({"transactionHash": "0x01", "logs": null})
+        );
+
+        let logs = success(json!([]));
+        let original = logs.as_ref().to_owned();
+        assert_eq!(normalize_response(logs, true).as_ref(), original);
+    }
+
+    #[test]
     fn leaves_standard_profile_response_unchanged() {
-        let response = success(json!({"blockTimestamp": "0x02"}));
+        let response = success(json!({"blockTimestamp": "0x02", "logs": []}));
         let original = response.as_ref().to_owned();
         assert_eq!(normalize_response(response, false).as_ref(), original);
     }
