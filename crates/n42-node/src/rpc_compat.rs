@@ -14,10 +14,12 @@ use tower::Layer;
 /// Keeps gov5 H2's established JSON-RPC response shape while sharing reth's Ethereum RPC server.
 ///
 /// Reth annotates mined transaction and log objects with the non-standard `blockTimestamp`
-/// convenience field, while gov5 does not. Reth also serializes an empty receipt log list as `[]`,
-/// while gov5's established receipt shape uses `null`. Normalizing those response-only differences
-/// keeps cross-client responses structurally identical without changing block, transaction,
-/// receipt, or state commitments.
+/// convenience field, while gov5 does not. Reth also serializes empty receipt log and topic lists
+/// as `[]`, while gov5's established receipt shape uses `null`. Top-level `eth_getLogs` results
+/// retain an intentionally different gov5 shape: empty data is `""`, indexes are JSON numbers, and
+/// empty topics remain `[]`. Normalizing those response-only differences keeps cross-client
+/// responses structurally identical without changing block, transaction, receipt, or state
+/// commitments.
 #[derive(Clone, Copy, Debug)]
 pub struct Gov5RpcCompatLayer {
     enabled: bool,
@@ -92,6 +94,13 @@ fn normalize_gov5_metadata(value: &mut Value) -> bool {
                 fields.insert("logs".to_owned(), Value::Null);
                 changed = true;
             }
+            if fields
+                .get("topics")
+                .is_some_and(|topics| matches!(topics, Value::Array(entries) if entries.is_empty()))
+            {
+                fields.insert("topics".to_owned(), Value::Null);
+                changed = true;
+            }
             changed |= fields
                 .values_mut()
                 .fold(false, |found, value| normalize_gov5_metadata(value) | found);
@@ -102,6 +111,55 @@ fn normalize_gov5_metadata(value: &mut Value) -> bool {
             .fold(false, |found, value| normalize_gov5_metadata(value) | found),
         _ => false,
     }
+}
+
+fn normalize_log_quantity(fields: &mut serde_json::Map<String, Value>, name: &str) -> bool {
+    let Some(quantity) = fields
+        .get(name)
+        .and_then(Value::as_str)
+        .and_then(|value| value.strip_prefix("0x"))
+        .and_then(|value| u64::from_str_radix(if value.is_empty() { "0" } else { value }, 16).ok())
+    else {
+        return false;
+    };
+    fields.insert(name.to_owned(), Value::Number(quantity.into()));
+    true
+}
+
+fn normalize_top_level_logs(value: &mut Value) -> Option<bool> {
+    let Value::Array(logs) = value else {
+        return None;
+    };
+    if logs.is_empty()
+        || !logs.iter().all(|log| {
+            log.as_object().is_some_and(|fields| {
+                fields.contains_key("data")
+                    && fields.contains_key("logIndex")
+                    && fields.contains_key("topics")
+            })
+        })
+    {
+        return None;
+    }
+
+    let mut changed = false;
+    for log in logs {
+        let Value::Object(fields) = log else {
+            unreachable!("top-level log result shape was checked above");
+        };
+        changed |= fields.remove("blockTimestamp").is_some();
+        if fields.get("data").and_then(Value::as_str) == Some("0x") {
+            fields.insert("data".to_owned(), Value::String(String::new()));
+            changed = true;
+        }
+        changed |= normalize_log_quantity(fields, "logIndex");
+        changed |= normalize_log_quantity(fields, "transactionIndex");
+    }
+    Some(changed)
+}
+
+fn normalize_gov5_result(value: &mut Value) -> bool {
+    normalize_top_level_logs(value).unwrap_or_else(|| normalize_gov5_metadata(value))
 }
 
 fn normalize_response(response: MethodResponse, enabled: bool) -> MethodResponse {
@@ -125,7 +183,7 @@ fn normalize_method_response(response: MethodResponse) -> MethodResponse {
         return response;
     };
     let mut result = result.into_owned();
-    if !normalize_gov5_metadata(&mut result) {
+    if !normalize_gov5_result(&mut result) {
         return response;
     }
 
@@ -147,7 +205,7 @@ fn normalize_batch_response(response: MethodResponse) -> MethodResponse {
         let item = match item.payload {
             ResponsePayload::Success(result) => {
                 let mut result = result.into_owned();
-                changed |= normalize_gov5_metadata(&mut result);
+                changed |= normalize_gov5_result(&mut result);
                 MethodResponse::response(id, MethodResponsePayload::success(result), usize::MAX)
             }
             ResponsePayload::Error(error) => MethodResponse::error(id, error.into_owned()),
@@ -218,6 +276,52 @@ mod tests {
         let logs = success(json!([]));
         let original = logs.as_ref().to_owned();
         assert_eq!(normalize_response(logs, true).as_ref(), original);
+    }
+
+    #[test]
+    fn distinguishes_receipt_logs_from_top_level_log_results() {
+        let log = json!({
+            "address": "0x01",
+            "blockTimestamp": "0x02",
+            "data": "0x",
+            "logIndex": "0x2a",
+            "topics": [],
+            "transactionIndex": "0x03"
+        });
+
+        let receipt = success(json!({
+            "transactionHash": "0x04",
+            "logs": [log.clone()]
+        }));
+        let normalized = normalize_response(receipt, true);
+        let value: Value = serde_json::from_str(normalized.as_ref()).unwrap();
+        assert_eq!(
+            value["result"],
+            json!({
+                "transactionHash": "0x04",
+                "logs": [{
+                    "address": "0x01",
+                    "data": "0x",
+                    "logIndex": "0x2a",
+                    "topics": null,
+                    "transactionIndex": "0x03"
+                }]
+            })
+        );
+
+        let logs = success(json!([log]));
+        let normalized = normalize_response(logs, true);
+        let value: Value = serde_json::from_str(normalized.as_ref()).unwrap();
+        assert_eq!(
+            value["result"],
+            json!([{
+                "address": "0x01",
+                "data": "",
+                "logIndex": 42,
+                "topics": [],
+                "transactionIndex": 3
+            }])
+        );
     }
 
     #[test]

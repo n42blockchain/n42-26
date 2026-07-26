@@ -624,7 +624,10 @@ impl ConsensusEngine {
     /// vote is never released. Rotating the live hash to the back keeps the
     /// cache bounded (by at most one extra entry) without stranding it.
     fn evict_oldest_imported_block(&mut self) {
-        let live = self.pending_proposal.as_ref().map(|pending| pending.block_hash);
+        let live = self
+            .pending_proposal
+            .as_ref()
+            .map(|pending| pending.block_hash);
         for _ in 0..self.imported_block_fifo.len() {
             let Some(oldest) = self.imported_block_fifo.pop_front() else {
                 return;

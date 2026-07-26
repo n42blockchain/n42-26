@@ -107,9 +107,7 @@ impl ConsensusSigningProfile {
     ) -> Result<(), Vec<usize>> {
         match self {
             Self::Native => batch_verify_with_fallback(messages, signatures, public_keys),
-            Self::H2V4(_) => {
-                batch_verify_h2_v4_with_fallback(messages, signatures, public_keys)
-            }
+            Self::H2V4(_) => batch_verify_h2_v4_with_fallback(messages, signatures, public_keys),
         }
     }
 
