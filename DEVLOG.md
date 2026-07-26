@@ -148,7 +148,7 @@ Logs are split into separate files by phase for easy maintenance:
 | [devlog-115-h2-v4-envelope-observer](docs/devlog-115-h2-v4-envelope-observer.md) | H2-v4 chain-bound envelope、Go Snappy vector 与 Rust `/n42/h2/4/ssz_snappy` 只读 observer | Interop |
 | [devlog-116-h2-v4-finality-verifier](docs/devlog-116-h2-v4-finality-verifier.md) | gov5→Rust 固定 BLS CommitQC 对拍、POP/NUL ciphersuite 隔离、只读 observer finality 证明门禁 | Interop |
 | [devlog-117-h2-v4-production-profile](docs/devlog-117-h2-v4-production-profile.md) | gov5 H2-v4 静态验证者生产 profile、全路径签名域、Decide 双发与 Rust 只读最终性同步目标；默认关闭并保护旧 7 节点/QMDB/archive+ 数据 | Interop |
-| [devlog-137-reth-upstream-20260726-assessment](docs/devlog-137-reth-upstream-20260726-assessment.md) | upstream 33 提交合并评估：零冲突、n42 定制点存活、依赖 pin 未变、46 套件零失败；因 P4 窗口在跑**未切换基线**，E2E 待补 | Dependencies |
+| [devlog-137-reth-upstream-20260726-assessment](docs/devlog-137-reth-upstream-20260726-assessment.md) | upstream 33 提交合并评估：零冲突、定制点存活、46 套件与 E2E 功能全过（state root 跨节点一致）；但同机对照下场景 1 出块 101→69（-32%），**升级被吞吐回归挡住**，基线未切换 | Dependencies |
 
 ### 上游借鉴与跟踪
 
