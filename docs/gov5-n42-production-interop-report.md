@@ -571,6 +571,21 @@ root, lag was zero, and the finalized interval contained no transactions.
 The authoritative stream is `p4-f49422f-zero-tx-24h.jsonl`; its immutable
 baseline is `p4-f49422f-formal-soak-baseline.jsonl`.
 
+One response-layer issue discovered after this start is deliberately deferred
+until the formal window closes. `Gov5RpcCompatService::call` limits rewriting
+to `eth_*`, while `batch` currently enables recursive rewriting for every
+method in the batch. A mixed Gov5H2 batch can therefore rewrite nested
+`blockTimestamp`, empty `logs`, or empty `topics` in `n42_*`, `debug_*`, or
+`trace_*` results even though the corresponding single calls remain
+unchanged. This is T9: batch responses must be matched back to their request
+methods and only `eth_*` successes normalized, preserving IDs, order, errors,
+notifications, and extensions. The current zero-transaction P4 stimulus does
+not exercise that path, and no source, binary, database, acceptance value, or
+window process was changed. The discovery, mobile-RPC risk, intentional
+Gov5-only `eth_getLogs` quantity shape, and post-window acceptance tests are
+recorded in `t9-rpc-batch-method-scope-discovery.jsonl`. T9 must close before
+final delivery; it does not inherit or erase any eligible P4 time.
+
 A fail-closed finalizer is armed against the formal monitor. It cannot release
 the burst unless every sample, historical empty-block interval, lag bound, and
 all warning and deadline counters pass. An independent 30-second guard also
@@ -867,7 +882,10 @@ the read-only part of P6 as running. The eligible P4 stream now starts at
 `2026-07-26T03:56:35Z`, while the prior completed-but-ineligible window
 remains immutable. This post-T2 alignment is independently recorded in
 `overall-goal-alignment-f49422f-p4-restart-audit.jsonl`; it reports no
-deviation and does not claim completion. The required order remains P4 pass, P6 participant
+deviation and does not claim completion. T9 was subsequently added as a
+post-P4 response-scope gate: it cannot change the running formal baseline and
+must pass before final delivery. The required order remains P4 pass, close T9
+without crediting the new binary with the completed P4 time, P6 participant
 activation and 24-hour replacement,
 active rollback rehearsal, final gates, main integration, report commit, and
 push in their required order.
