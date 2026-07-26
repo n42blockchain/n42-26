@@ -202,7 +202,44 @@ T1 (P4 窗口判定)
 T5 (回滚演练)  ────────────────────────┤
 T6 (分支整合) ✅ 已完成 ───────────────┘
 T7 (批量验签) ✅ 已完成
+T9 (rpc_compat 批量路径，窗口结束后)
 ```
+
+---
+
+### T9 — `rpc_compat` 的批量路径缺方法过滤（本机审计发现 / 非阻塞，窗口结束后处理）
+
+**不影响当前 P4 窗口**：零交易 soak 不会命中这条路径。记在这里以免随窗口一起被忘掉。
+
+`crates/n42-node/src/rpc_compat.rs`（`f49422f`）的单次调用与批量调用对"归一化谁"
+的判定不一致：
+
+```rust
+fn call(...)  { let rewrite = self.enabled && req.method.starts_with("eth_"); ... }
+fn batch(...) { let rewrite = self.enabled; ... }   // 没有前缀过滤
+```
+
+而 `normalize_gov5_metadata` 是**递归全树**的——它移除任意深度的 `blockTimestamp`，
+把任意深度的空 `logs` / `topics` 数组改成 `null`。两者叠加的后果是：在 Gov5H2
+profile 下，批量请求里的 `n42_*`（手机 RPC）、`debug_*`、`trace_*` 等非 eth 方法，
+其响应只要在任何层级出现这三个字段名，同样会被改写；而同一个方法走单次调用则不会。
+同一份数据经两种调用方式返回两种形状。
+
+最可能先踩到的是手机侧：`n42_*` 收据里的空 `logs` 从 `[]` 变成 `null`，解析按数组
+写的话会直接失败。P5 的 archive RPC 对拍若用批量请求也在此列。
+
+**修法**：把 `batch` 的判定改成逐条按 `请求方法` 决定是否归一化，与 `call` 对齐；
+`normalize_batch_response` 需要拿到每条子请求的方法名，而不是只看响应。
+
+**验收**：同一 `n42_*` 方法经单次与批量调用返回逐字节相同的 JSON；现有 eth 归一化
+行为不变。
+
+另记：`normalize_log_quantity` 把 `logIndex` / `transactionIndex` 从 hex 字符串转成
+JSON 数字，这偏离以太坊 JSON-RPC 的 QUANTITY 约定。在 Gov5H2 profile 下这是**有意
+匹配 gov5 的既有形状**，不是缺陷；但要意识到标准 eth 客户端（Blockscout 等）连到
+这类节点时会解析失败，因此该 profile 不应对外提供通用 RPC 服务。
+
+---
 
 ## 交接协议
 
