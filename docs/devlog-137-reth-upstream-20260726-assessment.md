@@ -44,7 +44,7 @@ epoch`、`rebase partial proof roots`、`remove sparse trie memory accounting`�
 失败一次。单独重跑通过，随后完整重跑 46 套件零失败。该测试验证 mpsc 满时的重试
 行为，依赖 tokio 调度时序，与 reth 无关。记录在此以免下次再被同一条误导。
 
-## E2E：功能全过，但出块吞吐回归 32%
+## E2E：功能全过，出块吞吐回归 32%（已在 devlog-138 修复）
 
 补跑了 CI 覆盖的六个场景（`e2e.yml` 的 1/3/4 与 5/8/12），验证分支
 `verify/e2e-reth-20260726` = 本评估分支 + T7 批量验签 + Windows 原生支持
@@ -52,7 +52,7 @@ epoch`、`rebase partial proof roots`、`remove sparse trie memory accounting`�
 
 | 场景 | 结果 |
 |---|---|
-| 1 单节点连续出块 | **FAILED** — 69 块，低于 70 下限 |
+| 1 单节点连续出块 | **FAILED** — 69 块，低于 70 下限（已在 devlog-138 修复，现 101 块）|
 | 3 ERC-20 | PASSED — 300 笔转账全成功，余额与总供应守恒 |
 | 4 多节点共识 | PASSED — 1/3/5 节点全部 5 项验证通过 |
 | 5 手机验证 | PASSED — 245 次 attestation 零错误 |
@@ -78,16 +78,11 @@ n42 的 state-root 定制。
 的地板随 version 单调上升"），对照结果排除了这个猜测：旧 reth 同样跑到 101 块且零
 劣化，问题在 reth 侧。
 
-upstream 这批里值得先看的嫌疑：
-
-- `197481f0c perf(engine): keep 5 in-memory blocks by default (#26462)`——内存中保留
-  的块数变少，state root 计算可能更多回落到磁盘；
-- `84f4c989c feat(trie): prune sparse trie nodes by epoch (#26485)`；
-- `f708b8be1 perf(trie): parallelize pruning retention set calculation, remove LFU (#26439)`；
-- `a04b780d6 perf(trie): remove sparse trie memory accounting (#26458)`。
-
-劣化从第 28 块才开始，不像"每块固定开销变大"，更像某个按累积量触发的机制（epoch
-剪枝、内存块窗口滚出）到达阈值后才生效。
+根因是 `197481f0c perf(engine): keep 5 in-memory blocks by default (#26462)`——
+它把 `DEFAULT_MEMORY_BLOCK_BUFFER_TARGET` 从 0 改成 5，五个块滞留内存等待持久化，
+而 N42 的 state root 走 `HashedPostState` overlay，需要遍历的 overlay 深度跟着这个
+缓冲一起长。劣化之所以从第 28 块而非第 6 块开始：持久化是异步的，缓冲填满后 gap 才
+逐步累积。完整定位与修法见 `devlog-138`。
 
 ### 附带发现：5 节点启动超时不是功能问题
 
@@ -113,20 +108,20 @@ n42-26 工作区回到 `hardening/gov5-cross-port`。原因是 P4 正式窗口�
 
 ## 后续
 
-**升级被这个吞吐回归挡住了，不是时机问题。** 原本的结论是"编译与测试全绿，等 P6
-完成就可以切"；E2E 之后要改成"先定位 -32% 的出块回归，再谈切换"。8 秒 slot 下
-（场景 4 实测 7.7s）还看不出问题，4 秒 slot 就掉到 5.87s——生产目标是 8 秒 slot，
-当前余量掩盖了它，但这是在把余量吃掉。
+**吞吐回归已定位并修复**，详见 `devlog-138`：根因是 upstream `197481f0c` 把
+`DEFAULT_MEMORY_BLOCK_BUFFER_TARGET` 从 0 改成 5，n42-node 在 CLI 解析前用
+`DefaultEngineValues::with_memory_block_buffer_target(0)` 固定回 0（`61ba867`，分支
+`verify/e2e-reth-20260726`）。修复后不带任何环境变量覆盖，场景 1 回到 101 块 /
+3.97s / 最大 5s / 零慢间隔，六场景全绿。**reth 未做任何修改。**
 
-顺序：
+因此升级本身不再有已知阻塞。剩下的是流程：
 
-1. 定位回归提交：在 `chore/reth-upstream-20260726` 上对嫌疑提交做二分，每次跑场景 1
-   取出块数（101 vs 69 的区分度足够，单次即可判定）；
-2. 判断是配置可调（如 in-memory block 窗口）还是需要适配 n42 的 state-root 定制；
-3. 修复或规避后重跑六场景，确认场景 1 回到 100 块量级；
-4. 再走原计划：切基线 → 更新 `CLAUDE.md` 基线一节与 `.github/workflows/*.yml` 的
-   checkout ref → 全量门禁 → 合入。
+1. 等 P6 24 小时替换窗口完成、interop 合入 `main`（避免与真机构建基线分叉）；
+2. 切 `chore/reth-upstream-20260726` 为基线；
+3. 更新 `CLAUDE.md` 基线一节与 `.github/workflows/*.yml` 的 checkout ref；
+4. Linux CI 上跑一遍完整门禁——本轮 E2E 在 Windows 原生环境，吞吐绝对值不可直接
+   外推；
+5. 合入。
 
-在此之前 **`CLAUDE.md` 记载的唯一正确基线仍是 `chore/reth-upstream-20260719`**。
-`../reth` 已切回该分支，`n42-node` 也已在其上重建（对照实验的产物），当前工作区
-就是正确基线。
+在此之前 **`CLAUDE.md` 记载的唯一正确基线仍是 `chore/reth-upstream-20260719`**，
+不要因为回归已修就提前切换——切换的前置条件是 P6 完成，与本次修复无关。
