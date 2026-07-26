@@ -720,27 +720,13 @@ impl ConsensusEngine {
             .iter()
             .map(|(_, _, _, _, public_key)| *public_key)
             .collect::<Vec<_>>();
-        let bad = match self.signing_profile {
-            ConsensusSigningProfile::Native => n42_primitives::bls::batch_verify_with_fallback(
-                &signing_messages,
-                &signatures,
-                &public_keys,
-            )
+        let bad = self
+            .signing_profile
+            .batch_verify(&signing_messages, &signatures, &public_keys)
             .err()
             .unwrap_or_default()
             .into_iter()
-            .collect::<HashSet<_>>(),
-            ConsensusSigningProfile::H2V4(_) => candidates
-                .iter()
-                .enumerate()
-                .filter_map(|(position, (_, _, message, signature, public_key))| {
-                    (!self
-                        .signing_profile
-                        .verify_single(public_key, message, signature))
-                    .then_some(position)
-                })
-                .collect(),
-        };
+            .collect::<HashSet<_>>();
 
         let mut verified_proofs = vec![None; messages.len()];
         for (candidate_position, (message_position, proof, ..)) in candidates.iter().enumerate() {
