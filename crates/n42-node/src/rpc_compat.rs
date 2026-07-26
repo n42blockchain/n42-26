@@ -1,14 +1,14 @@
 use jsonrpsee::{
     MethodResponse,
     core::{
-        middleware::{Batch, Notification},
+        middleware::{Batch, BatchEntry, Notification},
         server::{BatchResponseBuilder, ResponsePayload as MethodResponsePayload},
     },
     server::middleware::rpc::RpcServiceT,
     types::{Request, Response, ResponsePayload},
 };
 use serde_json::Value;
-use std::future::Future;
+use std::{collections::HashSet, future::Future};
 use tower::Layer;
 
 /// Keeps gov5 H2's established JSON-RPC response shape while sharing reth's Ethereum RPC server.
@@ -70,9 +70,19 @@ where
     }
 
     fn batch<'a>(&self, req: Batch<'a>) -> impl Future<Output = Self::BatchResponse> + Send + 'a {
-        let rewrite = self.enabled;
+        let rewrite_ids = self
+            .enabled
+            .then(|| batch_eth_rewrite_ids(&req))
+            .unwrap_or_default();
         let inner = self.inner.clone();
-        async move { normalize_response(inner.batch(req).await, rewrite) }
+        async move {
+            let response = inner.batch(req).await;
+            if rewrite_ids.is_empty() {
+                response
+            } else {
+                normalize_batch_response(response, Some(&rewrite_ids))
+            }
+        }
     }
 
     fn notification<'a>(
@@ -81,6 +91,24 @@ where
     ) -> impl Future<Output = Self::NotificationResponse> + Send + 'a {
         self.inner.notification(notification)
     }
+}
+
+fn batch_eth_rewrite_ids(batch: &Batch<'_>) -> HashSet<jsonrpsee::types::Id<'static>> {
+    let mut eth_ids = HashSet::new();
+    let mut other_ids = HashSet::new();
+    for entry in batch.iter().flatten() {
+        let BatchEntry::Call(request) = entry else {
+            continue;
+        };
+        let id = request.id().into_owned();
+        if request.method.starts_with("eth_") {
+            eth_ids.insert(id);
+        } else {
+            other_ids.insert(id);
+        }
+    }
+    eth_ids.retain(|id| !other_ids.contains(id));
+    eth_ids
 }
 
 fn normalize_gov5_metadata(value: &mut Value) -> bool {
@@ -169,7 +197,7 @@ fn normalize_response(response: MethodResponse, enabled: bool) -> MethodResponse
     if response.is_method_call() {
         normalize_method_response(response)
     } else if response.is_batch() {
-        normalize_batch_response(response)
+        normalize_batch_response(response, None)
     } else {
         response
     }
@@ -193,7 +221,10 @@ fn normalize_method_response(response: MethodResponse) -> MethodResponse {
         .with_extensions(extensions)
 }
 
-fn normalize_batch_response(response: MethodResponse) -> MethodResponse {
+fn normalize_batch_response(
+    response: MethodResponse,
+    rewrite_ids: Option<&HashSet<jsonrpsee::types::Id<'static>>>,
+) -> MethodResponse {
     let Ok(parsed) = serde_json::from_str::<Vec<Response<'_, Value>>>(response.as_ref()) else {
         return response;
     };
@@ -205,7 +236,9 @@ fn normalize_batch_response(response: MethodResponse) -> MethodResponse {
         let item = match item.payload {
             ResponsePayload::Success(result) => {
                 let mut result = result.into_owned();
-                changed |= normalize_gov5_result(&mut result);
+                if rewrite_ids.is_none_or(|ids| ids.contains(&id)) {
+                    changed |= normalize_gov5_result(&mut result);
+                }
                 MethodResponse::response(id, MethodResponsePayload::success(result), usize::MAX)
             }
             ResponsePayload::Error(error) => MethodResponse::error(id, error.into_owned()),
@@ -234,11 +267,11 @@ mod tests {
     use serde_json::json;
 
     fn success(result: Value) -> MethodResponse {
-        MethodResponse::response(
-            Id::Number(7),
-            MethodResponsePayload::success(result),
-            usize::MAX,
-        )
+        success_with_id(Id::Number(7), result)
+    }
+
+    fn success_with_id(id: Id<'static>, result: Value) -> MethodResponse {
+        MethodResponse::response(id, MethodResponsePayload::success(result), usize::MAX)
     }
 
     #[test]
@@ -349,5 +382,70 @@ mod tests {
         assert_eq!(value[0]["result"], json!({"hash": "0x01"}));
         assert_eq!(value[1]["error"]["code"], -32000);
         assert_eq!(value[1]["error"]["message"], "unchanged");
+    }
+
+    #[test]
+    fn normalizes_only_eth_method_ids_in_mixed_batch() {
+        let mut requests = Batch::new();
+        requests.push(Request::borrowed(
+            "eth_getTransactionReceipt",
+            None,
+            Id::Number(7),
+        ));
+        requests.push(Request::borrowed(
+            "n42_getMobileReceipt",
+            None,
+            Id::Number(8),
+        ));
+        requests.push(Request::borrowed("debug_traceBlock", None, Id::Number(9)));
+        let rewrite_ids = batch_eth_rewrite_ids(&requests);
+        assert_eq!(rewrite_ids, HashSet::from([Id::Number(7)]));
+
+        let mut batch = BatchResponseBuilder::new_with_limit(usize::MAX);
+        batch
+            .append(success_with_id(
+                Id::Number(8),
+                json!({"blockTimestamp": "0x02", "logs": [], "topics": []}),
+            ))
+            .unwrap();
+        batch
+            .append(success_with_id(
+                Id::Number(7),
+                json!({"blockTimestamp": "0x02", "logs": [], "topics": []}),
+            ))
+            .unwrap();
+        batch
+            .append(success_with_id(
+                Id::Number(9),
+                json!({"blockTimestamp": "0x02", "logs": [], "topics": []}),
+            ))
+            .unwrap();
+
+        let normalized = normalize_batch_response(
+            MethodResponse::from_batch(batch.finish()),
+            Some(&rewrite_ids),
+        );
+        let value: Value = serde_json::from_str(normalized.as_ref()).unwrap();
+        assert_eq!(
+            value[0]["result"],
+            json!({"blockTimestamp": "0x02", "logs": [], "topics": []})
+        );
+        assert_eq!(value[1]["result"], json!({"logs": null, "topics": null}));
+        assert_eq!(
+            value[2]["result"],
+            json!({"blockTimestamp": "0x02", "logs": [], "topics": []})
+        );
+    }
+
+    #[test]
+    fn ambiguous_duplicate_id_is_not_rewritten() {
+        let mut requests = Batch::new();
+        requests.push(Request::borrowed("eth_getLogs", None, Id::Number(7)));
+        requests.push(Request::borrowed(
+            "n42_getMobileReceipt",
+            None,
+            Id::Number(7),
+        ));
+        assert!(batch_eth_rewrite_ids(&requests).is_empty());
     }
 }
