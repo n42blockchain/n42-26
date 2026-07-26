@@ -584,7 +584,9 @@ not exercise that path, and no source, binary, database, acceptance value, or
 window process was changed. The discovery, mobile-RPC risk, intentional
 Gov5-only `eth_getLogs` quantity shape, and post-window acceptance tests are
 recorded in `t9-rpc-batch-method-scope-discovery.jsonl`. T9 must close before
-final delivery; it does not inherit or erase any eligible P4 time.
+final delivery; it does not inherit or erase any eligible P4 time. Participant
+activation is fail-closed behind `T9.PASS`, which will bind the post-fix source,
+binary, and replacement finalizer hashes.
 
 A fail-closed finalizer is armed against the formal monitor. It cannot release
 the burst unless every sample, historical empty-block interval, lag bound, and
@@ -757,12 +759,20 @@ lag at most four, `observerReadOnly=true`, and
 one healthy sample; that control-plane launch failure and its correction are
 preserved, while the original observer stream remained healthy throughout.
 No participant activation or consensus-state write occurred. The fresh P6
-finalizer also proves continuity from the completed formal observer stream
+finalizer proves continuity from the completed formal observer stream
 through the post-threshold extension, the final overlap, and this durable T2
 overlap, with every internal and handoff gap bounded at 120 seconds. It stops
 all observer guards immediately before activation and is itself bound by
 `T2.PASS` at SHA-256
 `8f0091b1f78936387b2e6acd43e085eb721069ad6f1dbd6454bb28d63b1dbb83`.
+The final-overlap monitor ended naturally at `2026-07-26T05:30:00Z` after
+overlapping the durable stream; the durable stream and its independent guard
+remain live. After T9 was registered, the waiting old-binary P6 finalizer was
+stopped before `P4.PASS` and before any participant state existed. A release
+barrier now requires both `P4.PASS` and a hash-bound `T9.PASS` before executing
+the post-fix P6 finalizer. This control-only rearm did not restart P4, any node,
+or the observer and is archived in
+`p6-t9-release-barrier-rearm-audit.jsonl`.
 
 The observer intentionally does not rewrite voting consensus state: its
 snapshot remains at view 900 while its Reth/QMDB head continues following the
