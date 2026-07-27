@@ -40,8 +40,10 @@
 - T2 已选定并部署 `f49422f` / `c0ce2778...`；T7 的 QC 与 TC 三个调用点也已纳入。
 - `f49422f` 的 P4 控制进程在 45,186 秒后退出。此前 736 个样本全部健康，但未达到
   86,400 秒且留下不可接受的采样空洞，因此整段保留并排除，P4 仍须从零重跑。
-- T9 的 RPC batch 方法域修复已推送为 `6180ec5` + `1b8d52b`；定向回归通过，
-  `T9.PASS` 仍等待全门禁、隔离 release 构建与 pinned SHA-256。
+- T9 的 RPC batch 方法域修复已推送为 `6180ec5` + `1b8d52b`。定向回归 7/7、
+  format/check/Clippy、完整 `cargo test --workspace`（46 条结果记录、零失败）及隔离
+  locked release 构建全部通过；`T9.PASS` 已于 `2026-07-27T06:01:08Z` 关闭，
+  pinned SHA-256 为 `b03eb3eddcd14a5b81fac6af900cd12b1819221507308fc0e77965c7edc55fae`。
 - P6 participant 从未激活。observer 连续守卫退出后，原 observer 停在 65,537；
   使用原二进制、原数据库重启时在默认 65,536 replay-depth 边界 fail-closed。只读审计
   证明 65,537 条 retained block 全部 parent 完整、空 operations、root 等于认证 base；
@@ -204,12 +206,15 @@ T4 的 24 小时窗口与回滚就绪，不并行替换多个。
 
 ---
 
-### T9 — RPC batch 方法域收口（本机 + 真机 / 前置新 P4）
+### T9 — RPC batch 方法域收口 ✅ 已完成（本机 + 真机 / 前置新 P4）
 
 `Gov5H2` 下逐条按请求 method 和 response ID 关联，只允许 `eth_*` 成功响应进入
 递归归一化；`n42_*`、`debug_*`、`trace_*`、通知、错误与 ambiguous duplicate ID
-保持原样。完成全工作区门禁和隔离 release 构建后写 `T9.PASS`，其 source/binary
-SHA-256 是下一轮 P4 和 P6 的唯一基线。
+保持原样。实现提交为 `6180ec5` + `1b8d52b`，隔离构建 source checkpoint 为
+`a72180e`。全工作区门禁与实际 release binary 启动验证均 PASS；不可变清单为
+`runtime-11-production-qualification/evidence/t9-rpc-batch-method-scope-pass.jsonl`。
+下一轮 P4 与后续 P6 participant 的唯一 Rust binary 基线为
+`b03eb3eddcd14a5b81fac6af900cd12b1819221507308fc0e77965c7edc55fae`。
 
 ---
 

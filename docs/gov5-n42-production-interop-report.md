@@ -33,6 +33,8 @@ Pushed implementation commits:
 - n42-26: `afafd37` (`fix(interop): normalize gov5 RPC transaction metadata`)
 - n42-26: `851c1b7` (`fix(interop): normalize empty gov5 receipt logs`)
 - n42-26: `f49422f` (`fix(interop): normalize gov5 log response shapes`)
+- n42-26: `6180ec5` (`fix(rpc): scope batch normalization by request method`)
+- n42-26: `1b8d52b` (`style(rpc): make disabled batch path explicit`)
 - N42-gov5: `b027f3040` (`feat(interop): harden Gov5 mixed-client operation`)
 - N42-gov5: `34021c3f7` (`test: make hive genesis fixture self-contained`)
 - N42-gov5: `a70f7cf68` (`test: share hive fixture across packages`)
@@ -64,6 +66,8 @@ in clean checkouts:
   `7fcec8e3ad22fab37d265c5509fb461684f248e57e9f5ded02e79ea3c947ce31`
 - Rust selected T2 `n42-node`, built from `f49422f`:
   `c0ce2778b1deaa329416d56ced26b2c40463b6133a0a172281c3d077191e1e4d`
+- Rust selected T9 `n42-node`, isolated locked release built from checkpoint
+  `a72180e`: `b03eb3eddcd14a5b81fac6af900cd12b1819221507308fc0e77965c7edc55fae`
 - Gov5 `n42`:
   `fa02d37c1e7b480a1c3196d318cd7bc79fb2d4247e5977331b79151873a82ae7`
 - Gov5 `n42-qmdb-export`:
@@ -82,9 +86,9 @@ acceptance.
 The P6 observer began with immutable Rust hash
 `73cd5bc9cf59715a0126a2e7cb6697b1ef5de30a28933c53eadfd092c341b10c`.
 Observer qualification remains read-only and keeps that startup binary
-unchanged for the entire observer window. Selected Rust hash `c0ce2778...`
+unchanged for the entire observer window. Selected T9 Rust hash `b03eb3ed...`
 and Gov5 hash `fa02d37c...` are staged separately for the maintenance-window
-participant phase.
+participant phase; the superseded T2 Rust artifact remains preserved.
 
 The selected T2 source baseline is `f49422f`, and the Gov5 branch baseline is
 `a35aa6293`; see the T2 gate evidence and `source-remote-ref-audit.jsonl`.
@@ -105,7 +109,7 @@ verified integration branch `integration/gov5-interop-main` is pushed at
 the audit fixes, and the four cross-port hardening commits. `main` remains at
 `3bbad4b` until the replacement P4 window ends, so the measured runtime and
 delivery baseline cannot be confused.
-The latest audit-plan tip is `3332d2a`; the authoritative H2-v4
+The T9 isolated-build source checkpoint is `a72180e`; the authoritative H2-v4
 batch-verification tip is `e89425b`. Its exact three-call-site content is
 present on the live branch as `8134235` plus `04ab69e`; a tree comparison of
 the affected consensus and devlog paths is exact. T2 full gates passed against
@@ -156,9 +160,9 @@ or removed.
 | P1 follower and catch-up | PASS | authenticated reverse/concurrent ancestry logs, 1,000+ following blocks, persisted restart recovery |
 | P2 automatic bootstrap and recovery | PASS | chain-bound bundle, blank-datadir materialization, replay receipt, cold restart |
 | P3 bidirectional leader handoff | PASS | `p3-5gov-2rust-28views-pass.jsonl`; 44 consecutive exact blocks covering more than two rotations |
-| P4 fault and lifecycle matrix | IN PROGRESS | the prior completed window and failed burst parity are preserved and excluded; the `f49422f` rerun accumulated 736 healthy samples over 45,186 seconds before its control process exited, so that stream is also preserved and excluded; a T9-bound binary must restart P4 from zero |
+| P4 fault and lifecycle matrix | IN PROGRESS | the prior completed window and failed burst parity are preserved and excluded; the `f49422f` rerun accumulated 736 healthy samples over 45,186 seconds before its control process exited, so that stream is also preserved and excluded; T9 is PASS and pinned binary `b03eb3ed...` must restart P4 from zero |
 | P5 minimal full archive+ parity | PASS | 209 RPC comparisons, 22 offline proof checks, export/import and corruption recovery |
-| P6 existing seven-node rollout | IN PROGRESS | observer cold bootstrap, exact epoch crossing, and the independent 24-hour read-only window pass; the post-window continuity controller exited and the stopped observer now fails closed while validating one retained QMDB branch, so no participant has been activated and the original seven Gov5 validators remain exact |
+| P6 existing seven-node rollout | IN PROGRESS | observer cold bootstrap, exact epoch crossing, and the independent 24-hour read-only window pass; the retained branch was proven complete and exceeded the default replay-depth by one, then the same binary/database passed two cold starts with explicit depth 131,072; continuity-v2 is active, no participant has been activated, and the original seven Gov5 validators remain exact |
 
 ## P0 — safety and participation baseline
 
@@ -607,9 +611,16 @@ inner service is called; only successful responses whose IDs map uniquely to
 remain shape-compatible with their single-call paths, while an ID reused
 across eligible and ineligible method families is conservatively left
 unchanged. Seven focused regressions, including mixed families and ambiguous
-duplicate IDs, pass. The commits are pushed, but `T9.PASS` remains absent
-until the full workspace gates, isolated release build, and pinned binary
-hash finish.
+duplicate IDs, pass. Format, all-target check, all-target Clippy with warnings
+denied, and the complete workspace test run all pass; the latter contains 46
+result records and zero failures. A `--locked` release build in an empty
+isolated target completed in 39 minutes 39 seconds, and the resulting arm64
+Mach-O passed an actual `--version` launch. `T9.PASS` was written at
+`2026-07-27T06:01:08Z` and binds source checkpoint `a72180e`, binary SHA-256
+`b03eb3eddcd14a5b81fac6af900cd12b1819221507308fc0e77965c7edc55fae`,
+and SHA-256 values for every gate log. Exact binary copies are staged in both
+runtime artifact directories without replacing any active process. The
+authoritative audit is `t9-rpc-batch-method-scope-pass.jsonl`.
 
 A fail-closed finalizer is armed against the formal monitor. It cannot release
 the burst unless every sample, historical empty-block interval, lag bound, and
@@ -843,8 +854,9 @@ spliced into v2. The recovery, compression, and v2 handoff are archived in
 After T9 was registered, the waiting old-binary P6 finalizer was
 stopped before `P4.PASS` and before any participant state existed. A release
 barrier now requires both `P4.PASS` and a hash-bound `T9.PASS` before executing
-the post-fix P6 finalizer. This control-only rearm did not restart P4, any node,
-or the observer and is archived in
+the post-fix P6 finalizer. T9 is now satisfied by `b03eb3ed...`; P4 remains
+pending, so participant activation is still blocked. This control-only rearm
+did not restart P4, any node, or the observer and is archived in
 `p6-t9-release-barrier-rearm-audit.jsonl`.
 
 The observer intentionally does not rewrite voting consensus state: its
@@ -966,9 +978,10 @@ ineligible because its controller exited before the threshold; both prior
 windows remain immutable. This post-T2 alignment is independently recorded in
 `overall-goal-alignment-f49422f-p4-restart-audit.jsonl`; it reports no
 deviation and does not claim completion. T9 was subsequently added as a
-response-scope gate and is now the selected baseline for the next P4 window.
+response-scope gate and passed on pinned binary `b03eb3ed...`, now the selected
+baseline for the next P4 window.
 No elapsed time from either excluded P4 stream will be credited to the new
-binary. The required order remains close T9, restart and pass P4 from zero,
+binary. The required order is now restart and pass P4 from zero,
 qualify the P6 observer recovery and continuity handoff, activate the single
 participant for its 24-hour replacement window,
 active rollback rehearsal, final gates, main integration, report commit, and
