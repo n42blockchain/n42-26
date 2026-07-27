@@ -48,6 +48,10 @@
   max lag 分别为 0 和 1，且实机混合 batch 保持 `n42_*` 单次/批量响应一致。新 P4
   已于 `2026-07-27T06:38:31Z` 从零起表；旧窗口时间没有复用，正式窗口期间禁止换
   binary。86,400 秒阈值不早于 `2026-07-28T06:38:31Z`。
+- `2026-07-27T19:42:25Z` 的 12h+ 不可变里程碑为 775 样本 / 46,992 秒 / 零失败 /
+  max lag 1 / 最大采样间隙 64 秒 / 推进 8,003 块；warning/deadline 计数器与基线
+  完全相同，两 Rust CommitQC/hash 一致且 equivocation 为零。该记录只标记
+  `PASS_MILESTONE_ONLY`，不提前关闭 P4。
 - P6 participant 从未激活。observer 连续守卫退出后，原 observer 停在 65,537；
   使用原二进制、原数据库重启时在默认 65,536 replay-depth 边界 fail-closed。只读审计
   证明 65,537 条 retained block 全部 parent 完整、空 operations、root 等于认证 base；

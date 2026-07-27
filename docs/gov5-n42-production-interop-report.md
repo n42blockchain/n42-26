@@ -646,6 +646,17 @@ time from any prior P4 stream is credited. The 86,400-second threshold is not
 reachable before `2026-07-28T06:38:31Z`; the 90,000-second control duration
 provides sample-count and timing margin before the signed burst finalizer.
 
+The immutable 12-hour-plus milestone at `2026-07-27T19:42:25Z` records 775
+samples over 46,992 seconds, zero failures, maximum lag one, maximum sample
+gap 64 seconds, and 8,003 blocks of progress. Every newly covered block was
+empty and exact across the seven endpoints. Warning and deadline counters
+remain byte-for-byte equal to the baseline; both Rust validators report the
+same CommitQC view and hash, validator count seven, and zero authenticated
+equivocation. The concurrent P6 observer recovery stream had 892 read-only
+samples with zero failures and maximum lag one. This is deliberately only
+`PASS_MILESTONE_ONLY`; no burst was released and neither P4 nor P6 is closed.
+The audit is `p4-b03eb3ed-formal-12h-plus-milestone-audit.jsonl`.
+
 A fail-closed finalizer is armed against the formal monitor. It cannot release
 the burst unless every sample, historical empty-block interval, lag bound, and
 all warning and deadline counters pass. An independent 30-second guard also
