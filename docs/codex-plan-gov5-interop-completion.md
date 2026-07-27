@@ -43,8 +43,10 @@
 - T9 的 RPC batch 方法域修复已推送为 `6180ec5` + `1b8d52b`；定向回归通过，
   `T9.PASS` 仍等待全门禁、隔离 release 构建与 pinned SHA-256。
 - P6 participant 从未激活。observer 连续守卫退出后，原 observer 停在 65,537；
-  使用原二进制、原数据库重启时对一条 retained QMDB branch 校验失败并 fail-closed。
-  原七个 Gov5 节点继续精确一致。不得清库或跳过校验，须先完成 T10。
+  使用原二进制、原数据库重启时在默认 65,536 replay-depth 边界 fail-closed。只读审计
+  证明 65,537 条 retained block 全部 parent 完整、空 operations、root 等于认证 base；
+  显式使用 131,072 深度后，同一二进制和数据库完整验签、追平并保持只读。T10 的
+  continuity v2 已从 `2026-07-27T04:44:25Z` 起表，participant 仍未激活。
 
 ## 红线（任何任务都不得突破）
 
@@ -213,13 +215,14 @@ SHA-256 是下一轮 P4 和 P6 的唯一基线。
 
 ### T10 — P6 observer retained-branch 恢复（真机 / 前置 T9、T3）
 
-保留失败 observer 原库与全部日志，不原地修复。先在 manifest 校验的副本上把
-`gov5_qmdb_branches.bin` 的唯一失败 block 定位到具体 hash、parent、root 和失败类别，
-并与 Reth canonical archive 及认证 QMDB checkpoint 对拍。只有能证明待排除项是
-非 canonical、且恢复算法自身 fail-closed 并有 corruption 回归时，才允许生成新的
-observer/participant 候选副本。候选必须用 T9 pinned binary 冷启动、追平七 Gov5、
-保持 `hasCommittedQc=false` 与 vote log 不变，再开启新的 durable continuity stream。
-任何无法证明的分支一律拒绝恢复，不得删除文件后“重新同步”。
+保留失败 observer 原库与全部日志，不原地修复。先只读解析
+`gov5_qmdb_branches.bin`，定位具体失败类别，并与认证 QMDB checkpoint 对拍。若是
+missing parent、divergent root 或环，只有能证明待排除项非 canonical 且恢复算法自身
+fail-closed 时才允许生成候选副本；若只是完整 canonical lineage 超过配置深度，则提高
+显式 replay depth 后仍须从认证 base 完整重放，不能跳过任何 block。候选必须用 pinned
+binary 冷启动、追平七 Gov5、保持 `hasCommittedQc=false` 与 vote log 不变，再开启
+新的 durable continuity stream。任何无法证明的分支一律拒绝恢复，不得删除文件后
+“重新同步”。
 
 ---
 

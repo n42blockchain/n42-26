@@ -812,6 +812,34 @@ observer database is quarantined from participant preparation until its
 retained branch can be authenticated against the execution archive and a
 fail-closed recovery is qualified.
 
+The read-only branch audit resolved the combined error without weakening it.
+The persisted file contains exactly 65,537 retained blocks: every parent is
+present, every operation list is empty, every stored root equals the
+authenticated base root, and there is no self-parent. The one rejected block
+was therefore the depth-65,537 boundary against the default 65,536 replay
+limit, not corrupt or divergent state. With the unchanged `73cd5bc9...`
+binary and database, `N42_QMDB_REPLAY_DEPTH=131072` replayed every retained
+block from the authenticated base, opened RPC, caught up, and then remained
+exact with all seven Gov5 endpoints for more than five hours. At the recorded
+milestone all eight endpoints matched at height 78,062; the observer still
+reported `hasCommittedQc=false`, and the vote-log hash remained
+`374708ff...`.
+
+The verbose recovery/catch-up log reached 128,404,080,710 bytes before any
+new formal continuity stream existed. It was stopped cleanly and recoverably
+compressed to a 4,198,278,956-byte Zstd archive with content checksum and
+SHA-256 recorded; no database file was removed or rewritten by log rotation.
+A second cold start with the same binary, database, and explicit replay depth
+again passed full validation and rejoined exactly. The eligible continuity-v2
+stream started at `2026-07-27T04:44:25Z`; its independent guard binds the
+observer and monitor PIDs, maximum sample age 150 seconds, maximum lag four,
+exact roots, read-only status, and no participant activation. An earlier
+two-sample controller-launch preflight is explicitly excluded rather than
+spliced into v2. The recovery, compression, and v2 handoff are archived in
+`p6-observer-replay-depth-recovery-20260727.jsonl`,
+`p6-observer-depth-recovery-launch-handoff.jsonl`, and
+`p6-observer-depth-recovery-v2-until-activation.jsonl`.
+
 After T9 was registered, the waiting old-binary P6 finalizer was
 stopped before `P4.PASS` and before any participant state existed. A release
 barrier now requires both `P4.PASS` and a hash-bound `T9.PASS` before executing
