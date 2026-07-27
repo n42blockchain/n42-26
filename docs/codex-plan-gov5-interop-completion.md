@@ -44,6 +44,10 @@
   format/check/Clippy、完整 `cargo test --workspace`（46 条结果记录、零失败）及隔离
   locked release 构建全部通过；`T9.PASS` 已于 `2026-07-27T06:01:08Z` 关闭，
   pinned SHA-256 为 `b03eb3eddcd14a5b81fac6af900cd12b1819221507308fc0e77965c7edc55fae`。
+- pinned binary 已按 Rust-1 → Rust-2 顺序部署，两个独立 5 分钟七端点窗口均零失败，
+  max lag 分别为 0 和 1，且实机混合 batch 保持 `n42_*` 单次/批量响应一致。新 P4
+  已于 `2026-07-27T06:38:31Z` 从零起表；旧窗口时间没有复用，正式窗口期间禁止换
+  binary。86,400 秒阈值不早于 `2026-07-28T06:38:31Z`。
 - P6 participant 从未激活。observer 连续守卫退出后，原 observer 停在 65,537；
   使用原二进制、原数据库重启时在默认 65,536 replay-depth 边界 fail-closed。只读审计
   证明 65,537 条 retained block 全部 parent 完整、空 operations、root 等于认证 base；
@@ -64,7 +68,8 @@
 
 ### T1 — P4 当前窗口判定（真机 / 阻塞全局）
 
-**前置**：无。窗口约在 `2026-07-25T22:06Z` 达到 86,400 秒阈值。
+**当前状态**：T9 pinned binary 的全新窗口已从 `2026-07-27T06:38:31Z` 起表；
+acceptance 仍需 ≥86,400 秒、≥1,400 样本，控制命令留有 90,000 秒运行余量。
 
 **步骤**
 1. 让窗口自然跑完，**不要因为 T2 的修复而提前换二进制**。

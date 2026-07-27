@@ -160,7 +160,7 @@ or removed.
 | P1 follower and catch-up | PASS | authenticated reverse/concurrent ancestry logs, 1,000+ following blocks, persisted restart recovery |
 | P2 automatic bootstrap and recovery | PASS | chain-bound bundle, blank-datadir materialization, replay receipt, cold restart |
 | P3 bidirectional leader handoff | PASS | `p3-5gov-2rust-28views-pass.jsonl`; 44 consecutive exact blocks covering more than two rotations |
-| P4 fault and lifecycle matrix | IN PROGRESS | the prior completed window and failed burst parity are preserved and excluded; the `f49422f` rerun accumulated 736 healthy samples over 45,186 seconds before its control process exited, so that stream is also preserved and excluded; T9 is PASS and pinned binary `b03eb3ed...` must restart P4 from zero |
+| P4 fault and lifecycle matrix | IN PROGRESS | the prior completed window and failed burst parity and the interrupted `f49422f` stream are preserved and excluded; T9 is PASS, pinned binary `b03eb3ed...` passed one-at-a-time rollout, and the new zero-transaction window started from zero at `2026-07-27T06:38:31Z` |
 | P5 minimal full archive+ parity | PASS | 209 RPC comparisons, 22 offline proof checks, export/import and corruption recovery |
 | P6 existing seven-node rollout | IN PROGRESS | observer cold bootstrap, exact epoch crossing, and the independent 24-hour read-only window pass; the retained branch was proven complete and exceeded the default replay-depth by one, then the same binary/database passed two cold starts with explicit depth 131,072; continuity-v2 is active, no participant has been activated, and the original seven Gov5 validators remain exact |
 
@@ -622,6 +622,30 @@ and SHA-256 values for every gate log. Exact binary copies are staged in both
 runtime artifact directories without replacing any active process. The
 authoritative audit is `t9-rpc-batch-method-scope-pass.jsonl`.
 
+The pinned T9 binary was then introduced into the disposable committee one
+Rust validator at a time without changing either database, key, port, or
+consensus configuration. Rust-1 passed 30 exact seven-endpoint samples over
+299 seconds with zero failures, maximum lag zero, and 54 blocks of progress.
+Only then was Rust-2 replaced; both new binaries passed another 30 samples
+over 299 seconds with zero failures, maximum lag one, and 51 blocks of
+progress. Both live mixed-batch probes preserved the exact single-call
+`n42_consensusStatus` shape and the untouched `debug_*` method error, both
+validators retained CommitQC with validator count seven, and authenticated
+equivocation remained zero. Their executable mappings independently hash to
+`b03eb3ed...`.
+
+The fresh P4 zero-transaction stream started at `2026-07-27T06:38:31Z`.
+Its first sample matched all seven endpoints at height 57,184 with lag zero,
+the authenticated state and receipt roots, and zero-transaction coverage
+through that exact height. The monitor, independent consensus/counter guard,
+and hash-bound finalizer are all active; no failure artifact is nonempty.
+The immutable baseline is `p4-b03eb3ed-formal-soak-baseline.jsonl`, the
+authoritative stream is `p4-b03eb3ed-zero-tx-24h.jsonl`, and the rollout plus
+restart audit is `t9-b03eb3ed-rollout-and-p4-restart-audit.jsonl`. No elapsed
+time from any prior P4 stream is credited. The 86,400-second threshold is not
+reachable before `2026-07-28T06:38:31Z`; the 90,000-second control duration
+provides sample-count and timing margin before the signed burst finalizer.
+
 A fail-closed finalizer is armed against the formal monitor. It cannot release
 the burst unless every sample, historical empty-block interval, lag bound, and
 all warning and deadline counters pass. An independent 30-second guard also
@@ -978,10 +1002,10 @@ ineligible because its controller exited before the threshold; both prior
 windows remain immutable. This post-T2 alignment is independently recorded in
 `overall-goal-alignment-f49422f-p4-restart-audit.jsonl`; it reports no
 deviation and does not claim completion. T9 was subsequently added as a
-response-scope gate and passed on pinned binary `b03eb3ed...`, now the selected
-baseline for the next P4 window.
+response-scope gate and passed on pinned binary `b03eb3ed...`. That binary
+passed one-at-a-time rollout and is now the active fresh P4 baseline.
 No elapsed time from either excluded P4 stream will be credited to the new
-binary. The required order is now restart and pass P4 from zero,
+binary. The required order is now let this new P4 window finish and pass,
 qualify the P6 observer recovery and continuity handoff, activate the single
 participant for its 24-hour replacement window,
 active rollback rehearsal, final gates, main integration, report commit, and
