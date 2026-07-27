@@ -1,0 +1,18 @@
+[package]
+name = "n42-rbtc-embedding-test"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dev-dependencies]
+bitcoin = "=0.32.8"
+rbtc = { path = "../../../rBTC" }
+reth-tasks = { path = "../../../reth/crates/tasks" }
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+
+[patch.crates-io]
+bitcoinconsensus = { path = "../../../rBTC/vendor/bitcoinconsensus" }
+redb = { path = "../../../rBTC/vendor/redb" }
