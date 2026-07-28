@@ -1213,3 +1213,15 @@ running freshness/gap guard PID 64578, and finalizer PID 64585 were alive
 after launch, with no failure sentinel. The 86,400-second acceptance threshold
 cannot be reached before `2026-07-29T08:40:30Z`; no time from the excluded
 stream is credited.
+
+At `2026-07-28T11:15:30Z`, the first post-restart immutable milestone was
+`PASS_MILESTONE_ONLY`: 153 P4 samples covered 9,247 seconds with zero
+failures, maximum lag one, maximum sample gap 63 seconds, and 1,571 blocks of
+progress. Zero-transaction coverage was contiguous, all warning/deadline
+counters matched baseline, both Rust nodes reported the same committed view
+and hash with a valid CommitQC, and authenticated equivocations remained
+zero. All seven execution endpoints were exact. The concurrent P6-v3 stream
+had 156 healthy read-only samples, maximum lag one, and maximum gap 62
+seconds. The audit is
+`p4-current-main-replay1m-formal-2h-plus-milestone-audit.jsonl`; it does not
+close P4 or release the burst.

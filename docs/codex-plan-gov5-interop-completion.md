@@ -101,6 +101,10 @@
   2/2 PASS，baseline 高度 68,722，首正式样本高度 68,723、lag 0。monitor、实时
   gap guard 和 finalizer 全部存活，86,400 秒阈值不早于
   `2026-07-29T08:40:30Z`。
+- `2026-07-28T11:15:30Z` 的 2h+ 不可变里程碑为 153 样本 / 9,247 秒 / 零失败 /
+  max lag 1 / 最大采样间隙 63 秒 / 推进 1,571 块。零交易验证连续，warning/deadline
+  计数器未变，两 Rust committed view/hash 一致且 equivocation 为零；P6-v3 同期
+  156 样本、零失败、最大间隙 62 秒。该记录仅为 `PASS_MILESTONE_ONLY`。
 
 ## 红线（任何任务都不得突破）
 
