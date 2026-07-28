@@ -68,8 +68,14 @@ in clean checkouts:
   `c0ce2778b1deaa329416d56ced26b2c40463b6133a0a172281c3d077191e1e4d`
 - Rust selected T9 `n42-node`, isolated locked release built from checkpoint
   `a72180e`: `b03eb3eddcd14a5b81fac6af900cd12b1819221507308fc0e77965c7edc55fae`
+- Rust selected replay-horizon `n42-node`, built twice identically from
+  `8fa9c817c`:
+  `391185a473ee86f6ae4ec8d9ad7be3a458a7e7994ea7553c6852c64c7d8a236e`
 - Gov5 `n42`:
   `fa02d37c1e7b480a1c3196d318cd7bc79fb2d4247e5977331b79151873a82ae7`
+- Gov5 current-main integration `n42`, built twice identically from
+  `912a01d29`:
+  `86b61c2d710e09bf5efddac7631d450278930acd4671e6c74362de8e63057452`
 - Gov5 `n42-qmdb-export`:
   `faa7cf2c0dc4f21903313e0d4f679a88876607eca2b343f4938e4e3c79a2437b`
 - Gov5 `peerid`:
@@ -160,7 +166,7 @@ or removed.
 | P1 follower and catch-up | PASS | authenticated reverse/concurrent ancestry logs, 1,000+ following blocks, persisted restart recovery |
 | P2 automatic bootstrap and recovery | PASS | chain-bound bundle, blank-datadir materialization, replay receipt, cold restart |
 | P3 bidirectional leader handoff | PASS | `p3-5gov-2rust-28views-pass.jsonl`; 44 consecutive exact blocks covering more than two rotations |
-| P4 fault and lifecycle matrix | IN PROGRESS | the prior completed window and failed burst parity and the interrupted `f49422f` stream are preserved and excluded; T9 is PASS, pinned binary `b03eb3ed...` passed one-at-a-time rollout, and the new zero-transaction window started from zero at `2026-07-27T06:38:31Z` |
+| P4 fault and lifecycle matrix | IN PROGRESS | all prior failed or incomplete windows are preserved and excluded; the `b03eb3ed...` window failed closed at the 65,536 replay-depth boundary; Gov5 `912a01d29` / `86b61c2d...` and Rust `8fa9c817c` / `391185a4...` passed full gates, one-at-a-time rollout, complete retained-database replay, and three exact seven-endpoint comparisons; the independent five-minute preflight precedes a new zero-transaction window from zero |
 | P5 minimal full archive+ parity | PASS | 209 RPC comparisons, 22 offline proof checks, export/import and corruption recovery |
 | P6 existing seven-node rollout | IN PROGRESS | observer cold bootstrap, exact epoch crossing, and the independent 24-hour read-only window pass; the retained branch was proven complete and exceeded the default replay-depth by one, then the same binary/database passed two cold starts with explicit depth 131,072; continuity-v2 is active, no participant has been activated, and the original seven Gov5 validators remain exact |
 
@@ -1102,3 +1108,50 @@ reproducible build of `912a01d29`, one-at-a-time Gov5 rollout, the replay-depth
 fixed Rust binary, exact-root and cross-client preflights, and a completely new
 86,400-second zero-transaction window. `main` remains frozen until that
 baseline is selected and passes.
+
+## 2026-07-28 selected current-main and replay-horizon baseline
+
+The Gov5 integration branch is pushed at
+`integration/gov5-interop-current-main-20260727 @
+912a01d29fdc64d55b780be8d46e3dcd7519adb0`; the remote ref was re-read and
+matched exactly. Targeted consensus/RPC tests, `go test ./...`, and
+`go test -race ./...` pass. Two clean `make n42` builds produced the identical
+pinned SHA-256
+`86b61c2d710e09bf5efddac7631d450278930acd4671e6c74362de8e63057452`.
+No newer Gov5 `origin/main` existed at the selection checkpoint.
+
+The n42 replay-horizon branch is pushed at
+`feat/gov5-n42-live-interop @
+8fa9c817c4d99de21304a8bf7f6acd60374f6b9d`. Format, all-target check,
+Clippy with warnings denied, targeted replay tests, and the full workspace
+suite pass. Two release builds produced the identical pinned SHA-256
+`391185a473ee86f6ae4ec8d9ad7be3a458a7e7994ea7553c6852c64c7d8a236e`.
+The bounded default and the qualification launcher's explicit value are both
+1,048,576; explicit smaller limits still fail closed.
+
+The five Gov5 validators were stopped and replaced one at a time. Each
+graceful stop was followed by an immutable copy of its original database
+before the new process was started. The snapshot stream SHA-256 values for
+Gov1 through Gov5 are, in order:
+`3540d7416a9c78426db923aa6f73eddc9000f1d064b80edd52c517415e35f43e`,
+`88c9104f13c9806df32732206b94e84964dae9a51496aa8ecbc5f51133700dc8`,
+`9eda22f76c0eab9e86b13c0822a64f49ac3abb367110b6d699f1f5d7d3976043`,
+`23168aeb3e2441dace6715a6ae723e9581ad5218bdfe6332980c42d895fbb7cd`,
+and `ae94cc0d92f9530f3dda626d9aa068907f71df429785715341610182c8afdfbb`.
+
+The two Rust validators were then stopped and replaced one at a time, again
+without deleting or rewriting either retained database. Their pre-rollout
+snapshot stream SHA-256 values are
+`e79d7d37fa997a2d9e46b46c02f67b4a3f5095966458b400cc234500b93f7057`
+and
+`e98b16a253885ca606be4c5b4d51d7daf45deda630d71e6a7fe55cb72ac0b8f8`.
+Each new process replayed the complete retained lineage with the explicit
+1,048,576 limit before opening RPC and catching the live chain. Three
+successive comparisons across all five Gov5 and both Rust endpoints had one
+height, block hash, state root, and receipts root per round.
+
+P6 remains isolated from this rollout. Its observer, continuity monitor, and
+fail-closed guard are alive; samples remain `ok=true`, lag zero, read-only,
+and without a committed QC. No participant PID, participant directory, or
+replacement marker exists. n42 `origin/main` remains frozen at
+`3bbad4ba530bc8f93ee4aebcb64584c1b0b67da6`.

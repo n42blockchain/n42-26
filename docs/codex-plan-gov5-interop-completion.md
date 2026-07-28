@@ -58,6 +58,27 @@
   显式使用 131,072 深度后，同一二进制和数据库完整验签、追平并保持只读。T10 的
   continuity v2 已从 `2026-07-27T04:44:25Z` 起表，participant 仍未激活。
 
+### 2026-07-28 运行态更正
+
+- `b03eb3ed` 窗口已于 `2026-07-27T20:17:18Z` fail-closed：此前 810 样本 /
+  49,118 秒 / 零 parity 失败 / max lag 1，但两台 Rust 在第 65,538 块同时命中
+  `QMDB ancestry exceeds the configured replay depth 65536`。该窗口、日志与数据库
+  全部保留并排除，burst 未释放。
+- Gov5 当前 main 已在隔离分支
+  `integration/gov5-interop-current-main-20260727 @ 912a01d29` 完成整合并推送；
+  `go test ./...`、`go test -race ./...` 与两次可复现构建均 PASS，pinned binary
+  SHA-256 为 `86b61c2d710e09bf5efddac7631d450278930acd4671e6c74362de8e63057452`。
+  五个 Gov5 已逐台停机、保留快照、替换和追平，全程没有同时替换两台。
+- replay-horizon 修复已以 `9d26d38` 纳入；const 回归修正后的分支 tip 为
+  `8fa9c817c`（已推送）。format/check/Clippy/workspace tests、定向回归与两次 release
+  构建全部 PASS，pinned Rust SHA-256 为
+  `391185a473ee86f6ae4ec8d9ad7be3a458a7e7994ea7553c6852c64c7d8a236e`。
+  两台 Rust 使用原数据库、显式 replay depth `1,048,576` 逐台完成完整回放；替换后
+  三轮七端点 height/hash/state-root/receipts-root 精确一致。
+- 新基线的独立 5 分钟存活预检正在生成；通过并固化门禁证据后，P4 将以这两个 pinned
+  binary 从零起表。`main` 仍冻结在 `3bbad4b`，P6 observer/monitor/guard 继续只读，
+  participant 从未激活。
+
 ## 红线（任何任务都不得突破）
 
 - 不初始化、不重建、不格式化、不压缩、不清理、不删除任何既有七节点数据库。
@@ -72,7 +93,9 @@
 
 ### T1 — P4 当前窗口判定（真机 / 阻塞全局）
 
-**当前状态**：T9 pinned binary 的全新窗口已从 `2026-07-27T06:38:31Z` 起表；
+**当前状态**：`b03eb3ed` 窗口已因 65,536 replay-depth 边界失败并排除。Gov5
+`912a01d29` / `86b61c2d...` 与 Rust `8fa9c817c` / `391185a4...` 已完成逐台替换、
+原库回放和三轮七端点精确对拍；独立 5 分钟预检通过后，新正式窗口从零起表。
 acceptance 仍需 ≥86,400 秒、≥1,400 样本，控制命令留有 90,000 秒运行余量。
 
 **步骤**
@@ -255,8 +278,10 @@ authenticated recovery view 与 durable vote commitments/divergence report；RPC
 必须在公共加载入口统一恢复，否则 v2 重启会丢失 `PhaseTimedOut`。定向
 HotStuff/RPC 测试及 `go test ./...` 均 PASS。
 
-在线五个 Gov5 进程仍保持旧 binary，不在失败窗口事后热换。新 P4 启动前须先完成
-`912a01d29` 的可复现构建、逐台替换和 exact-root/wire preflight。
+`go test ./...` 与 `go test -race ./...` 均 PASS；两次 `make n42` 产物逐字节一致，
+pinned SHA-256 为 `86b61c2d710e09bf5efddac7631d450278930acd4671e6c74362de8e63057452`。
+在线五个 Gov5 已使用原数据库逐台替换；每台停机后均先生成不可变快照，再启动、追平并
+完成七端点 exact-root 检查后才处理下一台。T11 已满足新 P4 前置条件。
 
 ---
 
@@ -270,11 +295,13 @@ leader build stall、timeout 重播，守卫最终由新增 duplicate-publish �
 
 修复提交 **`9d26d38`** 把 CLI 的硬编码默认收口到 `qmdb_state_root` 单一常量，并把
 有界生产默认提升到 `1,048,576`；资格脚本仍显式传同值，防止以后默认漂移或遗漏。
-显式小深度的
-fail-closed 行为不变，重启仍从认证 base 完整重放，不能跳块。必须补齐格式、定向测试、
-全工作区门禁、release 构建、两台 Rust 逐台恢复与现有数据库完整重放证据，之后新 P4
-从零计时。长期运行还须在逼近该有界容量前形成新的认证 checkpoint；本修复不宣称
-无限保留。
+显式小深度的 fail-closed 行为不变，重启仍从认证 base 完整重放，不能跳块。修复后的
+分支 tip `8fa9c817c` 已推送；格式、定向测试、全工作区门禁和两次 release 构建全部
+PASS，pinned SHA-256 为
+`391185a473ee86f6ae4ec8d9ad7be3a458a7e7994ea7553c6852c64c7d8a236e`。
+两台 Rust 已使用原数据库、显式深度 `1,048,576` 逐台完成完整回放并追平，三轮七端点
+对拍精确一致。T12 已满足新 P4 前置条件。长期运行还须在逼近该有界容量前形成新的认证
+checkpoint；本修复不宣称无限保留。
 
 ---
 
