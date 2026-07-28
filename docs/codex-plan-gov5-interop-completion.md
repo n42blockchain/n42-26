@@ -240,11 +240,50 @@ binary 冷启动、追平七 Gov5、保持 `hasCommittedQc=false` 与 vote log �
 
 ---
 
+### T11 — Gov5 当前 main 跟进（本机 + 真机 / 前置新 P4）
+
+`origin/main @ 8797f080` 已不再等同于当前在线 Gov5 基线。更新涉及 durable consensus
+transition、vote journal、canonical-chain 偏离诊断、payload 信任边界、eth/68–71
+协议范围、direct block transfer 独立 64 MiB 上限、QMDB 增量持久化与 RPC 并发指标，
+因此不能用旧 P4 证据替它背书。
+
+隔离分支 **`integration/gov5-interop-current-main-20260727`** 已把在线互操作基线
+`a35aa629` 与 `origin/main @ 8797f080` 合并为 **`912a01d29`** 并推送。四处显式冲突
+按并集解决：两套跨客户端 wire fixture 全保留；恢复路径同时保留 exact phase/
+authenticated recovery view 与 durable vote commitments/divergence report；RPC metrics
+保留双检锁。另修复一处自动合并未标冲突：v2 durable vote record 与独立 phase key
+必须在公共加载入口统一恢复，否则 v2 重启会丢失 `PhaseTimedOut`。定向
+HotStuff/RPC 测试及 `go test ./...` 均 PASS。
+
+在线五个 Gov5 进程仍保持旧 binary，不在失败窗口事后热换。新 P4 启动前须先完成
+`912a01d29` 的可复现构建、逐台替换和 exact-root/wire preflight。
+
+---
+
+### T12 — QMDB 65,536 高度边界（HIGH / 前置新 P4）
+
+`b03eb3ed` P4 在 `2026-07-27T20:17Z` fail-closed。此前 810 个样本、49,118 秒、
+零 parity 失败、最大 lag 1；第 65,538 块开始两台 Rust 同时报
+`QMDB ancestry exceeds the configured replay depth 65536`，随后执行 catch-up 高频重试、
+leader build stall、timeout 重播，守卫最终由新增 duplicate-publish 警告终止窗口。
+该窗口完整保留并排除，burst 未释放。
+
+修复提交 **`9d26d38`** 把 CLI 的硬编码默认收口到 `qmdb_state_root` 单一常量，并把
+有界生产默认提升到 `1,048,576`；资格脚本仍显式传同值，防止以后默认漂移或遗漏。
+显式小深度的
+fail-closed 行为不变，重启仍从认证 base 完整重放，不能跳块。必须补齐格式、定向测试、
+全工作区门禁、release 构建、两台 Rust 逐台恢复与现有数据库完整重放证据，之后新 P4
+从零计时。长期运行还须在逼近该有界容量前形成新的认证 checkpoint；本修复不宣称
+无限保留。
+
+---
+
 ## 依赖图
 
 ```
-T9 (RPC batch 收口 + pinned build)
- └─> T1/T2 (新基线 P4 从零重跑)
+T11 (Gov5 current-main 隔离整合) ─┐
+T12 (QMDB 65,536 HIGH 修复) ──────┼─> T1/T2 (新基线 P4 从零重跑)
+T9  (RPC batch 收口) ─────────────┘
       └─> T3 (P4 gate 关闭)
            └─> T10 (observer 恢复与连续交接)
                 └─> T4 (P6 24h 替换窗口) ──┐

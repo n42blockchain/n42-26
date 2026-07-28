@@ -1057,3 +1057,48 @@ Existing preserved artifacts remain in place:
 An accidental empty version-probe directory was retained under a descriptive
 name rather than deleted. Qualification runtimes are additive and disposable;
 they do not replace source data.
+
+## 2026-07-27 current-main follow-up and replay-depth boundary
+
+The T9-bound P4 window failed closed at `2026-07-27T20:17:18Z`; it is not a
+completed soak and no transaction burst was released. Its 810 samples covered
+49,118 seconds, advanced the common execution height from 57,184 to 65,537,
+contained zero parity failures, and had maximum lag one. Both Rust validators
+then rejected block 65,538 with
+`QMDB ancestry exceeds the configured replay depth 65536`. Execution catch-up
+repeated the same failure, the Rust leader could not build, and deterministic
+timeout re-publication produced the duplicate-publish warnings that the formal
+guard observed. The guard terminated the monitor and the controller recorded
+exit 143 exactly as required. The live nodes were not counted as healthy merely
+because consensus later continued above their execution head; this window is
+preserved and excluded.
+
+The resulting HIGH fix, commit `9d26d38`, removes the participant CLI's
+duplicated 65,536 default and uses the shared QMDB replay-depth constant, now
+bounded at 1,048,576.
+`scripts/gov5-interop-qualification.sh` explicitly supplies the same value so
+an operational launcher cannot silently fall back to a smaller horizon.
+Explicit lower limits still fail closed, and no block, root, or operation is
+skipped during reconstruction. The existing Rust databases have not been
+deleted, reformatted, compacted, or pruned. A new binary and a fresh P4 window
+are required after the code gates and one-at-a-time recovery complete.
+
+Gov5 also changed materially while this gate was open. The online interop
+branch remains frozen at `a35aa629`, while current `origin/main` is
+`8797f080`. Their isolated merge is pushed as
+`integration/gov5-interop-current-main-20260727 @ 912a01d29`; its two parents
+are those exact commits. The merge retains both cross-client wire-fixture
+suites, combines exact-phase/authenticated-view recovery with the new durable
+vote journal and canonical-chain divergence diagnostics, and preserves the
+RPC metrics double-check lock. A non-marker merge defect was also corrected:
+the standalone phase key is now loaded for both v1 and v2 durable consensus
+records, so the v2 journal cannot silently reset a recovered `TimedOut` phase.
+Targeted HotStuff and JSON-RPC tests and the full `go test ./...` suite pass.
+
+Because the Gov5 update touches consensus persistence, payload trust, protocol
+bounds, direct block transfer, and QMDB persistence, the prior P4 evidence does
+not qualify the new Gov5 binary. The next formal baseline therefore requires a
+reproducible build of `912a01d29`, one-at-a-time Gov5 rollout, the replay-depth
+fixed Rust binary, exact-root and cross-client preflights, and a completely new
+86,400-second zero-transaction window. `main` remains frozen until that
+baseline is selected and passes.
