@@ -166,7 +166,7 @@ or removed.
 | P1 follower and catch-up | PASS | authenticated reverse/concurrent ancestry logs, 1,000+ following blocks, persisted restart recovery |
 | P2 automatic bootstrap and recovery | PASS | chain-bound bundle, blank-datadir materialization, replay receipt, cold restart |
 | P3 bidirectional leader handoff | PASS | `p3-5gov-2rust-28views-pass.jsonl`; 44 consecutive exact blocks covering more than two rotations |
-| P4 fault and lifecycle matrix | IN PROGRESS | all prior failed or incomplete windows are preserved and excluded; the `b03eb3ed...` window failed closed at the 65,536 replay-depth boundary; Gov5 `912a01d29` / `86b61c2d...` and Rust `8fa9c817c` / `391185a4...` passed full gates, one-at-a-time rollout, complete retained-database replay, three exact seven-endpoint comparisons, and a 30/30 five-minute preflight; the new zero-transaction window started from zero at `2026-07-28T03:23:23Z` |
+| P4 fault and lifecycle matrix | IN PROGRESS | all prior failed or incomplete windows are preserved and excluded; the `b03eb3ed...` window failed at the 65,536 replay-depth boundary; the current-main/replay-horizon baseline passed full gates and rollout, but its `2026-07-28T03:23:23Z` stream was excluded after host sleep created a 6,187-second sample gap; an in-window freshness guard and sleep inhibitor are now required for the fresh zero-transaction restart |
 | P5 minimal full archive+ parity | PASS | 209 RPC comparisons, 22 offline proof checks, export/import and corruption recovery |
 | P6 existing seven-node rollout | IN PROGRESS | observer cold bootstrap, exact epoch crossing, and the independent 24-hour read-only window pass; the retained branch was proven complete and exceeded the default replay-depth by one, then the same binary/database passed two cold starts with explicit depth 131,072; continuity-v2 is active, no participant has been activated, and the original seven Gov5 validators remain exact |
 
@@ -1167,3 +1167,23 @@ cannot be reached before `2026-07-29T03:23:23Z`. Monitor PID 12863, guard PID
 12913, and finalizer PID 12914 were all alive after launch, the first formal
 sample was exact with lag zero, no prior window was reused, and the signed
 burst remains unreleased.
+
+That stream is now excluded. The host entered clamshell sleep at
+`2026-07-28T06:32:30Z`; the next sample at `08:15:37Z` produced a 6,187-
+second gap, violating the immutable 120-second limit. At detection, 204
+samples contained zero parity failures, maximum lag one, contiguous zero-
+transaction coverage, unchanged warning/deadline counters, equal Rust
+committed views and hashes, and zero authenticated equivocations. The
+qualification failure is therefore control-plane continuity, not chain
+safety. The signed burst was never released.
+
+The stream and its baseline, launch/failure records, logs, and PID records are
+preserved under
+`excluded/p4-current-main-replay1m-20260728T032323Z-sleep-gap/`; the formal
+stream SHA-256 is
+`d7efb14b389a6511e3f34a73cd01cbe65a614d8dbae6b4e0f7b97b9b4c4839ad`.
+The formal guard now checks both last-sample freshness and the largest adjacent
+gap during the running window and terminates immediately above 120 seconds.
+The replacement controller is launched under the macOS sleep inhibitor.
+Neither binary, database, nor topology changes, and none of the excluded
+elapsed time is reusable.
