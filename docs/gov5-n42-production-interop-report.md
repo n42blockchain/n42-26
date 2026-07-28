@@ -166,7 +166,7 @@ or removed.
 | P1 follower and catch-up | PASS | authenticated reverse/concurrent ancestry logs, 1,000+ following blocks, persisted restart recovery |
 | P2 automatic bootstrap and recovery | PASS | chain-bound bundle, blank-datadir materialization, replay receipt, cold restart |
 | P3 bidirectional leader handoff | PASS | `p3-5gov-2rust-28views-pass.jsonl`; 44 consecutive exact blocks covering more than two rotations |
-| P4 fault and lifecycle matrix | IN PROGRESS | all prior failed or incomplete windows are preserved and excluded; the `b03eb3ed...` window failed at the 65,536 replay-depth boundary; the current-main/replay-horizon baseline passed full gates and rollout, but its `2026-07-28T03:23:23Z` stream was excluded after host sleep created a 6,187-second sample gap; an in-window freshness guard and sleep inhibitor are now required for the fresh zero-transaction restart |
+| P4 fault and lifecycle matrix | IN PROGRESS | all prior failed or incomplete windows are preserved and excluded; the current-main/replay-horizon baseline passed full gates and rollout, while its `03:23:23Z` stream was excluded after a host-sleep gap; with the in-window freshness guard and sleep inhibitor active, the new zero-transaction stream started from zero at `2026-07-28T08:40:30Z` |
 | P5 minimal full archive+ parity | PASS | 209 RPC comparisons, 22 offline proof checks, export/import and corruption recovery |
 | P6 existing seven-node rollout | IN PROGRESS | observer cold bootstrap, exact epoch crossing, and the independent 24-hour read-only window pass remain valid; continuity-v2 was excluded from final handoff continuity after the host-sleep gap, and continuity-v3 started at `2026-07-28T08:39:00Z` without restarting the healthy read-only observer; no participant has been activated |
 
@@ -1203,3 +1203,13 @@ lag zero, read-only, and had no committed QC. The v3 guard checks current
 sample freshness and the maximum adjacent gap over the entire new stream.
 Monitor PID 63345 and guard PID 63480 were alive after launch, no failure
 sentinel existed, and participant activation remained absent.
+
+With both P4 and P6 controllers held under explicit macOS sleep-inhibitor
+assertions, the fresh P4 controller completed its independent two-sample
+preflight and armed at height 68,722. The authoritative formal stream began at
+`2026-07-28T08:40:30Z`; its first sample was exact at height 68,723 with lag
+zero and contiguous zero-transaction verification. Monitor PID 64529, the
+running freshness/gap guard PID 64578, and finalizer PID 64585 were alive
+after launch, with no failure sentinel. The 86,400-second acceptance threshold
+cannot be reached before `2026-07-29T08:40:30Z`; no time from the excluded
+stream is credited.
