@@ -857,7 +857,9 @@ mod tests {
 
     #[test]
     fn production_default_exceeds_legacy_65536_boundary() {
-        assert!(DEFAULT_QMDB_REPLAY_DEPTH > 65_537);
+        const {
+            assert!(DEFAULT_QMDB_REPLAY_DEPTH > 65_537);
+        }
     }
 
     #[test]
