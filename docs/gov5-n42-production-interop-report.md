@@ -166,7 +166,7 @@ or removed.
 | P1 follower and catch-up | PASS | authenticated reverse/concurrent ancestry logs, 1,000+ following blocks, persisted restart recovery |
 | P2 automatic bootstrap and recovery | PASS | chain-bound bundle, blank-datadir materialization, replay receipt, cold restart |
 | P3 bidirectional leader handoff | PASS | `p3-5gov-2rust-28views-pass.jsonl`; 44 consecutive exact blocks covering more than two rotations |
-| P4 fault and lifecycle matrix | IN PROGRESS | all prior failed or incomplete windows are preserved and excluded; the `b03eb3ed...` window failed closed at the 65,536 replay-depth boundary; Gov5 `912a01d29` / `86b61c2d...` and Rust `8fa9c817c` / `391185a4...` passed full gates, one-at-a-time rollout, complete retained-database replay, and three exact seven-endpoint comparisons; the independent five-minute preflight precedes a new zero-transaction window from zero |
+| P4 fault and lifecycle matrix | IN PROGRESS | all prior failed or incomplete windows are preserved and excluded; the `b03eb3ed...` window failed closed at the 65,536 replay-depth boundary; Gov5 `912a01d29` / `86b61c2d...` and Rust `8fa9c817c` / `391185a4...` passed full gates, one-at-a-time rollout, complete retained-database replay, three exact seven-endpoint comparisons, and a 30/30 five-minute preflight; the new zero-transaction window started from zero at `2026-07-28T03:23:23Z` |
 | P5 minimal full archive+ parity | PASS | 209 RPC comparisons, 22 offline proof checks, export/import and corruption recovery |
 | P6 existing seven-node rollout | IN PROGRESS | observer cold bootstrap, exact epoch crossing, and the independent 24-hour read-only window pass; the retained branch was proven complete and exceeded the default replay-depth by one, then the same binary/database passed two cold starts with explicit depth 131,072; continuity-v2 is active, no participant has been activated, and the original seven Gov5 validators remain exact |
 
@@ -1155,3 +1155,15 @@ fail-closed guard are alive; samples remain `ok=true`, lag zero, read-only,
 and without a committed QC. No participant PID, participant directory, or
 replacement marker exists. n42 `origin/main` remains frozen at
 `3bbad4ba530bc8f93ee4aebcb64584c1b0b67da6`.
+
+The post-rollout preflight contains 30 samples from
+`2026-07-28T03:17:08Z` through `2026-07-28T03:22:06Z`, zero failures,
+maximum lag zero, and one state and receipts root throughout. Its SHA-256 is
+`a4aa53b92970a19d156701e51172c6888c87fd57af266eb6ebfd391044cbd776`.
+The formal controller then performed an independent two-sample preflight and
+armed the immutable baseline at height 66,534. The authoritative zero-
+transaction stream began at `2026-07-28T03:23:23Z`; the acceptance threshold
+cannot be reached before `2026-07-29T03:23:23Z`. Monitor PID 12863, guard PID
+12913, and finalizer PID 12914 were all alive after launch, the first formal
+sample was exact with lag zero, no prior window was reused, and the signed
+burst remains unreleased.
