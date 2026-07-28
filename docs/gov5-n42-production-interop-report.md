@@ -168,7 +168,7 @@ or removed.
 | P3 bidirectional leader handoff | PASS | `p3-5gov-2rust-28views-pass.jsonl`; 44 consecutive exact blocks covering more than two rotations |
 | P4 fault and lifecycle matrix | IN PROGRESS | all prior failed or incomplete windows are preserved and excluded; the `b03eb3ed...` window failed at the 65,536 replay-depth boundary; the current-main/replay-horizon baseline passed full gates and rollout, but its `2026-07-28T03:23:23Z` stream was excluded after host sleep created a 6,187-second sample gap; an in-window freshness guard and sleep inhibitor are now required for the fresh zero-transaction restart |
 | P5 minimal full archive+ parity | PASS | 209 RPC comparisons, 22 offline proof checks, export/import and corruption recovery |
-| P6 existing seven-node rollout | IN PROGRESS | observer cold bootstrap, exact epoch crossing, and the independent 24-hour read-only window pass; the retained branch was proven complete and exceeded the default replay-depth by one, then the same binary/database passed two cold starts with explicit depth 131,072; continuity-v2 is active, no participant has been activated, and the original seven Gov5 validators remain exact |
+| P6 existing seven-node rollout | IN PROGRESS | observer cold bootstrap, exact epoch crossing, and the independent 24-hour read-only window pass remain valid; continuity-v2 was excluded from final handoff continuity after the host-sleep gap, and continuity-v3 started at `2026-07-28T08:39:00Z` without restarting the healthy read-only observer; no participant has been activated |
 
 ## P0 — safety and participation baseline
 
@@ -1187,3 +1187,19 @@ gap during the running window and terminates immediately above 120 seconds.
 The replacement controller is launched under the macOS sleep inhibitor.
 Neither binary, database, nor topology changes, and none of the excluded
 elapsed time is reusable.
+
+The same host sleep invalidated the P6 continuity-v2 handoff stream. It
+contained 1,560 healthy samples and maximum lag one, but adjacent gaps of
+5,801 and 448 seconds caused its freshness guard to fail closed at
+`2026-07-28T08:15:36Z`. This does not revoke the already completed independent
+P6 observer 24-hour gate, but v2 cannot establish the final ≤120-second
+observer-to-participant handoff. Its monitor, evidence, guard records, and PID
+records are preserved under
+`excluded/p6-observer-depth-recovery-v2-20260728-sleep-gap/`.
+
+The observer process remained healthy and was not restarted. Continuity-v3
+started from a fresh sample at `2026-07-28T08:39:00Z`; that sample was exact,
+lag zero, read-only, and had no committed QC. The v3 guard checks current
+sample freshness and the maximum adjacent gap over the entire new stream.
+Monitor PID 63345 and guard PID 63480 were alive after launch, no failure
+sentinel existed, and participant activation remained absent.
