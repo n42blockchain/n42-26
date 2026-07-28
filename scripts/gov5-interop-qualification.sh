@@ -72,8 +72,13 @@ start_gov_node() {
       )
     fi
   done
+  if test "${N42_GOV_FOREGROUND:-0}" = "1"; then
+    echo "$$" >"$pid_file"
+    exec "$gov_binary" "${args[@]}" \
+      </dev/null >>"$runtime/logs/gov${node}.log" 2>&1
+  fi
   nohup "$gov_binary" "${args[@]}" \
-    >"$runtime/logs/gov${node}.log" 2>&1 &
+    </dev/null >>"$runtime/logs/gov${node}.log" 2>&1 &
   echo "$!" >"$pid_file"
 }
 
@@ -126,35 +131,45 @@ start_rust_validator() {
   if test "$validator_node" -ne 0; then
     trusted_peers="$trusted_peers,/ip4/127.0.0.1/udp/19780/quic-v1/p2p/$rust_peer"
   fi
-  nohup env \
-    N42_CONSENSUS_CONFIG="$consensus_config" \
-    N42_VALIDATOR_KEY="@${validator_key_files[0]}" \
-    N42_P2P_KEY="@$key_dir/network-keys" \
-    N42_DATA_DIR="$runtime/$name/consensus" \
-    N42_GOV5_H2_PARTICIPANT=1 \
-    N42_GOV5_HEADER_PROFILE=1 \
-    N42_INTEROP_GENESIS_HASH="$genesis_hash" \
-    N42_GOV5_BOOTSTRAP_BUNDLE="$runtime/artifacts/bootstrap-bundle.json" \
-    N42_CONSENSUS_PORT="$consensus_port" \
-    N42_STARHUB_PORT="$starhub_port" \
-    N42_NO_AUTO_CONNECT=1 \
-    N42_TRUSTED_PEERS="$trusted_peers" \
-    N42_ENABLE_MDNS=0 \
-    N42_ENABLE_DHT=0 \
-    N42_ENABLE_HTTP_RPC=1 \
-    "$rust_binary" node \
-      --chain "$runtime/artifacts/genesis.json" \
-      --datadir "$runtime/$name/reth" \
-      --disable-discovery \
-      --port "$reth_port" \
-      --http \
-      --http.addr 127.0.0.1 \
-      --http.port "$http_port" \
-      --authrpc.port "$auth_port" \
-      --ipcdisable \
-      --log.file.max-files 0 \
-      --color never \
-      >"$runtime/logs/$name.log" 2>&1 &
+  rust_env=(
+    "N42_CONSENSUS_CONFIG=$consensus_config"
+    "N42_VALIDATOR_KEY=@${validator_key_files[0]}"
+    "N42_P2P_KEY=@$key_dir/network-keys"
+    "N42_DATA_DIR=$runtime/$name/consensus"
+    "N42_GOV5_H2_PARTICIPANT=1"
+    "N42_GOV5_HEADER_PROFILE=1"
+    "N42_INTEROP_GENESIS_HASH=$genesis_hash"
+    "N42_GOV5_BOOTSTRAP_BUNDLE=$runtime/artifacts/bootstrap-bundle.json"
+    "N42_QMDB_REPLAY_DEPTH=${N42_QMDB_REPLAY_DEPTH:-1048576}"
+    "N42_CONSENSUS_PORT=$consensus_port"
+    "N42_STARHUB_PORT=$starhub_port"
+    "N42_NO_AUTO_CONNECT=1"
+    "N42_TRUSTED_PEERS=$trusted_peers"
+    "N42_ENABLE_MDNS=0"
+    "N42_ENABLE_DHT=0"
+    "N42_ENABLE_HTTP_RPC=1"
+  )
+  rust_args=(
+    node
+    --chain "$runtime/artifacts/genesis.json"
+    --datadir "$runtime/$name/reth"
+    --disable-discovery
+    --port "$reth_port"
+    --http
+    --http.addr 127.0.0.1
+    --http.port "$http_port"
+    --authrpc.port "$auth_port"
+    --ipcdisable
+    --log.file.max-files 0
+    --color never
+  )
+  if test "${N42_RUST_FOREGROUND:-0}" = "1"; then
+    echo "$$" >"$pid_file"
+    exec env "${rust_env[@]}" "$rust_binary" "${rust_args[@]}" \
+      </dev/null >>"$runtime/logs/$name.log" 2>&1
+  fi
+  nohup env "${rust_env[@]}" "$rust_binary" "${rust_args[@]}" \
+    </dev/null >>"$runtime/logs/$name.log" 2>&1 &
   echo "$!" >"$pid_file"
 }
 
@@ -937,6 +952,8 @@ case "${1:-}" in
   start-gov-node) start_gov_node "${2:-}" ;;
   start-rust) start_rust ;;
   start-rust2) start_rust2 ;;
+  stop-rust) stop_one "$runtime/pids/rust.pid" ;;
+  stop-rust2) stop_one "$runtime/pids/rust2.pid" ;;
   start) start_gov; start_rust ;;
   stop) stop_all ;;
   restart-rust) stop_one "$runtime/pids/rust.pid"; start_rust ;;
@@ -962,7 +979,7 @@ case "${1:-}" in
   archive-rpc-parity) archive_rpc_parity "${2:-}" "${3:-}" "${4:-}" ;;
   transaction-burst) transaction_burst "${2:-}" "${3:-}" ;;
   *)
-    echo "usage: $0 {start-gov|start-gov-node N|start-rust|start-rust2|start|stop|restart-gov-node N|restart-rust|restart-rust2|status|monitor-heads <seconds> [interval] [evidence-file]|record-clock <label> [evidence-file]|record-head <label> <port> [evidence-file]|era-checksums <directory>|archive-export <node> <snapshot>|archive-verify <snapshot>|archive-import <snapshot> <fresh-destination>|archive-corruption-drill <snapshot> <corrupt-copy> <recovered-copy> [evidence-file]|archive-rpc-parity <gov-endpoint> <rust-endpoint> [evidence-file]|transaction-burst [ARTIFACT] [EVIDENCE]}" >&2
+    echo "usage: $0 {start-gov|start-gov-node N|start-rust|start-rust2|stop-rust|stop-rust2|start|stop|restart-gov-node N|restart-rust|restart-rust2|status|monitor-heads <seconds> [interval] [evidence-file]|record-clock <label> [evidence-file]|record-head <label> <port> [evidence-file]|era-checksums <directory>|archive-export <node> <snapshot>|archive-verify <snapshot>|archive-import <snapshot> <fresh-destination>|archive-corruption-drill <snapshot> <corrupt-copy> <recovered-copy> [evidence-file]|archive-rpc-parity <gov-endpoint> <rust-endpoint> [evidence-file]|transaction-burst [ARTIFACT] [EVIDENCE]}" >&2
     exit 2
     ;;
 esac

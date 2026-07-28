@@ -38,7 +38,14 @@ use crate::{
 };
 
 /// Maximum ancestry replay accepted by the bounded interoperability strategy.
-pub const DEFAULT_QMDB_REPLAY_DEPTH: usize = 4096;
+///
+/// The production Gov5 bridge retains an authenticated lineage from its
+/// bootstrap checkpoint. The previous participant default (65,536, duplicated
+/// in the CLI) made a healthy node deterministically fail at block 65,538.
+/// Keep one shared default with enough runway for qualification and production
+/// replacement windows. Operators can still set a smaller explicit bound for
+/// fail-closed testing or a larger audited bound for longer archive horizons.
+pub const DEFAULT_QMDB_REPLAY_DEPTH: usize = 1_048_576;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StoredQmdbBlock {
@@ -846,6 +853,11 @@ mod tests {
             ),
             Err(Gov5QmdbStateRootError::ReplayDepthExceeded(1))
         ));
+    }
+
+    #[test]
+    fn production_default_exceeds_legacy_65536_boundary() {
+        assert!(DEFAULT_QMDB_REPLAY_DEPTH > 65_537);
     }
 
     #[test]

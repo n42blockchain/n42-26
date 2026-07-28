@@ -35,7 +35,7 @@ use n42_node::mobile_packet::mobile_packet_loop;
 use n42_node::mobile_reward::MobileRewardManager;
 use n42_node::persistence;
 use n42_node::qmdb_state::{gov5_qmdb_genesis_tree, gov5_replay_execution_genesis};
-use n42_node::qmdb_state_root::Gov5QmdbStateRootStore;
+use n42_node::qmdb_state_root::{DEFAULT_QMDB_REPLAY_DEPTH, Gov5QmdbStateRootStore};
 use n42_node::rpc::{N42ApiServer, N42RpcServer};
 use n42_node::staking::StakingManager;
 use n42_node::tx_bridge::TxPoolBridge;
@@ -1086,7 +1086,8 @@ fn main() {
                 .unwrap_or(DEFAULT_QMDB_EXECUTION_MAX_SLOTS);
             let max_bytes = env_parse("N42_QMDB_EXECUTION_MAX_BYTES")
                 .unwrap_or(DEFAULT_QMDB_EXECUTION_MAX_BYTES);
-            let max_replay_depth = env_parse("N42_QMDB_REPLAY_DEPTH").unwrap_or(65_536usize);
+            let max_replay_depth =
+                env_parse("N42_QMDB_REPLAY_DEPTH").unwrap_or(DEFAULT_QMDB_REPLAY_DEPTH);
             let loaded = load_gov5_genesis_execution_bootstrap(
                 Path::new(&path),
                 Path::new(&genesis_range),
