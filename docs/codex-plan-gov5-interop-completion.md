@@ -105,6 +105,13 @@
   max lag 1 / 最大采样间隙 63 秒 / 推进 1,571 块。零交易验证连续，warning/deadline
   计数器未变，两 Rust committed view/hash 一致且 equivocation 为零；P6-v3 同期
   156 样本、零失败、最大间隙 62 秒。该记录仅为 `PASS_MILESTONE_ONLY`。
+- 截至 `2026-07-29T04:45:03Z`，新 P4 为 1,191 样本 / 72,265 秒 / 零失败 /
+  max lag 1 / 最大间隙 63 秒；P6-v3 为 1,197 样本 / 72,325 秒 / 零失败 /
+  最大间隙 62 秒。P4 尚未到 86,400 秒门槛。
+- P6 current-main/replay1m finalizer 已完成重绑并于 `2026-07-29T04:51:36Z` 在防睡眠
+  screen 中 ARMED：锁定 Rust `8fa9c817/391185a4`、Gov5 `912a01d/86b61c2d`、
+  P6-v3 新鲜交接流与当前 P4 PASS；participant、替换 marker 均仍不存在。P4 PASS 后
+  才允许停 observer、制作两份维护快照并进入 24 小时 participant 窗口。
 
 ## 红线（任何任务都不得突破）
 
@@ -174,6 +181,10 @@ runtimes" 一项可以打勾。
 ### T4 — P6 participant 24 小时替换窗口（真机 / 前置 T3）
 
 **前置**：P4 PASS；observer 只读守卫与 participant 首个正式样本的交接间隙 ≤120 秒。
+
+**当前状态**：current-main/replay1m finalizer 已 ARMED 并等待当前 P4 PASS；
+preactivation gate、pinned binaries、回滚快照前置条件和 continuity-v3 均已验证，
+participant 尚未激活。
 
 **步骤**：按 report 已写定的 runbook 六步执行——停 observer 并做 manifest 校验的
 状态副本 → 停 Gov5 validator 6 并做第二份维护快照 → 用 validator 6 的精确 BLS 与

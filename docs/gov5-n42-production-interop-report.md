@@ -1225,3 +1225,19 @@ had 156 healthy read-only samples, maximum lag one, and maximum gap 62
 seconds. The audit is
 `p4-current-main-replay1m-formal-2h-plus-milestone-audit.jsonl`; it does not
 close P4 or release the burst.
+
+At `2026-07-29T04:45:03Z`, P4 had 1,191 samples spanning 72,265 seconds,
+zero failures, maximum lag one, maximum gap 63 seconds, and 12,309 blocks of
+progress. P6 continuity-v3 concurrently had 1,197 healthy read-only samples
+spanning 72,325 seconds with maximum gap 62 seconds. P4 remained below its
+86,400-second threshold and no burst or participant activation had occurred.
+
+The P6 current-main/replay-horizon preactivation gate now binds Rust
+`8fa9c817` / `391185a4...`, Gov5 `912a01d` / `86b61c2d...`, the original
+independent observer 24-hour PASS, and the fresh continuity-v3 stream. Both
+pinned binaries are staged and exact in runtime 12; the existing observer and
+Gov5 processes remain unchanged until P4 PASS. The finalizer, including
+participant 24-hour monitoring, restart/rejoin, pending-proposal-without-R1
+guard, active rollback rehearsal, and final mixed reactivation, is ARMED under
+a sleep inhibitor since `2026-07-29T04:51:36Z`. Participant state and the
+replacement marker remain absent.
