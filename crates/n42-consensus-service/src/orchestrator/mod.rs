@@ -358,7 +358,7 @@ pub struct ConsensusService {
     h2_v4_unbound_blocks: BTreeMap<B256, (PeerId, Vec<u8>)>,
     /// Authenticated ancestry collected newest-to-oldest during far catch-up.
     /// It is released to Engine API only in ascending block order.
-    h2_v4_catchup_blocks: BTreeMap<u64, (PeerId, Vec<u8>)>,
+    h2_v4_catchup_blocks: BTreeMap<u64, (PeerId, Vec<u8>, u64)>,
     /// Explicitly bounded block count for authenticated reverse-ancestry
     /// catch-up. Production keeps the conservative default; qualification can
     /// opt into a larger, hard-capped window for a known retained chain.
@@ -705,6 +705,7 @@ impl ConsensusService {
         source: PeerId,
         rlp: Vec<u8>,
         height: u64,
+        authenticated_view: u64,
         activate: bool,
     ) -> bool {
         self.prune_executed_h2_v4_catchup_history();
@@ -719,7 +720,8 @@ impl ConsensusService {
             );
             return false;
         }
-        self.h2_v4_catchup_blocks.insert(height, (source, rlp));
+        self.h2_v4_catchup_blocks
+            .insert(height, (source, rlp, authenticated_view));
         if activate {
             self.h2_v4_catchup_active = true;
         }
@@ -752,13 +754,13 @@ impl ConsensusService {
         // after a QC jump authenticates their hashes. Starting at the newest
         // authenticated block, select only the exact parent-hash chain that
         // terminates at the durable execution head.
-        let (&last_height, (_, newest_rlp)) = self.h2_v4_catchup_blocks.last_key_value()?;
+        let (&last_height, (_, newest_rlp, _)) = self.h2_v4_catchup_blocks.last_key_value()?;
         let newest = n42_network::decode_gov5_block_rlp(newest_rlp).ok()?;
         let mut expected_hash = newest.block_hash;
         let mut height = last_height;
         let mut selected_heights = Vec::new();
         loop {
-            let (_, candidate_rlp) = self.h2_v4_catchup_blocks.get(&height)?;
+            let (_, candidate_rlp, _) = self.h2_v4_catchup_blocks.get(&height)?;
             let candidate = n42_network::decode_gov5_block_rlp(candidate_rlp).ok()?;
             if candidate.block_hash != expected_hash {
                 return None;
@@ -798,21 +800,13 @@ impl ConsensusService {
             blocks = catchup.len(),
             "releasing reverse-delivered authenticated Gov5 ancestry in execution order"
         );
-        for (catchup_source, catchup_rlp) in catchup {
+        for (catchup_source, catchup_rlp, catchup_view) in catchup {
             let catchup_block = match n42_network::decode_gov5_block_rlp(&catchup_rlp) {
                 Ok(block) => block,
                 Err(error) => {
                     error!(target: "n42::interop::h2v4", %error, "buffered Gov5 block failed repeat decoding");
                     return false;
                 }
-            };
-            let Some(catchup_view) = self
-                .h2_v4_block_views
-                .get(&catchup_block.block_hash)
-                .copied()
-            else {
-                error!(target: "n42::interop::h2v4", hash = %catchup_block.block_hash, "buffered Gov5 block lost its authenticated binding");
-                return false;
             };
             if !self
                 .import_h2_v4_catchup_block(catchup_source, catchup_block, catchup_view)
@@ -923,6 +917,7 @@ impl ConsensusService {
             source,
             rlp.clone(),
             block.header.number,
+            view,
             activate_catchup,
         ) {
             return;
@@ -5278,7 +5273,7 @@ mod tests {
 
         for height in 1..=2048 {
             orch.h2_v4_catchup_blocks
-                .insert(height, (peer, vec![height as u8]));
+                .insert(height, (peer, vec![height as u8], height));
         }
         orch.h2_v4_catchup_active = true;
         orch.head_block_number = 1600;
@@ -5310,10 +5305,10 @@ mod tests {
 
         for height in 1..=DEFAULT_H2_V4_CATCHUP_BUFFER_BLOCKS {
             orch.h2_v4_catchup_blocks
-                .insert(height as u64, (peer, vec![height as u8]));
+                .insert(height as u64, (peer, vec![height as u8], height as u64));
         }
 
-        assert!(!orch.stage_h2_v4_catchup_block(peer, vec![0xff], 2049, true));
+        assert!(!orch.stage_h2_v4_catchup_block(peer, vec![0xff], 2049, 3049, true));
         assert_eq!(
             orch.h2_v4_catchup_blocks.len(),
             DEFAULT_H2_V4_CATCHUP_BUFFER_BLOCKS
@@ -5331,11 +5326,17 @@ mod tests {
 
         for height in 1..=DEFAULT_H2_V4_CATCHUP_BUFFER_BLOCKS {
             orch.h2_v4_catchup_blocks
-                .insert(height as u64, (peer, vec![height as u8]));
+                .insert(height as u64, (peer, vec![height as u8], height as u64));
         }
 
-        assert!(orch.stage_h2_v4_catchup_block(peer, vec![0xff], 2049, true));
+        assert!(orch.stage_h2_v4_catchup_block(peer, vec![0xff], 2049, 3049, true));
         assert_eq!(orch.h2_v4_catchup_blocks.len(), 2049);
+        assert_eq!(
+            orch.h2_v4_catchup_blocks
+                .get(&2049)
+                .map(|(_, _, authenticated_view)| *authenticated_view),
+            Some(3049)
+        );
 
         orch = orch.with_h2_v4_catchup_buffer_blocks(usize::MAX);
         assert_eq!(
@@ -5420,9 +5421,9 @@ mod tests {
         let source = n42_network::PeerId::random();
         orch.head_block_number = 100;
 
-        assert!(orch.stage_h2_v4_catchup_block(source, vec![0x01], 101, false));
+        assert!(orch.stage_h2_v4_catchup_block(source, vec![0x01], 101, 201, false));
         assert!(!orch.h2_v4_catchup_active);
-        assert!(orch.stage_h2_v4_catchup_block(source, vec![0x02], 102, true));
+        assert!(orch.stage_h2_v4_catchup_block(source, vec![0x02], 102, 202, true));
         assert!(orch.h2_v4_catchup_active);
         assert_eq!(
             orch.h2_v4_catchup_blocks
@@ -5458,7 +5459,7 @@ mod tests {
         orch.head_block_number = 100;
         orch.remember_h2_v4_block_view(successor_hash, 202);
 
-        assert!(orch.stage_h2_v4_catchup_block(source, successor_rlp, 102, true));
+        assert!(orch.stage_h2_v4_catchup_block(source, successor_rlp, 102, 202, true));
         assert_eq!(
             orch.ready_h2_v4_catchup_heights(),
             None,
