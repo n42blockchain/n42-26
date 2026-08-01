@@ -4,7 +4,7 @@ use crate::types::{AccountWrite, ParallelEvmError, ReadEntry, TxIdx};
 use crate::{ParallelExecutionOutput, TxResult};
 use alloy_primitives::{Address, Log, U256};
 use parking_lot::Mutex;
-use revm::state::{Account, EvmStorageSlot, TransactionId};
+use revm::state::{Account, EvmStorageSlot};
 use std::collections::HashMap;
 
 /// Internal per-tx output (before merging into the block state).
@@ -27,15 +27,10 @@ pub(crate) fn merge_tx_state(
     account_writes: Vec<(Address, AccountWrite)>,
     storage_writes: Vec<(Address, U256, U256)>,
 ) {
-    // revm 40 tracks the originating transaction via a TransactionId (NonMaxU32).
-    // The parallel_execute entry rejects blocks with >= u32::MAX txs, so tx_idx
-    // is always a valid NonMaxU32 here.
-    let tx_id = TransactionId::new(tx_idx)
-        .expect("tx_idx < u32::MAX guaranteed by parallel_execute entry check");
     for (addr, write) in account_writes {
         let account = state_changes
             .entry(addr)
-            .or_insert_with(|| Account::new_not_existing(tx_id));
+            .or_insert_with(|| Account::new_not_existing(tx_idx));
         match write {
             AccountWrite::Updated(info) => {
                 account.info = info;
@@ -49,10 +44,10 @@ pub(crate) fn merge_tx_state(
     for (addr, slot, value) in storage_writes {
         let account = state_changes
             .entry(addr)
-            .or_insert_with(|| Account::new_not_existing(tx_id));
+            .or_insert_with(|| Account::new_not_existing(tx_idx));
         account
             .storage
-            .insert(slot, EvmStorageSlot::new_changed(U256::ZERO, value, tx_id));
+            .insert(slot, EvmStorageSlot::new_changed(U256::ZERO, value, tx_idx));
     }
 }
 

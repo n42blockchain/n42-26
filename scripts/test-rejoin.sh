@@ -41,6 +41,7 @@ NUM_VALIDATORS=4    # Must leave >= quorum nodes running; quorum=2f+1, f=(n-1)/3
 ISOLATE_BLOCKS=20   # How many blocks the killed node misses before restart
 DEBUG_BUILD=false
 KEEP_RUNNING="${KEEP_RUNNING:-0}"
+FIRST_BLOCK_TIMEOUT_SEC="${N42_FIRST_BLOCK_TIMEOUT:-300}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -272,6 +273,7 @@ start_validator() {
         --authrpc.port "$((BASE_AUTH + idx))" \
         --port "$((BASE_P2P + idx))" \
         --discovery.port "$((BASE_P2P + idx))" \
+        --discovery.v5.port "$((BASE_P2P + idx))" \
         --log.file.directory "$datadir/logs" \
         --ipcdisable \
         --max-outbound-peers "$((NUM_VALIDATORS + 1))" \
@@ -301,7 +303,7 @@ done
 RPC="$((BASE_HTTP))"   # node 0 is our stable RPC for the whole test
 
 log "Waiting for first block..."
-wait_for_height "$RPC" 1 120 "v0" || fail "No blocks within 120s — check $DATA_DIR/validator-0.log"
+wait_for_height "$RPC" 1 "$FIRST_BLOCK_TIMEOUT_SEC" "v0" || fail "No blocks within ${FIRST_BLOCK_TIMEOUT_SEC}s — check $DATA_DIR/validator-0.log"
 
 log "Waiting for 5 blocks to confirm stable liveness..."
 h1=$(block_number "$RPC")

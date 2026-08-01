@@ -141,7 +141,11 @@ impl ShardedSbmt {
                     }
                 }
                 AccountChangeType::Created | AccountChangeType::Modified => {
-                    let balance = account_diff.balance.as_ref().map(|v| v.to).unwrap_or_default();
+                    let balance = account_diff
+                        .balance
+                        .as_ref()
+                        .map(|v| v.to)
+                        .unwrap_or_default();
                     let nonce = account_diff.nonce.as_ref().map(|v| v.to).unwrap_or(0);
                     let code_hash = match &account_diff.code_change {
                         Some(change) => change.to.unwrap_or(EMPTY_CODE_HASH),
@@ -319,7 +323,11 @@ mod tests {
         let (v, root) = t.apply_diff(&created_diff(100));
         assert_eq!(v, 1);
         assert_ne!(root, B256::ZERO);
-        assert_eq!(root, t.root_hash(), "returned root must match recomputed root");
+        assert_eq!(
+            root,
+            t.root_hash(),
+            "returned root must match recomputed root"
+        );
     }
 
     #[test]
@@ -361,7 +369,10 @@ mod tests {
         let mut t = ShardedSbmt::new();
         t.apply_diff(&created_diff(200));
         let non_empty = t.shard_stats().iter().filter(|(n, _)| *n > 0).count();
-        assert!(non_empty >= 8, "expected ≥8 non-empty shards, got {non_empty}");
+        assert!(
+            non_empty >= 8,
+            "expected ≥8 non-empty shards, got {non_empty}"
+        );
     }
 
     #[test]
@@ -434,7 +445,11 @@ mod tests {
 
         let key = account_key(&addr).0;
         let val = t.get(&key).unwrap();
-        assert_eq!(decode_code_hash(&val), code_hash, "code_hash must survive modify");
+        assert_eq!(
+            decode_code_hash(&val),
+            code_hash,
+            "code_hash must survive modify"
+        );
     }
 
     #[test]
@@ -455,7 +470,10 @@ mod tests {
 
         let mut bad = proof.clone();
         bad.shard_root[0] ^= 0xFF;
-        assert!(bad.verify(&root.0).is_err(), "tampered shard root must fail");
+        assert!(
+            bad.verify(&root.0).is_err(),
+            "tampered shard root must fail"
+        );
     }
 
     #[test]

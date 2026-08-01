@@ -67,7 +67,7 @@ reth-node-builder = { path = "../reth/crates/node/builder" }
 reth-node-ethereum = { path = "../reth/crates/ethereum/node" }
 reth-node-types = { path = "../reth/crates/node/types" }
 reth-payload-builder = { path = "../reth/crates/payload/builder" }
-reth-primitives-traits = { version = "0.5.0", default-features = false }
+reth-primitives-traits = { version = "=0.3.1", default-features = false }
 reth-provider = { path = "../reth/crates/storage/provider" }
 reth-revm = { path = "../reth/crates/revm" }
 reth-tasks = { path = "../reth/crates/tasks" }
@@ -91,23 +91,23 @@ reth-rpc-server-types = { path = "../reth/crates/rpc/rpc-server-types" }
 reth-node-core = { path = "../reth/crates/node/core" }
 
 # Alloy (aligned with n42blockchain/reth merged with upstream main)
-alloy-consensus = { version = "2.0.5", default-features = false, features = ["serde"] }
-alloy-eips = { version = "2.0.5", default-features = false, features = ["serde"] }
-alloy-primitives = { version = "1.6.0", default-features = false, features = ["serde"] }
+alloy-consensus = { version = "=2.0.4", default-features = false, features = ["serde"] }
+alloy-eips = { version = "=2.0.4", default-features = false, features = ["serde"] }
+alloy-primitives = { version = "=1.5.6", default-features = false, features = ["serde"] }
 alloy-rlp = { version = "0.3.13", default-features = false }
-alloy-genesis = { version = "2.0.5", default-features = false }
-alloy-rpc-types-engine = { version = "2.0.5", default-features = false }
+alloy-genesis = { version = "=2.0.4", default-features = false }
+alloy-rpc-types-engine = { version = "=2.0.4", default-features = false }
 
 # Alloy signing & network
-alloy-signer = { version = "2.0.5", default-features = false }
-alloy-signer-local = { version = "2.0.5", default-features = false }
-alloy-network = { version = "2.0.5", default-features = false }
-alloy-rpc-types-eth = { version = "2.0.5", default-features = false }
-alloy-sol-types = { version = "1.6.0", default-features = false }
+alloy-signer = { version = "=2.0.4", default-features = false }
+alloy-signer-local = { version = "=2.0.4", default-features = false }
+alloy-network = { version = "=2.0.4", default-features = false }
+alloy-rpc-types-eth = { version = "=2.0.4", default-features = false }
+alloy-sol-types = { version = "=1.5.6", default-features = false }
 
 # EVM — aligned with `../reth/Cargo.toml` (upstream main).
-alloy-evm = { version = "0.37.0", default-features = false }
-revm = { version = "41.0.0", default-features = false, features = ["std", "serde"] }
+alloy-evm = { version = "=0.34.0", default-features = false }
+revm = { version = "=38.0.0", default-features = false, features = ["std", "serde"] }
 
 # Testing
 reth-testing-utils = { path = "../reth/testing/testing-utils" }
@@ -176,6 +176,7 @@ bytes = "1"
 
 # Compression
 zstd = "0.13"
+snap = "1.1"
 
 # Testing
 tempfile = "3"

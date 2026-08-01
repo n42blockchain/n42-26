@@ -9,7 +9,6 @@ use alloy_primitives::address;
 use revm::{
     context::{BlockEnv, TxEnv},
     context_interface::result::{EVMError, HaltReason},
-    database_interface::DBErrorMarker,
     inspector::{Inspector, NoOpInspector},
     precompile::{Precompile, PrecompileId, PrecompileSpecId, Precompiles},
     primitives::hardfork::SpecId,
@@ -54,7 +53,7 @@ impl EvmFactory for N42EvmFactory {
         EthEvm<DB, I, Self::Precompiles>;
     type Context<DB: alloy_evm::Database> = EthEvmContext<DB>;
     type Tx = TxEnv;
-    type Error<DBError: DBErrorMarker> = EVMError<DBError>;
+    type Error<DBError: std::error::Error + Send + Sync + 'static> = EVMError<DBError>;
     type HaltReason = HaltReason;
     type Spec = SpecId;
     type BlockEnv = BlockEnv;

@@ -108,7 +108,7 @@ fn to_built_block(payload: reth_payload_builder::EthBuiltPayload) -> BuiltBlock 
         number: block.header().number,
         timestamp: block.header().timestamp,
         tx_count: block.body().transactions().count(),
-        execution_data: <EthEngineTypes as PayloadTypes>::block_to_payload(block.clone(), None),
+        execution_data: <EthEngineTypes as PayloadTypes>::block_to_payload(block.clone()),
         blob_tx_hashes,
     }
 }

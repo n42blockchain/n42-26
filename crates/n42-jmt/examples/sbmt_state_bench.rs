@@ -31,7 +31,10 @@ use std::collections::BTreeMap;
 use std::time::Instant;
 
 fn env_usize(key: &str, default: usize) -> usize {
-    std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 /// Distinct 20-byte address for index `i` (no 256-collision).
@@ -50,7 +53,10 @@ fn block_diff(start: usize, count: usize) -> StateDiff {
             addr_of(i),
             AccountDiff {
                 change_type: AccountChangeType::Created,
-                balance: Some(ValueChange::new(U256::ZERO, U256::from(1_000u64 + i as u64))),
+                balance: Some(ValueChange::new(
+                    U256::ZERO,
+                    U256::from(1_000u64 + i as u64),
+                )),
                 nonce: Some(ValueChange::new(0, 1)),
                 code_change: None,
                 storage: BTreeMap::new(),
@@ -98,7 +104,9 @@ fn main() {
     }
     let build_elapsed = build_start.elapsed().as_secs_f64();
 
-    let rss_after_build = memory_stats::memory_stats().map(|m| m.physical_mem).unwrap_or(0);
+    let rss_after_build = memory_stats::memory_stats()
+        .map(|m| m.physical_mem)
+        .unwrap_or(0);
 
     // ── Optional update phase: overwrite random existing accounts (Modified),
     // the apples-to-apples workload for comparing against QMDB-style update
@@ -118,7 +126,10 @@ fn main() {
                     addr_of(i),
                     AccountDiff {
                         change_type: AccountChangeType::Modified,
-                        balance: Some(ValueChange::new(U256::ZERO, U256::from(rng.random::<u64>()))),
+                        balance: Some(ValueChange::new(
+                            U256::ZERO,
+                            U256::from(rng.random::<u64>()),
+                        )),
                         nonce: Some(ValueChange::new(0, 1)),
                         code_change: None,
                         storage: BTreeMap::new(),
@@ -132,9 +143,7 @@ fn main() {
             done += count;
         }
         upd_per_sec = updates as f64 / (upd_us / 1e6).max(f64::MIN_POSITIVE);
-        println!(
-            "updates:      {updates} ops, {upd_per_sec:.0} upd/s (block={block}, overwrite)"
-        );
+        println!("updates:      {updates} ops, {upd_per_sec:.0} upd/s (block={block}, overwrite)");
     }
     let _ = upd_per_sec;
 
@@ -175,7 +184,10 @@ fn main() {
             verify_ok += 1;
         }
     }
-    assert_eq!(verify_ok, n_samples, "all sampled proofs must verify (bound)");
+    assert_eq!(
+        verify_ok, n_samples,
+        "all sampled proofs must verify (bound)"
+    );
 
     sizes.sort_unstable();
     let proof_size_avg = sizes.iter().sum::<usize>() as f64 / sizes.len().max(1) as f64;
@@ -220,11 +232,22 @@ fn main() {
 
     // ── Human summary + gov5 BMT @5M reference. ──
     let s = &report["sbmt"];
-    println!("\n=== n42-SBMT state bench ({entries} entries / {} blocks) ===", per_block_us.len());
+    println!(
+        "\n=== n42-SBMT state bench ({entries} entries / {} blocks) ===",
+        per_block_us.len()
+    );
     println!("build:        {build_elapsed:.2}s  ({entries_per_sec:.0} entries/s)");
-    println!("per-block:    {root_time_avg_us:.2} us  ({blocks_per_sec:.1} blocks/s)  [apply+root]");
-    println!("live nodes:   {total_nodes}  (int {} / leaf {})", ns.internal_nodes, ns.leaf_nodes);
-    println!("avg node sz:  {:.1} B", s["avg_node_size"].as_f64().unwrap());
+    println!(
+        "per-block:    {root_time_avg_us:.2} us  ({blocks_per_sec:.1} blocks/s)  [apply+root]"
+    );
+    println!(
+        "live nodes:   {total_nodes}  (int {} / leaf {})",
+        ns.internal_nodes, ns.leaf_nodes
+    );
+    println!(
+        "avg node sz:  {:.1} B",
+        s["avg_node_size"].as_f64().unwrap()
+    );
     println!("live node B:  {:.2} MB", ns.serialized_bytes as f64 / 1e6);
     println!("snapshot B:   {:.2} MB (KV)", snapshot_bytes as f64 / 1e6);
     println!("RSS:          {:.2} MB", rss_after_build as f64 / 1e6);
@@ -240,6 +263,8 @@ fn main() {
     println!("\n--- gov5 Go BMT reference (bench_state_5m_bmt.json, 18.34M entries/5M blocks) ---");
     println!("per-block:    4010.67 us  (249.3 blocks/s)  [root only]");
     println!("avg node sz:  95.9 B   (archival: 350.9M nodes, 33.65 GB cumulative)");
-    println!("proof:        avg 713.9 B (p50 704 / p99 928), depth 22.31, gen 66.82 us, verify 2.56 us");
+    println!(
+        "proof:        avg 713.9 B (p50 704 / p99 928), depth 22.31, gen 66.82 us, verify 2.56 us"
+    );
     println!("\nreport written: {out_path}");
 }

@@ -10,7 +10,7 @@ use crate::types::ParallelEvmError;
 use alloy_primitives::{Address, U256};
 use revm::context::{BlockEnv, TxEnv};
 use revm::database_interface::DatabaseRef;
-use revm::state::{Account, AccountInfo, TransactionId};
+use revm::state::{Account, AccountInfo};
 use std::fmt;
 
 /// How a block's beneficiary should be handled under parallel execution.
@@ -101,11 +101,10 @@ impl DeferredCoinbase {
         }
         let mut info = self.base.clone().unwrap_or_default();
         info.balance = info.balance.saturating_add(sum);
-        let tx_id = TransactionId::new(0).expect("0 is a valid TransactionId");
         let account = output
             .state_changes
             .entry(self.bene)
-            .or_insert_with(|| Account::new_not_existing(tx_id));
+            .or_insert_with(|| Account::new_not_existing(0));
         account.info = info;
         account.mark_touch();
     }

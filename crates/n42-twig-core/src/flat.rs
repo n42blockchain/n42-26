@@ -27,7 +27,9 @@ pub(crate) struct FlatIndex {
 fn random_seed() -> u64 {
     // std-only entropy: RandomState's per-process random SipHash keys.
     use std::hash::{BuildHasher, Hasher};
-    std::collections::hash_map::RandomState::new().build_hasher().finish()
+    std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish()
 }
 
 impl FlatIndex {
@@ -100,7 +102,11 @@ impl FlatIndex {
             let s = self.slots[b];
             if s == EMPTY {
                 // Not present: reuse the first tombstone seen, else this vacancy.
-                let at = if insert_at != usize::MAX { insert_at } else { b };
+                let at = if insert_at != usize::MAX {
+                    insert_at
+                } else {
+                    b
+                };
                 if self.slots[at] == TOMB {
                     self.tombs -= 1;
                 }

@@ -37,6 +37,7 @@ sha2.workspace = true
 
 # Encoding
 hex.workspace = true
+snap.workspace = true
 
 # Random (jitter for reconnection backoff)
 rand.workspace = true

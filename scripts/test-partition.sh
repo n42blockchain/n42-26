@@ -55,6 +55,7 @@ NUM_VALIDATORS=4
 PARTITION_HOLD_S=30     # seconds to hold the partition before healing
 RECOVERY_WINDOW_S=180   # seconds to wait for post-heal block production
 KEEP_RUNNING="${KEEP_RUNNING:-0}"
+FIRST_BLOCK_TIMEOUT_SEC="${N42_FIRST_BLOCK_TIMEOUT:-300}"
 DEBUG_BUILD=false
 
 while [[ $# -gt 0 ]]; do
@@ -303,6 +304,7 @@ start_validator() {
         --authrpc.port "$((BASE_AUTH + idx))" \
         --port "$((BASE_P2P + idx))" \
         --discovery.port "$((BASE_P2P + idx))" \
+        --discovery.v5.port "$((BASE_P2P + idx))" \
         --log.file.directory "$datadir/logs" \
         --ipcdisable \
         --max-outbound-peers "$((NUM_VALIDATORS + 2))" \
@@ -335,7 +337,7 @@ done
 RPC_V0=$BASE_HTTP   # V0 is our stable RPC throughout (stays in the live half)
 
 log "Waiting for first block..."
-wait_for_height "$RPC_V0" 1 120 "v0" || fail "No blocks in 120s — check $DATA_DIR/validator-0.log"
+wait_for_height "$RPC_V0" 1 "$FIRST_BLOCK_TIMEOUT_SEC" "v0" || fail "No blocks in ${FIRST_BLOCK_TIMEOUT_SEC}s — check $DATA_DIR/validator-0.log"
 
 log "Waiting for 5 more blocks to confirm stable liveness..."
 set +u

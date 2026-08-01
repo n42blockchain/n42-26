@@ -1,8 +1,10 @@
 use alloy_primitives::keccak256;
 use libp2p::gossipsub::{self, Message, MessageId, TopicHash};
 use n42_primitives::{CONSENSUS_PROTOCOL_VERSION, ConsensusMessage, VersionedMessage};
+use std::env;
 
 use crate::error::NetworkError;
+use crate::h2_wire;
 
 /// Maximum size for a consensus bincode message (4MB).
 const MAX_CONSENSUS_MSG_SIZE: usize = 4 * 1024 * 1024;
@@ -12,6 +14,12 @@ const MAX_CONSENSUS_MSG_SIZE: usize = 4 * 1024 * 1024;
 /// Wraps in a `VersionedMessage` envelope so receivers can detect version
 /// mismatches during rolling upgrades.
 pub fn encode_consensus_message(msg: &ConsensusMessage) -> Result<Vec<u8>, NetworkError> {
+    if is_gov5_compat_enabled() {
+        if let Some(vote_bytes) = encode_gov5_vote_compat(msg) {
+            return Ok(vote_bytes);
+        }
+    }
+
     let versioned = VersionedMessage {
         version: CONSENSUS_PROTOCOL_VERSION,
         message: msg.clone(),
@@ -19,14 +27,11 @@ pub fn encode_consensus_message(msg: &ConsensusMessage) -> Result<Vec<u8>, Netwo
     bincode::serialize(&versioned).map_err(|e| NetworkError::Codec(e.to_string()))
 }
 
-/// Decodes a versioned consensus message from GossipSub bytes.
+/// Decodes a consensus message from GossipSub bytes.
 ///
-/// Rejects payloads exceeding 4MB to prevent OOM. The fallback to bare
-/// `ConsensusMessage` deserialization has been intentionally removed:
-/// accepting unversioned messages allows a downgrade attack where a
-/// malicious peer sends pre-versioned (unversioned) messages that bypass
-/// the version check entirely. During rolling upgrades, nodes should be
-/// upgraded before the version is bumped.
+/// Rejects payloads exceeding 4MB to prevent OOM. By default this expects the
+/// Rust versioned format. When `N42_GOV5_COMPAT=1`, it also accepts a Gov5 vote
+/// envelope as a compatibility path.
 pub fn decode_consensus_message(data: &[u8]) -> Result<ConsensusMessage, NetworkError> {
     if data.len() > MAX_CONSENSUS_MSG_SIZE {
         return Err(NetworkError::Codec(format!(
@@ -34,6 +39,32 @@ pub fn decode_consensus_message(data: &[u8]) -> Result<ConsensusMessage, Network
             data.len(),
             MAX_CONSENSUS_MSG_SIZE,
         )));
+    }
+
+    if is_gov5_compat_enabled() {
+        if is_gov5_envelope(data) {
+            if let Ok(msg) = decode_gov5_message_compat(data) {
+                return Ok(msg);
+            }
+        }
+
+        if let Ok(versioned) = bincode::deserialize::<VersionedMessage>(data) {
+            if versioned.version == CONSENSUS_PROTOCOL_VERSION {
+                return Ok(versioned.message);
+            }
+            return Err(NetworkError::Codec(format!(
+                "unsupported protocol version: got {}, expected {}",
+                versioned.version, CONSENSUS_PROTOCOL_VERSION,
+            )));
+        }
+
+        if let Ok(msg) = decode_gov5_message_compat(data) {
+            return Ok(msg);
+        }
+
+        return Err(NetworkError::Codec(
+            "unsupported gov5 consensus envelope".into(),
+        ));
     }
 
     let versioned = bincode::deserialize::<VersionedMessage>(data)
@@ -47,6 +78,53 @@ pub fn decode_consensus_message(data: &[u8]) -> Result<ConsensusMessage, Network
     }
 
     Ok(versioned.message)
+}
+
+fn is_gov5_compat_enabled() -> bool {
+    matches!(
+        env::var("N42_GOV5_COMPAT")
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "on" | "yes"
+    )
+}
+
+fn is_gov5_envelope(data: &[u8]) -> bool {
+    if data.is_empty() {
+        return false;
+    }
+    h2_wire::H2MessageKind::try_from(data[0]).is_ok()
+}
+
+fn encode_gov5_vote_compat(msg: &ConsensusMessage) -> Option<Vec<u8>> {
+    match msg {
+        ConsensusMessage::Vote(vote) => {
+            let gov5_vote = h2_wire::H2Vote {
+                view: vote.view,
+                block_hash: vote.block_hash,
+                voter: vote.voter,
+                signature: vote.signature.clone(),
+                high_tc: None,
+            };
+            h2_wire::encode_vote(&gov5_vote).ok()
+        }
+        _ => None,
+    }
+}
+
+fn decode_gov5_message_compat(data: &[u8]) -> Result<ConsensusMessage, NetworkError> {
+    match h2_wire::decode_vote(data) {
+        Ok(vote) => Ok(ConsensusMessage::Vote(n42_primitives::Vote {
+            view: vote.view,
+            block_hash: vote.block_hash,
+            voter: vote.voter,
+            signature: vote.signature.clone(),
+        })),
+        Err(_) => Err(NetworkError::Codec(
+            "no Rust consensus format match and gov5 decode failed".into(),
+        )),
+    }
 }
 
 /// Generates a unique message ID for GossipSub deduplication.

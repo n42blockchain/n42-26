@@ -447,12 +447,12 @@ mod x86 {
             let mut lanes = [0usize; 16];
             let mut n = 0usize;
             let flush = |lanes: &[usize; 16],
-                             n: usize,
-                             m1_t: &mut [u32; 256],
-                             m2_t: &mut [u32; 256],
-                             lens: &mut [i32; 16],
-                             out_t: &mut [u32; 128],
-                             out: &mut [Hash]| {
+                         n: usize,
+                         m1_t: &mut [u32; 256],
+                         m2_t: &mut [u32; 256],
+                         lens: &mut [i32; 16],
+                         out_t: &mut [u32; 128],
+                         out: &mut [Hash]| {
                 if n == 0 {
                     return;
                 }
@@ -502,7 +502,12 @@ mod x86 {
 
     /// 8-lane variant of [`core16`] (AVX2 has no native rotate: shift+or).
     #[target_feature(enable = "avx2")]
-    unsafe fn core8(cv: &[__m256i; 8], m: &[__m256i; 16], len: __m256i, flags: u32) -> [__m256i; 8] {
+    unsafe fn core8(
+        cv: &[__m256i; 8],
+        m: &[__m256i; 16],
+        len: __m256i,
+        flags: u32,
+    ) -> [__m256i; 8] {
         {
             macro_rules! bc {
                 ($x:expr) => {
@@ -634,12 +639,12 @@ mod x86 {
             let mut lanes = [0usize; 8];
             let mut n = 0usize;
             let flush = |lanes: &[usize; 8],
-                             n: usize,
-                             m1_t: &mut [u32; 128],
-                             m2_t: &mut [u32; 128],
-                             lens: &mut [i32; 8],
-                             out_t: &mut [u32; 64],
-                             out: &mut [Hash]| {
+                         n: usize,
+                         m1_t: &mut [u32; 128],
+                         m2_t: &mut [u32; 128],
+                         lens: &mut [i32; 8],
+                         out_t: &mut [u32; 64],
+                         out: &mut [Hash]| {
                 if n == 0 {
                     return;
                 }

@@ -295,8 +295,15 @@ impl StarHub {
                     match incoming.await {
                         Ok(connection) => {
                             handle_phone_connection(
-                                sid, connection, sessions, event_tx, receipt_batch_tx,
-                                session_tx, session_rx, senders, max_conns,
+                                sid,
+                                connection,
+                                sessions,
+                                event_tx,
+                                receipt_batch_tx,
+                                session_tx,
+                                session_rx,
+                                senders,
+                                max_conns,
                             )
                             .await;
                         }
