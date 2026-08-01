@@ -5346,6 +5346,40 @@ mod tests {
     }
 
     #[test]
+    fn long_h2_catchup_retains_views_after_live_binding_eviction() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx)
+            .with_h2_v4_catchup_buffer_blocks(4096);
+        let source = n42_network::PeerId::random();
+        let mut parent = B256::repeat_byte(0x61);
+        orch.head_block_hash = parent;
+
+        for height in 1..=2049_u64 {
+            let view = height + 100;
+            let (hash, rlp) = test_gov5_block_rlp(parent, height, view);
+            orch.h2_v4_catchup_blocks
+                .insert(height, (source, rlp, view));
+            orch.remember_h2_v4_block_view(hash, view);
+            parent = hash;
+        }
+        orch.h2_v4_catchup_active = true;
+
+        assert_eq!(orch.h2_v4_block_views.len(), 2048);
+        assert_eq!(
+            orch.ready_h2_v4_catchup_heights(),
+            Some((1..=2049).collect())
+        );
+        assert_eq!(
+            orch.h2_v4_catchup_blocks
+                .get(&1)
+                .map(|(_, _, authenticated_view)| *authenticated_view),
+            Some(101)
+        );
+    }
+
+    #[test]
     fn bound_h2_bodies_are_released_in_execution_height_order() {
         let (engine, output_rx) = make_test_engine();
         let (network, _cmd_rx, _prx) = make_test_network();

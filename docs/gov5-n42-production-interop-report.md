@@ -17,11 +17,16 @@ parent is `origin/main @ e6396fd034fec9e1cc1a1baebc33634491f741c4`, version
 also includes the preceding current-main MDBX durable-default and txspool
 changes. Full `go test ./...` passed on the merged candidate.
 
-The live Rust source remains `feat/gov5-n42-live-interop @ c970f5895`, built
-against the separate Reth worktree at `c533db8` (Reth 2.4.1). The targeted
-Rust interop suite passed: 164 tests, zero failures. The staged binary hashes
-are Gov5 `4797696faa42cff77cb4f75fb8db22cb89decb42cd10178748052c25131f77f2`
-and Rust `cb3675f27d2ded18b997e3fdfa735ecb13bbc7f696aca9245fe787fbcdeda206`.
+The active qualification binary source is `feat/gov5-n42-live-interop @ 4a11238`, built
+against the separate Reth worktree at `c533db8` (Reth 2.4.1). Commits
+`ac1fc06` and `4a11238` add an explicitly configured, hard-capped authenticated
+Gov5 catch-up buffer and retain each buffered block's already-verified H2 view
+independently of the 2,048-entry live binding cache. The production default
+remains 2,048 blocks; the 5.7.905 qualification run explicitly uses 131,072.
+The targeted Rust suites passed 569 tests (220 consensus, 185 service, and 164
+network), zero failures. The staged binary hashes are Gov5
+`4797696faa42cff77cb4f75fb8db22cb89decb42cd10178748052c25131f77f2` and
+Rust `e23b8db8096f060bb6a6f6ef1e3443daa8f9bccf0bc65ad136c88f82f179a9a3`.
 
 An independent 5.7.905 `init` against the qualification genesis regenerated
 block zero as
@@ -35,8 +40,16 @@ startup attempt is preserved under runtime-15 logs. The 5 Gov5 nodes reached
 the same head, but the two Reth 2.4.1 Rust processes did not open RPC within
 the 10-minute readiness budget when given the copied legacy Reth database;
 therefore no acceptance time was credited and no P4 evidence file was
-created. A compatible Reth 2.4.1 data snapshot or a fresh current-data
-generation is required before arming the 24-hour window.
+created. Runtime-16 therefore regenerates both Rust databases from the
+authenticated bootstrap bundle instead of copying the legacy Reth database:
+`/Users/jieliu/Documents/n42/live-interop-20260721/runtime-16-gov5-905-fresh-reth`.
+Its first repaired Rust node opened RPC immediately, replayed block zero
+through checkpoint 29, then released and executed a 784-block authenticated
+Gov5 ancestry segment to durable height 813. It has now selected the current
+5.7.905 Gov head near 83.5k and is performing the long reverse-ancestry fetch.
+This is active progress, not yet a 24-hour PASS; the acceptance clock remains
+unarmed until both Rust validators reach the exact Gov head and jointly
+participate in block production.
 
 ## Source and binary identity
 
@@ -65,6 +78,8 @@ Pushed implementation commits:
 - n42-26: `f49422f` (`fix(interop): normalize gov5 log response shapes`)
 - n42-26: `6180ec5` (`fix(rpc): scope batch normalization by request method`)
 - n42-26: `1b8d52b` (`style(rpc): make disabled batch path explicit`)
+- n42-26: `ac1fc06` (`fix(interop): bound configurable Gov5 catch-up buffer`)
+- n42-26: `4a11238` (`fix(interop): retain catch-up authentication views`)
 - N42-gov5: `b027f3040` (`feat(interop): harden Gov5 mixed-client operation`)
 - N42-gov5: `34021c3f7` (`test: make hive genesis fixture self-contained`)
 - N42-gov5: `a70f7cf68` (`test: share hive fixture across packages`)
