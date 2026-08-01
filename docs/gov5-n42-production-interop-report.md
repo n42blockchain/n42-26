@@ -31,8 +31,12 @@ runtime copies the verified chain data while excluding old MDBX locks, PID
 files, LOCK files, and IPC sockets; it is
 `/Users/jieliu/Documents/n42/live-interop-20260721/runtime-15-gov5-905-interop`.
 The fresh 905 mixed-client 24-hour window is armed but not yet a PASS; its
-acceptance evidence is
-`evidence/p4-gov5-905-mixed-24h.jsonl`.
+startup attempt is preserved under runtime-15 logs. The 5 Gov5 nodes reached
+the same head, but the two Reth 2.4.1 Rust processes did not open RPC within
+the 10-minute readiness budget when given the copied legacy Reth database;
+therefore no acceptance time was credited and no P4 evidence file was
+created. A compatible Reth 2.4.1 data snapshot or a fresh current-data
+generation is required before arming the 24-hour window.
 
 ## Source and binary identity
 
