@@ -141,6 +141,7 @@ start_rust_validator() {
     "N42_INTEROP_GENESIS_HASH=$genesis_hash"
     "N42_GOV5_BOOTSTRAP_BUNDLE=$runtime/artifacts/bootstrap-bundle.json"
     "N42_QMDB_REPLAY_DEPTH=${N42_QMDB_REPLAY_DEPTH:-1048576}"
+    "N42_GOV5_CATCHUP_BUFFER_BLOCKS=${N42_GOV5_CATCHUP_BUFFER_BLOCKS:-2048}"
     "N42_CONSENSUS_PORT=$consensus_port"
     "N42_STARHUB_PORT=$starhub_port"
     "N42_NO_AUTO_CONNECT=1"

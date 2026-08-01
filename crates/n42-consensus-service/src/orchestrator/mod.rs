@@ -41,6 +41,19 @@ const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
 /// use a larger batch target to reduce cross-task and cross-peer overhead.
 const TX_FORWARD_BATCH_TARGET: usize = 512;
 const H2_V4_FETCH_RETRY_TIMEOUT: Duration = Duration::from_secs(12);
+const DEFAULT_H2_V4_CATCHUP_BUFFER_BLOCKS: usize = 2048;
+const MAX_H2_V4_CATCHUP_BUFFER_BLOCKS: usize = 131_072;
+
+fn h2_v4_catchup_buffer_blocks() -> usize {
+    std::env::var("N42_GOV5_CATCHUP_BUFFER_BLOCKS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_H2_V4_CATCHUP_BUFFER_BLOCKS)
+        .clamp(
+            DEFAULT_H2_V4_CATCHUP_BUFFER_BLOCKS,
+            MAX_H2_V4_CATCHUP_BUFFER_BLOCKS,
+        )
+}
 
 /// Maximum number of already-queued R1/R2 votes verified in one randomized
 /// BLS multi-pairing. Draining is non-blocking, so this adds no timer latency.
@@ -346,6 +359,10 @@ pub struct ConsensusService {
     /// Authenticated ancestry collected newest-to-oldest during far catch-up.
     /// It is released to Engine API only in ascending block order.
     h2_v4_catchup_blocks: BTreeMap<u64, (PeerId, Vec<u8>)>,
+    /// Explicitly bounded block count for authenticated reverse-ancestry
+    /// catch-up. Production keeps the conservative default; qualification can
+    /// opt into a larger, hard-capped window for a known retained chain.
+    h2_v4_catchup_buffer_blocks: usize,
     h2_v4_catchup_active: bool,
     /// Peers that failed to serve an authenticated block hash during the
     /// current bounded retry round. A mixed Rust/Gov set may gossip a child
@@ -690,14 +707,13 @@ impl ConsensusService {
         height: u64,
         activate: bool,
     ) -> bool {
-        const MAX_H2_V4_CATCHUP_BLOCKS: usize = 2048;
         self.prune_executed_h2_v4_catchup_history();
-        if self.h2_v4_catchup_blocks.len() >= MAX_H2_V4_CATCHUP_BLOCKS
+        if self.h2_v4_catchup_blocks.len() >= self.h2_v4_catchup_buffer_blocks
             && !self.h2_v4_catchup_blocks.contains_key(&height)
         {
             error!(
                 target: "n42::interop::h2v4",
-                limit = MAX_H2_V4_CATCHUP_BLOCKS,
+                limit = self.h2_v4_catchup_buffer_blocks,
                 height,
                 "authenticated Gov5 catch-up exceeds the bounded buffer"
             );
@@ -1831,6 +1847,7 @@ impl ConsensusService {
             h2_v4_block_numbers: BTreeMap::new(),
             h2_v4_unbound_blocks: BTreeMap::new(),
             h2_v4_catchup_blocks: BTreeMap::new(),
+            h2_v4_catchup_buffer_blocks: h2_v4_catchup_buffer_blocks(),
             h2_v4_catchup_active: false,
             h2_v4_fetch_failed_peers: BTreeMap::new(),
             h2_v4_fetch_requested_at: HashMap::new(),
@@ -2043,9 +2060,18 @@ impl ConsensusService {
             .unwrap_or(0)
             > 0;
         let async_finalize_fcu = Self::async_finalize_fcu_enabled();
+        let h2_v4_catchup_buffer_blocks = h2_v4_catchup_buffer_blocks();
 
         if slot_time_ms > 0 {
             info!(target: "n42::cl::orchestrator", slot_time_ms, fast_propose, async_finalize_fcu, "slot timing configured");
+        }
+        if h2_v4_catchup_buffer_blocks != DEFAULT_H2_V4_CATCHUP_BUFFER_BLOCKS {
+            info!(
+                target: "n42::interop::h2v4",
+                h2_v4_catchup_buffer_blocks,
+                max = MAX_H2_V4_CATCHUP_BUFFER_BLOCKS,
+                "configured authenticated Gov5 catch-up buffer"
+            );
         }
 
         Self {
@@ -2056,6 +2082,7 @@ impl ConsensusService {
             h2_v4_block_numbers: BTreeMap::new(),
             h2_v4_unbound_blocks: BTreeMap::new(),
             h2_v4_catchup_blocks: BTreeMap::new(),
+            h2_v4_catchup_buffer_blocks,
             h2_v4_catchup_active: false,
             h2_v4_fetch_failed_peers: BTreeMap::new(),
             h2_v4_fetch_requested_at: HashMap::new(),
@@ -2152,6 +2179,14 @@ impl ConsensusService {
 
     pub fn with_exec_output_cache(mut self, cache: Arc<dyn ExecutionOutputCache>) -> Self {
         self.exec_output_cache = Some(cache);
+        self
+    }
+
+    pub fn with_h2_v4_catchup_buffer_blocks(mut self, blocks: usize) -> Self {
+        self.h2_v4_catchup_buffer_blocks = blocks.clamp(
+            DEFAULT_H2_V4_CATCHUP_BUFFER_BLOCKS,
+            MAX_H2_V4_CATCHUP_BUFFER_BLOCKS,
+        );
         self
     }
 
@@ -5262,6 +5297,51 @@ mod tests {
         orch.prune_executed_h2_v4_catchup_history();
         assert!(orch.h2_v4_catchup_blocks.is_empty());
         assert!(!orch.h2_v4_catchup_active);
+    }
+
+    #[test]
+    fn h2_catchup_buffer_keeps_the_conservative_default() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx)
+            .with_h2_v4_catchup_buffer_blocks(DEFAULT_H2_V4_CATCHUP_BUFFER_BLOCKS);
+        let peer = n42_network::PeerId::random();
+
+        for height in 1..=DEFAULT_H2_V4_CATCHUP_BUFFER_BLOCKS {
+            orch.h2_v4_catchup_blocks
+                .insert(height as u64, (peer, vec![height as u8]));
+        }
+
+        assert!(!orch.stage_h2_v4_catchup_block(peer, vec![0xff], 2049, true));
+        assert_eq!(
+            orch.h2_v4_catchup_blocks.len(),
+            DEFAULT_H2_V4_CATCHUP_BUFFER_BLOCKS
+        );
+    }
+
+    #[test]
+    fn h2_catchup_buffer_can_be_explicitly_expanded_but_remains_hard_capped() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx)
+            .with_h2_v4_catchup_buffer_blocks(4096);
+        let peer = n42_network::PeerId::random();
+
+        for height in 1..=DEFAULT_H2_V4_CATCHUP_BUFFER_BLOCKS {
+            orch.h2_v4_catchup_blocks
+                .insert(height as u64, (peer, vec![height as u8]));
+        }
+
+        assert!(orch.stage_h2_v4_catchup_block(peer, vec![0xff], 2049, true));
+        assert_eq!(orch.h2_v4_catchup_blocks.len(), 2049);
+
+        orch = orch.with_h2_v4_catchup_buffer_blocks(usize::MAX);
+        assert_eq!(
+            orch.h2_v4_catchup_buffer_blocks,
+            MAX_H2_V4_CATCHUP_BUFFER_BLOCKS
+        );
     }
 
     #[test]
