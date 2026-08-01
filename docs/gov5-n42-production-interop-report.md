@@ -8,6 +8,32 @@ disposable-runtime tests, and the guarded exercise against the preserved
 seven-node deployment. Machine-readable evidence and immutable log manifests
 are stored in the qualification runtimes named below.
 
+## Current 2026-08-01 baseline — GOV5 5.7.905
+
+The current-main Gov5 candidate is pushed as
+`integration/gov5-interop-current-main-20260801 @ 520ea7bb7`. Its upstream
+parent is `origin/main @ e6396fd034fec9e1cc1a1baebc33634491f741c4`, version
+5.7.905. The 5.7.905 commit itself only increments the version; the candidate
+also includes the preceding current-main MDBX durable-default and txspool
+changes. Full `go test ./...` passed on the merged candidate.
+
+The live Rust source remains `feat/gov5-n42-live-interop @ c970f5895`, built
+against the separate Reth worktree at `c533db8` (Reth 2.4.1). The targeted
+Rust interop suite passed: 164 tests, zero failures. The staged binary hashes
+are Gov5 `4797696faa42cff77cb4f75fb8db22cb89decb42cd10178748052c25131f77f2`
+and Rust `cb3675f27d2ded18b997e3fdfa735ecb13bbc7f696aca9245fe787fbcdeda206`.
+
+An independent 5.7.905 `init` against the qualification genesis regenerated
+block zero as
+`b71c28109836f120453d097c38819a55b14c49abcc92713037fb9b11201392ec`, matching
+the Rust H2 configuration and the preserved Gov5 chain. The new long-test
+runtime copies the verified chain data while excluding old MDBX locks, PID
+files, LOCK files, and IPC sockets; it is
+`/Users/jieliu/Documents/n42/live-interop-20260721/runtime-15-gov5-905-interop`.
+The fresh 905 mixed-client 24-hour window is armed but not yet a PASS; its
+acceptance evidence is
+`evidence/p4-gov5-905-mixed-24h.jsonl`.
+
 ## Source and binary identity
 
 Interop branches:
