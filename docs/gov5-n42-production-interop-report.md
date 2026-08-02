@@ -111,10 +111,16 @@ an exact common head at `2026-08-02T14:23:42Z` in
 `runtime-18-gov5-906-latest-reth`; it runs for 86,640 seconds and acceptance
 still requires at least 86,400 seconds between the first and last evidence
 samples. Its independent transaction preflight confirmed nonce 17 on all six
-endpoints and sent zero transactions. Live latest-906 participation and leader
-handoff are therefore proved, while the 24-hour gate remains IN PROGRESS and is
-not declared PASS until the full interval, 17-transaction burst, post-burst
-archive parity, restart/rejoin, and final leader audits complete.
+endpoints and sent zero transactions. A separate read-only rehearsal used the
+17 previously finalized transactions at blocks `0x92ea..0x9322` and passed 258
+exact six-endpoint comparisons covering full and hash-only blocks, receipts,
+logs, every transaction object and receipt, balances, nonce, code, and storage.
+This directly confirms that the old Rust-only `blockTimestamp` response-shape
+failure remains fixed in the current binaries without contaminating the new
+zero-transaction window. Live latest-906 participation and leader handoff are
+therefore proved, while the 24-hour gate remains IN PROGRESS and is not declared
+PASS until the full interval, 17-transaction burst, post-burst archive parity,
+restart/rejoin, and final leader audits complete.
 
 ## Source and binary identity
 
