@@ -25,17 +25,19 @@ network. Both clients must:
 | Existing-network observer/follower | Complete | Live Gov5 seven-node Noise/Yamux/H2 following |
 | Execution-gated Rust vote | Complete in isolated committee | Rust imported `Valid`, voted at view 149, Gov5 committed |
 | Out-of-order batch catch-up | Code and unit gate complete | Non-Valid child no longer advances validated watermark |
-| Automatic validator cold start | Not complete | Latest participant run required an explicitly prepared consensus snapshot |
-| Rust leader handoff | Not complete | Production code exists; no full live Rust-proposal → Gov5-votes → CommitQC run yet |
-| Fault/rejoin/epoch soak | Not complete | Mixed-client long-run matrix still pending |
-| Minimal full archive+ parity | Not complete | Historical QMDB state/proof/RPC retention still needs end-to-end serving tests |
+| Automatic validator cold start | Complete | Chain-bound bootstrap bundle, blank-datadir materialization, replay receipt, and cold restart |
+| Rust leader handoff | Complete | 5-Gov/2-Rust P3 plus latest 5-Gov/1-Rust live runs prove Rust proposal → Gov5 `5+5` votes → CommitQC |
+| Fault/rejoin/epoch soak | In progress | Fault matrix and earlier soaks pass; authoritative Gov5 5.7.906 24-hour window and final restart/rejoin remain active |
+| Minimal full archive+ parity | Complete | 209 RPC comparisons, offline QMDB proofs, export/import, corruption recovery, and fresh one-hour parity rehearsal |
 
 Operationally:
 
 - **Read-only follow:** ready now, behind explicit observer gates.
-- **Voting follower:** beta-ready only in a disposable/staged mixed committee.
+- **Voting follower:** qualified in disposable/staged mixed committees.
 - **Existing seven-node validator replacement:** not yet production-ready.
-- **Rust leader and archive+ service:** not yet production-ready.
+- **Rust leader and archive+ service:** qualified in disposable/staged mixed
+  committees; production replacement still depends on the remaining P4/P6
+  gates.
 
 ## Completion plan
 
