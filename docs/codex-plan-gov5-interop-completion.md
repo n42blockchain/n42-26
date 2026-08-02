@@ -370,3 +370,23 @@ T7 (批量验签) ✅ 已完成
   按窗口节奏决定纳入时机。
 - 每个 gate 状态变更同步更新
   `docs/gov5-n42-production-interop-report.md` 的 gate ledger 与对应章节。
+
+---
+
+### T13 — Gov5 5.7.906 / current-main 重新锁定（2026-08-02）
+
+Gov5 `origin/main` 已前进到 `920f7536...`，因此此前尚未满 24 小时的窗口已按
+fail-closed 规则归档，不复用任何 elapsed time。新候选为
+`8915b4cc...`，完整 Go 与 race 测试通过；修复 libmdbx 编译时间戳和 Go build ID 后，
+两次清缓存构建均得到 `51e68918...`。
+
+905 数据迁移复核确认：保留/复制的数据库仍是 `b71c2810...` 创世链；906 空目录的
+内置 private genesis 却是 `75ca525a...`，仅设置 genesis override 不能改变本地链。
+启动脚本因此必须拒绝空目录，并要求固定 SHA 的 genesis artifact、已有 MDBX、准确
+BLS key、network key、network metadata 和 epoch schedule。新目录只能用固定 artifact
+显式 `n42 init`，或复制已经验证的 905 数据。
+
+五个 Gov 节点逐个替换并保留升级前快照后，301 秒恢复监控 PASS：58 个样本、增长
+29 块、最大 lag 0、六端点同高同 hash/stateRoot/receiptsRoot。下一步是从该身份重新
+开始完整 24 小时零交易窗口，同时持续核对 Gov5 current main；随后才释放交易 burst、
+运行 burst 后窗口与 Rust 重启/重入验收。

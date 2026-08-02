@@ -4,6 +4,7 @@ set -euo pipefail
 runtime="${N42_QUAL_RUNTIME:-/Users/jieliu/Documents/n42/live-interop-20260721/runtime-11-production-qualification}"
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 genesis_hash="0xb71c28109836f120453d097c38819a55b14c49abcc92713037fb9b11201392ec"
+genesis_artifact_sha256="561808693c76b356e51f8f5961304e68f3167943c17145bda056612041dca687"
 rust_peer="12D3KooWBMkhLsvbQUWSva1tFiKNmWztd6oqvpaG1DGFqriT9DXi"
 gov_peers=(
   "16Uiu2HAm9yzV5dzXsgu65UzkbtTnnDBTM79UZ76sjQ5pGnwqymFw"
@@ -41,16 +42,35 @@ start_gov_node() {
   fi
   gov_binary="${N42_GOV_BINARY:-$runtime/geth-live}"
   require_file "$gov_binary"
+  require_file "$runtime/artifacts/genesis.json"
   mkdir -p "$runtime/logs" "$runtime/pids"
   index=$((node - 1))
   pid_file="$runtime/pids/gov${node}.pid"
   if pid_alive "$pid_file"; then
     return
   fi
+  gov_datadir="$runtime/gov/node${node}"
+  # Gov5 5.7.906's built-in `--chain private` genesis is not the interop
+  # genesis. Never let an empty or partially copied directory silently create
+  # that different chain. Operators must explicitly run `n42 init` with the
+  # pinned artifact or copy a previously validated 5.7.905 data directory.
+  test "$(shasum -a 256 "$runtime/artifacts/genesis.json" | awk '{print $1}')" = \
+    "$genesis_artifact_sha256" || {
+    echo "refusing Gov$node start: interop genesis artifact SHA-256 mismatch" >&2
+    return 1
+  }
+  test -s "$gov_datadir/chaindata/mdbx.dat" || {
+    echo "refusing Gov$node start: validated initialized chaindata is required" >&2
+    return 1
+  }
+  require_file "$gov_datadir/keystore/bls_${gov_addresses[$index]#0x}.key"
+  require_file "$gov_datadir/network-keys"
+  require_file "$gov_datadir/network.json"
+  require_file "$gov_datadir/epoch_schedule.json"
   args=(
     --chain private
     --profile n42
-    --datadir "$runtime/gov/node${node}"
+    --datadir "$gov_datadir"
     --port "$((30301 + index))"
     --http
     --http.port "$((28501 + index))"
@@ -1647,6 +1667,18 @@ transaction_burst() {
 case "${1:-}" in
   start-gov) start_gov ;;
   start-gov-node) start_gov_node "${2:-}" ;;
+  stop-gov-node)
+    node="${2:-}"
+    test -n "$node" || {
+      echo "gov node number required" >&2
+      exit 2
+    }
+    if test "$node" -lt 1 || test "$node" -gt 6; then
+      echo "gov node number must be in 1..6: $node" >&2
+      exit 2
+    fi
+    stop_one "$runtime/pids/gov${node}.pid"
+    ;;
   start-rust) start_rust ;;
   start-rust2) start_rust2 ;;
   stop-rust) stop_one "$runtime/pids/rust.pid" ;;
@@ -1683,7 +1715,7 @@ case "${1:-}" in
   archive-rpc-parity) archive_rpc_parity "${2:-}" "${3:-}" "${4:-}" ;;
   transaction-burst) transaction_burst "${2:-}" "${3:-}" ;;
   *)
-    echo "usage: $0 {start-gov|start-gov-node N|start-rust|start-rust2|stop-rust|stop-rust2|start|stop|restart-gov-node N|restart-rust|restart-rust2|status|monitor-heads <seconds> [interval] [evidence-file]|audit-soak <evidence-file> <minimum-elapsed-seconds> [maximum-gap-seconds] [maximum-lag] [require-zero-tx]|audit-rust-leaders <first-rust-height> [end-height] [evidence-file]|audit-timeout-recovery <rust-log> [evidence-file]|audit-runtime-logs <rust-log> [evidence-file]|audit-rust-resources <evidence-file> [minimum-elapsed-seconds] [output-file]|record-rust-resources [evidence-file]|monitor-rust-resources <seconds> [interval] [evidence-file]|record-clock <label> [evidence-file]|record-head <label> <port> [evidence-file]|era-checksums <directory>|archive-export <node> <snapshot>|archive-verify <snapshot>|archive-import <snapshot> <fresh-destination>|archive-corruption-drill <snapshot> <corrupt-copy> <recovered-copy> [evidence-file]|archive-rpc-parity <gov-endpoint> <rust-endpoint> [evidence-file]|transaction-burst [ARTIFACT] [EVIDENCE]}" >&2
+    echo "usage: $0 {start-gov|start-gov-node N|stop-gov-node N|start-rust|start-rust2|stop-rust|stop-rust2|start|stop|restart-gov-node N|restart-rust|restart-rust2|status|monitor-heads <seconds> [interval] [evidence-file]|audit-soak <evidence-file> <minimum-elapsed-seconds> [maximum-gap-seconds] [maximum-lag] [require-zero-tx]|audit-rust-leaders <first-rust-height> [end-height] [evidence-file]|audit-timeout-recovery <rust-log> [evidence-file]|audit-runtime-logs <rust-log> [evidence-file]|audit-rust-resources <evidence-file> [minimum-elapsed-seconds] [output-file]|record-rust-resources [evidence-file]|monitor-rust-resources <seconds> [interval] [evidence-file]|record-clock <label> [evidence-file]|record-head <label> <port> [evidence-file]|era-checksums <directory>|archive-export <node> <snapshot>|archive-verify <snapshot>|archive-import <snapshot> <fresh-destination>|archive-corruption-drill <snapshot> <corrupt-copy> <recovered-copy> [evidence-file]|archive-rpc-parity <gov-endpoint> <rust-endpoint> [evidence-file]|transaction-burst [ARTIFACT] [EVIDENCE]}" >&2
     exit 2
     ;;
 esac

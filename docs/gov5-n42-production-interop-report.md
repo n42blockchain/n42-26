@@ -1615,3 +1615,57 @@ participant 24-hour monitoring, restart/rejoin, pending-proposal-without-R1
 guard, active rollback rehearsal, and final mixed reactivation, is ARMED under
 a sleep inhibitor since `2026-07-29T04:51:36Z`. Participant state and the
 replacement marker remain absent.
+
+## 2026-08-02 Gov5 5.7.906 current-main reselection
+
+Gov5 `origin/main` advanced to
+`920f7536eb263b6744b48f28dfeb77f4c2798c1a`. The preceding mixed-client
+window was therefore excluded rather than credited toward qualification. Its
+13,847 seconds, 456 samples, 1,566 blocks of growth, maximum lag two, and zero
+transactions are preserved under
+`excluded/gov5-906-superseded-upstream-20260802T194556Z/`; the exclusion
+manifest SHA-256 is
+`cb5fb95b25b35e06f4536cc5629dfe037ca3b839aac3affa01635fc28a4a644f`.
+
+The new integration candidate is pushed at
+`integration/gov5-interop-current-main-20260801 @
+8915b4cc07d82dc195daee2e8e741ea5e8446068`. It includes current main and a
+build fix that pins the Go build ID to the source commit and replaces
+libmdbx's compile-time timestamp with `reproducible`. Two independent builds,
+each preceded by `go clean -cache`, now produce the same executable SHA-256:
+`51e68918560be65f8e5221f02a3d544a7baf42bed9aa86655623449a4fd765d0`.
+`go test ./...`, the targeted P2P/txspool race suite, and
+`go test -race ./...` all pass. The executable identifies itself as
+5.7.906 at candidate commit `8915b4cc`.
+
+The data migration check found a consensus-critical distinction. Starting an
+empty 5.7.906 directory with only `--chain private` creates built-in genesis
+`0x75ca525a980dad7c9faf1b8ceea38e6bb4276ca6b65a7ffac2a9858a7c1c8a32`
+with state root
+`0x471b9d2c852cdffce5dfb636b9e77d90c6e0a5af129b44db8db70bd4cf615570`.
+That is not this interop chain. Explicitly running `n42 init --profile n42
+--chain private --data.dir <dir> artifacts/genesis.json` produces the required
+genesis
+`0xb71c28109836f120453d097c38819a55b14c49abcc92713037fb9b11201392ec`,
+state root
+`0x91a450c13f9deab2c9edf5832c96008862e7cc1169599f68461c3ec947099941`,
+and empty transaction/receipt root
+`0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421`.
+The pinned genesis artifact SHA-256 is
+`561808693c76b356e51f8f5961304e68f3167943c17145bda056612041dca687`.
+`--p2p.genesis-override` changes handshake identity only and cannot repair an
+incorrect local database. Consequently, the qualification launcher now
+refuses empty, partial, or wrong-artifact Gov directories: each validator must
+use an explicitly initialized database or a validated copy of the 5.7.905
+data, with its original validator and network keys retained.
+
+All five retained 5.7.905/5.7.906 validator databases remained on the required
+`b71c...` lineage. Before replacement, APFS snapshots were captured under
+`snapshots/pre-gov5-8915b4cc0/`. The validators were then stopped, replaced,
+and restarted one at a time without deleting or regenerating data. The final
+post-rollout recovery stream has SHA-256
+`56680c89a56121d84cd9d099c21d1bd6ba2e84ccdb4fc6158c437e2592deda94`:
+58 samples over 301 seconds, 29 blocks of growth, maximum lag zero, zero
+transactions, and exact block hash, state root, and receipt root across five
+Gov endpoints and the Rust/Reth endpoint. This recovery check is a preflight,
+not a substitute for the fresh strict 24-hour window.

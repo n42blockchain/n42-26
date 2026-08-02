@@ -18,6 +18,7 @@ runtime_log_final="$runtime/evidence/runtime-log-final-audit.jsonl"
 resource_evidence="$runtime/evidence/rust-resource-24h.jsonl"
 resource_audit="$runtime/evidence/rust-resource-24h-audit.json"
 upstream="$runtime/evidence/gov5-upstream-24h.jsonl"
+upstream_complete="$runtime/evidence/gov5-upstream-24h-complete.json"
 upstream_audit="$runtime/evidence/gov5-upstream-24h-audit.json"
 soak_audit="$runtime/evidence/mixed-soak-24h-audit.json"
 post_burst_audit="$runtime/evidence/mixed-post-burst-10m-audit.json"
@@ -29,9 +30,10 @@ rust_port="${N42_QUAL_RUST_PORT:-29545}"
 rust_miner="${N42_QUAL_RUST_MINER:-0x81d4c1f92ddb837cb46f82280d9b491b101fa582}"
 rust_leader_start="${N42_QUAL_RUST_LEADER_START:-85387}"
 expected_genesis="0xb71c28109836f120453d097c38819a55b14c49abcc92713037fb9b11201392ec"
-expected_gov_sha="${N42_QUAL_EXPECTED_GOV_SHA:-fe24cf475bdd362229faaf22e48f65af5011e4abf714d46fe0f83b3b496a9f1f}"
+expected_gov_sha="${N42_QUAL_EXPECTED_GOV_SHA:-51e68918560be65f8e5221f02a3d544a7baf42bed9aa86655623449a4fd765d0}"
 expected_rust_sha="d917782b906176119172e656005218be34ec3d5ad1b7241c0c53f8f6d593da2d"
-expected_gov_upstream_sha="${N42_QUAL_EXPECTED_GOV_UPSTREAM_SHA:-f3dbeba4694590e6478780ac8a14e900f7dd7505}"
+expected_gov_upstream_sha="${N42_QUAL_EXPECTED_GOV_UPSTREAM_SHA:-920f7536eb263b6744b48f28dfeb77f4c2798c1a}"
+expected_gov_candidate_sha="${N42_QUAL_EXPECTED_GOV_CANDIDATE_SHA:-8915b4cc07d82dc195daee2e8e741ea5e8446068}"
 gov_repo="${N42_QUAL_GOV_REPO:-/Users/jieliu/Documents/n42/live-interop-20260721/N42-gov5-current-main-20260801}"
 
 mkdir -p "$runtime/evidence"
@@ -125,6 +127,16 @@ assert_gov_upstream() {
   test "$remote" = "$expected_gov_upstream_sha"
 }
 
+assert_gov_source() {
+  local branch remote_candidate
+  test "$(git -C "$gov_repo" rev-parse HEAD)" = "$expected_gov_candidate_sha"
+  test -z "$(git -C "$gov_repo" status --porcelain)"
+  branch="$(git -C "$gov_repo" rev-parse --abbrev-ref HEAD)"
+  remote_candidate="$(git -C "$gov_repo" ls-remote origin "refs/heads/$branch" |
+    awk 'NR == 1 {print $1}')"
+  test "$remote_candidate" = "$expected_gov_candidate_sha"
+}
+
 audit_gov_upstream() {
   jq -e -s --arg expected "$expected_gov_upstream_sha" '
     length >= 2 and
@@ -197,6 +209,7 @@ require_file "$burst_artifact"
 require_file "$upstream"
 require_file "$resource_evidence"
 assert_runtime_identity
+assert_gov_source
 assert_genesis
 assert_live_identity
 assert_gov_upstream
@@ -251,16 +264,19 @@ assert_live_identity
 # The tested Gov5 baseline must also remain the latest upstream main for a
 # complete 24-hour observation window. This prevents a stale Gov build from
 # receiving a final PASS if upstream moves while the mixed-client soak runs.
-while ! jq -e -s '
-  length >= 2 and
-  ((.[-1].at | fromdateiso8601) - (.[0].at | fromdateiso8601)) >= 86400
-' "$upstream" >/dev/null; do
+upstream_monitor_pattern="gov5-current-upstream-monitor.sh 87000 600 $upstream"
+while ! test -f "$upstream_complete"; do
+  pgrep -f "$upstream_monitor_pattern" >/dev/null
   kill -0 "$(<"$runtime/pids/rust.pid")"
   for port in $ports; do
     wait_for_rpc "$port" 1
   done
   sleep 60
 done
+jq -e --arg expected "$expected_gov_upstream_sha" '
+  .event == "gov5_upstream_monitor_complete" and .status == "PASS" and
+  .expectedMain == $expected and .elapsedSeconds >= 86400 and .samples >= 2
+' "$upstream_complete" >/dev/null
 audit_gov_upstream >"$upstream_audit.pending"
 mv "$upstream_audit.pending" "$upstream_audit"
 
@@ -397,6 +413,7 @@ mv "$resource_audit.pending" "$resource_audit"
 assert_genesis
 assert_live_identity
 assert_gov_upstream
+assert_gov_source
 
 jq -nc \
   --arg at "$(date -u +%FT%TZ)" \
