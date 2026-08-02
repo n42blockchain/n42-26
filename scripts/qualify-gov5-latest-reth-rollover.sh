@@ -27,6 +27,7 @@ expected_p2p_key_sha="d82561e312fbb044f56eec5f434f03ea1e852924f055a8949ea82be9e7
 expected_consensus_config_sha="38cd3fb1f57e5e3053e23de836b7c98e542ccb5375d0521a65b5c2f6175bd8bf"
 expected_bootstrap_sha="35dda59684e7f56978e5d8de385fa2d2bf15b47747388b88a7449ac31387bf15"
 expected_genesis_artifact_sha="561808693c76b356e51f8f5961304e68f3167943c17145bda056612041dca687"
+expected_old_binary_sha="d917782b906176119172e656005218be34ec3d5ad1b7241c0c53f8f6d593da2d"
 key_dir="$runtime/artifacts/validator-keys/node0"
 validator_key="$key_dir/keystore/bls_81d4c1f92ddb837cb46f82280d9b491b101fa582.key"
 p2p_key="$key_dir/network-keys"
@@ -39,25 +40,58 @@ leader_evidence="$qualification_dir/latest-reth-leader-audit.jsonl"
 latest_log="$qualification_dir/latest-reth-rust.log"
 summary="$qualification_dir/latest-reth-final-qualification.json"
 failures="$qualification_dir/latest-reth-failures.jsonl"
+snapshot="$qualification_dir/pre-latest-reth-rust-data"
+source_manifest="$qualification_dir/pre-latest-reth-source-manifest.sha256"
+snapshot_manifest="$qualification_dir/pre-latest-reth-snapshot-manifest.sha256"
 resource_pid=""
+rollover_phase="waiting"
 
 mkdir -p "$qualification_dir"
 
 on_error() {
   local status=$?
   local line="${BASH_LINENO[0]:-0}"
+  local rollback_attempted=false rollback_succeeded=false rollback_pid=null
+  local rust_alive=false
   trap - ERR
   if test -n "$resource_pid" && kill -0 "$resource_pid" 2>/dev/null; then
     kill "$resource_pid" 2>/dev/null || true
     wait "$resource_pid" 2>/dev/null || true
   fi
+  if test -f "$runtime/pids/rust.pid" &&
+    kill -0 "$(<"$runtime/pids/rust.pid")" 2>/dev/null; then
+    rust_alive=true
+  fi
+  if test "$rollover_phase" = "old_stopped" && test "$rust_alive" = false; then
+    rollback_attempted=true
+    rm -f "$runtime/pids/rust.pid"
+    if env \
+      N42_QUAL_RUNTIME="$runtime" \
+      N42_NODE_BINARY="$runtime/n42-node" \
+      N42_CONSENSUS_CONFIG_FILE="$runtime/artifacts/consensus-peer-bound.json" \
+      N42_VALIDATOR_KEY_DIR="$key_dir" \
+      N42_EXPECTED_VALIDATOR_KEY_SHA256="$expected_validator_key_sha" \
+      N42_EXPECTED_P2P_KEY_SHA256="$expected_p2p_key_sha" \
+      N42_GOV5_CATCHUP_BUFFER_BLOCKS=131072 \
+      N42_QMDB_REPLAY_DEPTH=1048576 \
+      "$harness" start-rust >/dev/null 2>&1; then
+      rollback_succeeded=true
+      rollback_pid="$(<"$runtime/pids/rust.pid")"
+    fi
+  fi
   jq -nc \
     --arg at "$(date -u +%FT%TZ)" \
     --argjson status "$status" \
     --argjson line "$line" \
+    --arg phase "$rollover_phase" \
+    --argjson rollback_attempted "$rollback_attempted" \
+    --argjson rollback_succeeded "$rollback_succeeded" \
+    --argjson rollback_pid "$rollback_pid" \
     --arg command "${BASH_COMMAND:-unknown}" \
     '{at:$at,event:"latest_reth_rollover_failure",statusCode:$status,
-      line:$line,command:$command}' >>"$failures"
+      line:$line,phase:$phase,command:$command,
+      rollbackAttempted:$rollback_attempted,
+      rollbackSucceeded:$rollback_succeeded,rollbackPid:$rollback_pid}' >>"$failures"
   exit "$status"
 }
 trap on_error ERR
@@ -149,6 +183,8 @@ assert_static_inputs() {
   fi
   test -x "$latest_binary"
   test "$(shasum -a 256 "$latest_binary" | awk '{print $1}')" = "$expected_binary_sha"
+  test "$(shasum -a 256 "$runtime/n42-node" | awk '{print $1}')" = \
+    "$expected_old_binary_sha"
   version="$("$latest_binary" --version)"
   grep -F 'Reth Version: 2.4.1' <<<"$version" >/dev/null
   grep -F "Commit SHA: $expected_reth_commit" <<<"$version" >/dev/null
@@ -219,6 +255,7 @@ run_qualification() {
   local pre_head_hex pre_head pre_status pre_equiv resource_status
   local post_head_hex post_head post_status post_equiv first_latest_height
   local process_command version
+  local snapshot_files snapshot_kib
 
   assert_static_inputs
   jq -e '.status == "PASS"' "$independent" >/dev/null
@@ -228,6 +265,9 @@ run_qualification() {
   test ! -e "$rollover_evidence"
   test ! -e "$leader_evidence"
   test ! -e "$latest_log"
+  test ! -e "$snapshot"
+  test ! -e "$source_manifest"
+  test ! -e "$snapshot_manifest"
   test ! -s "$failures"
 
   wait_for_rust_authored_head
@@ -252,6 +292,37 @@ run_qualification() {
       headBefore:$head,consensusBefore:$consensus,equivocationsBefore:$equivocations}' \
     >>"$rollover_evidence"
 
+  rollover_phase="old_stopped"
+  env N42_QUAL_RUNTIME="$runtime" "$harness" stop-rust
+  test ! -e "$runtime/pids/rust.pid"
+  cp -a "$runtime/rust" "$snapshot"
+  (
+    cd "$runtime/rust"
+    find . -type f -print0 | LC_ALL=C sort -z | xargs -0 shasum -a 256
+  ) >"$source_manifest"
+  (
+    cd "$snapshot"
+    find . -type f -print0 | LC_ALL=C sort -z | xargs -0 shasum -a 256
+  ) >"$snapshot_manifest"
+  cmp -s "$source_manifest" "$snapshot_manifest"
+  snapshot_files="$(wc -l <"$snapshot_manifest" | tr -d ' ')"
+  snapshot_kib="$(du -sk "$snapshot" | awk '{print $1}')"
+  test "$snapshot_files" -gt 0
+  test "$snapshot_kib" -gt 0
+  jq -nc \
+    --arg at "$(date -u +%FT%TZ)" \
+    --arg snapshot "$snapshot" \
+    --arg source_manifest_sha "$(shasum -a 256 "$source_manifest" | awk '{print $1}')" \
+    --arg snapshot_manifest_sha "$(shasum -a 256 "$snapshot_manifest" | awk '{print $1}')" \
+    --argjson files "$snapshot_files" \
+    --argjson size_kib "$snapshot_kib" \
+    '{at:$at,event:"pre_latest_reth_data_snapshot",status:"PASS",
+      snapshot:$snapshot,files:$files,sizeKiB:$size_kib,
+      sourceManifestSha256:$source_manifest_sha,
+      snapshotManifestSha256:$snapshot_manifest_sha,
+      manifestsByteExact:($source_manifest_sha == $snapshot_manifest_sha)}' \
+    >>"$rollover_evidence"
+
   env \
     N42_QUAL_RUNTIME="$runtime" \
     N42_NODE_BINARY="$latest_binary" \
@@ -261,7 +332,8 @@ run_qualification() {
     N42_EXPECTED_P2P_KEY_SHA256="$expected_p2p_key_sha" \
     N42_GOV5_CATCHUP_BUFFER_BLOCKS=131072 \
     N42_QMDB_REPLAY_DEPTH=1048576 \
-    "$harness" restart-rust
+    "$harness" start-rust
+  rollover_phase="latest_running"
   wait_for_rpc 300
   rpc_recovery=$(( $(date +%s) - started ))
   new_pid="$(<"$runtime/pids/rust.pid")"
@@ -346,6 +418,11 @@ run_qualification() {
     --arg leader_sha "$(shasum -a 256 "$leader_evidence" | awk '{print $1}')" \
     --arg rollover_sha "$(shasum -a 256 "$rollover_evidence" | awk '{print $1}')" \
     --arg log_sha "$(shasum -a 256 "$latest_log" | awk '{print $1}')" \
+    --arg snapshot "$snapshot" \
+    --arg source_manifest_sha "$(shasum -a 256 "$source_manifest" | awk '{print $1}')" \
+    --arg snapshot_manifest_sha "$(shasum -a 256 "$snapshot_manifest" | awk '{print $1}')" \
+    --argjson snapshot_files "$snapshot_files" \
+    --argjson snapshot_kib "$snapshot_kib" \
     --argjson pid_before "$old_pid" \
     --argjson pid_after "$new_pid" \
     --argjson head_before "$pre_head" \
@@ -370,13 +447,17 @@ run_qualification() {
       resourceEvidenceSha256:$resource_sha,resourceAudit:$resource_audit[0],
       leaderEvidenceSha256:$leader_sha,rustLeaderAudit:$leader[-1],
       rolloverEvidenceSha256:$rollover_sha,latestRustLogSha256:$log_sha,
+      preRolloverDataSnapshot:{path:$snapshot,files:$snapshot_files,
+        sizeKiB:$snapshot_kib,sourceManifestSha256:$source_manifest_sha,
+        snapshotManifestSha256:$snapshot_manifest_sha,byteExact:true},
       consensus:$consensus,equivocations:$equivocations,
       genesisExact:true,allSixEndpointsExact:true,latestBinaryStillRunning:true}' \
     >"$summary"
   jq -e '.status == "PASS" and .headGrowth > 0 and
     .headAudit.status == "PASS" and .resourceAudit.status == "PASS" and
     .rustLeaderAudit.status == "PASS" and .consensus.hasCommittedQc == true and
-    .equivocations.total == 0' "$summary" >/dev/null
+    .equivocations.total == 0 and .preRolloverDataSnapshot.byteExact == true' \
+    "$summary" >/dev/null
   cat "$summary"
 }
 
