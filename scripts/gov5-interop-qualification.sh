@@ -715,7 +715,7 @@ audit_timeout_recovery() {
     "$leader_log" | jq -Rc '
     capture("^(?<at>[^ ]+).*view change view=(?<view>[0-9]+)$") |
     {at,view:(.view|tonumber)}' >"$pacemaker"
-  rg ' INFO block committed! view=[0-9]+' "$leader_log" | jq -Rc '
+  rg ' INFO (.*: )?block committed! view=[0-9]+' "$leader_log" | jq -Rc '
     capture("^(?<at>[^ ]+).*block committed! view=(?<view>[0-9]+) block_hash=(?<hash>0x[0-9a-f]{64}).*votes=(?<votes>[0-9]+[+][0-9]+)$") |
     {at,view:(.view|tonumber),hash,votes}' >"$rust_commits"
 
@@ -796,7 +796,7 @@ audit_runtime_logs() {
     "$rust_log" || echo 0)"
   eviction="$(rg -c ' WARN .*evicted rejected compact execution output hash=' \
     "$rust_log" || echo 0)"
-  commits="$(rg -c ' INFO block committed! view=' "$rust_log" || echo 0)"
+  commits="$(rg -c ' INFO (.*: )?block committed! view=' "$rust_log" || echo 0)"
   duplicate_vote="$(rg -c \
     ' WARN .*suppressed duplicate vote \(already voted in this view\)' \
     "$rust_log" || echo 0)"
