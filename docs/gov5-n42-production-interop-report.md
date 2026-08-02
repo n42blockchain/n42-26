@@ -200,6 +200,9 @@ Reth data, consensus data, QMDB WAL, and log counters, plus explicit 1 GiB RSS,
 samples over 4,202 seconds with 474 blocks of growth, RSS 217,680--258,032 KiB,
 161--162 threads, and exactly 93 descriptors. The finalizer waits for the
 resource monitor to close before auditing and hash-binding the immutable file.
+Live catch-up telemetry also remained at `buffered=1` for every observed
+release and recorded zero bounded-buffer overflow errors, excluding the
+configured 131,072-block emergency capacity as an accumulating live map.
 
 ## Source and binary identity
 
