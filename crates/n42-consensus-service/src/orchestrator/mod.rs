@@ -363,6 +363,10 @@ pub struct ConsensusService {
     /// catch-up. Production keeps the conservative default; qualification can
     /// opt into a larger, hard-capped window for a known retained chain.
     h2_v4_catchup_buffer_blocks: usize,
+    /// Avoids rescanning the bounded hash-indexed execution metadata while a
+    /// reverse catch-up holds the same durable head for many thousands of
+    /// incoming ancestors.
+    h2_v4_last_pruned_head_block_number: Option<u64>,
     h2_v4_catchup_active: bool,
     /// Peers that failed to serve an authenticated block hash during the
     /// current bounded retry round. A mixed Rust/Gov set may gossip a child
@@ -691,10 +695,18 @@ impl ConsensusService {
     }
 
     fn prune_executed_h2_v4_catchup_history(&mut self) {
-        self.h2_v4_catchup_blocks
-            .retain(|height, _| *height > self.head_block_number);
-        self.h2_v4_block_numbers
-            .retain(|_, height| *height > self.head_block_number);
+        while self
+            .h2_v4_catchup_blocks
+            .first_key_value()
+            .is_some_and(|(height, _)| *height <= self.head_block_number)
+        {
+            self.h2_v4_catchup_blocks.pop_first();
+        }
+        if self.h2_v4_last_pruned_head_block_number != Some(self.head_block_number) {
+            self.h2_v4_block_numbers
+                .retain(|_, height| *height > self.head_block_number);
+            self.h2_v4_last_pruned_head_block_number = Some(self.head_block_number);
+        }
         if self.h2_v4_catchup_blocks.is_empty() {
             self.h2_v4_catchup_active = false;
         }
@@ -1843,6 +1855,7 @@ impl ConsensusService {
             h2_v4_unbound_blocks: BTreeMap::new(),
             h2_v4_catchup_blocks: BTreeMap::new(),
             h2_v4_catchup_buffer_blocks: h2_v4_catchup_buffer_blocks(),
+            h2_v4_last_pruned_head_block_number: None,
             h2_v4_catchup_active: false,
             h2_v4_fetch_failed_peers: BTreeMap::new(),
             h2_v4_fetch_requested_at: HashMap::new(),
@@ -2078,6 +2091,7 @@ impl ConsensusService {
             h2_v4_unbound_blocks: BTreeMap::new(),
             h2_v4_catchup_blocks: BTreeMap::new(),
             h2_v4_catchup_buffer_blocks,
+            h2_v4_last_pruned_head_block_number: None,
             h2_v4_catchup_active: false,
             h2_v4_fetch_failed_peers: BTreeMap::new(),
             h2_v4_fetch_requested_at: HashMap::new(),
@@ -5280,6 +5294,7 @@ mod tests {
         orch.prune_executed_h2_v4_catchup_history();
 
         assert_eq!(orch.h2_v4_catchup_blocks.len(), 448);
+        assert_eq!(orch.h2_v4_last_pruned_head_block_number, Some(1600));
         assert_eq!(
             orch.h2_v4_catchup_blocks
                 .first_key_value()
@@ -5287,6 +5302,11 @@ mod tests {
             Some(1601)
         );
         assert!(orch.h2_v4_catchup_active);
+
+        orch.h2_v4_catchup_blocks
+            .insert(1500, (peer, vec![0xff], 1500));
+        orch.prune_executed_h2_v4_catchup_history();
+        assert!(!orch.h2_v4_catchup_blocks.contains_key(&1500));
 
         orch.head_block_number = 2048;
         orch.prune_executed_h2_v4_catchup_history();
