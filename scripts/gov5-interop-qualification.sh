@@ -616,6 +616,80 @@ audit_rust_leaders() {
   printf '%s\n' "$summary"
 }
 
+record_rust_resources() {
+  local evidence_file="${1:-}"
+  local pid_file="${N42_QUAL_RUST_PID_FILE:-$runtime/pids/rust.pid}"
+  require_file "$pid_file"
+  local rust_pid
+  rust_pid="$(<"$pid_file")"
+  kill -0 "$rust_pid" 2>/dev/null || {
+    echo "Rust process is not alive: $rust_pid" >&2
+    return 1
+  }
+
+  local rss_kib vsz_kib cpu_percent process_elapsed thread_count fd_count
+  local reth_kib consensus_kib log_bytes wal_file wal_bytes head_hex head
+  rss_kib="$(ps -p "$rust_pid" -o rss= | tr -d ' ')"
+  vsz_kib="$(ps -p "$rust_pid" -o vsz= | tr -d ' ')"
+  cpu_percent="$(ps -p "$rust_pid" -o %cpu= | tr -d ' ')"
+  process_elapsed="$(ps -p "$rust_pid" -o etime= | tr -d ' ')"
+  thread_count="$(ps -M -p "$rust_pid" 2>/dev/null | tail -n +2 | wc -l | tr -d ' ')"
+  fd_count="$(lsof -p "$rust_pid" 2>/dev/null | tail -n +2 | wc -l | tr -d ' ')"
+  reth_kib="$(du -sk "$runtime/rust/reth" | awk '{print $1}')"
+  consensus_kib="$(du -sk "$runtime/rust/consensus" | awk '{print $1}')"
+  log_bytes="$(stat -f '%z' "$runtime/logs/rust.log")"
+  wal_file="$(find "$runtime/rust/consensus" -maxdepth 1 -type f -name '*wal*' -print |
+    head -n 1)"
+  wal_bytes=0
+  if test -n "$wal_file"; then
+    wal_bytes="$(stat -f '%z' "$wal_file")"
+  fi
+  head_hex="$(rpc_request "http://127.0.0.1:${N42_QUAL_RUST_PORT:-29545}" \
+    eth_blockNumber '[]' | jq -er 'select(.error == null) | .result')"
+  head=$((head_hex))
+
+  local snapshot
+  snapshot="$(jq -nc \
+    --arg at "$(date -u +%FT%TZ)" \
+    --argjson pid "$rust_pid" \
+    --arg process_elapsed "$process_elapsed" \
+    --argjson head "$head" \
+    --argjson rss_kib "$rss_kib" \
+    --argjson vsz_kib "$vsz_kib" \
+    --argjson cpu_percent "$cpu_percent" \
+    --argjson threads "$thread_count" \
+    --argjson file_descriptors "$fd_count" \
+    --argjson reth_kib "$reth_kib" \
+    --argjson consensus_kib "$consensus_kib" \
+    --argjson log_bytes "$log_bytes" \
+    --arg wal_file "$wal_file" \
+    --argjson wal_bytes "$wal_bytes" '
+    {at:$at,event:"rust_resource_snapshot",pid:$pid,
+     processElapsed:$process_elapsed,head:$head,rssKiB:$rss_kib,vszKiB:$vsz_kib,
+     cpuPercent:$cpu_percent,threads:$threads,fileDescriptors:$file_descriptors,
+     rethDataKiB:$reth_kib,consensusDataKiB:$consensus_kib,logBytes:$log_bytes,
+     qmdbWalFile:$wal_file,qmdbWalBytes:$wal_bytes}')"
+  if test -n "$evidence_file"; then
+    mkdir -p "$(dirname "$evidence_file")"
+    printf '%s\n' "$snapshot" >>"$evidence_file"
+  fi
+  printf '%s\n' "$snapshot"
+}
+
+monitor_rust_resources() {
+  local duration_seconds="${1:?duration seconds required}"
+  local interval_seconds="${2:-300}"
+  local evidence_file="${3:-$runtime/evidence/rust-resource-snapshots.jsonl}"
+  local first_sample_seconds="$SECONDS"
+  while true; do
+    record_rust_resources "$evidence_file" >/dev/null
+    if test $((SECONDS - first_sample_seconds)) -ge "$duration_seconds"; then
+      break
+    fi
+    sleep "$interval_seconds"
+  done
+}
+
 record_clock_snapshot() {
   label="${1:?snapshot label required}"
   evidence_file="${2:-$runtime/evidence/clock-snapshots.jsonl}"
@@ -1327,6 +1401,8 @@ case "${1:-}" in
   monitor-heads) monitor_heads "${2:-}" "${3:-10}" "${4:-}" ;;
   audit-soak) audit_soak "${2:-}" "${3:-}" "${4:-120}" "${5:-6}" "${6:-0}" ;;
   audit-rust-leaders) audit_rust_leaders "${2:-}" "${3:-}" "${4:-}" ;;
+  record-rust-resources) record_rust_resources "${2:-}" ;;
+  monitor-rust-resources) monitor_rust_resources "${2:-}" "${3:-300}" "${4:-}" ;;
   record-clock) record_clock_snapshot "${2:-}" "${3:-}" ;;
   record-head) record_single_head "${2:-}" "${3:-}" "${4:-}" ;;
   era-checksums) write_era_checksums "${2:-}" ;;
@@ -1337,7 +1413,7 @@ case "${1:-}" in
   archive-rpc-parity) archive_rpc_parity "${2:-}" "${3:-}" "${4:-}" ;;
   transaction-burst) transaction_burst "${2:-}" "${3:-}" ;;
   *)
-    echo "usage: $0 {start-gov|start-gov-node N|start-rust|start-rust2|stop-rust|stop-rust2|start|stop|restart-gov-node N|restart-rust|restart-rust2|status|monitor-heads <seconds> [interval] [evidence-file]|audit-soak <evidence-file> <minimum-elapsed-seconds> [maximum-gap-seconds] [maximum-lag] [require-zero-tx]|audit-rust-leaders <first-rust-height> [end-height] [evidence-file]|record-clock <label> [evidence-file]|record-head <label> <port> [evidence-file]|era-checksums <directory>|archive-export <node> <snapshot>|archive-verify <snapshot>|archive-import <snapshot> <fresh-destination>|archive-corruption-drill <snapshot> <corrupt-copy> <recovered-copy> [evidence-file]|archive-rpc-parity <gov-endpoint> <rust-endpoint> [evidence-file]|transaction-burst [ARTIFACT] [EVIDENCE]}" >&2
+    echo "usage: $0 {start-gov|start-gov-node N|start-rust|start-rust2|stop-rust|stop-rust2|start|stop|restart-gov-node N|restart-rust|restart-rust2|status|monitor-heads <seconds> [interval] [evidence-file]|audit-soak <evidence-file> <minimum-elapsed-seconds> [maximum-gap-seconds] [maximum-lag] [require-zero-tx]|audit-rust-leaders <first-rust-height> [end-height] [evidence-file]|record-rust-resources [evidence-file]|monitor-rust-resources <seconds> [interval] [evidence-file]|record-clock <label> [evidence-file]|record-head <label> <port> [evidence-file]|era-checksums <directory>|archive-export <node> <snapshot>|archive-verify <snapshot>|archive-import <snapshot> <fresh-destination>|archive-corruption-drill <snapshot> <corrupt-copy> <recovered-copy> [evidence-file]|archive-rpc-parity <gov-endpoint> <rust-endpoint> [evidence-file]|transaction-burst [ARTIFACT] [EVIDENCE]}" >&2
     exit 2
     ;;
 esac
