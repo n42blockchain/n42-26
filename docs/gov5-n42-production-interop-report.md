@@ -1683,3 +1683,10 @@ No earlier elapsed time is credited. If all three immutable streams pass, the
 armed finalizer will release the 17-transaction burst, run a ten-minute
 post-burst parity window and archive proof checks, restart Rust, require exact
 rejoin, and run a final ten-minute stability window before issuing PASS.
+
+The two fail-closed branches were exercised independently after launch. A
+deliberately wrong expected `origin/main` exited with status one after writing
+one mismatch sample and did not create a completion marker. An otherwise valid
+runtime with no initialized MDBX also exited with status one before creating a
+Gov PID. The retained regression summary is `PASS` with SHA-256
+`fd4116349fd582f30b3f419b1f19666dd11728b5eea5a69337d47839eaa464db`.

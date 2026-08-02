@@ -396,3 +396,6 @@ BLS key、network key、network metadata 和 epoch schedule。新目录只能用
 资源流绑定 PID 97040，上游流绑定 `920f7536...`。交易预检确认六端点 nonce 都是
 `0x11` 且发送数为 0。只有完整窗口及后续 burst、post-burst、restart/rejoin 全部
 通过后，T13 才能关闭。
+
+补充 fail-closed 回归已通过：伪造的错误 upstream SHA 以状态 1 退出且没有 completion
+marker；空 Gov 数据目录同样在产生 PID 前以状态 1 退出。两条安全门不会静默降级。
