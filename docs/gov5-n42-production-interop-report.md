@@ -1770,3 +1770,11 @@ records RPC recovery separately. Only the finalizer was reloaded; node and
 monitor PIDs, the zero-transaction window, and the sender nonce were unchanged.
 The replacement evidence SHA-256 is
 `4145d5e1d1ab95b9895fdcddc5956b8bbc3f14b8c79deb291f0f49f5828acbba`.
+
+Before release, all 17 pre-signed burst transactions were also decoded
+offline with Cast 1.5.1. Their signer, chain ID 1143, contiguous nonces 17--33,
+hashes, gas fields, deployment bytecode, transfer targets, and values are
+exact. The nonce-17 contract derivation matches the pinned expected address,
+and the sender balance is identical on all six endpoints. This validation sent
+no transaction. Its evidence SHA-256 is
+`73e8ce72a6a7b743cbfd7c46e0850f2aa30f03a92bf47e36d79f0680498b6e23`.
