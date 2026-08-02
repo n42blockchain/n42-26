@@ -1851,3 +1851,10 @@ backpressure recovery remain PASS without relaxed requirements. Thus the only
 open P4 item is this authoritative 24-hour stream and its burst, post-burst,
 and controlled restart/rejoin closure. The recheck evidence SHA-256 is
 `93f8162618ba23a3070d1490d2ffb71856a219d188eabc012eb34d73fd76c616`.
+
+The machine-readable P0, P1, P2, P3, and P5 requirement audits were likewise
+reopened and checked rather than inferred from this report. Every top-level and
+nested requirement remains PASS, the complete Rust/Go P0 gate record remains
+PASS, and all six authoritative file hashes were recomputed. No requirement
+was relaxed. The consolidated recheck evidence SHA-256 is
+`d42ee31493f05e87f7b191d1e98168c370c76c5c0f135a4bd5c6055db299079e`.
