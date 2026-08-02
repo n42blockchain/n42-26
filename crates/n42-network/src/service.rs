@@ -2219,6 +2219,11 @@ impl NetworkService {
                 self.pending_gov5_block_hashes.remove(&requested_hash);
                 self.pending_gov5_block_requests
                     .retain(|_, hash| *hash != requested_hash);
+                // This entry only guards an in-flight attempt and its short
+                // retry cooldown. Keeping every successful historical hash
+                // makes the overflow cleanup scan thousands of entries on
+                // every step of a long reverse ancestry.
+                self.recent_gov5_block_requests.remove(&requested_hash);
                 metrics::counter!("n42_gov5_block_fetch_succeeded_total").increment(1);
                 self.emit_event(NetworkEvent::Gov5BlockFetched {
                     source: peer,
