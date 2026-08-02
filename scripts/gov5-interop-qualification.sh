@@ -831,6 +831,76 @@ audit_runtime_logs() {
   printf '%s\n' "$summary"
 }
 
+audit_rust_resources() {
+  local evidence_file="${1:?resource evidence required}"
+  local minimum_elapsed="${2:-86400}"
+  local output_file="${3:-}"
+  require_file "$evidence_file"
+
+  jq -e -s --argjson minimum_elapsed "$minimum_elapsed" '
+    length >= 2 and
+    all(.[];
+      .event == "rust_resource_snapshot" and
+      (.pid|type) == "number" and (.head|type) == "number" and
+      (.rssKiB|type) == "number" and .rssKiB > 0 and .rssKiB <= 1048576 and
+      (.threads|type) == "number" and .threads > 0 and .threads <= 256 and
+      (.fileDescriptors|type) == "number" and
+        .fileDescriptors > 0 and .fileDescriptors <= 256 and
+      (.rethDataKiB|type) == "number" and
+      (.consensusDataKiB|type) == "number" and
+      (.logBytes|type) == "number" and
+      (.qmdbWalBytes|type) == "number") and
+    ([.[].pid] | unique | length) == 1 and
+    ([.[].at | fromdateiso8601] as $times |
+      ($times[-1] - $times[0]) >= $minimum_elapsed and
+      ([range(1; $times|length) as $i |
+        ($times[$i]-$times[$i-1]) > 0 and
+        ($times[$i]-$times[$i-1]) <= 360] | all)) and
+    .[-1].head > .[0].head and
+    ([range(1;length) as $i |
+      .[$i].head >= .[$i-1].head and
+      .[$i].rethDataKiB >= .[$i-1].rethDataKiB and
+      .[$i].consensusDataKiB >= .[$i-1].consensusDataKiB and
+      .[$i].logBytes >= .[$i-1].logBytes and
+      .[$i].qmdbWalBytes >= .[$i-1].qmdbWalBytes] | all)
+  ' "$evidence_file" >/dev/null
+
+  local summary
+  summary="$(jq -nc \
+    --arg at "$(date -u +%FT%TZ)" \
+    --arg evidence "$evidence_file" \
+    --arg evidence_sha256 "$(shasum -a 256 "$evidence_file" | awk '{print $1}')" \
+    --argjson minimum_elapsed "$minimum_elapsed" \
+    --slurpfile samples "$evidence_file" '
+    [$samples[].at | fromdateiso8601] as $times |
+    {at:$at,event:"rust_resource_audit",status:"PASS",
+      evidence:$evidence,evidenceSha256:$evidence_sha256,
+      samples:($samples|length),pid:$samples[0].pid,
+      firstAt:$samples[0].at,lastAt:$samples[-1].at,
+      elapsedSeconds:($times[-1]-$times[0]),
+      minimumElapsedSeconds:$minimum_elapsed,
+      maximumSampleGapSeconds:([range(1;$times|length) as $i |
+        $times[$i]-$times[$i-1]]|max),
+      startHead:$samples[0].head,endHead:$samples[-1].head,
+      headGrowth:($samples[-1].head-$samples[0].head),
+      rssKiB:{minimum:([$samples[].rssKiB]|min),
+        maximum:([$samples[].rssKiB]|max),limit:1048576},
+      threads:{minimum:([$samples[].threads]|min),
+        maximum:([$samples[].threads]|max),limit:256},
+      fileDescriptors:{minimum:([$samples[].fileDescriptors]|min),
+        maximum:([$samples[].fileDescriptors]|max),limit:256},
+      growth:{rethDataKiB:($samples[-1].rethDataKiB-$samples[0].rethDataKiB),
+        consensusDataKiB:($samples[-1].consensusDataKiB-$samples[0].consensusDataKiB),
+        logBytes:($samples[-1].logBytes-$samples[0].logBytes),
+        qmdbWalBytes:($samples[-1].qmdbWalBytes-$samples[0].qmdbWalBytes)},
+      singleProcess:true,storageAndLogCountersMonotonic:true}')"
+  if test -n "$output_file"; then
+    mkdir -p "$(dirname "$output_file")"
+    printf '%s\n' "$summary" >>"$output_file"
+  fi
+  printf '%s\n' "$summary"
+}
+
 monitor_rust_resources() {
   local duration_seconds="${1:?duration seconds required}"
   local interval_seconds="${2:-300}"
@@ -1561,6 +1631,7 @@ case "${1:-}" in
   audit-rust-leaders) audit_rust_leaders "${2:-}" "${3:-}" "${4:-}" ;;
   audit-timeout-recovery) audit_timeout_recovery "${2:-}" "${3:-}" ;;
   audit-runtime-logs) audit_runtime_logs "${2:-}" "${3:-}" ;;
+  audit-rust-resources) audit_rust_resources "${2:-}" "${3:-86400}" "${4:-}" ;;
   record-rust-resources) record_rust_resources "${2:-}" ;;
   monitor-rust-resources) monitor_rust_resources "${2:-}" "${3:-300}" "${4:-}" ;;
   record-clock) record_clock_snapshot "${2:-}" "${3:-}" ;;
@@ -1573,7 +1644,7 @@ case "${1:-}" in
   archive-rpc-parity) archive_rpc_parity "${2:-}" "${3:-}" "${4:-}" ;;
   transaction-burst) transaction_burst "${2:-}" "${3:-}" ;;
   *)
-    echo "usage: $0 {start-gov|start-gov-node N|start-rust|start-rust2|stop-rust|stop-rust2|start|stop|restart-gov-node N|restart-rust|restart-rust2|status|monitor-heads <seconds> [interval] [evidence-file]|audit-soak <evidence-file> <minimum-elapsed-seconds> [maximum-gap-seconds] [maximum-lag] [require-zero-tx]|audit-rust-leaders <first-rust-height> [end-height] [evidence-file]|audit-timeout-recovery <rust-log> [evidence-file]|audit-runtime-logs <rust-log> [evidence-file]|record-rust-resources [evidence-file]|monitor-rust-resources <seconds> [interval] [evidence-file]|record-clock <label> [evidence-file]|record-head <label> <port> [evidence-file]|era-checksums <directory>|archive-export <node> <snapshot>|archive-verify <snapshot>|archive-import <snapshot> <fresh-destination>|archive-corruption-drill <snapshot> <corrupt-copy> <recovered-copy> [evidence-file]|archive-rpc-parity <gov-endpoint> <rust-endpoint> [evidence-file]|transaction-burst [ARTIFACT] [EVIDENCE]}" >&2
+    echo "usage: $0 {start-gov|start-gov-node N|start-rust|start-rust2|stop-rust|stop-rust2|start|stop|restart-gov-node N|restart-rust|restart-rust2|status|monitor-heads <seconds> [interval] [evidence-file]|audit-soak <evidence-file> <minimum-elapsed-seconds> [maximum-gap-seconds] [maximum-lag] [require-zero-tx]|audit-rust-leaders <first-rust-height> [end-height] [evidence-file]|audit-timeout-recovery <rust-log> [evidence-file]|audit-runtime-logs <rust-log> [evidence-file]|audit-rust-resources <evidence-file> [minimum-elapsed-seconds] [output-file]|record-rust-resources [evidence-file]|monitor-rust-resources <seconds> [interval] [evidence-file]|record-clock <label> [evidence-file]|record-head <label> <port> [evidence-file]|era-checksums <directory>|archive-export <node> <snapshot>|archive-verify <snapshot>|archive-import <snapshot> <fresh-destination>|archive-corruption-drill <snapshot> <corrupt-copy> <recovered-copy> [evidence-file]|archive-rpc-parity <gov-endpoint> <rust-endpoint> [evidence-file]|transaction-burst [ARTIFACT] [EVIDENCE]}" >&2
     exit 2
     ;;
 esac
