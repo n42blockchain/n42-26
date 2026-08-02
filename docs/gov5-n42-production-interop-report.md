@@ -117,10 +117,17 @@ exact six-endpoint comparisons covering full and hash-only blocks, receipts,
 logs, every transaction object and receipt, balances, nonce, code, and storage.
 This directly confirms that the old Rust-only `blockTimestamp` response-shape
 failure remains fixed in the current binaries without contaminating the new
-zero-transaction window. Live latest-906 participation and leader handoff are
-therefore proved, while the 24-hour gate remains IN PROGRESS and is not declared
-PASS until the full interval, 17-transaction burst, post-burst archive parity,
-restart/rejoin, and final leader audits complete.
+zero-transaction window. A controller audit also found and fixed a release
+race: the finalizer could previously release the burst at the 86,400-second
+acceptance threshold while the deliberately 86,640-second zero-transaction
+monitor was still running. Commit `dc65f36` now waits for that monitor to close
+and re-audits its complete immutable stream before sending anything. Only the
+finalizer was replaced; all nodes, the formal monitor, its start time, and its
+accumulated samples remained uninterrupted, and the replacement evidence
+records `transactionsSent:0`. Live latest-906 participation and leader handoff
+are therefore proved, while the 24-hour gate remains IN PROGRESS and is not
+declared PASS until the full interval, 17-transaction burst, post-burst archive
+parity, restart/rejoin, and final leader audits complete.
 
 ## Source and binary identity
 
@@ -172,6 +179,8 @@ Pushed implementation commits:
 - n42-26: `97454e9` (`test(interop): scope leader audit to current runtime`)
 - n42-26: `1236936` (`docs: record gov5 906 live qualification`)
 - n42-26: `b4aceb1` (`test: pin latest gov5 906 qualification runtime`)
+- n42-26: `7a96b97` (`docs: record historical transaction parity rehearsal`)
+- n42-26: `dc65f36` (`fix: close zero-transaction monitor before burst`)
 - N42-gov5: `b027f3040` (`feat(interop): harden Gov5 mixed-client operation`)
 - N42-gov5: `34021c3f7` (`test: make hive genesis fixture self-contained`)
 - N42-gov5: `a70f7cf68` (`test: share hive fixture across packages`)
