@@ -172,19 +172,22 @@ test ! -e "$post_burst_audit"
 test ! -e "$post_restart_audit"
 test ! -e "$summary"
 
-# Wait for the first-to-last formal evidence interval to reach a real 24 hours.
-while ! env N42_QUAL_RUNTIME="$runtime" "$harness" \
-  audit-soak "$formal" 86400 120 6 1 >"$soak_audit.pending" 2>/dev/null; do
+# The monitor intentionally runs four minutes beyond the 24-hour acceptance
+# threshold. Do not release the transaction burst merely because an in-flight
+# snapshot has reached 86,400 seconds: the still-running zero-transaction
+# monitor would observe that burst, fail, and append a disqualifying row after
+# the audit. Wait for the complete 86,640-second stream to close first, then
+# audit the immutable file before any transaction is sent.
+formal_monitor_pattern="monitor-heads 86640 30 $formal"
+while pgrep -f "$formal_monitor_pattern" >/dev/null; do
   kill -0 "$(<"$runtime/pids/rust.pid")"
   for port in $ports; do
     wait_for_rpc "$port" 1
   done
-  if ! pgrep -f "monitor-heads 86640 30 $formal" >/dev/null; then
-    echo "formal monitor exited before its evidence passed" >&2
-    exit 1
-  fi
   sleep 60
 done
+env N42_QUAL_RUNTIME="$runtime" "$harness" \
+  audit-soak "$formal" 86400 120 6 1 >"$soak_audit.pending"
 mv "$soak_audit.pending" "$soak_audit"
 env N42_QUAL_RUNTIME="$runtime" "$harness" \
   audit-soak "$formal" 86400 120 6 1 >/dev/null
