@@ -1869,3 +1869,33 @@ next view with none pending. All 1,147 warnings partition exactly with zero
 unknown or critical signals, and 13 Gov5 upstream samples remain exact over
 7,210 seconds. The combined milestone SHA-256 is
 `b89f7cc0880b67f68f15ab1d7595ed903db6bfffe89c6b00dfe7745f04e7178c`.
+
+The strict three-hour milestone also passes without relaxing acceptance. Its
+380 immutable head samples span 11,561 seconds, grow from block 87,860 to
+89,162, retain continuous zero-transaction coverage, and have maximum lag two.
+The canonical audit scans 1,321 blocks through the exact Rust-authored close at
+block 89,163 (`3f712773d60fd77a332f1ca6666ec710932b1c627303df6005bc4f8f4521791e`).
+All 221 expected Rust leader slots are canonical on all six endpoints and all
+221 commit records contain `votes=5+5`. Every one of the 221 completed missing-
+validator timeouts recovers at the next view, with none pending. The frozen
+logs contain zero unknown warnings and zero critical signals; all 20 Gov5
+upstream samples remain exact over 11,416 seconds. The combined milestone
+SHA-256 is
+`96415fe4561f9ed34cb63fc0d63b32828a42f291948cb7ff6e6c8e9eae3e564b`.
+
+That milestone exposed a resource-auditor edge before the 24-hour release.
+`du -sk` reports allocated filesystem blocks rather than logical bytes, and one
+sample moved from 21,024 to 21,020 KiB while the same Rust PID advanced its
+head and every logical counter; the complete three-hour interval still grew
+Reth allocation by 1,544 KiB, consensus allocation by 240 KiB, logs by
+17,011,373 bytes, and the QMDB WAL by 210,576 bytes. Commit `86c5ffb` therefore
+permits only a single-step allocation-granularity jitter of at most 4 KiB for
+the two `du` counters, while still requiring nonnegative end-to-end allocation
+growth and strict monotonicity for head, log bytes, and QMDB WAL bytes. The
+captured 4 KiB case passes and a synthetic 8 KiB regression fails. The frozen
+harness, finalizer, and independent verifier are now respectively bound to
+`6b95241f...`, `22268b2d...`, and `c22cb061...`. Only the waiting controllers
+were replaced; Rust PID 97040 and monitor PIDs 98287--98290 retained their
+original streams, no node restarted, no transaction was sent, and no elapsed
+time was reset. The rearm evidence SHA-256 is
+`618de069bfc193e3318c49d69d75267ba2559e612f03618faacad67c29cd64f1`.
