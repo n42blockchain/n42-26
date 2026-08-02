@@ -693,7 +693,9 @@ monitor_rust_resources() {
 record_clock_snapshot() {
   label="${1:?snapshot label required}"
   evidence_file="${2:-$runtime/evidence/clock-snapshots.jsonl}"
-  ports=(28501 28502 28503 28504 28505 29545 29546)
+  local -a ports
+  read -r -a ports <<<"${N42_QUAL_PORTS:-28501 28502 28503 28504 28505 29545 29546}"
+  reference_port="${ports[0]}"
   sample_dir="$(mktemp -d)"
   trap 'rm -rf "$sample_dir"' RETURN
   expected=""
@@ -713,13 +715,14 @@ record_clock_snapshot() {
   done
   mkdir -p "$(dirname "$evidence_file")"
   wall_time="$(date +%s)"
-  timestamp_hex="$(jq -er '.result.timestamp' "$sample_dir/28501.json")"
+  timestamp_hex="$(jq -er '.result.timestamp' "$sample_dir/$reference_port.json")"
   block_time=$((timestamp_hex))
   jq -c \
     --arg at "$(date -u +%FT%TZ)" \
     --arg label "$label" \
     --argjson wall_time "$wall_time" \
     --argjson block_time "$block_time" \
+    --argjson participants "${#ports[@]}" \
     '.result | {
       at:$at,
       label:$label,
@@ -730,9 +733,9 @@ record_clock_snapshot() {
       timestamp,
       wallTime:$wall_time,
       futureSeconds:($block_time - $wall_time),
-      participants:7,
+      participants:$participants,
       allEqual:true
-    }' "$sample_dir/28501.json" >>"$evidence_file"
+    }' "$sample_dir/$reference_port.json" >>"$evidence_file"
 }
 
 record_single_head() {
