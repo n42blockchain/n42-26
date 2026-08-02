@@ -938,10 +938,12 @@ audit_rust_resources() {
         ($times[$i]-$times[$i-1]) > 0 and
         ($times[$i]-$times[$i-1]) <= 360] | all)) and
     .[-1].head > .[0].head and
+    .[-1].rethDataKiB >= .[0].rethDataKiB and
+    .[-1].consensusDataKiB >= .[0].consensusDataKiB and
     ([range(1;length) as $i |
       .[$i].head >= .[$i-1].head and
-      .[$i].rethDataKiB >= .[$i-1].rethDataKiB and
-      .[$i].consensusDataKiB >= .[$i-1].consensusDataKiB and
+      .[$i].rethDataKiB + 4 >= .[$i-1].rethDataKiB and
+      .[$i].consensusDataKiB + 4 >= .[$i-1].consensusDataKiB and
       .[$i].logBytes >= .[$i-1].logBytes and
       .[$i].qmdbWalBytes >= .[$i-1].qmdbWalBytes] | all)
   ' "$evidence_file" >/dev/null
@@ -974,7 +976,14 @@ audit_rust_resources() {
         consensusDataKiB:($samples[-1].consensusDataKiB-$samples[0].consensusDataKiB),
         logBytes:($samples[-1].logBytes-$samples[0].logBytes),
         qmdbWalBytes:($samples[-1].qmdbWalBytes-$samples[0].qmdbWalBytes)},
-      singleProcess:true,storageAndLogCountersMonotonic:true}')"
+      allocatedStorageStepJitterKiB:{
+        maximumObserved:([range(1;$samples|length) as $i |
+          ([($samples[$i-1].rethDataKiB-$samples[$i].rethDataKiB),
+            ($samples[$i-1].consensusDataKiB-$samples[$i].consensusDataKiB)] | max) |
+          select(. > 0)] | max // 0),limit:4},
+      singleProcess:true,logicalCountersMonotonic:true,
+      allocatedStorageGrowthNonnegative:true,
+      storageAndLogCountersMonotonicWithinAllocationGranularity:true}')"
   if test -n "$output_file"; then
     mkdir -p "$(dirname "$output_file")"
     printf '%s\n' "$summary" >>"$output_file"

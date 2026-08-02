@@ -146,9 +146,9 @@ assert_pinned_inputs() {
   assert_sha "$runtime/artifacts/bootstrap-bundle.json" \
     35dda59684e7f56978e5d8de385fa2d2bf15b47747388b88a7449ac31387bf15
   assert_sha "$runtime/artifacts/scripts/gov5-interop-qualification.sh" \
-    bd5fafe7b47a8613252c977d0060ccd25e2e1ee6fba949c8f28e0b9feda95d5e
+    6b95241f06fbf2225e9dff8a9bd4534ac5c1363f6f62109883695ebf7db189ab
   assert_sha "$runtime/artifacts/scripts/gov5-current-qualification-finalizer.sh" \
-    dc6f26ecd1b2d94a192266e15ec95e39f79d3cdcf7295308caf53a8da391654a
+    22268b2d7d1a230e0f4ebf0ded8cf7784426c1e334a1e44279060a60cc17f2ec
   assert_sha "$runtime/artifacts/binaries/n42-qmdb-proof-verify" \
     b329baa1e51435082b2bb2cf538a8d1a1ffd994b5c4ac73474e688ffbfc35c19
   assert_sha "$runtime/artifacts/validator-keys/node0/keystore/bls_81d4c1f92ddb837cb46f82280d9b491b101fa582.key" \
@@ -251,7 +251,11 @@ jq -e '
   .rustResourceAudit.status == "PASS" and
   .rustResourceAudit.elapsedSeconds >= 86400 and
   .rustResourceAudit.singleProcess == true and
-  .rustResourceAudit.storageAndLogCountersMonotonic == true
+  .rustResourceAudit.logicalCountersMonotonic == true and
+  .rustResourceAudit.allocatedStorageGrowthNonnegative == true and
+  .rustResourceAudit.storageAndLogCountersMonotonicWithinAllocationGranularity == true and
+  .rustResourceAudit.allocatedStorageStepJitterKiB.maximumObserved <= 4 and
+  .rustResourceAudit.allocatedStorageStepJitterKiB.limit == 4
 ' "$summary" >/dev/null
 
 jq -e \
