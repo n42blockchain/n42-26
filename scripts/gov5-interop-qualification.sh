@@ -247,6 +247,8 @@ monitor_heads() {
   while true; do
     sample_dir="$(mktemp -d)"
     sample_failed=0
+    failed_port=0
+    failed_phase=""
     min_height=-1
     max_height=0
     for port in "${ports[@]}"; do
@@ -255,6 +257,8 @@ monitor_heads() {
         --data '{"jsonrpc":"2.0","id":1,"method":"eth_getBlockByNumber","params":["latest",false]}' \
         "http://127.0.0.1:$port" >"$sample_dir/latest-$port.json"; then
         sample_failed=1
+        failed_port="$port"
+        failed_phase="latest"
         break
       fi
       number_hex="$(jq -er '.result.number' "$sample_dir/latest-$port.json")"
@@ -269,7 +273,9 @@ monitor_heads() {
 
     if test "$sample_failed" -ne 0; then
       jq -nc --arg at "$(date -u +%FT%TZ)" \
-        '{at:$at,ok:false,error:"rpc unavailable"}' >>"$evidence_file"
+        --argjson port "$failed_port" --arg phase "$failed_phase" \
+        '{at:$at,ok:false,error:"rpc unavailable",failedPort:$port,
+          failedPhase:$phase}' >>"$evidence_file"
       rm -rf "$sample_dir"
       return 1
     fi
@@ -283,6 +289,8 @@ monitor_heads() {
         -H 'content-type: application/json' \
         --data "$request" "http://127.0.0.1:$port" >"$sample_dir/common-$port.json"; then
         sample_failed=1
+        failed_port="$port"
+        failed_phase="common-height"
         break
       fi
       identity="$(jq -er '.result | [.hash,.stateRoot,.receiptsRoot] | join(":")' \
@@ -300,7 +308,11 @@ monitor_heads() {
     error=""
     if test "$sample_failed" -ne 0; then
       ok=false
-      error="canonical divergence at common height"
+      if test "$failed_port" -ne 0; then
+        error="rpc unavailable at common height"
+      else
+        error="canonical divergence at common height"
+      fi
     elif test "$lag" -gt "$max_lag"; then
       ok=false
       error="execution lag exceeded bound"
@@ -351,8 +363,15 @@ monitor_heads() {
       --argjson zero_tx_required "$require_zero_tx" \
       --argjson zero_tx_verified_from "$zero_tx_verified_from" \
       --argjson zero_tx_verified_to "$zero_tx_verified_to" \
+      --argjson failed_port "$failed_port" \
+      --arg failed_phase "$failed_phase" \
       --arg identity "$expected" \
-      '{at:$at,ok:$ok,error:$error,commonHeight:$common_height,maximumHeight:$maximum_height,lag:$lag,identity:$identity,zeroTxRequired:$zero_tx_required,zeroTxVerifiedFrom:$zero_tx_verified_from,zeroTxVerifiedTo:$zero_tx_verified_to}' \
+      '{at:$at,ok:$ok,error:$error,commonHeight:$common_height,
+        maximumHeight:$maximum_height,lag:$lag,identity:$identity,
+        zeroTxRequired:$zero_tx_required,zeroTxVerifiedFrom:$zero_tx_verified_from,
+        zeroTxVerifiedTo:$zero_tx_verified_to,
+        failedPort:(if $failed_port == 0 then null else $failed_port end),
+        failedPhase:(if $failed_phase == "" then null else $failed_phase end)}' \
       >>"$evidence_file"
     rm -rf "$sample_dir"
     if test "$ok" != true; then
