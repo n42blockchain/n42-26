@@ -9,8 +9,8 @@ Refresh the N42 workspace to the latest compatible stable dependencies while pre
 deployed replay, consensus, snapshot, keystore, and proof formats. The paired execution-layer
 checkout is the N42 Reth 2.4.1 fork:
 
-- branch: `chore/reth-upstream-20260719`
-- commit: `c533db8bad6f300be93ec047ecffc717b08957f8`
+- branch: `chore/reth-upstream-20260726`
+- commit: `d025e10403b5b0e7ef31f8d6359406f528b0e203`
 - workspace version: `2.4.1`
 
 The Reth checkout remained clean. N42 continues to use local `../reth` paths because the fork
@@ -60,7 +60,20 @@ obsolete `fast-srgb8` edge and adds `palette_math` through palette 0.7.7.
 After the update, another `cargo update --dry-run --verbose` locked zero packages. The only newer
 versions reported are the intentional major or release-matrix pins already documented above.
 The updated lockfile SHA-256 is
-`c5998ac1a8e2a3e8dcaf21847cac78c80ad6e817050c09300cc7183753afff74`.
+`62463bc57fa161ffaf411f7544473603e63ee5ab3781279c2e0682ce4567124e`.
+
+## 2026-08-02 paired Reth follow-up
+
+The paired fork now includes the post-2.4.1 upstream fixes merged by
+`chore/reth-upstream-20260726`. Its default `reth` feature set no longer enables
+`revmc`/LLVM 22 implicitly, keeping ordinary macOS and Windows builds portable; JIT remains
+available through explicit `--features jit`. The Reth dev-node integration harness also uses
+unique ports and a bounded 60-second readiness check with captured child logs instead of the
+dependency helper's fixed ten-second deadline.
+
+Moving the paired checkout from `c533db8` to `d025e1040` added two real dependency edges to the
+N42 lock graph (`parking_lot` and `libc`) without changing package versions or deployed formats.
+The lockfile was regenerated offline, then accepted by a fresh `--locked` all-target check.
 
 The refreshed RustSec database reports no new vulnerability outside the three exact, documented
 nightly exceptions in `audit.toml`. Two belong to hickory 0.25 through libp2p mDNS, which is
@@ -78,9 +91,12 @@ advisory will still fail the nightly gate.
 - JNI 0.22 host compile/clippy harness for `src/android.rs`: passed with warnings denied
 - paired `../reth` status after verification: clean
 
-The 2026-08-02 lock refresh repeated the all-target workspace check, complete workspace test
-suite, and warnings-denied all-target Clippy gate; all passed. These checks ran against the clean
-paired Reth checkout at `c533db8bad6f300be93ec047ecffc717b08957f8` (workspace version 2.4.1).
+The 2026-08-02 lock refresh and paired-Reth follow-up repeated the locked all-target workspace
+check, complete locked workspace test suite, and warnings-denied locked all-target Clippy gate;
+all passed. These checks ran against the clean paired Reth checkout at
+`d025e10403b5b0e7ef31f8d6359406f528b0e203` (workspace version 2.4.1). Reth's own 24 integration
+tests, package tests, full-workspace all-target check, and warnings-denied all-target Clippy gate
+also pass at that revision.
 
 The excluded `n42-zkproof-guest` remains a separate SP1 RISC-V build and was not host-compiled.
 No Android Rust target is installed in this macOS verification environment, so the JNI bridge was
