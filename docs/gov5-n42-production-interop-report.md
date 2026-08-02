@@ -1813,3 +1813,12 @@ difference; both are below the signed `0x186a0` limit, and all `eth_call`
 results are the same. No state changed and no transaction was sent. The
 evidence SHA-256 is
 `77eb639a5412bc39263bb71a52c2aab2ae3aeb27ed8bc5e1e1578d875276d389`.
+
+Finally, the finalizer itself was frozen into the strict runtime and launched
+with its expected SHA-256 supplied out of band. A negative preflight proved
+that a different SHA is rejected before any action; the exact-SHA preflight
+then passed all identity, source, genesis, key, tooling, upstream, and nonce
+checks with zero transactions sent. This finalizer is PID 52570; all node and
+long-running monitor PIDs remain the strict-launch processes. The launch
+evidence SHA-256 is
+`a1b999f37f3660ae9fd569c6dd7af2599b1e67de21667ce58d7f99e8060212a6`.
