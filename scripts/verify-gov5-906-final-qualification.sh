@@ -3,6 +3,8 @@ set -euo pipefail
 
 runtime="${N42_QUAL_RUNTIME:-/Users/jieliu/Documents/n42/live-interop-20260721/runtime-18-gov5-906-latest-reth}"
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+verifier_script="${BASH_SOURCE[0]}"
+expected_verifier_script_sha="${N42_VERIFY_EXPECTED_SELF_SHA:-}"
 gov_repo="${N42_QUAL_GOV_REPO:-/Users/jieliu/Documents/n42/live-interop-20260721/N42-gov5-current-main-20260801}"
 deps_repo="${N42_QUAL_DEPS_REPO:-/Users/jieliu/Documents/n42/deps-latest-20260721/n42-26}"
 reth_repo="${N42_QUAL_RETH_REPO:-/Users/jieliu/Documents/n42/deps-latest-20260721/reth}"
@@ -130,6 +132,9 @@ assert_sources() {
 }
 
 assert_pinned_inputs() {
+  if test -n "$expected_verifier_script_sha"; then
+    assert_sha "$verifier_script" "$expected_verifier_script_sha"
+  fi
   assert_sha "$runtime/geth-live" \
     51e68918560be65f8e5221f02a3d544a7baf42bed9aa86655623449a4fd765d0
   assert_sha "$runtime/n42-node" \
@@ -160,10 +165,13 @@ assert_sources
 if test "$preflight_only" = 1; then
   assert_sender_nonce 0x11
   jq -nc --arg at "$(date -u +%FT%TZ)" \
+    --arg verifier_sha "$expected_verifier_script_sha" \
     '{at:$at,event:"gov5_906_independent_final_verifier_preflight",
       status:"PASS",liveChainExact:true,genesisExact:true,
       consensusReady:true,zeroEquivocations:true,pinnedInputsExact:true,
-      sourcesAndRemotesExact:true,senderNonce:"0x11",transactionsSent:0}'
+      sourcesAndRemotesExact:true,
+      verifierScriptSha256:(if $verifier_sha == "" then null else $verifier_sha end),
+      senderNonce:"0x11",transactionsSent:0}'
   exit 0
 fi
 
@@ -361,8 +369,10 @@ jq -nc \
   --arg at "$(date -u +%FT%TZ)" \
   --arg summary "$summary" \
   --arg summary_sha256 "$(sha256 "$summary")" \
+  --arg verifier_sha "${expected_verifier_script_sha:-$(sha256 "$verifier_script")}" \
   '{at:$at,event:"gov5_906_independent_final_verification",status:"PASS",
     summary:$summary,summarySha256:$summary_sha256,
+    verifierScriptSha256:$verifier_sha,
     allEvidenceHashesRecomputedExact:true,allEmbeddedAuditsExact:true,
     independentRawAuditsReexecuted:true,liveArchiveParityReexecuted:true,
     liveChainExact:true,genesisExact:true,consensusReady:true,
