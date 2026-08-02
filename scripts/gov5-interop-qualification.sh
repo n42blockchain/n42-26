@@ -758,6 +758,79 @@ audit_timeout_recovery() {
   printf '%s\n' "$summary"
 }
 
+audit_runtime_logs() {
+  local rust_log="${1:?Rust log required}"
+  local evidence_file="${2:-}"
+  require_file "$rust_log"
+
+  local audit_dir unknown critical
+  audit_dir="$(mktemp -d)"
+  trap 'rm -rf "$audit_dir"' RETURN
+  unknown="$audit_dir/unknown-warnings.log"
+  critical="$audit_dir/critical-signals.log"
+
+  local total timeout pacemaker eviction commits duplicate_vote duplicate_commit
+  total="$(rg -c ' WARN ' "$rust_log" || echo 0)"
+  timeout="$(rg -c ' WARN view timed out view=' "$rust_log" || echo 0)"
+  pacemaker="$(rg -c ' WARN pacemaker timeout, initiating view change view=' \
+    "$rust_log" || echo 0)"
+  eviction="$(rg -c ' WARN .*evicted rejected compact execution output hash=' \
+    "$rust_log" || echo 0)"
+  commits="$(rg -c ' INFO block committed! view=' "$rust_log" || echo 0)"
+  duplicate_vote="$(rg -c \
+    ' WARN .*suppressed duplicate vote \(already voted in this view\)' \
+    "$rust_log" || echo 0)"
+  duplicate_commit="$(rg -c \
+    ' WARN .*suppressed duplicate commit vote \(already commit-voted in this view\)' \
+    "$rust_log" || echo 0)"
+
+  rg ' WARN ' "$rust_log" | rg -v \
+    ' WARN (view timed out view=|pacemaker timeout, initiating view change view=)| WARN .*evicted rejected compact execution output hash=| WARN .*suppressed duplicate (commit )?vote \(already (commit-)?voted in this view\)' \
+    >"$unknown" || true
+  local log
+  for log in "$runtime"/logs/gov{1,2,3,4,5}.log "$rust_log"; do
+    require_file "$log"
+    rg -i '(^|[^a-z])(error|panic|fatal|equivocat)' "$log" >>"$critical" || true
+  done
+
+  test "$total" -gt 0
+  test "$timeout" -gt 0
+  test "$timeout" -eq "$pacemaker"
+  test "$eviction" -eq "$commits"
+  test "$total" -eq \
+    $((timeout + pacemaker + eviction + duplicate_vote + duplicate_commit))
+  test ! -s "$unknown"
+  test ! -s "$critical"
+
+  local summary
+  summary="$(jq -nc \
+    --arg at "$(date -u +%FT%TZ)" \
+    --arg log "$rust_log" \
+    --arg log_sha256 "$(shasum -a 256 "$rust_log" | awk '{print $1}')" \
+    --argjson total "$total" \
+    --argjson timeout "$timeout" \
+    --argjson pacemaker "$pacemaker" \
+    --argjson eviction "$eviction" \
+    --argjson commits "$commits" \
+    --argjson duplicate_vote "$duplicate_vote" \
+    --argjson duplicate_commit "$duplicate_commit" '
+    {at:$at,event:"mixed_client_runtime_log_audit",status:"PASS",
+      rustLog:$log,rustLogSha256:$log_sha256,totalWarnings:$total,
+      warningCounts:{viewTimeout:$timeout,pacemakerTimeout:$pacemaker,
+        compactExecutionEviction:$eviction,rustLeaderCommit:$commits,
+        duplicateVoteSuppression:$duplicate_vote,
+        duplicateCommitVoteSuppression:$duplicate_commit},
+      warningPartitionExact:true,timeoutSetsCountExact:true,
+      compactEvictionsMatchRustLeaderCommits:true,
+      unexpectedWarnings:0,criticalSignals:0,
+      govLogsChecked:5,rustLogsChecked:1}')"
+  if test -n "$evidence_file"; then
+    mkdir -p "$(dirname "$evidence_file")"
+    printf '%s\n' "$summary" >>"$evidence_file"
+  fi
+  printf '%s\n' "$summary"
+}
+
 monitor_rust_resources() {
   local duration_seconds="${1:?duration seconds required}"
   local interval_seconds="${2:-300}"
@@ -1487,6 +1560,7 @@ case "${1:-}" in
   audit-soak) audit_soak "${2:-}" "${3:-}" "${4:-120}" "${5:-6}" "${6:-0}" ;;
   audit-rust-leaders) audit_rust_leaders "${2:-}" "${3:-}" "${4:-}" ;;
   audit-timeout-recovery) audit_timeout_recovery "${2:-}" "${3:-}" ;;
+  audit-runtime-logs) audit_runtime_logs "${2:-}" "${3:-}" ;;
   record-rust-resources) record_rust_resources "${2:-}" ;;
   monitor-rust-resources) monitor_rust_resources "${2:-}" "${3:-300}" "${4:-}" ;;
   record-clock) record_clock_snapshot "${2:-}" "${3:-}" ;;
@@ -1499,7 +1573,7 @@ case "${1:-}" in
   archive-rpc-parity) archive_rpc_parity "${2:-}" "${3:-}" "${4:-}" ;;
   transaction-burst) transaction_burst "${2:-}" "${3:-}" ;;
   *)
-    echo "usage: $0 {start-gov|start-gov-node N|start-rust|start-rust2|stop-rust|stop-rust2|start|stop|restart-gov-node N|restart-rust|restart-rust2|status|monitor-heads <seconds> [interval] [evidence-file]|audit-soak <evidence-file> <minimum-elapsed-seconds> [maximum-gap-seconds] [maximum-lag] [require-zero-tx]|audit-rust-leaders <first-rust-height> [end-height] [evidence-file]|audit-timeout-recovery <rust-log> [evidence-file]|record-rust-resources [evidence-file]|monitor-rust-resources <seconds> [interval] [evidence-file]|record-clock <label> [evidence-file]|record-head <label> <port> [evidence-file]|era-checksums <directory>|archive-export <node> <snapshot>|archive-verify <snapshot>|archive-import <snapshot> <fresh-destination>|archive-corruption-drill <snapshot> <corrupt-copy> <recovered-copy> [evidence-file]|archive-rpc-parity <gov-endpoint> <rust-endpoint> [evidence-file]|transaction-burst [ARTIFACT] [EVIDENCE]}" >&2
+    echo "usage: $0 {start-gov|start-gov-node N|start-rust|start-rust2|stop-rust|stop-rust2|start|stop|restart-gov-node N|restart-rust|restart-rust2|status|monitor-heads <seconds> [interval] [evidence-file]|audit-soak <evidence-file> <minimum-elapsed-seconds> [maximum-gap-seconds] [maximum-lag] [require-zero-tx]|audit-rust-leaders <first-rust-height> [end-height] [evidence-file]|audit-timeout-recovery <rust-log> [evidence-file]|audit-runtime-logs <rust-log> [evidence-file]|record-rust-resources [evidence-file]|monitor-rust-resources <seconds> [interval] [evidence-file]|record-clock <label> [evidence-file]|record-head <label> <port> [evidence-file]|era-checksums <directory>|archive-export <node> <snapshot>|archive-verify <snapshot>|archive-import <snapshot> <fresh-destination>|archive-corruption-drill <snapshot> <corrupt-copy> <recovered-copy> [evidence-file]|archive-rpc-parity <gov-endpoint> <rust-endpoint> [evidence-file]|transaction-burst [ARTIFACT] [EVIDENCE]}" >&2
     exit 2
     ;;
 esac
