@@ -67,6 +67,15 @@ runtime chain. A six-endpoint boundary audit additionally compared blocks 0,
 85,290, 85,291, 85,380, 85,381, 85,386, and 85,387. Every hash and root was
 exact, and the 85,290→85,291 upgrade edge, 85,380→85,381 copied-data edge, and
 85,386→85,387 runtime-local leader edge all retained exact parent continuity.
+An independent live recheck at `2026-08-02T19:05:53Z` also hashes the three
+5.7.905/5.7.906 genesis artifacts byte-for-byte identically as
+`561808693c76b356e51f8f5961304e68f3167943c17145bda056612041dca687`.
+All six live endpoints return genesis hash
+`b71c28109836f120453d097c38819a55b14c49abcc92713037fb9b11201392ec`,
+state root `91a450c13f9deab2c9edf5832c96008862e7cc1169599f68461c3ec947099941`,
+and the expected empty transaction and receipt roots; their current heads are
+also exact. The immutable recheck evidence SHA-256 is
+`ace0a62bfcbc2e33b100a839728f8d9e3a0eb7b6046bd22b5c8a65b15bd0e00e`.
 The first long-test runtime copied the verified chain data while excluding old
 MDBX locks, PID files, LOCK files, and IPC sockets; it was
 `/Users/jieliu/Documents/n42/live-interop-20260721/runtime-15-gov5-905-interop`.
