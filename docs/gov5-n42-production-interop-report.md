@@ -17,8 +17,10 @@ parent is `origin/main @ e6396fd034fec9e1cc1a1baebc33634491f741c4`, version
 also includes the preceding current-main MDBX durable-default and txspool
 changes. Full `go test ./...` passed on the merged candidate.
 
-The active qualification binary source is `feat/gov5-n42-live-interop @ fc15007`, built
-against the separate Reth worktree at `c533db8` (Reth 2.4.1). Commits
+The active qualification runtime binary was built from
+`feat/gov5-n42-live-interop @ fc15007` against the separate Reth worktree at
+`c533db8` (Reth 2.4.1). Qualification tooling fixes through `790e16c` are
+pushed on the same branch without changing that measured runtime binary. Commits
 `ac1fc06` and `4a11238` add an explicitly configured, hard-capped authenticated
 Gov5 catch-up buffer and retain each buffered block's already-verified H2 view
 independently of the 2,048-entry live binding cache. Commit `161d64a` also
@@ -59,17 +61,33 @@ ancestry from block 84,646 to block 30 in 30.5 seconds. It then executed every
 block in height order with `new_payload(Valid)` and an exact per-height hash
 match against Gov5. A guarded restart at durable Reth/QMDB height 27,986 loaded
 the same canonical hash and QMDB lineage, then resumed the remaining ancestry
-without regenerating or replacing Gov5 data. The final live participation and
-long-duration acceptance window remain in progress and are not declared PASS
-until the Rust validator reaches the exact Gov head and produces blocks accepted
-by all five running Gov5 validators.
+without regenerating or replacing Gov5 data. The Rust node reached the exact
+five-Gov head at block 84,756 on `2026-08-02T12:32:02Z`. At its next leader
+opportunity it built block 84,757, hash
+`280756fff9eb440e1f156a6e82634a0d531eca197cc977bb4d3c8529f0d4395f`,
+with fee recipient `81d4c1f92ddb837cb46f82280d9b491b101fa582`; five Gov5 peers supplied
+both voting rounds (`votes=5+5`), Rust committed it in 88 ms, and all six RPC
+endpoints returned that block as canonical. Subsequent Rust-authored blocks
+occur exactly every six committed heights in the intentionally five-Gov plus
+one-Rust live topology, with no missing or extra Rust producer slot.
+
+The 5.7.905 archive check also passed 209 Gov/Rust RPC, state, and storage
+comparisons across 11 historical heights. Two current-head Gov5 QMDB proofs
+were byte-for-byte equal to Rust archive proofs, and all 24 current plus
+historical proofs authenticated their expected root and key with the offline
+Rust verifier. The strict zero-transaction window started from an exact common
+head at `2026-08-02T13:12:45Z`; it runs for 86,640 seconds so the first-to-last
+evidence interval is at least 86,400 seconds. Live participation is therefore
+proved, while the 24-hour gate remains IN PROGRESS and is not declared PASS
+until the full interval, signed transaction burst, and final post-window audits
+complete.
 
 ## Source and binary identity
 
 Interop branches:
 
 - n42-26: `feat/gov5-n42-live-interop`
-- N42-gov5: `feat/gov5-n42-live-interop`
+- N42-gov5: `integration/gov5-interop-current-main-20260801`
 
 Pushed implementation commits:
 
@@ -94,10 +112,20 @@ Pushed implementation commits:
 - n42-26: `ac1fc06` (`fix(interop): bound configurable Gov5 catch-up buffer`)
 - n42-26: `4a11238` (`fix(interop): retain catch-up authentication views`)
 - n42-26: `161d64a` (`perf(interop): prune catch-up history incrementally`)
+- n42-26: `63f97db` (`fix(interop): rotate serialized Gov5 ancestry fetches`)
+- n42-26: `5091fb4` (`fix(interop): deduplicate staged ancestry walkers`)
+- n42-26: `f753716` (`perf(interop): retire successful Gov5 fetch metadata`)
+- n42-26: `d079c63` (`perf(interop): gate full ancestry readiness scan`)
+- n42-26: `fc15007` (`perf(interop): append QMDB catch-up durability log`)
+- n42-26: `65a7718` (`fix(interop): report idle zero-tx samples accurately`)
+- n42-26: `b8896ae` (`fix(interop): qualify live Gov5 archive proofs`)
+- n42-26: `11cbb42` (`fix(interop): stage burst for configured topology`)
+- n42-26: `790e16c` (`fix(interop): measure soak between evidence samples`)
 - N42-gov5: `b027f3040` (`feat(interop): harden Gov5 mixed-client operation`)
 - N42-gov5: `34021c3f7` (`test: make hive genesis fixture self-contained`)
 - N42-gov5: `a70f7cf68` (`test: share hive fixture across packages`)
 - N42-gov5: `a35aa6293` (`fix(ethel): join state-root stream producers`)
+- N42-gov5: `520ea7bb7` (5.7.905 current-main interoperability candidate)
 
 The original P4 qualification binary was built at `24210f0`. The preceding
 `21ea922` commit bounds both consensus state-sync requests and
