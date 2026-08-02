@@ -31,6 +31,9 @@ rust_miner="${N42_QUAL_RUST_MINER:-0x81d4c1f92ddb837cb46f82280d9b491b101fa582}"
 configured_rust_leader_start="${N42_QUAL_RUST_LEADER_START:-}"
 rust_leader_start=""
 expected_genesis="0xb71c28109836f120453d097c38819a55b14c49abcc92713037fb9b11201392ec"
+expected_genesis_artifact_sha="561808693c76b356e51f8f5961304e68f3167943c17145bda056612041dca687"
+expected_consensus_config_sha="38cd3fb1f57e5e3053e23de836b7c98e542ccb5375d0521a65b5c2f6175bd8bf"
+expected_bootstrap_bundle_sha="35dda59684e7f56978e5d8de385fa2d2bf15b47747388b88a7449ac31387bf15"
 expected_gov_sha="${N42_QUAL_EXPECTED_GOV_SHA:-51e68918560be65f8e5221f02a3d544a7baf42bed9aa86655623449a4fd765d0}"
 expected_rust_sha="d917782b906176119172e656005218be34ec3d5ad1b7241c0c53f8f6d593da2d"
 frozen_validator_key_dir="$runtime/artifacts/validator-keys/node0"
@@ -235,12 +238,24 @@ assert_genesis() {
 assert_runtime_identity() {
   local validator_key="$frozen_validator_key_dir/keystore/bls_81d4c1f92ddb837cb46f82280d9b491b101fa582.key"
   local p2p_key="$frozen_validator_key_dir/network-keys"
+  local genesis_artifact="$runtime/artifacts/genesis.json"
+  local consensus_config="$runtime/artifacts/consensus-peer-bound.json"
+  local bootstrap_bundle="$runtime/artifacts/bootstrap-bundle.json"
   require_file "$runtime/geth-live"
   require_file "$runtime/n42-node"
+  require_file "$genesis_artifact"
+  require_file "$consensus_config"
+  require_file "$bootstrap_bundle"
   require_file "$validator_key"
   require_file "$p2p_key"
   test "$(shasum -a 256 "$runtime/geth-live" | awk '{print $1}')" = "$expected_gov_sha"
   test "$(shasum -a 256 "$runtime/n42-node" | awk '{print $1}')" = "$expected_rust_sha"
+  test "$(shasum -a 256 "$genesis_artifact" | awk '{print $1}')" = \
+    "$expected_genesis_artifact_sha"
+  test "$(shasum -a 256 "$consensus_config" | awk '{print $1}')" = \
+    "$expected_consensus_config_sha"
+  test "$(shasum -a 256 "$bootstrap_bundle" | awk '{print $1}')" = \
+    "$expected_bootstrap_bundle_sha"
   test "$(shasum -a 256 "$validator_key" | awk '{print $1}')" = \
     "$expected_validator_key_sha"
   test "$(shasum -a 256 "$p2p_key" | awk '{print $1}')" = \
@@ -379,6 +394,8 @@ jq -e -s '
 # Begin the restart immediately after a Rust-authored commit, leaving the
 # largest possible part of the six-height leader cycle for graceful shutdown
 # and persisted-state recovery.
+assert_runtime_identity
+assert_genesis
 wait_for_rust_authored_head
 assert_live_identity
 pre_restart_pid="$(<"$runtime/pids/rust.pid")"
@@ -497,6 +514,9 @@ jq -nc \
   --arg at "$(date -u +%FT%TZ)" \
   --arg gov_version "$gov_version" \
   --arg runtime "$runtime" \
+  --arg genesis_artifact_sha "$expected_genesis_artifact_sha" \
+  --arg consensus_config_sha "$expected_consensus_config_sha" \
+  --arg bootstrap_bundle_sha "$expected_bootstrap_bundle_sha" \
   --arg validator_key_sha "$expected_validator_key_sha" \
   --arg p2p_key_sha "$expected_p2p_key_sha" \
   --arg formal "$formal" \
@@ -526,6 +546,10 @@ jq -nc \
   --slurpfile resources "$resource_audit" '
   {at:$at,event:("gov5_"+$gov_version+"_final_qualification"),status:"PASS",runtime:$runtime,
    acceptanceRelaxed:false,genesisExact:true,binariesExact:true,
+   genesisArtifactSha256:$genesis_artifact_sha,
+   consensusConfigSha256:$consensus_config_sha,
+   bootstrapBundleSha256:$bootstrap_bundle_sha,
+   restartConfigurationFrozenAndExact:true,
    validatorKeySha256:$validator_key_sha,p2pKeySha256:$p2p_key_sha,
    keyMaterialFrozenAndExact:true,
    formalEvidence:$formal,formalEvidenceSha256:$formal_sha,
