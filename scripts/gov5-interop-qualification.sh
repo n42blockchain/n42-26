@@ -311,8 +311,9 @@ monitor_heads() {
       if test "$zero_tx_verified_to" -lt 0; then
         zero_tx_verified_to="$min_height"
       else
-        zero_tx_verified_from=$((zero_tx_verified_to + 1))
-        if test "$zero_tx_verified_from" -le "$min_height"; then
+        next_zero_tx_height=$((zero_tx_verified_to + 1))
+        if test "$next_zero_tx_height" -le "$min_height"; then
+          zero_tx_verified_from="$next_zero_tx_height"
           for height in $(seq "$zero_tx_verified_from" "$min_height"); do
           height_hex="$(printf '0x%x' "$height")"
           request="$(jq -nc --arg height "$height_hex" \
