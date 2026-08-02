@@ -1714,3 +1714,19 @@ Rust warnings partitioned into known bounded classes with zero critical signal.
 This controller-only correction did not restart a node or monitor and released
 no transaction. The replacement manifest is `PASS` with SHA-256
 `87804ce5a583903eefdbcbc70f9b3bc1a3b84749fdd6240165ca0fea65232932`.
+
+The replacement window's first complete one-hour milestone is also `PASS`.
+Its 120 formal samples span 3,631 seconds, progress from block 87,860 to
+88,268, have a maximum 32-second gap and maximum endpoint lag two, and retain
+contiguous zero-transaction coverage. Thirteen resource samples bind one Rust
+PID for 3,603 seconds: RSS is at most 257,392 KiB, threads at most 162, file
+descriptors exactly 93, and all storage/log counters are monotonic. Seven Gov5
+upstream samples span 3,605 seconds and remain reachable and exact at
+`920f7536...`. The canonical scan covers blocks 87,843 through 88,263 and finds
+all 71 Rust slots with six-height cadence, continuous parents, exact six-RPC
+hashes, `votes=5+5`, and seven-view stride. All 72 completed missing-validator
+timeouts recover at the next view, while 584 warnings partition exactly with
+zero critical signal. The leader, timeout, and log milestone SHA-256 values are
+`1e4dc93b0b512fc6041ba07ec260c8dcf186f8a28298207f281166dae1ea4faa`,
+`91d1d4c2155d6a40dc3389e1bf1d9634f9fdc8afe2060366361735504d2b2481`, and
+`fd741aecd494defd941c5eada37eafd52edde7542681826a05cff01724abdf16`.
