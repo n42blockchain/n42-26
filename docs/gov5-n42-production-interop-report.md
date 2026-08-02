@@ -1778,3 +1778,11 @@ exact. The nonce-17 contract derivation matches the pinned expected address,
 and the sender balance is identical on all six endpoints. This validation sent
 no transaction. Its evidence SHA-256 is
 `73e8ce72a6a7b743cbfd7c46e0850f2aa30f03a92bf47e36d79f0680498b6e23`.
+
+The controlled Rust restart no longer depends on mutable validator material in
+an older runtime. The validator BLS key and P2P key were copied with mode 0600
+into the strict runtime, verified byte-for-byte against the keys used by the
+running node, and pinned by SHA-256 in both the restart path and final summary.
+Only the finalizer was reloaded; the node and long-running monitor PIDs were
+unchanged and no transaction was sent. The replacement evidence SHA-256 is
+`4b1fcc18ef25d6a88de88ae599af06f7b42bc76a11d80a83c2a8da9bff78a1ef`.
