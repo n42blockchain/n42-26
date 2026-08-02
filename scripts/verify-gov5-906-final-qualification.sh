@@ -286,6 +286,18 @@ jq -e --slurpfile artifact "$post_restart_audit" '.postRestartAudit == $artifact
   "$summary" >/dev/null
 jq -e --slurpfile artifact "$restart" '.restart == $artifact' \
   "$summary" >/dev/null
+jq -e --slurpfile artifact "$burst" '
+  .transactionBurst ==
+    ($artifact | map(select(.event == "p4_transaction_burst_pass"))[0])
+' "$summary" >/dev/null
+jq -e --slurpfile artifact "$leaders" '.rustLeaderAudit == $artifact[-1]' \
+  "$summary" >/dev/null
+jq -e --slurpfile artifact "$timeouts" '.timeoutRecoveryAudit == $artifact[-1]' \
+  "$summary" >/dev/null
+jq -e --slurpfile artifact "$runtime_logs" '.runtimeLogAudit == $artifact[-1]' \
+  "$summary" >/dev/null
+jq -e --slurpfile artifact "$resource_audit" '.rustResourceAudit == $artifact[-1]' \
+  "$summary" >/dev/null
 
 jq -e -s '
   (map(select(.event == "p4_transaction_finalized")) | length) == 17 and
