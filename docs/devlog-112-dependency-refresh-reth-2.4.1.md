@@ -10,7 +10,7 @@ deployed replay, consensus, snapshot, keystore, and proof formats. The paired ex
 checkout is the N42 Reth 2.4.1 fork:
 
 - branch: `chore/reth-upstream-20260726`
-- commit: `d025e10403b5b0e7ef31f8d6359406f528b0e203`
+- commit: `91725e3aa8f2a0bbc5a425e931a2f2b2f31b2a7b`
 - workspace version: `2.4.1`
 
 The Reth checkout remained clean. N42 continues to use local `../reth` paths because the fork
@@ -71,9 +71,11 @@ available through explicit `--features jit`. The Reth dev-node integration harne
 unique ports and a bounded 60-second readiness check with captured child logs instead of the
 dependency helper's fixed ten-second deadline.
 
-Moving the paired checkout from `c533db8` to `d025e1040` added two real dependency edges to the
+Moving the paired checkout from `c533db8` to `91725e3aa` added two real dependency edges to the
 N42 lock graph (`parking_lot` and `libc`) without changing package versions or deployed formats.
-The lockfile was regenerated offline, then accepted by a fresh `--locked` all-target check.
+The lockfile was regenerated offline, then accepted by a fresh `--locked` all-target check. The
+Reth follow-up also removes the now-unused `alloy-node-bindings` test dependency and its obsolete
+transitive lock entries; that Reth-only dev-graph cleanup does not change the N42 lock graph.
 
 The refreshed RustSec database reports no new vulnerability outside the three exact, documented
 nightly exceptions in `audit.toml`. Two belong to hickory 0.25 through libp2p mDNS, which is
@@ -94,7 +96,7 @@ advisory will still fail the nightly gate.
 The 2026-08-02 lock refresh and paired-Reth follow-up repeated the locked all-target workspace
 check, complete locked workspace test suite, and warnings-denied locked all-target Clippy gate;
 all passed. These checks ran against the clean paired Reth checkout at
-`d025e10403b5b0e7ef31f8d6359406f528b0e203` (workspace version 2.4.1). Reth's own 24 integration
+`91725e3aa8f2a0bbc5a425e931a2f2b2f31b2a7b` (workspace version 2.4.1). Reth's own 24 integration
 tests, package tests, full-workspace all-target check, and warnings-denied all-target Clippy gate
 also pass at that revision.
 
