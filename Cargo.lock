@@ -9954,6 +9954,7 @@ dependencies = [
  "indexmap 2.14.0",
  "metrics",
  "moka",
+ "parking_lot",
  "rayon",
  "reth-chain-state",
  "reth-consensus",
@@ -10465,6 +10466,7 @@ name = "reth-metrics"
 version = "2.4.1"
 dependencies = [
  "futures",
+ "libc",
  "metrics",
  "metrics-derive",
  "reth-primitives-traits",

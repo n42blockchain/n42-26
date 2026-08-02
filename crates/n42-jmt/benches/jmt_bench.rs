@@ -27,11 +27,10 @@ fn make_diff(n: usize, slots_per_account: usize) -> StateDiff {
         accounts.insert(
             addr,
             AccountDiff {
-                change_type: if i % 10 == 0 {
-                    AccountChangeType::Created
-                } else {
-                    AccountChangeType::Modified
-                },
+                // Every benchmark applies this diff to a fresh tree. Mark every
+                // synthetic account as created; a Modified account must already
+                // have a leaf so its unchanged code hash can be preserved.
+                change_type: AccountChangeType::Created,
                 balance: Some(ValueChange::new(
                     U256::from(1000u64),
                     U256::from(1000u64 + i as u64),
@@ -150,11 +149,9 @@ fn make_diff_distinct(n: usize) -> StateDiff {
         accounts.insert(
             addr_of(i),
             AccountDiff {
-                change_type: if i % 10 == 0 {
-                    AccountChangeType::Created
-                } else {
-                    AccountChangeType::Modified
-                },
+                // This diff is also applied to a fresh tree in each in-memory
+                // benchmark iteration, so all accounts are creations.
+                change_type: AccountChangeType::Created,
                 balance: Some(ValueChange::new(
                     U256::from(1000u64),
                     U256::from(1000u64 + i as u64),
