@@ -174,6 +174,13 @@ The final controller is stricter than this in-flight milestone: commit
 `e4f40f2` waits for a Rust-authored recovery head and requires zero pending
 timeouts before it can emit the qualification summary. A live closed-point
 rehearsal passed with 73 of 73 timeout events recovered and none pending.
+Commit `e505a32` also makes runtime-log classification fail closed. At its
+one-hour rehearsal all 659 Rust warnings partitioned exactly into 81 view
+timeouts, 81 matching pacemaker transitions, 81 compact-output evictions for
+81 Rust leader commits, seven duplicate-vote suppressions, and 409 duplicate
+commit-vote suppressions. No unknown warning remained, and all five Gov logs
+plus the Rust log contained zero error, panic, fatal, or equivocation signals.
+The final qualification summary now embeds and hash-binds this audit.
 
 ## Source and binary identity
 
