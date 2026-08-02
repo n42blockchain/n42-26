@@ -2,7 +2,7 @@
 set -euo pipefail
 
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-runtime="${N42_QUAL_RUNTIME:-/Users/jieliu/Documents/n42/live-interop-20260721/runtime-17-gov5-906-fresh-reth}"
+runtime="${N42_QUAL_RUNTIME:-/Users/jieliu/Documents/n42/live-interop-20260721/runtime-18-gov5-906-latest-reth}"
 harness="$repo/scripts/gov5-interop-qualification.sh"
 gov_version="${N42_QUAL_GOV_VERSION:-906}"
 formal="$runtime/evidence/mixed-soak-24h.jsonl"
@@ -21,9 +21,9 @@ failures="$runtime/evidence/gov5-$gov_version-finalizer-failures.jsonl"
 ports="${N42_QUAL_PORTS:-28501 28502 28503 28504 28505 29545}"
 rust_port="${N42_QUAL_RUST_PORT:-29545}"
 rust_miner="${N42_QUAL_RUST_MINER:-0x81d4c1f92ddb837cb46f82280d9b491b101fa582}"
-rust_leader_start="${N42_QUAL_RUST_LEADER_START:-85291}"
+rust_leader_start="${N42_QUAL_RUST_LEADER_START:-85387}"
 expected_genesis="0xb71c28109836f120453d097c38819a55b14c49abcc92713037fb9b11201392ec"
-expected_gov_sha="${N42_QUAL_EXPECTED_GOV_SHA:-050d79612ce6bb02f7bbee44dc87461277747dfea33845597db8c1a1bc26c08d}"
+expected_gov_sha="${N42_QUAL_EXPECTED_GOV_SHA:-fe24cf475bdd362229faaf22e48f65af5011e4abf714d46fe0f83b3b496a9f1f}"
 expected_rust_sha="d917782b906176119172e656005218be34ec3d5ad1b7241c0c53f8f6d593da2d"
 
 mkdir -p "$runtime/evidence"
