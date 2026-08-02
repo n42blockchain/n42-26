@@ -29,7 +29,7 @@ The active Rust qualification binary was built from
 pushed on the same branch without changing that measured runtime binary.
 
 The broader compatible dependency refresh is independently delivered and
-pushed at `chore/deps-latest-20260721 @ 8edb950d08296b10d81141485482730235490c80`;
+pushed at `chore/deps-latest-20260721 @ cbd00ab4fc7c74ea8dd790322c8ecd4f8ee06302`;
 its manifest and devlog pin the same Reth 2.4.1 revision
 `c533db8bad6f300be93ec047ecffc717b08957f8`. That delivery branch is not
 misrepresented as an ancestor of the measured interop binary: this runtime
