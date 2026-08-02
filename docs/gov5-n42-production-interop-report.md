@@ -1696,3 +1696,19 @@ one mismatch sample and did not create a completion marker. An otherwise valid
 runtime with no initialized MDBX also exited with status one before creating a
 Gov PID. The retained regression summary is `PASS` with SHA-256
 `fd4116349fd582f30b3f419b1f19666dd11728b5eea5a69337d47839eaa464db`.
+
+An in-flight controller rehearsal then exposed a log-boundary defect before it
+could invalidate the completed window. The strict launch intentionally rotated
+the Rust log, whose first canonical Rust commit is block 87,843, but the
+finalizer still defaulted its final leader audit to historical block 85,387.
+The chain scan therefore had more history than the immutable log could prove.
+The finalizer now derives the start height from the first committed hash in the
+strict Rust log, resolves that hash through RPC, requires it to be canonical and
+Rust-authored, and rejects any configured override that differs. The repaired
+audit scanned blocks 87,843 through 88,179: all 57 expected Rust slots had exact
+six-height cadence, continuous parents, identical hashes on all six endpoints,
+`votes=5+5`, exact seven-view stride, and matching log order. Concurrently, all
+58 completed missing-validator timeouts recovered at the next view, and all 472
+Rust warnings partitioned into known bounded classes with zero critical signal.
+This controller-only correction did not restart a node or monitor and released
+no transaction.

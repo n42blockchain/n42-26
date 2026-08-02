@@ -28,7 +28,8 @@ failures="$runtime/evidence/gov5-$gov_version-finalizer-failures.jsonl"
 ports="${N42_QUAL_PORTS:-28501 28502 28503 28504 28505 29545}"
 rust_port="${N42_QUAL_RUST_PORT:-29545}"
 rust_miner="${N42_QUAL_RUST_MINER:-0x81d4c1f92ddb837cb46f82280d9b491b101fa582}"
-rust_leader_start="${N42_QUAL_RUST_LEADER_START:-85387}"
+configured_rust_leader_start="${N42_QUAL_RUST_LEADER_START:-}"
+rust_leader_start=""
 expected_genesis="0xb71c28109836f120453d097c38819a55b14c49abcc92713037fb9b11201392ec"
 expected_gov_sha="${N42_QUAL_EXPECTED_GOV_SHA:-51e68918560be65f8e5221f02a3d544a7baf42bed9aa86655623449a4fd765d0}"
 expected_rust_sha="d917782b906176119172e656005218be34ec3d5ad1b7241c0c53f8f6d593da2d"
@@ -94,6 +95,57 @@ wait_for_rust_authored_head() {
     sleep 0.25
   done
   return 1
+}
+
+resolve_rust_leader_start() {
+  local line="" hash block number_hex derived attempt
+  # The strict-launch Rust log may be rotated independently of older runtime
+  # history. Bind the canonical leader audit to the first commit that is
+  # actually present in the immutable log instead of a stale historical
+  # height that the log cannot prove.
+  for attempt in $(seq 1 1200); do
+    line="$(rg -m1 ' INFO (.*: )?block committed! view=' \
+      "$runtime/logs/rust.log" || true)"
+    if test -n "$line"; then
+      break
+    fi
+    sleep 0.25
+  done
+  if test -z "$line"; then
+    echo "strict Rust log contains no committed leader block" >&2
+    return 1
+  fi
+  hash="$(sed -E -n \
+    's/.*block_hash=(0x[0-9a-f]{64}).*/\1/p' <<<"$line")"
+  if ! [[ "$hash" =~ ^0x[0-9a-f]{64}$ ]]; then
+    echo "cannot parse first committed block hash from strict Rust log" >&2
+    return 1
+  fi
+  block="$(rpc "$rust_port" eth_getBlockByHash \
+    "$(jq -nc --arg hash "$hash" '[$hash,false]')" | jq -ec '.result')"
+  jq -e --arg miner "$rust_miner" '
+    .hash != null and (.hash | test("^0x[0-9a-f]{64}$")) and
+    (.miner | ascii_downcase) == $miner and
+    (.number | test("^0x[0-9a-f]+$"))
+  ' <<<"$block" >/dev/null || {
+    echo "first logged Rust commit is not a canonical Rust-authored block" >&2
+    return 1
+  }
+  number_hex="$(jq -er '.number' <<<"$block")"
+  derived=$((number_hex))
+  if test "$derived" -lt 1; then
+    echo "invalid first strict Rust leader height: $derived" >&2
+    return 1
+  fi
+  if test -n "$configured_rust_leader_start"; then
+    if ! [[ "$configured_rust_leader_start" =~ ^[0-9]+$ ]] ||
+      test "$configured_rust_leader_start" -ne "$derived"; then
+      echo "configured Rust leader start does not match strict log: " \
+        "configured=$configured_rust_leader_start derived=$derived" >&2
+      return 1
+    fi
+  fi
+  printf '%s\n' "$derived"
 }
 
 assert_live_identity() {
@@ -213,6 +265,7 @@ assert_gov_source
 assert_genesis
 assert_live_identity
 assert_gov_upstream
+rust_leader_start="$(resolve_rust_leader_start)"
 
 if test "${N42_QUAL_FINALIZER_PREFLIGHT_ONLY:-0}" = 1; then
   preflight_burst launch-preflight
