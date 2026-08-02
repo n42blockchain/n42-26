@@ -131,7 +131,15 @@ start_rust_validator() {
   if pid_alive "$pid_file"; then
     return
   fi
-  key_dir="/Users/jieliu/Documents/n42/live-interop-20260721/runtime-02-generated/node${validator_node}"
+  key_dir="${N42_VALIDATOR_KEY_DIR:-}"
+  if test -z "$key_dir"; then
+    frozen_key_dir="$runtime/artifacts/validator-keys/node${validator_node}"
+    if test -d "$frozen_key_dir"; then
+      key_dir="$frozen_key_dir"
+    else
+      key_dir="/Users/jieliu/Documents/n42/live-interop-20260721/runtime-02-generated/node${validator_node}"
+    fi
+  fi
   validator_key_files=("$key_dir"/keystore/*.key)
   if test "${#validator_key_files[@]}" -ne 1 ||
     ! test -f "${validator_key_files[0]}"; then
@@ -139,6 +147,20 @@ start_rust_validator() {
     return 2
   fi
   require_file "$key_dir/network-keys"
+  if test -n "${N42_EXPECTED_VALIDATOR_KEY_SHA256:-}"; then
+    test "$(shasum -a 256 "${validator_key_files[0]}" | awk '{print $1}')" = \
+      "$N42_EXPECTED_VALIDATOR_KEY_SHA256" || {
+      echo "validator key SHA-256 mismatch: ${validator_key_files[0]}" >&2
+      return 1
+    }
+  fi
+  if test -n "${N42_EXPECTED_P2P_KEY_SHA256:-}"; then
+    test "$(shasum -a 256 "$key_dir/network-keys" | awk '{print $1}')" = \
+      "$N42_EXPECTED_P2P_KEY_SHA256" || {
+      echo "P2P key SHA-256 mismatch: $key_dir/network-keys" >&2
+      return 1
+    }
+  fi
   trusted_peers=""
   gov_count=6
   if test "$validator_node" -eq 6; then

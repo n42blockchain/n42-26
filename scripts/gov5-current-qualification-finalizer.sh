@@ -33,6 +33,9 @@ rust_leader_start=""
 expected_genesis="0xb71c28109836f120453d097c38819a55b14c49abcc92713037fb9b11201392ec"
 expected_gov_sha="${N42_QUAL_EXPECTED_GOV_SHA:-51e68918560be65f8e5221f02a3d544a7baf42bed9aa86655623449a4fd765d0}"
 expected_rust_sha="d917782b906176119172e656005218be34ec3d5ad1b7241c0c53f8f6d593da2d"
+frozen_validator_key_dir="$runtime/artifacts/validator-keys/node0"
+expected_validator_key_sha="babd0b3550da7702230d3da9a3f00bfce741ed9f1fb8210b702c6023080ea509"
+expected_p2p_key_sha="d82561e312fbb044f56eec5f434f03ea1e852924f055a8949ea82be9e7bbe277"
 expected_gov_upstream_sha="${N42_QUAL_EXPECTED_GOV_UPSTREAM_SHA:-920f7536eb263b6744b48f28dfeb77f4c2798c1a}"
 expected_gov_candidate_sha="${N42_QUAL_EXPECTED_GOV_CANDIDATE_SHA:-8915b4cc07d82dc195daee2e8e741ea5e8446068}"
 gov_repo="${N42_QUAL_GOV_REPO:-/Users/jieliu/Documents/n42/live-interop-20260721/N42-gov5-current-main-20260801}"
@@ -230,10 +233,18 @@ assert_genesis() {
 }
 
 assert_runtime_identity() {
+  local validator_key="$frozen_validator_key_dir/keystore/bls_81d4c1f92ddb837cb46f82280d9b491b101fa582.key"
+  local p2p_key="$frozen_validator_key_dir/network-keys"
   require_file "$runtime/geth-live"
   require_file "$runtime/n42-node"
+  require_file "$validator_key"
+  require_file "$p2p_key"
   test "$(shasum -a 256 "$runtime/geth-live" | awk '{print $1}')" = "$expected_gov_sha"
   test "$(shasum -a 256 "$runtime/n42-node" | awk '{print $1}')" = "$expected_rust_sha"
+  test "$(shasum -a 256 "$validator_key" | awk '{print $1}')" = \
+    "$expected_validator_key_sha"
+  test "$(shasum -a 256 "$p2p_key" | awk '{print $1}')" = \
+    "$expected_p2p_key_sha"
 }
 
 preflight_burst() {
@@ -394,6 +405,9 @@ env \
   N42_QUAL_RUNTIME="$runtime" \
   N42_NODE_BINARY="$runtime/n42-node" \
   N42_CONSENSUS_CONFIG_FILE="$runtime/artifacts/consensus-peer-bound.json" \
+  N42_VALIDATOR_KEY_DIR="$frozen_validator_key_dir" \
+  N42_EXPECTED_VALIDATOR_KEY_SHA256="$expected_validator_key_sha" \
+  N42_EXPECTED_P2P_KEY_SHA256="$expected_p2p_key_sha" \
   N42_GOV5_CATCHUP_BUFFER_BLOCKS=131072 \
   N42_QMDB_REPLAY_DEPTH=1048576 \
   "$harness" restart-rust
@@ -483,6 +497,8 @@ jq -nc \
   --arg at "$(date -u +%FT%TZ)" \
   --arg gov_version "$gov_version" \
   --arg runtime "$runtime" \
+  --arg validator_key_sha "$expected_validator_key_sha" \
+  --arg p2p_key_sha "$expected_p2p_key_sha" \
   --arg formal "$formal" \
   --arg formal_sha "$(shasum -a 256 "$formal" | awk '{print $1}')" \
   --arg burst_sha "$(shasum -a 256 "$burst_evidence" | awk '{print $1}')" \
@@ -510,6 +526,8 @@ jq -nc \
   --slurpfile resources "$resource_audit" '
   {at:$at,event:("gov5_"+$gov_version+"_final_qualification"),status:"PASS",runtime:$runtime,
    acceptanceRelaxed:false,genesisExact:true,binariesExact:true,
+   validatorKeySha256:$validator_key_sha,p2pKeySha256:$p2p_key_sha,
+   keyMaterialFrozenAndExact:true,
    formalEvidence:$formal,formalEvidenceSha256:$formal_sha,
    soakAudit:$soak[0],
    gov5UpstreamAudit:$upstream[0],gov5UpstreamEvidenceSha256:$upstream_sha,
