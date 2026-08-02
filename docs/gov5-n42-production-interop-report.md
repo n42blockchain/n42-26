@@ -1711,4 +1711,5 @@ six-height cadence, continuous parents, identical hashes on all six endpoints,
 58 completed missing-validator timeouts recovered at the next view, and all 472
 Rust warnings partitioned into known bounded classes with zero critical signal.
 This controller-only correction did not restart a node or monitor and released
-no transaction.
+no transaction. The replacement manifest is `PASS` with SHA-256
+`87804ce5a583903eefdbcbc70f9b3bc1a3b84749fdd6240165ca0fea65232932`.
