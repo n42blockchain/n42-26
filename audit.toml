@@ -13,8 +13,10 @@
 ignore = [
     # hickory-proto (transitive via libp2p-mdns / libp2p-dns / reth-dns-discovery).
     # Two CPU exhaustion advisories at 0.25.2; fix for 0119 is 0.26.1+ but
-    # current libp2p 0.56 still pins 0.25. 0118 has no fixed release. mDNS is
-    # disabled by default in production; keep monitoring the upstream bump.
+    # current released libp2p 0.56 still pins 0.25. Upstream master moved to
+    # hickory 0.26.1 in PR 6423, but that change is in the unreleased libp2p
+    # 0.57 line as of 2026-08-02. mDNS is disabled by default in production;
+    # keep monitoring the upstream release and remove both exceptions then.
     "RUSTSEC-2026-0119",
     # hickory-proto NSEC3 unbounded loop on cross-zone responses. No fixed
     # upgrade available from upstream as of this writing.

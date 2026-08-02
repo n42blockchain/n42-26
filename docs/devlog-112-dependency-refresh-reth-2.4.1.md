@@ -62,6 +62,14 @@ versions reported are the intentional major or release-matrix pins already docum
 The updated lockfile SHA-256 is
 `c5998ac1a8e2a3e8dcaf21847cac78c80ad6e817050c09300cc7183753afff74`.
 
+The refreshed RustSec database reports no new vulnerability outside the three exact, documented
+nightly exceptions in `audit.toml`. Two belong to hickory 0.25 through libp2p mDNS, which is
+disabled by default in production. The latest published libp2p remains 0.56 and still selects
+hickory 0.25; upstream PR 6423 moves the unreleased 0.57 line to hickory 0.26.1. The third is an
+inactive optional `tracing-subscriber 0.2.25` edge under arkworks; N42's active logging path is
+0.3.23. Running `cargo audit` with those three explicit advisory IDs ignored passes, so a new
+advisory will still fail the nightly gate.
+
 ## Verification
 
 - `cargo check --workspace --all-targets`: passed
