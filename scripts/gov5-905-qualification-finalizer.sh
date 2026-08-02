@@ -71,6 +71,18 @@ wait_for_rpc() {
   return 1
 }
 
+wait_for_rust_authored_head() {
+  local _ block
+  for _ in $(seq 1 1200); do
+    block="$(rpc "$rust_port" eth_getBlockByNumber '["latest",false]' | jq -ec '.result')"
+    if test "$(jq -r '.miner | ascii_downcase' <<<"$block")" = "$rust_miner"; then
+      return 0
+    fi
+    sleep 0.25
+  done
+  return 1
+}
+
 assert_live_identity() {
   local attempt expected port identity exact
   for attempt in $(seq 1 30); do
@@ -206,6 +218,11 @@ jq -e -s '
     .qmdbProofRootExact == true and .qmdbProofOfflineVerified == true)) | length) == 11
 ' "$archive_post_burst" >/dev/null
 
+# Begin the restart immediately after a Rust-authored commit, leaving the
+# largest possible part of the six-height leader cycle for graceful shutdown
+# and persisted-state recovery.
+wait_for_rust_authored_head
+assert_live_identity
 pre_restart_pid="$(<"$runtime/pids/rust.pid")"
 pre_restart_head_hex="$(rpc "$rust_port" eth_blockNumber '[]' | jq -er '.result')"
 pre_restart_head=$((pre_restart_head_hex))
