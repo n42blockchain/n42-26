@@ -547,6 +547,48 @@ audit_rust_leaders() {
     fi
   done
 
+  local leader_log="${N42_QUAL_RUST_LOG:-}"
+  local expected_view_stride="${N42_QUAL_RUST_VIEW_STRIDE:-7}"
+  local log_summary=null
+  if test -n "$leader_log"; then
+    require_file "$leader_log"
+    local parsed_log="$audit_dir/leader-log.jsonl"
+    local matched_log="$audit_dir/matched-leader-log.jsonl"
+    rg 'block committed' "$leader_log" | jq -Rc '
+      capture("block committed. view=(?<view>[0-9]+) block_hash=(?<hash>0x[0-9a-f]{64}).*proposal=@(?<proposal>[0-9]+)ms R1_collect=(?<r1>[0-9]+)ms R2_collect=(?<r2>[0-9]+)ms total=(?<total>[0-9]+)ms votes=(?<votes>[0-9]+[+][0-9]+)") |
+      {view:(.view|tonumber),hash,proposalMs:(.proposal|tonumber),
+       r1Ms:(.r1|tonumber),r2Ms:(.r2|tonumber),
+       totalMs:(.total|tonumber),votes}' >"$parsed_log"
+    jq -c --slurpfile references "$reference_file" '
+      . as $entry |
+      ([$references[].hash] | index($entry.hash)) as $index |
+      select($index != null) | $entry
+    ' "$parsed_log" >"$matched_log"
+    jq -s 'map(.hash)' "$reference_file" >"$audit_dir/reference-hashes.json"
+    jq -s 'map(.hash)' "$matched_log" >"$audit_dir/log-hashes.json"
+    if ! cmp -s "$audit_dir/reference-hashes.json" "$audit_dir/log-hashes.json"; then
+      echo "Rust leader commit log does not match canonical Rust block order" >&2
+      return 1
+    fi
+    jq -e -s --argjson expected "$expected_leaders" \
+      --argjson view_stride "$expected_view_stride" '
+      length == $expected and
+      all(.[]; .votes == "5+5") and
+      ([range(1; length) as $i |
+        .[$i].view - .[$i - 1].view == $view_stride] | all)
+    ' "$matched_log" >/dev/null
+    log_summary="$(jq -nc --slurpfile logs "$matched_log" \
+      --argjson view_stride "$expected_view_stride" '
+      {matchedCommits:($logs|length),allVotesFivePlusFive:true,
+       expectedViewStride:$view_stride,viewStrideExact:true,hashOrderExact:true,
+       firstView:$logs[0].view,lastView:$logs[-1].view,
+       latencyMs:{proposalMinimum:([$logs[].proposalMs]|min),
+         proposalMaximum:([$logs[].proposalMs]|max),
+         commitMinimum:([$logs[].totalMs]|min),
+         commitMaximum:([$logs[].totalMs]|max),
+         commitAverage:(([$logs[].totalMs]|add)/($logs|length))}}')"
+  fi
+
   local first_hash last_hash summary
   first_hash="$(jq -sr '.[0].hash' "$reference_file")"
   last_hash="$(jq -sr '.[-1].hash' "$reference_file")"
@@ -560,12 +602,13 @@ audit_rust_leaders() {
     --argjson stride "$leader_stride" \
     --argjson blocks "$total_blocks" \
     --argjson leaders "$expected_leaders" \
+    --argjson leader_log "$log_summary" \
     --argjson ports "$(printf '%s\n' "${ports[@]}" | jq -R 'tonumber' | jq -s '.')" '
     {at:$at,event:"rust_leader_canonical_audit",status:"PASS",miner:$miner,
      startHeight:$start,endHeight:$end,blocksScanned:$blocks,leaderStride:$stride,
      rustAuthoredBlocks:$leaders,firstRustHash:$first_hash,lastRustHash:$last_hash,
      ports:$ports,parentChainContinuous:true,expectedLeaderSlotsExact:true,
-     allConfiguredEndpointsExact:true}')"
+     allConfiguredEndpointsExact:true,leaderCommitLog:$leader_log}')"
   if test -n "$evidence_file"; then
     mkdir -p "$(dirname "$evidence_file")"
     printf '%s\n' "$summary" >>"$evidence_file"
