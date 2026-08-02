@@ -25,8 +25,19 @@ transaction, logging, and `cmd/n42`.
 
 The active Rust qualification binary was built from
 `feat/gov5-n42-live-interop @ fc15007` against the separate Reth worktree at
-`c533db8` (Reth 2.4.1). Qualification tooling fixes through `b4aceb1` are
-pushed on the same branch without changing that measured runtime binary. Commits
+`c533db8` (Reth 2.4.1). Qualification tooling fixes through `ebcb736` are
+pushed on the same branch without changing that measured runtime binary.
+
+The broader compatible dependency refresh is independently delivered and
+pushed at `chore/deps-latest-20260721 @ 57599a4a3076e999354803a253c6b37207e65b07`;
+its manifest and devlog pin the same Reth 2.4.1 revision
+`c533db8bad6f300be93ec047ecffc717b08957f8`. That delivery branch is not
+misrepresented as an ancestor of the measured interop binary: this runtime
+uses the interop branch's own locked dependency graph, whose Reth packages are
+also 2.4.1, plus Rust 1.97.1. No dependency or execution binary was changed
+after the strict window began.
+
+Commits
 `ac1fc06` and `4a11238` add an explicitly configured, hard-capped authenticated
 Gov5 catch-up buffer and retain each buffered block's already-verified H2 view
 independently of the 2,048-entry live binding cache. Commit `161d64a` also
