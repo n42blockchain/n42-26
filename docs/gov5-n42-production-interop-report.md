@@ -1761,3 +1761,12 @@ All six sender nonces remained `0x11`, no transaction was sent, and the strict
 window continued on the original node and monitor PIDs. The replacement
 evidence SHA-256 is
 `9b7d9bde9899f3388f3c598f9ef72f3899dbd04727e2ccbb5c72f6f88725d800`.
+
+A subsequent executable review found and fixed the deferred restart QC check's
+missing jq field prefix before the check could gate the 24-hour result. The
+same change now verifies zero equivocations both before and after restart,
+measures rejoin from before shutdown rather than after RPC recovery, and
+records RPC recovery separately. Only the finalizer was reloaded; node and
+monitor PIDs, the zero-transaction window, and the sender nonce were unchanged.
+The replacement evidence SHA-256 is
+`4145d5e1d1ab95b9895fdcddc5956b8bbc3f14b8c79deb291f0f49f5828acbba`.
