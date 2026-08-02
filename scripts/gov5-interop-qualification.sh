@@ -242,9 +242,9 @@ monitor_heads() {
   read -r -a ports <<<"${N42_QUAL_PORTS:-28501 28502 28503 28504 28505 29545 29546}"
   rust_history_port="${N42_QUAL_RUST_PORT:-29546}"
   mkdir -p "$(dirname "$evidence_file")"
-  deadline=$((SECONDS + duration_seconds))
+  first_sample_seconds="$SECONDS"
 
-  while test "$SECONDS" -lt "$deadline"; do
+  while true; do
     sample_dir="$(mktemp -d)"
     sample_failed=0
     min_height=-1
@@ -357,6 +357,9 @@ monitor_heads() {
     rm -rf "$sample_dir"
     if test "$ok" != true; then
       return 1
+    fi
+    if test $((SECONDS - first_sample_seconds)) -ge "$duration_seconds"; then
+      break
     fi
     sleep "$interval_seconds"
   done
