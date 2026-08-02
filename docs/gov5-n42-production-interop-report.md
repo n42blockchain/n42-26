@@ -30,9 +30,9 @@ The active Rust qualification binary was built from
 binary.
 
 The broader compatible dependency refresh is independently delivered and
-pushed at `chore/deps-latest-20260721 @ 0bde2e751ad1f5c157ada4cb0cbb32340887a3c1`;
+pushed at `chore/deps-latest-20260721 @ aec34a0cd465e8fdbb598b90bc778fe96e25d6c0`;
 its manifest and devlog pin the newer paired Reth 2.4.1 revision
-`d025e10403b5b0e7ef31f8d6359406f528b0e203` on
+`91725e3aa8f2a0bbc5a425e931a2f2b2f31b2a7b` on
 `chore/reth-upstream-20260726`. That delivery branch is not
 misrepresented as an ancestor of the measured interop binary: this runtime
 uses the interop branch's own locked dependency graph against `c533db8`, plus
@@ -40,12 +40,13 @@ Rust 1.97.1. The independent delivery locks all 37 newly available
 semver-compatible maintenance updates and the two dependency edges added by the
 post-release Reth fixes; a subsequent dry-run locks zero packages. Its locked
 all-target workspace check, complete workspace tests, and warnings-denied
-all-target Clippy gate pass against `d025e1040`. Reth's own 24 integration
+all-target Clippy gate pass against `91725e3aa`. Reth's own 24 integration
 tests, package tests, full-workspace all-target check, and warnings-denied
 all-target Clippy also pass. The Reth default build now keeps revmc/LLVM 22 JIT
-opt-in and its dev-node tests use bounded 60-second readiness with unique
-ports. No dependency or execution binary in the active qualification runtime
-was changed after the strict window began.
+opt-in, its dev-node tests use bounded 60-second readiness with unique ports,
+and the obsolete `alloy-node-bindings` dev edge has been removed. No dependency
+or execution binary in the active qualification runtime was changed after the
+strict window began.
 
 Commits
 `ac1fc06` and `4a11238` add an explicitly configured, hard-capped authenticated
