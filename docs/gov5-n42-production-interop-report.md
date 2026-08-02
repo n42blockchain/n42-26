@@ -1735,3 +1735,12 @@ current-head Gov/Rust QMDB reference proof is byte-exact and offline-verified,
 and 11 historical heights from genesis through block 5,189 have exact RPC,
 root, and offline proof parity. Its 12-record evidence SHA-256 is
 `8308a1487ff492976a1387b818f6a63b1cbecc5f8a5261e842723f0da7957f7b`.
+
+A second genesis check inside the strict window independently re-hashes the
+5.7.905, initial-5.7.906, and current-5.7.906 artifacts. All three remain
+byte-exact at `56180869...`. Every Gov and Rust RPC returns block-zero hash
+`b71c2810...`, state root `91a450c1...`, and empty transaction/receipt root
+`56e81f17...`; all six also return one exact live head. This proves the local
+databases, not merely `--p2p.genesis-override`, remain on the required lineage.
+No transaction had been sent. The evidence SHA-256 is
+`f212a205701b9ffd8d3745904f288979294c379606e39500b02a41df27682dcb`.
