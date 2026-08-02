@@ -149,6 +149,9 @@ waits for exact six-endpoint canonical identity before beginning its ten-minute
 stability interval and records that rejoin delay. Replacing only the waiting
 finalizer did not restart any node, resource sampler, upstream sampler, or the
 formal zero-transaction monitor.
+Its first upstream milestone passed with seven reachable, exact snapshots over
+3,605 seconds, a maximum 601-second gap, and a fresh remote lookup still equal
+to `f3dbeba4694590e6478780ac8a14e900f7dd7505`.
 Commit `9ac3ce1` promotes the missing-validator recovery check into the reusable
 `audit-timeout-recovery` qualification command and the final PASS controller.
 Its first live invocation observed 65 timeout events: all 64 whose successor
