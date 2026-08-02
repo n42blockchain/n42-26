@@ -167,6 +167,10 @@ stride. The paired timeout audit proved recovery for all 71 completed timeout
 events; one current timeout remained correctly in flight. Thirteen resource
 samples held file descriptors at 93 and threads at 161--162 while RSS remained
 between 217,680 and 251,552 KiB.
+The final controller is stricter than this in-flight milestone: commit
+`e4f40f2` waits for a Rust-authored recovery head and requires zero pending
+timeouts before it can emit the qualification summary. A live closed-point
+rehearsal passed with 73 of 73 timeout events recovered and none pending.
 
 ## Source and binary identity
 
