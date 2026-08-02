@@ -140,6 +140,15 @@ records `transactionsSent:0`. Live latest-906 participation and leader handoff
 are therefore proved, while the 24-hour gate remains IN PROGRESS and is not
 declared PASS until the full interval, 17-transaction burst, post-burst archive
 parity, restart/rejoin, and final leader audits complete.
+Commit `96de5cb` additionally makes the continuously sampled Gov5 upstream
+identity a hard acceptance gate: `origin/main` must remain exactly
+`f3dbeba4694590e6478780ac8a14e900f7dd7505` for at least 86,400 seconds, every
+ten-minute snapshot must be reachable and exact, and a fresh remote lookup
+must still match before the burst and final summary. The restart stage now
+waits for exact six-endpoint canonical identity before beginning its ten-minute
+stability interval and records that rejoin delay. Replacing only the waiting
+finalizer did not restart any node, resource sampler, upstream sampler, or the
+formal zero-transaction monitor.
 
 ## Source and binary identity
 
