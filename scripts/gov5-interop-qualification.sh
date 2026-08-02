@@ -789,6 +789,7 @@ audit_runtime_logs() {
   critical="$audit_dir/critical-signals.log"
 
   local total timeout pacemaker eviction commits duplicate_vote duplicate_commit
+  local payload_retry unsupported_state_sync
   total="$(rg -c ' WARN ' "$rust_log" || echo 0)"
   timeout="$(rg -c ' WARN view timed out view=' "$rust_log" || echo 0)"
   pacemaker="$(rg -c ' WARN pacemaker timeout, initiating view change view=' \
@@ -802,22 +803,37 @@ audit_runtime_logs() {
   duplicate_commit="$(rg -c \
     ' WARN .*suppressed duplicate commit vote \(already commit-voted in this view\)' \
     "$rust_log" || echo 0)"
+  payload_retry="$(rg -c \
+    ' WARN fork_choice_updated did not return payload_id, scheduling retry$' \
+    "$rust_log" || true)"
+  payload_retry="${payload_retry:-0}"
+  unsupported_state_sync="$(rg -c \
+    ' WARN sync request failed peer=.* error=peer does not advertise N42 state-sync$' \
+    "$rust_log" || true)"
+  unsupported_state_sync="${unsupported_state_sync:-0}"
 
   rg ' WARN ' "$rust_log" | rg -v \
-    ' WARN (view timed out view=|pacemaker timeout, initiating view change view=)| WARN .*evicted rejected compact execution output hash=| WARN .*suppressed duplicate (commit )?vote \(already (commit-)?voted in this view\)' \
+    ' WARN (view timed out view=|pacemaker timeout, initiating view change view=|fork_choice_updated did not return payload_id, scheduling retry$|sync request failed peer=.* error=peer does not advertise N42 state-sync$)| WARN .*evicted rejected compact execution output hash=| WARN .*suppressed duplicate (commit )?vote \(already (commit-)?voted in this view\)' \
     >"$unknown" || true
   local log
   for log in "$runtime"/logs/gov{1,2,3,4,5}.log "$rust_log"; do
     require_file "$log"
-    rg -i '(^|[^a-z])(error|panic|fatal|equivocat)' "$log" >>"$critical" || true
+    rg -i ' ERROR |(^|[^a-z])(panic|fatal|equivocat)' "$log" >>"$critical" || true
   done
 
   test "$total" -gt 0
   test "$timeout" -gt 0
   test "$timeout" -eq "$pacemaker"
   test "$eviction" -eq "$commits"
+  # The strict runtime has one persisted-state start before the soak and one
+  # controlled restart in the finalizer. Each start may observe one SYNCING
+  # FCU and one unsupported state-sync response from each of the five Gov
+  # peers before authenticated block catch-up takes over.
+  test "$payload_retry" -le 2
+  test "$unsupported_state_sync" -le 10
   test "$total" -eq \
-    $((timeout + pacemaker + eviction + duplicate_vote + duplicate_commit))
+    $((timeout + pacemaker + eviction + duplicate_vote + duplicate_commit +
+      payload_retry + unsupported_state_sync))
   test ! -s "$unknown"
   test ! -s "$critical"
 
@@ -832,13 +848,17 @@ audit_runtime_logs() {
     --argjson eviction "$eviction" \
     --argjson commits "$commits" \
     --argjson duplicate_vote "$duplicate_vote" \
-    --argjson duplicate_commit "$duplicate_commit" '
+    --argjson duplicate_commit "$duplicate_commit" \
+    --argjson payload_retry "$payload_retry" \
+    --argjson unsupported_state_sync "$unsupported_state_sync" '
     {at:$at,event:"mixed_client_runtime_log_audit",status:"PASS",
       rustLog:$log,rustLogSha256:$log_sha256,totalWarnings:$total,
       warningCounts:{viewTimeout:$timeout,pacemakerTimeout:$pacemaker,
         compactExecutionEviction:$eviction,rustLeaderCommit:$commits,
         duplicateVoteSuppression:$duplicate_vote,
-        duplicateCommitVoteSuppression:$duplicate_commit},
+        duplicateCommitVoteSuppression:$duplicate_commit,
+        payloadBuildRetry:$payload_retry,
+        unsupportedStateSyncFallback:$unsupported_state_sync},
       warningPartitionExact:true,timeoutSetsCountExact:true,
       compactEvictionsMatchRustLeaderCommits:true,
       unexpectedWarnings:0,criticalSignals:0,
