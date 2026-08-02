@@ -117,8 +117,12 @@ exact six-endpoint comparisons covering full and hash-only blocks, receipts,
 logs, every transaction object and receipt, balances, nonce, code, and storage.
 This directly confirms that the old Rust-only `blockTimestamp` response-shape
 failure remains fixed in the current binaries without contaminating the new
-zero-transaction window. A controller audit also found and fixed a release
-race: the finalizer could previously release the burst at the 86,400-second
+zero-transaction window. The pinned 5.7.906 binaries also passed a fresh
+read-only archive rehearsal: 209 exact Gov/Rust RPC comparisons across 11
+historical heights, two byte-exact current-head QMDB reference proofs, and all
+current plus historical proofs verified offline against their expected roots.
+A controller audit also found and fixed a release race: the finalizer could
+previously release the burst at the 86,400-second
 acceptance threshold while the deliberately 86,640-second zero-transaction
 monitor was still running. Commit `dc65f36` now waits for that monitor to close
 and re-audits its complete immutable stream before sending anything. Only the
