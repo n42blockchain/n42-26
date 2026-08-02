@@ -40,7 +40,12 @@ const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
 /// TX forwarding batches are latency-bounded by a 50ms flush timer, so we can
 /// use a larger batch target to reduce cross-task and cross-peer overhead.
 const TX_FORWARD_BATCH_TARGET: usize = 512;
-const H2_V4_FETCH_RETRY_TIMEOUT: Duration = Duration::from_secs(12);
+// Gov5 serves block-by-hash from its local database. A healthy local validator
+// responds well inside this deadline; waiting for the ten-second transport
+// timeout makes a long reverse ancestry effectively serial at one block per
+// timeout whenever a command is suppressed or a swarm terminal event is lost.
+const H2_V4_FETCH_RETRY_TIMEOUT: Duration = Duration::from_secs(2);
+const H2_V4_FETCH_RETRY_ROUND: Duration = Duration::from_secs(30);
 const DEFAULT_H2_V4_CATCHUP_BUFFER_BLOCKS: usize = 2048;
 const MAX_H2_V4_CATCHUP_BUFFER_BLOCKS: usize = 131_072;
 
@@ -653,16 +658,35 @@ impl ConsensusService {
             {
                 continue;
             }
-            let retry_peer = self
+            let attempted = {
+                let entry = self
+                    .h2_v4_fetch_failed_peers
+                    .entry(block_hash)
+                    .or_insert_with(|| (now, HashSet::new()));
+                if now.duration_since(entry.0) >= H2_V4_FETCH_RETRY_ROUND {
+                    entry.0 = now;
+                    entry.1.clear();
+                }
+                entry.1.insert(previous_peer);
+                entry.1.clone()
+            };
+            while self.h2_v4_fetch_failed_peers.len() > 2048 {
+                self.h2_v4_fetch_failed_peers.pop_first();
+            }
+            let mut retry_peer = self
                 .connected_peers
                 .iter()
                 .copied()
-                .find(|peer| *peer != previous_peer)
-                .or_else(|| {
-                    self.connected_peers
-                        .contains(&previous_peer)
-                        .then_some(previous_peer)
-                });
+                .find(|peer| !attempted.contains(peer));
+            if retry_peer.is_none() {
+                // Every connected peer has had one bounded attempt. Start a
+                // fresh round instead of leaving this ancestry hash stranded.
+                if let Some(entry) = self.h2_v4_fetch_failed_peers.get_mut(&block_hash) {
+                    entry.0 = now;
+                    entry.1.clear();
+                }
+                retry_peer = self.connected_peers.iter().copied().next();
+            }
             if let Some(retry_peer) = retry_peer {
                 counter!("n42_h2_v4_block_fetch_deadline_retries_total").increment(1);
                 warn!(
@@ -670,6 +694,7 @@ impl ConsensusService {
                     %block_hash,
                     %previous_peer,
                     %retry_peer,
+                    attempted = attempted.len(),
                     "authenticated Gov5 block fetch deadline expired; retrying"
                 );
                 self.request_h2_v4_gov5_block(retry_peer, block_hash);
@@ -736,6 +761,17 @@ impl ConsensusService {
             .insert(height, (source, rlp, authenticated_view));
         if activate {
             self.h2_v4_catchup_active = true;
+        }
+        let buffered = self.h2_v4_catchup_blocks.len();
+        if buffered == 1 || buffered % 1024 == 0 {
+            info!(
+                target: "n42::interop::h2v4",
+                buffered,
+                oldest_height = self.h2_v4_catchup_blocks.first_key_value().map(|(height, _)| *height),
+                newest_height = self.h2_v4_catchup_blocks.last_key_value().map(|(height, _)| *height),
+                execution_head_number = self.head_block_number,
+                "authenticated Gov5 reverse ancestry progress"
+            );
         }
         true
     }
@@ -3380,14 +3416,13 @@ impl ConsensusService {
             } if self.h2_v4_identity.is_some() => {
                 self.h2_v4_fetch_requested_at.remove(&block_hash);
                 warn!(target: "n42::interop::h2v4", %source, %block_hash, %error, "H2-authenticated gov5 block fetch failed");
-                const FETCH_RETRY_ROUND: Duration = Duration::from_secs(5);
                 let now = Instant::now();
                 let attempted = {
                     let entry = self
                         .h2_v4_fetch_failed_peers
                         .entry(block_hash)
                         .or_insert_with(|| (now, HashSet::new()));
-                    if now.duration_since(entry.0) >= FETCH_RETRY_ROUND {
+                    if now.duration_since(entry.0) >= H2_V4_FETCH_RETRY_ROUND {
                         entry.0 = now;
                         entry.1.clear();
                     }
@@ -3397,11 +3432,18 @@ impl ConsensusService {
                 while self.h2_v4_fetch_failed_peers.len() > 2048 {
                     self.h2_v4_fetch_failed_peers.pop_first();
                 }
-                let retry_peer = self
+                let mut retry_peer = self
                     .connected_peers
                     .iter()
                     .copied()
                     .find(|peer| !attempted.contains(peer));
+                if retry_peer.is_none() {
+                    if let Some(entry) = self.h2_v4_fetch_failed_peers.get_mut(&block_hash) {
+                        entry.0 = now;
+                        entry.1.clear();
+                    }
+                    retry_peer = self.connected_peers.iter().copied().next();
+                }
                 if let Some(retry_peer) = retry_peer {
                     counter!("n42_h2_v4_block_fetch_retries_total").increment(1);
                     debug!(
@@ -5211,7 +5253,11 @@ mod tests {
         let (network, _cmd_rx, mut prx) = make_test_network();
         let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
         let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
-        let peers = [libp2p::PeerId::random(), libp2p::PeerId::random()];
+        let peers = [
+            libp2p::PeerId::random(),
+            libp2p::PeerId::random(),
+            libp2p::PeerId::random(),
+        ];
         let block_hash = B256::repeat_byte(0xa7);
         orch.connected_peers.extend(peers);
 
@@ -5233,17 +5279,36 @@ mod tests {
         orch.retry_expired_h2_v4_fetches();
 
         let retry = prx.try_recv().expect("deadline retry command");
-        assert!(matches!(
-            retry,
-            NetworkCommand::RequestGov5BlockByHash { peer, block_hash: hash }
-                if peer == peers[1] && hash == block_hash
-        ));
+        let NetworkCommand::RequestGov5BlockByHash {
+            peer: second_peer,
+            block_hash: second_hash,
+        } = retry
+        else {
+            panic!("expected block fetch retry command")
+        };
+        assert_ne!(second_peer, peers[0]);
+        assert_eq!(second_hash, block_hash);
         assert_eq!(
             orch.h2_v4_fetch_requested_at
                 .get(&block_hash)
                 .map(|(_, peer)| *peer),
-            Some(peers[1])
+            Some(second_peer)
         );
+
+        orch.h2_v4_fetch_requested_at.insert(
+            block_hash,
+            (
+                Instant::now() - H2_V4_FETCH_RETRY_TIMEOUT - Duration::from_secs(1),
+                second_peer,
+            ),
+        );
+        orch.retry_expired_h2_v4_fetches();
+        let third = prx.try_recv().expect("second deadline retry command");
+        assert!(matches!(
+            third,
+            NetworkCommand::RequestGov5BlockByHash { peer, block_hash: hash }
+                if peer != peers[0] && peer != second_peer && hash == block_hash
+        ));
     }
 
     #[tokio::test]

@@ -44,13 +44,17 @@ const SYNC_RATE_WINDOW: Duration = Duration::from_secs(1);
 const MAX_SYNC_REQUESTS_UNTRUSTED: u32 = 4;
 const MAX_SYNC_REQUESTS_VALIDATOR: u32 = 32;
 const MAX_PENDING_GOV5_BLOCK_REQUESTS: usize = 256;
-const MAX_GOV5_BLOCK_FETCH_FANOUT: usize = 8;
+// A reverse ancestry is intrinsically serial: the next parent hash is learned
+// from the current body. Sending every step to every validator leaves several
+// redundant ten-second request streams alive after the first response and
+// eventually starves useful requests. Hedge by rotating peers after a short
+// deadline instead of eagerly duplicating every request.
+const MAX_GOV5_BLOCK_FETCH_FANOUT: usize = 1;
 const MAX_RECENT_GOV5_BLOCK_REQUESTS: usize = 4096;
 const GOV5_BLOCK_REQUEST_COOLDOWN: Duration = Duration::from_millis(750);
-// The underlying request-response behaviour times out after ten seconds.
-// Keep one second of scheduling headroom, then let the next orchestrator retry
-// clear any hash-level state whose terminal swarm event was lost or delayed.
-const GOV5_BLOCK_REQUEST_STALE_AFTER: Duration = Duration::from_secs(11);
+// Re-arm before the orchestrator's two-second retry. Late transport responses
+// are redundant and safely ignored after their request id is reaped.
+const GOV5_BLOCK_REQUEST_STALE_AFTER: Duration = Duration::from_millis(1500);
 const MAX_SERVED_GOV5_BLOCKS: usize = 1024;
 
 fn stale_gov5_block_fetches(
@@ -81,10 +85,10 @@ fn gov5_block_fetch_fanout(
         }
     };
 
-    // Preserve the authenticated message source as the first choice, then
-    // cover every connected implementation in one bounded round. Keeping the
-    // previous failed peer until last prevents a pair of lagging Rust nodes
-    // from selecting only each other while Gov5 peers already have the body.
+    // Preserve the authenticated message source as the first choice. The
+    // orchestrator remembers attempted peers and rotates through the complete
+    // connected set on short deadlines, so only one transport stream is needed
+    // per attempt and the previous peer remains the final fallback.
     if connected.contains(&preferred) && Some(preferred) != last_peer {
         push(preferred);
     }
@@ -2700,9 +2704,9 @@ impl NetworkService {
             NetworkCommand::RequestGov5BlockByHash { peer, block_hash } => {
                 let now = Instant::now();
                 // Hash de-duplication must not outlive the transport request
-                // that created it. In live catch-up a fan-out round could lose
+                // that created it. In live catch-up a request could lose
                 // every terminal swarm event, leaving the orchestrator's
-                // twelve-second retry permanently suppressed even though all
+                // orchestrator retry suppressed even though all
                 // Gov5 peers already served the body. Reap every overdue hash
                 // before applying pending/capacity checks; late responses are
                 // safely treated as redundant by the response handler.
@@ -3178,7 +3182,7 @@ mod tests {
     }
 
     #[test]
-    fn gov5_block_fetch_fanout_covers_connected_peers_and_defers_last_failure() {
+    fn gov5_block_fetch_uses_one_preferred_peer_per_attempt() {
         let preferred = PeerId::random();
         let advertised = PeerId::random();
         let rust_peer = PeerId::random();
@@ -3186,10 +3190,11 @@ mod tests {
 
         let peers = gov5_block_fetch_fanout(preferred, Some(rust_peer), &[advertised], &connected);
 
-        assert_eq!(peers[0], preferred);
-        assert!(peers.contains(&advertised));
-        assert_eq!(peers.last(), Some(&rust_peer));
-        assert_eq!(peers.len(), connected.len());
+        assert_eq!(peers, vec![preferred]);
+
+        let rotated =
+            gov5_block_fetch_fanout(preferred, Some(preferred), &[advertised], &connected);
+        assert_eq!(rotated, vec![advertised]);
     }
 
     #[test]
@@ -3200,7 +3205,8 @@ mod tests {
         let peers = gov5_block_fetch_fanout(preferred, None, &[], &connected);
 
         assert!(!peers.contains(&preferred));
-        assert_eq!(peers.len(), connected.len());
+        assert_eq!(peers.len(), 1);
+        assert!(connected.contains(&peers[0]));
     }
 
     #[test]
