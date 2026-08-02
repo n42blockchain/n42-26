@@ -1832,3 +1832,13 @@ verifier will recompute every evidence SHA and re-evaluate the 24-hour,
 transaction, restart, leader, timeout, log, resource, and live-chain gates.
 The preflight evidence SHA-256 is
 `d1ea4a04a6f6c2a7cc3f3cb6bae3a2e9376fa7213167e78471a6ebe266137b75`.
+
+The independent verifier was subsequently hardened to compare every embedded
+audit object with its source file and to re-execute the raw soak, resource,
+leader, timeout, log, archive RPC, and offline QMDB proof checks. A frozen,
+SHA-bound copy passed both negative and positive identity preflights. A second
+fail-closed waiter, PID 57182, now watches frozen finalizer PID 52570 and will
+publish the independent result atomically only after the final summary exists.
+No node or long-running monitor PID changed and no transaction was sent. The
+waiter launch evidence SHA-256 is
+`b8848b6603077748e47578b316d85f3ea953933431af21900f438a7b4147464f`.
