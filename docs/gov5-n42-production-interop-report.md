@@ -302,6 +302,24 @@ the complete manifest SHA-256 is
 `f05a19fcd64169f97042eeb67e6be72d96397c450b6bec64ec40db3ff1ed7b8f`.
 This remains an in-progress milestone and releases no transaction.
 
+The three-hour immutable milestone is preserved under
+`evidence/milestones/replacement-three-hour-20260802T1859Z/`. Its 366 formal
+samples span 11,104 seconds, grow from block 85,977 to 87,231, retain a
+maximum 31-second sample gap and maximum lag two, and remain transaction-free.
+The canonical audit scans 1,284 blocks and matches all 214 expected Rust slots
+across all six RPC endpoints with continuous parents, exact hashes,
+`votes=5+5`, and exact seven-view stride. The Rust-head snapshot closes all
+214 timeout events with none pending. All 1,740 warnings partition exactly,
+with zero unknown or critical signals. Thirty-eight resource samples span
+11,106 seconds under Rust PID 30367, with RSS no higher than 270,976 KiB, at
+most 162 threads, and 93 descriptors; all storage and log counters remain
+monotonic. Nineteen Gov5 upstream samples span 10,815 seconds and remain exact
+at `f3dbeba4694590e6478780ac8a14e900f7dd7505`. The formal snapshot SHA-256 is
+`b3ae220377502010359efb70819da3dcc516758bd2f7b96979e9c3dbe62273c1`;
+the complete manifest SHA-256 is
+`4c45d9b93551bfb74e24e4ce86d54642d67e8afd3177d4dc48f98f6a691071b7`.
+This remains an in-progress milestone and releases no transaction.
+
 ## Source and binary identity
 
 Interop branches:
