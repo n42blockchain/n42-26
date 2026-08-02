@@ -1,6 +1,7 @@
 # Devlog 112: dependency refresh and Reth 2.4.1 baseline
 
 Date: 2026-07-21
+Latest compatible lock refresh: 2026-08-02
 
 ## Scope
 
@@ -47,6 +48,20 @@ These versions intentionally do not follow their newest major release:
 versions are the explicit pins above or transitive packages whose parent dependency controls the
 version.
 
+## 2026-08-02 compatible lock refresh
+
+A fresh registry and git-index resolution found 37 newer semver-compatible packages after the
+original 2026-07-21 validation. `Cargo.lock` now includes all of them while retaining the exact
+Reth 2.4.1 checkout and the compatibility pins above. The refresh covers AES/BLST and supporting
+crypto crates, Rustls and PKI types, Tokio macros/streams, HTTP, Clap, TOML, platform/build
+tooling, palette, Pest, Schemars, and other transitive maintenance releases. It also removes the
+obsolete `fast-srgb8` edge and adds `palette_math` through palette 0.7.7.
+
+After the update, another `cargo update --dry-run --verbose` locked zero packages. The only newer
+versions reported are the intentional major or release-matrix pins already documented above.
+The updated lockfile SHA-256 is
+`c5998ac1a8e2a3e8dcaf21847cac78c80ad6e817050c09300cc7183753afff74`.
+
 ## Verification
 
 - `cargo check --workspace --all-targets`: passed
@@ -54,6 +69,10 @@ version.
 - `cargo clippy --workspace --all-targets -- -D warnings`: passed
 - JNI 0.22 host compile/clippy harness for `src/android.rs`: passed with warnings denied
 - paired `../reth` status after verification: clean
+
+The 2026-08-02 lock refresh repeated the all-target workspace check, complete workspace test
+suite, and warnings-denied all-target Clippy gate; all passed. These checks ran against the clean
+paired Reth checkout at `c533db8bad6f300be93ec047ecffc717b08957f8` (workspace version 2.4.1).
 
 The excluded `n42-zkproof-guest` remains a separate SP1 RISC-V build and was not host-compiled.
 No Android Rust target is installed in this macOS verification environment, so the JNI bridge was
