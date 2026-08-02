@@ -365,6 +365,75 @@ monitor_heads() {
   done
 }
 
+audit_soak() {
+  local evidence_file="${1:?evidence file required}"
+  local minimum_elapsed="${2:?minimum first-to-last sample seconds required}"
+  local maximum_gap="${3:-120}"
+  local maximum_lag="${4:-6}"
+  local require_zero_tx="${5:-0}"
+  require_file "$evidence_file"
+  jq -e -s \
+    --argjson minimum_elapsed "$minimum_elapsed" \
+    --argjson maximum_gap "$maximum_gap" \
+    --argjson maximum_lag "$maximum_lag" \
+    --argjson require_zero_tx "$require_zero_tx" '
+    . as $samples |
+    ($samples | length >= 2) and
+    ($samples | all(.[];
+      .ok == true and
+      (.error // "") == "" and
+      (.commonHeight | type) == "number" and
+      (.maximumHeight | type) == "number" and
+      .maximumHeight >= .commonHeight and
+      .lag == (.maximumHeight - .commonHeight) and
+      .lag <= $maximum_lag and
+      (.identity | test("^0x[0-9a-f]{64}:0x[0-9a-f]{64}:0x[0-9a-f]{64}$")))) and
+    ([$samples[].at | fromdateiso8601] as $times |
+      ($times[-1] - $times[0]) >= $minimum_elapsed and
+      ([range(1; $times | length) as $i |
+        ($times[$i] - $times[$i - 1]) > 0 and
+        ($times[$i] - $times[$i - 1]) <= $maximum_gap] | all)) and
+    ($samples[-1].commonHeight > $samples[0].commonHeight) and
+    ($require_zero_tx == 0 or
+      (($samples[0].zeroTxRequired == 1) and
+       ($samples[0].zeroTxVerifiedFrom == -1) and
+       ($samples[0].zeroTxVerifiedTo == $samples[0].commonHeight) and
+       ([range(1; $samples | length) as $i |
+         $samples[$i].zeroTxRequired == 1 and
+         $samples[$i].zeroTxVerifiedTo == $samples[$i].commonHeight and
+         (if $samples[$i].commonHeight > $samples[$i - 1].commonHeight then
+            $samples[$i].zeroTxVerifiedFrom == ($samples[$i - 1].zeroTxVerifiedTo + 1)
+          else
+            $samples[$i].zeroTxVerifiedFrom == -1 and
+            $samples[$i].zeroTxVerifiedTo == $samples[$i - 1].zeroTxVerifiedTo
+          end)] | all)))
+  ' "$evidence_file" >/dev/null
+
+  jq -nc \
+    --arg at "$(date -u +%FT%TZ)" \
+    --arg evidence "$evidence_file" \
+    --arg evidence_sha256 "$(sha256sum "$evidence_file" | awk '{print $1}')" \
+    --argjson minimum_elapsed "$minimum_elapsed" \
+    --argjson maximum_gap "$maximum_gap" \
+    --argjson maximum_lag "$maximum_lag" \
+    --argjson require_zero_tx "$require_zero_tx" \
+    --slurpfile samples "$evidence_file" '
+    [$samples[].at | fromdateiso8601] as $times |
+    {
+      at:$at,event:"mixed_client_soak_audit",status:"PASS",
+      evidence:$evidence,evidenceSha256:$evidence_sha256,
+      samples:($samples|length),firstAt:$samples[0].at,lastAt:$samples[-1].at,
+      elapsedSeconds:($times[-1]-$times[0]),
+      maximumSampleGapSeconds:([range(1;$times|length) as $i |
+        $times[$i]-$times[$i-1]]|max),
+      startHeight:$samples[0].commonHeight,endHeight:$samples[-1].commonHeight,
+      blockGrowth:($samples[-1].commonHeight-$samples[0].commonHeight),
+      maximumLag:([$samples[].lag]|max),zeroTransactionRequired:($require_zero_tx==1),
+      thresholds:{minimumElapsedSeconds:$minimum_elapsed,
+        maximumSampleGapSeconds:$maximum_gap,maximumLag:$maximum_lag}
+    }'
+}
+
 record_clock_snapshot() {
   label="${1:?snapshot label required}"
   evidence_file="${2:-$runtime/evidence/clock-snapshots.jsonl}"
@@ -1074,6 +1143,7 @@ case "${1:-}" in
     ;;
   status) status ;;
   monitor-heads) monitor_heads "${2:-}" "${3:-10}" "${4:-}" ;;
+  audit-soak) audit_soak "${2:-}" "${3:-}" "${4:-120}" "${5:-6}" "${6:-0}" ;;
   record-clock) record_clock_snapshot "${2:-}" "${3:-}" ;;
   record-head) record_single_head "${2:-}" "${3:-}" "${4:-}" ;;
   era-checksums) write_era_checksums "${2:-}" ;;
@@ -1084,7 +1154,7 @@ case "${1:-}" in
   archive-rpc-parity) archive_rpc_parity "${2:-}" "${3:-}" "${4:-}" ;;
   transaction-burst) transaction_burst "${2:-}" "${3:-}" ;;
   *)
-    echo "usage: $0 {start-gov|start-gov-node N|start-rust|start-rust2|stop-rust|stop-rust2|start|stop|restart-gov-node N|restart-rust|restart-rust2|status|monitor-heads <seconds> [interval] [evidence-file]|record-clock <label> [evidence-file]|record-head <label> <port> [evidence-file]|era-checksums <directory>|archive-export <node> <snapshot>|archive-verify <snapshot>|archive-import <snapshot> <fresh-destination>|archive-corruption-drill <snapshot> <corrupt-copy> <recovered-copy> [evidence-file]|archive-rpc-parity <gov-endpoint> <rust-endpoint> [evidence-file]|transaction-burst [ARTIFACT] [EVIDENCE]}" >&2
+    echo "usage: $0 {start-gov|start-gov-node N|start-rust|start-rust2|stop-rust|stop-rust2|start|stop|restart-gov-node N|restart-rust|restart-rust2|status|monitor-heads <seconds> [interval] [evidence-file]|audit-soak <evidence-file> <minimum-elapsed-seconds> [maximum-gap-seconds] [maximum-lag] [require-zero-tx]|record-clock <label> [evidence-file]|record-head <label> <port> [evidence-file]|era-checksums <directory>|archive-export <node> <snapshot>|archive-verify <snapshot>|archive-import <snapshot> <fresh-destination>|archive-corruption-drill <snapshot> <corrupt-copy> <recovered-copy> [evidence-file]|archive-rpc-parity <gov-endpoint> <rust-endpoint> [evidence-file]|transaction-burst [ARTIFACT] [EVIDENCE]}" >&2
     exit 2
     ;;
 esac
