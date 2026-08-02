@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 runtime="${N42_QUAL_RUNTIME:-/Users/jieliu/Documents/n42/live-interop-20260721/runtime-18-gov5-906-latest-reth}"
-harness="$repo/scripts/gov5-interop-qualification.sh"
+harness="$runtime/artifacts/scripts/gov5-interop-qualification.sh"
+qmdb_proof_verifier="$runtime/artifacts/binaries/n42-qmdb-proof-verify"
 gov_version="${N42_QUAL_GOV_VERSION:-906}"
 formal="$runtime/evidence/mixed-soak-24h.jsonl"
 burst_artifact="$runtime/artifacts/p4-signed-transaction-burst.json"
@@ -34,6 +34,8 @@ expected_genesis="0xb71c28109836f120453d097c38819a55b14c49abcc92713037fb9b112013
 expected_genesis_artifact_sha="561808693c76b356e51f8f5961304e68f3167943c17145bda056612041dca687"
 expected_consensus_config_sha="38cd3fb1f57e5e3053e23de836b7c98e542ccb5375d0521a65b5c2f6175bd8bf"
 expected_bootstrap_bundle_sha="35dda59684e7f56978e5d8de385fa2d2bf15b47747388b88a7449ac31387bf15"
+expected_harness_sha="bd5fafe7b47a8613252c977d0060ccd25e2e1ee6fba949c8f28e0b9feda95d5e"
+expected_qmdb_verifier_sha="b329baa1e51435082b2bb2cf538a8d1a1ffd994b5c4ac73474e688ffbfc35c19"
 expected_gov_sha="${N42_QUAL_EXPECTED_GOV_SHA:-51e68918560be65f8e5221f02a3d544a7baf42bed9aa86655623449a4fd765d0}"
 expected_rust_sha="d917782b906176119172e656005218be34ec3d5ad1b7241c0c53f8f6d593da2d"
 frozen_validator_key_dir="$runtime/artifacts/validator-keys/node0"
@@ -243,6 +245,8 @@ assert_runtime_identity() {
   local bootstrap_bundle="$runtime/artifacts/bootstrap-bundle.json"
   require_file "$runtime/geth-live"
   require_file "$runtime/n42-node"
+  require_file "$harness"
+  require_file "$qmdb_proof_verifier"
   require_file "$genesis_artifact"
   require_file "$consensus_config"
   require_file "$bootstrap_bundle"
@@ -250,6 +254,10 @@ assert_runtime_identity() {
   require_file "$p2p_key"
   test "$(shasum -a 256 "$runtime/geth-live" | awk '{print $1}')" = "$expected_gov_sha"
   test "$(shasum -a 256 "$runtime/n42-node" | awk '{print $1}')" = "$expected_rust_sha"
+  test "$(shasum -a 256 "$harness" | awk '{print $1}')" = \
+    "$expected_harness_sha"
+  test "$(shasum -a 256 "$qmdb_proof_verifier" | awk '{print $1}')" = \
+    "$expected_qmdb_verifier_sha"
   test "$(shasum -a 256 "$genesis_artifact" | awk '{print $1}')" = \
     "$expected_genesis_artifact_sha"
   test "$(shasum -a 256 "$consensus_config" | awk '{print $1}')" = \
@@ -381,7 +389,9 @@ env N42_QUAL_RUNTIME="$runtime" N42_QUAL_PORTS="$ports" \
 env N42_QUAL_RUNTIME="$runtime" "$harness" \
   audit-soak "$post_burst" 600 120 6 0 >"$post_burst_audit"
 
-env N42_QUAL_RUNTIME="$runtime" "$harness" archive-rpc-parity \
+env N42_QUAL_RUNTIME="$runtime" \
+  N42_QUAL_QMDB_PROOF_VERIFY="$qmdb_proof_verifier" \
+  "$harness" archive-rpc-parity \
   http://127.0.0.1:28501 "http://127.0.0.1:$rust_port" "$archive_post_burst"
 jq -e -s '
   (map(select(.event == "archive_qmdb_reference_parity" and
@@ -517,6 +527,8 @@ jq -nc \
   --arg genesis_artifact_sha "$expected_genesis_artifact_sha" \
   --arg consensus_config_sha "$expected_consensus_config_sha" \
   --arg bootstrap_bundle_sha "$expected_bootstrap_bundle_sha" \
+  --arg harness_sha "$expected_harness_sha" \
+  --arg qmdb_verifier_sha "$expected_qmdb_verifier_sha" \
   --arg validator_key_sha "$expected_validator_key_sha" \
   --arg p2p_key_sha "$expected_p2p_key_sha" \
   --arg formal "$formal" \
@@ -549,6 +561,9 @@ jq -nc \
    genesisArtifactSha256:$genesis_artifact_sha,
    consensusConfigSha256:$consensus_config_sha,
    bootstrapBundleSha256:$bootstrap_bundle_sha,
+   qualificationHarnessSha256:$harness_sha,
+   qmdbProofVerifierSha256:$qmdb_verifier_sha,
+   finalToolingFrozenAndExact:true,
    restartConfigurationFrozenAndExact:true,
    validatorKeySha256:$validator_key_sha,p2pKeySha256:$p2p_key_sha,
    keyMaterialFrozenAndExact:true,
