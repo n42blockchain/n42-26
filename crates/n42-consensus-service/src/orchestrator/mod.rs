@@ -767,7 +767,7 @@ impl ConsensusService {
             self.h2_v4_catchup_active = true;
         }
         let buffered = self.h2_v4_catchup_blocks.len();
-        if buffered == 1 || buffered % 1024 == 0 {
+        if buffered == 1 || buffered.is_multiple_of(1024) {
             info!(
                 target: "n42::interop::h2v4",
                 buffered,

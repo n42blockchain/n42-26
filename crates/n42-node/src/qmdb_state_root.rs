@@ -1,9 +1,9 @@
 //! Branch-safe, correctness-first QMDB state-root tracking for Gov5 Engine imports.
 //!
-//! The store retains per-block operation deltas and reconstructs each candidate from an
-//! authenticated base snapshot. This is intentionally bounded and slower than gov5's persistent
-//! undo/index implementation, but it never mutates a canonical global tree before the candidate's
-//! header root has matched. It is the safe execution-follower bridge for bounded replay ranges.
+//! The store retains per-block operation deltas and reconstructs branch candidates from an
+//! authenticated base snapshot. Empty state transitions use their authenticated parent's root
+//! directly, and crash-safe deltas are appended to a checksummed WAL. It never mutates a canonical
+//! global tree before the candidate's header root has matched.
 
 use alloy_primitives::B256;
 use alloy_rpc_types_engine::ExecutionData;
@@ -25,7 +25,8 @@ use reth_provider::{BlockExecutionOutput, ProviderError, ProviderResult};
 use reth_trie::updates::TrieUpdates;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
+    fs::OpenOptions,
     io::Write,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -47,7 +48,7 @@ use crate::{
 /// fail-closed testing or a larger audited bound for longer archive horizons.
 pub const DEFAULT_QMDB_REPLAY_DEPTH: usize = 1_048_576;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct StoredQmdbBlock {
     parent_hash: B256,
     root: B256,
@@ -67,6 +68,15 @@ struct PersistedQmdbBranchState {
     base_snapshot: QmdbSnapshot,
     blocks: HashMap<B256, StoredQmdbBlock>,
 }
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistedQmdbWalRecord {
+    block_hash: B256,
+    block: StoredQmdbBlock,
+}
+
+const QMDB_WAL_MAX_RECORD_BYTES: usize = 64 * 1024 * 1024;
+const QMDB_WAL_CHECKSUM_BYTES: usize = 32;
 
 /// Thread-safe QMDB candidate store rooted at one authenticated checkpoint.
 #[derive(Debug)]
@@ -179,18 +189,22 @@ impl Gov5QmdbStateRootStore {
                 {
                     return Err(Gov5QmdbStateRootError::PersistedBaseMismatch);
                 }
+                let mut blocks = persisted.blocks;
+                load_wal(&wal_path(&path), &mut blocks)?;
                 validate_persisted_blocks(
                     store.base_block_hash,
                     store.base_root,
                     &store.base_snapshot,
                     store.max_replay_depth,
-                    &persisted.blocks,
+                    &blocks,
                 )?;
-                store.state = Mutex::new(QmdbBranchState {
-                    blocks: persisted.blocks,
-                });
+                store.state = Mutex::new(QmdbBranchState { blocks });
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                store.persist_checkpoint_locked(&QmdbBranchState {
+                    blocks: HashMap::new(),
+                })?;
+            }
             Err(error) => {
                 return Err(Gov5QmdbStateRootError::Persistence(error.to_string()));
             }
@@ -271,7 +285,13 @@ impl Gov5QmdbStateRootStore {
                 operations,
             },
         );
-        if let Err(error) = self.persist_locked(&state) {
+        if let Err(error) = self.append_wal_block(
+            block_hash,
+            state
+                .blocks
+                .get(&block_hash)
+                .expect("inserted QMDB block is present"),
+        ) {
             state.blocks.remove(&block_hash);
             return Err(error);
         }
@@ -285,6 +305,21 @@ impl Gov5QmdbStateRootStore {
         parent_hash: B256,
         operations: &[QmdbOperation],
     ) -> Result<B256, Gov5QmdbStateRootError> {
+        // Applying no operations cannot alter a QMDB root. Avoid replaying the entire ancestry
+        // for the common empty-block case when the total retained graph proves the configured
+        // depth cannot have been exceeded. Once the graph is larger than that bound, fall back to
+        // exact ancestry reconstruction so heavily branched stores still fail closed correctly.
+        if operations.is_empty() && state.blocks.len() <= self.max_replay_depth {
+            return if parent_hash == self.base_block_hash {
+                Ok(self.base_root)
+            } else {
+                state
+                    .blocks
+                    .get(&parent_hash)
+                    .map(|block| block.root)
+                    .ok_or(Gov5QmdbStateRootError::MissingParent(parent_hash))
+            };
+        }
         let mut tree = self.reconstruct_tree_locked(state, parent_hash)?;
         Ok(B256::from(
             tree.apply_sorted_ops(operations.iter().cloned())?,
@@ -431,7 +466,10 @@ impl Gov5QmdbStateRootStore {
             .map(|block| block.parent_hash))
     }
 
-    fn persist_locked(&self, state: &QmdbBranchState) -> Result<(), Gov5QmdbStateRootError> {
+    fn persist_checkpoint_locked(
+        &self,
+        state: &QmdbBranchState,
+    ) -> Result<(), Gov5QmdbStateRootError> {
         let Some(path) = &self.persistence_path else {
             return Ok(());
         };
@@ -446,6 +484,137 @@ impl Gov5QmdbStateRootStore {
             .map_err(|error| Gov5QmdbStateRootError::Persistence(error.to_string()))?;
         atomic_write(path, &bytes)
     }
+
+    fn append_wal_block(
+        &self,
+        block_hash: B256,
+        block: &StoredQmdbBlock,
+    ) -> Result<(), Gov5QmdbStateRootError> {
+        let Some(path) = &self.persistence_path else {
+            return Ok(());
+        };
+        append_wal_record(
+            &wal_path(path),
+            &PersistedQmdbWalRecord {
+                block_hash,
+                block: block.clone(),
+            },
+        )
+    }
+}
+
+fn wal_path(checkpoint_path: &Path) -> PathBuf {
+    checkpoint_path.with_extension("wal")
+}
+
+fn append_wal_record(
+    path: &Path,
+    record: &PersistedQmdbWalRecord,
+) -> Result<(), Gov5QmdbStateRootError> {
+    let payload = bincode::serialize(record)
+        .map_err(|error| Gov5QmdbStateRootError::Persistence(error.to_string()))?;
+    let payload_len = u32::try_from(payload.len()).map_err(|_| {
+        Gov5QmdbStateRootError::Persistence("QMDB WAL record exceeds u32 length".into())
+    })?;
+    if payload.len() > QMDB_WAL_MAX_RECORD_BYTES {
+        return Err(Gov5QmdbStateRootError::Persistence(format!(
+            "QMDB WAL record is {} bytes, exceeding {}",
+            payload.len(),
+            QMDB_WAL_MAX_RECORD_BYTES
+        )));
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| Gov5QmdbStateRootError::Persistence(error.to_string()))?;
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .append(true)
+        .open(path)
+        .map_err(|error| Gov5QmdbStateRootError::Persistence(error.to_string()))?;
+    let original_len = file
+        .metadata()
+        .map_err(|error| Gov5QmdbStateRootError::Persistence(error.to_string()))?
+        .len();
+    let checksum = blake3::hash(&payload);
+    let write_result = file
+        .write_all(&payload_len.to_le_bytes())
+        .and_then(|()| file.write_all(&payload))
+        .and_then(|()| file.write_all(checksum.as_bytes()))
+        .and_then(|()| file.sync_all());
+    if let Err(error) = write_result {
+        let _ = file.set_len(original_len);
+        let _ = file.sync_all();
+        return Err(Gov5QmdbStateRootError::Persistence(error.to_string()));
+    }
+    Ok(())
+}
+
+fn load_wal(
+    path: &Path,
+    blocks: &mut HashMap<B256, StoredQmdbBlock>,
+) -> Result<(), Gov5QmdbStateRootError> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(Gov5QmdbStateRootError::Persistence(error.to_string())),
+    };
+    let mut offset = 0usize;
+    while offset < bytes.len() {
+        let record_start = offset;
+        let Some(length_bytes) = bytes.get(offset..offset.saturating_add(4)) else {
+            truncate_incomplete_wal(path, record_start)?;
+            break;
+        };
+        let payload_len = u32::from_le_bytes(length_bytes.try_into().expect("four bytes")) as usize;
+        if payload_len > QMDB_WAL_MAX_RECORD_BYTES {
+            return Err(Gov5QmdbStateRootError::Persistence(format!(
+                "QMDB WAL record at offset {record_start} declares invalid length {payload_len}"
+            )));
+        }
+        offset += 4;
+        let Some(frame_end) = offset
+            .checked_add(payload_len)
+            .and_then(|end| end.checked_add(QMDB_WAL_CHECKSUM_BYTES))
+        else {
+            return Err(Gov5QmdbStateRootError::Persistence(
+                "QMDB WAL frame length overflow".into(),
+            ));
+        };
+        if frame_end > bytes.len() {
+            truncate_incomplete_wal(path, record_start)?;
+            break;
+        }
+        let payload = &bytes[offset..offset + payload_len];
+        offset += payload_len;
+        let checksum = &bytes[offset..frame_end];
+        if blake3::hash(payload).as_bytes() != checksum {
+            return Err(Gov5QmdbStateRootError::Persistence(format!(
+                "QMDB WAL checksum mismatch at offset {record_start}"
+            )));
+        }
+        let record: PersistedQmdbWalRecord = bincode::deserialize(payload)
+            .map_err(|error| Gov5QmdbStateRootError::Persistence(error.to_string()))?;
+        if let Some(existing) = blocks.insert(record.block_hash, record.block.clone())
+            && existing != record.block
+        {
+            return Err(Gov5QmdbStateRootError::Persistence(format!(
+                "QMDB WAL redefines block {}",
+                record.block_hash
+            )));
+        }
+        offset = frame_end;
+    }
+    Ok(())
+}
+
+fn truncate_incomplete_wal(path: &Path, valid_len: usize) -> Result<(), Gov5QmdbStateRootError> {
+    OpenOptions::new()
+        .write(true)
+        .open(path)
+        .and_then(|file| file.set_len(valid_len as u64))
+        .map_err(|error| Gov5QmdbStateRootError::Persistence(error.to_string()))
 }
 
 fn qualification_abort_at(point: &str) {
@@ -462,52 +631,71 @@ fn validate_persisted_blocks(
     max_replay_depth: usize,
     blocks: &HashMap<B256, StoredQmdbBlock>,
 ) -> Result<(), Gov5QmdbStateRootError> {
-    let mut validated = HashMap::from([(base_block_hash, base_root)]);
-    let mut pending: Vec<_> = blocks.keys().copied().collect();
-    for _ in 0..=blocks.len() {
-        let before = pending.len();
-        pending.retain(|hash| {
-            let block = &blocks[hash];
-            let Some(_) = validated.get(&block.parent_hash) else {
-                return true;
-            };
-            let mut lineage = Vec::new();
-            let mut cursor = *hash;
-            while cursor != base_block_hash {
-                if lineage.len() >= max_replay_depth {
-                    return true;
-                }
-                let Some(stored) = blocks.get(&cursor) else {
-                    return true;
-                };
-                lineage.push((cursor, stored));
-                cursor = stored.parent_hash;
+    let mut children: HashMap<B256, Vec<B256>> = HashMap::new();
+    for (hash, block) in blocks {
+        children.entry(block.parent_hash).or_default().push(*hash);
+    }
+    let mut validated = HashMap::from([(base_block_hash, (base_root, 0usize))]);
+    let mut queue = VecDeque::from([base_block_hash]);
+    while let Some(parent_hash) = queue.pop_front() {
+        let (parent_root, parent_depth) = validated[&parent_hash];
+        for hash in children.remove(&parent_hash).unwrap_or_default() {
+            let block = &blocks[&hash];
+            let depth = parent_depth.checked_add(1).ok_or_else(|| {
+                Gov5QmdbStateRootError::Persistence("QMDB ancestry depth overflow".into())
+            })?;
+            // Candidate computation replays the parent and then applies the child's operations,
+            // so a stored child may be one level beyond the parent replay bound.
+            if depth > max_replay_depth.saturating_add(1) {
+                return Err(Gov5QmdbStateRootError::Persistence(format!(
+                    "QMDB block {hash} exceeds replay depth {max_replay_depth}"
+                )));
             }
-            let Ok(mut tree) = QmdbCompatTree::from_snapshot(base_snapshot) else {
-                return true;
-            };
-            for (lineage_hash, stored) in lineage.into_iter().rev() {
-                let Ok(root) = tree.apply_sorted_ops(stored.operations.iter().cloned()) else {
-                    return true;
-                };
-                if B256::from(root) != stored.root {
-                    return true;
+            let computed = if block.operations.is_empty() {
+                parent_root
+            } else {
+                let mut lineage = Vec::new();
+                let mut cursor = parent_hash;
+                while cursor != base_block_hash {
+                    if lineage.len() >= max_replay_depth {
+                        return Err(Gov5QmdbStateRootError::Persistence(format!(
+                            "QMDB parent {parent_hash} exceeds replay depth {max_replay_depth}"
+                        )));
+                    }
+                    let stored = blocks.get(&cursor).ok_or_else(|| {
+                        Gov5QmdbStateRootError::Persistence(format!(
+                            "QMDB block {hash} has missing ancestor {cursor}"
+                        ))
+                    })?;
+                    lineage.push(stored);
+                    cursor = stored.parent_hash;
                 }
-                validated.insert(lineage_hash, stored.root);
+                let mut tree = QmdbCompatTree::from_snapshot(base_snapshot)?;
+                for stored in lineage.into_iter().rev() {
+                    tree.apply_sorted_ops(stored.operations.iter().cloned())?;
+                }
+                B256::from(tree.apply_sorted_ops(block.operations.iter().cloned())?)
+            };
+            if computed != block.root {
+                return Err(Gov5QmdbStateRootError::Persistence(format!(
+                    "QMDB stored root diverged for block {hash}: got {computed}, stored {}",
+                    block.root
+                )));
             }
-            false
-        });
-        if pending.is_empty() {
-            return Ok(());
-        }
-        if pending.len() == before {
-            break;
+            validated.insert(hash, (block.root, depth));
+            queue.push_back(hash);
         }
     }
-    Err(Gov5QmdbStateRootError::Persistence(format!(
-        "{} retained QMDB blocks have missing ancestry, excessive depth, or divergent roots",
-        pending.len()
-    )))
+    if validated.len() == blocks.len().saturating_add(1) {
+        Ok(())
+    } else {
+        Err(Gov5QmdbStateRootError::Persistence(format!(
+            "{} retained QMDB blocks have missing or cyclic ancestry",
+            blocks
+                .len()
+                .saturating_sub(validated.len().saturating_sub(1))
+        )))
+    }
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), Gov5QmdbStateRootError> {
@@ -902,5 +1090,54 @@ mod tests {
             .unwrap_err(),
             Gov5QmdbStateRootError::PersistedBaseMismatch
         );
+    }
+
+    #[test]
+    fn persistent_empty_chain_uses_linear_wal_and_recovers_torn_tail() {
+        let (store, snapshot) = store();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty-chain.bin");
+        let persistent = Gov5QmdbStateRootStore::persistent(
+            store.base_block_hash(),
+            store.base_root(),
+            snapshot.clone(),
+            512,
+            path.clone(),
+        )
+        .unwrap();
+        let mut parent = persistent.base_block_hash();
+        for number in 1u64..=256 {
+            let mut hash = [0u8; 32];
+            hash[..8].copy_from_slice(&number.to_le_bytes());
+            let hash = B256::from(hash);
+            assert_eq!(
+                persistent
+                    .compute_and_commit(parent, hash, store.base_root(), Vec::new())
+                    .unwrap(),
+                store.base_root()
+            );
+            parent = hash;
+        }
+
+        let wal = wal_path(&path);
+        let valid_len = std::fs::metadata(&wal).unwrap().len();
+        assert!(valid_len < 64 * 1024, "WAL unexpectedly large: {valid_len}");
+        OpenOptions::new()
+            .append(true)
+            .open(&wal)
+            .unwrap()
+            .write_all(&[0xaa, 0xbb, 0xcc])
+            .unwrap();
+
+        let reopened = Gov5QmdbStateRootStore::persistent(
+            store.base_block_hash(),
+            store.base_root(),
+            snapshot,
+            512,
+            path,
+        )
+        .unwrap();
+        assert_eq!(reopened.root_for(parent).unwrap(), Some(store.base_root()));
+        assert_eq!(std::fs::metadata(wal).unwrap().len(), valid_len);
     }
 }
