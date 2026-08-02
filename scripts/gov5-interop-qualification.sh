@@ -434,6 +434,145 @@ audit_soak() {
     }'
 }
 
+audit_rust_leaders() {
+  local start_height="${1:?first expected Rust-authored height required}"
+  local end_height="${2:-}"
+  local evidence_file="${3:-}"
+  local rust_port="${N42_QUAL_RUST_PORT:-29545}"
+  local rust_miner="${N42_QUAL_RUST_MINER:-0x81d4c1f92ddb837cb46f82280d9b491b101fa582}"
+  local leader_stride="${N42_QUAL_RUST_LEADER_STRIDE:-6}"
+  local -a ports
+  read -r -a ports <<<"${N42_QUAL_PORTS:-28501 28502 28503 28504 28505 29545}"
+
+  local minimum_head=-1 port head_hex head
+  for port in "${ports[@]}"; do
+    head_hex="$(rpc_request "http://127.0.0.1:$port" eth_blockNumber '[]' |
+      jq -er 'select(.error == null) | .result')"
+    head=$((head_hex))
+    if test "$minimum_head" -lt 0 || test "$head" -lt "$minimum_head"; then
+      minimum_head="$head"
+    fi
+  done
+  if test -z "$end_height"; then
+    end_height="$minimum_head"
+  fi
+  if test "$end_height" -gt "$minimum_head"; then
+    echo "Rust leader audit end height $end_height exceeds common head $minimum_head" >&2
+    return 1
+  fi
+  if test "$end_height" -lt "$start_height" || test "$leader_stride" -lt 1; then
+    echo "invalid Rust leader audit range or stride" >&2
+    return 2
+  fi
+
+  local audit_dir
+  audit_dir="$(mktemp -d)"
+  trap 'rm -rf "$audit_dir"' RETURN
+
+  local range_file="$audit_dir/range.jsonl"
+  local chunk_start chunk_end height request response
+  chunk_start="$start_height"
+  while test "$chunk_start" -le "$end_height"; do
+    chunk_end=$((chunk_start + 499))
+    if test "$chunk_end" -gt "$end_height"; then
+      chunk_end="$end_height"
+    fi
+    request="$(for height in $(seq "$chunk_start" "$chunk_end"); do
+      jq -nc --argjson id "$height" --arg block "$(printf '0x%x' "$height")" \
+        '{jsonrpc:"2.0",id:$id,method:"eth_getBlockByNumber",params:[$block,false]}'
+    done | jq -s '.')"
+    response="$(curl -fsS --max-time 30 -H 'content-type: application/json' \
+      --data "$request" "http://127.0.0.1:$rust_port")"
+    printf '%s' "$response" | jq -ec \
+      'sort_by(.id)[] | select(.error == null and .result != null) |
+       {height:.id,number:.result.number,hash:.result.hash,
+        parentHash:.result.parentHash,miner:(.result.miner|ascii_downcase),
+        difficulty:.result.difficulty}' >>"$range_file"
+    chunk_start=$((chunk_end + 1))
+  done
+
+  local total_blocks expected_leaders
+  total_blocks=$((end_height - start_height + 1))
+  expected_leaders=$(((end_height - start_height) / leader_stride + 1))
+  jq -e -s \
+    --arg miner "$rust_miner" \
+    --argjson start "$start_height" \
+    --argjson end "$end_height" \
+    --argjson stride "$leader_stride" \
+    --argjson total "$total_blocks" \
+    --argjson leaders "$expected_leaders" '
+    length == $total and
+    (.[0].height == $start) and (.[-1].height == $end) and
+    (all(.[];
+      (.hash | test("^0x[0-9a-f]{64}$")) and
+      (.parentHash | test("^0x[0-9a-f]{64}$")) and
+      (if ((.height - $start) % $stride) == 0 then
+         .miner == $miner and .difficulty == "0x0"
+       else
+         .miner != $miner
+       end))) and
+    ([.[] | select(.miner == $miner)] | length == $leaders) and
+    ([range(1; length) as $i |
+      .[$i].height == (.[$i - 1].height + 1) and
+      .[$i].parentHash == .[$i - 1].hash] | all)
+  ' "$range_file" >/dev/null
+
+  local reference_file="$audit_dir/reference.jsonl"
+  jq -c --arg miner "$rust_miner" \
+    'select(.miner == $miner) | {height,hash,miner,difficulty}' \
+    "$range_file" >"$reference_file"
+
+  local endpoint_file leader_index=0
+  for port in "${ports[@]}"; do
+    endpoint_file="$audit_dir/endpoint-$port.jsonl"
+    chunk_start="$start_height"
+    while test "$chunk_start" -le "$end_height"; do
+      request="$(for ((height=chunk_start, leader_index=0;
+                       height<=end_height && leader_index<500;
+                       height+=leader_stride, leader_index++)); do
+        jq -nc --argjson id "$height" --arg block "$(printf '0x%x' "$height")" \
+          '{jsonrpc:"2.0",id:$id,method:"eth_getBlockByNumber",params:[$block,false]}'
+      done | jq -s '.')"
+      response="$(curl -fsS --max-time 30 -H 'content-type: application/json' \
+        --data "$request" "http://127.0.0.1:$port")"
+      printf '%s' "$response" | jq -ec \
+        'sort_by(.id)[] | select(.error == null and .result != null) |
+         {height:.id,hash:.result.hash,miner:(.result.miner|ascii_downcase),
+          difficulty:.result.difficulty}' >>"$endpoint_file"
+      chunk_start=$((chunk_start + leader_stride * 500))
+    done
+    if ! cmp -s "$reference_file" "$endpoint_file"; then
+      echo "Rust-authored canonical blocks differ at RPC port $port" >&2
+      return 1
+    fi
+  done
+
+  local first_hash last_hash summary
+  first_hash="$(jq -sr '.[0].hash' "$reference_file")"
+  last_hash="$(jq -sr '.[-1].hash' "$reference_file")"
+  summary="$(jq -nc \
+    --arg at "$(date -u +%FT%TZ)" \
+    --arg miner "$rust_miner" \
+    --arg first_hash "$first_hash" \
+    --arg last_hash "$last_hash" \
+    --argjson start "$start_height" \
+    --argjson end "$end_height" \
+    --argjson stride "$leader_stride" \
+    --argjson blocks "$total_blocks" \
+    --argjson leaders "$expected_leaders" \
+    --argjson ports "$(printf '%s\n' "${ports[@]}" | jq -R 'tonumber' | jq -s '.')" '
+    {at:$at,event:"rust_leader_canonical_audit",status:"PASS",miner:$miner,
+     startHeight:$start,endHeight:$end,blocksScanned:$blocks,leaderStride:$stride,
+     rustAuthoredBlocks:$leaders,firstRustHash:$first_hash,lastRustHash:$last_hash,
+     ports:$ports,parentChainContinuous:true,expectedLeaderSlotsExact:true,
+     allConfiguredEndpointsExact:true}')"
+  if test -n "$evidence_file"; then
+    mkdir -p "$(dirname "$evidence_file")"
+    printf '%s\n' "$summary" >>"$evidence_file"
+  fi
+  printf '%s\n' "$summary"
+}
+
 record_clock_snapshot() {
   label="${1:?snapshot label required}"
   evidence_file="${2:-$runtime/evidence/clock-snapshots.jsonl}"
@@ -1144,6 +1283,7 @@ case "${1:-}" in
   status) status ;;
   monitor-heads) monitor_heads "${2:-}" "${3:-10}" "${4:-}" ;;
   audit-soak) audit_soak "${2:-}" "${3:-}" "${4:-120}" "${5:-6}" "${6:-0}" ;;
+  audit-rust-leaders) audit_rust_leaders "${2:-}" "${3:-}" "${4:-}" ;;
   record-clock) record_clock_snapshot "${2:-}" "${3:-}" ;;
   record-head) record_single_head "${2:-}" "${3:-}" "${4:-}" ;;
   era-checksums) write_era_checksums "${2:-}" ;;
@@ -1154,7 +1294,7 @@ case "${1:-}" in
   archive-rpc-parity) archive_rpc_parity "${2:-}" "${3:-}" "${4:-}" ;;
   transaction-burst) transaction_burst "${2:-}" "${3:-}" ;;
   *)
-    echo "usage: $0 {start-gov|start-gov-node N|start-rust|start-rust2|stop-rust|stop-rust2|start|stop|restart-gov-node N|restart-rust|restart-rust2|status|monitor-heads <seconds> [interval] [evidence-file]|audit-soak <evidence-file> <minimum-elapsed-seconds> [maximum-gap-seconds] [maximum-lag] [require-zero-tx]|record-clock <label> [evidence-file]|record-head <label> <port> [evidence-file]|era-checksums <directory>|archive-export <node> <snapshot>|archive-verify <snapshot>|archive-import <snapshot> <fresh-destination>|archive-corruption-drill <snapshot> <corrupt-copy> <recovered-copy> [evidence-file]|archive-rpc-parity <gov-endpoint> <rust-endpoint> [evidence-file]|transaction-burst [ARTIFACT] [EVIDENCE]}" >&2
+    echo "usage: $0 {start-gov|start-gov-node N|start-rust|start-rust2|stop-rust|stop-rust2|start|stop|restart-gov-node N|restart-rust|restart-rust2|status|monitor-heads <seconds> [interval] [evidence-file]|audit-soak <evidence-file> <minimum-elapsed-seconds> [maximum-gap-seconds] [maximum-lag] [require-zero-tx]|audit-rust-leaders <first-rust-height> [end-height] [evidence-file]|record-clock <label> [evidence-file]|record-head <label> <port> [evidence-file]|era-checksums <directory>|archive-export <node> <snapshot>|archive-verify <snapshot>|archive-import <snapshot> <fresh-destination>|archive-corruption-drill <snapshot> <corrupt-copy> <recovered-copy> [evidence-file]|archive-rpc-parity <gov-endpoint> <rust-endpoint> [evidence-file]|transaction-burst [ARTIFACT] [EVIDENCE]}" >&2
     exit 2
     ;;
 esac
