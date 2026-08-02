@@ -1744,3 +1744,12 @@ byte-exact at `56180869...`. Every Gov and Rust RPC returns block-zero hash
 databases, not merely `--p2p.genesis-override`, remain on the required lineage.
 No transaction had been sent. The evidence SHA-256 is
 `f212a205701b9ffd8d3745904f288979294c379606e39500b02a41df27682dcb`.
+
+The companion data-boundary recheck performs 54 independent RPC reads across
+all six endpoints at block 0 and eight upgrade/runtime boundary heights. The
+85,290→85,291 905/906 edge, 85,380→85,381 copied-data edge,
+85,386→85,387 runtime Rust-leader edge, and 87,842→87,843 strict-log edge all
+have exact parent continuity. Every sampled hash/root/miner is identical on all
+endpoints, all four successor blocks are Rust-authored as expected, and all
+sampled blocks remain empty. The evidence SHA-256 is
+`9720ebb62b897cedd17a222fb88b041d8089c13f313374fec99a9d3a2083f3e2`.
