@@ -229,6 +229,17 @@ for the Rust log, and
 for the task sample. Commit `72ba377` now also records the exact failed RPC
 port and phase in every fail-closed monitor row.
 
+The clean persisted-state restart exposed two expected startup warning classes
+that the earlier runtime-log gate had never encountered: one FCU `SYNCING`
+payload retry and five Gov-peer responses indicating that the peer does not
+advertise Rust state sync before authenticated block catch-up takes over.
+Commit `18eff35` classifies those exact messages, bounds them to two payload
+retries and ten peer fallbacks across the initial start plus final controlled
+restart, and no longer mistakes a structured `error=` field for an ERROR-level
+log. All other warning text and every ERROR, panic, fatal, or equivocation
+signal still fail closed. The live audit then passed all 130 warnings with the
+complete partition, zero unknown warnings, and zero critical signals.
+
 Rust was then restarted from the same persisted Reth, consensus, QMDB, and
 genesis data with the pinned binary. It authored and finalized block 85,948
 (`0x1867bf2f5b8ab91b527595a9e8e1c2c1017d226abba739d40308505970753126`)
@@ -303,6 +314,7 @@ Pushed implementation commits:
 - n42-26: `e505a32` (`test: hard-gate runtime warning classification`)
 - n42-26: `ebcb736` (`test: audit 24-hour Rust resource stability`)
 - n42-26: `72ba377` (`test: identify failing soak endpoint`)
+- n42-26: `18eff35` (`test: classify bounded startup fallback warnings`)
 - N42-gov5: `b027f3040` (`feat(interop): harden Gov5 mixed-client operation`)
 - N42-gov5: `34021c3f7` (`test: make hive genesis fixture self-contained`)
 - N42-gov5: `a70f7cf68` (`test: share hive fixture across packages`)
