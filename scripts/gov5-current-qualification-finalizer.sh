@@ -352,12 +352,15 @@ env \
   N42_QUAL_RUST_LOG="$runtime/logs/rust.log" \
   "$harness" audit-rust-leaders "$rust_leader_start" "$post_restart_head" \
     "$leader_final" >/dev/null
+# Close the final evidence at a Rust-authored recovery point so the summary
+# contains no timeout that is merely waiting for its successor view.
+wait_for_rust_authored_head
 env N42_QUAL_RUNTIME="$runtime" N42_QUAL_RUST_PORT="$rust_port" \
   "$harness" audit-timeout-recovery "$runtime/logs/rust.log" \
     "$timeout_final" >/dev/null
 jq -e -s '
   length == 1 and .[0].status == "PASS" and
-  .[0].completedTimeouts >= 1 and .[0].pendingTimeouts <= 1 and
+  .[0].completedTimeouts >= 1 and .[0].pendingTimeouts == 0 and
   .[0].timeoutViewStride == 7 and
   .[0].timeoutAndPacemakerSetsExact == true and
   .[0].everyCompletedTimeoutRecoveredAtNextView == true and
