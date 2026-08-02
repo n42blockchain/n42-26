@@ -239,6 +239,13 @@ restart, and no longer mistakes a structured `error=` field for an ERROR-level
 log. All other warning text and every ERROR, panic, fatal, or equivocation
 signal still fail closed. The live audit then passed all 130 warnings with the
 complete partition, zero unknown warnings, and zero critical signals.
+The 30-minute audit subsequently encountered a valid Rust commit line carrying
+the tracing context `process_event{...}:` between its INFO level and message.
+Commit `c66b504` accepts that optional context in both commit-count and timeout
+recovery parsing while leaving the exact commit fields, `votes=5+5`, view
+sequence, hash sequence, and warning partition checks unchanged. The repaired
+live audit matched all 44 leader commits and the recovery audit closed all 43
+timeout events with zero pending.
 
 Rust was then restarted from the same persisted Reth, consensus, QMDB, and
 genesis data with the pinned binary. It authored and finalized block 85,948
@@ -315,6 +322,7 @@ Pushed implementation commits:
 - n42-26: `ebcb736` (`test: audit 24-hour Rust resource stability`)
 - n42-26: `72ba377` (`test: identify failing soak endpoint`)
 - n42-26: `18eff35` (`test: classify bounded startup fallback warnings`)
+- n42-26: `c66b504` (`test: accept traced Rust commit log context`)
 - N42-gov5: `b027f3040` (`feat(interop): harden Gov5 mixed-client operation`)
 - N42-gov5: `34021c3f7` (`test: make hive genesis fixture self-contained`)
 - N42-gov5: `a70f7cf68` (`test: share hive fixture across packages`)
