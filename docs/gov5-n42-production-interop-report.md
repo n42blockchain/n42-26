@@ -11,8 +11,8 @@ are stored in the qualification runtimes named below.
 ## Current 2026-08-02 baseline — GOV5 5.7.906
 
 The current-main Gov5 candidate is pushed as
-`integration/gov5-interop-current-main-20260801 @ b70505738`. Its pinned
-upstream cutoff is `origin/main @ f3dbeba4694590e6478780ac8a14e900f7dd7505`,
+`integration/gov5-interop-current-main-20260801 @ 8915b4cc0`. Its pinned
+upstream cutoff is `origin/main @ 920f7536eb263b6744b48f28dfeb77f4c2798c1a`,
 version 5.7.906. A live remote-reference check immediately before the strict
 window confirmed that both hashes still match the pushed branches. This
 release changes transaction gossip from protobuf to RLP, removes the remaining
@@ -25,21 +25,27 @@ transaction, logging, and `cmd/n42`.
 
 The active Rust qualification binary was built from
 `feat/gov5-n42-live-interop @ fc15007` against the separate Reth worktree at
-`c533db8` (Reth 2.4.1). Qualification tooling fixes through `ebcb736` are
-pushed on the same branch without changing that measured runtime binary.
+`c533db8` (Reth 2.4.1). Qualification tooling and evidence fixes through
+`9347828` are pushed on the same branch without changing that measured runtime
+binary.
 
 The broader compatible dependency refresh is independently delivered and
-pushed at `chore/deps-latest-20260721 @ cbd00ab4fc7c74ea8dd790322c8ecd4f8ee06302`;
-its manifest and devlog pin the same Reth 2.4.1 revision
-`c533db8bad6f300be93ec047ecffc717b08957f8`. That delivery branch is not
+pushed at `chore/deps-latest-20260721 @ 0bde2e751ad1f5c157ada4cb0cbb32340887a3c1`;
+its manifest and devlog pin the newer paired Reth 2.4.1 revision
+`d025e10403b5b0e7ef31f8d6359406f528b0e203` on
+`chore/reth-upstream-20260726`. That delivery branch is not
 misrepresented as an ancestor of the measured interop binary: this runtime
-uses the interop branch's own locked dependency graph against the same Reth
-2.4.1 workspace baseline, plus Rust 1.97.1. The `2026-08-02` follow-up locks
-all 37 newly available semver-compatible maintenance updates; a subsequent
-dry-run locks zero packages, and the all-target workspace check, complete
-workspace tests, and warnings-denied all-target Clippy gate pass. No dependency
-or execution binary in the active qualification runtime was changed after the
-strict window began.
+uses the interop branch's own locked dependency graph against `c533db8`, plus
+Rust 1.97.1. The independent delivery locks all 37 newly available
+semver-compatible maintenance updates and the two dependency edges added by the
+post-release Reth fixes; a subsequent dry-run locks zero packages. Its locked
+all-target workspace check, complete workspace tests, and warnings-denied
+all-target Clippy gate pass against `d025e1040`. Reth's own 24 integration
+tests, package tests, full-workspace all-target check, and warnings-denied
+all-target Clippy also pass. The Reth default build now keeps revmc/LLVM 22 JIT
+opt-in and its dev-node tests use bounded 60-second readiness with unique
+ports. No dependency or execution binary in the active qualification runtime
+was changed after the strict window began.
 
 Commits
 `ac1fc06` and `4a11238` add an explicitly configured, hard-capped authenticated
@@ -59,7 +65,7 @@ and the complete n42-node library suite passed another 167 tests; zero failures.
 The n42-node all-target Clippy gate also passed with warnings denied. The
 latest pinned 5.7.906 Gov binary was built twice byte-for-byte identically. The
 active runtime hashes are Gov5
-`fe24cf475bdd362229faaf22e48f65af5011e4abf714d46fe0f83b3b496a9f1f` and
+`51e68918560be65f8e5221f02a3d544a7baf42bed9aa86655623449a4fd765d0` and
 Rust `d917782b906176119172e656005218be34ec3d5ad1b7241c0c53f8f6d593da2d`.
 
 Independent 5.7.905, initial 5.7.906, and pinned-current 5.7.906 `init` runs
