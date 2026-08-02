@@ -591,6 +591,8 @@ archive_rpc_parity() {
   local gov_endpoint="${1:?Gov RPC endpoint required}"
   local rust_endpoint="${2:?Rust RPC endpoint required}"
   local evidence_file="${3:-$runtime/evidence/p5-archive-rpc-parity.jsonl}"
+  local qmdb_proof_verifier="${N42_QUAL_QMDB_PROOF_VERIFY:-$repo/target/release/n42-qmdb-proof-verify}"
+  require_file "$qmdb_proof_verifier"
   local heights=(0 29 999 1000 1999 2000 3999 4000 4999 5000 5189)
   local addresses=(
     "0x81d4c1f92ddb837cb46f82280d9b491b101fa582"
@@ -600,28 +602,80 @@ archive_rpc_parity() {
     "0x43f460c4d9a58c02e7ff036c37ec1968bf56805c8e549ab945f29059fd596212"
     "0x33977041c4e34e98960946ac3b6a251aba9a3102783167b487b3567f94465a2a"
   )
-  local reference_height="0x1388"
-  local reference_block reference_root
+  local gov_head_hex rust_head_hex gov_head rust_head reference_height_number
+  local reference_height reference_block reference_block_hash reference_root
   local -a reference_proofs=()
   local address_index
 
+  gov_head_hex="$(rpc_request "$gov_endpoint" eth_blockNumber '[]' | jq -er '.result')"
+  rust_head_hex="$(rpc_request "$rust_endpoint" eth_blockNumber '[]' | jq -er '.result')"
+  gov_head=$((gov_head_hex))
+  rust_head=$((rust_head_hex))
+  if test "$gov_head" -lt "$rust_head"; then
+    reference_height_number="$gov_head"
+  else
+    reference_height_number="$rust_head"
+  fi
+  reference_height="$(printf '0x%x' "$reference_height_number")"
   reference_block="$(rpc_request "$gov_endpoint" eth_getBlockByNumber \
     "$(jq -nc --arg height "$reference_height" '[$height,false]')")"
+  reference_block_hash="$(printf '%s' "$reference_block" | jq -er '.result.hash')"
   reference_root="$(printf '%s' "$reference_block" | jq -er '.result.stateRoot')"
   for address_index in 0 1; do
-    local reference_response
+    local reference_response rust_reference_response rust_reference_root
+    local rust_reference_proof
     reference_response="$(rpc_request "$gov_endpoint" eth_getProof \
       "$(jq -nc --arg address "${addresses[$address_index]}" \
         --arg height "$reference_height" '[$address,[],$height]')")"
     reference_proofs+=("$(printf '%s' "$reference_response" |
       jq -er '.result.accountProof[0] | select(length > 66)')")
+    rust_reference_response="$(rpc_request "$rust_endpoint" n42_qmdbArchiveProof \
+      "$(jq -nc --arg hash "$reference_block_hash" \
+        --arg key "${qmdb_keys[$address_index]}" '[$hash,$key]')")"
+    rust_reference_root="$(printf '%s' "$rust_reference_response" | jq -er \
+      'select(.error == null) | .result.root')"
+    rust_reference_proof="$(printf '%s' "$rust_reference_response" | jq -er \
+      'select(.error == null) | "0x" + .result.proofHex')"
+    if test "$rust_reference_root" != "$reference_root"; then
+      echo "QMDB reference proof root mismatch at height $reference_height_number" >&2
+      return 1
+    fi
+    if test "$rust_reference_proof" != "${reference_proofs[$address_index]}"; then
+      echo "QMDB reference proof bytes mismatch at height $reference_height_number" >&2
+      return 1
+    fi
+    if ! "$qmdb_proof_verifier" \
+      --root "$reference_root" \
+      --key "${qmdb_keys[$address_index]}" \
+      --proof-hex "$rust_reference_proof" >/dev/null; then
+      echo "QMDB reference proof verification failed at height $reference_height_number" >&2
+      return 1
+    fi
   done
 
   mkdir -p "$(dirname "$evidence_file")"
+  jq -nc \
+    --arg at "$(date -u +%FT%TZ)" \
+    --argjson height "$reference_height_number" \
+    --arg block_hash "$reference_block_hash" \
+    --arg state_root "$reference_root" \
+    --argjson proofs "${#reference_proofs[@]}" \
+    '{
+      at:$at,
+      event:"archive_qmdb_reference_parity",
+      height:$height,
+      blockHash:$block_hash,
+      stateRoot:$state_root,
+      proofs:$proofs,
+      govRustProofRootsExact:true,
+      govRustProofBytesExact:true,
+      govRustProofsOfflineVerified:true
+    }' >>"$evidence_file"
+
   local height
   for height in "${heights[@]}"; do
     local height_hex block_response block_hash state_root
-    local checks=0
+    local checks=0 proof_bytes_checks=0
     height_hex="$(printf '0x%x' "$height")"
     block_response="$(rpc_request "$gov_endpoint" eth_getBlockByNumber \
       "$(jq -nc --arg height "$height_hex" '[$height,false]')")"
@@ -713,10 +767,20 @@ archive_rpc_parity() {
         echo "QMDB archive proof root mismatch at height $height: $address" >&2
         return 1
       fi
+      if ! "$qmdb_proof_verifier" \
+        --root "$state_root" \
+        --key "${qmdb_keys[$address_index]}" \
+        --proof-hex "$proof_hex" >/dev/null; then
+        echo "QMDB archive proof verification failed at height $height: $address" >&2
+        return 1
+      fi
       if test "$state_root" = "$reference_root" &&
         test "$proof_hex" != "${reference_proofs[$address_index]}"; then
         echo "QMDB archive proof bytes mismatch at height $height: $address" >&2
         return 1
+      fi
+      if test "$state_root" = "$reference_root"; then
+        proof_bytes_checks=$((proof_bytes_checks + 1))
       fi
       checks=$((checks + 2))
     done
@@ -728,6 +792,7 @@ archive_rpc_parity() {
       --arg state_root "$state_root" \
       --arg reference_height "$reference_height" \
       --argjson checks "$checks" \
+      --argjson proof_bytes_checks "$proof_bytes_checks" \
       '{
         at:$at,
         event:"archive_rpc_parity",
@@ -737,7 +802,9 @@ archive_rpc_parity() {
         checks:$checks,
         govRustRpcExact:true,
         qmdbProofRootExact:true,
-        qmdbProofBytesExactAgainstGovReference:true,
+        qmdbProofOfflineVerified:true,
+        qmdbProofByteComparisonsAgainstGovReference:$proof_bytes_checks,
+        govQmdbReferenceProofExact:true,
         govQmdbReferenceHeight:$reference_height
       }' >>"$evidence_file"
   done
