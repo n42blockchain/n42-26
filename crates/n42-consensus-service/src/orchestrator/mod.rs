@@ -613,6 +613,10 @@ impl ConsensusService {
             || block_hash == self.head_block_hash
             || self.pending_block_data.contains_key(&block_hash)
             || self.h2_v4_unbound_blocks.contains_key(&block_hash)
+            || self
+                .h2_v4_block_numbers
+                .get(&block_hash)
+                .is_some_and(|height| self.h2_v4_catchup_blocks.contains_key(height))
             || self.h2_v4_fetch_requested_at.contains_key(&block_hash)
         {
             return;
@@ -941,7 +945,14 @@ impl ConsensusService {
         // evict the mapping for a live asynchronous Engine API completion.
         self.h2_v4_block_numbers
             .insert(block.block_hash, block.header.number);
-        while self.h2_v4_block_numbers.len() > 2048 {
+        // Keep the complete bounded reverse suffix addressable by hash. Live
+        // proposals can otherwise start overlapping ancestry walkers: when an
+        // already-staged parent falls out of a small hash index, re-downloading
+        // it recursively walks the same historical chain again.
+        let block_number_index_limit = self
+            .h2_v4_catchup_buffer_blocks
+            .saturating_add(DEFAULT_H2_V4_CATCHUP_BUFFER_BLOCKS);
+        while self.h2_v4_block_numbers.len() > block_number_index_limit {
             self.h2_v4_block_numbers.pop_first();
         }
         // A consensus-authenticated child header cryptographically binds its
@@ -5309,6 +5320,28 @@ mod tests {
             NetworkCommand::RequestGov5BlockByHash { peer, block_hash: hash }
                 if peer != peers[0] && peer != second_peer && hash == block_hash
         ));
+    }
+
+    #[tokio::test]
+    async fn staged_h2_parent_does_not_start_an_overlapping_ancestry_walk() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, mut prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
+        let peer = libp2p::PeerId::random();
+        let staged_hash = B256::repeat_byte(0xa8);
+        let staged_height = 42;
+        orch.h2_v4_block_numbers.insert(staged_hash, staged_height);
+        orch.h2_v4_catchup_blocks
+            .insert(staged_height, (peer, vec![0x42], 43));
+
+        orch.request_h2_v4_gov5_block(peer, staged_hash);
+
+        assert!(
+            prx.try_recv().is_err(),
+            "an already-staged hash must not recursively walk the same ancestry"
+        );
+        assert!(!orch.h2_v4_fetch_requested_at.contains_key(&staged_hash));
     }
 
     #[tokio::test]
