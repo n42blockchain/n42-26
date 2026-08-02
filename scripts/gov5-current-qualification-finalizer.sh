@@ -13,6 +13,8 @@ post_restart="$runtime/evidence/mixed-post-restart-10m.jsonl"
 archive_post_burst="$runtime/evidence/archive-rpc-parity-$gov_version-post-burst.jsonl"
 restart_evidence="$runtime/evidence/rust-restart-rejoin-$gov_version.jsonl"
 leader_final="$runtime/evidence/rust-leader-final-audit.jsonl"
+upstream="$runtime/evidence/gov5-upstream-24h.jsonl"
+upstream_audit="$runtime/evidence/gov5-upstream-24h-audit.json"
 soak_audit="$runtime/evidence/mixed-soak-24h-audit.json"
 post_burst_audit="$runtime/evidence/mixed-post-burst-10m-audit.json"
 post_restart_audit="$runtime/evidence/mixed-post-restart-10m-audit.json"
@@ -25,6 +27,8 @@ rust_leader_start="${N42_QUAL_RUST_LEADER_START:-85387}"
 expected_genesis="0xb71c28109836f120453d097c38819a55b14c49abcc92713037fb9b11201392ec"
 expected_gov_sha="${N42_QUAL_EXPECTED_GOV_SHA:-fe24cf475bdd362229faaf22e48f65af5011e4abf714d46fe0f83b3b496a9f1f}"
 expected_rust_sha="d917782b906176119172e656005218be34ec3d5ad1b7241c0c53f8f6d593da2d"
+expected_gov_upstream_sha="${N42_QUAL_EXPECTED_GOV_UPSTREAM_SHA:-f3dbeba4694590e6478780ac8a14e900f7dd7505}"
+gov_repo="${N42_QUAL_GOV_REPO:-/Users/jieliu/Documents/n42/live-interop-20260721/N42-gov5-current-main-20260801}"
 
 mkdir -p "$runtime/evidence"
 
@@ -87,8 +91,9 @@ wait_for_rust_authored_head() {
 }
 
 assert_live_identity() {
+  local attempts="${1:-30}"
   local attempt expected port identity exact
-  for attempt in $(seq 1 30); do
+  for attempt in $(seq 1 "$attempts"); do
     expected=""
     exact=true
     for port in $ports; do
@@ -107,6 +112,45 @@ assert_live_identity() {
     sleep 1
   done
   return 1
+}
+
+assert_gov_upstream() {
+  local remote
+  remote="$(git -C "$gov_repo" ls-remote origin refs/heads/main |
+    awk 'NR == 1 {print $1}')"
+  test "$remote" = "$expected_gov_upstream_sha"
+}
+
+audit_gov_upstream() {
+  jq -e -s --arg expected "$expected_gov_upstream_sha" '
+    length >= 2 and
+    all(.[];
+      .event == "gov5_upstream_snapshot" and
+      .baseline == $expected and .remoteMain == $expected and
+      .remoteReachable == true and .baselineExact == true) and
+    ([.[].at | fromdateiso8601] as $times |
+      ($times[-1] - $times[0]) >= 86400 and
+      ([range(1; $times | length) as $i |
+        ($times[$i] - $times[$i - 1]) > 0 and
+        ($times[$i] - $times[$i - 1]) <= 700] | all))
+  ' "$upstream" >/dev/null
+  assert_gov_upstream
+
+  jq -nc \
+    --arg at "$(date -u +%FT%TZ)" \
+    --arg evidence "$upstream" \
+    --arg evidence_sha256 "$(shasum -a 256 "$upstream" | awk '{print $1}')" \
+    --arg expected "$expected_gov_upstream_sha" \
+    --slurpfile samples "$upstream" '
+    [$samples[].at | fromdateiso8601] as $times |
+    {at:$at,event:"gov5_upstream_audit",status:"PASS",
+      evidence:$evidence,evidenceSha256:$evidence_sha256,
+      expectedMain:$expected,samples:($samples|length),
+      firstAt:$samples[0].at,lastAt:$samples[-1].at,
+      elapsedSeconds:($times[-1]-$times[0]),
+      maximumSampleGapSeconds:([range(1;$times|length) as $i |
+        $times[$i]-$times[$i-1]]|max),
+      allSnapshotsReachableAndExact:true,currentRemoteMainExact:true}'
 }
 
 assert_genesis() {
@@ -146,9 +190,11 @@ preflight_burst() {
 require_file "$harness"
 require_file "$formal"
 require_file "$burst_artifact"
+require_file "$upstream"
 assert_runtime_identity
 assert_genesis
 assert_live_identity
+assert_gov_upstream
 
 if test "${N42_QUAL_FINALIZER_PREFLIGHT_ONLY:-0}" = 1; then
   preflight_burst launch-preflight
@@ -167,6 +213,7 @@ test ! -e "$post_restart"
 test ! -e "$archive_post_burst"
 test ! -e "$restart_evidence"
 test ! -e "$leader_final"
+test ! -e "$upstream_audit"
 test ! -e "$soak_audit"
 test ! -e "$post_burst_audit"
 test ! -e "$post_restart_audit"
@@ -192,6 +239,22 @@ mv "$soak_audit.pending" "$soak_audit"
 env N42_QUAL_RUNTIME="$runtime" "$harness" \
   audit-soak "$formal" 86400 120 6 1 >/dev/null
 assert_live_identity
+
+# The tested Gov5 baseline must also remain the latest upstream main for a
+# complete 24-hour observation window. This prevents a stale Gov build from
+# receiving a final PASS if upstream moves while the mixed-client soak runs.
+while ! jq -e -s '
+  length >= 2 and
+  ((.[-1].at | fromdateiso8601) - (.[0].at | fromdateiso8601)) >= 86400
+' "$upstream" >/dev/null; do
+  kill -0 "$(<"$runtime/pids/rust.pid")"
+  for port in $ports; do
+    wait_for_rpc "$port" 1
+  done
+  sleep 60
+done
+audit_gov_upstream >"$upstream_audit.pending"
+mv "$upstream_audit.pending" "$upstream_audit"
 
 preflight_burst final-preflight
 env \
@@ -252,6 +315,9 @@ env \
 wait_for_rpc "$rust_port" 300
 post_restart_pid="$(<"$runtime/pids/rust.pid")"
 test "$post_restart_pid" != "$pre_restart_pid"
+rejoin_wait_started="$(date +%s)"
+assert_live_identity 300
+rejoin_wait_seconds=$(( $(date +%s) - rejoin_wait_started ))
 
 env N42_QUAL_RUNTIME="$runtime" N42_QUAL_PORTS="$ports" \
   N42_QUAL_RUST_PORT="$rust_port" N42_QUAL_MAX_LAG=6 \
@@ -269,9 +335,11 @@ jq -nc \
   --arg at "$(date -u +%FT%TZ)" \
   --argjson pid "$post_restart_pid" \
   --argjson head "$post_restart_head" \
+  --argjson rejoin_wait_seconds "$rejoin_wait_seconds" \
   --argjson consensus "$post_restart_status" \
   --argjson equivocations "$equivocations" \
   '{at:$at,event:"rust_restart_rejoined",pidAfter:$pid,headAfter:$head,
+    exactIdentityBeforeStabilityWindow:true,rejoinWaitSeconds:$rejoin_wait_seconds,
     consensusAfter:$consensus,equivocations:$equivocations}' >>"$restart_evidence"
 
 env \
@@ -284,6 +352,7 @@ env \
     "$leader_final" >/dev/null
 assert_genesis
 assert_live_identity
+assert_gov_upstream
 
 jq -nc \
   --arg at "$(date -u +%FT%TZ)" \
@@ -294,7 +363,9 @@ jq -nc \
   --arg burst_sha "$(shasum -a 256 "$burst_evidence" | awk '{print $1}')" \
   --arg restart_sha "$(shasum -a 256 "$restart_evidence" | awk '{print $1}')" \
   --arg leader_sha "$(shasum -a 256 "$leader_final" | awk '{print $1}')" \
+  --arg upstream_sha "$(shasum -a 256 "$upstream" | awk '{print $1}')" \
   --slurpfile soak "$soak_audit" \
+  --slurpfile upstream "$upstream_audit" \
   --slurpfile burst "$burst_evidence" \
   --slurpfile restart "$restart_evidence" \
   --slurpfile leaders "$leader_final" '
@@ -302,6 +373,7 @@ jq -nc \
    acceptanceRelaxed:false,genesisExact:true,binariesExact:true,
    formalEvidence:$formal,formalEvidenceSha256:$formal_sha,
    soakAudit:$soak[0],
+   gov5UpstreamAudit:$upstream[0],gov5UpstreamEvidenceSha256:$upstream_sha,
    transactionBurst:($burst|map(select(.event=="p4_transaction_burst_pass"))[0]),
    transactionBurstEvidenceSha256:$burst_sha,
    restart:$restart,restartEvidenceSha256:$restart_sha,
