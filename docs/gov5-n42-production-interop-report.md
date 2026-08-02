@@ -52,8 +52,12 @@ against the qualification genesis all regenerated block zero as
 `b71c28109836f120453d097c38819a55b14c49abcc92713037fb9b11201392ec`, matching
 the Rust H2 configuration and the preserved Gov5 chain. The independently
 queried pinned-current block-zero state root and receipts root also match the
-runtime chain. The first long-test runtime copied the verified chain data while
-excluding old MDBX locks, PID files, LOCK files, and IPC sockets; it was
+runtime chain. A six-endpoint boundary audit additionally compared blocks 0,
+85,290, 85,291, 85,380, 85,381, 85,386, and 85,387. Every hash and root was
+exact, and the 85,290→85,291 upgrade edge, 85,380→85,381 copied-data edge, and
+85,386→85,387 runtime-local leader edge all retained exact parent continuity.
+The first long-test runtime copied the verified chain data while excluding old
+MDBX locks, PID files, LOCK files, and IPC sockets; it was
 `/Users/jieliu/Documents/n42/live-interop-20260721/runtime-15-gov5-905-interop`.
 Its startup attempt is preserved under runtime-15 logs. The 5 Gov5 nodes reached
 the same head, but the two Reth 2.4.1 Rust processes did not open RPC within
