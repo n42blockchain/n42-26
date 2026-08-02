@@ -1669,3 +1669,17 @@ post-rollout recovery stream has SHA-256
 transactions, and exact block hash, state root, and receipt root across five
 Gov endpoints and the Rust/Reth endpoint. This recovery check is a preflight,
 not a substitute for the fresh strict 24-hour window.
+
+The fresh strict window started at `2026-08-02T20:37:47Z`. Its formal
+zero-transaction monitor runs for 86,640 seconds at 30-second intervals; the
+single-PID Rust resource monitor and current-main monitor each run for 87,000
+seconds. The first formal sample was exact at height 87,860 with lag zero.
+The resource stream is bound to Rust PID 97040, and the upstream stream is
+fail-closed on any value other than `920f7536...`. The signed transaction
+preflight found nonce `0x11` on all six endpoints and sent zero transactions.
+The launch manifest SHA-256 is
+`aed63bf9a0933fdd9565f6701b42db84172060228cc7e60e5c5ce78be6ea5780`.
+No earlier elapsed time is credited. If all three immutable streams pass, the
+armed finalizer will release the 17-transaction burst, run a ten-minute
+post-burst parity window and archive proof checks, restart Rust, require exact
+rejoin, and run a final ten-minute stability window before issuing PASS.

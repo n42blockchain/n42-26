@@ -390,3 +390,9 @@ BLS key、network key、network metadata 和 epoch schedule。新目录只能用
 29 块、最大 lag 0、六端点同高同 hash/stateRoot/receiptsRoot。下一步是从该身份重新
 开始完整 24 小时零交易窗口，同时持续核对 Gov5 current main；随后才释放交易 burst、
 运行 burst 后窗口与 Rust 重启/重入验收。
+
+严格窗口已于 `2026-08-02T20:37:47Z` 从零开始：formal/resource/upstream 三条
+证据流和自动 finalizer 均存活，首样本高度 87,860、lag 0、六端点精确一致；Rust
+资源流绑定 PID 97040，上游流绑定 `920f7536...`。交易预检确认六端点 nonce 都是
+`0x11` 且发送数为 0。只有完整窗口及后续 burst、post-burst、restart/rejoin 全部
+通过后，T13 才能关闭。
