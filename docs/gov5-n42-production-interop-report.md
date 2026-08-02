@@ -1842,3 +1842,12 @@ publish the independent result atomically only after the final summary exists.
 No node or long-running monitor PID changed and no transaction was sent. The
 waiter launch evidence SHA-256 is
 `b8848b6603077748e47578b316d85f3ea953933431af21900f438a7b4147464f`.
+
+A fresh requirement-level recheck also recomputed the preserved P4 fault
+matrix and selected evidence hashes. The 512-block rejoin, gossip/rotor vote
+recovery, Gov/Rust TC and NewView paths, invalid payload isolation, four crash
+boundaries, two epoch transitions, Byzantine/crash threshold, and bounded
+backpressure recovery remain PASS without relaxed requirements. Thus the only
+open P4 item is this authoritative 24-hour stream and its burst, post-burst,
+and controlled restart/rejoin closure. The recheck evidence SHA-256 is
+`93f8162618ba23a3070d1490d2ffb71856a219d188eabc012eb34d73fd76c616`.
