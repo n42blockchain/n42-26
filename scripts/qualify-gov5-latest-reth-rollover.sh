@@ -295,7 +295,10 @@ run_qualification() {
   rollover_phase="old_stopped"
   env N42_QUAL_RUNTIME="$runtime" "$harness" stop-rust
   test ! -e "$runtime/pids/rust.pid"
-  cp -a "$runtime/rust" "$snapshot"
+  # APFS clone-on-write keeps the 4 GiB sparse MDBX logical file sparse while
+  # preserving a byte-stable rollback image. cp falls back to copyfile when
+  # cloning is unavailable and still preserves holes unless -S is requested.
+  cp -ac "$runtime/rust" "$snapshot"
   (
     cd "$runtime/rust"
     find . -type f -print0 | LC_ALL=C sort -z | xargs -0 shasum -a 256
