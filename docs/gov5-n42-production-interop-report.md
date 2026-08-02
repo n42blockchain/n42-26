@@ -11,19 +11,21 @@ are stored in the qualification runtimes named below.
 ## Current 2026-08-02 baseline — GOV5 5.7.906
 
 The current-main Gov5 candidate is pushed as
-`integration/gov5-interop-current-main-20260801 @ 32d6ceccb`. Its current
-upstream parent is `origin/main @ 40ba28238b5ea7bddfb8fad59fe45842239114a0`,
-version 5.7.906. This release changes transaction gossip from protobuf to RLP,
-removes protobuf from the remaining gossip path, bounds deployment logging,
-and adds the compact transaction-log table codec. The compact log reader
-accepts both old protobuf and new compact records, so the stopped 5.7.905 data
-can be copied without migration. The merged candidate passed full
+`integration/gov5-interop-current-main-20260801 @ b70505738`. Its pinned
+upstream cutoff is `origin/main @ f3dbeba4694590e6478780ac8a14e900f7dd7505`,
+version 5.7.906. A live remote-reference check immediately before the strict
+window confirmed that both hashes still match the pushed branches. This
+release changes transaction gossip from protobuf to RLP, removes the remaining
+non-consensus/non-gRPC protobuf producers, bounds deployment logging, and gives
+freezer bodies and the transaction-log table compact codecs. The compact log
+reader accepts both old protobuf and new compact records, so the stopped
+5.7.905 data can be copied without migration. The merged candidate passed full
 `go test ./...` plus race-enabled tests for p2p, sync, HotStuff, rawdb, block,
 transaction, logging, and `cmd/n42`.
 
-The active qualification runtime binary was built from
+The active Rust qualification binary was built from
 `feat/gov5-n42-live-interop @ fc15007` against the separate Reth worktree at
-`c533db8` (Reth 2.4.1). Qualification tooling fixes through `97454e9` are
+`c533db8` (Reth 2.4.1). Qualification tooling fixes through `b4aceb1` are
 pushed on the same branch without changing that measured runtime binary. Commits
 `ac1fc06` and `4a11238` add an explicitly configured, hard-capped authenticated
 Gov5 catch-up buffer and retain each buffered block's already-verified H2 view
@@ -40,20 +42,20 @@ persisted empty ancestry in linear time. The production catch-up default remains
 targeted consensus/service/network suites passed 570 tests (220, 186, and 164),
 and the complete n42-node library suite passed another 167 tests; zero failures.
 The n42-node all-target Clippy gate also passed with warnings denied. The
-5.7.906 Gov binary was built twice byte-for-byte identically. The active binary
-hashes are Gov5
-`050d79612ce6bb02f7bbee44dc87461277747dfea33845597db8c1a1bc26c08d` and
+latest pinned 5.7.906 Gov binary was built twice byte-for-byte identically. The
+active runtime hashes are Gov5
+`fe24cf475bdd362229faaf22e48f65af5011e4abf714d46fe0f83b3b496a9f1f` and
 Rust `d917782b906176119172e656005218be34ec3d5ad1b7241c0c53f8f6d593da2d`.
 
-Independent 5.7.905 and 5.7.906 `init` runs against the qualification genesis
-both regenerated block zero as
+Independent 5.7.905, initial 5.7.906, and pinned-current 5.7.906 `init` runs
+against the qualification genesis all regenerated block zero as
 `b71c28109836f120453d097c38819a55b14c49abcc92713037fb9b11201392ec`, matching
-the Rust H2 configuration and the preserved Gov5 chain. The new long-test
-runtime copies the verified chain data while excluding old MDBX locks, PID
-files, LOCK files, and IPC sockets; it is
+the Rust H2 configuration and the preserved Gov5 chain. The independently
+queried pinned-current block-zero state root and receipts root also match the
+runtime chain. The first long-test runtime copied the verified chain data while
+excluding old MDBX locks, PID files, LOCK files, and IPC sockets; it was
 `/Users/jieliu/Documents/n42/live-interop-20260721/runtime-15-gov5-905-interop`.
-The fresh 905 mixed-client 24-hour window is armed but not yet a PASS; its
-startup attempt is preserved under runtime-15 logs. The 5 Gov5 nodes reached
+Its startup attempt is preserved under runtime-15 logs. The 5 Gov5 nodes reached
 the same head, but the two Reth 2.4.1 Rust processes did not open RPC within
 the 10-minute readiness budget when given the copied legacy Reth database;
 therefore no acceptance time was credited and no P4 evidence file was
@@ -94,13 +96,25 @@ The pre-upgrade 5.7.905 archive check passed 209 Gov/Rust RPC, state, and storag
 comparisons across 11 historical heights. Two current-head Gov5 QMDB proofs
 were byte-for-byte equal to Rust archive proofs, and all 24 current plus
 historical proofs authenticated their expected root and key with the offline
-Rust verifier. The authoritative 5.7.906 strict zero-transaction window started
-from an exact common head at `2026-08-02T14:05:18Z`; it runs for 86,640 seconds
-and acceptance still requires at least 86,400 seconds between the first and
-last evidence samples. Live 906 participation and leader handoff are therefore
-proved, while the 24-hour gate remains IN PROGRESS and is not declared PASS
-until the full interval, signed transaction burst, post-burst archive parity,
-restart/rejoin, and final leader audits complete.
+Rust verifier. The first 5.7.906 window accumulated 701 seconds and 72 blocks
+with maximum lag zero and no parity failure, but was superseded without sending
+transactions when same-version upstream commits advanced the pinned candidate.
+Runtime-18 then copied the exact stopped chain state with lock files excluded
+and replaced only the Gov executable with the reproducible pinned-current
+binary. Its first runtime-local Rust leader was block 85,387. A startup audit
+through block 85,404 found all three expected Rust slots, exact six-height
+cadence, continuous parents, identical canonical hashes on all six endpoints,
+exact seven-view stride, and `votes=5+5` for every commit.
+
+The authoritative pinned 5.7.906 strict zero-transaction window started from
+an exact common head at `2026-08-02T14:23:42Z` in
+`runtime-18-gov5-906-latest-reth`; it runs for 86,640 seconds and acceptance
+still requires at least 86,400 seconds between the first and last evidence
+samples. Its independent transaction preflight confirmed nonce 17 on all six
+endpoints and sent zero transactions. Live latest-906 participation and leader
+handoff are therefore proved, while the 24-hour gate remains IN PROGRESS and is
+not declared PASS until the full interval, 17-transaction burst, post-burst
+archive parity, restart/rejoin, and final leader audits complete.
 
 ## Source and binary identity
 
@@ -150,12 +164,15 @@ Pushed implementation commits:
 - n42-26: `86c0829` (`test(interop): align restart after Rust leader`)
 - n42-26: `a4e24bd` (`test(interop): qualify current Gov5 release`)
 - n42-26: `97454e9` (`test(interop): scope leader audit to current runtime`)
+- n42-26: `1236936` (`docs: record gov5 906 live qualification`)
+- n42-26: `b4aceb1` (`test: pin latest gov5 906 qualification runtime`)
 - N42-gov5: `b027f3040` (`feat(interop): harden Gov5 mixed-client operation`)
 - N42-gov5: `34021c3f7` (`test: make hive genesis fixture self-contained`)
 - N42-gov5: `a70f7cf68` (`test: share hive fixture across packages`)
 - N42-gov5: `a35aa6293` (`fix(ethel): join state-root stream producers`)
 - N42-gov5: `520ea7bb7` (5.7.905 current-main interoperability candidate)
 - N42-gov5: `32d6ceccb` (5.7.906 current-main interoperability candidate)
+- N42-gov5: `b70505738` (pinned latest 5.7.906 interoperability candidate)
 
 The original P4 qualification binary was built at `24210f0`. The preceding
 `21ea922` commit bounds both consensus state-sync requests and
@@ -260,6 +277,19 @@ participant and Gov5 artifacts also retain their expected hashes.
   `/Users/jieliu/Documents/n42/live-interop-20260721/runtime-11-production-qualification`
 - Topologies exercised: 6 Gov5 + 1 Rust, then 5 Gov5 + 2 Rust
 
+### Current pinned 5.7.906 strict runtime
+
+- Runtime:
+  `/Users/jieliu/Documents/n42/live-interop-20260721/runtime-18-gov5-906-latest-reth`
+- Topology: 5 Gov5 + 1 Rust/Reth validator
+- Gov5 candidate: `b70505738`, upstream cutoff `f3dbeba46`
+- Genesis:
+  `0xb71c28109836f120453d097c38819a55b14c49abcc92713037fb9b11201392ec`
+- Formal evidence: `evidence/mixed-soak-24h.jsonl`, started
+  `2026-08-02T14:23:42Z`
+- Automated completion controller:
+  `scripts/gov5-current-qualification-finalizer.sh`
+
 ### Preserved seven-node deployment
 
 - Chain ID: `1143`
@@ -283,7 +313,7 @@ or removed.
 | P1 follower and catch-up | PASS | authenticated reverse/concurrent ancestry logs, 1,000+ following blocks, persisted restart recovery |
 | P2 automatic bootstrap and recovery | PASS | chain-bound bundle, blank-datadir materialization, replay receipt, cold restart |
 | P3 bidirectional leader handoff | PASS | `p3-5gov-2rust-28views-pass.jsonl`; 44 consecutive exact blocks covering more than two rotations |
-| P4 fault and lifecycle matrix | IN PROGRESS | all prior failed or incomplete windows remain preserved and excluded; 5.7.905 live catch-up, leader handoff, archive parity, and a 4,633-second six-endpoint soak passed, but upstream advanced before its strict window completed; 5.7.906 was merged, fully tested, reproducibly built, and resumed from the exact stopped data at block 85,290; its authoritative zero-transaction stream started from zero at `2026-08-02T14:05:18Z` |
+| P4 fault and lifecycle matrix | IN PROGRESS | all prior failed, superseded, or incomplete windows remain preserved and excluded; 5.7.905 live catch-up, leader handoff, archive parity, and a 4,633-second six-endpoint soak passed, but upstream advanced before its strict window completed; the first 5.7.906 stream passed 701 seconds with maximum lag zero but was superseded by same-version upstream commits; pinned candidate `b70505738` was fully tested, reproducibly built, and resumed from exact copied chain data; runtime-18's authoritative zero-transaction stream started at `2026-08-02T14:23:42Z` after exact genesis, binary, endpoint, leader, and zero-transaction preflights |
 | P5 minimal full archive+ parity | PASS | 209 RPC comparisons, 22 offline proof checks, export/import and corruption recovery |
 | P6 existing seven-node rollout | IN PROGRESS | observer cold bootstrap, exact epoch crossing, and the independent 24-hour read-only window pass remain valid; continuity-v2 was excluded from final handoff continuity after the host-sleep gap, and continuity-v3 started at `2026-07-28T08:39:00Z` without restarting the healthy read-only observer; no participant has been activated |
 
