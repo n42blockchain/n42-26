@@ -2,26 +2,27 @@
 set -euo pipefail
 
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-runtime="${N42_QUAL_RUNTIME:-/Users/jieliu/Documents/n42/live-interop-20260721/runtime-16-gov5-905-fresh-reth}"
+runtime="${N42_QUAL_RUNTIME:-/Users/jieliu/Documents/n42/live-interop-20260721/runtime-17-gov5-906-fresh-reth}"
 harness="$repo/scripts/gov5-interop-qualification.sh"
+gov_version="${N42_QUAL_GOV_VERSION:-906}"
 formal="$runtime/evidence/mixed-soak-24h.jsonl"
 burst_artifact="$runtime/artifacts/p4-signed-transaction-burst.json"
-burst_evidence="$runtime/evidence/p4-transaction-burst-905.jsonl"
+burst_evidence="$runtime/evidence/p4-transaction-burst-$gov_version.jsonl"
 post_burst="$runtime/evidence/mixed-post-burst-10m.jsonl"
 post_restart="$runtime/evidence/mixed-post-restart-10m.jsonl"
-archive_post_burst="$runtime/evidence/archive-rpc-parity-905-post-burst.jsonl"
-restart_evidence="$runtime/evidence/rust-restart-rejoin-905.jsonl"
+archive_post_burst="$runtime/evidence/archive-rpc-parity-$gov_version-post-burst.jsonl"
+restart_evidence="$runtime/evidence/rust-restart-rejoin-$gov_version.jsonl"
 leader_final="$runtime/evidence/rust-leader-final-audit.jsonl"
 soak_audit="$runtime/evidence/mixed-soak-24h-audit.json"
 post_burst_audit="$runtime/evidence/mixed-post-burst-10m-audit.json"
 post_restart_audit="$runtime/evidence/mixed-post-restart-10m-audit.json"
-summary="$runtime/evidence/gov5-905-final-qualification.json"
-failures="$runtime/evidence/gov5-905-finalizer-failures.jsonl"
+summary="$runtime/evidence/gov5-$gov_version-final-qualification.json"
+failures="$runtime/evidence/gov5-$gov_version-finalizer-failures.jsonl"
 ports="${N42_QUAL_PORTS:-28501 28502 28503 28504 28505 29545}"
 rust_port="${N42_QUAL_RUST_PORT:-29545}"
 rust_miner="${N42_QUAL_RUST_MINER:-0x81d4c1f92ddb837cb46f82280d9b491b101fa582}"
 expected_genesis="0xb71c28109836f120453d097c38819a55b14c49abcc92713037fb9b11201392ec"
-expected_gov_sha="4797696faa42cff77cb4f75fb8db22cb89decb42cd10178748052c25131f77f2"
+expected_gov_sha="${N42_QUAL_EXPECTED_GOV_SHA:-050d79612ce6bb02f7bbee44dc87461277747dfea33845597db8c1a1bc26c08d}"
 expected_rust_sha="d917782b906176119172e656005218be34ec3d5ad1b7241c0c53f8f6d593da2d"
 
 mkdir -p "$runtime/evidence"
@@ -32,10 +33,11 @@ on_error() {
   trap - ERR
   jq -nc \
     --arg at "$(date -u +%FT%TZ)" \
+    --arg gov_version "$gov_version" \
     --argjson status "$status" \
     --argjson line "$line" \
     --arg command "${BASH_COMMAND:-unknown}" \
-    '{at:$at,event:"gov5_905_finalizer_failure",statusCode:$status,
+    '{at:$at,event:("gov5_"+$gov_version+"_finalizer_failure"),statusCode:$status,
       line:$line,command:$command}' >>"$failures"
   exit "$status"
 }
@@ -123,7 +125,7 @@ assert_runtime_identity() {
 
 preflight_burst() {
   local label="${1:?preflight label required}"
-  local preflight="$runtime/evidence/p4-transaction-burst-905-finalizer-$label.jsonl"
+  local preflight="$runtime/evidence/p4-transaction-burst-$gov_version-finalizer-$label.jsonl"
   test ! -e "$preflight"
   env \
     N42_QUAL_RUNTIME="$runtime" \
@@ -151,8 +153,9 @@ if test "${N42_QUAL_FINALIZER_PREFLIGHT_ONLY:-0}" = 1; then
   preflight_burst launch-preflight
   jq -nc \
     --arg at "$(date -u +%FT%TZ)" \
+    --arg gov_version "$gov_version" \
     --arg runtime "$runtime" \
-    '{at:$at,event:"gov5_905_finalizer_preflight",status:"PASS",
+    '{at:$at,event:("gov5_"+$gov_version+"_finalizer_preflight"),status:"PASS",
       runtime:$runtime,transactionsSent:0}'
   exit 0
 fi
@@ -279,6 +282,7 @@ assert_live_identity
 
 jq -nc \
   --arg at "$(date -u +%FT%TZ)" \
+  --arg gov_version "$gov_version" \
   --arg runtime "$runtime" \
   --arg formal "$formal" \
   --arg formal_sha "$(shasum -a 256 "$formal" | awk '{print $1}')" \
@@ -289,7 +293,7 @@ jq -nc \
   --slurpfile burst "$burst_evidence" \
   --slurpfile restart "$restart_evidence" \
   --slurpfile leaders "$leader_final" '
-  {at:$at,event:"gov5_905_final_qualification",status:"PASS",runtime:$runtime,
+  {at:$at,event:("gov5_"+$gov_version+"_final_qualification"),status:"PASS",runtime:$runtime,
    acceptanceRelaxed:false,genesisExact:true,binariesExact:true,
    formalEvidence:$formal,formalEvidenceSha256:$formal_sha,
    soakAudit:$soak[0],
