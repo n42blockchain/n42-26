@@ -17,16 +17,18 @@ parent is `origin/main @ e6396fd034fec9e1cc1a1baebc33634491f741c4`, version
 also includes the preceding current-main MDBX durable-default and txspool
 changes. Full `go test ./...` passed on the merged candidate.
 
-The active qualification binary source is `feat/gov5-n42-live-interop @ 4a11238`, built
+The active qualification binary source is `feat/gov5-n42-live-interop @ 161d64a`, built
 against the separate Reth worktree at `c533db8` (Reth 2.4.1). Commits
 `ac1fc06` and `4a11238` add an explicitly configured, hard-capped authenticated
 Gov5 catch-up buffer and retain each buffered block's already-verified H2 view
-independently of the 2,048-entry live binding cache. The production default
+independently of the 2,048-entry live binding cache. Commit `161d64a` also
+removes an O(n²) full-tree prune from each received ancestor while preserving
+incremental removal whenever the durable execution head advances. The production default
 remains 2,048 blocks; the 5.7.905 qualification run explicitly uses 131,072.
 The targeted Rust suites passed 569 tests (220 consensus, 185 service, and 164
 network), zero failures. The staged binary hashes are Gov5
 `4797696faa42cff77cb4f75fb8db22cb89decb42cd10178748052c25131f77f2` and
-Rust `e23b8db8096f060bb6a6f6ef1e3443daa8f9bccf0bc65ad136c88f82f179a9a3`.
+Rust `31eff9d1f4bd83362f8c67576c04953bf665a9452a9746e76b31eb164c29318b`.
 
 An independent 5.7.905 `init` against the qualification genesis regenerated
 block zero as
@@ -80,6 +82,7 @@ Pushed implementation commits:
 - n42-26: `1b8d52b` (`style(rpc): make disabled batch path explicit`)
 - n42-26: `ac1fc06` (`fix(interop): bound configurable Gov5 catch-up buffer`)
 - n42-26: `4a11238` (`fix(interop): retain catch-up authentication views`)
+- n42-26: `161d64a` (`perf(interop): prune catch-up history incrementally`)
 - N42-gov5: `b027f3040` (`feat(interop): harden Gov5 mixed-client operation`)
 - N42-gov5: `34021c3f7` (`test: make hive genesis fixture self-contained`)
 - N42-gov5: `a70f7cf68` (`test: share hive fixture across packages`)
