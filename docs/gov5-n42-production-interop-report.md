@@ -1858,3 +1858,14 @@ nested requirement remains PASS, the complete Rust/Go P0 gate record remains
 PASS, and all six authoritative file hashes were recomputed. No requirement
 was relaxed. The consolidated recheck evidence SHA-256 is
 `d42ee31493f05e87f7b191d1e98168c370c76c5c0f135a4bd5c6055db299079e`.
+
+The strict two-hour milestone independently passes all six active streams.
+Across 240 head samples and 7,282 seconds, the chain grew by 822 blocks with
+maximum lag two and continuous zero-transaction coverage. Twenty-five resource
+samples retain Rust PID 97040, at most 275,536 KiB RSS, and exactly 93 file
+descriptors. The canonical audit covers 846 blocks and 141 exact Rust leader
+slots with `5+5` votes on all six endpoints; all 141 timeouts recovered at the
+next view with none pending. All 1,147 warnings partition exactly with zero
+unknown or critical signals, and 13 Gov5 upstream samples remain exact over
+7,210 seconds. The combined milestone SHA-256 is
+`b89f7cc0880b67f68f15ab1d7595ed903db6bfffe89c6b00dfe7745f04e7178c`.
