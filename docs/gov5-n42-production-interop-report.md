@@ -109,6 +109,10 @@ binary. Its first runtime-local Rust leader was block 85,387. A startup audit
 through block 85,404 found all three expected Rust slots, exact six-height
 cadence, continuous parents, identical canonical hashes on all six endpoints,
 exact seven-view stride, and `votes=5+5` for every commit.
+The intentionally absent seventh validator also exercises timeout recovery on
+every rotation. An early long-run audit paired all 49 observed timed-out views
+with a successful Rust commit at exactly `view + 1`; none remained in flight,
+and the live status retained a seven-validator committed QC.
 
 The authoritative pinned 5.7.906 strict zero-transaction window started from
 an exact common head at `2026-08-02T14:23:42Z` in
