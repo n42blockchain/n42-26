@@ -1822,3 +1822,13 @@ checks with zero transactions sent. This finalizer is PID 52570; all node and
 long-running monitor PIDs remain the strict-launch processes. The launch
 evidence SHA-256 is
 `a1b999f37f3660ae9fd569c6dd7af2599b1e67de21667ce58d7f99e8060212a6`.
+
+An independent final verifier now checks the finalizer rather than trusting
+its PASS at face value. Its preflight independently verified the live six-node
+chain and genesis, CommitQC and zero equivocations, every frozen input, all
+four source/upstream relationships, official Reth stable `v2.4.1`, and nonce
+`0x11` with no transaction sent. After the final artifacts appear, the same
+verifier will recompute every evidence SHA and re-evaluate the 24-hour,
+transaction, restart, leader, timeout, log, resource, and live-chain gates.
+The preflight evidence SHA-256 is
+`d1ea4a04a6f6c2a7cc3f3cb6bae3a2e9376fa7213167e78471a6ebe266137b75`.
