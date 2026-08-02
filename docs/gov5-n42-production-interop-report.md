@@ -1730,3 +1730,8 @@ zero critical signal. The leader, timeout, and log milestone SHA-256 values are
 `1e4dc93b0b512fc6041ba07ec260c8dcf186f8a28298207f281166dae1ea4faa`,
 `91d1d4c2155d6a40dc3389e1bf1d9634f9fdc8afe2060366361735504d2b2481`, and
 `fd741aecd494defd941c5eada37eafd52edde7542681826a05cff01724abdf16`.
+A fresh read-only archive rehearsal at the same milestone also passes: one
+current-head Gov/Rust QMDB reference proof is byte-exact and offline-verified,
+and 11 historical heights from genesis through block 5,189 have exact RPC,
+root, and offline proof parity. Its 12-record evidence SHA-256 is
+`8308a1487ff492976a1387b818f6a63b1cbecc5f8a5261e842723f0da7957f7b`.
