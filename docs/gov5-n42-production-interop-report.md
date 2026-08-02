@@ -125,11 +125,11 @@ every rotation. An early long-run audit paired all 49 observed timed-out views
 with a successful Rust commit at exactly `view + 1`; none remained in flight,
 and the live status retained a seven-validator committed QC.
 
-The authoritative pinned 5.7.906 strict zero-transaction window started from
-an exact common head at `2026-08-02T14:23:42Z` in
-`runtime-18-gov5-906-latest-reth`; it runs for 86,640 seconds and acceptance
-still requires at least 86,400 seconds between the first and last evidence
-samples. Its independent transaction preflight confirmed nonce 17 on all six
+The first pinned 5.7.906 strict zero-transaction attempt started from an exact
+common head at `2026-08-02T14:23:42Z` in
+`runtime-18-gov5-906-latest-reth`. It later failed closed after an operator
+diagnostic suspended the Rust task and is excluded from acceptance as described
+below. Its independent transaction preflight confirmed nonce 17 on all six
 endpoints and sent zero transactions. A separate read-only rehearsal used the
 17 previously finalized transactions at blocks `0x92ea..0x9322` and passed 258
 exact six-endpoint comparisons covering full and hash-only blocks, receipts,
@@ -144,23 +144,23 @@ A controller audit also found and fixed a release race: the finalizer could
 previously release the burst at the 86,400-second
 acceptance threshold while the deliberately 86,640-second zero-transaction
 monitor was still running. Commit `dc65f36` now waits for that monitor to close
-and re-audits its complete immutable stream before sending anything. Only the
-finalizer was replaced; all nodes, the formal monitor, its start time, and its
-accumulated samples remained uninterrupted, and the replacement evidence
-records `transactionsSent:0`. Live latest-906 participation and leader handoff
-are therefore proved, while the 24-hour gate remains IN PROGRESS and is not
-declared PASS until the full interval, 17-transaction burst, post-burst archive
-parity, restart/rejoin, and final leader audits complete.
+and re-audits its complete immutable stream before sending anything. The
+replacement evidence recorded `transactionsSent:0`; that controller correction
+did not itself restart any node or monitor. Live latest-906 participation and
+leader handoff are therefore proved, while the 24-hour gate remains IN PROGRESS
+and is not declared PASS until a complete unpolluted interval, the
+17-transaction burst, post-burst archive parity, restart/rejoin, and final
+leader audits complete.
 Commit `96de5cb` additionally makes the continuously sampled Gov5 upstream
 identity a hard acceptance gate: `origin/main` must remain exactly
 `f3dbeba4694590e6478780ac8a14e900f7dd7505` for at least 86,400 seconds, every
 ten-minute snapshot must be reachable and exact, and a fresh remote lookup
 must still match before the burst and final summary. The restart stage now
 waits for exact six-endpoint canonical identity before beginning its ten-minute
-stability interval and records that rejoin delay. Replacing only the waiting
-finalizer did not restart any node, resource sampler, upstream sampler, or the
-formal zero-transaction monitor.
-Its first upstream milestone passed with seven reachable, exact snapshots over
+stability interval and records that rejoin delay. Replacing only the
+then-waiting finalizer did not restart any node, resource sampler, upstream
+sampler, or formal monitor. The now-excluded attempt's first upstream milestone
+passed with seven reachable, exact snapshots over
 3,605 seconds, a maximum 601-second gap, and a fresh remote lookup still equal
 to `f3dbeba4694590e6478780ac8a14e900f7dd7505`.
 Commit `9ac3ce1` promotes the missing-validator recovery check into the reusable
@@ -171,7 +171,8 @@ view was already committed had an exact `view + 1` Rust leader commit with
 the pacemaker and timeout sets were identical, and every timeout view was seven
 views after the previous one. Empty logs and unavailable consensus status are
 rejected rather than treated as vacuous success.
-The first immutable one-hour milestone passed at `2026-08-02T15:24:23Z`:
+The first attempt produced a one-hour in-flight milestone at
+`2026-08-02T15:24:23Z`:
 120 formal samples spanned 3,621 seconds, grew from block 85,410 to 85,818,
 had a maximum 31-second sample gap, maximum endpoint lag one, zero failures,
 and contiguous zero-transaction verification. A same-head leader audit scanned
@@ -180,7 +181,9 @@ byte-identical hashes on all six endpoints, `votes=5+5`, and exact seven-view
 stride. The paired timeout audit proved recovery for all 71 completed timeout
 events; one current timeout remained correctly in flight. Thirteen resource
 samples held file descriptors at 93 and threads at 161--162 while RSS remained
-between 217,680 and 251,552 KiB.
+between 217,680 and 251,552 KiB. This milestone is retained as diagnostic
+history only: the later failure disqualifies the complete stream, so none of
+its elapsed time counts toward the replacement window.
 The final controller is stricter than this in-flight milestone: commit
 `e4f40f2` waits for a Rust-authored recovery head and requires zero pending
 timeouts before it can emit the qualification summary. A live closed-point
@@ -203,6 +206,44 @@ resource monitor to close before auditing and hash-binding the immutable file.
 Live catch-up telemetry also remained at `buffered=1` for every observed
 release and recorded zero bounded-buffer overflow errors, excluding the
 configured 131,072-block emergency capacity as an accumulating live map.
+
+At `2026-08-02T15:41:51Z`, the first formal monitor appended a fail-closed
+`rpc unavailable` row for Rust port 29545; the finalizer stopped at
+`15:41:53Z` and released no transaction. The Rust log had stopped at a view
+timeout while the process still existed and accepted TCP without servicing
+RPC. The timing and a subsequently captured parked-thread sample identify the
+operator's concurrent `vmmap -summary` inspection as a macOS task suspension,
+not an internal panic or a canonical-chain disagreement. Once the diagnostic
+released the task, the same Rust PID resumed, reconnected, and returned to
+exact six-endpoint identity without a restart by `15:45:45Z`. Fail-closed
+semantics still require a fresh full window. The 23 incident files are
+preserved under
+`excluded/diagnostic-task-suspension-20260802T154151Z/`; SHA-256 values are
+`0388a8a1a141eee0aa8000dc8e29ddd2aa4992de135cf2465a3204f7feb64848`
+for the excluded formal stream,
+`dfb7a6b3c5923c5c55d67c4954e2f89c1718e3e181068fce0b9fd590fce6a7de`
+for its failure stream,
+`03388971ee7a15b4cc8508542301b3b9aea7c3fc9b5b6dcd25a2355585e7d474`
+for the Rust log, and
+`9ed8290e30f00feabcbea8b759975af7e8229b5351bb46719ece0242f3ce31d8`
+for the task sample. Commit `72ba377` now also records the exact failed RPC
+port and phase in every fail-closed monitor row.
+
+Rust was then restarted from the same persisted Reth, consensus, QMDB, and
+genesis data with the pinned binary. It authored and finalized block 85,948
+(`0x1867bf2f5b8ab91b527595a9e8e1c2c1017d226abba739d40308505970753126`)
+with all five Gov nodes contributing `votes=5+5`. A clean 180-second startup
+preflight passed 35 six-endpoint samples with maximum lag zero, progressed from
+block 85,953 to 85,971, and sent no transaction; its SHA-256 is
+`f2c4dc0fe46a66a401d0f053a5cf3af29e8e111e4d887e834d5cb7f7a50d6153`.
+The replacement authoritative 86,640-second zero-transaction stream and the
+independent 87,000-second resource and Gov5-upstream streams all started from
+empty files at `2026-08-02T15:55:37Z`. Their first sample was exact at block
+85,977 with lag zero; the upstream sample remained exactly
+`f3dbeba4694590e6478780ac8a14e900f7dd7505`, and the resource sample recorded
+212,624 KiB RSS, 161 threads, and 93 file descriptors for Rust PID 30367. A
+fresh finalizer preflight again confirmed nonce 17 on all six endpoints and
+`transactionsSent:0`. No elapsed time from the excluded attempt is credited.
 
 ## Source and binary identity
 
@@ -256,6 +297,12 @@ Pushed implementation commits:
 - n42-26: `b4aceb1` (`test: pin latest gov5 906 qualification runtime`)
 - n42-26: `7a96b97` (`docs: record historical transaction parity rehearsal`)
 - n42-26: `dc65f36` (`fix: close zero-transaction monitor before burst`)
+- n42-26: `96de5cb` (`test: pin Gov5 upstream through final qualification`)
+- n42-26: `9ac3ce1` (`test: hard-gate timeout recovery in final qualification`)
+- n42-26: `e4f40f2` (`test: close final audit at Rust recovery point`)
+- n42-26: `e505a32` (`test: hard-gate runtime warning classification`)
+- n42-26: `ebcb736` (`test: audit 24-hour Rust resource stability`)
+- n42-26: `72ba377` (`test: identify failing soak endpoint`)
 - N42-gov5: `b027f3040` (`feat(interop): harden Gov5 mixed-client operation`)
 - N42-gov5: `34021c3f7` (`test: make hive genesis fixture self-contained`)
 - N42-gov5: `a70f7cf68` (`test: share hive fixture across packages`)
@@ -376,7 +423,7 @@ participant and Gov5 artifacts also retain their expected hashes.
 - Genesis:
   `0xb71c28109836f120453d097c38819a55b14c49abcc92713037fb9b11201392ec`
 - Formal evidence: `evidence/mixed-soak-24h.jsonl`, started
-  `2026-08-02T14:23:42Z`
+  `2026-08-02T15:55:37Z`; the prior diagnostic-suspended stream is excluded
 - Automated completion controller:
   `scripts/gov5-current-qualification-finalizer.sh`
 
@@ -403,7 +450,7 @@ or removed.
 | P1 follower and catch-up | PASS | authenticated reverse/concurrent ancestry logs, 1,000+ following blocks, persisted restart recovery |
 | P2 automatic bootstrap and recovery | PASS | chain-bound bundle, blank-datadir materialization, replay receipt, cold restart |
 | P3 bidirectional leader handoff | PASS | `p3-5gov-2rust-28views-pass.jsonl`; 44 consecutive exact blocks covering more than two rotations |
-| P4 fault and lifecycle matrix | IN PROGRESS | all prior failed, superseded, or incomplete windows remain preserved and excluded; 5.7.905 live catch-up, leader handoff, archive parity, and a 4,633-second six-endpoint soak passed, but upstream advanced before its strict window completed; the first 5.7.906 stream passed 701 seconds with maximum lag zero but was superseded by same-version upstream commits; pinned candidate `b70505738` was fully tested, reproducibly built, and resumed from exact copied chain data; runtime-18's authoritative zero-transaction stream started at `2026-08-02T14:23:42Z` after exact genesis, binary, endpoint, leader, and zero-transaction preflights |
+| P4 fault and lifecycle matrix | IN PROGRESS | all prior failed, superseded, incomplete, or operator-contaminated windows remain preserved and excluded; 5.7.905 live catch-up, leader handoff, archive parity, and a 4,633-second six-endpoint soak passed, but upstream advanced before its strict window completed; the first 5.7.906 stream passed 701 seconds with maximum lag zero but was superseded by same-version upstream commits; pinned candidate `b70505738` was fully tested and reproducibly built; runtime-18's `14:23:42Z` attempt failed closed when an operator diagnostic suspended Rust and is excluded; the authoritative replacement started from zero at `2026-08-02T15:55:37Z` after exact genesis, binary, endpoint, leader, restart-stability, upstream, resource, and zero-transaction preflights |
 | P5 minimal full archive+ parity | PASS | 209 RPC comparisons, 22 offline proof checks, export/import and corruption recovery |
 | P6 existing seven-node rollout | IN PROGRESS | observer cold bootstrap, exact epoch crossing, and the independent 24-hour read-only window pass remain valid; continuity-v2 was excluded from final handoff continuity after the host-sleep gap, and continuity-v3 started at `2026-07-28T08:39:00Z` without restarting the healthy read-only observer; no participant has been activated |
 
