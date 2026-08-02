@@ -802,6 +802,23 @@ impl ConsensusService {
         if !self.h2_v4_catchup_active {
             return None;
         }
+        // During a far reverse walk, the suffix is deliberately contiguous at
+        // its newest end but has not reached the durable execution head yet.
+        // This readiness function is called after every lifecycle event; a
+        // full newest-to-oldest scan here makes catch-up quadratic. The oldest
+        // buffered body can close the suffix only when it is the exact direct
+        // successor of the durable head. Keep the common incomplete check O(1)
+        // and perform the full hash-chain validation only once that boundary
+        // is present.
+        let expected_first_height = self.head_block_number.checked_add(1)?;
+        let (&first_height, (_, oldest_rlp, _)) = self.h2_v4_catchup_blocks.first_key_value()?;
+        if first_height != expected_first_height {
+            return None;
+        }
+        let oldest = n42_network::decode_gov5_block_rlp(oldest_rlp).ok()?;
+        if oldest.header.parent_hash != self.head_block_hash {
+            return None;
+        }
         // The unbound-message cache can release old, already-executed blocks
         // after a QC jump authenticates their hashes. Starting at the newest
         // authenticated block, select only the exact parent-hash chain that
