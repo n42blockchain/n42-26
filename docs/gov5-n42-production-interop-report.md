@@ -1753,3 +1753,11 @@ have exact parent continuity. Every sampled hash/root/miner is identical on all
 endpoints, all four successor blocks are Rust-authored as expected, and all
 sampled blocks remain empty. The evidence SHA-256 is
 `9720ebb62b897cedd17a222fb88b041d8089c13f313374fec99a9d3a2083f3e2`.
+
+The strict finalizer was reloaded once more without touching any node or
+long-running monitor so its final PASS summary binds the post-burst,
+post-restart, and archive-parity evidence paths and SHA-256 values directly.
+All six sender nonces remained `0x11`, no transaction was sent, and the strict
+window continued on the original node and monitor PIDs. The replacement
+evidence SHA-256 is
+`9b7d9bde9899f3388f3c598f9ef72f3899dbd04727e2ccbb5c72f6f88725d800`.
