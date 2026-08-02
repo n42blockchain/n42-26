@@ -263,6 +263,26 @@ empty files at `2026-08-02T15:55:37Z`. Their first sample was exact at block
 fresh finalizer preflight again confirmed nonce 17 on all six endpoints and
 `transactionsSent:0`. No elapsed time from the excluded attempt is credited.
 
+The replacement window's first immutable milestone is preserved under
+`evidence/milestones/replacement-one-hour-20260802T1700Z/`. Its 130 formal
+samples span 3,925 seconds, grow from block 85,977 to 86,415, have a maximum
+31-second sample gap and maximum lag two, and verify every covered block as
+zero-transaction. The canonical audit scans 468 blocks and matches all 78
+expected Rust slots on all six endpoints with continuous parents, exact hashes,
+`votes=5+5`, and seven-view log stride. The immutable timeout snapshot closes
+all 77 timeout events below its committed view and correctly retains one
+current event in flight; a live Rust-head closure immediately before the copy
+closed 77 of 77 with none pending. All 641 snapshot warnings partition exactly,
+with zero unknown or critical signals. Fourteen resource samples span 3,902
+seconds under one PID, hold RSS at 212,624--254,368 KiB, threads at 161--162,
+and descriptors at 93. Seven reachable Gov5-upstream snapshots span 3,605
+seconds and remain exact. The formal snapshot SHA-256 is
+`cdbb96bdeaeea97766a9d3ea74432ada5884d04b76e712abafa168f18c700608`;
+the SHA-256 of its complete manifest is
+`0928d0907dac3171b7cf27d1d65aff91cfbc525209066e0b18c4545ec5c30b13`.
+This is a milestone only; the live 24-hour streams continue from their original
+first samples and no transaction has been released.
+
 ## Source and binary identity
 
 Interop branches:
