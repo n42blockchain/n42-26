@@ -157,6 +157,16 @@ view was already committed had an exact `view + 1` Rust leader commit with
 the pacemaker and timeout sets were identical, and every timeout view was seven
 views after the previous one. Empty logs and unavailable consensus status are
 rejected rather than treated as vacuous success.
+The first immutable one-hour milestone passed at `2026-08-02T15:24:23Z`:
+120 formal samples spanned 3,621 seconds, grew from block 85,410 to 85,818,
+had a maximum 31-second sample gap, maximum endpoint lag one, zero failures,
+and contiguous zero-transaction verification. A same-head leader audit scanned
+432 canonical blocks and found all 72 Rust slots with continuous parents,
+byte-identical hashes on all six endpoints, `votes=5+5`, and exact seven-view
+stride. The paired timeout audit proved recovery for all 71 completed timeout
+events; one current timeout remained correctly in flight. Thirteen resource
+samples held file descriptors at 93 and threads at 161--162 while RSS remained
+between 217,680 and 251,552 KiB.
 
 ## Source and binary identity
 
