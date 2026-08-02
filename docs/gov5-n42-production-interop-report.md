@@ -17,18 +17,26 @@ parent is `origin/main @ e6396fd034fec9e1cc1a1baebc33634491f741c4`, version
 also includes the preceding current-main MDBX durable-default and txspool
 changes. Full `go test ./...` passed on the merged candidate.
 
-The active qualification binary source is `feat/gov5-n42-live-interop @ 161d64a`, built
+The active qualification binary source is `feat/gov5-n42-live-interop @ fc15007`, built
 against the separate Reth worktree at `c533db8` (Reth 2.4.1). Commits
 `ac1fc06` and `4a11238` add an explicitly configured, hard-capped authenticated
 Gov5 catch-up buffer and retain each buffered block's already-verified H2 view
 independently of the 2,048-entry live binding cache. Commit `161d64a` also
 removes an O(n²) full-tree prune from each received ancestor while preserving
-incremental removal whenever the durable execution head advances. The production default
-remains 2,048 blocks; the 5.7.905 qualification run explicitly uses 131,072.
-The targeted Rust suites passed 569 tests (220 consensus, 185 service, and 164
-network), zero failures. The staged binary hashes are Gov5
+incremental removal whenever the durable execution head advances. Commits
+`63f97db` through `d079c63` serialize and rotate ancestry requests, deduplicate
+overlapping walkers, retire completed metadata, and gate the full readiness
+scan until the suffix reaches the durable head. Commit `fc15007` makes empty
+QMDB transitions O(1), replaces the per-block full branch-file rewrite with a
+checksummed append-only WAL that still fsyncs every accepted block, and validates
+persisted empty ancestry in linear time. The production catch-up default remains
+2,048 blocks; the 5.7.905 qualification run explicitly uses 131,072. The
+targeted consensus/service/network suites passed 570 tests (220, 186, and 164),
+and the complete n42-node library suite passed another 167 tests; zero failures.
+The n42-node all-target Clippy gate also passed with warnings denied. The staged
+binary hashes are Gov5
 `4797696faa42cff77cb4f75fb8db22cb89decb42cd10178748052c25131f77f2` and
-Rust `31eff9d1f4bd83362f8c67576c04953bf665a9452a9746e76b31eb164c29318b`.
+Rust `d917782b906176119172e656005218be34ec3d5ad1b7241c0c53f8f6d593da2d`.
 
 An independent 5.7.905 `init` against the qualification genesis regenerated
 block zero as
@@ -46,12 +54,15 @@ created. Runtime-16 therefore regenerates both Rust databases from the
 authenticated bootstrap bundle instead of copying the legacy Reth database:
 `/Users/jieliu/Documents/n42/live-interop-20260721/runtime-16-gov5-905-fresh-reth`.
 Its first repaired Rust node opened RPC immediately, replayed block zero
-through checkpoint 29, then released and executed a 784-block authenticated
-Gov5 ancestry segment to durable height 813. It has now selected the current
-5.7.905 Gov head near 83.5k and is performing the long reverse-ancestry fetch.
-This is active progress, not yet a 24-hour PASS; the acceptance clock remains
-unarmed until both Rust validators reach the exact Gov head and jointly
-participate in block production.
+through checkpoint 29, and authenticated the complete 84,617-block reverse
+ancestry from block 84,646 to block 30 in 30.5 seconds. It then executed every
+block in height order with `new_payload(Valid)` and an exact per-height hash
+match against Gov5. A guarded restart at durable Reth/QMDB height 27,986 loaded
+the same canonical hash and QMDB lineage, then resumed the remaining ancestry
+without regenerating or replacing Gov5 data. The final live participation and
+long-duration acceptance window remain in progress and are not declared PASS
+until the Rust validator reaches the exact Gov head and produces blocks accepted
+by all five running Gov5 validators.
 
 ## Source and binary identity
 

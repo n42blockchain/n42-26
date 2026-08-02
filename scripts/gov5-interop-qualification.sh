@@ -239,7 +239,8 @@ monitor_heads() {
   max_lag="${N42_QUAL_MAX_LAG:-16}"
   require_zero_tx="${N42_QUAL_REQUIRE_ZERO_TX:-0}"
   zero_tx_verified_to=-1
-  ports=(28501 28502 28503 28504 28505 29545 29546)
+  read -r -a ports <<<"${N42_QUAL_PORTS:-28501 28502 28503 28504 28505 29545 29546}"
+  rust_history_port="${N42_QUAL_RUST_PORT:-29546}"
   mkdir -p "$(dirname "$evidence_file")"
   deadline=$((SECONDS + duration_seconds))
 
@@ -321,7 +322,7 @@ monitor_heads() {
             "http://127.0.0.1:28501" 2>/dev/null || true)"
           rust_block="$(curl -fsS --max-time 3 \
             -H 'content-type: application/json' --data "$request" \
-            "http://127.0.0.1:29546" 2>/dev/null || true)"
+            "http://127.0.0.1:$rust_history_port" 2>/dev/null || true)"
           gov_identity="$(printf '%s' "$gov_block" | jq -er \
             '.result | select((.transactions | length) == 0) | [.hash,.stateRoot,.receiptsRoot] | join(":")' \
             2>/dev/null || true)"
