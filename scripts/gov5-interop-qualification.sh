@@ -814,7 +814,18 @@ transaction_burst() {
   local artifact="${1:-$runtime/artifacts/p4-signed-transaction-burst.json}"
   local evidence_file="${2:-$runtime/evidence/p4-transaction-burst.jsonl}"
   local sender contract
-  local ports=(28501 28502 28503 28504 28505 29545 29546)
+  local -a ports
+  local gov_ingress_port="${N42_QUAL_GOV_INGRESS_PORT:-28501}"
+  local rust_ingress_port="${N42_QUAL_RUST_INGRESS_PORT:-29545}"
+  read -r -a ports <<<"${N42_QUAL_PORTS:-28501 28502 28503 28504 28505 29545 29546}"
+  case " ${ports[*]} " in
+    *" $gov_ingress_port "*) ;;
+    *) echo "Gov transaction ingress port is not monitored: $gov_ingress_port" >&2; return 1 ;;
+  esac
+  case " ${ports[*]} " in
+    *" $rust_ingress_port "*) ;;
+    *) echo "Rust transaction ingress port is not monitored: $rust_ingress_port" >&2; return 1 ;;
+  esac
   require_file "$artifact"
   jq -e '
     (.chainId == 1143) and
@@ -845,6 +856,24 @@ transaction_burst() {
     fi
   done
 
+  if test "${N42_QUAL_BURST_PREFLIGHT_ONLY:-0}" = 1; then
+    jq -nc \
+      --arg at "$(date -u +%FT%TZ)" \
+      --arg artifact "$artifact" \
+      --arg artifact_sha256 "$(sha256sum "$artifact" | awk '{print $1}')" \
+      --arg sender "$sender" \
+      --arg expected_nonce "$expected_nonce" \
+      --argjson first_nonce "$first_nonce" \
+      --argjson ports "$(printf '%s\n' "${ports[@]}" | jq -R 'tonumber' | jq -s '.')" \
+      '{
+        at:$at,event:"p4_transaction_burst_preflight",artifact:$artifact,
+        artifactSha256:$artifact_sha256,sender:$sender,firstNonce:$first_nonce,
+        expectedNonce:$expected_nonce,ports:$ports,
+        allConfiguredEndpointNoncesExact:true,transactionsSent:0
+      }' >>"$evidence_file"
+    return 0
+  fi
+
   local count index kind nonce ingress raw expected_hash ingress_port
   local response returned_hash receipt block_number first_block="" last_block=""
   count="$(jq -er '.transactions | length' "$artifact")"
@@ -855,9 +884,9 @@ transaction_burst() {
     raw="$(jq -er --argjson index "$index" '.transactions[$index].raw' "$artifact")"
     expected_hash="$(jq -er --argjson index "$index" '.transactions[$index].hash' "$artifact")"
     if test "$ingress" = gov; then
-      ingress_port=28501
+      ingress_port="$gov_ingress_port"
     else
-      ingress_port=29545
+      ingress_port="$rust_ingress_port"
     fi
     response="$(rpc_request "http://127.0.0.1:$ingress_port" \
       eth_sendRawTransaction "$(jq -nc --arg raw "$raw" '[$raw]')")"
@@ -1007,11 +1036,14 @@ transaction_burst() {
     --arg last_block "$last_block" \
     --argjson transactions "$count" \
     --argjson exact_checks "$exact_checks" \
+    --argjson endpoint_count "${#ports[@]}" \
     '{
       at:$at,event:"p4_transaction_burst_pass",artifact:$artifact,
       artifactSha256:$artifact_sha256,sender:$sender,contract:$contract,
       firstBlock:$first_block,lastBlock:$last_block,transactions:$transactions,
-      govIngress:true,rustIngress:true,allSevenEndpointsExact:true,
+      govIngress:true,rustIngress:true,endpointCount:$endpoint_count,
+      allConfiguredEndpointsExact:true,
+      allSevenEndpointsExact:($endpoint_count == 7),
       receiptAndLogParity:true,stateAndStorageParity:true,
       exactRpcComparisons:$exact_checks
     }' >>"$evidence_file"
