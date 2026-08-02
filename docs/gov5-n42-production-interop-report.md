@@ -181,6 +181,14 @@ timeouts, 81 matching pacemaker transitions, 81 compact-output evictions for
 commit-vote suppressions. No unknown warning remained, and all five Gov logs
 plus the Rust log contained zero error, panic, fatal, or equivocation signals.
 The final qualification summary now embeds and hash-binds this audit.
+Commit `ebcb736` closes the remaining resource-evidence gap. The reusable
+resource auditor requires a continuous single-PID stream, at least 86,400
+seconds between evidence endpoints, no gap above 360 seconds, monotonic head,
+Reth data, consensus data, QMDB WAL, and log counters, plus explicit 1 GiB RSS,
+256-thread, and 256-file-descriptor ceilings. Its one-hour rehearsal passed 15
+samples over 4,202 seconds with 474 blocks of growth, RSS 217,680--258,032 KiB,
+161--162 threads, and exactly 93 descriptors. The finalizer waits for the
+resource monitor to close before auditing and hash-binding the immutable file.
 
 ## Source and binary identity
 
