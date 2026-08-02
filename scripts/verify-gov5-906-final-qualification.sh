@@ -246,6 +246,24 @@ jq -e '
   .rustResourceAudit.storageAndLogCountersMonotonic == true
 ' "$summary" >/dev/null
 
+jq -e \
+  --arg finalizer "$(sha256 "$runtime/artifacts/scripts/gov5-current-qualification-finalizer.sh")" \
+  --arg genesis "$(sha256 "$runtime/artifacts/genesis.json")" \
+  --arg consensus "$(sha256 "$runtime/artifacts/consensus-peer-bound.json")" \
+  --arg bootstrap "$(sha256 "$runtime/artifacts/bootstrap-bundle.json")" \
+  --arg harness "$(sha256 "$runtime/artifacts/scripts/gov5-interop-qualification.sh")" \
+  --arg verifier "$(sha256 "$runtime/artifacts/binaries/n42-qmdb-proof-verify")" \
+  --arg validator "$(sha256 "$runtime/artifacts/validator-keys/node0/keystore/bls_81d4c1f92ddb837cb46f82280d9b491b101fa582.key")" \
+  --arg p2p "$(sha256 "$runtime/artifacts/validator-keys/node0/network-keys")" '
+  .finalizerScriptSha256 == $finalizer and
+  .genesisArtifactSha256 == $genesis and
+  .consensusConfigSha256 == $consensus and
+  .bootstrapBundleSha256 == $bootstrap and
+  .qualificationHarnessSha256 == $harness and
+  .qmdbProofVerifierSha256 == $verifier and
+  .validatorKeySha256 == $validator and .p2pKeySha256 == $p2p
+' "$summary" >/dev/null
+
 assert_summary_sha "$summary" formalEvidenceSha256 "$formal"
 assert_summary_sha "$summary" gov5UpstreamEvidenceSha256 "$upstream"
 assert_summary_sha "$summary" transactionBurstEvidenceSha256 "$burst"
