@@ -10,6 +10,9 @@ expected_binary_sha="${N42_LATEST_RETH_BINARY_SHA256:-0a4dbcf30d7cc9944a7cd7c96a
 expected_reth_commit="${N42_LATEST_RETH_COMMIT:-91725e3aa8f2a0bbc5a425e931a2f2b2f31b2a7b}"
 expected_source_commit="${N42_LATEST_RETH_SOURCE_COMMIT:-}"
 source_repo="${N42_LATEST_RETH_SOURCE_REPO:-/Users/jieliu/Documents/n42/interop-reth-latest-20260802/n42-26}"
+gov_repo="${N42_LATEST_RETH_GOV_REPO:-/Users/jieliu/Documents/n42/live-interop-20260721/N42-gov5-current-main-20260801}"
+expected_gov_commit="${N42_LATEST_RETH_GOV_COMMIT:-8915b4cc07d82dc195daee2e8e741ea5e8446068}"
+expected_gov_upstream="${N42_LATEST_RETH_GOV_UPSTREAM:-920f7536eb263b6744b48f28dfeb77f4c2798c1a}"
 harness="$runtime/artifacts/scripts/gov5-interop-qualification.sh"
 independent="$runtime/evidence/gov5-906-independent-final-verification.json"
 ports="${N42_QUAL_PORTS:-28501 28502 28503 28504 28505 29545}"
@@ -36,6 +39,7 @@ leader_evidence="$qualification_dir/latest-reth-leader-audit.jsonl"
 latest_log="$qualification_dir/latest-reth-rust.log"
 summary="$qualification_dir/latest-reth-final-qualification.json"
 failures="$qualification_dir/latest-reth-failures.jsonl"
+resource_pid=""
 
 mkdir -p "$qualification_dir"
 
@@ -43,6 +47,10 @@ on_error() {
   local status=$?
   local line="${BASH_LINENO[0]:-0}"
   trap - ERR
+  if test -n "$resource_pid" && kill -0 "$resource_pid" 2>/dev/null; then
+    kill "$resource_pid" 2>/dev/null || true
+    wait "$resource_pid" 2>/dev/null || true
+  fi
   jq -nc \
     --arg at "$(date -u +%FT%TZ)" \
     --argjson status "$status" \
@@ -121,6 +129,19 @@ assert_source() {
   test "$remote" = "$(git -C "$source_repo" rev-parse HEAD)"
 }
 
+assert_gov_source() {
+  local branch remote_candidate remote_main
+  test "$(git -C "$gov_repo" rev-parse HEAD)" = "$expected_gov_commit"
+  test -z "$(git -C "$gov_repo" status --porcelain --untracked-files=no)"
+  branch="$(git -C "$gov_repo" rev-parse --abbrev-ref HEAD)"
+  remote_candidate="$(git -C "$gov_repo" ls-remote origin "refs/heads/$branch" |
+    awk 'NR == 1 {print $1}')"
+  remote_main="$(git -C "$gov_repo" ls-remote origin refs/heads/main |
+    awk 'NR == 1 {print $1}')"
+  test "$remote_candidate" = "$expected_gov_commit"
+  test "$remote_main" = "$expected_gov_upstream"
+}
+
 assert_static_inputs() {
   local version
   if test -n "$expected_self_sha"; then
@@ -142,6 +163,7 @@ assert_static_inputs() {
   test "$(shasum -a 256 "$runtime/artifacts/genesis.json" | awk '{print $1}')" = \
     "$expected_genesis_artifact_sha"
   assert_source
+  assert_gov_source
   assert_genesis
   assert_live_identity
 }
@@ -160,14 +182,21 @@ wait_for_rust_authored_head() {
 
 resolve_first_latest_rust_height() {
   local line hash block number_hex
-  line="$(rg -m1 ' INFO (.*: )?block committed! view=' "$latest_log")"
-  hash="$(sed -E -n 's/.*block_hash=(0x[0-9a-f]{64}).*/\1/p' <<<"$line")"
-  test -n "$hash"
-  block="$(rpc "$rust_port" eth_getBlockByHash \
-    "$(jq -nc --arg hash "$hash" '[$hash,false]')" | jq -ec '.result')"
-  test "$(jq -r '.miner | ascii_downcase' <<<"$block")" = "$rust_miner"
-  number_hex="$(jq -er '.number' <<<"$block")"
-  printf '%s\n' "$((number_hex))"
+  while IFS= read -r line; do
+    hash="$(sed -E -n 's/.*block_hash=(0x[0-9a-f]{64}).*/\1/p' <<<"$line")"
+    if ! [[ "$hash" =~ ^0x[0-9a-f]{64}$ ]]; then
+      continue
+    fi
+    block="$(rpc "$rust_port" eth_getBlockByHash \
+      "$(jq -nc --arg hash "$hash" '[$hash,false]')" | jq -ec '.result')"
+    if test "$(jq -r '.miner | ascii_downcase' <<<"$block")" = "$rust_miner"; then
+      number_hex="$(jq -er '.number' <<<"$block")"
+      printf '%s\n' "$((number_hex))"
+      return 0
+    fi
+  done < <(rg ' INFO (.*: )?block committed! view=' "$latest_log")
+  echo "latest Reth log contains no canonical Rust-authored block" >&2
+  return 1
 }
 
 preflight() {
@@ -187,7 +216,7 @@ preflight() {
 
 run_qualification() {
   local old_pid new_pid log_bytes_before started rpc_recovery rejoin_wait
-  local pre_head_hex pre_head pre_status pre_equiv resource_pid resource_status
+  local pre_head_hex pre_head pre_status pre_equiv resource_status
   local post_head_hex post_head post_status post_equiv first_latest_height
   local process_command version
 
@@ -278,9 +307,31 @@ run_qualification() {
   jq -e '.total == 0 and (.evidence | length) == 0' <<<"$post_equiv" >/dev/null
   assert_genesis
   assert_live_identity
+  assert_source
+  assert_gov_source
+  test "$(<"$runtime/pids/rust.pid")" = "$new_pid"
   kill -0 "$new_pid"
+  process_command="$(ps -p "$new_pid" -o command=)"
+  case "$process_command" in
+    "$latest_binary node "*) ;;
+    *) echo "latest Reth final process command mismatch: $process_command" >&2; return 1 ;;
+  esac
   test "$(shasum -a 256 "$latest_binary" | awk '{print $1}')" = "$expected_binary_sha"
   version="$("$latest_binary" --version)"
+
+  jq -nc \
+    --arg at "$(date -u +%FT%TZ)" \
+    --argjson pid "$new_pid" \
+    --argjson head "$post_head" \
+    --argjson rpc_recovery "$rpc_recovery" \
+    --argjson rejoin_wait "$rejoin_wait" \
+    --argjson consensus "$post_status" \
+    --argjson equivocations "$post_equiv" \
+    '{at:$at,event:"latest_reth_rollover_completed",pidAfter:$pid,
+      headAfter:$head,rpcRecoverySeconds:$rpc_recovery,
+      rejoinWaitSeconds:$rejoin_wait,consensusAfter:$consensus,
+      equivocations:$equivocations,sourceAndGovUpstreamStillExact:true}' \
+    >>"$rollover_evidence"
 
   jq -nc \
     --arg at "$(date -u +%FT%TZ)" \
@@ -309,6 +360,7 @@ run_qualification() {
     {at:$at,event:"latest_reth_final_qualification",status:"PASS",
       binary:$binary,binarySha256:$binary_sha256,rethVersion:"2.4.1",
       rethCommit:$reth_commit,versionOutput:$version,
+      sourceAndGovUpstreamStillExact:true,
       strictIndependentVerification:$independent,
       strictIndependentVerificationSha256:$independent_sha,
       pidBefore:$pid_before,pidAfter:$pid_after,headBefore:$head_before,
