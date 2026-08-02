@@ -1786,3 +1786,11 @@ running node, and pinned by SHA-256 in both the restart path and final summary.
 Only the finalizer was reloaded; the node and long-running monitor PIDs were
 unchanged and no transaction was sent. The replacement evidence SHA-256 is
 `4b1fcc18ef25d6a88de88ae599af06f7b42bc76a11d80a83c2a8da9bff78a1ef`.
+
+The restart closure also pins the local genesis artifact, peer-bound consensus
+configuration, and bootstrap bundle by SHA-256. The finalizer validates all
+three when it starts, repeats the validation immediately before restarting
+Rust, and binds the values into the final PASS summary. Reloading this guard
+did not change any node or long-running monitor PID and sent no transaction.
+The replacement evidence SHA-256 is
+`9539a714aff3f7ad2249a0fc7a7411f7779d362c700aefc9fa133325dd1541c1`.
