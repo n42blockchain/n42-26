@@ -1794,3 +1794,12 @@ Rust, and binds the values into the final PASS summary. Reloading this guard
 did not change any node or long-running monitor PID and sent no transaction.
 The replacement evidence SHA-256 is
 `9539a714aff3f7ad2249a0fc7a7411f7779d362c700aefc9fa133325dd1541c1`.
+
+The qualification harness and offline QMDB proof verifier used after the
+24-hour wait were frozen into the strict runtime as well. Their pinned copies
+successfully reran the in-flight soak audit and the complete Gov/Rust archive
+RPC plus offline-proof parity test. The finalizer now refuses any different
+tooling bytes and records both SHA-256 values in its final summary. No node or
+long-running monitor PID changed and no transaction was sent. The replacement
+evidence SHA-256 is
+`958d641ca632f5837e056ad673bb586632cf1b4413000376b60a4526cd205aa8`.
