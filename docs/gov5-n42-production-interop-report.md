@@ -1803,3 +1803,13 @@ tooling bytes and records both SHA-256 values in its final summary. No node or
 long-running monitor PID changed and no transaction was sent. The replacement
 evidence SHA-256 is
 `958d641ca632f5837e056ad673bb586632cf1b4413000376b60a4526cd205aa8`.
+
+A read-only execution preflight confirms that the deployment and transfer
+calls succeed on all six endpoints and that every estimate fits within its
+signed gas limit. Transfer estimates are exactly 21,000 on Gov and Rust. The
+contract-creation estimate is `0x12799` on Gov and `0x12b0c` on Rust, reflecting
+client-local estimation heuristics rather than an execution or consensus
+difference; both are below the signed `0x186a0` limit, and all `eth_call`
+results are the same. No state changed and no transaction was sent. The
+evidence SHA-256 is
+`77eb639a5412bc39263bb71a52c2aab2ae3aeb27ed8bc5e1e1578d875276d389`.
