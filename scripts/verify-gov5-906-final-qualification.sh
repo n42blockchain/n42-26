@@ -314,6 +314,49 @@ jq -e '.event == "gov5_upstream_monitor_complete" and .status == "PASS" and
   .expectedMain == $expected and .elapsedSeconds >= 86400' \
   --arg expected "$expected_gov_upstream" "$upstream_complete" >/dev/null
 
+# Re-run the acceptance logic over raw evidence and live archive RPC instead
+# of accepting only the finalizer-produced audit objects.
+frozen_harness="$runtime/artifacts/scripts/gov5-interop-qualification.sh"
+frozen_qmdb_verifier="$runtime/artifacts/binaries/n42-qmdb-proof-verify"
+env N42_QUAL_RUNTIME="$runtime" "$frozen_harness" \
+  audit-soak "$formal" 86400 120 6 1 >/dev/null
+env N42_QUAL_RUNTIME="$runtime" "$frozen_harness" \
+  audit-soak "$post_burst" 600 120 6 0 >/dev/null
+env N42_QUAL_RUNTIME="$runtime" "$frozen_harness" \
+  audit-soak "$post_restart" 600 120 6 0 >/dev/null
+env N42_QUAL_RUNTIME="$runtime" "$frozen_harness" \
+  audit-rust-resources "$resources" 86400 >/dev/null
+jq -e -s --arg expected "$expected_gov_upstream" '
+  length >= 2 and
+  all(.[];
+    .event == "gov5_upstream_snapshot" and .baseline == $expected and
+    .remoteMain == $expected and .remoteReachable == true and
+    .baselineExact == true) and
+  ([.[].at | fromdateiso8601] as $times |
+    ($times[-1] - $times[0]) >= 86400 and
+    ([range(1; $times | length) as $i |
+      ($times[$i] - $times[$i - 1]) > 0 and
+      ($times[$i] - $times[$i - 1]) <= 700] | all))
+' "$upstream" >/dev/null
+
+leader_start="$(jq -er '.rustLeaderAudit.startHeight' "$summary")"
+leader_end="$(jq -er '.rustLeaderAudit.endHeight' "$summary")"
+env N42_QUAL_RUNTIME="$runtime" N42_QUAL_PORTS="$ports" \
+  N42_QUAL_RUST_PORT=29545 \
+  N42_QUAL_RUST_MINER=0x81d4c1f92ddb837cb46f82280d9b491b101fa582 \
+  N42_QUAL_RUST_LOG="$runtime/logs/rust.log" \
+  "$frozen_harness" audit-rust-leaders "$leader_start" "$leader_end" \
+    /dev/null >/dev/null
+env N42_QUAL_RUNTIME="$runtime" N42_QUAL_RUST_PORT=29545 \
+  "$frozen_harness" audit-timeout-recovery "$runtime/logs/rust.log" \
+    /dev/null >/dev/null
+env N42_QUAL_RUNTIME="$runtime" "$frozen_harness" \
+  audit-runtime-logs "$runtime/logs/rust.log" /dev/null >/dev/null
+env N42_QUAL_RUNTIME="$runtime" \
+  N42_QUAL_QMDB_PROOF_VERIFY="$frozen_qmdb_verifier" \
+  "$frozen_harness" archive-rpc-parity \
+    http://127.0.0.1:28501 http://127.0.0.1:29545 /dev/null
+
 jq -nc \
   --arg at "$(date -u +%FT%TZ)" \
   --arg summary "$summary" \
@@ -321,6 +364,7 @@ jq -nc \
   '{at:$at,event:"gov5_906_independent_final_verification",status:"PASS",
     summary:$summary,summarySha256:$summary_sha256,
     allEvidenceHashesRecomputedExact:true,allEmbeddedAuditsExact:true,
+    independentRawAuditsReexecuted:true,liveArchiveParityReexecuted:true,
     liveChainExact:true,genesisExact:true,consensusReady:true,
     zeroEquivocations:true,pinnedInputsExact:true,sourcesAndRemotesExact:true,
     finalSenderNonce:"0x22",transactionsFinalized:17}'
