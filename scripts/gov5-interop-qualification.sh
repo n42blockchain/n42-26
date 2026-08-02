@@ -676,6 +676,88 @@ record_rust_resources() {
   printf '%s\n' "$snapshot"
 }
 
+audit_timeout_recovery() {
+  local leader_log="${1:?Rust consensus log required}"
+  local evidence_file="${2:-}"
+  local rust_port="${N42_QUAL_RUST_PORT:-29545}"
+  require_file "$leader_log"
+
+  local audit_dir
+  audit_dir="$(mktemp -d)"
+  trap 'rm -rf "$audit_dir"' RETURN
+
+  local timed_out="$audit_dir/timed-out.jsonl"
+  local pacemaker="$audit_dir/pacemaker.jsonl"
+  local rust_commits="$audit_dir/rust-commits.jsonl"
+  rg ' WARN view timed out view=[0-9]+' "$leader_log" | jq -Rc '
+    capture("^(?<at>[^ ]+).*view timed out view=(?<view>[0-9]+)$") |
+    {at,view:(.view|tonumber)}' >"$timed_out"
+  rg ' WARN pacemaker timeout, initiating view change view=[0-9]+' \
+    "$leader_log" | jq -Rc '
+    capture("^(?<at>[^ ]+).*view change view=(?<view>[0-9]+)$") |
+    {at,view:(.view|tonumber)}' >"$pacemaker"
+  rg ' INFO block committed! view=[0-9]+' "$leader_log" | jq -Rc '
+    capture("^(?<at>[^ ]+).*block committed! view=(?<view>[0-9]+) block_hash=(?<hash>0x[0-9a-f]{64}).*votes=(?<votes>[0-9]+[+][0-9]+)$") |
+    {at,view:(.view|tonumber),hash,votes}' >"$rust_commits"
+
+  local committed_view
+  committed_view="$(rpc_request "http://127.0.0.1:$rust_port" \
+    n42_consensusStatus '[]' | jq -er '.result.latestCommittedView')"
+
+  jq -e -n \
+    --argjson committed_view "$committed_view" \
+    --slurpfile timed_out "$timed_out" \
+    --slurpfile pacemaker "$pacemaker" \
+    --slurpfile rust_commits "$rust_commits" '
+    ($timed_out | sort_by(.view)) as $timeouts |
+    ($pacemaker | sort_by(.view)) as $pacemakers |
+    ($rust_commits | sort_by(.view)) as $commits |
+    ($timeouts | map(select(.view < $committed_view))) as $eligible |
+    ($timeouts | map(select(.view >= $committed_view))) as $pending |
+    ($timeouts | length >= 1) and
+    (($timeouts | map(.view) | unique | length) == ($timeouts | length)) and
+    (($pacemakers | map(.view) | unique | length) == ($pacemakers | length)) and
+    (($commits | map(.view) | unique | length) == ($commits | length)) and
+    (($timeouts | map(.view)) == ($pacemakers | map(.view))) and
+    ([range(1; $timeouts | length) as $i |
+      $timeouts[$i].view - $timeouts[$i - 1].view == 7] | all) and
+    ($eligible | length >= 1) and ($pending | length <= 1) and
+    ([$eligible[] as $timeout |
+      any($commits[];
+        .view == ($timeout.view + 1) and .votes == "5+5" and
+        (.hash | test("^0x[0-9a-f]{64}$")))] | all)
+  ' >/dev/null
+
+  local summary
+  summary="$(jq -nc \
+    --arg at "$(date -u +%FT%TZ)" \
+    --arg log "$leader_log" \
+    --arg log_sha256 "$(shasum -a 256 "$leader_log" | awk '{print $1}')" \
+    --argjson committed_view "$committed_view" \
+    --slurpfile timed_out "$timed_out" \
+    --slurpfile rust_commits "$rust_commits" '
+    ($timed_out | sort_by(.view)) as $timeouts |
+    ($rust_commits | sort_by(.view)) as $commits |
+    ($timeouts | map(select(.view < $committed_view))) as $eligible |
+    ($timeouts | map(select(.view >= $committed_view))) as $pending |
+    {at:$at,event:"timeout_recovery_audit",status:"PASS",
+      log:$log,logSha256:$log_sha256,latestCommittedView:$committed_view,
+      timeoutEvents:($timeouts|length),completedTimeouts:($eligible|length),
+      pendingTimeouts:($pending|length),
+      firstTimeoutView:$timeouts[0].view,lastTimeoutView:$timeouts[-1].view,
+      timeoutViewStride:7,timeoutAndPacemakerSetsExact:true,
+      everyCompletedTimeoutRecoveredAtNextView:true,
+      recoveredByRustVotesFivePlusFive:true,
+      firstRecoveryView:($eligible[0].view+1),
+      lastRecoveryView:($eligible[-1].view+1),
+      rustLeaderCommitsObserved:($commits|length)}')"
+  if test -n "$evidence_file"; then
+    mkdir -p "$(dirname "$evidence_file")"
+    printf '%s\n' "$summary" >>"$evidence_file"
+  fi
+  printf '%s\n' "$summary"
+}
+
 monitor_rust_resources() {
   local duration_seconds="${1:?duration seconds required}"
   local interval_seconds="${2:-300}"
@@ -1404,6 +1486,7 @@ case "${1:-}" in
   monitor-heads) monitor_heads "${2:-}" "${3:-10}" "${4:-}" ;;
   audit-soak) audit_soak "${2:-}" "${3:-}" "${4:-120}" "${5:-6}" "${6:-0}" ;;
   audit-rust-leaders) audit_rust_leaders "${2:-}" "${3:-}" "${4:-}" ;;
+  audit-timeout-recovery) audit_timeout_recovery "${2:-}" "${3:-}" ;;
   record-rust-resources) record_rust_resources "${2:-}" ;;
   monitor-rust-resources) monitor_rust_resources "${2:-}" "${3:-300}" "${4:-}" ;;
   record-clock) record_clock_snapshot "${2:-}" "${3:-}" ;;
@@ -1416,7 +1499,7 @@ case "${1:-}" in
   archive-rpc-parity) archive_rpc_parity "${2:-}" "${3:-}" "${4:-}" ;;
   transaction-burst) transaction_burst "${2:-}" "${3:-}" ;;
   *)
-    echo "usage: $0 {start-gov|start-gov-node N|start-rust|start-rust2|stop-rust|stop-rust2|start|stop|restart-gov-node N|restart-rust|restart-rust2|status|monitor-heads <seconds> [interval] [evidence-file]|audit-soak <evidence-file> <minimum-elapsed-seconds> [maximum-gap-seconds] [maximum-lag] [require-zero-tx]|audit-rust-leaders <first-rust-height> [end-height] [evidence-file]|record-rust-resources [evidence-file]|monitor-rust-resources <seconds> [interval] [evidence-file]|record-clock <label> [evidence-file]|record-head <label> <port> [evidence-file]|era-checksums <directory>|archive-export <node> <snapshot>|archive-verify <snapshot>|archive-import <snapshot> <fresh-destination>|archive-corruption-drill <snapshot> <corrupt-copy> <recovered-copy> [evidence-file]|archive-rpc-parity <gov-endpoint> <rust-endpoint> [evidence-file]|transaction-burst [ARTIFACT] [EVIDENCE]}" >&2
+    echo "usage: $0 {start-gov|start-gov-node N|start-rust|start-rust2|stop-rust|stop-rust2|start|stop|restart-gov-node N|restart-rust|restart-rust2|status|monitor-heads <seconds> [interval] [evidence-file]|audit-soak <evidence-file> <minimum-elapsed-seconds> [maximum-gap-seconds] [maximum-lag] [require-zero-tx]|audit-rust-leaders <first-rust-height> [end-height] [evidence-file]|audit-timeout-recovery <rust-log> [evidence-file]|record-rust-resources [evidence-file]|monitor-rust-resources <seconds> [interval] [evidence-file]|record-clock <label> [evidence-file]|record-head <label> <port> [evidence-file]|era-checksums <directory>|archive-export <node> <snapshot>|archive-verify <snapshot>|archive-import <snapshot> <fresh-destination>|archive-corruption-drill <snapshot> <corrupt-copy> <recovered-copy> [evidence-file]|archive-rpc-parity <gov-endpoint> <rust-endpoint> [evidence-file]|transaction-burst [ARTIFACT] [EVIDENCE]}" >&2
     exit 2
     ;;
 esac

@@ -13,6 +13,7 @@ post_restart="$runtime/evidence/mixed-post-restart-10m.jsonl"
 archive_post_burst="$runtime/evidence/archive-rpc-parity-$gov_version-post-burst.jsonl"
 restart_evidence="$runtime/evidence/rust-restart-rejoin-$gov_version.jsonl"
 leader_final="$runtime/evidence/rust-leader-final-audit.jsonl"
+timeout_final="$runtime/evidence/timeout-recovery-final-audit.jsonl"
 upstream="$runtime/evidence/gov5-upstream-24h.jsonl"
 upstream_audit="$runtime/evidence/gov5-upstream-24h-audit.json"
 soak_audit="$runtime/evidence/mixed-soak-24h-audit.json"
@@ -213,6 +214,7 @@ test ! -e "$post_restart"
 test ! -e "$archive_post_burst"
 test ! -e "$restart_evidence"
 test ! -e "$leader_final"
+test ! -e "$timeout_final"
 test ! -e "$upstream_audit"
 test ! -e "$soak_audit"
 test ! -e "$post_burst_audit"
@@ -350,6 +352,17 @@ env \
   N42_QUAL_RUST_LOG="$runtime/logs/rust.log" \
   "$harness" audit-rust-leaders "$rust_leader_start" "$post_restart_head" \
     "$leader_final" >/dev/null
+env N42_QUAL_RUNTIME="$runtime" N42_QUAL_RUST_PORT="$rust_port" \
+  "$harness" audit-timeout-recovery "$runtime/logs/rust.log" \
+    "$timeout_final" >/dev/null
+jq -e -s '
+  length == 1 and .[0].status == "PASS" and
+  .[0].completedTimeouts >= 1 and .[0].pendingTimeouts <= 1 and
+  .[0].timeoutViewStride == 7 and
+  .[0].timeoutAndPacemakerSetsExact == true and
+  .[0].everyCompletedTimeoutRecoveredAtNextView == true and
+  .[0].recoveredByRustVotesFivePlusFive == true
+' "$timeout_final" >/dev/null
 assert_genesis
 assert_live_identity
 assert_gov_upstream
@@ -363,12 +376,14 @@ jq -nc \
   --arg burst_sha "$(shasum -a 256 "$burst_evidence" | awk '{print $1}')" \
   --arg restart_sha "$(shasum -a 256 "$restart_evidence" | awk '{print $1}')" \
   --arg leader_sha "$(shasum -a 256 "$leader_final" | awk '{print $1}')" \
+  --arg timeout_sha "$(shasum -a 256 "$timeout_final" | awk '{print $1}')" \
   --arg upstream_sha "$(shasum -a 256 "$upstream" | awk '{print $1}')" \
   --slurpfile soak "$soak_audit" \
   --slurpfile upstream "$upstream_audit" \
   --slurpfile burst "$burst_evidence" \
   --slurpfile restart "$restart_evidence" \
-  --slurpfile leaders "$leader_final" '
+  --slurpfile leaders "$leader_final" \
+  --slurpfile timeouts "$timeout_final" '
   {at:$at,event:("gov5_"+$gov_version+"_final_qualification"),status:"PASS",runtime:$runtime,
    acceptanceRelaxed:false,genesisExact:true,binariesExact:true,
    formalEvidence:$formal,formalEvidenceSha256:$formal_sha,
@@ -378,6 +393,7 @@ jq -nc \
    transactionBurstEvidenceSha256:$burst_sha,
    restart:$restart,restartEvidenceSha256:$restart_sha,
    rustLeaderAudit:$leaders[-1],rustLeaderEvidenceSha256:$leader_sha,
+   timeoutRecoveryAudit:$timeouts[-1],timeoutRecoveryEvidenceSha256:$timeout_sha,
    postBurstExact:true,postRestartExact:true,archiveParityPostBurst:true,
    zeroEquivocations:true}' >"$summary"
 
