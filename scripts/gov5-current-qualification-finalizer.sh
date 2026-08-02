@@ -374,13 +374,21 @@ pre_restart_pid="$(<"$runtime/pids/rust.pid")"
 pre_restart_head_hex="$(rpc "$rust_port" eth_blockNumber '[]' | jq -er '.result')"
 pre_restart_head=$((pre_restart_head_hex))
 pre_restart_status="$(rpc "$rust_port" n42_consensusStatus '[]' | jq -ec '.result')"
+pre_restart_equivocations="$(rpc "$rust_port" n42_equivocations '[]' | jq -ec '.result')"
+jq -e '.hasCommittedQc == true and .validatorCount == 7' \
+  <<<"$pre_restart_status" >/dev/null
+jq -e '.total == 0 and (.evidence | length) == 0' \
+  <<<"$pre_restart_equivocations" >/dev/null
+restart_started_seconds="$(date +%s)"
 jq -nc \
   --arg at "$(date -u +%FT%TZ)" \
   --argjson pid "$pre_restart_pid" \
   --argjson head "$pre_restart_head" \
   --argjson consensus "$pre_restart_status" \
+  --argjson equivocations "$pre_restart_equivocations" \
   '{at:$at,event:"rust_restart_started",pidBefore:$pid,headBefore:$head,
-    consensusBefore:$consensus}' >>"$restart_evidence"
+    consensusBefore:$consensus,equivocationsBefore:$equivocations}' \
+  >>"$restart_evidence"
 
 env \
   N42_QUAL_RUNTIME="$runtime" \
@@ -390,11 +398,11 @@ env \
   N42_QMDB_REPLAY_DEPTH=1048576 \
   "$harness" restart-rust
 wait_for_rpc "$rust_port" 300
+rpc_recovery_seconds=$(( $(date +%s) - restart_started_seconds ))
 post_restart_pid="$(<"$runtime/pids/rust.pid")"
 test "$post_restart_pid" != "$pre_restart_pid"
-rejoin_wait_started="$(date +%s)"
 assert_live_identity 300
-rejoin_wait_seconds=$(( $(date +%s) - rejoin_wait_started ))
+rejoin_wait_seconds=$(( $(date +%s) - restart_started_seconds ))
 
 env N42_QUAL_RUNTIME="$runtime" N42_QUAL_PORTS="$ports" \
   N42_QUAL_RUST_PORT="$rust_port" N42_QUAL_MAX_LAG=6 \
@@ -406,17 +414,20 @@ post_restart_head=$((post_restart_head_hex))
 test "$post_restart_head" -gt "$pre_restart_head"
 post_restart_status="$(rpc "$rust_port" n42_consensusStatus '[]' | jq -ec '.result')"
 equivocations="$(rpc "$rust_port" n42_equivocations '[]' | jq -ec '.result')"
-jq -e 'hasCommittedQc == true and .validatorCount == 7' <<<"$post_restart_status" >/dev/null
+jq -e '.hasCommittedQc == true and .validatorCount == 7' \
+  <<<"$post_restart_status" >/dev/null
 jq -e '.total == 0 and (.evidence | length) == 0' <<<"$equivocations" >/dev/null
 jq -nc \
   --arg at "$(date -u +%FT%TZ)" \
   --argjson pid "$post_restart_pid" \
   --argjson head "$post_restart_head" \
+  --argjson rpc_recovery_seconds "$rpc_recovery_seconds" \
   --argjson rejoin_wait_seconds "$rejoin_wait_seconds" \
   --argjson consensus "$post_restart_status" \
   --argjson equivocations "$equivocations" \
   '{at:$at,event:"rust_restart_rejoined",pidAfter:$pid,headAfter:$head,
     exactIdentityBeforeStabilityWindow:true,rejoinWaitSeconds:$rejoin_wait_seconds,
+    rpcRecoverySeconds:$rpc_recovery_seconds,
     consensusAfter:$consensus,equivocations:$equivocations}' >>"$restart_evidence"
 
 env \
