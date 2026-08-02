@@ -475,7 +475,13 @@ jq -nc \
   --arg formal "$formal" \
   --arg formal_sha "$(shasum -a 256 "$formal" | awk '{print $1}')" \
   --arg burst_sha "$(shasum -a 256 "$burst_evidence" | awk '{print $1}')" \
+  --arg post_burst "$post_burst" \
+  --arg post_burst_sha "$(shasum -a 256 "$post_burst" | awk '{print $1}')" \
+  --arg archive_post_burst "$archive_post_burst" \
+  --arg archive_post_burst_sha "$(shasum -a 256 "$archive_post_burst" | awk '{print $1}')" \
   --arg restart_sha "$(shasum -a 256 "$restart_evidence" | awk '{print $1}')" \
+  --arg post_restart "$post_restart" \
+  --arg post_restart_sha "$(shasum -a 256 "$post_restart" | awk '{print $1}')" \
   --arg leader_sha "$(shasum -a 256 "$leader_final" | awk '{print $1}')" \
   --arg timeout_sha "$(shasum -a 256 "$timeout_final" | awk '{print $1}')" \
   --arg runtime_log_sha "$(shasum -a 256 "$runtime_log_final" | awk '{print $1}')" \
@@ -484,6 +490,8 @@ jq -nc \
   --slurpfile soak "$soak_audit" \
   --slurpfile upstream "$upstream_audit" \
   --slurpfile burst "$burst_evidence" \
+  --slurpfile post_burst_audit "$post_burst_audit" \
+  --slurpfile post_restart_audit "$post_restart_audit" \
   --slurpfile restart "$restart_evidence" \
   --slurpfile leaders "$leader_final" \
   --slurpfile timeouts "$timeout_final" \
@@ -496,7 +504,13 @@ jq -nc \
    gov5UpstreamAudit:$upstream[0],gov5UpstreamEvidenceSha256:$upstream_sha,
    transactionBurst:($burst|map(select(.event=="p4_transaction_burst_pass"))[0]),
    transactionBurstEvidenceSha256:$burst_sha,
+   postBurstEvidence:$post_burst,postBurstEvidenceSha256:$post_burst_sha,
+   postBurstAudit:$post_burst_audit[0],
+   archiveParityPostBurstEvidence:$archive_post_burst,
+   archiveParityPostBurstEvidenceSha256:$archive_post_burst_sha,
    restart:$restart,restartEvidenceSha256:$restart_sha,
+   postRestartEvidence:$post_restart,postRestartEvidenceSha256:$post_restart_sha,
+   postRestartAudit:$post_restart_audit[0],
    rustLeaderAudit:$leaders[-1],rustLeaderEvidenceSha256:$leader_sha,
    timeoutRecoveryAudit:$timeouts[-1],timeoutRecoveryEvidenceSha256:$timeout_sha,
    runtimeLogAudit:$runtime_logs[-1],runtimeLogEvidenceSha256:$runtime_log_sha,
