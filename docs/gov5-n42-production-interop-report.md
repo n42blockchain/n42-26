@@ -33,9 +33,9 @@ pushed at `chore/deps-latest-20260721 @ 57599a4a3076e999354803a253c6b37207e65b07
 its manifest and devlog pin the same Reth 2.4.1 revision
 `c533db8bad6f300be93ec047ecffc717b08957f8`. That delivery branch is not
 misrepresented as an ancestor of the measured interop binary: this runtime
-uses the interop branch's own locked dependency graph, whose Reth packages are
-also 2.4.1, plus Rust 1.97.1. No dependency or execution binary was changed
-after the strict window began.
+uses the interop branch's own locked dependency graph against the same Reth
+2.4.1 workspace baseline, plus Rust 1.97.1. No dependency or execution binary
+was changed after the strict window began.
 
 Commits
 `ac1fc06` and `4a11238` add an explicitly configured, hard-capped authenticated
