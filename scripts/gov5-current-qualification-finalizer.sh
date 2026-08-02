@@ -21,6 +21,7 @@ failures="$runtime/evidence/gov5-$gov_version-finalizer-failures.jsonl"
 ports="${N42_QUAL_PORTS:-28501 28502 28503 28504 28505 29545}"
 rust_port="${N42_QUAL_RUST_PORT:-29545}"
 rust_miner="${N42_QUAL_RUST_MINER:-0x81d4c1f92ddb837cb46f82280d9b491b101fa582}"
+rust_leader_start="${N42_QUAL_RUST_LEADER_START:-85291}"
 expected_genesis="0xb71c28109836f120453d097c38819a55b14c49abcc92713037fb9b11201392ec"
 expected_gov_sha="${N42_QUAL_EXPECTED_GOV_SHA:-050d79612ce6bb02f7bbee44dc87461277747dfea33845597db8c1a1bc26c08d}"
 expected_rust_sha="d917782b906176119172e656005218be34ec3d5ad1b7241c0c53f8f6d593da2d"
@@ -276,7 +277,8 @@ env \
   N42_QUAL_RUST_PORT="$rust_port" \
   N42_QUAL_RUST_MINER="$rust_miner" \
   N42_QUAL_RUST_LOG="$runtime/logs/rust.log" \
-  "$harness" audit-rust-leaders 84757 "$post_restart_head" "$leader_final" >/dev/null
+  "$harness" audit-rust-leaders "$rust_leader_start" "$post_restart_head" \
+    "$leader_final" >/dev/null
 assert_genesis
 assert_live_identity
 
