@@ -2,6 +2,8 @@
 set -euo pipefail
 
 runtime="${N42_QUAL_RUNTIME:-/Users/jieliu/Documents/n42/live-interop-20260721/runtime-18-gov5-906-latest-reth}"
+finalizer_script="${BASH_SOURCE[0]}"
+expected_finalizer_sha="${N42_QUAL_EXPECTED_FINALIZER_SHA:?expected finalizer SHA-256 required}"
 harness="$runtime/artifacts/scripts/gov5-interop-qualification.sh"
 qmdb_proof_verifier="$runtime/artifacts/binaries/n42-qmdb-proof-verify"
 gov_version="${N42_QUAL_GOV_VERSION:-906}"
@@ -245,6 +247,7 @@ assert_runtime_identity() {
   local bootstrap_bundle="$runtime/artifacts/bootstrap-bundle.json"
   require_file "$runtime/geth-live"
   require_file "$runtime/n42-node"
+  require_file "$finalizer_script"
   require_file "$harness"
   require_file "$qmdb_proof_verifier"
   require_file "$genesis_artifact"
@@ -254,6 +257,8 @@ assert_runtime_identity() {
   require_file "$p2p_key"
   test "$(shasum -a 256 "$runtime/geth-live" | awk '{print $1}')" = "$expected_gov_sha"
   test "$(shasum -a 256 "$runtime/n42-node" | awk '{print $1}')" = "$expected_rust_sha"
+  test "$(shasum -a 256 "$finalizer_script" | awk '{print $1}')" = \
+    "$expected_finalizer_sha"
   test "$(shasum -a 256 "$harness" | awk '{print $1}')" = \
     "$expected_harness_sha"
   test "$(shasum -a 256 "$qmdb_proof_verifier" | awk '{print $1}')" = \
@@ -524,6 +529,7 @@ jq -nc \
   --arg at "$(date -u +%FT%TZ)" \
   --arg gov_version "$gov_version" \
   --arg runtime "$runtime" \
+  --arg finalizer_sha "$expected_finalizer_sha" \
   --arg genesis_artifact_sha "$expected_genesis_artifact_sha" \
   --arg consensus_config_sha "$expected_consensus_config_sha" \
   --arg bootstrap_bundle_sha "$expected_bootstrap_bundle_sha" \
@@ -558,6 +564,7 @@ jq -nc \
   --slurpfile resources "$resource_audit" '
   {at:$at,event:("gov5_"+$gov_version+"_final_qualification"),status:"PASS",runtime:$runtime,
    acceptanceRelaxed:false,genesisExact:true,binariesExact:true,
+   finalizerScriptSha256:$finalizer_sha,
    genesisArtifactSha256:$genesis_artifact_sha,
    consensusConfigSha256:$consensus_config_sha,
    bootstrapBundleSha256:$bootstrap_bundle_sha,
