@@ -149,6 +149,14 @@ waits for exact six-endpoint canonical identity before beginning its ten-minute
 stability interval and records that rejoin delay. Replacing only the waiting
 finalizer did not restart any node, resource sampler, upstream sampler, or the
 formal zero-transaction monitor.
+Commit `9ac3ce1` promotes the missing-validator recovery check into the reusable
+`audit-timeout-recovery` qualification command and the final PASS controller.
+Its first live invocation observed 65 timeout events: all 64 whose successor
+view was already committed had an exact `view + 1` Rust leader commit with
+`votes=5+5`; the single current timeout was correctly classified as in flight,
+the pacemaker and timeout sets were identical, and every timeout view was seven
+views after the previous one. Empty logs and unavailable consensus status are
+rejected rather than treated as vacuous success.
 
 ## Source and binary identity
 
