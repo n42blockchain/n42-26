@@ -687,3 +687,13 @@ WAL 单调并记录 1,944 KiB compaction；37 个 Gov5 main 精确样本覆盖 2
 里程碑记录 405 次 Rust `5+5`、七验证者 CommitQC、零双签、零交易和空失败流，
 SHA-256 为 `c906d490bff8e62eeb741191cc4d4e9e1b44b9e0609651e56af9e15d18d9ef74`。
 12/18 小时等待器与完整受控闭环继续挂载。
+
+同刻六小时链身份 canary 再次证明 chainId `0x477`、完整固定创世三元组、六端
+当前块身份和 sender nonce `0x11` 均精确一致；客户端仍为 Gov5 5.7.906 与 Reth
+2.4.1。Rust 已记录 406 次唯一 `5+5`，七验证者 CommitQC 存在、零双签；证据
+SHA-256 为 `2db923d8521e310b4cd55af0a7be36a4d56a3a0ff941e5a5a20a7c349a5fd15a`。
+
+六小时只读 archive/QMDB 检查也 PASS：当前高度 95,047 的两份 Gov5 proof 与
+Rust QMDB proof 根和字节一致并离线验真；11 个历史高度再次通过 209 项精确检查，
+六端 pending nonce 仍为 `0x11`。未发送交易或重启节点；证据 SHA-256 为
+`1e4c44543cb8561096d5fcc6f84ac6e33252f2c1116e0d627bd332b2d6849dcc`。

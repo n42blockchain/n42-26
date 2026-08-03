@@ -414,6 +414,20 @@ equivocations, zero transactions, and no failure evidence. Its SHA-256 is
 `c906d490bff8e62eeb741191cc4d4e9e1b44b9e0609651e56af9e15d18d9ef74`.
 The 12- and 18-hour waiters and complete guarded closure remain armed.
 
+The simultaneous six-hour chain-identity canary again verifies chain ID
+`0x477`, the complete pinned genesis hash/state/receipts tuple, all-six live
+block identity, and sender nonce `0x11`. Client versions remain Gov5 5.7.906
+and Reth 2.4.1; Rust has 406 unique `5+5` commits, seven-validator CommitQC,
+and zero equivocations. Its SHA-256 is
+`2db923d8521e310b4cd55af0a7be36a4d56a3a0ff941e5a5a20a7c349a5fd15a`.
+
+The six-hour read-only archive/QMDB checkpoint also passes. At live height
+95,047, two Gov5 proofs and Rust QMDB proofs have identical roots and bytes and
+verify offline. Eleven historical heights again pass 209 exact RPC/proof
+checks; all six pending nonces remain `0x11`. No transaction or restart was
+used. Evidence SHA-256 is
+`1e4c44543cb8561096d5fcc6f84ac6e33252f2c1116e0d627bd332b2d6849dcc`.
+
 Two runtime27 canary dry runs produced no mutation: the controller wait loop
 did not yet continue across slots in which Rust was not the leader. Their
 zero-byte outputs were moved under `excluded/`; the corrected canary and all
