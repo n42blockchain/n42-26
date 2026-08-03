@@ -672,3 +672,10 @@ v2.4.1，tag object `8eb21017...`，两端二进制 SHA 也未漂移。机器证
 并全部精确匹配 `d12257c...`。里程碑记录 342 次 Rust `5+5`、七验证者 CommitQC、
 零双签、零交易和空失败流，SHA-256 为
 `cffb11780ddee8aca95cefdbe2234ede2309e477bdc09523328f118b154b3d68`。
+
+五小时独立不可变日志深审扫描高度 92,624 至 94,664：2,041 个规范块父链连续，
+341 个预期 Rust 轮值在六端精确一致，341/341 日志均为 `5+5`，view stride 和
+hash 顺序精确。343 组 timeout/pacemaker 全部在下一 view 恢复，pending 为零；
+2,794 条 warning 全量归类，未知 warning 与 critical signal 均为零。冻结 Rust
+日志、leader、timeout、runtime-log SHA-256 分别为 `7390709d...3bec`、
+`dfa0365f...eeea`、`6ac00a2a...da71`、`a9c2593d...031c`。

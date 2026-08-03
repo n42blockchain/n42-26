@@ -393,6 +393,15 @@ seven-validator CommitQC, zero equivocations, zero transactions, and no failure
 evidence. Its SHA-256 is
 `cffb11780ddee8aca95cefdbe2234ede2309e477bdc09523328f118b154b3d68`.
 
+The five-hour independent immutable-log audit scans heights 92,624 through
+94,664. All 2,041 blocks are parent-continuous; all 341 expected Rust slots are
+exact at all six endpoints and match 341 `5+5` records with exact view stride
+and hash order. All 343 timeout/pacemaker pairs recover at the next view with
+zero pending. The 2,794 warnings partition exactly into allowed classes, with
+zero unknown warnings or critical signals. The frozen Rust log, leader,
+timeout, and runtime-log SHA-256 values are `7390709d...3bec`,
+`dfa0365f...eeea`, `6ac00a2a...da71`, and `a9c2593d...031c`.
+
 Two runtime27 canary dry runs produced no mutation: the controller wait loop
 did not yet continue across slots in which Rust was not the leader. Their
 zero-byte outputs were moved under `excluded/`; the corrected canary and all
