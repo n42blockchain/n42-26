@@ -8,6 +8,7 @@ expected_self_sha="${N42_LATEST_RETH_EXPECTED_SELF_SHA256:-}"
 latest_binary="${N42_LATEST_RETH_BINARY:-$qualification_dir/n42-node}"
 expected_binary_sha="${N42_LATEST_RETH_BINARY_SHA256:-0a4dbcf30d7cc9944a7cd7c96a25c1ebf862df10bde76210a381ef492e362b9f}"
 expected_reth_commit="${N42_LATEST_RETH_COMMIT:-91725e3aa8f2a0bbc5a425e931a2f2b2f31b2a7b}"
+expected_reth_stable="${N42_LATEST_RETH_STABLE_TAG:-v2.4.1}"
 expected_source_commit="${N42_LATEST_RETH_SOURCE_COMMIT:-}"
 source_repo="${N42_LATEST_RETH_SOURCE_REPO:-/Users/jieliu/Documents/n42/interop-reth-latest-20260802/n42-26}"
 gov_repo="${N42_LATEST_RETH_GOV_REPO:-/Users/jieliu/Documents/n42/live-interop-20260721/N42-gov5-current-main-20260801}"
@@ -176,6 +177,26 @@ assert_gov_source() {
   test "$remote_main" = "$expected_gov_upstream"
 }
 
+assert_latest_reth_stable() {
+  local tags latest attempt
+  for attempt in $(seq 1 6); do
+    if tags="$(git ls-remote --tags https://github.com/paradigmxyz/reth.git \
+      'refs/tags/v*')"; then
+      latest="$(sed -E 's#.*refs/tags/##; s/\^\{\}//' <<<"$tags" |
+        rg -v -- '-(alpha|beta|rc)[.-]' | sort -V | tail -n 1)"
+      test -n "$latest"
+      if test "$latest" != "$expected_reth_stable"; then
+        echo "official Reth stable changed: expected $expected_reth_stable, latest $latest" >&2
+        return 1
+      fi
+      return 0
+    fi
+    sleep 10
+  done
+  echo "official Reth stable tags remained unreachable after six attempts" >&2
+  return 1
+}
+
 assert_static_inputs() {
   local version
   if test -n "$expected_self_sha"; then
@@ -200,6 +221,7 @@ assert_static_inputs() {
     "$expected_genesis_artifact_sha"
   assert_source
   assert_gov_source
+  assert_latest_reth_stable
   assert_genesis
   assert_live_identity
 }
@@ -243,10 +265,12 @@ preflight() {
     --arg binary "$latest_binary" \
     --arg binary_sha256 "$expected_binary_sha" \
     --arg reth_commit "$expected_reth_commit" \
+    --arg stable "$expected_reth_stable" \
     --arg source_commit "$(git -C "$source_repo" rev-parse HEAD)" \
     '{at:$at,event:"latest_reth_rollover_preflight",status:"PASS",
       binary:$binary,binarySha256:$binary_sha256,rethVersion:"2.4.1",
-      rethCommit:$reth_commit,sourceCommit:$source_commit,
+      rethCommit:$reth_commit,officialStableTag:$stable,
+      officialStableTagExact:true,sourceCommit:$source_commit,
       liveSixEndpointIdentityExact:true,genesisExact:true,mutationPerformed:false}'
 }
 
@@ -384,6 +408,7 @@ run_qualification() {
   assert_live_identity
   assert_source
   assert_gov_source
+  assert_latest_reth_stable
   test "$(<"$runtime/pids/rust.pid")" = "$new_pid"
   kill -0 "$new_pid"
   process_command="$(ps -p "$new_pid" -o command=)"
@@ -413,6 +438,7 @@ run_qualification() {
     --arg binary "$latest_binary" \
     --arg binary_sha256 "$expected_binary_sha" \
     --arg reth_commit "$expected_reth_commit" \
+    --arg stable "$expected_reth_stable" \
     --arg version "$version" \
     --arg independent "$independent" \
     --arg independent_sha "$(shasum -a 256 "$independent" | awk '{print $1}')" \
@@ -440,6 +466,7 @@ run_qualification() {
     {at:$at,event:"latest_reth_final_qualification",status:"PASS",
       binary:$binary,binarySha256:$binary_sha256,rethVersion:"2.4.1",
       rethCommit:$reth_commit,versionOutput:$version,
+      officialStableTag:$stable,officialStableTagExact:true,
       sourceAndGovUpstreamStillExact:true,
       strictIndependentVerification:$independent,
       strictIndependentVerificationSha256:$independent_sha,
@@ -457,6 +484,7 @@ run_qualification() {
       genesisExact:true,allSixEndpointsExact:true,latestBinaryStillRunning:true}' \
     >"$summary"
   jq -e '.status == "PASS" and .headGrowth > 0 and
+    .officialStableTag == "v2.4.1" and .officialStableTagExact == true and
     .headAudit.status == "PASS" and .resourceAudit.status == "PASS" and
     .rustLeaderAudit.status == "PASS" and .consensus.hasCommittedQc == true and
     .equivocations.total == 0 and .preRolloverDataSnapshot.byteExact == true' \
