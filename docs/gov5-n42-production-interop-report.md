@@ -2188,3 +2188,34 @@ binary `0a4dbcf3...62b9f`. The armed closure remains transaction-free until the
 complete 86,640-second stream closes, then performs the 17-transaction
 dual-ingress burst, post-burst parity, Rust restart/rejoin, independent strict
 verification, and the additional one-hour official-stable-Reth qualification.
+
+The `65a7682645...` baseline was itself superseded by Gov5 main
+`ddcdaa2f6a...` shortly after runtime21 began. An independent 60-second guard
+detected this before the next ten-minute upstream sample, stopped every
+controller and node, and preserved the run as excluded. The formal stream has
+19 healthy zero-transaction samples over 548 seconds, heights 90,895 through
+90,955, growth 60, and maximum lag zero. Every endpoint still reported latest
+and pending nonce `0x11`. Exclusion evidence SHA-256 is
+`7d7dd40dc2c1140c8abd10497153c60106330de6bc654fc5b2e49971f7ab711a`.
+
+The new upstream commit adds a txpool configuration path and bounded eviction
+for stranded transactions, with dedicated configuration, flag, and queue
+tests. It does not touch genesis or HotStuff. Candidate `673299abf0...` is
+pushed; full Go tests, the complete race suite, and two cold-cache builds pass.
+Both builds produced Gov binary SHA-256
+`f84ac8e9ae49a1abe1af4e46945d3ecc8d8b769655dbfe0808d2043d9cf16ea3`.
+
+runtime22 is a stopped-state clone of runtime21 at exact height/hash
+90,961/`4bd6735b...0fb6`. Its 105-file source and destination manifests are
+byte-identical with SHA-256
+`7d16d977671c940f36345dd81d6c04d1d5ce487d11025ece1c49dd56e2116d9d`.
+Preflight again passes 90 seconds of exact zero-transaction heads with maximum
+lag zero, two canonical Rust leader slots with `5+5`, exact timeout recovery,
+strict log partitioning, CommitQC, zero equivocations, independent source and
+binary checks, and a mutation-free burst preflight at nonce `0x11`.
+
+The runtime22 formal/resource/upstream streams started at
+`2026-08-03T05:14:42Z`, common height 90,991 and lag zero, bound to upstream
+`ddcdaa2f6a...`, candidate `673299abf0...`, Gov binary `f84ac8e9...6ea3`,
+and official stable Reth 2.4.1 binary `0a4dbcf3...62b9f`. As before, no
+transaction is released before the complete strict stream closes.

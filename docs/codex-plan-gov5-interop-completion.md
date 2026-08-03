@@ -447,3 +447,24 @@ lag 0；两次 Rust 轮值均在六端点形成同一规范块并得到 `5+5`，
 正式 formal/resource/upstream 三流于 `2026-08-03T04:51:02Z` 启动，首样本高度
 90,895、lag 0，上游绑定 `65a76826...`；24 小时闭环仍按零交易、burst、重启重入及
 官方稳定 Reth 2.4.1 额外一小时的顺序执行。
+
+---
+
+### T16 — Gov5 ddcdaa current-main 与 runtime22（2026-08-03）
+
+runtime21 启动约九分钟后，独立守卫先于十分钟周期上游监控发现 Gov5 `main` 从
+`65a76826...` 前进到 `ddcdaa2f...`。全部控制进程和节点立即停止；19 个正式样本
+跨度 548 秒，高度 90,895 到 90,955，增长 60 块、最大 lag 0、全程零交易，六端点
+latest/pending nonce 都保持 `0x11`。排除证据 SHA-256 为 `7d7dd40d...711a`。
+
+最新上游增加 txpool 配置文件/CLI 路径和滞留交易驱逐测试，不修改 genesis 或
+HotStuff。合并候选 `673299ab...` 已推送；全量测试、完整 race suite 和两次独立
+冷缓存构建通过，二进制逐字节一致，SHA-256 为 `f84ac8e9...6ea3`。runtime21
+停止数据复制为 runtime22，105 个持久文件清单逐字节一致，清单 SHA-256 为
+`7d16d977...6d9d`。
+
+runtime22 从高度 90,961 的精确 hash/root 恢复；90 秒严格预检、两次 Rust `5+5`
+轮值、timeout 下一视图恢复、日志分区、六端点创世/nonce、CommitQC、零
+equivocation、独立验证器和交易零发送预检全部 PASS。新的 formal/resource/upstream
+三流于 `2026-08-03T05:14:42Z` 启动，首样本高度 90,991、lag 0，上游绑定
+`ddcdaa2f...`。
