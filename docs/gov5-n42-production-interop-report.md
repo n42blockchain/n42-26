@@ -1899,3 +1899,27 @@ were replaced; Rust PID 97040 and monitor PIDs 98287--98290 retained their
 original streams, no node restarted, no transaction was sent, and no elapsed
 time was reset. The rearm evidence SHA-256 is
 `618de069bfc193e3318c49d69d75267ba2559e612f03618faacad67c29cd64f1`.
+
+The strict four-hour immutable milestone passes as well. Its 484 head samples
+span 14,726 seconds, grow from block 87,860 to 89,528, keep continuous zero-
+transaction coverage, and retain maximum lag two. The canonical audit scans
+1,681 blocks through Rust-authored block 89,523
+(`12bd2cdf18c9338935fb4fcdd65cd6e6e279c3357dc4978abd5f0bea069429ab`).
+All 281 expected Rust slots are exact on all six endpoints with continuous
+parents and `votes=5+5`; all 281 completed missing-validator timeouts recover
+at the next view with none pending. Fifty resource samples preserve Rust PID
+97040, stay below 275,536 KiB RSS and 94 descriptors, and retain the bounded
+4 KiB allocation jitter. Twenty-five Gov5 upstream samples remain exact over
+14,421 seconds, and all 2,285 warnings partition with zero unknown or critical
+signals. An independent recheck recomputed every embedded audit and raw-
+snapshot SHA, queried the closing block on all six endpoints, and confirmed
+nonce `0x11` everywhere. The milestone SHA-256 is
+`5eb068c1761eed2178af3bef1ec81372f49f8741d40c33aa9cbcd144f07413d2`.
+
+The first auxiliary four-hour copy ended after timeout view 91,839 but before
+its recovery commit. It was rejected before a milestone could be emitted and
+is retained as excluded diagnostic evidence; it did not affect a node,
+monitor, transaction, or acceptance time. The replacement copy explicitly
+waits for `pendingTimeouts:0` before freezing logs. The exclusion-record
+SHA-256 is
+`defbe6a1d6cfe773ba95823cc5f7e63ea196ae7528319f999559369001de0399`.
