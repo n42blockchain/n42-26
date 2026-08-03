@@ -1938,3 +1938,8 @@ endpoints still returned the explicit 5.7.905-lineage genesis
 port, PID, monitor, transaction, or acceptance time changed. The exclusion
 record SHA-256 is
 `ed6486ca6e6fb7fcff506a6eba1b7a40fe4641dad1432adbe9390e72f1e329ea`.
+The source confirms that urfave/cli exposes version as the global flag rather
+than a command. A subsequent isolated `geth-live --version` exited zero with
+`n42 version 5.7.906-8915b4cc`, created no datadir, and touched no strict
+runtime state. Its evidence SHA-256 is
+`51f406520e095abb156cc952ff65272d4eae2ecbc977a9b9bad7fde7d179acd4`.
