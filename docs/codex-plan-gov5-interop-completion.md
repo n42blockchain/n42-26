@@ -721,3 +721,18 @@ hash 顺序精确。累计 467 组 timeout/pacemaker 全部在下一 view 恢复
 冻结 Rust 日志、leader、timeout、runtime-log SHA-256 分别为
 `366baf19...edf4`、`8086be8c...b9e`、`ce96ce70...efd`、
 `66cd4e49...88f8`。24 小时前仍不发送交易或重启节点。
+
+额外八小时复合里程碑继续在未放宽验收规则下 PASS：953 个 head 样本覆盖
+28,884 秒并增长 3,192 块，最大间隔 31 秒、最大 lag 2、全程零交易；97 个同一
+Rust PID 89930 的资源样本覆盖 28,814 秒，峰值 RSS 276,064 KiB、线程 162、
+FD 93，head/log/QMDB WAL 单调并保留 1,944 KiB compaction 记录；49 个 Gov5
+upstream 样本覆盖 28,844 秒且全部精确匹配 `d12257c...`。里程碑记录 535 次
+Rust `5+5`、七验证者 CommitQC、零双签、零交易和空失败流，SHA-256 为
+`ba9bb4ed1f2800cea120da2e03def11fdd96a0f9d698adb687fc7a6651b51c0e`。
+
+八小时冻结日志增量审计扫描七小时后的 Rust 槽位高度 95,408 至 95,815：68 个
+预期 Rust 规范块在六端精确一致，68/68 均为 `5+5`，父链、view stride 和 hash
+顺序精确。累计 535 组 timeout/pacemaker 全部在下一 view 恢复且 pending 为零；
+4,346 条 warning 全量归类，未知 warning 与 critical signal 均为零。冻结 Rust
+日志、leader、timeout、runtime-log SHA-256 分别为 `d81f611a...4df2`、
+`72a2e549...bb9d`、`aa5cf464...a6de`、`c961ced4...31d1`。
