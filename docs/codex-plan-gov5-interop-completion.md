@@ -588,6 +588,14 @@ Gov5 5.7.906、官方 Reth 2.4.1 和零双签，SHA-256 为 `b2afa7bc...c3b1`。
 以及 log/WAL/head 回退、PID 变化、非正 allocation、过大采样间隔必须 FAIL；脚本
 SHA-256 为 `73822807...f7f`。
 
+完整三小时 canonical leader 深审独立扫描高度 92,624 至 93,841：1,218 个区块
+父链连续，203 个预期 Rust 轮值在六端逐字一致，203/203 日志均为 `5+5`，七 view
+stride 与 hash 顺序精确。同一冻结日志包含 212 组 timeout/pacemaker，全部由下一
+view 的 Rust `5+5` 恢复且 pending 为零；1,732 条 warning 全部精确分类，未知
+warning 与 critical signal 均为零。冻结日志、leader、timeout、runtime-log
+SHA-256 分别为 `4609b765...aac7`、`cd9e2e38...4876`、`8598364e...764b`、
+`6ffb346d...7a18`。
+
 三小时门槛后的只读 archive/QMDB 检查点同样 PASS：当前参考高度 93,871 的两份
 Gov5 account proof 与 Rust QMDB proof root/bytes 完全一致并通过离线验证；从创世到
 5,189 的 11 个固定历史高度完成 209 项 block/receipt/log/state/storage/proof 检查，

@@ -259,6 +259,16 @@ The permanent resource-auditor regression test is executable at
 and rejects log/WAL/head rollback, PID replacement, nonpositive allocation,
 and oversized sample gaps. Its SHA-256 is `73822807...f7f`.
 
+The full three-hour canonical leader audit independently scans heights 92,624
+through 93,841. All 1,218 blocks are parent-continuous; all 203 expected Rust
+slots are byte-identical at the six endpoints and have matching `5+5` log
+entries, exact seven-view stride, and exact hash order. One immutable log tree
+contains 212 timeout/pacemaker pairs, all recovered by Rust `5+5` at the next
+view with zero pending. Its 1,732 warnings partition exactly, with zero unknown
+warnings and zero critical signals. The immutable-log, leader, timeout, and
+runtime-log SHA-256 values are `4609b765...aac7`, `cd9e2e38...4876`,
+`8598364e...764b`, and `6ffb346d...7a18`.
+
 A read-only archive/QMDB checkpoint immediately after the three-hour gate also
 passes. At live reference height 93,871, two Gov5 account proofs and Rust QMDB
 proofs have identical roots and bytes and both verify offline. Eleven fixed
