@@ -268,6 +268,16 @@ about 133 KiB/hour, QMDB WAL about 60 KiB/hour, and consensus allocated data
 does not grow. Evidence SHA-256 is
 `0d4fbf81d5483781ea53f8924b045e88f5a5504eb587ba85137fae978fd49699`.
 
+The five Gov5 processes have a matching 90-minute-side audit. Original PIDs
+70737/70743/70749/70755/70761 all remain alive and unreplaced after about one
+hour 47 minutes of process time. Every node reports `N42/5.7.906`, chain ID
+`0x477`, and common height 93,271 with lag zero; all five Gov endpoints and
+Rust return the same eight-field fixed-block identity and the expected genesis
+hash. Gov RSS ranges from 143,152 to 145,168 KiB, at most 4,832 KiB above the
+one-hour snapshot; threads remain 18–19 and file descriptors exactly 34.
+Evidence SHA-256 is
+`3f5326c45c88cf8d204f21e7af69aa145331a3357af12180162d887cea84989f`.
+
 The superseded runtime27 candidate passed all `internal` and `cmd/n42` tests;
 two consecutive optimized builds were byte-identical. Its pinned Gov binary
 SHA-256 was `72e918d9500169e227ef1a0c9d5dd751dcd7d58f1df0871825b61f196e3fce95`.
