@@ -92,6 +92,14 @@ verifier SHA-256 is `90c2bf05...8a51`, PASS evidence SHA-256 is
 `caf40cea...b3ce`. Deliberately altered transaction hash, chain ID, nonce
 sequence, and ingress-plan artifacts are all rejected.
 
+The 30-minute composite milestone independently froze and re-audited all
+three qualification streams. Heads covered 61 samples / 1,826 seconds / 198
+blocks with max lag two and zero transactions; resources covered seven samples
+/ 1,801 seconds with one PID; Gov5 upstream covered four exact snapshots /
+1,803 seconds. Rust had 37 `5+5` commits, CommitQC was present, equivocations
+were zero, and no failure evidence existed. Milestone evidence SHA-256 is
+`b71a6b466e79c3d2f7a7a56675b0e68a123896bcf1aba7709d1f3b726af1ca29`.
+
 The authoritative zero-transaction stream began at
 `2026-08-03T09:49:44Z`, common height 92,623, lag zero. It requires continuous
 six-endpoint hash/state/receipt equality, zero transactions in every newly
