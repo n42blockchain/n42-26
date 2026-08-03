@@ -1972,3 +1972,17 @@ the fresh preflight evidence SHA-256 is
 `3cad1e790aa3f60e0ba47466542caf9333740164253dd5b3d6469e644d9cae37`.
 No transaction was broadcast, so the zero-transaction qualification window
 continues uninterrupted.
+
+The latest-Reth qualification line was then merged into the primary interop
+branch as `9e5fe3a`. This carries the Reth 2.4.1 lockfile additions, the fresh-
+tree JMT benchmark fixture correction, and the frozen latest-Reth rollover
+driver without changing any live runtime file. A detached validation worktree
+paired that exact merge with Reth `91725e3aa`: `cargo check --workspace
+--all-targets --locked` passed, all 106 `n42-jmt` unit tests and every benchmark
+target passed, package-scoped rustfmt passed, and all four qualification shell
+scripts passed `bash -n`. The old `c533db8` sibling used by the active strict
+node was deliberately left untouched and its dependency graph was not allowed
+to rewrite the 2.4.1 lockfile. After the merge was pushed, the frozen
+independent verifier repeated its complete preflight and again found exact
+sources/remotes, genesis, six-endpoint live identity, CommitQC, zero
+equivocations, and nonce `0x11`, with zero transactions sent.
