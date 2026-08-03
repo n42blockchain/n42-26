@@ -155,6 +155,14 @@ time is 9.81 seconds, and the maximum interval is 40 seconds—well below the
 61-second no-stall threshold even with the configured absent-validator
 timeout cycle. Evidence SHA-256 is `418c4e10...1071`.
 
+The 50-minute resource trend covers 11 samples / 3,001 seconds / 306 blocks
+from the same Rust PID. Threads remain exactly 161 and file descriptors 93;
+RSS increased only 11.5 MiB end-to-end, about 13.8 MiB/hour. Reth allocated
+data grew about 158 KiB/hour, consensus data stayed flat, and QMDB WAL grew
+about 60 KiB/hour. Even a deliberately conservative linear 24-hour RSS
+projection is about 551 MiB, below the frozen 1 GiB limit. Evidence SHA-256 is
+`383e11e3...0991`.
+
 The superseded runtime27 candidate passed all `internal` and `cmd/n42` tests;
 two consecutive optimized builds were byte-identical. Its pinned Gov binary
 SHA-256 was `72e918d9500169e227ef1a0c9d5dd751dcd7d58f1df0871825b61f196e3fce95`.
