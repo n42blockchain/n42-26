@@ -58,6 +58,13 @@ parent chain and the same 19 expected Rust-authored slots. Commit-log views
 95,473 through 95,599 had exact stride seven, hash order, and `5+5` votes;
 checkpoint evidence SHA-256 is
 `b73e59ef86bb72691c6a80d1c0131bfc79ce3846a3bf0fd3dc0c954c0fd65ef2`.
+The same checkpoint froze Rust log SHA-256 `53381bef...0f691` immediately
+after recovery view 95,620. Its independent timeout audit found 24/24 matched
+timeout and pacemaker events at exact stride seven, all recovered in the next
+view by Rust `5+5`, with zero pending timeouts. The frozen-log partition audit
+accounted for all 200 warnings exactly and found zero unexpected warnings or
+critical signals. The timeout and log-audit evidence SHA-256 values are
+`fbc874d6...13c1c` and `ce464745...c3620` respectively.
 
 The authoritative zero-transaction stream began at
 `2026-08-03T09:49:44Z`, common height 92,623, lag zero. It requires continuous
