@@ -2022,3 +2022,18 @@ formal/resource/upstream monitors, finalizer, independent verifier waiter,
 data, elapsed time, and zero-transaction state were unchanged. The controller-
 rearm evidence SHA-256 is
 `73762b7e421af9a35ad5e5a063d187a8277cde7f522936ae82022d02628d3903`.
+
+The latest-Reth closure was then held to the same consensus-log standard as
+the strict binary. Commit `7dc4c1e` makes the one-hour run close on a canonical
+Rust-authored block, requires at least one completed missing-validator timeout
+with zero pending, exact timeout/pacemaker sets, next-view recovery by Rust
+`5+5`, an exact warning partition, and zero unknown warnings or critical
+signals. Both new audits and their SHA-256 values are embedded in the final
+rollover summary and rechecked by its terminal assertion. The replacement
+script SHA-256 is
+`73e900525b3faf9e31a8b26b282cdd2cd53b99448fb58297f094e9247966fc98`;
+its mutation-free live preflight SHA-256 is
+`b3e0dc295641e0a0bea90303314ffe09f3fa3a0fa2d6c8bd36ac6b51fe764ca5`.
+Only the three waiting control processes were rebound again; all strict node
+and evidence-stream PIDs remain unchanged. The rearm evidence SHA-256 is
+`9faffbfb661143f5a0a1d40a01443fd559289503f548b699066dbe738b83c951`.
