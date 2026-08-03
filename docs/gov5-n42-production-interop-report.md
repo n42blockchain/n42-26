@@ -250,6 +250,15 @@ the complete deep scan through 93,218 independently includes this boundary.
 This proves an RPC sampling race rather than a canonical fork. Evidence
 SHA-256 is `d5b3339b1a86def1092d213c538bc0e8e6cfed532e6de20534406993fba5f1a3`.
 
+The 90-minute composite gate subsequently passed. Its 180 head samples span
+5,426 seconds and 552 blocks; the only lag-one row is the same already-closed
+sample above, with no new lag event. Nineteen resource samples span 5,402
+seconds and all bind original Rust PID 70765; peak RSS is 248,256 KiB, threads
+remain 161, and file descriptors 93. Ten reachable Gov5-main samples span
+5,407 seconds and remain exact. Rust has 108 `5+5` commits, CommitQC remains
+present, and equivocations and released transactions remain zero. Milestone
+SHA-256 is `cc440f0759498a1aca0f3022bb5ebb20665fed58ab952e031fa94b747da353cd`.
+
 The superseded runtime27 candidate passed all `internal` and `cmd/n42` tests;
 two consecutive optimized builds were byte-identical. Its pinned Gov binary
 SHA-256 was `72e918d9500169e227ef1a0c9d5dd751dcd7d58f1df0871825b61f196e3fce95`.
