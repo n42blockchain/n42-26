@@ -903,6 +903,11 @@ peer count 为 0，但原 PID 70765 到 Gov 30301–30305 的五条共识 TCP �
 96,432 以 `5+5` 提交；CommitQC 存在、双签为零，committed block 六端身份精确。
 只读证据 SHA-256 为 `ac1234e5...9ab0`。
 
+两小时 archive/QMDB 复核也 PASS：共同高度 93,457 的两份 Gov/Rust reference proof
+在 root 与编码字节上完全一致并通过冻结离线 verifier；创世、bootstrap 边界及高度
+999–5,189 的 11 个历史点共 209 项 RPC/root/proof 检查全部精确。只读证据 SHA-256
+为 `959cb74e...d3af`。
+
 约 80 分钟处再次完整执行只读 archive/QMDB parity：当前共同高度 93,199 的两组
 Gov/Rust proof root 与编码逐字节一致并通过冻结离线验证器；创世到 5,189 的 11 个
 历史高度再次通过全部 RPC/root/proof 检查。证据 SHA-256 为 `03f3de7d...3d57`。

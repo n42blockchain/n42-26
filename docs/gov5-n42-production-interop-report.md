@@ -364,6 +364,13 @@ zero, and the committed block has an exact six-endpoint identity. This audit
 is read-only; evidence SHA-256 is
 `ac1234e5500bc0b61cf485a5802ac75f6e78986a58f4f3b45473aa7822c79ab0`.
 
+The two-hour archive/QMDB repetition passes as well. At common height 93,457,
+both current Gov/Rust reference proofs have exact roots and encoded bytes and
+pass the frozen offline verifier. Eleven historical points spanning genesis,
+the bootstrap boundary, and heights 999 through 5,189 pass all 209 RPC/root/
+proof checks. The operation is read-only; evidence SHA-256 is
+`959cb74ecdcb6d20bba6f07d8f925cf1025188c0175d87f248d958503666d3af`.
+
 The superseded runtime27 candidate passed all `internal` and `cmd/n42` tests;
 two consecutive optimized builds were byte-identical. Its pinned Gov binary
 SHA-256 was `72e918d9500169e227ef1a0c9d5dd751dcd7d58f1df0871825b61f196e3fce95`.
