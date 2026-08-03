@@ -596,6 +596,14 @@ warning 与 critical signal 均为零。冻结日志、leader、timeout、runtim
 SHA-256 分别为 `4609b765...aac7`、`cd9e2e38...4876`、`8598364e...764b`、
 `6ffb346d...7a18`。
 
+三小时依赖交付复核也 PASS：混合客户端组合分支精确为已推送的 `ab058386...`，
+Reth 交付分支精确为已推送的 `91725e3...`，依赖升级分支精确为已推送的
+`aec34a0...`；三者 tracked worktree 均 clean 且远端分支与本地 HEAD 完全一致。
+Gov5 candidate `d0999e7...` 仍绑定 upstream main `d12257c...`，官方最新稳定 Reth
+仍是 v2.4.1 / `8eb21017...`，Gov5/Rust 二进制 SHA-256 仍为 `72e918d9...` /
+`0a4dbcf3...`。机器证据 SHA-256 为
+`9d3fbf70a7725ed906bf37fa873c3b5b73624137ec12c137238b4a93c9d27b54`。
+
 三小时门槛后的只读 archive/QMDB 检查点同样 PASS：当前参考高度 93,871 的两份
 Gov5 account proof 与 Rust QMDB proof root/bytes 完全一致并通过离线验证；从创世到
 5,189 的 11 个固定历史高度完成 209 项 block/receipt/log/state/storage/proof 检查，

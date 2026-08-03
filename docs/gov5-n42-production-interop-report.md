@@ -269,6 +269,16 @@ warnings and zero critical signals. The immutable-log, leader, timeout, and
 runtime-log SHA-256 values are `4609b765...aac7`, `cd9e2e38...4876`,
 `8598364e...764b`, and `6ffb346d...7a18`.
 
+The three-hour dependency-delivery recheck also passes. The pushed mixed-client
+combination branch is exactly `ab058386...`, the pushed Reth delivery branch is
+exactly `91725e3...`, and the pushed dependency-upgrade branch is exactly
+`aec34a0...`; each tracked worktree is clean and each remote branch matches its
+local HEAD. Gov5 candidate `d0999e7...` still tracks upstream main `d12257c...`,
+the official latest stable Reth tag remains v2.4.1 at `8eb21017...`, and the
+Gov5/Rust binary SHA-256 values remain `72e918d9...` and `0a4dbcf3...`.
+Machine evidence SHA-256 is
+`9d3fbf70a7725ed906bf37fa873c3b5b73624137ec12c137238b4a93c9d27b54`.
+
 A read-only archive/QMDB checkpoint immediately after the three-hour gate also
 passes. At live reference height 93,871, two Gov5 account proofs and Rust QMDB
 proofs have identical roots and bytes and both verify offline. Eleven fixed
