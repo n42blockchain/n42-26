@@ -361,6 +361,17 @@ Reth 2.4.1. Rust has 285 unique `5+5` commits, seven-validator CommitQC, and
 zero equivocations. The identity evidence SHA-256 is
 `3e554ff12f4efcc56b501df7640bb01d6e197e9d9423cf69b62f22f26e3142fb`.
 
+The four-hour 905-data boundary recheck also passes. The original copy remains
+bound to identical source and target manifest SHA-256 `1c115b92...37b4b`
+(124 files / 17,316,415,839 bytes). All 24 epoch schedule, network config/key,
+and BLS-keystore files across the six retained Gov data directories still
+match their initial hashes. Genesis, consensus/bootstrap artifacts, validator
+and P2P keys, frozen harness/finalizer/independent/QMDB tools, and both client
+binaries retain their pinned hashes. Live chaindata remains deliberately
+excluded because block production must mutate it. No mutation was performed;
+evidence SHA-256 is
+`4322ede81bd6d5102cad96e94e35ede59d899bafa458178b8dd7347768c47381`.
+
 Two runtime27 canary dry runs produced no mutation: the controller wait loop
 did not yet continue across slots in which Rust was not the leader. Their
 zero-byte outputs were moved under `excluded/`; the corrected canary and all

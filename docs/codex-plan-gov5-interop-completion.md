@@ -650,3 +650,11 @@ hash/state/receipts 三元组和当前块身份均精确一致，sender latest/p
 `0x11`，客户端仍为 Gov5 5.7.906 与官方 Reth 2.4.1。Rust 已记录 285 次唯一
 `5+5` 提交，七验证者 CommitQC 存在且 equivocation 为零；身份检查 SHA-256 为
 `3e554ff12f4efcc56b501df7640bb01d6e197e9d9423cf69b62f22f26e3142fb`。
+
+四小时 905 数据静态边界复核同样 PASS：初始复制仍绑定 124 文件、
+17,316,415,839 bytes 和相同源/目标 manifest SHA `1c115b92...37b4b`；六个 Gov
+数据目录的 24 个 epoch schedule、network config/key、BLS keystore 静态文件均
+与初始 SHA 一致。创世、共识/bootstrap、验证者/P2P 密钥、冻结工具和两端二进制
+也保持锁定值。运行 chaindata 因正常出块必然变化而继续按设计排除；检查未执行
+任何突变，证据 SHA-256 为
+`4322ede81bd6d5102cad96e94e35ede59d899bafa458178b8dd7347768c47381`。
