@@ -354,6 +354,16 @@ Composite and deep-audit SHA-256 values are
 and `e4e87236dfe0e287af92e09f25d342a4456647a9804d7a405b3c7895fe0c61ef`.
 No transaction, restart, process replacement, or data mutation occurred.
 
+A fresh post-two-hour network matrix also passes. Every Gov execution endpoint
+has five devp2p peers. Rust reports zero execution peers as designed, while
+original PID 70765 retains established consensus TCP connections to all five
+Gov ports 30301–30305 and five unique authenticated validator peers. Leader
+view 96,432 sees five connected peers against quorum four, direct-push reaches
+all five, and commits with `5+5`. CommitQC remains present, equivocations are
+zero, and the committed block has an exact six-endpoint identity. This audit
+is read-only; evidence SHA-256 is
+`ac1234e5500bc0b61cf485a5802ac75f6e78986a58f4f3b45473aa7822c79ab0`.
+
 The superseded runtime27 candidate passed all `internal` and `cmd/n42` tests;
 two consecutive optimized builds were byte-identical. Its pinned Gov binary
 SHA-256 was `72e918d9500169e227ef1a0c9d5dd751dcd7d58f1df0871825b61f196e3fce95`.
