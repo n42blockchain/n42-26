@@ -689,6 +689,15 @@ added 25 GiB allowance plus 64 GiB reserve still fits. Caffeinate PID 72825 has
 upstream gate plus 8,400-second final-closure allowance; all three sleep
 assertions remain active. Evidence SHA-256 is `9f7bf2a7...5cc3`.
 
+The four-hour closure linkage then rehashes and cross-binds all four evidence
+families. Composite and six-endpoint raw boundaries are both exactly
+92,696–94,189, covering 1,494 blocks / 249 cycles. Every raw file has 1,494
+rows and identical SHA-256 `f6716c23...c4e1`. Embedded milestone hashes in
+both deep and supplemental evidence equal `18d40534...e4a5`; deep coverage
+extends through 94,196, and the frozen Rust log remains
+`d994013f...9604`. Linkage evidence SHA-256 is `1a04be1f...dd7b` and explicitly
+records that the historical window cannot be altered by the later burst.
+
 The strict 2.5-hour (9,000-second) composite gate passes. Its 299 head
 samples span 9,034 seconds, grow by 924 blocks, retain continuous zero-
 transaction coverage, and have maximum lag one. Thirty-one resource samples
