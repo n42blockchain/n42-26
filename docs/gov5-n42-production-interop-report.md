@@ -96,6 +96,13 @@ post-burst nonce `0x22`, exact six-endpoint latest identity, CommitQC, and zero
 equivocations on the latest-Reth process before emitting its own final PASS.
 Launch evidence SHA-256 is `078089fc...bb6`.
 
+The 30-minute composite milestone passed as well. Its frozen snapshots contain
+65 head samples over 1,940 seconds and 198 blocks with maximum lag zero; seven
+resource samples from the unchanged Rust PID span 1,801 seconds; and four
+reachable, exact Gov5-main samples span 1,802 seconds. Rust has 48 `5+5`
+leader commits, CommitQC remains present, and both equivocations and released
+transactions remain zero. Milestone SHA-256 is `8276dfae...d6ab`.
+
 The superseded runtime27 candidate passed all `internal` and `cmd/n42` tests;
 two consecutive optimized builds were byte-identical. Its pinned Gov binary
 SHA-256 was `72e918d9500169e227ef1a0c9d5dd751dcd7d58f1df0871825b61f196e3fce95`.
