@@ -1158,6 +1158,13 @@ live 身份、创世和 latest/pending nonce `0x11` 全部精确，mutation 为 
 post-exclusion preflight PASS，证据 SHA-256 为 `a6f3ff6f...47de`，独立确认重挂
 waiter 已不再引用旧的辅助 rollover 副本。
 
+`2026-08-03T23:45:25Z` 又执行一次只读 5.7.905 数据审计并 PASS。五个 live Gov
+MDBX 均存在且 `txindex.ranges` 为 0；六端 chain ID `0x477`、创世
+`b71c2810...1392ec`、复制高度 92,605 hash `b88a3571...5a82` 以及
+latest/pending nonce `0x11` 全部精确。固定 main `b8c17d04...` 的 variable-segment
+builder 与 in-memory tail 仍未在实现/测试之外接线，因此继续明确判定无需重新复制或
+生成数据。mutation-free 证据 SHA-256 为 `06a33a4c...5501`。
+
 2.5 小时（9,000 秒）复合门严格 PASS：299 个 head 样本覆盖 9,034 秒，增长 924
 块、最大 lag 1、零交易；原 Rust PID 70765 的 31 个资源样本覆盖 9,004 秒，RSS
 峰值 263,824 KiB、线程最多 163、FD 93；16 个 Gov5 main 样本覆盖 9,012 秒并
