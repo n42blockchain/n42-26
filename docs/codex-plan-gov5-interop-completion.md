@@ -976,6 +976,13 @@ Rust 槽位全部六端精确且日志顺序 `5+5`；172/172 timeout 均在下�
 pending 0。1,383 条 warning 全量归类，unexpected/critical 均为 0；24 个 905
 静态文件再次精确。深审证据 SHA-256 为 `b29b5e2c...eb02`。
 
+2.5 小时 archive/QMDB 与网络矩阵并行复核也 PASS：当前高度 93,649 的两份
+Gov/Rust proof root/bytes 精确并通过离线验证，11 个历史点共 209 项检查全部通过；
+原 Rust PID 70765 仍建立并认证五个 Gov consensus peers，leader quorum 为 5/4、
+direct push 5，view 96,663 以 `5+5` 提交，CommitQC、零双签且 committed block
+六端身份精确。两份只读证据 SHA-256 分别为 `14d50609...3ec8`、
+`66a376f3...0a1a`。
+
 约 80 分钟处再次完整执行只读 archive/QMDB parity：当前共同高度 93,199 的两组
 Gov/Rust proof root 与编码逐字节一致并通过冻结离线验证器；创世到 5,189 的 11 个
 历史高度再次通过全部 RPC/root/proof 检查。证据 SHA-256 为 `03f3de7d...3d57`。

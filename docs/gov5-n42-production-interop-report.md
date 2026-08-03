@@ -476,6 +476,16 @@ unexpected or critical signals, and all 24 immutable 905-lineage files remain
 exact. Deep-audit evidence SHA-256 is
 `b29b5e2c8213afde8819208a7a255f8501e60e2d6058355d8f93c12f559eeb02`.
 
+Parallel 2.5-hour archive/QMDB and network-matrix repetitions also pass. Both
+current proofs at height 93,649 retain exact Gov/Rust roots and bytes and pass
+offline verification; eleven historical points pass all 209 checks. Original
+Rust PID 70765 still has five established and authenticated Gov consensus
+peers, leader quorum is 5/4, direct-push reaches all five, and view 96,663
+commits with `5+5`. CommitQC, zero equivocations, and exact six-endpoint
+committed-block identity remain true. Read-only evidence SHA-256 values are
+`14d50609abd423a9efa21dbdf9c92587c510f31b92c7bdf938da4f67f9f03ec8`
+and `66a376f35049cd9dbbd04d708d10350ddd26ec82d4b9c0e64401cac350f30a1a`.
+
 The superseded runtime27 candidate passed all `internal` and `cmd/n42` tests;
 two consecutive optimized builds were byte-identical. Its pinned Gov binary
 SHA-256 was `72e918d9500169e227ef1a0c9d5dd751dcd7d58f1df0871825b61f196e3fce95`.
