@@ -528,6 +528,15 @@ MDBX files, zero `txindex.ranges`, exact six-endpoint genesis/copied/live
 heads, and no recopy requirement. Main/mixed delivery commits are
 `1c569bf1...ab6f` and `122bf21c...b4c2`.
 
+Final V2 completion auditor SHA-256 `cf73a512...4093` passes preflight and is
+pushed in `40d0e81d...c0b1`. It does not replace the frozen base auditor;
+after base PASS it additionally requires strict-24-hour six-endpoint raw and
+linkage evidence, final 905 data compatibility, and the full 24-hour resource
+trend. It also pins the 17-transaction burst artifact at SHA-256
+`6cf05cd0...d750` and recomputes all six raw sequence hashes and line counts.
+Current output is read-only `completionNotClaimed=true`; final nonce must be
+`0x22`.
+
 The six-hour V2 deep audit has also passed its frozen-source preflight and is
 active as PID 82622 / session 95373. Harness, static rechecker, and immutable
 905 baseline SHA-256 values are `037cc547...5309`, `b27890ad...10ec`, and

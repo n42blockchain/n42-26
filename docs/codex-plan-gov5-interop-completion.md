@@ -1011,6 +1011,12 @@ session 77080 启动。它只等待总目标 PASS，然后在交易突发、Reth
 `txindex.ranges`、六端创世/复制头/live 头精确且无需重复制。主/混合交付提交分别为
 `1c569bf1...ab6f`、`122bf21c...b4c2`。
 
+最终 V2 completion auditor（SHA-256 `cf73a512...4093`）预检 PASS，并在提交
+`40d0e81d...c0b1` 推送。它不替换冻结的基础 auditor，而是在其 PASS 后强制绑定
+strict24h 六端 raw/链接证据、最终 905 数据审计和完整 24 小时资源趋势；同时固定
+17 笔 burst artifact SHA-256 `6cf05cd0...d750`，逐文件重算六份 raw 序列及行数。
+当前只发布 `completionNotClaimed=true` 的只读预检，最终 nonce 必须为 `0x22`。
+
 6 小时 V2 深审计也已通过冻结源预检并启动：harness、静态 rechecker、905 静态基线
 SHA-256 分别为 `037cc547...5309`、`b27890ad...10ec`、
 `6ea80521...203c`；PID 82622 / session 95373 仅等待严格 6 小时复合门，随后闭合
