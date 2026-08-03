@@ -171,6 +171,15 @@ threads remain 161, and file descriptors 93. Seven exact Gov5-main samples
 span 3,605 seconds. Rust has 76 `5+5` commits, CommitQC is present, and
 equivocations remain zero. Milestone SHA-256 is `64c648af...9505`.
 
+The closed one-hour log audit scans canonical heights 92,696–93,068. All six
+endpoints agree on the continuous 373-block parent chain, and all 63 expected
+Rust leader slots match ordered `5+5` commits. Every one of 77
+timeout/pacemaker pairs recovers at the next Rust `5+5` view with zero pending.
+All 624 warnings partition exactly into allowed classes, with zero unknown or
+critical signals. Immutable Rust log, leader, timeout, and runtime-log SHA-256
+values are `f16a27a1...e644`, `5763da46...4a8a`, `40ff2727...97ca`, and
+`e9fb2aca...5410`.
+
 The superseded runtime27 candidate passed all `internal` and `cmd/n42` tests;
 two consecutive optimized builds were byte-identical. Its pinned Gov binary
 SHA-256 was `72e918d9500169e227ef1a0c9d5dd751dcd7d58f1df0871825b61f196e3fce95`.

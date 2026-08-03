@@ -860,3 +860,10 @@ data 约增 158 KiB/小时，consensus data 不变，QMDB WAL 约增 60 KiB/小�
 241,040 KiB、线程 161、FD 93；7 个 Gov5 main 精确样本覆盖 3,605 秒。Rust
 累计 76 次 `5+5`，CommitQC 存在、零双签；里程碑 SHA-256 为
 `64c648af...9505`。
+
+一小时闭合日志深审扫描规范高度 92,696–93,068：六端 373 块父链连续，63 个
+预期 Rust 槽位全部匹配有序 `5+5` 日志。77/77 timeout/pacemaker 均在下一
+Rust `5+5` view 恢复，pending 为零；624 条 warning 精确归入允许类别，未知与
+critical 均为零。冻结 Rust 日志、leader、timeout、runtime-log SHA-256 分别为
+`f16a27a1...e644`、`5763da46...4a8a`、`40ff2727...97ca`、
+`e9fb2aca...5410`。
