@@ -186,6 +186,17 @@ from 140,016 to 141,920 KiB, thread counts from 18 to 19, and every process has
 34 open file descriptors; no Gov process was replaced. Evidence SHA-256 is
 `df9227ed...1906`.
 
+The one-hour static-boundary recheck was recomputed from the original evidence
+rather than copying its verdict. It re-hashed all 24 immutable Gov files, the
+genesis/consensus/bootstrap artifacts, Rust validator and P2P keys, every
+frozen verifier, and the Gov5/Reth binaries. All current hashes remain exact;
+the original 124-file copied-data manifest and entries hashes remain
+`561ed6ad...ce5` and `1c115b92...7b4b`. Advancing chaindata is intentionally
+excluded, and the audit performs no mutation. Evidence SHA-256 is
+`dee51343ac6b82b5f40ed6371783854cf4a87d08fa175c2c125e394803ff929a`.
+The reusable read-only rechecker is
+`scripts/recheck-gov5-runtime-static-boundary.sh`.
+
 The superseded runtime27 candidate passed all `internal` and `cmd/n42` tests;
 two consecutive optimized builds were byte-identical. Its pinned Gov binary
 SHA-256 was `72e918d9500169e227ef1a0c9d5dd751dcd7d58f1df0871825b61f196e3fce95`.

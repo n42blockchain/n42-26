@@ -807,6 +807,12 @@ number/hash/parentHash/stateRoot/receiptsRoot/transactionsRoot/miner/交易数�
 Reth 进程上再次要求 nonce `0x22`、六端实时头精确、CommitQC 和零双签。启动证据
 SHA-256 为 `078089fc...bb6`。
 
+正式运行一小时后再次从初始证据重算静态边界，而不是复用原结论：24 个 Gov 静态
+文件、创世/共识/bootstrap、Rust 验证者与 P2P 密钥、冻结验收工具以及 Gov5/Reth
+二进制全部保持精确；原始 124 文件复制清单仍为 PASS，推进中的 chaindata 按设计
+排除且未发生写操作。证据 SHA-256 为 `dee51343...929a`，可重复复核脚本为
+`scripts/recheck-gov5-runtime-static-boundary.sh`。
+
 三十分钟复合门 PASS：65 个 head 样本覆盖 1,940 秒、增长 198 块、最大 lag 0；
 7 个同 PID 资源样本覆盖 1,801 秒；4 个可达且精确的 Gov5 main 样本覆盖 1,802
 秒。Rust 累计 48 次 `5+5`，CommitQC 仍存在，双签与已发送交易均为零；里程碑
