@@ -11,12 +11,12 @@ are stored in the qualification runtimes named below.
 ## Current 2026-08-03 qualification — latest Gov5 main and latest stable Reth
 
 The authoritative run is now
-`runtime-26-gov5-d09-latest-reth`. It is pinned to Gov5 `origin/main @
-d09b3ad00dc7c52983f7d31e96638723438c9af3`, pushed integration candidate
-`94bb59634f36d3c0e2b817e296162bb3f585cb1b`, and reproducible Gov binary
-SHA-256 `c28907b7426f8a0601b0192b57b1581f67fa4c93aeada9380f170f405fe882ad`.
-The candidate passed the changed RPC, sync, P2P encoder, and txpool packages;
-two consecutive optimized builds were byte-identical. The paired Rust binary
+`runtime-27-gov5-d122-latest-reth`. It is pinned to Gov5 `origin/main @
+d12257c92e9b1e83d35c981441593663db6db72b`, pushed integration candidate
+`d0999e7680bfbba71c252de1dd95efe64736e5f9`, and reproducible Gov binary
+SHA-256 `72e918d9500169e227ef1a0c9d5dd751dcd7d58f1df0871825b61f196e3fce95`.
+The candidate passed all `internal` and `cmd/n42` tests; two consecutive
+optimized builds were byte-identical. The paired Rust binary
 is official-stable Reth 2.4.1 at
 `91725e3aa8f2a0bbc5a425e931a2f2b2f31b2a7b`, combined and pushed at
 `ab05838691e6ec71f5df0faa1d3eefb1fc9d3d9e`, with binary SHA-256
@@ -25,34 +25,35 @@ is official-stable Reth 2.4.1 at
 The repeated Gov5 updates were handled fail-closed. Runtime22 was excluded
 when main moved from `ddcdaa2f6...` to `5afabac1f...`; runtime23 was excluded
 when it moved to `9c821032e...`; runtime24 was excluded when it moved to
-`379046b97...`; and runtime25 completed its mixed-client canary but was
-excluded before formal timing when main moved to `d09b3ad00...`. None of these
+`379046b97...`; runtime25 was excluded when main moved to `d09b3ad00...`; and
+runtime26 was excluded after 731 seconds of healthy formal evidence when main
+moved to `d12257c92...`. None of these
 excluded runs released a transaction. Each exclusion preserves the exact
 six-endpoint head, Rust `5+5` leader evidence, old/new upstream commits, and a
 recoverable stopped data directory.
 
-Runtime26 is an APFS copy-on-write clone of the cleanly stopped runtime25
-state. A full source-versus-target content pass compared all 123 persistent
-Gov/Rust files, totaling 17,316,195,842 bytes; both canonical manifests hash
-to `61dde959387dc00a5c2841b5ad7addf581a2225bcca08322f00901e24c61ce30`.
+Runtime27 is an APFS copy-on-write clone of the cleanly stopped runtime26
+state. A full source-versus-target content pass compared all 124 persistent
+Gov/Rust files, totaling 17,316,415,839 bytes; both canonical manifests hash
+to `1c115b9226bbc303092ae893fa7c0b86a50fae8080adb49e2e7746339be37b4b`.
 The JSON evidence SHA-256 is
-`86afbab51bed27f7ca8eae8d2a0e6dec4d9dd53955e13559c4c41a3246e4e90f`.
+`50433f934a854e24206e023bb2e9dcb4e398dc60c62afd9d76a0dd39aefe132f`.
 The copied genesis artifact remains byte-exact at
 `561808693c76b356e51f8f5961304e68f3167943c17145bda056612041dca687`;
 all six RPC endpoints return genesis
 `b71c28109836f120453d097c38819a55b14c49abcc92713037fb9b11201392ec`.
 
 The current-main canary passed with exact heads, roots, and receipts across
-five Gov nodes and one Rust node. Rust authored views 95,305 and 95,312 with
+five Gov nodes and one Rust node. Rust authored views 95,452 and 95,459 with
 full `5+5` votes, CommitQC was present for all seven configured validators,
 and equivocation evidence was empty. The canary evidence SHA-256 is
-`14389c5e8b606460712a14d59f4997c130400640d1176c16996ad335ecd7933b`.
+`1d79bd4ea045b89994ea69574da66c229ec17a0aaf73b491d3fe0a7dc673379b`.
 Mutation-free burst, strict-independent, latest-Reth rollover, and
 latest-Reth-independent preflights all passed at sender nonce `0x11` with zero
 transactions sent.
 
 The authoritative zero-transaction stream began at
-`2026-08-03T09:28:14Z`, common height 92,515, lag zero. It requires continuous
+`2026-08-03T09:49:44Z`, common height 92,623, lag zero. It requires continuous
 six-endpoint hash/state/receipt equality, zero transactions in every newly
 observed block, maximum lag six, 86,400 seconds of elapsed samples, continuous
 Gov5-main and official-Reth-stable pins, and bounded Rust resources. Exact-PID
@@ -66,7 +67,7 @@ re-execution. Only then may the additional one-hour latest-stable-Reth run and
 its independent verifier begin. No final acceptance is claimed before the
 atomic total-goal verifier passes.
 
-Two runtime26 controller dry runs produced no mutation: the first canary
+Two runtime27 controller dry runs produced no mutation: the first canary
 wait-loop revision exited before its second Rust slot, and the first strict
 verifier invocation referenced the wrong dependency-worktree date. Their
 zero-byte outputs were moved under `excluded/`; the corrected canary and

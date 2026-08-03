@@ -468,3 +468,33 @@ runtime22 从高度 90,961 的精确 hash/root 恢复；90 秒严格预检、两
 equivocation、独立验证器和交易零发送预检全部 PASS。新的 formal/resource/upstream
 三流于 `2026-08-03T05:14:42Z` 启动，首样本高度 90,991、lag 0，上游绑定
 `ddcdaa2f...`。
+
+---
+
+### T17 — Gov5 连续更新、runtime23–27 与 d12257 current-main（2026-08-03）
+
+Gov5 `main` 随后连续推进到 `5afabac1...`、`9c821032...`、`379046b97...`、
+`d09b3ad00...` 和 `d12257c92...`。每次变化都由独立上游守卫 fail-closed 检出；
+runtime22–26 均保留停止态数据、六端点精确头、Rust `5+5` 轮值和零交易 nonce 证据，
+没有把旧 main 上的运行时长计入当前资格。runtime26 在排除前积累了 25 个严格样本、
+731 秒、增长 84 块、最大 lag 0，排除证据 SHA-256 为
+`a9c8a5235828aec83ec50f78e3ae40eec541087b5e64aa2ecebf586a98386419`。
+
+当前候选 `d0999e7680bfbba71c252de1dd95efe64736e5f9` 合并
+`d12257c92e9b1e83d35c981441593663db6db72b` 并已推送。全量
+`go test ./internal/... ./cmd/n42/...` 通过，两次独立构建逐字节一致，Gov binary
+SHA-256 为 `72e918d9...e3fce95`。runtime27 从 runtime26 的停止态 905 血统数据
+复制；124 个文件、17,316,415,839 bytes 的源/目标内容清单完全一致，canonical
+manifest SHA-256 为 `1c115b92...37b4b`。创世 artifact 仍为
+`56180869...a687`，六端点创世 hash 仍为 `b71c2810...1392ec`，没有误用 906
+空目录内置的不同创世。
+
+runtime27 canary 的六端点 hash/stateRoot/receiptsRoot 精确一致；Rust 在 views
+95,452 和 95,459 出块并获得 `5+5`，七验证者 CommitQC 存在且 equivocation 为零。
+交易、严格独立验证器、最新 Reth rollover 和最新 Reth 独立验证器四项预检均 PASS，
+sender latest/pending nonce 保持 `0x11`，发送数为零。正式三流从
+`2026-08-03T09:49:44Z` 重新计时，首高度 92,623、lag 0；最终器、不可变日志门、
+两级独立验证器、官方稳定 Reth 监控、精确 PID 守卫以及 1/3/6/12/18 小时里程碑均已
+挂载。严格 24 小时通过后才执行 17 笔交易、archive/QMDB、burst 后 10 分钟、Rust
+重启重入 10 分钟；其后才执行官方稳定 Reth 2.4.1 (`91725e3aa...`) 的额外一小时
+验证。总目标只能由原子最终验证器关闭。

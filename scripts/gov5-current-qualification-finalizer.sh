@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-runtime="${N42_QUAL_RUNTIME:-/Users/jieliu/Documents/n42/live-interop-20260721/runtime-26-gov5-d09-latest-reth}"
+runtime="${N42_QUAL_RUNTIME:-/Users/jieliu/Documents/n42/live-interop-20260721/runtime-27-gov5-d122-latest-reth}"
 finalizer_script="${BASH_SOURCE[0]}"
 expected_finalizer_sha="${N42_QUAL_EXPECTED_FINALIZER_SHA:?expected finalizer SHA-256 required}"
 harness="$runtime/artifacts/scripts/gov5-interop-qualification.sh"
@@ -40,13 +40,13 @@ expected_consensus_config_sha="38cd3fb1f57e5e3053e23de836b7c98e542ccb5375d0521a6
 expected_bootstrap_bundle_sha="35dda59684e7f56978e5d8de385fa2d2bf15b47747388b88a7449ac31387bf15"
 expected_harness_sha="6b95241f06fbf2225e9dff8a9bd4534ac5c1363f6f62109883695ebf7db189ab"
 expected_qmdb_verifier_sha="b329baa1e51435082b2bb2cf538a8d1a1ffd994b5c4ac73474e688ffbfc35c19"
-expected_gov_sha="${N42_QUAL_EXPECTED_GOV_SHA:-c28907b7426f8a0601b0192b57b1581f67fa4c93aeada9380f170f405fe882ad}"
+expected_gov_sha="${N42_QUAL_EXPECTED_GOV_SHA:-72e918d9500169e227ef1a0c9d5dd751dcd7d58f1df0871825b61f196e3fce95}"
 expected_rust_sha="${N42_QUAL_EXPECTED_RUST_SHA:-0a4dbcf30d7cc9944a7cd7c96a25c1ebf862df10bde76210a381ef492e362b9f}"
 frozen_validator_key_dir="$runtime/artifacts/validator-keys/node0"
 expected_validator_key_sha="babd0b3550da7702230d3da9a3f00bfce741ed9f1fb8210b702c6023080ea509"
 expected_p2p_key_sha="d82561e312fbb044f56eec5f434f03ea1e852924f055a8949ea82be9e7bbe277"
-expected_gov_upstream_sha="${N42_QUAL_EXPECTED_GOV_UPSTREAM_SHA:-d09b3ad00dc7c52983f7d31e96638723438c9af3}"
-expected_gov_candidate_sha="${N42_QUAL_EXPECTED_GOV_CANDIDATE_SHA:-94bb59634f36d3c0e2b817e296162bb3f585cb1b}"
+expected_gov_upstream_sha="${N42_QUAL_EXPECTED_GOV_UPSTREAM_SHA:-d12257c92e9b1e83d35c981441593663db6db72b}"
+expected_gov_candidate_sha="${N42_QUAL_EXPECTED_GOV_CANDIDATE_SHA:-d0999e7680bfbba71c252de1dd95efe64736e5f9}"
 gov_repo="${N42_QUAL_GOV_REPO:-/Users/jieliu/Documents/n42/live-interop-20260721/N42-gov5-current-main-20260803}"
 
 mkdir -p "$runtime/evidence"
