@@ -511,16 +511,18 @@ To preserve the running total verifier's launch-time source commitment, the
 mixed working directory now tracks the pushed
 `qualification/runtime28-combo-ab058` branch; both HEAD and upstream are exact
 at pinned `ab058386...3d9e`. Updated delivery branch
-`feat/gov5-n42-live-interop-reth-latest` retains `810cc934...0c4d` and advances
-to `809db3bea451233fd19cb6e59cf0e0b46c9e5c81`.
+`feat/gov5-n42-live-interop-reth-latest` retains `810cc934...0c4d` and
+`809db3be...5c81`, and advances to
+`ee22f8df1b5d6bf0103096a1bfd8ef38a17c3227`.
 After a complete 60-second fail-closed cycle, total verifier PID 83205 remains
 alive with no failure evidence. Qualification reproducibility and new-tool
 delivery are therefore both retained.
 
 Updated delivery also has an independent local worktree at
 `/Users/jieliu/Documents/n42/interop-reth-latest-20260802/n42-26-delivery-latest`.
-Its HEAD/upstream are exact at `809db3be...5c81`, which adds the supplemental
-waiter on top of `810cc934...0c4d`. SHA-256 values for the 905 data auditor,
+Its HEAD/upstream are exact at `ee22f8df...3227`; the branch adds the
+supplemental waiter above `810cc934...0c4d` and the final completion waiter
+above `809db3be...5c81`. SHA-256 values for the 905 data auditor,
 final 905 waiter, and resource-trend auditor are respectively
 `5bb09bb1...9a67`, `183b7901...08b3`, and `f6c5c495...bb80`. The qualification
 directory remains pinned at `ab058386...3d9e`; neither worktree changes the
@@ -629,6 +631,16 @@ six-endpoint identity, 17-item burst artifact `6cf05cd0...d750`, nonce `0x11`,
 and empty failure streams while explicitly retaining
 `completionNotClaimed=true` and mutation-free status. Combined preflight
 evidence SHA-256 is `a327662e...d06b`.
+
+Commit `171baf79...01af` adds the final completion waiter and synchronizes it
+to mixed delivery commit `ee22f8df...3227`. Frozen script SHA-256 is
+`47c41aae...1b69`. After the final 905 data audit passes at nonce `0x22`, the
+waiter automatically and resumably runs base completion followed by V2
+completion. Its 60-second fail-closed loop pins live nodes, Gov5 main, all
+three auditor hashes, and every failure stream without changing chain state
+early. Frozen preflight passes with evidence SHA-256 `8ea5a15d...224a`.
+Production PID 28426 / session 15009 remains alive after a complete cycle with
+no failure evidence, removing manual triggering from the last two audits.
 
 The strict 2.5-hour (9,000-second) composite gate passes. Its 299 head
 samples span 9,034 seconds, grow by 924 blocks, retain continuous zero-
