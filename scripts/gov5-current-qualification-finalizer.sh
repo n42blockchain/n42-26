@@ -97,12 +97,22 @@ wait_for_rpc() {
   return 1
 }
 
-wait_for_rust_authored_head() {
-  local _ block
+wait_for_timeout_recovery_close() {
+  local _ recent timeout_view recovery_view committed_view recovery_line
   for _ in $(seq 1 1200); do
-    block="$(rpc "$rust_port" eth_getBlockByNumber '["latest",false]' | jq -ec '.result')"
-    if test "$(jq -r '.miner | ascii_downcase' <<<"$block")" = "$rust_miner"; then
-      return 0
+    recent="$(tail -n 2000 "$runtime/logs/rust.log")"
+    timeout_view="$(sed -E -n \
+      's/.*view timed out view=([0-9]+)$/\1/p' <<<"$recent" | tail -n 1)"
+    if [[ "$timeout_view" =~ ^[0-9]+$ ]]; then
+      recovery_view=$((timeout_view + 1))
+      committed_view="$(rpc "$rust_port" n42_consensusStatus '[]' |
+        jq -er '.result.latestCommittedView')"
+      recovery_line="$(rg -F "block committed! view=$recovery_view " \
+        <<<"$recent" | tail -n 1 || true)"
+      if test "$committed_view" -ge "$recovery_view" &&
+        [[ "$recovery_line" == *"votes=5+5" ]]; then
+        return 0
+      fi
     fi
     sleep 0.25
   done
@@ -409,12 +419,13 @@ jq -e -s '
     .qmdbProofRootExact == true and .qmdbProofOfflineVerified == true)) | length) == 11
 ' "$archive_post_burst" >/dev/null
 
-# Begin the restart immediately after a Rust-authored commit, leaving the
-# largest possible part of the six-height leader cycle for graceful shutdown
-# and persisted-state recovery.
+# Begin the restart only after the latest missing-validator timeout has its
+# canonical Rust 5+5 recovery commit. Requiring that Rust block to remain the
+# RPC latest head is racy because all five Gov blocks can follow in less than
+# the polling interval.
 assert_runtime_identity
 assert_genesis
-wait_for_rust_authored_head
+wait_for_timeout_recovery_close
 assert_live_identity
 pre_restart_pid="$(<"$runtime/pids/rust.pid")"
 pre_restart_head_hex="$(rpc "$rust_port" eth_blockNumber '[]' | jq -er '.result')"
@@ -479,9 +490,9 @@ jq -nc \
     rpcRecoverySeconds:$rpc_recovery_seconds,
     consensusAfter:$consensus,equivocations:$equivocations}' >>"$restart_evidence"
 
-# Close the final evidence at a Rust-authored recovery point so the summary
-# contains no timeout that is merely waiting for its successor view.
-wait_for_rust_authored_head
+# Close the final evidence only after the latest timeout's Rust 5+5 recovery,
+# so the summary contains no timeout waiting for its successor view.
+wait_for_timeout_recovery_close
 
 # Freeze one log tree and use that exact immutable Rust log for all three
 # final log-dependent audits. The live log continues growing while resource
