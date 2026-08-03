@@ -823,3 +823,8 @@ timeout/pacemaker 均在下一 view 由 Rust `5+5` 恢复，pending 为零；435
 全量归类，未知与 critical 均为零。冻结 Rust 日志、leader、timeout、runtime-log
 SHA-256 分别为 `cc519e7e...1d4f`、`513f8e01...21a2`、
 `90432cd5...360f`、`30c7d65e...f180`。
+
+正式生产者分布审计另扫高度 92,696–92,947 的 252 个连续块：Rust 与五个 Gov
+出块地址各自产生 42 块，完全均衡，父链连续且无交易。六个在线 leader 槽位精确，
+配置中的第七个缺席验证者由上述 timeout 恢复路径处理；证据 SHA-256 为
+`80028a25...72c1`。

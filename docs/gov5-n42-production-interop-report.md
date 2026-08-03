@@ -120,6 +120,13 @@ log, leader audit, timeout audit, and runtime-log audit SHA-256 values are
 `cc519e7e...1d4f`, `513f8e01...21a2`, `90432cd5...360f`, and
 `30c7d65e...f180`.
 
+The formal producer-distribution audit independently scans 252 consecutive
+blocks at heights 92,696–92,947. Rust and each of the five Gov producers
+authored exactly 42 blocks, with a continuous parent chain and no
+transactions. This exact balance confirms the six active leader slots while
+the configured seventh, absent validator is handled by the already-verified
+timeout recovery path. Evidence SHA-256 is `80028a25...72c1`.
+
 The superseded runtime27 candidate passed all `internal` and `cmd/n42` tests;
 two consecutive optimized builds were byte-identical. Its pinned Gov binary
 SHA-256 was `72e918d9500169e227ef1a0c9d5dd751dcd7d58f1df0871825b61f196e3fce95`.
