@@ -484,6 +484,14 @@ SHA-256 values are
 `e289e5292eb16ad3c32e99185c53a14a6437e1ded3746ca1afcf28a8bf04fa7f`
 and `2e6ca52ca2c0f7ec0a8b8b207d9c519493ee7418f7ed31133cbf0e56cd3e3201`.
 
+The new Rust resource-trend audit passes over the three-hour window. Its 39
+same-PID samples span 11,405 seconds and grow by 1,176 blocks. RSS OLS slope is
+10.57 MiB/hour; conservatively extending that positive slope to 24 hours gives
+486,153 KiB, below the 1,048,576 KiB limit. Threads peak at 163, descriptors
+stay exactly 93, Reth data grows only 404 KiB, and consensus data grows zero.
+Script/evidence SHA-256 values are `f6c5c495...bb80` and `a264d76f...ae98`;
+main/mixed delivery commits are `c5b6673b...087c` and `810cc934...0c4d`.
+
 The frozen copied-boundary verifier passes another post-three-hour preflight.
 It re-executes all seven historical boundaries: genesis remains
 `b71c2810...1392ec`, copied 905 persisted head 92,605 remains
