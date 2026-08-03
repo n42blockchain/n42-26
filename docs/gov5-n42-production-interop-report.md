@@ -728,6 +728,15 @@ performed. The post-exclusion preflight is PASS at SHA-256
 `a6f3ff6f...47de`, independently confirming that the rearmed waiter no longer
 references the stale auxiliary rollover copy.
 
+A fresh read-only 5.7.905 data audit at `2026-08-03T23:45:25Z` also remains
+PASS. All five live Gov MDBX databases are present and contain zero
+`txindex.ranges`; all six endpoints report chain ID `0x477`, genesis
+`b71c2810...1392ec`, copied height 92,605 hash `b88a3571...5a82`, and
+latest/pending nonce `0x11`. The variable-segment builder and in-memory tail
+remain unwired outside their implementations/tests at pinned main
+`b8c17d04...`, so data recopy or regeneration is still not required. The
+mutation-free evidence SHA-256 is `06a33a4c...5501`.
+
 The strict 2.5-hour (9,000-second) composite gate passes. Its 299 head
 samples span 9,034 seconds, grow by 924 blocks, retain continuous zero-
 transaction coverage, and have maximum lag one. Thirty-one resource samples
