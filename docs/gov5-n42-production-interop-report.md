@@ -2061,7 +2061,14 @@ passes with nonce `0x11`. The verifier SHA-256 is
 `ec8fec33a48e9d523fed37180c3d60f84d7cfc7d792b633cd9936bad8ad15164`;
 the preflight SHA-256 is
 `42c5c71810ad3ebc2d20a0b9916540f8d327b38d1d8419503c29961d3596c49d`.
-An independent waiter, PID 18901, will publish its result atomically after the
-rollover summary; the replacement guard now requires that independent PASS.
-The launch evidence SHA-256 is
+The initial waiter launch evidence SHA-256 is
 `b9ee3d7c21101412a3f83f942a305022d02f44efae7f483aeeb8a78ef6925b6d`.
+Because committing the verifier itself advanced the exact latest-Reth source
+from `7dc4c1e` to `de17452`, the final controller chain was rebound once more:
+rollover waiter PID 19541, independent verifier waiter PID 19545, guard PID
+19551, and six-hour waiter PID 19560. The verifier publishes atomically only
+after the rollover summary, and the guard now closes only on that independent
+PASS. No final artifact existed before this rebind, and no node, evidence
+stream, elapsed time, or transaction state changed. The final rebind evidence
+SHA-256 is
+`5ee20165e86b248b60b41028a6cd7fcb5a22f41a7782b97dff7de07c91dec1ed`.
