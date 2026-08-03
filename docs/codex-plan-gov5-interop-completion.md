@@ -664,3 +664,11 @@ hash/state/receipts 三元组和当前块身份均精确一致，sender latest/p
 candidate `d0999e7...` / upstream main `d12257c...`；官方最新稳定 Reth 仍为
 v2.4.1，tag object `8eb21017...`，两端二进制 SHA 也未漂移。机器证据 SHA-256
 为 `5b7eb21ebc003aafb71ff3b11b105fae4d10aab790047c0d1326cdfef8db6cbe`。
+
+额外五小时复合里程碑在未放宽规则下 PASS：595 个 head 样本覆盖 18,031 秒并
+增长 2,034 块，最大间隔 31 秒、最大 lag 2、全程零交易；61 个同 PID 资源样本
+覆盖 18,009 秒，峰值 RSS 275,616 KiB、线程 162、FD 93，head/log/QMDB WAL
+单调且保留 1,944 KiB compaction 记录；31 个 Gov5 upstream 样本覆盖 18,029 秒
+并全部精确匹配 `d12257c...`。里程碑记录 342 次 Rust `5+5`、七验证者 CommitQC、
+零双签、零交易和空失败流，SHA-256 为
+`cffb11780ddee8aca95cefdbe2234ede2309e477bdc09523328f118b154b3d68`。

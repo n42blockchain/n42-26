@@ -381,6 +381,18 @@ the official latest stable Reth release remains v2.4.1 at tag object
 SHA-256 is
 `5b7eb21ebc003aafb71ff3b11b105fae4d10aab790047c0d1326cdfef8db6cbe`.
 
+The additional five-hour composite milestone passes without relaxing any
+acceptance rule. Its 595 head samples span 18,031 seconds and grow 2,034 blocks
+from height 92,623 to 94,657, with a 31-second maximum gap, maximum lag two,
+and continuous zero-transaction coverage. Sixty-one same-PID resource samples
+span 18,009 seconds; peak RSS is 275,616 KiB, thread and descriptor maxima are
+162 and 93, and head/log/QMDB WAL remain monotonic while retaining the observed
+1,944-KiB compaction. Thirty-one Gov5-upstream samples span 18,029 seconds and
+all equal `d12257c...`. The milestone records 342 Rust `5+5` commits,
+seven-validator CommitQC, zero equivocations, zero transactions, and no failure
+evidence. Its SHA-256 is
+`cffb11780ddee8aca95cefdbe2234ede2309e477bdc09523328f118b154b3d68`.
+
 Two runtime27 canary dry runs produced no mutation: the controller wait loop
 did not yet continue across slots in which Rust was not the leader. Their
 zero-byte outputs were moved under `excluded/`; the corrected canary and all
