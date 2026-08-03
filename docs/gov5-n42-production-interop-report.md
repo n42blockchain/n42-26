@@ -1943,3 +1943,16 @@ than a command. A subsequent isolated `geth-live --version` exited zero with
 `n42 version 5.7.906-8915b4cc`, created no datadir, and touched no strict
 runtime state. Its evidence SHA-256 is
 `51f406520e095abb156cc952ff65272d4eae2ecbc977a9b9bad7fde7d179acd4`.
+
+After the immutable four-hour milestone, the frozen transaction-burst harness
+was run once more in preflight-only mode. All six endpoints still report sender
+nonce `0x11`; the harness accepted the exact pinned artifact and recorded zero
+transactions sent. A separate offline check then confirmed 17 entries, chain
+ID 1143, contiguous nonces 17--33, alternating Rust/Gov intended ingress, one
+deployment followed by 16 value transfers, and a matching Keccak hash for
+every raw transaction. The artifact remains SHA-256
+`6cf05cd0cfb4059c3000f589b9e77c74aa6bc14fcf8ea6b8465f9de8e63dd750`;
+the fresh preflight evidence SHA-256 is
+`3cad1e790aa3f60e0ba47466542caf9333740164253dd5b3d6469e644d9cae37`.
+No transaction was broadcast, so the zero-transaction qualification window
+continues uninterrupted.
