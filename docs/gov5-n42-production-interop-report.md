@@ -492,6 +492,15 @@ stay exactly 93, Reth data grows only 404 KiB, and consensus data grows zero.
 Script/evidence SHA-256 values are `f6c5c495...bb80` and `a264d76f...ae98`;
 main/mixed delivery commits are `c5b6673b...087c` and `810cc934...0c4d`.
 
+To preserve the running total verifier's launch-time source commitment, the
+mixed working directory now tracks the pushed
+`qualification/runtime28-combo-ab058` branch; both HEAD and upstream are exact
+at pinned `ab058386...3d9e`. Updated delivery branch
+`feat/gov5-n42-live-interop-reth-latest` still retains `810cc934...0c4d`.
+After a complete 60-second fail-closed cycle, total verifier PID 83205 remains
+alive with no failure evidence. Qualification reproducibility and new-tool
+delivery are therefore both retained.
+
 The frozen copied-boundary verifier passes another post-three-hour preflight.
 It re-executes all seven historical boundaries: genesis remains
 `b71c2810...1392ec`, copied 905 persisted head 92,605 remains
