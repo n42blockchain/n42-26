@@ -828,3 +828,8 @@ SHA-256 分别为 `cc519e7e...1d4f`、`513f8e01...21a2`、
 出块地址各自产生 42 块，完全均衡，父链连续且无交易。六个在线 leader 槽位精确，
 配置中的第七个缺席验证者由上述 timeout 恢复路径处理；证据 SHA-256 为
 `80028a25...72c1`。
+
+共同头推进到 92,953 后重复执行 archive/QMDB 只读审计也 PASS：2 份当前
+reference proof 在 Gov/Rust 间 root 与 bytes 精确并通过固定离线验证器；11 个历史
+高度各自的 19 项 RPC/root/proof 检查全部一致，覆盖创世与 bootstrap 边界。证据
+SHA-256 为 `3d1ab47e...4ff9`。
