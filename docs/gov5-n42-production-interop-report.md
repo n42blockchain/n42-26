@@ -303,6 +303,17 @@ the same full identity on all six endpoints. Evidence SHA-256 is
 Reusable post-restart checker `scripts/audit-gov5-mixed-network-matrix.sh`
 has SHA-256 `955580f2...c533`.
 
+That checker is now part of a separate final post-rollover gate. Pushed commit
+`3093cc7f...8c5f` adds a frozen verifier that waits for the atomic total-goal
+PASS (including the additional latest-Reth hour), then dynamically binds the
+new Rust PID and re-runs the complete socket/authentication/quorum/direct-push/
+`5+5`/CommitQC/equivocation/committed-block matrix. It additionally requires
+both latest and pending nonce `0x22` on all six endpoints before publishing.
+Verifier SHA-256 is `be0471b4...c809`; its frozen mutation-free preflight at
+nonce `0x11` has SHA-256 `f8a6529c...d729`. Persistent waiter PID 94851 is
+armed. This gate sends no transaction and does not alter the existing atomic
+total verifier or copied-boundary verifier.
+
 The superseded runtime27 candidate passed all `internal` and `cmd/n42` tests;
 two consecutive optimized builds were byte-identical. Its pinned Gov binary
 SHA-256 was `72e918d9500169e227ef1a0c9d5dd751dcd7d58f1df0871825b61f196e3fce95`.

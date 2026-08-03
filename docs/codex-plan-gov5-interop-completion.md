@@ -866,6 +866,13 @@ CommitQC、零双签，status committed hash 在六端反查完整身份一致�
 为 `7e7df6e0...1f8d`；可在 Reth 重启后复用的审计器为
 `scripts/audit-gov5-mixed-network-matrix.sh`。
 
+提交 `3093cc7f...8c5f` 又增加最终 post-rollover 网络门 PID 94851。它等待含最新
+Reth 附加一小时的原子总验收 PASS 后，动态绑定新 Rust PID 并重新执行 socket、认证
+validator peers、quorum/direct push、`5+5`、CommitQC、零双签与 committed block
+六端反查，同时要求六端 latest/pending nonce 均为 `0x22`。冻结验证器 SHA-256 为
+`be0471b4...c809`，nonce `0x11` mutation-free 预检 SHA-256 为
+`f8a6529c...d729`。该门不发送交易，也不改变已有总验收与复制边界门。
+
 约 80 分钟处再次完整执行只读 archive/QMDB parity：当前共同高度 93,199 的两组
 Gov/Rust proof root 与编码逐字节一致并通过冻结离线验证器；创世到 5,189 的 11 个
 历史高度再次通过全部 RPC/root/proof 检查。证据 SHA-256 为 `03f3de7d...3d57`。
