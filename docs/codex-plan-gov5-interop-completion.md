@@ -644,3 +644,9 @@ Gov5 account proof 与 Rust QMDB proof 根和字节精确一致并通过离线�
 两次仅包装层的诊断已置于 `excluded/`：一次误拼 verifier 环境变量并在输出前失败，
 一次误把实际的 1 条 live proof 加 11 条历史记录断言为总计 11 条；正确绑定的证据
 仅生成一次，并以 1+11 schema 原地复核通过。
+
+同刻四小时链身份 canary 再次证明六端 chainId `0x477`、完整固定创世
+hash/state/receipts 三元组和当前块身份均精确一致，sender latest/pending nonce 均为
+`0x11`，客户端仍为 Gov5 5.7.906 与官方 Reth 2.4.1。Rust 已记录 285 次唯一
+`5+5` 提交，七验证者 CommitQC 存在且 equivocation 为零；身份检查 SHA-256 为
+`3e554ff12f4efcc56b501df7640bb01d6e197e9d9423cf69b62f22f26e3142fb`。

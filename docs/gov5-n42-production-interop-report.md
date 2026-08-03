@@ -352,6 +352,15 @@ mistakenly expected 11 total records instead of the harness's one live proof
 record plus 11 historical records. The correctly bound evidence was validated
 in place and was neither appended nor regenerated.
 
+The simultaneous four-hour chain-identity canary again verifies chain ID
+`0x477`, genesis hash `b71c2810...1392ec`, genesis state root
+`91a450c1...9941`, and empty genesis receipts root `56e81f17...b421` at all
+six endpoints. Their live block identity is also exact, both sender nonce
+queries remain `0x11`, and client versions remain Gov5 5.7.906 and official
+Reth 2.4.1. Rust has 285 unique `5+5` commits, seven-validator CommitQC, and
+zero equivocations. The identity evidence SHA-256 is
+`3e554ff12f4efcc56b501df7640bb01d6e197e9d9423cf69b62f22f26e3142fb`.
+
 Two runtime27 canary dry runs produced no mutation: the controller wait loop
 did not yet continue across slots in which Rust was not the leader. Their
 zero-byte outputs were moved under `excluded/`; the corrected canary and all
