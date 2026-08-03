@@ -163,6 +163,46 @@ Gov5 5.7.906 clients, official Reth 2.4.1, CommitQC, 110 observed Rust `5+5`
 commits, and zero equivocations. Checkpoint SHA-256 is
 `3dd0de1c0956375119c1e1a812bd21aab2b0bbb6c0c5962e3a2c550d63442d43`.
 
+The optional two-hour milestone then exposed a resource-auditor semantics
+bug, not a node or consensus failure. `du -sk` measures allocated filesystem
+blocks: while the same Rust PID advanced normally, consensus allocation moved
+from 87,400 to 85,532 and then 87,580 KiB during compaction. Head, log bytes,
+QMDB WAL, all resource ceilings, six-endpoint identity, and the end-to-end
+allocation change remained healthy. The old auditor nevertheless rejected
+the 1,868-KiB transient decrease because it treated allocated blocks as a
+logical monotonic counter with a four-KiB tolerance. That first optional
+snapshot and failure are preserved under
+`excluded/runtime27-resource-compaction-auditor-controller-rearm/` and do not
+disqualify the uninterrupted authoritative streams.
+
+The corrected auditor permits nonnegative allocated-block measurements to
+decrease during compaction, explicitly reports maximum Reth and consensus
+step decreases, and still strictly requires one PID, monotonic head/log/WAL,
+bounded sample gaps, head growth, and the RSS/thread/descriptor ceilings. A
+synthetic 1,868-KiB compaction passes, while a synthetic logical log-byte
+decrease fails; the real frozen resource snapshot also passes. The updated
+harness, finalizer, and independent-verifier SHA-256 values are
+`037cc547...5309`, `e116089d...f9c0`, and `39b11db6...102d`. Both mutation-free
+preflights passed at nonce `0x11`; their SHA-256 values are
+`b08efb69...2005` and `7e320726...d0cf`.
+
+Only waiting controllers were rebound. All six node PIDs, all three formal
+monitor PIDs, the official-Reth monitor, monitor PID guardian, and caffeinate
+remained unchanged; no transaction, restart, chain mutation, or elapsed-time
+reset occurred. The new exact-PID guardian is PASS and the strict independent
+waiter is again held by the immutable gate. Rearm evidence SHA-256 is
+`f534f806afd21948569cdbaec69f4fb406e1b4d2836bce8ec7a8e918355a285c`.
+
+The corrected two-hour composite milestone passes independently. Heads cover
+254 samples / 7,690 seconds / 864 blocks with maximum lag two and continuous
+zero transactions. Resources cover 26 samples / 7,504 seconds from Rust PID
+89930, with maximum RSS 261,344 KiB, 162 threads, 93 descriptors, monotonic
+head/log/WAL, and the explicitly reported 1,868-KiB consensus compaction.
+Thirteen Gov5-upstream samples span 7,210 seconds and remain exact at
+`d12257c92...`. Rust has 148 `5+5` commits, CommitQC is present, and
+equivocations and failure evidence are zero. Milestone SHA-256 is
+`ce33a8b268acb8a85e0b16b1f0b492c6c76c26fc4922dc08b91abf6cb9cf9806`.
+
 The authoritative zero-transaction stream began at
 `2026-08-03T09:49:44Z`, common height 92,623, lag zero. It requires continuous
 six-endpoint hash/state/receipt equality, zero transactions in every newly

@@ -535,3 +535,20 @@ chainId、完整 genesis hash/state/receipts roots、sender latest/pending nonce
 `0x477`、完整创世三元组、nonce `0x11`、六端同头、Gov5 5.7.906、Reth 2.4.1、
 CommitQC、110 次 Rust `5+5` 和零 equivocation；证据 SHA-256 为
 `3dd0de1c0956375119c1e1a812bd21aab2b0bbb6c0c5962e3a2c550d63442d43`。
+
+可选 2 小时里程碑暴露的是资源审计语义问题，而非节点或共识失败：同一 Rust PID
+持续推进时，`du -sk` 的 consensus 已分配块因 compaction 从 87,400 降至 85,532，
+随后恢复到 87,580 KiB；head、log bytes、QMDB WAL、资源上限和六端链身份始终正常。
+旧审计器错误地把 allocated blocks 当作仅允许 4 KiB 波动的逻辑单调计数器。修复后
+允许非负 allocated-block 测量随 compaction 下降并显式记录最大下降，同时继续严格要求
+单一 PID、head/log/WAL 单调、采样间隔、链增长和 RSS/thread/FD 上限。1,868 KiB
+合成 compaction 与实网快照均 PASS，合成 log-byte 回退仍 FAIL。
+
+新 harness/finalizer/独立 verifier SHA-256 分别为 `037cc547...5309`、
+`e116089d...f9c0`、`39b11db6...102d`，两项零突变 preflight 在 nonce `0x11`
+通过。只替换了等待控制器；六节点、三正式 monitor、Reth stable monitor、monitor guardian
+和 caffeinate PID 均未变化，正式流未重启、未发交易。重绑证据 SHA-256 为
+`f534f806...a285c`。修复后的 2 小时里程碑为 254 head 样本 / 7,690 秒 / 增长 864
+块 / 最大 lag 2 / 零交易，26 个同 PID 资源样本 / 7,504 秒，13 个精确 Gov5 upstream
+样本 / 7,210 秒，148 次 Rust `5+5`、CommitQC、零 equivocation；里程碑 SHA-256
+为 `ce33a8b268acb8a85e0b16b1f0b492c6c76c26fc4922dc08b91abf6cb9cf9806`。
