@@ -56,7 +56,7 @@ done
 test "$exact" = true
 
 for _ in $(seq 1 180); do
-  rg 'block committed! view=.*votes=5\+5' "$runtime/logs/rust.log" |
+  (rg 'block committed! view=.*votes=5\+5' "$runtime/logs/rust.log" || true) |
     jq -Rc 'capture("view=(?<view>[0-9]+) block_hash=(?<hash>0x[0-9a-f]{64}).*votes=(?<votes>[0-9]+[+][0-9]+)") |
       {view:(.view|tonumber),hash,votes}' |
     jq -sc 'unique_by(.view) | sort_by(.view)' >"$work_dir/rust-leaders.json"
