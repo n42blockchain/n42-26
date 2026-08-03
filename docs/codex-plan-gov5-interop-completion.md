@@ -1095,6 +1095,13 @@ SHA-256 仍为 `b87aa985...b3f0`、`cf73a512...4093`。两项最新 preflight �
 28426 / session 15009 跨过完整周期后仍存活且失败证据为空，因此最终两道审计不再
 依赖人工触发。
 
+接近 4 小时进程运行点的只读 archive/QMDB 重复审计再次 PASS：当前高度 94,105
+的两份 Gov/Rust proof root、bytes 精确且通过冻结离线验证器，11 个历史点全部
+RPC/root/proof 一致，共 12 个事件；证据 SHA-256 为 `44f3ffa1...5ccb`。同刻静态
+边界 recheck 重新计算 24 个 905 不变文件、创世/共识/bootstrap 工件、验证者与
+P2P 密钥、冻结 harness/finalizer/independent/QMDB/total 工具及 Gov/Rust 二进制，
+全部保持初始 SHA；证据 SHA-256 为 `b03e479c...ab64`。
+
 2.5 小时（9,000 秒）复合门严格 PASS：299 个 head 样本覆盖 9,034 秒，增长 924
 块、最大 lag 1、零交易；原 Rust PID 70765 的 31 个资源样本覆盖 9,004 秒，RSS
 峰值 263,824 KiB、线程最多 163、FD 93；16 个 Gov5 main 样本覆盖 9,012 秒并

@@ -642,6 +642,16 @@ early. Frozen preflight passes with evidence SHA-256 `8ea5a15d...224a`.
 Production PID 28426 / session 15009 remains alive after a complete cycle with
 no failure evidence, removing manual triggering from the last two audits.
 
+A read-only archive/QMDB repetition near four hours of process uptime also
+passes. At current height 94,105 both Gov/Rust proof roots and bytes are exact
+and pass the frozen offline verifier; all eleven historical points retain exact
+RPC/root/proof parity across twelve events. Evidence SHA-256 is
+`44f3ffa1...5ccb`. The simultaneous static-boundary recheck recomputes all 24
+immutable 905 files, genesis/consensus/bootstrap artifacts, validator and P2P
+keys, frozen harness/finalizer/independent/QMDB/total tools, and both Gov/Rust
+binaries. Every initial SHA remains exact; evidence SHA-256 is
+`b03e479c...ab64`.
+
 The strict 2.5-hour (9,000-second) composite gate passes. Its 299 head
 samples span 9,034 seconds, grow by 924 blocks, retain continuous zero-
 transaction coverage, and have maximum lag one. Thirty-one resource samples
