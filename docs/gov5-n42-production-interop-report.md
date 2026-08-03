@@ -149,6 +149,12 @@ the next formal Rust slot at height 92,696. All four checkpoint hashes were
 re-read identically from all six RPC endpoints. Evidence SHA-256 is
 `586d04fe...4676`.
 
+The formal block-cadence audit scans 301 continuous blocks over 2,942 block
+timestamp seconds. Timestamps are strictly increasing, average inter-block
+time is 9.81 seconds, and the maximum interval is 40 seconds—well below the
+61-second no-stall threshold even with the configured absent-validator
+timeout cycle. Evidence SHA-256 is `418c4e10...1071`.
+
 The superseded runtime27 candidate passed all `internal` and `cmd/n42` tests;
 two consecutive optimized builds were byte-identical. Its pinned Gov binary
 SHA-256 was `72e918d9500169e227ef1a0c9d5dd751dcd7d58f1df0871825b61f196e3fce95`.
