@@ -259,6 +259,14 @@ The permanent resource-auditor regression test is executable at
 and rejects log/WAL/head rollback, PID replacement, nonpositive allocation,
 and oversized sample gaps. Its SHA-256 is `73822807...f7f`.
 
+A read-only archive/QMDB checkpoint immediately after the three-hour gate also
+passes. At live reference height 93,871, two Gov5 account proofs and Rust QMDB
+proofs have identical roots and bytes and both verify offline. Eleven fixed
+historical heights from genesis through 5,189 pass 209 block, receipt, log,
+state, storage, and proof checks with exact Gov5/Rust RPC results. All six
+pending nonces remain `0x11`, and the checkpoint sends no transaction. Its
+SHA-256 is `c9336afeb6958cddb2f60f9017c43a242a56f042cbd7cbd822f1b499585ba4be`.
+
 The authoritative zero-transaction stream began at
 `2026-08-03T09:49:44Z`, common height 92,623, lag zero. It requires continuous
 six-endpoint hash/state/receipt equality, zero transactions in every newly

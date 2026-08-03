@@ -587,3 +587,9 @@ Gov5 5.7.906、官方 Reth 2.4.1 和零双签，SHA-256 为 `b2afa7bc...c3b1`。
 永久资源审计回归脚本 `scripts/test-gov5-resource-auditor.sh` 已覆盖 compaction PASS，
 以及 log/WAL/head 回退、PID 变化、非正 allocation、过大采样间隔必须 FAIL；脚本
 SHA-256 为 `73822807...f7f`。
+
+三小时门槛后的只读 archive/QMDB 检查点同样 PASS：当前参考高度 93,871 的两份
+Gov5 account proof 与 Rust QMDB proof root/bytes 完全一致并通过离线验证；从创世到
+5,189 的 11 个固定历史高度完成 209 项 block/receipt/log/state/storage/proof 检查，
+Gov5/Rust RPC 全部精确。六端 pending nonce 仍为 `0x11`，未发送交易；证据
+SHA-256 为 `c9336afeb6958cddb2f60f9017c43a242a56f042cbd7cbd822f1b499585ba4be`。
