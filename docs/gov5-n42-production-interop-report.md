@@ -2072,3 +2072,44 @@ PASS. No final artifact existed before this rebind, and no node, evidence
 stream, elapsed time, or transaction state changed. The final rebind evidence
 SHA-256 is
 `5ee20165e86b248b60b41028a6cd7fcb5a22f41a7782b97dff7de07c91dec1ed`.
+
+The strict six-hour milestone passed without relaxing any acceptance rule.
+Across 711 samples and 21,625 seconds the six clients grew from height 87,860
+to 90,266, with maximum lag two and continuous zero-transaction verification.
+The complete canonical scan covered 2,419 blocks and 404 Rust leader slots;
+every Rust-authored block was exact on all six endpoints and every matching
+commit carried `5+5`. All 405 missing-validator timeouts recovered at the next
+view with none pending. Rust remained the original PID 97040, with maximum RSS
+275,536 KiB, 162 threads, and 94 file descriptors. All 3,290 warnings
+partitioned into the expected sets, with zero unknown warnings or critical
+signals. The milestone closed on Rust-authored block 90,261, hash
+`0xe04ee81ba022fcf7ca95d9de39364b5d84c833577ff8f14a0a7a1b54bc253131`,
+canonical by number on every endpoint. Its SHA-256 is
+`2eb92366dd6cdd71233d01fba47a28dabfb70ae2d5af0868b36b604e6bcc20f9`.
+An independent re-execution recomputed all evidence hashes and audits. It
+normalized only audit timestamps, copied snapshot paths, and the live
+`latestCommittedView` read from the still-advancing chain; every frozen-log
+timeout and recovery field remained exact. Its compact evidence SHA-256 is
+`dc4751f8dea5fddae45fc4c4a9cb547a0075052d2e034149df7e88e30e830926`.
+
+That independent recheck exposed a control-plane false-negative risk in the
+latest-Reth final verifier: its timeout audit reads `latestCommittedView` from
+the live chain, so the value can legitimately advance between rollover
+summary creation and independent re-execution. Commit `ab05838` now compares
+all frozen timeout/recovery fields exactly while normalizing only the audit
+timestamp and this live watermark. The frozen verifier SHA-256 is
+`5d0836afe7d23433f785e78e76693edfe99cc84100d08e00948663850a046e22`.
+Its mutation-free preflight, bound to full source commit
+`ab05838691e6ec71f5df0faa1d3eefb1fc9d3d9e`, again passed official stable
+Reth `v2.4.1`, genesis, six-endpoint identity, and both nonce views at `0x11`;
+the preflight evidence SHA-256 is
+`c1d4895dc5c5ef9cbd6064dea44b6f0d0b425819cf0a39a5a06f0e3a551bc17b`.
+Only the already-waiting latest control processes were replaced: rollover
+waiter PID 54563, independent verifier waiter PID 54574, and guard PID 54775.
+The strict finalizer, strict verifier, resource sentinel, five Gov nodes, Rust
+PID 97040, official-stable monitor, chain data, elapsed evidence, and
+transaction state were unchanged. At rebind, all six endpoints were exact at
+height 90,332 with hash
+`0xd6ea22cd3b9c4cc4b32d1bbdb520d0810ba481f2499ebd641ee2fa0fe20d0fe3`.
+The rebind evidence SHA-256 is
+`65b0e17c07a4c893769619a3156aae96465d96434f36cd7fe8b82f58db07a758`.
