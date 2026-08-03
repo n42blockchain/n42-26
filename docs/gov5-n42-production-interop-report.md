@@ -2048,3 +2048,20 @@ view with none pending. Rust remains PID 97040 below the resource limits, and
 all 2,796 warnings partition exactly with zero unknown or critical signals.
 The compact readiness evidence SHA-256 is
 `40b684ff6c3c1da7bdc16067f0441c104133d5a58fa50ef293b7d8e522613bbe`.
+
+The latest-Reth final result is no longer trusted solely because its rollover
+driver self-checks. Commit `de17452` adds a frozen independent verifier that
+recomputes every summary evidence SHA, compares every embedded audit with its
+source, re-executes the one-hour head, resource, Rust-leader, timeout, and
+runtime-log audits, compares the stopped-data snapshot manifests, and rechecks
+the official stable tag, both source branches and remotes, Gov candidate/main,
+the running binary/PID, six live endpoint identities and genesis, and both
+`latest` and `pending` final nonce `0x22`. Its current mutation-free preflight
+passes with nonce `0x11`. The verifier SHA-256 is
+`ec8fec33a48e9d523fed37180c3d60f84d7cfc7d792b633cd9936bad8ad15164`;
+the preflight SHA-256 is
+`42c5c71810ad3ebc2d20a0b9916540f8d327b38d1d8419503c29961d3596c49d`.
+An independent waiter, PID 18901, will publish its result atomically after the
+rollover summary; the replacement guard now requires that independent PASS.
+The launch evidence SHA-256 is
+`b9ee3d7c21101412a3f83f942a305022d02f44efae7f483aeeb8a78ef6925b6d`.
