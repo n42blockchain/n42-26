@@ -604,6 +604,17 @@ six-endpoint exact, so no recopy or regeneration is needed. Read-only evidence
 SHA-256 values are `2388c016...10b2` and `eb6e25a3...4371`. The independent
 post-burst final audit still requires nonce `0x22`.
 
+The frozen resource-trend audit over the same pre-gate window covers 44 samples
+from original Rust PID 70765, 12,906 seconds, and 1,338 blocks. RSS OLS slope is
+10.41 MiB/hour and the conservative 24-hour projection is 484,412 KiB, below
+the 1 GiB limit; threads peak at 163 and descriptors remain 93. Evidence
+SHA-256 is `5f9cd9e2...cb59`. A new six-endpoint raw rotation segment covers
+heights 93,956–94,033: 78 blocks form 13 complete cycles, with Rust and Gov1
+through Gov5 each producing 13 blocks and all endpoint sequence SHA-256 values
+equal to `952ddac5...662e`. Its first parent exactly links to the prior segment's
+height-93,955 terminal hash `ea374f94...c06a`; composite evidence SHA-256 is
+`3fa0d9a2...4788`.
+
 The strict 2.5-hour (9,000-second) composite gate passes. Its 299 head
 samples span 9,034 seconds, grow by 924 blocks, retain continuous zero-
 transaction coverage, and have maximum lag one. Thirty-one resource samples
