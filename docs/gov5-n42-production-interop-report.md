@@ -338,6 +338,22 @@ block is also exact on all six endpoints at nonce `0x11`. Static and composite
 evidence SHA-256 values are `1588df47...32e1` and
 `64428199aad56c35ab1d852d76c34629f87fbcd887b700cfe22e7f7433b8bf23`.
 
+The strict two-hour composite milestone and its V2 closed-range deep audit
+both pass without relaxed acceptance. The 240 head samples span 7,245 seconds,
+advance from height 92,695 to 93,433 by 738 blocks, retain continuous zero-
+transaction coverage, and have maximum lag one. Twenty-five resource samples
+retain original Rust PID 70765 for 7,203 seconds; RSS peaks at 248,256 KiB,
+threads at 163, and file descriptors remain 93. All 13 Gov5-upstream samples
+remain exact. The deep audit scans canonical heights 92,696–93,434: all 739
+blocks are exact on six endpoints, all 124 Rust leader slots match ordered
+`5+5` commits, all 138 timeouts recover at the immediately following view with
+zero pending, and all 1,113 warnings partition with zero unexpected or
+critical signals. The 24 immutable 905-lineage files also re-hash exactly.
+Composite and deep-audit SHA-256 values are
+`0a4f2057596b690999c07ee6898153bf97eaca54229a22a5c889b7bd48d1b314`
+and `e4e87236dfe0e287af92e09f25d342a4456647a9804d7a405b3c7895fe0c61ef`.
+No transaction, restart, process replacement, or data mutation occurred.
+
 The superseded runtime27 candidate passed all `internal` and `cmd/n42` tests;
 two consecutive optimized builds were byte-identical. Its pinned Gov binary
 SHA-256 was `72e918d9500169e227ef1a0c9d5dd751dcd7d58f1df0871825b61f196e3fce95`.
