@@ -771,3 +771,9 @@ Reth stable 均被独立持续监控。最终器 mutation-free preflight 在六�
 正常完成 86,640 秒时误判退出，并提前终止仍需运行到 87,000 秒的 resource/upstream。
 该短流已隔离；修正后的 wrapper 会把成功完成的 monitor 托管到最终关闭。节点、链数据、
 最终器和 nonce 均未重启或改变，正式时长仅从上述新起点计算。
+
+修正流十分钟复合里程碑 PASS：22 个 head 样本覆盖 637 秒并增长 66 块，最大
+lag 0、全程零交易；3 个同一 Rust PID 资源样本覆盖 600 秒；2 个 Gov5 main
+精确样本覆盖 601 秒。Rust 累计 26 次 `5+5`，CommitQC 存在、零双签；里程碑
+SHA-256 为 `723db1a6...fd29`。只读 archive/QMDB 初检也通过 1 个当前 reference
+proof 和 11 个历史高度的精确 Gov/Rust 对比，证据 SHA-256 为 `6b814b2f...ce1`。

@@ -46,6 +46,14 @@ resource/upstream tails early. The corrected wrappers keep each successful
 monitor supervised through final closure; nodes, chain data, finalizer, and
 nonce were not restarted or changed.
 
+The corrected stream's ten-minute composite milestone passed without relaxed
+criteria: 22 head samples span 637 seconds and 66 blocks with maximum lag
+zero and continuous zero-transaction coverage; three same-PID resource
+samples span 600 seconds; and two Gov5-main snapshots span 601 seconds and
+both equal `b8c17d046...`. Rust recorded 26 `5+5` leader commits, CommitQC is
+present, and equivocation evidence remains empty. Milestone SHA-256 is
+`723db1a6b77d4b2276b55c65edd2e309085b60741f04e08fe3ff09f93ac8fd29`.
+
 The superseded runtime27 candidate passed all `internal` and `cmd/n42` tests;
 two consecutive optimized builds were byte-identical. Its pinned Gov binary
 SHA-256 was `72e918d9500169e227ef1a0c9d5dd751dcd7d58f1df0871825b61f196e3fce95`.
