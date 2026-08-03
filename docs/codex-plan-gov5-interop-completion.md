@@ -873,6 +873,13 @@ validator peers、quorum/direct push、`5+5`、CommitQC、零双签与 committed
 `be0471b4...c809`，nonce `0x11` mutation-free 预检 SHA-256 为
 `f8a6529c...d729`。该门不发送交易，也不改变已有总验收与复制边界门。
 
+超过 100 分钟后再次执行 905 数据谱系审计：正式流 6,366 秒、增长 648 块时，五个
+Gov datadir 仍均无 `txindex.ranges` 和 migration marker，未发生破坏性迁移；每节点
+分配空间相比早期兼容截面仅增 24 KiB。24 个静态 Gov 文件仍精确；创世、复制持久头
+92,605 前后及全部 7 个边界高度再次六端一致，创世仍为 `b71c2810...1392ec`，复制头
+仍为 `b88a3571...5a82`。静态与复合证据 SHA-256 分别为 `1588df47...32e1`、
+`64428199...bf23`。
+
 约 80 分钟处再次完整执行只读 archive/QMDB parity：当前共同高度 93,199 的两组
 Gov/Rust proof root 与编码逐字节一致并通过冻结离线验证器；创世到 5,189 的 11 个
 历史高度再次通过全部 RPC/root/proof 检查。证据 SHA-256 为 `03f3de7d...3d57`。

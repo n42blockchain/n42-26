@@ -314,6 +314,18 @@ nonce `0x11` has SHA-256 `f8a6529c...d729`. Persistent waiter PID 94851 is
 armed. This gate sends no transaction and does not alter the existing atomic
 total verifier or copied-boundary verifier.
 
+A post-100-minute 905-data lineage recheck passed after 6,366 formal seconds
+and 648 new blocks. All five Gov datadirs still contain zero
+`txindex.ranges` and zero migration markers; no destructive migration was
+performed, while allocated size increased by only 24 KiB per node from the
+earlier compatibility snapshot. All 24 immutable Gov files remain exact. The
+audit re-executes the seven six-endpoint historical identities from genesis
+through the 92,605 copied persisted head and live boundaries; genesis remains
+`b71c2810...1392ec` and copied head remains `b88a3571...5a82`. A current fixed
+block is also exact on all six endpoints at nonce `0x11`. Static and composite
+evidence SHA-256 values are `1588df47...32e1` and
+`64428199aad56c35ab1d852d76c34629f87fbcd887b700cfe22e7f7433b8bf23`.
+
 The superseded runtime27 candidate passed all `internal` and `cmd/n42` tests;
 two consecutive optimized builds were byte-identical. Its pinned Gov binary
 SHA-256 was `72e918d9500169e227ef1a0c9d5dd751dcd7d58f1df0871825b61f196e3fce95`.
