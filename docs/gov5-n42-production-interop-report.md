@@ -2005,3 +2005,20 @@ after one non-exact sample, while six consecutive simulated remote failures
 exit 43 after six fail-closed samples; neither path silently falls back. Their
 combined evidence SHA-256 is
 `7fe94fef59efb50e3f715dfb756682a1505df4f94cefe5089a8421ceb77432c7`.
+
+A follow-up control-path audit found that the rollover itself asserted the
+pinned 2.4.1 binary at start and end but did not independently re-query the
+official stable tag immediately before writing its final PASS. Commit
+`bc30868` closes that gap: official tags are checked during preflight and again
+after the one-hour run, remote lookup receives six bounded retries, and both
+the preflight and final summary bind `officialStableTag:v2.4.1` plus an exact
+boolean. The frozen replacement script SHA-256 is
+`488e6523ed7af0eabedd26d1a5b65e79d7db77e102528522beffadf73f5c0fd0`;
+its exact-source/live-chain preflight SHA-256 is
+`20789a9f359b7b5eae42d6e9ec4da83a4109952eb251e47804be6cdd57c0b23f`.
+Only the still-waiting latest-Reth waiter, its guard, and the not-yet-emitted
+six-hour milestone waiter were rebound. Rust PID 97040, all five Gov nodes,
+formal/resource/upstream monitors, finalizer, independent verifier waiter,
+data, elapsed time, and zero-transaction state were unchanged. The controller-
+rearm evidence SHA-256 is
+`73762b7e421af9a35ad5e5a063d187a8277cde7f522936ae82022d02628d3903`.
