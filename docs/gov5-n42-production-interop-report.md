@@ -78,6 +78,16 @@ consensus/bootstrap, Rust validator/P2P keys, frozen tools, and both client
 binaries retain their expected hashes; advancing chaindata is explicitly and
 correctly excluded. Evidence SHA-256 is `6ea80521...203c`.
 
+A second read-only block-identity audit targets the copied-data execution
+boundary itself. All six endpoints agree on every selected canonical field at
+genesis, bootstrap checkpoint 29, copied persisted head 92,605 and its
+immediate predecessor/successor, initial archive head 92,677, and live common
+height 92,857. In particular, copied head 92,605 remains
+`b88a3571...5a82`, its parent link is exact on all clients, and the next block
+is the expected Rust-authored block. The audit compares number, block and
+parent hashes, state/receipts/transaction roots, miner, and transaction count;
+evidence SHA-256 is `04f58aef...2e82`.
+
 The superseded runtime27 candidate passed all `internal` and `cmd/n42` tests;
 two consecutive optimized builds were byte-identical. Its pinned Gov binary
 SHA-256 was `72e918d9500169e227ef1a0c9d5dd751dcd7d58f1df0871825b61f196e3fce95`.

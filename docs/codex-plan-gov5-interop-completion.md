@@ -795,3 +795,9 @@ lag 0、连续零交易；5 个同 PID 资源样本覆盖 1,200 秒；3 个 Gov5
 config/key 和 BLS keystore，全部与初始 124 文件复制清单精确一致。创世、共识/
 bootstrap、Rust 验证者/P2P 密钥、冻结工具与两端 binary 哈希也保持锁定；正常推进的
 chaindata 明确排除。证据 SHA-256 为 `6ea80521...203c`。
+
+随后又对复制执行边界做了只读块身份复核：六端在创世、bootstrap 高度 29、复制态
+持久头 92,605 及其前后块、初始 archive 头 92,677 和实时共同高度 92,857 上，
+number/hash/parentHash/stateRoot/receiptsRoot/transactionsRoot/miner/交易数均逐项
+一致。复制头仍为 `b88a3571...5a82`，其后一块由 Rust 按轮值产生；证据 SHA-256
+为 `04f58aef...2e82`。
