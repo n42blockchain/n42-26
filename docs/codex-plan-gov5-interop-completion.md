@@ -948,6 +948,11 @@ number/hash/parent/state/receipts/transactions root/miner/txCount 序列 SHA-256
 PASS 后它按里程碑 `endHeight` 向下闭合到完整六槽轮次，调用冻结审计器并原子保存
 六端 raw JSONL。启动证据 SHA-256 为 `d3097c9b...642d`，未修改节点或交易状态。
 
+同一冻结工具又为 6/8/12/18 小时门分别启动 PID 4853/4854/4856/4861（sessions
+9868/40880/94311/7904）。四份预检均确认目标门尚未出现、节点存活和失败流为空；
+每个 waiter 只消费自己的复合门并写入独立 JSON/raw 目录。合并启动证据 SHA-256 为
+`e4bc03f4...d3ab`，全程 mutation-free。
+
 约 80 分钟处再次完整执行只读 archive/QMDB parity：当前共同高度 93,199 的两组
 Gov/Rust proof root 与编码逐字节一致并通过冻结离线验证器；创世到 5,189 的 11 个
 历史高度再次通过全部 RPC/root/proof 检查。证据 SHA-256 为 `03f3de7d...3d57`。

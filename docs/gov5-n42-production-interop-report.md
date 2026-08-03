@@ -435,6 +435,13 @@ now waits for the three-hour composite PASS, closes its `endHeight` down to a
 full six-slot boundary, and atomically retains all six raw sequences. Launch
 evidence SHA-256 is `d3097c9b...642d`; it changes no node or transaction state.
 
+The same frozen tooling now waits independently at six, eight, twelve, and
+eighteen hours as PIDs 4853/4854/4856/4861 (sessions
+9868/40880/94311/7904). All four preflights verify absent target milestones,
+live nodes, and empty failure streams. Each waiter consumes only its matching
+composite PASS and writes a distinct JSON/raw directory. Consolidated launch
+evidence SHA-256 is `e4bc03f4...d3ab`; all launches are mutation-free.
+
 The superseded runtime27 candidate passed all `internal` and `cmd/n42` tests;
 two consecutive optimized builds were byte-identical. Its pinned Gov binary
 SHA-256 was `72e918d9500169e227ef1a0c9d5dd751dcd7d58f1df0871825b61f196e3fce95`.
