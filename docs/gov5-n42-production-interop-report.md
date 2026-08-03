@@ -52,6 +52,13 @@ Mutation-free burst, strict-independent, latest-Reth rollover, and
 latest-Reth-independent preflights all passed at sender nonce `0x11` with zero
 transactions sent.
 
+The independent 15-minute leader checkpoint scanned canonical heights 92,624
+through 92,732. All six endpoints returned the same continuous 109-block
+parent chain and the same 19 expected Rust-authored slots. Commit-log views
+95,473 through 95,599 had exact stride seven, hash order, and `5+5` votes;
+checkpoint evidence SHA-256 is
+`b73e59ef86bb72691c6a80d1c0131bfc79ce3846a3bf0fd3dc0c954c0fd65ef2`.
+
 The authoritative zero-transaction stream began at
 `2026-08-03T09:49:44Z`, common height 92,623, lag zero. It requires continuous
 six-endpoint hash/state/receipt equality, zero transactions in every newly
