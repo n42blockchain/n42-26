@@ -525,3 +525,13 @@ upstream 流 10 个 `d12257c92...` 精确样本 / 5,408 秒。Rust `5+5` 轮值�
 `28487e6d0d17e05dd33382c06b857180c5bb5ce5482e937cc3ea0c9a8884a158`。一个未产生
 输出的 detached waiter 启动被执行环境回收后已隔离；受托管替代运行没有重启节点或
 正式流，只有后者计入里程碑。
+
+90 分钟后的只读 archive/QMDB 重跑也 PASS：高度 93,241 的两个参考 proof 在 Gov/Rust
+两侧 root、bytes 精确一致并离线验真，11 个历史 RPC 点全部一致，证据 SHA-256 为
+`c981bfc5...dbe3a`。`record-gov5-current-canary.sh` 现同时 fail-close 检查六端
+chainId、完整 genesis hash/state/receipts roots、sender latest/pending nonce 和客户端
+版本，并保持旧 `.genesis` 字符串 schema；错误 nonce 负向回归被拒绝且无链变化。
+最终记录器 SHA-256 为 `e4840036...e770`。高度 93,265 的实网检查点确认 chainId
+`0x477`、完整创世三元组、nonce `0x11`、六端同头、Gov5 5.7.906、Reth 2.4.1、
+CommitQC、110 次 Rust `5+5` 和零 equivocation；证据 SHA-256 为
+`3dd0de1c0956375119c1e1a812bd21aab2b0bbb6c0c5962e3a2c550d63442d43`。

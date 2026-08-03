@@ -146,6 +146,23 @@ reaped with an empty log before producing any output; it is preserved under
 tool-managed replacement did not restart nodes or formal streams and is the
 only attempt counted here.
 
+The 90-minute read-only archive/QMDB rerun also passed at live reference
+height 93,241: all 11 historical RPC comparisons were byte-exact, and both
+reference proofs had identical Gov/Rust roots and bytes and passed the frozen
+offline verifier. Evidence SHA-256 is
+`c981bfc57c39b3dffc7b3ef5967141d7da708254d810bbb2fbd86a47384dbe3a`.
+The reusable current-main canary recorder now additionally fail-closes on all
+six chain IDs, full genesis hash/state/receipts roots, sender latest/pending
+nonces, and records client versions while retaining the prior endpoint
+`.genesis` string schema. Its SHA-256 is `e4840036...e770`; an intentionally
+wrong nonce was rejected with no output or chain mutation. The resulting
+height-93,265 checkpoint confirms chain ID `0x477`, genesis
+`b71c2810...1392ec` / state root `91a450c1...9941` / receipts root
+`56e81f17...b421`, nonce `0x11`, exact six-endpoint latest identity, five
+Gov5 5.7.906 clients, official Reth 2.4.1, CommitQC, 110 observed Rust `5+5`
+commits, and zero equivocations. Checkpoint SHA-256 is
+`3dd0de1c0956375119c1e1a812bd21aab2b0bbb6c0c5962e3a2c550d63442d43`.
+
 The authoritative zero-transaction stream began at
 `2026-08-03T09:49:44Z`, common height 92,623, lag zero. It requires continuous
 six-endpoint hash/state/receipt equality, zero transactions in every newly
