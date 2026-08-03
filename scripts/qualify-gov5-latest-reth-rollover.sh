@@ -38,6 +38,8 @@ resource_evidence="$qualification_dir/latest-reth-resources-1h.jsonl"
 resource_audit="$qualification_dir/latest-reth-resources-1h-audit.json"
 rollover_evidence="$qualification_dir/latest-reth-rollover.jsonl"
 leader_evidence="$qualification_dir/latest-reth-leader-audit.jsonl"
+timeout_evidence="$qualification_dir/latest-reth-timeout-recovery-audit.jsonl"
+runtime_log_evidence="$qualification_dir/latest-reth-runtime-log-audit.jsonl"
 latest_log="$qualification_dir/latest-reth-rust.log"
 summary="$qualification_dir/latest-reth-final-qualification.json"
 failures="$qualification_dir/latest-reth-failures.jsonl"
@@ -288,6 +290,8 @@ run_qualification() {
   test ! -e "$resource_evidence"
   test ! -e "$rollover_evidence"
   test ! -e "$leader_evidence"
+  test ! -e "$timeout_evidence"
+  test ! -e "$runtime_log_evidence"
   test ! -e "$latest_log"
   test ! -e "$snapshot"
   test ! -e "$source_manifest"
@@ -390,6 +394,10 @@ run_qualification() {
     audit-rust-resources "$resource_evidence" "$resource_duration" \
     "$resource_audit" >/dev/null
 
+  # Freeze the latest-Reth log only after a canonical Rust-authored close so
+  # every observed missing-validator timeout has its successor recovery view.
+  wait_for_rust_authored_head
+  assert_live_identity
   tail -c "+$((log_bytes_before + 1))" "$runtime/logs/rust.log" >"$latest_log"
   first_latest_height="$(resolve_first_latest_rust_height)"
   post_head_hex="$(rpc "$rust_port" eth_blockNumber '[]' | jq -er '.result')"
@@ -400,6 +408,27 @@ run_qualification() {
     N42_QUAL_RUST_LOG="$latest_log" \
     "$harness" audit-rust-leaders "$first_latest_height" "$post_head" \
     "$leader_evidence" >/dev/null
+  env N42_QUAL_RUNTIME="$runtime" N42_QUAL_RUST_PORT="$rust_port" \
+    "$harness" audit-timeout-recovery "$latest_log" \
+    "$timeout_evidence" >/dev/null
+  jq -e -s '
+    length == 1 and .[0].status == "PASS" and
+    .[0].completedTimeouts >= 1 and .[0].pendingTimeouts == 0 and
+    .[0].timeoutViewStride == 7 and
+    .[0].timeoutAndPacemakerSetsExact == true and
+    .[0].everyCompletedTimeoutRecoveredAtNextView == true and
+    .[0].recoveredByRustVotesFivePlusFive == true
+  ' "$timeout_evidence" >/dev/null
+  env N42_QUAL_RUNTIME="$runtime" \
+    "$harness" audit-runtime-logs "$latest_log" \
+    "$runtime_log_evidence" >/dev/null
+  jq -e -s '
+    length == 1 and .[0].status == "PASS" and
+    .[0].warningPartitionExact == true and
+    .[0].timeoutSetsCountExact == true and
+    .[0].compactEvictionsMatchRustLeaderCommits == true and
+    .[0].unexpectedWarnings == 0 and .[0].criticalSignals == 0
+  ' "$runtime_log_evidence" >/dev/null
   post_status="$(rpc "$rust_port" n42_consensusStatus '[]' | jq -ec '.result')"
   post_equiv="$(rpc "$rust_port" n42_equivocations '[]' | jq -ec '.result')"
   jq -e '.hasCommittedQc == true and .validatorCount == 7' <<<"$post_status" >/dev/null
@@ -430,7 +459,8 @@ run_qualification() {
     '{at:$at,event:"latest_reth_rollover_completed",pidAfter:$pid,
       headAfter:$head,rpcRecoverySeconds:$rpc_recovery,
       rejoinWaitSeconds:$rejoin_wait,consensusAfter:$consensus,
-      equivocations:$equivocations,sourceAndGovUpstreamStillExact:true}' \
+      equivocations:$equivocations,timeoutAndRuntimeLogsExact:true,
+      sourceAndGovUpstreamStillExact:true}' \
     >>"$rollover_evidence"
 
   jq -nc \
@@ -445,6 +475,8 @@ run_qualification() {
     --arg head_sha "$(shasum -a 256 "$head_evidence" | awk '{print $1}')" \
     --arg resource_sha "$(shasum -a 256 "$resource_evidence" | awk '{print $1}')" \
     --arg leader_sha "$(shasum -a 256 "$leader_evidence" | awk '{print $1}')" \
+    --arg timeout_sha "$(shasum -a 256 "$timeout_evidence" | awk '{print $1}')" \
+    --arg runtime_log_audit_sha "$(shasum -a 256 "$runtime_log_evidence" | awk '{print $1}')" \
     --arg rollover_sha "$(shasum -a 256 "$rollover_evidence" | awk '{print $1}')" \
     --arg log_sha "$(shasum -a 256 "$latest_log" | awk '{print $1}')" \
     --arg snapshot "$snapshot" \
@@ -462,7 +494,9 @@ run_qualification() {
     --argjson equivocations "$post_equiv" \
     --slurpfile head_audit "$head_audit" \
     --slurpfile resource_audit "$resource_audit" \
-    --slurpfile leader "$leader_evidence" '
+    --slurpfile leader "$leader_evidence" \
+    --slurpfile timeout "$timeout_evidence" \
+    --slurpfile runtime_log_audit "$runtime_log_evidence" '
     {at:$at,event:"latest_reth_final_qualification",status:"PASS",
       binary:$binary,binarySha256:$binary_sha256,rethVersion:"2.4.1",
       rethCommit:$reth_commit,versionOutput:$version,
@@ -476,6 +510,9 @@ run_qualification() {
       headEvidenceSha256:$head_sha,headAudit:$head_audit[0],
       resourceEvidenceSha256:$resource_sha,resourceAudit:$resource_audit[0],
       leaderEvidenceSha256:$leader_sha,rustLeaderAudit:$leader[-1],
+      timeoutEvidenceSha256:$timeout_sha,timeoutAudit:$timeout[-1],
+      runtimeLogAuditSha256:$runtime_log_audit_sha,
+      runtimeLogAudit:$runtime_log_audit[-1],
       rolloverEvidenceSha256:$rollover_sha,latestRustLogSha256:$log_sha,
       preRolloverDataSnapshot:{path:$snapshot,files:$snapshot_files,
         sizeKiB:$snapshot_kib,sourceManifestSha256:$source_manifest_sha,
@@ -487,6 +524,10 @@ run_qualification() {
     .officialStableTag == "v2.4.1" and .officialStableTagExact == true and
     .headAudit.status == "PASS" and .resourceAudit.status == "PASS" and
     .rustLeaderAudit.status == "PASS" and .consensus.hasCommittedQc == true and
+    .timeoutAudit.status == "PASS" and .timeoutAudit.pendingTimeouts == 0 and
+    .runtimeLogAudit.status == "PASS" and
+    .runtimeLogAudit.unexpectedWarnings == 0 and
+    .runtimeLogAudit.criticalSignals == 0 and
     .equivocations.total == 0 and .preRolloverDataSnapshot.byteExact == true' \
     "$summary" >/dev/null
   cat "$summary"
