@@ -54,6 +54,16 @@ both equal `b8c17d046...`. Rust recorded 26 `5+5` leader commits, CommitQC is
 present, and equivocation evidence remains empty. Milestone SHA-256 is
 `723db1a6b77d4b2276b55c65edd2e309085b60741f04e08fe3ff09f93ac8fd29`.
 
+An early closed-log audit independently scans canonical heights 92,696 through
+92,797. All six endpoints return the same continuous 102-block parent chain;
+all 17 expected Rust-authored slots match 17 `5+5` log commits with exact
+seven-view stride and hash order. The frozen log contains 31 timeout/pacemaker
+pairs, all recovered at the next view by Rust `5+5`, with zero pending. All
+251 warnings partition into allowed classes, with zero unexpected warnings or
+critical signals. Frozen-log, leader, timeout, and log-audit SHA-256 values are
+`f976d11c...95e8`, `81e9e574...f097`, `aa9eff62...14c`, and
+`0dc84ad1...54a`.
+
 The superseded runtime27 candidate passed all `internal` and `cmd/n42` tests;
 two consecutive optimized builds were byte-identical. Its pinned Gov binary
 SHA-256 was `72e918d9500169e227ef1a0c9d5dd751dcd7d58f1df0871825b61f196e3fce95`.

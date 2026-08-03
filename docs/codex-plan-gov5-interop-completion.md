@@ -777,3 +777,11 @@ lag 0、全程零交易；3 个同一 Rust PID 资源样本覆盖 600 秒；2 �
 精确样本覆盖 601 秒。Rust 累计 26 次 `5+5`，CommitQC 存在、零双签；里程碑
 SHA-256 为 `723db1a6...fd29`。只读 archive/QMDB 初检也通过 1 个当前 reference
 proof 和 11 个历史高度的精确 Gov/Rust 对比，证据 SHA-256 为 `6b814b2f...ce1`。
+
+早期闭合日志深审扫描高度 92,696–92,797 的 102 个连续规范块；17 个预期 Rust
+轮值在六端精确一致，17/17 日志提交均为 `5+5`，view stride 和 hash 顺序精确。
+31/31 timeout/pacemaker 全部在下一 view 由 Rust `5+5` 恢复，pending 为零；
+251 条 warning 全量归类，未知 warning 和 critical signal 均为零。冻结日志、
+leader、timeout、runtime-log SHA-256 分别为 `f976d11c...95e8`、
+`81e9e574...f097`、`aa9eff62...14c`、`0dc84ad1...54a`。两个诊断截面恰在
+timeout 与恢复 view 之间，已移入 `excluded/`，不作为闭合证据。
