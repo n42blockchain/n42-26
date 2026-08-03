@@ -983,6 +983,11 @@ direct push 5，view 96,663 以 `5+5` 提交，CommitQC、零双签且 committed
 六端身份精确。两份只读证据 SHA-256 分别为 `14d50609...3ec8`、
 `66a376f3...0a1a`。
 
+冻结复制边界验证器在 2.5 小时再次独立 preflight PASS：重新执行全部 7 个历史边界，
+创世 `b71c2810...1392ec` 与 905 复制持久头 92,605 /
+`b88a3571...5a82` 仍逐字段六端精确；live 六端身份一致，latest/pending nonce 均为
+`0x11`。mutation-free 证据 SHA-256 为 `6f0b8128...8245`。
+
 约 80 分钟处再次完整执行只读 archive/QMDB parity：当前共同高度 93,199 的两组
 Gov/Rust proof root 与编码逐字节一致并通过冻结离线验证器；创世到 5,189 的 11 个
 历史高度再次通过全部 RPC/root/proof 检查。证据 SHA-256 为 `03f3de7d...3d57`。

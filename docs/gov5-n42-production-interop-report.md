@@ -486,6 +486,14 @@ committed-block identity remain true. Read-only evidence SHA-256 values are
 `14d50609abd423a9efa21dbdf9c92587c510f31b92c7bdf938da4f67f9f03ec8`
 and `66a376f35049cd9dbbd04d708d10350ddd26ec82d4b9c0e64401cac350f30a1a`.
 
+The frozen copied-boundary verifier independently passes another preflight at
+2.5 hours. It re-executes all seven historical boundaries: genesis remains
+`b71c2810...1392ec`, copied 905 persisted head 92,605 remains
+`b88a3571...5a82`, and every stored identity field is exact on all six
+endpoints. The live six-endpoint identity is exact, latest and pending nonce
+remain `0x11`, and no mutation occurs. Evidence SHA-256 is
+`6f0b8128cbaaf156f957b59764144155b138f1c93633aaa93bccbdfc3aaa8245`.
+
 The superseded runtime27 candidate passed all `internal` and `cmd/n42` tests;
 two consecutive optimized builds were byte-identical. Its pinned Gov binary
 SHA-256 was `72e918d9500169e227ef1a0c9d5dd751dcd7d58f1df0871825b61f196e3fce95`.
