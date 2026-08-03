@@ -103,6 +103,13 @@ reachable, exact Gov5-main samples span 1,802 seconds. Rust has 48 `5+5`
 leader commits, CommitQC remains present, and both equivocations and released
 transactions remain zero. Milestone SHA-256 is `8276dfae...d6ab`.
 
+The live 905-data compatibility recheck found no implicit migration after the
+formal chain advanced from height 92,695 to 92,911. All five Gov datadirs
+still contain zero `txindex.ranges` files, all six clients remain exact with
+lag zero, and no destructive data conversion occurred. The final gated
+17-transaction burst and archive RPC pass will exercise lookup behavior with
+new transactions. Recheck evidence SHA-256 is `f5432630...e5a8`.
+
 The superseded runtime27 candidate passed all `internal` and `cmd/n42` tests;
 two consecutive optimized builds were byte-identical. Its pinned Gov binary
 SHA-256 was `72e918d9500169e227ef1a0c9d5dd751dcd7d58f1df0871825b61f196e3fce95`.
