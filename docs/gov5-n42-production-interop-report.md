@@ -128,6 +128,24 @@ leader, timeout, and log-audit SHA-256 values are respectively
 dependency, and output-collision checks; the old runtime paths remaining in
 script defaults are overridden by the already-passed runtime27 launch binding.
 
+An additional 90-minute composite milestone passed at
+`2026-08-03T11:20:24Z`, again without relaxing acceptance. Its frozen head
+stream contains 179 samples over 5,415 seconds, grows 606 blocks from 92,623
+to 93,229, has a maximum 31-second gap and maximum lag two, and remains
+zero-transaction throughout. The resource stream contains 19 samples over
+5,403 seconds from unchanged Rust PID 89930; peak RSS was 253,616 KiB,
+threads 162, and file descriptors 93. Ten Gov5-upstream samples over 5,408
+seconds all remain exact at `d12257c92...`. Rust recorded 104 `5+5` leader
+commits, CommitQC remained present, and equivocations and failure evidence
+remained zero. Independent recomputation of the summary and all three frozen
+streams passed; milestone SHA-256 is
+`28487e6d0d17e05dd33382c06b857180c5bb5ce5482e937cc3ea0c9a8884a158`.
+The first attempt to add this optional waiter as a detached shell child was
+reaped with an empty log before producing any output; it is preserved under
+`excluded/runtime27-ninety-minute-detached-launch-not-persistent/`. The
+tool-managed replacement did not restart nodes or formal streams and is the
+only attempt counted here.
+
 The authoritative zero-transaction stream began at
 `2026-08-03T09:49:44Z`, common height 92,623, lag zero. It requires continuous
 six-endpoint hash/state/receipt equality, zero transactions in every newly
