@@ -697,3 +697,11 @@ SHA-256 为 `2db923d8521e310b4cd55af0a7be36a4d56a3a0ff941e5a5a20a7c349a5fd15a`�
 Rust QMDB proof 根和字节一致并离线验真；11 个历史高度再次通过 209 项精确检查，
 六端 pending nonce 仍为 `0x11`。未发送交易或重启节点；证据 SHA-256 为
 `1e4c44543cb8561096d5fcc6f84ac6e33252f2c1116e0d627bd332b2d6849dcc`。
+
+六小时独立不可变日志深审扫描高度 92,624 至 95,048：2,425 个规范块父链连续，
+405 个预期 Rust 轮值在六端精确一致，405/405 日志均为 `5+5`，view stride 和
+hash 顺序精确。407 组 timeout/pacemaker 全部在下一 view 恢复，pending 为零；
+3,309 条 warning 全量归类，未知 warning 与 critical signal 均为零。冻结 Rust
+日志、leader、timeout、runtime-log SHA-256 分别为 `bfee67d8...2327`、
+`f2606ff2...17dc`、`8a089dd9...36c7`、`0ea18d51...f889`。另已挂载只读九小时
+复合等待器，缩短 6→12 小时观察间隔。

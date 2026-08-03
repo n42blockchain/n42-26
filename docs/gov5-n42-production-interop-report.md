@@ -428,6 +428,16 @@ checks; all six pending nonces remain `0x11`. No transaction or restart was
 used. Evidence SHA-256 is
 `1e4c44543cb8561096d5fcc6f84ac6e33252f2c1116e0d627bd332b2d6849dcc`.
 
+The six-hour independent immutable-log audit scans heights 92,624 through
+95,048. All 2,425 blocks are parent-continuous; all 405 expected Rust slots are
+exact at all six endpoints and match 405 `5+5` records with exact view stride
+and hash order. All 407 timeout/pacemaker pairs recover at the next view with
+zero pending. The 3,309 warnings partition exactly into allowed classes, with
+zero unknown warnings or critical signals. The frozen Rust log, leader,
+timeout, and runtime-log SHA-256 values are `bfee67d8...2327`,
+`f2606ff2...17dc`, `8a089dd9...36c7`, and `0ea18d51...f889`. A read-only
+nine-hour composite waiter is additionally armed to narrow the 6→12 hour gap.
+
 Two runtime27 canary dry runs produced no mutation: the controller wait loop
 did not yet continue across slots in which Rust was not the leader. Their
 zero-byte outputs were moved under `excluded/`; the corrected canary and all
