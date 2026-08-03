@@ -30,8 +30,9 @@ heads="$runtime/evidence/mixed-soak-24h.jsonl"
 resources="$runtime/evidence/rust-resource-24h.jsonl"
 upstream="$runtime/evidence/gov5-upstream-24h.jsonl"
 stable="$qualification_dir/official-reth-stable-monitor.jsonl"
-copied="$runtime/evidence/runtime26-copied-chain-data-manifest.json"
-canary="$runtime/evidence/runtime26-current-main-canary.json"
+copied="${N42_TOTAL_COPIED_MANIFEST:?copied-data manifest is required}"
+canary="${N42_TOTAL_CANARY:?current-main canary is required}"
+expected_copied_files="${N42_TOTAL_COPIED_FILES:?copied-data file count is required}"
 controller="$runtime/evidence/gov5-qualification-controller-guardian.jsonl"
 monitor="$runtime/evidence/runtime22-monitor-pid-guardian.jsonl"
 output="$runtime/evidence/gov5-906-total-goal-final-verification.json"
@@ -186,7 +187,7 @@ jq -e -s --arg expected "$expected_gov_main" '
 jq -e -s 'length>=2 and all(.[];.remoteReachable==true and
   .baselineExact==true and .expected=="v2.4.1" and .latest=="v2.4.1")' \
   "$stable" >/dev/null
-jq -e '.status=="PASS" and .files==123 and
+jq -e --argjson files "$expected_copied_files" '.status=="PASS" and .files==$files and
   .sourceManifestSha256==.targetManifestSha256 and
   .allPathsSizesAndHashesExact==true' "$copied" >/dev/null
 jq -e '.status=="PASS" and .allSixLatestExact==true and .genesisExact==true and
@@ -265,6 +266,7 @@ jq -nc --arg at "$(date -u +%FT%TZ)" --arg verifier_sha "$expected_self_sha" \
   --arg gov_candidate "$expected_gov_candidate" \
   --arg primary_head "$(git -C "$primary_repo" rev-parse HEAD)" \
   --arg combo "$expected_combo" --arg reth "$expected_reth" --arg deps "$expected_deps" \
+  --argjson copied_files "$expected_copied_files" \
   --arg strict_sha "$(sha256 "$strict_summary")" \
   --arg strict_independent_sha "$(sha256 "$strict_independent")" \
   --arg immutable_sha "$(sha256 "$immutable")" \
@@ -280,7 +282,7 @@ jq -nc --arg at "$(date -u +%FT%TZ)" --arg verifier_sha "$expected_self_sha" \
     rustLeaderProductionExact:true,timeoutRecoveryExact:true,
     archiveAndQmdbParityExact:true,controlledRestartRejoined:true,
     latestRethExtraHourExact:true,
-    copiedData:{files:123,evidenceSha256:$copied_sha,byteExact:true},
+    copiedData:{files:$copied_files,evidenceSha256:$copied_sha,byteExact:true},
     sources:{primaryHead:$primary_head,govCandidate:$gov_candidate,govMain:$gov_main,
       latestCombination:$combo,reth:$reth,dependencyUpdate:$deps,allPushed:true},
     evidenceSha256:{strictSummary:$strict_sha,
