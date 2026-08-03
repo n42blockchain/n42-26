@@ -698,6 +698,28 @@ extends through 94,196, and the frozen Rust log remains
 `d994013f...9604`. Linkage evidence SHA-256 is `1a04be1f...dd7b` and explicitly
 records that the historical window cannot be altered by the later burst.
 
+After four hours, an auxiliary latest-Reth preflight mistakenly invoked the
+stale rollover copy under runtime `artifacts/scripts` (SHA-256
+`778e77c1...7664`, with its older embedded harness pin). It failed closed at a
+static SHA assertion before any transaction, node restart, or chain mutation.
+The original 282-byte failure is preserved byte-for-byte at SHA-256
+`6b41bea4...8fe8` under
+`evidence/excluded-operator-preflight-wrong-rollover-copy-20260803T232257Z/`;
+its exclusion record SHA-256 is `6d7d171e...6564`. Latest independent correctly
+observed that temporary failure stream and exited; its preserved 204-byte
+derived failure has SHA-256 `a58c0ec9...463f`, with derived exclusion record
+SHA-256 `4b98bcdc...f5a8`. Formal 24-hour evidence is unchanged.
+
+The formal `evidence/official-reth-stable` rollover copy (SHA-256
+`68c1f209...ca0`) then passes a real preflight. Reth v2.4.1 / `91725e3a`, binary
+`0a4dbcf3...62b9f`, live six-endpoint identity, and genesis are exact without
+mutation; evidence SHA-256 is `cac545d2...79b7`. Dependent waiters are rearmed
+with their original frozen parameters: latest independent PID 87801/session
+35229, total PID 87802/session 30844, final 905 PID 88093/session 66123, and
+completion PID 88094/session 38136. After a complete 60-second cycle, all four
+and formal rollover PID 80652 remain alive with empty new failure streams and
+continued zero lag.
+
 The strict 2.5-hour (9,000-second) composite gate passes. Its 299 head
 samples span 9,034 seconds, grow by 924 blocks, retain continuous zero-
 transaction coverage, and have maximum lag one. Thirty-one resource samples

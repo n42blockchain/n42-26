@@ -1135,6 +1135,23 @@ SHA-256 均为 `f6716c23...c4e1`。deep 与 supplemental 内嵌的 milestone SHA
 `d994013f...9604`。linkage 证据 SHA-256 为 `1a04be1f...dd7b`，并明确历史窗口
 不会被后续 burst 改写。
 
+四小时后一次辅助 latest-Reth preflight 误调用了 runtime `artifacts/scripts` 中的旧
+rollover 副本（SHA-256 `778e77c1...7664`，内嵌旧 harness pin），在静态 SHA
+断言处 fail-closed；交易、节点重启和链 mutation 均为 0。原始 282 字节失败按 SHA
+`6b41bea4...8fe8` 完整移动到
+`evidence/excluded-operator-preflight-wrong-rollover-copy-20260803T232257Z/`，排除记录
+SHA-256 为 `6d7d171e...6564`。latest independent 因正确观察到该临时 failure 流而
+派生退出，其 204 字节原始失败 SHA-256 `a58c0ec9...463f` 也完整归档，派生排除记录
+SHA-256 为 `4b98bcdc...f5a8`；正式 24 小时 evidence 未被修改。
+
+随后使用正式 `evidence/official-reth-stable` rollover 副本（SHA-256
+`68c1f209...ca0`）重跑 preflight 并 PASS：Reth v2.4.1 / `91725e3a`、二进制
+`0a4dbcf3...62b9f`、六端 live 身份和创世均精确，mutation-free；证据 SHA-256
+为 `cac545d2...79b7`。受影响的依赖 waiter 以原冻结参数重挂：latest independent
+PID 87801/session 35229、total PID 87802/session 30844、final 905 PID
+88093/session 66123、completion PID 88094/session 38136。跨过完整 60 秒后连同
+正式 rollover PID 80652 全部存活，新 failure 流为空，六端继续 lag 0。
+
 2.5 小时（9,000 秒）复合门严格 PASS：299 个 head 样本覆盖 9,034 秒，增长 924
 块、最大 lag 1、零交易；原 Rust PID 70765 的 31 个资源样本覆盖 9,004 秒，RSS
 峰值 263,824 KiB、线程最多 163、FD 93；16 个 Gov5 main 样本覆盖 9,012 秒并
