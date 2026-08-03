@@ -484,6 +484,21 @@ SHA-256 values are
 `e289e5292eb16ad3c32e99185c53a14a6437e1ded3746ca1afcf28a8bf04fa7f`
 and `2e6ca52ca2c0f7ec0a8b8b207d9c519493ee7418f7ed31133cbf0e56cd3e3201`.
 
+The frozen copied-boundary verifier passes another post-three-hour preflight.
+It re-executes all seven historical boundaries: genesis remains
+`b71c2810...1392ec`, copied 905 persisted head 92,605 remains
+`b88a3571...5a82`, and every stored identity field is exact on all six
+endpoints. Live six-endpoint identity is exact, latest and pending nonce remain
+`0x11`, and no mutation occurs. Evidence SHA-256 is
+`f60946f5a1c77db2aa1b5a18b0306eab84b34698653325485bf7d61996848632`.
+
+The six-hour V2 deep audit has also passed its frozen-source preflight and is
+active as PID 82622 / session 95373. Harness, static rechecker, and immutable
+905 baseline SHA-256 values are `037cc547...5309`, `b27890ad...10ec`, and
+`6ea80521...203c`. It waits only for the strict six-hour composite gate, then
+closes Rust leaders, timeout recovery, complete logs, and 24 immutable files
+without mutating chain state.
+
 The strict 2.5-hour (9,000-second) composite gate passes. Its 299 head
 samples span 9,034 seconds, grow by 924 blocks, retain continuous zero-
 transaction coverage, and have maximum lag one. Thirty-one resource samples
