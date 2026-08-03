@@ -371,6 +371,16 @@ the bootstrap boundary, and heights 999 through 5,189 pass all 209 RPC/root/
 proof checks. The operation is read-only; evidence SHA-256 is
 `959cb74ecdcb6d20bba6f07d8f925cf1025188c0175d87f248d958503666d3af`.
 
+The frozen completion auditor was then rerun in mutation-free preflight mode
+against newly pushed primary HEAD `07682df34e95e3168f16a88192171be05517ccf2`.
+Its dynamic primary-HEAD/remote check passes along with all fixed Gov5, Reth,
+combination, and dependency pins, both binary hashes, six live identities,
+genesis, and nonce `0x11`; it still explicitly reports
+`completionNotClaimed=true`. This confirms intermediate evidence-documentation
+commits will not create a false source-drift failure at final closure.
+Evidence SHA-256 is
+`76ddcd3e7f1103c4eb0a412b0dbd6429c3b7ea40750dce4cc795a47afa042396`.
+
 The superseded runtime27 candidate passed all `internal` and `cmd/n42` tests;
 two consecutive optimized builds were byte-identical. Its pinned Gov binary
 SHA-256 was `72e918d9500169e227ef1a0c9d5dd751dcd7d58f1df0871825b61f196e3fce95`.

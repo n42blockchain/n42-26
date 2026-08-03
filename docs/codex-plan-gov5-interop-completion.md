@@ -908,6 +908,12 @@ peer count 为 0，但原 PID 70765 到 Gov 30301–30305 的五条共识 TCP �
 999–5,189 的 11 个历史点共 209 项 RPC/root/proof 检查全部精确。只读证据 SHA-256
 为 `959cb74e...d3af`。
 
+两小时后又以最新已推送主仓库 HEAD `07682df3...5ccf2` 重跑冻结 completion auditor
+的 mutation-free 预检：主仓库动态 HEAD/远端一致，Gov5/Reth/deps 固定 pin、两端
+二进制、六端身份、创世与 nonce `0x11` 全部精确；结果仍明确
+`completionNotClaimed=true`。这证明中途证据文档提交不会让最终门误报源码漂移。
+证据 SHA-256 为 `76ddcd3e...2396`。
+
 约 80 分钟处再次完整执行只读 archive/QMDB parity：当前共同高度 93,199 的两组
 Gov/Rust proof root 与编码逐字节一致并通过冻结离线验证器；创世到 5,189 的 11 个
 历史高度再次通过全部 RPC/root/proof 检查。证据 SHA-256 为 `03f3de7d...3d57`。
