@@ -833,3 +833,8 @@ SHA-256 分别为 `cc519e7e...1d4f`、`513f8e01...21a2`、
 reference proof 在 Gov/Rust 间 root 与 bytes 精确并通过固定离线验证器；11 个历史
 高度各自的 19 项 RPC/root/proof 检查全部一致，覆盖创世与 bootstrap 边界。证据
 SHA-256 为 `3d1ab47e...4ff9`。
+
+实时客户端身份矩阵确认 28501–28505 均报告 `N42/5.7.906`，29545 报告
+`reth/v2.4.1-91725e3/aarch64-apple-darwin`；六端 chainId 均为 `0x477`、均非
+syncing，并在固定高度 92,971 返回精确相同的创世与块 hash/state/receipts 身份。
+矩阵证据 SHA-256 为 `67eea2d0...5351`。
