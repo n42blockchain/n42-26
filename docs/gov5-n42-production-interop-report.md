@@ -652,6 +652,35 @@ keys, frozen harness/finalizer/independent/QMDB/total tools, and both Gov/Rust
 binaries. Every initial SHA remains exact; evidence SHA-256 is
 `b03e479c...ab64`.
 
+The strict four-hour (14,400-second) four-part gate closes without relaxed
+acceptance. Its composite has 477 head samples over 14,430 seconds, grows by
+1,494 blocks, and retains maximum lag one with zero bad rows. Forty-nine
+same-PID resource samples span 14,406 seconds; 25 exact Gov5-main samples span
+14,419 seconds with maximum gap 601 seconds. Rust accumulates 264 `5+5`
+commits, equivocations remain zero, and no transaction is sent. Composite
+evidence SHA-256 is `18d40534...e4a5`.
+
+The frozen six-endpoint raw audit closes heights 92,696–94,189. Its 1,494
+blocks form 249 complete cycles; Rust and Gov1 through Gov5 each produce 249
+blocks. All six sequences share SHA-256 `f6716c23...c4e1`, with exact parents,
+slots, and zero transactions; composite evidence SHA-256 is
+`8f48cb81...0fc8`. Independent deep audit reaches height 94,196 across 1,501
+blocks. All 251 Rust slots are six-endpoint exact `5+5`; all 265 timeouts
+recover in the next view with zero pending. All 2,132 warnings partition with
+zero unexpected or critical signals, and 24 immutable files retain their
+initial SHAs. Deep-audit and frozen-Rust-log SHA-256 values are
+`ef5559e7...771f` and `d994013f...9604`.
+
+The matching supplemental audit also passes. Twelve archive/QMDB events are
+exact; five consensus sockets and five authenticated validators retain quorum,
+view 97,293 commits with `5+5`, and its block is six-endpoint exact. The 905
+data still contains zero `txindex.ranges`; genesis and copied head are exact,
+with no regeneration required. Resource OLS slope falls to 8.83 MiB/hour and
+24-hour RSS projects to 434,568 KiB. Supplemental and archive/network/data/
+resource child evidence SHA-256 values are `e03e8047...3262`,
+`c7a6ea03...06a3`, `88a6e3ae...5a8d`, `ecf5e405...e640`, and
+`95e27c1c...c1c4`.
+
 The strict 2.5-hour (9,000-second) composite gate passes. Its 299 head
 samples span 9,034 seconds, grow by 924 blocks, retain continuous zero-
 transaction coverage, and have maximum lag one. Thirty-one resource samples

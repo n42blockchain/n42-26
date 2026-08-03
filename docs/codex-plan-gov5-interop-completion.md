@@ -1102,6 +1102,26 @@ RPC/root/proof 一致，共 12 个事件；证据 SHA-256 为 `44f3ffa1...5ccb`�
 P2P 密钥、冻结 harness/finalizer/independent/QMDB/total 工具及 Gov/Rust 二进制，
 全部保持初始 SHA；证据 SHA-256 为 `b03e479c...ab64`。
 
+4 小时（14,400 秒）正式四联门全部闭合且未放宽规则。复合门含 477 个 head 样本，
+覆盖 14,430 秒、增长 1,494 块、最大 lag 1、bad row 0；49 个原 PID 资源样本覆盖
+14,406 秒，25 个 Gov5 main 样本覆盖 14,419 秒且最大间隔 601 秒。Rust 累计
+264 次 `5+5`、双签为零、交易为零；复合证据 SHA-256 为 `18d40534...e4a5`。
+
+冻结六端 raw 审计闭合高度 92,696–94,189：1,494 块组成 249 个完整轮次，Rust 与
+Gov1–Gov5 各产生 249 块；六端序列 SHA-256 均为 `f6716c23...c4e1`，父链、槽位
+和零交易全部精确，复合证据 SHA-256 为 `8f48cb81...0fc8`。独立深审进一步到
+94,196 的 1,501 块：251 个 Rust 槽位全部六端匹配 `5+5`，265/265 timeout 在下一
+view 恢复且 pending 0；2,132 条 warning 全量归类，unexpected/critical 为 0，
+24 个静态文件保持初始 SHA。深审及冻结 Rust log SHA-256 分别为
+`ef5559e7...771f`、`d994013f...9604`。
+
+同门 supplemental 也 PASS：archive/QMDB 12 个事件精确，五个共识连接与五个认证
+验证者保持 quorum，view 97,293 以 `5+5` 提交且 committed block 六端一致；905
+数据仍为零 `txindex.ranges`，创世/复制头精确且无需重生成。资源 OLS 斜率降至
+8.83 MiB/小时，24 小时 RSS 预测 434,568 KiB。supplemental 及其 archive/network/
+data/resource 子证据 SHA-256 分别为 `e03e8047...3262`、`c7a6ea03...06a3`、
+`88a6e3ae...5a8d`、`ecf5e405...e640`、`95e27c1c...c1c4`。
+
 2.5 小时（9,000 秒）复合门严格 PASS：299 个 head 样本覆盖 9,034 秒，增长 924
 块、最大 lag 1、零交易；原 Rust PID 70765 的 31 个资源样本覆盖 9,004 秒，RSS
 峰值 263,824 KiB、线程最多 163、FD 93；16 个 Gov5 main 样本覆盖 9,012 秒并
