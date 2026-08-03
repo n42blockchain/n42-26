@@ -48,6 +48,22 @@ and the obsolete `alloy-node-bindings` dev edge has been removed. No dependency
 or execution binary in the active qualification runtime was changed after the
 strict window began.
 
+The measured interop code has now also been validated directly against that
+newer Reth revision, rather than relying only on the separate dependency
+delivery branch. Branch `feat/gov5-n42-live-interop-reth-latest` commit
+`50ad7ed` combines the current interop head with Reth
+`91725e3aa8f2a0bbc5a425e931a2f2b2f31b2a7b`. The only lockfile changes are the
+`parking_lot` and `libc` dependency edges required by the newer Reth crates.
+The combination passes locked full-workspace/all-target check and test,
+warnings-denied all-target Clippy, and nightly formatting. The all-target test
+exposed and fixed a stale JMT benchmark fixture that described absent accounts
+as modifications; synthetic accounts applied to a fresh tree are now correctly
+marked as creations. Its optimized `n42-node` reports Reth 2.4.1 commit
+`91725e3aa` and has SHA-256
+`0a4dbcf30d7cc9944a7cd7c96a25c1ebf862df10bde76210a381ef492e362b9f`.
+This additional build did not replace or otherwise disturb the frozen strict
+runtime.
+
 Commits
 `ac1fc06` and `4a11238` add an explicitly configured, hard-capped authenticated
 Gov5 catch-up buffer and retain each buffered block's already-verified H2 view
