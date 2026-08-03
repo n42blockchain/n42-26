@@ -507,3 +507,11 @@ Rust 已记录 71 次 `5+5` 轮值提交，CommitQC 存在、equivocation 为零
 独立只读复算再次通过；里程碑 SHA-256 为
 `40b0c17fd2d512a6ca80593ae22ef902494d82f483d23eba42a6041fcef1506a`。其余 3/6/12/18
 小时里程碑及最终自动闭环继续运行，首小时通过不提前释放交易。
+
+首小时后又对同一冻结 Rust 日志完成闭合深审计：高度 92,624–93,073 的 450 个
+规范块 parent 连续、六端精确一致，75 个预期 Rust 轮值块与 75 条 stride-seven
+提交日志逐一匹配且全部 `5+5`；77/77 timeout/pacemaker 均在下一 view 由 Rust
+`5+5` 恢复，630 条 warning 精确归类，未知 warning 和 critical signal 均为零。
+冻结 Rust 日志、leader、timeout、日志审计 SHA-256 分别为 `2ac01623...6a18`、
+`ce7dab33...48db`、`d8f76e88...1f26`、`1cc39713...7ff0`。冻结控制脚本的语法、
+启动记录哈希、依赖命令及最终输出无碰撞检查也全部通过。

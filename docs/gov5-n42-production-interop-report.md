@@ -114,6 +114,20 @@ streams, limits, monotonicity, PID identity, and upstream pin. Milestone
 evidence SHA-256 is
 `40b0c17fd2d512a6ca80593ae22ef902494d82f483d23eba42a6041fcef1506a`.
 
+A closed-log deep audit immediately after that milestone strengthens the
+leader-count check into a canonical range proof. It scans all 450 blocks from
+92,624 through 93,073, proves a continuous parent chain and exact responses
+from all six endpoints, and matches all 75 expected Rust-authored slots to 75
+ordered log commits with view stride seven and `5+5` votes. On the same frozen
+Rust log, all 77 timeout/pacemaker pairs are complete and recover in the next
+view through Rust `5+5`; all 630 warnings partition into the known categories,
+with zero unexpected warnings or critical signals. The frozen Rust log,
+leader, timeout, and log-audit SHA-256 values are respectively
+`2ac01623...6a18`, `ce7dab33...48db`, `d8f76e88...1f26`, and
+`1cc39713...7ff0`. The frozen controller chain also passes syntax, hash,
+dependency, and output-collision checks; the old runtime paths remaining in
+script defaults are overridden by the already-passed runtime27 launch binding.
+
 The authoritative zero-transaction stream began at
 `2026-08-03T09:49:44Z`, common height 92,623, lag zero. It requires continuous
 six-endpoint hash/state/receipt equality, zero transactions in every newly
