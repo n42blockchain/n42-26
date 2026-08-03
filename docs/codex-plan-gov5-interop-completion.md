@@ -760,9 +760,14 @@ hash 为 `b71c2810...1392ec`。canary 在 views 95,452/95,459 记录两次 Rust
 `5+5`，六端同头、CommitQC 存在、零 equivocation，SHA-256 为
 `13c087af...a914`。
 
-新的严格零交易流从 `2026-08-03T19:06:25Z`、高度 92,635、lag 0 重新计时。
+新的严格零交易流从 `2026-08-03T19:15:19Z`、高度 92,695、lag 0 重新计时。
 head 监控请求 86,640 秒，resource/upstream 请求 87,000 秒；Gov5 main 和官方
 Reth stable 均被独立持续监控。最终器 mutation-free preflight 在六端 nonce
 `0x11` 通过，交易发送数为零；1/3/6/8/12/18 小时等待器、最终器和 30 小时防休眠
 均已挂载。只有完整 24 小时门通过后才允许执行 burst、archive/QMDB、Rust 重启追高
 及后续最新 Reth 附加验证。
+
+正式流首次启动约七分钟后，静态生命周期审计发现 supervisor 会在 head monitor
+正常完成 86,640 秒时误判退出，并提前终止仍需运行到 87,000 秒的 resource/upstream。
+该短流已隔离；修正后的 wrapper 会把成功完成的 monitor 托管到最终关闭。节点、链数据、
+最终器和 nonce 均未重启或改变，正式时长仅从上述新起点计算。

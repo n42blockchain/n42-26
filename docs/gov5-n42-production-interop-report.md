@@ -33,11 +33,18 @@ authored views 95,452 and 95,459 with `5+5`, CommitQC was present, and
 equivocation evidence was empty. Canary SHA-256 is `13c087af...a914`.
 
 The new zero-transaction head, resource, Gov5-upstream, and official-Reth
-streams began at `2026-08-03T19:06:25Z`, first common height 92,635 and lag
+streams began at `2026-08-03T19:15:19Z`, first common height 92,695 and lag
 zero. Finalizer preflight passed with all six sender nonces at `0x11` and zero
 sends. The 1/3/6/8/12/18-hour milestones and guarded finalizer are armed; the
 17-transaction burst, archive/QMDB parity, and Rust restart/rejoin remain
 gated until the complete 86,640-second strict stream closes.
+
+An earlier seven-minute monitor stream was deliberately excluded after a
+static lifecycle audit found its supervisor would have treated the head
+monitor's eventual successful exit as a failure and stopped the 87,000-second
+resource/upstream tails early. The corrected wrappers keep each successful
+monitor supervised through final closure; nodes, chain data, finalizer, and
+nonce were not restarted or changed.
 
 The superseded runtime27 candidate passed all `internal` and `cmd/n42` tests;
 two consecutive optimized builds were byte-identical. Its pinned Gov binary
