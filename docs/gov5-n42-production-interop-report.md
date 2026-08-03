@@ -2037,3 +2037,14 @@ its mutation-free live preflight SHA-256 is
 Only the three waiting control processes were rebound again; all strict node
 and evidence-stream PIDs remain unchanged. The rearm evidence SHA-256 is
 `9faffbfb661143f5a0a1d40a01443fd559289503f548b699066dbe738b83c951`.
+
+A separate five-hour readiness re-audit confirms that those control-process
+rebindings did not create an evidence gap. The three streams independently
+span 18,046, 18,012, and 18,025 seconds; 593 head samples grow 2,040 blocks
+with maximum lag two and continuous zero-transaction coverage. The complete
+canonical scan covers 2,059 blocks and 344 exact Rust leader slots on all six
+endpoints, every one with `5+5`; all 344 completed timeouts recover at the next
+view with none pending. Rust remains PID 97040 below the resource limits, and
+all 2,796 warnings partition exactly with zero unknown or critical signals.
+The compact readiness evidence SHA-256 is
+`40b684ff6c3c1da7bdc16067f0441c104133d5a58fa50ef293b7d8e522613bbe`.
