@@ -214,16 +214,30 @@ block, snapshots all six logs, scans every formal block from 92,696 through
 that boundary, requires the exact six-block Rust leader cadence and ordered
 `5+5` commits, proves every completed missing-validator timeout recovers at
 the next view, partitions every warning, rejects all critical signals, and
-re-runs the complete static-boundary check. The pushed source commit is
-`49fe63195c7be074edcdf1151225f7f130e8ff39`; frozen deep-audit and static-tool
-SHA-256 values are `c95e7cb6...33db` and `b27890ad...10ec`. Its mutation-free
-preflight SHA-256 is `4ac052bb...444`, and supervised waiter PID 57537 is
-armed. An initial detached spawn was reaped with its command session before it
-could write output; its empty log and stale PID are preserved under
-`excluded/failed-three-hour-deep-audit-launch-20260803T2033Z/`. It neither
-executed an audit nor created failure evidence, so the frozen tool was
-relaunched in the persistent supervisor session without changing any node,
-monitor, chain data, nonce, or elapsed stream.
+re-runs the complete static-boundary check.
+
+An 80-minute full-path rehearsal exposed and correctly rejected a snapshot
+boundary race in the first audit implementation: it selected the most recent
+historical Rust block, but a newer timeout could be logged before the copy and
+its next-view recovery immediately after it. The partial audit still proved
+the 505-block canonical leader range, exact `5+5` order, warning partition,
+and recovery of all 99 completed timeouts, but fail-closed rejected the one
+boundary timeout as pending. Commit `5b855bab...ed4` now waits until the latest
+timeout's recovery commit is present in both the live log and committed view
+before selecting and freezing the boundary. The superseded artifacts are
+preserved under `excluded/`.
+
+The corrected frozen V2 (`aea2c249...a73`, static tool
+`b27890ad...10ec`) then passed the same 80-minute gate end-to-end. It scans
+heights 92,696–93,218: all 523 blocks form one continuous six-endpoint chain,
+all 88 Rust slots are exact ordered `5+5`, all 102 timeouts recover at the next
+view with zero pending, all 824 warnings are classified with zero unexpected
+or critical signals, and all 24 static Gov files remain exact. Composite and
+milestone SHA-256 values are `5210a5e8...fbff` and `817cce64...b878`.
+V2 mutation-free preflight SHA-256 is `8e894c62...6565`; persistent
+three-hour waiter PID 71290 is armed. Earlier detached/supervisor V1 launch
+artifacts remain recoverably excluded and did not affect nodes, chain data,
+nonce, or formal timing.
 
 The superseded runtime27 candidate passed all `internal` and `cmd/n42` tests;
 two consecutive optimized builds were byte-identical. Its pinned Gov binary
