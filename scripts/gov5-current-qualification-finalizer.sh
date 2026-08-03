@@ -17,6 +17,8 @@ restart_evidence="$runtime/evidence/rust-restart-rejoin-$gov_version.jsonl"
 leader_final="$runtime/evidence/rust-leader-final-audit.jsonl"
 timeout_final="$runtime/evidence/timeout-recovery-final-audit.jsonl"
 runtime_log_final="$runtime/evidence/runtime-log-final-audit.jsonl"
+final_log_root="$runtime/evidence/final-log-snapshot"
+final_rust_log="$final_log_root/logs/rust.log"
 resource_evidence="$runtime/evidence/rust-resource-24h.jsonl"
 resource_audit="$runtime/evidence/rust-resource-24h-audit.json"
 upstream="$runtime/evidence/gov5-upstream-24h.jsonl"
@@ -325,6 +327,7 @@ test ! -e "$restart_evidence"
 test ! -e "$leader_final"
 test ! -e "$timeout_final"
 test ! -e "$runtime_log_final"
+test ! -e "$final_log_root"
 test ! -e "$resource_audit"
 test ! -e "$upstream_audit"
 test ! -e "$soak_audit"
@@ -476,19 +479,28 @@ jq -nc \
     rpcRecoverySeconds:$rpc_recovery_seconds,
     consensusAfter:$consensus,equivocations:$equivocations}' >>"$restart_evidence"
 
+# Close the final evidence at a Rust-authored recovery point so the summary
+# contains no timeout that is merely waiting for its successor view.
+wait_for_rust_authored_head
+
+# Freeze one log tree and use that exact immutable Rust log for all three
+# final log-dependent audits. The live log continues growing while resource
+# evidence closes, so auditing it directly would leave stale embedded hashes.
+mkdir -p "$final_log_root/logs"
+cp "$runtime"/logs/gov{1,2,3,4,5}.log "$runtime/logs/rust.log" \
+  "$final_log_root/logs/"
+final_rust_log_sha="$(shasum -a 256 "$final_rust_log" | awk '{print $1}')"
+
 env \
   N42_QUAL_RUNTIME="$runtime" \
   N42_QUAL_PORTS="$ports" \
   N42_QUAL_RUST_PORT="$rust_port" \
   N42_QUAL_RUST_MINER="$rust_miner" \
-  N42_QUAL_RUST_LOG="$runtime/logs/rust.log" \
+  N42_QUAL_RUST_LOG="$final_rust_log" \
   "$harness" audit-rust-leaders "$rust_leader_start" "$post_restart_head" \
     "$leader_final" >/dev/null
-# Close the final evidence at a Rust-authored recovery point so the summary
-# contains no timeout that is merely waiting for its successor view.
-wait_for_rust_authored_head
-env N42_QUAL_RUNTIME="$runtime" N42_QUAL_RUST_PORT="$rust_port" \
-  "$harness" audit-timeout-recovery "$runtime/logs/rust.log" \
+env N42_QUAL_RUNTIME="$final_log_root" N42_QUAL_RUST_PORT="$rust_port" \
+  "$harness" audit-timeout-recovery "$final_rust_log" \
     "$timeout_final" >/dev/null
 jq -e -s '
   length == 1 and .[0].status == "PASS" and
@@ -498,8 +510,8 @@ jq -e -s '
   .[0].everyCompletedTimeoutRecoveredAtNextView == true and
   .[0].recoveredByRustVotesFivePlusFive == true
 ' "$timeout_final" >/dev/null
-env N42_QUAL_RUNTIME="$runtime" \
-  "$harness" audit-runtime-logs "$runtime/logs/rust.log" \
+env N42_QUAL_RUNTIME="$final_log_root" \
+  "$harness" audit-runtime-logs "$final_rust_log" \
     "$runtime_log_final" >/dev/null
 jq -e -s '
   length == 1 and .[0].status == "PASS" and
@@ -508,6 +520,9 @@ jq -e -s '
   .[0].compactEvictionsMatchRustLeaderCommits == true and
   .[0].unexpectedWarnings == 0 and .[0].criticalSignals == 0
 ' "$runtime_log_final" >/dev/null
+test "$(jq -er '.[0].logSha256' "$timeout_final")" = "$final_rust_log_sha"
+test "$(jq -er '.[0].rustLogSha256' "$runtime_log_final")" = \
+  "$final_rust_log_sha"
 resource_monitor_pattern="monitor-rust-resources 87000 300 $resource_evidence"
 while pgrep -f "$resource_monitor_pattern" >/dev/null; do
   kill -0 "$(<"$runtime/pids/rust.pid")"
@@ -550,6 +565,8 @@ jq -nc \
   --arg leader_sha "$(shasum -a 256 "$leader_final" | awk '{print $1}')" \
   --arg timeout_sha "$(shasum -a 256 "$timeout_final" | awk '{print $1}')" \
   --arg runtime_log_sha "$(shasum -a 256 "$runtime_log_final" | awk '{print $1}')" \
+  --arg final_rust_log "$final_rust_log" \
+  --arg final_rust_log_sha "$final_rust_log_sha" \
   --arg resource_sha "$(shasum -a 256 "$resource_evidence" | awk '{print $1}')" \
   --arg upstream_sha "$(shasum -a 256 "$upstream" | awk '{print $1}')" \
   --slurpfile soak "$soak_audit" \
@@ -589,6 +606,7 @@ jq -nc \
    rustLeaderAudit:$leaders[-1],rustLeaderEvidenceSha256:$leader_sha,
    timeoutRecoveryAudit:$timeouts[-1],timeoutRecoveryEvidenceSha256:$timeout_sha,
    runtimeLogAudit:$runtime_logs[-1],runtimeLogEvidenceSha256:$runtime_log_sha,
+   immutableFinalLog:{path:$final_rust_log,sha256:$final_rust_log_sha},
    rustResourceAudit:$resources[-1],rustResourceEvidenceSha256:$resource_sha,
    postBurstExact:true,postRestartExact:true,archiveParityPostBurst:true,
    zeroEquivocations:true}' >"$summary"

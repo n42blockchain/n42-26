@@ -192,6 +192,8 @@ post_restart_audit="$runtime/evidence/mixed-post-restart-10m-audit.json"
 leaders="$runtime/evidence/rust-leader-final-audit.jsonl"
 timeouts="$runtime/evidence/timeout-recovery-final-audit.jsonl"
 runtime_logs="$runtime/evidence/runtime-log-final-audit.jsonl"
+final_log_root="$runtime/evidence/final-log-snapshot"
+final_rust_log="$final_log_root/logs/rust.log"
 resources="$runtime/evidence/rust-resource-24h.jsonl"
 resource_audit="$runtime/evidence/rust-resource-24h-audit.json"
 failures="$runtime/evidence/gov5-906-finalizer-failures.jsonl"
@@ -200,7 +202,7 @@ for path in "$summary" "$formal" "$soak_audit" "$upstream" \
   "$upstream_complete" "$upstream_audit" "$burst" "$post_burst" \
   "$post_burst_audit" "$archive_post_burst" "$restart" "$post_restart" \
   "$post_restart_audit" "$leaders" "$timeouts" "$runtime_logs" \
-  "$resources" "$resource_audit"; do
+  "$final_rust_log" "$resources" "$resource_audit"; do
   require_file "$path"
 done
 test ! -s "$failures"
@@ -249,6 +251,8 @@ jq -e '
   .runtimeLogAudit.status == "PASS" and
   .runtimeLogAudit.unexpectedWarnings == 0 and
   .runtimeLogAudit.criticalSignals == 0 and
+  .immutableFinalLog.path != null and
+  (.immutableFinalLog.sha256 | test("^[0-9a-f]{64}$")) and
   .rustResourceAudit.status == "PASS" and
   .rustResourceAudit.elapsedSeconds >= 86400 and
   .rustResourceAudit.singleProcess == true and
@@ -288,6 +292,16 @@ assert_summary_sha "$summary" rustLeaderEvidenceSha256 "$leaders"
 assert_summary_sha "$summary" timeoutRecoveryEvidenceSha256 "$timeouts"
 assert_summary_sha "$summary" runtimeLogEvidenceSha256 "$runtime_logs"
 assert_summary_sha "$summary" rustResourceEvidenceSha256 "$resources"
+
+test "$(jq -er '.immutableFinalLog.path' "$summary")" = "$final_rust_log"
+test "$(jq -er '.immutableFinalLog.sha256' "$summary")" = \
+  "$(sha256 "$final_rust_log")"
+test "$(jq -er '.timeoutRecoveryAudit.log' "$summary")" = "$final_rust_log"
+test "$(jq -er '.timeoutRecoveryAudit.logSha256' "$summary")" = \
+  "$(sha256 "$final_rust_log")"
+test "$(jq -er '.runtimeLogAudit.rustLog' "$summary")" = "$final_rust_log"
+test "$(jq -er '.runtimeLogAudit.rustLogSha256' "$summary")" = \
+  "$(sha256 "$final_rust_log")"
 
 jq -e --slurpfile artifact "$soak_audit" '.soakAudit == $artifact[0]' \
   "$summary" >/dev/null
@@ -357,14 +371,14 @@ leader_end="$(jq -er '.rustLeaderAudit.endHeight' "$summary")"
 env N42_QUAL_RUNTIME="$runtime" N42_QUAL_PORTS="$ports" \
   N42_QUAL_RUST_PORT=29545 \
   N42_QUAL_RUST_MINER=0x81d4c1f92ddb837cb46f82280d9b491b101fa582 \
-  N42_QUAL_RUST_LOG="$runtime/logs/rust.log" \
+  N42_QUAL_RUST_LOG="$final_rust_log" \
   "$frozen_harness" audit-rust-leaders "$leader_start" "$leader_end" \
     /dev/null >/dev/null
-env N42_QUAL_RUNTIME="$runtime" N42_QUAL_RUST_PORT=29545 \
-  "$frozen_harness" audit-timeout-recovery "$runtime/logs/rust.log" \
+env N42_QUAL_RUNTIME="$final_log_root" N42_QUAL_RUST_PORT=29545 \
+  "$frozen_harness" audit-timeout-recovery "$final_rust_log" \
     /dev/null >/dev/null
-env N42_QUAL_RUNTIME="$runtime" "$frozen_harness" \
-  audit-runtime-logs "$runtime/logs/rust.log" /dev/null >/dev/null
+env N42_QUAL_RUNTIME="$final_log_root" "$frozen_harness" \
+  audit-runtime-logs "$final_rust_log" /dev/null >/dev/null
 env N42_QUAL_RUNTIME="$runtime" \
   N42_QUAL_QMDB_PROOF_VERIFY="$frozen_qmdb_verifier" \
   "$frozen_harness" archive-rpc-parity \
@@ -380,6 +394,7 @@ jq -nc \
     verifierScriptSha256:$verifier_sha,
     allEvidenceHashesRecomputedExact:true,allEmbeddedAuditsExact:true,
     independentRawAuditsReexecuted:true,liveArchiveParityReexecuted:true,
+    immutableFinalLogExact:true,
     liveChainExact:true,genesisExact:true,consensusReady:true,
     zeroEquivocations:true,pinnedInputsExact:true,sourcesAndRemotesExact:true,
     finalSenderNonce:"0x22",transactionsFinalized:17}'
