@@ -679,3 +679,11 @@ hash 顺序精确。343 组 timeout/pacemaker 全部在下一 view 恢复，pend
 2,794 条 warning 全量归类，未知 warning 与 critical signal 均为零。冻结 Rust
 日志、leader、timeout、runtime-log SHA-256 分别为 `7390709d...3bec`、
 `dfa0365f...eeea`、`6ac00a2a...da71`、`a9c2593d...031c`。
+
+正式六小时复合里程碑在未放宽验收规则下 PASS：715 个 head 样本覆盖 21,668 秒
+并增长 2,412 块，最大间隔 31 秒、最大 lag 2、全程零交易；73 个同 PID 资源
+样本覆盖 21,610 秒，峰值 RSS 275,616 KiB、线程 162、FD 93，head/log/QMDB
+WAL 单调并记录 1,944 KiB compaction；37 个 Gov5 main 精确样本覆盖 21,634 秒。
+里程碑记录 405 次 Rust `5+5`、七验证者 CommitQC、零双签、零交易和空失败流，
+SHA-256 为 `c906d490bff8e62eeb741191cc4d4e9e1b44b9e0609651e56af9e15d18d9ef74`。
+12/18 小时等待器与完整受控闭环继续挂载。

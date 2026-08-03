@@ -402,6 +402,18 @@ zero unknown warnings or critical signals. The frozen Rust log, leader,
 timeout, and runtime-log SHA-256 values are `7390709d...3bec`,
 `dfa0365f...eeea`, `6ac00a2a...da71`, and `a9c2593d...031c`.
 
+The formal six-hour composite milestone passes without relaxed acceptance.
+Its 715 head samples span 21,668 seconds and grow 2,412 blocks from height
+92,623 to 95,035, with a 31-second maximum gap, maximum lag two, and continuous
+zero-transaction coverage. Seventy-three same-PID resource samples span
+21,610 seconds; peak RSS is 275,616 KiB, thread and descriptor maxima are 162
+and 93, and head/log/QMDB WAL remain monotonic while recording the 1,944-KiB
+compaction. Thirty-seven exact Gov5-main samples span 21,634 seconds. The
+milestone records 405 Rust `5+5` commits, seven-validator CommitQC, zero
+equivocations, zero transactions, and no failure evidence. Its SHA-256 is
+`c906d490bff8e62eeb741191cc4d4e9e1b44b9e0609651e56af9e15d18d9ef74`.
+The 12- and 18-hour waiters and complete guarded closure remain armed.
+
 Two runtime27 canary dry runs produced no mutation: the controller wait loop
 did not yet continue across slots in which Rust was not the leader. Their
 zero-byte outputs were moved under `excluded/`; the corrected canary and all
