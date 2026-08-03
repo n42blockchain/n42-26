@@ -67,11 +67,10 @@ re-execution. Only then may the additional one-hour latest-stable-Reth run and
 its independent verifier begin. No final acceptance is claimed before the
 atomic total-goal verifier passes.
 
-Two runtime27 controller dry runs produced no mutation: the first canary
-wait-loop revision exited before its second Rust slot, and the first strict
-verifier invocation referenced the wrong dependency-worktree date. Their
-zero-byte outputs were moved under `excluded/`; the corrected canary and
-verifier preflight were rerun from fresh output paths before formal timing.
+Two runtime27 canary dry runs produced no mutation: the controller wait loop
+did not yet continue across slots in which Rust was not the leader. Their
+zero-byte outputs were moved under `excluded/`; the corrected canary and all
+four preflights were rerun from fresh output paths before formal timing.
 
 ## Current 2026-08-02 baseline — GOV5 5.7.906
 
