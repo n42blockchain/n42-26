@@ -531,6 +531,17 @@ run_qualification() {
     .equivocations.total == 0 and .preRolloverDataSnapshot.byteExact == true' \
     "$summary" >/dev/null
   cat "$summary"
+
+  # Keep the foreground controller (and therefore its latest-Reth child
+  # process group) alive until the independent and total-goal verifiers have
+  # consumed the live post-rollover chain.
+  total_goal="$runtime/evidence/gov5-906-total-goal-final-verification.json"
+  while ! test -s "$total_goal"; do
+    kill -0 "$(<"$runtime/pids/rust.pid")"
+    test ! -s "$failures"
+    sleep 1
+  done
+  jq -e '.status == "PASS"' "$total_goal" >/dev/null
 }
 
 case "${1:-}" in
