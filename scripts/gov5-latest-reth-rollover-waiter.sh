@@ -76,4 +76,3 @@ exec env \
   N42_LATEST_RETH_GOV_COMMIT="$expected_gov_candidate" \
   N42_LATEST_RETH_GOV_UPSTREAM="$expected_gov_main" \
   "$script" run
-

@@ -67,4 +67,3 @@ env \
 jq -e '.status == "PASS"' "$temporary" >/dev/null
 mv "$temporary" "$output"
 cat "$output"
-
