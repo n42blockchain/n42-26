@@ -581,6 +581,15 @@ eight-hour gate already has composite and full six-endpoint raw coverage, and
 the 24-hour finalizer performs the complete final deep audit, so long-run
 coverage is continuous without duplicating state mutation.
 
+Pushed commit `d0353f6c...f4ab` adds generic supplemental waiter SHA-256
+`6878355c...e2e8`. Frozen 6/12/18-hour instances run as PIDs
+8497/8962/9075 (sessions 55444/45824/39512). Each consumes only its strict
+milestone, then automatically repeats the 12-event archive/QMDB audit,
+five-socket/five-authenticated-peer network matrix, 905 data compatibility,
+and 24-hour resource projection. Frozen network/data/resource auditor SHA-256
+values are `955580f2...c533`, `5bb09bb1...9a67`, and `f6c5c495...bb80`.
+All preflights pass without mutation.
+
 The strict 2.5-hour (9,000-second) composite gate passes. Its 299 head
 samples span 9,034 seconds, grow by 924 blocks, retain continuous zero-
 transaction coverage, and have maximum lag one. Thirty-one resource samples
