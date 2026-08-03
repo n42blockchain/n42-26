@@ -813,6 +813,15 @@ SHA-256 为 `078089fc...bb6`。
 排除且未发生写操作。证据 SHA-256 为 `dee51343...929a`，可重复复核脚本为
 `scripts/recheck-gov5-runtime-static-boundary.sh`。
 
+三小时门另挂载 fail-closed 深审计 PID 57537。它只在原复合里程碑 PASS 后冻结六端
+日志，并从正式首个 Rust 块 92,696 扫描到闭合 Rust 块，逐块检查六端规范链、六块
+轮值节奏、顺序 `5+5`、timeout 下一 view 恢复、warning 全量分类和 critical signal；
+随后再次执行 905 静态边界复核。审计器提交为 `49fe6319...e8ff39`，冻结工具 SHA-256
+为 `c95e7cb6...33db`，mutation-free 预检证据 SHA-256 为 `4ac052bb...444`。首次
+detached spawn 随命令 session 被回收，尚未产生审计或失败证据；空日志和 stale PID
+已移入 `excluded/`，随后改由持久 supervisor session 启动，节点、数据、nonce 和
+正式计时均未变化。
+
 三十分钟复合门 PASS：65 个 head 样本覆盖 1,940 秒、增长 198 块、最大 lag 0；
 7 个同 PID 资源样本覆盖 1,801 秒；4 个可达且精确的 Gov5 main 样本覆盖 1,802
 秒。Rust 累计 48 次 `5+5`，CommitQC 仍存在，双签与已发送交易均为零；里程碑

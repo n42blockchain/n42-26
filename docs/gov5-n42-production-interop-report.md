@@ -197,6 +197,24 @@ excluded, and the audit performs no mutation. Evidence SHA-256 is
 The reusable read-only rechecker is
 `scripts/recheck-gov5-runtime-static-boundary.sh`.
 
+The three-hour gate now has an additional fail-closed deep audit rather than
+relying only on sampled head/resource/upstream health. After the existing
+three-hour milestone passes, the frozen audit closes on a canonical Rust
+block, snapshots all six logs, scans every formal block from 92,696 through
+that boundary, requires the exact six-block Rust leader cadence and ordered
+`5+5` commits, proves every completed missing-validator timeout recovers at
+the next view, partitions every warning, rejects all critical signals, and
+re-runs the complete static-boundary check. The pushed source commit is
+`49fe63195c7be074edcdf1151225f7f130e8ff39`; frozen deep-audit and static-tool
+SHA-256 values are `c95e7cb6...33db` and `b27890ad...10ec`. Its mutation-free
+preflight SHA-256 is `4ac052bb...444`, and supervised waiter PID 57537 is
+armed. An initial detached spawn was reaped with its command session before it
+could write output; its empty log and stale PID are preserved under
+`excluded/failed-three-hour-deep-audit-launch-20260803T2033Z/`. It neither
+executed an audit nor created failure evidence, so the frozen tool was
+relaunched in the persistent supervisor session without changing any node,
+monitor, chain data, nonce, or elapsed stream.
+
 The superseded runtime27 candidate passed all `internal` and `cmd/n42` tests;
 two consecutive optimized builds were byte-identical. Its pinned Gov binary
 SHA-256 was `72e918d9500169e227ef1a0c9d5dd751dcd7d58f1df0871825b61f196e3fce95`.
