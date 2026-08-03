@@ -17,7 +17,7 @@ expected_deps_head="aec34a0cd465e8fdbb598b90bc778fe96e25d6c0"
 expected_reth_head="91725e3aa8f2a0bbc5a425e931a2f2b2f31b2a7b"
 expected_gov_binary_sha="${N42_VERIFY_GOV_BINARY_SHA:-f84ac8e9ae49a1abe1af4e46945d3ecc8d8b769655dbfe0808d2043d9cf16ea3}"
 expected_rust_binary_sha="${N42_VERIFY_RUST_BINARY_SHA:-0a4dbcf30d7cc9944a7cd7c96a25c1ebf862df10bde76210a381ef492e362b9f}"
-expected_finalizer_sha="${N42_VERIFY_FINALIZER_SHA:-2a6a7ec212735c2d274c834d48fac83321fcb109f761b6ef295bede5be9d8e41}"
+expected_finalizer_sha="${N42_VERIFY_FINALIZER_SHA:-8fe85ecf8b64948751700d13758d1f53f9a82d5ad0a623a335803de04c430add}"
 
 require_file() {
   test -f "$1" || {
