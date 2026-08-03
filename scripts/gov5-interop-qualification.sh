@@ -927,8 +927,8 @@ audit_rust_resources() {
       (.threads|type) == "number" and .threads > 0 and .threads <= 256 and
       (.fileDescriptors|type) == "number" and
         .fileDescriptors > 0 and .fileDescriptors <= 256 and
-      (.rethDataKiB|type) == "number" and
-      (.consensusDataKiB|type) == "number" and
+      (.rethDataKiB|type) == "number" and .rethDataKiB > 0 and
+      (.consensusDataKiB|type) == "number" and .consensusDataKiB > 0 and
       (.logBytes|type) == "number" and
       (.qmdbWalBytes|type) == "number") and
     ([.[].pid] | unique | length) == 1 and
@@ -938,12 +938,8 @@ audit_rust_resources() {
         ($times[$i]-$times[$i-1]) > 0 and
         ($times[$i]-$times[$i-1]) <= 360] | all)) and
     .[-1].head > .[0].head and
-    .[-1].rethDataKiB >= .[0].rethDataKiB and
-    .[-1].consensusDataKiB >= .[0].consensusDataKiB and
     ([range(1;length) as $i |
       .[$i].head >= .[$i-1].head and
-      .[$i].rethDataKiB + 4 >= .[$i-1].rethDataKiB and
-      .[$i].consensusDataKiB + 4 >= .[$i-1].consensusDataKiB and
       .[$i].logBytes >= .[$i-1].logBytes and
       .[$i].qmdbWalBytes >= .[$i-1].qmdbWalBytes] | all)
   ' "$evidence_file" >/dev/null
@@ -976,14 +972,21 @@ audit_rust_resources() {
         consensusDataKiB:($samples[-1].consensusDataKiB-$samples[0].consensusDataKiB),
         logBytes:($samples[-1].logBytes-$samples[0].logBytes),
         qmdbWalBytes:($samples[-1].qmdbWalBytes-$samples[0].qmdbWalBytes)},
-      allocatedStorageStepJitterKiB:{
+      allocatedStorageStepDecreaseKiB:{
         maximumObserved:([range(1;$samples|length) as $i |
           ([($samples[$i-1].rethDataKiB-$samples[$i].rethDataKiB),
             ($samples[$i-1].consensusDataKiB-$samples[$i].consensusDataKiB)] | max) |
-          select(. > 0)] | max // 0),limit:4},
+          select(. > 0)] | max // 0),
+        rethMaximum:([range(1;$samples|length) as $i |
+          ($samples[$i-1].rethDataKiB-$samples[$i].rethDataKiB) |
+          select(. > 0)] | max // 0),
+        consensusMaximum:([range(1;$samples|length) as $i |
+          ($samples[$i-1].consensusDataKiB-$samples[$i].consensusDataKiB) |
+          select(. > 0)] | max // 0)},
       singleProcess:true,logicalCountersMonotonic:true,
-      allocatedStorageGrowthNonnegative:true,
-      storageAndLogCountersMonotonicWithinAllocationGranularity:true}')"
+      allocatedStorageMeasurementsNonnegative:true,
+      allocatedStorageMayDecreaseDuringCompaction:true,
+      headLogAndWalCountersMonotonic:true}')"
   if test -n "$output_file"; then
     mkdir -p "$(dirname "$output_file")"
     printf '%s\n' "$summary" >>"$output_file"

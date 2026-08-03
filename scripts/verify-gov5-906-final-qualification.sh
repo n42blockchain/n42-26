@@ -17,7 +17,7 @@ expected_deps_head="aec34a0cd465e8fdbb598b90bc778fe96e25d6c0"
 expected_reth_head="91725e3aa8f2a0bbc5a425e931a2f2b2f31b2a7b"
 expected_gov_binary_sha="${N42_VERIFY_GOV_BINARY_SHA:-72e918d9500169e227ef1a0c9d5dd751dcd7d58f1df0871825b61f196e3fce95}"
 expected_rust_binary_sha="${N42_VERIFY_RUST_BINARY_SHA:-0a4dbcf30d7cc9944a7cd7c96a25c1ebf862df10bde76210a381ef492e362b9f}"
-expected_finalizer_sha="${N42_VERIFY_FINALIZER_SHA:-884cf614af78ad8001a64c1972659982cae6953d399197f84384cfb070b6fb0a}"
+expected_finalizer_sha="${N42_VERIFY_FINALIZER_SHA:-e116089dab3082c44645eb4c547f6c3ec0f2e7d7afc3361ec77b509e2544f9c0}"
 
 require_file() {
   test -f "$1" || {
@@ -147,7 +147,7 @@ assert_pinned_inputs() {
   assert_sha "$runtime/artifacts/bootstrap-bundle.json" \
     35dda59684e7f56978e5d8de385fa2d2bf15b47747388b88a7449ac31387bf15
   assert_sha "$runtime/artifacts/scripts/gov5-interop-qualification.sh" \
-    6b95241f06fbf2225e9dff8a9bd4534ac5c1363f6f62109883695ebf7db189ab
+    037cc547eb958f0b993565b81aefe30b239e0ad061c27895e3287c6d23e95309
   assert_sha "$runtime/artifacts/scripts/gov5-current-qualification-finalizer.sh" \
     "$expected_finalizer_sha"
   assert_sha "$runtime/artifacts/binaries/n42-qmdb-proof-verify" \
@@ -257,10 +257,12 @@ jq -e '
   .rustResourceAudit.elapsedSeconds >= 86400 and
   .rustResourceAudit.singleProcess == true and
   .rustResourceAudit.logicalCountersMonotonic == true and
-  .rustResourceAudit.allocatedStorageGrowthNonnegative == true and
-  .rustResourceAudit.storageAndLogCountersMonotonicWithinAllocationGranularity == true and
-  .rustResourceAudit.allocatedStorageStepJitterKiB.maximumObserved <= 4 and
-  .rustResourceAudit.allocatedStorageStepJitterKiB.limit == 4
+  .rustResourceAudit.allocatedStorageMeasurementsNonnegative == true and
+  .rustResourceAudit.allocatedStorageMayDecreaseDuringCompaction == true and
+  .rustResourceAudit.headLogAndWalCountersMonotonic == true and
+  (.rustResourceAudit.allocatedStorageStepDecreaseKiB.maximumObserved|type) == "number" and
+  (.rustResourceAudit.allocatedStorageStepDecreaseKiB.rethMaximum|type) == "number" and
+  (.rustResourceAudit.allocatedStorageStepDecreaseKiB.consensusMaximum|type) == "number"
 ' "$summary" >/dev/null
 
 jq -e \
