@@ -1923,3 +1923,18 @@ monitor, transaction, or acceptance time. The replacement copy explicitly
 waits for `pendingTimeouts:0` before freezing logs. The exclusion-record
 SHA-256 is
 `defbe6a1d6cfe773ba95823cc5f7e63ea196ae7528319f999559369001de0399`.
+
+A fresh remote and binary recheck during the continuing window finds no
+baseline movement. Gov5 `origin/main` remains `920f7536...`, the pushed 5.7.906
+candidate remains `8915b4cc...`, and official Reth stable remains `v2.4.1`.
+The prepared rollover binary reports Reth 2.4.1 at `91725e3aa` and retains
+SHA-256 `0a4dbcf3...362b9f`. A direct Gov5 `geth-live version` probe revealed that
+this CLI treats `version` as a default-node start: it printed the 5.7.906
+banner, created a separate `./n42data`, and exited on its built-in mainnet
+genesis mismatch. The probe PID was absent before preservation, its 4 MiB
+default directory was moved intact under excluded evidence, and all six strict
+endpoints still returned the explicit 5.7.905-lineage genesis
+`b71c2810...1392ec` plus identical current heads and roots. No strict datadir,
+port, PID, monitor, transaction, or acceptance time changed. The exclusion
+record SHA-256 is
+`ed6486ca6e6fb7fcff506a6eba1b7a40fe4641dad1432adbe9390e72f1e329ea`.
