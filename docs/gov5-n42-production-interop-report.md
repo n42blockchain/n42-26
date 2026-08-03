@@ -615,6 +615,21 @@ equal to `952ddac5...662e`. Its first parent exactly links to the prior segment'
 height-93,955 terminal hash `ea374f94...c06a`; composite evidence SHA-256 is
 `3fa0d9a2...4788`.
 
+An independent read-only audit of the final closure DAG confirms the ordering:
+the strict finalizer consumes the immutable 24-hour stream, sends the 17-item
+burst, runs ten-minute post-burst stability, archive/QMDB parity, Rust restart
+and catch-up, and ten-minute post-restart stability. Strict independent
+verification then triggers the extra official-Reth-2.4.1 hour; total evidence,
+the final nonce-`0x22` 905 data audit, base completion, and V2 completion close
+in sequence with no evidence dependency cycle. All seven frozen closure
+scripts pass `bash -n`; base/V2 auditor SHA-256 values remain
+`b87aa985...b3f0` and `cf73a512...4093`. Fresh preflights both pass at pushed
+primary `5e3a3701...e5e`, rechecking source/remotes, binaries, genesis, live
+six-endpoint identity, 17-item burst artifact `6cf05cd0...d750`, nonce `0x11`,
+and empty failure streams while explicitly retaining
+`completionNotClaimed=true` and mutation-free status. Combined preflight
+evidence SHA-256 is `a327662e...d06b`.
+
 The strict 2.5-hour (9,000-second) composite gate passes. Its 299 head
 samples span 9,034 seconds, grow by 924 blocks, retain continuous zero-
 transaction coverage, and have maximum lag one. Thirty-one resource samples

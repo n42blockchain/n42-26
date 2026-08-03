@@ -1075,6 +1075,17 @@ Gov1–Gov5 各自产生 13 块，六端序列 SHA-256 均为 `952ddac5...662e`�
 parent 与上一段高度 93,955 的末块 hash `ea374f94...c06a` 精确衔接。复合证据
 SHA-256 为 `3fa0d9a2...4788`。
 
+最终收口 DAG 又完成一次独立只读审计：strict finalizer 依次执行 24 小时不可变流、
+17 笔 burst、10 分钟 post-burst、archive/QMDB、Rust 重启追高及 10 分钟
+post-restart；strict independent 完成后才触发 official Reth 2.4.1 额外一小时，随后
+total、最终 nonce `0x22` 的 905 数据审计、基础 completion 与 V2 completion 顺序
+闭合，不存在证据依赖环。七个冻结收口脚本 `bash -n` 全部通过；基础/V2 auditor
+SHA-256 仍为 `b87aa985...b3f0`、`cf73a512...4093`。两项最新 preflight 均以主
+提交 `5e3a3701...e5e` PASS，重新确认远端/source/binary/genesis/六端 live 身份、
+17 笔 burst 工件 `6cf05cd0...d750`、nonce `0x11` 与零失败证据，且明确
+`completionNotClaimed=true`、mutation-free；合并证据 SHA-256 为
+`a327662e...d06b`。
+
 2.5 小时（9,000 秒）复合门严格 PASS：299 个 head 样本覆盖 9,034 秒，增长 924
 块、最大 lag 1、零交易；原 Rust PID 70765 的 31 个资源样本覆盖 9,004 秒，RSS
 峰值 263,824 KiB、线程最多 163、FD 93；16 个 Gov5 main 样本覆盖 9,012 秒并
