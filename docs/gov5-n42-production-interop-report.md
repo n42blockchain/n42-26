@@ -329,6 +329,16 @@ The 6-, 12-, and 18-hour waiters, strict finalizer, restart/rejoin checks, and
 latest-stable-Reth rollover remain armed; this checkpoint releases no
 transaction and does not claim final acceptance.
 
+An independent immutable-log audit at the same boundary scans canonical
+heights 92,624 through 94,262. All 1,639 blocks are parent-continuous; all 274
+expected Rust slots are exact at all six endpoints and match 274 `5+5` commit
+records with exact view stride and hash order. All 276 timeout/pacemaker pairs
+recover at the next view with zero pending. The 2,252 warnings partition
+exactly into allowed classes, with zero unknown warnings or critical signals.
+The frozen Rust log, leader, timeout, and runtime-log SHA-256 values are
+`a185811f...8e55`, `53270ea6...2ebe`, `59c90704...4076`, and
+`e52303d2...100a`.
+
 Two runtime27 canary dry runs produced no mutation: the controller wait loop
 did not yet continue across slots in which Rust was not the leader. Their
 zero-byte outputs were moved under `excluded/`; the corrected canary and all
