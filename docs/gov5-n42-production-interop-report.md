@@ -393,6 +393,16 @@ and Rust's is `0x12b0c`, both below signed gas `0x186a0`; all transfers estimate
 exactly `0x5208`. The audit sends zero transactions. Evidence SHA-256 is
 `206b8ba43a9ca7cbf72fcb4507884ad04a92c056f1a4a6bccafcb53b2f8bbc3d`.
 
+A negative fixture replacing transaction index eight's declared hash with
+zero is rejected immediately with exit code one and no PASS output or live-
+runtime mutation. Negative evidence SHA-256 is
+`2b6f305fb419935f1985578223bd76355931045ff3b0bd9e020b5914d082b6af`.
+The adjacent live resource recheck spans 27 samples, 7,803 seconds, and 798
+blocks on unchanged Rust PID 70765. RSS peaks at 253,088 KiB, threads at 163,
+and descriptors remain 93; head, log, and WAL logical counters are monotonic.
+Resource evidence SHA-256 is
+`65e04bac6aac5e4197d3a66c009b34e1499ce4847d6d569ebaa9541d1ce7896e`.
+
 The superseded runtime27 candidate passed all `internal` and `cmd/n42` tests;
 two consecutive optimized builds were byte-identical. Its pinned Gov binary
 SHA-256 was `72e918d9500169e227ef1a0c9d5dd751dcd7d58f1df0871825b61f196e3fce95`.
