@@ -203,6 +203,19 @@ Thirteen Gov5-upstream samples span 7,210 seconds and remain exact at
 equivocations and failure evidence are zero. Milestone SHA-256 is
 `ce33a8b268acb8a85e0b16b1f0b492c6c76c26fc4922dc08b91abf6cb9cf9806`.
 
+A fresh mutation-free 135-minute identity checkpoint specifically rechecked
+the 905-data/906-binary boundary and the previously suspected genesis change.
+All six endpoints reported chain ID `0x477`, genesis hash
+`0xb71c28109836f120453d097c38819a55b14c49abcc92713037fb9b11201392ec`,
+genesis state root `0x91a450c13f9deab2c9edf5832c96008862e7cc1169599f68461c3ec947099941`,
+and genesis receipts root
+`0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421`.
+At height `0x16d65`, latest hash/state/receipts were byte-for-byte identical,
+the sender latest and pending nonce remained `0x11`, client versions were Gov5
+5.7.906 and official Reth 2.4.1, and 156 Rust `5+5` commits, CommitQC, and zero
+equivocations were present. Checkpoint SHA-256 is
+`9f1881315a3a11a18d8ee2d6d4c2e8fde652cea285b9057b8be313e4603effb6`.
+
 The authoritative zero-transaction stream began at
 `2026-08-03T09:49:44Z`, common height 92,623, lag zero. It requires continuous
 six-endpoint hash/state/receipt equality, zero transactions in every newly

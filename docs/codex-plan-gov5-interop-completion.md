@@ -552,3 +552,10 @@ CommitQC、110 次 Rust `5+5` 和零 equivocation；证据 SHA-256 为
 块 / 最大 lag 2 / 零交易，26 个同 PID 资源样本 / 7,504 秒，13 个精确 Gov5 upstream
 样本 / 7,210 秒，148 次 Rust `5+5`、CommitQC、零 equivocation；里程碑 SHA-256
 为 `ce33a8b268acb8a85e0b16b1f0b492c6c76c26fc4922dc08b91abf6cb9cf9806`。
+
+随后在 135 分钟再次执行零突变完整身份检查，专门复核 905 数据延续到 906 二进制后
+可能变化的创世信息。六端 chainId 均为 `0x477`，创世 hash/state/receipts 三元组仍为
+固定预期值；高度 `0x16d65` 的最新 hash/state/receipts 逐字一致，latest/pending nonce
+仍为 `0x11`，客户端版本为 Gov5 5.7.906 与官方 Reth 2.4.1，并观察到 156 次 Rust
+`5+5`、CommitQC 和零 equivocation。证据 SHA-256 为
+`9f1881315a3a11a18d8ee2d6d4c2e8fde652cea285b9057b8be313e4603effb6`。
