@@ -438,6 +438,29 @@ timeout, and runtime-log SHA-256 values are `bfee67d8...2327`,
 `f2606ff2...17dc`, `8a089dd9...36c7`, and `0ea18d51...f889`. A read-only
 nine-hour composite waiter is additionally armed to narrow the 6→12 hour gap.
 
+The additional seven-hour composite milestone also passes without relaxed
+acceptance. Its 833 head samples span 25,245 seconds and grow 2,784 blocks,
+with a 31-second maximum gap, maximum lag two, and continuous zero-transaction
+coverage. Eighty-five samples from the same Rust PID 89930 span 25,212 seconds;
+peak RSS is 275,760 KiB, thread and descriptor maxima are 162 and 93, and the
+head/log/QMDB-WAL counters remain monotonic while retaining the 1,944-KiB
+compaction observation. All 43 upstream samples over 25,239 seconds equal
+`d12257c...`. The milestone records 467 Rust `5+5` commits, seven-validator
+CommitQC, zero equivocations, zero transactions, and no failure evidence. Its
+SHA-256 is
+`167b2c53ef9819cbec0ee2dd5abf4e6532da964406b57e46501564b911829756`.
+
+The seven-hour frozen-log incremental audit then scans the post-six-hour Rust
+slots from height 95,054 through 95,407. All 59 expected Rust canonical blocks
+are exact at all six endpoints and match 59/59 `5+5` records with continuous
+parents, exact view stride, and exact hash order. All 467 cumulative
+timeout/pacemaker pairs recover at the next view with zero pending. The 3,798
+warnings partition exactly into allowed classes, with zero unexpected warnings
+or critical signals. The frozen Rust log, leader, timeout, and runtime-log
+SHA-256 values are `366baf19...edf4`, `8086be8c...b9e`,
+`ce96ce70...efd`, and `66cd4e49...88f8`. No transaction or node restart is
+permitted before the 24-hour boundary.
+
 Two runtime27 canary dry runs produced no mutation: the controller wait loop
 did not yet continue across slots in which Rust was not the leader. Their
 zero-byte outputs were moved under `excluded/`; the corrected canary and all
