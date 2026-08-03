@@ -399,3 +399,859 @@ BLS key、network key、network metadata 和 epoch schedule。新目录只能用
 
 补充 fail-closed 回归已通过：伪造的错误 upstream SHA 以状态 1 退出且没有 completion
 marker；空 Gov 数据目录同样在产生 PID 前以状态 1 退出。两条安全门不会静默降级。
+
+---
+
+### T14 — Gov5 latest-main 再同步与 runtime20 严格窗口（2026-08-03）
+
+Gov5 `main` 在 runtime18 运行期间先推进到 `1114f1dd...`，随后在 runtime19
+预检期间又推进到 `c611124d...`。两个旧窗口均按 fail-closed 规则排除；runtime18
+保留了 24,464 秒、804 个健康零交易样本作为非资格诊断证据，runtime19 尚未开始正式
+计时。最新合并候选 `0f688685...` 已推送；新增上游提交仅修改 txflood 的 HTTP 响应体
+回收，不触及 genesis、HotStuff 或存储格式。
+
+Gov 全量测试和 `go test -race ./...` 通过；随机负缓存故障模拟器曾单次未触发，随后目标
+测试连续 20 次、整个 state 包连续 3 次及全量重跑全部通过。两个独立冷缓存构建逐字节
+一致，Gov SHA-256 为 `3a2ed3e0...e0da`。905 血统数据在停止态复制，99 个持久文件的
+源/目标清单逐字节一致，清单 SHA-256 为 `19624fe1...a993`；创世仍为
+`b71c2810...1392ec`。
+
+runtime20 使用五个 Gov 5.7.906 节点和官方稳定 Reth 2.4.1
+(`91725e3aa...`, binary `0a4dbcf3...62b9f`)。正式零交易窗口从
+`2026-08-03T04:07:59Z` 重新计时，首样本高度 90,704、lag 0、六端点
+hash/stateRoot/receiptsRoot 一致。资源流绑定 Rust PID 12655；Gov 上游流绑定
+`c611124d...`。独立预检、交易零发送预检、轮值、超时恢复与日志分区均 PASS。
+24 小时后自动执行 17 笔双入口交易、burst 后稳定性、归档/QMDB 对比、Rust 重启重入
+和最终独立复验；随后同一官方 Reth 还会做停止态字节快照和额外一小时复验。T14 仅在
+两级独立最终 PASS 均生成后关闭。
+
+---
+
+### T15 — Gov5 65a768 current-main 与 runtime21（2026-08-03）
+
+runtime20 的上游监控在 `2026-08-03T04:27:31Z` 检测到 Gov5 `main` 从
+`c611124d...` 前进到 `65a76826...`，因此按 fail-closed 规则立即停机并排除。该窗口
+保留 41 个全部健康的零交易样本，跨度 1,219 秒，高度 90,704 到 90,836，最大 lag 0；
+没有释放任何交易。排除证据 SHA-256 为 `e4e597e0...828d`。
+
+新上游只修改 txflood 与 txpool 容量环境变量，不涉及 genesis、HotStuff 或存储格式。
+合并候选 `1331c0df...` 已推送；全量测试、完整 race suite 和两次隔离冷缓存构建均通过，
+两个二进制逐字节一致，SHA-256 为 `73d01d1a...8ac6`。runtime20 在停止态的 905
+血统数据复制到 runtime21，102 个持久文件的相对路径清单逐字节一致，清单 SHA-256
+为 `99ec46f9...cc5`。
+
+runtime21 的六个 RPC 仍报告创世 `b71c2810...1392ec`，并从停止高度 90,836 同高同
+hash/stateRoot/receiptsRoot 恢复增长。严格预检覆盖 90 秒、18 个零交易样本，最大
+lag 0；两次 Rust 轮值均在六端点形成同一规范块并得到 `5+5`，缺席 Gov6 的 timeout
+集合精确且下一视图恢复，日志无未知告警，独立验证器与交易零发送预检均 PASS。
+正式 formal/resource/upstream 三流于 `2026-08-03T04:51:02Z` 启动，首样本高度
+90,895、lag 0，上游绑定 `65a76826...`；24 小时闭环仍按零交易、burst、重启重入及
+官方稳定 Reth 2.4.1 额外一小时的顺序执行。
+
+---
+
+### T16 — Gov5 ddcdaa current-main 与 runtime22（2026-08-03）
+
+runtime21 启动约九分钟后，独立守卫先于十分钟周期上游监控发现 Gov5 `main` 从
+`65a76826...` 前进到 `ddcdaa2f...`。全部控制进程和节点立即停止；19 个正式样本
+跨度 548 秒，高度 90,895 到 90,955，增长 60 块、最大 lag 0、全程零交易，六端点
+latest/pending nonce 都保持 `0x11`。排除证据 SHA-256 为 `7d7dd40d...711a`。
+
+最新上游增加 txpool 配置文件/CLI 路径和滞留交易驱逐测试，不修改 genesis 或
+HotStuff。合并候选 `673299ab...` 已推送；全量测试、完整 race suite 和两次独立
+冷缓存构建通过，二进制逐字节一致，SHA-256 为 `f84ac8e9...6ea3`。runtime21
+停止数据复制为 runtime22，105 个持久文件清单逐字节一致，清单 SHA-256 为
+`7d16d977...6d9d`。
+
+runtime22 从高度 90,961 的精确 hash/root 恢复；90 秒严格预检、两次 Rust `5+5`
+轮值、timeout 下一视图恢复、日志分区、六端点创世/nonce、CommitQC、零
+equivocation、独立验证器和交易零发送预检全部 PASS。新的 formal/resource/upstream
+三流于 `2026-08-03T05:14:42Z` 启动，首样本高度 90,991、lag 0，上游绑定
+`ddcdaa2f...`。
+
+---
+
+### T17 — Gov5 连续更新、runtime23–27 与 d12257 current-main（2026-08-03）
+
+Gov5 `main` 随后连续推进到 `5afabac1...`、`9c821032...`、`379046b97...`、
+`d09b3ad00...` 和 `d12257c92...`。每次变化都由独立上游守卫 fail-closed 检出；
+runtime22–26 均保留停止态数据、六端点精确头、Rust `5+5` 轮值和零交易 nonce 证据，
+没有把旧 main 上的运行时长计入当前资格。runtime26 在排除前积累了 25 个严格样本、
+731 秒、增长 84 块、最大 lag 0，排除证据 SHA-256 为
+`a9c8a5235828aec83ec50f78e3ae40eec541087b5e64aa2ecebf586a98386419`。
+
+当前候选 `d0999e7680bfbba71c252de1dd95efe64736e5f9` 合并
+`d12257c92e9b1e83d35c981441593663db6db72b` 并已推送。全量
+`go test ./internal/... ./cmd/n42/...` 通过，两次独立构建逐字节一致，Gov binary
+SHA-256 为 `72e918d9...e3fce95`。runtime27 从 runtime26 的停止态 905 血统数据
+复制；124 个文件、17,316,415,839 bytes 的源/目标内容清单完全一致，canonical
+manifest SHA-256 为 `1c115b92...37b4b`。创世 artifact 仍为
+`56180869...a687`，六端点创世 hash 仍为 `b71c2810...1392ec`，没有误用 906
+空目录内置的不同创世。
+
+runtime27 canary 的六端点 hash/stateRoot/receiptsRoot 精确一致；Rust 在 views
+95,452 和 95,459 出块并获得 `5+5`，七验证者 CommitQC 存在且 equivocation 为零。
+交易、严格独立验证器、最新 Reth rollover 和最新 Reth 独立验证器四项预检均 PASS，
+sender latest/pending nonce 保持 `0x11`，发送数为零。正式三流从
+`2026-08-03T09:49:44Z` 重新计时，首高度 92,623、lag 0；最终器、不可变日志门、
+两级独立验证器、官方稳定 Reth 监控、精确 PID 守卫以及 1/3/6/12/18 小时里程碑均已
+挂载。严格 24 小时通过后才执行 17 笔交易、archive/QMDB、burst 后 10 分钟、Rust
+重启重入 10 分钟；其后才执行官方稳定 Reth 2.4.1 (`91725e3aa...`) 的额外一小时
+验证。总目标只能由原子最终验证器关闭。
+
+首个严格一小时复合里程碑已于 `2026-08-03T10:50:56Z` PASS，未放宽任何门槛。
+冻结 head 流为 121 个样本 / 3,651 秒 / 增长 408 块 / 最大 lag 2 / 全程零交易；
+resource 流为 13 个样本 / 3,602 秒 / 单一 Rust PID 89930，峰值 RSS 250,096 KiB、
+threads 162、FD 93；upstream 流为 7 个精确 `d12257c92...` 样本 / 3,605 秒。
+Rust 已记录 71 次 `5+5` 轮值提交，CommitQC 存在、equivocation 为零、失败证据为空。
+独立只读复算再次通过；里程碑 SHA-256 为
+`40b0c17fd2d512a6ca80593ae22ef902494d82f483d23eba42a6041fcef1506a`。其余 3/6/12/18
+小时里程碑及最终自动闭环继续运行，首小时通过不提前释放交易。
+
+首小时后又对同一冻结 Rust 日志完成闭合深审计：高度 92,624–93,073 的 450 个
+规范块 parent 连续、六端精确一致，75 个预期 Rust 轮值块与 75 条 stride-seven
+提交日志逐一匹配且全部 `5+5`；77/77 timeout/pacemaker 均在下一 view 由 Rust
+`5+5` 恢复，630 条 warning 精确归类，未知 warning 和 critical signal 均为零。
+冻结 Rust 日志、leader、timeout、日志审计 SHA-256 分别为 `2ac01623...6a18`、
+`ce7dab33...48db`、`d8f76e88...1f26`、`1cc39713...7ff0`。冻结控制脚本的语法、
+启动记录哈希、依赖命令及最终输出无碰撞检查也全部通过。
+
+额外 90 分钟复合里程碑于 `2026-08-03T11:20:24Z` PASS：head 流 179 个样本 /
+5,415 秒 / 增长 606 块 / 最大 lag 2 / 全程零交易；resource 流 19 个样本 /
+5,403 秒 / 同一 Rust PID 89930 / 峰值 RSS 253,616 KiB、threads 162、FD 93；
+upstream 流 10 个 `d12257c92...` 精确样本 / 5,408 秒。Rust `5+5` 轮值提交累计
+104 次，CommitQC 存在、equivocation 和失败证据均为零。独立复算三份冻结流及汇总
+再次 PASS，里程碑 SHA-256 为
+`28487e6d0d17e05dd33382c06b857180c5bb5ce5482e937cc3ea0c9a8884a158`。一个未产生
+输出的 detached waiter 启动被执行环境回收后已隔离；受托管替代运行没有重启节点或
+正式流，只有后者计入里程碑。
+
+90 分钟后的只读 archive/QMDB 重跑也 PASS：高度 93,241 的两个参考 proof 在 Gov/Rust
+两侧 root、bytes 精确一致并离线验真，11 个历史 RPC 点全部一致，证据 SHA-256 为
+`c981bfc5...dbe3a`。`record-gov5-current-canary.sh` 现同时 fail-close 检查六端
+chainId、完整 genesis hash/state/receipts roots、sender latest/pending nonce 和客户端
+版本，并保持旧 `.genesis` 字符串 schema；错误 nonce 负向回归被拒绝且无链变化。
+最终记录器 SHA-256 为 `e4840036...e770`。高度 93,265 的实网检查点确认 chainId
+`0x477`、完整创世三元组、nonce `0x11`、六端同头、Gov5 5.7.906、Reth 2.4.1、
+CommitQC、110 次 Rust `5+5` 和零 equivocation；证据 SHA-256 为
+`3dd0de1c0956375119c1e1a812bd21aab2b0bbb6c0c5962e3a2c550d63442d43`。
+
+可选 2 小时里程碑暴露的是资源审计语义问题，而非节点或共识失败：同一 Rust PID
+持续推进时，`du -sk` 的 consensus 已分配块因 compaction 从 87,400 降至 85,532，
+随后恢复到 87,580 KiB；head、log bytes、QMDB WAL、资源上限和六端链身份始终正常。
+旧审计器错误地把 allocated blocks 当作仅允许 4 KiB 波动的逻辑单调计数器。修复后
+允许非负 allocated-block 测量随 compaction 下降并显式记录最大下降，同时继续严格要求
+单一 PID、head/log/WAL 单调、采样间隔、链增长和 RSS/thread/FD 上限。1,868 KiB
+合成 compaction 与实网快照均 PASS，合成 log-byte 回退仍 FAIL。
+
+新 harness/finalizer/独立 verifier SHA-256 分别为 `037cc547...5309`、
+`e116089d...f9c0`、`39b11db6...102d`，两项零突变 preflight 在 nonce `0x11`
+通过。只替换了等待控制器；六节点、三正式 monitor、Reth stable monitor、monitor guardian
+和 caffeinate PID 均未变化，正式流未重启、未发交易。重绑证据 SHA-256 为
+`f534f806...a285c`。修复后的 2 小时里程碑为 254 head 样本 / 7,690 秒 / 增长 864
+块 / 最大 lag 2 / 零交易，26 个同 PID 资源样本 / 7,504 秒，13 个精确 Gov5 upstream
+样本 / 7,210 秒，148 次 Rust `5+5`、CommitQC、零 equivocation；里程碑 SHA-256
+为 `ce33a8b268acb8a85e0b16b1f0b492c6c76c26fc4922dc08b91abf6cb9cf9806`。
+
+随后在 135 分钟再次执行零突变完整身份检查，专门复核 905 数据延续到 906 二进制后
+可能变化的创世信息。六端 chainId 均为 `0x477`，创世 hash/state/receipts 三元组仍为
+固定预期值；高度 `0x16d65` 的最新 hash/state/receipts 逐字一致，latest/pending nonce
+仍为 `0x11`，客户端版本为 Gov5 5.7.906 与官方 Reth 2.4.1，并观察到 156 次 Rust
+`5+5`、CommitQC 和零 equivocation。证据 SHA-256 为
+`9f1881315a3a11a18d8ee2d6d4c2e8fde652cea285b9057b8be313e4603effb6`。
+
+140 分钟统一冻结日志深审进一步覆盖高度 92,624 至 93,601 的 978 个连续区块；
+163 个预期 Rust 轮值在六端 canonical 完全一致，163/163 日志提交均为 `5+5`，
+view stride 和 hash 顺序精确。165 次 timeout/pacemaker 全部由下一 view 的 Rust
+`5+5` 恢复，pending 为零；1,351 条 warning 全部归入允许分类，未知 warning 和
+critical signal 均为零。冻结日志、leader、timeout、runtime-log 证据 SHA-256
+分别为 `a1ad313e...515a`、`1eb7eeb5...8bcc`、`56dcb732...d37b`、
+`f096a71e...d54c`。
+
+150 分钟固定路径滚动组合审计同样 PASS：299 个 head 样本 / 9,055 秒 / 增长
+1,014 块 / 最大 lag 2，31 个同 PID 资源样本及 16 个精确 upstream 样本。第二次
+实网 compaction 的单步下降达到 1,944 KiB，consensus allocation 相对起点净变化
+为 -740 KiB，但 head/log/QMDB WAL 仍全部单调且资源上限正常，再次实证修正后的
+allocated-storage 语义。组合摘要 SHA-256 为
+`349481a3ee0b4a7ab934345deb140878e06b9a612cf22e99d519c99f7120faa0`。
+
+正式三小时里程碑及独立重跑均在未放宽验收条件下 PASS：358 个 head 样本 /
+10,845 秒 / 增长 1,218 块 / 最大间隔 31 秒 / 最大 lag 2 / 连续零交易；37 个
+Rust PID 89930 资源样本 / 10,806 秒，RSS 最大 268,000 KiB、线程 162、FD 93，
+head/log/WAL 单调且正确记录 1,944 KiB compaction；19 个 Gov5 main 精确样本 /
+10,815 秒。里程碑记录 206 次 Rust `5+5`、CommitQC、七验证者、零双签与零交易，
+SHA-256 为 `953e03d8...d782`；独立重审 SHA-256 为 `1e4f3179...76eb`。
+
+同刻身份检查仍证明 chainId `0x477`、完整固定创世三元组、六端同头、nonce `0x11`、
+Gov5 5.7.906、官方 Reth 2.4.1 和零双签，SHA-256 为 `b2afa7bc...c3b1`。
+永久资源审计回归脚本 `scripts/test-gov5-resource-auditor.sh` 已覆盖 compaction PASS，
+以及 log/WAL/head 回退、PID 变化、非正 allocation、过大采样间隔必须 FAIL；脚本
+SHA-256 为 `73822807...f7f`。
+
+完整三小时 canonical leader 深审独立扫描高度 92,624 至 93,841：1,218 个区块
+父链连续，203 个预期 Rust 轮值在六端逐字一致，203/203 日志均为 `5+5`，七 view
+stride 与 hash 顺序精确。同一冻结日志包含 212 组 timeout/pacemaker，全部由下一
+view 的 Rust `5+5` 恢复且 pending 为零；1,732 条 warning 全部精确分类，未知
+warning 与 critical signal 均为零。冻结日志、leader、timeout、runtime-log
+SHA-256 分别为 `4609b765...aac7`、`cd9e2e38...4876`、`8598364e...764b`、
+`6ffb346d...7a18`。
+
+三小时依赖交付复核也 PASS：混合客户端组合分支精确为已推送的 `ab058386...`，
+Reth 交付分支精确为已推送的 `91725e3...`，依赖升级分支精确为已推送的
+`aec34a0...`；三者 tracked worktree 均 clean 且远端分支与本地 HEAD 完全一致。
+Gov5 candidate `d0999e7...` 仍绑定 upstream main `d12257c...`，官方最新稳定 Reth
+仍是 v2.4.1 / `8eb21017...`，Gov5/Rust 二进制 SHA-256 仍为 `72e918d9...` /
+`0a4dbcf3...`。机器证据 SHA-256 为
+`9d3fbf70a7725ed906bf37fa873c3b5b73624137ec12c137238b4a93c9d27b54`。
+
+三小时 905 数据静态边界复核也 PASS：初始复制证据仍将 124 文件 /
+17,316,415,839 bytes 绑定到相同源/目标 manifest SHA `1c115b92...`；六个保留
+Gov 数据目录中的 24 个 epoch schedule、network config/key、BLS keystore 文件
+当前 SHA 均与初始复制一致。创世、consensus/bootstrap、验证者/P2P 密钥、冻结
+harness/finalizer/独立 verifier/QMDB verifier 及两个二进制也保持固定 SHA。
+运行 chaindata 因正确出块必然变化而按设计排除。证据 SHA-256 为
+`b1b4306dc929720719058960d68430344f0b68cc282a226b27ce4d6e45d20955`。
+
+三小时门槛后的只读 archive/QMDB 检查点同样 PASS：当前参考高度 93,871 的两份
+Gov5 account proof 与 Rust QMDB proof root/bytes 完全一致并通过离线验证；从创世到
+5,189 的 11 个固定历史高度完成 209 项 block/receipt/log/state/storage/proof 检查，
+Gov5/Rust RPC 全部精确。六端 pending nonce 仍为 `0x11`，未发送交易；证据
+SHA-256 为 `c9336afeb6958cddb2f60f9017c43a242a56f042cbd7cbd822f1b499585ba4be`。
+
+正式四小时复合里程碑继续在未放宽验收规则下 PASS：477 个 head 样本覆盖
+14,453 秒并增长 1,626 块，最大采样间隔 31 秒、最大 lag 2、全程零交易；49 个
+同一 Rust PID 89930 的资源样本覆盖 14,407 秒，峰值 RSS 269,808 KiB、线程 162、
+FD 93，head/log/QMDB WAL 单调并保留 1,944 KiB compaction 记录；25 个 Gov5
+upstream 样本覆盖 14,422 秒且全部精确匹配 `d12257c...`。Rust 已累计 274 次
+`5+5` 轮值提交，七验证者 CommitQC 存在且 equivocation 为零。里程碑 SHA-256
+为 `e5c64c8987a930b9b1a610322d554bdf45a323d760f0845388378da09a495585`。
+6/12/18 小时等待器、24 小时最终器、重启重入和最新稳定 Reth 额外一小时闭环继续
+挂载；本里程碑未释放交易，也不提前关闭总目标。
+
+同边界独立不可变日志深审扫描高度 92,624 至 94,262：1,639 个规范块父链连续，
+274 个预期 Rust 轮值在六端精确一致，274/274 提交均为 `5+5`，view stride 与
+hash 顺序精确。276 组 timeout/pacemaker 全部在下一 view 恢复且 pending 为零；
+2,252 条 warning 全量归入允许分类，未知 warning 和 critical signal 均为零。
+冻结 Rust 日志、leader、timeout、runtime-log SHA-256 分别为
+`a185811f...8e55`、`53270ea6...2ebe`、`59c90704...4076`、
+`e52303d2...100a`。
+
+四小时门槛后的第二次只读 archive/QMDB 复核也 PASS：当前高度 94,303 的两份
+Gov5 account proof 与 Rust QMDB proof 根和字节精确一致并通过离线验证；创世至
+5,189 的 11 个历史高度再次通过 209 项 RPC/proof 检查。六端 pending nonce 仍为
+`0x11`，未发送交易或重启进程；证据 SHA-256 为
+`1060c76b310359b3655a43d0d9c517933290a91eacb3b91cbf5c39ba74785974`。
+两次仅包装层的诊断已置于 `excluded/`：一次误拼 verifier 环境变量并在输出前失败，
+一次误把实际的 1 条 live proof 加 11 条历史记录断言为总计 11 条；正确绑定的证据
+仅生成一次，并以 1+11 schema 原地复核通过。
+
+同刻四小时链身份 canary 再次证明六端 chainId `0x477`、完整固定创世
+hash/state/receipts 三元组和当前块身份均精确一致，sender latest/pending nonce 均为
+`0x11`，客户端仍为 Gov5 5.7.906 与官方 Reth 2.4.1。Rust 已记录 285 次唯一
+`5+5` 提交，七验证者 CommitQC 存在且 equivocation 为零；身份检查 SHA-256 为
+`3e554ff12f4efcc56b501df7640bb01d6e197e9d9423cf69b62f22f26e3142fb`。
+
+四小时 905 数据静态边界复核同样 PASS：初始复制仍绑定 124 文件、
+17,316,415,839 bytes 和相同源/目标 manifest SHA `1c115b92...37b4b`；六个 Gov
+数据目录的 24 个 epoch schedule、network config/key、BLS keystore 静态文件均
+与初始 SHA 一致。创世、共识/bootstrap、验证者/P2P 密钥、冻结工具和两端二进制
+也保持锁定值。运行 chaindata 因正常出块必然变化而继续按设计排除；检查未执行
+任何突变，证据 SHA-256 为
+`4322ede81bd6d5102cad96e94e35ede59d899bafa458178b8dd7347768c47381`。
+
+四小时依赖交付复核也 PASS：主分支、Gov5 candidate、混合客户端组合、Reth 交付和
+依赖升级五个分支均 tracked clean 且与已推送远端 HEAD 精确一致。Gov5 仍为
+candidate `d0999e7...` / upstream main `d12257c...`；官方最新稳定 Reth 仍为
+v2.4.1，tag object `8eb21017...`，两端二进制 SHA 也未漂移。机器证据 SHA-256
+为 `5b7eb21ebc003aafb71ff3b11b105fae4d10aab790047c0d1326cdfef8db6cbe`。
+
+额外五小时复合里程碑在未放宽规则下 PASS：595 个 head 样本覆盖 18,031 秒并
+增长 2,034 块，最大间隔 31 秒、最大 lag 2、全程零交易；61 个同 PID 资源样本
+覆盖 18,009 秒，峰值 RSS 275,616 KiB、线程 162、FD 93，head/log/QMDB WAL
+单调且保留 1,944 KiB compaction 记录；31 个 Gov5 upstream 样本覆盖 18,029 秒
+并全部精确匹配 `d12257c...`。里程碑记录 342 次 Rust `5+5`、七验证者 CommitQC、
+零双签、零交易和空失败流，SHA-256 为
+`cffb11780ddee8aca95cefdbe2234ede2309e477bdc09523328f118b154b3d68`。
+
+五小时独立不可变日志深审扫描高度 92,624 至 94,664：2,041 个规范块父链连续，
+341 个预期 Rust 轮值在六端精确一致，341/341 日志均为 `5+5`，view stride 和
+hash 顺序精确。343 组 timeout/pacemaker 全部在下一 view 恢复，pending 为零；
+2,794 条 warning 全量归类，未知 warning 与 critical signal 均为零。冻结 Rust
+日志、leader、timeout、runtime-log SHA-256 分别为 `7390709d...3bec`、
+`dfa0365f...eeea`、`6ac00a2a...da71`、`a9c2593d...031c`。
+
+正式六小时复合里程碑在未放宽验收规则下 PASS：715 个 head 样本覆盖 21,668 秒
+并增长 2,412 块，最大间隔 31 秒、最大 lag 2、全程零交易；73 个同 PID 资源
+样本覆盖 21,610 秒，峰值 RSS 275,616 KiB、线程 162、FD 93，head/log/QMDB
+WAL 单调并记录 1,944 KiB compaction；37 个 Gov5 main 精确样本覆盖 21,634 秒。
+里程碑记录 405 次 Rust `5+5`、七验证者 CommitQC、零双签、零交易和空失败流，
+SHA-256 为 `c906d490bff8e62eeb741191cc4d4e9e1b44b9e0609651e56af9e15d18d9ef74`。
+12/18 小时等待器与完整受控闭环继续挂载。
+
+同刻六小时链身份 canary 再次证明 chainId `0x477`、完整固定创世三元组、六端
+当前块身份和 sender nonce `0x11` 均精确一致；客户端仍为 Gov5 5.7.906 与 Reth
+2.4.1。Rust 已记录 406 次唯一 `5+5`，七验证者 CommitQC 存在、零双签；证据
+SHA-256 为 `2db923d8521e310b4cd55af0a7be36a4d56a3a0ff941e5a5a20a7c349a5fd15a`。
+
+六小时只读 archive/QMDB 检查也 PASS：当前高度 95,047 的两份 Gov5 proof 与
+Rust QMDB proof 根和字节一致并离线验真；11 个历史高度再次通过 209 项精确检查，
+六端 pending nonce 仍为 `0x11`。未发送交易或重启节点；证据 SHA-256 为
+`1e4c44543cb8561096d5fcc6f84ac6e33252f2c1116e0d627bd332b2d6849dcc`。
+
+六小时独立不可变日志深审扫描高度 92,624 至 95,048：2,425 个规范块父链连续，
+405 个预期 Rust 轮值在六端精确一致，405/405 日志均为 `5+5`，view stride 和
+hash 顺序精确。407 组 timeout/pacemaker 全部在下一 view 恢复，pending 为零；
+3,309 条 warning 全量归类，未知 warning 与 critical signal 均为零。冻结 Rust
+日志、leader、timeout、runtime-log SHA-256 分别为 `bfee67d8...2327`、
+`f2606ff2...17dc`、`8a089dd9...36c7`、`0ea18d51...f889`。另已挂载只读九小时
+复合等待器，缩短 6→12 小时观察间隔。
+
+额外七小时复合里程碑继续在未放宽验收规则下 PASS：833 个 head 样本覆盖
+25,245 秒并增长 2,784 块，最大间隔 31 秒、最大 lag 2、全程零交易；85 个同一
+Rust PID 89930 的资源样本覆盖 25,212 秒，峰值 RSS 275,760 KiB、线程 162、
+FD 93，head/log/QMDB WAL 单调并保留 1,944 KiB compaction 记录；43 个 Gov5
+upstream 样本覆盖 25,239 秒且全部精确匹配 `d12257c...`。里程碑记录 467 次
+Rust `5+5`、七验证者 CommitQC、零双签、零交易和空失败流，SHA-256 为
+`167b2c53ef9819cbec0ee2dd5abf4e6532da964406b57e46501564b911829756`。
+
+七小时冻结日志增量审计进一步扫描六小时后的 Rust 槽位高度 95,054 至 95,407：
+59 个预期 Rust 规范块在六端精确一致，59/59 均为 `5+5`，父链、view stride 和
+hash 顺序精确。累计 467 组 timeout/pacemaker 全部在下一 view 恢复且 pending
+为零；3,798 条 warning 全量归类，未知 warning 与 critical signal 均为零。
+冻结 Rust 日志、leader、timeout、runtime-log SHA-256 分别为
+`366baf19...edf4`、`8086be8c...b9e`、`ce96ce70...efd`、
+`66cd4e49...88f8`。24 小时前仍不发送交易或重启节点。
+
+额外八小时复合里程碑继续在未放宽验收规则下 PASS：953 个 head 样本覆盖
+28,884 秒并增长 3,192 块，最大间隔 31 秒、最大 lag 2、全程零交易；97 个同一
+Rust PID 89930 的资源样本覆盖 28,814 秒，峰值 RSS 276,064 KiB、线程 162、
+FD 93，head/log/QMDB WAL 单调并保留 1,944 KiB compaction 记录；49 个 Gov5
+upstream 样本覆盖 28,844 秒且全部精确匹配 `d12257c...`。里程碑记录 535 次
+Rust `5+5`、七验证者 CommitQC、零双签、零交易和空失败流，SHA-256 为
+`ba9bb4ed1f2800cea120da2e03def11fdd96a0f9d698adb687fc7a6651b51c0e`。
+
+八小时冻结日志增量审计扫描七小时后的 Rust 槽位高度 95,408 至 95,815：68 个
+预期 Rust 规范块在六端精确一致，68/68 均为 `5+5`，父链、view stride 和 hash
+顺序精确。累计 535 组 timeout/pacemaker 全部在下一 view 恢复且 pending 为零；
+4,346 条 warning 全量归类，未知 warning 与 critical signal 均为零。冻结 Rust
+日志、leader、timeout、runtime-log SHA-256 分别为 `d81f611a...4df2`、
+`72a2e549...bb9d`、`aa5cf464...a6de`、`c961ced4...31d1`。
+
+---
+
+### T18 — Gov5 b8c17d current-main 与 runtime28（2026-08-03）
+
+runtime27 第九小时期间，Gov5 `main` 从 `d12257c92...` 前进到
+`b8c17d046...`。严格上游门按预期失败关闭；八小时 PASS 证据保留，但该运行被排除，
+没有释放交易。新提交只修改 `internal/txlookup`：segment 可从任意 source 按交易数
+构建，并增加可从 durable block bodies 重建的内存 tail。现有 905 血统数据没有
+`txindex.ranges`，按兼容路径读取，无需破坏性迁移。
+
+候选 `a2da47a70f6c83c765d8a626b86ac383a4fb9551` 已推送并精确包含
+`b8c17d04614346bace2fbb5c05393bdaf454cf5a`。`go test ./...`、
+`go test ./internal/txlookup` 和 `make n42` 均通过；两次构建逐字节一致，Gov binary
+SHA-256 为 `705abbb2...664`。Reth 保持官方稳定 v2.4.1 / source
+`91725e3aa...` / binary `0a4dbcf3...62b9f`。
+
+runtime28 从停止态 runtime26 克隆并重新核验全部 124 个持久文件、
+17,316,415,839 bytes；源/目标 records SHA-256 均为 `1c115b92...37b4b`。
+创世 artifact SHA-256 仍为 `56180869...a687`，六端 chainId 为 `0x477`，创世
+hash 为 `b71c2810...1392ec`。canary 在 views 95,452/95,459 记录两次 Rust
+`5+5`，六端同头、CommitQC 存在、零 equivocation，SHA-256 为
+`13c087af...a914`。
+
+新的严格零交易流从 `2026-08-03T19:15:19Z`、高度 92,695、lag 0 重新计时。
+head 监控请求 86,640 秒，resource/upstream 请求 87,000 秒；Gov5 main 和官方
+Reth stable 均被独立持续监控。最终器 mutation-free preflight 在六端 nonce
+`0x11` 通过，交易发送数为零；1/3/6/8/12/18 小时等待器、最终器和 30 小时防休眠
+均已挂载。只有完整 24 小时门通过后才允许执行 burst、archive/QMDB、Rust 重启追高
+及后续最新 Reth 附加验证。
+
+正式流首次启动约七分钟后，静态生命周期审计发现 supervisor 会在 head monitor
+正常完成 86,640 秒时误判退出，并提前终止仍需运行到 87,000 秒的 resource/upstream。
+该短流已隔离；修正后的 wrapper 会把成功完成的 monitor 托管到最终关闭。节点、链数据、
+最终器和 nonce 均未重启或改变，正式时长仅从上述新起点计算。
+
+修正流十分钟复合里程碑 PASS：22 个 head 样本覆盖 637 秒并增长 66 块，最大
+lag 0、全程零交易；3 个同一 Rust PID 资源样本覆盖 600 秒；2 个 Gov5 main
+精确样本覆盖 601 秒。Rust 累计 26 次 `5+5`，CommitQC 存在、零双签；里程碑
+SHA-256 为 `723db1a6...fd29`。只读 archive/QMDB 初检也通过 1 个当前 reference
+proof 和 11 个历史高度的精确 Gov/Rust 对比，证据 SHA-256 为 `6b814b2f...ce1`。
+
+早期闭合日志深审扫描高度 92,696–92,797 的 102 个连续规范块；17 个预期 Rust
+轮值在六端精确一致，17/17 日志提交均为 `5+5`，view stride 和 hash 顺序精确。
+31/31 timeout/pacemaker 全部在下一 view 由 Rust `5+5` 恢复，pending 为零；
+251 条 warning 全量归类，未知 warning 和 critical signal 均为零。冻结日志、
+leader、timeout、runtime-log SHA-256 分别为 `f976d11c...95e8`、
+`81e9e574...f097`、`aa9eff62...14c`、`0dc84ad1...54a`。两个诊断截面恰在
+timeout 与恢复 view 之间，已移入 `excluded/`，不作为闭合证据。
+
+十五分钟复合门进一步 PASS：41 个 head 样本覆盖 1,213 秒并增长 126 块，最大
+lag 0、连续零交易；5 个同 PID 资源样本覆盖 1,200 秒；3 个 Gov5 main 精确样本
+覆盖 1,201 秒。Rust 累计 36 次 `5+5`、CommitQC、零双签；里程碑 SHA-256 为
+`0e236d19...9719`。
+
+905 血统静态边界审计重算六个 Gov 数据目录中的 24 个 epoch schedule、network
+config/key 和 BLS keystore，全部与初始 124 文件复制清单精确一致。创世、共识/
+bootstrap、Rust 验证者/P2P 密钥、冻结工具与两端 binary 哈希也保持锁定；正常推进的
+chaindata 明确排除。证据 SHA-256 为 `6ea80521...203c`。
+
+随后又对复制执行边界做了只读块身份复核：六端在创世、bootstrap 高度 29、复制态
+持久头 92,605 及其前后块、初始 archive 头 92,677 和实时共同高度 92,857 上，
+number/hash/parentHash/stateRoot/receiptsRoot/transactionsRoot/miner/交易数均逐项
+一致。复制头仍为 `b88a3571...5a82`，其后一块由 Rust 按轮值产生；证据 SHA-256
+为 `04f58aef...2e82`。
+
+复制边界还增加了最终独立门：提交 `6fc5d326...bae2` 的验证器已在 nonce `0x11`
+完成零变更预检，并持续重放上述 7 个历史块。它等待原子总验收 PASS 后，才会在最新
+Reth 进程上再次要求 nonce `0x22`、六端实时头精确、CommitQC 和零双签。启动证据
+SHA-256 为 `078089fc...bb6`。
+
+正式运行一小时后再次从初始证据重算静态边界，而不是复用原结论：24 个 Gov 静态
+文件、创世/共识/bootstrap、Rust 验证者与 P2P 密钥、冻结验收工具以及 Gov5/Reth
+二进制全部保持精确；原始 124 文件复制清单仍为 PASS，推进中的 chaindata 按设计
+排除且未发生写操作。证据 SHA-256 为 `dee51343...929a`，可重复复核脚本为
+`scripts/recheck-gov5-runtime-static-boundary.sh`。
+
+三小时门另挂载 fail-closed 深审计 V2 PID 71290。它只在原复合里程碑 PASS 后冻结六端
+日志，并从正式首个 Rust 块 92,696 扫描到闭合 Rust 块，逐块检查六端规范链、六块
+轮值节奏、顺序 `5+5`、timeout 下一 view 恢复、warning 全量分类和 critical signal；
+随后再次执行 905 静态边界复核。80 分钟全路径演练正确发现 V1 的冻结边界竞态：选择
+历史最近 Rust 块后，复制前可能已记录下一 timeout、复制后才出现 recovery，因而严格
+门以 pending=1 拒绝。提交 `5b855bab...ed4` 改为先同时确认 live log 与 committed view
+已含最新 timeout 的下一 view `5+5` recovery，再选择并冻结闭合块。
+
+修复后的 V2 全路径 PASS：高度 92,696–93,218 的 523 块六端连续精确，88 个 Rust
+轮值全部顺序 `5+5`，102/102 timeout 下一 view 恢复且 pending 0，824 条 warning
+全量归类、unexpected/critical 均为 0，24 个静态 Gov 文件仍精确。复合证据 SHA-256
+为 `5210a5e8...fbff`，冻结 V2 SHA-256 为 `aea2c249...a73`，预检为
+`8e894c62...6565`。V1 部分证据和旧启动均可恢复地移入 `excluded/`；节点、数据、
+nonce 与正式计时未变化。
+
+80 分钟 head 快照唯一 lag 1 出现在 `20:16:57Z`：共同高度 93,071、最快端
+93,072；31 秒后样本已在 93,073 恢复 lag 0。独立固定高度重读证明 93,071–93,073
+在六端的 number/hash/parent/state/receipts/transactions root、miner 与交易数全部
+一致，父链连续且零交易；全区间深审计还继续覆盖到 93,218。因此该行是 RPC 采样
+边界竞态而非规范分叉，证据 SHA-256 为 `d5b3339b...f1a3`。
+
+90 分钟复合门继续 PASS：180 个 head 样本覆盖 5,426 秒并增长 552 块，唯一 lag 1
+仍是上述已闭合采样行，没有新增 lag；19 个资源样本均为原 Rust PID 70765，RSS 峰值
+248,256 KiB、线程 161、FD 93；10 个 Gov5 main 样本精确。Rust 累计 108 次
+`5+5`，CommitQC、零双签、零交易；里程碑 SHA-256 为 `cc440f07...53cd`。
+
+冻结的 90 分钟资源序列进一步显示：原 PID 70765 在 5,402 秒内增长 552 块，RSS
+端点增长 20,288 KiB、约 13,520 KiB/小时；按同一线性斜率投影 24 小时约
+550,152 KiB，低于 1 GiB 门限。线程固定 161、FD 固定 93；Reth 数据约
+133 KiB/小时、QMDB WAL 约 60 KiB/小时，consensus 数据无增长。证据 SHA-256
+为 `0d4fbf81...9699`。
+
+五个 Gov5 进程的 90 分钟侧审计也 PASS：原 PID 70737/43/49/55/61 均未替换，
+进程运行约 1:47；全部报告 `N42/5.7.906`、chainId `0x477`，共同高度 93,271、
+lag 0，并与 Rust 在固定块八项身份及创世 hash 上完全一致。RSS 为
+143,152–145,168 KiB，相比一小时截面最大仅增 4,832 KiB；线程 18–19、FD 34。
+证据 SHA-256 为 `3f5326c4...989f`。
+
+90 分钟生产者全量审计覆盖高度 92,696–93,277 的 582 块、97 个完整轮次。六端每一
+块的 number/hash/parent/state/receipts/transactions root、miner 与交易数序列完全
+相同，各端序列 SHA-256 均为 `95259664...27dd`；父链连续且全程零交易。Rust 与
+五个 Gov 地址各自产生恰好 97 块，每个 modulo-six 槽位始终绑定同一生产者；配置中
+第七个缺席验证者继续由 timeout 恢复审计覆盖。证据 SHA-256 为
+`03e36dd5...d336`。
+
+网络/共识矩阵进一步区分 execution peer 与混合共识通道：五个 Gov 端点各报告 5 个
+devp2p peers；Rust 执行层 peer API 为 0，但 PID 70765 实际建立到 Gov
+30301–30305 的五条连接，并认证索引 1–5 的五个 validator peers。最新 leader build
+连接数 5、quorum 需求 4、direct push 5，Rust view 96,271 以 `5+5` 提交；
+CommitQC、零双签，status committed hash 在六端反查完整身份一致。证据 SHA-256
+为 `7e7df6e0...1f8d`；可在 Reth 重启后复用的审计器为
+`scripts/audit-gov5-mixed-network-matrix.sh`。
+
+提交 `3093cc7f...8c5f` 又增加最终 post-rollover 网络门 PID 94851。它等待含最新
+Reth 附加一小时的原子总验收 PASS 后，动态绑定新 Rust PID 并重新执行 socket、认证
+validator peers、quorum/direct push、`5+5`、CommitQC、零双签与 committed block
+六端反查，同时要求六端 latest/pending nonce 均为 `0x22`。冻结验证器 SHA-256 为
+`be0471b4...c809`，nonce `0x11` mutation-free 预检 SHA-256 为
+`f8a6529c...d729`。该门不发送交易，也不改变已有总验收与复制边界门。
+
+提交 `71d11a6b...bf65` 增加最终目标级 completion auditor：只有原子总验收、复制
+905 边界门和 post-rollover 网络门三者均独立 PASS，且所有仓库/远端 pin、官方稳定
+Reth tag、两端二进制、六端 live identity/genesis、CommitQC、零双签、空失败流与
+latest/pending nonce `0x22` 全部重检通过，才发布目标完成证据。审计器 SHA-256 为
+`b87aa985...b3f0`，冻结 mutation-free 预检为 `6591008d...1f5f`，当前明确记录
+`completionNotClaimed=true` 和 nonce `0x11`。最终文档推送后才手动执行，避免其记录
+的 primary HEAD 被自身交付文档再次推进。
+
+超过 100 分钟后再次执行 905 数据谱系审计：正式流 6,366 秒、增长 648 块时，五个
+Gov datadir 仍均无 `txindex.ranges` 和 migration marker，未发生破坏性迁移；每节点
+分配空间相比早期兼容截面仅增 24 KiB。24 个静态 Gov 文件仍精确；创世、复制持久头
+92,605 前后及全部 7 个边界高度再次六端一致，创世仍为 `b71c2810...1392ec`，复制头
+仍为 `b88a3571...5a82`。静态与复合证据 SHA-256 分别为 `1588df47...32e1`、
+`64428199...bf23`。
+
+严格两小时复合门与 V2 闭区间深审均 PASS。head 流 240 个样本覆盖 7,245 秒，链从
+92,695 推进到 93,433、增长 738 块，最大 lag 1 且零交易；原 Rust PID 70765 的 25
+个资源样本覆盖 7,203 秒，RSS 峰值 248,256 KiB、线程最多 163、FD 93；13 个 Gov5
+上游样本连续精确。深审扫描 92,696–93,434 的 739 个规范块，124 个 Rust 槽位全部
+六端精确并按序 `5+5`；138/138 timeout 均在下一 view 恢复、pending 0，1,113 条
+warning 全量归类且 unexpected/critical 为 0，24 个 905 静态文件再次精确。复合与
+深审证据 SHA-256 分别为 `0a4f2057...b314`、`e4e87236...61ef`；未发送交易、未替换
+进程、未修改数据。
+
+两小时后的网络矩阵再次 PASS：五个 Gov execution peer count 各为 5；Rust execution
+peer count 为 0，但原 PID 70765 到 Gov 30301–30305 的五条共识 TCP 均已建立，并认证
+五个唯一 validator peer。leader build 连接 5、quorum 需 4、direct push 5，view
+96,432 以 `5+5` 提交；CommitQC 存在、双签为零，committed block 六端身份精确。
+只读证据 SHA-256 为 `ac1234e5...9ab0`。
+
+两小时 archive/QMDB 复核也 PASS：共同高度 93,457 的两份 Gov/Rust reference proof
+在 root 与编码字节上完全一致并通过冻结离线 verifier；创世、bootstrap 边界及高度
+999–5,189 的 11 个历史点共 209 项 RPC/root/proof 检查全部精确。只读证据 SHA-256
+为 `959cb74e...d3af`。
+
+两小时后又以最新已推送主仓库 HEAD `07682df3...5ccf2` 重跑冻结 completion auditor
+的 mutation-free 预检：主仓库动态 HEAD/远端一致，Gov5/Reth/deps 固定 pin、两端
+二进制、六端身份、创世与 nonce `0x11` 全部精确；结果仍明确
+`completionNotClaimed=true`。这证明中途证据文档提交不会让最终门误报源码漂移。
+证据 SHA-256 为 `76ddcd3e...2396`。
+
+新增 `scripts/audit-gov5-burst-readonly.sh`（SHA-256 `4fb70ee3...1ae4`）并在两小时
+状态重跑最终 17 笔 burst 的只读执行审计。所有 raw 签名均恢复到预期 sender，chainId
+均为 `0x477`，nonce `0x11–0x21` 连续、17 个声明 hash 全部精确，计划入口 Rust/Gov
+为 9/8。六端 latest/pending nonce 仍为 `0x11`，部署和转账 `eth_call` 全成功；Gov
+部署估算 `0x12799`、Rust `0x12b0c`，均低于签名 gas `0x186a0`，转账均精确
+`0x5208`。审计发送 0 笔交易，证据 SHA-256 为 `206b8ba4...bc3d`。
+
+该 burst 审计器的负向夹具把第 9 笔声明 hash 置零后被立即拒绝（退出码 1），且没有
+产生 PASS 文件或触碰活动运行；证据 SHA-256 为 `2b6f305f...b6af`。同期实时资源
+重审覆盖原 Rust PID 70765 的 27 个样本 / 7,803 秒 / 798 块，RSS 峰值 253,088
+KiB、线程最多 163、FD 93；head/log/WAL 等逻辑计数全部单调，证据 SHA-256 为
+`65e04bac...896e`。
+
+长测主机容量审计 PASS：正式流 267 个样本 / 8,064 秒、最大间隙 31 秒、坏行 0；
+数据卷可用 730,728,404 KiB，runtime 当前 18,002,992 KiB。即按极保守的每小时
+1 GiB 增长并另留 64 GiB，也只投影到 44,217,392 KiB。caffeinate PID 72825 的
+system/user/disk sleep assertions 均有效，剩余 99,502 秒；覆盖 87,336 秒的严格
+上游窗口、post-window、附加一小时和收尾预算后仍余 12,166 秒。证据 SHA-256 为
+`5f712367...bef9`。
+
+新增可重复的 `scripts/audit-gov5-six-producer-range.sh`（SHA-256
+`37aace7a...e003`）。稳定版原子保留六端 raw JSONL，并全量扫描高度
+92,696–93,565 的 870 个块、145 个完整六槽轮次；六个 RPC 端点各自 870 行的完整
+number/hash/parent/state/receipts/transactions root/miner/txCount 序列 SHA-256 均为
+`67b6bf6d...f24a`。父链连续、全程零交易，Rust 与 Gov1–Gov5 各出恰好 145 块且
+槽位绑定精确。证据 SHA-256 为 `c1d3749f...229f`；含无效临时路径及未保留 raw 的
+前两版输出已可恢复地移入 `excluded/`，不计入结论。
+
+提交 `c469bba7...fee91` 增加通用 milestone raw producer waiter（SHA-256
+`393d2b36...5b70`）。冻结预检 SHA-256 `40c69083...2d31` 确认六节点、失败流、
+目标路径和冻结审计器精确；持久 PID 3492 / session 38246 已等待三小时复合门。门
+PASS 后它按里程碑 `endHeight` 向下闭合到完整六槽轮次，调用冻结审计器并原子保存
+六端 raw JSONL。启动证据 SHA-256 为 `d3097c9b...642d`，未修改节点或交易状态。
+
+同一冻结工具又为 6/8/12/18 小时门分别启动 PID 4853/4854/4856/4861（sessions
+9868/40880/94311/7904）。四份预检均确认目标门尚未出现、节点存活和失败流为空；
+每个 waiter 只消费自己的复合门并写入独立 JSON/raw 目录。合并启动证据 SHA-256 为
+`e4bc03f4...d3ab`，全程 mutation-free。
+
+提交 `98daf559...2aa0` 又增加 strict24h 专用 raw waiter（SHA-256
+`20c7f542...2fc6`）。它只等待 finalizer 在 burst 前原子发布的
+`mixed-soak-24h-audit.json`，按其中零交易 `endHeight` 固定历史闭区间；随后交易无法
+改变已审计历史。冻结预检 SHA-256 为 `af4a0025...a2ad`，PID 7527 / session 50942
+已启动；最终除六端 raw 外还发布 soak/producer 两份 SHA 绑定。启动证据 SHA-256 为
+`a4a3de4d...7aa2`。
+
+3 小时（10,800 秒）复合门严格 PASS：359 个 head 样本覆盖 10,853 秒，增长
+1,116 块、最大 lag 1、零交易；原 Rust PID 70765 的 37 个资源样本覆盖 10,805
+秒，RSS 峰值 275,856 KiB、线程最多 163、FD 93；19 个 Gov5 main 样本覆盖
+10,815 秒并全部精确。Rust 累计 201 次 `5+5`，CommitQC 存在、双签为零。里程碑
+SHA-256 为 `e09f9a2a...12be`，未放宽验收。
+
+冻结 raw 工具按该门精确闭合高度 92,696–93,811：1,116 块组成 186 个完整轮次，
+Rust 与 Gov1–Gov5 各自产生 186 块；六端原始序列 SHA-256 均为
+`fb38033f...b0b3`，父链连续、槽位固定且全程零交易。复合 raw 证据 SHA-256 为
+`984e03f7...d9c6`。冻结 V2 深审另覆盖到高度 93,812 的 1,117 个规范块，187 个
+Rust 槽位全部六端精确且日志顺序 `5+5`；201/201 timeout 均在下一 view 恢复，
+pending 0。1,619 条 warning 全量归类，unexpected/critical 均为 0；24 个 905
+静态文件再次精确。深审证据 SHA-256 为 `9fc98f43...8086`。
+
+3 小时闭合点之后又独立审计高度 93,812–93,955：144 块组成 24 个完整轮次，Rust
+与 Gov1–Gov5 各自产生 24 块；六端原始序列 SHA-256 均为
+`5c6d031f...0565`，父链连续、槽位固定且零交易。增量复合证据 SHA-256 为
+`b1fe9e66...0d13`，证明 3→6 小时等待区间继续保持相同轮值规则。
+
+同一时点 archive/QMDB 与网络矩阵复核也 PASS：当前高度 93,823 的两份
+Gov/Rust proof root/bytes 精确并通过离线验证，11 个历史点共 209 项检查全部通过；
+原 Rust PID 70765 仍建立五个 Gov 共识连接并认证五个验证者，leader quorum 为
+5/4、direct push 5，view 96,866 以 `5+5` 提交，CommitQC、零双签且 committed
+block 六端身份精确。两份只读证据 SHA-256 分别为 `e289e529...fa7f`、
+`2e6ca52c...3201`。
+
+新增的 Rust 资源趋势审计在 3 小时窗口 PASS：39 个同 PID 样本覆盖 11,405 秒并
+增长 1,176 块；RSS OLS 斜率为 10.57 MiB/小时，按该正斜率保守外推到 24 小时为
+486,153 KiB，低于 1,048,576 KiB 门限。线程峰值 163、FD 恒定 93，Reth 数据仅
+增长 404 KiB、共识数据增长 0。脚本/证据 SHA-256 分别为 `f6c5c495...bb80`、
+`a264d76f...ae98`，主/混合交付提交为 `c5b6673b...087c`、`810cc934...0c4d`。
+
+3.5 小时宿主容量复核仍严格 PASS：407 个共识样本覆盖 12,308 秒并增长 1,266 块，
+bad row 0、最大 lag 1；磁盘可用 730,563,924 KiB，runtime 当前 18,049,804 KiB，
+按额外 25 GiB 增长和 64 GiB 保留量仍充足。caffeinate PID 72825 剩余 95,265
+秒，对 upstream 门加 8,400 秒最终收口需求仍有 12,186 秒裕量，三类 sleep assertion
+均有效。证据 SHA-256 为 `ef86aa3a...79d`。
+
+为保持运行中总目标验证器的启动时源码承诺，混合工作目录已切到新建并推送的
+`qualification/runtime28-combo-ab058`，其 HEAD/上游均精确为固定提交
+`ab058386...3d9e`；更新交付分支 `feat/gov5-n42-live-interop-reth-latest` 仍完整保留
+`810cc934...0c4d`、`809db3be...5c81` 并继续前移到 `ee22f8df...3227`。跨过一个完整 60 秒
+fail-closed 周期后，总验证器 PID 83205
+继续存活且失败证据为空，兼顾资格可复现与新增工具交付。
+
+更新交付分支另在
+`/Users/jieliu/Documents/n42/interop-reth-latest-20260802/n42-26-delivery-latest`
+建立独立 worktree，HEAD/上游精确为 `ee22f8df...3227`；该分支在
+`810cc934...0c4d` 之上新增 supplemental waiter，并在 `809db3be...5c81` 之上
+新增最终 completion waiter。905 数据审计、最终 905 waiter、
+资源趋势脚本 SHA-256 分别精确为 `5bb09bb1...9a67`、
+`183b7901...08b3`、`f6c5c495...bb80`。资格目录继续固定 `ab058386...3d9e`，两者
+互不改变。
+
+冻结复制边界验证器在 3 小时后再次 preflight PASS：重新执行全部 7 个历史边界，
+创世 `b71c2810...1392ec` 与 905 复制持久头 92,605 /
+`b88a3571...5a82` 仍逐字段六端精确；live 六端身份一致，latest/pending nonce 均为
+`0x11`，全程 mutation-free。证据 SHA-256 为 `f60946f5...8632`。
+
+新增的只读 905 数据兼容审计在 3 小时运行态 PASS：固定 Gov main `b8c17d0`，确认
+可变宽度 builder `337cea4` 与内存 tail `b8c17d0` 均尚未接入共识提交路径；五个
+Gov MDBX 均存在且原 PID 存活，`txindex.ranges` 文件数均为 0。六端 chain ID、
+创世、复制持久头 92,605、live 区块身份和 latest/pending nonce 均精确，因此无需
+重复制或重生成 905 数据。脚本/证据 SHA-256 分别为 `5bb09bb1...9a67`、
+`61db5b57...141b`；脚本已同步到混合 Reth 交付分支提交 `8e985cf8...0faf`。
+
+最终 905 数据 waiter（SHA-256 `183b7901...08b3`）预检 PASS 后以 PID 90131 /
+session 77080 启动。它只等待总目标 PASS，然后在交易突发、Reth 重启追高和额外一小时
+之后以 nonce `0x22` 重跑相同审计；最终仍须证明五个 MDBX 存活、零
+`txindex.ranges`、六端创世/复制头/live 头精确且无需重复制。主/混合交付提交分别为
+`1c569bf1...ab6f`、`122bf21c...b4c2`。
+
+最终 V2 completion auditor（SHA-256 `cf73a512...4093`）预检 PASS，并在提交
+`40d0e81d...c0b1` 推送。它不替换冻结的基础 auditor，而是在其 PASS 后强制绑定
+strict24h 六端 raw/链接证据、最终 905 数据审计和完整 24 小时资源趋势；同时固定
+17 笔 burst artifact SHA-256 `6cf05cd0...d750`，逐文件重算六份 raw 序列及行数。
+当前只发布 `completionNotClaimed=true` 的只读预检，最终 nonce 必须为 `0x22`。
+
+V2 与资源趋势 auditor 已冻结到 runtime evidence；冻结 SHA-256 仍分别为
+`cf73a512...4093`、`f6c5c495...bb80`。冻结副本重新预检 PASS，确认 17 笔 burst
+artifact `6cf05cd0...d750`、节点存活、失败流为空、nonce `0x11`，且仍明确
+`completionNotClaimed=true`；预检证据 SHA-256 为 `7109cc4d...aa8a`。
+
+6 小时 V2 深审计也已通过冻结源预检并启动：harness、静态 rechecker、905 静态基线
+SHA-256 分别为 `037cc547...5309`、`b27890ad...10ec`、
+`6ea80521...203c`；PID 82622 / session 95373 仅等待严格 6 小时复合门，随后闭合
+Rust leader、timeout 恢复、全量日志和 24 个静态文件，不修改链状态。
+
+相同冻结源又为 12/18 小时门通过独立预检并启动 PID 88663/88787（sessions
+15588/65112）。它们只消费各自严格复合门并发布独立闭合深审证据；8 小时已有组合门
+和全范围六端 raw 审计，24 小时由最终器执行完整深审，因此覆盖连续且不重复改状态。
+
+提交 `d0353f6c...f4ab` 新增通用 supplemental waiter（SHA-256
+`6878355c...e2e8`），冻结后为 6/12/18 小时分别启动 PID 8497/8962/9075
+（sessions 55444/45824/39512）。三个实例只消费自己的严格里程碑，随后自动重复
+archive/QMDB 12 事件、五连接/五认证网络矩阵、905 数据兼容和 24 小时资源趋势外推；
+冻结 network/data/resource auditor SHA-256 分别为 `955580f2...c533`、
+`5bb09bb1...9a67`、`f6c5c495...bb80`。预检全部 PASS 且 mutation-free。
+
+约 3 小时 45 分钟的 6 小时门前双重复核继续 PASS。网络矩阵确认原 Rust PID 70765
+仍建立并认证全部五个 Gov consensus peers，leader quorum 5/4、direct push 5，
+view 97,083 以 `5+5` 提交；CommitQC 存在、双签为零、committed block 六端身份
+精确。905 数据审计再次确认固定 Gov main `b8c17d0`、五个 MDBX 原 PID 存活、
+`txindex.ranges` 全部为零；创世 `b71c2810...1392ec`、复制头 92,605 /
+`b88a3571...5a82`、live 身份和当前阶段 nonce `0x11` 六端精确，因此无需重复制或
+重生成数据。两份只读证据 SHA-256 分别为 `2388c016...10b2`、
+`eb6e25a3...4371`；最终 burst 后审计仍独立要求 nonce `0x22`。
+
+同一门前窗口的冻结资源趋势审计覆盖原 Rust PID 70765 的 44 个样本、12,906 秒和
+1,338 块；RSS OLS 斜率为 10.41 MiB/小时，保守外推 24 小时为 484,412 KiB，
+低于 1 GiB 门限，线程峰值 163、FD 93。证据 SHA-256 为 `5f9cd9e2...cb59`。
+新增六端 raw 轮值段覆盖高度 93,956–94,033 的 78 块、13 个完整轮次，Rust 与
+Gov1–Gov5 各自产生 13 块，六端序列 SHA-256 均为 `952ddac5...662e`；首块
+parent 与上一段高度 93,955 的末块 hash `ea374f94...c06a` 精确衔接。复合证据
+SHA-256 为 `3fa0d9a2...4788`。
+
+最终收口 DAG 又完成一次独立只读审计：strict finalizer 依次执行 24 小时不可变流、
+17 笔 burst、10 分钟 post-burst、archive/QMDB、Rust 重启追高及 10 分钟
+post-restart；strict independent 完成后才触发 official Reth 2.4.1 额外一小时，随后
+total、最终 nonce `0x22` 的 905 数据审计、基础 completion 与 V2 completion 顺序
+闭合，不存在证据依赖环。七个冻结收口脚本 `bash -n` 全部通过；基础/V2 auditor
+SHA-256 仍为 `b87aa985...b3f0`、`cf73a512...4093`。两项最新 preflight 均以主
+提交 `5e3a3701...e5e` PASS，重新确认远端/source/binary/genesis/六端 live 身份、
+17 笔 burst 工件 `6cf05cd0...d750`、nonce `0x11` 与零失败证据，且明确
+`completionNotClaimed=true`、mutation-free；合并证据 SHA-256 为
+`a327662e...d06b`。
+
+提交 `171baf79...01af` 新增最终 completion waiter，并同步到混合交付提交
+`ee22f8df...3227`。冻结脚本 SHA-256 为 `47c41aae...1b69`；它在最终 905 数据
+审计以 nonce `0x22` PASS 后自动、可恢复地执行基础 completion 与 V2 completion，
+每 60 秒 fail-closed 绑定节点、Gov5 main、三份 auditor SHA 和全部失败流，不提前
+改变链。冻结 preflight PASS，证据 SHA-256 为 `8ea5a15d...224a`；正式实例 PID
+28426 / session 15009 跨过完整周期后仍存活且失败证据为空，因此最终两道审计不再
+依赖人工触发。
+
+接近 4 小时进程运行点的只读 archive/QMDB 重复审计再次 PASS：当前高度 94,105
+的两份 Gov/Rust proof root、bytes 精确且通过冻结离线验证器，11 个历史点全部
+RPC/root/proof 一致，共 12 个事件；证据 SHA-256 为 `44f3ffa1...5ccb`。同刻静态
+边界 recheck 重新计算 24 个 905 不变文件、创世/共识/bootstrap 工件、验证者与
+P2P 密钥、冻结 harness/finalizer/independent/QMDB/total 工具及 Gov/Rust 二进制，
+全部保持初始 SHA；证据 SHA-256 为 `b03e479c...ab64`。
+
+4 小时（14,400 秒）正式四联门全部闭合且未放宽规则。复合门含 477 个 head 样本，
+覆盖 14,430 秒、增长 1,494 块、最大 lag 1、bad row 0；49 个原 PID 资源样本覆盖
+14,406 秒，25 个 Gov5 main 样本覆盖 14,419 秒且最大间隔 601 秒。Rust 累计
+264 次 `5+5`、双签为零、交易为零；复合证据 SHA-256 为 `18d40534...e4a5`。
+
+冻结六端 raw 审计闭合高度 92,696–94,189：1,494 块组成 249 个完整轮次，Rust 与
+Gov1–Gov5 各产生 249 块；六端序列 SHA-256 均为 `f6716c23...c4e1`，父链、槽位
+和零交易全部精确，复合证据 SHA-256 为 `8f48cb81...0fc8`。独立深审进一步到
+94,196 的 1,501 块：251 个 Rust 槽位全部六端匹配 `5+5`，265/265 timeout 在下一
+view 恢复且 pending 0；2,132 条 warning 全量归类，unexpected/critical 为 0，
+24 个静态文件保持初始 SHA。深审及冻结 Rust log SHA-256 分别为
+`ef5559e7...771f`、`d994013f...9604`。
+
+同门 supplemental 也 PASS：archive/QMDB 12 个事件精确，五个共识连接与五个认证
+验证者保持 quorum，view 97,293 以 `5+5` 提交且 committed block 六端一致；905
+数据仍为零 `txindex.ranges`，创世/复制头精确且无需重生成。资源 OLS 斜率降至
+8.83 MiB/小时，24 小时 RSS 预测 434,568 KiB。supplemental 及其 archive/network/
+data/resource 子证据 SHA-256 分别为 `e03e8047...3262`、`c7a6ea03...06a3`、
+`88a6e3ae...5a8d`、`ecf5e405...e640`、`95e27c1c...c1c4`。
+
+4 小时宿主容量复核也严格 PASS：486 个 head 样本已覆盖 14,703 秒并增长 1,518
+块，最大 lag 1、bad row 0。磁盘可用 730,451,864 KiB，runtime 当前
+18,079,660 KiB；保守追加 25 GiB 并预留 64 GiB 后仍充足。caffeinate PID 72825
+剩余 92,877 秒，对 87,000 秒上游门加 8,400 秒最终收口需求仍有 11,896 秒裕量，
+三类 sleep assertion 全部有效。证据 SHA-256 为 `9f7bf2a7...5cc3`。
+
+四小时 closure linkage 又逐文件重算并交叉绑定全部四联证据：复合门与六端 raw
+边界均精确为 92,696–94,189，1,494 块 / 249 轮；六个 raw 文件各 1,494 行且
+SHA-256 均为 `f6716c23...c4e1`。deep 与 supplemental 内嵌的 milestone SHA
+均精确为 `18d40534...e4a5`，deep 边界覆盖到 94,196；冻结 Rust log 仍为
+`d994013f...9604`。linkage 证据 SHA-256 为 `1a04be1f...dd7b`，并明确历史窗口
+不会被后续 burst 改写。
+
+四小时后一次辅助 latest-Reth preflight 误调用了 runtime `artifacts/scripts` 中的旧
+rollover 副本（SHA-256 `778e77c1...7664`，内嵌旧 harness pin），在静态 SHA
+断言处 fail-closed；交易、节点重启和链 mutation 均为 0。原始 282 字节失败按 SHA
+`6b41bea4...8fe8` 完整移动到
+`evidence/excluded-operator-preflight-wrong-rollover-copy-20260803T232257Z/`，排除记录
+SHA-256 为 `6d7d171e...6564`。latest independent 因正确观察到该临时 failure 流而
+派生退出，其 204 字节原始失败 SHA-256 `a58c0ec9...463f` 也完整归档，派生排除记录
+SHA-256 为 `4b98bcdc...f5a8`；正式 24 小时 evidence 未被修改。
+
+随后使用正式 `evidence/official-reth-stable` rollover 副本（SHA-256
+`68c1f209...ca0`）重跑 preflight 并 PASS：Reth v2.4.1 / `91725e3a`、二进制
+`0a4dbcf3...62b9f`、六端 live 身份和创世均精确，mutation-free；证据 SHA-256
+为 `cac545d2...79b7`。受影响的依赖 waiter 以原冻结参数重挂：latest independent
+PID 87801/session 35229、total PID 87802/session 30844、final 905 PID
+88093/session 66123、completion PID 88094/session 38136。跨过完整 60 秒后连同
+正式 rollover PID 80652 全部存活，新 failure 流为空，六端继续 lag 0。
+
+恢复后的 latest-Reth independent verifier 又按 PID 87801 使用的同一组冻结参数直接
+实跑。verifier SHA-256 为 `9b90145b...02b5`；official stable tag v2.4.1、六端
+live 身份、创世和 latest/pending nonce `0x11` 全部精确，mutation 为 0。该
+post-exclusion preflight PASS，证据 SHA-256 为 `a6f3ff6f...47de`，独立确认重挂
+waiter 已不再引用旧的辅助 rollover 副本。
+
+2.5 小时（9,000 秒）复合门严格 PASS：299 个 head 样本覆盖 9,034 秒，增长 924
+块、最大 lag 1、零交易；原 Rust PID 70765 的 31 个资源样本覆盖 9,004 秒，RSS
+峰值 263,824 KiB、线程最多 163、FD 93；16 个 Gov5 main 样本覆盖 9,012 秒并
+全部精确。Rust 累计 170 次 `5+5`，CommitQC 存在、双签为零。里程碑 SHA-256 为
+`dc639f5d...cdf7`，未放宽验收。
+
+同一冻结 raw 工具随后精确消费该里程碑：高度 92,696–93,619 共 924 块、154 个
+完整轮次。六端各保留 924 行完整区块身份，序列 SHA-256 均为
+`8763d282...6691`；父链连续、全程零交易，Rust 与 Gov1–Gov5 各自产生 154 块且
+槽位固定。复合 raw 证据 SHA-256 为 `448b88f7...faa6`。
+
+冻结 V2 深审随后从同一里程碑闭合到 Rust 高度 93,638：扫描 943 个规范块，158 个
+Rust 槽位全部六端精确且日志顺序 `5+5`；172/172 timeout 均在下一 view 恢复，
+pending 0。1,383 条 warning 全量归类，unexpected/critical 均为 0；24 个 905
+静态文件再次精确。深审证据 SHA-256 为 `b29b5e2c...eb02`。
+
+2.5 小时 archive/QMDB 与网络矩阵并行复核也 PASS：当前高度 93,649 的两份
+Gov/Rust proof root/bytes 精确并通过离线验证，11 个历史点共 209 项检查全部通过；
+原 Rust PID 70765 仍建立并认证五个 Gov consensus peers，leader quorum 为 5/4、
+direct push 5，view 96,663 以 `5+5` 提交，CommitQC、零双签且 committed block
+六端身份精确。两份只读证据 SHA-256 分别为 `14d50609...3ec8`、
+`66a376f3...0a1a`。
+
+冻结复制边界验证器在 2.5 小时再次独立 preflight PASS：重新执行全部 7 个历史边界，
+创世 `b71c2810...1392ec` 与 905 复制持久头 92,605 /
+`b88a3571...5a82` 仍逐字段六端精确；live 六端身份一致，latest/pending nonce 均为
+`0x11`。mutation-free 证据 SHA-256 为 `6f0b8128...8245`。
+
+约 80 分钟处再次完整执行只读 archive/QMDB parity：当前共同高度 93,199 的两组
+Gov/Rust proof root 与编码逐字节一致并通过冻结离线验证器；创世到 5,189 的 11 个
+历史高度再次通过全部 RPC/root/proof 检查。证据 SHA-256 为 `03f3de7d...3d57`。
+高位 905 复制边界 92,605 仍由独立持续验证器覆盖，二者不混淆。
+
+三十分钟复合门 PASS：65 个 head 样本覆盖 1,940 秒、增长 198 块、最大 lag 0；
+7 个同 PID 资源样本覆盖 1,801 秒；4 个可达且精确的 Gov5 main 样本覆盖 1,802
+秒。Rust 累计 48 次 `5+5`，CommitQC 仍存在，双签与已发送交易均为零；里程碑
+SHA-256 为 `8276dfae...d6ab`。
+
+905 数据兼容路径的运行中复核也通过：正式链从高度 92,695 推进到 92,911 后，
+五个 Gov datadir 仍均无 `txindex.ranges`，未发生破坏性迁移，六端保持 lag 0。
+最终门控的 17 笔交易与 archive RPC 会继续覆盖新增交易的 lookup 路径；本次证据
+SHA-256 为 `f5432630...e5a8`。
+
+三十分钟闭合日志深审覆盖高度 92,696–92,930 的 235 个连续规范块，40 个预期
+Rust 槽位全部六端精确且日志为 `5+5`，view stride 与 hash 顺序一致。54/54
+timeout/pacemaker 均在下一 view 由 Rust `5+5` 恢复，pending 为零；435 条 warning
+全量归类，未知与 critical 均为零。冻结 Rust 日志、leader、timeout、runtime-log
+SHA-256 分别为 `cc519e7e...1d4f`、`513f8e01...21a2`、
+`90432cd5...360f`、`30c7d65e...f180`。
+
+正式生产者分布审计另扫高度 92,696–92,947 的 252 个连续块：Rust 与五个 Gov
+出块地址各自产生 42 块，完全均衡，父链连续且无交易。六个在线 leader 槽位精确，
+配置中的第七个缺席验证者由上述 timeout 恢复路径处理；证据 SHA-256 为
+`80028a25...72c1`。
+
+共同头推进到 92,953 后重复执行 archive/QMDB 只读审计也 PASS：2 份当前
+reference proof 在 Gov/Rust 间 root 与 bytes 精确并通过固定离线验证器；11 个历史
+高度各自的 19 项 RPC/root/proof 检查全部一致，覆盖创世与 bootstrap 边界。证据
+SHA-256 为 `3d1ab47e...4ff9`。
+
+实时客户端身份矩阵确认 28501–28505 均报告 `N42/5.7.906`，29545 报告
+`reth/v2.4.1-91725e3/aarch64-apple-darwin`；六端 chainId 均为 `0x477`、均非
+syncing，并在固定高度 92,971 返回精确相同的创世与块 hash/state/receipts 身份。
+矩阵证据 SHA-256 为 `67eea2d0...5351`。
+
+复制数据启动/追高的直接证据链也已闭合：活动 Rust 进程于 `19:01:54Z` 从持久头
+92,605、snapshot-exact view 95,450 和认证 QMDB root 恢复，29.438 秒后就在
+92,606 产生规范 `5+5` 块；随后认证执行血统连续推进到六端正式共同头 92,695，
+并在 92,696 再次按 Rust 槽位出块。四个检查点哈希均从六端 RPC 重读一致；证据
+SHA-256 为 `586d04fe...4676`。
+
+正式出块节奏审计扫描 301 个连续块、覆盖 2,942 个块时间戳秒；时间戳严格递增，
+平均块间隔 9.81 秒、最大 40 秒，即使包含缺席验证者 timeout 周期也未超过 61 秒
+无停顿门限。证据 SHA-256 为 `418c4e10...1071`。
+
+五十分钟资源趋势覆盖同一 Rust PID 的 11 个样本、3,001 秒和 306 块；线程恒为
+161、FD 恒为 93，RSS 首末仅增 11.5 MiB（约 13.8 MiB/小时）。Reth allocated
+data 约增 158 KiB/小时，consensus data 不变，QMDB WAL 约增 60 KiB/小时；即使
+保守线性投影 24 小时 RSS 也约 551 MiB，低于冻结的 1 GiB 门限。证据 SHA-256
+为 `383e11e3...0991`。
+
+保守一小时复合门在未放宽条件下 PASS：120 个 head 样本覆盖 3,607 秒并增长
+366 块，最大 lag 0 且全程零交易；13 个同 PID 资源样本覆盖 3,601 秒，RSS 峰值
+241,040 KiB、线程 161、FD 93；7 个 Gov5 main 精确样本覆盖 3,605 秒。Rust
+累计 76 次 `5+5`，CommitQC 存在、零双签；里程碑 SHA-256 为
+`64c648af...9505`。
+
+一小时闭合日志深审扫描规范高度 92,696–93,068：六端 373 块父链连续，63 个
+预期 Rust 槽位全部匹配有序 `5+5` 日志。77/77 timeout/pacemaker 均在下一
+Rust `5+5` view 恢复，pending 为零；624 条 warning 精确归入允许类别，未知与
+critical 均为零。冻结 Rust 日志、leader、timeout、runtime-log SHA-256 分别为
+`f16a27a1...e644`、`5763da46...4a8a`、`40ff2727...97ca`、
+`e9fb2aca...5410`。
+
+补充的一小时 Gov5 进程基线确认五个原始 PID 均存活且运行超过一小时，共同高度
+93,091；RSS 为 140,016–141,920 KiB，线程 18–19，FD 均为 34，没有 Gov
+进程替换。证据 SHA-256 为 `df9227ed...1906`。

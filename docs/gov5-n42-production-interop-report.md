@@ -8,6 +8,1255 @@ disposable-runtime tests, and the guarded exercise against the preserved
 seven-node deployment. Machine-readable evidence and immutable log manifests
 are stored in the qualification runtimes named below.
 
+## Current 2026-08-03 qualification — latest Gov5 main and latest stable Reth
+
+The authoritative run is now
+`runtime-28-gov5-b8c-latest-reth`. Gov5 main advanced during runtime27's
+ninth hour from `d12257c92...` to
+`b8c17d04614346bace2fbb5c05393bdaf454cf5a`; the strict upstream guard failed
+closed, no transaction was released, and runtime27's already-passed eight-hour
+evidence was retained as an excluded qualification rather than counted toward
+the new window. The current pushed integration candidate is
+`a2da47a70f6c83c765d8a626b86ac383a4fb9551`, and its reproducible Gov binary
+SHA-256 is `705abbb2084eea36523fa5ee55ccae00060ad472976d9d4ca1b2c98dc56bd664`.
+The two upstream commits change only transaction-lookup segment construction
+and its rebuildable in-memory tail. The optional `txindex.ranges` file is not
+required for the preserved 905-lineage data, and no destructive migration was
+performed.
+
+Runtime28 is an exact copy of the cleanly stopped 905-lineage runtime26 state:
+124 persistent files / 17,316,415,839 bytes match source and target with
+canonical records SHA-256 `1c115b92...37b4b`. Its canary passed across five
+Gov5 5.7.906 nodes and one Reth 2.4.1 validator: all six endpoints returned the
+same head/hash/state/receipts identity and genesis `b71c2810...1392ec`; Rust
+authored views 95,452 and 95,459 with `5+5`, CommitQC was present, and
+equivocation evidence was empty. Canary SHA-256 is `13c087af...a914`.
+
+The new zero-transaction head, resource, Gov5-upstream, and official-Reth
+streams began at `2026-08-03T19:15:19Z`, first common height 92,695 and lag
+zero. Finalizer preflight passed with all six sender nonces at `0x11` and zero
+sends. The 1/3/6/8/12/18-hour milestones and guarded finalizer are armed; the
+17-transaction burst, archive/QMDB parity, and Rust restart/rejoin remain
+gated until the complete 86,640-second strict stream closes.
+
+An earlier seven-minute monitor stream was deliberately excluded after a
+static lifecycle audit found its supervisor would have treated the head
+monitor's eventual successful exit as a failure and stopped the 87,000-second
+resource/upstream tails early. The corrected wrappers keep each successful
+monitor supervised through final closure; nodes, chain data, finalizer, and
+nonce were not restarted or changed.
+
+The corrected stream's ten-minute composite milestone passed without relaxed
+criteria: 22 head samples span 637 seconds and 66 blocks with maximum lag
+zero and continuous zero-transaction coverage; three same-PID resource
+samples span 600 seconds; and two Gov5-main snapshots span 601 seconds and
+both equal `b8c17d046...`. Rust recorded 26 `5+5` leader commits, CommitQC is
+present, and equivocation evidence remains empty. Milestone SHA-256 is
+`723db1a6b77d4b2276b55c65edd2e309085b60741f04e08fe3ff09f93ac8fd29`.
+
+An early closed-log audit independently scans canonical heights 92,696 through
+92,797. All six endpoints return the same continuous 102-block parent chain;
+all 17 expected Rust-authored slots match 17 `5+5` log commits with exact
+seven-view stride and hash order. The frozen log contains 31 timeout/pacemaker
+pairs, all recovered at the next view by Rust `5+5`, with zero pending. All
+251 warnings partition into allowed classes, with zero unexpected warnings or
+critical signals. Frozen-log, leader, timeout, and log-audit SHA-256 values are
+`f976d11c...95e8`, `81e9e574...f097`, `aa9eff62...14c`, and
+`0dc84ad1...54a`.
+
+The 15-minute composite milestone also passed. Its conservative upstream
+sampling boundary yields 41 head samples / 1,213 seconds / 126 blocks,
+maximum lag zero and continuous zero transactions; five same-PID resource
+samples / 1,200 seconds; and three exact Gov5-main snapshots / 1,201 seconds.
+Rust recorded 36 `5+5` commits with CommitQC and zero equivocations. Milestone
+SHA-256 is `0e236d19...9719`.
+
+A separate 905-lineage static-boundary audit re-hashed all 24 immutable Gov
+epoch schedules, network configurations/keys, and BLS keystores against the
+initial 124-file copy manifest. Every file remains exact. Genesis,
+consensus/bootstrap, Rust validator/P2P keys, frozen tools, and both client
+binaries retain their expected hashes; advancing chaindata is explicitly and
+correctly excluded. Evidence SHA-256 is `6ea80521...203c`.
+
+A second read-only block-identity audit targets the copied-data execution
+boundary itself. All six endpoints agree on every selected canonical field at
+genesis, bootstrap checkpoint 29, copied persisted head 92,605 and its
+immediate predecessor/successor, initial archive head 92,677, and live common
+height 92,857. In particular, copied head 92,605 remains
+`b88a3571...5a82`, its parent link is exact on all clients, and the next block
+is the expected Rust-authored block. The audit compares number, block and
+parent hashes, state/receipts/transaction roots, miner, and transaction count;
+evidence SHA-256 is `04f58aef...2e82`.
+
+That boundary audit is also enforced after the final Reth rollover. The pushed
+verifier at commit `6fc5d326...bae2` passed a mutation-free preflight at nonce
+`0x11` and is now waiting on the atomic total-goal result. It continuously
+replays all seven historical identities while waiting, then requires the
+post-burst nonce `0x22`, exact six-endpoint latest identity, CommitQC, and zero
+equivocations on the latest-Reth process before emitting its own final PASS.
+Launch evidence SHA-256 is `078089fc...bb6`.
+
+The 30-minute composite milestone passed as well. Its frozen snapshots contain
+65 head samples over 1,940 seconds and 198 blocks with maximum lag zero; seven
+resource samples from the unchanged Rust PID span 1,801 seconds; and four
+reachable, exact Gov5-main samples span 1,802 seconds. Rust has 48 `5+5`
+leader commits, CommitQC remains present, and both equivocations and released
+transactions remain zero. Milestone SHA-256 is `8276dfae...d6ab`.
+
+The live 905-data compatibility recheck found no implicit migration after the
+formal chain advanced from height 92,695 to 92,911. All five Gov datadirs
+still contain zero `txindex.ranges` files, all six clients remain exact with
+lag zero, and no destructive data conversion occurred. The final gated
+17-transaction burst and archive RPC pass will exercise lookup behavior with
+new transactions. Recheck evidence SHA-256 is `f5432630...e5a8`.
+
+A closed 30-minute log snapshot provides a deeper canonical check. Heights
+92,696 through 92,930 form one continuous 235-block chain on all six
+endpoints; all 40 expected Rust slots match ordered `5+5` commits with exact
+seven-view stride. All 54 timeout/pacemaker pairs recover at the immediately
+following Rust `5+5` view with zero pending, while all 435 warnings partition
+into allowed classes with zero unknown or critical signals. The immutable Rust
+log, leader audit, timeout audit, and runtime-log audit SHA-256 values are
+`cc519e7e...1d4f`, `513f8e01...21a2`, `90432cd5...360f`, and
+`30c7d65e...f180`.
+
+The formal producer-distribution audit independently scans 252 consecutive
+blocks at heights 92,696–92,947. Rust and each of the five Gov producers
+authored exactly 42 blocks, with a continuous parent chain and no
+transactions. This exact balance confirms the six active leader slots while
+the configured seventh, absent validator is handled by the already-verified
+timeout recovery path. Evidence SHA-256 is `80028a25...72c1`.
+
+The repeated live archive/QMDB audit also passed after the common head reached
+92,953. Two current reference proofs have byte-identical Gov/Rust roots and
+proof encodings and pass the pinned offline verifier. Eleven historical
+heights each pass all 19 RPC/root/proof checks, including genesis and the
+bootstrap boundary. Evidence SHA-256 is `3d1ab47e...4ff9`.
+
+The same full read-only archive/QMDB audit was repeated again around the
+80-minute boundary at common reference height 93,199. Both current proofs
+remain byte-identical between Gov and Rust and pass the pinned offline
+verifier; all eleven historical heights from genesis through height 5,189
+again pass exact RPC/root/proof parity. No transaction or data mutation was
+performed. Evidence SHA-256 is
+`03f3de7dc023cca83223a1263ae32fa982aaad8eb053a9f874fa5c43cd4d3d57`.
+The separate continuously running copied-boundary verifier continues to cover
+the high 905 persisted boundary at height 92,605.
+
+The live client-identity matrix confirms that ports 28501–28505 all report
+`N42/5.7.906`, while port 29545 reports
+`reth/v2.4.1-91725e3/aarch64-apple-darwin`. Every endpoint reports chain ID
+`0x477`, is not syncing, and returns the exact genesis tuple and the same block
+hash/state/receipts identity at fixed height 92,971. Matrix evidence SHA-256
+is `67eea2d0...5351`.
+
+Direct startup/catch-up evidence closes the copied-data lineage chain. The
+active Rust process restored persisted head 92,605 and authenticated QMDB root
+from snapshot-exact view 95,450 at `19:01:54Z`. It produced canonical block
+92,606 with `5+5` only 29.438 seconds later, then continuously authenticated
+execution lineage through the six-endpoint formal head 92,695 and authored
+the next formal Rust slot at height 92,696. All four checkpoint hashes were
+re-read identically from all six RPC endpoints. Evidence SHA-256 is
+`586d04fe...4676`.
+
+The formal block-cadence audit scans 301 continuous blocks over 2,942 block
+timestamp seconds. Timestamps are strictly increasing, average inter-block
+time is 9.81 seconds, and the maximum interval is 40 seconds—well below the
+61-second no-stall threshold even with the configured absent-validator
+timeout cycle. Evidence SHA-256 is `418c4e10...1071`.
+
+The 50-minute resource trend covers 11 samples / 3,001 seconds / 306 blocks
+from the same Rust PID. Threads remain exactly 161 and file descriptors 93;
+RSS increased only 11.5 MiB end-to-end, about 13.8 MiB/hour. Reth allocated
+data grew about 158 KiB/hour, consensus data stayed flat, and QMDB WAL grew
+about 60 KiB/hour. Even a deliberately conservative linear 24-hour RSS
+projection is about 551 MiB, below the frozen 1 GiB limit. Evidence SHA-256 is
+`383e11e3...0991`.
+
+The conservative one-hour composite milestone passed without relaxed
+criteria. Its 120 head samples span 3,607 seconds and 366 blocks with maximum
+lag zero and continuous zero-transaction coverage. Thirteen resource samples
+from the unchanged Rust PID span 3,601 seconds; peak RSS is 241,040 KiB,
+threads remain 161, and file descriptors 93. Seven exact Gov5-main samples
+span 3,605 seconds. Rust has 76 `5+5` commits, CommitQC is present, and
+equivocations remain zero. Milestone SHA-256 is `64c648af...9505`.
+
+The closed one-hour log audit scans canonical heights 92,696–93,068. All six
+endpoints agree on the continuous 373-block parent chain, and all 63 expected
+Rust leader slots match ordered `5+5` commits. Every one of 77
+timeout/pacemaker pairs recovers at the next Rust `5+5` view with zero pending.
+All 624 warnings partition exactly into allowed classes, with zero unknown or
+critical signals. Immutable Rust log, leader, timeout, and runtime-log SHA-256
+values are `f16a27a1...e644`, `5763da46...4a8a`, `40ff2727...97ca`, and
+`e9fb2aca...5410`.
+
+A supplementary one-hour Gov5 process baseline confirms all five original
+PIDs remain alive and older than one hour at common height 93,091. RSS ranges
+from 140,016 to 141,920 KiB, thread counts from 18 to 19, and every process has
+34 open file descriptors; no Gov process was replaced. Evidence SHA-256 is
+`df9227ed...1906`.
+
+The one-hour static-boundary recheck was recomputed from the original evidence
+rather than copying its verdict. It re-hashed all 24 immutable Gov files, the
+genesis/consensus/bootstrap artifacts, Rust validator and P2P keys, every
+frozen verifier, and the Gov5/Reth binaries. All current hashes remain exact;
+the original 124-file copied-data manifest and entries hashes remain
+`561ed6ad...ce5` and `1c115b92...7b4b`. Advancing chaindata is intentionally
+excluded, and the audit performs no mutation. Evidence SHA-256 is
+`dee51343ac6b82b5f40ed6371783854cf4a87d08fa175c2c125e394803ff929a`.
+The reusable read-only rechecker is
+`scripts/recheck-gov5-runtime-static-boundary.sh`.
+
+The three-hour gate now has an additional fail-closed deep audit rather than
+relying only on sampled head/resource/upstream health. After the existing
+three-hour milestone passes, the frozen audit closes on a canonical Rust
+block, snapshots all six logs, scans every formal block from 92,696 through
+that boundary, requires the exact six-block Rust leader cadence and ordered
+`5+5` commits, proves every completed missing-validator timeout recovers at
+the next view, partitions every warning, rejects all critical signals, and
+re-runs the complete static-boundary check.
+
+An 80-minute full-path rehearsal exposed and correctly rejected a snapshot
+boundary race in the first audit implementation: it selected the most recent
+historical Rust block, but a newer timeout could be logged before the copy and
+its next-view recovery immediately after it. The partial audit still proved
+the 505-block canonical leader range, exact `5+5` order, warning partition,
+and recovery of all 99 completed timeouts, but fail-closed rejected the one
+boundary timeout as pending. Commit `5b855bab...ed4` now waits until the latest
+timeout's recovery commit is present in both the live log and committed view
+before selecting and freezing the boundary. The superseded artifacts are
+preserved under `excluded/`.
+
+The corrected frozen V2 (`aea2c249...a73`, static tool
+`b27890ad...10ec`) then passed the same 80-minute gate end-to-end. It scans
+heights 92,696–93,218: all 523 blocks form one continuous six-endpoint chain,
+all 88 Rust slots are exact ordered `5+5`, all 102 timeouts recover at the next
+view with zero pending, all 824 warnings are classified with zero unexpected
+or critical signals, and all 24 static Gov files remain exact. Composite and
+milestone SHA-256 values are `5210a5e8...fbff` and `817cce64...b878`.
+V2 mutation-free preflight SHA-256 is `8e894c62...6565`; persistent
+three-hour waiter PID 71290 is armed. Earlier detached/supervisor V1 launch
+artifacts remain recoverably excluded and did not affect nodes, chain data,
+nonce, or formal timing.
+
+The 80-minute head snapshot contains exactly one transient lag-one sample, at
+`20:16:57Z`: common height 93,071 while the fastest endpoint had observed
+93,072. The next 30-second sample (31 wall-clock seconds later) is again lag
+zero at height 93,073. A dedicated fixed-height replay re-read heights
+93,071–93,073 from all six endpoints and compared number, block/parent hashes,
+state/receipts/transaction roots, miner, and transaction count. Every field is
+exact, the three-block parent chain is continuous, and all blocks are empty;
+the complete deep scan through 93,218 independently includes this boundary.
+This proves an RPC sampling race rather than a canonical fork. Evidence
+SHA-256 is `d5b3339b1a86def1092d213c538bc0e8e6cfed532e6de20534406993fba5f1a3`.
+
+The 90-minute composite gate subsequently passed. Its 180 head samples span
+5,426 seconds and 552 blocks; the only lag-one row is the same already-closed
+sample above, with no new lag event. Nineteen resource samples span 5,402
+seconds and all bind original Rust PID 70765; peak RSS is 248,256 KiB, threads
+remain 161, and file descriptors 93. Ten reachable Gov5-main samples span
+5,407 seconds and remain exact. Rust has 108 `5+5` commits, CommitQC remains
+present, and equivocations and released transactions remain zero. Milestone
+SHA-256 is `cc440f0759498a1aca0f3022bb5ebb20665fed58ab952e031fa94b747da353cd`.
+
+The frozen 90-minute resource series also supports a longer-horizon trend
+check. Original PID 70765 advances 552 blocks over 5,402 seconds; endpoint RSS
+growth is 20,288 KiB, about 13,520 KiB/hour. Holding that deliberately linear
+slope for a full day projects roughly 550,152 KiB, well below the 1 GiB gate.
+Threads remain exactly 161 and file descriptors 93. Reth allocated data grows
+about 133 KiB/hour, QMDB WAL about 60 KiB/hour, and consensus allocated data
+does not grow. Evidence SHA-256 is
+`0d4fbf81d5483781ea53f8924b045e88f5a5504eb587ba85137fae978fd49699`.
+
+The five Gov5 processes have a matching 90-minute-side audit. Original PIDs
+70737/70743/70749/70755/70761 all remain alive and unreplaced after about one
+hour 47 minutes of process time. Every node reports `N42/5.7.906`, chain ID
+`0x477`, and common height 93,271 with lag zero; all five Gov endpoints and
+Rust return the same eight-field fixed-block identity and the expected genesis
+hash. Gov RSS ranges from 143,152 to 145,168 KiB, at most 4,832 KiB above the
+one-hour snapshot; threads remain 18–19 and file descriptors exactly 34.
+Evidence SHA-256 is
+`3f5326c45c88cf8d204f21e7af69aa145331a3357af12180162d887cea84989f`.
+
+A full six-producer audit then replaces sampling with every block in 97
+complete leader cycles. Across heights 92,696–93,277, all six endpoints return
+the same 582-row sequence of number, block/parent hashes, state/receipts/
+transaction roots, miner, and transaction count; each endpoint sequence has
+SHA-256 `95259664...27dd`. The parent chain is continuous and transaction count
+is zero throughout. Rust and each of the five Gov producers author exactly 97
+blocks, with every modulo-six slot permanently bound to one producer. This
+confirms both mixed-client participation and exact Gov rotation while the
+configured seventh absent validator remains covered by the timeout-recovery
+audit. Evidence SHA-256 is
+`03e36dd50afcbedafa464bf975ce2491cfba8bd0497c14149bcf3eff5da5d336`.
+
+The network/consensus matrix also distinguishes execution peer accounting from
+the mixed consensus channel. Each Gov endpoint reports five devp2p peers;
+Rust correctly reports zero execution peers, but PID 70765 has five established
+connections to Gov ports 30301–30305 and authenticates five distinct validator
+peer IDs at indices 1–5. The latest leader-build log reports five connected
+validator peers against a quorum requirement of four, direct-push reaches all
+five, and Rust view 96,271 commits with `5+5`. CommitQC is present,
+equivocations are zero, and the status API's committed block hash resolves to
+the same full identity on all six endpoints. Evidence SHA-256 is
+`7e7df6e05017f112228bca27c439803ee90d5a1cb94030de371bedb7f53b1f8d`.
+Reusable post-restart checker `scripts/audit-gov5-mixed-network-matrix.sh`
+has SHA-256 `955580f2...c533`.
+
+That checker is now part of a separate final post-rollover gate. Pushed commit
+`3093cc7f...8c5f` adds a frozen verifier that waits for the atomic total-goal
+PASS (including the additional latest-Reth hour), then dynamically binds the
+new Rust PID and re-runs the complete socket/authentication/quorum/direct-push/
+`5+5`/CommitQC/equivocation/committed-block matrix. It additionally requires
+both latest and pending nonce `0x22` on all six endpoints before publishing.
+Verifier SHA-256 is `be0471b4...c809`; its frozen mutation-free preflight at
+nonce `0x11` has SHA-256 `f8a6529c...d729`. Persistent waiter PID 94851 is
+armed. This gate sends no transaction and does not alter the existing atomic
+total verifier or copied-boundary verifier.
+
+Pushed commit `71d11a6b...bf65` adds the final objective-level completion
+auditor. It accepts completion only when the atomic total-goal result, copied
+905 boundary result, and post-rollover network result all independently pass;
+it then rechecks every repository and remote pin, official stable Reth tag,
+both binaries, all six live client identities and genesis, CommitQC, zero
+equivocations, empty failure streams, and six-endpoint latest/pending nonce
+`0x22`. Auditor SHA-256 is `b87aa985...b3f0`; frozen mutation-free preflight
+SHA-256 is `6591008d...1f5f` and explicitly says `completionNotClaimed=true` at
+nonce `0x11`. It is intentionally executed manually only after all final
+evidence and the final documentation commit are pushed, so its recorded
+primary HEAD cannot be made stale by its own handoff documentation.
+
+A post-100-minute 905-data lineage recheck passed after 6,366 formal seconds
+and 648 new blocks. All five Gov datadirs still contain zero
+`txindex.ranges` and zero migration markers; no destructive migration was
+performed, while allocated size increased by only 24 KiB per node from the
+earlier compatibility snapshot. All 24 immutable Gov files remain exact. The
+audit re-executes the seven six-endpoint historical identities from genesis
+through the 92,605 copied persisted head and live boundaries; genesis remains
+`b71c2810...1392ec` and copied head remains `b88a3571...5a82`. A current fixed
+block is also exact on all six endpoints at nonce `0x11`. Static and composite
+evidence SHA-256 values are `1588df47...32e1` and
+`64428199aad56c35ab1d852d76c34629f87fbcd887b700cfe22e7f7433b8bf23`.
+
+The strict two-hour composite milestone and its V2 closed-range deep audit
+both pass without relaxed acceptance. The 240 head samples span 7,245 seconds,
+advance from height 92,695 to 93,433 by 738 blocks, retain continuous zero-
+transaction coverage, and have maximum lag one. Twenty-five resource samples
+retain original Rust PID 70765 for 7,203 seconds; RSS peaks at 248,256 KiB,
+threads at 163, and file descriptors remain 93. All 13 Gov5-upstream samples
+remain exact. The deep audit scans canonical heights 92,696–93,434: all 739
+blocks are exact on six endpoints, all 124 Rust leader slots match ordered
+`5+5` commits, all 138 timeouts recover at the immediately following view with
+zero pending, and all 1,113 warnings partition with zero unexpected or
+critical signals. The 24 immutable 905-lineage files also re-hash exactly.
+Composite and deep-audit SHA-256 values are
+`0a4f2057596b690999c07ee6898153bf97eaca54229a22a5c889b7bd48d1b314`
+and `e4e87236dfe0e287af92e09f25d342a4456647a9804d7a405b3c7895fe0c61ef`.
+No transaction, restart, process replacement, or data mutation occurred.
+
+A fresh post-two-hour network matrix also passes. Every Gov execution endpoint
+has five devp2p peers. Rust reports zero execution peers as designed, while
+original PID 70765 retains established consensus TCP connections to all five
+Gov ports 30301–30305 and five unique authenticated validator peers. Leader
+view 96,432 sees five connected peers against quorum four, direct-push reaches
+all five, and commits with `5+5`. CommitQC remains present, equivocations are
+zero, and the committed block has an exact six-endpoint identity. This audit
+is read-only; evidence SHA-256 is
+`ac1234e5500bc0b61cf485a5802ac75f6e78986a58f4f3b45473aa7822c79ab0`.
+
+The two-hour archive/QMDB repetition passes as well. At common height 93,457,
+both current Gov/Rust reference proofs have exact roots and encoded bytes and
+pass the frozen offline verifier. Eleven historical points spanning genesis,
+the bootstrap boundary, and heights 999 through 5,189 pass all 209 RPC/root/
+proof checks. The operation is read-only; evidence SHA-256 is
+`959cb74ecdcb6d20bba6f07d8f925cf1025188c0175d87f248d958503666d3af`.
+
+The frozen completion auditor was then rerun in mutation-free preflight mode
+against newly pushed primary HEAD `07682df34e95e3168f16a88192171be05517ccf2`.
+Its dynamic primary-HEAD/remote check passes along with all fixed Gov5, Reth,
+combination, and dependency pins, both binary hashes, six live identities,
+genesis, and nonce `0x11`; it still explicitly reports
+`completionNotClaimed=true`. This confirms intermediate evidence-documentation
+commits will not create a false source-drift failure at final closure.
+Evidence SHA-256 is
+`76ddcd3e7f1103c4eb0a412b0dbd6429c3b7ea40750dce4cc795a47afa042396`.
+
+Reusable script `scripts/audit-gov5-burst-readonly.sh` (SHA-256
+`4fb70ee35803e23c26be7d8fcb895a3d8980a9a9f3a39e660b76d6a4a4fb1ae4`)
+independently decodes and simulates the final 17-transaction burst at the
+two-hour state. Every signature recovers the expected sender, every chain ID
+is `0x477`, nonces are contiguous from `0x11` through `0x21`, and all 17 raw
+hashes match the artifact; intended Rust/Gov ingress counts are 9/8. All six
+endpoints retain latest and pending nonce `0x11`, and both deployment and
+transfer `eth_call` requests succeed. Gov deployment estimates are `0x12799`
+and Rust's is `0x12b0c`, both below signed gas `0x186a0`; all transfers estimate
+exactly `0x5208`. The audit sends zero transactions. Evidence SHA-256 is
+`206b8ba43a9ca7cbf72fcb4507884ad04a92c056f1a4a6bccafcb53b2f8bbc3d`.
+
+A negative fixture replacing transaction index eight's declared hash with
+zero is rejected immediately with exit code one and no PASS output or live-
+runtime mutation. Negative evidence SHA-256 is
+`2b6f305fb419935f1985578223bd76355931045ff3b0bd9e020b5914d082b6af`.
+The adjacent live resource recheck spans 27 samples, 7,803 seconds, and 798
+blocks on unchanged Rust PID 70765. RSS peaks at 253,088 KiB, threads at 163,
+and descriptors remain 93; head, log, and WAL logical counters are monotonic.
+Resource evidence SHA-256 is
+`65e04bac6aac5e4197d3a66c009b34e1499ce4847d6d569ebaa9541d1ce7896e`.
+
+The long-run host-capacity audit passes at 267 samples and 8,064 formal
+seconds, with a 31-second maximum gap and zero bad rows. The data volume has
+730,728,404 KiB available while runtime28 allocates 18,002,992 KiB. Even a
+deliberately extreme 1 GiB/hour growth assumption plus a separate 64 GiB
+reserve projects only 44,217,392 KiB. Caffeinate PID 72825 holds system,
+user-idle, and disk-idle assertions for another 99,502 seconds, exceeding the
+87,336-second strict-upstream, post-window, extra-hour, and closure budget by
+12,166 seconds. Evidence SHA-256 is
+`5f7123675d22b314a7fcd2299ff4c6cfcea2b5ff56a1bf86790256db9ab8bef9`.
+
+Reusable `scripts/audit-gov5-six-producer-range.sh` (SHA-256
+`37aace7a053ce22f9963dec422d732ee5b10e5ae9cb9effc8ae96fbd3417e003`)
+now atomically retains the six raw JSONL sequences for independent rechecking.
+Its stable two-hour scan covers heights 92,696–93,565: 870 blocks and 145 full
+six-slot cycles. All six RPC endpoints preserve the same 870-row number/hash/
+parent/state/receipts/transactions-root/miner/transaction-count sequence,
+SHA-256 `67b6bf6d...f24a`. Parents are continuous, every block is empty, and
+Rust plus Gov1 through Gov5 each author exactly 145 blocks in permanently
+exact slots.
+Evidence SHA-256 is
+`c1d3749f3f729a897e62a4a42677428360b916a5dea53a343b915efd36f4229f`.
+The first output containing ephemeral paths and the second hash-only output
+are recoverably retained under `excluded/` and are not used for acceptance.
+
+Pushed commit `c469bba7a8abca056fea34e59135e887a97fee91` adds a generic
+milestone raw-producer waiter, SHA-256 `393d2b36...5b70`. Frozen preflight
+SHA-256 `40c69083...2d31` verifies all six nodes, empty failure streams, target
+paths, and the exact frozen range auditor. Persistent PID 3492 / session 38246
+now waits for the three-hour composite PASS, closes its `endHeight` down to a
+full six-slot boundary, and atomically retains all six raw sequences. Launch
+evidence SHA-256 is `d3097c9b...642d`; it changes no node or transaction state.
+
+The same frozen tooling now waits independently at six, eight, twelve, and
+eighteen hours as PIDs 4853/4854/4856/4861 (sessions
+9868/40880/94311/7904). All four preflights verify absent target milestones,
+live nodes, and empty failure streams. Each waiter consumes only its matching
+composite PASS and writes a distinct JSON/raw directory. Consolidated launch
+evidence SHA-256 is `e4bc03f4...d3ab`; all launches are mutation-free.
+
+Pushed commit `98daf559b5324c35e7d274edd1a2bf7ab46a2aa0` adds the
+strict-24-hour-specific raw waiter (SHA-256 `20c7f542...2fc6`). It waits only
+for `mixed-soak-24h-audit.json`, which the finalizer publishes atomically
+before the burst, and fixes its historical range from that zero-transaction
+`endHeight`; later transactions cannot change the audited blocks. Frozen
+preflight SHA-256 is `af4a0025...a2ad`; PID 7527 / session 50942 is active.
+Besides six raw sequences, final output binds the soak and producer audits by
+SHA-256. Launch evidence SHA-256 is `a4a3de4d...7aa2`.
+
+The strict three-hour (10,800-second) composite gate passes. Its 359 head
+samples span 10,853 seconds, grow by 1,116 blocks, retain continuous zero-
+transaction coverage, and have maximum lag one. Thirty-seven resource samples
+retain original Rust PID 70765 for 10,805 seconds; RSS peaks at 275,856 KiB,
+threads at 163, and descriptors remain 93. All 19 Gov5-main samples are exact
+over 10,815 seconds. Rust has 201 `5+5` commits, CommitQC is present, and
+equivocations remain zero. No acceptance criterion is relaxed; milestone
+SHA-256 is `e09f9a2a72499c72971a91f5f2ba5280d241e383f417e1a2a1cb6cdefaa112be`.
+
+The frozen raw tool closes that exact gate over heights 92,696–93,811. Its
+1,116 blocks form 186 complete cycles; Rust and Gov1 through Gov5 each author
+186 blocks. All six retained raw sequences have SHA-256
+`fb38033f...b0b3`; parents are continuous, slots are exact, and all blocks are
+empty. Composite raw evidence SHA-256 is
+`984e03f73a043137e7be3b95c57a2b9fce15b6fca4a25121d1195d11147cd9c6`.
+The frozen V2 deep audit independently reaches height 93,812 and scans 1,117
+canonical blocks. All 187 Rust slots are six-endpoint exact and match ordered
+`5+5` logs; all 201 timeouts recover at the next view with zero pending. Its
+1,619 warnings partition completely with zero unexpected or critical signals,
+and all 24 immutable 905-lineage files remain exact. Deep-audit evidence
+SHA-256 is `9fc98f4302ba6cf91c4016deba68f8f784d040af564b30ac8277b9810a328086`.
+
+An independent post-three-hour raw audit covers heights 93,812–93,955. Its
+144 blocks form 24 complete cycles; Rust and Gov1 through Gov5 each author 24
+blocks. All six raw sequences have SHA-256 `5c6d031f...0565`, with continuous
+parents, fixed slots, and zero transactions. Incremental composite evidence
+SHA-256 is `b1fe9e66dcfcb829d2f00b71cfa7d4f870596b8dda23ec3166dcbda5ceb40d13`,
+showing unchanged rotation through the three-to-six-hour waiting interval.
+
+The matching three-hour archive/QMDB and network-matrix repetitions also pass.
+Both current proofs at height 93,823 retain exact Gov/Rust roots and bytes and
+pass offline verification; eleven historical points pass all 209 checks.
+Original Rust PID 70765 still has five established Gov consensus connections
+and five authenticated validators, leader quorum is 5/4, direct-push reaches
+all five, and view 96,866 commits with `5+5`. CommitQC, zero equivocations, and
+exact six-endpoint committed-block identity remain true. Read-only evidence
+SHA-256 values are
+`e289e5292eb16ad3c32e99185c53a14a6437e1ded3746ca1afcf28a8bf04fa7f`
+and `2e6ca52ca2c0f7ec0a8b8b207d9c519493ee7418f7ed31133cbf0e56cd3e3201`.
+
+The new Rust resource-trend audit passes over the three-hour window. Its 39
+same-PID samples span 11,405 seconds and grow by 1,176 blocks. RSS OLS slope is
+10.57 MiB/hour; conservatively extending that positive slope to 24 hours gives
+486,153 KiB, below the 1,048,576 KiB limit. Threads peak at 163, descriptors
+stay exactly 93, Reth data grows only 404 KiB, and consensus data grows zero.
+Script/evidence SHA-256 values are `f6c5c495...bb80` and `a264d76f...ae98`;
+main/mixed delivery commits are `c5b6673b...087c` and `810cc934...0c4d`.
+
+A 3.5-hour host-capacity recheck remains strict PASS. Its 407 consensus
+samples span 12,308 seconds and grow by 1,266 blocks with zero bad rows and
+maximum lag one. Disk availability is 730,563,924 KiB against current runtime
+18,049,804 KiB; an added 25 GiB growth allowance plus 64 GiB reserve still
+fits. Caffeinate PID 72825 has 95,265 seconds remaining, leaving 12,186 seconds
+beyond the upstream gate plus 8,400-second final-closure allowance; all three
+sleep assertions remain active. Evidence SHA-256 is `ef86aa3a...79d`.
+
+To preserve the running total verifier's launch-time source commitment, the
+mixed working directory now tracks the pushed
+`qualification/runtime28-combo-ab058` branch; both HEAD and upstream are exact
+at pinned `ab058386...3d9e`. Updated delivery branch
+`feat/gov5-n42-live-interop-reth-latest` retains `810cc934...0c4d` and
+`809db3be...5c81`, and advances to
+`ee22f8df1b5d6bf0103096a1bfd8ef38a17c3227`.
+After a complete 60-second fail-closed cycle, total verifier PID 83205 remains
+alive with no failure evidence. Qualification reproducibility and new-tool
+delivery are therefore both retained.
+
+Updated delivery also has an independent local worktree at
+`/Users/jieliu/Documents/n42/interop-reth-latest-20260802/n42-26-delivery-latest`.
+Its HEAD/upstream are exact at `ee22f8df...3227`; the branch adds the
+supplemental waiter above `810cc934...0c4d` and the final completion waiter
+above `809db3be...5c81`. SHA-256 values for the 905 data auditor,
+final 905 waiter, and resource-trend auditor are respectively
+`5bb09bb1...9a67`, `183b7901...08b3`, and `f6c5c495...bb80`. The qualification
+directory remains pinned at `ab058386...3d9e`; neither worktree changes the
+other.
+
+The frozen copied-boundary verifier passes another post-three-hour preflight.
+It re-executes all seven historical boundaries: genesis remains
+`b71c2810...1392ec`, copied 905 persisted head 92,605 remains
+`b88a3571...5a82`, and every stored identity field is exact on all six
+endpoints. Live six-endpoint identity is exact, latest and pending nonce remain
+`0x11`, and no mutation occurs. Evidence SHA-256 is
+`f60946f5a1c77db2aa1b5a18b0306eab84b34698653325485bf7d61996848632`.
+
+The new read-only 905 data-compatibility audit passes against the live
+three-hour runtime. At pinned Gov main `b8c17d0`, variable-width builder
+`337cea4` and in-memory tail `b8c17d0` are both still unwired from consensus
+commit. All five Gov MDBX files exist under their original live PIDs and every
+datadir contains zero `txindex.ranges` files. Chain ID, genesis, copied
+persisted head 92,605, live block identity, and latest/pending nonce are exact
+on all six endpoints, so no 905 data recopy or regeneration is required.
+Script/evidence SHA-256 values are `5bb09bb1...9a67` and `61db5b57...141b`;
+the script is also synchronized to mixed-Reth delivery commit
+`8e985cf860f03081f0b2c25744cd0b69a8840faf`.
+
+The final 905 data waiter (SHA-256 `183b7901...08b3`) passes preflight and is
+active as PID 90131 / session 77080. It waits only for total-goal PASS, then
+repeats the same audit with nonce `0x22` after the transaction burst, Reth
+restart/catch-up, and extra hour. Final acceptance still requires five live
+MDBX files, zero `txindex.ranges`, exact six-endpoint genesis/copied/live
+heads, and no recopy requirement. Main/mixed delivery commits are
+`1c569bf1...ab6f` and `122bf21c...b4c2`.
+
+Final V2 completion auditor SHA-256 `cf73a512...4093` passes preflight and is
+pushed in `40d0e81d...c0b1`. It does not replace the frozen base auditor;
+after base PASS it additionally requires strict-24-hour six-endpoint raw and
+linkage evidence, final 905 data compatibility, and the full 24-hour resource
+trend. It also pins the 17-transaction burst artifact at SHA-256
+`6cf05cd0...d750` and recomputes all six raw sequence hashes and line counts.
+Current output is read-only `completionNotClaimed=true`; final nonce must be
+`0x22`.
+
+V2 and its resource-trend auditor are now frozen into runtime evidence with
+unchanged SHA-256 values `cf73a512...4093` and `f6c5c495...bb80`. A fresh
+frozen-copy preflight passes, pinning burst artifact `6cf05cd0...d750`, live
+nodes, empty failure streams, and nonce `0x11`, while explicitly retaining
+`completionNotClaimed=true`. Preflight evidence SHA-256 is
+`7109cc4d2aa2075b6747da74aa6c3d55c1bd659e2f8f60315d742f2566d3aa8a`.
+
+The six-hour V2 deep audit has also passed its frozen-source preflight and is
+active as PID 82622 / session 95373. Harness, static rechecker, and immutable
+905 baseline SHA-256 values are `037cc547...5309`, `b27890ad...10ec`, and
+`6ea80521...203c`. It waits only for the strict six-hour composite gate, then
+closes Rust leaders, timeout recovery, complete logs, and 24 immutable files
+without mutating chain state.
+
+The same frozen source independently preflights and starts the 12/18-hour deep
+audits as PIDs 88663/88787 (sessions 15588/65112). Each consumes only its own
+strict composite gate and publishes separate closed deep evidence. The
+eight-hour gate already has composite and full six-endpoint raw coverage, and
+the 24-hour finalizer performs the complete final deep audit, so long-run
+coverage is continuous without duplicating state mutation.
+
+Pushed commit `d0353f6c...f4ab` adds generic supplemental waiter SHA-256
+`6878355c...e2e8`. Frozen 6/12/18-hour instances run as PIDs
+8497/8962/9075 (sessions 55444/45824/39512). Each consumes only its strict
+milestone, then automatically repeats the 12-event archive/QMDB audit,
+five-socket/five-authenticated-peer network matrix, 905 data compatibility,
+and 24-hour resource projection. Frozen network/data/resource auditor SHA-256
+values are `955580f2...c533`, `5bb09bb1...9a67`, and `f6c5c495...bb80`.
+All preflights pass without mutation.
+
+A pre-six-hour double recheck at approximately 3 hours 45 minutes also passes.
+The network matrix confirms original Rust PID 70765 still has all five Gov
+consensus sockets and authenticated validators, 5/4 leader quorum, direct push
+to five, and a `5+5` commit at view 97,083. CommitQC remains present,
+equivocations remain zero, and the committed block is six-endpoint exact. The
+905 data audit again pins Gov main `b8c17d0`, all five original live MDBX
+processes, and zero `txindex.ranges`; genesis `b71c2810...1392ec`, copied head
+92,605 / `b88a3571...5a82`, live identity, and current-stage nonce `0x11` are
+six-endpoint exact, so no recopy or regeneration is needed. Read-only evidence
+SHA-256 values are `2388c016...10b2` and `eb6e25a3...4371`. The independent
+post-burst final audit still requires nonce `0x22`.
+
+The frozen resource-trend audit over the same pre-gate window covers 44 samples
+from original Rust PID 70765, 12,906 seconds, and 1,338 blocks. RSS OLS slope is
+10.41 MiB/hour and the conservative 24-hour projection is 484,412 KiB, below
+the 1 GiB limit; threads peak at 163 and descriptors remain 93. Evidence
+SHA-256 is `5f9cd9e2...cb59`. A new six-endpoint raw rotation segment covers
+heights 93,956–94,033: 78 blocks form 13 complete cycles, with Rust and Gov1
+through Gov5 each producing 13 blocks and all endpoint sequence SHA-256 values
+equal to `952ddac5...662e`. Its first parent exactly links to the prior segment's
+height-93,955 terminal hash `ea374f94...c06a`; composite evidence SHA-256 is
+`3fa0d9a2...4788`.
+
+An independent read-only audit of the final closure DAG confirms the ordering:
+the strict finalizer consumes the immutable 24-hour stream, sends the 17-item
+burst, runs ten-minute post-burst stability, archive/QMDB parity, Rust restart
+and catch-up, and ten-minute post-restart stability. Strict independent
+verification then triggers the extra official-Reth-2.4.1 hour; total evidence,
+the final nonce-`0x22` 905 data audit, base completion, and V2 completion close
+in sequence with no evidence dependency cycle. All seven frozen closure
+scripts pass `bash -n`; base/V2 auditor SHA-256 values remain
+`b87aa985...b3f0` and `cf73a512...4093`. Fresh preflights both pass at pushed
+primary `5e3a3701...e5e`, rechecking source/remotes, binaries, genesis, live
+six-endpoint identity, 17-item burst artifact `6cf05cd0...d750`, nonce `0x11`,
+and empty failure streams while explicitly retaining
+`completionNotClaimed=true` and mutation-free status. Combined preflight
+evidence SHA-256 is `a327662e...d06b`.
+
+Commit `171baf79...01af` adds the final completion waiter and synchronizes it
+to mixed delivery commit `ee22f8df...3227`. Frozen script SHA-256 is
+`47c41aae...1b69`. After the final 905 data audit passes at nonce `0x22`, the
+waiter automatically and resumably runs base completion followed by V2
+completion. Its 60-second fail-closed loop pins live nodes, Gov5 main, all
+three auditor hashes, and every failure stream without changing chain state
+early. Frozen preflight passes with evidence SHA-256 `8ea5a15d...224a`.
+Production PID 28426 / session 15009 remains alive after a complete cycle with
+no failure evidence, removing manual triggering from the last two audits.
+
+A read-only archive/QMDB repetition near four hours of process uptime also
+passes. At current height 94,105 both Gov/Rust proof roots and bytes are exact
+and pass the frozen offline verifier; all eleven historical points retain exact
+RPC/root/proof parity across twelve events. Evidence SHA-256 is
+`44f3ffa1...5ccb`. The simultaneous static-boundary recheck recomputes all 24
+immutable 905 files, genesis/consensus/bootstrap artifacts, validator and P2P
+keys, frozen harness/finalizer/independent/QMDB/total tools, and both Gov/Rust
+binaries. Every initial SHA remains exact; evidence SHA-256 is
+`b03e479c...ab64`.
+
+The strict four-hour (14,400-second) four-part gate closes without relaxed
+acceptance. Its composite has 477 head samples over 14,430 seconds, grows by
+1,494 blocks, and retains maximum lag one with zero bad rows. Forty-nine
+same-PID resource samples span 14,406 seconds; 25 exact Gov5-main samples span
+14,419 seconds with maximum gap 601 seconds. Rust accumulates 264 `5+5`
+commits, equivocations remain zero, and no transaction is sent. Composite
+evidence SHA-256 is `18d40534...e4a5`.
+
+The frozen six-endpoint raw audit closes heights 92,696–94,189. Its 1,494
+blocks form 249 complete cycles; Rust and Gov1 through Gov5 each produce 249
+blocks. All six sequences share SHA-256 `f6716c23...c4e1`, with exact parents,
+slots, and zero transactions; composite evidence SHA-256 is
+`8f48cb81...0fc8`. Independent deep audit reaches height 94,196 across 1,501
+blocks. All 251 Rust slots are six-endpoint exact `5+5`; all 265 timeouts
+recover in the next view with zero pending. All 2,132 warnings partition with
+zero unexpected or critical signals, and 24 immutable files retain their
+initial SHAs. Deep-audit and frozen-Rust-log SHA-256 values are
+`ef5559e7...771f` and `d994013f...9604`.
+
+The matching supplemental audit also passes. Twelve archive/QMDB events are
+exact; five consensus sockets and five authenticated validators retain quorum,
+view 97,293 commits with `5+5`, and its block is six-endpoint exact. The 905
+data still contains zero `txindex.ranges`; genesis and copied head are exact,
+with no regeneration required. Resource OLS slope falls to 8.83 MiB/hour and
+24-hour RSS projects to 434,568 KiB. Supplemental and archive/network/data/
+resource child evidence SHA-256 values are `e03e8047...3262`,
+`c7a6ea03...06a3`, `88a6e3ae...5a8d`, `ecf5e405...e640`, and
+`95e27c1c...c1c4`.
+
+The four-hour host-capacity recheck also passes strictly. Its 486 head samples
+span 14,703 seconds and grow by 1,518 blocks with maximum lag one and zero bad
+rows. Disk availability is 730,451,864 KiB against runtime 18,079,660 KiB; an
+added 25 GiB allowance plus 64 GiB reserve still fits. Caffeinate PID 72825 has
+92,877 seconds remaining, leaving 11,896 seconds beyond the 87,000-second
+upstream gate plus 8,400-second final-closure allowance; all three sleep
+assertions remain active. Evidence SHA-256 is `9f7bf2a7...5cc3`.
+
+The four-hour closure linkage then rehashes and cross-binds all four evidence
+families. Composite and six-endpoint raw boundaries are both exactly
+92,696–94,189, covering 1,494 blocks / 249 cycles. Every raw file has 1,494
+rows and identical SHA-256 `f6716c23...c4e1`. Embedded milestone hashes in
+both deep and supplemental evidence equal `18d40534...e4a5`; deep coverage
+extends through 94,196, and the frozen Rust log remains
+`d994013f...9604`. Linkage evidence SHA-256 is `1a04be1f...dd7b` and explicitly
+records that the historical window cannot be altered by the later burst.
+
+After four hours, an auxiliary latest-Reth preflight mistakenly invoked the
+stale rollover copy under runtime `artifacts/scripts` (SHA-256
+`778e77c1...7664`, with its older embedded harness pin). It failed closed at a
+static SHA assertion before any transaction, node restart, or chain mutation.
+The original 282-byte failure is preserved byte-for-byte at SHA-256
+`6b41bea4...8fe8` under
+`evidence/excluded-operator-preflight-wrong-rollover-copy-20260803T232257Z/`;
+its exclusion record SHA-256 is `6d7d171e...6564`. Latest independent correctly
+observed that temporary failure stream and exited; its preserved 204-byte
+derived failure has SHA-256 `a58c0ec9...463f`, with derived exclusion record
+SHA-256 `4b98bcdc...f5a8`. Formal 24-hour evidence is unchanged.
+
+The formal `evidence/official-reth-stable` rollover copy (SHA-256
+`68c1f209...ca0`) then passes a real preflight. Reth v2.4.1 / `91725e3a`, binary
+`0a4dbcf3...62b9f`, live six-endpoint identity, and genesis are exact without
+mutation; evidence SHA-256 is `cac545d2...79b7`. Dependent waiters are rearmed
+with their original frozen parameters: latest independent PID 87801/session
+35229, total PID 87802/session 30844, final 905 PID 88093/session 66123, and
+completion PID 88094/session 38136. After a complete 60-second cycle, all four
+and formal rollover PID 80652 remain alive with empty new failure streams and
+continued zero lag.
+
+The recovered latest-Reth independent verifier was then exercised directly,
+using the same frozen invocation consumed by PID 87801. Its verifier SHA-256
+is `9b90145b...02b5`; official stable tag v2.4.1, live six-endpoint identity,
+genesis, and latest/pending nonce `0x11` are exact, and no mutation was
+performed. The post-exclusion preflight is PASS at SHA-256
+`a6f3ff6f...47de`, independently confirming that the rearmed waiter no longer
+references the stale auxiliary rollover copy.
+
+The strict 2.5-hour (9,000-second) composite gate passes. Its 299 head
+samples span 9,034 seconds, grow by 924 blocks, retain continuous zero-
+transaction coverage, and have maximum lag one. Thirty-one resource samples
+retain original Rust PID 70765 for 9,004 seconds; RSS peaks at 263,824 KiB,
+threads at 163, and descriptors remain 93. All 16 Gov5-main samples are exact
+over 9,012 seconds. Rust has 170 `5+5` commits, CommitQC is present, and
+equivocations remain zero. No acceptance criterion is relaxed; milestone
+SHA-256 is `dc639f5d1b46f9b3e88a0e9024c48d7c50609bf477a876119c5dbf695757cdf7`.
+
+The frozen raw producer tooling then consumes that exact milestone boundary.
+Heights 92,696–93,619 contain 924 blocks and 154 complete cycles. Each of the
+six endpoints retains a 924-row full-identity sequence with the same SHA-256,
+`8763d282...6691`. Parents are continuous, every block is empty, and Rust plus
+Gov1 through Gov5 each author exactly 154 blocks in fixed slots. Composite raw
+evidence SHA-256 is
+`448b88f76d6a07fe5a66b365da8244f722df6b86ccebcc1ed6fa13487cf3faa6`.
+
+The frozen V2 deep audit then closes the same milestone on Rust-authored height
+93,638. It scans 943 canonical blocks; all 158 Rust slots are exact on six
+endpoints and match ordered `5+5` logs. All 172 timeouts recover at the next
+view with zero pending. The 1,383 warnings partition completely with zero
+unexpected or critical signals, and all 24 immutable 905-lineage files remain
+exact. Deep-audit evidence SHA-256 is
+`b29b5e2c8213afde8819208a7a255f8501e60e2d6058355d8f93c12f559eeb02`.
+
+Parallel 2.5-hour archive/QMDB and network-matrix repetitions also pass. Both
+current proofs at height 93,649 retain exact Gov/Rust roots and bytes and pass
+offline verification; eleven historical points pass all 209 checks. Original
+Rust PID 70765 still has five established and authenticated Gov consensus
+peers, leader quorum is 5/4, direct-push reaches all five, and view 96,663
+commits with `5+5`. CommitQC, zero equivocations, and exact six-endpoint
+committed-block identity remain true. Read-only evidence SHA-256 values are
+`14d50609abd423a9efa21dbdf9c92587c510f31b92c7bdf938da4f67f9f03ec8`
+and `66a376f35049cd9dbbd04d708d10350ddd26ec82d4b9c0e64401cac350f30a1a`.
+
+The frozen copied-boundary verifier independently passes another preflight at
+2.5 hours. It re-executes all seven historical boundaries: genesis remains
+`b71c2810...1392ec`, copied 905 persisted head 92,605 remains
+`b88a3571...5a82`, and every stored identity field is exact on all six
+endpoints. The live six-endpoint identity is exact, latest and pending nonce
+remain `0x11`, and no mutation occurs. Evidence SHA-256 is
+`6f0b8128cbaaf156f957b59764144155b138f1c93633aaa93bccbdfc3aaa8245`.
+
+The superseded runtime27 candidate passed all `internal` and `cmd/n42` tests;
+two consecutive optimized builds were byte-identical. Its pinned Gov binary
+SHA-256 was `72e918d9500169e227ef1a0c9d5dd751dcd7d58f1df0871825b61f196e3fce95`.
+The paired Rust binary is official-stable Reth 2.4.1 at
+`91725e3aa8f2a0bbc5a425e931a2f2b2f31b2a7b`, combined and pushed at
+`ab05838691e6ec71f5df0faa1d3eefb1fc9d3d9e`, with binary SHA-256
+`0a4dbcf30d7cc9944a7cd7c96a25c1ebf862df10bde76210a381ef492e362b9f`.
+
+The repeated Gov5 updates were handled fail-closed. Runtime22 was excluded
+when main moved from `ddcdaa2f6...` to `5afabac1f...`; runtime23 was excluded
+when it moved to `9c821032e...`; runtime24 was excluded when it moved to
+`379046b97...`; runtime25 was excluded when main moved to `d09b3ad00...`; and
+runtime26 was excluded after 731 seconds of healthy formal evidence when main
+moved to `d12257c92...`. None of these
+excluded runs released a transaction. Each exclusion preserves the exact
+six-endpoint head, Rust `5+5` leader evidence, old/new upstream commits, and a
+recoverable stopped data directory.
+
+Runtime27 is an APFS copy-on-write clone of the cleanly stopped runtime26
+state. A full source-versus-target content pass compared all 124 persistent
+Gov/Rust files, totaling 17,316,415,839 bytes; both canonical manifests hash
+to `1c115b9226bbc303092ae893fa7c0b86a50fae8080adb49e2e7746339be37b4b`.
+The JSON evidence SHA-256 is
+`50433f934a854e24206e023bb2e9dcb4e398dc60c62afd9d76a0dd39aefe132f`.
+The copied genesis artifact remains byte-exact at
+`561808693c76b356e51f8f5961304e68f3167943c17145bda056612041dca687`;
+all six RPC endpoints return genesis
+`b71c28109836f120453d097c38819a55b14c49abcc92713037fb9b11201392ec`.
+
+The current-main canary passed with exact heads, roots, and receipts across
+five Gov nodes and one Rust node. Rust authored views 95,452 and 95,459 with
+full `5+5` votes, CommitQC was present for all seven configured validators,
+and equivocation evidence was empty. The canary evidence SHA-256 is
+`1d79bd4ea045b89994ea69574da66c229ec17a0aaf73b491d3fe0a7dc673379b`.
+Mutation-free burst, strict-independent, latest-Reth rollover, and
+latest-Reth-independent preflights all passed at sender nonce `0x11` with zero
+transactions sent.
+
+The independent 15-minute leader checkpoint scanned canonical heights 92,624
+through 92,732. All six endpoints returned the same continuous 109-block
+parent chain and the same 19 expected Rust-authored slots. Commit-log views
+95,473 through 95,599 had exact stride seven, hash order, and `5+5` votes;
+checkpoint evidence SHA-256 is
+`b73e59ef86bb72691c6a80d1c0131bfc79ce3846a3bf0fd3dc0c954c0fd65ef2`.
+The same checkpoint froze Rust log SHA-256 `53381bef...0f691` immediately
+after recovery view 95,620. Its independent timeout audit found 24/24 matched
+timeout and pacemaker events at exact stride seven, all recovered in the next
+view by Rust `5+5`, with zero pending timeouts. The frozen-log partition audit
+accounted for all 200 warnings exactly and found zero unexpected warnings or
+critical signals. The timeout and log-audit evidence SHA-256 values are
+`fbc874d6...13c1c` and `ce464745...c3620` respectively.
+The 20-minute resource checkpoint covers five samples over 1,201 seconds with
+one unchanged Rust PID and 132 blocks of head growth. Peak RSS was 238,976
+KiB, threads 162, and file descriptors 93, all well below the frozen limits;
+logical storage and log counters were monotonic. Its snapshot and audit
+SHA-256 values are `1dd0d0c9...8a503` and `9389d086...af14`.
+The read-only archive/QMDB checkpoint then compared 11 historical RPC points
+and two reference proofs at height 92,767. Gov and Rust returned byte-exact
+RPC payloads, proof roots, and proof bytes, and the frozen offline verifier
+accepted every proof. No transaction or chain mutation was involved; evidence
+SHA-256 is `d9ab509e182789d6fbe96084c54d3325aab2ea73e0a6b162737dc7a3411bb26c`.
+The 20-minute identity recheck also confirms chain ID `0x477` and, on all six
+endpoints, genesis hash `b71c2810...1392ec`, genesis state root
+`91a450c1...9941`, and genesis receipts root `56e81f17...b421`. At height
+92,773 all six latest block hash/state/receipts tuples were exact; 28 Rust
+`5+5` commits had been observed through view 95,641, with CommitQC and zero
+equivocations. The latest-identity and detailed-genesis evidence SHA-256 values
+are `99d3af7d...0c163` and `6baf439e...deff6`.
+The signed burst artifact was also independently decoded offline before any
+broadcast. All 17 raw transaction hashes recomputed exactly, every signature
+recovered sender `f39fd6e5...2266`, every EIP-155 chain ID was `0x477`, nonces
+were continuous from 17 through 33, deployment and transfer semantics were
+exact, and the CREATE address recomputed to `9a9f2ccf...63ae`. The alternating
+ingress plan contains eight Gov and nine Rust submissions. The reusable
+verifier SHA-256 is `90c2bf05...8a51`, PASS evidence SHA-256 is
+`caf40cea...b3ce`. Deliberately altered transaction hash, chain ID, nonce
+sequence, and ingress-plan artifacts are all rejected.
+
+The 30-minute composite milestone independently froze and re-audited all
+three qualification streams. Heads covered 61 samples / 1,826 seconds / 198
+blocks with max lag two and zero transactions; resources covered seven samples
+/ 1,801 seconds with one PID; Gov5 upstream covered four exact snapshots /
+1,803 seconds. Rust had 37 `5+5` commits, CommitQC was present, equivocations
+were zero, and no failure evidence existed. Milestone evidence SHA-256 is
+`b71a6b466e79c3d2f7a7a56675b0e68a123896bcf1aba7709d1f3b726af1ca29`.
+
+The strict one-hour composite milestone passed at `2026-08-03T10:50:56Z`
+without relaxing acceptance. Its frozen head stream contains 121 samples over
+3,651 seconds, grows from height 92,623 to 93,031, has a maximum 31-second
+sample gap and maximum lag two, and verifies zero transactions throughout.
+The resource stream contains 13 samples over 3,602 seconds from the unchanged
+Rust PID 89930; peak RSS was 250,096 KiB, threads 162, and file descriptors 93.
+Seven upstream samples over 3,605 seconds all resolve exactly to Gov5 main
+`d12257c92...`. Rust recorded 71 `5+5` leader commits, CommitQC remained
+present, equivocations remained zero, and no failure evidence existed. A
+separate read-only recomputation rechecked the milestone, all three frozen
+streams, limits, monotonicity, PID identity, and upstream pin. Milestone
+evidence SHA-256 is
+`40b0c17fd2d512a6ca80593ae22ef902494d82f483d23eba42a6041fcef1506a`.
+
+A closed-log deep audit immediately after that milestone strengthens the
+leader-count check into a canonical range proof. It scans all 450 blocks from
+92,624 through 93,073, proves a continuous parent chain and exact responses
+from all six endpoints, and matches all 75 expected Rust-authored slots to 75
+ordered log commits with view stride seven and `5+5` votes. On the same frozen
+Rust log, all 77 timeout/pacemaker pairs are complete and recover in the next
+view through Rust `5+5`; all 630 warnings partition into the known categories,
+with zero unexpected warnings or critical signals. The frozen Rust log,
+leader, timeout, and log-audit SHA-256 values are respectively
+`2ac01623...6a18`, `ce7dab33...48db`, `d8f76e88...1f26`, and
+`1cc39713...7ff0`. The frozen controller chain also passes syntax, hash,
+dependency, and output-collision checks; the old runtime paths remaining in
+script defaults are overridden by the already-passed runtime27 launch binding.
+
+An additional 90-minute composite milestone passed at
+`2026-08-03T11:20:24Z`, again without relaxing acceptance. Its frozen head
+stream contains 179 samples over 5,415 seconds, grows 606 blocks from 92,623
+to 93,229, has a maximum 31-second gap and maximum lag two, and remains
+zero-transaction throughout. The resource stream contains 19 samples over
+5,403 seconds from unchanged Rust PID 89930; peak RSS was 253,616 KiB,
+threads 162, and file descriptors 93. Ten Gov5-upstream samples over 5,408
+seconds all remain exact at `d12257c92...`. Rust recorded 104 `5+5` leader
+commits, CommitQC remained present, and equivocations and failure evidence
+remained zero. Independent recomputation of the summary and all three frozen
+streams passed; milestone SHA-256 is
+`28487e6d0d17e05dd33382c06b857180c5bb5ce5482e937cc3ea0c9a8884a158`.
+The first attempt to add this optional waiter as a detached shell child was
+reaped with an empty log before producing any output; it is preserved under
+`excluded/runtime27-ninety-minute-detached-launch-not-persistent/`. The
+tool-managed replacement did not restart nodes or formal streams and is the
+only attempt counted here.
+
+The 90-minute read-only archive/QMDB rerun also passed at live reference
+height 93,241: all 11 historical RPC comparisons were byte-exact, and both
+reference proofs had identical Gov/Rust roots and bytes and passed the frozen
+offline verifier. Evidence SHA-256 is
+`c981bfc57c39b3dffc7b3ef5967141d7da708254d810bbb2fbd86a47384dbe3a`.
+The reusable current-main canary recorder now additionally fail-closes on all
+six chain IDs, full genesis hash/state/receipts roots, sender latest/pending
+nonces, and records client versions while retaining the prior endpoint
+`.genesis` string schema. Its SHA-256 is `e4840036...e770`; an intentionally
+wrong nonce was rejected with no output or chain mutation. The resulting
+height-93,265 checkpoint confirms chain ID `0x477`, genesis
+`b71c2810...1392ec` / state root `91a450c1...9941` / receipts root
+`56e81f17...b421`, nonce `0x11`, exact six-endpoint latest identity, five
+Gov5 5.7.906 clients, official Reth 2.4.1, CommitQC, 110 observed Rust `5+5`
+commits, and zero equivocations. Checkpoint SHA-256 is
+`3dd0de1c0956375119c1e1a812bd21aab2b0bbb6c0c5962e3a2c550d63442d43`.
+
+The optional two-hour milestone then exposed a resource-auditor semantics
+bug, not a node or consensus failure. `du -sk` measures allocated filesystem
+blocks: while the same Rust PID advanced normally, consensus allocation moved
+from 87,400 to 85,532 and then 87,580 KiB during compaction. Head, log bytes,
+QMDB WAL, all resource ceilings, six-endpoint identity, and the end-to-end
+allocation change remained healthy. The old auditor nevertheless rejected
+the 1,868-KiB transient decrease because it treated allocated blocks as a
+logical monotonic counter with a four-KiB tolerance. That first optional
+snapshot and failure are preserved under
+`excluded/runtime27-resource-compaction-auditor-controller-rearm/` and do not
+disqualify the uninterrupted authoritative streams.
+
+The corrected auditor permits nonnegative allocated-block measurements to
+decrease during compaction, explicitly reports maximum Reth and consensus
+step decreases, and still strictly requires one PID, monotonic head/log/WAL,
+bounded sample gaps, head growth, and the RSS/thread/descriptor ceilings. A
+synthetic 1,868-KiB compaction passes, while a synthetic logical log-byte
+decrease fails; the real frozen resource snapshot also passes. The updated
+harness, finalizer, and independent-verifier SHA-256 values are
+`037cc547...5309`, `e116089d...f9c0`, and `39b11db6...102d`. Both mutation-free
+preflights passed at nonce `0x11`; their SHA-256 values are
+`b08efb69...2005` and `7e320726...d0cf`.
+
+Only waiting controllers were rebound. All six node PIDs, all three formal
+monitor PIDs, the official-Reth monitor, monitor PID guardian, and caffeinate
+remained unchanged; no transaction, restart, chain mutation, or elapsed-time
+reset occurred. The new exact-PID guardian is PASS and the strict independent
+waiter is again held by the immutable gate. Rearm evidence SHA-256 is
+`f534f806afd21948569cdbaec69f4fb406e1b4d2836bce8ec7a8e918355a285c`.
+
+The corrected two-hour composite milestone passes independently. Heads cover
+254 samples / 7,690 seconds / 864 blocks with maximum lag two and continuous
+zero transactions. Resources cover 26 samples / 7,504 seconds from Rust PID
+89930, with maximum RSS 261,344 KiB, 162 threads, 93 descriptors, monotonic
+head/log/WAL, and the explicitly reported 1,868-KiB consensus compaction.
+Thirteen Gov5-upstream samples span 7,210 seconds and remain exact at
+`d12257c92...`. Rust has 148 `5+5` commits, CommitQC is present, and
+equivocations and failure evidence are zero. Milestone SHA-256 is
+`ce33a8b268acb8a85e0b16b1f0b492c6c76c26fc4922dc08b91abf6cb9cf9806`.
+
+A fresh mutation-free 135-minute identity checkpoint specifically rechecked
+the 905-data/906-binary boundary and the previously suspected genesis change.
+All six endpoints reported chain ID `0x477`, genesis hash
+`0xb71c28109836f120453d097c38819a55b14c49abcc92713037fb9b11201392ec`,
+genesis state root `0x91a450c13f9deab2c9edf5832c96008862e7cc1169599f68461c3ec947099941`,
+and genesis receipts root
+`0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421`.
+At height `0x16d65`, latest hash/state/receipts were byte-for-byte identical,
+the sender latest and pending nonce remained `0x11`, client versions were Gov5
+5.7.906 and official Reth 2.4.1, and 156 Rust `5+5` commits, CommitQC, and zero
+equivocations were present. Checkpoint SHA-256 is
+`9f1881315a3a11a18d8ee2d6d4c2e8fde652cea285b9057b8be313e4603effb6`.
+
+The unified 140-minute frozen-log audit extends the deep leader proof from
+height 92,624 through 93,601. All 978 blocks form one parent-continuous
+canonical range, all six endpoints agree on every expected leader block, and
+all 163 Rust slots have exact `5+5` log entries, seven-view stride, and hash
+order. The same immutable Rust log contains 165 timeout/pacemaker pairs; all
+165 recover at the immediately following view with Rust `5+5`, leaving zero
+pending timeout. Its 1,351 warnings partition exactly into the accepted
+timeout, compact-eviction, Rust-commit, and duplicate-suppression classes,
+with zero unknown warnings or critical signals. The immutable log, leader,
+timeout, and runtime-log SHA-256 values are `a1ad313e...515a`,
+`1eb7eeb5...8bcc`, `56dcb732...d37b`, and `f096a71e...d54c`.
+
+A fixed-path 150-minute rolling composite then passed with 299 head samples /
+9,055 seconds / 1,014 blocks / maximum lag two, 31 same-PID resource samples,
+and 16 exact Gov5-upstream samples. A second live compaction lowered consensus
+allocation by 1,944 KiB in one step and left its end-to-end allocation 740 KiB
+below the stream start, while head, log bytes, and QMDB WAL remained monotonic
+and every resource ceiling remained satisfied. This independently exercises
+the corrected allocated-storage semantics beyond the earlier 1,868-KiB case.
+The rolling summary SHA-256 is
+`349481a3ee0b4a7ab934345deb140878e06b9a612cf22e99d519c99f7120faa0`.
+
+The formal three-hour milestone and an independent rerun both pass without
+relaxed acceptance. Heads contain 358 samples / 10,845 seconds / 1,218 blocks,
+with a 31-second maximum gap, maximum lag two, and continuous zero-transaction
+coverage. Resources contain 37 samples / 10,806 seconds from Rust PID 89930,
+with maximum RSS 268,000 KiB, 162 threads, 93 descriptors, monotonic
+head/log/WAL, and the observed 1,944-KiB compaction. Nineteen exact Gov5-main
+samples span 10,815 seconds. The milestone records 206 Rust `5+5` commits,
+CommitQC, seven validators, zero equivocations, and zero transactions. Its
+SHA-256 is `953e03d8cd0f3b955a9e9ae4c1fb2d54475fcd6cd2bea1c5a04560469695d782`;
+the independent recheck SHA-256 is
+`1e4f317926f5187a26795d166647470f13e5b9c8e8d2cd1928358b99f92376eb`.
+
+The simultaneous identity checkpoint again proves chain ID `0x477`, the full
+pinned genesis hash/state/receipts tuple, all-six latest identity, sender nonce
+`0x11`, Gov5 5.7.906, official Reth 2.4.1, and zero equivocations; its SHA-256
+is `b2afa7bc26b26f56a0cbf8d16aac2f58b45c071e07820ef8778bb70c29f4c3b1`.
+The permanent resource-auditor regression test is executable at
+`scripts/test-gov5-resource-auditor.sh`; it accepts allocated-block compaction
+and rejects log/WAL/head rollback, PID replacement, nonpositive allocation,
+and oversized sample gaps. Its SHA-256 is `73822807...f7f`.
+
+The full three-hour canonical leader audit independently scans heights 92,624
+through 93,841. All 1,218 blocks are parent-continuous; all 203 expected Rust
+slots are byte-identical at the six endpoints and have matching `5+5` log
+entries, exact seven-view stride, and exact hash order. One immutable log tree
+contains 212 timeout/pacemaker pairs, all recovered by Rust `5+5` at the next
+view with zero pending. Its 1,732 warnings partition exactly, with zero unknown
+warnings and zero critical signals. The immutable-log, leader, timeout, and
+runtime-log SHA-256 values are `4609b765...aac7`, `cd9e2e38...4876`,
+`8598364e...764b`, and `6ffb346d...7a18`.
+
+The three-hour dependency-delivery recheck also passes. The pushed mixed-client
+combination branch is exactly `ab058386...`, the pushed Reth delivery branch is
+exactly `91725e3...`, and the pushed dependency-upgrade branch is exactly
+`aec34a0...`; each tracked worktree is clean and each remote branch matches its
+local HEAD. Gov5 candidate `d0999e7...` still tracks upstream main `d12257c...`,
+the official latest stable Reth tag remains v2.4.1 at `8eb21017...`, and the
+Gov5/Rust binary SHA-256 values remain `72e918d9...` and `0a4dbcf3...`.
+Machine evidence SHA-256 is
+`9d3fbf70a7725ed906bf37fa873c3b5b73624137ec12c137238b4a93c9d27b54`.
+
+The three-hour 905-data static-boundary recheck passes as well. The immutable
+copy evidence still binds 124 files / 17,316,415,839 bytes to identical source
+and target manifest SHA-256 `1c115b92...`; all 24 epoch schedule, network
+configuration, network-key, and BLS-keystore files across the six preserved
+Gov data directories still match their initial-copy hashes. Genesis,
+consensus/bootstrap configuration, validator/P2P keys, frozen harness,
+finalizer, independent verifier, QMDB verifier, and both binaries also retain
+their pinned SHA-256 values. Running chaindata is deliberately excluded because
+correct block production must mutate it. Evidence SHA-256 is
+`b1b4306dc929720719058960d68430344f0b68cc282a226b27ce4d6e45d20955`.
+
+A read-only archive/QMDB checkpoint immediately after the three-hour gate also
+passes. At live reference height 93,871, two Gov5 account proofs and Rust QMDB
+proofs have identical roots and bytes and both verify offline. Eleven fixed
+historical heights from genesis through 5,189 pass 209 block, receipt, log,
+state, storage, and proof checks with exact Gov5/Rust RPC results. All six
+pending nonces remain `0x11`, and the checkpoint sends no transaction. Its
+SHA-256 is `c9336afeb6958cddb2f60f9017c43a242a56f042cbd7cbd822f1b499585ba4be`.
+
+The authoritative zero-transaction stream began at
+`2026-08-03T09:49:44Z`, common height 92,623, lag zero. It requires continuous
+six-endpoint hash/state/receipt equality, zero transactions in every newly
+observed block, maximum lag six, 86,400 seconds of elapsed samples, continuous
+Gov5-main and official-Reth-stable pins, and bounded Rust resources. Exact-PID
+guardians cover all six nodes, the three evidence streams, finalizer,
+immutable-log gate, both independent verifiers, latest-Reth rollover, and
+sleep prevention. The one-hour milestone has passed; 3-, 6-, 12-, and 18-hour
+milestones remain armed. After the strict window, the guarded finalizer
+performs the 17-transaction dual-ingress
+burst, archive/QMDB checks, ten-minute post-burst run, controlled Rust restart,
+ten-minute post-restart run, immutable log verification, and independent
+re-execution. Only then may the additional one-hour latest-stable-Reth run and
+its independent verifier begin. No final acceptance is claimed before the
+atomic total-goal verifier passes.
+
+The formal four-hour composite milestone also passes without relaxing any
+acceptance rule. Its 477 head samples span 14,453 seconds and grow from height
+92,623 to 94,249, with a 31-second maximum gap, maximum lag two, and continuous
+zero-transaction coverage. Forty-nine resource samples span 14,407 seconds
+from the original Rust PID 89930; peak RSS is 269,808 KiB, thread and descriptor
+maxima are 162 and 93, and head/log/QMDB WAL remain monotonic while the auditor
+correctly records the earlier 1,944-KiB allocated-storage compaction. Twenty-five
+Gov5-upstream samples span 14,422 seconds and all match `d12257c...`. Rust has
+274 `5+5` leader commits, CommitQC with seven validators, and zero equivocations.
+The milestone SHA-256 is
+`e5c64c8987a930b9b1a610322d554bdf45a323d760f0845388378da09a495585`.
+The 6-, 12-, and 18-hour waiters, strict finalizer, restart/rejoin checks, and
+latest-stable-Reth rollover remain armed; this checkpoint releases no
+transaction and does not claim final acceptance.
+
+An independent immutable-log audit at the same boundary scans canonical
+heights 92,624 through 94,262. All 1,639 blocks are parent-continuous; all 274
+expected Rust slots are exact at all six endpoints and match 274 `5+5` commit
+records with exact view stride and hash order. All 276 timeout/pacemaker pairs
+recover at the next view with zero pending. The 2,252 warnings partition
+exactly into allowed classes, with zero unknown warnings or critical signals.
+The frozen Rust log, leader, timeout, and runtime-log SHA-256 values are
+`a185811f...8e55`, `53270ea6...2ebe`, `59c90704...4076`, and
+`e52303d2...100a`.
+
+A second read-only archive/QMDB checkpoint after the four-hour gate also
+passes. At live height 94,303, two Gov5 account proofs and Rust QMDB proofs
+have identical roots and bytes and both verify offline. Eleven historical
+heights from genesis through 5,189 again pass 209 exact RPC and proof checks.
+All six pending nonces remain `0x11`; no transaction or process restart was
+used. The evidence SHA-256 is
+`1060c76b310359b3655a43d0d9c517933290a91eacb3b91cbf5c39ba74785974`.
+Two wrapper-only diagnostics are retained under `excluded/`: one misspelled
+the frozen verifier environment name and failed before output, while the other
+mistakenly expected 11 total records instead of the harness's one live proof
+record plus 11 historical records. The correctly bound evidence was validated
+in place and was neither appended nor regenerated.
+
+The simultaneous four-hour chain-identity canary again verifies chain ID
+`0x477`, genesis hash `b71c2810...1392ec`, genesis state root
+`91a450c1...9941`, and empty genesis receipts root `56e81f17...b421` at all
+six endpoints. Their live block identity is also exact, both sender nonce
+queries remain `0x11`, and client versions remain Gov5 5.7.906 and official
+Reth 2.4.1. Rust has 285 unique `5+5` commits, seven-validator CommitQC, and
+zero equivocations. The identity evidence SHA-256 is
+`3e554ff12f4efcc56b501df7640bb01d6e197e9d9423cf69b62f22f26e3142fb`.
+
+The four-hour 905-data boundary recheck also passes. The original copy remains
+bound to identical source and target manifest SHA-256 `1c115b92...37b4b`
+(124 files / 17,316,415,839 bytes). All 24 epoch schedule, network config/key,
+and BLS-keystore files across the six retained Gov data directories still
+match their initial hashes. Genesis, consensus/bootstrap artifacts, validator
+and P2P keys, frozen harness/finalizer/independent/QMDB tools, and both client
+binaries retain their pinned hashes. Live chaindata remains deliberately
+excluded because block production must mutate it. No mutation was performed;
+evidence SHA-256 is
+`4322ede81bd6d5102cad96e94e35ede59d899bafa458178b8dd7347768c47381`.
+
+The four-hour dependency-delivery recheck passes as well. The primary branch,
+Gov5 candidate, mixed-client combination, Reth delivery, and dependency-update
+branches are each tracked-clean and exactly equal to their pushed remote
+heads. Gov5 remains candidate `d0999e7...` over upstream main `d12257c...`;
+the official latest stable Reth release remains v2.4.1 at tag object
+`8eb21017...`, and the Gov5/Rust binary hashes remain pinned. Machine evidence
+SHA-256 is
+`5b7eb21ebc003aafb71ff3b11b105fae4d10aab790047c0d1326cdfef8db6cbe`.
+
+The additional five-hour composite milestone passes without relaxing any
+acceptance rule. Its 595 head samples span 18,031 seconds and grow 2,034 blocks
+from height 92,623 to 94,657, with a 31-second maximum gap, maximum lag two,
+and continuous zero-transaction coverage. Sixty-one same-PID resource samples
+span 18,009 seconds; peak RSS is 275,616 KiB, thread and descriptor maxima are
+162 and 93, and head/log/QMDB WAL remain monotonic while retaining the observed
+1,944-KiB compaction. Thirty-one Gov5-upstream samples span 18,029 seconds and
+all equal `d12257c...`. The milestone records 342 Rust `5+5` commits,
+seven-validator CommitQC, zero equivocations, zero transactions, and no failure
+evidence. Its SHA-256 is
+`cffb11780ddee8aca95cefdbe2234ede2309e477bdc09523328f118b154b3d68`.
+
+The five-hour independent immutable-log audit scans heights 92,624 through
+94,664. All 2,041 blocks are parent-continuous; all 341 expected Rust slots are
+exact at all six endpoints and match 341 `5+5` records with exact view stride
+and hash order. All 343 timeout/pacemaker pairs recover at the next view with
+zero pending. The 2,794 warnings partition exactly into allowed classes, with
+zero unknown warnings or critical signals. The frozen Rust log, leader,
+timeout, and runtime-log SHA-256 values are `7390709d...3bec`,
+`dfa0365f...eeea`, `6ac00a2a...da71`, and `a9c2593d...031c`.
+
+The formal six-hour composite milestone passes without relaxed acceptance.
+Its 715 head samples span 21,668 seconds and grow 2,412 blocks from height
+92,623 to 95,035, with a 31-second maximum gap, maximum lag two, and continuous
+zero-transaction coverage. Seventy-three same-PID resource samples span
+21,610 seconds; peak RSS is 275,616 KiB, thread and descriptor maxima are 162
+and 93, and head/log/QMDB WAL remain monotonic while recording the 1,944-KiB
+compaction. Thirty-seven exact Gov5-main samples span 21,634 seconds. The
+milestone records 405 Rust `5+5` commits, seven-validator CommitQC, zero
+equivocations, zero transactions, and no failure evidence. Its SHA-256 is
+`c906d490bff8e62eeb741191cc4d4e9e1b44b9e0609651e56af9e15d18d9ef74`.
+The 12- and 18-hour waiters and complete guarded closure remain armed.
+
+The simultaneous six-hour chain-identity canary again verifies chain ID
+`0x477`, the complete pinned genesis hash/state/receipts tuple, all-six live
+block identity, and sender nonce `0x11`. Client versions remain Gov5 5.7.906
+and Reth 2.4.1; Rust has 406 unique `5+5` commits, seven-validator CommitQC,
+and zero equivocations. Its SHA-256 is
+`2db923d8521e310b4cd55af0a7be36a4d56a3a0ff941e5a5a20a7c349a5fd15a`.
+
+The six-hour read-only archive/QMDB checkpoint also passes. At live height
+95,047, two Gov5 proofs and Rust QMDB proofs have identical roots and bytes and
+verify offline. Eleven historical heights again pass 209 exact RPC/proof
+checks; all six pending nonces remain `0x11`. No transaction or restart was
+used. Evidence SHA-256 is
+`1e4c44543cb8561096d5fcc6f84ac6e33252f2c1116e0d627bd332b2d6849dcc`.
+
+The six-hour independent immutable-log audit scans heights 92,624 through
+95,048. All 2,425 blocks are parent-continuous; all 405 expected Rust slots are
+exact at all six endpoints and match 405 `5+5` records with exact view stride
+and hash order. All 407 timeout/pacemaker pairs recover at the next view with
+zero pending. The 3,309 warnings partition exactly into allowed classes, with
+zero unknown warnings or critical signals. The frozen Rust log, leader,
+timeout, and runtime-log SHA-256 values are `bfee67d8...2327`,
+`f2606ff2...17dc`, `8a089dd9...36c7`, and `0ea18d51...f889`. A read-only
+nine-hour composite waiter is additionally armed to narrow the 6→12 hour gap.
+
+The additional seven-hour composite milestone also passes without relaxed
+acceptance. Its 833 head samples span 25,245 seconds and grow 2,784 blocks,
+with a 31-second maximum gap, maximum lag two, and continuous zero-transaction
+coverage. Eighty-five samples from the same Rust PID 89930 span 25,212 seconds;
+peak RSS is 275,760 KiB, thread and descriptor maxima are 162 and 93, and the
+head/log/QMDB-WAL counters remain monotonic while retaining the 1,944-KiB
+compaction observation. All 43 upstream samples over 25,239 seconds equal
+`d12257c...`. The milestone records 467 Rust `5+5` commits, seven-validator
+CommitQC, zero equivocations, zero transactions, and no failure evidence. Its
+SHA-256 is
+`167b2c53ef9819cbec0ee2dd5abf4e6532da964406b57e46501564b911829756`.
+
+The seven-hour frozen-log incremental audit then scans the post-six-hour Rust
+slots from height 95,054 through 95,407. All 59 expected Rust canonical blocks
+are exact at all six endpoints and match 59/59 `5+5` records with continuous
+parents, exact view stride, and exact hash order. All 467 cumulative
+timeout/pacemaker pairs recover at the next view with zero pending. The 3,798
+warnings partition exactly into allowed classes, with zero unexpected warnings
+or critical signals. The frozen Rust log, leader, timeout, and runtime-log
+SHA-256 values are `366baf19...edf4`, `8086be8c...b9e`,
+`ce96ce70...efd`, and `66cd4e49...88f8`. No transaction or node restart is
+permitted before the 24-hour boundary.
+
+The additional eight-hour composite milestone passes without relaxed
+acceptance. Its 953 head samples span 28,884 seconds and grow 3,192 blocks,
+with a 31-second maximum gap, maximum lag two, and continuous zero-transaction
+coverage. Ninety-seven samples from the same Rust PID 89930 span 28,814
+seconds; peak RSS is 276,064 KiB, thread and descriptor maxima are 162 and 93,
+and head/log/QMDB-WAL counters remain monotonic while retaining the 1,944-KiB
+compaction observation. All 49 upstream samples over 28,844 seconds equal
+`d12257c...`. The milestone records 535 Rust `5+5` commits, seven-validator
+CommitQC, zero equivocations, zero transactions, and no failure evidence. Its
+SHA-256 is
+`ba9bb4ed1f2800cea120da2e03def11fdd96a0f9d698adb687fc7a6651b51c0e`.
+
+The eight-hour frozen-log incremental audit scans the post-seven-hour Rust
+slots from height 95,408 through 95,815. All 68 expected Rust canonical blocks
+are exact at all six endpoints and match 68/68 `5+5` records with continuous
+parents, exact view stride, and exact hash order. All 535 cumulative
+timeout/pacemaker pairs recover at the next view with zero pending. The 4,346
+warnings partition exactly into allowed classes, with zero unexpected warnings
+or critical signals. The frozen Rust log, leader, timeout, and runtime-log
+SHA-256 values are `d81f611a...4df2`, `72a2e549...bb9d`,
+`aa5cf464...a6de`, and `c961ced4...31d1`.
+
+Two runtime27 canary dry runs produced no mutation: the controller wait loop
+did not yet continue across slots in which Rust was not the leader. Their
+zero-byte outputs were moved under `excluded/`; the corrected canary and all
+four preflights were rerun from fresh output paths before formal timing.
+At 10:02Z a static controller audit found that the still-gated strict
+independent waiter had been launched with the detached latest-Reth build
+worktree instead of the branch-backed dependency-delivery Reth worktree. The
+waiter, immutable gate, controller guardian, and total verifier were replaced
+before any final summary or transaction release. Nodes and evidence monitors
+were not restarted, the formal stream remained continuous, all six nonces
+remained `0x11`, and a machine-readable correction record preserves both PID
+sets. The corrected waiter is again held by the immutable gate and targets
+`chore/reth-upstream-20260726 @ 91725e3aa...` with exact upstream equality.
+Both independent-verifier waiters now also require their temporary verifier
+output to be non-empty before parsing and atomically publishing it, giving an
+immediate local failure if a future verifier exits without producing evidence.
+
 ## Current 2026-08-02 baseline — GOV5 5.7.906
 
 The current-main Gov5 candidate is pushed as
