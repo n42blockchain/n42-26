@@ -442,6 +442,15 @@ live nodes, and empty failure streams. Each waiter consumes only its matching
 composite PASS and writes a distinct JSON/raw directory. Consolidated launch
 evidence SHA-256 is `e4bc03f4...d3ab`; all launches are mutation-free.
 
+Pushed commit `98daf559b5324c35e7d274edd1a2bf7ab46a2aa0` adds the
+strict-24-hour-specific raw waiter (SHA-256 `20c7f542...2fc6`). It waits only
+for `mixed-soak-24h-audit.json`, which the finalizer publishes atomically
+before the burst, and fixes its historical range from that zero-transaction
+`endHeight`; later transactions cannot change the audited blocks. Frozen
+preflight SHA-256 is `af4a0025...a2ad`; PID 7527 / session 50942 is active.
+Besides six raw sequences, final output binds the soak and producer audits by
+SHA-256. Launch evidence SHA-256 is `a4a3de4d...7aa2`.
+
 The superseded runtime27 candidate passed all `internal` and `cmd/n42` tests;
 two consecutive optimized builds were byte-identical. Its pinned Gov binary
 SHA-256 was `72e918d9500169e227ef1a0c9d5dd751dcd7d58f1df0871825b61f196e3fce95`.
