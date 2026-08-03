@@ -592,6 +592,18 @@ and 24-hour resource projection. Frozen network/data/resource auditor SHA-256
 values are `955580f2...c533`, `5bb09bb1...9a67`, and `f6c5c495...bb80`.
 All preflights pass without mutation.
 
+A pre-six-hour double recheck at approximately 3 hours 45 minutes also passes.
+The network matrix confirms original Rust PID 70765 still has all five Gov
+consensus sockets and authenticated validators, 5/4 leader quorum, direct push
+to five, and a `5+5` commit at view 97,083. CommitQC remains present,
+equivocations remain zero, and the committed block is six-endpoint exact. The
+905 data audit again pins Gov main `b8c17d0`, all five original live MDBX
+processes, and zero `txindex.ranges`; genesis `b71c2810...1392ec`, copied head
+92,605 / `b88a3571...5a82`, live identity, and current-stage nonce `0x11` are
+six-endpoint exact, so no recopy or regeneration is needed. Read-only evidence
+SHA-256 values are `2388c016...10b2` and `eb6e25a3...4371`. The independent
+post-burst final audit still requires nonce `0x22`.
+
 The strict 2.5-hour (9,000-second) composite gate passes. Its 299 head
 samples span 9,034 seconds, grow by 924 blocks, retain continuous zero-
 transaction coverage, and have maximum lag one. Thirty-one resource samples

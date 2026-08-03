@@ -1058,6 +1058,15 @@ archive/QMDB 12 事件、五连接/五认证网络矩阵、905 数据兼容和 2
 冻结 network/data/resource auditor SHA-256 分别为 `955580f2...c533`、
 `5bb09bb1...9a67`、`f6c5c495...bb80`。预检全部 PASS 且 mutation-free。
 
+约 3 小时 45 分钟的 6 小时门前双重复核继续 PASS。网络矩阵确认原 Rust PID 70765
+仍建立并认证全部五个 Gov consensus peers，leader quorum 5/4、direct push 5，
+view 97,083 以 `5+5` 提交；CommitQC 存在、双签为零、committed block 六端身份
+精确。905 数据审计再次确认固定 Gov main `b8c17d0`、五个 MDBX 原 PID 存活、
+`txindex.ranges` 全部为零；创世 `b71c2810...1392ec`、复制头 92,605 /
+`b88a3571...5a82`、live 身份和当前阶段 nonce `0x11` 六端精确，因此无需重复制或
+重生成数据。两份只读证据 SHA-256 分别为 `2388c016...10b2`、
+`eb6e25a3...4371`；最终 burst 后审计仍独立要求 nonce `0x22`。
+
 2.5 小时（9,000 秒）复合门严格 PASS：299 个 head 样本覆盖 9,034 秒，增长 924
 块、最大 lag 1、零交易；原 Rust PID 70765 的 31 个资源样本覆盖 9,004 秒，RSS
 峰值 263,824 KiB、线程最多 163、FD 93；16 个 Gov5 main 样本覆盖 9,012 秒并
