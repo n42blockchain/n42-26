@@ -604,6 +604,14 @@ Gov5 candidate `d0999e7...` 仍绑定 upstream main `d12257c...`，官方最新�
 `0a4dbcf3...`。机器证据 SHA-256 为
 `9d3fbf70a7725ed906bf37fa873c3b5b73624137ec12c137238b4a93c9d27b54`。
 
+三小时 905 数据静态边界复核也 PASS：初始复制证据仍将 124 文件 /
+17,316,415,839 bytes 绑定到相同源/目标 manifest SHA `1c115b92...`；六个保留
+Gov 数据目录中的 24 个 epoch schedule、network config/key、BLS keystore 文件
+当前 SHA 均与初始复制一致。创世、consensus/bootstrap、验证者/P2P 密钥、冻结
+harness/finalizer/独立 verifier/QMDB verifier 及两个二进制也保持固定 SHA。
+运行 chaindata 因正确出块必然变化而按设计排除。证据 SHA-256 为
+`b1b4306dc929720719058960d68430344f0b68cc282a226b27ce4d6e45d20955`。
+
 三小时门槛后的只读 archive/QMDB 检查点同样 PASS：当前参考高度 93,871 的两份
 Gov5 account proof 与 Rust QMDB proof root/bytes 完全一致并通过离线验证；从创世到
 5,189 的 11 个固定历史高度完成 209 项 block/receipt/log/state/storage/proof 检查，

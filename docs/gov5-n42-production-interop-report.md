@@ -279,6 +279,17 @@ Gov5/Rust binary SHA-256 values remain `72e918d9...` and `0a4dbcf3...`.
 Machine evidence SHA-256 is
 `9d3fbf70a7725ed906bf37fa873c3b5b73624137ec12c137238b4a93c9d27b54`.
 
+The three-hour 905-data static-boundary recheck passes as well. The immutable
+copy evidence still binds 124 files / 17,316,415,839 bytes to identical source
+and target manifest SHA-256 `1c115b92...`; all 24 epoch schedule, network
+configuration, network-key, and BLS-keystore files across the six preserved
+Gov data directories still match their initial-copy hashes. Genesis,
+consensus/bootstrap configuration, validator/P2P keys, frozen harness,
+finalizer, independent verifier, QMDB verifier, and both binaries also retain
+their pinned SHA-256 values. Running chaindata is deliberately excluded because
+correct block production must mutate it. Evidence SHA-256 is
+`b1b4306dc929720719058960d68430344f0b68cc282a226b27ce4d6e45d20955`.
+
 A read-only archive/QMDB checkpoint immediately after the three-hour gate also
 passes. At live reference height 93,871, two Gov5 account proofs and Rust QMDB
 proofs have identical roots and bytes and both verify offline. Eleven fixed
