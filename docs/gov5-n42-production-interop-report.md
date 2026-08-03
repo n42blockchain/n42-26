@@ -110,6 +110,16 @@ lag zero, and no destructive data conversion occurred. The final gated
 17-transaction burst and archive RPC pass will exercise lookup behavior with
 new transactions. Recheck evidence SHA-256 is `f5432630...e5a8`.
 
+A closed 30-minute log snapshot provides a deeper canonical check. Heights
+92,696 through 92,930 form one continuous 235-block chain on all six
+endpoints; all 40 expected Rust slots match ordered `5+5` commits with exact
+seven-view stride. All 54 timeout/pacemaker pairs recover at the immediately
+following Rust `5+5` view with zero pending, while all 435 warnings partition
+into allowed classes with zero unknown or critical signals. The immutable Rust
+log, leader audit, timeout audit, and runtime-log audit SHA-256 values are
+`cc519e7e...1d4f`, `513f8e01...21a2`, `90432cd5...360f`, and
+`30c7d65e...f180`.
+
 The superseded runtime27 candidate passed all `internal` and `cmd/n42` tests;
 two consecutive optimized builds were byte-identical. Its pinned Gov binary
 SHA-256 was `72e918d9500169e227ef1a0c9d5dd751dcd7d58f1df0871825b61f196e3fce95`.

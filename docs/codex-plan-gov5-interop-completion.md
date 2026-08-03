@@ -816,3 +816,10 @@ SHA-256 为 `8276dfae...d6ab`。
 五个 Gov datadir 仍均无 `txindex.ranges`，未发生破坏性迁移，六端保持 lag 0。
 最终门控的 17 笔交易与 archive RPC 会继续覆盖新增交易的 lookup 路径；本次证据
 SHA-256 为 `f5432630...e5a8`。
+
+三十分钟闭合日志深审覆盖高度 92,696–92,930 的 235 个连续规范块，40 个预期
+Rust 槽位全部六端精确且日志为 `5+5`，view stride 与 hash 顺序一致。54/54
+timeout/pacemaker 均在下一 view 由 Rust `5+5` 恢复，pending 为零；435 条 warning
+全量归类，未知与 critical 均为零。冻结 Rust 日志、leader、timeout、runtime-log
+SHA-256 分别为 `cc519e7e...1d4f`、`513f8e01...21a2`、
+`90432cd5...360f`、`30c7d65e...f180`。
