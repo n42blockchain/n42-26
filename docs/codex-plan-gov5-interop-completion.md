@@ -851,6 +851,13 @@ lag 0，并与 Rust 在固定块八项身份及创世 hash 上完全一致。RSS
 143,152–145,168 KiB，相比一小时截面最大仅增 4,832 KiB；线程 18–19、FD 34。
 证据 SHA-256 为 `3f5326c4...989f`。
 
+90 分钟生产者全量审计覆盖高度 92,696–93,277 的 582 块、97 个完整轮次。六端每一
+块的 number/hash/parent/state/receipts/transactions root、miner 与交易数序列完全
+相同，各端序列 SHA-256 均为 `95259664...27dd`；父链连续且全程零交易。Rust 与
+五个 Gov 地址各自产生恰好 97 块，每个 modulo-six 槽位始终绑定同一生产者；配置中
+第七个缺席验证者继续由 timeout 恢复审计覆盖。证据 SHA-256 为
+`03e36dd5...d336`。
+
 约 80 分钟处再次完整执行只读 archive/QMDB parity：当前共同高度 93,199 的两组
 Gov/Rust proof root 与编码逐字节一致并通过冻结离线验证器；创世到 5,189 的 11 个
 历史高度再次通过全部 RPC/root/proof 检查。证据 SHA-256 为 `03f3de7d...3d57`。

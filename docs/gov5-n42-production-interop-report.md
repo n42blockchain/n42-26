@@ -278,6 +278,18 @@ one-hour snapshot; threads remain 18–19 and file descriptors exactly 34.
 Evidence SHA-256 is
 `3f5326c45c88cf8d204f21e7af69aa145331a3357af12180162d887cea84989f`.
 
+A full six-producer audit then replaces sampling with every block in 97
+complete leader cycles. Across heights 92,696–93,277, all six endpoints return
+the same 582-row sequence of number, block/parent hashes, state/receipts/
+transaction roots, miner, and transaction count; each endpoint sequence has
+SHA-256 `95259664...27dd`. The parent chain is continuous and transaction count
+is zero throughout. Rust and each of the five Gov producers author exactly 97
+blocks, with every modulo-six slot permanently bound to one producer. This
+confirms both mixed-client participation and exact Gov rotation while the
+configured seventh absent validator remains covered by the timeout-recovery
+audit. Evidence SHA-256 is
+`03e36dd50afcbedafa464bf975ce2491cfba8bd0497c14149bcf3eff5da5d336`.
+
 The superseded runtime27 candidate passed all `internal` and `cmd/n42` tests;
 two consecutive optimized builds were byte-identical. Its pinned Gov binary
 SHA-256 was `72e918d9500169e227ef1a0c9d5dd751dcd7d58f1df0871825b61f196e3fce95`.
