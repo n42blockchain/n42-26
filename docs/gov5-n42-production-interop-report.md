@@ -460,6 +460,14 @@ over 9,012 seconds. Rust has 170 `5+5` commits, CommitQC is present, and
 equivocations remain zero. No acceptance criterion is relaxed; milestone
 SHA-256 is `dc639f5d1b46f9b3e88a0e9024c48d7c50609bf477a876119c5dbf695757cdf7`.
 
+The frozen raw producer tooling then consumes that exact milestone boundary.
+Heights 92,696–93,619 contain 924 blocks and 154 complete cycles. Each of the
+six endpoints retains a 924-row full-identity sequence with the same SHA-256,
+`8763d282...6691`. Parents are continuous, every block is empty, and Rust plus
+Gov1 through Gov5 each author exactly 154 blocks in fixed slots. Composite raw
+evidence SHA-256 is
+`448b88f76d6a07fe5a66b365da8244f722df6b86ccebcc1ed6fa13487cf3faa6`.
+
 The superseded runtime27 candidate passed all `internal` and `cmd/n42` tests;
 two consecutive optimized builds were byte-identical. Its pinned Gov binary
 SHA-256 was `72e918d9500169e227ef1a0c9d5dd751dcd7d58f1df0871825b61f196e3fce95`.
