@@ -2154,3 +2154,37 @@ No transaction has been sent. The armed closure performs the 17-transaction
 dual-ingress burst, post-burst and post-restart stability, archive/QMDB parity,
 restart/rejoin, and an independent raw-evidence verification, followed by a
 stopped-data snapshot and an additional one-hour official-Reth qualification.
+
+Gov5 `main` advanced again to `65a7682645...` at
+`2026-08-03T04:27:31Z`. The independent upstream stream failed closed and
+runtime20 was stopped without sending a transaction. Its excluded formal
+stream contains 41 healthy samples over 1,219 seconds, heights 90,704 through
+90,836, maximum lag zero; the exclusion record SHA-256 is
+`e4e597e0941913cd70718f5bf42b1998022fd001f584de6a945aa399ffac828d`.
+
+Candidate `1331c0dfe4...` merges the interop line with `65a7682645...` and is
+pushed. The new upstream changes only txflood controls and opt-in txpool
+capacity environment variables. Genesis, HotStuff, and storage code are
+unchanged. Full tests, the complete race suite, and two independent cold-cache
+builds passed; both builds produced Gov binary SHA-256
+`73d01d1a0bcd52ba8b5d5cf42cefa3292e8e4c31b2838c7f47ed3c5b47a68ac6`.
+
+runtime21 copied the cleanly stopped 905-lineage state from runtime20. The
+102-file source and destination manifests are byte-identical and hash to
+`99ec46f9e53c9eb66d793060d029639e497ec74109f9e8066573c55612d07cc5`.
+All six endpoints retain genesis `b71c2810...1392ec` and resumed from exact
+height/hash 90,836/`7856ddd6...d9af8`. A clean preflight proved exact heads,
+roots, and receipts on every endpoint; 18 zero-transaction samples over 90
+seconds with maximum lag zero; two exact Rust leader slots with `5+5`; exact
+timeout-to-next-view recovery; zero equivocations; and no unexpected log
+signals. Independent verifier and burst preflight passed with latest and
+pending nonce `0x11` and zero sends.
+
+The replacement formal, resource, and upstream streams began at
+`2026-08-03T04:51:02Z`, first common height 90,895 and lag zero. They bind Gov
+upstream `65a7682645...`, candidate `1331c0dfe4...`, Gov binary
+`73d01d1a...8ac6`, official stable Reth 2.4.1 source `91725e3aa8...`, and Reth
+binary `0a4dbcf3...62b9f`. The armed closure remains transaction-free until the
+complete 86,640-second stream closes, then performs the 17-transaction
+dual-ingress burst, post-burst parity, Rust restart/rejoin, independent strict
+verification, and the additional one-hour official-stable-Reth qualification.

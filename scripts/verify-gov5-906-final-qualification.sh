@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-runtime="${N42_QUAL_RUNTIME:-/Users/jieliu/Documents/n42/live-interop-20260721/runtime-20-gov5-c611-latest-reth}"
+runtime="${N42_QUAL_RUNTIME:-/Users/jieliu/Documents/n42/live-interop-20260721/runtime-21-gov5-65a-latest-reth}"
 repo="${N42_VERIFY_REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 verifier_script="${BASH_SOURCE[0]}"
 expected_verifier_script_sha="${N42_VERIFY_EXPECTED_SELF_SHA:-}"
@@ -11,11 +11,11 @@ reth_repo="${N42_QUAL_RETH_REPO:-/Users/jieliu/Documents/n42/deps-latest-2026072
 preflight_only="${N42_VERIFY_PREFLIGHT_ONLY:-0}"
 ports="${N42_QUAL_PORTS:-28501 28502 28503 28504 28505 29545}"
 expected_genesis="0xb71c28109836f120453d097c38819a55b14c49abcc92713037fb9b11201392ec"
-expected_gov_upstream="${N42_VERIFY_GOV_UPSTREAM:-c611124dfc09378eb22876a2a502189d64c8dd30}"
-expected_gov_candidate="${N42_VERIFY_GOV_CANDIDATE:-0f688685f02c97ebddc7a3a6bb280536b030c31a}"
+expected_gov_upstream="${N42_VERIFY_GOV_UPSTREAM:-65a76826459152457ae99558000fac6e85d31122}"
+expected_gov_candidate="${N42_VERIFY_GOV_CANDIDATE:-1331c0dfe4be6715db0d5c58c4d2ac750c0d544f}"
 expected_deps_head="aec34a0cd465e8fdbb598b90bc778fe96e25d6c0"
 expected_reth_head="91725e3aa8f2a0bbc5a425e931a2f2b2f31b2a7b"
-expected_gov_binary_sha="${N42_VERIFY_GOV_BINARY_SHA:-3a2ed3e066b60db0358a2ca25800b67de5649e9df8cfca1bc3242e7c6796e0da}"
+expected_gov_binary_sha="${N42_VERIFY_GOV_BINARY_SHA:-73d01d1a0bcd52ba8b5d5cf42cefa3292e8e4c31b2838c7f47ed3c5b47a68ac6}"
 expected_rust_binary_sha="${N42_VERIFY_RUST_BINARY_SHA:-0a4dbcf30d7cc9944a7cd7c96a25c1ebf862df10bde76210a381ef492e362b9f}"
 expected_finalizer_sha="${N42_VERIFY_FINALIZER_SHA:-2a6a7ec212735c2d274c834d48fac83321fcb109f761b6ef295bede5be9d8e41}"
 

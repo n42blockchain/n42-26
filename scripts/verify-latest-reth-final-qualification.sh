@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-runtime="${N42_QUAL_RUNTIME:-/Users/jieliu/Documents/n42/live-interop-20260721/runtime-20-gov5-c611-latest-reth}"
-qualification_dir="${N42_LATEST_RETH_QUAL_DIR:-/Users/jieliu/Documents/n42/live-interop-20260721/post-qualification-latest-reth-20260803}"
+runtime="${N42_QUAL_RUNTIME:-/Users/jieliu/Documents/n42/live-interop-20260721/runtime-21-gov5-65a-latest-reth}"
+qualification_dir="${N42_LATEST_RETH_QUAL_DIR:-/Users/jieliu/Documents/n42/live-interop-20260721/post-qualification-latest-reth-20260803-65a}"
 source_repo="${N42_LATEST_RETH_SOURCE_REPO:-/Users/jieliu/Documents/n42/interop-reth-latest-20260802/n42-26}"
 primary_repo="${N42_LATEST_RETH_PRIMARY_REPO:-/Users/jieliu/Documents/n42/live-interop-20260721/n42-26}"
 gov_repo="${N42_LATEST_RETH_GOV_REPO:-/Users/jieliu/Documents/n42/live-interop-20260721/N42-gov5-current-main-20260803}"
@@ -14,8 +14,8 @@ ports="${N42_QUAL_PORTS:-28501 28502 28503 28504 28505 29545}"
 expected_genesis="0xb71c28109836f120453d097c38819a55b14c49abcc92713037fb9b11201392ec"
 expected_binary_sha="0a4dbcf30d7cc9944a7cd7c96a25c1ebf862df10bde76210a381ef492e362b9f"
 expected_reth_commit="91725e3aa8f2a0bbc5a425e931a2f2b2f31b2a7b"
-expected_gov_commit="${N42_LATEST_RETH_GOV_COMMIT:-0f688685f02c97ebddc7a3a6bb280536b030c31a}"
-expected_gov_upstream="${N42_LATEST_RETH_GOV_UPSTREAM:-c611124dfc09378eb22876a2a502189d64c8dd30}"
+expected_gov_commit="${N42_LATEST_RETH_GOV_COMMIT:-1331c0dfe4be6715db0d5c58c4d2ac750c0d544f}"
+expected_gov_upstream="${N42_LATEST_RETH_GOV_UPSTREAM:-65a76826459152457ae99558000fac6e85d31122}"
 expected_harness_sha="6b95241f06fbf2225e9dff8a9bd4534ac5c1363f6f62109883695ebf7db189ab"
 latest_binary="$qualification_dir/n42-node"
 harness="$runtime/artifacts/scripts/gov5-interop-qualification.sh"

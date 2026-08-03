@@ -27,7 +27,7 @@ network. Both clients must:
 | Out-of-order batch catch-up | Code and unit gate complete | Non-Valid child no longer advances validated watermark |
 | Automatic validator cold start | Complete | Chain-bound bootstrap bundle, blank-datadir materialization, replay receipt, and cold restart |
 | Rust leader handoff | Complete | 5-Gov/2-Rust P3 plus latest 5-Gov/1-Rust live runs prove Rust proposal → Gov5 `5+5` votes → CommitQC |
-| Fault/rejoin/epoch soak | In progress | Fault matrix and earlier soaks pass; authoritative Gov5 5.7.906 24-hour window and final restart/rejoin remain active |
+| Fault/rejoin/epoch soak | In progress | Fault matrix and earlier soaks pass; authoritative Gov5 current-main runtime21 24-hour window and final restart/rejoin are active |
 | Minimal full archive+ parity | Complete | 209 RPC comparisons, offline QMDB proofs, export/import, corruption recovery, and fresh one-hour parity rehearsal |
 
 Operationally:
