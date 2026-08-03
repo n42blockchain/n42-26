@@ -873,6 +873,14 @@ validator peers、quorum/direct push、`5+5`、CommitQC、零双签与 committed
 `be0471b4...c809`，nonce `0x11` mutation-free 预检 SHA-256 为
 `f8a6529c...d729`。该门不发送交易，也不改变已有总验收与复制边界门。
 
+提交 `71d11a6b...bf65` 增加最终目标级 completion auditor：只有原子总验收、复制
+905 边界门和 post-rollover 网络门三者均独立 PASS，且所有仓库/远端 pin、官方稳定
+Reth tag、两端二进制、六端 live identity/genesis、CommitQC、零双签、空失败流与
+latest/pending nonce `0x22` 全部重检通过，才发布目标完成证据。审计器 SHA-256 为
+`b87aa985...b3f0`，冻结 mutation-free 预检为 `6591008d...1f5f`，当前明确记录
+`completionNotClaimed=true` 和 nonce `0x11`。最终文档推送后才手动执行，避免其记录
+的 primary HEAD 被自身交付文档再次推进。
+
 超过 100 分钟后再次执行 905 数据谱系审计：正式流 6,366 秒、增长 648 块时，五个
 Gov datadir 仍均无 `txindex.ranges` 和 migration marker，未发生破坏性迁移；每节点
 分配空间相比早期兼容截面仅增 24 KiB。24 个静态 Gov 文件仍精确；创世、复制持久头
