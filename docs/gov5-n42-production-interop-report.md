@@ -65,6 +65,11 @@ view by Rust `5+5`, with zero pending timeouts. The frozen-log partition audit
 accounted for all 200 warnings exactly and found zero unexpected warnings or
 critical signals. The timeout and log-audit evidence SHA-256 values are
 `fbc874d6...13c1c` and `ce464745...c3620` respectively.
+The 20-minute resource checkpoint covers five samples over 1,201 seconds with
+one unchanged Rust PID and 132 blocks of head growth. Peak RSS was 238,976
+KiB, threads 162, and file descriptors 93, all well below the frozen limits;
+logical storage and log counters were monotonic. Its snapshot and audit
+SHA-256 values are `1dd0d0c9...8a503` and `9389d086...af14`.
 
 The authoritative zero-transaction stream began at
 `2026-08-03T09:49:44Z`, common height 92,623, lag zero. It requires continuous
