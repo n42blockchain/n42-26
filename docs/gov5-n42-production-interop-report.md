@@ -75,6 +75,13 @@ and two reference proofs at height 92,767. Gov and Rust returned byte-exact
 RPC payloads, proof roots, and proof bytes, and the frozen offline verifier
 accepted every proof. No transaction or chain mutation was involved; evidence
 SHA-256 is `d9ab509e182789d6fbe96084c54d3325aab2ea73e0a6b162737dc7a3411bb26c`.
+The 20-minute identity recheck also confirms chain ID `0x477` and, on all six
+endpoints, genesis hash `b71c2810...1392ec`, genesis state root
+`91a450c1...9941`, and genesis receipts root `56e81f17...b421`. At height
+92,773 all six latest block hash/state/receipts tuples were exact; 28 Rust
+`5+5` commits had been observed through view 95,641, with CommitQC and zero
+equivocations. The latest-identity and detailed-genesis evidence SHA-256 values
+are `99d3af7d...0c163` and `6baf439e...deff6`.
 
 The authoritative zero-transaction stream began at
 `2026-08-03T09:49:44Z`, common height 92,623, lag zero. It requires continuous
