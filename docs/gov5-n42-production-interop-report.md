@@ -427,6 +427,14 @@ Evidence SHA-256 is
 The first output containing ephemeral paths and the second hash-only output
 are recoverably retained under `excluded/` and are not used for acceptance.
 
+Pushed commit `c469bba7a8abca056fea34e59135e887a97fee91` adds a generic
+milestone raw-producer waiter, SHA-256 `393d2b36...5b70`. Frozen preflight
+SHA-256 `40c69083...2d31` verifies all six nodes, empty failure streams, target
+paths, and the exact frozen range auditor. Persistent PID 3492 / session 38246
+now waits for the three-hour composite PASS, closes its `endHeight` down to a
+full six-slot boundary, and atomically retains all six raw sequences. Launch
+evidence SHA-256 is `d3097c9b...642d`; it changes no node or transaction state.
+
 The superseded runtime27 candidate passed all `internal` and `cmd/n42` tests;
 two consecutive optimized builds were byte-identical. Its pinned Gov binary
 SHA-256 was `72e918d9500169e227ef1a0c9d5dd751dcd7d58f1df0871825b61f196e3fce95`.

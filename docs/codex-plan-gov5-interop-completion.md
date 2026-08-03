@@ -942,6 +942,12 @@ number/hash/parent/state/receipts/transactions root/miner/txCount 序列 SHA-256
 槽位绑定精确。证据 SHA-256 为 `c1d3749f...229f`；含无效临时路径及未保留 raw 的
 前两版输出已可恢复地移入 `excluded/`，不计入结论。
 
+提交 `c469bba7...fee91` 增加通用 milestone raw producer waiter（SHA-256
+`393d2b36...5b70`）。冻结预检 SHA-256 `40c69083...2d31` 确认六节点、失败流、
+目标路径和冻结审计器精确；持久 PID 3492 / session 38246 已等待三小时复合门。门
+PASS 后它按里程碑 `endHeight` 向下闭合到完整六槽轮次，调用冻结审计器并原子保存
+六端 raw JSONL。启动证据 SHA-256 为 `d3097c9b...642d`，未修改节点或交易状态。
+
 约 80 分钟处再次完整执行只读 archive/QMDB parity：当前共同高度 93,199 的两组
 Gov/Rust proof root 与编码逐字节一致并通过冻结离线验证器；创世到 5,189 的 11 个
 历史高度再次通过全部 RPC/root/proof 检查。证据 SHA-256 为 `03f3de7d...3d57`。
