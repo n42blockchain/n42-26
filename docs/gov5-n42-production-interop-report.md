@@ -1985,4 +1985,6 @@ node was deliberately left untouched and its dependency graph was not allowed
 to rewrite the 2.4.1 lockfile. After the merge was pushed, the frozen
 independent verifier repeated its complete preflight and again found exact
 sources/remotes, genesis, six-endpoint live identity, CommitQC, zero
-equivocations, and nonce `0x11`, with zero transactions sent.
+equivocations, and nonce `0x11`, with zero transactions sent. The machine-
+readable merge-validation evidence SHA-256 is
+`0aba5f8846c1055de25936bd73daa0844e4310729290ed5c836194eb49c58145`.
