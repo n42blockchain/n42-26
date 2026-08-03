@@ -82,6 +82,14 @@ endpoints, genesis hash `b71c2810...1392ec`, genesis state root
 `5+5` commits had been observed through view 95,641, with CommitQC and zero
 equivocations. The latest-identity and detailed-genesis evidence SHA-256 values
 are `99d3af7d...0c163` and `6baf439e...deff6`.
+The signed burst artifact was also independently decoded offline before any
+broadcast. All 17 raw transaction hashes recomputed exactly, every signature
+recovered sender `f39fd6e5...2266`, every EIP-155 chain ID was `0x477`, nonces
+were continuous from 17 through 33, deployment and transfer semantics were
+exact, and the CREATE address recomputed to `9a9f2ccf...63ae`. The alternating
+ingress plan contains eight Gov and nine Rust submissions. The reusable
+verifier SHA-256 is `90c2bf05...8a51`, PASS evidence SHA-256 is
+`caf40cea...b3ce`, and a deliberately altered transaction hash is rejected.
 
 The authoritative zero-transaction stream began at
 `2026-08-03T09:49:44Z`, common height 92,623, lag zero. It requires continuous
