@@ -68,6 +68,30 @@ check_wait_state() {
   test "$(jq -er '.status' "$static_baseline")" = PASS
 }
 
+wait_for_timeout_recovery_close() {
+  local recent timeout_view recovery_view committed_view recovery_line
+  local attempt
+  for attempt in $(seq 1 1200); do
+    check_wait_state
+    recent="$(tail -n 2000 "$runtime/logs/rust.log")"
+    timeout_view="$(sed -E -n \
+      's/.*view timed out view=([0-9]+)$/\1/p' <<<"$recent" | tail -n 1)"
+    if [[ "$timeout_view" =~ ^[0-9]+$ ]]; then
+      recovery_view=$((timeout_view + 1))
+      committed_view="$(rpc 29545 n42_consensusStatus '[]' | \
+        jq -er '.result.latestCommittedView')"
+      recovery_line="$(rg -F "block committed! view=$recovery_view " \
+        <<<"$recent" | tail -n 1 || true)"
+      if test "$committed_view" -ge "$recovery_view" &&
+        [[ "$recovery_line" == *"votes=5+5" ]]; then
+        return 0
+      fi
+    fi
+    sleep 0.25
+  done
+  return 1
+}
+
 on_error() {
   local status=$? line="${BASH_LINENO[0]:-0}"
   trap - ERR
@@ -101,8 +125,14 @@ jq -e --arg label "$label" \
    .soak.zeroTransactionRequired==true and .equivocations.total==0' \
   "$milestone" >/dev/null
 
-# Freeze only after a canonical Rust-authored block so the preceding missing-
-# validator timeout has its immediate 5+5 recovery in the immutable log.
+# The latest historical Rust block may precede the next missing-validator
+# timeout. Waiting on the live timeout/recovery pair before selecting the
+# boundary prevents a snapshot race in which that newer timeout is logged
+# after the selected block but before its 5+5 recovery commit.
+wait_for_timeout_recovery_close
+
+# Freeze only after the latest missing-validator timeout has its canonical
+# Rust 5+5 recovery commit.
 minimum_head=-1
 for port in "${ports[@]}"; do
   head_hex="$(rpc "$port" eth_blockNumber '[]' | jq -er '.result')"
