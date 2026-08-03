@@ -11,10 +11,12 @@ reth_repo="${N42_QUAL_RETH_REPO:-/Users/jieliu/Documents/n42/deps-latest-2026072
 preflight_only="${N42_VERIFY_PREFLIGHT_ONLY:-0}"
 ports="${N42_QUAL_PORTS:-28501 28502 28503 28504 28505 29545}"
 expected_genesis="0xb71c28109836f120453d097c38819a55b14c49abcc92713037fb9b11201392ec"
-expected_gov_upstream="920f7536eb263b6744b48f28dfeb77f4c2798c1a"
-expected_gov_candidate="8915b4cc07d82dc195daee2e8e741ea5e8446068"
+expected_gov_upstream="${N42_VERIFY_GOV_UPSTREAM:-920f7536eb263b6744b48f28dfeb77f4c2798c1a}"
+expected_gov_candidate="${N42_VERIFY_GOV_CANDIDATE:-8915b4cc07d82dc195daee2e8e741ea5e8446068}"
 expected_deps_head="aec34a0cd465e8fdbb598b90bc778fe96e25d6c0"
 expected_reth_head="91725e3aa8f2a0bbc5a425e931a2f2b2f31b2a7b"
+expected_gov_binary_sha="${N42_VERIFY_GOV_BINARY_SHA:-51e68918560be65f8e5221f02a3d544a7baf42bed9aa86655623449a4fd765d0}"
+expected_rust_binary_sha="${N42_VERIFY_RUST_BINARY_SHA:-d917782b906176119172e656005218be34ec3d5ad1b7241c0c53f8f6d593da2d}"
 
 require_file() {
   test -f "$1" || {
@@ -135,10 +137,8 @@ assert_pinned_inputs() {
   if test -n "$expected_verifier_script_sha"; then
     assert_sha "$verifier_script" "$expected_verifier_script_sha"
   fi
-  assert_sha "$runtime/geth-live" \
-    51e68918560be65f8e5221f02a3d544a7baf42bed9aa86655623449a4fd765d0
-  assert_sha "$runtime/n42-node" \
-    d917782b906176119172e656005218be34ec3d5ad1b7241c0c53f8f6d593da2d
+  assert_sha "$runtime/geth-live" "$expected_gov_binary_sha"
+  assert_sha "$runtime/n42-node" "$expected_rust_binary_sha"
   assert_sha "$runtime/artifacts/genesis.json" \
     561808693c76b356e51f8f5961304e68f3167943c17145bda056612041dca687
   assert_sha "$runtime/artifacts/consensus-peer-bound.json" \
