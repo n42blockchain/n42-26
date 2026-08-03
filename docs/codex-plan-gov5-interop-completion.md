@@ -567,3 +567,10 @@ view stride 和 hash 顺序精确。165 次 timeout/pacemaker 全部由下一 vi
 critical signal 均为零。冻结日志、leader、timeout、runtime-log 证据 SHA-256
 分别为 `a1ad313e...515a`、`1eb7eeb5...8bcc`、`56dcb732...d37b`、
 `f096a71e...d54c`。
+
+150 分钟固定路径滚动组合审计同样 PASS：299 个 head 样本 / 9,055 秒 / 增长
+1,014 块 / 最大 lag 2，31 个同 PID 资源样本及 16 个精确 upstream 样本。第二次
+实网 compaction 的单步下降达到 1,944 KiB，consensus allocation 相对起点净变化
+为 -740 KiB，但 head/log/QMDB WAL 仍全部单调且资源上限正常，再次实证修正后的
+allocated-storage 语义。组合摘要 SHA-256 为
+`349481a3ee0b4a7ab934345deb140878e06b9a612cf22e99d519c99f7120faa0`。

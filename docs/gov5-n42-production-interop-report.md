@@ -228,6 +228,16 @@ with zero unknown warnings or critical signals. The immutable log, leader,
 timeout, and runtime-log SHA-256 values are `a1ad313e...515a`,
 `1eb7eeb5...8bcc`, `56dcb732...d37b`, and `f096a71e...d54c`.
 
+A fixed-path 150-minute rolling composite then passed with 299 head samples /
+9,055 seconds / 1,014 blocks / maximum lag two, 31 same-PID resource samples,
+and 16 exact Gov5-upstream samples. A second live compaction lowered consensus
+allocation by 1,944 KiB in one step and left its end-to-end allocation 740 KiB
+below the stream start, while head, log bytes, and QMDB WAL remained monotonic
+and every resource ceiling remained satisfied. This independently exercises
+the corrected allocated-storage semantics beyond the earlier 1,868-KiB case.
+The rolling summary SHA-256 is
+`349481a3ee0b4a7ab934345deb140878e06b9a612cf22e99d519c99f7120faa0`.
+
 The authoritative zero-transaction stream began at
 `2026-08-03T09:49:44Z`, common height 92,623, lag zero. It requires continuous
 six-endpoint hash/state/receipt equality, zero transactions in every newly
