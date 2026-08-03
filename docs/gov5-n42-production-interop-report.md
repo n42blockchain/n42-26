@@ -1988,3 +1988,14 @@ sources/remotes, genesis, six-endpoint live identity, CommitQC, zero
 equivocations, and nonce `0x11`, with zero transactions sent. The machine-
 readable merge-validation evidence SHA-256 is
 `0aba5f8846c1055de25936bd73daa0844e4310729290ed5c836194eb49c58145`.
+
+Because the final rollover must use the latest stable Reth rather than merely
+the release that was latest when the 24-hour window began, an official-tag
+sentinel now checks `paradigmxyz/reth` every ten minutes until rollover
+qualification closes. It records transient remote failures and retries, but
+fails closed if six consecutive checks cannot reach the remote or if the
+stable tag advances beyond the pinned `v2.4.1`; neither condition resets or
+mutates the strict Gov/Rust chain. The first live sample reports reachable,
+latest `v2.4.1`, and exact baseline. The running script is PID 98531 and is
+bound to SHA-256
+`5194cd81b912c2d1d7d73c363aee20b768a64489b9c9c9ad53d4e104cbcf7809`.
