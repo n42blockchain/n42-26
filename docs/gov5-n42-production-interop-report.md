@@ -2113,3 +2113,16 @@ height 90,332 with hash
 `0xd6ea22cd3b9c4cc4b32d1bbdb520d0810ba481f2499ebd641ee2fa0fe20d0fe3`.
 The rebind evidence SHA-256 is
 `65b0e17c07a4c893769619a3156aae96465d96434f36cd7fe8b82f58db07a758`.
+
+A read-only post-six-hour audit then checked the newly produced segment rather
+than relying only on the milestone boundary. It scanned heights 90,267 through
+90,417: all 26 expected Rust slots were canonical and exact on six endpoints,
+with continuous parents, exact seven-view stride, and `5+5` commits. The one
+timeout observed at the first live-log read was still awaiting its immediate
+successor view; a bounded follow-up proved recovery at view 92,904 and closed
+the set at 431 completed, zero pending. The corresponding log partition is
+exact with 431 timeout/pacemaker pairs and 431 Rust commits, zero unknown
+warnings, and zero critical signals. At the adjacent formal sample the strict
+stream contained 760 healthy zero-transaction samples over 23,113 seconds,
+with maximum lag two. Compact evidence SHA-256 is
+`ba686f0ae2533005a294b3bc2f509ffac0d2fd34f025204b3077847e6c54f405`.
