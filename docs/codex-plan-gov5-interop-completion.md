@@ -801,3 +801,8 @@ chaindata 明确排除。证据 SHA-256 为 `6ea80521...203c`。
 number/hash/parentHash/stateRoot/receiptsRoot/transactionsRoot/miner/交易数均逐项
 一致。复制头仍为 `b88a3571...5a82`，其后一块由 Rust 按轮值产生；证据 SHA-256
 为 `04f58aef...2e82`。
+
+复制边界还增加了最终独立门：提交 `6fc5d326...bae2` 的验证器已在 nonce `0x11`
+完成零变更预检，并持续重放上述 7 个历史块。它等待原子总验收 PASS 后，才会在最新
+Reth 进程上再次要求 nonce `0x22`、六端实时头精确、CommitQC 和零双签。启动证据
+SHA-256 为 `078089fc...bb6`。

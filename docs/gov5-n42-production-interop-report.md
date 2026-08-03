@@ -88,6 +88,14 @@ is the expected Rust-authored block. The audit compares number, block and
 parent hashes, state/receipts/transaction roots, miner, and transaction count;
 evidence SHA-256 is `04f58aef...2e82`.
 
+That boundary audit is also enforced after the final Reth rollover. The pushed
+verifier at commit `6fc5d326...bae2` passed a mutation-free preflight at nonce
+`0x11` and is now waiting on the atomic total-goal result. It continuously
+replays all seven historical identities while waiting, then requires the
+post-burst nonce `0x22`, exact six-endpoint latest identity, CommitQC, and zero
+equivocations on the latest-Reth process before emitting its own final PASS.
+Launch evidence SHA-256 is `078089fc...bb6`.
+
 The superseded runtime27 candidate passed all `internal` and `cmd/n42` tests;
 two consecutive optimized builds were byte-identical. Its pinned Gov binary
 SHA-256 was `72e918d9500169e227ef1a0c9d5dd751dcd7d58f1df0871825b61f196e3fce95`.
