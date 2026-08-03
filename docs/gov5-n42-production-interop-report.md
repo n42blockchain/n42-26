@@ -89,7 +89,8 @@ were continuous from 17 through 33, deployment and transfer semantics were
 exact, and the CREATE address recomputed to `9a9f2ccf...63ae`. The alternating
 ingress plan contains eight Gov and nine Rust submissions. The reusable
 verifier SHA-256 is `90c2bf05...8a51`, PASS evidence SHA-256 is
-`caf40cea...b3ce`, and a deliberately altered transaction hash is rejected.
+`caf40cea...b3ce`. Deliberately altered transaction hash, chain ID, nonce
+sequence, and ingress-plan artifacts are all rejected.
 
 The authoritative zero-transaction stream began at
 `2026-08-03T09:49:44Z`, common height 92,623, lag zero. It requires continuous
