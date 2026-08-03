@@ -986,6 +986,13 @@ block 六端身份精确。两份只读证据 SHA-256 分别为 `e289e529...fa7f
 `b88a3571...5a82` 仍逐字段六端精确；live 六端身份一致，latest/pending nonce 均为
 `0x11`，全程 mutation-free。证据 SHA-256 为 `f60946f5...8632`。
 
+新增的只读 905 数据兼容审计在 3 小时运行态 PASS：固定 Gov main `b8c17d0`，确认
+可变宽度 builder `337cea4` 与内存 tail `b8c17d0` 均尚未接入共识提交路径；五个
+Gov MDBX 均存在且原 PID 存活，`txindex.ranges` 文件数均为 0。六端 chain ID、
+创世、复制持久头 92,605、live 区块身份和 latest/pending nonce 均精确，因此无需
+重复制或重生成 905 数据。脚本/证据 SHA-256 分别为 `5bb09bb1...9a67`、
+`61db5b57...141b`；脚本已同步到混合 Reth 交付分支提交 `8e985cf8...0faf`。
+
 6 小时 V2 深审计也已通过冻结源预检并启动：harness、静态 rechecker、905 静态基线
 SHA-256 分别为 `037cc547...5309`、`b27890ad...10ec`、
 `6ea80521...203c`；PID 82622 / session 95373 仅等待严格 6 小时复合门，随后闭合

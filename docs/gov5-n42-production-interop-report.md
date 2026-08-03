@@ -492,6 +492,17 @@ endpoints. Live six-endpoint identity is exact, latest and pending nonce remain
 `0x11`, and no mutation occurs. Evidence SHA-256 is
 `f60946f5a1c77db2aa1b5a18b0306eab84b34698653325485bf7d61996848632`.
 
+The new read-only 905 data-compatibility audit passes against the live
+three-hour runtime. At pinned Gov main `b8c17d0`, variable-width builder
+`337cea4` and in-memory tail `b8c17d0` are both still unwired from consensus
+commit. All five Gov MDBX files exist under their original live PIDs and every
+datadir contains zero `txindex.ranges` files. Chain ID, genesis, copied
+persisted head 92,605, live block identity, and latest/pending nonce are exact
+on all six endpoints, so no 905 data recopy or regeneration is required.
+Script/evidence SHA-256 values are `5bb09bb1...9a67` and `61db5b57...141b`;
+the script is also synchronized to mixed-Reth delivery commit
+`8e985cf860f03081f0b2c25744cd0b69a8840faf`.
+
 The six-hour V2 deep audit has also passed its frozen-source preflight and is
 active as PID 82622 / session 95373. Harness, static rechecker, and immutable
 905 baseline SHA-256 values are `037cc547...5309`, `b27890ad...10ec`, and
