@@ -473,6 +473,13 @@ canonical blocks. All 187 Rust slots are six-endpoint exact and match ordered
 and all 24 immutable 905-lineage files remain exact. Deep-audit evidence
 SHA-256 is `9fc98f4302ba6cf91c4016deba68f8f784d040af564b30ac8277b9810a328086`.
 
+An independent post-three-hour raw audit covers heights 93,812–93,955. Its
+144 blocks form 24 complete cycles; Rust and Gov1 through Gov5 each author 24
+blocks. All six raw sequences have SHA-256 `5c6d031f...0565`, with continuous
+parents, fixed slots, and zero transactions. Incremental composite evidence
+SHA-256 is `b1fe9e66dcfcb829d2f00b71cfa7d4f870596b8dda23ec3166dcbda5ceb40d13`,
+showing unchanged rotation through the three-to-six-hour waiting interval.
+
 The matching three-hour archive/QMDB and network-matrix repetitions also pass.
 Both current proofs at height 93,823 retain exact Gov/Rust roots and bytes and
 pass offline verification; eleven historical points pass all 209 checks.
