@@ -399,3 +399,28 @@ BLS key、network key、network metadata 和 epoch schedule。新目录只能用
 
 补充 fail-closed 回归已通过：伪造的错误 upstream SHA 以状态 1 退出且没有 completion
 marker；空 Gov 数据目录同样在产生 PID 前以状态 1 退出。两条安全门不会静默降级。
+
+---
+
+### T14 — Gov5 latest-main 再同步与 runtime20 严格窗口（2026-08-03）
+
+Gov5 `main` 在 runtime18 运行期间先推进到 `1114f1dd...`，随后在 runtime19
+预检期间又推进到 `c611124d...`。两个旧窗口均按 fail-closed 规则排除；runtime18
+保留了 24,464 秒、804 个健康零交易样本作为非资格诊断证据，runtime19 尚未开始正式
+计时。最新合并候选 `0f688685...` 已推送；新增上游提交仅修改 txflood 的 HTTP 响应体
+回收，不触及 genesis、HotStuff 或存储格式。
+
+Gov 全量测试和 `go test -race ./...` 通过；随机负缓存故障模拟器曾单次未触发，随后目标
+测试连续 20 次、整个 state 包连续 3 次及全量重跑全部通过。两个独立冷缓存构建逐字节
+一致，Gov SHA-256 为 `3a2ed3e0...e0da`。905 血统数据在停止态复制，99 个持久文件的
+源/目标清单逐字节一致，清单 SHA-256 为 `19624fe1...a993`；创世仍为
+`b71c2810...1392ec`。
+
+runtime20 使用五个 Gov 5.7.906 节点和官方稳定 Reth 2.4.1
+(`91725e3aa...`, binary `0a4dbcf3...62b9f`)。正式零交易窗口从
+`2026-08-03T04:07:59Z` 重新计时，首样本高度 90,704、lag 0、六端点
+hash/stateRoot/receiptsRoot 一致。资源流绑定 Rust PID 12655；Gov 上游流绑定
+`c611124d...`。独立预检、交易零发送预检、轮值、超时恢复与日志分区均 PASS。
+24 小时后自动执行 17 笔双入口交易、burst 后稳定性、归档/QMDB 对比、Rust 重启重入
+和最终独立复验；随后同一官方 Reth 还会做停止态字节快照和额外一小时复验。T14 仅在
+两级独立最终 PASS 均生成后关闭。

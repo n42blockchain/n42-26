@@ -4,8 +4,8 @@ set -euo pipefail
 duration_seconds="${1:?duration seconds required}"
 interval_seconds="${2:-600}"
 evidence_file="${3:?evidence file required}"
-expected_main="${N42_QUAL_EXPECTED_GOV_UPSTREAM_SHA:-920f7536eb263b6744b48f28dfeb77f4c2798c1a}"
-gov_repo="${N42_QUAL_GOV_REPO:-/Users/jieliu/Documents/n42/live-interop-20260721/N42-gov5-current-main-20260801}"
+expected_main="${N42_QUAL_EXPECTED_GOV_UPSTREAM_SHA:-c611124dfc09378eb22876a2a502189d64c8dd30}"
+gov_repo="${N42_QUAL_GOV_REPO:-/Users/jieliu/Documents/n42/live-interop-20260721/N42-gov5-current-main-20260803}"
 completion_file="${evidence_file%.jsonl}-complete.json"
 
 test ! -e "$evidence_file"

@@ -1,23 +1,23 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-runtime="${N42_QUAL_RUNTIME:-/Users/jieliu/Documents/n42/live-interop-20260721/runtime-18-gov5-906-latest-reth}"
+runtime="${N42_QUAL_RUNTIME:-/Users/jieliu/Documents/n42/live-interop-20260721/runtime-20-gov5-c611-latest-reth}"
 repo="${N42_VERIFY_REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 verifier_script="${BASH_SOURCE[0]}"
 expected_verifier_script_sha="${N42_VERIFY_EXPECTED_SELF_SHA:-}"
-gov_repo="${N42_QUAL_GOV_REPO:-/Users/jieliu/Documents/n42/live-interop-20260721/N42-gov5-current-main-20260801}"
+gov_repo="${N42_QUAL_GOV_REPO:-/Users/jieliu/Documents/n42/live-interop-20260721/N42-gov5-current-main-20260803}"
 deps_repo="${N42_QUAL_DEPS_REPO:-/Users/jieliu/Documents/n42/deps-latest-20260721/n42-26}"
 reth_repo="${N42_QUAL_RETH_REPO:-/Users/jieliu/Documents/n42/deps-latest-20260721/reth}"
 preflight_only="${N42_VERIFY_PREFLIGHT_ONLY:-0}"
 ports="${N42_QUAL_PORTS:-28501 28502 28503 28504 28505 29545}"
 expected_genesis="0xb71c28109836f120453d097c38819a55b14c49abcc92713037fb9b11201392ec"
-expected_gov_upstream="${N42_VERIFY_GOV_UPSTREAM:-920f7536eb263b6744b48f28dfeb77f4c2798c1a}"
-expected_gov_candidate="${N42_VERIFY_GOV_CANDIDATE:-8915b4cc07d82dc195daee2e8e741ea5e8446068}"
+expected_gov_upstream="${N42_VERIFY_GOV_UPSTREAM:-c611124dfc09378eb22876a2a502189d64c8dd30}"
+expected_gov_candidate="${N42_VERIFY_GOV_CANDIDATE:-0f688685f02c97ebddc7a3a6bb280536b030c31a}"
 expected_deps_head="aec34a0cd465e8fdbb598b90bc778fe96e25d6c0"
 expected_reth_head="91725e3aa8f2a0bbc5a425e931a2f2b2f31b2a7b"
-expected_gov_binary_sha="${N42_VERIFY_GOV_BINARY_SHA:-51e68918560be65f8e5221f02a3d544a7baf42bed9aa86655623449a4fd765d0}"
-expected_rust_binary_sha="${N42_VERIFY_RUST_BINARY_SHA:-d917782b906176119172e656005218be34ec3d5ad1b7241c0c53f8f6d593da2d}"
-expected_finalizer_sha="${N42_VERIFY_FINALIZER_SHA:-22268b2d7d1a230e0f4ebf0ded8cf7784426c1e334a1e44279060a60cc17f2ec}"
+expected_gov_binary_sha="${N42_VERIFY_GOV_BINARY_SHA:-3a2ed3e066b60db0358a2ca25800b67de5649e9df8cfca1bc3242e7c6796e0da}"
+expected_rust_binary_sha="${N42_VERIFY_RUST_BINARY_SHA:-0a4dbcf30d7cc9944a7cd7c96a25c1ebf862df10bde76210a381ef492e362b9f}"
+expected_finalizer_sha="${N42_VERIFY_FINALIZER_SHA:-2a6a7ec212735c2d274c834d48fac83321fcb109f761b6ef295bede5be9d8e41}"
 
 require_file() {
   test -f "$1" || {

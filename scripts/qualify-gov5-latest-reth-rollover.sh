@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-runtime="${N42_QUAL_RUNTIME:-/Users/jieliu/Documents/n42/live-interop-20260721/runtime-18-gov5-906-latest-reth}"
-qualification_dir="${N42_LATEST_RETH_QUAL_DIR:-/Users/jieliu/Documents/n42/live-interop-20260721/post-qualification-latest-reth-20260802}"
+runtime="${N42_QUAL_RUNTIME:-/Users/jieliu/Documents/n42/live-interop-20260721/runtime-20-gov5-c611-latest-reth}"
+qualification_dir="${N42_LATEST_RETH_QUAL_DIR:-/Users/jieliu/Documents/n42/live-interop-20260721/post-qualification-latest-reth-20260803}"
 script_path="${BASH_SOURCE[0]}"
 expected_self_sha="${N42_LATEST_RETH_EXPECTED_SELF_SHA256:-}"
 latest_binary="${N42_LATEST_RETH_BINARY:-$qualification_dir/n42-node}"
@@ -11,9 +11,9 @@ expected_reth_commit="${N42_LATEST_RETH_COMMIT:-91725e3aa8f2a0bbc5a425e931a2f2b2
 expected_reth_stable="${N42_LATEST_RETH_STABLE_TAG:-v2.4.1}"
 expected_source_commit="${N42_LATEST_RETH_SOURCE_COMMIT:-}"
 source_repo="${N42_LATEST_RETH_SOURCE_REPO:-/Users/jieliu/Documents/n42/interop-reth-latest-20260802/n42-26}"
-gov_repo="${N42_LATEST_RETH_GOV_REPO:-/Users/jieliu/Documents/n42/live-interop-20260721/N42-gov5-current-main-20260801}"
-expected_gov_commit="${N42_LATEST_RETH_GOV_COMMIT:-8915b4cc07d82dc195daee2e8e741ea5e8446068}"
-expected_gov_upstream="${N42_LATEST_RETH_GOV_UPSTREAM:-920f7536eb263b6744b48f28dfeb77f4c2798c1a}"
+gov_repo="${N42_LATEST_RETH_GOV_REPO:-/Users/jieliu/Documents/n42/live-interop-20260721/N42-gov5-current-main-20260803}"
+expected_gov_commit="${N42_LATEST_RETH_GOV_COMMIT:-0f688685f02c97ebddc7a3a6bb280536b030c31a}"
+expected_gov_upstream="${N42_LATEST_RETH_GOV_UPSTREAM:-c611124dfc09378eb22876a2a502189d64c8dd30}"
 harness="$runtime/artifacts/scripts/gov5-interop-qualification.sh"
 independent="$runtime/evidence/gov5-906-independent-final-verification.json"
 ports="${N42_QUAL_PORTS:-28501 28502 28503 28504 28505 29545}"
@@ -28,7 +28,7 @@ expected_p2p_key_sha="d82561e312fbb044f56eec5f434f03ea1e852924f055a8949ea82be9e7
 expected_consensus_config_sha="38cd3fb1f57e5e3053e23de836b7c98e542ccb5375d0521a65b5c2f6175bd8bf"
 expected_bootstrap_sha="35dda59684e7f56978e5d8de385fa2d2bf15b47747388b88a7449ac31387bf15"
 expected_genesis_artifact_sha="561808693c76b356e51f8f5961304e68f3167943c17145bda056612041dca687"
-expected_old_binary_sha="${N42_LATEST_RETH_OLD_BINARY_SHA:-d917782b906176119172e656005218be34ec3d5ad1b7241c0c53f8f6d593da2d}"
+expected_old_binary_sha="${N42_LATEST_RETH_OLD_BINARY_SHA:-0a4dbcf30d7cc9944a7cd7c96a25c1ebf862df10bde76210a381ef492e362b9f}"
 key_dir="$runtime/artifacts/validator-keys/node0"
 validator_key="$key_dir/keystore/bls_81d4c1f92ddb837cb46f82280d9b491b101fa582.key"
 p2p_key="$key_dir/network-keys"

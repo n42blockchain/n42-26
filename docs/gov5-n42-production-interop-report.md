@@ -2126,3 +2126,31 @@ warnings, and zero critical signals. At the adjacent formal sample the strict
 stream contained 760 healthy zero-transaction samples over 23,113 seconds,
 with maximum lag two. Compact evidence SHA-256 is
 `ba686f0ae2533005a294b3bc2f509ffac0d2fd34f025204b3077847e6c54f405`.
+
+Gov5 upstream then advanced twice. Runtime18 was excluded at the first
+movement (`920f7536...` to `1114f1dd...`) after 804 healthy samples spanning
+24,464 seconds and 2,718 blocks; this elapsed time is diagnostic only. Runtime19
+validated `1114f1dd...`, copied the stopped data byte-exactly, and proved mixed
+growth, but was excluded before formal timing when `main` advanced again to
+`c611124d...`. Neither excluded run released a transaction.
+
+The current pushed candidate is `0f688685...`, merging the interop line with
+Gov5 `c611124d...`. The last upstream change is confined to txflood HTTP body
+draining; genesis, HotStuff, and storage formats are unchanged. Full Go tests,
+the complete race suite, and two byte-identical cold-cache builds passed. The
+new Gov binary SHA-256 is `3a2ed3e0...e0da`. A stopped-data migration into
+runtime20 compared all 99 persistent files byte-for-byte; both manifests hash
+to `19624fe1...a993`, and all six endpoints still report genesis
+`b71c2810...1392ec`.
+
+Runtime20 combines five latest Gov5 5.7.906 nodes with official stable Reth
+2.4.1 (`91725e3aa...`, binary `0a4dbcf3...62b9f`). After a clean-log restart,
+Rust leader slots, `5+5` votes, missing-validator timeout recovery, warning
+partition, CommitQC, and zero equivocations all passed preflight. The strict
+zero-transaction stream restarted from zero at `2026-08-03T04:07:59Z`, height
+90,704, with lag zero and exact hash/state/receipt roots. Resource monitoring
+binds Rust PID 12655; the independent upstream stream binds `c611124d...`.
+No transaction has been sent. The armed closure performs the 17-transaction
+dual-ingress burst, post-burst and post-restart stability, archive/QMDB parity,
+restart/rejoin, and an independent raw-evidence verification, followed by a
+stopped-data snapshot and an additional one-hour official-Reth qualification.
