@@ -992,6 +992,12 @@ block 六端身份精确。两份只读证据 SHA-256 分别为 `e289e529...fa7f
 增长 404 KiB、共识数据增长 0。脚本/证据 SHA-256 分别为 `f6c5c495...bb80`、
 `a264d76f...ae98`，主/混合交付提交为 `c5b6673b...087c`、`810cc934...0c4d`。
 
+3.5 小时宿主容量复核仍严格 PASS：407 个共识样本覆盖 12,308 秒并增长 1,266 块，
+bad row 0、最大 lag 1；磁盘可用 730,563,924 KiB，runtime 当前 18,049,804 KiB，
+按额外 25 GiB 增长和 64 GiB 保留量仍充足。caffeinate PID 72825 剩余 95,265
+秒，对 upstream 门加 8,400 秒最终收口需求仍有 12,186 秒裕量，三类 sleep assertion
+均有效。证据 SHA-256 为 `ef86aa3a...79d`。
+
 为保持运行中总目标验证器的启动时源码承诺，混合工作目录已切到新建并推送的
 `qualification/runtime28-combo-ab058`，其 HEAD/上游均精确为固定提交
 `ab058386...3d9e`；更新交付分支 `feat/gov5-n42-live-interop-reth-latest` 仍完整保留

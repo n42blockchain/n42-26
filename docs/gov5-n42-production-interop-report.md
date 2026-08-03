@@ -499,6 +499,14 @@ stay exactly 93, Reth data grows only 404 KiB, and consensus data grows zero.
 Script/evidence SHA-256 values are `f6c5c495...bb80` and `a264d76f...ae98`;
 main/mixed delivery commits are `c5b6673b...087c` and `810cc934...0c4d`.
 
+A 3.5-hour host-capacity recheck remains strict PASS. Its 407 consensus
+samples span 12,308 seconds and grow by 1,266 blocks with zero bad rows and
+maximum lag one. Disk availability is 730,563,924 KiB against current runtime
+18,049,804 KiB; an added 25 GiB growth allowance plus 64 GiB reserve still
+fits. Caffeinate PID 72825 has 95,265 seconds remaining, leaving 12,186 seconds
+beyond the upstream gate plus 8,400-second final-closure allowance; all three
+sleep assertions remain active. Evidence SHA-256 is `ef86aa3a...79d`.
+
 To preserve the running total verifier's launch-time source commitment, the
 mixed working directory now tracks the pushed
 `qualification/runtime28-combo-ab058` branch; both HEAD and upstream are exact
