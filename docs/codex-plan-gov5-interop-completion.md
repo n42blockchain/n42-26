@@ -736,3 +736,33 @@ Rust `5+5`、七验证者 CommitQC、零双签、零交易和空失败流，SHA-
 4,346 条 warning 全量归类，未知 warning 与 critical signal 均为零。冻结 Rust
 日志、leader、timeout、runtime-log SHA-256 分别为 `d81f611a...4df2`、
 `72a2e549...bb9d`、`aa5cf464...a6de`、`c961ced4...31d1`。
+
+---
+
+### T18 — Gov5 b8c17d current-main 与 runtime28（2026-08-03）
+
+runtime27 第九小时期间，Gov5 `main` 从 `d12257c92...` 前进到
+`b8c17d046...`。严格上游门按预期失败关闭；八小时 PASS 证据保留，但该运行被排除，
+没有释放交易。新提交只修改 `internal/txlookup`：segment 可从任意 source 按交易数
+构建，并增加可从 durable block bodies 重建的内存 tail。现有 905 血统数据没有
+`txindex.ranges`，按兼容路径读取，无需破坏性迁移。
+
+候选 `a2da47a70f6c83c765d8a626b86ac383a4fb9551` 已推送并精确包含
+`b8c17d04614346bace2fbb5c05393bdaf454cf5a`。`go test ./...`、
+`go test ./internal/txlookup` 和 `make n42` 均通过；两次构建逐字节一致，Gov binary
+SHA-256 为 `705abbb2...664`。Reth 保持官方稳定 v2.4.1 / source
+`91725e3aa...` / binary `0a4dbcf3...62b9f`。
+
+runtime28 从停止态 runtime26 克隆并重新核验全部 124 个持久文件、
+17,316,415,839 bytes；源/目标 records SHA-256 均为 `1c115b92...37b4b`。
+创世 artifact SHA-256 仍为 `56180869...a687`，六端 chainId 为 `0x477`，创世
+hash 为 `b71c2810...1392ec`。canary 在 views 95,452/95,459 记录两次 Rust
+`5+5`，六端同头、CommitQC 存在、零 equivocation，SHA-256 为
+`13c087af...a914`。
+
+新的严格零交易流从 `2026-08-03T19:06:25Z`、高度 92,635、lag 0 重新计时。
+head 监控请求 86,640 秒，resource/upstream 请求 87,000 秒；Gov5 main 和官方
+Reth stable 均被独立持续监控。最终器 mutation-free preflight 在六端 nonce
+`0x11` 通过，交易发送数为零；1/3/6/8/12/18 小时等待器、最终器和 30 小时防休眠
+均已挂载。只有完整 24 小时门通过后才允许执行 burst、archive/QMDB、Rust 重启追高
+及后续最新 Reth 附加验证。

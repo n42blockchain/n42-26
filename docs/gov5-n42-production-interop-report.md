@@ -11,13 +11,38 @@ are stored in the qualification runtimes named below.
 ## Current 2026-08-03 qualification — latest Gov5 main and latest stable Reth
 
 The authoritative run is now
-`runtime-27-gov5-d122-latest-reth`. It is pinned to Gov5 `origin/main @
-d12257c92e9b1e83d35c981441593663db6db72b`, pushed integration candidate
-`d0999e7680bfbba71c252de1dd95efe64736e5f9`, and reproducible Gov binary
-SHA-256 `72e918d9500169e227ef1a0c9d5dd751dcd7d58f1df0871825b61f196e3fce95`.
-The candidate passed all `internal` and `cmd/n42` tests; two consecutive
-optimized builds were byte-identical. The paired Rust binary
-is official-stable Reth 2.4.1 at
+`runtime-28-gov5-b8c-latest-reth`. Gov5 main advanced during runtime27's
+ninth hour from `d12257c92...` to
+`b8c17d04614346bace2fbb5c05393bdaf454cf5a`; the strict upstream guard failed
+closed, no transaction was released, and runtime27's already-passed eight-hour
+evidence was retained as an excluded qualification rather than counted toward
+the new window. The current pushed integration candidate is
+`a2da47a70f6c83c765d8a626b86ac383a4fb9551`, and its reproducible Gov binary
+SHA-256 is `705abbb2084eea36523fa5ee55ccae00060ad472976d9d4ca1b2c98dc56bd664`.
+The two upstream commits change only transaction-lookup segment construction
+and its rebuildable in-memory tail. The optional `txindex.ranges` file is not
+required for the preserved 905-lineage data, and no destructive migration was
+performed.
+
+Runtime28 is an exact copy of the cleanly stopped 905-lineage runtime26 state:
+124 persistent files / 17,316,415,839 bytes match source and target with
+canonical records SHA-256 `1c115b92...37b4b`. Its canary passed across five
+Gov5 5.7.906 nodes and one Reth 2.4.1 validator: all six endpoints returned the
+same head/hash/state/receipts identity and genesis `b71c2810...1392ec`; Rust
+authored views 95,452 and 95,459 with `5+5`, CommitQC was present, and
+equivocation evidence was empty. Canary SHA-256 is `13c087af...a914`.
+
+The new zero-transaction head, resource, Gov5-upstream, and official-Reth
+streams began at `2026-08-03T19:06:25Z`, first common height 92,635 and lag
+zero. Finalizer preflight passed with all six sender nonces at `0x11` and zero
+sends. The 1/3/6/8/12/18-hour milestones and guarded finalizer are armed; the
+17-transaction burst, archive/QMDB parity, and Rust restart/rejoin remain
+gated until the complete 86,640-second strict stream closes.
+
+The superseded runtime27 candidate passed all `internal` and `cmd/n42` tests;
+two consecutive optimized builds were byte-identical. Its pinned Gov binary
+SHA-256 was `72e918d9500169e227ef1a0c9d5dd751dcd7d58f1df0871825b61f196e3fce95`.
+The paired Rust binary is official-stable Reth 2.4.1 at
 `91725e3aa8f2a0bbc5a425e931a2f2b2f31b2a7b`, combined and pushed at
 `ab05838691e6ec71f5df0faa1d3eefb1fc9d3d9e`, with binary SHA-256
 `0a4dbcf30d7cc9944a7cd7c96a25c1ebf862df10bde76210a381ef492e362b9f`.
