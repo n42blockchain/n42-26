@@ -103,7 +103,7 @@ env \
   N42_VERIFY_RUST_BINARY_SHA="$expected_rust_binary_sha" \
   N42_VERIFY_FINALIZER_SHA="$expected_finalizer_sha" \
   "$verifier" >"$temporary"
+test -s "$temporary"
 jq -e '.status == "PASS"' "$temporary" >/dev/null
 mv "$temporary" "$output"
 cat "$output"
-

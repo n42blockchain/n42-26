@@ -80,6 +80,9 @@ were not restarted, the formal stream remained continuous, all six nonces
 remained `0x11`, and a machine-readable correction record preserves both PID
 sets. The corrected waiter is again held by the immutable gate and targets
 `chore/reth-upstream-20260726 @ 91725e3aa...` with exact upstream equality.
+Both independent-verifier waiters now also require their temporary verifier
+output to be non-empty before parsing and atomically publishing it, giving an
+immediate local failure if a future verifier exits without producing evidence.
 
 ## Current 2026-08-02 baseline — GOV5 5.7.906
 

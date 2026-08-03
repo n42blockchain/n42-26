@@ -64,6 +64,7 @@ env \
   N42_LATEST_RETH_GOV_UPSTREAM="$expected_gov_main" \
   N42_LATEST_RETH_VERIFY_EXPECTED_SELF_SHA256="$expected_verifier_sha" \
   "$verifier" >"$temporary"
+test -s "$temporary"
 jq -e '.status == "PASS"' "$temporary" >/dev/null
 mv "$temporary" "$output"
 cat "$output"
