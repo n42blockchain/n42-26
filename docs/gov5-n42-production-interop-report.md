@@ -414,17 +414,18 @@ user-idle, and disk-idle assertions for another 99,502 seconds, exceeding the
 `5f7123675d22b314a7fcd2299ff4c6cfcea2b5ff56a1bf86790256db9ab8bef9`.
 
 Reusable `scripts/audit-gov5-six-producer-range.sh` (SHA-256
-`66264b639d1f4c9790af10133b401ea65c124fee170ee7172f6d124e93c94e40`)
-now performs this complete producer audit at any later milestone. Its stable
-two-hour scan covers heights 92,696–93,553: 858 blocks and 143 full six-slot
-cycles. All six RPC endpoints produce the same complete number/hash/parent/
-state/receipts/transactions-root/miner/transaction-count sequence, SHA-256
-`95d7c188...500d`. Parents are continuous, every block is empty, and Rust plus
-Gov1 through Gov5 each author exactly 143 blocks in permanently exact slots.
+`37aace7a053ce22f9963dec422d732ee5b10e5ae9cb9effc8ae96fbd3417e003`)
+now atomically retains the six raw JSONL sequences for independent rechecking.
+Its stable two-hour scan covers heights 92,696–93,565: 870 blocks and 145 full
+six-slot cycles. All six RPC endpoints preserve the same 870-row number/hash/
+parent/state/receipts/transactions-root/miner/transaction-count sequence,
+SHA-256 `67b6bf6d...f24a`. Parents are continuous, every block is empty, and
+Rust plus Gov1 through Gov5 each author exactly 145 blocks in permanently
+exact slots.
 Evidence SHA-256 is
-`377f9eb7f84a10d2df5385b96e3a648a5e76bd06e1d1262a35693aab57ba1a5c`.
-The first output containing ephemeral audit-directory paths is recoverably
-retained under `excluded/` and is not used for acceptance.
+`c1d3749f3f729a897e62a4a42677428360b916a5dea53a343b915efd36f4229f`.
+The first output containing ephemeral paths and the second hash-only output
+are recoverably retained under `excluded/` and are not used for acceptance.
 
 The superseded runtime27 candidate passed all `internal` and `cmd/n42` tests;
 two consecutive optimized builds were byte-identical. Its pinned Gov binary

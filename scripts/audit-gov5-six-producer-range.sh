@@ -17,6 +17,8 @@ miners=(
 
 test -d "$runtime"
 test ! -e "$output"
+raw_dir="${output%.json}-raw"
+test ! -e "$raw_dir"
 [[ "$start" =~ ^[0-9]+$ ]]
 
 rpc() {
@@ -51,7 +53,7 @@ test "$blocks" -gt 0
 test $((blocks % 6)) -eq 0
 cycles=$((blocks / 6))
 
-audit_dir="$(mktemp -d)"
+audit_dir="$(mktemp -d "$(dirname "$output")/.six-producer-raw.XXXXXX")"
 trap 'rm -rf "$audit_dir"' EXIT
 endpoint_rows="$audit_dir/endpoints.jsonl"
 
@@ -77,8 +79,9 @@ for port in "${ports[@]}"; do
   done
   test "$(wc -l <"$rows" | tr -d ' ')" -eq "$blocks"
   jq -nc --argjson port "$port" \
+    --arg raw_file "$raw_dir/port-$port.jsonl" \
     --arg sha "$(shasum -a 256 "$rows" | awk '{print $1}')" \
-    '{port:$port,sequenceSha256:$sha}' >>"$endpoint_rows"
+    '{port:$port,rawFile:$raw_file,sequenceSha256:$sha}' >>"$endpoint_rows"
 done
 
 reference="$audit_dir/port-${ports[0]}.jsonl"
@@ -117,5 +120,7 @@ jq -e '
   .expectedProducerSlotsExact and .allProducerCountsBalanced and
   .zeroTransactions and (.mutationPerformed|not)
 ' "$temporary" >/dev/null
+mv "$audit_dir" "$raw_dir"
+trap - EXIT
 mv "$temporary" "$output"
 cat "$output"
