@@ -720,6 +720,14 @@ completion PID 88094/session 38136. After a complete 60-second cycle, all four
 and formal rollover PID 80652 remain alive with empty new failure streams and
 continued zero lag.
 
+The recovered latest-Reth independent verifier was then exercised directly,
+using the same frozen invocation consumed by PID 87801. Its verifier SHA-256
+is `9b90145b...02b5`; official stable tag v2.4.1, live six-endpoint identity,
+genesis, and latest/pending nonce `0x11` are exact, and no mutation was
+performed. The post-exclusion preflight is PASS at SHA-256
+`a6f3ff6f...47de`, independently confirming that the rearmed waiter no longer
+references the stale auxiliary rollover copy.
+
 The strict 2.5-hour (9,000-second) composite gate passes. Its 299 head
 samples span 9,034 seconds, grow by 924 blocks, retain continuous zero-
 transaction coverage, and have maximum lag one. Thirty-one resource samples

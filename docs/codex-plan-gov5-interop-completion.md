@@ -1152,6 +1152,12 @@ PID 87801/session 35229、total PID 87802/session 30844、final 905 PID
 88093/session 66123、completion PID 88094/session 38136。跨过完整 60 秒后连同
 正式 rollover PID 80652 全部存活，新 failure 流为空，六端继续 lag 0。
 
+恢复后的 latest-Reth independent verifier 又按 PID 87801 使用的同一组冻结参数直接
+实跑。verifier SHA-256 为 `9b90145b...02b5`；official stable tag v2.4.1、六端
+live 身份、创世和 latest/pending nonce `0x11` 全部精确，mutation 为 0。该
+post-exclusion preflight PASS，证据 SHA-256 为 `a6f3ff6f...47de`，独立确认重挂
+waiter 已不再引用旧的辅助 rollover 副本。
+
 2.5 小时（9,000 秒）复合门严格 PASS：299 个 head 样本覆盖 9,034 秒，增长 924
 块、最大 lag 1、零交易；原 Rust PID 70765 的 31 个资源样本覆盖 9,004 秒，RSS
 峰值 263,824 KiB、线程最多 163、FD 93；16 个 Gov5 main 样本覆盖 9,012 秒并
