@@ -914,6 +914,13 @@ peer count 为 0，但原 PID 70765 到 Gov 30301–30305 的五条共识 TCP �
 `completionNotClaimed=true`。这证明中途证据文档提交不会让最终门误报源码漂移。
 证据 SHA-256 为 `76ddcd3e...2396`。
 
+新增 `scripts/audit-gov5-burst-readonly.sh`（SHA-256 `4fb70ee3...1ae4`）并在两小时
+状态重跑最终 17 笔 burst 的只读执行审计。所有 raw 签名均恢复到预期 sender，chainId
+均为 `0x477`，nonce `0x11–0x21` 连续、17 个声明 hash 全部精确，计划入口 Rust/Gov
+为 9/8。六端 latest/pending nonce 仍为 `0x11`，部署和转账 `eth_call` 全成功；Gov
+部署估算 `0x12799`、Rust `0x12b0c`，均低于签名 gas `0x186a0`，转账均精确
+`0x5208`。审计发送 0 笔交易，证据 SHA-256 为 `206b8ba4...bc3d`。
+
 约 80 分钟处再次完整执行只读 archive/QMDB parity：当前共同高度 93,199 的两组
 Gov/Rust proof root 与编码逐字节一致并通过冻结离线验证器；创世到 5,189 的 11 个
 历史高度再次通过全部 RPC/root/proof 检查。证据 SHA-256 为 `03f3de7d...3d57`。

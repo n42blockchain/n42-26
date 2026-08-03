@@ -381,6 +381,18 @@ commits will not create a false source-drift failure at final closure.
 Evidence SHA-256 is
 `76ddcd3e7f1103c4eb0a412b0dbd6429c3b7ea40750dce4cc795a47afa042396`.
 
+Reusable script `scripts/audit-gov5-burst-readonly.sh` (SHA-256
+`4fb70ee35803e23c26be7d8fcb895a3d8980a9a9f3a39e660b76d6a4a4fb1ae4`)
+independently decodes and simulates the final 17-transaction burst at the
+two-hour state. Every signature recovers the expected sender, every chain ID
+is `0x477`, nonces are contiguous from `0x11` through `0x21`, and all 17 raw
+hashes match the artifact; intended Rust/Gov ingress counts are 9/8. All six
+endpoints retain latest and pending nonce `0x11`, and both deployment and
+transfer `eth_call` requests succeed. Gov deployment estimates are `0x12799`
+and Rust's is `0x12b0c`, both below signed gas `0x186a0`; all transfers estimate
+exactly `0x5208`. The audit sends zero transactions. Evidence SHA-256 is
+`206b8ba43a9ca7cbf72fcb4507884ad04a92c056f1a4a6bccafcb53b2f8bbc3d`.
+
 The superseded runtime27 candidate passed all `internal` and `cmd/n42` tests;
 two consecutive optimized builds were byte-identical. Its pinned Gov binary
 SHA-256 was `72e918d9500169e227ef1a0c9d5dd751dcd7d58f1df0871825b61f196e3fce95`.
