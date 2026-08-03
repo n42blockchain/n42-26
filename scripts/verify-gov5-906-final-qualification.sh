@@ -17,6 +17,7 @@ expected_deps_head="aec34a0cd465e8fdbb598b90bc778fe96e25d6c0"
 expected_reth_head="91725e3aa8f2a0bbc5a425e931a2f2b2f31b2a7b"
 expected_gov_binary_sha="${N42_VERIFY_GOV_BINARY_SHA:-51e68918560be65f8e5221f02a3d544a7baf42bed9aa86655623449a4fd765d0}"
 expected_rust_binary_sha="${N42_VERIFY_RUST_BINARY_SHA:-d917782b906176119172e656005218be34ec3d5ad1b7241c0c53f8f6d593da2d}"
+expected_finalizer_sha="${N42_VERIFY_FINALIZER_SHA:-22268b2d7d1a230e0f4ebf0ded8cf7784426c1e334a1e44279060a60cc17f2ec}"
 
 require_file() {
   test -f "$1" || {
@@ -148,7 +149,7 @@ assert_pinned_inputs() {
   assert_sha "$runtime/artifacts/scripts/gov5-interop-qualification.sh" \
     6b95241f06fbf2225e9dff8a9bd4534ac5c1363f6f62109883695ebf7db189ab
   assert_sha "$runtime/artifacts/scripts/gov5-current-qualification-finalizer.sh" \
-    22268b2d7d1a230e0f4ebf0ded8cf7784426c1e334a1e44279060a60cc17f2ec
+    "$expected_finalizer_sha"
   assert_sha "$runtime/artifacts/binaries/n42-qmdb-proof-verify" \
     b329baa1e51435082b2bb2cf538a8d1a1ffd994b5c4ac73474e688ffbfc35c19
   assert_sha "$runtime/artifacts/validator-keys/node0/keystore/bls_81d4c1f92ddb837cb46f82280d9b491b101fa582.key" \
