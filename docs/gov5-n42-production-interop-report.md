@@ -1978,16 +1978,17 @@ branch as `9e5fe3a`. This carries the Reth 2.4.1 lockfile additions, the fresh-
 tree JMT benchmark fixture correction, and the frozen latest-Reth rollover
 driver without changing any live runtime file. A detached validation worktree
 paired that exact merge with Reth `91725e3aa`: `cargo check --workspace
---all-targets --locked` passed, all 106 `n42-jmt` unit tests and every benchmark
-target passed, package-scoped rustfmt passed, and all four qualification shell
-scripts passed `bash -n`. The old `c533db8` sibling used by the active strict
+--all-targets --locked` and the corresponding all-targets warnings-denied
+Clippy gate passed, all 106 `n42-jmt` unit tests and every benchmark target
+passed, package-scoped rustfmt passed, and all four qualification shell scripts
+passed `bash -n`. The old `c533db8` sibling used by the active strict
 node was deliberately left untouched and its dependency graph was not allowed
 to rewrite the 2.4.1 lockfile. After the merge was pushed, the frozen
 independent verifier repeated its complete preflight and again found exact
 sources/remotes, genesis, six-endpoint live identity, CommitQC, zero
 equivocations, and nonce `0x11`, with zero transactions sent. The machine-
 readable merge-validation evidence SHA-256 is
-`0aba5f8846c1055de25936bd73daa0844e4310729290ed5c836194eb49c58145`.
+`d727dc0ec766211655bde7a8b6338354c7e4403b510b25c6345e3b04292127fe`.
 
 Because the final rollover must use the latest stable Reth rather than merely
 the release that was latest when the 24-hour window began, an official-tag
