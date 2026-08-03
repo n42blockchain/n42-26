@@ -1024,6 +1024,11 @@ strict24h 六端 raw/链接证据、最终 905 数据审计和完整 24 小时�
 17 笔 burst artifact SHA-256 `6cf05cd0...d750`，逐文件重算六份 raw 序列及行数。
 当前只发布 `completionNotClaimed=true` 的只读预检，最终 nonce 必须为 `0x22`。
 
+V2 与资源趋势 auditor 已冻结到 runtime evidence；冻结 SHA-256 仍分别为
+`cf73a512...4093`、`f6c5c495...bb80`。冻结副本重新预检 PASS，确认 17 笔 burst
+artifact `6cf05cd0...d750`、节点存活、失败流为空、nonce `0x11`，且仍明确
+`completionNotClaimed=true`；预检证据 SHA-256 为 `7109cc4d...aa8a`。
+
 6 小时 V2 深审计也已通过冻结源预检并启动：harness、静态 rechecker、905 静态基线
 SHA-256 分别为 `037cc547...5309`、`b27890ad...10ec`、
 `6ea80521...203c`；PID 82622 / session 95373 仅等待严格 6 小时复合门，随后闭合

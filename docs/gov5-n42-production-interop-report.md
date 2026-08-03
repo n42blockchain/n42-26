@@ -545,6 +545,13 @@ trend. It also pins the 17-transaction burst artifact at SHA-256
 Current output is read-only `completionNotClaimed=true`; final nonce must be
 `0x22`.
 
+V2 and its resource-trend auditor are now frozen into runtime evidence with
+unchanged SHA-256 values `cf73a512...4093` and `f6c5c495...bb80`. A fresh
+frozen-copy preflight passes, pinning burst artifact `6cf05cd0...d750`, live
+nodes, empty failure streams, and nonce `0x11`, while explicitly retaining
+`completionNotClaimed=true`. Preflight evidence SHA-256 is
+`7109cc4d2aa2075b6747da74aa6c3d55c1bd659e2f8f60315d742f2566d3aa8a`.
+
 The six-hour V2 deep audit has also passed its frozen-source preflight and is
 active as PID 82622 / session 95373. Harness, static rechecker, and immutable
 905 baseline SHA-256 values are `037cc547...5309`, `b27890ad...10ec`, and
