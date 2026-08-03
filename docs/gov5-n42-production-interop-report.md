@@ -290,6 +290,19 @@ configured seventh absent validator remains covered by the timeout-recovery
 audit. Evidence SHA-256 is
 `03e36dd50afcbedafa464bf975ce2491cfba8bd0497c14149bcf3eff5da5d336`.
 
+The network/consensus matrix also distinguishes execution peer accounting from
+the mixed consensus channel. Each Gov endpoint reports five devp2p peers;
+Rust correctly reports zero execution peers, but PID 70765 has five established
+connections to Gov ports 30301–30305 and authenticates five distinct validator
+peer IDs at indices 1–5. The latest leader-build log reports five connected
+validator peers against a quorum requirement of four, direct-push reaches all
+five, and Rust view 96,271 commits with `5+5`. CommitQC is present,
+equivocations are zero, and the status API's committed block hash resolves to
+the same full identity on all six endpoints. Evidence SHA-256 is
+`7e7df6e05017f112228bca27c439803ee90d5a1cb94030de371bedb7f53b1f8d`.
+Reusable post-restart checker `scripts/audit-gov5-mixed-network-matrix.sh`
+has SHA-256 `955580f2...c533`.
+
 The superseded runtime27 candidate passed all `internal` and `cmd/n42` tests;
 two consecutive optimized builds were byte-identical. Its pinned Gov binary
 SHA-256 was `72e918d9500169e227ef1a0c9d5dd751dcd7d58f1df0871825b61f196e3fce95`.

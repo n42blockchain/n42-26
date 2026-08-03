@@ -858,6 +858,14 @@ lag 0，并与 Rust 在固定块八项身份及创世 hash 上完全一致。RSS
 第七个缺席验证者继续由 timeout 恢复审计覆盖。证据 SHA-256 为
 `03e36dd5...d336`。
 
+网络/共识矩阵进一步区分 execution peer 与混合共识通道：五个 Gov 端点各报告 5 个
+devp2p peers；Rust 执行层 peer API 为 0，但 PID 70765 实际建立到 Gov
+30301–30305 的五条连接，并认证索引 1–5 的五个 validator peers。最新 leader build
+连接数 5、quorum 需求 4、direct push 5，Rust view 96,271 以 `5+5` 提交；
+CommitQC、零双签，status committed hash 在六端反查完整身份一致。证据 SHA-256
+为 `7e7df6e0...1f8d`；可在 Reth 重启后复用的审计器为
+`scripts/audit-gov5-mixed-network-matrix.sh`。
+
 约 80 分钟处再次完整执行只读 archive/QMDB parity：当前共同高度 93,199 的两组
 Gov/Rust proof root 与编码逐字节一致并通过冻结离线验证器；创世到 5,189 的 11 个
 历史高度再次通过全部 RPC/root/proof 检查。证据 SHA-256 为 `03f3de7d...3d57`。
