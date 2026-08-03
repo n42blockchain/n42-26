@@ -403,6 +403,16 @@ and descriptors remain 93; head, log, and WAL logical counters are monotonic.
 Resource evidence SHA-256 is
 `65e04bac6aac5e4197d3a66c009b34e1499ce4847d6d569ebaa9541d1ce7896e`.
 
+The long-run host-capacity audit passes at 267 samples and 8,064 formal
+seconds, with a 31-second maximum gap and zero bad rows. The data volume has
+730,728,404 KiB available while runtime28 allocates 18,002,992 KiB. Even a
+deliberately extreme 1 GiB/hour growth assumption plus a separate 64 GiB
+reserve projects only 44,217,392 KiB. Caffeinate PID 72825 holds system,
+user-idle, and disk-idle assertions for another 99,502 seconds, exceeding the
+87,336-second strict-upstream, post-window, extra-hour, and closure budget by
+12,166 seconds. Evidence SHA-256 is
+`5f7123675d22b314a7fcd2299ff4c6cfcea2b5ff56a1bf86790256db9ab8bef9`.
+
 The superseded runtime27 candidate passed all `internal` and `cmd/n42` tests;
 two consecutive optimized builds were byte-identical. Its pinned Gov binary
 SHA-256 was `72e918d9500169e227ef1a0c9d5dd751dcd7d58f1df0871825b61f196e3fce95`.

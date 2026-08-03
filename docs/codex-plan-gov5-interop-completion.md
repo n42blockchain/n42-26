@@ -927,6 +927,13 @@ peer count 为 0，但原 PID 70765 到 Gov 30301–30305 的五条共识 TCP �
 KiB、线程最多 163、FD 93；head/log/WAL 等逻辑计数全部单调，证据 SHA-256 为
 `65e04bac...896e`。
 
+长测主机容量审计 PASS：正式流 267 个样本 / 8,064 秒、最大间隙 31 秒、坏行 0；
+数据卷可用 730,728,404 KiB，runtime 当前 18,002,992 KiB。即按极保守的每小时
+1 GiB 增长并另留 64 GiB，也只投影到 44,217,392 KiB。caffeinate PID 72825 的
+system/user/disk sleep assertions 均有效，剩余 99,502 秒；覆盖 87,336 秒的严格
+上游窗口、post-window、附加一小时和收尾预算后仍余 12,166 秒。证据 SHA-256 为
+`5f712367...bef9`。
+
 约 80 分钟处再次完整执行只读 archive/QMDB parity：当前共同高度 93,199 的两组
 Gov/Rust proof root 与编码逐字节一致并通过冻结离线验证器；创世到 5,189 的 11 个
 历史高度再次通过全部 RPC/root/proof 检查。证据 SHA-256 为 `03f3de7d...3d57`。
