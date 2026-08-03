@@ -993,6 +993,13 @@ block 六端身份精确。两份只读证据 SHA-256 分别为 `e289e529...fa7f
 `810cc934...0c4d`。跨过一个完整 60 秒 fail-closed 周期后，总验证器 PID 83205
 继续存活且失败证据为空，兼顾资格可复现与新增工具交付。
 
+更新交付分支另在
+`/Users/jieliu/Documents/n42/interop-reth-latest-20260802/n42-26-delivery-latest`
+建立独立 worktree，HEAD/上游精确为 `810cc934...0c4d`；905 数据审计、最终 905
+waiter、资源趋势脚本 SHA-256 分别精确为 `5bb09bb1...9a67`、
+`183b7901...08b3`、`f6c5c495...bb80`。资格目录继续固定 `ab058386...3d9e`，两者
+互不改变。
+
 冻结复制边界验证器在 3 小时后再次 preflight PASS：重新执行全部 7 个历史边界，
 创世 `b71c2810...1392ec` 与 905 复制持久头 92,605 /
 `b88a3571...5a82` 仍逐字段六端精确；live 六端身份一致，latest/pending nonce 均为

@@ -501,6 +501,14 @@ After a complete 60-second fail-closed cycle, total verifier PID 83205 remains
 alive with no failure evidence. Qualification reproducibility and new-tool
 delivery are therefore both retained.
 
+Updated delivery also has an independent local worktree at
+`/Users/jieliu/Documents/n42/interop-reth-latest-20260802/n42-26-delivery-latest`.
+Its HEAD/upstream are exact at `810cc934...0c4d`; SHA-256 values for the 905
+data auditor, final 905 waiter, and resource-trend auditor are respectively
+`5bb09bb1...9a67`, `183b7901...08b3`, and `f6c5c495...bb80`. The qualification
+directory remains pinned at `ab058386...3d9e`; neither worktree changes the
+other.
+
 The frozen copied-boundary verifier passes another post-three-hour preflight.
 It re-executes all seven historical boundaries: genesis remains
 `b71c2810...1392ec`, copied 905 persisted head 92,605 remains
