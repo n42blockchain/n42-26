@@ -1122,6 +1122,12 @@ view 恢复且 pending 0；2,132 条 warning 全量归类，unexpected/critical 
 data/resource 子证据 SHA-256 分别为 `e03e8047...3262`、`c7a6ea03...06a3`、
 `88a6e3ae...5a8d`、`ecf5e405...e640`、`95e27c1c...c1c4`。
 
+4 小时宿主容量复核也严格 PASS：486 个 head 样本已覆盖 14,703 秒并增长 1,518
+块，最大 lag 1、bad row 0。磁盘可用 730,451,864 KiB，runtime 当前
+18,079,660 KiB；保守追加 25 GiB 并预留 64 GiB 后仍充足。caffeinate PID 72825
+剩余 92,877 秒，对 87,000 秒上游门加 8,400 秒最终收口需求仍有 11,896 秒裕量，
+三类 sleep assertion 全部有效。证据 SHA-256 为 `9f7bf2a7...5cc3`。
+
 2.5 小时（9,000 秒）复合门严格 PASS：299 个 head 样本覆盖 9,034 秒，增长 924
 块、最大 lag 1、零交易；原 Rust PID 70765 的 31 个资源样本覆盖 9,004 秒，RSS
 峰值 263,824 KiB、线程最多 163、FD 93；16 个 Gov5 main 样本覆盖 9,012 秒并

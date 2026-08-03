@@ -681,6 +681,14 @@ resource child evidence SHA-256 values are `e03e8047...3262`,
 `c7a6ea03...06a3`, `88a6e3ae...5a8d`, `ecf5e405...e640`, and
 `95e27c1c...c1c4`.
 
+The four-hour host-capacity recheck also passes strictly. Its 486 head samples
+span 14,703 seconds and grow by 1,518 blocks with maximum lag one and zero bad
+rows. Disk availability is 730,451,864 KiB against runtime 18,079,660 KiB; an
+added 25 GiB allowance plus 64 GiB reserve still fits. Caffeinate PID 72825 has
+92,877 seconds remaining, leaving 11,896 seconds beyond the 87,000-second
+upstream gate plus 8,400-second final-closure allowance; all three sleep
+assertions remain active. Evidence SHA-256 is `9f7bf2a7...5cc3`.
+
 The strict 2.5-hour (9,000-second) composite gate passes. Its 299 head
 samples span 9,034 seconds, grow by 924 blocks, retain continuous zero-
 transaction coverage, and have maximum lag one. Thirty-one resource samples
