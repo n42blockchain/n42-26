@@ -259,6 +259,15 @@ remain 161, and file descriptors 93. Ten reachable Gov5-main samples span
 present, and equivocations and released transactions remain zero. Milestone
 SHA-256 is `cc440f0759498a1aca0f3022bb5ebb20665fed58ab952e031fa94b747da353cd`.
 
+The frozen 90-minute resource series also supports a longer-horizon trend
+check. Original PID 70765 advances 552 blocks over 5,402 seconds; endpoint RSS
+growth is 20,288 KiB, about 13,520 KiB/hour. Holding that deliberately linear
+slope for a full day projects roughly 550,152 KiB, well below the 1 GiB gate.
+Threads remain exactly 161 and file descriptors 93. Reth allocated data grows
+about 133 KiB/hour, QMDB WAL about 60 KiB/hour, and consensus allocated data
+does not grow. Evidence SHA-256 is
+`0d4fbf81d5483781ea53f8924b045e88f5a5504eb587ba85137fae978fd49699`.
+
 The superseded runtime27 candidate passed all `internal` and `cmd/n42` tests;
 two consecutive optimized builds were byte-identical. Its pinned Gov binary
 SHA-256 was `72e918d9500169e227ef1a0c9d5dd751dcd7d58f1df0871825b61f196e3fce95`.
