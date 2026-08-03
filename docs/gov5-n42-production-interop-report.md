@@ -140,6 +140,15 @@ The live client-identity matrix confirms that ports 28501–28505 all report
 hash/state/receipts identity at fixed height 92,971. Matrix evidence SHA-256
 is `67eea2d0...5351`.
 
+Direct startup/catch-up evidence closes the copied-data lineage chain. The
+active Rust process restored persisted head 92,605 and authenticated QMDB root
+from snapshot-exact view 95,450 at `19:01:54Z`. It produced canonical block
+92,606 with `5+5` only 29.438 seconds later, then continuously authenticated
+execution lineage through the six-endpoint formal head 92,695 and authored
+the next formal Rust slot at height 92,696. All four checkpoint hashes were
+re-read identically from all six RPC endpoints. Evidence SHA-256 is
+`586d04fe...4676`.
+
 The superseded runtime27 candidate passed all `internal` and `cmd/n42` tests;
 two consecutive optimized builds were byte-identical. Its pinned Gov binary
 SHA-256 was `72e918d9500169e227ef1a0c9d5dd751dcd7d58f1df0871825b61f196e3fce95`.
