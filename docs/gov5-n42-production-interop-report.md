@@ -339,6 +339,19 @@ The frozen Rust log, leader, timeout, and runtime-log SHA-256 values are
 `a185811f...8e55`, `53270ea6...2ebe`, `59c90704...4076`, and
 `e52303d2...100a`.
 
+A second read-only archive/QMDB checkpoint after the four-hour gate also
+passes. At live height 94,303, two Gov5 account proofs and Rust QMDB proofs
+have identical roots and bytes and both verify offline. Eleven historical
+heights from genesis through 5,189 again pass 209 exact RPC and proof checks.
+All six pending nonces remain `0x11`; no transaction or process restart was
+used. The evidence SHA-256 is
+`1060c76b310359b3655a43d0d9c517933290a91eacb3b91cbf5c39ba74785974`.
+Two wrapper-only diagnostics are retained under `excluded/`: one misspelled
+the frozen verifier environment name and failed before output, while the other
+mistakenly expected 11 total records instead of the harness's one live proof
+record plus 11 historical records. The correctly bound evidence was validated
+in place and was neither appended nor regenerated.
+
 Two runtime27 canary dry runs produced no mutation: the controller wait loop
 did not yet continue across slots in which Rust was not the leader. Their
 zero-byte outputs were moved under `excluded/`; the corrected canary and all

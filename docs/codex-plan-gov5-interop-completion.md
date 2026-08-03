@@ -635,3 +635,12 @@ hash 顺序精确。276 组 timeout/pacemaker 全部在下一 view 恢复且 pen
 冻结 Rust 日志、leader、timeout、runtime-log SHA-256 分别为
 `a185811f...8e55`、`53270ea6...2ebe`、`59c90704...4076`、
 `e52303d2...100a`。
+
+四小时门槛后的第二次只读 archive/QMDB 复核也 PASS：当前高度 94,303 的两份
+Gov5 account proof 与 Rust QMDB proof 根和字节精确一致并通过离线验证；创世至
+5,189 的 11 个历史高度再次通过 209 项 RPC/proof 检查。六端 pending nonce 仍为
+`0x11`，未发送交易或重启进程；证据 SHA-256 为
+`1060c76b310359b3655a43d0d9c517933290a91eacb3b91cbf5c39ba74785974`。
+两次仅包装层的诊断已置于 `excluded/`：一次误拼 verifier 环境变量并在输出前失败，
+一次误把实际的 1 条 live proof 加 11 条历史记录断言为总计 11 条；正确绑定的证据
+仅生成一次，并以 1+11 schema 原地复核通过。
