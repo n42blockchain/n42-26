@@ -1999,3 +1999,8 @@ mutates the strict Gov/Rust chain. The first live sample reports reachable,
 latest `v2.4.1`, and exact baseline. The running script is PID 98531 and is
 bound to SHA-256
 `5194cd81b912c2d1d7d73c363aee20b768a64489b9c9c9ad53d4e104cbcf7809`.
+Isolated negative tests also prove that a simulated `v2.4.2` release exits 42
+after one non-exact sample, while six consecutive simulated remote failures
+exit 43 after six fail-closed samples; neither path silently falls back. Their
+combined evidence SHA-256 is
+`7fe94fef59efb50e3f715dfb756682a1505df4f94cefe5089a8421ceb77432c7`.
