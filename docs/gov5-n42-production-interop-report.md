@@ -468,6 +468,14 @@ Gov1 through Gov5 each author exactly 154 blocks in fixed slots. Composite raw
 evidence SHA-256 is
 `448b88f76d6a07fe5a66b365da8244f722df6b86ccebcc1ed6fa13487cf3faa6`.
 
+The frozen V2 deep audit then closes the same milestone on Rust-authored height
+93,638. It scans 943 canonical blocks; all 158 Rust slots are exact on six
+endpoints and match ordered `5+5` logs. All 172 timeouts recover at the next
+view with zero pending. The 1,383 warnings partition completely with zero
+unexpected or critical signals, and all 24 immutable 905-lineage files remain
+exact. Deep-audit evidence SHA-256 is
+`b29b5e2c8213afde8819208a7a255f8501e60e2d6058355d8f93c12f559eeb02`.
+
 The superseded runtime27 candidate passed all `internal` and `cmd/n42` tests;
 two consecutive optimized builds were byte-identical. Its pinned Gov binary
 SHA-256 was `72e918d9500169e227ef1a0c9d5dd751dcd7d58f1df0871825b61f196e3fce95`.

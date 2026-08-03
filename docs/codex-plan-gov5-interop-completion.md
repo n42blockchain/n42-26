@@ -971,6 +971,11 @@ PASS 后它按里程碑 `endHeight` 向下闭合到完整六槽轮次，调用�
 `8763d282...6691`；父链连续、全程零交易，Rust 与 Gov1–Gov5 各自产生 154 块且
 槽位固定。复合 raw 证据 SHA-256 为 `448b88f7...faa6`。
 
+冻结 V2 深审随后从同一里程碑闭合到 Rust 高度 93,638：扫描 943 个规范块，158 个
+Rust 槽位全部六端精确且日志顺序 `5+5`；172/172 timeout 均在下一 view 恢复，
+pending 0。1,383 条 warning 全量归类，unexpected/critical 均为 0；24 个 905
+静态文件再次精确。深审证据 SHA-256 为 `b29b5e2c...eb02`。
+
 约 80 分钟处再次完整执行只读 archive/QMDB parity：当前共同高度 93,199 的两组
 Gov/Rust proof root 与编码逐字节一致并通过冻结离线验证器；创世到 5,189 的 11 个
 历史高度再次通过全部 RPC/root/proof 检查。证据 SHA-256 为 `03f3de7d...3d57`。
