@@ -238,6 +238,27 @@ the corrected allocated-storage semantics beyond the earlier 1,868-KiB case.
 The rolling summary SHA-256 is
 `349481a3ee0b4a7ab934345deb140878e06b9a612cf22e99d519c99f7120faa0`.
 
+The formal three-hour milestone and an independent rerun both pass without
+relaxed acceptance. Heads contain 358 samples / 10,845 seconds / 1,218 blocks,
+with a 31-second maximum gap, maximum lag two, and continuous zero-transaction
+coverage. Resources contain 37 samples / 10,806 seconds from Rust PID 89930,
+with maximum RSS 268,000 KiB, 162 threads, 93 descriptors, monotonic
+head/log/WAL, and the observed 1,944-KiB compaction. Nineteen exact Gov5-main
+samples span 10,815 seconds. The milestone records 206 Rust `5+5` commits,
+CommitQC, seven validators, zero equivocations, and zero transactions. Its
+SHA-256 is `953e03d8cd0f3b955a9e9ae4c1fb2d54475fcd6cd2bea1c5a04560469695d782`;
+the independent recheck SHA-256 is
+`1e4f317926f5187a26795d166647470f13e5b9c8e8d2cd1928358b99f92376eb`.
+
+The simultaneous identity checkpoint again proves chain ID `0x477`, the full
+pinned genesis hash/state/receipts tuple, all-six latest identity, sender nonce
+`0x11`, Gov5 5.7.906, official Reth 2.4.1, and zero equivocations; its SHA-256
+is `b2afa7bc26b26f56a0cbf8d16aac2f58b45c071e07820ef8778bb70c29f4c3b1`.
+The permanent resource-auditor regression test is executable at
+`scripts/test-gov5-resource-auditor.sh`; it accepts allocated-block compaction
+and rejects log/WAL/head rollback, PID replacement, nonpositive allocation,
+and oversized sample gaps. Its SHA-256 is `73822807...f7f`.
+
 The authoritative zero-transaction stream began at
 `2026-08-03T09:49:44Z`, common height 92,623, lag zero. It requires continuous
 six-endpoint hash/state/receipt equality, zero transactions in every newly

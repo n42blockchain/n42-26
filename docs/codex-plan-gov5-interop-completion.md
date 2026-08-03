@@ -574,3 +574,16 @@ critical signal 均为零。冻结日志、leader、timeout、runtime-log 证据
 为 -740 KiB，但 head/log/QMDB WAL 仍全部单调且资源上限正常，再次实证修正后的
 allocated-storage 语义。组合摘要 SHA-256 为
 `349481a3ee0b4a7ab934345deb140878e06b9a612cf22e99d519c99f7120faa0`。
+
+正式三小时里程碑及独立重跑均在未放宽验收条件下 PASS：358 个 head 样本 /
+10,845 秒 / 增长 1,218 块 / 最大间隔 31 秒 / 最大 lag 2 / 连续零交易；37 个
+Rust PID 89930 资源样本 / 10,806 秒，RSS 最大 268,000 KiB、线程 162、FD 93，
+head/log/WAL 单调且正确记录 1,944 KiB compaction；19 个 Gov5 main 精确样本 /
+10,815 秒。里程碑记录 206 次 Rust `5+5`、CommitQC、七验证者、零双签与零交易，
+SHA-256 为 `953e03d8...d782`；独立重审 SHA-256 为 `1e4f3179...76eb`。
+
+同刻身份检查仍证明 chainId `0x477`、完整固定创世三元组、六端同头、nonce `0x11`、
+Gov5 5.7.906、官方 Reth 2.4.1 和零双签，SHA-256 为 `b2afa7bc...c3b1`。
+永久资源审计回归脚本 `scripts/test-gov5-resource-auditor.sh` 已覆盖 compaction PASS，
+以及 log/WAL/head 回退、PID 变化、非正 allocation、过大采样间隔必须 FAIL；脚本
+SHA-256 为 `73822807...f7f`。
