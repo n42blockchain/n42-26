@@ -71,6 +71,15 @@ Two runtime27 canary dry runs produced no mutation: the controller wait loop
 did not yet continue across slots in which Rust was not the leader. Their
 zero-byte outputs were moved under `excluded/`; the corrected canary and all
 four preflights were rerun from fresh output paths before formal timing.
+At 10:02Z a static controller audit found that the still-gated strict
+independent waiter had been launched with the detached latest-Reth build
+worktree instead of the branch-backed dependency-delivery Reth worktree. The
+waiter, immutable gate, controller guardian, and total verifier were replaced
+before any final summary or transaction release. Nodes and evidence monitors
+were not restarted, the formal stream remained continuous, all six nonces
+remained `0x11`, and a machine-readable correction record preserves both PID
+sets. The corrected waiter is again held by the immutable gate and targets
+`chore/reth-upstream-20260726 @ 91725e3aa...` with exact upstream equality.
 
 ## Current 2026-08-02 baseline — GOV5 5.7.906
 
