@@ -70,6 +70,11 @@ one unchanged Rust PID and 132 blocks of head growth. Peak RSS was 238,976
 KiB, threads 162, and file descriptors 93, all well below the frozen limits;
 logical storage and log counters were monotonic. Its snapshot and audit
 SHA-256 values are `1dd0d0c9...8a503` and `9389d086...af14`.
+The read-only archive/QMDB checkpoint then compared 11 historical RPC points
+and two reference proofs at height 92,767. Gov and Rust returned byte-exact
+RPC payloads, proof roots, and proof bytes, and the frozen offline verifier
+accepted every proof. No transaction or chain mutation was involved; evidence
+SHA-256 is `d9ab509e182789d6fbe96084c54d3325aab2ea73e0a6b162737dc7a3411bb26c`.
 
 The authoritative zero-transaction stream began at
 `2026-08-03T09:49:44Z`, common height 92,623, lag zero. It requires continuous
