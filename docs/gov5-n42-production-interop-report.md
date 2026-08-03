@@ -163,6 +163,14 @@ about 60 KiB/hour. Even a deliberately conservative linear 24-hour RSS
 projection is about 551 MiB, below the frozen 1 GiB limit. Evidence SHA-256 is
 `383e11e3...0991`.
 
+The conservative one-hour composite milestone passed without relaxed
+criteria. Its 120 head samples span 3,607 seconds and 366 blocks with maximum
+lag zero and continuous zero-transaction coverage. Thirteen resource samples
+from the unchanged Rust PID span 3,601 seconds; peak RSS is 241,040 KiB,
+threads remain 161, and file descriptors 93. Seven exact Gov5-main samples
+span 3,605 seconds. Rust has 76 `5+5` commits, CommitQC is present, and
+equivocations remain zero. Milestone SHA-256 is `64c648af...9505`.
+
 The superseded runtime27 candidate passed all `internal` and `cmd/n42` tests;
 two consecutive optimized builds were byte-identical. Its pinned Gov binary
 SHA-256 was `72e918d9500169e227ef1a0c9d5dd751dcd7d58f1df0871825b61f196e3fce95`.
