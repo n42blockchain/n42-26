@@ -511,15 +511,17 @@ To preserve the running total verifier's launch-time source commitment, the
 mixed working directory now tracks the pushed
 `qualification/runtime28-combo-ab058` branch; both HEAD and upstream are exact
 at pinned `ab058386...3d9e`. Updated delivery branch
-`feat/gov5-n42-live-interop-reth-latest` still retains `810cc934...0c4d`.
+`feat/gov5-n42-live-interop-reth-latest` retains `810cc934...0c4d` and advances
+to `809db3bea451233fd19cb6e59cf0e0b46c9e5c81`.
 After a complete 60-second fail-closed cycle, total verifier PID 83205 remains
 alive with no failure evidence. Qualification reproducibility and new-tool
 delivery are therefore both retained.
 
 Updated delivery also has an independent local worktree at
 `/Users/jieliu/Documents/n42/interop-reth-latest-20260802/n42-26-delivery-latest`.
-Its HEAD/upstream are exact at `810cc934...0c4d`; SHA-256 values for the 905
-data auditor, final 905 waiter, and resource-trend auditor are respectively
+Its HEAD/upstream are exact at `809db3be...5c81`, which adds the supplemental
+waiter on top of `810cc934...0c4d`. SHA-256 values for the 905 data auditor,
+final 905 waiter, and resource-trend auditor are respectively
 `5bb09bb1...9a67`, `183b7901...08b3`, and `f6c5c495...bb80`. The qualification
 directory remains pinned at `ab058386...3d9e`; neither worktree changes the
 other.
