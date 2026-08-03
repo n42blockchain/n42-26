@@ -100,6 +100,20 @@ blocks with max lag two and zero transactions; resources covered seven samples
 were zero, and no failure evidence existed. Milestone evidence SHA-256 is
 `b71a6b466e79c3d2f7a7a56675b0e68a123896bcf1aba7709d1f3b726af1ca29`.
 
+The strict one-hour composite milestone passed at `2026-08-03T10:50:56Z`
+without relaxing acceptance. Its frozen head stream contains 121 samples over
+3,651 seconds, grows from height 92,623 to 93,031, has a maximum 31-second
+sample gap and maximum lag two, and verifies zero transactions throughout.
+The resource stream contains 13 samples over 3,602 seconds from the unchanged
+Rust PID 89930; peak RSS was 250,096 KiB, threads 162, and file descriptors 93.
+Seven upstream samples over 3,605 seconds all resolve exactly to Gov5 main
+`d12257c92...`. Rust recorded 71 `5+5` leader commits, CommitQC remained
+present, equivocations remained zero, and no failure evidence existed. A
+separate read-only recomputation rechecked the milestone, all three frozen
+streams, limits, monotonicity, PID identity, and upstream pin. Milestone
+evidence SHA-256 is
+`40b0c17fd2d512a6ca80593ae22ef902494d82f483d23eba42a6041fcef1506a`.
+
 The authoritative zero-transaction stream began at
 `2026-08-03T09:49:44Z`, common height 92,623, lag zero. It requires continuous
 six-endpoint hash/state/receipt equality, zero transactions in every newly
@@ -107,8 +121,9 @@ observed block, maximum lag six, 86,400 seconds of elapsed samples, continuous
 Gov5-main and official-Reth-stable pins, and bounded Rust resources. Exact-PID
 guardians cover all six nodes, the three evidence streams, finalizer,
 immutable-log gate, both independent verifiers, latest-Reth rollover, and
-sleep prevention. Milestones are armed at 1, 3, 6, 12, and 18 hours. After the
-strict window, the guarded finalizer performs the 17-transaction dual-ingress
+sleep prevention. The one-hour milestone has passed; 3-, 6-, 12-, and 18-hour
+milestones remain armed. After the strict window, the guarded finalizer
+performs the 17-transaction dual-ingress
 burst, archive/QMDB checks, ten-minute post-burst run, controlled Rust restart,
 ten-minute post-restart run, immutable log verification, and independent
 re-execution. Only then may the additional one-hour latest-stable-Reth run and
