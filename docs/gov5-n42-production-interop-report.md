@@ -451,7 +451,40 @@ preflight SHA-256 is `af4a0025...a2ad`; PID 7527 / session 50942 is active.
 Besides six raw sequences, final output binds the soak and producer audits by
 SHA-256. Launch evidence SHA-256 is `a4a3de4d...7aa2`.
 
-The strict 2.5-hour (9,000-second) composite milestone passes. Its 299 head
+The strict three-hour (10,800-second) composite gate passes. Its 359 head
+samples span 10,853 seconds, grow by 1,116 blocks, retain continuous zero-
+transaction coverage, and have maximum lag one. Thirty-seven resource samples
+retain original Rust PID 70765 for 10,805 seconds; RSS peaks at 275,856 KiB,
+threads at 163, and descriptors remain 93. All 19 Gov5-main samples are exact
+over 10,815 seconds. Rust has 201 `5+5` commits, CommitQC is present, and
+equivocations remain zero. No acceptance criterion is relaxed; milestone
+SHA-256 is `e09f9a2a72499c72971a91f5f2ba5280d241e383f417e1a2a1cb6cdefaa112be`.
+
+The frozen raw tool closes that exact gate over heights 92,696–93,811. Its
+1,116 blocks form 186 complete cycles; Rust and Gov1 through Gov5 each author
+186 blocks. All six retained raw sequences have SHA-256
+`fb38033f...b0b3`; parents are continuous, slots are exact, and all blocks are
+empty. Composite raw evidence SHA-256 is
+`984e03f73a043137e7be3b95c57a2b9fce15b6fca4a25121d1195d11147cd9c6`.
+The frozen V2 deep audit independently reaches height 93,812 and scans 1,117
+canonical blocks. All 187 Rust slots are six-endpoint exact and match ordered
+`5+5` logs; all 201 timeouts recover at the next view with zero pending. Its
+1,619 warnings partition completely with zero unexpected or critical signals,
+and all 24 immutable 905-lineage files remain exact. Deep-audit evidence
+SHA-256 is `9fc98f4302ba6cf91c4016deba68f8f784d040af564b30ac8277b9810a328086`.
+
+The matching three-hour archive/QMDB and network-matrix repetitions also pass.
+Both current proofs at height 93,823 retain exact Gov/Rust roots and bytes and
+pass offline verification; eleven historical points pass all 209 checks.
+Original Rust PID 70765 still has five established Gov consensus connections
+and five authenticated validators, leader quorum is 5/4, direct-push reaches
+all five, and view 96,866 commits with `5+5`. CommitQC, zero equivocations, and
+exact six-endpoint committed-block identity remain true. Read-only evidence
+SHA-256 values are
+`e289e5292eb16ad3c32e99185c53a14a6437e1ded3746ca1afcf28a8bf04fa7f`
+and `2e6ca52ca2c0f7ec0a8b8b207d9c519493ee7418f7ed31133cbf0e56cd3e3201`.
+
+The strict 2.5-hour (9,000-second) composite gate passes. Its 299 head
 samples span 9,034 seconds, grow by 924 blocks, retain continuous zero-
 transaction coverage, and have maximum lag one. Thirty-one resource samples
 retain original Rust PID 70765 for 9,004 seconds; RSS peaks at 263,824 KiB,
