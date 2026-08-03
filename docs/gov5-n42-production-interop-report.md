@@ -510,6 +510,13 @@ active as PID 82622 / session 95373. Harness, static rechecker, and immutable
 closes Rust leaders, timeout recovery, complete logs, and 24 immutable files
 without mutating chain state.
 
+The same frozen source independently preflights and starts the 12/18-hour deep
+audits as PIDs 88663/88787 (sessions 15588/65112). Each consumes only its own
+strict composite gate and publishes separate closed deep evidence. The
+eight-hour gate already has composite and full six-endpoint raw coverage, and
+the 24-hour finalizer performs the complete final deep audit, so long-run
+coverage is continuous without duplicating state mutation.
+
 The strict 2.5-hour (9,000-second) composite gate passes. Its 299 head
 samples span 9,034 seconds, grow by 924 blocks, retain continuous zero-
 transaction coverage, and have maximum lag one. Thirty-one resource samples
