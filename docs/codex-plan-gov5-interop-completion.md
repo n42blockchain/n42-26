@@ -658,3 +658,9 @@ hash/state/receipts 三元组和当前块身份均精确一致，sender latest/p
 也保持锁定值。运行 chaindata 因正常出块必然变化而继续按设计排除；检查未执行
 任何突变，证据 SHA-256 为
 `4322ede81bd6d5102cad96e94e35ede59d899bafa458178b8dd7347768c47381`。
+
+四小时依赖交付复核也 PASS：主分支、Gov5 candidate、混合客户端组合、Reth 交付和
+依赖升级五个分支均 tracked clean 且与已推送远端 HEAD 精确一致。Gov5 仍为
+candidate `d0999e7...` / upstream main `d12257c...`；官方最新稳定 Reth 仍为
+v2.4.1，tag object `8eb21017...`，两端二进制 SHA 也未漂移。机器证据 SHA-256
+为 `5b7eb21ebc003aafb71ff3b11b105fae4d10aab790047c0d1326cdfef8db6cbe`。

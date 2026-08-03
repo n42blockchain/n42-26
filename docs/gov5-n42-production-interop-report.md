@@ -372,6 +372,15 @@ excluded because block production must mutate it. No mutation was performed;
 evidence SHA-256 is
 `4322ede81bd6d5102cad96e94e35ede59d899bafa458178b8dd7347768c47381`.
 
+The four-hour dependency-delivery recheck passes as well. The primary branch,
+Gov5 candidate, mixed-client combination, Reth delivery, and dependency-update
+branches are each tracked-clean and exactly equal to their pushed remote
+heads. Gov5 remains candidate `d0999e7...` over upstream main `d12257c...`;
+the official latest stable Reth release remains v2.4.1 at tag object
+`8eb21017...`, and the Gov5/Rust binary hashes remain pinned. Machine evidence
+SHA-256 is
+`5b7eb21ebc003aafb71ff3b11b105fae4d10aab790047c0d1326cdfef8db6cbe`.
+
 Two runtime27 canary dry runs produced no mutation: the controller wait loop
 did not yet continue across slots in which Rust was not the leader. Their
 zero-byte outputs were moved under `excluded/`; the corrected canary and all
