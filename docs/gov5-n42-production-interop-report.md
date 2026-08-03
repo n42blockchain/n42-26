@@ -64,6 +64,20 @@ critical signals. Frozen-log, leader, timeout, and log-audit SHA-256 values are
 `f976d11c...95e8`, `81e9e574...f097`, `aa9eff62...14c`, and
 `0dc84ad1...54a`.
 
+The 15-minute composite milestone also passed. Its conservative upstream
+sampling boundary yields 41 head samples / 1,213 seconds / 126 blocks,
+maximum lag zero and continuous zero transactions; five same-PID resource
+samples / 1,200 seconds; and three exact Gov5-main snapshots / 1,201 seconds.
+Rust recorded 36 `5+5` commits with CommitQC and zero equivocations. Milestone
+SHA-256 is `0e236d19...9719`.
+
+A separate 905-lineage static-boundary audit re-hashed all 24 immutable Gov
+epoch schedules, network configurations/keys, and BLS keystores against the
+initial 124-file copy manifest. Every file remains exact. Genesis,
+consensus/bootstrap, Rust validator/P2P keys, frozen tools, and both client
+binaries retain their expected hashes; advancing chaindata is explicitly and
+correctly excluded. Evidence SHA-256 is `6ea80521...203c`.
+
 The superseded runtime27 candidate passed all `internal` and `cmd/n42` tests;
 two consecutive optimized builds were byte-identical. Its pinned Gov binary
 SHA-256 was `72e918d9500169e227ef1a0c9d5dd751dcd7d58f1df0871825b61f196e3fce95`.

@@ -785,3 +785,13 @@ proof 和 11 个历史高度的精确 Gov/Rust 对比，证据 SHA-256 为 `6b81
 leader、timeout、runtime-log SHA-256 分别为 `f976d11c...95e8`、
 `81e9e574...f097`、`aa9eff62...14c`、`0dc84ad1...54a`。两个诊断截面恰在
 timeout 与恢复 view 之间，已移入 `excluded/`，不作为闭合证据。
+
+十五分钟复合门进一步 PASS：41 个 head 样本覆盖 1,213 秒并增长 126 块，最大
+lag 0、连续零交易；5 个同 PID 资源样本覆盖 1,200 秒；3 个 Gov5 main 精确样本
+覆盖 1,201 秒。Rust 累计 36 次 `5+5`、CommitQC、零双签；里程碑 SHA-256 为
+`0e236d19...9719`。
+
+905 血统静态边界审计重算六个 Gov 数据目录中的 24 个 epoch schedule、network
+config/key 和 BLS keystore，全部与初始 124 文件复制清单精确一致。创世、共识/
+bootstrap、Rust 验证者/P2P 密钥、冻结工具与两端 binary 哈希也保持锁定；正常推进的
+chaindata 明确排除。证据 SHA-256 为 `6ea80521...203c`。
