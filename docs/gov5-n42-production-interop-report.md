@@ -503,6 +503,14 @@ Script/evidence SHA-256 values are `5bb09bb1...9a67` and `61db5b57...141b`;
 the script is also synchronized to mixed-Reth delivery commit
 `8e985cf860f03081f0b2c25744cd0b69a8840faf`.
 
+The final 905 data waiter (SHA-256 `183b7901...08b3`) passes preflight and is
+active as PID 90131 / session 77080. It waits only for total-goal PASS, then
+repeats the same audit with nonce `0x22` after the transaction burst, Reth
+restart/catch-up, and extra hour. Final acceptance still requires five live
+MDBX files, zero `txindex.ranges`, exact six-endpoint genesis/copied/live
+heads, and no recopy requirement. Main/mixed delivery commits are
+`1c569bf1...ab6f` and `122bf21c...b4c2`.
+
 The six-hour V2 deep audit has also passed its frozen-source preflight and is
 active as PID 82622 / session 95373. Harness, static rechecker, and immutable
 905 baseline SHA-256 values are `037cc547...5309`, `b27890ad...10ec`, and
