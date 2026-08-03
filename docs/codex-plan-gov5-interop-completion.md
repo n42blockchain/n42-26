@@ -960,6 +960,12 @@ PASS 后它按里程碑 `endHeight` 向下闭合到完整六槽轮次，调用�
 已启动；最终除六端 raw 外还发布 soak/producer 两份 SHA 绑定。启动证据 SHA-256 为
 `a4a3de4d...7aa2`。
 
+2.5 小时（9,000 秒）复合门严格 PASS：299 个 head 样本覆盖 9,034 秒，增长 924
+块、最大 lag 1、零交易；原 Rust PID 70765 的 31 个资源样本覆盖 9,004 秒，RSS
+峰值 263,824 KiB、线程最多 163、FD 93；16 个 Gov5 main 样本覆盖 9,012 秒并
+全部精确。Rust 累计 170 次 `5+5`，CommitQC 存在、双签为零。里程碑 SHA-256 为
+`dc639f5d...cdf7`，未放宽验收。
+
 约 80 分钟处再次完整执行只读 archive/QMDB parity：当前共同高度 93,199 的两组
 Gov/Rust proof root 与编码逐字节一致并通过冻结离线验证器；创世到 5,189 的 11 个
 历史高度再次通过全部 RPC/root/proof 检查。证据 SHA-256 为 `03f3de7d...3d57`。

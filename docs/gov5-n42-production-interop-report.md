@@ -451,6 +451,15 @@ preflight SHA-256 is `af4a0025...a2ad`; PID 7527 / session 50942 is active.
 Besides six raw sequences, final output binds the soak and producer audits by
 SHA-256. Launch evidence SHA-256 is `a4a3de4d...7aa2`.
 
+The strict 2.5-hour (9,000-second) composite milestone passes. Its 299 head
+samples span 9,034 seconds, grow by 924 blocks, retain continuous zero-
+transaction coverage, and have maximum lag one. Thirty-one resource samples
+retain original Rust PID 70765 for 9,004 seconds; RSS peaks at 263,824 KiB,
+threads at 163, and descriptors remain 93. All 16 Gov5-main samples are exact
+over 9,012 seconds. Rust has 170 `5+5` commits, CommitQC is present, and
+equivocations remain zero. No acceptance criterion is relaxed; milestone
+SHA-256 is `dc639f5d1b46f9b3e88a0e9024c48d7c50609bf477a876119c5dbf695757cdf7`.
+
 The superseded runtime27 candidate passed all `internal` and `cmd/n42` tests;
 two consecutive optimized builds were byte-identical. Its pinned Gov binary
 SHA-256 was `72e918d9500169e227ef1a0c9d5dd751dcd7d58f1df0871825b61f196e3fce95`.
