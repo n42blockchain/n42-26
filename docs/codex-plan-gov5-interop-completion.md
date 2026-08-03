@@ -822,6 +822,11 @@ detached spawn 随命令 session 被回收，尚未产生审计或失败证据�
 已移入 `excluded/`，随后改由持久 supervisor session 启动，节点、数据、nonce 和
 正式计时均未变化。
 
+约 80 分钟处再次完整执行只读 archive/QMDB parity：当前共同高度 93,199 的两组
+Gov/Rust proof root 与编码逐字节一致并通过冻结离线验证器；创世到 5,189 的 11 个
+历史高度再次通过全部 RPC/root/proof 检查。证据 SHA-256 为 `03f3de7d...3d57`。
+高位 905 复制边界 92,605 仍由独立持续验证器覆盖，二者不混淆。
+
 三十分钟复合门 PASS：65 个 head 样本覆盖 1,940 秒、增长 198 块、最大 lag 0；
 7 个同 PID 资源样本覆盖 1,801 秒；4 个可达且精确的 Gov5 main 样本覆盖 1,802
 秒。Rust 累计 48 次 `5+5`，CommitQC 仍存在，双签与已发送交易均为零；里程碑

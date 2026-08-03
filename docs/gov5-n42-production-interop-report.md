@@ -133,6 +133,16 @@ proof encodings and pass the pinned offline verifier. Eleven historical
 heights each pass all 19 RPC/root/proof checks, including genesis and the
 bootstrap boundary. Evidence SHA-256 is `3d1ab47e...4ff9`.
 
+The same full read-only archive/QMDB audit was repeated again around the
+80-minute boundary at common reference height 93,199. Both current proofs
+remain byte-identical between Gov and Rust and pass the pinned offline
+verifier; all eleven historical heights from genesis through height 5,189
+again pass exact RPC/root/proof parity. No transaction or data mutation was
+performed. Evidence SHA-256 is
+`03f3de7dc023cca83223a1263ae32fa982aaad8eb053a9f874fa5c43cd4d3d57`.
+The separate continuously running copied-boundary verifier continues to cover
+the high 905 persisted boundary at height 92,605.
+
 The live client-identity matrix confirms that ports 28501–28505 all report
 `N42/5.7.906`, while port 29545 reports
 `reth/v2.4.1-91725e3/aarch64-apple-darwin`. Every endpoint reports chain ID
