@@ -867,3 +867,7 @@ Rust `5+5` view 恢复，pending 为零；624 条 warning 精确归入允许类�
 critical 均为零。冻结 Rust 日志、leader、timeout、runtime-log SHA-256 分别为
 `f16a27a1...e644`、`5763da46...4a8a`、`40ff2727...97ca`、
 `e9fb2aca...5410`。
+
+补充的一小时 Gov5 进程基线确认五个原始 PID 均存活且运行超过一小时，共同高度
+93,091；RSS 为 140,016–141,920 KiB，线程 18–19，FD 均为 34，没有 Gov
+进程替换。证据 SHA-256 为 `df9227ed...1906`。

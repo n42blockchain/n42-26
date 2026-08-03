@@ -180,6 +180,12 @@ critical signals. Immutable Rust log, leader, timeout, and runtime-log SHA-256
 values are `f16a27a1...e644`, `5763da46...4a8a`, `40ff2727...97ca`, and
 `e9fb2aca...5410`.
 
+A supplementary one-hour Gov5 process baseline confirms all five original
+PIDs remain alive and older than one hour at common height 93,091. RSS ranges
+from 140,016 to 141,920 KiB, thread counts from 18 to 19, and every process has
+34 open file descriptors; no Gov process was replaced. Evidence SHA-256 is
+`df9227ed...1906`.
+
 The superseded runtime27 candidate passed all `internal` and `cmd/n42` tests;
 two consecutive optimized builds were byte-identical. Its pinned Gov binary
 SHA-256 was `72e918d9500169e227ef1a0c9d5dd751dcd7d58f1df0871825b61f196e3fce95`.
