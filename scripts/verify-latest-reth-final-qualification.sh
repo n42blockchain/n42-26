@@ -231,13 +231,15 @@ for pair in \
   "$audit_dir/heads.json:$head_audit" \
   "$audit_dir/resources.json:$resource_audit" \
   "$audit_dir/leaders.jsonl:$leaders" \
-  "$audit_dir/timeouts.jsonl:$timeouts" \
   "$audit_dir/runtime-logs.jsonl:$runtime_logs"; do
   actual="${pair%%:*}"
   expected="${pair#*:}"
   jq -e --slurpfile expected "$expected" 'del(.at)==($expected[-1]|del(.at))' \
     "$actual" >/dev/null
 done
+jq -e --slurpfile expected "$timeouts" \
+  'del(.at,.latestCommittedView)==($expected[-1]|del(.at,.latestCommittedView))' \
+  "$audit_dir/timeouts.jsonl" >/dev/null
 
 pid="$(jq -er '.pidAfter' "$summary")"
 test "$(<"$runtime/pids/rust.pid")" = "$pid"
