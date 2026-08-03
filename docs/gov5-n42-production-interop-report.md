@@ -216,6 +216,18 @@ the sender latest and pending nonce remained `0x11`, client versions were Gov5
 equivocations were present. Checkpoint SHA-256 is
 `9f1881315a3a11a18d8ee2d6d4c2e8fde652cea285b9057b8be313e4603effb6`.
 
+The unified 140-minute frozen-log audit extends the deep leader proof from
+height 92,624 through 93,601. All 978 blocks form one parent-continuous
+canonical range, all six endpoints agree on every expected leader block, and
+all 163 Rust slots have exact `5+5` log entries, seven-view stride, and hash
+order. The same immutable Rust log contains 165 timeout/pacemaker pairs; all
+165 recover at the immediately following view with Rust `5+5`, leaving zero
+pending timeout. Its 1,351 warnings partition exactly into the accepted
+timeout, compact-eviction, Rust-commit, and duplicate-suppression classes,
+with zero unknown warnings or critical signals. The immutable log, leader,
+timeout, and runtime-log SHA-256 values are `a1ad313e...515a`,
+`1eb7eeb5...8bcc`, `56dcb732...d37b`, and `f096a71e...d54c`.
+
 The authoritative zero-transaction stream began at
 `2026-08-03T09:49:44Z`, common height 92,623, lag zero. It requires continuous
 six-endpoint hash/state/receipt equality, zero transactions in every newly

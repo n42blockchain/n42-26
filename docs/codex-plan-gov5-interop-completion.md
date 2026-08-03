@@ -559,3 +559,11 @@ CommitQC、110 次 Rust `5+5` 和零 equivocation；证据 SHA-256 为
 仍为 `0x11`，客户端版本为 Gov5 5.7.906 与官方 Reth 2.4.1，并观察到 156 次 Rust
 `5+5`、CommitQC 和零 equivocation。证据 SHA-256 为
 `9f1881315a3a11a18d8ee2d6d4c2e8fde652cea285b9057b8be313e4603effb6`。
+
+140 分钟统一冻结日志深审进一步覆盖高度 92,624 至 93,601 的 978 个连续区块；
+163 个预期 Rust 轮值在六端 canonical 完全一致，163/163 日志提交均为 `5+5`，
+view stride 和 hash 顺序精确。165 次 timeout/pacemaker 全部由下一 view 的 Rust
+`5+5` 恢复，pending 为零；1,351 条 warning 全部归入允许分类，未知 warning 和
+critical signal 均为零。冻结日志、leader、timeout、runtime-log 证据 SHA-256
+分别为 `a1ad313e...515a`、`1eb7eeb5...8bcc`、`56dcb732...d37b`、
+`f096a71e...d54c`。
