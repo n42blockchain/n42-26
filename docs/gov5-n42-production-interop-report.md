@@ -239,6 +239,17 @@ three-hour waiter PID 71290 is armed. Earlier detached/supervisor V1 launch
 artifacts remain recoverably excluded and did not affect nodes, chain data,
 nonce, or formal timing.
 
+The 80-minute head snapshot contains exactly one transient lag-one sample, at
+`20:16:57Z`: common height 93,071 while the fastest endpoint had observed
+93,072. The next 30-second sample (31 wall-clock seconds later) is again lag
+zero at height 93,073. A dedicated fixed-height replay re-read heights
+93,071–93,073 from all six endpoints and compared number, block/parent hashes,
+state/receipts/transaction roots, miner, and transaction count. Every field is
+exact, the three-block parent chain is continuous, and all blocks are empty;
+the complete deep scan through 93,218 independently includes this boundary.
+This proves an RPC sampling race rather than a canonical fork. Evidence
+SHA-256 is `d5b3339b1a86def1092d213c538bc0e8e6cfed532e6de20534406993fba5f1a3`.
+
 The superseded runtime27 candidate passed all `internal` and `cmd/n42` tests;
 two consecutive optimized builds were byte-identical. Its pinned Gov binary
 SHA-256 was `72e918d9500169e227ef1a0c9d5dd751dcd7d58f1df0871825b61f196e3fce95`.
