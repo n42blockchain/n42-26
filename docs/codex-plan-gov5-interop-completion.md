@@ -617,3 +617,13 @@ Gov5 account proof 与 Rust QMDB proof root/bytes 完全一致并通过离线验
 5,189 的 11 个固定历史高度完成 209 项 block/receipt/log/state/storage/proof 检查，
 Gov5/Rust RPC 全部精确。六端 pending nonce 仍为 `0x11`，未发送交易；证据
 SHA-256 为 `c9336afeb6958cddb2f60f9017c43a242a56f042cbd7cbd822f1b499585ba4be`。
+
+正式四小时复合里程碑继续在未放宽验收规则下 PASS：477 个 head 样本覆盖
+14,453 秒并增长 1,626 块，最大采样间隔 31 秒、最大 lag 2、全程零交易；49 个
+同一 Rust PID 89930 的资源样本覆盖 14,407 秒，峰值 RSS 269,808 KiB、线程 162、
+FD 93，head/log/QMDB WAL 单调并保留 1,944 KiB compaction 记录；25 个 Gov5
+upstream 样本覆盖 14,422 秒且全部精确匹配 `d12257c...`。Rust 已累计 274 次
+`5+5` 轮值提交，七验证者 CommitQC 存在且 equivocation 为零。里程碑 SHA-256
+为 `e5c64c8987a930b9b1a610322d554bdf45a323d760f0845388378da09a495585`。
+6/12/18 小时等待器、24 小时最终器、重启重入和最新稳定 Reth 额外一小时闭环继续
+挂载；本里程碑未释放交易，也不提前关闭总目标。

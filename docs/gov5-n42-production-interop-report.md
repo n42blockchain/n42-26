@@ -314,6 +314,21 @@ re-execution. Only then may the additional one-hour latest-stable-Reth run and
 its independent verifier begin. No final acceptance is claimed before the
 atomic total-goal verifier passes.
 
+The formal four-hour composite milestone also passes without relaxing any
+acceptance rule. Its 477 head samples span 14,453 seconds and grow from height
+92,623 to 94,249, with a 31-second maximum gap, maximum lag two, and continuous
+zero-transaction coverage. Forty-nine resource samples span 14,407 seconds
+from the original Rust PID 89930; peak RSS is 269,808 KiB, thread and descriptor
+maxima are 162 and 93, and head/log/QMDB WAL remain monotonic while the auditor
+correctly records the earlier 1,944-KiB allocated-storage compaction. Twenty-five
+Gov5-upstream samples span 14,422 seconds and all match `d12257c...`. Rust has
+274 `5+5` leader commits, CommitQC with seven validators, and zero equivocations.
+The milestone SHA-256 is
+`e5c64c8987a930b9b1a610322d554bdf45a323d760f0845388378da09a495585`.
+The 6-, 12-, and 18-hour waiters, strict finalizer, restart/rejoin checks, and
+latest-stable-Reth rollover remain armed; this checkpoint releases no
+transaction and does not claim final acceptance.
+
 Two runtime27 canary dry runs produced no mutation: the controller wait loop
 did not yet continue across slots in which Rust was not the leader. Their
 zero-byte outputs were moved under `excluded/`; the corrected canary and all
