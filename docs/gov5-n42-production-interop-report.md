@@ -413,6 +413,19 @@ user-idle, and disk-idle assertions for another 99,502 seconds, exceeding the
 12,166 seconds. Evidence SHA-256 is
 `5f7123675d22b314a7fcd2299ff4c6cfcea2b5ff56a1bf86790256db9ab8bef9`.
 
+Reusable `scripts/audit-gov5-six-producer-range.sh` (SHA-256
+`66264b639d1f4c9790af10133b401ea65c124fee170ee7172f6d124e93c94e40`)
+now performs this complete producer audit at any later milestone. Its stable
+two-hour scan covers heights 92,696–93,553: 858 blocks and 143 full six-slot
+cycles. All six RPC endpoints produce the same complete number/hash/parent/
+state/receipts/transactions-root/miner/transaction-count sequence, SHA-256
+`95d7c188...500d`. Parents are continuous, every block is empty, and Rust plus
+Gov1 through Gov5 each author exactly 143 blocks in permanently exact slots.
+Evidence SHA-256 is
+`377f9eb7f84a10d2df5385b96e3a648a5e76bd06e1d1262a35693aab57ba1a5c`.
+The first output containing ephemeral audit-directory paths is recoverably
+retained under `excluded/` and is not used for acceptance.
+
 The superseded runtime27 candidate passed all `internal` and `cmd/n42` tests;
 two consecutive optimized builds were byte-identical. Its pinned Gov binary
 SHA-256 was `72e918d9500169e227ef1a0c9d5dd751dcd7d58f1df0871825b61f196e3fce95`.

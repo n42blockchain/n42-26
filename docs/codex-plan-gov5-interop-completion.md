@@ -934,6 +934,13 @@ system/user/disk sleep assertions 均有效，剩余 99,502 秒；覆盖 87,336 
 上游窗口、post-window、附加一小时和收尾预算后仍余 12,166 秒。证据 SHA-256 为
 `5f712367...bef9`。
 
+新增可重复的 `scripts/audit-gov5-six-producer-range.sh`（SHA-256
+`66264b63...4e40`）。稳定版全量扫描高度 92,696–93,553 的 858 个块、143 个完整
+六槽轮次；六个 RPC 端点的完整 number/hash/parent/state/receipts/transactions root/
+miner/txCount 序列 SHA-256 均为 `95d7c188...500d`。父链连续、全程零交易，Rust 与
+Gov1–Gov5 各出恰好 143 块且槽位绑定精确。证据 SHA-256 为 `377f9eb7...1a5c`；
+含无效临时路径的首版输出已可恢复地移入 `excluded/`，不计入结论。
+
 约 80 分钟处再次完整执行只读 archive/QMDB parity：当前共同高度 93,199 的两组
 Gov/Rust proof root 与编码逐字节一致并通过冻结离线验证器；创世到 5,189 的 11 个
 历史高度再次通过全部 RPC/root/proof 检查。证据 SHA-256 为 `03f3de7d...3d57`。
