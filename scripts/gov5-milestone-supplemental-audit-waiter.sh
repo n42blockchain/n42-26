@@ -106,7 +106,8 @@ jq -e --arg label "$label" --argjson elapsed "$minimum_elapsed" '
 test -s "$resource_snapshot"
 assert_state
 
-"$network_auditor" "$runtime" "$network" >/dev/null
+N42_NETWORK_AUDIT_LABEL="$label" \
+  "$network_auditor" "$runtime" "$network" >/dev/null
 N42_QUAL_RUNTIME="$runtime" N42_QUAL_QMDB_PROOF_VERIFY="$qmdb_verifier" \
   "$harness" archive-rpc-parity http://127.0.0.1:28501 \
   http://127.0.0.1:29545 "$archive"

@@ -4,6 +4,7 @@ set -euo pipefail
 runtime="${1:?usage: $0 RUNTIME OUTPUT}"
 output="${2:?usage: $0 RUNTIME OUTPUT}"
 expected_rust_client="${N42_NETWORK_EXPECTED_RUST_CLIENT:-reth/v2.4.1-91725e3/aarch64-apple-darwin}"
+audit_label="${N42_NETWORK_AUDIT_LABEL:-}"
 ports=(28501 28502 28503 28504 28505 29545)
 expected_remote_ports='[30301,30302,30303,30304,30305]'
 
@@ -104,7 +105,8 @@ jq -e -s --arg hash "$committed_hash" '
 ' "$committed_rows" >/dev/null
 
 temporary="$(mktemp "$(dirname "$output")/.network-matrix.XXXXXX")"
-jq -nc --arg at "$(date -u +%FT%TZ)" --argjson pid "$rust_pid" \
+jq -nc --arg at "$(date -u +%FT%TZ)" --arg label "$audit_label" \
+  --argjson pid "$rust_pid" \
   --argjson remote_ports "$remote_ports" --arg quorum_line "$quorum_line" \
   --argjson connected "$connected" --argjson needed "$needed" \
   --arg direct_line "$direct_line" --argjson direct "$direct" \
@@ -113,8 +115,9 @@ jq -nc --arg at "$(date -u +%FT%TZ)" --argjson pid "$rust_pid" \
   --argjson equivocations "$equivocations" --slurpfile rpc "$rpc_rows" \
   --slurpfile authenticated "$authenticated_rows" \
   --slurpfile committed "$committed_rows" '
-  {at:$at,event:"runtime28_ninety_minute_network_consensus_matrix",
-   status:"PASS",mutationPerformed:false,rpcEndpoints:$rpc,
+  {at:$at,event:"gov5_mixed_network_consensus_matrix",
+   status:"PASS",label:(if $label=="" then null else $label end),
+   mutationPerformed:false,rpcEndpoints:$rpc,
    executionPeerCountSemantics:{govDevp2pPeersEach:5,rustExecutionPeers:0,
      rustConsensusPeersCountedSeparately:true},
    rustConsensusSockets:{pid:$pid,establishedGovTcpRemotePorts:$remote_ports,

@@ -101,6 +101,23 @@ An isolated transition test then supplied two nonexistent PIDs with completed
 `PASS` artifacts; the guardian accepted the completed state and emitted no
 failure, proving it will not flag a correctly exited milestone waiter.
 
+An independent 80-minute checkpoint also passes. Its 167 head samples span
+5,034 seconds, grow 528 blocks, have a 31-second maximum gap and maximum lag
+one, and remain transaction-free. Nine Gov5-main samples are exact, Rust has
+94 `5+5` commits, and equivocations remain zero. The new post-one-hour range
+94,838–94,987 contains 150 blocks and 25 complete rotations; Rust and Gov1–Gov5
+each author exactly 25 blocks, with all six endpoint sequences sharing
+SHA-256 `395e2aa1...e17a`.
+
+This checkpoint exposed only a stale runtime28/ninety-minute event name inside
+the otherwise passing network-matrix artifact. The auditor now emits the
+generic `gov5_mixed_network_consensus_matrix` event with an explicit milestone
+label. A full v2 rerun passes with five authenticated Gov peers, quorum 5/4,
+direct push five, copied-905 height 92,605, nonce `0x11`, absent txindex state,
+exact archive/QMDB checks, and a 24-hour RSS projection of 600,697 KiB. Its
+composite SHA-256 is `8ad2a6b5...52ec`; the mislabeled v1 is preserved but not
+credited.
+
 The primary interop branch is pushed at `97bd0d3ba006...`. The separate latest
 delivery branch is pushed at `3f06839e2e5f...`; its 905-data auditor and final
 completion verifier are byte-identical to the primary branch. The pinned

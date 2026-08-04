@@ -1371,3 +1371,15 @@ phase guardian 也已扩展为可选监督里程碑等待器：在证据尚未�
 finalizer 和计时均连续。
 隔离转换测试使用两个不存在的模拟 PID 与已落盘 PASS 证据，守护正确接受
 已完成状态且不产生失败文件，证明里程碑结束后不会因旧 PID 消失误报。
+
+80 分钟独立复合检查点继续 PASS：167 个 head 样本覆盖 5,034 秒、增长
+528 块、最大 gap 31 秒、lag 1、零交易；9 次 Gov main 采样精确，Rust
+`5+5` commit 94 次且双签 0。一小时边界后的 94,838–94,987 共 150 块
+全量审计再次证明 Rust 与 Gov1–Gov5 各生产 25 块，六端序列 SHA-256
+同为 `395e2aa1...e17a`。
+
+补充审计更正了网络矩阵内部残留的 runtime28/ninety-minute 事件名，现使用
+`gov5_mixed_network_consensus_matrix` 和显式 `eighty-minute` label。v2 全套重跑
+再次 PASS：5/5 认证 Gov peer、quorum 5/4、direct push 5、905 复制高度
+92,605、nonce `0x11`、txindex 缺席、QMDB/归档精确，24 小时 RSS 投影
+600,697 KiB。综合证据 SHA-256 为 `8ad2a6b5...52ec`。
