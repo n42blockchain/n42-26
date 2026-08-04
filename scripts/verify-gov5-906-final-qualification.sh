@@ -146,9 +146,9 @@ assert_pinned_inputs() {
   assert_sha "$runtime/artifacts/bootstrap-bundle.json" \
     35dda59684e7f56978e5d8de385fa2d2bf15b47747388b88a7449ac31387bf15
   assert_sha "$runtime/artifacts/scripts/gov5-interop-qualification.sh" \
-    bd5fafe7b47a8613252c977d0060ccd25e2e1ee6fba949c8f28e0b9feda95d5e
+    0c6bee522016f3af4d101d5ecc6bc202e65189b61e64003c620708085238dd6c
   assert_sha "$runtime/artifacts/scripts/gov5-current-qualification-finalizer.sh" \
-    dc6f26ecd1b2d94a192266e15ec95e39f79d3cdcf7295308caf53a8da391654a
+    d5c2b1479c8b9d194fe778553f5f6c5f96109f7eec2398de75aa39c4c93832e8
   assert_sha "$runtime/artifacts/binaries/n42-qmdb-proof-verify" \
     b329baa1e51435082b2bb2cf538a8d1a1ffd994b5c4ac73474e688ffbfc35c19
   assert_sha "$runtime/artifacts/validator-keys/node0/keystore/bls_81d4c1f92ddb837cb46f82280d9b491b101fa582.key" \
