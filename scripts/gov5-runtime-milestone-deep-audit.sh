@@ -19,7 +19,7 @@ runtime_number="$(basename "$(realpath "$runtime")" | sed -En \
   's/^runtime-([0-9]+)(-|$).*/\1/p')"
 test -n "$runtime_number"
 
-harness="$runtime/artifacts/scripts/gov5-interop-qualification.sh"
+harness="${N42_DEEP_HARNESS:-$runtime/artifacts/scripts/gov5-interop-qualification.sh}"
 rechecker="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/recheck-gov5-runtime-static-boundary.sh"
 milestone="$runtime/evidence/gov5-906-$label-milestone.json"
 prefix="$runtime/evidence/runtime${runtime_number}-$label-closed"
@@ -176,7 +176,11 @@ jq -e '.status=="PASS" and .pendingTimeouts==0 and
   .recoveredByRustVotesFivePlusFive' "$timeout" >/dev/null
 jq -e '.status=="PASS" and .warningPartitionExact and
   .unexpectedWarnings==0 and .criticalSignals==0' "$runtime_log" >/dev/null
-test -z "$(rg -il ' ERROR |(^|[^a-z])(panic|fatal|equivocat)' "$snapshot/logs" || true)"
+critical_log_files="$({
+  rg -l ' ERROR ' "$snapshot/logs" || true
+  rg -il '(^|[^a-z])(panic|fatal|equivocat)' "$snapshot/logs" || true
+} | LC_ALL=C sort -u)"
+test -z "$critical_log_files"
 
 "$rechecker" "$runtime" "$static_baseline" "$static" >/dev/null
 jq -e '.status=="PASS" and .mutationPerformed==false and
