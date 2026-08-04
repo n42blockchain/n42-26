@@ -860,7 +860,11 @@ audit_runtime_logs() {
   local log
   for log in "$runtime"/logs/gov{1,2,3,4,5}.log "$rust_log"; do
     require_file "$log"
-    rg -i ' ERROR |(^|[^a-z])(panic|fatal|equivocat)' "$log" >>"$critical" || true
+    # Keep the structured ERROR level case-sensitive. With a global -i this
+    # also matched harmless INFO fields such as "error=IO error on outbound
+    # stream" and falsely rejected an otherwise healthy startup handshake.
+    rg ' ERROR ' "$log" >>"$critical" || true
+    rg -i '(^|[^a-z])(panic|fatal|equivocat)' "$log" >>"$critical" || true
   done
 
   test "$total" -gt 0
