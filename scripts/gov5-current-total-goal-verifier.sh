@@ -205,8 +205,9 @@ jq -e '.status=="PASS" and .acceptanceRelaxed==false and
 jq -e '.status=="PASS" and .transactionsFinalized==17 and
   .finalSenderNonce=="0x22" and .independentRawAuditsReexecuted==true and
   .liveArchiveParityReexecuted==true' "$strict_independent" >/dev/null
-jq -e '.status=="PASS" and .rethVersion=="2.4.1" and
-  .rethCommit=="91725e3aa8f2a0bbc5a425e931a2f2b2f31b2a7b" and
+jq -e --arg expected_reth "$expected_reth" '
+  .status=="PASS" and .rethVersion=="2.4.1" and
+  .rethCommit==$expected_reth and
   .officialStableTag=="v2.4.1" and .officialStableTagExact==true and
   .headAudit.elapsedSeconds>=3600 and .resourceAudit.elapsedSeconds>=3600 and
   .rustLeaderAudit.status=="PASS" and .timeoutAudit.pendingTimeouts==0 and

@@ -1,23 +1,24 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-runtime="${N42_QUAL_RUNTIME:-/Users/jieliu/Documents/n42/live-interop-20260721/runtime-27-gov5-d122-latest-reth}"
-repo="${N42_VERIFY_REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+runtime="${N42_QUAL_RUNTIME:-/Users/jieliu/Documents/n42/live-interop-20260721/runtime-35-gov5-906-rustsec-final}"
+repo="${N42_VERIFY_REPO:-/Users/jieliu/Documents/n42/security-refresh-20260804/n42-26}"
 verifier_script="${BASH_SOURCE[0]}"
 expected_verifier_script_sha="${N42_VERIFY_EXPECTED_SELF_SHA:-}"
 gov_repo="${N42_QUAL_GOV_REPO:-/Users/jieliu/Documents/n42/live-interop-20260721/N42-gov5-current-main-20260803}"
-deps_repo="${N42_QUAL_DEPS_REPO:-/Users/jieliu/Documents/n42/deps-latest-20260721/n42-26}"
-reth_repo="${N42_QUAL_RETH_REPO:-/Users/jieliu/Documents/n42/deps-latest-20260721/reth}"
+deps_repo="${N42_QUAL_DEPS_REPO:-/Users/jieliu/Documents/n42/security-refresh-20260804/n42-26}"
+reth_repo="${N42_QUAL_RETH_REPO:-/Users/jieliu/Documents/n42/security-refresh-20260804/reth}"
+paired_reth_repo="${N42_QUAL_PAIRED_RETH_REPO:-/Users/jieliu/Documents/n42/security-refresh-20260804/reth}"
 preflight_only="${N42_VERIFY_PREFLIGHT_ONLY:-0}"
 ports="${N42_QUAL_PORTS:-28501 28502 28503 28504 28505 29545}"
 expected_genesis="0xb71c28109836f120453d097c38819a55b14c49abcc92713037fb9b11201392ec"
-expected_gov_upstream="${N42_VERIFY_GOV_UPSTREAM:-d12257c92e9b1e83d35c981441593663db6db72b}"
-expected_gov_candidate="${N42_VERIFY_GOV_CANDIDATE:-d0999e7680bfbba71c252de1dd95efe64736e5f9}"
-expected_deps_head="aec34a0cd465e8fdbb598b90bc778fe96e25d6c0"
-expected_reth_head="91725e3aa8f2a0bbc5a425e931a2f2b2f31b2a7b"
-expected_gov_binary_sha="${N42_VERIFY_GOV_BINARY_SHA:-72e918d9500169e227ef1a0c9d5dd751dcd7d58f1df0871825b61f196e3fce95}"
-expected_rust_binary_sha="${N42_VERIFY_RUST_BINARY_SHA:-0a4dbcf30d7cc9944a7cd7c96a25c1ebf862df10bde76210a381ef492e362b9f}"
-expected_finalizer_sha="${N42_VERIFY_FINALIZER_SHA:-1943db322fa2c58a4783c7cf8f6ff346080881a5bf8403339d1f99e4f2a9ab87}"
+expected_gov_upstream="${N42_VERIFY_GOV_UPSTREAM:-75dab6e5d1bc6aefa213f4f0f7dcc972dd04f89d}"
+expected_gov_candidate="${N42_VERIFY_GOV_CANDIDATE:-23533225648c62440c6112f88dfdb64b5f55f3f1}"
+expected_deps_head="${N42_VERIFY_DEPS_HEAD:-ce4e88ccfe7bc845ecd57605d417a7559fbde932}"
+expected_reth_head="${N42_VERIFY_RETH_HEAD:-0fc810bae34412838bedfd8dc2f212e14e915e5d}"
+expected_gov_binary_sha="${N42_VERIFY_GOV_BINARY_SHA:-e08c1ea7aac198e268d7fb07eacce33347798c90f33532ffc4cd85bfc1af7033}"
+expected_rust_binary_sha="${N42_VERIFY_RUST_BINARY_SHA:-d639f712a87c22c2a45de29dbd895897058a8a28e4a2145061bd195d79eb6d2e}"
+expected_finalizer_sha="${N42_VERIFY_FINALIZER_SHA:-c48c5f3a94e361ce7cb81b41c586e12907f7a2adff688cb661062d9d21692fa0}"
 
 require_file() {
   test -f "$1" || {
@@ -92,6 +93,17 @@ assert_live_consensus() {
     <<<"$equivocations" >/dev/null
 }
 
+assert_gov_qmdb_index_disabled() {
+  local file pid command
+  for file in "$runtime"/pids/gov{1,2,3,4,5}.pid; do
+    test -s "$file"
+    pid="$(<"$file")"
+    kill -0 "$pid"
+    command="$(ps eww -p "$pid" -o command=)"
+    [[ "$command" != *"N42_QMDB_TRUNC_INDEX="* ]]
+  done
+}
+
 assert_sender_nonce() {
   local expected_nonce="$1"
   local port nonce
@@ -128,6 +140,8 @@ assert_sources() {
   test -z "$(git -C "$reth_repo" status --porcelain)"
   test "$(git -C "$reth_repo" rev-parse HEAD)" = \
     "$(git -C "$reth_repo" rev-parse '@{upstream}')"
+  test "$(git -C "$paired_reth_repo" rev-parse HEAD)" = "$expected_reth_head"
+  test -z "$(git -C "$paired_reth_repo" status --porcelain)"
   latest_stable="$(git ls-remote --tags https://github.com/paradigmxyz/reth.git \
     'refs/tags/v*' | sed -E 's#.*refs/tags/##; s/\^\{\}//' |
     rg -v -- '-(alpha|beta|rc)[.-]' | sort -V | tail -n 1)"
@@ -147,7 +161,7 @@ assert_pinned_inputs() {
   assert_sha "$runtime/artifacts/bootstrap-bundle.json" \
     35dda59684e7f56978e5d8de385fa2d2bf15b47747388b88a7449ac31387bf15
   assert_sha "$runtime/artifacts/scripts/gov5-interop-qualification.sh" \
-    deca79a5a8f88f2d51f3c13f98e9258918480259365cf9abbafa8263164f9d4f
+    aa906f42b83048cb4168e1ceb1077d1ca8b27429be5189acd1aaa74f06c551e9
   assert_sha "$runtime/artifacts/scripts/gov5-current-qualification-finalizer.sh" \
     "$expected_finalizer_sha"
   assert_sha "$runtime/artifacts/binaries/n42-qmdb-proof-verify" \
@@ -160,6 +174,7 @@ assert_pinned_inputs() {
 
 assert_live_chain
 assert_live_consensus
+assert_gov_qmdb_index_disabled
 assert_pinned_inputs
 assert_sources
 
@@ -170,7 +185,7 @@ if test "$preflight_only" = 1; then
     '{at:$at,event:"gov5_906_independent_final_verifier_preflight",
       status:"PASS",liveChainExact:true,genesisExact:true,
       consensusReady:true,zeroEquivocations:true,pinnedInputsExact:true,
-      sourcesAndRemotesExact:true,
+      sourcesAndRemotesExact:true,qmdbTruncIndexDisabledOnAllGovNodes:true,
       verifierScriptSha256:(if $verifier_sha == "" then null else $verifier_sha end),
       senderNonce:"0x11",transactionsSent:0}'
   exit 0
