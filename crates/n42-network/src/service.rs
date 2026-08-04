@@ -204,6 +204,11 @@ pub enum NetworkCommand {
         peer: PeerId,
         block_hash: B256,
     },
+    /// Retire an in-flight Gov5 hash fetch after the same block body arrived
+    /// through gossip or the validator direct-push lane.
+    CancelGov5BlockFetch {
+        block_hash: B256,
+    },
     SendSyncResponse {
         request_id: u64,
         response: BlockSyncResponse,
@@ -652,6 +657,17 @@ impl NetworkHandle {
         block_hash: B256,
     ) -> Result<(), NetworkError> {
         self.send_priority(NetworkCommand::RequestGov5BlockByHash { peer, block_hash })
+    }
+
+    pub async fn cancel_gov5_block_fetch_reliable(
+        &self,
+        block_hash: B256,
+    ) -> Result<(), NetworkError> {
+        Self::send_with_backpressure(
+            &self.priority_tx,
+            NetworkCommand::CancelGov5BlockFetch { block_hash },
+        )
+        .await
     }
 }
 
@@ -2811,6 +2827,22 @@ impl NetworkService {
                 metrics::counter!("n42_gov5_block_fetch_fanout_total")
                     .increment(selected_peers.len() as u64);
             }
+            NetworkCommand::CancelGov5BlockFetch { block_hash } => {
+                let requests_before = self.pending_gov5_block_requests.len();
+                self.pending_gov5_block_requests
+                    .retain(|_, pending_hash| *pending_hash != block_hash);
+                let reaped = requests_before - self.pending_gov5_block_requests.len();
+                let pending = self.pending_gov5_block_hashes.remove(&block_hash);
+                let recent = self.recent_gov5_block_requests.remove(&block_hash);
+                if reaped > 0 || pending || recent.is_some() {
+                    metrics::counter!("n42_gov5_block_fetch_cross_path_retired_total").increment(1);
+                    tracing::debug!(
+                        %block_hash,
+                        reaped,
+                        "retired Gov5 block fetch satisfied by another delivery path"
+                    );
+                }
+            }
             NetworkCommand::AnnounceBlock(data) => {
                 self.gossipsub_publish(block_announce_topic(), data, "block announcement");
             }
@@ -2956,6 +2988,24 @@ mod tests {
         match prx.try_recv().unwrap() {
             NetworkCommand::AnnounceBlock(data) => assert_eq!(data, vec![1, 2, 3]),
             other => panic!("expected AnnounceBlock, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_cancel_gov5_block_fetch_uses_priority_lane() {
+        let (handle, _rx, mut prx) = test_handle();
+        let block_hash = B256::repeat_byte(0x42);
+
+        handle
+            .cancel_gov5_block_fetch_reliable(block_hash)
+            .await
+            .expect("fetch cancellation should queue");
+
+        match prx.try_recv().expect("queued cancellation") {
+            NetworkCommand::CancelGov5BlockFetch {
+                block_hash: received,
+            } => assert_eq!(received, block_hash),
+            other => panic!("expected CancelGov5BlockFetch, got {other:?}"),
         }
     }
 

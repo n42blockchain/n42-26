@@ -42,6 +42,13 @@ pub trait ConsensusNetwork: Send + Sync {
         block_hash: alloy_primitives::B256,
     ) -> Result<(), NetworkError>;
 
+    /// Retire a hash fetch whose body arrived through another authenticated
+    /// delivery path before the request-response stream completed.
+    async fn cancel_gov5_block_fetch_reliable(
+        &self,
+        block_hash: alloy_primitives::B256,
+    ) -> Result<(), NetworkError>;
+
     /// Broadcast a blob sidecar (standard channel).
     fn broadcast_blob_sidecar(&self, data: Vec<u8>) -> Result<(), NetworkError>;
 
@@ -121,6 +128,13 @@ impl ConsensusNetwork for NetworkHandle {
         block_hash: alloy_primitives::B256,
     ) -> Result<(), NetworkError> {
         NetworkHandle::request_gov5_block_by_hash(self, peer, block_hash)
+    }
+
+    async fn cancel_gov5_block_fetch_reliable(
+        &self,
+        block_hash: alloy_primitives::B256,
+    ) -> Result<(), NetworkError> {
+        NetworkHandle::cancel_gov5_block_fetch_reliable(self, block_hash).await
     }
 
     fn broadcast_blob_sidecar(&self, data: Vec<u8>) -> Result<(), NetworkError> {

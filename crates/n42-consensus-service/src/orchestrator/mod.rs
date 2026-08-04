@@ -709,6 +709,26 @@ impl ConsensusService {
         }
     }
 
+    async fn retire_h2_v4_fetch_satisfied_elsewhere(&mut self, block_hash: B256) {
+        let tracked = self.h2_v4_fetch_requested_at.remove(&block_hash);
+        self.h2_v4_fetch_failed_peers.remove(&block_hash);
+        if tracked.is_none() {
+            return;
+        }
+        if let Err(error) = self
+            .network
+            .cancel_gov5_block_fetch_reliable(block_hash)
+            .await
+        {
+            warn!(
+                target: "n42::interop::h2v4",
+                %block_hash,
+                %error,
+                "could not retire Gov5 fetch satisfied by another delivery path"
+            );
+        }
+    }
+
     fn remember_h2_v4_block_view(&mut self, block_hash: B256, view: u64) {
         const MAX_H2_V4_BLOCK_BINDINGS: usize = 2048;
         if !self.h2_v4_block_views.contains_key(&block_hash) {
@@ -913,7 +933,8 @@ impl ConsensusService {
             warn!(target: "n42::interop::h2v4", %source, expected = ?requested_hash, received = %block.block_hash, "gov5 block response hash mismatch");
             return;
         }
-        self.h2_v4_fetch_requested_at.remove(&block.block_hash);
+        self.retire_h2_v4_fetch_satisfied_elsewhere(block.block_hash)
+            .await;
         let Some(bound_view) = self.h2_v4_block_views.get(&block.block_hash).copied() else {
             self.h2_v4_unbound_blocks
                 .insert(block.block_hash, (source, rlp));
@@ -3432,8 +3453,6 @@ impl ConsensusService {
                 requested_hash,
                 rlp,
             } if self.h2_v4_identity.is_some() => {
-                self.h2_v4_fetch_requested_at.remove(&requested_hash);
-                self.h2_v4_fetch_failed_peers.remove(&requested_hash);
                 self.handle_h2_v4_gov5_block(source, rlp, Some(requested_hash))
                     .await;
             }
@@ -3588,6 +3607,7 @@ mod tests {
         broadcasts: Arc<Mutex<Vec<n42_primitives::ConsensusMessage>>>,
         h2_v4_broadcasts: Arc<Mutex<Vec<n42_network::h2_v4::H2V4Envelope>>>,
         direct_messages: Arc<Mutex<Vec<(n42_network::PeerId, n42_primitives::ConsensusMessage)>>>,
+        cancelled_gov5_fetches: Arc<Mutex<Vec<B256>>>,
     }
 
     impl MockConsensusNetwork {
@@ -4018,6 +4038,17 @@ mod tests {
             _peer: n42_network::PeerId,
             _block_hash: B256,
         ) -> Result<(), n42_network::NetworkError> {
+            Ok(())
+        }
+
+        async fn cancel_gov5_block_fetch_reliable(
+            &self,
+            block_hash: B256,
+        ) -> Result<(), n42_network::NetworkError> {
+            self.cancelled_gov5_fetches
+                .lock()
+                .expect("mock cancelled Gov5 fetches lock")
+                .push(block_hash);
             Ok(())
         }
 
@@ -5273,6 +5304,28 @@ mod tests {
                 .elapsed()
                 < Duration::from_secs(2)
         );
+    }
+
+    #[tokio::test]
+    async fn direct_block_data_retires_concurrent_gov5_hash_fetch() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, mut prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
+        let block_hash = B256::repeat_byte(0xa6);
+        let peer = libp2p::PeerId::random();
+        orch.h2_v4_fetch_requested_at
+            .insert(block_hash, (Instant::now(), peer));
+
+        orch.handle_block_data(test_block_data(B256::ZERO, block_hash, 1))
+            .await;
+
+        assert!(!orch.h2_v4_fetch_requested_at.contains_key(&block_hash));
+        assert!(matches!(
+            prx.try_recv().expect("cross-path cancellation command"),
+            NetworkCommand::CancelGov5BlockFetch { block_hash: hash }
+                if hash == block_hash
+        ));
     }
 
     #[tokio::test]

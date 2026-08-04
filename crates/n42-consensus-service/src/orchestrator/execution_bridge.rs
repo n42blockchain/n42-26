@@ -459,6 +459,7 @@ impl ConsensusService {
         };
 
         let hash = broadcast.block_hash;
+        self.retire_h2_v4_fetch_satisfied_elsewhere(hash).await;
         if self.bad_blocks.should_skip(hash, "block_data") {
             return;
         }
