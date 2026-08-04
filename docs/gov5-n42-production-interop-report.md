@@ -82,6 +82,15 @@ regenerate data. Two current QMDB proofs plus 11 historical checks are exact
 between Gov and Rust and verify offline. The composite evidence SHA-256 is
 `90e2d2f3...7469`.
 
+Two additional fail-closed three-hour waiters are armed. One reruns
+archive/QMDB parity, the network consensus matrix, 905-data compatibility,
+and resource-trend projection after the composite milestone passes; the other
+reads the entire canonical six-producer range from height 94,460. Their
+evidence prefix is now configurable while retaining the runtime28 default for
+backward compatibility, so runtime30 output and failure paths are labeled
+unambiguously. Only these newly added read-only waiters were replaced during
+the naming correction; no node, formal monitor, finalizer, or timer restarted.
+
 The primary interop branch is pushed at `97bd0d3ba006...`. The separate latest
 delivery branch is pushed at `3f06839e2e5f...`; its 905-data auditor and final
 completion verifier are byte-identical to the primary branch. The pinned

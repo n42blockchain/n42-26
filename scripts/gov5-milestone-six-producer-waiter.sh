@@ -8,7 +8,7 @@ auditor="${4:?usage: $0 RUNTIME LABEL START_HEIGHT AUDITOR EXPECTED_SHA [OUTPUT]
 expected_auditor_sha="${5:?usage: $0 RUNTIME LABEL START_HEIGHT AUDITOR EXPECTED_SHA [OUTPUT]}"
 output="${6:-$runtime/evidence/runtime28-$label-six-producer-full-range.json}"
 milestone="$runtime/evidence/gov5-906-$label-milestone.json"
-failure="$runtime/evidence/runtime28-$label-six-producer-full-range-failure.json"
+failure="${N42_PRODUCER_WAITER_FAILURE:-${output%.json}-failure.json}"
 preflight_only="${N42_PRODUCER_WAITER_PREFLIGHT_ONLY:-0}"
 
 test -d "$runtime"
