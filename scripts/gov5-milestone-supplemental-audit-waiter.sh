@@ -15,12 +15,13 @@ expected_resource_sha="${11:?resource trend auditor SHA-256 is required}"
 preflight_only="${N42_SUPPLEMENTAL_PREFLIGHT_ONLY:-0}"
 milestone="$runtime/evidence/gov5-906-$label-milestone.json"
 resource_snapshot="$runtime/evidence/gov5-906-$label-resources.snapshot.jsonl"
-archive="$runtime/evidence/runtime28-$label-archive-qmdb-parity.jsonl"
-network="$runtime/evidence/runtime28-$label-network-consensus-matrix.json"
-data="$runtime/evidence/runtime28-$label-905-data-compatibility-audit.json"
-resource="$runtime/evidence/runtime28-$label-rust-resource-trend-audit.json"
-output="$runtime/evidence/runtime28-$label-supplemental-audit.json"
-failure="$runtime/evidence/runtime28-$label-supplemental-audit-failure.json"
+evidence_prefix="${N42_SUPPLEMENTAL_EVIDENCE_PREFIX:-$runtime/evidence/runtime28-$label}"
+archive="$evidence_prefix-archive-qmdb-parity.jsonl"
+network="$evidence_prefix-network-consensus-matrix.json"
+data="$evidence_prefix-905-data-compatibility-audit.json"
+resource="$evidence_prefix-rust-resource-trend-audit.json"
+output="$evidence_prefix-supplemental-audit.json"
+failure="$evidence_prefix-supplemental-audit-failure.json"
 harness="$runtime/artifacts/scripts/gov5-interop-qualification.sh"
 qmdb_verifier="$runtime/artifacts/binaries/n42-qmdb-proof-verify"
 expected_harness_sha="037cc547eb958f0b993565b81aefe30b239e0ad061c27895e3287c6d23e95309"
@@ -71,7 +72,7 @@ on_error() {
   jq -nc --arg at "$(date -u +%FT%TZ)" --arg label "$label" \
     --argjson status "$status" --argjson line "$line" \
     --arg command "${BASH_COMMAND:-unknown}" \
-    '{at:$at,event:"runtime28_milestone_supplemental_audit_failure",
+    '{at:$at,event:"gov5_milestone_supplemental_audit_failure",
       status:"FAIL",label:$label,statusCode:$status,line:$line,command:$command}' \
     >"$failure"
   exit "$status"
@@ -84,7 +85,7 @@ if test "$preflight_only" = 1; then
     --arg network_sha "$expected_network_sha" --arg data_sha "$expected_data_sha" \
     --arg resource_sha "$expected_resource_sha" \
     --argjson milestone_present "$(test -s "$milestone" && echo true || echo false)" \
-    '{at:$at,event:"runtime28_milestone_supplemental_waiter_preflight",
+    '{at:$at,event:"gov5_milestone_supplemental_waiter_preflight",
       status:"PASS",label:$label,networkAuditorSha256:$network_sha,
       dataAuditorSha256:$data_sha,resourceAuditorSha256:$resource_sha,
       milestonePresent:$milestone_present,nodesAlive:true,noFailureEvidence:true,
@@ -144,7 +145,7 @@ jq -nc --arg at "$(date -u +%FT%TZ)" --arg label "$label" \
   --arg data_sha "$(sha256 "$data")" --arg resource_sha "$(sha256 "$resource")" \
   --slurpfile network "$network" --slurpfile data "$data" \
   --slurpfile resource "$resource" '
-  {at:$at,event:"runtime28_milestone_supplemental_audit",status:"PASS",
+  {at:$at,event:"gov5_milestone_supplemental_audit",status:"PASS",
    label:$label,acceptanceRelaxed:false,mutationPerformed:false,
    evidenceSha256:{milestone:$milestone_sha,archiveQmdb:$archive_sha,
      networkMatrix:$network_sha,data905Compatibility:$data_sha,
