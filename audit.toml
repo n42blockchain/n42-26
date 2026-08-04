@@ -1,4 +1,6 @@
-# cargo-audit ignore list for known transitive-dep vulnerabilities.
+# cargo-audit policy source for known transitive-dependency vulnerabilities.
+# cargo-audit 0.22 does not load this file automatically, so CI passes these
+# exact IDs through explicit `--ignore` flags in .github/workflows/nightly.yml.
 #
 # All entries below are vulnerabilities in dependencies that N42 does NOT
 # control directly — they come through libp2p 0.56 and optional entries in the
@@ -8,13 +10,22 @@
 #
 # Owner: revisit this list whenever reth or libp2p is bumped. Drop entries
 # whose source dependency has since released a fixed version.
+#
+# RUSTSEC-2026-0002 (lru 0.12.5) is intentionally not ignored here: cargo-audit
+# reports it as an informational unsound warning, not a vulnerability. It is
+# absent from the default feature graph and appears only through the optional
+# n42-zkproof -> sp1-sdk 4.2.1 -> sp1-cuda/prover graph. Active direct N42 and
+# Reth paths use patched lru 0.18.2 and 0.16.4 respectively. SP1 remains pinned
+# to its deployed circuit/serialization boundary until a versioned migration.
 
 [advisories]
 ignore = [
     # hickory-proto (transitive via libp2p-mdns / libp2p-dns / reth-dns-discovery).
     # Two CPU exhaustion advisories at 0.25.2; fix for 0119 is 0.26.1+ but
-    # current libp2p 0.56 still pins 0.25. 0118 has no fixed release. mDNS is
-    # disabled by default in production; keep monitoring the upstream bump.
+    # current released libp2p 0.56 still pins 0.25. Upstream master moved to
+    # hickory 0.26.1 in PR 6423, but that change is in the unreleased libp2p
+    # 0.57 line as of 2026-08-02. mDNS is disabled by default in production;
+    # keep monitoring the upstream release and remove both exceptions then.
     "RUSTSEC-2026-0119",
     # hickory-proto NSEC3 unbounded loop on cross-zone responses. No fixed
     # upgrade available from upstream as of this writing.

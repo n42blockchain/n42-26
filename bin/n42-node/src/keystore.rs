@@ -1,6 +1,6 @@
 use aes_gcm::aead::Aead;
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
-use rand::RngCore;
+use rand::Rng;
 use scrypt::{Params as ScryptParams, scrypt};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -35,7 +35,7 @@ impl Keystore {
         let scrypt_log_n: u8 = 13; // N=8192
         let scrypt_r: u32 = 8;
         let scrypt_p: u32 = 1;
-        let params = ScryptParams::new(scrypt_log_n, scrypt_r, scrypt_p, 32)
+        let params = ScryptParams::new(scrypt_log_n, scrypt_r, scrypt_p)
             .map_err(|e| format!("scrypt params: {e}"))?;
 
         let mut derived_key = [0u8; 32];
@@ -44,9 +44,10 @@ impl Keystore {
 
         let cipher =
             Aes256Gcm::new_from_slice(&derived_key).map_err(|e| format!("AES init: {e}"))?;
-        let nonce = Nonce::from_slice(&nonce_bytes);
+        let nonce =
+            Nonce::try_from(nonce_bytes.as_slice()).map_err(|e| format!("AES nonce: {e}"))?;
         let ciphertext = cipher
-            .encrypt(nonce, secret_key_bytes.as_ref())
+            .encrypt(&nonce, secret_key_bytes.as_ref())
             .map_err(|e| format!("AES encrypt: {e}"))?;
 
         Ok(Self {
@@ -86,7 +87,7 @@ impl Keystore {
                 self.scrypt_log_n
             ));
         }
-        let params = ScryptParams::new(self.scrypt_log_n, self.scrypt_r, self.scrypt_p, 32)
+        let params = ScryptParams::new(self.scrypt_log_n, self.scrypt_r, self.scrypt_p)
             .map_err(|e| format!("scrypt params: {e}"))?;
         let mut derived_key = [0u8; 32];
         scrypt(password.as_bytes(), &salt, &params, &mut derived_key)
@@ -94,9 +95,10 @@ impl Keystore {
 
         let cipher =
             Aes256Gcm::new_from_slice(&derived_key).map_err(|e| format!("AES init: {e}"))?;
-        let nonce = Nonce::from_slice(&nonce_bytes);
+        let nonce =
+            Nonce::try_from(nonce_bytes.as_slice()).map_err(|e| format!("AES nonce: {e}"))?;
         let plaintext = cipher
-            .decrypt(nonce, ciphertext.as_ref())
+            .decrypt(&nonce, ciphertext.as_ref())
             .map_err(|_| "decryption failed: wrong password or corrupted keystore".to_string())?;
 
         plaintext
