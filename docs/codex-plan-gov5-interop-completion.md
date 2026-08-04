@@ -1322,3 +1322,24 @@ Gov peer、`5+5` CommitQC 与零双签均精确，txindex 未启用且无需数�
 22 个 head 样本覆盖 636 秒、增长 66 块、最大 lag 0、全程零交易；三个同 PID
 资源样本覆盖 601 秒；两个 Gov main 样本覆盖 601 秒且均为 `57d5b0d293...`；
 Rust 已有 18 个 `5+5` leader commit，CommitQC 存在、equivocation 为 0。
+
+同一 10 分钟冻结边界的完整生产者审计扫描 94,460–94,525 共 66 个连续块：Rust
+与 Gov1–Gov5 各精确产生 11 块，父链、轮值槽位和六端序列全部一致，全程零交易；
+六个 raw 序列 SHA-256 同为 `ec8fb349...e8c47`，复合证据 SHA-256 为
+`ecb1d267...386e1`。冻结 Rust log 的独立审计匹配 11/11 Rust 块与有序 `5+5`
+日志；23/23 timeout 全部在下一 view 由 Rust `5+5` 恢复且 pending 0；188 条
+warning 全量归类，unexpected/critical 均为 0。leader、timeout、runtime-log 和
+冻结日志 SHA-256 分别为 `f3d96500...d008`、`e4afa46f...1abc`、
+`9a394018...4ec`、`fb4071d1...582c`。
+
+主互操作分支已推送到 `97bd0d3ba00609f3ba101651c9c9a639a6be79b6`。latest-delivery
+工作树保持独立于固定 qualification 组合，补齐恢复审计、Stage 3、最新 P2P 固定值
+和 runtime30 报告后推送到 `3f06839e2e5fa981997e6a022ffaa311301225f7`；两边当前
+905 数据审计与最终 completion verifier 脚本逐字节一致。固定
+`qualification/runtime28-combo-ab058` 仍停在 `ab058386...`，未被改写。
+
+一次只读 operator preflight 暴露出旧 phase guardian 只接受直接 verifier 命令，
+而 runtime30 有意使用更严格的 waiter 命令。该预检未重启节点或控制器、未发送交易、
+未修改正式证据；原失败已隔离且不计入资格。guardian 现兼容 direct/waiter 两种受控
+命令，独立预检 PASS，并以 PID 51358、60 秒间隔重新挂载。重挂载时六端在高度
+94,591 精确一致，Gov5 main 与官方 Reth binary pin 均保持不变，严格窗口不重置。
