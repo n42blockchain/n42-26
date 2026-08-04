@@ -1396,3 +1396,9 @@ SHA-256 为 `9226886e...00aa`。
 111 次、双签 0。90–100 分钟的 95,024–95,083 共 60 块形成 10 个完整轮次，
 六生产者各 10 块。归档/QMDB、网络、905 数据和资源趋势全部复验 PASS，
 24 小时 RSS 投影 569,312 KiB；补充证据 SHA-256 为 `ff96dcbf...548d`。
+
+同一 100 分钟边界的冻结日志深审计也 PASS：94,460–95,078 共 619 块中
+104 个 Rust 槽位与 104 条有序 `5+5` commit 精确匹配，view stride 和 hash 顺序全部
+正确，commit 延迟 53–85 ms、平均 67.7 ms。114/114 timeout 全部在下一 view 由
+Rust `5+5` 恢复，pending 0。920 条 warning 全量归类，unexpected/critical 均为 0，
+且六份冻结日志中无 error/panic/fatal/equivocation 信号。
