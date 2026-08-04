@@ -136,6 +136,14 @@ sequences exact. Archive/QMDB, network, copied-905 data, and resource trends
 all pass again; projected 24-hour RSS is 569,312 KiB. The supplemental
 SHA-256 is `ff96dcbf...548d`.
 
+The matching frozen-log deep audit passes. Across heights 94,460–95,078,
+all 104 Rust slots match 104 ordered `5+5` commit lines with exact view stride
+and hash order; commit latency ranges from 53 to 85 ms and averages 67.7 ms.
+All 114 timeout events recover at the next view through Rust `5+5`, with zero
+pending. All 920 warnings are classified, unexpected and critical counts are
+zero, and the six frozen logs contain no error, panic, fatal, or equivocation
+signal.
+
 The primary interop branch is pushed at `97bd0d3ba006...`. The separate latest
 delivery branch is pushed at `3f06839e2e5f...`; its 905-data auditor and final
 completion verifier are byte-identical to the primary branch. The pinned
