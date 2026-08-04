@@ -59,19 +59,28 @@ assert_hash artifacts/scripts/gov5-current-total-goal-verifier.sh "$total" >/dev
 assert_hash geth-live "$gov_binary" >/dev/null
 assert_hash n42-node "$rust_binary" >/dev/null
 
-copied_manifest="$runtime/evidence/runtime28-copied-chain-data-manifest.json"
+copied_manifest_relative="$(jq -er \
+  '.copiedData.manifestPath // "evidence/runtime28-copied-chain-data-manifest.json"' \
+  "$baseline")"
+[[ "$copied_manifest_relative" != /* ]]
+[[ "/$copied_manifest_relative/" != *"/../"* ]]
+copied_manifest="$runtime/$copied_manifest_relative"
 copied_manifest_sha="$(jq -er '.copiedData.evidenceSha256' "$baseline")"
 copied_entries_sha="$(jq -er '.copiedData.entriesSha256' "$baseline")"
 test "$(sha256 "$copied_manifest")" = "$copied_manifest_sha"
 test "$(jq -er '.status' "$copied_manifest")" = PASS
 test "$(jq -er '.allPathsSizesAndHashesExact' "$copied_manifest")" = true
-test "$(jq -er '.recomputedEntriesSha256' "$copied_manifest")" = "$copied_entries_sha"
+test "$(jq -er \
+  '.recomputedEntriesSha256 //
+   (select(.sourceManifestSha256 == .targetManifestSha256) |
+    .targetManifestSha256)' "$copied_manifest")" = "$copied_entries_sha"
 
 temporary="$(mktemp "$runtime/evidence/.static-boundary.XXXXXX")"
 jq -nc \
   --arg at "$(date -u +%FT%TZ)" \
   --arg baseline "$(realpath "$baseline")" \
   --arg baseline_sha "$(sha256 "$baseline")" \
+  --arg copied_manifest_path "$copied_manifest_relative" \
   --arg copied_manifest_sha "$copied_manifest_sha" \
   --arg copied_entries_sha "$copied_entries_sha" \
   --arg genesis "$genesis" --arg consensus "$consensus" \
@@ -82,7 +91,8 @@ jq -nc \
   --slurpfile files "$static_rows" '
   {at:$at,event:"gov5_runtime_static_boundary_recheck",status:"PASS",
    mutationPerformed:false,baselineEvidence:$baseline,baselineEvidenceSha256:$baseline_sha,
-   copiedData:{manifestSha256:$copied_manifest_sha,entriesSha256:$copied_entries_sha,
+   copiedData:{manifestPath:$copied_manifest_path,
+     manifestSha256:$copied_manifest_sha,entriesSha256:$copied_entries_sha,
      originalCopyExact:true,runningDataRehashExcludedBecauseExpectedToAdvance:true},
    staticGov5Data:{filesChecked:($files|length),allCurrentHashesMatchInitialCopy:true,
      files:$files},

@@ -15,10 +15,14 @@ test -d "$runtime"
 git -C "$gov_repo" rev-parse --git-dir >/dev/null
 test -s "$static_baseline"
 
+runtime_number="$(basename "$(realpath "$runtime")" | sed -En \
+  's/^runtime-([0-9]+)(-|$).*/\1/p')"
+test -n "$runtime_number"
+
 harness="$runtime/artifacts/scripts/gov5-interop-qualification.sh"
 rechecker="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/recheck-gov5-runtime-static-boundary.sh"
 milestone="$runtime/evidence/gov5-906-$label-milestone.json"
-prefix="$runtime/evidence/runtime28-$label-closed"
+prefix="$runtime/evidence/runtime${runtime_number}-$label-closed"
 snapshot="$prefix-log-snapshot"
 leader="$prefix-leader-audit.jsonl"
 timeout="$prefix-timeout-audit.jsonl"
