@@ -1322,3 +1322,9 @@ Gov peer、`5+5` CommitQC 与零双签均精确，txindex 未启用且无需数�
 22 个 head 样本覆盖 636 秒、增长 66 块、最大 lag 0、全程零交易；三个同 PID
 资源样本覆盖 601 秒；两个 Gov main 样本覆盖 601 秒且均为 `57d5b0d293...`；
 Rust 已有 18 个 `5+5` leader commit，CommitQC 存在、equivocation 为 0。
+
+主互操作分支已推送到 `97bd0d3ba00609f3ba101651c9c9a639a6be79b6`。latest-delivery
+工作树保持独立于固定 qualification 组合，补齐恢复审计、Stage 3、最新 P2P 固定值
+和 runtime30 报告后推送到 `3f06839e2e5fa981997e6a022ffaa311301225f7`；两边当前
+905 数据审计与最终 completion verifier 脚本逐字节一致。固定
+`qualification/runtime28-combo-ab058` 仍停在 `ab058386...`，未被改写。

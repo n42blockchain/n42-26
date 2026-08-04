@@ -46,6 +46,11 @@ seconds / 66 blocks / maximum lag zero, three same-PID resource samples / 601
 seconds, two exact Gov5-main samples / 601 seconds, 18 Rust `5+5` commits,
 CommitQC present, and zero equivocations.
 
+The primary interop branch is pushed at `97bd0d3ba006...`. The separate latest
+delivery branch is pushed at `3f06839e2e5f...`; its 905-data auditor and final
+completion verifier are byte-identical to the primary branch. The pinned
+qualification combination remains untouched at `ab05838691e6...`.
+
 Runtime28 is now excluded. At `2026-08-03T23:50:41Z`, the independent guard
 observed Gov5 `main` advance from `b8c17d046...` to `8e1d27efb...`; all
 milestone and final verifiers failed closed, and all six nodes were cleanly
