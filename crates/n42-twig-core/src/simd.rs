@@ -688,7 +688,7 @@ mod x86 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::RngCore;
+    use rand::Rng;
 
     fn random_nodes(n: usize) -> Vec<Hash> {
         let mut rng = rand::rng();

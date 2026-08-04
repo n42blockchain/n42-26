@@ -21,15 +21,16 @@ GIT_COMMITTER_NAME="Nyxen" GIT_COMMITTER_EMAIL="40690755+MiraWells@users.noreply
 
 ### ⚠️ reth fork 基线（务必对齐，否则会触发依赖降级）
 
-**当前唯一正确基线：`../reth` @ `chore/reth-upstream-20260719`（reth 2.4.1，包含
-paradigmxyz/main `362979d5e8`，merge commit `8e84768246`）**，对应 workspace pin
-**revm 41.0.0 / alloy-evm 0.37.1 / reth-primitives-traits 0.5.2 / Alloy 2.2.0**。动手前先
-`git -C ../reth log -1 --oneline` 确认 reth 在 `8e84768246`（或其后代）。jit/revmc 默认关闭
+**当前唯一正确基线：`../reth` @ `chore/reth-upstream-20260804`（reth 2.4.1，包含
+paradigmxyz/main `92855d264`，merge commit `82debcaff`）**，对应 workspace pin
+**revm 42.0.1 / alloy-evm 0.38.0 / reth-primitives-traits 0.6.0 / Alloy 2.3.0**。动手前先
+`git -C ../reth log -1 --oneline` 确认 reth 在 `82debcaff`（或其后代）。jit/revmc 默认关闭
 （Windows 无 LLVM 22；Linux 要 JIT 用 `--features jit`）。**CI 已对齐**：所有 workflow
-checkout reth 的 `chore/reth-upstream-20260719`（见 `.github/workflows/*.yml`）。
+checkout reth 的 `chore/reth-upstream-20260804`（见 `.github/workflows/*.yml`）。
 适配要点：reth 2.4.1 删除 changed-path 跟踪并重构 sparse-trie proof target；N42 的
-payload-cache/state-root 定制必须保留 `HashedPostState` 路径。alloy-rpc-types-engine 2.0→2.1
-给 `PayloadAttributes` 加了 `target_gas_limit`（n42 设 `None`）。
+payload-cache/state-root 定制必须保留 `HashedPostState` 路径。20260804 合并起
+`BlobStore::insert` 收 `PooledBlobSidecar`（`BlobTransactionSidecarVariant` 加
+`.into()` 即以 full availability 包装）。
 
 **🔴 红线：切勿为了让旧 reth 编过而降级 `Cargo.toml` 的 revm/alloy/reth-* 版本。** 那会推翻
 deps upgrade 工作（参见 devlog-60 维护者说明），也正是历史上 CI 误用旧 ref（`n42-v2-upgrade`）
@@ -44,6 +45,7 @@ deps upgrade 工作（参见 devlog-60 维护者说明），也正是历史上 C
 | `chore/merge-upstream-fc2cc1e` | reth 2.3 @449ecfdce | revm 40.0.3 / alloy-evm 0.36.0 / reth-primitives-traits 0.4.1 |
 | `chore/merge-upstream-paradigmxyz-latest` | reth 2.3 @0655e7a9a | revm 41.0.0 / alloy-evm 0.37.0 / reth-primitives-traits 0.5.0 |
 | `chore/reth-upstream-20260714` | reth 2.3/2.4.0 @ccce351451 | revm 41.0.0 / alloy-evm 0.37.1 / reth-primitives-traits 0.5.2 |
+| `chore/reth-upstream-20260719` | reth 2.4.1 @8e84768246 | revm 41.0.0 / alloy-evm 0.37.1 / reth-primitives-traits 0.5.2 |
 
 ## 常用命令
 
