@@ -91,6 +91,13 @@ backward compatibility, so runtime30 output and failure paths are labeled
 unambiguously. Only these newly added read-only waiters were replaced during
 the naming correction; no node, formal monitor, finalizer, or timer restarted.
 
+The phase guardian now optionally supervises milestone waiters as well. Before
+their evidence exists it requires the exact PID and approved command; after a
+waiter exits it requires a `PASS` output, and any non-empty failure artifact is
+fatal. Runtime30 rearmed this guardian as PID 17470 with both three-hour deep
+waiters covered. Only the phase guardian changed PID; all six nodes, formal
+streams, finalizer, and the strict timer remained continuous.
+
 The primary interop branch is pushed at `97bd0d3ba006...`. The separate latest
 delivery branch is pushed at `3f06839e2e5f...`; its 905-data auditor and final
 completion verifier are byte-identical to the primary branch. The pinned

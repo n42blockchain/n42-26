@@ -12,6 +12,12 @@ rollover_pid="${N42_GUARD_ROLLOVER_PID:?rollover PID is required}"
 latest_verifier_pid="${N42_GUARD_LATEST_VERIFIER_PID:?latest verifier PID is required}"
 stable_monitor_pid="${N42_GUARD_STABLE_MONITOR_PID:?stable monitor PID is required}"
 caffeinate_pid="${N42_GUARD_CAFFEINATE_PID:?caffeinate PID is required}"
+milestone_supplemental_pid="${N42_GUARD_MILESTONE_SUPPLEMENTAL_PID:-}"
+milestone_supplemental_output="${N42_GUARD_MILESTONE_SUPPLEMENTAL_OUTPUT:-}"
+milestone_supplemental_failure="${N42_GUARD_MILESTONE_SUPPLEMENTAL_FAILURE:-}"
+milestone_producer_pid="${N42_GUARD_MILESTONE_PRODUCER_PID:-}"
+milestone_producer_output="${N42_GUARD_MILESTONE_PRODUCER_OUTPUT:-}"
+milestone_producer_failure="${N42_GUARD_MILESTONE_PRODUCER_FAILURE:-}"
 interval="${N42_GUARD_INTERVAL_SECONDS:-60}"
 once="${N42_GUARD_ONCE:-0}"
 
@@ -76,6 +82,23 @@ require_process_any() {
   fail "PID reuse or command mismatch pid=$pid expected one of: $* actual=$command"
 }
 
+require_process_or_pass() {
+  local pid="$1" expected="$2" output="$3" failure="$4" label="$5"
+  if test -z "$pid$output$failure"; then
+    return 0
+  fi
+  test -n "$pid" && test -n "$output" && test -n "$failure" ||
+    fail "incomplete optional waiter guard configuration label=$label"
+  test ! -s "$failure" ||
+    fail "optional waiter failure evidence is non-empty label=$label path=$failure"
+  if test -s "$output"; then
+    jq -e '.status=="PASS"' "$output" >/dev/null ||
+      fail "optional waiter output is not PASS label=$label path=$output"
+    return 0
+  fi
+  require_process "$pid" "$expected"
+}
+
 require_live_nodes() {
   local file pid command binary
   for file in "$runtime"/pids/gov{1,2,3,4,5}.pid; do
@@ -103,6 +126,14 @@ check_phase() {
   require_process "$caffeinate_pid" "caffeinate -dimsu -t"
   test ! -s "$strict_failures" || fail "strict finalizer failure evidence is non-empty"
   test ! -s "$latest_failures" || fail "latest-Reth failure evidence is non-empty"
+  require_process_or_pass "$milestone_supplemental_pid" \
+    "gov5-milestone-supplemental-audit-waiter.sh" \
+    "$milestone_supplemental_output" "$milestone_supplemental_failure" \
+    milestone-supplemental
+  require_process_or_pass "$milestone_producer_pid" \
+    "gov5-milestone-six-producer-waiter.sh" \
+    "$milestone_producer_output" "$milestone_producer_failure" \
+    milestone-six-producer
   remote="$(git -C "$gov_repo" ls-remote origin refs/heads/main |
     awk 'NR==1 {print $1}')"
   test "$remote" = "$expected_gov_main" ||
