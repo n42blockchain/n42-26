@@ -1308,3 +1308,17 @@ runtime29 使用逐文件完全相同的 126 文件 / 17,318,592,333 字节停�
 `e062a429647875300493d6e1329cc35825a660ca2bb77195d6d361f2f147cf3e`。
 runtime30 必须再次从 runtime28 冻结停止态复制数据，并在创世、92,605 复制边界、
 六端 live 身份、nonce 和最新上游门全部通过后从零启动严格 24 小时窗口。
+
+runtime30 已按该约束启动。复制清单为 126 文件 / 17,318,592,333 字节，源与目标
+记录 SHA-256 同为 `9bb438ab...e94`；Gov/Reth 二进制分别为 `e062a429...cf3e`、
+`0a4dbcf3...62b9f`。905/906 数据审计、current-main canary、completion auditor
+preflight、复制边界七高度复读和最终网络矩阵 preflight 全部 PASS：创世
+`b71c2810...92ec`、92,605 hash `b88a3571...5a82`、nonce `0x11`、五个认证
+Gov peer、`5+5` CommitQC 与零双签均精确，txindex 未启用且无需数据迁移/重生成。
+
+严格窗口从 `2026-08-04T00:27:48Z`、共同高度 94,459、lag 0、零交易开始；预计
+最早 24 小时边界为 `2026-08-05T00:27:48Z`。四条正式流和 fail-closed guardian
+均在运行，17 笔 burst 继续被 finalizer 锁定。10 分钟复合里程碑已严格 PASS：
+22 个 head 样本覆盖 636 秒、增长 66 块、最大 lag 0、全程零交易；三个同 PID
+资源样本覆盖 601 秒；两个 Gov main 样本覆盖 601 秒且均为 `57d5b0d293...`；
+Rust 已有 18 个 `5+5` leader commit，CommitQC 存在、equivocation 为 0。

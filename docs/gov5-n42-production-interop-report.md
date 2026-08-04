@@ -28,6 +28,24 @@ runtime28's frozen clean data; its strict 24-hour timer starts from zero only
 after the latest-main, genesis, copied-boundary, six-endpoint, and nonce gates
 all pass.
 
+Runtime30 is now the authoritative run. Its stopped-data copy contains 126
+files / 17,318,592,333 bytes with identical source and target record SHA-256
+`9bb438ab...e94`. The 905/906 compatibility audit, current-main canary,
+completion-auditor preflight, seven-height copied-boundary replay, and final
+network-matrix preflight all pass. Genesis is `b71c2810...92ec`, block 92,605
+is `b88a3571...5a82`, nonce is `0x11`, txindex remains disabled, all five Gov
+consensus peers are authenticated, Rust has `5+5` CommitQC, and equivocations
+are zero. No migration or regeneration is required.
+
+The strict zero-transaction window started at `2026-08-04T00:27:48Z`, common
+height 94,459 and lag zero; its earliest 24-hour boundary is
+`2026-08-05T00:27:48Z`. The head, resource, Gov5-main, and official-Reth
+streams plus a fail-closed guardian are live, and the 17-transaction burst
+remains locked. The ten-minute milestone passed with 22 head samples / 636
+seconds / 66 blocks / maximum lag zero, three same-PID resource samples / 601
+seconds, two exact Gov5-main samples / 601 seconds, 18 Rust `5+5` commits,
+CommitQC present, and zero equivocations.
+
 Runtime28 is now excluded. At `2026-08-03T23:50:41Z`, the independent guard
 observed Gov5 `main` advance from `b8c17d046...` to `8e1d27efb...`; all
 milestone and final verifiers failed closed, and all six nodes were cleanly
