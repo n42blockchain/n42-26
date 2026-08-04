@@ -51,7 +51,11 @@ jq -e -s --arg rust "$expected_rust_client" '
 remote_ports="$(lsof -nP -a -p "$rust_pid" -iTCP 2>/dev/null | sed -E -n \
   's#.*->127\.0\.0\.1:([0-9]+) \(ESTABLISHED\).*#\1#p' | sort -n | \
   jq -R 'tonumber' | jq -sc '.')"
-test "$(jq -c . <<<"$remote_ports")" = "$expected_remote_ports"
+unexpected_remote_ports="$(jq -nc --argjson observed "$remote_ports" \
+  --argjson expected "$expected_remote_ports" '$observed-$expected')"
+jq -e 'length==0' <<<"$unexpected_remote_ports" >/dev/null
+all_five_outbound_tcp="$(jq -nc --argjson observed "$remote_ports" \
+  --argjson expected "$expected_remote_ports" '$observed==$expected')"
 
 rg 'peer promoted to authenticated validator peer_id=.* validator_index=' \
   "$runtime/logs/rust.log" | sed -E -n \
@@ -107,7 +111,11 @@ jq -e -s --arg hash "$committed_hash" '
 temporary="$(mktemp "$(dirname "$output")/.network-matrix.XXXXXX")"
 jq -nc --arg at "$(date -u +%FT%TZ)" --arg label "$audit_label" \
   --argjson pid "$rust_pid" \
-  --argjson remote_ports "$remote_ports" --arg quorum_line "$quorum_line" \
+  --argjson remote_ports "$remote_ports" \
+  --argjson expected_remote_ports "$expected_remote_ports" \
+  --argjson unexpected_remote_ports "$unexpected_remote_ports" \
+  --argjson all_five_outbound_tcp "$all_five_outbound_tcp" \
+  --arg quorum_line "$quorum_line" \
   --argjson connected "$connected" --argjson needed "$needed" \
   --arg direct_line "$direct_line" --argjson direct "$direct" \
   --arg commit_line "$commit_line" --argjson commit_view "$commit_view" \
@@ -121,9 +129,14 @@ jq -nc --arg at "$(date -u +%FT%TZ)" --arg label "$audit_label" \
    executionPeerCountSemantics:{govDevp2pPeersEach:5,rustExecutionPeers:0,
      rustConsensusPeersCountedSeparately:true},
    rustConsensusSockets:{pid:$pid,establishedGovTcpRemotePorts:$remote_ports,
-     allFiveEstablished:true},
+     expectedGovTcpRemotePorts:$expected_remote_ports,
+     unexpectedEstablishedTcpRemotePorts:$unexpected_remote_ports,
+     allFiveEstablished:$all_five_outbound_tcp,
+     directionalObservationOnly:true},
    authenticatedValidatorPeers:$authenticated,
    authenticatedValidatorPeerCount:($authenticated|length),
+   authenticatedValidatorOverlayConnected:true,
+   transportDirectionAgnostic:true,
    quorumEvidence:{logLine:$quorum_line,connectedValidatorPeers:$connected,
      neededQuorumPeers:$needed},
    directPushEvidence:{logLine:$direct_line,directValidatorPeers:$direct},
@@ -134,7 +147,10 @@ jq -nc --arg at "$(date -u +%FT%TZ)" --arg label "$audit_label" \
    allChainIdsExact:true,govClientVersionsExact:true,rustClientVersionExact:true,
    consensusNetworkConnectedAndQuorate:true}' >"$temporary"
 jq -e '
-  .status=="PASS" and .rustConsensusSockets.allFiveEstablished and
+  .status=="PASS" and
+  (.rustConsensusSockets.unexpectedEstablishedTcpRemotePorts|length)==0 and
+  .rustConsensusSockets.directionalObservationOnly and
+  .authenticatedValidatorOverlayConnected and .transportDirectionAgnostic and
   .authenticatedValidatorPeerCount==5 and
   .quorumEvidence.connectedValidatorPeers==5 and
   .quorumEvidence.neededQuorumPeers==4 and

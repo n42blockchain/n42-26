@@ -1482,3 +1482,21 @@ interface，因 map 不可比较而在 reload 与事务 abort/recommit 路径 pa
 一致，SHA-256 为
 `de89a17768b8711b50820104f2e9f77b7dd8f03b689261bffa7eb9bd8b8b60f0`。候选已推送，
 下一 runtime32 仍须从 runtime28 冻结数据重新复制。
+
+---
+
+### T23 — runtime32 方向无关共识传输门（2026-08-04）
+
+runtime32 从冻结 runtime28 再次逐文件精确复制 126 文件 / 17,318,592,333 字节，
+源与目标记录 SHA-256 均为 `9bb438ab...e94`。current-main canary 与 905 数据审计
+已确认 Gov5 `39db96184...`、候选 `c3da82738...`、创世
+`b71c2810...92ec`、复制边界 92,605/`b88a3571...5a82`、nonce `0x11`、六端同块、
+txindex 缺席和无需数据重生成全部精确。
+
+网络预检发现连接方向是 Gov5 经 `/udp/19780/quic-v1` 主动连入 Rust；因此 Rust
+进程没有到 30301–30305 的主动 TCP socket。旧矩阵把这一随机连接方向误当作共识
+成立条件。审计现如实保留主动 TCP 观察值并拒绝任何未知 TCP 远端，但以五个唯一
+认证验证者、quorum 5/4、direct push 5、Rust `votes=5+5`、CommitQC、零双签和六端
+提交块身份精确作为方向无关硬门。runtime32 实测全部 PASS，且证据明确记录主动
+TCP 数为 0；没有伪造 socket，也没有降低共识接受标准。预检证据 SHA-256 为
+`b0f1dda2504fb656fe8188305dac91e5f8f778c2a7fa112b920c0928f0d37293`。

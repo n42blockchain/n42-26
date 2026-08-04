@@ -81,7 +81,9 @@ assert_matrix() {
   local matrix_file="$1"
   jq -e '
     .status=="PASS" and .mutationPerformed==false and
-    .rustConsensusSockets.allFiveEstablished and
+    (.rustConsensusSockets.unexpectedEstablishedTcpRemotePorts|length)==0 and
+    .rustConsensusSockets.directionalObservationOnly and
+    .authenticatedValidatorOverlayConnected and .transportDirectionAgnostic and
     .authenticatedValidatorPeerCount==5 and
     .quorumEvidence.connectedValidatorPeers==5 and
     .quorumEvidence.neededQuorumPeers==4 and

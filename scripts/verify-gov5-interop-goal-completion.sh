@@ -182,7 +182,10 @@ jq -e '
 jq -e '
   .status=="PASS" and .latestRethConsensusNetworkReestablished and
   .latestAndPendingNonce=="0x22" and .matrix.status=="PASS" and
-  .matrix.rustConsensusSockets.allFiveEstablished and
+  (.matrix.rustConsensusSockets.unexpectedEstablishedTcpRemotePorts|length)==0 and
+  .matrix.rustConsensusSockets.directionalObservationOnly and
+  .matrix.authenticatedValidatorOverlayConnected and
+  .matrix.transportDirectionAgnostic and
   .matrix.authenticatedValidatorPeerCount==5 and
   .matrix.quorumEvidence.connectedValidatorPeers==5 and
   .matrix.latestRustFivePlusFiveCommit.blockHash!=null and
