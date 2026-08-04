@@ -7,6 +7,7 @@ expected_finalizer_sha="${N42_QUAL_EXPECTED_FINALIZER_SHA:?expected finalizer SH
 harness="$runtime/artifacts/scripts/gov5-interop-qualification.sh"
 qmdb_proof_verifier="$runtime/artifacts/binaries/n42-qmdb-proof-verify"
 gov_version="${N42_QUAL_GOV_VERSION:-906}"
+keep_rust_session_after_success="${N42_QUAL_KEEP_RUST_SESSION_AFTER_SUCCESS:-0}"
 formal="$runtime/evidence/mixed-soak-24h.jsonl"
 burst_artifact="$runtime/artifacts/p4-signed-transaction-burst.json"
 burst_evidence="$runtime/evidence/p4-transaction-burst-$gov_version.jsonl"
@@ -50,6 +51,7 @@ expected_gov_candidate_sha="${N42_QUAL_EXPECTED_GOV_CANDIDATE_SHA:-d0999e7680bfb
 gov_repo="${N42_QUAL_GOV_REPO:-/Users/jieliu/Documents/n42/live-interop-20260721/N42-gov5-current-main-20260803}"
 
 mkdir -p "$runtime/evidence"
+[[ "$keep_rust_session_after_success" =~ ^[01]$ ]]
 
 on_error() {
   local status=$?
@@ -580,6 +582,7 @@ jq -nc \
   --arg final_rust_log_sha "$final_rust_log_sha" \
   --arg resource_sha "$(shasum -a 256 "$resource_evidence" | awk '{print $1}')" \
   --arg upstream_sha "$(shasum -a 256 "$upstream" | awk '{print $1}')" \
+  --argjson keep_rust_session "$keep_rust_session_after_success" \
   --slurpfile soak "$soak_audit" \
   --slurpfile upstream "$upstream_audit" \
   --slurpfile burst "$burst_evidence" \
@@ -620,7 +623,21 @@ jq -nc \
    immutableFinalLog:{path:$final_rust_log,sha256:$final_rust_log_sha},
    rustResourceAudit:$resources[-1],rustResourceEvidenceSha256:$resource_sha,
    postBurstExact:true,postRestartExact:true,archiveParityPostBurst:true,
+   postSuccessRustSessionKeeperEnabled:($keep_rust_session==1),
    zeroEquivocations:true}' >"$summary"
 
 test ! -s "$failures"
 cat "$summary"
+
+# Some execution hosts terminate all descendants when the top-level command
+# exits, even when the restarted node was launched through nohup. Keeping the
+# finalizer process alive preserves that process group after the controlled
+# Rust restart. Opt in for managed qualification sessions; ordinary callers
+# retain the historical exit-after-summary behavior.
+if test "$keep_rust_session_after_success" = 1; then
+  while :; do
+    test -s "$runtime/pids/rust.pid"
+    kill -0 "$(<"$runtime/pids/rust.pid")"
+    sleep 300
+  done
+fi
