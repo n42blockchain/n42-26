@@ -40,6 +40,7 @@ copied="$runtime/evidence/runtime35-stopped-copy-manifest.json"
 launch="$runtime/evidence/runtime35-rustsec-final-launch-manifest.json"
 static_v3="$runtime/evidence/runtime35-rustsec-final-static-boundary-v3.json"
 static_correction="$runtime/evidence/runtime35-rustsec-final-static-boundary-v2-correction.json"
+supervisor_correction="$runtime/evidence/runtime35-rustsec-final-pre-mutation-supervisor-correction.json"
 data_905="$runtime/evidence/runtime35-rustsec-final-905-data-compatibility.json"
 network="$runtime/evidence/runtime35-rustsec-final-network-consensus-matrix.json"
 output="${N42_TOTAL_OUTPUT:-$runtime/evidence/runtime35-rustsec-final-goal-completion.json}"
@@ -187,6 +188,15 @@ assert_static() {
     .v2MislabeledSha256==.runtime34TotalGoalFinalizerActualSha256 and
     .v3EvidenceSha256=="8ce579852659a4c696cc3f2131df6bc239f6caaede0ffc4aab67bb6e292dc37f"' \
     "$static_correction" >/dev/null
+  jq -e '.status=="PASS" and .acceptanceRelaxed==false and
+    .chainOrDataMutation==false and .transactionsSent==0 and
+    .rustRestartPerformed==false and .formalMonitorDuringCorrection.allOk==true and
+    .formalMonitorDuringCorrection.allZeroTxRequired==true and
+    .formalMonitorDuringCorrection.maximumLag==0 and
+    .formalMonitorDuringCorrection.maximumSampleGapSeconds<=31 and
+    .originalNodePidsUnchanged==true and .waitersRelaunched.total==15 and
+    .topLevelFailureEvidencePresent==false and .rawFormalEvidenceEdited==false and
+    .runningChainDataEdited==false' "$supervisor_correction" >/dev/null
   jq -e '.status=="PASS" and .genesisAndCopiedHeadSixEndpointExact==true and
     .liveSixEndpointIdentityExact==true and .dataRecopyOrRegenerationRequired==false' \
     "$data_905" >/dev/null
@@ -371,6 +381,7 @@ jq -nc --arg at "$(date -u +%FT%TZ)" --arg self "$expected_self_sha" \
   --arg independent_sha "$(sha256 "$independent")" \
   --arg producer_sha "$(sha256 "$producer")" \
   --arg static_sha "$(sha256 "$static_v3")" \
+  --arg supervisor_correction_sha "$(sha256 "$supervisor_correction")" \
   --arg copy_sha "$(sha256 "$copied")" \
   '{at:$at,event:"runtime35_rustsec_final_goal_completion",status:"PASS",
     acceptanceRelaxed:false,objectiveRequirementsExtendedClosure:true,
@@ -381,12 +392,14 @@ jq -nc --arg at "$(date -u +%FT%TZ)" --arg self "$expected_self_sha" \
     sixProducerRotationExact:true,transactionsFinalized:17,
     archiveAndQmdbParityExact:true,controlledRustRestartRejoined:true,
     postRestartStabilityExact:true,intermediateMilestonesExact:true,
-    staticDataAndToolsExact:true,zeroEquivocations:true,
+    staticDataAndToolsExact:true,preMutationToolingCorrectionAudited:true,
+    zeroEquivocations:true,
     officialRethStable:"v2.4.1",sourceAndRemotePinsExact:true,binariesExact:true,
     sources:{govMain:$gov_main,govCandidate:$gov_candidate,n42:$n42,reth:$reth,
       interopTooling:$interop,allPushed:true},
     evidenceSha256:{strictSummary:$strict_sha,independentVerification:$independent_sha,
       strict24hSixProducer:$producer_sha,staticBoundaryV3:$static_sha,
+      preMutationSupervisorCorrection:$supervisor_correction_sha,
       stoppedDataCopy:$copy_sha},noFailureEvidence:true}' >"$temporary"
 jq -e '.status=="PASS" and .strict24h.elapsedSeconds>=86400 and
   .strict24h.maximumLag<=1 and .transactionsFinalized==17 and
