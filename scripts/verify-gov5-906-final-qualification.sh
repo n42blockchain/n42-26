@@ -147,7 +147,7 @@ assert_pinned_inputs() {
   assert_sha "$runtime/artifacts/bootstrap-bundle.json" \
     35dda59684e7f56978e5d8de385fa2d2bf15b47747388b88a7449ac31387bf15
   assert_sha "$runtime/artifacts/scripts/gov5-interop-qualification.sh" \
-    037cc547eb958f0b993565b81aefe30b239e0ad061c27895e3287c6d23e95309
+    deca79a5a8f88f2d51f3c13f98e9258918480259365cf9abbafa8263164f9d4f
   assert_sha "$runtime/artifacts/scripts/gov5-current-qualification-finalizer.sh" \
     "$expected_finalizer_sha"
   assert_sha "$runtime/artifacts/binaries/n42-qmdb-proof-verify" \

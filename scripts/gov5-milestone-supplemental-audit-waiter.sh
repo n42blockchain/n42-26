@@ -24,7 +24,7 @@ output="$evidence_prefix-supplemental-audit.json"
 failure="$evidence_prefix-supplemental-audit-failure.json"
 harness="$runtime/artifacts/scripts/gov5-interop-qualification.sh"
 qmdb_verifier="$runtime/artifacts/binaries/n42-qmdb-proof-verify"
-expected_harness_sha="037cc547eb958f0b993565b81aefe30b239e0ad061c27895e3287c6d23e95309"
+expected_harness_sha="deca79a5a8f88f2d51f3c13f98e9258918480259365cf9abbafa8263164f9d4f"
 expected_qmdb_sha="b329baa1e51435082b2bb2cf538a8d1a1ffd994b5c4ac73474e688ffbfc35c19"
 
 [[ "$label" =~ ^[a-z0-9-]+$ ]]
