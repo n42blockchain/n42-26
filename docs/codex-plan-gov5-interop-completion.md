@@ -1262,3 +1262,29 @@ critical 均为零。冻结 Rust 日志、leader、timeout、runtime-log SHA-256
 补充的一小时 Gov5 进程基线确认五个原始 PID 均存活且运行超过一小时，共同高度
 93,091；RSS 为 140,016–141,920 KiB，线程 18–19，FD 均为 34，没有 Gov
 进程替换。证据 SHA-256 为 `df9227ed...1906`。
+
+---
+
+### T19 — Gov5 8e1d27 txindexer Stage 3 与 runtime29（2026-08-03）
+
+`2026-08-03T23:50:41Z` 独立检查发现 Gov5 `main` 已从 `b8c17d046...` 前进到
+`8e1d27efb...`。runtime28 的 milestone/final verifier 全部 fail-closed，六节点在
+`23:52:02Z` 干净停止。冻结正式流保留 548 个样本，覆盖 19:15:19Z–23:51:43Z、
+高度 92,695–94,423、增长 1,728 块，最大 lag 1、bad row 0、发送交易 0；不得与
+新窗口拼接。绑定七个原始失败及三条正式流的排除记录 SHA-256 为
+`ee94f9fb...03db`。
+
+新上游将 txindex tail Stage 3 接入 node，但仅在 `N42_TXINDEX_TAIL=1` 时启用，
+并在共识 MDBX transaction 完成后接收 hash。未设置变量时仍使用旧 TxLookup 路径，
+不会创建 `txindex` 目录或 range 文件。因此停止态 905 血统数据需要复制到新 runtime
+以保持证据隔离，但不需要格式迁移或重新生成。905 审计工具已改为同时证明 node 接线、
+opt-in 关闭、进程环境无该变量及磁盘索引不存在；最终目标工具也更新到新固定值。
+
+候选 `7c777432536aa7507ba3a265b71a8cd935935ef9` 已推送并包含
+`8e1d27efb7380a3a43702bd84c78283373ccc408`；另对上游八个未格式化 Go 文件执行
+纯机械 gofmt。首次全仓测试仅有主机争用下的 sender-recovery 性能断言 0.97x；该
+测试随后独立连续五次以 1.91x–2.03x PASS，第二次 `go test ./...` 全量 PASS，完整
+`go test -race ./...` PASS。两个独立冷 GOCACHE 生产构建逐字节一致，新 Gov binary
+SHA-256 为 `b3e4288f6615803f1bb2d3af079bcdd879ea7b1df23426288ce9a83eb8967c1b`。
+runtime29 将从 runtime28 干净停止数据复制，使用官方稳定 Reth 2.4.1，并在全部
+创世/复制边界/六端同头/nonce 门通过后从零启动新的严格 24 小时计时。

@@ -9,7 +9,9 @@ expected_nonce="${5:-0x11}"
 expected_genesis="0xb71c28109836f120453d097c38819a55b14c49abcc92713037fb9b11201392ec"
 expected_copied_head=92605
 expected_copied_hash="0xb88a3571223cf8cd8291d608572a55f306ea88957cc7ede8ab6b8812ada85a82"
-expected_builder_commit="337cea43c4338ef708bcf974f7bdecce9d41600e"
+expected_builder_commit="8e1d27efb7380a3a43702bd84c78283373ccc408"
+expected_tail_commit="b8c17d04614346bace2fbb5c05393bdaf454cf5a"
+expected_integration_commit="8e1d27efb7380a3a43702bd84c78283373ccc408"
 ports=(28501 28502 28503 28504 28505 29545)
 
 test -d "$runtime"
@@ -51,16 +53,21 @@ builder_commit="$(git -C "$gov_repo" log -1 --format=%H "$expected_main" -- \
 tail_commit="$(git -C "$gov_repo" log -1 --format=%H "$expected_main" -- \
   internal/txlookup/tail.go)"
 test "$builder_commit" = "$expected_builder_commit"
-test "$tail_commit" = "$expected_main"
+test "$tail_commit" = "$expected_tail_commit"
 
-# Both additions are still groundwork at this pinned main. If either is wired
-# outside its own implementation/tests, the old 905 data expectation must be
-# revisited instead of silently accepting a newly created on-disk index.
-test -z "$(git -C "$gov_repo" grep -n 'NewTail()' "$expected_main" -- '*.go' \
-  ':!internal/txlookup/tail.go' ':!internal/txlookup/tail_test.go' || true)"
-test -z "$(git -C "$gov_repo" grep -n 'BuildSegmentFromSource(' "$expected_main" -- \
-  '*.go' ':!internal/txlookup/source_builder.go' \
-  ':!internal/txlookup/source_builder_test.go' ':!internal/txlookup/tail_test.go' || true)"
+# Stage 3 wires the tail into the node, but only behind an explicit opt-in.
+# The Add call happens after CommitToCanonical's MDBX transaction, so this tier
+# remains off the consensus write path. Running 905-lineage data is accepted
+# only when every Gov process leaves the opt-in absent and no index files were
+# materialized.
+integration_commit="$(git -C "$gov_repo" log -1 --format=%H "$expected_main" -- \
+  internal/txindexer/indexer.go internal/node/node.go internal/blockchain.go)"
+test "$integration_commit" = "$expected_integration_commit"
+git -C "$gov_repo" grep -q 'N42_TXINDEX_TAIL' "$expected_main" -- \
+  internal/txindexer/indexer.go
+git -C "$gov_repo" grep -q 'txindexer.New' "$expected_main" -- internal/node/node.go
+git -C "$gov_repo" grep -q 'bc.txIndexer.Add' "$expected_main" -- \
+  internal/blockchain.go
 
 for node in 1 2 3 4 5; do
   pid_file="$runtime/pids/gov${node}.pid"
@@ -69,7 +76,10 @@ for node in 1 2 3 4 5; do
   test -s "$pid_file"
   pid="$(<"$pid_file")"
   kill -0 "$pid"
+  test -z "$(ps eww -p "$pid" -o command= | \
+    rg '(^| )N42_TXINDEX_TAIL=' || true)"
   test -s "$mdbx"
+  test ! -e "$datadir/txindex"
   ranges_count="$(find "$datadir" -type f -name txindex.ranges -print | wc -l | \
     tr -d ' ')"
   test "$ranges_count" = 0
@@ -81,6 +91,7 @@ for node in 1 2 3 4 5; do
     --argjson ranges_count "$ranges_count" \
     '{node:$node,pid:$pid,datadir:$datadir,mdbxBytes:$mdbx_bytes,
       mdbxAllocatedKiB:$mdbx_allocated_kib,txindexRangesFiles:$ranges_count,
+      txindexTailEnvironmentPresent:false,txindexDirectoryPresent:false,
       processAlive:true,chaindataPresent:true}' >>"$node_rows"
 done
 
@@ -134,12 +145,16 @@ test "$latest_exact" = true
 temporary="$(mktemp "$(dirname "$output")/.905-data-compat.XXXXXX")"
 jq -nc --arg at "$(date -u +%FT%TZ)" --arg expected_main "$expected_main" \
   --arg remote_main "$remote_main" --arg builder_commit "$builder_commit" \
-  --arg tail_commit "$tail_commit" --arg expected_nonce "$expected_nonce" \
+  --arg tail_commit "$tail_commit" --arg integration_commit "$integration_commit" \
+  --arg expected_nonce "$expected_nonce" \
   --argjson latest "$latest_identity" --slurpfile nodes "$node_rows" \
   --slurpfile rpc "$rpc_rows" '
   {at:$at,event:"gov5_905_data_compatibility_audit",status:"PASS",
    mutationPerformed:false,expectedMain:$expected_main,remoteMain:$remote_main,
    source:{variableSegmentBuilderCommit:$builder_commit,tailCommit:$tail_commit,
+     nodeIntegrationCommit:$integration_commit,nodeIntegrationPresent:true,
+     activationEnvironment:"N42_TXINDEX_TAIL",activationOptIn:true,
+     activationAbsentInAllRunningGovProcesses:true,runtimeTailEnabled:false,
      variableSegmentsWiredToConsensus:false,inMemoryTailWiredToConsensus:false,
      txindexRangesExpectedInRunning905Data:false},nodes:$nodes,rpcEndpoints:$rpc,
    copiedPersistedHead:92605,latestSixEndpointIdentity:$latest,
@@ -148,6 +163,9 @@ jq -nc --arg at "$(date -u +%FT%TZ)" --arg expected_main "$expected_main" \
    genesisAndCopiedHeadSixEndpointExact:true,liveSixEndpointIdentityExact:true,
    dataRecopyOrRegenerationRequired:false}' >"$temporary"
 jq -e '.status=="PASS" and .mutationPerformed==false and
+  .source.nodeIntegrationPresent and .source.activationOptIn and
+  .source.activationAbsentInAllRunningGovProcesses and
+  .source.runtimeTailEnabled==false and
   .source.variableSegmentsWiredToConsensus==false and
   .source.inMemoryTailWiredToConsensus==false and
   .allFiveTxindexRangesAbsent and .genesisAndCopiedHeadSixEndpointExact and
