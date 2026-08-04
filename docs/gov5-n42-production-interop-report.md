@@ -118,6 +118,15 @@ exact archive/QMDB checks, and a 24-hour RSS projection of 600,697 KiB. Its
 composite SHA-256 is `8ad2a6b5...52ec`; the mislabeled v1 is preserved but not
 credited.
 
+The strict 90-minute checkpoint passes as well: 180 head samples span 5,428
+seconds and grow 564 blocks, with a 31-second maximum gap, maximum lag one,
+and zero transactions. Ten Gov5-main and ten official-Reth-stable samples are
+exact; Rust records 100 `5+5` commits and no equivocation. Heights
+94,988–95,023 add six complete rotations, with all six producers authoring six
+blocks each and every endpoint sequence exact. Archive/QMDB, network, copied
+905 data, and resource-trend checks all pass again; projected 24-hour RSS falls
+to 548,030 KiB. The supplemental SHA-256 is `9226886e...00aa`.
+
 The primary interop branch is pushed at `97bd0d3ba006...`. The separate latest
 delivery branch is pushed at `3f06839e2e5f...`; its 905-data auditor and final
 completion verifier are byte-identical to the primary branch. The pinned

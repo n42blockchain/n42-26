@@ -1383,3 +1383,10 @@ finalizer 和计时均连续。
 再次 PASS：5/5 认证 Gov peer、quorum 5/4、direct push 5、905 复制高度
 92,605、nonce `0x11`、txindex 缺席、QMDB/归档精确，24 小时 RSS 投影
 600,697 KiB。综合证据 SHA-256 为 `8ad2a6b5...52ec`。
+
+90 分钟检查点同样严格 PASS：180 个 head 样本覆盖 5,428 秒、增长 564 块、
+最大 gap 31 秒、lag 1、零交易；10 次 Gov main 和 10 次官方 Reth stable 采样
+精确，Rust `5+5` commit 100 次、双签 0。80–90 分钟的 94,988–95,023 共
+36 块再次形成 6 个完整轮次，六生产者各 6 块。归档/QMDB、网络、905 数据与
+资源趋势全套复验再次 PASS，24 小时 RSS 投影降至 548,030 KiB；复合证据
+SHA-256 为 `9226886e...00aa`。
