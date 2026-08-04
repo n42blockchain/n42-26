@@ -127,6 +127,15 @@ blocks each and every endpoint sequence exact. Archive/QMDB, network, copied
 905 data, and resource-trend checks all pass again; projected 24-hour RSS falls
 to 548,030 KiB. The supplemental SHA-256 is `9226886e...00aa`.
 
+At 100 minutes the strict stream still passes: 200 head samples span 6,034
+seconds and grow 624 blocks, with a 31-second maximum gap, maximum lag one,
+and no transaction. Eleven Gov5-main samples are exact; Rust has 111 `5+5`
+commits and zero equivocation. Heights 95,024–95,083 form ten complete
+rotations, with each producer authoring ten blocks and all six endpoint
+sequences exact. Archive/QMDB, network, copied-905 data, and resource trends
+all pass again; projected 24-hour RSS is 569,312 KiB. The supplemental
+SHA-256 is `ff96dcbf...548d`.
+
 The primary interop branch is pushed at `97bd0d3ba006...`. The separate latest
 delivery branch is pushed at `3f06839e2e5f...`; its 905-data auditor and final
 completion verifier are byte-identical to the primary branch. The pinned
