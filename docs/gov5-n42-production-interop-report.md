@@ -46,6 +46,13 @@ seconds / 66 blocks / maximum lag zero, three same-PID resource samples / 601
 seconds, two exact Gov5-main samples / 601 seconds, 18 Rust `5+5` commits,
 CommitQC present, and zero equivocations.
 
+The matching producer audit scans canonical heights 94,460–94,525: Rust and
+Gov1–Gov5 each author exactly 11 of 66 continuous zero-transaction blocks,
+and all six raw endpoint sequences have SHA-256 `ec8fb349...e8c47`. A frozen
+Rust-log audit matches all 11 Rust blocks to ordered `5+5` commits, proves all
+23 timeouts recover at the next view with none pending, and partitions all 188
+warnings with zero unexpected or critical signals.
+
 The primary interop branch is pushed at `97bd0d3ba006...`. The separate latest
 delivery branch is pushed at `3f06839e2e5f...`; its 905-data auditor and final
 completion verifier are byte-identical to the primary branch. The pinned
