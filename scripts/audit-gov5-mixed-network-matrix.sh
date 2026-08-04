@@ -3,7 +3,7 @@ set -euo pipefail
 
 runtime="${1:?usage: $0 RUNTIME OUTPUT}"
 output="${2:?usage: $0 RUNTIME OUTPUT}"
-expected_rust_client="${N42_NETWORK_EXPECTED_RUST_CLIENT:-reth/v2.4.1-91725e3/aarch64-apple-darwin}"
+expected_rust_client="${N42_NETWORK_EXPECTED_RUST_CLIENT:-reth/v2.4.1-0fc810b/aarch64-apple-darwin}"
 audit_label="${N42_NETWORK_AUDIT_LABEL:-}"
 ports=(28501 28502 28503 28504 28505 29545)
 expected_remote_ports='[30301,30302,30303,30304,30305]'
