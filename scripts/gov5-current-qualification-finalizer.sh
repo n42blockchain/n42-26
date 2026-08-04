@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-runtime="${N42_QUAL_RUNTIME:-/Users/jieliu/Documents/n42/live-interop-20260721/runtime-27-gov5-d122-latest-reth}"
+runtime="${N42_QUAL_RUNTIME:-/Users/jieliu/Documents/n42/live-interop-20260721/runtime-35-gov5-906-rustsec-final}"
 finalizer_script="${BASH_SOURCE[0]}"
 expected_finalizer_sha="${N42_QUAL_EXPECTED_FINALIZER_SHA:?expected finalizer SHA-256 required}"
 harness="$runtime/artifacts/scripts/gov5-interop-qualification.sh"
@@ -39,15 +39,15 @@ expected_genesis="0xb71c28109836f120453d097c38819a55b14c49abcc92713037fb9b112013
 expected_genesis_artifact_sha="561808693c76b356e51f8f5961304e68f3167943c17145bda056612041dca687"
 expected_consensus_config_sha="38cd3fb1f57e5e3053e23de836b7c98e542ccb5375d0521a65b5c2f6175bd8bf"
 expected_bootstrap_bundle_sha="35dda59684e7f56978e5d8de385fa2d2bf15b47747388b88a7449ac31387bf15"
-expected_harness_sha="deca79a5a8f88f2d51f3c13f98e9258918480259365cf9abbafa8263164f9d4f"
+expected_harness_sha="aa906f42b83048cb4168e1ceb1077d1ca8b27429be5189acd1aaa74f06c551e9"
 expected_qmdb_verifier_sha="b329baa1e51435082b2bb2cf538a8d1a1ffd994b5c4ac73474e688ffbfc35c19"
-expected_gov_sha="${N42_QUAL_EXPECTED_GOV_SHA:-72e918d9500169e227ef1a0c9d5dd751dcd7d58f1df0871825b61f196e3fce95}"
-expected_rust_sha="${N42_QUAL_EXPECTED_RUST_SHA:-0a4dbcf30d7cc9944a7cd7c96a25c1ebf862df10bde76210a381ef492e362b9f}"
+expected_gov_sha="${N42_QUAL_EXPECTED_GOV_SHA:-e08c1ea7aac198e268d7fb07eacce33347798c90f33532ffc4cd85bfc1af7033}"
+expected_rust_sha="${N42_QUAL_EXPECTED_RUST_SHA:-d639f712a87c22c2a45de29dbd895897058a8a28e4a2145061bd195d79eb6d2e}"
 frozen_validator_key_dir="$runtime/artifacts/validator-keys/node0"
 expected_validator_key_sha="babd0b3550da7702230d3da9a3f00bfce741ed9f1fb8210b702c6023080ea509"
 expected_p2p_key_sha="d82561e312fbb044f56eec5f434f03ea1e852924f055a8949ea82be9e7bbe277"
-expected_gov_upstream_sha="${N42_QUAL_EXPECTED_GOV_UPSTREAM_SHA:-d12257c92e9b1e83d35c981441593663db6db72b}"
-expected_gov_candidate_sha="${N42_QUAL_EXPECTED_GOV_CANDIDATE_SHA:-d0999e7680bfbba71c252de1dd95efe64736e5f9}"
+expected_gov_upstream_sha="${N42_QUAL_EXPECTED_GOV_UPSTREAM_SHA:-75dab6e5d1bc6aefa213f4f0f7dcc972dd04f89d}"
+expected_gov_candidate_sha="${N42_QUAL_EXPECTED_GOV_CANDIDATE_SHA:-23533225648c62440c6112f88dfdb64b5f55f3f1}"
 gov_repo="${N42_QUAL_GOV_REPO:-/Users/jieliu/Documents/n42/live-interop-20260721/N42-gov5-current-main-20260803}"
 
 mkdir -p "$runtime/evidence"
