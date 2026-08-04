@@ -172,6 +172,17 @@ or critical signals, and all six frozen logs are free of error, panic, fatal,
 or equivocation signals. The V2 checkpoint binds both composites at SHA-256
 `294c10490317360394ca6592ad8a6cac261bd664c67ebaae71d7076fdff766ba`.
 
+The 150-minute composite checkpoint also passes. Its 298 head samples span
+9,005 seconds and grow 930 blocks from 94,459 to 95,389 with maximum lag one
+and no transaction. The original Rust PID remains within limits across 31
+resource samples; peak RSS is 269,952 KiB and its 24-hour projection is
+508,786 KiB. Sixteen Gov5-main samples are exact, Rust has 161 `5+5` commits,
+and equivocations remain zero. The full-range producer audit covers 930 blocks
+and 155 complete rotations, with all six producers authoring exactly 155
+blocks and all endpoint sequences sharing SHA-256 `b353073b...c26e`.
+Archive/QMDB, network, copied-905, and resource-trend audits all pass again;
+the cross-hashed checkpoint SHA-256 is `25cd0cacb2e5ec23ab5c003d24b95ab32d51c60e98e8763a0370ac0dc449f80a`.
+
 The primary interop branch is pushed at `97bd0d3ba006...`. The separate latest
 delivery branch is pushed at `3f06839e2e5f...`; its 905-data auditor and final
 completion verifier are byte-identical to the primary branch. The pinned
