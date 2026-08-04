@@ -578,6 +578,13 @@ zero equivocations, and exact six-endpoint committed-block identity. This keeps
 the acceptance criteria transport-direction independent without weakening the
 consensus evidence.
 
+Runtime32 confirms the corrected gate over a fresh 905-lineage copy. Its first
+formal ten-minute window covers 66 consecutive zero-transaction blocks and 11
+complete rotations; Rust and Gov1–Gov5 each produce exactly 11 blocks, with an
+identical six-endpoint sequence hash. The same checkpoint re-runs archive/QMDB
+parity, the authenticated consensus matrix, copied-height/genesis checks, and
+resource projection successfully while the strict 24-hour window continues.
+
 That checker is now part of a separate final post-rollover gate. Pushed commit
 `3093cc7f...8c5f` adds a frozen verifier that waits for the atomic total-goal
 PASS (including the additional latest-Reth hour), then dynamically binds the
