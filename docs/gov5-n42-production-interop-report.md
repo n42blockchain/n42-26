@@ -10,7 +10,33 @@ are stored in the qualification runtimes named below.
 
 ## Current 2026-08-03 qualification — latest Gov5 main and latest stable Reth
 
-The authoritative run is now
+Runtime28 is now excluded. At `2026-08-03T23:50:41Z`, the independent guard
+observed Gov5 `main` advance from `b8c17d046...` to `8e1d27efb...`; all
+milestone and final verifiers failed closed, and all six nodes were cleanly
+stopped by `23:52:02Z`. Its formal stream retains 548 samples from
+`19:15:19Z` through `23:51:43Z`, 92,695–94,423 / 1,728 blocks, maximum lag
+one, zero bad rows, and zero transactions. It cannot be joined to a later
+window. The exclusion record binds seven original failure files and all three
+formal streams at SHA-256 `ee94f9fb...03db`.
+
+The replacement pushed candidate is `7c777432536a...`, merging the interop
+line with `8e1d27efb...` and applying `gofmt` to eight malformed upstream Go
+files. Stage 3 now integrates the txindex tail with the node, but it remains
+explicitly opt-in behind `N42_TXINDEX_TAIL=1` and runs after the consensus MDBX
+transaction. With that variable absent, the old TxLookup path remains active,
+no `txindex` directory/range file is created, and the stopped 905-lineage data
+requires a fresh runtime copy but no format migration or regeneration. The
+first all-package test run exposed only a host-contention performance
+assertion; that test then passed five times at 1.91–2.03x, and a second full
+run passed. The complete race suite passed, and two independent cold-cache
+production builds are byte-identical at SHA-256 `b3e4288f...7c1b`.
+
+The next authoritative run will be a new runtime29 cloned from runtime28's
+cleanly stopped data and started with official stable Reth 2.4.1. Its strict
+24-hour timer must begin from zero after the new candidate, data, genesis,
+copied boundary, live six-endpoint identity, and transaction nonce all pass.
+
+The previous authoritative run was
 `runtime-28-gov5-b8c-latest-reth`. Gov5 main advanced during runtime27's
 ninth hour from `d12257c92...` to
 `b8c17d04614346bace2fbb5c05393bdaf454cf5a`; the strict upstream guard failed
