@@ -710,11 +710,14 @@ impl ConsensusService {
     }
 
     async fn retire_h2_v4_fetch_satisfied_elsewhere(&mut self, block_hash: B256) {
-        let tracked = self.h2_v4_fetch_requested_at.remove(&block_hash);
+        self.h2_v4_fetch_requested_at.remove(&block_hash);
         self.h2_v4_fetch_failed_peers.remove(&block_hash);
-        if tracked.is_none() {
-            return;
-        }
+        // The observer and participant orchestrators share one network
+        // service, but intentionally keep independent ancestry trackers. A
+        // body delivered to this orchestrator can therefore satisfy a fetch
+        // started by the other one. Always retire the network-layer hash;
+        // conditioning this command on the local tracker leaves that shared
+        // request alive until its transport deadline.
         if let Err(error) = self
             .network
             .cancel_gov5_block_fetch_reliable(block_hash)
@@ -5323,6 +5326,25 @@ mod tests {
         assert!(!orch.h2_v4_fetch_requested_at.contains_key(&block_hash));
         assert!(matches!(
             prx.try_recv().expect("cross-path cancellation command"),
+            NetworkCommand::CancelGov5BlockFetch { block_hash: hash }
+                if hash == block_hash
+        ));
+    }
+
+    #[tokio::test]
+    async fn direct_block_data_retires_fetch_owned_by_other_consumer() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, mut prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
+        let block_hash = B256::repeat_byte(0xa7);
+
+        assert!(!orch.h2_v4_fetch_requested_at.contains_key(&block_hash));
+        orch.handle_block_data(test_block_data(B256::ZERO, block_hash, 1))
+            .await;
+
+        assert!(matches!(
+            prx.try_recv().expect("shared fetch cancellation command"),
             NetworkCommand::CancelGov5BlockFetch { block_hash: hash }
                 if hash == block_hash
         ));

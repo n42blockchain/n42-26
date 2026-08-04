@@ -51,6 +51,7 @@ const MAX_PENDING_GOV5_BLOCK_REQUESTS: usize = 256;
 // deadline instead of eagerly duplicating every request.
 const MAX_GOV5_BLOCK_FETCH_FANOUT: usize = 1;
 const MAX_RECENT_GOV5_BLOCK_REQUESTS: usize = 4096;
+const GOV5_BLOCK_FULFILLED_RETENTION: Duration = Duration::from_secs(30);
 const GOV5_BLOCK_REQUEST_COOLDOWN: Duration = Duration::from_millis(750);
 // Re-arm before the orchestrator's two-second retry. Late transport responses
 // are redundant and safely ignored after their request id is reaped.
@@ -70,6 +71,41 @@ fn stale_gov5_block_fetches(
                 .then_some(*hash)
         })
         .collect()
+}
+
+fn gov5_block_fulfilled_recently(
+    fulfilled: &mut HashMap<B256, Instant>,
+    block_hash: B256,
+    now: Instant,
+) -> bool {
+    if fulfilled.get(&block_hash).is_some_and(|fulfilled_at| {
+        now.saturating_duration_since(*fulfilled_at) < GOV5_BLOCK_FULFILLED_RETENTION
+    }) {
+        return true;
+    }
+    fulfilled.remove(&block_hash);
+    false
+}
+
+fn remember_gov5_block_fulfilled(
+    fulfilled: &mut HashMap<B256, Instant>,
+    block_hash: B256,
+    now: Instant,
+) {
+    if fulfilled.len() >= MAX_RECENT_GOV5_BLOCK_REQUESTS {
+        fulfilled.retain(|_, fulfilled_at| {
+            now.saturating_duration_since(*fulfilled_at) < GOV5_BLOCK_FULFILLED_RETENTION
+        });
+    }
+    if fulfilled.len() >= MAX_RECENT_GOV5_BLOCK_REQUESTS
+        && let Some(oldest) = fulfilled
+            .iter()
+            .min_by_key(|(_, fulfilled_at)| *fulfilled_at)
+            .map(|(hash, _)| *hash)
+    {
+        fulfilled.remove(&oldest);
+    }
+    fulfilled.insert(block_hash, now);
 }
 
 fn gov5_block_fetch_fanout(
@@ -707,6 +743,11 @@ pub struct NetworkService {
     pending_gov5_block_hashes: HashSet<B256>,
     /// Last attempt and peer per hash, used for bounded retry and peer rotation.
     recent_gov5_block_requests: HashMap<B256, (Instant, PeerId)>,
+    /// Short tombstones for bodies already delivered through any authenticated
+    /// path. The observer and participant can enqueue request/cancel commands
+    /// concurrently; retaining fulfillment closes the cancel-before-request
+    /// ordering without making historical hashes permanent.
+    recent_gov5_block_fulfilled: HashMap<B256, Instant>,
     /// Peers that advertised the native Gov5 block-by-hash protocol.
     gov5_block_by_hash_peers: HashSet<PeerId>,
     /// Peers that advertised N42's native state-sync protocol. Gov5 peers do
@@ -1027,6 +1068,7 @@ impl NetworkService {
             pending_gov5_block_requests: HashMap::new(),
             pending_gov5_block_hashes: HashSet::new(),
             recent_gov5_block_requests: HashMap::new(),
+            recent_gov5_block_fulfilled: HashMap::new(),
             gov5_block_by_hash_peers: HashSet::new(),
             state_sync_peers: HashSet::new(),
             gov5_served_blocks: HashMap::new(),
@@ -2240,6 +2282,11 @@ impl NetworkService {
                 // makes the overflow cleanup scan thousands of entries on
                 // every step of a long reverse ancestry.
                 self.recent_gov5_block_requests.remove(&requested_hash);
+                remember_gov5_block_fulfilled(
+                    &mut self.recent_gov5_block_fulfilled,
+                    requested_hash,
+                    Instant::now(),
+                );
                 metrics::counter!("n42_gov5_block_fetch_succeeded_total").increment(1);
                 self.emit_event(NetworkEvent::Gov5BlockFetched {
                     source: peer,
@@ -2724,6 +2771,18 @@ impl NetworkService {
             }
             NetworkCommand::RequestGov5BlockByHash { peer, block_hash } => {
                 let now = Instant::now();
+                if gov5_block_fulfilled_recently(
+                    &mut self.recent_gov5_block_fulfilled,
+                    block_hash,
+                    now,
+                ) {
+                    metrics::counter!(
+                        "n42_gov5_block_fetch_suppressed_total",
+                        "reason" => "already_fulfilled"
+                    )
+                    .increment(1);
+                    return;
+                }
                 // Hash de-duplication must not outlive the transport request
                 // that created it. In live catch-up a request could lose
                 // every terminal swarm event, leaving the orchestrator's
@@ -2834,6 +2893,11 @@ impl NetworkService {
                 let reaped = requests_before - self.pending_gov5_block_requests.len();
                 let pending = self.pending_gov5_block_hashes.remove(&block_hash);
                 let recent = self.recent_gov5_block_requests.remove(&block_hash);
+                remember_gov5_block_fulfilled(
+                    &mut self.recent_gov5_block_fulfilled,
+                    block_hash,
+                    Instant::now(),
+                );
                 if reaped > 0 || pending || recent.is_some() {
                     metrics::counter!("n42_gov5_block_fetch_cross_path_retired_total").increment(1);
                     tracing::debug!(
@@ -3007,6 +3071,26 @@ mod tests {
             } => assert_eq!(received, block_hash),
             other => panic!("expected CancelGov5BlockFetch, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn fulfilled_gov5_block_suppresses_reordered_request_until_expiry() {
+        let block_hash = B256::repeat_byte(0x43);
+        let started = Instant::now();
+        let mut fulfilled = HashMap::new();
+        remember_gov5_block_fulfilled(&mut fulfilled, block_hash, started);
+
+        assert!(gov5_block_fulfilled_recently(
+            &mut fulfilled,
+            block_hash,
+            started + Duration::from_secs(29)
+        ));
+        assert!(!gov5_block_fulfilled_recently(
+            &mut fulfilled,
+            block_hash,
+            started + Duration::from_secs(31)
+        ));
+        assert!(!fulfilled.contains_key(&block_hash));
     }
 
     #[test]
