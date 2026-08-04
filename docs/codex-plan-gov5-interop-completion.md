@@ -1343,3 +1343,16 @@ warning 全量归类，unexpected/critical 均为 0。leader、timeout、runtime
 未修改正式证据；原失败已隔离且不计入资格。guardian 现兼容 direct/waiter 两种受控
 命令，独立预检 PASS，并以 PID 51358、60 秒间隔重新挂载。重挂载时六端在高度
 94,591 精确一致，Gov5 main 与官方 Reth binary pin 均保持不变，严格窗口不重置。
+
+1 小时复合里程碑已严格 PASS：121 个 head 样本覆盖 3,637 秒，高度
+94,459–94,837，增长 378 块，最大 gap 31 秒、lag 0、零交易；13 个同 PID
+Rust 资源样本覆盖 3,602 秒，RSS 峰值 253,808 KiB，24 小时投影
+669,013 KiB，线程 161、FD 93；7 次 Gov main 采样全部精确匹配。
+
+整小时六生产者审计扫描 94,460–94,837 共 378 个连续块和 63 个完整
+轮次：Rust 与 Gov1–Gov5 各精确生产 63 块，六端 raw 序列 SHA-256 均为
+`b4a6c425...e00b9`，父链、槽位和零交易均精确。同一只读检查还再次
+确认 5/5 Gov 认证连接、quorum 5/4、direct push 5、905 复制高度 92,605、
+nonce `0x11`、txindex 缺席且无需重复制/重生成，以及 QMDB 当前两证明和
+11 个历史检查全部 Gov/Rust 精确。复合证据 SHA-256 为
+`90e2d2f3...7469`。
