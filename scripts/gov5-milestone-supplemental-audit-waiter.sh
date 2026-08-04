@@ -124,7 +124,10 @@ jq -e -s '
     .qmdbProofRootExact and .qmdbProofOfflineVerified))|length)==11
 ' "$archive" >/dev/null
 jq -e '.status=="PASS" and .consensusNetworkConnectedAndQuorate and
-  .rustConsensusSockets.allFiveEstablished and .authenticatedValidatorPeerCount==5 and
+  (.rustConsensusSockets.unexpectedEstablishedTcpRemotePorts|length)==0 and
+  .rustConsensusSockets.directionalObservationOnly and
+  .authenticatedValidatorOverlayConnected and .transportDirectionAgnostic and
+  .authenticatedValidatorPeerCount==5 and
   .quorumEvidence.connectedValidatorPeers==5 and
   .directPushEvidence.directValidatorPeers==5 and
   .allSixCommittedBlockIdentityExact and .equivocations.total==0' "$network" >/dev/null

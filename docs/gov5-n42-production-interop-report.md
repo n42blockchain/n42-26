@@ -568,6 +568,16 @@ the same full identity on all six endpoints. Evidence SHA-256 is
 Reusable post-restart checker `scripts/audit-gov5-mixed-network-matrix.sh`
 has SHA-256 `955580f2...c533`.
 
+Later runtime32 validation showed that the same authenticated overlay may be
+formed in the opposite direction: all five Gov nodes dial Rust over QUIC while
+Rust has no outbound TCP connections to ports 30301–30305. The reusable matrix
+therefore records outbound TCP as a directional observation, rejects unexpected
+TCP endpoints, and gates connectivity on five unique authenticated validator
+peers, quorum 5/4, direct push to five peers, a Rust `5+5` commit, CommitQC,
+zero equivocations, and exact six-endpoint committed-block identity. This keeps
+the acceptance criteria transport-direction independent without weakening the
+consensus evidence.
+
 That checker is now part of a separate final post-rollover gate. Pushed commit
 `3093cc7f...8c5f` adds a frozen verifier that waits for the atomic total-goal
 PASS (including the additional latest-Reth hour), then dynamically binds the
