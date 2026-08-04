@@ -183,6 +183,14 @@ blocks and all endpoint sequences sharing SHA-256 `b353073b...c26e`.
 Archive/QMDB, network, copied-905, and resource-trend audits all pass again;
 the cross-hashed checkpoint SHA-256 is `25cd0cacb2e5ec23ab5c003d24b95ab32d51c60e98e8763a0370ac0dc449f80a`.
 
+Its frozen-log companion scans 949 canonical blocks through height 95,408.
+All 159 Rust slots match ordered `5+5` commits with exact view stride and hash
+order; commit latency is 53–109 ms with a 68.9-ms average. All 164 timeout
+pairs recover at the next view with none pending. All 1,319 warnings are
+classified, unknown and critical counts are zero, and no frozen log contains
+an error, panic, fatal, or equivocation signal. V2 checkpoint SHA-256 is
+`c89e9522e07a46a10daee52f7174e8fa14ab5de6a56419bb098b352fea023cc5`.
+
 The primary interop branch is pushed at `97bd0d3ba006...`. The separate latest
 delivery branch is pushed at `3f06839e2e5f...`; its 905-data auditor and final
 completion verifier are byte-identical to the primary branch. The pinned

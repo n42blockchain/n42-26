@@ -1430,3 +1430,10 @@ RSS 峰值 269,952 KiB、24 小时投影 508,786 KiB，线程 161、FD 93；16 �
 轮次，Rust 与 Gov1–Gov5 各生产 155 块，六端序列 SHA-256 均为
 `b353073b...c26e`。归档/QMDB、网络、905 数据和资源趋势全套复验再次 PASS，复合
 证据 SHA-256 为 `25cd0cacb2e5ec23ab5c003d24b95ab32d51c60e98e8763a0370ac0dc449f80a`。
+
+同一 150 分钟边界的冻结日志审计覆盖 94,460–95,408 共 949 个 canonical 块，159 个
+Rust 槽位全部匹配有序 `5+5` commit，view stride/hash 顺序精确，commit 延迟
+53–109 ms、平均 68.9 ms。164/164 timeout 均在下一 view 恢复、pending 0；1,319 条
+warning 全量归类，unexpected/critical 为 0，六份冻结日志无
+error/panic/fatal/equivocation 信号。V2 检查点 SHA-256 为
+`c89e9522e07a46a10daee52f7174e8fa14ab5de6a56419bb098b352fea023cc5`。
