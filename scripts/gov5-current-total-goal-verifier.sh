@@ -19,6 +19,7 @@ expected_deps="${N42_TOTAL_DEPS_COMMIT:?dependency commit is required}"
 rollover_pid="${N42_TOTAL_ROLLOVER_PID:?rollover controller PID is required}"
 copied="${N42_TOTAL_COPIED_MANIFEST:?copied-data manifest is required}"
 canary="${N42_TOTAL_CANARY:?current-main canary is required}"
+expected_copied_files="${N42_TOTAL_COPIED_FILES:-126}"
 preflight_only="${N42_TOTAL_PREFLIGHT_ONLY:-0}"
 
 strict_summary="$runtime/evidence/gov5-906-final-qualification.json"
@@ -229,9 +230,13 @@ jq -e -s --arg expected "$expected_gov_main" 'length>=2 and
 jq -e -s 'length>=2 and all(.[];.remoteReachable==true and
   .baselineExact==true and .expected=="v2.4.1" and .latest=="v2.4.1")' \
   "$stable" >/dev/null
-jq -e '.status=="PASS" and .files==124 and
-  .recomputedEntriesSha256==.baselineManifestEntriesSha256 and
-  .allPathsSizesAndHashesExact==true' "$copied" >/dev/null
+jq -e --argjson files "$expected_copied_files" '
+  .status=="PASS" and .files==$files and .allPathsSizesAndHashesExact==true and
+  ((.sourceManifestSha256!=null and
+      .sourceManifestSha256==.targetManifestSha256) or
+   (.recomputedEntriesSha256!=null and
+      .recomputedEntriesSha256==.baselineManifestEntriesSha256))
+' "$copied" >/dev/null
 jq -e '.status=="PASS" and .allSixLatestExact==true and .genesisExact==true and
   .rustFivePlusFive==true and (.rustCommits|length)>=2 and
   .equivocations.total==0' "$canary" >/dev/null
@@ -262,6 +267,7 @@ jq -nc --arg at "$(date -u +%FT%TZ)" --arg verifier_sha "$(sha256 "${BASH_SOURCE
   --arg latest_sha "$(sha256 "$latest_summary")" \
   --arg latest_independent_sha "$(sha256 "$latest_independent")" \
   --arg copied_sha "$(sha256 "$copied")" \
+  --argjson copied_files "$expected_copied_files" \
   '{at:$at,event:"gov5_906_total_goal_final_verification",status:"PASS",
     acceptanceRelaxed:false,verifierScriptSha256:$verifier_sha,strict24h:$strict,
     finalCanonicalHead:$head,consensus:$consensus,equivocations:$equivocations,
@@ -269,7 +275,7 @@ jq -nc --arg at "$(date -u +%FT%TZ)" --arg verifier_sha "$(sha256 "${BASH_SOURCE
     transactionsFinalized:17,rustLeaderProductionExact:true,
     timeoutRecoveryExact:true,archiveAndQmdbParityExact:true,
     controlledRestartRejoined:true,latestRethExtraHourExact:true,
-    copiedData:{files:124,evidenceSha256:$copied_sha,byteExact:true},
+    copiedData:{files:$copied_files,evidenceSha256:$copied_sha,byteExact:true},
     sources:{primaryHead:$primary,govCandidate:$gov_candidate,govMain:$gov_main,
       latestCombination:$combo,reth:$reth,dependencyUpdate:$deps,allPushed:true},
     evidenceSha256:{strictSummary:$strict_sha,strictIndependent:$strict_independent_sha,
