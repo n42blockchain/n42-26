@@ -191,6 +191,33 @@ classified, unknown and critical counts are zero, and no frozen log contains
 an error, panic, fatal, or equivocation signal. V2 checkpoint SHA-256 is
 `c89e9522e07a46a10daee52f7174e8fa14ab5de6a56419bb098b352fea023cc5`.
 
+Runtime30 is excluded from final qualification. At
+`2026-08-04T03:17:50Z` its fail-closed guardian observed Gov5 `main` advance
+from `57d5b0d29385bb51a26b7774d24c44fa10d5285c` to
+`71289cf79ec498117dde36cfa2cb1fd58a413948` and stopped all six nodes. The
+frozen diagnostic interval contains 337 samples over 10,188 seconds, advances
+from 94,459 to 95,509 by 1,050 blocks with maximum lag one, and contains zero
+transactions or bad rows. Rust produced 181 ordered `5+5` commits; the logs
+contain no panic, fatal, error, or equivocation signal. This interval is not
+credited and its advanced target data will not be reused. The exclusion record
+SHA-256 is
+`8f5a4e9ef56661c389a5edb1e7977d42ee126572b7edc9ca506c0c876721a2d`.
+
+The replacement Gov5 candidate is
+`4f5bb0a690d36a52fb3bc3e436849fac1e551251`, merging the interop line with
+`71289cf79ec498117dde36cfa2cb1fd58a413948`. The upstream change reduces
+compact transaction decode allocations and bounds the opt-in txindex tail by
+block count; it does not change genesis, block encoding, HotStuff, or the
+default txindex-disabled 905 data path. Targeted transaction/txindex tests,
+the complete `go test ./...` suite, and the complete `go test -race ./...`
+suite pass. The compact-storage decode benchmark reports 210.8 ns/op,
+408 B/op, and 3 allocs/op. Two independent cold-GOCACHE builds using the
+official `make n42` recipe are byte-identical at SHA-256
+`6daa1a3a73c3df31a9b3ec6799a3c1524817096940ffde74c05f5c7430240148`.
+Runtime31 must start from another exact copy of runtime28's frozen 905-lineage
+data and earn a new strict 24-hour window from zero after all data, genesis,
+copied-boundary, nonce, six-endpoint, Gov5-main, and official-Reth gates pass.
+
 The primary interop branch is pushed at `97bd0d3ba006...`. The separate latest
 delivery branch is pushed at `3f06839e2e5f...`; its 905-data auditor and final
 completion verifier are byte-identical to the primary branch. The pinned
