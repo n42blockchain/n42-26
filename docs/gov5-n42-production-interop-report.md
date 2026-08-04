@@ -53,6 +53,16 @@ Rust-log audit matches all 11 Rust blocks to ordered `5+5` commits, proves all
 23 timeouts recover at the next view with none pending, and partitions all 188
 warnings with zero unexpected or critical signals.
 
+A read-only operator preflight found that the legacy phase guardian accepted
+only direct verifier command names while runtime30 intentionally uses the
+stricter waiter commands. The rejected preflight restarted no node or
+controller, submitted no transaction, and changed neither chain state nor the
+formal timer; its original failure is preserved under an excluded-event
+record. The guardian now accepts both approved direct and waiter forms, passed
+an isolated preflight, and is persistently rearmed as PID 51358 at a 60-second
+interval. All six endpoints were exact at height 94,591 during rearm, with the
+Gov5-main and official-Reth pins unchanged.
+
 The primary interop branch is pushed at `97bd0d3ba006...`. The separate latest
 delivery branch is pushed at `3f06839e2e5f...`; its 905-data auditor and final
 completion verifier are byte-identical to the primary branch. The pinned

@@ -61,6 +61,21 @@ require_process() {
     fail "PID reuse or command mismatch pid=$pid expected=$expected actual=$command"
 }
 
+require_process_any() {
+  local pid="$1" command expected
+  shift
+  kill -0 "$pid" 2>/dev/null ||
+    fail "missing process pid=$pid expected one of: $*"
+  command="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+  test -n "$command" || fail "empty command pid=$pid expected one of: $*"
+  for expected in "$@"; do
+    if rg -F -- "$expected" <<<"$command" >/dev/null; then
+      return 0
+    fi
+  done
+  fail "PID reuse or command mismatch pid=$pid expected one of: $* actual=$command"
+}
+
 require_live_nodes() {
   local file pid command binary
   for file in "$runtime"/pids/gov{1,2,3,4,5}.pid; do
@@ -96,9 +111,15 @@ check_phase() {
   if ! test -s "$strict_summary"; then
     phase=strict
     require_process "$finalizer_pid" "gov5-current-qualification-finalizer.sh"
-    require_process "$strict_verifier_pid" "verify-gov5-906-final-qualification.sh"
-    require_process "$rollover_pid" "qualify-gov5-latest-reth-rollover.sh"
-    require_process "$latest_verifier_pid" "verify-latest-reth-final-qualification.sh"
+    require_process_any "$strict_verifier_pid" \
+      "verify-gov5-906-final-qualification.sh" \
+      "gov5-strict-independent-verifier-waiter.sh"
+    require_process_any "$rollover_pid" \
+      "qualify-gov5-latest-reth-rollover.sh" \
+      "gov5-latest-reth-rollover-waiter.sh"
+    require_process_any "$latest_verifier_pid" \
+      "verify-latest-reth-final-qualification.sh" \
+      "gov5-latest-reth-independent-verifier-waiter.sh"
     require_process "$stable_monitor_pid" "monitor-official-reth-stable.sh"
     test -s "$strict_heads" || fail "strict head evidence is empty"
     tail -n 1 "$strict_heads" | jq -e '.ok==true and .zeroTxRequired==1' >/dev/null ||
@@ -107,16 +128,26 @@ check_phase() {
     phase=strict-independent
     jq -e '.status=="PASS"' "$strict_summary" >/dev/null ||
       fail "strict summary is not PASS"
-    require_process "$strict_verifier_pid" "verify-gov5-906-final-qualification.sh"
-    require_process "$rollover_pid" "qualify-gov5-latest-reth-rollover.sh"
-    require_process "$latest_verifier_pid" "verify-latest-reth-final-qualification.sh"
+    require_process_any "$strict_verifier_pid" \
+      "verify-gov5-906-final-qualification.sh" \
+      "gov5-strict-independent-verifier-waiter.sh"
+    require_process_any "$rollover_pid" \
+      "qualify-gov5-latest-reth-rollover.sh" \
+      "gov5-latest-reth-rollover-waiter.sh"
+    require_process_any "$latest_verifier_pid" \
+      "verify-latest-reth-final-qualification.sh" \
+      "gov5-latest-reth-independent-verifier-waiter.sh"
     require_process "$stable_monitor_pid" "monitor-official-reth-stable.sh"
   elif ! test -s "$latest_summary"; then
     phase=latest-reth
     jq -e '.status=="PASS"' "$strict_independent" >/dev/null ||
       fail "strict independent verification is not PASS"
-    require_process "$rollover_pid" "qualify-gov5-latest-reth-rollover.sh"
-    require_process "$latest_verifier_pid" "verify-latest-reth-final-qualification.sh"
+    require_process_any "$rollover_pid" \
+      "qualify-gov5-latest-reth-rollover.sh" \
+      "gov5-latest-reth-rollover-waiter.sh"
+    require_process_any "$latest_verifier_pid" \
+      "verify-latest-reth-final-qualification.sh" \
+      "gov5-latest-reth-independent-verifier-waiter.sh"
     require_process "$stable_monitor_pid" "monitor-official-reth-stable.sh"
     if test -s "$latest_heads"; then
       tail -n 1 "$latest_heads" | jq -e '.ok==true' >/dev/null ||
@@ -126,7 +157,9 @@ check_phase() {
     phase=latest-independent
     jq -e '.status=="PASS"' "$latest_summary" >/dev/null ||
       fail "latest-Reth summary is not PASS"
-    require_process "$latest_verifier_pid" "verify-latest-reth-final-qualification.sh"
+    require_process_any "$latest_verifier_pid" \
+      "verify-latest-reth-final-qualification.sh" \
+      "gov5-latest-reth-independent-verifier-waiter.sh"
   fi
   printf '%s\n' "$phase:$remote"
 }
