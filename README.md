@@ -49,7 +49,7 @@ A high-performance blockchain system combining **HotStuff-2** BFT consensus with
 
 - **HotStuff-2 Consensus**: 2-round optimistic commit with 3-round timeout recovery
 - **BLS12-381 Signatures**: Aggregated signatures for compact quorum certificates
-- **reth v2.4.1 Integration**: Tracks `n42blockchain/reth` branch `chore/reth-upstream-20260726` at `91725e3aa`, including post-release upstream fixes plus N42-specific payload-cache/QMDB patches; revmc/LLVM JIT remains explicit opt-in
+- **reth v2.4.1 Integration**: Tracks `n42blockchain/reth` branch `chore/reth-alloy-matrix-20260804` at `acb016ee1`, including post-release upstream fixes, an exact Alloy/REVM execution matrix, and N42-specific payload-cache/QMDB patches; revmc/LLVM JIT remains explicit opt-in and commit-pinned
 - **Reserve SBMT Path**: `N42_JMT=1` explicitly selects the legacy-compatible 16-shard sparse binary backend and RPC surface
 - **Compact Block Propagation**: Leader caches execution output; the default follower path skips duplicate EVM execution (cache hit ~3ms)
 - **QMDB Binary Twig Backend**: The QMDB-style 16-shard binary twig tree is the default N42 state-proof backend (`N42_TWIG` defaults on)
@@ -230,7 +230,7 @@ Both configurations are well within the **8-second slot target**.
 ### Prerequisites
 
 - Rust 1.97+ (development and CI are pinned to Rust 1.97.1)
-- N42 `reth` 2.4.1 fork checked out at `../reth` (`91725e3aa8f2`)
+- N42 `reth` 2.4.1 fork checked out at `../reth` (`acb016ee1d81`)
 - Android local builds: JDK 17 recommended for Gradle/Kotlin
 - SP1 toolchain v4.2.1 (optional, for ZK proof guest build): `curl -L https://sp1up.succinct.xyz | bash && sp1up --version v4.2.1`
 
@@ -238,8 +238,8 @@ Both configurations are well within the **8-second slot target**.
 
 ```bash
 git clone https://github.com/n42blockchain/reth.git ../reth
-git -C ../reth checkout chore/reth-upstream-20260726
-test "$(git -C ../reth rev-parse HEAD)" = "91725e3aa8f2a0bbc5a425e931a2f2b2f31b2a7b"
+git -C ../reth checkout chore/reth-alloy-matrix-20260804
+test "$(git -C ../reth rev-parse HEAD)" = "acb016ee1d81db90a4747bac22129d3c57c1bc04"
 ```
 
 ### Build
@@ -261,7 +261,7 @@ JAVA_HOME=$(/usr/libexec/java_home -v 17) \
 
 ```bash
 git -C ../reth fetch origin
-git -C ../reth checkout chore/reth-upstream-20260726
+git -C ../reth checkout chore/reth-alloy-matrix-20260804
 git -C ../reth pull --ff-only
 ```
 

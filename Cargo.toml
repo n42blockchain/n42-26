@@ -51,7 +51,7 @@ n42-bmt-core = { path = "crates/n42-bmt-core" }
 n42-twig-core = { path = "crates/n42-twig-core" }
 n42-zkproof = { path = "crates/n42-zkproof" }
 
-# Reth 2.4.1 dependencies (n42blockchain/reth @ c533db8bad6f, local path)
+# Reth 2.4.1 dependencies (n42blockchain/reth @ acb016ee1d81, local path)
 reth-chainspec = { path = "../reth/crates/chainspec" }
 reth-consensus = { path = "../reth/crates/consensus/consensus" }
 reth-db = { path = "../reth/crates/storage/db" }
@@ -90,19 +90,19 @@ reth-rpc-builder = { path = "../reth/crates/rpc/rpc-builder" }
 reth-rpc-server-types = { path = "../reth/crates/rpc/rpc-server-types" }
 reth-node-core = { path = "../reth/crates/node/core" }
 
-# Alloy (aligned with n42blockchain/reth merged with upstream main)
-alloy-consensus = { version = "2.2.0", default-features = false, features = ["serde"] }
-alloy-eips = { version = "2.2.0", default-features = false, features = ["serde"] }
+# Alloy (exact Reth 2.4.1 release matrix; do not float independently)
+alloy-consensus = { version = "=2.2.0", default-features = false, features = ["serde"] }
+alloy-eips = { version = "=2.2.0", default-features = false, features = ["serde"] }
 alloy-primitives = { version = "1.6.1", default-features = false, features = ["serde"] }
 alloy-rlp = { version = "0.3.16", default-features = false }
-alloy-genesis = { version = "2.2.0", default-features = false }
-alloy-rpc-types-engine = { version = "2.2.0", default-features = false }
+alloy-genesis = { version = "=2.2.0", default-features = false }
+alloy-rpc-types-engine = { version = "=2.2.0", default-features = false }
 
 # Alloy signing & network
-alloy-signer = { version = "2.2.0", default-features = false }
-alloy-signer-local = { version = "2.2.0", default-features = false }
-alloy-network = { version = "2.2.0", default-features = false }
-alloy-rpc-types-eth = { version = "2.2.0", default-features = false }
+alloy-signer = { version = "=2.2.0", default-features = false }
+alloy-signer-local = { version = "=2.2.0", default-features = false }
+alloy-network = { version = "=2.2.0", default-features = false }
+alloy-rpc-types-eth = { version = "=2.2.0", default-features = false }
 alloy-sol-types = { version = "1.6.1", default-features = false }
 
 # EVM — aligned with `../reth/Cargo.toml` (upstream main).

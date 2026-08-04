@@ -20,7 +20,8 @@ jobs:
       - uses: actions/checkout@v7
         with:
           repository: n42blockchain/reth
-          ref: chore/reth-upstream-20260719
+          # Exact N42 Reth 2.4.1 companion revision; keep in sync with Cargo.toml.
+          ref: acb016ee1d81db90a4747bac22129d3c57c1bc04
           path: reth
 
       - uses: dtolnay/rust-toolchain@1.97.1
@@ -68,7 +69,8 @@ jobs:
       - uses: actions/checkout@v7
         with:
           repository: n42blockchain/reth
-          ref: chore/reth-upstream-20260719
+          # Exact N42 Reth 2.4.1 companion revision; keep in sync with Cargo.toml.
+          ref: acb016ee1d81db90a4747bac22129d3c57c1bc04
           path: reth
 
       - uses: dtolnay/rust-toolchain@1.97.1

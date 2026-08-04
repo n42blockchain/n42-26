@@ -1,7 +1,7 @@
 # Devlog 112: dependency refresh and Reth 2.4.1 baseline
 
 Date: 2026-07-21
-Latest compatible lock refresh: 2026-08-02
+Latest compatible lock refresh: 2026-08-04
 
 ## Scope
 
@@ -9,8 +9,8 @@ Refresh the N42 workspace to the latest compatible stable dependencies while pre
 deployed replay, consensus, snapshot, keystore, and proof formats. The paired execution-layer
 checkout is the N42 Reth 2.4.1 fork:
 
-- branch: `chore/reth-upstream-20260726`
-- commit: `91725e3aa8f2a0bbc5a425e931a2f2b2f31b2a7b`
+- branch: `chore/reth-alloy-matrix-20260804`
+- commit: `acb016ee1d81db90a4747bac22129d3c57c1bc04`
 - workspace version: `2.4.1`
 
 The Reth checkout remained clean. N42 continues to use local `../reth` paths because the fork
@@ -84,6 +84,48 @@ hickory 0.25; upstream PR 6423 moves the unreleased 0.57 line to hickory 0.26.1.
 inactive optional `tracing-subscriber 0.2.25` edge under arkworks; N42's active logging path is
 0.3.23. Running `cargo audit` with those three explicit advisory IDs ignored passes, so a new
 advisory will still fail the nightly gate.
+
+## 2026-08-04 live compatible refresh
+
+A current-index `cargo update --dry-run --verbose` found another compatible maintenance wave.
+The lock now absorbs `aho-corasick 1.1.5`, the data-encoding 2.11.1 macro family,
+`instability 0.3.13`, `line-clipping 0.3.8`, `lru 0.18.2`, and the vergen 10.0.2 family,
+including the new Darling 0.24 derive edge required by the refreshed graph.
+
+The same dry run also exposed that the documented Alloy release-matrix pin was only a lockfile
+pin: direct workspace requirements used normal caret semantics and therefore allowed the newly
+published Alloy 2.3 line. The direct Alloy 2.2 requirements are now exact, and every Alloy
+protocol/RPC/transport package in `Cargo.lock` remains on the single 2.2.0 matrix selected by
+Reth 2.4.1. The paired Reth manifest now exact-pins the complete Alloy 2.2 family, including its
+proc-macro helper, so a dry run reports every Alloy 2.3 package as unchanged rather than allowing
+a partial 2.2/2.3 graph. No compatible update remains.
+
+The refreshed lockfile SHA-256 is
+`834ca9a291f075358a602907447e5c86edbcbf6bfc4c1660c13b508063405716`.
+
+Fresh isolated-worktree validation against clean Reth commit `acb016ee1d81` passed:
+
+- `cargo check --locked --workspace --all-targets`
+- `cargo test --locked --workspace` (1,285 passed, 8 intentionally ignored)
+- `cargo clippy --locked --workspace --all-targets -- -D warnings`
+
+The security gate also passes with only the three existing vulnerability exceptions, using the
+same explicit `--ignore` arguments as `.github/workflows/nightly.yml`. RustSec additionally
+reports `RUSTSEC-2026-0002` for `lru 0.12.5` as an informational unsound warning. That version is
+absent from the default feature graph and is reachable only through the optional
+`n42-zkproof -> sp1-sdk 4.2.1 -> sp1-cuda/sp1-prover` all-features graph. N42's direct path uses
+patched `lru 0.18.2`, and Reth's active path uses patched `lru 0.16.4`; the SP1 stack stays pinned
+until its deployed circuit and serialization boundary can be migrated as a unit.
+
+All workflows now fetch the exact paired Reth commit instead of the older movable integration
+branch, so CI exercises the same 2.4.1 source revision used by this validation.
+
+The paired Reth lock independently absorbed 64 compatible maintenance updates. Its optional JIT
+source changed from a moving `main` branch to exact revmc commit `520462a4`, preventing a routine
+refresh from silently introducing Alloy-EVM 0.38 and REVM 42. The resulting Reth graph contains
+only Alloy 2.2.0, Alloy-EVM 0.37.1, and REVM 41.0.0. Reth's locked full-workspace all-target check,
+`reth-consensus` tests/doc-test, and full-workspace warnings-denied Clippy gate all pass; its
+security audit passes with the sole inactive `tracing-subscriber 0.2.25` exception.
 
 ## Verification
 
