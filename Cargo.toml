@@ -145,7 +145,7 @@ tracing = "0.1"
 metrics = "0.24"
 
 # Networking
-libp2p = { version = "0.56", features = ["gossipsub", "tokio", "quic", "tcp", "noise", "yamux", "identify", "macros", "request-response", "mdns", "kad"] }
+libp2p = { version = "0.57.0", git = "https://github.com/libp2p/rust-libp2p.git", rev = "6348a0be4aeb5b48eecf17a5d0aae15ff8239984", features = ["gossipsub", "tokio", "quic", "tcp", "noise", "yamux", "identify", "macros", "request-response", "mdns", "kad", "secp256k1"] }
 quinn = "0.11"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rcgen = "0.14.8"
@@ -216,3 +216,6 @@ strip = true
 inherits = "release"
 debug = true
 strip = false
+
+[patch.crates-io]
+ark-relations = { git = "https://github.com/arkworks-rs/snark.git", rev = "845ce9d50bbe535792f04b44db78b009ee402ed7" }
