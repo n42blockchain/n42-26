@@ -20,7 +20,7 @@ runtime_number="$(basename "$(realpath "$runtime")" | sed -En \
 test -n "$runtime_number"
 
 harness="${N42_DEEP_HARNESS:-$runtime/artifacts/scripts/gov5-interop-qualification.sh}"
-rechecker="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/recheck-gov5-runtime-static-boundary.sh"
+rechecker="${N42_DEEP_RECHECKER:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/recheck-gov5-runtime-static-boundary.sh}"
 milestone="$runtime/evidence/gov5-906-$label-milestone.json"
 prefix="$runtime/evidence/runtime${runtime_number}-$label-closed"
 snapshot="$prefix-log-snapshot"
