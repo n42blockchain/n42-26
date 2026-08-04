@@ -1422,3 +1422,11 @@ quorum 5/4、direct push 5；创世 `b71c2810...92ec`、复制高度/hash
 1,104 条 warning 全量归类，unexpected/critical 为 0，六份冻结日志无
 error/panic/fatal/equivocation 信号。V2 检查点绑定两份复合证据，SHA-256 为
 `294c10490317360394ca6592ad8a6cac261bd664c67ebaae71d7076fdff766ba`。
+
+150 分钟复合检查点继续 PASS：298 个 head 样本覆盖 9,005 秒，高度
+94,459–95,389、增长 930 块、最大 lag 1、零交易；31 个原 Rust PID 资源样本中
+RSS 峰值 269,952 KiB、24 小时投影 508,786 KiB，线程 161、FD 93；16 次 Gov main
+精确，Rust `5+5` commit 161 次、双签 0。完整轮值审计覆盖 930 个连续块和 155 个
+轮次，Rust 与 Gov1–Gov5 各生产 155 块，六端序列 SHA-256 均为
+`b353073b...c26e`。归档/QMDB、网络、905 数据和资源趋势全套复验再次 PASS，复合
+证据 SHA-256 为 `25cd0cacb2e5ec23ab5c003d24b95ab32d51c60e98e8763a0370ac0dc449f80a`。
