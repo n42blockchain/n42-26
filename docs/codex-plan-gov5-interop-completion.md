@@ -1437,3 +1437,26 @@ Rust 槽位全部匹配有序 `5+5` commit，view stride/hash 顺序精确，com
 warning 全量归类，unexpected/critical 为 0，六份冻结日志无
 error/panic/fatal/equivocation 信号。V2 检查点 SHA-256 为
 `c89e9522e07a46a10daee52f7174e8fa14ab5de6a56419bb098b352fea023cc5`。
+
+---
+
+### T21 — Gov5 71289cf 与 runtime31 重置（2026-08-04）
+
+`2026-08-04T03:17:50Z` fail-closed guardian 发现 Gov5 `main` 从
+`57d5b0d29385bb51a26b7774d24c44fa10d5285c` 前进到
+`71289cf79ec498117dde36cfa2cb1fd58a413948` 并停止全部六节点。runtime30 冻结
+诊断窗口保留 337 个样本、10,188 秒、高度 94,459–95,509、增长 1,050 块、最大
+lag 1、bad row 0、交易 0；Rust 有 181 次 `5+5`，日志无 panic/fatal/error 或
+equivocation。该时长不计入最终资格，已推进的目标数据不得复用；排除记录 SHA-256
+为 `8f5a4e9ef56661c389a5edb1e7977d42ee126572b7edc9ca506c0c876721a2d`。
+
+新候选 `4f5bb0a690d36a52fb3bc3e436849fac1e551251` 已合并并推送。上游变化只减少
+compact transaction decode 分配并按块数约束 opt-in txindex tail，不修改创世、
+区块编码、HotStuff 或默认 txindex-disabled 的 905 数据路径。定向测试、完整
+`go test ./...`、完整 `go test -race ./...` 均 PASS；compact-storage decode
+benchmark 为 210.8 ns/op、408 B/op、3 allocs/op。两个独立冷 GOCACHE 且使用
+官方 `make n42` recipe 的生产构建逐字节一致，SHA-256 为
+`6daa1a3a73c3df31a9b3ec6799a3c1524817096940ffde74c05f5c7430240148`。
+runtime31 必须再次从 runtime28 冻结停止态精确复制 905-lineage 数据，并在创世、
+92,605 边界、nonce、六端身份、Gov5 main 和官方 Reth 门全部通过后从零开始严格
+24 小时窗口。
