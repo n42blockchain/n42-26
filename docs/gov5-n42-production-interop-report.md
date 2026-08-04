@@ -63,6 +63,25 @@ an isolated preflight, and is persistently rearmed as PID 51358 at a 60-second
 interval. All six endpoints were exact at height 94,591 during rearm, with the
 Gov5-main and official-Reth pins unchanged.
 
+The strict one-hour composite milestone passes without relaxing acceptance:
+121 head samples span 3,637 seconds and heights 94,459–94,837, growing 378
+blocks with a 31-second maximum gap, maximum lag zero, and no transaction.
+Thirteen resource samples from the original Rust PID span 3,602 seconds; RSS
+peaks at 253,808 KiB and projects to 669,013 KiB at 24 hours, below the
+1-GiB limit, while threads remain 161 and file descriptors 93. All seven
+Gov5-main samples exactly match `57d5b0d293...`.
+
+The full-hour producer audit independently reads canonical heights
+94,460–94,837. Across 378 continuous blocks and 63 complete rotations, Rust
+and Gov1–Gov5 each author exactly 63 blocks. All six endpoint sequences share
+SHA-256 `b4a6c425...e00b9`; parent links and scheduled slots are exact and all
+blocks are transaction-free. A matching read-only supplemental audit confirms
+five authenticated Gov peers, quorum 5/4, direct push to all five, copied-905
+height 92,605, nonce `0x11`, absent txindex state, and no need to recopy or
+regenerate data. Two current QMDB proofs plus 11 historical checks are exact
+between Gov and Rust and verify offline. The composite evidence SHA-256 is
+`90e2d2f3...7469`.
+
 The primary interop branch is pushed at `97bd0d3ba006...`. The separate latest
 delivery branch is pushed at `3f06839e2e5f...`; its 905-data auditor and final
 completion verifier are byte-identical to the primary branch. The pinned
