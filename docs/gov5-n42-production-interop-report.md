@@ -218,6 +218,32 @@ Runtime31 must start from another exact copy of runtime28's frozen 905-lineage
 data and earn a new strict 24-hour window from zero after all data, genesis,
 copied-boundary, nonce, six-endpoint, Gov5-main, and official-Reth gates pass.
 
+Runtime31 is a prequalification exclusion and earned zero qualification time.
+It copied all 126 files / 17,318,592,333 bytes exactly from runtime28, then
+advanced from 94,423 to 94,441 with 18 zero-transaction blocks and three Rust
+`5+5` commits. Its network preflight proved six-endpoint identity, five
+authenticated Gov peers, quorum 5/4, direct push five, CommitQC, and zero
+equivocations. During the current-main canary, Gov5 moved from `71289cf79...`
+to `0bb2c0de4...`; canary and 905-data gates rejected the run, all six nodes
+stopped, and the advanced target data is not reusable. The exclusion record
+SHA-256 is `ff60a1dff1c826ed58184b45cb3097f875b9a58f8600c1ddfa6983afef82771c`.
+
+Gov5 then advanced again to `39db96184cd0d4a8745057e2733b1cea421f9983`.
+The two QMDB commits pre-size the in-memory index during reload and report its
+utilisation, with an environment opt-out; they do not alter genesis, block
+encoding, or HotStuff. Full tests exposed an upstream panic in the reload and
+transaction-abort paths: the reporting code compared an interface whose
+dynamic `mapIndex` value is not comparable. Candidate
+`c3da82738dfb3a7cf13814e863551af0a16aa2da` fixes this by returning an
+explicit replacement flag from `reserve`, and adds coverage for empty,
+populated, foreign, disabled, reload, and abort/recommit cases. Both original
+panic paths and the reserve cases pass ten repeated runs; targeted, complete,
+and complete race suites pass. Two independent cold-GOCACHE official builds
+are byte-identical at SHA-256
+`de89a17768b8711b50820104f2e9f77b7dd8f03b689261bffa7eb9bd8b8b60f0`.
+The candidate is pushed and Gov5 `main` is pinned at `39db96184...`; runtime32
+must again copy runtime28's frozen data rather than reuse runtime31.
+
 The primary interop branch is pushed at `97bd0d3ba006...`. The separate latest
 delivery branch is pushed at `3f06839e2e5f...`; its 905-data auditor and final
 completion verifier are byte-identical to the primary branch. The pinned
