@@ -1460,3 +1460,25 @@ benchmark 为 210.8 ns/op、408 B/op、3 allocs/op。两个独立冷 GOCACHE 且
 runtime31 必须再次从 runtime28 冻结停止态精确复制 905-lineage 数据，并在创世、
 92,605 边界、nonce、六端身份、Gov5 main 和官方 Reth 门全部通过后从零开始严格
 24 小时窗口。
+
+---
+
+### T22 — runtime31 预检排除与 Gov5 QMDB reload 修复（2026-08-04）
+
+runtime31 从 runtime28 再次精确复制 126 文件 / 17,318,592,333 字节并启动；六端从
+94,423 推进到 94,441，共 18 个零交易块和 3 次 Rust `5+5`。网络预检确认六端身份、
+5 个认证 Gov peer、quorum 5/4、direct push 5、CommitQC 与零双签。但 current-main
+canary 发现 Gov5 从 `71289cf79...` 前进到 `0bb2c0de4...`，canary 与 905 数据门拒绝
+通过，六节点停止，正式计时从未开始且目标数据不得复用。排除记录 SHA-256 为
+`ff60a1dff1c826ed58184b45cb3097f875b9a58f8600c1ddfa6983afef82771c`。
+
+Gov5 随后又前进到 `39db96184cd0d4a8745057e2733b1cea421f9983`。两次 QMDB 更新为
+reload 时的内存索引预分配容量并报告利用率，同时提供环境 opt-out；不修改创世、
+区块编码或 HotStuff。完整测试发现新 reporting 代码比较了动态值为 `mapIndex` 的
+interface，因 map 不可比较而在 reload 与事务 abort/recommit 路径 panic。候选
+`c3da82738dfb3a7cf13814e863551af0a16aa2da` 改为由 `reserve` 显式返回 replacement
+布尔值，并覆盖空/非空/外部/禁用索引及两个原 panic 路径。相关回归各重复 10 次、
+定向测试、完整测试和完整 race 均 PASS；两个独立冷 GOCACHE 官方生产构建逐字节
+一致，SHA-256 为
+`de89a17768b8711b50820104f2e9f77b7dd8f03b689261bffa7eb9bd8b8b60f0`。候选已推送，
+下一 runtime32 仍须从 runtime28 冻结数据重新复制。
