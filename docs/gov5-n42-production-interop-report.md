@@ -97,6 +97,9 @@ waiter exits it requires a `PASS` output, and any non-empty failure artifact is
 fatal. Runtime30 rearmed this guardian as PID 17470 with both three-hour deep
 waiters covered. Only the phase guardian changed PID; all six nodes, formal
 streams, finalizer, and the strict timer remained continuous.
+An isolated transition test then supplied two nonexistent PIDs with completed
+`PASS` artifacts; the guardian accepted the completed state and emitted no
+failure, proving it will not flag a correctly exited milestone waiter.
 
 The primary interop branch is pushed at `97bd0d3ba006...`. The separate latest
 delivery branch is pushed at `3f06839e2e5f...`; its 905-data auditor and final
