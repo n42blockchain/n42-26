@@ -10,8 +10,8 @@ expected_genesis="0xb71c28109836f120453d097c38819a55b14c49abcc92713037fb9b112013
 expected_copied_head=92605
 expected_copied_hash="0xb88a3571223cf8cd8291d608572a55f306ea88957cc7ede8ab6b8812ada85a82"
 expected_builder_commit="8e1d27efb7380a3a43702bd84c78283373ccc408"
-expected_tail_commit="b8c17d04614346bace2fbb5c05393bdaf454cf5a"
-expected_integration_commit="8e1d27efb7380a3a43702bd84c78283373ccc408"
+expected_tail_commit="71289cf79ec498117dde36cfa2cb1fd58a413948"
+expected_integration_commit="71289cf79ec498117dde36cfa2cb1fd58a413948"
 ports=(28501 28502 28503 28504 28505 29545)
 
 test -d "$runtime"
