@@ -163,6 +163,15 @@ height/hash 92,605/`b88a3571...5a82`, nonce `0x11`, absent txindex state, and
 no need to recopy or regenerate 905 data. The fully cross-hashed composite
 evidence SHA-256 is `f05e82b687c4e90bd6851643edbbf50ff7364554fde92c3d242159a025d39a8a`.
 
+A frozen-log companion extends that boundary through Rust-authored height
+95,246. It scans 787 canonical blocks, matches all 132 Rust slots to ordered
+`5+5` commits with exact stride and hash order, and measures commit latency at
+53–109 ms with a 68.7-ms average. All 137 timeout pairs recover at the next
+view with none pending; all 1,104 warnings are classified with zero unexpected
+or critical signals, and all six frozen logs are free of error, panic, fatal,
+or equivocation signals. The V2 checkpoint binds both composites at SHA-256
+`294c10490317360394ca6592ad8a6cac261bd664c67ebaae71d7076fdff766ba`.
+
 The primary interop branch is pushed at `97bd0d3ba006...`. The separate latest
 delivery branch is pushed at `3f06839e2e5f...`; its 905-data auditor and final
 completion verifier are byte-identical to the primary branch. The pinned

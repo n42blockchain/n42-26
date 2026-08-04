@@ -1415,3 +1415,10 @@ quorum 5/4、direct push 5；创世 `b71c2810...92ec`、复制高度/hash
 92,605/`b88a3571...5a82`、nonce `0x11`、txindex 缺席均精确，仍无需重复制或重生成
 905 数据。七项底层证据哈希均由复合检查点重新计算，检查点 SHA-256 为
 `f05e82b687c4e90bd6851643edbbf50ff7364554fde92c3d242159a025d39a8a`。
+
+两小时冻结日志 companion 又覆盖到 Rust 高度 95,246：787 个 canonical 块中的
+132 个 Rust 槽位全部匹配有序 `5+5` commit，view stride/hash 顺序精确，commit
+延迟 53–109 ms、平均 68.7 ms。137/137 timeout 均在下一 view 恢复、pending 0；
+1,104 条 warning 全量归类，unexpected/critical 为 0，六份冻结日志无
+error/panic/fatal/equivocation 信号。V2 检查点绑定两份复合证据，SHA-256 为
+`294c10490317360394ca6592ad8a6cac261bd664c67ebaae71d7076fdff766ba`。
