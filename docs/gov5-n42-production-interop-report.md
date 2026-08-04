@@ -144,6 +144,25 @@ pending. All 920 warnings are classified, unexpected and critical counts are
 zero, and the six frozen logs contain no error, panic, fatal, or equivocation
 signal.
 
+The strict two-hour composite milestone and its two independent deep audits
+also pass without relaxed acceptance. The frozen head stream contains 239
+samples over 7,216 seconds and advances from 94,459 to 95,203 by 744 blocks,
+with a 31-second maximum gap, maximum lag one, and continuous zero-transaction
+coverage. The original Rust PID supplies 25 resource samples over 7,204
+seconds; RSS peaks at 263,984 KiB and projects to 517,827 KiB at 24 hours,
+while threads remain 161 and file descriptors 93. Thirteen Gov5-main samples
+remain exact at `57d5b0d293...`, Rust records 130 `5+5` commits, CommitQC is
+present, and equivocations remain zero.
+
+The complete two-hour producer scan covers 94,460–95,203: all 744 parent-linked
+blocks form 124 exact rotations, Rust and Gov1–Gov5 each author exactly 124
+blocks, and all six endpoint sequences share SHA-256 `d218d5ca...100c`.
+The supplemental rerun again proves five authenticated Gov peers, quorum 5/4,
+direct push five, exact archive/QMDB results, genesis `b71c2810...92ec`, copied
+height/hash 92,605/`b88a3571...5a82`, nonce `0x11`, absent txindex state, and
+no need to recopy or regenerate 905 data. The fully cross-hashed composite
+evidence SHA-256 is `f05e82b687c4e90bd6851643edbbf50ff7364554fde92c3d242159a025d39a8a`.
+
 The primary interop branch is pushed at `97bd0d3ba006...`. The separate latest
 delivery branch is pushed at `3f06839e2e5f...`; its 905-data auditor and final
 completion verifier are byte-identical to the primary branch. The pinned

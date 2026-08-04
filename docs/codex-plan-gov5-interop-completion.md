@@ -1402,3 +1402,16 @@ SHA-256 为 `9226886e...00aa`。
 正确，commit 延迟 53–85 ms、平均 67.7 ms。114/114 timeout 全部在下一 view 由
 Rust `5+5` 恢复，pending 0。920 条 warning 全量归类，unexpected/critical 均为 0，
 且六份冻结日志中无 error/panic/fatal/equivocation 信号。
+
+2 小时正式复合门和两项独立深审计继续严格 PASS：239 个 head 样本覆盖 7,216 秒，
+高度 94,459–95,203、增长 744 块、最大 gap 31 秒、lag 1、零交易；25 个原 Rust PID
+资源样本覆盖 7,204 秒，RSS 峰值 263,984 KiB、24 小时投影 517,827 KiB，线程 161、
+FD 93；13 次 Gov main 精确，Rust `5+5` commit 130 次、双签 0。完整生产者扫描覆盖
+94,460–95,203 的 744 个连续块和 124 个完整轮次，Rust 与 Gov1–Gov5 各精确生产
+124 块，六端序列 SHA-256 均为 `d218d5ca...100c`。
+
+同一边界的归档/QMDB、网络、905 数据和资源趋势复验全部 PASS：认证 Gov peer 5、
+quorum 5/4、direct push 5；创世 `b71c2810...92ec`、复制高度/hash
+92,605/`b88a3571...5a82`、nonce `0x11`、txindex 缺席均精确，仍无需重复制或重生成
+905 数据。七项底层证据哈希均由复合检查点重新计算，检查点 SHA-256 为
+`f05e82b687c4e90bd6851643edbbf50ff7364554fde92c3d242159a025d39a8a`。
