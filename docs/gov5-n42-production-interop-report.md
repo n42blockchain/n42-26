@@ -8,7 +8,25 @@ disposable-runtime tests, and the guarded exercise against the preserved
 seven-node deployment. Machine-readable evidence and immutable log manifests
 are stored in the qualification runtimes named below.
 
-## Current 2026-08-03 qualification — latest Gov5 main and latest stable Reth
+## Current 2026-08-04 qualification — latest Gov5 main and latest stable Reth
+
+Runtime29 is excluded. It started from a 126-file, 17,318,592,333-byte exact
+copy of runtime28's clean stop and advanced all six endpoints from 94,423 to
+94,435, including two Rust-authored `5+5` blocks. The latest-main gate then
+observed Gov5 move from `8e1d27efb...` to `57d5b0d293...`; all nodes stopped
+cleanly at `00:13:05Z`, no qualification time is credited, and its data will
+not be reused. The exclusion record SHA-256 is `fbed1cf1...c0c68`.
+
+The replacement candidate `94584a4ae5c...` is pushed and includes the two
+new P2P commits. They disable peer scoring for a fixed no-discovery peer set,
+bound the seen-message cache to 30 seconds, and avoid setting topic score
+parameters when scoring is off. They do not change chain data, genesis,
+block encoding, or the consensus commit path. Targeted tests, the full suite,
+and the full race suite pass. Two independent cold-cache builds are byte
+identical at SHA-256 `e062a429...cf3e`. Runtime30 will be copied again from
+runtime28's frozen clean data; its strict 24-hour timer starts from zero only
+after the latest-main, genesis, copied-boundary, six-endpoint, and nonce gates
+all pass.
 
 Runtime28 is now excluded. At `2026-08-03T23:50:41Z`, the independent guard
 observed Gov5 `main` advance from `b8c17d046...` to `8e1d27efb...`; all
