@@ -11,7 +11,12 @@ expected_copied_head=92605
 expected_copied_hash="0xb88a3571223cf8cd8291d608572a55f306ea88957cc7ede8ab6b8812ada85a82"
 expected_builder_commit="8e1d27efb7380a3a43702bd84c78283373ccc408"
 expected_tail_commit="71289cf79ec498117dde36cfa2cb1fd58a413948"
-expected_integration_commit="71289cf79ec498117dde36cfa2cb1fd58a413948"
+# The txindex opt-in wiring itself still originates at 71289c, but current
+# Gov5 main also touches node.go/blockchain.go to attach the transaction pool
+# as a sender-hint cache. Pin the latest commit across the audited integration
+# paths so an unrelated source drift cannot be mistaken for the validated
+# c0a146 main while all runtime opt-in and on-disk absence checks remain strict.
+expected_integration_commit="dd6cd1538a36cdacda538f37b46c2e7a12d68dd2"
 ports=(28501 28502 28503 28504 28505 29545)
 
 test -d "$runtime"
