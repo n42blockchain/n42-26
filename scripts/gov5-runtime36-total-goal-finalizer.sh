@@ -198,7 +198,27 @@ test ! -e "$output"
 test ! -e "$failure"
 trap on_error ERR
 
+milestone_required=()
+for spec in 'formal-15m 900' 'formal-1h 3600' 'formal-4h 14400' \
+  'formal-8h 28800' 'formal-12h 43200' 'formal-16h 57600' 'formal-20h 72000'; do
+  label="${spec%% *}"
+  milestone_required+=(
+    "$evidence/gov5-906-$label-milestone.json"
+    "$evidence/runtime36-$label-closed-deep-audit.json"
+    "$evidence/runtime36-latest-c0a146-$label-six-producer.json"
+  )
+  if test "$label" = formal-15m; then
+    milestone_required+=(
+      "$evidence/runtime36-latest-c0a146-formal-15m-corrected-supplemental-audit.json"
+    )
+  else
+    milestone_required+=(
+      "$evidence/runtime36-latest-c0a146-$label-supplemental-audit.json"
+    )
+  fi
+done
 required=("$strict" "$independent" "$producer" "$producer_linkage" "$resource_audit" "$upstream_complete" "$upstream_audit")
+required+=("${milestone_required[@]}")
 while :; do
   missing=false
   for item in "${required[@]}"; do test -s "$item" || missing=true; done
@@ -238,6 +258,41 @@ jq -e '.status=="PASS" and .elapsedSeconds>=86400 and .singleProcess==true and
   .logicalCountersMonotonic==true and .headLogAndWalCountersMonotonic==true' "$resource_audit" >/dev/null
 jq -e -s 'length>=2 and all(.[];.remoteReachable==true and .baselineExact==true and
   .expected=="v2.4.1" and .latest=="v2.4.1")' "$stable" >/dev/null
+
+for spec in 'formal-15m 900' 'formal-1h 3600' 'formal-4h 14400' \
+  'formal-8h 28800' 'formal-12h 43200' 'formal-16h 57600' 'formal-20h 72000'; do
+  label="${spec%% *}"
+  minimum="${spec##* }"
+  if test "$label" = formal-15m; then
+    supplemental_path="$evidence/runtime36-latest-c0a146-formal-15m-corrected-supplemental-audit.json"
+  else
+    supplemental_path="$evidence/runtime36-latest-c0a146-$label-supplemental-audit.json"
+  fi
+  jq -e --arg label "$label" --argjson minimum "$minimum" '
+    .status=="PASS" and .label==$label and .acceptanceRelaxed==false and
+    .soak.elapsedSeconds>=$minimum and .soak.maximumLag<=1 and
+    .soak.zeroTransactionRequired==true and .resources.elapsedSeconds>=$minimum and
+    .gov5Upstream.elapsedSeconds>=$minimum and .rustLeaderCommitsFivePlusFive>=2 and
+    .equivocations.total==0 and .transactionsSent==0 and .failureEvidencePresent==false
+  ' "$evidence/gov5-906-$label-milestone.json" >/dev/null
+  jq -e '.status=="PASS" and .acceptanceRelaxed==false and
+    .archiveAndQmdbParityExact==true and .networkConsensusExact==true and
+    .data905CompatibilityExact==true and .resourceTrendWithin24hBudget==true and
+    .noFailureEvidence==true' \
+    "$supplemental_path" >/dev/null
+  jq -e '.status=="PASS" and .acceptanceRelaxed==false and
+    .rustLeaders.leaderCommitLog.allVotesFivePlusFive==true and
+    .timeoutRecovery.pendingTimeouts==0 and .runtimeLogs.unexpectedWarnings==0 and
+    .runtimeLogs.criticalSignals==0 and
+    .staticBoundary.staticGov5Data.allCurrentHashesMatchInitialCopy==true and
+    .transactionsSent==0 and .failureEvidencePresent==false' \
+    "$evidence/runtime36-$label-closed-deep-audit.json" >/dev/null
+  jq -e '.status=="PASS" and .startHeight==99938 and .completeCycles>0 and
+    .allSixEndpointSequencesExact==true and .parentChainContinuous==true and
+    .expectedProducerSlotsExact==true and .allProducerCountsBalanced==true and
+    .zeroTransactions==true' \
+    "$evidence/runtime36-latest-c0a146-$label-six-producer.json" >/dev/null
+done
 
 audit_dir="$(mktemp -d /tmp/n42-runtime36-total.XXXXXX)"
 trap 'rm -rf "$audit_dir"' EXIT
@@ -298,7 +353,8 @@ jq -nc --arg at "$(date -u +%FT%TZ)" --arg self "$expected_self_sha" \
     genesis905AndSecurityBoundariesExact:true,copiedDataExact:true,allSixEndpointsExact:true,
     strict24hZeroTransactionExact:true,sixProducerRotationExact:true,transactionsFinalized:17,
     archiveAndQmdbParityExact:true,controlledRustRestartRejoined:true,postRestartStabilityExact:true,
-    staticDataAndToolsExact:true,zeroEquivocations:true,officialRethStable:"v2.4.1",
+    intermediateMilestonesExact:true,staticDataAndToolsExact:true,zeroEquivocations:true,
+    officialRethStable:"v2.4.1",
     correctedNonAcceptanceToolingFailureEvidence:true,noUncorrectedFailureEvidence:true,
     sourceAndRemotePinsExact:true,binariesExact:true,
     sources:{govMain:$gov_main,govCandidate:$gov_candidate,n42:$n42,reth:$reth,interopTooling:$interop,allPushed:true},
@@ -308,7 +364,8 @@ jq -nc --arg at "$(date -u +%FT%TZ)" --arg self "$expected_self_sha" \
       latestRethQualification:$latest_reth_sha},noFailureEvidence:true}' >"$temporary"
 jq -e '.status=="PASS" and .strict24h.elapsedSeconds>=86400 and .strict24h.maximumLag<=1 and
   .transactionsFinalized==17 and .sixProducerRotationExact==true and
-  .controlledRustRestartRejoined==true and .sourceAndRemotePinsExact==true and
+  .controlledRustRestartRejoined==true and .intermediateMilestonesExact==true and
+  .sourceAndRemotePinsExact==true and
   .objectiveRequirementsExtendedClosure==true and .noFailureEvidence==true' "$temporary" >/dev/null
 mv "$temporary" "$output"
 trap - EXIT
