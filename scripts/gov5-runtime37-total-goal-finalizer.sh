@@ -48,6 +48,7 @@ correction_waiter_failure="$evidence/runtime37-latest-c0a146-formal-15m-resource
 correction_waiter_v2_failure="$evidence/runtime37-latest-c0a146-formal-15m-resource-correction-v2-failure.json"
 controller_rebind_correction="$evidence/runtime37-finalizer-session-keeper-rebind-correction.json"
 independent_harness_rebind="$evidence/runtime37-independent-verifier-harness-rebind.json"
+remote_retry_controller_rebind="$evidence/runtime37-remote-retry-controller-rebind.json"
 milestone_4h_transient_failure="$evidence/gov5-906-formal-4h-milestone-controller-transient-failure.json"
 milestone_20h_transient_failure="$evidence/gov5-906-formal-20h-milestone-controller-transient-failure.json"
 milestone_remote_retry_correction="$evidence/runtime37-milestone-network-retry-correction.json"
@@ -63,6 +64,22 @@ network_auditor="$runtime/artifacts/scripts/audit-gov5-mixed-network-matrix.sh"
 
 sha256() { shasum -a 256 "$1" | awk '{print $1}'; }
 
+git_ls_remote_with_retry() {
+  local attempt output=""
+  local attempts="${N42_GOV_REMOTE_RETRY_ATTEMPTS:-6}"
+  local delay="${N42_GOV_REMOTE_RETRY_DELAY_SECONDS:-10}"
+  [[ "$attempts" =~ ^[1-9][0-9]*$ ]]
+  [[ "$delay" =~ ^[0-9]+$ ]]
+  for ((attempt=1; attempt<=attempts; attempt++)); do
+    if output="$(git "$@" 2>/dev/null)" && test -n "$output"; then
+      printf '%s\n' "$output"
+      return 0
+    fi
+    test "$attempt" -ge "$attempts" || sleep "$delay"
+  done
+  return 1
+}
+
 rpc() {
   local port="$1" method="$2" params="$3"
   curl -fsS --max-time 10 -H 'content-type: application/json' \
@@ -72,11 +89,12 @@ rpc() {
 }
 
 remote_gov_main() {
-  git -C "$gov_repo" ls-remote origin refs/heads/main | awk 'NR==1{print $1}'
+  git_ls_remote_with_retry -C "$gov_repo" ls-remote origin refs/heads/main |
+    awk 'NR==1{print $1}'
 }
 
 latest_reth_stable() {
-  git ls-remote --tags https://github.com/paradigmxyz/reth.git 'refs/tags/v*' |
+  git_ls_remote_with_retry ls-remote --tags https://github.com/paradigmxyz/reth.git 'refs/tags/v*' |
     sed -E 's#.*refs/tags/##; s/\^\{\}//' |
     rg -v -- '-(alpha|beta|rc)[.-]' | sort -V | tail -n 1
 }
@@ -87,7 +105,8 @@ assert_branch_pushed() {
   test -z "$(git -C "$repo" status --porcelain --untracked-files=no)"
   branch="$(git -C "$repo" branch --show-current)"
   test -n "$branch"
-  remote="$(git -C "$repo" ls-remote origin "refs/heads/$branch" | awk 'NR==1{print $1}')"
+  remote="$(git_ls_remote_with_retry -C "$repo" ls-remote origin "refs/heads/$branch" |
+    awk 'NR==1{print $1}')"
   test "$remote" = "$expected"
 }
 
@@ -129,15 +148,14 @@ assert_independent_harness_rebind() {
   test -s "$independent_harness_rebind"
   jq -e \
     --arg prior_rebind_sha "$(sha256 "$controller_rebind_correction")" \
-    --arg verifier_sha "$expected_verifier" --arg harness_sha "$expected_harness" \
-    --arg waiter_sha "$(sha256 "$runtime/artifacts/scripts/gov5-strict-independent-verifier-waiter.sh")" '
+    --arg harness_sha "$expected_harness" '
     .event=="runtime37_independent_verifier_harness_rebind" and
     .status=="PASS" and .acceptanceRelaxed==false and
     .priorRebindCorrectionSha256==$prior_rebind_sha and
     .oldIndependentWaiter.pid==55356 and
     .oldIndependentWaiter.verifierSha256=="35bfee43ecd472540c0e09a42855c103735a2f67ada43bfda88e46f727c6909b" and
-    .newIndependentWaiter.verifierSha256==$verifier_sha and
-    .newIndependentWaiter.waiterSha256==$waiter_sha and
+    .newIndependentWaiter.verifierSha256=="528074c17cb1ee8a9460bbc8c5f97c98d3207015d85ebee56962443148442073" and
+    .newIndependentWaiter.waiterSha256=="0352156d194d5ded5aec2278cfe7f467a9f876528313d8c95f637c4c41c51406" and
     .newIndependentWaiter.harnessSha256==$harness_sha and
     .formalWindow.continuous==true and .formalWindow.maximumGapSeconds<=120 and
     .formalWindow.failedSamples==0 and .formalWindow.zeroTransactionRequired==true and
@@ -145,8 +163,32 @@ assert_independent_harness_rebind() {
     .nodeOrFormalMonitorMutationPerformed==false and
     .independentVerifierHarnessPinCorrected==true
   ' "$independent_harness_rebind" >/dev/null
+  test -s "$remote_retry_controller_rebind"
+  jq -e --arg prior "$(sha256 "$independent_harness_rebind")" \
+    --arg prior_controller "$(sha256 "$controller_rebind_correction")" \
+    --arg finalizer_sha "$expected_finalizer" --arg verifier_sha "$expected_verifier" \
+    --arg waiter_sha "$(sha256 "$runtime/artifacts/scripts/gov5-strict-independent-verifier-waiter.sh")" \
+    --arg total_sha "$expected_self_sha" '
+    .event=="runtime37_remote_retry_controller_rebind" and
+    .status=="PASS" and .acceptanceRelaxed==false and
+    .priorIndependentHarnessRebindSha256==$prior and
+    .priorControllerRebindSha256==$prior_controller and
+    .oldControllers.finalizerPid==55068 and .oldControllers.independentWaiterPid==68043 and
+    .oldControllers.totalGoalFinalizerPid==12776 and
+    .newControllers.finalizerSha256==$finalizer_sha and
+    .newControllers.independentVerifierSha256==$verifier_sha and
+    .newControllers.independentWaiterSha256==$waiter_sha and
+    .newControllers.totalGoalFinalizerSha256==$total_sha and
+    .retryPolicy.attempts==6 and .retryPolicy.delaySeconds==10 and
+    .retryPolicy.failsAfterExhaustion==true and
+    .formalWindow.continuous==true and .formalWindow.maximumGapSeconds<=120 and
+    .formalWindow.failedSamples==0 and .formalWindow.zeroTransactionRequired==true and
+    .chainDataMutationPerformed==false and
+    .nodeOrFormalMonitorMutationPerformed==false and
+    .controllerFailureCorrected==true
+  ' "$remote_retry_controller_rebind" >/dev/null
   if ! test -s "$independent"; then
-    independent_pid="$(jq -er '.newIndependentWaiter.pid' "$independent_harness_rebind")"
+    independent_pid="$(jq -er '.newControllers.independentWaiterPid' "$remote_retry_controller_rebind")"
     kill -0 "$independent_pid"
     ps -p "$independent_pid" -o command= | rg -F 'gov5-strict-independent-verifier-waiter.sh' >/dev/null
   fi
@@ -174,7 +216,7 @@ assert_controller_rebind_correction() {
     .controllerRebindCorrected==true and
     .totalGoalFinalizerRelaunchRequired==true
   ' "$controller_rebind_correction" >/dev/null
-  finalizer_pid="$(jq -er '.newControllers.finalizerPid' "$controller_rebind_correction")"
+  finalizer_pid="$(jq -er '.newControllers.finalizerPid' "$remote_retry_controller_rebind")"
   kill -0 "$finalizer_pid"
   ps -p "$finalizer_pid" -o command= | rg -F 'gov5-current-qualification-finalizer.sh' >/dev/null
   assert_independent_harness_rebind
@@ -185,6 +227,8 @@ assert_controller_rebind_correction() {
       .priorCorrectionWaiterFailureSha256==$failure_sha and
       .controllerRebindFailureCorrected==true and
       .controllerRebindCorrectionSha256==$rebind_sha and
+      .remoteRetryControllerRebindCorrected==true and
+      .remoteRetryControllerRebindSha256!="" and
       .noUncorrectedFailureEvidence==true
     ' "$supplemental_15m_correction" >/dev/null
   fi
@@ -504,6 +548,7 @@ jq -nc --arg at "$(date -u +%FT%TZ)" --arg self "$expected_self_sha" \
   --arg controller_rebind_sha "$(sha256 "$controller_rebind_correction")" \
   --arg milestone_remote_retry_sha "$(sha256 "$milestone_remote_retry_correction")" \
   --arg independent_harness_rebind_sha "$(sha256 "$independent_harness_rebind")" \
+  --arg remote_retry_rebind_sha "$(sha256 "$remote_retry_controller_rebind")" \
   --arg correction_waiter_failure_sha "$(sha256 "$correction_waiter_failure")" \
   --arg latest_reth_sha "$(sha256 "$latest_reth")" \
   '{at:$at,event:"runtime37_goal_completion",status:"PASS",acceptanceRelaxed:false,
@@ -517,6 +562,7 @@ jq -nc --arg at "$(date -u +%FT%TZ)" --arg self "$expected_self_sha" \
     correctedShortWindowResourceProjectionFailure:true,
     correctedControllerRebindFailure:true,correctedIndependentVerifierHarnessPin:true,
     correctedMilestoneRemoteRetryFailure:true,
+    correctedRemoteRetryControllerRebind:true,
     failureEvidencePreserved:true,
     noUncorrectedFailureEvidence:true,noConsensusOrDataFailureEvidence:true,
     sourceAndRemotePinsExact:true,binariesExact:true,
@@ -527,6 +573,7 @@ jq -nc --arg at "$(date -u +%FT%TZ)" --arg self "$expected_self_sha" \
       controllerRebindCorrection:$controller_rebind_sha,
       milestoneRemoteRetryCorrection:$milestone_remote_retry_sha,
       independentVerifierHarnessRebind:$independent_harness_rebind_sha,
+      remoteRetryControllerRebind:$remote_retry_rebind_sha,
       preservedCorrectionWaiterFailure:$correction_waiter_failure_sha,
       latestRethQualification:$latest_reth_sha}}' >"$temporary"
 jq -e '.status=="PASS" and .strict24h.elapsedSeconds>=86400 and .strict24h.maximumLag<=1 and
@@ -536,6 +583,7 @@ jq -e '.status=="PASS" and .strict24h.elapsedSeconds>=86400 and .strict24h.maxim
   .objectiveRequirementsExtendedClosure==true and
   .correctedIndependentVerifierHarnessPin==true and
   .correctedMilestoneRemoteRetryFailure==true and
+  .correctedRemoteRetryControllerRebind==true and
   .failureEvidencePreserved==true and .noUncorrectedFailureEvidence==true and
   .noConsensusOrDataFailureEvidence==true' "$temporary" >/dev/null
 mv "$temporary" "$output"

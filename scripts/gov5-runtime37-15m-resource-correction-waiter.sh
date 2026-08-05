@@ -14,6 +14,7 @@ waiter_failure="${N42_CORRECTION_WAITER_FAILURE:-$runtime/evidence/runtime37-lat
 prior_waiter_failure="${N42_CORRECTION_PRIOR_WAITER_FAILURE:-}"
 rebind_correction="${N42_CORRECTION_REBIND_CORRECTION:-}"
 prior_finalizer_pid="${N42_CORRECTION_PRIOR_FINALIZER_PID:-}"
+remote_retry_rebind="${N42_CORRECTION_REMOTE_RETRY_REBIND:-}"
 preflight_only="${N42_CORRECTION_PREFLIGHT_ONLY:-0}"
 
 test -s "$failure"
@@ -25,6 +26,7 @@ sha256() { shasum -a 256 "$1" | awk '{print $1}'; }
 original_failure_sha="$(sha256 "$failure")"
 prior_waiter_failure_sha=""
 rebind_correction_sha=""
+remote_retry_rebind_sha=""
 
 assert_original_failure() {
   test "$(sha256 "$failure")" = "$original_failure_sha"
@@ -35,6 +37,7 @@ assert_original_failure() {
 }
 
 assert_controller_rebind_correction() {
+  local bound_finalizer="$finalizer_pid"
   test -n "$prior_waiter_failure"
   test -n "$rebind_correction"
   [[ "$prior_finalizer_pid" =~ ^[1-9][0-9]*$ ]]
@@ -47,7 +50,11 @@ assert_controller_rebind_correction() {
     .status=="FAIL" and .statusCode==1 and .line==56 and
     .command=="kill -0 \"$finalizer_pid\""
   ' "$prior_waiter_failure" >/dev/null
-  jq -e --argjson old "$prior_finalizer_pid" --argjson new "$finalizer_pid" \
+  if test -n "$remote_retry_rebind"; then
+    test -s "$remote_retry_rebind"
+    bound_finalizer="$(jq -er '.oldControllers.finalizerPid' "$remote_retry_rebind")"
+  fi
+  jq -e --argjson old "$prior_finalizer_pid" --argjson new "$bound_finalizer" \
     --arg prior_sha "$prior_waiter_failure_sha" '
     .event=="runtime37_finalizer_session_keeper_rebind_correction" and
     .status=="PASS" and .acceptanceRelaxed==false and
@@ -62,6 +69,23 @@ assert_controller_rebind_correction() {
     .nodeOrFormalMonitorMutationPerformed==false and
     .controllerRebindCorrected==true
   ' "$rebind_correction" >/dev/null
+  if test -n "$remote_retry_rebind"; then
+    test "$(sha256 "$remote_retry_rebind")" = "$remote_retry_rebind_sha"
+    jq -e --arg prior "$(sha256 "$rebind_correction")" \
+      --argjson old "$bound_finalizer" --argjson new "$finalizer_pid" '
+      .event=="runtime37_remote_retry_controller_rebind" and
+      .status=="PASS" and .acceptanceRelaxed==false and
+      .priorControllerRebindSha256==$prior and
+      .oldControllers.finalizerPid==$old and .newControllers.finalizerPid==$new and
+      .retryPolicy.attempts==6 and .retryPolicy.delaySeconds==10 and
+      .retryPolicy.failsAfterExhaustion==true and
+      .formalWindow.continuous==true and .formalWindow.maximumGapSeconds<=120 and
+      .formalWindow.failedSamples==0 and .formalWindow.zeroTransactionRequired==true and
+      .chainDataMutationPerformed==false and
+      .nodeOrFormalMonitorMutationPerformed==false and
+      .controllerFailureCorrected==true
+    ' "$remote_retry_rebind" >/dev/null
+  fi
 }
 
 on_error() {
@@ -77,10 +101,13 @@ trap on_error ERR
 
 assert_original_failure
 if test -n "$prior_waiter_failure" || test -n "$rebind_correction" ||
-  test -n "$prior_finalizer_pid"; then
+  test -n "$prior_finalizer_pid" || test -n "$remote_retry_rebind"; then
   test -n "$prior_waiter_failure"
   test -n "$rebind_correction"
   test -n "$prior_finalizer_pid"
+  if test -n "$remote_retry_rebind"; then
+    remote_retry_rebind_sha="$(sha256 "$remote_retry_rebind")"
+  fi
   prior_waiter_failure_sha="$(sha256 "$prior_waiter_failure")"
   rebind_correction_sha="$(sha256 "$rebind_correction")"
   assert_controller_rebind_correction
@@ -144,6 +171,7 @@ jq -nc --arg at "$(date -u +%FT%TZ)" \
   --arg data_sha "$(sha256 "$data")" --arg resource_sha "$(sha256 "$resource")" \
   --arg prior_waiter_failure_sha "$prior_waiter_failure_sha" \
   --arg rebind_correction_sha "$rebind_correction_sha" \
+  --arg remote_retry_rebind_sha "$remote_retry_rebind_sha" \
   --slurpfile resource "$resource" '
   {at:$at,event:"runtime37_formal_15m_resource_projection_correction",status:"PASS",
    label:"formal-15m",acceptanceRelaxed:false,mutationPerformed:false,
@@ -158,11 +186,14 @@ jq -nc --arg at "$(date -u +%FT%TZ)" \
    priorCorrectionWaiterFailureSha256:$prior_waiter_failure_sha,
    controllerRebindFailureCorrected:($rebind_correction_sha!=""),
    controllerRebindCorrectionSha256:$rebind_correction_sha,
+   remoteRetryControllerRebindCorrected:($remote_retry_rebind_sha!=""),
+   remoteRetryControllerRebindSha256:$remote_retry_rebind_sha,
    measured24hResourceAudit:$resource[0],noUncorrectedFailureEvidence:true,
    evidenceSha256:{milestone:$milestone_sha,archiveQmdb:$archive_sha,
      networkMatrix:$network_sha,data905Compatibility:$data_sha,
      measured24hResourceAudit:$resource_sha}}' >"$temporary"
-jq -e --argjson rebind_expected "$(test -n "$prior_waiter_failure" && echo true || echo false)" '
+jq -e --argjson rebind_expected "$(test -n "$prior_waiter_failure" && echo true || echo false)" \
+  --argjson remote_retry_expected "$(test -n "$remote_retry_rebind" && echo true || echo false)" '
   .status=="PASS" and .acceptanceRelaxed==false and
   .mutationPerformed==false and .originalFailurePreserved==true and
   .measured24hResourceAudit.elapsedSeconds>=86400 and
@@ -170,6 +201,7 @@ jq -e --argjson rebind_expected "$(test -n "$prior_waiter_failure" && echo true 
   .data905CompatibilityExact and .resourceTrendWithin24hBudget and
   .priorCorrectionWaiterFailurePreserved==$rebind_expected and
   .controllerRebindFailureCorrected==$rebind_expected and
+  .remoteRetryControllerRebindCorrected==$remote_retry_expected and
   .noUncorrectedFailureEvidence' "$temporary" >/dev/null
 mv "$temporary" "$output"
 cat "$output"

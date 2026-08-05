@@ -86,6 +86,22 @@ rpc() {
     "http://127.0.0.1:$port"
 }
 
+git_ls_remote_with_retry() {
+  local attempt output=""
+  local attempts="${N42_GOV_REMOTE_RETRY_ATTEMPTS:-6}"
+  local delay="${N42_GOV_REMOTE_RETRY_DELAY_SECONDS:-10}"
+  [[ "$attempts" =~ ^[1-9][0-9]*$ ]]
+  [[ "$delay" =~ ^[0-9]+$ ]]
+  for ((attempt=1; attempt<=attempts; attempt++)); do
+    if output="$(git "$@" 2>/dev/null)" && test -n "$output"; then
+      printf '%s\n' "$output"
+      return 0
+    fi
+    test "$attempt" -ge "$attempts" || sleep "$delay"
+  done
+  return 1
+}
+
 wait_for_rpc() {
   local port="$1"
   local attempts="$2"
@@ -198,7 +214,7 @@ assert_live_identity() {
 
 assert_gov_upstream() {
   local remote
-  remote="$(git -C "$gov_repo" ls-remote origin refs/heads/main |
+  remote="$(git_ls_remote_with_retry -C "$gov_repo" ls-remote origin refs/heads/main |
     awk 'NR == 1 {print $1}')"
   test "$remote" = "$expected_gov_upstream_sha"
 }
@@ -208,7 +224,7 @@ assert_gov_source() {
   test "$(git -C "$gov_repo" rev-parse HEAD)" = "$expected_gov_candidate_sha"
   test -z "$(git -C "$gov_repo" status --porcelain)"
   branch="$(git -C "$gov_repo" rev-parse --abbrev-ref HEAD)"
-  remote_candidate="$(git -C "$gov_repo" ls-remote origin "refs/heads/$branch" |
+  remote_candidate="$(git_ls_remote_with_retry -C "$gov_repo" ls-remote origin "refs/heads/$branch" |
     awk 'NR == 1 {print $1}')"
   test "$remote_candidate" = "$expected_gov_candidate_sha"
 }

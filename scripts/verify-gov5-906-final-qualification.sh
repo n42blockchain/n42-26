@@ -32,6 +32,22 @@ sha256() {
   shasum -a 256 "$1" | awk '{print $1}'
 }
 
+git_ls_remote_with_retry() {
+  local attempt output=""
+  local attempts="${N42_GOV_REMOTE_RETRY_ATTEMPTS:-6}"
+  local delay="${N42_GOV_REMOTE_RETRY_DELAY_SECONDS:-10}"
+  [[ "$attempts" =~ ^[1-9][0-9]*$ ]]
+  [[ "$delay" =~ ^[0-9]+$ ]]
+  for ((attempt=1; attempt<=attempts; attempt++)); do
+    if output="$(git "$@" 2>/dev/null)" && test -n "$output"; then
+      printf '%s\n' "$output"
+      return 0
+    fi
+    test "$attempt" -ge "$attempts" || sleep "$delay"
+  done
+  return 1
+}
+
 rpc() {
   local port="$1"
   local method="$2"
@@ -125,10 +141,10 @@ assert_sources() {
   test "$(git -C "$gov_repo" rev-parse HEAD)" = "$expected_gov_candidate"
   test -z "$(git -C "$gov_repo" status --porcelain)"
   branch="$(git -C "$gov_repo" rev-parse --abbrev-ref HEAD)"
-  remote="$(git -C "$gov_repo" ls-remote origin "refs/heads/$branch" |
+  remote="$(git_ls_remote_with_retry -C "$gov_repo" ls-remote origin "refs/heads/$branch" |
     awk 'NR == 1 {print $1}')"
   test "$remote" = "$expected_gov_candidate"
-  remote="$(git -C "$gov_repo" ls-remote origin refs/heads/main |
+  remote="$(git_ls_remote_with_retry -C "$gov_repo" ls-remote origin refs/heads/main |
     awk 'NR == 1 {print $1}')"
   test "$remote" = "$expected_gov_upstream"
 
@@ -143,7 +159,7 @@ assert_sources() {
     "$(git -C "$reth_repo" rev-parse '@{upstream}')"
   test "$(git -C "$paired_reth_repo" rev-parse HEAD)" = "$expected_reth_head"
   test -z "$(git -C "$paired_reth_repo" status --porcelain)"
-  latest_stable="$(git ls-remote --tags https://github.com/paradigmxyz/reth.git \
+  latest_stable="$(git_ls_remote_with_retry ls-remote --tags https://github.com/paradigmxyz/reth.git \
     'refs/tags/v*' | sed -E 's#.*refs/tags/##; s/\^\{\}//' |
     rg -v -- '-(alpha|beta|rc)[.-]' | sort -V | tail -n 1)"
   test "$latest_stable" = v2.4.1

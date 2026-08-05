@@ -33,6 +33,22 @@ sha256() {
   shasum -a 256 "$1" | awk '{print $1}'
 }
 
+git_ls_remote_with_retry() {
+  local attempt output=""
+  local attempts="${N42_GOV_REMOTE_RETRY_ATTEMPTS:-6}"
+  local delay="${N42_GOV_REMOTE_RETRY_DELAY_SECONDS:-10}"
+  [[ "$attempts" =~ ^[1-9][0-9]*$ ]]
+  [[ "$delay" =~ ^[0-9]+$ ]]
+  for ((attempt=1; attempt<=attempts; attempt++)); do
+    if output="$(git "$@" 2>/dev/null)" && test -n "$output"; then
+      printf '%s\n' "$output"
+      return 0
+    fi
+    test "$attempt" -ge "$attempts" || sleep "$delay"
+  done
+  return 1
+}
+
 require_process() {
   local pid="$1"
   local expected="$2"
@@ -94,7 +110,7 @@ while ! test -s "$summary"; do
   check_nodes
   require_process "$finalizer_pid" "gov5-current-qualification-finalizer.sh"
   test "$(sha256 "$finalizer")" = "$expected_finalizer_sha"
-  remote="$(git -C "$gov_repo" ls-remote origin refs/heads/main |
+  remote="$(git_ls_remote_with_retry -C "$gov_repo" ls-remote origin refs/heads/main |
     awk 'NR == 1 {print $1}')"
   test "$remote" = "$expected_gov_main"
   test ! -s "$runtime/evidence/gov5-906-finalizer-failures.jsonl"
