@@ -37,6 +37,8 @@ rg -F 'waiter_failure="${N42_CORRECTION_WAITER_FAILURE:-' "$correction_waiter" >
 rg -F 'assert_controller_rebind_correction' "$correction_waiter" >/dev/null
 rg -F 'milestone_required+=("$supplemental_15m_correction")' "$total_finalizer" >/dev/null
 rg -F 'assert_no_uncorrected_failures' "$total_finalizer" >/dev/null
+rg -F 'failures="${N42_QUAL_FAILURES:-' "$finalizer" >/dev/null
+rg -F 'preflight_burst "${N42_QUAL_PREFLIGHT_LABEL:-launch-preflight}"' "$finalizer" >/dev/null
 rg -F '"$correction_waiter_v2_failure"' "$total_finalizer" >/dev/null
 rg -F 'correctedControllerRebindFailure:true,correctedIndependentVerifierHarnessPin:true' \
   "$total_finalizer" >/dev/null
@@ -59,6 +61,8 @@ done
 jq -nc '{status:"PASS",harnessShaOverrideAccepted:true,legacyDefaultPreserved:true,
   producerCompanionPathsFollowOutput:true,
   shortWindowProjectionCorrectionRequiresMeasured24h:true,
+  finalizerPreflightFailurePathIsIsolated:true,
+  finalizerPreflightArtifactLabelIsIsolated:true,
   correctedControllerRebindFailureIsPreservedAndBound:true,
   correctedControllerV2FailureRemainsFailClose:true,
   independentVerifierHarnessShaIsExplicitlyPinned:true,

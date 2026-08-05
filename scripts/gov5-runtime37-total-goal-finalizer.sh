@@ -49,6 +49,10 @@ correction_waiter_v2_failure="$evidence/runtime37-latest-c0a146-formal-15m-resou
 controller_rebind_correction="$evidence/runtime37-finalizer-session-keeper-rebind-correction.json"
 independent_harness_rebind="$evidence/runtime37-independent-verifier-harness-rebind.json"
 remote_retry_controller_rebind="$evidence/runtime37-remote-retry-controller-rebind.json"
+finalizer_preflight_config_failure="$evidence/gov5-906-finalizer-preflight-config-failure.jsonl"
+milestone_8h_controller_cascade_failure="$evidence/gov5-906-formal-8h-milestone-controller-cascade-failure.json"
+milestone_12h_controller_cascade_failure="$evidence/gov5-906-formal-12h-milestone-controller-cascade-failure.json"
+milestone_20h_controller_cascade_failure="$evidence/gov5-906-formal-20h-milestone-controller-cascade-failure.json"
 milestone_4h_transient_failure="$evidence/gov5-906-formal-4h-milestone-controller-transient-failure.json"
 milestone_20h_transient_failure="$evidence/gov5-906-formal-20h-milestone-controller-transient-failure.json"
 milestone_remote_retry_correction="$evidence/runtime37-milestone-network-retry-correction.json"
@@ -144,7 +148,7 @@ assert_nodes() {
 }
 
 assert_independent_harness_rebind() {
-  local independent_pid
+  local independent_pid controller_failure
   test -s "$independent_harness_rebind"
   jq -e \
     --arg prior_rebind_sha "$(sha256 "$controller_rebind_correction")" \
@@ -164,8 +168,23 @@ assert_independent_harness_rebind() {
     .independentVerifierHarnessPinCorrected==true
   ' "$independent_harness_rebind" >/dev/null
   test -s "$remote_retry_controller_rebind"
+  test -s "$finalizer_preflight_config_failure"
+  for controller_failure in "$milestone_8h_controller_cascade_failure" \
+    "$milestone_12h_controller_cascade_failure" \
+    "$milestone_20h_controller_cascade_failure"; do
+    test -s "$controller_failure"
+    jq -e '.event=="gov5_qualification_milestone_failure" and .status=="FAIL" and
+      .statusCode==1 and .command=="test ! -s \"$path\""' "$controller_failure" >/dev/null
+  done
+  jq -e '.event=="gov5_906_finalizer_failure" and .statusCode==1 and .line==337 and
+    .command=="rust_leader_start=\"$(resolve_rust_leader_start)\""' \
+    "$finalizer_preflight_config_failure" >/dev/null
   jq -e --arg prior "$(sha256 "$independent_harness_rebind")" \
     --arg prior_controller "$(sha256 "$controller_rebind_correction")" \
+    --arg preflight_failure "$(sha256 "$finalizer_preflight_config_failure")" \
+    --arg cascade8 "$(sha256 "$milestone_8h_controller_cascade_failure")" \
+    --arg cascade12 "$(sha256 "$milestone_12h_controller_cascade_failure")" \
+    --arg cascade20 "$(sha256 "$milestone_20h_controller_cascade_failure")" \
     --arg finalizer_sha "$expected_finalizer" --arg verifier_sha "$expected_verifier" \
     --arg waiter_sha "$(sha256 "$runtime/artifacts/scripts/gov5-strict-independent-verifier-waiter.sh")" \
     --arg total_sha "$expected_self_sha" '
@@ -173,6 +192,11 @@ assert_independent_harness_rebind() {
     .status=="PASS" and .acceptanceRelaxed==false and
     .priorIndependentHarnessRebindSha256==$prior and
     .priorControllerRebindSha256==$prior_controller and
+    .priorFailures.finalizerPreflightConfig.sha256==$preflight_failure and
+    .priorFailures.milestone8hCascade.sha256==$cascade8 and
+    .priorFailures.milestone12hCascade.sha256==$cascade12 and
+    .priorFailures.milestone20hCascade.sha256==$cascade20 and
+    .priorFailures.allPreserved==true and .priorFailures.controllerOnly==true and
     .oldControllers.finalizerPid==55068 and .oldControllers.independentWaiterPid==68043 and
     .oldControllers.totalGoalFinalizerPid==12776 and
     .newControllers.finalizerSha256==$finalizer_sha and

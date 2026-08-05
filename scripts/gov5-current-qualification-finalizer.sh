@@ -29,7 +29,7 @@ soak_audit="$runtime/evidence/mixed-soak-24h-audit.json"
 post_burst_audit="$runtime/evidence/mixed-post-burst-10m-audit.json"
 post_restart_audit="$runtime/evidence/mixed-post-restart-10m-audit.json"
 summary="$runtime/evidence/gov5-$gov_version-final-qualification.json"
-failures="$runtime/evidence/gov5-$gov_version-finalizer-failures.jsonl"
+failures="${N42_QUAL_FAILURES:-$runtime/evidence/gov5-$gov_version-finalizer-failures.jsonl}"
 ports="${N42_QUAL_PORTS:-28501 28502 28503 28504 28505 29545}"
 rust_port="${N42_QUAL_RUST_PORT:-29545}"
 rust_miner="${N42_QUAL_RUST_MINER:-0x81d4c1f92ddb837cb46f82280d9b491b101fa582}"
@@ -337,7 +337,7 @@ assert_gov_upstream
 rust_leader_start="$(resolve_rust_leader_start)"
 
 if test "${N42_QUAL_FINALIZER_PREFLIGHT_ONLY:-0}" = 1; then
-  preflight_burst launch-preflight
+  preflight_burst "${N42_QUAL_PREFLIGHT_LABEL:-launch-preflight}"
   jq -nc \
     --arg at "$(date -u +%FT%TZ)" \
     --arg gov_version "$gov_version" \
