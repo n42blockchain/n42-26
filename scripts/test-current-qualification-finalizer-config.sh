@@ -44,6 +44,8 @@ rg -F 'N42_VERIFY_HARNESS_SHA="$expected_harness_sha"' "$independent_waiter" >/d
 rg -F 'expected_harness_sha="${N42_VERIFY_HARNESS_SHA:-' "$independent_verifier" >/dev/null
 rg -F 'N42_VERIFY_HARNESS_SHA="$expected_harness"' "$total_finalizer" >/dev/null
 rg -F 'assert_independent_harness_rebind' "$total_finalizer" >/dev/null
+rg -F 'assert_milestone_remote_retry_correction' "$total_finalizer" >/dev/null
+rg -F '.correctedMilestoneRemoteRetryFailure==true' "$total_finalizer" >/dev/null
 rg -F 'static="${N42_TOTAL_STATIC:-' "$total_finalizer" >/dev/null
 rg -F '.frozenTools.independentVerifierSha256==$verifier' "$total_finalizer" >/dev/null
 rg -F '.correction.priorBaselinePreserved==true' "$total_finalizer" >/dev/null
@@ -59,4 +61,5 @@ jq -nc '{status:"PASS",harnessShaOverrideAccepted:true,legacyDefaultPreserved:tr
   correctedControllerV2FailureRemainsFailClose:true,
   independentVerifierHarnessShaIsExplicitlyPinned:true,
   correctedStaticBaselineIsExplicitlyBound:true,
+  milestoneRemoteRetryFailureIsPreservedAndCorrected:true,
   plannedRustRestartDoesNotTripGuardians:true}'

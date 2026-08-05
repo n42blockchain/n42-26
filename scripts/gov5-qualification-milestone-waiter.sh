@@ -51,6 +51,25 @@ elapsed() {
     ((.[-1].at|fromdateiso8601)-(.[0].at|fromdateiso8601)) end' "$file"
 }
 
+remote_main_with_retry() {
+  local attempt remote=""
+  local attempts="${N42_GOV_REMOTE_RETRY_ATTEMPTS:-6}"
+  local delay="${N42_GOV_REMOTE_RETRY_DELAY_SECONDS:-10}"
+  [[ "$attempts" =~ ^[1-9][0-9]*$ ]]
+  [[ "$delay" =~ ^[0-9]+$ ]]
+  for ((attempt=1; attempt<=attempts; attempt++)); do
+    if remote="$(git -C "$gov_repo" ls-remote origin refs/heads/main 2>/dev/null |
+      awk 'NR==1 {print $1}')" && [[ "$remote" =~ ^[0-9a-f]{40}$ ]]; then
+      printf '%s\n' "$remote"
+      return 0
+    fi
+    if test "$attempt" -lt "$attempts"; then
+      sleep "$delay"
+    fi
+  done
+  return 1
+}
+
 while :; do
   for file in "$runtime"/pids/gov{1,2,3,4,5}.pid "$runtime/pids/rust.pid"; do
     test -s "$file"
@@ -62,8 +81,7 @@ while :; do
     "$runtime/evidence/runtime22-monitor-pid-guardian-failures.jsonl"; do
     test ! -s "$path"
   done
-  remote="$(git -C "$gov_repo" ls-remote origin refs/heads/main |
-    awk 'NR==1 {print $1}')"
+  remote="$(remote_main_with_retry)"
   test "$remote" = "$expected_gov_main"
   if test -s "$heads"; then
     tail -n 1 "$heads" | jq -e '.ok==true and .zeroTxRequired==1' >/dev/null

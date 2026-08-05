@@ -44,6 +44,25 @@ sha256() {
   shasum -a 256 "$1" | awk '{print $1}'
 }
 
+remote_main_with_retry() {
+  local attempt remote=""
+  local attempts="${N42_GOV_REMOTE_RETRY_ATTEMPTS:-6}"
+  local delay="${N42_GOV_REMOTE_RETRY_DELAY_SECONDS:-10}"
+  [[ "$attempts" =~ ^[1-9][0-9]*$ ]]
+  [[ "$delay" =~ ^[0-9]+$ ]]
+  for ((attempt=1; attempt<=attempts; attempt++)); do
+    if remote="$(git -C "$gov_repo" ls-remote origin refs/heads/main 2>/dev/null |
+      awk 'NR==1{print $1}')" && [[ "$remote" =~ ^[0-9a-f]{40}$ ]]; then
+      printf '%s\n' "$remote"
+      return 0
+    fi
+    if test "$attempt" -lt "$attempts"; then
+      sleep "$delay"
+    fi
+  done
+  return 1
+}
+
 assert_state() {
   local item remote
   test "$(sha256 "$network_auditor")" = "$expected_network_sha"
@@ -61,8 +80,7 @@ assert_state() {
     "$runtime/evidence/gov5-906-total-goal-final-verification-failure.json"; do
     test ! -s "$item"
   done
-  remote="$(git -C "$gov_repo" ls-remote origin refs/heads/main | \
-    awk 'NR==1{print $1}')"
+  remote="$(remote_main_with_retry)"
   test "$remote" = "$expected_main"
 }
 

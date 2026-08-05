@@ -53,6 +53,25 @@ rpc() {
     "http://127.0.0.1:$port"
 }
 
+remote_main_with_retry() {
+  local attempt remote=""
+  local attempts="${N42_GOV_REMOTE_RETRY_ATTEMPTS:-6}"
+  local delay="${N42_GOV_REMOTE_RETRY_DELAY_SECONDS:-10}"
+  [[ "$attempts" =~ ^[1-9][0-9]*$ ]]
+  [[ "$delay" =~ ^[0-9]+$ ]]
+  for ((attempt=1; attempt<=attempts; attempt++)); do
+    if remote="$(git -C "$gov_repo" ls-remote origin refs/heads/main 2>/dev/null |
+      awk 'NR==1{print $1}')" && [[ "$remote" =~ ^[0-9a-f]{40}$ ]]; then
+      printf '%s\n' "$remote"
+      return 0
+    fi
+    if test "$attempt" -lt "$attempts"; then
+      sleep "$delay"
+    fi
+  done
+  return 1
+}
+
 check_wait_state() {
   local file remote
   for file in "$runtime"/pids/gov{1,2,3,4,5}.pid "$runtime/pids/rust.pid"; do
@@ -67,7 +86,7 @@ check_wait_state() {
     "$runtime/evidence/runtime22-monitor-pid-guardian-failures.jsonl"; do
     test ! -s "$file"
   done
-  remote="$(git -C "$gov_repo" ls-remote origin refs/heads/main | awk 'NR==1{print $1}')"
+  remote="$(remote_main_with_retry)"
   test "$remote" = "$expected_main"
   test "$(jq -er '.status' "$static_baseline")" = PASS
 }

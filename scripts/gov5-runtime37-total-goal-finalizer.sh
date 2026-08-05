@@ -48,6 +48,8 @@ correction_waiter_failure="$evidence/runtime37-latest-c0a146-formal-15m-resource
 correction_waiter_v2_failure="$evidence/runtime37-latest-c0a146-formal-15m-resource-correction-v2-failure.json"
 controller_rebind_correction="$evidence/runtime37-finalizer-session-keeper-rebind-correction.json"
 independent_harness_rebind="$evidence/runtime37-independent-verifier-harness-rebind.json"
+milestone_4h_transient_failure="$evidence/gov5-906-formal-4h-milestone-controller-transient-failure.json"
+milestone_remote_retry_correction="$evidence/runtime37-formal-4h-milestone-network-retry-correction.json"
 latest_reth="$evidence/latest-reth-final-qualification.json"
 output="${N42_TOTAL_OUTPUT:-$evidence/runtime37-goal-completion.json}"
 compat_output="${N42_TOTAL_COMPAT_OUTPUT:-$evidence/gov5-906-goal-completion-audit-v2.json}"
@@ -187,6 +189,37 @@ assert_controller_rebind_correction() {
   fi
 }
 
+assert_milestone_remote_retry_correction() {
+  test -s "$milestone_4h_transient_failure"
+  test -s "$milestone_remote_retry_correction"
+  jq -e '
+    .event=="gov5_qualification_milestone_failure" and
+    .status=="FAIL" and .label=="formal-4h" and .statusCode==128 and
+    .command=="remote=\"$(git -C \"$gov_repo\" ls-remote origin refs/heads/main |\n    awk '\''NR==1 {print $1}'\'')\""
+  ' "$milestone_4h_transient_failure" >/dev/null
+  jq -e --arg failure_sha "$(sha256 "$milestone_4h_transient_failure")" \
+    --arg expected "$expected_gov_main" \
+    --arg milestone_sha "$(sha256 "$runtime/artifacts/scripts/gov5-qualification-milestone-waiter.sh")" \
+    --arg supplemental_sha "$(sha256 "$runtime/artifacts/scripts/gov5-milestone-supplemental-audit-waiter.sh")" \
+    --arg deep_sha "$(sha256 "$runtime/artifacts/scripts/gov5-runtime-milestone-deep-audit-v2.sh")" '
+    .event=="runtime37_formal_4h_milestone_network_retry_correction" and
+    .status=="PASS" and .acceptanceRelaxed==false and
+    .priorFailure.sha256==$failure_sha and .priorFailure.preserved==true and
+    .priorFailure.controllerOnly==true and .priorFailure.statusCode==128 and
+    .remoteRecheck.main==$expected and .remoteRecheck.exact==true and
+    .retryPolicy.attempts==6 and .retryPolicy.delaySeconds==10 and
+    .retryPolicy.failsAfterExhaustion==true and
+    .replacementScripts.milestoneSha256==$milestone_sha and
+    .replacementScripts.supplementalSha256==$supplemental_sha and
+    .replacementScripts.deepAuditSha256==$deep_sha and
+    .formalWindow.continuous==true and .formalWindow.maximumGapSeconds<=120 and
+    .formalWindow.failedSamples==0 and .formalWindow.zeroTransactionRequired==true and
+    .chainDataMutationPerformed==false and
+    .nodeOrFormalMonitorMutationPerformed==false and
+    .controllersRelaunched==true and .controllerFailureCorrected==true
+  ' "$milestone_remote_retry_correction" >/dev/null
+}
+
 assert_no_uncorrected_failures() {
   local item
   for item in \
@@ -201,6 +234,7 @@ assert_no_uncorrected_failures() {
   if test -s "$correction_waiter_failure"; then
     assert_controller_rebind_correction
   fi
+  assert_milestone_remote_retry_correction
 }
 
 assert_live() {
@@ -458,6 +492,7 @@ jq -nc --arg at "$(date -u +%FT%TZ)" --arg self "$expected_self_sha" \
   --arg static_sha "$(sha256 "$static")" --arg copy_sha "$(sha256 "$copied")" \
   --arg supplemental_correction_sha "$(sha256 "$supplemental_15m_correction")" \
   --arg controller_rebind_sha "$(sha256 "$controller_rebind_correction")" \
+  --arg milestone_remote_retry_sha "$(sha256 "$milestone_remote_retry_correction")" \
   --arg independent_harness_rebind_sha "$(sha256 "$independent_harness_rebind")" \
   --arg correction_waiter_failure_sha "$(sha256 "$correction_waiter_failure")" \
   --arg latest_reth_sha "$(sha256 "$latest_reth")" \
@@ -471,6 +506,7 @@ jq -nc --arg at "$(date -u +%FT%TZ)" --arg self "$expected_self_sha" \
     officialRethStable:"v2.4.1",
     correctedShortWindowResourceProjectionFailure:true,
     correctedControllerRebindFailure:true,correctedIndependentVerifierHarnessPin:true,
+    correctedMilestoneRemoteRetryFailure:true,
     failureEvidencePreserved:true,
     noUncorrectedFailureEvidence:true,noConsensusOrDataFailureEvidence:true,
     sourceAndRemotePinsExact:true,binariesExact:true,
@@ -479,6 +515,7 @@ jq -nc --arg at "$(date -u +%FT%TZ)" --arg self "$expected_self_sha" \
       strict24hSixProducer:$producer_sha,staticBoundary:$static_sha,stoppedDataCopy:$copy_sha,
       supplemental15mResourceCorrection:$supplemental_correction_sha,
       controllerRebindCorrection:$controller_rebind_sha,
+      milestoneRemoteRetryCorrection:$milestone_remote_retry_sha,
       independentVerifierHarnessRebind:$independent_harness_rebind_sha,
       preservedCorrectionWaiterFailure:$correction_waiter_failure_sha,
       latestRethQualification:$latest_reth_sha}}' >"$temporary"
@@ -488,6 +525,7 @@ jq -e '.status=="PASS" and .strict24h.elapsedSeconds>=86400 and .strict24h.maxim
   .sourceAndRemotePinsExact==true and
   .objectiveRequirementsExtendedClosure==true and
   .correctedIndependentVerifierHarnessPin==true and
+  .correctedMilestoneRemoteRetryFailure==true and
   .failureEvidencePreserved==true and .noUncorrectedFailureEvidence==true and
   .noConsensusOrDataFailureEvidence==true' "$temporary" >/dev/null
 mv "$temporary" "$output"
