@@ -41,6 +41,8 @@ copied="$evidence/runtime36-stopped-copy-manifest.json"
 static="$evidence/runtime36-latest-c0a146-static-boundary.json"
 data_905="$evidence/runtime36-latest-c0a146-905-data-compatibility.json"
 network="$evidence/runtime36-latest-c0a146-network-consensus-matrix.json"
+supplemental_launch_failure="$evidence/runtime36-latest-c0a146-formal-15m-supplemental-audit-failure.json"
+supplemental_launch_correction="$evidence/runtime36-latest-c0a146-formal-15m-supplemental-launch-correction.json"
 latest_reth="$evidence/latest-reth-final-qualification.json"
 output="${N42_TOTAL_OUTPUT:-$evidence/runtime36-goal-completion.json}"
 failure="${N42_TOTAL_FAILURE:-$evidence/runtime36-goal-completion-failure.json}"
@@ -104,6 +106,16 @@ assert_no_failures() {
     "$evidence/runtime28-strict24h-six-producer-full-range-failure.json"; do
     test ! -s "$item"
   done
+  if test -s "$supplemental_launch_failure"; then
+    test -s "$supplemental_launch_correction"
+    jq -e --arg failure_sha "$(sha256 "$supplemental_launch_failure")" '
+      .status=="PASS" and .originalFailurePreserved==true and
+      .originalFailureSha256==$failure_sha and .chainOrDataMutation==false and
+      .correctedAuditStatus=="PASS" and .acceptanceRelaxed==false and
+      .transactionsSent==0 and .nodesRestarted==false and
+      .rawFormalEvidenceEdited==false
+    ' "$supplemental_launch_correction" >/dev/null
+  fi
 }
 
 assert_live() {
@@ -278,6 +290,7 @@ jq -nc --arg at "$(date -u +%FT%TZ)" --arg self "$expected_self_sha" \
   --arg interop "$expected_interop" --arg strict_sha "$(sha256 "$strict")" \
   --arg independent_sha "$(sha256 "$independent")" --arg producer_sha "$(sha256 "$producer")" \
   --arg static_sha "$(sha256 "$static")" --arg copy_sha "$(sha256 "$copied")" \
+  --arg supplemental_correction_sha "$(sha256 "$supplemental_launch_correction")" \
   --arg latest_reth_sha "$(sha256 "$latest_reth")" \
   '{at:$at,event:"runtime36_goal_completion",status:"PASS",acceptanceRelaxed:false,
     objectiveRequirementsExtendedClosure:true,verifierScriptSha256:$self,strict24h:$strict,
@@ -286,10 +299,12 @@ jq -nc --arg at "$(date -u +%FT%TZ)" --arg self "$expected_self_sha" \
     strict24hZeroTransactionExact:true,sixProducerRotationExact:true,transactionsFinalized:17,
     archiveAndQmdbParityExact:true,controlledRustRestartRejoined:true,postRestartStabilityExact:true,
     staticDataAndToolsExact:true,zeroEquivocations:true,officialRethStable:"v2.4.1",
+    correctedNonAcceptanceToolingFailureEvidence:true,noUncorrectedFailureEvidence:true,
     sourceAndRemotePinsExact:true,binariesExact:true,
     sources:{govMain:$gov_main,govCandidate:$gov_candidate,n42:$n42,reth:$reth,interopTooling:$interop,allPushed:true},
     evidenceSha256:{strictSummary:$strict_sha,independentVerification:$independent_sha,
       strict24hSixProducer:$producer_sha,staticBoundary:$static_sha,stoppedDataCopy:$copy_sha,
+      supplementalLaunchCorrection:$supplemental_correction_sha,
       latestRethQualification:$latest_reth_sha},noFailureEvidence:true}' >"$temporary"
 jq -e '.status=="PASS" and .strict24h.elapsedSeconds>=86400 and .strict24h.maximumLag<=1 and
   .transactionsFinalized==17 and .sixProducerRotationExact==true and
