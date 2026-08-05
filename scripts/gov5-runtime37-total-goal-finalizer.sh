@@ -19,6 +19,7 @@ expected_rust_binary="d639f712a87c22c2a45de29dbd895897058a8a28e4a2145061bd195d79
 expected_verifier="${N42_TOTAL_EXPECTED_VERIFIER_SHA:?independent verifier SHA-256 is required}"
 expected_finalizer="${N42_TOTAL_EXPECTED_FINALIZER_SHA:?qualification finalizer SHA-256 is required}"
 expected_static="${N42_TOTAL_EXPECTED_STATIC_SHA:?static boundary SHA-256 is required}"
+expected_harness="210517ae2b40233a078b4a2999e07ea9bd2f6211d30d24a87eaf481473f5376b"
 expected_genesis="0xb71c28109836f120453d097c38819a55b14c49abcc92713037fb9b11201392ec"
 expected_905_boundary="0xb88a3571223cf8cd8291d608572a55f306ea88957cc7ede8ab6b8812ada85a82"
 expected_security_boundary="0x7ccd33002b040389eb0627fca27ef361e330234f85091b016c5e3c4256332407"
@@ -46,6 +47,7 @@ supplemental_15m_correction="$evidence/runtime37-latest-c0a146-formal-15m-correc
 correction_waiter_failure="$evidence/runtime37-latest-c0a146-formal-15m-resource-correction-failure.json"
 correction_waiter_v2_failure="$evidence/runtime37-latest-c0a146-formal-15m-resource-correction-v2-failure.json"
 controller_rebind_correction="$evidence/runtime37-finalizer-session-keeper-rebind-correction.json"
+independent_harness_rebind="$evidence/runtime37-independent-verifier-harness-rebind.json"
 latest_reth="$evidence/latest-reth-final-qualification.json"
 output="${N42_TOTAL_OUTPUT:-$evidence/runtime37-goal-completion.json}"
 compat_output="${N42_TOTAL_COMPAT_OUTPUT:-$evidence/gov5-906-goal-completion-audit-v2.json}"
@@ -119,8 +121,36 @@ assert_nodes() {
   fi
 }
 
+assert_independent_harness_rebind() {
+  local independent_pid
+  test -s "$independent_harness_rebind"
+  jq -e \
+    --arg prior_rebind_sha "$(sha256 "$controller_rebind_correction")" \
+    --arg verifier_sha "$expected_verifier" --arg harness_sha "$expected_harness" \
+    --arg waiter_sha "$(sha256 "$runtime/artifacts/scripts/gov5-strict-independent-verifier-waiter.sh")" '
+    .event=="runtime37_independent_verifier_harness_rebind" and
+    .status=="PASS" and .acceptanceRelaxed==false and
+    .priorRebindCorrectionSha256==$prior_rebind_sha and
+    .oldIndependentWaiter.pid==55356 and
+    .oldIndependentWaiter.verifierSha256=="35bfee43ecd472540c0e09a42855c103735a2f67ada43bfda88e46f727c6909b" and
+    .newIndependentWaiter.verifierSha256==$verifier_sha and
+    .newIndependentWaiter.waiterSha256==$waiter_sha and
+    .newIndependentWaiter.harnessSha256==$harness_sha and
+    .formalWindow.continuous==true and .formalWindow.maximumGapSeconds<=120 and
+    .formalWindow.failedSamples==0 and .formalWindow.zeroTransactionRequired==true and
+    .chainDataMutationPerformed==false and
+    .nodeOrFormalMonitorMutationPerformed==false and
+    .independentVerifierHarnessPinCorrected==true
+  ' "$independent_harness_rebind" >/dev/null
+  if ! test -s "$independent"; then
+    independent_pid="$(jq -er '.newIndependentWaiter.pid' "$independent_harness_rebind")"
+    kill -0 "$independent_pid"
+    ps -p "$independent_pid" -o command= | rg -F 'gov5-strict-independent-verifier-waiter.sh' >/dev/null
+  fi
+}
+
 assert_controller_rebind_correction() {
-  local finalizer_pid independent_pid
+  local finalizer_pid
   test -s "$correction_waiter_failure"
   test -s "$controller_rebind_correction"
   jq -e '
@@ -144,11 +174,7 @@ assert_controller_rebind_correction() {
   finalizer_pid="$(jq -er '.newControllers.finalizerPid' "$controller_rebind_correction")"
   kill -0 "$finalizer_pid"
   ps -p "$finalizer_pid" -o command= | rg -F 'gov5-current-qualification-finalizer.sh' >/dev/null
-  if ! test -s "$independent"; then
-    independent_pid="$(jq -er '.newControllers.independentWaiterPid' "$controller_rebind_correction")"
-    kill -0 "$independent_pid"
-    ps -p "$independent_pid" -o command= | rg -F 'gov5-strict-independent-verifier-waiter.sh' >/dev/null
-  fi
+  assert_independent_harness_rebind
   if test -s "$supplemental_15m_correction"; then
     jq -e --arg failure_sha "$(sha256 "$correction_waiter_failure")" \
       --arg rebind_sha "$(sha256 "$controller_rebind_correction")" '
@@ -207,6 +233,7 @@ assert_static() {
   test "$(sha256 "$runtime/n42-node")" = "$expected_rust_binary"
   test "$(sha256 "$verifier")" = "$expected_verifier"
   test "$(sha256 "$runtime/artifacts/scripts/gov5-current-qualification-finalizer.sh")" = "$expected_finalizer"
+  test "$(sha256 "$runtime/artifacts/scripts/gov5-interop-qualification.sh")" = "$expected_harness"
   test "$(sha256 "$static")" = "$expected_static"
   "$runtime/n42-node" --version | rg -F 'Reth Version: 2.4.1' >/dev/null
   "$runtime/n42-node" --version | rg -F "Commit SHA: $expected_reth" >/dev/null
@@ -382,6 +409,7 @@ env N42_QUAL_RUNTIME="$runtime" N42_VERIFY_REPO="$n42_repo" N42_QUAL_GOV_REPO="$
   N42_VERIFY_GOV_CANDIDATE="$expected_gov_candidate" N42_VERIFY_DEPS_HEAD="$expected_n42" \
   N42_VERIFY_RETH_HEAD="$expected_reth" N42_VERIFY_GOV_BINARY_SHA="$expected_gov_binary" \
   N42_VERIFY_RUST_BINARY_SHA="$expected_rust_binary" N42_VERIFY_FINALIZER_SHA="$expected_finalizer" \
+  N42_VERIFY_HARNESS_SHA="$expected_harness" \
   "$verifier" >"$audit_dir/independent.json"
 jq -e '.status=="PASS" and .transactionsFinalized==17' "$audit_dir/independent.json" >/dev/null
 
@@ -419,6 +447,7 @@ jq -nc --arg at "$(date -u +%FT%TZ)" --arg self "$expected_self_sha" \
   --arg static_sha "$(sha256 "$static")" --arg copy_sha "$(sha256 "$copied")" \
   --arg supplemental_correction_sha "$(sha256 "$supplemental_15m_correction")" \
   --arg controller_rebind_sha "$(sha256 "$controller_rebind_correction")" \
+  --arg independent_harness_rebind_sha "$(sha256 "$independent_harness_rebind")" \
   --arg correction_waiter_failure_sha "$(sha256 "$correction_waiter_failure")" \
   --arg latest_reth_sha "$(sha256 "$latest_reth")" \
   '{at:$at,event:"runtime37_goal_completion",status:"PASS",acceptanceRelaxed:false,
@@ -430,7 +459,8 @@ jq -nc --arg at "$(date -u +%FT%TZ)" --arg self "$expected_self_sha" \
     intermediateMilestonesExact:true,staticDataAndToolsExact:true,zeroEquivocations:true,
     officialRethStable:"v2.4.1",
     correctedShortWindowResourceProjectionFailure:true,
-    correctedControllerRebindFailure:true,failureEvidencePreserved:true,
+    correctedControllerRebindFailure:true,correctedIndependentVerifierHarnessPin:true,
+    failureEvidencePreserved:true,
     noUncorrectedFailureEvidence:true,noConsensusOrDataFailureEvidence:true,
     sourceAndRemotePinsExact:true,binariesExact:true,
     sources:{govMain:$gov_main,govCandidate:$gov_candidate,n42:$n42,reth:$reth,interopTooling:$interop,allPushed:true},
@@ -438,6 +468,7 @@ jq -nc --arg at "$(date -u +%FT%TZ)" --arg self "$expected_self_sha" \
       strict24hSixProducer:$producer_sha,staticBoundary:$static_sha,stoppedDataCopy:$copy_sha,
       supplemental15mResourceCorrection:$supplemental_correction_sha,
       controllerRebindCorrection:$controller_rebind_sha,
+      independentVerifierHarnessRebind:$independent_harness_rebind_sha,
       preservedCorrectionWaiterFailure:$correction_waiter_failure_sha,
       latestRethQualification:$latest_reth_sha}}' >"$temporary"
 jq -e '.status=="PASS" and .strict24h.elapsedSeconds>=86400 and .strict24h.maximumLag<=1 and
@@ -445,6 +476,7 @@ jq -e '.status=="PASS" and .strict24h.elapsedSeconds>=86400 and .strict24h.maxim
   .controlledRustRestartRejoined==true and .intermediateMilestonesExact==true and
   .sourceAndRemotePinsExact==true and
   .objectiveRequirementsExtendedClosure==true and
+  .correctedIndependentVerifierHarnessPin==true and
   .failureEvidencePreserved==true and .noUncorrectedFailureEvidence==true and
   .noConsensusOrDataFailureEvidence==true' "$temporary" >/dev/null
 mv "$temporary" "$output"

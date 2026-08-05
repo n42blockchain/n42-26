@@ -19,6 +19,7 @@ expected_reth_head="${N42_VERIFY_RETH_HEAD:-0fc810bae34412838bedfd8dc2f212e14e91
 expected_gov_binary_sha="${N42_VERIFY_GOV_BINARY_SHA:-e08c1ea7aac198e268d7fb07eacce33347798c90f33532ffc4cd85bfc1af7033}"
 expected_rust_binary_sha="${N42_VERIFY_RUST_BINARY_SHA:-d639f712a87c22c2a45de29dbd895897058a8a28e4a2145061bd195d79eb6d2e}"
 expected_finalizer_sha="${N42_VERIFY_FINALIZER_SHA:-c48c5f3a94e361ce7cb81b41c586e12907f7a2adff688cb661062d9d21692fa0}"
+expected_harness_sha="${N42_VERIFY_HARNESS_SHA:-aa906f42b83048cb4168e1ceb1077d1ca8b27429be5189acd1aaa74f06c551e9}"
 
 require_file() {
   test -f "$1" || {
@@ -161,7 +162,7 @@ assert_pinned_inputs() {
   assert_sha "$runtime/artifacts/bootstrap-bundle.json" \
     35dda59684e7f56978e5d8de385fa2d2bf15b47747388b88a7449ac31387bf15
   assert_sha "$runtime/artifacts/scripts/gov5-interop-qualification.sh" \
-    aa906f42b83048cb4168e1ceb1077d1ca8b27429be5189acd1aaa74f06c551e9
+    "$expected_harness_sha"
   assert_sha "$runtime/artifacts/scripts/gov5-current-qualification-finalizer.sh" \
     "$expected_finalizer_sha"
   assert_sha "$runtime/artifacts/binaries/n42-qmdb-proof-verify" \
@@ -182,11 +183,13 @@ if test "$preflight_only" = 1; then
   assert_sender_nonce 0x11
   jq -nc --arg at "$(date -u +%FT%TZ)" \
     --arg verifier_sha "$expected_verifier_script_sha" \
+    --arg harness_sha "$expected_harness_sha" \
     '{at:$at,event:"gov5_906_independent_final_verifier_preflight",
       status:"PASS",liveChainExact:true,genesisExact:true,
       consensusReady:true,zeroEquivocations:true,pinnedInputsExact:true,
       sourcesAndRemotesExact:true,qmdbTruncIndexDisabledOnAllGovNodes:true,
       verifierScriptSha256:(if $verifier_sha == "" then null else $verifier_sha end),
+      qualificationHarnessSha256:$harness_sha,
       senderNonce:"0x11",transactionsSent:0}'
   exit 0
 fi
@@ -406,9 +409,11 @@ jq -nc \
   --arg summary "$summary" \
   --arg summary_sha256 "$(sha256 "$summary")" \
   --arg verifier_sha "${expected_verifier_script_sha:-$(sha256 "$verifier_script")}" \
+  --arg harness_sha "$expected_harness_sha" \
   '{at:$at,event:"gov5_906_independent_final_verification",status:"PASS",
     summary:$summary,summarySha256:$summary_sha256,
     verifierScriptSha256:$verifier_sha,
+    qualificationHarnessSha256:$harness_sha,
     allEvidenceHashesRecomputedExact:true,allEmbeddedAuditsExact:true,
     independentRawAuditsReexecuted:true,liveArchiveParityReexecuted:true,
     immutableFinalLogExact:true,

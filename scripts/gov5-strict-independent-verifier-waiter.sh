@@ -10,6 +10,7 @@ reth_repo="${N42_INDEPENDENT_RETH_REPO:?Reth repository is required}"
 expected_self_sha="${N42_INDEPENDENT_EXPECTED_SELF_SHA:?waiter SHA-256 is required}"
 expected_verifier_sha="${N42_INDEPENDENT_VERIFIER_SHA:?verifier SHA-256 is required}"
 expected_finalizer_sha="${N42_INDEPENDENT_FINALIZER_SHA:?finalizer SHA-256 is required}"
+expected_harness_sha="${N42_INDEPENDENT_HARNESS_SHA:?qualification harness SHA-256 is required}"
 expected_gov_main="${N42_INDEPENDENT_GOV_MAIN:?Gov5 main commit is required}"
 expected_gov_candidate="${N42_INDEPENDENT_GOV_CANDIDATE:?Gov5 candidate commit is required}"
 expected_deps_head="${N42_INDEPENDENT_DEPS_HEAD:?dependency commit is required}"
@@ -122,6 +123,7 @@ env \
   N42_VERIFY_GOV_BINARY_SHA="$expected_gov_binary_sha" \
   N42_VERIFY_RUST_BINARY_SHA="$expected_rust_binary_sha" \
   N42_VERIFY_FINALIZER_SHA="$expected_finalizer_sha" \
+  N42_VERIFY_HARNESS_SHA="$expected_harness_sha" \
   "$verifier" >"$temporary"
 test -s "$temporary"
 jq -e '.status == "PASS"' "$temporary" >/dev/null
