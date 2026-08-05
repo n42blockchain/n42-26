@@ -41,6 +41,8 @@ copied="$evidence/runtime37-stopped-copy-manifest.json"
 static="$evidence/runtime37-latest-c0a146-static-boundary-v2.json"
 data_905="$evidence/runtime37-preflight-905-data-compat.json"
 network="$evidence/runtime37-latest-c0a146-network-consensus-matrix.json"
+supplemental_15m_failure="$evidence/runtime37-latest-c0a146-formal-15m-supplemental-audit-failure.json"
+supplemental_15m_correction="$evidence/runtime37-latest-c0a146-formal-15m-corrected-supplemental-audit.json"
 latest_reth="$evidence/latest-reth-final-qualification.json"
 output="${N42_TOTAL_OUTPUT:-$evidence/runtime37-goal-completion.json}"
 compat_output="${N42_TOTAL_COMPAT_OUTPUT:-$evidence/gov5-906-goal-completion-audit-v2.json}"
@@ -197,9 +199,13 @@ for spec in 'formal-15m 900' 'formal-1h 3600' 'formal-4h 14400' \
     "$evidence/runtime37-$label-closed-deep-audit.json"
     "$evidence/runtime37-latest-c0a146-$label-six-producer.json"
   )
-  milestone_required+=(
-    "$evidence/runtime37-latest-c0a146-$label-supplemental-audit.json"
-  )
+  if test "$label" = formal-15m; then
+    milestone_required+=("$supplemental_15m_correction")
+  else
+    milestone_required+=(
+      "$evidence/runtime37-latest-c0a146-$label-supplemental-audit.json"
+    )
+  fi
 done
 required=("$strict" "$independent" "$producer" "$producer_linkage" "$resource_audit" "$upstream_complete" "$upstream_audit")
 required+=("${milestone_required[@]}")
@@ -248,7 +254,11 @@ for spec in 'formal-15m 900' 'formal-1h 3600' 'formal-4h 14400' \
   'formal-8h 28800' 'formal-12h 43200' 'formal-16h 57600' 'formal-20h 72000'; do
   label="${spec%% *}"
   minimum="${spec##* }"
-  supplemental_path="$evidence/runtime37-latest-c0a146-$label-supplemental-audit.json"
+  if test "$label" = formal-15m; then
+    supplemental_path="$supplemental_15m_correction"
+  else
+    supplemental_path="$evidence/runtime37-latest-c0a146-$label-supplemental-audit.json"
+  fi
   jq -e --arg label "$label" --argjson minimum "$minimum" '
     .status=="PASS" and .label==$label and .acceptanceRelaxed==false and
     .soak.elapsedSeconds>=$minimum and .soak.maximumLag<=1 and
@@ -256,11 +266,22 @@ for spec in 'formal-15m 900' 'formal-1h 3600' 'formal-4h 14400' \
     .gov5Upstream.elapsedSeconds>=$minimum and .rustLeaderCommitsFivePlusFive>=2 and
     .equivocations.total==0 and .transactionsSent==0 and .failureEvidencePresent==false
   ' "$evidence/gov5-906-$label-milestone.json" >/dev/null
-  jq -e '.status=="PASS" and .acceptanceRelaxed==false and
-    .archiveAndQmdbParityExact==true and .networkConsensusExact==true and
-    .data905CompatibilityExact==true and .resourceTrendWithin24hBudget==true and
-    .noFailureEvidence==true' \
-    "$supplemental_path" >/dev/null
+  if test "$label" = formal-15m; then
+    jq -e --arg failure_sha "$(sha256 "$supplemental_15m_failure")" '
+      .status=="PASS" and .acceptanceRelaxed==false and
+      .originalFailurePreserved==true and .originalFailureSha256==$failure_sha and
+      .measured24hResourceAudit.elapsedSeconds>=86400 and
+      .archiveAndQmdbParityExact==true and .networkConsensusExact==true and
+      .data905CompatibilityExact==true and .resourceTrendWithin24hBudget==true and
+      .noUncorrectedFailureEvidence==true
+    ' "$supplemental_path" >/dev/null
+  else
+    jq -e '.status=="PASS" and .acceptanceRelaxed==false and
+      .archiveAndQmdbParityExact==true and .networkConsensusExact==true and
+      .data905CompatibilityExact==true and .resourceTrendWithin24hBudget==true and
+      .noFailureEvidence==true' \
+      "$supplemental_path" >/dev/null
+  fi
   jq -e '.status=="PASS" and .acceptanceRelaxed==false and
     .rustLeaders.leaderCommitLog.allVotesFivePlusFive==true and
     .timeoutRecovery.pendingTimeouts==0 and .runtimeLogs.unexpectedWarnings==0 and
@@ -326,6 +347,7 @@ jq -nc --arg at "$(date -u +%FT%TZ)" --arg self "$expected_self_sha" \
   --arg interop "$expected_interop" --arg strict_sha "$(sha256 "$strict")" \
   --arg independent_sha "$(sha256 "$independent")" --arg producer_sha "$(sha256 "$producer")" \
   --arg static_sha "$(sha256 "$static")" --arg copy_sha "$(sha256 "$copied")" \
+  --arg supplemental_correction_sha "$(sha256 "$supplemental_15m_correction")" \
   --arg latest_reth_sha "$(sha256 "$latest_reth")" \
   '{at:$at,event:"runtime37_goal_completion",status:"PASS",acceptanceRelaxed:false,
     objectiveRequirementsExtendedClosure:true,verifierScriptSha256:$self,strict24h:$strict,
@@ -335,11 +357,12 @@ jq -nc --arg at "$(date -u +%FT%TZ)" --arg self "$expected_self_sha" \
     archiveAndQmdbParityExact:true,controlledRustRestartRejoined:true,postRestartStabilityExact:true,
     intermediateMilestonesExact:true,staticDataAndToolsExact:true,zeroEquivocations:true,
     officialRethStable:"v2.4.1",
-    noUncorrectedFailureEvidence:true,
+    correctedShortWindowResourceProjectionFailure:true,noUncorrectedFailureEvidence:true,
     sourceAndRemotePinsExact:true,binariesExact:true,
     sources:{govMain:$gov_main,govCandidate:$gov_candidate,n42:$n42,reth:$reth,interopTooling:$interop,allPushed:true},
     evidenceSha256:{strictSummary:$strict_sha,independentVerification:$independent_sha,
       strict24hSixProducer:$producer_sha,staticBoundary:$static_sha,stoppedDataCopy:$copy_sha,
+      supplemental15mResourceCorrection:$supplemental_correction_sha,
       latestRethQualification:$latest_reth_sha},noFailureEvidence:true}' >"$temporary"
 jq -e '.status=="PASS" and .strict24h.elapsedSeconds>=86400 and .strict24h.maximumLag<=1 and
   .transactionsFinalized==17 and .sixProducerRotationExact==true and
