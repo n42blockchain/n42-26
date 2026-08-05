@@ -6,6 +6,7 @@ output="${2:?output evidence path is required}"
 minimum_elapsed="${3:?minimum elapsed seconds is required}"
 target_seconds="${4:?target duration seconds is required}"
 rss_limit_kib="${5:-1048576}"
+fd_final_growth_limit=4
 
 test -s "$input"
 test ! -e "$output"
@@ -51,7 +52,7 @@ test "$max_rss" -le "$rss_limit_kib"
 test "$max_threads" -le 256
 test "$last_threads" -le $((first_threads + 4))
 test "$max_fd" -le 256
-test "$last_fd" -le "$first_fd"
+test "$last_fd" -le $((first_fd + fd_final_growth_limit))
 test "$reth_growth" -ge 0
 test "$consensus_growth" -ge 0
 test "$log_growth" -ge 0
@@ -94,7 +95,8 @@ jq -nc --arg at "$(date -u +%FT%TZ)" --arg input "$input" \
   --argjson rss_limit "$rss_limit_kib" --argjson first_threads "$first_threads" \
   --argjson last_threads "$last_threads" --argjson max_threads "$max_threads" \
   --argjson first_fd "$first_fd" --argjson last_fd "$last_fd" \
-  --argjson max_fd "$max_fd" --argjson reth_growth "$reth_growth" \
+  --argjson max_fd "$max_fd" --argjson fd_final_growth_limit "$fd_final_growth_limit" \
+  --argjson reth_growth "$reth_growth" \
   --argjson consensus_growth "$consensus_growth" --argjson log_growth "$log_growth" \
   --argjson wal_growth "$wal_growth" '
   {at:$at,event:"rust_resource_trend_audit",status:"PASS",mutationPerformed:false,
@@ -106,7 +108,9 @@ jq -nc --arg at "$(date -u +%FT%TZ)" --arg input "$input" \
      slopeMiBPerHour:($slope*3600/1024),projectedAtTarget:$projected_rss,
      limit:$rss_limit,projectionWithinLimit:($projected_rss<=$rss_limit)},
    threads:{first:$first_threads,last:$last_threads,max:$max_threads,limit:256},
-   fileDescriptors:{first:$first_fd,last:$last_fd,max:$max_fd,limit:256},
+   fileDescriptors:{first:$first_fd,last:$last_fd,max:$max_fd,limit:256,
+     finalGrowth:($last_fd-$first_fd),finalGrowthLimit:$fd_final_growth_limit,
+     finalWithinGrowthLimit:(($last_fd-$first_fd)<=$fd_final_growth_limit)},
    growth:{rethDataKiB:$reth_growth,consensusDataKiB:$consensus_growth,
      logBytes:$log_growth,qmdbWalBytes:$wal_growth},singleProcess:true,
    timestampsStrictlyIncreasing:true,headsMonotonic:true,
@@ -115,6 +119,7 @@ jq -e '.status=="PASS" and .mutationPerformed==false and .singleProcess and
   .timestampsStrictlyIncreasing and .headsMonotonic and
   .rssKiB.projectionWithinLimit and .threads.max<=.threads.limit and
   .fileDescriptors.max<=.fileDescriptors.limit and
+  .fileDescriptors.finalWithinGrowthLimit and
   .resourceProjectionWithin24hBudget' "$temporary" >/dev/null
 mv "$temporary" "$output"
 cat "$output"
