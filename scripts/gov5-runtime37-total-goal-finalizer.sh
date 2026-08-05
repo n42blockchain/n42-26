@@ -39,7 +39,7 @@ upstream_complete="$evidence/gov5-upstream-24h-complete.json"
 upstream_audit="$evidence/gov5-upstream-24h-audit.json"
 stable="$evidence/official-reth-stable-monitor.jsonl"
 copied="$evidence/runtime37-stopped-copy-manifest.json"
-static="${N42_TOTAL_STATIC:-$evidence/runtime37-latest-c0a146-static-boundary-v3.json}"
+static="${N42_TOTAL_STATIC:-$evidence/runtime37-latest-c0a146-static-boundary-v4.json}"
 data_905="$evidence/runtime37-preflight-905-data-compat.json"
 network="$evidence/runtime37-latest-c0a146-network-consensus-matrix.json"
 supplemental_15m_failure="$evidence/runtime37-latest-c0a146-formal-15m-supplemental-audit-failure.json"
@@ -348,13 +348,17 @@ assert_static() {
   test "$(sha256 "$runtime/artifacts/scripts/gov5-interop-qualification.sh")" = "$expected_harness"
   test "$(sha256 "$static")" = "$expected_static"
   jq -e --arg verifier "$expected_verifier" \
-    --arg prior "b1931cea87f9d1c104e8246cfcc0f857d5568135b8440137e446be24168b766c" \
-    --arg rebind "$(sha256 "$independent_harness_rebind")" '
+    --arg finalizer "$expected_finalizer" \
+    --arg prior "8da5cab89800d914f38621f3f7da0dfc99a91b14a5d80f1076c3ca8e1543df38" \
+    --arg rebind "$(sha256 "$remote_retry_controller_rebind")" '
     .status=="PASS" and .acceptanceRelaxed==false and
     .frozenTools.independentVerifierSha256==$verifier and
+    .frozenTools.finalizerSha256==$finalizer and
     .correction.priorBaselineSha256==$prior and
     .correction.priorBaselinePreserved==true and
-    .correction.independentVerifierHarnessRebindSha256==$rebind and
+    .correction.remoteRetryControllerRebindSha256==$rebind and
+    .correction.independentVerifierSha256==$verifier and
+    .correction.finalizerSha256==$finalizer and
     .correction.chainDataMutationPerformed==false and
     .correction.nodeOrFormalMonitorMutationPerformed==false
   ' "$static" >/dev/null

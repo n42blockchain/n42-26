@@ -53,6 +53,7 @@ rg -F '.correctedRemoteRetryControllerRebind==true' "$total_finalizer" >/dev/nul
 rg -F 'static="${N42_TOTAL_STATIC:-' "$total_finalizer" >/dev/null
 rg -F '.frozenTools.independentVerifierSha256==$verifier' "$total_finalizer" >/dev/null
 rg -F '.correction.priorBaselinePreserved==true' "$total_finalizer" >/dev/null
+rg -F '.correction.remoteRetryControllerRebindSha256==$rebind' "$total_finalizer" >/dev/null
 for script in "$independent_waiter" "$main_guardian" "$total_finalizer"; do
   rg -F 'planned_rust_restart_in_progress' "$script" >/dev/null
   rg -F 'test "$age" -ge 0 && test "$age" -le 900' "$script" >/dev/null
