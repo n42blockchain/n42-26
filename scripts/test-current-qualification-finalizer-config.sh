@@ -35,6 +35,7 @@ rg -F 'waiter_failure="${N42_CORRECTION_WAITER_FAILURE:-' "$correction_waiter" >
 rg -F 'assert_controller_rebind_correction' "$correction_waiter" >/dev/null
 rg -F 'milestone_required+=("$supplemental_15m_correction")' "$total_finalizer" >/dev/null
 rg -F 'assert_no_uncorrected_failures' "$total_finalizer" >/dev/null
+rg -F '"$correction_waiter_v2_failure"' "$total_finalizer" >/dev/null
 rg -F 'correctedControllerRebindFailure:true,failureEvidencePreserved:true' \
   "$total_finalizer" >/dev/null
 for script in "$independent_waiter" "$main_guardian" "$total_finalizer"; do
@@ -46,4 +47,5 @@ jq -nc '{status:"PASS",harnessShaOverrideAccepted:true,legacyDefaultPreserved:tr
   producerCompanionPathsFollowOutput:true,
   shortWindowProjectionCorrectionRequiresMeasured24h:true,
   correctedControllerRebindFailureIsPreservedAndBound:true,
+  correctedControllerV2FailureRemainsFailClose:true,
   plannedRustRestartDoesNotTripGuardians:true}'

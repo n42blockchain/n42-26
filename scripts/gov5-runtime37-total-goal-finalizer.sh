@@ -44,6 +44,7 @@ network="$evidence/runtime37-latest-c0a146-network-consensus-matrix.json"
 supplemental_15m_failure="$evidence/runtime37-latest-c0a146-formal-15m-supplemental-audit-failure.json"
 supplemental_15m_correction="$evidence/runtime37-latest-c0a146-formal-15m-corrected-supplemental-audit.json"
 correction_waiter_failure="$evidence/runtime37-latest-c0a146-formal-15m-resource-correction-failure.json"
+correction_waiter_v2_failure="$evidence/runtime37-latest-c0a146-formal-15m-resource-correction-v2-failure.json"
 controller_rebind_correction="$evidence/runtime37-finalizer-session-keeper-rebind-correction.json"
 latest_reth="$evidence/latest-reth-final-qualification.json"
 output="${N42_TOTAL_OUTPUT:-$evidence/runtime37-goal-completion.json}"
@@ -167,6 +168,7 @@ assert_no_uncorrected_failures() {
     "$evidence/gov5-current-main-fail-close-guardian-v2-failure.json" \
     "$evidence/gov5-906-finalizer-failures.jsonl" \
     "$evidence/gov5-906-independent-final-verification-failure.json" \
+    "$correction_waiter_v2_failure" \
     "$evidence/runtime37-latest-c0a146-strict24h-six-producer-failure.json"; do
     test ! -s "$item"
   done
