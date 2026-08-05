@@ -274,16 +274,74 @@ status() {
   done
 }
 
+collect_latest_head_snapshot() {
+  local output_dir="${1:?snapshot output directory required}"
+  shift
+  local snapshot_ports=("$@")
+  local snapshot_pids=()
+  local snapshot_port pid index number_hex number
+  local snapshot_failed_port=0
+  local snapshot_min_height=-1
+  local snapshot_max_height=0
+
+  # Start every latest-head request before waiting for any response. Sequential
+  # reads can straddle a rapid catch-up burst and report an artificial lag even
+  # though all clients commit the same canonical blocks within milliseconds.
+  for snapshot_port in "${snapshot_ports[@]}"; do
+    curl -fsS --max-time 3 \
+      -H 'content-type: application/json' \
+      --data '{"jsonrpc":"2.0","id":1,"method":"eth_getBlockByNumber","params":["latest",false]}' \
+      "http://127.0.0.1:$snapshot_port" \
+      >"$output_dir/latest-$snapshot_port.json" &
+    snapshot_pids+=("$!")
+  done
+
+  for index in "${!snapshot_pids[@]}"; do
+    pid="${snapshot_pids[$index]}"
+    snapshot_port="${snapshot_ports[$index]}"
+    if ! wait "$pid"; then
+      if test "$snapshot_failed_port" -eq 0; then
+        snapshot_failed_port="$snapshot_port"
+      fi
+    fi
+  done
+
+  if test "$snapshot_failed_port" -eq 0; then
+    for snapshot_port in "${snapshot_ports[@]}"; do
+      if ! number_hex="$(jq -er '.result.number' \
+        "$output_dir/latest-$snapshot_port.json")"; then
+        snapshot_failed_port="$snapshot_port"
+        break
+      fi
+      number=$((number_hex))
+      if test "$snapshot_min_height" -lt 0 || \
+        test "$number" -lt "$snapshot_min_height"; then
+        snapshot_min_height="$number"
+      fi
+      if test "$number" -gt "$snapshot_max_height"; then
+        snapshot_max_height="$number"
+      fi
+    done
+  fi
+
+  printf '%s\t%s\t%s\n' \
+    "$snapshot_min_height" "$snapshot_max_height" "$snapshot_failed_port"
+}
+
 monitor_heads() {
   duration_seconds="${1:?duration seconds required}"
   interval_seconds="${2:-10}"
   evidence_file="${3:-$runtime/evidence/head-monitor.jsonl}"
   max_lag="${N42_QUAL_MAX_LAG:-16}"
+  lag_confirmation_attempts="${N42_QUAL_LAG_CONFIRMATION_ATTEMPTS:-3}"
+  lag_confirmation_delay="${N42_QUAL_LAG_CONFIRMATION_DELAY_SECONDS:-0.2}"
   require_zero_tx="${N42_QUAL_REQUIRE_ZERO_TX:-0}"
   zero_tx_verified_to=-1
   read -r -a ports <<<"${N42_QUAL_PORTS:-28501 28502 28503 28504 28505 29545 29546}"
   rust_history_port="${N42_QUAL_RUST_PORT:-29546}"
   mkdir -p "$(dirname "$evidence_file")"
+  [[ "$lag_confirmation_attempts" =~ ^[1-9][0-9]*$ ]]
+  [[ "$lag_confirmation_delay" =~ ^[0-9]+([.][0-9]+)?$ ]]
   first_sample_seconds="$SECONDS"
 
   while true; do
@@ -291,26 +349,24 @@ monitor_heads() {
     sample_failed=0
     failed_port=0
     failed_phase=""
-    min_height=-1
-    max_height=0
-    for port in "${ports[@]}"; do
-      if ! curl -fsS --max-time 3 \
-        -H 'content-type: application/json' \
-        --data '{"jsonrpc":"2.0","id":1,"method":"eth_getBlockByNumber","params":["latest",false]}' \
-        "http://127.0.0.1:$port" >"$sample_dir/latest-$port.json"; then
+    latest_snapshot_attempt=1
+    while true; do
+      read -r min_height max_height latest_failed_port < <(
+        collect_latest_head_snapshot "$sample_dir" "${ports[@]}"
+      )
+      if test "$latest_failed_port" -ne 0; then
         sample_failed=1
-        failed_port="$port"
+        failed_port="$latest_failed_port"
         failed_phase="latest"
         break
       fi
-      number_hex="$(jq -er '.result.number' "$sample_dir/latest-$port.json")"
-      number=$((number_hex))
-      if test "$min_height" -lt 0 || test "$number" -lt "$min_height"; then
-        min_height="$number"
+      lag=$((max_height - min_height))
+      if test "$lag" -le "$max_lag" || \
+        test "$latest_snapshot_attempt" -ge "$lag_confirmation_attempts"; then
+        break
       fi
-      if test "$number" -gt "$max_height"; then
-        max_height="$number"
-      fi
+      sleep "$lag_confirmation_delay"
+      latest_snapshot_attempt=$((latest_snapshot_attempt + 1))
     done
 
     if test "$sample_failed" -ne 0; then
@@ -402,6 +458,7 @@ monitor_heads() {
       --argjson common_height "$min_height" \
       --argjson maximum_height "$max_height" \
       --argjson lag "$lag" \
+      --argjson latest_snapshot_attempts "$latest_snapshot_attempt" \
       --argjson zero_tx_required "$require_zero_tx" \
       --argjson zero_tx_verified_from "$zero_tx_verified_from" \
       --argjson zero_tx_verified_to "$zero_tx_verified_to" \
@@ -410,6 +467,8 @@ monitor_heads() {
       --arg identity "$expected" \
       '{at:$at,ok:$ok,error:$error,commonHeight:$common_height,
         maximumHeight:$maximum_height,lag:$lag,identity:$identity,
+        latestSnapshotAttempts:$latest_snapshot_attempts,
+        latestSnapshotConcurrent:true,
         zeroTxRequired:$zero_tx_required,zeroTxVerifiedFrom:$zero_tx_verified_from,
         zeroTxVerifiedTo:$zero_tx_verified_to,
         failedPort:(if $failed_port == 0 then null else $failed_port end),
