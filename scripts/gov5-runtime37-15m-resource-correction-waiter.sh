@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
 
 runtime="${N42_CORRECTION_RUNTIME:?runtime is required}"
 finalizer_pid="${N42_CORRECTION_FINALIZER_PID:?qualification finalizer PID is required}"
@@ -23,8 +23,8 @@ original_failure_sha="$(sha256 "$failure")"
 assert_original_failure() {
   test "$(sha256 "$failure")" = "$original_failure_sha"
   jq -e '
-    .status=="FAIL" and .label=="formal-15m" and .statusCode==1 and
-    (.command|contains("audit-rust-resource-trend"))
+    .status=="FAIL" and .label=="formal-15m" and .statusCode==1 and .line==116 and
+    (.command|contains("$resource_auditor"))
   ' "$failure" >/dev/null
 }
 
