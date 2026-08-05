@@ -17,6 +17,7 @@ expected_tail_commit="71289cf79ec498117dde36cfa2cb1fd58a413948"
 # paths so an unrelated source drift cannot be mistaken for the validated
 # c0a146 main while all runtime opt-in and on-disk absence checks remain strict.
 expected_integration_commit="dd6cd1538a36cdacda538f37b46c2e7a12d68dd2"
+expected_qmdb_guard_commit="75dab6e5d1bc6aefa213f4f0f7dcc972dd04f89d"
 ports=(28501 28502 28503 28504 28505 29545)
 
 test -d "$runtime"
@@ -74,6 +75,16 @@ git -C "$gov_repo" grep -q 'txindexer.New' "$expected_main" -- internal/node/nod
 git -C "$gov_repo" grep -q 'bc.txIndexer.Add' "$expected_main" -- \
   internal/blockchain.go
 
+qmdb_guard_commit="$(git -C "$gov_repo" log -1 --format=%H "$expected_main" -- \
+  lib/qmdb/index_trunc.go)"
+test "$qmdb_guard_commit" = "$expected_qmdb_guard_commit"
+git -C "$gov_repo" grep -q 'N42_QMDB_TRUNC_INDEX' "$expected_main" -- \
+  lib/qmdb/index_trunc.go
+git -C "$gov_repo" grep -q 'does NOT go through' "$expected_main" -- \
+  lib/qmdb/index_trunc.go
+git -C "$gov_repo" grep -q 'Off by default' "$expected_main" -- \
+  lib/qmdb/index_trunc.go
+
 for node in 1 2 3 4 5; do
   pid_file="$runtime/pids/gov${node}.pid"
   datadir="$runtime/gov/node${node}"
@@ -83,6 +94,8 @@ for node in 1 2 3 4 5; do
   kill -0 "$pid"
   test -z "$(ps eww -p "$pid" -o command= | \
     rg '(^| )N42_TXINDEX_TAIL=' || true)"
+  test -z "$(ps eww -p "$pid" -o command= | \
+    rg '(^| )N42_QMDB_TRUNC_INDEX=' || true)"
   test -s "$mdbx"
   test ! -e "$datadir/txindex"
   ranges_count="$(find "$datadir" -type f -name txindex.ranges -print | wc -l | \
@@ -96,7 +109,8 @@ for node in 1 2 3 4 5; do
     --argjson ranges_count "$ranges_count" \
     '{node:$node,pid:$pid,datadir:$datadir,mdbxBytes:$mdbx_bytes,
       mdbxAllocatedKiB:$mdbx_allocated_kib,txindexRangesFiles:$ranges_count,
-      txindexTailEnvironmentPresent:false,txindexDirectoryPresent:false,
+      txindexTailEnvironmentPresent:false,qmdbTruncIndexEnvironmentPresent:false,
+      txindexDirectoryPresent:false,
       processAlive:true,chaindataPresent:true}' >>"$node_rows"
 done
 
@@ -151,6 +165,7 @@ temporary="$(mktemp "$(dirname "$output")/.905-data-compat.XXXXXX")"
 jq -nc --arg at "$(date -u +%FT%TZ)" --arg expected_main "$expected_main" \
   --arg remote_main "$remote_main" --arg builder_commit "$builder_commit" \
   --arg tail_commit "$tail_commit" --arg integration_commit "$integration_commit" \
+  --arg qmdb_guard_commit "$qmdb_guard_commit" \
   --arg expected_nonce "$expected_nonce" \
   --argjson latest "$latest_identity" --slurpfile nodes "$node_rows" \
   --slurpfile rpc "$rpc_rows" '
@@ -160,6 +175,11 @@ jq -nc --arg at "$(date -u +%FT%TZ)" --arg expected_main "$expected_main" \
      nodeIntegrationCommit:$integration_commit,nodeIntegrationPresent:true,
      activationEnvironment:"N42_TXINDEX_TAIL",activationOptIn:true,
      activationAbsentInAllRunningGovProcesses:true,runtimeTailEnabled:false,
+     qmdbTruncIndexGuardCommit:$qmdb_guard_commit,
+     qmdbTruncIndexEnvironment:"N42_QMDB_TRUNC_INDEX",
+     qmdbTruncIndexOptIn:true,
+     qmdbTruncIndexResolverAvoidsLiveness:true,
+     qmdbTruncIndexAbsentInAllRunningGovProcesses:true,
      variableSegmentsWiredToConsensus:false,inMemoryTailWiredToConsensus:false,
      txindexRangesExpectedInRunning905Data:false},nodes:$nodes,rpcEndpoints:$rpc,
    copiedPersistedHead:92605,latestSixEndpointIdentity:$latest,
@@ -170,6 +190,9 @@ jq -nc --arg at "$(date -u +%FT%TZ)" --arg expected_main "$expected_main" \
 jq -e '.status=="PASS" and .mutationPerformed==false and
   .source.nodeIntegrationPresent and .source.activationOptIn and
   .source.activationAbsentInAllRunningGovProcesses and
+  .source.qmdbTruncIndexOptIn and
+  .source.qmdbTruncIndexResolverAvoidsLiveness and
+  .source.qmdbTruncIndexAbsentInAllRunningGovProcesses and
   .source.runtimeTailEnabled==false and
   .source.variableSegmentsWiredToConsensus==false and
   .source.inMemoryTailWiredToConsensus==false and
