@@ -47,6 +47,7 @@ latest_reth="$evidence/latest-reth-final-qualification.json"
 output="${N42_TOTAL_OUTPUT:-$evidence/runtime37-goal-completion.json}"
 compat_output="${N42_TOTAL_COMPAT_OUTPUT:-$evidence/gov5-906-goal-completion-audit-v2.json}"
 failure="${N42_TOTAL_FAILURE:-$evidence/runtime37-goal-completion-failure.json}"
+restart_evidence="$evidence/rust-restart-rejoin-906.jsonl"
 verifier="$runtime/artifacts/scripts/verify-gov5-906-final-qualification.sh"
 rechecker="$runtime/artifacts/scripts/recheck-gov5-runtime-static-boundary-v2.sh"
 data_auditor="$runtime/artifacts/scripts/audit-gov5-905-data-compat.sh"
@@ -90,20 +91,39 @@ assert_sources() {
   test "$(remote_gov_main)" = "$expected_gov_main"
 }
 
+planned_rust_restart_in_progress() {
+  local event started now age
+  test -s "$restart_evidence" || return 1
+  event="$(tail -n 1 "$restart_evidence" | jq -er '.event')"
+  test "$event" = rust_restart_started || return 1
+  started="$(tail -n 1 "$restart_evidence" | jq -er '.at|fromdateiso8601')"
+  now="$(date +%s)"
+  age=$((now - started))
+  test "$age" -ge 0 && test "$age" -le 900
+}
+
 assert_nodes() {
-  local file
-  for file in "$runtime"/pids/gov{1,2,3,4,5}.pid "$runtime/pids/rust.pid"; do
+  local file rust_pid
+  for file in "$runtime"/pids/gov{1,2,3,4,5}.pid; do
     test -s "$file"
     kill -0 "$(<"$file")"
   done
+  file="$runtime/pids/rust.pid"
+  test -s "$file"
+  rust_pid="$(<"$file")"
+  if ! kill -0 "$rust_pid" 2>/dev/null; then
+    planned_rust_restart_in_progress
+  fi
 }
 
 assert_no_failures() {
   local item
   for item in \
     "$evidence/gov5-current-main-fail-close-guardian-failure.json" \
+    "$evidence/gov5-current-main-fail-close-guardian-v2-failure.json" \
     "$evidence/gov5-906-finalizer-failures.jsonl" \
     "$evidence/gov5-906-independent-final-verification-failure.json" \
+    "$evidence/runtime37-latest-c0a146-formal-15m-resource-correction-failure.json" \
     "$evidence/runtime37-latest-c0a146-strict24h-six-producer-failure.json"; do
     test ! -s "$item"
   done

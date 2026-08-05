@@ -6,6 +6,8 @@ finalizer="$script_dir/gov5-current-qualification-finalizer.sh"
 producer_waiter="$script_dir/gov5-strict24h-six-producer-waiter.sh"
 correction_waiter="$script_dir/gov5-runtime37-15m-resource-correction-waiter.sh"
 total_finalizer="$script_dir/gov5-runtime37-total-goal-finalizer.sh"
+independent_waiter="$script_dir/gov5-strict-independent-verifier-waiter.sh"
+main_guardian="$script_dir/gov5-current-main-fail-close-guardian.sh"
 override="210517ae2b40233a078b4a2999e07ea9bd2f6211d30d24a87eaf481473f5376b"
 default="aa906f42b83048cb4168e1ceb1077d1ca8b27429be5189acd1aaa74f06c551e9"
 assignment="$(rg -m1 '^expected_harness_sha=' "$finalizer")"
@@ -14,6 +16,8 @@ bash -n "$finalizer"
 bash -n "$producer_waiter"
 bash -n "$correction_waiter"
 bash -n "$total_finalizer"
+bash -n "$independent_waiter"
+bash -n "$main_guardian"
 test -n "$assignment"
 
 actual="$(N42_QUAL_EXPECTED_HARNESS_SHA="$override" bash -c "$assignment; printf '%s' \"\$expected_harness_sha\"")"
@@ -28,7 +32,12 @@ rg -F 'failure="${N42_STRICT24H_PRODUCER_FAILURE:-${output%.json}-failure.json}"
   "$producer_waiter" >/dev/null
 rg -F 'measured24hResourceAudit.elapsedSeconds>=86400' "$correction_waiter" >/dev/null
 rg -F 'milestone_required+=("$supplemental_15m_correction")' "$total_finalizer" >/dev/null
+for script in "$independent_waiter" "$main_guardian" "$total_finalizer"; do
+  rg -F 'planned_rust_restart_in_progress' "$script" >/dev/null
+  rg -F 'test "$age" -ge 0 && test "$age" -le 900' "$script" >/dev/null
+done
 
 jq -nc '{status:"PASS",harnessShaOverrideAccepted:true,legacyDefaultPreserved:true,
   producerCompanionPathsFollowOutput:true,
-  shortWindowProjectionCorrectionRequiresMeasured24h:true}'
+  shortWindowProjectionCorrectionRequiresMeasured24h:true,
+  plannedRustRestartDoesNotTripGuardians:true}'

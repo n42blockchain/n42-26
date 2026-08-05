@@ -21,6 +21,7 @@ summary="$runtime/evidence/gov5-906-final-qualification.json"
 output="$runtime/evidence/gov5-906-independent-final-verification.json"
 failure="$runtime/evidence/gov5-906-independent-final-verification-failure.json"
 heads="$runtime/evidence/mixed-soak-24h.jsonl"
+restart_evidence="$runtime/evidence/rust-restart-rejoin-906.jsonl"
 finalizer="$runtime/artifacts/scripts/gov5-current-qualification-finalizer.sh"
 verifier="$runtime/artifacts/scripts/verify-gov5-906-final-qualification.sh"
 
@@ -41,6 +42,17 @@ require_process() {
   rg -F -- "$expected" <<<"$command" >/dev/null
 }
 
+planned_rust_restart_in_progress() {
+  local event started now age
+  test -s "$restart_evidence" || return 1
+  event="$(tail -n 1 "$restart_evidence" | jq -er '.event')"
+  test "$event" = rust_restart_started || return 1
+  started="$(tail -n 1 "$restart_evidence" | jq -er '.at|fromdateiso8601')"
+  now="$(date +%s)"
+  age=$((now - started))
+  test "$age" -ge 0 && test "$age" -le 900
+}
+
 check_nodes() {
   local file pid command
   for file in "$runtime"/pids/gov{1,2,3,4,5}.pid; do
@@ -48,7 +60,10 @@ check_nodes() {
     require_process "$pid" "$runtime/geth-live"
   done
   pid="$(<"$runtime/pids/rust.pid")"
-  kill -0 "$pid"
+  if ! kill -0 "$pid" 2>/dev/null; then
+    planned_rust_restart_in_progress
+    return 0
+  fi
   command="$(ps -p "$pid" -o command=)"
   case "$command" in
     "$runtime/n42-node node "*|*/n42-node\ node\ *) ;;

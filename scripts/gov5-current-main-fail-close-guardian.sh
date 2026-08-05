@@ -8,6 +8,7 @@ interval="${N42_FAIL_CLOSE_INTERVAL_SECONDS:-60}"
 output="${N42_FAIL_CLOSE_OUTPUT:-$runtime/evidence/gov5-current-main-fail-close-guardian.jsonl}"
 failure="${N42_FAIL_CLOSE_FAILURE:-$runtime/evidence/gov5-current-main-fail-close-guardian-failure.json}"
 completion="${N42_FAIL_CLOSE_COMPLETION:-$runtime/evidence/gov5-906-goal-completion-audit-v2.json}"
+restart_evidence="$runtime/evidence/rust-restart-rejoin-906.jsonl"
 preflight_only="${N42_FAIL_CLOSE_PREFLIGHT_ONLY:-0}"
 
 [[ "$expected_main" =~ ^[0-9a-f]{40}$ ]]
@@ -24,6 +25,17 @@ node_pids() {
   done
 }
 
+planned_rust_restart_in_progress() {
+  local event started now age
+  test -s "$restart_evidence" || return 1
+  event="$(tail -n 1 "$restart_evidence" | jq -er '.event')"
+  test "$event" = rust_restart_started || return 1
+  started="$(tail -n 1 "$restart_evidence" | jq -er '.at|fromdateiso8601')"
+  now="$(date +%s)"
+  age=$((now - started))
+  test "$age" -ge 0 && test "$age" -le 900
+}
+
 assert_nodes() {
   local file pid command
   for file in "$runtime"/pids/gov{1,2,3,4,5}.pid; do
@@ -36,7 +48,10 @@ assert_nodes() {
   file="$runtime/pids/rust.pid"
   test -s "$file"
   pid="$(<"$file")"
-  kill -0 "$pid"
+  if ! kill -0 "$pid" 2>/dev/null; then
+    planned_rust_restart_in_progress
+    return 0
+  fi
   command="$(ps -p "$pid" -o command=)"
   [[ "$command" == *"/n42-node node "* ]]
 }
