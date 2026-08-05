@@ -880,6 +880,12 @@ impl QmdbCompatTree {
     }
 
     fn ensure_twig(&mut self, twig_id: usize) {
+        // Called once per `set`, but the twig almost always exists already.
+        // `null_level()` is 11 hash compressions, so computing it before the
+        // guard burned them on every entry of a full import for nothing.
+        if self.twigs.len() > twig_id {
+            return;
+        }
         let nulls = null_level();
         while self.twigs.len() <= twig_id {
             self.twigs.push(Twig::new(&nulls));

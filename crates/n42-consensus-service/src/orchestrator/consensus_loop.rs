@@ -1721,6 +1721,15 @@ impl ConsensusService {
                             let elapsed_ms = start.elapsed().as_millis();
                             gauge!("n42_twig_latest_root").set(version as f64);
                             histogram!("n42_twig_apply_diff_ms").record(elapsed_ms as f64);
+                            // Pair the duration with the forest size. Part of the
+                            // per-block cost scales with twig count and not with
+                            // the block, so the two series together separate
+                            // "this block was big" from "the tree has grown" —
+                            // which is not decidable from the duration alone.
+                            let twig_count = twig.node_count();
+                            if let Some(count) = twig_count {
+                                gauge!("n42_twig_count").set(count as f64);
+                            }
                             info!(
                                 target: "n42::twig",
                                 view,
@@ -1729,6 +1738,7 @@ impl ConsensusService {
                                 %root,
                                 accounts = diff.len(),
                                 storage_changes = diff.total_storage_changes(),
+                                twig_count,
                                 elapsed_ms,
                                 "Twig updated"
                             );

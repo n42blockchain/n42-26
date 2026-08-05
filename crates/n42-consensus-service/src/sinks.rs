@@ -17,6 +17,18 @@ pub trait StateSink: Send + Sync {
     /// `block_hash` binds optional sidecar consistency probes to the exact reth
     /// post-state that produced `diff`.
     fn apply_diff(&self, block_hash: B256, diff: &StateDiff) -> Result<(u64, B256), String>;
+
+    /// Size of the sink's backing structure, for sinks that have one.
+    ///
+    /// The twig tree is append-only, so this grows with total historical writes
+    /// rather than with the live key set, and parts of the per-block work are
+    /// O(this) no matter how small the block was. Exporting it is what makes it
+    /// possible to answer whether that fixed cost currently matters, instead of
+    /// arguing about it from the source. Sinks without a meaningful size return
+    /// `None`.
+    fn node_count(&self) -> Option<usize> {
+        None
+    }
 }
 
 /// The ZK proof sidecar: schedules asynchronous proof generation for a
