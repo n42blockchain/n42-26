@@ -49,7 +49,8 @@ correction_waiter_v2_failure="$evidence/runtime37-latest-c0a146-formal-15m-resou
 controller_rebind_correction="$evidence/runtime37-finalizer-session-keeper-rebind-correction.json"
 independent_harness_rebind="$evidence/runtime37-independent-verifier-harness-rebind.json"
 milestone_4h_transient_failure="$evidence/gov5-906-formal-4h-milestone-controller-transient-failure.json"
-milestone_remote_retry_correction="$evidence/runtime37-formal-4h-milestone-network-retry-correction.json"
+milestone_20h_transient_failure="$evidence/gov5-906-formal-20h-milestone-controller-transient-failure.json"
+milestone_remote_retry_correction="$evidence/runtime37-milestone-network-retry-correction.json"
 latest_reth="$evidence/latest-reth-final-qualification.json"
 output="${N42_TOTAL_OUTPUT:-$evidence/runtime37-goal-completion.json}"
 compat_output="${N42_TOTAL_COMPAT_OUTPUT:-$evidence/gov5-906-goal-completion-audit-v2.json}"
@@ -191,21 +192,30 @@ assert_controller_rebind_correction() {
 
 assert_milestone_remote_retry_correction() {
   test -s "$milestone_4h_transient_failure"
+  test -s "$milestone_20h_transient_failure"
   test -s "$milestone_remote_retry_correction"
-  jq -e '
+  jq -e --arg label formal-4h '
     .event=="gov5_qualification_milestone_failure" and
-    .status=="FAIL" and .label=="formal-4h" and .statusCode==128 and
+    .status=="FAIL" and .label==$label and .statusCode==128 and
     .command=="remote=\"$(git -C \"$gov_repo\" ls-remote origin refs/heads/main |\n    awk '\''NR==1 {print $1}'\'')\""
   ' "$milestone_4h_transient_failure" >/dev/null
-  jq -e --arg failure_sha "$(sha256 "$milestone_4h_transient_failure")" \
+  jq -e --arg label formal-20h '
+    .event=="gov5_qualification_milestone_failure" and
+    .status=="FAIL" and .label==$label and .statusCode==128 and
+    .command=="remote=\"$(git -C \"$gov_repo\" ls-remote origin refs/heads/main |\n    awk '\''NR==1 {print $1}'\'')\""
+  ' "$milestone_20h_transient_failure" >/dev/null
+  jq -e --arg failure_4h_sha "$(sha256 "$milestone_4h_transient_failure")" \
+    --arg failure_20h_sha "$(sha256 "$milestone_20h_transient_failure")" \
     --arg expected "$expected_gov_main" \
     --arg milestone_sha "$(sha256 "$runtime/artifacts/scripts/gov5-qualification-milestone-waiter.sh")" \
     --arg supplemental_sha "$(sha256 "$runtime/artifacts/scripts/gov5-milestone-supplemental-audit-waiter.sh")" \
     --arg deep_sha "$(sha256 "$runtime/artifacts/scripts/gov5-runtime-milestone-deep-audit-v2.sh")" '
-    .event=="runtime37_formal_4h_milestone_network_retry_correction" and
+    .event=="runtime37_milestone_network_retry_correction" and
     .status=="PASS" and .acceptanceRelaxed==false and
-    .priorFailure.sha256==$failure_sha and .priorFailure.preserved==true and
-    .priorFailure.controllerOnly==true and .priorFailure.statusCode==128 and
+    .priorFailures.formal4h.sha256==$failure_4h_sha and
+    .priorFailures.formal20h.sha256==$failure_20h_sha and
+    .priorFailures.count==2 and .priorFailures.allPreserved==true and
+    .priorFailures.controllerOnly==true and .priorFailures.statusCode==128 and
     .remoteRecheck.main==$expected and .remoteRecheck.exact==true and
     .retryPolicy.attempts==6 and .retryPolicy.delaySeconds==10 and
     .retryPolicy.failsAfterExhaustion==true and
