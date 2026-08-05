@@ -45,6 +45,7 @@ supplemental_launch_failure="$evidence/runtime36-latest-c0a146-formal-15m-supple
 supplemental_launch_correction="$evidence/runtime36-latest-c0a146-formal-15m-supplemental-launch-correction.json"
 latest_reth="$evidence/latest-reth-final-qualification.json"
 output="${N42_TOTAL_OUTPUT:-$evidence/runtime36-goal-completion.json}"
+compat_output="${N42_TOTAL_COMPAT_OUTPUT:-$evidence/gov5-906-goal-completion-audit-v2.json}"
 failure="${N42_TOTAL_FAILURE:-$evidence/runtime36-goal-completion-failure.json}"
 verifier="$runtime/artifacts/scripts/verify-gov5-906-final-qualification.sh"
 rechecker="$runtime/artifacts/scripts/recheck-gov5-runtime-static-boundary-v2.sh"
@@ -195,6 +196,7 @@ if test "$preflight_only" = 1; then
 fi
 
 test ! -e "$output"
+test ! -e "$compat_output"
 test ! -e "$failure"
 trap on_error ERR
 
@@ -368,6 +370,10 @@ jq -e '.status=="PASS" and .strict24h.elapsedSeconds>=86400 and .strict24h.maxim
   .sourceAndRemotePinsExact==true and
   .objectiveRequirementsExtendedClosure==true and .noFailureEvidence==true' "$temporary" >/dev/null
 mv "$temporary" "$output"
+compat_temporary="$(mktemp "$evidence/.runtime36-total-compat.XXXXXX")"
+cp "$output" "$compat_temporary"
+test "$(sha256 "$compat_temporary")" = "$(sha256 "$output")"
+mv "$compat_temporary" "$compat_output"
 trap - EXIT
 rm -rf "$audit_dir"
 cat "$output"
