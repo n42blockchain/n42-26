@@ -31,7 +31,12 @@ rg -F 'linkage="${N42_STRICT24H_PRODUCER_LINKAGE:-${output%.json}-linkage.json}"
 rg -F 'failure="${N42_STRICT24H_PRODUCER_FAILURE:-${output%.json}-failure.json}"' \
   "$producer_waiter" >/dev/null
 rg -F 'measured24hResourceAudit.elapsedSeconds>=86400' "$correction_waiter" >/dev/null
+rg -F 'waiter_failure="${N42_CORRECTION_WAITER_FAILURE:-' "$correction_waiter" >/dev/null
+rg -F 'assert_controller_rebind_correction' "$correction_waiter" >/dev/null
 rg -F 'milestone_required+=("$supplemental_15m_correction")' "$total_finalizer" >/dev/null
+rg -F 'assert_no_uncorrected_failures' "$total_finalizer" >/dev/null
+rg -F 'correctedControllerRebindFailure:true,failureEvidencePreserved:true' \
+  "$total_finalizer" >/dev/null
 for script in "$independent_waiter" "$main_guardian" "$total_finalizer"; do
   rg -F 'planned_rust_restart_in_progress' "$script" >/dev/null
   rg -F 'test "$age" -ge 0 && test "$age" -le 900' "$script" >/dev/null
@@ -40,4 +45,5 @@ done
 jq -nc '{status:"PASS",harnessShaOverrideAccepted:true,legacyDefaultPreserved:true,
   producerCompanionPathsFollowOutput:true,
   shortWindowProjectionCorrectionRequiresMeasured24h:true,
+  correctedControllerRebindFailureIsPreservedAndBound:true,
   plannedRustRestartDoesNotTripGuardians:true}'

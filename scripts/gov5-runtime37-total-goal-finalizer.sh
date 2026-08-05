@@ -43,6 +43,8 @@ data_905="$evidence/runtime37-preflight-905-data-compat.json"
 network="$evidence/runtime37-latest-c0a146-network-consensus-matrix.json"
 supplemental_15m_failure="$evidence/runtime37-latest-c0a146-formal-15m-supplemental-audit-failure.json"
 supplemental_15m_correction="$evidence/runtime37-latest-c0a146-formal-15m-corrected-supplemental-audit.json"
+correction_waiter_failure="$evidence/runtime37-latest-c0a146-formal-15m-resource-correction-failure.json"
+controller_rebind_correction="$evidence/runtime37-finalizer-session-keeper-rebind-correction.json"
 latest_reth="$evidence/latest-reth-final-qualification.json"
 output="${N42_TOTAL_OUTPUT:-$evidence/runtime37-goal-completion.json}"
 compat_output="${N42_TOTAL_COMPAT_OUTPUT:-$evidence/gov5-906-goal-completion-audit-v2.json}"
@@ -116,17 +118,61 @@ assert_nodes() {
   fi
 }
 
-assert_no_failures() {
+assert_controller_rebind_correction() {
+  local finalizer_pid independent_pid
+  test -s "$correction_waiter_failure"
+  test -s "$controller_rebind_correction"
+  jq -e '
+    .event=="runtime37_formal_15m_resource_correction_failure" and
+    .status=="FAIL" and .statusCode==1 and .line==56 and
+    .command=="kill -0 \"$finalizer_pid\""
+  ' "$correction_waiter_failure" >/dev/null
+  jq -e --arg failure_sha "$(sha256 "$correction_waiter_failure")" '
+    .event=="runtime37_finalizer_session_keeper_rebind_correction" and
+    .status=="PASS" and .acceptanceRelaxed==false and
+    .priorCorrectionWaiterFailure.sha256==$failure_sha and
+    .priorCorrectionWaiterFailure.preserved==true and
+    .priorCorrectionWaiterFailure.controllerOnly==true and
+    .formalWindow.continuous==true and .formalWindow.maximumGapSeconds<=120 and
+    .formalWindow.failedSamples==0 and .formalWindow.zeroTransactionRequired==true and
+    .chainDataMutationPerformed==false and
+    .nodeOrFormalMonitorMutationPerformed==false and
+    .controllerRebindCorrected==true and
+    .totalGoalFinalizerRelaunchRequired==true
+  ' "$controller_rebind_correction" >/dev/null
+  finalizer_pid="$(jq -er '.newControllers.finalizerPid' "$controller_rebind_correction")"
+  kill -0 "$finalizer_pid"
+  ps -p "$finalizer_pid" -o command= | rg -F 'gov5-current-qualification-finalizer.sh' >/dev/null
+  if ! test -s "$independent"; then
+    independent_pid="$(jq -er '.newControllers.independentWaiterPid' "$controller_rebind_correction")"
+    kill -0 "$independent_pid"
+    ps -p "$independent_pid" -o command= | rg -F 'gov5-strict-independent-verifier-waiter.sh' >/dev/null
+  fi
+  if test -s "$supplemental_15m_correction"; then
+    jq -e --arg failure_sha "$(sha256 "$correction_waiter_failure")" \
+      --arg rebind_sha "$(sha256 "$controller_rebind_correction")" '
+      .status=="PASS" and .priorCorrectionWaiterFailurePreserved==true and
+      .priorCorrectionWaiterFailureSha256==$failure_sha and
+      .controllerRebindFailureCorrected==true and
+      .controllerRebindCorrectionSha256==$rebind_sha and
+      .noUncorrectedFailureEvidence==true
+    ' "$supplemental_15m_correction" >/dev/null
+  fi
+}
+
+assert_no_uncorrected_failures() {
   local item
   for item in \
     "$evidence/gov5-current-main-fail-close-guardian-failure.json" \
     "$evidence/gov5-current-main-fail-close-guardian-v2-failure.json" \
     "$evidence/gov5-906-finalizer-failures.jsonl" \
     "$evidence/gov5-906-independent-final-verification-failure.json" \
-    "$evidence/runtime37-latest-c0a146-formal-15m-resource-correction-failure.json" \
     "$evidence/runtime37-latest-c0a146-strict24h-six-producer-failure.json"; do
     test ! -s "$item"
   done
+  if test -s "$correction_waiter_failure"; then
+    assert_controller_rebind_correction
+  fi
 }
 
 assert_live() {
@@ -191,7 +237,7 @@ on_error() {
 
 assert_static
 assert_nodes
-assert_no_failures
+assert_no_uncorrected_failures
 assert_live 0x11
 test "$(latest_reth_stable)" = v2.4.1
 
@@ -234,7 +280,7 @@ while :; do
   for item in "${required[@]}"; do test -s "$item" || missing=true; done
   test "$missing" = false && break
   assert_nodes
-  assert_no_failures
+  assert_no_uncorrected_failures
   test "$(remote_gov_main)" = "$expected_gov_main"
   sleep 60
 done
@@ -290,6 +336,8 @@ for spec in 'formal-15m 900' 'formal-1h 3600' 'formal-4h 14400' \
     jq -e --arg failure_sha "$(sha256 "$supplemental_15m_failure")" '
       .status=="PASS" and .acceptanceRelaxed==false and
       .originalFailurePreserved==true and .originalFailureSha256==$failure_sha and
+      .priorCorrectionWaiterFailurePreserved==true and
+      .controllerRebindFailureCorrected==true and
       .measured24hResourceAudit.elapsedSeconds>=86400 and
       .archiveAndQmdbParityExact==true and .networkConsensusExact==true and
       .data905CompatibilityExact==true and .resourceTrendWithin24hBudget==true and
@@ -337,7 +385,7 @@ jq -e '.status=="PASS" and .transactionsFinalized==17' "$audit_dir/independent.j
 
 assert_static
 assert_nodes
-assert_no_failures
+assert_no_uncorrected_failures
 assert_live 0x22
 test "$(latest_reth_stable)" = v2.4.1
 
@@ -368,6 +416,8 @@ jq -nc --arg at "$(date -u +%FT%TZ)" --arg self "$expected_self_sha" \
   --arg independent_sha "$(sha256 "$independent")" --arg producer_sha "$(sha256 "$producer")" \
   --arg static_sha "$(sha256 "$static")" --arg copy_sha "$(sha256 "$copied")" \
   --arg supplemental_correction_sha "$(sha256 "$supplemental_15m_correction")" \
+  --arg controller_rebind_sha "$(sha256 "$controller_rebind_correction")" \
+  --arg correction_waiter_failure_sha "$(sha256 "$correction_waiter_failure")" \
   --arg latest_reth_sha "$(sha256 "$latest_reth")" \
   '{at:$at,event:"runtime37_goal_completion",status:"PASS",acceptanceRelaxed:false,
     objectiveRequirementsExtendedClosure:true,verifierScriptSha256:$self,strict24h:$strict,
@@ -377,18 +427,24 @@ jq -nc --arg at "$(date -u +%FT%TZ)" --arg self "$expected_self_sha" \
     archiveAndQmdbParityExact:true,controlledRustRestartRejoined:true,postRestartStabilityExact:true,
     intermediateMilestonesExact:true,staticDataAndToolsExact:true,zeroEquivocations:true,
     officialRethStable:"v2.4.1",
-    correctedShortWindowResourceProjectionFailure:true,noUncorrectedFailureEvidence:true,
+    correctedShortWindowResourceProjectionFailure:true,
+    correctedControllerRebindFailure:true,failureEvidencePreserved:true,
+    noUncorrectedFailureEvidence:true,noConsensusOrDataFailureEvidence:true,
     sourceAndRemotePinsExact:true,binariesExact:true,
     sources:{govMain:$gov_main,govCandidate:$gov_candidate,n42:$n42,reth:$reth,interopTooling:$interop,allPushed:true},
     evidenceSha256:{strictSummary:$strict_sha,independentVerification:$independent_sha,
       strict24hSixProducer:$producer_sha,staticBoundary:$static_sha,stoppedDataCopy:$copy_sha,
       supplemental15mResourceCorrection:$supplemental_correction_sha,
-      latestRethQualification:$latest_reth_sha},noFailureEvidence:true}' >"$temporary"
+      controllerRebindCorrection:$controller_rebind_sha,
+      preservedCorrectionWaiterFailure:$correction_waiter_failure_sha,
+      latestRethQualification:$latest_reth_sha}}' >"$temporary"
 jq -e '.status=="PASS" and .strict24h.elapsedSeconds>=86400 and .strict24h.maximumLag<=1 and
   .transactionsFinalized==17 and .sixProducerRotationExact==true and
   .controlledRustRestartRejoined==true and .intermediateMilestonesExact==true and
   .sourceAndRemotePinsExact==true and
-  .objectiveRequirementsExtendedClosure==true and .noFailureEvidence==true' "$temporary" >/dev/null
+  .objectiveRequirementsExtendedClosure==true and
+  .failureEvidencePreserved==true and .noUncorrectedFailureEvidence==true and
+  .noConsensusOrDataFailureEvidence==true' "$temporary" >/dev/null
 mv "$temporary" "$output"
 compat_temporary="$(mktemp "$evidence/.runtime37-total-compat.XXXXXX")"
 cp "$output" "$compat_temporary"
