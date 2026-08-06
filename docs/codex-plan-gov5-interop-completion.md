@@ -1543,3 +1543,11 @@ Gov peer、quorum 5/4、direct push 5、CommitQC、零双签和归档/QMDB 均�
 错误已保留失败证据并由 v2 审计纠正，未重启节点、未重置正式窗口、未改数据、未发
 交易。6/12/24 小时门和最终 17 笔 burst、归档/QMDB、Rust 重启重加入仍在运行，
 在全部闭环前不得宣布目标完成。
+
+Reth 依赖更新固定在提交 `0fc810bae34412838bedfd8dc2f212e14e915e5d`：
+`ark-relations 0.5.1` 改用上游修复 revision
+`845ce9d50bbe535792f04b44db78b009ee402ed7`，旧的
+`tracing-subscriber 0.2.25` 锁项已移除。2026-08-06 使用 `cargo audit 0.22.2`
+重新扫描 1,113 个锁定依赖，漏洞为 0，退出码为 0；仅保留 5 个允许的无人维护依赖
+警告。runtime38 的 Reth 2.4.1 binary 明确报告该提交，SHA-256 为
+`e3ce3278e9be89418f726f41f9d1f0814cfddba7d869407f30d3ec39a519f533`。

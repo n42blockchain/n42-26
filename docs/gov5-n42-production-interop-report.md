@@ -3807,3 +3807,13 @@ v3 SHA-256 is
 `4f5cfd7eb56090c49059122ad3f41ab4ca872c2d39ccb6cf6e76db32bec81f4d`.
 The 6/12/24-hour gates and final transaction/restart lifecycle remain armed;
 runtime38 is not declared complete before those gates close.
+
+The paired Reth dependency refresh is source commit
+`0fc810bae34412838bedfd8dc2f212e14e915e5d`. It patches `ark-relations 0.5.1`
+to upstream revision `845ce9d50bbe535792f04b44db78b009ee402ed7` and removes the
+obsolete `tracing-subscriber 0.2.25` lock entry. A fresh `cargo audit` 0.22.2
+scan on 2026-08-06 examined 1,113 locked dependencies and returned success with
+zero vulnerabilities; the remaining five findings are allowed unmaintained-
+crate warnings. The runtime38 binary reports Reth 2.4.1 at that exact source
+commit and hashes to
+`e3ce3278e9be89418f726f41f9d1f0814cfddba7d869407f30d3ec39a519f533`.
