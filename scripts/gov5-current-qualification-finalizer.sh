@@ -8,6 +8,7 @@ harness="$runtime/artifacts/scripts/gov5-interop-qualification.sh"
 qmdb_proof_verifier="$runtime/artifacts/binaries/n42-qmdb-proof-verify"
 gov_version="${N42_QUAL_GOV_VERSION:-906}"
 keep_rust_session_after_success="${N42_QUAL_KEEP_RUST_SESSION_AFTER_SUCCESS:-0}"
+resume_after_burst_failure="${N42_QUAL_RESUME_AFTER_BURST_FAILURE:-0}"
 formal="$runtime/evidence/mixed-soak-24h.jsonl"
 burst_artifact="$runtime/artifacts/p4-signed-transaction-burst.json"
 burst_evidence="$runtime/evidence/p4-transaction-burst-$gov_version.jsonl"
@@ -30,6 +31,10 @@ post_burst_audit="$runtime/evidence/mixed-post-burst-10m-audit.json"
 post_restart_audit="$runtime/evidence/mixed-post-restart-10m-audit.json"
 summary="$runtime/evidence/gov5-$gov_version-final-qualification.json"
 failures="${N42_QUAL_FAILURES:-$runtime/evidence/gov5-$gov_version-finalizer-failures.jsonl}"
+prior_failure="${N42_QUAL_PRIOR_FINALIZER_FAILURE:-$runtime/evidence/gov5-$gov_version-finalizer-failures.jsonl}"
+burst_correction="${N42_QUAL_BURST_CORRECTION:-$runtime/evidence/gov5-$gov_version-post-burst-correction.json}"
+expected_prior_failure_sha="${N42_QUAL_EXPECTED_PRIOR_FAILURE_SHA:-}"
+expected_burst_correction_sha="${N42_QUAL_EXPECTED_BURST_CORRECTION_SHA:-}"
 ports="${N42_QUAL_PORTS:-28501 28502 28503 28504 28505 29545}"
 rust_port="${N42_QUAL_RUST_PORT:-29545}"
 rust_miner="${N42_QUAL_RUST_MINER:-0x81d4c1f92ddb837cb46f82280d9b491b101fa582}"
@@ -52,6 +57,7 @@ gov_repo="${N42_QUAL_GOV_REPO:-/Users/jieliu/Documents/n42/live-interop-20260721
 
 mkdir -p "$runtime/evidence"
 [[ "$keep_rust_session_after_success" =~ ^[01]$ ]]
+[[ "$resume_after_burst_failure" =~ ^[01]$ ]]
 
 on_error() {
   local status=$?
@@ -305,6 +311,42 @@ assert_runtime_identity() {
     "$expected_p2p_key_sha"
 }
 
+assert_burst_correction() {
+  test "$resume_after_burst_failure" = 1
+  test -n "$expected_prior_failure_sha"
+  test -n "$expected_burst_correction_sha"
+  require_file "$prior_failure"
+  require_file "$burst_correction"
+  test "$(shasum -a 256 "$prior_failure" | awk '{print $1}')" = \
+    "$expected_prior_failure_sha"
+  test "$(shasum -a 256 "$burst_correction" | awk '{print $1}')" = \
+    "$expected_burst_correction_sha"
+  jq -e --arg failure "$prior_failure" \
+    --arg failure_sha "$expected_prior_failure_sha" \
+    --arg harness_sha "$expected_harness_sha" '
+    .event == "gov5_906_post_burst_correction" and .status == "PASS" and
+    .acceptanceRelaxed == false and
+    .priorFinalizerFailure.path == $failure and
+    .priorFinalizerFailure.sha256 == $failure_sha and
+    .priorFinalizerFailure.preserved == true and
+    .finalizedBurstBeforeCorrection.finalizedTransactions == 17 and
+    .finalizedBurstBeforeCorrection.passRows == 0 and
+    .tooling.newHarnessSha256 == $harness_sha and
+    .tooling.oldComparisonUsedJsonEncodedString == true and
+    .tooling.newComparisonUsesRawString == true and
+    .allSeventeenReceiptsExactAcrossEndpoints == true and
+    .allEndpointLatestAndPendingNoncesExact == true and
+    .expectedNonce == "0x22" and
+    .deployBlockLastBlockAndLatestStorageExact == true and
+    .transactionsResent == 0 and .chainDataMutationPerformed == false and
+    .nodeOrMonitorMutationPerformed == false and .resumeRequired == true
+  ' "$burst_correction" >/dev/null
+  jq -e -s '
+    length == 1 and .[0].event == "gov5_906_finalizer_failure" and
+    .[0].statusCode == 1 and (.[0].command | contains("transaction-burst"))
+  ' "$prior_failure" >/dev/null
+}
+
 preflight_burst() {
   local label="${1:?preflight label required}"
   local preflight="$runtime/evidence/p4-transaction-burst-$gov_version-finalizer-$label.jsonl"
@@ -347,7 +389,21 @@ if test "${N42_QUAL_FINALIZER_PREFLIGHT_ONLY:-0}" = 1; then
   exit 0
 fi
 
-test ! -e "$burst_evidence"
+if test "$resume_after_burst_failure" = 1; then
+  assert_burst_correction
+  require_file "$burst_evidence"
+  jq -e -s '
+    length == 17 and
+    (map(select(.event == "p4_transaction_finalized")) | length) == 17 and
+    (map(select(.event == "p4_transaction_burst_pass")) | length) == 0
+  ' "$burst_evidence" >/dev/null
+  require_file "$soak_audit"
+  require_file "$upstream_audit"
+else
+  test ! -e "$burst_evidence"
+  test ! -e "$soak_audit"
+  test ! -e "$upstream_audit"
+fi
 test ! -e "$post_burst"
 test ! -e "$post_restart"
 test ! -e "$archive_post_burst"
@@ -357,8 +413,6 @@ test ! -e "$timeout_final"
 test ! -e "$runtime_log_final"
 test ! -e "$final_log_root"
 test ! -e "$resource_audit"
-test ! -e "$upstream_audit"
-test ! -e "$soak_audit"
 test ! -e "$post_burst_audit"
 test ! -e "$post_restart_audit"
 test ! -e "$summary"
@@ -369,17 +423,19 @@ test ! -e "$summary"
 # monitor would observe that burst, fail, and append a disqualifying row after
 # the audit. Wait for the complete 86,640-second stream to close first, then
 # audit the immutable file before any transaction is sent.
-formal_monitor_pattern="monitor-heads 86640 30 $formal"
-while pgrep -f "$formal_monitor_pattern" >/dev/null; do
-  kill -0 "$(<"$runtime/pids/rust.pid")"
-  for port in $ports; do
-    wait_for_rpc "$port" 1
+if test "$resume_after_burst_failure" = 0; then
+  formal_monitor_pattern="monitor-heads 86640 30 $formal"
+  while pgrep -f "$formal_monitor_pattern" >/dev/null; do
+    kill -0 "$(<"$runtime/pids/rust.pid")"
+    for port in $ports; do
+      wait_for_rpc "$port" 1
+    done
+    sleep 60
   done
-  sleep 60
-done
-env N42_QUAL_RUNTIME="$runtime" "$harness" \
-  audit-soak "$formal" 86400 120 6 1 >"$soak_audit.pending"
-mv "$soak_audit.pending" "$soak_audit"
+  env N42_QUAL_RUNTIME="$runtime" "$harness" \
+    audit-soak "$formal" 86400 120 6 1 >"$soak_audit.pending"
+  mv "$soak_audit.pending" "$soak_audit"
+fi
 env N42_QUAL_RUNTIME="$runtime" "$harness" \
   audit-soak "$formal" 86400 120 6 1 >/dev/null
 assert_live_identity
@@ -400,15 +456,22 @@ jq -e --arg expected "$expected_gov_upstream_sha" '
   .event == "gov5_upstream_monitor_complete" and .status == "PASS" and
   .expectedMain == $expected and .elapsedSeconds >= 86400 and .samples >= 2
 ' "$upstream_complete" >/dev/null
-audit_gov_upstream >"$upstream_audit.pending"
-mv "$upstream_audit.pending" "$upstream_audit"
+if test "$resume_after_burst_failure" = 0; then
+  audit_gov_upstream >"$upstream_audit.pending"
+  mv "$upstream_audit.pending" "$upstream_audit"
+else
+  audit_gov_upstream >/dev/null
+fi
 
-preflight_burst final-preflight
+if test "$resume_after_burst_failure" = 0; then
+  preflight_burst final-preflight
+fi
 env \
   N42_QUAL_RUNTIME="$runtime" \
   N42_QUAL_PORTS="$ports" \
   N42_QUAL_GOV_INGRESS_PORT=28501 \
   N42_QUAL_RUST_INGRESS_PORT="$rust_port" \
+  N42_QUAL_BURST_RESUME_EXISTING="$resume_after_burst_failure" \
   "$harness" transaction-burst "$burst_artifact" "$burst_evidence"
 jq -e -s '
   (map(select(.event == "p4_transaction_finalized")) | length) == 17 and
@@ -416,7 +479,11 @@ jq -e -s '
   (map(select(.event == "p4_transaction_burst_pass"))[0] |
     .transactions == 17 and .endpointCount == 6 and
     .allConfiguredEndpointsExact == true and
-    .receiptAndLogParity == true and .stateAndStorageParity == true)
+    .receiptAndLogParity == true and .stateAndStorageParity == true and
+    (if $ENV.N42_QUAL_RESUME_AFTER_BURST_FAILURE == "1" then
+       .resumedFromFinalizedTransactionsOnly == true and
+       .noTransactionsResentDuringResume == true
+     else true end))
 ' "$burst_evidence" >/dev/null
 
 env N42_QUAL_RUNTIME="$runtime" N42_QUAL_PORTS="$ports" \
@@ -598,6 +665,11 @@ jq -nc \
   --arg final_rust_log_sha "$final_rust_log_sha" \
   --arg resource_sha "$(shasum -a 256 "$resource_evidence" | awk '{print $1}')" \
   --arg upstream_sha "$(shasum -a 256 "$upstream" | awk '{print $1}')" \
+  --arg burst_correction "$burst_correction" \
+  --arg burst_correction_sha "$(if test "$resume_after_burst_failure" = 1; then shasum -a 256 "$burst_correction" | awk '{print $1}'; fi)" \
+  --arg prior_failure "$prior_failure" \
+  --arg prior_failure_sha "$expected_prior_failure_sha" \
+  --argjson resumed_after_burst_failure "$resume_after_burst_failure" \
   --argjson keep_rust_session "$keep_rust_session_after_success" \
   --slurpfile soak "$soak_audit" \
   --slurpfile upstream "$upstream_audit" \
@@ -626,6 +698,12 @@ jq -nc \
    gov5UpstreamAudit:$upstream[0],gov5UpstreamEvidenceSha256:$upstream_sha,
    transactionBurst:($burst|map(select(.event=="p4_transaction_burst_pass"))[0]),
    transactionBurstEvidenceSha256:$burst_sha,
+   correctedPostBurstFailure:(if $resumed_after_burst_failure==1 then
+     {correctionEvidence:$burst_correction,
+      correctionEvidenceSha256:$burst_correction_sha,
+      priorFailure:$prior_failure,priorFailureSha256:$prior_failure_sha,
+      priorFailurePreserved:true,resumedWithoutTransactionResend:true}
+     else null end),
    postBurstEvidence:$post_burst,postBurstEvidenceSha256:$post_burst_sha,
    postBurstAudit:$post_burst_audit[0],
    archiveParityPostBurstEvidence:$archive_post_burst,

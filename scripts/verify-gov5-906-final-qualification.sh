@@ -20,6 +20,8 @@ expected_gov_binary_sha="${N42_VERIFY_GOV_BINARY_SHA:-e08c1ea7aac198e268d7fb07ea
 expected_rust_binary_sha="${N42_VERIFY_RUST_BINARY_SHA:-d639f712a87c22c2a45de29dbd895897058a8a28e4a2145061bd195d79eb6d2e}"
 expected_finalizer_sha="${N42_VERIFY_FINALIZER_SHA:-c48c5f3a94e361ce7cb81b41c586e12907f7a2adff688cb661062d9d21692fa0}"
 expected_harness_sha="${N42_VERIFY_HARNESS_SHA:-aa906f42b83048cb4168e1ceb1077d1ca8b27429be5189acd1aaa74f06c551e9}"
+expected_prior_failure_sha="${N42_VERIFY_PRIOR_FINALIZER_FAILURE_SHA:-}"
+expected_burst_correction_sha="${N42_VERIFY_BURST_CORRECTION_SHA:-}"
 
 require_file() {
   test -f "$1" || {
@@ -231,6 +233,8 @@ final_rust_log="$final_log_root/logs/rust.log"
 resources="$runtime/evidence/rust-resource-24h.jsonl"
 resource_audit="$runtime/evidence/rust-resource-24h-audit.json"
 failures="$runtime/evidence/gov5-906-finalizer-failures.jsonl"
+resume_failures="$runtime/evidence/gov5-906-finalizer-resume-failures.jsonl"
+burst_correction="$runtime/evidence/gov5-906-post-burst-correction.json"
 
 for path in "$summary" "$formal" "$soak_audit" "$upstream" \
   "$upstream_complete" "$upstream_audit" "$burst" "$post_burst" \
@@ -239,10 +243,34 @@ for path in "$summary" "$formal" "$soak_audit" "$upstream" \
   "$final_rust_log" "$resources" "$resource_audit"; do
   require_file "$path"
 done
-test ! -s "$failures"
+test ! -s "$resume_failures"
+if test -n "$expected_burst_correction_sha"; then
+  require_file "$failures"
+  require_file "$burst_correction"
+  test -n "$expected_prior_failure_sha"
+  test "$(sha256 "$failures")" = "$expected_prior_failure_sha"
+  test "$(sha256 "$burst_correction")" = "$expected_burst_correction_sha"
+  jq -e --arg failure "$failures" --arg failure_sha "$expected_prior_failure_sha" \
+    --arg harness_sha "$expected_harness_sha" '
+    .event == "gov5_906_post_burst_correction" and .status == "PASS" and
+    .acceptanceRelaxed == false and .priorFinalizerFailure.path == $failure and
+    .priorFinalizerFailure.sha256 == $failure_sha and
+    .priorFinalizerFailure.preserved == true and
+    .finalizedBurstBeforeCorrection.finalizedTransactions == 17 and
+    .tooling.newHarnessSha256 == $harness_sha and
+    .allSeventeenReceiptsExactAcrossEndpoints == true and
+    .allEndpointLatestAndPendingNoncesExact == true and
+    .deployBlockLastBlockAndLatestStorageExact == true and
+    .transactionsResent == 0 and .chainDataMutationPerformed == false
+  ' "$burst_correction" >/dev/null
+else
+  test -z "$expected_prior_failure_sha"
+  test ! -s "$failures"
+  test ! -e "$burst_correction"
+fi
 assert_sender_nonce 0x22
 
-jq -e '
+jq -e --argjson corrected "$(test -n "$expected_burst_correction_sha" && echo true || echo false)" '
   .event == "gov5_906_final_qualification" and .status == "PASS" and
   .acceptanceRelaxed == false and .genesisExact == true and
   .binariesExact == true and .finalToolingFrozenAndExact == true and
@@ -260,6 +288,16 @@ jq -e '
   .transactionBurst.allConfiguredEndpointsExact == true and
   .transactionBurst.receiptAndLogParity == true and
   .transactionBurst.stateAndStorageParity == true and
+  (if $corrected then
+     .transactionBurst.resumedFromFinalizedTransactionsOnly == true and
+     .transactionBurst.noTransactionsResentDuringResume == true and
+     .correctedPostBurstFailure.priorFailurePreserved == true and
+     .correctedPostBurstFailure.resumedWithoutTransactionResend == true
+   else
+     .transactionBurst.resumedFromFinalizedTransactionsOnly == false and
+     .transactionBurst.noTransactionsResentDuringResume == false and
+     .correctedPostBurstFailure == null
+   end) and
   .postBurstAudit.status == "PASS" and .postBurstAudit.elapsedSeconds >= 600 and
   .postBurstAudit.maximumLag <= 6 and
   .postRestartAudit.status == "PASS" and .postRestartAudit.elapsedSeconds >= 600 and
@@ -328,6 +366,12 @@ assert_summary_sha "$summary" rustLeaderEvidenceSha256 "$leaders"
 assert_summary_sha "$summary" timeoutRecoveryEvidenceSha256 "$timeouts"
 assert_summary_sha "$summary" runtimeLogEvidenceSha256 "$runtime_logs"
 assert_summary_sha "$summary" rustResourceEvidenceSha256 "$resources"
+if test -n "$expected_burst_correction_sha"; then
+  test "$(jq -er '.correctedPostBurstFailure.correctionEvidenceSha256' "$summary")" = \
+    "$(sha256 "$burst_correction")"
+  test "$(jq -er '.correctedPostBurstFailure.priorFailureSha256' "$summary")" = \
+    "$(sha256 "$failures")"
+fi
 
 test "$(jq -er '.immutableFinalLog.path' "$summary")" = "$final_rust_log"
 test "$(jq -er '.immutableFinalLog.sha256' "$summary")" = \

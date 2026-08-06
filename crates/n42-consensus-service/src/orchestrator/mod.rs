@@ -555,6 +555,10 @@ pub struct ConsensusService {
     epoch_schedule: Option<EpochSchedule>,
     /// Buffer for batching tx forwards to the current leader.
     tx_forward_buffer: Vec<Vec<u8>>,
+    /// View in which a missing remote tx-forward leader was already reported.
+    /// A deliberately absent validator can hold a view for the full pacemaker
+    /// timeout, so the 50 ms flush tick must not emit the same warning repeatedly.
+    tx_forward_missing_leader_warned_view: Option<u64>,
     /// Last R1/R2 vote sent in the current view. If direct delivery was lost and
     /// the view has not advanced, retry it periodically to the collector.
     pending_vote_resend: Option<PendingVoteResend>,
@@ -1993,6 +1997,7 @@ impl ConsensusService {
             view_started_at: None,
             epoch_schedule: None,
             tx_forward_buffer: Vec::new(),
+            tx_forward_missing_leader_warned_view: None,
             pending_vote_resend: None,
             pipeline_timings: HashMap::new(),
             last_commit_instant: None,
@@ -2229,6 +2234,7 @@ impl ConsensusService {
             view_started_at: None,
             epoch_schedule: None,
             tx_forward_buffer: Vec::new(),
+            tx_forward_missing_leader_warned_view: None,
             pending_vote_resend: None,
             pipeline_timings: HashMap::new(),
             last_commit_instant: None,
@@ -2984,6 +2990,14 @@ impl ConsensusService {
         self.trim_tx_forward_buffer(leader_idx, "forward send failure");
     }
 
+    fn should_warn_missing_tx_forward_leader(&mut self, view: u64) -> bool {
+        if self.tx_forward_missing_leader_warned_view == Some(view) {
+            return false;
+        }
+        self.tx_forward_missing_leader_warned_view = Some(view);
+        true
+    }
+
     /// Flush buffered txs to the current leader via the tx_forward protocol.
     async fn flush_tx_forward_buffer(&mut self) {
         if self.tx_forward_buffer.is_empty() {
@@ -2999,6 +3013,7 @@ impl ConsensusService {
                 .unwrap_or(false)
         });
         if disabled {
+            self.tx_forward_missing_leader_warned_view = None;
             // Feed all buffered txs into local pool and return (no forwarding).
             let txs = std::mem::take(&mut self.tx_forward_buffer);
             if self.tx_import_tx.is_some() {
@@ -3013,6 +3028,7 @@ impl ConsensusService {
 
         // If we are the leader, feed txs directly into the local pool.
         if self.engine.is_current_leader() {
+            self.tx_forward_missing_leader_warned_view = None;
             let txs = std::mem::take(&mut self.tx_forward_buffer);
             let count = txs.len();
             if self.tx_import_tx.is_some() {
@@ -3031,6 +3047,7 @@ impl ConsensusService {
 
         match leader_peer {
             Some(peer) => {
+                self.tx_forward_missing_leader_warned_view = None;
                 let txs = std::mem::take(&mut self.tx_forward_buffer);
                 let count = txs.len();
                 debug!(target: "n42::cl::orchestrator", count, leader_idx, %peer, "flushing tx forward buffer to leader");
@@ -3056,7 +3073,10 @@ impl ConsensusService {
                 // Leader not connected yet — fall back to keeping in buffer.
                 // If buffer grows too large, drop oldest to prevent memory bloat.
                 let buf_len = self.tx_forward_buffer.len();
-                warn!(target: "n42::cl::orchestrator", leader_idx, buf_len, peers = validator_peers.len(), "leader peer not found for tx forward");
+                let view = self.engine.current_view();
+                if self.should_warn_missing_tx_forward_leader(view) {
+                    warn!(target: "n42::cl::orchestrator", view, leader_idx, buf_len, peers = validator_peers.len(), "leader peer not found for tx forward");
+                }
                 self.trim_tx_forward_buffer(leader_idx, "leader peer not found");
             }
         }
@@ -5224,6 +5244,19 @@ mod tests {
 
         assert_eq!(orch.tx_forward_buffer.len(), 2048);
         assert_eq!(orch.tx_forward_buffer, expected_tail);
+    }
+
+    #[test]
+    fn test_missing_tx_forward_leader_warns_once_per_view() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
+
+        assert!(orch.should_warn_missing_tx_forward_leader(41));
+        assert!(!orch.should_warn_missing_tx_forward_leader(41));
+        assert!(orch.should_warn_missing_tx_forward_leader(42));
+        assert!(!orch.should_warn_missing_tx_forward_leader(42));
     }
 
     #[tokio::test]

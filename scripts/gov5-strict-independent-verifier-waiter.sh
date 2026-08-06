@@ -17,6 +17,8 @@ expected_deps_head="${N42_INDEPENDENT_DEPS_HEAD:?dependency commit is required}"
 expected_reth_head="${N42_INDEPENDENT_RETH_HEAD:?Reth commit is required}"
 expected_gov_binary_sha="${N42_INDEPENDENT_GOV_BINARY_SHA:?Gov5 binary SHA-256 is required}"
 expected_rust_binary_sha="${N42_INDEPENDENT_RUST_BINARY_SHA:?Rust binary SHA-256 is required}"
+expected_prior_failure_sha="${N42_INDEPENDENT_PRIOR_FAILURE_SHA:-}"
+expected_burst_correction_sha="${N42_INDEPENDENT_BURST_CORRECTION_SHA:-}"
 ports="${N42_INDEPENDENT_PORTS:-28501 28502 28503 28504 28505 29545}"
 summary="$runtime/evidence/gov5-906-final-qualification.json"
 output="$runtime/evidence/gov5-906-independent-final-verification.json"
@@ -113,7 +115,17 @@ while ! test -s "$summary"; do
   remote="$(git_ls_remote_with_retry -C "$gov_repo" ls-remote origin refs/heads/main |
     awk 'NR == 1 {print $1}')"
   test "$remote" = "$expected_gov_main"
-  test ! -s "$runtime/evidence/gov5-906-finalizer-failures.jsonl"
+  if test -n "$expected_burst_correction_sha"; then
+    test -n "$expected_prior_failure_sha"
+    test "$(sha256 "$runtime/evidence/gov5-906-finalizer-failures.jsonl")" = \
+      "$expected_prior_failure_sha"
+    test "$(sha256 "$runtime/evidence/gov5-906-post-burst-correction.json")" = \
+      "$expected_burst_correction_sha"
+  else
+    test -z "$expected_prior_failure_sha"
+    test ! -s "$runtime/evidence/gov5-906-finalizer-failures.jsonl"
+  fi
+  test ! -s "$runtime/evidence/gov5-906-finalizer-resume-failures.jsonl"
   if test -s "$heads"; then
     tail -n 1 "$heads" |
       jq -e '.ok == true and .zeroTxRequired == 1' >/dev/null
@@ -140,6 +152,8 @@ env \
   N42_VERIFY_RUST_BINARY_SHA="$expected_rust_binary_sha" \
   N42_VERIFY_FINALIZER_SHA="$expected_finalizer_sha" \
   N42_VERIFY_HARNESS_SHA="$expected_harness_sha" \
+  N42_VERIFY_PRIOR_FINALIZER_FAILURE_SHA="$expected_prior_failure_sha" \
+  N42_VERIFY_BURST_CORRECTION_SHA="$expected_burst_correction_sha" \
   "$verifier" >"$temporary"
 test -s "$temporary"
 jq -e '.status == "PASS"' "$temporary" >/dev/null

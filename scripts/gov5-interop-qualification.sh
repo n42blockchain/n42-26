@@ -890,7 +890,7 @@ audit_runtime_logs() {
   critical="$audit_dir/critical-signals.log"
 
   local total timeout pacemaker eviction commits duplicate_vote duplicate_commit
-  local payload_retry unsupported_state_sync
+  local payload_retry unsupported_state_sync missing_tx_forward_leader
   total="$(rg -c ' WARN ' "$rust_log" || echo 0)"
   timeout="$(rg -c ' WARN view timed out view=' "$rust_log" || echo 0)"
   pacemaker="$(rg -c ' WARN pacemaker timeout, initiating view change view=' \
@@ -912,9 +912,13 @@ audit_runtime_logs() {
     ' WARN sync request failed peer=.* error=peer does not advertise N42 state-sync$' \
     "$rust_log" || true)"
   unsupported_state_sync="${unsupported_state_sync:-0}"
+  missing_tx_forward_leader="$(rg -c \
+    ' WARN leader peer not found for tx forward view=[0-9]+ leader_idx=[0-9]+ buf_len=[0-9]+ peers=[0-9]+$' \
+    "$rust_log" || true)"
+  missing_tx_forward_leader="${missing_tx_forward_leader:-0}"
 
   rg ' WARN ' "$rust_log" | rg -v \
-    ' WARN (view timed out view=|pacemaker timeout, initiating view change view=|fork_choice_updated did not return payload_id, scheduling retry$|sync request failed peer=.* error=peer does not advertise N42 state-sync$)| WARN .*evicted rejected compact execution output hash=| WARN .*suppressed duplicate (commit )?vote \(already (commit-)?voted in this view\)' \
+    ' WARN (view timed out view=|pacemaker timeout, initiating view change view=|fork_choice_updated did not return payload_id, scheduling retry$|sync request failed peer=.* error=peer does not advertise N42 state-sync$|leader peer not found for tx forward view=[0-9]+ leader_idx=[0-9]+ buf_len=[0-9]+ peers=[0-9]+$)| WARN .*evicted rejected compact execution output hash=| WARN .*suppressed duplicate (commit )?vote \(already (commit-)?voted in this view\)' \
     >"$unknown" || true
   local log
   for log in "$runtime"/logs/gov{1,2,3,4,5}.log "$rust_log"; do
@@ -936,9 +940,13 @@ audit_runtime_logs() {
   # peers before authenticated block catch-up takes over.
   test "$payload_retry" -le 2
   test "$unsupported_state_sync" -le 10
+  # A missing validator may be selected while a transaction is buffered. The
+  # orchestrator emits at most one warning for that view, never one per flush
+  # tick, and the missing-leader views are bounded by pacemaker timeouts.
+  test "$missing_tx_forward_leader" -le "$timeout"
   test "$total" -eq \
     $((timeout + pacemaker + eviction + duplicate_vote + duplicate_commit +
-      payload_retry + unsupported_state_sync))
+      payload_retry + unsupported_state_sync + missing_tx_forward_leader))
   test ! -s "$unknown"
   test ! -s "$critical"
 
@@ -955,7 +963,8 @@ audit_runtime_logs() {
     --argjson duplicate_vote "$duplicate_vote" \
     --argjson duplicate_commit "$duplicate_commit" \
     --argjson payload_retry "$payload_retry" \
-    --argjson unsupported_state_sync "$unsupported_state_sync" '
+    --argjson unsupported_state_sync "$unsupported_state_sync" \
+    --argjson missing_tx_forward_leader "$missing_tx_forward_leader" '
     {at:$at,event:"mixed_client_runtime_log_audit",status:"PASS",
       rustLog:$log,rustLogSha256:$log_sha256,totalWarnings:$total,
       warningCounts:{viewTimeout:$timeout,pacemakerTimeout:$pacemaker,
@@ -963,7 +972,9 @@ audit_runtime_logs() {
         duplicateVoteSuppression:$duplicate_vote,
         duplicateCommitVoteSuppression:$duplicate_commit,
         payloadBuildRetry:$payload_retry,
-        unsupportedStateSyncFallback:$unsupported_state_sync},
+        unsupportedStateSyncFallback:$unsupported_state_sync,
+        missingTxForwardLeader:$missing_tx_forward_leader},
+      missingTxForwardLeaderAtMostOncePerView:true,
       warningPartitionExact:true,timeoutSetsCountExact:true,
       compactEvictionsMatchRustLeaderCommits:true,
       unexpectedWarnings:0,criticalSignals:0,
@@ -1529,6 +1540,12 @@ transaction_burst() {
   local -a ports
   local gov_ingress_port="${N42_QUAL_GOV_INGRESS_PORT:-28501}"
   local rust_ingress_port="${N42_QUAL_RUST_INGRESS_PORT:-29545}"
+  local resume_existing="${N42_QUAL_BURST_RESUME_EXISTING:-0}"
+  local state_visibility_attempts="${N42_QUAL_STATE_VISIBILITY_ATTEMPTS:-30}"
+  local state_visibility_delay="${N42_QUAL_STATE_VISIBILITY_DELAY_SECONDS:-1}"
+  [[ "$resume_existing" =~ ^[01]$ ]]
+  [[ "$state_visibility_attempts" =~ ^[1-9][0-9]*$ ]]
+  [[ "$state_visibility_delay" =~ ^[0-9]+$ ]]
   read -r -a ports <<<"${N42_QUAL_PORTS:-28501 28502 28503 28504 28505 29545 29546}"
   case " ${ports[*]} " in
     *" $gov_ingress_port "*) ;;
@@ -1556,9 +1573,14 @@ transaction_burst() {
   contract="$(jq -er '.expectedContract' "$artifact")"
   mkdir -p "$(dirname "$evidence_file")"
 
-  local port nonce_response first_nonce expected_nonce
+  local port nonce_response first_nonce expected_nonce count
   first_nonce="$(jq -er '.transactions[0].nonce' "$artifact")"
-  printf -v expected_nonce '0x%x' "$first_nonce"
+  count="$(jq -er '.transactions | length' "$artifact")"
+  if test "$resume_existing" = 1; then
+    printf -v expected_nonce '0x%x' "$((first_nonce + count))"
+  else
+    printf -v expected_nonce '0x%x' "$first_nonce"
+  fi
   for port in "${ports[@]}"; do
     nonce_response="$(rpc_request "http://127.0.0.1:$port" \
       eth_getTransactionCount "$(jq -nc --arg sender "$sender" '[$sender,"latest"]')")"
@@ -1586,10 +1608,28 @@ transaction_burst() {
     return 0
   fi
 
-  local count index kind nonce ingress raw expected_hash ingress_port
+  local index kind nonce ingress raw expected_hash ingress_port
   local response returned_hash receipt block_number first_block="" last_block=""
-  count="$(jq -er '.transactions | length' "$artifact")"
-  for index in $(seq 0 $((count - 1))); do
+  if test "$resume_existing" = 1; then
+    test -s "$evidence_file"
+    jq -e -s --slurpfile artifact "$artifact" '
+      (map(select(.event == "p4_transaction_finalized"))) as $finalized |
+      (map(select(.event == "p4_transaction_burst_pass")) | length) == 0 and
+      ($finalized | length) == ($artifact[0].transactions | length) and
+      ([range(0; $finalized | length) as $index |
+        ($finalized[$index].nonce == $artifact[0].transactions[$index].nonce and
+         $finalized[$index].kind == $artifact[0].transactions[$index].kind and
+         $finalized[$index].ingress == $artifact[0].transactions[$index].intendedIngress and
+         $finalized[$index].transactionHash == $artifact[0].transactions[$index].hash and
+         $finalized[$index].status == "0x1")] | all)
+    ' "$evidence_file" >/dev/null
+    first_block="$(jq -ers 'map(select(.event == "p4_transaction_finalized"))[0].blockNumber' \
+      "$evidence_file")"
+    last_block="$(jq -ers 'map(select(.event == "p4_transaction_finalized"))[-1].blockNumber' \
+      "$evidence_file")"
+  fi
+  if test "$resume_existing" = 0; then
+    for index in $(seq 0 $((count - 1))); do
     kind="$(jq -er --argjson index "$index" '.transactions[$index].kind' "$artifact")"
     nonce="$(jq -er --argjson index "$index" '.transactions[$index].nonce' "$artifact")"
     ingress="$(jq -er --argjson index "$index" '.transactions[$index].intendedIngress' "$artifact")"
@@ -1644,7 +1684,8 @@ transaction_burst() {
         ingress:$ingress,ingressPort:$ingress_port,
         transactionHash:$transaction_hash,blockNumber:$block_number,status:"0x1"
       }' >>"$evidence_file"
-  done
+    done
+  fi
 
   local method params reference candidate
   local exact_checks=0
@@ -1720,21 +1761,30 @@ transaction_burst() {
   done
   params="$(jq -nc --arg contract "$contract" --arg block "$last_block" \
     '[$contract,"0x0",$block]')"
-  reference=""
-  for port in "${ports[@]}"; do
-    candidate="$(rpc_request "http://127.0.0.1:$port" eth_getStorageAt "$params" |
-      jq -ecS 'select(.error == null) | .result')"
-    if test -z "$reference"; then
-      reference="$candidate"
-    elif test "$candidate" != "$reference"; then
-      echo "transaction burst storage mismatch at port $port" >&2
-      return 1
+  local visibility_attempt storage_exact expected_storage
+  expected_storage="0x0000000000000000000000000000000000000000000000000000000000000001"
+  storage_exact=false
+  for visibility_attempt in $(seq 1 "$state_visibility_attempts"); do
+    reference=""
+    storage_exact=true
+    for port in "${ports[@]}"; do
+      candidate="$(rpc_request "http://127.0.0.1:$port" eth_getStorageAt "$params" |
+        jq -er 'select(.error == null) | .result')"
+      if test -z "$reference"; then
+        reference="$candidate"
+      elif test "$candidate" != "$reference"; then
+        storage_exact=false
+      fi
+      exact_checks=$((exact_checks + 1))
+    done
+    if test "$storage_exact" = true && test "$reference" = "$expected_storage"; then
+      break
     fi
-    exact_checks=$((exact_checks + 1))
+    test "$visibility_attempt" -ge "$state_visibility_attempts" ||
+      sleep "$state_visibility_delay"
   done
-  if test "$reference" != \
-    "0x0000000000000000000000000000000000000000000000000000000000000001"; then
-    echo "transaction burst contract storage did not contain one" >&2
+  if test "$storage_exact" != true || test "$reference" != "$expected_storage"; then
+    echo "transaction burst contract storage was not consistently visible" >&2
     return 1
   fi
 
@@ -1749,6 +1799,8 @@ transaction_burst() {
     --argjson transactions "$count" \
     --argjson exact_checks "$exact_checks" \
     --argjson endpoint_count "${#ports[@]}" \
+    --argjson resumed "$resume_existing" \
+    --argjson visibility_attempts "$visibility_attempt" \
     '{
       at:$at,event:"p4_transaction_burst_pass",artifact:$artifact,
       artifactSha256:$artifact_sha256,sender:$sender,contract:$contract,
@@ -1757,7 +1809,10 @@ transaction_burst() {
       allConfiguredEndpointsExact:true,
       allSevenEndpointsExact:($endpoint_count == 7),
       receiptAndLogParity:true,stateAndStorageParity:true,
-      exactRpcComparisons:$exact_checks
+      exactRpcComparisons:$exact_checks,
+      resumedFromFinalizedTransactionsOnly:($resumed == 1),
+      stateVisibilityAttempts:$visibility_attempts,
+      noTransactionsResentDuringResume:($resumed == 1)
     }' >>"$evidence_file"
 }
 
