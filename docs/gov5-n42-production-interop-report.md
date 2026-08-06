@@ -3759,3 +3759,51 @@ The runtime22 formal/resource/upstream streams started at
 `ddcdaa2f6a...`, candidate `673299abf0...`, Gov binary `f84ac8e9...6ea3`,
 and official stable Reth 2.4.1 binary `0a4dbcf3...62b9f`. As before, no
 transaction is released before the complete strict stream closes.
+
+## 2026-08-06 runtime37 exclusion and runtime38 requalification
+
+Runtime37 completed its zero-transaction window and post-soak lifecycle checks,
+but its immutable final log contained 9,426 identical missing-validator
+tx-forward warnings emitted every 50 ms. The run is therefore excluded from the
+final qualification even though its chain checks passed. The preserved
+exclusion evidence SHA-256 is
+`c1f6d72cfe323dfd6273e4e4aa5d6d60fd33b0f049c163dd5d3b3288e4c0e289`.
+N42 commit `40d1ce69bd9a2102e51e96a77b2348a6bec915ea` rate-limits that warning to
+once per consensus view and is pushed; the replacement Rust binary SHA-256 is
+`e3ce3278e9be89418f726f41f9d1f0814cfddba7d869407f30d3ec39a519f533`.
+
+Runtime38 starts from the clean, stopped runtime34 data rather than runtime37's
+advanced state. Its 141-file, 17,325,704,613-byte copy is exact; the copy
+manifest SHA-256 is
+`ae4e7ff351afa4e010751fe2a79fa25ae5921a1fcdecf3d9c6ad695d1fe39a85`.
+Preflight reverified genesis `b71c2810...92ec`, the 5.7.905 copied boundary at
+height 92,605 (`b88a3571...5a82`), the security boundary at height 99,895
+(`7ccd3300...2407`), nonce `0x11`, six-endpoint identity, five authenticated
+Gov peers, quorum 5/4, direct push 5, CommitQC, zero equivocations, and exact
+archive/QMDB proofs. Gov5 is 5.7.906 at main `c0a146468...` and candidate
+`9ae0421ce...`; Rust uses official stable Reth 2.4.1 at `0fc810bae...`.
+
+The fresh strict stream began at `2026-08-06T12:41:42Z`, common height 99,925.
+Its first-hour milestone contains 121 healthy samples over 3,635 seconds,
+height growth 384, maximum lag one, and continuous zero-transaction coverage.
+The exact six-producer scan covers heights 99,926--100,309: 384 blocks and 64
+complete rotations, with Rust and Gov1--Gov5 producing 64 blocks each on the
+same parent-continuous sequence at all six endpoints. The frozen-log audit
+covers 433 blocks and 73 Rust slots; every Rust slot has an ordered `5+5`
+commit, all 73 timeouts recover at the next view, and all 589 warnings partition
+with zero unknown or critical signals. The one-hour milestone, producer,
+supplemental, and deep-audit SHA-256 values are respectively
+`3fa2a5d86c240678b7f0a9ff8efa83f36940e4a960fdd7e7a03eb25db64a2448`,
+`7562d3c14563b27104b2f9f5cdc4ddce9b32f124f1ab1bb77cca5eb0eb6b14e2`,
+`00fffc2d3923b6dc1bdd5646120825221a94476ab28aec8a6eaf8bee75392567`, and
+`af3ac39da2ddb7c56758198bc3d56cf151172b30170e4c8c1ca31084daa0b248`.
+
+Two controller-only failures remain preserved: the first producer audit began
+one block before the Rust-aligned rotation boundary, and the first deep audit
+referenced an obsolete frozen-tool boundary after the total verifier was
+upgraded. Corrected v2 audits pass without restarting any node, resetting the
+formal window, modifying chain data, or sending a transaction. Static boundary
+v3 SHA-256 is
+`4f5cfd7eb56090c49059122ad3f41ab4ca872c2d39ccb6cf6e76db32bec81f4d`.
+The 6/12/24-hour gates and final transaction/restart lifecycle remain armed;
+runtime38 is not declared complete before those gates close.
