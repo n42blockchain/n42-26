@@ -27,14 +27,16 @@ resources="$evidence/rust-resource-24h.jsonl"
 resource_audit="$evidence/rust-resource-24h-audit.json"
 stable="$evidence/official-reth-stable-monitor.jsonl"
 copy_manifest="$evidence/runtime38-stopped-copy-manifest.json"
-static_boundary="$evidence/runtime38-static-boundary-v2.json"
+static_boundary="$evidence/runtime38-static-boundary-v3.json"
 data_905="$evidence/runtime38-preflight-905-data-compat.json"
 network="$evidence/runtime38-network-consensus-matrix.json"
 archive_preflight="$evidence/runtime38-preflight-archive-qmdb-parity.jsonl"
 transaction_preflight="$evidence/runtime38-transaction-preflight.jsonl"
 runtime37_exclusion="$evidence/runtime37-final-log-warning-exclusion.json"
-strict_producer="$evidence/runtime38-strict24h-six-producer-full-range.json"
-strict_producer_linkage="$evidence/runtime38-strict24h-six-producer-linkage.json"
+strict_producer="$evidence/runtime38-strict24h-six-producer-full-range-v2.json"
+strict_producer_linkage="$evidence/runtime38-strict24h-six-producer-linkage-v2.json"
+producer_start_failure="$evidence/runtime38-one-hour-six-producer-failure.json"
+deep_v1_failure="$evidence/runtime38-one-hour-closed-deep-audit-failure.json"
 latest="$evidence/latest-reth-final-qualification.json"
 latest_independent="$evidence/latest-reth-independent-final-verification.json"
 output="${N42_TOTAL_OUTPUT:-$evidence/runtime38-goal-completion.json}"
@@ -94,14 +96,15 @@ assert_no_failures() {
     "$evidence/gov5-906-independent-final-verification-failure.json" \
     "$evidence/runtime38-goal-completion-failure.json" \
     "$evidence/gov5-current-main-fail-close-guardian-failure.json" \
-    "$evidence/runtime38-one-hour-six-producer-failure.json" \
     "$evidence/runtime38-strict24h-six-producer-failure.json" \
+    "$evidence/runtime38-one-hour-six-producer-v2-failure.json" \
+    "$evidence/runtime38-strict24h-six-producer-v2-failure.json" \
     "$evidence/runtime38-one-hour-supplemental-audit-failure.json" \
     "$evidence/runtime38-strict24h-supplemental-audit-failure.json"; do
     test ! -s "$path"
   done
   for path in "$evidence"/gov5-906-*-milestone-failure.json \
-    "$evidence"/runtime38-*-closed-deep-audit-failure.json; do
+    "$evidence"/runtime38-*-v2-closed-deep-audit-failure.json; do
     test ! -e "$path" || test ! -s "$path"
   done
 }
@@ -161,17 +164,18 @@ required=(
   "$summary" "$independent" "$formal" "$formal_audit" "$resources"
   "$resource_audit" "$stable" "$copy_manifest" "$static_boundary" "$data_905"
   "$network" "$archive_preflight" "$transaction_preflight" "$runtime37_exclusion"
-  "$strict_producer" "$strict_producer_linkage" "$verifier"
+  "$strict_producer" "$strict_producer_linkage" "$producer_start_failure"
+  "$deep_v1_failure" "$verifier"
   "$evidence/gov5-906-one-hour-milestone.json"
   "$evidence/gov5-906-six-hour-milestone.json"
   "$evidence/gov5-906-twelve-hour-milestone.json"
   "$evidence/gov5-906-strict24h-milestone.json"
-  "$evidence/runtime38-one-hour-six-producer-full-range.json"
+  "$evidence/runtime38-one-hour-six-producer-full-range-v2.json"
   "$evidence/runtime38-one-hour-supplemental-audit.json"
   "$evidence/runtime38-strict24h-supplemental-audit.json"
-  "$evidence/runtime38-one-hour-closed-deep-audit.json"
-  "$evidence/runtime38-twelve-hour-closed-deep-audit.json"
-  "$evidence/runtime38-strict24h-closed-deep-audit.json"
+  "$evidence/runtime38-one-hour-v2-closed-deep-audit.json"
+  "$evidence/runtime38-twelve-hour-v2-closed-deep-audit.json"
+  "$evidence/runtime38-strict24h-v2-closed-deep-audit.json"
 )
 for path in "${required[@]}"; do test -s "$path"; done
 
@@ -249,6 +253,12 @@ jq -e '.status=="EXCLUDED" and .acceptanceRelaxed==false and
   .replacement.runtime37AdvancedDataReused==false and
   .replacement.strictQualificationRestartsFromZero and .finalQualificationCredited==false' \
   "$runtime37_exclusion" >/dev/null
+jq -e '.event=="gov5_milestone_six_producer_waiter_failure" and
+  .status=="FAIL" and .label=="one-hour" and .exitCode==1 and .line==80 and
+  (.command|contains("$auditor"))' "$producer_start_failure" >/dev/null
+jq -e '.event=="gov5_runtime_milestone_deep_audit_failure" and
+  .status=="FAIL" and .label=="one-hour" and .statusCode==1 and .line==185 and
+  (.command|contains("$rechecker"))' "$deep_v1_failure" >/dev/null
 
 for label in one-hour six-hour twelve-hour strict24h; do
   jq -e --arg label "$label" '.status=="PASS" and .label==$label and
@@ -257,9 +267,9 @@ for label in one-hour six-hour twelve-hour strict24h; do
     "$evidence/gov5-906-$label-milestone.json" >/dev/null
 done
 for path in \
-  "$evidence/runtime38-one-hour-closed-deep-audit.json" \
-  "$evidence/runtime38-twelve-hour-closed-deep-audit.json" \
-  "$evidence/runtime38-strict24h-closed-deep-audit.json"; do
+  "$evidence/runtime38-one-hour-v2-closed-deep-audit.json" \
+  "$evidence/runtime38-twelve-hour-v2-closed-deep-audit.json" \
+  "$evidence/runtime38-strict24h-v2-closed-deep-audit.json"; do
   jq -e '.status=="PASS" and .acceptanceRelaxed==false and
     .transactionsSent==0 and .failureEvidencePresent==false and
     .runtimeLogs.unexpectedWarnings==0 and .runtimeLogs.criticalSignals==0 and
@@ -274,7 +284,7 @@ for path in \
     .data905CompatibilityExact and .resourceTrendWithin24hBudget and
     .noFailureEvidence' "$path" >/dev/null
 done
-for path in "$evidence/runtime38-one-hour-six-producer-full-range.json" \
+for path in "$evidence/runtime38-one-hour-six-producer-full-range-v2.json" \
   "$strict_producer"; do
   jq -e '.status=="PASS" and .allSixEndpointSequencesExact and
     .parentChainContinuous and .expectedProducerSlotsExact and
@@ -353,6 +363,12 @@ jq -nc --arg at "$(date -u +%FT%TZ)" --arg runtime "$runtime" \
     fullSixProducerHistoricalWindowExact:true,
     runtime37:{excluded:true,finalQualificationCredited:false,
       exclusionEvidenceSha256:$exclusion_sha},
+    producerAuditControllerCorrection:{incorrectStartHeight:99925,
+      correctedRustAlignedStartHeight:99926,formalWindowReset:false,
+      nodeRestarted:false,transactionSent:false,failedControllerEvidencePreserved:true},
+    deepAuditControllerCorrection:{obsoleteStaticBoundaryVersion:1,
+      correctedStaticBoundaryVersion:3,formalWindowReset:false,nodeRestarted:false,
+      transactionSent:false,failedControllerEvidencePreserved:true},
     summary:{path:$summary,sha256:$summary_sha},
     independentVerification:{path:$independent,sha256:$independent_sha},
     allRequiredEvidenceIndependentlyReverified:true,sourcesCommittedAndPushed:true}' \
