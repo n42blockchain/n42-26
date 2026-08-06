@@ -23,6 +23,16 @@ use crate::tx_forward::TxForwardCodec;
 /// hard-coding a second copy that silently drifts out of sync with this one.
 pub const MAX_GOSSIP_MESSAGE_SIZE: usize = 8 * 1024 * 1024;
 
+/// Largest blob-sidecar message GossipSub receivers will accept.
+///
+/// This is the blob topic's Reject threshold; the publisher packs sidecars
+/// into frames no larger than this instead of one all-or-nothing message. One
+/// EIP-4844 sidecar is ~137 KiB per blob, so a full 6-blob transaction
+/// (~825 KiB) fits in a frame with room to spare. Public for the same reason
+/// as [`MAX_GOSSIP_MESSAGE_SIZE`]: a second hard-coded copy on the publish
+/// side is exactly what let blob broadcasts outgrow the receivers unnoticed.
+pub const MAX_BLOB_GOSSIP_MESSAGE_SIZE: usize = 1024 * 1024;
+
 /// The composite network behaviour for N42 nodes.
 ///
 /// Combines GossipSub (pub/sub consensus), Identify (peer metadata),

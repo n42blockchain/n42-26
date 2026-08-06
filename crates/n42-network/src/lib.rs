@@ -26,7 +26,8 @@ pub use state_sync::{
     SyncBlock, SyncPayload,
 };
 pub use transport::{
-    MAX_GOSSIP_MESSAGE_SIZE, N42Behaviour, TransportConfig, build_swarm,
+    MAX_BLOB_GOSSIP_MESSAGE_SIZE, MAX_GOSSIP_MESSAGE_SIZE, N42Behaviour, TransportConfig,
+    build_swarm,
     build_swarm_with_validator_index, deterministic_validator_keypair,
     deterministic_validator_peer_id,
 };
