@@ -3817,3 +3817,7 @@ zero vulnerabilities; the remaining five findings are allowed unmaintained-
 crate warnings. The runtime38 binary reports Reth 2.4.1 at that exact source
 commit and hashes to
 `e3ce3278e9be89418f726f41f9d1f0814cfddba7d869407f30d3ec39a519f533`.
+The paired canonical N42 lockfile also passes a fresh scan of 1,290
+dependencies with zero vulnerabilities. Its seven allowed warnings include
+`lru 0.12.5` only in the disabled SP1 v4 proof graph; the active N42 and Reth
+runtime graphs resolve the unaffected `lru 0.18.2` and `0.16.4` releases.
