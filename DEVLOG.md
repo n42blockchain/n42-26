@@ -150,6 +150,7 @@ Logs are split into separate files by phase for easy maintenance:
 | [devlog-116-h2-v4-finality-verifier](docs/devlog-116-h2-v4-finality-verifier.md) | gov5→Rust 固定 BLS CommitQC 对拍、POP/NUL ciphersuite 隔离、只读 observer finality 证明门禁 | Interop |
 | [devlog-117-h2-v4-production-profile](docs/devlog-117-h2-v4-production-profile.md) | gov5 H2-v4 静态验证者生产 profile、全路径签名域、Decide 双发与 Rust 只读最终性同步目标；默认关闭并保护旧 7 节点/QMDB/archive+ 数据 | Interop |
 | [devlog-118-audit-and-deps-20260804](docs/devlog-118-audit-and-deps-20260804.md) | v0.5.x 收尾 4 提交增量审计（1 minor 修复：越界测试绑常量）+ reth fork 合并上游 75 提交（20260804）+ 全依赖升级（revm 42/alloy 2.3/alloy-evm 0.38/rpt 0.6/rand 0.10/lru 0.18/toml 1.1），仅 2 处 API 适配 | Audit |
+| [devlog-119-post-merge-audit-20260806](docs/devlog-119-post-merge-audit-20260806.md) | 合并后审计：HIGH-1 守卫补 observer 第 5 消费点、blob 广播发送/接收尺寸漂移修复（共享常量 + 分帧）、ingest 批字节上限；compact 缓存生命周期与 twig 缓冲复用核查为清 | Audit |
 
 ### 上游借鉴与跟踪
 
