@@ -3808,6 +3808,35 @@ v3 SHA-256 is
 The 6/12/24-hour gates and final transaction/restart lifecycle remain armed;
 runtime38 is not declared complete before those gates close.
 
+Runtime38's strict six-hour milestone passed at `2026-08-06T18:42:36Z`
+without relaxed acceptance. The closed head snapshot contains 715 samples over
+21,628 seconds, grows from height 99,925 to 102,229 (2,304 blocks), has maximum
+lag one, and remains transaction-free. Seventy-three resource samples from the
+same Rust PID cover 21,609 seconds; RSS peaks at 255,984 KiB, threads at 162,
+file descriptors at 90, and the 24-hour RSS projection is 315,982 KiB. All 37
+Gov-main samples remain exactly `c0a146468...`. The milestone and supplemental
+audit SHA-256 values are
+`5f28ab642d9f634d82c4bb8f0e4993dc77f4951f9908cea60bf030c42be32c00` and
+`31600ff7d56472b730d172af41ebcb06fe9c2345828c696974508f890d04124d`.
+The supplemental audit again proves exact genesis and height-92,605 identities
+on all six endpoints, nonce `0x11`, absent txindex/QMDB opt-ins, and no need to
+recopy or regenerate the 5.7.905-lineage data.
+
+The closed full-range producer audit scans heights 99,926 through 102,229:
+2,304 blocks and 384 complete rotations. Rust and Gov1 through Gov5 each author
+exactly 384 blocks, with identical six-endpoint sequences, continuous parent
+links, exact producer slots, and zero transactions. Its SHA-256 is
+`450148f74fc0057dfff62c7ed200e115d3fd9dd4087c02c94363bcf37e886ad5`.
+The V2 deep audit scans 2,329 blocks at heights 99,902 through 102,230 and finds
+389 canonical Rust slots, all with ordered `5+5` commits. All 389 timeout views
+recover at the next view with none pending. Its 3,135 warnings partition
+exactly, with zero missing-leader, unexpected, or critical signals. All 24 Gov
+static files, the stopped-copy manifest, binaries, and frozen tools remain
+byte-exact. The deep-audit SHA-256 is
+`50cf223598ce0728c9a160ac39f2fff26dbb5214e89979fb12ea3fb8cf0211d6`.
+No node was restarted, no chain data was rewritten, and no transaction was
+sent; the 12/24-hour and final burst/restart gates remain armed.
+
 The paired Reth dependency refresh is source commit
 `0fc810bae34412838bedfd8dc2f212e14e915e5d`. It patches `ark-relations 0.5.1`
 to upstream revision `845ce9d50bbe535792f04b44db78b009ee402ed7` and removes the
