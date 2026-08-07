@@ -143,14 +143,17 @@ hickory-proto 0.25.2 经 libp2p 0.56 真实存在，只有升到 0.57 才能消�
 
 ## 六、留档：未修但需跟踪的项
 
-1. **QMDB archive RPC 持锁全谱系重放**（中）：`qmdbArchiveState`/`qmdbArchiveProof`
-   在持 store 锁期间从 base snapshot 逐块重放，与导入路径 `compute_and_commit`
-   争用同一把锁；开启 archive 且保留数千块时，无认证客户端反复调用可饿死导入。
-   功能 opt-in 且 RPC 通常内网，故未在本次合并中改。建议后续把重建移出锁外，或给
-   archive 端点加节流/admin 门。
-2. **branch store 无修剪**（低-中）：`blocks` HashMap 与 WAL 只增不减，重启校验
-   对每块从 base 重放 = 链长二次方。资格测试无害，长跑需随 finalized 折叠
-   base checkpoint。
+1. ~~**QMDB archive RPC 持锁全谱系重放**~~（**已随第 2 项一并降级**）：
+   `qmdbArchiveState`/`qmdbArchiveProof` 持锁重建，与导入争同一把锁。实测单次调用
+   成本与一次导入同量级（深度 1200 时各约 66ms/68ms），优化后降到 4ms —— 它是
+   放大器而非根因，根因是重建本身太贵（见第 2 项）。仍建议给 archive 端点加节流或
+   admin 门，因为它允许未认证方以极低代价触发服务端重建。
+2. ~~**branch store 无修剪**~~（**已测量并修复，见第九节**）：审计记为"重启校验
+   二次方、资格测试无害"，实测发现**贵的那一半在运行时**——`compute_and_commit`
+   对任何非空块都从 base 重放整条祖先链，每块 O(深度)、整链 O(n²)，约两周撞上
+   8s slot。已加提交后 tip 树缓存，导入降到近常数。WAL/`blocks` 仍只增不减，
+   长跑仍应随 finalized 折叠 base checkpoint（那会同时缩短启动校验，后者是独立
+   实现、未受本次优化影响）。
 3. ~~**每块一次 fsync + 第二次快照写**~~（**已测量，结论：不动**）：
    `advance_execution_validated_head` 无条件写 lineage proof（60 字节 +
    `sync_data()`）并再存一次共识状态，原生模式下基本每块触发；lineage 文件只追加
@@ -231,3 +234,61 @@ devlog-8x 的教训一致：先量，再决定值不值得写。
 
 注：数值是 Windows NTFS 上的；生产 Linux 通常 fsync 更快，所以这是保守上界。若将来
 把共识状态挪到更慢的介质（网络盘）或把 slot 压到亚秒级，重跑这两个基准即可。
+
+## 九、QMDB 重建的二次方开销（关闭第六节第 1、2 项）
+
+### 测量
+
+基准 `qmdb_replay_scaling_by_depth`（`crates/n42-node/src/qmdb_state_root.rs`，
+`#[ignore]`，每块 32 次写）：
+
+```bash
+cargo test -p n42-node --release qmdb_replay_scaling -- --ignored --nocapture
+```
+
+| 链深 | 尖端块导入 | archive `snapshot_for`（持锁） | 建链总耗时 |
+|------|-----------|------------------------------|-----------|
+| 300 | 15 ms | 15 ms | 4.5 s |
+| 600 | 31 ms（2.07×） | 32 ms | 17.7 s |
+| 1200 | 68 ms（2.19×） | 66 ms | 72.4 s |
+
+深度翻倍、耗时翻倍——每块导入是 O(链深)，整链 O(n²)。外推：约 0.057 ms/深度，
+打满 8s slot 需约 14 万块 ≈ **13 天**（按 50% 预算算约 6.5 天）。gov5 互操作正在做
+长跑资格测试，这是会真实撞上的墙，不是理论问题。
+
+根因在 `compute_candidate_locked`：只有**空块**走"直接取父 root"的快捷路径，任何
+带操作的块都落到 `reconstruct_tree_locked`，从 base snapshot 重放全部祖先。
+
+### 修复
+
+`QmdbBranchState` 增加 `cached_tip: Option<CachedTipTree>`，保存最近一次**已提交**
+块的树。顺序导入时回溯在缓存处命中，只重放当前块的操作 + 一次树 clone。
+
+优化后（同一基准）：
+
+| 链深 | 尖端块导入 | archive `snapshot_for` | 建链总耗时 |
+|------|-----------|----------------------|-----------|
+| 300 | **1 ms** | 1 ms | 0.2 s |
+| 600 | **1 ms** | 2 ms | 0.8 s |
+| 1200 | **2 ms** | 4 ms | 2.6 s（**28×**） |
+
+### 正确性约束（三项测试守住）
+
+- **深度上限仍从 base 计算**：缓存缩短的是走链长度，不是深度。若按走链长度判定，
+  `max_replay_depth` 的 fail-closed 会被悄悄绕过。
+  `cached_tip_rejects_at_the_same_depth_as_a_cold_store` 直接跑一个热 store 和一个
+  每轮新建的冷 store，逐块对拍**拒绝边界**——而不是硬编码某个深度数字（第一版测试
+  正是硬编码错了边界才失败，暴露出我对原语义的判断偏差：原代码是"parent 深度 > max"
+  才拒，不是 ≥）。
+- **只缓存可信状态**：root 校验通过、块已入 `blocks`、WAL 追加成功之后才写缓存；
+  试算路径 `compute_candidate` 明确丢弃重建的树，未提交的块不污染缓存。
+- **分支不串味**：另一条分支上的块不在缓存的祖先链上，自然 miss 并全量重建，
+  `cached_tip_does_not_leak_across_branches` 覆盖。
+- **与冷重建逐块等价**：`cached_tip_reproduces_cold_reconstruction` 对 24 个块逐个
+  比对热/冷两条路径的 `snapshot_for` 输出。
+- **启动校验未动**：`validate_persisted_blocks` 是独立实现，不经 `reconstruct_tree_locked`，
+  完整性检查一字未改。
+
+顺带：`QmdbBranchState` 原有的 `#[derive(Debug, Serialize, Deserialize)]` 是历史遗留
+（持久化实际走 `PersistedQmdbBranchState`），已改为手写 `Debug`，顺便保证缓存的树
+内容不会被打进日志。
