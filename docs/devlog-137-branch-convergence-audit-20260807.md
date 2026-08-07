@@ -151,11 +151,12 @@ hickory-proto 0.25.2 经 libp2p 0.56 真实存在，只有升到 0.57 才能消�
 2. **branch store 无修剪**（低-中）：`blocks` HashMap 与 WAL 只增不减，重启校验
    对每块从 base 重放 = 链长二次方。资格测试无害，长跑需随 finalized 折叠
    base checkpoint。
-3. **每块一次 fsync + 第二次快照写**（低-中）：`advance_execution_validated_head`
-   无条件写 lineage proof（60 字节 + `sync_data()`）并再存一次共识状态，原生模式
-   下基本每块触发；lineage 文件只追加无轮转，启动时全量读入（约 0.65 MB/天）。
-   8s slot 下大概率仍在预算内，但属共识循环内联的同步 fsync，建议按"先测量"
-   规矩量一次每块 persist 耗时。
+3. ~~**每块一次 fsync + 第二次快照写**~~（**已测量，结论：不动**）：
+   `advance_execution_validated_head` 无条件写 lineage proof（60 字节 +
+   `sync_data()`）并再存一次共识状态，原生模式下基本每块触发；lineage 文件只追加
+   无轮转，启动时全量读入。两半担忧各量一次（见第八节），都不成立：每块
+   **6.5 ms**（占 8s slot 的 0.081%），一年 226 MiB 的 lineage 文件恢复
+   **340 ms**。按"先测量"的规矩，不写优化。
 4. ~~**eager-import 水位语义放宽**~~（**已由场景 9 验证，见第七节**）：为修 catch-up
    毒化，抑制从"即写即拦"改为"Valid 后才抬水位"，且视图切换时重置为 0。同高度
    不同哈希的两个 eager import 现在可能双双提交给 reth。这是修复必须付的代价，
@@ -193,3 +194,33 @@ CI 不含场景 9，而水位语义放宽最可能出问题的正是"落后节�
 提交窗口——而追平吞吐达正常出块速率（2 块/秒）的 66 倍、状态分毫不差，说明放宽
 既未破坏一致性、也未拖慢同步路径。V2 的出块缺口（6841 vs 7200）等于停机 121 秒的
 产能损失加同步窗口，符合预期。
+
+## 八、持久化开销测量（关闭第六节第 3 项）
+
+审计提出"每块一次内联 fsync 值得按先测量的规矩量一次"。两个 `#[ignore]` 基准写在
+`crates/n42-consensus-service/src/persistence.rs`，随代码走、可重复执行：
+
+```bash
+cargo test -p n42-consensus-service --release persist_cost -- --ignored --nocapture
+cargo test -p n42-consensus-service --release lineage_recovery_cost -- --ignored --nocapture
+```
+
+本机（Windows / NTFS，release）实测：
+
+| 项目 | 实测 | 相对基准 |
+|------|------|----------|
+| lineage 记录 append + `sync_data()` | 2.9 ms/块 | — |
+| 快照 write + `sync_all()` + rename | 3.6 ms/块 | — |
+| **每块合计** | **6.5 ms** | **8s slot 的 0.081%** |
+| 一年 lineage 文件（3,942,000 记录 / 225.6 MiB）全量恢复 | **340 ms** | 一次性，仅启动时 |
+
+两半担忧都不成立：每块开销比 slot 预算小三个数量级；恢复扫描虽是 O(记录数)，但
+226 MiB 只要 340 ms——即便跑十年也不到 4 秒，且只在启动时付一次。恢复基准刻意把
+唯一匹配记录放在文件末尾，测的是无法提前退出的最坏情况。
+
+**结论：不动。** 折叠 base checkpoint、批量 append、去掉第二次快照写这些方案都有
+真实成本（崩溃恢复语义变复杂），而数据显示它们要解决的问题不存在。这与
+devlog-8x 的教训一致：先量，再决定值不值得写。
+
+注：数值是 Windows NTFS 上的；生产 Linux 通常 fsync 更快，所以这是保守上界。若将来
+把共识状态挪到更慢的介质（网络盘）或把 slot 压到亚秒级，重跑这两个基准即可。
