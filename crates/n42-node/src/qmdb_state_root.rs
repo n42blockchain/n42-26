@@ -1139,4 +1139,60 @@ mod tests {
         assert_eq!(reopened.root_for(parent).unwrap(), Some(store.base_root()));
         assert_eq!(std::fs::metadata(wal).unwrap().len(), valid_len);
     }
+
+    /// Measures the lock-holding cost of an archive RPC at realistic depth.
+    ///
+    /// `snapshot_for`/`proof_for` reconstruct the tree by replaying the whole
+    /// lineage from the base snapshot, and they do it while holding the same
+    /// mutex `compute_and_commit` needs on the import path. A cheap request
+    /// that costs the server a deep replay is the shape of a starvation bug —
+    /// but only if the replay is actually slow. Measure it:
+    ///
+    ///   cargo test -p n42-node --release archive_rpc_lock_hold --     ///     --ignored --nocapture
+    ///
+    /// Read the per-call number against the 8s slot: `compute_and_commit` must
+    /// win the lock once per block. If a single archive call approaches that
+    /// budget, the endpoint needs throttling or an out-of-lock rebuild.
+    #[test]
+    #[ignore = "measurement, not a correctness gate"]
+    fn archive_rpc_lock_hold_cost_by_depth() {
+        // Each block writes 32 keys, roughly a small real block's footprint.
+        const OPS_PER_BLOCK: usize = 32;
+        for depth in [100usize, 1_000, 5_000] {
+            let (store, _snapshot) = store();
+            let mut parent = store.base_block_hash();
+            let mut tip = parent;
+            for block in 0..depth {
+                let block_hash = B256::from(blake3::hash(&block.to_le_bytes()).as_bytes());
+                let operations: Vec<_> = (0..OPS_PER_BLOCK)
+                    .map(|k| {
+                        let mut key = [0u8; 32];
+                        key[..8].copy_from_slice(&((block * OPS_PER_BLOCK + k) as u64).to_le_bytes());
+                        QmdbOperation {
+                            key,
+                            value: Some(vec![(block % 251) as u8; 32]),
+                        }
+                    })
+                    .collect();
+                let root = store.compute_candidate(parent, &operations).unwrap();
+                store
+                    .compute_and_commit(parent, block_hash, root, operations)
+                    .unwrap();
+                parent = block_hash;
+                tip = block_hash;
+            }
+
+            let start = std::time::Instant::now();
+            let snapshot = store.snapshot_for(tip).unwrap();
+            let elapsed = start.elapsed();
+            assert!(snapshot.is_some());
+
+            println!(
+                "archive snapshot_for at depth {depth} ({} ops replayed): {}ms lock held                  ({:.2}% of an 8s slot)",
+                depth * OPS_PER_BLOCK,
+                elapsed.as_millis(),
+                elapsed.as_secs_f64() / 8.0 * 100.0,
+            );
+        }
+    }
 }

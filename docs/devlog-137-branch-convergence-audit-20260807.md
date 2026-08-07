@@ -161,8 +161,15 @@ hickory-proto 0.25.2 经 libp2p 0.56 真实存在，只有升到 0.57 才能消�
    毒化，抑制从"即写即拦"改为"Valid 后才抬水位"，且视图切换时重置为 0。同高度
    不同哈希的两个 eager import 现在可能双双提交给 reth。这是修复必须付的代价，
    属原生生产路径的行为放宽——两轮场景 9 均 7/7 通过，未见恢复路径回归。
-5. **ed25519-dalek 双版本共存**：workspace 直接依赖是 2.x（手机侧），libp2p 0.57
-   带入 3.0.0，编译无碍但增大攻击面与体积，值得后续统一。
+5. ~~**ed25519-dalek 双版本共存**~~（**已查清，判断被推翻**）：审计据 workspace 的
+   `ed25519-dalek = "2"` 推断"手机侧用 2.x、值得与 libp2p 0.57 的 3.0.0 统一"。
+   实际**没有任何 crate 依赖它**——`n42-mobile` 早已改走 `n42-primitives` 的 BLS，
+   那行是死声明（CLAUDE.md 的 crate 描述也停在旧状态，一并更正）。图里两个版本
+   分别来自 reth 的 enr/discv5 栈（2.2.0）与 libp2p 0.57（3.0.0），**改我们自己的
+   pin 无法收敛**，只能等上游对齐。死声明已删。
+   顺带清掉一个从未生效的 `[patch.crates-io] ark-relations`：patch 给 0.5.1 而图里
+   解析出 0.6.0，cargo 每次都报 `patch was not used in the crate graph`，它只在
+   lockfile 里留了个 git 源（绕开 crates.io yank、cargo-audit 匹配不可靠）。
 6. **libp2p 0.57 仍是未发布的 git rev**（`6348a0be`），另有 `[patch.crates-io]`
    的 ark-relations git rev。git 源绕开 crates.io 的 yank 机制，cargo-audit 对
    git 依赖的匹配也不可靠。要么等 0.57 正式发版再跟，要么明确记录复核责任与

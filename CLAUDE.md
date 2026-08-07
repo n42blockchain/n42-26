@@ -108,7 +108,7 @@ E2E_SCENARIO_FILTER=5,8,12 target/release/e2e-test --binary target/release/n42-n
 | `n42-chainspec` | 链配置、ValidatorInfo、ConsensusConfig（含 deterministic_key_bytes） |
 | `n42-consensus` | HotStuff-2 状态机、验证者生命周期、reth 适配器 |
 | `n42-execution` | EVM 执行辅助、witness 生成、state diff |
-| `n42-mobile` | 手机协议、数据包、收据、本地验证（零 reth 依赖，仅 alloy + ed25519） |
+| `n42-mobile` | 手机协议、数据包、收据、本地验证（零 reth 依赖，签名走 n42-primitives 的 BLS） |
 | `n42-mobile-ffi` | Android/iOS C/JNI 绑定（staticlib + cdylib） |
 | `n42-network` | libp2p 服务、QUIC StarHub、共识/区块直连通道 |
 | `n42-node` | 编排器（ConsensusOrchestrator 3-way select! loop）、RPC、持久化、手机桥接、奖励分发 |
@@ -119,7 +119,11 @@ E2E_SCENARIO_FILTER=5,8,12 target/release/e2e-test --binary target/release/n42-n
 ### 依赖关系要点
 
 - `n42-primitives` 是最底层 crate，被几乎所有 crate 依赖
-- `n42-mobile` 零 reth 依赖 — 只依赖 `alloy-primitives`、`ed25519-dalek`、`lru`、`serde`
+- `n42-mobile` 零 reth 依赖 — 只依赖 `alloy-primitives`、`n42-primitives`(BLS)、
+  `n42-bmt-core`、`n42-twig-core`、`lru`、`serde`、`bincode`、`thiserror`。
+  （**已不用 ed25519-dalek**；workspace 里那条死声明已删。图里的
+  ed25519-dalek 2.2.0/3.0.0 分别来自 reth 的 enr/discv5 栈与 libp2p 0.57，
+  非 n42 直接依赖。）
 - `n42-zkproof-guest` 用 SP1 RISC-V 工具链构建，已从 workspace 排除
 - 所有 reth 依赖通过 `../reth` 本地 path 引入
 
