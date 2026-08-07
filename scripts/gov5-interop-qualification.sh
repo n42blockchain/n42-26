@@ -183,7 +183,11 @@ start_rust_validator() {
     "N42_INTEROP_GENESIS_HASH=$genesis_hash"
     "N42_GOV5_BOOTSTRAP_BUNDLE=$runtime/artifacts/bootstrap-bundle.json"
     "N42_QMDB_REPLAY_DEPTH=${N42_QMDB_REPLAY_DEPTH:-1048576}"
-    "N42_GOV5_CATCHUP_BUFFER_BLOCKS=${N42_GOV5_CATCHUP_BUFFER_BLOCKS:-2048}"
+    # A validator restored from the pinned 905 genesis can be ~100k blocks
+    # behind the preserved Gov5 data. Keep enough authenticated ancestry to
+    # complete that first catch-up rather than falling back to state-sync,
+    # which Gov5 peers do not advertise.
+    "N42_GOV5_CATCHUP_BUFFER_BLOCKS=${N42_GOV5_CATCHUP_BUFFER_BLOCKS:-131072}"
     "N42_CONSENSUS_PORT=$consensus_port"
     "N42_STARHUB_PORT=$starhub_port"
     "N42_NO_AUTO_CONNECT=1"
@@ -217,6 +221,8 @@ start_rust_validator() {
 }
 
 start_rust() {
+  # The primary Rust validator is slot 0.  A full seven-validator mixed run
+  # also starts `rust2`, which replaces Gov5 slot 6 with its exact identity.
   start_rust_validator rust 0 19780 31303 29545 29551 9443
 }
 
