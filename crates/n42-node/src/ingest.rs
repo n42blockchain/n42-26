@@ -48,6 +48,16 @@ const CREDIT_WAIT_SENTINEL: u32 = u32::MAX;
 /// time, so this ceiling is far above any legitimate sender and only exists to
 /// keep a malformed or hostile header from turning into an allocation.
 const MAX_INGEST_BATCH_TXS: usize = 65_536;
+/// Upper bound on the bytes one batch may buffer before pool admission.
+///
+/// The count ceiling alone still admits 65,536 transactions of the u16-length
+/// maximum (~64 KiB each), letting one connection buffer ~4 GiB into `raw_txs`
+/// before the pool sees any of it. The real client's 500-tx batches of typical
+/// transfers are well under a megabyte, so 64 MiB is far above any legitimate
+/// batch while keeping a hostile stream from becoming a memory bomb.
+const MAX_INGEST_BATCH_BYTES: usize = 64 * 1024 * 1024;
+/// Framing bytes accompanying each transaction: u16 length + 20-byte sender.
+const INGEST_TX_FRAME_OVERHEAD: usize = 22;
 const DEFAULT_INGEST_HIGH_WATER: usize = 90_000;
 const DEFAULT_INGEST_TARGET_PENDING: usize = 82_000;
 const DEFAULT_INGEST_VIRTUAL_BLOCK_CREDIT_MS: u64 = 0;
@@ -664,12 +674,27 @@ where
         // Read the batch into memory first. This lets the sender use credit probes
         // without requiring a second decode pass when only a prefix is admissible.
         let mut raw_txs = Vec::with_capacity(num_txs);
+        let mut batch_bytes = 0usize;
 
         for _ in 0..num_txs {
             // Read tx length: u16 LE
             let mut len_buf = [0u8; 2];
             stream.read_exact(&mut len_buf).await?;
             let tx_len = u16::from_le_bytes(len_buf) as usize;
+
+            // Byte ceiling, checked before this transaction is buffered: the
+            // count ceiling above cannot stop 65k × 64 KiB of real bytes.
+            batch_bytes += tx_len + INGEST_TX_FRAME_OVERHEAD;
+            if batch_bytes > MAX_INGEST_BATCH_BYTES {
+                warn!(
+                    target: "n42::ingest",
+                    batch_bytes,
+                    max = MAX_INGEST_BATCH_BYTES,
+                    buffered_txs = raw_txs.len(),
+                    "batch exceeds byte ceiling; dropping connection"
+                );
+                return Ok(());
+            }
 
             // Read tx data
             if tx_len > tx_buf.len() {
@@ -876,5 +901,43 @@ mod tests {
 
         // Rejected before the counter is bumped, so nothing was accounted as received.
         assert_eq!(stats.received.load(Ordering::Relaxed), 0);
+    }
+
+    /// The count ceiling alone cannot stop a batch of maximum-length
+    /// transactions from buffering gigabytes into `raw_txs`. Once cumulative
+    /// frame bytes cross the byte ceiling the connection must be dropped.
+    #[tokio::test]
+    async fn batch_over_byte_ceiling_drops_the_connection() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stats = Arc::new(IngestStats::new());
+        let server_stats = stats.clone();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            handle_client(stream, NoopPool, &server_stats).await
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let frame_bytes = u16::MAX as usize + INGEST_TX_FRAME_OVERHEAD;
+        let num_txs = (MAX_INGEST_BATCH_BYTES / frame_bytes + 1) as u32;
+        client.write_all(&num_txs.to_le_bytes()).await.unwrap();
+
+        let mut frame = vec![0u8; 2 + u16::MAX as usize + 20];
+        frame[..2].copy_from_slice(&u16::MAX.to_le_bytes());
+        for _ in 0..num_txs {
+            // The server closes mid-batch once the ceiling trips, so a write
+            // error here is the expected outcome, not a test failure.
+            if client.write_all(&frame).await.is_err() {
+                break;
+            }
+        }
+        let _ = client.flush().await;
+
+        let result = tokio::time::timeout(Duration::from_secs(10), server)
+            .await
+            .expect("handler hung on an over-ceiling batch")
+            .expect("handler task panicked");
+        assert!(result.is_ok(), "handler should close cleanly: {result:?}");
     }
 }

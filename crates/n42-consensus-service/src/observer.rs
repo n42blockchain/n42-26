@@ -513,8 +513,14 @@ impl ObserverOrchestrator {
                     if compact_injected && let Some(ref cache) = self.exec_output_cache {
                         cache.evict(hash);
                     }
-                    self.bad_blocks
-                        .insert_if_invalid(hash, &status.status, "observer_import");
+                    // The compact output came from an unauthenticated gossip peer.
+                    // A rejection after injection describes those bytes, not the
+                    // declared block hash, so evict above and keep the hash
+                    // retryable (HIGH-1, same rule as the orchestrator paths).
+                    if !compact_injected {
+                        self.bad_blocks
+                            .insert_if_invalid(hash, &status.status, "observer_import");
+                    }
                     warn!(target: "n42::observer", %hash, view, status = ?status.status, "new_payload rejected block");
                     false
                 }

@@ -90,7 +90,11 @@ pub fn validate_message(
         // refuses — no quorum, and only a warning to show for it.
         crate::transport::MAX_GOSSIP_MESSAGE_SIZE
     } else if topic == blob_sidecar_topic_hash {
-        1024 * 1024 // 1MB for blob sidecars
+        // Shared with the publisher, which packs sidecars into frames of at
+        // most this size (`broadcast_blob_sidecars`). A hardcoded copy here
+        // once sat below what the publisher could emit: a block with more than
+        // ~7 sidecars went out as a single frame every receiver then rejected.
+        crate::transport::MAX_BLOB_GOSSIP_MESSAGE_SIZE
     } else if topic == mempool_topic_hash {
         128 * 1024 // 128KB for individual transactions
     } else {
@@ -205,6 +209,40 @@ mod tests {
             &topic_hash,
             &oversized,
             &topic_hash,
+            &block_hash,
+            &mem_hash(),
+            &blob_hash(),
+        );
+        assert!(matches!(result, gossipsub::MessageAcceptance::Reject));
+    }
+
+    #[test]
+    fn test_validate_message_blob_topic_at_ceiling_accepted() {
+        let consensus_hash = consensus_topic().hash();
+        let block_hash = block_announce_topic().hash();
+        let at_limit = vec![0u8; crate::transport::MAX_BLOB_GOSSIP_MESSAGE_SIZE];
+
+        let result = validate_message(
+            &blob_hash(),
+            &at_limit,
+            &consensus_hash,
+            &block_hash,
+            &mem_hash(),
+            &blob_hash(),
+        );
+        assert!(matches!(result, gossipsub::MessageAcceptance::Accept));
+    }
+
+    #[test]
+    fn test_validate_message_blob_topic_over_ceiling_rejected() {
+        let consensus_hash = consensus_topic().hash();
+        let block_hash = block_announce_topic().hash();
+        let oversized = vec![0u8; crate::transport::MAX_BLOB_GOSSIP_MESSAGE_SIZE + 1];
+
+        let result = validate_message(
+            &blob_hash(),
+            &oversized,
+            &consensus_hash,
             &block_hash,
             &mem_hash(),
             &blob_hash(),
