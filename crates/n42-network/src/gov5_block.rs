@@ -28,6 +28,31 @@ pub enum Gov5BlockError {
     PayloadHashMismatch,
 }
 
+impl Gov5BlockError {
+    /// Whether re-fetching the same hash could ever produce a different
+    /// outcome.
+    ///
+    /// Every variant here is a verdict about content that the requested hash
+    /// commits to, so it cannot: a peer serving that hash must serve those
+    /// same bytes, and any peer serving different bytes fails the hash check
+    /// instead of reaching this error. Retrying a rejected hash against the
+    /// rest of the fan-out therefore re-derives the same rejection as fast as
+    /// the network allows — measured at ~1,465 identical failures per second
+    /// against a four-node chain, which is a log flood rather than progress.
+    ///
+    /// Kept as a method on the error rather than a check at the call site so
+    /// that a future variant has to state which kind it is.
+    pub const fn is_permanent(&self) -> bool {
+        match self {
+            Self::InvalidRlp
+            | Self::HeaderProfile(_)
+            | Self::TransactionRootMismatch
+            | Self::PayloadReconstruction(_)
+            | Self::PayloadHashMismatch => true,
+        }
+    }
+}
+
 const GOV5_H2_SEAL_BYTES: usize = 96;
 
 /// Returns the consensus view committed into a validated Gov5 H2 header.
@@ -500,5 +525,25 @@ mod tests {
             gov5_header_view(&header),
             Err(Gov5BlockError::HeaderProfile(_))
         ));
+    }
+
+    /// The retry loop keys off this classification, so a new variant defaulting
+    /// to the wrong side is the difference between giving up on a bad block and
+    /// re-requesting it from every peer forever. Enumerated explicitly rather
+    /// than spot-checked so adding a variant forces a decision here.
+    #[test]
+    fn every_content_verdict_is_permanent() {
+        for error in [
+            Gov5BlockError::InvalidRlp,
+            Gov5BlockError::HeaderProfile("difficulty is not zero".to_owned()),
+            Gov5BlockError::TransactionRootMismatch,
+            Gov5BlockError::PayloadReconstruction("bad payload".to_owned()),
+            Gov5BlockError::PayloadHashMismatch,
+        ] {
+            assert!(
+                error.is_permanent(),
+                "{error} is a verdict about content the hash commits to, so refetching cannot change it"
+            );
+        }
     }
 }

@@ -40,6 +40,10 @@ const MAX_SYNC_BATCH: u64 = 128;
 /// Bounds unauthenticated live block bodies and authenticated Decide records
 /// retained while their counterpart is in flight.
 const MAX_GOV5_LIVE_PENDING: usize = 512;
+/// Bound on remembered content-level rejections. Each entry is one hash the
+/// chain can never legitimately contain, so the set stays small in practice;
+/// the cap only stops an adversary from growing it without limit.
+const MAX_GOV5_REJECTED: usize = 4096;
 
 /// Maximum authenticated parent links retained while walking backwards from a
 /// verified Gov5 Decide. Unlike [`MAX_GOV5_LIVE_PENDING`], these entries contain
@@ -306,6 +310,12 @@ pub struct ObserverOrchestrator {
     gov5_finality: HashMap<B256, Gov5FinalityRecord>,
     gov5_finality_order: VecDeque<B256>,
     gov5_fetch_requested_at: HashMap<B256, Instant>,
+    /// Hashes whose content was rejected on its merits, so no peer can serve a
+    /// version that decodes differently. Without this the fan-out retries a
+    /// verdict it already has: a joint testnet produced ~1,465 identical
+    /// rejections per second and 66 MB of log in two minutes, all for one hash.
+    gov5_rejected: HashSet<B256>,
+    gov5_rejected_order: VecDeque<B256>,
     gov5_finalized_catchup: Option<Gov5FinalizedCatchup>,
     h2_v4_shadow_verified: [u64; H2_V4_SHADOW_KINDS],
     h2_v4_shadow_rejected: [u64; H2_V4_SHADOW_KINDS],
@@ -349,6 +359,8 @@ impl ObserverOrchestrator {
             gov5_finality: HashMap::new(),
             gov5_finality_order: VecDeque::new(),
             gov5_fetch_requested_at: HashMap::new(),
+            gov5_rejected: HashSet::new(),
+            gov5_rejected_order: VecDeque::new(),
             gov5_finalized_catchup: None,
             h2_v4_shadow_verified: [0; H2_V4_SHADOW_KINDS],
             h2_v4_shadow_rejected: [0; H2_V4_SHADOW_KINDS],
@@ -454,7 +466,24 @@ impl ObserverOrchestrator {
                 source,
                 block_hash,
                 error,
+                permanent,
             } => {
+                if permanent {
+                    // Log once per hash. The retry loop used to re-derive this
+                    // same verdict from every other peer, forever.
+                    if self.remember_gov5_rejection(block_hash) {
+                        warn!(
+                            target: "n42::observer",
+                            %source,
+                            %block_hash,
+                            %error,
+                            "gov5 block rejected on content; will not re-request this hash"
+                        );
+                        counter!("n42_gov5_block_rejected_permanent_total").increment(1);
+                    }
+                    self.gov5_fetch_requested_at.remove(&block_hash);
+                    return;
+                }
                 warn!(target: "n42::observer", %source, %block_hash, %error, "gov5 block fetch failed");
                 self.retry_gov5_block_fetch(source, block_hash);
             }
@@ -654,6 +683,12 @@ impl ObserverOrchestrator {
         if block_hash == self.head_block_hash || self.gov5_live_blocks.contains_key(&block_hash) {
             return;
         }
+        // Guard the entry point, not just the retry path: ancestry walks and
+        // finality catch-up both start fetches, and any of them re-requesting
+        // a hash we already rejected on its merits restarts the same loop.
+        if self.gov5_rejected.contains(&block_hash) {
+            return;
+        }
         if self.gov5_fetch_requested_at.len() >= MAX_GOV5_LIVE_PENDING
             && !self.gov5_fetch_requested_at.contains_key(&block_hash)
         {
@@ -679,8 +714,26 @@ impl ObserverOrchestrator {
         }
     }
 
+    /// Records a content-level rejection. Returns whether it was new, so the
+    /// caller logs the verdict once instead of once per fan-out attempt.
+    fn remember_gov5_rejection(&mut self, block_hash: B256) -> bool {
+        if !self.gov5_rejected.insert(block_hash) {
+            return false;
+        }
+        self.gov5_rejected_order.push_back(block_hash);
+        while self.gov5_rejected_order.len() > MAX_GOV5_REJECTED {
+            if let Some(evicted) = self.gov5_rejected_order.pop_front() {
+                self.gov5_rejected.remove(&evicted);
+            }
+        }
+        true
+    }
+
     fn retry_gov5_block_fetch(&mut self, failed_peer: PeerId, block_hash: B256) {
         self.gov5_fetch_requested_at.remove(&block_hash);
+        if self.gov5_rejected.contains(&block_hash) {
+            return;
+        }
         if let Some(peer) = self
             .connected_peers
             .iter()
@@ -1971,5 +2024,75 @@ mod tests {
 
         let third = select_sync_target(30, 30, 200, 138).unwrap();
         assert_eq!(third, (200, SyncTargetSource::GossipHint));
+    }
+
+    /// Minimal observer for state-machine tests that never touch the execution
+    /// layer. The receivers come back with it: dropping them closes the command
+    /// channels, and every send the observer makes would fail silently.
+    fn test_observer() -> (
+        ObserverOrchestrator,
+        mpsc::Receiver<NetworkCommand>,
+        mpsc::Receiver<NetworkCommand>,
+    ) {
+        let (command_tx, command_rx) = mpsc::channel(1024);
+        let (priority_tx, priority_rx) = mpsc::channel(16);
+        let network = NetworkHandle::new(command_tx, priority_tx);
+        let (_event_tx, event_rx) = mpsc::channel(16);
+        let execution = Arc::new(CatchupExecutionLayer::default());
+        (
+            ObserverOrchestrator::new(network, event_rx, execution, B256::ZERO),
+            command_rx,
+            priority_rx,
+        )
+    }
+
+    /// A content-level rejection must retire the hash rather than rotate the
+    /// fan-out. Against a live four-node gov5 chain the old behaviour re-derived
+    /// the same verdict ~1,465 times per second and wrote 66 MB of identical
+    /// log lines in two minutes, because every peer necessarily serves bytes
+    /// that decode the same way for a given hash.
+    #[test]
+    fn permanent_rejection_is_remembered_and_stops_refetching() {
+        let hash = B256::repeat_byte(0xC1);
+        let (mut orch, _command_rx, _priority_rx) = test_observer();
+
+        assert!(
+            orch.remember_gov5_rejection(hash),
+            "first rejection is new, so it is worth logging"
+        );
+        assert!(
+            !orch.remember_gov5_rejection(hash),
+            "a repeat must not log again"
+        );
+
+        // Both the retry path and the entry point have to honour it: ancestry
+        // walks and finality catch-up start fetches independently.
+        let peer = libp2p::PeerId::random();
+        orch.connected_peers.insert(peer);
+        orch.retry_gov5_block_fetch(libp2p::PeerId::random(), hash);
+        assert!(!orch.gov5_fetch_requested_at.contains_key(&hash));
+        orch.request_gov5_block(peer, hash);
+        assert!(
+            !orch.gov5_fetch_requested_at.contains_key(&hash),
+            "a rejected hash must not be re-requested through any path"
+        );
+
+        // An unrelated hash is unaffected.
+        let other = B256::repeat_byte(0xC2);
+        orch.request_gov5_block(peer, other);
+        assert!(orch.gov5_fetch_requested_at.contains_key(&other));
+    }
+
+    /// The rejection set is fed by peer-supplied hashes, so it needs a bound.
+    #[test]
+    fn rejection_set_is_bounded() {
+        let (mut orch, _command_rx, _priority_rx) = test_observer();
+        for i in 0..(MAX_GOV5_REJECTED + 64) {
+            let mut bytes = [0u8; 32];
+            bytes[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            orch.remember_gov5_rejection(B256::from(bytes));
+        }
+        assert_eq!(orch.gov5_rejected.len(), MAX_GOV5_REJECTED);
+        assert_eq!(orch.gov5_rejected_order.len(), MAX_GOV5_REJECTED);
     }
 }

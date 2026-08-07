@@ -20,7 +20,7 @@ use crate::gossipsub::topics::{
     blob_sidecar_topic, block_announce_topic, consensus_topic, gov5_block_topic, gov5_h2_topic,
     h2_v4_topic, mempool_topic, verification_receipts_topic,
 };
-use crate::gov5_block::decode_gov5_block_rlp;
+use crate::gov5_block::{Gov5BlockError, decode_gov5_block_rlp};
 use crate::gov5_rpc::{
     GOV5_BLOCK_BY_HASH_PROTOCOL, Gov5BlockByHashRequest, Gov5BlockByHashResponse,
     Gov5BlockPushRequest, Gov5BlockPushResponse, Gov5HotstuffDirectRequest,
@@ -303,6 +303,11 @@ pub enum NetworkEvent {
         source: PeerId,
         block_hash: B256,
         error: String,
+        /// True when the failure is a verdict about content the requested hash
+        /// commits to, so no peer can serve anything that decodes differently.
+        /// Consumers must stop re-requesting the hash; see
+        /// [`Gov5BlockError::is_permanent`].
+        permanent: bool,
     },
     H2V4Message {
         source: PeerId,
@@ -1577,8 +1582,8 @@ impl NetworkService {
         }
     }
 
-    fn retain_gov5_served_block(&mut self, rlp: &[u8]) -> Result<B256, String> {
-        let block = decode_gov5_block_rlp(rlp).map_err(|error| error.to_string())?;
+    fn retain_gov5_served_block(&mut self, rlp: &[u8]) -> Result<B256, Gov5BlockError> {
+        let block = decode_gov5_block_rlp(rlp)?;
         if self.gov5_served_blocks.len() >= MAX_SERVED_GOV5_BLOCKS
             && !self.gov5_served_blocks.contains_key(&block.block_hash)
         {
@@ -2267,11 +2272,15 @@ impl NetworkService {
                                 source: peer,
                                 block_hash: requested_hash,
                                 error,
+                                // This peer served a different block; another
+                                // may still hold the requested one.
+                                permanent: false,
                             });
                         }
                         return;
                     }
                     Err(error) => {
+                        let permanent = error.is_permanent();
                         metrics::counter!("n42_gov5_block_fetch_failed_total").increment(1);
                         if !self
                             .pending_gov5_block_requests
@@ -2284,6 +2293,7 @@ impl NetworkService {
                                 source: peer,
                                 block_hash: requested_hash,
                                 error: format!("all fan-out peers failed; final response: {error}"),
+                                permanent,
                             });
                         }
                         return;
@@ -2334,6 +2344,8 @@ impl NetworkService {
                             source: peer,
                             block_hash,
                             error: format!("all fan-out peers failed; final failure: {error_text}"),
+                            // Transport-level: the content was never seen.
+                            permanent: false,
                         });
                     }
                 }
@@ -3406,6 +3418,7 @@ mod tests {
                 source,
                 block_hash,
                 error: "deadline".to_owned(),
+                permanent: false,
             },
         ];
 

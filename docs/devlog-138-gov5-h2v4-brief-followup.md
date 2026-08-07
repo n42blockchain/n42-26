@@ -12,7 +12,7 @@ H2-v4 profile 合并提交 `c387d6c6`）
 | 2 | 实现/复核 v4 八个签名域 | ✅ 已有（`h2_v4.rs` 对齐 `h2_v4_domains_v1.json`） |
 | 3 | 信封编解码 + **五条拒绝路径** | ⚠️ 缺 canonical 检查，已补（见三） |
 | 4 | 消费 finality proof（订阅 + 验证） | ✅ 已有（`verify_h2_v4_decide` + `/n42/h2/4/ssz_snappy`） |
-| 5 | 联合测试网（gov5 `interopV4:true` + n42 observer） | ⏳ 需真机 gov5 环境 |
+| 5 | 联合测试网（gov5 `interopV4:true` + n42 observer） | ✅ **已跑通**（见七） |
 | 6 | v4 链上**不要**配 epoch 验证者变更 | ⚠️ 原为纯运维约定，已变成代码保证（见四） |
 
 ## 二、fixture 完整性：git 内容正确，工作区被 CRLF 改写
@@ -110,3 +110,100 @@ Native 路径不变，仍绑定真实 changes hash。测试
 3. 本次未改 `verify_h2_v4_decide` 对 `changes_hash` 的处理：它把信封里的值绑进
    验签消息，篡改会导致验签失败，因此非零值不构成安全问题；等动态变更规范落地后
    再决定是否显式拒绝非零。
+
+## 七、联合测试网：observer 仅凭 envelope 跟随 gov5 finality
+
+### 拓扑（与在跑的 7 节点性能舰队完全隔离）
+
+舰队正跑在 `mainnet_qmdb_staggered`（chainId 94，`interopV4` **ABSENT** —— 与 brief
+一致：flag 缺失时 legacy wire 字节不变，性能网不受影响），当天刚滚动升级到 v5.7.947。
+brief 要求 v4 只能用于**新链**（它改变签名字节），故另建：
+
+| 项 | 舰队（勿动） | v4 联合测试网 |
+|----|-------------|--------------|
+| chainId | 94 | **941** |
+| interopV4 | absent | **true** |
+| epochLength | 200 | **0**（遵守 brief 第 6 条） |
+| p2p / http | 32000-32006 / 20012-20018 | 32100-32103 / 20112-20115 |
+| 数据 | `E:/qs-node*` | `C:/n42/v4-interop-testnet` |
+
+4 节点（f=1、quorum=3），genesis `0x09c4f0bc…dc2ee1`。
+
+### 验收结果
+
+| 指标 | 结果 |
+|------|------|
+| 验证通过的 H2-v4 finality proof | **50 个**，view 连续至 56 |
+| 提供证明的 gov5 源 | **4 个节点全覆盖** |
+| H2 影子验签 | `h2_shadow_verified=[…,48]`，**`h2_shadow_rejected` 全零** |
+| observer 跟随 | `highest_seen=54`，gov5 实际 55 |
+| gov5 四节点高度 | 一致 |
+
+日志证据保留在 `C:/n42/v4-interop-testnet/observer-evidence.log`。这满足 brief
+的验收定义："success = the observer follows finality from envelopes alone"。
+
+### 途中撞到的三件事
+
+**1. interop profile 对 genesis 有硬性形状要求（非缺陷，是配置约束）。**
+observer 起初拒绝整条链：先 `difficulty is not zero`（gov5 对未指定的 genesis
+difficulty 默认 `0x20000`），改零后又 `extra data is not exactly 32 zero bytes`。
+根因是 `validate_gov5_interop_header` 按 extra_data 是否带 gov5 magic 分流——gov5
+H2 引擎产的块带 magic 走宽松检查，而**手写的 genesis 不带**，落进严格的 replay-v2
+历史形状（8 条约束，见 `adapter.rs:82`）。finality following 不受影响；要让
+observer 也导入区块体（当前 `imported=0`），genesis 需满足其中一种形状，或按 brief
+用 `n42-qmdb-export` 快照引导。**新建 v4 链时须知。**
+
+顺带记录 gov5 的一个好设计：datadir 有 network binding（`network.json` 记着 genesis
+hash），换链重 init 会 fail-closed 拒绝，防止数据目录被误用于另一条链。
+
+**2. 一个真实的重试缺陷（已修，见八）。**
+
+**3. Git Bash 会静默破坏 multiaddr。** MSYS 路径转换把 `/ip4/127.0.0.1/tcp/...`
+当 Unix 路径改写成 `C:/Program Files/...`，节点全 0 peers，日志只说"连接被拒绝"，
+看不出参数已被篡改。**在 Windows 上启动带 multiaddr 的进程一律用 PowerShell**
+（或设 `MSYS_NO_PATHCONV=1`）。
+
+## 八、修复：确定性拒绝不再无限重试
+
+### 现象
+
+联合测试网上，observer 对 genesis 的 fetch 失败进入紧循环：
+
+- **174,943 条**相同错误，**119 秒**，即 **~1,465 行/秒**
+- **66 MB** 日志（约 2 GB/小时，会填满磁盘）
+- 全部指向**同一个** block hash
+
+### 根因
+
+`retry_gov5_block_fetch` 无条件换一个 peer **立即**重试，既不区分错误类型、也无
+退避与次数上限：peer A 失败 → 立刻问 peer B → 失败 → 又回到 A。
+
+而 header 形状违规是**确定性**的：block_hash 承诺了 header 内容，任何 peer 若给出
+不同字节会先在哈希校验处失败，根本到不了这个错误。所以换 peer 只是以网络速度
+重新推导同一个结论。
+
+这与本轮早先修的 HIGH-1 恰好互为镜像：那里是"不该拉黑的拉黑了"，这里是"该记住的
+没记住"。
+
+### 修法
+
+1. `Gov5BlockError::is_permanent()`——用穷举 match 而非 `_` 通配，**新增变体必须
+   显式表态**属于哪一类；
+2. `NetworkEvent::Gov5BlockFetchFailed` 增 `permanent: bool`。三个发射点按语义分类：
+   内容裁决 → 永久；**hash 不匹配 → 非永久**（该 peer 给错了块，别的 peer 可能有对的）；
+   **传输失败 → 非永久**（根本没看到内容）；
+3. observer 记住被裁定的哈希（`gov5_rejected`，上限 4096 条、FIFO），**每个哈希只
+   告警一次**；orchestrator 侧同样退休该 fetch；
+4. 关键：守卫加在 **`request_gov5_block` 入口**而不只是重试路径——祖先回溯与
+   finality catch-up 都会独立发起 fetch，任一条重新请求已裁定的哈希就会重启循环。
+
+### 测试
+
+- `every_content_verdict_is_permanent`：逐个列出全部变体，防止新变体默认站错边；
+- `permanent_rejection_is_remembered_and_stops_refetching`：重试路径与入口双双拦截，
+  且不误伤无关哈希；
+- `rejection_set_is_bounded`：该集合由 peer 提供的哈希喂养，必须有界。
+
+写测试时踩到一个坑值得记：辅助函数里创建的 channel receiver 若不返回，函数一返回就
+被 drop，channel 关闭，observer 的所有发送静默失败——测试会以看似无关的断言失败。
+现在辅助函数把 receiver 一并交出。

@@ -3540,8 +3540,25 @@ impl ConsensusService {
                 source,
                 block_hash,
                 error,
+                permanent,
             } if self.h2_v4_identity.is_some() => {
                 self.h2_v4_fetch_requested_at.remove(&block_hash);
+                if permanent {
+                    // A verdict about content the hash commits to: every peer
+                    // would serve bytes that decode the same way, so rotating
+                    // the fan-out only repeats it.
+                    warn!(
+                        target: "n42::interop::h2v4",
+                        %source,
+                        %block_hash,
+                        %error,
+                        "gov5 block rejected on content; retiring the fetch"
+                    );
+                    counter!("n42_gov5_block_rejected_permanent_total").increment(1);
+                    self.h2_v4_fetch_failed_peers.remove(&block_hash);
+                    self.remember_h2_v4_fetch_fulfilled(block_hash, Instant::now());
+                    return;
+                }
                 warn!(target: "n42::interop::h2v4", %source, %block_hash, %error, "H2-authenticated gov5 block fetch failed");
                 let now = Instant::now();
                 let attempted = {
