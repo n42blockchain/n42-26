@@ -3632,8 +3632,16 @@ impl ConsensusService {
             NetworkEvent::SyncResponse { peer, response } => {
                 self.handle_sync_response(peer, response).await;
             }
-            NetworkEvent::SyncRequestFailed { peer, error } => {
-                warn!(target: "n42::cl::orchestrator", %peer, %error, "sync request failed");
+            NetworkEvent::SyncRequestFailed {
+                peer,
+                error,
+                unsupported_protocol,
+            } => {
+                if unsupported_protocol {
+                    warn!(target: "n42::cl::orchestrator", %peer, %error, "peer does not speak N42 state-sync");
+                } else {
+                    warn!(target: "n42::cl::orchestrator", %peer, %error, "sync request failed");
+                }
                 if self.sync_requested_peers.remove(&peer) && self.sync_requested_peers.is_empty() {
                     self.sync_in_flight = false;
                     self.sync_started_at = None;

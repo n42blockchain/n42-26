@@ -352,6 +352,10 @@ pub enum NetworkEvent {
     SyncRequestFailed {
         peer: PeerId,
         error: String,
+        /// True when the peer never advertised the N42 state-sync protocol, so
+        /// no retry against it can succeed. Consumers should drop it from the
+        /// sync rotation rather than come back every interval.
+        unsupported_protocol: bool,
     },
 }
 
@@ -1835,6 +1839,9 @@ impl NetworkService {
                 self.emit_event(NetworkEvent::SyncRequestFailed {
                     peer,
                     error: error.to_string(),
+                    // A transport failure says nothing about the peer's
+                    // protocol set.
+                    unsupported_protocol: false,
                 });
             }
             libp2p::request_response::Event::InboundFailure { peer, error, .. } => {
@@ -2984,6 +2991,7 @@ impl NetworkService {
                     self.emit_event(NetworkEvent::SyncRequestFailed {
                         peer,
                         error: "peer does not advertise N42 state-sync".to_string(),
+                        unsupported_protocol: true,
                     });
                     return;
                 }

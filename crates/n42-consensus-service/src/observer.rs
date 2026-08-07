@@ -290,6 +290,13 @@ pub struct ObserverOrchestrator {
 
     // Sync
     sync_in_flight: bool,
+    /// Peers that answered a sync request by saying they do not speak N42
+    /// state-sync at all. That is a fact about the peer's protocol set, not a
+    /// transient failure, so rotating to it again just re-asks a settled
+    /// question — against an all-gov5 peer set the rotation re-asked every
+    /// peer every 5s indefinitely. Cleared on disconnect, since a reconnecting
+    /// peer may be a different build.
+    sync_unsupported_peers: HashSet<PeerId>,
     sync_started_at: Option<Instant>,
     sync_attempt_counter: u64,
     committed_blocks: VecDeque<CommittedBlock>,
@@ -348,6 +355,7 @@ impl ObserverOrchestrator {
             epoch_length: 0,
             epoch_schedule: None,
             sync_in_flight: false,
+            sync_unsupported_peers: HashSet::new(),
             sync_started_at: None,
             sync_attempt_counter: 0,
             committed_blocks: VecDeque::new(),
@@ -441,6 +449,8 @@ impl ObserverOrchestrator {
             NetworkEvent::PeerDisconnected(peer_id) => {
                 warn!(target: "n42::observer", %peer_id, "peer disconnected");
                 self.connected_peers.remove(&peer_id);
+                // A reconnecting peer may be a newer build that does support it.
+                self.sync_unsupported_peers.remove(&peer_id);
                 gauge!("n42_observer_connected_peers").set(self.connected_peers.len() as f64);
             }
             NetworkEvent::BlockAnnouncement { source, data } => {
@@ -589,8 +599,26 @@ impl ObserverOrchestrator {
             NetworkEvent::SyncResponse { peer, response } => {
                 self.handle_sync_response(peer, response).await;
             }
-            NetworkEvent::SyncRequestFailed { peer, error } => {
-                warn!(target: "n42::observer", %peer, %error, "sync request failed");
+            NetworkEvent::SyncRequestFailed {
+                peer,
+                error,
+                unsupported_protocol,
+            } => {
+                // Distinguish "this peer cannot ever serve this" from "this
+                // attempt failed". Only the former is worth remembering.
+                if unsupported_protocol {
+                    if self.sync_unsupported_peers.insert(peer) {
+                        warn!(
+                            target: "n42::observer",
+                            %peer,
+                            %error,
+                            "peer does not speak N42 state-sync; excluding it from sync rotation"
+                        );
+                        counter!("n42_sync_peer_unsupported_total").increment(1);
+                    }
+                } else {
+                    warn!(target: "n42::observer", %peer, %error, "sync request failed");
+                }
                 self.sync_in_flight = false;
                 self.sync_started_at = None;
             }
@@ -1507,8 +1535,16 @@ impl ObserverOrchestrator {
             }
         }
 
-        let peers: Vec<_> = self.connected_peers.iter().copied().collect();
+        let peers: Vec<_> = self
+            .connected_peers
+            .iter()
+            .copied()
+            .filter(|peer| !self.sync_unsupported_peers.contains(peer))
+            .collect();
         if peers.is_empty() {
+            // Either nobody is connected, or every connected peer has told us
+            // it does not speak this protocol. Both mean there is no sync to
+            // start; the caller retries when the peer set changes.
             return None;
         }
 
@@ -2094,5 +2130,45 @@ mod tests {
         }
         assert_eq!(orch.gov5_rejected.len(), MAX_GOV5_REJECTED);
         assert_eq!(orch.gov5_rejected_order.len(), MAX_GOV5_REJECTED);
+    }
+
+    /// A peer that does not speak N42 state-sync will never speak it on this
+    /// connection, so the rotation must drop it instead of coming back every
+    /// interval. Against an all-gov5 peer set (Go nodes, which have no reason
+    /// to implement this protocol) the old rotation logged a failure every 5
+    /// seconds forever.
+    #[test]
+    fn peers_without_state_sync_leave_the_rotation() {
+        let (mut orch, _command_rx, _priority_rx) = test_observer();
+        let unsupported = libp2p::PeerId::random();
+        let usable = libp2p::PeerId::random();
+        orch.connected_peers.insert(unsupported);
+        orch.connected_peers.insert(usable);
+
+        assert!(orch.sync_unsupported_peers.insert(unsupported));
+        assert!(
+            !orch.sync_unsupported_peers.insert(unsupported),
+            "a repeat verdict must not log again"
+        );
+
+        // Reconnecting may be a different build, so the verdict is per-connection.
+        orch.connected_peers.remove(&unsupported);
+        orch.sync_unsupported_peers.remove(&unsupported);
+        assert!(!orch.sync_unsupported_peers.contains(&unsupported));
+
+        // With every peer refusing, there is no sync to start at all.
+        orch.connected_peers.insert(unsupported);
+        orch.sync_unsupported_peers.insert(unsupported);
+        orch.sync_unsupported_peers.insert(usable);
+        let candidates: Vec<_> = orch
+            .connected_peers
+            .iter()
+            .copied()
+            .filter(|peer| !orch.sync_unsupported_peers.contains(peer))
+            .collect();
+        assert!(
+            candidates.is_empty(),
+            "no candidate should remain when every peer refused"
+        );
     }
 }
