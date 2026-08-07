@@ -20,6 +20,14 @@ pub fn gov5_h2_topic(genesis_hash: B256) -> IdentTopic {
     IdentTopic::new(format!("/n42/{fork_digest}/hotstuff_consensus/ssz_snappy"))
 }
 
+/// Gov5's canonical sealed-block gossip topic.
+///
+/// The payload is raw Snappy around the ETH-style RLP block wire form.
+pub fn gov5_block_topic(genesis_hash: B256) -> IdentTopic {
+    let fork_digest = hex::encode(&genesis_hash.as_slice()[..4]);
+    IdentTopic::new(format!("/n42/{fork_digest}/block/ssz_snappy"))
+}
+
 pub fn h2_v4_topic() -> IdentTopic {
     IdentTopic::new("/n42/h2/4/ssz_snappy")
 }
@@ -80,6 +88,10 @@ mod tests {
         assert_eq!(
             gov5_h2_topic(B256::repeat_byte(0xab)).hash(),
             IdentTopic::new("/n42/abababab/hotstuff_consensus/ssz_snappy").hash()
+        );
+        assert_eq!(
+            gov5_block_topic(B256::repeat_byte(0xab)).hash(),
+            IdentTopic::new("/n42/abababab/block/ssz_snappy").hash()
         );
         assert_eq!(
             h2_v4_topic().hash(),

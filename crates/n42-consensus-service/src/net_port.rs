@@ -3,7 +3,9 @@
 //! (`impl ConsensusNetwork for NetworkHandle`) lives node-side; this crate holds
 //! only the trait. Caplin EL-seam refactor (stage 4 / 6c).
 
-use n42_network::{BlockSyncRequest, BlockSyncResponse, NetworkError, NetworkHandle, PeerId};
+use n42_network::{
+    BlockSyncRequest, BlockSyncResponse, NetworkError, NetworkHandle, PeerId, h2_v4::H2V4Envelope,
+};
 use n42_primitives::ConsensusMessage;
 use std::collections::HashMap;
 
@@ -14,6 +16,9 @@ use std::collections::HashMap;
 pub trait ConsensusNetwork: Send + Sync {
     /// Broadcast a consensus message via GossipSub (priority channel).
     fn broadcast_consensus(&self, msg: ConsensusMessage) -> Result<(), NetworkError>;
+
+    /// Broadcast a chain-bound gov5-compatible H2-v4 message.
+    fn broadcast_h2_v4(&self, envelope: H2V4Envelope) -> Result<(), NetworkError>;
 
     /// Resolve a validator index to its connected `PeerId`, if known.
     fn validator_peer(&self, index: u32) -> Option<PeerId>;
@@ -30,11 +35,21 @@ pub trait ConsensusNetwork: Send + Sync {
     /// Send a block-sync request to a peer (standard channel).
     fn request_sync(&self, peer: PeerId, request: BlockSyncRequest) -> Result<(), NetworkError>;
 
+    /// Fetch one gov5 block body whose hash was authenticated by H2-v4.
+    fn request_gov5_block_by_hash(
+        &self,
+        peer: PeerId,
+        block_hash: alloy_primitives::B256,
+    ) -> Result<(), NetworkError>;
+
     /// Broadcast a blob sidecar (standard channel).
     fn broadcast_blob_sidecar(&self, data: Vec<u8>) -> Result<(), NetworkError>;
 
     /// Announce a built block to followers with backpressure (awaited).
     async fn announce_block_reliable(&self, data: Vec<u8>) -> Result<(), NetworkError>;
+
+    /// Publish a locally built block on gov5's canonical block topic.
+    async fn broadcast_gov5_block_reliable(&self, rlp: Vec<u8>) -> Result<(), NetworkError>;
 
     /// Send block data directly to a peer with backpressure (awaited).
     async fn send_block_direct_reliable(
@@ -76,6 +91,10 @@ impl ConsensusNetwork for NetworkHandle {
         NetworkHandle::broadcast_consensus(self, msg)
     }
 
+    fn broadcast_h2_v4(&self, envelope: H2V4Envelope) -> Result<(), NetworkError> {
+        NetworkHandle::broadcast_h2_v4(self, envelope)
+    }
+
     fn validator_peer(&self, index: u32) -> Option<PeerId> {
         NetworkHandle::validator_peer(self, index)
     }
@@ -96,12 +115,24 @@ impl ConsensusNetwork for NetworkHandle {
         NetworkHandle::request_sync(self, peer, request)
     }
 
+    fn request_gov5_block_by_hash(
+        &self,
+        peer: PeerId,
+        block_hash: alloy_primitives::B256,
+    ) -> Result<(), NetworkError> {
+        NetworkHandle::request_gov5_block_by_hash(self, peer, block_hash)
+    }
+
     fn broadcast_blob_sidecar(&self, data: Vec<u8>) -> Result<(), NetworkError> {
         NetworkHandle::broadcast_blob_sidecar(self, data)
     }
 
     async fn announce_block_reliable(&self, data: Vec<u8>) -> Result<(), NetworkError> {
         NetworkHandle::announce_block_reliable(self, data).await
+    }
+
+    async fn broadcast_gov5_block_reliable(&self, rlp: Vec<u8>) -> Result<(), NetworkError> {
+        NetworkHandle::broadcast_gov5_block_reliable(self, rlp).await
     }
 
     async fn send_block_direct_reliable(

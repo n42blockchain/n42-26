@@ -118,6 +118,7 @@ fn build_service(
         el,
         consensus_state,
         head_block_hash,
+        0,
         fee_recipient,
     );
 

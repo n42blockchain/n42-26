@@ -1,7 +1,6 @@
 use alloy_primitives::B256;
 use n42_primitives::consensus::{ConsensusMessage, PrepareQC, Proposal, ViewNumber};
 
-use super::quorum::{commit_signing_message, signing_message};
 use super::round::Phase;
 use super::state_machine::{ConsensusEngine, EngineOutput};
 use crate::error::{ConsensusError, ConsensusResult};
@@ -91,14 +90,14 @@ impl ConsensusEngine {
                 return Ok(false);
             }
         };
-        let prop_msg = super::quorum::proposal_signing_message(
+        let prop_msg = self.signing_profile.proposal_message(
             proposal.view,
-            &proposal.block_hash,
+            proposal.block_hash,
             &proposal.validator_changes,
         );
-        if pk
-            .verify_prevalidated(&prop_msg, &proposal.signature)
-            .is_err()
+        if !self
+            .signing_profile
+            .verify_single(pk, &prop_msg, &proposal.signature)
         {
             tracing::warn!(
                 target: "n42::cl::proposal",
@@ -151,6 +150,15 @@ impl ConsensusEngine {
         // Include any pending validator changes so all nodes apply the same
         // changes at CommitQC time (consensus-safe commit-then-activate).
         let validator_changes = self.epoch_manager.pending_changes_for_proposal();
+        if matches!(
+            self.signing_profile,
+            super::quorum::ConsensusSigningProfile::H2V4(_)
+        ) && validator_changes
+            .as_ref()
+            .is_some_and(|changes| !changes.is_empty())
+        {
+            return Err(ConsensusError::H2V4ValidatorChangesUnsupported);
+        }
         let changes_hash = match validator_changes.as_ref() {
             Some(changes) => crate::EpochManager::hash_changes(changes),
             None => B256::ZERO,
@@ -160,10 +168,11 @@ impl ConsensusEngine {
         self.pending_changes_hashes.insert(block_hash, changes_hash);
 
         // Signature covers changes_hash to prevent Byzantine relay from swapping changes.
-        let prop_msg =
-            super::quorum::proposal_signing_message(view, &block_hash, &validator_changes);
-        let signature = self.secret_key.sign(&prop_msg);
-        let vote_msg = signing_message(view, &block_hash);
+        let prop_msg = self
+            .signing_profile
+            .proposal_message(view, block_hash, &validator_changes);
+        let signature = self.signing_profile.sign(&self.secret_key, &prop_msg);
+        let vote_msg = self.signing_profile.vote_message(view, block_hash);
 
         // Use the epoch-aware index for the proposer field.  In the epoch-drift zone
         // (staging committed but epoch boundary not yet fired), validator_set_for_view
@@ -232,7 +241,7 @@ impl ConsensusEngine {
         // send_vote(); a fsync failure aborts the proposal.
         self.vote_log.record_vote(view)?;
         // Reuse the vote_msg computed above (same view + block_hash).
-        let leader_vote_sig = self.secret_key.sign(&vote_msg);
+        let leader_vote_sig = self.signing_profile.sign(&self.secret_key, &vote_msg);
         if let Some(ref mut collector) = self.vote_collector {
             collector.add_verified_vote(self.my_index, leader_vote_sig)?;
         }
@@ -268,17 +277,31 @@ impl ConsensusEngine {
         }
 
         let pk = view_set.get_public_key(proposal.proposer)?;
+        if matches!(
+            self.signing_profile,
+            super::quorum::ConsensusSigningProfile::H2V4(_)
+        ) && proposal
+            .validator_changes
+            .as_ref()
+            .is_some_and(|changes| !changes.is_empty())
+        {
+            return Err(ConsensusError::H2V4ValidatorChangesUnsupported);
+        }
         // Verify proposal signature covers (view, block_hash, changes_hash).
-        let prop_msg = super::quorum::proposal_signing_message(
+        let prop_msg = self.signing_profile.proposal_message(
             view,
-            &proposal.block_hash,
+            proposal.block_hash,
             &proposal.validator_changes,
         );
-        pk.verify_prevalidated(&prop_msg, &proposal.signature)
-            .map_err(|_| ConsensusError::InvalidSignature {
+        if !self
+            .signing_profile
+            .verify_single(pk, &prop_msg, &proposal.signature)
+        {
+            return Err(ConsensusError::InvalidSignature {
                 view,
                 validator_index: proposal.proposer,
-            })?;
+            });
+        }
 
         // Track the exact signed message rather than only block_hash: validator
         // changes are part of the signature domain and two different change
@@ -340,10 +363,12 @@ impl ConsensusEngine {
 
         // Chained mode: process piggybacked PrepareQC if present.
         if let Some(ref piggybacked_qc) = proposal.prepare_qc {
-            match super::quorum::verify_qc(
-                piggybacked_qc,
-                self.resolve_qc_validator_set(piggybacked_qc),
-            ) {
+            let verification = self
+                .resolve_qc_validator_set(piggybacked_qc)
+                .and_then(|set| {
+                    super::quorum::verify_qc_with_profile(piggybacked_qc, set, self.signing_profile)
+                });
+            match verification {
                 Ok(()) => {
                     tracing::debug!(target: "n42::cl::proposal",
                         view,
@@ -397,6 +422,26 @@ impl ConsensusEngine {
         // Trigger eager import in background (needed for finalization).
         self.emit(EngineOutput::ExecuteBlock(proposal.block_hash))?;
 
+        // Gov5's H2 profile is import-gated: an R1 vote attests that this node
+        // has executed and validated the proposed payload, not merely seen its
+        // hash. Keep the native profile's established optimistic path intact.
+        if matches!(
+            self.signing_profile,
+            super::quorum::ConsensusSigningProfile::H2V4(_)
+        ) {
+            self.pending_proposal = Some(super::state_machine::PendingProposal {
+                view,
+                block_hash: proposal.block_hash,
+            });
+            if self.imported_blocks.contains(&proposal.block_hash) {
+                tracing::info!(target: "n42::interop::h2v4", view, block_hash = %proposal.block_hash, "import-gated vote: block already execution-validated");
+                self.send_vote(view, proposal.block_hash)?;
+            } else {
+                tracing::info!(target: "n42::interop::h2v4", view, block_hash = %proposal.block_hash, "import-gated vote: waiting for execution validation");
+            }
+            return Ok(());
+        }
+
         // Optimistic Voting: vote immediately after Proposal validation.
         //
         // R1 vote signs (view, block_hash) — it does NOT commit to block validity.
@@ -441,7 +486,8 @@ impl ConsensusEngine {
             });
         }
 
-        super::quorum::verify_qc(&pqc.qc, self.resolve_qc_validator_set(&pqc.qc))?;
+        let qc_set = self.resolve_qc_validator_set(&pqc.qc)?;
+        super::quorum::verify_qc_with_profile(&pqc.qc, qc_set, self.signing_profile)?;
         self.round_state.update_locked_qc(&pqc.qc);
         self.round_state.enter_pre_commit();
 
@@ -470,8 +516,10 @@ impl ConsensusEngine {
         // Bind this R2 commit-vote signature to the same changes_hash the
         // leader's proposal carried.
         let changes_hash = self.cached_changes_hash(&pqc.block_hash);
-        let commit_msg = commit_signing_message(view, &pqc.block_hash, &changes_hash);
-        let commit_sig = self.secret_key.sign(&commit_msg);
+        let commit_msg = self
+            .signing_profile
+            .commit_message(view, pqc.block_hash, changes_hash);
+        let commit_sig = self.signing_profile.sign(&self.secret_key, &commit_msg);
         let leader = self.leader_index_for_view(view);
 
         let commit_vote = n42_primitives::consensus::CommitVote {
@@ -519,8 +567,8 @@ impl ConsensusEngine {
         self.vote_log.record_vote(view)?;
 
         let leader = self.leader_index_for_view(view);
-        let vote_msg = signing_message(view, &block_hash);
-        let vote_sig = self.secret_key.sign(&vote_msg);
+        let vote_msg = self.signing_profile.vote_message(view, block_hash);
+        let vote_sig = self.signing_profile.sign(&self.secret_key, &vote_msg);
 
         let vote = n42_primitives::consensus::Vote {
             view,
@@ -539,21 +587,57 @@ impl ConsensusEngine {
 
     /// Handles the BlockImported event from the orchestrator.
     ///
-    /// With Optimistic Voting, R1 votes are sent immediately upon Proposal validation
-    /// (no waiting for BlockData). This handler only tracks imported blocks for
-    /// diagnostics and eager import coordination.
+    /// Native optimistic voting uses this as execution diagnostics. Gov5 H2
+    /// participant mode also releases the matching deferred R1 vote here.
     pub(super) fn on_block_imported(&mut self, block_hash: B256) -> ConsensusResult<()> {
-        if self.imported_blocks.len() < MAX_IMPORTED_BLOCKS {
-            self.imported_blocks.insert(block_hash);
-        } else {
-            tracing::warn!(
-                target: "n42::cl::proposal",
-                view = self.round_state.current_view(),
-                limit = MAX_IMPORTED_BLOCKS,
-                %block_hash,
-                "imported_blocks at capacity, discarding entry (diagnostic tracking only)"
-            );
+        if self.imported_blocks.insert(block_hash) {
+            if self.imported_block_fifo.len() >= MAX_IMPORTED_BLOCKS {
+                self.evict_oldest_imported_block();
+            }
+            self.imported_block_fifo.push_back(block_hash);
+        }
+
+        if matches!(
+            self.signing_profile,
+            super::quorum::ConsensusSigningProfile::H2V4(_)
+        ) && let Some(pending) = self.pending_proposal.as_ref()
+            && pending.view == self.round_state.current_view()
+            && pending.block_hash == block_hash
+            && self.round_state.may_vote_in(pending.view)
+        {
+            let view = pending.view;
+            tracing::info!(target: "n42::interop::h2v4", view, %block_hash, "import-gated vote: execution validated, sending vote");
+            self.send_vote(view, block_hash)?;
         }
         Ok(())
+    }
+
+    /// Drops the oldest import evidence, skipping the hash a deferred H2 vote is
+    /// still waiting on.
+    ///
+    /// The block whose import releases the pending vote is not necessarily the
+    /// most recent one imported: catching up delivers a burst of blocks, and 64
+    /// of them are enough to push the awaited hash out. Losing that entry is
+    /// terminal for the view rather than merely wasteful — the orchestrator
+    /// deduplicates both block data and eager imports, so no second
+    /// `BlockImported` ever arrives for a hash reth already executed, and the
+    /// vote is never released. Rotating the live hash to the back keeps the
+    /// cache bounded (by at most one extra entry) without stranding it.
+    fn evict_oldest_imported_block(&mut self) {
+        let live = self
+            .pending_proposal
+            .as_ref()
+            .map(|pending| pending.block_hash);
+        for _ in 0..self.imported_block_fifo.len() {
+            let Some(oldest) = self.imported_block_fifo.pop_front() else {
+                return;
+            };
+            if Some(oldest) == live {
+                self.imported_block_fifo.push_back(oldest);
+                continue;
+            }
+            self.imported_blocks.remove(&oldest);
+            return;
+        }
     }
 }

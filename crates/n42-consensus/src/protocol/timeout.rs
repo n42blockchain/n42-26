@@ -1,6 +1,6 @@
 use n42_primitives::consensus::{ConsensusMessage, NewView, TimeoutCertificate, TimeoutMessage};
 
-use super::quorum::{TimeoutCollector, newview_signing_message, timeout_signing_message};
+use super::quorum::TimeoutCollector;
 use super::round::Phase;
 use super::state_machine::{ConsensusEngine, EngineOutput};
 use crate::error::{ConsensusError, ConsensusResult};
@@ -53,12 +53,16 @@ impl ConsensusEngine {
         };
 
         let pk = view_set.get_public_key(timeout.sender)?;
-        let msg = timeout_signing_message(timeout.view);
-        pk.verify_prevalidated(&msg, &timeout.signature)
-            .map_err(|_| ConsensusError::InvalidSignature {
+        let msg = self.signing_profile.timeout_message(timeout.view);
+        if !self
+            .signing_profile
+            .verify_single(pk, &msg, &timeout.signature)
+        {
+            return Err(ConsensusError::InvalidSignature {
                 view: timeout.view,
                 validator_index: timeout.sender,
-            })?;
+            });
+        }
         self.verify_embedded_qc(&timeout.high_qc)?;
 
         let next_leader = LeaderSelector::leader_for_view(next_view, &next_view_set);
@@ -86,7 +90,7 @@ impl ConsensusEngine {
             return Ok(false);
         }
 
-        let tc = collector.build_tc(&view_set)?;
+        let tc = collector.build_tc_with_profile(&view_set, self.signing_profile)?;
         self.future_timeout_collectors.remove(&timeout.view);
         tracing::info!(target: "n42::cl::timeout",
             local_view = current_view,
@@ -158,8 +162,8 @@ impl ConsensusEngine {
             self.pacemaker
                 .reset_for_view(view, self.round_state.consecutive_timeouts());
 
-            let message = timeout_signing_message(view);
-            let signature = self.secret_key.sign(&message);
+            let message = self.signing_profile.timeout_message(view);
+            let signature = self.signing_profile.sign(&self.secret_key, &message);
             let timeout_msg = TimeoutMessage {
                 view,
                 high_qc: self.round_state.locked_qc().clone(),
@@ -194,7 +198,13 @@ impl ConsensusEngine {
 
         // Clear pending block data: similar to Tendermint's "prevote nil".
         self.pending_proposal = None;
-        self.imported_blocks.clear();
+        if !matches!(
+            self.signing_profile,
+            super::quorum::ConsensusSigningProfile::H2V4(_)
+        ) {
+            self.imported_blocks.clear();
+            self.imported_block_fifo.clear();
+        }
 
         // Preserve any timeouts already collected from validators who timed out before us.
         // Unconditional replacement would discard those votes, potentially preventing
@@ -203,8 +213,8 @@ impl ConsensusEngine {
         self.timeout_collector
             .get_or_insert_with(|| TimeoutCollector::new(view, n_validators));
 
-        let message = timeout_signing_message(view);
-        let signature = self.secret_key.sign(&message);
+        let message = self.signing_profile.timeout_message(view);
+        let signature = self.signing_profile.sign(&self.secret_key, &message);
 
         let timeout_msg = TimeoutMessage {
             view,
@@ -244,12 +254,16 @@ impl ConsensusEngine {
         // Current-view timeout processing.
         let view_set = self.validator_set_for_view(view);
         let pk = view_set.get_public_key(timeout.sender)?;
-        let msg = timeout_signing_message(view);
-        pk.verify_prevalidated(&msg, &timeout.signature)
-            .map_err(|_| ConsensusError::InvalidSignature {
+        let msg = self.signing_profile.timeout_message(view);
+        if !self
+            .signing_profile
+            .verify_single(pk, &msg, &timeout.signature)
+        {
+            return Err(ConsensusError::InvalidSignature {
                 view,
                 validator_index: timeout.sender,
-            })?;
+            });
+        }
 
         // Verify the embedded high_qc to prevent Byzantine validators from injecting
         // forged QCs that could manipulate the locked_qc via TC formation.
@@ -262,49 +276,59 @@ impl ConsensusEngine {
         let n_validators = view_set.len();
         let quorum_size = view_set.quorum_size();
         let next_view = view.saturating_add(1);
-
-        // Only the next-view leader can form and sign NewView, so make every
-        // non-leader receiver a relay for verified timeout votes. This matters
-        // after a leader reconnects: the original sender's direct stream may
-        // still be negotiating, while another validator already has a healthy
-        // stream to it. Relay before duplicate detection so repeat timeouts can
-        // repair exactly that late-join gap. SendToValidator retains GossipSub
-        // as a fallback, while the direct leg is not suppressed by GossipSub's
-        // byte-identical message-id cache.
         let next_leader = LeaderSelector::leader_for_view(next_view, view_set);
-        if timeout.sender != self.my_index && next_leader != self.my_index {
+        let relay_timeout = (timeout.sender != self.my_index && next_leader != self.my_index)
+            .then(|| timeout.clone());
+
+        let (has_quorum, timeout_count) = {
+            let collector = self
+                .timeout_collector
+                .get_or_insert_with(|| TimeoutCollector::new(view, n_validators));
+
+            match collector.add_verified_timeout(timeout.sender, timeout.signature, timeout.high_qc)
+            {
+                Ok(()) => {}
+                Err(ConsensusError::DuplicateVote { .. }) => {
+                    tracing::debug!(target: "n42::cl::timeout",
+                        view,
+                        sender = timeout.sender,
+                        "ignoring duplicate timeout (GossipSub multi-path)"
+                    );
+                    return Ok(());
+                }
+                Err(e) => return Err(e),
+            }
+
+            (collector.has_quorum(quorum_size), collector.timeout_count())
+        };
+
+        // Only the next-view leader can form and sign NewView, so make a
+        // non-leader receiver relay each newly observed timeout vote once.
+        //
+        // This must happen after collector deduplication. H2-v4 carries the same
+        // timeout over two GossipSub topics plus validator direct streams, and
+        // SendToValidator uses those same redundant transports. Relaying every
+        // duplicate therefore creates a positive feedback loop: each copy is
+        // fanned out again, eventually exhausting request-response stream
+        // capacity and preventing missing-block recovery. The timeout originator
+        // already periodically re-broadcasts while the view remains timed out,
+        // so a reconnecting next leader still receives a fresh copy without
+        // duplicate-triggered relay amplification.
+        if let Some(timeout) = relay_timeout {
             self.emit(EngineOutput::SendToValidator(
                 next_leader,
-                ConsensusMessage::Timeout(timeout.clone()),
+                ConsensusMessage::Timeout(timeout),
             ))?;
-        }
-
-        let collector = self
-            .timeout_collector
-            .get_or_insert_with(|| TimeoutCollector::new(view, n_validators));
-
-        match collector.add_verified_timeout(timeout.sender, timeout.signature, timeout.high_qc) {
-            Ok(()) => {}
-            Err(ConsensusError::DuplicateVote { .. }) => {
-                tracing::debug!(target: "n42::cl::timeout",
-                    view,
-                    sender = timeout.sender,
-                    "ignoring duplicate timeout (GossipSub multi-path)"
-                );
-                return Ok(());
-            }
-            Err(e) => return Err(e),
         }
 
         tracing::debug!(target: "n42::cl::timeout",
             view,
             sender = timeout.sender,
-            count = collector.timeout_count(),
+            count = timeout_count,
             "received timeout"
         );
 
-        let should_form_tc =
-            collector.has_quorum(quorum_size) && self.is_leader_for_view(next_view);
+        let should_form_tc = has_quorum && self.is_leader_for_view(next_view);
 
         if should_form_tc {
             self.try_form_tc_and_advance(view, next_view)?;
@@ -333,12 +357,16 @@ impl ConsensusEngine {
 
         // Verify leader's signature to prevent Byzantine nodes from forging NewView messages.
         let pk = new_view_set.get_public_key(nv.leader)?;
-        let nv_msg = newview_signing_message(nv.view);
-        pk.verify_prevalidated(&nv_msg, &nv.signature)
-            .map_err(|_| ConsensusError::InvalidSignature {
+        let nv_msg = self.signing_profile.new_view_message(nv.view);
+        if !self
+            .signing_profile
+            .verify_single(pk, &nv_msg, &nv.signature)
+        {
+            return Err(ConsensusError::InvalidSignature {
                 view: nv.view,
                 validator_index: nv.leader,
-            })?;
+            });
+        }
 
         // TC must be for the previous view (nv.view - 1).
         if nv.timeout_cert.view != nv.view.saturating_sub(1) {
@@ -351,9 +379,10 @@ impl ConsensusEngine {
                 ),
             });
         }
-        super::quorum::verify_tc(
+        super::quorum::verify_tc_with_profile(
             &nv.timeout_cert,
             self.validator_set_for_view(nv.timeout_cert.view),
+            self.signing_profile,
         )?;
 
         // Verify TC's high_qc signature to prevent injection of forged QCs.
@@ -381,7 +410,10 @@ impl ConsensusEngine {
         next_view: u64,
     ) -> ConsensusResult<()> {
         let tc = match self.timeout_collector.as_ref() {
-            Some(c) => c.build_tc(self.validator_set_for_view(current_view))?,
+            Some(c) => c.build_tc_with_profile(
+                self.validator_set_for_view(current_view),
+                self.signing_profile,
+            )?,
             None => {
                 tracing::warn!(target: "n42::cl::timeout", view = current_view, "timeout_collector disappeared during TC formation");
                 return Ok(());
@@ -399,8 +431,8 @@ impl ConsensusEngine {
 
         self.round_state.update_locked_qc(&tc.high_qc);
 
-        let nv_message = newview_signing_message(next_view);
-        let nv_sig = self.secret_key.sign(&nv_message);
+        let nv_message = self.signing_profile.new_view_message(next_view);
+        let nv_sig = self.signing_profile.sign(&self.secret_key, &nv_message);
 
         let leader = self.local_validator_index_for_view(next_view).ok_or(
             ConsensusError::LocalValidatorNotInSet {

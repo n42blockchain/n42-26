@@ -2,6 +2,7 @@ pub mod attestation_store;
 pub mod blob_port;
 mod components;
 pub mod el;
+pub mod engine_validator;
 pub mod exec_cache;
 pub mod ingest;
 pub mod mobile_bridge;
@@ -13,7 +14,10 @@ mod node;
 pub mod packet_builder;
 pub mod payload;
 pub mod pool;
+pub mod qmdb_state;
+pub mod qmdb_state_root;
 pub mod rpc;
+mod rpc_compat;
 pub mod sinks;
 pub mod staking;
 pub mod tx_bridge;
@@ -123,9 +127,7 @@ mod state_root_flag_tests {
     #[test]
     fn bypass_with_allow_only_inside_bench_range() {
         assert!(validate_state_root_bypass_flags(false, true, true, BENCH_CHAIN_ID_MIN).is_ok());
-        assert!(
-            validate_state_root_bypass_flags(true, true, true, BENCH_CHAIN_ID_MAX - 1).is_ok()
-        );
+        assert!(validate_state_root_bypass_flags(true, true, true, BENCH_CHAIN_ID_MAX - 1).is_ok());
         assert!(validate_state_root_bypass_flags(false, true, true, BENCH_CHAIN_ID_MAX).is_err());
         assert!(validate_state_root_bypass_flags(true, false, true, 1).is_err());
         assert!(validate_state_root_bypass_flags(true, false, true, 94).is_err());

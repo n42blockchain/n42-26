@@ -10,6 +10,91 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+const EXECUTION_LINEAGE_MAGIC: &[u8; 4] = b"N42E";
+const EXECUTION_LINEAGE_RECORD_LEN: usize = 4 + 8 + 32 + 16;
+const MAX_DURABLE_VOTE_WATERMARK_AHEAD: u64 = 128;
+
+fn execution_lineage_path(snapshot_path: &Path) -> PathBuf {
+    let mut path = snapshot_path.as_os_str().to_os_string();
+    path.push(".execution-lineage");
+    PathBuf::from(path)
+}
+
+/// Appends and fsyncs an exact execution-valid `(view, hash)` proof.
+///
+/// This log is deliberately separate from the replace-in-place consensus JSON:
+/// after FCU returns Valid, Reth and the snapshot can become durable at
+/// different instants. Retaining every recent proof lets restart map a Reth
+/// head that fell back to any previously validated ancestor without guessing.
+pub fn append_execution_lineage_proof(
+    snapshot_path: &Path,
+    view: u64,
+    hash: B256,
+) -> io::Result<()> {
+    let path = execution_lineage_path(snapshot_path);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut record = Vec::with_capacity(EXECUTION_LINEAGE_RECORD_LEN);
+    record.extend_from_slice(EXECUTION_LINEAGE_MAGIC);
+    record.extend_from_slice(&view.to_le_bytes());
+    record.extend_from_slice(hash.as_slice());
+    let checksum = blake3::hash(&record);
+    record.extend_from_slice(&checksum.as_bytes()[..16]);
+    debug_assert_eq!(record.len(), EXECUTION_LINEAGE_RECORD_LEN);
+
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    file.write_all(&record)?;
+    file.sync_data()
+}
+
+/// Finds the newest durable proof for `canonical_head_hash`.
+///
+/// A partial final record is tolerated as a crash tear. Any corruption in a
+/// complete record fails closed, because silently skipping it could turn an
+/// unproven hash/view pair into an accepted recovery point.
+pub fn recover_execution_lineage_proof(
+    snapshot_path: &Path,
+    canonical_head_hash: B256,
+) -> io::Result<Option<(u64, B256)>> {
+    let path = execution_lineage_path(snapshot_path);
+    let mut bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let complete_len = bytes.len() - (bytes.len() % EXECUTION_LINEAGE_RECORD_LEN);
+    bytes.truncate(complete_len);
+
+    let mut recovered = None;
+    for record in bytes.chunks_exact(EXECUTION_LINEAGE_RECORD_LEN) {
+        let payload = &record[..44];
+        if &payload[..4] != EXECUTION_LINEAGE_MAGIC {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid execution-lineage record magic",
+            ));
+        }
+        let expected = blake3::hash(payload);
+        if record[44..] != expected.as_bytes()[..16] {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "execution-lineage record checksum mismatch",
+            ));
+        }
+        let view = u64::from_le_bytes(
+            payload[4..12]
+                .try_into()
+                .expect("fixed execution-lineage view width"),
+        );
+        let hash = B256::from_slice(&payload[12..44]);
+        if hash == canonical_head_hash {
+            recovered = Some((view, hash));
+        }
+    }
+    Ok(recovered)
+}
+
 /// Snapshot of consensus state persisted to disk.
 ///
 /// Contains the minimum state needed to safely resume after a crash:
@@ -175,16 +260,19 @@ impl ConsensusSnapshot {
                 self.last_committed_qc.view, self.locked_qc.view
             ));
         }
-        if self.last_voted_view > self.current_view {
+        let maximum_vote_watermark = self
+            .current_view
+            .saturating_add(MAX_DURABLE_VOTE_WATERMARK_AHEAD);
+        if self.last_voted_view > maximum_vote_watermark {
             return Err(format!(
-                "last_voted_view ({}) > current_view ({})",
-                self.last_voted_view, self.current_view
+                "last_voted_view ({}) exceeds bounded recovery watermark {} for current_view ({})",
+                self.last_voted_view, maximum_vote_watermark, self.current_view
             ));
         }
-        if self.last_commit_voted_view > self.current_view {
+        if self.last_commit_voted_view > maximum_vote_watermark {
             return Err(format!(
-                "last_commit_voted_view ({}) > current_view ({})",
-                self.last_commit_voted_view, self.current_view
+                "last_commit_voted_view ({}) exceeds bounded recovery watermark {} for current_view ({})",
+                self.last_commit_voted_view, maximum_vote_watermark, self.current_view
             ));
         }
         if let Some((target_epoch, validators, fault_tolerance)) = &self.scheduled_epoch_transition
@@ -426,7 +514,9 @@ impl FileVoteLog {
             .map_err(|e| ConsensusError::VoteLogFsync(format!("vote log mutex poisoned: {e}")))?;
         guard.seek(SeekFrom::Start(offset)).map_err(map_io_err)?;
         guard.write_all(&view.to_le_bytes()).map_err(map_io_err)?;
-        guard.sync_data().map_err(map_io_err)
+        guard.sync_data().map_err(map_io_err)?;
+        crate::qualification_abort_at("vote_persisted");
+        Ok(())
     }
 }
 
@@ -652,18 +742,26 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_rejects_vote_views_ahead_of_current_view() {
+    fn test_validate_allows_bounded_vote_watermarks_ahead_of_snapshot_view() {
         assert!(
             ConsensusSnapshot {
                 last_voted_view: 11,
                 ..genesis_snapshot(10)
             }
             .validate()
-            .is_err()
+            .is_ok()
         );
         assert!(
             ConsensusSnapshot {
                 last_commit_voted_view: 11,
+                ..genesis_snapshot(10)
+            }
+            .validate()
+            .is_ok()
+        );
+        assert!(
+            ConsensusSnapshot {
+                last_commit_voted_view: 139,
                 ..genesis_snapshot(10)
             }
             .validate()
@@ -1134,5 +1232,64 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn execution_lineage_recovers_newest_exact_hash_view() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot_path = dir.path().join("consensus_state.json");
+        let first = B256::repeat_byte(0x11);
+        let second = B256::repeat_byte(0x22);
+
+        append_execution_lineage_proof(&snapshot_path, 41, first).unwrap();
+        append_execution_lineage_proof(&snapshot_path, 42, second).unwrap();
+        append_execution_lineage_proof(&snapshot_path, 43, first).unwrap();
+
+        assert_eq!(
+            recover_execution_lineage_proof(&snapshot_path, first).unwrap(),
+            Some((43, first))
+        );
+        assert_eq!(
+            recover_execution_lineage_proof(&snapshot_path, second).unwrap(),
+            Some((42, second))
+        );
+    }
+
+    #[test]
+    fn execution_lineage_tolerates_only_a_partial_final_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot_path = dir.path().join("consensus_state.json");
+        let hash = B256::repeat_byte(0x33);
+        append_execution_lineage_proof(&snapshot_path, 77, hash).unwrap();
+
+        let path = execution_lineage_path(&snapshot_path);
+        let mut file = OpenOptions::new().append(true).open(path).unwrap();
+        file.write_all(b"N42Epartial").unwrap();
+        file.sync_data().unwrap();
+
+        assert_eq!(
+            recover_execution_lineage_proof(&snapshot_path, hash).unwrap(),
+            Some((77, hash))
+        );
+    }
+
+    #[test]
+    fn execution_lineage_rejects_complete_record_corruption() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot_path = dir.path().join("consensus_state.json");
+        let hash = B256::repeat_byte(0x44);
+        append_execution_lineage_proof(&snapshot_path, 88, hash).unwrap();
+
+        let path = execution_lineage_path(&snapshot_path);
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[20] ^= 0x01;
+        std::fs::write(path, bytes).unwrap();
+
+        assert_eq!(
+            recover_execution_lineage_proof(&snapshot_path, hash)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
     }
 }
