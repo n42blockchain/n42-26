@@ -36,13 +36,19 @@ impl ConsensusSigningProfile {
     ) -> Vec<u8> {
         match self {
             Self::Native => proposal_signing_message(view, &block_hash, validator_changes).to_vec(),
-            Self::H2V4(identity) => h2_v4_proposal_signing_message(
-                identity,
-                view,
-                block_hash,
-                validator_changes_hash(validator_changes),
-            )
-            .to_vec(),
+            // gov5's v4 profile hardcodes a zero validator-change hash and
+            // does not support reconfiguration (interop_v4.go). Deriving a
+            // real hash here would be invisible until a committee change
+            // actually lands, and then the two clients would sign different
+            // preimages for the same proposal and reject each other at
+            // exactly that view. Zero until the dynamic-changes revision
+            // defines one hash both clients derive identically; the brief is
+            // explicit that no v4 chain may configure epoch changes before
+            // then. The startup log already states this invariant.
+            Self::H2V4(identity) => {
+                let _ = validator_changes;
+                h2_v4_proposal_signing_message(identity, view, block_hash, B256::ZERO).to_vec()
+            }
         }
     }
 
@@ -56,8 +62,10 @@ impl ConsensusSigningProfile {
     pub fn commit_message(self, view: ViewNumber, block_hash: B256, changes_hash: B256) -> Vec<u8> {
         match self {
             Self::Native => commit_signing_message(view, &block_hash, &changes_hash).to_vec(),
+            // Zero for the same reason as `proposal_message`.
             Self::H2V4(identity) => {
-                h2_v4_commit_signing_message(identity, view, block_hash, changes_hash).to_vec()
+                let _ = changes_hash;
+                h2_v4_commit_signing_message(identity, view, block_hash, B256::ZERO).to_vec()
             }
         }
     }
@@ -1494,6 +1502,55 @@ mod tests {
             tc.signers.count_ones(),
             3,
             "the other three timeouts must survive"
+        );
+    }
+
+    /// gov5's v4 profile signs a zero validator-change hash unconditionally
+    /// (`interop_v4.go` passes `types.Hash{}`), and its first revision does not
+    /// support reconfiguration at all. If this side derived a real hash from
+    /// the changes, nothing would look wrong until a committee change actually
+    /// landed — at that view the two clients would sign different preimages
+    /// for the same proposal, each reject the other's signature, and the
+    /// chain would stall precisely when it was reconfiguring.
+    ///
+    /// Native signing keeps binding the real hash; only the v4 profile is
+    /// pinned, and only until both sides specify one derivation they share.
+    #[test]
+    fn h2_v4_signing_ignores_validator_changes() {
+        use n42_primitives::consensus::{H2V4ChainIdentity, ValidatorChange};
+
+        let identity = H2V4ChainIdentity {
+            chain_id: 94,
+            genesis_hash: B256::repeat_byte(0x11),
+        };
+        let profile = ConsensusSigningProfile::H2V4(identity);
+        let view = 7;
+        let block_hash = B256::repeat_byte(0xAB);
+        let changes = Some(vec![ValidatorChange::Remove {
+            address: alloy_primitives::Address::with_last_byte(3),
+        }]);
+
+        // Sanity: these changes really do hash to something non-zero, so the
+        // assertions below are not vacuous.
+        assert_ne!(validator_changes_hash(&changes), B256::ZERO);
+
+        assert_eq!(
+            profile.proposal_message(view, block_hash, &changes),
+            profile.proposal_message(view, block_hash, &None),
+            "v4 proposal signing must not depend on validator changes"
+        );
+        assert_eq!(
+            profile.commit_message(view, block_hash, validator_changes_hash(&changes)),
+            profile.commit_message(view, block_hash, B256::ZERO),
+            "v4 commit signing must not depend on validator changes"
+        );
+
+        // Native is unchanged: it still binds the changes.
+        let native = ConsensusSigningProfile::Native;
+        assert_ne!(
+            native.proposal_message(view, block_hash, &changes),
+            native.proposal_message(view, block_hash, &None),
+            "native signing must keep binding validator changes"
         );
     }
 }

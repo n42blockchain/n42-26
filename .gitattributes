@@ -1,0 +1,7 @@
+# Cross-client fixtures are byte-exact contracts shared with gov5: their
+# SHA-256 is pinned on both sides. A Windows checkout with core.autocrlf=true
+# rewrites them to CRLF, which changes those bytes and makes the pinned-SHA
+# tests report drift that does not exist. gov5 pins the same attribute for the
+# same reason; keep the two in step.
+crates/n42-network/testdata/*.json -text
+crates/n42-consensus-service/testdata/*.json -text

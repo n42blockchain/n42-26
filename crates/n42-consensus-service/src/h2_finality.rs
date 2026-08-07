@@ -803,4 +803,19 @@ mod tests {
             })
         );
     }
+
+    /// Byte-exact contract with gov5; see the equivalent check in
+    /// `n42-network::h2_v4` for why the raw bytes are hashed rather than the
+    /// parsed JSON.
+    #[test]
+    fn vendored_finality_fixture_matches_the_gov5_contract() {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(include_bytes!("../testdata/h2_v4_finality_v1.json").as_slice());
+        assert_eq!(
+            hex::encode(hasher.finalize()),
+            "feacd6d0d2dc3babcbe3440384021ee9291b68103baaf7d47cd0ff1c6b703488",
+            "h2_v4_finality_v1.json no longer matches the fixture gov5 pins"
+        );
+    }
 }
