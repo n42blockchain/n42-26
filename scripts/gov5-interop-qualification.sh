@@ -568,7 +568,10 @@ audit_rust_leaders() {
   local rust_miner="${N42_QUAL_RUST_MINER:-0x81d4c1f92ddb837cb46f82280d9b491b101fa582}"
   local leader_stride="${N42_QUAL_RUST_LEADER_STRIDE:-6}"
   local -a ports
-  read -r -a ports <<<"${N42_QUAL_PORTS:-28501 28502 28503 28504 28505 29545}"
+  # The qualification topology has five Gov5 validators plus Rust slots 0
+  # and 6.  Keep the full set as the default so an omitted environment value
+  # cannot silently turn a seven-validator leader audit into a six-node check.
+  read -r -a ports <<<"${N42_QUAL_PORTS:-28501 28502 28503 28504 28505 29545 29546}"
 
   local minimum_head=-1 port head_hex head
   for port in "${ports[@]}"; do
