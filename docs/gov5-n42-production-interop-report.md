@@ -3850,3 +3850,23 @@ The paired canonical N42 lockfile also passes a fresh scan of 1,290
 dependencies with zero vulnerabilities. Its seven allowed warnings include
 `lru 0.12.5` only in the disabled SP1 v4 proof graph; the active N42 and Reth
 runtime graphs resolve the unaffected `lru 0.18.2` and `0.16.4` releases.
+
+The strict twelve-hour milestone passed at `2026-08-07T00:43:33Z` without
+relaxed acceptance or transactions. Its 1,430 closed head samples cover
+43,294 seconds and grow from height 99,925 to 104,617 (4,692 blocks), with a
+31-second maximum sample gap and maximum lag one. The same Rust PID has 145
+resource samples over 43,218 seconds: RSS peaks at 267,104 KiB, threads at
+162, and file descriptors at 90. All 73 Gov-main observations remain exactly
+`c0a146468...`; CommitQC remains present with seven validators and zero
+equivocations. The milestone SHA-256 is
+`f3168b44a757755f287b61e74a16798640505b7098cee54f0ede7ba2f17bfebd`.
+
+The independent immutable twelve-hour audit closes at height 104,618. It
+scans 4,717 parent-continuous blocks and verifies 787 canonical Rust slots at
+all six endpoints, each with an ordered `5+5` commit, exact seven-view stride,
+and matching hash order. All 787 timeout/pacemaker pairs recover at the next
+view; the 6,344 warnings partition exactly, with zero missing-forward-leader,
+unexpected, or critical signals. The audit does not mutate chain state and its
+SHA-256 is `9f9569fab20f210db135188a05b035aaca5cd788e35d91ca07d9b0e15eca7bd0`.
+The strict 24-hour zero-transaction streams remain active; the signed burst
+and Rust restart/rejoin checks stay intentionally gated behind their closure.
