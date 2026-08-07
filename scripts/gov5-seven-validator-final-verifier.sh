@@ -94,7 +94,11 @@ for leader_file in "$rust0_leaders" "$rust6_leaders"; do
 done
 for log in "$runtime"/logs/gov{1,2,3,4,5}.log "$runtime"/logs/rust.log "$runtime"/logs/rust2.log; do
   require_file "$log"
-  ! rg -q ' ERROR |(^|[^[:alpha:]])(panic|fatal|equivocat)' "$log"
+  # Do not use a global case-insensitive `error` match: the consensus transport
+  # records harmless startup de-duplication as `error=Duplicate`.  Structured
+  # ERROR remains strict, while fatal signals are case-insensitive.
+  ! rg -q ' ERROR ' "$log"
+  ! rg -qi '(^|[^[:alpha:]])(panic|fatal|equivocat)' "$log"
 done
 
 jq -nc --arg at "$(date -u +%FT%TZ)" --arg runtime "$runtime" \
