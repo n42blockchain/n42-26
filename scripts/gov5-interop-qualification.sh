@@ -744,7 +744,8 @@ audit_rust_leaders() {
 
 record_rust_resources() {
   local evidence_file="${1:-}"
-  local pid_file="${N42_QUAL_RUST_PID_FILE:-$runtime/pids/rust.pid}"
+  local rust_instance="${N42_QUAL_RUST_INSTANCE:-rust}"
+  local pid_file="${N42_QUAL_RUST_PID_FILE:-$runtime/pids/$rust_instance.pid}"
   require_file "$pid_file"
   local rust_pid
   rust_pid="$(<"$pid_file")"
@@ -761,10 +762,10 @@ record_rust_resources() {
   process_elapsed="$(ps -p "$rust_pid" -o etime= | tr -d ' ')"
   thread_count="$(ps -M -p "$rust_pid" 2>/dev/null | tail -n +2 | wc -l | tr -d ' ')"
   fd_count="$(lsof -p "$rust_pid" 2>/dev/null | tail -n +2 | wc -l | tr -d ' ')"
-  reth_kib="$(du -sk "$runtime/rust/reth" | awk '{print $1}')"
-  consensus_kib="$(du -sk "$runtime/rust/consensus" | awk '{print $1}')"
-  log_bytes="$(stat -f '%z' "$runtime/logs/rust.log")"
-  wal_file="$(find "$runtime/rust/consensus" -maxdepth 1 -type f -name '*wal*' -print |
+  reth_kib="$(du -sk "$runtime/$rust_instance/reth" | awk '{print $1}')"
+  consensus_kib="$(du -sk "$runtime/$rust_instance/consensus" | awk '{print $1}')"
+  log_bytes="$(stat -f '%z' "$runtime/logs/$rust_instance.log")"
+  wal_file="$(find "$runtime/$rust_instance/consensus" -maxdepth 1 -type f -name '*wal*' -print |
     head -n 1)"
   wal_bytes=0
   if test -n "$wal_file"; then
@@ -777,6 +778,7 @@ record_rust_resources() {
   local snapshot
   snapshot="$(jq -nc \
     --arg at "$(date -u +%FT%TZ)" \
+    --arg instance "$rust_instance" \
     --argjson pid "$rust_pid" \
     --arg process_elapsed "$process_elapsed" \
     --argjson head "$head" \
@@ -790,7 +792,7 @@ record_rust_resources() {
     --argjson log_bytes "$log_bytes" \
     --arg wal_file "$wal_file" \
     --argjson wal_bytes "$wal_bytes" '
-    {at:$at,event:"rust_resource_snapshot",pid:$pid,
+    {at:$at,event:"rust_resource_snapshot",instance:$instance,pid:$pid,
      processElapsed:$process_elapsed,head:$head,rssKiB:$rss_kib,vszKiB:$vsz_kib,
      cpuPercent:$cpu_percent,threads:$threads,fileDescriptors:$file_descriptors,
      rethDataKiB:$reth_kib,consensusDataKiB:$consensus_kib,logBytes:$log_bytes,
