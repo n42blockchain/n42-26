@@ -207,3 +207,84 @@ hash），换链重 init 会 fail-closed 拒绝，防止数据目录被误用于
 写测试时踩到一个坑值得记：辅助函数里创建的 channel receiver 若不返回，函数一返回就
 被 drop，channel 关闭，observer 的所有发送静默失败——测试会以看似无关的断言失败。
 现在辅助函数把 receiver 一并交出。
+
+## 九、补上 `imported=0`：observer 完整跟随 gov5 链
+
+第七节的联合测试网达到了 brief 的字面验收（仅凭 envelope 跟随 finality），但
+`imported=0` —— observer 在验证签名，一个区块体都没导入，`local_view` 始终为 0。
+
+### 诊断：不是配置错，是结构上不可能
+
+最初以为是 genesis 参数写错，改 difficulty、改 extraData 都不对。真实原因：
+
+| | genesis hash |
+|---|---|
+| gov5 从 genesis.json 算 | `0x09c4f0bc…dc2ee1` |
+| observer 的 reth 从**同一份** genesis.json 算 | `0xe554f37b…6c9e` |
+
+两个客户端对同一份 JSON 的解释不同（状态树算法、header 字段集都不同），observer
+的 reth genesis 还缺 `withdrawals_root`/`parentBeaconBlockRoot`/`requestsHash`。
+**从 genesis 起跟在结构上不可能**，这正是 brief 提 `n42-qmdb-export` 的原因。
+
+一个曾经误导过我的细节：observer 之所以报 genesis 的 profile 错误，不是因为
+bootstrap 要求它合规，而是因为**没有 bootstrap 时它会一路祖先回溯到 genesis** 再去
+fetch。`load_gov5_genesis_execution_bootstrap` 对 block 0 只检查"parent 为零、
+body/receipts 为空、state_root 等于 alloc 算出的 QMDB root"，**不做 header profile
+检查**。有了检查点就不会回溯到那里。
+
+### 两份引导素材
+
+1. **QMDB 检查点**：gov5 自带 `cmd/n42-qmdb-export`，导出 block 21260、
+   root `0x1738aeb5…`；
+2. **genesis range**：`FinalizedRange` 格式**只在 n42 侧定义**
+   （`crates/n42-network/src/finalized_range.rs`），gov5 没有编码器。为此写了
+   `scripts/gov5-export-genesis-range.go`（`//go:build ignore`，须拷进 gov5
+   checkout 运行）。
+
+   关键设计：**用 gov5 自己的 RLP 实现**读 block 0，而不是手工复现编码。验证方会
+   重算 `keccak(header)` 与公布的 block hash 比对，手写编码错一个可选字段就前功尽
+   弃，且失败发生在很后面、极难定位。工具在写文件前先自检哈希，对不上直接退出。
+
+三方 root 一致可作为链路正确的交叉验证：genesis range 的 `state_root`、QMDB 快照
+root、observer 运行时算出的 `gov5-qmdb` state root 全是 `0x1738aeb5…`。
+
+### 结果
+
+| 指标 | 引导前 | 引导后 |
+|------|--------|--------|
+| `imported` | 0 | **25,050** |
+| `local_view` | 0（从未推进） | **25,051** |
+| `stage` | 永远 `catch-up` | **`tracking`** |
+| 高度 vs gov5 四节点 | 不可比 | **完全一致** |
+| block 5000 hash / state root | — | **与 gov5 逐字节相同** |
+
+追赶 21,000 块用约 6 分钟（55–77 块/秒，是 gov5 出块速率的 100 倍以上），随后转入
+live tracking 并**连续稳定 2 小时**（7,180 秒），期间 3,577 个 H2-v4 finality proof
+全部通过、`h2_shadow_rejected` 保持全零。
+
+至此 observer 不再只是"验证得动"，而是真正与 gov5 跑在同一条链上。
+
+### 复现步骤
+
+```bash
+# 1. QMDB 检查点（gov5 仓库内）
+go run ./cmd/n42-qmdb-export --db <gov5-datadir>/chaindata \
+    --out checkpoint.n42qmdb --map.gb 8
+
+# 2. genesis range（把本仓库的工具拷过去再跑）
+cp scripts/gov5-export-genesis-range.go ../n42-gov5/
+cd ../n42-gov5 && go run ./gov5-export-genesis-range.go \
+    -db <gov5-datadir>/chaindata -out genesis-range.n42frng
+
+# 3. observer（关键环境变量）
+N42_OBSERVER_MODE=1 N42_GOV5_HEADER_PROFILE=1 N42_GOV5_QMDB_EXECUTION=1 \
+N42_QMDB_BOOTSTRAP=<checkpoint> N42_QMDB_BOOTSTRAP_BLOCK=<n> \
+N42_QMDB_BOOTSTRAP_BLOCK_HASH=<hash> N42_QMDB_BOOTSTRAP_ROOT=<root> \
+N42_GOV5_GENESIS_BOOTSTRAP=<genesis-range> \
+N42_INTEROP_GENESIS_HASH=<gov5 block 0 hash> \
+N42_CONSENSUS_CONFIG=<validators.json> N42_TRUSTED_PEERS=<multiaddrs> \
+  n42-node node --chain <gov5 genesis.json> --datadir <dir> ...
+```
+
+Windows 提醒：带 multiaddr 的进程一律用 PowerShell 启动，Git Bash 的 MSYS 路径转换
+会把 `/ip4/...` 改写成 `C:/Program Files/...`（第七节第 3 点）。
