@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Wait for the independently started long monitors, then perform the final
+# read-only seven-validator audit.  A missing upstream completion record is a
+# hard failure: it means Gov5 main moved or the guardian did not finish.
+
+runtime="${N42_FINAL_RUNTIME:?runtime is required}"
+gov_repo="${N42_FINAL_GOV_REPO:?Gov5 repository is required}"
+expected_gov_main="${N42_FINAL_EXPECTED_GOV_MAIN:?expected Gov5 main SHA is required}"
+expected_gov_binary="${N42_FINAL_GOV_BINARY_SHA:?Gov5 binary SHA-256 is required}"
+expected_rust_binary="${N42_FINAL_RUST_BINARY_SHA:?Rust binary SHA-256 is required}"
+head_monitor_pid="${N42_FINAL_HEAD_MONITOR_PID:?head monitor PID is required}"
+upstream_monitor_pid="${N42_FINAL_UPSTREAM_MONITOR_PID:?upstream monitor PID is required}"
+rust0_monitor_pid="${N42_FINAL_RUST0_MONITOR_PID:?Rust0 monitor PID is required}"
+rust6_monitor_pid="${N42_FINAL_RUST6_MONITOR_PID:?Rust6 monitor PID is required}"
+qualification="${N42_FINAL_QUALIFICATION_SCRIPT:-$runtime/artifacts/scripts/gov5-interop-qualification.sh}"
+verifier="${N42_FINAL_VERIFIER:?seven-validator final verifier is required}"
+failure="$runtime/evidence/runtime42-seven-validator-finalizer-failure.json"
+output="$runtime/evidence/runtime42-seven-validator-final-verification.json"
+ports='28501 28502 28503 28504 28505 29545 29546'
+
+fail() {
+  jq -nc --arg at "$(date -u +%FT%TZ)" --arg reason "$1" \
+    '{at:$at,event:"gov5_seven_validator_finalizer",status:"FAIL",reason:$reason}' >"$failure"
+  exit 1
+}
+alive() { kill -0 "$1" 2>/dev/null; }
+
+test ! -e "$output"
+test ! -e "$failure"
+for script in "$qualification" "$verifier"; do test -x "$script" || fail "missing executable: $script"; done
+
+while alive "$head_monitor_pid" || alive "$upstream_monitor_pid" || \
+  alive "$rust0_monitor_pid" || alive "$rust6_monitor_pid"; do
+  # The upstream guardian must outlive the window.  If it stops without its
+  # PASS artifact, do not wait for the other monitors or use their evidence.
+  if ! alive "$upstream_monitor_pid" && \
+    ! test -f "$runtime/evidence/runtime42-gov5-upstream-24h-complete.json"; then
+    fail 'Gov5 upstream guardian exited without PASS completion'
+  fi
+  sleep 60
+done
+
+test -f "$runtime/evidence/runtime42-gov5-upstream-24h-complete.json" || \
+  fail 'Gov5 upstream guardian completed without PASS artifact'
+
+# Give all endpoints a small finalized margin, then align 71-block ranges to
+# each Rust validator's known slot phase (0: 99958; 6: 99950).
+head_hex="$(curl -fsS --max-time 10 -H 'content-type: application/json' \
+  --data '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}' \
+  http://127.0.0.1:29545 | jq -er '.result')"
+head=$((head_hex))
+target=$((head - 80))
+rust0_start=$((99958 + ((target - 99958) / 7) * 7))
+rust6_start=$((99950 + ((target - 99950) / 7) * 7))
+rust0_end=$((rust0_start + 70))
+rust6_end=$((rust6_start + 70))
+test "$rust0_end" -lt "$head" || fail 'insufficient final head margin for Rust0 audit'
+test "$rust6_end" -lt "$head" || fail 'insufficient final head margin for Rust6 audit'
+
+env N42_QUAL_RUNTIME="$runtime" N42_QUAL_PORTS="$ports" \
+  N42_QUAL_RUST_PORT=29545 N42_QUAL_RUST_MINER=0x81d4c1f92ddb837cb46f82280d9b491b101fa582 \
+  N42_QUAL_RUST_LEADER_STRIDE=7 "$qualification" audit-rust-leaders \
+  "$rust0_start" "$rust0_end" "$runtime/evidence/runtime42-rust0-final-leader-range.json" >/dev/null
+env N42_QUAL_RUNTIME="$runtime" N42_QUAL_PORTS="$ports" \
+  N42_QUAL_RUST_PORT=29546 N42_QUAL_RUST_MINER=0x853b2026deebc83fb79ac7d0c48efea595c22578 \
+  N42_QUAL_RUST_LEADER_STRIDE=7 "$qualification" audit-rust-leaders \
+  "$rust6_start" "$rust6_end" "$runtime/evidence/runtime42-rust6-final-leader-range.json" >/dev/null
+
+env N42_FINAL_RUNTIME="$runtime" N42_FINAL_GOV_REPO="$gov_repo" \
+  N42_FINAL_EXPECTED_GOV_MAIN="$expected_gov_main" \
+  N42_FINAL_GOV_BINARY_SHA="$expected_gov_binary" N42_FINAL_RUST_BINARY_SHA="$expected_rust_binary" \
+  N42_FINAL_QUALIFICATION_SCRIPT="$qualification" N42_FINAL_VERIFIER="$verifier" \
+  N42_FINAL_RUST0_LEADERS="$runtime/evidence/runtime42-rust0-final-leader-range.json" \
+  N42_FINAL_RUST6_LEADERS="$runtime/evidence/runtime42-rust6-final-leader-range.json" \
+  N42_FINAL_OUTPUT="$output" "$verifier"
