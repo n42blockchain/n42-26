@@ -20,7 +20,7 @@ use crate::gossipsub::topics::{
     blob_sidecar_topic, block_announce_topic, consensus_topic, gov5_block_topic, gov5_h2_topic,
     h2_v4_topic, mempool_topic, verification_receipts_topic,
 };
-use crate::gov5_block::{Gov5BlockError, decode_gov5_block_rlp};
+use crate::gov5_block::{Gov5BlockError, attributable_hash, decode_gov5_block_rlp};
 use crate::gov5_rpc::{
     GOV5_BLOCK_BY_HASH_PROTOCOL, Gov5BlockByHashRequest, Gov5BlockByHashResponse,
     Gov5BlockPushRequest, Gov5BlockPushResponse, Gov5HotstuffDirectRequest,
@@ -2287,7 +2287,15 @@ impl NetworkService {
                         return;
                     }
                     Err(error) => {
-                        let permanent = error.is_permanent();
+                        // A rejection only rules out the requested hash if the
+                        // bytes actually belong to it. A peer that does not
+                        // have the block answers with an empty body, which
+                        // fails to decode but says nothing about the block —
+                        // and the serve cache is a 1024-entry FIFO, so an
+                        // honest, fully-synced peer returns empty for anything
+                        // older than that.
+                        let permanent = error.is_permanent()
+                            && attributable_hash(&response.rlp) == Some(requested_hash);
                         metrics::counter!("n42_gov5_block_fetch_failed_total").increment(1);
                         if !self
                             .pending_gov5_block_requests
