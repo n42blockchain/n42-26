@@ -17,6 +17,7 @@ n42-mobile.workspace = true
 n42-network.workspace = true
 n42-parallel-evm.workspace = true
 n42-jmt.workspace = true
+n42-twig-core.workspace = true
 n42-zkproof.workspace = true
 
 reth-chainspec.workspace = true
@@ -41,6 +42,7 @@ reth-tasks.workspace = true
 reth-tracing.workspace = true
 
 alloy-consensus.workspace = true
+alloy-genesis.workspace = true
 alloy-eips.workspace = true
 alloy-primitives.workspace = true
 alloy-rlp.workspace = true
@@ -51,15 +53,19 @@ reth-basic-payload-builder.workspace = true
 reth-payload-builder-primitives.workspace = true
 reth-payload-primitives.workspace = true
 reth-engine-primitives.workspace = true
+reth-engine-tree.workspace = true
 reth-chain-state.workspace = true
+reth-storage-overlay.workspace = true
 reth-storage-api.workspace = true
 reth-trie-common.workspace = true
+reth-trie.workspace = true
 reth-rpc-builder.workspace = true
 
 arc-swap.workspace = true
 jsonrpsee.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tower.workspace = true
 bincode.workspace = true
 
 revm.workspace = true
@@ -79,5 +85,6 @@ bitvec.workspace = true
 libp2p.workspace = true
 revm.workspace = true
 reth-testing-utils.workspace = true
+# Keep key types identical to the Reth 2.4.1 / Alloy dependency graph.
 secp256k1 = { version = "0.30", features = ["global-context"] }
 tempfile.workspace = true

@@ -1,8 +1,11 @@
 use crate::components::{N42ConsensusBuilder, N42ExecutorBuilder};
 use crate::consensus_state::SharedConsensusState;
+use crate::engine_validator::N42EngineValidatorBuilder;
 use crate::payload::N42PayloadBuilder;
 use crate::pool::N42PoolBuilder;
-use n42_consensus::ValidatorSetResolver;
+use crate::qmdb_state_root::{Gov5QmdbStateRootStore, N42EngineTreeValidatorBuilder};
+use crate::rpc_compat::Gov5RpcCompatLayer;
+use n42_consensus::{N42HeaderProfile, ValidatorSetResolver};
 use reth_chainspec::ChainSpec;
 use reth_ethereum_engine_primitives::EthEngineTypes;
 use reth_ethereum_primitives::EthPrimitives;
@@ -10,10 +13,9 @@ use reth_node_builder::{
     Node, NodeAdapter,
     components::{BasicPayloadServiceBuilder, ComponentsBuilder},
     node::{FullNodeTypes, NodeTypes},
+    rpc::{BasicEngineApiBuilder, Identity, RpcAddOns},
 };
-use reth_node_ethereum::node::{
-    EthereumAddOns, EthereumEngineValidatorBuilder, EthereumEthApiBuilder, EthereumNetworkBuilder,
-};
+use reth_node_ethereum::node::{EthereumAddOns, EthereumEthApiBuilder, EthereumNetworkBuilder};
 use reth_provider::EthStorage;
 use std::sync::Arc;
 
@@ -25,6 +27,8 @@ use std::sync::Arc;
 pub struct N42Node {
     pub consensus_state: Arc<SharedConsensusState>,
     pub validator_set_resolver: Option<ValidatorSetResolver>,
+    pub header_profile: N42HeaderProfile,
+    pub qmdb_state_root_store: Option<Arc<Gov5QmdbStateRootStore>>,
 }
 
 impl std::fmt::Debug for N42Node {
@@ -33,6 +37,11 @@ impl std::fmt::Debug for N42Node {
             .field(
                 "has_validator_set_resolver",
                 &self.validator_set_resolver.is_some(),
+            )
+            .field("header_profile", &self.header_profile)
+            .field(
+                "has_qmdb_state_root_store",
+                &self.qmdb_state_root_store.is_some(),
             )
             .finish()
     }
@@ -43,6 +52,8 @@ impl N42Node {
         Self {
             consensus_state,
             validator_set_resolver: None,
+            header_profile: N42HeaderProfile::Ethereum,
+            qmdb_state_root_store: None,
         }
     }
 
@@ -51,6 +62,18 @@ impl N42Node {
         validator_set_resolver: ValidatorSetResolver,
     ) -> Self {
         self.validator_set_resolver = Some(validator_set_resolver);
+        self
+    }
+
+    pub const fn with_header_profile(mut self, header_profile: N42HeaderProfile) -> Self {
+        self.header_profile = header_profile;
+        self
+    }
+
+    /// Install an authenticated, bounded QMDB execution base. Startup wiring must keep this
+    /// observer-only until continuous cross-client execution gates pass.
+    pub fn with_gov5_qmdb_state_root_store(mut self, store: Arc<Gov5QmdbStateRootStore>) -> Self {
+        self.qmdb_state_root_store = Some(store);
         self
     }
 }
@@ -75,8 +98,14 @@ where
         N42ConsensusBuilder,
     >;
 
-    type AddOns =
-        EthereumAddOns<NodeAdapter<N>, EthereumEthApiBuilder, EthereumEngineValidatorBuilder>;
+    type AddOns = EthereumAddOns<
+        NodeAdapter<N>,
+        EthereumEthApiBuilder,
+        N42EngineValidatorBuilder,
+        BasicEngineApiBuilder<N42EngineValidatorBuilder>,
+        N42EngineTreeValidatorBuilder,
+        Gov5RpcCompatLayer,
+    >;
 
     fn components_builder(&self) -> Self::ComponentsBuilder {
         ComponentsBuilder::default()
@@ -93,12 +122,22 @@ where
                 if let Some(resolver) = self.validator_set_resolver.clone() {
                     builder = builder.with_validator_set_resolver(resolver);
                 }
-                builder
+                builder.with_header_profile(self.header_profile)
             })
     }
 
     fn add_ons(&self) -> Self::AddOns {
-        EthereumAddOns::default()
+        let validator = N42EngineValidatorBuilder::new(self.header_profile);
+        let rpc_middleware =
+            Gov5RpcCompatLayer::new(self.header_profile == N42HeaderProfile::Gov5H2);
+        EthereumAddOns::new(RpcAddOns::new(
+            EthereumEthApiBuilder::default(),
+            validator,
+            BasicEngineApiBuilder::default(),
+            N42EngineTreeValidatorBuilder::new(validator, self.qmdb_state_root_store.clone()),
+            rpc_middleware,
+            Identity::new(),
+        ))
     }
 }
 

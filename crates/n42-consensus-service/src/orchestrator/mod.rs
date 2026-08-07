@@ -13,12 +13,13 @@ use crate::exec_cache::ExecutionOutputCache;
 use crate::net_port::ConsensusNetwork;
 use crate::sinks::{StakingSink, StateSink, WithdrawalSource, ZkSink};
 use alloy_primitives::{Address, B256};
+use alloy_rpc_types_engine::{ForkchoiceState, PayloadStatusEnum};
 use metrics::{counter, gauge, histogram};
 use n42_consensus::{
     AuthenticatedConsensusMessage, ConsensusEngine, EngineOutput, FUTURE_VIEW_WINDOW, ValidatorSet,
 };
-use n42_network::{NetworkEvent, PeerId, SyncPayload};
-use n42_primitives::QuorumCertificate;
+use n42_network::{NetworkError, NetworkEvent, PeerId, SyncPayload};
+use n42_primitives::{BlsSecretKey, ConsensusMessage, QuorumCertificate};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -39,6 +40,31 @@ const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
 /// TX forwarding batches are latency-bounded by a 50ms flush timer, so we can
 /// use a larger batch target to reduce cross-task and cross-peer overhead.
 const TX_FORWARD_BATCH_TARGET: usize = 512;
+// Gov5 serves block-by-hash from its local database. A healthy local validator
+// responds well inside this deadline; waiting for the ten-second transport
+// timeout makes a long reverse ancestry effectively serial at one block per
+// timeout whenever a command is suppressed or a swarm terminal event is lost.
+const H2_V4_FETCH_RETRY_TIMEOUT: Duration = Duration::from_secs(2);
+const H2_V4_FETCH_RETRY_ROUND: Duration = Duration::from_secs(30);
+// A body can be delivered and committed before duplicate H2 proposals/QCs
+// already queued on the consensus lane are drained. Keep the same short
+// fulfillment tombstone as the network service so those duplicates cannot
+// re-arm an orchestrator-local retry timer for a request the network suppresses.
+const H2_V4_FETCH_FULFILLED_RETENTION: Duration = Duration::from_secs(30);
+const MAX_H2_V4_FETCH_FULFILLED: usize = 4096;
+const DEFAULT_H2_V4_CATCHUP_BUFFER_BLOCKS: usize = 2048;
+const MAX_H2_V4_CATCHUP_BUFFER_BLOCKS: usize = 131_072;
+
+fn h2_v4_catchup_buffer_blocks() -> usize {
+    std::env::var("N42_GOV5_CATCHUP_BUFFER_BLOCKS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_H2_V4_CATCHUP_BUFFER_BLOCKS)
+        .clamp(
+            DEFAULT_H2_V4_CATCHUP_BUFFER_BLOCKS,
+            MAX_H2_V4_CATCHUP_BUFFER_BLOCKS,
+        )
+}
 
 /// Maximum number of already-queued R1/R2 votes verified in one randomized
 /// BLS multi-pairing. Draining is non-blocking, so this adds no timer latency.
@@ -324,6 +350,52 @@ struct RecentBlockData {
 /// pacemaker timeouts, and BlockReady signals.
 pub struct ConsensusService {
     engine: ConsensusEngine,
+    /// Enables bidirectional H2-v4 consensus conversion. `None` preserves the
+    /// native network and observer behavior exactly.
+    h2_v4_identity: Option<n42_network::h2_v4::H2V4ChainIdentity>,
+    /// H2-authenticated block hash -> consensus view. Gov5 block gossip is not
+    /// executed until one of these bindings exists.
+    h2_v4_block_views: BTreeMap<B256, u64>,
+    /// Insertion order for the bounded binding map above. `BTreeMap::pop_first`
+    /// is hash order, not age order: once the map reached capacity, a live
+    /// low-valued block hash could otherwise evict itself immediately and
+    /// strand its already-received body in the unbound cache forever.
+    h2_v4_block_view_order: VecDeque<B256>,
+    /// Header-derived execution height for authenticated/interoperable blocks.
+    /// This lets asynchronous `Valid` completions advance the exact height
+    /// floor without confusing a newer consensus count for executed state.
+    h2_v4_block_numbers: BTreeMap<B256, u64>,
+    /// Structurally valid gov5 bodies that arrived before their H2 binding.
+    h2_v4_unbound_blocks: BTreeMap<B256, (PeerId, Vec<u8>)>,
+    /// Authenticated ancestry collected newest-to-oldest during far catch-up.
+    /// It is released to Engine API only in ascending block order.
+    h2_v4_catchup_blocks: BTreeMap<u64, (PeerId, Vec<u8>, u64)>,
+    /// Explicitly bounded block count for authenticated reverse-ancestry
+    /// catch-up. Production keeps the conservative default; qualification can
+    /// opt into a larger, hard-capped window for a known retained chain.
+    h2_v4_catchup_buffer_blocks: usize,
+    /// Avoids rescanning the bounded hash-indexed execution metadata while a
+    /// reverse catch-up holds the same durable head for many thousands of
+    /// incoming ancestors.
+    h2_v4_last_pruned_head_block_number: Option<u64>,
+    h2_v4_catchup_active: bool,
+    /// Peers that failed to serve an authenticated block hash during the
+    /// current bounded retry round. A mixed Rust/Gov set may gossip a child
+    /// from a Rust validator whose execution head is also behind; retrying
+    /// that same peer forever prevents either Rust node from reaching a Gov
+    /// peer that already has the missing parent.
+    h2_v4_fetch_failed_peers: BTreeMap<B256, (Instant, HashSet<PeerId>)>,
+    /// Accepted Gov5 block-by-hash commands awaiting a body. The network layer
+    /// has its own bounded request table, but capacity/cooldown suppression is
+    /// intentionally non-blocking; this orchestrator-owned deadline guarantees
+    /// that a consensus-authenticated body is retried even if no failure event
+    /// can be emitted for a command that was suppressed before transmission.
+    h2_v4_fetch_requested_at: HashMap<B256, (Instant, PeerId)>,
+    /// Recently delivered block hashes. This mirrors the network-layer
+    /// fulfillment tombstones because request commands are fire-and-forget:
+    /// a network-side suppression cannot otherwise stop this orchestrator from
+    /// recording a nonexistent request and retrying it two seconds later.
+    h2_v4_fetch_fulfilled_at: HashMap<B256, Instant>,
     /// Network port (Caplin sentinel-client seam). One in-process adapter today
     /// (`NetworkHandle`); the trait object lets the orchestrator move into a
     /// service crate without depending on `n42-network` / libp2p internals.
@@ -342,6 +414,10 @@ pub struct ConsensusService {
     /// distinct from `committed_block_count`: HotStuff agreement may advance before
     /// reth has accepted the corresponding payload.
     head_block_hash: B256,
+    /// Canonical execution height paired with `head_block_hash`. Historical
+    /// H2 bodies released from the unbound cache at or below this floor are
+    /// already executed and must not consume the bounded catch-up suffix.
+    head_block_number: u64,
     /// Highest committed/sync view whose block reth confirmed as `Valid`.
     /// Guards async finalize/import completions from regressing the executed head.
     execution_validated_head_view: u64,
@@ -419,10 +495,6 @@ pub struct ConsensusService {
     /// state. Catch-up fan-out keeps every successful recipient here until one
     /// returns useful data or all recipients finish.
     sync_requested_peers: HashSet<PeerId>,
-    /// Round-robin cursor for recovery requests. The execution-validated view
-    /// can remain pinned while consensus advances, so keying peer choice only
-    /// on that view would retry the same possibly incomplete peer forever.
-    sync_peer_cursor: usize,
     state_file: Option<PathBuf>,
     validator_set_for_sync: Option<ValidatorSet>,
     /// View at which a validator_changes block was applied during sync.
@@ -494,6 +566,10 @@ pub struct ConsensusService {
     epoch_schedule: Option<EpochSchedule>,
     /// Buffer for batching tx forwards to the current leader.
     tx_forward_buffer: Vec<Vec<u8>>,
+    /// View in which a missing remote tx-forward leader was already reported.
+    /// A deliberately absent validator can hold a view for the full pacemaker
+    /// timeout, so the 50 ms flush tick must not emit the same warning repeatedly.
+    tx_forward_missing_leader_warned_view: Option<u64>,
     /// Last R1/R2 vote sent in the current view. If direct delivery was lost and
     /// the view has not advanced, retry it periodically to the collector.
     pending_vote_resend: Option<PendingVoteResend>,
@@ -509,9 +585,9 @@ pub struct ConsensusService {
     timeout_view_diags: BTreeMap<u64, TimeoutViewDiag>,
     /// Last committed parent for which commit->build_start has already been recorded.
     commit_to_build_recorded_parent: Option<B256>,
-    /// Guards follower eager import: tracks the last block number sent to reth
-    /// via new_payload. Prevents multiple eager imports for the same block number
-    /// with different hashes, which triggers reth pipeline sync and chain stalls.
+    /// Highest block number for which eager import received a deterministic
+    /// `new_payload(Valid)` verdict. Non-Valid attempts never advance it, so an
+    /// out-of-order child cannot suppress the missing parents needed for catch-up.
     eager_import_block_guard: Arc<std::sync::atomic::AtomicU64>,
     /// Fast propose mode: skip slot boundary alignment, build immediately after
     /// ViewChanged/BlockCommitted. Consensus voting naturally paces block production.
@@ -547,6 +623,685 @@ pub struct ConsensusService {
 }
 
 impl ConsensusService {
+    fn h2_v4_fetch_fulfilled_recently(&mut self, block_hash: B256, now: Instant) -> bool {
+        if self
+            .h2_v4_fetch_fulfilled_at
+            .get(&block_hash)
+            .is_some_and(|fulfilled_at| {
+                now.saturating_duration_since(*fulfilled_at) < H2_V4_FETCH_FULFILLED_RETENTION
+            })
+        {
+            return true;
+        }
+        self.h2_v4_fetch_fulfilled_at.remove(&block_hash);
+        false
+    }
+
+    fn remember_h2_v4_fetch_fulfilled(&mut self, block_hash: B256, now: Instant) {
+        if self.h2_v4_fetch_fulfilled_at.len() >= MAX_H2_V4_FETCH_FULFILLED {
+            self.h2_v4_fetch_fulfilled_at.retain(|_, fulfilled_at| {
+                now.saturating_duration_since(*fulfilled_at) < H2_V4_FETCH_FULFILLED_RETENTION
+            });
+        }
+        if self.h2_v4_fetch_fulfilled_at.len() >= MAX_H2_V4_FETCH_FULFILLED
+            && let Some(oldest) = self
+                .h2_v4_fetch_fulfilled_at
+                .iter()
+                .min_by_key(|(_, fulfilled_at)| *fulfilled_at)
+                .map(|(hash, _)| *hash)
+        {
+            self.h2_v4_fetch_fulfilled_at.remove(&oldest);
+        }
+        self.h2_v4_fetch_fulfilled_at.insert(block_hash, now);
+    }
+
+    fn request_h2_v4_gov5_block(&mut self, peer: PeerId, block_hash: B256) {
+        let now = Instant::now();
+        if block_hash == B256::ZERO || self.h2_v4_fetch_fulfilled_recently(block_hash, now) {
+            return;
+        }
+        if block_hash == self.head_block_hash
+            || self.pending_block_data.contains_key(&block_hash)
+            || self.h2_v4_unbound_blocks.contains_key(&block_hash)
+            || self
+                .h2_v4_block_numbers
+                .get(&block_hash)
+                .is_some_and(|height| self.h2_v4_catchup_blocks.contains_key(height))
+            || self.h2_v4_fetch_requested_at.contains_key(&block_hash)
+        {
+            return;
+        }
+        match self.network.request_gov5_block_by_hash(peer, block_hash) {
+            Ok(()) => {
+                self.h2_v4_fetch_requested_at
+                    .insert(block_hash, (Instant::now(), peer));
+                while self.h2_v4_fetch_requested_at.len() > 2048 {
+                    let Some(oldest) = self
+                        .h2_v4_fetch_requested_at
+                        .iter()
+                        .min_by_key(|(_, (requested_at, _))| *requested_at)
+                        .map(|(hash, _)| *hash)
+                    else {
+                        break;
+                    };
+                    self.h2_v4_fetch_requested_at.remove(&oldest);
+                }
+                debug!(target: "n42::interop::h2v4", %peer, %block_hash, "tracking authenticated Gov5 block fetch");
+            }
+            Err(error) => {
+                warn!(target: "n42::interop::h2v4", %peer, %block_hash, %error, "could not queue authenticated Gov5 block fetch");
+            }
+        }
+    }
+
+    fn retry_expired_h2_v4_fetches(&mut self) {
+        let now = Instant::now();
+        let expired = self
+            .h2_v4_fetch_requested_at
+            .iter()
+            .filter_map(|(hash, (requested_at, peer))| {
+                (now.duration_since(*requested_at) >= H2_V4_FETCH_RETRY_TIMEOUT)
+                    .then_some((*hash, *peer))
+            })
+            .collect::<Vec<_>>();
+        for (block_hash, previous_peer) in expired {
+            self.h2_v4_fetch_requested_at.remove(&block_hash);
+            if self.h2_v4_fetch_fulfilled_recently(block_hash, now)
+                || block_hash == self.head_block_hash
+                || self.pending_block_data.contains_key(&block_hash)
+                || self.h2_v4_unbound_blocks.contains_key(&block_hash)
+            {
+                continue;
+            }
+            let attempted = {
+                let entry = self
+                    .h2_v4_fetch_failed_peers
+                    .entry(block_hash)
+                    .or_insert_with(|| (now, HashSet::new()));
+                if now.duration_since(entry.0) >= H2_V4_FETCH_RETRY_ROUND {
+                    entry.0 = now;
+                    entry.1.clear();
+                }
+                entry.1.insert(previous_peer);
+                entry.1.clone()
+            };
+            while self.h2_v4_fetch_failed_peers.len() > 2048 {
+                self.h2_v4_fetch_failed_peers.pop_first();
+            }
+            let mut retry_peer = self
+                .connected_peers
+                .iter()
+                .copied()
+                .find(|peer| !attempted.contains(peer));
+            if retry_peer.is_none() {
+                // Every connected peer has had one bounded attempt. Start a
+                // fresh round instead of leaving this ancestry hash stranded.
+                if let Some(entry) = self.h2_v4_fetch_failed_peers.get_mut(&block_hash) {
+                    entry.0 = now;
+                    entry.1.clear();
+                }
+                retry_peer = self.connected_peers.iter().copied().next();
+            }
+            if let Some(retry_peer) = retry_peer {
+                counter!("n42_h2_v4_block_fetch_deadline_retries_total").increment(1);
+                warn!(
+                    target: "n42::interop::h2v4",
+                    %block_hash,
+                    %previous_peer,
+                    %retry_peer,
+                    attempted = attempted.len(),
+                    "authenticated Gov5 block fetch deadline expired; retrying"
+                );
+                self.request_h2_v4_gov5_block(retry_peer, block_hash);
+            } else {
+                self.h2_v4_fetch_requested_at
+                    .insert(block_hash, (now, previous_peer));
+            }
+        }
+    }
+
+    async fn retire_h2_v4_fetch_satisfied_elsewhere(&mut self, block_hash: B256) {
+        self.h2_v4_fetch_requested_at.remove(&block_hash);
+        self.h2_v4_fetch_failed_peers.remove(&block_hash);
+        self.remember_h2_v4_fetch_fulfilled(block_hash, Instant::now());
+        // The observer and participant orchestrators share one network
+        // service, but intentionally keep independent ancestry trackers. A
+        // body delivered to this orchestrator can therefore satisfy a fetch
+        // started by the other one. Always retire the network-layer hash;
+        // conditioning this command on the local tracker leaves that shared
+        // request alive until its transport deadline.
+        if let Err(error) = self
+            .network
+            .cancel_gov5_block_fetch_reliable(block_hash)
+            .await
+        {
+            warn!(
+                target: "n42::interop::h2v4",
+                %block_hash,
+                %error,
+                "could not retire Gov5 fetch satisfied by another delivery path"
+            );
+        }
+    }
+
+    fn remember_h2_v4_block_view(&mut self, block_hash: B256, view: u64) {
+        const MAX_H2_V4_BLOCK_BINDINGS: usize = 2048;
+        if !self.h2_v4_block_views.contains_key(&block_hash) {
+            self.h2_v4_block_view_order.push_back(block_hash);
+        }
+        self.h2_v4_block_views.insert(block_hash, view);
+        while self.h2_v4_block_views.len() > MAX_H2_V4_BLOCK_BINDINGS {
+            let Some(oldest) = self.h2_v4_block_view_order.pop_front() else {
+                break;
+            };
+            self.h2_v4_block_views.remove(&oldest);
+        }
+    }
+
+    fn prune_executed_h2_v4_catchup_history(&mut self) {
+        while self
+            .h2_v4_catchup_blocks
+            .first_key_value()
+            .is_some_and(|(height, _)| *height <= self.head_block_number)
+        {
+            self.h2_v4_catchup_blocks.pop_first();
+        }
+        if self.h2_v4_last_pruned_head_block_number != Some(self.head_block_number) {
+            self.h2_v4_block_numbers
+                .retain(|_, height| *height > self.head_block_number);
+            self.h2_v4_last_pruned_head_block_number = Some(self.head_block_number);
+        }
+        if self.h2_v4_catchup_blocks.is_empty() {
+            self.h2_v4_catchup_active = false;
+        }
+    }
+
+    fn stage_h2_v4_catchup_block(
+        &mut self,
+        source: PeerId,
+        rlp: Vec<u8>,
+        height: u64,
+        authenticated_view: u64,
+        activate: bool,
+    ) -> bool {
+        self.prune_executed_h2_v4_catchup_history();
+        if self.h2_v4_catchup_blocks.len() >= self.h2_v4_catchup_buffer_blocks
+            && !self.h2_v4_catchup_blocks.contains_key(&height)
+        {
+            error!(
+                target: "n42::interop::h2v4",
+                limit = self.h2_v4_catchup_buffer_blocks,
+                height,
+                "authenticated Gov5 catch-up exceeds the bounded buffer"
+            );
+            return false;
+        }
+        self.h2_v4_catchup_blocks
+            .insert(height, (source, rlp, authenticated_view));
+        if activate {
+            self.h2_v4_catchup_active = true;
+        }
+        let buffered = self.h2_v4_catchup_blocks.len();
+        if buffered == 1 || buffered.is_multiple_of(1024) {
+            info!(
+                target: "n42::interop::h2v4",
+                buffered,
+                oldest_height = self.h2_v4_catchup_blocks.first_key_value().map(|(height, _)| *height),
+                newest_height = self.h2_v4_catchup_blocks.last_key_value().map(|(height, _)| *height),
+                execution_head_number = self.head_block_number,
+                "authenticated Gov5 reverse ancestry progress"
+            );
+        }
+        true
+    }
+
+    fn ready_h2_v4_bound_blocks_in_height_order(&self) -> Vec<B256> {
+        let mut ready = self
+            .h2_v4_unbound_blocks
+            .iter()
+            .filter(|(hash, _)| self.h2_v4_block_views.contains_key(*hash))
+            .map(|(hash, (_, rlp))| {
+                let height = n42_network::decode_gov5_block_rlp(rlp)
+                    .map(|block| block.header.number)
+                    // Keep malformed entries visible to the canonical handler,
+                    // which records the rejection. They sort behind valid bodies.
+                    .unwrap_or(u64::MAX);
+                (height, *hash)
+            })
+            .collect::<Vec<_>>();
+        ready.sort_unstable();
+        ready.into_iter().map(|(_, hash)| hash).collect()
+    }
+
+    fn ready_h2_v4_catchup_heights(&self) -> Option<Vec<u64>> {
+        if !self.h2_v4_catchup_active {
+            return None;
+        }
+        // During a far reverse walk, the suffix is deliberately contiguous at
+        // its newest end but has not reached the durable execution head yet.
+        // This readiness function is called after every lifecycle event; a
+        // full newest-to-oldest scan here makes catch-up quadratic. The oldest
+        // buffered body can close the suffix only when it is the exact direct
+        // successor of the durable head. Keep the common incomplete check O(1)
+        // and perform the full hash-chain validation only once that boundary
+        // is present.
+        let expected_first_height = self.head_block_number.checked_add(1)?;
+        let (&first_height, (_, oldest_rlp, _)) = self.h2_v4_catchup_blocks.first_key_value()?;
+        if first_height != expected_first_height {
+            return None;
+        }
+        let oldest = n42_network::decode_gov5_block_rlp(oldest_rlp).ok()?;
+        if oldest.header.parent_hash != self.head_block_hash {
+            return None;
+        }
+        // The unbound-message cache can release old, already-executed blocks
+        // after a QC jump authenticates their hashes. Starting at the newest
+        // authenticated block, select only the exact parent-hash chain that
+        // terminates at the durable execution head.
+        let (&last_height, (_, newest_rlp, _)) = self.h2_v4_catchup_blocks.last_key_value()?;
+        let newest = n42_network::decode_gov5_block_rlp(newest_rlp).ok()?;
+        let mut expected_hash = newest.block_hash;
+        let mut height = last_height;
+        let mut selected_heights = Vec::new();
+        loop {
+            let (_, candidate_rlp, _) = self.h2_v4_catchup_blocks.get(&height)?;
+            let candidate = n42_network::decode_gov5_block_rlp(candidate_rlp).ok()?;
+            if candidate.block_hash != expected_hash {
+                return None;
+            }
+            selected_heights.push(height);
+            if candidate.header.parent_hash == self.head_block_hash {
+                selected_heights.reverse();
+                return Some(selected_heights);
+            }
+            if height == 0 {
+                return None;
+            }
+            expected_hash = candidate.header.parent_hash;
+            height -= 1;
+        }
+    }
+
+    async fn release_ready_h2_v4_catchup_blocks(&mut self) -> bool {
+        let Some(selected_heights) = self.ready_h2_v4_catchup_heights() else {
+            return false;
+        };
+        let mut catchup = Vec::with_capacity(selected_heights.len());
+        for height in selected_heights {
+            let Some(entry) = self.h2_v4_catchup_blocks.remove(&height) else {
+                error!(target: "n42::interop::h2v4", height, "selected Gov5 catch-up block disappeared");
+                return false;
+            };
+            catchup.push(entry);
+        }
+        // Everything left is an unrelated historical release or a stale
+        // branch at/below the selected suffix. Retaining it would poison the
+        // next catch-up activation.
+        self.h2_v4_catchup_blocks.clear();
+        self.h2_v4_catchup_active = false;
+        info!(
+            target: "n42::interop::h2v4",
+            blocks = catchup.len(),
+            "releasing reverse-delivered authenticated Gov5 ancestry in execution order"
+        );
+        for (catchup_source, catchup_rlp, catchup_view) in catchup {
+            let catchup_block = match n42_network::decode_gov5_block_rlp(&catchup_rlp) {
+                Ok(block) => block,
+                Err(error) => {
+                    error!(target: "n42::interop::h2v4", %error, "buffered Gov5 block failed repeat decoding");
+                    return false;
+                }
+            };
+            if !self
+                .import_h2_v4_catchup_block(catchup_source, catchup_block, catchup_view)
+                .await
+            {
+                return false;
+            }
+        }
+        info!(
+            target: "n42::interop::h2v4",
+            execution_validated_view = self.execution_validated_head_view,
+            execution_validated_head = %self.head_block_hash,
+            "authenticated Gov5 ancestry reached a durable execution head"
+        );
+        true
+    }
+
+    async fn handle_h2_v4_gov5_block(
+        &mut self,
+        source: PeerId,
+        rlp: Vec<u8>,
+        requested_hash: Option<B256>,
+    ) {
+        const MAX_H2_V4_UNBOUND_BLOCKS: usize = 512;
+        let block = match n42_network::decode_gov5_block_rlp(&rlp) {
+            Ok(block) => block,
+            Err(error) => {
+                counter!("n42_h2_v4_blocks_rejected_total", "reason" => "decode").increment(1);
+                warn!(target: "n42::interop::h2v4", %source, %error, "rejected invalid gov5 block body");
+                return;
+            }
+        };
+        if requested_hash.is_some_and(|expected| expected != block.block_hash) {
+            counter!("n42_h2_v4_blocks_rejected_total", "reason" => "requested_hash").increment(1);
+            warn!(target: "n42::interop::h2v4", %source, expected = ?requested_hash, received = %block.block_hash, "gov5 block response hash mismatch");
+            return;
+        }
+        self.retire_h2_v4_fetch_satisfied_elsewhere(block.block_hash)
+            .await;
+        let Some(bound_view) = self.h2_v4_block_views.get(&block.block_hash).copied() else {
+            self.h2_v4_unbound_blocks
+                .insert(block.block_hash, (source, rlp));
+            while self.h2_v4_unbound_blocks.len() > MAX_H2_V4_UNBOUND_BLOCKS {
+                self.h2_v4_unbound_blocks.pop_first();
+            }
+            debug!(target: "n42::interop::h2v4", %source, hash = %block.block_hash, number = block.header.number, "holding gov5 block until H2-v4 authenticates its hash");
+            return;
+        };
+        let view = match n42_network::gov5_header_view(&block.header) {
+            Ok(view) => view,
+            Err(error) => {
+                counter!("n42_h2_v4_blocks_rejected_total", "reason" => "header_view").increment(1);
+                warn!(target: "n42::interop::h2v4", %source, hash = %block.block_hash, %error, "rejected Gov5 block without an exact header view");
+                return;
+            }
+        };
+        // A verified proposal can legitimately re-propose an already built
+        // locked block in a later view, so its certificate view may be newer
+        // than the immutable view committed into that block's header. The
+        // authenticated hash already binds the complete header/body; only a
+        // header claiming a view newer than its certificate is impossible.
+        // Zero remains the internal transitively-authenticated parent sentinel.
+        if bound_view != 0 && view > bound_view {
+            counter!("n42_h2_v4_blocks_rejected_total", "reason" => "consensus_header_view")
+                .increment(1);
+            warn!(target: "n42::interop::h2v4", %source, hash = %block.block_hash, bound_view, header_view = view, "rejected Gov5 block whose header view is newer than its H2 certificate");
+            return;
+        }
+        self.remember_h2_v4_block_view(block.block_hash, view);
+        if block.header.number <= self.head_block_number {
+            self.prune_executed_h2_v4_catchup_history();
+            debug!(
+                target: "n42::interop::h2v4",
+                %source,
+                hash = %block.block_hash,
+                number = block.header.number,
+                execution_head_number = self.head_block_number,
+                "ignoring already-executed historical Gov5 block"
+            );
+            return;
+        }
+        // Retain heights only after the body hash has an authenticated H2
+        // binding and only while it is ahead of the durable execution floor.
+        // Otherwise a stream of unbound or already-executed history could
+        // evict the mapping for a live asynchronous Engine API completion.
+        self.h2_v4_block_numbers
+            .insert(block.block_hash, block.header.number);
+        // Keep the complete bounded reverse suffix addressable by hash. Live
+        // proposals can otherwise start overlapping ancestry walkers: when an
+        // already-staged parent falls out of a small hash index, re-downloading
+        // it recursively walks the same historical chain again.
+        let block_number_index_limit = self
+            .h2_v4_catchup_buffer_blocks
+            .saturating_add(DEFAULT_H2_V4_CATCHUP_BUFFER_BLOCKS);
+        while self.h2_v4_block_numbers.len() > block_number_index_limit {
+            self.h2_v4_block_numbers.pop_first();
+        }
+        // A consensus-authenticated child header cryptographically binds its
+        // exact parent hash. Walk that ancestry newest-to-oldest, but buffer
+        // execution until the complete bounded segment can be released in
+        // ascending order. This still exercises reverse network delivery while
+        // ensuring every parent reaches Engine API before its child.
+        // A known hash binding is not proof that the parent reached execution:
+        // several future Proposal/QC messages can arrive together and populate
+        // the binding map while Reth is still behind. The only safe live
+        // boundary is the durable execution head itself.
+        let missing_parent =
+            block.header.number > 0 && block.header.parent_hash != self.head_block_hash;
+        // Retain even the direct successor until execution advances. If several
+        // authenticated bodies are released from a backlogged consensus batch,
+        // the successor may be handled asynchronously just before its child
+        // reveals the gap. Without this one-block staging floor, catch-up then
+        // lacks the exact first parent and cannot reconnect to the durable head.
+        let activate_catchup = self.h2_v4_catchup_active || missing_parent;
+        if !self.stage_h2_v4_catchup_block(
+            source,
+            rlp.clone(),
+            block.header.number,
+            view,
+            activate_catchup,
+        ) {
+            return;
+        }
+        if missing_parent {
+            // The child header authenticates the exact parent hash, but timeout
+            // views mean the parent's view cannot be inferred arithmetically.
+            // Record a sentinel until the parent header supplies its exact view.
+            if !self
+                .h2_v4_block_views
+                .contains_key(&block.header.parent_hash)
+            {
+                self.remember_h2_v4_block_view(block.header.parent_hash, 0);
+            }
+            self.request_h2_v4_gov5_block(source, block.header.parent_hash);
+            return;
+        }
+        if self.h2_v4_catchup_active {
+            if !self.release_ready_h2_v4_catchup_blocks().await {
+                warn!(
+                    target: "n42::interop::h2v4",
+                    buffered = self.h2_v4_catchup_blocks.len(),
+                    execution_head = %self.head_block_hash,
+                    "waiting for authenticated Gov5 suffix to reach the durable execution head"
+                );
+            }
+        } else {
+            self.process_h2_v4_gov5_block(source, block, view).await;
+        }
+    }
+
+    /// Imports a transitively authenticated catch-up segment synchronously.
+    ///
+    /// `handle_block_data` is intentionally concurrent for the ordinary live
+    /// path. A far-behind node needs the stronger property that every parent
+    /// obtains `new_payload(Valid)` before its child and that each successful
+    /// FCU immediately persists the exact header-derived view/hash proof.
+    async fn import_h2_v4_catchup_block(
+        &mut self,
+        source: PeerId,
+        block: n42_network::Gov5GossipBlock,
+        view: u64,
+    ) -> bool {
+        let Some(el) = self.el.clone() else {
+            error!(target: "n42::interop::h2v4", "cannot import authenticated Gov5 catch-up without an execution layer");
+            return false;
+        };
+        let block_hash = block.block_hash;
+        let block_number = block.header.number;
+        let block_timestamp = block.header.timestamp;
+        let execution_data = match crate::replay_import::build_gov5_execution_data(
+            block_hash,
+            &block.header,
+            &block.transactions,
+        ) {
+            Ok(data) => data,
+            Err(error) => {
+                error!(target: "n42::interop::h2v4", %source, %block_hash, block_number, view, %error, "could not reconstruct authenticated Gov5 catch-up payload");
+                return false;
+            }
+        };
+
+        match el.new_payload(execution_data).await {
+            Ok(status) if matches!(status.status, PayloadStatusEnum::Valid) => {
+                info!(target: "n42::interop::h2v4", %block_hash, block_number, view, "authenticated Gov5 catch-up parent reached new_payload(Valid)");
+            }
+            Ok(status) => {
+                error!(target: "n42::interop::h2v4", %source, %block_hash, block_number, view, status = ?status.status, "authenticated Gov5 catch-up stopped on non-Valid payload");
+                return false;
+            }
+            Err(error) => {
+                error!(target: "n42::interop::h2v4", %source, %block_hash, block_number, view, %error, "authenticated Gov5 catch-up new_payload failed");
+                return false;
+            }
+        }
+
+        // Blocks at/below the durable floor have already been made canonical by
+        // bootstrap or an earlier run. Re-submitting them to new_payload proves
+        // the complete parent chain without issuing a backward FCU.
+        if view <= self.execution_validated_head_view {
+            if let Err(error) = self
+                .engine
+                .process_event(n42_consensus::ConsensusEvent::BlockImported(block_hash))
+            {
+                error!(target: "n42::interop::h2v4", %block_hash, view, %error, "could not release execution-gated vote for replayed Gov5 parent");
+            }
+            return true;
+        }
+
+        let forkchoice = ForkchoiceState {
+            head_block_hash: block_hash,
+            safe_block_hash: block_hash,
+            finalized_block_hash: block_hash,
+        };
+        match el.fork_choice_updated(forkchoice).await {
+            Ok(result) if matches!(result.payload_status.status, PayloadStatusEnum::Valid) => {
+                self.last_committed_timestamp = self.last_committed_timestamp.max(block_timestamp);
+                self.advance_execution_validated_head(
+                    view,
+                    block_hash,
+                    "authenticated Gov5 catch-up",
+                );
+                self.head_block_number = self.head_block_number.max(block_number);
+                self.prune_executed_h2_v4_catchup_history();
+                crate::qualification_abort_at("execution_validated");
+                // This synchronous catch-up path bypasses handle_valid_import,
+                // which normally releases the H2 execution-gated vote and
+                // closes a matching deferred finalization. Omitting these
+                // notifications leaves the consensus state machine waiting
+                // forever even though Reth is already canonical at this hash.
+                let imported = BlockDataBroadcast {
+                    block_hash,
+                    view,
+                    payload_json: Vec::new(),
+                    timestamp: block_timestamp,
+                    execution_output: None,
+                    leader_ready_unix_ms: 0,
+                };
+                self.complete_deferred_finalization(&imported).await;
+                if let Err(error) = self
+                    .engine
+                    .process_event(n42_consensus::ConsensusEvent::BlockImported(block_hash))
+                {
+                    error!(target: "n42::interop::h2v4", %block_hash, view, %error, "could not release execution-gated vote for Gov5 catch-up block");
+                }
+                true
+            }
+            Ok(result) => {
+                error!(target: "n42::interop::h2v4", %source, %block_hash, block_number, view, status = ?result.payload_status.status, "authenticated Gov5 catch-up FCU was not Valid");
+                false
+            }
+            Err(error) => {
+                error!(target: "n42::interop::h2v4", %source, %block_hash, block_number, view, %error, "authenticated Gov5 catch-up FCU failed");
+                false
+            }
+        }
+    }
+
+    async fn process_h2_v4_gov5_block(
+        &mut self,
+        source: PeerId,
+        block: n42_network::Gov5GossipBlock,
+        view: u64,
+    ) {
+        let execution_data = match crate::replay_import::build_gov5_execution_data(
+            block.block_hash,
+            &block.header,
+            &block.transactions,
+        ) {
+            Ok(data) => data,
+            Err(error) => {
+                counter!("n42_h2_v4_blocks_rejected_total", "reason" => "execution_payload")
+                    .increment(1);
+                warn!(target: "n42::interop::h2v4", %source, hash = %block.block_hash, %error, "could not reconstruct gov5 execution payload");
+                return;
+            }
+        };
+        let payload_json = match serde_json::to_vec(&execution_data) {
+            Ok(payload) => compress_payload(&payload),
+            Err(error) => {
+                warn!(target: "n42::interop::h2v4", %source, hash = %block.block_hash, %error, "could not serialize gov5 execution payload");
+                return;
+            }
+        };
+        let broadcast = BlockDataBroadcast {
+            block_hash: block.block_hash,
+            view,
+            payload_json,
+            timestamp: block.header.timestamp,
+            execution_output: None,
+            leader_ready_unix_ms: 0,
+        };
+        match bincode::serialize(&broadcast) {
+            Ok(data) => self.handle_block_data(data).await,
+            Err(error) => {
+                warn!(target: "n42::interop::h2v4", %source, hash = %block.block_hash, %error, "could not encode internal block data")
+            }
+        }
+    }
+
+    async fn drain_h2_v4_bound_blocks(&mut self) {
+        // The cache is keyed by hash for authentication lookup, but execution
+        // ancestry is ordered by height. A temporarily backlogged batch can
+        // contain several bodies; hash-order release makes children race their
+        // parents and can strand reth in Syncing even though every body arrived.
+        let ready = self.ready_h2_v4_bound_blocks_in_height_order();
+        for hash in ready {
+            if let Some((source, rlp)) = self.h2_v4_unbound_blocks.remove(&hash) {
+                self.handle_h2_v4_gov5_block(source, rlp, Some(hash)).await;
+            }
+        }
+    }
+
+    fn broadcast_engine_consensus(
+        &self,
+        mut message: ConsensusMessage,
+    ) -> Result<(), NetworkError> {
+        // Deliberately corrupts our own signatures so a qualification run can
+        // observe how peers reject them. Vote and CommitVote go out once per
+        // validator per block on the native path too, so an env var alone is
+        // not a safe gate: a stray value in a unit file or container image
+        // would silently stop this node from producing a valid vote in any
+        // view. Compiled out of release builds entirely.
+        #[cfg(debug_assertions)]
+        if std::env::var("N42_QUALIFICATION_FORGE_CONSENSUS")
+            .ok()
+            .as_deref()
+            == Some("1")
+        {
+            let forged = BlsSecretKey::key_gen(&[0xA5; 32])
+                .expect("fixed qualification BLS key must be valid")
+                .sign(b"n42-qualification-forged-consensus");
+            match &mut message {
+                ConsensusMessage::Proposal(value) => value.signature = forged.clone(),
+                ConsensusMessage::Vote(value) => value.signature = forged.clone(),
+                ConsensusMessage::CommitVote(value) => value.signature = forged.clone(),
+                ConsensusMessage::Timeout(value) => value.signature = forged.clone(),
+                ConsensusMessage::NewView(value) => value.signature = forged,
+                ConsensusMessage::PrepareQC(_) | ConsensusMessage::Decide(_) => {}
+            }
+        }
+        if let Some(identity) = self.h2_v4_identity {
+            let envelope =
+                n42_network::consensus_to_h2_v4(identity, &message).map_err(|error| {
+                    NetworkError::Codec(format!("H2-v4 consensus conversion failed: {error}"))
+                })?;
+            self.network.broadcast_h2_v4(envelope)
+        } else {
+            self.network.broadcast_consensus(message)
+        }
+    }
+
     fn vote_resend_delay() -> Duration {
         Duration::from_millis(
             std::env::var("N42_VOTE_RESEND_MS")
@@ -569,7 +1324,9 @@ impl ConsensusService {
         }
 
         let mut delivered_directly = false;
-        if let Some(peer_id) = self.network.validator_peer(pending.target) {
+        if self.h2_v4_identity.is_none()
+            && let Some(peer_id) = self.network.validator_peer(pending.target)
+        {
             match self.network.send_direct(peer_id, pending.message.clone()) {
                 Ok(()) => delivered_directly = true,
                 Err(error) => warn!(
@@ -582,7 +1339,7 @@ impl ConsensusService {
             }
         }
 
-        if !delivered_directly && let Err(error) = self.network.broadcast_consensus(pending.message)
+        if !delivered_directly && let Err(error) = self.broadcast_engine_consensus(pending.message)
         {
             warn!(
                 target: "n42::cl::orchestrator",
@@ -1238,6 +1995,18 @@ impl ConsensusService {
         let (build_complete_tx, build_complete_rx) = mpsc::channel(256);
         Self {
             engine,
+            h2_v4_identity: None,
+            h2_v4_block_views: BTreeMap::new(),
+            h2_v4_block_view_order: VecDeque::new(),
+            h2_v4_block_numbers: BTreeMap::new(),
+            h2_v4_unbound_blocks: BTreeMap::new(),
+            h2_v4_catchup_blocks: BTreeMap::new(),
+            h2_v4_catchup_buffer_blocks: h2_v4_catchup_buffer_blocks(),
+            h2_v4_last_pruned_head_block_number: None,
+            h2_v4_catchup_active: false,
+            h2_v4_fetch_failed_peers: BTreeMap::new(),
+            h2_v4_fetch_requested_at: HashMap::new(),
+            h2_v4_fetch_fulfilled_at: HashMap::new(),
             network,
             consensus_event_rx: None,
             net_event_rx,
@@ -1245,6 +2014,7 @@ impl ConsensusService {
             el: None,
             consensus_state: None,
             head_block_hash: B256::ZERO,
+            head_block_number: 0,
             execution_validated_head_view: 0,
             eager_execution_validated: VecDeque::new(),
             pending_sidecar_diffs: BTreeMap::new(),
@@ -1278,7 +2048,6 @@ impl ConsensusService {
             sync_started_at: None,
             sync_request_range: None,
             sync_requested_peers: HashSet::new(),
-            sync_peer_cursor: 0,
             state_file: None,
             validator_set_for_sync: None,
             epoch_sync_staged_view: None,
@@ -1308,6 +2077,7 @@ impl ConsensusService {
             view_started_at: None,
             epoch_schedule: None,
             tx_forward_buffer: Vec::new(),
+            tx_forward_missing_leader_warned_view: None,
             pending_vote_resend: None,
             pipeline_timings: HashMap::new(),
             last_commit_instant: None,
@@ -1425,6 +2195,7 @@ impl ConsensusService {
         el: Arc<dyn ExecutionLayer>,
         consensus_state: Arc<SharedConsensusState>,
         head_block_hash: B256,
+        head_block_number: u64,
         fee_recipient: Address,
     ) -> Self {
         let (block_ready_tx, block_ready_rx) = mpsc::channel(256);
@@ -1446,13 +2217,34 @@ impl ConsensusService {
             .unwrap_or(0)
             > 0;
         let async_finalize_fcu = Self::async_finalize_fcu_enabled();
+        let h2_v4_catchup_buffer_blocks = h2_v4_catchup_buffer_blocks();
 
         if slot_time_ms > 0 {
             info!(target: "n42::cl::orchestrator", slot_time_ms, fast_propose, async_finalize_fcu, "slot timing configured");
         }
+        if h2_v4_catchup_buffer_blocks != DEFAULT_H2_V4_CATCHUP_BUFFER_BLOCKS {
+            info!(
+                target: "n42::interop::h2v4",
+                h2_v4_catchup_buffer_blocks,
+                max = MAX_H2_V4_CATCHUP_BUFFER_BLOCKS,
+                "configured authenticated Gov5 catch-up buffer"
+            );
+        }
 
         Self {
             engine,
+            h2_v4_identity: None,
+            h2_v4_block_views: BTreeMap::new(),
+            h2_v4_block_view_order: VecDeque::new(),
+            h2_v4_block_numbers: BTreeMap::new(),
+            h2_v4_unbound_blocks: BTreeMap::new(),
+            h2_v4_catchup_blocks: BTreeMap::new(),
+            h2_v4_catchup_buffer_blocks,
+            h2_v4_last_pruned_head_block_number: None,
+            h2_v4_catchup_active: false,
+            h2_v4_fetch_failed_peers: BTreeMap::new(),
+            h2_v4_fetch_requested_at: HashMap::new(),
+            h2_v4_fetch_fulfilled_at: HashMap::new(),
             network,
             consensus_event_rx: Some(consensus_event_rx),
             net_event_rx,
@@ -1460,6 +2252,7 @@ impl ConsensusService {
             el: Some(el),
             consensus_state: Some(consensus_state),
             head_block_hash,
+            head_block_number,
             execution_validated_head_view: 0,
             eager_execution_validated: VecDeque::new(),
             pending_sidecar_diffs: BTreeMap::new(),
@@ -1493,7 +2286,6 @@ impl ConsensusService {
             sync_started_at: None,
             sync_request_range: None,
             sync_requested_peers: HashSet::new(),
-            sync_peer_cursor: 0,
             state_file: None,
             validator_set_for_sync: None,
             epoch_sync_staged_view: None,
@@ -1523,6 +2315,7 @@ impl ConsensusService {
             view_started_at: None,
             epoch_schedule: None,
             tx_forward_buffer: Vec::new(),
+            tx_forward_missing_leader_warned_view: None,
             pending_vote_resend: None,
             pipeline_timings: HashMap::new(),
             last_commit_instant: None,
@@ -1546,6 +2339,25 @@ impl ConsensusService {
 
     pub fn with_exec_output_cache(mut self, cache: Arc<dyn ExecutionOutputCache>) -> Self {
         self.exec_output_cache = Some(cache);
+        self
+    }
+
+    pub fn with_h2_v4_catchup_buffer_blocks(mut self, blocks: usize) -> Self {
+        self.h2_v4_catchup_buffer_blocks = blocks.clamp(
+            DEFAULT_H2_V4_CATCHUP_BUFFER_BLOCKS,
+            MAX_H2_V4_CATCHUP_BUFFER_BLOCKS,
+        );
+        self
+    }
+
+    /// Enables the complete H2-v4 participant profile: chain-bound POP BLS
+    /// signatures in the engine plus bidirectional network conversion.
+    pub fn with_h2_v4_participant(
+        mut self,
+        identity: n42_network::h2_v4::H2V4ChainIdentity,
+    ) -> Self {
+        self.engine.enable_h2_v4_signing(identity);
+        self.h2_v4_identity = Some(identity);
         self
     }
 
@@ -1768,6 +2580,30 @@ impl ConsensusService {
             };
             tokio::pin!(vote_resend_timer);
 
+            let sync_request_deadline = self
+                .sync_started_at
+                .map(|started| started + state_mgmt::sync_request_timeout());
+            let sync_request_timer = async {
+                match sync_request_deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::pin!(sync_request_timer);
+
+            let h2_v4_fetch_deadline = self
+                .h2_v4_fetch_requested_at
+                .values()
+                .map(|(requested_at, _)| *requested_at + H2_V4_FETCH_RETRY_TIMEOUT)
+                .min();
+            let h2_v4_fetch_timer = async {
+                match h2_v4_fetch_deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::pin!(h2_v4_fetch_timer);
+
             // Biased select: consensus-critical channels are checked FIRST.
             // Without biased, tokio randomly permutes branch order on each poll,
             // causing consensus votes to compete with high-frequency TX events.
@@ -1817,6 +2653,17 @@ impl ConsensusService {
                 // a collector's direct or gossip receive path was transiently lost.
                 _ = &mut vote_resend_timer => {
                     self.resend_pending_vote();
+                }
+
+                // Recovery deadlines are independent of new consensus/network
+                // traffic. A quiet stall must still clear and re-drive all
+                // request state at its configured deadline.
+                _ = &mut sync_request_timer => {
+                    self.retry_expired_sync_request();
+                }
+
+                _ = &mut h2_v4_fetch_timer => {
+                    self.retry_expired_h2_v4_fetches();
                 }
 
                 // === Priority 3: Async finalize-FCU completion ===
@@ -2049,6 +2896,13 @@ impl ConsensusService {
             while let Ok(engine_output) = self.output_rx.try_recv() {
                 self.handle_engine_output(engine_output).await;
             }
+            // A child body can arrive while its direct parent is still inside
+            // an asynchronous new_payload/FCU. That child is correctly staged,
+            // but no later network event is guaranteed after the parent moves
+            // the durable execution head. Re-check after every selected
+            // lifecycle event so an execution completion itself releases the
+            // now-contiguous authenticated suffix.
+            self.release_ready_h2_v4_catchup_blocks().await;
         }
 
         info!(target: "n42::cl::orchestrator", view = self.engine.current_view(), "orchestrator shutting down, persisting final state");
@@ -2163,6 +3017,12 @@ impl ConsensusService {
     /// Broadcasts a consensus message using Rotor relay: send directly to relay nodes,
     /// then always broadcast via GossipSub as safety net.
     fn broadcast_via_rotor(&mut self, msg: n42_primitives::ConsensusMessage) {
+        if self.h2_v4_identity.is_some() {
+            if let Err(error) = self.broadcast_engine_consensus(msg) {
+                error!(target: "n42::interop::h2v4", %error, "H2-v4 proposal broadcast failed");
+            }
+            return;
+        }
         use n42_consensus::rotor::cached_relay_assignment;
 
         let view = self.engine.current_view();
@@ -2211,6 +3071,14 @@ impl ConsensusService {
         self.trim_tx_forward_buffer(leader_idx, "forward send failure");
     }
 
+    fn should_warn_missing_tx_forward_leader(&mut self, view: u64) -> bool {
+        if self.tx_forward_missing_leader_warned_view == Some(view) {
+            return false;
+        }
+        self.tx_forward_missing_leader_warned_view = Some(view);
+        true
+    }
+
     /// Flush buffered txs to the current leader via the tx_forward protocol.
     async fn flush_tx_forward_buffer(&mut self) {
         if self.tx_forward_buffer.is_empty() {
@@ -2226,6 +3094,7 @@ impl ConsensusService {
                 .unwrap_or(false)
         });
         if disabled {
+            self.tx_forward_missing_leader_warned_view = None;
             // Feed all buffered txs into local pool and return (no forwarding).
             let txs = std::mem::take(&mut self.tx_forward_buffer);
             if self.tx_import_tx.is_some() {
@@ -2240,6 +3109,7 @@ impl ConsensusService {
 
         // If we are the leader, feed txs directly into the local pool.
         if self.engine.is_current_leader() {
+            self.tx_forward_missing_leader_warned_view = None;
             let txs = std::mem::take(&mut self.tx_forward_buffer);
             let count = txs.len();
             if self.tx_import_tx.is_some() {
@@ -2258,6 +3128,7 @@ impl ConsensusService {
 
         match leader_peer {
             Some(peer) => {
+                self.tx_forward_missing_leader_warned_view = None;
                 let txs = std::mem::take(&mut self.tx_forward_buffer);
                 let count = txs.len();
                 debug!(target: "n42::cl::orchestrator", count, leader_idx, %peer, "flushing tx forward buffer to leader");
@@ -2283,13 +3154,82 @@ impl ConsensusService {
                 // Leader not connected yet — fall back to keeping in buffer.
                 // If buffer grows too large, drop oldest to prevent memory bloat.
                 let buf_len = self.tx_forward_buffer.len();
-                warn!(target: "n42::cl::orchestrator", leader_idx, buf_len, peers = validator_peers.len(), "leader peer not found for tx forward");
+                let view = self.engine.current_view();
+                if self.should_warn_missing_tx_forward_leader(view) {
+                    warn!(target: "n42::cl::orchestrator", view, leader_idx, buf_len, peers = validator_peers.len(), "leader peer not found for tx forward");
+                }
                 self.trim_tx_forward_buffer(leader_idx, "leader peer not found");
             }
         }
     }
 
     async fn handle_consensus_event_batch(&mut self, events: Vec<NetworkEvent>) {
+        let events = events
+            .into_iter()
+            .filter_map(|event| match event {
+                NetworkEvent::Gov5H2Message { source, message } => {
+                    let Some(identity) = self.h2_v4_identity else {
+                        return Some(NetworkEvent::Gov5H2Message { source, message });
+                    };
+                    let envelope = n42_network::h2_v4::H2V4Envelope {
+                        identity,
+                        changes_hash: B256::ZERO,
+                        message: *message,
+                    };
+                    match n42_network::consensus_from_h2_v4(envelope) {
+                        Ok(message) => {
+                            counter!(
+                                "n42_h2_v4_participant_received_total",
+                                "transport" => "gov5"
+                            )
+                            .increment(1);
+                            Some(NetworkEvent::ConsensusMessage {
+                                source,
+                                message: Box::new(message),
+                            })
+                        }
+                        Err(error) => {
+                            counter!(
+                                "n42_h2_v4_participant_rejected_total",
+                                "reason" => "gov5_conversion"
+                            )
+                            .increment(1);
+                            warn!(target: "n42::interop::h2v4", %source, %error, "rejected canonical Gov5 participant message");
+                            None
+                        }
+                    }
+                }
+                NetworkEvent::H2V4Message { source, envelope } => {
+                    let Some(identity) = self.h2_v4_identity else {
+                        return Some(NetworkEvent::H2V4Message { source, envelope });
+                    };
+                    if envelope.identity != identity {
+                        counter!("n42_h2_v4_participant_rejected_total", "reason" => "identity")
+                            .increment(1);
+                        return None;
+                    }
+                    match n42_network::consensus_from_h2_v4(*envelope) {
+                        Ok(message) => {
+                            counter!("n42_h2_v4_participant_received_total").increment(1);
+                            Some(NetworkEvent::ConsensusMessage {
+                                source,
+                                message: Box::new(message),
+                            })
+                        }
+                        Err(error) => {
+                            counter!("n42_h2_v4_participant_rejected_total", "reason" => "conversion")
+                                .increment(1);
+                            warn!(target: "n42::interop::h2v4", %source, %error, "rejected H2-v4 participant message");
+                            None
+                        }
+                    }
+                }
+                other => Some(other),
+            })
+            .collect::<Vec<_>>();
+        if events.is_empty() {
+            return;
+        }
         let current_view = self.engine.current_view();
         let mut positions = Vec::new();
         let mut messages = Vec::new();
@@ -2314,6 +3254,7 @@ impl ConsensusService {
             for event in events {
                 self.handle_network_event(event).await;
             }
+            self.drain_h2_v4_bound_blocks().await;
             return;
         }
 
@@ -2332,6 +3273,7 @@ impl ConsensusService {
         for (event, hint) in events.into_iter().zip(hints) {
             self.handle_network_event_with_auth(event, hint).await;
         }
+        self.drain_h2_v4_bound_blocks().await;
     }
 
     async fn handle_network_event(&mut self, event: NetworkEvent) {
@@ -2426,6 +3368,54 @@ impl ConsensusService {
                 }
                 // Save the message view before process_event consumes it via *message.
                 let msg_view = message.view();
+                // A body hash becomes eligible for execution only after the H2
+                // state machine has authenticated and accepted the corresponding
+                // message. Merely decoding a chain-bound envelope is not
+                // authentication: any connected peer can publish one.
+                //
+                // Bind every QC-carried block as well as a Proposal/Decide's own
+                // block. A recovering node can legitimately receive only a
+                // far-future Timeout/NewView/PrepareQC first; the verified QC in
+                // that message is then its only authenticated ancestry anchor.
+                let h2_block_bindings = self.h2_v4_identity.map(|_| {
+                    fn bind_qc(
+                        bindings: &mut Vec<(alloy_primitives::B256, u64)>,
+                        qc: &n42_primitives::QuorumCertificate,
+                    ) {
+                        if qc.view > 0 && qc.block_hash != alloy_primitives::B256::ZERO {
+                            bindings.push((qc.block_hash, qc.view));
+                        }
+                    }
+
+                    let mut bindings = Vec::with_capacity(3);
+                    match message.as_ref() {
+                        CM::Proposal(value) => {
+                            if validator_index == Some(value.proposer) {
+                                bindings.push((value.block_hash, value.view));
+                            }
+                            bind_qc(&mut bindings, &value.justify_qc);
+                            if let Some(qc) = value.prepare_qc.as_ref() {
+                                bind_qc(&mut bindings, qc);
+                            }
+                        }
+                        CM::PrepareQC(value) => {
+                            bindings.push((value.block_hash, value.view));
+                            bind_qc(&mut bindings, &value.qc);
+                        }
+                        CM::Timeout(value) => bind_qc(&mut bindings, &value.high_qc),
+                        CM::NewView(value) => {
+                            bind_qc(&mut bindings, &value.timeout_cert.high_qc);
+                        }
+                        CM::Decide(value) => {
+                            bindings.push((value.block_hash, value.view));
+                            bind_qc(&mut bindings, &value.commit_qc);
+                        }
+                        CM::Vote(_) | CM::CommitVote(_) => {}
+                    }
+                    bindings.sort_unstable();
+                    bindings.dedup();
+                    bindings
+                });
                 debug!(target: "n42::cl::orchestrator", msg_type, view = self.engine.current_view(), "processing consensus message");
                 let result = match authenticated {
                     Some(authenticated) => self.engine.process_authenticated_message(authenticated),
@@ -2434,7 +3424,20 @@ impl ConsensusService {
                         .process_event(n42_consensus::ConsensusEvent::Message(*message)),
                 };
                 match result {
-                    Ok(()) => {}
+                    Ok(()) => {
+                        for (block_hash, view) in h2_block_bindings.into_iter().flatten() {
+                            self.remember_h2_v4_block_view(block_hash, view);
+                            if !self.pending_block_data.contains_key(&block_hash)
+                                && !self.h2_v4_unbound_blocks.contains_key(&block_hash)
+                            {
+                                self.request_h2_v4_gov5_block(source, block_hash);
+                            }
+                        }
+                        // Release a body as soon as its authenticating message is
+                        // accepted, before later Proposal/QC/Decide events in the
+                        // same drained batch can commit descendants ahead of it.
+                        self.drain_h2_v4_bound_blocks().await;
+                    }
                     Err(e) => {
                         if matches!(e, n42_consensus::N42ConsensusError::SafetyViolation { .. }) {
                             debug!(target: "n42::cl::orchestrator", error = %e, "benign safety check (QC ordering race)");
@@ -2480,6 +3483,29 @@ impl ConsensusService {
                 self.connected_peers.insert(peer_id);
                 gauge!("n42_connected_peers").set(self.connected_peers.len() as f64);
 
+                // A restart can recover a far-newer locked/commit QC while its
+                // execution head is intentionally still behind. No fresh
+                // Proposal/Decide is guaranteed to arrive immediately (the
+                // recovering validator may itself be the current leader), so
+                // seed authenticated ancestry fetches directly from the
+                // persisted certificates as soon as a Gov5 peer is available.
+                if self.h2_v4_identity.is_some() {
+                    let recovery_anchors = [
+                        self.engine.locked_qc().clone(),
+                        self.engine.last_committed_qc().clone(),
+                    ];
+                    for qc in recovery_anchors {
+                        if qc.view == 0
+                            || qc.block_hash == B256::ZERO
+                            || qc.block_hash == self.head_block_hash
+                        {
+                            continue;
+                        }
+                        self.remember_h2_v4_block_view(qc.block_hash, qc.view);
+                        self.request_h2_v4_gov5_block(peer_id, qc.block_hash);
+                    }
+                }
+
                 if self.pending_leader_build_mode_for_current_view().is_some() {
                     let slot_timestamp = self.next_slot_timestamp;
                     self.evaluate_leader_build_wait(slot_timestamp).await;
@@ -2498,6 +3524,72 @@ impl ConsensusService {
             NetworkEvent::BlockAnnouncement { source, data } => {
                 tracing::debug!(target: "n42::cl::orchestrator", %source, bytes = data.len(), "received block data broadcast");
                 self.handle_block_data(data).await;
+            }
+            NetworkEvent::Gov5Block { source, rlp } if self.h2_v4_identity.is_some() => {
+                self.handle_h2_v4_gov5_block(source, rlp, None).await;
+            }
+            NetworkEvent::Gov5BlockFetched {
+                source,
+                requested_hash,
+                rlp,
+            } if self.h2_v4_identity.is_some() => {
+                self.handle_h2_v4_gov5_block(source, rlp, Some(requested_hash))
+                    .await;
+            }
+            NetworkEvent::Gov5BlockFetchFailed {
+                source,
+                block_hash,
+                error,
+            } if self.h2_v4_identity.is_some() => {
+                self.h2_v4_fetch_requested_at.remove(&block_hash);
+                warn!(target: "n42::interop::h2v4", %source, %block_hash, %error, "H2-authenticated gov5 block fetch failed");
+                let now = Instant::now();
+                let attempted = {
+                    let entry = self
+                        .h2_v4_fetch_failed_peers
+                        .entry(block_hash)
+                        .or_insert_with(|| (now, HashSet::new()));
+                    if now.duration_since(entry.0) >= H2_V4_FETCH_RETRY_ROUND {
+                        entry.0 = now;
+                        entry.1.clear();
+                    }
+                    entry.1.insert(source);
+                    entry.1.clone()
+                };
+                while self.h2_v4_fetch_failed_peers.len() > 2048 {
+                    self.h2_v4_fetch_failed_peers.pop_first();
+                }
+                let mut retry_peer = self
+                    .connected_peers
+                    .iter()
+                    .copied()
+                    .find(|peer| !attempted.contains(peer));
+                if retry_peer.is_none() {
+                    if let Some(entry) = self.h2_v4_fetch_failed_peers.get_mut(&block_hash) {
+                        entry.0 = now;
+                        entry.1.clear();
+                    }
+                    retry_peer = self.connected_peers.iter().copied().next();
+                }
+                if let Some(retry_peer) = retry_peer {
+                    counter!("n42_h2_v4_block_fetch_retries_total").increment(1);
+                    debug!(
+                        target: "n42::interop::h2v4",
+                        failed_peer = %source,
+                        %retry_peer,
+                        %block_hash,
+                        attempted = attempted.len(),
+                        "retrying authenticated Gov5 block fetch with another peer"
+                    );
+                    self.request_h2_v4_gov5_block(retry_peer, block_hash);
+                } else {
+                    warn!(
+                        target: "n42::interop::h2v4",
+                        %block_hash,
+                        attempted = attempted.len(),
+                        "authenticated Gov5 block fetch exhausted connected peers for this retry round"
+                    );
+                }
             }
             NetworkEvent::TransactionReceived { source: _, data } => {
                 self.enqueue_tx_import(data, "p2p transaction received")
@@ -2544,6 +3636,9 @@ impl ConsensusService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_consensus::{
+        Block, BlockBody, Header, TxEnvelope, proofs::calculate_transaction_root,
+    };
     use alloy_primitives::{Address, B256, Bloom, Bytes, U256};
     use alloy_rpc_types_engine::{
         ExecutionData, ExecutionPayload, ExecutionPayloadSidecar, ExecutionPayloadV1,
@@ -2556,16 +3651,43 @@ mod tests {
     use n42_consensus::{ConsensusEngine, EpochManager, ValidatorSet};
     use n42_network::{NetworkCommand, NetworkHandle};
     use n42_primitives::consensus::ValidatorChange;
-    use n42_primitives::{BlsSecretKey, ConsensusMessage, QuorumCertificate, TimeoutMessage, Vote};
+    use n42_primitives::{
+        BlsSecretKey, ConsensusMessage, Proposal, QuorumCertificate, TimeoutMessage, Vote,
+    };
     use std::collections::{HashMap, HashSet};
     use std::sync::{Arc, Mutex, RwLock};
     use std::time::Duration;
+
+    fn test_gov5_block_rlp(parent_hash: B256, number: u64, view: u64) -> (B256, Vec<u8>) {
+        let mut extra_data = Vec::with_capacity(12);
+        extra_data.extend_from_slice(b"N42H");
+        extra_data.extend_from_slice(&view.to_le_bytes());
+        let block = Block::<TxEnvelope> {
+            header: Header {
+                parent_hash,
+                ommers_hash: B256::ZERO,
+                transactions_root: calculate_transaction_root::<TxEnvelope>(&[]),
+                number,
+                base_fee_per_gas: Some(0),
+                extra_data: extra_data.into(),
+                ..Default::default()
+            },
+            body: BlockBody::default(),
+        };
+        let block_hash = block.header.hash_slow();
+        let execution = ExecutionData::from_block_unchecked(block_hash, &block);
+        let rlp =
+            n42_network::encode_gov5_block_rlp(&execution).expect("test Gov5 block must encode");
+        (block_hash, rlp)
+    }
 
     #[derive(Clone, Default)]
     struct MockConsensusNetwork {
         peers: Arc<RwLock<HashMap<u32, n42_network::PeerId>>>,
         broadcasts: Arc<Mutex<Vec<n42_primitives::ConsensusMessage>>>,
+        h2_v4_broadcasts: Arc<Mutex<Vec<n42_network::h2_v4::H2V4Envelope>>>,
         direct_messages: Arc<Mutex<Vec<(n42_network::PeerId, n42_primitives::ConsensusMessage)>>>,
+        cancelled_gov5_fetches: Arc<Mutex<Vec<B256>>>,
     }
 
     impl MockConsensusNetwork {
@@ -2588,6 +3710,13 @@ mod tests {
             self.direct_messages
                 .lock()
                 .expect("mock direct messages lock")
+                .clone()
+        }
+
+        fn h2_v4_broadcasts(&self) -> Vec<n42_network::h2_v4::H2V4Envelope> {
+            self.h2_v4_broadcasts
+                .lock()
+                .expect("mock H2-v4 broadcasts lock")
                 .clone()
         }
     }
@@ -2928,6 +4057,17 @@ mod tests {
             Ok(())
         }
 
+        fn broadcast_h2_v4(
+            &self,
+            envelope: n42_network::h2_v4::H2V4Envelope,
+        ) -> Result<(), n42_network::NetworkError> {
+            self.h2_v4_broadcasts
+                .lock()
+                .expect("mock H2-v4 broadcasts lock")
+                .push(envelope);
+            Ok(())
+        }
+
         fn validator_peer(&self, index: u32) -> Option<n42_network::PeerId> {
             self.peers
                 .read()
@@ -2973,6 +4113,25 @@ mod tests {
             Ok(())
         }
 
+        fn request_gov5_block_by_hash(
+            &self,
+            _peer: n42_network::PeerId,
+            _block_hash: B256,
+        ) -> Result<(), n42_network::NetworkError> {
+            Ok(())
+        }
+
+        async fn cancel_gov5_block_fetch_reliable(
+            &self,
+            block_hash: B256,
+        ) -> Result<(), n42_network::NetworkError> {
+            self.cancelled_gov5_fetches
+                .lock()
+                .expect("mock cancelled Gov5 fetches lock")
+                .push(block_hash);
+            Ok(())
+        }
+
         fn broadcast_blob_sidecar(&self, _data: Vec<u8>) -> Result<(), n42_network::NetworkError> {
             Ok(())
         }
@@ -2980,6 +4139,13 @@ mod tests {
         async fn announce_block_reliable(
             &self,
             _data: Vec<u8>,
+        ) -> Result<(), n42_network::NetworkError> {
+            Ok(())
+        }
+
+        async fn broadcast_gov5_block_reliable(
+            &self,
+            _rlp: Vec<u8>,
         ) -> Result<(), n42_network::NetworkError> {
             Ok(())
         }
@@ -3160,6 +4326,72 @@ mod tests {
             matches!(cmd, NetworkCommand::BroadcastConsensus(_)),
             "should be a BroadcastConsensus command"
         );
+    }
+
+    #[tokio::test]
+    async fn h2_v4_participant_routes_engine_output_only_to_h2_topic() {
+        let (engine, output_rx) = make_test_engine();
+        let network = Arc::new(MockConsensusNetwork::default());
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let identity = n42_network::h2_v4::H2V4ChainIdentity {
+            chain_id: 42,
+            genesis_hash: B256::repeat_byte(0x42),
+        };
+        let mut orch = ConsensusService::new(engine, network.clone(), net_event_rx, output_rx)
+            .with_h2_v4_participant(identity);
+        let vote = Vote {
+            view: 1,
+            block_hash: B256::repeat_byte(0xAA),
+            voter: 0,
+            signature: test_key(0x11).sign_h2_v4(b"test"),
+        };
+
+        orch.handle_engine_output(EngineOutput::BroadcastMessage(ConsensusMessage::Vote(vote)))
+            .await;
+
+        assert!(network.broadcasts().is_empty());
+        let envelopes = network.h2_v4_broadcasts();
+        assert_eq!(envelopes.len(), 1);
+        assert_eq!(envelopes[0].identity, identity);
+        assert_eq!(envelopes[0].changes_hash, B256::ZERO);
+        assert!(matches!(
+            envelopes[0].message,
+            n42_network::h2_wire::H2Message::Vote(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn h2_v4_rejects_body_binding_before_proposal_authentication() {
+        let (engine, output_rx) = make_test_engine();
+        let network = Arc::new(MockConsensusNetwork::default());
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let identity = n42_network::h2_v4::H2V4ChainIdentity {
+            chain_id: 42,
+            genesis_hash: B256::repeat_byte(0x42),
+        };
+        let mut orch = ConsensusService::new(engine, network, net_event_rx, output_rx)
+            .with_h2_v4_participant(identity);
+        let block_hash = B256::repeat_byte(0xA5);
+        let proposal = ConsensusMessage::Proposal(Proposal {
+            view: 1,
+            block_hash,
+            justify_qc: QuorumCertificate::genesis(),
+            proposer: 0,
+            signature: test_key(0x77).sign_h2_v4(b"forged proposal"),
+            prepare_qc: None,
+            tx_root_hash: Some(B256::ZERO),
+            validator_changes: None,
+        });
+        let envelope = n42_network::consensus_to_h2_v4(identity, &proposal).unwrap();
+        let source = Keypair::generate_ed25519().public().to_peer_id();
+
+        orch.handle_consensus_event_batch(vec![NetworkEvent::H2V4Message {
+            source,
+            envelope: Box::new(envelope),
+        }])
+        .await;
+
+        assert!(!orch.h2_v4_block_views.contains_key(&block_hash));
     }
 
     #[tokio::test]
@@ -4105,6 +5337,19 @@ mod tests {
         assert_eq!(orch.tx_forward_buffer, expected_tail);
     }
 
+    #[test]
+    fn test_missing_tx_forward_leader_warns_once_per_view() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
+
+        assert!(orch.should_warn_missing_tx_forward_leader(41));
+        assert!(!orch.should_warn_missing_tx_forward_leader(41));
+        assert!(orch.should_warn_missing_tx_forward_leader(42));
+        assert!(!orch.should_warn_missing_tx_forward_leader(42));
+    }
+
     #[tokio::test]
     async fn test_sync_timeout_resets_in_flight() {
         let (engine, output_rx) = make_test_engine();
@@ -4125,6 +5370,266 @@ mod tests {
             started.elapsed() < Duration::from_secs(2),
             "sync_started_at should be recent after timeout reset"
         );
+    }
+
+    #[tokio::test]
+    async fn independent_sync_deadline_refans_out_the_original_range() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
+        let peers = [libp2p::PeerId::random(), libp2p::PeerId::random()];
+        orch.connected_peers.extend(peers);
+        orch.sync_in_flight = true;
+        orch.sync_started_at =
+            Some(Instant::now() - state_mgmt::sync_request_timeout() - Duration::from_secs(1));
+        orch.sync_request_range = Some((41, 47));
+        orch.sync_requested_peers.insert(peers[0]);
+
+        orch.retry_expired_sync_request();
+
+        assert!(orch.sync_in_flight);
+        assert_eq!(orch.sync_request_range, Some((41, 47)));
+        assert_eq!(orch.sync_requested_peers, peers.into_iter().collect());
+        assert!(
+            orch.sync_started_at
+                .expect("replacement request has a deadline")
+                .elapsed()
+                < Duration::from_secs(2)
+        );
+    }
+
+    fn test_h2_identity() -> n42_network::h2_v4::H2V4ChainIdentity {
+        n42_network::h2_v4::H2V4ChainIdentity {
+            chain_id: 42,
+            genesis_hash: B256::repeat_byte(0x42),
+        }
+    }
+
+    /// A block-data envelope is unauthenticated bincode: `block_hash` is a
+    /// self-declared field, and nothing has checked it against the payload by
+    /// the time `handle_block_data` returns. Retiring a Gov5 fetch on it would
+    /// let anyone who can reach this port cancel an in-flight ancestry fetch —
+    /// and suppress re-requests for 30s — by gossiping a forged envelope
+    /// carrying the victim's target hash.
+    #[tokio::test]
+    async fn forged_block_data_envelope_cannot_retire_a_gov5_fetch() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, mut prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx)
+            .with_h2_v4_participant(test_h2_identity());
+        let target_hash = B256::repeat_byte(0xa6);
+        let peer = libp2p::PeerId::random();
+        orch.h2_v4_fetch_requested_at
+            .insert(target_hash, (Instant::now(), peer));
+
+        // The envelope names the hash the victim is fetching. Its payload is
+        // never validated against that claim on this path.
+        orch.handle_block_data(test_block_data(B256::ZERO, target_hash, 1))
+            .await;
+
+        assert!(
+            orch.h2_v4_fetch_requested_at.contains_key(&target_hash),
+            "an unauthenticated envelope must not cancel a live fetch"
+        );
+        assert!(
+            prx.try_recv().is_err(),
+            "no cancellation command may be derived from a claimed hash"
+        );
+    }
+
+    /// Retirement moves to the eager-import completion callback: reth only
+    /// reaches it after accepting that exact payload, so the hash is proven
+    /// rather than claimed. Both the local tracker and the shared network-layer
+    /// request are retired there, including a fetch owned by the other
+    /// orchestrator sharing this network service.
+    #[tokio::test]
+    async fn validated_import_retires_concurrent_gov5_hash_fetch() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, mut prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx)
+            .with_h2_v4_participant(test_h2_identity());
+        let block_hash = B256::repeat_byte(0xa6);
+        let peer = libp2p::PeerId::random();
+        orch.h2_v4_fetch_requested_at
+            .insert(block_hash, (Instant::now(), peer));
+
+        orch.handle_eager_import_done(block_hash, 1).await;
+
+        assert!(!orch.h2_v4_fetch_requested_at.contains_key(&block_hash));
+        assert!(matches!(
+            prx.try_recv().expect("cross-path cancellation command"),
+            NetworkCommand::CancelGov5BlockFetch { block_hash: hash }
+                if hash == block_hash
+        ));
+    }
+
+    #[tokio::test]
+    async fn validated_import_retires_fetch_owned_by_other_consumer() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, mut prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx)
+            .with_h2_v4_participant(test_h2_identity());
+        let block_hash = B256::repeat_byte(0xa7);
+
+        assert!(!orch.h2_v4_fetch_requested_at.contains_key(&block_hash));
+        orch.handle_eager_import_done(block_hash, 1).await;
+
+        assert!(matches!(
+            prx.try_recv().expect("shared fetch cancellation command"),
+            NetworkCommand::CancelGov5BlockFetch { block_hash: hash }
+                if hash == block_hash
+        ));
+    }
+
+    /// Native mode never fetches bodies from Gov5, so it must not pay for the
+    /// tombstone write or the network command on every block.
+    #[tokio::test]
+    async fn native_mode_import_does_not_touch_gov5_fetch_state() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, mut prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
+        let block_hash = B256::repeat_byte(0xa9);
+
+        orch.handle_eager_import_done(block_hash, 1).await;
+
+        assert!(prx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn fulfilled_block_cannot_rearm_a_local_h2_fetch_deadline() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, mut prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx)
+            .with_h2_v4_participant(test_h2_identity());
+        let block_hash = B256::repeat_byte(0xa8);
+        let peer = libp2p::PeerId::random();
+
+        orch.handle_eager_import_done(block_hash, 1).await;
+        assert!(matches!(
+            prx.try_recv().expect("body delivery cancellation command"),
+            NetworkCommand::CancelGov5BlockFetch { block_hash: hash }
+                if hash == block_hash
+        ));
+
+        // A duplicate proposal/QC can be queued behind the body and ask for
+        // the same hash after it has already advanced out of the head slot.
+        orch.request_h2_v4_gov5_block(peer, block_hash);
+
+        assert!(!orch.h2_v4_fetch_requested_at.contains_key(&block_hash));
+        assert!(
+            prx.try_recv().is_err(),
+            "a recently fulfilled hash must not queue another request"
+        );
+
+        // Also fail closed if an already-queued command managed to create a
+        // local deadline just before the fulfillment tombstone was observed.
+        orch.connected_peers.insert(peer);
+        orch.h2_v4_fetch_requested_at.insert(
+            block_hash,
+            (
+                Instant::now() - H2_V4_FETCH_RETRY_TIMEOUT - Duration::from_secs(1),
+                peer,
+            ),
+        );
+        orch.retry_expired_h2_v4_fetches();
+
+        assert!(!orch.h2_v4_fetch_requested_at.contains_key(&block_hash));
+        assert!(
+            prx.try_recv().is_err(),
+            "a fulfilled hash must not be retried from a stale local deadline"
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_h2_block_fetch_rotates_without_a_network_failure_event() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, mut prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
+        let peers = [
+            libp2p::PeerId::random(),
+            libp2p::PeerId::random(),
+            libp2p::PeerId::random(),
+        ];
+        let block_hash = B256::repeat_byte(0xa7);
+        orch.connected_peers.extend(peers);
+
+        orch.request_h2_v4_gov5_block(peers[0], block_hash);
+        let first = prx.try_recv().expect("initial fetch command");
+        assert!(matches!(
+            first,
+            NetworkCommand::RequestGov5BlockByHash { peer, block_hash: hash }
+                if peer == peers[0] && hash == block_hash
+        ));
+        orch.h2_v4_fetch_requested_at.insert(
+            block_hash,
+            (
+                Instant::now() - H2_V4_FETCH_RETRY_TIMEOUT - Duration::from_secs(1),
+                peers[0],
+            ),
+        );
+
+        orch.retry_expired_h2_v4_fetches();
+
+        let retry = prx.try_recv().expect("deadline retry command");
+        let NetworkCommand::RequestGov5BlockByHash {
+            peer: second_peer,
+            block_hash: second_hash,
+        } = retry
+        else {
+            panic!("expected block fetch retry command")
+        };
+        assert_ne!(second_peer, peers[0]);
+        assert_eq!(second_hash, block_hash);
+        assert_eq!(
+            orch.h2_v4_fetch_requested_at
+                .get(&block_hash)
+                .map(|(_, peer)| *peer),
+            Some(second_peer)
+        );
+
+        orch.h2_v4_fetch_requested_at.insert(
+            block_hash,
+            (
+                Instant::now() - H2_V4_FETCH_RETRY_TIMEOUT - Duration::from_secs(1),
+                second_peer,
+            ),
+        );
+        orch.retry_expired_h2_v4_fetches();
+        let third = prx.try_recv().expect("second deadline retry command");
+        assert!(matches!(
+            third,
+            NetworkCommand::RequestGov5BlockByHash { peer, block_hash: hash }
+                if peer != peers[0] && peer != second_peer && hash == block_hash
+        ));
+    }
+
+    #[tokio::test]
+    async fn staged_h2_parent_does_not_start_an_overlapping_ancestry_walk() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, mut prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
+        let peer = libp2p::PeerId::random();
+        let staged_hash = B256::repeat_byte(0xa8);
+        let staged_height = 42;
+        orch.h2_v4_block_numbers.insert(staged_hash, staged_height);
+        orch.h2_v4_catchup_blocks
+            .insert(staged_height, (peer, vec![0x42], 43));
+
+        orch.request_h2_v4_gov5_block(peer, staged_hash);
+
+        assert!(
+            prx.try_recv().is_err(),
+            "an already-staged hash must not recursively walk the same ancestry"
+        );
+        assert!(!orch.h2_v4_fetch_requested_at.contains_key(&staged_hash));
     }
 
     #[tokio::test]
@@ -4155,6 +5660,262 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(2),
             "sync_started_at should belong to the replacement request"
+        );
+    }
+
+    #[test]
+    fn executed_h2_history_cannot_exhaust_the_bounded_catchup_suffix() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
+        let peer = n42_network::PeerId::random();
+
+        for height in 1..=2048 {
+            orch.h2_v4_catchup_blocks
+                .insert(height, (peer, vec![height as u8], height));
+        }
+        orch.h2_v4_catchup_active = true;
+        orch.head_block_number = 1600;
+        orch.prune_executed_h2_v4_catchup_history();
+
+        assert_eq!(orch.h2_v4_catchup_blocks.len(), 448);
+        assert_eq!(orch.h2_v4_last_pruned_head_block_number, Some(1600));
+        assert_eq!(
+            orch.h2_v4_catchup_blocks
+                .first_key_value()
+                .map(|(height, _)| *height),
+            Some(1601)
+        );
+        assert!(orch.h2_v4_catchup_active);
+
+        orch.h2_v4_catchup_blocks
+            .insert(1500, (peer, vec![0xff], 1500));
+        orch.prune_executed_h2_v4_catchup_history();
+        assert!(!orch.h2_v4_catchup_blocks.contains_key(&1500));
+
+        orch.head_block_number = 2048;
+        orch.prune_executed_h2_v4_catchup_history();
+        assert!(orch.h2_v4_catchup_blocks.is_empty());
+        assert!(!orch.h2_v4_catchup_active);
+    }
+
+    #[test]
+    fn h2_catchup_buffer_keeps_the_conservative_default() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx)
+            .with_h2_v4_catchup_buffer_blocks(DEFAULT_H2_V4_CATCHUP_BUFFER_BLOCKS);
+        let peer = n42_network::PeerId::random();
+
+        for height in 1..=DEFAULT_H2_V4_CATCHUP_BUFFER_BLOCKS {
+            orch.h2_v4_catchup_blocks
+                .insert(height as u64, (peer, vec![height as u8], height as u64));
+        }
+
+        assert!(!orch.stage_h2_v4_catchup_block(peer, vec![0xff], 2049, 3049, true));
+        assert_eq!(
+            orch.h2_v4_catchup_blocks.len(),
+            DEFAULT_H2_V4_CATCHUP_BUFFER_BLOCKS
+        );
+    }
+
+    #[test]
+    fn h2_catchup_buffer_can_be_explicitly_expanded_but_remains_hard_capped() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx)
+            .with_h2_v4_catchup_buffer_blocks(4096);
+        let peer = n42_network::PeerId::random();
+
+        for height in 1..=DEFAULT_H2_V4_CATCHUP_BUFFER_BLOCKS {
+            orch.h2_v4_catchup_blocks
+                .insert(height as u64, (peer, vec![height as u8], height as u64));
+        }
+
+        assert!(orch.stage_h2_v4_catchup_block(peer, vec![0xff], 2049, 3049, true));
+        assert_eq!(orch.h2_v4_catchup_blocks.len(), 2049);
+        assert_eq!(
+            orch.h2_v4_catchup_blocks
+                .get(&2049)
+                .map(|(_, _, authenticated_view)| *authenticated_view),
+            Some(3049)
+        );
+
+        orch = orch.with_h2_v4_catchup_buffer_blocks(usize::MAX);
+        assert_eq!(
+            orch.h2_v4_catchup_buffer_blocks,
+            MAX_H2_V4_CATCHUP_BUFFER_BLOCKS
+        );
+    }
+
+    #[test]
+    fn long_h2_catchup_retains_views_after_live_binding_eviction() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx)
+            .with_h2_v4_catchup_buffer_blocks(4096);
+        let source = n42_network::PeerId::random();
+        let mut parent = B256::repeat_byte(0x61);
+        orch.head_block_hash = parent;
+
+        for height in 1..=2049_u64 {
+            let view = height + 100;
+            let (hash, rlp) = test_gov5_block_rlp(parent, height, view);
+            orch.h2_v4_catchup_blocks
+                .insert(height, (source, rlp, view));
+            orch.remember_h2_v4_block_view(hash, view);
+            parent = hash;
+        }
+        orch.h2_v4_catchup_active = true;
+
+        assert_eq!(orch.h2_v4_block_views.len(), 2048);
+        assert_eq!(
+            orch.ready_h2_v4_catchup_heights(),
+            Some((1..=2049).collect())
+        );
+        assert_eq!(
+            orch.h2_v4_catchup_blocks
+                .get(&1)
+                .map(|(_, _, authenticated_view)| *authenticated_view),
+            Some(101)
+        );
+    }
+
+    #[test]
+    fn bound_h2_bodies_are_released_in_execution_height_order() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
+        let source = n42_network::PeerId::random();
+        let mut parent = B256::repeat_byte(0x70);
+        let mut expected = Vec::new();
+
+        for (height, view) in [(101, 201), (102, 202), (103, 203)] {
+            let (hash, rlp) = test_gov5_block_rlp(parent, height, view);
+            orch.h2_v4_unbound_blocks.insert(hash, (source, rlp));
+            orch.h2_v4_block_views.insert(hash, view);
+            expected.push(hash);
+            parent = hash;
+        }
+
+        assert_eq!(
+            orch.ready_h2_v4_bound_blocks_in_height_order(),
+            expected,
+            "a hash-keyed body cache must still release canonical ancestry by height"
+        );
+    }
+
+    #[test]
+    fn full_h2_binding_cache_evicts_oldest_not_new_low_hash() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
+        let mut oldest = B256::ZERO;
+
+        for index in 0..2048_u64 {
+            let mut bytes = [0xf0; 32];
+            bytes[24..].copy_from_slice(&index.to_be_bytes());
+            let hash = B256::from(bytes);
+            if index == 0 {
+                oldest = hash;
+            }
+            orch.remember_h2_v4_block_view(hash, index + 1);
+        }
+
+        let live_low_hash = B256::repeat_byte(0x05);
+        orch.remember_h2_v4_block_view(live_low_hash, 4096);
+
+        assert_eq!(orch.h2_v4_block_views.len(), 2048);
+        assert!(
+            orch.h2_v4_block_views.contains_key(&live_low_hash),
+            "a newly authenticated low-valued hash must not evict itself"
+        );
+        assert!(
+            !orch.h2_v4_block_views.contains_key(&oldest),
+            "capacity eviction must remove the oldest binding"
+        );
+        let mut second_bytes = [0xf0; 32];
+        second_bytes[24..].copy_from_slice(&1_u64.to_be_bytes());
+        assert_eq!(
+            orch.h2_v4_block_view_order.front().copied(),
+            Some(B256::from(second_bytes))
+        );
+        assert_eq!(
+            orch.h2_v4_block_view_order.back().copied(),
+            Some(live_low_hash)
+        );
+    }
+
+    #[test]
+    fn direct_h2_successor_is_staged_before_a_later_child_activates_catchup() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
+        let source = n42_network::PeerId::random();
+        orch.head_block_number = 100;
+
+        assert!(orch.stage_h2_v4_catchup_block(source, vec![0x01], 101, 201, false));
+        assert!(!orch.h2_v4_catchup_active);
+        assert!(orch.stage_h2_v4_catchup_block(source, vec![0x02], 102, 202, true));
+        assert!(orch.h2_v4_catchup_active);
+        assert_eq!(
+            orch.h2_v4_catchup_blocks
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![101, 102],
+            "the first missing parent must remain available when its child reveals the gap"
+        );
+
+        orch.head_block_number = 101;
+        orch.prune_executed_h2_v4_catchup_history();
+        assert_eq!(
+            orch.h2_v4_catchup_blocks
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![102]
+        );
+    }
+
+    #[test]
+    fn staged_h2_successor_becomes_releasable_when_async_parent_advances_head() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
+        let source = n42_network::PeerId::random();
+        let old_head = B256::repeat_byte(0x60);
+        let (parent_hash, _parent_rlp) = test_gov5_block_rlp(old_head, 101, 201);
+        let (successor_hash, successor_rlp) = test_gov5_block_rlp(parent_hash, 102, 202);
+        orch.head_block_hash = old_head;
+        orch.head_block_number = 100;
+        orch.remember_h2_v4_block_view(successor_hash, 202);
+
+        assert!(orch.stage_h2_v4_catchup_block(source, successor_rlp, 102, 202, true));
+        assert_eq!(
+            orch.ready_h2_v4_catchup_heights(),
+            None,
+            "the successor must wait while its parent is still executing"
+        );
+
+        // This models the asynchronous parent new_payload/FCU completion that
+        // previously left the already-buffered successor stranded forever.
+        orch.head_block_hash = parent_hash;
+        orch.head_block_number = 101;
+        orch.prune_executed_h2_v4_catchup_history();
+
+        assert_eq!(
+            orch.ready_h2_v4_catchup_heights(),
+            Some(vec![102]),
+            "moving the durable head to the parent must release the staged successor"
         );
     }
 
@@ -4943,6 +6704,68 @@ mod tests {
                     (key.key().name() == "n42_sync_blocks_out_of_range_total").then_some(value)
                 });
         assert_eq!(dropped, Some(DebugValue::Counter(1)));
+    }
+
+    #[test]
+    fn sync_qc_rejects_old_committee_signing_future_view() {
+        let (mut engine, output_rx) = make_test_engine_with_validator_count(4, 0);
+        let old_keys: Vec<_> = (0..4).map(test_key).collect();
+        let old_set = engine.epoch_manager().current_validator_set().clone();
+        *engine.epoch_manager_mut() = EpochManager::with_epoch_length(old_set.clone(), 10);
+
+        let next_infos = (0..5)
+            .map(|i| {
+                let key = test_key(0x80 + i);
+                ValidatorInfo {
+                    address: Address::with_last_byte(0x80 + i),
+                    bls_public_key: key.public_key(),
+                    p2p_peer_id: None,
+                }
+            })
+            .collect::<Vec<_>>();
+        engine
+            .epoch_manager_mut()
+            .stage_next_epoch(&next_infos, 1)
+            .unwrap();
+        assert!(engine.epoch_manager_mut().advance_epoch());
+
+        let block_hash = B256::repeat_byte(0xA9);
+        let message =
+            n42_consensus::protocol::quorum::commit_signing_message(11, &block_hash, &B256::ZERO);
+        let signatures = old_keys[..3]
+            .iter()
+            .map(|key| key.sign(&message))
+            .collect::<Vec<_>>();
+        let signature_refs = signatures.iter().collect::<Vec<_>>();
+        let aggregate_signature =
+            n42_primitives::bls::AggregateSignature::aggregate(&signature_refs).unwrap();
+        let mut signers = QuorumCertificate::genesis().signers;
+        signers.resize(4, false);
+        for index in 0..3 {
+            signers.set(index, true);
+        }
+        let commit_qc = QuorumCertificate {
+            view: 11,
+            block_hash,
+            aggregate_signature,
+            signers,
+        };
+
+        let (network, _cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let service = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
+        let block = n42_network::SyncBlock {
+            view: 11,
+            block_hash,
+            commit_qc,
+            payload: vec![1],
+            validator_changes: None,
+        };
+
+        assert!(
+            !service.verify_sync_block_qc(&block),
+            "a cryptographically valid old committee is not authorized at the future view"
+        );
     }
 
     /// A CommitQC child can finalize a prepared execution ancestor that has no

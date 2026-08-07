@@ -1,21 +1,20 @@
 use alloy_primitives::B256;
 use n42_primitives::{
     BlsSecretKey,
-    consensus::{ConsensusMessage, QuorumCertificate, ViewNumber},
+    consensus::{ConsensusMessage, H2V4ChainIdentity, QuorumCertificate, ViewNumber},
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
 
 use super::bounded_fifo::BoundedFifoMap;
 use super::pacemaker::Pacemaker;
-use super::quorum::{
-    TimeoutCollector, VoteCollector, commit_signing_message, newview_signing_message,
-    signing_message, timeout_signing_message,
-};
+use super::quorum::{ConsensusSigningProfile, TimeoutCollector, VoteCollector};
+#[cfg(test)]
+use super::quorum::{commit_signing_message, signing_message, timeout_signing_message};
 use super::round::{Phase, RoundState};
-use crate::error::ConsensusResult;
+use crate::error::{ConsensusError, ConsensusResult};
 use crate::validator::{EpochManager, LeaderSelector, ValidatorSet};
 use crate::vote_log::{NoopVoteLog, VoteLogWriter};
 
@@ -227,12 +226,12 @@ pub enum EngineOutput {
     },
 }
 
-/// Pending proposal state (retained for timeout cleanup; with optimistic voting,
-/// R1 votes are sent immediately and this struct is rarely populated).
+/// Pending proposal state. Gov5-compatible H2 participants retain this until
+/// the execution layer confirms the matching block is valid.
 #[derive(Debug, Clone)]
 pub(super) struct PendingProposal {
-    pub(super) _view: ViewNumber,
-    pub(super) _block_hash: B256,
+    pub(super) view: ViewNumber,
+    pub(super) block_hash: B256,
 }
 
 /// The HotStuff-2 consensus engine.
@@ -260,6 +259,9 @@ pub struct ConsensusEngine {
     /// multiplications in `local_validator_index_for_view` (called on every message).
     pub(super) local_public_key: n42_primitives::BlsPublicKey,
     pub(super) epoch_manager: EpochManager,
+    /// Explicitly selected signing domain. Native is the safe default; H2-v4
+    /// is enabled only for gov5 participant mode.
+    pub(super) signing_profile: ConsensusSigningProfile,
     pub(super) round_state: RoundState,
     pub(super) pacemaker: Pacemaker,
     pub(super) vote_collector: Option<VoteCollector>,
@@ -278,6 +280,9 @@ pub struct ConsensusEngine {
     pub(super) pending_proposal: Option<PendingProposal>,
     /// Block hashes imported before their matching proposal arrived.
     pub(super) imported_blocks: HashSet<B256>,
+    /// Insertion order for bounded imported-block eviction. H2 import evidence
+    /// survives view changes because a new leader can repropose the same block.
+    pub(super) imported_block_fifo: VecDeque<B256>,
     /// Tracks which block hash each validator voted for (equivocation detection).
     /// Tracks R1 (Vote) per validator per view for equivocation detection.
     pub(super) equivocation_tracker: HashMap<u32, B256>,
@@ -367,6 +372,7 @@ impl ConsensusEngine {
             secret_key,
             local_public_key,
             epoch_manager,
+            signing_profile: ConsensusSigningProfile::Native,
             round_state: RoundState::new(),
             pacemaker: Pacemaker::new(base_timeout_ms, max_timeout_ms),
             vote_collector: None,
@@ -378,6 +384,7 @@ impl ConsensusEngine {
             output_tx,
             pending_proposal: None,
             imported_blocks: HashSet::new(),
+            imported_block_fifo: VecDeque::new(),
             equivocation_tracker: HashMap::new(),
             commit_equivocation_tracker: HashMap::new(),
             proposal_equivocation_tracker: HashMap::new(),
@@ -465,6 +472,7 @@ impl ConsensusEngine {
             secret_key,
             local_public_key,
             epoch_manager,
+            signing_profile: ConsensusSigningProfile::Native,
             round_state: RoundState::from_snapshot(
                 recovered_view,
                 locked_qc,
@@ -483,6 +491,7 @@ impl ConsensusEngine {
             output_tx,
             pending_proposal: None,
             imported_blocks: HashSet::new(),
+            imported_block_fifo: VecDeque::new(),
             equivocation_tracker: HashMap::new(),
             commit_equivocation_tracker: HashMap::new(),
             proposal_equivocation_tracker: HashMap::new(),
@@ -496,6 +505,17 @@ impl ConsensusEngine {
     }
 
     // ── Public accessors ──
+
+    /// Enables gov5-compatible, chain-bound H2-v4 signatures. This does not
+    /// change wire routing by itself, so observer and native nodes remain
+    /// unaffected unless the participant bridge is also explicitly enabled.
+    pub fn enable_h2_v4_signing(&mut self, identity: H2V4ChainIdentity) {
+        self.signing_profile = ConsensusSigningProfile::H2V4(identity);
+    }
+
+    pub fn signing_profile(&self) -> ConsensusSigningProfile {
+        self.signing_profile
+    }
 
     pub fn current_view(&self) -> ViewNumber {
         self.round_state.current_view()
@@ -543,14 +563,14 @@ impl ConsensusEngine {
                     .validator_set_for_view(proposal.view)
                     .get_public_key(proposal.proposer)
                     .ok()?;
-                let sig_msg = crate::protocol::quorum::proposal_signing_message(
+                let sig_msg = self.signing_profile.proposal_message(
                     proposal.view,
-                    &proposal.block_hash,
+                    proposal.block_hash,
                     &proposal.validator_changes,
                 );
-                if pk
-                    .verify_prevalidated(&sig_msg, &proposal.signature)
-                    .is_err()
+                if !self
+                    .signing_profile
+                    .verify_single(pk, &sig_msg, &proposal.signature)
                 {
                     tracing::debug!(target: "n42::consensus", view = proposal.view, proposer = proposal.proposer, "proposal signature verification failed");
                     return None;
@@ -562,8 +582,13 @@ impl ConsensusEngine {
                     .validator_set_for_view(vote.view)
                     .get_public_key(vote.voter)
                     .ok()?;
-                let sig_msg = signing_message(vote.view, &vote.block_hash);
-                if pk.verify_prevalidated(&sig_msg, &vote.signature).is_err() {
+                let sig_msg = self
+                    .signing_profile
+                    .vote_message(vote.view, vote.block_hash);
+                if !self
+                    .signing_profile
+                    .verify_single(pk, &sig_msg, &vote.signature)
+                {
                     tracing::debug!(target: "n42::consensus", view = vote.view, voter = vote.voter, "vote signature verification failed");
                     return None;
                 }
@@ -579,14 +604,14 @@ impl ConsensusEngine {
                 // not be cached yet. The canonical verification re-runs in
                 // process_commit_vote with the same fallback semantics.
                 let changes_hash = self.cached_changes_hash(&commit_vote.block_hash);
-                let sig_msg = commit_signing_message(
+                let sig_msg = self.signing_profile.commit_message(
                     commit_vote.view,
-                    &commit_vote.block_hash,
-                    &changes_hash,
+                    commit_vote.block_hash,
+                    changes_hash,
                 );
-                if pk
-                    .verify_prevalidated(&sig_msg, &commit_vote.signature)
-                    .is_err()
+                if !self
+                    .signing_profile
+                    .verify_single(pk, &sig_msg, &commit_vote.signature)
                 {
                     tracing::debug!(target: "n42::consensus", view = commit_vote.view, voter = commit_vote.voter, "commit_vote signature verification failed");
                     return None;
@@ -598,10 +623,10 @@ impl ConsensusEngine {
                     .validator_set_for_view(timeout.view)
                     .get_public_key(timeout.sender)
                     .ok()?;
-                let sig_msg = timeout_signing_message(timeout.view);
-                if pk
-                    .verify_prevalidated(&sig_msg, &timeout.signature)
-                    .is_err()
+                let sig_msg = self.signing_profile.timeout_message(timeout.view);
+                if !self
+                    .signing_profile
+                    .verify_single(pk, &sig_msg, &timeout.signature)
                 {
                     tracing::debug!(target: "n42::consensus", view = timeout.view, sender = timeout.sender, "timeout signature verification failed");
                     return None;
@@ -613,10 +638,10 @@ impl ConsensusEngine {
                     .validator_set_for_view(new_view.view)
                     .get_public_key(new_view.leader)
                     .ok()?;
-                let sig_msg = newview_signing_message(new_view.view);
-                if pk
-                    .verify_prevalidated(&sig_msg, &new_view.signature)
-                    .is_err()
+                let sig_msg = self.signing_profile.new_view_message(new_view.view);
+                if !self
+                    .signing_profile
+                    .verify_single(pk, &sig_msg, &new_view.signature)
                 {
                     tracing::debug!(target: "n42::consensus", view = new_view.view, leader = new_view.leader, "new_view signature verification failed");
                     return None;
@@ -650,7 +675,8 @@ impl ConsensusEngine {
                     candidates.push((
                         position,
                         AuthenticatedVoteProof::Vote { signer: vote.voter },
-                        signing_message(vote.view, &vote.block_hash).to_vec(),
+                        self.signing_profile
+                            .vote_message(vote.view, vote.block_hash),
                         &vote.signature,
                         public_key,
                     ));
@@ -669,12 +695,11 @@ impl ConsensusEngine {
                             signer: commit_vote.voter,
                             validator_changes_hash: changes_hash,
                         },
-                        commit_signing_message(
+                        self.signing_profile.commit_message(
                             commit_vote.view,
-                            &commit_vote.block_hash,
-                            &changes_hash,
-                        )
-                        .to_vec(),
+                            commit_vote.block_hash,
+                            changes_hash,
+                        ),
                         &commit_vote.signature,
                         public_key,
                     ));
@@ -695,15 +720,13 @@ impl ConsensusEngine {
             .iter()
             .map(|(_, _, _, _, public_key)| *public_key)
             .collect::<Vec<_>>();
-        let bad = n42_primitives::bls::batch_verify_with_fallback(
-            &signing_messages,
-            &signatures,
-            &public_keys,
-        )
-        .err()
-        .unwrap_or_default()
-        .into_iter()
-        .collect::<HashSet<_>>();
+        let bad = self
+            .signing_profile
+            .batch_verify(&signing_messages, &signatures, &public_keys)
+            .err()
+            .unwrap_or_default()
+            .into_iter()
+            .collect::<HashSet<_>>();
 
         let mut verified_proofs = vec![None; messages.len()];
         for (candidate_position, (message_position, proof, ..)) in candidates.iter().enumerate() {
@@ -1056,14 +1079,17 @@ impl ConsensusEngine {
         // we fall back to ZERO since the proposal is not yet cached on this
         // far-behind node (acceptable: the next regular proposal will retry).
         let verify_result = match msg {
-            ConsensusMessage::Decide(decide) => super::quorum::verify_commit_qc(
+            ConsensusMessage::Decide(decide) => super::quorum::verify_commit_qc_with_profile(
                 qc,
                 self.validator_set_for_view(qc.view),
                 &decide.validator_changes_hash,
+                self.signing_profile,
             ),
-            ConsensusMessage::PrepareQC(_) => {
-                super::quorum::verify_qc(qc, self.validator_set_for_view(qc.view))
-            }
+            ConsensusMessage::PrepareQC(_) => super::quorum::verify_qc_with_profile(
+                qc,
+                self.validator_set_for_view(qc.view),
+                self.signing_profile,
+            ),
             ConsensusMessage::Proposal(_)
             | ConsensusMessage::Timeout(_)
             | ConsensusMessage::NewView(_) => self.verify_qc_any_domain_or_known(qc),
@@ -1206,7 +1232,14 @@ impl ConsensusEngine {
         });
         self.prepare_qc = None;
         self.pending_proposal = None;
-        self.imported_blocks.clear();
+        // Gov5 keeps successful import evidence across view changes: a new
+        // leader commonly reproposes the same uncommitted block, and reth will
+        // not emit a second import completion for it. Native optimistic voting
+        // does not need this cache beyond the view.
+        if !matches!(self.signing_profile, ConsensusSigningProfile::H2V4(_)) {
+            self.imported_blocks.clear();
+            self.imported_block_fifo.clear();
+        }
         self.equivocation_tracker.clear();
         self.commit_equivocation_tracker.clear();
         self.proposal_equivocation_tracker.clear();
@@ -1259,46 +1292,32 @@ impl ConsensusEngine {
         self.epoch_manager.validator_set_for_view(view)
     }
 
-    /// Resolves the correct validator set for QC verification.
+    /// Resolves the validator set authorized for a QC's exact view.
     ///
-    /// `validator_set_for_view` uses a mathematical epoch formula that diverges
-    /// from the actual epoch state in the "epoch-drift zone": after a validator-set
-    /// transition the formula may map old views to the wrong epoch number, causing
-    /// it to fall back to the current (larger) set.  For example, after advancing
-    /// from epoch 0 (3 validators) to epoch 1 (4 validators) at view 151, the first
-    /// proposal carries a justify_qc from view 150.  `epoch_for_view(150)` = 4,
-    /// which is neither the current epoch (1) nor in history (only epoch 0 stored),
-    /// so `validator_set_for_view` falls back to the current 4-validator set.
-    /// Verifying a 3-bit bitmap against a 4-validator set then fails.
-    ///
-    /// This method detects the mismatch via bitmap-size comparison and falls back
-    /// to `find_validator_set_by_len`, which searches current / next / historical
-    /// sets by validator count.  BLS verification in the caller confirms correctness.
+    /// A valid BLS signature proves only that the selected keys signed the message;
+    /// it does not prove that those keys were authorized for the claimed view. Never
+    /// substitute another known set merely because its length matches the bitmap.
     pub(super) fn resolve_qc_validator_set(
         &self,
         qc: &n42_primitives::consensus::QuorumCertificate,
-    ) -> &ValidatorSet {
-        let primary = self.validator_set_for_view(qc.view);
-        if primary.len() as usize == qc.signers.len() {
-            return primary;
+    ) -> ConsensusResult<&ValidatorSet> {
+        let Some(authorized) = self.epoch_manager.known_validator_set_for_view(qc.view) else {
+            return Err(ConsensusError::InvalidQC {
+                view: qc.view,
+                reason: "validator set unavailable for certificate view".into(),
+            });
+        };
+        if authorized.len() as usize != qc.signers.len() {
+            return Err(ConsensusError::InvalidQC {
+                view: qc.view,
+                reason: format!(
+                    "signer bitmap length {} does not match authorized validator set length {}",
+                    qc.signers.len(),
+                    authorized.len()
+                ),
+            });
         }
-        // Bitmap size doesn't match the primary set — epoch drift has occurred.
-        // Search all known sets by size; BLS in the caller will confirm the match.
-        if let Some(vs) = self
-            .epoch_manager
-            .find_validator_set_by_len(qc.signers.len())
-        {
-            tracing::debug!(
-                target: "n42::cl::engine",
-                qc_view = qc.view,
-                primary_len = primary.len(),
-                bitmap_len = qc.signers.len(),
-                "epoch-drift fallback: using historical validator set for QC verification"
-            );
-            return vs;
-        }
-        // No set matched the bitmap size; return primary and let BLS fail clearly.
-        primary
+        Ok(authorized)
     }
 
     pub(super) fn leader_index_for_view(&self, view: ViewNumber) -> u32 {
@@ -1339,7 +1358,12 @@ impl ConsensusEngine {
         }
 
         let changes_hash = self.cached_changes_hash(&qc.block_hash);
-        super::quorum::verify_qc_any_domain(qc, self.resolve_qc_validator_set(qc), &changes_hash)
+        super::quorum::verify_qc_any_domain_with_profile(
+            qc,
+            self.resolve_qc_validator_set(qc)?,
+            &changes_hash,
+            self.signing_profile,
+        )
     }
 
     pub(super) fn emit(&self, output: EngineOutput) -> ConsensusResult<()> {
@@ -1573,6 +1597,36 @@ mod tests {
         }
     }
 
+    fn signed_h2_test_proposal(
+        engine: &ConsensusEngine,
+        view: ViewNumber,
+        block_hash: B256,
+        proposer: u32,
+        signer: &n42_primitives::BlsSecretKey,
+    ) -> Proposal {
+        let validator_changes = None;
+        let message = engine
+            .signing_profile
+            .proposal_message(view, block_hash, &validator_changes);
+        Proposal {
+            view,
+            block_hash,
+            justify_qc: QuorumCertificate::genesis(),
+            proposer,
+            signature: engine.signing_profile.sign(signer, &message),
+            prepare_qc: None,
+            tx_root_hash: None,
+            validator_changes,
+        }
+    }
+
+    fn enable_test_h2(engine: &mut ConsensusEngine) {
+        engine.enable_h2_v4_signing(H2V4ChainIdentity {
+            chain_id: 1143,
+            genesis_hash: B256::repeat_byte(0x42),
+        });
+    }
+
     #[test]
     fn test_recovered_commit_qc_with_changes_can_justify_first_proposal() {
         let (fresh, sks, vs, _fresh_rx) = make_engine(4, 0);
@@ -1702,6 +1756,42 @@ mod tests {
             .filter(|output| matches!(output, EngineOutput::EpochTransition { .. }))
             .count();
         assert_eq!(transitions, 2);
+    }
+
+    #[test]
+    fn test_qc_resolver_rejects_old_committee_for_future_view() {
+        let (mut engine, old_keys, old_set, _output_rx) = make_engine(4, 0);
+        engine.epoch_manager = EpochManager::with_epoch_length(old_set.clone(), 10);
+
+        let mut next_infos = vec![ValidatorInfo {
+            address: Address::with_last_byte(0),
+            bls_public_key: old_keys[0].public_key(),
+            p2p_peer_id: None,
+        }];
+        next_infos.extend((0..4).map(|i| {
+            let key = test_key(0x90 + i);
+            ValidatorInfo {
+                address: Address::with_last_byte(0x90 + i),
+                bls_public_key: key.public_key(),
+                p2p_peer_id: None,
+            }
+        }));
+        engine
+            .epoch_manager
+            .stage_next_epoch(&next_infos, 1)
+            .unwrap();
+        engine.advance_to_view(11).unwrap();
+
+        // The removed epoch-0 committee can produce a cryptographically valid
+        // certificate over arbitrary future-view bytes. It is not authorized at
+        // view 11, and its four-bit bitmap must not select it over the active
+        // five-validator committee.
+        let forged =
+            build_test_commit_qc(11, B256::repeat_byte(0xA7), &old_keys, &old_set, &[0, 1, 2]);
+        assert!(matches!(
+            engine.resolve_qc_validator_set(&forged),
+            Err(ConsensusError::InvalidQC { .. })
+        ));
     }
 
     /// Tests that `sync_local_validator_index` correctly updates `my_index`
@@ -2503,6 +2593,79 @@ mod tests {
             o,
             EngineOutput::SendToValidator(_, ConsensusMessage::Vote(_))
         )));
+    }
+
+    #[test]
+    fn test_h2_vote_waits_for_execution_import() {
+        let (mut engine, sks, _, mut rx) = make_engine(4, 0);
+        enable_test_h2(&mut engine);
+        let block_hash = B256::repeat_byte(0xE1);
+        let proposal = signed_h2_test_proposal(&engine, 1, block_hash, 1, &sks[1]);
+
+        engine
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(
+                proposal,
+            )))
+            .expect("H2 proposal should be accepted");
+
+        let before_import: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(before_import.iter().any(
+            |output| matches!(output, EngineOutput::ExecuteBlock(hash) if *hash == block_hash)
+        ));
+        assert!(!before_import.iter().any(|output| matches!(
+            output,
+            EngineOutput::SendToValidator(_, ConsensusMessage::Vote(_))
+        )));
+
+        engine
+            .process_event(ConsensusEvent::BlockImported(block_hash))
+            .expect("execution-valid import should release the H2 vote");
+        let after_import: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(after_import.iter().any(|output| matches!(
+            output,
+            EngineOutput::SendToValidator(_, ConsensusMessage::Vote(vote))
+                if vote.block_hash == block_hash && vote.view == 1
+        )));
+    }
+
+    #[test]
+    fn test_h2_import_before_proposal_votes_immediately() {
+        let (mut engine, sks, _, mut rx) = make_engine(4, 0);
+        enable_test_h2(&mut engine);
+        let block_hash = B256::repeat_byte(0xE2);
+        engine
+            .process_event(ConsensusEvent::BlockImported(block_hash))
+            .expect("early execution-valid import should be cached");
+        let proposal = signed_h2_test_proposal(&engine, 1, block_hash, 1, &sks[1]);
+
+        engine
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(
+                proposal,
+            )))
+            .expect("H2 proposal should use prior import evidence");
+
+        assert!(
+            std::iter::from_fn(|| rx.try_recv().ok()).any(|output| matches!(
+                output,
+                EngineOutput::SendToValidator(_, ConsensusMessage::Vote(vote))
+                    if vote.block_hash == block_hash && vote.view == 1
+            ))
+        );
+    }
+
+    #[test]
+    fn test_h2_import_evidence_survives_view_change() {
+        let (mut engine, _, _, mut rx) = make_engine(4, 0);
+        enable_test_h2(&mut engine);
+        let block_hash = B256::repeat_byte(0xE3);
+        engine
+            .process_event(ConsensusEvent::BlockImported(block_hash))
+            .expect("import should be cached");
+        engine.advance_to_view(2).expect("view should advance");
+        while rx.try_recv().is_ok() {}
+
+        assert!(engine.imported_blocks.contains(&block_hash));
+        assert_eq!(engine.imported_block_fifo.front(), Some(&block_hash));
     }
 
     #[test]
@@ -3792,7 +3955,48 @@ mod tests {
             .process_event(ConsensusEvent::BlockImported(B256::repeat_byte(0xFF)))
             .expect("BlockImported at capacity should succeed");
         assert_eq!(engine.imported_blocks.len(), 64);
-        assert!(!engine.imported_blocks.contains(&B256::repeat_byte(0xFF)));
+        assert!(engine.imported_blocks.contains(&B256::repeat_byte(0xFF)));
+        assert!(!engine.imported_blocks.contains(&B256::repeat_byte(0)));
+    }
+
+    /// A deferred H2 vote waits on one specific hash, and catching up imports
+    /// enough blocks to evict it. The awaited entry must survive: the
+    /// orchestrator never re-emits `BlockImported` for a hash reth already
+    /// executed, so evicting it would strand the vote for the whole view.
+    #[test]
+    fn imported_block_eviction_keeps_the_hash_a_deferred_vote_waits_on() {
+        let (mut engine, _sks, _, _rx) = make_engine(4, 0);
+        let awaited = B256::repeat_byte(0x01);
+
+        engine
+            .process_event(ConsensusEvent::BlockImported(awaited))
+            .expect("BlockImported should succeed");
+        engine.pending_proposal = Some(PendingProposal {
+            view: engine.current_view(),
+            block_hash: awaited,
+        });
+
+        for index in 0..128u64 {
+            let mut bytes = [0x7f; 32];
+            bytes[24..].copy_from_slice(&index.to_be_bytes());
+            engine
+                .process_event(ConsensusEvent::BlockImported(B256::from(bytes)))
+                .expect("BlockImported should succeed");
+        }
+
+        assert!(
+            engine.imported_blocks.contains(&awaited),
+            "the awaited hash must not be evicted while a vote is deferred on it"
+        );
+        assert!(
+            engine.imported_blocks.len() <= 65,
+            "keeping the live hash must not unbound the cache: {}",
+            engine.imported_blocks.len()
+        );
+        assert_eq!(
+            engine.imported_blocks.len(),
+            engine.imported_block_fifo.len()
+        );
     }
 
     #[test]
@@ -4315,10 +4519,11 @@ mod tests {
     }
 
     #[test]
-    fn test_verified_repeat_timeout_is_relayed_to_next_leader() {
+    fn test_verified_repeat_timeout_is_relayed_to_next_leader_once() {
         // View 1's next leader is validator 2 in a four-validator set. Validator 0
-        // has already timed out and receives validator 1's vote; even a duplicate
-        // must be sent directly to validator 2 so a reconnect cannot strand the TC.
+        // has already timed out and receives validator 1's vote. The first verified
+        // copy is relayed, while redundant H2-v4 transport copies must not be fanned
+        // out again or they form a positive feedback loop.
         let (mut engine, sks, _, mut rx) = make_engine(4, 0);
         engine.on_timeout().expect("local timeout");
         while rx.try_recv().is_ok() {}
@@ -4330,7 +4535,7 @@ mod tests {
             signature: sks[1].sign(&timeout_signing_message(1)),
         };
 
-        for expected_attempt in 1..=2 {
+        for expected_relays in [1, 0] {
             engine
                 .process_event(ConsensusEvent::Message(ConsensusMessage::Timeout(
                     timeout.clone(),
@@ -4349,8 +4554,8 @@ mod tests {
                 })
                 .count();
             assert_eq!(
-                relays, 1,
-                "relay attempt {expected_attempt} must target the next leader"
+                relays, expected_relays,
+                "only the first verified timeout copy may be relayed"
             );
         }
     }
@@ -4448,10 +4653,18 @@ mod tests {
 
         let (fresh, sks, vs, _) = make_engine(4, 3);
         let (output_tx, mut output_rx) = mpsc::channel(64);
+        let mut epoch_manager = EpochManager::from_epoch(vs.clone(), 30, 1);
+        // Cross-epoch recovery is safe only when the target view's authority is
+        // known exactly. A static schedule may explicitly stage the unchanged
+        // committee; absence of a staged set must fail closed because the lagging
+        // node cannot know whether remote governance rotated membership.
+        epoch_manager
+            .stage_next_epoch(&vs.validator_infos(), vs.fault_tolerance())
+            .unwrap();
         let mut engine = ConsensusEngine::with_recovered_state(
             3,
             sks[3].clone(),
-            EpochManager::from_epoch(vs.clone(), 30, 1),
+            epoch_manager,
             60_000,
             120_000,
             output_tx,

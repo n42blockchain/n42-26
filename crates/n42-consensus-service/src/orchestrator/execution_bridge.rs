@@ -25,6 +25,10 @@ pub fn compact_block_enabled() -> bool {
     })
 }
 
+fn should_broadcast_execution_output(h2_v4_participant: bool) -> bool {
+    compact_block_enabled() && !h2_v4_participant
+}
+
 fn elapsed_since_unix_ms(start_ms: u64) -> Option<u64> {
     (start_ms > 0).then(|| now_unix_ms().saturating_sub(start_ms))
 }
@@ -51,6 +55,18 @@ pub(super) const MAX_PENDING_BLOCK_DATA: usize = 16;
 
 /// Maximum number of blocks in the syncing retry queue.
 const MAX_SYNCING_QUEUE_SIZE: usize = 8;
+
+fn eager_import_already_validated(
+    guard: &std::sync::atomic::AtomicU64,
+    block_number: u64,
+) -> Option<u64> {
+    let validated = guard.load(std::sync::atomic::Ordering::Acquire);
+    (validated >= block_number).then_some(validated)
+}
+
+fn mark_eager_import_valid(guard: &std::sync::atomic::AtomicU64, block_number: u64) -> u64 {
+    guard.fetch_max(block_number, std::sync::atomic::Ordering::AcqRel)
+}
 
 impl ConsensusService {
     /// Builds `PayloadAttributes` with timestamp correction and reward withdrawal injection.
@@ -136,6 +152,27 @@ impl ConsensusService {
                 current_view = build_context.view, "build already in progress on this parent, skipping");
             return;
         }
+        if self.engine.last_voted_view() >= build_context.view {
+            debug!(
+                target: "n42::cl::exec_bridge",
+                view = build_context.view,
+                last_voted_view = self.engine.last_voted_view(),
+                %parent,
+                "leader already released a proposal/vote for this view; suppressing duplicate build"
+            );
+            self.next_build_at = None;
+            self.next_slot_timestamp = None;
+            self.clear_leader_build_wait();
+            return;
+        }
+
+        // This build supersedes any retry timer left behind by an earlier FCU
+        // Syncing result. Catch-up completion can invoke this method before that
+        // timer fires; leaving it armed would build a second child after the first
+        // proposal has already been released.
+        self.next_build_at = None;
+        self.next_slot_timestamp = None;
+        self.clear_leader_build_wait();
         let build_start = Instant::now();
         let pool_depth = self.pool_depth_snapshot();
         let view = build_context.view;
@@ -330,6 +367,7 @@ impl ConsensusService {
         let block_guard = self.eager_import_block_guard.clone();
         let exec_output_cache = self.exec_output_cache.clone();
         let bad_blocks = self.bad_blocks.clone();
+        let h2_v4_participant = self.h2_v4_identity.is_some();
 
         let handle = tokio::spawn(async move {
             // Allow builder time to pack transactions from the pool.
@@ -361,6 +399,7 @@ impl ConsensusService {
                         block_ready_tx,
                         leader_payload_tx,
                         current_view,
+                        h2_v4_participant,
                         blob_store,
                         exec_output_cache,
                         bad_blocks,
@@ -420,6 +459,14 @@ impl ConsensusService {
         };
 
         let hash = broadcast.block_hash;
+        // The Gov5 fetch is NOT retired here. At this point `hash` is only a
+        // self-declared field of an unauthenticated bincode envelope — the
+        // payload behind it is not checked against it until the eager import
+        // below. Retiring on it would let anyone who can reach this port cancel
+        // an in-flight ancestry fetch and suppress re-requests for 30s by
+        // gossiping a forged envelope carrying the victim's target hash.
+        // `handle_eager_import_done` retires it instead: reth has accepted that
+        // exact payload by then, so the hash is proven, not merely claimed.
         if self.bad_blocks.should_skip(hash, "block_data") {
             return;
         }
@@ -476,13 +523,17 @@ impl ConsensusService {
             return;
         }
 
-        // Notify consensus immediately — enables voting without EVM execution.
-        debug!(target: "n42::cl::exec_bridge", %hash, "block data cached, notifying consensus (deferred execution)");
-        if let Err(e) = self
-            .engine
-            .process_event(ConsensusEvent::BlockImported(hash))
-        {
-            error!(target: "n42::cl::exec_bridge", error = %e, "error processing BlockImported for deferred execution");
+        // Native mode preserves optimistic voting on cached data. Gov5 H2
+        // participant mode releases its vote only from eager_import_done after
+        // reth returns Valid for this exact payload.
+        if self.h2_v4_identity.is_none() {
+            debug!(target: "n42::cl::exec_bridge", %hash, "block data cached, notifying consensus (deferred execution)");
+            if let Err(e) = self
+                .engine
+                .process_event(ConsensusEvent::BlockImported(hash))
+            {
+                error!(target: "n42::cl::exec_bridge", error = %e, "error processing BlockImported for deferred execution");
+            }
         }
 
         // Follower eager import: start new_payload + fcu in parallel with consensus voting.
@@ -548,17 +599,20 @@ impl ConsensusService {
                     has_compact_block = execution_output_compressed.is_some(),
                     "N42_DECOMPRESS: follower payload decoded"
                 );
-                // Guard against duplicate imports for the same block number with different hashes.
-                // Sending new_payload for the same block number but different hash triggers
-                // reth pipeline sync and causes chain stalls.
+                // Only a block previously accepted as Valid may suppress another
+                // submission at this height. Advancing this watermark before
+                // `new_payload` returns lets an out-of-order child that returns
+                // Syncing poison the whole catch-up batch by suppressing its
+                // missing parents.
                 let block_number = execution_data.block_number();
                 let tx_count = execution_data.transaction_count();
                 if bad_blocks.should_skip(hash, "block_data_eager") {
                     return;
                 }
-                let prev = block_guard.fetch_max(block_number, std::sync::atomic::Ordering::SeqCst);
-                if prev >= block_number {
-                    info!(target: "n42::cl::exec_bridge", %hash, view, block_number, prev, "follower eager import: skipping duplicate block number");
+                if let Some(validated) =
+                    eager_import_already_validated(block_guard.as_ref(), block_number)
+                {
+                    info!(target: "n42::cl::exec_bridge", %hash, view, block_number, validated, "follower eager import: skipping already validated block number");
                     return;
                 }
 
@@ -592,6 +646,7 @@ impl ConsensusService {
                     // (stored, not executed) must fall through to the stale arm
                     // so a later commit never promotes an unexecuted block (F3).
                     Ok(status) if matches!(status.status, PayloadStatusEnum::Valid) => {
+                        mark_eager_import_valid(block_guard.as_ref(), block_number);
                         let np_elapsed = import_start.elapsed().as_millis() as u64;
                         let follower_import_ms = block_data_received.elapsed().as_millis() as u64;
                         let ready_to_accept_ms = elapsed_since_unix_ms(leader_ready_unix_ms);
@@ -930,6 +985,7 @@ impl ConsensusService {
         }
 
         self.advance_execution_validated_head(broadcast.view, broadcast.block_hash, "sync import");
+        crate::qualification_abort_at("execution_validated");
         self.complete_deferred_finalization(broadcast).await;
 
         if let Err(e) = self
@@ -1202,6 +1258,7 @@ async fn handle_built_payload(
     block_ready_tx: mpsc::Sender<super::PayloadBuildReady>,
     leader_payload_tx: mpsc::Sender<(B256, Vec<u8>)>,
     current_view: u64,
+    h2_v4_participant: bool,
     blob_store: Option<Arc<dyn BlobStorePort>>,
     exec_output_cache: Option<Arc<dyn ExecutionOutputCache>>,
     bad_blocks: super::bad_block_cache::BadBlockCache,
@@ -1211,13 +1268,56 @@ async fn handle_built_payload(
     build_context: super::PayloadBuildContext,
 ) {
     let BuiltBlock {
-        hash,
+        mut hash,
         number: block_number,
         timestamp: block_timestamp,
         tx_count,
-        execution_data,
+        mut execution_data,
         blob_tx_hashes,
     } = built;
+    let original_hash = hash;
+    if h2_v4_participant {
+        let original_parent = execution_data.parent_hash();
+        let (gov5_state_root, gov5_receipts_root, _execution_output) = match exec_output_cache
+            .as_ref()
+            .and_then(|cache| cache.take_gov5_normalization(original_hash, original_parent))
+        {
+            Some(cached) => cached,
+            None => {
+                error!(
+                    target: "n42::interop::h2v4",
+                    %original_hash,
+                    block_number,
+                    tx_count,
+                    "refusing to normalize Gov5 payload without its executed QMDB state and receipts"
+                );
+                return;
+            }
+        };
+        execution_data = match n42_network::normalize_execution_payload_for_gov5_h2(
+            &execution_data,
+            current_view,
+            gov5_state_root,
+            gov5_receipts_root,
+        ) {
+            Ok(normalized) => normalized,
+            Err(error) => {
+                error!(target: "n42::interop::h2v4", original_hash = %hash, %error, "refusing to propose a payload that cannot be normalized to the gov5 H2 header profile");
+                return;
+            }
+        };
+        hash = execution_data.block_hash();
+        // Header normalization necessarily changes the block hash, so the
+        // builder's execution result remains keyed by a hash that can never be
+        // submitted or broadcast. Drop it before validating the normalized
+        // payload to avoid an unbounded stale-cache tail on every Rust-led
+        // Gov5 view.
+        if hash != original_hash
+            && let Some(ref cache) = exec_output_cache
+        {
+            cache.evict(original_hash);
+        }
+    }
     let actual_parent = execution_data.parent_hash();
     if actual_parent != build_context.parent_hash {
         error!(target: "n42::cl::exec_bridge", %hash, %actual_parent,
@@ -1238,6 +1338,55 @@ async fn handle_built_payload(
     }
     if bad_blocks.should_skip(hash, "leader_built_payload") {
         return;
+    }
+    if h2_v4_participant {
+        let import_start = std::time::Instant::now();
+        match el.new_payload(execution_data.clone()).await {
+            Ok(status) if matches!(status.status, PayloadStatusEnum::Valid) => {
+                mark_eager_import_valid(block_guard.as_ref(), block_number);
+                info!(
+                    target: "n42::interop::h2v4",
+                    %hash,
+                    block_number,
+                    elapsed_ms = import_start.elapsed().as_millis() as u64,
+                    "validated normalized Gov5 leader payload before proposal release"
+                );
+                if eager_import_done_tx
+                    .send((hash, block_timestamp))
+                    .await
+                    .is_err()
+                {
+                    debug!(target: "n42::cl::exec_bridge", %hash, "leader eager import completion receiver dropped");
+                }
+            }
+            Ok(status) => {
+                if let Some(ref cache) = exec_output_cache {
+                    cache.evict(hash);
+                }
+                bad_blocks.insert_if_invalid(hash, &status.status, "gov5_leader_pre_proposal");
+                error!(
+                    target: "n42::interop::h2v4",
+                    %hash,
+                    block_number,
+                    status = ?status.status,
+                    "refusing to release Gov5 leader proposal before new_payload(Valid)"
+                );
+                return;
+            }
+            Err(error) => {
+                if let Some(ref cache) = exec_output_cache {
+                    cache.evict(hash);
+                }
+                error!(
+                    target: "n42::interop::h2v4",
+                    %hash,
+                    block_number,
+                    %error,
+                    "refusing to release Gov5 leader proposal after new_payload failure"
+                );
+                return;
+            }
+        }
     }
     {
         let span = tracing::Span::current();
@@ -1266,7 +1415,7 @@ async fn handle_built_payload(
     );
 
     // Compact Block: serialize execution output for followers to skip EVM re-execution.
-    let execution_output_bytes = if compact_block_enabled() {
+    let execution_output_bytes = if should_broadcast_execution_output(h2_v4_participant) {
         exec_output_cache
             .as_ref()
             .and_then(|c| c.take_serialized(hash))
@@ -1292,6 +1441,19 @@ async fn handle_built_payload(
         has_compact_block = execution_output_bytes.is_some(),
         "N42_TIMEOUT_VIEW: leader_ready"
     );
+    if h2_v4_participant {
+        let gov5_rlp = match n42_network::encode_gov5_block_rlp(&execution_data) {
+            Ok(encoded) => encoded,
+            Err(error) => {
+                error!(target: "n42::interop::h2v4", %hash, %error, "refusing to propose a payload that cannot be encoded for gov5 peers");
+                return;
+            }
+        };
+        if let Err(error) = network.broadcast_gov5_block_reliable(gov5_rlp).await {
+            error!(target: "n42::interop::h2v4", %hash, %error, "refusing to propose after gov5 block broadcast failed");
+            return;
+        }
+    }
     // 1. Broadcast block data + blob sidecars to followers
     broadcast_block_data(
         network.as_ref(),
@@ -1329,14 +1491,13 @@ async fn handle_built_payload(
     //    This is the key pipelining optimization — by the time finalize_committed_block
     //    runs after consensus commit, the block is likely already in reth (Case A).
     //
-    //    Guard: prevent importing the same block number with different hashes,
-    //    which triggers reth pipeline sync and chain stalls.
+    //    Guard: suppress only heights already accepted as Valid. A Syncing or
+    //    Accepted child must not prevent a late parent from reaching reth.
     if bad_blocks.should_skip(hash, "leader_eager_import_pre_submit") {
         return;
     }
-    let prev = block_guard.fetch_max(block_number, std::sync::atomic::Ordering::SeqCst);
-    if prev >= block_number {
-        debug!(target: "n42::cl::exec_bridge", %hash, block_number, prev, "leader eager import: skipping duplicate block number");
+    if let Some(validated) = eager_import_already_validated(block_guard.as_ref(), block_number) {
+        debug!(target: "n42::cl::exec_bridge", %hash, block_number, validated, "leader eager import: skipping already validated block number");
         return;
     }
     // Leader eager import: only run new_payload (no FCU).
@@ -1349,6 +1510,7 @@ async fn handle_built_payload(
         // executed) falls through to the stale arm so a later commit never
         // promotes an unexecuted block (F3).
         Ok(status) if matches!(status.status, PayloadStatusEnum::Valid) => {
+            mark_eager_import_valid(block_guard.as_ref(), block_number);
             let np_elapsed = import_start.elapsed().as_millis() as u64;
             info!(target: "n42::cl::exec_bridge", %hash, np_elapsed, "eager import: new_payload accepted (no FCU)");
             metrics::counter!("n42_eager_import_hits_total").increment(1);
@@ -1752,5 +1914,42 @@ mod blob_frame_tests {
         let (frames, oversized) = pack_blob_sidecar_frames(Vec::new(), 1024);
         assert!(frames.is_empty());
         assert_eq!(oversized, 0);
+    }
+}
+
+#[cfg(test)]
+mod eager_import_guard_tests {
+    use super::{
+        eager_import_already_validated, mark_eager_import_valid, should_broadcast_execution_output,
+    };
+    use std::sync::atomic::AtomicU64;
+
+    #[test]
+    fn out_of_order_syncing_child_does_not_suppress_missing_parents() {
+        let guard = AtomicU64::new(95);
+
+        // Block 101 reaches new_payload first and returns Syncing. The caller
+        // deliberately does not mark that outcome, leaving all missing parents
+        // eligible for submission.
+        assert_eq!(eager_import_already_validated(&guard, 101), None);
+        assert_eq!(eager_import_already_validated(&guard, 98), None);
+        assert_eq!(eager_import_already_validated(&guard, 99), None);
+        assert_eq!(eager_import_already_validated(&guard, 100), None);
+
+        mark_eager_import_valid(&guard, 98);
+        assert_eq!(eager_import_already_validated(&guard, 98), Some(98));
+        assert_eq!(eager_import_already_validated(&guard, 99), None);
+
+        mark_eager_import_valid(&guard, 100);
+        assert_eq!(eager_import_already_validated(&guard, 99), Some(100));
+        assert_eq!(eager_import_already_validated(&guard, 101), None);
+    }
+
+    #[test]
+    fn normalized_gov5_payload_never_broadcasts_builder_compact_output() {
+        // Header normalization changes the block hash and selects the QMDB
+        // state-root profile. A builder-side Ethereum execution result is not
+        // valid compact data for that normalized payload.
+        assert!(!should_broadcast_execution_output(true));
     }
 }

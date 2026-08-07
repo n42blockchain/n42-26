@@ -16,6 +16,22 @@ pub trait ExecutionOutputCache: Send + Sync {
     /// leader puts in `BlockDataBroadcast.execution_output`.
     fn take_serialized(&self, hash: B256) -> Option<Vec<u8>>;
 
+    /// Take the locally built execution output, derive the chain-native QMDB
+    /// state and receipts commitments from the authenticated parent branch,
+    /// and serialize the same output for compact broadcast. Gov5 header
+    /// normalization changes the block hash after payload construction, so the
+    /// orchestrator must bind the new header to what was actually executed.
+    ///
+    /// Adapters that do not support Gov5 normalization may keep the default
+    /// `None`; an H2 participant then fails closed for non-empty blocks.
+    fn take_gov5_normalization(
+        &self,
+        _hash: B256,
+        _parent_hash: B256,
+    ) -> Option<(B256, B256, Vec<u8>)> {
+        None
+    }
+
     /// Inject a received compact-block wire blob into the payload cache so the
     /// next `new_payload` hits the cache and skips EVM re-execution. Returns
     /// whether the inject succeeded.

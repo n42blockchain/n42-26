@@ -1,5 +1,5 @@
 use arc_swap::ArcSwapOption;
-use n42_consensus::{N42Consensus, ValidatorSet, ValidatorSetResolver};
+use n42_consensus::{N42Consensus, N42HeaderProfile, ValidatorSet, ValidatorSetResolver};
 use n42_execution::N42EvmConfig;
 use reth_chainspec::{ChainSpec, EthChainSpec, EthereumHardforks};
 use reth_ethereum_primitives::EthPrimitives;
@@ -38,6 +38,7 @@ where
 pub struct N42ConsensusBuilder {
     validator_set: Option<Arc<ArcSwapOption<ValidatorSet>>>,
     validator_set_resolver: Option<ValidatorSetResolver>,
+    header_profile: N42HeaderProfile,
 }
 
 impl std::fmt::Debug for N42ConsensusBuilder {
@@ -48,6 +49,7 @@ impl std::fmt::Debug for N42ConsensusBuilder {
                 "has_validator_set_resolver",
                 &self.validator_set_resolver.is_some(),
             )
+            .field("header_profile", &self.header_profile)
             .finish()
     }
 }
@@ -57,6 +59,7 @@ impl N42ConsensusBuilder {
         Self {
             validator_set,
             validator_set_resolver: None,
+            header_profile: N42HeaderProfile::Ethereum,
         }
     }
 
@@ -65,6 +68,11 @@ impl N42ConsensusBuilder {
         validator_set_resolver: ValidatorSetResolver,
     ) -> Self {
         self.validator_set_resolver = Some(validator_set_resolver);
+        self
+    }
+
+    pub const fn with_header_profile(mut self, header_profile: N42HeaderProfile) -> Self {
+        self.header_profile = header_profile;
         self
     }
 }
@@ -93,9 +101,10 @@ where
                 validator_set,
                 self.validator_set_resolver,
             )
+            .with_header_profile(self.header_profile)
         } else {
             info!(target: "n42::consensus", "No initial validators configured, QC verification disabled");
-            N42Consensus::new(chain_spec)
+            N42Consensus::new(chain_spec).with_header_profile(self.header_profile)
         };
 
         Ok(Arc::new(consensus))

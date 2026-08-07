@@ -17,13 +17,22 @@ use crate::gossipsub::handlers::{
     decode_consensus_message, encode_consensus_message, validate_message,
 };
 use crate::gossipsub::topics::{
-    blob_sidecar_topic, block_announce_topic, consensus_topic, gov5_h2_topic, h2_v4_topic,
-    mempool_topic, verification_receipts_topic,
+    blob_sidecar_topic, block_announce_topic, consensus_topic, gov5_block_topic, gov5_h2_topic,
+    h2_v4_topic, mempool_topic, verification_receipts_topic,
 };
-use crate::h2_wire::{H2Message, decode_gov5_gossip_message};
-use crate::h2_v4::{H2V4ChainIdentity, H2V4Envelope, decode_gossip as decode_h2_v4_gossip};
+use crate::gov5_block::decode_gov5_block_rlp;
+use crate::gov5_rpc::{
+    GOV5_BLOCK_BY_HASH_PROTOCOL, Gov5BlockByHashRequest, Gov5BlockByHashResponse,
+    Gov5BlockPushRequest, Gov5BlockPushResponse, Gov5HotstuffDirectRequest,
+    Gov5HotstuffDirectResponse, Gov5Status,
+};
+use crate::h2_v4::{
+    H2V4ChainIdentity, H2V4Envelope, decode_gossip as decode_h2_v4_gossip,
+    encode_gossip as encode_h2_v4_gossip,
+};
+use crate::h2_wire::{H2Message, decode_gov5_gossip_message, encode_gov5_gossip_message};
 use crate::reconnection::ReconnectionManager;
-use crate::state_sync::{BlockSyncRequest, BlockSyncResponse};
+use crate::state_sync::{BlockSyncRequest, BlockSyncResponse, SYNC_PROTOCOL};
 use crate::transport::{N42Behaviour, N42BehaviourEvent, deterministic_validator_peer_id};
 use crate::tx_forward::{TxForwardRequest, TxForwardResponse};
 
@@ -34,6 +43,106 @@ const DEFAULT_COMMAND_SEND_TIMEOUT_MS: u64 = 50;
 const SYNC_RATE_WINDOW: Duration = Duration::from_secs(1);
 const MAX_SYNC_REQUESTS_UNTRUSTED: u32 = 4;
 const MAX_SYNC_REQUESTS_VALIDATOR: u32 = 32;
+const MAX_PENDING_GOV5_BLOCK_REQUESTS: usize = 256;
+// A reverse ancestry is intrinsically serial: the next parent hash is learned
+// from the current body. Sending every step to every validator leaves several
+// redundant ten-second request streams alive after the first response and
+// eventually starves useful requests. Hedge by rotating peers after a short
+// deadline instead of eagerly duplicating every request.
+const MAX_GOV5_BLOCK_FETCH_FANOUT: usize = 1;
+const MAX_RECENT_GOV5_BLOCK_REQUESTS: usize = 4096;
+const GOV5_BLOCK_FULFILLED_RETENTION: Duration = Duration::from_secs(30);
+const GOV5_BLOCK_REQUEST_COOLDOWN: Duration = Duration::from_millis(750);
+// Re-arm before the orchestrator's two-second retry. Late transport responses
+// are redundant and safely ignored after their request id is reaped.
+const GOV5_BLOCK_REQUEST_STALE_AFTER: Duration = Duration::from_millis(1500);
+const MAX_SERVED_GOV5_BLOCKS: usize = 1024;
+
+fn stale_gov5_block_fetches(
+    pending_hashes: &HashSet<B256>,
+    recent_requests: &HashMap<B256, (Instant, PeerId)>,
+    now: Instant,
+) -> Vec<B256> {
+    recent_requests
+        .iter()
+        .filter_map(|(hash, (attempted, _))| {
+            (pending_hashes.contains(hash)
+                && now.saturating_duration_since(*attempted) >= GOV5_BLOCK_REQUEST_STALE_AFTER)
+                .then_some(*hash)
+        })
+        .collect()
+}
+
+fn gov5_block_fulfilled_recently(
+    fulfilled: &mut HashMap<B256, Instant>,
+    block_hash: B256,
+    now: Instant,
+) -> bool {
+    if fulfilled.get(&block_hash).is_some_and(|fulfilled_at| {
+        now.saturating_duration_since(*fulfilled_at) < GOV5_BLOCK_FULFILLED_RETENTION
+    }) {
+        return true;
+    }
+    fulfilled.remove(&block_hash);
+    false
+}
+
+fn remember_gov5_block_fulfilled(
+    fulfilled: &mut HashMap<B256, Instant>,
+    block_hash: B256,
+    now: Instant,
+) {
+    if fulfilled.len() >= MAX_RECENT_GOV5_BLOCK_REQUESTS {
+        fulfilled.retain(|_, fulfilled_at| {
+            now.saturating_duration_since(*fulfilled_at) < GOV5_BLOCK_FULFILLED_RETENTION
+        });
+    }
+    if fulfilled.len() >= MAX_RECENT_GOV5_BLOCK_REQUESTS
+        && let Some(oldest) = fulfilled
+            .iter()
+            .min_by_key(|(_, fulfilled_at)| *fulfilled_at)
+            .map(|(hash, _)| *hash)
+    {
+        fulfilled.remove(&oldest);
+    }
+    fulfilled.insert(block_hash, now);
+}
+
+fn gov5_block_fetch_fanout(
+    preferred: PeerId,
+    last_peer: Option<PeerId>,
+    advertised_connected: &[PeerId],
+    connected: &[PeerId],
+) -> Vec<PeerId> {
+    let mut peers = Vec::with_capacity(MAX_GOV5_BLOCK_FETCH_FANOUT);
+    let mut push = |peer: PeerId| {
+        if peers.len() < MAX_GOV5_BLOCK_FETCH_FANOUT && !peers.contains(&peer) {
+            peers.push(peer);
+        }
+    };
+
+    // Preserve the authenticated message source as the first choice. The
+    // orchestrator remembers attempted peers and rotates through the complete
+    // connected set on short deadlines, so only one transport stream is needed
+    // per attempt and the previous peer remains the final fallback.
+    if connected.contains(&preferred) && Some(preferred) != last_peer {
+        push(preferred);
+    }
+    for peer in advertised_connected
+        .iter()
+        .chain(connected)
+        .copied()
+        .filter(|peer| Some(*peer) != last_peer)
+    {
+        push(peer);
+    }
+    if let Some(last_peer) = last_peer
+        && connected.contains(&last_peer)
+    {
+        push(last_peer);
+    }
+    peers
+}
 
 #[derive(Clone, Copy)]
 struct SyncRequestWindow {
@@ -102,6 +211,8 @@ impl RecentBlockAnnouncementDedup {
 #[derive(Debug)]
 pub enum NetworkCommand {
     BroadcastConsensus(ConsensusMessage),
+    BroadcastH2V4(H2V4Envelope),
+    BroadcastGov5Block(Vec<u8>),
     SendDirect {
         peer: PeerId,
         message: ConsensusMessage,
@@ -123,6 +234,16 @@ pub enum NetworkCommand {
     RequestSync {
         peer: PeerId,
         request: BlockSyncRequest,
+    },
+    /// Fetch one Gov5 block body from an already-connected peer.
+    RequestGov5BlockByHash {
+        peer: PeerId,
+        block_hash: B256,
+    },
+    /// Retire an in-flight Gov5 hash fetch after the same block body arrived
+    /// through gossip or the validator direct-push lane.
+    CancelGov5BlockFetch {
+        block_hash: B256,
     },
     SendSyncResponse {
         request_id: u64,
@@ -158,11 +279,30 @@ pub enum NetworkEvent {
         source: PeerId,
         message: Box<ConsensusMessage>,
     },
-    /// Strictly decoded legacy gov5 H2 message. Observer-only: it is never
-    /// passed to the Rust voting engine while signature domains differ.
+    /// Strictly decoded canonical Gov5 H2 message. In H2-v4 participant mode
+    /// this is promoted to the reliable consensus lane and converted by the
+    /// orchestrator; otherwise it remains observer data.
     Gov5H2Message {
         source: PeerId,
         message: Box<H2Message>,
+    },
+    /// Snappy-decoded Gov5 ETH-style RLP block. It remains untrusted until the
+    /// observer validates its header/body commitments and matches its hash to
+    /// an authenticated H2-v4 Decide.
+    Gov5Block {
+        source: PeerId,
+        rlp: Vec<u8>,
+    },
+    /// Gov5 block returned by the hash-bound fetch-on-miss protocol.
+    Gov5BlockFetched {
+        source: PeerId,
+        requested_hash: B256,
+        rlp: Vec<u8>,
+    },
+    Gov5BlockFetchFailed {
+        source: PeerId,
+        block_hash: B256,
+        error: String,
     },
     H2V4Message {
         source: PeerId,
@@ -210,6 +350,21 @@ pub enum NetworkEvent {
     },
 }
 
+fn event_uses_consensus_lane(event: &NetworkEvent, h2_v4_participant: bool) -> bool {
+    matches!(
+        event,
+        NetworkEvent::ConsensusMessage { .. } | NetworkEvent::BlockAnnouncement { .. }
+    ) || h2_v4_participant
+        && matches!(
+            event,
+            NetworkEvent::Gov5H2Message { .. }
+                | NetworkEvent::H2V4Message { .. }
+                | NetworkEvent::Gov5Block { .. }
+                | NetworkEvent::Gov5BlockFetched { .. }
+                | NetworkEvent::Gov5BlockFetchFailed { .. }
+        )
+}
+
 /// Handle for sending commands to the running `NetworkService`.
 ///
 /// Cheaply cloneable. The main interface for the node layer to interact with
@@ -255,6 +410,14 @@ impl NetworkHandle {
 
     pub fn broadcast_consensus(&self, msg: ConsensusMessage) -> Result<(), NetworkError> {
         self.send_priority(NetworkCommand::BroadcastConsensus(msg))
+    }
+
+    pub fn broadcast_h2_v4(&self, envelope: H2V4Envelope) -> Result<(), NetworkError> {
+        self.send_priority(NetworkCommand::BroadcastH2V4(envelope))
+    }
+
+    pub fn broadcast_gov5_block(&self, rlp: Vec<u8>) -> Result<(), NetworkError> {
+        self.send_priority(NetworkCommand::BroadcastGov5Block(rlp))
     }
 
     pub fn announce_block(&self, data: Vec<u8>) -> Result<(), NetworkError> {
@@ -483,6 +646,19 @@ impl NetworkHandle {
             .await
     }
 
+    pub async fn broadcast_h2_v4_reliable(
+        &self,
+        envelope: H2V4Envelope,
+    ) -> Result<(), NetworkError> {
+        Self::send_with_backpressure(&self.priority_tx, NetworkCommand::BroadcastH2V4(envelope))
+            .await
+    }
+
+    pub async fn broadcast_gov5_block_reliable(&self, rlp: Vec<u8>) -> Result<(), NetworkError> {
+        Self::send_with_backpressure(&self.priority_tx, NetworkCommand::BroadcastGov5Block(rlp))
+            .await
+    }
+
     pub async fn send_direct_reliable(
         &self,
         peer: PeerId,
@@ -510,6 +686,25 @@ impl NetworkHandle {
         )
         .await
     }
+
+    pub fn request_gov5_block_by_hash(
+        &self,
+        peer: PeerId,
+        block_hash: B256,
+    ) -> Result<(), NetworkError> {
+        self.send_priority(NetworkCommand::RequestGov5BlockByHash { peer, block_hash })
+    }
+
+    pub async fn cancel_gov5_block_fetch_reliable(
+        &self,
+        block_hash: B256,
+    ) -> Result<(), NetworkError> {
+        Self::send_with_backpressure(
+            &self.priority_tx,
+            NetworkCommand::CancelGov5BlockFetch { block_hash },
+        )
+        .await
+    }
 }
 
 /// The network service drives the libp2p swarm and bridges messages between
@@ -529,8 +724,12 @@ pub struct NetworkService {
     pending_data_events: VecDeque<NetworkEvent>,
     consensus_topic_hash: gossipsub::TopicHash,
     gov5_h2_topic_hash: Option<gossipsub::TopicHash>,
+    gov5_block_topic_hash: Option<gossipsub::TopicHash>,
     h2_v4_topic_hash: Option<gossipsub::TopicHash>,
     h2_v4_identity: Option<H2V4ChainIdentity>,
+    h2_v4_participant: bool,
+    gov5_status: Option<Gov5Status>,
+    pending_gov5_status_peers: HashSet<PeerId>,
     block_announce_topic_hash: gossipsub::TopicHash,
     mempool_topic_hash: gossipsub::TopicHash,
     blob_sidecar_topic_hash: gossipsub::TopicHash,
@@ -538,6 +737,30 @@ pub struct NetworkService {
     /// Maps internal request ID → libp2p ResponseChannel for sending sync replies.
     pending_sync_channels:
         HashMap<u64, libp2p::request_response::ResponseChannel<BlockSyncResponse>>,
+    pending_gov5_block_requests: HashMap<libp2p::request_response::OutboundRequestId, B256>,
+    /// Hash-level de-duplication keeps a stream of QCs for the same missing
+    /// ancestry from creating an unbounded request-response storm.
+    pending_gov5_block_hashes: HashSet<B256>,
+    /// Last attempt and peer per hash, used for bounded retry and peer rotation.
+    recent_gov5_block_requests: HashMap<B256, (Instant, PeerId)>,
+    /// Short tombstones for bodies already delivered through any authenticated
+    /// path. The observer and participant can enqueue request/cancel commands
+    /// concurrently; retaining fulfillment closes the cancel-before-request
+    /// ordering without making historical hashes permanent.
+    recent_gov5_block_fulfilled: HashMap<B256, Instant>,
+    /// Peers that advertised the native Gov5 block-by-hash protocol.
+    gov5_block_by_hash_peers: HashSet<PeerId>,
+    /// Peers that advertised N42's native state-sync protocol. Gov5 peers do
+    /// not implement it and must never receive those requests.
+    state_sync_peers: HashSet<PeerId>,
+    /// Recently broadcast canonical Gov5 blocks, retained so followers that
+    /// receive the proposal before the block can recover through Gov5's native
+    /// block-by-hash RPC.
+    gov5_served_blocks: HashMap<B256, Vec<u8>>,
+    /// Insertion order for `gov5_served_blocks` eviction. HashMap iteration
+    /// order is arbitrary, and evicting an arbitrary entry preferentially
+    /// drops exactly the fresh blocks followers are most likely to fetch.
+    gov5_served_block_order: VecDeque<B256>,
     /// Fixed-window protection for inbound catch-up work. Validators receive a
     /// higher allowance, while unauthenticated peers cannot monopolize the
     /// bounded response-channel table or node-side database reads.
@@ -593,6 +816,15 @@ fn expected_peer_id_for_validator(
     }
 }
 
+fn validator_index_for_expected_peer(
+    expected_validator_peer_ids: &HashMap<u32, PeerId>,
+    peer_id: PeerId,
+) -> Option<u32> {
+    expected_validator_peer_ids
+        .iter()
+        .find_map(|(&index, &expected)| (expected == peer_id).then_some(index))
+}
+
 fn push_bounded_backlog<T>(queue: &mut VecDeque<T>, max_len: usize, item: T, label: &'static str) {
     if queue.len() >= max_len {
         metrics::counter!("n42_network_event_drops_total").increment(1);
@@ -626,7 +858,7 @@ impl NetworkService {
         ),
         NetworkError,
     > {
-        Self::new_with_options(swarm, HashMap::new(), true, None, None)
+        Self::new_with_options(swarm, HashMap::new(), true, None, None, None, false)
     }
 
     /// Creates a non-voting service which also subscribes to the gov5 H2 topic
@@ -649,10 +881,45 @@ impl NetworkService {
             HashMap::new(),
             true,
             Some(gov5_h2_topic(genesis_hash)),
+            Some(gov5_block_topic(genesis_hash)),
             Some(H2V4ChainIdentity {
                 chain_id,
                 genesis_hash,
             }),
+            false,
+        )
+    }
+
+    /// Creates a voting H2-v4 network endpoint. Unlike observer mode, inbound
+    /// H2-v4 frames use the high-priority consensus channel and outbound H2-v4
+    /// publication is enabled. The caller must still enable the matching
+    /// consensus signing profile before processing messages.
+    pub fn new_gov5_h2_participant(
+        swarm: Swarm<N42Behaviour>,
+        expected_validator_peer_ids: HashMap<u32, PeerId>,
+        allow_deterministic_peer_ids: bool,
+        chain_id: u64,
+        genesis_hash: B256,
+    ) -> Result<
+        (
+            Self,
+            NetworkHandle,
+            mpsc::Receiver<NetworkEvent>,
+            mpsc::Receiver<NetworkEvent>,
+        ),
+        NetworkError,
+    > {
+        Self::new_with_options(
+            swarm,
+            expected_validator_peer_ids,
+            allow_deterministic_peer_ids,
+            Some(gov5_h2_topic(genesis_hash)),
+            Some(gov5_block_topic(genesis_hash)),
+            Some(H2V4ChainIdentity {
+                chain_id,
+                genesis_hash,
+            }),
+            true,
         )
     }
 
@@ -675,6 +942,8 @@ impl NetworkService {
             allow_deterministic_peer_ids,
             None,
             None,
+            None,
+            false,
         )
     }
 
@@ -683,7 +952,9 @@ impl NetworkService {
         expected_validator_peer_ids: HashMap<u32, PeerId>,
         allow_deterministic_peer_ids: bool,
         gov5_h2_observer_topic: Option<gossipsub::IdentTopic>,
+        gov5_block_observer_topic: Option<gossipsub::IdentTopic>,
         h2_v4_identity: Option<H2V4ChainIdentity>,
+        h2_v4_participant: bool,
     ) -> Result<
         (
             Self,
@@ -732,7 +1003,19 @@ impl NetworkService {
                 .map_err(|e| NetworkError::Subscribe(e.to_string()))?;
             tracing::info!(topic = %topic.hash(), "subscribed to legacy gov5 H2 observer topic");
         }
+        if let Some(topic) = gov5_block_observer_topic.as_ref() {
+            swarm
+                .behaviour_mut()
+                .gossipsub
+                .subscribe(topic)
+                .map_err(|e| NetworkError::Subscribe(e.to_string()))?;
+            tracing::info!(topic = %topic.hash(), "subscribed to gov5 block observer topic");
+        }
         let h2_v4_observer_topic = h2_v4_identity.map(|_| h2_v4_topic());
+        let gov5_status = h2_v4_identity.map(|identity| Gov5Status {
+            genesis_hash: identity.genesis_hash,
+            current_height: 0,
+        });
         if let Some(topic) = h2_v4_observer_topic.as_ref() {
             swarm
                 .behaviour_mut()
@@ -755,6 +1038,7 @@ impl NetworkService {
         let mempool_topic_hash = mempool.hash();
         let blob_sidecar_topic_hash = blob_sidecar.hash();
         let gov5_h2_topic_hash = gov5_h2_observer_topic.map(|topic| topic.hash());
+        let gov5_block_topic_hash = gov5_block_observer_topic.map(|topic| topic.hash());
         let h2_v4_topic_hash = h2_v4_observer_topic.map(|topic| topic.hash());
 
         let validator_peer_map = Arc::new(RwLock::new(HashMap::new()));
@@ -774,13 +1058,25 @@ impl NetworkService {
             pending_data_events: VecDeque::new(),
             consensus_topic_hash,
             gov5_h2_topic_hash,
+            gov5_block_topic_hash,
             h2_v4_topic_hash,
             h2_v4_identity,
+            h2_v4_participant,
+            gov5_status,
+            pending_gov5_status_peers: HashSet::new(),
             block_announce_topic_hash,
             mempool_topic_hash,
             blob_sidecar_topic_hash,
             verification_receipts_topic_hash,
             pending_sync_channels: HashMap::new(),
+            pending_gov5_block_requests: HashMap::new(),
+            pending_gov5_block_hashes: HashSet::new(),
+            recent_gov5_block_requests: HashMap::new(),
+            recent_gov5_block_fulfilled: HashMap::new(),
+            gov5_block_by_hash_peers: HashSet::new(),
+            state_sync_peers: HashSet::new(),
+            gov5_served_blocks: HashMap::new(),
+            gov5_served_block_order: VecDeque::new(),
             sync_request_windows: HashMap::new(),
             next_sync_id: 0,
             expected_validator_peer_ids,
@@ -829,6 +1125,22 @@ impl NetworkService {
         }
 
         loop {
+            // Gov5 gives an inbound peer ten seconds to initiate Status. Flush
+            // this immediately after ConnectionEstablished, ahead of catch-up
+            // queues that can remain continuously non-empty.
+            if let Some(status) = self.gov5_status {
+                for peer_id in std::mem::take(&mut self.pending_gov5_status_peers) {
+                    if self.swarm.is_connected(&peer_id) {
+                        let request_id = self
+                            .swarm
+                            .behaviour_mut()
+                            .gov5_status
+                            .send_request(&peer_id, status);
+                        tracing::info!(%peer_id, %request_id, "queued gov5 Status handshake");
+                    }
+                }
+            }
+
             while let Some(event) = self.pending_reliable_events.pop_front() {
                 let tx = self.consensus_event_tx.clone();
                 if tx.send(event).await.is_err() {
@@ -932,6 +1244,18 @@ impl NetworkService {
             SwarmEvent::Behaviour(N42BehaviourEvent::BlockDirect(event)) => {
                 self.handle_block_direct_event(event);
             }
+            SwarmEvent::Behaviour(N42BehaviourEvent::Gov5BlockPush(event)) => {
+                self.handle_gov5_block_push_event(event);
+            }
+            SwarmEvent::Behaviour(N42BehaviourEvent::Gov5BlockByHash(event)) => {
+                self.handle_gov5_block_by_hash_event(event);
+            }
+            SwarmEvent::Behaviour(N42BehaviourEvent::Gov5Status(event)) => {
+                self.handle_gov5_status_event(event);
+            }
+            SwarmEvent::Behaviour(N42BehaviourEvent::Gov5HotstuffDirect(event)) => {
+                self.handle_gov5_hotstuff_direct_event(event);
+            }
             SwarmEvent::Behaviour(N42BehaviourEvent::TxForward(event)) => {
                 self.handle_tx_forward_event(event);
             }
@@ -951,12 +1275,25 @@ impl NetworkService {
                 tracing::info!(%peer_id, "peer connected");
                 metrics::gauge!("n42_active_peer_connections").increment(1.0);
                 self.reconnection.on_connected(&peer_id);
+                if let Some(validator_index) = self.route_expected_validator_peer(peer_id) {
+                    tracing::info!(
+                        %peer_id,
+                        validator_index,
+                        "routed connected peer using expected validator binding"
+                    );
+                }
+                if self.gov5_status.is_some() {
+                    self.pending_gov5_status_peers.insert(peer_id);
+                }
                 self.emit_event(NetworkEvent::PeerConnected(peer_id));
             }
             SwarmEvent::ConnectionClosed { peer_id, .. } => {
                 tracing::info!(%peer_id, "peer disconnected");
                 metrics::gauge!("n42_active_peer_connections").decrement(1.0);
                 self.reconnection.on_disconnected(&peer_id);
+                self.pending_gov5_status_peers.remove(&peer_id);
+                self.gov5_block_by_hash_peers.remove(&peer_id);
+                self.state_sync_peers.remove(&peer_id);
                 self.sync_request_windows.remove(&peer_id);
                 self.clear_validator_mapping_for_peer(&peer_id);
                 self.clear_authenticated_validator_peer(&peer_id);
@@ -1003,6 +1340,29 @@ impl NetworkService {
                 self.authenticated_validator_peer_map.remove(&idx);
             }
         }
+    }
+
+    /// Routes a live peer whose Noise-authenticated PeerId exactly matches the
+    /// configured binding for a validator. This does not mark the peer as BLS
+    /// authenticated; that stronger authorization remains gated on a verified
+    /// single-validator consensus message.
+    fn route_expected_validator_peer(&mut self, peer_id: PeerId) -> Option<u32> {
+        let validator_index =
+            validator_index_for_expected_peer(&self.expected_validator_peer_ids, peer_id)?;
+
+        self.reconnection.register_peer(peer_id, Vec::new(), true);
+        self.peer_validator_map
+            .retain(|_, idx| *idx != validator_index);
+        self.peer_validator_map.insert(peer_id, validator_index);
+        let mut map = self.validator_peer_map.write().unwrap_or_else(|e| {
+            tracing::error!(
+                "validator_peer_map lock poisoned on expected peer route: {}",
+                e
+            );
+            e.into_inner()
+        });
+        map.insert(validator_index, peer_id);
+        Some(validator_index)
     }
 
     fn authenticate_validator_peer(&mut self, peer_id: PeerId, validator_index: u32) {
@@ -1101,17 +1461,62 @@ impl NetworkService {
             e.into_inner()
         });
         map.retain(|idx, peer_id| self.expected_validator_peer_ids.get(idx) == Some(peer_id));
+        drop(map);
+
+        let connected_expected: Vec<_> = self
+            .expected_validator_peer_ids
+            .values()
+            .copied()
+            .filter(|peer_id| self.swarm.is_connected(peer_id))
+            .collect();
+        for peer_id in connected_expected {
+            self.route_expected_validator_peer(peer_id);
+        }
+
+        let routed = self
+            .validator_peer_map
+            .read()
+            .map(|map| map.len())
+            .unwrap_or_default();
 
         tracing::info!(
             validator_count = self.expected_validator_peer_ids.len(),
             authenticated = self.authenticated_validator_peer_map.len(),
-            routed = map.len(),
+            routed,
             "replaced expected validator peer bindings"
         );
     }
 
     fn handle_identify_event(&mut self, peer_id: PeerId, info: libp2p::identify::Info) {
-        tracing::debug!(%peer_id, protocol = ?info.protocol_version, "identified peer");
+        let supports_gov5_block_fetch = info
+            .protocols
+            .iter()
+            .any(|protocol| protocol.as_ref() == GOV5_BLOCK_BY_HASH_PROTOCOL);
+        let supports_state_sync = info
+            .protocols
+            .iter()
+            .any(|protocol| protocol.as_ref() == SYNC_PROTOCOL);
+        let newly_ready_for_block_fetch =
+            supports_gov5_block_fetch && self.gov5_block_by_hash_peers.insert(peer_id);
+        let newly_ready_for_state_sync =
+            supports_state_sync && self.state_sync_peers.insert(peer_id);
+        if newly_ready_for_block_fetch || newly_ready_for_state_sync {
+            tracing::info!(
+                %peer_id,
+                protocol = ?info.protocol_version,
+                supports_gov5_block_fetch,
+                supports_state_sync,
+                "identified peer capabilities"
+            );
+        } else {
+            tracing::debug!(
+                %peer_id,
+                protocol = ?info.protocol_version,
+                supports_gov5_block_fetch,
+                supports_state_sync,
+                "refreshed peer capabilities"
+            );
+        }
 
         if let Some(idx) = claimed_validator_index(&info.agent_version) {
             let expected_peer_id = expected_peer_id_for_validator(
@@ -1163,6 +1568,36 @@ impl NetworkService {
                 kad.add_address(&peer_id, addr.clone());
             }
         }
+
+        // ConnectionEstablished precedes Identify. Re-emitting this idempotent
+        // event makes startup recovery retry persisted certificate anchors as
+        // soon as a native block source is actually usable.
+        if newly_ready_for_block_fetch {
+            self.emit_event(NetworkEvent::PeerConnected(peer_id));
+        }
+    }
+
+    fn retain_gov5_served_block(&mut self, rlp: &[u8]) -> Result<B256, String> {
+        let block = decode_gov5_block_rlp(rlp).map_err(|error| error.to_string())?;
+        if self.gov5_served_blocks.len() >= MAX_SERVED_GOV5_BLOCKS
+            && !self.gov5_served_blocks.contains_key(&block.block_hash)
+        {
+            // Evict the oldest entry, not an arbitrary HashMap key: the newest
+            // blocks are the ones followers are still about to request.
+            while let Some(evicted) = self.gov5_served_block_order.pop_front() {
+                if self.gov5_served_blocks.remove(&evicted).is_some() {
+                    break;
+                }
+            }
+        }
+        if self
+            .gov5_served_blocks
+            .insert(block.block_hash, rlp.to_vec())
+            .is_none()
+        {
+            self.gov5_served_block_order.push_back(block.block_hash);
+        }
+        Ok(block.block_hash)
     }
 
     fn handle_gossipsub_message(&mut self, source: PeerId, message: gossipsub::Message) {
@@ -1176,6 +1611,7 @@ impl NetworkService {
             &self.block_announce_topic_hash,
             &self.mempool_topic_hash,
             &self.blob_sidecar_topic_hash,
+            self.gov5_block_topic_hash.as_ref(),
         );
 
         if !matches!(acceptance, gossipsub::MessageAcceptance::Accept) {
@@ -1185,6 +1621,54 @@ impl NetworkService {
 
         let topic = &message.topic;
         let event = match () {
+            _ if self
+                .gov5_block_topic_hash
+                .as_ref()
+                .is_some_and(|hash| topic == hash) =>
+            {
+                const MAX_GOV5_BLOCK_BYTES: usize = 1 << 20;
+                let decoded_len = match snap::raw::decompress_len(&message.data) {
+                    Ok(len) if len <= MAX_GOV5_BLOCK_BYTES => len,
+                    Ok(len) => {
+                        metrics::counter!("n42_gov5_blocks_rejected_total", "reason" => "oversized")
+                            .increment(1);
+                        tracing::warn!(target: "n42::interop::block", %source, decoded_len = len, "rejected oversized gov5 block gossip");
+                        return;
+                    }
+                    Err(error) => {
+                        metrics::counter!("n42_gov5_blocks_rejected_total", "reason" => "snappy")
+                            .increment(1);
+                        tracing::warn!(target: "n42::interop::block", %source, %error, "rejected invalid gov5 block snappy frame");
+                        return;
+                    }
+                };
+                match snap::raw::Decoder::new().decompress_vec(&message.data) {
+                    Ok(rlp) if rlp.len() == decoded_len => {
+                        metrics::counter!("n42_gov5_blocks_observed_total").increment(1);
+                        if let Err(error) = self.retain_gov5_served_block(&rlp) {
+                            tracing::warn!(
+                                target: "n42::interop::block",
+                                %source,
+                                %error,
+                                "refusing to retain malformed gov5 block gossip"
+                            );
+                        }
+                        NetworkEvent::Gov5Block { source, rlp }
+                    }
+                    Ok(_) => {
+                        metrics::counter!("n42_gov5_blocks_rejected_total", "reason" => "length")
+                            .increment(1);
+                        tracing::warn!(target: "n42::interop::block", %source, "rejected inconsistent gov5 block snappy frame");
+                        return;
+                    }
+                    Err(error) => {
+                        metrics::counter!("n42_gov5_blocks_rejected_total", "reason" => "snappy")
+                            .increment(1);
+                        tracing::warn!(target: "n42::interop::block", %source, %error, "rejected invalid gov5 block snappy frame");
+                        return;
+                    }
+                }
+            }
             _ if self
                 .h2_v4_topic_hash
                 .as_ref()
@@ -1595,6 +2079,322 @@ impl NetworkService {
         }
     }
 
+    fn handle_gov5_block_push_event(
+        &mut self,
+        event: libp2p::request_response::Event<Gov5BlockPushRequest, Gov5BlockPushResponse>,
+    ) {
+        match event {
+            libp2p::request_response::Event::Message {
+                peer,
+                message:
+                    libp2p::request_response::Message::Request {
+                        request, channel, ..
+                    },
+                ..
+            } => {
+                metrics::counter!("n42_gov5_block_push_received_total").increment(1);
+                if let Err(error) = self.retain_gov5_served_block(&request.rlp) {
+                    tracing::warn!(
+                        target: "n42::interop::block",
+                        %peer,
+                        %error,
+                        "refusing to retain malformed gov5 block push"
+                    );
+                }
+                self.emit_event(NetworkEvent::Gov5Block {
+                    source: peer,
+                    rlp: request.rlp,
+                });
+                let _ = self
+                    .swarm
+                    .behaviour_mut()
+                    .gov5_block_push
+                    .send_response(channel, Gov5BlockPushResponse);
+            }
+            libp2p::request_response::Event::Message {
+                peer,
+                message: libp2p::request_response::Message::Response { .. },
+                ..
+            } => {
+                tracing::debug!(%peer, "gov5 block push completed");
+                metrics::counter!("n42_gov5_block_push_completed_total").increment(1);
+            }
+            libp2p::request_response::Event::OutboundFailure { peer, error, .. } => {
+                tracing::warn!(%peer, ?error, "gov5 block direct push failed");
+                metrics::counter!("n42_gov5_block_push_send_failures_total").increment(1);
+            }
+            libp2p::request_response::Event::InboundFailure { peer, error, .. } => {
+                tracing::debug!(%peer, ?error, "inbound gov5 block push failed");
+            }
+            libp2p::request_response::Event::ResponseSent { .. } => {}
+        }
+    }
+
+    fn handle_gov5_hotstuff_direct_event(
+        &mut self,
+        event: libp2p::request_response::Event<
+            Gov5HotstuffDirectRequest,
+            Gov5HotstuffDirectResponse,
+        >,
+    ) {
+        match event {
+            libp2p::request_response::Event::Message {
+                peer,
+                message:
+                    libp2p::request_response::Message::Request {
+                        request, channel, ..
+                    },
+                ..
+            } => {
+                match decode_gov5_gossip_message(&request.data) {
+                    Ok(message) => {
+                        metrics::counter!(
+                            "n42_gov5_h2_direct_received_total",
+                            "kind" => message.kind().as_str()
+                        )
+                        .increment(1);
+                        self.emit_event(NetworkEvent::Gov5H2Message {
+                            source: peer,
+                            message: Box::new(message),
+                        });
+                    }
+                    Err(error) => {
+                        metrics::counter!("n42_gov5_h2_direct_rejected_total").increment(1);
+                        tracing::warn!(
+                            target: "n42::interop::h2v4",
+                            %peer,
+                            %error,
+                            "rejected malformed Gov5 direct consensus message"
+                        );
+                    }
+                }
+                let _ = self
+                    .swarm
+                    .behaviour_mut()
+                    .gov5_hotstuff_direct
+                    .send_response(channel, Gov5HotstuffDirectResponse);
+            }
+            libp2p::request_response::Event::Message {
+                peer,
+                message: libp2p::request_response::Message::Response { .. },
+                ..
+            } => {
+                tracing::debug!(%peer, "Gov5 direct consensus delivery completed");
+            }
+            libp2p::request_response::Event::OutboundFailure { peer, error, .. } => {
+                // Gov5 intentionally closes this one-way stream without an
+                // acknowledgement. Gossip remains the independent fallback.
+                tracing::debug!(%peer, ?error, "Gov5 direct consensus stream completed without ACK");
+            }
+            libp2p::request_response::Event::InboundFailure { peer, error, .. } => {
+                tracing::debug!(%peer, ?error, "Gov5 direct consensus receive failed");
+            }
+            libp2p::request_response::Event::ResponseSent { .. } => {}
+        }
+    }
+
+    fn handle_gov5_block_by_hash_event(
+        &mut self,
+        event: libp2p::request_response::Event<Gov5BlockByHashRequest, Gov5BlockByHashResponse>,
+    ) {
+        match event {
+            libp2p::request_response::Event::Message {
+                peer,
+                message:
+                    libp2p::request_response::Message::Request {
+                        request, channel, ..
+                    },
+                ..
+            } => {
+                let response = self
+                    .gov5_served_blocks
+                    .get(&request.block_hash)
+                    .cloned()
+                    .unwrap_or_default();
+                let found = !response.is_empty();
+                if self
+                    .swarm
+                    .behaviour_mut()
+                    .gov5_block_by_hash
+                    .send_response(channel, Gov5BlockByHashResponse { rlp: response })
+                    .is_err()
+                {
+                    tracing::warn!(%peer, block_hash = %request.block_hash, "failed to answer Gov5 block-by-hash request");
+                } else {
+                    metrics::counter!(
+                        "n42_gov5_block_fetch_responses_total",
+                        "result" => if found { "found" } else { "missing" }
+                    )
+                    .increment(1);
+                    tracing::debug!(
+                        %peer,
+                        block_hash = %request.block_hash,
+                        found,
+                        "answered Gov5 block-by-hash request"
+                    );
+                }
+            }
+            libp2p::request_response::Event::Message {
+                peer,
+                message:
+                    libp2p::request_response::Message::Response {
+                        request_id,
+                        response,
+                    },
+                ..
+            } => {
+                let Some(requested_hash) = self.pending_gov5_block_requests.remove(&request_id)
+                else {
+                    tracing::debug!(%peer, "received redundant gov5 block response after another fan-out peer succeeded");
+                    return;
+                };
+                match self.retain_gov5_served_block(&response.rlp) {
+                    Ok(actual_hash) if actual_hash == requested_hash => {}
+                    Ok(actual_hash) => {
+                        self.gov5_served_blocks.remove(&actual_hash);
+                        let error = format!(
+                            "gov5 block fetch hash mismatch: requested {requested_hash}, got {actual_hash}"
+                        );
+                        metrics::counter!("n42_gov5_block_fetch_failed_total").increment(1);
+                        if !self
+                            .pending_gov5_block_requests
+                            .values()
+                            .any(|hash| *hash == requested_hash)
+                        {
+                            self.pending_gov5_block_hashes.remove(&requested_hash);
+                            self.recent_gov5_block_requests.remove(&requested_hash);
+                            self.emit_event(NetworkEvent::Gov5BlockFetchFailed {
+                                source: peer,
+                                block_hash: requested_hash,
+                                error,
+                            });
+                        }
+                        return;
+                    }
+                    Err(error) => {
+                        metrics::counter!("n42_gov5_block_fetch_failed_total").increment(1);
+                        if !self
+                            .pending_gov5_block_requests
+                            .values()
+                            .any(|hash| *hash == requested_hash)
+                        {
+                            self.pending_gov5_block_hashes.remove(&requested_hash);
+                            self.recent_gov5_block_requests.remove(&requested_hash);
+                            self.emit_event(NetworkEvent::Gov5BlockFetchFailed {
+                                source: peer,
+                                block_hash: requested_hash,
+                                error: format!("all fan-out peers failed; final response: {error}"),
+                            });
+                        }
+                        return;
+                    }
+                }
+                self.pending_gov5_block_hashes.remove(&requested_hash);
+                self.pending_gov5_block_requests
+                    .retain(|_, hash| *hash != requested_hash);
+                // This entry only guards an in-flight attempt and its short
+                // retry cooldown. Keeping every successful historical hash
+                // makes the overflow cleanup scan thousands of entries on
+                // every step of a long reverse ancestry.
+                self.recent_gov5_block_requests.remove(&requested_hash);
+                remember_gov5_block_fulfilled(
+                    &mut self.recent_gov5_block_fulfilled,
+                    requested_hash,
+                    Instant::now(),
+                );
+                metrics::counter!("n42_gov5_block_fetch_succeeded_total").increment(1);
+                self.emit_event(NetworkEvent::Gov5BlockFetched {
+                    source: peer,
+                    requested_hash,
+                    rlp: response.rlp,
+                });
+            }
+            libp2p::request_response::Event::OutboundFailure {
+                peer,
+                request_id,
+                error,
+                ..
+            } => {
+                if let Some(block_hash) = self.pending_gov5_block_requests.remove(&request_id) {
+                    let error_text = error.to_string();
+                    if error_text.contains("supports none")
+                        || error_text.contains("UnsupportedProtocols")
+                    {
+                        self.gov5_block_by_hash_peers.remove(&peer);
+                    }
+                    metrics::counter!("n42_gov5_block_fetch_failed_total").increment(1);
+                    if !self
+                        .pending_gov5_block_requests
+                        .values()
+                        .any(|hash| *hash == block_hash)
+                    {
+                        self.pending_gov5_block_hashes.remove(&block_hash);
+                        self.recent_gov5_block_requests.remove(&block_hash);
+                        self.emit_event(NetworkEvent::Gov5BlockFetchFailed {
+                            source: peer,
+                            block_hash,
+                            error: format!("all fan-out peers failed; final failure: {error_text}"),
+                        });
+                    }
+                }
+            }
+            libp2p::request_response::Event::InboundFailure { peer, error, .. } => {
+                tracing::debug!(%peer, %error, "gov5 block-by-hash inbound failure");
+            }
+            libp2p::request_response::Event::ResponseSent { .. } => {}
+        }
+    }
+
+    fn handle_gov5_status_event(
+        &mut self,
+        event: libp2p::request_response::Event<Gov5Status, Gov5Status>,
+    ) {
+        let Some(local_status) = self.gov5_status else {
+            return;
+        };
+        match event {
+            libp2p::request_response::Event::Message {
+                peer,
+                message:
+                    libp2p::request_response::Message::Request {
+                        request, channel, ..
+                    },
+                ..
+            } => {
+                if request.genesis_hash != local_status.genesis_hash {
+                    tracing::warn!(%peer, remote_genesis = %request.genesis_hash, local_genesis = %local_status.genesis_hash, "gov5 status genesis mismatch");
+                }
+                let _ = self
+                    .swarm
+                    .behaviour_mut()
+                    .gov5_status
+                    .send_response(channel, local_status);
+            }
+            libp2p::request_response::Event::Message {
+                peer,
+                message: libp2p::request_response::Message::Response { response, .. },
+                ..
+            } => {
+                if response.genesis_hash == local_status.genesis_hash {
+                    metrics::counter!("n42_gov5_status_succeeded_total").increment(1);
+                    tracing::debug!(%peer, height = response.current_height, "validated gov5 status response");
+                } else {
+                    metrics::counter!("n42_gov5_status_failed_total").increment(1);
+                    tracing::warn!(%peer, remote_genesis = %response.genesis_hash, local_genesis = %local_status.genesis_hash, "rejected gov5 status response for another genesis");
+                }
+            }
+            libp2p::request_response::Event::OutboundFailure { peer, error, .. } => {
+                metrics::counter!("n42_gov5_status_failed_total").increment(1);
+                tracing::info!(%peer, %error, "gov5 status outbound exchange failed");
+            }
+            libp2p::request_response::Event::InboundFailure { peer, error, .. } => {
+                metrics::counter!("n42_gov5_status_failed_total").increment(1);
+                tracing::info!(%peer, %error, "gov5 status inbound exchange failed");
+            }
+            libp2p::request_response::Event::ResponseSent { .. } => {}
+        }
+    }
+
     fn observe_block_announcement(&mut self, data: &[u8], source: &'static str) -> bool {
         let duplicate = self.recent_block_announcements.observe(data);
         if duplicate {
@@ -1749,13 +2549,19 @@ impl NetworkService {
     /// BlockData is critical for follower import pipeline — deprioritizing it
     /// delays block import → delays voting → delays commit.
     fn emit_event(&mut self, event: NetworkEvent) {
-        let reliable_consensus = matches!(
-            &event,
-            NetworkEvent::ConsensusMessage { .. } | NetworkEvent::BlockAnnouncement { .. }
-        );
+        // H2 participant block bodies are part of the execution-gated
+        // consensus path. Routing gossip/fetch responses through the lower
+        // data lane lets a continuously readable consensus lane starve them:
+        // the node can authenticate and commit several hashes while reth
+        // remains unable to execute any of their bodies. Preserve observer
+        // isolation by promoting these events only in participant mode.
+        let reliable_consensus = event_uses_consensus_lane(&event, self.h2_v4_participant);
         let reliable_data = matches!(
             &event,
             NetworkEvent::Gov5H2Message { .. }
+                | NetworkEvent::Gov5Block { .. }
+                | NetworkEvent::Gov5BlockFetched { .. }
+                | NetworkEvent::Gov5BlockFetchFailed { .. }
                 | NetworkEvent::H2V4Message { .. }
                 | NetworkEvent::VerificationReceipt { .. }
                 | NetworkEvent::BlobSidecarReceived { .. }
@@ -1827,6 +2633,137 @@ impl NetworkService {
                 metrics::counter!("n42_broadcast_messages_sent").increment(1);
                 self.publish_consensus(&msg, "consensus message");
             }
+            NetworkCommand::BroadcastH2V4(envelope) => {
+                if !self.h2_v4_participant {
+                    tracing::warn!(target: "n42::interop::h2v4", "refusing H2-v4 publish outside participant mode");
+                    return;
+                }
+                // Publish both migration transports and also fan out the
+                // canonical payload over Gov5's reliable Rotor/direct stream.
+                // Direct delivery is required for leader/vote latency even
+                // while either GossipSub mesh is still converging.
+                match encode_gov5_gossip_message(&envelope.message) {
+                    Ok(data) => {
+                        metrics::counter!(
+                            "n42_gov5_h2_messages_sent_total",
+                            "kind" => envelope.message.kind().as_str()
+                        )
+                        .increment(1);
+                        self.gossipsub_publish(
+                            gov5_h2_topic(envelope.identity.genesis_hash),
+                            data.clone(),
+                            "Gov5 H2-v4 consensus message",
+                        );
+                        let direct_peers: Vec<PeerId> = self
+                            .validator_peer_map
+                            .read()
+                            .unwrap_or_else(|error| {
+                                tracing::warn!(%error, "validator_peer_map poisoned, recovering");
+                                error.into_inner()
+                            })
+                            .iter()
+                            .filter_map(|(index, peer)| {
+                                (Some(*index) != self.my_validator_index).then_some(*peer)
+                            })
+                            .collect();
+                        for peer in &direct_peers {
+                            self.swarm
+                                .behaviour_mut()
+                                .gov5_hotstuff_direct
+                                .send_request(
+                                    peer,
+                                    Gov5HotstuffDirectRequest { data: data.clone() },
+                                );
+                        }
+                        metrics::counter!(
+                            "n42_gov5_h2_direct_sent_total",
+                            "kind" => envelope.message.kind().as_str()
+                        )
+                        .increment(direct_peers.len() as u64);
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            target: "n42::interop::h2v4",
+                            %error,
+                            "failed to encode canonical Gov5 H2-v4 message"
+                        )
+                    }
+                }
+                match encode_h2_v4_gossip(&envelope) {
+                    Ok(data) => {
+                        metrics::counter!("n42_h2_v4_messages_sent_total", "kind" => envelope.message.kind().as_str()).increment(1);
+                        self.gossipsub_publish(h2_v4_topic(), data, "H2-v4 consensus message");
+                    }
+                    Err(error) => {
+                        tracing::warn!(target: "n42::interop::h2v4", %error, "failed to encode H2-v4 message")
+                    }
+                }
+            }
+            NetworkCommand::BroadcastGov5Block(rlp) => {
+                let Some(identity) = self.h2_v4_identity.filter(|_| self.h2_v4_participant) else {
+                    tracing::warn!(target: "n42::interop::h2v4", "refusing gov5 block publish outside participant mode");
+                    return;
+                };
+
+                if let Err(error) = self.retain_gov5_served_block(&rlp) {
+                    tracing::warn!(
+                        target: "n42::interop::h2v4",
+                        %error,
+                        "refusing to retain malformed local Gov5 block"
+                    );
+                    return;
+                }
+
+                // Gov5's canonical leader delivery is a one-way direct stream.
+                // Fan out the raw RLP to every connected validator before the
+                // gossip fallback; a lone block publisher cannot rely on a
+                // GossipSub mesh being formed for the block topic.
+                let direct_peers: Vec<PeerId> = self
+                    .validator_peer_map
+                    .read()
+                    .unwrap_or_else(|error| {
+                        tracing::warn!(%error, "validator_peer_map poisoned, recovering");
+                        error.into_inner()
+                    })
+                    .iter()
+                    .filter_map(|(index, peer)| {
+                        (Some(*index) != self.my_validator_index).then_some(*peer)
+                    })
+                    .collect();
+                for peer in &direct_peers {
+                    self.swarm.behaviour_mut().gov5_block_push.send_request(
+                        peer,
+                        Gov5BlockPushRequest {
+                            rlp: rlp.clone(),
+                            fork_digest: identity.genesis_hash.as_slice()[..4]
+                                .try_into()
+                                .expect("four-byte genesis prefix"),
+                        },
+                    );
+                }
+                metrics::counter!("n42_gov5_block_push_sent_total")
+                    .increment(direct_peers.len() as u64);
+                tracing::info!(
+                    target: "n42::interop::h2v4",
+                    peers = direct_peers.len(),
+                    bytes = rlp.len(),
+                    "direct-pushed gov5 leader block"
+                );
+
+                match snap::raw::Encoder::new().compress_vec(&rlp) {
+                    Ok(data) => {
+                        metrics::counter!("n42_h2_v4_blocks_sent_total").increment(1);
+                        self.gossipsub_publish(
+                            gov5_block_topic(identity.genesis_hash),
+                            data,
+                            "gov5 block",
+                        );
+                    }
+                    Err(error) => {
+                        tracing::warn!(target: "n42::interop::h2v4", %error, "failed to compress gov5 block")
+                    }
+                }
+            }
             NetworkCommand::SendDirect { peer, message } => {
                 metrics::counter!("n42_direct_messages_sent").increment(1);
                 // Use request-response for true point-to-point delivery instead of gossipsub.
@@ -1845,6 +2782,144 @@ impl NetworkService {
                         tracing::warn!(%peer, error = %e, "failed to encode direct message, falling back to broadcast");
                         self.publish_consensus(&message, "direct fallback");
                     }
+                }
+            }
+            NetworkCommand::RequestGov5BlockByHash { peer, block_hash } => {
+                let now = Instant::now();
+                if gov5_block_fulfilled_recently(
+                    &mut self.recent_gov5_block_fulfilled,
+                    block_hash,
+                    now,
+                ) {
+                    metrics::counter!(
+                        "n42_gov5_block_fetch_suppressed_total",
+                        "reason" => "already_fulfilled"
+                    )
+                    .increment(1);
+                    return;
+                }
+                // Hash de-duplication must not outlive the transport request
+                // that created it. In live catch-up a request could lose
+                // every terminal swarm event, leaving the orchestrator's
+                // orchestrator retry suppressed even though all
+                // Gov5 peers already served the body. Reap every overdue hash
+                // before applying pending/capacity checks; late responses are
+                // safely treated as redundant by the response handler.
+                let stale = stale_gov5_block_fetches(
+                    &self.pending_gov5_block_hashes,
+                    &self.recent_gov5_block_requests,
+                    now,
+                );
+                for stale_hash in stale {
+                    let requests_before = self.pending_gov5_block_requests.len();
+                    self.pending_gov5_block_requests
+                        .retain(|_, hash| *hash != stale_hash);
+                    self.pending_gov5_block_hashes.remove(&stale_hash);
+                    self.recent_gov5_block_requests.remove(&stale_hash);
+                    let reaped = requests_before - self.pending_gov5_block_requests.len();
+                    metrics::counter!("n42_gov5_block_fetch_stale_rearmed_total").increment(1);
+                    tracing::warn!(
+                        %stale_hash,
+                        reaped,
+                        "re-armed stale Gov5 block fetch after transport deadline"
+                    );
+                }
+                if self.pending_gov5_block_hashes.contains(&block_hash)
+                    || self.pending_gov5_block_requests.len() >= MAX_PENDING_GOV5_BLOCK_REQUESTS
+                {
+                    metrics::counter!(
+                        "n42_gov5_block_fetch_suppressed_total",
+                        "reason" => "pending"
+                    )
+                    .increment(1);
+                    return;
+                }
+
+                if self.recent_gov5_block_requests.len() >= MAX_RECENT_GOV5_BLOCK_REQUESTS {
+                    self.recent_gov5_block_requests.retain(|_, (attempted, _)| {
+                        now.duration_since(*attempted) < Duration::from_secs(60)
+                    });
+                }
+                let previous = self.recent_gov5_block_requests.get(&block_hash).copied();
+                if previous.is_some_and(|(attempted, _)| {
+                    now.duration_since(attempted) < GOV5_BLOCK_REQUEST_COOLDOWN
+                }) {
+                    metrics::counter!(
+                        "n42_gov5_block_fetch_suppressed_total",
+                        "reason" => "cooldown"
+                    )
+                    .increment(1);
+                    return;
+                }
+
+                let last_peer = previous.map(|(_, last_peer)| last_peer);
+                // Gov5 registers the compatible stream handler after its
+                // identify service starts, so older peers do not always
+                // advertise the protocol in their first identify snapshot.
+                // A trusted, connected preferred peer is still safe to try:
+                // multistream-select will reject it cleanly if unsupported.
+                // Falling back across all connected peers also avoids a
+                // Rust↔Rust missing-parent loop when only Rust peers happened
+                // to advertise the capability.
+                let connected: Vec<_> = self.swarm.connected_peers().copied().collect();
+                let advertised_connected: Vec<_> = self
+                    .gov5_block_by_hash_peers
+                    .iter()
+                    .copied()
+                    .filter(|candidate| connected.contains(candidate))
+                    .collect();
+                let mut selected_peers =
+                    gov5_block_fetch_fanout(peer, last_peer, &advertised_connected, &connected);
+                let available =
+                    MAX_PENDING_GOV5_BLOCK_REQUESTS - self.pending_gov5_block_requests.len();
+                selected_peers.truncate(available);
+                if selected_peers.is_empty() {
+                    metrics::counter!(
+                        "n42_gov5_block_fetch_suppressed_total",
+                        "reason" => "unsupported_peer"
+                    )
+                    .increment(1);
+                    tracing::debug!(
+                        %peer,
+                        %block_hash,
+                        "no connected peer advertises gov5 block-by-hash"
+                    );
+                    return;
+                }
+                for selected_peer in &selected_peers {
+                    let request_id = self
+                        .swarm
+                        .behaviour_mut()
+                        .gov5_block_by_hash
+                        .send_request(selected_peer, Gov5BlockByHashRequest { block_hash });
+                    self.pending_gov5_block_requests
+                        .insert(request_id, block_hash);
+                }
+                self.pending_gov5_block_hashes.insert(block_hash);
+                self.recent_gov5_block_requests
+                    .insert(block_hash, (now, selected_peers[0]));
+                metrics::counter!("n42_gov5_block_fetch_fanout_total")
+                    .increment(selected_peers.len() as u64);
+            }
+            NetworkCommand::CancelGov5BlockFetch { block_hash } => {
+                let requests_before = self.pending_gov5_block_requests.len();
+                self.pending_gov5_block_requests
+                    .retain(|_, pending_hash| *pending_hash != block_hash);
+                let reaped = requests_before - self.pending_gov5_block_requests.len();
+                let pending = self.pending_gov5_block_hashes.remove(&block_hash);
+                let recent = self.recent_gov5_block_requests.remove(&block_hash);
+                remember_gov5_block_fulfilled(
+                    &mut self.recent_gov5_block_fulfilled,
+                    block_hash,
+                    Instant::now(),
+                );
+                if reaped > 0 || pending || recent.is_some() {
+                    metrics::counter!("n42_gov5_block_fetch_cross_path_retired_total").increment(1);
+                    tracing::debug!(
+                        %block_hash,
+                        reaped,
+                        "retired Gov5 block fetch satisfied by another delivery path"
+                    );
                 }
             }
             NetworkCommand::AnnounceBlock(data) => {
@@ -1882,6 +2957,24 @@ impl NetworkService {
                 }
             }
             NetworkCommand::RequestSync { peer, request } => {
+                if !self.state_sync_peers.contains(&peer) {
+                    metrics::counter!(
+                        "n42_state_sync_requests_suppressed_total",
+                        "reason" => "unsupported_peer"
+                    )
+                    .increment(1);
+                    tracing::debug!(
+                        %peer,
+                        from_view = request.from_view,
+                        to_view = request.to_view,
+                        "not sending N42 state-sync request to peer without advertised support"
+                    );
+                    self.emit_event(NetworkEvent::SyncRequestFailed {
+                        peer,
+                        error: "peer does not advertise N42 state-sync".to_string(),
+                    });
+                    return;
+                }
                 tracing::debug!(
                     %peer,
                     from_view = request.from_view,
@@ -1975,6 +3068,44 @@ mod tests {
             NetworkCommand::AnnounceBlock(data) => assert_eq!(data, vec![1, 2, 3]),
             other => panic!("expected AnnounceBlock, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_handle_cancel_gov5_block_fetch_uses_priority_lane() {
+        let (handle, _rx, mut prx) = test_handle();
+        let block_hash = B256::repeat_byte(0x42);
+
+        handle
+            .cancel_gov5_block_fetch_reliable(block_hash)
+            .await
+            .expect("fetch cancellation should queue");
+
+        match prx.try_recv().expect("queued cancellation") {
+            NetworkCommand::CancelGov5BlockFetch {
+                block_hash: received,
+            } => assert_eq!(received, block_hash),
+            other => panic!("expected CancelGov5BlockFetch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fulfilled_gov5_block_suppresses_reordered_request_until_expiry() {
+        let block_hash = B256::repeat_byte(0x43);
+        let started = Instant::now();
+        let mut fulfilled = HashMap::new();
+        remember_gov5_block_fulfilled(&mut fulfilled, block_hash, started);
+
+        assert!(gov5_block_fulfilled_recently(
+            &mut fulfilled,
+            block_hash,
+            started + Duration::from_secs(29)
+        ));
+        assert!(!gov5_block_fulfilled_recently(
+            &mut fulfilled,
+            block_hash,
+            started + Duration::from_secs(31)
+        ));
+        assert!(!fulfilled.contains_key(&block_hash));
     }
 
     #[test]
@@ -2205,6 +3336,92 @@ mod tests {
     }
 
     #[test]
+    fn gov5_block_fetch_uses_one_preferred_peer_per_attempt() {
+        let preferred = PeerId::random();
+        let advertised = PeerId::random();
+        let rust_peer = PeerId::random();
+        let connected = vec![preferred, advertised, rust_peer];
+
+        let peers = gov5_block_fetch_fanout(preferred, Some(rust_peer), &[advertised], &connected);
+
+        assert_eq!(peers, vec![preferred]);
+
+        let rotated =
+            gov5_block_fetch_fanout(preferred, Some(preferred), &[advertised], &connected);
+        assert_eq!(rotated, vec![advertised]);
+    }
+
+    #[test]
+    fn gov5_block_fetch_fanout_ignores_unconnected_preferred_peer() {
+        let preferred = PeerId::random();
+        let connected = vec![PeerId::random(), PeerId::random()];
+
+        let peers = gov5_block_fetch_fanout(preferred, None, &[], &connected);
+
+        assert!(!peers.contains(&preferred));
+        assert_eq!(peers.len(), 1);
+        assert!(connected.contains(&peers[0]));
+    }
+
+    #[test]
+    fn stale_gov5_block_fetch_is_rearmed_after_transport_deadline() {
+        let now = Instant::now();
+        let stale_hash = B256::repeat_byte(0x41);
+        let live_hash = B256::repeat_byte(0x42);
+        let peer = PeerId::random();
+        let pending = HashSet::from([stale_hash, live_hash]);
+        let recent = HashMap::from([
+            (stale_hash, (now - GOV5_BLOCK_REQUEST_STALE_AFTER, peer)),
+            (
+                live_hash,
+                (
+                    now - GOV5_BLOCK_REQUEST_STALE_AFTER + Duration::from_millis(1),
+                    peer,
+                ),
+            ),
+        ]);
+
+        assert_eq!(
+            stale_gov5_block_fetches(&pending, &recent, now),
+            vec![stale_hash],
+            "only a hash at or beyond the transport deadline may bypass pending de-duplication"
+        );
+    }
+
+    #[test]
+    fn h2_participant_block_lifecycle_uses_consensus_lane() {
+        let source = PeerId::random();
+        let block_hash = B256::repeat_byte(0x42);
+        let events = [
+            NetworkEvent::Gov5Block {
+                source,
+                rlp: vec![0xc0],
+            },
+            NetworkEvent::Gov5BlockFetched {
+                source,
+                requested_hash: block_hash,
+                rlp: vec![0xc0],
+            },
+            NetworkEvent::Gov5BlockFetchFailed {
+                source,
+                block_hash,
+                error: "deadline".to_owned(),
+            },
+        ];
+
+        for event in &events {
+            assert!(
+                event_uses_consensus_lane(event, true),
+                "participant execution event must not be starved in the data lane: {event:?}"
+            );
+            assert!(
+                !event_uses_consensus_lane(event, false),
+                "observer block handling must remain isolated from the consensus lane: {event:?}"
+            );
+        }
+    }
+
+    #[test]
     fn test_claimed_validator_index_parses_expected_format() {
         assert_eq!(claimed_validator_index("n42/1.0.0/v7"), Some(7));
         assert_eq!(claimed_validator_index("n42/1.0.0"), None);
@@ -2233,6 +3450,22 @@ mod tests {
         assert_eq!(
             expected_peer_id_for_validator(&expected, 7, false).unwrap(),
             peer_id
+        );
+    }
+
+    #[test]
+    fn test_validator_index_for_expected_peer_requires_exact_noise_identity() {
+        let expected_peer = PeerId::random();
+        let mut expected = HashMap::new();
+        expected.insert(7, expected_peer);
+
+        assert_eq!(
+            validator_index_for_expected_peer(&expected, expected_peer),
+            Some(7)
+        );
+        assert_eq!(
+            validator_index_for_expected_peer(&expected, PeerId::random()),
+            None
         );
     }
 

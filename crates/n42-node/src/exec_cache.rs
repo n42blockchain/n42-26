@@ -9,17 +9,35 @@ use n42_consensus_service::orchestrator::{
 };
 use reth_execution_types::{BlockExecutionOutput, BlockExecutionResult};
 use std::collections::{HashMap, VecDeque};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use tracing::{info, warn};
 
 pub use n42_consensus_service::exec_cache::ExecutionOutputCache;
 
 /// In-process adapter over reth's global `reth_evm::payload_cache`.
-pub struct RethExecutionOutputCache;
+pub struct RethExecutionOutputCache {
+    qmdb_store: Option<Arc<crate::qmdb_state_root::Gov5QmdbStateRootStore>>,
+}
+
+impl RethExecutionOutputCache {
+    pub const fn new(
+        qmdb_store: Option<Arc<crate::qmdb_state_root::Gov5QmdbStateRootStore>>,
+    ) -> Self {
+        Self { qmdb_store }
+    }
+}
 
 impl ExecutionOutputCache for RethExecutionOutputCache {
     fn take_serialized(&self, hash: B256) -> Option<Vec<u8>> {
         take_and_serialize_execution_output(&hash)
+    }
+
+    fn take_gov5_normalization(
+        &self,
+        hash: B256,
+        parent_hash: B256,
+    ) -> Option<(B256, B256, Vec<u8>)> {
+        take_gov5_normalization_output(&hash, parent_hash, self.qmdb_store.as_deref())
     }
 
     fn inject(&self, hash: B256, compressed: &[u8], source: &'static str) -> bool {
@@ -93,7 +111,14 @@ fn observe_compact_inject_attempt(hash: B256, source: &'static str) -> Option<u6
 pub(crate) fn take_and_serialize_execution_output(hash: &B256) -> Option<Vec<u8>> {
     let (output, senders) =
         reth_evm::payload_cache::take_broadcast_execution::<CachedPayloadData>(hash)?;
+    serialize_execution_output(hash, output, senders)
+}
 
+fn serialize_execution_output(
+    hash: &B256,
+    output: BlockExecutionOutput<reth_ethereum_primitives::Receipt>,
+    senders: Vec<Address>,
+) -> Option<Vec<u8>> {
     let ser_start = std::time::Instant::now();
     let compact = CompactBlockExecution {
         bundle_state: output.state,
@@ -124,6 +149,45 @@ pub(crate) fn take_and_serialize_execution_output(hash: &B256) -> Option<Vec<u8>
             None
         }
     }
+}
+
+/// Consume the builder's broadcast copy once and bind Gov5's native receipt
+/// commitment to exactly the same execution output that will be re-keyed under
+/// the normalized H2 block hash.
+fn take_gov5_normalization_output(
+    hash: &B256,
+    parent_hash: B256,
+    qmdb_store: Option<&crate::qmdb_state_root::Gov5QmdbStateRootStore>,
+) -> Option<(B256, B256, Vec<u8>)> {
+    let (output, senders) =
+        reth_evm::payload_cache::take_broadcast_execution::<CachedPayloadData>(hash)?;
+    let receipts_root = n42_network::gov5_native_receipts_root(&output.result.receipts);
+    let operations = crate::qmdb_state::gov5_qmdb_operations_from_output(&output);
+    let state_root = match qmdb_store {
+        Some(store) => match store.compute_candidate(parent_hash, &operations) {
+            Ok(root) => root,
+            Err(error) => {
+                warn!(
+                    target: "n42::interop::h2v4",
+                    %hash,
+                    %parent_hash,
+                    %error,
+                    "failed to derive Gov5 QMDB root for locally built payload"
+                );
+                return None;
+            }
+        },
+        None => {
+            warn!(
+                target: "n42::interop::h2v4",
+                %hash,
+                "Gov5 normalization requires an authenticated QMDB state-root store"
+            );
+            return None;
+        }
+    };
+    let compressed = serialize_execution_output(hash, output, senders)?;
+    Some((state_root, receipts_root, compressed))
 }
 
 /// Deserialize compact block execution output and load it into the payload cache.

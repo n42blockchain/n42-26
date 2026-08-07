@@ -11,6 +11,11 @@ use crate::gossipsub::message_id_fn;
 use crate::gossipsub::topics::{
     blob_sidecar_topic, block_announce_topic, consensus_topic, mempool_topic,
 };
+use crate::gov5_rpc::{
+    GOV5_BLOCK_BY_HASH_PROTOCOL, GOV5_BLOCK_PUSH_PROTOCOL, GOV5_HOTSTUFF_DIRECT_PROTOCOL,
+    GOV5_STATUS_PROTOCOL, Gov5BlockByHashCodec, Gov5BlockPushCodec, Gov5HotstuffDirectCodec,
+    Gov5StatusCodec,
+};
 use crate::state_sync::StateSyncCodec;
 use crate::tx_forward::TxForwardCodec;
 
@@ -47,6 +52,14 @@ pub struct N42Behaviour {
     pub consensus_direct: libp2p::request_response::Behaviour<ConsensusDirectCodec>,
     /// Direct block data push from leader to validators (bypasses GossipSub).
     pub block_direct: libp2p::request_response::Behaviour<BlockDirectCodec>,
+    /// Gov5 reliable block push, enabled inbound for observer compatibility.
+    pub gov5_block_push: libp2p::request_response::Behaviour<Gov5BlockPushCodec>,
+    /// Gov5 fetch-on-miss block retrieval, enabled outbound for observer catch-up.
+    pub gov5_block_by_hash: libp2p::request_response::Behaviour<Gov5BlockByHashCodec>,
+    /// Gov5 chain-status handshake, enabled only on the TCP interop observer.
+    pub gov5_status: libp2p::request_response::Behaviour<Gov5StatusCodec>,
+    /// Gov5 raw one-way Rotor/direct consensus stream.
+    pub gov5_hotstuff_direct: libp2p::request_response::Behaviour<Gov5HotstuffDirectCodec>,
     /// Transaction forwarding from non-leader validators to current leader.
     pub tx_forward: libp2p::request_response::Behaviour<TxForwardCodec>,
     /// Disabled in production; enabled in dev/test via `enable_mdns`.
@@ -177,6 +190,29 @@ pub fn build_swarm(keypair: Keypair, config: TransportConfig) -> eyre::Result<Sw
     build_swarm_with_validator_index(keypair, config, None)
 }
 
+/// Builds the read-only interop observer swarm with both native QUIC and
+/// gov5-compatible TCP/Noise/Yamux transports.
+///
+/// Existing validators continue to call [`build_swarm_with_validator_index`]
+/// and therefore keep their QUIC-only transport surface. The TCP transport is
+/// enabled only for the explicitly selected observer runtime.
+pub fn build_interop_observer_swarm(
+    keypair: Keypair,
+    config: TransportConfig,
+) -> eyre::Result<Swarm<N42Behaviour>> {
+    build_swarm_with_transports(keypair, config, None, true)
+}
+
+/// Builds a voting interop swarm with gov5 TCP/Noise/Yamux transport and an
+/// explicit validator identity. Selection remains an opt-in node policy.
+pub fn build_interop_participant_swarm(
+    keypair: Keypair,
+    config: TransportConfig,
+    validator_index: u32,
+) -> eyre::Result<Swarm<N42Behaviour>> {
+    build_swarm_with_transports(keypair, config, Some(validator_index), true)
+}
+
 /// Derives the deterministic libp2p keypair currently used for validator P2P identities.
 pub fn deterministic_validator_keypair(index: u32) -> eyre::Result<Keypair> {
     let seed = alloy_primitives::keccak256(format!("n42-p2p-key-{index}").as_bytes());
@@ -204,6 +240,15 @@ pub fn build_swarm_with_validator_index(
     config: TransportConfig,
     validator_index: Option<u32>,
 ) -> eyre::Result<Swarm<N42Behaviour>> {
+    build_swarm_with_transports(keypair, config, validator_index, false)
+}
+
+fn build_swarm_with_transports(
+    keypair: Keypair,
+    config: TransportConfig,
+    validator_index: Option<u32>,
+    enable_gov5_tcp: bool,
+) -> eyre::Result<Swarm<N42Behaviour>> {
     let gossipsub_config = gossipsub::ConfigBuilder::default()
         .heartbeat_interval(config.heartbeat_interval)
         // Permissive: messages forwarded automatically after delivery.
@@ -222,129 +267,213 @@ pub fn build_swarm_with_validator_index(
 
     let peer_id = keypair.public().to_peer_id();
 
-    let swarm = libp2p::SwarmBuilder::with_existing_identity(keypair.clone())
-        .with_tokio()
-        .with_quic()
-        .with_behaviour(|key| {
-            let peer_score_params = build_peer_score_params();
-            let thresholds = PeerScoreThresholds {
-                gossip_threshold: -50.0,
-                publish_threshold: -100.0,
-                graylist_threshold: -200.0,
-                ..Default::default()
-            };
+    let build_behaviour = |key: &Keypair| {
+        let peer_score_params = build_peer_score_params();
+        let thresholds = PeerScoreThresholds {
+            gossip_threshold: -50.0,
+            publish_threshold: -100.0,
+            graylist_threshold: -200.0,
+            ..Default::default()
+        };
 
-            let mut gossipsub = gossipsub::Behaviour::new(
-                gossipsub::MessageAuthenticity::Signed(key.clone()),
-                gossipsub_config,
-            )
+        // Gov5 runs GossipSub in StrictNoSign mode. Consensus payloads already
+        // carry validator BLS authentication, so an additional libp2p message
+        // signature is both redundant and actively incompatible: Gov5 rejects
+        // signed GossipSub envelopes and eventually prunes the Rust peer from
+        // the mesh, leaving only intermittent IHAVE/IWANT recovery. The
+        // anonymous envelope is therefore scoped to gov5-facing swarms only —
+        // production N42 swarms keep the signed envelope they always had.
+        // Both sides run Permissive validation, so mixed deployments interop.
+        let message_authenticity = if enable_gov5_tcp {
+            gossipsub::MessageAuthenticity::Anonymous
+        } else {
+            gossipsub::MessageAuthenticity::Signed(key.clone())
+        };
+        let mut gossipsub = gossipsub::Behaviour::new(message_authenticity, gossipsub_config.clone())
             .map_err(|e| eyre::eyre!("gossipsub behaviour error: {e}"))?;
 
-            gossipsub
-                .with_peer_score(peer_score_params, thresholds)
-                .map_err(|e| eyre::eyre!("gossipsub peer scoring error: {e}"))?;
+        gossipsub
+            .with_peer_score(peer_score_params, thresholds)
+            .map_err(|e| eyre::eyre!("gossipsub peer scoring error: {e}"))?;
 
-            let agent_version = match validator_index {
-                Some(idx) => format!("n42/1.0.0/v{idx}"),
-                None => "n42/1.0.0".to_string(),
-            };
-            let identify = libp2p::identify::Behaviour::new(
-                libp2p::identify::Config::new("/n42/1.0.0".into(), key.public())
-                    .with_agent_version(agent_version)
-                    .with_interval(Duration::from_secs(10)),
-            );
+        let agent_version = match validator_index {
+            Some(idx) => format!("n42/1.0.0/v{idx}"),
+            None => "n42/1.0.0".to_string(),
+        };
+        let identify = libp2p::identify::Behaviour::new(
+            libp2p::identify::Config::new("/n42/1.0.0".into(), key.public())
+                .with_agent_version(agent_version)
+                .with_interval(Duration::from_secs(10)),
+        );
 
-            let state_sync = libp2p::request_response::Behaviour::new(
-                [(
-                    libp2p::StreamProtocol::new(crate::state_sync::SYNC_PROTOCOL),
+        let state_sync = libp2p::request_response::Behaviour::new(
+            [(
+                libp2p::StreamProtocol::new(crate::state_sync::SYNC_PROTOCOL),
+                libp2p::request_response::ProtocolSupport::Full,
+            )],
+            libp2p::request_response::Config::default(),
+        );
+
+        let consensus_direct = libp2p::request_response::Behaviour::new(
+            [(
+                libp2p::StreamProtocol::new(crate::consensus_direct::CONSENSUS_DIRECT_PROTOCOL),
+                libp2p::request_response::ProtocolSupport::Full,
+            )],
+            libp2p::request_response::Config::default()
+                .with_request_timeout(Duration::from_secs(5)),
+        );
+
+        let block_direct = libp2p::request_response::Behaviour::new(
+            [(
+                libp2p::StreamProtocol::new(crate::block_direct::BLOCK_DIRECT_PROTOCOL),
+                libp2p::request_response::ProtocolSupport::Full,
+            )],
+            libp2p::request_response::Config::default()
+                .with_request_timeout(Duration::from_secs(30)),
+        );
+
+        let gov5_block_push = libp2p::request_response::Behaviour::new(
+            [(
+                libp2p::StreamProtocol::new(GOV5_BLOCK_PUSH_PROTOCOL),
+                libp2p::request_response::ProtocolSupport::Full,
+            )],
+            libp2p::request_response::Config::default()
+                .with_request_timeout(Duration::from_secs(10)),
+        );
+
+        let gov5_block_by_hash = libp2p::request_response::Behaviour::new(
+            [(
+                libp2p::StreamProtocol::new(GOV5_BLOCK_BY_HASH_PROTOCOL),
+                // A Rust validator can be the only peer that retained a block
+                // received from Gov5. Advertise the fetch protocol in both
+                // directions so another recovering Rust validator can use it
+                // as a bounded, authenticated data source.
+                libp2p::request_response::ProtocolSupport::Full,
+            )],
+            libp2p::request_response::Config::default()
+                .with_request_timeout(Duration::from_secs(10)),
+        );
+
+        let gov5_status_protocols = enable_gov5_tcp
+            .then(|| {
+                (
+                    libp2p::StreamProtocol::new(GOV5_STATUS_PROTOCOL),
                     libp2p::request_response::ProtocolSupport::Full,
-                )],
-                libp2p::request_response::Config::default(),
-            );
-
-            let consensus_direct = libp2p::request_response::Behaviour::new(
-                [(
-                    libp2p::StreamProtocol::new(crate::consensus_direct::CONSENSUS_DIRECT_PROTOCOL),
-                    libp2p::request_response::ProtocolSupport::Full,
-                )],
-                libp2p::request_response::Config::default()
-                    .with_request_timeout(Duration::from_secs(5)),
-            );
-
-            let block_direct = libp2p::request_response::Behaviour::new(
-                [(
-                    libp2p::StreamProtocol::new(crate::block_direct::BLOCK_DIRECT_PROTOCOL),
-                    libp2p::request_response::ProtocolSupport::Full,
-                )],
-                libp2p::request_response::Config::default()
-                    .with_request_timeout(Duration::from_secs(30)),
-            );
-
-            let tx_forward = libp2p::request_response::Behaviour::new(
-                [(
-                    libp2p::StreamProtocol::new(crate::tx_forward::TX_FORWARD_PROTOCOL),
-                    libp2p::request_response::ProtocolSupport::Full,
-                )],
-                libp2p::request_response::Config::default()
-                    .with_request_timeout(Duration::from_secs(5)),
-            );
-
-            let mdns = if config.enable_mdns {
-                let mdns_config = libp2p::mdns::Config {
-                    ttl: Duration::from_secs(300),
-                    query_interval: Duration::from_secs(60),
-                    enable_ipv6: false,
-                };
-                match libp2p::mdns::tokio::Behaviour::new(mdns_config, key.public().to_peer_id()) {
-                    Ok(m) => {
-                        tracing::info!("mDNS peer discovery enabled");
-                        Toggle::from(Some(m))
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "mDNS init failed, continuing without it");
-                        Toggle::from(None)
-                    }
-                }
-            } else {
-                Toggle::from(None)
-            };
-
-            let kademlia = if config.enable_kademlia {
-                let local_peer_id = key.public().to_peer_id();
-                let store = libp2p::kad::store::MemoryStore::new(local_peer_id);
-                let mut kad_config =
-                    libp2p::kad::Config::new(libp2p::StreamProtocol::new("/n42/kad/1.0.0"));
-                kad_config.set_query_timeout(Duration::from_secs(60));
-                let kad = libp2p::kad::Behaviour::with_config(local_peer_id, store, kad_config);
-                tracing::info!("Kademlia DHT peer discovery enabled");
-                Toggle::from(Some(kad))
-            } else {
-                Toggle::from(None)
-            };
-
-            let limits = libp2p::connection_limits::ConnectionLimits::default()
-                .with_max_established_incoming(Some(config.max_established_incoming))
-                .with_max_established_outgoing(Some(config.max_established_outgoing))
-                .with_max_established(Some(config.max_established_total))
-                .with_max_established_per_peer(Some(1));
-
-            Ok(N42Behaviour {
-                gossipsub,
-                identify,
-                state_sync,
-                consensus_direct,
-                block_direct,
-                tx_forward,
-                mdns,
-                kademlia,
-                connection_limits: libp2p::connection_limits::Behaviour::new(limits),
+                )
             })
-        })
-        .map_err(|e| eyre::eyre!("swarm builder error: {e}"))?
-        .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(config.idle_connection_timeout))
-        .build();
+            .into_iter();
+        let gov5_status = libp2p::request_response::Behaviour::new(
+            gov5_status_protocols,
+            libp2p::request_response::Config::default()
+                .with_request_timeout(Duration::from_secs(10)),
+        );
 
-    tracing::info!(%peer_id, "swarm built with QUIC transport");
+        let gov5_hotstuff_direct = libp2p::request_response::Behaviour::new(
+            [(
+                libp2p::StreamProtocol::new(GOV5_HOTSTUFF_DIRECT_PROTOCOL),
+                libp2p::request_response::ProtocolSupport::Full,
+            )],
+            libp2p::request_response::Config::default()
+                .with_request_timeout(Duration::from_secs(10)),
+        );
+
+        let tx_forward = libp2p::request_response::Behaviour::new(
+            [(
+                libp2p::StreamProtocol::new(crate::tx_forward::TX_FORWARD_PROTOCOL),
+                libp2p::request_response::ProtocolSupport::Full,
+            )],
+            libp2p::request_response::Config::default()
+                .with_request_timeout(Duration::from_secs(5)),
+        );
+
+        let mdns = if config.enable_mdns {
+            let mdns_config = libp2p::mdns::Config {
+                ttl: Duration::from_secs(300),
+                query_interval: Duration::from_secs(60),
+                enable_ipv6: false,
+            };
+            match libp2p::mdns::tokio::Behaviour::new(mdns_config, key.public().to_peer_id()) {
+                Ok(m) => {
+                    tracing::info!("mDNS peer discovery enabled");
+                    Toggle::from(Some(m))
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "mDNS init failed, continuing without it");
+                    Toggle::from(None)
+                }
+            }
+        } else {
+            Toggle::from(None)
+        };
+
+        let kademlia = if config.enable_kademlia {
+            let local_peer_id = key.public().to_peer_id();
+            let store = libp2p::kad::store::MemoryStore::new(local_peer_id);
+            let mut kad_config =
+                libp2p::kad::Config::new(libp2p::StreamProtocol::new("/n42/kad/1.0.0"));
+            kad_config.set_query_timeout(Duration::from_secs(60));
+            let kad = libp2p::kad::Behaviour::with_config(local_peer_id, store, kad_config);
+            tracing::info!("Kademlia DHT peer discovery enabled");
+            Toggle::from(Some(kad))
+        } else {
+            Toggle::from(None)
+        };
+
+        let limits = libp2p::connection_limits::ConnectionLimits::default()
+            .with_max_established_incoming(Some(config.max_established_incoming))
+            .with_max_established_outgoing(Some(config.max_established_outgoing))
+            .with_max_established(Some(config.max_established_total))
+            .with_max_established_per_peer(Some(1));
+
+        Ok(N42Behaviour {
+            gossipsub,
+            identify,
+            state_sync,
+            consensus_direct,
+            block_direct,
+            gov5_block_push,
+            gov5_block_by_hash,
+            gov5_status,
+            gov5_hotstuff_direct,
+            tx_forward,
+            mdns,
+            kademlia,
+            connection_limits: libp2p::connection_limits::Behaviour::new(limits),
+        })
+    };
+
+    let swarm = if enable_gov5_tcp {
+        libp2p::SwarmBuilder::with_existing_identity(keypair.clone())
+            .with_tokio()
+            .with_tcp(
+                libp2p::tcp::Config::default().nodelay(true),
+                libp2p::noise::Config::new,
+                libp2p::yamux::Config::default,
+            )?
+            .with_quic()
+            .with_behaviour(build_behaviour)
+            .map_err(|e| eyre::eyre!("swarm builder error: {e}"))?
+            .with_swarm_config(|cfg| {
+                cfg.with_idle_connection_timeout(config.idle_connection_timeout)
+            })
+            .build()
+    } else {
+        libp2p::SwarmBuilder::with_existing_identity(keypair.clone())
+            .with_tokio()
+            .with_quic()
+            .with_behaviour(build_behaviour)
+            .map_err(|e| eyre::eyre!("swarm builder error: {e}"))?
+            .with_swarm_config(|cfg| {
+                cfg.with_idle_connection_timeout(config.idle_connection_timeout)
+            })
+            .build()
+    };
+
+    if enable_gov5_tcp {
+        tracing::info!(%peer_id, "observer swarm built with QUIC and TCP transports");
+    } else {
+        tracing::info!(%peer_id, "swarm built with QUIC transport");
+    }
     Ok(swarm)
 }
 
@@ -425,6 +554,8 @@ fn build_peer_score_params() -> PeerScoreParams {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::StreamExt;
+    use libp2p::{Multiaddr, multiaddr::Protocol, swarm::SwarmEvent};
 
     #[test]
     fn test_for_network_size_3_nodes() {
@@ -514,5 +645,58 @@ mod tests {
         assert_eq!(large.max_established_incoming, 499 + 16); // max(128, 499+16) = 515
         assert_eq!(large.max_established_outgoing, 499 + 16); // max(64, 499+16) = 515
         assert_eq!(large.max_established_total, (499 + 16) * 2); // max(192, 515*2) = 1030
+    }
+
+    #[tokio::test]
+    async fn interop_observer_completes_tcp_noise_yamux_handshake() {
+        let mut listener = build_interop_observer_swarm(
+            Keypair::generate_ed25519(),
+            TransportConfig::for_network_size(2),
+        )
+        .expect("build TCP-capable observer listener");
+        let listener_peer_id = *listener.local_peer_id();
+        listener
+            .listen_on("/ip4/127.0.0.1/tcp/0".parse::<Multiaddr>().unwrap())
+            .expect("listen on ephemeral TCP port");
+
+        let listen_addr = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let SwarmEvent::NewListenAddr { address, .. } = listener.select_next_some().await
+                    && address.iter().any(|part| matches!(part, Protocol::Tcp(_)))
+                {
+                    break address;
+                }
+            }
+        })
+        .await
+        .expect("TCP listener should become ready");
+
+        let mut dialer = build_interop_observer_swarm(
+            Keypair::generate_ed25519(),
+            TransportConfig::for_network_size(2),
+        )
+        .expect("build TCP-capable observer dialer");
+        let mut dial_addr = listen_addr;
+        dial_addr.push(Protocol::P2p(listener_peer_id));
+        dialer.dial(dial_addr).expect("start TCP dial");
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                tokio::select! {
+                    event = listener.select_next_some() => {
+                        if matches!(event, SwarmEvent::ConnectionEstablished { .. }) {
+                            break;
+                        }
+                    }
+                    event = dialer.select_next_some() => {
+                        if matches!(event, SwarmEvent::ConnectionEstablished { .. }) {
+                            break;
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .expect("TCP/Noise/Yamux handshake should complete");
     }
 }

@@ -2,7 +2,7 @@ use super::{BlockDataBroadcast, CommittedBlock, ConsensusService};
 use crate::persistence::{self, ConsensusSnapshot};
 use alloy_primitives::B256;
 use metrics::counter;
-use n42_consensus::{validator_changes_hash, verify_commit_qc};
+use n42_consensus::{validator_changes_hash, verify_commit_qc_with_profile};
 use n42_network::{
     BlockSyncResponse, MAX_BLOCKS_PER_SYNC_REQUEST, MAX_SYNC_MESSAGE_SIZE, PeerId, SyncBlock,
     SyncPayload,
@@ -255,7 +255,7 @@ impl ConsensusService {
 
         let elapsed = self.sync_started_at.map(|started| started.elapsed());
         let timed_out = elapsed
-            .map(|elapsed| elapsed > sync_request_timeout())
+            .map(|elapsed| elapsed >= sync_request_timeout())
             // An in-flight request without a start time violates the local
             // state invariant. Treat it as stale instead of wedging recovery.
             .unwrap_or(true);
@@ -275,6 +275,22 @@ impl ConsensusService {
         self.sync_request_range = None;
         self.sync_requested_peers.clear();
         true
+    }
+
+    /// Expires and immediately re-drives the exact outstanding range.
+    ///
+    /// The event-loop timer calls this independently of consensus progress.
+    /// Without that timer, a lost request can remain in flight forever when
+    /// the stalled node receives no later event that happens to initiate sync.
+    pub(super) fn retry_expired_sync_request(&mut self) {
+        let retry_range = self.sync_request_range;
+        if !self.expire_stale_sync_request() {
+            return;
+        }
+        let Some((from_view, to_view)) = retry_range else {
+            return;
+        };
+        self.initiate_sync(from_view.saturating_sub(1), to_view);
     }
 
     /// Requests an execution lineage from every connected peer.
@@ -338,8 +354,12 @@ impl ConsensusService {
         self.sync_requested_peers = requested_peers;
     }
 
-    /// Initiates a state sync request to a connected peer.
-    /// Uses deterministic peer rotation by view number to avoid always hitting the same peer.
+    /// Initiates a state sync request across the connected peer set.
+    ///
+    /// Hybrid Gov5/N42 networks include peers that do not implement N42's
+    /// state-sync protocol. Fan-out lets a capable Rust peer answer while the
+    /// network layer explicitly rejects unsupported recipients. Responses
+    /// remain range-bound, QC-verified, and idempotent.
     pub(super) fn initiate_sync(&mut self, local_view: u64, target_view: u64) {
         self.expire_stale_sync_request();
         if self.sync_in_flight {
@@ -352,11 +372,6 @@ impl ConsensusService {
             warn!(target: "n42::cl::sync", "no connected peers for sync");
             return;
         }
-        let peer = peers[self.sync_peer_cursor % peers.len()];
-        self.sync_peer_cursor = self.sync_peer_cursor.wrapping_add(1);
-
-        info!(target: "n42::cl::sync", %peer, local_view, target_view, "initiating state sync");
-
         // Cap to_view so the request doesn't exceed MAX_BLOCKS_PER_SYNC_REQUEST.
         // The peer will reject oversized ranges; capping here avoids a wasted round-trip.
         let capped_to_view = target_view.min(local_view + MAX_BLOCKS_PER_SYNC_REQUEST);
@@ -366,17 +381,32 @@ impl ConsensusService {
             local_committed_view: local_view,
         };
 
-        let request_range = (request.from_view, request.to_view);
-        if let Err(e) = self.network.request_sync(peer, request) {
-            error!(target: "n42::cl::sync", error = %e, "failed to send sync request");
+        let mut requested_peers = std::collections::HashSet::new();
+        for peer in peers {
+            match self.network.request_sync(peer, request.clone()) {
+                Ok(()) => {
+                    requested_peers.insert(peer);
+                }
+                Err(error) => {
+                    warn!(target: "n42::cl::sync", %peer, %error, "failed to queue state sync request");
+                }
+            }
+        }
+        if requested_peers.is_empty() {
             return;
         }
 
+        info!(
+            target: "n42::cl::sync",
+            local_view,
+            target_view = capped_to_view,
+            peers = requested_peers.len(),
+            "initiating state sync fan-out"
+        );
         self.sync_in_flight = true;
         self.sync_started_at = Some(Instant::now());
-        self.sync_request_range = Some(request_range);
-        self.sync_requested_peers.clear();
-        self.sync_requested_peers.insert(peer);
+        self.sync_request_range = Some((request.from_view, request.to_view));
+        self.sync_requested_peers = requested_peers;
     }
 
     /// Handles an incoming sync request from a peer.
@@ -1152,17 +1182,13 @@ impl ConsensusService {
 
     /// Verifies commit QC validity for a sync block.
     /// Returns false and logs a warning if verification fails.
-    fn verify_sync_block_qc(&self, sync_block: &SyncBlock) -> bool {
-        // Identify the validator set by matching the QC's bitmap length rather than
-        // computing epoch_for_view().  epoch_for_view() assumes epoch advances fire
-        // exactly at every boundary, but in practice staging can be delayed past a
-        // boundary (e.g., validator added at view 47 → epoch advances at view 61, not
-        // view 31).  Matching by size is correct because each epoch has a distinct
-        // validator count in the normal add/remove workflow; BLS verification then
-        // confirms we picked the right set.
+    pub(super) fn verify_sync_block_qc(&self, sync_block: &SyncBlock) -> bool {
+        // Resolve authority from the certificate view. Bitmap width is only a
+        // structural check: a different epoch can have the same width, and even a
+        // differently-sized old set can validly sign bytes for an unauthorized view.
         let bitmap_len = sync_block.commit_qc.signers.len();
         let em = self.engine.epoch_manager();
-        let vs = match em.find_validator_set_by_len(bitmap_len) {
+        let vs = match em.known_validator_set_for_view(sync_block.commit_qc.view) {
             Some(vs) => vs,
             None => {
                 warn!(
@@ -1170,14 +1196,29 @@ impl ConsensusService {
                     view = sync_block.view,
                     bitmap_len,
                     current_epoch = em.current_epoch(),
-                    "no validator set with matching bitmap length; rejecting sync block"
+                    "validator set unavailable for commit_qc view; rejecting sync block"
                 );
                 return false;
             }
         };
+        if vs.len() as usize != bitmap_len {
+            warn!(
+                target: "n42::cl::sync",
+                view = sync_block.view,
+                bitmap_len,
+                authorized_len = vs.len(),
+                "commit_qc bitmap does not match view-authorized validator set"
+            );
+            return false;
+        }
 
         let ch = validator_changes_hash(&sync_block.validator_changes);
-        if let Err(e) = verify_commit_qc(&sync_block.commit_qc, vs, &ch) {
+        if let Err(e) = verify_commit_qc_with_profile(
+            &sync_block.commit_qc,
+            vs,
+            &ch,
+            self.engine.signing_profile(),
+        ) {
             warn!(
                 target: "n42::cl::sync",
                 view = sync_block.view,

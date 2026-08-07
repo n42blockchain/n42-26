@@ -17,13 +17,7 @@ impl ConsensusEngine {
             return Ok(());
         }
 
-        // Use resolve_qc_validator_set instead of validator_set_for_view to handle
-        // the epoch-drift zone: after staging a new validator set but before the epoch
-        // boundary fires, validator_set_for_view returns the staged next_set (wrong size)
-        // for views that fall in the "mathematical next epoch" range.  The resolver falls
-        // back to find_validator_set_by_len when there is a bitmap-size mismatch, which
-        // correctly identifies the 3-validator set for a 3-bit QC even while next_set is staged.
-        let commit_set = self.resolve_qc_validator_set(&decide.commit_qc);
+        let commit_set = self.resolve_qc_validator_set(&decide.commit_qc)?;
         let quorum_size = commit_set.quorum_size();
         if decide.commit_qc.signer_count() < quorum_size {
             return Err(ConsensusError::InsufficientVotes {
@@ -52,10 +46,11 @@ impl ConsensusEngine {
         // The `validator_changes_hash` is part of the signed message (Plan #2 in
         // the HotStuff-2 audit), so a Byzantine leader cannot substitute a
         // different changes_hash after collecting commit votes.
-        super::quorum::verify_commit_qc(
+        super::quorum::verify_commit_qc_with_profile(
             &decide.commit_qc,
             commit_set,
             &decide.validator_changes_hash,
+            self.signing_profile,
         )?;
 
         // Cache the committed block's changes hash so a late Proposal for the same

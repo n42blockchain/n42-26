@@ -27,7 +27,7 @@ thiserror.workspace = true
 
 # Misc
 derive_more.workspace = true
-getrandom = "0.3"
+getrandom = "0.4"
 zeroize.workspace = true
 
 [dev-dependencies]

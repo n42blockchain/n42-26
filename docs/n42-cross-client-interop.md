@@ -1,6 +1,6 @@
 # N42 原生链跨语言节点互通路线（QMDB + HotStuff-2）
 
-> 状态：QMDB Phase 0/1 已完成并通过现有 full replay；H2 legacy wire Phase 0 与只读 observer 已完成，H2-v4 共同签名域仍待实现。本文定义 gov5（Go）与 n42-26（Rust）成为同一条 N42 原生链中独立客户端的边界、迁移顺序和验收条件。replay-v2 的 QMDB 历史和 HotStuff-2（H2）共识是第一优先级；eth-el archive+ 互通在此路线稳定后再单独推进。
+> 状态：QMDB Phase 0/1 已完成并通过现有 full replay；H2-v4 wire、共同签名域、静态验证者生产 profile 与 gov5→Rust 真机 finality observer 已完成。本文定义 gov5（Go）与 n42-26（Rust）成为同一条 N42 原生链中独立客户端的边界、迁移顺序和验收条件。replay-v2 的 QMDB 历史和 HotStuff-2（H2）共识是第一优先级；eth-el archive+ 互通在此路线稳定后再单独推进。
 
 ## 目标
 
@@ -77,7 +77,7 @@ H2-v4 签名域现已由共享 vectors 固定为
 `N42H2V4 || phase || chain_id || genesis_hash || view`，并按消息阶段追加 block hash 与 validator-change hash。旧引擎尚未切换；必须等 v4 envelope/topic 与双向验证完成后通过显式链配置启用。
 
 H2-v4 envelope 与 Go 生成的 Snappy frame 也已互认；Rust observer 会同时订阅
-`/n42/h2/4/ssz_snappy` 并按本地 chain id/genesis 严格过滤。当前仍只产生观察事件，不转换为 Rust 原生投票事件。
+`/n42/h2/4/ssz_snappy` 并按显式 chain id/genesis 严格过滤。2026-07-21 的独立七节点真机运行中，Rust 经 TCP/Noise/Yamux 接入 gov5，在 view 476 成功验证真实 Decide 的 BLS CommitQC。当前仍只产生观察事件，不转换为 Rust 原生投票事件；详见 devlog-118。
 
 ### Phase 3 — replay-v2 等价性与 catch-up
 
@@ -101,4 +101,41 @@ H2-v4 envelope 与 Go 生成的 Snappy frame 也已互认；Rust observer 会同
 
 ## 下一项实现
 
-QMDB 已完成 deterministic vectors、portable exporter、Rust importer，以及既有 87,786,434-slot full replay 的同 root 验收。H2 全部 7 类 legacy 消息、签名 preimage、QC/TC bitmap、Go Snappy frame 与 Rust 只读 observer 也已通过双端 vectors。下一项是设计并实现双方共同的 H2-v4 commit 签名域和 versioned topic，再做 1,000-block finalized bundle replay；在此之前仍禁止混合 validator 投票。
+QMDB 已完成 deterministic vectors、portable exporter、Rust importer，以及既有 87,786,434-slot full replay 的同 root 验收。H2 全部 7 类 legacy 消息、H2-v4 签名域/envelope、QC/TC bitmap、Go Snappy frame、生产 profile 与 Rust 真机只读 finality observer 均已通过。下一项是实现 finalized-range/replay-v2 transport 并完成 1,000-block finalized bundle + QMDB checkpoint replay；在此之前仍禁止混合 validator 投票。
+
+Rust observer 现可在启动网络前通过 `N42_QMDB_BOOTSTRAP` 读取并流式验证
+portable checkpoint。必须同时提供 `N42_QMDB_BOOTSTRAP_BLOCK`、
+`N42_QMDB_BOOTSTRAP_BLOCK_HASH` 与 `N42_QMDB_BOOTSTRAP_ROOT`；节点将它们连同
+chain ID 和 gov5 genesis identity 全部核对，任一不符即 fail closed。该路径只建立
+QMDB replay 锚，不会把 gov5 的 QMDB root 冒充成本地 Reth/MPT execution root。
+
+可同时设置 `N42_FINALIZED_RANGE_BOOTSTRAP`。该 bounded v1 bundle 最多包含 128 个
+连续 canonical blocks，Rust 会验证 header Keccak、block 内嵌 header、parent lineage、
+chain/genesis 与整帧 Blake3，并要求 range head 的 block hash/state root 与 QMDB
+checkpoint 完全一致。compact receipts 已按 gov5 native codec 解码，并与 block 交易数
+绑定、逐块重算 native receipt root；runtime-02 的 49 块/247 tx 已通过。当前仍是只读
+import boundary；安全的两阶段执行导入和网络 request/response 完成前不会推进本地
+Reth head，也不会开放 validator 投票。
+
+两阶段导入的第一阶段现已实现：`decode_finalized_range_stream` 只有在整帧摘要、完整扩展
+header、block lineage、Ethereum transaction trie root、compact receipts 与 native receipt
+root 全部通过后，才返回带 256 MiB 总物化上限的 typed entries。任何 execution/archive
+副作用必须只消费该返回值；QMDB execution commitment 尚未接入 Reth 前仍禁止提交 Engine
+API 或借助 state-root bypass 推进 head。
+
+已认证 entries 现可进入无副作用的 Engine import-plan 预检。显式、observer-only 的
+`Gov5H2` profile 会严格验证并无损恢复全零 `ommers_hash`、当前 `difficulty=0`（以及旧
+replay-v2 历史的 `difficulty=1`）和有界
+`N42H` extra-data；默认 Ethereum profile 不变。runtime-01 的 128 块与 runtime-02 的 49
+块/247 tx 均已保持原 block hash 生成 payload 计划。当前仍不能声称 execution follower：
+Reth 的 MPT state root/receipt trie 与 gov5 replay-v2 的 QMDB/native receipt commitment 不同，
+且不得改写既有七节点历史。
+
+确定性 QMDB state-root 验证现已接入 Reth 2.4.1 官方 `StateRootStrategy`。显式设置
+`N42_GOV5_QMDB_EXECUTION=1` 时，节点会从认证 portable base 按候选块的精确父分支重放 EVM
+mutation，只有 computed root 等于 header root 才登记该候选；兄弟分支不共享可变 canonical
+tree。该模式仍被锁在 observer，并对物化 slots/bytes 设置硬上限。它还要求本地 Reth head 的
+number/hash 与 QMDB base 精确一致：当前 block-49 checkpoint 不能直接配 fresh Reth genesis，
+必须先完成 Gov5 genesis 或 checkpoint 对应的 PlainState/canonical ancestor hydration。因此此时
+仍不能接入现有七节点作为 execution follower，更不能参与投票；下一验收是一次性 datadir 上的
+runtime-02 block 1–49 连续执行与逐块 QMDB/receipt/header 对拍。

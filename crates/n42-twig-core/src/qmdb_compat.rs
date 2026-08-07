@@ -20,6 +20,74 @@ const PORTABLE_SNAPSHOT_HEADER_SIZE: usize = 8 + 8 + 32 + 8 + 32 + 32 + 8 + 8;
 const PORTABLE_SNAPSHOT_ENTRY_SIZE: usize = 8 + 1 + 32 + 4;
 const MAX_PORTABLE_VALUE_SIZE: usize = 16 << 20;
 
+/// Keccak-256 of empty bytecode. gov5 treats both this value and zero as an empty code hash when
+/// serializing a QMDB account leaf.
+pub const GOV5_EMPTY_CODE_HASH: Hash = [
+    0xc5, 0xd2, 0x46, 0x01, 0x86, 0xf7, 0x23, 0x3c, 0x92, 0x7e, 0x7d, 0xb2, 0xdc, 0xc7, 0x03, 0xc0,
+    0xe5, 0x00, 0xb6, 0x53, 0xca, 0x82, 0x27, 0x3b, 0x7b, 0xfa, 0xd8, 0x04, 0x5d, 0x85, 0xa4, 0x70,
+];
+
+/// gov5 QMDB account key: `Blake3(address)` with no domain prefix.
+pub fn gov5_account_key(address: &[u8; 20]) -> Hash {
+    *blake3::hash(address).as_bytes()
+}
+
+/// gov5 QMDB storage key: `Blake3(address || slot)` with no domain prefix.
+pub fn gov5_storage_key(address: &[u8; 20], slot: &[u8; 32]) -> Hash {
+    let mut input = [0_u8; 52];
+    input[..20].copy_from_slice(address);
+    input[20..].copy_from_slice(slot);
+    *blake3::hash(&input).as_bytes()
+}
+
+/// Exact gov5 `StateAccount.MarshalV2` leaf encoding.
+///
+/// The balance must be a 32-byte big-endian integer. Non-zero nonce uses unsigned LEB128;
+/// non-zero balance uses a one-byte length followed by minimal big-endian bytes; non-empty code
+/// hash is stored verbatim. The first byte is the presence bitmap (nonce=1, balance=2, code=8).
+pub fn encode_gov5_account_value(nonce: u64, balance: &[u8; 32], code_hash: &Hash) -> Vec<u8> {
+    let balance_start = balance.iter().position(|byte| *byte != 0);
+    let has_code = *code_hash != NULL_HASH && *code_hash != GOV5_EMPTY_CODE_HASH;
+    let mut value = Vec::with_capacity(
+        1 + if nonce == 0 { 0 } else { 10 }
+            + balance_start.map_or(0, |start| 1 + balance.len() - start)
+            + if has_code { 32 } else { 0 },
+    );
+    value.push(0);
+    if nonce != 0 {
+        value[0] |= 1;
+        let mut remaining = nonce;
+        while remaining >= 0x80 {
+            value.push((remaining as u8) | 0x80);
+            remaining >>= 7;
+        }
+        value.push(remaining as u8);
+    }
+    if let Some(start) = balance_start {
+        value[0] |= 2;
+        value.push((balance.len() - start) as u8);
+        value.extend_from_slice(&balance[start..]);
+    }
+    if has_code {
+        value[0] |= 8;
+        value.extend_from_slice(code_hash);
+    }
+    value
+}
+
+/// One deterministic QMDB mutation. `None` deactivates the current live slot for `key`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct QmdbOperation {
+    pub key: Hash,
+    pub value: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
+pub enum QmdbOperationError {
+    #[error("QMDB block mutation contains duplicate key {0:?}")]
+    DuplicateKey(Hash),
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct QmdbEntrySnapshot {
     pub key: Hash,
@@ -527,6 +595,41 @@ pub enum QmdbProofCodecError {
 }
 
 impl QmdbProof {
+    /// Encode the exact v2 proof layout consumed by gov5 and [`Self::decode`].
+    pub fn encode(&self) -> Result<Vec<u8>, QmdbProofCodecError> {
+        if self.upper_path.len() > MAX_UPPER_PATH {
+            return Err(QmdbProofCodecError::UpperPathTooLong(self.upper_path.len()));
+        }
+        let value_len = u32::try_from(self.value.len())
+            .map_err(|_| QmdbProofCodecError::ValueLengthOverflow)?;
+        let mut out = Vec::with_capacity(
+            1 + 32
+                + 8
+                + 1
+                + TWIG_HEIGHT * 32
+                + BITS_BYTES
+                + 1
+                + self.upper_path.len() * 32
+                + 4
+                + self.value.len(),
+        );
+        out.push(PROOF_CODEC_VERSION);
+        out.extend_from_slice(&self.key);
+        out.extend_from_slice(&self.slot.to_le_bytes());
+        out.push(TWIG_HEIGHT as u8);
+        for sibling in &self.twig_path {
+            out.extend_from_slice(sibling);
+        }
+        out.extend_from_slice(&self.active_bits);
+        out.push(self.upper_path.len() as u8);
+        for sibling in &self.upper_path {
+            out.extend_from_slice(sibling);
+        }
+        out.extend_from_slice(&value_len.to_le_bytes());
+        out.extend_from_slice(&self.value);
+        Ok(out)
+    }
+
     /// Decode the exact v2 proof layout emitted by gov5 `qmdb.Proof.Marshal`.
     /// The transport envelope (SSZ/snappy/RPC) is intentionally outside this
     /// low-level verifier.
@@ -575,10 +678,17 @@ impl QmdbProof {
         })
     }
 
-    /// Verify membership against a QMDB world root, including the active-bit
-    /// assertion which distinguishes a frozen dead leaf from a live value.
-    pub fn verify(&self, root: &Hash) -> bool {
-        let mut local = (self.slot as usize) % TWIG_SIZE;
+    /// Verify membership against a QMDB world root and the key requested by the caller.
+    ///
+    /// The explicit key binding is mandatory at an untrusted RPC boundary: a Merkle proof can be
+    /// internally valid while answering a different query. Slot high bits must also be exhausted
+    /// by the authenticated upper path, otherwise the same path could be relabelled as a twig
+    /// outside the committed tree.
+    pub fn verify_for_key(&self, root: &Hash, expected_key: &Hash) -> bool {
+        if self.key != *expected_key {
+            return false;
+        }
+        let mut local = (self.slot % TWIG_SIZE as u64) as usize;
         if self.active_bits[local / 8] & (1 << (local % 8)) == 0 {
             return false;
         }
@@ -592,7 +702,7 @@ impl QmdbProof {
             local >>= 1;
         }
         node = hash_node(&node, &hash_bits(&self.active_bits));
-        let mut twig_id = (self.slot as usize) / TWIG_SIZE;
+        let mut twig_id = self.slot / TWIG_SIZE as u64;
         for sibling in &self.upper_path {
             node = if twig_id & 1 == 0 {
                 hash_node(&node, sibling)
@@ -601,7 +711,7 @@ impl QmdbProof {
             };
             twig_id >>= 1;
         }
-        node == *root
+        twig_id == 0 && node == *root
     }
 }
 
@@ -762,6 +872,45 @@ impl QmdbCompatTree {
             .map(|slot| self.entries[*slot as usize].value.as_slice())
     }
 
+    /// Generate a gov5-compatible membership proof for an active key.
+    pub fn prove(&self, key: &Hash) -> Option<QmdbProof> {
+        let slot = *self.index.get(key)?;
+        let twig_id = slot as usize / TWIG_SIZE;
+        let local = slot as usize % TWIG_SIZE;
+        let twig = &self.twigs[twig_id];
+
+        let mut twig_path = [NULL_HASH; TWIG_HEIGHT];
+        let mut node = TWIG_SIZE + local;
+        for sibling in &mut twig_path {
+            *sibling = twig.nodes[node ^ 1];
+            node >>= 1;
+        }
+
+        let cap = self.twigs.len().next_power_of_two();
+        let mut upper = vec![NULL_HASH; cap * 2];
+        for (index, twig) in self.twigs.iter().enumerate() {
+            upper[cap + index] = twig.root;
+        }
+        for index in (1..cap).rev() {
+            upper[index] = hash_node(&upper[index * 2], &upper[index * 2 + 1]);
+        }
+        let mut upper_path = Vec::with_capacity(cap.trailing_zeros() as usize);
+        let mut upper_node = cap + twig_id;
+        while upper_node > 1 {
+            upper_path.push(upper[upper_node ^ 1]);
+            upper_node >>= 1;
+        }
+
+        Some(QmdbProof {
+            key: *key,
+            value: self.entries[slot as usize].value.clone(),
+            slot,
+            twig_path,
+            active_bits: twig.bits,
+            upper_path,
+        })
+    }
+
     /// Append a new frozen leaf, deactivating an earlier live slot for `key`.
     pub fn set(&mut self, key: Hash, value: Vec<u8>) {
         if let Some(old_slot) = self.index.get(&key).copied() {
@@ -789,6 +938,29 @@ impl QmdbCompatTree {
         };
         self.deactivate(slot);
         true
+    }
+
+    /// Apply one block's mutations in the exact deterministic order used by gov5. Duplicates are
+    /// rejected before the tree is changed so a malformed conversion cannot partially mutate it.
+    pub fn apply_sorted_ops(
+        &mut self,
+        operations: impl IntoIterator<Item = QmdbOperation>,
+    ) -> Result<Hash, QmdbOperationError> {
+        let mut operations = operations.into_iter().collect::<Vec<_>>();
+        operations.sort_unstable_by_key(|operation| operation.key);
+        for pair in operations.windows(2) {
+            if pair[0].key == pair[1].key {
+                return Err(QmdbOperationError::DuplicateKey(pair[0].key));
+            }
+        }
+        for operation in operations {
+            if let Some(value) = operation.value {
+                self.set(operation.key, value);
+            } else {
+                self.delete(&operation.key);
+            }
+        }
+        Ok(self.root())
     }
 
     pub fn root(&self) -> Hash {
@@ -960,6 +1132,87 @@ mod tests {
     }
 
     #[test]
+    fn gov5_state_leaf_codec_matches_marshal_v2_layout() {
+        let zero = [0_u8; 32];
+        assert_eq!(encode_gov5_account_value(0, &zero, &zero), [0]);
+        assert_eq!(
+            encode_gov5_account_value(100_000, &zero, &GOV5_EMPTY_CODE_HASH),
+            hex::decode("01a08d06").unwrap()
+        );
+
+        let mut one_eth = [0_u8; 32];
+        one_eth[24..].copy_from_slice(&1_000_000_000_000_000_000_u64.to_be_bytes());
+        assert_eq!(
+            encode_gov5_account_value(0, &one_eth, &zero),
+            hex::decode("02080de0b6b3a7640000").unwrap()
+        );
+
+        let code_hash = [0x12; 32];
+        let mut balance = [0_u8; 32];
+        balance[24..].copy_from_slice(&5_000_000_000_000_000_000_u64.to_be_bytes());
+        let encoded = encode_gov5_account_value(42, &balance, &code_hash);
+        assert_eq!(encoded[0], 0x0b);
+        assert_eq!(
+            &encoded[1..11],
+            &hex::decode("2a084563918244f40000").unwrap()
+        );
+        assert_eq!(&encoded[11..], &code_hash);
+    }
+
+    #[test]
+    fn gov5_keys_and_sorted_block_mutations_are_deterministic() {
+        let address = [0x11; 20];
+        let slot = [0x22; 32];
+        assert_eq!(
+            gov5_account_key(&address),
+            *blake3::hash(&address).as_bytes()
+        );
+        let mut storage_input = [0_u8; 52];
+        storage_input[..20].copy_from_slice(&address);
+        storage_input[20..].copy_from_slice(&slot);
+        assert_eq!(
+            gov5_storage_key(&address, &slot),
+            *blake3::hash(&storage_input).as_bytes()
+        );
+
+        let operations = vec![
+            QmdbOperation {
+                key: key(3),
+                value: Some(b"three".to_vec()),
+            },
+            QmdbOperation {
+                key: key(1),
+                value: Some(b"one".to_vec()),
+            },
+            QmdbOperation {
+                key: key(2),
+                value: Some(b"two".to_vec()),
+            },
+        ];
+        let mut sorted = QmdbCompatTree::new();
+        let sorted_root = sorted.apply_sorted_ops(operations).unwrap();
+        let mut expected = QmdbCompatTree::new();
+        expected.set(key(1), b"one".to_vec());
+        expected.set(key(2), b"two".to_vec());
+        expected.set(key(3), b"three".to_vec());
+        assert_eq!(sorted_root, expected.root());
+
+        let before = sorted.snapshot();
+        let duplicate = sorted.apply_sorted_ops([
+            QmdbOperation {
+                key: key(4),
+                value: Some(b"first".to_vec()),
+            },
+            QmdbOperation {
+                key: key(4),
+                value: None,
+            },
+        ]);
+        assert_eq!(duplicate, Err(QmdbOperationError::DuplicateKey(key(4))));
+        assert_eq!(sorted.snapshot(), before);
+    }
+
+    #[test]
     fn matches_gov5_cross_client_v1_vectors() {
         let vector: CrossClientVector =
             serde_json::from_str(include_str!("../testdata/cross_client_v1.json")).unwrap();
@@ -1008,7 +1261,7 @@ mod tests {
         let proof_bytes = hex::decode(vector.proof.hex).unwrap();
         let proof = QmdbProof::decode(&proof_bytes).unwrap();
         assert_eq!(proof.key, interop_key(vector.proof.key));
-        assert!(proof.verify(&final_root));
+        assert!(proof.verify_for_key(&final_root, &interop_key(vector.proof.key)));
 
         let portable_bytes = hex::decode(vector.portable.hex).unwrap();
         let portable = QmdbPortableSnapshot::decode(&portable_bytes).unwrap();
@@ -1130,22 +1383,28 @@ mod tests {
     fn verify_portable_stream_matches_in_memory_root() {
         let genesis = interop_key(0x11);
         let portable = build_sequential_portable(1143, genesis, 2050);
-        let in_memory_root = portable
-            .verify_and_build(1143, &genesis)
-            .unwrap()
-            .root();
+        let in_memory_root = portable.verify_and_build(1143, &genesis).unwrap().root();
         let encoded = portable.encode().unwrap();
 
         let streamed = verify_portable_stream(encoded.as_slice(), 1143, &genesis).unwrap();
-        assert_eq!(streamed.root, portable.root, "streaming root must match snapshot claim");
-        assert_eq!(streamed.root, in_memory_root, "streaming path must agree with in-memory path");
+        assert_eq!(
+            streamed.root, portable.root,
+            "streaming root must match snapshot claim"
+        );
+        assert_eq!(
+            streamed.root, in_memory_root,
+            "streaming path must agree with in-memory path"
+        );
         assert_eq!(streamed.next_slot, 2050);
         assert_eq!(streamed.live_count, 2050);
 
         // Wrong chain identity is rejected before any root work.
         assert!(matches!(
             verify_portable_stream(encoded.as_slice(), 1, &genesis),
-            Err(QmdbPortableError::WrongChainId { expected: 1, got: 1143 })
+            Err(QmdbPortableError::WrongChainId {
+                expected: 1,
+                got: 1143
+            })
         ));
     }
 
@@ -1157,14 +1416,14 @@ mod tests {
     fn verify_portable_stream_non_power_of_two_twig_count() {
         let genesis = interop_key(0x11);
         let portable = build_sequential_portable(1143, genesis, 5000);
-        let in_memory_root = portable
-            .verify_and_build(1143, &genesis)
-            .unwrap()
-            .root();
+        let in_memory_root = portable.verify_and_build(1143, &genesis).unwrap().root();
         let encoded = portable.encode().unwrap();
 
         let streamed = verify_portable_stream(encoded.as_slice(), 1143, &genesis).unwrap();
-        assert_eq!(streamed.root, in_memory_root, "3-twig fold must agree across paths");
+        assert_eq!(
+            streamed.root, in_memory_root,
+            "3-twig fold must agree across paths"
+        );
         assert_eq!(streamed.next_slot, 5000);
     }
 
@@ -1187,7 +1446,10 @@ mod tests {
         // No entries / no valid digest: the stream must error on the first missing
         // entry read, never having reserved for `huge` twigs.
         let result = verify_portable_stream(header.as_slice(), 1143, &interop_key(0x11));
-        assert!(result.is_err(), "truncated oversized stream must fail, not OOM");
+        assert!(
+            result.is_err(),
+            "truncated oversized stream must fail, not OOM"
+        );
     }
 
     #[test]
@@ -1299,15 +1561,39 @@ mod tests {
         encoded.extend_from_slice(b"proof-value");
 
         let proof = QmdbProof::decode(&encoded).unwrap();
-        assert!(proof.verify(&root));
+        assert!(proof.verify_for_key(&root, &key(7)));
+        assert!(!proof.verify_for_key(&root, &key(8)));
+
+        let mut unauthenticated_slot = proof.clone();
+        unauthenticated_slot.slot += TWIG_SIZE as u64;
+        assert!(!unauthenticated_slot.verify_for_key(&root, &key(7)));
 
         let mut dead = proof.clone();
         dead.active_bits[0] = 0;
-        assert!(!dead.verify(&root));
+        assert!(!dead.verify_for_key(&root, &key(7)));
         encoded.push(0);
         assert!(matches!(
             QmdbProof::decode(&encoded),
             Err(QmdbProofCodecError::TrailingBytes(1))
         ));
+    }
+
+    #[test]
+    fn generated_proof_roundtrips_exact_codec_and_root() {
+        let mut tree = QmdbCompatTree::new();
+        let indexed_key = |index: u64| {
+            let mut out = [0_u8; 32];
+            out[..8].copy_from_slice(&index.to_le_bytes());
+            out
+        };
+        for index in 0..(TWIG_SIZE + 3) {
+            tree.set(indexed_key(index as u64), index.to_le_bytes().to_vec());
+        }
+        let query = indexed_key((TWIG_SIZE + 1) as u64);
+        let proof = tree.prove(&query).expect("active key has proof");
+        assert!(proof.verify_for_key(&tree.root(), &query));
+        let encoded = proof.encode().unwrap();
+        assert_eq!(QmdbProof::decode(&encoded).unwrap(), proof);
+        assert!(tree.prove(&indexed_key(u64::MAX)).is_none());
     }
 }

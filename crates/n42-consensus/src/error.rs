@@ -139,6 +139,10 @@ pub enum ConsensusError {
     )]
     EpochsDisabled,
 
+    /// gov5 H2-v4 currently commits a static validator-set hash of zero.
+    #[error("H2-v4 participant mode does not support dynamic validator changes")]
+    H2V4ValidatorChangesUnsupported,
+
     /// A validator's BLS public key failed subgroup / non-infinity validation.
     /// Detected at `ValidatorSet::try_new` so all subsequent verifications can
     /// safely skip the per-call subgroup check.

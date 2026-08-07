@@ -1,13 +1,131 @@
 use alloy_primitives::B256;
 use bitvec::prelude::*;
 use n42_primitives::{
-    bls::{AggregateSignature, BlsPublicKey, BlsSignature, batch_verify_with_fallback},
-    consensus::{QuorumCertificate, TimeoutCertificate, ViewNumber},
+    BlsSecretKey,
+    bls::{
+        AggregateSignature, BlsPublicKey, BlsSignature, batch_verify_h2_v4_with_fallback,
+        batch_verify_with_fallback,
+    },
+    consensus::{
+        H2V4ChainIdentity, QuorumCertificate, TimeoutCertificate, ViewNumber,
+        h2_v4_commit_signing_message, h2_v4_new_view_signing_message,
+        h2_v4_proposal_signing_message, h2_v4_timeout_signing_message, h2_v4_vote_signing_message,
+    },
 };
 use std::collections::{HashMap, HashSet};
 
 use crate::error::{ConsensusError, ConsensusResult};
 use crate::validator::ValidatorSet;
+
+/// Selects the BLS ciphersuite and signed bytes used by the consensus engine.
+/// Native remains the default; H2-v4 is enabled only by an explicit participant
+/// configuration and binds every signature to the chain identity.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ConsensusSigningProfile {
+    #[default]
+    Native,
+    H2V4(H2V4ChainIdentity),
+}
+
+impl ConsensusSigningProfile {
+    pub fn proposal_message(
+        self,
+        view: ViewNumber,
+        block_hash: B256,
+        validator_changes: &Option<Vec<n42_primitives::consensus::ValidatorChange>>,
+    ) -> Vec<u8> {
+        match self {
+            Self::Native => proposal_signing_message(view, &block_hash, validator_changes).to_vec(),
+            Self::H2V4(identity) => h2_v4_proposal_signing_message(
+                identity,
+                view,
+                block_hash,
+                validator_changes_hash(validator_changes),
+            )
+            .to_vec(),
+        }
+    }
+
+    pub fn vote_message(self, view: ViewNumber, block_hash: B256) -> Vec<u8> {
+        match self {
+            Self::Native => signing_message(view, &block_hash).to_vec(),
+            Self::H2V4(identity) => h2_v4_vote_signing_message(identity, view, block_hash).to_vec(),
+        }
+    }
+
+    pub fn commit_message(self, view: ViewNumber, block_hash: B256, changes_hash: B256) -> Vec<u8> {
+        match self {
+            Self::Native => commit_signing_message(view, &block_hash, &changes_hash).to_vec(),
+            Self::H2V4(identity) => {
+                h2_v4_commit_signing_message(identity, view, block_hash, changes_hash).to_vec()
+            }
+        }
+    }
+
+    pub fn timeout_message(self, view: ViewNumber) -> Vec<u8> {
+        match self {
+            Self::Native => timeout_signing_message(view).to_vec(),
+            Self::H2V4(identity) => h2_v4_timeout_signing_message(identity, view).to_vec(),
+        }
+    }
+
+    pub fn new_view_message(self, view: ViewNumber) -> Vec<u8> {
+        match self {
+            Self::Native => newview_signing_message(view).to_vec(),
+            Self::H2V4(identity) => h2_v4_new_view_signing_message(identity, view).to_vec(),
+        }
+    }
+
+    pub fn sign(self, secret_key: &BlsSecretKey, message: &[u8]) -> BlsSignature {
+        match self {
+            Self::Native => secret_key.sign(message),
+            Self::H2V4(_) => secret_key.sign_h2_v4(message),
+        }
+    }
+
+    pub fn verify_single(
+        self,
+        public_key: &BlsPublicKey,
+        message: &[u8],
+        signature: &BlsSignature,
+    ) -> bool {
+        match self {
+            Self::Native => public_key.verify_prevalidated(message, signature),
+            Self::H2V4(_) => public_key.verify_h2_v4_prevalidated(message, signature),
+        }
+        .is_ok()
+    }
+
+    /// Batch-verifies distinct (message, signature, key) tuples, returning the
+    /// positions that failed. Both ciphersuites use the multi-pairing path with
+    /// random scalars; only the domain and the localizing fallback differ.
+    pub fn batch_verify(
+        self,
+        messages: &[&[u8]],
+        signatures: &[&BlsSignature],
+        public_keys: &[&BlsPublicKey],
+    ) -> Result<(), Vec<usize>> {
+        match self {
+            Self::Native => batch_verify_with_fallback(messages, signatures, public_keys),
+            Self::H2V4(_) => batch_verify_h2_v4_with_fallback(messages, signatures, public_keys),
+        }
+    }
+
+    fn verify_aggregate(
+        self,
+        message: &[u8],
+        signature: &BlsSignature,
+        public_keys: &[&BlsPublicKey],
+    ) -> bool {
+        match self {
+            Self::Native => AggregateSignature::verify_aggregate(message, signature, public_keys),
+            Self::H2V4(_) => {
+                AggregateSignature::verify_h2_v4_aggregate(message, signature, public_keys)
+            }
+        }
+        .is_ok()
+    }
+}
 
 /// Collects votes for a specific view and produces a QuorumCertificate
 /// once n-f votes from the active validator set are received.
@@ -91,6 +209,15 @@ impl VoteCollector {
         validator_set: &ValidatorSet,
         message: &[u8],
     ) -> ConsensusResult<QuorumCertificate> {
+        self.build_qc_with_profile_message(validator_set, message, ConsensusSigningProfile::Native)
+    }
+
+    pub fn build_qc_with_profile_message(
+        &self,
+        validator_set: &ValidatorSet,
+        message: &[u8],
+        signing_profile: ConsensusSigningProfile,
+    ) -> ConsensusResult<QuorumCertificate> {
         // Guard: the validator_set passed here must match the set_size this collector
         // was created with. A mismatch (e.g. during epoch transitions) would cause
         // bitvec index out-of-bounds panics in release builds or UB in debug builds.
@@ -152,7 +279,8 @@ impl VoteCollector {
                 .map(|(_, sig, _)| *sig)
                 .collect::<Vec<_>>();
             let public_keys = unverified.iter().map(|(_, _, pk)| *pk).collect::<Vec<_>>();
-            let bad = batch_verify_with_fallback(&messages, &signatures, &public_keys)
+            let bad = signing_profile
+                .batch_verify(&messages, &signatures, &public_keys)
                 .err()
                 .unwrap_or_default()
                 .into_iter()
@@ -252,6 +380,14 @@ impl TimeoutCollector {
     /// Timeout messages with invalid signatures are skipped (defense-in-depth).
     /// The TC fails only if fewer than `quorum_size` valid timeouts remain.
     pub fn build_tc(&self, validator_set: &ValidatorSet) -> ConsensusResult<TimeoutCertificate> {
+        self.build_tc_with_profile(validator_set, ConsensusSigningProfile::Native)
+    }
+
+    pub fn build_tc_with_profile(
+        &self,
+        validator_set: &ValidatorSet,
+        signing_profile: ConsensusSigningProfile,
+    ) -> ConsensusResult<TimeoutCertificate> {
         if validator_set.len() != self.set_size {
             return Err(ConsensusError::InvalidTC {
                 view: self.view,
@@ -272,7 +408,7 @@ impl TimeoutCollector {
             });
         }
 
-        let message = timeout_signing_message(self.view);
+        let message = signing_profile.timeout_message(self.view);
         let mut highest_qc: Option<&QuorumCertificate> = None;
         let mut valid_sigs: Vec<&BlsSignature> = Vec::with_capacity(self.timeouts.len());
         let mut signers = bitvec![u8, Msb0; 0; self.set_size as usize];
@@ -313,7 +449,8 @@ impl TimeoutCollector {
                 .iter()
                 .map(|(_, _, pk, _)| *pk)
                 .collect::<Vec<_>>();
-            let bad = batch_verify_with_fallback(&messages, &signatures, &public_keys)
+            let bad = signing_profile
+                .batch_verify(&messages, &signatures, &public_keys)
                 .err()
                 .unwrap_or_default()
                 .into_iter()
@@ -410,6 +547,14 @@ fn collect_signer_keys<'a>(
 
 /// Verifies a QuorumCertificate (Round 1) against the validator set.
 pub fn verify_qc(qc: &QuorumCertificate, validator_set: &ValidatorSet) -> ConsensusResult<()> {
+    verify_qc_with_profile(qc, validator_set, ConsensusSigningProfile::Native)
+}
+
+pub fn verify_qc_with_profile(
+    qc: &QuorumCertificate,
+    validator_set: &ValidatorSet,
+    signing_profile: ConsensusSigningProfile,
+) -> ConsensusResult<()> {
     let quorum_size = validator_set.quorum_size();
     let signer_pks = collect_signer_keys(
         &qc.signers,
@@ -418,13 +563,14 @@ pub fn verify_qc(qc: &QuorumCertificate, validator_set: &ValidatorSet) -> Consen
         qc.view,
         CertKind::QC,
     )?;
-    let message = signing_message(qc.view, &qc.block_hash);
-    AggregateSignature::verify_aggregate(&message, &qc.aggregate_signature, &signer_pks).map_err(
-        |_| ConsensusError::InvalidQC {
+    let message = signing_profile.vote_message(qc.view, qc.block_hash);
+    signing_profile
+        .verify_aggregate(&message, &qc.aggregate_signature, &signer_pks)
+        .then_some(())
+        .ok_or_else(|| ConsensusError::InvalidQC {
             view: qc.view,
             reason: "aggregated signature verification failed".to_string(),
-        },
-    )
+        })
 }
 
 /// Verifies a CommitQC (Round 2) against the validator set.
@@ -438,6 +584,20 @@ pub fn verify_commit_qc(
     validator_set: &ValidatorSet,
     changes_hash: &B256,
 ) -> ConsensusResult<()> {
+    verify_commit_qc_with_profile(
+        qc,
+        validator_set,
+        changes_hash,
+        ConsensusSigningProfile::Native,
+    )
+}
+
+pub fn verify_commit_qc_with_profile(
+    qc: &QuorumCertificate,
+    validator_set: &ValidatorSet,
+    changes_hash: &B256,
+    signing_profile: ConsensusSigningProfile,
+) -> ConsensusResult<()> {
     let quorum_size = validator_set.quorum_size();
     let signer_pks = collect_signer_keys(
         &qc.signers,
@@ -446,13 +606,14 @@ pub fn verify_commit_qc(
         qc.view,
         CertKind::QC,
     )?;
-    let message = commit_signing_message(qc.view, &qc.block_hash, changes_hash);
-    AggregateSignature::verify_aggregate(&message, &qc.aggregate_signature, &signer_pks).map_err(
-        |_| ConsensusError::InvalidQC {
+    let message = signing_profile.commit_message(qc.view, qc.block_hash, *changes_hash);
+    signing_profile
+        .verify_aggregate(&message, &qc.aggregate_signature, &signer_pks)
+        .then_some(())
+        .ok_or_else(|| ConsensusError::InvalidQC {
             view: qc.view,
             reason: "commit QC aggregated signature verification failed".to_string(),
-        },
-    )
+        })
 }
 
 /// Verifies a QC that may be either a PrepareQC (Round 1) or CommitQC (Round 2).
@@ -467,6 +628,20 @@ pub fn verify_qc_any_domain(
     validator_set: &ValidatorSet,
     changes_hash: &B256,
 ) -> ConsensusResult<()> {
+    verify_qc_any_domain_with_profile(
+        qc,
+        validator_set,
+        changes_hash,
+        ConsensusSigningProfile::Native,
+    )
+}
+
+pub fn verify_qc_any_domain_with_profile(
+    qc: &QuorumCertificate,
+    validator_set: &ValidatorSet,
+    changes_hash: &B256,
+    signing_profile: ConsensusSigningProfile,
+) -> ConsensusResult<()> {
     let quorum_size = validator_set.quorum_size();
     let signer_pks = collect_signer_keys(
         &qc.signers,
@@ -477,27 +652,34 @@ pub fn verify_qc_any_domain(
     )?;
 
     // Try prepare (Round 1) message format first (most common path).
-    let prepare_msg = signing_message(qc.view, &qc.block_hash);
-    if AggregateSignature::verify_aggregate(&prepare_msg, &qc.aggregate_signature, &signer_pks)
-        .is_ok()
-    {
+    let prepare_msg = signing_profile.vote_message(qc.view, qc.block_hash);
+    if signing_profile.verify_aggregate(&prepare_msg, &qc.aggregate_signature, &signer_pks) {
         return Ok(());
     }
 
     // Fall back to commit (Round 2) message format.
-    let commit_msg = commit_signing_message(qc.view, &qc.block_hash, changes_hash);
-    AggregateSignature::verify_aggregate(&commit_msg, &qc.aggregate_signature, &signer_pks).map_err(
-        |_| ConsensusError::InvalidQC {
+    let commit_msg = signing_profile.commit_message(qc.view, qc.block_hash, *changes_hash);
+    signing_profile
+        .verify_aggregate(&commit_msg, &qc.aggregate_signature, &signer_pks)
+        .then_some(())
+        .ok_or_else(|| ConsensusError::InvalidQC {
             view: qc.view,
             reason:
                 "aggregated signature verification failed (tried both prepare and commit domains)"
                     .to_string(),
-        },
-    )
+        })
 }
 
 /// Verifies a TimeoutCertificate against the validator set.
 pub fn verify_tc(tc: &TimeoutCertificate, validator_set: &ValidatorSet) -> ConsensusResult<()> {
+    verify_tc_with_profile(tc, validator_set, ConsensusSigningProfile::Native)
+}
+
+pub fn verify_tc_with_profile(
+    tc: &TimeoutCertificate,
+    validator_set: &ValidatorSet,
+    signing_profile: ConsensusSigningProfile,
+) -> ConsensusResult<()> {
     let quorum_size = validator_set.quorum_size();
     let signer_pks = collect_signer_keys(
         &tc.signers,
@@ -506,13 +688,14 @@ pub fn verify_tc(tc: &TimeoutCertificate, validator_set: &ValidatorSet) -> Conse
         tc.view,
         CertKind::TC,
     )?;
-    let message = timeout_signing_message(tc.view);
-    AggregateSignature::verify_aggregate(&message, &tc.aggregate_signature, &signer_pks).map_err(
-        |_| ConsensusError::InvalidTC {
+    let message = signing_profile.timeout_message(tc.view);
+    signing_profile
+        .verify_aggregate(&message, &tc.aggregate_signature, &signer_pks)
+        .then_some(())
+        .ok_or_else(|| ConsensusError::InvalidTC {
             view: tc.view,
             reason: "aggregated signature verification failed".to_string(),
-        },
-    )
+        })
 }
 
 /// Computes the `changes_hash` for a set of validator changes.
@@ -1198,5 +1381,119 @@ mod tests {
         let m1 = proposal_signing_message(1, &B256::ZERO, &changes);
         let m2 = proposal_signing_message(1, &B256::ZERO, &changes);
         assert_eq!(m1, m2);
+    }
+
+    #[test]
+    fn h2_v4_profile_forms_and_verifies_qc_only_in_pop_domain() {
+        let (sks, vs) = test_validator_set(4);
+        let identity = H2V4ChainIdentity {
+            chain_id: 42,
+            genesis_hash: B256::repeat_byte(0xA4),
+        };
+        let profile = ConsensusSigningProfile::H2V4(identity);
+        let view = 17;
+        let block_hash = B256::repeat_byte(0xB4);
+        let message = profile.vote_message(view, block_hash);
+        let mut collector = VoteCollector::new(view, block_hash, vs.len());
+        for index in 0..3 {
+            collector
+                .add_vote(index, profile.sign(&sks[index as usize], &message))
+                .unwrap();
+        }
+
+        let qc = collector
+            .build_qc_with_profile_message(&vs, &message, profile)
+            .unwrap();
+        verify_qc_with_profile(&qc, &vs, profile).unwrap();
+        assert!(verify_qc(&qc, &vs).is_err());
+    }
+
+    #[test]
+    fn h2_v4_profile_forms_and_verifies_commit_qc_only_in_pop_domain() {
+        let (sks, vs) = test_validator_set(4);
+        let profile = ConsensusSigningProfile::H2V4(H2V4ChainIdentity {
+            chain_id: 42,
+            genesis_hash: B256::repeat_byte(0xA5),
+        });
+        let view = 18;
+        let block_hash = B256::repeat_byte(0xB5);
+        let changes_hash = B256::ZERO;
+        let message = profile.commit_message(view, block_hash, changes_hash);
+        let mut collector = VoteCollector::new(view, block_hash, vs.len());
+        for index in 0..3 {
+            collector
+                .add_vote(index, profile.sign(&sks[index as usize], &message))
+                .unwrap();
+        }
+
+        let qc = collector
+            .build_qc_with_profile_message(&vs, &message, profile)
+            .unwrap();
+        verify_commit_qc_with_profile(&qc, &vs, &changes_hash, profile).unwrap();
+        assert!(verify_commit_qc(&qc, &vs, &changes_hash).is_err());
+    }
+
+    #[test]
+    fn h2_v4_profile_forms_and_verifies_timeout_certificate() {
+        let (sks, vs) = test_validator_set(4);
+        let profile = ConsensusSigningProfile::H2V4(H2V4ChainIdentity {
+            chain_id: 42,
+            genesis_hash: B256::repeat_byte(0xC4),
+        });
+        let view = 19;
+        let message = profile.timeout_message(view);
+        let mut collector = TimeoutCollector::new(view, vs.len());
+        for index in 0..3 {
+            collector
+                .add_timeout(
+                    index,
+                    profile.sign(&sks[index as usize], &message),
+                    QuorumCertificate::genesis(),
+                )
+                .unwrap();
+        }
+
+        let tc = collector.build_tc_with_profile(&vs, profile).unwrap();
+        verify_tc_with_profile(&tc, &vs, profile).unwrap();
+        assert!(verify_tc(&tc, &vs).is_err());
+    }
+
+    /// TC construction batches the same way QC construction does, so it needs
+    /// the same guarantee: a bad signature is localized and dropped rather than
+    /// failing the whole batch, and its signer bit stays clear.
+    #[test]
+    fn h2_v4_timeout_certificate_drops_only_the_bad_signature() {
+        let (sks, vs) = test_validator_set(4);
+        let profile = ConsensusSigningProfile::H2V4(H2V4ChainIdentity {
+            chain_id: 42,
+            genesis_hash: B256::repeat_byte(0xC5),
+        });
+        let view = 23;
+        let message = profile.timeout_message(view);
+        let mut collector = TimeoutCollector::new(view, vs.len());
+        for index in 0..4u32 {
+            // Validator 2 signs the wrong view, which is exactly what the batch
+            // must catch without discarding the other three.
+            let signature = if index == 2 {
+                profile.sign(&sks[2], &profile.timeout_message(view + 1))
+            } else {
+                profile.sign(&sks[index as usize], &message)
+            };
+            collector
+                .add_timeout(index, signature, QuorumCertificate::genesis())
+                .unwrap();
+        }
+
+        let tc = collector.build_tc_with_profile(&vs, profile).unwrap();
+        verify_tc_with_profile(&tc, &vs, profile).unwrap();
+        assert!(
+            !tc.signers[2],
+            "the wrong-view signer must not appear in the TC bitmap"
+        );
+        assert_eq!(
+            tc.signers.count_ones(),
+            3,
+            "the other three timeouts must survive"
+        );
     }
 }

@@ -75,6 +75,7 @@ pub fn validate_message(
     block_topic_hash: &TopicHash,
     mempool_topic_hash: &TopicHash,
     blob_sidecar_topic_hash: &TopicHash,
+    gov5_block_topic_hash: Option<&TopicHash>,
 ) -> gossipsub::MessageAcceptance {
     if data.is_empty() {
         return gossipsub::MessageAcceptance::Reject;
@@ -83,23 +84,25 @@ pub fn validate_message(
     // Per-topic size limits.
     // Block data can reach several MB; consensus messages are small (~130-500 bytes).
     // Mempool transactions capped at 128KB; blob sidecars at 1MB.
-    let max_size = if topic == block_topic_hash {
-        // Same constant the publisher and max_transmit_size use. This is the
-        // receiver's Reject threshold, so a second hardcoded copy drifting below
-        // the send side would let a leader publish a block every follower then
-        // refuses — no quorum, and only a warning to show for it.
-        crate::transport::MAX_GOSSIP_MESSAGE_SIZE
-    } else if topic == blob_sidecar_topic_hash {
-        // Shared with the publisher, which packs sidecars into frames of at
-        // most this size (`broadcast_blob_sidecars`). A hardcoded copy here
-        // once sat below what the publisher could emit: a block with more than
-        // ~7 sidecars went out as a single frame every receiver then rejected.
-        crate::transport::MAX_BLOB_GOSSIP_MESSAGE_SIZE
-    } else if topic == mempool_topic_hash {
-        128 * 1024 // 128KB for individual transactions
-    } else {
-        1024 * 1024 // 1MB for consensus and other topics
-    };
+    let max_size =
+        if topic == block_topic_hash || gov5_block_topic_hash.is_some_and(|hash| topic == hash) {
+            // Same constant the publisher and max_transmit_size use. This is the
+            // receiver's Reject threshold, so a second hardcoded copy drifting below
+            // the send side would let a leader publish a block every follower then
+            // refuses — no quorum, and only a warning to show for it. The gov5
+            // interop block topic carries the same block payloads and shares it.
+            crate::transport::MAX_GOSSIP_MESSAGE_SIZE
+        } else if topic == blob_sidecar_topic_hash {
+            // Shared with the publisher, which packs sidecars into frames of at
+            // most this size (`broadcast_blob_sidecars`). A hardcoded copy here
+            // once sat below what the publisher could emit: a block with more than
+            // ~7 sidecars went out as a single frame every receiver then rejected.
+            crate::transport::MAX_BLOB_GOSSIP_MESSAGE_SIZE
+        } else if topic == mempool_topic_hash {
+            128 * 1024 // 128KB for individual transactions
+        } else {
+            1024 * 1024 // 1MB for consensus and other topics
+        };
 
     if data.len() > max_size {
         return gossipsub::MessageAcceptance::Reject;
@@ -179,6 +182,7 @@ mod tests {
             &block_hash,
             &mem_hash(),
             &blob_hash(),
+            None,
         );
         assert!(matches!(result, gossipsub::MessageAcceptance::Accept));
     }
@@ -195,6 +199,7 @@ mod tests {
             &block_hash,
             &mem_hash(),
             &blob_hash(),
+            None,
         );
         assert!(matches!(result, gossipsub::MessageAcceptance::Reject));
     }
@@ -212,6 +217,7 @@ mod tests {
             &block_hash,
             &mem_hash(),
             &blob_hash(),
+            None,
         );
         assert!(matches!(result, gossipsub::MessageAcceptance::Reject));
     }
@@ -229,6 +235,7 @@ mod tests {
             &block_hash,
             &mem_hash(),
             &blob_hash(),
+            None,
         );
         assert!(matches!(result, gossipsub::MessageAcceptance::Accept));
     }
@@ -246,6 +253,7 @@ mod tests {
             &block_hash,
             &mem_hash(),
             &blob_hash(),
+            None,
         );
         assert!(matches!(result, gossipsub::MessageAcceptance::Reject));
     }
@@ -263,6 +271,7 @@ mod tests {
             &block_hash,
             &mem_hash(),
             &blob_hash(),
+            None,
         );
         assert!(matches!(result, gossipsub::MessageAcceptance::Accept));
     }
@@ -282,6 +291,7 @@ mod tests {
             &block_hash,
             &mem_hash(),
             &blob_hash(),
+            None,
         );
         assert!(matches!(result, gossipsub::MessageAcceptance::Reject));
     }
@@ -299,6 +309,7 @@ mod tests {
             &block_hash,
             &mem_hash(),
             &blob_hash(),
+            None,
         );
         assert!(matches!(result, gossipsub::MessageAcceptance::Reject));
     }
@@ -316,6 +327,7 @@ mod tests {
             &block_hash,
             &mem_hash(),
             &blob_hash(),
+            None,
         );
         assert!(matches!(result, gossipsub::MessageAcceptance::Accept));
     }
@@ -333,6 +345,7 @@ mod tests {
             &block_hash,
             &mem_hash(),
             &blob_hash(),
+            None,
         );
         assert!(matches!(result, gossipsub::MessageAcceptance::Reject));
     }
@@ -351,6 +364,7 @@ mod tests {
             &block_hash,
             &mp_hash,
             &blob_hash(),
+            None,
         );
         assert!(matches!(result, gossipsub::MessageAcceptance::Accept));
 
@@ -362,6 +376,7 @@ mod tests {
             &block_hash,
             &mp_hash,
             &blob_hash(),
+            None,
         );
         assert!(matches!(result, gossipsub::MessageAcceptance::Reject));
     }
