@@ -38,16 +38,13 @@ jobs:
 
       - name: Security audit
         working-directory: n42-26
-        # Ignore list — see audit.toml in the repo root for rationale per
-        # advisory. Remaining entries are transitive deps N42 doesn't control
-        # directly (libp2p mDNS / an inactive revm optional dependency edge).
-        # Drop a flag once the corresponding upstream releases the fix.
+        # No ignore flags: libp2p 0.57 removed the hickory-proto 0.25.2 edge and
+        # tracing-subscriber is down to 0.3.23, so the three advisories this
+        # step used to suppress have no cause left. See audit.toml for the
+        # rationale, and re-check it on every reth or libp2p bump.
         run: |
           cargo install cargo-audit --locked --quiet
-          cargo audit \
-            --ignore RUSTSEC-2026-0119 \
-            --ignore RUSTSEC-2026-0118 \
-            --ignore RUSTSEC-2025-0055
+          cargo audit
 
       - name: Build n42-node and e2e harness
         working-directory: n42-26

@@ -46,6 +46,12 @@ const TX_FORWARD_BATCH_TARGET: usize = 512;
 // timeout whenever a command is suppressed or a swarm terminal event is lost.
 const H2_V4_FETCH_RETRY_TIMEOUT: Duration = Duration::from_secs(2);
 const H2_V4_FETCH_RETRY_ROUND: Duration = Duration::from_secs(30);
+// A body can be delivered and committed before duplicate H2 proposals/QCs
+// already queued on the consensus lane are drained. Keep the same short
+// fulfillment tombstone as the network service so those duplicates cannot
+// re-arm an orchestrator-local retry timer for a request the network suppresses.
+const H2_V4_FETCH_FULFILLED_RETENTION: Duration = Duration::from_secs(30);
+const MAX_H2_V4_FETCH_FULFILLED: usize = 4096;
 const DEFAULT_H2_V4_CATCHUP_BUFFER_BLOCKS: usize = 2048;
 const MAX_H2_V4_CATCHUP_BUFFER_BLOCKS: usize = 131_072;
 
@@ -385,6 +391,11 @@ pub struct ConsensusService {
     /// that a consensus-authenticated body is retried even if no failure event
     /// can be emitted for a command that was suppressed before transmission.
     h2_v4_fetch_requested_at: HashMap<B256, (Instant, PeerId)>,
+    /// Recently delivered block hashes. This mirrors the network-layer
+    /// fulfillment tombstones because request commands are fire-and-forget:
+    /// a network-side suppression cannot otherwise stop this orchestrator from
+    /// recording a nonexistent request and retrying it two seconds later.
+    h2_v4_fetch_fulfilled_at: HashMap<B256, Instant>,
     /// Network port (Caplin sentinel-client seam). One in-process adapter today
     /// (`NetworkHandle`); the trait object lets the orchestrator move into a
     /// service crate without depending on `n42-network` / libp2p internals.
@@ -612,9 +623,44 @@ pub struct ConsensusService {
 }
 
 impl ConsensusService {
+    fn h2_v4_fetch_fulfilled_recently(&mut self, block_hash: B256, now: Instant) -> bool {
+        if self
+            .h2_v4_fetch_fulfilled_at
+            .get(&block_hash)
+            .is_some_and(|fulfilled_at| {
+                now.saturating_duration_since(*fulfilled_at) < H2_V4_FETCH_FULFILLED_RETENTION
+            })
+        {
+            return true;
+        }
+        self.h2_v4_fetch_fulfilled_at.remove(&block_hash);
+        false
+    }
+
+    fn remember_h2_v4_fetch_fulfilled(&mut self, block_hash: B256, now: Instant) {
+        if self.h2_v4_fetch_fulfilled_at.len() >= MAX_H2_V4_FETCH_FULFILLED {
+            self.h2_v4_fetch_fulfilled_at.retain(|_, fulfilled_at| {
+                now.saturating_duration_since(*fulfilled_at) < H2_V4_FETCH_FULFILLED_RETENTION
+            });
+        }
+        if self.h2_v4_fetch_fulfilled_at.len() >= MAX_H2_V4_FETCH_FULFILLED
+            && let Some(oldest) = self
+                .h2_v4_fetch_fulfilled_at
+                .iter()
+                .min_by_key(|(_, fulfilled_at)| *fulfilled_at)
+                .map(|(hash, _)| *hash)
+        {
+            self.h2_v4_fetch_fulfilled_at.remove(&oldest);
+        }
+        self.h2_v4_fetch_fulfilled_at.insert(block_hash, now);
+    }
+
     fn request_h2_v4_gov5_block(&mut self, peer: PeerId, block_hash: B256) {
-        if block_hash == B256::ZERO
-            || block_hash == self.head_block_hash
+        let now = Instant::now();
+        if block_hash == B256::ZERO || self.h2_v4_fetch_fulfilled_recently(block_hash, now) {
+            return;
+        }
+        if block_hash == self.head_block_hash
             || self.pending_block_data.contains_key(&block_hash)
             || self.h2_v4_unbound_blocks.contains_key(&block_hash)
             || self
@@ -660,7 +706,8 @@ impl ConsensusService {
             .collect::<Vec<_>>();
         for (block_hash, previous_peer) in expired {
             self.h2_v4_fetch_requested_at.remove(&block_hash);
-            if block_hash == self.head_block_hash
+            if self.h2_v4_fetch_fulfilled_recently(block_hash, now)
+                || block_hash == self.head_block_hash
                 || self.pending_block_data.contains_key(&block_hash)
                 || self.h2_v4_unbound_blocks.contains_key(&block_hash)
             {
@@ -710,6 +757,30 @@ impl ConsensusService {
                 self.h2_v4_fetch_requested_at
                     .insert(block_hash, (now, previous_peer));
             }
+        }
+    }
+
+    async fn retire_h2_v4_fetch_satisfied_elsewhere(&mut self, block_hash: B256) {
+        self.h2_v4_fetch_requested_at.remove(&block_hash);
+        self.h2_v4_fetch_failed_peers.remove(&block_hash);
+        self.remember_h2_v4_fetch_fulfilled(block_hash, Instant::now());
+        // The observer and participant orchestrators share one network
+        // service, but intentionally keep independent ancestry trackers. A
+        // body delivered to this orchestrator can therefore satisfy a fetch
+        // started by the other one. Always retire the network-layer hash;
+        // conditioning this command on the local tracker leaves that shared
+        // request alive until its transport deadline.
+        if let Err(error) = self
+            .network
+            .cancel_gov5_block_fetch_reliable(block_hash)
+            .await
+        {
+            warn!(
+                target: "n42::interop::h2v4",
+                %block_hash,
+                %error,
+                "could not retire Gov5 fetch satisfied by another delivery path"
+            );
         }
     }
 
@@ -917,7 +988,8 @@ impl ConsensusService {
             warn!(target: "n42::interop::h2v4", %source, expected = ?requested_hash, received = %block.block_hash, "gov5 block response hash mismatch");
             return;
         }
-        self.h2_v4_fetch_requested_at.remove(&block.block_hash);
+        self.retire_h2_v4_fetch_satisfied_elsewhere(block.block_hash)
+            .await;
         let Some(bound_view) = self.h2_v4_block_views.get(&block.block_hash).copied() else {
             self.h2_v4_unbound_blocks
                 .insert(block.block_hash, (source, rlp));
@@ -1195,6 +1267,13 @@ impl ConsensusService {
         &self,
         mut message: ConsensusMessage,
     ) -> Result<(), NetworkError> {
+        // Deliberately corrupts our own signatures so a qualification run can
+        // observe how peers reject them. Vote and CommitVote go out once per
+        // validator per block on the native path too, so an env var alone is
+        // not a safe gate: a stray value in a unit file or container image
+        // would silently stop this node from producing a valid vote in any
+        // view. Compiled out of release builds entirely.
+        #[cfg(debug_assertions)]
         if std::env::var("N42_QUALIFICATION_FORGE_CONSENSUS")
             .ok()
             .as_deref()
@@ -1927,6 +2006,7 @@ impl ConsensusService {
             h2_v4_catchup_active: false,
             h2_v4_fetch_failed_peers: BTreeMap::new(),
             h2_v4_fetch_requested_at: HashMap::new(),
+            h2_v4_fetch_fulfilled_at: HashMap::new(),
             network,
             consensus_event_rx: None,
             net_event_rx,
@@ -2164,6 +2244,7 @@ impl ConsensusService {
             h2_v4_catchup_active: false,
             h2_v4_fetch_failed_peers: BTreeMap::new(),
             h2_v4_fetch_requested_at: HashMap::new(),
+            h2_v4_fetch_fulfilled_at: HashMap::new(),
             network,
             consensus_event_rx: Some(consensus_event_rx),
             net_event_rx,
@@ -3452,8 +3533,6 @@ impl ConsensusService {
                 requested_hash,
                 rlp,
             } if self.h2_v4_identity.is_some() => {
-                self.h2_v4_fetch_requested_at.remove(&requested_hash);
-                self.h2_v4_fetch_failed_peers.remove(&requested_hash);
                 self.handle_h2_v4_gov5_block(source, rlp, Some(requested_hash))
                     .await;
             }
@@ -3608,6 +3687,7 @@ mod tests {
         broadcasts: Arc<Mutex<Vec<n42_primitives::ConsensusMessage>>>,
         h2_v4_broadcasts: Arc<Mutex<Vec<n42_network::h2_v4::H2V4Envelope>>>,
         direct_messages: Arc<Mutex<Vec<(n42_network::PeerId, n42_primitives::ConsensusMessage)>>>,
+        cancelled_gov5_fetches: Arc<Mutex<Vec<B256>>>,
     }
 
     impl MockConsensusNetwork {
@@ -4038,6 +4118,17 @@ mod tests {
             _peer: n42_network::PeerId,
             _block_hash: B256,
         ) -> Result<(), n42_network::NetworkError> {
+            Ok(())
+        }
+
+        async fn cancel_gov5_block_fetch_reliable(
+            &self,
+            block_hash: B256,
+        ) -> Result<(), n42_network::NetworkError> {
+            self.cancelled_gov5_fetches
+                .lock()
+                .expect("mock cancelled Gov5 fetches lock")
+                .push(block_hash);
             Ok(())
         }
 
@@ -5305,6 +5396,153 @@ mod tests {
                 .expect("replacement request has a deadline")
                 .elapsed()
                 < Duration::from_secs(2)
+        );
+    }
+
+    fn test_h2_identity() -> n42_network::h2_v4::H2V4ChainIdentity {
+        n42_network::h2_v4::H2V4ChainIdentity {
+            chain_id: 42,
+            genesis_hash: B256::repeat_byte(0x42),
+        }
+    }
+
+    /// A block-data envelope is unauthenticated bincode: `block_hash` is a
+    /// self-declared field, and nothing has checked it against the payload by
+    /// the time `handle_block_data` returns. Retiring a Gov5 fetch on it would
+    /// let anyone who can reach this port cancel an in-flight ancestry fetch —
+    /// and suppress re-requests for 30s — by gossiping a forged envelope
+    /// carrying the victim's target hash.
+    #[tokio::test]
+    async fn forged_block_data_envelope_cannot_retire_a_gov5_fetch() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, mut prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx)
+            .with_h2_v4_participant(test_h2_identity());
+        let target_hash = B256::repeat_byte(0xa6);
+        let peer = libp2p::PeerId::random();
+        orch.h2_v4_fetch_requested_at
+            .insert(target_hash, (Instant::now(), peer));
+
+        // The envelope names the hash the victim is fetching. Its payload is
+        // never validated against that claim on this path.
+        orch.handle_block_data(test_block_data(B256::ZERO, target_hash, 1))
+            .await;
+
+        assert!(
+            orch.h2_v4_fetch_requested_at.contains_key(&target_hash),
+            "an unauthenticated envelope must not cancel a live fetch"
+        );
+        assert!(
+            prx.try_recv().is_err(),
+            "no cancellation command may be derived from a claimed hash"
+        );
+    }
+
+    /// Retirement moves to the eager-import completion callback: reth only
+    /// reaches it after accepting that exact payload, so the hash is proven
+    /// rather than claimed. Both the local tracker and the shared network-layer
+    /// request are retired there, including a fetch owned by the other
+    /// orchestrator sharing this network service.
+    #[tokio::test]
+    async fn validated_import_retires_concurrent_gov5_hash_fetch() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, mut prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx)
+            .with_h2_v4_participant(test_h2_identity());
+        let block_hash = B256::repeat_byte(0xa6);
+        let peer = libp2p::PeerId::random();
+        orch.h2_v4_fetch_requested_at
+            .insert(block_hash, (Instant::now(), peer));
+
+        orch.handle_eager_import_done(block_hash, 1).await;
+
+        assert!(!orch.h2_v4_fetch_requested_at.contains_key(&block_hash));
+        assert!(matches!(
+            prx.try_recv().expect("cross-path cancellation command"),
+            NetworkCommand::CancelGov5BlockFetch { block_hash: hash }
+                if hash == block_hash
+        ));
+    }
+
+    #[tokio::test]
+    async fn validated_import_retires_fetch_owned_by_other_consumer() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, mut prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx)
+            .with_h2_v4_participant(test_h2_identity());
+        let block_hash = B256::repeat_byte(0xa7);
+
+        assert!(!orch.h2_v4_fetch_requested_at.contains_key(&block_hash));
+        orch.handle_eager_import_done(block_hash, 1).await;
+
+        assert!(matches!(
+            prx.try_recv().expect("shared fetch cancellation command"),
+            NetworkCommand::CancelGov5BlockFetch { block_hash: hash }
+                if hash == block_hash
+        ));
+    }
+
+    /// Native mode never fetches bodies from Gov5, so it must not pay for the
+    /// tombstone write or the network command on every block.
+    #[tokio::test]
+    async fn native_mode_import_does_not_touch_gov5_fetch_state() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, mut prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
+        let block_hash = B256::repeat_byte(0xa9);
+
+        orch.handle_eager_import_done(block_hash, 1).await;
+
+        assert!(prx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn fulfilled_block_cannot_rearm_a_local_h2_fetch_deadline() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, mut prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx)
+            .with_h2_v4_participant(test_h2_identity());
+        let block_hash = B256::repeat_byte(0xa8);
+        let peer = libp2p::PeerId::random();
+
+        orch.handle_eager_import_done(block_hash, 1).await;
+        assert!(matches!(
+            prx.try_recv().expect("body delivery cancellation command"),
+            NetworkCommand::CancelGov5BlockFetch { block_hash: hash }
+                if hash == block_hash
+        ));
+
+        // A duplicate proposal/QC can be queued behind the body and ask for
+        // the same hash after it has already advanced out of the head slot.
+        orch.request_h2_v4_gov5_block(peer, block_hash);
+
+        assert!(!orch.h2_v4_fetch_requested_at.contains_key(&block_hash));
+        assert!(
+            prx.try_recv().is_err(),
+            "a recently fulfilled hash must not queue another request"
+        );
+
+        // Also fail closed if an already-queued command managed to create a
+        // local deadline just before the fulfillment tombstone was observed.
+        orch.connected_peers.insert(peer);
+        orch.h2_v4_fetch_requested_at.insert(
+            block_hash,
+            (
+                Instant::now() - H2_V4_FETCH_RETRY_TIMEOUT - Duration::from_secs(1),
+                peer,
+            ),
+        );
+        orch.retry_expired_h2_v4_fetches();
+
+        assert!(!orch.h2_v4_fetch_requested_at.contains_key(&block_hash));
+        assert!(
+            prx.try_recv().is_err(),
+            "a fulfilled hash must not be retried from a stale local deadline"
         );
     }
 

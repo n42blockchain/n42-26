@@ -459,6 +459,14 @@ impl ConsensusService {
         };
 
         let hash = broadcast.block_hash;
+        // The Gov5 fetch is NOT retired here. At this point `hash` is only a
+        // self-declared field of an unauthenticated bincode envelope — the
+        // payload behind it is not checked against it until the eager import
+        // below. Retiring on it would let anyone who can reach this port cancel
+        // an in-flight ancestry fetch and suppress re-requests for 30s by
+        // gossiping a forged envelope carrying the victim's target hash.
+        // `handle_eager_import_done` retires it instead: reth has accepted that
+        // exact payload by then, so the hash is proven, not merely claimed.
         if self.bad_blocks.should_skip(hash, "block_data") {
             return;
         }

@@ -599,6 +599,10 @@ impl ObserverOrchestrator {
             self.retry_gov5_block_fetch(source, requested_hash);
             return;
         }
+        self.gov5_fetch_requested_at.remove(&hash);
+        if let Err(error) = self.network.cancel_gov5_block_fetch_reliable(hash).await {
+            warn!(target: "n42::observer", %hash, %error, "could not retire Gov5 fetch satisfied by an authenticated body");
+        }
         if hash == self.head_block_hash || self.bad_blocks.should_skip(hash, "gov5_live_gossip") {
             return;
         }

@@ -1458,12 +1458,20 @@ impl ConsensusService {
         // Gov5-compatible votes are execution attestations. Only a successful
         // reth new_payload result reaches this callback, so this is the first
         // safe point to release an H2 participant's deferred vote.
-        if self.h2_v4_identity.is_some()
-            && let Err(error) = self
+        if self.h2_v4_identity.is_some() {
+            // Same reasoning retires the Gov5 fetch here rather than on arrival
+            // of the block-data envelope: reth accepting this payload is what
+            // proves the hash, so a forged envelope can no longer cancel an
+            // in-flight ancestry fetch. Native mode never fetches from Gov5, so
+            // it stays out of this path entirely.
+            self.retire_h2_v4_fetch_satisfied_elsewhere(hash).await;
+
+            if let Err(error) = self
                 .engine
                 .process_event(n42_consensus::ConsensusEvent::BlockImported(hash))
-        {
-            error!(target: "n42::interop::h2v4", %hash, %error, "failed to release execution-gated H2 vote");
+            {
+                error!(target: "n42::interop::h2v4", %hash, %error, "failed to release execution-gated H2 vote");
+            }
         }
 
         // If commit/finalize raced ahead of eager new_payload, re-drive the

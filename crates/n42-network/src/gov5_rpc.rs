@@ -1,6 +1,6 @@
 use alloy_primitives::B256;
 use futures::prelude::*;
-use libp2p::{StreamProtocol, request_response};
+use libp2p::{request_response, StreamProtocol};
 use snap::read::FrameDecoder;
 use snap::write::FrameEncoder;
 use std::io::{self, Read, Write};
@@ -33,7 +33,6 @@ pub struct Gov5HotstuffDirectResponse;
 #[derive(Clone, Debug, Default)]
 pub struct Gov5HotstuffDirectCodec;
 
-#[async_trait::async_trait]
 impl request_response::Codec for Gov5HotstuffDirectCodec {
     type Protocol = StreamProtocol;
     type Request = Gov5HotstuffDirectRequest;
@@ -430,7 +429,6 @@ fn encode_chunked_block(rlp: &[u8], fork_digest: [u8; 4]) -> io::Result<Vec<u8>>
 #[derive(Clone, Debug, Default)]
 pub struct Gov5BlockPushCodec;
 
-#[async_trait::async_trait]
 impl request_response::Codec for Gov5BlockPushCodec {
     type Protocol = StreamProtocol;
     type Request = Gov5BlockPushRequest;
@@ -502,7 +500,6 @@ impl request_response::Codec for Gov5BlockPushCodec {
 #[derive(Clone, Debug, Default)]
 pub struct Gov5BlockByHashCodec;
 
-#[async_trait::async_trait]
 impl request_response::Codec for Gov5BlockByHashCodec {
     type Protocol = StreamProtocol;
     type Request = Gov5BlockByHashRequest;
@@ -576,7 +573,6 @@ impl request_response::Codec for Gov5BlockByHashCodec {
 #[derive(Clone, Debug, Default)]
 pub struct Gov5StatusCodec;
 
-#[async_trait::async_trait]
 impl request_response::Codec for Gov5StatusCodec {
     type Protocol = StreamProtocol;
     type Request = Gov5Status;
