@@ -700,6 +700,10 @@ pub struct NetworkService {
     /// receive the proposal before the block can recover through Gov5's native
     /// block-by-hash RPC.
     gov5_served_blocks: HashMap<B256, Vec<u8>>,
+    /// Insertion order for `gov5_served_blocks` eviction. HashMap iteration
+    /// order is arbitrary, and evicting an arbitrary entry preferentially
+    /// drops exactly the fresh blocks followers are most likely to fetch.
+    gov5_served_block_order: VecDeque<B256>,
     /// Fixed-window protection for inbound catch-up work. Validators receive a
     /// higher allowance, while unauthenticated peers cannot monopolize the
     /// bounded response-channel table or node-side database reads.
@@ -1014,6 +1018,7 @@ impl NetworkService {
             gov5_block_by_hash_peers: HashSet::new(),
             state_sync_peers: HashSet::new(),
             gov5_served_blocks: HashMap::new(),
+            gov5_served_block_order: VecDeque::new(),
             sync_request_windows: HashMap::new(),
             next_sync_id: 0,
             expected_validator_peer_ids,
@@ -1518,12 +1523,22 @@ impl NetworkService {
         let block = decode_gov5_block_rlp(rlp).map_err(|error| error.to_string())?;
         if self.gov5_served_blocks.len() >= MAX_SERVED_GOV5_BLOCKS
             && !self.gov5_served_blocks.contains_key(&block.block_hash)
-            && let Some(evicted) = self.gov5_served_blocks.keys().next().copied()
         {
-            self.gov5_served_blocks.remove(&evicted);
+            // Evict the oldest entry, not an arbitrary HashMap key: the newest
+            // blocks are the ones followers are still about to request.
+            while let Some(evicted) = self.gov5_served_block_order.pop_front() {
+                if self.gov5_served_blocks.remove(&evicted).is_some() {
+                    break;
+                }
+            }
         }
-        self.gov5_served_blocks
-            .insert(block.block_hash, rlp.to_vec());
+        if self
+            .gov5_served_blocks
+            .insert(block.block_hash, rlp.to_vec())
+            .is_none()
+        {
+            self.gov5_served_block_order.push_back(block.block_hash);
+        }
         Ok(block.block_hash)
     }
 

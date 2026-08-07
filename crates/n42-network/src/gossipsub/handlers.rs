@@ -235,6 +235,7 @@ mod tests {
             &block_hash,
             &mem_hash(),
             &blob_hash(),
+            None,
         );
         assert!(matches!(result, gossipsub::MessageAcceptance::Accept));
     }
@@ -252,6 +253,7 @@ mod tests {
             &block_hash,
             &mem_hash(),
             &blob_hash(),
+            None,
         );
         assert!(matches!(result, gossipsub::MessageAcceptance::Reject));
     }

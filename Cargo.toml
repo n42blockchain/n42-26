@@ -86,6 +86,7 @@ reth-payload-primitives = { path = "../reth/crates/payload/primitives" }
 reth-engine-primitives = { path = "../reth/crates/engine/primitives" }
 reth-engine-tree = { path = "../reth/crates/engine/tree" }
 reth-chain-state = { path = "../reth/crates/chain-state" }
+reth-storage-overlay = { path = "../reth/crates/storage/storage-overlay" }
 reth-libmdbx = { path = "../reth/crates/storage/libmdbx-rs" }
 reth-storage-api = { path = "../reth/crates/storage/storage-api" }
 reth-rpc-builder = { path = "../reth/crates/rpc/rpc-builder" }

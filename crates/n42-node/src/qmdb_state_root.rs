@@ -10,7 +10,7 @@ use alloy_rpc_types_engine::ExecutionData;
 use n42_twig_core::qmdb_compat::{
     QmdbCompatTree, QmdbOperation, QmdbOperationError, QmdbProof, QmdbSnapshot, QmdbSnapshotError,
 };
-use reth_chain_state::StateTrieOverlayManager;
+use reth_storage_overlay::OverlayManager;
 use reth_engine_tree::tree::state_root_strategy::{
     LazyHashedPostState, PreparedStateRootJob, StateRootJob, StateRootJobContext,
     StateRootJobOutcome, StateRootStrategy,
@@ -19,7 +19,7 @@ use reth_engine_tree::tree::{BasicEngineValidator, TreeConfig};
 use reth_ethereum_primitives::{EthPrimitives, Receipt};
 use reth_evm::{ConfigureEngineEvm, ConfigureEvm};
 use reth_node_api::FullNodeComponents;
-use reth_node_builder::rpc::{BasicEngineValidatorBuilder, ChangesetCache, EngineValidatorBuilder};
+use reth_node_builder::rpc::{BasicEngineValidatorBuilder, EngineValidatorBuilder};
 use reth_primitives_traits::RecoveredBlock;
 use reth_provider::{BlockExecutionOutput, ProviderError, ProviderResult};
 use reth_trie::updates::TrieUpdates;
@@ -835,12 +835,11 @@ where
         self,
         ctx: &reth_node_api::AddOnsContext<'_, Node>,
         tree_config: TreeConfig,
-        changeset_cache: ChangesetCache,
-        state_trie_overlays: StateTrieOverlayManager<EthPrimitives>,
+        overlay_manager: OverlayManager<EthPrimitives>,
     ) -> eyre::Result<Self::EngineValidator> {
         let validator = self
             .inner
-            .build_tree_validator(ctx, tree_config, changeset_cache, state_trie_overlays)
+            .build_tree_validator(ctx, tree_config, overlay_manager)
             .await?;
         let Some(store) = self.qmdb_store else {
             return Ok(validator);

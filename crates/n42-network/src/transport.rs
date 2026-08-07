@@ -280,14 +280,17 @@ fn build_swarm_with_transports(
         // carry validator BLS authentication, so an additional libp2p message
         // signature is both redundant and actively incompatible: Gov5 rejects
         // signed GossipSub envelopes and eventually prunes the Rust peer from
-        // the mesh, leaving only intermittent IHAVE/IWANT recovery. Keep the
-        // transport envelope anonymous; application-level consensus validation
-        // remains mandatory in the service/engine.
-        let mut gossipsub = gossipsub::Behaviour::new(
-            gossipsub::MessageAuthenticity::Anonymous,
-            gossipsub_config.clone(),
-        )
-        .map_err(|e| eyre::eyre!("gossipsub behaviour error: {e}"))?;
+        // the mesh, leaving only intermittent IHAVE/IWANT recovery. The
+        // anonymous envelope is therefore scoped to gov5-facing swarms only —
+        // production N42 swarms keep the signed envelope they always had.
+        // Both sides run Permissive validation, so mixed deployments interop.
+        let message_authenticity = if enable_gov5_tcp {
+            gossipsub::MessageAuthenticity::Anonymous
+        } else {
+            gossipsub::MessageAuthenticity::Signed(key.clone())
+        };
+        let mut gossipsub = gossipsub::Behaviour::new(message_authenticity, gossipsub_config.clone())
+            .map_err(|e| eyre::eyre!("gossipsub behaviour error: {e}"))?;
 
         gossipsub
             .with_peer_score(peer_score_params, thresholds)
