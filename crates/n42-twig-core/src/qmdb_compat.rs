@@ -755,6 +755,7 @@ struct Entry {
     active: bool,
 }
 
+#[derive(Clone)]
 struct Twig {
     nodes: Box<[Hash; 2 * TWIG_SIZE]>,
     bits: [u8; BITS_BYTES],
@@ -831,6 +832,7 @@ fn hash_bits(bits: &[u8; BITS_BYTES]) -> Hash {
 /// It deliberately rebuilds the small upper tree on root reads. gov5's
 /// incremental upper-tree and eviction optimizations can be added after this
 /// representation has complete replay-v2 vectors.
+#[derive(Clone)]
 pub struct QmdbCompatTree {
     entries: Vec<Entry>,
     index: HashMap<Hash, u64>,

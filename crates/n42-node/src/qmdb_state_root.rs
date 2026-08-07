@@ -55,9 +55,52 @@ struct StoredQmdbBlock {
     operations: Vec<QmdbOperation>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+// In-memory only: persistence goes through `PersistedQmdbBranchState`, and
+// the cached tree is a derived accelerator that must never be written out.
 struct QmdbBranchState {
     blocks: HashMap<B256, StoredQmdbBlock>,
+    /// The most recently committed block's reconstructed tree.
+    ///
+    /// Without it every non-empty block replays its whole ancestry from the
+    /// base snapshot, so importing block N costs O(N) and a run costs O(N^2).
+    /// Measured at 32 writes/block: 15ms at depth 300, 31ms at 600, 68ms at
+    /// 1200 — linear, and on track to consume an 8s slot after roughly two
+    /// weeks at that rate. Resuming from the committed tip turns sequential
+    /// import into one block's work plus a tree clone.
+    ///
+    /// Only ever holds a tree whose root was verified against the stored
+    /// block, and lives under the same mutex as `blocks`, so a reader can
+    /// never observe it out of step with the ancestry it summarizes.
+    cached_tip: Option<CachedTipTree>,
+}
+
+struct CachedTipTree {
+    block_hash: B256,
+    /// Blocks between the base snapshot and `block_hash`, so a resumed
+    /// reconstruction still measures depth from the base and keeps the
+    /// `max_replay_depth` bound fail-closed.
+    depth: usize,
+    tree: QmdbCompatTree,
+}
+
+// Hand-written so the tree's contents never land in a log line; its identity
+// and depth are the only parts worth seeing.
+impl std::fmt::Debug for QmdbBranchState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QmdbBranchState")
+            .field("blocks", &self.blocks.len())
+            .field("cached_tip", &self.cached_tip)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for CachedTipTree {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CachedTipTree")
+            .field("block_hash", &self.block_hash)
+            .field("depth", &self.depth)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -156,6 +199,7 @@ impl Gov5QmdbStateRootStore {
             max_replay_depth,
             persistence_path: None,
             state: Mutex::new(QmdbBranchState {
+                cached_tip: None,
                 blocks: HashMap::new(),
             }),
         })
@@ -198,10 +242,14 @@ impl Gov5QmdbStateRootStore {
                     store.max_replay_depth,
                     &blocks,
                 )?;
-                store.state = Mutex::new(QmdbBranchState { blocks });
+                store.state = Mutex::new(QmdbBranchState {
+                    blocks,
+                    cached_tip: None,
+                });
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 store.persist_checkpoint_locked(&QmdbBranchState {
+                    cached_tip: None,
                     blocks: HashMap::new(),
                 })?;
             }
@@ -240,7 +288,10 @@ impl Gov5QmdbStateRootStore {
             .state
             .lock()
             .map_err(|_| Gov5QmdbStateRootError::LockPoisoned)?;
+        // Speculative: the caller may never commit this block, so the rebuilt
+        // tree is dropped rather than cached.
         self.compute_candidate_locked(&state, parent_hash, operations)
+            .map(|(root, _)| root)
     }
 
     pub fn compute_and_commit(
@@ -269,7 +320,7 @@ impl Gov5QmdbStateRootStore {
             };
         }
 
-        let root = self.compute_candidate_locked(&state, parent_hash, &operations)?;
+        let (root, rebuilt) = self.compute_candidate_locked(&state, parent_hash, &operations)?;
         if root != expected_root {
             return Err(Gov5QmdbStateRootError::RootMismatch {
                 block_hash,
@@ -295,45 +346,78 @@ impl Gov5QmdbStateRootStore {
             state.blocks.remove(&block_hash);
             return Err(error);
         }
+        // Cache only now: the root matched, the block is in `blocks`, and the
+        // WAL append succeeded, so the tree describes durable committed state.
+        // Empty blocks took the fast path and rebuilt nothing; leaving the
+        // older tip cached is correct, since replaying an empty block over it
+        // costs nothing.
+        if let Some((tree, parent_depth)) = rebuilt {
+            state.cached_tip = Some(CachedTipTree {
+                block_hash,
+                depth: parent_depth.saturating_add(1),
+                tree,
+            });
+        }
         qualification_abort_at("qmdb_committed");
         Ok(root)
     }
 
+    /// Returns the candidate root, plus the rebuilt tree when one was built.
+    ///
+    /// The tree comes back so `compute_and_commit` can cache it instead of
+    /// throwing away the work and rebuilding on the next block. The
+    /// empty-block fast path builds no tree and returns `None`.
+    #[allow(clippy::type_complexity)]
     fn compute_candidate_locked(
         &self,
         state: &QmdbBranchState,
         parent_hash: B256,
         operations: &[QmdbOperation],
-    ) -> Result<B256, Gov5QmdbStateRootError> {
+    ) -> Result<(B256, Option<(QmdbCompatTree, usize)>), Gov5QmdbStateRootError> {
         // Applying no operations cannot alter a QMDB root. Avoid replaying the entire ancestry
         // for the common empty-block case when the total retained graph proves the configured
         // depth cannot have been exceeded. Once the graph is larger than that bound, fall back to
         // exact ancestry reconstruction so heavily branched stores still fail closed correctly.
         if operations.is_empty() && state.blocks.len() <= self.max_replay_depth {
             return if parent_hash == self.base_block_hash {
-                Ok(self.base_root)
+                Ok((self.base_root, None))
             } else {
                 state
                     .blocks
                     .get(&parent_hash)
-                    .map(|block| block.root)
+                    .map(|block| (block.root, None))
                     .ok_or(Gov5QmdbStateRootError::MissingParent(parent_hash))
             };
         }
-        let mut tree = self.reconstruct_tree_locked(state, parent_hash)?;
-        Ok(B256::from(
-            tree.apply_sorted_ops(operations.iter().cloned())?,
-        ))
+        let (mut tree, parent_depth) = self.reconstruct_tree_locked(state, parent_hash)?;
+        let root = B256::from(tree.apply_sorted_ops(operations.iter().cloned())?);
+        Ok((root, Some((tree, parent_depth))))
     }
 
+    /// Rebuilds the tree at `block_hash` and reports its depth from the base.
+    ///
+    /// Walks back to whichever comes first: the cached tip or the base
+    /// snapshot. Resuming from the cache skips re-verifying ancestors that
+    /// were already verified when they were committed — the stored operations
+    /// they would replay cannot have changed, since `blocks` is append-only
+    /// and lives under this same lock. Ancestry the cache does not cover is
+    /// replayed and root-checked exactly as before.
     fn reconstruct_tree_locked(
         &self,
         state: &QmdbBranchState,
         block_hash: B256,
-    ) -> Result<QmdbCompatTree, Gov5QmdbStateRootError> {
+    ) -> Result<(QmdbCompatTree, usize), Gov5QmdbStateRootError> {
         let mut lineage = Vec::new();
         let mut cursor = block_hash;
+        let mut resumed = None;
         while cursor != self.base_block_hash {
+            if let Some(cached) = state.cached_tip.as_ref()
+                && cached.block_hash == cursor
+            {
+                resumed = Some(cached);
+                break;
+            }
+            // Also bounds a cycle in `blocks`: the walk cannot run forever.
             if lineage.len() >= self.max_replay_depth {
                 return Err(Gov5QmdbStateRootError::ReplayDepthExceeded(
                     self.max_replay_depth,
@@ -347,7 +431,18 @@ impl Gov5QmdbStateRootStore {
             cursor = stored.parent_hash;
         }
 
-        let mut tree = QmdbCompatTree::from_snapshot(&self.base_snapshot)?;
+        let (mut tree, base_depth) = match resumed {
+            Some(cached) => (cached.tree.clone(), cached.depth),
+            None => (QmdbCompatTree::from_snapshot(&self.base_snapshot)?, 0),
+        };
+        // Depth is measured from the base whether or not the walk was resumed,
+        // so the bound rejects the same set of ancestries either way.
+        let depth = base_depth.saturating_add(lineage.len());
+        if depth > self.max_replay_depth {
+            return Err(Gov5QmdbStateRootError::ReplayDepthExceeded(
+                self.max_replay_depth,
+            ));
+        }
         for (hash, stored) in lineage.into_iter().rev() {
             let root = B256::from(tree.apply_sorted_ops(stored.operations.iter().cloned())?);
             if root != stored.root {
@@ -358,7 +453,7 @@ impl Gov5QmdbStateRootStore {
                 });
             }
         }
-        Ok(tree)
+        Ok((tree, depth))
     }
 
     pub fn contains(&self, block_hash: B256) -> Result<bool, Gov5QmdbStateRootError> {
@@ -398,7 +493,7 @@ impl Gov5QmdbStateRootStore {
             return Ok(None);
         }
         Ok(Some(
-            self.reconstruct_tree_locked(&state, block_hash)?.snapshot(),
+            self.reconstruct_tree_locked(&state, block_hash)?.0.snapshot(),
         ))
     }
 
@@ -418,6 +513,7 @@ impl Gov5QmdbStateRootStore {
         }
         Ok(self
             .reconstruct_tree_locked(&state, block_hash)?
+            .0
             .prove(&key))
     }
 
@@ -1140,58 +1236,232 @@ mod tests {
         assert_eq!(std::fs::metadata(wal).unwrap().len(), valid_len);
     }
 
-    /// Measures the lock-holding cost of an archive RPC at realistic depth.
+    /// The cached tip is an accelerator, so every root it produces must equal
+    /// what a cold store computes from the base snapshot for the same blocks.
+    #[test]
+    fn cached_tip_reproduces_cold_reconstruction() {
+        let (warm, snapshot) = store();
+        let (cold, _) = store();
+        let mut parent = warm.base_block_hash();
+        let mut all_ops = Vec::new();
+
+        for block in 0u8..24 {
+            let block_hash = B256::repeat_byte(0x30 + block);
+            let operations = vec![operation(block, block.wrapping_mul(3))];
+            all_ops.push(operations.clone());
+            let expected = expected_root(&snapshot, &all_ops);
+
+            // The warm store carries a cached tip from the previous iteration.
+            assert_eq!(
+                warm.compute_and_commit(parent, block_hash, expected, operations.clone())
+                    .unwrap(),
+                expected
+            );
+            // The cold one is rebuilt each time, so it never has a usable cache.
+            let (fresh, _) = store();
+            for (i, ops) in all_ops.iter().enumerate() {
+                let hash = B256::repeat_byte(0x30 + i as u8);
+                let prev = if i == 0 {
+                    cold.base_block_hash()
+                } else {
+                    B256::repeat_byte(0x30 + i as u8 - 1)
+                };
+                fresh
+                    .compute_and_commit(
+                        prev,
+                        hash,
+                        expected_root(&snapshot, &all_ops[..=i]),
+                        ops.clone(),
+                    )
+                    .unwrap();
+            }
+            assert_eq!(
+                warm.snapshot_for(block_hash).unwrap(),
+                fresh.snapshot_for(block_hash).unwrap(),
+                "cached and cold reconstructions diverged at block {block}"
+            );
+            parent = block_hash;
+        }
+    }
+
+    /// A fork off an older block cannot resume from a cached tip on the other
+    /// branch, and must still produce that fork's own root.
+    #[test]
+    fn cached_tip_does_not_leak_across_branches() {
+        let (store_, snapshot) = store();
+        let base = store_.base_block_hash();
+
+        let a_ops = vec![operation(1, 11)];
+        let a_hash = B256::repeat_byte(0x41);
+        let a_root = expected_root(&snapshot, std::slice::from_ref(&a_ops));
+        store_
+            .compute_and_commit(base, a_hash, a_root, a_ops.clone())
+            .unwrap();
+
+        // Extends A, so the cache now describes A's descendant.
+        let a2_ops = vec![operation(2, 22)];
+        let a2_hash = B256::repeat_byte(0x42);
+        let a2_root = expected_root(&snapshot, &[a_ops, a2_ops.clone()]);
+        store_
+            .compute_and_commit(a_hash, a2_hash, a2_root, a2_ops)
+            .unwrap();
+
+        // Sibling of A off the base: the cached tip is not an ancestor.
+        let b_ops = vec![operation(9, 99)];
+        let b_hash = B256::repeat_byte(0x4B);
+        let b_root = expected_root(&snapshot, std::slice::from_ref(&b_ops));
+        assert_eq!(
+            store_
+                .compute_and_commit(base, b_hash, b_root, b_ops)
+                .unwrap(),
+            b_root
+        );
+        assert_ne!(b_root, a2_root);
+        assert_eq!(store_.root_for(a2_hash).unwrap(), Some(a2_root));
+    }
+
+    /// Resuming from the cache shortens the ancestry walk, so the bound has to
+    /// be measured from the base rather than from where the walk started.
+    /// Pins that by rejecting at exactly the same block a cache-less store
+    /// rejects at — the boundary itself, not a hardcoded guess about it.
+    #[test]
+    fn cached_tip_rejects_at_the_same_depth_as_a_cold_store() {
+        const MAX_DEPTH: usize = 3;
+
+        fn bounded_store(snapshot: &QmdbSnapshot, root: [u8; 32]) -> Gov5QmdbStateRootStore {
+            Gov5QmdbStateRootStore::with_max_replay_depth(
+                B256::repeat_byte(0x10),
+                B256::from(root),
+                snapshot.clone(),
+                MAX_DEPTH,
+            )
+            .unwrap()
+        }
+
+        let mut base = QmdbCompatTree::new();
+        base.set([1; 32], vec![1]);
+        let snapshot = base.snapshot();
+        let base_root = base.root();
+
+        let warm = bounded_store(&snapshot, base_root);
+        let mut parent = warm.base_block_hash();
+        let mut all_ops: Vec<Vec<QmdbOperation>> = Vec::new();
+        let mut first_rejected = None;
+
+        for block in 0u8..8 {
+            let operations = vec![operation(block, block)];
+            all_ops.push(operations.clone());
+            let hash = B256::repeat_byte(0x50 + block);
+            let root = expected_root(&snapshot, &all_ops);
+
+            // The warm store has a cached tip from the previous block; the cold
+            // one is built from scratch and replays the whole ancestry.
+            let cold = bounded_store(&snapshot, base_root);
+            let mut cold_parent = cold.base_block_hash();
+            let mut cold_result = None;
+            for (i, ops) in all_ops.iter().enumerate() {
+                let h = B256::repeat_byte(0x50 + i as u8);
+                cold_result = Some(cold.compute_and_commit(
+                    cold_parent,
+                    h,
+                    expected_root(&snapshot, &all_ops[..=i]),
+                    ops.clone(),
+                ));
+                cold_parent = h;
+            }
+
+            let warm_result = warm.compute_and_commit(parent, hash, root, operations);
+            let warm_depth_error = matches!(
+                warm_result,
+                Err(Gov5QmdbStateRootError::ReplayDepthExceeded(MAX_DEPTH))
+            );
+            let cold_depth_error = matches!(
+                cold_result,
+                Some(Err(Gov5QmdbStateRootError::ReplayDepthExceeded(MAX_DEPTH)))
+            );
+            assert_eq!(
+                warm_depth_error, cold_depth_error,
+                "cached and cold stores disagreed about the depth bound at block {block}"
+            );
+            if warm_depth_error {
+                first_rejected = Some(block);
+                break;
+            }
+            all_ops.truncate(usize::from(block) + 1);
+            parent = hash;
+        }
+
+        assert!(
+            first_rejected.is_some(),
+            "the bound never triggered, so the test proved nothing"
+        );
+    }
+
+
+    /// Measures how QMDB import and archive reads scale with chain depth.
     ///
-    /// `snapshot_for`/`proof_for` reconstruct the tree by replaying the whole
-    /// lineage from the base snapshot, and they do it while holding the same
-    /// mutex `compute_and_commit` needs on the import path. A cheap request
-    /// that costs the server a deep replay is the shape of a starvation bug —
-    /// but only if the replay is actually slow. Measure it:
+    /// `compute_and_commit` takes the `compute_candidate_locked` fast path only
+    /// for empty blocks. Any block with operations falls through to
+    /// `reconstruct_tree_locked`, which replays the entire lineage from the
+    /// base snapshot — so importing block N replays N-1 blocks' operations, and
+    /// the whole chain costs O(n^2). `snapshot_for`/`proof_for` do the same
+    /// replay while holding the mutex the import path needs.
     ///
-    ///   cargo test -p n42-node --release archive_rpc_lock_hold --     ///     --ignored --nocapture
+    ///   cargo test -p n42-node --release qmdb_replay_scaling --     ///     --ignored --nocapture
     ///
-    /// Read the per-call number against the 8s slot: `compute_and_commit` must
-    /// win the lock once per block. If a single archive call approaches that
-    /// budget, the endpoint needs throttling or an out-of-lock rebuild.
+    /// Read the per-block import number against the 8s slot. The growth rate
+    /// between depths matters more than any single value: if it is linear in
+    /// depth, the store needs a base-checkpoint fold before a long run, and
+    /// the depth at which import crosses the slot budget is the deadline.
     #[test]
     #[ignore = "measurement, not a correctness gate"]
-    fn archive_rpc_lock_hold_cost_by_depth() {
-        // Each block writes 32 keys, roughly a small real block's footprint.
+    fn qmdb_replay_scaling_by_depth() {
+        // 32 keys per block, roughly a small real block's write footprint.
         const OPS_PER_BLOCK: usize = 32;
-        for depth in [100usize, 1_000, 5_000] {
+
+        fn block_ops(block: usize) -> Vec<QmdbOperation> {
+            (0..OPS_PER_BLOCK)
+                .map(|k| {
+                    let mut key = [0u8; 32];
+                    key[..8]
+                        .copy_from_slice(&((block * OPS_PER_BLOCK + k) as u64).to_le_bytes());
+                    QmdbOperation {
+                        key,
+                        value: Some(vec![(block % 251) as u8; 32]),
+                    }
+                })
+                .collect()
+        }
+
+        for depth in [300usize, 600, 1_200] {
             let (store, _snapshot) = store();
             let mut parent = store.base_block_hash();
             let mut tip = parent;
+            let mut last_import = std::time::Duration::ZERO;
+            let total_start = std::time::Instant::now();
+
             for block in 0..depth {
                 let block_hash = B256::from(blake3::hash(&block.to_le_bytes()).as_bytes());
-                let operations: Vec<_> = (0..OPS_PER_BLOCK)
-                    .map(|k| {
-                        let mut key = [0u8; 32];
-                        key[..8].copy_from_slice(&((block * OPS_PER_BLOCK + k) as u64).to_le_bytes());
-                        QmdbOperation {
-                            key,
-                            value: Some(vec![(block % 251) as u8; 32]),
-                        }
-                    })
-                    .collect();
+                let operations = block_ops(block);
                 let root = store.compute_candidate(parent, &operations).unwrap();
+                let start = std::time::Instant::now();
                 store
                     .compute_and_commit(parent, block_hash, root, operations)
                     .unwrap();
+                last_import = start.elapsed();
                 parent = block_hash;
                 tip = block_hash;
             }
+            let build_secs = total_start.elapsed().as_secs_f64();
 
             let start = std::time::Instant::now();
-            let snapshot = store.snapshot_for(tip).unwrap();
-            let elapsed = start.elapsed();
-            assert!(snapshot.is_some());
+            assert!(store.snapshot_for(tip).unwrap().is_some());
+            let archive_ms = start.elapsed().as_secs_f64() * 1000.0;
 
             println!(
-                "archive snapshot_for at depth {depth} ({} ops replayed): {}ms lock held                  ({:.2}% of an 8s slot)",
-                depth * OPS_PER_BLOCK,
-                elapsed.as_millis(),
-                elapsed.as_secs_f64() / 8.0 * 100.0,
+                "depth {depth}: import of the tip block {:.0}ms ({:.2}% of an 8s slot),                  archive snapshot_for {archive_ms:.0}ms holding the import mutex,                  building the chain took {build_secs:.1}s",
+                last_import.as_secs_f64() * 1000.0,
+                last_import.as_secs_f64() / 8.0 * 100.0,
             );
         }
     }
