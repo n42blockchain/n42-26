@@ -51,7 +51,7 @@ jq -e --arg expected "$expected_gov_main" '
   .requestedDurationSeconds >= 86400 and .elapsedSeconds >= 86400 and
   .samples >= 2
 ' "$upstream_complete" >/dev/null
-jq -e --arg expected "$expected_gov_main" '
+jq -s -e --arg expected "$expected_gov_main" '
   length >= 2 and all(.[]; .baselineExact == true and .remoteReachable == true and
     .remoteMain == $expected and .baseline == $expected)
 ' "$upstream" >/dev/null
