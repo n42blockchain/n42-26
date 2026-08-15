@@ -10,6 +10,7 @@ gov_repo="${N42_FINAL_GOV_REPO:?Gov5 repository is required}"
 expected_gov_main="${N42_FINAL_EXPECTED_GOV_MAIN:?expected Gov5 main SHA is required}"
 expected_gov_binary="${N42_FINAL_GOV_BINARY_SHA:?Gov5 binary SHA-256 is required}"
 expected_rust_binary="${N42_FINAL_RUST_BINARY_SHA:?Rust binary SHA-256 is required}"
+log_start="${N42_FINAL_LOG_START:-}"
 qualification="${N42_FINAL_QUALIFICATION_SCRIPT:-$runtime/artifacts/scripts/gov5-interop-qualification.sh}"
 output="${N42_FINAL_OUTPUT:-$runtime/evidence/runtime42-seven-validator-final-verification.json}"
 
@@ -97,9 +98,18 @@ for log in "$runtime"/logs/gov{1,2,3,4,5}.log "$runtime"/logs/rust.log "$runtime
   require_file "$log"
   # Do not use a global case-insensitive `error` match: the consensus transport
   # records harmless startup de-duplication as `error=Duplicate`.  Structured
-  # ERROR remains strict, while fatal signals are case-insensitive.
-  ! rg -q ' ERROR ' "$log"
-  ! rg -qi '(^|[^[:alpha:]])(panic|fatal|equivocat)' "$log"
+  # ERROR remains strict, while fatal signals are case-insensitive.  A reused
+  # 905 runtime may contain an older run's log history; when the caller gives
+  # this run's ISO-8601 start (seconds precision), only newer lines are audited.
+  if [ -n "$log_start" ]; then
+    ! awk -v start="$log_start" \
+      'substr($0,1,19) >= start && index($0," ERROR ") {bad=1} END {exit bad}' "$log"
+    ! awk -v start="$log_start" \
+      'substr($0,1,19) >= start && tolower($0) ~ /(^|[^[:alpha:]])(panic|fatal|equivocat)/ {bad=1} END {exit bad}' "$log"
+  else
+    ! rg -q ' ERROR ' "$log"
+    ! rg -qi '(^|[^[:alpha:]])(panic|fatal|equivocat)' "$log"
+  fi
 done
 
 jq -nc --arg at "$(date -u +%FT%TZ)" --arg runtime "$runtime" \

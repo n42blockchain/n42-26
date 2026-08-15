@@ -10,6 +10,7 @@ gov_repo="${N42_FINAL_GOV_REPO:?Gov5 repository is required}"
 expected_gov_main="${N42_FINAL_EXPECTED_GOV_MAIN:?expected Gov5 main SHA is required}"
 expected_gov_binary="${N42_FINAL_GOV_BINARY_SHA:?Gov5 binary SHA-256 is required}"
 expected_rust_binary="${N42_FINAL_RUST_BINARY_SHA:?Rust binary SHA-256 is required}"
+log_start="${N42_FINAL_LOG_START:-}"
 head_monitor_pid="${N42_FINAL_HEAD_MONITOR_PID:?head monitor PID is required}"
 upstream_monitor_pid="${N42_FINAL_UPSTREAM_MONITOR_PID:?upstream monitor PID is required}"
 rust0_monitor_pid="${N42_FINAL_RUST0_MONITOR_PID:?Rust0 monitor PID is required}"
@@ -78,6 +79,7 @@ env N42_QUAL_RUNTIME="$runtime" N42_QUAL_PORTS="$ports" \
 env N42_FINAL_RUNTIME="$runtime" N42_FINAL_GOV_REPO="$gov_repo" \
   N42_FINAL_EXPECTED_GOV_MAIN="$expected_gov_main" \
   N42_FINAL_GOV_BINARY_SHA="$expected_gov_binary" N42_FINAL_RUST_BINARY_SHA="$expected_rust_binary" \
+  N42_FINAL_LOG_START="$log_start" \
   N42_FINAL_QUALIFICATION_SCRIPT="$qualification" N42_FINAL_VERIFIER="$verifier" \
   N42_FINAL_EVIDENCE_DIR="$evidence_dir" N42_FINAL_HEADS="$heads" \
   N42_FINAL_UPSTREAM="$upstream" N42_FINAL_UPSTREAM_COMPLETE="$upstream_complete" \
