@@ -24,6 +24,8 @@ rust0_leaders="${N42_FINAL_RUST0_LEADERS:?final Rust0 leader audit is required}"
 rust6_leaders="${N42_FINAL_RUST6_LEADERS:?final Rust6 leader audit is required}"
 ports=(28501 28502 28503 28504 28505 29545 29546)
 expected_genesis="0xb71c28109836f120453d097c38819a55b14c49abcc92713037fb9b11201392ec"
+copied_head="${N42_FINAL_COPIED_HEAD:-92605}"
+expected_copied_hash="${N42_FINAL_COPIED_HASH:-0x7491932238552b24588a635ba1b292033001479a4fe2c1593b88924850d2f235}"
 
 require_file() { test -f "$1" || { echo "missing required file: $1" >&2; exit 2; }; }
 sha256() { shasum -a 256 "$1" | awk '{print $1}'; }
@@ -67,6 +69,19 @@ for port in "${ports[@]}"; do
   test "$(curl -fsS --max-time 10 -H 'content-type: application/json' \
     --data '{"jsonrpc":"2.0","id":1,"method":"eth_getBlockByNumber","params":["0x0",false]}' \
     "http://127.0.0.1:$port" | jq -er '.result.hash')" = "$expected_genesis"
+done
+
+copied_tag="$(printf '0x%x' "$copied_head")"
+copied_identity=""
+for port in "${ports[@]}"; do
+  identity="$(curl -fsS --max-time 10 -H 'content-type: application/json' \
+    --data "$(jq -nc --arg tag "$copied_tag" \
+      '{jsonrpc:"2.0",id:1,method:"eth_getBlockByNumber",params:[$tag,false]}')" \
+    "http://127.0.0.1:$port" | jq -ec '.result|[.number,.hash,.stateRoot,.receiptsRoot,.transactionsRoot]|join(":")')"
+  test "$(cut -d: -f1 <<<"$identity")" = "$copied_tag"
+  test "$(cut -d: -f2 <<<"$identity")" = "$expected_copied_hash"
+  test -z "$copied_identity" && copied_identity="$identity"
+  test "$identity" = "$copied_identity"
 done
 
 latest=""
@@ -114,10 +129,14 @@ done
 
 jq -nc --arg at "$(date -u +%FT%TZ)" --arg runtime "$runtime" \
   --arg gov_main "$expected_gov_main" --arg genesis "$expected_genesis" \
+  --arg copied_head "$copied_tag" --arg copied_hash "$expected_copied_hash" \
+  --arg copied_identity "$copied_identity" \
   --argjson head_audit "$head_audit" --argjson rust0_audit "$rust0_audit" \
   --argjson rust6_audit "$rust6_audit" \
   '{at:$at,event:"gov5_seven_validator_final_verification",status:"PASS",
     runtime:$runtime,govMain:$gov_main,genesis:$genesis,ports:[28501,28502,28503,28504,28505,29545,29546],
+    reused905Data:{copiedPersistedHead:$copied_head,copiedPersistedHash:$copied_hash,
+      allConfiguredEndpointsExact:true,identity:$copied_identity},
     liveIdentityExact:true,validatorCount:7,rustValidators:2,committedQc:true,equivocations:0,
     headAudit:$head_audit,rust0ResourceAudit:$rust0_audit,rust6ResourceAudit:$rust6_audit,
     bothRustLeaderAuditsExact:true,criticalLogs:0}' >"$output"
