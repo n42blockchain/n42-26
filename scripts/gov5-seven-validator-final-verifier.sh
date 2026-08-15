@@ -13,11 +13,12 @@ expected_rust_binary="${N42_FINAL_RUST_BINARY_SHA:?Rust binary SHA-256 is requir
 qualification="${N42_FINAL_QUALIFICATION_SCRIPT:-$runtime/artifacts/scripts/gov5-interop-qualification.sh}"
 output="${N42_FINAL_OUTPUT:-$runtime/evidence/runtime42-seven-validator-final-verification.json}"
 
-heads="$runtime/evidence/runtime42-seven-validator-24h-head-monitor.jsonl"
-upstream="$runtime/evidence/runtime42-gov5-upstream-24h.jsonl"
-upstream_complete="${upstream%.jsonl}-complete.json"
-rust0_resources="$runtime/evidence/runtime42-rust0-resource-24h.jsonl"
-rust6_resources="$runtime/evidence/runtime42-rust6-resource-24h.jsonl"
+evidence_dir="${N42_FINAL_EVIDENCE_DIR:-$runtime/evidence}"
+heads="${N42_FINAL_HEADS:-$evidence_dir/runtime42-seven-validator-24h-head-monitor.jsonl}"
+upstream="${N42_FINAL_UPSTREAM:-$evidence_dir/runtime42-gov5-upstream-24h.jsonl}"
+upstream_complete="${N42_FINAL_UPSTREAM_COMPLETE:-${upstream%.jsonl}-complete.json}"
+rust0_resources="${N42_FINAL_RUST0_RESOURCES:-$evidence_dir/runtime42-rust0-resource-24h.jsonl}"
+rust6_resources="${N42_FINAL_RUST6_RESOURCES:-$evidence_dir/runtime42-rust6-resource-24h.jsonl}"
 rust0_leaders="${N42_FINAL_RUST0_LEADERS:?final Rust0 leader audit is required}"
 rust6_leaders="${N42_FINAL_RUST6_LEADERS:?final Rust6 leader audit is required}"
 ports=(28501 28502 28503 28504 28505 29545 29546)

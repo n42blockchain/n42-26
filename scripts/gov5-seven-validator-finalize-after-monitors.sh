@@ -16,8 +16,16 @@ rust0_monitor_pid="${N42_FINAL_RUST0_MONITOR_PID:?Rust0 monitor PID is required}
 rust6_monitor_pid="${N42_FINAL_RUST6_MONITOR_PID:?Rust6 monitor PID is required}"
 qualification="${N42_FINAL_QUALIFICATION_SCRIPT:-$runtime/artifacts/scripts/gov5-interop-qualification.sh}"
 verifier="${N42_FINAL_VERIFIER:?seven-validator final verifier is required}"
-failure="$runtime/evidence/runtime42-seven-validator-finalizer-failure.json"
-output="$runtime/evidence/runtime42-seven-validator-final-verification.json"
+evidence_dir="${N42_FINAL_EVIDENCE_DIR:-$runtime/evidence}"
+heads="${N42_FINAL_HEADS:-$evidence_dir/runtime42-seven-validator-24h-head-monitor.jsonl}"
+upstream="${N42_FINAL_UPSTREAM:-$evidence_dir/runtime42-gov5-upstream-24h.jsonl}"
+upstream_complete="${N42_FINAL_UPSTREAM_COMPLETE:-${upstream%.jsonl}-complete.json}"
+rust0_resources="${N42_FINAL_RUST0_RESOURCES:-$evidence_dir/runtime42-rust0-resource-24h.jsonl}"
+rust6_resources="${N42_FINAL_RUST6_RESOURCES:-$evidence_dir/runtime42-rust6-resource-24h.jsonl}"
+failure="${N42_FINAL_FAILURE:-$evidence_dir/runtime42-seven-validator-finalizer-failure.json}"
+output="${N42_FINAL_OUTPUT:-$evidence_dir/runtime42-seven-validator-final-verification.json}"
+rust0_leaders="${N42_FINAL_RUST0_LEADERS:-$evidence_dir/runtime42-rust0-final-leader-range.json}"
+rust6_leaders="${N42_FINAL_RUST6_LEADERS:-$evidence_dir/runtime42-rust6-final-leader-range.json}"
 ports='28501 28502 28503 28504 28505 29545 29546'
 
 fail() {
@@ -35,14 +43,13 @@ while alive "$head_monitor_pid" || alive "$upstream_monitor_pid" || \
   alive "$rust0_monitor_pid" || alive "$rust6_monitor_pid"; do
   # The upstream guardian must outlive the window.  If it stops without its
   # PASS artifact, do not wait for the other monitors or use their evidence.
-  if ! alive "$upstream_monitor_pid" && \
-    ! test -f "$runtime/evidence/runtime42-gov5-upstream-24h-complete.json"; then
+  if ! alive "$upstream_monitor_pid" && ! test -f "$upstream_complete"; then
     fail 'Gov5 upstream guardian exited without PASS completion'
   fi
   sleep 60
 done
 
-test -f "$runtime/evidence/runtime42-gov5-upstream-24h-complete.json" || \
+test -f "$upstream_complete" || \
   fail 'Gov5 upstream guardian completed without PASS artifact'
 
 # Give all endpoints a small finalized margin, then align 71-block ranges to
@@ -72,6 +79,8 @@ env N42_FINAL_RUNTIME="$runtime" N42_FINAL_GOV_REPO="$gov_repo" \
   N42_FINAL_EXPECTED_GOV_MAIN="$expected_gov_main" \
   N42_FINAL_GOV_BINARY_SHA="$expected_gov_binary" N42_FINAL_RUST_BINARY_SHA="$expected_rust_binary" \
   N42_FINAL_QUALIFICATION_SCRIPT="$qualification" N42_FINAL_VERIFIER="$verifier" \
-  N42_FINAL_RUST0_LEADERS="$runtime/evidence/runtime42-rust0-final-leader-range.json" \
-  N42_FINAL_RUST6_LEADERS="$runtime/evidence/runtime42-rust6-final-leader-range.json" \
+  N42_FINAL_EVIDENCE_DIR="$evidence_dir" N42_FINAL_HEADS="$heads" \
+  N42_FINAL_UPSTREAM="$upstream" N42_FINAL_UPSTREAM_COMPLETE="$upstream_complete" \
+  N42_FINAL_RUST0_RESOURCES="$rust0_resources" N42_FINAL_RUST6_RESOURCES="$rust6_resources" \
+  N42_FINAL_RUST0_LEADERS="$rust0_leaders" N42_FINAL_RUST6_LEADERS="$rust6_leaders" \
   N42_FINAL_OUTPUT="$output" "$verifier"
