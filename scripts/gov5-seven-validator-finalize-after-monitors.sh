@@ -69,11 +69,11 @@ test "$rust6_end" -lt "$head" || fail 'insufficient final head margin for Rust6 
 env N42_QUAL_RUNTIME="$runtime" N42_QUAL_PORTS="$ports" \
   N42_QUAL_RUST_PORT=29545 N42_QUAL_RUST_MINER=0x81d4c1f92ddb837cb46f82280d9b491b101fa582 \
   N42_QUAL_RUST_LEADER_STRIDE=7 "$qualification" audit-rust-leaders \
-  "$rust0_start" "$rust0_end" "$runtime/evidence/runtime42-rust0-final-leader-range.json" >/dev/null
+  "$rust0_start" "$rust0_end" "$rust0_leaders" >/dev/null
 env N42_QUAL_RUNTIME="$runtime" N42_QUAL_PORTS="$ports" \
   N42_QUAL_RUST_PORT=29546 N42_QUAL_RUST_MINER=0x853b2026deebc83fb79ac7d0c48efea595c22578 \
   N42_QUAL_RUST_LEADER_STRIDE=7 "$qualification" audit-rust-leaders \
-  "$rust6_start" "$rust6_end" "$runtime/evidence/runtime42-rust6-final-leader-range.json" >/dev/null
+  "$rust6_start" "$rust6_end" "$rust6_leaders" >/dev/null
 
 env N42_FINAL_RUNTIME="$runtime" N42_FINAL_GOV_REPO="$gov_repo" \
   N42_FINAL_EXPECTED_GOV_MAIN="$expected_gov_main" \
