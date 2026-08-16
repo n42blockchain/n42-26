@@ -246,19 +246,21 @@ impl ConsensusService {
             execution_head = %self.head_block_hash, locked_view = self.engine.locked_qc().view,
             timestamp, "triggering payload build on LockedQC branch via fork_choice_updated");
 
-        // Try FCU; on "invalid payload attributes" (timestamp race), retry once with
-        // a conservatively bumped timestamp.  This handles the edge case where
-        // last_committed_timestamp doesn't perfectly track reth's internal head.
+        // Try FCU; on "invalid payload attributes" (timestamp race), retry with
+        // monotonically increasing timestamps.  A reused Gov5 runtime can receive
+        // a committed block whose timestamp is several seconds ahead of the local
+        // watermark while the old 905 history is being authenticated.  Two retries
+        // are not enough in that case: reth rejects every attribute that is not
+        // strictly greater than the actual parent header timestamp.
         let mut last_err = None;
-        for attempt in 0..2u8 {
+        let mut retry_timestamp = attrs.timestamp;
+        for attempt in 0..8u8 {
             let try_attrs = if attempt == 0 {
                 attrs.clone()
             } else {
-                // Retry: bump timestamp aggressively to guarantee > head.timestamp.
-                // Use +2 because consecutive fast blocks bump by +1 each, and our
-                // last_committed_timestamp tracking can be 1 behind the actual head.
-                let bumped_ts = self.last_committed_timestamp.max(attrs.timestamp) + 2;
-                warn!(target: "n42::cl::exec_bridge", bumped_ts, "retrying FCU with bumped timestamp");
+                retry_timestamp = self.last_committed_timestamp.max(retry_timestamp) + 1;
+                let bumped_ts = retry_timestamp;
+                warn!(target: "n42::cl::exec_bridge", attempt, bumped_ts, "retrying FCU with bumped timestamp");
                 let mut retry_attrs = attrs.clone();
                 retry_attrs.timestamp = bumped_ts;
                 retry_attrs

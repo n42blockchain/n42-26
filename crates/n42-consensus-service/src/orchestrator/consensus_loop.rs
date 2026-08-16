@@ -553,7 +553,17 @@ impl ConsensusService {
             .position(|hash| *hash == block_hash)
         {
             self.eager_execution_validated.remove(index);
-            self.advance_execution_validated_head(view, block_hash, "eager import before commit");
+            if self.import_would_regress_head(view, block_hash) {
+                warn!(
+                    target: "n42::cl::consensus_loop",
+                    view,
+                    %block_hash,
+                    "ignoring stale eager import completion before commit"
+                );
+                counter!("n42_stale_eager_import_skipped_total").increment(1);
+            } else {
+                self.advance_execution_validated_head(view, block_hash, "eager import before commit");
+            }
         }
 
         // Leader eager-imported blocks can finalize via Case A before the select
@@ -702,6 +712,32 @@ impl ConsensusService {
         block_hash: B256,
         commit_qc: QuorumCertificate,
     ) {
+        // A delayed commit/import completion can arrive after a newer execution
+        // head is already durable.  Never ask reth to move canonical state
+        // backward or sideways: that deterministically produces "too deep reorg"
+        // and leaves a misleading retry storm in long mixed-client runs.
+        if self.import_would_regress_head(view, block_hash) {
+            warn!(
+                target: "n42::cl::consensus_loop",
+                view,
+                %block_hash,
+                execution_validated_head_view = self.execution_validated_head_view,
+                execution_validated_head = %self.head_block_hash,
+                "skipping stale committed FCU because execution head is already newer"
+            );
+            self.pending_block_data.remove(&block_hash);
+            self.pending_executions.remove(&block_hash);
+            if self
+                .pending_finalization
+                .as_ref()
+                .is_some_and(|pending| pending.block_hash == block_hash)
+            {
+                self.pending_finalization = None;
+            }
+            counter!("n42_stale_committed_fcu_skipped_total").increment(1);
+            return;
+        }
+
         let engine_handle = match &self.el {
             Some(el) => el.clone(),
             None => {
@@ -842,7 +878,17 @@ impl ConsensusService {
             // Case A: Block already in reth (leader built + new_payload already done,
             // OR block was previously imported by a follower, OR rescued by eager import).
             debug!(target: "n42::cl::consensus_loop", view, %block_hash, "block finalized in reth");
-            self.advance_execution_validated_head(view, block_hash, "finalize fcu");
+            if self.import_would_regress_head(view, block_hash) {
+                warn!(
+                    target: "n42::cl::consensus_loop",
+                    view,
+                    %block_hash,
+                    "ignoring stale finalize completion"
+                );
+                counter!("n42_stale_finalize_completion_skipped_total").increment(1);
+            } else {
+                self.advance_execution_validated_head(view, block_hash, "finalize fcu");
+            }
 
             // Deferred state root mode: log that state root verification is pending.
             // Future: spawn async state root computation here using reth's provider.
@@ -1372,8 +1418,20 @@ impl ConsensusService {
             if let Some(timing) = self.pipeline_timings.get_mut(&hash) {
                 timing.import_complete = Some(Instant::now());
             }
-            info!(target: "n42::cl::consensus_loop", %hash, view, "background import completed, updating head");
-            self.advance_execution_validated_head(view, hash, "background import");
+            if self.import_would_regress_head(view, hash) {
+                warn!(
+                    target: "n42::cl::consensus_loop",
+                    %hash,
+                    view,
+                    execution_validated_head_view = self.execution_validated_head_view,
+                    execution_validated_head = %self.head_block_hash,
+                    "ignoring stale background import completion"
+                );
+                counter!("n42_stale_background_import_skipped_total").increment(1);
+            } else {
+                info!(target: "n42::cl::consensus_loop", %hash, view, "background import completed, updating head");
+                self.advance_execution_validated_head(view, hash, "background import");
+            }
             if block_timestamp > 0 {
                 self.last_committed_timestamp = self.last_committed_timestamp.max(block_timestamp);
             }
@@ -1490,7 +1548,17 @@ impl ConsensusService {
                     .pending_finalization
                     .as_ref()
                     .is_some_and(|pending| pending.block_hash == hash);
-            self.advance_execution_validated_head(view, hash, "eager import after commit");
+            if self.import_would_regress_head(view, hash) {
+                warn!(
+                    target: "n42::cl::consensus_loop",
+                    view,
+                    %hash,
+                    "ignoring stale eager import completion after commit"
+                );
+                counter!("n42_stale_eager_import_skipped_total").increment(1);
+            } else {
+                self.advance_execution_validated_head(view, hash, "eager import after commit");
+            }
             if let Some(index) = self
                 .eager_execution_validated
                 .iter()
