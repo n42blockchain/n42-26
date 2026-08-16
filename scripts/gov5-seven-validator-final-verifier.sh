@@ -24,6 +24,7 @@ rust0_leaders="${N42_FINAL_RUST0_LEADERS:?final Rust0 leader audit is required}"
 rust6_leaders="${N42_FINAL_RUST6_LEADERS:?final Rust6 leader audit is required}"
 ports=(28501 28502 28503 28504 28505 29545 29546)
 expected_genesis="0xb71c28109836f120453d097c38819a55b14c49abcc92713037fb9b11201392ec"
+maximum_sample_gap="${N42_FINAL_MAX_SAMPLE_GAP_SECONDS:-120}"
 copied_head="${N42_FINAL_COPIED_HEAD:-92605}"
 expected_copied_hash="${N42_FINAL_COPIED_HASH:-0x7491932238552b24588a635ba1b292033001479a4fe2c1593b88924850d2f235}"
 
@@ -98,7 +99,7 @@ for port in 29545 29546; do
 done
 
 head_audit="$(env N42_QUAL_RUNTIME="$runtime" N42_QUAL_PORTS="${ports[*]}" \
-  "$qualification" audit-soak "$heads" 86400 120 0 1)"
+  "$qualification" audit-soak "$heads" 86400 "$maximum_sample_gap" 0 1)"
 rust0_audit="$(env N42_QUAL_RUNTIME="$runtime" "$qualification" audit-rust-resources "$rust0_resources" 86400)"
 rust6_audit="$(env N42_QUAL_RUNTIME="$runtime" "$qualification" audit-rust-resources "$rust6_resources" 86400)"
 printf '%s\n' "$head_audit" | jq -e '.status == "PASS" and .maximumLag == 0 and .zeroTransactionRequired == true' >/dev/null
