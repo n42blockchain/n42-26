@@ -892,59 +892,84 @@ audit_timeout_recovery() {
 audit_runtime_logs() {
   local rust_log="${1:?Rust log required}"
   local evidence_file="${2:-}"
+  local log_start="${N42_QUAL_LOG_START:-}"
+  local require_timeouts="${N42_QUAL_REQUIRE_TIMEOUTS:-1}"
+  local require_timestamp_bumps="${N42_QUAL_REQUIRE_TIMESTAMP_BUMPS:-0}"
   require_file "$rust_log"
+  [[ "$require_timeouts" =~ ^[01]$ ]]
+  [[ "$require_timestamp_bumps" =~ ^[01]$ ]]
 
   local audit_dir unknown critical
   audit_dir="$(mktemp -d)"
   trap 'rm -rf "$audit_dir"' RETURN
   unknown="$audit_dir/unknown-warnings.log"
   critical="$audit_dir/critical-signals.log"
+  local audited_rust_log="$rust_log"
+  if test -n "$log_start"; then
+    audited_rust_log="$audit_dir/rust-window.log"
+    awk -v start="$log_start" 'substr($0,1,19) >= start' \
+      "$rust_log" >"$audited_rust_log"
+  fi
 
   local total timeout pacemaker eviction commits duplicate_vote duplicate_commit
-  local payload_retry unsupported_state_sync missing_tx_forward_leader
-  total="$(rg -c ' WARN ' "$rust_log" || echo 0)"
-  timeout="$(rg -c ' WARN view timed out view=' "$rust_log" || echo 0)"
+  local payload_retry unsupported_state_sync missing_tx_forward_leader timestamp_bump
+  total="$(rg -c ' WARN ' "$audited_rust_log" || echo 0)"
+  timeout="$(rg -c ' WARN view timed out view=' "$audited_rust_log" || echo 0)"
   pacemaker="$(rg -c ' WARN pacemaker timeout, initiating view change view=' \
-    "$rust_log" || echo 0)"
+    "$audited_rust_log" || echo 0)"
   eviction="$(rg -c ' WARN .*evicted rejected compact execution output hash=' \
-    "$rust_log" || echo 0)"
-  commits="$(rg -c ' INFO (.*: )?block committed! view=' "$rust_log" || echo 0)"
+    "$audited_rust_log" || echo 0)"
+  commits="$(rg -c ' INFO (.*: )?block committed! view=' "$audited_rust_log" || echo 0)"
   duplicate_vote="$(rg -c \
     ' WARN .*suppressed duplicate vote \(already voted in this view\)' \
-    "$rust_log" || echo 0)"
+    "$audited_rust_log" || echo 0)"
   duplicate_commit="$(rg -c \
     ' WARN .*suppressed duplicate commit vote \(already commit-voted in this view\)' \
-    "$rust_log" || echo 0)"
+    "$audited_rust_log" || echo 0)"
   payload_retry="$(rg -c \
     ' WARN fork_choice_updated did not return payload_id, scheduling retry$' \
-    "$rust_log" || true)"
+    "$audited_rust_log" || true)"
   payload_retry="${payload_retry:-0}"
   unsupported_state_sync="$(rg -c \
     ' WARN sync request failed peer=.* error=peer does not advertise N42 state-sync$' \
-    "$rust_log" || true)"
+    "$audited_rust_log" || true)"
   unsupported_state_sync="${unsupported_state_sync:-0}"
   missing_tx_forward_leader="$(rg -c \
     ' WARN leader peer not found for tx forward view=[0-9]+ leader_idx=[0-9]+ buf_len=[0-9]+ peers=[0-9]+$' \
-    "$rust_log" || true)"
+    "$audited_rust_log" || true)"
   missing_tx_forward_leader="${missing_tx_forward_leader:-0}"
+  timestamp_bump="$(rg -c \
+    ' WARN timestamp <= last committed block, bumping to avoid Engine API rejection proposed=[0-9]+ last_committed=[0-9]+ bumped_to=[0-9]+$' \
+    "$audited_rust_log" || true)"
+  timestamp_bump="${timestamp_bump:-0}"
 
-  rg ' WARN ' "$rust_log" | rg -v \
-    ' WARN (view timed out view=|pacemaker timeout, initiating view change view=|fork_choice_updated did not return payload_id, scheduling retry$|sync request failed peer=.* error=peer does not advertise N42 state-sync$|leader peer not found for tx forward view=[0-9]+ leader_idx=[0-9]+ buf_len=[0-9]+ peers=[0-9]+$)| WARN .*evicted rejected compact execution output hash=| WARN .*suppressed duplicate (commit )?vote \(already (commit-)?voted in this view\)' \
+  rg ' WARN ' "$audited_rust_log" | rg -v \
+    ' WARN (view timed out view=|pacemaker timeout, initiating view change view=|fork_choice_updated did not return payload_id, scheduling retry$|sync request failed peer=.* error=peer does not advertise N42 state-sync$|leader peer not found for tx forward view=[0-9]+ leader_idx=[0-9]+ buf_len=[0-9]+ peers=[0-9]+$|timestamp <= last committed block, bumping to avoid Engine API rejection proposed=[0-9]+ last_committed=[0-9]+ bumped_to=[0-9]+$)| WARN .*evicted rejected compact execution output hash=| WARN .*suppressed duplicate (commit )?vote \(already (commit-)?voted in this view\)' \
     >"$unknown" || true
   local log
   for log in "$runtime"/logs/gov{1,2,3,4,5}.log "$rust_log"; do
     require_file "$log"
+    local audited_log="$log"
+    if test -n "$log_start"; then
+      audited_log="$audit_dir/$(basename "$log").window.log"
+      awk -v start="$log_start" 'substr($0,1,19) >= start' \
+        "$log" >"$audited_log"
+    fi
     # Keep the structured ERROR level case-sensitive. With a global -i this
     # also matched harmless INFO fields such as "error=IO error on outbound
     # stream" and falsely rejected an otherwise healthy startup handshake.
-    rg ' ERROR ' "$log" >>"$critical" || true
-    rg -i '(^|[^a-z])(panic|fatal|equivocat)' "$log" >>"$critical" || true
+    rg ' ERROR ' "$audited_log" >>"$critical" || true
+    rg -i '(^|[^a-z])(panic|fatal|equivocat)' "$audited_log" >>"$critical" || true
   done
 
   test "$total" -gt 0
-  test "$timeout" -gt 0
+  if test "$require_timeouts" = 1; then test "$timeout" -gt 0; fi
   test "$timeout" -eq "$pacemaker"
   test "$eviction" -eq "$commits"
+  if test "$require_timestamp_bumps" = 1; then
+    test "$timestamp_bump" -gt 0
+    test "$timestamp_bump" -eq "$commits"
+  fi
   # The strict runtime has one persisted-state start before the soak and one
   # controlled restart in the finalizer. Each start may observe one SYNCING
   # FCU and one unsupported state-sync response from each of the five Gov
@@ -957,7 +982,8 @@ audit_runtime_logs() {
   test "$missing_tx_forward_leader" -le "$timeout"
   test "$total" -eq \
     $((timeout + pacemaker + eviction + duplicate_vote + duplicate_commit +
-      payload_retry + unsupported_state_sync + missing_tx_forward_leader))
+      payload_retry + unsupported_state_sync + missing_tx_forward_leader +
+      timestamp_bump))
   test ! -s "$unknown"
   test ! -s "$critical"
 
@@ -965,7 +991,8 @@ audit_runtime_logs() {
   summary="$(jq -nc \
     --arg at "$(date -u +%FT%TZ)" \
     --arg log "$rust_log" \
-    --arg log_sha256 "$(shasum -a 256 "$rust_log" | awk '{print $1}')" \
+    --arg log_start "$log_start" \
+    --arg log_sha256 "$(shasum -a 256 "$audited_rust_log" | awk '{print $1}')" \
     --argjson total "$total" \
     --argjson timeout "$timeout" \
     --argjson pacemaker "$pacemaker" \
@@ -975,19 +1002,26 @@ audit_runtime_logs() {
     --argjson duplicate_commit "$duplicate_commit" \
     --argjson payload_retry "$payload_retry" \
     --argjson unsupported_state_sync "$unsupported_state_sync" \
-    --argjson missing_tx_forward_leader "$missing_tx_forward_leader" '
+    --argjson missing_tx_forward_leader "$missing_tx_forward_leader" \
+    --argjson timestamp_bump "$timestamp_bump" \
+    --argjson require_timeouts "$require_timeouts" \
+    --argjson require_timestamp_bumps "$require_timestamp_bumps" '
     {at:$at,event:"mixed_client_runtime_log_audit",status:"PASS",
-      rustLog:$log,rustLogSha256:$log_sha256,totalWarnings:$total,
+      rustLog:$log,logStart:(if $log_start=="" then null else $log_start end),
+      auditedLogSha256:$log_sha256,totalWarnings:$total,
       warningCounts:{viewTimeout:$timeout,pacemakerTimeout:$pacemaker,
         compactExecutionEviction:$eviction,rustLeaderCommit:$commits,
         duplicateVoteSuppression:$duplicate_vote,
         duplicateCommitVoteSuppression:$duplicate_commit,
         payloadBuildRetry:$payload_retry,
         unsupportedStateSyncFallback:$unsupported_state_sync,
-        missingTxForwardLeader:$missing_tx_forward_leader},
+        missingTxForwardLeader:$missing_tx_forward_leader,
+        parentTimestampBump:$timestamp_bump},
       missingTxForwardLeaderAtMostOncePerView:true,
       warningPartitionExact:true,timeoutSetsCountExact:true,
       compactEvictionsMatchRustLeaderCommits:true,
+      timestampBumpsMatchRustLeaderCommits:($require_timestamp_bumps==1),
+      timeoutsRequired:($require_timeouts==1),
       unexpectedWarnings:0,criticalSignals:0,
       govLogsChecked:5,rustLogsChecked:1}')"
   if test -n "$evidence_file"; then

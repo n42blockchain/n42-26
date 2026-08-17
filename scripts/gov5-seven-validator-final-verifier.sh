@@ -130,10 +130,24 @@ head_audit="$(env N42_QUAL_RUNTIME="$runtime" N42_QUAL_PORTS="${ports[*]}" \
   "$qualification" audit-soak "$heads" 86400 "$maximum_sample_gap" "$maximum_lag" 1)"
 rust0_audit="$(env N42_QUAL_RUNTIME="$runtime" "$qualification" audit-rust-resources "$rust0_resources" 86400)"
 rust6_audit="$(env N42_QUAL_RUNTIME="$runtime" "$qualification" audit-rust-resources "$rust6_resources" 86400)"
+rust0_log_audit="$(env N42_QUAL_RUNTIME="$runtime" N42_QUAL_LOG_START="$log_start" \
+  N42_QUAL_REQUIRE_TIMEOUTS=0 N42_QUAL_REQUIRE_TIMESTAMP_BUMPS=1 \
+  "$qualification" audit-runtime-logs "$runtime/logs/rust.log")"
+rust6_log_audit="$(env N42_QUAL_RUNTIME="$runtime" N42_QUAL_LOG_START="$log_start" \
+  N42_QUAL_REQUIRE_TIMEOUTS=0 N42_QUAL_REQUIRE_TIMESTAMP_BUMPS=1 \
+  "$qualification" audit-runtime-logs "$runtime/logs/rust2.log")"
 printf '%s\n' "$head_audit" | jq -e --argjson maximum_lag "$maximum_lag" \
   '.status == "PASS" and .maximumLag <= $maximum_lag and .zeroTransactionRequired == true' >/dev/null
 printf '%s\n' "$rust0_audit" | jq -e '.status == "PASS" and .singleProcess and .logicalCountersMonotonic' >/dev/null
 printf '%s\n' "$rust6_audit" | jq -e '.status == "PASS" and .singleProcess and .logicalCountersMonotonic' >/dev/null
+for log_audit in "$rust0_log_audit" "$rust6_log_audit"; do
+  printf '%s\n' "$log_audit" | jq -e '
+    .status == "PASS" and .warningPartitionExact and
+    .compactEvictionsMatchRustLeaderCommits and
+    .timestampBumpsMatchRustLeaderCommits and
+    .unexpectedWarnings == 0 and .criticalSignals == 0
+  ' >/dev/null
+done
 for leader_file in "$rust0_leaders" "$rust6_leaders"; do
   jq -e '.status == "PASS" and .leaderStride == 7 and .rustAuthoredBlocks > 0 and
     .parentChainContinuous and .expectedLeaderSlotsExact and .allConfiguredEndpointsExact and
@@ -165,6 +179,8 @@ jq -nc --arg at "$(date -u +%FT%TZ)" --arg runtime "$runtime" \
   --argjson latest_lag "$((latest_max - latest_min))" --argjson maximum_lag "$maximum_lag" \
   --argjson head_audit "$head_audit" --argjson rust0_audit "$rust0_audit" \
   --argjson rust6_audit "$rust6_audit" \
+  --argjson rust0_log_audit "$rust0_log_audit" \
+  --argjson rust6_log_audit "$rust6_log_audit" \
   --slurpfile execution_audit "$execution_audit" \
   '{at:$at,event:"gov5_seven_validator_final_verification",status:"PASS",
     runtime:$runtime,govMain:$gov_main,genesis:$genesis,ports:[28501,28502,28503,28504,28505,29545,29546],
@@ -175,5 +191,6 @@ jq -nc --arg at "$(date -u +%FT%TZ)" --arg runtime "$runtime" \
     validatorCount:7,rustValidators:2,committedQc:true,equivocations:0,
     sevenEndpointEvmExecutionExact:true,executionAudit:$execution_audit[0],
     headAudit:$head_audit,rust0ResourceAudit:$rust0_audit,rust6ResourceAudit:$rust6_audit,
+    rust0FormalLogAudit:$rust0_log_audit,rust6FormalLogAudit:$rust6_log_audit,
     bothRustLeaderAuditsExact:true,criticalLogs:0}' >"$output"
 cat "$output"
