@@ -366,6 +366,28 @@ impl ConsensusService {
             }
         } else {
             self.pending_executions.insert(block_hash);
+            // ExecuteBlock is emitted only after the consensus engine accepts
+            // the proposal/QC carrying this hash.  In Gov5 participant mode
+            // that makes the hash an authenticated ancestry anchor even when
+            // its block gossip was missed while a long catch-up import was
+            // occupying the orchestrator.  Merely remembering the deferred
+            // execution leaves a permanent hole: later state-sync responses
+            // submit the descendants to Reth, which can only return Syncing
+            // forever because Gov5 peers do not advertise N42 state-sync.
+            // Fetch the exact body so the existing reverse-ancestry path can
+            // close and release the suffix in parent-first order.
+            if self.h2_v4_identity.is_some() {
+                self.remember_h2_v4_block_view(block_hash, self.engine.current_view());
+                if let Some(peer) = self.connected_peers.iter().copied().next() {
+                    self.request_h2_v4_gov5_block(peer, block_hash);
+                } else {
+                    warn!(
+                        target: "n42::interop::h2v4",
+                        %block_hash,
+                        "cannot fetch authenticated Gov5 ExecuteBlock body without a connected peer"
+                    );
+                }
+            }
         }
     }
 

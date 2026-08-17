@@ -9885,6 +9885,7 @@ dependencies = [
  "alloy-consensus",
  "alloy-eip7928",
  "alloy-primitives",
+ "alloy-tx-macros",
  "auto_impl",
  "reth-execution-types",
  "reth-primitives-traits",

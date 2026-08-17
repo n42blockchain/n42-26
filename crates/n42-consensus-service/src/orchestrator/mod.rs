@@ -4584,11 +4584,43 @@ mod tests {
     #[tokio::test]
     async fn test_handle_engine_output_execute_block() {
         let (engine, output_rx) = make_test_engine();
-        let (network, _cmd_rx, _prx) = make_test_network();
+        let (network, _cmd_rx, mut prx) = make_test_network();
         let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
         let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
-        orch.handle_engine_output(EngineOutput::ExecuteBlock(B256::repeat_byte(0xCC)))
+        let block_hash = B256::repeat_byte(0xCC);
+
+        orch.handle_engine_output(EngineOutput::ExecuteBlock(block_hash))
             .await;
+
+        assert!(orch.pending_executions.contains(&block_hash));
+        assert!(
+            prx.try_recv().is_err(),
+            "native mode must not fetch a Gov5 body"
+        );
+    }
+
+    #[tokio::test]
+    async fn h2_execute_block_without_body_starts_authenticated_gov5_fetch() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, mut prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx)
+            .with_h2_v4_participant(test_h2_identity());
+        let peer = libp2p::PeerId::random();
+        let block_hash = B256::repeat_byte(0xCD);
+        orch.connected_peers.insert(peer);
+
+        orch.handle_engine_output(EngineOutput::ExecuteBlock(block_hash))
+            .await;
+
+        assert!(orch.pending_executions.contains(&block_hash));
+        assert!(orch.h2_v4_block_views.contains_key(&block_hash));
+        assert!(orch.h2_v4_fetch_requested_at.contains_key(&block_hash));
+        assert!(matches!(
+            prx.try_recv().expect("authenticated body fetch command"),
+            NetworkCommand::RequestGov5BlockByHash { peer: requested_peer, block_hash: requested_hash }
+                if requested_peer == peer && requested_hash == block_hash
+        ));
     }
 
     #[tokio::test]
