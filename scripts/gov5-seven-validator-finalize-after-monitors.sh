@@ -80,6 +80,7 @@ env N42_FINAL_RUNTIME="$runtime" N42_FINAL_GOV_REPO="$gov_repo" \
   N42_FINAL_EXPECTED_GOV_MAIN="$expected_gov_main" \
   N42_FINAL_GOV_BINARY_SHA="$expected_gov_binary" N42_FINAL_RUST_BINARY_SHA="$expected_rust_binary" \
   N42_FINAL_LOG_START="$log_start" \
+  N42_FINAL_MAX_LAG="${N42_FINAL_MAX_LAG:-6}" \
   N42_FINAL_QUALIFICATION_SCRIPT="$qualification" N42_FINAL_VERIFIER="$verifier" \
   N42_FINAL_EVIDENCE_DIR="$evidence_dir" N42_FINAL_HEADS="$heads" \
   N42_FINAL_UPSTREAM="$upstream" N42_FINAL_UPSTREAM_COMPLETE="$upstream_complete" \

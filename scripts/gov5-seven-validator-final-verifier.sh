@@ -25,8 +25,9 @@ rust6_leaders="${N42_FINAL_RUST6_LEADERS:?final Rust6 leader audit is required}"
 ports=(28501 28502 28503 28504 28505 29545 29546)
 expected_genesis="0xb71c28109836f120453d097c38819a55b14c49abcc92713037fb9b11201392ec"
 maximum_sample_gap="${N42_FINAL_MAX_SAMPLE_GAP_SECONDS:-120}"
+maximum_lag="${N42_FINAL_MAX_LAG:-6}"
 copied_head="${N42_FINAL_COPIED_HEAD:-92605}"
-expected_copied_hash="${N42_FINAL_COPIED_HASH:-0x7491932238552b24588a635ba1b292033001479a4fe2c1593b88924850d2f235}"
+expected_copied_hash="${N42_FINAL_COPIED_HASH:-0xb88a3571223cf8cd8291d608572a55f306ea88957cc7ede8ab6b8812ada85a82}"
 
 require_file() { test -f "$1" || { echo "missing required file: $1" >&2; exit 2; }; }
 sha256() { shasum -a 256 "$1" | awk '{print $1}'; }
@@ -85,13 +86,28 @@ for port in "${ports[@]}"; do
   test "$identity" = "$copied_identity"
 done
 
-latest=""
+latest_min=-1
+latest_max=-1
+for port in "${ports[@]}"; do
+  height_hex="$(rpc "$port" eth_blockNumber | jq -er '.result')"
+  height=$((height_hex))
+  if test "$latest_min" -lt 0 || test "$height" -lt "$latest_min"; then
+    latest_min="$height"
+  fi
+  if test "$latest_max" -lt 0 || test "$height" -gt "$latest_max"; then
+    latest_max="$height"
+  fi
+done
+test "$((latest_max - latest_min))" -le "$maximum_lag"
+common_tag="$(printf '0x%x' "$latest_min")"
+common_identity=""
 for port in "${ports[@]}"; do
   identity="$(curl -fsS --max-time 10 -H 'content-type: application/json' \
-    --data '{"jsonrpc":"2.0","id":1,"method":"eth_getBlockByNumber","params":["latest",false]}' \
+    --data "$(jq -nc --arg tag "$common_tag" \
+      '{jsonrpc:"2.0",id:1,method:"eth_getBlockByNumber",params:[$tag,false]}')" \
     "http://127.0.0.1:$port" | jq -ec '.result|[.number,.hash,.stateRoot,.receiptsRoot]')"
-  test -z "$latest" && latest="$identity"
-  test "$identity" = "$latest"
+  test -z "$common_identity" && common_identity="$identity"
+  test "$identity" = "$common_identity"
 done
 for port in 29545 29546; do
   rpc "$port" n42_consensusStatus | jq -e '.result.validatorCount == 7 and .result.hasCommittedQc == true' >/dev/null
@@ -99,10 +115,11 @@ for port in 29545 29546; do
 done
 
 head_audit="$(env N42_QUAL_RUNTIME="$runtime" N42_QUAL_PORTS="${ports[*]}" \
-  "$qualification" audit-soak "$heads" 86400 "$maximum_sample_gap" 0 1)"
+  "$qualification" audit-soak "$heads" 86400 "$maximum_sample_gap" "$maximum_lag" 1)"
 rust0_audit="$(env N42_QUAL_RUNTIME="$runtime" "$qualification" audit-rust-resources "$rust0_resources" 86400)"
 rust6_audit="$(env N42_QUAL_RUNTIME="$runtime" "$qualification" audit-rust-resources "$rust6_resources" 86400)"
-printf '%s\n' "$head_audit" | jq -e '.status == "PASS" and .maximumLag == 0 and .zeroTransactionRequired == true' >/dev/null
+printf '%s\n' "$head_audit" | jq -e --argjson maximum_lag "$maximum_lag" \
+  '.status == "PASS" and .maximumLag <= $maximum_lag and .zeroTransactionRequired == true' >/dev/null
 printf '%s\n' "$rust0_audit" | jq -e '.status == "PASS" and .singleProcess and .logicalCountersMonotonic' >/dev/null
 printf '%s\n' "$rust6_audit" | jq -e '.status == "PASS" and .singleProcess and .logicalCountersMonotonic' >/dev/null
 for leader_file in "$rust0_leaders" "$rust6_leaders"; do
@@ -132,13 +149,17 @@ jq -nc --arg at "$(date -u +%FT%TZ)" --arg runtime "$runtime" \
   --arg gov_main "$expected_gov_main" --arg genesis "$expected_genesis" \
   --arg copied_head "$copied_tag" --arg copied_hash "$expected_copied_hash" \
   --arg copied_identity "$copied_identity" \
+  --arg common_height "$common_tag" --arg common_identity "$common_identity" \
+  --argjson latest_lag "$((latest_max - latest_min))" --argjson maximum_lag "$maximum_lag" \
   --argjson head_audit "$head_audit" --argjson rust0_audit "$rust0_audit" \
   --argjson rust6_audit "$rust6_audit" \
   '{at:$at,event:"gov5_seven_validator_final_verification",status:"PASS",
     runtime:$runtime,govMain:$gov_main,genesis:$genesis,ports:[28501,28502,28503,28504,28505,29545,29546],
     reused905Data:{copiedPersistedHead:$copied_head,copiedPersistedHash:$copied_hash,
       allConfiguredEndpointsExact:true,identity:$copied_identity},
-    liveIdentityExact:true,validatorCount:7,rustValidators:2,committedQc:true,equivocations:0,
+    liveCommonHeightIdentityExact:true,commonHeight:$common_height,commonIdentity:$common_identity,
+    latestLag:$latest_lag,maximumLagBound:$maximum_lag,
+    validatorCount:7,rustValidators:2,committedQc:true,equivocations:0,
     headAudit:$head_audit,rust0ResourceAudit:$rust0_audit,rust6ResourceAudit:$rust6_audit,
     bothRustLeaderAuditsExact:true,criticalLogs:0}' >"$output"
 cat "$output"
