@@ -218,6 +218,19 @@ impl ConsensusService {
         self.building_on_parent = Some(build_context);
         self.build_triggered_at = Some(build_start);
 
+        if let Some(parent_timestamp) = el.validated_payload_timestamp(parent)
+            && parent_timestamp > self.last_committed_timestamp
+        {
+            info!(
+                target: "n42::cl::exec_bridge",
+                %parent,
+                parent_timestamp,
+                cached_timestamp = self.last_committed_timestamp,
+                "calibrating payload timestamp from the execution-validated LockedQC parent"
+            );
+            self.last_committed_timestamp = parent_timestamp;
+        }
+
         let attrs = self.build_payload_attributes(slot_timestamp);
         let timestamp = attrs.timestamp;
 
@@ -246,19 +259,27 @@ impl ConsensusService {
             execution_head = %self.head_block_hash, locked_view = self.engine.locked_qc().view,
             timestamp, "triggering payload build on LockedQC branch via fork_choice_updated");
 
-        // Try FCU; on "invalid payload attributes" (timestamp race), retry once with
-        // a conservatively bumped timestamp.  This handles the edge case where
-        // last_committed_timestamp doesn't perfectly track reth's internal head.
+        // Try FCU; on "invalid payload attributes" (timestamp race), retry with
+        // exponentially increasing timestamp headroom. The exact-parent cache
+        // above handles normal races. This bounded fallback also covers a first
+        // post-restart build whose parent predates that in-memory cache.
         let mut last_err = None;
-        for attempt in 0..2u8 {
+        for attempt in 0..16u8 {
             let try_attrs = if attempt == 0 {
                 attrs.clone()
             } else {
-                // Retry: bump timestamp aggressively to guarantee > head.timestamp.
-                // Use +2 because consecutive fast blocks bump by +1 each, and our
-                // last_committed_timestamp tracking can be 1 behind the actual head.
-                let bumped_ts = self.last_committed_timestamp.max(attrs.timestamp) + 2;
-                warn!(target: "n42::cl::exec_bridge", bumped_ts, "retrying FCU with bumped timestamp");
+                let headroom = 1u64 << attempt;
+                let bumped_ts = self
+                    .last_committed_timestamp
+                    .max(attrs.timestamp)
+                    .saturating_add(headroom);
+                warn!(
+                    target: "n42::cl::exec_bridge",
+                    attempt,
+                    headroom,
+                    bumped_ts,
+                    "retrying FCU with increasing timestamp headroom"
+                );
                 let mut retry_attrs = attrs.clone();
                 retry_attrs.timestamp = bumped_ts;
                 retry_attrs
@@ -1900,10 +1921,8 @@ mod blob_frame_tests {
     #[test]
     fn unshippable_sidecar_is_dropped_and_counted() {
         let max = n42_network::MAX_BLOB_GOSSIP_MESSAGE_SIZE;
-        let (frames, oversized) = pack_blob_sidecar_frames(
-            vec![sidecar(1, 10), sidecar(2, max), sidecar(3, 10)],
-            max,
-        );
+        let (frames, oversized) =
+            pack_blob_sidecar_frames(vec![sidecar(1, 10), sidecar(2, max), sidecar(3, 10)], max);
         assert_eq!(oversized, 1);
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].len(), 2, "the shippable neighbours still go out");

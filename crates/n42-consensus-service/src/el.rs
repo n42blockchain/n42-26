@@ -82,4 +82,13 @@ pub trait ExecutionLayer: Send + Sync + 'static {
         id: PayloadId,
         kind: ResolveKind,
     ) -> Option<Result<BuiltBlock, ElError>>;
+
+    /// Returns the timestamp of a payload that this adapter has already seen
+    /// the EL validate, when it is still present in the adapter's bounded
+    /// recent-payload cache.  Leaders use the exact LockedQC parent timestamp
+    /// to satisfy the Engine API's strict `attributes.timestamp > parent`
+    /// requirement after restart catch-up races.
+    fn validated_payload_timestamp(&self, _hash: B256) -> Option<u64> {
+        None
+    }
 }

@@ -3757,6 +3757,10 @@ mod tests {
         fcu_heads: Arc<Mutex<Vec<B256>>>,
         /// Every new_payload block hash.
         new_payload_hashes: Arc<Mutex<Vec<B256>>>,
+        /// Payload-attribute timestamps sent by leader build requests.
+        build_timestamps: Arc<Mutex<Vec<u64>>>,
+        /// Exact timestamps of recently execution-validated payloads.
+        validated_payload_timestamps: Arc<Mutex<HashMap<B256, u64>>>,
     }
 
     impl MockExecutionLayer {
@@ -3768,6 +3772,8 @@ mod tests {
                 build_forkchoices: Arc::new(Mutex::new(Vec::new())),
                 fcu_heads: Arc::new(Mutex::new(Vec::new())),
                 new_payload_hashes: Arc::new(Mutex::new(Vec::new())),
+                build_timestamps: Arc::new(Mutex::new(Vec::new())),
+                validated_payload_timestamps: Arc::new(Mutex::new(HashMap::new())),
             }
         }
 
@@ -3787,6 +3793,8 @@ mod tests {
                 build_forkchoices: Arc::new(Mutex::new(Vec::new())),
                 fcu_heads: Arc::new(Mutex::new(Vec::new())),
                 new_payload_hashes: Arc::new(Mutex::new(Vec::new())),
+                build_timestamps: Arc::new(Mutex::new(Vec::new())),
+                validated_payload_timestamps: Arc::new(Mutex::new(HashMap::new())),
             }
         }
 
@@ -3806,6 +3814,8 @@ mod tests {
                 build_forkchoices: Arc::new(Mutex::new(Vec::new())),
                 fcu_heads: Arc::new(Mutex::new(Vec::new())),
                 new_payload_hashes: Arc::new(Mutex::new(Vec::new())),
+                build_timestamps: Arc::new(Mutex::new(Vec::new())),
+                validated_payload_timestamps: Arc::new(Mutex::new(HashMap::new())),
             }
         }
 
@@ -3835,6 +3845,20 @@ mod tests {
                 .lock()
                 .expect("mock execution-layer lock")
                 .clone()
+        }
+
+        fn build_timestamps(&self) -> Vec<u64> {
+            self.build_timestamps
+                .lock()
+                .expect("mock execution-layer lock")
+                .clone()
+        }
+
+        fn set_validated_payload_timestamp(&self, hash: B256, timestamp: u64) {
+            self.validated_payload_timestamps
+                .lock()
+                .expect("mock execution-layer lock")
+                .insert(hash, timestamp);
         }
     }
 
@@ -3883,8 +3907,12 @@ mod tests {
         async fn fork_choice_updated_with_attrs(
             &self,
             state: ForkchoiceState,
-            _attrs: PayloadAttributes,
+            attrs: PayloadAttributes,
         ) -> Result<ForkchoiceUpdated, crate::el::ElError> {
+            self.build_timestamps
+                .lock()
+                .expect("mock execution-layer lock")
+                .push(attrs.timestamp);
             self.build_forkchoices
                 .lock()
                 .expect("mock execution-layer lock")
@@ -3906,6 +3934,14 @@ mod tests {
             _kind: crate::el::ResolveKind,
         ) -> Option<Result<crate::el::BuiltBlock, crate::el::ElError>> {
             None
+        }
+
+        fn validated_payload_timestamp(&self, hash: B256) -> Option<u64> {
+            self.validated_payload_timestamps
+                .lock()
+                .expect("mock execution-layer lock")
+                .get(&hash)
+                .copied()
         }
     }
 
@@ -4745,6 +4781,31 @@ mod tests {
             vec![(locked_parent, B256::ZERO, B256::ZERO)],
             "LockedQC must drive FCU head without claiming sibling B as its safe/finalized ancestor"
         );
+    }
+
+    /// A restart catch-up can validate several payloads inside reth before the
+    /// orchestrator drains their completion callbacks. The next leader build
+    /// must use the exact validated parent's timestamp, not a stale scalar that
+    /// assumes it can lag by at most one block.
+    #[tokio::test]
+    async fn leader_build_calibrates_timestamp_from_validated_locked_parent() {
+        let locked_parent = B256::repeat_byte(0xA4);
+        let (engine, output_rx) = make_test_engine_locked_on(locked_parent);
+        let (network, _cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let mock_el = Arc::new(MockExecutionLayer::new(
+            PayloadStatusEnum::Valid,
+            PayloadStatusEnum::Valid,
+        ));
+        mock_el.set_validated_payload_timestamp(locked_parent, 1_786_993_239);
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
+        orch.el = Some(mock_el.clone());
+        orch.last_committed_timestamp = 1_786_993_235;
+
+        orch.do_trigger_payload_build(Some(1_786_987_141)).await;
+
+        assert_eq!(orch.last_committed_timestamp, 1_786_993_239);
+        assert_eq!(mock_el.build_timestamps(), vec![1_786_993_240]);
     }
 
     #[test]
