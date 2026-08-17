@@ -28,6 +28,7 @@ output="${N42_FINAL_OUTPUT:-$evidence_dir/runtime42-seven-validator-final-verifi
 rust0_leaders="${N42_FINAL_RUST0_LEADERS:-$evidence_dir/runtime42-rust0-final-leader-range.json}"
 rust6_leaders="${N42_FINAL_RUST6_LEADERS:-$evidence_dir/runtime42-rust6-final-leader-range.json}"
 execution_audit="${N42_FINAL_EXECUTION_AUDIT:-$evidence_dir/runtime42-seven-endpoint-evm-execution.json}"
+recovery_audit="${N42_FINAL_RECOVERY_AUDIT:?Rust restart catch-up audit is required}"
 execution_audit_script="${N42_FINAL_EXECUTION_AUDIT_SCRIPT:-$runtime/artifacts/scripts/audit-gov5-burst-readonly.sh}"
 ports='28501 28502 28503 28504 28505 29545 29546'
 minimum_duration="${N42_FINAL_MINIMUM_DURATION_SECONDS:-86400}"
@@ -140,5 +141,6 @@ env N42_FINAL_RUNTIME="$runtime" N42_FINAL_GOV_REPO="$gov_repo" \
   N42_FINAL_UPSTREAM="$upstream" N42_FINAL_UPSTREAM_COMPLETE="$upstream_complete" \
   N42_FINAL_RUST0_RESOURCES="$rust0_resources" N42_FINAL_RUST6_RESOURCES="$rust6_resources" \
   N42_FINAL_EXECUTION_AUDIT="$execution_audit" \
+  N42_FINAL_RECOVERY_AUDIT="$recovery_audit" \
   N42_FINAL_RUST0_LEADERS="$rust0_leaders" N42_FINAL_RUST6_LEADERS="$rust6_leaders" \
   N42_FINAL_OUTPUT="$output" "$verifier"
