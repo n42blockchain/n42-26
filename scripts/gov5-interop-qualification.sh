@@ -566,7 +566,7 @@ audit_rust_leaders() {
   local evidence_file="${3:-}"
   local rust_port="${N42_QUAL_RUST_PORT:-29545}"
   local rust_miner="${N42_QUAL_RUST_MINER:-0x81d4c1f92ddb837cb46f82280d9b491b101fa582}"
-  local leader_stride="${N42_QUAL_RUST_LEADER_STRIDE:-6}"
+  local leader_stride="${N42_QUAL_RUST_LEADER_STRIDE:-7}"
   local -a ports
   # The qualification topology has five Gov5 validators plus Rust slots 0
   # and 6.  Keep the full set as the default so an omitted environment value
