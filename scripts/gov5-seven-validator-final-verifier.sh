@@ -79,7 +79,7 @@ for port in "${ports[@]}"; do
   identity="$(curl -fsS --max-time 10 -H 'content-type: application/json' \
     --data "$(jq -nc --arg tag "$copied_tag" \
       '{jsonrpc:"2.0",id:1,method:"eth_getBlockByNumber",params:[$tag,false]}')" \
-    "http://127.0.0.1:$port" | jq -ec '.result|[.number,.hash,.stateRoot,.receiptsRoot,.transactionsRoot]|join(":")')"
+    "http://127.0.0.1:$port" | jq -er '.result|[.number,.hash,.stateRoot,.receiptsRoot,.transactionsRoot]|join(":")')"
   test "$(cut -d: -f1 <<<"$identity")" = "$copied_tag"
   test "$(cut -d: -f2 <<<"$identity")" = "$expected_copied_hash"
   test -z "$copied_identity" && copied_identity="$identity"

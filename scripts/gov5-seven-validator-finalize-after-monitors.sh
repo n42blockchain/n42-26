@@ -53,15 +53,34 @@ done
 test -f "$upstream_complete" || \
   fail 'Gov5 upstream guardian completed without PASS artifact'
 
-# Give all endpoints a small finalized margin, then align 71-block ranges to
-# each Rust validator's known slot phase (0: 99958; 6: 99950).
+# Give all endpoints a small finalized margin, then discover each Rust
+# validator's current seven-slot phase from the canonical chain.  Do not carry
+# a height anchor across runtimes: an epoch schedule transition can preserve
+# the validator order while changing the height/view offset.
 head_hex="$(curl -fsS --max-time 10 -H 'content-type: application/json' \
   --data '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}' \
   http://127.0.0.1:29545 | jq -er '.result')"
 head=$((head_hex))
 target=$((head - 80))
-rust0_start=$((99958 + ((target - 99958) / 7) * 7))
-rust6_start=$((99950 + ((target - 99950) / 7) * 7))
+find_leader_start() {
+  local miner="${1:?miner required}" candidate tag observed
+  for candidate in $(seq "$target" -1 "$((target - 6))"); do
+    tag="$(printf '0x%x' "$candidate")"
+    observed="$(curl -fsS --max-time 10 -H 'content-type: application/json' \
+      --data "$(jq -nc --arg tag "$tag" \
+        '{jsonrpc:"2.0",id:1,method:"eth_getBlockByNumber",params:[$tag,false]}')" \
+      http://127.0.0.1:29545 | jq -er '.result.miner | ascii_downcase')"
+    if test "$observed" = "$miner"; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+rust0_start="$(find_leader_start 0x81d4c1f92ddb837cb46f82280d9b491b101fa582)" || \
+  fail 'could not discover Rust0 leader slot in canonical seven-block cycle'
+rust6_start="$(find_leader_start 0x853b2026deebc83fb79ac7d0c48efea595c22578)" || \
+  fail 'could not discover Rust6 leader slot in canonical seven-block cycle'
 rust0_end=$((rust0_start + 70))
 rust6_end=$((rust6_start + 70))
 test "$rust0_end" -lt "$head" || fail 'insufficient final head margin for Rust0 audit'
