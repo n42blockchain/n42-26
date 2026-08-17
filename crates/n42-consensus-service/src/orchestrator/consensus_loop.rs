@@ -724,6 +724,43 @@ impl ConsensusService {
         block_hash: B256,
         commit_qc: QuorumCertificate,
     ) {
+        let candidate_block_number = self
+            .pending_block_data
+            .get(&block_hash)
+            .and_then(|data| Self::execution_parent_and_number(data))
+            .map(|(_, number)| number)
+            .or_else(|| {
+                self.committed_blocks
+                    .iter()
+                    .rev()
+                    .find(|block| block.block_hash == block_hash && !block.payload.is_empty())
+                    .and_then(|block| {
+                        Self::execution_parent_and_number_from_payload(&block.payload)
+                    })
+                    .map(|(_, number)| number)
+            });
+        let already_execution_covered = view < self.execution_validated_head_view
+            || (view == self.execution_validated_head_view
+                && (block_hash == self.head_block_hash
+                    || candidate_block_number
+                        .is_some_and(|number| number <= self.head_block_number)));
+        if already_execution_covered {
+            self.pending_block_data.remove(&block_hash);
+            self.pending_executions.remove(&block_hash);
+            counter!("n42_finalize_already_execution_covered_total").increment(1);
+            info!(
+                target: "n42::cl::consensus_loop",
+                view,
+                %block_hash,
+                candidate_block_number,
+                execution_validated_head_view = self.execution_validated_head_view,
+                execution_validated_head = %self.head_block_hash,
+                execution_validated_head_number = self.head_block_number,
+                "discarded committed finalization already covered by the execution-valid head"
+            );
+            return;
+        }
+
         let engine_handle = match &self.el {
             Some(el) => el.clone(),
             None => {

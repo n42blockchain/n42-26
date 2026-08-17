@@ -806,15 +806,46 @@ impl ConsensusService {
                 && self.execution_validated_head_view != 0
                 && sync_block.block_hash != self.head_block_hash
             {
-                error!(
-                    target: "n42::cl::sync",
-                    view = sync_block.view,
-                    hash = %sync_block.block_hash,
-                    execution_validated_head = %self.head_block_hash,
-                    "refusing conflicting sync block at the execution-validated view"
-                );
-                counter!("n42_sync_blocks_conflict_validated_head_total").increment(1);
-                continue;
+                let sync_block_number = raw_lineage_by_hash
+                    .get(&sync_block.block_hash)
+                    .map(|(_, number)| *number)
+                    .or_else(|| {
+                        Self::execution_parent_and_number_from_payload(&sync_block.payload)
+                            .map(|(_, number)| number)
+                    });
+                if sync_block_number.is_some_and(|number| number <= self.head_block_number) {
+                    if already_committed && let Some(ref changes) = sync_block.validator_changes {
+                        self.recover_committed_block_validator_changes(
+                            sync_block.view,
+                            sync_block.block_hash,
+                            changes.clone(),
+                        );
+                    }
+                    info!(
+                        target: "n42::cl::sync",
+                        view = sync_block.view,
+                        hash = %sync_block.block_hash,
+                        sync_block_number,
+                        execution_validated_head = %self.head_block_hash,
+                        execution_validated_head_number = self.head_block_number,
+                        "discarding same-view sync lineage already covered by the execution-valid head"
+                    );
+                    counter!("n42_sync_same_view_lineage_already_covered_total").increment(1);
+                    imported += 1;
+                    continue;
+                } else {
+                    error!(
+                        target: "n42::cl::sync",
+                        view = sync_block.view,
+                        hash = %sync_block.block_hash,
+                        sync_block_number,
+                        execution_validated_head = %self.head_block_hash,
+                        execution_validated_head_number = self.head_block_number,
+                        "refusing conflicting sync block at the execution-validated view"
+                    );
+                    counter!("n42_sync_blocks_conflict_validated_head_total").increment(1);
+                    continue;
+                }
             }
 
             // (T2b) Hoisted execution-validated-head guard. Never re-import or

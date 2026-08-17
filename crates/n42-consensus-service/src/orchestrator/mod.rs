@@ -6812,6 +6812,40 @@ mod tests {
         assert_eq!(skipped, Some(DebugValue::Counter(1)));
     }
 
+    /// A prepared execution ancestor and its CommitQC child may share the same
+    /// consensus view in recovered lineage. Once the child is the durable
+    /// execution head, a delayed finalize for the lower execution number is
+    /// covered work and must not issue a backward FCU.
+    #[tokio::test]
+    async fn same_view_execution_ancestor_finalize_issues_no_backward_fcu() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let ancestor = B256::repeat_byte(0x41);
+        let head = B256::repeat_byte(0x51);
+        let mock = Arc::new(MockExecutionLayer::new(
+            PayloadStatusEnum::Valid,
+            PayloadStatusEnum::Valid,
+        ));
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
+        orch.el = Some(mock.clone());
+        orch.head_block_hash = head;
+        orch.head_block_number = 10;
+        orch.execution_validated_head_view = 7;
+        orch.pending_block_data.insert(
+            ancestor,
+            test_block_data_at_number(B256::repeat_byte(0x31), ancestor, 7, 9),
+        );
+
+        orch.finalize_committed_block(7, ancestor, QuorumCertificate::genesis())
+            .await;
+
+        assert!(mock.fcu_heads().is_empty());
+        assert!(!orch.pending_block_data.contains_key(&ancestor));
+        assert_eq!(orch.head_block_hash, head);
+        assert_eq!(orch.head_block_number, 10);
+    }
+
     /// T2a: a sync response block outside the requested `[from_view, to_view]`
     /// range is dropped before QC verification and never counted.
     #[tokio::test(flavor = "current_thread")]
