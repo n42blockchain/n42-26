@@ -6565,6 +6565,39 @@ mod tests {
         assert_eq!(mock_el.fcu_heads(), vec![committed_hash]);
     }
 
+    /// A delayed deferred-finalization record can outlive its own successful
+    /// import while later canonical blocks advance the execution-valid head.
+    /// It is then bookkeeping for an ancestor, not work that may issue FCU.
+    #[tokio::test]
+    async fn stale_pending_finalization_covered_by_newer_execution_head_is_discarded() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let parent = B256::repeat_byte(0x31);
+        let committed_hash = B256::repeat_byte(0x44);
+        let newer_hash = B256::repeat_byte(0x66);
+        let raw = test_block_data(parent, committed_hash, 3);
+        let mock_el = Arc::new(MockExecutionLayer::new(
+            PayloadStatusEnum::Valid,
+            PayloadStatusEnum::Valid,
+        ));
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
+        orch.el = Some(mock_el.clone());
+        orch.pending_block_data.insert(committed_hash, raw);
+        orch.store_committed_block(3, committed_hash, QuorumCertificate::genesis(), None);
+        orch.defer_finalization(3, committed_hash, QuorumCertificate::genesis());
+        orch.advance_execution_validated_head(5, newer_hash, "newer canonical test head");
+
+        orch.handle_view_changed(6).await;
+
+        assert!(orch.pending_finalization.is_none());
+        assert!(!orch.sync_in_flight);
+        assert!(!orch.bg_import_hashes.contains(&committed_hash));
+        assert!(orch.import_done_rx.try_recv().is_err());
+        assert!(mock_el.new_payload_hashes().is_empty());
+        assert!(mock_el.fcu_heads().is_empty());
+    }
+
     /// Task 3 fallback: with no retained broadcast the stale finalization
     /// still goes to sync (the pre-existing behavior).
     #[tokio::test]

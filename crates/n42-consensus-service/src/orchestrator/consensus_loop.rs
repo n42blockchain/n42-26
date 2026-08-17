@@ -1168,7 +1168,7 @@ impl ConsensusService {
                     pending_view = pf.view,
                     new_view,
                     hash = %pf.block_hash,
-                    "pending_finalization stale (>2 views behind), clearing and requesting sync"
+                    "pending_finalization stale (>2 views behind), clearing and reconciling execution state"
                 );
                 counter!("n42_pending_finalization_stale_total").increment(1);
                 let stale_view = pf.view;
@@ -1176,51 +1176,74 @@ impl ConsensusService {
                 self.pending_finalization = None;
                 self.pending_block_data.clear();
                 self.pending_executions.clear();
-                // A COMMITTED block whose broadcast we still hold must be
-                // re-driven locally - dropping straight to sync gambled that a
-                // peer retained the only copy of data this node already had
-                // (the committed_blocks ring keeps the raw broadcast exactly
-                // for this). Only a truly data-less stall goes to sync.
-                let local = self
-                    .committed_blocks
-                    .iter()
-                    .rev()
-                    .find(|b| b.block_hash == stale_hash && !b.payload.is_empty())
-                    .map(|b| super::BlockDataBroadcast {
-                        block_hash: b.block_hash,
-                        view: b.view,
-                        payload_json: b.payload.clone(),
-                        timestamp: 0,
-                        execution_output: None,
-                        leader_ready_unix_ms: 0,
-                    });
-                if let Some(broadcast) = local {
-                    let raw = match bincode::serialize(&broadcast) {
-                        Ok(raw) => raw,
-                        Err(error) => {
-                            error!(
-                                target: "n42::cl::consensus_loop",
-                                stale_view,
-                                hash = %stale_hash,
-                                %error,
-                                "failed to rebuild retained committed broadcast; requesting sync"
-                            );
-                            self.initiate_sync(stale_view, new_view);
-                            return;
-                        }
-                    };
-                    counter!("n42_pending_finalization_local_redrive_total").increment(1);
+                // The eager import can finish after Decide defers this block,
+                // and later blocks may advance the durable execution head
+                // before the matching deferred-finalization callback is
+                // observed.  Re-driving that now-canonical ancestor issues a
+                // backwards FCU, which Reth correctly rejects as a deep
+                // reorg.  A strictly newer execution-valid view (or the exact
+                // same view/hash) already proves this finalization is covered;
+                // consume the stale bookkeeping without importing or syncing.
+                let already_execution_validated = stale_view < self.execution_validated_head_view
+                    || (stale_view == self.execution_validated_head_view
+                        && stale_hash == self.head_block_hash);
+                if already_execution_validated {
+                    counter!("n42_pending_finalization_already_validated_total").increment(1);
                     info!(
                         target: "n42::cl::consensus_loop",
                         stale_view,
-                        new_view,
                         hash = %stale_hash,
-                        "stale pending_finalization re-driven from the retained committed broadcast"
+                        execution_validated_head_view = self.execution_validated_head_view,
+                        execution_validated_head = %self.head_block_hash,
+                        "discarded stale pending_finalization already covered by the execution-valid head"
                     );
-                    self.enqueue_bg_import(raw, stale_hash, stale_view);
                 } else {
-                    // Trigger sync to recover the missing block
-                    self.initiate_sync(stale_view, new_view);
+                    // A COMMITTED block whose broadcast we still hold must be
+                    // re-driven locally - dropping straight to sync gambled that a
+                    // peer retained the only copy of data this node already had
+                    // (the committed_blocks ring keeps the raw broadcast exactly
+                    // for this). Only a truly data-less stall goes to sync.
+                    let local = self
+                        .committed_blocks
+                        .iter()
+                        .rev()
+                        .find(|b| b.block_hash == stale_hash && !b.payload.is_empty())
+                        .map(|b| super::BlockDataBroadcast {
+                            block_hash: b.block_hash,
+                            view: b.view,
+                            payload_json: b.payload.clone(),
+                            timestamp: 0,
+                            execution_output: None,
+                            leader_ready_unix_ms: 0,
+                        });
+                    if let Some(broadcast) = local {
+                        let raw = match bincode::serialize(&broadcast) {
+                            Ok(raw) => raw,
+                            Err(error) => {
+                                error!(
+                                    target: "n42::cl::consensus_loop",
+                                    stale_view,
+                                    hash = %stale_hash,
+                                    %error,
+                                    "failed to rebuild retained committed broadcast; requesting sync"
+                                );
+                                self.initiate_sync(stale_view, new_view);
+                                return;
+                            }
+                        };
+                        counter!("n42_pending_finalization_local_redrive_total").increment(1);
+                        info!(
+                            target: "n42::cl::consensus_loop",
+                            stale_view,
+                            new_view,
+                            hash = %stale_hash,
+                            "stale pending_finalization re-driven from the retained committed broadcast"
+                        );
+                        self.enqueue_bg_import(raw, stale_hash, stale_view);
+                    } else {
+                        // Trigger sync to recover the missing block
+                        self.initiate_sync(stale_view, new_view);
+                    }
                 }
             }
         }
