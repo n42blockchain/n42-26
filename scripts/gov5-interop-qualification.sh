@@ -1047,9 +1047,11 @@ audit_rust_resources() {
       (.fileDescriptors|type) == "number" and
         .fileDescriptors > 0 and .fileDescriptors <= 256 and
       (.rethDataKiB|type) == "number" and .rethDataKiB > 0 and
+        .rethDataKiB <= 16777216 and
       (.consensusDataKiB|type) == "number" and .consensusDataKiB > 0 and
-      (.logBytes|type) == "number" and
-      (.qmdbWalBytes|type) == "number") and
+        .consensusDataKiB <= 1048576 and
+      (.logBytes|type) == "number" and .logBytes <= 2147483648 and
+      (.qmdbWalBytes|type) == "number" and .qmdbWalBytes <= 536870912) and
     ([.[].pid] | unique | length) == 1 and
     ([.[].at | fromdateiso8601] as $times |
       ($times[-1] - $times[0]) >= $minimum_elapsed and
@@ -1091,6 +1093,8 @@ audit_rust_resources() {
         consensusDataKiB:($samples[-1].consensusDataKiB-$samples[0].consensusDataKiB),
         logBytes:($samples[-1].logBytes-$samples[0].logBytes),
         qmdbWalBytes:($samples[-1].qmdbWalBytes-$samples[0].qmdbWalBytes)},
+      limits:{rethDataKiB:16777216,consensusDataKiB:1048576,
+        logBytes:2147483648,qmdbWalBytes:536870912},
       allocatedStorageStepDecreaseKiB:{
         maximumObserved:([range(1;$samples|length) as $i |
           ([($samples[$i-1].rethDataKiB-$samples[$i].rethDataKiB),
