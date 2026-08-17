@@ -20,6 +20,9 @@ upstream="${N42_FINAL_UPSTREAM:-$evidence_dir/runtime42-gov5-upstream-24h.jsonl}
 upstream_complete="${N42_FINAL_UPSTREAM_COMPLETE:-${upstream%.jsonl}-complete.json}"
 rust0_resources="${N42_FINAL_RUST0_RESOURCES:-$evidence_dir/runtime42-rust0-resource-24h.jsonl}"
 rust6_resources="${N42_FINAL_RUST6_RESOURCES:-$evidence_dir/runtime42-rust6-resource-24h.jsonl}"
+milestone_prefix="${N42_FINAL_MILESTONE_PREFIX:-${heads%-heads.jsonl}-milestone}"
+milestone_failure="${N42_FINAL_MILESTONE_FAILURE:-${milestone_prefix}-failure.json}"
+milestone_seconds="${N42_FINAL_MILESTONE_SECONDS:-3600 21600 43200 64800}"
 execution_audit="${N42_FINAL_EXECUTION_AUDIT:?final seven-endpoint EVM execution audit is required}"
 recovery_audit="${N42_FINAL_RECOVERY_AUDIT:?Rust restart catch-up audit is required}"
 rust0_leaders="${N42_FINAL_RUST0_LEADERS:?final Rust0 leader audit is required}"
@@ -51,6 +54,7 @@ require_file "$execution_audit"
 require_file "$recovery_audit"
 require_file "$rust0_leaders"
 require_file "$rust6_leaders"
+test ! -e "$milestone_failure"
 test ! -e "$output"
 test "$(sha256 "$runtime/geth-live")" = "$expected_gov_binary"
 test "$(sha256 "$runtime/n42-node")" = "$expected_rust_binary"
@@ -187,6 +191,34 @@ for leader_file in "$rust0_leaders" "$rust6_leaders"; do
     .parentChainContinuous and .expectedLeaderSlotsExact and .allConfiguredEndpointsExact and
     (.ports | length == 7)' "$leader_file" >/dev/null
 done
+milestone_audits='[]'
+for milestone in $milestone_seconds; do
+  milestone_file="${milestone_prefix}-${milestone}s.json"
+  require_file "$milestone_file"
+  milestone_audit="$(jq -ec --argjson milestone "$milestone" --argjson maximum_lag "$maximum_lag" '
+    select(
+      .event == "gov5_seven_validator_milestone_audit" and .status == "PASS" and
+      .milestoneSeconds == $milestone and
+      .head.status == "PASS" and .head.elapsedSeconds >= $milestone and
+      .head.maximumLag <= $maximum_lag and .head.zeroTransactionRequired == true and
+      .rust0Resource.status == "PASS" and .rust0Resource.elapsedSeconds >= $milestone and
+      .rust0Resource.singleProcess and .rust0Resource.logicalCountersMonotonic and
+      .rust6Resource.status == "PASS" and .rust6Resource.elapsedSeconds >= $milestone and
+      .rust6Resource.singleProcess and .rust6Resource.logicalCountersMonotonic and
+      .rust0Log.status == "PASS" and .rust0Log.warningPartitionExact and
+      .rust0Log.unexpectedWarnings == 0 and .rust0Log.criticalSignals == 0 and
+      .rust6Log.status == "PASS" and .rust6Log.warningPartitionExact and
+      .rust6Log.unexpectedWarnings == 0 and .rust6Log.criticalSignals == 0 and
+      .gov5Upstream.allExact and .gov5Upstream.elapsedSeconds >= $milestone and
+      (.gov5Upstream.remoteMains | length) == 1 and
+      (.consensus | length) == 2 and all(.consensus[];
+        .validatorCount == 7 and .hasCommittedQc == true) and
+      (.equivocations | length) == 2 and all(.equivocations[]; .total == 0)
+    )
+  ' "$milestone_file")"
+  milestone_audits="$(jq -nc --argjson audits "$milestone_audits" \
+    --argjson audit "$milestone_audit" '$audits + [$audit]')"
+done
 for log in "$runtime"/logs/gov{1,2,3,4,5}.log "$runtime"/logs/rust.log "$runtime"/logs/rust2.log; do
   require_file "$log"
   # Do not use a global case-insensitive `error` match: the consensus transport
@@ -221,6 +253,7 @@ jq -nc --arg at "$(date -u +%FT%TZ)" --arg runtime "$runtime" \
   --argjson rust6_audit "$rust6_audit" \
   --argjson rust0_log_audit "$rust0_log_audit" \
   --argjson rust6_log_audit "$rust6_log_audit" \
+  --argjson milestone_audits "$milestone_audits" \
   --slurpfile execution_audit "$execution_audit" \
   --slurpfile recovery_audit "$recovery_audit" \
   '{at:$at,event:"gov5_seven_validator_final_verification",status:"PASS",
@@ -238,6 +271,7 @@ jq -nc --arg at "$(date -u +%FT%TZ)" --arg runtime "$runtime" \
     sevenEndpointEvmExecutionExact:true,executionAudit:$execution_audit[0],
     rustRestartCatchupExact:true,recoveryAudit:$recovery_audit[0],
     headAudit:$head_audit,rust0ResourceAudit:$rust0_audit,rust6ResourceAudit:$rust6_audit,
+    milestoneAudits:$milestone_audits,
     rust0FormalLogAudit:$rust0_log_audit,rust6FormalLogAudit:$rust6_log_audit,
     bothRustLeaderAuditsExact:true,criticalLogs:0}' >"$output"
 cat "$output"
