@@ -18,8 +18,17 @@ preflight_only="${N42_POST_PREFLIGHT_ONLY:-0}"
 fail() {
   jq -nc --arg at "$(date -u +%FT%TZ)" --arg reason "$1" \
     '{at:$at,event:"gov5_post_soak_execution_finalizer",status:"FAIL",reason:$reason}' \
-    >"$failure"
+    >"$failure.pending"
+  mv "$failure.pending" "$failure"
   exit 1
+}
+
+rpc() {
+  local port="${1:?port required}" method="${2:?method required}"
+  curl -fsS --max-time 10 -H 'content-type: application/json' \
+    --data "$(jq -nc --arg method "$method" \
+      '{jsonrpc:"2.0",id:1,method:$method,params:[]}')" \
+    "http://127.0.0.1:$port"
 }
 
 test -x "$qualification" || fail "missing executable: $qualification"
@@ -39,11 +48,20 @@ done
 jq -e '
   .event == "gov5_seven_validator_final_verification" and .status == "PASS" and
   .headAudit.elapsedSeconds >= 86400 and .headAudit.maximumLag <= 6 and
+  (.milestoneAudits | length) == 4 and
+  [.milestoneAudits[].milestoneSeconds] == [3600,21600,43200,64800] and
+  all(.milestoneAudits[]; .status == "PASS") and
   .liveCommonHeightIdentityExact and .bothRustLeaderAuditsExact and
   .sevenEndpointEvmExecutionExact and .rustRestartCatchupExact and
+  .rust0ResourceAudit.status == "PASS" and .rust6ResourceAudit.status == "PASS" and
   .rust0FormalLogAudit.unexpectedWarnings == 0 and
-  .rust6FormalLogAudit.unexpectedWarnings == 0
+  .rust6FormalLogAudit.unexpectedWarnings == 0 and
+  .rust0FormalLogAudit.criticalSignals == 0 and
+  .rust6FormalLogAudit.criticalSignals == 0 and .equivocations == 0
 ' "$formal" >/dev/null || fail 'formal 24h verification artifact is not a complete PASS'
+
+jq -e '.transactions | length == 17' "$artifact" >/dev/null || \
+  fail 'transaction artifact does not contain exactly 17 transactions'
 
 if test "$preflight_only" = 1; then
   env N42_QUAL_RUNTIME="$runtime" N42_QUAL_PORTS="$ports" \
@@ -94,6 +112,25 @@ printf '%s\n' "$post_audit" | jq -e '
   .maximumLag <= 6
 ' >/dev/null || fail 'post-transaction head audit did not satisfy thresholds'
 
+post_consensus='[]'
+post_equivocations='[]'
+for port in 29545 29546; do
+  consensus="$(rpc "$port" n42_consensusStatus | jq -ec --argjson port "$port" '
+    {port:$port,view:.result.latestCommittedView,
+     hash:.result.latestCommittedBlockHash,
+     validatorCount:.result.validatorCount,hasCommittedQc:.result.hasCommittedQc} |
+    select(.validatorCount == 7 and .hasCommittedQc == true)
+  ')" || fail "invalid post-transaction consensus status at port $port"
+  equivocation="$(rpc "$port" n42_equivocations | jq -ec --argjson port "$port" '
+    {port:$port,total:.result.total,evidenceCount:(.result.evidence | length)} |
+    select(.total == 0 and .evidenceCount == 0)
+  ')" || fail "post-transaction equivocation evidence at port $port"
+  post_consensus="$(jq -nc --argjson current "$post_consensus" \
+    --argjson item "$consensus" '$current + [$item]')"
+  post_equivocations="$(jq -nc --argjson current "$post_equivocations" \
+    --argjson item "$equivocation" '$current + [$item]')"
+done
+
 for log in "$runtime"/logs/gov{1,2,3,4,5}.log "$runtime"/logs/rust.log "$runtime"/logs/rust2.log; do
   ! awk -v start="${transaction_started_at%Z}" '
     substr($0,1,19) >= start &&
@@ -112,7 +149,9 @@ jq -nc \
   --arg burst "$burst" --arg burst_sha256 "$(shasum -a 256 "$burst" | awk '{print $1}')" \
   --arg heads "$heads" --arg heads_sha256 "$(shasum -a 256 "$heads" | awk '{print $1}')" \
   --argjson formal_verification "$(<"$formal")" \
-  --argjson burst_pass "$burst_pass" --argjson post_audit "$post_audit" '
+  --argjson burst_pass "$burst_pass" --argjson post_audit "$post_audit" \
+  --argjson post_consensus "$post_consensus" \
+  --argjson post_equivocations "$post_equivocations" '
   {at:$at,event:"gov5_seven_validator_total_final_verification",status:"PASS",
    transactionStartedAt:$transaction_started_at,
    topology:{gov5:5,rust:2,validators:7},
@@ -121,6 +160,8 @@ jq -nc \
      signedTransactions:17,alternatingGoRustIngress:true,allSevenEndpointsExact:true,
      receiptsLogsStateAndStorageExact:true},
    postTransactionConvergence:{artifact:$heads,sha256:$heads_sha256,audit:$post_audit},
+   postTransactionConsensus:{rust:$post_consensus,equivocations:$post_equivocations,
+     validatorCount:7,committedQc:true,equivocationCount:0},
    criticalSignalsAfterTransactions:0}' >"$output.pending"
 mv "$output.pending" "$output"
 cat "$output"
