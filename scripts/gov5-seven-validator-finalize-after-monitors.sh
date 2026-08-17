@@ -147,13 +147,17 @@ rust6_end="$last_height"
 current_stage='audit_rust0_leaders'
 env N42_QUAL_RUNTIME="$runtime" N42_QUAL_PORTS="$ports" \
   N42_QUAL_RUST_PORT=29545 N42_QUAL_RUST_MINER=0x81d4c1f92ddb837cb46f82280d9b491b101fa582 \
-  N42_QUAL_RUST_LEADER_STRIDE=7 "$qualification" audit-rust-leaders \
+  N42_QUAL_RUST_LEADER_STRIDE=7 N42_QUAL_RUST_VIEW_STRIDE=7 \
+  N42_QUAL_RUST_LOG="$runtime/logs/rust.log" \
+  "$qualification" audit-rust-leaders \
   "$rust0_start" "$rust0_end" "$rust0_leaders.pending" >/dev/null
 mv "$rust0_leaders.pending" "$rust0_leaders"
 current_stage='audit_rust6_leaders'
 env N42_QUAL_RUNTIME="$runtime" N42_QUAL_PORTS="$ports" \
   N42_QUAL_RUST_PORT=29546 N42_QUAL_RUST_MINER=0x853b2026deebc83fb79ac7d0c48efea595c22578 \
-  N42_QUAL_RUST_LEADER_STRIDE=7 "$qualification" audit-rust-leaders \
+  N42_QUAL_RUST_LEADER_STRIDE=7 N42_QUAL_RUST_VIEW_STRIDE=7 \
+  N42_QUAL_RUST_LOG="$runtime/logs/rust2.log" \
+  "$qualification" audit-rust-leaders \
   "$rust6_start" "$rust6_end" "$rust6_leaders.pending" >/dev/null
 mv "$rust6_leaders.pending" "$rust6_leaders"
 
