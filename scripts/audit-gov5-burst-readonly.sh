@@ -4,7 +4,7 @@ set -euo pipefail
 runtime="${1:?usage: $0 RUNTIME OUTPUT}"
 output="${2:?usage: $0 RUNTIME OUTPUT}"
 artifact="$runtime/artifacts/p4-signed-transaction-burst.json"
-ports=(28501 28502 28503 28504 28505 29545)
+ports=(28501 28502 28503 28504 28505 29545 29546)
 expected_sender=0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266
 expected_recipient=0x000000000000000000000000000000000000dead
 
@@ -93,10 +93,15 @@ for port in "${ports[@]}"; do
 done
 
 jq -e -s '
-  length==6 and all(.[];
+  length==7 and all(.[];
     .latestNonce=="0x11" and .pendingNonce=="0x11" and
     .contractDeploy.callResult=="0x" and .valueTransfer.callResult=="0x") and
-  ([.[].valueTransfer.estimatedGas]|unique)==["0x5208"]
+  ([.[].valueTransfer.estimatedGas]|unique)==["0x5208"] and
+  ([.[] | {latestNonce,pendingNonce,
+      contractDeployResult:.contractDeploy.callResult,
+      valueTransferResult:.valueTransfer.callResult,
+      valueTransferEstimatedGas:.valueTransfer.estimatedGas}] |
+    unique | length)==1
 ' "$rpc_rows" >/dev/null
 
 temporary="$(mktemp "$(dirname "$output")/.burst-readonly.XXXXXX")"
@@ -114,14 +119,18 @@ jq -nc --arg at "$(date -u +%FT%TZ)" --arg artifact "$artifact" \
      gov:([$decoded[]|select(.intendedIngress=="gov")]|length)},
    allSignaturesRecoverExpectedSender:true,allRawHashesExact:true,
    allNoncesContiguous:true,allChainIdsExact:true,rpcEndpoints:$rpc,
-   allEndpointNoncesExact:true,allCallsSucceeded:true,allEstimatesWithinSignedGas:true}' \
+   allEndpointNoncesExact:true,allEndpointExecutionResultsExact:true,
+   deploymentEstimateGasVariants:([$rpc[].contractDeploy.estimatedGas]|unique),
+   allCallsSucceeded:true,allEstimatesWithinSignedGas:true}' \
   >"$temporary"
 jq -e '
   .status=="PASS" and .mutationPerformed==false and .transactionsSent==0 and
   .transactionsDecoded==17 and .firstNonce=="0x11" and .lastNonce=="0x21" and
   .intendedIngressCounts=={rust:9,gov:8} and .allSignaturesRecoverExpectedSender and
   .allRawHashesExact and .allNoncesContiguous and .allChainIdsExact and
-  .allEndpointNoncesExact and .allCallsSucceeded and .allEstimatesWithinSignedGas
+  (.rpcEndpoints|length)==7 and .allEndpointNoncesExact and
+  .allEndpointExecutionResultsExact and .allCallsSucceeded and
+  .allEstimatesWithinSignedGas
 ' "$temporary" >/dev/null
 mv "$temporary" "$output"
 cat "$output"

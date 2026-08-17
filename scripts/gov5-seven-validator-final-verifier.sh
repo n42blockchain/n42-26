@@ -20,6 +20,7 @@ upstream="${N42_FINAL_UPSTREAM:-$evidence_dir/runtime42-gov5-upstream-24h.jsonl}
 upstream_complete="${N42_FINAL_UPSTREAM_COMPLETE:-${upstream%.jsonl}-complete.json}"
 rust0_resources="${N42_FINAL_RUST0_RESOURCES:-$evidence_dir/runtime42-rust0-resource-24h.jsonl}"
 rust6_resources="${N42_FINAL_RUST6_RESOURCES:-$evidence_dir/runtime42-rust6-resource-24h.jsonl}"
+execution_audit="${N42_FINAL_EXECUTION_AUDIT:?final seven-endpoint EVM execution audit is required}"
 rust0_leaders="${N42_FINAL_RUST0_LEADERS:?final Rust0 leader audit is required}"
 rust6_leaders="${N42_FINAL_RUST6_LEADERS:?final Rust6 leader audit is required}"
 ports=(28501 28502 28503 28504 28505 29545 29546)
@@ -45,6 +46,7 @@ require_file "$upstream"
 require_file "$upstream_complete"
 require_file "$rust0_resources"
 require_file "$rust6_resources"
+require_file "$execution_audit"
 require_file "$rust0_leaders"
 require_file "$rust6_leaders"
 test ! -e "$output"
@@ -61,6 +63,16 @@ jq -s -e --arg expected "$expected_gov_main" '
   length >= 2 and all(.[]; .baselineExact == true and .remoteReachable == true and
     .remoteMain == $expected and .baseline == $expected)
 ' "$upstream" >/dev/null
+jq -e '
+  .event == "gov5_burst_readonly_audit" and .status == "PASS" and
+  .mutationPerformed == false and .transactionsSent == 0 and
+  .transactionsDecoded == 17 and .intendedIngressCounts == {rust:9,gov:8} and
+  .allSignaturesRecoverExpectedSender and .allRawHashesExact and
+  .allNoncesContiguous and .allChainIdsExact and
+  .allEndpointNoncesExact and .allEndpointExecutionResultsExact and
+  .allCallsSucceeded and .allEstimatesWithinSignedGas and
+  ([.rpcEndpoints[].port] | sort) == [28501,28502,28503,28504,28505,29545,29546]
+' "$execution_audit" >/dev/null
 
 for pid_file in "$runtime"/pids/gov{1,2,3,4,5}.pid "$runtime/pids/rust.pid" "$runtime/pids/rust2.pid"; do
   require_file "$pid_file"
@@ -153,6 +165,7 @@ jq -nc --arg at "$(date -u +%FT%TZ)" --arg runtime "$runtime" \
   --argjson latest_lag "$((latest_max - latest_min))" --argjson maximum_lag "$maximum_lag" \
   --argjson head_audit "$head_audit" --argjson rust0_audit "$rust0_audit" \
   --argjson rust6_audit "$rust6_audit" \
+  --slurpfile execution_audit "$execution_audit" \
   '{at:$at,event:"gov5_seven_validator_final_verification",status:"PASS",
     runtime:$runtime,govMain:$gov_main,genesis:$genesis,ports:[28501,28502,28503,28504,28505,29545,29546],
     reused905Data:{copiedPersistedHead:$copied_head,copiedPersistedHash:$copied_hash,
@@ -160,6 +173,7 @@ jq -nc --arg at "$(date -u +%FT%TZ)" --arg runtime "$runtime" \
     liveCommonHeightIdentityExact:true,commonHeight:$common_height,commonIdentity:$common_identity,
     latestLag:$latest_lag,maximumLagBound:$maximum_lag,
     validatorCount:7,rustValidators:2,committedQc:true,equivocations:0,
+    sevenEndpointEvmExecutionExact:true,executionAudit:$execution_audit[0],
     headAudit:$head_audit,rust0ResourceAudit:$rust0_audit,rust6ResourceAudit:$rust6_audit,
     bothRustLeaderAuditsExact:true,criticalLogs:0}' >"$output"
 cat "$output"
