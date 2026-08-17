@@ -109,19 +109,18 @@ for evidence in "$heads" "$rust0_resources" "$rust6_resources"; do
     fail "monitor evidence is shorter than the qualification window: $evidence"
 done
 
-# Give all endpoints a small finalized margin, then discover each Rust
-# validator's current seven-slot phase from the canonical chain.  Do not carry
-# a height anchor across runtimes: an epoch schedule transition can preserve
-# the validator order while changing the height/view offset.
+# Discover each Rust validator's first seven-slot phase inside the formal
+# evidence window, then audit every block through the window's final common
+# height.  A short tail range only proves the endpoint state at shutdown; the
+# full range proves that both Rust validators continuously occupied their
+# expected leader slots throughout the entire soak.
 current_stage='discover_final_leader_ranges'
-head_hex="$(curl -fsS --max-time 10 -H 'content-type: application/json' \
-  --data '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}' \
-  http://127.0.0.1:29545 | jq -er '.result')"
-head=$((head_hex))
-target=$((head - 80))
+first_height="$(jq -sr '.[0].commonHeight' "$heads")"
+last_height="$(jq -sr '.[-1].commonHeight' "$heads")"
+test "$last_height" -gt "$first_height" || fail 'formal head evidence did not grow'
 find_leader_start() {
   local miner="${1:?miner required}" candidate tag observed
-  for candidate in $(seq "$target" -1 "$((target - 6))"); do
+  for candidate in $(seq "$first_height" "$((first_height + 6))"); do
     tag="$(printf '0x%x' "$candidate")"
     observed="$(curl -fsS --max-time 10 -H 'content-type: application/json' \
       --data "$(jq -nc --arg tag "$tag" \
@@ -138,10 +137,8 @@ rust0_start="$(find_leader_start 0x81d4c1f92ddb837cb46f82280d9b491b101fa582)" ||
   fail 'could not discover Rust0 leader slot in canonical seven-block cycle'
 rust6_start="$(find_leader_start 0x853b2026deebc83fb79ac7d0c48efea595c22578)" || \
   fail 'could not discover Rust6 leader slot in canonical seven-block cycle'
-rust0_end=$((rust0_start + 70))
-rust6_end=$((rust6_start + 70))
-test "$rust0_end" -lt "$head" || fail 'insufficient final head margin for Rust0 audit'
-test "$rust6_end" -lt "$head" || fail 'insufficient final head margin for Rust6 audit'
+rust0_end="$last_height"
+rust6_end="$last_height"
 
 current_stage='audit_rust0_leaders'
 env N42_QUAL_RUNTIME="$runtime" N42_QUAL_PORTS="$ports" \

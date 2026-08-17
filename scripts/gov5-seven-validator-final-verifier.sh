@@ -187,9 +187,17 @@ for log_audit in "$rust0_log_audit" "$rust6_log_audit"; do
   ' >/dev/null
 done
 for leader_file in "$rust0_leaders" "$rust6_leaders"; do
-  jq -e '.status == "PASS" and .leaderStride == 7 and .rustAuthoredBlocks > 0 and
+  jq -e --argjson first_height "$first_height" --argjson last_height "$last_height" '
+    .status == "PASS" and .leaderStride == 7 and .rustAuthoredBlocks > 0 and
+    .startHeight >= $first_height and .startHeight <= ($first_height + 6) and
+    .endHeight == $last_height and
+    .blocksScanned == (.endHeight - .startHeight + 1) and
+    .rustAuthoredBlocks == (((.endHeight - .startHeight) / .leaderStride | floor) + 1) and
     .parentChainContinuous and .expectedLeaderSlotsExact and .allConfiguredEndpointsExact and
-    (.ports | length == 7)' "$leader_file" >/dev/null
+    (.ports | length == 7) and
+    .leaderCommitLog.allVotesFivePlusFive and .leaderCommitLog.viewStrideExact and
+    .leaderCommitLog.hashOrderExact
+  ' "$leader_file" >/dev/null
 done
 milestone_audits='[]'
 for milestone in $milestone_seconds; do
