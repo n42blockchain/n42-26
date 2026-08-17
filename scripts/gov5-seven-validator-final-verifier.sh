@@ -126,6 +126,29 @@ for port in 29545 29546; do
   rpc "$port" n42_equivocations | jq -e '.result.total == 0 and (.result.evidence|length) == 0' >/dev/null
 done
 
+first_height="$(jq -sr '.[0].commonHeight' "$heads")"
+last_height="$(jq -sr '.[-1].commonHeight' "$heads")"
+first_wall="$(jq -sr '.[0].at | fromdateiso8601' "$heads")"
+last_wall="$(jq -sr '.[-1].at | fromdateiso8601' "$heads")"
+block_timestamp() {
+  local height="${1:?height required}" tag
+  tag="$(printf '0x%x' "$height")"
+  timestamp_hex="$(curl -fsS --max-time 10 -H 'content-type: application/json' \
+    --data "$(jq -nc --arg tag "$tag" \
+      '{jsonrpc:"2.0",id:1,method:"eth_getBlockByNumber",params:[$tag,false]}')" \
+    http://127.0.0.1:29545 | jq -er '.result.timestamp')"
+  printf '%s\n' "$((timestamp_hex))"
+}
+first_block_timestamp="$(block_timestamp "$first_height")"
+last_block_timestamp="$(block_timestamp "$last_height")"
+clock_block_growth=$((last_height - first_height))
+clock_timestamp_growth=$((last_block_timestamp - first_block_timestamp))
+test "$clock_block_growth" -gt 0
+test "$clock_timestamp_growth" -ge "$clock_block_growth"
+test "$clock_timestamp_growth" -le "$((clock_block_growth * 4))"
+first_future_seconds=$((first_block_timestamp - first_wall))
+last_future_seconds=$((last_block_timestamp - last_wall))
+
 head_audit="$(env N42_QUAL_RUNTIME="$runtime" N42_QUAL_PORTS="${ports[*]}" \
   "$qualification" audit-soak "$heads" 86400 "$maximum_sample_gap" "$maximum_lag" 1)"
 rust0_audit="$(env N42_QUAL_RUNTIME="$runtime" "$qualification" audit-rust-resources "$rust0_resources" 86400)"
@@ -177,6 +200,12 @@ jq -nc --arg at "$(date -u +%FT%TZ)" --arg runtime "$runtime" \
   --arg copied_identity "$copied_identity" \
   --arg common_height "$common_tag" --arg common_identity "$common_identity" \
   --argjson latest_lag "$((latest_max - latest_min))" --argjson maximum_lag "$maximum_lag" \
+  --argjson first_height "$first_height" --argjson last_height "$last_height" \
+  --argjson first_block_timestamp "$first_block_timestamp" \
+  --argjson last_block_timestamp "$last_block_timestamp" \
+  --argjson first_future_seconds "$first_future_seconds" \
+  --argjson last_future_seconds "$last_future_seconds" \
+  --argjson clock_timestamp_growth "$clock_timestamp_growth" \
   --argjson head_audit "$head_audit" --argjson rust0_audit "$rust0_audit" \
   --argjson rust6_audit "$rust6_audit" \
   --argjson rust0_log_audit "$rust0_log_audit" \
@@ -188,6 +217,11 @@ jq -nc --arg at "$(date -u +%FT%TZ)" --arg runtime "$runtime" \
       allConfiguredEndpointsExact:true,identity:$copied_identity},
     liveCommonHeightIdentityExact:true,commonHeight:$common_height,commonIdentity:$common_identity,
     latestLag:$latest_lag,maximumLagBound:$maximum_lag,
+    clockAudit:{firstHeight:$first_height,lastHeight:$last_height,
+      firstBlockTimestamp:$first_block_timestamp,lastBlockTimestamp:$last_block_timestamp,
+      timestampGrowth:$clock_timestamp_growth,minimumSecondsPerBlock:1,maximumSecondsPerBlock:4,
+      firstFutureSeconds:$first_future_seconds,lastFutureSeconds:$last_future_seconds,
+      protocolTimestampCadenceValid:true},
     validatorCount:7,rustValidators:2,committedQc:true,equivocations:0,
     sevenEndpointEvmExecutionExact:true,executionAudit:$execution_audit[0],
     headAudit:$head_audit,rust0ResourceAudit:$rust0_audit,rust6ResourceAudit:$rust6_audit,
