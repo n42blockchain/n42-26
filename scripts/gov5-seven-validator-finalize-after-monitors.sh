@@ -28,6 +28,7 @@ output="${N42_FINAL_OUTPUT:-$evidence_dir/runtime42-seven-validator-final-verifi
 rust0_leaders="${N42_FINAL_RUST0_LEADERS:-$evidence_dir/runtime42-rust0-final-leader-range.json}"
 rust6_leaders="${N42_FINAL_RUST6_LEADERS:-$evidence_dir/runtime42-rust6-final-leader-range.json}"
 ports='28501 28502 28503 28504 28505 29545 29546'
+minimum_duration="${N42_FINAL_MINIMUM_DURATION_SECONDS:-86400}"
 
 fail() {
   jq -nc --arg at "$(date -u +%FT%TZ)" --arg reason "$1" \
@@ -35,6 +36,16 @@ fail() {
   exit 1
 }
 alive() { kill -0 "$1" 2>/dev/null; }
+evidence_elapsed() {
+  local evidence="${1:?evidence required}"
+  if ! test -f "$evidence"; then
+    printf '0\n'
+    return
+  fi
+  jq -sr 'if length < 2 then 0 else
+    ((.[-1].at | fromdateiso8601) - (.[0].at | fromdateiso8601)) end' \
+    "$evidence"
+}
 
 test ! -e "$output"
 test ! -e "$failure"
@@ -47,11 +58,27 @@ while alive "$head_monitor_pid" || alive "$upstream_monitor_pid" || \
   if ! alive "$upstream_monitor_pid" && ! test -f "$upstream_complete"; then
     fail 'Gov5 upstream guardian exited without PASS completion'
   fi
+  if ! alive "$head_monitor_pid" && \
+    test "$(evidence_elapsed "$heads")" -lt "$minimum_duration"; then
+    fail 'head monitor exited before the complete qualification window'
+  fi
+  if ! alive "$rust0_monitor_pid" && \
+    test "$(evidence_elapsed "$rust0_resources")" -lt "$minimum_duration"; then
+    fail 'Rust0 resource monitor exited before the complete qualification window'
+  fi
+  if ! alive "$rust6_monitor_pid" && \
+    test "$(evidence_elapsed "$rust6_resources")" -lt "$minimum_duration"; then
+    fail 'Rust6 resource monitor exited before the complete qualification window'
+  fi
   sleep 60
 done
 
 test -f "$upstream_complete" || \
   fail 'Gov5 upstream guardian completed without PASS artifact'
+for evidence in "$heads" "$rust0_resources" "$rust6_resources"; do
+  test "$(evidence_elapsed "$evidence")" -ge "$minimum_duration" || \
+    fail "monitor evidence is shorter than the qualification window: $evidence"
+done
 
 # Give all endpoints a small finalized margin, then discover each Rust
 # validator's current seven-slot phase from the canonical chain.  Do not carry
