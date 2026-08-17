@@ -23,6 +23,7 @@ rust6_resources="${N42_FINAL_RUST6_RESOURCES:-$evidence_dir/runtime42-rust6-reso
 milestone_prefix="${N42_FINAL_MILESTONE_PREFIX:-${heads%-heads.jsonl}-milestone}"
 milestone_failure="${N42_FINAL_MILESTONE_FAILURE:-${milestone_prefix}-failure.json}"
 milestone_seconds="${N42_FINAL_MILESTONE_SECONDS:-3600 21600 43200 64800}"
+transaction_artifact="${N42_FINAL_TRANSACTION_ARTIFACT:-$runtime/artifacts/p4-signed-transaction-burst.json}"
 execution_audit="${N42_FINAL_EXECUTION_AUDIT:?final seven-endpoint EVM execution audit is required}"
 recovery_audit="${N42_FINAL_RECOVERY_AUDIT:?Rust restart catch-up audit is required}"
 rust0_leaders="${N42_FINAL_RUST0_LEADERS:?final Rust0 leader audit is required}"
@@ -50,6 +51,7 @@ require_file "$upstream"
 require_file "$upstream_complete"
 require_file "$rust0_resources"
 require_file "$rust6_resources"
+require_file "$transaction_artifact"
 require_file "$execution_audit"
 require_file "$recovery_audit"
 require_file "$rust0_leaders"
@@ -69,8 +71,9 @@ jq -s -e --arg expected "$expected_gov_main" '
   length >= 2 and all(.[]; .baselineExact == true and .remoteReachable == true and
     .remoteMain == $expected and .baseline == $expected)
 ' "$upstream" >/dev/null
-jq -e '
+jq -e --arg artifact_sha256 "$(sha256 "$transaction_artifact")" '
   .event == "gov5_burst_readonly_audit" and .status == "PASS" and
+  .artifactSha256 == $artifact_sha256 and
   .mutationPerformed == false and .transactionsSent == 0 and
   .transactionsDecoded == 17 and .intendedIngressCounts == {rust:9,gov:8} and
   .allSignaturesRecoverExpectedSender and .allRawHashesExact and

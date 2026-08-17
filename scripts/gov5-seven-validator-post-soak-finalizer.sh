@@ -53,6 +53,7 @@ current_stage='validate_configuration'
 [[ "$preflight_only" =~ ^[01]$ ]] || fail 'preflight flag must be 0 or 1'
 test -x "$qualification" || fail "missing executable: $qualification"
 test -s "$artifact" || fail "missing transaction artifact: $artifact"
+artifact_sha256="$(shasum -a 256 "$artifact" | awk '{print $1}')"
 test ! -e "$burst" || fail "transaction evidence already exists: $burst"
 test ! -e "$heads" || fail "post-transaction head evidence already exists: $heads"
 test ! -e "$output" || fail "total verification output already exists: $output"
@@ -67,7 +68,7 @@ while ! test -f "$formal"; do
 done
 
 current_stage='validate_formal_verification'
-jq -e '
+jq -e --arg artifact_sha256 "$artifact_sha256" '
   .event == "gov5_seven_validator_final_verification" and .status == "PASS" and
   .headAudit.elapsedSeconds >= 86400 and .headAudit.maximumLag <= 6 and
   (.milestoneAudits | length) == 4 and
@@ -75,6 +76,7 @@ jq -e '
   all(.milestoneAudits[]; .status == "PASS") and
   .liveCommonHeightIdentityExact and .bothRustLeaderAuditsExact and
   .sevenEndpointEvmExecutionExact and .rustRestartCatchupExact and
+  .executionAudit.artifactSha256 == $artifact_sha256 and
   .rust0ResourceAudit.status == "PASS" and .rust6ResourceAudit.status == "PASS" and
   .rust0FormalLogAudit.unexpectedWarnings == 0 and
   .rust6FormalLogAudit.unexpectedWarnings == 0 and
@@ -114,11 +116,12 @@ env N42_QUAL_RUNTIME="$runtime" N42_QUAL_PORTS="$ports" \
   "$qualification" transaction-burst "$artifact" "$burst" >/dev/null || \
   fail 'mixed Go/Rust transaction burst failed'
 
-jq -e -s --slurpfile artifact "$artifact" '
+jq -e -s --slurpfile artifact "$artifact" --arg artifact_sha256 "$artifact_sha256" '
   (map(select(.event == "p4_transaction_finalized"))) as $finalized |
   (map(select(.event == "p4_transaction_burst_pass"))) as $passes |
   ($finalized | length) == ($artifact[0].transactions | length) and
   ($passes | length) == 1 and
+  $passes[0].artifactSha256 == $artifact_sha256 and
   ([range(0; $finalized | length) as $index |
     $finalized[$index].nonce == $artifact[0].transactions[$index].nonce and
     $finalized[$index].kind == $artifact[0].transactions[$index].kind and
@@ -179,6 +182,8 @@ burst_pass="$(jq -sc 'map(select(.event == "p4_transaction_burst_pass"))[0]' "$b
 jq -nc \
   --arg at "$(date -u +%FT%TZ)" \
   --arg transaction_started_at "$transaction_started_at" \
+  --arg transaction_artifact "$artifact" \
+  --arg transaction_artifact_sha256 "$artifact_sha256" \
   --arg formal "$formal" --arg formal_sha256 "$(shasum -a 256 "$formal" | awk '{print $1}')" \
   --arg burst "$burst" --arg burst_sha256 "$(shasum -a 256 "$burst" | awk '{print $1}')" \
   --arg heads "$heads" --arg heads_sha256 "$(shasum -a 256 "$heads" | awk '{print $1}')" \
@@ -191,6 +196,8 @@ jq -nc \
    topology:{gov5:5,rust:2,validators:7},
    formal24h:{artifact:$formal,sha256:$formal_sha256,verification:$formal_verification},
    onChainExecution:{artifact:$burst,sha256:$burst_sha256,pass:$burst_pass,
+     transactionArtifact:$transaction_artifact,
+     transactionArtifactSha256:$transaction_artifact_sha256,
      signedTransactions:17,alternatingGoRustIngress:true,allSevenEndpointsExact:true,
      receiptsLogsStateAndStorageExact:true},
    postTransactionConvergence:{artifact:$heads,sha256:$heads_sha256,audit:$post_audit},
