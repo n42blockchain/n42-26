@@ -82,8 +82,14 @@ jq -e '
   .rust6FormalLogAudit.criticalSignals == 0 and .equivocations == 0
 ' "$formal" >/dev/null || fail 'formal 24h verification artifact is not a complete PASS'
 
-jq -e '.transactions | length == 17' "$artifact" >/dev/null || \
-  fail 'transaction artifact does not contain exactly 17 transactions'
+jq -e '
+  .chainId == 1143 and (.transactions | length) == 17 and
+  .transactions[0].nonce == 17 and
+  [.transactions[].nonce] == [range(17;34)] and
+  [.transactions[].intendedIngress] ==
+    [range(0;17) | if (. % 2) == 0 then "rust" else "gov" end]
+' "$artifact" >/dev/null || \
+  fail 'transaction artifact is not the exact alternating 9-Rust/8-Go sequence'
 
 if test "$preflight_only" = 1; then
   current_stage='transaction_preflight'
