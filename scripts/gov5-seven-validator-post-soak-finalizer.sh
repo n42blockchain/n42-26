@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
 
 runtime="${N42_POST_RUNTIME:?runtime is required}"
 formalizer_pid="${N42_POST_FORMALIZER_PID:?formal finalizer PID is required}"
@@ -13,14 +13,30 @@ output="${N42_POST_OUTPUT:?total final verification output is required}"
 failure="${N42_POST_FAILURE:?post-soak failure output is required}"
 ports='28501 28502 28503 28504 28505 29545 29546'
 preflight_only="${N42_POST_PREFLIGHT_ONLY:-0}"
-[[ "$preflight_only" =~ ^[01]$ ]]
+current_stage='startup'
 
 fail() {
+  trap - ERR
   jq -nc --arg at "$(date -u +%FT%TZ)" --arg reason "$1" \
     '{at:$at,event:"gov5_post_soak_execution_finalizer",status:"FAIL",reason:$reason}' \
     >"$failure.pending"
   mv "$failure.pending" "$failure"
   exit 1
+}
+
+record_unexpected_failure() {
+  local status="${1:?exit status required}"
+  local command="${2:-unknown}"
+  local line="${3:-0}"
+  trap - ERR
+  jq -nc --arg at "$(date -u +%FT%TZ)" --arg reason 'unexpected command failure' \
+    --arg stage "$current_stage" --arg command "$command" \
+    --argjson line "$line" --argjson exitStatus "$status" '
+    {at:$at,event:"gov5_post_soak_execution_finalizer",status:"FAIL",reason:$reason,
+     stage:$stage,command:$command,line:$line,exitStatus:$exitStatus}
+  ' >"$failure.pending"
+  mv "$failure.pending" "$failure"
+  exit "$status"
 }
 
 rpc() {
@@ -31,6 +47,10 @@ rpc() {
     "http://127.0.0.1:$port"
 }
 
+trap 'record_unexpected_failure "$?" "$BASH_COMMAND" "$LINENO"' ERR
+
+current_stage='validate_configuration'
+[[ "$preflight_only" =~ ^[01]$ ]] || fail 'preflight flag must be 0 or 1'
 test -x "$qualification" || fail "missing executable: $qualification"
 test -s "$artifact" || fail "missing transaction artifact: $artifact"
 test ! -e "$burst" || fail "transaction evidence already exists: $burst"
@@ -38,6 +58,7 @@ test ! -e "$heads" || fail "post-transaction head evidence already exists: $head
 test ! -e "$output" || fail "total verification output already exists: $output"
 test ! -e "$failure" || exit 1
 
+current_stage='wait_for_formal_verification'
 while ! test -f "$formal"; do
   test ! -f "$formal_failure" || fail 'formal 24h finalizer reported failure'
   kill -0 "$formalizer_pid" 2>/dev/null || \
@@ -45,6 +66,7 @@ while ! test -f "$formal"; do
   sleep 60
 done
 
+current_stage='validate_formal_verification'
 jq -e '
   .event == "gov5_seven_validator_final_verification" and .status == "PASS" and
   .headAudit.elapsedSeconds >= 86400 and .headAudit.maximumLag <= 6 and
@@ -64,6 +86,7 @@ jq -e '.transactions | length == 17' "$artifact" >/dev/null || \
   fail 'transaction artifact does not contain exactly 17 transactions'
 
 if test "$preflight_only" = 1; then
+  current_stage='transaction_preflight'
   env N42_QUAL_RUNTIME="$runtime" N42_QUAL_PORTS="$ports" \
     N42_QUAL_GOV_INGRESS_PORT=28501 N42_QUAL_RUST_INGRESS_PORT=29545 \
     N42_QUAL_BURST_PREFLIGHT_ONLY=1 \
@@ -78,6 +101,7 @@ if test "$preflight_only" = 1; then
   exit 0
 fi
 
+current_stage='execute_transaction_burst'
 transaction_started_at="$(date -u +%FT%TZ)"
 env N42_QUAL_RUNTIME="$runtime" N42_QUAL_PORTS="$ports" \
   N42_QUAL_GOV_INGRESS_PORT=28501 N42_QUAL_RUST_INGRESS_PORT=29545 \
@@ -100,6 +124,7 @@ jq -e -s --slurpfile artifact "$artifact" '
   $passes[0].stateAndStorageParity and $passes[0].exactRpcComparisons >= 301
 ' "$burst" >/dev/null || fail 'transaction burst evidence is incomplete'
 
+current_stage='monitor_post_transaction_heads'
 env N42_QUAL_RUNTIME="$runtime" N42_QUAL_PORTS="$ports" \
   N42_QUAL_RUST_PORT=29546 N42_QUAL_MAX_LAG=6 N42_QUAL_REQUIRE_ZERO_TX=0 \
   "$qualification" monitor-heads 180 5 "$heads" || \
@@ -112,6 +137,7 @@ printf '%s\n' "$post_audit" | jq -e '
   .maximumLag <= 6
 ' >/dev/null || fail 'post-transaction head audit did not satisfy thresholds'
 
+current_stage='audit_post_transaction_consensus'
 post_consensus='[]'
 post_equivocations='[]'
 for port in 29545 29546; do
@@ -131,6 +157,7 @@ for port in 29545 29546; do
     --argjson item "$equivocation" '$current + [$item]')"
 done
 
+current_stage='audit_post_transaction_logs'
 for log in "$runtime"/logs/gov{1,2,3,4,5}.log "$runtime"/logs/rust.log "$runtime"/logs/rust2.log; do
   ! awk -v start="${transaction_started_at%Z}" '
     substr($0,1,19) >= start &&
@@ -141,6 +168,7 @@ for log in "$runtime"/logs/gov{1,2,3,4,5}.log "$runtime"/logs/rust.log "$runtime
   ' "$log" || fail "critical log signal after transaction burst: $log"
 done
 
+current_stage='write_total_final_verification'
 burst_pass="$(jq -sc 'map(select(.event == "p4_transaction_burst_pass"))[0]' "$burst")"
 jq -nc \
   --arg at "$(date -u +%FT%TZ)" \
