@@ -187,16 +187,19 @@ for log_audit in "$rust0_log_audit" "$rust6_log_audit"; do
   ' >/dev/null
 done
 for leader_file in "$rust0_leaders" "$rust6_leaders"; do
-  jq -e --argjson first_height "$first_height" --argjson last_height "$last_height" '
-    .status == "PASS" and .leaderStride == 7 and .rustAuthoredBlocks > 0 and
-    .startHeight >= $first_height and .startHeight <= ($first_height + 6) and
-    .endHeight == $last_height and
-    .blocksScanned == (.endHeight - .startHeight + 1) and
-    .rustAuthoredBlocks == (((.endHeight - .startHeight) / .leaderStride | floor) + 1) and
-    .parentChainContinuous and .expectedLeaderSlotsExact and .allConfiguredEndpointsExact and
-    (.ports | length == 7) and
-    .leaderCommitLog.allVotesFivePlusFive and .leaderCommitLog.viewStrideExact and
-    .leaderCommitLog.hashOrderExact
+  jq -s -e --argjson first_height "$first_height" --argjson last_height "$last_height" '
+    length == 1 and .[0] as $audit |
+    $audit.status == "PASS" and $audit.leaderStride == 7 and
+    $audit.rustAuthoredBlocks > 0 and
+    $audit.startHeight >= $first_height and $audit.startHeight <= ($first_height + 6) and
+    $audit.endHeight == $last_height and
+    $audit.blocksScanned == ($audit.endHeight - $audit.startHeight + 1) and
+    $audit.rustAuthoredBlocks ==
+      ((($audit.endHeight - $audit.startHeight) / $audit.leaderStride | floor) + 1) and
+    $audit.parentChainContinuous and $audit.expectedLeaderSlotsExact and
+    $audit.allConfiguredEndpointsExact and ($audit.ports | length == 7) and
+    $audit.leaderCommitLog.allVotesFivePlusFive and
+    $audit.leaderCommitLog.viewStrideExact and $audit.leaderCommitLog.hashOrderExact
   ' "$leader_file" >/dev/null
 done
 milestone_audits='[]'

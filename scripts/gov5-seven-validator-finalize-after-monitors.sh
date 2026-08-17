@@ -74,6 +74,10 @@ current_stage='validate_configuration'
 [[ "$minimum_duration" =~ ^[1-9][0-9]*$ ]] || fail 'minimum duration must be positive'
 test ! -e "$output" || fail "final verification output already exists: $output"
 test ! -e "$failure" || exit 1
+for leader_output in "$rust0_leaders" "$rust6_leaders"; do
+  test ! -e "$leader_output" || fail "leader audit output already exists: $leader_output"
+  test ! -e "$leader_output.pending" || fail "partial leader audit exists: $leader_output.pending"
+done
 for script in "$qualification" "$verifier" "$execution_audit_script"; do
   test -x "$script" || fail "missing executable: $script"
 done
@@ -144,12 +148,14 @@ current_stage='audit_rust0_leaders'
 env N42_QUAL_RUNTIME="$runtime" N42_QUAL_PORTS="$ports" \
   N42_QUAL_RUST_PORT=29545 N42_QUAL_RUST_MINER=0x81d4c1f92ddb837cb46f82280d9b491b101fa582 \
   N42_QUAL_RUST_LEADER_STRIDE=7 "$qualification" audit-rust-leaders \
-  "$rust0_start" "$rust0_end" "$rust0_leaders" >/dev/null
+  "$rust0_start" "$rust0_end" "$rust0_leaders.pending" >/dev/null
+mv "$rust0_leaders.pending" "$rust0_leaders"
 current_stage='audit_rust6_leaders'
 env N42_QUAL_RUNTIME="$runtime" N42_QUAL_PORTS="$ports" \
   N42_QUAL_RUST_PORT=29546 N42_QUAL_RUST_MINER=0x853b2026deebc83fb79ac7d0c48efea595c22578 \
   N42_QUAL_RUST_LEADER_STRIDE=7 "$qualification" audit-rust-leaders \
-  "$rust6_start" "$rust6_end" "$rust6_leaders" >/dev/null
+  "$rust6_start" "$rust6_end" "$rust6_leaders.pending" >/dev/null
+mv "$rust6_leaders.pending" "$rust6_leaders"
 
 current_stage='audit_readonly_evm_execution'
 test ! -e "$execution_audit" || fail "execution audit output already exists: $execution_audit"
