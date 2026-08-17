@@ -19,6 +19,25 @@ use crate::gov5_rpc::{
 use crate::state_sync::StateSyncCodec;
 use crate::tx_forward::TxForwardCodec;
 
+/// Largest message GossipSub will publish or accept.
+///
+/// This is the tightest ceiling any block on this chain has to fit through:
+/// block data goes out over `block_direct` (16 MiB) *and* unconditionally over
+/// GossipSub as a reliability fallback, so 8 MiB is the effective limit. It is
+/// public so block producers can derive their budget from it instead of
+/// hard-coding a second copy that silently drifts out of sync with this one.
+pub const MAX_GOSSIP_MESSAGE_SIZE: usize = 8 * 1024 * 1024;
+
+/// Largest blob-sidecar message GossipSub receivers will accept.
+///
+/// This is the blob topic's Reject threshold; the publisher packs sidecars
+/// into frames no larger than this instead of one all-or-nothing message. One
+/// EIP-4844 sidecar is ~137 KiB per blob, so a full 6-blob transaction
+/// (~825 KiB) fits in a frame with room to spare. Public for the same reason
+/// as [`MAX_GOSSIP_MESSAGE_SIZE`]: a second hard-coded copy on the publish
+/// side is exactly what let blob broadcasts outgrow the receivers unnoticed.
+pub const MAX_BLOB_GOSSIP_MESSAGE_SIZE: usize = 1024 * 1024;
+
 /// The composite network behaviour for N42 nodes.
 ///
 /// Combines GossipSub (pub/sub consensus), Identify (peer metadata),
@@ -236,7 +255,7 @@ fn build_swarm_with_transports(
         // Application-level validation is in handle_gossipsub_message.
         .validation_mode(gossipsub::ValidationMode::Permissive)
         // 8MB max: high-throughput blocks can reach several MB.
-        .max_transmit_size(8 * 1024 * 1024)
+        .max_transmit_size(MAX_GOSSIP_MESSAGE_SIZE)
         .mesh_n(config.mesh_d)
         .mesh_n_low(config.mesh_d_low)
         .mesh_n_high(config.mesh_d_high)
@@ -261,14 +280,17 @@ fn build_swarm_with_transports(
         // carry validator BLS authentication, so an additional libp2p message
         // signature is both redundant and actively incompatible: Gov5 rejects
         // signed GossipSub envelopes and eventually prunes the Rust peer from
-        // the mesh, leaving only intermittent IHAVE/IWANT recovery. Keep the
-        // transport envelope anonymous; application-level consensus validation
-        // remains mandatory in the service/engine.
-        let mut gossipsub = gossipsub::Behaviour::new(
-            gossipsub::MessageAuthenticity::Anonymous,
-            gossipsub_config.clone(),
-        )
-        .map_err(|e| eyre::eyre!("gossipsub behaviour error: {e}"))?;
+        // the mesh, leaving only intermittent IHAVE/IWANT recovery. The
+        // anonymous envelope is therefore scoped to gov5-facing swarms only —
+        // production N42 swarms keep the signed envelope they always had.
+        // Both sides run Permissive validation, so mixed deployments interop.
+        let message_authenticity = if enable_gov5_tcp {
+            gossipsub::MessageAuthenticity::Anonymous
+        } else {
+            gossipsub::MessageAuthenticity::Signed(key.clone())
+        };
+        let mut gossipsub = gossipsub::Behaviour::new(message_authenticity, gossipsub_config.clone())
+            .map_err(|e| eyre::eyre!("gossipsub behaviour error: {e}"))?;
 
         gossipsub
             .with_peer_score(peer_score_params, thresholds)

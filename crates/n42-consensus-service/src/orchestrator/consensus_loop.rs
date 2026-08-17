@@ -1080,7 +1080,13 @@ impl ConsensusService {
                 if compact_injected && let Some(ref cache) = exec_cache {
                     cache.evict(block_hash);
                 }
-                bad_blocks.insert_if_invalid(block_hash, &status.status, "committed_import");
+                // The committed background path consumes the same unauthenticated
+                // compact bytes as eager/sync imports. A rejection after injection
+                // describes those bytes, not necessarily the committed block, so
+                // evict above and keep the hash retryable (HIGH-1).
+                if !compact_injected {
+                    bad_blocks.insert_if_invalid(block_hash, &status.status, "committed_import");
+                }
                 warn!(target: "n42::cl::consensus_loop", %block_hash, status = ?status.status, "bg import: new_payload rejected");
                 (ImportOutcome::Invalid, 0)
             }
@@ -1452,12 +1458,20 @@ impl ConsensusService {
         // Gov5-compatible votes are execution attestations. Only a successful
         // reth new_payload result reaches this callback, so this is the first
         // safe point to release an H2 participant's deferred vote.
-        if self.h2_v4_identity.is_some()
-            && let Err(error) = self
+        if self.h2_v4_identity.is_some() {
+            // Same reasoning retires the Gov5 fetch here rather than on arrival
+            // of the block-data envelope: reth accepting this payload is what
+            // proves the hash, so a forged envelope can no longer cancel an
+            // in-flight ancestry fetch. Native mode never fetches from Gov5, so
+            // it stays out of this path entirely.
+            self.retire_h2_v4_fetch_satisfied_elsewhere(hash).await;
+
+            if let Err(error) = self
                 .engine
                 .process_event(n42_consensus::ConsensusEvent::BlockImported(hash))
-        {
-            error!(target: "n42::interop::h2v4", %hash, %error, "failed to release execution-gated H2 vote");
+            {
+                error!(target: "n42::interop::h2v4", %hash, %error, "failed to release execution-gated H2 vote");
+            }
         }
 
         // If commit/finalize raced ahead of eager new_payload, re-drive the
@@ -1755,6 +1769,15 @@ impl ConsensusService {
                             let elapsed_ms = start.elapsed().as_millis();
                             gauge!("n42_twig_latest_root").set(version as f64);
                             histogram!("n42_twig_apply_diff_ms").record(elapsed_ms as f64);
+                            // Pair the duration with the forest size. Part of the
+                            // per-block cost scales with twig count and not with
+                            // the block, so the two series together separate
+                            // "this block was big" from "the tree has grown" —
+                            // which is not decidable from the duration alone.
+                            let twig_count = twig.node_count();
+                            if let Some(count) = twig_count {
+                                gauge!("n42_twig_count").set(count as f64);
+                            }
                             info!(
                                 target: "n42::twig",
                                 view,
@@ -1763,6 +1786,7 @@ impl ConsensusService {
                                 %root,
                                 accounts = diff.len(),
                                 storage_changes = diff.total_storage_changes(),
+                                twig_count,
                                 elapsed_ms,
                                 "Twig updated"
                             );

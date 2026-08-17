@@ -17,7 +17,10 @@ impl BlobStorePort for DiskBlobStorePort {
     fn insert_rlp(&self, tx_hash: B256, sidecar_rlp: &[u8]) {
         match <BlobTransactionSidecarVariant as Decodable>::decode(&mut &sidecar_rlp[..]) {
             Ok(sidecar) => {
-                if let Err(e) = self.0.insert(tx_hash, sidecar) {
+                // `.into()` wraps with `BlobCellAvailability::full()` — correct
+                // here: the RLP decoded above is the leader's complete sidecar,
+                // never a sparse EIP-7594 subset.
+                if let Err(e) = self.0.insert(tx_hash, sidecar.into()) {
                     debug!(target: "n42::cl::exec_bridge", %tx_hash, error = %e, "failed to insert blob sidecar");
                 }
             }

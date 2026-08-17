@@ -1292,4 +1292,114 @@ mod tests {
             io::ErrorKind::InvalidData
         );
     }
+
+    /// Measures what `advance_execution_validated_head` costs per block.
+    ///
+    /// That function fsyncs a 60-byte lineage record and then rewrites the
+    /// consensus snapshot, and it runs inline on the consensus loop for
+    /// essentially every block. Whether that matters is a question about this
+    /// machine's disk, not about the source, so measure it rather than argue:
+    ///
+    ///   cargo test -p n42-consensus-service --release persist_cost --     ///     --ignored --nocapture
+    ///
+    /// Read the result against the 8s slot budget. Anything in the low
+    /// milliseconds is noise; tens of milliseconds per block would justify
+    /// batching the lineage append or dropping the second snapshot write.
+    #[test]
+    #[ignore = "measurement, not a correctness gate"]
+    fn persist_cost_per_block() {
+        const BLOCKS: u32 = 200;
+        let dir = std::env::temp_dir().join("n42-persist-cost");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("consensus_state.json");
+
+        // Warm the path so directory creation is not counted.
+        save_consensus_state(&path, &genesis_snapshot(0)).unwrap();
+        append_execution_lineage_proof(&path, 0, B256::ZERO).unwrap();
+
+        let mut lineage_total = std::time::Duration::ZERO;
+        let mut snapshot_total = std::time::Duration::ZERO;
+        for view in 1..=BLOCKS as u64 {
+            let hash = B256::repeat_byte(view as u8);
+
+            let start = std::time::Instant::now();
+            append_execution_lineage_proof(&path, view, hash).unwrap();
+            lineage_total += start.elapsed();
+
+            let snapshot = genesis_snapshot(view);
+            let start = std::time::Instant::now();
+            save_consensus_state(&path, &snapshot).unwrap();
+            snapshot_total += start.elapsed();
+        }
+
+        let lineage_us = lineage_total.as_micros() as f64 / f64::from(BLOCKS);
+        let snapshot_us = snapshot_total.as_micros() as f64 / f64::from(BLOCKS);
+        let lineage_bytes = std::fs::metadata(execution_lineage_path(&path))
+            .unwrap()
+            .len();
+        println!(
+            "per block over {BLOCKS} blocks: lineage fsync {lineage_us:.0}us,              snapshot write+fsync+rename {snapshot_us:.0}us,              total {:.2}ms ({:.3}% of an 8s slot);              lineage file grew to {lineage_bytes} bytes",
+            (lineage_us + snapshot_us) / 1000.0,
+            (lineage_us + snapshot_us) / 80_000.0,
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Measures whether the append-only lineage log's growth threatens startup.
+    ///
+    /// `recover_execution_lineage_proof` reads the whole file and scans every
+    /// record. At an 8s slot the log grows ~60 bytes per block — roughly
+    /// 0.65 MB/day, 237 MB/year — so the question is whether a multi-year node
+    /// pays a startup cost worth engineering around:
+    ///
+    ///   cargo test -p n42-consensus-service --release lineage_recovery_cost --     ///     --ignored --nocapture
+    #[test]
+    #[ignore = "measurement, not a correctness gate"]
+    fn lineage_recovery_cost_at_scale() {
+        // One year at an 8s slot: 10,800 blocks/day * 365.
+        const RECORDS: u64 = 3_942_000;
+        let dir = std::env::temp_dir().join("n42-lineage-scale");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("consensus_state.json");
+        let lineage = execution_lineage_path(&path);
+
+        // Build the file in one buffered pass; the per-append fsync cost is
+        // already measured by persist_cost_per_block.
+        let target_hash = B256::repeat_byte(0xFE);
+        let mut bytes = Vec::with_capacity(RECORDS as usize * EXECUTION_LINEAGE_RECORD_LEN);
+        for view in 0..RECORDS {
+            // Only the final record matches, which is the worst case: the scan
+            // cannot stop early.
+            let hash = if view == RECORDS - 1 {
+                target_hash
+            } else {
+                B256::repeat_byte((view % 250) as u8)
+            };
+            let mut record = Vec::with_capacity(EXECUTION_LINEAGE_RECORD_LEN);
+            record.extend_from_slice(EXECUTION_LINEAGE_MAGIC);
+            record.extend_from_slice(&view.to_le_bytes());
+            record.extend_from_slice(hash.as_slice());
+            let checksum = blake3::hash(&record);
+            record.extend_from_slice(&checksum.as_bytes()[..16]);
+            bytes.extend_from_slice(&record);
+        }
+        let file_mb = bytes.len() as f64 / (1024.0 * 1024.0);
+        std::fs::write(&lineage, &bytes).unwrap();
+        drop(bytes);
+
+        let start = std::time::Instant::now();
+        let recovered = recover_execution_lineage_proof(&path, target_hash).unwrap();
+        let elapsed = start.elapsed();
+        assert_eq!(recovered, Some((RECORDS - 1, target_hash)));
+
+        println!(
+            "recovering from {RECORDS} records ({file_mb:.1} MiB, ~1 year at an 8s slot)              took {}ms",
+            elapsed.as_millis()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

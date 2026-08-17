@@ -459,6 +459,14 @@ impl ConsensusService {
         };
 
         let hash = broadcast.block_hash;
+        // The Gov5 fetch is NOT retired here. At this point `hash` is only a
+        // self-declared field of an unauthenticated bincode envelope — the
+        // payload behind it is not checked against it until the eager import
+        // below. Retiring on it would let anyone who can reach this port cancel
+        // an in-flight ancestry fetch and suppress re-requests for 30s by
+        // gossiping a forged envelope carrying the victim's target hash.
+        // `handle_eager_import_done` retires it instead: reth has accepted that
+        // exact payload by then, so the hash is proven, not merely claimed.
         if self.bad_blocks.should_skip(hash, "block_data") {
             return;
         }
@@ -1592,6 +1600,38 @@ async fn broadcast_block_data(
         }
     };
 
+    // This is the first and only point where the true on-wire size of a block is
+    // known: after zstd, after bincode, and including `execution_output`, none of
+    // which the payload builder can see. The builder budgets by transaction count
+    // and gas, and neither is denominated in bytes, so nothing upstream prevents
+    // a block from landing above the propagation ceiling.
+    //
+    // Both send paths below fail *quietly* when that happens — GossipSub logs a
+    // warning and drops the publish, receivers `Reject` it. Validators then have
+    // nothing to vote on, the view cannot reach quorum, and a restart rebuilds
+    // the identical block from the identical mempool. So the chain stops with
+    // only a warning to show for it. Record the overrun loudly and as a metric:
+    // it is the difference between an afternoon of confused log-reading and one
+    // glance at a dashboard.
+    metrics::gauge!("n42_block_broadcast_bytes").set(encoded.len() as f64);
+    if encoded.len() > n42_network::MAX_BROADCAST_PAYLOAD_BYTES {
+        metrics::counter!("n42_block_broadcast_oversized_total").increment(1);
+        error!(
+            target: "n42::cl::exec_bridge",
+            %hash,
+            current_view,
+            encoded_bytes = encoded.len(),
+            budget_bytes = n42_network::MAX_BROADCAST_PAYLOAD_BYTES,
+            gossip_limit_bytes = n42_network::MAX_GOSSIP_MESSAGE_SIZE,
+            raw_kb = raw_len / 1024,
+            compressed_kb = compressed_len / 1024,
+            exec_kb,
+            "block exceeds the propagation budget and will very likely not reach \
+             validators; the view cannot reach quorum and a restart will rebuild the \
+             same block — lower N42_MAX_TXS_PER_BLOCK or the block gas limit"
+        );
+    }
+
     let build_start_to_broadcast_ms = build_start.elapsed().as_millis() as u64;
     metrics::histogram!("n42_build_start_to_broadcast_ms")
         .record(build_start_to_broadcast_ms as f64);
@@ -1694,27 +1734,60 @@ fn broadcast_blob_sidecars(
 
     match blob_store.get_all_encoded(blob_tx_hashes) {
         Ok(encoded_sidecars) if !encoded_sidecars.is_empty() => {
-            let sidecar_count = encoded_sidecars.len();
-            let broadcast = BlobSidecarBroadcast {
-                block_hash: hash,
-                view: current_view,
-                sidecars: encoded_sidecars,
-            };
+            // Receivers Reject blob-topic messages above
+            // MAX_BLOB_GOSSIP_MESSAGE_SIZE, so a single all-or-nothing frame
+            // would be published and then refused network-wide as soon as a
+            // block carries more than ~7 sidecars — the same publish/receive
+            // drift 44a01a4 removed for block broadcasts. Pack into as many
+            // frames as the ceiling requires instead; receivers insert each
+            // frame's sidecars independently, so splitting is transparent.
+            let (frames, oversized) = pack_blob_sidecar_frames(
+                encoded_sidecars,
+                n42_network::MAX_BLOB_GOSSIP_MESSAGE_SIZE,
+            );
+            if oversized > 0 {
+                error!(
+                    target: "n42::cl::exec_bridge",
+                    %hash,
+                    oversized,
+                    max_frame_bytes = n42_network::MAX_BLOB_GOSSIP_MESSAGE_SIZE,
+                    "blob sidecar alone outgrows a gossip frame; receivers cannot obtain it"
+                );
+                metrics::counter!("n42_blob_sidecar_exceeds_frame_total")
+                    .increment(oversized as u64);
+            }
+            let frame_count = frames.len();
+            for (frame_idx, sidecars) in frames.into_iter().enumerate() {
+                let blob_count = sidecars.len();
+                let broadcast = BlobSidecarBroadcast {
+                    block_hash: hash,
+                    view: current_view,
+                    sidecars,
+                };
 
-            match bincode::serialize(&broadcast) {
-                Ok(encoded) => {
-                    debug!(target: "n42::cl::exec_bridge", %hash, blob_count = sidecar_count, bytes = encoded.len(), "broadcasting blob sidecars");
-                    if let Err(e) = network.broadcast_blob_sidecar(encoded) {
-                        warn!(target: "n42::cl::exec_bridge", error = %e, "failed to broadcast blob sidecars");
+                match bincode::serialize(&broadcast) {
+                    Ok(encoded) => {
+                        debug!(
+                            target: "n42::cl::exec_bridge",
+                            %hash,
+                            blob_count,
+                            frame = frame_idx + 1,
+                            frames = frame_count,
+                            bytes = encoded.len(),
+                            "broadcasting blob sidecars"
+                        );
+                        if let Err(e) = network.broadcast_blob_sidecar(encoded) {
+                            warn!(target: "n42::cl::exec_bridge", error = %e, "failed to broadcast blob sidecars");
+                        }
                     }
-                }
-                Err(error) => {
-                    warn!(
-                        target: "n42::cl::exec_bridge",
-                        %hash,
-                        error = %error,
-                        "failed to serialize blob sidecar broadcast"
-                    );
+                    Err(error) => {
+                        warn!(
+                            target: "n42::cl::exec_bridge",
+                            %hash,
+                            error = %error,
+                            "failed to serialize blob sidecar broadcast"
+                        );
+                    }
                 }
             }
         }
@@ -1722,6 +1795,125 @@ fn broadcast_blob_sidecars(
         Err(e) => {
             warn!(target: "n42::cl::exec_bridge", %hash, error = %e, "failed to get blob sidecars from store");
         }
+    }
+}
+
+/// Bincode bytes each `BlobSidecarBroadcast::sidecars` entry adds beyond its
+/// RLP payload: a `B256` tx hash serializes via `serialize_bytes` as 8-byte
+/// length prefix + 32 bytes, and the RLP `Vec` adds its own 8-byte prefix
+/// (bincode 1 fixint encoding, the wire format both broadcast paths use).
+/// `exact_budget_fill_stays_single_frame` pins these against real bincode.
+const BLOB_FRAME_ENTRY_OVERHEAD: usize = 48;
+
+/// Bincode bytes of the fixed `BlobSidecarBroadcast` header: length-prefixed
+/// 32-byte block hash (40) + 8-byte view + 8-byte `sidecars` length prefix.
+const BLOB_FRAME_HEADER_OVERHEAD: usize = 56;
+
+/// One frame's worth of `(tx_hash, sidecar_rlp)` entries.
+type BlobSidecarFrame = Vec<(B256, Vec<u8>)>;
+
+/// Packs sidecars into frames whose serialized size stays within
+/// `max_frame_bytes`, the blob topic's receiver Reject threshold. Order is
+/// preserved. Returns the frames plus the count of sidecars dropped because a
+/// single entry alone cannot fit in a frame — those are unshippable and the
+/// caller must surface them.
+fn pack_blob_sidecar_frames(
+    sidecars: BlobSidecarFrame,
+    max_frame_bytes: usize,
+) -> (Vec<BlobSidecarFrame>, usize) {
+    let budget = max_frame_bytes.saturating_sub(BLOB_FRAME_HEADER_OVERHEAD);
+    let mut frames = Vec::new();
+    let mut current: BlobSidecarFrame = Vec::new();
+    let mut current_bytes = 0usize;
+    let mut oversized = 0usize;
+
+    for (tx_hash, rlp) in sidecars {
+        let entry_bytes = BLOB_FRAME_ENTRY_OVERHEAD + rlp.len();
+        if entry_bytes > budget {
+            oversized += 1;
+            continue;
+        }
+        if current_bytes + entry_bytes > budget {
+            frames.push(std::mem::take(&mut current));
+            current_bytes = 0;
+        }
+        current_bytes += entry_bytes;
+        current.push((tx_hash, rlp));
+    }
+    if !current.is_empty() {
+        frames.push(current);
+    }
+    (frames, oversized)
+}
+
+#[cfg(test)]
+mod blob_frame_tests {
+    use super::*;
+
+    fn sidecar(byte: u8, len: usize) -> (B256, Vec<u8>) {
+        (B256::repeat_byte(byte), vec![byte; len])
+    }
+
+    /// The overhead constants must match what bincode actually emits — the
+    /// whole point of packing is that every frame clears the receiver's
+    /// Reject threshold.
+    #[test]
+    fn packed_frames_serialize_within_the_ceiling() {
+        let max = n42_network::MAX_BLOB_GOSSIP_MESSAGE_SIZE;
+        // 137 KiB ≈ one EIP-4844 blob + commitment + proof; 12 of them is a
+        // 1.6 MiB broadcast that previously went out as one rejected frame.
+        let sidecars: Vec<_> = (0..12u8).map(|i| sidecar(i, 137 * 1024)).collect();
+        let (frames, oversized) = pack_blob_sidecar_frames(sidecars.clone(), max);
+
+        assert_eq!(oversized, 0);
+        assert!(frames.len() > 1, "12 sidecars cannot fit one frame");
+        let repacked: Vec<_> = frames.iter().flatten().cloned().collect();
+        assert_eq!(repacked, sidecars, "order and content preserved");
+        for frame in frames {
+            let encoded = bincode::serialize(&BlobSidecarBroadcast {
+                block_hash: B256::repeat_byte(0xFF),
+                view: u64::MAX,
+                sidecars: frame,
+            })
+            .unwrap();
+            assert!(encoded.len() <= max, "frame is {} bytes", encoded.len());
+        }
+    }
+
+    #[test]
+    fn exact_budget_fill_stays_single_frame() {
+        let max = n42_network::MAX_BLOB_GOSSIP_MESSAGE_SIZE;
+        let budget = max - BLOB_FRAME_HEADER_OVERHEAD;
+        let (frames, oversized) =
+            pack_blob_sidecar_frames(vec![sidecar(1, budget - BLOB_FRAME_ENTRY_OVERHEAD)], max);
+        assert_eq!(oversized, 0);
+        assert_eq!(frames.len(), 1);
+        let encoded = bincode::serialize(&BlobSidecarBroadcast {
+            block_hash: B256::ZERO,
+            view: 0,
+            sidecars: frames.into_iter().next().unwrap(),
+        })
+        .unwrap();
+        assert_eq!(encoded.len(), max, "overhead constants match bincode");
+    }
+
+    #[test]
+    fn unshippable_sidecar_is_dropped_and_counted() {
+        let max = n42_network::MAX_BLOB_GOSSIP_MESSAGE_SIZE;
+        let (frames, oversized) = pack_blob_sidecar_frames(
+            vec![sidecar(1, 10), sidecar(2, max), sidecar(3, 10)],
+            max,
+        );
+        assert_eq!(oversized, 1);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].len(), 2, "the shippable neighbours still go out");
+    }
+
+    #[test]
+    fn empty_input_produces_no_frames() {
+        let (frames, oversized) = pack_blob_sidecar_frames(Vec::new(), 1024);
+        assert!(frames.is_empty());
+        assert_eq!(oversized, 0);
     }
 }
 

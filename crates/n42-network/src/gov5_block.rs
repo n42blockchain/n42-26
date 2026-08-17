@@ -28,6 +28,55 @@ pub enum Gov5BlockError {
     PayloadHashMismatch,
 }
 
+impl Gov5BlockError {
+    /// Whether this verdict, **if the bytes are known to belong to the hash
+    /// that was requested**, rules that hash out for good.
+    ///
+    /// This is only half of the test. The error alone cannot say which block
+    /// it describes: every path here returns before `block_hash` is derived,
+    /// so what failed is whatever the peer chose to send. Pair it with
+    /// [`attributable_hash`], which recovers the hash those bytes actually
+    /// commit to — a peer answering "I do not have it" sends an empty body,
+    /// and treating that as a verdict on the requested block would blacklist a
+    /// perfectly good hash because one peer was behind.
+    ///
+    /// Kept as a method on the error so a future variant has to state which
+    /// kind it is.
+    pub const fn is_permanent(&self) -> bool {
+        match self {
+            Self::InvalidRlp
+            | Self::HeaderProfile(_)
+            | Self::TransactionRootMismatch
+            | Self::PayloadReconstruction(_)
+            | Self::PayloadHashMismatch => true,
+        }
+    }
+}
+
+/// Recovers the block hash a response commits to, when it commits to one.
+///
+/// Only the outer list and the header item have to be well-formed: the hash is
+/// `keccak256` of the header RLP, so this answers "whose block is this?" even
+/// for a body that later fails validation. Returns `None` when the bytes do not
+/// name a block at all — an empty response, a truncated frame, a garbage
+/// payload — because there is then nothing to attribute a rejection to.
+pub fn attributable_hash(encoded: &[u8]) -> Option<B256> {
+    let mut payload = encoded;
+    let outer = RlpHeader::decode(&mut payload).ok()?;
+    if !outer.list || outer.payload_length != payload.len() {
+        return None;
+    }
+    let header_rlp = take_rlp_item(&mut payload)?;
+    // Confirm it parses as a header before trusting the hash: otherwise any
+    // leading list item would masquerade as one.
+    let mut cursor = header_rlp;
+    Header::decode(&mut cursor).ok()?;
+    if !cursor.is_empty() {
+        return None;
+    }
+    Some(keccak256(header_rlp))
+}
+
 const GOV5_H2_SEAL_BYTES: usize = 96;
 
 /// Returns the consensus view committed into a validated Gov5 H2 header.
@@ -500,5 +549,69 @@ mod tests {
             gov5_header_view(&header),
             Err(Gov5BlockError::HeaderProfile(_))
         ));
+    }
+
+    /// The retry loop keys off this classification, so a new variant defaulting
+    /// to the wrong side is the difference between giving up on a bad block and
+    /// re-requesting it from every peer forever. Enumerated explicitly rather
+    /// than spot-checked so adding a variant forces a decision here.
+    #[test]
+    fn every_content_verdict_is_permanent() {
+        for error in [
+            Gov5BlockError::InvalidRlp,
+            Gov5BlockError::HeaderProfile("difficulty is not zero".to_owned()),
+            Gov5BlockError::TransactionRootMismatch,
+            Gov5BlockError::PayloadReconstruction("bad payload".to_owned()),
+            Gov5BlockError::PayloadHashMismatch,
+        ] {
+            assert!(
+                error.is_permanent(),
+                "{error} is a verdict about content the hash commits to, so refetching cannot change it"
+            );
+        }
+    }
+
+    /// A rejection is only a verdict on the requested block if the bytes
+    /// belong to it. Serving peers answer "I do not have it" with an empty
+    /// body, and the serve cache is a 1024-entry FIFO, so an honest and fully
+    /// synced peer returns empty for anything older than that. Attributing
+    /// such a response to the requested hash would blacklist a good block and
+    /// stall ancestry walks permanently.
+    #[test]
+    fn unattributable_responses_name_no_block() {
+        for (name, bytes) in [
+            ("empty response (peer does not have the block)", Vec::new()),
+            ("garbage", vec![0xFF, 0xFE, 0xFD]),
+            ("empty rlp list", vec![0xC0]),
+            (
+                "truncated frame",
+                block_fixture(calculate_transaction_root::<TxEnvelope>(&[]))[..20].to_vec(),
+            ),
+        ] {
+            assert_eq!(
+                attributable_hash(&bytes),
+                None,
+                "{name} must not be attributed to any hash"
+            );
+        }
+    }
+
+    /// A body that names its block but fails validation is attributable: the
+    /// header hashes to exactly the block being judged, so the verdict sticks.
+    #[test]
+    fn a_body_that_fails_validation_still_names_its_block() {
+        let good = block_fixture(calculate_transaction_root::<TxEnvelope>(&[]));
+        let expected = decode_gov5_block_rlp(&good).unwrap().block_hash;
+        assert_eq!(attributable_hash(&good), Some(expected));
+
+        // Same header, wrong transaction root commitment: decoding fails, but
+        // the bytes still identify which block they claim to be.
+        let bad = block_fixture(B256::repeat_byte(0x99));
+        let bad_hash = attributable_hash(&bad).expect("header is intact");
+        assert!(decode_gov5_block_rlp(&bad).is_err());
+        assert_ne!(
+            bad_hash, expected,
+            "a different transaction root yields a different block"
+        );
     }
 }

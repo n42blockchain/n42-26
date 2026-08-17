@@ -366,6 +366,11 @@ impl TwigStateSink {
 }
 
 impl StateSink for TwigStateSink {
+    fn node_count(&self) -> Option<usize> {
+        let tree = self.tree.lock().unwrap_or_else(|e| e.into_inner());
+        Some(tree.twig_count())
+    }
+
     fn apply_diff(&self, block_hash: B256, diff: &StateDiff) -> Result<(u64, B256), String> {
         let _apply_guard = self
             .apply_lock

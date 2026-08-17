@@ -40,6 +40,10 @@ const MAX_SYNC_BATCH: u64 = 128;
 /// Bounds unauthenticated live block bodies and authenticated Decide records
 /// retained while their counterpart is in flight.
 const MAX_GOV5_LIVE_PENDING: usize = 512;
+/// Bound on remembered content-level rejections. Each entry is one hash the
+/// chain can never legitimately contain, so the set stays small in practice;
+/// the cap only stops an adversary from growing it without limit.
+const MAX_GOV5_REJECTED: usize = 4096;
 
 /// Maximum authenticated parent links retained while walking backwards from a
 /// verified Gov5 Decide. Unlike [`MAX_GOV5_LIVE_PENDING`], these entries contain
@@ -286,6 +290,13 @@ pub struct ObserverOrchestrator {
 
     // Sync
     sync_in_flight: bool,
+    /// Peers that answered a sync request by saying they do not speak N42
+    /// state-sync at all. That is a fact about the peer's protocol set, not a
+    /// transient failure, so rotating to it again just re-asks a settled
+    /// question — against an all-gov5 peer set the rotation re-asked every
+    /// peer every 5s indefinitely. Cleared on disconnect, since a reconnecting
+    /// peer may be a different build.
+    sync_unsupported_peers: HashSet<PeerId>,
     sync_started_at: Option<Instant>,
     sync_attempt_counter: u64,
     committed_blocks: VecDeque<CommittedBlock>,
@@ -306,6 +317,12 @@ pub struct ObserverOrchestrator {
     gov5_finality: HashMap<B256, Gov5FinalityRecord>,
     gov5_finality_order: VecDeque<B256>,
     gov5_fetch_requested_at: HashMap<B256, Instant>,
+    /// Hashes whose content was rejected on its merits, so no peer can serve a
+    /// version that decodes differently. Without this the fan-out retries a
+    /// verdict it already has: a joint testnet produced ~1,465 identical
+    /// rejections per second and 66 MB of log in two minutes, all for one hash.
+    gov5_rejected: HashSet<B256>,
+    gov5_rejected_order: VecDeque<B256>,
     gov5_finalized_catchup: Option<Gov5FinalizedCatchup>,
     h2_v4_shadow_verified: [u64; H2_V4_SHADOW_KINDS],
     h2_v4_shadow_rejected: [u64; H2_V4_SHADOW_KINDS],
@@ -338,6 +355,7 @@ impl ObserverOrchestrator {
             epoch_length: 0,
             epoch_schedule: None,
             sync_in_flight: false,
+            sync_unsupported_peers: HashSet::new(),
             sync_started_at: None,
             sync_attempt_counter: 0,
             committed_blocks: VecDeque::new(),
@@ -349,6 +367,8 @@ impl ObserverOrchestrator {
             gov5_finality: HashMap::new(),
             gov5_finality_order: VecDeque::new(),
             gov5_fetch_requested_at: HashMap::new(),
+            gov5_rejected: HashSet::new(),
+            gov5_rejected_order: VecDeque::new(),
             gov5_finalized_catchup: None,
             h2_v4_shadow_verified: [0; H2_V4_SHADOW_KINDS],
             h2_v4_shadow_rejected: [0; H2_V4_SHADOW_KINDS],
@@ -429,6 +449,8 @@ impl ObserverOrchestrator {
             NetworkEvent::PeerDisconnected(peer_id) => {
                 warn!(target: "n42::observer", %peer_id, "peer disconnected");
                 self.connected_peers.remove(&peer_id);
+                // A reconnecting peer may be a newer build that does support it.
+                self.sync_unsupported_peers.remove(&peer_id);
                 gauge!("n42_observer_connected_peers").set(self.connected_peers.len() as f64);
             }
             NetworkEvent::BlockAnnouncement { source, data } => {
@@ -454,7 +476,24 @@ impl ObserverOrchestrator {
                 source,
                 block_hash,
                 error,
+                permanent,
             } => {
+                if permanent {
+                    // Log once per hash. The retry loop used to re-derive this
+                    // same verdict from every other peer, forever.
+                    if self.remember_gov5_rejection(block_hash) {
+                        warn!(
+                            target: "n42::observer",
+                            %source,
+                            %block_hash,
+                            %error,
+                            "gov5 block rejected on content; will not re-request this hash"
+                        );
+                        counter!("n42_gov5_block_rejected_permanent_total").increment(1);
+                    }
+                    self.gov5_fetch_requested_at.remove(&block_hash);
+                    return;
+                }
                 warn!(target: "n42::observer", %source, %block_hash, %error, "gov5 block fetch failed");
                 self.retry_gov5_block_fetch(source, block_hash);
             }
@@ -560,8 +599,26 @@ impl ObserverOrchestrator {
             NetworkEvent::SyncResponse { peer, response } => {
                 self.handle_sync_response(peer, response).await;
             }
-            NetworkEvent::SyncRequestFailed { peer, error } => {
-                warn!(target: "n42::observer", %peer, %error, "sync request failed");
+            NetworkEvent::SyncRequestFailed {
+                peer,
+                error,
+                unsupported_protocol,
+            } => {
+                // Distinguish "this peer cannot ever serve this" from "this
+                // attempt failed". Only the former is worth remembering.
+                if unsupported_protocol {
+                    if self.sync_unsupported_peers.insert(peer) {
+                        warn!(
+                            target: "n42::observer",
+                            %peer,
+                            %error,
+                            "peer does not speak N42 state-sync; excluding it from sync rotation"
+                        );
+                        counter!("n42_sync_peer_unsupported_total").increment(1);
+                    }
+                } else {
+                    warn!(target: "n42::observer", %peer, %error, "sync request failed");
+                }
                 self.sync_in_flight = false;
                 self.sync_started_at = None;
             }
@@ -598,6 +655,10 @@ impl ObserverOrchestrator {
             warn!(target: "n42::observer", %source, %requested_hash, received_hash = %hash, "gov5 peer returned a different block than requested");
             self.retry_gov5_block_fetch(source, requested_hash);
             return;
+        }
+        self.gov5_fetch_requested_at.remove(&hash);
+        if let Err(error) = self.network.cancel_gov5_block_fetch_reliable(hash).await {
+            warn!(target: "n42::observer", %hash, %error, "could not retire Gov5 fetch satisfied by an authenticated body");
         }
         if hash == self.head_block_hash || self.bad_blocks.should_skip(hash, "gov5_live_gossip") {
             return;
@@ -650,6 +711,12 @@ impl ObserverOrchestrator {
         if block_hash == self.head_block_hash || self.gov5_live_blocks.contains_key(&block_hash) {
             return;
         }
+        // Guard the entry point, not just the retry path: ancestry walks and
+        // finality catch-up both start fetches, and any of them re-requesting
+        // a hash we already rejected on its merits restarts the same loop.
+        if self.gov5_rejected.contains(&block_hash) {
+            return;
+        }
         if self.gov5_fetch_requested_at.len() >= MAX_GOV5_LIVE_PENDING
             && !self.gov5_fetch_requested_at.contains_key(&block_hash)
         {
@@ -675,8 +742,26 @@ impl ObserverOrchestrator {
         }
     }
 
+    /// Records a content-level rejection. Returns whether it was new, so the
+    /// caller logs the verdict once instead of once per fan-out attempt.
+    fn remember_gov5_rejection(&mut self, block_hash: B256) -> bool {
+        if !self.gov5_rejected.insert(block_hash) {
+            return false;
+        }
+        self.gov5_rejected_order.push_back(block_hash);
+        while self.gov5_rejected_order.len() > MAX_GOV5_REJECTED {
+            if let Some(evicted) = self.gov5_rejected_order.pop_front() {
+                self.gov5_rejected.remove(&evicted);
+            }
+        }
+        true
+    }
+
     fn retry_gov5_block_fetch(&mut self, failed_peer: PeerId, block_hash: B256) {
         self.gov5_fetch_requested_at.remove(&block_hash);
+        if self.gov5_rejected.contains(&block_hash) {
+            return;
+        }
         if let Some(peer) = self
             .connected_peers
             .iter()
@@ -1237,8 +1322,14 @@ impl ObserverOrchestrator {
                     if compact_injected && let Some(ref cache) = self.exec_output_cache {
                         cache.evict(hash);
                     }
-                    self.bad_blocks
-                        .insert_if_invalid(hash, &status.status, "observer_import");
+                    // The compact output came from an unauthenticated gossip peer.
+                    // A rejection after injection describes those bytes, not the
+                    // declared block hash, so evict above and keep the hash
+                    // retryable (HIGH-1, same rule as the orchestrator paths).
+                    if !compact_injected {
+                        self.bad_blocks
+                            .insert_if_invalid(hash, &status.status, "observer_import");
+                    }
                     warn!(target: "n42::observer", %hash, view, status = ?status.status, "new_payload rejected block");
                     false
                 }
@@ -1444,8 +1535,16 @@ impl ObserverOrchestrator {
             }
         }
 
-        let peers: Vec<_> = self.connected_peers.iter().copied().collect();
+        let peers: Vec<_> = self
+            .connected_peers
+            .iter()
+            .copied()
+            .filter(|peer| !self.sync_unsupported_peers.contains(peer))
+            .collect();
         if peers.is_empty() {
+            // Either nobody is connected, or every connected peer has told us
+            // it does not speak this protocol. Both mean there is no sync to
+            // start; the caller retries when the peer set changes.
             return None;
         }
 
@@ -1961,5 +2060,115 @@ mod tests {
 
         let third = select_sync_target(30, 30, 200, 138).unwrap();
         assert_eq!(third, (200, SyncTargetSource::GossipHint));
+    }
+
+    /// Minimal observer for state-machine tests that never touch the execution
+    /// layer. The receivers come back with it: dropping them closes the command
+    /// channels, and every send the observer makes would fail silently.
+    fn test_observer() -> (
+        ObserverOrchestrator,
+        mpsc::Receiver<NetworkCommand>,
+        mpsc::Receiver<NetworkCommand>,
+    ) {
+        let (command_tx, command_rx) = mpsc::channel(1024);
+        let (priority_tx, priority_rx) = mpsc::channel(16);
+        let network = NetworkHandle::new(command_tx, priority_tx);
+        let (_event_tx, event_rx) = mpsc::channel(16);
+        let execution = Arc::new(CatchupExecutionLayer::default());
+        (
+            ObserverOrchestrator::new(network, event_rx, execution, B256::ZERO),
+            command_rx,
+            priority_rx,
+        )
+    }
+
+    /// A content-level rejection must retire the hash rather than rotate the
+    /// fan-out. Against a live four-node gov5 chain the old behaviour re-derived
+    /// the same verdict ~1,465 times per second and wrote 66 MB of identical
+    /// log lines in two minutes, because every peer necessarily serves bytes
+    /// that decode the same way for a given hash.
+    #[test]
+    fn permanent_rejection_is_remembered_and_stops_refetching() {
+        let hash = B256::repeat_byte(0xC1);
+        let (mut orch, _command_rx, _priority_rx) = test_observer();
+
+        assert!(
+            orch.remember_gov5_rejection(hash),
+            "first rejection is new, so it is worth logging"
+        );
+        assert!(
+            !orch.remember_gov5_rejection(hash),
+            "a repeat must not log again"
+        );
+
+        // Both the retry path and the entry point have to honour it: ancestry
+        // walks and finality catch-up start fetches independently.
+        let peer = libp2p::PeerId::random();
+        orch.connected_peers.insert(peer);
+        orch.retry_gov5_block_fetch(libp2p::PeerId::random(), hash);
+        assert!(!orch.gov5_fetch_requested_at.contains_key(&hash));
+        orch.request_gov5_block(peer, hash);
+        assert!(
+            !orch.gov5_fetch_requested_at.contains_key(&hash),
+            "a rejected hash must not be re-requested through any path"
+        );
+
+        // An unrelated hash is unaffected.
+        let other = B256::repeat_byte(0xC2);
+        orch.request_gov5_block(peer, other);
+        assert!(orch.gov5_fetch_requested_at.contains_key(&other));
+    }
+
+    /// The rejection set is fed by peer-supplied hashes, so it needs a bound.
+    #[test]
+    fn rejection_set_is_bounded() {
+        let (mut orch, _command_rx, _priority_rx) = test_observer();
+        for i in 0..(MAX_GOV5_REJECTED + 64) {
+            let mut bytes = [0u8; 32];
+            bytes[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            orch.remember_gov5_rejection(B256::from(bytes));
+        }
+        assert_eq!(orch.gov5_rejected.len(), MAX_GOV5_REJECTED);
+        assert_eq!(orch.gov5_rejected_order.len(), MAX_GOV5_REJECTED);
+    }
+
+    /// A peer that does not speak N42 state-sync will never speak it on this
+    /// connection, so the rotation must drop it instead of coming back every
+    /// interval. Against an all-gov5 peer set (Go nodes, which have no reason
+    /// to implement this protocol) the old rotation logged a failure every 5
+    /// seconds forever.
+    #[test]
+    fn peers_without_state_sync_leave_the_rotation() {
+        let (mut orch, _command_rx, _priority_rx) = test_observer();
+        let unsupported = libp2p::PeerId::random();
+        let usable = libp2p::PeerId::random();
+        orch.connected_peers.insert(unsupported);
+        orch.connected_peers.insert(usable);
+
+        assert!(orch.sync_unsupported_peers.insert(unsupported));
+        assert!(
+            !orch.sync_unsupported_peers.insert(unsupported),
+            "a repeat verdict must not log again"
+        );
+
+        // Reconnecting may be a different build, so the verdict is per-connection.
+        orch.connected_peers.remove(&unsupported);
+        orch.sync_unsupported_peers.remove(&unsupported);
+        assert!(!orch.sync_unsupported_peers.contains(&unsupported));
+
+        // With every peer refusing, there is no sync to start at all.
+        orch.connected_peers.insert(unsupported);
+        orch.sync_unsupported_peers.insert(unsupported);
+        orch.sync_unsupported_peers.insert(usable);
+        let candidates: Vec<_> = orch
+            .connected_peers
+            .iter()
+            .copied()
+            .filter(|peer| !orch.sync_unsupported_peers.contains(peer))
+            .collect();
+        assert!(
+            candidates.is_empty(),
+            "no candidate should remain when every peer refused"
+        );
     }
 }

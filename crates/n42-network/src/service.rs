@@ -20,7 +20,7 @@ use crate::gossipsub::topics::{
     blob_sidecar_topic, block_announce_topic, consensus_topic, gov5_block_topic, gov5_h2_topic,
     h2_v4_topic, mempool_topic, verification_receipts_topic,
 };
-use crate::gov5_block::decode_gov5_block_rlp;
+use crate::gov5_block::{Gov5BlockError, attributable_hash, decode_gov5_block_rlp};
 use crate::gov5_rpc::{
     GOV5_BLOCK_BY_HASH_PROTOCOL, Gov5BlockByHashRequest, Gov5BlockByHashResponse,
     Gov5BlockPushRequest, Gov5BlockPushResponse, Gov5HotstuffDirectRequest,
@@ -51,6 +51,7 @@ const MAX_PENDING_GOV5_BLOCK_REQUESTS: usize = 256;
 // deadline instead of eagerly duplicating every request.
 const MAX_GOV5_BLOCK_FETCH_FANOUT: usize = 1;
 const MAX_RECENT_GOV5_BLOCK_REQUESTS: usize = 4096;
+const GOV5_BLOCK_FULFILLED_RETENTION: Duration = Duration::from_secs(30);
 const GOV5_BLOCK_REQUEST_COOLDOWN: Duration = Duration::from_millis(750);
 // Re-arm before the orchestrator's two-second retry. Late transport responses
 // are redundant and safely ignored after their request id is reaped.
@@ -70,6 +71,41 @@ fn stale_gov5_block_fetches(
                 .then_some(*hash)
         })
         .collect()
+}
+
+fn gov5_block_fulfilled_recently(
+    fulfilled: &mut HashMap<B256, Instant>,
+    block_hash: B256,
+    now: Instant,
+) -> bool {
+    if fulfilled.get(&block_hash).is_some_and(|fulfilled_at| {
+        now.saturating_duration_since(*fulfilled_at) < GOV5_BLOCK_FULFILLED_RETENTION
+    }) {
+        return true;
+    }
+    fulfilled.remove(&block_hash);
+    false
+}
+
+fn remember_gov5_block_fulfilled(
+    fulfilled: &mut HashMap<B256, Instant>,
+    block_hash: B256,
+    now: Instant,
+) {
+    if fulfilled.len() >= MAX_RECENT_GOV5_BLOCK_REQUESTS {
+        fulfilled.retain(|_, fulfilled_at| {
+            now.saturating_duration_since(*fulfilled_at) < GOV5_BLOCK_FULFILLED_RETENTION
+        });
+    }
+    if fulfilled.len() >= MAX_RECENT_GOV5_BLOCK_REQUESTS
+        && let Some(oldest) = fulfilled
+            .iter()
+            .min_by_key(|(_, fulfilled_at)| *fulfilled_at)
+            .map(|(hash, _)| *hash)
+    {
+        fulfilled.remove(&oldest);
+    }
+    fulfilled.insert(block_hash, now);
 }
 
 fn gov5_block_fetch_fanout(
@@ -204,6 +240,11 @@ pub enum NetworkCommand {
         peer: PeerId,
         block_hash: B256,
     },
+    /// Retire an in-flight Gov5 hash fetch after the same block body arrived
+    /// through gossip or the validator direct-push lane.
+    CancelGov5BlockFetch {
+        block_hash: B256,
+    },
     SendSyncResponse {
         request_id: u64,
         response: BlockSyncResponse,
@@ -262,6 +303,11 @@ pub enum NetworkEvent {
         source: PeerId,
         block_hash: B256,
         error: String,
+        /// True when the failure is a verdict about content the requested hash
+        /// commits to, so no peer can serve anything that decodes differently.
+        /// Consumers must stop re-requesting the hash; see
+        /// [`Gov5BlockError::is_permanent`].
+        permanent: bool,
     },
     H2V4Message {
         source: PeerId,
@@ -306,6 +352,10 @@ pub enum NetworkEvent {
     SyncRequestFailed {
         peer: PeerId,
         error: String,
+        /// True when the peer never advertised the N42 state-sync protocol, so
+        /// no retry against it can succeed. Consumers should drop it from the
+        /// sync rotation rather than come back every interval.
+        unsupported_protocol: bool,
     },
 }
 
@@ -653,6 +703,17 @@ impl NetworkHandle {
     ) -> Result<(), NetworkError> {
         self.send_priority(NetworkCommand::RequestGov5BlockByHash { peer, block_hash })
     }
+
+    pub async fn cancel_gov5_block_fetch_reliable(
+        &self,
+        block_hash: B256,
+    ) -> Result<(), NetworkError> {
+        Self::send_with_backpressure(
+            &self.priority_tx,
+            NetworkCommand::CancelGov5BlockFetch { block_hash },
+        )
+        .await
+    }
 }
 
 /// The network service drives the libp2p swarm and bridges messages between
@@ -691,6 +752,11 @@ pub struct NetworkService {
     pending_gov5_block_hashes: HashSet<B256>,
     /// Last attempt and peer per hash, used for bounded retry and peer rotation.
     recent_gov5_block_requests: HashMap<B256, (Instant, PeerId)>,
+    /// Short tombstones for bodies already delivered through any authenticated
+    /// path. The observer and participant can enqueue request/cancel commands
+    /// concurrently; retaining fulfillment closes the cancel-before-request
+    /// ordering without making historical hashes permanent.
+    recent_gov5_block_fulfilled: HashMap<B256, Instant>,
     /// Peers that advertised the native Gov5 block-by-hash protocol.
     gov5_block_by_hash_peers: HashSet<PeerId>,
     /// Peers that advertised N42's native state-sync protocol. Gov5 peers do
@@ -700,6 +766,10 @@ pub struct NetworkService {
     /// receive the proposal before the block can recover through Gov5's native
     /// block-by-hash RPC.
     gov5_served_blocks: HashMap<B256, Vec<u8>>,
+    /// Insertion order for `gov5_served_blocks` eviction. HashMap iteration
+    /// order is arbitrary, and evicting an arbitrary entry preferentially
+    /// drops exactly the fresh blocks followers are most likely to fetch.
+    gov5_served_block_order: VecDeque<B256>,
     /// Fixed-window protection for inbound catch-up work. Validators receive a
     /// higher allowance, while unauthenticated peers cannot monopolize the
     /// bounded response-channel table or node-side database reads.
@@ -1011,9 +1081,11 @@ impl NetworkService {
             pending_gov5_block_requests: HashMap::new(),
             pending_gov5_block_hashes: HashSet::new(),
             recent_gov5_block_requests: HashMap::new(),
+            recent_gov5_block_fulfilled: HashMap::new(),
             gov5_block_by_hash_peers: HashSet::new(),
             state_sync_peers: HashSet::new(),
             gov5_served_blocks: HashMap::new(),
+            gov5_served_block_order: VecDeque::new(),
             sync_request_windows: HashMap::new(),
             next_sync_id: 0,
             expected_validator_peer_ids,
@@ -1514,16 +1586,26 @@ impl NetworkService {
         }
     }
 
-    fn retain_gov5_served_block(&mut self, rlp: &[u8]) -> Result<B256, String> {
-        let block = decode_gov5_block_rlp(rlp).map_err(|error| error.to_string())?;
+    fn retain_gov5_served_block(&mut self, rlp: &[u8]) -> Result<B256, Gov5BlockError> {
+        let block = decode_gov5_block_rlp(rlp)?;
         if self.gov5_served_blocks.len() >= MAX_SERVED_GOV5_BLOCKS
             && !self.gov5_served_blocks.contains_key(&block.block_hash)
-            && let Some(evicted) = self.gov5_served_blocks.keys().next().copied()
         {
-            self.gov5_served_blocks.remove(&evicted);
+            // Evict the oldest entry, not an arbitrary HashMap key: the newest
+            // blocks are the ones followers are still about to request.
+            while let Some(evicted) = self.gov5_served_block_order.pop_front() {
+                if self.gov5_served_blocks.remove(&evicted).is_some() {
+                    break;
+                }
+            }
         }
-        self.gov5_served_blocks
-            .insert(block.block_hash, rlp.to_vec());
+        if self
+            .gov5_served_blocks
+            .insert(block.block_hash, rlp.to_vec())
+            .is_none()
+        {
+            self.gov5_served_block_order.push_back(block.block_hash);
+        }
         Ok(block.block_hash)
     }
 
@@ -1757,6 +1839,9 @@ impl NetworkService {
                 self.emit_event(NetworkEvent::SyncRequestFailed {
                     peer,
                     error: error.to_string(),
+                    // A transport failure says nothing about the peer's
+                    // protocol set.
+                    unsupported_protocol: false,
                 });
             }
             libp2p::request_response::Event::InboundFailure { peer, error, .. } => {
@@ -2194,11 +2279,23 @@ impl NetworkService {
                                 source: peer,
                                 block_hash: requested_hash,
                                 error,
+                                // This peer served a different block; another
+                                // may still hold the requested one.
+                                permanent: false,
                             });
                         }
                         return;
                     }
                     Err(error) => {
+                        // A rejection only rules out the requested hash if the
+                        // bytes actually belong to it. A peer that does not
+                        // have the block answers with an empty body, which
+                        // fails to decode but says nothing about the block —
+                        // and the serve cache is a 1024-entry FIFO, so an
+                        // honest, fully-synced peer returns empty for anything
+                        // older than that.
+                        let permanent = error.is_permanent()
+                            && attributable_hash(&response.rlp) == Some(requested_hash);
                         metrics::counter!("n42_gov5_block_fetch_failed_total").increment(1);
                         if !self
                             .pending_gov5_block_requests
@@ -2211,6 +2308,7 @@ impl NetworkService {
                                 source: peer,
                                 block_hash: requested_hash,
                                 error: format!("all fan-out peers failed; final response: {error}"),
+                                permanent,
                             });
                         }
                         return;
@@ -2224,6 +2322,11 @@ impl NetworkService {
                 // makes the overflow cleanup scan thousands of entries on
                 // every step of a long reverse ancestry.
                 self.recent_gov5_block_requests.remove(&requested_hash);
+                remember_gov5_block_fulfilled(
+                    &mut self.recent_gov5_block_fulfilled,
+                    requested_hash,
+                    Instant::now(),
+                );
                 metrics::counter!("n42_gov5_block_fetch_succeeded_total").increment(1);
                 self.emit_event(NetworkEvent::Gov5BlockFetched {
                     source: peer,
@@ -2256,6 +2359,8 @@ impl NetworkService {
                             source: peer,
                             block_hash,
                             error: format!("all fan-out peers failed; final failure: {error_text}"),
+                            // Transport-level: the content was never seen.
+                            permanent: false,
                         });
                     }
                 }
@@ -2708,6 +2813,18 @@ impl NetworkService {
             }
             NetworkCommand::RequestGov5BlockByHash { peer, block_hash } => {
                 let now = Instant::now();
+                if gov5_block_fulfilled_recently(
+                    &mut self.recent_gov5_block_fulfilled,
+                    block_hash,
+                    now,
+                ) {
+                    metrics::counter!(
+                        "n42_gov5_block_fetch_suppressed_total",
+                        "reason" => "already_fulfilled"
+                    )
+                    .increment(1);
+                    return;
+                }
                 // Hash de-duplication must not outlive the transport request
                 // that created it. In live catch-up a request could lose
                 // every terminal swarm event, leaving the orchestrator's
@@ -2811,6 +2928,27 @@ impl NetworkService {
                 metrics::counter!("n42_gov5_block_fetch_fanout_total")
                     .increment(selected_peers.len() as u64);
             }
+            NetworkCommand::CancelGov5BlockFetch { block_hash } => {
+                let requests_before = self.pending_gov5_block_requests.len();
+                self.pending_gov5_block_requests
+                    .retain(|_, pending_hash| *pending_hash != block_hash);
+                let reaped = requests_before - self.pending_gov5_block_requests.len();
+                let pending = self.pending_gov5_block_hashes.remove(&block_hash);
+                let recent = self.recent_gov5_block_requests.remove(&block_hash);
+                remember_gov5_block_fulfilled(
+                    &mut self.recent_gov5_block_fulfilled,
+                    block_hash,
+                    Instant::now(),
+                );
+                if reaped > 0 || pending || recent.is_some() {
+                    metrics::counter!("n42_gov5_block_fetch_cross_path_retired_total").increment(1);
+                    tracing::debug!(
+                        %block_hash,
+                        reaped,
+                        "retired Gov5 block fetch satisfied by another delivery path"
+                    );
+                }
+            }
             NetworkCommand::AnnounceBlock(data) => {
                 self.gossipsub_publish(block_announce_topic(), data, "block announcement");
             }
@@ -2861,6 +2999,7 @@ impl NetworkService {
                     self.emit_event(NetworkEvent::SyncRequestFailed {
                         peer,
                         error: "peer does not advertise N42 state-sync".to_string(),
+                        unsupported_protocol: true,
                     });
                     return;
                 }
@@ -2957,6 +3096,44 @@ mod tests {
             NetworkCommand::AnnounceBlock(data) => assert_eq!(data, vec![1, 2, 3]),
             other => panic!("expected AnnounceBlock, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_handle_cancel_gov5_block_fetch_uses_priority_lane() {
+        let (handle, _rx, mut prx) = test_handle();
+        let block_hash = B256::repeat_byte(0x42);
+
+        handle
+            .cancel_gov5_block_fetch_reliable(block_hash)
+            .await
+            .expect("fetch cancellation should queue");
+
+        match prx.try_recv().expect("queued cancellation") {
+            NetworkCommand::CancelGov5BlockFetch {
+                block_hash: received,
+            } => assert_eq!(received, block_hash),
+            other => panic!("expected CancelGov5BlockFetch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fulfilled_gov5_block_suppresses_reordered_request_until_expiry() {
+        let block_hash = B256::repeat_byte(0x43);
+        let started = Instant::now();
+        let mut fulfilled = HashMap::new();
+        remember_gov5_block_fulfilled(&mut fulfilled, block_hash, started);
+
+        assert!(gov5_block_fulfilled_recently(
+            &mut fulfilled,
+            block_hash,
+            started + Duration::from_secs(29)
+        ));
+        assert!(!gov5_block_fulfilled_recently(
+            &mut fulfilled,
+            block_hash,
+            started + Duration::from_secs(31)
+        ));
+        assert!(!fulfilled.contains_key(&block_hash));
     }
 
     #[test]
@@ -3257,6 +3434,7 @@ mod tests {
                 source,
                 block_hash,
                 error: "deadline".to_owned(),
+                permanent: false,
             },
         ];
 
