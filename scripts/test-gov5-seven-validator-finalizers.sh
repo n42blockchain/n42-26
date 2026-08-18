@@ -6,6 +6,8 @@ finalizer="$script_dir/gov5-seven-validator-finalize-after-monitors.sh"
 verifier="$script_dir/gov5-seven-validator-final-verifier.sh"
 post="$script_dir/gov5-seven-validator-post-soak-finalizer.sh"
 milestones="$script_dir/gov5-seven-validator-milestone-monitor.sh"
+qualification="$script_dir/gov5-interop-qualification.sh"
+readonly="$script_dir/audit-gov5-burst-readonly.sh"
 
 for script in "$finalizer" "$verifier" "$post" "$milestones"; do
   bash -n "$script"
@@ -46,6 +48,23 @@ rg -F 'n42_consensusStatus' "$post" >/dev/null
 rg -F 'n42_equivocations' "$post" >/dev/null
 rg -F 'postTransactionConsensus:' "$post" >/dev/null
 
+# A completed burst can be resumed without resending transactions when a
+# later cross-client RPC audit fails.  Block comparisons deliberately ignore
+# only the known Gov5/Reth presentation-only fields while retaining exact
+# canonical, transaction, receipt, log, state, and storage comparisons.
+rg -F 'N42_POST_RESUME_EXISTING_BURST' "$post" >/dev/null
+rg -F 'N42_QUAL_BURST_RESUME_EXISTING="$resume_existing_burst"' "$post" >/dev/null
+rg -F 'burst_already_passed=true' "$post" >/dev/null
+rg -F 'noTransactionsResentDuringResume' "$post" >/dev/null
+rg -F '! test -s "$heads"' "$post" >/dev/null
+rg -F 'in_scope=(!timestamped || prefix >= start)' "$post" >/dev/null
+! rg -F '! awk -v start=' "$post" >/dev/null
+rg -F 'del(.rewards,.verifier,.totalDifficulty,.sha3Uncles,.size)' "$qualification" >/dev/null
+rg -F 'blockRpcComparison:"canonical-and-execution-fields"' "$qualification" >/dev/null
+rg -F 'storageRpcComparison:"numeric-word-value"' "$qualification" >/dev/null
+rg -F 'ports=(28501 28502 28503 28504 28505 29545 29546)' "$readonly" >/dev/null
+rg -F 'allSevenEndpointsExact:(($rpc|length)==7)' "$readonly" >/dev/null
+
 # All unattended controllers must fail close with atomic diagnostic evidence.
 for script in "$finalizer" "$post" "$milestones"; do
   rg -F 'record_unexpected_failure' "$script" >/dev/null ||
@@ -57,4 +76,6 @@ jq -nc '{event:"gov5_seven_validator_finalizer_config_test",status:"PASS",
   fullSoakRustLeaderCoverage:true,rustLeaderLogsBound:true,
   atomicLeaderEvidence:true,singleLeaderArtifactRequired:true,
   transactionArtifactShaBoundEndToEnd:true,exactAlternatingMixedIngress:true,
-  postTransactionConsensusRechecked:true,unattendedFailuresPersisted:true}'
+  postTransactionConsensusRechecked:true,transactionBurstResumeWithoutResend:true,
+  blockRpcPresentationNormalized:true,storageRpcWidthNormalized:true,
+  readonlyEvmCoversSevenEndpoints:true,unattendedFailuresPersisted:true}'

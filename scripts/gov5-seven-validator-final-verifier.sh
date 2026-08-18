@@ -233,7 +233,14 @@ for milestone in $milestone_seconds; do
   milestone_audits="$(jq -nc --argjson audits "$milestone_audits" \
     --argjson audit "$milestone_audit" '$audits + [$audit]')"
 done
-for log in "$runtime"/logs/gov{1,2,3,4,5}.log "$runtime"/logs/rust.log "$runtime"/logs/rust2.log; do
+# The two Rust logs were fully classified immediately above.  That audit keeps
+# every structured ERROR fatal except the exact same-view background ancestor
+# completion whose parent/child relationship it independently proves over the
+# corresponding live RPC endpoint.  Re-scanning those logs here with a raw
+# `ERROR` predicate would discard that proof and turn a safely refused head
+# regression into a false final failure.  Keep this independent raw scan for
+# Gov5, whose logs do not have that Rust-only recovery classification.
+for log in "$runtime"/logs/gov{1,2,3,4,5}.log; do
   require_file "$log"
   # Do not use a global case-insensitive `error` match: the consensus transport
   # records harmless startup de-duplication as `error=Duplicate`.  Structured

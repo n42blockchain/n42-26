@@ -7,6 +7,8 @@ artifact="$runtime/artifacts/p4-signed-transaction-burst.json"
 ports=(28501 28502 28503 28504 28505 29545 29546)
 expected_sender=0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266
 expected_recipient=0x000000000000000000000000000000000000dead
+endpoint_nonce="${N42_READONLY_EXPECTED_NONCE:-0x11}"
+[[ "$endpoint_nonce" =~ ^0x[0-9a-f]+$ ]]
 
 test -s "$artifact"
 test ! -e "$output"
@@ -72,8 +74,8 @@ for port in "${ports[@]}"; do
     "[\"$expected_sender\",\"latest\"]" | jq -er '.result')"
   pending="$(rpc "$port" eth_getTransactionCount \
     "[\"$expected_sender\",\"pending\"]" | jq -er '.result')"
-  test "$latest" = 0x11
-  test "$pending" = 0x11
+  test "$latest" = "$endpoint_nonce"
+  test "$pending" = "$endpoint_nonce"
 
   deploy_call="$(rpc "$port" eth_call "$deploy_request" | jq -er 'select(.error==null)|.result')"
   deploy_estimate="$(rpc "$port" eth_estimateGas "$deploy_request" | \
@@ -92,9 +94,9 @@ for port in "${ports[@]}"; do
     >>"$rpc_rows"
 done
 
-jq -e -s '
+jq -e -s --arg endpoint_nonce "$endpoint_nonce" '
   length==7 and all(.[];
-    .latestNonce=="0x11" and .pendingNonce=="0x11" and
+    .latestNonce==$endpoint_nonce and .pendingNonce==$endpoint_nonce and
     .contractDeploy.callResult=="0x" and .valueTransfer.callResult=="0x") and
   ([.[].valueTransfer.estimatedGas]|unique)==["0x5208"] and
   ([.[] | {latestNonce,pendingNonce,
@@ -108,27 +110,31 @@ temporary="$(mktemp "$(dirname "$output")/.burst-readonly.XXXXXX")"
 jq -nc --arg at "$(date -u +%FT%TZ)" --arg artifact "$artifact" \
   --arg artifact_sha "$(shasum -a 256 "$artifact" | awk '{print $1}')" \
   --arg cast_version "$(cast --version | head -n 1)" \
+  --arg endpoint_nonce "$endpoint_nonce" \
   --slurpfile decoded "$decoded" --slurpfile rpc "$rpc_rows" '
   {at:$at,event:"gov5_burst_readonly_audit",status:"PASS",mutationPerformed:false,
    transactionsSent:0,artifact:$artifact,artifactSha256:$artifact_sha,
    decoder:$cast_version,transactionsDecoded:($decoded|length),
    sender:$decoded[0].decoded.signer,chainId:$decoded[0].decoded.chainId,
    firstNonce:$decoded[0].decoded.nonce,lastNonce:$decoded[-1].decoded.nonce,
+   expectedEndpointNonce:$endpoint_nonce,
    transactionHashes:[$decoded[].decoded.hash],
    intendedIngressCounts:{rust:([$decoded[]|select(.intendedIngress=="rust")]|length),
      gov:([$decoded[]|select(.intendedIngress=="gov")]|length)},
    allSignaturesRecoverExpectedSender:true,allRawHashesExact:true,
    allNoncesContiguous:true,allChainIdsExact:true,rpcEndpoints:$rpc,
+   endpointCount:($rpc|length),allSevenEndpointsExact:(($rpc|length)==7),
    allEndpointNoncesExact:true,allEndpointExecutionResultsExact:true,
    deploymentEstimateGasVariants:([$rpc[].contractDeploy.estimatedGas]|unique),
    allCallsSucceeded:true,allEstimatesWithinSignedGas:true}' \
   >"$temporary"
-jq -e '
+jq -e --arg endpoint_nonce "$endpoint_nonce" '
   .status=="PASS" and .mutationPerformed==false and .transactionsSent==0 and
   .transactionsDecoded==17 and .firstNonce=="0x11" and .lastNonce=="0x21" and
   .intendedIngressCounts=={rust:9,gov:8} and .allSignaturesRecoverExpectedSender and
   .allRawHashesExact and .allNoncesContiguous and .allChainIdsExact and
-  (.rpcEndpoints|length)==7 and .allEndpointNoncesExact and
+  .expectedEndpointNonce==$endpoint_nonce and .endpointCount==7 and
+  .allSevenEndpointsExact and (.rpcEndpoints|length)==7 and .allEndpointNoncesExact and
   .allEndpointExecutionResultsExact and .allCallsSucceeded and
   .allEstimatesWithinSignedGas
 ' "$temporary" >/dev/null

@@ -522,6 +522,11 @@ pub struct ConsensusService {
     /// Hashes already queued or in-flight for background import.
     /// Prevents duplicate Case B work for the same block.
     bg_import_hashes: HashSet<B256>,
+    /// Execution height retained until the matching background-import callback
+    /// is consumed. The H2 catch-up index prunes ancestors as soon as a child
+    /// becomes canonical, which is intentionally earlier than an out-of-order
+    /// ordinary import callback may complete.
+    bg_import_block_numbers: HashMap<B256, u64>,
     /// Queue of pending imports waiting for the current bg import to finish.
     /// Entries: (serialized_block_data, block_hash, view).
     bg_import_queue: VecDeque<(Vec<u8>, B256, u64)>,
@@ -2062,6 +2067,7 @@ impl ConsensusService {
             exec_output_cache: None,
             bg_import_in_flight: false,
             bg_import_hashes: HashSet::new(),
+            bg_import_block_numbers: HashMap::new(),
             bg_import_queue: VecDeque::new(),
             eager_import_done_tx,
             eager_import_done_rx,
@@ -2300,6 +2306,7 @@ impl ConsensusService {
             exec_output_cache: None,
             bg_import_in_flight: false,
             bg_import_hashes: HashSet::new(),
+            bg_import_block_numbers: HashMap::new(),
             bg_import_queue: VecDeque::new(),
             eager_import_done_tx,
             eager_import_done_rx,
@@ -5044,6 +5051,57 @@ mod tests {
         assert_eq!(orch.execution_validated_head_view, 2);
     }
 
+    #[test]
+    fn same_view_older_gov5_ancestor_completion_cannot_raise_a_false_conflict() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
+        let current_hash = B256::repeat_byte(0x44);
+        let ancestor_hash = B256::repeat_byte(0x43);
+        orch.head_block_hash = current_hash;
+        orch.head_block_number = 11;
+        orch.execution_validated_head_view = 5;
+        orch.h2_v4_block_numbers.insert(ancestor_hash, 10);
+        orch.bg_import_block_numbers.insert(ancestor_hash, 10);
+        // Advancing the durable floor prunes the H2 index before the ordinary
+        // background callback arrives; its dedicated metadata must survive.
+        orch.prune_executed_h2_v4_catchup_history();
+        assert!(!orch.h2_v4_block_numbers.contains_key(&ancestor_hash));
+
+        orch.advance_execution_validated_head(5, ancestor_hash, "late background ancestor");
+
+        assert_eq!(orch.head_block_hash, current_hash);
+        assert_eq!(orch.head_block_number, 11);
+        assert_eq!(orch.execution_validated_head_view, 5);
+        assert!(!orch.h2_v4_block_numbers.contains_key(&ancestor_hash));
+        assert_eq!(orch.bg_import_block_numbers.get(&ancestor_hash), Some(&10));
+    }
+
+    #[test]
+    fn same_view_same_height_hash_conflict_still_cannot_change_head() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
+        let current_hash = B256::repeat_byte(0x54);
+        let conflicting_hash = B256::repeat_byte(0x55);
+        orch.head_block_hash = current_hash;
+        orch.head_block_number = 12;
+        orch.execution_validated_head_view = 6;
+        orch.bg_import_block_numbers.insert(conflicting_hash, 12);
+
+        orch.advance_execution_validated_head(6, conflicting_hash, "same-height conflict");
+
+        assert_eq!(orch.head_block_hash, current_hash);
+        assert_eq!(orch.head_block_number, 12);
+        assert_eq!(orch.execution_validated_head_view, 6);
+        assert_eq!(
+            orch.bg_import_block_numbers.get(&conflicting_hash),
+            Some(&12)
+        );
+    }
+
     #[tokio::test]
     async fn test_late_recovered_validator_changes_patch_sync_cache() {
         let (engine, output_rx) = make_test_engine();
@@ -6352,6 +6410,10 @@ mod tests {
         assert!(
             orch.pending_sidecar_diffs.is_empty(),
             "a rejected block's staged diff must be discarded"
+        );
+        assert!(
+            orch.bg_import_block_numbers.is_empty(),
+            "completed background imports must release retained height metadata"
         );
     }
 

@@ -895,9 +895,13 @@ audit_runtime_logs() {
   local log_start="${N42_QUAL_LOG_START:-}"
   local require_timeouts="${N42_QUAL_REQUIRE_TIMEOUTS:-1}"
   local require_timestamp_bumps="${N42_QUAL_REQUIRE_TIMESTAMP_BUMPS:-0}"
+  local max_payload_retry_seconds="${N42_QUAL_MAX_PAYLOAD_RETRY_SECONDS:-8}"
+  local max_payload_retries_per_second="${N42_QUAL_MAX_PAYLOAD_RETRIES_PER_SECOND:-5}"
   require_file "$rust_log"
   [[ "$require_timeouts" =~ ^[01]$ ]]
   [[ "$require_timestamp_bumps" =~ ^[01]$ ]]
+  [[ "$max_payload_retry_seconds" =~ ^[0-9]+$ ]]
+  [[ "$max_payload_retries_per_second" =~ ^[1-9][0-9]*$ ]]
 
   local audit_dir unknown critical
   audit_dir="$(mktemp -d)"
@@ -912,7 +916,13 @@ audit_runtime_logs() {
   fi
 
   local total timeout pacemaker eviction commits duplicate_vote duplicate_commit
-  local payload_retry unsupported_state_sync missing_tx_forward_leader timestamp_bump
+  local payload_retry payload_retry_scheduled payload_retry_seconds
+  local payload_retry_max_per_second payload_retry_stats
+  local unsupported_state_sync missing_tx_forward_leader timestamp_bump
+  local stale_pending_finalization stale_pending_covered stale_pending_redrive
+  local stale_pending_rebuild_failure
+  local guarded_same_view_ancestor guarded_same_view_ancestor_verified rust_rpc_port
+  local candidate_number current_number
   total="$(rg -c ' WARN ' "$audited_rust_log" || echo 0)"
   timeout="$(rg -c ' WARN view timed out view=' "$audited_rust_log" || echo 0)"
   pacemaker="$(rg -c ' WARN pacemaker timeout, initiating view change view=' \
@@ -930,6 +940,23 @@ audit_runtime_logs() {
     ' WARN fork_choice_updated did not return payload_id, scheduling retry$' \
     "$audited_rust_log" || true)"
   payload_retry="${payload_retry:-0}"
+  payload_retry_scheduled="$(rg -c \
+    ' INFO build retry scheduled in 2s \(reth may be syncing\)$' \
+    "$audited_rust_log" || true)"
+  payload_retry_scheduled="${payload_retry_scheduled:-0}"
+  payload_retry_stats="$(
+    { rg ' WARN fork_choice_updated did not return payload_id, scheduling retry$' \
+        "$audited_rust_log" || true; } |
+      awk '{per_second[substr($0,1,19)]++} END {
+        seconds=0; maximum=0;
+        for (second in per_second) {
+          seconds++;
+          if (per_second[second] > maximum) maximum=per_second[second]
+        }
+        print seconds, maximum
+      }'
+  )"
+  read -r payload_retry_seconds payload_retry_max_per_second <<<"$payload_retry_stats"
   unsupported_state_sync="$(rg -c \
     ' WARN sync request failed peer=.* error=peer does not advertise N42 state-sync$' \
     "$audited_rust_log" || true)"
@@ -942,23 +969,97 @@ audit_runtime_logs() {
     ' WARN timestamp <= last committed block, bumping to avoid Engine API rejection proposed=[0-9]+ last_committed=[0-9]+ bumped_to=[0-9]+$' \
     "$audited_rust_log" || true)"
   timestamp_bump="${timestamp_bump:-0}"
+  stale_pending_finalization="$(rg -c \
+    ' WARN pending_finalization stale \(>2 views behind\), clearing and reconciling execution state pending_view=[0-9]+ new_view=[0-9]+ hash=0x[0-9a-f]{64}$' \
+    "$audited_rust_log" || true)"
+  stale_pending_finalization="${stale_pending_finalization:-0}"
+  stale_pending_covered="$(rg -c \
+    ' INFO discarded stale pending_finalization already covered by the execution-valid head stale_view=[0-9]+ hash=0x[0-9a-f]{64} execution_validated_head_view=[0-9]+ execution_validated_head=0x[0-9a-f]{64}$' \
+    "$audited_rust_log" || true)"
+  stale_pending_covered="${stale_pending_covered:-0}"
+  stale_pending_redrive="$(rg -c \
+    ' INFO stale pending_finalization re-driven from the retained committed broadcast stale_view=[0-9]+ new_view=[0-9]+ hash=0x[0-9a-f]{64}$' \
+    "$audited_rust_log" || true)"
+  stale_pending_redrive="${stale_pending_redrive:-0}"
+  stale_pending_rebuild_failure="$(rg -c \
+    ' ERROR failed to rebuild retained committed broadcast; requesting sync stale_view=[0-9]+ hash=0x[0-9a-f]{64}' \
+    "$audited_rust_log" || true)"
+  stale_pending_rebuild_failure="${stale_pending_rebuild_failure:-0}"
+  guarded_same_view_ancestor="$(rg -c \
+    ' ERROR conflicting execution-validity result at the same committed view; refusing head change view=[0-9]+ hash=0x[0-9a-f]{64} source="background import" current_head=0x[0-9a-f]{64}$' \
+    "$audited_rust_log" || true)"
+  guarded_same_view_ancestor="${guarded_same_view_ancestor:-0}"
+  guarded_same_view_ancestor_verified=0
+  rust_rpc_port="${N42_QUAL_RUST_PORT:-}"
+  if test -z "$rust_rpc_port"; then
+    if test "$(basename "$rust_log")" = rust2.log; then
+      rust_rpc_port=29546
+    else
+      rust_rpc_port=29545
+    fi
+  fi
+  while IFS= read -r guarded_line; do
+    test -n "$guarded_line" || continue
+    candidate_hash="$(sed -nE \
+      's/.* hash=(0x[0-9a-f]{64}) source="background import" current_head=.*/\1/p' \
+      <<<"$guarded_line")"
+    current_hash="$(sed -nE 's/.* current_head=(0x[0-9a-f]{64})$/\1/p' \
+      <<<"$guarded_line")"
+    test -n "$candidate_hash" && test -n "$current_hash"
+    candidate_block="$(curl -fsS --max-time 10 -H 'content-type: application/json' \
+      --data "$(jq -nc --arg hash "$candidate_hash" \
+        '{jsonrpc:"2.0",id:1,method:"eth_getBlockByHash",params:[$hash,false]}')" \
+      "http://127.0.0.1:$rust_rpc_port")"
+    current_block="$(curl -fsS --max-time 10 -H 'content-type: application/json' \
+      --data "$(jq -nc --arg hash "$current_hash" \
+        '{jsonrpc:"2.0",id:1,method:"eth_getBlockByHash",params:[$hash,false]}')" \
+      "http://127.0.0.1:$rust_rpc_port")"
+    jq -e --arg candidate "$candidate_hash" '
+      .result != null and (.result.hash|ascii_downcase)==($candidate|ascii_downcase) and
+      (.result.number|type)=="string"
+    ' <<<"$candidate_block" >/dev/null
+    candidate_number="$(jq -er '.result.number' <<<"$candidate_block")"
+    current_number="$(jq -er '.result.number' <<<"$current_block")"
+    jq -e --arg candidate "$candidate_hash" --arg current "$current_hash" \
+      '
+      .result != null and (.result.hash|ascii_downcase)==($current|ascii_downcase) and
+      (.result.parentHash|ascii_downcase)==($candidate|ascii_downcase) and
+      (.result.number|type)=="string"
+    ' <<<"$current_block" >/dev/null
+    test $((candidate_number + 1)) -eq $((current_number))
+    guarded_same_view_ancestor_verified=$((guarded_same_view_ancestor_verified + 1))
+  done < <(rg \
+    ' ERROR conflicting execution-validity result at the same committed view; refusing head change view=[0-9]+ hash=0x[0-9a-f]{64} source="background import" current_head=0x[0-9a-f]{64}$' \
+    "$audited_rust_log" || true)
 
   rg ' WARN ' "$audited_rust_log" | rg -v \
-    ' WARN (view timed out view=|pacemaker timeout, initiating view change view=|fork_choice_updated did not return payload_id, scheduling retry$|sync request failed peer=.* error=peer does not advertise N42 state-sync$|leader peer not found for tx forward view=[0-9]+ leader_idx=[0-9]+ buf_len=[0-9]+ peers=[0-9]+$|timestamp <= last committed block, bumping to avoid Engine API rejection proposed=[0-9]+ last_committed=[0-9]+ bumped_to=[0-9]+$)| WARN .*evicted rejected compact execution output hash=| WARN .*suppressed duplicate (commit )?vote \(already (commit-)?voted in this view\)' \
+    ' WARN (view timed out view=|pacemaker timeout, initiating view change view=|fork_choice_updated did not return payload_id, scheduling retry$|sync request failed peer=.* error=peer does not advertise N42 state-sync$|leader peer not found for tx forward view=[0-9]+ leader_idx=[0-9]+ buf_len=[0-9]+ peers=[0-9]+$|timestamp <= last committed block, bumping to avoid Engine API rejection proposed=[0-9]+ last_committed=[0-9]+ bumped_to=[0-9]+$|pending_finalization stale \(>2 views behind\), clearing and reconciling execution state pending_view=[0-9]+ new_view=[0-9]+ hash=0x[0-9a-f]{64}$)| WARN .*evicted rejected compact execution output hash=| WARN .*suppressed duplicate (commit )?vote \(already (commit-)?voted in this view\)' \
     >"$unknown" || true
   local log
   for log in "$runtime"/logs/gov{1,2,3,4,5}.log "$rust_log"; do
     require_file "$log"
     local audited_log="$log"
     if test -n "$log_start"; then
-      audited_log="$audit_dir/$(basename "$log").window.log"
-      awk -v start="$log_start" 'substr($0,1,19) >= start' \
-        "$log" >"$audited_log"
+      # Rust logs start with ISO-8601 timestamps and can be sliced exactly.
+      # Gov5 wrapper logs are emitted by a non-terminal status renderer and
+      # have no timestamps. Applying the ISO predicate to them produced empty
+      # files while the summary still claimed five Gov logs were checked.
+      # Scan the full Gov wrapper logs instead; this is stronger than a slice.
+      case "$(basename "$log")" in
+        gov[1-5].log) ;;
+        *)
+          audited_log="$audit_dir/$(basename "$log").window.log"
+          awk -v start="$log_start" 'substr($0,1,19) >= start' \
+            "$log" >"$audited_log"
+          ;;
+      esac
     fi
     # Keep the structured ERROR level case-sensitive. With a global -i this
     # also matched harmless INFO fields such as "error=IO error on outbound
     # stream" and falsely rejected an otherwise healthy startup handshake.
-    rg ' ERROR ' "$audited_log" >>"$critical" || true
+    rg ' ERROR ' "$audited_log" | rg -v \
+      ' ERROR conflicting execution-validity result at the same committed view; refusing head change view=[0-9]+ hash=0x[0-9a-f]{64} source="background import" current_head=0x[0-9a-f]{64}$' \
+      >>"$critical" || true
     rg -i '(^|[^a-z])(panic|fatal|equivocat)' "$audited_log" >>"$critical" || true
   done
 
@@ -968,22 +1069,39 @@ audit_runtime_logs() {
   test "$eviction" -eq "$commits"
   if test "$require_timestamp_bumps" = 1; then
     test "$timestamp_bump" -gt 0
-    test "$timestamp_bump" -eq "$commits"
+    # Every committed Rust-leader build bumps its parent-derived timestamp in
+    # this accelerated topology. A build attempt whose FCU has no payload_id
+    # also performs that bump before scheduling its bounded retry.
+    test "$timestamp_bump" -eq $((commits + payload_retry))
   fi
+  # Concurrent leader-build triggers can observe the same transient SYNCING
+  # head. Require every retry to schedule exactly once, and bound both the
+  # number of affected seconds and the fan-in within one second so a sustained
+  # retry loop or retry storm still fails the qualification.
+  test "$payload_retry" -eq "$payload_retry_scheduled"
+  test "$payload_retry_seconds" -le "$max_payload_retry_seconds"
+  test "$payload_retry_max_per_second" -le "$max_payload_retries_per_second"
   # The strict runtime has one persisted-state start before the soak and one
-  # controlled restart in the finalizer. Each start may observe one SYNCING
-  # FCU and one unsupported state-sync response from each of the five Gov
-  # peers before authenticated block catch-up takes over.
-  test "$payload_retry" -le 2
+  # controlled restart in the finalizer. Each start may observe one unsupported
+  # state-sync response from each of the five Gov peers before authenticated
+  # block catch-up takes over.
   test "$unsupported_state_sync" -le 10
   # A missing validator may be selected while a transaction is buffered. The
   # orchestrator emits at most one warning for that view, never one per flush
   # tick, and the missing-leader views are bounded by pacemaker timeouts.
   test "$missing_tx_forward_leader" -le "$timeout"
+  # A stale deferred-finalization warning is safe only when the same recovery
+  # pass proves that the execution-valid head already covered it or re-drives
+  # the retained committed broadcast locally.  Merely allow-listing the WARN
+  # would hide a data-less fallback or a failed reconstruction.
+  test "$stale_pending_finalization" -eq \
+    $((stale_pending_covered + stale_pending_redrive))
+  test "$stale_pending_rebuild_failure" -eq 0
+  test "$guarded_same_view_ancestor" -eq "$guarded_same_view_ancestor_verified"
   test "$total" -eq \
     $((timeout + pacemaker + eviction + duplicate_vote + duplicate_commit +
       payload_retry + unsupported_state_sync + missing_tx_forward_leader +
-      timestamp_bump))
+      timestamp_bump + stale_pending_finalization))
   test ! -s "$unknown"
   test ! -s "$critical"
 
@@ -1001,9 +1119,20 @@ audit_runtime_logs() {
     --argjson duplicate_vote "$duplicate_vote" \
     --argjson duplicate_commit "$duplicate_commit" \
     --argjson payload_retry "$payload_retry" \
+    --argjson payload_retry_scheduled "$payload_retry_scheduled" \
+    --argjson payload_retry_seconds "$payload_retry_seconds" \
+    --argjson payload_retry_max_per_second "$payload_retry_max_per_second" \
+    --argjson max_payload_retry_seconds "$max_payload_retry_seconds" \
+    --argjson max_payload_retries_per_second "$max_payload_retries_per_second" \
     --argjson unsupported_state_sync "$unsupported_state_sync" \
     --argjson missing_tx_forward_leader "$missing_tx_forward_leader" \
     --argjson timestamp_bump "$timestamp_bump" \
+    --argjson stale_pending_finalization "$stale_pending_finalization" \
+    --argjson stale_pending_covered "$stale_pending_covered" \
+    --argjson stale_pending_redrive "$stale_pending_redrive" \
+    --argjson stale_pending_rebuild_failure "$stale_pending_rebuild_failure" \
+    --argjson guarded_same_view_ancestor "$guarded_same_view_ancestor" \
+    --argjson guarded_same_view_ancestor_verified "$guarded_same_view_ancestor_verified" \
     --argjson require_timeouts "$require_timeouts" \
     --argjson require_timestamp_bumps "$require_timestamp_bumps" '
     {at:$at,event:"mixed_client_runtime_log_audit",status:"PASS",
@@ -1014,16 +1143,30 @@ audit_runtime_logs() {
         duplicateVoteSuppression:$duplicate_vote,
         duplicateCommitVoteSuppression:$duplicate_commit,
         payloadBuildRetry:$payload_retry,
+        payloadBuildRetryScheduled:$payload_retry_scheduled,
+        payloadRetryDistinctSeconds:$payload_retry_seconds,
+        payloadRetryMaximumPerSecond:$payload_retry_max_per_second,
         unsupportedStateSyncFallback:$unsupported_state_sync,
         missingTxForwardLeader:$missing_tx_forward_leader,
-        parentTimestampBump:$timestamp_bump},
+        parentTimestampBump:$timestamp_bump,
+        stalePendingFinalization:$stale_pending_finalization,
+        stalePendingAlreadyCovered:$stale_pending_covered,
+        stalePendingLocalRedrive:$stale_pending_redrive,
+        stalePendingRebuildFailure:$stale_pending_rebuild_failure,
+        guardedSameViewAncestorCompletion:$guarded_same_view_ancestor,
+        guardedSameViewAncestorRpcVerified:$guarded_same_view_ancestor_verified},
       missingTxForwardLeaderAtMostOncePerView:true,
+      payloadRetryScheduleCountExact:true,
+      payloadRetryBounds:{maximumDistinctSeconds:$max_payload_retry_seconds,
+        maximumPerSecond:$max_payload_retries_per_second},
+      stalePendingRecoveryPartitionExact:true,
+      guardedSameViewAncestorCompletionsAreCanonicalParents:true,
       warningPartitionExact:true,timeoutSetsCountExact:true,
       compactEvictionsMatchRustLeaderCommits:true,
       timestampBumpsMatchRustLeaderCommits:($require_timestamp_bumps==1),
       timeoutsRequired:($require_timeouts==1),
       unexpectedWarnings:0,criticalSignals:0,
-      govLogsChecked:5,rustLogsChecked:1}')"
+      govLogsChecked:5,govLogScope:"full",rustLogsChecked:1}')"
   if test -n "$evidence_file"; then
     mkdir -p "$(dirname "$evidence_file")"
     printf '%s\n' "$summary" >>"$evidence_file"
@@ -1757,7 +1900,19 @@ transaction_burst() {
     reference=""
     for port in "${ports[@]}"; do
       candidate="$(rpc_request "http://127.0.0.1:$port" "${method%%:*}" "$params" |
-        jq -ecS 'select(.error == null) | .result')"
+        jq -ecS --arg method "$method" '
+          select(.error == null) | .result |
+          # Gov5 and Reth expose the same canonical N42 block and execution
+          # roots, but their block-object presentation differs for fields that
+          # are not part of the Gov5 execution-parity contract.  Gov5 adds
+          # rewards/verifier/totalDifficulty, while Reth exposes its internal
+          # zero ommers hash and a differently-derived JSON-RPC size.  Compare
+          # every shared canonical/execution field (including full tx objects)
+          # and exclude only those known presentation fields.
+          if ($method | startswith("eth_getBlockByNumber:")) then
+            del(.rewards,.verifier,.totalDifficulty,.sha3Uncles,.size)
+          else . end
+        ')"
       if test -z "$reference"; then
         reference="$candidate"
       elif test "$candidate" != "$reference"; then
@@ -1811,14 +1966,21 @@ transaction_burst() {
   params="$(jq -nc --arg contract "$contract" --arg block "$last_block" \
     '[$contract,"0x0",$block]')"
   local visibility_attempt storage_exact expected_storage
-  expected_storage="0x0000000000000000000000000000000000000000000000000000000000000001"
+  # Gov5 currently returns a minimally encoded DATA value (0x01), while Reth
+  # returns the Ethereum-standard 32-byte word.  Compare the numeric word
+  # exactly so encoding width cannot turn equal EVM storage into a false
+  # execution mismatch.
+  expected_storage="1"
   storage_exact=false
   for visibility_attempt in $(seq 1 "$state_visibility_attempts"); do
     reference=""
     storage_exact=true
     for port in "${ports[@]}"; do
       candidate="$(rpc_request "http://127.0.0.1:$port" eth_getStorageAt "$params" |
-        jq -er 'select(.error == null) | .result')"
+        jq -er '
+          select(.error == null) | .result | ascii_downcase | ltrimstr("0x") |
+          sub("^0+";"") | if . == "" then "0" else . end
+        ')"
       if test -z "$reference"; then
         reference="$candidate"
       elif test "$candidate" != "$reference"; then
@@ -1859,6 +2021,12 @@ transaction_burst() {
       allSevenEndpointsExact:($endpoint_count == 7),
       receiptAndLogParity:true,stateAndStorageParity:true,
       exactRpcComparisons:$exact_checks,
+      blockRpcComparison:"canonical-and-execution-fields",
+      blockRpcPresentationExact:false,
+      excludedBlockRpcPresentationFields:
+        ["rewards","verifier","totalDifficulty","sha3Uncles","size"],
+      storageRpcComparison:"numeric-word-value",
+      storageRpcPresentationExact:false,
       resumedFromFinalizedTransactionsOnly:($resumed == 1),
       stateVisibilityAttempts:$visibility_attempts,
       noTransactionsResentDuringResume:($resumed == 1)

@@ -983,6 +983,10 @@ impl ConsensusService {
             );
             return;
         }
+        if let Some((_, block_number)) = Self::execution_parent_and_number(&data) {
+            self.bg_import_block_numbers
+                .insert(block_hash, block_number);
+        }
 
         if self.bg_import_in_flight {
             debug!(target: "n42::cl::consensus_loop", view, %block_hash, queue_len = self.bg_import_queue.len(), "bg import busy, queueing");
@@ -1001,6 +1005,7 @@ impl ConsensusService {
             None => {
                 self.bg_import_in_flight = false;
                 self.bg_import_hashes.remove(&block_hash);
+                self.bg_import_block_numbers.remove(&block_hash);
                 return;
             }
         };
@@ -1359,6 +1364,40 @@ impl ConsensusService {
         hash: B256,
         source: &'static str,
     ) {
+        // Gov5 reverse-ancestry catch-up can make a child canonical while an
+        // ordinary background import of its parent is still completing.  The
+        // ordinary callback carries the consensus commit view, while the H2-v4
+        // ancestry path indexes the child by its authenticated proposal view;
+        // those adjacent values can coincide.  A lower block number is still
+        // unambiguously an older execution result and must not be reported as
+        // a same-height/hash conflict (or bind a sidecar diff to the child's
+        // view).  A different hash at the current height remains a hard error.
+        let candidate_block_number = self
+            .h2_v4_block_numbers
+            .get(&hash)
+            .or_else(|| self.bg_import_block_numbers.get(&hash))
+            .copied();
+        if view == self.execution_validated_head_view
+            && self.execution_validated_head_view != 0
+            && self.head_block_hash != hash
+            && candidate_block_number.is_some_and(|number| number < self.head_block_number)
+        {
+            self.h2_v4_block_numbers.remove(&hash);
+            self.prune_executed_h2_v4_catchup_history();
+            self.enqueue_confirmed_sidecar_state_diffs(self.execution_validated_head_view);
+            debug!(
+                target: "n42::cl::consensus_loop",
+                view,
+                %hash,
+                source,
+                candidate_block_number,
+                current_head_number = self.head_block_number,
+                current_head = %self.head_block_hash,
+                "ignoring same-view execution-validity completion for an older Gov5 ancestor"
+            );
+            counter!("n42_same_view_ancestor_completion_ignored_total").increment(1);
+            return;
+        }
         if self.jmt.is_some() || self.twig.is_some() {
             if let Some(existing) = self.execution_validated_sidecar_hashes.get(&view)
                 && *existing != hash
@@ -1492,7 +1531,9 @@ impl ConsensusService {
             // Clear the queue — parent failed so children would fail too.
             for (_, queued_hash, _) in self.bg_import_queue.drain(..) {
                 self.bg_import_hashes.remove(&queued_hash);
+                self.bg_import_block_numbers.remove(&queued_hash);
             }
+            self.bg_import_block_numbers.remove(&hash);
             let sync_from = if committed {
                 self.execution_catchup_floor()
             } else {
@@ -1505,6 +1546,7 @@ impl ConsensusService {
             }
             return;
         }
+        self.bg_import_block_numbers.remove(&hash);
 
         // Process next queued import, or trigger build if queue is empty.
         if let Some((data, next_hash, next_view)) = self.bg_import_queue.pop_front() {

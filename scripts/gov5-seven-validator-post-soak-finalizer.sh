@@ -13,6 +13,7 @@ output="${N42_POST_OUTPUT:?total final verification output is required}"
 failure="${N42_POST_FAILURE:?post-soak failure output is required}"
 ports='28501 28502 28503 28504 28505 29545 29546'
 preflight_only="${N42_POST_PREFLIGHT_ONLY:-0}"
+resume_existing_burst="${N42_POST_RESUME_EXISTING_BURST:-0}"
 current_stage='startup'
 
 fail() {
@@ -51,11 +52,21 @@ trap 'record_unexpected_failure "$?" "$BASH_COMMAND" "$LINENO"' ERR
 
 current_stage='validate_configuration'
 [[ "$preflight_only" =~ ^[01]$ ]] || fail 'preflight flag must be 0 or 1'
+[[ "$resume_existing_burst" =~ ^[01]$ ]] || fail 'resume-existing-burst flag must be 0 or 1'
 test -x "$qualification" || fail "missing executable: $qualification"
 test -s "$artifact" || fail "missing transaction artifact: $artifact"
 artifact_sha256="$(shasum -a 256 "$artifact" | awk '{print $1}')"
-test ! -e "$burst" || fail "transaction evidence already exists: $burst"
-test ! -e "$heads" || fail "post-transaction head evidence already exists: $heads"
+if test "$resume_existing_burst" = 1; then
+  test -s "$burst" || fail "transaction evidence is required for resume: $burst"
+else
+  test ! -e "$burst" || fail "transaction evidence already exists: $burst"
+fi
+if test "$resume_existing_burst" = 1; then
+  test ! -e "$heads" || test -s "$heads" || \
+    fail "post-transaction head evidence is empty: $heads"
+else
+  test ! -e "$heads" || fail "post-transaction head evidence already exists: $heads"
+fi
 test ! -e "$output" || fail "total verification output already exists: $output"
 test ! -e "$failure" || exit 1
 
@@ -110,11 +121,29 @@ if test "$preflight_only" = 1; then
 fi
 
 current_stage='execute_transaction_burst'
-transaction_started_at="$(date -u +%FT%TZ)"
-env N42_QUAL_RUNTIME="$runtime" N42_QUAL_PORTS="$ports" \
-  N42_QUAL_GOV_INGRESS_PORT=28501 N42_QUAL_RUST_INGRESS_PORT=29545 \
-  "$qualification" transaction-burst "$artifact" "$burst" >/dev/null || \
-  fail 'mixed Go/Rust transaction burst failed'
+if test "$resume_existing_burst" = 1; then
+  transaction_started_at="$(jq -ers '
+    map(select(.event == "p4_transaction_finalized"))[0].at // empty
+  ' "$burst")"
+  test -n "$transaction_started_at" || fail 'resume evidence has no finalized transaction start'
+else
+  transaction_started_at="$(date -u +%FT%TZ)"
+fi
+burst_already_passed=false
+if test "$resume_existing_burst" = 1 && jq -e -s '
+  (map(select(.event == "p4_transaction_burst_pass")) | length) == 1
+' "$burst" >/dev/null; then
+  # A repair may finish the read-only parity phase before this outer
+  # finalizer is relaunched.  Consume that PASS instead of trying to resume a
+  # burst which is already complete.
+  burst_already_passed=true
+else
+  env N42_QUAL_RUNTIME="$runtime" N42_QUAL_PORTS="$ports" \
+    N42_QUAL_GOV_INGRESS_PORT=28501 N42_QUAL_RUST_INGRESS_PORT=29545 \
+    N42_QUAL_BURST_RESUME_EXISTING="$resume_existing_burst" \
+    "$qualification" transaction-burst "$artifact" "$burst" >/dev/null || \
+    fail 'mixed Go/Rust transaction burst failed'
+fi
 
 jq -e -s --slurpfile artifact "$artifact" --arg artifact_sha256 "$artifact_sha256" '
   (map(select(.event == "p4_transaction_finalized"))) as $finalized |
@@ -134,10 +163,12 @@ jq -e -s --slurpfile artifact "$artifact" --arg artifact_sha256 "$artifact_sha25
 ' "$burst" >/dev/null || fail 'transaction burst evidence is incomplete'
 
 current_stage='monitor_post_transaction_heads'
-env N42_QUAL_RUNTIME="$runtime" N42_QUAL_PORTS="$ports" \
-  N42_QUAL_RUST_PORT=29546 N42_QUAL_MAX_LAG=6 N42_QUAL_REQUIRE_ZERO_TX=0 \
-  "$qualification" monitor-heads 180 5 "$heads" || \
-  fail 'post-transaction mixed-client head monitor failed'
+if ! test "$resume_existing_burst" = 1 || ! test -s "$heads"; then
+  env N42_QUAL_RUNTIME="$runtime" N42_QUAL_PORTS="$ports" \
+    N42_QUAL_RUST_PORT=29546 N42_QUAL_MAX_LAG=6 N42_QUAL_REQUIRE_ZERO_TX=0 \
+    "$qualification" monitor-heads 180 5 "$heads" || \
+    fail 'post-transaction mixed-client head monitor failed'
+fi
 post_audit="$(env N42_QUAL_RUNTIME="$runtime" N42_QUAL_PORTS="$ports" \
   "$qualification" audit-soak "$heads" 180 15 6 0)" || \
   fail 'post-transaction mixed-client head audit failed'
@@ -167,9 +198,33 @@ for port in 29545 29546; do
 done
 
 current_stage='audit_post_transaction_logs'
-for log in "$runtime"/logs/gov{1,2,3,4,5}.log "$runtime"/logs/rust.log "$runtime"/logs/rust2.log; do
-  ! awk -v start="${transaction_started_at%Z}" '
-    substr($0,1,19) >= start &&
+post_rust0_log_audit="$(env N42_QUAL_RUNTIME="$runtime" \
+  N42_QUAL_LOG_START="$transaction_started_at" N42_QUAL_RUST_PORT=29545 \
+  N42_QUAL_REQUIRE_TIMEOUTS=0 N42_QUAL_REQUIRE_TIMESTAMP_BUMPS=1 \
+  "$qualification" audit-runtime-logs "$runtime/logs/rust.log")" || \
+  fail 'post-transaction Rust0 log audit failed'
+post_rust6_log_audit="$(env N42_QUAL_RUNTIME="$runtime" \
+  N42_QUAL_LOG_START="$transaction_started_at" N42_QUAL_RUST_PORT=29546 \
+  N42_QUAL_REQUIRE_TIMEOUTS=0 N42_QUAL_REQUIRE_TIMESTAMP_BUMPS=1 \
+  "$qualification" audit-runtime-logs "$runtime/logs/rust2.log")" || \
+  fail 'post-transaction Rust6 log audit failed'
+for audit in "$post_rust0_log_audit" "$post_rust6_log_audit"; do
+  printf '%s\n' "$audit" | jq -e '
+    .status == "PASS" and .warningPartitionExact and
+    .unexpectedWarnings == 0 and .criticalSignals == 0
+  ' >/dev/null || fail 'post-transaction Rust log audit is incomplete'
+done
+# Gov5 has no Rust recovery guard to classify, so retain the direct fatal scan.
+for log in "$runtime"/logs/gov{1,2,3,4,5}.log; do
+  awk -v start="${transaction_started_at%Z}" '
+    {
+      prefix=substr($0,1,19)
+      timestamped=(substr(prefix,5,1)=="-" && substr(prefix,8,1)=="-" &&
+                   substr(prefix,11,1)=="T" && substr(prefix,14,1)==":" &&
+                   substr(prefix,17,1)==":")
+      in_scope=(!timestamped || prefix >= start)
+    }
+    in_scope &&
     (index($0," ERROR ") || tolower($0) ~ /(^|[^[:alpha:]])(panic|fatal|equivocat)/) {
       bad=1
     }
@@ -190,7 +245,10 @@ jq -nc \
   --argjson formal_verification "$(<"$formal")" \
   --argjson burst_pass "$burst_pass" --argjson post_audit "$post_audit" \
   --argjson post_consensus "$post_consensus" \
-  --argjson post_equivocations "$post_equivocations" '
+  --argjson post_equivocations "$post_equivocations" \
+  --argjson post_rust0_log_audit "$post_rust0_log_audit" \
+  --argjson post_rust6_log_audit "$post_rust6_log_audit" \
+  --argjson burst_already_passed "$burst_already_passed" '
   {at:$at,event:"gov5_seven_validator_total_final_verification",status:"PASS",
    transactionStartedAt:$transaction_started_at,
    topology:{gov5:5,rust:2,validators:7},
@@ -199,10 +257,15 @@ jq -nc \
      transactionArtifact:$transaction_artifact,
      transactionArtifactSha256:$transaction_artifact_sha256,
      signedTransactions:17,alternatingGoRustIngress:true,allSevenEndpointsExact:true,
-     receiptsLogsStateAndStorageExact:true},
+     receiptsLogsStateAndStorageExact:true,
+     resumedAfterAuditFailure:($burst_pass.resumedFromFinalizedTransactionsOnly == true),
+     noTransactionsResentDuringResume:($burst_pass.noTransactionsResentDuringResume == true),
+     resumedFromExistingPass:$burst_already_passed},
    postTransactionConvergence:{artifact:$heads,sha256:$heads_sha256,audit:$post_audit},
    postTransactionConsensus:{rust:$post_consensus,equivocations:$post_equivocations,
      validatorCount:7,committedQc:true,equivocationCount:0},
+   postTransactionLogs:{rust0:$post_rust0_log_audit,rust6:$post_rust6_log_audit,
+     unexpectedWarnings:0,criticalSignals:0},
    criticalSignalsAfterTransactions:0}' >"$output.pending"
 mv "$output.pending" "$output"
 cat "$output"
