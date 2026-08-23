@@ -96,6 +96,10 @@ n42-26/
 └── DEVLOG.md                      # Development log index
 ```
 
+## Operations
+
+- [Gov5 × N42 共建网络、加入舰队与混合节点出块手册](docs/gov5-mixed-validator-fleet-runbook.md)
+
 ## Consensus Protocol
 
 N42 uses a **HotStuff-2** variant — a two-round BFT consensus achieving O(n) message complexity:
