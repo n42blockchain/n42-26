@@ -47,6 +47,7 @@ impl ExecutionOutputCache for RethExecutionOutputCache {
     fn evict(&self, hash: B256) {
         let removed =
             reth_evm::payload_cache::take_payload_execution::<CachedPayloadData>(&hash).is_some();
+        reth_evm::payload_cache::remove_payload_transactions_root(&hash);
         metrics::counter!(
             "n42_compact_block_cache_evictions_total",
             "removed" => if removed { "true" } else { "false" }
@@ -120,6 +121,7 @@ fn serialize_execution_output(
     senders: Vec<Address>,
 ) -> Option<Vec<u8>> {
     let ser_start = std::time::Instant::now();
+    let transactions_root = reth_evm::payload_cache::payload_transactions_root(hash);
     let compact = CompactBlockExecution {
         bundle_state: output.state,
         receipts: output.result.receipts,
@@ -127,6 +129,7 @@ fn serialize_execution_output(
         gas_used: output.result.gas_used,
         blob_gas_used: output.result.blob_gas_used,
         senders,
+        transactions_root,
     };
     match serde_json::to_vec(&compact) {
         Ok(serialized) => {
@@ -225,6 +228,9 @@ pub(crate) fn inject_compact_block(hash: &B256, compressed: &[u8], source: &'sta
             blob_gas_used: compact.blob_gas_used,
         },
     };
+    if let Some(transactions_root) = compact.transactions_root {
+        reth_evm::payload_cache::store_payload_transactions_root(*hash, transactions_root);
+    }
     reth_evm::payload_cache::store_payload_execution(*hash, (output, compact.senders));
     let store_ms = store_start.elapsed().as_millis() as u64;
 

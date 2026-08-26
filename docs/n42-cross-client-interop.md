@@ -21,6 +21,7 @@ gov5 和 n42-26 应像 geth 与 reth 一样，能以不同实现加入同一条 
 |---|---|---|---|
 | 传输 | libp2p，SSZ+snappy，协议后缀 `/ssz_snappy` | libp2p，长度前缀 bincode | 连接层相近，wire codec 不兼容 |
 | Gossip | `/n42/{fork-digest}/...` | 固定 `/n42/consensus/1`、`/n42/blocks/1` 等 | topic 和 fork 隔离不兼容 |
+| Gossip MsgID | `Keccak256(genesis || topic || data)[:20]` | 原为 `Keccak256(data || topic)` | 已改为 gov5 布局；两端共享 5 个 Go 生成的 golden vectors |
 | 同步 | SSZ 的 status、range、snap/checkpoint RPC | `BlockSyncRequest/Response` 的 bincode `/n42/sync/1` | 不能直接互相同步 |
 | QMDB commitment | Go split commitment：冻结 leaf tree + active-bits commitment | Rust Twig 删除时把旧 leaf 写为 `NULL_HASH` | **更新/删除后的 root 不相同；当前 Rust Twig 不能导入 QMDB replay state** |
 | QMDB 持久化 | MDBX `qmdbEntries/Twigs/Meta/Index`，history 另有 death stamps 等表 | bincode+zstd snapshot + StateDiff WAL | 不能共享 datadir；需要 portable export/import |
@@ -78,6 +79,14 @@ H2-v4 签名域现已由共享 vectors 固定为
 
 H2-v4 envelope 与 Go 生成的 Snappy frame 也已互认；Rust observer 会同时订阅
 `/n42/h2/4/ssz_snappy` 并按显式 chain id/genesis 严格过滤。2026-07-21 的独立七节点真机运行中，Rust 经 TCP/Noise/Yamux 接入 gov5，在 view 476 成功验证真实 Decide 的 BLS CommitQC。当前仍只产生观察事件，不转换为 Rust 原生投票事件；详见 devlog-118。
+
+GossipSub 的本地去重键也已与 gov5 对齐。gov5 `internal/p2p/message_id.go` 的注释曾写
+SHA-256，但实际调用的 `common/hash.Hash` 使用 `crypto.KeccakState`；真实布局是
+`genesis_hash || topic || data`，结果截取前 20 字节。N42-26 原实现虽然仍能与 gov5 互通，
+但只计算 `Keccak256(data || topic)`，没有绑定 genesis，且拼接顺序不同。现在所有 swarm
+构造都必须显式传入真实 genesis，并由 `crates/n42-network/testdata/gov5_message_id_v1.json`
+中的 5 个 Go 生成向量锁定算法。topic/genesis 作用域是安全边界：seen-cache 在应用验证前、
+跨 topic 记录 ID，缺少作用域会允许相同 payload 先从错误 topic 污染缓存并压制真实消息。
 
 ### Phase 3 — replay-v2 等价性与 catch-up
 

@@ -1,4 +1,4 @@
-use super::{BlobSidecarBroadcast, BlockDataBroadcast, ConsensusService};
+use super::{BlobSidecarBroadcast, BlockDataBroadcast, ConsensusService, EagerImportDone};
 use crate::blob_port::BlobStorePort;
 use crate::el::{BuiltBlock, ExecutionLayer, ResolveKind};
 use crate::exec_cache::ExecutionOutputCache;
@@ -362,6 +362,7 @@ impl ConsensusService {
         let current_view = build_context.view;
         let blob_store = self.blob_store.clone();
         let eager_import_done_tx = self.eager_import_done_tx.clone();
+        let state_diff_ready_tx = self.state_diff_ready_tx.clone();
         let build_complete_tx = self.build_complete_tx.clone();
         let completed_context = build_context;
         let block_guard = self.eager_import_block_guard.clone();
@@ -404,6 +405,7 @@ impl ConsensusService {
                         exec_output_cache,
                         bad_blocks,
                         eager_import_done_tx,
+                        state_diff_ready_tx,
                         block_guard,
                         build_start,
                         build_context,
@@ -459,6 +461,7 @@ impl ConsensusService {
         };
 
         let hash = broadcast.block_hash;
+        let payload_len = broadcast.payload_json.len();
         // The Gov5 fetch is NOT retired here. At this point `hash` is only a
         // self-declared field of an unauthenticated bincode envelope — the
         // payload behind it is not checked against it until the eager import
@@ -514,7 +517,13 @@ impl ConsensusService {
             .as_ref()
             .map(|pending| pending.block_hash)
             .unwrap_or(hash);
-        if !self.cache_pending_block_data(hash, data, &[hash, pending_finalization_hash]) {
+        if !self.cache_pending_block_data_with_metadata(
+            hash,
+            data,
+            &[hash, pending_finalization_hash],
+            broadcast.view,
+            payload_len,
+        ) {
             warn!(
                 target: "n42::cl::exec_bridge",
                 %hash,
@@ -548,6 +557,7 @@ impl ConsensusService {
             let leader_ready_unix_ms = broadcast.leader_ready_unix_ms;
             let block_data_received = std::time::Instant::now();
             let eager_done_tx = self.eager_import_done_tx.clone();
+            let state_diff_ready_tx = self.state_diff_ready_tx.clone();
             let block_guard = self.eager_import_block_guard.clone();
             let exec_cache = self.exec_output_cache.clone();
             let bad_blocks = self.bad_blocks.clone();
@@ -559,17 +569,22 @@ impl ConsensusService {
             );
             tokio::spawn(async move {
                 let decompress_start = std::time::Instant::now();
-                let payload_json = match super::decompress_payload(&payload_compressed) {
+                let payload_wire = match super::decompress_payload(&payload_compressed) {
                     Ok(d) => d,
                     Err(_) => return,
                 };
                 let decompress_ms = decompress_start.elapsed().as_millis() as u64;
                 // Deserialize first, then use typed accessor for block number.
                 let deser_start = std::time::Instant::now();
+                let payload_format = super::execution_payload_wire_format(&payload_wire);
+                let decompressed_len = payload_wire.len();
                 let execution_data: alloy_rpc_types_engine::ExecutionData =
-                    match serde_json::from_slice(&payload_json) {
+                    match super::decode_execution_payload_owned(payload_wire) {
                         Ok(data) => data,
-                        Err(_) => return,
+                        Err(error) => {
+                            warn!(target: "n42::cl::exec_bridge", %hash, %error, payload_format, "failed to decode execution payload");
+                            return;
+                        }
                     };
                 if execution_data.block_hash() != hash {
                     warn!(
@@ -589,8 +604,9 @@ impl ConsensusService {
                 info!(
                     target: "n42::cl::exec_bridge",
                     %hash,
+                    payload_format,
                     compressed_kb = payload_compressed.len() / 1024,
-                    decompressed_kb = payload_json.len() / 1024,
+                    decompressed_kb = decompressed_len / 1024,
                     decompress_ms,
                     deser_ms,
                     leader_ready_unix_ms,
@@ -605,7 +621,10 @@ impl ConsensusService {
                 // Syncing poison the whole catch-up batch by suppressing its
                 // missing parents.
                 let block_number = execution_data.block_number();
+                let parent_hash = execution_data.parent_hash();
                 let tx_count = execution_data.transaction_count();
+                let has_staking_target =
+                    super::execution_might_contain_staking_target(&execution_data);
                 if bad_blocks.should_skip(hash, "block_data_eager") {
                     return;
                 }
@@ -615,6 +634,20 @@ impl ConsensusService {
                     info!(target: "n42::cl::exec_bridge", %hash, view, block_number, validated, "follower eager import: skipping already validated block number");
                     return;
                 }
+
+                // The compact execution bundle is already needed by reth's
+                // cache injection. Derive the sidecar delta on a blocking
+                // worker while new_payload and consensus progress, then expose
+                // it only if reth validates this exact payload below.
+                let state_diff_task = execution_output_compressed.as_ref().map(|exec_bytes| {
+                    let exec_bytes = exec_bytes.clone();
+                    tokio::task::spawn_blocking(move || {
+                        ConsensusService::extract_state_diff_from_execution_output(
+                            hash,
+                            &exec_bytes,
+                        )
+                    })
+                });
 
                 // Compact Block: load execution output into payload cache before `new_payload`.
                 // This lets reth skip EVM re-execution (cache hit path), reducing import from
@@ -708,8 +741,34 @@ impl ConsensusService {
                             "role" => "follower", "outcome" => "hit"
                         )
                         .increment(1);
-                        if eager_done_tx.send((hash, block_ts)).await.is_err() {
+                        if eager_done_tx
+                            .send((
+                                hash,
+                                block_ts,
+                                parent_hash,
+                                block_number,
+                                has_staking_target,
+                                None,
+                            ))
+                            .await
+                            .is_err()
+                        {
                             debug!(target: "n42::cl::exec_bridge", %hash, view, "eager import completion receiver dropped");
+                        }
+                        if let Some(task) = state_diff_task {
+                            match task.await {
+                                Ok(Some(state_diff)) => {
+                                    if state_diff_ready_tx.send((hash, state_diff)).await.is_err() {
+                                        debug!(target: "n42::cl::exec_bridge", %hash, view, "state-diff completion receiver dropped");
+                                    }
+                                }
+                                Ok(None) => {
+                                    metrics::counter!("n42_state_diff_precompute_missing_total", "role" => "follower").increment(1);
+                                }
+                                Err(error) => {
+                                    warn!(target: "n42::cl::exec_bridge", %hash, view, %error, "state-diff precompute task failed");
+                                }
+                            }
                         }
                     }
                     Ok(status) => {
@@ -804,22 +863,21 @@ impl ConsensusService {
             self.last_committed_timestamp = self.last_committed_timestamp.max(broadcast.timestamp);
         }
 
-        let payload_json = match super::decompress_payload(&broadcast.payload_json) {
+        let payload_wire = match super::decompress_payload(&broadcast.payload_json) {
             Ok(d) => d,
             Err(e) => {
                 warn!(target: "n42::cl::exec_bridge", hash = %broadcast.block_hash, "failed to decompress payload: {e}");
                 return false;
             }
         };
-        let execution_data: alloy_rpc_types_engine::ExecutionData = match serde_json::from_slice(
-            &payload_json,
-        ) {
-            Ok(data) => data,
-            Err(e) => {
-                warn!(target: "n42::cl::exec_bridge", hash = %broadcast.block_hash, "failed to deserialize execution payload: {e}");
-                return false;
-            }
-        };
+        let execution_data: alloy_rpc_types_engine::ExecutionData =
+            match super::decode_execution_payload_owned(payload_wire) {
+                Ok(data) => data,
+                Err(e) => {
+                    warn!(target: "n42::cl::exec_bridge", hash = %broadcast.block_hash, "failed to deserialize execution payload: {e}");
+                    return false;
+                }
+            };
         if execution_data.block_hash() != broadcast.block_hash {
             warn!(
                 target: "n42::cl::exec_bridge",
@@ -1086,15 +1144,14 @@ impl ConsensusService {
                 Ok(d) => d,
                 Err(_) => continue,
             };
-            let retry_exec: alloy_rpc_types_engine::ExecutionData = match serde_json::from_slice(
-                &retry_payload,
-            ) {
-                Ok(d) => d,
-                Err(e) => {
-                    warn!(target: "n42::cl::exec_bridge", %retry_hash, error = %e, "failed to deserialize retry payload");
-                    continue;
-                }
-            };
+            let retry_exec: alloy_rpc_types_engine::ExecutionData =
+                match super::decode_execution_payload_owned(retry_payload) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        warn!(target: "n42::cl::exec_bridge", %retry_hash, error = %e, "failed to deserialize retry payload");
+                        continue;
+                    }
+                };
             if retry_exec.block_hash() != retry_hash {
                 warn!(
                     target: "n42::cl::exec_bridge",
@@ -1256,13 +1313,14 @@ async fn handle_built_payload(
     el: Arc<dyn ExecutionLayer>,
     network: Arc<dyn ConsensusNetwork>,
     block_ready_tx: mpsc::Sender<super::PayloadBuildReady>,
-    leader_payload_tx: mpsc::Sender<(B256, Vec<u8>)>,
+    leader_payload_tx: mpsc::Sender<(B256, super::SharedBlockData)>,
     current_view: u64,
     h2_v4_participant: bool,
     blob_store: Option<Arc<dyn BlobStorePort>>,
     exec_output_cache: Option<Arc<dyn ExecutionOutputCache>>,
     bad_blocks: super::bad_block_cache::BadBlockCache,
-    eager_import_done_tx: mpsc::Sender<(B256, u64)>,
+    eager_import_done_tx: mpsc::Sender<EagerImportDone>,
+    state_diff_ready_tx: mpsc::Sender<super::StateDiffReady>,
     block_guard: Arc<std::sync::atomic::AtomicU64>,
     build_start: Instant,
     build_context: super::PayloadBuildContext,
@@ -1352,7 +1410,16 @@ async fn handle_built_payload(
                     "validated normalized Gov5 leader payload before proposal release"
                 );
                 if eager_import_done_tx
-                    .send((hash, block_timestamp))
+                    // This completion precedes Gov5 payload serialization, so
+                    // stay conservative and force the ordinary staking scan.
+                    .send((
+                        hash,
+                        block_timestamp,
+                        actual_parent,
+                        block_number,
+                        true,
+                        None,
+                    ))
                     .await
                     .is_err()
                 {
@@ -1394,34 +1461,86 @@ async fn handle_built_payload(
         span.record("block_number", block_number);
     }
 
-    let ser_start = std::time::Instant::now();
-    let payload_json = match serde_json::to_vec(&execution_data) {
-        Ok(json) => json,
+    // The execution payload and compact execution output are independent wire
+    // representations of the same finished block.  Large blocks spend roughly
+    // 40-50 ms in each serializer, so running them serially leaves a core idle
+    // on the leader's critical path.  Keep small blocks inline to avoid paying
+    // thread-spawn overhead when there is no useful work to overlap.
+    let should_take_execution_output = should_broadcast_execution_output(h2_v4_participant);
+    let (payload_wire_result, ser_ms, execution_output_bytes) = if should_take_execution_output
+        && tx_count >= 1_024
+    {
+        std::thread::scope(|scope| {
+            let compact_task = scope.spawn(|| {
+                exec_output_cache
+                    .as_ref()
+                    .and_then(|cache| cache.take_serialized(hash))
+            });
+            let ser_start = std::time::Instant::now();
+            let payload_wire_result = super::encode_execution_payload(&mut execution_data);
+            let ser_ms = ser_start.elapsed().as_millis() as u64;
+            let execution_output_bytes = match compact_task.join() {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    error!(
+                        target: "n42::cl::exec_bridge",
+                        %hash,
+                        "compact-block serialization worker panicked; broadcasting payload without execution output"
+                    );
+                    None
+                }
+            };
+            (payload_wire_result, ser_ms, execution_output_bytes)
+        })
+    } else {
+        let ser_start = std::time::Instant::now();
+        let payload_wire_result = super::encode_execution_payload(&mut execution_data);
+        let ser_ms = ser_start.elapsed().as_millis() as u64;
+        let execution_output_bytes = if should_take_execution_output {
+            exec_output_cache
+                .as_ref()
+                .and_then(|cache| cache.take_serialized(hash))
+        } else {
+            None
+        };
+        (payload_wire_result, ser_ms, execution_output_bytes)
+    };
+    let encoded_payload = match payload_wire_result {
+        Ok(payload) => payload,
         Err(e) => {
             error!(target: "n42::cl::exec_bridge", %hash, error = %e, "CRITICAL: failed to serialize execution payload");
             return;
         }
     };
-    let ser_ms = ser_start.elapsed().as_millis() as u64;
+    let has_staking_target = super::execution_might_contain_staking_target(&execution_data);
+    let payload_format = encoded_payload.format;
+    let payload_header_bytes = encoded_payload.header_bytes;
+    let payload_transaction_bytes = encoded_payload.transaction_bytes;
+    let payload_wire = encoded_payload.bytes;
 
     info!(
         target: "n42::cl::exec_bridge",
         %hash,
         tx_count,
-        payload_kb = payload_json.len() / 1024,
+        payload_format,
+        payload_kb = payload_wire.len() / 1024,
+        payload_bytes = payload_wire.len(),
+        header_bytes = payload_header_bytes,
+        transaction_bytes = payload_transaction_bytes,
         ser_ms,
         block_timestamp,
         "N42_LEADER_SERIALIZE: payload serialized"
     );
 
-    // Compact Block: serialize execution output for followers to skip EVM re-execution.
-    let execution_output_bytes = if should_broadcast_execution_output(h2_v4_participant) {
-        exec_output_cache
-            .as_ref()
-            .and_then(|c| c.take_serialized(hash))
-    } else {
-        None
-    };
+    // Compact Block: the execution output was serialized alongside payload JSON
+    // above so followers can skip EVM re-execution without extending the leader
+    // critical path by another full serialization pass.
+    let state_diff_task = execution_output_bytes.as_ref().map(|exec_bytes| {
+        let exec_bytes = exec_bytes.clone();
+        tokio::task::spawn_blocking(move || {
+            ConsensusService::extract_state_diff_from_execution_output(hash, &exec_bytes)
+        })
+    });
     let leader_ready_unix_ms = now_unix_ms();
     info!(
         target: "n42::cl::exec_bridge",
@@ -1456,11 +1575,11 @@ async fn handle_built_payload(
     }
     // 1. Broadcast block data + blob sidecars to followers
     broadcast_block_data(
-        network.as_ref(),
+        network.clone(),
         &leader_payload_tx,
         hash,
         current_view,
-        &payload_json,
+        &payload_wire,
         block_timestamp,
         execution_output_bytes,
         leader_ready_unix_ms,
@@ -1520,11 +1639,33 @@ async fn handle_built_payload(
             )
             .increment(1);
             if eager_import_done_tx
-                .send((hash, block_timestamp))
+                .send((
+                    hash,
+                    block_timestamp,
+                    actual_parent,
+                    block_number,
+                    has_staking_target,
+                    None,
+                ))
                 .await
                 .is_err()
             {
                 debug!(target: "n42::cl::exec_bridge", %hash, "leader eager import completion receiver dropped");
+            }
+            if let Some(task) = state_diff_task {
+                match task.await {
+                    Ok(Some(state_diff)) => {
+                        if state_diff_ready_tx.send((hash, state_diff)).await.is_err() {
+                            debug!(target: "n42::cl::exec_bridge", %hash, "state-diff completion receiver dropped");
+                        }
+                    }
+                    Ok(None) => {
+                        metrics::counter!("n42_state_diff_precompute_missing_total", "role" => "leader").increment(1);
+                    }
+                    Err(error) => {
+                        warn!(target: "n42::cl::exec_bridge", %hash, %error, "state-diff precompute task failed");
+                    }
+                }
             }
         }
         Ok(status) => {
@@ -1555,28 +1696,33 @@ async fn handle_built_payload(
 
 #[allow(clippy::too_many_arguments)]
 async fn broadcast_block_data(
-    network: &dyn ConsensusNetwork,
-    leader_payload_tx: &mpsc::Sender<(B256, Vec<u8>)>,
+    network: Arc<dyn ConsensusNetwork>,
+    leader_payload_tx: &mpsc::Sender<(B256, super::SharedBlockData)>,
     hash: B256,
     current_view: u64,
-    payload_json: &[u8],
+    payload_wire: &[u8],
     timestamp: u64,
     execution_output: Option<Vec<u8>>,
     leader_ready_unix_ms: u64,
     build_start: Instant,
 ) {
-    if payload_json.is_empty() {
+    if payload_wire.is_empty() {
         return;
     }
+    let payload_format = super::execution_payload_wire_format(payload_wire);
     let compress_start = std::time::Instant::now();
-    let compressed = super::compress_payload(payload_json);
+    let compressed = super::compress_execution_payload(payload_wire);
     let compress_ms = compress_start.elapsed().as_millis() as u64;
-    let raw_len = payload_json.len();
+    let raw_len = payload_wire.len();
     let compressed_len = compressed.len();
-    let exec_kb = execution_output.as_ref().map_or(0, |v| v.len() / 1024);
+    let execution_output_len = execution_output.as_ref().map_or(0, Vec::len);
+    let exec_kb = execution_output_len / 1024;
     info!(
         target: "n42::cl::exec_bridge",
         %hash,
+        payload_format,
+        raw_bytes = raw_len,
+        compressed_bytes = compressed_len,
         raw_kb = raw_len / 1024,
         compressed_kb = compressed_len / 1024,
         exec_kb,
@@ -1593,7 +1739,7 @@ async fn broadcast_block_data(
         leader_ready_unix_ms,
     };
     let encoded = match bincode::serialize(&broadcast) {
-        Ok(enc) => enc,
+        Ok(enc) => Arc::new(enc),
         Err(e) => {
             error!(target: "n42::cl::exec_bridge", error = %e, "failed to serialize block data broadcast");
             return;
@@ -1614,21 +1760,27 @@ async fn broadcast_block_data(
     // it is the difference between an afternoon of confused log-reading and one
     // glance at a dashboard.
     metrics::gauge!("n42_block_broadcast_bytes").set(encoded.len() as f64);
-    if encoded.len() > n42_network::MAX_BROADCAST_PAYLOAD_BYTES {
+    let direct_only_requested = block_direct_only_enabled();
+    let propagation_budget = if direct_only_requested {
+        n42_network::MAX_BLOCK_DIRECT_SIZE
+    } else {
+        n42_network::MAX_BROADCAST_PAYLOAD_BYTES
+    };
+    if encoded.len() > propagation_budget {
         metrics::counter!("n42_block_broadcast_oversized_total").increment(1);
         error!(
             target: "n42::cl::exec_bridge",
             %hash,
             current_view,
             encoded_bytes = encoded.len(),
-            budget_bytes = n42_network::MAX_BROADCAST_PAYLOAD_BYTES,
+            budget_bytes = propagation_budget,
             gossip_limit_bytes = n42_network::MAX_GOSSIP_MESSAGE_SIZE,
             raw_kb = raw_len / 1024,
             compressed_kb = compressed_len / 1024,
             exec_kb,
             "block exceeds the propagation budget and will very likely not reach \
-             validators; the view cannot reach quorum and a restart will rebuild the \
-             same block — lower N42_MAX_TXS_PER_BLOCK or the block gas limit"
+             validators through the configured propagation mode; lower \
+             N42_MAX_TXS_PER_BLOCK or the block gas limit"
         );
     }
 
@@ -1639,6 +1791,8 @@ async fn broadcast_block_data(
         target: "n42::cl::exec_bridge",
         %hash,
         current_view,
+        payload_format,
+        encoded_bytes = encoded.len(),
         encoded_kb = encoded.len() / 1024,
         raw_kb = raw_len / 1024,
         compressed_kb = compressed_len / 1024,
@@ -1650,12 +1804,93 @@ async fn broadcast_block_data(
 
     // Leader direct push: send to all known validator peers via QUIC unicast.
     // This bypasses GossipSub mesh flooding for large payloads.
-    let validator_peers = network.all_validator_peers();
+    // Direct request-response is valuable for large payloads, but sending every
+    // tiny/empty block into the same QUIC lane can build a deep substream queue
+    // before a burst starts. Keep small blocks on GossipSub and reserve direct
+    // push capacity for payloads where bypassing mesh relay is material.
+    let direct_min_bytes = block_direct_min_bytes();
+    // A direct-only run must also carry small/empty block payloads directly;
+    // otherwise disabling GossipSub would create a liveness hole between load
+    // waves. Outside this explicit benchmark mode, keep the size threshold.
+    let direct_eligible =
+        block_direct_push_enabled() && (direct_only_requested || encoded.len() >= direct_min_bytes);
+    let mut validator_peers = if direct_eligible {
+        network.all_validator_peers()
+    } else {
+        Vec::new()
+    };
+    let requested_fanout = block_direct_fanout();
+    if !validator_peers.is_empty() {
+        // Keep a bounded direct fanout deterministic and fair across views.
+        // Sending one full-size copy to every validator can leave six large
+        // request-response streams contending on the leader while GossipSub is
+        // already providing the reliable all-node path.
+        validator_peers.sort_unstable_by_key(|(validator_index, _)| *validator_index);
+        let fanout = requested_fanout.min(validator_peers.len());
+        let rotation = (current_view as usize) % validator_peers.len();
+        validator_peers.rotate_left(rotation);
+        validator_peers.truncate(fanout);
+    }
+    if block_direct_push_enabled() && !direct_eligible {
+        metrics::counter!("n42_block_direct_skipped_small").increment(1);
+        tracing::debug!(
+            target: "n42::cl::exec_bridge",
+            %hash,
+            bytes = encoded.len(),
+            direct_min_bytes,
+            "skipping direct push for small block payload"
+        );
+    }
     let direct_count = validator_peers.len();
+    // Disable the heavy block-data GossipSub copy only when the requested
+    // finite direct fanout is completely available. During startup or a peer
+    // outage the normal fallback remains active instead of silently reducing
+    // the recipients below the benchmark's configured validator set.
+    let direct_only_active = direct_only_requested
+        && requested_fanout > 0
+        && requested_fanout != usize::MAX
+        && direct_count == requested_fanout;
+    let gossip_origin_copies = usize::from(!direct_only_active);
+    let logical_origin_bytes = encoded
+        .len()
+        .saturating_mul(gossip_origin_copies.saturating_add(direct_count));
+    info!(
+        target: "n42::cl::exec_bridge",
+        %hash,
+        current_view,
+        payload_format,
+        payload_raw_bytes = raw_len,
+        payload_compressed_bytes = compressed_len,
+        execution_output_bytes = execution_output_len,
+        envelope_bytes = encoded.len(),
+        direct_copies = direct_count,
+        gossip_origin_copies,
+        direct_only_requested,
+        direct_only_active,
+        logical_origin_bytes,
+        "N42_COMMUNICATION: leader block propagation accounting"
+    );
+    // Share one immutable payload across all direct requests. The old Vec clone
+    // per peer multiplied a ~15 MiB block by the validator fanout before the
+    // request-response codec performed its own serialization copy.
+    let direct_encoded = (!validator_peers.is_empty()).then(|| Arc::clone(&encoded));
+    if direct_encoded.is_some() {
+        metrics::counter!(
+            "n42_block_data_copy_avoided_bytes_total",
+            "site" => "direct_origin"
+        )
+        .increment(encoded.len() as u64);
+    }
     let send_start = std::time::Instant::now();
     for (idx, peer_id) in &validator_peers {
         if let Err(error) = network
-            .send_block_direct_reliable(*peer_id, encoded.clone())
+            .send_block_direct_reliable(
+                *peer_id,
+                direct_encoded
+                    .as_ref()
+                    .expect("direct payload exists when peers are present")
+                    .clone(),
+            )
             .await
         {
             tracing::warn!(
@@ -1679,15 +1914,52 @@ async fn broadcast_block_data(
         );
     }
 
-    // Always broadcast via GossipSub as a reliability fallback.
-    // Direct push (request-response) can silently fail due to QUIC transport
-    // issues, causing validators to miss block data and unable to vote.
-    // The receiver deduplicates via pending_block_data.contains_key(&hash).
-    let gossip_start = std::time::Instant::now();
-    if let Err(e) = network.announce_block_reliable(encoded.clone()).await {
-        warn!(target: "n42::cl::exec_bridge", error = %e, "failed to broadcast block data via gossipsub");
+    // The normal mode retains GossipSub as a reliability fallback because
+    // enqueue success on block_direct is not a remote delivery acknowledgement.
+    // Explicit direct-only benchmarks may skip that full-payload duplicate only
+    // after the complete configured direct fanout has been resolved above.
+    // A delayed fallback remains available to non-direct-only experiments.
+    let gossip_delay = block_gossip_fallback_delay();
+    let gossip_delay_ms = gossip_delay.as_millis() as u64;
+    let mut gossip_ms = 0;
+    if direct_only_active {
+        metrics::counter!("n42_block_gossip_fallback_skipped_direct_only_total").increment(1);
+        info!(
+            target: "n42::cl::exec_bridge",
+            %hash,
+            encoded_kb = encoded.len() / 1024,
+            direct_peers = direct_count,
+            "N42_DIRECT_ONLY: block-data GossipSub fallback disabled"
+        );
+    } else if gossip_delay.is_zero() {
+        let gossip_start = std::time::Instant::now();
+        if let Err(e) = network
+            .announce_block_reliable(encoded.as_ref().clone())
+            .await
+        {
+            warn!(target: "n42::cl::exec_bridge", error = %e, "failed to broadcast block data via gossipsub");
+        }
+        gossip_ms = gossip_start.elapsed().as_millis() as u64;
+    } else {
+        let gossip_network = network.clone();
+        let gossip_encoded = encoded.as_ref().clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(gossip_delay).await;
+            let gossip_start = std::time::Instant::now();
+            let gossip_encoded_kb = gossip_encoded.len() / 1024;
+            if let Err(e) = gossip_network.announce_block_reliable(gossip_encoded).await {
+                warn!(target: "n42::cl::exec_bridge", %hash, error = %e, "delayed block-data GossipSub fallback failed");
+            }
+            info!(
+                target: "n42::cl::exec_bridge",
+                %hash,
+                encoded_kb = gossip_encoded_kb,
+                gossip_delay_ms,
+                gossip_ms = gossip_start.elapsed().as_millis() as u64,
+                "N42_GOSSIP_FALLBACK: delayed block-data gossip enqueued"
+            );
+        });
     }
-    let gossip_ms = gossip_start.elapsed().as_millis() as u64;
     info!(
         target: "n42::cl::exec_bridge",
         %hash,
@@ -1695,8 +1967,11 @@ async fn broadcast_block_data(
         direct_peers = direct_count,
         send_ms,
         gossip_ms,
+        gossip_delay_ms,
+        direct_only_requested,
+        direct_only_active,
         total_broadcast_ms = send_ms + gossip_ms,
-        "N42_BROADCAST: direct push + gossipsub complete"
+        "N42_BROADCAST: block propagation dispatched"
     );
     info!(
         target: "n42::cl::timeout_diag",
@@ -1706,6 +1981,9 @@ async fn broadcast_block_data(
         direct_peers = direct_count,
         send_ms,
         gossip_ms,
+        gossip_delay_ms,
+        direct_only_requested,
+        direct_only_active,
         total_broadcast_ms = send_ms + gossip_ms,
         build_start_to_broadcast_ms,
         "N42_TIMEOUT_VIEW: leader_broadcast_complete"
@@ -1714,6 +1992,59 @@ async fn broadcast_block_data(
     if leader_payload_tx.send((hash, encoded)).await.is_err() {
         debug!(target: "n42::cl::exec_bridge", %hash, "leader payload feedback receiver dropped");
     }
+}
+
+fn block_gossip_fallback_delay() -> std::time::Duration {
+    static DELAY: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+    *DELAY.get_or_init(|| {
+        let delay_ms = std::env::var("N42_BLOCK_GOSSIP_FALLBACK_DELAY_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or_default()
+            .min(2_000);
+        std::time::Duration::from_millis(delay_ms)
+    })
+}
+
+fn block_direct_push_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("N42_BLOCK_DIRECT_PUSH").ok().as_deref(),
+            Some("0") | Some("false") | Some("off")
+        )
+    })
+}
+
+fn block_direct_only_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("N42_BLOCK_DIRECT_ONLY").ok().as_deref(),
+            Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES")
+        )
+    })
+}
+
+fn block_direct_min_bytes() -> usize {
+    static MIN_BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MIN_BYTES.get_or_init(|| {
+        std::env::var("N42_BLOCK_DIRECT_MIN_BYTES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(64 * 1024)
+            .min(n42_network::MAX_GOSSIP_MESSAGE_SIZE)
+    })
+}
+
+fn block_direct_fanout() -> usize {
+    static FANOUT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *FANOUT.get_or_init(|| {
+        std::env::var("N42_BLOCK_DIRECT_FANOUT")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(usize::MAX)
+    })
 }
 
 fn broadcast_blob_sidecars(
@@ -1900,10 +2231,8 @@ mod blob_frame_tests {
     #[test]
     fn unshippable_sidecar_is_dropped_and_counted() {
         let max = n42_network::MAX_BLOB_GOSSIP_MESSAGE_SIZE;
-        let (frames, oversized) = pack_blob_sidecar_frames(
-            vec![sidecar(1, 10), sidecar(2, max), sidecar(3, 10)],
-            max,
-        );
+        let (frames, oversized) =
+            pack_blob_sidecar_frames(vec![sidecar(1, 10), sidecar(2, max), sidecar(3, 10)], max);
         assert_eq!(oversized, 1);
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].len(), 2, "the shippable neighbours still go out");

@@ -1592,6 +1592,8 @@ impl ObserverOrchestrator {
             block_hash,
             commit_qc,
             payload: payload.to_vec(),
+            payload_len: payload.len(),
+            block_data: None,
             validator_changes: None,
             execution_lineage: Vec::new(),
         });

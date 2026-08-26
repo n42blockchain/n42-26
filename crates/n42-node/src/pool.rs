@@ -5,7 +5,7 @@ use reth_node_builder::{
     components::{PoolBuilder, TxPoolBuilder},
     node::{FullNodeTypes, NodeTypes},
 };
-use reth_tasks::{RuntimeBuilder, RuntimeConfig, TokioConfig};
+use reth_tasks::{RayonConfig, RuntimeBuilder, RuntimeConfig, TokioConfig};
 use reth_transaction_pool::{
     CoinbaseTipOrdering, EthPooledTransaction, EthTransactionValidator, PoolConfig, SubPoolLimit,
     TransactionValidationTaskExecutor, blobstore::DiskFileBlobStore,
@@ -95,18 +95,36 @@ where
         // Leak the runtime so it lives as long as the process — avoids
         // "Cannot drop a runtime in a context where blocking is not allowed"
         // since build_pool() is async and Runtime::drop needs blocking.
-        let pool_runtime: &'static _ = Box::leak(Box::new(
-            RuntimeBuilder::new(RuntimeConfig::default().with_tokio(TokioConfig::Owned {
+        // RuntimeBuilder also owns three eager Rayon pools.  The validation
+        // executor only uses the Tokio handle, so inheriting the machine-wide
+        // defaults here used to create another cpu/rpc/storage set (525
+        // threads on the 256-thread benchmark host) for every validator.
+        let auxiliary_rayon = RayonConfig {
+            cpu_threads: Some(1),
+            reserved_cpu_cores: 0,
+            rpc_threads: Some(1),
+            storage_threads: Some(1),
+            max_blocking_tasks: 1,
+            proof_storage_worker_threads: Some(1),
+            proof_account_worker_threads: Some(1),
+            prewarming_threads: Some(1),
+            bal_streaming_threads: Some(1),
+            state_trie_overlay_worker_threads: Some(1),
+        };
+        let runtime_config = RuntimeConfig::default()
+            .with_tokio(TokioConfig::Owned {
                 worker_threads: Some(validation_threads),
                 thread_keep_alive: std::time::Duration::from_secs(60),
                 thread_name: "pool-val",
-            }))
-            .build()?,
-        ));
+            })
+            .with_rayon(auxiliary_rayon);
+        let pool_runtime: &'static _ =
+            Box::leak(Box::new(RuntimeBuilder::new(runtime_config).build()?));
 
         info!(
             target: "n42::pool",
             threads = validation_threads,
+            auxiliary_rayon_threads = 3,
             "TX pool validation running on dedicated runtime"
         );
 

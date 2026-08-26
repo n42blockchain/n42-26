@@ -79,11 +79,13 @@ thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 metrics.workspace = true
+rayon.workspace = true
 
 [dev-dependencies]
 bitvec.workspace = true
 libp2p.workspace = true
 revm.workspace = true
+reth-transaction-pool = { workspace = true, features = ["test-utils"] }
 reth-testing-utils.workspace = true
 # Keep key types identical to the Reth 2.4.1 / Alloy dependency graph.
 secp256k1 = { version = "0.30", features = ["global-context"] }

@@ -22,8 +22,8 @@ use clap::{Parser, ValueEnum};
 use eyre::Result;
 use std::hint::black_box;
 use std::io::{BufReader, BufWriter, Read as IoRead, Write as IoWrite};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tiny_keccak::{Hasher, Keccak};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -181,7 +181,15 @@ enum SyncIngestMode {
     GlobalWave,
 }
 
-const CHAIN_ID: u64 = 4242;
+fn chain_id() -> u64 {
+    static CHAIN_ID: OnceLock<u64> = OnceLock::new();
+    *CHAIN_ID.get_or_init(|| {
+        std::env::var("N42_CHAIN_ID")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(4242)
+    })
+}
 const TRANSFER_GAS: u64 = 21_000;
 // The stress storage-burner does 2 cold SSTOREs to fresh slots (per-caller
 // counter + timestamp): 21k intrinsic + 2×22.1k SSTORE_SET + cold SLOAD + KECCAK
@@ -329,7 +337,7 @@ fn sample_signed_transfer_size(account: &TestAccount, targets: &[Address], sampl
     let mut total = 0usize;
     for i in 0..samples.max(1) {
         let tx = TxEip1559 {
-            chain_id: CHAIN_ID,
+            chain_id: chain_id(),
             nonce: i as u64,
             gas_limit: TRANSFER_GAS,
             max_fee_per_gas: MAX_FEE_PER_GAS,
@@ -401,7 +409,7 @@ fn run_batch_transfer_bench(
         push_batch_transfer_records(&mut encoded, sender_idx, transfers_per_sender);
         let records = &encoded
             [records_start..records_start + transfers_per_sender * BATCH_TRANSFER_RECORD_BYTES];
-        let prehash = batch_transfer_prehash(CHAIN_ID, 0, start_nonce, count, records);
+        let prehash = batch_transfer_prehash(chain_id(), 0, start_nonce, count, records);
         let sig = account.signer.sign_hash_sync(&prehash).expect("batch sign");
         encoded[header_pos + 12..header_pos + 77].copy_from_slice(&sig.as_bytes());
         signed_batches.push((prehash, sig, account.address));
@@ -471,7 +479,7 @@ fn run_batch_transfer_bench(
             let records = &encoded[records_start..records_end];
 
             let hash_start = Instant::now();
-            let prehash = batch_transfer_prehash(CHAIN_ID, 0, start_nonce, count as u32, records);
+            let prehash = batch_transfer_prehash(chain_id(), 0, start_nonce, count as u32, records);
             record_hash_ms += hash_start.elapsed().as_secs_f64() * 1000.0;
 
             let verify_start = Instant::now();
@@ -597,7 +605,7 @@ fn sign_mixed_batch(
 
             let tx = if is_contract_call {
                 TxEip1559 {
-                    chain_id: CHAIN_ID,
+                    chain_id: chain_id(),
                     nonce,
                     gas_limit: CONTRACT_CALL_GAS,
                     max_fee_per_gas: MAX_FEE_PER_GAS,
@@ -610,7 +618,7 @@ fn sign_mixed_batch(
             } else {
                 let to = targets[(nonce as usize) % targets.len()];
                 TxEip1559 {
-                    chain_id: CHAIN_ID,
+                    chain_id: chain_id(),
                     nonce,
                     gas_limit: TRANSFER_GAS,
                     max_fee_per_gas: MAX_FEE_PER_GAS,
@@ -1374,7 +1382,7 @@ fn presign_all(
 
                         let tx = if is_contract_call {
                             TxEip1559 {
-                                chain_id: CHAIN_ID,
+                                chain_id: chain_id(),
                                 nonce,
                                 gas_limit: CONTRACT_CALL_GAS,
                                 max_fee_per_gas: MAX_FEE_PER_GAS,
@@ -1387,7 +1395,7 @@ fn presign_all(
                         } else {
                             let to = targets[(nonce as usize) % targets.len()];
                             TxEip1559 {
-                                chain_id: CHAIN_ID,
+                                chain_id: chain_id(),
                                 nonce,
                                 gas_limit: TRANSFER_GAS,
                                 max_fee_per_gas: MAX_FEE_PER_GAS,
@@ -1502,7 +1510,7 @@ fn presign_and_save(
 
                         let tx = if is_contract_call {
                             TxEip1559 {
-                                chain_id: CHAIN_ID,
+                                chain_id: chain_id(),
                                 nonce,
                                 gas_limit: CONTRACT_CALL_GAS,
                                 max_fee_per_gas: MAX_FEE_PER_GAS,
@@ -1515,7 +1523,7 @@ fn presign_and_save(
                         } else {
                             let to = targets[(nonce as usize) % targets.len()];
                             TxEip1559 {
-                                chain_id: CHAIN_ID,
+                                chain_id: chain_id(),
                                 nonce,
                                 gas_limit: TRANSFER_GAS,
                                 max_fee_per_gas: MAX_FEE_PER_GAS,
@@ -1568,7 +1576,7 @@ fn presign_and_save(
     // Header
     w.write_all(FILE_MAGIC)?;
     w.write_all(&[FILE_VERSION])?;
-    w.write_all(&CHAIN_ID.to_le_bytes())?;
+    w.write_all(&chain_id().to_le_bytes())?;
     w.write_all(&(num_rpcs as u32).to_le_bytes())?;
     w.write_all(&(total_signed as u64).to_le_bytes())?;
 
@@ -1630,11 +1638,11 @@ fn load_presigned(path: &str) -> Result<Vec<Vec<String>>> {
     let mut chain_id_buf = [0u8; 8];
     r.read_exact(&mut chain_id_buf)?;
     let chain_id = u64::from_le_bytes(chain_id_buf);
-    if chain_id != CHAIN_ID {
+    if chain_id != crate::chain_id() {
         eyre::bail!(
             "Chain ID mismatch: file={}, expected={}",
             chain_id,
-            CHAIN_ID
+            crate::chain_id()
         );
     }
 
@@ -1727,11 +1735,11 @@ fn load_presigned_binary(path: &str, num_endpoints: usize) -> Result<Vec<Vec<Raw
     let mut chain_id_buf = [0u8; 8];
     r.read_exact(&mut chain_id_buf)?;
     let chain_id = u64::from_le_bytes(chain_id_buf);
-    if chain_id != CHAIN_ID {
+    if chain_id != crate::chain_id() {
         eyre::bail!(
             "Chain ID mismatch: file={}, expected={}",
             chain_id,
-            CHAIN_ID
+            crate::chain_id()
         );
     }
 
@@ -1819,6 +1827,35 @@ fn load_presigned_binary(path: &str, num_endpoints: usize) -> Result<Vec<Vec<Raw
 }
 
 /// Binary TCP ingest mode: stream raw txs with sender over TCP to node ingest servers.
+fn write_bench_marker(name: &str) {
+    let Ok(dir) = std::env::var("N42_BENCH_MARKER_DIR") else {
+        return;
+    };
+    let timestamp_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    if let Err(error) = std::fs::create_dir_all(&dir).and_then(|()| {
+        std::fs::write(
+            std::path::Path::new(&dir).join(name),
+            timestamp_ns.to_string(),
+        )
+    }) {
+        tracing::warn!(%error, name, "could not write benchmark marker");
+    }
+}
+
+async fn wait_for_bench_start_gate() {
+    let Ok(gate) = std::env::var("N42_BENCH_START_GATE_FILE") else {
+        return;
+    };
+    write_bench_marker("ingest-ready.ns");
+    tracing::info!(%gate, "waiting for external benchmark start gate");
+    while !std::path::Path::new(&gate).exists() {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_ingest_mode(
     endpoints: &[String],
@@ -1832,7 +1869,9 @@ async fn run_ingest_mode(
     start_block: u64,
     duration_secs: u64,
 ) {
+    wait_for_bench_start_gate().await;
     let start = Instant::now();
+    write_bench_marker("ingest-start.ns");
     let stop = Arc::new(AtomicBool::new(false));
 
     // Monitor using RPC (ingest via TCP, monitoring via JSON-RPC)
@@ -1890,6 +1929,7 @@ async fn run_ingest_mode(
     let dur_guard = tokio::spawn(async move {
         tokio::time::sleep(Duration::from_secs(duration_secs)).await;
         dur_stop.store(true, Ordering::Relaxed);
+        write_bench_marker("ingest-end.ns");
         tracing::info!(duration_secs, "ingest duration reached");
     });
 

@@ -13,6 +13,87 @@ These runs go through the normal transaction path and are the right references f
 | TCP inject + pool gate + fast propose | 45,668 | 48K cap | `README.md` | Zero nonce gaps and zero stuck tx. |
 | 2s slot, all optimizations | 13,858 | 48K cap | `README.md`, `docs/devlog-76-tps-bottleneck-map.md` | More production-like timing. |
 
+### Controlled 7-Node Binary Payload A/B
+
+These one-minute runs use the Ethereum transaction/block path but also enable explicit benchmark
+flags (`N42_SKIP_TX_VERIFY=1`, deferred state root, trusted TCP ingest). They are controlled codec and
+network comparisons, not production-chain records. Source and raw-data accounting:
+`docs/devlog-139-zstd-quic-direct-push-audit-20260824.md`.
+
+| Run | Reported 60s TPS | Payload format | Full envelope | Notes |
+| --- | ---: | --- | ---: | --- |
+| round29 JSON control | 85,050 | legacy JSON + zstd | 15,606,245 B | Paired baseline. |
+| round30 binary-v1 | 90,783 | binary-v1 + zstd | 14,957,470 B | +6.74% TPS; envelope -4.16%; direct ACK 0/42 dispatches. |
+| round38 direct fixed | 90,613 | binary-v1 + zstd | 12.49 MiB full-block sample | 5,437,000 committed tx/60.002165s. Direct ACK 204/204, failure/reject 0. |
+| round39 direct-only | 94,199 | binary-v1 + zstd | 12.15 MiB full-block sample | 5,652,000 committed tx/60.000901s; one final 163k proposal committed after the boundary. Six direct copies, no full-block GossipSub copy; direct ACK 222/222. |
+| round42 thread/copy optimized direct-only | **136,996** | binary-v1 + zstd | 12.14 MiB full-block sample | 8,220,000 committed tx/60.001539s; first strict >100k result. Threads 16,791→3,093 versus unbounded load baseline; injection-window direct ACK 318/318. |
+| round44 commit-cadence optimized direct-only | 153,197 | binary-v1 + zstd | 12.38 MB strict-window average | 9,192,000 committed tx/60.001320s; +11.83% over round42. Commit-path p95 533→218 ms; direct ACK 348/348. |
+| round46 zero-copy follower decode | 152,410 | binary-v1 + zstd | 12.33 MB strict-window average | 9,145,000 committed tx/60.002453s, also 58 transaction blocks; boundary fill explains the 0.51% delta from round44. Whole-run accounting avoided 8.30 GiB of transaction-body copies; direct ACK 342/342. |
+| round50 async commit + QUIC v3 chunks | 151,870 | binary-v1 + zstd | 14.97 MB full-block average | 9,112,456 committed tx/60.001845s. Async FCU 406 Valid/0 Syncing; 336 large transfers and 1,338 chunks with zero failure/retry/digest/auth errors. Control cpuset remained scheduler-managed. |
+| round52 sender-run deterministic merge | **156,500** | binary-v1 + zstd | 14.96 MB full-block average | **Current strict record:** 9,390,144 committed tx/60.001004s. Sender drain 52.74→19.21 ms versus round51; 420 FCUs all Valid; 348 large transfers/1,380 chunks, all error counters zero. |
+
+Disabling zstd is rejected by the paired isolation runs: the envelope grew to 20,697,396 bytes when
+the payload outer layer was disabled and to 44,864,336 bytes when all block-payload compression was
+disabled. Both exceeded active propagation limits and stalled well below the zstd-on runs.
+
+Round38 fixes silent direct-push loss by placing connection limits before stateful libp2p
+request-response behaviours. It establishes propagation reliability but does not materially change
+the then-reported leader-proposal window throughput from round30; 100k remained unachieved by that
+historical metric. The run used
+154 aggregate node cores on average during injection, 39.1 GiB peak aggregate node RSS, 132.7 MB/s
+physical `/data` NVMe writes (about 3.7% device busy), and 291.4 MB/s one-direction loopback traffic
+over the broader 69-second resource window. See devlog 139 for counter definitions and raw paths.
+
+Round39 adds the explicit benchmark switch `N42_BLOCK_DIRECT_ONLY=1`. Full-block GossipSub is skipped
+only when the configured finite direct fanout is completely resolved (6/6 in this run); otherwise it
+automatically remains the fallback. This isolated removal improved reported leader-proposal throughput
+by 6.95% over round38 and reduced leader block-propagation bytes from 546.88 to 469.02 B/proposed tx,
+but 96,915
+leader-proposal TPS was still 3.08% below 100k. A parser audit that counts both follower `Decide`
+and validator-0 self-leader `block committed!` events gives 94,199 strict commit TPS for round39 and
+90,613 for round38. Consensus messages remain on GossipSub; healthy-path state
+sync and Gov5 block fetch generated zero data requests during the measured window.
+
+Round42 partitions the 256 logical CPUs across the seven local validators, prevents the transaction
+validation runtime from creating a second host-sized Rayon set, and shares the serialized block
+envelope through the consensus/import/direct-push path. It is the first strict `Decide` wall-clock
+result over 100k: 136,996 TPS, 45.43% above round39 under the same corrected commit-time parser.
+The comparable leader-proposal figures are 139,713 versus 96,915 TPS (+44.16%). Unbounded load-state
+thread count fell from 16,791 to 3,093;
+aggregate injection CPU fell from 163.04 to 63.37 cores while throughput increased. Zstd stayed on
+and saved 39.79% of payload bytes. The strict committed blocks used 64.23 MB/s of logical direct
+origin payload, with no full-block GossipSub origin; all 318 direct requests dispatched during the
+injection window were accepted and ACKed. At round42 the gap to 1M was 7.30x and was primarily an
+execution/commit-cadence architecture problem, not an SSD capacity or host-wide thread-count problem.
+
+Round44 moves state-diff completion and staking classification off the commit critical path and keeps
+the committed-block ring on the shared block allocation. Strict commit TPS rises to 153,197, 11.83%
+above round42. The strict set carries 4.308 GB of six-copy direct-origin data (71.80 MB/s), no full-block
+GossipSub origin, and zstd still saves 39.80% of payload bytes. The gap to 1M is now 6.53x.
+
+Round45 tested, then rejected, a zero-millisecond eager-metadata grace period: 313 async FCUs returned
+`Syncing` and strict TPS regressed to 144,495. Round50 replaces that blocking grace with an explicit
+ordered `Committed → ExecutionReady → Finalized` state machine and an off-loop deadline fallback.
+Its 406 FCUs were all `Valid`, pending returned to zero, and strict throughput stayed within 0.87% of
+the round44 record. Round46 independently removes the per-transaction follower decode copy and counts
+8.30 GiB of avoided transient copies.
+
+Round50 also validates `/n42/block-direct/3`: one manifest plus 2--4 MiB chunks on one request
+substream per block over the persistent authenticated QUIC connection. The measurement records 336
+large transfers, 1,338 chunks, 4.991 GB of chunk payload in each direction, and zero transport,
+queue, retry, digest, or validator-auth failures. It does **not** validate the 1M target: 58 committed
+blocks in 60 seconds corresponds to about 1.03 s/block, while 1M at 163K/block requires about
+163 ms/block. The sender-sharded snapshot used 8 lanes, but canonical reth EVM execution remained
+serial (`n42_parallel_evm_blocks_total=0`); the record must not be described as parallel-execution TPS.
+
+Round52 replaces the sender snapshot's per-transaction heap pop/push with an order-equivalent run
+release when consecutive nonces have the same sender and effective tip. Lane-local grouping and sender
+preparation average 7.82 and 3.37 ms; deterministic merge falls from round51's 42.54 ms to 8.02 ms,
+and total drain falls from 52.74 to 19.21 ms. Strict TPS improves 4.88% over round51 and 2.16% over
+the prior round44 record. The run still has about 989 ms inter-block cadence and zero canonical
+parallel-EVM blocks, so its remaining 6.39x gap to 1M is principally execution/assemble/pipeline work,
+not txpool drain, QUIC reliability, CPU capacity, or NVMe bandwidth.
+
 ## Benchmark-Only Upper Bounds
 
 These runs do **not** represent production-chain TPS. They intentionally bypass parts of the Ethereum/reth path to measure the ceiling of a narrow protocol idea.

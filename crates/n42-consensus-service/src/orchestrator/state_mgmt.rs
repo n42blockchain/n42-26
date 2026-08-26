@@ -162,14 +162,14 @@ impl ConsensusService {
         block_hash: B256,
         commit_qc: QuorumCertificate,
         validator_changes: Option<Vec<n42_primitives::consensus::ValidatorChange>>,
+        recent_lineage: &[super::RecentBlockData],
     ) {
-        let execution_lineage: Vec<_> = self
-            .recent_execution_lineage(block_hash)
-            .into_iter()
+        let execution_lineage: Vec<_> = recent_lineage
+            .iter()
             .map(|entry| SyncPayload {
                 view: entry.view,
                 block_hash: entry.block_hash,
-                block_data: entry.block_data,
+                block_data: entry.block_data.as_ref().clone(),
             })
             .collect();
         // Ordinary blocks remain recoverable through `SyncBlock`; duplicating
@@ -181,11 +181,12 @@ impl ConsensusService {
         } else {
             Vec::new()
         };
-        let payload = self
-            .pending_block_data
-            .get(&block_hash)
-            .and_then(|data| bincode::deserialize::<BlockDataBroadcast>(data).ok())
-            .map(|b| b.payload_json)
+        let block_data = self.pending_block_data.get(&block_hash).cloned();
+        let payload_len = self
+            .recent_block_data
+            .iter()
+            .find(|entry| entry.block_hash == block_hash)
+            .map(|entry| entry.payload_len)
             .unwrap_or_default();
 
         if self.committed_blocks.len() >= max_committed_blocks() {
@@ -195,7 +196,9 @@ impl ConsensusService {
             view,
             block_hash,
             commit_qc,
-            payload,
+            payload: Vec::new(),
+            payload_len,
+            block_data,
             validator_changes,
             execution_lineage,
         });
@@ -446,7 +449,7 @@ impl ConsensusService {
                 view: b.view,
                 block_hash: b.block_hash,
                 commit_qc: b.commit_qc.clone(),
-                payload: b.payload.clone(),
+                payload: b.retained_payload(),
                 validator_changes: b.validator_changes.clone(),
             })
             .collect();
@@ -921,8 +924,10 @@ impl ConsensusService {
                     if let Some(block_number) = execution_block_number
                         && block_number > staking_sink.last_scanned_block()
                         && let Ok(decompressed) = super::decompress_payload(&sync_block.payload)
+                        && let Ok(payload_json) =
+                            super::execution_payload_json_for_staking(&decompressed)
                     {
-                        staking_sink.scan_committed_block(block_number, &decompressed);
+                        staking_sink.scan_committed_block(block_number, &payload_json);
                     }
                 } else {
                     for entry in &block_lineage {
@@ -931,9 +936,11 @@ impl ConsensusService {
                         if block_number <= staking_sink.last_scanned_block() {
                             continue;
                         }
-                        match super::decompress_payload(&broadcast.payload_json) {
-                            Ok(decompressed) => {
-                                staking_sink.scan_committed_block(block_number, &decompressed)
+                        match super::decompress_payload(&broadcast.payload_json).and_then(
+                            |decompressed| super::execution_payload_json_for_staking(&decompressed),
+                        ) {
+                            Ok(payload_json) => {
+                                staking_sink.scan_committed_block(block_number, &payload_json)
                             }
                             Err(error) => warn!(
                                 target: "n42::cl::sync",
@@ -967,6 +974,7 @@ impl ConsensusService {
                             raw_lineage_by_hash.get(&sync_block.block_hash)
                     {
                         block.payload = broadcast.payload_json.clone();
+                        block.payload_len = block.payload.len();
                     }
                 }
                 if let Some(ref changes) = sync_block.validator_changes {
@@ -1093,6 +1101,10 @@ impl ConsensusService {
                 payload: validated_raw_child
                     .map(|entry| entry.1.payload_json.clone())
                     .unwrap_or_else(|| sync_block.payload.clone()),
+                payload_len: validated_raw_child
+                    .map(|entry| entry.1.payload_json.len())
+                    .unwrap_or(sync_block.payload.len()),
+                block_data: None,
                 validator_changes: sync_block.validator_changes.clone(),
                 execution_lineage: retained_execution_lineage,
             });

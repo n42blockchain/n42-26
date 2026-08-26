@@ -17,6 +17,7 @@ libp2p.workspace = true
 quinn.workspace = true
 rustls.workspace = true
 rcgen.workspace = true
+socket2 = "0.6"
 
 # Serialization
 serde.workspace = true

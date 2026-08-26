@@ -1,7 +1,7 @@
 use alloy_primitives::B256;
 use futures::prelude::*;
-use libp2p::request_response;
 use libp2p::StreamProtocol;
+use libp2p::request_response;
 use n42_primitives::consensus::QuorumCertificate;
 use serde::{Deserialize, Serialize};
 use std::io;

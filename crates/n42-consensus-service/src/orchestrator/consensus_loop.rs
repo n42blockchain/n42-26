@@ -1,4 +1,4 @@
-use super::{ConsensusService, ImportOutcome};
+use super::{AsyncCommitStage, AsyncCommitState, ConsensusService, ImportOutcome};
 use super::{LeaderBuildWaitMode, state_mgmt::max_consecutive_empty_skips};
 use crate::el::ExecutionLayer;
 use crate::exec_cache::ExecutionOutputCache;
@@ -20,6 +20,19 @@ const EMPTY_BLOCK_CHECK_WINDOW: usize = 3;
 /// Payload size below which a block is considered "empty" (no meaningful transactions).
 const EMPTY_BLOCK_SIZE_THRESHOLD: usize = 512;
 
+fn commit_execution_ready_timeout() -> Duration {
+    static TIMEOUT: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *TIMEOUT.get_or_init(|| {
+        Duration::from_millis(
+            std::env::var("N42_COMMIT_EXECUTION_READY_TIMEOUT_MS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(150)
+                .clamp(10, 5_000),
+        )
+    })
+}
+
 impl ConsensusService {
     pub(super) fn recent_blocks_empty(&self) -> bool {
         let check_count = EMPTY_BLOCK_CHECK_WINDOW.min(self.committed_blocks.len());
@@ -30,7 +43,7 @@ impl ConsensusService {
             .iter()
             .rev()
             .take(check_count)
-            .all(|b| b.payload.is_empty() || b.payload.len() < EMPTY_BLOCK_SIZE_THRESHOLD)
+            .all(|b| b.payload_len < EMPTY_BLOCK_SIZE_THRESHOLD)
     }
 
     /// Schedules the next payload build, skipping if recent blocks are empty.
@@ -382,12 +395,49 @@ impl ConsensusService {
         // channel rather than the network announcement path. Drain anything
         // already available before deriving the execution lineage.
         self.drain_leader_payload_rx(&[block_hash]);
+        // Consensus output has higher select-loop priority than eager-import
+        // completions. Drain completions here so already validated execution
+        // metadata is reused instead of decompressing and parsing the same
+        // multi-megabyte payload again on the commit path.
+        let mut eager_completions = Vec::new();
+        let mut current_completion_seen = false;
+        while let Ok(completion) = self.eager_import_done_rx.try_recv() {
+            let (hash, _, parent_hash, block_number, has_staking_target, state_diff) = &completion;
+            self.record_validated_execution_metadata(
+                *hash,
+                *parent_hash,
+                *block_number,
+                *has_staking_target,
+                state_diff.clone(),
+            );
+            current_completion_seen |= *hash == block_hash;
+            eager_completions.push(completion);
+        }
+        // Never sleep in the consensus output handler. The lifecycle below
+        // retains the CommitQC at `Committed` until the matching completion
+        // arrives, which gives the old 150 ms grace period its safety without
+        // putting that latency on the select loop.
+        histogram!("n42_commit_eager_metadata_wait_ms").record(0.0);
+        counter!(
+            "n42_commit_eager_metadata_wait_total",
+            "outcome" => if current_completion_seen { "immediate_hit" } else { "async" }
+        )
+        .increment(1);
+        // Preserve the existing finalization/rescue semantics. These events
+        // still need the ordinary eager-completion handler after we borrow
+        // their validated metadata for lineage construction.
+        for completion in eager_completions {
+            if self.eager_import_done_tx.try_send(completion).is_err() {
+                warn!(target: "n42::cl::consensus_loop", "failed to requeue eager-import completion after metadata prefetch");
+            }
+        }
         // A prepared block can survive a timeout as LockedQC and become an
         // execution ancestor of the next block that obtains a CommitQC. Reth
         // then advances by more than one block for a single consensus commit.
         // Recover that complete raw lineage before any pending caches are
         // cleared so block numbering and QMDB/Twig sidecars do not skip it.
         let execution_lineage = self.recent_execution_lineage(block_hash);
+        let lineage_ready_at = Instant::now();
         if let Some(prev_commit) = self.last_commit_instant {
             let inter_block_commit_ms = commit_now.duration_since(prev_commit).as_millis() as u64;
             histogram!("n42_inter_block_commit_ms").record(inter_block_commit_ms as f64);
@@ -411,8 +461,13 @@ impl ConsensusService {
         let previous_block_count = self.committed_block_count;
         let committed_execution_number = execution_lineage
             .last()
-            .and_then(|entry| Self::execution_parent_and_number(&entry.block_data))
-            .map(|(_, block_number)| block_number)
+            .and_then(|entry| entry.execution_block_number)
+            .or_else(|| {
+                self.recent_block_data
+                    .iter()
+                    .find(|entry| entry.block_hash == block_hash)
+                    .and_then(|entry| entry.execution_block_number)
+            })
             .or_else(|| {
                 self.pending_block_data
                     .get(&block_hash)
@@ -546,15 +601,20 @@ impl ConsensusService {
         // Refresh RPC-visible epoch status (captures pending→staged transition from CommitQC).
         self.refresh_epoch_status();
 
-        self.store_committed_block(view, block_hash, commit_qc.clone(), validator_changes);
-        if let Some(index) = self
-            .eager_execution_validated
-            .iter()
-            .position(|hash| *hash == block_hash)
-        {
-            self.eager_execution_validated.remove(index);
-            self.advance_execution_validated_head(view, block_hash, "eager import before commit");
-        }
+        let store_started_at = Instant::now();
+        self.store_committed_block(
+            view,
+            block_hash,
+            commit_qc.clone(),
+            validator_changes,
+            &execution_lineage,
+        );
+        let store_done_at = Instant::now();
+        let execution_ready = current_completion_seen
+            || self
+                .eager_execution_validated
+                .iter()
+                .any(|hash| *hash == block_hash);
 
         // Leader eager-imported blocks can finalize via Case A before the select
         // loop processes `leader_payload_rx`. Drain it here so state-tree
@@ -575,32 +635,46 @@ impl ConsensusService {
         // confirmation path (eager import, finalize FCU, bg import, sync) funnels
         // through.
         if self.jmt.is_some() || self.twig.is_some() {
-            let lineage_data: Vec<(u64, B256, Vec<u8>)> = if execution_lineage.is_empty() {
-                self.pending_block_data
-                    .get(&block_hash)
-                    .map(|data| vec![(view, block_hash, data.clone())])
-                    .unwrap_or_default()
-            } else {
-                execution_lineage
-                    .iter()
-                    .map(|entry| (entry.view, entry.block_hash, entry.block_data.clone()))
-                    .collect()
-            };
-            for (lineage_view, lineage_hash, data) in lineage_data {
-                if let Some(diff) = Self::extract_state_diff_for_state_tree(lineage_hash, &data) {
+            let lineage_data: Vec<(u64, B256, Option<n42_execution::state_diff::StateDiff>)> =
+                if execution_lineage.is_empty() {
+                    self.pending_block_data
+                        .get(&block_hash)
+                        .map(|_| {
+                            let cached_diff = self
+                                .recent_block_data
+                                .iter()
+                                .find(|entry| entry.block_hash == block_hash)
+                                .and_then(|entry| entry.execution_state_diff.clone());
+                            vec![(view, block_hash, cached_diff)]
+                        })
+                        .unwrap_or_default()
+                } else {
+                    execution_lineage
+                        .iter()
+                        .map(|entry| {
+                            (
+                                entry.view,
+                                entry.block_hash,
+                                entry.execution_state_diff.clone(),
+                            )
+                        })
+                        .collect()
+                };
+            for (lineage_view, lineage_hash, cached_diff) in lineage_data {
+                if let Some(diff) = cached_diff {
                     self.missing_sidecar_diffs.remove(&lineage_view);
                     self.pending_sidecar_diffs
                         .insert(lineage_view, (lineage_hash, diff));
                 } else {
                     self.missing_sidecar_diffs
                         .insert(lineage_view, lineage_hash);
-                    error!(
+                    debug!(
                         target: "n42::twig",
                         view = lineage_view,
                         %lineage_hash,
-                        "committed sidecar diff unavailable; pausing QMDB/SBMT updates at this view until block data recovery"
+                        "committed sidecar diff still computing; pausing QMDB/SBMT updates at this view"
                     );
-                    counter!("n42_sidecar_diff_gap_total").increment(1);
+                    counter!("n42_sidecar_diff_deferred_total").increment(1);
                 }
             }
             // The commit may confirm execution in the same breath (eager
@@ -610,6 +684,7 @@ impl ConsensusService {
                 self.enqueue_confirmed_sidecar_state_diffs(self.execution_validated_head_view);
             }
         }
+        let sidecar_done_at = Instant::now();
 
         // ZK proof sidecar: schedule proof generation (async, non-blocking).
         // Uses committed_block_count (monotonically increasing) for interval check,
@@ -641,8 +716,8 @@ impl ConsensusService {
         }
 
         // Scan committed block for staking/unstaking transactions.
-        if let Some(ref staking_sink) = self.staking_sink {
-            let lineage_data: Vec<&[u8]> = if execution_lineage.is_empty() {
+        if self.staking_sink.is_some() {
+            let lineage_data: Vec<(u64, B256, Option<bool>)> = if execution_lineage.is_empty() {
                 // If reth already advanced to the child, or the raw child links
                 // directly to the current head, this is an ordinary one-block
                 // lineage. Otherwise an ancestor is missing: defer all scans so
@@ -654,46 +729,283 @@ impl ConsensusService {
                             || Self::execution_parent_and_number(data)
                                 .is_some_and(|(parent, _)| parent == self.head_block_hash)
                     })
-                    .map(|data| vec![data.as_slice()])
+                    .map(|_| {
+                        vec![(
+                            committed_execution_number.unwrap_or(self.committed_block_count),
+                            block_hash,
+                            self.recent_block_data
+                                .iter()
+                                .find(|entry| entry.block_hash == block_hash)
+                                .and_then(|entry| entry.execution_has_staking_target),
+                        )]
+                    })
                     .unwrap_or_default()
             } else {
                 execution_lineage
                     .iter()
-                    .map(|entry| entry.block_data.as_slice())
+                    .map(|entry| {
+                        (
+                            entry
+                                .execution_block_number
+                                .unwrap_or(self.committed_block_count),
+                            entry.block_hash,
+                            entry.execution_has_staking_target,
+                        )
+                    })
                     .collect()
             };
-            for data in lineage_data {
-                let block_number = Self::execution_parent_and_number(data)
-                    .map(|(_, block_number)| block_number)
-                    .unwrap_or(self.committed_block_count);
-                if block_number <= staking_sink.last_scanned_block() {
-                    continue;
-                }
-                match bincode::deserialize::<super::BlockDataBroadcast>(data)
-                    .map_err(|e| e.to_string())
-                    .and_then(|broadcast| {
-                        super::decompress_payload(&broadcast.payload_json)
-                            .map_err(|e| e.to_string())
-                    }) {
-                    Ok(decompressed) => {
-                        staking_sink.scan_committed_block(block_number, &decompressed);
-                    }
-                    Err(e) => {
-                        warn!(target: "n42::cl::consensus_loop", block_number, error = %e, "failed to decompress payload for staking scan");
-                    }
+            for (block_number, lineage_hash, has_staking_target) in lineage_data {
+                if let Some(has_staking_target) = has_staking_target {
+                    self.queue_validated_staking_scan(
+                        lineage_hash,
+                        block_number,
+                        has_staking_target,
+                    );
+                } else {
+                    counter!("n42_staking_scan_deferred_total").increment(1);
+                    debug!(
+                        target: "n42::cl::consensus_loop",
+                        block_number,
+                        %lineage_hash,
+                        "staking classification still validating; deferred off commit path"
+                    );
                 }
             }
         }
+        let staking_done_at = Instant::now();
 
-        self.finalize_committed_block(view, block_hash, commit_qc)
-            .await;
+        self.enqueue_async_commit(view, block_hash, commit_qc, execution_ready);
+        if !execution_ready {
+            let timeout_tx = self.commit_execution_timeout_tx.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(commit_execution_ready_timeout()).await;
+                let _ = timeout_tx.send((view, block_hash)).await;
+            });
+        }
+        self.drive_async_commits().await;
+        let finalize_done_at = Instant::now();
         self.save_consensus_state();
+        let persisted_at = Instant::now();
+        info!(
+            target: "n42::cl::consensus_loop",
+            view,
+            %block_hash,
+            commit_to_lineage_ms = lineage_ready_at.duration_since(commit_now).as_millis() as u64,
+            pre_store_ms = store_started_at.duration_since(lineage_ready_at).as_millis() as u64,
+            store_ms = store_done_at.duration_since(store_started_at).as_millis() as u64,
+            sidecar_ms = sidecar_done_at.duration_since(store_done_at).as_millis() as u64,
+            staking_ms = staking_done_at.duration_since(sidecar_done_at).as_millis() as u64,
+            finalize_dispatch_ms = finalize_done_at.duration_since(staking_done_at).as_millis() as u64,
+            persist_ms = persisted_at.duration_since(finalize_done_at).as_millis() as u64,
+            total_ms = persisted_at.duration_since(commit_now).as_millis() as u64,
+            "N42_COMMIT_PATH: committed-block service stages"
+        );
         crate::qualification_abort_at("commit_qc_persisted");
 
         // Note: if finalize_committed_block spawned a background import (Case B),
         // we do NOT schedule the next payload build here. It will be triggered by
         // handle_import_done when the background import completes.
         // Case A (block already in reth) schedules the build immediately.
+    }
+
+    fn enqueue_async_commit(
+        &mut self,
+        view: u64,
+        block_hash: B256,
+        commit_qc: QuorumCertificate,
+        execution_ready: bool,
+    ) {
+        let inserted = match self.async_commit_states.entry(view) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(AsyncCommitState {
+                    view,
+                    block_hash,
+                    commit_qc,
+                    stage: AsyncCommitStage::Committed,
+                    finalize_in_flight: false,
+                    committed_at: Instant::now(),
+                });
+                true
+            }
+            std::collections::btree_map::Entry::Occupied(entry) => {
+                if entry.get().block_hash != block_hash {
+                    error!(
+                        target: "n42::cl::consensus_loop",
+                        view,
+                        existing_hash = %entry.get().block_hash,
+                        %block_hash,
+                        "conflicting block in asynchronous commit lifecycle"
+                    );
+                    return;
+                }
+                false
+            }
+        };
+        if inserted {
+            counter!("n42_async_commit_transitions_total", "stage" => "committed").increment(1);
+            info!(
+                target: "n42::cl::consensus_loop",
+                view,
+                %block_hash,
+                execution_ready,
+                "N42_COMMIT_STATE: Committed"
+            );
+        }
+        if execution_ready {
+            self.mark_async_commit_execution_ready(block_hash);
+        }
+        gauge!("n42_async_commits_pending").set(
+            self.async_commit_states
+                .values()
+                .filter(|state| state.stage != AsyncCommitStage::Finalized)
+                .count() as f64,
+        );
+    }
+
+    fn mark_async_commit_execution_ready(&mut self, block_hash: B256) -> bool {
+        let Some(state) = self
+            .async_commit_states
+            .values_mut()
+            .find(|state| state.block_hash == block_hash)
+        else {
+            return false;
+        };
+        if state.stage == AsyncCommitStage::Committed {
+            state.stage = AsyncCommitStage::ExecutionReady;
+            counter!("n42_async_commit_transitions_total", "stage" => "execution_ready")
+                .increment(1);
+            histogram!("n42_commit_to_execution_ready_ms")
+                .record(state.committed_at.elapsed().as_secs_f64() * 1_000.0);
+            info!(
+                target: "n42::cl::consensus_loop",
+                view = state.view,
+                %block_hash,
+                elapsed_ms = state.committed_at.elapsed().as_millis() as u64,
+                "N42_COMMIT_STATE: ExecutionReady"
+            );
+        }
+        true
+    }
+
+    fn mark_async_commit_finalized(&mut self, view: u64, block_hash: B256) {
+        if let Some(state) = self.async_commit_states.get_mut(&view)
+            && state.block_hash == block_hash
+            && state.stage != AsyncCommitStage::Finalized
+        {
+            state.stage = AsyncCommitStage::Finalized;
+            state.finalize_in_flight = false;
+            counter!("n42_async_commit_transitions_total", "stage" => "finalized").increment(1);
+            histogram!("n42_commit_to_finalized_ms")
+                .record(state.committed_at.elapsed().as_secs_f64() * 1_000.0);
+            info!(
+                target: "n42::cl::consensus_loop",
+                view,
+                %block_hash,
+                elapsed_ms = state.committed_at.elapsed().as_millis() as u64,
+                "N42_COMMIT_STATE: Finalized"
+            );
+        }
+        if let Some(index) = self
+            .eager_execution_validated
+            .iter()
+            .position(|hash| *hash == block_hash)
+        {
+            self.eager_execution_validated.remove(index);
+        }
+        while self.async_commit_states.len() > 256
+            && self
+                .async_commit_states
+                .first_key_value()
+                .is_some_and(|(_, state)| state.stage == AsyncCommitStage::Finalized)
+        {
+            self.async_commit_states.pop_first();
+        }
+        gauge!("n42_async_commits_pending").set(
+            self.async_commit_states
+                .values()
+                .filter(|state| state.stage != AsyncCommitStage::Finalized)
+                .count() as f64,
+        );
+    }
+
+    fn mark_async_commit_retryable(&mut self, view: u64, block_hash: B256) {
+        if let Some(state) = self.async_commit_states.get_mut(&view)
+            && state.block_hash == block_hash
+        {
+            state.stage = AsyncCommitStage::Committed;
+            state.finalize_in_flight = false;
+            counter!("n42_async_commit_transitions_total", "stage" => "retryable").increment(1);
+        }
+    }
+
+    pub(super) fn handle_commit_execution_timeout(&mut self, view: u64, block_hash: B256) {
+        let still_waiting = self.async_commit_states.get(&view).is_some_and(|state| {
+            state.block_hash == block_hash && state.stage == AsyncCommitStage::Committed
+        });
+        if !still_waiting {
+            return;
+        }
+        let retained = self
+            .pending_block_data
+            .get(&block_hash)
+            .cloned()
+            .or_else(|| {
+                self.committed_blocks
+                    .iter()
+                    .rev()
+                    .find(|block| block.block_hash == block_hash)
+                    .and_then(|block| block.block_data.clone())
+            });
+        if let Some(data) = retained {
+            counter!("n42_async_commit_execution_timeout_total", "action" => "local_import")
+                .increment(1);
+            warn!(
+                target: "n42::cl::consensus_loop",
+                view,
+                %block_hash,
+                timeout_ms = commit_execution_ready_timeout().as_millis() as u64,
+                "ExecutionReady deadline expired; starting retained-data import off the consensus loop"
+            );
+            self.enqueue_bg_import(data, block_hash, view);
+        } else {
+            counter!("n42_async_commit_execution_timeout_total", "action" => "sync").increment(1);
+            self.initiate_execution_catchup_sync(view, self.engine.current_view());
+        }
+    }
+
+    /// Dispatches canonical FCUs in deterministic CommitQC order. In async-FCU
+    /// mode exactly one lifecycle entry remains in flight; its completion wakes
+    /// the next entry from the orchestrator select loop.
+    pub(super) async fn drive_async_commits(&mut self) {
+        loop {
+            let next = self
+                .async_commit_states
+                .iter()
+                .find(|(_, state)| state.stage != AsyncCommitStage::Finalized)
+                .map(|(view, state)| {
+                    (
+                        *view,
+                        state.block_hash,
+                        state.commit_qc.clone(),
+                        state.stage,
+                        state.finalize_in_flight,
+                    )
+                });
+            let Some((view, block_hash, commit_qc, stage, in_flight)) = next else {
+                break;
+            };
+            if stage != AsyncCommitStage::ExecutionReady || in_flight {
+                break;
+            }
+            if let Some(state) = self.async_commit_states.get_mut(&view) {
+                state.finalize_in_flight = true;
+            }
+            self.finalize_committed_block(view, block_hash, commit_qc)
+                .await;
+            if self.async_finalize_fcu {
+                break;
+            }
+        }
     }
 
     pub(super) async fn finalize_committed_block(
@@ -707,6 +1019,12 @@ impl ConsensusService {
             None => {
                 self.pending_block_data.clear();
                 self.pending_executions.clear();
+                self.advance_execution_validated_head(
+                    view,
+                    block_hash,
+                    "EL-less execution-ready finalize",
+                );
+                self.mark_async_commit_finalized(view, block_hash);
                 return;
             }
         };
@@ -724,6 +1042,14 @@ impl ConsensusService {
                 let finalized = match engine_handle.fork_choice_updated(fcu_state).await {
                     Ok(result) => {
                         let elapsed_ms = fcu_start.elapsed().as_millis() as u64;
+                        let outcome = match result.payload_status.status {
+                            PayloadStatusEnum::Valid => "valid",
+                            PayloadStatusEnum::Syncing => "syncing",
+                            PayloadStatusEnum::Accepted => "accepted",
+                            PayloadStatusEnum::Invalid { .. } => "invalid",
+                        };
+                        counter!("n42_async_finalize_fcu_outcomes_total", "status" => outcome)
+                            .increment(1);
                         histogram!("n42_fcu_latency_ms", "attempt" => "first")
                             .record(elapsed_ms as f64);
                         info!(target: "n42::cl::consensus_loop", view, %block_hash, status = ?result.payload_status.status, elapsed_ms, "N42_FCU: async finalize fcu");
@@ -732,6 +1058,8 @@ impl ConsensusService {
                         matches!(result.payload_status.status, PayloadStatusEnum::Valid)
                     }
                     Err(e) => {
+                        counter!("n42_async_finalize_fcu_outcomes_total", "status" => "error")
+                            .increment(1);
                         histogram!("n42_fcu_latency_ms", "attempt" => "first_err")
                             .record(fcu_start.elapsed().as_millis() as f64);
                         warn!(target: "n42::cl::consensus_loop", view, %block_hash, error = %e, "async fork_choice_updated failed");
@@ -775,7 +1103,16 @@ impl ConsensusService {
         // FCU — the block should now be in the engine tree and FCU will succeed.
         let finalized = if !finalized {
             let mut found_match = false;
-            while let Ok((hash, ts)) = self.eager_import_done_rx.try_recv() {
+            while let Ok((hash, ts, parent_hash, block_number, has_staking_target, state_diff)) =
+                self.eager_import_done_rx.try_recv()
+            {
+                self.record_validated_execution_metadata(
+                    hash,
+                    parent_hash,
+                    block_number,
+                    has_staking_target,
+                    state_diff,
+                );
                 self.record_eager_execution_validated(hash);
                 if ts > 0 {
                     self.last_committed_timestamp = self.last_committed_timestamp.max(ts);
@@ -839,6 +1176,7 @@ impl ConsensusService {
         finalized: bool,
     ) {
         if finalized {
+            self.mark_async_commit_finalized(view, block_hash);
             // Case A: Block already in reth (leader built + new_payload already done,
             // OR block was previously imported by a follower, OR rescued by eager import).
             debug!(target: "n42::cl::consensus_loop", view, %block_hash, "block finalized in reth");
@@ -866,12 +1204,14 @@ impl ConsensusService {
                 }
             }
         } else if let Some(data) = self.pending_block_data.remove(&block_hash) {
+            self.mark_async_commit_retryable(view, block_hash);
             // Case B: BlockData cached but not yet imported (deferred import path).
             info!(target: "n42::cl::consensus_loop", view, %block_hash, "queueing background import for deferred finalization");
             self.pending_block_data.clear();
             self.pending_executions.clear();
             self.enqueue_bg_import(data, block_hash, view);
         } else {
+            self.mark_async_commit_retryable(view, block_hash);
             // Block data not found — this commonly happens when the leader's own block
             // data (sent via leader_payload_tx) hasn't been processed by the select loop
             // yet because block_ready_rx was processed first, triggering the consensus
@@ -893,7 +1233,7 @@ impl ConsensusService {
 
     /// Enqueues a block for background import. If no import is in flight, spawns immediately.
     /// Otherwise queues for sequential processing (parent must be imported before child).
-    fn enqueue_bg_import(&mut self, data: Vec<u8>, block_hash: B256, view: u64) {
+    fn enqueue_bg_import(&mut self, data: super::SharedBlockData, block_hash: B256, view: u64) {
         if self
             .bad_blocks
             .should_skip(block_hash, "committed_import_enqueue")
@@ -934,7 +1274,7 @@ impl ConsensusService {
     }
 
     /// Spawns a single background import task.
-    fn spawn_bg_import(&mut self, data: Vec<u8>, block_hash: B256, view: u64) {
+    fn spawn_bg_import(&mut self, data: super::SharedBlockData, block_hash: B256, view: u64) {
         self.bg_import_in_flight = true;
         let done_tx = self.import_done_tx.clone();
         let eh = match &self.el {
@@ -950,7 +1290,8 @@ impl ConsensusService {
         info!(target: "n42::cl::consensus_loop", view, %block_hash, "spawning background import");
         tokio::spawn(async move {
             let (outcome, block_ts) =
-                Self::background_import(eh, exec_cache, bad_blocks, &data, block_hash).await;
+                Self::background_import(eh, exec_cache, bad_blocks, data.as_slice(), block_hash)
+                    .await;
             if done_tx
                 .send((block_hash, view, outcome, block_ts))
                 .await
@@ -984,22 +1325,21 @@ impl ConsensusService {
         // Use the direct timestamp field from the broadcast struct.
         let block_timestamp = broadcast.timestamp;
 
-        let payload_json = match super::decompress_payload(&broadcast.payload_json) {
+        let payload_wire = match super::decompress_payload(&broadcast.payload_json) {
             Ok(d) => d,
             Err(e) => {
                 warn!(target: "n42::cl::consensus_loop", %block_hash, error = %e, "bg import: failed to decompress payload");
                 return (ImportOutcome::Invalid, 0);
             }
         };
-        let execution_data: alloy_rpc_types_engine::ExecutionData = match serde_json::from_slice(
-            &payload_json,
-        ) {
-            Ok(d) => d,
-            Err(e) => {
-                warn!(target: "n42::cl::consensus_loop", %block_hash, error = %e, "bg import: failed to parse execution payload");
-                return (ImportOutcome::Invalid, 0);
-            }
-        };
+        let execution_data: alloy_rpc_types_engine::ExecutionData =
+            match super::decode_execution_payload_owned(payload_wire) {
+                Ok(d) => d,
+                Err(e) => {
+                    warn!(target: "n42::cl::consensus_loop", %block_hash, error = %e, "bg import: failed to parse execution payload");
+                    return (ImportOutcome::Invalid, 0);
+                }
+            };
         if broadcast.block_hash != block_hash || execution_data.block_hash() != block_hash {
             warn!(
                 target: "n42::cl::consensus_loop",
@@ -1163,30 +1503,23 @@ impl ConsensusService {
                     .committed_blocks
                     .iter()
                     .rev()
-                    .find(|b| b.block_hash == stale_hash && !b.payload.is_empty())
-                    .map(|b| super::BlockDataBroadcast {
-                        block_hash: b.block_hash,
-                        view: b.view,
-                        payload_json: b.payload.clone(),
-                        timestamp: 0,
-                        execution_output: None,
-                        leader_ready_unix_ms: 0,
+                    .find(|b| b.block_hash == stale_hash)
+                    .and_then(|b| {
+                        b.block_data.clone().or_else(|| {
+                            (!b.payload.is_empty())
+                                .then(|| super::BlockDataBroadcast {
+                                    block_hash: b.block_hash,
+                                    view: b.view,
+                                    payload_json: b.payload.clone(),
+                                    timestamp: 0,
+                                    execution_output: None,
+                                    leader_ready_unix_ms: 0,
+                                })
+                                .and_then(|broadcast| bincode::serialize(&broadcast).ok())
+                                .map(Into::into)
+                        })
                     });
-                if let Some(broadcast) = local {
-                    let raw = match bincode::serialize(&broadcast) {
-                        Ok(raw) => raw,
-                        Err(error) => {
-                            error!(
-                                target: "n42::cl::consensus_loop",
-                                stale_view,
-                                hash = %stale_hash,
-                                %error,
-                                "failed to rebuild retained committed broadcast; requesting sync"
-                            );
-                            self.initiate_sync(stale_view, new_view);
-                            return;
-                        }
-                    };
+                if let Some(raw) = local {
                     counter!("n42_pending_finalization_local_redrive_total").increment(1);
                     info!(
                         target: "n42::cl::consensus_loop",
@@ -1374,6 +1707,7 @@ impl ConsensusService {
             }
             info!(target: "n42::cl::consensus_loop", %hash, view, "background import completed, updating head");
             self.advance_execution_validated_head(view, hash, "background import");
+            self.mark_async_commit_finalized(view, hash);
             if block_timestamp > 0 {
                 self.last_committed_timestamp = self.last_committed_timestamp.max(block_timestamp);
             }
@@ -1439,7 +1773,15 @@ impl ConsensusService {
     /// The block is now in reth's engine tree (via new_payload only, no FCU).
     /// We record this so finalize_committed_block knows the block is pre-validated
     /// and its FCU will succeed immediately (Case A).
-    pub(super) async fn handle_eager_import_done(&mut self, hash: B256, block_ts: u64) {
+    pub(super) async fn handle_eager_import_done(
+        &mut self,
+        hash: B256,
+        block_ts: u64,
+        parent_hash: B256,
+        block_number: u64,
+        has_staking_target: bool,
+        state_diff: Option<n42_execution::state_diff::StateDiff>,
+    ) {
         // Record the pre-imported block hash. When finalize_committed_block runs,
         // it will find this block already in reth's engine tree, making FCU instant.
         // We do NOT update head_block_hash here — that should only change via FCU
@@ -1451,6 +1793,13 @@ impl ConsensusService {
         if let Some(timing) = self.pipeline_timings.get_mut(&hash) {
             timing.import_complete = Some(Instant::now());
         }
+        self.record_validated_execution_metadata(
+            hash,
+            parent_hash,
+            block_number,
+            has_staking_target,
+            state_diff,
+        );
         debug!(target: "n42::cl::consensus_loop", %hash, "eager import done: block in engine tree (awaiting consensus commit)");
 
         self.record_eager_execution_validated(hash);
@@ -1485,27 +1834,138 @@ impl ConsensusService {
             .find(|block| block.block_hash == hash)
             .map(|block| (block.view, block.commit_qc.clone()));
         if let Some((view, commit_qc)) = committed {
-            let needs_finalize = self.head_block_hash != hash
-                || self
-                    .pending_finalization
-                    .as_ref()
-                    .is_some_and(|pending| pending.block_hash == hash);
-            self.advance_execution_validated_head(view, hash, "eager import after commit");
-            if let Some(index) = self
-                .eager_execution_validated
-                .iter()
-                .position(|validated_hash| *validated_hash == hash)
-            {
-                self.eager_execution_validated.remove(index);
-            }
-            if needs_finalize {
-                info!(target: "n42::cl::consensus_loop", view, %hash, "late eager import accepted for committed block; retrying finalization");
-                self.finalize_committed_block(view, hash, commit_qc).await;
-            }
+            self.queue_validated_staking_scan(hash, block_number, has_staking_target);
+            // Tests and restart recovery can materialize the committed ring
+            // before the in-memory lifecycle map. Reconstruct the entry, then
+            // promote it with the exact hash accepted by new_payload.
+            self.enqueue_async_commit(view, hash, commit_qc, true);
+            self.mark_async_commit_execution_ready(hash);
+            self.drive_async_commits().await;
         }
     }
 
-    pub(super) async fn handle_leader_payload_feedback(&mut self, hash: B256, data: Vec<u8>) {
+    /// Drains validated staking classifications strictly in execution-block
+    /// order. The common negative case advances with `{}` and never decodes the
+    /// multi-megabyte payload on the commit event loop.
+    fn queue_validated_staking_scan(
+        &mut self,
+        hash: B256,
+        block_number: u64,
+        has_staking_target: bool,
+    ) {
+        let Some(staking_sink) = self.staking_sink.as_ref() else {
+            return;
+        };
+        if block_number <= staking_sink.last_scanned_block() {
+            return;
+        }
+        self.pending_staking_scans
+            .insert(block_number, (hash, has_staking_target));
+
+        loop {
+            let last_scanned = self
+                .staking_sink
+                .as_ref()
+                .map(|sink| sink.last_scanned_block())
+                .unwrap_or_default();
+            let next_block = last_scanned.saturating_add(1);
+            let Some((next_hash, next_has_target)) =
+                self.pending_staking_scans.get(&next_block).copied()
+            else {
+                break;
+            };
+
+            let payload = if next_has_target {
+                self.recent_block_data
+                    .iter()
+                    .find(|entry| entry.block_hash == next_hash)
+                    .and_then(|entry| {
+                        bincode::deserialize::<super::BlockDataBroadcast>(
+                            entry.block_data.as_slice(),
+                        )
+                        .ok()
+                    })
+                    .and_then(|broadcast| super::decompress_payload(&broadcast.payload_json).ok())
+                    .and_then(|payload| super::execution_payload_json_for_staking(&payload).ok())
+            } else {
+                Some(Vec::new())
+            };
+            let Some(payload) = payload else {
+                warn!(target: "n42::cl::consensus_loop", block_number = next_block, %next_hash, "validated staking payload unavailable; preserving ordered scan barrier");
+                break;
+            };
+
+            if let Some(staking_sink) = self.staking_sink.as_ref() {
+                staking_sink.scan_committed_block(
+                    next_block,
+                    if next_has_target { &payload } else { b"{}" },
+                );
+            }
+            self.pending_staking_scans.remove(&next_block);
+            counter!("n42_staking_scan_deferred_drained_total").increment(1);
+        }
+    }
+
+    /// Completes auxiliary QMDB/Twig staging without delaying the execution-
+    /// validity notification that drives finalize FCU and the next leader.
+    pub(super) fn handle_state_diff_ready(
+        &mut self,
+        hash: B256,
+        state_diff: n42_execution::state_diff::StateDiff,
+    ) {
+        let Some(view) = self
+            .recent_block_data
+            .iter()
+            .find(|entry| entry.block_hash == hash)
+            .map(|entry| entry.view)
+        else {
+            counter!("n42_state_diff_ready_orphan_total").increment(1);
+            debug!(target: "n42::twig", %hash, "state-diff completion arrived after raw metadata eviction");
+            return;
+        };
+
+        let committed_gap = self
+            .missing_sidecar_diffs
+            .get(&view)
+            .is_some_and(|missing_hash| *missing_hash == hash);
+        if !committed_gap {
+            if let Some(entry) = self
+                .recent_block_data
+                .iter_mut()
+                .find(|entry| entry.block_hash == hash)
+            {
+                entry.execution_state_diff = Some(state_diff);
+            }
+            return;
+        }
+
+        self.missing_sidecar_diffs.remove(&view);
+        self.pending_sidecar_diffs.insert(view, (hash, state_diff));
+        counter!("n42_sidecar_diff_deferred_ready_total").increment(1);
+        debug!(target: "n42::twig", view, %hash, "asynchronous committed sidecar diff ready");
+        if view <= self.execution_validated_head_view {
+            self.enqueue_confirmed_sidecar_state_diffs(self.execution_validated_head_view);
+        }
+    }
+
+    pub(super) async fn handle_leader_payload_feedback(
+        &mut self,
+        hash: B256,
+        data: super::SharedBlockData,
+    ) {
+        let decoded_broadcast =
+            match bincode::deserialize::<super::BlockDataBroadcast>(data.as_slice()) {
+                Ok(broadcast) => Some(broadcast),
+                Err(error) => {
+                    warn!(
+                        target: "n42::cl::consensus_loop",
+                        %hash,
+                        error = %error,
+                        "failed to decode leader block data broadcast"
+                    );
+                    None
+                }
+            };
         // Cache the block data for deferred import during finalization.
         // The leader skips new_payload during building (deferred-import optimization),
         // so the block data must be available in pending_block_data for Case B in
@@ -1516,22 +1976,29 @@ impl ConsensusService {
             .as_ref()
             .map(|pending| pending.block_hash)
             .unwrap_or(hash);
-        if self.cache_pending_block_data(hash, data.clone(), &[hash, pending_finalization_hash]) {
+        let cached = if let Some(broadcast) = decoded_broadcast.as_ref() {
+            self.cache_pending_block_data_with_metadata(
+                hash,
+                Arc::clone(&data),
+                &[hash, pending_finalization_hash],
+                broadcast.view,
+                broadcast.payload_json.len(),
+            )
+        } else {
+            self.cache_pending_block_data(
+                hash,
+                Arc::clone(&data),
+                &[hash, pending_finalization_hash],
+            )
+        };
+        if cached {
+            counter!(
+                "n42_block_data_copy_avoided_bytes_total",
+                "site" => "leader_feedback"
+            )
+            .increment(data.len() as u64);
             debug!(target: "n42::cl::consensus_loop", %hash, "cached leader block data for deferred import");
         }
-
-        let decoded_broadcast = match bincode::deserialize::<super::BlockDataBroadcast>(&data) {
-            Ok(broadcast) => Some(broadcast),
-            Err(error) => {
-                warn!(
-                    target: "n42::cl::consensus_loop",
-                    %hash,
-                    error = %error,
-                    "failed to decode leader block data broadcast"
-                );
-                None
-            }
-        };
 
         if let Some(ref broadcast) = decoded_broadcast
             && broadcast.timestamp > 0
@@ -1544,11 +2011,13 @@ impl ConsensusService {
             .iter_mut()
             .rev()
             .find(|b| b.block_hash == hash)
-            && block.payload.is_empty()
-            && let Some(ref broadcast) = decoded_broadcast
+            && block.block_data.is_none()
         {
-            block.payload = broadcast.payload_json.clone();
-            debug!(target: "n42::cl::consensus_loop", %hash, "populated committed block payload from leader build task");
+            block.block_data = Some(Arc::clone(&data));
+            if let Some(ref broadcast) = decoded_broadcast {
+                block.payload_len = broadcast.payload_json.len();
+            }
+            debug!(target: "n42::cl::consensus_loop", %hash, "linked committed block to shared leader envelope");
         }
 
         // If a deferred finalization is pending for this hash, complete it now.
@@ -1826,7 +2295,20 @@ impl ConsensusService {
                 return None;
             }
         };
-        let decompressed = match zstd::bulk::decompress(exec_bytes, 64 * 1024 * 1024) {
+        Self::extract_state_diff_from_execution_output(block_hash, exec_bytes)
+    }
+
+    /// Derive the sidecar delta directly from the compressed compact execution
+    /// output. Eager import tasks use this entry point so parsing overlaps reth
+    /// validation and consensus instead of delaying the next leader at commit.
+    pub(super) fn extract_state_diff_from_execution_output(
+        block_hash: B256,
+        exec_bytes: &[u8],
+    ) -> Option<n42_execution::state_diff::StateDiff> {
+        let decompressed = match zstd::bulk::decompress(
+            exec_bytes,
+            super::MAX_DECOMPRESSED_BLOCK_COMPONENT_SIZE,
+        ) {
             Ok(decompressed) => decompressed,
             Err(error) => {
                 warn!(
@@ -1889,7 +2371,7 @@ impl ConsensusService {
                 return None;
             }
         };
-        match zstd::bulk::decompress(exec_bytes, 64 * 1024 * 1024) {
+        match zstd::bulk::decompress(exec_bytes, super::MAX_DECOMPRESSED_BLOCK_COMPONENT_SIZE) {
             Ok(bundle_json) => Some(bundle_json),
             Err(error) => {
                 warn!(

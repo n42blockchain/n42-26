@@ -57,18 +57,19 @@ pub struct TxResult {
 
 /// Worker count for the parallel path. Block-STM's in-order validation is partly
 /// serial, so idle workers spin/contend on the shared scheduler atoms; past a
-/// point adding threads makes cheap-tx blocks slower on a contended allocator
-/// (the Windows default heap; jemalloc on production Linux scales far better).
-/// Cap to a sane default; raise `N42_PARALLEL_WORKERS` on contract-heavy chains.
-/// See `docs/devlog-67`.
+/// point adding threads makes cheap-tx blocks slower on a contended allocator.
+/// Keep the production lane count in the measured 6--8 range. The shared
+/// `N42_EXECUTION_LANES` knob drives txpool preparation and Block-STM; the old
+/// `N42_PARALLEL_WORKERS` name remains a compatibility fallback.
 fn worker_count(num_txs: usize) -> usize {
     let cores = rayon::current_num_threads();
-    let cap = std::env::var("N42_PARALLEL_WORKERS")
+    let requested = std::env::var("N42_EXECUTION_LANES")
+        .or_else(|_| std::env::var("N42_PARALLEL_WORKERS"))
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
-        .filter(|&w| w > 0)
-        .unwrap_or_else(|| cores.min(8));
-    cap.min(cores).min(num_txs).max(1)
+        .unwrap_or(8)
+        .clamp(6, 8);
+    requested.min(cores).min(num_txs).max(1)
 }
 
 /// Execute transactions in parallel using Block-STM.
@@ -92,7 +93,6 @@ where
     DB: DatabaseRef + Send + Sync,
     DB::Error: fmt::Display + Send,
 {
-    tracing::Span::current().record("parallelism", rayon::current_num_threads());
     let num_txs = txs.len();
     if num_txs == 0 {
         return Ok(ParallelExecutionOutput {
@@ -126,6 +126,8 @@ where
     };
 
     let num_workers = worker_count(num_txs);
+    tracing::Span::current().record("parallelism", num_workers);
+    metrics::gauge!("n42_parallel_evm_execution_lanes").set(num_workers as f64);
     let start = std::time::Instant::now();
     let mv = MvMemory::new();
     let scheduler = Scheduler::new(num_txs);

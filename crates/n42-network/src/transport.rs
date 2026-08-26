@@ -1,8 +1,10 @@
+use alloy_primitives::B256;
 use libp2p::gossipsub::{self, PeerScoreParams, PeerScoreThresholds, TopicScoreParams};
 use libp2p::identity::Keypair;
 use libp2p::swarm::NetworkBehaviour;
 use libp2p::swarm::behaviour::toggle::Toggle;
 use libp2p::{PeerId, Swarm};
+use std::io;
 use std::time::Duration;
 
 use crate::block_direct::BlockDirectCodec;
@@ -21,12 +23,15 @@ use crate::tx_forward::TxForwardCodec;
 
 /// Largest message GossipSub will publish or accept.
 ///
-/// This is the tightest ceiling any block on this chain has to fit through:
-/// block data goes out over `block_direct` (16 MiB) *and* unconditionally over
-/// GossipSub as a reliability fallback, so 8 MiB is the effective limit. It is
-/// public so block producers can derive their budget from it instead of
-/// hard-coding a second copy that silently drifts out of sync with this one.
-pub const MAX_GOSSIP_MESSAGE_SIZE: usize = 8 * 1024 * 1024;
+/// A 90k-transfer compact block is already about 8.9 MiB on the wire. Keeping
+/// the old 8 MiB ceiling made GossipSub silently drop the fallback while only a
+/// subset of validators received the direct push. The block could still reach
+/// quorum, but a later leader that missed it could not build on the committed
+/// parent and remained `Syncing`. Sixteen MiB leaves measured headroom for
+/// 120k-transfer blocks while retaining a bounded receiver allocation.
+///
+/// This is public so block producers and receiver validation share one limit.
+pub const MAX_GOSSIP_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 
 /// Largest blob-sidecar message GossipSub receivers will accept.
 ///
@@ -38,6 +43,23 @@ pub const MAX_GOSSIP_MESSAGE_SIZE: usize = 8 * 1024 * 1024;
 /// side is exactly what let blob broadcasts outgrow the receivers unnoticed.
 pub const MAX_BLOB_GOSSIP_MESSAGE_SIZE: usize = 1024 * 1024;
 
+const DEFAULT_QUIC_MAX_STREAM_DATA: u32 = 40 * 1024 * 1024;
+const DEFAULT_QUIC_MAX_CONNECTION_DATA: u32 = 96 * 1024 * 1024;
+const DEFAULT_QUIC_MAX_CONCURRENT_STREAMS: u32 = 256;
+const DEFAULT_QUIC_UDP_SOCKET_BUFFER_BYTES: usize = 16 * 1024 * 1024;
+const DEFAULT_BLOCK_DIRECT_REQUEST_TIMEOUT_MS: u64 = 10_000;
+const MIN_QUIC_FLOW_WINDOW: u32 = 1024 * 1024;
+const MAX_QUIC_FLOW_WINDOW: u32 = 512 * 1024 * 1024;
+
+/// Effective UDP socket buffer sizes after applying the local kernel limits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuicUdpSocketBuffers {
+    pub matched_sockets: usize,
+    pub requested_bytes: usize,
+    pub receive_bytes: usize,
+    pub send_bytes: usize,
+}
+
 /// The composite network behaviour for N42 nodes.
 ///
 /// Combines GossipSub (pub/sub consensus), Identify (peer metadata),
@@ -45,13 +67,24 @@ pub const MAX_BLOB_GOSSIP_MESSAGE_SIZE: usize = 1024 * 1024;
 /// optional Kademlia (WAN discovery), and connection limits.
 #[derive(NetworkBehaviour)]
 pub struct N42Behaviour {
+    /// Reject excess connections before any stateful child behaviour sees
+    /// them. Request-response records a connection while constructing its
+    /// handler; if a later child rejects that same connection, its cached
+    /// `ConnectionId` becomes stale and outbound requests are silently sent
+    /// to a handler that was never installed in the swarm.
+    pub connection_limits: libp2p::connection_limits::Behaviour,
+    /// Direct block data push from leader to validators (bypasses GossipSub).
+    ///
+    /// Keep this before GossipSub. The derived composite behaviour and its
+    /// connection handler poll children in declaration order. A continuously
+    /// writable multi-megabyte GossipSub stream can otherwise leave a newly
+    /// queued request-response substream below it without ever being polled.
+    pub block_direct: libp2p::request_response::Behaviour<BlockDirectCodec>,
+    /// Point-to-point consensus messaging (votes, proposals to specific validators).
+    pub consensus_direct: libp2p::request_response::Behaviour<ConsensusDirectCodec>,
     pub gossipsub: gossipsub::Behaviour,
     pub identify: libp2p::identify::Behaviour,
     pub state_sync: libp2p::request_response::Behaviour<StateSyncCodec>,
-    /// Point-to-point consensus messaging (votes, proposals to specific validators).
-    pub consensus_direct: libp2p::request_response::Behaviour<ConsensusDirectCodec>,
-    /// Direct block data push from leader to validators (bypasses GossipSub).
-    pub block_direct: libp2p::request_response::Behaviour<BlockDirectCodec>,
     /// Gov5 reliable block push, enabled inbound for observer compatibility.
     pub gov5_block_push: libp2p::request_response::Behaviour<Gov5BlockPushCodec>,
     /// Gov5 fetch-on-miss block retrieval, enabled outbound for observer catch-up.
@@ -66,8 +99,6 @@ pub struct N42Behaviour {
     pub mdns: Toggle<libp2p::mdns::tokio::Behaviour>,
     /// Disabled in dev/test; enabled in production via `enable_kademlia`.
     pub kademlia: Toggle<libp2p::kad::Behaviour<libp2p::kad::store::MemoryStore>>,
-    /// Prevents fd exhaustion from excessive peer connections.
-    pub connection_limits: libp2p::connection_limits::Behaviour,
 }
 
 /// Configuration for the N42 network transport layer.
@@ -98,6 +129,15 @@ pub struct TransportConfig {
     pub max_established_incoming: u32,
     pub max_established_outgoing: u32,
     pub max_established_total: u32,
+    /// QUIC receive credit available to one stream. libp2p defaults to 10 MB,
+    /// which is smaller than the current 16 MiB block propagation budget.
+    pub quic_max_stream_data: u32,
+    /// QUIC receive credit shared by all streams on one peer connection.
+    pub quic_max_connection_data: u32,
+    /// Maximum peer-initiated bidirectional QUIC streams per connection.
+    pub quic_max_concurrent_streams: u32,
+    /// Timeout for a negotiated block-direct request/response substream.
+    pub block_direct_request_timeout: Duration,
 }
 
 impl TransportConfig {
@@ -136,6 +176,25 @@ impl TransportConfig {
             2.min(mesh_d / 2)
                 .min(if mesh_d_low > 0 { mesh_d_low - 1 } else { 0 });
         let retain_scores = 4.min(mesh_d_high.max(1));
+        let quic_max_stream_data =
+            env_quic_window("N42_QUIC_MAX_STREAM_DATA", DEFAULT_QUIC_MAX_STREAM_DATA);
+        let quic_max_connection_data = env_quic_window(
+            "N42_QUIC_MAX_CONNECTION_DATA",
+            DEFAULT_QUIC_MAX_CONNECTION_DATA,
+        )
+        .max(quic_max_stream_data);
+        let quic_max_concurrent_streams = std::env::var("N42_QUIC_MAX_CONCURRENT_STREAMS")
+            .ok()
+            .and_then(|raw| raw.parse::<u32>().ok())
+            .unwrap_or(DEFAULT_QUIC_MAX_CONCURRENT_STREAMS)
+            .clamp(32, 4096);
+        let block_direct_request_timeout = Duration::from_millis(
+            std::env::var("N42_BLOCK_DIRECT_REQUEST_TIMEOUT_MS")
+                .ok()
+                .and_then(|raw| raw.parse::<u64>().ok())
+                .unwrap_or(DEFAULT_BLOCK_DIRECT_REQUEST_TIMEOUT_MS)
+                .clamp(1_000, 60_000),
+        );
 
         Self {
             heartbeat_interval: Duration::from_secs(1),
@@ -152,6 +211,10 @@ impl TransportConfig {
             max_established_incoming: 128u32.max(max_peers as u32 + 16),
             max_established_outgoing: 64u32.max(max_peers as u32 + 16),
             max_established_total: 192u32.max((max_peers as u32 + 16) * 2),
+            quic_max_stream_data,
+            quic_max_connection_data,
+            quic_max_concurrent_streams,
+            block_direct_request_timeout,
         }
     }
 }
@@ -162,6 +225,113 @@ fn env_mesh_override(name: &str, max_peers: usize) -> Option<usize> {
     let raw = std::env::var(name).ok()?;
     let parsed: usize = raw.parse().ok()?;
     Some(parsed.min(max_peers))
+}
+
+fn env_quic_window(name: &str, default: u32) -> u32 {
+    std::env::var(name)
+        .ok()
+        .and_then(|raw| raw.parse::<u32>().ok())
+        .unwrap_or(default)
+        .clamp(MIN_QUIC_FLOW_WINDOW, MAX_QUIC_FLOW_WINDOW)
+}
+
+/// Requested per-process QUIC UDP receive/send buffer. Linux may cap this at
+/// `net.core.rmem_max` / `net.core.wmem_max`; the effective value is logged
+/// after the listener becomes visible.
+pub fn requested_quic_udp_socket_buffer_bytes() -> usize {
+    std::env::var("N42_QUIC_UDP_SOCKET_BUFFER_BYTES")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_QUIC_UDP_SOCKET_BUFFER_BYTES)
+        .clamp(256 * 1024, 256 * 1024 * 1024)
+}
+
+/// Returns the UDP port only for a QUIC multiaddr.
+pub fn quic_udp_port(address: &libp2p::Multiaddr) -> Option<u16> {
+    let mut udp_port = None;
+    let mut is_quic = false;
+    for protocol in address.iter() {
+        match protocol {
+            libp2p::multiaddr::Protocol::Udp(port) => udp_port = Some(port),
+            libp2p::multiaddr::Protocol::QuicV1 => is_quic = true,
+            _ => {}
+        }
+    }
+    is_quic.then_some(udp_port).flatten()
+}
+
+/// Enlarges all UDP sockets owned by this process that are bound to `port`.
+///
+/// libp2p creates its QUIC socket internally and currently exposes flow-control
+/// settings but not `SO_RCVBUF` / `SO_SNDBUF`. On Linux, locating the already
+/// bound descriptor through `/proc/self/fd` lets the node apply the setting
+/// without weakening QUIC authentication or replacing the transport.
+#[cfg(target_os = "linux")]
+pub fn tune_quic_udp_socket_buffers(
+    port: u16,
+    requested_bytes: usize,
+) -> io::Result<Option<QuicUdpSocketBuffers>> {
+    use socket2::{SockRef, Type};
+    use std::os::fd::BorrowedFd;
+
+    let mut matched_sockets = 0usize;
+    let mut receive_bytes = usize::MAX;
+    let mut send_bytes = usize::MAX;
+
+    for entry in std::fs::read_dir("/proc/self/fd")? {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => continue,
+        };
+        let Some(raw_fd) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        if raw_fd < 0 {
+            continue;
+        }
+
+        // SAFETY: `raw_fd` comes from this process' live `/proc/self/fd`
+        // directory and is borrowed only for the duration of this iteration.
+        let borrowed = unsafe { BorrowedFd::borrow_raw(raw_fd) };
+        let socket = SockRef::from(&borrowed);
+        if socket.r#type().ok() != Some(Type::DGRAM) {
+            continue;
+        }
+        let Some(local_addr) = socket.local_addr().ok().and_then(|addr| addr.as_socket()) else {
+            continue;
+        };
+        if local_addr.port() != port {
+            continue;
+        }
+
+        socket.set_recv_buffer_size(requested_bytes)?;
+        socket.set_send_buffer_size(requested_bytes)?;
+        receive_bytes = receive_bytes.min(socket.recv_buffer_size()?);
+        send_bytes = send_bytes.min(socket.send_buffer_size()?);
+        matched_sockets += 1;
+    }
+
+    if matched_sockets == 0 {
+        return Ok(None);
+    }
+    Ok(Some(QuicUdpSocketBuffers {
+        matched_sockets,
+        requested_bytes,
+        receive_bytes,
+        send_bytes,
+    }))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn tune_quic_udp_socket_buffers(
+    _port: u16,
+    _requested_bytes: usize,
+) -> io::Result<Option<QuicUdpSocketBuffers>> {
+    Ok(None)
 }
 
 impl Default for TransportConfig {
@@ -179,6 +349,12 @@ impl Default for TransportConfig {
             max_established_incoming: 128,
             max_established_outgoing: 64,
             max_established_total: 192,
+            quic_max_stream_data: DEFAULT_QUIC_MAX_STREAM_DATA,
+            quic_max_connection_data: DEFAULT_QUIC_MAX_CONNECTION_DATA,
+            quic_max_concurrent_streams: DEFAULT_QUIC_MAX_CONCURRENT_STREAMS,
+            block_direct_request_timeout: Duration::from_millis(
+                DEFAULT_BLOCK_DIRECT_REQUEST_TIMEOUT_MS,
+            ),
         }
     }
 }
@@ -186,8 +362,12 @@ impl Default for TransportConfig {
 /// Builds the libp2p Swarm with QUIC transport and N42Behaviour.
 ///
 /// Uses QUIC for low-latency encrypted transport (TLS 1.3 built-in).
-pub fn build_swarm(keypair: Keypair, config: TransportConfig) -> eyre::Result<Swarm<N42Behaviour>> {
-    build_swarm_with_validator_index(keypair, config, None)
+pub fn build_swarm(
+    keypair: Keypair,
+    config: TransportConfig,
+    genesis_hash: B256,
+) -> eyre::Result<Swarm<N42Behaviour>> {
+    build_swarm_with_validator_index(keypair, config, None, genesis_hash)
 }
 
 /// Builds the read-only interop observer swarm with both native QUIC and
@@ -199,8 +379,9 @@ pub fn build_swarm(keypair: Keypair, config: TransportConfig) -> eyre::Result<Sw
 pub fn build_interop_observer_swarm(
     keypair: Keypair,
     config: TransportConfig,
+    genesis_hash: B256,
 ) -> eyre::Result<Swarm<N42Behaviour>> {
-    build_swarm_with_transports(keypair, config, None, true)
+    build_swarm_with_transports(keypair, config, None, true, genesis_hash)
 }
 
 /// Builds a voting interop swarm with gov5 TCP/Noise/Yamux transport and an
@@ -209,8 +390,9 @@ pub fn build_interop_participant_swarm(
     keypair: Keypair,
     config: TransportConfig,
     validator_index: u32,
+    genesis_hash: B256,
 ) -> eyre::Result<Swarm<N42Behaviour>> {
-    build_swarm_with_transports(keypair, config, Some(validator_index), true)
+    build_swarm_with_transports(keypair, config, Some(validator_index), true, genesis_hash)
 }
 
 /// Derives the deterministic libp2p keypair currently used for validator P2P identities.
@@ -239,8 +421,9 @@ pub fn build_swarm_with_validator_index(
     keypair: Keypair,
     config: TransportConfig,
     validator_index: Option<u32>,
+    genesis_hash: B256,
 ) -> eyre::Result<Swarm<N42Behaviour>> {
-    build_swarm_with_transports(keypair, config, validator_index, false)
+    build_swarm_with_transports(keypair, config, validator_index, false, genesis_hash)
 }
 
 fn build_swarm_with_transports(
@@ -248,20 +431,22 @@ fn build_swarm_with_transports(
     config: TransportConfig,
     validator_index: Option<u32>,
     enable_gov5_tcp: bool,
+    genesis_hash: B256,
 ) -> eyre::Result<Swarm<N42Behaviour>> {
     let gossipsub_config = gossipsub::ConfigBuilder::default()
         .heartbeat_interval(config.heartbeat_interval)
         // Permissive: messages forwarded automatically after delivery.
         // Application-level validation is in handle_gossipsub_message.
         .validation_mode(gossipsub::ValidationMode::Permissive)
-        // 8MB max: high-throughput blocks can reach several MB.
+        // High-throughput compact blocks can reach several MiB. Keep this in
+        // lockstep with per-topic receiver validation and the producer budget.
         .max_transmit_size(MAX_GOSSIP_MESSAGE_SIZE)
         .mesh_n(config.mesh_d)
         .mesh_n_low(config.mesh_d_low)
         .mesh_n_high(config.mesh_d_high)
         .mesh_outbound_min(config.mesh_outbound_min)
         .retain_scores(config.retain_scores)
-        .message_id_fn(message_id_fn)
+        .message_id_fn(message_id_fn(genesis_hash))
         .build()
         .map_err(|e| eyre::eyre!("gossipsub config error: {e}"))?;
 
@@ -289,8 +474,9 @@ fn build_swarm_with_transports(
         } else {
             gossipsub::MessageAuthenticity::Signed(key.clone())
         };
-        let mut gossipsub = gossipsub::Behaviour::new(message_authenticity, gossipsub_config.clone())
-            .map_err(|e| eyre::eyre!("gossipsub behaviour error: {e}"))?;
+        let mut gossipsub =
+            gossipsub::Behaviour::new(message_authenticity, gossipsub_config.clone())
+                .map_err(|e| eyre::eyre!("gossipsub behaviour error: {e}"))?;
 
         gossipsub
             .with_peer_score(peer_score_params, thresholds)
@@ -329,7 +515,7 @@ fn build_swarm_with_transports(
                 libp2p::request_response::ProtocolSupport::Full,
             )],
             libp2p::request_response::Config::default()
-                .with_request_timeout(Duration::from_secs(30)),
+                .with_request_timeout(config.block_direct_request_timeout),
         );
 
         let gov5_block_push = libp2p::request_response::Behaviour::new(
@@ -450,7 +636,12 @@ fn build_swarm_with_transports(
                 libp2p::noise::Config::new,
                 libp2p::yamux::Config::default,
             )?
-            .with_quic()
+            .with_quic_config(|mut quic| {
+                quic.max_stream_data = config.quic_max_stream_data;
+                quic.max_connection_data = config.quic_max_connection_data;
+                quic.max_concurrent_stream_limit = config.quic_max_concurrent_streams;
+                quic
+            })
             .with_behaviour(build_behaviour)
             .map_err(|e| eyre::eyre!("swarm builder error: {e}"))?
             .with_swarm_config(|cfg| {
@@ -460,7 +651,12 @@ fn build_swarm_with_transports(
     } else {
         libp2p::SwarmBuilder::with_existing_identity(keypair.clone())
             .with_tokio()
-            .with_quic()
+            .with_quic_config(|mut quic| {
+                quic.max_stream_data = config.quic_max_stream_data;
+                quic.max_connection_data = config.quic_max_connection_data;
+                quic.max_concurrent_stream_limit = config.quic_max_concurrent_streams;
+                quic
+            })
             .with_behaviour(build_behaviour)
             .map_err(|e| eyre::eyre!("swarm builder error: {e}"))?
             .with_swarm_config(|cfg| {
@@ -470,9 +666,23 @@ fn build_swarm_with_transports(
     };
 
     if enable_gov5_tcp {
-        tracing::info!(%peer_id, "observer swarm built with QUIC and TCP transports");
+        tracing::info!(
+            %peer_id,
+            quic_max_stream_data = config.quic_max_stream_data,
+            quic_max_connection_data = config.quic_max_connection_data,
+            quic_max_concurrent_streams = config.quic_max_concurrent_streams,
+            block_direct_request_timeout_ms = config.block_direct_request_timeout.as_millis(),
+            "observer swarm built with QUIC and TCP transports"
+        );
     } else {
-        tracing::info!(%peer_id, "swarm built with QUIC transport");
+        tracing::info!(
+            %peer_id,
+            quic_max_stream_data = config.quic_max_stream_data,
+            quic_max_connection_data = config.quic_max_connection_data,
+            quic_max_concurrent_streams = config.quic_max_concurrent_streams,
+            block_direct_request_timeout_ms = config.block_direct_request_timeout.as_millis(),
+            "swarm built with QUIC transport"
+        );
     }
     Ok(swarm)
 }
@@ -556,6 +766,28 @@ mod tests {
     use super::*;
     use futures::StreamExt;
     use libp2p::{Multiaddr, multiaddr::Protocol, swarm::SwarmEvent};
+
+    #[test]
+    fn quic_udp_port_requires_quic_protocol() {
+        let quic: Multiaddr = "/ip4/127.0.0.1/udp/9000/quic-v1".parse().unwrap();
+        let plain_udp: Multiaddr = "/ip4/127.0.0.1/udp/9000".parse().unwrap();
+        assert_eq!(quic_udp_port(&quic), Some(9000));
+        assert_eq!(quic_udp_port(&plain_udp), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tunes_owned_udp_socket_buffers() {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = socket.local_addr().unwrap().port();
+        let requested = 512 * 1024;
+        let tuned = tune_quic_udp_socket_buffers(port, requested)
+            .unwrap()
+            .expect("bound UDP socket should be found through /proc/self/fd");
+        assert!(tuned.matched_sockets >= 1);
+        assert!(tuned.receive_bytes >= requested);
+        assert!(tuned.send_bytes >= requested);
+    }
 
     #[test]
     fn test_for_network_size_3_nodes() {
@@ -652,6 +884,7 @@ mod tests {
         let mut listener = build_interop_observer_swarm(
             Keypair::generate_ed25519(),
             TransportConfig::for_network_size(2),
+            B256::repeat_byte(0x11),
         )
         .expect("build TCP-capable observer listener");
         let listener_peer_id = *listener.local_peer_id();
@@ -674,6 +907,7 @@ mod tests {
         let mut dialer = build_interop_observer_swarm(
             Keypair::generate_ed25519(),
             TransportConfig::for_network_size(2),
+            B256::repeat_byte(0x11),
         )
         .expect("build TCP-capable observer dialer");
         let mut dial_addr = listen_addr;

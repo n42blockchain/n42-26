@@ -1992,7 +1992,11 @@ fn main() {
                     transport_config.enable_mdns = env_bool("N42_ENABLE_MDNS");
                     transport_config.enable_kademlia = env_bool("N42_ENABLE_DHT");
 
-                    let swarm = build_interop_observer_swarm(keypair, transport_config)
+                    let swarm = build_interop_observer_swarm(
+                        keypair,
+                        transport_config,
+                        interop_genesis_hash,
+                    )
                         .map_err(|e| eyre::eyre!("failed to build observer libp2p swarm: {e}"))?;
 
                     let (mut net_service, net_handle, _consensus_event_rx, net_event_rx) =
@@ -2095,9 +2099,19 @@ fn main() {
                     std::env::var("N42_INTEROP_GENESIS_HASH").ok().as_deref(),
                 )?;
                 let swarm = if h2_v4_participant {
-                    build_interop_participant_swarm(keypair, transport_config, my_index)
+                    build_interop_participant_swarm(
+                        keypair,
+                        transport_config,
+                        my_index,
+                        interop_genesis_hash,
+                    )
                 } else {
-                    build_swarm_with_validator_index(keypair, transport_config, Some(my_index))
+                    build_swarm_with_validator_index(
+                        keypair,
+                        transport_config,
+                        Some(my_index),
+                        genesis_hash,
+                    )
                 }
                 .map_err(|e| eyre::eyre!("failed to build consensus libp2p swarm: {e}"))?;
 

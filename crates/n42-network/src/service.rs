@@ -10,7 +10,11 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::time::interval;
 
-use crate::block_direct::{BlockDirectRequest, BlockDirectResponse};
+use crate::block_direct::{
+    BLOCK_DIRECT_PROTOCOL, BlockDirectFrame, BlockDirectManifest, BlockDirectRequest,
+    BlockDirectResponse, MAX_BLOCK_DIRECT_CHUNK_SIZE, MAX_BLOCK_DIRECT_SIZE,
+    MIN_BLOCK_DIRECT_CHUNK_SIZE, block_direct_chunk_size,
+};
 use crate::consensus_direct::{ConsensusDirectRequest, ConsensusDirectResponse};
 use crate::error::NetworkError;
 use crate::gossipsub::handlers::{
@@ -33,11 +37,18 @@ use crate::h2_v4::{
 use crate::h2_wire::{H2Message, decode_gov5_gossip_message, encode_gov5_gossip_message};
 use crate::reconnection::ReconnectionManager;
 use crate::state_sync::{BlockSyncRequest, BlockSyncResponse, SYNC_PROTOCOL};
-use crate::transport::{N42Behaviour, N42BehaviourEvent, deterministic_validator_peer_id};
+use crate::transport::{
+    N42Behaviour, N42BehaviourEvent, deterministic_validator_peer_id, quic_udp_port,
+    requested_quic_udp_socket_buffer_bytes, tune_quic_udp_socket_buffers,
+};
 use crate::tx_forward::{TxForwardRequest, TxForwardResponse};
 
 const MAX_PENDING_RELIABLE_EVENTS: usize = 2048;
 const MAX_PENDING_DATA_EVENTS: usize = 8192;
+// Bound work done before polling the swarm. Draining an always-ready priority
+// lane to exhaustion can prevent libp2p from opening the substreams requested
+// by the commands that were just accepted.
+const MAX_PRIORITY_COMMANDS_PER_TICK: usize = 8;
 const RECENT_BLOCK_ANNOUNCEMENT_IDS_LIMIT: usize = 4096;
 const DEFAULT_COMMAND_SEND_TIMEOUT_MS: u64 = 50;
 const SYNC_RATE_WINDOW: Duration = Duration::from_secs(1);
@@ -57,6 +68,58 @@ const GOV5_BLOCK_REQUEST_COOLDOWN: Duration = Duration::from_millis(750);
 // are redundant and safely ignored after their request id is reaped.
 const GOV5_BLOCK_REQUEST_STALE_AFTER: Duration = Duration::from_millis(1500);
 const MAX_SERVED_GOV5_BLOCKS: usize = 1024;
+const MAX_INBOUND_BLOCK_DIRECT_TRANSFERS: usize = 32;
+const BLOCK_DIRECT_TRANSFER_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_BLOCK_DIRECT_QUEUE_DEPTH: usize = 64;
+const MAX_BLOCK_DIRECT_RETRIES: u8 = 2;
+
+#[derive(Debug, Clone, Copy)]
+enum PendingBlockDirectFrame {
+    Complete,
+    Transfer { transfer_id: [u8; 32] },
+}
+
+#[derive(Debug)]
+struct PendingBlockDirectRequest {
+    peer: PeerId,
+    bytes: usize,
+    started_at: Instant,
+    frame: PendingBlockDirectFrame,
+    data: Arc<Vec<u8>>,
+    attempt: u8,
+}
+
+#[derive(Debug)]
+struct QueuedBlockDirect {
+    data: Arc<Vec<u8>>,
+    attempt: u8,
+}
+
+#[derive(Debug)]
+struct OutboundBlockDirectTransfer {
+    manifest: BlockDirectManifest,
+    data: Arc<Vec<u8>>,
+    started_at: Instant,
+}
+
+#[derive(Debug)]
+struct InboundBlockDirectTransfer {
+    manifest: BlockDirectManifest,
+    next_chunk: u32,
+    data: Vec<u8>,
+    started_at: Instant,
+}
+
+fn block_direct_queue_depth() -> usize {
+    static DEPTH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *DEPTH.get_or_init(|| {
+        std::env::var("N42_BLOCK_DIRECT_QUEUE_DEPTH")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(DEFAULT_BLOCK_DIRECT_QUEUE_DEPTH)
+            .clamp(2, 256)
+    })
+}
 
 fn stale_gov5_block_fetches(
     pending_hashes: &HashSet<B256>,
@@ -223,7 +286,7 @@ pub enum NetworkCommand {
     /// Send block data directly to a specific peer (leader → validator).
     SendBlockDirect {
         peer: PeerId,
-        data: Vec<u8>,
+        data: Arc<Vec<u8>>,
     },
     /// Forward a batch of RLP-encoded transactions to the current leader.
     ForwardTxBatch {
@@ -443,7 +506,10 @@ impl NetworkHandle {
 
     /// Sends block data directly to a specific validator peer.
     pub fn send_block_direct(&self, peer: PeerId, data: Vec<u8>) -> Result<(), NetworkError> {
-        self.send_priority(NetworkCommand::SendBlockDirect { peer, data })
+        self.send_priority(NetworkCommand::SendBlockDirect {
+            peer,
+            data: Arc::new(data),
+        })
     }
 
     /// Forwards a batch of RLP-encoded transactions to the current leader.
@@ -687,7 +753,7 @@ impl NetworkHandle {
     pub async fn send_block_direct_reliable(
         &self,
         peer: PeerId,
-        data: Vec<u8>,
+        data: Arc<Vec<u8>>,
     ) -> Result<(), NetworkError> {
         Self::send_with_backpressure(
             &self.priority_tx,
@@ -746,6 +812,22 @@ pub struct NetworkService {
     /// Maps internal request ID → libp2p ResponseChannel for sending sync replies.
     pending_sync_channels:
         HashMap<u64, libp2p::request_response::ResponseChannel<BlockSyncResponse>>,
+    /// Outbound block pushes retained until the remote validator ACKs or the
+    /// request-response protocol reports a transport failure. Queue admission
+    /// alone is not delivery, so this is also the source of direct-path
+    /// latency and backlog diagnostics.
+    pending_block_direct_requests:
+        HashMap<libp2p::request_response::OutboundRequestId, PendingBlockDirectRequest>,
+    /// One ACK-paced manifest/chunk transfer per peer. Every chunk references
+    /// the original Arc envelope; the sender does not allocate chunk copies.
+    outbound_block_direct_transfers: HashMap<PeerId, OutboundBlockDirectTransfer>,
+    /// Authenticated receiver-side reassembly, bounded by count, total size,
+    /// strict next index and a 30-second lifetime.
+    inbound_block_direct_transfers: HashMap<(PeerId, [u8; 32]), InboundBlockDirectTransfer>,
+    /// Ordered per-peer block queue behind the single in-flight QUIC data
+    /// substream. It preserves every intermediate block instead of coalescing
+    /// to the latest hash, and is bounded to the request-timeout horizon.
+    queued_block_direct_by_peer: HashMap<PeerId, VecDeque<QueuedBlockDirect>>,
     pending_gov5_block_requests: HashMap<libp2p::request_response::OutboundRequestId, B256>,
     /// Hash-level de-duplication keeps a stream of QCs for the same missing
     /// ancestry from creating an unbounded request-response storm.
@@ -762,6 +844,13 @@ pub struct NetworkService {
     /// Peers that advertised N42's native state-sync protocol. Gov5 peers do
     /// not implement it and must never receive those requests.
     state_sync_peers: HashSet<PeerId>,
+    /// Peers whose Identify protocol set contains the block-direct protocol.
+    /// Dispatch remains compatible with pre-Identify startup, but every large
+    /// request records this capability bit so unsupported negotiation is no
+    /// longer indistinguishable from a congested QUIC stream.
+    block_direct_peers: HashSet<PeerId>,
+    /// QUIC listener ports whose kernel UDP buffers were successfully tuned.
+    tuned_quic_udp_ports: HashSet<u16>,
     /// Recently broadcast canonical Gov5 blocks, retained so followers that
     /// receive the proposal before the block can recover through Gov5's native
     /// block-by-hash RPC.
@@ -1078,12 +1167,18 @@ impl NetworkService {
             blob_sidecar_topic_hash,
             verification_receipts_topic_hash,
             pending_sync_channels: HashMap::new(),
+            pending_block_direct_requests: HashMap::new(),
+            outbound_block_direct_transfers: HashMap::new(),
+            inbound_block_direct_transfers: HashMap::new(),
+            queued_block_direct_by_peer: HashMap::new(),
             pending_gov5_block_requests: HashMap::new(),
             pending_gov5_block_hashes: HashSet::new(),
             recent_gov5_block_requests: HashMap::new(),
             recent_gov5_block_fulfilled: HashMap::new(),
             gov5_block_by_hash_peers: HashSet::new(),
             state_sync_peers: HashSet::new(),
+            block_direct_peers: HashSet::new(),
+            tuned_quic_udp_ports: HashSet::new(),
             gov5_served_blocks: HashMap::new(),
             gov5_served_block_order: VecDeque::new(),
             sync_request_windows: HashMap::new(),
@@ -1150,38 +1245,59 @@ impl NetworkService {
                 }
             }
 
+            // A full consumer channel must not suspend the only task polling
+            // the swarm. Retain the front event and retry on the next tick.
             while let Some(event) = self.pending_reliable_events.pop_front() {
-                let tx = self.consensus_event_tx.clone();
-                if tx.send(event).await.is_err() {
-                    metrics::counter!("n42_network_event_drops_total").increment(1);
-                    tracing::warn!(
-                        "consensus event channel closed while draining reliable backlog"
-                    );
-                    self.pending_reliable_events.clear();
-                    break;
+                match self.consensus_event_tx.try_send(event) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(event)) => {
+                        self.pending_reliable_events.push_front(event);
+                        break;
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        metrics::counter!("n42_network_event_drops_total").increment(1);
+                        tracing::warn!(
+                            "consensus event channel closed while draining reliable backlog"
+                        );
+                        self.pending_reliable_events.clear();
+                        break;
+                    }
                 }
             }
 
             while let Some(event) = self.pending_data_events.pop_front() {
-                let tx = self.event_tx.clone();
-                if tx.send(event).await.is_err() {
-                    metrics::counter!("n42_network_event_drops_total").increment(1);
-                    tracing::warn!("data event channel closed while draining reliable backlog");
-                    self.pending_data_events.clear();
-                    break;
+                match self.event_tx.try_send(event) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(event)) => {
+                        self.pending_data_events.push_front(event);
+                        break;
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        metrics::counter!("n42_network_event_drops_total").increment(1);
+                        tracing::warn!("data event channel closed while draining reliable backlog");
+                        self.pending_data_events.clear();
+                        break;
+                    }
                 }
             }
 
-            // Drain all pending priority commands first (block data, consensus).
-            // This ensures block transmission is never delayed by tx broadcast backlog.
-            while let Ok(cmd) = self.priority_rx.try_recv() {
+            // Preserve a short priority burst, then force one swarm poll when
+            // it is ready so command intake cannot starve connection progress.
+            for _ in 0..MAX_PRIORITY_COMMANDS_PER_TICK {
+                let Ok(cmd) = self.priority_rx.try_recv() else {
+                    break;
+                };
                 self.handle_command(cmd);
             }
 
             tokio::select! {
-                // biased: check priority channel first each iteration.
+                // Swarm first after the bounded command burst. If it is not
+                // ready, priority commands still win over the normal lane.
                 biased;
 
+                event = self.swarm.select_next_some() => {
+                    self.handle_swarm_event(event);
+                }
                 cmd = async {
                     if self.priority_rx.is_closed() && self.priority_rx.is_empty() {
                         std::future::pending::<Option<NetworkCommand>>().await
@@ -1195,9 +1311,6 @@ impl NetworkService {
                             tracing::debug!("priority command channel closed");
                         }
                     }
-                }
-                event = self.swarm.select_next_some() => {
-                    self.handle_swarm_event(event);
                 }
                 cmd = self.command_rx.recv() => {
                     match cmd {
@@ -1303,6 +1416,17 @@ impl NetworkService {
                 self.pending_gov5_status_peers.remove(&peer_id);
                 self.gov5_block_by_hash_peers.remove(&peer_id);
                 self.state_sync_peers.remove(&peer_id);
+                self.block_direct_peers.remove(&peer_id);
+                self.outbound_block_direct_transfers.remove(&peer_id);
+                self.inbound_block_direct_transfers
+                    .retain(|(peer, _), _| *peer != peer_id);
+                self.queued_block_direct_by_peer.remove(&peer_id);
+                let queued_total = self
+                    .queued_block_direct_by_peer
+                    .values()
+                    .map(VecDeque::len)
+                    .sum::<usize>();
+                metrics::gauge!("n42_block_direct_queued").set(queued_total as f64);
                 self.sync_request_windows.remove(&peer_id);
                 self.clear_validator_mapping_for_peer(&peer_id);
                 self.clear_authenticated_validator_peer(&peer_id);
@@ -1318,8 +1442,62 @@ impl NetworkService {
             SwarmEvent::NewListenAddr { address, .. } => {
                 let local_peer_id = *self.swarm.local_peer_id();
                 tracing::info!(%local_peer_id, %address, "listening on address");
+                self.tune_quic_listener_socket(&address);
             }
             _ => {}
+        }
+    }
+
+    fn tune_quic_listener_socket(&mut self, address: &Multiaddr) {
+        let Some(port) = quic_udp_port(address) else {
+            return;
+        };
+        if self.tuned_quic_udp_ports.contains(&port) {
+            return;
+        }
+
+        let requested_bytes = requested_quic_udp_socket_buffer_bytes();
+        match tune_quic_udp_socket_buffers(port, requested_bytes) {
+            Ok(Some(buffers)) => {
+                self.tuned_quic_udp_ports.insert(port);
+                metrics::gauge!("n42_quic_udp_receive_buffer_bytes")
+                    .set(buffers.receive_bytes as f64);
+                metrics::gauge!("n42_quic_udp_send_buffer_bytes").set(buffers.send_bytes as f64);
+                if buffers.receive_bytes < requested_bytes || buffers.send_bytes < requested_bytes {
+                    tracing::warn!(
+                        port,
+                        requested_bytes,
+                        receive_bytes = buffers.receive_bytes,
+                        send_bytes = buffers.send_bytes,
+                        matched_sockets = buffers.matched_sockets,
+                        "QUIC UDP socket buffer capped by host limits; raise net.core.rmem_max and net.core.wmem_max"
+                    );
+                } else {
+                    tracing::info!(
+                        port,
+                        requested_bytes,
+                        receive_bytes = buffers.receive_bytes,
+                        send_bytes = buffers.send_bytes,
+                        matched_sockets = buffers.matched_sockets,
+                        "tuned QUIC UDP socket buffers"
+                    );
+                }
+            }
+            Ok(None) => {
+                tracing::warn!(
+                    port,
+                    requested_bytes,
+                    "QUIC listener socket not found while applying UDP buffer tuning"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    port,
+                    requested_bytes,
+                    %error,
+                    "failed to tune QUIC UDP socket buffers"
+                );
+            }
         }
     }
 
@@ -1348,6 +1526,8 @@ impl NetworkService {
             if self.authenticated_validator_peer_map.get(&idx) == Some(peer_id) {
                 self.authenticated_validator_peer_map.remove(&idx);
             }
+            metrics::gauge!("n42_authenticated_validator_peers")
+                .set(self.authenticated_peer_validator_map.len() as f64);
         }
     }
 
@@ -1419,6 +1599,10 @@ impl NetworkService {
         // through mDNS/Identify as an ordinary peer.
         self.reconnection.register_peer(peer_id, Vec::new(), true);
 
+        let already_authenticated = self.authenticated_validator_peer_map.get(&validator_index)
+            == Some(&peer_id)
+            && self.authenticated_peer_validator_map.get(&peer_id) == Some(&validator_index);
+
         if let Some(previous_peer) = self
             .authenticated_validator_peer_map
             .insert(validator_index, peer_id)
@@ -1445,11 +1629,22 @@ impl NetworkService {
         });
         map.insert(validator_index, peer_id);
 
-        tracing::info!(
-            %peer_id,
-            validator_index,
-            "peer promoted to authenticated validator"
-        );
+        metrics::gauge!("n42_authenticated_validator_peers")
+            .set(self.authenticated_peer_validator_map.len() as f64);
+        if already_authenticated {
+            tracing::debug!(
+                %peer_id,
+                validator_index,
+                "refreshed authenticated validator mapping"
+            );
+        } else {
+            metrics::counter!("n42_validator_peer_auth_promotions_total").increment(1);
+            tracing::info!(
+                %peer_id,
+                validator_index,
+                "peer promoted to authenticated validator"
+            );
+        }
     }
 
     fn replace_expected_validator_peers(&mut self, peers: HashMap<u32, PeerId>) {
@@ -1505,16 +1700,27 @@ impl NetworkService {
             .protocols
             .iter()
             .any(|protocol| protocol.as_ref() == SYNC_PROTOCOL);
+        let supports_block_direct = info
+            .protocols
+            .iter()
+            .any(|protocol| protocol.as_ref() == BLOCK_DIRECT_PROTOCOL);
         let newly_ready_for_block_fetch =
             supports_gov5_block_fetch && self.gov5_block_by_hash_peers.insert(peer_id);
         let newly_ready_for_state_sync =
             supports_state_sync && self.state_sync_peers.insert(peer_id);
-        if newly_ready_for_block_fetch || newly_ready_for_state_sync {
+        let newly_ready_for_block_direct =
+            supports_block_direct && self.block_direct_peers.insert(peer_id);
+        if !supports_block_direct {
+            self.block_direct_peers.remove(&peer_id);
+        }
+        if newly_ready_for_block_fetch || newly_ready_for_state_sync || newly_ready_for_block_direct
+        {
             tracing::info!(
                 %peer_id,
                 protocol = ?info.protocol_version,
                 supports_gov5_block_fetch,
                 supports_state_sync,
+                supports_block_direct,
                 "identified peer capabilities"
             );
         } else {
@@ -1523,6 +1729,7 @@ impl NetworkService {
                 protocol = ?info.protocol_version,
                 supports_gov5_block_fetch,
                 supports_state_sync,
+                supports_block_direct,
                 "refreshed peer capabilities"
             );
         }
@@ -2008,6 +2215,315 @@ impl NetworkService {
         }
     }
 
+    fn dispatch_block_direct_frame(
+        &mut self,
+        peer: PeerId,
+        frame: BlockDirectFrame,
+        pending_frame: PendingBlockDirectFrame,
+        queued: QueuedBlockDirect,
+    ) {
+        let bytes = frame.payload_len();
+        let request_id = self
+            .swarm
+            .behaviour_mut()
+            .block_direct
+            .send_request(&peer, BlockDirectRequest { frame });
+        self.pending_block_direct_requests.insert(
+            request_id,
+            PendingBlockDirectRequest {
+                peer,
+                bytes,
+                started_at: Instant::now(),
+                frame: pending_frame,
+                data: queued.data,
+                attempt: queued.attempt,
+            },
+        );
+        metrics::counter!("n42_block_direct_frames_sent_total").increment(1);
+        metrics::gauge!("n42_block_direct_pending")
+            .set(self.pending_block_direct_requests.len() as f64);
+    }
+
+    fn dispatch_block_direct_request(&mut self, peer: PeerId, queued: QueuedBlockDirect) {
+        metrics::counter!("n42_block_direct_sent").increment(1);
+        let data = Arc::clone(&queued.data);
+        let bytes = data.len();
+        if bytes > MAX_BLOCK_DIRECT_SIZE {
+            tracing::error!(%peer, bytes, max = MAX_BLOCK_DIRECT_SIZE, "block direct envelope exceeds reconstructed transfer limit");
+            metrics::counter!("n42_block_direct_oversized_total").increment(1);
+            return;
+        }
+        let chunk_size = block_direct_chunk_size();
+        if bytes <= chunk_size {
+            self.dispatch_block_direct_frame(
+                peer,
+                BlockDirectFrame::Complete { data },
+                PendingBlockDirectFrame::Complete,
+                queued,
+            );
+            return;
+        }
+
+        let transfer_id = *blake3::hash(data.as_slice()).as_bytes();
+        let chunk_count = bytes.div_ceil(chunk_size) as u32;
+        let manifest = BlockDirectManifest {
+            transfer_id,
+            total_len: bytes as u64,
+            chunk_size: chunk_size as u32,
+            chunk_count,
+        };
+        self.outbound_block_direct_transfers.insert(
+            peer,
+            OutboundBlockDirectTransfer {
+                manifest,
+                data: Arc::clone(&data),
+                started_at: Instant::now(),
+            },
+        );
+        metrics::counter!("n42_block_direct_chunked_transfers_total").increment(1);
+        tracing::info!(
+            %peer,
+            bytes,
+            chunk_size,
+            chunk_count,
+            transfer_id = %hex::encode(transfer_id),
+            "N42_BLOCK_DIRECT_MANIFEST: starting one-substream chunk transfer"
+        );
+        self.dispatch_block_direct_frame(
+            peer,
+            BlockDirectFrame::Transfer { manifest, data },
+            PendingBlockDirectFrame::Transfer { transfer_id },
+            queued,
+        );
+    }
+
+    fn enqueue_or_dispatch_block_direct(&mut self, peer: PeerId, data: Arc<Vec<u8>>) {
+        let in_flight = self
+            .pending_block_direct_requests
+            .values()
+            .any(|request| request.peer == peer)
+            || self.outbound_block_direct_transfers.contains_key(&peer);
+        if !in_flight {
+            self.dispatch_block_direct_request(peer, QueuedBlockDirect { data, attempt: 0 });
+            return;
+        }
+
+        let bytes = data.len();
+        let queue = self.queued_block_direct_by_peer.entry(peer).or_default();
+        if queue.len() >= block_direct_queue_depth() {
+            metrics::counter!("n42_block_direct_queue_overflow_total").increment(1);
+            tracing::error!(
+                %peer,
+                bytes,
+                queue_depth = queue.len(),
+                max_queue_depth = block_direct_queue_depth(),
+                "N42_BLOCK_DIRECT_QUEUE_OVERFLOW: refusing to lose an older committed block"
+            );
+            return;
+        }
+        queue.push_back(QueuedBlockDirect { data, attempt: 0 });
+        let peer_queue_depth = queue.len();
+        metrics::counter!("n42_block_direct_queued_total").increment(1);
+        let queued_total = self
+            .queued_block_direct_by_peer
+            .values()
+            .map(VecDeque::len)
+            .sum::<usize>();
+        metrics::gauge!("n42_block_direct_queued").set(queued_total as f64);
+        if bytes >= 1024 * 1024 {
+            tracing::info!(
+                %peer,
+                bytes,
+                pending = self.pending_block_direct_requests.len(),
+                peer_queue_depth,
+                queued_total,
+                "N42_BLOCK_DIRECT_QUEUE: retained ordered block behind in-flight request"
+            );
+        }
+    }
+
+    fn dispatch_queued_block_direct(&mut self, peer: PeerId) {
+        if self
+            .pending_block_direct_requests
+            .values()
+            .any(|request| request.peer == peer)
+            || self.outbound_block_direct_transfers.contains_key(&peer)
+        {
+            return;
+        }
+        let Some(queued) = self
+            .queued_block_direct_by_peer
+            .get_mut(&peer)
+            .and_then(VecDeque::pop_front)
+        else {
+            return;
+        };
+        if self
+            .queued_block_direct_by_peer
+            .get(&peer)
+            .is_some_and(VecDeque::is_empty)
+        {
+            self.queued_block_direct_by_peer.remove(&peer);
+        }
+        metrics::counter!("n42_block_direct_queued_dispatch_total").increment(1);
+        let queued_total = self
+            .queued_block_direct_by_peer
+            .values()
+            .map(VecDeque::len)
+            .sum::<usize>();
+        metrics::gauge!("n42_block_direct_queued").set(queued_total as f64);
+        self.dispatch_block_direct_request(peer, queued);
+    }
+
+    fn accept_inbound_block_direct_frame(
+        &mut self,
+        peer: PeerId,
+        frame: BlockDirectFrame,
+    ) -> (bool, Option<Vec<u8>>) {
+        let now = Instant::now();
+        self.inbound_block_direct_transfers.retain(|_, transfer| {
+            now.saturating_duration_since(transfer.started_at) < BLOCK_DIRECT_TRANSFER_TIMEOUT
+        });
+        match frame {
+            BlockDirectFrame::Complete { data } => {
+                if data.len() > block_direct_chunk_size() {
+                    return (false, None);
+                }
+                (
+                    true,
+                    Some(Arc::try_unwrap(data).unwrap_or_else(|shared| (*shared).clone())),
+                )
+            }
+            // The codec has already bounded every allocation and verified each
+            // chunk length. Recheck the manifest/digest at the authorization
+            // boundary before exposing the reconstructed envelope.
+            BlockDirectFrame::Transfer { manifest, data } => {
+                let total_len = usize::try_from(manifest.total_len).unwrap_or(usize::MAX);
+                let chunk_size = manifest.chunk_size as usize;
+                let valid = total_len == data.len()
+                    && total_len > chunk_size
+                    && total_len <= MAX_BLOCK_DIRECT_SIZE
+                    && (MIN_BLOCK_DIRECT_CHUNK_SIZE..=MAX_BLOCK_DIRECT_CHUNK_SIZE)
+                        .contains(&chunk_size)
+                    && manifest.chunk_count as usize == total_len.div_ceil(chunk_size)
+                    && blake3::hash(data.as_slice()).as_bytes() == &manifest.transfer_id;
+                if !valid {
+                    metrics::counter!("n42_block_direct_manifest_rejected_total").increment(1);
+                    return (false, None);
+                }
+                metrics::counter!("n42_block_direct_stream_transfers_received_total").increment(1);
+                (
+                    true,
+                    Some(Arc::try_unwrap(data).unwrap_or_else(|shared| (*shared).clone())),
+                )
+            }
+            BlockDirectFrame::Manifest(manifest) => {
+                let Ok(total_len) = usize::try_from(manifest.total_len) else {
+                    return (false, None);
+                };
+                let chunk_size = manifest.chunk_size as usize;
+                let expected_count = total_len.div_ceil(chunk_size.max(1));
+                if total_len <= chunk_size
+                    || total_len > MAX_BLOCK_DIRECT_SIZE
+                    || !(MIN_BLOCK_DIRECT_CHUNK_SIZE..=MAX_BLOCK_DIRECT_CHUNK_SIZE)
+                        .contains(&chunk_size)
+                    || manifest.chunk_count == 0
+                    || manifest.chunk_count as usize != expected_count
+                {
+                    metrics::counter!("n42_block_direct_manifest_rejected_total").increment(1);
+                    return (false, None);
+                }
+                if self.inbound_block_direct_transfers.len() >= MAX_INBOUND_BLOCK_DIRECT_TRANSFERS
+                    && let Some(oldest) = self
+                        .inbound_block_direct_transfers
+                        .iter()
+                        .min_by_key(|(_, transfer)| transfer.started_at)
+                        .map(|(key, _)| *key)
+                {
+                    self.inbound_block_direct_transfers.remove(&oldest);
+                    metrics::counter!("n42_block_direct_reassembly_evictions_total").increment(1);
+                }
+                // A peer has one ordered data channel. A fresh manifest retires
+                // any abandoned transfer from that peer before reserving bytes.
+                self.inbound_block_direct_transfers
+                    .retain(|(source, _), _| *source != peer);
+                let mut data = Vec::new();
+                if data.try_reserve_exact(total_len).is_err() {
+                    metrics::counter!("n42_block_direct_reassembly_alloc_failures_total")
+                        .increment(1);
+                    return (false, None);
+                }
+                self.inbound_block_direct_transfers.insert(
+                    (peer, manifest.transfer_id),
+                    InboundBlockDirectTransfer {
+                        manifest,
+                        next_chunk: 0,
+                        data,
+                        started_at: now,
+                    },
+                );
+                metrics::gauge!("n42_block_direct_reassemblies")
+                    .set(self.inbound_block_direct_transfers.len() as f64);
+                (true, None)
+            }
+            BlockDirectFrame::Chunk {
+                transfer_id,
+                index,
+                data,
+                offset,
+                len,
+            } => {
+                let key = (peer, transfer_id);
+                let Some(transfer) = self.inbound_block_direct_transfers.get_mut(&key) else {
+                    metrics::counter!("n42_block_direct_orphan_chunks_total").increment(1);
+                    return (false, None);
+                };
+                let chunk_size = transfer.manifest.chunk_size as usize;
+                let Some(chunk_offset) = (index as usize).checked_mul(chunk_size) else {
+                    self.inbound_block_direct_transfers.remove(&key);
+                    return (false, None);
+                };
+                let Some(remaining) =
+                    (transfer.manifest.total_len as usize).checked_sub(chunk_offset)
+                else {
+                    self.inbound_block_direct_transfers.remove(&key);
+                    return (false, None);
+                };
+                let expected_len = remaining.min(chunk_size);
+                let valid_range = offset.checked_add(len).is_some_and(|end| end <= data.len());
+                if index != transfer.next_chunk || len != expected_len || !valid_range {
+                    metrics::counter!("n42_block_direct_out_of_order_chunks_total").increment(1);
+                    self.inbound_block_direct_transfers.remove(&key);
+                    return (false, None);
+                }
+                transfer.data.extend_from_slice(&data[offset..offset + len]);
+                transfer.next_chunk += 1;
+                metrics::counter!("n42_block_direct_chunk_bytes_received_total")
+                    .increment(len as u64);
+                if transfer.next_chunk < transfer.manifest.chunk_count {
+                    return (true, None);
+                }
+
+                let transfer = self
+                    .inbound_block_direct_transfers
+                    .remove(&key)
+                    .expect("reassembly exists until final chunk");
+                metrics::gauge!("n42_block_direct_reassemblies")
+                    .set(self.inbound_block_direct_transfers.len() as f64);
+                if transfer.data.len() != transfer.manifest.total_len as usize
+                    || blake3::hash(&transfer.data).as_bytes() != &transfer_id
+                {
+                    metrics::counter!("n42_block_direct_digest_mismatch_total").increment(1);
+                    return (false, None);
+                }
+                metrics::histogram!("n42_block_direct_transfer_ms")
+                    .record(transfer.started_at.elapsed().as_secs_f64() * 1_000.0);
+                metrics::counter!("n42_block_direct_reassembled_total").increment(1);
+                (true, Some(transfer.data))
+            }
+        }
+    }
+
     fn handle_block_direct_event(
         &mut self,
         event: libp2p::request_response::Event<BlockDirectRequest, BlockDirectResponse>,
@@ -2018,32 +2534,44 @@ impl NetworkService {
                     request, channel, ..
                 } => {
                     metrics::counter!("n42_block_direct_received").increment(1);
-                    let bytes = request.data.len();
+                    let bytes = request.frame.payload_len();
                     // Accept direct push only from peers that have already proved
                     // control of a current validator key via a signed consensus message.
                     if let Some(&validator_idx) = self.authenticated_peer_validator_map.get(&peer) {
-                        tracing::debug!(%peer, validator_index = validator_idx, bytes, "received block via direct push from validator");
-                        let is_duplicate =
-                            self.observe_block_announcement(&request.data, "block_direct");
-                        if is_duplicate {
-                            tracing::info!(
-                                %peer,
-                                validator_index = validator_idx,
-                                dedup_source = "block_direct",
-                                bytes,
-                                "N42_DUP_BLOCK_ANNOUNCEMENT_RAW: dropped duplicate block announcement"
-                            );
-                        } else {
-                            self.emit_event(NetworkEvent::BlockAnnouncement {
-                                source: peer,
-                                data: request.data,
-                            });
+                        let (accepted, completed) =
+                            self.accept_inbound_block_direct_frame(peer, request.frame);
+                        if let Some(data) = completed {
+                            let total_bytes = data.len();
+                            metrics::counter!("n42_block_direct_bytes_received_total")
+                                .increment(total_bytes as u64);
+                            let is_duplicate =
+                                self.observe_block_announcement(&data, "block_direct_v3");
+                            if is_duplicate {
+                                tracing::info!(
+                                    %peer,
+                                    validator_index = validator_idx,
+                                    dedup_source = "block_direct_v3",
+                                    bytes = total_bytes,
+                                    "N42_DUP_BLOCK_ANNOUNCEMENT_RAW: dropped duplicate block announcement"
+                                );
+                            } else {
+                                tracing::info!(
+                                    %peer,
+                                    validator_index = validator_idx,
+                                    bytes = total_bytes,
+                                    "N42_BLOCK_DIRECT_RECV: authenticated envelope complete"
+                                );
+                                self.emit_event(NetworkEvent::BlockAnnouncement {
+                                    source: peer,
+                                    data,
+                                });
+                            }
                         }
                         if self
                             .swarm
                             .behaviour_mut()
                             .block_direct
-                            .send_response(channel, BlockDirectResponse { accepted: true })
+                            .send_response(channel, BlockDirectResponse { accepted })
                             .is_err()
                         {
                             tracing::warn!(%peer, "failed to send block direct ACK");
@@ -2078,13 +2606,127 @@ impl NetworkService {
                         }
                     }
                 }
-                libp2p::request_response::Message::Response { .. } => {
-                    // ACK received — fire-and-forget.
+                libp2p::request_response::Message::Response {
+                    request_id,
+                    response,
+                } => {
+                    if let Some(pending) = self.pending_block_direct_requests.remove(&request_id) {
+                        let completed_peer = pending.peer;
+                        let elapsed_ms = pending.started_at.elapsed().as_millis() as u64;
+                        metrics::histogram!("n42_block_direct_ack_latency_ms")
+                            .record(elapsed_ms as f64);
+                        metrics::gauge!("n42_block_direct_pending")
+                            .set(self.pending_block_direct_requests.len() as f64);
+                        if pending.bytes >= 1024 * 1024 {
+                            tracing::debug!(
+                                %peer,
+                                expected_peer = %pending.peer,
+                                ?request_id,
+                                accepted = response.accepted,
+                                bytes = pending.bytes,
+                                elapsed_ms,
+                                pending = self.pending_block_direct_requests.len(),
+                                "N42_BLOCK_DIRECT_ACK: remote validator completed block push"
+                            );
+                        }
+                        if !response.accepted {
+                            self.outbound_block_direct_transfers.remove(&completed_peer);
+                            metrics::counter!("n42_block_direct_remote_rejections_total")
+                                .increment(1);
+                            self.dispatch_queued_block_direct(completed_peer);
+                            return;
+                        }
+                        metrics::counter!("n42_block_direct_bytes_sent_total")
+                            .increment(pending.bytes as u64);
+                        match pending.frame {
+                            PendingBlockDirectFrame::Complete => {
+                                self.dispatch_queued_block_direct(completed_peer);
+                            }
+                            PendingBlockDirectFrame::Transfer { transfer_id } => {
+                                if let Some(transfer) = self
+                                    .outbound_block_direct_transfers
+                                    .remove(&completed_peer)
+                                    .filter(|transfer| transfer.manifest.transfer_id == transfer_id)
+                                {
+                                    metrics::histogram!("n42_block_direct_transfer_send_ms")
+                                        .record(
+                                            transfer.started_at.elapsed().as_secs_f64() * 1_000.0,
+                                        );
+                                    metrics::counter!("n42_block_direct_chunk_bytes_sent_total")
+                                        .increment(transfer.data.len() as u64);
+                                }
+                                self.dispatch_queued_block_direct(completed_peer);
+                            }
+                        }
+                    } else {
+                        tracing::debug!(%peer, ?request_id, "received block direct ACK for unknown request");
+                    }
                 }
             },
-            libp2p::request_response::Event::OutboundFailure { peer, error, .. } => {
-                tracing::debug!(%peer, ?error, "block direct send failed");
+            libp2p::request_response::Event::OutboundFailure {
+                peer,
+                request_id,
+                error,
+                ..
+            } => {
+                let pending = self.pending_block_direct_requests.remove(&request_id);
+                let failed_peer = pending.as_ref().map(|request| request.peer).unwrap_or(peer);
+                let (bytes, elapsed_ms) = pending
+                    .as_ref()
+                    .map(|request| {
+                        (
+                            request.bytes,
+                            request.started_at.elapsed().as_millis() as u64,
+                        )
+                    })
+                    .unwrap_or_default();
+                tracing::warn!(
+                    %peer,
+                    ?request_id,
+                    ?error,
+                    bytes,
+                    elapsed_ms,
+                    pending = self.pending_block_direct_requests.len(),
+                    "N42_BLOCK_DIRECT_FAILURE: block direct send failed"
+                );
                 metrics::counter!("n42_block_direct_send_failures").increment(1);
+                metrics::gauge!("n42_block_direct_pending")
+                    .set(self.pending_block_direct_requests.len() as f64);
+                self.outbound_block_direct_transfers.remove(&failed_peer);
+                if let Some(pending) = pending
+                    && pending.attempt < MAX_BLOCK_DIRECT_RETRIES
+                {
+                    let next_attempt = pending.attempt + 1;
+                    let queue = self
+                        .queued_block_direct_by_peer
+                        .entry(failed_peer)
+                        .or_default();
+                    if queue.len() >= block_direct_queue_depth() {
+                        // Preserve the failed older block and the contiguous
+                        // prefix; a later suffix is the only safe eviction.
+                        queue.pop_back();
+                        metrics::counter!("n42_block_direct_retry_suffix_evictions_total")
+                            .increment(1);
+                    }
+                    queue.push_front(QueuedBlockDirect {
+                        data: pending.data,
+                        attempt: next_attempt,
+                    });
+                    metrics::counter!("n42_block_direct_retries_total").increment(1);
+                    tracing::warn!(
+                        %failed_peer,
+                        next_attempt,
+                        max_attempts = MAX_BLOCK_DIRECT_RETRIES + 1,
+                        "N42_BLOCK_DIRECT_RETRY: requeued failed block at the ordered queue head"
+                    );
+                }
+                let queued_total = self
+                    .queued_block_direct_by_peer
+                    .values()
+                    .map(VecDeque::len)
+                    .sum::<usize>();
+                metrics::gauge!("n42_block_direct_queued").set(queued_total as f64);
+                self.dispatch_queued_block_direct(failed_peer);
             }
             libp2p::request_response::Event::InboundFailure { .. } => {}
             libp2p::request_response::Event::ResponseSent { .. } => {}
@@ -2961,12 +3603,7 @@ impl NetworkService {
                 self.gossipsub_publish(blob_sidecar_topic(), data, "blob sidecar");
             }
             NetworkCommand::SendBlockDirect { peer, data } => {
-                metrics::counter!("n42_block_direct_sent").increment(1);
-                let req = BlockDirectRequest { data };
-                self.swarm
-                    .behaviour_mut()
-                    .block_direct
-                    .send_request(&peer, req);
+                self.enqueue_or_dispatch_block_direct(peer, data);
             }
             NetworkCommand::ForwardTxBatch { peer, txs } => {
                 let count = txs.len();
@@ -3348,7 +3985,7 @@ mod tests {
         match prx.try_recv().unwrap() {
             NetworkCommand::SendBlockDirect { peer: p, data } => {
                 assert_eq!(p, peer);
-                assert_eq!(data, vec![0x42]);
+                assert_eq!(data.as_slice(), &[0x42]);
             }
             other => panic!("expected SendBlockDirect, got {other:?}"),
         }

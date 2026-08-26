@@ -8,6 +8,7 @@ use n42_network::{
 };
 use n42_primitives::ConsensusMessage;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// The network operations the consensus orchestrator needs. One in-process
 /// adapter today (`NetworkHandle`, node-side). `async_trait` is used for the
@@ -62,7 +63,7 @@ pub trait ConsensusNetwork: Send + Sync {
     async fn send_block_direct_reliable(
         &self,
         peer: PeerId,
-        data: Vec<u8>,
+        data: Arc<Vec<u8>>,
     ) -> Result<(), NetworkError>;
 
     /// Reply to a sync request with backpressure (awaited).
@@ -152,7 +153,7 @@ impl ConsensusNetwork for NetworkHandle {
     async fn send_block_direct_reliable(
         &self,
         peer: PeerId,
-        data: Vec<u8>,
+        data: Arc<Vec<u8>>,
     ) -> Result<(), NetworkError> {
         NetworkHandle::send_block_direct_reliable(self, peer, data).await
     }

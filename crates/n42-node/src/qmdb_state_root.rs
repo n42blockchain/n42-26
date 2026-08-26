@@ -10,7 +10,6 @@ use alloy_rpc_types_engine::ExecutionData;
 use n42_twig_core::qmdb_compat::{
     QmdbCompatTree, QmdbOperation, QmdbOperationError, QmdbProof, QmdbSnapshot, QmdbSnapshotError,
 };
-use reth_storage_overlay::OverlayManager;
 use reth_engine_tree::tree::state_root_strategy::{
     LazyHashedPostState, PreparedStateRootJob, StateRootJob, StateRootJobContext,
     StateRootJobOutcome, StateRootStrategy,
@@ -22,6 +21,7 @@ use reth_node_api::FullNodeComponents;
 use reth_node_builder::rpc::{BasicEngineValidatorBuilder, EngineValidatorBuilder};
 use reth_primitives_traits::RecoveredBlock;
 use reth_provider::{BlockExecutionOutput, ProviderError, ProviderResult};
+use reth_storage_overlay::OverlayManager;
 use reth_trie::updates::TrieUpdates;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -493,7 +493,9 @@ impl Gov5QmdbStateRootStore {
             return Ok(None);
         }
         Ok(Some(
-            self.reconstruct_tree_locked(&state, block_hash)?.0.snapshot(),
+            self.reconstruct_tree_locked(&state, block_hash)?
+                .0
+                .snapshot(),
         ))
     }
 
@@ -1397,7 +1399,6 @@ mod tests {
         );
     }
 
-
     /// Measures how QMDB import and archive reads scale with chain depth.
     ///
     /// `compute_and_commit` takes the `compute_candidate_locked` fast path only
@@ -1423,8 +1424,7 @@ mod tests {
             (0..OPS_PER_BLOCK)
                 .map(|k| {
                     let mut key = [0u8; 32];
-                    key[..8]
-                        .copy_from_slice(&((block * OPS_PER_BLOCK + k) as u64).to_le_bytes());
+                    key[..8].copy_from_slice(&((block * OPS_PER_BLOCK + k) as u64).to_le_bytes());
                     QmdbOperation {
                         key,
                         value: Some(vec![(block % 251) as u8; 32]),

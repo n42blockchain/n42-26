@@ -1,4 +1,4 @@
-use alloy_primitives::keccak256;
+use alloy_primitives::{B256, keccak256};
 use libp2p::gossipsub::{self, Message, MessageId, TopicHash};
 use n42_primitives::{CONSENSUS_PROTOCOL_VERSION, ConsensusMessage, VersionedMessage};
 
@@ -49,15 +49,38 @@ pub fn decode_consensus_message(data: &[u8]) -> Result<ConsensusMessage, Network
     Ok(versioned.message)
 }
 
-/// Generates a unique message ID for GossipSub deduplication.
+/// Length of gov5's GossipSub message ID.
+pub const MESSAGE_ID_LEN: usize = 20;
+
+/// Computes gov5's chain- and topic-scoped message ID.
 ///
-/// Hashes message data + topic to prevent cross-topic collisions and
-/// resist intentional ID collision attacks.
-pub fn message_id_fn(message: &Message) -> MessageId {
-    let mut data = Vec::with_capacity(message.data.len() + message.topic.as_str().len());
-    data.extend_from_slice(&message.data);
-    data.extend_from_slice(message.topic.as_str().as_bytes());
-    MessageId::from(keccak256(&data).as_slice().to_vec())
+/// The byte layout is exactly `genesis_hash || topic || data`, hashed with
+/// Keccak-256 and truncated to 20 bytes. Gov5's source comment historically
+/// said SHA-256, but its `common/hash.Hash` implementation uses a
+/// `crypto.KeccakState`; the cross-client vectors below guard that distinction.
+pub fn message_id_parts(genesis_hash: B256, topic: &str, data: &[u8]) -> [u8; MESSAGE_ID_LEN] {
+    let mut preimage = Vec::with_capacity(B256::len_bytes() + topic.len() + data.len());
+    preimage.extend_from_slice(genesis_hash.as_slice());
+    preimage.extend_from_slice(topic.as_bytes());
+    preimage.extend_from_slice(data);
+
+    let digest = keccak256(preimage);
+    let mut message_id = [0u8; MESSAGE_ID_LEN];
+    message_id.copy_from_slice(&digest[..MESSAGE_ID_LEN]);
+    message_id
+}
+
+/// Builds the GossipSub ID function bound to the swarm's genesis hash.
+///
+/// Topic and genesis scoping are load-bearing: the seen cache is shared across
+/// topics and can be populated before application validation, so identical
+/// bytes delivered on another topic or chain must not suppress the real frame.
+pub fn message_id_fn(genesis_hash: B256) -> impl Fn(&Message) -> MessageId + Send + Sync + 'static {
+    move |message: &Message| {
+        MessageId::from(
+            message_id_parts(genesis_hash, message.topic.as_str(), &message.data).to_vec(),
+        )
+    }
 }
 
 /// Validates a gossipsub message before forwarding.
@@ -126,6 +149,20 @@ mod tests {
     };
     use alloy_primitives::B256;
     use n42_primitives::{BlsSecretKey, ConsensusMessage, Vote};
+    use serde::Deserialize;
+
+    #[derive(Deserialize)]
+    struct MessageIdVector {
+        genesis_hash: String,
+        topic: String,
+        data: String,
+        message_id: String,
+    }
+
+    #[derive(Deserialize)]
+    struct MessageIdVectors {
+        vectors: Vec<MessageIdVector>,
+    }
 
     fn test_key(seed: u8) -> BlsSecretKey {
         BlsSecretKey::key_gen(&[seed; 32]).expect("deterministic test key should be valid")
@@ -140,6 +177,41 @@ mod tests {
             voter: 0,
             signature: sig,
         })
+    }
+
+    #[test]
+    fn message_id_matches_gov5_keccak_vectors() {
+        let fixture: MessageIdVectors =
+            serde_json::from_str(include_str!("../../testdata/gov5_message_id_v1.json"))
+                .expect("gov5 message-ID fixture must decode");
+        assert_eq!(fixture.vectors.len(), 5, "fixture lost test vectors");
+
+        for (index, vector) in fixture.vectors.iter().enumerate() {
+            let genesis = B256::from_slice(
+                &hex::decode(&vector.genesis_hash).expect("genesis hash must be hex"),
+            );
+            let data = hex::decode(&vector.data).expect("message data must be hex");
+            let actual = message_id_parts(genesis, &vector.topic, &data);
+            assert_eq!(
+                hex::encode(actual),
+                vector.message_id,
+                "vector {index} diverged from gov5; use Keccak256(genesis || topic || data)[:20]"
+            );
+        }
+    }
+
+    #[test]
+    fn message_id_scopes_same_payload_by_topic_and_genesis() {
+        let payload = b"same payload";
+        let genesis = B256::repeat_byte(0x11);
+        assert_ne!(
+            message_id_parts(genesis, "/n42/topic/a", payload),
+            message_id_parts(genesis, "/n42/topic/b", payload)
+        );
+        assert_ne!(
+            message_id_parts(B256::repeat_byte(0x11), "/n42/topic/a", payload),
+            message_id_parts(B256::repeat_byte(0x22), "/n42/topic/a", payload)
+        );
     }
 
     fn mem_hash() -> TopicHash {

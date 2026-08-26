@@ -45,7 +45,7 @@ BASE_P2P=30303
 BASE_CONSENSUS=9000
 BASE_STARHUB=9400
 
-CHAIN_ID=4242
+CHAIN_ID="${N42_CHAIN_ID:-4242}"
 
 # Colors
 RED='\033[0;31m'
@@ -68,7 +68,7 @@ parse_args() {
     NO_MONITOR=false
     NO_MOBILE_SIM=false
     DATA_DIR=""
-    BLOCK_INTERVAL_MS=2000
+    BLOCK_INTERVAL_MS="${N42_TARGET_CADENCE_MS:-163}"
     PUBLIC_IP="localhost"
 
     while [[ $# -gt 0 ]]; do
@@ -130,7 +130,7 @@ parse_args() {
                 echo "  --no-mobile-sim      Don't start mobile phone simulator"
                 echo "  --mobile-sim         Start mobile phone simulator (default)"
                 echo "  --data-dir DIR       Custom data directory (default: ~/n42-testnet-data-N)"
-                echo "  --block-interval MS  Block interval in ms (default: 2000)"
+                echo "  --block-interval MS  Block interval in ms (default: 163)"
                 exit 0
                 ;;
             *)
@@ -162,6 +162,99 @@ parse_args() {
         # (can be overridden with --mobile-sim before --nodes 1 in args)
         : # keep whatever was set
     fi
+}
+
+# ---------------------------------------------------------------------------
+# Optional CCD/L3-aware affinity A/B
+# ---------------------------------------------------------------------------
+
+declare -a N42_NODE_CPUSETS=()
+
+prepare_l3_cpusets() {
+    local mode="${N42_CPUSET_AB_MODE:-off}"
+    N42_NODE_CPUSETS=()
+    if [[ "$mode" == "off" || "$mode" == "0" ]]; then
+        log "CPU affinity A/B: control (scheduler-managed; no cpuset binding)"
+        return
+    fi
+    if [[ "$mode" != "l3" ]]; then
+        warn "Unknown N42_CPUSET_AB_MODE=$mode; leaving affinity scheduler-managed"
+        return
+    fi
+    if ! command -v taskset >/dev/null 2>&1 || [[ ! -d /sys/devices/system/cpu ]]; then
+        warn "L3 cpuset A/B requested but taskset/sysfs topology is unavailable; not binding"
+        return
+    fi
+
+    local allowed_list
+    allowed_list=$(awk '/^Cpus_allowed_list:/ {print $2}' /proc/self/status)
+    if [[ -z "$allowed_list" ]]; then
+        warn "Could not read current allowed CPU set; not binding"
+        return
+    fi
+    declare -A allowed_cpu=()
+    local range first last cpu
+    IFS=',' read -ra allowed_ranges <<< "$allowed_list"
+    for range in "${allowed_ranges[@]}"; do
+        if [[ "$range" == *-* ]]; then
+            first=${range%-*}
+            last=${range#*-}
+        else
+            first=$range
+            last=$range
+        fi
+        for ((cpu=first; cpu<=last; cpu++)); do
+            allowed_cpu[$cpu]=1
+        done
+    done
+
+    declare -A l3_cpus=()
+    local id_file l3_id
+    for id_file in /sys/devices/system/cpu/cpu[0-9]*/cache/index3/id; do
+        [[ -r "$id_file" ]] || continue
+        cpu=${id_file#/sys/devices/system/cpu/cpu}
+        cpu=${cpu%%/*}
+        [[ -n "${allowed_cpu[$cpu]:-}" ]] || continue
+        [[ ! -r "/sys/devices/system/cpu/cpu${cpu}/online" ]] \
+            || [[ "$(<"/sys/devices/system/cpu/cpu${cpu}/online")" == "1" ]] \
+            || continue
+        l3_id=$(<"$id_file")
+        if [[ -n "${l3_cpus[$l3_id]:-}" ]]; then
+            l3_cpus[$l3_id]+=",$cpu"
+        else
+            l3_cpus[$l3_id]="$cpu"
+        fi
+    done
+
+    local -a l3_ids=()
+    mapfile -t l3_ids < <(printf '%s\n' "${!l3_cpus[@]}" | sort -n)
+    local domains_per_node="${N42_CCDS_PER_NODE:-2}"
+    if ! [[ "$domains_per_node" =~ ^[1-9][0-9]*$ ]]; then
+        warn "Invalid N42_CCDS_PER_NODE=$domains_per_node; not binding"
+        return
+    fi
+    local needed=$((NUM_VALIDATORS * domains_per_node))
+    if (( ${#l3_ids[@]} < needed )); then
+        warn "L3 cpuset A/B needs ${needed} disjoint L3 domains, found ${#l3_ids[@]}; not binding"
+        return
+    fi
+
+    local node domain_index domain cpus
+    : > "$DATA_DIR/cpu-affinity.tsv"
+    printf 'variant\tnode\tl3_domains\tcpus\n' >> "$DATA_DIR/cpu-affinity.tsv"
+    for ((node=0; node<NUM_VALIDATORS; node++)); do
+        cpus=""
+        local domain_labels=""
+        for ((domain_index=0; domain_index<domains_per_node; domain_index++)); do
+            domain=${l3_ids[$((node * domains_per_node + domain_index))]}
+            cpus+="${cpus:+,}${l3_cpus[$domain]}"
+            domain_labels+="${domain_labels:+,}$domain"
+        done
+        N42_NODE_CPUSETS[$node]="$cpus"
+        printf 'l3\t%s\t%s\t%s\n' "$node" "$domain_labels" "$cpus" \
+            >> "$DATA_DIR/cpu-affinity.tsv"
+    done
+    log "CPU affinity A/B: treatment=l3, ${domains_per_node} disjoint L3 domains/node; mapping=$DATA_DIR/cpu-affinity.tsv"
 }
 
 # ---------------------------------------------------------------------------
@@ -387,7 +480,7 @@ generate_genesis() {
 import json, os, time
 
 NUM_ACCOUNTS = 5000
-CHAIN_ID = 4242
+CHAIN_ID = int(os.environ.get("N42_CHAIN_ID", "4242"))
 INITIAL_BALANCE = "0x4B3B4CA85A86C47A098A224000000"  # 100M N42 per account
 STRESS_CONTRACT_ADDRESS = "0x000000000000000000000000000000000000C042"
 STRESS_CONTRACT_BYTECODE = "0x33600052600060205260406000208054600101905560016020526040600020429055600160005260206000f3"
@@ -526,6 +619,52 @@ start_validators() {
     fi
     ENODES=()
 
+    # A dense testnet shares one machine.  Without explicit budgets every reth
+    # process independently sizes all of its runtimes for the whole host (for
+    # example, seven validators each created 256-thread pools on a 256-thread
+    # host).  Keep an override for isolated-node benchmarks, but partition the
+    # host by default and cap the per-node budget to avoid scheduler thrashing.
+    local host_threads
+    host_threads="$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc)"
+    local automatic_node_budget=$((host_threads / NUM_VALIDATORS))
+    (( automatic_node_budget < 4 )) && automatic_node_budget=4
+    (( automatic_node_budget > 32 )) && automatic_node_budget=32
+    local runtime_threads="${N42_TESTNET_THREADS_PER_NODE:-$automatic_node_budget}"
+    local tokio_threads="${N42_TESTNET_TOKIO_THREADS:-$runtime_threads}"
+    if [[ -z "${N42_TESTNET_TOKIO_THREADS:-}" ]] && (( tokio_threads > 16 )); then
+        tokio_threads=16
+    fi
+    local rpc_threads="${N42_TESTNET_RPC_THREADS:-4}"
+    local storage_threads="${N42_TESTNET_STORAGE_THREADS:-4}"
+    local global_rayon_threads="${N42_TESTNET_GLOBAL_RAYON_THREADS:-$runtime_threads}"
+    local blocking_threads="${N42_TESTNET_MAX_BLOCKING_THREADS:-$((runtime_threads * 2))}"
+    if [[ -z "${N42_TESTNET_MAX_BLOCKING_THREADS:-}" ]]; then
+        (( blocking_threads < 16 )) && blocking_threads=16
+        (( blocking_threads > 64 )) && blocking_threads=64
+    fi
+    local eth_blocking_threads="${N42_TESTNET_ETH_BLOCKING_THREADS:-$tokio_threads}"
+    local prewarming_threads="${N42_TESTNET_PREWARMING_THREADS:-$tokio_threads}"
+    local disable_mobile_packets="${N42_DISABLE_MOBILE_PACKETS:-}"
+    if [[ -z "$disable_mobile_packets" ]]; then
+        if [[ "${N42_BLOCK_DIRECT_ONLY:-0}" == "1" ]]; then
+            disable_mobile_packets=1
+        else
+            disable_mobile_packets=0
+        fi
+    fi
+
+    if [[ "${N42_LOW_MEMORY:-0}" == "1" ]]; then
+        runtime_threads=2
+        tokio_threads=2
+        rpc_threads=2
+        storage_threads=2
+        global_rayon_threads=2
+        blocking_threads=4
+        eth_blocking_threads=2
+        prewarming_threads=1
+    fi
+    log "Runtime budget: host=${host_threads} threads, per-node cpu=${runtime_threads} tokio=${tokio_threads} rpc=${rpc_threads} storage=${storage_threads} global-rayon=${global_rayon_threads} blocking<=${blocking_threads} prewarm=${prewarming_threads}"
+
     for i in $(seq 0 $((NUM_VALIDATORS - 1))); do
         datadir="$DATA_DIR/validator-${i}"
         http_port=$((BASE_HTTP_RPC + i))
@@ -565,21 +704,30 @@ start_validators() {
             log "  v${i}: profiling with samply -> $profile_output"
             node_launcher=(samply record --save-only -o "$profile_output" -- "$BINARY")
         fi
+        if [[ -n "${N42_NODE_CPUSETS[$i]:-}" ]]; then
+            log "  v${i}: L3 treatment cpus=${N42_NODE_CPUSETS[$i]}"
+            node_launcher=(taskset --cpu-list "${N42_NODE_CPUSETS[$i]}" "${node_launcher[@]}")
+        fi
 
         # Low-memory mode: reduce reth caches, pool sizes, and thread counts
         # for dense local testnets. Activated when N42_LOW_MEMORY=1.
         local low_mem_flags=""
         if [[ "${N42_LOW_MEMORY:-0}" == "1" ]]; then
             low_mem_flags="--engine.cross-block-cache-size 64 --engine.disable-state-cache --engine.prewarming-threads 1 --engine.storage-worker-count 2 --engine.account-worker-count 2 --rpc.max-connections 50 --txpool.additional-validation-tasks 2"
-            export TOKIO_WORKER_THREADS=2
-            export RAYON_NUM_THREADS=2
-            export N42_WORKER_THREADS=2
         else
-            low_mem_flags="--rpc.max-connections 1000 --txpool.additional-validation-tasks 16"
-            unset TOKIO_WORKER_THREADS 2>/dev/null || true
+            low_mem_flags="--engine.prewarming-threads ${prewarming_threads} --engine.storage-worker-count ${storage_threads} --engine.account-worker-count ${storage_threads} --rpc.max-connections 1000 --txpool.additional-validation-tasks 16"
         fi
 
-        RUST_LOG="info,libp2p_mdns=off,libp2p_gossipsub::behaviour=error" \
+        RUST_LOG="${RUST_LOG:-info,libp2p_mdns=off,libp2p_gossipsub::behaviour=error}" \
+        RETH_TOKIO_WORKER_THREADS="$tokio_threads" \
+        RETH_TOKIO_MAX_BLOCKING_THREADS="$blocking_threads" \
+        RETH_RAYON_CPU_THREADS="$runtime_threads" \
+        RETH_RAYON_RPC_THREADS="$rpc_threads" \
+        RETH_RAYON_STORAGE_THREADS="$storage_threads" \
+        RETH_GLOBAL_RAYON_THREADS="$global_rayon_threads" \
+        RAYON_NUM_THREADS="$eth_blocking_threads" \
+        TOKIO_WORKER_THREADS="$tokio_threads" \
+        N42_WORKER_THREADS="$runtime_threads" \
         N42_VALIDATOR_KEY="${KEYS[$i]}" \
         N42_VALIDATOR_COUNT="$NUM_VALIDATORS" \
         N42_ENABLE_MDNS="$mdns_flag" \
@@ -597,6 +745,21 @@ start_validators() {
         N42_MIN_ATTESTATION_THRESHOLD="1" \
         N42_OPEN_VERIFICATION="1" \
         N42_MAX_TXS_PER_BLOCK="${N42_MAX_TXS_PER_BLOCK:-48000}" \
+        N42_EXECUTION_LANES="${N42_EXECUTION_LANES:-8}" \
+        N42_SENDER_SHARDED_DRAIN="${N42_SENDER_SHARDED_DRAIN:-1}" \
+        N42_PARALLEL_WORKERS="${N42_PARALLEL_WORKERS:-8}" \
+        N42_ASYNC_FINALIZE_FCU="${N42_ASYNC_FINALIZE_FCU:-1}" \
+        N42_PAYLOAD_ZSTD="${N42_PAYLOAD_ZSTD:-1}" \
+        N42_ZSTD_LEVEL="${N42_ZSTD_LEVEL:-3}" \
+        N42_BLOCK_DIRECT_ONLY="${N42_BLOCK_DIRECT_ONLY:-0}" \
+        N42_BLOCK_DIRECT_FANOUT="${N42_BLOCK_DIRECT_FANOUT:-$((NUM_VALIDATORS - 1))}" \
+        N42_BLOCK_DIRECT_CHUNK_MIB="${N42_BLOCK_DIRECT_CHUNK_MIB:-4}" \
+        N42_QUIC_MAX_STREAM_DATA="${N42_QUIC_MAX_STREAM_DATA:-41943040}" \
+        N42_QUIC_MAX_CONNECTION_DATA="${N42_QUIC_MAX_CONNECTION_DATA:-100663296}" \
+        N42_QUIC_MAX_CONCURRENT_STREAMS="${N42_QUIC_MAX_CONCURRENT_STREAMS:-256}" \
+        N42_QUIC_UDP_SOCKET_BUFFER_BYTES="${N42_QUIC_UDP_SOCKET_BUFFER_BYTES:-16777216}" \
+        N42_BLOCK_DIRECT_REQUEST_TIMEOUT_MS="${N42_BLOCK_DIRECT_REQUEST_TIMEOUT_MS:-10000}" \
+        N42_DISABLE_MOBILE_PACKETS="$disable_mobile_packets" \
         N42_FAST_PROPOSE="${N42_FAST_PROPOSE:-0}" \
         N42_MIN_PROPOSE_DELAY_MS="${N42_MIN_PROPOSE_DELAY_MS:-0}" \
         N42_SKIP_TX_VERIFY="${N42_SKIP_TX_VERIFY:-0}" \
@@ -890,6 +1053,15 @@ if [[ "$CLEAN" == true ]]; then
 fi
 
 mkdir -p "$DATA_DIR"
+
+prepare_l3_cpusets
+
+# Read-only topology probe used by the cpuset A/B qualification.  It stops
+# before ulimit changes, builds, key generation, or node startup.
+if [[ "${N42_TESTNET_TOPOLOGY_ONLY:-0}" == "1" ]]; then
+    log "Topology-only probe complete; no validators were started"
+    exit 0
+fi
 
 setup_ulimit
 setup_python_venv

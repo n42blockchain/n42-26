@@ -13,13 +13,15 @@ use crate::exec_cache::ExecutionOutputCache;
 use crate::net_port::ConsensusNetwork;
 use crate::sinks::{StakingSink, StateSink, WithdrawalSource, ZkSink};
 use alloy_primitives::{Address, B256};
-use alloy_rpc_types_engine::{ForkchoiceState, PayloadStatusEnum};
+use alloy_rpc_types_engine::{ExecutionData, ForkchoiceState, PayloadStatusEnum};
 use metrics::{counter, gauge, histogram};
 use n42_consensus::{
     AuthenticatedConsensusMessage, ConsensusEngine, EngineOutput, FUTURE_VIEW_WINDOW, ValidatorSet,
 };
 use n42_network::{NetworkError, NetworkEvent, PeerId, SyncPayload};
-use n42_primitives::{BlsSecretKey, ConsensusMessage, QuorumCertificate};
+#[cfg(debug_assertions)]
+use n42_primitives::BlsSecretKey;
+use n42_primitives::{ConsensusMessage, QuorumCertificate};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -36,6 +38,10 @@ pub type TxImportBatch = Vec<Vec<u8>>;
 
 /// zstd magic bytes: all zstd frames start with 0x28B52FFD.
 const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
+/// 1M transfer transactions are about 78 MiB before envelope/sidecar data.
+/// Keep a bounded but non-blocking ceiling above that target; the old 64 MiB
+/// limit made the new chunk transport succeed only to fail during decode.
+const MAX_DECOMPRESSED_BLOCK_COMPONENT_SIZE: usize = 512 * 1024 * 1024;
 
 /// TX forwarding batches are latency-bounded by a 50ms flush timer, so we can
 /// use a larger batch target to reduce cross-task and cross-peer overhead.
@@ -98,23 +104,282 @@ enum LeaderBuildWaitMode {
     Scheduled,
 }
 
-/// Compress payload JSON with zstd (level 3 — good speed/ratio tradeoff).
-pub fn compress_payload(json: &[u8]) -> Vec<u8> {
-    zstd::bulk::compress(json, 3).unwrap_or_else(|e| {
-        tracing::warn!(target: "n42::cl", len = json.len(), error = %e, "zstd compression failed, sending uncompressed");
-        json.to_vec()
+/// Compress a block-data component with zstd. Production keeps level 3; throughput
+/// qualification can choose a faster level through `N42_ZSTD_LEVEL`.
+pub fn compress_payload(payload: &[u8]) -> Vec<u8> {
+    let level = payload_zstd_level();
+    zstd::bulk::compress(payload, level).unwrap_or_else(|e| {
+        tracing::warn!(target: "n42::cl", len = payload.len(), error = %e, "zstd compression failed, sending uncompressed");
+        payload.to_vec()
     })
 }
 
-/// Decompress payload if zstd-compressed; pass through raw JSON unchanged.
-/// Backward-compatible: old nodes send uncompressed JSON, new nodes send zstd.
+/// Compress the execution-payload wire image, with an explicit benchmark switch
+/// that does not also disable compression of the compact execution sidecar.
+pub fn compress_execution_payload(payload: &[u8]) -> Vec<u8> {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let enabled = *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("N42_PAYLOAD_ZSTD").ok().as_deref(),
+            Some("0") | Some("false") | Some("off")
+        )
+    });
+    if !enabled {
+        return payload.to_vec();
+    }
+    compress_payload(payload)
+}
+
+fn payload_zstd_level() -> i32 {
+    static LEVEL: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+    *LEVEL.get_or_init(|| {
+        std::env::var("N42_ZSTD_LEVEL")
+            .ok()
+            .and_then(|value| value.parse::<i32>().ok())
+            .map(|value| value.clamp(1, 9))
+            .unwrap_or(3)
+    })
+}
+
+/// Decompress payload if zstd-compressed; pass through an uncompressed wire image.
+/// Backward-compatible with old nodes that sent uncompressed JSON.
 pub fn decompress_payload(data: &[u8]) -> std::io::Result<Vec<u8>> {
     if data.len() >= 4 && data[..4] == ZSTD_MAGIC {
-        zstd::bulk::decompress(data, 64 * 1024 * 1024) // 64 MB max
+        zstd::bulk::decompress(data, MAX_DECOMPRESSED_BLOCK_COMPONENT_SIZE)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     } else {
         Ok(data.to_vec())
     }
+}
+
+/// Versioned execution-payload framing. The JSON header retains Alloy's exact
+/// V1-V4/sidecar representation with an empty transaction array; transactions
+/// follow as raw bytes so JSON hex encoding no longer doubles the dominant data.
+const EXECUTION_PAYLOAD_BINARY_V1_MAGIC: [u8; 8] = *b"N42EPB01";
+const EXECUTION_PAYLOAD_BINARY_HEADER_BYTES: usize = 16;
+const MAX_EXECUTION_PAYLOAD_HEADER_BYTES: usize = 1024 * 1024;
+const MAX_EXECUTION_PAYLOAD_TRANSACTIONS: usize = 2_000_000;
+
+pub(super) struct EncodedExecutionPayload {
+    pub bytes: Vec<u8>,
+    pub format: &'static str,
+    pub header_bytes: usize,
+    pub transaction_bytes: usize,
+}
+
+fn execution_payload_binary_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("N42_EXECUTION_PAYLOAD_BINARY")
+            .map(|value| value != "0")
+            .unwrap_or(true)
+    })
+}
+
+fn invalid_payload(error: impl std::fmt::Display) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
+}
+
+/// Encode without cloning the transaction bodies. The transaction vector is
+/// removed only while the small JSON header is serialized and is restored on
+/// every return path.
+pub(super) fn encode_execution_payload(
+    execution: &mut ExecutionData,
+) -> std::io::Result<EncodedExecutionPayload> {
+    if !execution_payload_binary_enabled() {
+        let bytes = serde_json::to_vec(execution).map_err(invalid_payload)?;
+        return Ok(EncodedExecutionPayload {
+            transaction_bytes: execution
+                .payload
+                .transactions()
+                .iter()
+                .map(|transaction| transaction.len())
+                .sum(),
+            header_bytes: bytes.len(),
+            bytes,
+            format: "json",
+        });
+    }
+
+    let transactions = std::mem::take(execution.payload.transactions_mut());
+    let header_result = serde_json::to_vec(execution);
+    *execution.payload.transactions_mut() = transactions;
+    let header = header_result.map_err(invalid_payload)?;
+
+    let header_len = u32::try_from(header.len())
+        .map_err(|_| invalid_payload("execution payload header exceeds u32"))?;
+    let transactions = execution.payload.transactions();
+    let transaction_count = u32::try_from(transactions.len())
+        .map_err(|_| invalid_payload("execution payload transaction count exceeds u32"))?;
+    let transaction_bytes = transactions.iter().try_fold(0usize, |total, transaction| {
+        let _ = u32::try_from(transaction.len())
+            .map_err(|_| invalid_payload("execution transaction exceeds u32"))?;
+        total
+            .checked_add(transaction.len())
+            .ok_or_else(|| invalid_payload("execution transaction bytes overflow"))
+    })?;
+    let capacity = EXECUTION_PAYLOAD_BINARY_HEADER_BYTES
+        .checked_add(header.len())
+        .and_then(|size| size.checked_add(transactions.len().saturating_mul(4)))
+        .and_then(|size| size.checked_add(transaction_bytes))
+        .ok_or_else(|| invalid_payload("execution payload size overflow"))?;
+
+    let mut bytes = Vec::with_capacity(capacity);
+    bytes.extend_from_slice(&EXECUTION_PAYLOAD_BINARY_V1_MAGIC);
+    bytes.extend_from_slice(&header_len.to_le_bytes());
+    bytes.extend_from_slice(&transaction_count.to_le_bytes());
+    bytes.extend_from_slice(&header);
+    for transaction in transactions {
+        let transaction_len =
+            u32::try_from(transaction.len()).expect("transaction length was validated above");
+        bytes.extend_from_slice(&transaction_len.to_le_bytes());
+        bytes.extend_from_slice(transaction);
+    }
+
+    Ok(EncodedExecutionPayload {
+        bytes,
+        format: "binary-v1",
+        header_bytes: header.len(),
+        transaction_bytes,
+    })
+}
+
+pub(super) fn execution_payload_wire_format(payload: &[u8]) -> &'static str {
+    if payload.starts_with(&EXECUTION_PAYLOAD_BINARY_V1_MAGIC) {
+        "binary-v1"
+    } else {
+        "json"
+    }
+}
+
+pub(super) fn decode_execution_payload(payload: &[u8]) -> std::io::Result<ExecutionData> {
+    if !payload.starts_with(&EXECUTION_PAYLOAD_BINARY_V1_MAGIC) {
+        return serde_json::from_slice(payload).map_err(invalid_payload);
+    }
+    decode_binary_execution_payload(payload, None)
+}
+
+/// Decode a received payload while retaining the decompressed allocation as the
+/// backing store for every transaction body. A full block otherwise copies
+/// roughly 20 MiB into 163K independent `Bytes` values on every follower.
+pub(super) fn decode_execution_payload_owned(payload: Vec<u8>) -> std::io::Result<ExecutionData> {
+    if !payload.starts_with(&EXECUTION_PAYLOAD_BINARY_V1_MAGIC) {
+        return serde_json::from_slice(&payload).map_err(invalid_payload);
+    }
+    let backing = alloy_primitives::Bytes::from(payload);
+    decode_binary_execution_payload(backing.as_ref(), Some(&backing))
+}
+
+fn decode_binary_execution_payload(
+    payload: &[u8],
+    backing: Option<&alloy_primitives::Bytes>,
+) -> std::io::Result<ExecutionData> {
+    if payload.len() < EXECUTION_PAYLOAD_BINARY_HEADER_BYTES {
+        return Err(invalid_payload("truncated binary execution payload header"));
+    }
+
+    let header_len = u32::from_le_bytes(
+        payload[8..12]
+            .try_into()
+            .expect("four-byte header length slice"),
+    ) as usize;
+    let transaction_count = u32::from_le_bytes(
+        payload[12..16]
+            .try_into()
+            .expect("four-byte transaction count slice"),
+    ) as usize;
+    if header_len > MAX_EXECUTION_PAYLOAD_HEADER_BYTES {
+        return Err(invalid_payload(
+            "binary execution payload header is too large",
+        ));
+    }
+    if transaction_count > MAX_EXECUTION_PAYLOAD_TRANSACTIONS {
+        return Err(invalid_payload(
+            "binary execution payload transaction count is too large",
+        ));
+    }
+    let header_end = EXECUTION_PAYLOAD_BINARY_HEADER_BYTES
+        .checked_add(header_len)
+        .filter(|end| *end <= payload.len())
+        .ok_or_else(|| invalid_payload("truncated binary execution payload JSON header"))?;
+    let mut execution: ExecutionData =
+        serde_json::from_slice(&payload[EXECUTION_PAYLOAD_BINARY_HEADER_BYTES..header_end])
+            .map_err(invalid_payload)?;
+    if !execution.payload.transactions().is_empty() {
+        return Err(invalid_payload(
+            "binary execution payload JSON header contains transactions",
+        ));
+    }
+
+    let minimum_transaction_bytes = transaction_count
+        .checked_mul(4)
+        .and_then(|lengths| header_end.checked_add(lengths))
+        .filter(|minimum| *minimum <= payload.len())
+        .ok_or_else(|| invalid_payload("truncated binary execution transaction lengths"))?;
+    let _ = minimum_transaction_bytes;
+    let mut cursor = header_end;
+    let mut transactions = Vec::with_capacity(transaction_count);
+    let mut shared_transaction_bytes = 0u64;
+    for _ in 0..transaction_count {
+        let length_end = cursor
+            .checked_add(4)
+            .filter(|end| *end <= payload.len())
+            .ok_or_else(|| invalid_payload("truncated binary execution transaction length"))?;
+        let transaction_len = u32::from_le_bytes(
+            payload[cursor..length_end]
+                .try_into()
+                .expect("four-byte transaction length slice"),
+        ) as usize;
+        cursor = length_end;
+        let transaction_end = cursor
+            .checked_add(transaction_len)
+            .filter(|end| *end <= payload.len())
+            .ok_or_else(|| invalid_payload("truncated binary execution transaction"))?;
+        transactions.push(match backing {
+            Some(backing) => {
+                shared_transaction_bytes =
+                    shared_transaction_bytes.saturating_add(transaction_len as u64);
+                backing.slice(cursor..transaction_end)
+            }
+            None => alloy_primitives::Bytes::copy_from_slice(&payload[cursor..transaction_end]),
+        });
+        cursor = transaction_end;
+    }
+    if cursor != payload.len() {
+        return Err(invalid_payload("trailing binary execution payload bytes"));
+    }
+    *execution.payload.transactions_mut() = transactions;
+    if shared_transaction_bytes > 0 {
+        metrics::counter!("n42_execution_payload_decode_copy_avoided_bytes_total")
+            .increment(shared_transaction_bytes);
+    }
+    Ok(execution)
+}
+
+/// The staking sink still consumes the historical JSON representation. This
+/// conversion is only reached for blocks whose validated metadata did not
+/// already prove that the staking address is absent.
+pub(super) fn execution_payload_json_for_staking(payload: &[u8]) -> std::io::Result<Vec<u8>> {
+    if payload.starts_with(&EXECUTION_PAYLOAD_BINARY_V1_MAGIC) {
+        serde_json::to_vec(&decode_execution_payload(payload)?).map_err(invalid_payload)
+    } else {
+        Ok(payload.to_vec())
+    }
+}
+
+/// Exact RLP call-target marker for the native staking address inside a raw
+/// Ethereum transaction envelope.
+const STAKING_TARGET_RLP: [u8; 21] = [
+    0x94, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x42,
+];
+
+/// Cheap typed prefilter run before the payload is moved into reth.
+pub(super) fn execution_might_contain_staking_target(execution: &ExecutionData) -> bool {
+    execution.payload.transactions().iter().any(|transaction| {
+        transaction
+            .windows(STAKING_TARGET_RLP.len())
+            .any(|window| window == STAKING_TARGET_RLP)
+    })
 }
 
 fn elapsed_since_unix_ms(start_ms: u64) -> Option<u64> {
@@ -137,8 +402,8 @@ fn elapsed_since_unix_ms(start_ms: u64) -> Option<u64> {
 pub struct BlockDataBroadcast {
     pub block_hash: B256,
     pub view: u64,
-    /// Execution payload — zstd-compressed JSON (or raw JSON from older peers).
-    /// Use `decompress_payload()` before `serde_json::from_slice()`.
+    /// Execution payload — zstd-compressed binary-v1 or legacy JSON.
+    /// Use `decompress_payload()` and `decode_execution_payload()`.
     pub payload_json: Vec<u8>,
     /// Block timestamp (seconds since epoch). Stored directly to avoid JSON re-parsing.
     /// Defaults to 0 for backwards compatibility with older serialized broadcasts.
@@ -179,6 +444,12 @@ pub struct CompactBlockExecution {
     pub gas_used: u64,
     pub blob_gas_used: u64,
     pub senders: Vec<Address>,
+    /// Transaction trie root authenticated by the leader's block hash.  This
+    /// lets followers avoid rebuilding the same 163K-transaction trie before
+    /// decoding the body.  Older compact messages omit it and retain the
+    /// standard full-root computation.
+    #[serde(default)]
+    pub transactions_root: Option<B256>,
 }
 
 /// Blob sidecar broadcast via /n42/blobs/1 GossipSub topic.
@@ -315,6 +586,26 @@ struct PendingFinalization {
     commit_qc: QuorumCertificate,
 }
 
+/// Consensus agreement and execution finality are deliberately separate.
+/// A CommitQC records `Committed`; a successful speculative `new_payload`
+/// promotes the exact hash to `ExecutionReady`; only a successful canonical
+/// FCU records `Finalized`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AsyncCommitStage {
+    Committed,
+    ExecutionReady,
+    Finalized,
+}
+
+struct AsyncCommitState {
+    view: u64,
+    block_hash: B256,
+    commit_qc: QuorumCertificate,
+    stage: AsyncCommitStage,
+    finalize_in_flight: bool,
+    committed_at: Instant,
+}
+
 type FinalizeDone = (u64, B256, QuorumCertificate, bool);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ImportOutcome {
@@ -324,12 +615,28 @@ enum ImportOutcome {
 }
 type ImportDone = (B256, u64, ImportOutcome, u64);
 type SidecarDiffWork = (u64, B256, n42_execution::state_diff::StateDiff);
+type SharedBlockData = Arc<Vec<u8>>;
+type StateDiffReady = (B256, n42_execution::state_diff::StateDiff);
+type CommitExecutionTimeout = (u64, B256);
+type EagerImportDone = (
+    B256,
+    u64,
+    B256,
+    u64,
+    bool,
+    Option<n42_execution::state_diff::StateDiff>,
+);
 
 pub struct CommittedBlock {
     pub view: u64,
     pub block_hash: B256,
     pub commit_qc: QuorumCertificate,
     pub payload: Vec<u8>,
+    /// Compressed payload length without materializing another owned copy.
+    pub(crate) payload_len: usize,
+    /// Exact live BlockData envelope, shared with the pending/recent caches.
+    /// Sync/recovery paths materialize `payload` only when they actually serve it.
+    pub(crate) block_data: Option<SharedBlockData>,
     pub validator_changes: Option<Vec<n42_primitives::consensus::ValidatorChange>>,
     /// Full execution lineage from the previously execution-validated head to
     /// this committed block. It may include a prepared ancestor that never
@@ -337,11 +644,35 @@ pub struct CommittedBlock {
     pub execution_lineage: Vec<SyncPayload>,
 }
 
+impl CommittedBlock {
+    fn retained_payload(&self) -> Vec<u8> {
+        if !self.payload.is_empty() {
+            return self.payload.clone();
+        }
+        self.block_data
+            .as_ref()
+            .and_then(|data| bincode::deserialize::<BlockDataBroadcast>(data.as_slice()).ok())
+            .map(|broadcast| broadcast.payload_json)
+            .unwrap_or_default()
+    }
+}
+
 #[derive(Clone)]
 struct RecentBlockData {
     view: u64,
     block_hash: B256,
-    block_data: Vec<u8>,
+    block_data: SharedBlockData,
+    payload_len: usize,
+    /// Populated only after reth accepts the exact payload as valid. The raw
+    /// broadcast envelope itself is unauthenticated, so lineage code must not
+    /// trust metadata merely claimed by its sender.
+    execution_parent_hash: Option<B256>,
+    execution_block_number: Option<u64>,
+    execution_has_staking_target: Option<bool>,
+    /// State-tree delta derived from the locally received compact execution
+    /// output. It is attached only after reth validates the matching payload,
+    /// so commit-time sidecars can reuse it without trusting peer bytes.
+    execution_state_diff: Option<n42_execution::state_diff::StateDiff>,
 }
 
 /// Bridges the consensus engine with the P2P network layer and reth Engine API.
@@ -455,13 +786,16 @@ pub struct ConsensusService {
     next_build_at: Option<Instant>,
     next_slot_timestamp: Option<u64>,
     consecutive_empty_skips: u32,
-    pending_block_data: BTreeMap<B256, Vec<u8>>,
+    pending_block_data: BTreeMap<B256, SharedBlockData>,
     /// Raw proposal payloads retained across ordinary pending-cache clears so
     /// CommitQC descendants can prove and serve any prepared execution
     /// ancestors needed by a restarting reth tree.
     recent_block_data: VecDeque<RecentBlockData>,
     pending_executions: HashSet<B256>,
     pending_finalization: Option<PendingFinalization>,
+    /// Ordered commit lifecycle. A later execution-ready child never overtakes
+    /// an earlier committed parent when canonical FCUs are dispatched.
+    async_commit_states: BTreeMap<u64, AsyncCommitState>,
     /// Blocks that returned `Syncing` from new_payload, queued for retry.
     /// Each entry is `(serialized_data, retry_count)` — dropped after 3 retries.
     syncing_blocks: VecDeque<(Vec<u8>, u32)>,
@@ -503,8 +837,8 @@ pub struct ConsensusService {
     /// (not from pre-existing live-consensus state), preventing premature advances.
     epoch_sync_staged_view: Option<u64>,
     mobile_packet_tx: Option<mpsc::Sender<(B256, u64)>>,
-    leader_payload_rx: mpsc::Receiver<(B256, Vec<u8>)>,
-    leader_payload_tx: mpsc::Sender<(B256, Vec<u8>)>,
+    leader_payload_rx: mpsc::Receiver<(B256, SharedBlockData)>,
+    leader_payload_tx: mpsc::Sender<(B256, SharedBlockData)>,
     /// Receives notifications when a background `import_and_notify` task completes.
     /// Tuple: (block_hash, view, execution outcome, block timestamp).
     import_done_rx: mpsc::Receiver<ImportDone>,
@@ -524,11 +858,21 @@ pub struct ConsensusService {
     bg_import_hashes: HashSet<B256>,
     /// Queue of pending imports waiting for the current bg import to finish.
     /// Entries: (serialized_block_data, block_hash, view).
-    bg_import_queue: VecDeque<(Vec<u8>, B256, u64)>,
+    bg_import_queue: VecDeque<(SharedBlockData, B256, u64)>,
     /// Speculative build: eager import tasks notify when a block is imported to reth.
     /// Allows the next leader to start building before consensus commits the current block.
-    eager_import_done_tx: mpsc::Sender<(B256, u64)>,
-    eager_import_done_rx: mpsc::Receiver<(B256, u64)>,
+    eager_import_done_tx: mpsc::Sender<EagerImportDone>,
+    eager_import_done_rx: mpsc::Receiver<EagerImportDone>,
+    /// Wakes a committed lifecycle that did not receive `new_payload(Valid)`
+    /// within the bounded grace period. The timer runs outside the consensus
+    /// loop; its handler starts the retained-data import/catch-up fallback.
+    commit_execution_timeout_tx: mpsc::Sender<CommitExecutionTimeout>,
+    commit_execution_timeout_rx: mpsc::Receiver<CommitExecutionTimeout>,
+    /// State-tree delta completion is deliberately separate from eager import.
+    /// `new_payload(Valid)` unblocks finalization and the next leader; deriving
+    /// an auxiliary QMDB/Twig sidecar must never extend that critical cadence.
+    state_diff_ready_tx: mpsc::Sender<StateDiffReady>,
+    state_diff_ready_rx: mpsc::Receiver<StateDiffReady>,
     /// Hash of the block whose speculative build is in progress.
     /// Set when build is triggered by eager import (before consensus commit).
     /// Cleared on ViewChanged or when finalize confirms the block.
@@ -548,6 +892,10 @@ pub struct ConsensusService {
     build_complete_rx: mpsc::Receiver<PayloadBuildContext>,
     /// Staking scan/persist behind the [`StakingSink`] port.
     staking_sink: Option<Arc<dyn StakingSink>>,
+    /// Validated staking classifications waiting for execution-block order.
+    /// Commit can overtake eager validation, so unknown blocks are filled in
+    /// later without ever skipping the durable staking watermark forward.
+    pending_staking_scans: BTreeMap<u64, (B256, bool)>,
     /// Reward + matured-stake withdrawal computation behind the
     /// [`WithdrawalSource`] port (build-path query).
     withdrawal_source: Option<Arc<dyn WithdrawalSource>>,
@@ -594,7 +942,7 @@ pub struct ConsensusService {
     /// Enabled by `N42_FAST_PROPOSE=1`. Default: false (grid-aligned slots).
     fast_propose: bool,
     /// Moves finalize forkchoiceUpdated off the consensus select-loop hot path.
-    /// Enabled by `N42_ASYNC_FINALIZE_FCU=1`. Default: false.
+    /// Enabled by default; `N42_ASYNC_FINALIZE_FCU=0` is the controlled fallback.
     async_finalize_fcu: bool,
     /// Deferred state-root mode (env `N42_DEFER_STATE_ROOT`, read once by the node
     /// at construction). When set, finalized blocks log a deferred-state-root note.
@@ -1214,7 +1562,7 @@ impl ConsensusService {
         block: n42_network::Gov5GossipBlock,
         view: u64,
     ) {
-        let execution_data = match crate::replay_import::build_gov5_execution_data(
+        let mut execution_data = match crate::replay_import::build_gov5_execution_data(
             block.block_hash,
             &block.header,
             &block.transactions,
@@ -1227,8 +1575,8 @@ impl ConsensusService {
                 return;
             }
         };
-        let payload_json = match serde_json::to_vec(&execution_data) {
-            Ok(payload) => compress_payload(&payload),
+        let payload_json = match encode_execution_payload(&mut execution_data) {
+            Ok(payload) => compress_payload(&payload.bytes),
             Err(error) => {
                 warn!(target: "n42::interop::h2v4", %source, hash = %block.block_hash, %error, "could not serialize gov5 execution payload");
                 return;
@@ -1263,10 +1611,9 @@ impl ConsensusService {
         }
     }
 
-    fn broadcast_engine_consensus(
-        &self,
-        mut message: ConsensusMessage,
-    ) -> Result<(), NetworkError> {
+    fn broadcast_engine_consensus(&self, message: ConsensusMessage) -> Result<(), NetworkError> {
+        #[cfg(debug_assertions)]
+        let mut message = message;
         // Deliberately corrupts our own signatures so a qualification run can
         // observe how peers reject them. Vote and CommitVote go out once per
         // validator per block on the native path too, so an env var alone is
@@ -1361,21 +1708,59 @@ impl ConsensusService {
         std::env::var("N42_ASYNC_FINALIZE_FCU")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(0)
+            // Unit tests keep the synchronous completion path unless they opt
+            // in explicitly; production uses the asynchronous state machine.
+            .unwrap_or(if cfg!(test) { 0 } else { 1 })
             > 0
+    }
+
+    fn mobile_packet_generation_enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            !matches!(
+                std::env::var("N42_DISABLE_MOBILE_PACKETS").ok().as_deref(),
+                Some("1") | Some("true") | Some("yes")
+            )
+        })
     }
 
     fn cache_pending_block_data(
         &mut self,
         hash: B256,
-        data: Vec<u8>,
+        data: impl Into<SharedBlockData>,
         protected_hashes: &[B256],
+    ) -> bool {
+        self.cache_pending_block_data_inner(hash, data.into(), protected_hashes, None)
+    }
+
+    fn cache_pending_block_data_with_metadata(
+        &mut self,
+        hash: B256,
+        data: impl Into<SharedBlockData>,
+        protected_hashes: &[B256],
+        view: u64,
+        payload_len: usize,
+    ) -> bool {
+        self.cache_pending_block_data_inner(
+            hash,
+            data.into(),
+            protected_hashes,
+            Some((view, payload_len)),
+        )
+    }
+
+    fn cache_pending_block_data_inner(
+        &mut self,
+        hash: B256,
+        data: SharedBlockData,
+        protected_hashes: &[B256],
+        metadata: Option<(u64, usize)>,
     ) -> bool {
         // A Decide-before-BlockData race may have left the sidecar paused at
         // this committed view. Recover the owned StateDiff directly from the
         // late bytes even if the bounded raw-data cache cannot retain them.
         self.try_recover_missing_sidecar_diff(hash, &data);
-        self.remember_recent_block_data(hash, &data);
+        self.remember_recent_block_data(hash, Arc::clone(&data), metadata);
         if self.pending_block_data.contains_key(&hash) {
             return false;
         }
@@ -1404,7 +1789,12 @@ impl ConsensusService {
         true
     }
 
-    fn remember_recent_block_data(&mut self, hash: B256, data: &[u8]) {
+    fn remember_recent_block_data(
+        &mut self,
+        hash: B256,
+        data: SharedBlockData,
+        metadata: Option<(u64, usize)>,
+    ) {
         if self
             .recent_block_data
             .iter()
@@ -1412,35 +1802,75 @@ impl ConsensusService {
         {
             return;
         }
-        let Ok(broadcast) = bincode::deserialize::<BlockDataBroadcast>(data) else {
-            return;
+        let (view, payload_len) = match metadata {
+            Some(metadata) => metadata,
+            None => {
+                let Ok(broadcast) = bincode::deserialize::<BlockDataBroadcast>(data.as_slice())
+                else {
+                    return;
+                };
+                if broadcast.block_hash != hash {
+                    return;
+                }
+                (broadcast.view, broadcast.payload_json.len())
+            }
         };
-        if broadcast.block_hash != hash {
-            return;
-        }
         if self.recent_block_data.len() >= execution_bridge::MAX_PENDING_BLOCK_DATA {
             self.recent_block_data.pop_front();
         }
+        counter!(
+            "n42_block_data_copy_avoided_bytes_total",
+            "site" => "recent_cache"
+        )
+        .increment(data.len() as u64);
         self.recent_block_data.push_back(RecentBlockData {
-            view: broadcast.view,
+            view,
             block_hash: hash,
-            block_data: data.to_vec(),
+            block_data: data,
+            payload_len,
+            execution_parent_hash: None,
+            execution_block_number: None,
+            execution_has_staking_target: None,
+            execution_state_diff: None,
         });
+    }
+
+    fn record_validated_execution_metadata(
+        &mut self,
+        hash: B256,
+        parent_hash: B256,
+        block_number: u64,
+        has_staking_target: bool,
+        state_diff: Option<n42_execution::state_diff::StateDiff>,
+    ) {
+        if let Some(entry) = self
+            .recent_block_data
+            .iter_mut()
+            .find(|entry| entry.block_hash == hash)
+        {
+            entry.execution_parent_hash = Some(parent_hash);
+            entry.execution_block_number = Some(block_number);
+            entry.execution_has_staking_target = Some(has_staking_target);
+            // Eager validity is intentionally reported before the auxiliary
+            // state-diff worker completes. A metadata refresh carrying `None`
+            // must not erase a diff that won the channel race and arrived first.
+            if state_diff.is_some() {
+                entry.execution_state_diff = state_diff;
+            }
+        }
     }
 
     fn execution_parent_and_number(data: &[u8]) -> Option<(B256, u64)> {
         let broadcast = bincode::deserialize::<BlockDataBroadcast>(data).ok()?;
         let payload = decompress_payload(&broadcast.payload_json).ok()?;
-        let execution: alloy_rpc_types_engine::ExecutionData =
-            serde_json::from_slice(&payload).ok()?;
+        let execution = decode_execution_payload_owned(payload).ok()?;
         (execution.block_hash() == broadcast.block_hash)
             .then(|| (execution.parent_hash(), execution.block_number()))
     }
 
     fn execution_parent_and_number_from_payload(payload_json: &[u8]) -> Option<(B256, u64)> {
         let payload = decompress_payload(payload_json).ok()?;
-        let execution: alloy_rpc_types_engine::ExecutionData =
-            serde_json::from_slice(&payload).ok()?;
+        let execution = decode_execution_payload_owned(payload).ok()?;
         Some((execution.parent_hash(), execution.block_number()))
     }
 
@@ -1458,7 +1888,7 @@ impl ConsensusService {
             if !seen.insert(current) {
                 return Vec::new();
             }
-            let Some(entry) = self
+            let Some(mut entry) = self
                 .recent_block_data
                 .iter()
                 .find(|entry| entry.block_hash == current)
@@ -1466,9 +1896,19 @@ impl ConsensusService {
             else {
                 return Vec::new();
             };
-            let Some((parent, _)) = Self::execution_parent_and_number(&entry.block_data) else {
-                return Vec::new();
-            };
+            let (parent, block_number) =
+                match (entry.execution_parent_hash, entry.execution_block_number) {
+                    (Some(parent), Some(block_number)) => (parent, block_number),
+                    _ => {
+                        let Some(metadata) = Self::execution_parent_and_number(&entry.block_data)
+                        else {
+                            return Vec::new();
+                        };
+                        metadata
+                    }
+                };
+            entry.execution_parent_hash = Some(parent);
+            entry.execution_block_number = Some(block_number);
             reversed.push(entry);
             current = parent;
         }
@@ -1742,14 +2182,24 @@ impl ConsensusService {
     fn drain_leader_payload_rx(&mut self, protected_hashes: &[B256]) {
         while let Ok((hash, data)) = self.leader_payload_rx.try_recv() {
             let decoded = bincode::deserialize::<BlockDataBroadcast>(&data).ok();
-            self.cache_pending_block_data(hash, data, protected_hashes);
+            if let Some(broadcast) = decoded.as_ref() {
+                self.cache_pending_block_data_with_metadata(
+                    hash,
+                    Arc::clone(&data),
+                    protected_hashes,
+                    broadcast.view,
+                    broadcast.payload_json.len(),
+                );
+            } else {
+                self.cache_pending_block_data(hash, Arc::clone(&data), protected_hashes);
+            }
             let execution_lineage = self
                 .recent_execution_lineage(hash)
                 .into_iter()
                 .map(|entry| SyncPayload {
                     view: entry.view,
                     block_hash: entry.block_hash,
-                    block_data: entry.block_data,
+                    block_data: entry.block_data.as_ref().clone(),
                 })
                 .collect::<Vec<_>>();
             if let Some(broadcast) = decoded {
@@ -1763,12 +2213,13 @@ impl ConsensusService {
                     .rev()
                     .find(|block| block.block_hash == hash)
                 {
-                    if block.payload.is_empty() {
-                        block.payload = broadcast.payload_json;
+                    if block.block_data.is_none() {
+                        block.payload_len = broadcast.payload_json.len();
+                        block.block_data = Some(Arc::clone(&data));
                         debug!(
                             target: "n42::cl::consensus_loop",
                             %hash,
-                            "backfilled committed payload while draining leader feedback"
+                            "linked committed block to shared envelope while draining leader feedback"
                         );
                     }
                     if block.execution_lineage.is_empty() && execution_lineage.len() > 1 {
@@ -1992,6 +2443,8 @@ impl ConsensusService {
         let (import_done_tx, import_done_rx) = mpsc::channel(256);
         let (finalize_done_tx, finalize_done_rx) = mpsc::channel(256);
         let (eager_import_done_tx, eager_import_done_rx) = mpsc::channel(256);
+        let (commit_execution_timeout_tx, commit_execution_timeout_rx) = mpsc::channel(256);
+        let (state_diff_ready_tx, state_diff_ready_rx) = mpsc::channel(256);
         let (build_complete_tx, build_complete_rx) = mpsc::channel(256);
         Self {
             engine,
@@ -2036,6 +2489,7 @@ impl ConsensusService {
             recent_block_data: VecDeque::new(),
             pending_executions: HashSet::new(),
             pending_finalization: None,
+            async_commit_states: BTreeMap::new(),
             syncing_blocks: VecDeque::new(),
             bad_blocks: bad_block_cache::BadBlockCache::default(),
             tx_import_tx: None,
@@ -2065,12 +2519,17 @@ impl ConsensusService {
             bg_import_queue: VecDeque::new(),
             eager_import_done_tx,
             eager_import_done_rx,
+            commit_execution_timeout_tx,
+            commit_execution_timeout_rx,
+            state_diff_ready_tx,
+            state_diff_ready_rx,
             speculative_build_hash: None,
             building_on_parent: None,
             build_triggered_at: None,
             build_complete_tx,
             build_complete_rx,
             staking_sink: None,
+            pending_staking_scans: BTreeMap::new(),
             withdrawal_source: None,
             committed_block_count: 0,
             last_committed_timestamp: 0,
@@ -2109,6 +2568,9 @@ impl ConsensusService {
         view: u64,
         reason: &'static str,
     ) {
+        if !Self::mobile_packet_generation_enabled() {
+            return;
+        }
         let Some(tx) = self.mobile_packet_tx.as_ref().cloned() else {
             return;
         };
@@ -2203,6 +2665,8 @@ impl ConsensusService {
         let (import_done_tx, import_done_rx) = mpsc::channel(256);
         let (finalize_done_tx, finalize_done_rx) = mpsc::channel(256);
         let (eager_import_done_tx, eager_import_done_rx) = mpsc::channel(256);
+        let (commit_execution_timeout_tx, commit_execution_timeout_rx) = mpsc::channel(256);
+        let (state_diff_ready_tx, state_diff_ready_rx) = mpsc::channel(256);
         let (build_complete_tx, build_complete_rx) = mpsc::channel(256);
 
         let slot_time_ms: u64 = std::env::var("N42_BLOCK_INTERVAL_MS")
@@ -2274,6 +2738,7 @@ impl ConsensusService {
             recent_block_data: VecDeque::new(),
             pending_executions: HashSet::new(),
             pending_finalization: None,
+            async_commit_states: BTreeMap::new(),
             syncing_blocks: VecDeque::new(),
             bad_blocks: bad_block_cache::BadBlockCache::default(),
             tx_import_tx: None,
@@ -2303,12 +2768,17 @@ impl ConsensusService {
             bg_import_queue: VecDeque::new(),
             eager_import_done_tx,
             eager_import_done_rx,
+            commit_execution_timeout_tx,
+            commit_execution_timeout_rx,
+            state_diff_ready_tx,
+            state_diff_ready_rx,
             speculative_build_hash: None,
             building_on_parent: None,
             build_triggered_at: None,
             build_complete_tx,
             build_complete_rx,
             staking_sink: None,
+            pending_staking_scans: BTreeMap::new(),
             withdrawal_source: None,
             committed_block_count: 0,
             last_committed_timestamp: 0,
@@ -2676,7 +3146,22 @@ impl ConsensusService {
                 } => {
                     if let Some((view, block_hash, commit_qc, finalized)) = finalize_done {
                         self.handle_finalize_done(view, block_hash, commit_qc, finalized).await;
+                        self.drive_async_commits().await;
                         self.save_consensus_state();
+                    }
+                }
+
+                commit_execution_timeout = async {
+                    if self.commit_execution_timeout_rx.is_closed()
+                        && self.commit_execution_timeout_rx.is_empty()
+                    {
+                        std::future::pending::<Option<CommitExecutionTimeout>>().await
+                    } else {
+                        self.commit_execution_timeout_rx.recv().await
+                    }
+                } => {
+                    if let Some((view, block_hash)) = commit_execution_timeout {
+                        self.handle_commit_execution_timeout(view, block_hash);
                     }
                 }
 
@@ -2747,6 +3232,7 @@ impl ConsensusService {
                 } => {
                     if let Some((hash, view, outcome, block_ts)) = import_result {
                         self.handle_import_done(hash, view, outcome, block_ts).await;
+                        self.drive_async_commits().await;
                         // Background import completion can advance the
                         // execution-validity guard after the commit-time
                         // snapshot was written. Persist the exact new pair now.
@@ -2756,26 +3242,38 @@ impl ConsensusService {
 
                 eager_done = async {
                     if self.eager_import_done_rx.is_closed() && self.eager_import_done_rx.is_empty() {
-                        std::future::pending::<Option<(B256, u64)>>().await
+                        std::future::pending::<Option<EagerImportDone>>().await
                     } else {
                         self.eager_import_done_rx.recv().await
                     }
                 } => {
-                    if let Some((hash, block_ts)) = eager_done {
+                    if let Some((hash, block_ts, parent_hash, block_number, has_staking_target, state_diff)) = eager_done {
                         // Pipeline: import complete — record timing.
                         if let Some(timing) = self.pipeline_timings.get_mut(&hash) {
                             timing.import_complete = Some(Instant::now());
                         }
-                        self.handle_eager_import_done(hash, block_ts).await;
+                        self.handle_eager_import_done(hash, block_ts, parent_hash, block_number, has_staking_target, state_diff).await;
                         // A late eager completion may close a committed Case C
                         // and advance the guard outside handle_block_committed.
                         self.save_consensus_state();
                     }
                 }
 
+                state_diff_ready = async {
+                    if self.state_diff_ready_rx.is_closed() && self.state_diff_ready_rx.is_empty() {
+                        std::future::pending::<Option<StateDiffReady>>().await
+                    } else {
+                        self.state_diff_ready_rx.recv().await
+                    }
+                } => {
+                    if let Some((hash, state_diff)) = state_diff_ready {
+                        self.handle_state_diff_ready(hash, state_diff);
+                    }
+                }
+
                 payload_data = async {
                     if self.leader_payload_rx.is_closed() && self.leader_payload_rx.is_empty() {
-                        std::future::pending::<Option<(B256, Vec<u8>)>>().await
+                        std::future::pending::<Option<(B256, SharedBlockData)>>().await
                     } else {
                         self.leader_payload_rx.recv().await
                     }
@@ -3973,6 +4471,94 @@ mod tests {
         test_execution_data_at_number(parent_hash, block_hash, 1)
     }
 
+    #[test]
+    fn binary_execution_payload_round_trips_raw_transactions() {
+        let mut execution = test_execution_data(B256::repeat_byte(0x11), B256::repeat_byte(0x22));
+        execution
+            .payload
+            .transactions_mut()
+            .extend([Bytes::from(vec![0xab; 119]), Bytes::from(vec![0xcd; 257])]);
+        let legacy_json = serde_json::to_vec(&execution).expect("serialize legacy JSON payload");
+
+        let encoded = encode_execution_payload(&mut execution).expect("encode binary payload");
+        assert_eq!(encoded.format, "binary-v1");
+        assert!(encoded.bytes.len() < legacy_json.len());
+        assert_eq!(execution.payload.transactions().len(), 2);
+        assert_eq!(encoded.transaction_bytes, 376);
+
+        let decoded = decode_execution_payload(&encoded.bytes).expect("decode binary payload");
+        assert_eq!(
+            serde_json::to_vec(&decoded).expect("serialize decoded payload"),
+            legacy_json
+        );
+    }
+
+    #[test]
+    fn owned_binary_decoder_slices_the_received_allocation() {
+        let mut execution = test_execution_data(B256::repeat_byte(0x23), B256::repeat_byte(0x45));
+        execution
+            .payload
+            .transactions_mut()
+            .extend([Bytes::from(vec![0xab; 119]), Bytes::from(vec![0xcd; 257])]);
+        let encoded = encode_execution_payload(&mut execution).expect("encode binary payload");
+        let allocation_start = encoded.bytes.as_ptr() as usize;
+        let allocation_end = allocation_start + encoded.bytes.len();
+
+        let decoded =
+            decode_execution_payload_owned(encoded.bytes).expect("decode owned binary payload");
+        assert_eq!(
+            decoded.payload.transactions(),
+            execution.payload.transactions()
+        );
+        for transaction in decoded.payload.transactions() {
+            let transaction_start = transaction.as_ptr() as usize;
+            let transaction_end = transaction_start + transaction.len();
+            assert!(transaction_start >= allocation_start);
+            assert!(transaction_end <= allocation_end);
+        }
+    }
+
+    #[test]
+    fn execution_payload_decoder_accepts_legacy_json() {
+        let execution = test_execution_data(B256::repeat_byte(0x33), B256::repeat_byte(0x44));
+        let legacy_json = serde_json::to_vec(&execution).expect("serialize legacy JSON payload");
+
+        let decoded = decode_execution_payload(&legacy_json).expect("decode legacy JSON payload");
+        assert_eq!(decoded.block_hash(), execution.block_hash());
+        assert_eq!(decoded.parent_hash(), execution.parent_hash());
+    }
+
+    #[test]
+    fn binary_execution_payload_rejects_truncation_and_trailing_bytes() {
+        let mut execution = test_execution_data(B256::repeat_byte(0x55), B256::repeat_byte(0x66));
+        execution
+            .payload
+            .transactions_mut()
+            .push(Bytes::from(vec![0xef; 32]));
+        let encoded = encode_execution_payload(&mut execution).expect("encode binary payload");
+
+        assert!(decode_execution_payload(&encoded.bytes[..encoded.bytes.len() - 1]).is_err());
+        let mut trailing = encoded.bytes;
+        trailing.push(0);
+        assert!(decode_execution_payload(&trailing).is_err());
+    }
+
+    #[test]
+    fn staking_target_prefilter_scans_raw_transaction_bytes() {
+        let mut execution = test_execution_data(B256::repeat_byte(0x77), B256::repeat_byte(0x88));
+        execution
+            .payload
+            .transactions_mut()
+            .push(Bytes::from(vec![0; 64]));
+        assert!(!execution_might_contain_staking_target(&execution));
+
+        let mut staking_transaction = vec![0xaa; 7];
+        staking_transaction.extend_from_slice(&STAKING_TARGET_RLP);
+        staking_transaction.extend_from_slice(&[0xbb; 9]);
+        execution.payload.transactions_mut()[0] = Bytes::from(staking_transaction);
+        assert!(execution_might_contain_staking_target(&execution));
+    }
+
     fn test_block_data(parent_hash: B256, block_hash: B256, view: u64) -> Vec<u8> {
         let payload_json = serde_json::to_vec(&test_execution_data(parent_hash, block_hash))
             .expect("serialize test execution data");
@@ -4054,6 +4640,7 @@ mod tests {
             gas_used: 0,
             blob_gas_used: 0,
             senders: Vec::new(),
+            transactions_root: None,
         };
         let execution_json = serde_json::to_vec(&compact).expect("serialize compact execution");
         let execution_output =
@@ -4178,7 +4765,7 @@ mod tests {
         async fn send_block_direct_reliable(
             &self,
             _peer: n42_network::PeerId,
-            _data: Vec<u8>,
+            _data: Arc<Vec<u8>>,
         ) -> Result<(), n42_network::NetworkError> {
             Ok(())
         }
@@ -4637,8 +5224,10 @@ mod tests {
         orch.el = Some(mock_el.clone());
         orch.head_block_hash = previous_head;
         orch.async_finalize_fcu = false;
-        orch.pending_block_data
-            .insert(bad_hash, test_block_data(previous_head, bad_hash, view));
+        orch.pending_block_data.insert(
+            bad_hash,
+            test_block_data(previous_head, bad_hash, view).into(),
+        );
 
         orch.handle_engine_output(EngineOutput::BlockCommitted {
             view,
@@ -4650,6 +5239,7 @@ mod tests {
 
         assert_eq!(orch.committed_block_count, 1, "QC agreement still advances");
         assert_eq!(orch.head_block_hash, previous_head);
+        orch.handle_commit_execution_timeout(view, bad_hash);
 
         let (hash, imported_view, outcome, block_ts) =
             tokio::time::timeout(Duration::from_secs(2), orch.import_done_rx.recv())
@@ -4808,6 +5398,8 @@ mod tests {
             block_hash: waiting_hash,
             commit_qc: QuorumCertificate::genesis(),
             payload: Vec::new(),
+            payload_len: 0,
+            block_data: None,
             validator_changes: None,
             execution_lineage: Vec::new(),
         });
@@ -4870,6 +5462,9 @@ mod tests {
         .await;
 
         assert_eq!(orch.committed_block_count, 1);
+        assert_eq!(orch.head_block_hash, previous_head);
+        orch.handle_eager_import_done(valid_hash, 1, previous_head, 1, false, None)
+            .await;
         assert_eq!(orch.head_block_hash, valid_hash);
         assert_eq!(orch.execution_validated_head_view, 1);
     }
@@ -4884,7 +5479,8 @@ mod tests {
         let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
         orch.head_block_hash = previous_head;
 
-        orch.handle_eager_import_done(eager_hash, 1).await;
+        orch.handle_eager_import_done(eager_hash, 1, previous_head, 1, false, None)
+            .await;
         assert_eq!(
             orch.head_block_hash, previous_head,
             "speculative eager validity must not move head before commit"
@@ -4919,7 +5515,7 @@ mod tests {
         orch.head_block_hash = previous_head;
         orch.async_finalize_fcu = false;
         orch.eager_import_done_tx
-            .send((eager_hash, 1))
+            .send((eager_hash, 1, previous_head, 1, false, None))
             .await
             .expect("queue eager completion");
 
@@ -4959,7 +5555,7 @@ mod tests {
         let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
 
         let block_hash = B256::repeat_byte(0xA5);
-        orch.store_committed_block(15, block_hash, QuorumCertificate::genesis(), None);
+        orch.store_committed_block(15, block_hash, QuorumCertificate::genesis(), None, &[]);
 
         orch.handle_engine_output(EngineOutput::CommittedBlockValidatorChangesRecovered {
             view: 15,
@@ -5176,12 +5772,53 @@ mod tests {
     }
 
     #[test]
+    fn pending_and_recent_block_caches_share_the_same_allocation() {
+        let mut orch = make_test_orchestrator_with_state(None);
+        let parent_hash = B256::repeat_byte(0x31);
+        let block_hash = B256::repeat_byte(0x32);
+        let data = Arc::new(test_block_data(parent_hash, block_hash, 2));
+
+        assert!(orch.cache_pending_block_data(block_hash, Arc::clone(&data), &[block_hash]));
+
+        let pending = Arc::clone(
+            orch.pending_block_data
+                .get(&block_hash)
+                .expect("block is retained for execution"),
+        );
+        let recent = Arc::clone(
+            &orch
+                .recent_block_data
+                .back()
+                .expect("block is retained for lineage")
+                .block_data,
+        );
+        assert!(Arc::ptr_eq(&data, &pending));
+        assert!(Arc::ptr_eq(&pending, &recent));
+
+        let expected_payload = bincode::deserialize::<BlockDataBroadcast>(data.as_slice())
+            .expect("test block data decodes")
+            .payload_json;
+        orch.store_committed_block(2, block_hash, QuorumCertificate::genesis(), None, &[]);
+        let committed = orch.committed_blocks.back().expect("commit ring entry");
+        assert!(
+            committed.payload.is_empty(),
+            "hot path must not copy payload"
+        );
+        assert!(Arc::ptr_eq(
+            &pending,
+            committed.block_data.as_ref().expect("shared envelope")
+        ));
+        assert_eq!(committed.retained_payload(), expected_payload);
+    }
+
+    #[test]
     fn test_cache_pending_block_data_preserves_protected_hash_when_full() {
         let mut orch = make_test_orchestrator_with_state(None);
         let protected_hash = B256::repeat_byte(0x00);
         for byte in 0..super::execution_bridge::MAX_PENDING_BLOCK_DATA {
             let hash = B256::repeat_byte(byte as u8);
-            orch.pending_block_data.insert(hash, vec![byte as u8]);
+            orch.pending_block_data
+                .insert(hash, vec![byte as u8].into());
         }
 
         let incoming_hash = B256::repeat_byte(0xff);
@@ -5205,16 +5842,17 @@ mod tests {
         let mut orch = make_test_orchestrator_with_state(None);
         for byte in 1..=super::execution_bridge::MAX_PENDING_BLOCK_DATA {
             let hash = B256::repeat_byte(byte as u8);
-            orch.pending_block_data.insert(hash, vec![byte as u8]);
+            orch.pending_block_data
+                .insert(hash, vec![byte as u8].into());
         }
 
         let finalizing_hash = B256::repeat_byte(0x00);
         let later_hash = B256::repeat_byte(0xff);
         orch.leader_payload_tx
-            .try_send((finalizing_hash, b"target".to_vec()))
+            .try_send((finalizing_hash, b"target".to_vec().into()))
             .expect("leader payload channel should accept target");
         orch.leader_payload_tx
-            .try_send((later_hash, b"later".to_vec()))
+            .try_send((later_hash, b"later".to_vec().into()))
             .expect("leader payload channel should accept later payload");
 
         orch.drain_leader_payload_rx(&[finalizing_hash]);
@@ -5222,7 +5860,7 @@ mod tests {
         assert_eq!(
             orch.pending_block_data
                 .get(&finalizing_hash)
-                .map(Vec::as_slice),
+                .map(|data| data.as_slice()),
             Some(&b"target"[..])
         );
         assert_eq!(
@@ -5251,16 +5889,21 @@ mod tests {
             block_hash,
             commit_qc: QuorumCertificate::genesis(),
             payload: Vec::new(),
+            payload_len: 0,
+            block_data: None,
             validator_changes: None,
             execution_lineage: Vec::new(),
         });
         orch.leader_payload_tx
-            .try_send((block_hash, data))
+            .try_send((block_hash, data.into()))
             .expect("leader payload channel should accept block");
 
         orch.drain_leader_payload_rx(&[block_hash]);
 
-        assert_eq!(orch.committed_blocks[0].payload, expected_payload);
+        assert_eq!(
+            orch.committed_blocks[0].retained_payload(),
+            expected_payload
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -5322,6 +5965,67 @@ mod tests {
             state.load_committed_qc().is_some(),
             "should have QC after commit"
         );
+    }
+
+    #[tokio::test]
+    async fn committed_waits_for_execution_ready_before_finalized_fcu() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let mock_el = Arc::new(MockExecutionLayer::new(
+            PayloadStatusEnum::Valid,
+            PayloadStatusEnum::Valid,
+        ));
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
+        orch.el = Some(mock_el.clone());
+        orch.async_finalize_fcu = false;
+        let block_hash = B256::repeat_byte(0xc1);
+
+        orch.handle_block_committed(1, block_hash, test_commit_qc(1, block_hash), None)
+            .await;
+
+        assert!(mock_el.fcu_heads().is_empty());
+        assert_eq!(
+            orch.async_commit_states.get(&1).map(|state| state.stage),
+            Some(AsyncCommitStage::Committed)
+        );
+
+        orch.handle_eager_import_done(block_hash, 1, B256::ZERO, 1, false, None)
+            .await;
+
+        assert_eq!(mock_el.fcu_heads(), vec![block_hash]);
+        assert_eq!(
+            orch.async_commit_states.get(&1).map(|state| state.stage),
+            Some(AsyncCommitStage::Finalized)
+        );
+    }
+
+    #[tokio::test]
+    async fn execution_ready_children_finalize_in_commit_order() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let mock_el = Arc::new(MockExecutionLayer::new(
+            PayloadStatusEnum::Valid,
+            PayloadStatusEnum::Valid,
+        ));
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
+        orch.el = Some(mock_el.clone());
+        orch.async_finalize_fcu = false;
+        let first = B256::repeat_byte(0xd1);
+        let second = B256::repeat_byte(0xd2);
+        orch.handle_block_committed(1, first, test_commit_qc(1, first), None)
+            .await;
+        orch.handle_block_committed(2, second, test_commit_qc(2, second), None)
+            .await;
+
+        orch.handle_eager_import_done(second, 2, first, 2, false, None)
+            .await;
+        assert!(mock_el.fcu_heads().is_empty());
+
+        orch.handle_eager_import_done(first, 1, B256::ZERO, 1, false, None)
+            .await;
+        assert_eq!(mock_el.fcu_heads(), vec![first, second]);
     }
 
     #[tokio::test]
@@ -5481,7 +6185,8 @@ mod tests {
         orch.h2_v4_fetch_requested_at
             .insert(block_hash, (Instant::now(), peer));
 
-        orch.handle_eager_import_done(block_hash, 1).await;
+        orch.handle_eager_import_done(block_hash, 1, B256::ZERO, 1, false, None)
+            .await;
 
         assert!(!orch.h2_v4_fetch_requested_at.contains_key(&block_hash));
         assert!(matches!(
@@ -5501,7 +6206,8 @@ mod tests {
         let block_hash = B256::repeat_byte(0xa7);
 
         assert!(!orch.h2_v4_fetch_requested_at.contains_key(&block_hash));
-        orch.handle_eager_import_done(block_hash, 1).await;
+        orch.handle_eager_import_done(block_hash, 1, B256::ZERO, 1, false, None)
+            .await;
 
         assert!(matches!(
             prx.try_recv().expect("shared fetch cancellation command"),
@@ -5520,7 +6226,8 @@ mod tests {
         let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
         let block_hash = B256::repeat_byte(0xa9);
 
-        orch.handle_eager_import_done(block_hash, 1).await;
+        orch.handle_eager_import_done(block_hash, 1, B256::ZERO, 1, false, None)
+            .await;
 
         assert!(prx.try_recv().is_err());
     }
@@ -5535,7 +6242,8 @@ mod tests {
         let block_hash = B256::repeat_byte(0xa8);
         let peer = libp2p::PeerId::random();
 
-        orch.handle_eager_import_done(block_hash, 1).await;
+        orch.handle_eager_import_done(block_hash, 1, B256::ZERO, 1, false, None)
+            .await;
         assert!(matches!(
             prx.try_recv().expect("body delivery cancellation command"),
             NetworkCommand::CancelGov5BlockFetch { block_hash: hash }
@@ -6228,7 +6936,7 @@ mod tests {
         orch.head_block_hash = previous_head;
         orch.async_finalize_fcu = false;
         orch.pending_block_data
-            .insert(bad_hash, test_block_data(previous_head, bad_hash, 1));
+            .insert(bad_hash, test_block_data(previous_head, bad_hash, 1).into());
         // The broadcast fixture carries no execution output, so stage the diff
         // directly - the staging/flush timing is what this test pins down.
         orch.pending_sidecar_diffs.insert(
@@ -6243,6 +6951,7 @@ mod tests {
             validator_changes: None,
         })
         .await;
+        orch.handle_commit_execution_timeout(1, bad_hash);
         let (hash, view, outcome, ts) =
             tokio::time::timeout(Duration::from_secs(2), orch.import_done_rx.recv())
                 .await
@@ -6346,6 +7055,26 @@ mod tests {
         );
         assert!(orch.missing_sidecar_diffs.is_empty());
         assert!(orch.pending_sidecar_diffs.is_empty());
+    }
+
+    #[test]
+    fn asynchronous_state_diff_completion_closes_committed_gap() {
+        use n42_execution::state_diff::StateDiff;
+
+        let mut orch = make_test_orchestrator_with_state(None);
+        let parent = B256::repeat_byte(0x41);
+        let block_hash = B256::repeat_byte(0x42);
+        let data = test_block_data(parent, block_hash, 7);
+        assert!(orch.cache_pending_block_data(block_hash, data, &[block_hash]));
+        orch.missing_sidecar_diffs.insert(7, block_hash);
+
+        orch.handle_state_diff_ready(block_hash, StateDiff::default());
+
+        assert!(!orch.missing_sidecar_diffs.contains_key(&7));
+        assert_eq!(
+            orch.pending_sidecar_diffs.get(&7).map(|entry| entry.0),
+            Some(block_hash)
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -6497,8 +7226,8 @@ mod tests {
         ));
         let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
         orch.el = Some(mock_el.clone());
-        orch.pending_block_data.insert(committed_hash, raw);
-        orch.store_committed_block(3, committed_hash, QuorumCertificate::genesis(), None);
+        orch.pending_block_data.insert(committed_hash, raw.into());
+        orch.store_committed_block(3, committed_hash, QuorumCertificate::genesis(), None, &[]);
         orch.defer_finalization(3, committed_hash, QuorumCertificate::genesis());
         orch.pending_block_data.clear(); // the eviction that used to force a sync
 
@@ -7008,6 +7737,8 @@ mod tests {
             block_hash: waiting,
             commit_qc: QuorumCertificate::genesis(),
             payload: Vec::new(),
+            payload_len: 0,
+            block_data: None,
             validator_changes: None,
             execution_lineage: Vec::new(),
         });
@@ -7054,6 +7785,8 @@ mod tests {
             block_hash: waiting,
             commit_qc: QuorumCertificate::genesis(),
             payload: Vec::new(),
+            payload_len: 0,
+            block_data: None,
             validator_changes: None,
             execution_lineage: Vec::new(),
         });
@@ -7339,7 +8072,7 @@ mod tests {
         orch.async_finalize_fcu = false;
         orch.pending_block_data.insert(
             honest_hash,
-            test_block_data_with_empty_execution(parent, honest_hash, 1),
+            test_block_data_with_empty_execution(parent, honest_hash, 1).into(),
         );
 
         orch.handle_engine_output(EngineOutput::BlockCommitted {
@@ -7349,6 +8082,7 @@ mod tests {
             validator_changes: None,
         })
         .await;
+        orch.handle_commit_execution_timeout(1, honest_hash);
         let (hash, view, outcome, _) =
             tokio::time::timeout(Duration::from_secs(2), orch.import_done_rx.recv())
                 .await
@@ -7478,7 +8212,7 @@ mod tests {
         orch.head_block_hash = head;
         orch.execution_validated_head_view = 1;
         orch.eager_import_done_tx
-            .send((block, 0))
+            .send((block, 0, head, 2, false, None))
             .await
             .expect("eager completion channel remains open");
 
@@ -7550,7 +8284,7 @@ mod tests {
 
         // Its eager import still completed and is waiting on the channel.
         orch.eager_import_done_tx
-            .send((committed_hash, 1))
+            .send((committed_hash, 1, previous_head, 1, false, None))
             .await
             .expect("queue eager completion");
 

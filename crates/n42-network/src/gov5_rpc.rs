@@ -1,6 +1,6 @@
 use alloy_primitives::B256;
 use futures::prelude::*;
-use libp2p::{request_response, StreamProtocol};
+use libp2p::{StreamProtocol, request_response};
 use snap::read::FrameDecoder;
 use snap::write::FrameEncoder;
 use std::io::{self, Read, Write};

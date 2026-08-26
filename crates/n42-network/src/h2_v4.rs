@@ -283,7 +283,10 @@ mod tests {
         let fixture: EnvelopeFixture =
             serde_json::from_str(include_str!("../testdata/h2_v4_envelope_v1.json")).unwrap();
         let valid = hex::decode(fixture.envelope_hex).unwrap();
-        assert!(decode_envelope(&valid, identity).is_ok(), "baseline decodes");
+        assert!(
+            decode_envelope(&valid, identity).is_ok(),
+            "baseline decodes"
+        );
 
         // 1. Chain identity mismatch — a message from another chain replayed here.
         let foreign = H2V4ChainIdentity {

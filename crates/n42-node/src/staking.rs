@@ -20,6 +20,18 @@ pub const UNSTAKE_COOLDOWN_BLOCKS: u64 = 21600;
 /// Function selector for `unstake()`: first 4 bytes of keccak256("unstake()").
 const UNSTAKE_SELECTOR: [u8; 4] = [0x2d, 0xef, 0x66, 0x20];
 
+// Every supported Ethereum transaction envelope RLP-encodes a 20-byte call target as
+// `0x94 || address`. Execution payload JSON carries the raw envelope as lowercase hex, so this
+// marker is a cheap, exact prefilter before parsing a multi-megabyte payload and decoding every
+// transaction. A staking transaction cannot be present when this marker is absent.
+const STAKING_TARGET_RLP_HEX: &[u8] = b"940000000000000000000000000000000000000042";
+
+fn payload_might_contain_staking_transaction(payload_json: &[u8]) -> bool {
+    payload_json
+        .windows(STAKING_TARGET_RLP_HEX.len())
+        .any(|window| window == STAKING_TARGET_RLP_HEX)
+}
+
 /// Status of a stake entry.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub enum StakeStatus {
@@ -201,6 +213,15 @@ impl StakingManager {
     /// Scans a committed block's execution payload for staking/unstaking transactions.
     pub fn scan_committed_block(&mut self, block_number: u64, payload_json: &[u8]) {
         self.last_scanned_block = block_number;
+
+        if !payload_might_contain_staking_transaction(payload_json) {
+            debug!(
+                target: "n42::staking",
+                block = block_number,
+                "staking scan skipped: payload has no staking target"
+            );
+            return;
+        }
 
         let parsed: serde_json::Value = match serde_json::from_slice(payload_json) {
             Ok(v) => v,
@@ -754,6 +775,16 @@ mod tests {
     #[test]
     fn test_min_stake_constant() {
         assert_eq!(MIN_STAKE_WEI, ether(32));
+    }
+
+    #[test]
+    fn staking_payload_prefilter_requires_rlp_call_target_marker() {
+        assert!(!payload_might_contain_staking_transaction(
+            br#"{"transactions":["0x940000000000000000000000000000000000000041"]}"#
+        ));
+        assert!(payload_might_contain_staking_transaction(
+            br#"{"transactions":["0x02f8940000000000000000000000000000000000000042"]}"#
+        ));
     }
 
     #[test]
