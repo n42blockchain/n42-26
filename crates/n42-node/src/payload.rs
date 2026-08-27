@@ -1,4 +1,5 @@
 use crate::consensus_state::SharedConsensusState;
+use n42_execution::ExecutionPath;
 use rayon::prelude::*;
 use reth_basic_payload_builder::{
     BuildArguments, BuildOutcome, MissingPayloadBehaviour, PayloadBuilder, PayloadConfig,
@@ -483,6 +484,26 @@ where
         );
 
         let elapsed_ms = build_start.elapsed().as_millis() as u64;
+        let outcome = match &result {
+            Ok(BuildOutcome::Better { .. }) => "better",
+            Ok(BuildOutcome::Aborted { .. }) => "aborted",
+            Ok(BuildOutcome::Cancelled) => "cancelled",
+            Ok(BuildOutcome::Freeze(_)) => "freeze",
+            Err(_) => "error",
+        };
+        metrics::histogram!(
+            "n42_evm_path_duration_ms",
+            "path" => ExecutionPath::LIVE_SEQUENTIAL.label(),
+            "phase" => "payload_build",
+        )
+        .record(build_start.elapsed().as_secs_f64() * 1_000.0);
+        metrics::counter!(
+            "n42_evm_path_calls_total",
+            "path" => ExecutionPath::LIVE_SEQUENTIAL.label(),
+            "phase" => "payload_build",
+            "outcome" => outcome,
+        )
+        .increment(1);
         match &result {
             Ok(BuildOutcome::Better { payload, .. }) => {
                 let tx_count = payload.block().body().transactions().count();

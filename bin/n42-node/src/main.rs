@@ -15,6 +15,7 @@ use n42_chainspec::{ConsensusConfig, ValidatorInfo};
 use n42_consensus::{
     ConsensusEngine, EpochManager, N42HeaderProfile, ValidatorSet, ValidatorSetResolver,
 };
+use n42_consensus_service::el::ExecutionPath;
 use n42_consensus_service::{
     ReplayExecutionPlan, bootstrap::Gov5BootstrapBundle, build_replay_execution_plan_with_profile,
 };
@@ -419,13 +420,31 @@ fn ensure_finalized_range_matches_qmdb(
     Ok(())
 }
 
+fn historical_replay_fcu_interval() -> usize {
+    // Four matches Reth's default maximum downloaded-block execution batch.
+    // Keep an explicit upper bound so an operator cannot accidentally turn a
+    // sequential canonical replay into an unbounded in-memory side chain.
+    env_parse::<usize>("N42_GOV5_REPLAY_FCU_INTERVAL")
+        .unwrap_or(4)
+        .clamp(1, 16)
+}
+
+fn historical_replay_checkpoint_due(position: usize, total: usize, interval: usize) -> bool {
+    debug_assert!(position > 0 && position <= total && interval > 0);
+    position.is_multiple_of(interval) || position == total
+}
+
 async fn import_authenticated_replay_plan(
     execution: &dyn n42_node::el::ExecutionLayer,
     plan: &ReplayExecutionPlan,
 ) -> eyre::Result<B256> {
     let verification = plan.verification();
+    let replay_started = std::time::Instant::now();
+    let fcu_interval = historical_replay_fcu_interval();
+    let payload_count = plan.payloads().len();
+    let mut finalized_batches = 0u64;
     let mut imported_head = verification.first_parent_hash;
-    for payload in plan.payloads() {
+    for (index, payload) in plan.payloads().iter().enumerate() {
         let block_number = payload.block_number();
         let block_hash = payload.block_hash();
         if payload.parent_hash() != imported_head {
@@ -434,7 +453,7 @@ async fn import_authenticated_replay_plan(
             ));
         }
         let status = execution
-            .new_payload(payload.clone())
+            .new_payload_for(ExecutionPath::HISTORICAL_SEQUENTIAL, payload.clone())
             .await
             .map_err(|error| {
                 eyre::eyre!(
@@ -450,34 +469,49 @@ async fn import_authenticated_replay_plan(
                 status.latest_valid_hash
             ));
         }
-        let forkchoice = execution
-            .fork_choice_updated(ForkchoiceState {
-                head_block_hash: block_hash,
-                safe_block_hash: block_hash,
-                finalized_block_hash: block_hash,
-            })
-            .await
-            .map_err(|error| {
-                eyre::eyre!(
-                    "fork_choice_updated failed for replay block {block_number}/{block_hash}: {error}"
-                )
-            })?;
-        if !matches!(forkchoice.payload_status.status, PayloadStatusEnum::Valid)
-            || forkchoice.payload_status.latest_valid_hash != Some(block_hash)
-        {
-            return Err(eyre::eyre!(
-                "replay forkchoice did not finalize block {block_number}/{block_hash}: status={:?} latest_valid_hash={:?}",
-                forkchoice.payload_status.status,
-                forkchoice.payload_status.latest_valid_hash
-            ));
-        }
         imported_head = block_hash;
-        info!(
-            target: "n42::cli",
-            block = block_number,
-            %block_hash,
-            "imported authenticated gov5 replay-v2 block"
-        );
+
+        // Historical canonical replay is ordered, but it does not need one
+        // Engine FCU per block. Stage a small, bounded chain in the engine tree
+        // and publish it in deterministic checkpoints. This is intentionally
+        // separate from the fully parallel, read-only `../pevm` replay path and
+        // from live consensus finalization. The final partial batch is always
+        // published, limiting restart rework to at most `fcu_interval - 1`.
+        let batch_end = historical_replay_checkpoint_due(index + 1, payload_count, fcu_interval);
+        if batch_end {
+            let forkchoice = execution
+                .fork_choice_updated_for(
+                    ExecutionPath::HISTORICAL_SEQUENTIAL,
+                    ForkchoiceState {
+                        head_block_hash: block_hash,
+                        safe_block_hash: block_hash,
+                        finalized_block_hash: block_hash,
+                    },
+                )
+                .await
+                .map_err(|error| {
+                    eyre::eyre!(
+                        "fork_choice_updated failed for replay checkpoint {block_number}/{block_hash}: {error}"
+                    )
+                })?;
+            if !matches!(forkchoice.payload_status.status, PayloadStatusEnum::Valid)
+                || forkchoice.payload_status.latest_valid_hash != Some(block_hash)
+            {
+                return Err(eyre::eyre!(
+                    "replay forkchoice did not finalize checkpoint {block_number}/{block_hash}: status={:?} latest_valid_hash={:?}",
+                    forkchoice.payload_status.status,
+                    forkchoice.payload_status.latest_valid_hash
+                ));
+            }
+            finalized_batches += 1;
+            info!(
+                target: "n42::cli",
+                block = block_number,
+                %block_hash,
+                fcu_interval,
+                "finalized authenticated gov5 sequential replay checkpoint"
+            );
+        }
     }
     if imported_head != verification.last_block_hash {
         return Err(eyre::eyre!(
@@ -485,6 +519,26 @@ async fn import_authenticated_replay_plan(
             verification.last_block_hash
         ));
     }
+    let elapsed = replay_started.elapsed();
+    metrics::histogram!(
+        "n42_evm_path_duration_ms",
+        "path" => ExecutionPath::HISTORICAL_SEQUENTIAL.label(),
+        "phase" => "complete_replay",
+    )
+    .record(elapsed.as_secs_f64() * 1_000.0);
+    metrics::counter!("n42_historical_sequential_replay_blocks_total")
+        .increment(payload_count as u64);
+    metrics::counter!("n42_historical_sequential_replay_fcu_batches_total")
+        .increment(finalized_batches);
+    info!(
+        target: "n42::cli",
+        blocks = payload_count,
+        finalized_batches,
+        fcu_interval,
+        elapsed_ms = elapsed.as_millis() as u64,
+        blocks_per_second = payload_count as f64 / elapsed.as_secs_f64().max(f64::EPSILON),
+        "authenticated gov5 sequential historical replay completed"
+    );
     Ok(imported_head)
 }
 
@@ -2924,6 +2978,16 @@ mod observer_identity_tests {
     #[test]
     fn vote_log_watermarks_do_not_manufacture_a_restart_view_transition() {
         assert_eq!(restart_entry_view(1000, 1001, 1002), 1000);
+    }
+
+    #[test]
+    fn sequential_historical_replay_checkpoints_each_full_and_final_partial_batch() {
+        let checkpoints = (1..=10)
+            .filter(|position| historical_replay_checkpoint_due(*position, 10, 4))
+            .collect::<Vec<_>>();
+        assert_eq!(checkpoints, vec![4, 8, 10]);
+
+        assert!((1..=3).all(|position| { historical_replay_checkpoint_due(position, 3, 1) }));
     }
 
     fn qmdb_portable_fixture() -> tempfile::NamedTempFile {

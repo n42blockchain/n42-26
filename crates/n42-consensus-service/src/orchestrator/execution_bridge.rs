@@ -1,6 +1,6 @@
 use super::{BlobSidecarBroadcast, BlockDataBroadcast, ConsensusService, EagerImportDone};
 use crate::blob_port::BlobStorePort;
-use crate::el::{BuiltBlock, ExecutionLayer, ResolveKind};
+use crate::el::{BuiltBlock, ExecutionLayer, ExecutionPath, ResolveKind};
 use crate::exec_cache::ExecutionOutputCache;
 use crate::ingest::note_virtual_block_credit;
 use crate::net_port::ConsensusNetwork;
@@ -266,7 +266,11 @@ impl ConsensusService {
             let used_ts = try_attrs.timestamp;
 
             match el
-                .fork_choice_updated_with_attrs(fcu_state, try_attrs)
+                .fork_choice_updated_with_attrs_for(
+                    ExecutionPath::LIVE_SEQUENTIAL,
+                    fcu_state,
+                    try_attrs,
+                )
                 .await
             {
                 Ok(result) => {
@@ -674,7 +678,10 @@ impl ConsensusService {
                 // the canonical chain — speculative blocks may not match what consensus
                 // ultimately commits, and premature FCU causes reorgs that stall the chain.
                 let import_start = std::time::Instant::now();
-                match eh.new_payload(execution_data).await {
+                match eh
+                    .new_payload_for(ExecutionPath::LIVE_SEQUENTIAL, execution_data)
+                    .await
+                {
                     // Only `Valid` marks the block eager-validated. `Accepted`
                     // (stored, not executed) must fall through to the stale arm
                     // so a later commit never promotes an unexecuted block (F3).
@@ -905,7 +912,10 @@ impl ConsensusService {
             false
         };
 
-        match engine_handle.new_payload(execution_data).await {
+        match engine_handle
+            .new_payload_for(ExecutionPath::HISTORICAL_SEQUENTIAL, execution_data)
+            .await
+        {
             Ok(status) => {
                 if matches!(status.status, PayloadStatusEnum::Valid) {
                     self.handle_valid_import(&broadcast, &engine_handle, &status)
@@ -1004,7 +1014,10 @@ impl ConsensusService {
             safe_block_hash: broadcast.block_hash,
             finalized_block_hash: broadcast.block_hash,
         };
-        match engine_handle.fork_choice_updated(fcu_state).await {
+        match engine_handle
+            .fork_choice_updated_for(ExecutionPath::HISTORICAL_SEQUENTIAL, fcu_state)
+            .await
+        {
             Ok(result) if matches!(result.payload_status.status, PayloadStatusEnum::Valid) => {}
             Ok(result)
                 if matches!(
@@ -1180,7 +1193,10 @@ impl ConsensusService {
                 false
             };
 
-            match engine_handle.new_payload(retry_exec).await {
+            match engine_handle
+                .new_payload_for(ExecutionPath::HISTORICAL_SEQUENTIAL, retry_exec)
+                .await
+            {
                 Ok(rs) if matches!(rs.status, PayloadStatusEnum::Valid) => {
                     if self.import_would_regress_head(retry_broadcast.view, retry_hash) {
                         debug!(
@@ -1199,7 +1215,10 @@ impl ConsensusService {
                         safe_block_hash: retry_hash,
                         finalized_block_hash: retry_hash,
                     };
-                    match engine_handle.fork_choice_updated(fcu).await {
+                    match engine_handle
+                        .fork_choice_updated_for(ExecutionPath::HISTORICAL_SEQUENTIAL, fcu)
+                        .await
+                    {
                         Ok(result)
                             if matches!(result.payload_status.status, PayloadStatusEnum::Valid) =>
                         {
@@ -1399,7 +1418,10 @@ async fn handle_built_payload(
     }
     if h2_v4_participant {
         let import_start = std::time::Instant::now();
-        match el.new_payload(execution_data.clone()).await {
+        match el
+            .new_payload_for(ExecutionPath::LIVE_SEQUENTIAL, execution_data.clone())
+            .await
+        {
             Ok(status) if matches!(status.status, PayloadStatusEnum::Valid) => {
                 mark_eager_import_valid(block_guard.as_ref(), block_number);
                 info!(
@@ -1624,7 +1646,10 @@ async fn handle_built_payload(
     // can accept it instantly. We skip FCU to avoid changing canonical chain —
     // only finalize_committed_block (after consensus commit) should do FCU.
     let import_start = std::time::Instant::now();
-    match el.new_payload(execution_data).await {
+    match el
+        .new_payload_for(ExecutionPath::LIVE_SEQUENTIAL, execution_data)
+        .await
+    {
         // Only `Valid` marks the block eager-validated. `Accepted` (stored, not
         // executed) falls through to the stale arm so a later commit never
         // promotes an unexecuted block (F3).

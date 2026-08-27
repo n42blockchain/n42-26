@@ -1,6 +1,6 @@
 use super::{AsyncCommitStage, AsyncCommitState, ConsensusService, ImportOutcome};
 use super::{LeaderBuildWaitMode, state_mgmt::max_consecutive_empty_skips};
-use crate::el::ExecutionLayer;
+use crate::el::{ExecutionLayer, ExecutionPath};
 use crate::exec_cache::ExecutionOutputCache;
 use crate::expected_validator_peer_ids_with_policy;
 use alloy_primitives::B256;
@@ -1039,7 +1039,10 @@ impl ConsensusService {
             let done_tx = self.finalize_done_tx.clone();
             tokio::spawn(async move {
                 let fcu_start = std::time::Instant::now();
-                let finalized = match engine_handle.fork_choice_updated(fcu_state).await {
+                let finalized = match engine_handle
+                    .fork_choice_updated_for(ExecutionPath::LIVE_SEQUENTIAL, fcu_state)
+                    .await
+                {
                     Ok(result) => {
                         let elapsed_ms = fcu_start.elapsed().as_millis() as u64;
                         let outcome = match result.payload_status.status {
@@ -1081,7 +1084,10 @@ impl ConsensusService {
         }
 
         let fcu_start = std::time::Instant::now();
-        let finalized = match engine_handle.fork_choice_updated(fcu_state).await {
+        let finalized = match engine_handle
+            .fork_choice_updated_for(ExecutionPath::LIVE_SEQUENTIAL, fcu_state)
+            .await
+        {
             Ok(result) => {
                 let elapsed_ms = fcu_start.elapsed().as_millis() as u64;
                 histogram!("n42_fcu_latency_ms", "attempt" => "first").record(elapsed_ms as f64);
@@ -1140,7 +1146,10 @@ impl ConsensusService {
                     finalized_block_hash: block_hash,
                 };
                 let retry_start = std::time::Instant::now();
-                match engine_handle.fork_choice_updated(retry_fcu).await {
+                match engine_handle
+                    .fork_choice_updated_for(ExecutionPath::LIVE_SEQUENTIAL, retry_fcu)
+                    .await
+                {
                     Ok(result) => {
                         let retry_ms = retry_start.elapsed().as_millis() as u64;
                         histogram!("n42_fcu_latency_ms", "attempt" => "retry")
@@ -1365,14 +1374,20 @@ impl ConsensusService {
             false
         };
 
-        match engine_handle.new_payload(execution_data).await {
+        match engine_handle
+            .new_payload_for(ExecutionPath::LIVE_SEQUENTIAL, execution_data)
+            .await
+        {
             Ok(status) if matches!(status.status, PayloadStatusEnum::Valid) => {
                 let fcu = ForkchoiceState {
                     head_block_hash: block_hash,
                     safe_block_hash: block_hash,
                     finalized_block_hash: block_hash,
                 };
-                match engine_handle.fork_choice_updated(fcu).await {
+                match engine_handle
+                    .fork_choice_updated_for(ExecutionPath::LIVE_SEQUENTIAL, fcu)
+                    .await
+                {
                     Ok(result)
                         if matches!(result.payload_status.status, PayloadStatusEnum::Valid) =>
                     {

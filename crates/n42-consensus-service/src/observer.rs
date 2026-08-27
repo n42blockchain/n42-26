@@ -1,5 +1,5 @@
 use crate::blob_port::BlobStorePort;
-use crate::el::ExecutionLayer;
+use crate::el::{ExecutionLayer, ExecutionPath};
 use crate::epoch_schedule::EpochSchedule;
 use crate::exec_cache::ExecutionOutputCache;
 use crate::h2_finality::{verify_h2_v4_decide, verify_h2_v4_shadow_message};
@@ -985,7 +985,11 @@ impl ObserverOrchestrator {
                 {
                     return;
                 }
-                match self.el.new_payload(block.execution_data).await {
+                match self
+                    .el
+                    .new_payload_for(ExecutionPath::HISTORICAL_SEQUENTIAL, block.execution_data)
+                    .await
+                {
                     Ok(status) if matches!(status.status, PayloadStatusEnum::Valid) => {
                         counter!("n42_gov5_live_blocks_executed_total").increment(1);
                     }
@@ -1019,7 +1023,11 @@ impl ObserverOrchestrator {
                 safe_block_hash: entry.hash,
                 finalized_block_hash: entry.hash,
             };
-            match self.el.fork_choice_updated(state).await {
+            match self
+                .el
+                .fork_choice_updated_for(ExecutionPath::HISTORICAL_SEQUENTIAL, state)
+                .await
+            {
                 Ok(result) if matches!(result.payload_status.status, PayloadStatusEnum::Valid) => {}
                 Ok(result) => {
                     warn!(target: "n42::observer", hash = %entry.hash, status = ?result.payload_status.status, "EL did not promote authenticated gov5 catch-up block");
@@ -1082,7 +1090,11 @@ impl ObserverOrchestrator {
             else {
                 continue;
             };
-            match self.el.new_payload(payload).await {
+            match self
+                .el
+                .new_payload_for(ExecutionPath::LIVE_SEQUENTIAL, payload)
+                .await
+            {
                 Ok(status) if matches!(status.status, PayloadStatusEnum::Valid) => {
                     if let Some(block) = self.gov5_live_blocks.get_mut(&hash) {
                         block.executed = true;
@@ -1139,7 +1151,11 @@ impl ObserverOrchestrator {
                 safe_block_hash: hash,
                 finalized_block_hash: hash,
             };
-            let promoted = match self.el.fork_choice_updated(state).await {
+            let promoted = match self
+                .el
+                .fork_choice_updated_for(ExecutionPath::LIVE_SEQUENTIAL, state)
+                .await
+            {
                 Ok(result) => matches!(result.payload_status.status, PayloadStatusEnum::Valid),
                 Err(error) => {
                     error!(target: "n42::observer", %hash, %error, "fork_choice_updated failed for finalized gov5 live block");
@@ -1246,7 +1262,11 @@ impl ObserverOrchestrator {
             false
         };
 
-        match self.el.new_payload(execution_data).await {
+        match self
+            .el
+            .new_payload_for(ExecutionPath::LIVE_SEQUENTIAL, execution_data)
+            .await
+        {
             Ok(status) => {
                 if matches!(status.status, PayloadStatusEnum::Valid) {
                     if !has_commit_proof {
@@ -1264,7 +1284,11 @@ impl ObserverOrchestrator {
                         safe_block_hash: hash,
                         finalized_block_hash: hash,
                     };
-                    let fcu_valid = match self.el.fork_choice_updated(fcu_state).await {
+                    let fcu_valid = match self
+                        .el
+                        .fork_choice_updated_for(ExecutionPath::LIVE_SEQUENTIAL, fcu_state)
+                        .await
+                    {
                         Ok(result) => {
                             let valid =
                                 matches!(result.payload_status.status, PayloadStatusEnum::Valid);

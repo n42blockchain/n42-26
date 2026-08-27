@@ -7,7 +7,7 @@ mod view_jump_throttle;
 
 use crate::blob_port::BlobStorePort;
 use crate::consensus_state::{PoolDepthSnapshot, SharedConsensusState};
-use crate::el::ExecutionLayer;
+use crate::el::{ExecutionLayer, ExecutionPath};
 use crate::epoch_schedule::EpochSchedule;
 use crate::exec_cache::ExecutionOutputCache;
 use crate::net_port::ConsensusNetwork;
@@ -1480,7 +1480,10 @@ impl ConsensusService {
             }
         };
 
-        match el.new_payload(execution_data).await {
+        match el
+            .new_payload_for(ExecutionPath::HISTORICAL_SEQUENTIAL, execution_data)
+            .await
+        {
             Ok(status) if matches!(status.status, PayloadStatusEnum::Valid) => {
                 info!(target: "n42::interop::h2v4", %block_hash, block_number, view, "authenticated Gov5 catch-up parent reached new_payload(Valid)");
             }
@@ -1512,7 +1515,10 @@ impl ConsensusService {
             safe_block_hash: block_hash,
             finalized_block_hash: block_hash,
         };
-        match el.fork_choice_updated(forkchoice).await {
+        match el
+            .fork_choice_updated_for(ExecutionPath::HISTORICAL_SEQUENTIAL, forkchoice)
+            .await
+        {
             Ok(result) if matches!(result.payload_status.status, PayloadStatusEnum::Valid) => {
                 self.last_committed_timestamp = self.last_committed_timestamp.max(block_timestamp);
                 self.advance_execution_validated_head(

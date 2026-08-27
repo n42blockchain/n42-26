@@ -162,6 +162,45 @@ Interpretation:
 - Use this row as an execution CPU control when comparing compressed-transfer
   experiments against the normal Ethereum/reth path.
 
+### Execution-path separation
+
+N42 reports EVM work on two independent axes: workload (`historical` or
+`live`) and scheduling strategy (`sequential` or `pevm`). Do not compare the
+three active controls as if they were the same pipeline:
+
+| Metric path | What it executes | Canonical writes | Parallelism | Valid comparison |
+| --- | --- | --- | --- | --- |
+| `historical_pevm` | Independent historical blocks in the sibling `../pevm` research harness, optionally from immutable mmap state-read logs | None | Blocks are distributed across workers; each has an independently addressable historical pre-state | PEVM/replay CPU and state-read throughput only |
+| `historical_sequential` | Authenticated Gov5 replay/catch-up through Reth `new_payload` in parent order | Yes, through bounded FCU checkpoints | Sequential canonical execution; FCU is batched separately | Startup/catch-up wall time, persistence and state-root cost |
+| `live_sequential` | Leader payload build, follower eager import, and commit-time FCU | Yes, consensus-gated | Reth's sequential revm executor today; sender-sharded tx selection is not parallel EVM | Production TPS and 163ms cadence |
+
+`live_pevm` is reserved in the code but is rejected by the current Engine API
+adapter. Enabling or tuning historical PEVM therefore cannot silently change
+live consensus execution. Live PEVM requires a standard
+`BlockExecutionOutput`/receipt/state-root adapter and sequential differential
+qualification before it may write canonical state.
+
+Gov5 uses the same comparison boundary, but additionally has a block-parallel
+witness replay mode that is neither live nor intra-block PEVM. The code-grounded
+handoff and deferred qualification list are in
+[`gov5-execution-path-handoff.md`](./gov5-execution-path-handoff.md).
+
+The canonical historical replay publishes one FCU per four validated blocks by
+default, matching Reth's small bounded execution batch instead of paying one
+FCU per block. Set `N42_GOV5_REPLAY_FCU_INTERVAL=1` for the old behavior; values
+are bounded to `1..=16`. The final partial batch is always finalized.
+
+Common metrics:
+
+- `n42_evm_path_duration_ms{path,phase}` and
+  `n42_evm_path_calls_total{path,phase,outcome}` separate live from canonical
+  historical work;
+- `n42_qmdb_lock_wait_ms`, `n42_qmdb_lock_hold_ms`,
+  `n42_qmdb_candidate_compute_ms`, and `n42_qmdb_wal_append_ms` distinguish
+  state calculation from serialization and durable publication;
+- the external PEVM harness continues to report its own `TPS` and
+  `Ggas_per_s`; it does not emit node canonical-path metrics.
+
 ### Local PEVM Replay Harness
 
 This repository is accompanied by a local sibling PEVM replay harness at

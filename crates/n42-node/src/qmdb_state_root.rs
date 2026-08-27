@@ -284,14 +284,25 @@ impl Gov5QmdbStateRootStore {
         parent_hash: B256,
         operations: &[QmdbOperation],
     ) -> Result<B256, Gov5QmdbStateRootError> {
+        let lock_started = std::time::Instant::now();
         let state = self
             .state
             .lock()
             .map_err(|_| Gov5QmdbStateRootError::LockPoisoned)?;
+        let lock_acquired = std::time::Instant::now();
+        metrics::histogram!("n42_qmdb_lock_wait_ms", "operation" => "candidate")
+            .record(lock_acquired.duration_since(lock_started).as_secs_f64() * 1_000.0);
         // Speculative: the caller may never commit this block, so the rebuilt
         // tree is dropped rather than cached.
-        self.compute_candidate_locked(&state, parent_hash, operations)
-            .map(|(root, _)| root)
+        let compute_started = std::time::Instant::now();
+        let result = self
+            .compute_candidate_locked(&state, parent_hash, operations)
+            .map(|(root, _)| root);
+        metrics::histogram!("n42_qmdb_candidate_compute_ms", "operation" => "candidate")
+            .record(compute_started.elapsed().as_secs_f64() * 1_000.0);
+        metrics::histogram!("n42_qmdb_lock_hold_ms", "operation" => "candidate")
+            .record(lock_acquired.elapsed().as_secs_f64() * 1_000.0);
+        result
     }
 
     pub fn compute_and_commit(
@@ -301,27 +312,57 @@ impl Gov5QmdbStateRootStore {
         expected_root: B256,
         operations: Vec<QmdbOperation>,
     ) -> Result<B256, Gov5QmdbStateRootError> {
+        let operation_count = operations.len();
+        let lock_started = std::time::Instant::now();
         let mut state = self
             .state
             .lock()
             .map_err(|_| Gov5QmdbStateRootError::LockPoisoned)?;
+        let lock_acquired = std::time::Instant::now();
+        metrics::histogram!("n42_qmdb_lock_wait_ms", "operation" => "commit")
+            .record(lock_acquired.duration_since(lock_started).as_secs_f64() * 1_000.0);
+        metrics::histogram!("n42_qmdb_operations_per_block").record(operation_count as f64);
         if let Some(stored) = state.blocks.get(&block_hash) {
-            return if stored.parent_hash == parent_hash
+            let result = if stored.parent_hash == parent_hash
                 && stored.root == expected_root
                 && stored.operations == operations
             {
+                metrics::counter!("n42_qmdb_commit_outcomes_total", "outcome" => "cache_hit")
+                    .increment(1);
                 Ok(stored.root)
             } else {
+                metrics::counter!("n42_qmdb_commit_outcomes_total", "outcome" => "cache_conflict")
+                    .increment(1);
                 Err(Gov5QmdbStateRootError::RootMismatch {
                     block_hash,
                     got: stored.root,
                     expected: expected_root,
                 })
             };
+            metrics::histogram!("n42_qmdb_lock_hold_ms", "operation" => "commit")
+                .record(lock_acquired.elapsed().as_secs_f64() * 1_000.0);
+            return result;
         }
 
-        let (root, rebuilt) = self.compute_candidate_locked(&state, parent_hash, &operations)?;
+        let compute_started = std::time::Instant::now();
+        let candidate = self.compute_candidate_locked(&state, parent_hash, &operations);
+        metrics::histogram!("n42_qmdb_candidate_compute_ms", "operation" => "commit")
+            .record(compute_started.elapsed().as_secs_f64() * 1_000.0);
+        let (root, rebuilt) = match candidate {
+            Ok(candidate) => candidate,
+            Err(error) => {
+                metrics::counter!("n42_qmdb_commit_outcomes_total", "outcome" => "compute_error")
+                    .increment(1);
+                metrics::histogram!("n42_qmdb_lock_hold_ms", "operation" => "commit")
+                    .record(lock_acquired.elapsed().as_secs_f64() * 1_000.0);
+                return Err(error);
+            }
+        };
         if root != expected_root {
+            metrics::counter!("n42_qmdb_commit_outcomes_total", "outcome" => "root_mismatch")
+                .increment(1);
+            metrics::histogram!("n42_qmdb_lock_hold_ms", "operation" => "commit")
+                .record(lock_acquired.elapsed().as_secs_f64() * 1_000.0);
             return Err(Gov5QmdbStateRootError::RootMismatch {
                 block_hash,
                 got: root,
@@ -336,6 +377,7 @@ impl Gov5QmdbStateRootStore {
                 operations,
             },
         );
+        let wal_started = std::time::Instant::now();
         if let Err(error) = self.append_wal_block(
             block_hash,
             state
@@ -343,9 +385,17 @@ impl Gov5QmdbStateRootStore {
                 .get(&block_hash)
                 .expect("inserted QMDB block is present"),
         ) {
+            metrics::histogram!("n42_qmdb_wal_append_ms")
+                .record(wal_started.elapsed().as_secs_f64() * 1_000.0);
+            metrics::counter!("n42_qmdb_commit_outcomes_total", "outcome" => "wal_error")
+                .increment(1);
             state.blocks.remove(&block_hash);
+            metrics::histogram!("n42_qmdb_lock_hold_ms", "operation" => "commit")
+                .record(lock_acquired.elapsed().as_secs_f64() * 1_000.0);
             return Err(error);
         }
+        metrics::histogram!("n42_qmdb_wal_append_ms")
+            .record(wal_started.elapsed().as_secs_f64() * 1_000.0);
         // Cache only now: the root matched, the block is in `blocks`, and the
         // WAL append succeeded, so the tree describes durable committed state.
         // Empty blocks took the fast path and rebuilt nothing; leaving the
@@ -359,6 +409,9 @@ impl Gov5QmdbStateRootStore {
             });
         }
         qualification_abort_at("qmdb_committed");
+        metrics::counter!("n42_qmdb_commit_outcomes_total", "outcome" => "committed").increment(1);
+        metrics::histogram!("n42_qmdb_lock_hold_ms", "operation" => "commit")
+            .record(lock_acquired.elapsed().as_secs_f64() * 1_000.0);
         Ok(root)
     }
 

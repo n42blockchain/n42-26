@@ -1,4 +1,4 @@
-use crate::{N42EvmConfig, state_diff::StateDiff, witness::ExecutionWitness};
+use crate::{ExecutionPath, N42EvmConfig, state_diff::StateDiff, witness::ExecutionWitness};
 use alloy_evm::ToTxEnv;
 use metrics::histogram;
 use reth_ethereum_primitives::EthPrimitives;
@@ -149,15 +149,15 @@ pub struct ParallelExecutionSummary {
     pub elapsed_ms: u64,
 }
 
-/// Executes a block using Block-STM parallel execution.
+/// Executes a historical/offline block using Block-STM parallel execution.
 ///
 /// Enable with `N42_PARALLEL_EVM=1`. Disabled by default because under
 /// 48K-cap workloads (simple transfers), MVCC overhead exceeds execution time.
 /// Beneficial for blocks with complex contract interactions.
 ///
 /// This function provides a **standalone** parallel execution result.
-/// It does **not** replace reth's built-in sequential executor.
-/// Callers choose which path to use.
+/// It does **not** produce the complete canonical output required by reth's
+/// executor and therefore must not be used as the live execution path.
 pub fn execute_block_parallel<DB: DatabaseRef + Send + Sync>(
     evm_config: &N42EvmConfig,
     db: &DB,
@@ -167,43 +167,69 @@ where
     DB::Error: core::error::Error + Send + Sync + 'static,
 {
     let start = Instant::now();
+    let result = (|| -> Result<(usize, u64, usize), BlockExecutionError> {
+        // 1. Derive CfgEnv + BlockEnv from the block header.
+        let evm_env = evm_config
+            .evm_env(block.header())
+            .map_err(BlockExecutionError::other)?;
 
-    // 1. Derive CfgEnv + BlockEnv from the block header.
-    let evm_env = evm_config
-        .evm_env(block.header())
-        .map_err(BlockExecutionError::other)?;
+        // 2. Convert each recovered transaction to a revm TxEnv.
+        let txs: Vec<revm::context::TxEnv> = block
+            .transactions_recovered()
+            .map(|recovered| recovered.to_tx_env())
+            .collect();
+        let tx_count = txs.len();
+        debug!(target: "n42::execution", tx_count, "execute_block_parallel starting");
 
-    // 2. Convert each recovered transaction to a revm TxEnv.
-    let txs: Vec<revm::context::TxEnv> = block
-        .transactions_recovered()
-        .map(|recovered| recovered.to_tx_env())
-        .collect();
-    let tx_count = txs.len();
-    debug!(target: "n42::execution", tx_count, "execute_block_parallel starting");
+        // 3. Run parallel execution.
+        let output =
+            n42_parallel_evm::parallel_execute(&txs, db, evm_env.cfg_env, evm_env.block_env)
+                .map_err(BlockExecutionError::other)?;
 
-    // 3. Run parallel execution.
-    let output = n42_parallel_evm::parallel_execute(&txs, db, evm_env.cfg_env, evm_env.block_env)
-        .map_err(BlockExecutionError::other)?;
-
-    // 4. Build summary.
-    let total_gas: u64 = output.results.iter().map(|r| r.gas_used).sum();
-    let success_count = output.results.iter().filter(|r| r.success).count();
+        let total_gas = output.results.iter().map(|result| result.gas_used).sum();
+        let success_count = output
+            .results
+            .iter()
+            .filter(|result| result.success)
+            .count();
+        Ok((tx_count, total_gas, success_count))
+    })();
     let elapsed_ms = start.elapsed().as_millis() as u64;
-
     histogram!("n42_parallel_execution_block_ms").record(elapsed_ms as f64);
-    info!(
-        target: "n42::execution",
-        tx_count,
-        total_gas,
-        success_count,
-        elapsed_ms,
-        "execute_block_parallel complete"
-    );
+    histogram!(
+        "n42_evm_path_duration_ms",
+        "path" => ExecutionPath::HISTORICAL_PEVM.label(),
+        "phase" => "standalone_block",
+    )
+    .record(start.elapsed().as_secs_f64() * 1_000.0);
+    metrics::counter!(
+        "n42_evm_path_calls_total",
+        "path" => ExecutionPath::HISTORICAL_PEVM.label(),
+        "phase" => "standalone_block",
+        "outcome" => if result.is_ok() { "ok" } else { "error" },
+    )
+    .increment(1);
 
-    Ok(ParallelExecutionSummary {
-        tx_count,
-        total_gas,
-        success_count,
-        elapsed_ms,
-    })
+    match result {
+        Ok((tx_count, total_gas, success_count)) => {
+            info!(
+                target: "n42::execution",
+                tx_count,
+                total_gas,
+                success_count,
+                elapsed_ms,
+                "execute_block_parallel complete"
+            );
+            Ok(ParallelExecutionSummary {
+                tx_count,
+                total_gas,
+                success_count,
+                elapsed_ms,
+            })
+        }
+        Err(error) => {
+            warn!(target: "n42::execution", elapsed_ms, %error, "execute_block_parallel failed");
+            Err(error)
+        }
+    }
 }
