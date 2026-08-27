@@ -27,7 +27,8 @@ use crate::gossipsub::topics::{
 use crate::gov5_block::{Gov5BlockError, attributable_hash, decode_gov5_block_rlp};
 use crate::gov5_rpc::{
     GOV5_BLOCK_BY_HASH_PROTOCOL, Gov5BlockByHashRequest, Gov5BlockByHashResponse,
-    Gov5BlockPushRequest, Gov5BlockPushResponse, Gov5HotstuffDirectRequest,
+    Gov5BlockPushRequest, Gov5BlockPushResponse, Gov5BodiesByRangeRequest,
+    Gov5BodiesByRangeResponse, Gov5CanonicalBlockReader, Gov5HotstuffDirectRequest,
     Gov5HotstuffDirectResponse, Gov5Status,
 };
 use crate::h2_v4::{
@@ -68,6 +69,10 @@ const GOV5_BLOCK_REQUEST_COOLDOWN: Duration = Duration::from_millis(750);
 // are redundant and safely ignored after their request id is reaped.
 const GOV5_BLOCK_REQUEST_STALE_AFTER: Duration = Duration::from_millis(1500);
 const MAX_SERVED_GOV5_BLOCKS: usize = 1024;
+const GOV5_RANGE_BLOCKS_PER_SECOND: f64 = 1024.0;
+const GOV5_RANGE_BLOCKS_BURST: f64 = 4096.0;
+const MAX_PENDING_GOV5_RANGES: usize = 8;
+const MAX_PENDING_GOV5_RANGES_PER_PEER: usize = 2;
 const MAX_INBOUND_BLOCK_DIRECT_TRANSFERS: usize = 32;
 const BLOCK_DIRECT_TRANSFER_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_BLOCK_DIRECT_QUEUE_DEPTH: usize = 64;
@@ -230,6 +235,34 @@ impl SyncRequestWindow {
             return false;
         }
         self.accepted += 1;
+        true
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Gov5RangeQuota {
+    tokens: f64,
+    updated_at: Instant,
+}
+
+impl Gov5RangeQuota {
+    fn new(now: Instant) -> Self {
+        Self {
+            tokens: GOV5_RANGE_BLOCKS_BURST,
+            updated_at: now,
+        }
+    }
+
+    fn allow(&mut self, now: Instant, blocks: u64) -> bool {
+        let elapsed = now.saturating_duration_since(self.updated_at).as_secs_f64();
+        self.tokens =
+            (self.tokens + elapsed * GOV5_RANGE_BLOCKS_PER_SECOND).min(GOV5_RANGE_BLOCKS_BURST);
+        self.updated_at = now;
+        let cost = blocks as f64;
+        if cost > self.tokens {
+            return false;
+        }
+        self.tokens -= cost;
         true
     }
 }
@@ -805,6 +838,18 @@ pub struct NetworkService {
     h2_v4_participant: bool,
     gov5_status: Option<Gov5Status>,
     pending_gov5_status_peers: HashSet<PeerId>,
+    /// Peers that completed a status exchange for this exact genesis. Range
+    /// serving is fail-closed until the Noise-authenticated PeerId is both a
+    /// configured/trusted validator and bound to this chain.
+    gov5_chain_authenticated_peers: HashSet<PeerId>,
+    /// Persistent canonical storage used by Gov5 range sync. Deliberately
+    /// separate from the recent `gov5_served_blocks` recovery cache.
+    gov5_canonical_blocks: Option<Gov5CanonicalBlockReader>,
+    /// Per-peer block-cost token buckets matching Gov5's 1024 block/s and
+    /// 4x burst defaults.
+    gov5_range_quotas: HashMap<PeerId, Gov5RangeQuota>,
+    /// Accepted range streams still being written by request-response.
+    pending_gov5_ranges: HashMap<libp2p::request_response::InboundRequestId, PeerId>,
     block_announce_topic_hash: gossipsub::TopicHash,
     mempool_topic_hash: gossipsub::TopicHash,
     blob_sidecar_topic_hash: gossipsub::TopicHash,
@@ -1162,6 +1207,10 @@ impl NetworkService {
             h2_v4_participant,
             gov5_status,
             pending_gov5_status_peers: HashSet::new(),
+            gov5_chain_authenticated_peers: HashSet::new(),
+            gov5_canonical_blocks: None,
+            gov5_range_quotas: HashMap::new(),
+            pending_gov5_ranges: HashMap::new(),
             block_announce_topic_hash,
             mempool_topic_hash,
             blob_sidecar_topic_hash,
@@ -1199,6 +1248,31 @@ impl NetworkService {
         Ok((service, handle, consensus_event_rx, event_rx))
     }
 
+    /// Installs the persistent canonical-chain source used to answer Gov5
+    /// `bodies_by_range` requests. Interop services advertise the protocol but
+    /// reject requests until this source is present.
+    pub fn set_gov5_canonical_block_reader(&mut self, reader: Gov5CanonicalBlockReader) {
+        self.gov5_canonical_blocks = Some(reader);
+    }
+
+    fn current_gov5_status(&self) -> Option<Gov5Status> {
+        let mut status = self.gov5_status?;
+        if let Some(reader) = self.gov5_canonical_blocks.as_ref() {
+            match reader.best_block_number() {
+                Ok(height) => status.current_height = height,
+                Err(error) => {
+                    tracing::warn!(
+                        target: "n42::interop::range",
+                        %error,
+                        "failed to read canonical head for Gov5 status; refusing stale status"
+                    );
+                    return None;
+                }
+            }
+        }
+        Some(status)
+    }
+
     pub fn listen_on(&mut self, addr: Multiaddr) -> Result<(), NetworkError> {
         self.swarm
             .listen_on(addr)
@@ -1232,7 +1306,7 @@ impl NetworkService {
             // Gov5 gives an inbound peer ten seconds to initiate Status. Flush
             // this immediately after ConnectionEstablished, ahead of catch-up
             // queues that can remain continuously non-empty.
-            if let Some(status) = self.gov5_status {
+            if let Some(status) = self.current_gov5_status() {
                 for peer_id in std::mem::take(&mut self.pending_gov5_status_peers) {
                     if self.swarm.is_connected(&peer_id) {
                         let request_id = self
@@ -1372,6 +1446,9 @@ impl NetworkService {
             SwarmEvent::Behaviour(N42BehaviourEvent::Gov5BlockByHash(event)) => {
                 self.handle_gov5_block_by_hash_event(event);
             }
+            SwarmEvent::Behaviour(N42BehaviourEvent::Gov5BodiesByRange(event)) => {
+                self.handle_gov5_bodies_by_range_event(event);
+            }
             SwarmEvent::Behaviour(N42BehaviourEvent::Gov5Status(event)) => {
                 self.handle_gov5_status_event(event);
             }
@@ -1415,6 +1492,10 @@ impl NetworkService {
                 self.reconnection.on_disconnected(&peer_id);
                 self.pending_gov5_status_peers.remove(&peer_id);
                 self.gov5_block_by_hash_peers.remove(&peer_id);
+                self.gov5_chain_authenticated_peers.remove(&peer_id);
+                self.gov5_range_quotas.remove(&peer_id);
+                self.pending_gov5_ranges
+                    .retain(|_, pending_peer| *pending_peer != peer_id);
                 self.state_sync_peers.remove(&peer_id);
                 self.block_direct_peers.remove(&peer_id);
                 self.outbound_block_direct_transfers.remove(&peer_id);
@@ -3014,11 +3095,224 @@ impl NetworkService {
         }
     }
 
+    fn gov5_range_peer_is_authorized(&self, peer: &PeerId) -> bool {
+        (self.reconnection.is_trusted(peer)
+            || self.authenticated_peer_validator_map.contains_key(peer))
+            && self.gov5_chain_authenticated_peers.contains(peer)
+    }
+
+    fn reject_gov5_range(
+        &mut self,
+        channel: libp2p::request_response::ResponseChannel<Gov5BodiesByRangeResponse>,
+        code: u8,
+        message: String,
+    ) {
+        let _ = self
+            .swarm
+            .behaviour_mut()
+            .gov5_bodies_by_range
+            .send_response(channel, Gov5BodiesByRangeResponse::Error { code, message });
+    }
+
+    fn handle_gov5_bodies_by_range_event(
+        &mut self,
+        event: libp2p::request_response::Event<Gov5BodiesByRangeRequest, Gov5BodiesByRangeResponse>,
+    ) {
+        match event {
+            libp2p::request_response::Event::Message {
+                peer,
+                message:
+                    libp2p::request_response::Message::Request {
+                        request_id,
+                        request,
+                        channel,
+                    },
+                ..
+            } => {
+                if let Err(error) = request.validate() {
+                    metrics::counter!(
+                        "n42_gov5_range_requests_rejected_total",
+                        "reason" => "invalid"
+                    )
+                    .increment(1);
+                    self.reject_gov5_range(channel, 1, error.to_string());
+                    return;
+                }
+                if !self.gov5_range_peer_is_authorized(&peer) {
+                    metrics::counter!(
+                        "n42_gov5_range_requests_rejected_total",
+                        "reason" => "unauthorized"
+                    )
+                    .increment(1);
+                    tracing::warn!(
+                        target: "n42::interop::range",
+                        %peer,
+                        "refusing Gov5 range request before trusted chain authentication"
+                    );
+                    self.reject_gov5_range(
+                        channel,
+                        1,
+                        "peer is not authorized for canonical range sync".to_owned(),
+                    );
+                    return;
+                }
+                let Some(reader) = self.gov5_canonical_blocks.clone() else {
+                    metrics::counter!(
+                        "n42_gov5_range_requests_rejected_total",
+                        "reason" => "unavailable"
+                    )
+                    .increment(1);
+                    self.reject_gov5_range(
+                        channel,
+                        2,
+                        "canonical block provider is unavailable".to_owned(),
+                    );
+                    return;
+                };
+                let best = match reader.best_block_number() {
+                    Ok(best) => best,
+                    Err(error) => {
+                        metrics::counter!(
+                            "n42_gov5_range_requests_rejected_total",
+                            "reason" => "provider"
+                        )
+                        .increment(1);
+                        self.reject_gov5_range(
+                            channel,
+                            2,
+                            format!("canonical head lookup failed: {error}"),
+                        );
+                        return;
+                    }
+                };
+                if request.start > best.saturating_add(2 * 1024) {
+                    metrics::counter!(
+                        "n42_gov5_range_requests_rejected_total",
+                        "reason" => "future"
+                    )
+                    .increment(1);
+                    self.reject_gov5_range(
+                        channel,
+                        1,
+                        "range starts too far beyond the canonical head".to_owned(),
+                    );
+                    return;
+                }
+                let pending_for_peer = self
+                    .pending_gov5_ranges
+                    .values()
+                    .filter(|pending_peer| **pending_peer == peer)
+                    .count();
+                if self.pending_gov5_ranges.len() >= MAX_PENDING_GOV5_RANGES
+                    || pending_for_peer >= MAX_PENDING_GOV5_RANGES_PER_PEER
+                {
+                    metrics::counter!(
+                        "n42_gov5_range_requests_rejected_total",
+                        "reason" => "concurrency"
+                    )
+                    .increment(1);
+                    self.reject_gov5_range(
+                        channel,
+                        1,
+                        "too many range responses are already in flight".to_owned(),
+                    );
+                    return;
+                }
+                let now = Instant::now();
+                if !self
+                    .gov5_range_quotas
+                    .entry(peer)
+                    .or_insert_with(|| Gov5RangeQuota::new(now))
+                    .allow(now, request.count)
+                {
+                    metrics::counter!(
+                        "n42_gov5_range_requests_rejected_total",
+                        "reason" => "rate_limit"
+                    )
+                    .increment(1);
+                    self.reject_gov5_range(
+                        channel,
+                        1,
+                        "range block-rate limit exceeded".to_owned(),
+                    );
+                    return;
+                }
+
+                let fork_digest = self
+                    .gov5_status
+                    .expect("authorized Gov5 range peer requires interop status")
+                    .genesis_hash
+                    .as_slice()[..4]
+                    .try_into()
+                    .expect("four-byte genesis prefix");
+                let response = Gov5BodiesByRangeResponse::Stream {
+                    request,
+                    fork_digest,
+                    reader,
+                };
+                if self
+                    .swarm
+                    .behaviour_mut()
+                    .gov5_bodies_by_range
+                    .send_response(channel, response)
+                    .is_err()
+                {
+                    metrics::counter!(
+                        "n42_gov5_range_requests_rejected_total",
+                        "reason" => "closed"
+                    )
+                    .increment(1);
+                    tracing::debug!(%peer, ?request_id, "Gov5 range response channel closed");
+                } else {
+                    self.pending_gov5_ranges.insert(request_id, peer);
+                    metrics::counter!("n42_gov5_range_requests_accepted_total").increment(1);
+                    metrics::counter!("n42_gov5_range_blocks_requested_total")
+                        .increment(request.count);
+                    tracing::debug!(
+                        target: "n42::interop::range",
+                        %peer,
+                        ?request_id,
+                        start = request.start,
+                        count = request.count,
+                        "serving Gov5 canonical block range"
+                    );
+                }
+            }
+            libp2p::request_response::Event::Message {
+                peer,
+                message: libp2p::request_response::Message::Response { .. },
+                ..
+            } => {
+                tracing::warn!(%peer, "unexpected outbound Gov5 bodies-by-range response");
+            }
+            libp2p::request_response::Event::InboundFailure {
+                peer,
+                request_id,
+                error,
+                ..
+            } => {
+                self.pending_gov5_ranges.remove(&request_id);
+                metrics::counter!("n42_gov5_range_response_failures_total").increment(1);
+                tracing::debug!(%peer, ?request_id, %error, "Gov5 range response failed");
+            }
+            libp2p::request_response::Event::OutboundFailure { peer, error, .. } => {
+                tracing::warn!(%peer, %error, "unexpected outbound Gov5 range request failed");
+            }
+            libp2p::request_response::Event::ResponseSent {
+                peer, request_id, ..
+            } => {
+                self.pending_gov5_ranges.remove(&request_id);
+                metrics::counter!("n42_gov5_range_responses_completed_total").increment(1);
+                tracing::debug!(%peer, ?request_id, "Gov5 range response completed");
+            }
+        }
+    }
+
     fn handle_gov5_status_event(
         &mut self,
         event: libp2p::request_response::Event<Gov5Status, Gov5Status>,
     ) {
-        let Some(local_status) = self.gov5_status else {
+        let Some(local_status) = self.current_gov5_status() else {
             return;
         };
         match event {
@@ -3031,7 +3325,10 @@ impl NetworkService {
                 ..
             } => {
                 if request.genesis_hash != local_status.genesis_hash {
+                    self.gov5_chain_authenticated_peers.remove(&peer);
                     tracing::warn!(%peer, remote_genesis = %request.genesis_hash, local_genesis = %local_status.genesis_hash, "gov5 status genesis mismatch");
+                } else {
+                    self.gov5_chain_authenticated_peers.insert(peer);
                 }
                 let _ = self
                     .swarm
@@ -3045,9 +3342,11 @@ impl NetworkService {
                 ..
             } => {
                 if response.genesis_hash == local_status.genesis_hash {
+                    self.gov5_chain_authenticated_peers.insert(peer);
                     metrics::counter!("n42_gov5_status_succeeded_total").increment(1);
                     tracing::debug!(%peer, height = response.current_height, "validated gov5 status response");
                 } else {
+                    self.gov5_chain_authenticated_peers.remove(&peer);
                     metrics::counter!("n42_gov5_status_failed_total").increment(1);
                     tracing::warn!(%peer, remote_genesis = %response.genesis_hash, local_genesis = %local_status.genesis_hash, "rejected gov5 status response for another genesis");
                 }
@@ -3879,6 +4178,19 @@ mod tests {
         }
         assert!(validator.allow(now, MAX_SYNC_REQUESTS_VALIDATOR));
         assert!(!untrusted.allow(now, MAX_SYNC_REQUESTS_UNTRUSTED));
+    }
+
+    #[test]
+    fn gov5_range_quota_matches_four_batch_burst_and_steady_refill() {
+        let now = Instant::now();
+        let mut quota = Gov5RangeQuota::new(now);
+
+        for _ in 0..4 {
+            assert!(quota.allow(now, 1024));
+        }
+        assert!(!quota.allow(now, 1));
+        assert!(quota.allow(now + Duration::from_secs(1), 1024));
+        assert!(!quota.allow(now + Duration::from_secs(1), 1));
     }
 
     #[test]

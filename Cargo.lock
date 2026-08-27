@@ -3553,7 +3553,7 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 
 [[package]]
 name = "e2e-test"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -6904,7 +6904,7 @@ dependencies = [
 
 [[package]]
 name = "n42-bmt-core"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "blake3",
  "serde",
@@ -6913,7 +6913,7 @@ dependencies = [
 
 [[package]]
 name = "n42-chainspec"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "alloy-consensus",
  "alloy-genesis",
@@ -6931,7 +6931,7 @@ dependencies = [
 
 [[package]]
 name = "n42-consensus"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "alloy-consensus",
  "alloy-primitives",
@@ -6959,7 +6959,7 @@ dependencies = [
 
 [[package]]
 name = "n42-consensus-service"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -6999,7 +6999,7 @@ dependencies = [
 
 [[package]]
 name = "n42-consensus-standalone"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "alloy-primitives",
  "alloy-rpc-types-engine",
@@ -7016,7 +7016,7 @@ dependencies = [
 
 [[package]]
 name = "n42-el-rpc"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "alloy-primitives",
  "alloy-rpc-types-engine",
@@ -7035,7 +7035,7 @@ dependencies = [
 
 [[package]]
 name = "n42-evm-bench"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "alloy-primitives",
  "bincode",
@@ -7050,7 +7050,7 @@ dependencies = [
 
 [[package]]
 name = "n42-execution"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "alloy-eips",
  "alloy-evm",
@@ -7079,7 +7079,7 @@ dependencies = [
 
 [[package]]
 name = "n42-jmt"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "alloy-primitives",
  "anyhow",
@@ -7109,7 +7109,7 @@ dependencies = [
 
 [[package]]
 name = "n42-mobile"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -7142,7 +7142,7 @@ dependencies = [
 
 [[package]]
 name = "n42-mobile-ffi"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "alloy-primitives",
  "bincode",
@@ -7171,7 +7171,7 @@ dependencies = [
 
 [[package]]
 name = "n42-mobile-sim"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "alloy-primitives",
  "bincode",
@@ -7188,7 +7188,7 @@ dependencies = [
 
 [[package]]
 name = "n42-network"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -7224,7 +7224,7 @@ dependencies = [
 
 [[package]]
 name = "n42-node"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -7302,7 +7302,7 @@ dependencies = [
 
 [[package]]
 name = "n42-node-bin"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "aes-gcm 0.11.0",
  "alloy-consensus",
@@ -7345,7 +7345,7 @@ dependencies = [
 
 [[package]]
 name = "n42-parallel-evm"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "alloy-primitives",
  "dashmap",
@@ -7361,7 +7361,7 @@ dependencies = [
 
 [[package]]
 name = "n42-primitives"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "alloy-primitives",
  "bincode",
@@ -7379,7 +7379,7 @@ dependencies = [
 
 [[package]]
 name = "n42-stress"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -7401,7 +7401,7 @@ dependencies = [
 
 [[package]]
 name = "n42-twig-core"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "bincode",
  "blake3",
@@ -7417,7 +7417,7 @@ dependencies = [
 
 [[package]]
 name = "n42-zkproof"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "alloy-primitives",
  "bincode",

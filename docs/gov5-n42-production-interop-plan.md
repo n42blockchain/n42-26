@@ -21,7 +21,8 @@ network. Both clients must:
 |---|---|---|
 | H2 wire, Snappy, BLS domains, QC/TC | Complete | Cross-language vectors and full shadow verification |
 | QMDB slot log, proof binding, replay-v2 roots | Complete | Portable bootstrap and cross-client roots |
-| Far catch-up and finalized-range authentication | Complete | 2,883-block live catch-up |
+| Rust ← Gov5 far catch-up and finalized-range authentication | Complete | 2,883-block live catch-up |
+| Gov5 ← Rust far catch-up | Code/unit gate complete; live gate pending | Inbound `/rpc/bodies_by_range/1/ssz_snappy`, persistent canonical reads, 1024-block batches, and `scripts/test-gov5-reverse-range-catchup.sh` |
 | Existing-network observer/follower | Complete | Live Gov5 seven-node Noise/Yamux/H2 following |
 | Execution-gated Rust vote | Complete in isolated committee | Rust imported `Valid`, voted at view 149, Gov5 committed |
 | Out-of-order batch catch-up | Code and unit gate complete | Non-Valid child no longer advances validated watermark |
@@ -45,12 +46,28 @@ Operationally:
 
 Deliverables:
 
+0. bidirectional cold catch-up: serve Gov5 `bodies_by_range` from Rust's
+   persistent canonical provider, then prove a Gov5 member at least 3,072
+   blocks behind crosses three or more 1,024-block batches and reaches the
+   same block hash/state root;
 1. compact-output bad-block-cache poisoning fix and regression;
 2. H2 vote release only after `new_payload(Valid)`;
 3. exact Noise PeerId validator routing without weakening BLS authorization;
 4. authenticated native/replay QMDB checkpoint profile selection;
 5. validated-only eager-import watermark for out-of-order catch-up;
 6. Rust and Go full check, lint, and test gates.
+
+P0-0 implementation is present. The server advertises only on Gov5 TCP
+interop swarms, requires a trusted/authenticated Noise PeerId plus a matching
+genesis Status exchange, streams blocks directly from persistent canonical
+storage, and applies Gov5's 1,024-block request ceiling, 64 MiB per-block cap,
+continuity checks, bounded concurrency, and 1,024 block/s with 4x burst rate
+limit. Interop profiles also listen on TCP (the consensus port number by
+default, or `N42_GOV5_TCP_PORT`) so a late Gov5 process can initiate the
+connection. The live gate remains open until the reverse-direction script produces
+its `result.json` on a retained mixed-client runtime. `headers_by_range` and
+Gov5 snapshot RPCs remain explicitly deferred because current Gov5 initial
+sync requests only `bodies_by_range`.
 
 Exit criterion: both interop branches are pushed and reproducible from clean
 worktrees on reth 2.4.1.

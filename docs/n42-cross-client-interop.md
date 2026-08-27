@@ -22,7 +22,7 @@ gov5 和 n42-26 应像 geth 与 reth 一样，能以不同实现加入同一条 
 | 传输 | libp2p，SSZ+snappy，协议后缀 `/ssz_snappy` | libp2p，长度前缀 bincode | 连接层相近，wire codec 不兼容 |
 | Gossip | `/n42/{fork-digest}/...` | 固定 `/n42/consensus/1`、`/n42/blocks/1` 等 | topic 和 fork 隔离不兼容 |
 | Gossip MsgID | `Keccak256(genesis || topic || data)[:20]` | 原为 `Keccak256(data || topic)` | 已改为 gov5 布局；两端共享 5 个 Go 生成的 golden vectors |
-| 同步 | SSZ 的 status、range、snap/checkpoint RPC | `BlockSyncRequest/Response` 的 bincode `/n42/sync/1` | 不能直接互相同步 |
+| 同步 | SSZ 的 status、`bodies_by_range`、snap/checkpoint RPC | 内部同步为 bincode `/n42/sync/2`；Gov5 TCP profile 另提供入站 `status`、`block_by_hash`、`bodies_by_range` | Gov5 可从 Rust canonical history 范围追块；Gov5 snapshot RPC 尚未实现 |
 | QMDB commitment | Go split commitment：冻结 leaf tree + active-bits commitment | Rust Twig 删除时把旧 leaf 写为 `NULL_HASH` | **更新/删除后的 root 不相同；当前 Rust Twig 不能导入 QMDB replay state** |
 | QMDB 持久化 | MDBX `qmdbEntries/Twigs/Meta/Index`，history 另有 death stamps 等表 | bincode+zstd snapshot + StateDiff WAL | 不能共享 datadir；需要 portable export/import |
 | H2 codec | SSZ `HotStuffConsensusMsg` + snappy | versioned bincode `ConsensusMessage` | 消息不能互解 |
@@ -93,6 +93,28 @@ SHA-256，但实际调用的 `common/hash.Hash` 使用 `crypto.KeccakState`；�
 - 将 replay 输入固定为 QMDB bootstrap export + finalized native block bundle/diff，而不是直接读取另一客户端的 MDBX 表。
 - 每个 checkpoint 比较 block hash、receipt root、QMDB root、nextSlot、live count、交易计数及跳过原因；差异保存为可复现的最小 bundle。
 - 先运行历史 replay 的小窗口，再运行现有完整历史数据；严禁通过跳过 root 或 receipt 校验来获得“成功”。
+
+反向 catch-up 的协议缺口现已在 Rust 侧补齐：
+
+- `/rpc/bodies_by_range/1/ssz_snappy` 使用 Gov5 的 52 字节 SSZ
+  `{StartBlockNumber: H256, Count, Step}` 与逐块 response-chunk framing；
+- 每次最多 1,024 块；与 gov5 一致先校验 `step` 和跨度，再把 `step>1` 归一为连续响应；
+  对范围溢出、64 MiB 单块上限、block number、parent continuity 和 Snappy 解压长度 fail closed；
+- 数据逐块来自 Reth persistent canonical provider，不使用最近 1,024 块的 Gov5 内存缓存；
+- 只有配置/认证的 Noise PeerId 完成同 genesis Status 交换后才服务，并限制全局/单 peer
+  并发及每 peer block-rate；Status 高度动态读取 persistent canonical head，确保 Gov5
+  能发现高度差并启动 initial sync；
+- interop observer/participant 同时监听 QUIC 与 TCP/Noise/Yamux；TCP 默认复用
+  `N42_CONSENSUS_PORT` 的数字，也可由 `N42_GOV5_TCP_PORT` 单独指定，因此后启动的 Gov5
+  可以主动连接 Rust；
+- `scripts/test-gov5-reverse-range-catchup.sh` 是真实反向门禁：Rust 先领先至少 3,072 块，
+  再启动旧快照 Gov5，要求跨至少三个已完成的 1,024-block 响应，并在固定目标高度比较
+  hash 与 state root；Rust 侧须预先以 committee PeerId binding 或 `N42_TRUSTED_PEERS`
+  授权该 Gov5 Noise PeerId。
+
+当前 Gov5 没有注册 `headers_by_range` handler，因此它不是本轮初始同步的依赖；Gov5
+snapshot RPC 也继续留在后续阶段。反向真机门禁生成证据前，不把“Gov5 ← Rust far
+catch-up”标成生产完成。
 
 ### Phase 4 — 受限混合网络
 

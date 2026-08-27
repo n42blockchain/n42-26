@@ -35,6 +35,10 @@
 # Consensus P2P port (QUIC transport, default: 9400).
 # N42_CONSENSUS_PORT = "9400"
 
+# Gov5-compatible TCP/Noise/Yamux listener for interop observer/participant
+# profiles (default: N42_CONSENSUS_PORT; TCP and UDP may share a number).
+# N42_GOV5_TCP_PORT = "9400"
+
 # Comma-separated trusted peer multiaddrs for bootstrap.
 # Example: "/ip4/10.0.0.1/udp/9400/quic-v1/p2p/12D3Koo..."
 # N42_TRUSTED_PEERS = ""

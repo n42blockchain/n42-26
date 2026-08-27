@@ -14,9 +14,9 @@ use crate::gossipsub::topics::{
     blob_sidecar_topic, block_announce_topic, consensus_topic, mempool_topic,
 };
 use crate::gov5_rpc::{
-    GOV5_BLOCK_BY_HASH_PROTOCOL, GOV5_BLOCK_PUSH_PROTOCOL, GOV5_HOTSTUFF_DIRECT_PROTOCOL,
-    GOV5_STATUS_PROTOCOL, Gov5BlockByHashCodec, Gov5BlockPushCodec, Gov5HotstuffDirectCodec,
-    Gov5StatusCodec,
+    GOV5_BLOCK_BY_HASH_PROTOCOL, GOV5_BLOCK_PUSH_PROTOCOL, GOV5_BODIES_BY_RANGE_PROTOCOL,
+    GOV5_HOTSTUFF_DIRECT_PROTOCOL, GOV5_STATUS_PROTOCOL, Gov5BlockByHashCodec, Gov5BlockPushCodec,
+    Gov5BodiesByRangeCodec, Gov5HotstuffDirectCodec, Gov5StatusCodec,
 };
 use crate::state_sync::StateSyncCodec;
 use crate::tx_forward::TxForwardCodec;
@@ -89,6 +89,8 @@ pub struct N42Behaviour {
     pub gov5_block_push: libp2p::request_response::Behaviour<Gov5BlockPushCodec>,
     /// Gov5 fetch-on-miss block retrieval, enabled outbound for observer catch-up.
     pub gov5_block_by_hash: libp2p::request_response::Behaviour<Gov5BlockByHashCodec>,
+    /// Gov5 canonical range retrieval, enabled inbound on TCP interop swarms.
+    pub gov5_bodies_by_range: libp2p::request_response::Behaviour<Gov5BodiesByRangeCodec>,
     /// Gov5 chain-status handshake, enabled only on the TCP interop observer.
     pub gov5_status: libp2p::request_response::Behaviour<Gov5StatusCodec>,
     /// Gov5 raw one-way Rotor/direct consensus stream.
@@ -540,6 +542,22 @@ fn build_swarm_with_transports(
                 .with_request_timeout(Duration::from_secs(10)),
         );
 
+        let gov5_range_protocols = enable_gov5_tcp
+            .then(|| {
+                (
+                    libp2p::StreamProtocol::new(GOV5_BODIES_BY_RANGE_PROTOCOL),
+                    // This node only serves ranges. Keeping outbound disabled
+                    // also prevents accidental use as N42's native sync path.
+                    libp2p::request_response::ProtocolSupport::Inbound,
+                )
+            })
+            .into_iter();
+        let gov5_bodies_by_range = libp2p::request_response::Behaviour::new(
+            gov5_range_protocols,
+            libp2p::request_response::Config::default()
+                .with_request_timeout(Duration::from_secs(30)),
+        );
+
         let gov5_status_protocols = enable_gov5_tcp
             .then(|| {
                 (
@@ -619,6 +637,7 @@ fn build_swarm_with_transports(
             block_direct,
             gov5_block_push,
             gov5_block_by_hash,
+            gov5_bodies_by_range,
             gov5_status,
             gov5_hotstuff_direct,
             tx_forward,

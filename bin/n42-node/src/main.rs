@@ -9,7 +9,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 use alloy_consensus::Header;
 use alloy_genesis::Genesis;
 use alloy_primitives::{Address, B256, U256, keccak256};
-use alloy_rpc_types_engine::{ForkchoiceState, PayloadStatusEnum};
+use alloy_rpc_types_engine::{ExecutionData, ForkchoiceState, PayloadStatusEnum};
 use clap::Parser;
 use n42_chainspec::{ConsensusConfig, ValidatorInfo};
 use n42_consensus::{
@@ -53,7 +53,7 @@ use reth_ethereum_cli::Cli;
 use reth_ethereum_cli::chainspec::EthereumChainSpecParser;
 use reth_node_core::args::{DefaultEngineValues, DefaultRpcServerArgs};
 use reth_primitives_traits::SealedHeader;
-use reth_storage_api::{BlockHashReader, BlockNumReader, HeaderProvider};
+use reth_storage_api::{BlockHashReader, BlockNumReader, BlockReader, HeaderProvider};
 use reth_transaction_pool::TransactionPool;
 use std::fs::File;
 use std::io::BufReader;
@@ -541,6 +541,31 @@ fn connect_trusted_peers(net_handle: &n42_network::NetworkHandle) {
             }
         }
     }
+}
+
+/// Opens the TCP/Noise/Yamux listener used by gov5. TCP and QUIC may safely
+/// share the same numeric port; deployments can override it when their legacy
+/// gov5 topology already reserves a separate TCP port.
+fn listen_gov5_tcp(net_service: &mut NetworkService, default_port: u16) -> eyre::Result<()> {
+    let tcp_port = env_parse("N42_GOV5_TCP_PORT").unwrap_or(default_port);
+    let listen_addr: libp2p::Multiaddr = format!("/ip4/0.0.0.0/tcp/{tcp_port}")
+        .parse()
+        .map_err(|error| eyre::eyre!("failed to parse Gov5 TCP listen address: {error}"))?;
+    if let Err(error) = net_service.listen_on(listen_addr.clone()) {
+        warn!(
+            target: "n42::cli",
+            %error,
+            %listen_addr,
+            "failed to listen on Gov5 TCP P2P address"
+        );
+    } else {
+        info!(
+            target: "n42::cli",
+            %listen_addr,
+            "Gov5 TCP/Noise/Yamux P2P listening"
+        );
+    }
+    Ok(())
 }
 
 fn build_epoch_manager(
@@ -2006,6 +2031,38 @@ fn main() {
                             interop_genesis_hash,
                         )
                             .map_err(|e| eyre::eyre!("failed to create observer network service: {e}"))?;
+                    let best_provider = full_node.provider.clone();
+                    let block_provider = full_node.provider.clone();
+                    net_service.set_gov5_canonical_block_reader(
+                        n42_network::Gov5CanonicalBlockReader::new(
+                            move || {
+                                best_provider
+                                    .best_block_number()
+                                    .map_err(|error| error.to_string())
+                            },
+                            move |number| {
+                                let Some(block) = block_provider
+                                    .block_by_number(number)
+                                    .map_err(|error| error.to_string())?
+                                else {
+                                    return Ok(None);
+                                };
+                                let block_hash = block_provider
+                                    .block_hash(number)
+                                    .map_err(|error| error.to_string())?
+                                    .ok_or_else(|| {
+                                        format!(
+                                            "canonical hash is missing for persisted block {number}"
+                                        )
+                                    })?;
+                                let execution =
+                                    ExecutionData::from_block_unchecked(block_hash, &block);
+                                n42_network::encode_gov5_block_rlp(&execution)
+                                    .map(Some)
+                                    .map_err(|error| error.to_string())
+                            },
+                        ),
+                    );
 
                     let consensus_port: u16 = env_parse("N42_CONSENSUS_PORT").unwrap_or(9400);
                     let listen_addr: libp2p::Multiaddr = format!(
@@ -2020,6 +2077,7 @@ fn main() {
                     } else {
                         info!(target: "n42::cli", %listen_addr, "Observer P2P listening");
                     }
+                    listen_gov5_tcp(&mut net_service, consensus_port)?;
 
                     task_executor.spawn_critical_task(
                         "n42-p2p-network",
@@ -2132,6 +2190,40 @@ fn main() {
                         )
                     }
                         .map_err(|e| eyre::eyre!("failed to create consensus network service: {e}"))?;
+                if h2_v4_participant {
+                    let best_provider = full_node.provider.clone();
+                    let block_provider = full_node.provider.clone();
+                    net_service.set_gov5_canonical_block_reader(
+                        n42_network::Gov5CanonicalBlockReader::new(
+                            move || {
+                                best_provider
+                                    .best_block_number()
+                                    .map_err(|error| error.to_string())
+                            },
+                            move |number| {
+                                let Some(block) = block_provider
+                                    .block_by_number(number)
+                                    .map_err(|error| error.to_string())?
+                                else {
+                                    return Ok(None);
+                                };
+                                let block_hash = block_provider
+                                    .block_hash(number)
+                                    .map_err(|error| error.to_string())?
+                                    .ok_or_else(|| {
+                                        format!(
+                                            "canonical hash is missing for persisted block {number}"
+                                        )
+                                    })?;
+                                let execution =
+                                    ExecutionData::from_block_unchecked(block_hash, &block);
+                                n42_network::encode_gov5_block_rlp(&execution)
+                                    .map(Some)
+                                    .map_err(|error| error.to_string())
+                            },
+                        ),
+                    );
+                }
 
                 let consensus_port: u16 = env_parse("N42_CONSENSUS_PORT").unwrap_or(9400);
                 let listen_addr: libp2p::Multiaddr = format!(
@@ -2145,6 +2237,9 @@ fn main() {
                     warn!(target: "n42::cli", error = %e, %listen_addr, "Failed to listen on consensus p2p address");
                 } else {
                     info!(target: "n42::cli", %listen_addr, "Consensus P2P listening");
+                }
+                if h2_v4_participant {
+                    listen_gov5_tcp(&mut net_service, consensus_port)?;
                 }
 
                 task_executor.spawn_critical_task(

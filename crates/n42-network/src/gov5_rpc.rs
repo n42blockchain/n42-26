@@ -3,7 +3,9 @@ use futures::prelude::*;
 use libp2p::{StreamProtocol, request_response};
 use snap::read::FrameDecoder;
 use snap::write::FrameEncoder;
+use std::fmt;
 use std::io::{self, Read, Write};
+use std::sync::Arc;
 
 /// Gov5's reliable leader-to-peer block push protocol.
 pub const GOV5_BLOCK_PUSH_PROTOCOL: &str = "/rpc/block_push/1/ssz_snappy";
@@ -14,12 +16,181 @@ pub const GOV5_BLOCK_BY_HASH_PROTOCOL: &str = "/rpc/block_by_hash/1/ssz_snappy";
 /// Gov5's periodic chain-status handshake.
 pub const GOV5_STATUS_PROTOCOL: &str = "/rpc/status/1/ssz_snappy";
 
+/// Gov5's canonical-chain catch-up protocol.
+pub const GOV5_BODIES_BY_RANGE_PROTOCOL: &str = "/rpc/bodies_by_range/1/ssz_snappy";
+
 /// Gov5's one-way Rotor/leader-direct HotStuff stream.
 pub const GOV5_HOTSTUFF_DIRECT_PROTOCOL: &str = "/rpc/hotstuff_direct/1";
 
 const MAX_GOV5_BLOCK_SIZE: usize = 1 << 20;
 const MAX_SNAPPY_FRAME_SIZE: usize = MAX_GOV5_BLOCK_SIZE + (MAX_GOV5_BLOCK_SIZE / 6) + 1024;
 const MAX_GOV5_HOTSTUFF_SIZE: usize = 16 * 1024;
+
+/// Gov5's `maxRequestBlocks` / `rangeLimit`.
+pub const MAX_GOV5_RANGE_BLOCKS: u64 = 1024;
+/// Gov5 uses a dedicated 64 MiB decoded limit for block response chunks.
+pub const MAX_GOV5_RANGE_BLOCK_SIZE: usize = 64 * 1024 * 1024;
+const MAX_GOV5_RANGE_WIRE_SIZE: usize =
+    MAX_GOV5_RANGE_BLOCK_SIZE + (MAX_GOV5_RANGE_BLOCK_SIZE / 6) + 1024;
+const GOV5_RANGE_REQUEST_SSZ_LEN: usize = 52;
+type Gov5BestBlockNumber = dyn Fn() -> Result<u64, String> + Send + Sync;
+type Gov5BlockRlpByNumber = dyn Fn(u64) -> Result<Option<Vec<u8>>, String> + Send + Sync;
+
+/// A persistent canonical-chain reader installed by the node layer.
+///
+/// Keeping this as a narrow callback boundary avoids making the transport
+/// crate depend on Reth's concrete provider type. Implementations must read
+/// canonical storage by number; the recent in-memory Gov5 body cache is not a
+/// valid source for this protocol.
+#[derive(Clone)]
+pub struct Gov5CanonicalBlockReader {
+    best_block_number: Arc<Gov5BestBlockNumber>,
+    block_rlp_by_number: Arc<Gov5BlockRlpByNumber>,
+}
+
+impl fmt::Debug for Gov5CanonicalBlockReader {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Gov5CanonicalBlockReader")
+            .finish_non_exhaustive()
+    }
+}
+
+impl Gov5CanonicalBlockReader {
+    pub fn new<B, R>(best_block_number: B, block_rlp_by_number: R) -> Self
+    where
+        B: Fn() -> Result<u64, String> + Send + Sync + 'static,
+        R: Fn(u64) -> Result<Option<Vec<u8>>, String> + Send + Sync + 'static,
+    {
+        Self {
+            best_block_number: Arc::new(best_block_number),
+            block_rlp_by_number: Arc::new(block_rlp_by_number),
+        }
+    }
+
+    pub fn best_block_number(&self) -> Result<u64, String> {
+        (self.best_block_number)()
+    }
+
+    pub fn block_rlp_by_number(&self, number: u64) -> Result<Option<Vec<u8>>, String> {
+        (self.block_rlp_by_number)(number)
+    }
+}
+
+/// Gov5's SSZ `{StartBlockNumber: H256, Count: uint64, Step: uint64}` request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Gov5BodiesByRangeRequest {
+    pub start: u64,
+    pub count: u64,
+    pub step: u64,
+}
+
+impl Gov5BodiesByRangeRequest {
+    pub fn validate(self) -> io::Result<()> {
+        if self.count == 0 || self.count > MAX_GOV5_RANGE_BLOCKS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Gov5 bodies-by-range count must be in 1..=1024",
+            ));
+        }
+        if self.step == 0 || self.step > MAX_GOV5_RANGE_BLOCKS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Gov5 bodies-by-range step must be in 1..=1024",
+            ));
+        }
+        let span = self.step.checked_mul(self.count - 1).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Gov5 bodies-by-range step*count overflows u64",
+            )
+        })?;
+        if span > MAX_GOV5_RANGE_BLOCKS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Gov5 bodies-by-range span exceeds 1024 blocks",
+            ));
+        }
+        self.start.checked_add(span).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Gov5 bodies-by-range end block overflows u64",
+            )
+        })?;
+        Ok(())
+    }
+
+    fn to_ssz(self) -> [u8; GOV5_RANGE_REQUEST_SSZ_LEN] {
+        let mut encoded = [0u8; GOV5_RANGE_REQUEST_SSZ_LEN];
+        encoded[..4].copy_from_slice(&20u32.to_le_bytes());
+        encoded[4..12].copy_from_slice(&self.count.to_le_bytes());
+        encoded[12..20].copy_from_slice(&self.step.to_le_bytes());
+        // H256 is four uint64 words in SSZ. For a u64 block number only the
+        // low word is non-zero; its SSZ representation is little-endian.
+        encoded[44..52].copy_from_slice(&self.start.to_le_bytes());
+        encoded
+    }
+
+    fn from_ssz(encoded: &[u8]) -> io::Result<Self> {
+        if encoded.len() != GOV5_RANGE_REQUEST_SSZ_LEN
+            || encoded[..4] != 20u32.to_le_bytes()
+            || encoded[20..44].iter().any(|byte| *byte != 0)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid Gov5 bodies-by-range SSZ layout",
+            ));
+        }
+        Ok(Self {
+            start: u64::from_le_bytes(encoded[44..52].try_into().unwrap()),
+            count: u64::from_le_bytes(encoded[4..12].try_into().unwrap()),
+            step: u64::from_le_bytes(encoded[12..20].try_into().unwrap()),
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Gov5RangeBlockChunk {
+    pub fork_digest: [u8; 4],
+    pub rlp: Vec<u8>,
+}
+
+/// A range reply read from the wire or streamed from persistent storage.
+#[derive(Clone)]
+pub enum Gov5BodiesByRangeResponse {
+    Blocks(Vec<Gov5RangeBlockChunk>),
+    Error {
+        code: u8,
+        message: String,
+    },
+    Stream {
+        request: Gov5BodiesByRangeRequest,
+        fork_digest: [u8; 4],
+        reader: Gov5CanonicalBlockReader,
+    },
+}
+
+impl fmt::Debug for Gov5BodiesByRangeResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Blocks(blocks) => formatter.debug_tuple("Blocks").field(blocks).finish(),
+            Self::Error { code, message } => formatter
+                .debug_struct("Error")
+                .field("code", code)
+                .field("message", message)
+                .finish(),
+            Self::Stream {
+                request,
+                fork_digest,
+                ..
+            } => formatter
+                .debug_struct("Stream")
+                .field("request", request)
+                .field("fork_digest", fork_digest)
+                .finish_non_exhaustive(),
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct Gov5HotstuffDirectRequest {
@@ -426,6 +597,321 @@ fn encode_chunked_block(rlp: &[u8], fork_digest: [u8; 4]) -> io::Result<Vec<u8>>
     Ok(encoded)
 }
 
+fn encode_framed_payload(payload: &[u8], max_decoded: usize) -> io::Result<Vec<u8>> {
+    if payload.len() > max_decoded {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Gov5 framed payload exceeds decoded size limit",
+        ));
+    }
+    let mut frame = FrameEncoder::new(Vec::new());
+    frame.write_all(payload)?;
+    let compressed = frame.into_inner().map_err(io::Error::other)?;
+    let mut encoded = Vec::with_capacity(10 + compressed.len());
+    encode_uvarint(payload.len(), &mut encoded);
+    encoded.extend_from_slice(&compressed);
+    Ok(encoded)
+}
+
+async fn read_framed_payload<T>(
+    io: &mut T,
+    max_wire: usize,
+    max_decoded: usize,
+) -> io::Result<Vec<u8>>
+where
+    T: AsyncRead + Unpin + Send,
+{
+    let mut encoded = Vec::with_capacity(128);
+    let declared_len = loop {
+        if encoded.len() == 10 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Gov5 framed payload length varint is too long",
+            ));
+        }
+        let mut byte = [0u8; 1];
+        io.read_exact(&mut byte).await?;
+        encoded.push(byte[0]);
+        if byte[0] & 0x80 == 0 {
+            break decode_uvarint(&encoded)?.0;
+        }
+    };
+    if declared_len > max_decoded {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Gov5 framed payload exceeds decoded size limit",
+        ));
+    }
+
+    let prefix_len = encoded.len();
+    let mut produced = 0usize;
+    let mut saw_stream_identifier = false;
+    while produced < declared_len || !saw_stream_identifier {
+        let mut header = [0u8; 4];
+        io.read_exact(&mut header).await?;
+        let chunk_len =
+            usize::from(header[1]) | (usize::from(header[2]) << 8) | (usize::from(header[3]) << 16);
+        let next_len = encoded
+            .len()
+            .checked_add(4)
+            .and_then(|length| length.checked_add(chunk_len))
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Gov5 Snappy frame size overflows",
+                )
+            })?;
+        if next_len > max_wire {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Gov5 Snappy frame exceeds wire size limit",
+            ));
+        }
+        encoded.extend_from_slice(&header);
+        let body_start = encoded.len();
+        encoded.resize(next_len, 0);
+        io.read_exact(&mut encoded[body_start..]).await?;
+        let body = &encoded[body_start..];
+
+        let decoded = match header[0] {
+            0xff => {
+                saw_stream_identifier = true;
+                0
+            }
+            0x00 => {
+                let compressed = body.get(4..).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "compressed Gov5 Snappy chunk is missing its checksum",
+                    )
+                })?;
+                snap::raw::decompress_len(compressed).map_err(io::Error::other)?
+            }
+            0x01 => body.len().checked_sub(4).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "uncompressed Gov5 Snappy chunk is missing its checksum",
+                )
+            })?,
+            0x80..=0xfe => 0,
+            kind => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("reserved Gov5 Snappy chunk type {kind:#x}"),
+                ));
+            }
+        };
+        produced = produced.checked_add(decoded).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Gov5 Snappy decoded length overflows",
+            )
+        })?;
+        if produced > declared_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Gov5 Snappy payload exceeds its declared length",
+            ));
+        }
+    }
+
+    let mut decoded = Vec::with_capacity(declared_len);
+    FrameDecoder::new(&encoded[prefix_len..])
+        .take((declared_len + 1) as u64)
+        .read_to_end(&mut decoded)?;
+    if decoded.len() != declared_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Gov5 Snappy payload does not match its declared length",
+        ));
+    }
+    Ok(decoded)
+}
+
+fn encode_range_chunk(chunk: &Gov5RangeBlockChunk) -> io::Result<Vec<u8>> {
+    let mut encoded = Vec::with_capacity(5 + chunk.rlp.len());
+    encoded.push(0);
+    encoded.extend_from_slice(&chunk.fork_digest);
+    encoded.extend_from_slice(&encode_framed_payload(
+        &chunk.rlp,
+        MAX_GOV5_RANGE_BLOCK_SIZE,
+    )?);
+    Ok(encoded)
+}
+
+fn encode_range_error(code: u8, message: &str) -> io::Result<Vec<u8>> {
+    let mut encoded = vec![code];
+    encoded.extend_from_slice(&encode_framed_payload(
+        message.as_bytes(),
+        MAX_GOV5_BLOCK_SIZE,
+    )?);
+    Ok(encoded)
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Gov5BodiesByRangeCodec;
+
+impl request_response::Codec for Gov5BodiesByRangeCodec {
+    type Protocol = StreamProtocol;
+    type Request = Gov5BodiesByRangeRequest;
+    type Response = Gov5BodiesByRangeResponse;
+
+    async fn read_request<T>(&mut self, _: &Self::Protocol, io: &mut T) -> io::Result<Self::Request>
+    where
+        T: AsyncRead + Unpin + Send,
+    {
+        let encoded = read_framed_payload(io, 1024, GOV5_RANGE_REQUEST_SSZ_LEN).await?;
+        Gov5BodiesByRangeRequest::from_ssz(&encoded)
+    }
+
+    async fn read_response<T>(
+        &mut self,
+        _: &Self::Protocol,
+        io: &mut T,
+    ) -> io::Result<Self::Response>
+    where
+        T: AsyncRead + Unpin + Send,
+    {
+        let mut blocks = Vec::new();
+        loop {
+            let mut status = [0u8; 1];
+            match io.read(&mut status).await? {
+                0 => return Ok(Gov5BodiesByRangeResponse::Blocks(blocks)),
+                1 if status[0] == 0 => {}
+                1 => {
+                    let message =
+                        read_framed_payload(io, MAX_SNAPPY_FRAME_SIZE, MAX_GOV5_BLOCK_SIZE).await?;
+                    return Ok(Gov5BodiesByRangeResponse::Error {
+                        code: status[0],
+                        message: String::from_utf8_lossy(&message).into_owned(),
+                    });
+                }
+                _ => unreachable!("one-byte read buffer"),
+            }
+            if blocks.len() >= MAX_GOV5_RANGE_BLOCKS as usize {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Gov5 peer served more than 1024 range blocks",
+                ));
+            }
+            let mut fork_digest = [0u8; 4];
+            io.read_exact(&mut fork_digest).await?;
+            let rlp = read_framed_payload(io, MAX_GOV5_RANGE_WIRE_SIZE, MAX_GOV5_RANGE_BLOCK_SIZE)
+                .await?;
+            blocks.push(Gov5RangeBlockChunk { fork_digest, rlp });
+        }
+    }
+
+    async fn write_request<T>(
+        &mut self,
+        _: &Self::Protocol,
+        io: &mut T,
+        request: Self::Request,
+    ) -> io::Result<()>
+    where
+        T: AsyncWrite + Unpin + Send,
+    {
+        request.validate()?;
+        io.write_all(&encode_framed_payload(
+            &request.to_ssz(),
+            GOV5_RANGE_REQUEST_SSZ_LEN,
+        )?)
+        .await?;
+        io.close().await
+    }
+
+    async fn write_response<T>(
+        &mut self,
+        _: &Self::Protocol,
+        io: &mut T,
+        response: Self::Response,
+    ) -> io::Result<()>
+    where
+        T: AsyncWrite + Unpin + Send,
+    {
+        match response {
+            Gov5BodiesByRangeResponse::Blocks(blocks) => {
+                if blocks.len() > MAX_GOV5_RANGE_BLOCKS as usize {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "Gov5 range response contains more than 1024 blocks",
+                    ));
+                }
+                for block in blocks {
+                    io.write_all(&encode_range_chunk(&block)?).await?;
+                }
+            }
+            Gov5BodiesByRangeResponse::Error { code, message } => {
+                io.write_all(&encode_range_error(code, &message)?).await?;
+            }
+            Gov5BodiesByRangeResponse::Stream {
+                request,
+                fork_digest,
+                reader,
+            } => {
+                request.validate()?;
+                // This deliberately matches gov5: validate the requested
+                // step/span first, then normalize any step > 1 to a
+                // contiguous response. Current gov5 clients always send 1.
+                let end = request
+                    .start
+                    .checked_add(request.count - 1)
+                    .expect("validated range cannot overflow");
+                let mut previous_hash = None;
+                for number in request.start..=end {
+                    let rlp = match reader.block_rlp_by_number(number) {
+                        Ok(Some(rlp)) => rlp,
+                        Ok(None) => {
+                            io.write_all(&encode_range_error(2, "block not found")?)
+                                .await?;
+                            break;
+                        }
+                        Err(error) => {
+                            io.write_all(&encode_range_error(2, &error)?).await?;
+                            break;
+                        }
+                    };
+                    if rlp.len() > MAX_GOV5_RANGE_BLOCK_SIZE {
+                        io.write_all(&encode_range_error(2, "block exceeds 64 MiB chunk limit")?)
+                            .await?;
+                        break;
+                    }
+                    let decoded = match crate::gov5_block::decode_gov5_block_rlp(&rlp) {
+                        Ok(decoded) => decoded,
+                        Err(error) => {
+                            io.write_all(&encode_range_error(
+                                2,
+                                &format!("invalid canonical block: {error}"),
+                            )?)
+                            .await?;
+                            break;
+                        }
+                    };
+                    if decoded.header.number != number {
+                        io.write_all(&encode_range_error(2, "canonical block number mismatch")?)
+                            .await?;
+                        break;
+                    }
+                    if previous_hash.is_some_and(|previous| decoded.header.parent_hash != previous)
+                    {
+                        // Match gov5: a broken by-number canonical sequence is
+                        // truncated at the linked prefix rather than poisoning
+                        // the requester with a disjoint block.
+                        break;
+                    }
+                    previous_hash = Some(decoded.block_hash);
+                    io.write_all(&encode_range_chunk(&Gov5RangeBlockChunk {
+                        fork_digest,
+                        rlp,
+                    })?)
+                    .await?;
+                }
+            }
+        }
+        io.close().await
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Gov5BlockPushCodec;
 
@@ -636,7 +1122,11 @@ impl request_response::Codec for Gov5StatusCodec {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_consensus::{Header, TxEnvelope, proofs::calculate_transaction_root};
+    use alloy_primitives::{Bytes, U256, keccak256};
+    use alloy_rlp::{Encodable, Header as RlpHeader};
     use libp2p::request_response::Codec;
+    use std::collections::HashMap;
     use std::{pin::Pin, task::Poll};
 
     struct NoEof {
@@ -663,6 +1153,39 @@ mod tests {
         frame.write_all(payload).unwrap();
         encoded.extend(frame.into_inner().unwrap());
         encoded
+    }
+
+    fn range_block(number: u64, parent_hash: B256) -> (B256, Vec<u8>) {
+        let mut extra_data = Vec::from(&b"N42H"[..]);
+        extra_data.extend_from_slice(&number.to_le_bytes());
+        let header = Header {
+            parent_hash,
+            number,
+            ommers_hash: B256::ZERO,
+            transactions_root: calculate_transaction_root::<TxEnvelope>(&[]),
+            difficulty: U256::ZERO,
+            base_fee_per_gas: Some(0),
+            extra_data: Bytes::from(extra_data),
+            ..Default::default()
+        };
+        let mut header_rlp = Vec::new();
+        header.encode(&mut header_rlp);
+        let transactions = Vec::<Bytes>::new();
+        let verifiers = Vec::<Bytes>::new();
+        let rewards = Vec::<Bytes>::new();
+        let payload_length =
+            header_rlp.len() + transactions.length() + verifiers.length() + rewards.length();
+        let mut encoded = Vec::new();
+        RlpHeader {
+            list: true,
+            payload_length,
+        }
+        .encode(&mut encoded);
+        encoded.extend_from_slice(&header_rlp);
+        transactions.encode(&mut encoded);
+        verifiers.encode(&mut encoded);
+        rewards.encode(&mut encoded);
+        (keccak256(header_rlp), encoded)
     }
 
     #[test]
@@ -821,5 +1344,279 @@ mod tests {
 
         let error = decode_chunked_block(&encoded).expect_err("expansion must be rejected");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn bodies_by_range_request_matches_gov5_ssz_and_framing() {
+        let request = Gov5BodiesByRangeRequest {
+            start: 7,
+            count: 1024,
+            step: 1,
+        };
+        let ssz = request.to_ssz();
+        assert_eq!(&ssz[..4], &20u32.to_le_bytes());
+        assert_eq!(&ssz[4..12], &1024u64.to_le_bytes());
+        assert_eq!(&ssz[12..20], &1u64.to_le_bytes());
+        assert_eq!(&ssz[20..44], &[0u8; 24]);
+        assert_eq!(&ssz[44..52], &7u64.to_le_bytes());
+
+        let protocol = StreamProtocol::new(GOV5_BODIES_BY_RANGE_PROTOCOL);
+        let mut wire = futures::io::Cursor::new(Vec::new());
+        futures::executor::block_on(
+            Gov5BodiesByRangeCodec.write_request(&protocol, &mut wire, request),
+        )
+        .unwrap();
+        let mut wire = futures::io::Cursor::new(wire.into_inner());
+        assert_eq!(
+            futures::executor::block_on(Gov5BodiesByRangeCodec.read_request(&protocol, &mut wire))
+                .unwrap(),
+            request
+        );
+    }
+
+    #[test]
+    fn bodies_by_range_rejects_invalid_count_step_and_overflow() {
+        for request in [
+            Gov5BodiesByRangeRequest {
+                start: 0,
+                count: 0,
+                step: 1,
+            },
+            Gov5BodiesByRangeRequest {
+                start: 0,
+                count: MAX_GOV5_RANGE_BLOCKS + 1,
+                step: 1,
+            },
+            Gov5BodiesByRangeRequest {
+                start: 0,
+                count: 1,
+                step: 0,
+            },
+            Gov5BodiesByRangeRequest {
+                start: 0,
+                count: 1,
+                step: MAX_GOV5_RANGE_BLOCKS + 1,
+            },
+            Gov5BodiesByRangeRequest {
+                start: 0,
+                count: 514,
+                step: 2,
+            },
+            Gov5BodiesByRangeRequest {
+                start: u64::MAX,
+                count: 2,
+                step: 1,
+            },
+        ] {
+            assert!(request.validate().is_err(), "accepted {request:?}");
+        }
+    }
+
+    #[test]
+    fn bodies_by_range_matches_gov5_step_normalization() {
+        let request = Gov5BodiesByRangeRequest {
+            start: 10,
+            count: 2,
+            step: 2,
+        };
+        request.validate().unwrap();
+
+        let (hash_10, block_10) = range_block(10, B256::repeat_byte(9));
+        let (_, block_11) = range_block(11, hash_10);
+        let expected = [block_10, block_11];
+        let stored: Arc<HashMap<u64, Vec<u8>>> =
+            Arc::new([(10, expected[0].clone()), (11, expected[1].clone())].into());
+        let blocks = Arc::clone(&stored);
+        let reader = Gov5CanonicalBlockReader::new(
+            || Ok(11),
+            move |number| Ok(blocks.get(&number).cloned()),
+        );
+        let response = Gov5BodiesByRangeResponse::Stream {
+            request,
+            fork_digest: [1, 2, 3, 4],
+            reader,
+        };
+        let protocol = StreamProtocol::new(GOV5_BODIES_BY_RANGE_PROTOCOL);
+        let mut wire = futures::io::Cursor::new(Vec::new());
+        futures::executor::block_on(
+            Gov5BodiesByRangeCodec.write_response(&protocol, &mut wire, response),
+        )
+        .unwrap();
+        let mut wire = futures::io::Cursor::new(wire.into_inner());
+        let Gov5BodiesByRangeResponse::Blocks(decoded) =
+            futures::executor::block_on(Gov5BodiesByRangeCodec.read_response(&protocol, &mut wire))
+                .unwrap()
+        else {
+            panic!("expected block response");
+        };
+        assert_eq!(
+            decoded
+                .into_iter()
+                .map(|chunk| chunk.rlp)
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
+
+    #[test]
+    fn bodies_by_range_streams_persistent_blocks_and_checks_continuity() {
+        let (_, block_10) = range_block(10, B256::repeat_byte(9));
+        let (hash_10, _) = range_block(10, B256::repeat_byte(9));
+        let (_, block_11) = range_block(11, hash_10);
+        let (hash_11, _) = range_block(11, hash_10);
+        let (_, block_12) = range_block(12, hash_11);
+        let expected = vec![block_10, block_11, block_12];
+        let stored: Arc<HashMap<u64, Vec<u8>>> = Arc::new(
+            expected
+                .iter()
+                .cloned()
+                .enumerate()
+                .map(|(offset, block)| (10 + offset as u64, block))
+                .collect(),
+        );
+        let blocks = Arc::clone(&stored);
+        let reader = Gov5CanonicalBlockReader::new(
+            || Ok(12),
+            move |number| Ok(blocks.get(&number).cloned()),
+        );
+        let response = Gov5BodiesByRangeResponse::Stream {
+            request: Gov5BodiesByRangeRequest {
+                start: 10,
+                count: 3,
+                step: 1,
+            },
+            fork_digest: [1, 2, 3, 4],
+            reader,
+        };
+        let protocol = StreamProtocol::new(GOV5_BODIES_BY_RANGE_PROTOCOL);
+        let mut wire = futures::io::Cursor::new(Vec::new());
+        futures::executor::block_on(
+            Gov5BodiesByRangeCodec.write_response(&protocol, &mut wire, response),
+        )
+        .unwrap();
+        let mut wire = futures::io::Cursor::new(wire.into_inner());
+        let decoded =
+            futures::executor::block_on(Gov5BodiesByRangeCodec.read_response(&protocol, &mut wire))
+                .unwrap();
+        let Gov5BodiesByRangeResponse::Blocks(decoded) = decoded else {
+            panic!("expected block response");
+        };
+        assert_eq!(decoded.len(), 3);
+        assert_eq!(
+            decoded
+                .into_iter()
+                .map(|chunk| chunk.rlp)
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
+
+    #[test]
+    fn bodies_by_range_truncates_a_disjoint_canonical_sequence() {
+        let (_, block_10) = range_block(10, B256::repeat_byte(9));
+        let (_, disjoint_block_11) = range_block(11, B256::repeat_byte(7));
+        let stored: Arc<HashMap<u64, Vec<u8>>> =
+            Arc::new([(10, block_10.clone()), (11, disjoint_block_11)].into());
+        let blocks = Arc::clone(&stored);
+        let reader = Gov5CanonicalBlockReader::new(
+            || Ok(11),
+            move |number| Ok(blocks.get(&number).cloned()),
+        );
+        let response = Gov5BodiesByRangeResponse::Stream {
+            request: Gov5BodiesByRangeRequest {
+                start: 10,
+                count: 2,
+                step: 1,
+            },
+            fork_digest: [1, 2, 3, 4],
+            reader,
+        };
+        let protocol = StreamProtocol::new(GOV5_BODIES_BY_RANGE_PROTOCOL);
+        let mut wire = futures::io::Cursor::new(Vec::new());
+        futures::executor::block_on(
+            Gov5BodiesByRangeCodec.write_response(&protocol, &mut wire, response),
+        )
+        .unwrap();
+        let mut wire = futures::io::Cursor::new(wire.into_inner());
+        let Gov5BodiesByRangeResponse::Blocks(decoded) =
+            futures::executor::block_on(Gov5BodiesByRangeCodec.read_response(&protocol, &mut wire))
+                .unwrap()
+        else {
+            panic!("expected block response");
+        };
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].rlp, block_10);
+    }
+
+    #[test]
+    fn bodies_by_range_serves_three_full_persistent_batches() {
+        let mut parent = B256::repeat_byte(9);
+        let mut stored = HashMap::with_capacity(3 * MAX_GOV5_RANGE_BLOCKS as usize);
+        for number in 1..=3 * MAX_GOV5_RANGE_BLOCKS {
+            let (hash, block) = range_block(number, parent);
+            stored.insert(number, block);
+            parent = hash;
+        }
+        let stored = Arc::new(stored);
+        let reader_blocks = Arc::clone(&stored);
+        let reader = Gov5CanonicalBlockReader::new(
+            || Ok(3 * MAX_GOV5_RANGE_BLOCKS),
+            move |number| Ok(reader_blocks.get(&number).cloned()),
+        );
+        let protocol = StreamProtocol::new(GOV5_BODIES_BY_RANGE_PROTOCOL);
+
+        for batch in 0..3 {
+            let start = 1 + batch * MAX_GOV5_RANGE_BLOCKS;
+            let response = Gov5BodiesByRangeResponse::Stream {
+                request: Gov5BodiesByRangeRequest {
+                    start,
+                    count: MAX_GOV5_RANGE_BLOCKS,
+                    step: 1,
+                },
+                fork_digest: [1, 2, 3, 4],
+                reader: reader.clone(),
+            };
+            let mut wire = futures::io::Cursor::new(Vec::new());
+            futures::executor::block_on(
+                Gov5BodiesByRangeCodec.write_response(&protocol, &mut wire, response),
+            )
+            .unwrap();
+            let mut wire = futures::io::Cursor::new(wire.into_inner());
+            let Gov5BodiesByRangeResponse::Blocks(decoded) = futures::executor::block_on(
+                Gov5BodiesByRangeCodec.read_response(&protocol, &mut wire),
+            )
+            .unwrap() else {
+                panic!("expected block response");
+            };
+            assert_eq!(decoded.len(), MAX_GOV5_RANGE_BLOCKS as usize);
+            assert_eq!(decoded[0].rlp, stored[&start]);
+            assert_eq!(
+                decoded.last().unwrap().rlp,
+                stored[&(start + MAX_GOV5_RANGE_BLOCKS - 1)]
+            );
+        }
+    }
+
+    #[test]
+    fn bodies_by_range_supports_blocks_above_the_old_one_mib_limit() {
+        let payload = vec![0x42; 2 * 1024 * 1024];
+        let response = Gov5BodiesByRangeResponse::Blocks(vec![Gov5RangeBlockChunk {
+            fork_digest: [9, 8, 7, 6],
+            rlp: payload.clone(),
+        }]);
+        let protocol = StreamProtocol::new(GOV5_BODIES_BY_RANGE_PROTOCOL);
+        let mut wire = futures::io::Cursor::new(Vec::new());
+        futures::executor::block_on(
+            Gov5BodiesByRangeCodec.write_response(&protocol, &mut wire, response),
+        )
+        .unwrap();
+        let mut wire = futures::io::Cursor::new(wire.into_inner());
+        let decoded =
+            futures::executor::block_on(Gov5BodiesByRangeCodec.read_response(&protocol, &mut wire))
+                .unwrap();
+        let Gov5BodiesByRangeResponse::Blocks(decoded) = decoded else {
+            panic!("expected block response");
+        };
+        assert_eq!(decoded[0].rlp, payload);
     }
 }
