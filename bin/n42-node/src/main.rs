@@ -64,6 +64,60 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
+/// Serve gov5 bodies-by-range from one consistent storage view per batch.
+///
+/// `block_by_number` and `block_hash` on the blockchain provider each take
+/// their own snapshot, so a reorg or a persistence step between the two calls
+/// could pair a body with another block's canonical hash;
+/// `encode_gov5_block_rlp` would then reject the pair via its `hash_slow()`
+/// check and the whole range would fail. A `ConsistentProvider` pins one
+/// database read transaction plus one in-memory canonical snapshot for the
+/// batch; it is dropped before the batch is written to the peer so the read
+/// transaction never outlives the socket pacing.
+fn gov5_canonical_block_reader<N>(
+    provider: reth_provider::providers::BlockchainProvider<N>,
+) -> n42_network::Gov5CanonicalBlockReader
+where
+    N: reth_provider::providers::ProviderNodeTypes<
+            Primitives = reth_ethereum_primitives::EthPrimitives,
+        >,
+{
+    let best_provider = provider.clone();
+    n42_network::Gov5CanonicalBlockReader::new_ranged(
+        move || {
+            best_provider
+                .best_block_number()
+                .map_err(|error| error.to_string())
+        },
+        move |numbers| {
+            let view = provider
+                .consistent_provider()
+                .map_err(|error| error.to_string())?;
+            let mut rlps = Vec::with_capacity(numbers.size_hint().0);
+            for number in numbers {
+                let Some(block) = view
+                    .block_by_number(number)
+                    .map_err(|error| error.to_string())?
+                else {
+                    break;
+                };
+                let block_hash = view
+                    .block_hash(number)
+                    .map_err(|error| error.to_string())?
+                    .ok_or_else(|| {
+                        format!("canonical hash is missing for persisted block {number}")
+                    })?;
+                let execution = ExecutionData::from_block_unchecked(block_hash, &block);
+                rlps.push(
+                    n42_network::encode_gov5_block_rlp(&execution)
+                        .map_err(|error| error.to_string())?,
+                );
+            }
+            Ok(rlps)
+        },
+    )
+}
+
 fn env_bool(name: &str) -> bool {
     std::env::var(name)
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -2085,38 +2139,9 @@ fn main() {
                             interop_genesis_hash,
                         )
                             .map_err(|e| eyre::eyre!("failed to create observer network service: {e}"))?;
-                    let best_provider = full_node.provider.clone();
-                    let block_provider = full_node.provider.clone();
-                    net_service.set_gov5_canonical_block_reader(
-                        n42_network::Gov5CanonicalBlockReader::new(
-                            move || {
-                                best_provider
-                                    .best_block_number()
-                                    .map_err(|error| error.to_string())
-                            },
-                            move |number| {
-                                let Some(block) = block_provider
-                                    .block_by_number(number)
-                                    .map_err(|error| error.to_string())?
-                                else {
-                                    return Ok(None);
-                                };
-                                let block_hash = block_provider
-                                    .block_hash(number)
-                                    .map_err(|error| error.to_string())?
-                                    .ok_or_else(|| {
-                                        format!(
-                                            "canonical hash is missing for persisted block {number}"
-                                        )
-                                    })?;
-                                let execution =
-                                    ExecutionData::from_block_unchecked(block_hash, &block);
-                                n42_network::encode_gov5_block_rlp(&execution)
-                                    .map(Some)
-                                    .map_err(|error| error.to_string())
-                            },
-                        ),
-                    );
+                    net_service.set_gov5_canonical_block_reader(gov5_canonical_block_reader(
+                        full_node.provider.clone(),
+                    ));
 
                     let consensus_port: u16 = env_parse("N42_CONSENSUS_PORT").unwrap_or(9400);
                     let listen_addr: libp2p::Multiaddr = format!(
@@ -2245,38 +2270,9 @@ fn main() {
                     }
                         .map_err(|e| eyre::eyre!("failed to create consensus network service: {e}"))?;
                 if h2_v4_participant {
-                    let best_provider = full_node.provider.clone();
-                    let block_provider = full_node.provider.clone();
-                    net_service.set_gov5_canonical_block_reader(
-                        n42_network::Gov5CanonicalBlockReader::new(
-                            move || {
-                                best_provider
-                                    .best_block_number()
-                                    .map_err(|error| error.to_string())
-                            },
-                            move |number| {
-                                let Some(block) = block_provider
-                                    .block_by_number(number)
-                                    .map_err(|error| error.to_string())?
-                                else {
-                                    return Ok(None);
-                                };
-                                let block_hash = block_provider
-                                    .block_hash(number)
-                                    .map_err(|error| error.to_string())?
-                                    .ok_or_else(|| {
-                                        format!(
-                                            "canonical hash is missing for persisted block {number}"
-                                        )
-                                    })?;
-                                let execution =
-                                    ExecutionData::from_block_unchecked(block_hash, &block);
-                                n42_network::encode_gov5_block_rlp(&execution)
-                                    .map(Some)
-                                    .map_err(|error| error.to_string())
-                            },
-                        ),
-                    );
+                    net_service.set_gov5_canonical_block_reader(gov5_canonical_block_reader(
+                        full_node.provider.clone(),
+                    ));
                 }
 
                 let consensus_port: u16 = env_parse("N42_CONSENSUS_PORT").unwrap_or(9400);
