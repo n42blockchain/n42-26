@@ -353,6 +353,153 @@ mod tests {
         }
     }
 
+    /// Small deterministic PRNG for the property tests below.
+    struct Xorshift(u64);
+
+    impl Xorshift {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, bound: usize) -> usize {
+            (self.next() % bound as u64) as usize
+        }
+    }
+
+    /// Highly compressible bytes: a short repeated pattern with rare edits,
+    /// so every chunk takes the compressed path.
+    fn repetitive(len: usize, seed: u64) -> Vec<u8> {
+        let pattern: Vec<u8> = (0..(seed % 13 + 3))
+            .map(|i| (i * 37 + seed) as u8)
+            .collect();
+        let mut out: Vec<u8> = pattern.iter().cycle().take(len).copied().collect();
+        let mut rng = Xorshift(seed | 1);
+        for _ in 0..len / 4096 {
+            let at = rng.below(len);
+            out[at] ^= 0x80;
+        }
+        out
+    }
+
+    /// A payload of a random content class: incompressible noise, mixed
+    /// block-like bytes, or repetitive data.
+    fn random_payload(rng: &mut Xorshift, len: usize, class: usize) -> (&'static str, Vec<u8>) {
+        let seed = rng.next();
+        match class {
+            0 => ("noise", noise(len, seed)),
+            1 => ("sample", sample(len, seed)),
+            _ => ("repetitive", repetitive(len, seed)),
+        }
+    }
+
+    /// `FrameEncoder` fed in random write sizes, the way a streaming writer
+    /// would, so our decoder is checked against every chunking snap emits.
+    fn snap_frame_split_writes(payload: &[u8], rng: &mut Xorshift) -> Vec<u8> {
+        let mut encoder = snap::write::FrameEncoder::new(Vec::new());
+        let mut rest = payload;
+        while !rest.is_empty() {
+            let take = (rng.below(3 * MAX_BLOCK_SIZE) + 1).min(rest.len());
+            encoder.write_all(&rest[..take]).unwrap();
+            rest = &rest[take..];
+        }
+        encoder.into_inner().unwrap()
+    }
+
+    /// Random length for the differential tests: mostly uniform over
+    /// 0..300 KiB, with the chunk boundaries and the tiny sizes forced in.
+    fn random_len(rng: &mut Xorshift, iteration: usize) -> usize {
+        const MAX_LEN: usize = 300 * 1024;
+        match iteration % 8 {
+            0 => rng.below(5),
+            1 => {
+                let boundary = MAX_BLOCK_SIZE * (rng.below(4) + 1);
+                (boundary + rng.below(7)).saturating_sub(3).min(MAX_LEN)
+            }
+            _ => rng.below(MAX_LEN + 1),
+        }
+    }
+
+    /// Differential property test against the `snap` crate: for random
+    /// lengths in 0..300 KiB and random, mixed and repetitive content, our
+    /// frame is byte-identical to `FrameEncoder`'s, `FrameDecoder` decodes
+    /// ours, our decoder decodes `FrameEncoder` output for any write
+    /// pattern, and a payload one byte over its limit is refused.
+    #[test]
+    fn frame_codec_matches_snap_over_random_inputs() {
+        let mut rng = Xorshift(0x5EED_5EED_5EED_5EED);
+        for iteration in 0..600 {
+            let len = random_len(&mut rng, iteration);
+            let (label, payload) = random_payload(&mut rng, len, iteration % 3);
+            let context = format!("iteration {iteration} {label} len {len}");
+
+            let ours = frame_encode(&payload).unwrap();
+            let theirs = snap_frame(&payload);
+            assert!(ours == theirs, "{context}: frame differs from FrameEncoder");
+
+            assert_eq!(frame_decode(&ours, len).unwrap(), payload, "{context}");
+            assert_eq!(
+                frame_decode(&ours, len + 1).unwrap(),
+                payload,
+                "{context}: a looser limit must not change the output"
+            );
+            if len > 0 {
+                assert_eq!(snap_unframe(&ours), payload, "{context}: FrameDecoder");
+                assert!(
+                    frame_decode(&ours, len - 1).is_err(),
+                    "{context}: one byte over the limit must be refused"
+                );
+                let split = snap_frame_split_writes(&payload, &mut rng);
+                assert_eq!(
+                    frame_decode(&split, len).unwrap(),
+                    payload,
+                    "{context}: FrameEncoder output with split writes"
+                );
+            }
+        }
+    }
+
+    /// CRC-32C oracle: `FrameEncoder` puts the masked CRC-32C of each block
+    /// in its chunk header, so a single-block frame exposes snap's checksum
+    /// for arbitrary data. Both of our implementations must reproduce it.
+    #[test]
+    fn crc32c_matches_snap_checksums_on_random_data() {
+        let mut rng = Xorshift(0xC5C5_C5C5_1234_5678);
+        for iteration in 0..400 {
+            let len = match iteration % 4 {
+                0 => rng.below(17),
+                1 => MAX_BLOCK_SIZE - rng.below(9),
+                _ => rng.below(MAX_BLOCK_SIZE) + 1,
+            };
+            if len == 0 {
+                continue;
+            }
+            let (label, data) = random_payload(&mut rng, len, iteration % 3);
+            let frame = snap_frame(&data);
+            assert_eq!(frame[10] & 0xfe, 0, "{label} len {len}: single data chunk");
+            let expected = u32::from_le_bytes(frame[14..18].try_into().unwrap());
+            assert_eq!(
+                crc32c_masked(&data),
+                expected,
+                "{label} len {len}: masked CRC"
+            );
+            let unmasked = crc32c_table(&data);
+            assert_eq!(
+                (unmasked.wrapping_shr(15) | unmasked.wrapping_shl(17)).wrapping_add(0xA282_EAD8),
+                expected,
+                "{label} len {len}: table CRC"
+            );
+            #[cfg(target_arch = "x86_64")]
+            if std::arch::is_x86_feature_detected!("sse4.2") {
+                // SAFETY: SSE4.2 was detected at runtime.
+                let hardware = unsafe { crc32c_sse42(&data) };
+                assert_eq!(hardware, unmasked, "{label} len {len}: SSE4.2 CRC");
+            }
+        }
+    }
+
     #[test]
     fn frame_encode_handles_the_twelve_mebibyte_range_chunk() {
         let payload = sample(12 << 20, 12);
