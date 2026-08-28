@@ -144,6 +144,11 @@ struct QmdbWalFile {
     /// Length after the last fully written frame; a torn append is rolled
     /// back to it.
     len: u64,
+    /// Set once a torn append could not be rolled back. `len` then no longer
+    /// matches the file, so a later append would land behind garbage and a
+    /// later rollback could cut into a durable frame; every further commit is
+    /// refused instead, and the next open recovers the file from disk.
+    poisoned: Option<String>,
 }
 
 /// Test-only WAL fault injection, applied to the next append.
@@ -154,6 +159,9 @@ enum WalFault {
     Delay(std::time::Duration),
     /// Write half the frame, then fail as an I/O error would.
     FailWrite,
+    /// Like `FailWrite`, but the rollback truncation fails as well, leaving
+    /// the torn half-frame on disk.
+    FailWriteAndRollback,
 }
 
 const QMDB_WAL_MAX_RECORD_BYTES: usize = 64 * 1024 * 1024;
@@ -771,9 +779,20 @@ impl Gov5QmdbStateRootStore {
     }
 
     /// Append one framed record through the persistent handle and make it
-    /// durable. The append only extends the file, so `sync_data` suffices: it
-    /// flushes the data plus the size change needed to read it back. A failed
-    /// or torn write is rolled back to the previous length.
+    /// durable.
+    ///
+    /// Durability uses `sync_data` (`fdatasync`) rather than `sync_all`. The
+    /// append only extends the file, and POSIX requires `fdatasync` to flush
+    /// every piece of metadata needed to read the written data back, which
+    /// includes the new size: both ext4 and XFS journal a size extension as
+    /// part of `fdatasync`, and only timestamps and similar bookkeeping are
+    /// left behind. The directory entry of a freshly created WAL is made
+    /// durable once, in [`open_wal_file`], so a first append after open needs
+    /// no `sync_all` either.
+    ///
+    /// A failed or torn write is rolled back to the previous length. If that
+    /// rollback itself fails the handle is poisoned and every later commit is
+    /// refused, because `len` would no longer describe the file.
     fn append_wal_frame(&self, frame: &[u8]) -> Result<(), Gov5QmdbStateRootError> {
         let mut guard = self
             .wal
@@ -782,10 +801,15 @@ impl Gov5QmdbStateRootStore {
         let Some(wal) = guard.as_mut() else {
             return Ok(());
         };
+        if let Some(reason) = &wal.poisoned {
+            return Err(Gov5QmdbStateRootError::Persistence(format!(
+                "QMDB WAL refuses appends after a failed rollback: {reason}"
+            )));
+        }
         #[cfg(test)]
-        let injected = self.apply_wal_fault(wal, frame);
+        let (injected, fail_rollback) = self.apply_wal_fault(wal, frame);
         #[cfg(not(test))]
-        let injected: Option<std::io::Error> = None;
+        let (injected, fail_rollback): (Option<std::io::Error>, bool) = (None, false);
         let write_result = match injected {
             Some(error) => Err(error),
             None => wal.file.write_all(frame).and_then(|()| {
@@ -797,8 +821,21 @@ impl Gov5QmdbStateRootStore {
             }),
         };
         if let Err(error) = write_result {
-            let _ = wal.file.set_len(wal.len);
-            let _ = wal.file.sync_all();
+            let rollback = if fail_rollback {
+                Err(std::io::Error::other("injected QMDB WAL rollback failure"))
+            } else {
+                wal.file.set_len(wal.len).and_then(|()| wal.file.sync_all())
+            };
+            if let Err(rollback_error) = rollback {
+                let reason = format!(
+                    "append failed ({error}) and rollback to {} bytes failed ({rollback_error})",
+                    wal.len
+                );
+                metrics::counter!("n42_qmdb_wal_poisoned_total").increment(1);
+                tracing::error!(target: "n42::qmdb", %reason, "QMDB WAL poisoned; refusing further commits until restart");
+                wal.poisoned = Some(reason.clone());
+                return Err(Gov5QmdbStateRootError::Persistence(reason));
+            }
             return Err(Gov5QmdbStateRootError::Persistence(error.to_string()));
         }
         wal.len = wal.len.saturating_add(frame.len() as u64);
@@ -806,15 +843,25 @@ impl Gov5QmdbStateRootStore {
     }
 
     #[cfg(test)]
-    fn apply_wal_fault(&self, wal: &mut QmdbWalFile, frame: &[u8]) -> Option<std::io::Error> {
-        match self.wal_fault.lock().unwrap().take()? {
+    fn apply_wal_fault(
+        &self,
+        wal: &mut QmdbWalFile,
+        frame: &[u8],
+    ) -> (Option<std::io::Error>, bool) {
+        let Some(fault) = self.wal_fault.lock().unwrap().take() else {
+            return (None, false);
+        };
+        match fault {
             WalFault::Delay(duration) => {
                 std::thread::sleep(duration);
-                None
+                (None, false)
             }
-            WalFault::FailWrite => {
+            WalFault::FailWrite | WalFault::FailWriteAndRollback => {
                 let _ = wal.file.write_all(&frame[..frame.len() / 2]);
-                Some(std::io::Error::other("injected QMDB WAL write failure"))
+                (
+                    Some(std::io::Error::other("injected QMDB WAL write failure")),
+                    matches!(fault, WalFault::FailWriteAndRollback),
+                )
             }
         }
     }
@@ -839,7 +886,20 @@ fn open_wal_file(path: &Path) -> Result<QmdbWalFile, Gov5QmdbStateRootError> {
         .metadata()
         .map_err(|error| Gov5QmdbStateRootError::Persistence(error.to_string()))?
         .len();
-    Ok(QmdbWalFile { file, len })
+    // A newly created WAL is only durable once its directory entry is; sync
+    // the directory here, once per open, so per-block appends can rely on
+    // `fdatasync` alone.
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        std::fs::File::open(parent)
+            .and_then(|dir| dir.sync_all())
+            .map_err(|error| Gov5QmdbStateRootError::Persistence(error.to_string()))?;
+    }
+    Ok(QmdbWalFile {
+        file,
+        len,
+        poisoned: None,
+    })
 }
 
 fn load_wal(
@@ -1760,6 +1820,76 @@ mod tests {
         );
         assert!(persistent.contains(second).unwrap());
         drop(persistent);
+        let reopened = persistent_store(&base, &snapshot, &path);
+        assert_eq!(reopened.root_for(second).unwrap(), Some(second_root));
+    }
+
+    /// When the torn frame cannot be truncated, `len` no longer describes the
+    /// file. The store must refuse further commits rather than append behind
+    /// the garbage, and a reopen recovers the durable prefix from disk.
+    #[test]
+    fn wal_rollback_failure_poisons_the_handle_until_reopen() {
+        let (base, snapshot) = store();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal-poison.bin");
+        let persistent = persistent_store(&base, &snapshot, &path);
+
+        let first_ops = vec![operation(2, 2)];
+        let first = B256::repeat_byte(0x21);
+        let first_root = expected_root(&snapshot, std::slice::from_ref(&first_ops));
+        persistent
+            .compute_and_commit(base.base_block_hash(), first, first_root, first_ops.clone())
+            .unwrap();
+        let wal = wal_path(&path);
+        let durable_len = std::fs::metadata(&wal).unwrap().len();
+
+        let second_ops = vec![operation(3, 3)];
+        let second = B256::repeat_byte(0x22);
+        let second_root = expected_root(&snapshot, &[first_ops.clone(), second_ops.clone()]);
+        persistent.inject_wal_fault(WalFault::FailWriteAndRollback);
+        let error = persistent
+            .compute_and_commit(first, second, second_root, second_ops.clone())
+            .unwrap_err();
+        assert!(
+            matches!(&error, Gov5QmdbStateRootError::Persistence(reason) if reason.contains("rollback")),
+            "unexpected error: {error:?}"
+        );
+        assert!(!persistent.contains(second).unwrap());
+        assert!(!persistent.wal_in_flight());
+        let torn_len = std::fs::metadata(&wal).unwrap().len();
+        assert!(torn_len > durable_len, "the torn half-frame stays on disk");
+
+        // Every later commit is refused without touching the file; reads and
+        // candidates on the durable graph still work.
+        let error = persistent
+            .compute_and_commit(first, second, second_root, second_ops.clone())
+            .unwrap_err();
+        assert!(
+            matches!(&error, Gov5QmdbStateRootError::Persistence(reason) if reason.contains("failed rollback")),
+            "unexpected error: {error:?}"
+        );
+        assert!(!persistent.contains(second).unwrap());
+        assert_eq!(std::fs::metadata(&wal).unwrap().len(), torn_len);
+        assert_eq!(persistent.root_for(first).unwrap(), Some(first_root));
+        assert_eq!(
+            persistent.compute_candidate(first, &second_ops).unwrap(),
+            second_root
+        );
+        drop(persistent);
+
+        // Reopen: recovery truncates the torn tail, keeps the durable prefix,
+        // and commits resume.
+        let reopened = persistent_store(&base, &snapshot, &path);
+        assert_eq!(std::fs::metadata(&wal).unwrap().len(), durable_len);
+        assert_eq!(reopened.root_for(first).unwrap(), Some(first_root));
+        assert_eq!(reopened.root_for(second).unwrap(), None);
+        assert_eq!(
+            reopened
+                .compute_and_commit(first, second, second_root, second_ops)
+                .unwrap(),
+            second_root
+        );
+        drop(reopened);
         let reopened = persistent_store(&base, &snapshot, &path);
         assert_eq!(reopened.root_for(second).unwrap(), Some(second_root));
     }
